@@ -15,7 +15,7 @@ use super::cleanup::{
     CancelAndWaitResult, cleanup_session_full, close_session_connection, send_cancel_and_wait,
     send_session_prompt_end,
 };
-use super::locale::{locale_from_grpc_request, localized};
+use super::locale::locale_from_grpc_request;
 
 #[instrument(skip(app_state, request))]
 pub async fn cancel_session(
@@ -53,12 +53,7 @@ pub async fn cancel_session(
                     return Ok(Response::new(CancelResponse {
                         success: true,
                         result: CancelResultType::CancelResultSuccess as i32,
-                        message: Some(localized(
-                            locale,
-                            "项目当前没有活跃会话",
-                            "專案目前沒有活躍工作階段",
-                            "Project has no active session",
-                        )),
+                        message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.no_active_session", locale)),
                     }));
                 }
             }
@@ -91,12 +86,7 @@ pub async fn cancel_session(
                 return Ok(Response::new(CancelResponse {
                     success: true,
                     result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some(localized(
-                        locale,
-                        "会话不存在或已完成",
-                        "工作階段不存在或已完成",
-                        "Session does not exist or already completed",
-                    )),
+                    message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.session_not_found", locale)),
                 }));
             }
         };
@@ -112,12 +102,7 @@ pub async fn cancel_session(
                     return Ok(Response::new(CancelResponse {
                         success: true,
                         result: CancelResultType::CancelResultSuccess as i32,
-                        message: Some(localized(
-                            locale,
-                            "项目当前没有活跃会话",
-                            "專案目前沒有活躍工作階段",
-                            "Project has no active session",
-                        )),
+                        message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.no_active_session", locale)),
                     }));
                 }
             };
@@ -137,12 +122,7 @@ pub async fn cancel_session(
                 return Ok(Response::new(CancelResponse {
                     success: true,
                     result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some(localized(
-                        locale,
-                        "Agent 已处于空闲状态",
-                        "Agent 已處於閒置狀態",
-                        "Agent already in idle status",
-                    )),
+                    message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.agent_idle", locale)),
                 }));
             }
             AgentStatus::Terminating => {
@@ -153,12 +133,7 @@ pub async fn cancel_session(
                 return Ok(Response::new(CancelResponse {
                     success: true,
                     result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some(localized(
-                        locale,
-                        "Agent 已在停止中",
-                        "Agent 已在停止中",
-                        "Agent is already stopping",
-                    )),
+                    message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.agent_stopping", locale)),
                 }));
             }
             AgentStatus::Active | AgentStatus::Pending => {
@@ -177,12 +152,7 @@ pub async fn cancel_session(
             return Ok(Response::new(CancelResponse {
                 success: false,
                 result: CancelResultType::CancelResultFailed as i32,
-                message: Some(localized(
-                    locale,
-                    "取消通道已关闭，Agent 可能已停止",
-                    "取消通道已關閉，Agent 可能已停止",
-                    "Cancel channel closed, Agent may have stopped",
-                )),
+                message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.channel_closed", locale)),
             }));
         }
 
@@ -205,12 +175,7 @@ pub async fn cancel_session(
                     return Ok(Response::new(CancelResponse {
                         success: false,
                         result: CancelResultType::CancelResultFailed as i32,
-                        message: Some(localized(
-                            locale,
-                            "Agent 取消执行失败",
-                            "Agent 取消執行失敗",
-                            "Agent cancel execution failed",
-                        )),
+                        message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.execution_failed", locale)),
                     }));
                 }
             }
@@ -226,12 +191,7 @@ pub async fn cancel_session(
                     StopReason::Cancelled,
                     Some(format!(
                         "{}: {}",
-                        localized(
-                            locale,
-                            "Agent 响应通道关闭",
-                            "Agent 回應通道關閉",
-                            "Agent response channel closed",
-                        ),
+                        shared_types_i18n::get_i18n_message("grpc.common.agent_response_closed", locale),
                         e
                     )),
                 )
@@ -243,7 +203,7 @@ pub async fn cancel_session(
                     result: CancelResultType::CancelResultFailed as i32,
                     message: Some(format!(
                         "{}: {}",
-                        localized(locale, "响应通道关闭", "回應通道關閉", "Response channel closed"),
+                        shared_types_i18n::get_i18n_message("grpc.common.response_closed", locale),
                         e
                     )),
                 }));
@@ -258,12 +218,7 @@ pub async fn cancel_session(
                     &project_id,
                     &actual_session_id,
                     StopReason::Cancelled,
-                    Some(localized(
-                        locale,
-                        "取消请求超时，主动清理资源",
-                        "取消請求逾時，主動清理資源",
-                        "Cancel request timed out; resources were cleaned up",
-                    )),
+                    Some(shared_types_i18n::get_i18n_message("grpc.cancel.timeout_cleanup", locale)),
                     true,
                     &[AgentStatus::Active],
                 )
@@ -272,12 +227,7 @@ pub async fn cancel_session(
                 return Ok(Response::new(CancelResponse {
                     success: false,
                     result: CancelResultType::CancelResultTimeout as i32,
-                    message: Some(localized(
-                        locale,
-                        "取消请求超时（30秒）",
-                        "取消請求逾時（30 秒）",
-                        "Cancel request timed out (30 seconds)",
-                    )),
+                    message: Some(shared_types_i18n::get_i18n_message("grpc.common.timeout_30s", locale)),
                 }));
             }
             CancelAndWaitResult::SendFailed(e) => {
@@ -287,12 +237,7 @@ pub async fn cancel_session(
                     result: CancelResultType::CancelResultFailed as i32,
                     message: Some(format!(
                         "{}: {}",
-                        localized(
-                            locale,
-                            "发送取消通知失败",
-                            "發送取消通知失敗",
-                            "Failed to send cancel notification",
-                        ),
+                        shared_types_i18n::get_i18n_message("grpc.common.notify_failed", locale),
                         e
                     )),
                 }));
@@ -312,12 +257,7 @@ pub async fn cancel_session(
         Ok(Response::new(CancelResponse {
             success: true,
             result: CancelResultType::CancelResultSuccess as i32,
-            message: Some(localized(
-                locale,
-                "取消成功",
-                "取消成功",
-                "Cancelled successfully",
-            )),
+            message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.success", locale)),
         }))
     })
     .await

@@ -170,6 +170,7 @@ postage = "0.5"
 regex = "1.0"
 semver = "1.0"
 shellexpand = "3.1"
+winnow = "1.0.3"
 shlex = "1.0"
 smallvec = "1.15"
 

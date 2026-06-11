@@ -13,7 +13,6 @@ use axum::{
     http::{Request, StatusCode},
     routing::post,
 };
-use shared_types;
 use tower::ServiceExt;
 
 use rcoder::handler::agent_mgmt_handler as handler;

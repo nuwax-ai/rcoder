@@ -107,7 +107,9 @@ pub async fn install_with_version_check(
     validate_version_format(version)?;
 
     // 0.5 获取 per-agent-version 安装锁
-    let state = lock_manager.get_or_create(agent_id, version);
+    let state = lock_manager.get_or_create(agent_id, version).ok_or_else(|| {
+        AgentMgmtError::InvalidVersion(format!("invalid semver version: {}", version))
+    })?;
     if force {
         // 强制模式：取消当前安装，等待锁
         state.cancel();
@@ -177,12 +179,9 @@ async fn do_install_with_version_check(
         return Ok(resp);
     }
 
-    // 判断是首次安装还是更新
-    let action = if registry.contains(agent_id) {
-        shared_types::InstallAction::Updated
-    } else {
-        shared_types::InstallAction::Installed
-    };
+    // 多版本并存模式：精确版本不存在即为新安装（不是更新）
+    // Updated 仅用于单版本替换场景（旧版本被新版本覆盖）
+    let action = shared_types::InstallAction::Installed;
 
     info!(
         "[agent_mgmt] version check: agent_id={}, action={}, requested_version={}",
@@ -260,20 +259,13 @@ async fn do_install_with_version_check(
 }
 
 /// 校验版本格式:至少包含一个数字(如 "1.0.0", "v2", "1.2.3-beta")
+/// 校验版本格式：必须是合法的 semver（如 "1.0.0"、"v2.1.3-beta"）
 fn validate_version_format(version: &str) -> AgentMgmtResult<()> {
-    let trimmed = version.trim().trim_start_matches('v').trim_start_matches('V');
-    if trimmed.is_empty() || !trimmed.chars().any(|c| c.is_ascii_digit()) {
-        return Err(AgentMgmtError::InvalidVersion(format!(
-            "version must contain at least one digit: {version:?}"
-        )));
-    }
-    // 至少第一个 segment 必须是纯数字
-    let first = trimmed.split('.').next().unwrap_or("");
-    if first.parse::<u64>().is_err() {
-        return Err(AgentMgmtError::InvalidVersion(format!(
-            "version major must be a number: {version:?}"
-        )));
-    }
+    shared_types::version_util::parse_semver(version).ok_or_else(|| {
+        AgentMgmtError::InvalidVersion(format!(
+            "invalid semver: {version:?}"
+        ))
+    })?;
     Ok(())
 }
 

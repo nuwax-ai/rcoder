@@ -15,7 +15,7 @@ use super::cleanup::{
     CancelAndWaitResult, close_session_connection, remove_agent_and_cleanup,
     remove_session_from_cache, send_cancel_and_wait, send_session_prompt_end,
 };
-use super::locale::{locale_from_grpc_request, localized};
+use super::locale::locale_from_grpc_request;
 
 fn cleanup_api_keys(app_state: &Arc<AppState>, project_id: &str) {
     if let Some((_, uuid)) = app_state.project_uuid_map.remove(project_id) {
@@ -51,12 +51,7 @@ pub async fn stop_agent(
             .reason
             .clone()
             .unwrap_or_else(|| {
-                localized(
-                    locale,
-                    "用户请求停止",
-                    "使用者請求停止",
-                    "Stop requested by user",
-                )
+                shared_types_i18n::get_i18n_message("grpc.stop.requested", locale)
             });
 
         info!(
@@ -87,12 +82,7 @@ pub async fn stop_agent(
                     result: "not_found".to_string(),
                     message: Some(format!(
                         "{} {}",
-                        localized(
-                            locale,
-                            "项目的 Agent 不存在或已停止:",
-                            "專案 Agent 不存在或已停止:",
-                            "Agent not found or already stopped for project:",
-                        ),
+                        shared_types_i18n::get_i18n_message("grpc.stop.not_found", locale),
                         project_id
                     )),
                     project_id,
@@ -108,12 +98,7 @@ pub async fn stop_agent(
                     &project_id,
                     &session_id,
                     StopReason::Cancelled,
-                    Some(localized(
-                        locale,
-                        "Agent 已在停止中",
-                        "Agent 已在停止中",
-                        "Agent is already stopping",
-                    )),
+                    Some(shared_types_i18n::get_i18n_message("grpc.cancel.agent_stopping", locale)),
                 )
                 .await;
                 close_session_connection(&session_id).await;
@@ -124,12 +109,7 @@ pub async fn stop_agent(
                 result: "already_stopped".to_string(),
                 message: Some(format!(
                     "{} {}",
-                    localized(
-                        locale,
-                        "项目的 Agent 已在停止中:",
-                        "專案的 Agent 已在停止中:",
-                        "Agent is already stopping for project:",
-                    ),
+                    shared_types_i18n::get_i18n_message("grpc.stop.already_stopping_project", locale),
                     project_id
                 )),
                 project_id,
@@ -164,12 +144,7 @@ pub async fn stop_agent(
             );
             let response_message = format!(
                 "{} {}",
-                localized(
-                    locale,
-                    "项目的 Agent 正在停止（后台清理中）:",
-                    "專案的 Agent 正在停止（後台清理中）:",
-                    "Agent is stopping (background cleanup in progress) for project:",
-                ),
+                shared_types_i18n::get_i18n_message("grpc.stop.stopping_cleanup", locale),
                 project_id
             );
 
@@ -218,12 +193,7 @@ pub async fn stop_agent(
 
                         let response_message = format!(
                             "{} {}",
-                            localized(
-                                locale,
-                                "项目的 Agent 已成功停止:",
-                                "專案的 Agent 已成功停止:",
-                                "Agent stopped successfully for project:",
-                            ),
+                            shared_types_i18n::get_i18n_message("grpc.stop.success", locale),
                             project_id
                         );
 
@@ -242,12 +212,7 @@ pub async fn stop_agent(
                         return Ok(Response::new(StopAgentResponse {
                             success: false,
                             result: "error".to_string(),
-                            message: Some(localized(
-                                locale,
-                                "取消会话失败",
-                                "取消工作階段失敗",
-                                "Failed to cancel session",
-                            )),
+                            message: Some(shared_types_i18n::get_i18n_message("grpc.stop.cancel_session_failed", locale)),
                             project_id,
                         }));
                     }
@@ -264,12 +229,7 @@ pub async fn stop_agent(
                         StopReason::Cancelled,
                         Some(format!(
                             "{}: {}",
-                            localized(
-                                locale,
-                                "Agent 响应通道关闭",
-                                "Agent 回應通道關閉",
-                                "Agent response channel closed",
-                            ),
+                            shared_types_i18n::get_i18n_message("grpc.common.agent_response_closed", locale),
                             e
                         )),
                     )
@@ -281,12 +241,7 @@ pub async fn stop_agent(
                         result: "error".to_string(),
                         message: Some(format!(
                             "{}: {}",
-                            localized(
-                                locale,
-                                "响应通道关闭",
-                                "回應通道關閉",
-                                "Response channel closed",
-                            ),
+                            shared_types_i18n::get_i18n_message("grpc.common.response_closed", locale),
                             e
                         )),
                         project_id,
@@ -298,12 +253,7 @@ pub async fn stop_agent(
                     return Ok(Response::new(StopAgentResponse {
                         success: false,
                         result: "error".to_string(),
-                        message: Some(localized(
-                            locale,
-                            "取消请求超时（30秒）",
-                            "取消請求逾時（30 秒）",
-                            "Cancel request timed out (30 seconds)",
-                        )),
+                        message: Some(shared_types_i18n::get_i18n_message("grpc.common.timeout_30s", locale)),
                         project_id,
                     }));
                 }
@@ -317,12 +267,7 @@ pub async fn stop_agent(
                         result: "error".to_string(),
                         message: Some(format!(
                             "{}: {}",
-                            localized(
-                                locale,
-                                "发送取消通知失败",
-                                "發送取消通知失敗",
-                                "Failed to send cancel notification",
-                            ),
+                            shared_types_i18n::get_i18n_message("grpc.common.notify_failed", locale),
                             e
                         )),
                         project_id,
@@ -338,12 +283,7 @@ pub async fn stop_agent(
         Ok(Response::new(StopAgentResponse {
             success: false,
             result: "error".to_string(),
-            message: Some(localized(
-                locale,
-                "意外的代码分支",
-                "意外的程式分支",
-                "Unexpected code path",
-            )),
+            message: Some(shared_types_i18n::get_i18n_message("grpc.stop.unexpected", locale)),
             project_id,
         }))
     })

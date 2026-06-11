@@ -83,14 +83,17 @@ pub struct SystemInfo {
 impl SystemInfo {
     /// 从当前运行环境获取系统信息
     pub fn current() -> Self {
-        let os = std::env::consts::OS.to_string();
-        let arch = match std::env::consts::ARCH {
-            "x86_64" => "amd64".to_string(),
-            "aarch64" => "arm64".to_string(),
-            other => other.to_string(),
-        };
-        let platform = format!("{}/{}", os, arch);
-        Self { os, arch, platform }
+        let key = crate::version_util::PlatformKey::current();
+        Self {
+            os: key.os.to_string(),
+            arch: key.arch.to_string(),
+            platform: format!("{}/{}", key.os, key.arch),
+        }
+    }
+
+    /// 转换为 PlatformKey 结构体
+    pub fn to_platform_key(&self) -> Option<crate::version_util::PlatformKey> {
+        crate::version_util::PlatformKey::new(&self.os, &self.arch)
     }
 }
 

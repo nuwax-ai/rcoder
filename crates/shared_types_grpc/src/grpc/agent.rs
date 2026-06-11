@@ -400,6 +400,15 @@ pub struct ChatAgentServerConfig {
     /// 工具审批规则（可选）
     #[prost(message, repeated, tag = "8")]
     pub tool_approval_rules: ::prost::alloc::vec::Vec<ToolApprovalRule>,
+    /// 期望安装的版本号（semver 格式，与 platforms 配合使用）
+    #[prost(string, optional, tag = "9")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
+    /// 多平台下载地址（PlatformEntry JSON 序列化，key = "{os}-{arch}"）
+    #[prost(map = "string, bytes", tag = "10")]
+    pub platforms: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::vec::Vec<u8>,
+    >,
 }
 /// 工具审批规则
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

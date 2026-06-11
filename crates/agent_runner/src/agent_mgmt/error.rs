@@ -67,6 +67,12 @@ pub enum AgentMgmtError {
     UnsupportedType(String),
 }
 
+impl From<shared_types::version_util::VersionParseError> for AgentMgmtError {
+    fn from(e: shared_types::version_util::VersionParseError) -> Self {
+        Self::InvalidVersion(e.to_string())
+    }
+}
+
 impl AgentMgmtError {
     /// 映射到业务错误码
     pub fn error_code(&self) -> &'static str {

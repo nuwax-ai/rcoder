@@ -39,6 +39,8 @@ pub(crate) struct SacpConnectionParams<N: SessionNotifier> {
     pub(crate) permission_handler: Arc<dyn PermissionRequestHandler>,
     /// 🔥 新增：共享的异常退出标志（子进程异常退出时设置为 true）
     pub(crate) abnormal_exit_flag: Arc<AtomicBool>,
+    /// 🔥 新增：详细的退出信息（signal、exit_code），用于生成更有意义的错误消息
+    pub(crate) exit_detail: Arc<tokio::sync::Mutex<Option<crate::launcher::lifecycle::ExitDetail>>>,
     /// 共享的 session_id，用于连接失败时发送错误通知
     /// 在 connect_with 内部初始化完成后设置，供外部错误处理使用
     pub(crate) session_id_shared: Arc<std::sync::Mutex<Option<String>>>,
@@ -75,6 +77,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         notifier,
         permission_handler,
         abnormal_exit_flag,
+        exit_detail,
         session_id_shared,
         mut connection_failed_tx,
         child_pid,
@@ -507,13 +510,28 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     "[SACP] Agent process exited abnormally, sending SSE error notification and disconnecting: project_id={}, session_id={}",
                                     project_id_for_prompt, session_id
                                 );
+
+                                // 🔥 优化：获取详细的退出信息，使用 i18n 生成有意义的错误消息
+                                let error_message = {
+                                    let detail_guard = exit_detail.lock().await;
+                                    if let Some(ref detail) = *detail_guard {
+                                        let i18n_key = detail.i18n_key();
+                                        match detail.format_arg() {
+                                            Some(arg) => error_codes::get_i18n_message_default(i18n_key).replace("{}", &arg),
+                                            None => error_codes::get_i18n_message_default(i18n_key),
+                                        }
+                                    } else {
+                                        error_codes::get_i18n_message_default("error.agent_process_abnormal_exit")
+                                    }
+                                };
+
                                 if let Err(e) = notifier_for_prompt
                                     .notify_prompt_error(
                                         &project_id_for_prompt,
                                         &session_id.to_string(),
                                         agent_client_protocol::Error::new(
                                             1001,
-                                            error_codes::get_i18n_message_default("error.agent_process_abnormal_exit"),
+                                            error_message,
                                         ),
                                         None, // request_id 可能已经不可用
                                     )
@@ -620,9 +638,24 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                                 "[SACP] Detected Agent process abnormal exit during prompt processing: project_id={}, session_id={}",
                                                 project_id_for_prompt, session_id
                                             );
+
+                                            // 🔥 优化：获取详细的退出信息，使用 i18n 生成有意义的错误消息
+                                            let error_message = {
+                                                let detail_guard = exit_detail.lock().await;
+                                                if let Some(ref detail) = *detail_guard {
+                                                    let i18n_key = detail.i18n_key();
+                                                    match detail.format_arg() {
+                                                        Some(arg) => error_codes::get_i18n_message_default(i18n_key).replace("{}", &arg),
+                                                        None => error_codes::get_i18n_message_default(i18n_key),
+                                                    }
+                                                } else {
+                                                    error_codes::get_i18n_message_default("error.agent_process_abnormal_exit")
+                                                }
+                                            };
+
                                             break Err(agent_client_protocol::Error::new(
                                                 1001,
-                                                error_codes::get_i18n_message_default("error.agent_process_abnormal_exit"),
+                                                error_message,
                                             ));
                                         } else {
                                             // 正常取消（用户主动取消或 Agent 正常退出）

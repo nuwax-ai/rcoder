@@ -3,6 +3,7 @@
 //! 简化版本，只包含运行时配置，不包含提示词配置。
 //! 提示词由独立的 system_prompt 和 user_prompt 入参控制。
 
+use crate::agent_mgmt_types::PlatformEntry;
 use crate::service_config::ServiceResourceLimits;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -206,6 +207,21 @@ pub struct ChatAgentServerConfig {
     /// 元数据（可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
+
+    /// 期望安装的版本号（semver 格式，如 "1.2.0"）
+    ///
+    /// 与 `platforms` 配合使用：chat handler 在启动 agent 前自动检查版本是否已安装，
+    /// 未安装则自动下载安装。版本归一化：v1.0.0 和 1.0.0 视为同一版本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+
+    /// 多平台下载地址
+    ///
+    /// key 格式: `{os}-{arch}`，如 "linux-x86_64"、"linux-aarch64"。
+    /// 与 `version` 配合使用：提供后 chat handler 自动检查/安装 agent。
+    /// 要求 `agent_id` 和 `command` 必须有值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<HashMap<String, PlatformEntry>>,
 }
 
 /// 工具审批规则

@@ -51,6 +51,8 @@ pub struct ClaudeProcessParams {
     pub project_uuid_map: Option<Arc<DashMap<String, String>>>,
     pub service_uuid: Option<String>,
     pub abnormal_exit_flag: Option<Arc<AtomicBool>>,
+    /// 🔥 新增：详细的退出信息（signal、exit_code），用于生成更有意义的错误消息
+    pub exit_detail: Option<Arc<Mutex<Option<ExitDetail>>>>,
     pub diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
     pub process_command: String,
     pub process_args: Vec<String>,
@@ -163,6 +165,7 @@ impl AgentLifecycleGuard {
             project_uuid_map: None,
             service_uuid: None,
             abnormal_exit_flag: None,
+            exit_detail: None,
             diagnostics_listener: None,
             process_command: String::new(),
             process_args: Vec::new(),
@@ -188,6 +191,7 @@ impl AgentLifecycleGuard {
             project_uuid_map,
             service_uuid,
             abnormal_exit_flag,
+            exit_detail,
             diagnostics_listener,
             process_command,
             process_args,
@@ -224,6 +228,7 @@ impl AgentLifecycleGuard {
         // 让 SACP 连接层检测到并发送 SSE 通知
         let cancel_token_for_reaper = cancel_token.clone();
         let abnormal_exit_flag_clone = abnormal_exit_flag.clone();
+        let exit_detail_clone = exit_detail.clone();
         let project_id_for_reaper = project_id.clone();
         let listener_for_reaper = diagnostics_listener.clone();
         let command_for_reaper = process_command.clone();
@@ -267,6 +272,14 @@ impl AgentLifecycleGuard {
                             if !was_cancelled {
                                 flag.store(true, Ordering::SeqCst);
                             }
+                        }
+                        // 🔥 新增：设置详细的退出信息，用于生成更有意义的错误消息
+                        if let Some(ref exit_detail) = exit_detail_clone
+                            && !was_cancelled
+                        {
+                            let detail = analyze_exit_detail(exit_code, signal);
+                            let mut guard = exit_detail.lock().await;
+                            *guard = Some(detail);
                         }
                         // 只有非用户主动取消时才视为需要报告错误
                         if !was_cancelled {
@@ -652,4 +665,82 @@ impl AgentLifecycle for AgentLifecycleGuard {
     fn cancellation_token(&self) -> &CancellationToken {
         AgentLifecycleGuard::cancellation_token(self)
     }
+}
+
+/// 进程退出详情
+///
+/// 用于标识进程退出的原因，便于选择对应的 i18n 消息
+#[derive(Debug, Clone)]
+pub enum ExitDetail {
+    /// 被 SIGKILL 杀死（通常是 OOM）
+    SigKilled,
+    /// 发生段错误
+    SigSegv,
+    /// 被 SIGTERM 终止
+    SigTerm,
+    /// 其他信号
+    Signal(i32),
+    /// 特定退出码
+    ExitCode(i32),
+    /// 未知原因
+    Unknown,
+}
+
+impl ExitDetail {
+    /// 获取对应的 i18n 消息 key
+    pub fn i18n_key(&self) -> &str {
+        match self {
+            ExitDetail::SigKilled => "error.agent_process_sigkilled",
+            ExitDetail::SigSegv => "error.agent_process_sigsegv",
+            ExitDetail::SigTerm => "error.agent_process_sigterm",
+            ExitDetail::Signal(_) => "error.agent_process_abnormal_exit",
+            ExitDetail::ExitCode(_) => "error.agent_process_exit_code",
+            ExitDetail::Unknown => "error.agent_process_abnormal_exit",
+        }
+    }
+
+    /// 获取格式化参数（用于带占位符的消息）
+    pub fn format_arg(&self) -> Option<String> {
+        match self {
+            ExitDetail::ExitCode(code) => Some(code.to_string()),
+            _ => None,
+        }
+    }
+}
+
+/// 分析进程退出详情
+///
+/// 根据 exit_code 和 signal 生成 ExitDetail 枚举，用于选择对应的 i18n 消息。
+///
+/// # Arguments
+/// * `exit_code` - 进程退出码
+/// * `signal` - 杀死进程的信号（Unix）
+///
+/// # Returns
+/// ExitDetail 枚举
+fn analyze_exit_detail(exit_code: Option<i32>, signal: Option<i32>) -> ExitDetail {
+    // 优先检查信号（SIGKILL、SIGTERM 等）
+    if let Some(sig) = signal {
+        match sig {
+            9 => return ExitDetail::SigKilled,
+            11 => return ExitDetail::SigSegv,
+            15 => return ExitDetail::SigTerm,
+            _ => return ExitDetail::Signal(sig),
+        }
+    }
+
+    // 检查退出码
+    if let Some(code) = exit_code {
+        match code {
+            // 128 + 9 = SIGKILL
+            137 => return ExitDetail::SigKilled,
+            // 128 + 11 = SIGSEGV
+            139 => return ExitDetail::SigSegv,
+            // 128 + 15 = SIGTERM
+            143 => return ExitDetail::SigTerm,
+            _ => return ExitDetail::ExitCode(code),
+        }
+    }
+
+    ExitDetail::Unknown
 }

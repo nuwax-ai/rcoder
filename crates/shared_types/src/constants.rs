@@ -86,3 +86,15 @@ pub const AGENT_PROMPT_CHANNEL_CAPACITY: usize = 1000;
 ///
 /// 从 100 增加到 1000，与 Prompt 通道保持一致。
 pub const AGENT_CANCEL_CHANNEL_CAPACITY: usize = 1000;
+
+// === 内置 ACP Agent ===
+
+/// 内置 ACP agent 标识符列表
+///
+/// 容器构建时已预装，chat 接口跳过自动安装逻辑。
+pub const BUILTIN_AGENT_IDS: &[&str] = &["claude-code-acp-ts", "nuwaxcode"];
+
+/// 判断是否为内置 agent
+pub fn is_builtin_agent(agent_id: &str) -> bool {
+    BUILTIN_AGENT_IDS.contains(&agent_id)
+}

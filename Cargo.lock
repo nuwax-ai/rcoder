@@ -162,7 +162,6 @@ dependencies = [
  "reqwest 0.13.3",
  "ringbuf",
  "rustls",
- "semver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5651,6 +5650,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "reqwest 0.13.3",
+ "semver",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -5669,6 +5669,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "winnow 1.0.3",
 ]
 
 [[package]]
@@ -6307,7 +6308,7 @@ dependencies = [
  "serde_spanned",
  "toml_datetime",
  "toml_write",
- "winnow",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -7297,6 +7298,15 @@ name = "winnow"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "winnow"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
 ]

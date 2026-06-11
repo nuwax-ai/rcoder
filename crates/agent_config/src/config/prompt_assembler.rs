@@ -333,12 +333,7 @@ mod tests {
         let agent_config = ChatAgentConfig {
             agent_server: Some(shared_types::ChatAgentServerConfig {
                 agent_id: Some("custom-agent".to_string()),
-                command: None,
-                args: None,
-                env: None,
-                model_env_bindings: Vec::new(),
-                agent_mode: None,
-                metadata: None,
+                ..Default::default()
             }),
             context_servers: HashMap::new(),
             resource_limits: None,
@@ -368,13 +363,8 @@ mod tests {
 
         let agent_config = ChatAgentConfig {
             agent_server: Some(shared_types::ChatAgentServerConfig {
-                agent_id: None,
-                command: None,
-                args: None,
                 env: Some(override_env),
-                model_env_bindings: Vec::new(),
-                agent_mode: None,
-                metadata: None,
+                ..Default::default()
             }),
             context_servers: HashMap::new(),
             resource_limits: None,

@@ -19,26 +19,28 @@ use error::AgentDownloadError;
 
 /// Validate that an identifier (agent_id or version) is safe for path construction.
 ///
-/// Only allows alphanumeric characters, dash, underscore, and dot.
-/// Rejects empty strings and path traversal sequences (`..`).
+/// Checks (in priority order):
+/// 1. Reject empty strings
+/// 2. Reject path traversal sequences (`..`) — security-critical, checked before character allowlist
+/// 3. Only allow alphanumeric characters, dash, underscore, and dot
 fn validate_download_identifier(id: &str, label: &str) -> Result<(), AgentDownloadError> {
     if id.is_empty() {
         return Err(AgentDownloadError::NotFound(format!("{} is empty", label)));
     }
-    // Only allow alphanumeric, dash, underscore, dot
-    if !id
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
-        return Err(AgentDownloadError::NotFound(format!(
-            "{} contains invalid characters: {}",
-            label, id
-        )));
-    }
-    // Reject path traversal
+    // Reject path traversal first (security-critical)
     if id.contains("..") {
         return Err(AgentDownloadError::NotFound(format!(
             "{} contains path traversal: {}",
+            label, id
+        )));
+    }
+    // Only allow alphanumeric, dash, underscore, dot, and v/V (semver prefix)
+    if !id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == 'v' || c == 'V')
+    {
+        return Err(AgentDownloadError::NotFound(format!(
+            "{} contains invalid characters: {}",
             label, id
         )));
     }
@@ -118,26 +120,32 @@ impl AgentDownloadManager {
 
     /// 检查缓存是否存在
     pub fn is_cached(&self, agent_id: &str, version: &str) -> bool {
-        self.version_dir(agent_id, version).exists()
+        self.version_dir(agent_id, version)
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
-    /// 获取版本缓存目录路径
-    pub fn version_dir(&self, agent_id: &str, version: &str) -> PathBuf {
-        self.cache_dir.join(agent_id).join(version)
+    /// 获取版本缓存目录路径（版本归一化）
+    pub fn version_dir(&self, agent_id: &str, version: &str) -> Result<PathBuf, AgentDownloadError> {
+        let normalized = shared_types::version_util::normalize_version(version)
+            .map_err(|e| AgentDownloadError::NotFound(e.to_string()))?;
+        Ok(self.cache_dir.join(agent_id).join(normalized))
     }
 
-    /// 获取下载锁键
-    fn lock_key(agent_id: &str, version: &str) -> String {
-        format!("{}:{}", agent_id, version)
+    /// 获取下载锁键（版本归一化）
+    fn lock_key(agent_id: &str, version: &str) -> Result<String, AgentDownloadError> {
+        let normalized = shared_types::version_util::normalize_version(version)
+            .map_err(|e| AgentDownloadError::NotFound(e.to_string()))?;
+        Ok(format!("{}:{}", agent_id, normalized))
     }
 
     /// 获取下载锁
-    fn get_download_lock(&self, agent_id: &str, version: &str) -> Arc<Mutex<()>> {
-        let key = Self::lock_key(agent_id, version);
-        self.download_locks
+    fn get_download_lock(&self, agent_id: &str, version: &str) -> Result<Arc<Mutex<()>>, AgentDownloadError> {
+        let key = Self::lock_key(agent_id, version)?;
+        Ok(self.download_locks
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+            .clone())
     }
 
     /// 下载到缓存（带并发控制）
@@ -154,7 +162,7 @@ impl AgentDownloadManager {
         validate_download_identifier(version, "version")?;
 
         // 获取锁（同一版本只有一个下载任务）
-        let lock = self.get_download_lock(agent_id, version);
+        let lock = self.get_download_lock(agent_id, version)?;
         let _guard = lock.lock().await;
 
         // 双重检查：可能其他请求已经下载完成
@@ -164,7 +172,7 @@ impl AgentDownloadManager {
                 version = %version,
                 "Agent already cached, skipping download"
             );
-            let version_dir = self.version_dir(agent_id, version);
+            let version_dir = self.version_dir(agent_id, version)?;
             // 获取已缓存文件的大小
             let file_size = self.get_cached_file_size(&version_dir).unwrap_or(0);
             return Ok(DownloadResult {
@@ -177,7 +185,7 @@ impl AgentDownloadManager {
         tokio::fs::create_dir_all(&self.cache_dir).await?;
 
         // 执行下载到临时文件
-        let version_dir = self.version_dir(agent_id, version);
+        let version_dir = self.version_dir(agent_id, version)?;
         let temp_file = self.cache_dir.join(format!(".download-{}-{}", agent_id, version));
 
         // 下载文件到临时文件（使用 download_utils）
@@ -240,7 +248,7 @@ impl AgentDownloadManager {
         validate_download_identifier(agent_id, "agent_id")?;
         validate_download_identifier(version, "version")?;
 
-        let source = self.version_dir(agent_id, version);
+        let source = self.version_dir(agent_id, version)?;
         let target = target_base.join(agent_id).join(version);
 
         // 检查源目录
@@ -304,11 +312,11 @@ mod tests {
         let manager = AgentDownloadManager::new(tmp_dir.path()).unwrap();
 
         assert_eq!(
-            manager.version_dir("codex-acp", "1.0.0"),
+            manager.version_dir("codex-acp", "1.0.0").unwrap(),
             tmp_dir.path().join("codex-acp").join("1.0.0")
         );
         assert_eq!(
-            manager.version_dir("my-agent", "2.0.0-beta"),
+            manager.version_dir("my-agent", "2.0.0-beta").unwrap(),
             tmp_dir.path().join("my-agent").join("2.0.0-beta")
         );
     }
@@ -316,7 +324,7 @@ mod tests {
     #[test]
     fn test_lock_key_format() {
         assert_eq!(
-            AgentDownloadManager::lock_key("codex-acp", "1.0.0"),
+            AgentDownloadManager::lock_key("codex-acp", "1.0.0").unwrap(),
             "codex-acp:1.0.0"
         );
     }
@@ -335,7 +343,7 @@ mod tests {
         let manager = AgentDownloadManager::new(tmp_dir.path()).unwrap();
 
         // 创建缓存目录
-        let version_dir = manager.version_dir("codex-acp", "1.0.0");
+        let version_dir = manager.version_dir("codex-acp", "1.0.0").unwrap();
         std::fs::create_dir_all(&version_dir).unwrap();
 
         assert!(manager.is_cached("codex-acp", "1.0.0"));
@@ -367,7 +375,7 @@ mod tests {
         let manager = AgentDownloadManager::new(tmp_dir.path().join("cache")).unwrap();
 
         // 创建源目录和文件
-        let source_dir = manager.version_dir("test-agent", "1.0.0");
+        let source_dir = manager.version_dir("test-agent", "1.0.0").unwrap();
         std::fs::create_dir_all(&source_dir).unwrap();
         std::fs::write(source_dir.join("binary"), b"fake binary").unwrap();
 

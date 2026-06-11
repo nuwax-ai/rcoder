@@ -14,36 +14,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use parking_lot::Mutex;
-use semver::Version;
 use shared_types::InstallType;
+use shared_types::version_util;
 use tracing::{info, warn};
 
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
 use crate::agent_mgmt::installer::AgentManifest;
 use crate::agent_mgmt::path_manager::PathManager;
-
-/// 版本键：空字符串表示无版本（向后兼容）
-fn version_key(version: Option<&str>) -> String {
-    version.unwrap_or("").to_string()
-}
-
-/// 解析版本字符串，支持 "v" 前缀
-///
-/// 返回 None 表示版本格式无效或为空
-fn parse_version(version: Option<&str>) -> Option<Version> {
-    let v = version?.trim();
-    let v = v.strip_prefix('v').or_else(|| v.strip_prefix('V')).unwrap_or(v);
-    Version::parse(v).ok()
-}
-
-/// 比较两个版本
-///
-/// 无效版本视为最低版本 "0.0.0"
-fn compare_versions(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
-    let a_ver = parse_version(a).unwrap_or(Version::new(0, 0, 0));
-    let b_ver = parse_version(b).unwrap_or(Version::new(0, 0, 0));
-    a_ver.cmp(&b_ver)
-}
 
 /// Agent 注册表(线程安全，支持多版本)
 pub struct AgentRegistry {
@@ -54,12 +31,59 @@ pub struct AgentRegistry {
 
 impl AgentRegistry {
     /// 创建新的注册表(从磁盘加载已有数据)
+    ///
+    /// 加载后自动清理残留条目：如果非 builtin agent 的安装目录已不存在，
+    /// 说明卸载过程中进程被 kill 导致注册表未更新，此时自动移除该条目。
     pub fn load(path_manager: PathManager) -> AgentMgmtResult<Self> {
-        let map = Self::read_from_disk(&path_manager.registry_path())?;
-        Ok(Self {
+        let mut map = Self::read_from_disk(&path_manager.registry_path())?;
+        let healed = Self::heal_orphaned_entries(&mut map);
+        let registry = Self {
             inner: Mutex::new(map),
             path_manager,
-        })
+        };
+        // 自愈后立即落盘，保持文件与内存一致
+        if healed > 0 {
+            registry.save_to_disk()?;
+        }
+        Ok(registry)
+    }
+
+    /// 清理注册表中安装目录已不存在的残留条目（启动时自愈）
+    ///
+    /// 通过检查每个非 builtin 条目的 binary_path 是否存在来判断是否残留。
+    /// 返回被移除的条目数量。
+    fn heal_orphaned_entries(
+        map: &mut HashMap<String, HashMap<String, AgentManifest>>,
+    ) -> usize {
+        let mut removed_count = 0;
+        for versions in map.values_mut() {
+            versions.retain(|_vkey, manifest| {
+                if manifest.install_type == InstallType::Builtin {
+                    return true;
+                }
+                let binary_path = std::path::PathBuf::from(&manifest.binary_path);
+                if !binary_path.exists() {
+                    warn!(
+                        "[agent_mgmt] Healing orphaned registry entry: agent_id={}, version={:?}, binary_path={} (directory missing)",
+                        manifest.agent_id,
+                        manifest.version,
+                        manifest.binary_path
+                    );
+                    removed_count += 1;
+                    return false;
+                }
+                true
+            });
+        }
+        // 清理空的 agent_id 条目
+        map.retain(|_, versions| !versions.is_empty());
+        if removed_count > 0 {
+            info!(
+                "[agent_mgmt] Healed {} orphaned registry entries on startup",
+                removed_count
+            );
+        }
+        removed_count
     }
 
     /// 安装根目录(供卸载安全检查等场景使用)
@@ -90,7 +114,7 @@ impl AgentRegistry {
                 versions
                     .values()
                     .filter(|m| m.install_type != InstallType::Builtin)
-                    .max_by(|a, b| compare_versions(a.version.as_deref(), b.version.as_deref()))
+                    .max_by(|a, b| version_util::compare_versions(a.version.as_deref().unwrap_or("0.0.0"), b.version.as_deref().unwrap_or("0.0.0")))
                     .cloned()
             })
             .collect()
@@ -102,7 +126,7 @@ impl AgentRegistry {
         let versions = guard.get(agent_id)?;
         versions
             .values()
-            .max_by(|a, b| compare_versions(a.version.as_deref(), b.version.as_deref()))
+            .max_by(|a, b| version_util::compare_versions(a.version.as_deref().unwrap_or("0.0.0"), b.version.as_deref().unwrap_or("0.0.0")))
             .cloned()
     }
 
@@ -110,7 +134,7 @@ impl AgentRegistry {
     pub fn get_version(&self, agent_id: &str, version: &str) -> Option<AgentManifest> {
         let guard = self.inner.lock();
         let versions = guard.get(agent_id)?;
-        let vkey = version_key(Some(version));
+        let vkey = version_util::normalize_version(version).ok()?;
         versions.get(&vkey).cloned()
     }
 
@@ -136,7 +160,10 @@ impl AgentRegistry {
     /// 是否已安装指定版本
     pub fn contains_version(&self, agent_id: &str, version: &str) -> bool {
         let guard = self.inner.lock();
-        let vkey = version_key(Some(version));
+        let vkey = match version_util::normalize_version(version) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         guard
             .get(agent_id)
             .map(|versions| versions.contains_key(&vkey))
@@ -148,7 +175,7 @@ impl AgentRegistry {
     pub fn insert(&self, manifest: AgentManifest) -> AgentMgmtResult<()> {
         manifest.validate()?;
         let mut guard = self.inner.lock();
-        let vkey = version_key(manifest.version.as_deref());
+        let vkey = version_util::normalize_version(manifest.version.as_deref().unwrap_or("0.0.0"))?;
         let versions = guard.entry(manifest.agent_id.clone()).or_default();
         if versions.contains_key(&vkey) {
             return Err(AgentMgmtError::VersionAlreadyInstalled {
@@ -165,7 +192,7 @@ impl AgentRegistry {
     pub fn upsert(&self, manifest: AgentManifest) -> AgentMgmtResult<()> {
         manifest.validate()?;
         let mut guard = self.inner.lock();
-        let vkey = version_key(manifest.version.as_deref());
+        let vkey = version_util::normalize_version(manifest.version.as_deref().unwrap_or("0.0.0"))?;
         let versions = guard.entry(manifest.agent_id.clone()).or_default();
         versions.insert(vkey, manifest);
         drop(guard);
@@ -187,7 +214,7 @@ impl AgentRegistry {
     /// 删除指定版本(立即落盘)
     pub fn remove_version(&self, agent_id: &str, version: &str) -> AgentMgmtResult<AgentManifest> {
         let mut guard = self.inner.lock();
-        let vkey = version_key(Some(version));
+        let vkey = version_util::normalize_version(version)?;
         let versions = guard
             .get_mut(agent_id)
             .ok_or_else(|| AgentMgmtError::NotFound(agent_id.to_string()))?;
@@ -232,7 +259,7 @@ impl AgentRegistry {
             v.sort_by(|a, b| {
                 a.agent_id
                     .cmp(&b.agent_id)
-                    .then_with(|| compare_versions(a.version.as_deref(), b.version.as_deref()))
+                    .then_with(|| version_util::compare_versions(a.version.as_deref().unwrap_or("0.0.0"), b.version.as_deref().unwrap_or("0.0.0")))
             });
             v
         };
@@ -289,27 +316,27 @@ impl AgentRegistry {
         };
         let mut map: HashMap<String, HashMap<String, AgentManifest>> = HashMap::new();
         for m in manifests {
-            let vkey = version_key(m.version.as_deref());
-            map.entry(m.agent_id.clone())
-                .or_default()
-                .insert(vkey, m);
+            let version_str = m.version.as_deref().unwrap_or("0.0.0");
+            match version_util::normalize_version(version_str) {
+                Ok(vkey) => {
+                    map.entry(m.agent_id.clone())
+                        .or_default()
+                        .insert(vkey, m);
+                }
+                Err(e) => {
+                    warn!(
+                        "[agent_mgmt] Skipping manifest with invalid version: agent_id={}, version={}, error={}",
+                        m.agent_id, version_str, e
+                    );
+                }
+            }
         }
         Ok(map)
     }
 }
 
-/// 归一化平台 key: `{os}-{arch}` 格式
-///
-/// - `amd64 → x86_64`, `arm64 → aarch64`
-/// - OS 保持原样(linux, darwin, windows)
-pub fn normalize_platform_key(os: &str, arch: &str) -> String {
-    let normalized_arch = match arch {
-        "amd64" => "x86_64",
-        "arm64" => "aarch64",
-        other => other,
-    };
-    format!("{os}-{normalized_arch}")
-}
+/// 归一化平台 key: `{os}-{arch}` 格式（代理到 shared_types）
+pub use shared_types::version_util::normalize_platform_key;
 
 #[cfg(test)]
 mod tests {
@@ -329,7 +356,24 @@ mod tests {
         PathManager::new_with_root(dir)
     }
 
+    /// 创建测试用 manifest，binary_path 指向临时目录内的真实路径
+    fn sample_manifest_in(id: &str, install_dir: &std::path::Path) -> AgentManifest {
+        let binary_path = install_dir.join(id).join("bin").join(id);
+        let mut m = AgentManifest::new(
+            id.into(),
+            InstallType::Binary,
+            "fake-agent".into(),
+            vec![],
+            binary_path.to_string_lossy().to_string(),
+            1024,
+            "executable".into(),
+        );
+        m.installed_at = 12345;
+        m
+    }
+
     fn sample_manifest(id: &str) -> AgentManifest {
+        // 回退到临时路径（仅用于不需要 load 自愈的测试）
         let mut m = AgentManifest::new(
             id.into(),
             InstallType::Binary,
@@ -345,6 +389,13 @@ mod tests {
 
     fn sample_manifest_with_version(id: &str, version: &str) -> AgentManifest {
         let mut m = sample_manifest(id);
+        m.version = Some(version.to_string());
+        m
+    }
+
+    /// 创建测试用 manifest，binary_path 指向临时目录内的真实路径（带版本）
+    fn sample_manifest_with_version_in(id: &str, version: &str, install_dir: &std::path::Path) -> AgentManifest {
+        let mut m = sample_manifest_in(id, install_dir);
         m.version = Some(version.to_string());
         m
     }
@@ -492,12 +543,21 @@ mod tests {
     #[test]
     fn load_persists_and_reloads() {
         let pm = temp_pm();
+        let install_dir = pm.install_dir().to_path_buf();
         let r1 = AgentRegistry::empty(pm.clone());
-        r1.insert(sample_manifest_with_version("alpha", "1.0.0"))
+        // 创建 binary_path 目录，防止自愈逻辑清理
+        for id in &["alpha", "beta"] {
+            for _ver in &["1.0.0", "2.0.0"] {
+                let path = install_dir.join(id).join("bin").join(id);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, b"fake").unwrap();
+            }
+        }
+        r1.insert(sample_manifest_with_version_in("alpha", "1.0.0", &install_dir))
             .unwrap();
-        r1.insert(sample_manifest_with_version("alpha", "2.0.0"))
+        r1.insert(sample_manifest_with_version_in("alpha", "2.0.0", &install_dir))
             .unwrap();
-        r1.insert(sample_manifest_with_version("beta", "1.0.0"))
+        r1.insert(sample_manifest_with_version_in("beta", "1.0.0", &install_dir))
             .unwrap();
 
         // 重新加载
@@ -526,35 +586,45 @@ mod tests {
     #[test]
     fn compare_versions_basic() {
         use std::cmp::Ordering;
-        assert_eq!(compare_versions(Some("1.0.0"), Some("1.0.0")), Ordering::Equal);
-        assert_eq!(compare_versions(Some("1.0.0"), Some("1.0.1")), Ordering::Less);
-        assert_eq!(compare_versions(Some("1.0.1"), Some("1.0.0")), Ordering::Greater);
-        assert_eq!(compare_versions(Some("1.0.0"), Some("2.0.0")), Ordering::Less);
-        assert_eq!(compare_versions(Some("1.2.3"), Some("1.2.4")), Ordering::Less);
+        let cv = shared_types::version_util::compare_versions;
+        assert_eq!(cv("1.0.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(cv("1.0.0", "1.0.1"), Ordering::Less);
+        assert_eq!(cv("1.0.1", "1.0.0"), Ordering::Greater);
+        assert_eq!(cv("1.0.0", "2.0.0"), Ordering::Less);
+        assert_eq!(cv("1.2.3", "1.2.4"), Ordering::Less);
     }
 
     #[test]
     fn compare_versions_with_v_prefix() {
         use std::cmp::Ordering;
-        assert_eq!(compare_versions(Some("v1.0.0"), Some("1.0.0")), Ordering::Equal);
-        assert_eq!(compare_versions(Some("V2.0.0"), Some("1.9.9")), Ordering::Greater);
+        let cv = shared_types::version_util::compare_versions;
+        assert_eq!(cv("v1.0.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(cv("V2.0.0", "1.9.9"), Ordering::Greater);
     }
 
     #[test]
-    fn compare_versions_malformed_defaults_to_zero() {
-        use std::cmp::Ordering;
-        // 格式不规范时，视为 0.0.0
-        assert_eq!(compare_versions(Some("invalid"), Some("0.0.0")), Ordering::Equal);
-        assert_eq!(compare_versions(Some("invalid"), Some("1.0.0")), Ordering::Less);
+    #[should_panic(expected = "invalid semver version")]
+    fn compare_versions_panics_on_invalid() {
+        shared_types::version_util::compare_versions("invalid", "0.0.0");
     }
 
     #[test]
-    fn compare_versions_none() {
-        use std::cmp::Ordering;
-        // None 视为 0.0.0
-        assert_eq!(compare_versions(None, Some("0.0.0")), Ordering::Equal);
-        assert_eq!(compare_versions(None, Some("1.0.0")), Ordering::Less);
-        assert_eq!(compare_versions(Some("1.0.0"), None), Ordering::Greater);
+    fn version_key_normalizes() {
+        let nk = shared_types::version_util::normalize_version;
+        // v 前缀归一化
+        assert_eq!(nk("v1.0.0").unwrap(), "1.0.0");
+        assert_eq!(nk("V2.0.0").unwrap(), "2.0.0");
+        // trim
+        assert_eq!(nk(" 1.0.0 ").unwrap(), "1.0.0");
+        // 已归一化的不变
+        assert_eq!(nk("1.0.0").unwrap(), "1.0.0");
+        // 相同版本不同表示 → 相同 key
+        assert_eq!(nk("v1.0.0").unwrap(), nk("1.0.0").unwrap());
+        assert_eq!(nk("V1.0.0").unwrap(), nk("1.0.0").unwrap());
+        // 非法版本号 → 错误
+        assert!(nk("").is_err());
+        assert!(nk("abc").is_err());
+        assert!(nk("latest").is_err());
     }
 
     #[test]
@@ -565,8 +635,8 @@ mod tests {
 
     #[test]
     fn normalize_platform_key_arm64() {
-        assert_eq!(normalize_platform_key("linux", "arm64"), "linux-aarch64");
-        assert_eq!(normalize_platform_key("linux", "aarch64"), "linux-aarch64");
-        assert_eq!(normalize_platform_key("darwin", "arm64"), "darwin-aarch64");
+        assert_eq!(normalize_platform_key("linux", "arm64"), "linux-arm64");
+        assert_eq!(normalize_platform_key("linux", "aarch64"), "linux-arm64");
+        assert_eq!(normalize_platform_key("darwin", "arm64"), "darwin-arm64");
     }
 }

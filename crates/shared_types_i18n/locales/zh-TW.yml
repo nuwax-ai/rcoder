@@ -99,6 +99,10 @@ error.unknown_retry_error: "未知重試錯誤"
 # SACP 相關
 error.sacp_session_id_send_failed: "無法發送工作階段 ID"
 error.agent_process_abnormal_exit: "Agent 處理序異常結束，請重試"
+error.agent_process_sigkilled: "Agent 處理序被 SIGKILL (訊號 9) 終止，通常是記憶體超限 (OOM) 或資源限制。請檢查容器記憶體使用情況。"
+error.agent_process_sigsegv: "Agent 處理序發生段錯誤 (SIGSEGV)，可能是記憶體存取越界或堆疊溢位。"
+error.agent_process_sigterm: "Agent 處理序被 SIGTERM (訊號 15) 終止"
+error.agent_process_exit_code: "Agent 處理序異常結束，結束碼: {}"
 error.session_cancelled: "工作階段已取消"
 error.cancel_response_timeout: "取消後等待回應逾時"
 error.agent_init_timeout: "智慧體初始化逾時，請重試（過多的MCP可能導致逾時）。如果持續失敗請重啟智慧體電腦（點選PC端右上圖示展開後，在[...]裡點選重啟智慧體電腦）"
@@ -120,3 +124,41 @@ error.agent_worker_unavailable: "Agent Worker 不可用，正在重啟，請稍�
 error.send_task_failed: "發送任務失敗"
 error.request_processing_failed: "處理請求失敗"
 error.system_busy: "系統繁忙：並發 Agent 工作階段數已達上限 ({} 個)，請稍後重試"
+
+# === gRPC 服務訊息 ===
+
+# 通用（cancel/stop 共享）
+grpc.common.response_closed: "回應通道關閉"
+grpc.common.agent_response_closed: "Agent 回應通道關閉"
+grpc.common.notify_failed: "發送取消通知失敗"
+grpc.common.timeout_30s: "取消請求逾時（30 秒）"
+
+# 取消
+grpc.cancel.no_active_session: "專案目前沒有活躍工作階段"
+grpc.cancel.session_not_found: "工作階段不存在或已完成"
+grpc.cancel.agent_idle: "Agent 已處於閒置狀態"
+grpc.cancel.agent_stopping: "Agent 已在停止中"
+grpc.cancel.channel_closed: "取消通道已關閉，Agent 可能已停止"
+grpc.cancel.execution_failed: "Agent 取消執行失敗"
+grpc.cancel.timeout_cleanup: "取消請求逾時，主動清理資源"
+grpc.cancel.success: "取消成功"
+
+# 停止
+grpc.stop.requested: "使用者請求停止"
+grpc.stop.not_found: "專案 Agent 不存在或已停止:"
+grpc.stop.already_stopping_project: "專案的 Agent 已在停止中:"
+grpc.stop.stopping_cleanup: "專案的 Agent 正在停止（後台清理中）:"
+grpc.stop.success: "專案的 Agent 已成功停止:"
+grpc.stop.cancel_session_failed: "取消工作階段失敗"
+grpc.stop.unexpected: "意外的程式分支"
+
+# 訂閱進度
+grpc.subscribe.create_connection_failed: "建立連線失敗"
+grpc.subscribe.user_cancelled: "使用者主動取消任務"
+grpc.subscribe.no_active_task: "Agent 目前沒有執行中的任務"
+grpc.subscribe.idle_timeout: "會話空閒逾時"
+
+# 狀態查詢
+grpc.status.vnc_ready: "VNC 服務已就緒"
+grpc.status.vnc_port_unreachable: "VNC 標記存在，但 noVNC 埠 6080 無法連線"
+grpc.status.vnc_not_ready: "VNC 服務尚未就緒（啟動中或啟動失敗）"

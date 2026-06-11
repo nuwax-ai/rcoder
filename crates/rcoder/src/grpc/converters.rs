@@ -252,6 +252,17 @@ pub fn to_grpc_chat_agent_server_config(
                 tool_kind: r.tool_kind,
             })
             .collect(),
+        version: config.version,
+        platforms: config
+            .platforms
+            .map(|p| {
+                p.into_iter()
+                    .filter_map(|(k, v)| {
+                        serde_json::to_vec(&v).ok().map(|bytes| (k, bytes))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

@@ -657,7 +657,7 @@ pub async fn install_from_url(
 
     // 获取平台 URL
     let sys_info = shared_types::SystemInfo::current();
-    let platform_key = format!("{}-{}", sys_info.os, sys_info.arch);
+    let platform_key = shared_types::version_util::normalize_platform_key(&sys_info.os, &sys_info.arch);
     let platform_entry = body.platforms.get(&platform_key).ok_or_else(|| {
         AppError::with_message(
             ec::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
@@ -698,7 +698,7 @@ pub async fn install_from_url(
     // version 已在前面通过 require_field 校验为必填
     let download_manager = &state.agent_download_manager;
     let version = body.agent.version.as_deref()
-        .expect("version should be validated as required");
+        .ok_or_else(|| AppError::with_message(ec::ERR_VALIDATION, "version is required"))?;
 
     let download_result = download_manager
         .download_to_cache(

@@ -328,6 +328,10 @@ message ChatAgentServerConfig {
   optional string agent_mode = 7;
   // 工具审批规则（可选）
   repeated ToolApprovalRule tool_approval_rules = 8;
+  // 期望安装的版本号（semver 格式，与 platforms 配合使用）
+  optional string version = 9;
+  // 多平台下载地址（PlatformEntry JSON 序列化，key = "{os}-{arch}"）
+  map<string, bytes> platforms = 10;
 }
 
 // 工具审批规则

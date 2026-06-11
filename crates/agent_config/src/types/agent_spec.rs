@@ -18,7 +18,8 @@ pub struct AgentSpec {
     /// Environment variables
     pub env: HashMap<String, String>,
 
-    /// Installation configuration
+    /// Installation configuration（可选，未配置时使用默认值）
+    #[serde(default)]
     pub installation: super::installation::InstallationConfig,
 
     /// System prompt configuration

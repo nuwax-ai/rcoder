@@ -76,8 +76,7 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<u
                 }
                 out.write_all(&buf[..n])?;
             }
-            // 不调用 sync_all() — 安装场景不需要每个文件都 fsync
-            // 数据会在进程结束后由 OS 自动刷盘
+            // 不逐文件 sync_all() — 解压完成后会对目标目录整体 sync 一次
 
             #[cfg(unix)]
             {
@@ -96,6 +95,13 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<u
                 entry_type, entry_path.display()
             );
         }
+    }
+
+    // 整体 sync 一次：保证所有文件数据落盘后再返回
+    // 避免进程被 kill 后目标目录中出现不完整的文件
+    if file_count > 0 {
+        let dir = File::open(dest_dir)?;
+        dir.sync_all()?;
     }
 
     Ok(file_count)
@@ -149,7 +155,7 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<usiz
             file_count += 1;
             let mut out = File::create(&dest_path)?;
             std::io::copy(&mut entry, &mut out)?;
-            // 不调用 sync_all() — 安装场景不需要每个文件都 fsync
+            // 不逐文件 sync_all() — 解压完成后会对目标目录整体 sync 一次
 
             #[cfg(unix)]
             if let Some(mode) = entry.unix_mode() {
@@ -162,6 +168,12 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<usiz
                 entry_name
             );
         }
+    }
+
+    // 整体 sync 一次：保证所有文件数据落盘后再返回
+    if file_count > 0 {
+        let dir = File::open(dest_dir)?;
+        dir.sync_all()?;
     }
 
     Ok(file_count)
@@ -540,9 +552,9 @@ mod tests {
         out.extend_from_slice(&header);
         out.extend_from_slice(data);
         let pad = (512 - (data.len() % 512)) % 512;
-        out.extend(std::iter::repeat(0u8).take(pad));
+        out.extend(std::iter::repeat_n(0u8, pad));
         // 2 个 512 字节的零块作为 EOF 标记
-        out.extend(std::iter::repeat(0u8).take(1024));
+        out.extend(std::iter::repeat_n(0u8, 1024));
         out
     }
 

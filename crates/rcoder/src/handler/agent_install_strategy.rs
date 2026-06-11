@@ -18,11 +18,30 @@
 //! 3. 在 `create_strategy` 中添加映射
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use shared_types::error_codes as ec;
-use shared_types::{AppError, ProjectAndContainerInfo, RoutingParams, ServiceType};
+use shared_types::{AppError, PlatformEntry, ProjectAndContainerInfo, RoutingParams, ServiceType};
+use tracing::{info, warn};
 
 use super::utils::{build_workspace_path, user_dir};
+
+/// Agent 自动安装请求参数
+///
+/// 将 `ensure_agent_installed` 的多个 agent 相关参数聚合为一个结构体，
+/// 避免函数参数过多（clippy::too_many_arguments）。
+pub struct AgentInstallRequest<'a> {
+    /// Agent 标识符（必填）
+    pub agent_id: &'a str,
+    /// 执行命令（必填）
+    pub command: &'a str,
+    /// 命令参数（可选，写入 registry 供 agent_runner 启动时使用）
+    pub args: &'a [String],
+    /// 期望版本号（必填，semver 格式）
+    pub version: &'a str,
+    /// 多平台下载地址（必填）
+    pub platforms: &'a std::collections::HashMap<String, PlatformEntry>,
+}
 
 /// 安装上下文
 ///
@@ -163,6 +182,130 @@ pub fn create_strategy(service_type: &ServiceType) -> Option<Box<dyn AgentInstal
         ServiceType::RCoder => Some(Box::new(RcoderStrategy)),
     }
 }
+
+// =============================================================================
+// Chat 接口自动安装
+// =============================================================================
+
+/// Chat 接口自动安装 agent
+///
+/// 在 chat handler 启动 agent 前调用。如果 agent_id + version 已在缓存中，
+/// 直接跳过（零延迟）。否则下载 → 复制到安装目录 → 更新 registry。
+pub async fn ensure_agent_installed(
+    state: &Arc<crate::router::AppState>,
+    project_id: &str,
+    request: &AgentInstallRequest<'_>,
+    service_type: &ServiceType,
+) -> Result<(), AppError> {
+    let t0 = std::time::Instant::now();
+    let download_manager = &state.agent_download_manager;
+    let agent_id = request.agent_id;
+    let version = request.version;
+
+    // 快速检查：缓存中已有该版本 → 跳过
+    if download_manager.is_cached(agent_id, version) {
+        info!(
+            "📦 [CHAT] Agent already cached, skipping install: agent_id={}, version={}, elapsed={:?}",
+            agent_id, version,
+            t0.elapsed()
+        );
+        return Ok(());
+    }
+
+    info!(
+        "📦 [CHAT] Agent not cached, starting auto-install: agent_id={}, version={}",
+        agent_id, version
+    );
+
+    // 1. 平台匹配
+    let sys_info = shared_types::SystemInfo::current();
+    let platform_key = normalize_platform_key(&sys_info.os, &sys_info.arch);
+    let platform_entry = request.platforms.get(&platform_key).ok_or_else(|| {
+        AppError::with_message(
+            shared_types::error_codes::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
+            format!(
+                "platform not found: {} (available: {:?})",
+                platform_key,
+                request.platforms.keys().collect::<Vec<_>>()
+            ),
+        )
+    })?;
+
+    // 2. 解析安装目录
+    let project = state
+        .get_project(project_id)
+        .ok_or_else(|| AppError::with_message(
+            shared_types::error_codes::ERR_PROJECT_NOT_FOUND,
+            format!("project not found: {}", project_id),
+        ))?;
+
+    let strategy = create_strategy(service_type).ok_or_else(|| {
+        AppError::with_message(
+            shared_types::error_codes::ERR_VALIDATION,
+            format!("agent installation not supported for service type: {:?}", service_type),
+        )
+    })?;
+
+    let routing = shared_types::RoutingParams {
+        project_id: Some(project_id.to_string()),
+        ..Default::default()
+    };
+    let install_ctx = strategy.resolve_install_context(&project, &routing)?;
+
+    // 3. 下载到缓存
+    download_manager
+        .download_to_cache(agent_id, version, &platform_entry.url)
+        .await
+        .map_err(|e| {
+            warn!("📦 [CHAT] Auto-install download failed: agent_id={}, version={}, error={}", agent_id, version, e);
+            AppError::with_message(
+                shared_types::error_codes::ERR_AGENT_MGMT_INSTALL_FAILED,
+                format!("auto-install download failed: {}", e),
+            )
+        })?;
+
+    // 4. 复制到安装目录
+    download_manager
+        .copy_to_target(agent_id, version, &install_ctx.install_dir)
+        .await
+        .map_err(|e| {
+            warn!("📦 [CHAT] Auto-install copy failed: agent_id={}, version={}, error={}", agent_id, version, e);
+            AppError::with_message(
+                shared_types::error_codes::ERR_AGENT_MGMT_INSTALL_FAILED,
+                format!("auto-install copy failed: {}", e),
+            )
+        })?;
+
+    // 5. 更新 registry
+    crate::agent_download::registry_update::update_registry(
+        &install_ctx.install_dir,
+        agent_id,
+        version,
+        request.command,
+        request.args,
+    )
+    .await
+    .map_err(|e| {
+        warn!("📦 [CHAT] Auto-install registry update failed: agent_id={}, version={}, error={}", agent_id, version, e);
+        AppError::with_message(
+            shared_types::error_codes::ERR_AGENT_MGMT_INSTALL_FAILED,
+            format!("auto-install registry update failed: {}", e),
+        )
+    })?;
+
+    info!(
+        "📦 [CHAT] Auto-install completed: agent_id={}, version={}, install_dir={}, elapsed={:?}",
+        agent_id,
+        version,
+        install_ctx.install_dir.display(),
+        t0.elapsed()
+    );
+
+    Ok(())
+}
+
+/// 归一化平台 key（代理到 shared_types）
+use shared_types::version_util::normalize_platform_key;
 
 // =============================================================================
 // 测试

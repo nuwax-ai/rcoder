@@ -110,6 +110,20 @@ pub fn convert_agent_server_config(
         } else {
             Some(grpc_config.metadata)
         },
+        version: grpc_config.version,
+        platforms: if grpc_config.platforms.is_empty() {
+            None
+        } else {
+            Some(
+                grpc_config
+                    .platforms
+                    .into_iter()
+                    .filter_map(|(k, bytes)| {
+                        serde_json::from_slice(&bytes).ok().map(|v| (k, v))
+                    })
+                    .collect(),
+            )
+        },
     })
 }
 

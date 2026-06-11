@@ -99,6 +99,10 @@ error.unknown_retry_error: "Unknown retry error"
 # SACP related
 error.sacp_session_id_send_failed: "Failed to send session ID"
 error.agent_process_abnormal_exit: "Agent process exited abnormally, please retry"
+error.agent_process_sigkilled: "Agent process killed by SIGKILL (signal 9), usually caused by OOM or resource limits. Please check container memory usage."
+error.agent_process_sigsegv: "Agent process crashed with SIGSEGV (segmentation fault), possibly due to memory access violation or stack overflow."
+error.agent_process_sigterm: "Agent process terminated by SIGTERM (signal 15)"
+error.agent_process_exit_code: "Agent process exited abnormally with exit code: {}"
 error.session_cancelled: "Session cancelled"
 error.cancel_response_timeout: "Response timeout after cancellation"
 error.agent_init_timeout: "Agent initialization timed out, please retry. Too many MCPs may cause timeout. If this persists, restart the agent computer (click the icon in the upper right corner of PC, then click [...] and select Restart Agent Computer)"
@@ -124,3 +128,41 @@ error.system_busy: "System is busy: concurrent Agent sessions reached limit ({})
 # Agent Management forwarding (P0-4)
 error.project_not_found: "Project not found or stopped"
 error.agent_runner_unavailable: "Agent Runner container is unavailable"
+
+# === gRPC service messages ===
+
+# Common (shared across cancel/stop)
+grpc.common.response_closed: "Response channel closed"
+grpc.common.agent_response_closed: "Agent response channel closed"
+grpc.common.notify_failed: "Failed to send cancel notification"
+grpc.common.timeout_30s: "Cancel request timed out (30 seconds)"
+
+# Cancel
+grpc.cancel.no_active_session: "Project has no active session"
+grpc.cancel.session_not_found: "Session does not exist or already completed"
+grpc.cancel.agent_idle: "Agent already in idle status"
+grpc.cancel.agent_stopping: "Agent is already stopping"
+grpc.cancel.channel_closed: "Cancel channel closed, Agent may have stopped"
+grpc.cancel.execution_failed: "Agent cancel execution failed"
+grpc.cancel.timeout_cleanup: "Cancel request timed out; resources were cleaned up"
+grpc.cancel.success: "Cancelled successfully"
+
+# Stop
+grpc.stop.requested: "Stop requested by user"
+grpc.stop.not_found: "Agent not found or already stopped for project:"
+grpc.stop.already_stopping_project: "Agent is already stopping for project:"
+grpc.stop.stopping_cleanup: "Agent is stopping (background cleanup in progress) for project:"
+grpc.stop.success: "Agent stopped successfully for project:"
+grpc.stop.cancel_session_failed: "Failed to cancel session"
+grpc.stop.unexpected: "Unexpected code path"
+
+# SubscribeProgress
+grpc.subscribe.create_connection_failed: "Failed to create connection"
+grpc.subscribe.user_cancelled: "Task cancelled by user"
+grpc.subscribe.no_active_task: "Agent has no active task"
+grpc.subscribe.idle_timeout: "Session idle timeout"
+
+# Status
+grpc.status.vnc_ready: "VNC service is ready"
+grpc.status.vnc_port_unreachable: "VNC marker exists, but noVNC port 6080 is unreachable"
+grpc.status.vnc_not_ready: "VNC service is not ready (starting or failed)"

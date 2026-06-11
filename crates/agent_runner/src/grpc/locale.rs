@@ -10,11 +10,3 @@ pub fn locale_from_grpc_request<T>(request: &tonic::Request<T>) -> &'static str 
             .and_then(|v| v.to_str().ok()),
     )
 }
-
-pub fn localized(locale: &'static str, zh_cn: &str, zh_tw: &str, en_us: &str) -> String {
-    match locale {
-        "zh-CN" => zh_cn.to_string(),
-        "zh-TW" => zh_tw.to_string(),
-        _ => en_us.to_string(),
-    }
-}

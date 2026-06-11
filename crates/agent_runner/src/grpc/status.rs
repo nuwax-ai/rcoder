@@ -12,7 +12,7 @@ use crate::model::AgentStatus;
 use crate::router::AppState;
 use crate::service::AGENT_REGISTRY;
 
-use super::locale::{locale_from_grpc_request, localized};
+use super::locale::locale_from_grpc_request;
 use super::utils::check_port_available;
 
 #[instrument(skip(_app_state, request))]
@@ -141,21 +141,11 @@ pub async fn get_vnc_status(
         let novnc_ready = file_exists && novnc_port_ready;
 
         let message = if vnc_ready && novnc_ready {
-            localized(locale, "VNC 服务已就绪", "VNC 服務已就緒", "VNC service is ready")
+            shared_types_i18n::get_i18n_message("grpc.status.vnc_ready", locale)
         } else if file_exists && !novnc_port_ready {
-            localized(
-                locale,
-                "VNC 标记存在，但 noVNC 端口 6080 不可达",
-                "VNC 標記存在，但 noVNC 埠 6080 無法連線",
-                "VNC marker exists, but noVNC port 6080 is unreachable",
-            )
+            shared_types_i18n::get_i18n_message("grpc.status.vnc_port_unreachable", locale)
         } else {
-            localized(
-                locale,
-                "VNC 服务未就绪（启动中或启动失败）",
-                "VNC 服務尚未就緒（啟動中或啟動失敗）",
-                "VNC service is not ready (starting or failed)",
-            )
+            shared_types_i18n::get_i18n_message("grpc.status.vnc_not_ready", locale)
         };
 
         let uptime_seconds = get_uptime_seconds();

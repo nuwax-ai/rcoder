@@ -269,6 +269,8 @@ where
                 agent_mode: Some(format!("{:?}", self.agent_mode).to_lowercase()),
                 tool_approval_rules: self.tool_approval_rules.clone(),
                 metadata: None,
+                version: None,
+                platforms: None,
             })
         } else {
             None

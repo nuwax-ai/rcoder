@@ -300,10 +300,10 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     "[SACP] 🔒 Setting default OPENCODE_PERMISSION for nuwaxcode (agent_mode={:?}): {}",
                     start_config.agent_mode, permission_config
                 );
-            } else {
+            } else if let Some(perm) = merged_envs.get(ENV_OPENCODE_PERMISSION) {
                 info!(
                     "[SACP] 🔒 Using request-provided OPENCODE_PERMISSION: {}",
-                    merged_envs.get(ENV_OPENCODE_PERMISSION).unwrap()
+                    perm
                 );
             }
         }
@@ -372,10 +372,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             ENV_CODEX_API_KEY,
             "ANTHROPIC_AUTH_TOKEN",
         ];
-        let mut env_keys: Vec<_> = merged_envs.keys().collect();
-        env_keys.sort();
-        for key in &env_keys {
-            let value = merged_envs.get(*key).unwrap();
+        let mut env_entries: Vec<_> = merged_envs.iter().collect();
+        env_entries.sort_by_key(|(k, _)| *k);
+        for (key, value) in &env_entries {
             if SENSITIVE_ENV_KEYS.contains(&key.as_str()) {
                 // 脱敏：只显示前4个字符 + ***
                 let masked = if value.len() > 4 {
@@ -490,6 +489,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // SACP 连接层可以检测此标志并发送相应的错误通知
         let abnormal_exit_flag = Arc::new(AtomicBool::new(false));
 
+        // 🔥 新增：详细的退出信息（signal、exit_code），用于生成更有意义的错误消息
+        let exit_detail = Arc::new(tokio::sync::Mutex::new(None::<crate::launcher::lifecycle::ExitDetail>));
+
         // 共享的 session_id，用于连接失败时发送错误通知
         let session_id_shared = Arc::new(std::sync::Mutex::new(None::<String>));
 
@@ -503,6 +505,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let notifier_clone = self.notifier.clone();
         let permission_handler_clone = self.permission_handler.clone();
         let abnormal_exit_flag_clone = abnormal_exit_flag.clone();
+        let exit_detail_clone = exit_detail.clone();
         let session_id_shared_clone = session_id_shared.clone();
         let connection_error_clone = connection_error_shared.clone();
         let error_notifier = self.notifier.clone();
@@ -537,6 +540,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 notifier: notifier_clone,
                 permission_handler: permission_handler_clone,
                 abnormal_exit_flag: abnormal_exit_flag_clone,
+                exit_detail: exit_detail_clone,
                 session_id_shared: session_id_shared_clone,
                 connection_failed_tx: connection_failed_tx.take(),
                 child_pid,
@@ -736,6 +740,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 project_uuid_map: None,
                 service_uuid: None,
                 abnormal_exit_flag: Some(abnormal_exit_flag),
+                exit_detail: Some(exit_detail),
                 diagnostics_listener: self.diagnostics_listener.clone(),
                 process_command: command_path,
                 process_args: command_args,

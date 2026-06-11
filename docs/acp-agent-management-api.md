@@ -204,25 +204,43 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/list \
 #### 查询单个 agent(POST + JSON body)
 
 ```bash
+# 查询最新版本
 curl -X POST http://localhost:8087/agent-mgmt/agents/get \
   -H "Content-Type: application/json" \
   -d '{"project_id": "p1", "agent_id": "codex-acp"}'
+
+# 查询指定版本
+curl -X POST http://localhost:8087/agent-mgmt/agents/get \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "p1", "agent_id": "codex-acp", "version": "1.0.0"}'
 ```
 
 #### 健康检查(POST + JSON body)
 
 ```bash
+# 检查最新版本
 curl -X POST http://localhost:8087/agent-mgmt/agents/check \
   -H "Content-Type: application/json" \
   -d '{"project_id": "p1", "agent_id": "codex-acp"}'
+
+# 检查指定版本
+curl -X POST http://localhost:8087/agent-mgmt/agents/check \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "p1", "agent_id": "codex-acp", "version": "1.0.0"}'
 ```
 
 #### 卸载(POST + JSON body)
 
 ```bash
+# 卸载全部版本
 curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
   -H "Content-Type: application/json" \
   -d '{"project_id": "p1", "agent_id": "codex-acp"}'
+
+# 只卸载指定版本
+curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "p1", "agent_id": "codex-acp", "version": "1.0.0"}'
 ```
 
 #### 从 URL 安装(POST + JSON body, 多平台 + 版本检查)
@@ -398,6 +416,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 {
   "project_id": "demo-project-001",
   "agent_id": "codex-acp",
+  "version": null,
   "user_id": null,
   "pod_id": null,
   "tenant_id": null,
@@ -412,6 +431,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 |------|------|------|------|
 | project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
 | agent_id | string | 是 | Agent 标识符 |
+| version | string? | 否 | 可选版本号，不传则检查最新版本；传值则只检查指定版本 |
 | user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式） |
 | pod_id | string | 否 | Pod ID |
 | tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
@@ -906,7 +926,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 > 以下仅展示 `data` 字段内容，省略外层 HttpResult 包装。
 
-**响应 - 实际安装/更新（新模式）**:
+**响应 - 新版本安装（多版本并存）**:
 
 ```json
 {
@@ -914,7 +934,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
   "status": "available",
   "action": "installed",
   "installed": true,
-  "binary_path": "/home/user/acp-agent/bin/codex-acp",
+  "binary_path": "/home/user/acp-agent/codex-acp/1.2.0/codex-acp",
   "file_type": "tar.gz",
   "file_count": 3,
   "file_size": 15728640,
@@ -925,7 +945,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 }
 ```
 
-**响应 - 跳过安装（版本已是最新）**:
+**响应 - 跳过安装（精确版本已存在）**:
 
 ```json
 {
@@ -933,7 +953,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
   "status": "available",
   "action": "skipped",
   "installed": false,
-  "binary_path": "/home/user/acp-agent/bin/codex-acp",
+  "binary_path": "/home/user/acp-agent/codex-acp/1.2.0/codex-acp",
   "file_type": "tar.gz",
   "file_count": null,
   "file_size": 0,
@@ -944,20 +964,33 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 }
 ```
 
-**响应 - 更新（从旧版本升级）**:
+**响应 - v 前缀归一化（"v1.2.0" 和 "1.2.0" 视为同一版本）**:
 
 ```json
+// 已安装 "1.2.0"，再次请求 "v1.2.0" → skipped
+{
+  "agent_id": "codex-acp",
+  "action": "skipped",
+  "version": "v1.2.0",
+  "previous_version": "v1.2.0"
+}
+```
+
+**响应 - 新版本并存安装（旧版本保留）**:
+
+```json
+// 已有 v1.1.0，请求 v1.2.0 → 新安装（两个版本并存）
 {
   "agent_id": "codex-acp",
   "status": "available",
-  "action": "updated",
+  "action": "installed",
   "installed": true,
-  "binary_path": "/home/user/acp-agent/bin/codex-acp",
+  "binary_path": "/home/user/acp-agent/codex-acp/1.2.0/codex-acp",
   "file_type": "tar.gz",
   "file_count": 3,
   "file_size": 15728640,
   "version": "1.2.0",
-  "previous_version": "1.1.0",
+  "previous_version": null,
   "platform": "linux-x86_64",
   "source_url": "https://cdn.example.com/agents/codex-acp/1.2.0/codex-acp-linux-amd64.tar.gz"
 }
@@ -969,7 +1002,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 |------|------|------|
 | agent_id | string | Agent 标识符 |
 | status | `"available"` \| `"broken"` \| `"not_installed"` \| `"unknown"` | 安装后状态 |
-| action | `"installed"` \| `"updated"` \| `"skipped"` | 本次操作类型 |
+| action | `"installed"` \| `"skipped"` | 本次操作类型（多版本并存模式：精确版本不存在 → installed，已存在 → skipped） |
 | installed | boolean | 本次是否实际执行了下载安装（`action != "skipped"`） |
 | binary_path | string | 可执行文件路径 |
 | file_type | `"executable"` \| `"tar.gz"` \| `"zip"` \| `"npm"` | 检测到的文件类型 |
@@ -980,26 +1013,25 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 | platform | string? | 实际匹配的平台 key（跳过时为 null） |
 | source_url | string? | 实际下载的 URL（跳过时为 null） |
 
-#### 处理流程（新模式: platforms + version）
+#### 处理流程（多版本并存模式: platforms + version）
 
 ```
 1. 验证参数
    - agent_id, command 必填
-   - version 必填（platforms 模式）
+   - version 必填（platforms 模式），必须是合法 semver（如 "1.0.0"、"v2.1.3"）
    - platforms 不能为空
    - 每个 platform entry 的 url 必须是 http:// 或 https://
 2. 定位目标容器（project_id / user_id / pod_id + 隔离字段）
-3. 版本检查（幂等核心）:
-   a. 查询注册表 registry.json → agent 是否已安装?
-   b. 未安装 → action = "installed"
-   c. 已安装 → semver 比较:
-      - installed_version < requested_version → action = "updated"
-      - installed_version >= requested_version → action = "skipped"
-      - 版本格式不规范,比较失败 → action = "updated"（保守策略,确保更新）
+3. 版本检查（幂等核心，精确版本匹配）:
+   a. 查询注册表 registry.json → 该精确版本是否已安装?
+      - version 归一化处理：去除 v/V 前缀、trim 空格
+      - "v1.0.0" 和 "1.0.0" 视为同一版本
+   b. 精确版本已安装 → action = "skipped"（直接返回，不下载）
+   c. 精确版本未安装 → action = "installed"（新版本并存安装）
 4. 如果 action == "skipped":
    - 直接返回现有 agent 信息（不下载,不替换）
    - installed = false, previous_version = version
-5. 如果 action == "installed" 或 "updated":
+5. 如果 action == "installed":
    a. 获取当前系统平台: SystemInfo { os, arch }
    b. 归一化: amd64 → x86_64, arm64 → aarch64
    c. 构造 key: "{os}-{arch}" (如 "linux-x86_64")
@@ -1047,6 +1079,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 {
   "project_id": "p1",
   "agent_id": "codex-acp",
+  "version": null,
   "user_id": null,
   "pod_id": null,
   "tenant_id": null,
@@ -1061,13 +1094,14 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 |------|------|------|------|
 | project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
 | agent_id | string | 是 | Agent 标识符 |
+| version | string? | 否 | 可选版本号，不传则卸载全部版本；传值则只卸载指定版本（向后兼容） |
 | user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式） |
 | pod_id | string | 否 | Pod ID |
 | tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
 | space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
 | isolation_type | string | 条件必填 | 隔离类型（pod_id 有值时必填） |
 
-#### 响应
+#### 响应 - 卸载全部版本
 
 > 以下仅展示 `data` 字段内容，省略外层 HttpResult 包装。
 
@@ -1076,6 +1110,16 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
   "agent_id": "codex-acp",
   "uninstalled": true,
   "install_type": "binary"
+}
+```
+
+#### 响应 - 卸载指定版本
+
+```json
+{
+  "agent_id": "codex-acp",
+  "uninstalled": true,
+  "install_type": "url"
 }
 ```
 
@@ -1091,12 +1135,15 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 ```
 1. 读取 registry.json，检查是否有记录
+   - version 有值 → 查找指定版本
+   - version 无值 → 查找最新版本（向后兼容）
 2. builtin 类型拒绝卸载（返回 ERR_AGENT_MGMT_BUILTIN_PROTECTED）
 3. 安全检查：binary_path 必须在安装目录下（防止 manifest 被篡改后删除系统文件）
-4. 删除入口二进制/符号链接
-5. 清理 agent 子目录（若有残留的 tar/zip 解压文件）
-6. 从注册表移除记录
-7. 返回卸载结果
+4. 删除操作：
+   - version 有值 → 只删除 {install_dir}/{agent_id}/{version}/ 目录 + 注册表移除该版本
+   - version 无值 → 删除整个 {install_dir}/{agent_id}/ 目录 + 注册表移除所有版本
+5. 如果删除指定版本后 agent 无剩余版本，自动清理空的父目录
+6. 返回卸载结果
 ```
 
 #### 错误场景
@@ -1316,10 +1363,11 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/check \
 # → { "agent": { "installed": true, "status": "available", "static_checks": { ... } } }
 ```
 
-### 5.4 场景四：通过 URL 安装 Agent（多平台 + 自动版本管理）
+### 5.4 场景四：通过 URL 安装 Agent（多平台 + 多版本并存）
 
-Agent 发布在 GitHub Releases 或 OSS 上时，业务方每次调用 `install-from-url`，传入最新版本号和多平台 URL。
-agent-runner 自动判断：版本相同则跳过下载，版本更新则自动下载安装。
+Agent 发布在 GitHub Releases 或 OSS 上时，业务方每次调用 `install-from-url`，传入版本号和多平台 URL。
+agent-runner 自动判断：精确版本已存在则跳过下载（幂等），不存在则安装（多版本并存）。
+版本号归一化处理：`v1.0.0` 和 `1.0.0` 视为同一版本。
 
 #### 5.4.1 首次安装（agent 未安装）
 
@@ -1365,10 +1413,10 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
 #   不下载，直接返回现有 agent 信息（零延迟）
 ```
 
-#### 5.4.3 版本更新（自动升级）
+#### 5.4.3 新版本并存安装
 
 ```bash
-# version 从 1.2.0 升到 1.3.0
+# 已有 v1.2.0，再安装 v1.3.0（两个版本并存，旧版本不删除）
 curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
   -H "Content-Type: application/json" \
   -d '{
@@ -1389,8 +1437,8 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install-from-url \
       }
     }
   }'
-# → action: "updated", installed: true, version: "1.3.0", previous_version: "1.2.0"
-#   自动下载新版本，替换旧二进制
+# → action: "installed", installed: true, version: "1.3.0", previous_version: null
+#   新版本安装到独立目录，v1.2.0 保留不变
 ```
 
 #### 5.4.4 Java 业务方典型调用模式
@@ -1413,9 +1461,9 @@ InstallResponse resp = httpClient.post("/agent-mgmt/agents/install-from-url", Ma
 
 // 无需 check → install 两步操作，一个接口搞定
 if (resp.action.equals("skipped")) {
-    // agent 已是最新，直接使用
+    // 该精确版本已安装，直接使用
 } else {
-    // installed / updated，agent 已就绪
+    // installed，新版本已就绪（旧版本仍保留）
 }
 ```
 
@@ -1440,11 +1488,17 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/list \
 ### 5.6 场景六：卸载 Agent
 
 ```bash
-# 卸载 codex-acp
+# 卸载 codex-acp（全部版本）
 curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
   -H "Content-Type: application/json" \
   -d '{"project_id": "p1", "agent_id": "codex-acp"}'
 # → { "uninstalled": true, "agent_id": "codex-acp", "install_type": "binary" }
+
+# 只卸载指定版本（保留其他版本）
+curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
+  -H "Content-Type: application/json" \
+  -d '{"project_id": "p1", "agent_id": "codex-acp", "version": "1.0.0"}'
+# → { "uninstalled": true, "agent_id": "codex-acp", "install_type": "url" }
 
 # 尝试卸载内置 Agent（被拒绝）
 curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
@@ -1467,12 +1521,12 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
 | 方法 | 路径 | Body | 转发到 |
 |------|------|------|--------|
 | POST | `/agent-mgmt/agents/list`             | `ListAgentsRequest` JSON:`{project_id?, user_id?, pod_id?, ...}` | `AgentMgmtService.ListAgents` |
-| POST | `/agent-mgmt/agents/get`              | `GetAgentRequest` JSON:`{project_id?, agent_id, user_id?, pod_id?, ...}` | `AgentMgmtService.GetAgent` |
-| POST | `/agent-mgmt/agents/check`            | `CheckAgentRequest` JSON:`{project_id?, agent_id, user_id?, pod_id?, ...}` | `AgentMgmtService.CheckAgent` |
+| POST | `/agent-mgmt/agents/get`              | `GetAgentRequest` JSON:`{project_id?, agent_id, version?, user_id?, pod_id?, ...}` | `AgentMgmtService.GetAgent` |
+| POST | `/agent-mgmt/agents/check`            | `CheckAgentRequest` JSON:`{project_id?, agent_id, version?, user_id?, pod_id?, ...}` | `AgentMgmtService.CheckAgent` |
 | POST | `/agent-mgmt/agents/install`          | `multipart/form-data`:`file`(binary) + `metadata`(JSON 字符串) | `AgentMgmtService.InstallAgent` (client streaming) |
 | POST | `/agent-mgmt/agents/install-from-url` | `InstallFromUrlRequest` JSON:`{project_id?, agent_id, command, version, platforms, args?, user_id?, ...}` | `AgentMgmtService.InstallAgent` (metadata only, 版本检查+多平台自动匹配) |
 | POST | `/agent-mgmt/agents/install-from-npm` | `InstallFromPackageManagerRequest` JSON:`{project_id?, agent_id, command, package, user_id?, ...}` | `AgentMgmtService.InstallAgent` (metadata only) |
-| POST | `/agent-mgmt/agents/uninstall`        | `UninstallAgentRequest` JSON:`{project_id?, agent_id, user_id?, pod_id?, ...}` | `AgentMgmtService.UninstallAgent` |
+| POST | `/agent-mgmt/agents/uninstall`        | `UninstallAgentRequest` JSON:`{project_id?, agent_id, version?, user_id?, pod_id?, ...}` | `AgentMgmtService.UninstallAgent` |
 
 > **`...`** 表示共享的 `RoutingParams` 字段：`user_id`, `pod_id`, `tenant_id`, `space_id`, `isolation_type`。
 > 所有端点的请求体都通过 `#[serde(flatten)]` 嵌入 `RoutingParams`（定义在 `shared_types`），`project_id` 在 `RoutingParams` 内，优先路由，无 `project_id` 时按 `pod_id`/`user_id` 定位容器。
@@ -1643,25 +1697,25 @@ pub struct ListInstalledAgentsRequest {
 }
 
 /// 检查 Agent 状态请求
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CheckAgentStatusRequest {
-    pub user_id: String,
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct CheckAgentRequest {
+    #[serde(flatten)]
+    pub routing: RoutingParams,
     pub agent_id: String,
-    pub pod_id: Option<String>,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
+    /// 可选版本号，不传则检查最新版本
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// 卸载 Agent 请求
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct UninstallAgentRequest {
-    pub user_id: String,
+    #[serde(flatten)]
+    pub routing: RoutingParams,
     pub agent_id: String,
-    pub pod_id: Option<String>,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
+    /// 可选版本号，不传则卸载全部版本
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// 二进制安装请求（multipart/form-data 字段）
@@ -2066,6 +2120,7 @@ message AgentInfoProto {
 
 message CheckAgentStatusRequest {
     string agent_id = 1;
+    optional string version = 2;    // 可选版本号，不传则检查最新版本
 }
 
 message CheckAgentStatusResponse {
@@ -2157,6 +2212,7 @@ message InstallAgentResult {
 
 message UninstallAgentRequest {
     string agent_id = 1;
+    optional string version = 2;    // 可选版本号，不传则卸载全部版本
 }
 
 message UninstallAgentResponse {

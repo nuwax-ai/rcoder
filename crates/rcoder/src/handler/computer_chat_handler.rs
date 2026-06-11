@@ -425,6 +425,77 @@ pub async fn handle_computer_chat(
         project_id
     );
 
+    // 自动安装检查：如果 agent_server 携带 platforms，必须同时提供 agent_id、command、version
+    // 内置 agent（容器预装）跳过安装逻辑
+    if let Some(ref agent_config) = request.agent_config
+        && let Some(ref server) = agent_config.agent_server
+        && let Some(ref platforms) = server.platforms
+    {
+        // agent_id 必填且非空
+        let agent_id = match server.agent_id.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(id) => id,
+            None => {
+                error!("[COMPUTER_CHAT] Validation failed: agent_id is required when platforms is provided");
+                return Ok(HttpResult::error_with_message(
+                    shared_types::error_codes::ERR_VALIDATION,
+                    locale,
+                    "agent_id is required and cannot be empty when platforms is provided",
+                ));
+            }
+        };
+
+        if !shared_types::is_builtin_agent(agent_id) {
+            let command = match server.command.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(c) => c,
+                None => {
+                    error!("[COMPUTER_CHAT] Validation failed: command is required when platforms is provided");
+                    return Ok(HttpResult::error_with_message(
+                        shared_types::error_codes::ERR_VALIDATION,
+                        locale,
+                        "command is required and cannot be empty when platforms is provided",
+                    ));
+                }
+            };
+            let version = match server.version.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(v) => v,
+                None => {
+                    error!("[COMPUTER_CHAT] Validation failed: version is required when platforms is provided");
+                    return Ok(HttpResult::error_with_message(
+                        shared_types::error_codes::ERR_VALIDATION,
+                        locale,
+                        "version is required and cannot be empty when platforms is provided",
+                    ));
+                }
+            };
+            let args = server.args.as_deref().unwrap_or(&[]);
+
+            info!(
+                "📦 [COMPUTER_CHAT] Auto-install: agent_id={}, version={}, args={:?}",
+                agent_id, version, args
+            );
+
+            let install_req = super::agent_install_strategy::AgentInstallRequest {
+                agent_id,
+                command,
+                args,
+                version,
+                platforms,
+            };
+            super::agent_install_strategy::ensure_agent_installed(
+                &state,
+                &project_id,
+                &install_req,
+                &shared_types::ServiceType::ComputerAgentRunner,
+            )
+            .await?;
+        } else {
+            debug!(
+                "📦 [COMPUTER_CHAT] Builtin agent detected, skipping install: agent_id={}",
+                agent_id
+            );
+        }
+    }
+
     // 5. 创建项目工作目录（在用户容器内）
     // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
     // 使用 ? 传播 AppError：验证错误 → HTTP 400，I/O 错误 → HTTP 500

@@ -296,6 +296,77 @@ pub async fn handle_chat(
     state.update_activity(&project_id);
     debug!("[CHAT] Updated activity time: project_id={}", project_id);
 
+    // 自动安装检查：如果 agent_server 携带 platforms，必须同时提供 agent_id、command、version
+    // 内置 agent（容器预装）跳过安装逻辑
+    if let Some(ref agent_config) = request.agent_config
+        && let Some(ref server) = agent_config.agent_server
+        && let Some(ref platforms) = server.platforms
+    {
+        // agent_id 必填且非空
+        let agent_id = match server.agent_id.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(id) => id,
+            None => {
+                error!("[CHAT] Validation failed: agent_id is required when platforms is provided");
+                return Ok(HttpResult::error_with_message(
+                    shared_types::error_codes::ERR_VALIDATION,
+                    locale,
+                    "agent_id is required and cannot be empty when platforms is provided",
+                ));
+            }
+        };
+
+        if !shared_types::is_builtin_agent(agent_id) {
+            let command = match server.command.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(c) => c,
+                None => {
+                    error!("[CHAT] Validation failed: command is required when platforms is provided");
+                    return Ok(HttpResult::error_with_message(
+                        shared_types::error_codes::ERR_VALIDATION,
+                        locale,
+                        "command is required and cannot be empty when platforms is provided",
+                    ));
+                }
+            };
+            let version = match server.version.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(v) => v,
+                None => {
+                    error!("[CHAT] Validation failed: version is required when platforms is provided");
+                    return Ok(HttpResult::error_with_message(
+                        shared_types::error_codes::ERR_VALIDATION,
+                        locale,
+                        "version is required and cannot be empty when platforms is provided",
+                    ));
+                }
+            };
+            let args = server.args.as_deref().unwrap_or(&[]);
+
+            info!(
+                "📦 [CHAT] Auto-install: agent_id={}, version={}, args={:?}",
+                agent_id, version, args
+            );
+
+            let install_req = super::agent_install_strategy::AgentInstallRequest {
+                agent_id,
+                command,
+                args,
+                version,
+                platforms,
+            };
+            super::agent_install_strategy::ensure_agent_installed(
+                &state,
+                &project_id,
+                &install_req,
+                &service_type,
+            )
+            .await?;
+        } else {
+            debug!(
+                "📦 [CHAT] Builtin agent detected, skipping install: agent_id={}",
+                agent_id
+            );
+        }
+    }
+
     // 🆕 自动查找 session_id 逻辑
     // 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id
     let session_id_to_use = match &request.session_id {
