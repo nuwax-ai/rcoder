@@ -110,11 +110,11 @@ docker_config:
       computer-agent-runner:
         service_type: "ComputerAgentRunner"
         # 🎯 使用本地构建的镜像（make docker-build-agent-runner 构建）
-        image: "dev-computer-agent-runner:latest"
-        arm64_image: "dev-computer-agent-runner:latest"
-        amd64_image: "dev-computer-agent-runner:latest"
-        default_image: "dev-computer-agent-runner:latest"
-        image_tag_prefix: "dev-computer-agent-runner"
+        image: "dev-rcoder-agent-runner:latest"
+        arm64_image: "dev-rcoder-agent-runner:latest"
+        amd64_image: "dev-rcoder-agent-runner:latest"
+        default_image: "dev-rcoder-agent-runner:latest"
+        image_tag_prefix: "dev-rcoder-agent-runner"
         enabled: true
 
         # rcoder 容器内用于反向解析宿主机路径的基准路径

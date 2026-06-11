@@ -131,6 +131,7 @@ docker-build-agent-runner:
 	fi; \
 	cd docker/rcoder-agent-runner && \
 		docker buildx build --platform linux/$(DOCKER_HOST_ARCH) --load \
+			--build-arg BASE_IMAGE=dev-rcoder-agent-base:latest \
 			--build-arg CACHEBUST=$$(date +%s) \
 			--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
 			--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
