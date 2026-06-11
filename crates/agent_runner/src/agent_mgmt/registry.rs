@@ -67,6 +67,11 @@ impl AgentRegistry {
         self.path_manager.install_dir()
     }
 
+    /// 访问内部 PathManager（用于构造 agent_dir / version_dir 路径）
+    pub fn path_manager(&self) -> &PathManager {
+        &self.path_manager
+    }
+
     /// 内存中创建空注册表(用于测试)
     pub fn empty(path_manager: PathManager) -> Self {
         Self {
@@ -110,7 +115,6 @@ impl AgentRegistry {
     }
 
     /// 获取 agent 的所有版本
-    /// TODO: per-version uninstall 实现时移除 cfg(test)
     #[cfg(test)]
     pub fn get_all_versions(&self, agent_id: &str) -> Vec<AgentManifest> {
         let guard = self.inner.lock();
@@ -181,8 +185,6 @@ impl AgentRegistry {
     }
 
     /// 删除指定版本(立即落盘)
-    /// TODO: per-version uninstall 实现时移除 cfg(test)
-    #[cfg(test)]
     pub fn remove_version(&self, agent_id: &str, version: &str) -> AgentMgmtResult<AgentManifest> {
         let mut guard = self.inner.lock();
         let vkey = version_key(Some(version));

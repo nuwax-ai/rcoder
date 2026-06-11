@@ -589,6 +589,8 @@ pub struct ListAgentsResponse {
 pub struct CheckAgentRequest {
     #[prost(string, tag = "1")]
     pub agent_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CheckAgentResponse {
@@ -601,6 +603,8 @@ pub struct CheckAgentResponse {
 pub struct GetAgentRequest {
     #[prost(string, tag = "1")]
     pub agent_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetAgentResponse {
@@ -614,6 +618,8 @@ pub struct GetAgentResponse {
 pub struct UninstallAgentRequest {
     #[prost(string, tag = "1")]
     pub agent_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UninstallAgentResponse {
@@ -623,6 +629,8 @@ pub struct UninstallAgentResponse {
     pub install_type: i32,
     #[prost(string, tag = "3")]
     pub agent_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "5")]
+    pub removed_versions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// 上传 binary 用的 streaming request
 /// 首包携带 metadata,后续包只携带 data

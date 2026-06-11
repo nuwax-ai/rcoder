@@ -35,6 +35,21 @@ use super::path_manager::PathManager;
 use super::registry::AgentRegistry;
 use super::uninstaller;
 
+/// 根据可选 version 解析 manifest
+///
+/// - version 为 Some 且非空 → 查询指定版本
+/// - version 为 None 或空 → 返回最新版本
+fn resolve_manifest(
+    registry: &AgentRegistry,
+    agent_id: &str,
+    version: Option<&str>,
+) -> Option<super::installer::AgentManifest> {
+    match version {
+        Some(v) if !v.is_empty() => registry.get_version(agent_id, v),
+        _ => registry.get(agent_id),
+    }
+}
+
 /// gRPC 服务实现
 pub struct AgentMgmtServiceImpl {
     pub registry: Arc<AgentRegistry>,
@@ -255,23 +270,34 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
         &self,
         request: Request<UninstallAgentRequest>,
     ) -> Result<Response<UninstallAgentResponse>, Status> {
-        let agent_id = request.into_inner().agent_id;
-        let removed = uninstaller::uninstall(&self.registry, &agent_id)
-            .await
-            .map_err(|e| {
-                warn!("[agent_mgmt] uninstall_agent failed: {e}");
-                Self::to_status(e)
-            })?;
+        let inner = request.into_inner();
+        let agent_id = inner.agent_id;
+        let version = inner.version;
+
+        let removed = uninstaller::uninstall_with_version(
+            &self.registry, &agent_id, version.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            warn!("[agent_mgmt] uninstall_agent failed: {e}");
+            Self::to_status(e)
+        })?;
 
         let first = removed.first().ok_or_else(|| {
             error!(agent_id = %agent_id, "[agent_mgmt] uninstall returned empty list");
             Status::internal("uninstall succeeded but no manifests returned")
         })?;
 
+        let removed_versions: Vec<String> = removed
+            .iter()
+            .filter_map(|m| m.version.clone())
+            .collect();
+
         Ok(Response::new(UninstallAgentResponse {
             uninstalled: true,
             install_type: conversion::install_type_to_proto(first.install_type) as i32,
             agent_id,
+            removed_versions,
         }))
     }
 
@@ -280,8 +306,8 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
         &self,
         request: Request<CheckAgentRequest>,
     ) -> Result<Response<CheckAgentResponse>, Status> {
-        let agent_id = request.into_inner().agent_id;
-        let manifest = self.registry.get(&agent_id);
+        let inner = request.into_inner();
+        let manifest = resolve_manifest(&self.registry, &inner.agent_id, inner.version.as_deref());
 
         let checker = AgentChecker::new(self.path_manager.clone());
         let detail = checker.detail_info(manifest.as_ref());
@@ -298,8 +324,8 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
         &self,
         request: Request<GetAgentRequest>,
     ) -> Result<Response<GetAgentResponse>, Status> {
-        let agent_id = request.into_inner().agent_id;
-        let manifest = self.registry.get(&agent_id);
+        let inner = request.into_inner();
+        let manifest = resolve_manifest(&self.registry, &inner.agent_id, inner.version.as_deref());
 
         match manifest {
             Some(m) => {

@@ -494,6 +494,7 @@ message ListAgentsResponse {
 
 message CheckAgentRequest {
   string agent_id = 1;
+  optional string version = 2;
 }
 
 message CheckAgentResponse {
@@ -503,6 +504,7 @@ message CheckAgentResponse {
 
 message GetAgentRequest {
   string agent_id = 1;
+  optional string version = 2;
 }
 
 message GetAgentResponse {
@@ -512,12 +514,14 @@ message GetAgentResponse {
 
 message UninstallAgentRequest {
   string agent_id = 1;
+  optional string version = 4;
 }
 
 message UninstallAgentResponse {
   bool uninstalled = 1;
   InstallType install_type = 2;
   string agent_id = 3;
+  repeated string removed_versions = 5;
 }
 
 // 上传 binary 用的 streaming request

@@ -30,6 +30,18 @@ use crate::agent_mgmt::{
 };
 use shared_types::{InstallType, ListAgentsRequest};
 
+/// 根据可选 version 解析 manifest
+fn resolve_manifest(
+    registry: &AgentRegistry,
+    agent_id: &str,
+    version: Option<&str>,
+) -> Option<crate::agent_mgmt::installer::AgentManifest> {
+    match version {
+        Some(v) if !v.is_empty() => registry.get_version(agent_id, v),
+        _ => registry.get(agent_id),
+    }
+}
+
 /// HTTP 应用状态扩展:把 agent_mgmt 所需依赖打包成一个 state
 #[derive(Clone)]
 pub struct AgentMgmtHttpState {
@@ -379,17 +391,23 @@ pub async fn uninstall_agent(
     Json(req): Json<shared_types::UninstallAgentRequest>,
 ) -> Response {
     let result = async {
-        let removed = uninstaller::uninstall(&state.registry, &req.agent_id).await?;
+        let removed = uninstaller::uninstall_with_version(
+            &state.registry, &req.agent_id, req.version.as_deref(),
+        ).await?;
 
         let first = removed.first().ok_or_else(|| {
             tracing::error!(agent_id = %req.agent_id, "[agent_mgmt] uninstall returned empty list");
             AgentMgmtError::InstallFailed("uninstall succeeded but no manifests returned".to_string())
         })?;
 
+        let removed_versions: Vec<String> = removed.iter()
+            .filter_map(|m| m.version.clone()).collect();
+
         Ok(shared_types::UninstallAgentResponse {
             uninstalled: true,
             install_type: first.install_type,
             agent_id: req.agent_id,
+            removed_versions,
         })
     }
     .await;
@@ -422,7 +440,7 @@ pub async fn check_agent(
     State(state): State<AgentMgmtHttpState>,
     Json(req): Json<shared_types::CheckAgentRequest>,
 ) -> Response {
-    let manifest = state.registry.get(&req.agent_id);
+    let manifest = resolve_manifest(&state.registry, &req.agent_id, req.version.as_deref());
     let checker = AgentChecker::new(state.path_manager.clone());
     let detail = checker.detail_info(manifest.as_ref());
     Json(HttpResult::success(detail)).into_response()
@@ -450,7 +468,7 @@ pub async fn get_agent(
     State(state): State<AgentMgmtHttpState>,
     Json(req): Json<shared_types::GetAgentRequest>,
 ) -> Response {
-    let manifest = state.registry.get(&req.agent_id);
+    let manifest = resolve_manifest(&state.registry, &req.agent_id, req.version.as_deref());
     match manifest {
         Some(m) => {
             let checker = AgentChecker::new(state.path_manager.clone());

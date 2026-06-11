@@ -225,6 +225,10 @@ pub struct CheckAgentRequest {
     /// Agent ID
     #[schema(example = "codex-acp")]
     pub agent_id: String,
+    /// 可选版本号，不传则返回最新版本
+    #[serde(default)]
+    #[schema(example = "1.0.0")]
+    pub version: Option<String>,
 }
 
 /// 查询单个 Agent 详情的请求
@@ -244,6 +248,10 @@ pub struct GetAgentRequest {
     /// Agent ID
     #[schema(example = "codex-acp")]
     pub agent_id: String,
+    /// 可选版本号，不传则返回最新版本
+    #[serde(default)]
+    #[schema(example = "1.0.0")]
+    pub version: Option<String>,
 }
 
 /// 检查指定 Agent 状态的响应
@@ -549,6 +557,10 @@ pub struct UninstallAgentRequest {
     /// Agent ID(要卸载的 agent 标识)
     #[schema(example = "codex-acp")]
     pub agent_id: String,
+    /// 可选版本号，不传则卸载全部版本
+    #[serde(default)]
+    #[schema(example = "1.0.0")]
+    pub version: Option<String>,
 }
 
 /// 卸载 Agent 的响应
@@ -560,6 +572,9 @@ pub struct UninstallAgentResponse {
     pub install_type: InstallType,
     /// 被卸载的 agent_id
     pub agent_id: String,
+    /// 被卸载的版本列表
+    #[serde(default)]
+    pub removed_versions: Vec<String>,
 }
 
 

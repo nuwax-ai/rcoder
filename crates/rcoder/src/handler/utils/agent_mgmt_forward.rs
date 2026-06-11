@@ -292,10 +292,12 @@ pub async fn uninstall_agent(
     ctx: &AgentMgmtForwardCtx,
     project: &ProjectAndContainerInfo,
     agent_id: &str,
+    version: Option<&str>,
 ) -> Result<UninstallAgentResponse, AppError> {
     let mut client = ctx.resolve_client(project).await?;
     let req = UninstallAgentRequest {
         agent_id: agent_id.to_string(),
+        version: version.map(String::from),
     };
     let resp: ProtoUninstallResponse = client
         .uninstall_agent(req)
@@ -311,10 +313,12 @@ pub async fn check_agent(
     ctx: &AgentMgmtForwardCtx,
     project: &ProjectAndContainerInfo,
     agent_id: &str,
+    version: Option<&str>,
 ) -> Result<CheckAgentResponse, AppError> {
     let mut client = ctx.resolve_client(project).await?;
     let req = CheckAgentRequest {
         agent_id: agent_id.to_string(),
+        version: version.map(String::from),
     };
     let resp = client
         .check_agent(req)
@@ -330,10 +334,12 @@ pub async fn get_agent(
     ctx: &AgentMgmtForwardCtx,
     project: &ProjectAndContainerInfo,
     agent_id: &str,
+    version: Option<&str>,
 ) -> Result<Option<AgentDetailInfo>, AppError> {
     let mut client = ctx.resolve_client(project).await?;
     let req = GetAgentRequest {
         agent_id: agent_id.to_string(),
+        version: version.map(String::from),
     };
     let resp: GetAgentResponse = client
         .get_agent(req)
@@ -380,6 +386,7 @@ fn uninstall_response_to_shared(p: ProtoUninstallResponse) -> UninstallAgentResp
         uninstalled: p.uninstalled,
         install_type: install_type_from_proto_i32(p.install_type),
         agent_id: p.agent_id,
+        removed_versions: p.removed_versions,
     }
 }
 

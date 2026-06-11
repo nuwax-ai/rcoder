@@ -322,7 +322,7 @@ pub async fn get_agent(
     validate_routing_params(&body.routing)?;
     let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
-    let resp = fwd_get(&ctx, &project, &body.agent_id).await?;
+    let resp = fwd_get(&ctx, &project, &body.agent_id, body.version.as_deref()).await?;
     Ok(Json(HttpResult::success(resp)))
 }
 
@@ -373,7 +373,7 @@ pub async fn check_agent(
     validate_routing_params(&body.routing)?;
     let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
-    let resp = fwd_check(&ctx, &project, &body.agent_id).await?;
+    let resp = fwd_check(&ctx, &project, &body.agent_id, body.version.as_deref()).await?;
     Ok(Json(HttpResult::success(resp)))
 }
 
@@ -886,7 +886,7 @@ pub async fn uninstall_agent(
     validate_routing_params(&body.routing)?;
     let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
-    let resp = fwd_uninstall(&ctx, &project, &body.agent_id).await?;
+    let resp = fwd_uninstall(&ctx, &project, &body.agent_id, body.version.as_deref()).await?;
     Ok(Json(HttpResult::success(resp)))
 }
 

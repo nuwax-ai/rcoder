@@ -232,6 +232,7 @@ impl AgentMgmtService for MockAgentMgmt {
             uninstalled: true,
             install_type: InstallType::Npm as i32,
             agent_id: req.into_inner().agent_id,
+            removed_versions: vec![],
         }))
     }
 
@@ -439,7 +440,7 @@ async fn get_agent_returns_none_when_not_found() {
     let ctx = make_ctx(addr);
     let project = make_project(addr);
 
-    let resp = get_agent(&ctx, &project, "missing").await.expect("get_agent ok");
+    let resp = get_agent(&ctx, &project, "missing", None).await.expect("get_agent ok");
     assert!(resp.is_none(), "missing agent should return None");
 }
 
@@ -449,7 +450,7 @@ async fn get_agent_returns_detail_when_found() {
     let ctx = make_ctx(addr);
     let project = make_project(addr);
 
-    let resp = get_agent(&ctx, &project, "codex-acp")
+    let resp = get_agent(&ctx, &project, "codex-acp", None)
         .await
         .expect("get_agent ok")
         .expect("agent should be found");
@@ -463,7 +464,7 @@ async fn uninstall_agent_forwards_request() {
     let ctx = make_ctx(addr);
     let project = make_project(addr);
 
-    let resp = uninstall_agent(&ctx, &project, "codex-acp")
+    let resp = uninstall_agent(&ctx, &project, "codex-acp", None)
         .await
         .expect("uninstall ok");
     assert!(resp.uninstalled);
@@ -478,7 +479,7 @@ async fn check_agent_forwards_request() {
     let ctx = make_ctx(addr);
     let project = make_project(addr);
 
-    let _ = check_agent(&ctx, &project, "codex-acp")
+    let _ = check_agent(&ctx, &project, "codex-acp", None)
         .await
         .expect("check ok");
     let snap = mock.snapshot();
