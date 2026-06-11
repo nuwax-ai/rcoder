@@ -7,7 +7,8 @@
 //! `info` 和 `service_type` 使用 `RwLock` 实现内部可变性。
 
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
 
 use chrono::{DateTime, Utc};
 use shared_types::{ContainerBasicInfo, ServiceType};
@@ -51,18 +52,18 @@ impl ContainerEntry {
 
     /// 获取容器信息的克隆
     pub fn info(&self) -> ContainerBasicInfo {
-        self.info.read().unwrap().clone()
+        self.info.read().clone()
     }
 
     /// 获取服务类型
     pub fn service_type(&self) -> ServiceType {
-        self.service_type.read().unwrap().clone()
+        self.service_type.read().clone()
     }
 
     /// 更新容器信息和服务类型
     pub fn update(&self, new_info: ContainerBasicInfo, new_service_type: ServiceType) {
-        *self.info.write().unwrap() = new_info;
-        *self.service_type.write().unwrap() = new_service_type;
+        *self.info.write() = new_info;
+        *self.service_type.write() = new_service_type;
     }
 
     /// 当前引用计数

@@ -9,7 +9,7 @@ use agent_client_protocol::schema::{
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use shared_types::{
     AcpRequestPermission, AgentMode, ResolvePermissionRequestDto, ResolvePermissionResponseDto,
     SessionNotify, ToolApprovalAction,
@@ -245,36 +245,39 @@ impl PermissionManager {
 
     pub fn cancel_session_permissions(&self, session_id: &str) -> usize {
         info!("[Permission] Cancelling all pending permissions for session: {}", session_id);
-        let keys: Vec<_> = self
-            .pending
-            .lock()
-            .iter()
-            .filter(|(key, _pending)| key.0 == session_id)
-            .map(|(key, _pending)| key.clone())
+        let mut guard = self.pending.lock();
+        let keys: Vec<_> = guard
+            .keys()
+            .filter(|key| key.0 == session_id)
+            .cloned()
             .collect();
-        let count = self.cancel_keys(keys);
+        let count = Self::remove_and_respond(&mut guard, &keys);
+        drop(guard);
         info!("[Permission] Cancelled {} pending permissions for session: {}", count, session_id);
         count
     }
 
     pub fn cancel_project_permissions(&self, project_id: &str) -> usize {
         info!("[Permission] Cancelling all pending permissions for project: {}", project_id);
-        let keys: Vec<_> = self
-            .pending
-            .lock()
+        let mut guard = self.pending.lock();
+        let keys: Vec<_> = guard
             .iter()
-            .filter(|(_key, pending)| pending.context.project_id == project_id)
-            .map(|(key, _pending)| key.clone())
+            .filter(|(_, pending)| pending.context.project_id == project_id)
+            .map(|(key, _)| key.clone())
             .collect();
-        let count = self.cancel_keys(keys);
+        let count = Self::remove_and_respond(&mut guard, &keys);
+        drop(guard);
         info!("[Permission] Cancelled {} pending permissions for project: {}", count, project_id);
         count
     }
 
-    fn cancel_keys(&self, keys: Vec<PendingKey>) -> usize {
+    fn remove_and_respond(
+        guard: &mut MutexGuard<'_, HashMap<PendingKey, PendingPermission>>,
+        keys: &[PendingKey],
+    ) -> usize {
         let mut count = 0;
         for key in keys {
-            if let Some(pending) = self.pending.lock().remove(&key) {
+            if let Some(pending) = guard.remove(key) {
                 if let Err(err) = pending.responder.respond(cancelled_response()) {
                     warn!("[Permission] failed to cancel pending permission: {err}");
                 }

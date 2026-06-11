@@ -2,7 +2,7 @@
 # LibreOffice 预下载配置（避免每次构建都重新下载）
 # ============================================================================
 # LibreOffice 版本（必须与 Dockerfile.base 保持一致）
-LIBREOFFICE_VERSION := 25.8.5
+LIBREOFFICE_VERSION := 25.8.7
 
 # 下载目录（相对于项目根目录）
 LIBREOFFICE_DOWNLOAD_DIR := docker/rcoder-agent-runner/downloads

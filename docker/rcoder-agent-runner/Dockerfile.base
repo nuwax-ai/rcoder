@@ -232,10 +232,10 @@ COPY downloads /tmp/downloads
 RUN echo "Installing LibreOffice..." && \
     case "${TARGETARCH}" in \
     "amd64") \
-        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.5/deb/x86_64/${LIBREOFFICE_FILE}" \
+        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.7/deb/x86_64/${LIBREOFFICE_FILE}" \
         ;; \
     "arm64") \
-        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.5/deb/aarch64/${LIBREOFFICE_FILE}" \
+        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.7/deb/aarch64/${LIBREOFFICE_FILE}" \
         ;; \
     *) echo "❌ Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac && \
