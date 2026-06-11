@@ -5,7 +5,8 @@
 
 use container_runtime_api::ContainerCreateParams;
 use chrono::Utc;
-use shared_types::{ContainerBasicInfo, ServiceType};
+use shared_types::{ContainerBasicInfo, IsolationType, ServiceType};
+use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 use super::manager::DockerManager;
@@ -242,25 +243,63 @@ impl<'a> AgentContainerStarter<'a> {
             Ok(workspace_host_path) => {
                 let (host_sub, container_mount) = if pod_id.is_some() {
                     // pod_id 有值：根据 isolation_type 决定挂载级别
-                    let tid = tenant_id.as_deref().unwrap_or("default");
-                    let sid = space_id.as_deref().unwrap_or("default");
-                    let proj = project_id.as_deref().unwrap_or("default");
-                    match isolation_type.as_deref().map(|s| s.to_lowercase()) {
-                        Some(ref it) if it == "space" => {
+                    // 必须校验必填字段，遵循 Fail Fast 原则
+                    let isolation = match isolation_type {
+                        Some(ref s) => IsolationType::from_str(s).map_err(|e| {
+                            DockerError::ContainerCreationError(e.to_string())
+                        })?,
+                        None => IsolationType::default(),
+                    };
+
+                    match isolation {
+                        IsolationType::Space => {
+                            // space 隔离需要 tenant_id 和 space_id
+                            let tid = tenant_id.as_deref().ok_or_else(|| {
+                                DockerError::ContainerCreationError(
+                                    "tenant_id is required when isolation_type is 'space' and pod_id is provided".to_string()
+                                )
+                            })?;
+                            let sid = space_id.as_deref().ok_or_else(|| {
+                                DockerError::ContainerCreationError(
+                                    "space_id is required when isolation_type is 'space' and pod_id is provided".to_string()
+                                )
+                            })?;
                             let sub = format!("{}/{}", tid, sid);
                             (
                                 sub.clone(),
                                 std::path::PathBuf::from(&workspace_container).join(&sub),
                             )
                         }
-                        Some(ref it) if it == "tenant" => {
+                        IsolationType::Tenant => {
+                            // tenant 隔离只需要 tenant_id
+                            let tid = tenant_id.as_deref().ok_or_else(|| {
+                                DockerError::ContainerCreationError(
+                                    "tenant_id is required when isolation_type is 'tenant' and pod_id is provided".to_string()
+                                )
+                            })?;
                             let sub = tid.to_string();
                             (
                                 sub.clone(),
                                 std::path::PathBuf::from(&workspace_container).join(&sub),
                             )
                         }
-                        _ => {
+                        IsolationType::Project => {
+                            // project 隔离需要 tenant_id、space_id 和 project_id
+                            let tid = tenant_id.as_deref().ok_or_else(|| {
+                                DockerError::ContainerCreationError(
+                                    "tenant_id is required when pod_id is provided".to_string()
+                                )
+                            })?;
+                            let sid = space_id.as_deref().ok_or_else(|| {
+                                DockerError::ContainerCreationError(
+                                    "space_id is required when pod_id is provided".to_string()
+                                )
+                            })?;
+                            let proj = project_id.as_deref().ok_or_else(|| {
+                                DockerError::ContainerCreationError(
+                                    "project_id is required when pod_id is provided".to_string()
+                                )
+                            })?;
                             let sub = format!("{}/{}/{}", tid, sid, proj);
                             (
                                 sub.clone(),
@@ -295,8 +334,23 @@ impl<'a> AgentContainerStarter<'a> {
 
                 let host_mount = workspace_host_path.join(&host_sub);
 
-                // 创建目录（在容器内创建，bind mount 传播到宿主机）
-                std::fs::create_dir_all(&container_mount).ok();
+                // 创建宿主机挂载目录（通过容器内路径创建，volume 会传播到宿主机）
+                // workspace_resolution 是容器内路径（如 /app/computer-project-workspace）
+                // host_sub 是子目录（如 tenant_abc）
+                // 拼接后在容器内创建目录，通过 docker-compose volume 自动同步到宿主机
+                let host_dir_to_create = std::path::PathBuf::from(&workspace_resolution).join(&host_sub);
+                if let Err(e) = std::fs::create_dir_all(&host_dir_to_create) {
+                    warn!(
+                        "[DOCKER_MGR] Failed to create workspace directory {}: {}",
+                        host_dir_to_create.display(),
+                        e
+                    );
+                } else {
+                    info!(
+                        "[DOCKER_MGR] Created workspace directory: {}",
+                        host_dir_to_create.display()
+                    );
+                }
 
                 let host_mount_str = host_mount.to_string_lossy().to_string();
                 let container_mount_str = container_mount.to_string_lossy().to_string();
