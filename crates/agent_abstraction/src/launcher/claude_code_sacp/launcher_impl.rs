@@ -132,8 +132,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         .await?;
 
         // 🎯 关键：检查是否有自定义 agent_server 配置覆盖
-        #[allow(unused_mut)] // Windows 平台会修改这两个变量
-        let (mut command_path, mut command_args, base_env, explicitly_bound_model_env_keys) = if let Some(
+        let (command_path, command_args, base_env, explicitly_bound_model_env_keys) = if let Some(
             ref agent_server_override,
         ) =
             start_config.agent_server_override
@@ -258,18 +257,22 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             Vec::new()
         };
 
+        // Windows 平台需要解析 node CLI 命令路径
         #[cfg(windows)]
-        if let Some((resolved_program, resolved_args)) =
-            resolve_windows_node_cli_command(&command_path, &command_args)
-        {
-            let entry = resolved_args.first().cloned().unwrap_or_default();
-            info!(
-                "[SACP] Windows direct node startup: {} -> {} {}",
-                command_path, resolved_program, entry
-            );
-            command_path = resolved_program;
-            command_args = resolved_args;
-        }
+        let (command_path, command_args) = {
+            if let Some((resolved_program, resolved_args)) =
+                resolve_windows_node_cli_command(&command_path, &command_args)
+            {
+                let entry = resolved_args.first().cloned().unwrap_or_default();
+                info!(
+                    "[SACP] Windows direct node startup: {} -> {} {}",
+                    command_path, resolved_program, entry
+                );
+                (resolved_program, resolved_args)
+            } else {
+                (command_path, command_args)
+            }
+        };
 
         // 准备环境变量（在 base_env 基础上添加项目相关变量）
         let mut merged_envs = base_env;
