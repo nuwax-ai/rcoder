@@ -13,13 +13,22 @@
     "@rcoder/cli-darwin-arm64": "0.0.0",
     "@rcoder/cli-win32-x64": "0.0.0"
   },
-  "os": ["linux", "darwin", "win32"],
-  "cpu": ["x64", "arm64"],
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/nuwax-ai/rcoder"
-  },
   "homepage": "https://github.com/nuwax-ai/rcoder",
-  "keywords": ["rcoder", "cli", "ai", "agent", "development"]
+  "keywords": [
+    "rcoder",
+    "cli",
+    "ai",
+    "agent",
+    "development"
+  ]
 }

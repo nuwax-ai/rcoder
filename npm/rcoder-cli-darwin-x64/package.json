@@ -2,14 +2,16 @@
   "name": "@rcoder/cli-darwin-x64",
   "version": "0.0.0",
   "description": "RCoder CLI binary for darwin-x64",
-  "os": ["darwin"],
-  "cpu": ["x64"],
-  "files": ["rcoder-cli"],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "rcoder-cli"
+  ],
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/nuwax-ai/rcoder"
-  },
   "publishConfig": {
     "access": "public"
   }
