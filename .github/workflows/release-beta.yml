@@ -251,23 +251,31 @@ jobs:
         run: |
           npm config set //registry.npmjs.org/:_authToken ${{ secrets.NPM_TOKEN }}
 
+          mkdir -p /tmp/npm-packages
+
           # 使用 npm pack 打包，然后 npm publish <tarball> 发布
           # 这样可以跳过 git 验证
           for pkg in npm/rcoder-cli-*; do
             if [ -f "$pkg/package.json" ]; then
               pkgName=$(jq -r '.name' "$pkg/package.json")
               echo "Packing $pkgName..."
-              tarball=$(npm pack "$pkg" --pack-destination /tmp/npm-packages 2>&1 | tail -1)
+              cd "$pkg"
+              tarball=$(npm pack 2>/dev/null)
+              cd -
               echo "Publishing $pkgName with beta tag..."
-              npm publish "/tmp/npm-packages/$tarball" --tag beta --registry https://registry.npmjs.org || echo "Warning: Failed to publish $pkgName"
+              npm publish "$pkg/$tarball" --tag beta --registry https://registry.npmjs.org || echo "Warning: Failed to publish $pkgName"
+              rm -f "$pkg/$tarball"
             fi
           done
 
           # 发布主包
           echo "Packing rcoder-cli..."
-          tarball=$(npm pack npm/rcoder-cli --pack-destination /tmp/npm-packages 2>&1 | tail -1)
+          cd npm/rcoder-cli
+          tarball=$(npm pack 2>/dev/null)
+          cd -
           echo "Publishing rcoder-cli with beta tag..."
-          npm publish "/tmp/npm-packages/$tarball" --tag beta --registry https://registry.npmjs.org
+          npm publish "npm/rcoder-cli/$tarball" --tag beta --registry https://registry.npmjs.org
+          rm -f "npm/rcoder-cli/$tarball"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
