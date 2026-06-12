@@ -1,8 +1,8 @@
-# Release CI - 正式版本发布
-# 触发条件: push tag (如 v1.0.0, 1.0.0)
-# npm tag: latest
+# Release Beta CI - 测试版本发布
+# 触发条件: push beta tag (如 v1.0.0-beta.1, 1.0.0-beta.1)
+# npm tag: beta
 
-name: Release
+name: Release Beta
 
 permissions:
   "contents": "write"
@@ -10,8 +10,8 @@ permissions:
 on:
   push:
     tags:
-      - '[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-beta*'
+      - 'v[0-9]+.[0-9]+.[0-9]+-beta*'
 
 jobs:
   # ============================================================
@@ -218,7 +218,7 @@ jobs:
             ${{ env.BUILD_MANIFEST_NAME }}
 
   # ============================================================
-  # Step 4: 创建 GitHub Release
+  # Step 4: 创建 GitHub Release (prerelease)
   # ============================================================
   host:
     needs:
@@ -277,9 +277,9 @@ jobs:
         run: |
           rm -f artifacts/*-dist-manifest.json
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (prerelease)
         env:
-          PRERELEASE_FLAG: ""
+          PRERELEASE_FLAG: "--prerelease"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
@@ -288,7 +288,7 @@ jobs:
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   # ============================================================
-  # Step 5: 发布 npm 包 (@latest)
+  # Step 5: 发布 npm 包 (@beta)
   # ============================================================
   publish-npm:
     needs:
@@ -375,12 +375,12 @@ jobs:
         run: |
           npm config set //registry.npmjs.org/:_authToken ${{ secrets.NPM_TOKEN }}
 
-          # 发布平台包
+          # 发布平台包到 beta tag
           for pkg in npm/rcoder-cli-*; do
             if [ -f "$pkg/package.json" ]; then
               pkgName=$(jq -r '.name' "$pkg/package.json")
-              echo "Publishing $pkgName..."
-              npm publish "$pkg" --access public --tag latest
+              echo "Publishing $pkgName with beta tag..."
+              npm publish "$pkg" --access public --tag beta
             fi
           done
         env:
@@ -389,8 +389,8 @@ jobs:
       # 发布主包
       - name: Publish main package
         run: |
-          echo "Publishing rcoder-cli..."
-          npm publish npm/rcoder-cli --access public --tag latest
+          echo "Publishing rcoder-cli with beta tag..."
+          npm publish npm/rcoder-cli --access public --tag beta
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
