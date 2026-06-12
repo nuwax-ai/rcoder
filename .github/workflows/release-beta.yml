@@ -252,10 +252,6 @@ jobs:
           npm config set //registry.npmjs.org/:_authToken ${{ secrets.NPM_TOKEN }}
           npm config set git-tag-version false
 
-          # 禁用 git 交互和 SSH 验证
-          export GIT_TERMINAL_PROMPT=0
-          export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-
           # 发布平台包
           for pkg in npm/rcoder-cli-*; do
             if [ -f "$pkg/package.json" ]; then
