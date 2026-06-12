@@ -130,7 +130,7 @@ impl K8sPvcOps for KubernetesRuntime {
         }
         // If not found, create it (falls through to creation logic below)
 
-        let storage_size = storage_size.unwrap_or("10Gi");
+        let storage_size = storage_size.unwrap_or("50Gi");
 
         let pvc = PersistentVolumeClaim {
             metadata: ObjectMeta {
