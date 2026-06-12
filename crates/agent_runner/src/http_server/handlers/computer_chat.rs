@@ -39,22 +39,7 @@ pub async fn handle_computer_chat(
 ) -> Result<Json<HttpResult<ChatResponse>>, shared_types::AppError> {
     let locale = locale_from_headers(&headers);
     info!(
-        "📨 [HTTP] Received Computer Chat request:\n\
-         ├─ user_id: {:?}\n\
-         ├─ project_id: {:?}\n\
-         ├─ session_id: {:?}\n\
-         ├─ request_id: {:?}\n\
-         ├─ prompt_len: {} chars\n\
-         ├─ pod_id: {:?}\n\
-         ├─ tenant_id: {:?}\n\
-         ├─ space_id: {:?}\n\
-         ├─ isolation_type: {:?}\n\
-         ├─ attachments: {:?}\n\
-         ├─ data_source_attachments: {:?}\n\
-         ├─ model_provider: {:#?}\n\
-         ├─ agent_config: {:#?}\n\
-         ├─ system_prompt_len: {} chars\n\
-         └─ user_prompt_len: {} chars",
+        "[HTTP] Received Computer Chat request: user_id={}, project_id={:?}, session_id={:?}, request_id={:?}, prompt_len={}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}, attachments={:?}, data_source_attachments={:?}, model_provider={:#?}, agent_config={:#?}, system_prompt_len={}, user_prompt_len={}",
         request.user_id,
         request.project_id,
         request.session_id,

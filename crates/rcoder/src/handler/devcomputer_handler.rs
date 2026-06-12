@@ -27,13 +27,12 @@ use shared_types::{
 };
 use std::convert::Infallible;
 use std::sync::Arc;
-use tracing::instrument;
+use tracing::{info, instrument};
 
 use crate::handler::utils::{I18nJsonOrQuery, I18nPath};
 use crate::handler::{
     SessionNotificationParams, computer_agent_progress_notification, computer_agent_session_cancel,
-    computer_agent_status, computer_agent_stop, computer_notify_resolved,
-    handle_computer_chat,
+    computer_agent_status, computer_agent_stop, computer_notify_resolved, handle_computer_chat,
 };
 use crate::{AppError, HttpResult, router::AppState};
 
@@ -93,6 +92,27 @@ pub async fn handle_devcomputer_chat(
             ..Default::default()
         });
     }
+
+    // 打印完整入参日志（devcomputer 调试接口专用）
+    info!(
+        "[DEVCOMPUTER] Received DevComputer Chat request: user_id={}, project_id={:?}, session_id={:?}, request_id={:?}, prompt_len={}, prompt={}, attachments={:?}, data_source_attachments={:?}, model_provider={:#?}, agent_config={:#?}, system_prompt_len={}, user_prompt_len={}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}",
+        request.user_id,
+        request.project_id,
+        request.session_id,
+        request.request_id,
+        request.prompt.len(),
+        request.prompt,
+        request.attachments,
+        request.data_source_attachments,
+        request.model_provider,
+        request.agent_config,
+        request.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0),
+        request.user_prompt.as_ref().map(|s| s.len()).unwrap_or(0),
+        request.pod_id,
+        request.tenant_id,
+        request.space_id,
+        request.isolation_type,
+    );
 
     // 直接委托给 computer handler
     handle_computer_chat(state, headers, I18nJsonOrQuery(request)).await
