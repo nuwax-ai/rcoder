@@ -132,7 +132,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         .await?;
 
         // 🎯 关键：检查是否有自定义 agent_server 配置覆盖
-        let (command_path, command_args, base_env, explicitly_bound_model_env_keys) = if let Some(
+        let (mut command_path, mut command_args, base_env, explicitly_bound_model_env_keys) = if let Some(
             ref agent_server_override,
         ) =
             start_config.agent_server_override
