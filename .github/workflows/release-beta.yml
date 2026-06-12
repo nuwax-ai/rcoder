@@ -15,15 +15,34 @@ on:
 
 jobs:
   # ============================================================
-  # Step 1: 计划发布
+  # Step 1: 提取版本信息
   # ============================================================
   plan:
     runs-on: "ubuntu-22.04"
     outputs:
-      val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ github.ref_name }}
-      tag-flag: ${{ format('--tag={0}', github.ref_name) }}
       version: ${{ steps.version.outputs.version }}
+      base-version: ${{ steps.version.outputs.base-version }}
+    steps:
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          # 提取基础版本 (去掉 -beta.x 后缀)
+          BASE_VERSION="${VERSION%%-*}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "base-version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Tag: $TAG"
+          echo "Version: $VERSION"
+          echo "Base Version: $BASE_VERSION"
+
+  # ============================================================
+  # Step 2: 使用 cargo-dist 构建平台二进制
+  # ============================================================
+  build:
+    needs: plan
+    runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -31,14 +50,6 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-
-      - name: Extract version
-        id: version
-        run: |
-          TAG="${{ github.ref_name }}"
-          VERSION="${TAG#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Version: $VERSION"
 
       - name: Install dist
         shell: bash
@@ -49,255 +60,40 @@ jobs:
             sleep 10
           done
 
-      - name: Cache dist
-        uses: actions/upload-artifact@v7
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/dist
-
-      - id: plan
+      # 使用基础版本号让 cargo-dist 能够识别
+      - name: Plan build
+        id: plan
         run: |
-          dist host --steps=create --tag=${{ github.ref_name }} --output-format=json > plan-dist-manifest.json
-          echo "dist ran successfully"
-          cat plan-dist-manifest.json
+          # 临时修改 Cargo.toml 版本为基础版本，让 cargo-dist 能工作
+          BASE_VERSION="${{ needs.plan.outputs.base-version }}"
+          sed -i "s/version = \".*\"/version = \"$BASE_VERSION\"/" crates/rcoder-cli/Cargo.toml
+
+          dist host --steps=create --tag=v$BASE_VERSION --output-format=json > plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
-
-      - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v7
-        with:
-          name: artifacts-plan-dist-manifest
-          path: plan-dist-manifest.json
-
-  # ============================================================
-  # Step 2: 构建平台二进制
-  # ============================================================
-  build-local-artifacts:
-    name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
-    needs:
-      - plan
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
-    runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container && matrix.container.image || null }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
-      RUSTUP_TOOLCHAIN: "1.91.0"
-    steps:
-      - name: enable windows longpaths
-        run: |
-          git config --global core.longpaths true
-
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Install Rust non-interactively if not already installed
-        if: ${{ matrix.container }}
-        run: |
-          if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          fi
-
-      - name: Install dist
-        run: ${{ matrix.install_dist.run }}
-
-      - name: Ensure dist in PATH (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Fetch local artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-
-      - name: Install dependencies
-        run: |
-          ${{ matrix.packages_install }}
-
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
-
-      - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          ARCH=$(uname -m)
-          if [ "$ARCH" = "aarch64" ]; then
-            PROTOC_ARCH="linux-aarch_64"
-          else
-            PROTOC_ARCH="linux-x86_64"
-          fi
-          curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-${PROTOC_ARCH}.zip"
-          unzip "protoc-25.1-${PROTOC_ARCH}.zip" -d $HOME/.local
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        run: choco install protoc -y
 
       - name: Build artifacts
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
-          echo "dist ran successfully"
+          BASE_VERSION="${{ needs.plan.outputs.base-version }}"
+          dist build --tag=v$BASE_VERSION --print=linkage --output-format=json > dist-manifest.json
 
-      - id: cargo-dist
-        name: Post-build
-        shell: bash
-        run: |
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
-
-      - name: "Upload artifacts"
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          name: build-artifacts
           path: |
-            ${{ steps.cargo-dist.outputs.paths }}
-            ${{ env.BUILD_MANIFEST_NAME }}
+            target/distrib/*.tar.xz
+            target/distrib/*.zip
 
   # ============================================================
-  # Step 3: 构建全局产物
+  # Step 3: 创建 GitHub Release 并发布 npm
   # ============================================================
-  build-global-artifacts:
-    needs:
-      - plan
-      - build-local-artifacts
-    runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Install cached dist
-        uses: actions/download-artifact@v8
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-
-      - run: chmod +x ~/.cargo/bin/dist
-
-      - name: Fetch local artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-
-      - id: cargo-dist
-        shell: bash
-        run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
-          echo "dist ran successfully"
-
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
-
-      - name: "Upload artifacts"
-        uses: actions/upload-artifact@v7
-        with:
-          name: artifacts-build-global
-          path: |
-            ${{ steps.cargo-dist.outputs.paths }}
-            ${{ env.BUILD_MANIFEST_NAME }}
-
-  # ============================================================
-  # Step 4: 创建 GitHub Release (prerelease)
-  # ============================================================
-  host:
-    needs:
-      - plan
-      - build-local-artifacts
-      - build-global-artifacts
-    if: ${{ always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: "ubuntu-22.04"
-    outputs:
-      val: ${{ steps.host.outputs.manifest }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Install cached dist
-        uses: actions/download-artifact@v8
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-
-      - run: chmod +x ~/.cargo/bin/dist
-
-      - name: Fetch artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-
-      - id: host
-        shell: bash
-        run: |
-          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
-          echo "artifacts uploaded and released successfully"
-          cat dist-manifest.json
-          echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
-
-      - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v7
-        with:
-          name: artifacts-dist-manifest
-          path: dist-manifest.json
-
-      - name: "Download GitHub Artifacts"
-        uses: actions/download-artifact@v8
-        with:
-          pattern: artifacts-*
-          path: artifacts
-          merge-multiple: true
-
-      - name: Cleanup
-        run: |
-          rm -f artifacts/*-dist-manifest.json
-
-      - name: Create GitHub Release (prerelease)
-        env:
-          PRERELEASE_FLAG: "--prerelease"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
-          RELEASE_COMMIT: "${{ github.sha }}"
-        run: |
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
-
-  # ============================================================
-  # Step 5: 发布 npm 包 (@beta)
-  # ============================================================
-  publish-npm:
-    needs:
-      - plan
-      - host
+  release:
+    needs: [plan, build]
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       VERSION: ${{ needs.plan.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
 
@@ -306,22 +102,25 @@ jobs:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
 
-      # 下载 GitHub Release 中的二进制文件
-      - name: Download release assets
+      # 下载构建产物
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: build-artifacts
+          path: binaries/
+
+      # 创建 GitHub Release
+      - name: Create GitHub Release
         run: |
-          mkdir -p binaries
-          cd binaries
+          echo "Creating prerelease: $TAG"
+          gh release create "$TAG" \
+            --prerelease \
+            --title "Beta Release $TAG" \
+            --notes "Beta release for testing" \
+            binaries/*
 
-          # 下载各平台二进制
-          gh release download "${{ needs.plan.outputs.tag }}" \
-            --pattern "*.tar.xz" \
-            --pattern "*.zip" \
-            --repo ${{ github.repository }}
-
-          ls -la
-
-      # 解压二进制文件到平台包目录
-      - name: Extract binaries
+      # 准备 npm 包
+      - name: Prepare npm packages
         run: |
           VERSION="${{ env.VERSION }}"
 
@@ -342,6 +141,11 @@ jobs:
             .optionalDependencies["@rcoder/cli-win32-x64"] = $v
           ' npm/rcoder-cli/package.json > npm/rcoder-cli/package.json.tmp
           mv npm/rcoder-cli/package.json.tmp npm/rcoder-cli/package.json
+
+      # 解压二进制文件
+      - name: Extract binaries
+        run: |
+          ls -la binaries/
 
           # 解压 Linux x64
           mkdir -p npm/rcoder-cli-linux-x64
@@ -366,48 +170,48 @@ jobs:
           # 显示结果
           echo "=== Package contents ==="
           for dir in npm/*/; do
-            echo "--- $dir ---"
-            ls -la "$dir"
+            if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
+              echo "--- $dir ---"
+              ls -la "$dir" | head -5
+            fi
           done
 
-      # 发布平台包
-      - name: Publish platform packages
+      # 发布 npm 包
+      - name: Publish npm packages
         run: |
           npm config set //registry.npmjs.org/:_authToken ${{ secrets.NPM_TOKEN }}
 
-          # 发布平台包到 beta tag
+          # 发布平台包
           for pkg in npm/rcoder-cli-*; do
             if [ -f "$pkg/package.json" ]; then
               pkgName=$(jq -r '.name' "$pkg/package.json")
               echo "Publishing $pkgName with beta tag..."
-              npm publish "$pkg" --access public --tag beta
+              npm publish "$pkg" --access public --tag beta || echo "Warning: Failed to publish $pkgName"
             fi
           done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      # 发布主包
-      - name: Publish main package
-        run: |
+          # 发布主包
           echo "Publishing rcoder-cli with beta tag..."
           npm publish npm/rcoder-cli --access public --tag beta
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ============================================================
-  # Step 6: 发布公告
+  # Step 4: 发布公告
   # ============================================================
   announce:
-    needs:
-      - plan
-      - host
-      - publish-npm
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-npm.result == 'skipped' || needs.publish-npm.result == 'success') }}
+    needs: [plan, release]
     runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          submodules: recursive
+      - name: Summary
+        run: |
+          echo "## Beta Release Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.plan.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag**: ${{ needs.plan.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **npm tag**: beta" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Install with:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "npm install -g rcoder-cli@beta" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
