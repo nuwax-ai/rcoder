@@ -15,7 +15,7 @@ on:
 
 jobs:
   # ============================================================
-  # Step 1: 提取版本信息
+  # Step 1: 提取版本信息并生成构建矩阵
   # ============================================================
   plan:
     runs-on: "ubuntu-22.04"
@@ -23,35 +23,81 @@ jobs:
       tag: ${{ github.ref_name }}
       version: ${{ steps.version.outputs.version }}
       base-version: ${{ steps.version.outputs.base-version }}
-    steps:
-      - name: Extract version
-        id: version
-        run: |
-          TAG="${{ github.ref_name }}"
-          VERSION="${TAG#v}"
-          # 提取基础版本 (去掉 -beta.x 后缀)
-          BASE_VERSION="${VERSION%%-*}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "base-version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Tag: $TAG"
-          echo "Version: $VERSION"
-          echo "Base Version: $BASE_VERSION"
-
-  # ============================================================
-  # Step 2: 使用 cargo-dist 构建平台二进制
-  # ============================================================
-  build:
-    needs: plan
-    runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
           submodules: recursive
 
-      - name: Install protoc
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          BASE_VERSION="${VERSION%%-*}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "base-version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate matrix
+        id: matrix
+        run: |
+          # 使用 cargo-dist 生成构建矩阵
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+
+          BASE_VERSION="${{ steps.version.outputs.base-version }}"
+          sed -i "s/version = \".*\"/version = \"$BASE_VERSION\"/" crates/rcoder-cli/Cargo.toml
+
+          dist host --steps=create --tag=v$BASE_VERSION --output-format=json > plan-dist-manifest.json
+
+          # 提取矩阵配置
+          MATRIX=$(jq -c '.ci.github.artifacts_matrix' plan-dist-manifest.json)
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: plan-manifest
+          path: plan-dist-manifest.json
+
+  # ============================================================
+  # Step 2: 并行构建各平台二进制
+  # ============================================================
+  build:
+    name: build (${{ join(matrix.targets, ', ') }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container && matrix.container.image || null }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RUSTUP_TOOLCHAIN: "1.91.0"
+    steps:
+      - name: enable windows longpaths
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust non-interactively if not already installed
+        if: ${{ matrix.container }}
+        run: |
+          if ! command -v cargo > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
         run: |
           ARCH=$(uname -m)
           if [ "$ARCH" = "aarch64" ]; then
@@ -63,38 +109,47 @@ jobs:
           unzip "protoc-25.1-${PROTOC_ARCH}.zip" -d $HOME/.local
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
       - name: Install dist
+        run: ${{ matrix.install_dist.run }}
+
+      - name: Ensure dist in PATH (Windows)
+        if: runner.os == 'Windows'
         shell: bash
-        run: |
-          for i in 1 2 3 4 5; do
-            curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh && break
-            echo "Attempt $i failed, retrying in 10s..."
-            sleep 10
-          done
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      # 使用基础版本号让 cargo-dist 能够识别
-      - name: Plan build
-        id: plan
-        run: |
-          # 临时修改 Cargo.toml 版本为基础版本，让 cargo-dist 能工作
-          BASE_VERSION="${{ needs.plan.outputs.base-version }}"
-          sed -i "s/version = \".*\"/version = \"$BASE_VERSION\"/" crates/rcoder-cli/Cargo.toml
+      - name: Fetch plan manifest
+        uses: actions/download-artifact@v7
+        with:
+          name: plan-manifest
+          path: target/distrib/
 
-          dist host --steps=create --tag=v$BASE_VERSION --output-format=json > plan-dist-manifest.json
-          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+      - name: Install dependencies
+        run: ${{ matrix.packages_install }}
 
       - name: Build artifacts
         run: |
           BASE_VERSION="${{ needs.plan.outputs.base-version }}"
-          dist build --tag=v$BASE_VERSION --print=linkage --output-format=json > dist-manifest.json
+          sed -i "s/version = \".*\"/version = \"$BASE_VERSION\"/" crates/rcoder-cli/Cargo.toml
 
-      - name: Upload build artifacts
+          dist build --tag=v$BASE_VERSION --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: build-artifacts
-          path: |
-            target/distrib/*.tar.xz
-            target/distrib/*.zip
+          name: build-${{ join(matrix.targets, '_') }}
+          path: ${{ steps.collect.outputs.paths }}
 
   # ============================================================
   # Step 3: 创建 GitHub Release 并发布 npm
@@ -114,12 +169,13 @@ jobs:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
 
-      # 下载构建产物
-      - name: Download build artifacts
+      # 下载所有构建产物
+      - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
-          name: build-artifacts
-          path: binaries/
+          pattern: build-*
+          path: artifacts/
+          merge-multiple: true
 
       # 创建 GitHub Release
       - name: Create GitHub Release
@@ -129,7 +185,7 @@ jobs:
             --prerelease \
             --title "Beta Release $TAG" \
             --notes "Beta release for testing" \
-            binaries/*
+            artifacts/*.tar.xz artifacts/*.zip
 
       # 准备 npm 包
       - name: Prepare npm packages
@@ -157,27 +213,27 @@ jobs:
       # 解压二进制文件
       - name: Extract binaries
         run: |
-          ls -la binaries/
+          ls -la artifacts/
 
           # 解压 Linux x64
           mkdir -p npm/rcoder-cli-linux-x64
-          tar -xf binaries/rcoder-cli-x86_64-unknown-linux-gnu.tar.xz -C npm/rcoder-cli-linux-x64
+          tar -xf artifacts/rcoder-cli-x86_64-unknown-linux-gnu.tar.xz -C npm/rcoder-cli-linux-x64
 
           # 解压 Linux arm64
           mkdir -p npm/rcoder-cli-linux-arm64
-          tar -xf binaries/rcoder-cli-aarch64-unknown-linux-gnu.tar.xz -C npm/rcoder-cli-linux-arm64
+          tar -xf artifacts/rcoder-cli-aarch64-unknown-linux-gnu.tar.xz -C npm/rcoder-cli-linux-arm64
 
           # 解压 macOS x64
           mkdir -p npm/rcoder-cli-darwin-x64
-          tar -xf binaries/rcoder-cli-x86_64-apple-darwin.tar.xz -C npm/rcoder-cli-darwin-x64
+          tar -xf artifacts/rcoder-cli-x86_64-apple-darwin.tar.xz -C npm/rcoder-cli-darwin-x64
 
           # 解压 macOS arm64
           mkdir -p npm/rcoder-cli-darwin-arm64
-          tar -xf binaries/rcoder-cli-aarch64-apple-darwin.tar.xz -C npm/rcoder-cli-darwin-arm64
+          tar -xf artifacts/rcoder-cli-aarch64-apple-darwin.tar.xz -C npm/rcoder-cli-darwin-arm64
 
           # 解压 Windows x64
           mkdir -p npm/rcoder-cli-win32-x64
-          unzip binaries/rcoder-cli-x86_64-pc-windows-msvc.zip -d npm/rcoder-cli-win32-x64
+          unzip artifacts/rcoder-cli-x86_64-pc-windows-msvc.zip -d npm/rcoder-cli-win32-x64
 
           # 显示结果
           echo "=== Package contents ==="
