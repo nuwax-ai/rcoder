@@ -30,5 +30,9 @@
     "ai",
     "agent",
     "development"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuwax-ai/rcoder.git"
+  }
 }
