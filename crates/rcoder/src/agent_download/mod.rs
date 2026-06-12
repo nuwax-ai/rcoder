@@ -198,18 +198,10 @@ impl AgentDownloadManager {
 
         // 创建版本目录并移动文件
         tokio::fs::create_dir_all(&version_dir).await?;
-        let raw_filename = url.split('/').next_back().unwrap_or("package.tar.gz");
-        // Reject path traversal and use safe default
-        if raw_filename.is_empty()
-            || raw_filename == "."
-            || raw_filename == ".."
-            || raw_filename.contains(std::path::MAIN_SEPARATOR)
-        {
-            return Err(AgentDownloadError::NotFound(
-                "invalid filename from URL".into(),
-            ));
-        }
-        let dest_path = version_dir.join(raw_filename);
+        // 从 URL 获取真实文件名（优先从 Content-Disposition，其次从 URL 路径）
+        let raw_filename = download_utils::get_filename_from_url(url).await
+            .unwrap_or_else(|_| "package.tar.gz".to_string());
+        let dest_path = version_dir.join(&raw_filename);
         tokio::fs::rename(&temp_file, &dest_path)
             .await?;
 
