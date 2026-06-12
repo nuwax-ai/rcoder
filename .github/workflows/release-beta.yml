@@ -157,6 +157,7 @@ jobs:
   # ============================================================
   release:
     needs: [plan, build]
+    if: ${{ always() && needs.plan.result == 'success' && needs.build.result != 'cancelled' }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
