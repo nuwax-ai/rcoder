@@ -51,6 +51,11 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Install dist
         shell: bash
         run: |
