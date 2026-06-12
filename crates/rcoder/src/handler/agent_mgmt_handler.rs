@@ -272,10 +272,86 @@ pub async fn list_agents(
     I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::ListAgentsRequest>,
 ) -> Result<Json<HttpResult<shared_types::ListAgentsResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
+
+    // 优先从文件直接读取注册表（支持 rcoder 直接安装的场景）
+    // 根据参数动态判断 ServiceType
+    let service_type = if body.routing.user_id.is_some() || body.routing.pod_id.is_some() {
+        ServiceType::ComputerAgentRunner
+    } else {
+        ServiceType::RCoder
+    };
+
+    let strategy = super::agent_install_strategy::create_strategy(&service_type);
+    if let Some(strategy) = strategy {
+        // 构造最小化的 ProjectAndContainerInfo 用于解析安装目录
+        let mut project = shared_types::ProjectAndContainerInfo::new(String::new());
+        project.set_user_id(body.routing.user_id.clone());
+        project.set_pod_id(body.routing.pod_id.clone());
+        project.set_service_type(Some(service_type));
+
+        if let Ok(install_ctx) = strategy.resolve_install_context(&project, &body.routing) {
+            let registry_path = install_ctx.install_dir.join("registry.json");
+            if registry_path.exists() {
+                match read_registry_from_file(&registry_path) {
+                    Ok(resp) => return Ok(Json(HttpResult::success(resp))),
+                    Err(e) => {
+                        warn!("[agent_mgmt] Failed to read registry from file: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // 回退到 gRPC 调用（需要容器运行）
     let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
     let resp = fwd_list(&ctx, &project).await?;
     Ok(Json(HttpResult::success(resp)))
+}
+
+/// 从文件直接读取注册表
+fn read_registry_from_file(registry_path: &std::path::Path) -> Result<shared_types::ListAgentsResponse, AppError> {
+    let data = std::fs::read_to_string(registry_path)
+        .map_err(|e| AppError::with_message(
+            ec::ERR_INTERNAL_SERVER_ERROR,
+            format!("read registry file: {}", e),
+        ))?;
+
+    let manifests: Vec<crate::agent_download::registry_update::AgentManifest> =
+        serde_json::from_str(&data)
+            .map_err(|e| AppError::with_message(
+                ec::ERR_INTERNAL_SERVER_ERROR,
+                format!("parse registry JSON: {}", e),
+            ))?;
+
+    let agents: Vec<shared_types::AgentInfo> = manifests
+        .into_iter()
+        .map(|m| shared_types::AgentInfo {
+            agent_id: m.agent_id,
+            install_type: match m.install_type.as_str() {
+                "npm" => shared_types::InstallType::Npm,
+                "url" => shared_types::InstallType::Url,
+                _ => shared_types::InstallType::Binary,
+            },
+            status: shared_types::AgentInstallStatus::Available,
+            version: m.version,
+            binary_path: Some(m.binary_path),
+            installed_at: Some(m.installed_at),
+        })
+        .collect();
+
+    let total = agents.len();
+    let install_dir = registry_path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    Ok(shared_types::ListAgentsResponse {
+        system_info: shared_types::SystemInfo::current(),
+        agents,
+        total,
+        install_dir,
+    })
 }
 
 /// 查询某个 agent 的详细信息(版本、安装路径、健康状态等)
@@ -644,7 +720,6 @@ pub async fn install_from_url(
     I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::InstallFromUrlRequest>,
 ) -> Result<Json<HttpResult<shared_types::InstallAgentResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     require_field(Some(&body.agent.agent_id), "agent_id")?;
     require_field(Some(&body.agent.command), "command")?;
     require_field(body.agent.version.as_deref(), "version")?;
@@ -655,89 +730,47 @@ pub async fn install_from_url(
         ));
     }
 
-    // 获取平台 URL
-    let sys_info = shared_types::SystemInfo::current();
-    let platform_key = shared_types::version_util::normalize_platform_key(&sys_info.os, &sys_info.arch);
-    let platform_entry = body.platforms.get(&platform_key).ok_or_else(|| {
-        AppError::with_message(
-            ec::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
-            format!("platform not found: {}", platform_key),
-        )
-    })?;
-
-    // 验证 URL 格式
-    if !platform_entry.url.starts_with("http://") && !platform_entry.url.starts_with("https://") {
-        return Err(AppError::with_message(
-            ec::ERR_VALIDATION,
-            format!("platforms[{}].url must start with http:// or https://", platform_key),
-        ));
-    }
-
-    // 使用策略模式解析安装目录
-    let service_type = project.service_type()
-        .ok_or_else(|| AppError::with_message(
-            ec::ERR_VALIDATION,
-            "service_type is required for agent installation"
-        ))?;
+    // 根据参数动态判断 ServiceType
+    let service_type = if body.routing.user_id.is_some() || body.routing.pod_id.is_some() {
+        ServiceType::ComputerAgentRunner
+    } else {
+        ServiceType::RCoder
+    };
 
     let strategy = super::agent_install_strategy::create_strategy(&service_type)
         .ok_or_else(|| AppError::with_message(
             ec::ERR_VALIDATION,
-            format!("agent installation is not supported for service type: {:?}", service_type),
+            format!("agent installation is not supported for {:?}", service_type),
         ))?;
+
+    // 构造最小化的 ProjectAndContainerInfo 用于解析安装目录
+    let mut project = shared_types::ProjectAndContainerInfo::new(String::new());
+    project.set_user_id(body.routing.user_id.clone());
+    project.set_pod_id(body.routing.pod_id.clone());
+    project.set_service_type(Some(service_type.clone()));
 
     let install_ctx = strategy.resolve_install_context(&project, &body.routing)?;
 
     info!(
-        "[agent_mgmt] Install context resolved: install_dir={}, container={}",
+        "[agent_mgmt] Install context resolved: install_dir={}, service_type={:?}",
         install_ctx.install_dir.display(),
-        install_ctx.container_identifier
+        service_type
     );
 
-    // 下载到缓存（rcoder 主动）
-    // version 已在前面通过 require_field 校验为必填
-    let download_manager = &state.agent_download_manager;
+    // 调用核心安装函数（复用 ensure_agent_installed 的逻辑）
     let version = body.agent.version.as_deref()
         .ok_or_else(|| AppError::with_message(ec::ERR_VALIDATION, "version is required"))?;
 
-    let download_result = download_manager
-        .download_to_cache(
-            &body.agent.agent_id,
-            version,
-            &platform_entry.url,
-        )
-        .await
-        .map_err(|e| {
-            warn!("[agent_mgmt] download to cache failed: {}", e);
-            AppError::with_message(ec::ERR_AGENT_MGMT_INSTALL_FAILED, format!("download failed: {}", e))
-        })?;
-
-    // 复制到策略指定的安装目录
-    download_manager
-        .copy_to_target(
-            &body.agent.agent_id,
-            version,
-            &install_ctx.install_dir,
-        )
-        .await
-        .map_err(|e| {
-            warn!("[agent_mgmt] copy to target failed: {}", e);
-            AppError::with_message(ec::ERR_AGENT_MGMT_INSTALL_FAILED, format!("copy failed: {}", e))
-        })?;
-
-    // 更新 registry
-    crate::agent_download::registry_update::update_registry(
-        &install_ctx.install_dir,
+    let (download_result, platform_key) = super::agent_install_strategy::do_install_from_url(
+        &state,
         &body.agent.agent_id,
         version,
         &body.agent.command,
         &body.agent.args,
+        &body.platforms,
+        &install_ctx.install_dir,
     )
-    .await
-    .map_err(|e| {
-        warn!("[agent_mgmt] update registry failed: {}", e);
-        AppError::with_message(ec::ERR_AGENT_MGMT_INSTALL_FAILED, format!("registry update failed: {}", e))
-    })?;
+    .await?;
 
     // 返回结果
     let resp = shared_types::InstallAgentResponse {
@@ -748,7 +781,7 @@ pub async fn install_from_url(
         file_count: None,
         file_size: download_result.file_size,
         version: body.agent.version,
-        source_url: Some(platform_entry.url.clone()),
+        source_url: body.platforms.get(&platform_key).map(|p| p.url.clone()),
         action: Some(shared_types::InstallAction::Installed),
         installed: true,
         previous_version: None,

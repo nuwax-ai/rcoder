@@ -45,12 +45,10 @@ pub struct AgentInstallRequest<'a> {
 
 /// 安装上下文
 ///
-/// 包含策略解析后的安装目录和容器标识符。
+/// 包含策略解析后的安装目录。
 pub struct InstallContext {
     /// 安装目录（如 "/app/computer-project-workspace/{user_id}/acp-agent"）
     pub install_dir: PathBuf,
-    /// 容器标识符（用于容器解析）
-    pub container_identifier: String,
 }
 
 /// Agent 安装策略 trait
@@ -113,7 +111,6 @@ impl AgentInstallStrategy for ComputerAgentRunnerStrategy {
 
         Ok(InstallContext {
             install_dir,
-            container_identifier: user_id.to_string(),
         })
     }
 }
@@ -153,16 +150,8 @@ impl AgentInstallStrategy for RcoderStrategy {
 
         let install_dir = PathBuf::from(workspace_path).join("acp-agent");
 
-        // 容器标识符：pod_id（共享容器）或 project_id
-        let container_identifier = routing
-            .pod_id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| project_id.to_string());
-
         Ok(InstallContext {
             install_dir,
-            container_identifier,
         })
     }
 }
@@ -187,6 +176,112 @@ pub fn create_strategy(service_type: &ServiceType) -> Option<Box<dyn AgentInstal
 // Chat 接口自动安装
 // =============================================================================
 
+/// 从 URL 安装 agent 的核心逻辑
+///
+/// 供 `install-from-url` API 和 `ensure_agent_installed` (chat 自动安装) 复用。
+///
+/// # 流程
+/// 1. 平台匹配：根据当前系统 OS/ARCH 从 platforms 中获取对应 URL
+/// 2. 缓存检查：已缓存则跳过下载
+/// 3. 下载到缓存目录
+/// 4. 复制到安装目录（自动解压）
+/// 5. 更新 registry.json
+///
+/// # 返回
+/// `(DownloadResult, platform_key)` - 下载结果和匹配的平台 key
+pub async fn do_install_from_url(
+    state: &Arc<crate::router::AppState>,
+    agent_id: &str,
+    version: &str,
+    command: &str,
+    args: &[String],
+    platforms: &std::collections::HashMap<String, shared_types::PlatformEntry>,
+    install_dir: &std::path::Path,
+) -> Result<(crate::agent_download::DownloadResult, String), AppError> {
+    let download_manager = &state.agent_download_manager;
+
+    // 1. 平台匹配
+    let sys_info = shared_types::SystemInfo::current();
+    let platform_key = normalize_platform_key(&sys_info.os, &sys_info.arch);
+    let platform_entry = platforms.get(&platform_key).ok_or_else(|| {
+        AppError::with_message(
+            shared_types::error_codes::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
+            format!(
+                "platform not found: {} (available: {:?})",
+                platform_key,
+                platforms.keys().collect::<Vec<_>>()
+            ),
+        )
+    })?;
+
+    // 2. 缓存检查
+    let from_cache = download_manager.is_cached(agent_id, version);
+
+    // 3. 下载到缓存
+    let download_result = download_manager
+        .download_to_cache(agent_id, version, &platform_entry.url)
+        .await
+        .map_err(|e| {
+            warn!(
+                "📦 [INSTALL] Download failed: agent_id={}, version={}, error={}",
+                agent_id, version, e
+            );
+            AppError::with_message(
+                shared_types::error_codes::ERR_AGENT_MGMT_INSTALL_FAILED,
+                format!("download failed: {}", e),
+            )
+        })?;
+
+    // 4. 复制到安装目录（自动解压）
+    download_manager
+        .copy_to_target(agent_id, version, install_dir)
+        .await
+        .map_err(|e| {
+            warn!(
+                "📦 [INSTALL] Copy failed: agent_id={}, version={}, error={}",
+                agent_id, version, e
+            );
+            AppError::with_message(
+                shared_types::error_codes::ERR_AGENT_MGMT_INSTALL_FAILED,
+                format!("copy failed: {}", e),
+            )
+        })?;
+
+    // 5. 更新 registry
+    crate::agent_download::registry_update::update_registry(
+        install_dir,
+        agent_id,
+        version,
+        command,
+        args,
+    )
+    .await
+    .map_err(|e| {
+        warn!(
+            "📦 [INSTALL] Registry update failed: agent_id={}, version={}, error={}",
+            agent_id, version, e
+        );
+        AppError::with_message(
+            shared_types::error_codes::ERR_AGENT_MGMT_INSTALL_FAILED,
+            format!("registry update failed: {}", e),
+        )
+    })?;
+
+    if from_cache {
+        info!(
+            "📦 [INSTALL] Agent installed from cache: agent_id={}, version={}, platform={}",
+            agent_id, version, platform_key
+        );
+    } else {
+        info!(
+            "📦 [INSTALL] Agent installed: agent_id={}, version={}, platform={}, file_size={}",
+            agent_id, version, platform_key, download_result.file_size
+        );
+    }
+
+    Ok((download_result, platform_key))
+}
+
 /// Chat 接口自动安装 agent
 ///
 /// 在 chat handler 启动 agent 前调用。如果 agent_id + version 已在缓存中，
@@ -198,12 +293,11 @@ pub async fn ensure_agent_installed(
     service_type: &ServiceType,
 ) -> Result<(), AppError> {
     let t0 = std::time::Instant::now();
-    let download_manager = &state.agent_download_manager;
     let agent_id = request.agent_id;
     let version = request.version;
 
     // 快速检查：缓存中已有该版本 → 跳过
-    if download_manager.is_cached(agent_id, version) {
+    if state.agent_download_manager.is_cached(agent_id, version) {
         info!(
             "📦 [CHAT] Agent already cached, skipping install: agent_id={}, version={}, elapsed={:?}",
             agent_id, version,
@@ -217,21 +311,7 @@ pub async fn ensure_agent_installed(
         agent_id, version
     );
 
-    // 1. 平台匹配
-    let sys_info = shared_types::SystemInfo::current();
-    let platform_key = normalize_platform_key(&sys_info.os, &sys_info.arch);
-    let platform_entry = request.platforms.get(&platform_key).ok_or_else(|| {
-        AppError::with_message(
-            shared_types::error_codes::ERR_AGENT_MGMT_PLATFORM_NOT_FOUND,
-            format!(
-                "platform not found: {} (available: {:?})",
-                platform_key,
-                request.platforms.keys().collect::<Vec<_>>()
-            ),
-        )
-    })?;
-
-    // 2. 解析安装目录
+    // 解析安装目录
     let project = state
         .get_project(project_id)
         .ok_or_else(|| AppError::with_message(
@@ -252,46 +332,17 @@ pub async fn ensure_agent_installed(
     };
     let install_ctx = strategy.resolve_install_context(&project, &routing)?;
 
-    // 3. 下载到缓存
-    download_manager
-        .download_to_cache(agent_id, version, &platform_entry.url)
-        .await
-        .map_err(|e| {
-            warn!("📦 [CHAT] Auto-install download failed: agent_id={}, version={}, error={}", agent_id, version, e);
-            AppError::with_message(
-                shared_types::error_codes::ERR_AGENT_MGMT_INSTALL_FAILED,
-                format!("auto-install download failed: {}", e),
-            )
-        })?;
-
-    // 4. 复制到安装目录
-    download_manager
-        .copy_to_target(agent_id, version, &install_ctx.install_dir)
-        .await
-        .map_err(|e| {
-            warn!("📦 [CHAT] Auto-install copy failed: agent_id={}, version={}, error={}", agent_id, version, e);
-            AppError::with_message(
-                shared_types::error_codes::ERR_AGENT_MGMT_INSTALL_FAILED,
-                format!("auto-install copy failed: {}", e),
-            )
-        })?;
-
-    // 5. 更新 registry
-    crate::agent_download::registry_update::update_registry(
-        &install_ctx.install_dir,
+    // 调用核心安装函数
+    do_install_from_url(
+        state,
         agent_id,
         version,
         request.command,
         request.args,
+        request.platforms,
+        &install_ctx.install_dir,
     )
-    .await
-    .map_err(|e| {
-        warn!("📦 [CHAT] Auto-install registry update failed: agent_id={}, version={}, error={}", agent_id, version, e);
-        AppError::with_message(
-            shared_types::error_codes::ERR_AGENT_MGMT_INSTALL_FAILED,
-            format!("auto-install registry update failed: {}", e),
-        )
-    })?;
+    .await?;
 
     info!(
         "📦 [CHAT] Auto-install completed: agent_id={}, version={}, install_dir={}, elapsed={:?}",
@@ -329,7 +380,6 @@ mod tests {
             ctx.install_dir,
             PathBuf::from("/app/computer-project-workspace/user-456/acp-agent")
         );
-        assert_eq!(ctx.container_identifier, "user-456");
     }
 
     #[test]
@@ -346,7 +396,6 @@ mod tests {
             ctx.install_dir,
             PathBuf::from("/app/computer-project-workspace/pod-789/acp-agent")
         );
-        assert_eq!(ctx.container_identifier, "pod-789");
     }
 
     #[test]
@@ -371,7 +420,6 @@ mod tests {
             ctx.install_dir,
             PathBuf::from("/app/project_workspace/proj-123/acp-agent")
         );
-        assert_eq!(ctx.container_identifier, "proj-123");
     }
 
     #[test]
@@ -391,20 +439,6 @@ mod tests {
             ctx.install_dir,
             PathBuf::from("/app/project_workspace/t1/s1/proj-123/acp-agent")
         );
-    }
-
-    #[test]
-    fn rcoder_strategy_uses_pod_id_as_container_identifier() {
-        let strategy = RcoderStrategy;
-        let project = ProjectAndContainerInfo::new("proj-123".to_string());
-
-        let routing = RoutingParams {
-            pod_id: Some("pod-456".to_string()),
-            ..Default::default()
-        };
-        let ctx = strategy.resolve_install_context(&project, &routing).unwrap();
-
-        assert_eq!(ctx.container_identifier, "pod-456");
     }
 
     #[test]

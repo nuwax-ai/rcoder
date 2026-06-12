@@ -137,8 +137,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # 复制 cargo 镜像配置文件（使用国内镜像加速）
 COPY .cargo/config.toml /root/.cargo/config.toml
 # 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
-# TODO: 暂时注释掉，因为上游依赖有编译错误
-# RUN cargo install --git https://github.com/nuwax-ai/codex-acp.git --branch test
+RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest
 
 
 
