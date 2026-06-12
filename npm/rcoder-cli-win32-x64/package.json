@@ -1,5 +1,5 @@
 {
-  "name": "@rcoder/cli-win32-x64",
+  "name": "cli-win32-x64",
   "version": "0.0.0",
   "description": "RCoder CLI binary for win32-x64",
   "os": [

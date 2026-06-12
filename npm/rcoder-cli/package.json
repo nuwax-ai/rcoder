@@ -7,11 +7,11 @@
     "rcoder-cli": "./bin/cli.js"
   },
   "optionalDependencies": {
-    "@rcoder/cli-linux-x64": "0.0.0",
-    "@rcoder/cli-linux-arm64": "0.0.0",
-    "@rcoder/cli-darwin-x64": "0.0.0",
-    "@rcoder/cli-darwin-arm64": "0.0.0",
-    "@rcoder/cli-win32-x64": "0.0.0"
+    "cli-linux-x64": "0.0.0",
+    "cli-linux-arm64": "0.0.0",
+    "cli-darwin-x64": "0.0.0",
+    "cli-darwin-arm64": "0.0.0",
+    "cli-win32-x64": "0.0.0"
   },
   "os": [
     "linux",
