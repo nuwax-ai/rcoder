@@ -1,7 +1,7 @@
 //! Agent 下载管理器
 //!
 //! 负责将 Agent 下载到统一缓存目录，并复制到 agent-runner 的安装目录。
-//! 使用 `download_utils` crate 提供的下载功能。
+//! 使用 `download_utils` crate 提供的下载和解压功能。
 
 pub mod error;
 pub mod registry_update;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use download_utils::{DownloadConfig, Downloader};
+use download_utils::archive::{self, ArchiveError};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -238,7 +239,10 @@ impl AgentDownloadManager {
         None
     }
 
-    /// 从缓存复制到目标目录
+    /// 从缓存复制到目标目录并解压
+    ///
+    /// 支持 tar.gz 和 zip 格式的自动解压。
+    /// 解压后会规范化目录结构（去除单层 wrapper 目录）。
     pub async fn copy_to_target(
         &self,
         agent_id: &str,
@@ -250,6 +254,14 @@ impl AgentDownloadManager {
 
         let source = self.version_dir(agent_id, version)?;
         let target = target_base.join(agent_id).join(version);
+
+        info!(
+            agent_id = %agent_id,
+            version = %version,
+            source = %source.display(),
+            target = %target.display(),
+            "copy_to_target: starting"
+        );
 
         // 检查源目录
         if !source.exists() {
@@ -267,18 +279,103 @@ impl AgentDownloadManager {
         // 确保父目录存在
         tokio::fs::create_dir_all(target.parent().unwrap()).await?;
 
-        // 递归复制
-        self.copy_dir_recursive(&source, &target).await?;
+        // 查找缓存中的归档文件
+        let archive_file = self.find_archive_file(&source).await?;
 
         info!(
             agent_id = %agent_id,
             version = %version,
-            source = %source.display(),
-            target = %target.display(),
-            "Agent copied from cache to target"
+            archive_file = ?archive_file,
+            "copy_to_target: archive file found"
         );
 
+        if let Some(archive_path) = archive_file {
+            // 检测文件类型并解压
+            let file_type = archive::detect_file_type_from_path(&archive_path)
+                .map_err(|e| AgentDownloadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+            info!(
+                agent_id = %agent_id,
+                version = %version,
+                archive = %archive_path.display(),
+                file_type = %file_type,
+                "Extracting agent archive"
+            );
+
+            // 创建目标目录
+            tokio::fs::create_dir_all(&target).await?;
+
+            // 在阻塞线程中执行解压（避免阻塞 tokio runtime）
+            let target_clone = target.clone();
+            let archive_clone = archive_path.clone();
+            let file_type_str = file_type.to_string();
+
+            tokio::task::spawn_blocking(move || {
+                match file_type_str.as_str() {
+                    "tar.gz" => archive::extract_tar_gz(&archive_clone, &target_clone),
+                    "zip" => archive::extract_zip(&archive_clone, &target_clone),
+                    _ => Err(ArchiveError::InvalidArchive(format!(
+                        "unsupported archive type: {}", file_type_str
+                    ))),
+                }
+            })
+            .await
+            .map_err(|e| AgentDownloadError::Io(std::io::Error::other(e.to_string())))?
+            .map_err(|e| AgentDownloadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+
+            // 规范化目录结构（去除单层 wrapper）
+            archive::normalize_extracted_dir(&target)
+                .map_err(|e| AgentDownloadError::Io(std::io::Error::other(e.to_string())))?;
+
+            info!(
+                agent_id = %agent_id,
+                version = %version,
+                target = %target.display(),
+                file_type = %file_type,
+                "Agent extracted successfully"
+            );
+        } else {
+            // 没有归档文件，直接复制（兼容非归档格式）
+            info!(
+                agent_id = %agent_id,
+                version = %version,
+                "No archive found, copying files directly"
+            );
+            self.copy_dir_recursive(&source, &target).await?;
+        }
+
         Ok(target)
+    }
+
+    /// 查找缓存目录中的归档文件
+    ///
+    /// 优先通过 magic bytes 识别（更可靠），然后通过扩展名兜底。
+    async fn find_archive_file(&self, source_dir: &Path) -> Result<Option<PathBuf>, AgentDownloadError> {
+        let mut entries = tokio::fs::read_dir(source_dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            // 1. 优先通过 magic bytes 识别（更可靠，不受文件名影响）
+            if let Ok(file_type) = archive::detect_file_type_from_path(&path)
+                && (file_type == "tar.gz" || file_type == "zip")
+            {
+                return Ok(Some(path));
+            }
+
+            // 2. 通过扩展名兜底（处理 magic bytes 无法识别的边界情况）
+            let file_name = entry.file_name().to_string_lossy().to_lowercase();
+            if file_name.ends_with(".tar.gz")
+                || file_name.ends_with(".tgz")
+                || file_name.ends_with(".zip")
+            {
+                return Ok(Some(path));
+            }
+        }
+
+        Ok(None)
     }
 
     /// 递归复制目录

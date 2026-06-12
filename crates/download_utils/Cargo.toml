@@ -40,6 +40,11 @@ hex = { workspace = true }
 # UUID (for temp files)
 uuid = { workspace = true }
 
+# Archive extraction
+flate2 = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
