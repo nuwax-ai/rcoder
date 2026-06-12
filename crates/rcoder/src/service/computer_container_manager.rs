@@ -237,6 +237,10 @@ impl ComputerContainerManager {
 
         // 只有在有资源限制时才设置
         if let Some(limits) = resource_limits {
+            // 提取 storage_size 用于 K8s PVC 创建
+            if let Some(ref storage_size) = limits.storage_size {
+                params_builder = params_builder.storage_size(storage_size.clone());
+            }
             params_builder = params_builder.resource_limits(limits);
         }
 

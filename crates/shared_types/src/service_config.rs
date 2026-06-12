@@ -101,6 +101,12 @@ pub struct ServiceResourceLimits {
     pub cpu_limit: Option<f64>,
     /// 交换空间限制（字节，支持浮点数输入）
     pub swap_limit: Option<f64>,
+    /// PVC 存储空间大小（仅 K8s 模式生效，Docker 模式忽略）
+    ///
+    /// 格式：`<数字><单位>`，支持 Mi/Gi/Ti（二进制）和 M/G/T（十进制）
+    /// 范围：最小 1Gi，最大 100Ti，默认 50Gi
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_size: Option<String>,
 }
 
 impl ServiceResourceLimits {
@@ -142,6 +148,7 @@ impl ServiceResourceLimits {
             memory_limit: override_limits.memory_limit.or(self.memory_limit),
             cpu_limit: override_limits.cpu_limit.or(self.cpu_limit),
             swap_limit: override_limits.swap_limit.or(self.swap_limit),
+            storage_size: override_limits.storage_size.clone().or_else(|| self.storage_size.clone()),
         }
     }
 }
@@ -437,6 +444,7 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
         memory_limit: Some(2_000_000_000.0), // 2GB
         cpu_limit: Some(2.0),                // 2 核
         swap_limit: Some(4_000_000_000.0),   // 4GB
+        storage_size: None,                  // K8s 模式下使用默认值 10Gi
     };
 
     ServiceImageConfig {
@@ -491,6 +499,7 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
         memory_limit: Some(4_000_000_000.0), // 4GB
         cpu_limit: Some(3.0),                // 3 核
         swap_limit: Some(8_000_000_000.0),   // 8GB
+        storage_size: None,                  // K8s 模式下使用默认值 10Gi
     };
 
     ServiceImageConfig {
@@ -582,6 +591,7 @@ mod tests {
                 memory_limit: None,
                 cpu_limit: None,
                 swap_limit: None,
+                storage_size: None,
             },
             work_dir: "/app".to_string(),
             network_mode: "bridge".to_string(),
@@ -696,6 +706,7 @@ mod tests {
             memory_limit: Some(1_000_000_000.0), // 1GB
             cpu_limit: Some(2.0),
             swap_limit: Some(2_000_000_000.0), // 2GB
+            storage_size: None,
         };
         assert!(valid.validate().is_ok());
     }
@@ -706,6 +717,7 @@ mod tests {
             memory_limit: Some(256_000_000.0), // 256MB - 太小
             cpu_limit: None,
             swap_limit: None,
+            storage_size: None,
         };
         assert!(invalid.validate().is_err());
         assert!(invalid.validate().unwrap_err().contains("at least 512MB"));
@@ -717,6 +729,7 @@ mod tests {
             memory_limit: Some(100_000_000_000.0), // 100GB - 太大
             cpu_limit: None,
             swap_limit: None,
+            storage_size: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -733,6 +746,7 @@ mod tests {
             memory_limit: None,
             cpu_limit: Some(0.1), // 太小
             swap_limit: None,
+            storage_size: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -749,6 +763,7 @@ mod tests {
             memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: None,
             swap_limit: Some(1_000_000_000.0), // 1GB - swap < memory
+            storage_size: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -765,18 +780,21 @@ mod tests {
             memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: Some(2.0),
             swap_limit: Some(4_000_000_000.0), // 4GB
+            storage_size: None,
         };
 
         let override_limits = ServiceResourceLimits {
             memory_limit: Some(4_000_000_000.0), // 覆盖：4GB
             cpu_limit: None,                     // 不覆盖
             swap_limit: Some(8_000_000_000.0),   // 覆盖：8GB
+            storage_size: Some("20Gi".to_string()),
         };
 
         let merged = default_limits.merge_with(&override_limits);
         assert_eq!(merged.memory_limit, Some(4_000_000_000.0));
         assert_eq!(merged.cpu_limit, Some(2.0)); // 保留默认
         assert_eq!(merged.swap_limit, Some(8_000_000_000.0));
+        assert_eq!(merged.storage_size, Some("20Gi".to_string()));
     }
 
     #[test]
@@ -785,12 +803,14 @@ mod tests {
             memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: Some(2.0),
             swap_limit: Some(4_000_000_000.0), // 4GB
+            storage_size: Some("10Gi".to_string()),
         };
 
         let override_limits = ServiceResourceLimits {
             memory_limit: None,
             cpu_limit: None,
             swap_limit: None,
+            storage_size: None,
         };
 
         let merged = default_limits.merge_with(&override_limits);
@@ -798,6 +818,7 @@ mod tests {
         assert_eq!(merged.memory_limit, Some(2_000_000_000.0));
         assert_eq!(merged.cpu_limit, Some(2.0));
         assert_eq!(merged.swap_limit, Some(4_000_000_000.0));
+        assert_eq!(merged.storage_size, Some("10Gi".to_string()));
     }
 
     #[test]

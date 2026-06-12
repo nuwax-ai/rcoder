@@ -4657,11 +4657,12 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "winnow 1.0.3",
 ]
 
 [[package]]
 name = "rcoder-cli"
-version = "0.1.1"
+version = "0.1.1-beta.1"
 dependencies = [
  "agent-client-protocol",
  "agent_abstraction",

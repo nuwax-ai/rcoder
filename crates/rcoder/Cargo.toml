@@ -72,6 +72,9 @@ serde_urlencoded = "0.7"
 garde = { version = "0.22.1", features = ["derive"] }
 regex = { workspace = true }
 
+# Parsing
+winnow = { workspace = true }
+
 derive_builder = { workspace = true }
 
 # Workspace dependencies

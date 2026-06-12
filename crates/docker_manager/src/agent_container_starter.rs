@@ -46,6 +46,7 @@ impl<'a> AgentContainerStarter<'a> {
             isolation_type,
             tenant_id,
             space_id,
+            storage_size: _, // Docker 模式忽略 storage_size，仅 K8s 模式使用
         } = params;
 
         info!(

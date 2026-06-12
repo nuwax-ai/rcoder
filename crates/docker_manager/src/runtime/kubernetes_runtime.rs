@@ -324,6 +324,7 @@ impl ContainerRuntime for KubernetesRuntime {
             isolation_type,
             tenant_id,
             space_id,
+            storage_size,
         } = params;
 
         // 确定容器标识符：pod_id > user_id > project_id（与 Docker 模式一致）
@@ -346,7 +347,7 @@ impl ContainerRuntime for KubernetesRuntime {
         // The PVC is backed by NFS Subdir External Provisioner which automatically
         // creates NFS subdirectory per PVC for isolation and automatic cleanup
         // Note: ensure_workspace_pvc waits for PVC Bound state before returning
-        self.ensure_workspace_pvc(identifier, &service_type, None)
+        self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
             .await?;
 
         // Check if pod already exists and is running

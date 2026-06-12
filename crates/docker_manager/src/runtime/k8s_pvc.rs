@@ -3,6 +3,12 @@
 //! 提供 workspace PVC 的创建、等待绑定、删除和 finalizer 检查等功能。
 //! 使用 trait extension 模式为 `KubernetesRuntime` 添加 PVC 操作方法。
 
+/// 默认 PVC 存储大小（当请求未指定 storage_size 时使用）
+///
+/// 50GB 配合 Ceph RBD 存储驱动，会强制限制用户数据大小。
+#[cfg(feature = "kubernetes")]
+const DEFAULT_PVC_STORAGE_SIZE: &str = "50Gi";
+
 #[cfg(feature = "kubernetes")]
 use async_trait::async_trait;
 #[cfg(feature = "kubernetes")]
@@ -130,7 +136,7 @@ impl K8sPvcOps for KubernetesRuntime {
         }
         // If not found, create it (falls through to creation logic below)
 
-        let storage_size = storage_size.unwrap_or("50Gi");
+        let storage_size = storage_size.unwrap_or(DEFAULT_PVC_STORAGE_SIZE);
 
         let pvc = PersistentVolumeClaim {
             metadata: ObjectMeta {
