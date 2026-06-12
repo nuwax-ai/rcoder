@@ -270,6 +270,8 @@ jobs:
           npm publish npm/rcoder-cli --access public --tag beta --registry https://registry.npmjs.org
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GIT_TERMINAL_PROMPT: 0
+          GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
   # ============================================================
   # Step 4: 发布公告
