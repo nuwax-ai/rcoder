@@ -133,7 +133,8 @@ jobs:
       - name: Build artifacts
         run: |
           BASE_VERSION="${{ needs.plan.outputs.base-version }}"
-          sed -i "s/version = \".*\"/version = \"$BASE_VERSION\"/" crates/rcoder-cli/Cargo.toml
+          sed -i.bak "s/version = \".*\"/version = \"$BASE_VERSION\"/" crates/rcoder-cli/Cargo.toml
+          rm -f crates/rcoder-cli/Cargo.toml.bak
 
           dist build --tag=v$BASE_VERSION --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
 
