@@ -251,7 +251,6 @@ jobs:
         run: |
           npm config set //registry.npmjs.org/:_authToken ${{ secrets.NPM_TOKEN }}
           npm config set git-tag-version false
-          npm config set repository ""
 
           # 禁用 git 交互和 SSH 验证
           export GIT_TERMINAL_PROMPT=0
