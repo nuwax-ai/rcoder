@@ -256,13 +256,13 @@ jobs:
             if [ -f "$pkg/package.json" ]; then
               pkgName=$(jq -r '.name' "$pkg/package.json")
               echo "Publishing $pkgName with beta tag..."
-              npm publish "$pkg" --access public --tag beta --no-git-checks || echo "Warning: Failed to publish $pkgName"
+              npm publish "$pkg" --access public --tag beta --registry https://registry.npmjs.org || echo "Warning: Failed to publish $pkgName"
             fi
           done
 
           # 发布主包
           echo "Publishing rcoder-cli with beta tag..."
-          npm publish npm/rcoder-cli --access public --tag beta --no-git-checks
+          npm publish npm/rcoder-cli --access public --tag beta --registry https://registry.npmjs.org
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
