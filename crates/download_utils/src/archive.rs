@@ -525,13 +525,13 @@ mod tests {
 
     #[test]
     fn test_extract_real_tar_gz() {
-        let archive_path = std::path::Path::new("/tmp/test-acp-install/cache/test.tar.gz");
+        let archive_path = Path::new("/tmp/test-acp-install/cache/test.tar.gz");
         if !archive_path.exists() {
             println!("Skipping test: archive file not found");
             return;
         }
 
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = tempdir().unwrap();
         let extract_dir = tmp_dir.path().join("extracted");
         std::fs::create_dir_all(&extract_dir).unwrap();
 

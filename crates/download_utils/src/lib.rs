@@ -58,12 +58,11 @@ pub async fn get_filename_from_url(url: &str) -> Result<String, DownloadError> {
         .map_err(|e| DownloadError::Http(format!("HEAD {}: {}", url, e)))?;
 
     // 1. 尝试从 Content-Disposition 获取
-    if let Some(cd) = response.headers().get("content-disposition") {
-        if let Ok(cd_str) = cd.to_str() {
-            if let Some(filename) = parse_content_disposition(cd_str) {
-                return Ok(filename);
-            }
-        }
+    if let Some(cd) = response.headers().get("content-disposition")
+        && let Ok(cd_str) = cd.to_str()
+        && let Some(filename) = parse_content_disposition(cd_str)
+    {
+        return Ok(filename);
     }
 
     // 2. 从 URL 路径提取（去掉查询参数）
@@ -80,15 +79,15 @@ pub async fn get_filename_from_url(url: &str) -> Result<String, DownloadError> {
 fn parse_content_disposition(cd: &str) -> Option<String> {
     for part in cd.split(';') {
         let part = part.trim();
-        if part.starts_with("filename=") {
-            let filename = part[9..].trim_matches('"');
+        if let Some(rest) = part.strip_prefix("filename=") {
+            let filename = rest.trim_matches('"');
             return Some(filename.to_string());
         }
-        if part.starts_with("filename*=") {
+        if let Some(rest) = part.strip_prefix("filename*=") {
             // RFC 5987: filename*=UTF-8''file.tar.gz
-            let filename = part[10..].trim_matches('"');
+            let filename = rest.trim_matches('"');
             if let Some(idx) = filename.find("''") {
-                return Some(filename[idx+2..].to_string());
+                return Some(filename[idx + 2..].to_string());
             }
         }
     }
