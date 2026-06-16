@@ -32,7 +32,8 @@ use tracing::{info, instrument};
 use crate::handler::utils::{I18nJsonOrQuery, I18nPath};
 use crate::handler::{
     SessionNotificationParams, computer_agent_progress_notification, computer_agent_session_cancel,
-    computer_agent_status, computer_agent_stop, computer_notify_resolved, handle_computer_chat,
+    computer_agent_status, computer_agent_stop, computer_notify_resolved,
+    computer_chat_handler::handle_computer_chat_internal,
 };
 use crate::{AppError, HttpResult, router::AppState};
 
@@ -114,8 +115,8 @@ pub async fn handle_devcomputer_chat(
         request.isolation_type,
     );
 
-    // 直接委托给 computer handler
-    handle_computer_chat(state, headers, I18nJsonOrQuery(request)).await
+    // 委托给 computer handler，设置 is_devcomputer=true
+    handle_computer_chat_internal(state, headers, I18nJsonOrQuery(request), true).await
 }
 
 /// 处理 DevComputer Agent 停止请求

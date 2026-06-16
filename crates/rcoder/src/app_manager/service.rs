@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bollard::Docker;
@@ -10,7 +11,7 @@ use bollard::query_parameters::{
     CreateContainerOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use chrono::Utc;
-use docker_manager::path::resolve_container_path_to_host;
+use docker_manager::path::HostPathResolver;
 use tokio::fs;
 use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
@@ -28,6 +29,7 @@ const WORKSPACE_ROOT: &str = "/app/app-workspace";
 pub struct AppService {
     config: AppManagerConfig,
     docker: Docker,
+    path_resolver: Option<Arc<HostPathResolver>>,
     apps: tokio::sync::RwLock<HashMap<String, AppInfo>>,
 }
 
@@ -47,9 +49,22 @@ impl AppService {
         let docker = Docker::connect_with_local_defaults()
             .context("连接 Docker 失败")?;
 
+        // 创建路径解析器（只创建一次，缓存复用）
+        let path_resolver = match HostPathResolver::new().await {
+            Ok(resolver) => {
+                info!("路径解析器初始化成功");
+                Some(Arc::new(resolver))
+            }
+            Err(e) => {
+                warn!("路径解析器初始化失败，将使用容器内路径: {}", e);
+                None
+            }
+        };
+
         Ok(Self {
             config,
             docker,
+            path_resolver,
             apps: tokio::sync::RwLock::new(HashMap::new()),
         })
     }
@@ -64,7 +79,7 @@ impl AppService {
         self.create_app_dirs(&app_id).await?;
 
         // 获取宿主机路径（用于容器挂载）
-        let host_app_dir = self.get_host_app_dir(&app_id).await;
+        let host_app_dir = self.get_host_app_dir(&app_id);
         info!("宿主机应用目录: {:?}", host_app_dir);
 
         // 构建应用信息
@@ -90,7 +105,7 @@ impl AppService {
 
         // 创建容器
         let container_name = container_name(&app_id);
-        let container_config = self.build_container_config(&app_id, &request).await;
+        let container_config = self.build_container_config(&app_id, &request);
 
         match self
             .docker
@@ -520,14 +535,17 @@ impl AppService {
 
     /// 获取应用目录（宿主机路径）
     ///
-    /// 使用路径解析器将容器内路径转换为宿主机路径
-    async fn get_host_app_dir(&self, app_id: &str) -> PathBuf {
+    /// 使用缓存的路径解析器将容器内路径转换为宿主机路径
+    fn get_host_app_dir(&self, app_id: &str) -> PathBuf {
         let container_path = app_workspace_path(app_id);
 
-        // 使用便捷函数解析宿主机路径
-        resolve_container_path_to_host(&container_path)
-            .await
-            .unwrap_or(container_path)
+        // 使用缓存的路径解析器
+        if let Some(resolver) = &self.path_resolver {
+            resolver.resolve_to_host_path(&container_path)
+                .unwrap_or(container_path)
+        } else {
+            container_path
+        }
     }
 
     /// 获取应用目录（容器内路径）
@@ -545,13 +563,13 @@ impl AppService {
     }
 
     /// 构建容器配置
-    async fn build_container_config(
+    fn build_container_config(
         &self,
         app_id: &str,
         request: &CreateAppRequest,
     ) -> ContainerCreateBody {
         // 使用宿主机路径进行挂载
-        let host_app_dir = self.get_host_app_dir(app_id).await;
+        let host_app_dir = self.get_host_app_dir(app_id);
 
         // 构建挂载点
         let mounts = vec![Mount {
