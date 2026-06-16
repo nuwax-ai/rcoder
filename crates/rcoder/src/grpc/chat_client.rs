@@ -31,10 +31,11 @@ pub async fn grpc_chat_with_pool(
     agent_config: Option<ChatAgentConfig>,
     service_type: Option<shared_types::ServiceType>,
     user_id: Option<String>, // 新增：用于 ComputerAgentRunner 模式
+    is_devcomputer: bool,    // 🆕 是否是 DevComputer 接口请求
 ) -> anyhow::Result<GrpcChatResponse> {
     info!(
-        "🚀 [gRPC_CHAT] Sending Chat request (connection pool): addr={}, project_id={}",
-        grpc_addr, project_id
+        "🚀 [gRPC_CHAT] Sending Chat request (connection pool): addr={}, project_id={}, is_devcomputer={}",
+        grpc_addr, project_id, is_devcomputer
     );
 
     // 使用连接池获取客户端
@@ -58,6 +59,7 @@ pub async fn grpc_chat_with_pool(
         agent_config: agent_config.map(super::converters::to_grpc_chat_agent_config),
         service_type: service_type.map(|st| format!("{:?}", st)),
         user_id, // 传递 user_id
+        is_devcomputer, // 🆕 传递 is_devcomputer
     };
 
     debug!("[gRPC_CHAT] sendrequest: {:?}", grpc_request);

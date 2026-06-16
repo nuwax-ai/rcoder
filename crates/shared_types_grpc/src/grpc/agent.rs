@@ -37,6 +37,9 @@ pub struct ChatRequest {
     /// 用户ID（可选，ComputerAgentRunner 模式必填）
     #[prost(string, optional, tag = "12")]
     pub user_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// 🆕 是否是 DevComputer 接口请求（用于 {PREFIX_WORKSPACE_DIR} 变量解析）
+    #[prost(bool, tag = "13")]
+    pub is_devcomputer: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChatResponse {

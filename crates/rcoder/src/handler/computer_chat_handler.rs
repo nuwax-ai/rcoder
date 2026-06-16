@@ -97,6 +97,18 @@ pub async fn handle_computer_chat(
     headers: HeaderMap,
     I18nJsonOrQuery(mut request): I18nJsonOrQuery<ComputerChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
+    handle_computer_chat_internal(State(state), headers, I18nJsonOrQuery(request), false).await
+}
+
+/// Computer Chat 内部处理函数
+///
+/// 支持 `is_devcomputer` 参数，用于区分 `/computer/chat` 和 `/devcomputer/chat` 请求
+pub(crate) async fn handle_computer_chat_internal(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    I18nJsonOrQuery(mut request): I18nJsonOrQuery<ComputerChatRequest>,
+    is_devcomputer: bool,
+) -> Result<HttpResult<ChatResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
 
@@ -623,6 +635,7 @@ pub async fn handle_computer_chat(
         locale,
         &state.container_prefix_rcoder,
         &state.container_prefix_computer,
+        is_devcomputer, // 🆕 传递 is_devcomputer
     )
     .await;
 
@@ -772,10 +785,11 @@ async fn forward_computer_request_to_container(
     locale: &'static str,
     rcoder_prefix: &str,
     computer_prefix: &str,
+    is_devcomputer: bool, // 🆕 是否是 DevComputer 接口请求
 ) -> HttpResult<ChatResponse> {
     info!(
-        "📤 [COMPUTER_FORWARD] Forwarding request to container (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}",
-        request.user_id, project_id, request.session_id, container_info.container_id
+        "📤 [COMPUTER_FORWARD] Forwarding request to container (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}, is_devcomputer={}",
+        request.user_id, project_id, request.session_id, container_info.container_id, is_devcomputer
     );
 
     // 直接使用 gRPC 的健康检查机制，不额外检查容器状态
@@ -860,6 +874,7 @@ async fn forward_computer_request_to_container(
             request.agent_config.clone(),
             Some(shared_types::ServiceType::ComputerAgentRunner), // ✅ 传递正确的 ServiceType
             Some(request.user_id.clone()), // ✅ 传递 user_id（ComputerAgentRunner 必需）
+            is_devcomputer, // 🆕 传递 is_devcomputer
         )
         .await
         {

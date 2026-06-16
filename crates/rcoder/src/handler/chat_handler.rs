@@ -563,6 +563,7 @@ async fn forward_request_to_container_service(
             request.agent_config.clone(),
             Some(shared_types::ServiceType::RCoder), // ✅ RCoder 模式使用 RCoder ServiceType
             None,                                    // RCoder 模式不需要 user_id
+            false,                                   // /chat 接口不是 devcomputer
         )
         .await
         {
