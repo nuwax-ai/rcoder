@@ -22,6 +22,7 @@ use shared_types::ProjectAndContainerInfo;
 
 use crate::{
     agent_download::AgentDownloadManager,
+    app_manager,
     config::{ApiKeyAuthConfig, AppConfig},
     handler,
     storage::ProjectAdapter,
@@ -80,10 +81,12 @@ pub struct AppState {
     pub cleanup_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>>>>,
     /// Agent 下载管理器（统一缓存）
     pub agent_download_manager: Arc<AgentDownloadManager>,
+    /// 应用管理服务
+    pub app_service: Arc<dyn crate::app_manager::AppServiceTrait>,
 }
 
 impl AppState {
-    pub fn new(
+    pub async fn new(
         config: AppConfig,
         pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
         api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
@@ -104,6 +107,20 @@ impl AppState {
                 .map_err(|e| anyhow::anyhow!("failed to initialize agent download manager: {}", e))?
         );
 
+        // 初始化应用管理服务（根据运行时类型选择）
+        let runtime_type = std::env::var("CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".to_string());
+        let app_service: Arc<dyn crate::app_manager::AppServiceTrait> = if runtime_type == "kubernetes" {
+            Arc::new(crate::app_manager::k8s_service::K8sAppService::new(
+                config.app_manager.clone(),
+                runtime.clone(),
+            ))
+        } else {
+            Arc::new(
+                crate::app_manager::service::AppService::new(config.app_manager.clone()).await
+                    .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?
+            )
+        };
+
         Ok(Self {
             config,
             projects,
@@ -117,6 +134,7 @@ impl AppState {
             runtime,
             cleanup_rx: Arc::new(std::sync::Mutex::new(Some(cleanup_rx))),
             agent_download_manager,
+            app_service,
         })
     }
 
@@ -402,13 +420,21 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         )
         .with_state(state.clone());
 
+    // 应用管理路由
+    let app_manager_state = Arc::new(app_manager::handlers::AppManagerState {
+        app_service: state.app_service.clone(),
+    });
+    let app_manager_routes = app_manager::routes::app_manager_routes()
+        .with_state(app_manager_state);
+
     let mut router = Router::new()
         .merge(health_routes)
         .merge(api_routes)
         .merge(computer_routes)
         .merge(devcomputer_routes)
         .merge(proxy_api_routes)
-        .merge(agent_mgmt_routes);
+        .merge(agent_mgmt_routes)
+        .merge(app_manager_routes);
 
     // 仅在启用 debug feature 时添加调试路由
     #[cfg(feature = "debug")]
@@ -541,6 +567,21 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::devcomputer_agent_session_cancel,
         handler::devcomputer_notify_resolved,
         handler::devcomputer_agent_progress_notification,
+        // 应用管理接口
+        app_manager::handlers::create_app,
+        app_manager::handlers::query_apps,
+        app_manager::handlers::get_app,
+        app_manager::handlers::update_app,
+        app_manager::handlers::delete_app,
+        app_manager::handlers::start_app,
+        app_manager::handlers::stop_app,
+        app_manager::handlers::restart_app,
+        app_manager::handlers::get_app_logs,
+        app_manager::handlers::get_app_health,
+        app_manager::handlers::get_app_stats,
+        app_manager::handlers::get_app_events,
+        app_manager::handlers::upload_file,
+        app_manager::handlers::list_files,
     ),
     components(
         schemas(
@@ -643,6 +684,17 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             // multipart 特有类型(rcoder 本地)
             handler::InstallMetadataBody,
             handler::InstallMultipartBody,
+            // 应用管理相关结构体
+            app_manager::models::CreateAppRequest,
+            app_manager::models::AppInfo,
+            app_manager::models::AppStatus,
+            app_manager::models::QueryAppsRequest,
+            app_manager::models::UpdateAppRequest,
+            app_manager::models::LogParams,
+            app_manager::models::LogEntry,
+            app_manager::models::ResourceStats,
+            app_manager::models::HealthInfo,
+            app_manager::models::PaginatedResponse<app_manager::models::AppInfo>,
         )
     ),
     tags(
@@ -654,6 +706,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
         (name = "agent-mgmt", description = "Agent 二进制安装/卸载/检查接口(P0-4: rcoder 转发到 agent_runner 容器)"),
         (name = "devcomputer", description = "DevComputer 调试接口（与 /computer 共享容器，自动注入 auto_reload 配置）"),
+        (name = "应用管理", description = "应用容器管理接口，支持创建、启动、停止、删除应用"),
     ),
     info(
         description = r#"

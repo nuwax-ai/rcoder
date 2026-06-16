@@ -28,6 +28,8 @@ services:
       - ./start-rcoder.sh:/app/start-rcoder.sh
       # 专门用于npm,pnpm,bun,uvx 缓存使用的目录
       - ./computer-cache:/root/.cache
+      # 应用管理工作空间目录
+      - ./app-workspace:/app/app-workspace
       # 🖼️ 挂载壁纸目录（供 agent_runner 子容器使用）
       # - ./wallpaper:/app/assets
     command: ["/bin/bash", "/app/start-rcoder.sh"]

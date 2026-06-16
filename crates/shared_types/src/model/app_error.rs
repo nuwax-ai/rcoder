@@ -58,6 +58,16 @@ impl AppError {
     pub fn validation_error(msg: &str) -> Self {
         Self::with_message(crate::error_codes::ERR_VALIDATION, msg)
     }
+
+    /// Create a not found error
+    pub fn not_found(msg: &str) -> Self {
+        Self::with_message(crate::error_codes::ERR_NOT_FOUND, msg)
+    }
+
+    /// Create a conflict error
+    pub fn conflict(msg: &str) -> Self {
+        Self::with_message(crate::error_codes::ERR_CONFLICT, msg)
+    }
 }
 
 // 为 axum 实现 IntoResponse trait

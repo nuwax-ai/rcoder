@@ -166,6 +166,14 @@ pub const ERR_PROJECT_NOT_FOUND: &str = "ERR_PROJECT_NOT_FOUND";
 /// Agent Runner 容器不可用(P0-4: gRPC 调用失败 / 容器离线)
 pub const ERR_AGENT_RUNNER_UNAVAILABLE: &str = "ERR_AGENT_RUNNER_UNAVAILABLE";
 
+// ========== 应用管理服务错误码 ==========
+
+/// 资源不存在
+pub const ERR_NOT_FOUND: &str = "ERR_NOT_FOUND";
+
+/// 资源冲突（已存在）
+pub const ERR_CONFLICT: &str = "ERR_CONFLICT";
+
 /// 获取错误码对应的翻译 key
 fn get_error_i18n_key(code: &str) -> &'static str {
     match code {
@@ -218,6 +226,8 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_AGENT_MGMT_INVALID_VERSION => "error.agent_mgmt_invalid_version",
         ERR_PROJECT_NOT_FOUND => "error.project_not_found",
         ERR_AGENT_RUNNER_UNAVAILABLE => "error.agent_runner_unavailable",
+        ERR_NOT_FOUND => "error.not_found",
+        ERR_CONFLICT => "error.conflict",
         ERR_UNKNOWN => "error.unknown",
         _ => "error.undefined",
     }

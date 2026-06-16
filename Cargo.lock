@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "agent_runner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-client-protocol",
  "agent_abstraction",
@@ -1088,7 +1088,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "container-runtime-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "docker_manager"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1607,7 +1607,7 @@ dependencies = [
  "container-runtime-api",
  "dashmap",
  "futures-util",
- "k8s-openapi",
+ "k8s-openapi 0.24.0",
  "kube",
  "moka",
  "reqwest 0.13.3",
@@ -1623,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "download_utils"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "futures-util",
@@ -2877,6 +2877,19 @@ dependencies = [
 
 [[package]]
 name = "k8s-openapi"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19501afb943ae5806548bc3ebd7f3374153ca057a38f480ef30adfde5ef09755"
+dependencies = [
+ "base64",
+ "chrono",
+ "serde",
+ "serde-value",
+ "serde_json",
+]
+
+[[package]]
+name = "k8s-openapi"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c75b990324f09bef15e791606b7b7a296d02fc88a344f6eba9390970a870ad5"
@@ -2914,7 +2927,7 @@ version = "0.98.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32053dc495efad4d188c7b33cc7c02ef4a6e43038115348348876efd39a53cba"
 dependencies = [
- "k8s-openapi",
+ "k8s-openapi 0.24.0",
  "kube-client",
  "kube-core",
  "kube-runtime",
@@ -2941,7 +2954,7 @@ dependencies = [
  "hyper-timeout",
  "hyper-util",
  "jsonpath-rust",
- "k8s-openapi",
+ "k8s-openapi 0.24.0",
  "kube-core",
  "pem",
  "rustls",
@@ -2968,7 +2981,7 @@ dependencies = [
  "form_urlencoded",
  "http",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.24.0",
  "serde",
  "serde-value",
  "serde_json",
@@ -2992,7 +3005,7 @@ dependencies = [
  "hostname",
  "json-patch",
  "jsonptr",
- "k8s-openapi",
+ "k8s-openapi 0.24.0",
  "kube-client",
  "parking_lot",
  "pin-project",
@@ -4716,7 +4729,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4740,6 +4753,8 @@ dependencies = [
  "garde",
  "hyper",
  "hyper-util",
+ "k8s-openapi 0.22.0",
+ "kube",
  "md5",
  "moka",
  "notify",
@@ -4806,7 +4821,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-gateway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5724,7 +5739,7 @@ dependencies = [
 
 [[package]]
 name = "shared_types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -5766,7 +5781,7 @@ dependencies = [
 
 [[package]]
 name = "shared_types_grpc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prost 0.14.3",
  "prost-types",

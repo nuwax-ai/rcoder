@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         container_prefix_rcoder,
         container_prefix_computer,
         runtime,
-    )?);
+    ).await?);
 
     let _bg_handles = background_tasks::start_all_background_tasks(&bootstrap_result.config, state.clone()).await?;
 
