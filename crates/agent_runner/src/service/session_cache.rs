@@ -344,6 +344,13 @@ impl SessionWorker {
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
                 SessionCommand::Push { message } => {
+                    debug!(
+                        "📤 [SessionWorker] Push message: message_type={:?}, sub_type={}, data={}",
+                        message.message_type,
+                        message.sub_type,
+                        truncate_message_for_log(&message.data, 2000)
+                    );
+
                     let should_buffer = !matches!(
                         message.message_type,
                         crate::model::SessionMessageType::Heartbeat

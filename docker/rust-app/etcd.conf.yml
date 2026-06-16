@@ -1,0 +1,44 @@
+# etcd 配置文件
+
+# 节点名称
+name: 'etcd-node-1'
+
+# 数据目录
+data-dir: '/app/data/etcd'
+
+# 监听客户端端口
+listen-client-urls: 'http://0.0.0.0:2379'
+advertise-client-urls: 'http://0.0.0.0:2379'
+
+# 监听对等端口
+listen-peer-urls: 'http://0.0.0.0:2380'
+initial-advertise-peer-urls: 'http://0.0.0.0:2380'
+
+# 集群配置（单节点模式）
+initial-cluster: 'etcd-node-1=http://0.0.0.0:2380'
+initial-cluster-state: 'new'
+initial-cluster-token: 'rcoder-etcd-cluster'
+
+# 日志配置
+log-level: 'info'
+log-outputs: ['/var/log/supervisor/etcd.log']
+
+# 心跳和选举超时
+heartbeat-interval: 100
+election-timeout: 1000
+
+# 快照配置
+snapshot-count: 10000
+
+# 安全配置（可选）
+# client-transport-security:
+#   cert-file: '/app/config/etcd/server.crt'
+#   key-file: '/app/config/etcd/server.key'
+#   client-cert-auth: true
+#   trusted-ca-file: '/app/config/etcd/ca.crt'
+
+# peer-transport-security:
+#   cert-file: '/app/config/etcd/peer.crt'
+#   key-file: '/app/config/etcd/peer.key'
+#   client-cert-auth: true
+#   trusted-ca-file: '/app/config/etcd/ca.crt'

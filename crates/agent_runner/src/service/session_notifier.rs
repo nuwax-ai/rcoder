@@ -10,6 +10,7 @@ use shared_types::{
 };
 
 use super::push_session_update_with_project;
+use tracing::debug;
 
 /// SSE 消息推送器
 ///
@@ -92,6 +93,11 @@ impl SessionNotifier for SseSessionNotifier {
         session_update: agent_client_protocol::schema::SessionUpdate,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(
+            "📤 [SseSessionNotifier] Received SessionUpdate from agent: project_id={}, session_id={}, update={:?}",
+            project_id, session_id, session_update
+        );
+
         let notify = SessionNotify::AgentSessionUpdate(Box::new(AgentSessionUpdate {
             session_id: session_id.to_string(),
             session_update,

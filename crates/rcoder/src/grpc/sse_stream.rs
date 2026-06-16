@@ -116,10 +116,16 @@ pub async fn create_grpc_sse_stream(
                         match stream.message().await {
                             Ok(Some(progress_event)) => {
                                 debug!(
-                                    "📨 [gRPC_SSE] Received progress event: session_id={}, message_type={}, sub_type={}",
+                                    "📨 [gRPC_SSE] Received progress event: session_id={}, message_type={}, sub_type={}, payload={}",
                                     session_id_clone,
                                     progress_event.message_type,
-                                    progress_event.sub_type
+                                    progress_event.sub_type,
+                                    if progress_event.payload.len() > 2000 {
+                                        let truncated: String = progress_event.payload.chars().take(2000).collect();
+                                        format!("{}... (truncated)", truncated)
+                                    } else {
+                                        progress_event.payload.clone()
+                                    }
                                 );
 
                                 // 将 ProgressEvent 转换为 SSE Event（传入 session_id 以重建完整消息结构）

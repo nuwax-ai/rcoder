@@ -333,16 +333,13 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 ```json
 {
-  "project_id": "demo-project-001",
-  "user_id": null,
-  "pod_id": null,
-  "tenant_id": null,
-  "space_id": null,
-  "isolation_type": null
+  "project_id": "demo-project-001"
 }
 ```
 
 #### 字段说明
+
+请求体通过 `#[serde(flatten)]` 嵌入 `RoutingParams`，所有字段均为**可选**：
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -400,7 +397,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 | status | `"available"` \| `"broken"` \| `"not_installed"` \| `"unknown"` | 状态 |
 | version | string? | 版本号（无法检测时为 null） |
 | binary_path | string? | 可执行文件路径（未安装时为 null） |
-| installed_at | number? | 安装时间 (Unix timestamp)，未安装时为 null |
+| installed_at | number? | 安装时间 (Unix timestamp 秒)，未安装时为 null |
 
 ---
 
@@ -415,17 +412,13 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 ```json
 {
   "project_id": "demo-project-001",
-  "agent_id": "codex-acp",
-  "version": null,
-  "user_id": null,
-  "pod_id": null,
-  "tenant_id": null,
-  "space_id": null,
-  "isolation_type": null
+  "agent_id": "codex-acp"
 }
 ```
 
 #### 字段说明
+
+请求体通过 `#[serde(flatten)]` 嵌入 `RoutingParams`，路由字段均为**可选**：
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -452,11 +445,10 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
   "agent": {
     "agent_id": "codex-acp",
     "install_type": "binary",
-    "status": "available",
     "installed": true,
+    "status": "available",
     "version": "1.2.0",
     "version_check_supported": true,
-    "binary_path": "/home/user/acp-agent/bin/codex-acp",
     "static_checks": {
       "file_exists": true,
       "executable": true,
@@ -480,11 +472,10 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
   "agent": {
     "agent_id": "kimi-cli",
     "install_type": "unknown",
-    "status": "not_installed",
     "installed": false,
+    "status": "not_installed",
     "version": null,
     "version_check_supported": false,
-    "binary_path": "",
     "static_checks": {
       "file_exists": false,
       "executable": false,
@@ -510,11 +501,10 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
   "agent": {
     "agent_id": "kilo-code",
     "install_type": "binary",
-    "status": "broken",
     "installed": true,
+    "status": "broken",
     "version": null,
     "version_check_supported": true,
-    "binary_path": "/home/user/acp-agent/bin/kilo-code",
     "static_checks": {
       "file_exists": true,
       "executable": true,
@@ -540,11 +530,10 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
   "agent": {
     "agent_id": "codex-acp",
     "install_type": "binary",
-    "status": "available",
     "installed": true,
+    "status": "available",
     "version": null,
     "version_check_supported": false,
-    "binary_path": "/home/user/acp-agent/bin/codex-acp",
     "static_checks": {
       "file_exists": true,
       "executable": true,
@@ -570,11 +559,10 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 |------|------|------|
 | agent_id | string | Agent 标识符 |
 | install_type | `"builtin"` \| `"binary"` \| `"npm"` \| `"url"` \| `"unknown"` | 安装类型 |
-| status | `"available"` \| `"broken"` \| `"not_installed"` \| `"unknown"` | 状态 |
 | installed | boolean | 是否已安装 |
+| status | `"available"` \| `"broken"` \| `"not_installed"` \| `"unknown"` | 状态 |
 | version | string? | 版本号 |
 | version_check_supported | boolean | 是否支持版本检测 |
-| binary_path | string | 可执行文件路径 |
 | static_checks | StaticCheckResult | 静态检查结果（不执行 agent 进程） |
 
 #### StaticCheckResult 字段说明
@@ -634,21 +622,30 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 | file | binary | 是 | 压缩包（.tar.gz / .zip，最大 1GB） |
 | metadata | string | 是 | JSON 字符串，包含安装元数据（见下表） |
 
-**metadata JSON 字段**:
+**metadata JSON 字段**（对应 `InstallMetadataBody`）:
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
-| agent_id | string | 是 | Agent 标识符（如 "codex-acp"） |
-| command | string | 是 | 入口可执行文件名（如 "codex-acp"） |
-| args | string[] | 否 | 默认启动参数（默认空） |
-| install_type | string | 否 | `"BINARY"`（默认）/ `"URL"` / `"NPM"` |
-| sha256 | string | 否 | SHA-256 校验和（hex，可选） |
-| user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式） |
-| pod_id | string | 否 | Pod ID |
+| project_id | string | 条件必填 | 项目 ID（RoutingParams 字段，与 user_id/pod_id 二选一） |
+| user_id | string | 条件必填 | 用户 ID（RoutingParams 字段，ComputerAgentRunner 模式） |
+| pod_id | string | 否 | Pod ID（RoutingParams 字段） |
 | tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
 | space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
 | isolation_type | string | 条件必填 | 隔离类型（pod_id 有值时必填） |
+| agent | object | 是 | Agent 身份信息（见下表 `AgentIdentity`） |
+| install_type | string | 否 | `"BINARY"`（默认）/ `"URL"` / `"NPM"`，大小写不敏感 |
+| source_url | string? | 否 | 下载 URL（URL 安装时必填） |
+| npm_package | string? | 否 | npm 包名（NPM 安装时必填，如 `@anthropic-ai/claude-code-acp`） |
+| sha256 | string | 否 | SHA-256 校验和（hex，可选，提供时安装后校验） |
+
+**agent 子对象字段**（`AgentIdentity`）:
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| agent_id | string | 是 | Agent 标识符（如 "codex-acp"） |
+| command | string | 是 | 入口可执行文件名（如 "codex-acp"） |
+| args | string[] | 否 | 启动参数（默认空） |
+| version | string? | 否 | 版本号（可选） |
 
 > **install_type 说明**：BINARY 模式必须提供 `file` 字段；URL/NPM 模式请使用专用端点 `/install-from-url` 和 `/install-from-npm`。
 
@@ -656,7 +653,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 ```bash
 curl -X POST http://localhost:8087/agent-mgmt/agents/install \
-  -F 'metadata={"project_id":"p1","agent_id":"codex-acp","command":"codex-acp","install_type":"BINARY"};type=application/json' \
+  -F 'metadata={"project_id":"p1","agent":{"agent_id":"codex-acp","command":"codex-acp"},"install_type":"BINARY"};type=application/json' \
   -F 'file=@./codex-acp-linux-amd64.tar.gz;type=application/octet-stream'
 ```
 
@@ -664,25 +661,8 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 ```bash
 curl -X POST http://localhost:8087/agent-mgmt/agents/install \
-  -F 'metadata={"user_id":"user_123","agent_id":"my-agent","command":"my-agent","install_type":"BINARY"};type=application/json' \
+  -F 'metadata={"user_id":"user_123","agent":{"agent_id":"my-agent","command":"my-agent"},"install_type":"BINARY"};type=application/json' \
   -F 'file=@./my-agent-v1.0-linux-amd64.tar.gz;type=application/octet-stream'
-```
-
-#### 响应 - 单文件
-
-> 以下仅展示 `data` 字段内容，省略外层 HttpResult 包装。
-
-```json
-{
-  "agent_id": "codex-acp",
-  "status": "available",
-  "binary_path": "/home/user/acp-agent/bin/codex-acp",
-  "file_type": "executable",
-  "file_size": 15728640,
-  "file_count": 1,
-  "version": "1.2.0",
-  "source_url": null
-}
 ```
 
 #### 响应 - 压缩包
@@ -693,27 +673,31 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 {
   "agent_id": "my-agent",
   "status": "available",
-  "binary_path": "/home/user/acp-agent/bin/my-agent",
+  "binary_path": "my-agent",
   "file_type": "tar.gz",
-  "file_size": 8388608,
   "file_count": 3,
+  "file_size": 8388608,
   "version": null,
   "source_url": null
 }
 ```
 
-#### 安装响应字段说明
+#### 安装响应字段说明（InstallAgentResponse，所有安装端点通用）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | agent_id | string | Agent 标识符 |
 | status | `"available"` \| `"broken"` \| `"not_installed"` \| `"unknown"` | 安装后状态 |
 | binary_path | string | 可执行文件路径 |
-| file_type | `"executable"` \| `"tar.gz"` \| `"zip"` \| `"npm"` | 检测到的文件类型 |
+| file_type | string | 检测到的文件类型（`"executable"` / `"tar.gz"` / `"zip"` / `"npm"`） |
 | file_size | number | 文件大小（字节） |
-| file_count | number? | 安装的文件数量（单文件为 1，压缩包为解压后的文件数） |
-| version | string? | 版本号 |
+| file_count | number? | 安装的文件数量（压缩包为解压后的文件数，单文件为 null） |
+| version | string? | 版本号（可选） |
 | source_url | string? | 下载源 URL（URL 安装时有值） |
+| action | string? | 本次操作类型（`"installed"` / `"updated"` / `"skipped"`，URL 安装时有值） |
+| installed | boolean | 本次是否实际执行了下载安装（`action != "skipped"` 时为 true） |
+| previous_version | string? | 更新前的版本号（首次安装为 null，跳过时等于 version） |
+| platform | string? | 实际匹配的平台 key（如 `"linux-x86_64"`，URL 安装时有值） |
 
 #### 处理流程
 
@@ -779,10 +763,12 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 #### 字段说明
 
+请求体通过 `#[serde(flatten)]` 嵌入 `RoutingParams`，路由字段均为**可选**：
+
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
-| agent | object | 是 | Agent 身份信息（见下表） |
+| agent | object | 是 | Agent 身份信息（见下表 `AgentIdentity`） |
 | package | string | 是 | npm 包名（如 `@anthropic-ai/claude-code-acp`） |
 | user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式） |
 | pod_id | string | 否 | Pod ID |
@@ -790,7 +776,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 | space_id | string | 条件必填 | 空间 ID（pod_id 有值时必填） |
 | isolation_type | string | 条件必填 | 隔离类型（pod_id 有值时必填） |
 
-**agent 子对象字段说明**:
+**agent 子对象字段说明**（`AgentIdentity`）:
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -801,12 +787,13 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 #### 响应
 
 > 以下仅展示 `data` 字段内容，省略外层 HttpResult 包装。
+> 响应类型为 `InstallAgentResponse`，与 `install` 和 `install-from-url` 端点通用。
 
 ```json
 {
   "agent_id": "claude-code-acp",
   "status": "available",
-  "binary_path": "/home/user/acp-agent/npm-global/bin/claude-code-acp",
+  "binary_path": "claude-code-acp",
   "file_type": "npm",
   "file_size": 0,
   "version": "1.0.38",
@@ -879,11 +866,14 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 #### 字段说明
 
+请求体通过 `#[serde(flatten)]` 嵌入 `RoutingParams`，路由字段均为**可选**：
+
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | project_id | string | 条件必填 | 项目 ID（与 user_id/pod_id 二选一） |
-| agent | object | 是 | Agent 身份信息（见下表） |
-| platforms | object | 是 | 平台 → 下载信息映射 |
+| agent | object | 是 | Agent 身份信息（见下表 `AgentIdentity`） |
+| platforms | object | 是 | 平台 → 下载信息映射（不能为空） |
+| force | boolean | 否 | 强制重新安装（取消正在进行的安装，重新开始），默认 false |
 | user_id | string | 条件必填 | 用户 ID（ComputerAgentRunner 模式，定位容器） |
 | pod_id | string | 否 | Pod ID（有值时覆盖 user_id 作为容器标识） |
 | tenant_id | string | 条件必填 | 租户 ID（pod_id 有值时必填） |
@@ -925,6 +915,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 #### 响应
 
 > 以下仅展示 `data` 字段内容，省略外层 HttpResult 包装。
+> 响应类型为 `InstallAgentResponse`，与 `install` 和 `install-from-npm` 端点通用。
 
 **响应 - 新版本安装（多版本并存）**:
 
@@ -932,16 +923,15 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 {
   "agent_id": "codex-acp",
   "status": "available",
-  "action": "installed",
-  "installed": true,
-  "binary_path": "/home/user/acp-agent/codex-acp/1.2.0/codex-acp",
-  "file_type": "tar.gz",
-  "file_count": 3,
+  "binary_path": "codex-acp",
+  "file_type": "binary",
   "file_size": 15728640,
   "version": "1.2.0",
+  "source_url": "https://cdn.example.com/agents/codex-acp/1.2.0/codex-acp-linux-amd64.tar.gz",
+  "action": "installed",
+  "installed": true,
   "previous_version": null,
-  "platform": "linux-x86_64",
-  "source_url": "https://cdn.example.com/agents/codex-acp/1.2.0/codex-acp-linux-amd64.tar.gz"
+  "platform": "linux-x86_64"
 }
 ```
 
@@ -951,16 +941,15 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 {
   "agent_id": "codex-acp",
   "status": "available",
-  "action": "skipped",
-  "installed": false,
-  "binary_path": "/home/user/acp-agent/codex-acp/1.2.0/codex-acp",
-  "file_type": "tar.gz",
-  "file_count": null,
+  "binary_path": "codex-acp",
+  "file_type": "binary",
   "file_size": 0,
   "version": "1.2.0",
+  "source_url": null,
+  "action": "skipped",
+  "installed": false,
   "previous_version": "1.2.0",
-  "platform": null,
-  "source_url": null
+  "platform": null
 }
 ```
 
@@ -972,7 +961,8 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
   "agent_id": "codex-acp",
   "action": "skipped",
   "version": "v1.2.0",
-  "previous_version": "v1.2.0"
+  "previous_version": "v1.2.0",
+  "installed": false
 }
 ```
 
@@ -983,35 +973,34 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 {
   "agent_id": "codex-acp",
   "status": "available",
-  "action": "installed",
-  "installed": true,
-  "binary_path": "/home/user/acp-agent/codex-acp/1.2.0/codex-acp",
-  "file_type": "tar.gz",
-  "file_count": 3,
+  "binary_path": "codex-acp",
+  "file_type": "binary",
   "file_size": 15728640,
   "version": "1.2.0",
+  "source_url": "https://cdn.example.com/agents/codex-acp/1.2.0/codex-acp-linux-amd64.tar.gz",
+  "action": "installed",
+  "installed": true,
   "previous_version": null,
-  "platform": "linux-x86_64",
-  "source_url": "https://cdn.example.com/agents/codex-acp/1.2.0/codex-acp-linux-amd64.tar.gz"
+  "platform": "linux-x86_64"
 }
 ```
 
-#### 响应字段说明
+#### 响应字段说明（InstallAgentResponse）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | agent_id | string | Agent 标识符 |
 | status | `"available"` \| `"broken"` \| `"not_installed"` \| `"unknown"` | 安装后状态 |
-| action | `"installed"` \| `"skipped"` | 本次操作类型（多版本并存模式：精确版本不存在 → installed，已存在 → skipped） |
-| installed | boolean | 本次是否实际执行了下载安装（`action != "skipped"`） |
 | binary_path | string | 可执行文件路径 |
-| file_type | `"executable"` \| `"tar.gz"` \| `"zip"` \| `"npm"` | 检测到的文件类型 |
-| file_count | number? | 安装的文件数量（压缩包为解压后的文件数，跳过时为 null） |
+| file_type | string | 检测到的文件类型（`"executable"` / `"tar.gz"` / `"zip"` / `"npm"` / `"binary"`） |
 | file_size | number | 文件大小（字节，跳过时为 0） |
+| file_count | number? | 安装的文件数量（压缩包为解压后的文件数，跳过时为 null） |
 | version | string? | 当前版本号 |
-| previous_version | string? | 更新前的版本号（首次安装为 null，跳过时等于 version） |
-| platform | string? | 实际匹配的平台 key（跳过时为 null） |
 | source_url | string? | 实际下载的 URL（跳过时为 null） |
+| action | string? | 本次操作类型（`"installed"` / `"updated"` / `"skipped"`） |
+| installed | boolean | 本次是否实际执行了下载安装（`action != "skipped"` 时为 true） |
+| previous_version | string? | 更新前的版本号（首次安装为 null，跳过时等于 version） |
+| platform | string? | 实际匹配的平台 key（如 `"linux-x86_64"`，跳过时为 null） |
 
 #### 处理流程（多版本并存模式: platforms + version）
 
@@ -1078,17 +1067,13 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 ```json
 {
   "project_id": "p1",
-  "agent_id": "codex-acp",
-  "version": null,
-  "user_id": null,
-  "pod_id": null,
-  "tenant_id": null,
-  "space_id": null,
-  "isolation_type": null
+  "agent_id": "codex-acp"
 }
 ```
 
 #### 字段说明
+
+请求体通过 `#[serde(flatten)]` 嵌入 `RoutingParams`，路由字段均为**可选**：
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -1109,7 +1094,8 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 {
   "agent_id": "codex-acp",
   "uninstalled": true,
-  "install_type": "binary"
+  "install_type": "binary",
+  "removed_versions": ["1.2.0", "1.1.0"]
 }
 ```
 
@@ -1119,17 +1105,19 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 {
   "agent_id": "codex-acp",
   "uninstalled": true,
-  "install_type": "url"
+  "install_type": "url",
+  "removed_versions": ["1.0.0"]
 }
 ```
 
-#### 响应字段说明
+#### 响应字段说明（UninstallAgentResponse）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | agent_id | string | Agent 标识符 |
 | uninstalled | boolean | 是否成功卸载 |
 | install_type | `"builtin"` \| `"binary"` \| `"npm"` \| `"url"` \| `"unknown"` | 安装类型 |
+| removed_versions | string[] | 被卸载的版本列表 |
 
 #### 处理逻辑
 
@@ -1517,19 +1505,22 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
 > - `install` 端点改用 `multipart/form-data`(字段 `file` + 字段 `metadata` JSON 字符串)
 > - 路径从 `/{id}` 改为 `/list` / `/get` / `/check` / `/uninstall` 等动词路径,语义更清晰
 > - **容器路由**：所有端点支持 `project_id`(向后兼容) 或 `user_id`/`pod_id` + 隔离字段(多租户)两种路由方式
+> - **gRPC 转发**：rcoder 通过独立的 `AgentMgmtService`（非 `AgentService`）gRPC 转发到 agent_runner 容器
 
-| 方法 | 路径 | Body | 转发到 |
-|------|------|------|--------|
+| 方法 | 路径 | 请求体类型 | gRPC 转发 |
+|------|------|-----------|----------|
 | POST | `/agent-mgmt/agents/list`             | `ListAgentsRequest` JSON:`{project_id?, user_id?, pod_id?, ...}` | `AgentMgmtService.ListAgents` |
-| POST | `/agent-mgmt/agents/get`              | `GetAgentRequest` JSON:`{project_id?, agent_id, version?, user_id?, pod_id?, ...}` | `AgentMgmtService.GetAgent` |
-| POST | `/agent-mgmt/agents/check`            | `CheckAgentRequest` JSON:`{project_id?, agent_id, version?, user_id?, pod_id?, ...}` | `AgentMgmtService.CheckAgent` |
+| POST | `/agent-mgmt/agents/get`              | `GetAgentRequest` JSON:`{project_id?, agent_id, version?, ...}` | `AgentMgmtService.GetAgent` |
+| POST | `/agent-mgmt/agents/check`            | `CheckAgentRequest` JSON:`{project_id?, agent_id, version?, ...}` | `AgentMgmtService.CheckAgent` |
 | POST | `/agent-mgmt/agents/install`          | `multipart/form-data`:`file`(binary) + `metadata`(JSON 字符串) | `AgentMgmtService.InstallAgent` (client streaming) |
-| POST | `/agent-mgmt/agents/install-from-url` | `InstallFromUrlRequest` JSON:`{project_id?, agent_id, command, version, platforms, args?, user_id?, ...}` | `AgentMgmtService.InstallAgent` (metadata only, 版本检查+多平台自动匹配) |
-| POST | `/agent-mgmt/agents/install-from-npm` | `InstallFromPackageManagerRequest` JSON:`{project_id?, agent_id, command, package, user_id?, ...}` | `AgentMgmtService.InstallAgent` (metadata only) |
-| POST | `/agent-mgmt/agents/uninstall`        | `UninstallAgentRequest` JSON:`{project_id?, agent_id, version?, user_id?, pod_id?, ...}` | `AgentMgmtService.UninstallAgent` |
+| POST | `/agent-mgmt/agents/install-from-url` | `InstallFromUrlRequest` JSON:`{project_id?, agent, platforms, force?, ...}` | `AgentMgmtService.InstallAgent` (metadata only) |
+| POST | `/agent-mgmt/agents/install-from-npm` | `InstallFromPackageManagerRequest` JSON:`{project_id?, agent, package, ...}` | `AgentMgmtService.InstallAgent` (metadata only) |
+| POST | `/agent-mgmt/agents/uninstall`        | `UninstallAgentRequest` JSON:`{project_id?, agent_id, version?, ...}` | `AgentMgmtService.UninstallAgent` |
 
 > **`...`** 表示共享的 `RoutingParams` 字段：`user_id`, `pod_id`, `tenant_id`, `space_id`, `isolation_type`。
 > 所有端点的请求体都通过 `#[serde(flatten)]` 嵌入 `RoutingParams`（定义在 `shared_types`），`project_id` 在 `RoutingParams` 内，优先路由，无 `project_id` 时按 `pod_id`/`user_id` 定位容器。
+>
+> **`install-from-url` 特殊说明**：该端点在 rcoder 端直接处理（不通过 gRPC 转发到 agent_runner），rcoder 调用 `agent_install_strategy::do_install_from_url` 在宿主机完成下载和注册表更新。
 
 ---
 
@@ -1539,8 +1530,9 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
 > rcoder 转发层(`status_to_app_error`)解析前缀还原为 `AppError`,前端拿到的错误码与直连 agent-runner HTTP 一致。
 > rcoder 自身还会产生两个新增错误码(`ERR_PROJECT_NOT_FOUND` / `ERR_AGENT_RUNNER_UNAVAILABLE`),
 > 用于"项目不存在"和"agent-runner 不可用"两种转发层失败模式。
+> 错误码定义文件: `crates/shared_types_i18n/src/error_codes.rs`
 
-### 7.1 agent-runner 业务错误码(20 个)
+### 7.1 agent-runner 业务错误码(21 个)
 
 | 错误码 | 说明 | 涉及的接口 |
 |--------|------|-----------|
@@ -1564,6 +1556,7 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
 | `ERR_AGENT_MGMT_INVALID_CHUNK` | streaming chunk 格式错误 | install |
 | `ERR_AGENT_MGMT_PLATFORM_NOT_FOUND` | `platforms` 中无匹配当前系统的 URL | install-from-url |
 | `ERR_AGENT_MGMT_INVALID_VERSION` | `version` 格式不合法(非语义化版本号) | install-from-url |
+| `ERR_AGENT_MGMT_INSTALL_CANCELLED` | 安装被取消(force=true 时取消正在进行的安装) | install-from-url |
 
 ### 7.2 rcoder 转发层错误码(2 个,新增)
 
@@ -1596,230 +1589,152 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
 
 文件路径: `crates/shared_types/src/agent_mgmt_types.rs`
 
+> 以下类型定义与代码保持一致（截至 2026-06-15）。
+
 ```rust
-/// 多租户容器路由参数（与 /computer/chat 保持一致）
+/// 多租户容器路由参数（所有 /agent-mgmt/* 端点共享）
 ///
-/// 所有 `/agent-mgmt/*` 端点共享此参数，用于定位目标容器。
+/// 所有请求体通过 `#[serde(flatten)]` 嵌入此结构体。
 /// - `project_id` 有值时: 按 project_id 查找（向后兼容）
 /// - `user_id` 或 `pod_id` 有值时: 按容器标识查找（多租户模式）
+/// - 路由字段全部可选，校验逻辑在 handler 层
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct RoutingParams {
+    /// 项目 ID（与 user_id/pod_id 二选一）
     pub project_id: Option<String>,
+    /// 用户 ID（ComputerAgentRunner 模式，定位容器）
     pub user_id: Option<String>,
+    /// 容器复用标识（有值时覆盖 user_id 作为容器标识）
     pub pod_id: Option<String>,
-    /// 同时接受字符串和数字
+    /// 租户 ID（pod_id 有值时必填，同时接受字符串和数字）
     #[serde(deserialize_with = "flexible_string")]
     pub tenant_id: Option<String>,
-    /// 同时接受字符串和数字
+    /// 空间 ID（pod_id 有值时必填，同时接受字符串和数字）
     #[serde(deserialize_with = "flexible_string")]
     pub space_id: Option<String>,
+    /// 隔离类型：tenant / space / project（pod_id 有值时必填）
     pub isolation_type: Option<String>,
 }
-```
 
-> 所有请求体结构通过 `#[serde(flatten)]` 嵌入 `RoutingParams`（定义在 `shared_types`），`project_id` 在 `RoutingParams` 内部。
-
-```rust
 /// 默认安装目录常量
 pub const DEFAULT_ACP_AGENT_INSTALL_DIR: &str = "/home/user/acp-agent";
+
+/// 二进制上传时单 chunk 大小(1 MB)
+pub const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// 最大允许的二进制文件大小(1 GB)
+pub const MAX_BINARY_SIZE: u64 = 1024 * 1024 * 1024;
+
+/// 解压后累计字节上限(1 GB,防 zip bomb)
+pub const MAX_EXTRACTED_SIZE: u64 = 1024 * 1024 * 1024;
+
+/// URL 下载超时(10 分钟)
+pub const URL_DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 
 /// 系统平台信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SystemInfo {
-    /// 操作系统（如 "linux", "darwin", "windows"）
     pub os: String,
-    /// CPU 架构（如 "amd64", "arm64"）
     pub arch: String,
-    /// 平台标识（"{os}/{arch}"，如 "linux/amd64"）
     pub platform: String,
 }
 
-impl SystemInfo {
-    /// 从当前运行环境获取系统信息
-    pub fn current() -> Self {
-        let os = std::env::consts::OS.to_string();
-        let arch = match std::env::consts::ARCH {
-            "x86_64" => "amd64".to_string(),
-            "aarch64" => "arm64".to_string(),
-            other => other.to_string(),
-        };
-        let platform = format!("{}/{}", os, arch);
-        Self { os, arch, platform }
-    }
-}
-
-/// 上传文件类型
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+/// Agent 安装类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum UploadFileType {
-    /// 单个可执行文件
-    Executable,
-    /// tar.gz 压缩包
-    TarGz,
-    /// zip 压缩包
-    Zip,
-}
-
-/// 安装类型
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentInstallType {
-    /// 内置 Agent（编译时嵌入）
+pub enum InstallType {
     Builtin,
-    /// 上传二进制文件
     Binary,
-    /// 通过包管理器安装
     Npm,
-}
-
-/// Agent 状态
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentInstallStatus {
-    /// 可用
-    Available,
-    /// 已安装但损坏
-    Broken,
-    /// 未安装
-    NotInstalled,
-    /// 状态未知
+    Url,
+    #[default]
     Unknown,
 }
 
-/// 列出已安装 Agent 请求
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListInstalledAgentsRequest {
-    pub user_id: String,
-    pub pod_id: Option<String>,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
+/// Agent 安装状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInstallStatus {
+    Available,
+    Broken,
+    NotInstalled,
+    #[default]
+    Unknown,
 }
 
-/// 检查 Agent 状态请求
+/// Agent 注册表条目（列表响应）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AgentInfo {
+    pub agent_id: String,
+    pub install_type: InstallType,
+    pub status: AgentInstallStatus,
+    pub version: Option<String>,
+    pub binary_path: Option<String>,
+    pub installed_at: Option<i64>,  // Unix timestamp 秒
+}
+
+/// 列出已安装 Agent 的请求
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct ListAgentsRequest {
+    #[serde(flatten)]
+    pub routing: RoutingParams,
+}
+
+/// 列出已安装 Agent 的响应
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAgentsResponse {
+    pub system_info: SystemInfo,
+    pub agents: Vec<AgentInfo>,
+    pub total: usize,
+    pub install_dir: String,
+}
+
+/// 静态检查结果
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct StaticCheckResult {
+    pub file_exists: bool,
+    pub executable: bool,
+    pub in_path: bool,
+}
+
+/// Agent 详情（check/get 响应）
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct AgentDetailInfo {
+    pub agent_id: String,
+    pub install_type: InstallType,
+    pub installed: bool,
+    pub status: AgentInstallStatus,
+    pub version: Option<String>,
+    pub version_check_supported: bool,
+    pub static_checks: StaticCheckResult,
+}
+
+/// 检查指定 Agent 状态的请求
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct CheckAgentRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
     pub agent_id: String,
-    /// 可选版本号，不传则检查最新版本
-    #[serde(default)]
     pub version: Option<String>,
 }
 
-/// 卸载 Agent 请求
+/// 查询单个 Agent 详情的请求
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
-pub struct UninstallAgentRequest {
+pub struct GetAgentRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
     pub agent_id: String,
-    /// 可选版本号，不传则卸载全部版本
-    #[serde(default)]
     pub version: Option<String>,
 }
 
-/// 二进制安装请求（multipart/form-data 字段）
-///
-/// 由于二进制上传使用 multipart/form-data 而非 JSON，
-/// 此结构体用于解析表单字段（不包含 file 字段）。
-/// file 字段通过 axum 的 Multipart 提取器单独处理。
+/// 检查指定 Agent 状态的响应
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct InstallAgentBinaryForm {
-    pub user_id: String,
-    pub agent_id: String,
-    pub command: Option<String>,
-    #[serde(default)]
-    pub args: Option<Vec<String>>,
-    pub version_check_command: Option<Vec<String>>,
-    pub pod_id: Option<String>,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
-    #[serde(default)]
-    pub metadata: Option<HashMap<String, String>>,
-}
-
-/// Agent 信息（用于列表和详情响应）
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AgentInfo {
-    pub agent_id: String,
-    pub install_type: Option<AgentInstallType>,
-    pub install_dir: Option<String>,
-    pub command: Option<String>,
-    pub args: Vec<String>,
-    pub status: AgentInstallStatus,
-    pub version: Option<String>,
-    pub version_check_supported: bool,
-    pub binary_path: Option<String>,
-    pub installed_at: Option<String>,
-    pub metadata: HashMap<String, String>,
-}
-
-/// Agent 详情（包含版本检查输出等调试信息）
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AgentDetailInfo {
-    /// 容器系统信息（操作系统、CPU 架构）
+pub struct CheckAgentResponse {
     pub system_info: SystemInfo,
-    #[serde(flatten)]
-    pub info: AgentInfo,
-    pub installed: bool,
-    pub version_check_output: Option<String>,
-    pub version_check_error: Option<String>,
-    pub which_output: Option<String>,
-    /// 静态检查结果（不执行 agent 进程）
-    /// 当 version_check_supported = false 时，status 完全由此字段决定
-    pub static_checks: StaticCheckResult,
+    pub agent: AgentDetailInfo,
 }
 
-/// 静态检查结果（文件系统层面，不执行 agent 进程）
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct StaticCheckResult {
-    /// binary_path 文件是否存在
-    pub file_exists: bool,
-    /// 文件是否有可执行权限
-    pub executable: bool,
-    /// which {command} 是否找到
-    pub in_path: bool,
-}
-
-/// 包管理器安装请求
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct InstallAgentPackageRequest {
-    pub user_id: String,
-    pub agent_id: String,
-    pub package_manager: String,
-    pub package_name: String,
-    #[serde(default = "default_latest")]
-    pub package_version: String,
-    pub command: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    pub version_check_command: Option<Vec<String>>,
-    pub registry_url: Option<String>,
-    pub pod_id: Option<String>,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
-    #[serde(default)]
-    pub metadata: HashMap<String, String>,
-}
-
-/// 多租户容器路由参数（所有 /agent-mgmt/* 端点共享）
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct RoutingParams {
-    pub project_id: Option<String>,
-    pub user_id: Option<String>,
-    pub pod_id: Option<String>,
-    /// 同时接受字符串和数字
-    #[serde(deserialize_with = "flexible_string")]
-    pub tenant_id: Option<String>,
-    /// 同时接受字符串和数字
-    #[serde(deserialize_with = "flexible_string")]
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
-}
-
-/// Agent 身份信息（所有安装端点共享）
+/// Agent 身份信息（所有安装端点共享的 `agent` 子对象）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct AgentIdentity {
     pub agent_id: String,
@@ -1830,143 +1745,108 @@ pub struct AgentIdentity {
     pub version: Option<String>,
 }
 
-/// URL 安装请求（多平台 + 版本检查）
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+/// URL 安装 Agent 的请求（多平台 + 版本管理）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct InstallFromUrlRequest {
     #[serde(flatten)]
     pub routing: RoutingParams,
-    /// Agent 身份信息（agent_id, command, args, version）
     pub agent: AgentIdentity,
-    /// 平台 → 下载信息映射（key 如 "linux-x86_64", "linux-aarch64"）
-    pub platforms: HashMap<String, PlatformEntry>,
+    pub platforms: std::collections::HashMap<String, PlatformEntry>,
+    /// 强制重新安装（取消正在进行的安装，重新开始）
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// 包管理器安装 Agent 的请求
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct InstallFromPackageManagerRequest {
+    #[serde(flatten)]
+    pub routing: RoutingParams,
+    pub agent: AgentIdentity,
+    pub package: String,
 }
 
 /// 平台下载信息（platforms map 的值）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlatformEntry {
-    /// 下载 URL（http:// 或 https://）
     pub url: String,
-    /// SHA-256 校验和（hex,可选）
     pub sha256: Option<String>,
-    /// 文件大小（字节,用于磁盘空间预检查）
     pub size: Option<u64>,
 }
 
 /// 安装操作类型
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallAction {
-    /// 首次安装
     Installed,
-    /// 从旧版本升级
     Updated,
-    /// 跳过（已安装版本 >= 请求版本）
     Skipped,
 }
 
-/// 安装结果
+/// 安装响应（所有安装端点通用）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AgentInstallResult {
+pub struct InstallAgentResponse {
     pub agent_id: String,
-    pub install_type: AgentInstallType,
-    pub install_dir: String,
     pub status: AgentInstallStatus,
-    pub version: Option<String>,
     pub binary_path: String,
-    pub command: String,
-    pub installed_at: String,
-    /// 安装过程的输出（npm install 日志等）
-    pub install_output: Option<String>,
-    /// 检测到的上传文件类型
-    pub file_type: Option<UploadFileType>,
-    /// 文件大小（字节）
-    pub file_size: Option<u64>,
-    /// 安装的文件数量（单文件为 1，压缩包为解压后的文件数）
-    pub file_count: Option<u32>,
-    /// 压缩包解压后的文件列表（仅压缩包时返回）
-    pub extracted_files: Option<Vec<String>>,
-    /// 下载源 URL（仅 url 安装时返回）
+    pub file_type: String,
+    pub file_count: Option<usize>,
+    pub file_size: u64,
+    pub version: Option<String>,
     pub source_url: Option<String>,
-    /// 包名（仅 npm 安装）
-    pub package_name: Option<String>,
-    /// 包版本（仅 npm 安装）
-    pub package_version: Option<String>,
-
-    // === 新增字段（多平台版本管理） ===
-    /// 本次操作类型: installed / updated / skipped
+    // === 多平台版本管理字段 ===
     pub action: Option<InstallAction>,
-    /// 本次是否实际执行了下载安装（action != "skipped"）
     pub installed: bool,
-    /// 更新前的版本号（首次安装为 null,跳过时等于当前 version）
     pub previous_version: Option<String>,
-    /// 实际匹配的平台 key（如 "linux-x86_64",跳过时为 null）
     pub platform: Option<String>,
 }
 
-/// Agent 列表响应
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AgentListResponse {
-    /// 容器系统信息（操作系统、CPU 架构）
-    pub system_info: SystemInfo,
-    pub agents: Vec<AgentInfo>,
-    pub total: usize,
-    pub install_dir: String,
-}
-
-/// 卸载结果
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AgentUninstallResult {
+/// 卸载 Agent 的请求
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct UninstallAgentRequest {
+    #[serde(flatten)]
+    pub routing: RoutingParams,
     pub agent_id: String,
-    pub uninstalled: bool,
-    pub install_type: AgentInstallType,
-    pub install_dir: String,
-    pub removed_path: Option<String>,
+    pub version: Option<String>,
 }
 
-fn default_latest() -> String {
-    "latest".to_string()
+/// 卸载 Agent 的响应
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UninstallAgentResponse {
+    pub uninstalled: bool,
+    pub install_type: InstallType,
+    pub agent_id: String,
+    pub removed_versions: Vec<String>,
 }
 ```
 
 ### A.2 注册表类型 (agent_runner 内部)
 
+> 注册表文件 `registry.json` 存储在安装根目录下，格式为 `Vec<AgentManifest>`（数组，非 map）。
+
 ```rust
-/// Agent 注册表条目
+/// Agent 注册表条目（registry.json 中的每条记录）
+///
+/// 文件路径: `crates/agent_runner/src/agent_mgmt/installer/mod.rs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentRegistryEntry {
+pub struct AgentManifest {
     pub agent_id: String,
-    pub install_type: AgentInstallType,
-    pub install_dir: String,
+    pub install_type: String,       // "binary" | "npm" | "url"
     pub binary_path: String,
     pub command: String,
+    #[serde(default)]
     pub args: Vec<String>,
     pub version: Option<String>,
-    pub version_check_command: Option<Vec<String>>,
-    pub package_name: Option<String>,
-    pub package_version: Option<String>,
-    pub installed_at: String,
-    pub updated_at: String,
-    pub metadata: HashMap<String, String>,
-}
-
-/// Agent 注册表
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentRegistry {
-    /// 默认安装根目录
-    pub install_dir: String,
-    /// 已安装 Agent 映射表（key = agent_id）
-    pub agents: HashMap<String, AgentRegistryEntry>,
-}
-
-impl Default for AgentRegistry {
-    fn default() -> Self {
-        Self {
-            install_dir: DEFAULT_ACP_AGENT_INSTALL_DIR.to_string(),
-            agents: HashMap::new(),
-        }
-    }
+    pub installed_at: i64,          // Unix timestamp 秒
+    #[serde(default)]
+    pub source_url: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,   // 如 "linux-x86_64"
 }
 ```
+
+> **注册表文件格式**: `registry.json` 是一个 JSON 数组，每个元素是一个 `AgentManifest`。
+> rcoder 的 `list_agents` handler 优先从宿主机直接读取此文件（快速路径），容器未就绪时才回退到 gRPC。
 
 ---
 
@@ -2008,8 +1888,9 @@ let agent_mgmt_routes = Router::new()
     .with_state(state.clone());
 ```
 
-> `project_id` 优先从 body JSON 读取,也兼容 `?project_id=xxx` query(I18nJsonOrQuery 自动合并,JSON 优先)。
+> `project_id` 优先从 body JSON 读取,也兼容 `?project_id=xxx` query(`I18nJsonOrQuery` 自动合并,JSON 优先)。
 > 所有端点都支持 `RoutingParams` 字段(project_id, user_id, pod_id, tenant_id, space_id, isolation_type)通过 `#[serde(flatten)]` 嵌入请求体。
+> 7 个端点全部使用 POST 方法，通过独立的 `AgentMgmtService` gRPC 转发到 agent_runner 容器。
 
 ### B.2 agent_runner 容器内路由(本地直起模式)
 
@@ -2067,143 +1948,137 @@ HttpResult<ListAgentsResponse> JSON
 
 ## 附录 C: gRPC Proto 定义
 
-文件路径: `crates/shared_types/proto/agent.proto`
+文件路径: `crates/shared_types_grpc/proto/agent.proto`
+
+> **架构说明**: Agent 管理使用**独立的 `AgentMgmtService`**（与 `AgentService` 平级），不混入 `AgentService`。
+> 所有安装类型（binary/url/npm）共用一个 `InstallAgent` client streaming RPC，通过 metadata 中的 `install_type` 字段区分。
 
 rcoder 主服务收到请求后，通过 gRPC 转发到容器内的 agent_runner 执行：
 
 ```proto
-// 新增 RPC 方法
+// ========== Agent Service（核心对话服务）==========
 service AgentService {
-    // ... 现有方法 ...
-    
-    // Agent 管理
-    rpc ListInstalledAgents(ListInstalledAgentsRequest) returns (ListInstalledAgentsResponse);
-    rpc CheckAgentStatus(CheckAgentStatusRequest) returns (CheckAgentStatusResponse);
-    rpc InstallAgentBinary(stream InstallAgentBinaryChunk) returns (InstallAgentResult);
-    rpc InstallAgentPackage(InstallAgentPackageRequest) returns (InstallAgentResult);
-    rpc InstallAgentFromUrl(InstallAgentFromUrlRequest) returns (InstallAgentResult);
+    rpc Chat(ChatRequest) returns (ChatResponse);
+    rpc SubscribeProgress(ProgressRequest) returns (stream ProgressEvent);
+    rpc CancelSession(CancelRequest) returns (CancelResponse);
+    rpc ResolvePermission(ResolvePermissionRequest) returns (ResolvePermissionResponse);
+    rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+    rpc StopAgent(StopAgentRequest) returns (StopAgentResponse);
+    rpc GetContainerStatus(GetContainerStatusRequest) returns (GetContainerStatusResponse);
+    rpc GetVncStatus(GetVncStatusRequest) returns (GetVncStatusResponse);
+}
+
+// ========== Agent Management Service（独立服务，P0-1）==========
+//
+// 部署在 agent_runner 容器内，提供安装/卸载/检查 agent 二进制的能力。
+// 二进制上传通过 client streaming (InstallAgent) 走 1MB chunk。
+service AgentMgmtService {
+    // 列出已安装的 agent
+    rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+    // 上传二进制（支持单文件/tar.gz/zip，client streaming）
+    rpc InstallAgent(stream InstallAgentRequest) returns (InstallAgentResponse);
+    // 卸载 agent
     rpc UninstallAgent(UninstallAgentRequest) returns (UninstallAgentResponse);
+    // 检查指定 agent 状态
+    rpc CheckAgent(CheckAgentRequest) returns (CheckAgentResponse);
+    // 查询单个 agent 详情（快速）
+    rpc GetAgent(GetAgentRequest) returns (GetAgentResponse);
 }
 
 // ========== Agent 管理消息类型 ==========
 
-message ListInstalledAgentsRequest {
-    // 安装目录由后端约定，无需客户端传入
+message ListAgentsRequest {
+    reserved 1;  // proto3 允许空 message，reserved 防止 field number 被复用
 }
 
-message ListInstalledAgentsResponse {
-    SystemInfoProto system_info = 1;
-    repeated AgentInfoProto agents = 2;
+message ListAgentsResponse {
+    SystemInfo system_info = 1;
+    repeated AgentInfo agents = 2;
     int32 total = 3;
     string install_dir = 4;
 }
 
-message SystemInfoProto {
+message SystemInfo {
     string os = 1;
     string arch = 2;
     string platform = 3;
 }
 
-message AgentInfoProto {
+message AgentInfo {
     string agent_id = 1;
-    string install_type = 2;       // "builtin" | "binary" | "npm"
-    string install_dir = 3;        // 安装目录（builtin 为空）
-    string command = 4;
-    repeated string args = 5;
-    string status = 6;             // "available" | "broken" | "not_installed" | "unknown"
-    string version = 7;            // 可为空
-    bool version_check_supported = 8;
-    string binary_path = 9;
-    string installed_at = 10;      // ISO 8601
-    map<string, string> metadata = 11;
+    string install_type = 2;       // "builtin" | "binary" | "npm" | "url" | "unknown"
+    string status = 3;             // "available" | "broken" | "not_installed" | "unknown"
+    optional string version = 4;
+    optional string binary_path = 5;
+    optional int64 installed_at = 6;  // Unix timestamp 秒
 }
 
-message CheckAgentStatusRequest {
+message CheckAgentRequest {
     string agent_id = 1;
-    optional string version = 2;    // 可选版本号，不传则检查最新版本
+    optional string version = 2;
 }
 
-message CheckAgentStatusResponse {
-    SystemInfoProto system_info = 1;
-    AgentInfoProto agent_info = 2;
+message CheckAgentResponse {
+    SystemInfo system_info = 1;
+    AgentDetailInfo agent = 2;
+}
+
+message GetAgentRequest {
+    string agent_id = 1;
+    optional string version = 2;
+}
+
+message GetAgentResponse {
+    bool found = 1;
+    AgentDetailInfo agent = 2;  // 仅当 found=true 有效
+}
+
+message AgentDetailInfo {
+    string agent_id = 1;
+    string install_type = 2;       // "builtin" | "binary" | "npm" | "url" | "unknown"
     bool installed = 3;
-    string version_check_output = 4;
-    string version_check_error = 5;
-    string which_output = 6;
-    // 静态检查结果（不执行 agent 进程）
-    bool file_exists = 7;
-    bool executable = 8;
-    bool in_path = 9;
+    string status = 4;             // "available" | "broken" | "not_installed" | "unknown"
+    optional string version = 5;
+    bool version_check_supported = 6;
+    StaticCheckResult static_checks = 7;
 }
 
-message InstallAgentBinaryChunk {
-    // 第一个 chunk 包含元数据，后续 chunk 包含文件内容
-    oneof payload {
-        InstallAgentBinaryMetadata metadata = 1;
-        bytes file_data = 2;
+message StaticCheckResult {
+    bool file_exists = 1;
+    bool executable = 2;
+    bool in_path = 3;
+}
+
+// 上传 binary 用的 streaming request
+// 首包携带 metadata，后续包只携带 data
+message InstallAgentRequest {
+    message Metadata {
+        optional string agent_id = 1;
+        optional string command = 2;
+        repeated string args = 3;
+        optional string sha256 = 4;
+        optional InstallType install_type = 5;  // 缺省 BINARY
+        optional string source_url = 6;         // URL 安装时必填
+        optional string npm_package = 7;        // NPM 安装时必填
+        // === 多平台版本管理 ===
+        optional string version = 8;            // 期望安装的版本号（semver）
+        optional string platforms = 9;          // HashMap<String, PlatformEntry> 的 JSON 序列化
+        optional bool force = 10;               // 强制重新安装
     }
+    Metadata metadata = 1;   // 首包携带
+    bytes data = 2;          // 后续 chunk 的数据
 }
 
-message InstallAgentBinaryMetadata {
+message InstallAgentResponse {
     string agent_id = 1;
-    string command = 2;
-    repeated string args = 3;
-    repeated string version_check_command = 4;
-    map<string, string> metadata = 5;
-    string filename = 6;           // 原始文件名
-    int64 total_size = 7;          // 文件总大小（字节）
-    string file_type = 8;          // "executable" | "tar.gz" | "zip"（由 rcoder 检测后传入）
-}
-
-message InstallAgentPackageRequest {
-    string agent_id = 1;
-    string package_manager = 2;    // "npm" | "bun" | "pnpm"
-    string package_name = 3;
-    string package_version = 4;
-    string command = 5;
-    repeated string args = 6;
-    repeated string version_check_command = 7;
-    string registry_url = 8;
-    map<string, string> metadata = 9;
-}
-
-message InstallAgentFromUrlRequest {
-    string agent_id = 1;
-    string command = 2;
-    string version = 3;            // 期望安装的版本号（semver）
-    // platforms: key = "{os}-{arch}" (如 "linux-x86_64"), value = PlatformEntry JSON
-    map<string, bytes> platforms = 4;  // 平台 → PlatformEntry (JSON 序列化)
-    repeated string args = 5;
-    map<string, string> metadata = 6;
-}
-
-// 注: 实际实现中,所有安装类型共用 InstallAgentRequest (client streaming),
-// 上述 InstallAgentFromUrlRequest 仅用于文档说明。
-// 新增字段通过 InstallAgentRequest.Metadata 传递:
-//   optional string version = 8;
-//   optional string platforms = 9;  // HashMap<String, PlatformEntry> 的 JSON 序列化(字符串)
-
-message InstallAgentResult {
-    string agent_id = 1;
-    string install_type = 2;
-    string install_dir = 3;
-    string status = 4;
-    string version = 5;
-    string binary_path = 6;
-    string command = 7;
-    string installed_at = 8;
-    string install_output = 9;     // npm install 日志等
-    string file_type = 10;         // "executable" | "tar.gz" | "zip"
-    int64 file_size = 11;
-    int32 file_count = 12;         // 安装的文件数量
-    repeated string extracted_files = 13;  // 压缩包解压后的文件列表
-    string source_url = 14;        // 下载源 URL（仅 url 安装）
-    string package_name = 15;      // 仅 npm
-    string package_version = 16;   // 仅 npm
-    bool success = 17;
-    string error_code = 18;
-    string error_message = 19;
-    // === 新增字段（多平台版本管理） ===
+    string status = 2;             // "available" | "broken" | "not_installed" | "unknown"
+    string binary_path = 3;
+    string file_type = 4;          // "executable" | "tar.gz" | "zip" | "npm"
+    optional int32 file_count = 5;
+    int64 file_size = 6;
+    optional string version = 7;
+    optional string source_url = 8;
+    // === 多平台版本管理响应字段 ===
     string action = 20;            // "installed" | "updated" | "skipped"
     bool installed = 21;           // 本次是否实际安装
     string previous_version = 22;  // 更新前版本（首次安装为空）
@@ -2212,22 +2087,18 @@ message InstallAgentResult {
 
 message UninstallAgentRequest {
     string agent_id = 1;
-    optional string version = 2;    // 可选版本号，不传则卸载全部版本
+    optional string version = 4;   // 可选版本号，不传则卸载全部版本
 }
 
 message UninstallAgentResponse {
-    string agent_id = 1;
-    bool uninstalled = 2;
-    string install_type = 3;
-    string install_dir = 4;
-    string removed_path = 5;
-    bool success = 6;
-    string error_code = 7;
-    string error_message = 8;
+    bool uninstalled = 1;
+    InstallType install_type = 2;
+    string agent_id = 3;
+    repeated string removed_versions = 5;
 }
 ```
 
-**注意**: `InstallAgentBinary` 使用 client streaming，将大文件分块传输（每块 1MB），避免 gRPC 单次消息大小限制。
+**注意**: `InstallAgent` 使用 client streaming，将大文件分块传输（每块 1MB），避免 gRPC 单次消息大小限制。URL 和 NPM 安装模式下 data 通常为空（仅首包 metadata 有效）。
 
 ---
 
