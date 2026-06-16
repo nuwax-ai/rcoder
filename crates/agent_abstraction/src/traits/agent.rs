@@ -58,6 +58,13 @@ pub struct AgentStartConfig {
 
     /// 工具审批规则（来自请求参数）
     pub tool_approval_rules: Option<Vec<shared_types::ToolApprovalRule>>,
+
+    /// 🆕 是否是 DevComputer 接口请求
+    ///
+    /// 用于 `{PREFIX_WORKSPACE_DIR}` 变量解析：
+    /// - `true`（devcomputer）：LOG_DIR 解析为 `/home/user/`（方便开发调试）
+    /// - `false`（computer）：LOG_DIR 解析为 `/app/container-logs`
+    pub is_devcomputer: bool,
 }
 
 impl AgentStartConfig {
@@ -78,6 +85,7 @@ impl AgentStartConfig {
             acp_session_create_timeout_secs: None,
             agent_cancel_timeout_secs: None,
             tool_approval_rules: None,
+            is_devcomputer: false,
         }
     }
 
@@ -153,6 +161,14 @@ impl AgentStartConfig {
         rules: Option<Vec<shared_types::ToolApprovalRule>>,
     ) -> Self {
         self.tool_approval_rules = rules;
+        self
+    }
+
+    /// 🆕 Set is_devcomputer flag
+    ///
+    /// 用于 `{PREFIX_WORKSPACE_DIR}` 变量解析逻辑
+    pub fn with_is_devcomputer(mut self, is_devcomputer: bool) -> Self {
+        self.is_devcomputer = is_devcomputer;
         self
     }
 
@@ -350,6 +366,13 @@ pub struct PromptMessage {
     ///
     /// Contains Agent server configuration and MCP server configuration
     pub agent_config_override: Option<shared_types::ChatAgentConfig>,
+
+    /// 是否是 DevComputer 接口请求
+    ///
+    /// 用于 `{PREFIX_WORKSPACE_DIR}` 变量解析：
+    /// - `true`：LOG_DIR 解析为 `/home/user/`
+    /// - `false`：LOG_DIR 解析为 `/app/container-logs`
+    pub is_devcomputer: bool,
 }
 
 impl PromptMessage {
@@ -375,6 +398,7 @@ impl PromptMessage {
             system_prompt_override: None,
             user_prompt_template_override: None,
             agent_config_override: None,
+            is_devcomputer: false,
         }
     }
 
@@ -428,11 +452,12 @@ impl PromptMessage {
 impl From<shared_types::ChatPrompt> for PromptMessage {
     fn from(chat_prompt: shared_types::ChatPrompt) -> Self {
         info!(
-            "[agent_abstraction] Converting ChatPrompt to PromptMessage, project_id={:?}, session_id={:?}, has_model_provider={}, has_agent_config_override={}",
+            "[agent_abstraction] Converting ChatPrompt to PromptMessage, project_id={:?}, session_id={:?}, has_model_provider={}, has_agent_config_override={}, is_devcomputer={}",
             chat_prompt.project_id,
             chat_prompt.session_id,
             chat_prompt.model_provider.is_some(),
             chat_prompt.agent_config_override.is_some(),
+            chat_prompt.is_devcomputer,
         );
 
         Self {
@@ -452,6 +477,7 @@ impl From<shared_types::ChatPrompt> for PromptMessage {
             system_prompt_override: chat_prompt.system_prompt_override,
             user_prompt_template_override: chat_prompt.user_prompt_template_override,
             agent_config_override: chat_prompt.agent_config_override,
+            is_devcomputer: chat_prompt.is_devcomputer,
         }
     }
 }

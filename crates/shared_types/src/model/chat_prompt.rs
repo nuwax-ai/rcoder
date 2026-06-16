@@ -53,6 +53,14 @@ pub struct ChatPrompt {
     /// 包含 Agent 服务器配置和 MCP 服务器配置
     #[builder(default)]
     pub agent_config_override: Option<ChatAgentConfig>,
+
+    /// 是否是 DevComputer 接口请求
+    ///
+    /// 用于 `{PREFIX_WORKSPACE_DIR}` 变量解析：
+    /// - `true`：LOG_DIR 解析为 `/home/user/`
+    /// - `false`：LOG_DIR 解析为 `/app/container-logs`
+    #[builder(default)]
+    pub is_devcomputer: bool,
 }
 
 /// 返回用户 prompt 的提示,一定有project_id ,session_id ,否则报错

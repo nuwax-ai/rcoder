@@ -104,6 +104,7 @@ impl TestRequestBuilder {
             system_prompt_override: None,
             user_prompt_template_override: None,
             agent_config_override: None,
+            is_devcomputer: false,
         }
     }
 

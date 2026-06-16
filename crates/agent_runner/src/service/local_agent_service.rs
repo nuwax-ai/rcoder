@@ -121,6 +121,7 @@ impl AgentHttpService for LocalAgentHttpService {
             agent_config_override: request.agent_config,
             system_prompt_override: request.system_prompt,
             user_prompt_template_override: request.user_prompt,
+            is_devcomputer: false,
         };
 
         // 6. 构建 ChatHandlerContext

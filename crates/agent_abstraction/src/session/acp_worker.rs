@@ -132,7 +132,8 @@ where
         let mut start_config = AgentStartConfig::new(request.prompt_message.service_type.clone())
             .with_system_prompt(system_prompt)
             .with_mcp_servers(mcp_servers)
-            .with_user_id(request.prompt_message.user_id.clone());
+            .with_user_id(request.prompt_message.user_id.clone())
+            .with_is_devcomputer(request.prompt_message.is_devcomputer);
 
         // 🆕 如果用户指定了 agent_server 配置，添加到 start_config
         // 注意：这里直接使用用户传入的配置，由 launcher 层负责与默认配置合并

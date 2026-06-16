@@ -645,9 +645,11 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 | agent_id | string | 是 | Agent 标识符（如 "codex-acp"） |
 | command | string | 是 | 入口可执行文件名（如 "codex-acp"） |
 | args | string[] | 否 | 启动参数（默认空） |
-| version | string? | 否 | 版本号（可选） |
+| version | string? | 否 | 版本号（可选，**当前实现忽略此字段**，见下方说明） |
 
 > **install_type 说明**：BINARY 模式必须提供 `file` 字段；URL/NPM 模式请使用专用端点 `/install-from-url` 和 `/install-from-npm`。
+>
+> **version 字段说明**：当前 `/install` 端点**不支持多版本并存**。虽然 metadata 中可以传 `agent.version`，但底层实现（`binary_installer::install_from_bytes` 和 `install_from_prepared_stream`）会忽略该字段，始终采用**单版本替换模式**——每次安装会覆盖同一 `agent_id` 的已有文件和注册表条目。如需多版本并存，请使用 `/install-from-url` 端点。
 
 #### 请求示例 - 上传 tar.gz 压缩包
 
@@ -705,27 +707,33 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 1. 验证参数（agent_id, command, metadata 必填）
 2. 验证文件大小（上限 1GB）
 3. 定位目标容器（根据 project_id / user_id / pod_id + 隔离字段）
-4. 确保安装目录存在：
-   mkdir -p /home/user/acp-agent/bin
+4. SHA-256 校验（如果 metadata 中提供了 sha256）
 5. 自动检测文件类型（扩展名 + magic bytes）:
-   - .tar.gz / .tgz → 压缩包
-   - .zip → 压缩包
-   - 其他 → 单文件
-6a. 单文件处理:
-    - 将文件写入临时位置：/tmp/acp-install-{uuid}/{command}
-    - 移动到目标位置：mv → /home/user/acp-agent/bin/{command}
-6b. 压缩包处理:
-    - 解压到临时目录：/tmp/acp-install-{uuid}/
-    - 在解压目录中查找 command 对应的可执行文件
-    - 将入口可执行文件移动到 bin/{command}
-    - 其余文件（动态库、配置等）移动到 lib/{agent_id}/
-7. 添加执行权限：chmod +x
-8. 更新 PATH 持久化脚本
-9. 验证安装：which {command} → 确认 PATH 可达
-10. 更新注册表 registry.json
-11. 清理临时文件
-12. 返回安装结果
+   - .tar.gz / .tgz → 压缩包 ✓
+   - .zip → 压缩包 ✓
+   - 其他 → 拒绝（返回 ERR_AGENT_MGMT_UNSUPPORTED_TYPE，当前仅支持压缩包）
+6. 确定安装目录：
+   - version 有值 → {install_dir}/{agent_id}/{version}/（当前实现 version 被忽略，始终走下方逻辑）
+   - version 无值 → {install_dir}/{agent_id}/（单版本替换模式）
+7. 如果目标目录已存在，删除整个目录（remove_dir_all）
+8. 创建目标目录，将压缩包写入 staging 文件
+9. 解压压缩包（tar.gz 或 zip）到目标目录
+10. 剥掉单个顶层目录包装（如 deepagents-dev-templates-0.2.9/）
+11. 检测包类型：
+    a. 目录型包（存在 agent-package.json / package.json）:
+       - 从 metadata 读取入口脚本和 args
+       - binary_path = 目录路径
+    b. 二进制型包（无 metadata 文件）:
+       - 在解压目录中查找 command 对应的可执行文件
+       - binary_path = 入口可执行文件路径
+12. 构建 AgentManifest，调用 registry.upsert() 覆盖式更新注册表
+13. 清理 staging 文件
+14. 返回安装结果
 ```
+
+> **与 `/install-from-url` 的区别**：
+> - `/install` 端点：单版本替换模式，每次安装覆盖同一 agent_id 的已有版本
+> - `/install-from-url` 端点：多版本并存模式，不同版本安装到独立目录，支持幂等跳过
 
 #### 错误场景
 
@@ -830,12 +838,16 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 
 ---
 
-### 3.5 通过 URL 安装 Agent（多平台自动版本管理）
+### 3.5 通过 URL 安装 Agent（多平台 + 多版本并存）
 
 **`POST /agent-mgmt/agents/install-from-url`**
 
-从指定 URL 下载压缩包安装 ACP Agent。支持**多平台 URL** + **版本号**，agent-runner 自动判断当前系统架构、对比已安装版本，决定是否需要下载安装（幂等）。
+从指定 URL 下载压缩包安装 ACP Agent。支持**多平台 URL** + **版本号** + **多版本并存**。
 
+> **执行位置**：此端点在 **rcoder 侧（宿主机）** 直接执行，不通过 gRPC 转发到 agent_runner 容器。
+> rcoder 调用 `agent_install_strategy::do_install_from_url`，基于 `AgentDownloadManager` 实现"下载到缓存 → 解压到版本目录 → 更新注册表"的流程。
+> 多版本并存的核心：每个版本安装到独立的 `{install_dir}/{agent_id}/{version}/` 目录，不同版本互不干扰。
+>
 > **设计参考**: Tauri 更新 manifest 的 `platforms` 字段设计（`{os}-{arch}` 命名，每个平台条目含 `url` / `sha256` / `size`）。
 
 #### 请求体
@@ -1002,42 +1014,45 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/install \
 | previous_version | string? | 更新前的版本号（首次安装为 null，跳过时等于 version） |
 | platform | string? | 实际匹配的平台 key（如 `"linux-x86_64"`，跳过时为 null） |
 
-#### 处理流程（多版本并存模式: platforms + version）
+#### 处理流程（rcoder 侧，多版本并存模式）
 
 ```
 1. 验证参数
    - agent_id, command 必填
-   - version 必填（platforms 模式），必须是合法 semver（如 "1.0.0"、"v2.1.3"）
+   - version 必填，必须是合法 semver（如 "1.0.0"、"v2.1.3"）
    - platforms 不能为空
    - 每个 platform entry 的 url 必须是 http:// 或 https://
-2. 定位目标容器（project_id / user_id / pod_id + 隔离字段）
-3. 版本检查（幂等核心，精确版本匹配）:
-   a. 查询注册表 registry.json → 该精确版本是否已安装?
-      - version 归一化处理：去除 v/V 前缀、trim 空格
-      - "v1.0.0" 和 "1.0.0" 视为同一版本
-   b. 精确版本已安装 → action = "skipped"（直接返回，不下载）
-   c. 精确版本未安装 → action = "installed"（新版本并存安装）
-4. 如果 action == "skipped":
-   - 直接返回现有 agent 信息（不下载,不替换）
-   - installed = false, previous_version = version
-5. 如果 action == "installed":
-   a. 获取当前系统平台: SystemInfo { os, arch }
+2. 根据 ServiceType 解析安装目录（Strategy Pattern）:
+   - ComputerAgentRunner → /app/computer-project-workspace/{user_id}/acp-agent
+   - RCoder → /app/project_workspace/{project_id}/acp-agent
+3. 平台匹配:
+   a. 获取当前系统 os/arch
    b. 归一化: amd64 → x86_64, arm64 → aarch64
    c. 构造 key: "{os}-{arch}" (如 "linux-x86_64")
-   d. 在 platforms 中查找:
-      - 精确匹配 → 使用
-      - 没找到 → 返回 ERR_AGENT_MGMT_PLATFORM_NOT_FOUND
-   e. 预检查磁盘空间（如果 size 有值）
-   f. 在容器内下载文件（流式,超时 10 分钟）
-   g. SHA-256 校验（如果该平台条目有 sha256）
-   h. 自动检测文件类型（扩展名 + magic bytes）
-   i. 解压 / 移动到 bin/{command},chmod +x
-   j. 更新 PATH 持久化脚本
-   k. 验证: which {command}
-   l. 更新注册表 registry.json（记录 version, source_url, platform）
-   m. 清理临时文件
-   n. 返回安装结果
+   d. 在 platforms 中查找 → 没找到返回 ERR_AGENT_MGMT_PLATFORM_NOT_FOUND
+4. 缓存检查（幂等核心）:
+   a. 检查 {cache_dir}/{agent_id}/{normalized_version}/ 是否存在
+   b. 已缓存 → 跳过下载，直接从缓存复制（零延迟）
+   c. 未缓存 → 执行下载
+5. 下载到缓存目录:
+   a. 并发锁: 同一 agent_id:version 只有一个下载任务
+   b. 双重检查: 锁内再次检查缓存（防止并发重复下载）
+   c. 下载到临时文件 → rename 到 {cache_dir}/{agent_id}/{version}/
+6. 复制到安装目录（多版本并存的关键）:
+   a. 目标路径: {install_dir}/{agent_id}/{version}/（每个版本独立目录）
+   b. 如果目标已存在 → 删除（确保干净复制）
+   c. 检测文件类型（magic bytes + 扩展名）:
+      - tar.gz / zip → 解压到目标目录 + 规范化目录结构（去除单层 wrapper）
+      - 其他 → 直接复制
+7. 更新注册表 registry.json:
+   a. 记录 agent_id, version, command, args, install_dir
+   b. 版本归一化: "v1.0.0" 和 "1.0.0" 视为同一版本
+8. 返回安装结果（action = "installed" 或 "skipped"）
 ```
+
+> **与 `/computer/chat` 自动安装的关系**：`/computer/chat` 请求中如果 `agent_config.agent_server` 携带了 `version` 和 `platforms` 字段，
+> chat handler 会在启动 agent 前自动调用同一个 `do_install_from_url` 函数，流程完全一致。
+> 业务方可以在 chat 请求中嵌入安装信息，无需单独调用 `/install-from-url` 端点。
 
 #### 错误场景
 
@@ -1513,14 +1528,14 @@ curl -X POST http://localhost:8087/agent-mgmt/agents/uninstall \
 | POST | `/agent-mgmt/agents/get`              | `GetAgentRequest` JSON:`{project_id?, agent_id, version?, ...}` | `AgentMgmtService.GetAgent` |
 | POST | `/agent-mgmt/agents/check`            | `CheckAgentRequest` JSON:`{project_id?, agent_id, version?, ...}` | `AgentMgmtService.CheckAgent` |
 | POST | `/agent-mgmt/agents/install`          | `multipart/form-data`:`file`(binary) + `metadata`(JSON 字符串) | `AgentMgmtService.InstallAgent` (client streaming) |
-| POST | `/agent-mgmt/agents/install-from-url` | `InstallFromUrlRequest` JSON:`{project_id?, agent, platforms, force?, ...}` | `AgentMgmtService.InstallAgent` (metadata only) |
+| POST | `/agent-mgmt/agents/install-from-url` | `InstallFromUrlRequest` JSON:`{project_id?, agent, platforms, force?, ...}` | rcoder 侧直接处理（不经过 gRPC） |
 | POST | `/agent-mgmt/agents/install-from-npm` | `InstallFromPackageManagerRequest` JSON:`{project_id?, agent, package, ...}` | `AgentMgmtService.InstallAgent` (metadata only) |
 | POST | `/agent-mgmt/agents/uninstall`        | `UninstallAgentRequest` JSON:`{project_id?, agent_id, version?, ...}` | `AgentMgmtService.UninstallAgent` |
 
 > **`...`** 表示共享的 `RoutingParams` 字段：`user_id`, `pod_id`, `tenant_id`, `space_id`, `isolation_type`。
 > 所有端点的请求体都通过 `#[serde(flatten)]` 嵌入 `RoutingParams`（定义在 `shared_types`），`project_id` 在 `RoutingParams` 内，优先路由，无 `project_id` 时按 `pod_id`/`user_id` 定位容器。
 >
-> **`install-from-url` 特殊说明**：该端点在 rcoder 端直接处理（不通过 gRPC 转发到 agent_runner），rcoder 调用 `agent_install_strategy::do_install_from_url` 在宿主机完成下载和注册表更新。
+> **`install-from-url` 特殊说明**：该端点在 rcoder 端直接处理（不通过 gRPC 转发到 agent_runner），rcoder 调用 `agent_install_strategy::do_install_from_url` 在宿主机完成下载和注册表更新。支持多版本并存：每个版本安装到独立的 `{install_dir}/{agent_id}/{version}/` 目录，精确版本已存在时幂等跳过。`/computer/chat` 请求中携带 `version` + `platforms` 时也会自动调用同一个函数。
 
 ---
 

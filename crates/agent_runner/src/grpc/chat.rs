@@ -106,6 +106,7 @@ pub async fn chat(
         agent_config_override,
         system_prompt_override: req.system_prompt,
         user_prompt_template_override: req.user_prompt,
+        is_devcomputer: false,
     };
 
     let context = ChatHandlerContext {

@@ -37,9 +37,22 @@ pub async fn handle_computer_chat(
     headers: HeaderMap,
     I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerChatRequest>,
 ) -> Result<Json<HttpResult<ChatResponse>>, shared_types::AppError> {
+    handle_computer_chat_internal(State(state), headers, I18nJsonOrQuery(request), false).await
+}
+
+/// Computer Chat 内部处理函数
+///
+/// 支持 `is_devcomputer` 参数，用于区分 `/computer/chat` 和 `/devcomputer/chat` 请求
+pub(crate) async fn handle_computer_chat_internal(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerChatRequest>,
+    is_devcomputer: bool,
+) -> Result<Json<HttpResult<ChatResponse>>, shared_types::AppError> {
     let locale = locale_from_headers(&headers);
     info!(
-        "[HTTP] Received Computer Chat request: user_id={}, project_id={:?}, session_id={:?}, request_id={:?}, prompt_len={}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}, attachments={:?}, data_source_attachments={:?}, model_provider={:#?}, agent_config={:#?}, system_prompt_len={}, user_prompt_len={}",
+        "[HTTP] Received {} Chat request: user_id={}, project_id={:?}, session_id={:?}, request_id={:?}, prompt_len={}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}, attachments={:?}, data_source_attachments={:?}, model_provider={:#?}, agent_config={:#?}, system_prompt_len={}, user_prompt_len={}",
+        if is_devcomputer { "DevComputer" } else { "Computer" },
         request.user_id,
         request.project_id,
         request.session_id,
@@ -120,6 +133,7 @@ pub async fn handle_computer_chat(
         agent_config_override: request.agent_config,
         system_prompt_override: request.system_prompt,
         user_prompt_template_override: request.user_prompt,
+        is_devcomputer,
     };
 
     // 7. 构建 ChatHandlerContext
@@ -164,7 +178,8 @@ pub async fn handle_computer_chat(
     // 10. 根据执行结果返回成功或错误
     if output.error.is_some() || !output.success {
         error!(
-            "❌ [HTTP] Computer Chat failed: session_id={}, error={:?}",
+            "❌ [HTTP] {} Chat failed: session_id={}, error={:?}",
+            if is_devcomputer { "DevComputer" } else { "Computer" },
             response.session_id, response.error
         );
         // 返回成功的 HTTP 状态码，但 HttpResult 包含错误信息
@@ -185,7 +200,8 @@ pub async fn handle_computer_chat(
     }
 
     info!(
-        "✅ [HTTP] Computer Chat response: session_id={}, error={:?}",
+        "✅ [HTTP] {} Chat response: session_id={}, error={:?}",
+        if is_devcomputer { "DevComputer" } else { "Computer" },
         response.session_id, response.error
     );
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -30,7 +30,7 @@ use super::config::load_sacp_agent_config_with_resolver;
 use super::connection::{SacpConnectionParams, run_sacp_connection};
 use super::env::{
     apply_model_env_bindings, apply_sensitive_model_env_fallback, ensure_subprocess_path_env,
-    render_model_template,
+    render_model_template, render_prefix_workspace_dir,
 };
 use super::mcp::convert_context_servers_sacp;
 use super::process::take_stdio;
@@ -227,6 +227,42 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 HashSet::new(),
             )
         };
+
+        // 🔧 解析 {PREFIX_WORKSPACE_DIR} 占位符
+        // 根据不同场景解析为不同的路径：
+        // - 环境变量 LOG_DIR/OPENCODE_LOG_DIR + devcomputer → /home/user/
+        // - 环境变量 LOG_DIR/OPENCODE_LOG_DIR + computer → /app/container-logs
+        // - command / args → /home/user/
+        let is_devcomputer = start_config.is_devcomputer;
+
+        // 解析 command 中的 {PREFIX_WORKSPACE_DIR}
+        let mut resolved_command = command_path.clone();
+        render_prefix_workspace_dir(&mut resolved_command, None, is_devcomputer);
+
+        // 解析 args 中的 {PREFIX_WORKSPACE_DIR}
+        let resolved_args: Vec<String> = command_args
+            .iter()
+            .map(|arg| {
+                let mut arg = arg.clone();
+                render_prefix_workspace_dir(&mut arg, None, is_devcomputer);
+                arg
+            })
+            .collect();
+
+        // 解析环境变量中的 {PREFIX_WORKSPACE_DIR}
+        let resolved_env: HashMap<String, String> = base_env
+            .iter()
+            .map(|(k, v)| {
+                let mut v = v.clone();
+                render_prefix_workspace_dir(&mut v, Some(k), is_devcomputer);
+                (k.clone(), v)
+            })
+            .collect();
+
+        // 使用解析后的值
+        let command_path = resolved_command;
+        let command_args = resolved_args;
+        let base_env = resolved_env;
 
         // 创建通道（使用有界通道防止 OOM）
         // 容量由常量定义，足够处理突发请求，同时提供背压保护

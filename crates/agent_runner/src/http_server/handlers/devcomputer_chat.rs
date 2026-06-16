@@ -12,11 +12,12 @@ use shared_types::{
     I18nJsonOrQuery,
 };
 
-use super::computer_chat::handle_computer_chat;
+use super::computer_chat::handle_computer_chat_internal;
 
 /// 处理 DevComputer Chat 请求
 ///
 /// 与 /computer/chat 共享同一个容器，自动注入 auto_reload 默认配置
+/// 并设置 `is_devcomputer=true`，影响 `{PREFIX_WORKSPACE_DIR}` 变量解析逻辑
 #[utoipa::path(
     post,
     path = "/devcomputer/chat",
@@ -45,5 +46,6 @@ pub async fn handle_devcomputer_chat(
         });
     }
 
-    handle_computer_chat(state, headers, I18nJsonOrQuery(request)).await
+    // 设置 is_devcomputer=true，影响 {PREFIX_WORKSPACE_DIR} 变量解析
+    handle_computer_chat_internal(state, headers, I18nJsonOrQuery(request), true).await
 }

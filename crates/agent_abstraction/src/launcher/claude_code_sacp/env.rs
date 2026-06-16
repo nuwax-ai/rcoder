@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 #[cfg(windows)]
 use crate::path_env::TAURI_APP_DATA_DIR;
@@ -192,6 +193,76 @@ pub(crate) fn render_model_template(value: &mut String, resolved: &ResolvedModel
         .replace("{MODEL_PROVIDER_NAME}", &resolved.provider_name);
 }
 
+/// `{PREFIX_WORKSPACE_DIR}` 变量的目标路径
+const WORKSPACE_DIR_LOG_PATH: &str = "/app/container-logs";
+const WORKSPACE_DIR_HOME_PATH: &str = "/home/user";
+
+/// 使用 Path 规范化路径，去除多余的分隔符和 `.` 组件
+///
+/// 例如：
+/// - `/home/user//project/logs` → `/home/user/project/logs`
+/// - `/home/user/./project` → `/home/user/project`
+fn normalize_path(path: &str) -> String {
+    Path::new(path)
+        .components()
+        .collect::<std::path::PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// 解析 `{PREFIX_WORKSPACE_DIR}` 占位符
+///
+/// 根据不同场景解析为不同的路径：
+/// - **环境变量场景**：
+///   - `LOG_DIR` / `OPENCODE_LOG_DIR`：解析为 `/app/container-logs`（日志专用目录）
+///   - `/devcomputer/chat` 接口的 `LOG_DIR`：解析为 `/home/user`（开发调试方便查看）
+/// - **command / args 场景**：解析为 `/home/user`（容器内工作目录前缀）
+///
+/// # Arguments
+/// * `value` - 需要解析的字符串
+/// * `env_key` - 环境变量名（用于判断是否是日志相关的变量），command/args 时传 None
+/// * `is_devcomputer` - 是否是 devcomputer 接口（影响日志路径解析）
+pub(crate) fn render_prefix_workspace_dir(
+    value: &mut String,
+    env_key: Option<&str>,
+    is_devcomputer: bool,
+) {
+    if !value.contains("{PREFIX_WORKSPACE_DIR}") {
+        return;
+    }
+
+    let replacement = match env_key {
+        Some(key) => {
+            // 环境变量场景
+            let upper_key = key.to_uppercase();
+            if upper_key == "LOG_DIR" || upper_key == "OPENCODE_LOG_DIR" {
+                if is_devcomputer {
+                    // devcomputer 接口：日志放在项目目录下，方便开发调试
+                    // 最终路径: /home/user/{project_id}/.logs
+                    WORKSPACE_DIR_HOME_PATH
+                } else {
+                    // computer 接口：日志放在专用日志目录
+                    WORKSPACE_DIR_LOG_PATH
+                }
+            } else {
+                // 其他环境变量：使用 home 路径
+                WORKSPACE_DIR_HOME_PATH
+            }
+        }
+        None => {
+            // command / args 场景：使用 home 路径
+            WORKSPACE_DIR_HOME_PATH
+        }
+    };
+
+    let replaced = value.replace("{PREFIX_WORKSPACE_DIR}", replacement);
+    *value = normalize_path(&replaced);
+    debug!(
+        "[SACP] Resolved {{PREFIX_WORKSPACE_DIR}} => '{}' (env_key={:?}, is_devcomputer={})",
+        replacement, env_key, is_devcomputer
+    );
+}
+
 fn resolved_model_binding_value(
     resolved: &ResolvedModelEnv,
     source: ModelEnvBindingSource,
@@ -260,5 +331,94 @@ pub(crate) fn apply_sensitive_model_env_fallback(
             env.insert(key.to_string(), resolved.base_url.clone());
             info!("[SACP] 🔒 Replaced {} with: {}", key, resolved.base_url);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_path() {
+        // 多余的斜杠被去除
+        assert_eq!(normalize_path("/home/user//project"), "/home/user/project");
+        assert_eq!(normalize_path("/home/user/project"), "/home/user/project");
+        assert_eq!(normalize_path("//home//user//"), "/home/user");
+
+        // 当前目录符号被去除
+        assert_eq!(normalize_path("/home/user/./project"), "/home/user/project");
+
+        // 根路径保持不变
+        assert_eq!(normalize_path("/"), "/");
+
+        // 空路径
+        assert_eq!(normalize_path(""), "");
+    }
+
+    #[test]
+    fn test_render_prefix_workspace_dir_no_placeholder() {
+        let mut value = "/some/path".to_string();
+        render_prefix_workspace_dir(&mut value, None, false);
+        assert_eq!(value, "/some/path");
+    }
+
+    #[test]
+    fn test_render_prefix_workspace_dir_command() {
+        let mut value = "{PREFIX_WORKSPACE_DIR}/project/node_modules/.bin/tsx".to_string();
+        render_prefix_workspace_dir(&mut value, None, false);
+        assert_eq!(value, "/home/user/project/node_modules/.bin/tsx");
+    }
+
+    #[test]
+    fn test_render_prefix_workspace_dir_args() {
+        let mut value = "{PREFIX_WORKSPACE_DIR}/project/src/index.ts".to_string();
+        render_prefix_workspace_dir(&mut value, None, true);
+        assert_eq!(value, "/home/user/project/src/index.ts");
+    }
+
+    #[test]
+    fn test_render_prefix_workspace_dir_log_dir_computer() {
+        let mut value = "{PREFIX_WORKSPACE_DIR}/{conversationId}/logs".to_string();
+        render_prefix_workspace_dir(&mut value, Some("LOG_DIR"), false);
+        assert_eq!(value, "/app/container-logs/{conversationId}/logs");
+    }
+
+    #[test]
+    fn test_render_prefix_workspace_dir_log_dir_devcomputer() {
+        let mut value = "{PREFIX_WORKSPACE_DIR}/{conversationId}/.logs".to_string();
+        render_prefix_workspace_dir(&mut value, Some("LOG_DIR"), true);
+        assert_eq!(value, "/home/user/{conversationId}/.logs");
+    }
+
+    #[test]
+    fn test_render_prefix_workspace_dir_opencode_log_dir_computer() {
+        let mut value = "{PREFIX_WORKSPACE_DIR}/{conversationId}/logs".to_string();
+        render_prefix_workspace_dir(&mut value, Some("OPENCODE_LOG_DIR"), false);
+        assert_eq!(value, "/app/container-logs/{conversationId}/logs");
+    }
+
+    #[test]
+    fn test_render_prefix_workspace_dir_opencode_log_dir_devcomputer() {
+        let mut value = "{PREFIX_WORKSPACE_DIR}/{conversationId}/.logs".to_string();
+        render_prefix_workspace_dir(&mut value, Some("OPENCODE_LOG_DIR"), true);
+        assert_eq!(value, "/home/user/{conversationId}/.logs");
+    }
+
+    #[test]
+    fn test_render_prefix_workspace_dir_other_env_var() {
+        let mut value = "{PREFIX_WORKSPACE_DIR}/other".to_string();
+        render_prefix_workspace_dir(&mut value, Some("OTHER_VAR"), false);
+        assert_eq!(value, "/home/user/other");
+    }
+
+    #[test]
+    fn test_render_prefix_workspace_dir_case_insensitive() {
+        let mut value = "{PREFIX_WORKSPACE_DIR}/logs".to_string();
+        render_prefix_workspace_dir(&mut value, Some("log_dir"), false);
+        assert_eq!(value, "/app/container-logs/logs");
+
+        let mut value = "{PREFIX_WORKSPACE_DIR}/logs".to_string();
+        render_prefix_workspace_dir(&mut value, Some("Log_Dir"), true);
+        assert_eq!(value, "/home/user/logs");
     }
 }

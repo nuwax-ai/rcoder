@@ -58,6 +58,12 @@ pub struct ChatHandlerInput {
     pub system_prompt_override: Option<String>,
     /// 用户提示模板覆盖（可选）
     pub user_prompt_template_override: Option<String>,
+    /// 是否是 DevComputer 接口请求
+    ///
+    /// 用于 `{PREFIX_WORKSPACE_DIR}` 变量解析：
+    /// - `true`：LOG_DIR 解析为 `/home/user/`
+    /// - `false`：LOG_DIR 解析为 `/app/container-logs`
+    pub is_devcomputer: bool,
 }
 
 /// Chat Handler 输出结果
@@ -554,6 +560,7 @@ pub async fn handle_chat_core(
         .system_prompt_override(input.system_prompt_override)
         .user_prompt_template_override(input.user_prompt_template_override)
         .agent_config_override(input.agent_config_override)
+        .is_devcomputer(input.is_devcomputer)
         .build()
     {
         Ok(prompt) => prompt,
