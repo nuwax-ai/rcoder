@@ -450,6 +450,12 @@ impl super::AppServiceTrait for K8sAppService {
         Ok(vec![])
     }
 
+    async fn upload_file(&self, _app_id: &str, _file_data: Vec<u8>, _target: &str) -> Result<UploadResult> {
+        // K8s 模式下文件上传待实现
+        warn!("K8s 文件上传功能待实现");
+        Err(anyhow::anyhow!("K8s 文件上传功能待实现"))
+    }
+
     async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>> {
         self.list_files(app_id).await
     }

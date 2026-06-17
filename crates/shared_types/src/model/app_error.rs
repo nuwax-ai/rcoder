@@ -68,6 +68,11 @@ impl AppError {
     pub fn conflict(msg: &str) -> Self {
         Self::with_message(crate::error_codes::ERR_CONFLICT, msg)
     }
+
+    /// Create a bad request error
+    pub fn bad_request(msg: &str) -> Self {
+        Self::with_message(crate::error_codes::ERR_VALIDATION, msg)
+    }
 }
 
 // 为 axum 实现 IntoResponse trait

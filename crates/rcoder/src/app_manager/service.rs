@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bollard::Docker;
+use futures::StreamExt;
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
 use bollard::query_parameters::{
     CreateContainerOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
@@ -25,6 +26,51 @@ const CONTAINER_PREFIX: &str = "rcoder-app";
 
 /// 工作空间根目录（容器内路径）
 const WORKSPACE_ROOT: &str = "/app/app-workspace";
+
+/// 计算 CPU 使用率
+fn calculate_cpu_percent(stats: &bollard::models::ContainerStatsResponse) -> f64 {
+    let cpu_stats = match &stats.cpu_stats {
+        Some(s) => s,
+        None => return 0.0,
+    };
+    let precpu_stats = match &stats.precpu_stats {
+        Some(s) => s,
+        None => return 0.0,
+    };
+
+    let cpu_usage = cpu_stats.cpu_usage.as_ref()
+        .and_then(|u| u.total_usage)
+        .unwrap_or(0);
+    let precpu_usage = precpu_stats.cpu_usage.as_ref()
+        .and_then(|u| u.total_usage)
+        .unwrap_or(0);
+
+    let cpu_delta = cpu_usage as f64 - precpu_usage as f64;
+    let system_cpu_delta = cpu_stats.system_cpu_usage.unwrap_or(0) as f64
+        - precpu_stats.system_cpu_usage.unwrap_or(0) as f64;
+    let number_cpus = cpu_stats.online_cpus.unwrap_or(1) as f64;
+
+    if system_cpu_delta > 0.0 && cpu_delta >= 0.0 {
+        (cpu_delta / system_cpu_delta) * number_cpus * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// 计算网络使用
+fn calculate_network_usage(stats: &bollard::models::ContainerStatsResponse) -> (u64, u64) {
+    let mut rx_bytes = 0u64;
+    let mut tx_bytes = 0u64;
+
+    if let Some(networks) = &stats.networks {
+        for net in networks.values() {
+            rx_bytes += net.rx_bytes.unwrap_or(0);
+            tx_bytes += net.tx_bytes.unwrap_or(0);
+        }
+    }
+
+    (rx_bytes, tx_bytes)
+}
 
 /// 应用管理服务 (Docker 模式)
 pub struct AppService {
@@ -480,52 +526,66 @@ impl AppService {
     pub async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats> {
         let _app = self.get_app(app_id).await?;
 
-        // 查询容器资源使用
         let container_name = container_name(app_id);
 
-        match self.docker.inspect_container(&container_name, None).await {
-            Ok(_container) => {
-                // TODO: 从容器信息中提取资源使用
-                // 需要调用 Docker stats API 获取实时资源使用
+        // 使用 Docker stats API 获取实时资源使用
+        use bollard::query_parameters::StatsOptionsBuilder;
 
-                Ok(ResourceStats {
-                    cpu: CpuStats {
-                        usage_percent: 0.0,
-                        usage_cores: 0.0,
-                        limit_cores: 0.0,
-                    },
-                    memory: MemoryStats {
-                        usage_bytes: 0,
-                        usage_percent: 0.0,
-                        limit_bytes: 0,
-                    },
-                    network: NetworkStats {
-                        rx_bytes: 0,
-                        tx_bytes: 0,
-                    },
-                    restart_count: 0,
-                })
+        let options = StatsOptionsBuilder::default()
+            .stream(false)
+            .one_shot(true)
+            .build();
+
+        let mut stats_stream = self.docker.stats(&container_name, Some(options));
+
+        if let Some(result) = stats_stream.next().await {
+            match result {
+                Ok(stats) => {
+                    // 计算 CPU 使用率
+                    let cpu_percent = calculate_cpu_percent(&stats);
+
+                    // 内存使用
+                    let memory_stats = stats.memory_stats.as_ref();
+                    let memory_usage = memory_stats
+                        .and_then(|m| m.usage)
+                        .unwrap_or(0);
+                    let memory_limit = memory_stats
+                        .and_then(|m| m.limit)
+                        .unwrap_or(0);
+                    let memory_percent = if memory_limit > 0 {
+                        (memory_usage as f64 / memory_limit as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    // 网络使用
+                    let (rx_bytes, tx_bytes) = calculate_network_usage(&stats);
+
+                    Ok(ResourceStats {
+                        cpu: CpuStats {
+                            usage_percent: cpu_percent,
+                            usage_cores: cpu_percent / 100.0,
+                            limit_cores: 1.0,
+                        },
+                        memory: MemoryStats {
+                            usage_bytes: memory_usage,
+                            usage_percent: memory_percent,
+                            limit_bytes: memory_limit,
+                        },
+                        network: NetworkStats {
+                            rx_bytes,
+                            tx_bytes,
+                        },
+                        restart_count: 0,
+                    })
+                }
+                Err(e) => {
+                    warn!("查询容器资源失败: {}", e);
+                    Err(anyhow::anyhow!("查询容器资源失败: {}", e))
+                }
             }
-            Err(e) => {
-                warn!("查询容器资源失败: {}", e);
-                Ok(ResourceStats {
-                    cpu: CpuStats {
-                        usage_percent: 0.0,
-                        usage_cores: 0.0,
-                        limit_cores: 0.0,
-                    },
-                    memory: MemoryStats {
-                        usage_bytes: 0,
-                        usage_percent: 0.0,
-                        limit_bytes: 0,
-                    },
-                    network: NetworkStats {
-                        rx_bytes: 0,
-                        tx_bytes: 0,
-                    },
-                    restart_count: 0,
-                })
-            }
+        } else {
+            Err(anyhow::anyhow!("无法获取容器资源信息"))
         }
     }
 
@@ -710,6 +770,10 @@ impl super::AppServiceTrait for AppService {
 
     async fn get_app_events(&self, app_id: &str) -> Result<Vec<String>> {
         self.get_app_events(app_id).await
+    }
+
+    async fn upload_file(&self, app_id: &str, file_data: Vec<u8>, target: &str) -> Result<UploadResult> {
+        self.upload_file(app_id, file_data, target).await
     }
 
     async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>> {

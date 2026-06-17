@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     Json,
 };
+use futures::StreamExt;
 use tracing::{info, instrument};
 
 use shared_types::{AppError, HttpResult};
@@ -404,21 +405,64 @@ pub async fn get_app_events(
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
+    request_body(content_type = "multipart/form-data", description = "上传文件"),
     responses(
         (status = 200, description = "上传成功", body = HttpResult<UploadResult>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "应用管理"
 )]
-#[instrument(skip(_state))]
+#[instrument(skip(state, multipart))]
 pub async fn upload_file(
-    State(_state): State<Arc<AppManagerState>>,
+    State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
+    mut multipart: Multipart,
 ) -> Result<Json<HttpResult<UploadResult>>, AppError> {
     info!("上传文件: {}", app_id);
 
-    // TODO: 实现文件上传（需要 multipart 处理）
-    Err(AppError::internal_server_error("文件上传功能待实现"))
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut file_name: Option<String> = None;
+    let mut target_path: Option<String> = None;
+
+    // 解析 multipart 数据
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        AppError::bad_request(&format!("解析上传文件失败: {}", e))
+    })? {
+        let name = field.name().unwrap_or("").to_string();
+
+        match name.as_str() {
+            "file" => {
+                file_name = field.file_name().map(|s| s.to_string());
+                let data = field.bytes().await.map_err(|e| {
+                    AppError::bad_request(&format!("读取文件数据失败: {}", e))
+                })?;
+                file_data = Some(data.to_vec());
+            }
+            "target" => {
+                let data = field.text().await.map_err(|e| {
+                    AppError::bad_request(&format!("读取目标路径失败: {}", e))
+                })?;
+                target_path = Some(data);
+            }
+            _ => {
+                // 忽略未知字段
+            }
+        }
+    }
+
+    // 验证必需字段
+    let data = file_data.ok_or_else(|| AppError::bad_request("缺少 file 字段"))?;
+    let name = file_name.unwrap_or_else(|| "uploaded_file".to_string());
+    let target = target_path.unwrap_or_else(|| format!("code/{}", name));
+
+    // 调用服务层上传文件
+    let result = state
+        .app_service
+        .upload_file(&app_id, data, &target)
+        .await
+        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+
+    Ok(Json(HttpResult::success(result)))
 }
 
 /// 列出文件
