@@ -233,7 +233,6 @@ pub(crate) async fn handle_computer_chat_internal(
 
     // view() 在闭包返回后立即释放锁，无 Ref 暴露
     if let Some(elapsed) = state.pod_creating.view(&user_id, |_, t| t.elapsed()) {
-
         // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
         if elapsed < std::time::Duration::from_secs(60) {
             info!(
@@ -359,12 +358,13 @@ pub(crate) async fn handle_computer_chat_internal(
         );
         // 必须先清理旧容器，否则 create_container 发现同名 "running" 容器会复用它
         let container_identifier = request.pod_id.as_deref().unwrap_or(&user_id);
-        if let Err(e) = state.runtime()
-                .stop_container_by_identifier(
-                    container_identifier,
-                    &shared_types::ServiceType::ComputerAgentRunner,
-                )
-                .await
+        if let Err(e) = state
+            .runtime()
+            .stop_container_by_identifier(
+                container_identifier,
+                &shared_types::ServiceType::ComputerAgentRunner,
+            )
+            .await
         {
             warn!(
                 "⚠️ [COMPUTER_CHAT] Failed to cleanup broken container before recreate: {}",
@@ -447,7 +447,9 @@ pub(crate) async fn handle_computer_chat_internal(
         let agent_id = match server.agent_id.as_deref().filter(|s| !s.trim().is_empty()) {
             Some(id) => id,
             None => {
-                error!("[COMPUTER_CHAT] Validation failed: agent_id is required when platforms is provided");
+                error!(
+                    "[COMPUTER_CHAT] Validation failed: agent_id is required when platforms is provided"
+                );
                 return Ok(HttpResult::error_with_message(
                     shared_types::error_codes::ERR_VALIDATION,
                     locale,
@@ -460,7 +462,9 @@ pub(crate) async fn handle_computer_chat_internal(
             let command = match server.command.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(c) => c,
                 None => {
-                    error!("[COMPUTER_CHAT] Validation failed: command is required when platforms is provided");
+                    error!(
+                        "[COMPUTER_CHAT] Validation failed: command is required when platforms is provided"
+                    );
                     return Ok(HttpResult::error_with_message(
                         shared_types::error_codes::ERR_VALIDATION,
                         locale,
@@ -471,7 +475,9 @@ pub(crate) async fn handle_computer_chat_internal(
             let version = match server.version.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(v) => v,
                 None => {
-                    error!("[COMPUTER_CHAT] Validation failed: version is required when platforms is provided");
+                    error!(
+                        "[COMPUTER_CHAT] Validation failed: version is required when platforms is provided"
+                    );
                     return Ok(HttpResult::error_with_message(
                         shared_types::error_codes::ERR_VALIDATION,
                         locale,
@@ -656,7 +662,8 @@ pub(crate) async fn handle_computer_chat_internal(
             );
 
             // 从 Runtime API 获取最新容器信息，避免使用过期 IP
-            let container_info = match state.runtime()
+            let container_info = match state
+                .runtime()
                 .get_container_info_by_identifier(
                     &user_id,
                     &shared_types::ServiceType::ComputerAgentRunner,
@@ -711,8 +718,16 @@ pub(crate) async fn handle_computer_chat_internal(
                 );
 
                 // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态
-                state.insert_project_with_session(map_key.clone(), Arc::new(updated_info), &session_id)
-                    .map_err(|e| { tracing::error!("[STORAGE] insert_project_with_session failed: {}", e); e })?;
+                state
+                    .insert_project_with_session(
+                        map_key.clone(),
+                        Arc::new(updated_info),
+                        &session_id,
+                    )
+                    .map_err(|e| {
+                        tracing::error!("[STORAGE] insert_project_with_session failed: {}", e);
+                        e
+                    })?;
 
                 info!(
                     "🔄 [COMPUTER_CHAT] Updated existing container mapping: user_id={}, project_id={}, session_id={} (last_activity refreshed)",
@@ -738,8 +753,16 @@ pub(crate) async fn handle_computer_chat_internal(
                 );
 
                 // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态
-                state.insert_project_with_session(map_key.clone(), Arc::new(project_info), &session_id)
-                    .map_err(|e| { tracing::error!("[STORAGE] insert_project_with_session failed: {}", e); e })?;
+                state
+                    .insert_project_with_session(
+                        map_key.clone(),
+                        Arc::new(project_info),
+                        &session_id,
+                    )
+                    .map_err(|e| {
+                        tracing::error!("[STORAGE] insert_project_with_session failed: {}", e);
+                        e
+                    })?;
 
                 info!(
                     "🆕 [COMPUTER_CHAT] Created new container mapping: user_id={}, project_id={}, session_id={}",
@@ -789,7 +812,11 @@ async fn forward_computer_request_to_container(
 ) -> HttpResult<ChatResponse> {
     info!(
         "📤 [COMPUTER_FORWARD] Forwarding request to container (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}, is_devcomputer={}",
-        request.user_id, project_id, request.session_id, container_info.container_id, is_devcomputer
+        request.user_id,
+        project_id,
+        request.session_id,
+        container_info.container_id,
+        is_devcomputer
     );
 
     // 直接使用 gRPC 的健康检查机制，不额外检查容器状态
@@ -874,7 +901,7 @@ async fn forward_computer_request_to_container(
             request.agent_config.clone(),
             Some(shared_types::ServiceType::ComputerAgentRunner), // ✅ 传递正确的 ServiceType
             Some(request.user_id.clone()), // ✅ 传递 user_id（ComputerAgentRunner 必需）
-            is_devcomputer, // 🆕 传递 is_devcomputer
+            is_devcomputer,                // 🆕 传递 is_devcomputer
         )
         .await
         {
@@ -991,14 +1018,8 @@ async fn ensure_project_workspace_exists(
 ) -> Result<(), AppError> {
     // 根据隔离类型构建工作空间路径
     let project_workspace_path = std::path::PathBuf::from(
-        build_computer_workspace_path(
-            isolation_type,
-            tenant_id,
-            space_id,
-            user_id,
-            project_id,
-        )
-        .map_err(|e| AppError::validation_error(&e.to_string()))?,
+        build_computer_workspace_path(isolation_type, tenant_id, space_id, user_id, project_id)
+            .map_err(|e| AppError::validation_error(&e.to_string()))?,
     );
 
     debug!(
@@ -1099,8 +1120,12 @@ fn ensure_project_mapping_in_state(
     );
 
     // immediately insert project record
-    state.insert_project(project_id.to_string(), Arc::new(project_info))
-        .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
+    state
+        .insert_project(project_id.to_string(), Arc::new(project_info))
+        .map_err(|e| {
+            tracing::error!("[STORAGE] insert_project failed: {}", e);
+            e
+        })?;
 
     info!(
         "🆕 [COMPUTER_CHAT] Inserted project record (immediately after container creation): user_id={}, project_id={}, container_id={}",

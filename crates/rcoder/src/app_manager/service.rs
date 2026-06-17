@@ -1,6 +1,5 @@
 //! 应用管理服务层
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,7 +10,9 @@ use bollard::query_parameters::{
     CreateContainerOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use chrono::Utc;
+use dashmap::DashMap;
 use docker_manager::path::HostPathResolver;
+use moka::sync::Cache;
 use tokio::fs;
 use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
@@ -29,8 +30,10 @@ const WORKSPACE_ROOT: &str = "/app/app-workspace";
 pub struct AppService {
     config: AppManagerConfig,
     docker: Docker,
-    path_resolver: Option<Arc<HostPathResolver>>,
-    apps: tokio::sync::RwLock<HashMap<String, AppInfo>>,
+    /// 路径解析器缓存（单例）
+    path_resolver: Cache<String, Arc<HostPathResolver>>,
+    /// 应用信息存储（并发安全，支持遍历）
+    apps: Arc<DashMap<String, AppInfo>>,
 }
 
 /// 生成容器名称
@@ -40,7 +43,9 @@ fn container_name(app_id: &str) -> String {
 
 /// 生成应用目录路径（容器内）
 fn app_workspace_path(app_id: &str) -> PathBuf {
-    PathBuf::from(WORKSPACE_ROOT).join(app_id)
+    let path = PathBuf::from(WORKSPACE_ROOT).join(app_id);
+    tracing::debug!("[app_workspace_path] WORKSPACE_ROOT={}, app_id={}, result={:?}", WORKSPACE_ROOT, app_id, path);
+    path
 }
 
 impl AppService {
@@ -49,23 +54,27 @@ impl AppService {
         let docker = Docker::connect_with_local_defaults()
             .context("连接 Docker 失败")?;
 
-        // 创建路径解析器（只创建一次，缓存复用）
-        let path_resolver = match HostPathResolver::new().await {
+        // 路径解析器缓存（单例）
+        let path_resolver: Cache<String, Arc<HostPathResolver>> = Cache::builder()
+            .max_capacity(1)
+            .build();
+
+        // 初始化路径解析器
+        match HostPathResolver::new().await {
             Ok(resolver) => {
                 info!("路径解析器初始化成功");
-                Some(Arc::new(resolver))
+                path_resolver.insert("default".to_string(), Arc::new(resolver));
             }
             Err(e) => {
                 warn!("路径解析器初始化失败，将使用容器内路径: {}", e);
-                None
             }
-        };
+        }
 
         Ok(Self {
             config,
             docker,
             path_resolver,
-            apps: tokio::sync::RwLock::new(HashMap::new()),
+            apps: Arc::new(DashMap::new()),
         })
     }
 
@@ -128,8 +137,7 @@ impl AppService {
         }
 
         // 保存应用信息
-        let mut apps = self.apps.write().await;
-        apps.insert(app_id.clone(), app_info.clone());
+        self.apps.insert(app_id.clone(), app_info.clone());
 
         Ok(app_info)
     }
@@ -137,8 +145,7 @@ impl AppService {
     /// 查询应用列表
     #[instrument(skip(self, request))]
     pub async fn query_apps(&self, request: QueryAppsRequest) -> Result<PaginatedResponse<AppInfo>> {
-        let apps = self.apps.read().await;
-        let mut items: Vec<AppInfo> = apps.values().cloned().collect();
+        let mut items: Vec<AppInfo> = self.apps.iter().map(|r| r.value().clone()).collect();
 
         // 过滤
         if let Some(filters) = &request.filters {
@@ -192,19 +199,20 @@ impl AppService {
     /// 获取应用详情
     #[instrument(skip(self))]
     pub async fn get_app(&self, app_id: &str) -> Result<AppInfo> {
-        let apps = self.apps.read().await;
-        apps.get(app_id)
-            .cloned()
+        self.apps
+            .get(app_id)
+            .map(|r| r.value().clone())
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))
     }
 
     /// 更新应用配置
     #[instrument(skip(self, request))]
     pub async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> Result<AppInfo> {
-        let mut apps = self.apps.write().await;
-        let app = apps
+        let mut entry = self.apps
             .get_mut(app_id)
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
+
+        let app = entry.value_mut();
 
         if let Some(name) = request.name {
             app.name = name;
@@ -244,8 +252,7 @@ impl AppService {
             .await;
 
         // 删除应用信息
-        let mut apps = self.apps.write().await;
-        apps.remove(app_id)
+        self.apps.remove(app_id)
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
 
         // 删除应用目录（容器内路径）
@@ -260,10 +267,11 @@ impl AppService {
     /// 启动应用
     #[instrument(skip(self))]
     pub async fn start_app(&self, app_id: &str) -> Result<AppInfo> {
-        let mut apps = self.apps.write().await;
-        let app = apps
+        let mut entry = self.apps
             .get_mut(app_id)
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
+
+        let app = entry.value_mut();
 
         if app.status == AppStatus::Running {
             return Err(anyhow::anyhow!("应用已在运行"));
@@ -295,10 +303,11 @@ impl AppService {
     /// 停止应用
     #[instrument(skip(self))]
     pub async fn stop_app(&self, app_id: &str) -> Result<AppInfo> {
-        let mut apps = self.apps.write().await;
-        let app = apps
+        let mut entry = self.apps
             .get_mut(app_id)
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
+
+        let app = entry.value_mut();
 
         if app.status != AppStatus::Running {
             return Err(anyhow::anyhow!("应用未在运行"));
@@ -335,10 +344,11 @@ impl AppService {
     /// 重启应用
     #[instrument(skip(self))]
     pub async fn restart_app(&self, app_id: &str) -> Result<AppInfo> {
-        let mut apps = self.apps.write().await;
-        let app = apps
+        let mut entry = self.apps
             .get_mut(app_id)
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
+
+        let app = entry.value_mut();
 
         // 重启容器
         let container_name = container_name(app_id);
@@ -538,12 +548,15 @@ impl AppService {
     /// 使用缓存的路径解析器将容器内路径转换为宿主机路径
     fn get_host_app_dir(&self, app_id: &str) -> PathBuf {
         let container_path = app_workspace_path(app_id);
+        tracing::debug!("[get_host_app_dir] app_id={}, container_path={:?}", app_id, container_path);
 
-        // 使用缓存的路径解析器
-        if let Some(resolver) = &self.path_resolver {
-            resolver.resolve_to_host_path(&container_path)
-                .unwrap_or(container_path)
+        // 从缓存获取路径解析器
+        if let Some(resolver) = self.path_resolver.get("default") {
+            let result = resolver.resolve_to_host_path(&container_path);
+            tracing::debug!("[get_host_app_dir] resolve result={:?}", result);
+            result.unwrap_or(container_path)
         } else {
+            tracing::warn!("[get_host_app_dir] path_resolver not available, using container_path");
             container_path
         }
     }
