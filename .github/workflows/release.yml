@@ -146,6 +146,7 @@ jobs:
         run: choco install protoc -y
 
       - name: Build artifacts
+        shell: bash
         run: |
           VERSION="${{ needs.plan.outputs.version }}"
           sed -i.bak "s/version = \".*\"/version = \"$VERSION\"/" crates/rcoder-cli/Cargo.toml
