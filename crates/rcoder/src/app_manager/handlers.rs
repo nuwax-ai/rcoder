@@ -6,7 +6,9 @@ use axum::{
     extract::{Multipart, Path, Query, State},
     Json,
 };
+use serde::Deserialize;
 use tracing::{info, instrument};
+use utoipa::ToSchema;
 
 use shared_types::{AppError, HttpResult};
 
@@ -107,8 +109,8 @@ pub async fn get_app(
 
 /// 更新应用配置
 #[utoipa::path(
-    put,
-    path = "/api/v1/apps/{app_id}",
+    post,
+    path = "/api/v1/apps/{app_id}/update",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
@@ -138,8 +140,8 @@ pub async fn update_app(
 
 /// 删除应用
 #[utoipa::path(
-    delete,
-    path = "/api/v1/apps/{app_id}",
+    post,
+    path = "/api/v1/apps/{app_id}/delete",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
@@ -493,30 +495,26 @@ pub async fn list_files(
     Ok(Json(HttpResult::success(files)))
 }
 
+/// 删除文件请求
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DeleteFileRequest {
+    /// 应用 ID
+    pub app_id: String,
+    /// 文件路径
+    pub path: String,
+}
+
 /// 删除文件
-#[utoipa::path(
-    delete,
-    path = "/api/v1/apps/{app_id}/files/{path}",
-    params(
-        ("app_id" = String, Path, description = "应用 ID"),
-        ("path" = String, Path, description = "文件路径")
-    ),
-    responses(
-        (status = 200, description = "删除成功", body = HttpResult<String>),
-        (status = 404, description = "文件不存在", body = HttpResult<String>)
-    ),
-    tag = "应用管理"
-)]
-#[instrument(skip(state))]
 pub async fn delete_file(
     State(state): State<Arc<AppManagerState>>,
-    Path((app_id, file_path)): Path<(String, String)>,
+    Json(request): Json<DeleteFileRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    info!("删除文件: {}/{}", app_id, file_path);
+    let app_id = request.app_id.clone();
+    info!("删除文件: {}/{}", app_id, request.path);
 
     state
         .app_service
-        .delete_file(&app_id, &file_path)
+        .delete_file(&app_id, &request.path)
         .await
         .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
 

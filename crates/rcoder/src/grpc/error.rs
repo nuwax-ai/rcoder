@@ -1,8 +1,8 @@
 //! gRPC 错误分类和处理
 //!
-//! 基于 Tonic 的 Status Code 进行智能错误分类，优化重试策略
+//! 使用枚举统一包装不同类型的 gRPC 错误，避免 downcast_ref 类型转换。
 
-use tonic::{Code, Status};
+use tonic::{Code, Status, transport};
 
 /// gRPC 错误分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,25 +15,78 @@ pub enum GrpcErrorCategory {
     Permanent,
 }
 
+/// 统一的 gRPC 错误类型
+///
+/// 在错误发生时就进行分类，避免下游使用 downcast_ref。
+/// 这种设计更符合 Rust 的类型系统，错误信息不会丢失。
+#[derive(Debug)]
+pub enum GrpcError {
+    /// gRPC 业务层错误（Status）
+    Status(Status),
+    /// gRPC 连接层错误（transport::Error）
+    ///
+    /// 包括：KeepAliveTimedOut, ConnectionRefused, ConnectionReset 等
+    /// 这类错误通常意味着连接已失效，应该重试
+    Transport(transport::Error),
+}
+
+impl GrpcError {
+    /// 判断错误是否应该重试
+    pub fn should_retry(&self) -> bool {
+        match self {
+            GrpcError::Status(status) => categorize_grpc_error(status) == GrpcErrorCategory::Retryable,
+            // transport::Error 表示连接层错误，通常应该重试
+            GrpcError::Transport(_) => true,
+        }
+    }
+
+    /// 获取错误分类
+    pub fn category(&self) -> GrpcErrorCategory {
+        match self {
+            GrpcError::Status(status) => categorize_grpc_error(status),
+            GrpcError::Transport(_) => GrpcErrorCategory::Retryable,
+        }
+    }
+}
+
+impl std::fmt::Display for GrpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GrpcError::Status(status) => write!(f, "gRPC Status: {} ({})", status.message(), status.code()),
+            GrpcError::Transport(err) => write!(f, "gRPC Transport: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for GrpcError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            GrpcError::Status(status) => Some(status),
+            GrpcError::Transport(err) => Some(err),
+        }
+    }
+}
+
+// 从 tonic::Status 转换
+impl From<Status> for GrpcError {
+    fn from(status: Status) -> Self {
+        GrpcError::Status(status)
+    }
+}
+
+// 从 tonic::transport::Error 转换
+impl From<transport::Error> for GrpcError {
+    fn from(err: transport::Error) -> Self {
+        GrpcError::Transport(err)
+    }
+}
+
+// GrpcError 已经实现了 std::error::Error，所以可以自动转换为 anyhow::Error
+// 无需显式实现 From<GrpcError> for anyhow::Error
+
 /// 基于 Tonic Status Code 分类 gRPC 错误
 ///
 /// 根据 gRPC 标准错误码判断错误是否应该重试
-///
-/// # Arguments
-/// * `status` - gRPC Status 对象
-///
-/// # Returns
-/// 错误分类结果
-///
-/// # Examples
-/// ```
-/// use tonic::{Code, Status};
-/// use rcoder::grpc::GrpcErrorCategory;
-///
-/// let status = Status::unavailable("服务不可用");
-/// let category = rcoder::grpc::categorize_grpc_error(&status);
-/// assert_eq!(category, GrpcErrorCategory::Retryable);
-/// ```
 pub fn categorize_grpc_error(status: &Status) -> GrpcErrorCategory {
     match status.code() {
         // ✅ 可重试错误：网络问题、资源不足、瞬时故障
@@ -68,51 +121,7 @@ pub fn categorize_grpc_error(status: &Status) -> GrpcErrorCategory {
     }
 }
 
-/// 判断 gRPC 错误是否应该重试
-///
-/// # Arguments
-/// * `status` - gRPC Status 对象
-///
-/// # Returns
-/// `true` 如果错误可以重试，`false` 否则
-pub fn should_retry_grpc_error(status: &Status) -> bool {
-    matches!(categorize_grpc_error(status), GrpcErrorCategory::Retryable)
-}
-
-/// 从 anyhow::Error 中提取 Tonic Status（如果存在）
-///
-/// # Arguments
-/// * `error` - anyhow Error 对象
-///
-/// # Returns
-/// `Some(Status)` 如果错误包含 Tonic Status，`None` 否则
-pub fn extract_grpc_status(error: &anyhow::Error) -> Option<&Status> {
-    error.downcast_ref::<Status>()
-}
-
-/// 判断 anyhow::Error 是否应该重试（自动提取 Tonic Status）
-///
-/// # Arguments
-/// * `error` - anyhow Error 对象
-///
-/// # Returns
-/// `true` 如果错误包含可重试的 gRPC 错误，`false` 否则
-pub fn should_retry_error(error: &anyhow::Error) -> bool {
-    if let Some(status) = extract_grpc_status(error) {
-        should_retry_grpc_error(status)
-    } else {
-        // 非 gRPC 错误，保守策略：不重试
-        false
-    }
-}
-
 /// 获取错误的友好描述
-///
-/// # Arguments
-/// * `status` - gRPC Status 对象
-///
-/// # Returns
-/// 错误的中文描述
 pub fn get_error_description(status: &Status) -> &'static str {
     match status.code() {
         Code::Ok => "Success",
@@ -199,11 +208,50 @@ mod tests {
     }
 
     #[test]
-    fn test_should_retry_grpc_error() {
-        let retryable = Status::unavailable("service unavailable");
-        assert!(should_retry_grpc_error(&retryable));
+    fn test_grpc_error_should_retry() {
+        // 测试 Status 类型的可重试错误
+        let retryable_status = GrpcError::Status(Status::unavailable("service unavailable"));
+        assert!(retryable_status.should_retry());
 
-        let non_retryable = Status::invalid_argument("bad request");
-        assert!(!should_retry_grpc_error(&non_retryable));
+        // 测试 Status 类型的不可重试错误
+        let non_retryable_status = GrpcError::Status(Status::invalid_argument("bad request"));
+        assert!(!non_retryable_status.should_retry());
+
+        // 注意：tonic::transport::Error 无法直接构造，其 should_retry() 始终返回 true
+        // 这个逻辑在 GrpcError::should_retry() 中已经实现
+    }
+
+    #[test]
+    fn test_grpc_error_category() {
+        // 测试 Status 错误分类
+        let unavailable = GrpcError::Status(Status::unavailable("unavailable"));
+        assert_eq!(unavailable.category(), GrpcErrorCategory::Retryable);
+
+        let invalid_arg = GrpcError::Status(Status::invalid_argument("invalid"));
+        assert_eq!(invalid_arg.category(), GrpcErrorCategory::NonRetryable);
+
+        let not_found = GrpcError::Status(Status::not_found("not found"));
+        assert_eq!(not_found.category(), GrpcErrorCategory::Permanent);
+
+        // 注意：tonic::transport::Error 无法直接构造，其 category() 始终返回 Retryable
+    }
+
+    #[test]
+    fn test_grpc_error_display() {
+        let status_err = GrpcError::Status(Status::unavailable("service down"));
+        let display = format!("{}", status_err);
+        // Display 格式是 "gRPC Status: {message} ({code_description})"
+        assert!(display.contains("service down"), "Display should contain message: {}", display);
+        assert!(display.contains("currently unavailable"), "Display should contain code description: {}", display);
+    }
+
+    #[test]
+    fn test_grpc_error_from_conversions() {
+        // 测试 From<Status> 转换
+        let status = Status::unavailable("test");
+        let err: GrpcError = status.into();
+        assert!(err.should_retry());
+
+        // 注意：tonic::transport::Error 无法直接构造，From 转换在实际运行时自动完成
     }
 }

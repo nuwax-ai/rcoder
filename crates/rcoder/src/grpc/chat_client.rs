@@ -2,8 +2,9 @@
 //!
 //! 通过 gRPC 调用 agent_runner 的 Chat RPC
 
-use crate::grpc::GrpcChannelPool;
+use crate::grpc::{GrpcChannelPool, GrpcError};
 use shared_types::ChatAgentConfig;
+use tonic::Status;
 use shared_types::grpc::{
     CancelRequest, CancelResponse, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, ResolvePermissionRequest as GrpcResolvePermissionRequest,
@@ -13,6 +14,9 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 /// 通过 gRPC 发送 Chat 请求到 agent_runner (使用连接池)
+///
+/// 返回 `Result<GrpcChatResponse, GrpcError>`，其中 `GrpcError` 包含
+/// 分类后的错误信息，便于调用方判断是否应该重试。
 #[allow(clippy::too_many_arguments)] // 直接映射 ChatRequest 字段，参数无法合并
 pub async fn grpc_chat_with_pool(
     pool: &Arc<GrpcChannelPool>,
@@ -32,14 +36,18 @@ pub async fn grpc_chat_with_pool(
     service_type: Option<shared_types::ServiceType>,
     user_id: Option<String>, // 新增：用于 ComputerAgentRunner 模式
     is_devcomputer: bool,    // 🆕 是否是 DevComputer 接口请求
-) -> anyhow::Result<GrpcChatResponse> {
+) -> Result<GrpcChatResponse, GrpcError> {
     info!(
         "🚀 [gRPC_CHAT] Sending Chat request (connection pool): addr={}, project_id={}, is_devcomputer={}",
         grpc_addr, project_id, is_devcomputer
     );
 
     // 使用连接池获取客户端
-    let mut client = pool.get_client(grpc_addr).await?;
+    let mut client = pool.get_client(grpc_addr).await.map_err(|e| {
+        error!("[gRPC_CHAT] Failed to get client: {}", e);
+        // 连接池错误通常是连接层问题，使用 Status::unavailable 表示
+        GrpcError::Status(Status::unavailable(format!("Connection failed: {}", e)))
+    })?;
 
     // 构建 gRPC 请求
     let grpc_request = GrpcChatRequest {
@@ -74,10 +82,10 @@ pub async fn grpc_chat_with_pool(
         debug!("⏱️ [gRPC_CHAT] request timeout: {:?}", timeout);
     }
 
-    // 发送请求
+    // 发送请求，使用 GrpcError 包装错误
     let response = client.chat(request).await.map_err(|e| {
         error!("[gRPC_CHAT] Chat RPC call failed: {}", e);
-        anyhow::Error::new(e)
+        GrpcError::from(e)
     })?;
 
     let chat_response = response.into_inner();
@@ -112,14 +120,17 @@ pub async fn grpc_cancel_session_with_pool(
     reason: String,
     project_id: String,
     request_timeout: Option<std::time::Duration>,
-) -> anyhow::Result<CancelResponse> {
+) -> Result<CancelResponse, GrpcError> {
     info!(
         "🛑 [gRPC_CANCEL] Sending cancel session request (connection pool): addr={}, session_id={}, project_id={}",
         grpc_addr, session_id, project_id
     );
 
     // 使用连接池获取客户端
-    let mut client = pool.get_client(grpc_addr).await?;
+    let mut client = pool.get_client(grpc_addr).await.map_err(|e| {
+        error!("[gRPC_CANCEL] Failed to get client: {}", e);
+        GrpcError::Status(Status::unavailable(format!("Connection failed: {}", e)))
+    })?;
 
     // 构建 gRPC 请求
     let grpc_request = CancelRequest {
@@ -142,7 +153,7 @@ pub async fn grpc_cancel_session_with_pool(
 
     let response = client.cancel_session(request).await.map_err(|e| {
         error!("[gRPC_CANCEL] CancelSession RPC call failed: {}", e);
-        anyhow::Error::new(e)
+        GrpcError::from(e)
     })?;
 
     let cancel_response = response.into_inner();
@@ -161,7 +172,7 @@ pub async fn grpc_cancel_session(
     session_id: String,
     reason: String,
     project_id: String,
-) -> anyhow::Result<CancelResponse> {
+) -> Result<CancelResponse, GrpcError> {
     // 创建临时连接池（单次使用）
     let pool = Arc::new(GrpcChannelPool::new());
     grpc_cancel_session_with_pool(&pool, grpc_addr, session_id, reason, project_id, None).await
@@ -173,13 +184,17 @@ pub async fn grpc_resolve_permission_with_pool(
     grpc_addr: &str,
     input: shared_types::ResolvePermissionRequestDto,
     request_timeout: Option<std::time::Duration>,
-) -> anyhow::Result<GrpcResolvePermissionResponse> {
+) -> Result<GrpcResolvePermissionResponse, GrpcError> {
     info!(
         "[gRPC_PERMISSION] Sending ResolvePermission: addr={}, session_id={}, tool_call_id={}",
         grpc_addr, input.session_id, input.tool_call_id
     );
 
-    let mut client = pool.get_client(grpc_addr).await?;
+    let mut client = pool.get_client(grpc_addr).await.map_err(|e| {
+        error!("[gRPC_PERMISSION] Failed to get client: {}", e);
+        GrpcError::Status(Status::unavailable(format!("Connection failed: {}", e)))
+    })?;
+
     let grpc_request = GrpcResolvePermissionRequest {
         session_id: input.session_id,
         tool_call_id: input.tool_call_id,
@@ -205,7 +220,7 @@ pub async fn grpc_resolve_permission_with_pool(
 
     let response = client.resolve_permission(request).await.map_err(|e| {
         error!("[gRPC_PERMISSION] ResolvePermission RPC call failed: {}", e);
-        anyhow::Error::new(e)
+        GrpcError::from(e)
     })?;
 
     Ok(response.into_inner())
@@ -219,14 +234,17 @@ pub async fn grpc_stop_agent_with_pool(
     reason: Option<String>,
     force: bool,
     request_timeout: Option<std::time::Duration>,
-) -> anyhow::Result<shared_types::grpc::StopAgentResponse> {
+) -> Result<shared_types::grpc::StopAgentResponse, GrpcError> {
     info!(
         "🔄 [gRPC_STOP_AGENT] Sending stop Agent request (connection pool): addr={}, project_id={}, force={}",
         grpc_addr, project_id, force
     );
 
     // 使用连接池获取客户端
-    let mut client = pool.get_client(grpc_addr).await?;
+    let mut client = pool.get_client(grpc_addr).await.map_err(|e| {
+        error!("[gRPC_STOP_AGENT] Failed to get client: {}", e);
+        GrpcError::Status(Status::unavailable(format!("Connection failed: {}", e)))
+    })?;
 
     // 构建 gRPC 请求
     let grpc_request = shared_types::grpc::StopAgentRequest {
@@ -249,7 +267,7 @@ pub async fn grpc_stop_agent_with_pool(
 
     let response = client.stop_agent(request).await.map_err(|e| {
         error!("[gRPC_STOP_AGENT] StopAgent RPC call failed: {}", e);
-        anyhow::Error::new(e)
+        GrpcError::from(e)
     })?;
 
     let stop_response = response.into_inner();

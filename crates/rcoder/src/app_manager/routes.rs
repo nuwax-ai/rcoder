@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    routing::{delete, get, post, put},
+    routing::{get, post},
     Router,
 };
 
@@ -18,8 +18,8 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
         .route("/api/v1/apps", post(handlers::create_app))
         .route("/api/v1/apps/query", post(handlers::query_apps))
         .route("/api/v1/apps/{app_id}", get(handlers::get_app))
-        .route("/api/v1/apps/{app_id}", put(handlers::update_app))
-        .route("/api/v1/apps/{app_id}", delete(handlers::delete_app))
+        .route("/api/v1/apps/{app_id}/update", post(handlers::update_app))
+        .route("/api/v1/apps/{app_id}/delete", post(handlers::delete_app))
         // 应用操作
         .route("/api/v1/apps/{app_id}/start", post(handlers::start_app))
         .route("/api/v1/apps/{app_id}/stop", post(handlers::stop_app))
@@ -32,5 +32,5 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
         // 文件管理
         .route("/api/v1/apps/{app_id}/upload", post(handlers::upload_file))
         .route("/api/v1/apps/{app_id}/files", get(handlers::list_files))
-        .route("/api/v1/apps/{app_id}/files/{path}", delete(handlers::delete_file))
+        .route("/api/v1/apps/{app_id}/files/delete", post(handlers::delete_file))
 }

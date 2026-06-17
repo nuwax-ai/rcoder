@@ -84,19 +84,17 @@ pub async fn computer_agent_stop(
     let project_id = request
         .project_id
         .as_ref()
-        .expect("validated: project_id is required and non-empty");
+        .ok_or_else(|| AppError::validation_error("project_id is required and non-empty"))?;
 
     // 1. 验证参数：user_id 或 pod_id 至少有一个
     let has_user_id = request
         .user_id
         .as_ref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
+        .is_some_and(|s| !s.trim().is_empty());
     let has_pod_id = request
         .pod_id
         .as_ref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
+        .is_some_and(|s| !s.trim().is_empty());
     if !has_user_id && !has_pod_id {
         error!("[COMPUTER_STOP] user_id or pod_id is required");
         return Ok(HttpResult::error_with_locale(
@@ -115,18 +113,16 @@ pub async fn computer_agent_stop(
 
     // 2. 查找容器（根据 user_id 或 pod_id）
     let container_info = if has_user_id {
-        crate::service::ComputerContainerManager::get_container_info(
-            user_id.as_ref().unwrap(),
-            state.runtime(),
-        )
-        .await?
+        let uid = user_id
+            .as_ref()
+            .ok_or_else(|| AppError::validation_error("user_id is required"))?;
+        crate::service::ComputerContainerManager::get_container_info(uid, state.runtime()).await?
     } else {
         // pod_id 作为容器标识符查找
-        crate::service::ComputerContainerManager::get_container_info(
-            pod_id.as_ref().unwrap(),
-            state.runtime(),
-        )
-        .await?
+        let pid = pod_id
+            .as_ref()
+            .ok_or_else(|| AppError::validation_error("pod_id is required"))?;
+        crate::service::ComputerContainerManager::get_container_info(pid, state.runtime()).await?
     };
 
     let container_info = match container_info {

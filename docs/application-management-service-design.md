@@ -280,36 +280,36 @@ spec:
 
 | 方法 | 路径 | 描述 | 说明 |
 |------|------|------|------|
-| POST | `/api/v1/apps` | 创建应用 | 创建 Deployment + Service + HTTPRoute |
-| POST | `/api/v1/apps/query` | 查询应用列表 | 支持复杂过滤和分页 |
-| GET | `/api/v1/apps/{app_id}` | 获取应用详情 | 包含状态、访问信息、健康状态 |
-| PUT | `/api/v1/apps/{app_id}` | 更新应用配置 | 更新 ConfigMap/Secret |
-| DELETE | `/api/v1/apps/{app_id}` | 删除应用 | 删除所有关联资源 |
+| POST | `/api/v1/apps` | 创建应用 | Body: CreateAppRequest |
+| POST | `/api/v1/apps/query` | 查询应用列表 | Body: QueryAppsRequest |
+| GET | `/api/v1/apps/{app_id}` | 获取应用详情 | - |
+| POST | `/api/v1/apps/{app_id}/update` | 更新应用配置 | Body: UpdateAppRequest |
+| POST | `/api/v1/apps/{app_id}/delete` | 删除应用 | - |
 
 #### 应用操作
 
 | 方法 | 路径 | 描述 | 说明 |
 |------|------|------|------|
-| POST | `/api/v1/apps/{app_id}/start` | 启动应用 | 启动已停止的应用 |
-| POST | `/api/v1/apps/{app_id}/stop` | 停止应用 | 停止运行中的应用 |
-| POST | `/api/v1/apps/{app_id}/restart` | 重启应用 | 重启应用 |
+| POST | `/api/v1/apps/{app_id}/start` | 启动应用 | - |
+| POST | `/api/v1/apps/{app_id}/stop` | 停止应用 | - |
+| POST | `/api/v1/apps/{app_id}/restart` | 重启应用 | - |
 
 #### 查询接口
 
 | 方法 | 路径 | 描述 | 说明 |
 |------|------|------|------|
-| GET | `/api/v1/apps/{app_id}/logs` | 获取日志 | 支持 tail、follow |
-| GET | `/api/v1/apps/{app_id}/health` | 获取健康状态 | Pod 状态 + Probe 结果 |
-| GET | `/api/v1/apps/{app_id}/events` | 获取事件 | K8s Events |
-| GET | `/api/v1/apps/{app_id}/stats` | 获取资源使用 | CPU/内存/网络 |
+| GET | `/api/v1/apps/{app_id}/logs` | 获取日志 | Query: tail, follow |
+| GET | `/api/v1/apps/{app_id}/health` | 获取健康状态 | - |
+| GET | `/api/v1/apps/{app_id}/events` | 获取事件 | - |
+| GET | `/api/v1/apps/{app_id}/stats` | 获取资源使用 | - |
 
 #### 文件管理接口
 
 | 方法 | 路径 | 描述 | 说明 |
 |------|------|------|------|
 | POST | `/api/v1/apps/{app_id}/upload` | 上传文件 | multipart/form-data |
-| GET | `/api/v1/apps/{app_id}/files` | 列出文件 | 列出应用目录文件 |
-| DELETE | `/api/v1/apps/{app_id}/files/{path}` | 删除文件 | 删除指定文件 |
+| GET | `/api/v1/apps/{app_id}/files` | 列出文件 | - |
+| POST | `/api/v1/apps/{app_id}/files/delete` | 删除文件 | Body: DeleteFileRequest |
 
 ### 4.2 创建应用
 

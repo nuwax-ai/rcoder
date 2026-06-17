@@ -5,11 +5,9 @@
 //! - [`npm_installer`]   — npm i -g
 //! - [`url_installer`]   — HTTP/HTTPS 下载
 //! - [`archive_installer`] — 共享的解压逻辑(路径遍历拦截 + zip bomb 防护)
-//! - [`default_agents`]  — 启动时注册内置 agent
 
 pub mod archive_installer;
 pub mod binary_installer;
-pub mod default_agents;
 pub mod npm_installer;
 pub mod url_installer;
 

@@ -591,14 +591,14 @@ async fn forward_request_to_container_service(
                     return Ok(crate::HttpResult::error(&error_code, &error_msg));
                 }
             }
-            Err(e) => {
+            Err(grpc_err) => {
                 warn!(
                     "⚠️ [FORWARD] gRPC call failed (attempt {}/{}): {}",
-                    attempt, max_retries, e
+                    attempt, max_retries, grpc_err
                 );
 
-                // ✅ 使用错误分类判断是否应该重试
-                let should_retry = crate::grpc::should_retry_error(&e);
+                // ✅ 使用 GrpcError 的 should_retry 方法，无需 downcast_ref
+                let should_retry = grpc_err.should_retry();
 
                 if should_retry && attempt < max_retries {
                     // 可重试错误：清理连接池并重新获取 IP 后重试
@@ -633,20 +633,20 @@ async fn forward_request_to_container_service(
                         }
                     }
 
-                    last_error = Some(e);
+                    last_error = Some(anyhow::Error::from(grpc_err));
                     continue;
                 } else if !should_retry {
                     // 不可重试错误：直接返回
                     error!(
                         "[FORWARD] Detected non-retryable error, stopped retry: {}",
-                        e
+                        grpc_err
                     );
-                    last_error = Some(e);
+                    last_error = Some(anyhow::Error::from(grpc_err));
                     break;
                 }
 
                 // 最后一次尝试失败
-                last_error = Some(e);
+                last_error = Some(anyhow::Error::from(grpc_err));
             }
         }
     }

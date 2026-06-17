@@ -928,13 +928,14 @@ async fn forward_computer_request_to_container(
                     return HttpResult::error(&error_code, &error_msg);
                 }
             }
-            Err(e) => {
+            Err(grpc_err) => {
                 warn!(
                     "⚠️ [COMPUTER_FORWARD] gRPC call failed (attempt {}/{}): {}",
-                    attempt, max_retries, e
+                    attempt, max_retries, grpc_err
                 );
 
-                let should_retry = crate::grpc::should_retry_error(&e);
+                // 使用 GrpcError 的 should_retry 方法，无需 downcast_ref
+                let should_retry = grpc_err.should_retry();
 
                 if should_retry && attempt < max_retries {
                     info!(
@@ -968,15 +969,15 @@ async fn forward_computer_request_to_container(
                         }
                     }
 
-                    last_error = Some(e);
+                    last_error = Some(anyhow::Error::from(grpc_err));
                     continue;
                 } else if !should_retry {
-                    error!("[COMPUTER_FORWARD] Retry error, stopped retry: {}", e);
-                    last_error = Some(e);
+                    error!("[COMPUTER_FORWARD] Non-retryable error, stopped retry: {}", grpc_err);
+                    last_error = Some(anyhow::Error::from(grpc_err));
                     break;
                 }
 
-                last_error = Some(e);
+                last_error = Some(anyhow::Error::from(grpc_err));
             }
         }
     }

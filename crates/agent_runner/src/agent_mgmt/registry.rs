@@ -171,7 +171,7 @@ impl AgentRegistry {
     }
 
     /// 插入条目(立即落盘)，拒绝重复的精确版本
-    #[allow(dead_code)] // used in tests and default_agents registration
+    #[allow(dead_code)] // used in tests
     pub fn insert(&self, manifest: AgentManifest) -> AgentMgmtResult<()> {
         manifest.validate()?;
         let mut guard = self.inner.lock();

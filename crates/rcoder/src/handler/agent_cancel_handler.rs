@@ -183,56 +183,62 @@ async fn forward_cancel_request_to_container_service(
                 ))
             }
         }
-        Err(e) => {
-            error!("[CANCEL_FORWARD] gRPC call failed: {}", e);
+        Err(grpc_err) => {
+            error!("[CANCEL_FORWARD] gRPC call failed: {}", grpc_err);
 
-            // 检查特定的 gRPC 错误码并分类处理
-            if let Some(status) = crate::grpc::extract_grpc_status(&e) {
-                use tonic::Code;
-                match status.code() {
-                    Code::NotFound => {
-                        // 会话或 Agent 不存在，返回成功（幂等设计）
-                        info!("[CANCEL_FORWARD] Session not found, cancel succeeded");
-                        return Ok(HttpResult::success(AgentCancelResponse {
-                            success: true,
-                            session_id: session_id.unwrap_or("").to_string(),
-                        }));
-                    }
-                    Code::Unavailable => {
-                        // Agent Worker 不可用，需要判断是容器已销毁还是临时故障
-                        // 通过 Docker API 检查容器是否真的存在
-                        let container_exists = check_container_exists_by_info(
-                            runtime,
-                            container_info,
-                            rcoder_prefix,
-                            computer_prefix,
-                        )
-                        .await;
-
-                        if !container_exists {
-                            // 容器已销毁，取消目标已达成（幂等设计）
-                            info!(
-                                "[CANCEL_FORWARD] container already destroyed, cancel request already completed"
-                            );
+            // 使用 GrpcError 枚举进行错误分类处理
+            match &grpc_err {
+                crate::grpc::GrpcError::Status(status) => {
+                    use tonic::Code;
+                    match status.code() {
+                        Code::NotFound => {
+                            // 会话或 Agent 不存在，返回成功（幂等设计）
+                            info!("[CANCEL_FORWARD] Session not found, cancel succeeded");
                             return Ok(HttpResult::success(AgentCancelResponse {
                                 success: true,
                                 session_id: session_id.unwrap_or("").to_string(),
                             }));
-                        } else {
-                            // 容器存在但服务不可用（可能是临时故障），返回错误
-                            warn!(
-                                "[CANCEL_FORWARD] Agent Worker unavailable (container exists, may be temporary failure)"
-                            );
-                            return Ok(HttpResult::error_with_locale(
-                                shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
-                                locale,
-                            ));
+                        }
+                        Code::Unavailable => {
+                            // Agent Worker 不可用，需要判断是容器已销毁还是临时故障
+                            // 通过 Docker API 检查容器是否真的存在
+                            let container_exists = check_container_exists_by_info(
+                                runtime,
+                                container_info,
+                                rcoder_prefix,
+                                computer_prefix,
+                            )
+                            .await;
+
+                            if !container_exists {
+                                // 容器已销毁，取消目标已达成（幂等设计）
+                                info!(
+                                    "[CANCEL_FORWARD] container already destroyed, cancel request already completed"
+                                );
+                                return Ok(HttpResult::success(AgentCancelResponse {
+                                    success: true,
+                                    session_id: session_id.unwrap_or("").to_string(),
+                                }));
+                            } else {
+                                // 容器存在但服务不可用（可能是临时故障），返回错误
+                                warn!(
+                                    "[CANCEL_FORWARD] Agent Worker unavailable (container exists, may be temporary failure)"
+                                );
+                                return Ok(HttpResult::error_with_locale(
+                                    shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
+                                    locale,
+                                ));
+                            }
+                        }
+                        other_code => {
+                            // 其他 gRPC 状态码
+                            error!("[CANCEL_FORWARD] gRPC error code: {:?}", other_code);
                         }
                     }
-                    other_code => {
-                        // 其他 gRPC 状态码
-                        error!("[CANCEL_FORWARD] gRPC error code: {:?}", other_code);
-                    }
+                }
+                crate::grpc::GrpcError::Transport(_) => {
+                    // 连接层错误，通常是网络问题
+                    error!("[CANCEL_FORWARD] gRPC transport error: {}", grpc_err);
                 }
             }
 

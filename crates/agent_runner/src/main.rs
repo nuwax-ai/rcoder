@@ -196,14 +196,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 异步注册内置 agent(失败不阻塞启动)
-    let _default_agent_handle =
-        crate::agent_mgmt::installer::default_agents::spawn_registration(
-            agent_mgmt_registry.clone(),
-            agent_mgmt_path_manager.clone(),
-        );
-    info!("🆕 [MAIN] Default agent registration spawned");
-
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
     {
