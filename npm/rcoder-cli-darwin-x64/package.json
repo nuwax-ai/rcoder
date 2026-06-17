@@ -1,5 +1,5 @@
 {
-  "name": "@rcoder/cli-darwin-x64",
+  "name": "rcoder-cli-darwin-x64",
   "version": "0.0.0",
   "description": "RCoder CLI binary for darwin-x64",
   "os": [

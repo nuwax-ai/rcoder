@@ -202,13 +202,13 @@ jobs:
             fi
           done
 
-          # 更新主包的 optionalDependencies 版本（平台包使用 scoped 包名）
+          # 更新主包的 optionalDependencies 版本（平台包使用非 scoped 唯一包名）
           jq --arg v "$VERSION" '
-            .optionalDependencies["@rcoder/cli-linux-x64"] = $v |
-            .optionalDependencies["@rcoder/cli-linux-arm64"] = $v |
-            .optionalDependencies["@rcoder/cli-darwin-x64"] = $v |
-            .optionalDependencies["@rcoder/cli-darwin-arm64"] = $v |
-            .optionalDependencies["@rcoder/cli-win32-x64"] = $v
+            .optionalDependencies["rcoder-cli-linux-x64"] = $v |
+            .optionalDependencies["rcoder-cli-linux-arm64"] = $v |
+            .optionalDependencies["rcoder-cli-darwin-x64"] = $v |
+            .optionalDependencies["rcoder-cli-darwin-arm64"] = $v |
+            .optionalDependencies["rcoder-cli-win32-x64"] = $v
           ' npm/rcoder-cli/package.json > npm/rcoder-cli/package.json.tmp
           mv npm/rcoder-cli/package.json.tmp npm/rcoder-cli/package.json
 

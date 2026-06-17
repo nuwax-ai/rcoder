@@ -6,11 +6,11 @@ const { execFileSync } = require("child_process");
 const path = require("path");
 
 const platformPackages = {
-  "linux-x64": "@rcoder/cli-linux-x64",
-  "linux-arm64": "@rcoder/cli-linux-arm64",
-  "darwin-x64": "@rcoder/cli-darwin-x64",
-  "darwin-arm64": "@rcoder/cli-darwin-arm64",
-  "win32-x64": "@rcoder/cli-win32-x64",
+  "linux-x64": "rcoder-cli-linux-x64",
+  "linux-arm64": "rcoder-cli-linux-arm64",
+  "darwin-x64": "rcoder-cli-darwin-x64",
+  "darwin-arm64": "rcoder-cli-darwin-arm64",
+  "win32-x64": "rcoder-cli-win32-x64",
 };
 
 const key = `${platform}-${arch}`;
