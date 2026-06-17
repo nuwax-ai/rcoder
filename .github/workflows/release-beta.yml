@@ -208,7 +208,7 @@ jobs:
             .optionalDependencies["rcoder-cli-linux-arm64"] = $v |
             .optionalDependencies["rcoder-cli-darwin-x64"] = $v |
             .optionalDependencies["rcoder-cli-darwin-arm64"] = $v |
-            .optionalDependencies["rcoder-cli-win32-x64"] = $v
+            .optionalDependencies["rcoder-cli-windows-x64"] = $v
           ' npm/rcoder-cli/package.json > npm/rcoder-cli/package.json.tmp
           mv npm/rcoder-cli/package.json.tmp npm/rcoder-cli/package.json
 
