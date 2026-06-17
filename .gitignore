@@ -28,4 +28,4 @@ crates/agent_runner/config.yml
 npm/*/rcoder-cli
 npm/*/rcoder-cli.exe
 
-docker/app-workspace/app-9ec2dffd/code/code/test.html
+docker/app-workspace/*
