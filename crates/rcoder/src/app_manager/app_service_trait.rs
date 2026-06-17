@@ -48,4 +48,7 @@ pub trait AppServiceTrait: Send + Sync {
 
     /// 列出文件
     async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>>;
+
+    /// 删除文件
+    async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()>;
 }

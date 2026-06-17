@@ -521,6 +521,35 @@ impl AppService {
         Ok(files)
     }
 
+    /// 删除文件
+    #[instrument(skip(self))]
+    pub async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
+        let _app = self.get_app(app_id).await?;
+
+        let app_dir = self.get_container_app_dir(app_id);
+        let full_path = app_dir.join("code").join(file_path);
+
+        // 安全检查：确保路径在应用目录内
+        let canonical_path = full_path.canonicalize()?;
+        let code_dir = app_dir.join("code").canonicalize()?;
+        if !canonical_path.starts_with(&code_dir) {
+            return Err(anyhow::anyhow!("路径不在应用目录内"));
+        }
+
+        if !canonical_path.exists() {
+            return Err(anyhow::anyhow!("文件不存在: {}", file_path));
+        }
+
+        if canonical_path.is_dir() {
+            fs::remove_dir_all(&canonical_path).await?;
+        } else {
+            fs::remove_file(&canonical_path).await?;
+        }
+
+        info!("文件已删除: {}", file_path);
+        Ok(())
+    }
+
     /// 获取资源使用情况
     #[instrument(skip(self))]
     pub async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats> {
@@ -776,5 +805,9 @@ impl super::AppServiceTrait for AppService {
 
     async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>> {
         self.list_files(app_id).await
+    }
+
+    async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
+        self.delete_file(app_id, file_path).await
     }
 }

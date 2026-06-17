@@ -483,6 +483,35 @@ impl K8sAppService {
         Ok(files)
     }
 
+    /// 删除文件
+    #[instrument(skip(self))]
+    pub async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
+        let _app = self.get_app(app_id).await?;
+
+        let code_dir = format!("{}/{}/code", self.config.workspace_root, app_id);
+        let full_path = std::path::Path::new(&code_dir).join(file_path);
+
+        // 安全检查：确保路径在应用目录内
+        let canonical_path = full_path.canonicalize()?;
+        let code_dir_canonical = std::path::Path::new(&code_dir).canonicalize()?;
+        if !canonical_path.starts_with(&code_dir_canonical) {
+            return Err(anyhow::anyhow!("路径不在应用目录内"));
+        }
+
+        if !canonical_path.exists() {
+            return Err(anyhow::anyhow!("文件不存在: {}", file_path));
+        }
+
+        if canonical_path.is_dir() {
+            tokio::fs::remove_dir_all(&canonical_path).await?;
+        } else {
+            tokio::fs::remove_file(&canonical_path).await?;
+        }
+
+        info!("文件已删除: {}", file_path);
+        Ok(())
+    }
+
     /// 上传文件
     #[instrument(skip(self, file_data))]
     pub async fn upload_file(&self, app_id: &str, file_data: Vec<u8>, target: &str) -> Result<UploadResult> {
@@ -933,5 +962,9 @@ impl super::AppServiceTrait for K8sAppService {
 
     async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>> {
         self.list_files(app_id).await
+    }
+
+    async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
+        self.delete_file(app_id, file_path).await
     }
 }

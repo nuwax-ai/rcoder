@@ -492,3 +492,33 @@ pub async fn list_files(
 
     Ok(Json(HttpResult::success(files)))
 }
+
+/// 删除文件
+#[utoipa::path(
+    delete,
+    path = "/api/v1/apps/{app_id}/files/{path}",
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("path" = String, Path, description = "文件路径")
+    ),
+    responses(
+        (status = 200, description = "删除成功", body = HttpResult<String>),
+        (status = 404, description = "文件不存在", body = HttpResult<String>)
+    ),
+    tag = "应用管理"
+)]
+#[instrument(skip(state))]
+pub async fn delete_file(
+    State(state): State<Arc<AppManagerState>>,
+    Path((app_id, file_path)): Path<(String, String)>,
+) -> Result<Json<HttpResult<String>>, AppError> {
+    info!("删除文件: {}/{}", app_id, file_path);
+
+    state
+        .app_service
+        .delete_file(&app_id, &file_path)
+        .await
+        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+
+    Ok(Json(HttpResult::success("文件删除成功".to_string())))
+}
