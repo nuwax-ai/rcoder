@@ -217,21 +217,21 @@ jobs:
         run: |
           ls -la artifacts/
 
-          # 解压 Linux x64
+          # 解压 Linux x64（tarball 带顶层目录，需 strip 1 层）
           mkdir -p npm/rcoder-cli-linux-x64
-          tar -xf artifacts/rcoder-cli-x86_64-unknown-linux-gnu.tar.xz -C npm/rcoder-cli-linux-x64
+          tar -xf artifacts/rcoder-cli-x86_64-unknown-linux-gnu.tar.xz --strip-components=1 -C npm/rcoder-cli-linux-x64
 
           # 解压 Linux arm64
           mkdir -p npm/rcoder-cli-linux-arm64
-          tar -xf artifacts/rcoder-cli-aarch64-unknown-linux-gnu.tar.xz -C npm/rcoder-cli-linux-arm64
+          tar -xf artifacts/rcoder-cli-aarch64-unknown-linux-gnu.tar.xz --strip-components=1 -C npm/rcoder-cli-linux-arm64
 
           # 解压 macOS x64
           mkdir -p npm/rcoder-cli-darwin-x64
-          tar -xf artifacts/rcoder-cli-x86_64-apple-darwin.tar.xz -C npm/rcoder-cli-darwin-x64
+          tar -xf artifacts/rcoder-cli-x86_64-apple-darwin.tar.xz --strip-components=1 -C npm/rcoder-cli-darwin-x64
 
           # 解压 macOS arm64
           mkdir -p npm/rcoder-cli-darwin-arm64
-          tar -xf artifacts/rcoder-cli-aarch64-apple-darwin.tar.xz -C npm/rcoder-cli-darwin-arm64
+          tar -xf artifacts/rcoder-cli-aarch64-apple-darwin.tar.xz --strip-components=1 -C npm/rcoder-cli-darwin-arm64
 
           # 解压 Windows x64
           mkdir -p npm/rcoder-cli-win32-x64
