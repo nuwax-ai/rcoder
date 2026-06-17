@@ -52,8 +52,8 @@ container-runtime-api = { path = "../container-runtime-api" }
 async-trait = { workspace = true }
 
 # Kubernetes runtime support (feature-gated)
-kube = { version = "0.98", features = ["runtime", "client", "kube-runtime", "config"], optional = true }
-k8s-openapi = { version = "0.24", features = ["v1_30"], optional = true }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
 
 [features]
 default = []

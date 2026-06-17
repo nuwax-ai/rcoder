@@ -110,10 +110,13 @@ impl AppState {
         // 初始化应用管理服务（根据运行时类型选择）
         let runtime_type = std::env::var("CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".to_string());
         let app_service: Arc<dyn crate::app_manager::AppServiceTrait> = if runtime_type == "kubernetes" {
-            Arc::new(crate::app_manager::k8s_service::K8sAppService::new(
-                config.app_manager.clone(),
-                runtime.clone(),
-            ))
+            Arc::new(
+                crate::app_manager::k8s_service::K8sAppService::new(
+                    config.app_manager.clone(),
+                    runtime.clone(),
+                ).await
+                .map_err(|e| anyhow::anyhow!("failed to initialize K8s app service: {}", e))?
+            )
         } else {
             Arc::new(
                 crate::app_manager::service::AppService::new(config.app_manager.clone()).await

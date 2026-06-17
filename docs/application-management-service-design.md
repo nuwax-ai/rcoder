@@ -303,6 +303,14 @@ spec:
 | GET | `/api/v1/apps/{app_id}/events` | 获取事件 | K8s Events |
 | GET | `/api/v1/apps/{app_id}/stats` | 获取资源使用 | CPU/内存/网络 |
 
+#### 文件管理接口
+
+| 方法 | 路径 | 描述 | 说明 |
+|------|------|------|------|
+| POST | `/api/v1/apps/{app_id}/upload` | 上传文件 | multipart/form-data |
+| GET | `/api/v1/apps/{app_id}/files` | 列出文件 | 列出应用目录文件 |
+| DELETE | `/api/v1/apps/{app_id}/files/{path}` | 删除文件 | 删除指定文件 |
+
 ### 4.2 创建应用
 
 **请求：**
@@ -1057,7 +1065,23 @@ pub struct InternalPort {
 
 ## 7. 实现说明
 
-### 7.1 K8s 资源创建流程
+### 7.1 K8s 模式实现状态
+
+| 功能 | 实现方式 | 状态 | 说明 |
+|------|---------|------|------|
+| 创建应用 | Deployment + Service + HTTPRoute | ✅ | 完整实现 |
+| 删除应用 | 删除所有 K8s 资源 | ✅ | 完整实现 |
+| 启动应用 | scale replicas=1 | ✅ | 完整实现 |
+| 停止应用 | scale replicas=0 | ✅ | 完整实现 |
+| 重启应用 | 滚动重启（更新 annotation） | ✅ | 完整实现 |
+| 查询列表 | 内存查询 | ✅ | 完整实现 |
+| 获取详情 | 查询 Pod 状态 | ✅ | 完整实现 |
+| 日志查询 | kube-rs logs API | ✅ | 完整实现 |
+| 事件查询 | K8s Events API | ✅ | 完整实现 |
+| 文件管理 | PVC 挂载目录读写 | ✅ | 完整实现 |
+| 资源使用 | Pod spec + Metrics Server | ⚠️ | 需要 Metrics Server |
+
+### 7.2 K8s 资源创建流程
 
 ```
 用户请求创建应用

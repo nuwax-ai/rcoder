@@ -271,7 +271,7 @@ pub struct LogEntry {
 }
 
 /// 资源使用
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ResourceStats {
     pub cpu: CpuStats,
     pub memory: MemoryStats,
@@ -279,21 +279,21 @@ pub struct ResourceStats {
     pub restart_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct CpuStats {
     pub usage_percent: f64,
     pub usage_cores: f64,
     pub limit_cores: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct MemoryStats {
     pub usage_bytes: u64,
     pub usage_percent: f64,
     pub limit_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct NetworkStats {
     pub rx_bytes: u64,
     pub tx_bytes: u64,

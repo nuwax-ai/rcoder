@@ -6,7 +6,6 @@ use axum::{
     extract::{Multipart, Path, Query, State},
     Json,
 };
-use futures::StreamExt;
 use tracing::{info, instrument};
 
 use shared_types::{AppError, HttpResult};

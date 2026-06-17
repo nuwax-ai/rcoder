@@ -95,7 +95,7 @@ use super::utils::{
 pub async fn handle_computer_chat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJsonOrQuery(mut request): I18nJsonOrQuery<ComputerChatRequest>,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     handle_computer_chat_internal(State(state), headers, I18nJsonOrQuery(request), false).await
 }

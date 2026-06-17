@@ -705,11 +705,9 @@ impl AppService {
                 tcp: tcp_ports,
             },
             internal: InternalAccess {
-                domain: format!(
-                    "{}-svc.{}.svc.cluster.local",
-                    app_id, self.config.namespace
-                ),
-                short_domain: format!("{}-svc.{}", app_id, self.config.namespace),
+                // Docker 模式：使用容器名称作为内部域名
+                domain: format!("rcoder-app-{}", app_id),
+                short_domain: format!("rcoder-app-{}", app_id),
                 ports: ports
                     .as_ref()
                     .map(|p| {
