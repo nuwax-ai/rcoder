@@ -40,6 +40,9 @@ pub struct ChatRequest {
     /// 🆕 是否是 DevComputer 接口请求（用于 {PREFIX_WORKSPACE_DIR} 变量解析）
     #[prost(bool, tag = "13")]
     pub is_devcomputer: bool,
+    /// 🆕 自定义工作目录标识符（可选，用于替代 project_id 参与工作目录拼接）
+    #[prost(string, optional, tag = "14")]
+    pub agent_work_dir: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChatResponse {

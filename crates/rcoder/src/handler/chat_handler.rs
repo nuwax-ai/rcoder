@@ -93,6 +93,23 @@ pub async fn handle_chat(
         }
     };
 
+    // 确定用于拼接工作目录的标识符
+    // agent_work_dir 用于替代 project_id 参与工作目录路径拼接
+    let work_dir_id = request
+        .agent_work_dir
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| project_id.clone());
+
+    // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）
+    if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+        return Ok(HttpResult::error_with_message(
+            shared_types::error_codes::ERR_VALIDATION,
+            locale,
+            &e,
+        ));
+    }
+
     // ========== 隔离类型参数校验 ==========
     // IF pod_id IS NOT NULL THEN isolation_type, tenant_id, space_id 必须非空
     if request.pod_id.is_some() {
@@ -155,13 +172,13 @@ pub async fn handle_chat(
 
     // ========== 构建工作空间路径 ==========
     // 根据 isolation_type 确定容器内工作目录：
-    // - tenant/space: /app/project_workspace/{tenant_id}/{space_id}/{project_id}
-    // - project 或默认: /app/project_workspace/{project_id}
+    // - tenant/space: /app/project_workspace/{tenant_id}/{space_id}/{work_dir_id}
+    // - project 或默认: /app/project_workspace/{work_dir_id}
     let container_work_path = build_workspace_path(
         request.isolation_type.as_deref(),
         request.tenant_id.as_deref(),
         request.space_id.as_deref(),
-        &project_id,
+        &work_dir_id,
     )
     .map_err(|e| AppError::validation_error(&e.to_string()))?;
 
@@ -564,6 +581,7 @@ async fn forward_request_to_container_service(
             Some(shared_types::ServiceType::RCoder), // ✅ RCoder 模式使用 RCoder ServiceType
             None,                                    // RCoder 模式不需要 user_id
             false,                                   // /chat 接口不是 devcomputer
+            request.agent_work_dir.clone(),          // 🆕 传递 agent_work_dir
         )
         .await
         {

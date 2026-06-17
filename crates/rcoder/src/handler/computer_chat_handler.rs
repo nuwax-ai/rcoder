@@ -199,6 +199,23 @@ pub(crate) async fn handle_computer_chat_internal(
         }
     };
 
+    // 确定用于拼接工作目录的标识符
+    // agent_work_dir 用于替代 project_id 参与工作目录路径拼接
+    let work_dir_id = request
+        .agent_work_dir
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| project_id.clone());
+
+    // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）
+    if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+        return Ok(HttpResult::error_with_message(
+            shared_types::error_codes::ERR_VALIDATION,
+            locale,
+            &e,
+        ));
+    }
+
     info!(
         "🚀 [COMPUTER_CHAT] Starting to process request: user_id={}, project_id={}, session_id={:?}, prompt_len={}, attachments={}, model_provider={:?}, agent_config={:?}",
         user_id,
@@ -515,14 +532,14 @@ pub(crate) async fn handle_computer_chat_internal(
     }
 
     // 5. 创建项目工作目录（在用户容器内）
-    // Computer Agent Runner 需要在用户工作区内为 project_id 创建子目录
+    // Computer Agent Runner 需要在用户工作区内为 work_dir_id 创建子目录
     // 使用 ? 传播 AppError：验证错误 → HTTP 400，I/O 错误 → HTTP 500
     ensure_project_workspace_exists(
         request.isolation_type.as_deref(),
         request.tenant_id.as_deref(),
         request.space_id.as_deref(),
         &user_id,
-        &project_id,
+        &work_dir_id,
     )
     .await?;
 
@@ -635,6 +652,7 @@ pub(crate) async fn handle_computer_chat_internal(
     let result = forward_computer_request_to_container(
         &request_for_forward, // 使用修改后的 request
         &project_id,
+        &work_dir_id,
         &container_info,
         state.runtime(),
         &state.grpc_pool,
@@ -802,6 +820,7 @@ pub(crate) async fn handle_computer_chat_internal(
 async fn forward_computer_request_to_container(
     request: &ComputerChatRequest,
     project_id: &str,
+    work_dir_id: &str,
     container_info: &ContainerBasicInfo,
     runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
@@ -863,8 +882,8 @@ async fn forward_computer_request_to_container(
     );
 
     // Computer Agent Runner 的工作目录路径
-    // 在容器内：/app/computer-project-workspace/{user_id}/{project_id}
-    let project_workspace = match project_dir(&request.user_id, project_id) {
+    // 在容器内：/app/computer-project-workspace/{user_id}/{work_dir_id}
+    let project_workspace = match project_dir(&request.user_id, work_dir_id) {
         Ok(path) => format!("{}/", path),
         Err(e) => {
             return HttpResult::error_with_message(
@@ -902,6 +921,7 @@ async fn forward_computer_request_to_container(
             Some(shared_types::ServiceType::ComputerAgentRunner), // ✅ 传递正确的 ServiceType
             Some(request.user_id.clone()), // ✅ 传递 user_id（ComputerAgentRunner 必需）
             is_devcomputer,                // 🆕 传递 is_devcomputer
+            request.agent_work_dir.clone(), // 🆕 传递 agent_work_dir
         )
         .await
         {
@@ -1009,17 +1029,17 @@ async fn forward_computer_request_to_container(
 /// - `tenant_id`: 租户 ID（可选）
 /// - `space_id`: 空间 ID（可选）
 /// - `user_id`: 用户 ID（当 isolation_type 为 project 时使用）
-/// - `project_id`: 项目 ID
+/// - `work_dir_id`: 工作目录标识符（可能是 project_id 或 agent_work_dir）
 async fn ensure_project_workspace_exists(
     isolation_type: Option<&str>,
     tenant_id: Option<&str>,
     space_id: Option<&str>,
     user_id: &str,
-    project_id: &str,
+    work_dir_id: &str,
 ) -> Result<(), AppError> {
     // 根据隔离类型构建工作空间路径
     let project_workspace_path = std::path::PathBuf::from(
-        build_computer_workspace_path(isolation_type, tenant_id, space_id, user_id, project_id)
+        build_computer_workspace_path(isolation_type, tenant_id, space_id, user_id, work_dir_id)
             .map_err(|e| AppError::validation_error(&e.to_string()))?,
     );
 
@@ -1040,8 +1060,8 @@ async fn ensure_project_workspace_exists(
         })?;
 
     info!(
-        "✅ [COMPUTER_CHAT] Project workspace directory created: user_id={}, project_id={}, isolation_type={:?}, path={:?}",
-        user_id, project_id, isolation_type, project_workspace_path
+        "✅ [COMPUTER_CHAT] Project workspace directory created: user_id={}, work_dir_id={}, isolation_type={:?}, path={:?}",
+        user_id, work_dir_id, isolation_type, project_workspace_path
     );
 
     Ok(())

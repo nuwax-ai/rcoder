@@ -81,6 +81,8 @@ message ChatRequest {
   optional string user_id = 12;
   // 🆕 是否是 DevComputer 接口请求（用于 {PREFIX_WORKSPACE_DIR} 变量解析）
   bool is_devcomputer = 13;
+  // 🆕 自定义工作目录标识符（可选，用于替代 project_id 参与工作目录拼接）
+  optional string agent_work_dir = 14;
 }
 
 message ChatResponse {

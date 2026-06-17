@@ -73,9 +73,21 @@ pub async fn chat(
         })
         .unwrap_or(shared_types::ServiceType::RCoder);
 
+    // 确定用于拼接工作目录的标识符
+    // HTTP 入口已保证：未传 agent_work_dir 时，用 project_id 赋值
+    let work_dir_id = req
+        .agent_work_dir
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| project_id.clone());
+
+    // 纵深防御：即使 HTTP 入口已校验，gRPC 入口也应校验
+    if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+        return Err(Status::invalid_argument(e));
+    }
+
     let project_dir = match service_type {
         shared_types::ServiceType::ComputerAgentRunner => {
-            std::path::PathBuf::from("/home/user").join(&project_id)
+            std::path::PathBuf::from("/home/user").join(&work_dir_id)
         }
         shared_types::ServiceType::RCoder => {
             let tenant_id = std::env::var("TENANT_ID").ok();
@@ -84,8 +96,8 @@ pub async fn chat(
                 (Some(tid), Some(sid)) => std::path::PathBuf::from("./project_workspace")
                     .join(&tid)
                     .join(&sid)
-                    .join(&project_id),
-                _ => std::path::PathBuf::from("./project_workspace").join(&project_id),
+                    .join(&work_dir_id),
+                _ => std::path::PathBuf::from("./project_workspace").join(&work_dir_id),
             }
         }
     };

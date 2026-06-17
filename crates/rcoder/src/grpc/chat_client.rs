@@ -36,6 +36,7 @@ pub async fn grpc_chat_with_pool(
     service_type: Option<shared_types::ServiceType>,
     user_id: Option<String>, // 新增：用于 ComputerAgentRunner 模式
     is_devcomputer: bool,    // 🆕 是否是 DevComputer 接口请求
+    agent_work_dir: Option<String>, // 🆕 自定义工作目录标识符
 ) -> Result<GrpcChatResponse, GrpcError> {
     info!(
         "🚀 [gRPC_CHAT] Sending Chat request (connection pool): addr={}, project_id={}, is_devcomputer={}",
@@ -68,6 +69,7 @@ pub async fn grpc_chat_with_pool(
         service_type: service_type.map(|st| format!("{:?}", st)),
         user_id, // 传递 user_id
         is_devcomputer, // 🆕 传递 is_devcomputer
+        agent_work_dir, // 🆕 传递 agent_work_dir
     };
 
     debug!("[gRPC_CHAT] sendrequest: {:?}", grpc_request);

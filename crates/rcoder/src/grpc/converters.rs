@@ -41,6 +41,7 @@ pub fn to_grpc_chat_request(
     service_type: Option<shared_types::ServiceType>,
     user_id: Option<String>, // 新增：用于 ComputerAgentRunner 模式
     is_devcomputer: bool,    // 🆕 是否是 DevComputer 接口请求
+    agent_work_dir: Option<String>, // 🆕 自定义工作目录标识符
 ) -> GrpcChatRequest {
     GrpcChatRequest {
         project_id,
@@ -57,6 +58,7 @@ pub fn to_grpc_chat_request(
         service_type: service_type.map(|st| format!("{:?}", st)),
         user_id, // 传递 user_id
         is_devcomputer, // 🆕 传递 is_devcomputer
+        agent_work_dir, // 🆕 传递 agent_work_dir
     }
 }
 

@@ -72,7 +72,7 @@ pub use shared_types_i18n::{
 
 // Validation 模块
 pub mod validation;
-pub use validation::garde_err_to_app_error;
+pub use validation::{garde_err_to_app_error, validate_identifier};
 
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
 pub use shared_types_grpc::grpc;

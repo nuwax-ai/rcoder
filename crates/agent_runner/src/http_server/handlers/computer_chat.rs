@@ -88,6 +88,19 @@ pub(crate) async fn handle_computer_chat_internal(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
 
+    // 确定用于拼接工作目录的标识符
+    // agent_work_dir 用于替代 project_id 参与工作目录路径拼接
+    let work_dir_id = request
+        .agent_work_dir
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| project_id.clone());
+
+    // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）
+    if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+        return Err(shared_types::AppError::with_message(ERR_VALIDATION, &e));
+    }
+
     // 3. 自动查找现有 session_id (如果未提供)
     let session_id = request.session_id.or_else(|| {
         AGENT_REGISTRY
@@ -97,8 +110,8 @@ pub(crate) async fn handle_computer_chat_internal(
 
     // 4. 创建项目工作目录（使用配置中的 projects_dir，支持外部配置）
     // Docker 挂载：宿主机 /computer-project-workspace/{user_id} → 容器 /home/user
-    // Agent 工作目录：/home/user/{project_id}
-    let project_dir = state.config.projects_dir.join(&project_id);
+    // Agent 工作目录：/home/user/{work_dir_id}
+    let project_dir = state.config.projects_dir.join(&work_dir_id);
 
     if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
         let error_msg = format!(

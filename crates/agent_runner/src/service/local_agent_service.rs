@@ -83,6 +83,23 @@ impl AgentHttpService for LocalAgentHttpService {
             .project_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
 
+        // 确定用于拼接工作目录的标识符
+        // agent_work_dir 用于替代 project_id 参与工作目录路径拼接
+        let work_dir_id = request
+            .agent_work_dir
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| project_id.clone());
+
+        // 校验 agent_work_dir（如果提供了）
+        // 注意：这里使用 project_id 作为 fallback，所以 work_dir_id 不会为空
+        // 但如果 agent_work_dir 有值且不合法，需要返回错误
+        if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+            return HttpResult::error(
+                shared_types::error_codes::ERR_VALIDATION,
+                &e,
+            );
+        }
+
         // 2. 自动查找现有 session_id（如果未提供）
         let session_id = request.session_id.or_else(|| {
             AGENT_REGISTRY
@@ -91,7 +108,7 @@ impl AgentHttpService for LocalAgentHttpService {
         });
 
         // 3. 创建项目工作目录
-        let project_dir = self.projects_dir.join(&project_id);
+        let project_dir = self.projects_dir.join(&work_dir_id);
         if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
             let error_msg = format!("Failed to create project dir: {}", e);
             warn!("[LocalAgent] {}", error_msg);
