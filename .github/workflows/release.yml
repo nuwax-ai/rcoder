@@ -57,6 +57,9 @@ jobs:
 
       - id: plan
         run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s/version = \".*\"/version = \"$VERSION\"/" crates/rcoder-cli/Cargo.toml
+
           dist host --steps=create --tag=${{ github.ref_name }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
@@ -144,6 +147,10 @@ jobs:
 
       - name: Build artifacts
         run: |
+          VERSION="${{ needs.plan.outputs.version }}"
+          sed -i.bak "s/version = \".*\"/version = \"$VERSION\"/" crates/rcoder-cli/Cargo.toml
+          rm -f crates/rcoder-cli/Cargo.toml.bak
+
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
 
@@ -200,6 +207,9 @@ jobs:
       - id: cargo-dist
         shell: bash
         run: |
+          VERSION="${{ needs.plan.outputs.version }}"
+          sed -i "s/version = \".*\"/version = \"$VERSION\"/" crates/rcoder-cli/Cargo.toml
+
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
@@ -333,31 +343,31 @@ jobs:
             fi
           done
 
-          # 更新主包的 optionalDependencies 版本
+          # 更新主包的 optionalDependencies 版本（平台包使用非 scoped 唯一包名）
           jq --arg v "$VERSION" '
-            .optionalDependencies["@rcoder/cli-linux-x64"] = $v |
-            .optionalDependencies["@rcoder/cli-linux-arm64"] = $v |
-            .optionalDependencies["@rcoder/cli-darwin-x64"] = $v |
-            .optionalDependencies["@rcoder/cli-darwin-arm64"] = $v |
-            .optionalDependencies["@rcoder/cli-win32-x64"] = $v
+            .optionalDependencies["rcoder-cli-linux-x64"] = $v |
+            .optionalDependencies["rcoder-cli-linux-arm64"] = $v |
+            .optionalDependencies["rcoder-cli-darwin-x64"] = $v |
+            .optionalDependencies["rcoder-cli-darwin-arm64"] = $v |
+            .optionalDependencies["rcoder-cli-windows-x64"] = $v
           ' npm/rcoder-cli/package.json > npm/rcoder-cli/package.json.tmp
           mv npm/rcoder-cli/package.json.tmp npm/rcoder-cli/package.json
 
-          # 解压 Linux x64
+          # 解压 Linux x64（tarball 带顶层目录，需 strip 1 层）
           mkdir -p npm/rcoder-cli-linux-x64
-          tar -xf binaries/rcoder-cli-x86_64-unknown-linux-gnu.tar.xz -C npm/rcoder-cli-linux-x64
+          tar -xf binaries/rcoder-cli-x86_64-unknown-linux-gnu.tar.xz --strip-components=1 -C npm/rcoder-cli-linux-x64
 
           # 解压 Linux arm64
           mkdir -p npm/rcoder-cli-linux-arm64
-          tar -xf binaries/rcoder-cli-aarch64-unknown-linux-gnu.tar.xz -C npm/rcoder-cli-linux-arm64
+          tar -xf binaries/rcoder-cli-aarch64-unknown-linux-gnu.tar.xz --strip-components=1 -C npm/rcoder-cli-linux-arm64
 
           # 解压 macOS x64
           mkdir -p npm/rcoder-cli-darwin-x64
-          tar -xf binaries/rcoder-cli-x86_64-apple-darwin.tar.xz -C npm/rcoder-cli-darwin-x64
+          tar -xf binaries/rcoder-cli-x86_64-apple-darwin.tar.xz --strip-components=1 -C npm/rcoder-cli-darwin-x64
 
           # 解压 macOS arm64
           mkdir -p npm/rcoder-cli-darwin-arm64
-          tar -xf binaries/rcoder-cli-aarch64-apple-darwin.tar.xz -C npm/rcoder-cli-darwin-arm64
+          tar -xf binaries/rcoder-cli-aarch64-apple-darwin.tar.xz --strip-components=1 -C npm/rcoder-cli-darwin-arm64
 
           # 解压 Windows x64
           mkdir -p npm/rcoder-cli-win32-x64
@@ -375,14 +385,27 @@ jobs:
         run: |
           npm config set //registry.npmjs.org/:_authToken ${{ secrets.NPM_TOKEN }}
 
-          # 发布平台包
+          failures=0
           for pkg in npm/rcoder-cli-*; do
             if [ -f "$pkg/package.json" ]; then
               pkgName=$(jq -r '.name' "$pkg/package.json")
-              echo "Publishing $pkgName..."
-              npm publish "$pkg" --access public --tag latest
+              echo "Packing $pkgName..."
+              cd "$pkg"
+              tarball=$(npm pack 2>/dev/null)
+              cd -
+              echo "Publishing $pkgName with latest tag..."
+              if ! npm publish "$pkg/$tarball" --access public --tag latest --registry https://registry.npmjs.org; then
+                echo "ERROR: Failed to publish $pkgName"
+                failures=$((failures+1))
+              fi
+              rm -f "$pkg/$tarball"
             fi
           done
+
+          if [ "$failures" -ne 0 ]; then
+            echo "ERROR: $failures npm package(s) failed to publish"
+            exit 1
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -390,7 +413,11 @@ jobs:
       - name: Publish main package
         run: |
           echo "Publishing rcoder-cli..."
-          npm publish npm/rcoder-cli --access public --tag latest
+          cd npm/rcoder-cli
+          tarball=$(npm pack 2>/dev/null)
+          cd -
+          npm publish "npm/rcoder-cli/$tarball" --access public --tag latest --registry https://registry.npmjs.org
+          rm -f "npm/rcoder-cli/$tarball"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
