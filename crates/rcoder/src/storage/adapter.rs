@@ -238,13 +238,27 @@ impl ProjectAdapter {
     /// 通过 session_id 获取项目信息
     ///
     /// 读时清理孤儿条目：如果 session_index 指向的 project 不存在，自动清理。
+    /// 同时验证 session 是否仍在 project 的 sessions 集合中，防止已清除的 session 被误访问。
     pub fn get_by_session_id(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
         let pid = self
             .session_index
             .view(session_id, |_, v| v.1.clone())?;
 
         match self.projects.view(&pid, |_, v| v.clone()) {
-            Some(info) => Some(info),
+            Some(info) => {
+                // 验证 session 是否仍在 sessions 集合中
+                if info.sessions().contains(session_id) {
+                    Some(info)
+                } else {
+                    // session 已被清除，清理索引
+                    debug!(
+                        "[STORAGE] session already removed from project, cleaning index: session_id={}, project_id={}",
+                        session_id, pid
+                    );
+                    self.session_index.remove(session_id);
+                    None
+                }
+            }
             None => {
                 // 孤儿条目：session_index 指向的 project 已不存在，清理
                 debug!(
@@ -260,7 +274,8 @@ impl ProjectAdapter {
     /// 向已有 project 追加 session（C1 修复推荐路径）
     ///
     /// 用于 chat 响应后只追加 session、不重建整个 ProjectAndContainerInfo 的场景。
-    /// 单步原子操作，多 session 并存语义。
+    /// 多步操作，使用 DashMap entry API 保证 sessions 集合更新的原子性。
+    /// 多 session 并存语义：一个 project 可以有多个并发活跃 session。
     ///
     /// 返回 false 表示 project 不存在（调用方需要走 insert_with_session 完整路径）。
     pub fn add_session_to_project(&self, project_id: &str, session_id: &str) -> bool {
@@ -377,20 +392,26 @@ impl ProjectAdapter {
     ///
     /// 语义：当用户主动 stop agent 时，所有 session 失效。
     /// 若只想清单个 session（如 SSE 流正常结束），请用 `clear_session_one`。
+    ///
+    /// 顺序：先清理 session_index，再清理 projects，避免并发访问时出现不一致。
     pub fn clear_session(&self, project_id: &str) {
-        // entry API: 读取所有 session + 清空在同一写锁内完成
+        // 先获取所有 session_id（用于后续清理 session_index）
         let cleared_sids: Vec<String> =
-            if let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) {
-                let info = Arc::make_mut(e.get_mut());
-                let sids = info.sessions().into_iter().collect();
-                info.clear_all_sessions();
-                sids
+            if let Some(info) = self.projects.view(project_id, |_, v| v.sessions().into_iter().collect()) {
+                info
             } else {
                 vec![]
             };
 
+        // 先清理 session_index，防止并发访问时 get_by_session_id 返回已清除的 session
         for sid in &cleared_sids {
             self.session_index.remove(sid);
+        }
+
+        // 再清理 projects 中的 sessions 集合
+        if let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) {
+            let info = Arc::make_mut(e.get_mut());
+            info.clear_all_sessions();
         }
 
         if !cleared_sids.is_empty() {
@@ -406,18 +427,24 @@ impl ProjectAdapter {
     ///
     /// 用于 SSE 流自然结束、单 session 取消等场景。
     /// 返回 true 表示该 session 之前存在。
+    ///
+    /// 顺序：先清理 session_index，再清理 projects，避免并发访问时出现不一致。
     pub fn clear_session_one(&self, project_id: &str, session_id: &str) -> bool {
-        let mut removed = false;
+        // 先清理 session_index，防止并发访问时 get_by_session_id 返回已清除的 session
+        let was_in_index = self.session_index.remove(session_id).is_some();
+
+        // 再清理 projects 中的 sessions 集合
+        let mut removed_from_project = false;
         if let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) {
             let info = Arc::make_mut(e.get_mut());
-            removed = info.remove_session(session_id);
+            removed_from_project = info.remove_session(session_id);
         }
 
+        let removed = was_in_index || removed_from_project;
         if removed {
-            self.session_index.remove(session_id);
             debug!(
-                "[STORAGE] cleared one session: project_id={}, sid={}",
-                project_id, session_id
+                "[STORAGE] cleared one session: project_id={}, sid={}, from_index={}, from_project={}",
+                project_id, session_id, was_in_index, removed_from_project
             );
         }
         removed
@@ -2036,5 +2063,169 @@ mod tests {
             !adapter.user_id_to_project_id.contains_key("user-shared"),
             "user_id 索引应在 remove 后被清理"
         );
+    }
+
+    /// 测试容器重建后 session_index 同步
+    ///
+    /// 场景：容器重建后，existing session 需要通过 add_session_to_project 同步到 session_index
+    #[test]
+    fn test_session_index_sync_after_container_rebuild() {
+        let adapter = make_adapter();
+        let project_id = "test-rebuild";
+        let session_id = "session-before-rebuild";
+
+        // 1. 创建项目并添加 session
+        let info = Arc::new(create_test_info_with_container(project_id, "container-old"));
+        adapter.insert(project_id.to_string(), info).unwrap();
+        adapter.add_session_to_project(project_id, session_id);
+
+        // 验证 session 可查
+        assert!(adapter.get_by_session_id(session_id).is_some());
+
+        // 2. 模拟容器重建：重新插入项目（不带 session）
+        let new_info = Arc::new(create_test_info_with_container(project_id, "container-new"));
+        adapter.insert(project_id.to_string(), new_info).unwrap();
+
+        // 此时 session_index 中应该还有旧的 session（因为 insert 不清理 session_index）
+        // 但 project 的 sessions 集合是空的
+        let project = adapter.get(project_id).unwrap();
+        assert_eq!(project.session_count(), 0, "新 project 的 sessions 应为空");
+
+        // 3. 模拟 ensure_project_mapping_in_state 的修复逻辑：同步 session 到 session_index
+        adapter.add_session_to_project(project_id, session_id);
+
+        // 验证 session 现在可查
+        let by_session = adapter.get_by_session_id(session_id);
+        assert!(by_session.is_some(), "同步后 session 应可查");
+        assert_eq!(by_session.unwrap().project_id(), project_id);
+
+        // 验证 project 的 sessions 集合也包含了这个 session
+        let project = adapter.get(project_id).unwrap();
+        assert_eq!(project.session_count(), 1, "project 应包含 1 个 session");
+    }
+
+    /// 测试 get_by_session_id 验证 session 是否在 sessions 集合中
+    ///
+    /// 场景：session 被 clear_session_one 清除后，get_by_session_id 应返回 None
+    #[test]
+    fn test_get_by_session_id_validates_session_in_set() {
+        let adapter = make_adapter();
+        let project_id = "test-validate-session";
+        let session_id = "session-to-validate";
+
+        // 创建项目并添加 session
+        let info = Arc::new(create_test_info(project_id));
+        adapter.insert(project_id.to_string(), info).unwrap();
+        adapter.add_session_to_project(project_id, session_id);
+
+        // 验证 session 可查
+        assert!(adapter.get_by_session_id(session_id).is_some());
+
+        // 清除 session
+        let cleared = adapter.clear_session_one(project_id, session_id);
+        assert!(cleared);
+
+        // 验证 session 不可查（关键断言）
+        assert!(
+            adapter.get_by_session_id(session_id).is_none(),
+            "清除后的 session 不应被 get_by_session_id 返回"
+        );
+
+        // 验证 session_index 也被清理
+        assert!(
+            !adapter.session_index.contains_key(session_id),
+            "session_index 应在 clear_session_one 后被清理"
+        );
+    }
+
+    /// 测试 clear_session_one 的顺序：先清理 session_index，再清理 projects
+    ///
+    /// 场景：验证 clear_session_one 后，session_index 和 projects 都被正确清理
+    #[test]
+    fn test_clear_session_one_order() {
+        let adapter = make_adapter();
+        let project_id = "test-clear-order";
+        let session_id = "session-clear-order";
+
+        // 创建项目并添加 session
+        let info = Arc::new(create_test_info(project_id));
+        adapter.insert(project_id.to_string(), info).unwrap();
+        adapter.add_session_to_project(project_id, session_id);
+
+        // 验证 session_index 和 projects 都有这个 session
+        assert!(adapter.session_index.contains_key(session_id));
+        let project = adapter.get(project_id).unwrap();
+        assert!(project.sessions().contains(session_id));
+
+        // 清除 session
+        let cleared = adapter.clear_session_one(project_id, session_id);
+        assert!(cleared);
+
+        // 验证 session_index 被清理
+        assert!(
+            !adapter.session_index.contains_key(session_id),
+            "session_index 应被清理"
+        );
+
+        // 验证 projects 中的 sessions 集合也被清理
+        let project = adapter.get(project_id).unwrap();
+        assert!(
+            !project.sessions().contains(session_id),
+            "projects 中的 sessions 集合应被清理"
+        );
+    }
+
+    /// 测试容器重建场景：insert 后 add_session_to_project 的完整流程
+    ///
+    /// 模拟 computer_chat_handler 中 ensure_project_mapping_in_state 的逻辑
+    #[test]
+    fn test_container_rebuild_with_session_migration() {
+        let adapter = make_adapter();
+        let project_id = "test-rebuild-migration";
+        let user_id = "user-123";
+
+        // 1. 初始状态：创建项目，添加 2 个 session
+        let mut info = create_test_info_with_container(project_id, "container-v1");
+        info.set_user_id(Some(user_id.to_string()));
+        adapter.insert(project_id.to_string(), Arc::new(info)).unwrap();
+        adapter.add_session_to_project(project_id, "session-1");
+        adapter.add_session_to_project(project_id, "session-2");
+
+        // 验证初始状态
+        assert_eq!(adapter.get(project_id).unwrap().session_count(), 2);
+        assert!(adapter.get_by_session_id("session-1").is_some());
+        assert!(adapter.get_by_session_id("session-2").is_some());
+
+        // 2. 模拟容器重建：获取 existing sessions
+        let existing_sessions: Vec<String> = adapter
+            .get(project_id)
+            .map(|p| p.sessions().into_iter().collect())
+            .unwrap_or_default();
+        assert_eq!(existing_sessions.len(), 2);
+
+        // 3. 插入新的 project（模拟容器重建）
+        let mut new_info = create_test_info_with_container(project_id, "container-v2");
+        new_info.set_user_id(Some(user_id.to_string()));
+        adapter.insert(project_id.to_string(), Arc::new(new_info)).unwrap();
+
+        // 4. 同步现有 session 到 session_index（修复逻辑）
+        for sid in &existing_sessions {
+            adapter.add_session_to_project(project_id, sid);
+        }
+
+        // 5. 验证所有 session 都可查
+        assert!(adapter.get_by_session_id("session-1").is_some(), "session-1 应可查");
+        assert!(adapter.get_by_session_id("session-2").is_some(), "session-2 应可查");
+
+        // 6. 验证 project 的 sessions 集合也正确
+        let project = adapter.get(project_id).unwrap();
+        assert_eq!(project.session_count(), 2, "project 应包含 2 个 session");
+
+        // 7. 添加新 session（新请求）
+        adapter.add_session_to_project(project_id, "session-3");
+        assert!(adapter.get_by_session_id("session-3").is_some(), "新 session-3 应可查");
+
+        let project = adapter.get(project_id).unwrap();
+        assert_eq!(project.session_count(), 3, "project 应包含 3 个 session");
     }
 }

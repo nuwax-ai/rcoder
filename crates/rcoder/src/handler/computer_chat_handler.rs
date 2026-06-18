@@ -1145,12 +1145,43 @@ fn ensure_project_mapping_in_state(
     );
 
     // immediately insert project record
-    state
-        .insert_project(project_id.to_string(), Arc::new(project_info))
-        .map_err(|e| {
-            tracing::error!("[STORAGE] insert_project failed: {}", e);
-            e
-        })?;
+    // 注意：如果有现有 session，必须使用 insert_with_session 来同步更新 session_index
+    // 否则容器重建后，session_index 中会丢失 session 映射，导致 SSE 连接失败
+    let project_info_arc = Arc::new(project_info);
+    let existing_sessions: Vec<String> = existing_project
+        .as_ref()
+        .map(|p| p.sessions().into_iter().collect())
+        .unwrap_or_default();
+
+    if existing_sessions.is_empty() {
+        // 没有现有 session，直接插入
+        state
+            .insert_project(project_id.to_string(), project_info_arc)
+            .map_err(|e| {
+                tracing::error!("[STORAGE] insert_project failed: {}", e);
+                e
+            })?;
+    } else {
+        // 有现有 session，使用 insert_with_session 同步更新 session_index
+        // 对于多个 session，先插入项目，再逐个添加 session
+        state
+            .insert_project(project_id.to_string(), project_info_arc.clone())
+            .map_err(|e| {
+                tracing::error!("[STORAGE] insert_project failed: {}", e);
+                e
+            })?;
+
+        // 逐个添加现有 session 到 session_index
+        for sid in &existing_sessions {
+            state.add_session_to_project(project_id, sid);
+        }
+
+        debug!(
+            "🔄 [COMPUTER_CHAT] Synced {} existing session(s) to session_index: project_id={}",
+            existing_sessions.len(),
+            project_id
+        );
+    }
 
     info!(
         "🆕 [COMPUTER_CHAT] Inserted project record (immediately after container creation): user_id={}, project_id={}, container_id={}",
