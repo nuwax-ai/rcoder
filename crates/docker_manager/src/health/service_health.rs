@@ -171,8 +171,8 @@ impl ServiceHealthChecker {
     /// * `true` - gRPC 服务响应正常
     /// * `false` - 连接失败、超时或 RPC 调用失败
     pub async fn check_grpc_connectivity(&self, ip: &str) -> bool {
-        use shared_types::grpc::agent_service_client::AgentServiceClient;
         use shared_types::grpc::GetStatusRequest;
+        use shared_types::grpc::agent_service_client::AgentServiceClient;
 
         let addr = format!("http://{}:{}", ip, self.grpc_port);
 

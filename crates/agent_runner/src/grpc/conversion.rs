@@ -2,13 +2,11 @@
 
 use shared_types::ModelProviderConfig;
 use shared_types::grpc::{
-    AutoReloadConfig as GrpcAutoReloadConfig,
-    ChatAgentConfig as GrpcChatAgentConfig,
+    AutoReloadConfig as GrpcAutoReloadConfig, ChatAgentConfig as GrpcChatAgentConfig,
     ChatAgentServerConfig as GrpcChatAgentServerConfig,
-    ChatContextServerConfig as GrpcChatContextServerConfig,
-    ModelEnvBinding as GrpcModelEnvBinding, ModelEnvBindingSource as GrpcModelEnvBindingSource,
-    ModelProviderConfig as GrpcModelProviderConfig,
-    attachment, attachment_source,
+    ChatContextServerConfig as GrpcChatContextServerConfig, ModelEnvBinding as GrpcModelEnvBinding,
+    ModelEnvBindingSource as GrpcModelEnvBindingSource,
+    ModelProviderConfig as GrpcModelProviderConfig, attachment, attachment_source,
 };
 use shared_types::{
     Attachment, AttachmentSource, AudioAttachment, AutoReloadConfig, DocumentAttachment,
@@ -18,8 +16,8 @@ use shared_types::{
     ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig, ModelEnvBinding,
     ModelEnvBindingSource, ToolApprovalAction, ToolApprovalRule, VALID_TOOL_KINDS,
 };
-use tracing::warn;
 use tonic::Status;
+use tracing::warn;
 
 pub fn convert_model_provider(grpc_config: GrpcModelProviderConfig) -> ModelProviderConfig {
     ModelProviderConfig {
@@ -118,9 +116,7 @@ pub fn convert_agent_server_config(
                 grpc_config
                     .platforms
                     .into_iter()
-                    .filter_map(|(k, bytes)| {
-                        serde_json::from_slice(&bytes).ok().map(|v| (k, v))
-                    })
+                    .filter_map(|(k, bytes)| serde_json::from_slice(&bytes).ok().map(|v| (k, v)))
                     .collect(),
             )
         },
@@ -158,7 +154,9 @@ fn convert_tool_approval_rule(
     })
 }
 
-pub fn convert_model_env_binding(grpc_binding: GrpcModelEnvBinding) -> Result<ModelEnvBinding, Status> {
+pub fn convert_model_env_binding(
+    grpc_binding: GrpcModelEnvBinding,
+) -> Result<ModelEnvBinding, Status> {
     let source = match GrpcModelEnvBindingSource::try_from(grpc_binding.source) {
         Ok(GrpcModelEnvBindingSource::ApiKey) => ModelEnvBindingSource::ApiKey,
         Ok(GrpcModelEnvBindingSource::BaseUrl) => ModelEnvBindingSource::BaseUrl,
@@ -319,7 +317,9 @@ pub fn convert_attachment(
     Some(result)
 }
 
-pub fn convert_attachments(grpc_attachments: Vec<shared_types::grpc::Attachment>) -> Vec<Attachment> {
+pub fn convert_attachments(
+    grpc_attachments: Vec<shared_types::grpc::Attachment>,
+) -> Vec<Attachment> {
     let total = grpc_attachments.len();
     let converted: Vec<Attachment> = grpc_attachments
         .into_iter()

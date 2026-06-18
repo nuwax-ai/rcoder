@@ -8,8 +8,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use semver::Version;
-use winnow::prelude::*;
 use winnow::ascii::alpha1;
+use winnow::prelude::*;
 
 // =============================================================================
 // 版本号处理
@@ -52,7 +52,10 @@ pub fn normalize_version(version: &str) -> Result<String, VersionParseError> {
 /// 返回 None 表示版本格式无效或为空。
 pub fn parse_semver(version: &str) -> Option<Version> {
     let v = version.trim();
-    let v = v.strip_prefix('v').or_else(|| v.strip_prefix('V')).unwrap_or(v);
+    let v = v
+        .strip_prefix('v')
+        .or_else(|| v.strip_prefix('V'))
+        .unwrap_or(v);
     Version::parse(v).ok()
 }
 
@@ -61,12 +64,10 @@ pub fn parse_semver(version: &str) -> Option<Version> {
 /// 两个版本都必须是合法的 semver 格式，否则 panic（Fail Fast）。
 /// 调用方应确保版本已经过校验。
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
-    let a_ver = parse_semver(a).unwrap_or_else(|| {
-        panic!("compare_versions: invalid semver version: '{}'", a)
-    });
-    let b_ver = parse_semver(b).unwrap_or_else(|| {
-        panic!("compare_versions: invalid semver version: '{}'", b)
-    });
+    let a_ver = parse_semver(a)
+        .unwrap_or_else(|| panic!("compare_versions: invalid semver version: '{}'", a));
+    let b_ver = parse_semver(b)
+        .unwrap_or_else(|| panic!("compare_versions: invalid semver version: '{}'", b));
     a_ver.cmp(&b_ver)
 }
 
@@ -179,7 +180,10 @@ pub struct PlatformParseError;
 
 impl fmt::Display for PlatformParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid platform key, expected format: {{os}}-{{arch}} (e.g. linux-x86_64)")
+        write!(
+            f,
+            "invalid platform key, expected format: {{os}}-{{arch}} (e.g. linux-x86_64)"
+        )
     }
 }
 
@@ -212,7 +216,7 @@ fn platform_key_parser(input: &mut &str) -> winnow::ModalResult<PlatformKey> {
         _ => {
             return Err(winnow::error::ErrMode::Backtrack(
                 winnow::error::ContextError::new(),
-            ))
+            ));
         }
     };
 
@@ -223,7 +227,7 @@ fn platform_key_parser(input: &mut &str) -> winnow::ModalResult<PlatformKey> {
         _ => {
             return Err(winnow::error::ErrMode::Backtrack(
                 winnow::error::ContextError::new(),
-            ))
+            ));
         }
     };
 
@@ -317,9 +321,12 @@ mod tests {
     #[test]
     fn platform_key_parse_all_6_platforms() {
         for s in &[
-            "linux-x86_64", "linux-arm64",
-            "darwin-arm64", "darwin-x86_64",
-            "windows-x86_64", "windows-arm64",
+            "linux-x86_64",
+            "linux-arm64",
+            "darwin-arm64",
+            "darwin-x86_64",
+            "windows-x86_64",
+            "windows-arm64",
         ] {
             let key: PlatformKey = s.parse().unwrap();
             assert_eq!(key.to_string(), *s);
@@ -385,6 +392,9 @@ mod tests {
     #[test]
     fn normalize_platform_key_fallback() {
         // 未知平台回退到原始拼接
-        assert_eq!(normalize_platform_key("freebsd", "x86_64"), "freebsd-x86_64");
+        assert_eq!(
+            normalize_platform_key("freebsd", "x86_64"),
+            "freebsd-x86_64"
+        );
     }
 }

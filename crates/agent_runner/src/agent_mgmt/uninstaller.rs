@@ -206,7 +206,8 @@ mod tests {
     async fn builtin_uninstall_rejected() {
         let r = AgentRegistry::empty(temp_pm());
         let install_dir = r.install_dir().to_path_buf();
-        r.insert(sample("builtin-1", InstallType::Builtin, &install_dir)).unwrap();
+        r.insert(sample("builtin-1", InstallType::Builtin, &install_dir))
+            .unwrap();
         let err = uninstall(&r, "builtin-1").await.unwrap_err();
         assert!(matches!(err, AgentMgmtError::BuiltinProtected));
         assert!(r.contains("builtin-1"));
@@ -216,7 +217,8 @@ mod tests {
     async fn user_install_uninstall_succeeds() {
         let r = AgentRegistry::empty(temp_pm());
         let install_dir = r.install_dir().to_path_buf();
-        r.insert(sample("user-1", InstallType::Binary, &install_dir)).unwrap();
+        r.insert(sample("user-1", InstallType::Binary, &install_dir))
+            .unwrap();
         let removed = uninstall(&r, "user-1").await.unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].agent_id, "user-1");
@@ -226,7 +228,11 @@ mod tests {
     #[tokio::test]
     async fn uninstall_rejects_binary_outside_install_dir() {
         let r = AgentRegistry::empty(temp_pm());
-        let mut m = sample("evil", InstallType::Binary, &std::path::PathBuf::from("/tmp"));
+        let mut m = sample(
+            "evil",
+            InstallType::Binary,
+            &std::path::PathBuf::from("/tmp"),
+        );
         m.binary_path = "/etc/passwd".to_string();
         r.insert(m).unwrap();
         let err = uninstall(&r, "evil").await.unwrap_err();
@@ -255,8 +261,20 @@ mod tests {
         std::fs::write(v1_dir.join("test-agent"), "v1").unwrap();
         std::fs::write(v2_dir.join("test-agent"), "v2").unwrap();
 
-        r.insert(sample_with_version("test-agent", "1.0.0", InstallType::Binary, &install_dir)).unwrap();
-        r.insert(sample_with_version("test-agent", "2.0.0", InstallType::Binary, &install_dir)).unwrap();
+        r.insert(sample_with_version(
+            "test-agent",
+            "1.0.0",
+            InstallType::Binary,
+            &install_dir,
+        ))
+        .unwrap();
+        r.insert(sample_with_version(
+            "test-agent",
+            "2.0.0",
+            InstallType::Binary,
+            &install_dir,
+        ))
+        .unwrap();
 
         // 卸载 1.0.0
         let removed = uninstall_version(&r, "test-agent", "1.0.0").await.unwrap();
@@ -282,7 +300,13 @@ mod tests {
         std::fs::create_dir_all(&v_dir).unwrap();
         std::fs::write(v_dir.join("solo-agent"), "v1").unwrap();
 
-        r.insert(sample_with_version("solo-agent", "1.0.0", InstallType::Binary, &install_dir)).unwrap();
+        r.insert(sample_with_version(
+            "solo-agent",
+            "1.0.0",
+            InstallType::Binary,
+            &install_dir,
+        ))
+        .unwrap();
 
         let removed = uninstall_version(&r, "solo-agent", "1.0.0").await.unwrap();
         assert_eq!(removed.version, Some("1.0.0".to_string()));
@@ -297,9 +321,17 @@ mod tests {
     async fn uninstall_nonexistent_version_returns_not_found() {
         let r = AgentRegistry::empty(temp_pm());
         let install_dir = r.install_dir().to_path_buf();
-        r.insert(sample_with_version("test-agent", "1.0.0", InstallType::Binary, &install_dir)).unwrap();
+        r.insert(sample_with_version(
+            "test-agent",
+            "1.0.0",
+            InstallType::Binary,
+            &install_dir,
+        ))
+        .unwrap();
 
-        let err = uninstall_version(&r, "test-agent", "9.9.9").await.unwrap_err();
+        let err = uninstall_version(&r, "test-agent", "9.9.9")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AgentMgmtError::NotFound(_)));
     }
 
@@ -307,16 +339,29 @@ mod tests {
     async fn uninstall_version_builtin_rejected() {
         let r = AgentRegistry::empty(temp_pm());
         let install_dir = r.install_dir().to_path_buf();
-        r.insert(sample_with_version("builtin-1", "1.0.0", InstallType::Builtin, &install_dir)).unwrap();
+        r.insert(sample_with_version(
+            "builtin-1",
+            "1.0.0",
+            InstallType::Builtin,
+            &install_dir,
+        ))
+        .unwrap();
 
-        let err = uninstall_version(&r, "builtin-1", "1.0.0").await.unwrap_err();
+        let err = uninstall_version(&r, "builtin-1", "1.0.0")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AgentMgmtError::BuiltinProtected));
     }
 
     #[tokio::test]
     async fn uninstall_version_rejects_binary_outside_install_dir() {
         let r = AgentRegistry::empty(temp_pm());
-        let mut m = sample_with_version("evil", "1.0.0", InstallType::Binary, &std::path::PathBuf::from("/tmp"));
+        let mut m = sample_with_version(
+            "evil",
+            "1.0.0",
+            InstallType::Binary,
+            &std::path::PathBuf::from("/tmp"),
+        );
         m.binary_path = "/etc/passwd".to_string();
         r.insert(m).unwrap();
 
@@ -334,11 +379,25 @@ mod tests {
         std::fs::create_dir_all(&v1_dir).unwrap();
         std::fs::create_dir_all(&v2_dir).unwrap();
 
-        r.insert(sample_with_version("multi-agent", "1.0.0", InstallType::Binary, &install_dir)).unwrap();
-        r.insert(sample_with_version("multi-agent", "2.0.0", InstallType::Binary, &install_dir)).unwrap();
+        r.insert(sample_with_version(
+            "multi-agent",
+            "1.0.0",
+            InstallType::Binary,
+            &install_dir,
+        ))
+        .unwrap();
+        r.insert(sample_with_version(
+            "multi-agent",
+            "2.0.0",
+            InstallType::Binary,
+            &install_dir,
+        ))
+        .unwrap();
 
         // version = None → 卸载全部
-        let removed = uninstall_with_version(&r, "multi-agent", None).await.unwrap();
+        let removed = uninstall_with_version(&r, "multi-agent", None)
+            .await
+            .unwrap();
         assert_eq!(removed.len(), 2);
         assert!(!r.contains("multi-agent"));
     }

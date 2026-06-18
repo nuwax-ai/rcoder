@@ -80,7 +80,9 @@ impl AgentManifest {
             return Err(AgentMgmtError::InvalidManifest("command is empty".into()));
         }
         if self.binary_path.is_empty() {
-            return Err(AgentMgmtError::InvalidManifest("binary_path is empty".into()));
+            return Err(AgentMgmtError::InvalidManifest(
+                "binary_path is empty".into(),
+            ));
         }
         crate::agent_mgmt::path_manager::validate_agent_id(&self.agent_id)
             .map_err(AgentMgmtError::InvalidManifest)?;

@@ -70,7 +70,10 @@ pub fn set_mcp_proxy_log_dir(path: String) {
             info!("[MCP] Set MCP_PROXY_LOG_DIR via OnceLock: {}", path);
         }
         Err(_) => {
-            debug!("[MCP] MCP_PROXY_LOG_DIR already set, ignoring new value: {}", path);
+            debug!(
+                "[MCP] MCP_PROXY_LOG_DIR already set, ignoring new value: {}",
+                path
+            );
         }
     }
 }

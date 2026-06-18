@@ -30,8 +30,8 @@ impl GatewayConfig {
             .unwrap_or_else(|_| "http://127.0.0.1:8087".to_string());
         let envoy_gateway_url = std::env::var("ENVOY_GATEWAY_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-        let namespace = std::env::var("RCODER_K8S_NAMESPACE")
-            .unwrap_or_else(|_| "default".to_string());
+        let namespace =
+            std::env::var("RCODER_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
         let cache_ttl_seconds = std::env::var("CACHE_TTL_SECONDS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -69,8 +69,17 @@ mod tests {
 
     #[test]
     fn test_parse_addr() {
-        assert_eq!(GatewayConfig::parse_addr("http://10.0.0.1:8080"), ("10.0.0.1", 8080));
-        assert_eq!(GatewayConfig::parse_addr("http://rcoder-control:8087/"), ("rcoder-control", 8087));
-        assert_eq!(GatewayConfig::parse_addr("http://localhost"), ("localhost", 80));
+        assert_eq!(
+            GatewayConfig::parse_addr("http://10.0.0.1:8080"),
+            ("10.0.0.1", 8080)
+        );
+        assert_eq!(
+            GatewayConfig::parse_addr("http://rcoder-control:8087/"),
+            ("rcoder-control", 8087)
+        );
+        assert_eq!(
+            GatewayConfig::parse_addr("http://localhost"),
+            ("localhost", 80)
+        );
     }
 }

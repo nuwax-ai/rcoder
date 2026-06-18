@@ -190,10 +190,7 @@ async fn sync_vnc_backends(
                 .await
                 .unwrap_or(false)
                 || runtime
-                    .is_container_running_by_identifier(
-                        user_id,
-                        &ServiceType::ComputerAgentRunner,
-                    )
+                    .is_container_running_by_identifier(user_id, &ServiceType::ComputerAgentRunner)
                     .await
                     .unwrap_or(false);
 

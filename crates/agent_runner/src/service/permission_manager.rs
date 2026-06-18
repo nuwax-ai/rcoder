@@ -244,7 +244,10 @@ impl PermissionManager {
     }
 
     pub fn cancel_session_permissions(&self, session_id: &str) -> usize {
-        info!("[Permission] Cancelling all pending permissions for session: {}", session_id);
+        info!(
+            "[Permission] Cancelling all pending permissions for session: {}",
+            session_id
+        );
         let mut guard = self.pending.lock();
         let keys: Vec<_> = guard
             .keys()
@@ -253,12 +256,18 @@ impl PermissionManager {
             .collect();
         let count = Self::remove_and_respond(&mut guard, &keys);
         drop(guard);
-        info!("[Permission] Cancelled {} pending permissions for session: {}", count, session_id);
+        info!(
+            "[Permission] Cancelled {} pending permissions for session: {}",
+            count, session_id
+        );
         count
     }
 
     pub fn cancel_project_permissions(&self, project_id: &str) -> usize {
-        info!("[Permission] Cancelling all pending permissions for project: {}", project_id);
+        info!(
+            "[Permission] Cancelling all pending permissions for project: {}",
+            project_id
+        );
         let mut guard = self.pending.lock();
         let keys: Vec<_> = guard
             .iter()
@@ -267,7 +276,10 @@ impl PermissionManager {
             .collect();
         let count = Self::remove_and_respond(&mut guard, &keys);
         drop(guard);
-        info!("[Permission] Cancelled {} pending permissions for project: {}", count, project_id);
+        info!(
+            "[Permission] Cancelled {} pending permissions for project: {}",
+            count, project_id
+        );
         count
     }
 
@@ -455,10 +467,14 @@ impl PermissionRequestHandler for PermissionManager {
                 "[Permission] dangerous command detected, forcing frontend approval: session_id={}, tool_call_id={}, command={:?}",
                 info.session_id, info.tool_call_id, info.command
             );
-            return self.push_permission_to_frontend(context, request, responder, &info).await;
+            return self
+                .push_permission_to_frontend(context, request, responder, &info)
+                .await;
         }
 
-        if let Some(decision) = self.rule_decision(&context, &info.tool_name, info.command.as_deref()) {
+        if let Some(decision) =
+            self.rule_decision(&context, &info.tool_name, info.command.as_deref())
+        {
             let preferred = match decision {
                 RuleDecision::Allow => [
                     PermissionOptionKind::AllowAlways,
@@ -1425,7 +1441,11 @@ mod tests {
     #[test]
     fn tool_approval_rules_multiple_patterns_or_logic() {
         let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
-            patterns: vec!["rm -rf *".to_string(), "sudo *".to_string(), "chmod 777 *".to_string()],
+            patterns: vec![
+                "rm -rf *".to_string(),
+                "sudo *".to_string(),
+                "chmod 777 *".to_string(),
+            ],
             action: ToolApprovalAction::Ask,
             tool_kind: None,
         }]));

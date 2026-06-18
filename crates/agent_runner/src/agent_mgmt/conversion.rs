@@ -5,12 +5,11 @@
 use shared_types::{
     AgentInfo, AgentInstallStatus as SharedStatus, InstallType as SharedInstallType,
 };
-use shared_types::{
-    InstallAgentResponse as SharedInstallResp, AgentInstallStatus,
-};
+use shared_types::{AgentInstallStatus, InstallAgentResponse as SharedInstallResp};
 use shared_types_grpc::{
-    AgentInfo as ProtoAgentInfo, AgentInstallStatus as ProtoStatus, InstallAgentResponse as ProtoInstallResp,
-    InstallType as ProtoInstallType, SystemInfo as ProtoSystemInfo,
+    AgentInfo as ProtoAgentInfo, AgentInstallStatus as ProtoStatus,
+    InstallAgentResponse as ProtoInstallResp, InstallType as ProtoInstallType,
+    SystemInfo as ProtoSystemInfo,
 };
 
 use crate::agent_mgmt::installer::AgentManifest;
@@ -107,8 +106,16 @@ pub fn install_response_to_shared(p: &ProtoInstallResp) -> SharedInstallResp {
         source_url: p.source_url.clone(),
         action: shared_types::InstallAction::from_str(p.action.as_str()).ok(),
         installed: p.installed,
-        previous_version: if p.previous_version.is_empty() { None } else { Some(p.previous_version.clone()) },
-        platform: if p.platform.is_empty() { None } else { Some(p.platform.clone()) },
+        previous_version: if p.previous_version.is_empty() {
+            None
+        } else {
+            Some(p.previous_version.clone())
+        },
+        platform: if p.platform.is_empty() {
+            None
+        } else {
+            Some(p.platform.clone())
+        },
     }
 }
 

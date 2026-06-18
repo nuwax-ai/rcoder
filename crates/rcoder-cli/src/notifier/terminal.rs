@@ -60,7 +60,8 @@ impl TerminalSessionNotifier {
                 ));
             }
             SessionUpdate::ToolCall(tool_call) => {
-                self.formatter.tool_call(&tool_call.title, &format!("{:?}", tool_call.status));
+                self.formatter
+                    .tool_call(&tool_call.title, &format!("{:?}", tool_call.status));
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 if let Some(ref title) = update.fields.title {
@@ -77,10 +78,8 @@ impl TerminalSessionNotifier {
                 self.formatter.debug("[plan update received]");
             }
             SessionUpdate::CurrentModeUpdate(mode_update) => {
-                self.formatter.info(&format!(
-                    "Mode changed: {}",
-                    mode_update.current_mode_id.0
-                ));
+                self.formatter
+                    .info(&format!("Mode changed: {}", mode_update.current_mode_id.0));
             }
             SessionUpdate::ConfigOptionUpdate(_)
             | SessionUpdate::SessionInfoUpdate(_)
@@ -157,8 +156,10 @@ impl SessionNotifier for TerminalSessionNotifier {
                 session_id, err
             ));
         } else {
-            self.formatter
-                .info(&format!("Prompt ended (session: {}, reason: {:?})", session_id, stop_reason));
+            self.formatter.info(&format!(
+                "Prompt ended (session: {}, reason: {:?})",
+                session_id, stop_reason
+            ));
         }
 
         // Signal completion to unblock send_prompt_and_wait()
@@ -174,8 +175,10 @@ impl SessionNotifier for TerminalSessionNotifier {
         error: agent_client_protocol::schema::Error,
         _request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.formatter
-            .error(&format!("Prompt error (session: {}): {:?}", session_id, error));
+        self.formatter.error(&format!(
+            "Prompt error (session: {}): {:?}",
+            session_id, error
+        ));
 
         // Signal completion even on error
         self.signal_completion();

@@ -316,7 +316,9 @@ impl SessionData {
         {
             // 检查是否因为 worker 已完成导致通道关闭
             if self.is_worker_finished_nonblocking() {
-                warn!("⚠️ [SessionData] Failed to push message: SessionWorker has exited (normal exit, cancelled, or panicked). Messages will be lost until session is recreated");
+                warn!(
+                    "⚠️ [SessionData] Failed to push message: SessionWorker has exited (normal exit, cancelled, or panicked). Messages will be lost until session is recreated"
+                );
             } else {
                 warn!("Failed to push message: command channel full (backpressure)");
             }
@@ -491,7 +493,9 @@ impl SessionWorker {
                     buffered_len = pushed_back;
                     debug!(
                         "📼 [SessionWorker] Replay: captured {} messages from ring buffer (occupied={}, pushed_back={})",
-                        snapshot.len(), count, pushed_back
+                        snapshot.len(),
+                        count,
+                        pushed_back
                     );
                     let _ = ack.send(snapshot);
                 }
@@ -504,10 +508,18 @@ impl SessionWorker {
 
 #[derive(Debug)]
 enum SessionCommand {
-    Push { message: UnifiedSessionMessage },
-    Clear { ack: oneshot::Sender<usize> },
-    MessageCount { ack: oneshot::Sender<usize> },
-    Replay { ack: oneshot::Sender<Vec<UnifiedSessionMessage>> },
+    Push {
+        message: UnifiedSessionMessage,
+    },
+    Clear {
+        ack: oneshot::Sender<usize>,
+    },
+    MessageCount {
+        ack: oneshot::Sender<usize>,
+    },
+    Replay {
+        ack: oneshot::Sender<Vec<UnifiedSessionMessage>>,
+    },
 }
 
 /// 便捷函数：添加SessionNotify消息（自动转换为统一格式）

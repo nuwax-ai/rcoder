@@ -44,7 +44,10 @@ fn get_agent_body_parses() {
 fn get_agent_body_missing_agent_id_fails() {
     let result: Result<shared_types::GetAgentRequest, _> =
         serde_json::from_str(r#"{"project_id":"p1"}"#);
-    assert!(result.is_err(), "missing agent_id should fail deserialization");
+    assert!(
+        result.is_err(),
+        "missing agent_id should fail deserialization"
+    );
 }
 
 #[test]
@@ -69,8 +72,14 @@ fn install_from_url_body_parses() {
     .unwrap();
     assert_eq!(body.agent.version.as_deref(), Some("1.2.0"));
     assert_eq!(body.platforms.len(), 1);
-    assert_eq!(body.platforms["linux-x86_64"].url, "https://x.example/agent-linux-amd64.tar.gz");
-    assert_eq!(body.platforms["linux-x86_64"].sha256.as_deref(), Some("abc"));
+    assert_eq!(
+        body.platforms["linux-x86_64"].url,
+        "https://x.example/agent-linux-amd64.tar.gz"
+    );
+    assert_eq!(
+        body.platforms["linux-x86_64"].sha256.as_deref(),
+        Some("abc")
+    );
     assert_eq!(body.agent.args, vec!["--serve"]);
 }
 
@@ -107,7 +116,10 @@ fn install_metadata_body_explicit_install_type_url() {
     }"#;
     let m: handler::InstallMetadataBody = serde_json::from_str(json).unwrap();
     assert_eq!(m.install_type, "URL");
-    assert_eq!(m.source_url.as_deref(), Some("https://example.com/x.tar.gz"));
+    assert_eq!(
+        m.source_url.as_deref(),
+        Some("https://example.com/x.tar.gz")
+    );
 }
 
 #[test]
@@ -158,10 +170,7 @@ async fn list_agents_route_rejects_get() {
 /// 验证 POST 能到达 handler(用 echo 桩验证)
 #[tokio::test]
 async fn list_agents_route_accepts_post() {
-    let app = Router::new().route(
-        "/agent-mgmt/agents/list",
-        post(|| async { "reached" }),
-    );
+    let app = Router::new().route("/agent-mgmt/agents/list", post(|| async { "reached" }));
     let req = Request::builder()
         .method("POST")
         .uri("/agent-mgmt/agents/list")
@@ -175,10 +184,7 @@ async fn list_agents_route_accepts_post() {
 /// 验证路径不存在时返回 404
 #[tokio::test]
 async fn unknown_path_returns_404() {
-    let app = Router::new().route(
-        "/agent-mgmt/agents/list",
-        post(|| async { "ok" }),
-    );
+    let app = Router::new().route("/agent-mgmt/agents/list", post(|| async { "ok" }));
     let req = Request::builder()
         .method("POST")
         .uri("/agent-mgmt/agents/typo")
@@ -203,7 +209,9 @@ fn build_multipart_body(file_bytes: &[u8], metadata_json: &str) -> (String, Vec<
     let mut body = Vec::new();
     // file part
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(b"Content-Disposition: form-data; name=\"file\"; filename=\"agent.bin\"\r\n");
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"file\"; filename=\"agent.bin\"\r\n",
+    );
     body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
     body.extend_from_slice(file_bytes);
     body.extend_from_slice(b"\r\n");
@@ -224,9 +232,11 @@ async fn install_route_accepts_1mb_multipart_body() {
     ) -> Result<String, (axum::http::StatusCode, String)> {
         let mut got_file = 0usize;
         let mut got_meta = String::new();
-        while let Some(f) = m.next_field().await.map_err(|e| {
-            (axum::http::StatusCode::BAD_REQUEST, format!("mp: {e}"))
-        })? {
+        while let Some(f) = m
+            .next_field()
+            .await
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("mp: {e}")))?
+        {
             match f.name().unwrap_or("") {
                 "file" => {
                     let b = f.bytes().await.map_err(|e| {
@@ -235,9 +245,10 @@ async fn install_route_accepts_1mb_multipart_body() {
                     got_file = b.len();
                 }
                 "metadata" => {
-                    got_meta = f.text().await.map_err(|e| {
-                        (axum::http::StatusCode::BAD_REQUEST, format!("text: {e}"))
-                    })?;
+                    got_meta = f
+                        .text()
+                        .await
+                        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("text: {e}")))?;
                 }
                 _ => {
                     let _ = f.bytes().await;
@@ -247,11 +258,10 @@ async fn install_route_accepts_1mb_multipart_body() {
         Ok(format!("file={got_file},meta={got_meta}"))
     }
 
-    let app = Router::new()
-        .route(
-            "/agent-mgmt/agents/install",
-            post(echo_handler).layer(DefaultBodyLimit::max(500 * 1024 * 1024)),
-        );
+    let app = Router::new().route(
+        "/agent-mgmt/agents/install",
+        post(echo_handler).layer(DefaultBodyLimit::max(500 * 1024 * 1024)),
+    );
 
     let payload = vec![0u8; 1024 * 1024]; // 1MB
     let meta = r#"{"agent":{"agent_id":"x","command":"x"},"install_type":"BINARY"}"#;
@@ -273,13 +283,16 @@ async fn install_route_accepts_10mb_multipart_body() {
         mut m: axum::extract::Multipart,
     ) -> Result<String, (axum::http::StatusCode, String)> {
         let mut got_file = 0usize;
-        while let Some(f) = m.next_field().await.map_err(|e| {
-            (axum::http::StatusCode::BAD_REQUEST, format!("mp: {e}"))
-        })? {
+        while let Some(f) = m
+            .next_field()
+            .await
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("mp: {e}")))?
+        {
             if f.name().unwrap_or("") == "file" {
-                let b = f.bytes().await.map_err(|e| {
-                    (axum::http::StatusCode::BAD_REQUEST, format!("bytes: {e}"))
-                })?;
+                let b = f
+                    .bytes()
+                    .await
+                    .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("bytes: {e}")))?;
                 got_file = b.len();
             }
         }
@@ -287,11 +300,10 @@ async fn install_route_accepts_10mb_multipart_body() {
     }
 
     // 模拟 install 路由的真实挂法:500MB DefaultBodyLimit
-    let app = Router::new()
-        .route(
-            "/agent-mgmt/agents/install",
-            post(echo_handler).layer(DefaultBodyLimit::max(500 * 1024 * 1024)),
-        );
+    let app = Router::new().route(
+        "/agent-mgmt/agents/install",
+        post(echo_handler).layer(DefaultBodyLimit::max(500 * 1024 * 1024)),
+    );
 
     let payload = vec![0u8; 10 * 1024 * 1024]; // 10MB
     let meta = r#"{"agent":{"agent_id":"x","command":"x"}}"#;
@@ -314,19 +326,17 @@ async fn install_route_accepts_10mb_multipart_body() {
 #[test]
 fn install_metadata_body_empty_install_type_defaults_to_binary() {
     // `Some("")` 会被 parse_install_type 视为缺失(走 trim+filter)
-    let m: handler::InstallMetadataBody = serde_json::from_str(
-        r#"{"agent":{"agent_id":"x","command":"x"},"install_type":""}"#,
-    )
-    .unwrap();
+    let m: handler::InstallMetadataBody =
+        serde_json::from_str(r#"{"agent":{"agent_id":"x","command":"x"},"install_type":""}"#)
+            .unwrap();
     assert_eq!(m.install_type, ""); // 字段本身保持空串(handler 才规范化)
 }
 
 #[test]
 fn install_metadata_body_explicit_binary_works() {
-    let m: handler::InstallMetadataBody = serde_json::from_str(
-        r#"{"agent":{"agent_id":"x","command":"x"},"install_type":"BINARY"}"#,
-    )
-    .unwrap();
+    let m: handler::InstallMetadataBody =
+        serde_json::from_str(r#"{"agent":{"agent_id":"x","command":"x"},"install_type":"BINARY"}"#)
+            .unwrap();
     assert_eq!(m.install_type, "BINARY");
 }
 
@@ -359,9 +369,8 @@ fn install_from_url_body_requires_agent() {
 
 #[test]
 fn install_from_npm_body_requires_agent() {
-    let r: Result<shared_types::InstallFromPackageManagerRequest, _> = serde_json::from_str(
-        r#"{"package":"@scope/p"}"#,
-    );
+    let r: Result<shared_types::InstallFromPackageManagerRequest, _> =
+        serde_json::from_str(r#"{"package":"@scope/p"}"#);
     assert!(r.is_err(), "missing agent should fail deserialization");
 }
 
@@ -378,9 +387,8 @@ fn install_from_url_body_empty_agent_id_parses_but_handler_rejects() {
 
 #[test]
 fn install_from_npm_body_empty_agent_id_parses_but_handler_rejects() {
-    let body: shared_types::InstallFromPackageManagerRequest = serde_json::from_str(
-        r#"{"agent":{"agent_id":"","command":"x"},"package":"@scope/p"}"#,
-    )
-    .unwrap();
+    let body: shared_types::InstallFromPackageManagerRequest =
+        serde_json::from_str(r#"{"agent":{"agent_id":"","command":"x"},"package":"@scope/p"}"#)
+            .unwrap();
     assert_eq!(body.agent.agent_id, "");
 }

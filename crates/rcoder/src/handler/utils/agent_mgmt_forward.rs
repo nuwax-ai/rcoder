@@ -16,23 +16,23 @@ use shared_types::ProjectAndContainerInfo;
 use shared_types::grpc::agent_mgmt_service_client::AgentMgmtServiceClient;
 use shared_types::grpc::{
     AgentDetailInfo as ProtoAgentDetailInfo, AgentInfo as ProtoAgentInfo,
-    AgentInstallStatus as ProtoAgentInstallStatus, CheckAgentRequest, CheckAgentResponse as ProtoCheckAgentResponse,
-    GetAgentRequest, GetAgentResponse, InstallAgentRequest,
-    InstallAgentResponse as ProtoInstallAgentResponse, InstallType as ProtoInstallType,
-    ListAgentsRequest as ProtoListAgentsRequest, ListAgentsResponse as ProtoListAgentsResponse,
-    StaticCheckResult, SystemInfo as ProtoSystemInfo, UninstallAgentRequest,
+    AgentInstallStatus as ProtoAgentInstallStatus, CheckAgentRequest,
+    CheckAgentResponse as ProtoCheckAgentResponse, GetAgentRequest, GetAgentResponse,
+    InstallAgentRequest, InstallAgentResponse as ProtoInstallAgentResponse,
+    InstallType as ProtoInstallType, ListAgentsRequest as ProtoListAgentsRequest,
+    ListAgentsResponse as ProtoListAgentsResponse, StaticCheckResult,
+    SystemInfo as ProtoSystemInfo, UninstallAgentRequest,
     UninstallAgentResponse as ProtoUninstallResponse,
     install_agent_request::Metadata as InstallMetadata,
 };
 use shared_types::{
-    AgentDetailInfo, AgentInfo, AgentInstallStatus, AppError, CheckAgentResponse, InstallType,
-    InstallAgentResponse, ListAgentsResponse,
-    SystemInfo, UninstallAgentResponse,
+    AgentDetailInfo, AgentInfo, AgentInstallStatus, AppError, CheckAgentResponse,
+    InstallAgentResponse, InstallType, ListAgentsResponse, SystemInfo, UninstallAgentResponse,
     error_codes as ec,
 };
 use std::sync::Arc;
-use tonic::transport::Channel;
 use tonic::Status;
+use tonic::transport::Channel;
 use tracing::{debug, instrument, warn};
 
 use crate::grpc::GrpcChannelPool;
@@ -250,9 +250,10 @@ pub async fn install_agent(
             source_url: params.source_url.clone(),
             npm_package: params.npm_package.clone(),
             version: params.agent.version.clone(),
-            platforms: params.platforms.as_ref().and_then(|p| {
-                serde_json::to_string(p).ok()
-            }),
+            platforms: params
+                .platforms
+                .as_ref()
+                .and_then(|p| serde_json::to_string(p).ok()),
             force: Some(params.force),
         }),
         data: vec![],
@@ -376,8 +377,16 @@ fn install_response_to_shared(p: ProtoInstallAgentResponse) -> InstallAgentRespo
         source_url: p.source_url,
         action: shared_types::InstallAction::from_str(p.action.as_str()).ok(),
         installed: p.installed,
-        previous_version: if p.previous_version.is_empty() { None } else { Some(p.previous_version) },
-        platform: if p.platform.is_empty() { None } else { Some(p.platform) },
+        previous_version: if p.previous_version.is_empty() {
+            None
+        } else {
+            Some(p.previous_version)
+        },
+        platform: if p.platform.is_empty() {
+            None
+        } else {
+            Some(p.platform)
+        },
     }
 }
 
@@ -390,9 +399,7 @@ fn uninstall_response_to_shared(p: ProtoUninstallResponse) -> UninstallAgentResp
     }
 }
 
-fn check_response_to_shared(
-    p: ProtoCheckAgentResponse,
-) -> CheckAgentResponse {
+fn check_response_to_shared(p: ProtoCheckAgentResponse) -> CheckAgentResponse {
     CheckAgentResponse {
         system_info: p.system_info.map(system_info_to_shared).unwrap_or_default(),
         agent: p.agent.map(agent_detail_to_shared).unwrap_or_default(),
@@ -459,12 +466,7 @@ fn agent_install_status_from_proto_i32(v: i32) -> AgentInstallStatus {
 }
 
 #[allow(dead_code)]
-fn _ensure_used(
-    _: &StaticCheckResult,
-    _: &ProtoInstallType,
-    _: &ProtoAgentInstallStatus,
-) {
-}
+fn _ensure_used(_: &StaticCheckResult, _: &ProtoInstallType, _: &ProtoAgentInstallStatus) {}
 
 #[cfg(test)]
 mod tests {
@@ -475,9 +477,17 @@ mod tests {
     /// 我们要能正确还原。这样前端拿到的错误码与直接调 agent-runner HTTP 一致。
     #[test]
     fn status_to_app_error_unwraps_business_code_prefix() {
-        let s = Status::not_found(format!("{}: agent x not found", ec::ERR_AGENT_MGMT_NOT_FOUND));
+        let s = Status::not_found(format!(
+            "{}: agent x not found",
+            ec::ERR_AGENT_MGMT_NOT_FOUND
+        ));
         let err = status_to_app_error(s);
-        if let AppError::Structured { code, internal_message, .. } = &err {
+        if let AppError::Structured {
+            code,
+            internal_message,
+            ..
+        } = &err
+        {
             assert_eq!(code, ec::ERR_AGENT_MGMT_NOT_FOUND);
             assert_eq!(internal_message.as_deref(), Some("agent x not found"));
         } else {
@@ -490,7 +500,12 @@ mod tests {
     fn status_to_app_error_uses_unavailable_for_unknown_prefix() {
         let s = Status::unavailable("connection refused");
         let err = status_to_app_error(s);
-        if let AppError::Structured { code, internal_message, .. } = &err {
+        if let AppError::Structured {
+            code,
+            internal_message,
+            ..
+        } = &err
+        {
             assert_eq!(code, ec::ERR_AGENT_RUNNER_UNAVAILABLE);
             assert!(internal_message.is_some());
         } else {
@@ -508,7 +523,12 @@ mod tests {
             ec::ERR_INTERNAL_SERVER_ERROR
         ));
         let err = status_to_app_error(s);
-        if let AppError::Structured { code, internal_message, .. } = &err {
+        if let AppError::Structured {
+            code,
+            internal_message,
+            ..
+        } = &err
+        {
             assert_eq!(
                 code,
                 ec::ERR_INTERNAL_SERVER_ERROR,
@@ -530,7 +550,12 @@ mod tests {
     fn status_to_app_error_with_bare_code_keeps_no_message() {
         let s = Status::failed_precondition(ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED);
         let err = status_to_app_error(s);
-        if let AppError::Structured { code, internal_message, i18n_key } = &err {
+        if let AppError::Structured {
+            code,
+            internal_message,
+            i18n_key,
+        } = &err
+        {
             assert_eq!(code, ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED);
             assert!(internal_message.is_none());
             assert!(i18n_key.is_none());
@@ -542,7 +567,12 @@ mod tests {
     /// install_type 转换:Binary 走 i32 2(对齐 proto)
     #[test]
     fn install_type_to_proto_i32_roundtrip() {
-        for t in [InstallType::Builtin, InstallType::Binary, InstallType::Npm, InstallType::Url] {
+        for t in [
+            InstallType::Builtin,
+            InstallType::Binary,
+            InstallType::Npm,
+            InstallType::Url,
+        ] {
             let v = install_type_to_proto_i32(t);
             let back = install_type_from_proto_i32(v);
             assert_eq!(back, t);

@@ -52,7 +52,11 @@ pub(crate) async fn handle_computer_chat_internal(
     let locale = locale_from_headers(&headers);
     info!(
         "[HTTP] Received {} Chat request: user_id={}, project_id={:?}, session_id={:?}, request_id={:?}, prompt_len={}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}, attachments={:?}, data_source_attachments={:?}, model_provider={:#?}, agent_config={:#?}, system_prompt_len={}, user_prompt_len={}",
-        if is_devcomputer { "DevComputer" } else { "Computer" },
+        if is_devcomputer {
+            "DevComputer"
+        } else {
+            "Computer"
+        },
         request.user_id,
         request.project_id,
         request.session_id,
@@ -192,8 +196,13 @@ pub(crate) async fn handle_computer_chat_internal(
     if output.error.is_some() || !output.success {
         error!(
             "❌ [HTTP] {} Chat failed: session_id={}, error={:?}",
-            if is_devcomputer { "DevComputer" } else { "Computer" },
-            response.session_id, response.error
+            if is_devcomputer {
+                "DevComputer"
+            } else {
+                "Computer"
+            },
+            response.session_id,
+            response.error
         );
         // 返回成功的 HTTP 状态码，但 HttpResult 包含错误信息
         // 这与 rcoder 的行为一致：HTTP 200 + HttpResult.error
@@ -214,8 +223,13 @@ pub(crate) async fn handle_computer_chat_internal(
 
     info!(
         "✅ [HTTP] {} Chat response: session_id={}, error={:?}",
-        if is_devcomputer { "DevComputer" } else { "Computer" },
-        response.session_id, response.error
+        if is_devcomputer {
+            "DevComputer"
+        } else {
+            "Computer"
+        },
+        response.session_id,
+        response.error
     );
 
     Ok(Json(HttpResult::success(response)))

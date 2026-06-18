@@ -148,8 +148,7 @@ impl ApiKeyManager {
     ///
     /// 如果找到配置则返回 `Some(ModelProviderConfig)`，否则返回 `None`。
     pub fn get(&self, service_name: &str) -> Option<ModelProviderConfig> {
-        self.shared
-            .view(service_name, |_, config| config.clone())
+        self.shared.view(service_name, |_, config| config.clone())
     }
 
     /// 获取 API 密钥

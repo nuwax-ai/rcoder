@@ -73,10 +73,7 @@ impl ControlPlaneClient {
         &self,
         session_id: &str,
     ) -> anyhow::Result<SessionResolveResponse> {
-        let url = format!(
-            "{}/internal/session/{}/resolve",
-            self.base_url, session_id
-        );
+        let url = format!("{}/internal/session/{}/resolve", self.base_url, session_id);
         let resp = self.client.get(&url).send().await?;
         Self::check_status(&resp, &url)?;
         let result: SessionResolveResponse = resp.json().await?;
@@ -86,11 +83,7 @@ impl ControlPlaneClient {
     fn check_status(resp: &reqwest::Response, url: &str) -> anyhow::Result<()> {
         let status = resp.status();
         if !status.is_success() {
-            anyhow::bail!(
-                "rcoder-control returned {} for {}",
-                status,
-                url
-            );
+            anyhow::bail!("rcoder-control returned {} for {}", status, url);
         }
         Ok(())
     }

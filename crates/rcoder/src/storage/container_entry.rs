@@ -40,7 +40,11 @@ impl ContainerEntry {
     }
 
     /// 创建新条目，指定初始 ref_count
-    pub fn with_ref_count(info: ContainerBasicInfo, service_type: ServiceType, ref_count: usize) -> Self {
+    pub fn with_ref_count(
+        info: ContainerBasicInfo,
+        service_type: ServiceType,
+        ref_count: usize,
+    ) -> Self {
         let now = Utc::now().timestamp();
         Self {
             info: RwLock::new(info),
@@ -89,17 +93,14 @@ impl ContainerEntry {
 
     /// 更新活跃时间为当前
     pub fn update_activity(&self) {
-        self.last_activity_ts.store(Utc::now().timestamp(), Ordering::Relaxed);
+        self.last_activity_ts
+            .store(Utc::now().timestamp(), Ordering::Relaxed);
     }
 
     /// 判断是否空闲（超过 idle_minutes 分钟无活跃）
     pub fn is_idle(&self, idle_minutes: i64) -> bool {
         let last = self.last_activity();
-        Utc::now()
-            .signed_duration_since(last)
-            .num_minutes()
-            .abs()
-            >= idle_minutes
+        Utc::now().signed_duration_since(last).num_minutes().abs() >= idle_minutes
     }
 }
 

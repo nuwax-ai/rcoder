@@ -461,7 +461,7 @@ impl AgentLifecycleGuard {
     async fn kill_process_group(&self, force: bool) -> Result<()> {
         #[cfg(unix)]
         {
-        let pgid = self.inner.pgid;
+            let pgid = self.inner.pgid;
             use nix::errno::Errno;
             use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;

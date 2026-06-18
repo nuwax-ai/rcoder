@@ -33,7 +33,10 @@ pub mod archive;
 pub mod downloader;
 pub mod error;
 
-pub use archive::{ArchiveError, extract_tar_gz, extract_zip, detect_file_type, detect_file_type_from_path, normalize_extracted_dir, find_entrypoint, find_entrypoint_from_metadata};
+pub use archive::{
+    ArchiveError, detect_file_type, detect_file_type_from_path, extract_tar_gz, extract_zip,
+    find_entrypoint, find_entrypoint_from_metadata, normalize_extracted_dir,
+};
 pub use downloader::{DownloadConfig, Downloader};
 pub use error::DownloadError;
 
@@ -54,7 +57,10 @@ pub async fn get_filename_from_url(url: &str) -> Result<String, DownloadError> {
         .map_err(|e| DownloadError::Http(format!("http client: {}", e)))?;
 
     // 发送 HEAD 请求获取 Content-Disposition
-    let response = client.head(url).send().await
+    let response = client
+        .head(url)
+        .send()
+        .await
         .map_err(|e| DownloadError::Http(format!("HEAD {}: {}", url, e)))?;
 
     // 1. 尝试从 Content-Disposition 获取

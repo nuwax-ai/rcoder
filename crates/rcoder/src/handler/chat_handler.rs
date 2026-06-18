@@ -267,8 +267,12 @@ pub async fn handle_chat(
                 mutable_info.update_activity();
 
                 let arc_info = Arc::new(mutable_info);
-                state.insert_project(project_id.clone(), arc_info.clone())
-                    .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
+                state
+                    .insert_project(project_id.clone(), arc_info.clone())
+                    .map_err(|e| {
+                        tracing::error!("[STORAGE] insert_project failed: {}", e);
+                        e
+                    })?;
 
                 info!(
                     "✅ [CHAT] Project info fully updated: project_id={}, container_id={}",
@@ -296,8 +300,12 @@ pub async fn handle_chat(
             );
 
             let arc_info = Arc::new(new_info);
-            state.insert_project(project_id.clone(), arc_info.clone())
-                .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
+            state
+                .insert_project(project_id.clone(), arc_info.clone())
+                .map_err(|e| {
+                    tracing::error!("[STORAGE] insert_project failed: {}", e);
+                    e
+                })?;
 
             info!(
                 "✅ [CHAT] Project info created: project_id={}, container_id={}",
@@ -336,7 +344,9 @@ pub async fn handle_chat(
             let command = match server.command.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(c) => c,
                 None => {
-                    error!("[CHAT] Validation failed: command is required when platforms is provided");
+                    error!(
+                        "[CHAT] Validation failed: command is required when platforms is provided"
+                    );
                     return Ok(HttpResult::error_with_message(
                         shared_types::error_codes::ERR_VALIDATION,
                         locale,
@@ -347,7 +357,9 @@ pub async fn handle_chat(
             let version = match server.version.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(v) => v,
                 None => {
-                    error!("[CHAT] Validation failed: version is required when platforms is provided");
+                    error!(
+                        "[CHAT] Validation failed: version is required when platforms is provided"
+                    );
                     return Ok(HttpResult::error_with_message(
                         shared_types::error_codes::ERR_VALIDATION,
                         locale,
@@ -578,7 +590,9 @@ async fn forward_request_to_container_service(
             request.data_source_attachments.clone(),
             request.model_provider.clone(),
             request.request_id.clone(),
-            Some(std::time::Duration::from_secs(300)), // 5 分钟超时，避免永久阻塞
+            Some(std::time::Duration::from_secs(
+                shared_types::GRPC_CHAT_TIMEOUT_SECS,
+            )),
             // 新增参数 (v2)
             request.system_prompt.clone(),
             request.user_prompt.clone(),
@@ -628,7 +642,7 @@ async fn forward_request_to_container_service(
                     info!(
                         "🔄 [FORWARD] Detected retryable error, re-resolving container IP and retrying..."
                     );
-                    grpc_pool.remove(&grpc_addr);
+                    grpc_pool.remove(&grpc_addr).await;
 
                     // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
                     match super::utils::get_realtime_container_ip(

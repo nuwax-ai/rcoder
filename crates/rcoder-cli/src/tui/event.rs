@@ -17,7 +17,6 @@ pub type PromptGeneration = u64;
 #[allow(dead_code)]
 pub enum AppEvent {
     // ── 终端事件（来自 crossterm） ──
-
     /// 键盘按键
     Key(KeyEvent),
 
@@ -28,7 +27,6 @@ pub enum AppEvent {
     Paste(String),
 
     // ── Agent 事件（来自 TuiSessionNotifier） ──
-
     /// Agent 流式文本片段
     AgentText(String),
 
@@ -59,7 +57,6 @@ pub enum AppEvent {
     Diagnostics(String),
 
     // ── 内部事件 ──
-
     /// 重置 waiting 状态（prompt 失败但 Agent 未发送 PromptEnded 时使用）。
     /// 携带 generation 标识，仅当 generation 匹配当前 prompt 时才生效，
     /// 防止旧 prompt 的超时错误覆盖新 prompt 的状态。

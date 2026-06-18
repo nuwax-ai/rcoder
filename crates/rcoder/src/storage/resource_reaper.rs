@@ -2,6 +2,19 @@
 //!
 //! 后台异步任务，接收 CleanupRequest 并执行物理容器销毁 + 资源清理。
 //! 使用 tokio mpsc channel 与 ProjectAdapter 解耦（同步发送、异步处理）。
+//!
+//! ## m2 文档：并发模型与堆积风险
+//!
+//! - **单消费者**：单个 tokio task 串行处理清理请求。
+//! - **120s 超时**：单个清理操作超时则跳过（防止慢容器 stop 阻塞队列）。
+//! - **unbounded channel**：生产者（chat 路径上的 RAII 触发）永远不会阻塞。
+//!
+//! 堆积风险评估：
+//! - chat 路径**不会**因清理队列堆积而阻塞（unbounded channel 同步 send）。
+//! - 堆积仅影响**清理延迟**：容器物理销毁变慢，但不会导致内存泄漏（containers map
+//!   条目在 ProjectAdapter::remove 内已被移除）。
+//! - 若业务观察到清理严重延迟（如 idle 容器数持续增长），可考虑改成多消费者并行，
+//!   但需要权衡 stop_container_by_identifier 在 runtime 层的并发安全性。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,14 +119,17 @@ impl ResourceReaper {
         // 2. 清理 gRPC 连接
         if !req.container_ip.is_empty() {
             let addr = format!("{}:{}", req.container_ip, GRPC_DEFAULT_PORT);
-            self.grpc_pool.remove(&addr);
+            self.grpc_pool.remove(&addr).await;
         }
 
         // 3. 清理 DockerManager 缓存（Docker 模式）
         if let Some(ref dm) = self.docker_manager {
             let removed = dm.remove_container_cache(&req.identifier).await;
             if removed.is_some() {
-                info!("[REAPER] cleaned DockerManager cache for {}", req.identifier);
+                info!(
+                    "[REAPER] cleaned DockerManager cache for {}",
+                    req.identifier
+                );
             }
         }
 

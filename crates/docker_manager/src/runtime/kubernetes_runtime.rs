@@ -39,9 +39,12 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 #[cfg(feature = "kubernetes")]
-use crate::types::DockerManagerConfig;
+use super::{
+    k8s_backend_crd::K8sBackendCRDOps, k8s_pod::K8sPodOps, k8s_pvc::K8sPvcOps,
+    k8s_service::K8sServiceOps,
+};
 #[cfg(feature = "kubernetes")]
-use super::{k8s_backend_crd::K8sBackendCRDOps, k8s_pod::K8sPodOps, k8s_pvc::K8sPvcOps, k8s_service::K8sServiceOps};
+use crate::types::DockerManagerConfig;
 #[cfg(feature = "kubernetes")]
 const RUNTIME_MANAGED_LABEL: &str = "managed-by=rcoder-runtime";
 
@@ -304,7 +307,6 @@ impl KubernetesRuntime {
             ),
         })
     }
-
 }
 
 #[cfg(feature = "kubernetes")]
@@ -943,7 +945,9 @@ impl ContainerRuntime for KubernetesRuntime {
 
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
         let total_start = std::time::Instant::now();
-        info!("[K8S_CLEANUP] Starting cleanup_all — sequential Backend CRD → Service → Pod → PVC deletion");
+        info!(
+            "[K8S_CLEANUP] Starting cleanup_all — sequential Backend CRD → Service → Pod → PVC deletion"
+        );
 
         let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
 

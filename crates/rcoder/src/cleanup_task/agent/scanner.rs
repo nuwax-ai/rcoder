@@ -39,6 +39,10 @@ impl AgentScanner {
 
         // 🚀 修复 N+1：iter() 返回所有项目+容器数据
         // 直接获取 (project_id, Arc<ProjectAndContainerInfo>)，避免逐个 get_project() 重新查询
+        //
+        // m5 文档说明：iter() 会 clone 所有 Arc<ProjectAndContainerInfo>（每次 O(1) Arc bump）。
+        // 这是**有意为之**：cleanup_task 是周期性低频任务（默认 60s 间隔），不在热路径。
+        // 对于热路径请用 view() 或 get() 单条查询。
         let projects = self.state.projects.iter();
 
         // 🚀 优化：使用流式并发替代批次等待，提高吞吐量

@@ -80,8 +80,10 @@ impl ProxyMetrics {
 
     pub fn record_response(&self, status_text: &str, duration: std::time::Duration) {
         self.total_responses.fetch_add(1, Ordering::Relaxed);
-        self.total_response_time_ns
-            .fetch_add(duration.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.total_response_time_ns.fetch_add(
+            duration.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
         // 粗略判断成功：2xx
         let is_success = status_text.starts_with('2');
         if is_success {
@@ -98,8 +100,10 @@ impl ProxyMetrics {
         duration: std::time::Duration,
     ) {
         let arc = self.get_or_create_port_metrics(port);
-        arc.total_response_time_ns
-            .fetch_add(duration.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        arc.total_response_time_ns.fetch_add(
+            duration.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
         let is_success = status_text.starts_with('2');
         if is_success {
             arc.successes.fetch_add(1, Ordering::Relaxed);
@@ -218,6 +222,11 @@ pub struct TrackingCtx {
     pub upstream_status: Option<u16>,
     /// 错误响应体缓冲（仅在 4xx/5xx 时收集）
     pub error_body_buf: Vec<u8>,
+    /// 当前请求关联的 user_id（仅 VNC/audio/IME 等需要 user 标识的路由设置）
+    ///
+    /// 用途：response_body_filter 等 hook 识别"VNC 还在用"，写入 vnc_activity[user_id] = now
+    /// 防止 cleanup_task 在用户使用 VNC 桌面期间误判 idle 并销毁容器。
+    pub user_id: Option<String>,
 }
 
 impl Default for TrackingCtx {
@@ -239,6 +248,7 @@ impl TrackingCtx {
             api_service_name: None,
             upstream_status: None,
             error_body_buf: Vec::new(),
+            user_id: None,
         }
     }
 }

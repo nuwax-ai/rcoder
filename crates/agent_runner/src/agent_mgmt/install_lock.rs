@@ -99,7 +99,10 @@ impl InstallLockManager {
     /// 构造锁键："{agent_id}:{normalized_version}"
     ///
     /// 版本号必须是合法 semver，否则返回 `VersionParseError`。
-    fn lock_key(agent_id: &str, version: &str) -> Result<String, shared_types::version_util::VersionParseError> {
+    fn lock_key(
+        agent_id: &str,
+        version: &str,
+    ) -> Result<String, shared_types::version_util::VersionParseError> {
         let normalized = shared_types::version_util::normalize_version(version)?;
         Ok(format!("{}:{}", agent_id, normalized))
     }
@@ -109,25 +112,25 @@ impl InstallLockManager {
     /// 版本号非法时返回 `None`。
     pub fn get_or_create(&self, agent_id: &str, version: &str) -> Option<Arc<InstallState>> {
         let key = Self::lock_key(agent_id, version).ok()?;
-        Some(self.states
-            .entry(key)
-            .or_insert_with(|| {
-                Arc::new(InstallState {
-                    lock: Mutex::new(()),
-                    installing_version: parking_lot::Mutex::new(None),
-                    cancel: parking_lot::Mutex::new(CancellationToken::new()),
+        Some(
+            self.states
+                .entry(key)
+                .or_insert_with(|| {
+                    Arc::new(InstallState {
+                        lock: Mutex::new(()),
+                        installing_version: parking_lot::Mutex::new(None),
+                        cancel: parking_lot::Mutex::new(CancellationToken::new()),
+                    })
                 })
-            })
-            .clone())
+                .clone(),
+        )
     }
 
     /// 检查指定 agent 版本是否正在安装（仅供测试使用）
     #[cfg(test)]
     pub fn is_installing(&self, agent_id: &str, version: &str) -> Option<String> {
         let key = Self::lock_key(agent_id, version).ok()?;
-        self.states
-            .get(&key)
-            .and_then(|s| s.installing_version())
+        self.states.get(&key).and_then(|s| s.installing_version())
     }
 }
 
@@ -177,7 +180,10 @@ mod tests {
         let state = mgr.get_or_create("agent-x", "1.0.0").unwrap();
 
         state.set_installing("1.0.0");
-        assert_eq!(mgr.is_installing("agent-x", "1.0.0"), Some("1.0.0".to_string()));
+        assert_eq!(
+            mgr.is_installing("agent-x", "1.0.0"),
+            Some("1.0.0".to_string())
+        );
 
         state.clear_installing();
         assert!(mgr.is_installing("agent-x", "1.0.0").is_none());

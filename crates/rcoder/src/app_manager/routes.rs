@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 
 use super::handlers::AppManagerState;
@@ -26,11 +26,20 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
         .route("/api/v1/apps/{app_id}/restart", post(handlers::restart_app))
         // 查询接口
         .route("/api/v1/apps/{app_id}/logs", get(handlers::get_app_logs))
-        .route("/api/v1/apps/{app_id}/health", get(handlers::get_app_health))
+        .route(
+            "/api/v1/apps/{app_id}/health",
+            get(handlers::get_app_health),
+        )
         .route("/api/v1/apps/{app_id}/stats", get(handlers::get_app_stats))
-        .route("/api/v1/apps/{app_id}/events", get(handlers::get_app_events))
+        .route(
+            "/api/v1/apps/{app_id}/events",
+            get(handlers::get_app_events),
+        )
         // 文件管理
         .route("/api/v1/apps/{app_id}/upload", post(handlers::upload_file))
         .route("/api/v1/apps/{app_id}/files", get(handlers::list_files))
-        .route("/api/v1/apps/{app_id}/files/delete", post(handlers::delete_file))
+        .route(
+            "/api/v1/apps/{app_id}/files/delete",
+            post(handlers::delete_file),
+        )
 }

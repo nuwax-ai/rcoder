@@ -24,8 +24,8 @@
 //! 所有错误用 `AppError` 表达(axum 自动映射成 HTTP 状态 + 业务错误码 JSON)。
 //! 18 个 agent-runner 业务码 + 2 个转发层专用码(见 `error_codes`)。
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 #[allow(unused_imports)] // `json!` 仅在 `#[schema(example = json!(...))]` 宏内使用
@@ -130,14 +130,22 @@ fn validate_routing_params(routing: &RoutingParams) -> Result<(), AppError> {
             }
         }
         // pod_id 有值时,tenant_id 必填
-        if routing.tenant_id.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        if routing
+            .tenant_id
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
             return Err(AppError::with_message(
                 ec::ERR_VALIDATION,
                 "tenant_id is required when pod_id is provided".to_string(),
             ));
         }
         // pod_id 有值时,space_id 必填
-        if routing.space_id.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        if routing
+            .space_id
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
             return Err(AppError::with_message(
                 ec::ERR_VALIDATION,
                 "space_id is required when pod_id is provided".to_string(),
@@ -159,9 +167,9 @@ async fn resolve_container_target(
 ) -> Result<Arc<shared_types::ProjectAndContainerInfo>, AppError> {
     // Path A: project_id 优先（向后兼容）
     if let Some(pid) = project_id.filter(|s| !s.is_empty()) {
-        return state
-            .get_project(pid)
-            .ok_or_else(|| AppError::with_i18n_key(ec::ERR_PROJECT_NOT_FOUND, "error.project_not_found"));
+        return state.get_project(pid).ok_or_else(|| {
+            AppError::with_i18n_key(ec::ERR_PROJECT_NOT_FOUND, "error.project_not_found")
+        });
     }
 
     // Path B: user_id 或 pod_id 路由
@@ -181,7 +189,10 @@ async fn resolve_container_target(
                     "[agent_mgmt] container lookup failed: identifier={}, error={}",
                     identifier, e
                 );
-                AppError::with_message(ec::ERR_CONTAINER_NOT_FOUND, format!("container lookup failed: {}", e))
+                AppError::with_message(
+                    ec::ERR_CONTAINER_NOT_FOUND,
+                    format!("container lookup failed: {}", e),
+                )
             })?
             .ok_or_else(|| {
                 AppError::with_message(
@@ -303,26 +314,31 @@ pub async fn list_agents(
     }
 
     // 回退到 gRPC 调用（需要容器运行）
-    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
+    let project =
+        resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
     let resp = fwd_list(&ctx, &project).await?;
     Ok(Json(HttpResult::success(resp)))
 }
 
 /// 从文件直接读取注册表
-fn read_registry_from_file(registry_path: &std::path::Path) -> Result<shared_types::ListAgentsResponse, AppError> {
-    let data = std::fs::read_to_string(registry_path)
-        .map_err(|e| AppError::with_message(
+fn read_registry_from_file(
+    registry_path: &std::path::Path,
+) -> Result<shared_types::ListAgentsResponse, AppError> {
+    let data = std::fs::read_to_string(registry_path).map_err(|e| {
+        AppError::with_message(
             ec::ERR_INTERNAL_SERVER_ERROR,
             format!("read registry file: {}", e),
-        ))?;
+        )
+    })?;
 
     let manifests: Vec<crate::agent_download::registry_update::AgentManifest> =
-        serde_json::from_str(&data)
-            .map_err(|e| AppError::with_message(
+        serde_json::from_str(&data).map_err(|e| {
+            AppError::with_message(
                 ec::ERR_INTERNAL_SERVER_ERROR,
                 format!("parse registry JSON: {}", e),
-            ))?;
+            )
+        })?;
 
     let agents: Vec<shared_types::AgentInfo> = manifests
         .into_iter()
@@ -396,7 +412,8 @@ pub async fn get_agent(
     I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::GetAgentRequest>,
 ) -> Result<Json<HttpResult<Option<shared_types::AgentDetailInfo>>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
+    let project =
+        resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
     let resp = fwd_get(&ctx, &project, &body.agent_id, body.version.as_deref()).await?;
     Ok(Json(HttpResult::success(resp)))
@@ -447,7 +464,8 @@ pub async fn check_agent(
     I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::CheckAgentRequest>,
 ) -> Result<Json<HttpResult<shared_types::CheckAgentResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
+    let project =
+        resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
     let resp = fwd_check(&ctx, &project, &body.agent_id, body.version.as_deref()).await?;
     Ok(Json(HttpResult::success(resp)))
@@ -523,11 +541,9 @@ pub async fn install_agent(
     let mut file_bytes = Bytes::new();
     let mut meta: Option<InstallMetadataBody> = None;
 
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::with_message(ec::ERR_INVALID_PARAMS, format!("invalid multipart: {e}")))?
-    {
+    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
+        AppError::with_message(ec::ERR_INVALID_PARAMS, format!("invalid multipart: {e}"))
+    })? {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             "file" => {
@@ -539,7 +555,10 @@ pub async fn install_agent(
                 let mut overflow_err: Option<AppError> = None;
 
                 let tmp = tempfile::NamedTempFile::new().map_err(|e| {
-                    AppError::with_message(ec::ERR_INTERNAL_SERVER_ERROR, format!("create temp: {e}"))
+                    AppError::with_message(
+                        ec::ERR_INTERNAL_SERVER_ERROR,
+                        format!("create temp: {e}"),
+                    )
                 })?;
                 let tmp_path = tmp.into_temp_path();
 
@@ -548,13 +567,11 @@ pub async fn install_agent(
                 // 阻塞线程:逐块写入临时文件,写完后读回并清理
                 let writer = tokio::task::spawn_blocking(move || {
                     use std::io::Write;
-                    let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
-                        std::io::Error::other(format!("create: {e}"))
-                    })?;
+                    let mut file = std::fs::File::create(&tmp_path)
+                        .map_err(|e| std::io::Error::other(format!("create: {e}")))?;
                     while let Some(chunk) = rx.blocking_recv() {
-                        file.write_all(&chunk).map_err(|e| {
-                            std::io::Error::other(format!("write: {e}"))
-                        })?;
+                        file.write_all(&chunk)
+                            .map_err(|e| std::io::Error::other(format!("write: {e}")))?;
                     }
                     file.flush().ok();
                     drop(file);
@@ -588,24 +605,34 @@ pub async fn install_agent(
 
                 // 无论成功/失败,都等待 writer 完成(确保临时文件被清理)
                 let writer_result = writer.await.map_err(|e| {
-                    AppError::with_message(ec::ERR_INTERNAL_SERVER_ERROR, format!("writer panic: {e}"))
+                    AppError::with_message(
+                        ec::ERR_INTERNAL_SERVER_ERROR,
+                        format!("writer panic: {e}"),
+                    )
                 })?;
 
                 if let Some(err) = overflow_err {
                     return Err(err);
                 }
                 file_bytes = writer_result.map_err(|e| {
-                    AppError::with_message(ec::ERR_INTERNAL_SERVER_ERROR, format!("temp file I/O: {e}"))
+                    AppError::with_message(
+                        ec::ERR_INTERNAL_SERVER_ERROR,
+                        format!("temp file I/O: {e}"),
+                    )
                 })?;
             }
             "metadata" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| AppError::with_message(ec::ERR_INVALID_PARAMS, format!("read metadata: {e}")))?;
-                meta = Some(serde_json::from_str::<InstallMetadataBody>(&text).map_err(|e| {
-                    AppError::with_message(ec::ERR_VALIDATION, format!("invalid metadata JSON: {e}"))
-                })?);
+                let text = field.text().await.map_err(|e| {
+                    AppError::with_message(ec::ERR_INVALID_PARAMS, format!("read metadata: {e}"))
+                })?;
+                meta = Some(
+                    serde_json::from_str::<InstallMetadataBody>(&text).map_err(|e| {
+                        AppError::with_message(
+                            ec::ERR_VALIDATION,
+                            format!("invalid metadata JSON: {e}"),
+                        )
+                    })?,
+                );
             }
             _ => {
                 tracing::debug!("[install_agent] ignoring unknown multipart field: {name}");
@@ -613,9 +640,8 @@ pub async fn install_agent(
         }
     }
 
-    let meta = meta.ok_or_else(|| {
-        AppError::with_message(ec::ERR_VALIDATION, "metadata field is required")
-    })?;
+    let meta = meta
+        .ok_or_else(|| AppError::with_message(ec::ERR_VALIDATION, "metadata field is required"))?;
     require_field(Some(&meta.agent.agent_id), "agent_id")?;
     require_field(Some(&meta.agent.command), "command")?;
 
@@ -635,7 +661,8 @@ pub async fn install_agent(
 
     // 2. 解析 project + 构造 ctx
     validate_routing_params(&meta.routing)?;
-    let project = resolve_container_target(&state, meta.routing.project_id.as_deref(), &meta.routing).await?;
+    let project =
+        resolve_container_target(&state, meta.routing.project_id.as_deref(), &meta.routing).await?;
     let ctx = build_ctx(&state);
 
     // 3. 构造 forward 参数
@@ -737,11 +764,13 @@ pub async fn install_from_url(
         ServiceType::RCoder
     };
 
-    let strategy = super::agent_install_strategy::create_strategy(&service_type)
-        .ok_or_else(|| AppError::with_message(
-            ec::ERR_VALIDATION,
-            format!("agent installation is not supported for {:?}", service_type),
-        ))?;
+    let strategy =
+        super::agent_install_strategy::create_strategy(&service_type).ok_or_else(|| {
+            AppError::with_message(
+                ec::ERR_VALIDATION,
+                format!("agent installation is not supported for {:?}", service_type),
+            )
+        })?;
 
     // 构造最小化的 ProjectAndContainerInfo 用于解析安装目录
     let mut project = shared_types::ProjectAndContainerInfo::new(String::new());
@@ -758,7 +787,10 @@ pub async fn install_from_url(
     );
 
     // 调用核心安装函数（复用 ensure_agent_installed 的逻辑）
-    let version = body.agent.version.as_deref()
+    let version = body
+        .agent
+        .version
+        .as_deref()
         .ok_or_else(|| AppError::with_message(ec::ERR_VALIDATION, "version is required"))?;
 
     let (download_result, platform_key) = super::agent_install_strategy::do_install_from_url(
@@ -851,7 +883,8 @@ pub async fn install_from_npm(
     I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::InstallFromPackageManagerRequest>,
 ) -> Result<Json<HttpResult<shared_types::InstallAgentResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
+    let project =
+        resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     require_field(Some(&body.agent.agent_id), "agent_id")?;
     require_field(Some(&body.agent.command), "command")?;
     require_field(Some(&body.package), "package")?;
@@ -868,7 +901,6 @@ pub async fn install_from_npm(
     let resp = fwd_install(&ctx, &project, params, Bytes::new()).await?;
     Ok(Json(HttpResult::success(resp)))
 }
-
 
 /// 卸载一个已安装的 agent
 ///
@@ -917,7 +949,8 @@ pub async fn uninstall_agent(
     I18nJsonOrQuery(body): I18nJsonOrQuery<shared_types::UninstallAgentRequest>,
 ) -> Result<Json<HttpResult<shared_types::UninstallAgentResponse>>, AppError> {
     validate_routing_params(&body.routing)?;
-    let project = resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
+    let project =
+        resolve_container_target(&state, body.routing.project_id.as_deref(), &body.routing).await?;
     let ctx = build_ctx(&state);
     let resp = fwd_uninstall(&ctx, &project, &body.agent_id, body.version.as_deref()).await?;
     Ok(Json(HttpResult::success(resp)))
@@ -951,18 +984,16 @@ fn parse_install_type(
             return Err(AppError::with_message(
                 ec::ERR_VALIDATION,
                 format!("unsupported install_type: {other}"),
-            ))
+            ));
         }
     };
     match t {
-        InstallType::Url if src_url.map(|s| s.is_empty()).unwrap_or(true) => Err(AppError::with_message(
-            ec::ERR_VALIDATION,
-            "URL install requires source_url",
-        )),
-        InstallType::Npm if npm_pkg.map(|s| s.is_empty()).unwrap_or(true) => Err(AppError::with_message(
-            ec::ERR_VALIDATION,
-            "NPM install requires npm_package",
-        )),
+        InstallType::Url if src_url.map(|s| s.is_empty()).unwrap_or(true) => Err(
+            AppError::with_message(ec::ERR_VALIDATION, "URL install requires source_url"),
+        ),
+        InstallType::Npm if npm_pkg.map(|s| s.is_empty()).unwrap_or(true) => Err(
+            AppError::with_message(ec::ERR_VALIDATION, "NPM install requires npm_package"),
+        ),
         _ => Ok(t),
     }
 }

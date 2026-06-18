@@ -12,8 +12,8 @@
 //!
 //! 安全相关:path traversal / zip bomb / unsafe URL scheme 都验证拒绝路径
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_runner::agent_mgmt::installer::AgentManifest;
 use agent_runner::agent_mgmt::{AgentRegistry, PathManager};
@@ -45,11 +45,8 @@ fn build_minimal_tar_gz(command: &str, script_body: &[u8]) -> Vec<u8> {
 fn temp_pm() -> PathManager {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "agent-mgmt-http-test-{}-{}",
-        std::process::id(),
-        n
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("agent-mgmt-http-test-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     PathManager::new_with_root(dir)
 }
@@ -227,8 +224,7 @@ async fn install_binary_rejects_oversize() {
 
     // 期待被拒绝:可能是 413 (HTTP body limit 50MB) 或 400 (installer 校验)
     assert!(
-        status == StatusCode::BAD_REQUEST
-            || status == StatusCode::PAYLOAD_TOO_LARGE,
+        status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE,
         "expected 400 or 413, got {status}, body: {}",
         serde_json::to_string(&json).unwrap_or_default()
     );

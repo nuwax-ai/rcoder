@@ -96,8 +96,9 @@ impl K8sPvcOps for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
-        let prefix =
-            KubernetesRuntime::sanitize_k8s_name_part(&self.service_container_prefix(service_type)?);
+        let prefix = KubernetesRuntime::sanitize_k8s_name_part(
+            &self.service_container_prefix(service_type)?,
+        );
         let sanitized = identifier.replace('_', "-");
         Ok(format!("{}-{}-workspace", prefix, sanitized))
     }
@@ -286,10 +287,7 @@ impl K8sPvcOps for KubernetesRuntime {
                     return Ok(());
                 }
                 Err(e) => {
-                    debug!(
-                        "[K8S] Poll PVC {} returned {} (will retry)",
-                        pvc_name, e
-                    );
+                    debug!("[K8S] Poll PVC {} returned {} (will retry)", pvc_name, e);
                 }
             }
             tokio::time::sleep(poll_interval).await;

@@ -7,8 +7,16 @@ use chrono::{DateTime, Utc};
 use shared_types::grpc::{GetStatusRequest, ProgressRequest};
 use shared_types::{SessionMessageType, UnifiedSessionMessage};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tonic::Code;
 use tracing::{debug, error, info, warn};
+
+/// 活跃时间更新节流间隔（秒）
+///
+/// 任务进度事件可能高频到达（agent_message_chunk 每 10ms 一条），如果每条都
+/// 打 storage 写锁会拖累热路径。10s 节流意味着每 10s 最多更新一次 last_activity，
+/// 对于 cleanup_task 的 30min idle_timeout 来说足够精细。
+const ACTIVITY_UPDATE_THROTTLE_SECS: i64 = 10;
 
 /// 创建基于 gRPC 的 SSE 代理流
 ///
@@ -17,12 +25,29 @@ use tracing::{debug, error, info, warn};
 ///
 /// 🚀 优化：使用连接池 + 智能重试机制
 /// 🆕 新增：在建立流之前检查 Agent 状态，如果 Agent 闲置则直接发送 SessionPromptEnd 并关闭
+///
+/// ## Bug 5 修复：活跃时间更新
+///
+/// 收到 agent 任务进度事件（非心跳）时，节流（10s 一次）更新 project + container 活跃时间，
+/// 防止 cleanup_task 在 agent 长任务执行期间误判 idle 并销毁容器。
+///
+/// 节流规则：
+/// - `Heartbeat` 消息：不更新（心跳只代表连接活着，不代表用户在用）
+/// - 其他消息（SessionPromptStart/End、AgentSessionUpdate、AcpRequestPermission 等）：可更新
+/// - 距上次更新 < 10s：跳过本次更新
+///
+/// ## 关于 activity_updater 闭包参数
+///
+/// 不直接传 `Arc<AppState>` 是因为 rcoder 同时作为 lib 和 bin 编译，
+/// `crate::router::AppState` 在两边是不同的类型实例。改用闭包解耦：
+/// 调用方在 lib 内部捕获 state 引用，bin crate 不需要知道 AppState 类型。
 pub async fn create_grpc_sse_stream(
     grpc_addr: String,
     session_id: String,
     project_id: String,
     pool: std::sync::Arc<crate::grpc::GrpcChannelPool>,
     locale: &'static str,
+    activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
     let (tx, rx) = tokio::sync::mpsc::channel(100);
@@ -34,6 +59,10 @@ pub async fn create_grpc_sse_stream(
             "🔗 [gRPC_SSE] Starting connection to agent_runner gRPC: addr={}, session_id={}, project_id={}",
             grpc_addr, session_id_clone, project_id
         );
+
+        // 节流状态：上次活跃时间更新的 Unix 秒（0 表示从未更新过）
+        // AtomicI64 无锁，跨 await 安全
+        let last_activity_update_secs: AtomicI64 = AtomicI64::new(0);
 
         let max_retries = 2;
         let mut last_error_msg = String::new();
@@ -47,7 +76,7 @@ pub async fn create_grpc_sse_stream(
                         "⚠️ [gRPC_SSE] Failed to get client (attempt {}/{}): {}, cleaning connection pool and retrying...",
                         attempt, max_retries, e
                     );
-                    pool.remove(&grpc_addr);
+                    pool.remove(&grpc_addr).await;
                     last_error_msg = format!("failed to get client: {}", e);
                     continue;
                 }
@@ -112,65 +141,89 @@ pub async fn create_grpc_sse_stream(
                     let mut stream = response.into_inner();
 
                     // 持续接收 gRPC 流中的事件
+                    //
+                    // M4 修复：用 tokio::select! 监听 tx.closed() 实现客户端断开的早期检测。
+                    // 原实现只能在下次 send 失败时才知道断开，期间浪费 CPU 接收/转换 gRPC 事件。
                     loop {
-                        match stream.message().await {
-                            Ok(Some(progress_event)) => {
-                                debug!(
-                                    "📨 [gRPC_SSE] Received progress event: session_id={}, message_type={}, sub_type={}, payload={}",
-                                    session_id_clone,
-                                    progress_event.message_type,
-                                    progress_event.sub_type,
-                                    if progress_event.payload.len() > 2000 {
-                                        let truncated: String = progress_event.payload.chars().take(2000).collect();
-                                        format!("{}... (truncated)", truncated)
-                                    } else {
-                                        progress_event.payload.clone()
-                                    }
-                                );
-
-                                // 将 ProgressEvent 转换为 SSE Event（传入 session_id 以重建完整消息结构）
-                                let sse_event =
-                                    progress_event_to_sse(&progress_event, &session_id_clone);
-
-                                if tx.send(Ok(sse_event)).await.is_err() {
-                                    warn!(
-                                        "⚠️ [gRPC_SSE] Client disconnected: session_id={}",
-                                        session_id_clone
-                                    );
-                                    // 客户端断开，直接退出任务
-                                    return;
-                                }
-                            }
-                            Ok(None) => {
-                                // 流正常结束（agent_runner 主动关闭）
+                        tokio::select! {
+                            // 客户端断开（所有 Receiver 都 drop）：立即停止接收 gRPC
+                            _ = tx.closed() => {
                                 info!(
-                                    "✅ [gRPC_SSE] gRPC stream ended normally: session_id={}",
+                                    "🔌 [gRPC_SSE] Client disconnected (early detection), stopping gRPC stream: session_id={}",
                                     session_id_clone
                                 );
                                 return;
                             }
-                            Err(e) => {
-                                // 流异常结束（连接中断、超时等）
-                                error!(
-                                    "❌ [gRPC_SSE] gRPC stream error: session_id={}, code={}, message={}",
-                                    session_id_clone,
-                                    e.code(),
-                                    e.message()
-                                );
-
-                                // 发送标准格式的错误消息
-                                let error_event = create_grpc_stream_error_event(
-                                    &session_id_clone,
-                                    e.code(),
-                                    e.message(),
-                                );
-                                if let Err(e) = tx.send(Ok(error_event)).await {
-                                    warn!(
-                                        "⚠️ [gRPC_SSE] Failed to send error event: session_id={}, error={}",
-                                        session_id_clone, e
+                            // gRPC 流消息
+                            msg = stream.message() => match msg {
+                                Ok(Some(progress_event)) => {
+                                    debug!(
+                                        "📨 [gRPC_SSE] Received progress event: session_id={}, message_type={}, sub_type={}, payload={}",
+                                        session_id_clone,
+                                        progress_event.message_type,
+                                        progress_event.sub_type,
+                                        if progress_event.payload.len() > 2000 {
+                                            let truncated: String = progress_event.payload.chars().take(2000).collect();
+                                            format!("{}... (truncated)", truncated)
+                                        } else {
+                                            progress_event.payload.clone()
+                                        }
                                     );
+
+                                    // Bug 5 修复：非心跳事件节流更新活跃时间
+                                    // Heartbeat 只是保活，不代表用户在用；其他事件代表 agent 在执行任务
+                                    if progress_event.message_type != "Heartbeat" {
+                                        maybe_update_session_activity(
+                                            &activity_updater,
+                                            &session_id_clone,
+                                            &last_activity_update_secs,
+                                        );
+                                    }
+
+                                    // 将 ProgressEvent 转换为 SSE Event（传入 session_id 以重建完整消息结构）
+                                    let sse_event =
+                                        progress_event_to_sse(&progress_event, &session_id_clone);
+
+                                    if tx.send(Ok(sse_event)).await.is_err() {
+                                        warn!(
+                                            "⚠️ [gRPC_SSE] Client disconnected: session_id={}",
+                                            session_id_clone
+                                        );
+                                        // 客户端断开，直接退出任务
+                                        return;
+                                    }
                                 }
-                                return;
+                                Ok(None) => {
+                                    // 流正常结束（agent_runner 主动关闭）
+                                    info!(
+                                        "✅ [gRPC_SSE] gRPC stream ended normally: session_id={}",
+                                        session_id_clone
+                                    );
+                                    return;
+                                }
+                                Err(e) => {
+                                    // 流异常结束（连接中断、超时等）
+                                    error!(
+                                        "❌ [gRPC_SSE] gRPC stream error: session_id={}, code={}, message={}",
+                                        session_id_clone,
+                                        e.code(),
+                                        e.message()
+                                    );
+
+                                    // 发送标准格式的错误消息
+                                    let error_event = create_grpc_stream_error_event(
+                                        &session_id_clone,
+                                        e.code(),
+                                        e.message(),
+                                    );
+                                    if let Err(e) = tx.send(Ok(error_event)).await {
+                                        warn!(
+                                            "⚠️ [gRPC_SSE] Failed to send error event: session_id={}, error={}",
+                                            session_id_clone, e
+                                        );
+                                    }
+                                    return;
+                                }
                             }
                         }
                     }
@@ -187,7 +240,7 @@ pub async fn create_grpc_sse_stream(
                             "🔌 [gRPC_SSE] Possibly connection broken, removing {} from connection pool and retrying...",
                             grpc_addr
                         );
-                        pool.remove(&grpc_addr);
+                        pool.remove(&grpc_addr).await;
                         last_error_msg = format!("stream subscription failed: {}", e);
                         continue;
                     }
@@ -445,5 +498,61 @@ fn map_tonic_code_to_error_code(code: Code) -> &'static str {
         Code::DeadlineExceeded => "GRPC_TIMEOUT",
         Code::Unknown => "GRPC_UNKNOWN_ERROR",
         _ => "GRPC_ERROR",
+    }
+}
+
+/// 节流更新 session 活跃时间（Bug 5 修复）
+///
+/// - 距上次更新 ≥ `ACTIVITY_UPDATE_THROTTLE_SECS`（10s）才真正调用 updater
+/// - updater 由调用方提供（通常封装 `state.update_session_activity`）
+/// - updater 失败不阻断 SSE 流
+fn maybe_update_session_activity(
+    activity_updater: &Arc<dyn Fn(&str) + Send + Sync>,
+    session_id: &str,
+    last_update_secs: &AtomicI64,
+) {
+    let now_secs = Utc::now().timestamp();
+    let last = last_update_secs.load(Ordering::Relaxed);
+    if now_secs - last < ACTIVITY_UPDATE_THROTTLE_SECS {
+        // 节流窗口内，跳过
+        return;
+    }
+
+    // CAS：只有一个并发请求能通过（其他会被下次 load 拦下）
+    // 失败说明其他线程刚刚更新过，跳过即可
+    if last_update_secs
+        .compare_exchange(last, now_secs, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    // 调用 updater（同时更新 project + container 活跃时间）
+    // 函数定义在 adapter.rs，原本是死代码，这里接上调用点（Issue 5 一并修复）
+    activity_updater(session_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_atomic_i64_initial_value() {
+        let counter = AtomicI64::new(0);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_cas_update_semantics() {
+        let counter = AtomicI64::new(100);
+        // CAS 成功
+        let result = counter.compare_exchange(100, 200, Ordering::AcqRel, Ordering::Acquire);
+        assert!(result.is_ok());
+        assert_eq!(counter.load(Ordering::Relaxed), 200);
+
+        // CAS 失败（期望值不匹配）
+        let result = counter.compare_exchange(100, 300, Ordering::AcqRel, Ordering::Acquire);
+        assert!(result.is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), 200);
     }
 }

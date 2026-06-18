@@ -44,7 +44,12 @@ pub trait AppServiceTrait: Send + Sync {
     async fn get_app_events(&self, app_id: &str) -> Result<Vec<String>>;
 
     /// 上传文件
-    async fn upload_file(&self, app_id: &str, file_data: Vec<u8>, target: &str) -> Result<UploadResult>;
+    async fn upload_file(
+        &self,
+        app_id: &str,
+        file_data: Vec<u8>,
+        target: &str,
+    ) -> Result<UploadResult>;
 
     /// 列出文件
     async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>>;

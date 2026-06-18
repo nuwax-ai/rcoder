@@ -84,9 +84,7 @@ impl Downloader {
         for attempt in 1..=self.config.max_retries {
             // Check existing bytes for resume
             let mut downloaded = if dest_path.exists() {
-                std::fs::metadata(dest_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0)
+                std::fs::metadata(dest_path).map(|m| m.len()).unwrap_or(0)
             } else {
                 0
             };
@@ -94,10 +92,7 @@ impl Downloader {
             // Build request with optional Range header
             let mut req = client.get(url);
             if downloaded > 0 {
-                info!(
-                    "[download] resume: url={}, from_byte={}",
-                    url, downloaded
-                );
+                info!("[download] resume: url={}, from_byte={}", url, downloaded);
                 req = req.header("Range", format!("bytes={}-", downloaded));
             }
 
@@ -106,7 +101,10 @@ impl Downloader {
                 Err(e) => {
                     let err = DownloadError::Http(format!("GET {}: {}", url, e));
                     if err.is_retryable() && attempt < self.config.max_retries {
-                        warn!("[download] attempt {} failed: {}, retrying...", attempt, err);
+                        warn!(
+                            "[download] attempt {} failed: {}, retrying...",
+                            attempt, err
+                        );
                         last_err = Some(err);
                         let backoff = Duration::from_secs(
                             self.config.retry_backoff_base_secs * 2u64.pow(attempt as u32 - 1),
@@ -152,7 +150,10 @@ impl Downloader {
             if status.is_server_error() {
                 let err = DownloadError::Http(format!("GET {}: HTTP {}", url, status));
                 if attempt < self.config.max_retries {
-                    warn!("[download] attempt {} failed: {}, retrying...", attempt, err);
+                    warn!(
+                        "[download] attempt {} failed: {}, retrying...",
+                        attempt, err
+                    );
                     last_err = Some(err);
                     let backoff = Duration::from_secs(
                         self.config.retry_backoff_base_secs * 2u64.pow(attempt as u32 - 1),
@@ -311,11 +312,10 @@ impl Downloader {
                     location
                 )));
             }
-            response = client
-                .get(location)
-                .send()
-                .await
-                .map_err(|e| DownloadError::Http(format!("redirect GET {}: {}", location, e)))?;
+            response =
+                client.get(location).send().await.map_err(|e| {
+                    DownloadError::Http(format!("redirect GET {}: {}", location, e))
+                })?;
         }
         if response.status().is_redirection() {
             return Err(DownloadError::TooManyRedirects(max_redirects));
@@ -360,7 +360,12 @@ mod tests {
             let downloader = Downloader::new(DownloadConfig::default());
             let cancel = CancellationToken::new();
             let result = downloader
-                .download_to_file("ftp://example.com/file", Path::new("/tmp/test"), None, &cancel)
+                .download_to_file(
+                    "ftp://example.com/file",
+                    Path::new("/tmp/test"),
+                    None,
+                    &cancel,
+                )
                 .await;
             assert!(matches!(result, Err(DownloadError::InvalidUrl(_))));
         });
@@ -387,7 +392,10 @@ mod tests {
 
         let hash = sha256_file(&file_path).unwrap();
         // SHA-256 of "hello world"
-        assert_eq!(hash, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 
     #[test]
@@ -398,6 +406,9 @@ mod tests {
 
         let hash = sha256_file(&file_path).unwrap();
         // SHA-256 of empty string
-        assert_eq!(hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 }

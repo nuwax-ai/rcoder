@@ -59,8 +59,8 @@ pub async fn init_proxy(
     info!("[Pingora] Pingora config created successfully");
 
     info!("[Pingora] PingoraServerManager created successfully");
-    let mut server_manager = PingoraServerManager::new(pingora_config)
-        .with_api_key_config(Arc::clone(&api_key_config));
+    let mut server_manager =
+        PingoraServerManager::new(pingora_config).with_api_key_config(Arc::clone(&api_key_config));
     let pingora_service = server_manager.service();
     info!("[Pingora] API Key config already loaded (no updates)");
 

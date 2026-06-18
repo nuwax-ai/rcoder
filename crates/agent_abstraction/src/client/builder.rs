@@ -276,8 +276,8 @@ where
             None
         };
 
-        let mut start_config = AgentStartConfig::new(self.service_type.clone())
-            .with_agent_mode(self.agent_mode);
+        let mut start_config =
+            AgentStartConfig::new(self.service_type.clone()).with_agent_mode(self.agent_mode);
 
         if let Some(sp) = self.system_prompt {
             start_config = start_config.with_system_prompt(sp);
@@ -293,15 +293,13 @@ where
         }
 
         // Create session manager
-        let session_manager = Arc::new(
-            AcpSessionManager::<N, R>::with_dependencies(
-                self.notifier.clone(),
-                self.registry.clone(),
-                model_env_resolver,
-                permission_handler,
-                self.diagnostics_listener.clone(),
-            ),
-        );
+        let session_manager = Arc::new(AcpSessionManager::<N, R>::with_dependencies(
+            self.notifier.clone(),
+            self.registry.clone(),
+            model_env_resolver,
+            permission_handler,
+            self.diagnostics_listener.clone(),
+        ));
 
         // Ensure working directory exists
         AcpSessionManager::<N, R>::ensure_project_dir(&self.working_dir).await?;

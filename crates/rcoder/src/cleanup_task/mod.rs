@@ -64,7 +64,9 @@ pub async fn start_cleanup_task(
         let reaper_rx = match reaper_rx {
             Some(rx) => rx,
             None => {
-                tracing::error!("[REAPER] cleanup_rx already consumed, ResourceReaper can only be started once");
+                tracing::error!(
+                    "[REAPER] cleanup_rx already consumed, ResourceReaper can only be started once"
+                );
                 return Err(anyhow::anyhow!("ResourceReaper can only be started once"));
             }
         };
@@ -77,7 +79,10 @@ pub async fn start_cleanup_task(
             docker_manager.clone(),
         );
         tokio::spawn(reaper.run());
-        tracing::info!("[REAPER] ResourceReaper started (docker_manager={})", docker_manager.is_some());
+        tracing::info!(
+            "[REAPER] ResourceReaper started (docker_manager={})",
+            docker_manager.is_some()
+        );
     }
 
     if docker_manager.is_none() {
@@ -146,16 +151,13 @@ pub async fn start_cleanup_task(
         Some(dm) => dm,
         None => {
             tracing::error!("[CLEANUP_TASK] docker_manager is None, cannot create AgentCleaner");
-            return Err(anyhow::anyhow!("docker_manager is None, cannot create AgentCleaner"));
+            return Err(anyhow::anyhow!(
+                "docker_manager is None, cannot create AgentCleaner"
+            ));
         }
     };
 
-    let mut cleaner = AgentCleaner::new(
-        config,
-        state,
-        dm,
-        pingora_service,
-    );
+    let mut cleaner = AgentCleaner::new(config, state, dm, pingora_service);
 
     Ok(tokio::task::spawn(async move {
         cleaner.run().await;

@@ -4,7 +4,10 @@
 //! - `POST /internal/pod/ensure` — 按 identifier 创建/查找 Pod（仅 ComputerAgentRunner）
 //! - `GET  /internal/session/{session_id}/resolve` — 解析 session → identifier
 
-use axum::{Json, extract::{Path, State}};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -173,7 +176,10 @@ fn parse_service_type(s: &str) -> ServiceType {
         "ComputerAgentRunner" => ServiceType::ComputerAgentRunner,
         "RCoder" | "rcoder" => ServiceType::RCoder,
         other => {
-            warn!("[INTERNAL] unknown service_type '{}', defaulting to RCoder", other);
+            warn!(
+                "[INTERNAL] unknown service_type '{}', defaulting to RCoder",
+                other
+            );
             ServiceType::RCoder
         }
     }

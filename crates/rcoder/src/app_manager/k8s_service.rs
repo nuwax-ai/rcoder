@@ -15,23 +15,25 @@ use super::models::*;
 
 // K8s API 类型（仅在 kubernetes feature 启用时使用）
 #[cfg(feature = "kubernetes")]
-use std::collections::BTreeMap;
-#[cfg(feature = "kubernetes")]
-use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams, LogParams as KubeLogParams, PatchParams, Patch, PostParams};
+use k8s_openapi::api::apps::v1::Deployment;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
-    Pod, Event, Service, ServicePort, ServiceSpec,
-    ConfigMap, Secret, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    VolumeResourceRequirements
+    ConfigMap, Event, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, Secret, Service,
+    ServicePort, ServiceSpec, VolumeResourceRequirements,
 };
 #[cfg(feature = "kubernetes")]
-use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams,
+    LogParams as KubeLogParams, Patch, PatchParams, PostParams,
+};
+#[cfg(feature = "kubernetes")]
+use std::collections::BTreeMap;
 
 /// 解析 K8s 内存数量（如 "512Mi", "1Gi"）为字节
 #[cfg(feature = "kubernetes")]
@@ -41,11 +43,20 @@ fn parse_memory_quantity(quantity: &str) -> Option<u64> {
     if let Some(num_str) = quantity.strip_suffix("Ki") {
         num_str.parse::<f64>().ok().map(|n| (n * 1024.0) as u64)
     } else if let Some(num_str) = quantity.strip_suffix("Mi") {
-        num_str.parse::<f64>().ok().map(|n| (n * 1024.0 * 1024.0) as u64)
+        num_str
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1024.0 * 1024.0) as u64)
     } else if let Some(num_str) = quantity.strip_suffix("Gi") {
-        num_str.parse::<f64>().ok().map(|n| (n * 1024.0 * 1024.0 * 1024.0) as u64)
+        num_str
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1024.0 * 1024.0 * 1024.0) as u64)
     } else if let Some(num_str) = quantity.strip_suffix("Ti") {
-        num_str.parse::<f64>().ok().map(|n| (n * 1024.0 * 1024.0 * 1024.0 * 1024.0) as u64)
+        num_str
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1024.0 * 1024.0 * 1024.0 * 1024.0) as u64)
     } else {
         // 字节数
         quantity.parse::<u64>().ok()
@@ -91,9 +102,10 @@ impl K8sAppService {
         // 1. 创建 PVC（如果需要持久化存储）
         #[cfg(feature = "kubernetes")]
         if let Some(resources) = &request.resources
-            && let Some(storage) = &resources.storage {
-                self.create_pvc(&app_id, storage).await?;
-            }
+            && let Some(storage) = &resources.storage
+        {
+            self.create_pvc(&app_id, storage).await?;
+        }
 
         // 2. 构建容器创建参数
         let params = self.build_container_params(&app_id, &request)?;
@@ -113,9 +125,10 @@ impl K8sAppService {
         // 5. 创建 HTTPRoute（HTTP 端口）
         #[cfg(feature = "kubernetes")]
         if let Some(ports) = &request.ports
-            && let Some(http_port) = ports.iter().find(|p| p.expose_type == ExposeType::Http) {
-                self.create_httproute(&app_id, http_port.port).await?;
-            }
+            && let Some(http_port) = ports.iter().find(|p| p.expose_type == ExposeType::Http)
+        {
+            self.create_httproute(&app_id, http_port.port).await?;
+        }
 
         // 6. 创建 NodePort Service（TCP 端口）
         #[cfg(feature = "kubernetes")]
@@ -172,7 +185,10 @@ impl K8sAppService {
 
     /// 查询应用列表
     #[instrument(skip(self, request))]
-    pub async fn query_apps(&self, request: QueryAppsRequest) -> Result<PaginatedResponse<AppInfo>> {
+    pub async fn query_apps(
+        &self,
+        request: QueryAppsRequest,
+    ) -> Result<PaginatedResponse<AppInfo>> {
         let apps = self.apps.read().await;
         let mut items: Vec<AppInfo> = apps.values().cloned().collect();
 
@@ -267,10 +283,7 @@ impl K8sAppService {
     #[instrument(skip(self))]
     pub async fn delete_app(&self, app_id: &str) -> Result<()> {
         // 1. 停止并删除容器
-        let _ = self
-            .runtime
-            .stop_container(app_id)
-            .await;
+        let _ = self.runtime.stop_container(app_id).await;
 
         // 2. 删除 K8s 资源（Deployment、Service、HTTPRoute、PVC 等）
         #[cfg(feature = "kubernetes")]
@@ -353,7 +366,8 @@ impl K8sAppService {
     #[cfg(feature = "kubernetes")]
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> Result<()> {
         if let Some(client) = &self.kube_client {
-            let deployments: Api<Deployment> = Api::namespaced(client.clone(), &self.config.namespace);
+            let deployments: Api<Deployment> =
+                Api::namespaced(client.clone(), &self.config.namespace);
             let name = format!("app-{}", app_id);
 
             let patch = serde_json::json!({
@@ -362,7 +376,9 @@ impl K8sAppService {
                 }
             });
 
-            deployments.patch(&name, &PatchParams::default(), &Patch::Merge(patch)).await?;
+            deployments
+                .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+                .await?;
             info!("Deployment {} scaled to {} replicas", name, replicas);
         }
 
@@ -373,7 +389,8 @@ impl K8sAppService {
     #[cfg(feature = "kubernetes")]
     async fn restart_deployment(&self, app_id: &str) -> Result<()> {
         if let Some(client) = &self.kube_client {
-            let deployments: Api<Deployment> = Api::namespaced(client.clone(), &self.config.namespace);
+            let deployments: Api<Deployment> =
+                Api::namespaced(client.clone(), &self.config.namespace);
             let name = format!("app-{}", app_id);
 
             let patch = serde_json::json!({
@@ -388,7 +405,9 @@ impl K8sAppService {
                 }
             });
 
-            deployments.patch(&name, &PatchParams::default(), &Patch::Merge(patch)).await?;
+            deployments
+                .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+                .await?;
             info!("Deployment {} restarted", name);
         }
 
@@ -514,7 +533,12 @@ impl K8sAppService {
 
     /// 上传文件
     #[instrument(skip(self, file_data))]
-    pub async fn upload_file(&self, app_id: &str, file_data: Vec<u8>, target: &str) -> Result<UploadResult> {
+    pub async fn upload_file(
+        &self,
+        app_id: &str,
+        file_data: Vec<u8>,
+        target: &str,
+    ) -> Result<UploadResult> {
         let _app = self.get_app(app_id).await?;
 
         // K8s 模式下，文件上传通过以下方式实现：
@@ -554,11 +578,8 @@ impl K8sAppService {
             let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
             let api_resource = ApiResource::from_gvk(&gvk);
 
-            let httproutes: Api<DynamicObject> = Api::namespaced_with(
-                client.clone(),
-                &self.config.namespace,
-                &api_resource,
-            );
+            let httproutes: Api<DynamicObject> =
+                Api::namespaced_with(client.clone(), &self.config.namespace, &api_resource);
 
             let httproute = serde_json::json!({
                 "apiVersion": "gateway.networking.k8s.io/v1",
@@ -592,7 +613,9 @@ impl K8sAppService {
             });
 
             let params = PostParams::default();
-            httproutes.create(&params, &serde_json::from_value(httproute)?).await?;
+            httproutes
+                .create(&params, &serde_json::from_value(httproute)?)
+                .await?;
             info!("HTTPRoute created for app: {}", app_id);
         }
 
@@ -601,13 +624,18 @@ impl K8sAppService {
 
     /// 创建 NodePort Service（用于 TCP 端口暴露）
     #[cfg(feature = "kubernetes")]
-    async fn create_nodeport_service(&self, app_id: &str, ports: &[PortConfig]) -> Result<Vec<TcpPortMapping>> {
+    async fn create_nodeport_service(
+        &self,
+        app_id: &str,
+        ports: &[PortConfig],
+    ) -> Result<Vec<TcpPortMapping>> {
         let mut tcp_ports = Vec::new();
 
         if let Some(client) = &self.kube_client {
             let services: Api<Service> = Api::namespaced(client.clone(), &self.config.namespace);
 
-            let tcp_port_configs: Vec<_> = ports.iter()
+            let tcp_port_configs: Vec<_> = ports
+                .iter()
                 .filter(|p| p.expose_type == ExposeType::Tcp)
                 .collect();
 
@@ -615,7 +643,8 @@ impl K8sAppService {
                 return Ok(tcp_ports);
             }
 
-            let service_ports: Vec<ServicePort> = tcp_port_configs.iter()
+            let service_ports: Vec<ServicePort> = tcp_port_configs
+                .iter()
                 .map(|p| ServicePort {
                     name: Some(p.name.clone()),
                     port: p.port as i32,
@@ -636,9 +665,10 @@ impl K8sAppService {
                 },
                 spec: Some(ServiceSpec {
                     type_: Some("NodePort".to_string()),
-                    selector: Some(BTreeMap::from([
-                        ("app".to_string(), format!("app-{}", app_id)),
-                    ])),
+                    selector: Some(BTreeMap::from([(
+                        "app".to_string(),
+                        format!("app-{}", app_id),
+                    )])),
                     ports: Some(service_ports),
                     ..Default::default()
                 }),
@@ -649,21 +679,26 @@ impl K8sAppService {
 
             // 获取分配的 NodePort
             if let Some(spec) = created.spec
-                && let Some(svc_ports) = spec.ports {
-                    for (i, port) in svc_ports.iter().enumerate() {
-                        if let Some(node_port) = port.node_port {
-                            tcp_ports.push(TcpPortMapping {
-                                name: tcp_port_configs.get(i)
-                                    .map(|p| p.name.clone())
-                                    .unwrap_or_default(),
-                                node_port: node_port as u16,
-                                access_url: format!("tcp://{}:{}", self.config.node_ip, node_port),
-                            });
-                        }
+                && let Some(svc_ports) = spec.ports
+            {
+                for (i, port) in svc_ports.iter().enumerate() {
+                    if let Some(node_port) = port.node_port {
+                        tcp_ports.push(TcpPortMapping {
+                            name: tcp_port_configs
+                                .get(i)
+                                .map(|p| p.name.clone())
+                                .unwrap_or_default(),
+                            node_port: node_port as u16,
+                            access_url: format!("tcp://{}:{}", self.config.node_ip, node_port),
+                        });
                     }
                 }
+            }
 
-            info!("NodePort Service created for app: {}, ports: {:?}", app_id, tcp_ports);
+            info!(
+                "NodePort Service created for app: {}, ports: {:?}",
+                app_id, tcp_ports
+            );
         }
 
         Ok(tcp_ports)
@@ -673,7 +708,8 @@ impl K8sAppService {
     #[cfg(feature = "kubernetes")]
     async fn create_pvc(&self, app_id: &str, storage_size: &str) -> Result<()> {
         if let Some(client) = &self.kube_client {
-            let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &self.config.namespace);
+            let pvcs: Api<PersistentVolumeClaim> =
+                Api::namespaced(client.clone(), &self.config.namespace);
 
             let pvc = PersistentVolumeClaim {
                 metadata: ObjectMeta {
@@ -689,9 +725,10 @@ impl K8sAppService {
                     access_modes: Some(vec!["ReadWriteOnce".to_string()]),
                     storage_class_name: Some(self.config.storage_class.clone()),
                     resources: Some(VolumeResourceRequirements {
-                        requests: Some(BTreeMap::from([
-                            ("storage".to_string(), Quantity(storage_size.to_string())),
-                        ])),
+                        requests: Some(BTreeMap::from([(
+                            "storage".to_string(),
+                            Quantity(storage_size.to_string()),
+                        )])),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -713,35 +750,47 @@ impl K8sAppService {
             let name = format!("app-{}", app_id);
 
             // 删除 Deployment
-            let deployments: Api<Deployment> = Api::namespaced(client.clone(), &self.config.namespace);
+            let deployments: Api<Deployment> =
+                Api::namespaced(client.clone(), &self.config.namespace);
             let _ = deployments.delete(&name, &DeleteParams::default()).await;
 
             // 删除 Service
             let services: Api<Service> = Api::namespaced(client.clone(), &self.config.namespace);
-            let _ = services.delete(&format!("{}-svc", name), &DeleteParams::default()).await;
-            let _ = services.delete(&format!("{}-nodeport", name), &DeleteParams::default()).await;
+            let _ = services
+                .delete(&format!("{}-svc", name), &DeleteParams::default())
+                .await;
+            let _ = services
+                .delete(&format!("{}-nodeport", name), &DeleteParams::default())
+                .await;
 
             // 删除 HTTPRoute
             let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
             let api_resource = ApiResource::from_gvk(&gvk);
-            let httproutes: Api<DynamicObject> = Api::namespaced_with(
-                client.clone(),
-                &self.config.namespace,
-                &api_resource,
-            );
-            let _ = httproutes.delete(&format!("{}-route", name), &DeleteParams::default()).await;
+            let httproutes: Api<DynamicObject> =
+                Api::namespaced_with(client.clone(), &self.config.namespace, &api_resource);
+            let _ = httproutes
+                .delete(&format!("{}-route", name), &DeleteParams::default())
+                .await;
 
             // 删除 PVC
-            let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &self.config.namespace);
-            let _ = pvcs.delete(&format!("{}-data", name), &DeleteParams::default()).await;
+            let pvcs: Api<PersistentVolumeClaim> =
+                Api::namespaced(client.clone(), &self.config.namespace);
+            let _ = pvcs
+                .delete(&format!("{}-data", name), &DeleteParams::default())
+                .await;
 
             // 删除 ConfigMap
-            let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), &self.config.namespace);
-            let _ = configmaps.delete(&format!("{}-config", name), &DeleteParams::default()).await;
+            let configmaps: Api<ConfigMap> =
+                Api::namespaced(client.clone(), &self.config.namespace);
+            let _ = configmaps
+                .delete(&format!("{}-config", name), &DeleteParams::default())
+                .await;
 
             // 删除 Secret
             let secrets: Api<Secret> = Api::namespaced(client.clone(), &self.config.namespace);
-            let _ = secrets.delete(&format!("{}-secret", name), &DeleteParams::default()).await;
+            let _ = secrets
+                .delete(&format!("{}-secret", name), &DeleteParams::default())
+                .await;
 
             info!("K8s resources deleted for app: {}", app_id);
         }
@@ -799,10 +848,7 @@ impl K8sAppService {
                 tcp: tcp_ports,
             },
             internal: InternalAccess {
-                domain: format!(
-                    "{}-svc.{}.svc.cluster.local",
-                    app_id, self.config.namespace
-                ),
+                domain: format!("{}-svc.{}.svc.cluster.local", app_id, self.config.namespace),
                 short_domain: format!("{}-svc.{}", app_id, self.config.namespace),
                 ports: ports
                     .as_ref()
@@ -871,17 +917,18 @@ impl super::AppServiceTrait for K8sAppService {
                 if let Some(pod) = pod_list.items.first() {
                     // 获取 Pod 资源使用（需要 Metrics Server）
                     // 这里返回从 Pod spec 中获取的资源配置
-                    let containers = pod.spec.as_ref()
-                        .and_then(|s| s.containers.first());
+                    let containers = pod.spec.as_ref().and_then(|s| s.containers.first());
 
                     let (cpu_limit, memory_limit) = containers
                         .and_then(|c| c.resources.as_ref())
                         .and_then(|r| r.limits.as_ref())
                         .map(|l| {
-                            let cpu = l.get("cpu")
+                            let cpu = l
+                                .get("cpu")
                                 .and_then(|q| q.0.parse::<f64>().ok())
                                 .unwrap_or(0.0);
-                            let memory = l.get("memory")
+                            let memory = l
+                                .get("memory")
                                 .and_then(|q| parse_memory_quantity(&q.0))
                                 .unwrap_or(0);
                             (cpu, memory)
@@ -889,7 +936,9 @@ impl super::AppServiceTrait for K8sAppService {
                         .unwrap_or((0.0, 0));
 
                     // 获取重启次数
-                    let restart_count = pod.status.as_ref()
+                    let restart_count = pod
+                        .status
+                        .as_ref()
                         .and_then(|s| s.container_statuses.as_ref())
                         .and_then(|cs| cs.first())
                         .map(|cs| cs.restart_count)
@@ -929,8 +978,8 @@ impl super::AppServiceTrait for K8sAppService {
                 let events: Api<Event> = Api::namespaced(client.clone(), &self.config.namespace);
 
                 // 查询与应用相关的事件
-                let lp = ListParams::default()
-                    .fields(&format!("involvedObject.name=app-{}", app_id));
+                let lp =
+                    ListParams::default().fields(&format!("involvedObject.name=app-{}", app_id));
 
                 let event_list = events.list(&lp).await?;
 
@@ -940,7 +989,9 @@ impl super::AppServiceTrait for K8sAppService {
                     .map(|e| {
                         let reason = e.reason.clone().unwrap_or_default();
                         let message = e.message.clone().unwrap_or_default();
-                        let timestamp = e.last_timestamp.as_ref()
+                        let timestamp = e
+                            .last_timestamp
+                            .as_ref()
                             .map(|t| t.0.to_rfc3339())
                             .unwrap_or_default();
                         format!("[{}] {}: {}", timestamp, reason, message)
@@ -956,7 +1007,12 @@ impl super::AppServiceTrait for K8sAppService {
         Ok(vec![])
     }
 
-    async fn upload_file(&self, app_id: &str, file_data: Vec<u8>, target: &str) -> Result<UploadResult> {
+    async fn upload_file(
+        &self,
+        app_id: &str,
+        file_data: Vec<u8>,
+        target: &str,
+    ) -> Result<UploadResult> {
         self.upload_file(app_id, file_data, target).await
     }
 

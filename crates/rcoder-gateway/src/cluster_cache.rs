@@ -46,25 +46,37 @@ impl ClusterCache {
             "[CACHE] miss: {}, calling rcoder-control ensure",
             identifier
         );
-        let resp = self.control_client.ensure_pod(identifier, service_type).await?;
+        let resp = self
+            .control_client
+            .ensure_pod(identifier, service_type)
+            .await?;
 
         if !resp.success {
             let msg = resp.message.unwrap_or_else(|| "unknown error".to_string());
             // RCoder 返回 not_found 时不应创建，回退到控制面
             if msg.contains("not_found") {
-                debug!("[CACHE] pod not found for {} (RCoder?), will route through control plane", identifier);
+                debug!(
+                    "[CACHE] pod not found for {} (RCoder?), will route through control plane",
+                    identifier
+                );
                 anyhow::bail!("not_found: {}", msg);
             }
             anyhow::bail!("pod/ensure failed for {}: {}", identifier, msg);
         }
 
         let cluster = build_backend_cluster_name(identifier);
-        self.cache.insert(identifier.to_string(), cluster.clone()).await;
+        self.cache
+            .insert(identifier.to_string(), cluster.clone())
+            .await;
         info!(
             "[CACHE] cached: {} → {} (ttl={:.0}s)",
             identifier,
             cluster,
-            self.cache.policy().time_to_idle().unwrap_or_default().as_secs_f64()
+            self.cache
+                .policy()
+                .time_to_idle()
+                .unwrap_or_default()
+                .as_secs_f64()
         );
         Ok(cluster)
     }
@@ -101,9 +113,6 @@ mod tests {
     #[test]
     fn test_build_backend_cluster_name_consistency() {
         // 确保与 control_plane_client 中的函数一致
-        assert_eq!(
-            build_backend_cluster_name("user-123"),
-            "backend-user-123"
-        );
+        assert_eq!(build_backend_cluster_name("user-123"), "backend-user-123");
     }
 }

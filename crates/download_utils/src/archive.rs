@@ -31,7 +31,11 @@ impl std::fmt::Display for ArchiveError {
             ArchiveError::Io(e) => write!(f, "IO error: {}", e),
             ArchiveError::PathTraversal(msg) => write!(f, "Path traversal: {}", msg),
             ArchiveError::ArchiveBomb { size, max } => {
-                write!(f, "Archive bomb: {} bytes exceeds limit of {} bytes", size, max)
+                write!(
+                    f,
+                    "Archive bomb: {} bytes exceeds limit of {} bytes",
+                    size, max
+                )
             }
             ArchiveError::InvalidArchive(msg) => write!(f, "Invalid archive: {}", msg),
         }
@@ -246,9 +250,7 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> Result<bool, ArchiveError> {
 
     // Rename wrapper out of the way
     std::fs::rename(&wrapper, &tmp_rename).map_err(|e| {
-        ArchiveError::Io(std::io::Error::other(
-            format!("rename wrapper dir: {}", e),
-        ))
+        ArchiveError::Io(std::io::Error::other(format!("rename wrapper dir: {}", e)))
     })?;
 
     // Move wrapper's children into agent_dir
@@ -275,7 +277,11 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> Result<bool, ArchiveError> {
             }
         }
         if let Err(re) = std::fs::rename(&tmp_rename, &wrapper) {
-            eprintln!("Rollback failed to restore wrapper dir {}: {}", wrapper.display(), re);
+            eprintln!(
+                "Rollback failed to restore wrapper dir {}: {}",
+                wrapper.display(),
+                re
+            );
         }
         return Err(ArchiveError::Io(e));
     }
@@ -392,9 +398,7 @@ fn sanitize_entry_path(path: &Path) -> Result<PathBuf, ArchiveError> {
 }
 
 fn ensure_within(dest_path: &Path, base: &Path) -> Result<(), ArchiveError> {
-    let base_canon = base
-        .canonicalize()
-        .unwrap_or_else(|_| base.to_path_buf());
+    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
 
     let parent = dest_path.parent().unwrap_or(dest_path);
     let canon_parent = parent
@@ -458,7 +462,8 @@ mod tests {
             header.set_size(data.len() as u64);
             header.set_mode(0o755);
             header.set_cksum();
-            tar.append_data(&mut header, "bin/hello", &data[..]).unwrap();
+            tar.append_data(&mut header, "bin/hello", &data[..])
+                .unwrap();
 
             tar.into_inner().unwrap().finish().unwrap();
         }

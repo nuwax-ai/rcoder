@@ -83,7 +83,6 @@ impl AgentChecker {
             },
         }
     }
-
 }
 
 /// 检查文件是否可执行(Unix: 检查 mode bit;Windows: 总是 true)

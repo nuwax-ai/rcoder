@@ -148,7 +148,10 @@ impl ServiceResourceLimits {
             memory_limit: override_limits.memory_limit.or(self.memory_limit),
             cpu_limit: override_limits.cpu_limit.or(self.cpu_limit),
             swap_limit: override_limits.swap_limit.or(self.swap_limit),
-            storage_size: override_limits.storage_size.clone().or_else(|| self.storage_size.clone()),
+            storage_size: override_limits
+                .storage_size
+                .clone()
+                .or_else(|| self.storage_size.clone()),
         }
     }
 }

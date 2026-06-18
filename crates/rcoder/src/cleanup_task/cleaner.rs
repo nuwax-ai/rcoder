@@ -228,8 +228,10 @@ impl AgentCleaner {
                 .container()
                 .map(|c| c.container_id.clone())
                 .unwrap_or_default();
-            let (deleted, project_count) =
-                self.state.projects.delete_container_with_projects(&container_id);
+            let (deleted, project_count) = self
+                .state
+                .projects
+                .delete_container_with_projects(&container_id);
             info!(
                 "[cleaner] Deleted container and {} associated projects from storage: container_id={}, container_deleted={}",
                 project_count, container_id, deleted

@@ -16,7 +16,9 @@ pub mod ui;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_abstraction::{AcpClientBuilder, DiagnosticsListener, ProcessDiagnostics, PromptCompletionSignal};
+use agent_abstraction::{
+    AcpClientBuilder, DiagnosticsListener, ProcessDiagnostics, PromptCompletionSignal,
+};
 use tokio::sync::mpsc;
 
 use crate::cli::TuiArgs;
@@ -66,9 +68,9 @@ impl DiagnosticsListener for TuiDiagnosticsListener {
 
     fn on_process_exited(&self, diagnostics: &ProcessDiagnostics) {
         if diagnostics.exit_code == Some(0) {
-            let _ = self.tx.try_send(AppEvent::Diagnostics(
-                "Agent 进程正常退出".to_string(),
-            ));
+            let _ = self
+                .tx
+                .try_send(AppEvent::Diagnostics("Agent 进程正常退出".to_string()));
         } else {
             let _ = self.tx.try_send(AppEvent::Diagnostics(format!(
                 "Agent 进程异常退出: exit_code={:?}",
@@ -168,7 +170,14 @@ pub async fn execute_tui(args: TuiArgs, _verbose: u8, quiet: bool) -> ExitCode {
 
     // 创建并运行 TUI 应用
     let client = Arc::new(client);
-    let app = App::new(client, event_tx, event_rx, tui_terminal, use_markdown, quiet);
+    let app = App::new(
+        client,
+        event_tx,
+        event_rx,
+        tui_terminal,
+        use_markdown,
+        quiet,
+    );
     let exit_code = app.run().await;
 
     if exit_code == 0 {

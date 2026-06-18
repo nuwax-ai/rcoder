@@ -141,10 +141,7 @@ pub fn remove_agent_and_cleanup(project_id: &str) {
             });
         }
     } else {
-        warn!(
-            "⚠️ [gRPC] Agent not in Registry: project_id={}",
-            project_id
-        );
+        warn!("⚠️ [gRPC] Agent not in Registry: project_id={}", project_id);
     }
 }
 
@@ -161,8 +158,8 @@ pub async fn send_cancel_and_wait(
     timeout_secs: u64,
 ) -> CancelAndWaitResult {
     use agent_client_protocol::schema::{CancelNotification, SessionId};
-    use tokio::sync::oneshot;
     use std::time::Duration;
+    use tokio::sync::oneshot;
 
     let session_id_obj = SessionId::new(Arc::from(session_id));
     let cancel_notification = CancelNotification::new(session_id_obj);

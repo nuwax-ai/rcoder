@@ -33,13 +33,12 @@ pub fn validate_identifier(value: &str, field_name: &str) -> Result<(), String> 
         return Err(format!("{} 不能为空", field_name));
     }
     if value.len() > 64 {
-        return Err(format!(
-            "{} 长度超过 64 字符: {}",
-            field_name,
-            value.len()
-        ));
+        return Err(format!("{} 长度超过 64 字符: {}", field_name, value.len()));
     }
-    if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return Err(format!(
             "{} 包含非法字符: '{}'，仅允许字母、数字、下划线和连字符",
             field_name, value

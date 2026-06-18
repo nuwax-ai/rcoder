@@ -13,12 +13,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use shared_types_grpc::{
-    agent_mgmt_service_server::AgentMgmtService,
-    AgentDetailInfo as ProtoAgentDetailInfo, AgentInfo as ProtoAgentInfo,
-    CheckAgentRequest, CheckAgentResponse,
-    GetAgentRequest, GetAgentResponse, InstallAgentRequest, InstallAgentResponse,
-    ListAgentsRequest, ListAgentsResponse,
-    StaticCheckResult, UninstallAgentRequest, UninstallAgentResponse,
+    AgentDetailInfo as ProtoAgentDetailInfo, AgentInfo as ProtoAgentInfo, CheckAgentRequest,
+    CheckAgentResponse, GetAgentRequest, GetAgentResponse, InstallAgentRequest,
+    InstallAgentResponse, ListAgentsRequest, ListAgentsResponse, StaticCheckResult,
+    UninstallAgentRequest, UninstallAgentResponse, agent_mgmt_service_server::AgentMgmtService,
 };
 use tonic::{Request, Response, Status};
 use tracing::{error, instrument, warn};
@@ -28,9 +26,7 @@ use super::error::AgentMgmtResult;
 use super::checker::AgentChecker;
 use super::conversion;
 use super::error::AgentMgmtError;
-use super::installer::{
-    binary_installer, npm_installer, url_installer,
-};
+use super::installer::{binary_installer, npm_installer, url_installer};
 use super::path_manager::PathManager;
 use super::registry::AgentRegistry;
 use super::uninstaller;
@@ -110,7 +106,11 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
             system_info: Some(system_info),
             agents,
             total,
-            install_dir: self.path_manager.install_dir().to_string_lossy().to_string(),
+            install_dir: self
+                .path_manager
+                .install_dir()
+                .to_string_lossy()
+                .to_string(),
         }))
     }
 
@@ -173,28 +173,28 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
                 let ver_opt = version.as_deref().filter(|s| !s.is_empty());
                 let json_opt = platforms.as_deref().filter(|s| !s.is_empty());
                 if let (Some(ver), Some(json)) = (ver_opt, json_opt) {
-                        let platforms: std::collections::HashMap<String, shared_types::PlatformEntry> =
-                            serde_json::from_str(json).map_err(|e| {
-                                Self::to_status(AgentMgmtError::InvalidChunk(
-                                    format!("invalid platforms JSON: {e}"),
-                                ))
-                            })?;
-                        if !platforms.is_empty() {
-                            let force = force.unwrap_or(false);
-                            return url_installer::install_with_version_check(
-                                &self.lock_manager,
-                                &self.registry,
-                                &self.path_manager,
-                                &agent_id,
-                                &command,
-                                &args,
-                                ver,
-                                &platforms,
-                                force,
-                            )
-                            .await
-                            .map_err(Self::to_status)
-                            .map(Response::new);
+                    let platforms: std::collections::HashMap<String, shared_types::PlatformEntry> =
+                        serde_json::from_str(json).map_err(|e| {
+                            Self::to_status(AgentMgmtError::InvalidChunk(format!(
+                                "invalid platforms JSON: {e}"
+                            )))
+                        })?;
+                    if !platforms.is_empty() {
+                        let force = force.unwrap_or(false);
+                        return url_installer::install_with_version_check(
+                            &self.lock_manager,
+                            &self.registry,
+                            &self.path_manager,
+                            &agent_id,
+                            &command,
+                            &args,
+                            ver,
+                            &platforms,
+                            force,
+                        )
+                        .await
+                        .map_err(Self::to_status)
+                        .map(Response::new);
                     }
                 }
                 // 旧模式: 单个 source_url
@@ -274,24 +274,21 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
         let agent_id = inner.agent_id;
         let version = inner.version;
 
-        let removed = uninstaller::uninstall_with_version(
-            &self.registry, &agent_id, version.as_deref(),
-        )
-        .await
-        .map_err(|e| {
-            warn!("[agent_mgmt] uninstall_agent failed: {e}");
-            Self::to_status(e)
-        })?;
+        let removed =
+            uninstaller::uninstall_with_version(&self.registry, &agent_id, version.as_deref())
+                .await
+                .map_err(|e| {
+                    warn!("[agent_mgmt] uninstall_agent failed: {e}");
+                    Self::to_status(e)
+                })?;
 
         let first = removed.first().ok_or_else(|| {
             error!(agent_id = %agent_id, "[agent_mgmt] uninstall returned empty list");
             Status::internal("uninstall succeeded but no manifests returned")
         })?;
 
-        let removed_versions: Vec<String> = removed
-            .iter()
-            .filter_map(|m| m.version.clone())
-            .collect();
+        let removed_versions: Vec<String> =
+            removed.iter().filter_map(|m| m.version.clone()).collect();
 
         Ok(Response::new(UninstallAgentResponse {
             uninstalled: true,

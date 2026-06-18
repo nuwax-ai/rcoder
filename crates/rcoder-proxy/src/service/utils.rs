@@ -144,10 +144,7 @@ mod tests {
         assert_eq!(mask_domain("localhost"), "localhost");
         assert_eq!(mask_domain("short"), "short");
         assert_eq!(mask_domain("api.openai.com"), "api***ai.com");
-        assert_eq!(
-            mask_domain("anthropic-code-api.nuwax.com"),
-            "ant***ax.com"
-        );
+        assert_eq!(mask_domain("anthropic-code-api.nuwax.com"), "ant***ax.com");
     }
 
     #[test]

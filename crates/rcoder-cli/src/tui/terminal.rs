@@ -8,9 +8,9 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::io::{self, stdout, Stdout};
+use ratatui::backend::CrosstermBackend;
+use std::io::{self, Stdout, stdout};
 
 /// 终端类型别名
 pub type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;

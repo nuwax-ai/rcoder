@@ -93,9 +93,7 @@ impl AgentMgmtError {
             Self::InstallCancelled => ec::ERR_AGENT_MGMT_INSTALL_CANCELLED,
             Self::VersionAlreadyInstalled { .. } => ec::ERR_AGENT_MGMT_ALREADY_INSTALLED,
             Self::UnsupportedType(_) => ec::ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
-            Self::Io(_) | Self::Archive(_) | Self::Json(_) => {
-                ec::ERR_INTERNAL_SERVER_ERROR
-            }
+            Self::Io(_) | Self::Archive(_) | Self::Json(_) => ec::ERR_INTERNAL_SERVER_ERROR,
         }
     }
 }

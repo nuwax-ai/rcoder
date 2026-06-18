@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use download_utils::{DownloadConfig, Downloader};
 use download_utils::archive::{self, ArchiveError};
+use download_utils::{DownloadConfig, Downloader};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -85,7 +85,10 @@ impl AgentDownloadManager {
     ///
     /// # Errors
     /// 如果缓存目录无法创建或没有写入权限，返回错误。
-    pub fn with_config(cache_dir: impl Into<PathBuf>, config: DownloadConfig) -> Result<Self, AgentDownloadError> {
+    pub fn with_config(
+        cache_dir: impl Into<PathBuf>,
+        config: DownloadConfig,
+    ) -> Result<Self, AgentDownloadError> {
         let cache_dir = cache_dir.into();
         Self::ensure_cache_dir(&cache_dir)?;
         Ok(Self {
@@ -99,16 +102,14 @@ impl AgentDownloadManager {
     fn ensure_cache_dir(cache_dir: &Path) -> Result<(), AgentDownloadError> {
         // 创建目录（如果不存在）
         if !cache_dir.exists() {
-            std::fs::create_dir_all(cache_dir).map_err(|e| {
-                AgentDownloadError::Download(download_utils::DownloadError::Io(e))
-            })?;
+            std::fs::create_dir_all(cache_dir)
+                .map_err(|e| AgentDownloadError::Download(download_utils::DownloadError::Io(e)))?;
         }
 
         // 验证目录是否可写（尝试创建并删除临时文件）
         let test_file = cache_dir.join(".write_test");
-        std::fs::write(&test_file, "").map_err(|e| {
-            AgentDownloadError::Download(download_utils::DownloadError::Io(e))
-        })?;
+        std::fs::write(&test_file, "")
+            .map_err(|e| AgentDownloadError::Download(download_utils::DownloadError::Io(e)))?;
         std::fs::remove_file(&test_file).ok(); // 忽略删除失败
 
         Ok(())
@@ -127,7 +128,11 @@ impl AgentDownloadManager {
     }
 
     /// 获取版本缓存目录路径（版本归一化）
-    pub fn version_dir(&self, agent_id: &str, version: &str) -> Result<PathBuf, AgentDownloadError> {
+    pub fn version_dir(
+        &self,
+        agent_id: &str,
+        version: &str,
+    ) -> Result<PathBuf, AgentDownloadError> {
         let normalized = shared_types::version_util::normalize_version(version)
             .map_err(|e| AgentDownloadError::NotFound(e.to_string()))?;
         Ok(self.cache_dir.join(agent_id).join(normalized))
@@ -141,9 +146,14 @@ impl AgentDownloadManager {
     }
 
     /// 获取下载锁
-    fn get_download_lock(&self, agent_id: &str, version: &str) -> Result<Arc<Mutex<()>>, AgentDownloadError> {
+    fn get_download_lock(
+        &self,
+        agent_id: &str,
+        version: &str,
+    ) -> Result<Arc<Mutex<()>>, AgentDownloadError> {
         let key = Self::lock_key(agent_id, version)?;
-        Ok(self.download_locks
+        Ok(self
+            .download_locks
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone())
@@ -187,11 +197,14 @@ impl AgentDownloadManager {
 
         // 执行下载到临时文件
         let version_dir = self.version_dir(agent_id, version)?;
-        let temp_file = self.cache_dir.join(format!(".download-{}-{}", agent_id, version));
+        let temp_file = self
+            .cache_dir
+            .join(format!(".download-{}-{}", agent_id, version));
 
         // 下载文件到临时文件（使用 download_utils）
         let cancel_token = CancellationToken::new();
-        let file_size = self.downloader
+        let file_size = self
+            .downloader
             .download_to_file(url, &temp_file, None, &cancel_token)
             .await
             .map_err(AgentDownloadError::Download)?;
@@ -199,11 +212,11 @@ impl AgentDownloadManager {
         // 创建版本目录并移动文件
         tokio::fs::create_dir_all(&version_dir).await?;
         // 从 URL 获取真实文件名（优先从 Content-Disposition，其次从 URL 路径）
-        let raw_filename = download_utils::get_filename_from_url(url).await
+        let raw_filename = download_utils::get_filename_from_url(url)
+            .await
             .unwrap_or_else(|_| "package.tar.gz".to_string());
         let dest_path = version_dir.join(&raw_filename);
-        tokio::fs::rename(&temp_file, &dest_path)
-            .await?;
+        tokio::fs::rename(&temp_file, &dest_path).await?;
 
         info!(
             agent_id = %agent_id,
@@ -283,8 +296,12 @@ impl AgentDownloadManager {
 
         if let Some(archive_path) = archive_file {
             // 检测文件类型并解压
-            let file_type = archive::detect_file_type_from_path(&archive_path)
-                .map_err(|e| AgentDownloadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+            let file_type = archive::detect_file_type_from_path(&archive_path).map_err(|e| {
+                AgentDownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                ))
+            })?;
             info!(
                 agent_id = %agent_id,
                 version = %version,
@@ -301,18 +318,22 @@ impl AgentDownloadManager {
             let archive_clone = archive_path.clone();
             let file_type_str = file_type.to_string();
 
-            tokio::task::spawn_blocking(move || {
-                match file_type_str.as_str() {
-                    "tar.gz" => archive::extract_tar_gz(&archive_clone, &target_clone),
-                    "zip" => archive::extract_zip(&archive_clone, &target_clone),
-                    _ => Err(ArchiveError::InvalidArchive(format!(
-                        "unsupported archive type: {}", file_type_str
-                    ))),
-                }
+            tokio::task::spawn_blocking(move || match file_type_str.as_str() {
+                "tar.gz" => archive::extract_tar_gz(&archive_clone, &target_clone),
+                "zip" => archive::extract_zip(&archive_clone, &target_clone),
+                _ => Err(ArchiveError::InvalidArchive(format!(
+                    "unsupported archive type: {}",
+                    file_type_str
+                ))),
             })
             .await
             .map_err(|e| AgentDownloadError::Io(std::io::Error::other(e.to_string())))?
-            .map_err(|e| AgentDownloadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+            .map_err(|e| {
+                AgentDownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                ))
+            })?;
 
             // 规范化目录结构（去除单层 wrapper）
             archive::normalize_extracted_dir(&target)
@@ -341,7 +362,10 @@ impl AgentDownloadManager {
     /// 查找缓存目录中的归档文件
     ///
     /// 优先通过 magic bytes 识别（更可靠），然后通过扩展名兜底。
-    async fn find_archive_file(&self, source_dir: &Path) -> Result<Option<PathBuf>, AgentDownloadError> {
+    async fn find_archive_file(
+        &self,
+        source_dir: &Path,
+    ) -> Result<Option<PathBuf>, AgentDownloadError> {
         let mut entries = tokio::fs::read_dir(source_dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
@@ -371,7 +395,11 @@ impl AgentDownloadManager {
     }
 
     /// 递归复制目录
-    async fn copy_dir_recursive(&self, source: &Path, target: &Path) -> Result<(), AgentDownloadError> {
+    async fn copy_dir_recursive(
+        &self,
+        source: &Path,
+        target: &Path,
+    ) -> Result<(), AgentDownloadError> {
         tokio::fs::create_dir_all(target).await?;
 
         let mut entries = tokio::fs::read_dir(source).await?;
@@ -470,7 +498,10 @@ mod tests {
 
         // 复制到目标
         let target_base = tmp_dir.path().join("target");
-        let result = manager.copy_to_target("test-agent", "1.0.0", &target_base).await.unwrap();
+        let result = manager
+            .copy_to_target("test-agent", "1.0.0", &target_base)
+            .await
+            .unwrap();
 
         // 验证目标文件存在
         assert!(result.exists());
@@ -486,7 +517,9 @@ mod tests {
         let manager = AgentDownloadManager::new(tmp_dir.path().join("cache")).unwrap();
 
         let target_base = tmp_dir.path().join("target");
-        let result = manager.copy_to_target("test-agent", "1.0.0", &target_base).await;
+        let result = manager
+            .copy_to_target("test-agent", "1.0.0", &target_base)
+            .await;
 
         assert!(matches!(result, Err(AgentDownloadError::NotFound(_))));
     }

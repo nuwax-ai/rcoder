@@ -8,11 +8,13 @@
 //! - `container_status_checker`: 容器状态检查器（定期查询容器状态，防止误杀）
 //! - `container_sync`: 容器状态同步任务（定期同步 Docker 容器状态到内存缓存）
 //! - `vnc_sync`: VNC 后端同步任务（定期同步容器 IP 到 Pingora 的 vnc_backends）
+//! - `vnc_activity_sync`: VNC 活跃时间同步任务（扫描 pingora vnc_activity 续期 storage）
 
 pub mod computer_container_manager;
 pub mod container_manager;
 pub mod container_status_checker;
 pub mod container_sync;
+pub mod vnc_activity_sync;
 pub mod vnc_sync;
 
 pub use computer_container_manager::ComputerContainerManager;
@@ -21,5 +23,7 @@ pub use computer_container_manager::ComputerContainerManager;
 pub use container_status_checker::{ContainerStatusCheckerConfig, start_container_status_checker};
 #[allow(unused_imports)]
 pub use container_sync::{ContainerSyncConfig, start_container_sync_task};
+#[allow(unused_imports)]
+pub use vnc_activity_sync::{VncActivitySyncConfig, start_vnc_activity_sync_task};
 #[allow(unused_imports)]
 pub use vnc_sync::{VncSyncConfig, start_vnc_sync_task};

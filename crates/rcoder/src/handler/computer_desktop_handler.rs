@@ -195,7 +195,8 @@ pub async fn computer_desktop_vnc(
     );
 
     // 2. 查找用户容器
-    let container_info = ComputerContainerManager::get_container_info(&user_id, state.runtime()).await?;
+    let container_info =
+        ComputerContainerManager::get_container_info(&user_id, state.runtime()).await?;
 
     let container_info = match container_info {
         Some(info) => info,

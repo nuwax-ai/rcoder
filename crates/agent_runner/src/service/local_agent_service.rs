@@ -94,10 +94,7 @@ impl AgentHttpService for LocalAgentHttpService {
         // 注意：这里使用 project_id 作为 fallback，所以 work_dir_id 不会为空
         // 但如果 agent_work_dir 有值且不合法，需要返回错误
         if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
-            return HttpResult::error(
-                shared_types::error_codes::ERR_VALIDATION,
-                &e,
-            );
+            return HttpResult::error(shared_types::error_codes::ERR_VALIDATION, &e);
         }
 
         // 2. 自动查找现有 session_id（如果未提供）

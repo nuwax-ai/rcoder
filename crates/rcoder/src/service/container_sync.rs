@@ -75,7 +75,7 @@ pub fn start_container_sync_task(
                                     container.container_ip,
                                     shared_types::GRPC_DEFAULT_PORT
                                 );
-                                grpc_pool.remove(&grpc_addr);
+                                grpc_pool.remove(&grpc_addr).await;
                             }
                         }
                     }

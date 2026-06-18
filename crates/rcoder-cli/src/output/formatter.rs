@@ -179,7 +179,11 @@ impl OutputFormatter {
             if self.color {
                 eprintln!(
                     "{}[TOOL]{} {} {} {}",
-                    colors::MAGENTA, colors::RESET, tool_name, colors::DIM, status
+                    colors::MAGENTA,
+                    colors::RESET,
+                    tool_name,
+                    colors::DIM,
+                    status
                 );
             } else {
                 eprintln!("[TOOL] {} {}", tool_name, status);

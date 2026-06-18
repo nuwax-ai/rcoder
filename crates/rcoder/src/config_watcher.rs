@@ -102,7 +102,9 @@ impl ConfigWatcher {
                     // 过滤：只处理目标配置文件的事件
                     if let Some(ref name) = file_name {
                         let event_matches = event.paths.iter().any(|p| {
-                            p.file_name().map(|n| n == name.as_os_str()).unwrap_or(false)
+                            p.file_name()
+                                .map(|n| n == name.as_os_str())
+                                .unwrap_or(false)
                         });
                         if !event_matches {
                             continue;
@@ -135,7 +137,10 @@ impl ConfigWatcher {
                                     } else {
                                         warn!(
                                             " [CONFIG_WATCHER] config reload attempt {}/{} failed: {}, retrying in {}ms",
-                                            attempt, max_retries, e, retry_delay.as_millis()
+                                            attempt,
+                                            max_retries,
+                                            e,
+                                            retry_delay.as_millis()
                                         );
                                         retry_delay *= 2; // 指数退避
                                     }

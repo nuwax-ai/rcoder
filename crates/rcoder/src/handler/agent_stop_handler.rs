@@ -60,7 +60,7 @@ async fn destroy_container_for_project(
                 container_info.container_ip,
                 shared_types::GRPC_DEFAULT_PORT
             );
-            state.grpc_pool.remove(&old_grpc_addr);
+            state.grpc_pool.remove(&old_grpc_addr).await;
         }
 
         // 从存储中移除项目（如果 project_id 不是 "unknown"）

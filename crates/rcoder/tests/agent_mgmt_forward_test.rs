@@ -15,9 +15,7 @@ use shared_types::ContainerBasicInfo;
 use shared_types::ProjectAndContainerInfo;
 use shared_types::ServiceType;
 use shared_types::grpc::agent_mgmt_service_client::AgentMgmtServiceClient;
-use shared_types::grpc::agent_mgmt_service_server::{
-    AgentMgmtService, AgentMgmtServiceServer,
-};
+use shared_types::grpc::agent_mgmt_service_server::{AgentMgmtService, AgentMgmtServiceServer};
 use shared_types::grpc::{
     AgentInstallStatus, CheckAgentRequest, CheckAgentResponse, GetAgentRequest, GetAgentResponse,
     InstallAgentRequest, InstallAgentResponse, InstallType, ListAgentsRequest, ListAgentsResponse,
@@ -33,11 +31,11 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use rcoder::grpc::GrpcChannelPool;
+use rcoder::handler::utils::status_to_app_error;
 use rcoder::handler::utils::{
     AgentMgmtForwardCtx, InstallAgentParams, check_agent, get_agent, install_agent, list_agents,
     uninstall_agent,
 };
-use rcoder::handler::utils::status_to_app_error;
 
 // === Mock ContainerRuntime ===
 
@@ -177,7 +175,9 @@ impl AgentMgmtService for MockAgentMgmt {
         // 检查是否配置了错误注入
         let error_code = self.state.lock().unwrap().install_error.clone();
         if let Some(code) = error_code {
-            return Err(Status::failed_precondition(format!("{code}: forced failure")));
+            return Err(Status::failed_precondition(format!(
+                "{code}: forced failure"
+            )));
         }
 
         let mut stream = request.into_inner();
@@ -273,7 +273,9 @@ impl AgentMgmtService for MockAgentMgmt {
 
 /// 启动 mock tonic gRPC server,返回 (server_addr, mock handle, server task)
 async fn start_mock_server() -> (SocketAddr, Arc<MockAgentMgmt>, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 127.0.0.1:0");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind 127.0.0.1:0");
     let addr = listener.local_addr().expect("local_addr");
     let mock = Arc::new(MockAgentMgmt::default());
 
@@ -372,7 +374,10 @@ async fn install_agent_streams_chunks_to_mock_server() {
         snap.chunks
     );
     // 第 1 个 chunk 必须是 metadata-only(data 为空)
-    assert!(snap.chunks[0].has_metadata, "first chunk must carry metadata");
+    assert!(
+        snap.chunks[0].has_metadata,
+        "first chunk must carry metadata"
+    );
     assert_eq!(snap.chunks[0].data_len, 0);
     // 后续 chunk 必须无 metadata,data 总和 = 2.5 MB
     let total_data: usize = snap.chunks.iter().map(|c| c.data_len).sum();
@@ -430,7 +435,10 @@ async fn list_agents_returns_parsed_response() {
     assert_eq!(resp.agents.len(), 1);
     assert_eq!(resp.agents[0].agent_id, "codex-acp");
     assert_eq!(resp.agents[0].install_type, SharedInstallType::Npm);
-    assert_eq!(resp.agents[0].status, shared_types::AgentInstallStatus::Available);
+    assert_eq!(
+        resp.agents[0].status,
+        shared_types::AgentInstallStatus::Available
+    );
     assert_eq!(resp.system_info.os, "linux");
 }
 
@@ -440,7 +448,9 @@ async fn get_agent_returns_none_when_not_found() {
     let ctx = make_ctx(addr);
     let project = make_project(addr);
 
-    let resp = get_agent(&ctx, &project, "missing", None).await.expect("get_agent ok");
+    let resp = get_agent(&ctx, &project, "missing", None)
+        .await
+        .expect("get_agent ok");
     assert!(resp.is_none(), "missing agent should return None");
 }
 

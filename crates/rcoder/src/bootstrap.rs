@@ -30,7 +30,8 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
     let file_log_config = FileLogConfig::new("logs", "rcoder")
         .with_max_files(config.cleanup_config.log_cleanup.log_retention_days as usize);
 
-    let telemetry_config = TelemetryConfig::from_env("rcoder").with_file_log_config(file_log_config);
+    let telemetry_config =
+        TelemetryConfig::from_env("rcoder").with_file_log_config(file_log_config);
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let telemetry = Arc::new(telemetry);
 

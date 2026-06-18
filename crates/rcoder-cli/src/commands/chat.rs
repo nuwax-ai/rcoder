@@ -63,10 +63,8 @@ async fn build_client(
     level: OutputLevel,
     completion_signal: PromptCompletionSignal,
 ) -> Result<AcpClient<TerminalSessionNotifier, SimpleSessionRegistry>, anyhow::Error> {
-    let notifier = TerminalSessionNotifier::new(
-        OutputFormatter::new(level),
-        Some(completion_signal.clone()),
-    );
+    let notifier =
+        TerminalSessionNotifier::new(OutputFormatter::new(level), Some(completion_signal.clone()));
     let registry = SimpleSessionRegistry::new();
     let env_vars = args.common.parse_env_vars();
     let timeout = Duration::from_secs(args.common.timeout);
@@ -141,7 +139,13 @@ pub async fn execute_chat(args: ChatArgs, verbose: u8, quiet: bool) -> ExitCode 
     let exit_code = if is_interactive {
         run_interactive_loop(&client, &formatter).await
     } else {
-        run_single_prompt(&client, &formatter, single_prompt.unwrap(), args.common.timeout).await
+        run_single_prompt(
+            &client,
+            &formatter,
+            single_prompt.unwrap(),
+            args.common.timeout,
+        )
+        .await
     };
 
     // 优雅停止 Agent

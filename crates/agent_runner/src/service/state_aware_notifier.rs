@@ -7,8 +7,8 @@
 //! 2. 通过 SessionRegistry trait 同步更新 Agent 状态（R-1 重构：不再直接依赖 AGENT_REGISTRY）
 //! 3. 保持状态转换的原子性和一致性
 
-use agent_abstraction::traits::SessionRegistry;
 use agent_abstraction::SessionNotifier;
+use agent_abstraction::traits::SessionRegistry;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{debug, error, info};

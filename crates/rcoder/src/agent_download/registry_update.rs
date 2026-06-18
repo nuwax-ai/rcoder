@@ -79,9 +79,9 @@ fn update_registry_sync(
     };
 
     // 检查是否已存在相同版本
-    let existing = manifests.iter().position(|m| {
-        m.agent_id == agent_id && m.version.as_deref() == Some(version)
-    });
+    let existing = manifests
+        .iter()
+        .position(|m| m.agent_id == agent_id && m.version.as_deref() == Some(version));
 
     // 创建新的 manifest
     let manifest = AgentManifest {
@@ -116,14 +116,12 @@ fn update_registry_sync(
 
     // 排序（便于阅读）
     manifests.sort_by(|a, b| {
-        a.agent_id
-            .cmp(&b.agent_id)
-            .then_with(|| {
-                a.version
-                    .as_deref()
-                    .unwrap_or("")
-                    .cmp(b.version.as_deref().unwrap_or(""))
-            })
+        a.agent_id.cmp(&b.agent_id).then_with(|| {
+            a.version
+                .as_deref()
+                .unwrap_or("")
+                .cmp(b.version.as_deref().unwrap_or(""))
+        })
     });
 
     // 写入文件（原子写入）
@@ -153,7 +151,9 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let acp_agent_dir = tmp_dir.path();
 
-        update_registry(acp_agent_dir, "test-agent", "1.0.0", "test-cmd", &[]).await.unwrap();
+        update_registry(acp_agent_dir, "test-agent", "1.0.0", "test-cmd", &[])
+            .await
+            .unwrap();
 
         // 验证文件存在
         let registry_path = acp_agent_dir.join("registry.json");
@@ -173,10 +173,14 @@ mod tests {
         let acp_agent_dir = tmp_dir.path();
 
         // 添加第一个版本
-        update_registry(acp_agent_dir, "test-agent", "1.0.0", "test-cmd", &[]).await.unwrap();
+        update_registry(acp_agent_dir, "test-agent", "1.0.0", "test-cmd", &[])
+            .await
+            .unwrap();
 
         // 添加第二个版本
-        update_registry(acp_agent_dir, "test-agent", "2.0.0", "test-cmd", &[]).await.unwrap();
+        update_registry(acp_agent_dir, "test-agent", "2.0.0", "test-cmd", &[])
+            .await
+            .unwrap();
 
         // 验证有两个版本
         let registry_path = acp_agent_dir.join("registry.json");
@@ -191,10 +195,20 @@ mod tests {
         let acp_agent_dir = tmp_dir.path();
 
         // 添加版本
-        update_registry(acp_agent_dir, "test-agent", "1.0.0", "old-cmd", &[]).await.unwrap();
+        update_registry(acp_agent_dir, "test-agent", "1.0.0", "old-cmd", &[])
+            .await
+            .unwrap();
 
         // 更新同一版本
-        update_registry(acp_agent_dir, "test-agent", "1.0.0", "new-cmd", &["--flag".to_string()]).await.unwrap();
+        update_registry(
+            acp_agent_dir,
+            "test-agent",
+            "1.0.0",
+            "new-cmd",
+            &["--flag".to_string()],
+        )
+        .await
+        .unwrap();
 
         // 验证只有一个版本，但命令已更新
         let registry_path = acp_agent_dir.join("registry.json");
@@ -210,8 +224,12 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let acp_agent_dir = tmp_dir.path();
 
-        update_registry(acp_agent_dir, "agent-a", "1.0.0", "cmd-a", &[]).await.unwrap();
-        update_registry(acp_agent_dir, "agent-b", "1.0.0", "cmd-b", &[]).await.unwrap();
+        update_registry(acp_agent_dir, "agent-a", "1.0.0", "cmd-a", &[])
+            .await
+            .unwrap();
+        update_registry(acp_agent_dir, "agent-b", "1.0.0", "cmd-b", &[])
+            .await
+            .unwrap();
 
         let registry_path = acp_agent_dir.join("registry.json");
         let data = std::fs::read_to_string(&registry_path).unwrap();

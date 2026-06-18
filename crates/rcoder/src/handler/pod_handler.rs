@@ -892,8 +892,10 @@ pub async fn pod_ensure(
     let mut rx = state.pod_created_tx.subscribe();
 
     // view() 在闭包返回后立即释放锁，无 Ref 暴露
-    if let Some(elapsed) = state.pod_creating.view(&request.user_id, |_, t| t.elapsed()) {
-
+    if let Some(elapsed) = state
+        .pod_creating
+        .view(&request.user_id, |_, t| t.elapsed())
+    {
         // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
         if elapsed < std::time::Duration::from_secs(60) {
             info!(
@@ -978,8 +980,12 @@ pub async fn pod_ensure(
                     pinfo.set_container(Some(info.clone()));
                     pinfo
                 };
-                state.insert_project(request.project_id.clone(), Arc::new(project_info))
-                    .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
+                state
+                    .insert_project(request.project_id.clone(), Arc::new(project_info))
+                    .map_err(|e| {
+                        tracing::error!("[STORAGE] insert_project failed: {}", e);
+                        e
+                    })?;
                 debug!(
                     "📝 [POD_ENSURE] project record updated: project_id={}, user_id={}, container_id={}",
                     request.project_id, request.user_id, info.container_id
@@ -1077,7 +1083,7 @@ pub async fn pod_ensure(
                     result.container_ip,
                     shared_types::GRPC_DEFAULT_PORT
                 );
-                state.grpc_pool.remove(&old_grpc_addr);
+                state.grpc_pool.remove(&old_grpc_addr).await;
             }
 
             // ⏱️ 等待 Docker 完全释放容器资源（避免竞态条件）
@@ -1180,7 +1186,9 @@ pub async fn pod_ensure(
                 state.pod_creating.remove(&request.user_id);
                 // 直接返回原始错误，保留具体的错误信息
                 return Err(last_error.unwrap_or_else(|| {
-                    AppError::internal_server_error("Container creation failed but no error info captured")
+                    AppError::internal_server_error(
+                        "Container creation failed but no error info captured",
+                    )
                 }));
             }
         }
@@ -1334,8 +1342,12 @@ pub async fn pod_ensure(
         info
     };
 
-    state.insert_project(request.project_id.clone(), Arc::new(project_info))
-        .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
+    state
+        .insert_project(request.project_id.clone(), Arc::new(project_info))
+        .map_err(|e| {
+            tracing::error!("[STORAGE] insert_project failed: {}", e);
+            e
+        })?;
     debug!(
         "📝 [POD_ENSURE] project record updated: project_id={}, user_id={}, container_id={}",
         request.project_id, request.user_id, container_info.container_id
@@ -1476,7 +1488,8 @@ pub async fn pod_keepalive(
     let (container_info, created) = if !existed {
         // 存储中没有记录，检查 Docker 中是否有容器
         let existing_container =
-            ComputerContainerManager::get_container_info(&container_identifier, state.runtime()).await?;
+            ComputerContainerManager::get_container_info(&container_identifier, state.runtime())
+                .await?;
 
         match existing_container {
             Some(info) => {
@@ -1488,8 +1501,12 @@ pub async fn pod_keepalive(
                     project_info
                         .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
                     project_info.set_container(Some(info.clone()));
-                    state.insert_project(request.project_id.clone(), Arc::new(project_info))
-                        .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
+                    state
+                        .insert_project(request.project_id.clone(), Arc::new(project_info))
+                        .map_err(|e| {
+                            tracing::error!("[STORAGE] insert_project failed: {}", e);
+                            e
+                        })?;
                     info!("[POD_KEEPALIVE] container already exists (Docker), updating 存储");
                 } else {
                     info!(
@@ -1630,7 +1647,8 @@ pub async fn pod_restart(
     );
 
     // 2. 检查容器是否存在
-    let existing_container = ComputerContainerManager::get_container_info(&request.user_id, state.runtime()).await?;
+    let existing_container =
+        ComputerContainerManager::get_container_info(&request.user_id, state.runtime()).await?;
     let was_existing = existing_container.is_some();
 
     // 3. 如果容器存在，先销毁
@@ -1680,7 +1698,7 @@ pub async fn pod_restart(
                 container_info.container_ip,
                 shared_types::GRPC_DEFAULT_PORT
             );
-            state.grpc_pool.remove(&old_grpc_addr);
+            state.grpc_pool.remove(&old_grpc_addr).await;
         }
 
         // 验证容器是否真正移除
@@ -1794,8 +1812,12 @@ pub async fn pod_restart(
             info.set_container(Some(container_info.clone()));
             info
         };
-        state.insert_project(request.project_id.clone(), Arc::new(project_info))
-            .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
+        state
+            .insert_project(request.project_id.clone(), Arc::new(project_info))
+            .map_err(|e| {
+                tracing::error!("[STORAGE] insert_project failed: {}", e);
+                e
+            })?;
     }
 
     // 7. 构建响应

@@ -175,26 +175,25 @@ async fn main() -> anyhow::Result<()> {
     // 注:用二进制自己的 `crate::agent_mgmt` 模块(与 router::AppState 同编译单元),
     //     lib 和 binary 是两个独立 crate,类型不能混用。
     let agent_mgmt_path_manager = crate::agent_mgmt::PathManager::new();
-    let agent_mgmt_registry = match crate::agent_mgmt::AgentRegistry::load(
-        agent_mgmt_path_manager.clone(),
-    ) {
-        Ok(r) => {
-            info!(
-                "📋 [MAIN] Agent management registry loaded: total={}, builtin={}",
-                r.total(),
-                r.builtin_count()
-            );
-            std::sync::Arc::new(r)
-        }
-        Err(e) => {
-            tracing::warn!(
-                "⚠️  [MAIN] Failed to load agent management registry, starting empty: {e}"
-            );
-            std::sync::Arc::new(crate::agent_mgmt::AgentRegistry::empty(
-                agent_mgmt_path_manager.clone(),
-            ))
-        }
-    };
+    let agent_mgmt_registry =
+        match crate::agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone()) {
+            Ok(r) => {
+                info!(
+                    "📋 [MAIN] Agent management registry loaded: total={}, builtin={}",
+                    r.total(),
+                    r.builtin_count()
+                );
+                std::sync::Arc::new(r)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "⚠️  [MAIN] Failed to load agent management registry, starting empty: {e}"
+                );
+                std::sync::Arc::new(crate::agent_mgmt::AgentRegistry::empty(
+                    agent_mgmt_path_manager.clone(),
+                ))
+            }
+        };
 
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
@@ -232,11 +231,10 @@ async fn main() -> anyhow::Result<()> {
             .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
             // P0-1: Agent 管理 gRPC 服务
-            let agent_mgmt_service =
-                crate::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
-                    agent_mgmt_registry.clone(),
-                    agent_mgmt_path_manager.clone(),
-                );
+            let agent_mgmt_service = crate::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+                agent_mgmt_registry.clone(),
+                agent_mgmt_path_manager.clone(),
+            );
 
             let handle = tokio::spawn(async move {
                 info!("gRPC service started, listening on port: {}", grpc_port);
@@ -313,7 +311,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => {
                     // This should never happen if grpc-server feature is enabled
-                    error!("🔴 CRITICAL: gRPC handle is None despite grpc-server feature being enabled. This is a bug in initialization logic.");
+                    error!(
+                        "🔴 CRITICAL: gRPC handle is None despite grpc-server feature being enabled. This is a bug in initialization logic."
+                    );
                     // Wait for ctrl_c instead of silently continuing
                     tokio::signal::ctrl_c().await?;
                     info!("📨 Received shutdown signal, preparing graceful shutdown...");

@@ -19,9 +19,9 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 use futures_util::Stream;
+use sha2::{Digest, Sha256};
 use shared_types::InstallType;
 use shared_types_grpc::{InstallAgentRequest, InstallAgentResponse};
-use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use super::archive_installer;
@@ -110,8 +110,8 @@ pub async fn install_from_stream(
         buffer.extend_from_slice(&first.data);
     }
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|e| AgentMgmtError::InvalidChunk(format!("grpc stream error: {e}")))?;
+        let chunk =
+            chunk.map_err(|e| AgentMgmtError::InvalidChunk(format!("grpc stream error: {e}")))?;
         if chunk.metadata.is_some() {
             return Err(AgentMgmtError::InvalidChunk(
                 "metadata only allowed in first chunk".into(),
@@ -176,8 +176,8 @@ pub async fn install_from_prepared_stream(
         buffer.extend_from_slice(&first_data);
     }
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|e| AgentMgmtError::InvalidChunk(format!("grpc stream error: {e}")))?;
+        let chunk =
+            chunk.map_err(|e| AgentMgmtError::InvalidChunk(format!("grpc stream error: {e}")))?;
         if chunk.metadata.is_some() {
             return Err(AgentMgmtError::InvalidChunk(
                 "metadata only allowed in first chunk".into(),
@@ -386,7 +386,10 @@ pub async fn install_from_file(
     // 3. 准备 staging 目录 + rename 文件
     let t0 = std::time::Instant::now();
     path_manager.ensure_dirs().await?;
-    debug!("[agent_mgmt] install_from_file: ensure_dirs took {:?}", t0.elapsed());
+    debug!(
+        "[agent_mgmt] install_from_file: ensure_dirs took {:?}",
+        t0.elapsed()
+    );
 
     // 使用版本目录（如果提供了版本号）
     let t1 = std::time::Instant::now();
@@ -404,7 +407,10 @@ pub async fn install_from_file(
     if version_dir.exists() {
         debug!("[agent_mgmt] install_from_file: removing existing version_dir");
         tokio::fs::remove_dir_all(&version_dir).await.ok();
-        info!("[agent_mgmt] install_from_file: remove_dir_all took {:?}", t1.elapsed());
+        info!(
+            "[agent_mgmt] install_from_file: remove_dir_all took {:?}",
+            t1.elapsed()
+        );
     }
     tokio::fs::create_dir_all(&version_dir).await?;
 
@@ -421,7 +427,10 @@ pub async fn install_from_file(
         tokio::fs::copy(download_path, &staging).await?;
         let _ = tokio::fs::remove_file(download_path).await;
     }
-    debug!("[agent_mgmt] install_from_file: staging file ready, took {:?}", t2.elapsed());
+    debug!(
+        "[agent_mgmt] install_from_file: staging file ready, took {:?}",
+        t2.elapsed()
+    );
 
     // 4. 共享解压/注册逻辑
     _install_from_staging(
@@ -492,14 +501,21 @@ async fn _install_from_staging(
     // resolved_args: 目录型包从 metadata 解析的 args（如 ["dist/index.js"]），二进制型为 None
     let t3 = std::time::Instant::now();
     let spawn_result = tokio::task::spawn_blocking(move || {
-        debug!("[agent_mgmt] spawn_blocking started, queue wait: {:?}", t3.elapsed());
+        debug!(
+            "[agent_mgmt] spawn_blocking started, queue wait: {:?}",
+            t3.elapsed()
+        );
         let t_extract = std::time::Instant::now();
         let count = match file_type_clone.as_str() {
             "tar.gz" => archive_installer::extract_tar_gz(&staging_clone, &agent_dir_clone)?,
             "zip" => archive_installer::extract_zip(&staging_clone, &agent_dir_clone)?,
             _ => unreachable!(),
         };
-        debug!("[agent_mgmt] extraction done: {} files, took {:?}", count, t_extract.elapsed());
+        debug!(
+            "[agent_mgmt] extraction done: {} files, took {:?}",
+            count,
+            t_extract.elapsed()
+        );
         let _ = std::fs::remove_file(&staging_clone);
 
         // 剥掉单个顶层目录包装（如 deepagents-dev-templates-0.2.9/）
@@ -530,10 +546,10 @@ async fn _install_from_staging(
         // 二进制型包：查找入口可执行文件
         let entrypoint = archive_installer::find_entrypoint(&agent_dir_clone, &command_for_block)
             .ok_or_else(|| {
-                AgentMgmtError::InstallFailed(format!(
-                    "could not find entrypoint '{command_for_block}' in extracted archive"
-                ))
-            })?;
+            AgentMgmtError::InstallFailed(format!(
+                "could not find entrypoint '{command_for_block}' in extracted archive"
+            ))
+        })?;
         // binary_path 直接指向入口文件（不复制到 bin/，由 Dockerfile PATH 配置解决查找）
         Ok::<(String, usize, Option<Vec<String>>), AgentMgmtError>((
             entrypoint.to_string_lossy().to_string(),
@@ -678,7 +694,10 @@ mod tests {
 
     #[test]
     fn detect_gzip() {
-        assert_eq!(detect_file_type(b"\x1F\x8B\x08\x00\x00\x00\x00\x00"), "tar.gz");
+        assert_eq!(
+            detect_file_type(b"\x1F\x8B\x08\x00\x00\x00\x00\x00"),
+            "tar.gz"
+        );
     }
 
     #[test]
@@ -769,7 +788,9 @@ mod tests {
                 agent_id: "x",
                 command: "x",
                 args: &[],
-                expected_sha256: Some("0000000000000000000000000000000000000000000000000000000000000000"),
+                expected_sha256: Some(
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                ),
                 install_type: InstallType::Binary,
                 bytes: Bytes::from(payload),
                 version: None,
@@ -847,10 +868,7 @@ mod tests {
             metadata: None,
             data: second_data,
         };
-        let s: IncomingStream = Box::pin(stream::iter(vec![
-            Ok(first_chunk),
-            Ok(second_chunk),
-        ]));
+        let s: IncomingStream = Box::pin(stream::iter(vec![Ok(first_chunk), Ok(second_chunk)]));
 
         let resp = install_from_stream(&r, &pm, s).await.unwrap();
         assert_eq!(resp.agent_id, "stream-first-data");

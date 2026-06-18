@@ -70,9 +70,7 @@ impl MarkdownRenderer {
             Event::Code(code) => {
                 self.current_line.push(Span::styled(
                     code.to_string(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .bg(Color::Rgb(40, 40, 40)),
+                    Style::default().fg(Color::Cyan).bg(Color::Rgb(40, 40, 40)),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -102,9 +100,7 @@ impl MarkdownRenderer {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            Tag::Paragraph
-                if !self.lines.is_empty() || !self.current_line.is_empty() =>
-            {
+            Tag::Paragraph if !self.lines.is_empty() || !self.current_line.is_empty() => {
                 self.flush_line();
             }
             Tag::CodeBlock(kind) => {
@@ -222,9 +218,7 @@ impl MarkdownRenderer {
             for line in text.split('\n') {
                 self.lines.push(Line::from(Span::styled(
                     format!("  │ {}", line),
-                    Style::default()
-                        .fg(Color::Green)
-                        .bg(Color::Rgb(30, 30, 30)),
+                    Style::default().fg(Color::Green).bg(Color::Rgb(30, 30, 30)),
                 )));
             }
             // Remove trailing empty line from split
@@ -233,16 +227,15 @@ impl MarkdownRenderer {
             }
         } else {
             let style = self.current_style();
-            self.current_line.push(Span::styled(text.to_string(), style));
+            self.current_line
+                .push(Span::styled(text.to_string(), style));
         }
     }
 
     fn current_style(&self) -> Style {
         let mut style = Style::default();
         if self.heading_level > 0 {
-            style = style
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD);
+            style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
         }
         if self.bold {
             style = style.add_modifier(Modifier::BOLD);
@@ -262,10 +255,7 @@ impl MarkdownRenderer {
             if self.blockquote_depth > 0 {
                 // 块引用：添加前缀，内容保留原有样式（代码、链接等）并叠加斜体
                 let prefix = "│ ".repeat(self.blockquote_depth);
-                let mut prefixed = vec![Span::styled(
-                    prefix,
-                    Style::default().fg(Color::DarkGray),
-                )];
+                let mut prefixed = vec![Span::styled(prefix, Style::default().fg(Color::DarkGray))];
                 for span in spans {
                     let style = span
                         .style
@@ -296,7 +286,9 @@ mod tests {
 
     /// Helper: check if any span contains the given substring
     fn contains_text(text: &Text<'_>, needle: &str) -> bool {
-        text.lines.iter().any(|l| l.spans.iter().any(|s| s.content.contains(needle)))
+        text.lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains(needle)))
     }
 
     #[test]

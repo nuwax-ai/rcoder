@@ -8,7 +8,9 @@ use async_trait::async_trait;
 #[cfg(feature = "kubernetes")]
 use chrono::Utc;
 #[cfg(feature = "kubernetes")]
-use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus, RuntimeContainerInfo};
+use container_runtime_api::{
+    ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus, RuntimeContainerInfo,
+};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::Pod;
 #[cfg(feature = "kubernetes")]
@@ -79,8 +81,9 @@ impl K8sPodOps for KubernetesRuntime {
         project_id: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
-        let prefix =
-            KubernetesRuntime::sanitize_k8s_name_part(&self.service_container_prefix(service_type)?);
+        let prefix = KubernetesRuntime::sanitize_k8s_name_part(
+            &self.service_container_prefix(service_type)?,
+        );
         let sanitized_id = project_id.replace('_', "-");
         Ok(format!("{}-{}", prefix, sanitized_id))
     }
@@ -262,10 +265,7 @@ impl K8sPodOps for KubernetesRuntime {
                 }
                 Err(e) => {
                     // 409 Conflict 等情况：Pod 正在被修改，下次轮询重试
-                    debug!(
-                        "[K8S] Poll pod {} returned {} (will retry)",
-                        pod_name, e
-                    );
+                    debug!("[K8S] Poll pod {} returned {} (will retry)", pod_name, e);
                 }
             }
             tokio::time::sleep(poll_interval).await;

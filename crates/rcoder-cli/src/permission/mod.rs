@@ -43,7 +43,13 @@ impl TerminalPermissionPrompt {
     /// 输出带颜色或纯文本的权限框行
     fn print_border(&self, text: &str) {
         if self.color {
-            eprintln!("{}{}{}{}", colors::YELLOW, colors::BOLD, text, colors::RESET);
+            eprintln!(
+                "{}{}{}{}",
+                colors::YELLOW,
+                colors::BOLD,
+                text,
+                colors::RESET
+            );
         } else {
             eprintln!("{}", text);
         }
@@ -52,10 +58,7 @@ impl TerminalPermissionPrompt {
     /// 输出带黄色竖线前缀的行
     fn print_line(&self, content: &str) {
         if self.color {
-            eprintln!(
-                "{}│{} {}",
-                colors::YELLOW, colors::RESET, content
-            );
+            eprintln!("{}│{} {}", colors::YELLOW, colors::RESET, content);
         } else {
             eprintln!("│ {}", content);
         }
@@ -66,7 +69,13 @@ impl TerminalPermissionPrompt {
         if self.color {
             eprintln!(
                 "{}│{} {}{}{}{}{}",
-                colors::YELLOW, colors::RESET, prefix, colors::BOLD, bold_part, colors::RESET, suffix
+                colors::YELLOW,
+                colors::RESET,
+                prefix,
+                colors::BOLD,
+                bold_part,
+                colors::RESET,
+                suffix
             );
         } else {
             eprintln!("│ {}{}{}", prefix, bold_part, suffix);
@@ -96,11 +105,7 @@ impl PermissionPrompt for TerminalPermissionPrompt {
 
         eprintln!();
         self.print_border("┌─ Permission Request ─────────────────────────────┐");
-        self.print_line_with_bold(
-            "Agent requests permission for: ",
-            tool_name,
-            "",
-        );
+        self.print_line_with_bold("Agent requests permission for: ", tool_name, "");
         self.print_line("");
 
         for (i, opt) in request.options.iter().enumerate() {
@@ -145,22 +150,20 @@ impl PermissionPrompt for TerminalPermissionPrompt {
         match input.to_lowercase().as_str() {
             "q" | "quit" | "cancel" | "n" => Ok(None),
             "" => Ok(None),
-            _ => {
-                match input.parse::<usize>() {
-                    Ok(n) if n >= 1 && n <= request.options.len() => {
-                        let option_id = request.options[n - 1].option_id.0.to_string();
-                        Ok(Some(option_id))
-                    }
-                    _ => {
-                        if self.color {
-                            eprintln!("{}Invalid choice: {}{}", colors::RED, input, colors::RESET);
-                        } else {
-                            eprintln!("Invalid choice: {}", input);
-                        }
-                        Ok(None)
-                    }
+            _ => match input.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= request.options.len() => {
+                    let option_id = request.options[n - 1].option_id.0.to_string();
+                    Ok(Some(option_id))
                 }
-            }
+                _ => {
+                    if self.color {
+                        eprintln!("{}Invalid choice: {}{}", colors::RED, input, colors::RESET);
+                    } else {
+                        eprintln!("Invalid choice: {}", input);
+                    }
+                    Ok(None)
+                }
+            },
         }
     }
 }

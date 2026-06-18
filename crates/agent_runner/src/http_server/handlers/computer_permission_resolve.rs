@@ -8,7 +8,9 @@ use tracing::{debug, info, warn};
 
 use crate::http_server::router::AppState;
 use crate::service::PERMISSION_MANAGER;
-use shared_types::{AppError, HttpResult, ResolvePermissionHttpRequest, ResolvePermissionResponseDto};
+use shared_types::{
+    AppError, HttpResult, ResolvePermissionHttpRequest, ResolvePermissionResponseDto,
+};
 
 /// 解析 Computer Agent 权限请求
 pub async fn handle_computer_permission_resolve(

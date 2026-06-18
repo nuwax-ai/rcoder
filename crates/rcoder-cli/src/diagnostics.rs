@@ -22,8 +22,10 @@ impl TerminalDiagnosticsListener {
 
 impl DiagnosticsListener for TerminalDiagnosticsListener {
     fn on_process_started(&self, pid: u32, command: &str) {
-        self.formatter
-            .info(&format!("Agent 进程已启动: pid={}, command={}", pid, command));
+        self.formatter.info(&format!(
+            "Agent 进程已启动: pid={}, command={}",
+            pid, command
+        ));
     }
 
     fn on_acp_initialized(&self, session_id: &str) {
@@ -44,8 +46,10 @@ impl DiagnosticsListener for TerminalDiagnosticsListener {
     }
 
     fn on_process_error(&self, diagnostics: &ProcessDiagnostics) {
-        self.formatter
-            .error(&format!("Agent 进程错误: {}", diagnostics.error_message.as_deref().unwrap_or("unknown")));
+        self.formatter.error(&format!(
+            "Agent 进程错误: {}",
+            diagnostics.error_message.as_deref().unwrap_or("unknown")
+        ));
         eprintln!("{}", diagnostics.format_terminal());
     }
 }

@@ -412,7 +412,7 @@ pub(crate) async fn handle_computer_chat_internal(
         container_info
     };
 
-    info!(
+    debug!(
         "✅ [COMPUTER_CHAT] Container ready: user_id={}, container_id={}, ip={}",
         user_id, container_info.container_id, container_info.container_ip
     );
@@ -590,7 +590,7 @@ pub(crate) async fn handle_computer_chat_internal(
                 match client.get_status(grpc_request).await {
                     Ok(resp) => {
                         let status = resp.into_inner().status;
-                        info!(
+                        debug!(
                             "📊 [COMPUTER_CHAT] Agent current status: project_id={}, status={}",
                             project_id, status
                         );
@@ -914,7 +914,9 @@ async fn forward_computer_request_to_container(
             request.data_source_attachments.clone(),
             request.model_provider.clone(),
             request.request_id.clone(),
-            Some(std::time::Duration::from_secs(300)), // 5 分钟超时，避免永久阻塞
+            Some(std::time::Duration::from_secs(
+                shared_types::GRPC_CHAT_TIMEOUT_SECS,
+            )),
             request.system_prompt.clone(),
             request.user_prompt.clone(),
             request.agent_config.clone(),
@@ -961,7 +963,7 @@ async fn forward_computer_request_to_container(
                     info!(
                         "🔄 [COMPUTER_FORWARD] Detected retryable error, re-resolving container IP and retrying..."
                     );
-                    grpc_pool.remove(&grpc_addr);
+                    grpc_pool.remove(&grpc_addr).await;
 
                     // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
                     match get_realtime_container_ip(
@@ -992,7 +994,10 @@ async fn forward_computer_request_to_container(
                     last_error = Some(anyhow::Error::from(grpc_err));
                     continue;
                 } else if !should_retry {
-                    error!("[COMPUTER_FORWARD] Non-retryable error, stopped retry: {}", grpc_err);
+                    error!(
+                        "[COMPUTER_FORWARD] Non-retryable error, stopped retry: {}",
+                        grpc_err
+                    );
                     last_error = Some(anyhow::Error::from(grpc_err));
                     break;
                 }
@@ -1059,7 +1064,7 @@ async fn ensure_project_workspace_exists(
             AppError::internal_server_error(&format!("Failed to create project workspace: {}", e))
         })?;
 
-    info!(
+    debug!(
         "✅ [COMPUTER_CHAT] Project workspace directory created: user_id={}, work_dir_id={}, isolation_type={:?}, path={:?}",
         user_id, work_dir_id, isolation_type, project_workspace_path
     );

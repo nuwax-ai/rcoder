@@ -145,11 +145,9 @@ impl<P: PermissionPrompt> PermissionRequestHandler for InteractivePermissionHand
         responder: Responder<RequestPermissionResponse>,
     ) -> Result<(), agent_client_protocol::Error> {
         match self.prompt.prompt_user(&context, &request).await {
-            Ok(Some(option_id)) => {
-                responder.respond(RequestPermissionResponse::new(
-                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
-                ))
-            }
+            Ok(Some(option_id)) => responder.respond(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
+            )),
             Ok(None) => {
                 // User cancelled
                 responder.respond(RequestPermissionResponse::new(
@@ -157,10 +155,7 @@ impl<P: PermissionPrompt> PermissionRequestHandler for InteractivePermissionHand
                 ))
             }
             Err(e) => {
-                tracing::error!(
-                    "[InteractivePermissionHandler] prompt_user failed: {:?}",
-                    e
-                );
+                tracing::error!("[InteractivePermissionHandler] prompt_user failed: {:?}", e);
                 // On error, cancel the permission request
                 responder.respond(RequestPermissionResponse::new(
                     RequestPermissionOutcome::Cancelled,

@@ -86,19 +86,23 @@ async fn forward_permission_resolution(
         grpc_addr, input.session_id, input.tool_call_id
     );
 
-    let response =
-        match crate::grpc::grpc_resolve_permission_with_pool(&state.grpc_pool, &grpc_addr, input, None)
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                error!("[PERMISSION] gRPC ResolvePermission failed: {}", err);
-                return Ok(Json(HttpResult::error_with_locale(
-                    shared_types::error_codes::ERR_GRPC_ERROR,
-                    locale,
-                )));
-            }
-        };
+    let response = match crate::grpc::grpc_resolve_permission_with_pool(
+        &state.grpc_pool,
+        &grpc_addr,
+        input,
+        None,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            error!("[PERMISSION] gRPC ResolvePermission failed: {}", err);
+            return Ok(Json(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_GRPC_ERROR,
+                locale,
+            )));
+        }
+    };
 
     let dto = ResolvePermissionResponseDto {
         success: response.success,

@@ -92,7 +92,8 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<u
         } else {
             debug!(
                 "[agent_mgmt] Skipping unsupported tar entry type: {:?} ({})",
-                entry_type, entry_path.display()
+                entry_type,
+                entry_path.display()
             );
         }
     }
@@ -323,10 +324,7 @@ fn read_bin_start_from_json(path: &Path) -> Option<(String, Vec<String>)> {
     let content = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
 
-    let bin_start = value
-        .get("bin")?
-        .get("start")?
-        .as_str()?;
+    let bin_start = value.get("bin")?.get("start")?.as_str()?;
 
     let parts: Vec<&str> = bin_start.split_whitespace().collect();
     if parts.is_empty() {
@@ -415,9 +413,7 @@ fn ensure_within(dest_path: &Path, base: &Path) -> AgentMgmtResult<()> {
     // 在 macOS / Linux 上 canonicalize 会解析符号链接,且需要文件存在。
     // 这里 dest_path 的父目录可能尚未创建(dest_dir 一定存在),
     // 所以我们用 cleaned() 进行路径规范化,然后对 dest_path 的父目录做 canonicalize。
-    let base_canon = base
-        .canonicalize()
-        .unwrap_or_else(|_| base.to_path_buf());
+    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
 
     let parent = dest_path.parent().unwrap_or(dest_path);
     let canon_parent = parent
@@ -473,7 +469,8 @@ mod tests {
             header.set_size(data.len() as u64);
             header.set_mode(0o755);
             header.set_cksum();
-            tar.append_data(&mut header, "bin/hello", &data[..]).unwrap();
+            tar.append_data(&mut header, "bin/hello", &data[..])
+                .unwrap();
 
             let mut header2 = tar::Header::new_gnu();
             let data2 = b"hello world";

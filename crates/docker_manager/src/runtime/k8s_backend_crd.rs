@@ -5,6 +5,10 @@
 //! 使用 kube-rs DynamicObject 操作自定义资源，避免编译时依赖 CRD 定义。
 
 #[cfg(feature = "kubernetes")]
+use super::k8s_service::K8sServiceOps;
+#[cfg(feature = "kubernetes")]
+use super::kubernetes_runtime::KubernetesRuntime;
+#[cfg(feature = "kubernetes")]
 use async_trait::async_trait;
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
@@ -18,10 +22,6 @@ use shared_types::{HTTP_DEFAULT_PORT, ServiceType};
 use std::collections::BTreeMap;
 #[cfg(feature = "kubernetes")]
 use tracing::{debug, info, warn};
-#[cfg(feature = "kubernetes")]
-use super::k8s_service::K8sServiceOps;
-#[cfg(feature = "kubernetes")]
-use super::kubernetes_runtime::KubernetesRuntime;
 
 /// Backend CRD 的 ApiResource 定义
 #[cfg(feature = "kubernetes")]

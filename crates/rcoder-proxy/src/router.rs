@@ -313,7 +313,10 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
         .insert("/api/{service_name}", RouteType::ApiProxy)
         .map_err(|e| {
             tracing::error!("[ROUTER] API proxy fallback route config failed: {}", e);
-            crate::ProxyError::RouteConfig(format!("API proxy fallback route configuration error: {}", e))
+            crate::ProxyError::RouteConfig(format!(
+                "API proxy fallback route configuration error: {}",
+                e
+            ))
         })?;
 
     // ========================================================================
@@ -404,7 +407,10 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
         )
         .map_err(|e| {
             tracing::error!("[ROUTER] ttyd fallback route config failed: {}", e);
-            crate::ProxyError::RouteConfig(format!("ttyd fallback route configuration error: {}", e))
+            crate::ProxyError::RouteConfig(format!(
+                "ttyd fallback route configuration error: {}",
+                e
+            ))
         })?;
 
     // ========================================================================
@@ -434,13 +440,13 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
     // Fallback: 匹配 /web/ttyd/{user_id}/{project_id}（无额外路径段）
     // matchit 的 {*path} 通配符需要至少一个字符，尾斜杠路径不匹配
     router
-        .insert(
-            "/web/ttyd/{user_id}/{project_id}",
-            RouteType::WebTtydProxy,
-        )
+        .insert("/web/ttyd/{user_id}/{project_id}", RouteType::WebTtydProxy)
         .map_err(|e| {
             tracing::error!("[ROUTER] Web ttyd fallback route config failed: {}", e);
-            crate::ProxyError::RouteConfig(format!("Web ttyd fallback route configuration error: {}", e))
+            crate::ProxyError::RouteConfig(format!(
+                "Web ttyd fallback route configuration error: {}",
+                e
+            ))
         })?;
 
     Ok(router)
@@ -800,16 +806,12 @@ mod tests {
         assert_eq!(matched.params.get("path"), Some("ws"));
 
         // index.html 路径
-        let matched = router
-            .at("/web/ttyd/user_123/proj_456/index.html")
-            .unwrap();
+        let matched = router.at("/web/ttyd/user_123/proj_456/index.html").unwrap();
         assert_eq!(*matched.value, RouteType::WebTtydProxy);
         assert_eq!(matched.params.get("path"), Some("index.html"));
 
         // 多级路径（ws/token）
-        let matched = router
-            .at("/web/ttyd/user_123/proj_456/ws/token")
-            .unwrap();
+        let matched = router.at("/web/ttyd/user_123/proj_456/ws/token").unwrap();
         assert_eq!(*matched.value, RouteType::WebTtydProxy);
         assert_eq!(matched.params.get("path"), Some("ws/token"));
     }

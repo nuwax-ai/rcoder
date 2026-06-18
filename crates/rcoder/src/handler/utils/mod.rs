@@ -10,8 +10,8 @@ mod paths;
 
 #[allow(unused_imports)]
 pub use agent_mgmt_forward::{
-    AgentMgmtForwardCtx, InstallAgentParams, check_agent, get_agent, install_agent,
-    list_agents, status_to_app_error, uninstall_agent,
+    AgentMgmtForwardCtx, InstallAgentParams, check_agent, get_agent, install_agent, list_agents,
+    status_to_app_error, uninstall_agent,
 };
 pub use grpc_addr::{
     container_identity_from_name, extract_grpc_addr, extract_grpc_addr_with_port,

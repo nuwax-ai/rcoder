@@ -52,10 +52,7 @@ impl ProcessDiagnostics {
             command_exists: false,
             startup_duration_ms: 0,
             acp_init_success: false,
-            error_message: Some(format!(
-                "Command '{}' not found in PATH",
-                command
-            )),
+            error_message: Some(format!("Command '{}' not found in PATH", command)),
         }
     }
 

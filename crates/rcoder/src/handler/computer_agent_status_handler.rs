@@ -145,7 +145,8 @@ pub async fn computer_agent_status(
     let identifier_str = identifier.as_deref().unwrap_or("");
 
     // 获取容器信息（ComputerAgentRunner 使用 user_id 或 pod_id 作为容器标识）
-    let container_info = match state.runtime()
+    let container_info = match state
+        .runtime()
         .get_container_info_by_identifier(
             identifier_str,
             &shared_types::ServiceType::ComputerAgentRunner,
@@ -285,33 +286,46 @@ pub async fn computer_agent_status(
             identifier_display, project_id
         );
 
-        // 🛡️ 自愈逻辑 (Self-Healing)
-        // 自动恢复丢失的项目记录，防止容器被孤立清理器误杀
-        let mut project_info = shared_types::ProjectAndContainerInfo::new(project_id.to_string());
-        project_info.set_user_id(request.user_id.clone());
-        project_info.set_pod_id(request.pod_id.clone());
+        // 🛡️ 自愈逻辑 (Self-Healing) - M5 修复：加二次检查避免高频状态查询触发频繁写入
+        //
+        // 历史问题：状态查询接口（GET）在 project 记录缺失时主动 insert_project，
+        // 破坏 CQRS（读路径不应写）。高频查询会持续争抢 storage 写锁。
+        //
+        // 修复策略：保留 self-healing（避免容器被孤立清理器误杀），但二次检查降低重复写：
+        //   - 二次 contains_project 检查：若其他线程刚刚写过，跳过本次写
+        //   - 即使触发写入也只写一次（insert_project 是 upsert 语义）
+        //
+        // 注意：contains_project + insert_project 之间仍有 race window（不是真 CAS），
+        // 极端并发下可能两个请求都进入 insert 分支，但 upsert 语义保证最终一致，
+        // 且 container_info 是实时查询的最新值，覆盖也不会丢失关键信息。
+        if state.contains_project(project_id) {
+            debug!(
+                "[COMPUTER_AGENT_STATUS] Self-healing skipped: project record concurrently inserted by another request: project_id={}",
+                project_id
+            );
+        } else {
+            let mut project_info =
+                shared_types::ProjectAndContainerInfo::new(project_id.to_string());
+            project_info.set_user_id(request.user_id.clone());
+            project_info.set_pod_id(request.pod_id.clone());
 
-        // 恢复容器信息
-        // 注意：这里我们使用查询到的 container_info
-        project_info.set_container(Some(container_info.clone()));
-        project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+            // 恢复容器信息
+            project_info.set_container(Some(container_info.clone()));
+            project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
 
-        // 设置状态 (根据 gRPC 返回的状态)
-        // gRPC status: "idle", "busy" -> 对应 AgentStatus
-        // 简单起见，我们先恢复记录，状态会在后续的心跳或交互中更新
+            // insert into storage（upsert 语义，安全）
+            state
+                .insert_project(project_id.to_string(), Arc::new(project_info.clone()))
+                .map_err(|e| {
+                    tracing::error!("[STORAGE] insert_project failed: {}", e);
+                    e
+                })?;
 
-        // 如果 gRPC 返回了 session_id（虽然 GetStatus 通常不返回 session_id），尝试恢复
-        // 但目前的 GetStatusResponse 没有 session_id 字段，所以只能置空或尝试从其他地方恢复
-        // 这里暂时置空，等下次聊天时会自动更新
-
-        // insert into storage
-        state.insert_project(project_id.to_string(), Arc::new(project_info.clone()))
-            .map_err(|e| { tracing::error!("[STORAGE] insert_project failed: {}", e); e })?;
-
-        info!(
-            "🔄 [COMPUTER_AGENT_STATUS] ✅ Self-healing succeeded: restored project record project_id={}, {}",
-            project_id, identifier_display
-        );
+            info!(
+                "🔄 [COMPUTER_AGENT_STATUS] ✅ Self-healing succeeded: restored project record project_id={}, {}",
+                project_id, identifier_display
+            );
+        }
 
         ComputerAgentStatusResponse {
             user_id: request.user_id.clone(),
@@ -436,7 +450,7 @@ async fn call_grpc_get_status_with_retry(
                                 e
                             );
                             // 从连接池移除失败的连接
-                            pool.remove(&grpc_addr);
+                            pool.remove(&grpc_addr).await;
                             last_error = Some(anyhow::anyhow!("gRPC call failed: {}", e));
 
                             // 指数退避: 100ms, 200ms, 400ms
@@ -462,7 +476,7 @@ async fn call_grpc_get_status_with_retry(
                     attempt, e
                 );
                 // 从连接池移除可能失效的连接
-                pool.remove(&grpc_addr);
+                pool.remove(&grpc_addr).await;
                 last_error = Some(e);
                 if attempt < max_retries {
                     // 指数退避: 100ms, 200ms, 400ms

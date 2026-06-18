@@ -16,12 +16,12 @@ mod utils;
 use std::sync::Arc;
 
 use shared_types::grpc::{
-    CancelRequest, CancelResponse, ChatRequest as GrpcChatRequest, ChatResponse as GrpcChatResponse,
-    GetContainerStatusRequest, GetContainerStatusResponse, GetStatusRequest, GetStatusResponse,
-    GetVncStatusRequest, GetVncStatusResponse, ProgressRequest,
-    ResolvePermissionRequest as GrpcResolvePermissionRequest,
-    ResolvePermissionResponse as GrpcResolvePermissionResponse,
-    StopAgentRequest, StopAgentResponse, agent_service_server::AgentService,
+    CancelRequest, CancelResponse, ChatRequest as GrpcChatRequest,
+    ChatResponse as GrpcChatResponse, GetContainerStatusRequest, GetContainerStatusResponse,
+    GetStatusRequest, GetStatusResponse, GetVncStatusRequest, GetVncStatusResponse,
+    ProgressRequest, ResolvePermissionRequest as GrpcResolvePermissionRequest,
+    ResolvePermissionResponse as GrpcResolvePermissionResponse, StopAgentRequest,
+    StopAgentResponse, agent_service_server::AgentService,
 };
 use tonic::{Request, Response, Status};
 use tracing::instrument;
@@ -48,8 +48,7 @@ impl AgentService for AgentServiceImpl {
         chat::chat(&self.app_state, request).await
     }
 
-    type SubscribeProgressStream =
-        subscribe_progress::SubscribeProgressStream;
+    type SubscribeProgressStream = subscribe_progress::SubscribeProgressStream;
 
     #[instrument(skip(self, request))]
     async fn subscribe_progress(

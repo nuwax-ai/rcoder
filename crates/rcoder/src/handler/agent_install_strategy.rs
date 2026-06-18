@@ -109,9 +109,7 @@ impl AgentInstallStrategy for ComputerAgentRunnerStrategy {
 
         let install_dir = PathBuf::from(user_workspace).join("acp-agent");
 
-        Ok(InstallContext {
-            install_dir,
-        })
+        Ok(InstallContext { install_dir })
     }
 }
 
@@ -142,17 +140,12 @@ impl AgentInstallStrategy for RcoderStrategy {
             project_id,
         )
         .map_err(|e| {
-            AppError::with_message(
-                ec::ERR_VALIDATION,
-                format!("invalid path params: {}", e),
-            )
+            AppError::with_message(ec::ERR_VALIDATION, format!("invalid path params: {}", e))
         })?;
 
         let install_dir = PathBuf::from(workspace_path).join("acp-agent");
 
-        Ok(InstallContext {
-            install_dir,
-        })
+        Ok(InstallContext { install_dir })
     }
 }
 
@@ -300,7 +293,8 @@ pub async fn ensure_agent_installed(
     if state.agent_download_manager.is_cached(agent_id, version) {
         info!(
             "📦 [CHAT] Agent already cached, skipping install: agent_id={}, version={}, elapsed={:?}",
-            agent_id, version,
+            agent_id,
+            version,
             t0.elapsed()
         );
         return Ok(());
@@ -312,17 +306,20 @@ pub async fn ensure_agent_installed(
     );
 
     // 解析安装目录
-    let project = state
-        .get_project(project_id)
-        .ok_or_else(|| AppError::with_message(
+    let project = state.get_project(project_id).ok_or_else(|| {
+        AppError::with_message(
             shared_types::error_codes::ERR_PROJECT_NOT_FOUND,
             format!("project not found: {}", project_id),
-        ))?;
+        )
+    })?;
 
     let strategy = create_strategy(service_type).ok_or_else(|| {
         AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            format!("agent installation not supported for service type: {:?}", service_type),
+            format!(
+                "agent installation not supported for service type: {:?}",
+                service_type
+            ),
         )
     })?;
 
@@ -374,7 +371,9 @@ mod tests {
         project.set_service_type(Some(ServiceType::ComputerAgentRunner));
 
         let routing = RoutingParams::default();
-        let ctx = strategy.resolve_install_context(&project, &routing).unwrap();
+        let ctx = strategy
+            .resolve_install_context(&project, &routing)
+            .unwrap();
 
         assert_eq!(
             ctx.install_dir,
@@ -390,7 +389,9 @@ mod tests {
         project.set_service_type(Some(ServiceType::ComputerAgentRunner));
 
         let routing = RoutingParams::default();
-        let ctx = strategy.resolve_install_context(&project, &routing).unwrap();
+        let ctx = strategy
+            .resolve_install_context(&project, &routing)
+            .unwrap();
 
         assert_eq!(
             ctx.install_dir,
@@ -414,7 +415,9 @@ mod tests {
         let project = ProjectAndContainerInfo::new("proj-123".to_string());
 
         let routing = RoutingParams::default();
-        let ctx = strategy.resolve_install_context(&project, &routing).unwrap();
+        let ctx = strategy
+            .resolve_install_context(&project, &routing)
+            .unwrap();
 
         assert_eq!(
             ctx.install_dir,
@@ -433,7 +436,9 @@ mod tests {
             space_id: Some("s1".to_string()),
             ..Default::default()
         };
-        let ctx = strategy.resolve_install_context(&project, &routing).unwrap();
+        let ctx = strategy
+            .resolve_install_context(&project, &routing)
+            .unwrap();
 
         assert_eq!(
             ctx.install_dir,

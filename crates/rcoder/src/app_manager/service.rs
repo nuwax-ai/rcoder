@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bollard::Docker;
-use futures::StreamExt;
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
 use bollard::query_parameters::{
     CreateContainerOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
@@ -13,6 +12,7 @@ use bollard::query_parameters::{
 use chrono::Utc;
 use dashmap::DashMap;
 use docker_manager::path::HostPathResolver;
+use futures::StreamExt;
 use moka::sync::Cache;
 use tokio::fs;
 use tracing::{error, info, instrument, warn};
@@ -38,10 +38,14 @@ fn calculate_cpu_percent(stats: &bollard::models::ContainerStatsResponse) -> f64
         None => return 0.0,
     };
 
-    let cpu_usage = cpu_stats.cpu_usage.as_ref()
+    let cpu_usage = cpu_stats
+        .cpu_usage
+        .as_ref()
         .and_then(|u| u.total_usage)
         .unwrap_or(0);
-    let precpu_usage = precpu_stats.cpu_usage.as_ref()
+    let precpu_usage = precpu_stats
+        .cpu_usage
+        .as_ref()
         .and_then(|u| u.total_usage)
         .unwrap_or(0);
 
@@ -90,20 +94,23 @@ fn container_name(app_id: &str) -> String {
 /// 生成应用目录路径（容器内）
 fn app_workspace_path(app_id: &str) -> PathBuf {
     let path = PathBuf::from(WORKSPACE_ROOT).join(app_id);
-    tracing::debug!("[app_workspace_path] WORKSPACE_ROOT={}, app_id={}, result={:?}", WORKSPACE_ROOT, app_id, path);
+    tracing::debug!(
+        "[app_workspace_path] WORKSPACE_ROOT={}, app_id={}, result={:?}",
+        WORKSPACE_ROOT,
+        app_id,
+        path
+    );
     path
 }
 
 impl AppService {
     /// 创建新的应用管理服务
     pub async fn new(config: AppManagerConfig) -> Result<Self> {
-        let docker = Docker::connect_with_local_defaults()
-            .context("连接 Docker 失败")?;
+        let docker = Docker::connect_with_local_defaults().context("连接 Docker 失败")?;
 
         // 路径解析器缓存（单例）
-        let path_resolver: Cache<String, Arc<HostPathResolver>> = Cache::builder()
-            .max_capacity(1)
-            .build();
+        let path_resolver: Cache<String, Arc<HostPathResolver>> =
+            Cache::builder().max_capacity(1).build();
 
         // 初始化路径解析器
         match HostPathResolver::new().await {
@@ -190,7 +197,10 @@ impl AppService {
 
     /// 查询应用列表
     #[instrument(skip(self, request))]
-    pub async fn query_apps(&self, request: QueryAppsRequest) -> Result<PaginatedResponse<AppInfo>> {
+    pub async fn query_apps(
+        &self,
+        request: QueryAppsRequest,
+    ) -> Result<PaginatedResponse<AppInfo>> {
         let mut items: Vec<AppInfo> = self.apps.iter().map(|r| r.value().clone()).collect();
 
         // 过滤
@@ -254,7 +264,8 @@ impl AppService {
     /// 更新应用配置
     #[instrument(skip(self, request))]
     pub async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> Result<AppInfo> {
-        let mut entry = self.apps
+        let mut entry = self
+            .apps
             .get_mut(app_id)
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
 
@@ -298,7 +309,8 @@ impl AppService {
             .await;
 
         // 删除应用信息
-        self.apps.remove(app_id)
+        self.apps
+            .remove(app_id)
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
 
         // 删除应用目录（容器内路径）
@@ -313,7 +325,8 @@ impl AppService {
     /// 启动应用
     #[instrument(skip(self))]
     pub async fn start_app(&self, app_id: &str) -> Result<AppInfo> {
-        let mut entry = self.apps
+        let mut entry = self
+            .apps
             .get_mut(app_id)
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
 
@@ -349,7 +362,8 @@ impl AppService {
     /// 停止应用
     #[instrument(skip(self))]
     pub async fn stop_app(&self, app_id: &str) -> Result<AppInfo> {
-        let mut entry = self.apps
+        let mut entry = self
+            .apps
             .get_mut(app_id)
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
 
@@ -390,7 +404,8 @@ impl AppService {
     /// 重启应用
     #[instrument(skip(self))]
     pub async fn restart_app(&self, app_id: &str) -> Result<AppInfo> {
-        let mut entry = self.apps
+        let mut entry = self
+            .apps
             .get_mut(app_id)
             .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
 
@@ -575,12 +590,8 @@ impl AppService {
 
                     // 内存使用
                     let memory_stats = stats.memory_stats.as_ref();
-                    let memory_usage = memory_stats
-                        .and_then(|m| m.usage)
-                        .unwrap_or(0);
-                    let memory_limit = memory_stats
-                        .and_then(|m| m.limit)
-                        .unwrap_or(0);
+                    let memory_usage = memory_stats.and_then(|m| m.usage).unwrap_or(0);
+                    let memory_limit = memory_stats.and_then(|m| m.limit).unwrap_or(0);
                     let memory_percent = if memory_limit > 0 {
                         (memory_usage as f64 / memory_limit as f64) * 100.0
                     } else {
@@ -601,10 +612,7 @@ impl AppService {
                             usage_percent: memory_percent,
                             limit_bytes: memory_limit,
                         },
-                        network: NetworkStats {
-                            rx_bytes,
-                            tx_bytes,
-                        },
+                        network: NetworkStats { rx_bytes, tx_bytes },
                         restart_count: 0,
                     })
                 }
@@ -637,7 +645,11 @@ impl AppService {
     /// 使用缓存的路径解析器将容器内路径转换为宿主机路径
     fn get_host_app_dir(&self, app_id: &str) -> PathBuf {
         let container_path = app_workspace_path(app_id);
-        tracing::debug!("[get_host_app_dir] app_id={}, container_path={:?}", app_id, container_path);
+        tracing::debug!(
+            "[get_host_app_dir] app_id={}, container_path={:?}",
+            app_id,
+            container_path
+        );
 
         // 从缓存获取路径解析器
         if let Some(resolver) = self.path_resolver.get("default") {
@@ -799,7 +811,12 @@ impl super::AppServiceTrait for AppService {
         self.get_app_events(app_id).await
     }
 
-    async fn upload_file(&self, app_id: &str, file_data: Vec<u8>, target: &str) -> Result<UploadResult> {
+    async fn upload_file(
+        &self,
+        app_id: &str,
+        file_data: Vec<u8>,
+        target: &str,
+    ) -> Result<UploadResult> {
         self.upload_file(app_id, file_data, target).await
     }
 

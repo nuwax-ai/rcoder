@@ -10,7 +10,9 @@ mod tests {
     use super::super::*;
     use crate::cleanup_task::strategies::CleanupStrategy;
     use chrono::{Duration as ChronoDuration, Utc};
-    use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ProjectExtendedFields, ServiceType};
+    use shared_types::{
+        ContainerBasicInfo, ProjectAndContainerInfo, ProjectExtendedFields, ServiceType,
+    };
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -338,10 +340,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(
-            proj.pod_id().is_none(),
-            "无 pod_id 的项目应该直接销毁容器"
-        );
+        assert!(proj.pod_id().is_none(), "无 pod_id 的项目应该直接销毁容器");
         assert!(
             !strategies::computer_runner::is_project_active(&proj, &config),
             "proj_solo (30分钟前活动) 应该被认为是闲置的"

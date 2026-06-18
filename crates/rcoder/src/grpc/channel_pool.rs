@@ -1,23 +1,35 @@
 //! gRPC Channel 连接池
 //!
 //! 管理到各个 agent_runner 容器的 gRPC 连接，支持 TTL 自动清理失效连接。
+//!
+//! ## M2 修复
+//!
+//! 历史实现用 `DashMap` 手写 TTL + 粗暴容量管理（接近 80% 时随机驱逐一半），
+//! DashMap iter 顺序无序导致可能驱逐活跃连接。
+//!
+//! 现改用 `moka::future::Cache`：
+//! - **真 LRU** + **TTI**（time-to-idle）淘汰，活跃连接不会被误清理
+//! - **并发安全**：内置并发哈希表，无需 entry API 手动双重检查
+//! - **容量上限 8000**：到容量自动按 LRU 淘汰最久未用的连接
 
 use anyhow::Result;
-use dashmap::DashMap;
+use moka::future::Cache;
 use shared_types::grpc::agent_mgmt_service_client::AgentMgmtServiceClient;
 use shared_types::grpc::agent_service_client::AgentServiceClient;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 /// gRPC 连接池 TTL（5分钟）
 ///
 /// 连接超过此时间未被使用则自动清理，防止内存泄漏。
-/// 注意：基于最后使用时间而非创建时间，活跃连接不会被误清理。
+/// moka 的 `time_to_idle` 实现真 LRU + TTI 语义。
 const CHANNEL_TTL_SECS: u64 = 300;
 
 /// gRPC 连接池最大容量
-const MAX_CAPACITY: usize = 10000;
+///
+/// 大量并发容器（K8s 模式下每 project 一个 Pod）时上限保护。
+const MAX_CAPACITY: usize = 8000;
 
 /// 创建配置好的 gRPC 客户端（设置消息大小限制）
 ///
@@ -36,95 +48,42 @@ fn create_mgmt_client(channel: Channel) -> AgentMgmtServiceClient<Channel> {
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
 }
 
-/// Channel 元数据（包含最后使用时间）
-#[derive(Clone)]
-struct ChannelEntry {
-    channel: Channel,
-    last_used: Instant,
-}
-
-impl ChannelEntry {
-    fn is_expired(&self) -> bool {
-        self.last_used.elapsed() > Duration::from_secs(CHANNEL_TTL_SECS)
-    }
-
-    fn touch(&mut self) {
-        self.last_used = Instant::now();
-    }
-}
-
 /// gRPC 连接池
 ///
 /// 为每个容器维护独立的 gRPC 连接，支持：
 /// - 连接复用：相同地址的请求复用同一连接
-/// - TTL 自动清理：5分钟未使用的连接自动移除，防止内存泄漏（基于最后使用时间）
-/// - 并发安全：支持高并发下的安全连接创建
+/// - LRU + TTI 淘汰：5分钟未使用或容量达上限时自动淘汰最旧连接
+/// - 并发安全：moka 内置无锁并发哈希表
 pub struct GrpcChannelPool {
-    /// 容器地址到 Channel 的映射
-    channels: DashMap<String, ChannelEntry>,
+    /// moka 异步缓存：addr → Channel
+    ///
+    /// - `max_capacity`：8000（超过后按 LRU 淘汰）
+    /// - `time_to_idle`：5 分钟未访问自动淘汰
+    channels: Cache<String, Channel>,
 }
 
 impl GrpcChannelPool {
     /// 创建新的连接池
     pub fn new() -> Self {
-        Self {
-            channels: DashMap::new(),
-        }
+        let channels = Cache::builder()
+            .max_capacity(MAX_CAPACITY as u64)
+            .time_to_idle(Duration::from_secs(CHANNEL_TTL_SECS))
+            .eviction_listener(|key, _value, cause| {
+                debug!(
+                    "🔌 [gRPC] moka evicted connection: addr={}, cause={:?}",
+                    key, cause
+                );
+            })
+            .build();
+        Self { channels }
     }
 
     /// 获取指定地址的 gRPC 客户端
     ///
-    /// 如果连接不存在则创建新连接。过期连接会被自动清理。
-    /// 🚀 优化：使用 entry API 原子化检查和插入，消除 TOCTOU 竞态窗口
+    /// 如果连接不存在则创建新连接。
     pub async fn get_client(&self, addr: &str) -> Result<AgentServiceClient<Channel>> {
         let channel = self.get_or_create_channel(addr).await?;
         Ok(create_configured_client(channel))
-    }
-
-    /// 清理过期的连接
-    ///
-    /// 每次调用时检查并清理过期连接，保持缓存高效。
-    fn cleanup_expired(&self) {
-        let _len = self.channels.len();
-
-        // 收集所有过期连接的键
-        let expired: Vec<String> = self
-            .channels
-            .iter()
-            .filter(|e| e.is_expired())
-            .map(|e| e.key().clone())
-            .collect();
-
-        // 移除过期连接
-        for key in &expired {
-            self.channels.remove(key);
-        }
-
-        if !expired.is_empty() {
-            debug!(
-                "🔌 [gRPC] cleaned up {} expired connections (cache size: {})",
-                expired.len(),
-                self.channels.len()
-            );
-        }
-
-        // 如果清理后仍然满（>= 80%），再清理一半的非过期连接
-        if self.channels.len() >= MAX_CAPACITY * 8 / 10 {
-            let to_remove: Vec<_> = self
-                .channels
-                .iter()
-                .take(MAX_CAPACITY / 2)
-                .map(|e| e.key().clone())
-                .collect();
-
-            for key in &to_remove {
-                self.channels.remove(key);
-            }
-            warn!(
-                "🔌 [gRPC] cache still full after cleanup, evicted {} entries",
-                to_remove.len()
-            );
-        }
     }
 
     /// 获取指定容器端口的 gRPC 客户端
@@ -140,89 +99,86 @@ impl GrpcChannelPool {
     }
 
     /// P0-4: 获取指定地址的 AgentMgmtServiceClient(用于 agent_mgmt 转发层)
-    ///
-    /// 复用 cache 中的 Channel(cheap clone),但 wrap 成 AgentMgmtServiceClient。
-    /// 调用方负责传 project 维度的容器地址。
-    pub async fn get_mgmt_client(
-        &self,
-        addr: &str,
-    ) -> Result<AgentMgmtServiceClient<Channel>> {
+    pub async fn get_mgmt_client(&self, addr: &str) -> Result<AgentMgmtServiceClient<Channel>> {
         let channel = self.get_or_create_channel(addr).await?;
         Ok(create_mgmt_client(channel))
     }
 
-    /// 获取或创建 Channel(公共逻辑,消除 get_client / get_mgmt_client 重复)
+    /// 获取或创建 Channel
     ///
-    /// 流程:缓存命中 → 创建新连接 → entry API 双重检查 → 写入缓存
+    /// moka 的 `try_get_with` 提供原子性"查或建"语义：
+    /// - 缓存命中：返回 cheap clone（lock-free）
+    /// - 缓存未命中：执行 `init_future`，期间并发请求会等待第一个完成（**不会重复建连**）
+    ///
+    /// **关键设计（Issue 4 修复）**：`Channel::connect()` 必须放在 `try_get_with` 的
+    /// init future **内部**，否则并发场景下多个线程会各 connect 一个 channel，
+    /// 只有一个写入缓存，其他被丢弃，浪费 TCP+HTTP/2 握手。
     async fn get_or_create_channel(&self, addr: &str) -> Result<Channel> {
-        // 快速路径:缓存命中且未过期
-        if let Some(mut entry) = self.channels.get_mut(addr)
-            && !entry.is_expired()
-        {
+        // 快速路径：moka get 是 lock-free 的
+        if let Some(channel) = self.channels.get(addr).await {
             debug!("📡 [gRPC] reuse connection: {}", addr);
-            entry.touch();
-            return Ok(entry.channel.clone());
+            return Ok(channel);
         }
 
-        // 缓存未命中或已过期,创建新连接
-        info!("🔌 [gRPC] creating connection: {}", addr);
-        let endpoint = format!("http://{}", addr);
-        let channel = Channel::from_shared(endpoint)
-            .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
-            .connect_timeout(Duration::from_secs(shared_types::GRPC_CONNECT_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(shared_types::GRPC_REQUEST_TIMEOUT_SECS))
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_while_idle(true)
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .tcp_nodelay(true)
-            .connect()
+        // 慢路径：try_get_with 原子化"查或建"
+        // 把 connect 放进 init future 内部，并发请求共享同一个 connect future
+        let addr_key = addr.to_string();
+        let channel = self
+            .channels
+            .try_get_with(addr_key, async move {
+                info!("🔌 [gRPC] creating connection: {}", addr);
+                let endpoint = format!("http://{}", addr);
+                Channel::from_shared(endpoint)
+                    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
+                    .connect_timeout(Duration::from_secs(shared_types::GRPC_CONNECT_TIMEOUT_SECS))
+                    .timeout(Duration::from_secs(shared_types::GRPC_REQUEST_TIMEOUT_SECS))
+                    .http2_keep_alive_interval(Duration::from_secs(30))
+                    .keep_alive_timeout(Duration::from_secs(10))
+                    .keep_alive_while_idle(true)
+                    .tcp_keepalive(Some(Duration::from_secs(60)))
+                    .tcp_nodelay(true)
+                    .connect()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))
+            })
             .await
-            .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
-
-        self.cleanup_expired();
-
-        // entry API 双重检查:避免并发创建重复连接
-        match self.channels.entry(addr.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                let existing = entry.get_mut();
-                if !existing.is_expired() {
-                    debug!("📡 [gRPC] concurrent creation detected, reusing: {}", addr);
-                    existing.touch();
-                    return Ok(existing.channel.clone());
-                }
-                entry.insert(ChannelEntry {
-                    channel: channel.clone(),
-                    last_used: Instant::now(),
-                });
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(ChannelEntry {
-                    channel: channel.clone(),
-                    last_used: Instant::now(),
-                });
-            }
-        }
+            .map_err(|e| {
+                warn!("🔌 [gRPC] try_get_with failed: {}", e);
+                anyhow::anyhow!("Failed to get or create channel: {}", e)
+            })?;
 
         Ok(channel)
     }
 
-    /// 移除指定地址的连接
-    pub fn remove(&self, addr: &str) {
-        if self.channels.remove(addr).is_some() {
+    /// 移除指定地址的连接（异步，等待 invalidate 完成才返回）
+    ///
+    /// 用于连接失败后的失效清理（让下次请求重建）。
+    ///
+    /// **重要**：必须 `await` 此方法，确保下一次 `get_client` 不会命中刚 remove 的坏连接。
+    /// moka 的 `invalidate` 是异步的，调用方必须在重试前等待完成。
+    ///
+    /// Bug 7 修复：原 fire-and-forget 版本会让 chat_handler 重试时拿到刚 remove 的坏连接。
+    pub async fn remove(&self, addr: &str) {
+        // moka 的 invalidate 是 async，直接 await
+        // entry_count 是 O(1) 近似值，用于日志判断
+        let had = self.channels.contains_key(addr);
+        self.channels.invalidate(addr).await;
+        if had {
             info!("🔌 [gRPC] removed connection: {}", addr);
         }
     }
 
     /// 清空所有连接
     pub fn clear(&self) {
-        self.channels.clear();
+        self.channels.invalidate_all();
         info!("🔌 [gRPC] cleared all connections");
     }
 
     /// 获取当前连接数
+    ///
+    /// 注意：moka 的 `entry_count` 是近似值（基于内部采样），用于监控足够。
     pub fn connection_count(&self) -> usize {
-        self.channels.len()
+        self.channels.entry_count() as usize
     }
 }
 
@@ -250,10 +206,10 @@ mod tests {
         assert_eq!(pool.connection_count(), 0);
     }
 
-    #[test]
-    fn test_remove_non_existent() {
+    #[tokio::test]
+    async fn test_remove_non_existent() {
         let pool = GrpcChannelPool::new();
-        pool.remove("non_existent");
+        pool.remove("non_existent").await;
         assert_eq!(pool.connection_count(), 0);
     }
 
@@ -262,5 +218,18 @@ mod tests {
         let pool = GrpcChannelPool::new();
         pool.clear();
         assert_eq!(pool.connection_count(), 0);
+    }
+
+    #[test]
+    fn test_default() {
+        let pool = GrpcChannelPool::default();
+        assert_eq!(pool.connection_count(), 0);
+    }
+
+    #[test]
+    fn test_debug_format() {
+        let pool = GrpcChannelPool::new();
+        let debug_str = format!("{:?}", pool);
+        assert!(debug_str.contains("GrpcChannelPool"));
     }
 }

@@ -35,12 +35,15 @@ pub const GRPC_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 /// gRPC Chat RPC 超时（秒）
 ///
-/// Chat RPC 是 fire-and-forget 语义：agent_runner 接受请求后立即返回 session_id，
-/// 实际进度通过 SubscribeProgress 流推送。300s 超时只会让 agent_runner 卡死时
-/// 客户端傻等 5 分钟，无法 SSE。30s 是合理的卡死检测窗口。
+/// Chat RPC 实际是"启动 + 接受"语义：agent_runner 收到请求后会先确保 agent 进程
+/// 就绪（某些 agent 如 codex-acp 启动慢，需要加载配置、初始化上下文服务等），
+/// 然后才返回 session_id。所以这个超时必须覆盖 agent 启动时间。
 ///
-/// M1 修复：从 300s 降到 30s。
-pub const GRPC_CHAT_TIMEOUT_SECS: u64 = 30;
+/// 历史值：300s（5 分钟）—— 太长，agent_runner 卡死时客户端会傻等
+/// 当前值：120s（2 分钟）—— 平衡：覆盖慢启动 agent，又能及时检测真正卡死
+///
+/// 进度推送不依赖这个超时，走 SubscribeProgress 流（长连接，独立超时）。
+pub const GRPC_CHAT_TIMEOUT_SECS: u64 = 120;
 
 /// CancelSession 请求超时（秒）
 ///

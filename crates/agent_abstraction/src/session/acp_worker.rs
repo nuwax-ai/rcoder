@@ -156,8 +156,8 @@ where
                     .unwrap_or(shared_types::AgentMode::Yolo),
             );
             start_config = start_config.with_agent_server_override(agent_server.clone());
-            start_config = start_config
-                .with_tool_approval_rules(agent_server.tool_approval_rules.clone());
+            start_config =
+                start_config.with_tool_approval_rules(agent_server.tool_approval_rules.clone());
         }
 
         // Resume 策略：直接传递 session_id，由 LoadSessionRequest 在 Agent 层面检查

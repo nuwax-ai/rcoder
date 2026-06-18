@@ -65,8 +65,9 @@ fn error_to_response(e: AgentMgmtError) -> Response {
     let code = e.error_code();
     let status = match code {
         ec::ERR_AGENT_MGMT_NOT_FOUND => StatusCode::NOT_FOUND,
-        ec::ERR_AGENT_MGMT_ALREADY_INSTALLED
-        | ec::ERR_AGENT_MGMT_INSTALL_CANCELLED => StatusCode::CONFLICT,
+        ec::ERR_AGENT_MGMT_ALREADY_INSTALLED | ec::ERR_AGENT_MGMT_INSTALL_CANCELLED => {
+            StatusCode::CONFLICT
+        }
         ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED => StatusCode::FORBIDDEN,
         ec::ERR_AGENT_MGMT_INVALID_MANIFEST
         | ec::ERR_AGENT_MGMT_INVALID_CHUNK
@@ -110,7 +111,11 @@ pub async fn list_agents(
         system_info,
         agents,
         total,
-        install_dir: state.path_manager.install_dir().to_string_lossy().to_string(),
+        install_dir: state
+            .path_manager
+            .install_dir()
+            .to_string_lossy()
+            .to_string(),
     };
     Json(HttpResult::success(resp)).into_response()
 }
@@ -138,7 +143,10 @@ pub async fn install_agent(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    let metadata_str = match headers.get("x-agent-metadata").and_then(|v| v.to_str().ok()) {
+    let metadata_str = match headers
+        .get("x-agent-metadata")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(s) => s.to_string(),
         None => {
             return error_to_response(AgentMgmtError::InvalidChunk(
@@ -156,9 +164,20 @@ pub async fn install_agent(
     };
     // agent 字段从嵌套的 "agent" 子对象提取
     let agent_obj = meta.get("agent").unwrap_or(&serde_json::Value::Null);
-    let agent_id = agent_obj.get("agent_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let command = agent_obj.get("command").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let version = agent_obj.get("version").and_then(|v| v.as_str()).map(String::from);
+    let agent_id = agent_obj
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let command = agent_obj
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let version = agent_obj
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let meta_args: Vec<String> = agent_obj
         .get("args")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -174,9 +193,18 @@ pub async fn install_agent(
         "NPM" | "npm" => InstallType::Npm,
         _ => InstallType::Binary,
     };
-    let source_url = meta.get("source_url").and_then(|v| v.as_str()).map(String::from);
-    let npm_package = meta.get("npm_package").and_then(|v| v.as_str()).map(String::from);
-    let sha256 = meta.get("sha256").and_then(|v| v.as_str()).map(String::from);
+    let source_url = meta
+        .get("source_url")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let npm_package = meta
+        .get("npm_package")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let sha256 = meta
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let result: AgentMgmtResult<shared_types_grpc::InstallAgentResponse> = match install_type {
         InstallType::Url => {
@@ -189,9 +217,9 @@ pub async fn install_agent(
                     match serde_json::from_value(platforms_val.clone()) {
                         Ok(p) => p,
                         Err(e) => {
-                            return error_to_response(AgentMgmtError::InvalidChunk(
-                                format!("invalid platforms field: {e}"),
-                            ));
+                            return error_to_response(AgentMgmtError::InvalidChunk(format!(
+                                "invalid platforms field: {e}"
+                            )));
                         }
                     };
                 if !platforms.is_empty() {
@@ -392,16 +420,21 @@ pub async fn uninstall_agent(
 ) -> Response {
     let result = async {
         let removed = uninstaller::uninstall_with_version(
-            &state.registry, &req.agent_id, req.version.as_deref(),
-        ).await?;
+            &state.registry,
+            &req.agent_id,
+            req.version.as_deref(),
+        )
+        .await?;
 
         let first = removed.first().ok_or_else(|| {
             tracing::error!(agent_id = %req.agent_id, "[agent_mgmt] uninstall returned empty list");
-            AgentMgmtError::InstallFailed("uninstall succeeded but no manifests returned".to_string())
+            AgentMgmtError::InstallFailed(
+                "uninstall succeeded but no manifests returned".to_string(),
+            )
         })?;
 
-        let removed_versions: Vec<String> = removed.iter()
-            .filter_map(|m| m.version.clone()).collect();
+        let removed_versions: Vec<String> =
+            removed.iter().filter_map(|m| m.version.clone()).collect();
 
         Ok(shared_types::UninstallAgentResponse {
             uninstalled: true,

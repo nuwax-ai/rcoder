@@ -34,7 +34,9 @@ impl GrpcError {
     /// 判断错误是否应该重试
     pub fn should_retry(&self) -> bool {
         match self {
-            GrpcError::Status(status) => categorize_grpc_error(status) == GrpcErrorCategory::Retryable,
+            GrpcError::Status(status) => {
+                categorize_grpc_error(status) == GrpcErrorCategory::Retryable
+            }
             // transport::Error 表示连接层错误，通常应该重试
             GrpcError::Transport(_) => true,
         }
@@ -52,7 +54,9 @@ impl GrpcError {
 impl std::fmt::Display for GrpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GrpcError::Status(status) => write!(f, "gRPC Status: {} ({})", status.message(), status.code()),
+            GrpcError::Status(status) => {
+                write!(f, "gRPC Status: {} ({})", status.message(), status.code())
+            }
             GrpcError::Transport(err) => write!(f, "gRPC Transport: {}", err),
         }
     }
@@ -241,8 +245,16 @@ mod tests {
         let status_err = GrpcError::Status(Status::unavailable("service down"));
         let display = format!("{}", status_err);
         // Display 格式是 "gRPC Status: {message} ({code_description})"
-        assert!(display.contains("service down"), "Display should contain message: {}", display);
-        assert!(display.contains("currently unavailable"), "Display should contain code description: {}", display);
+        assert!(
+            display.contains("service down"),
+            "Display should contain message: {}",
+            display
+        );
+        assert!(
+            display.contains("currently unavailable"),
+            "Display should contain code description: {}",
+            display
+        );
     }
 
     #[test]

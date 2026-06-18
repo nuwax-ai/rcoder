@@ -75,9 +75,9 @@ impl AppState {
 /// 组合 Computer Agent 路由和 RCoder Agent 路由
 pub fn create_router(state: Arc<AppState>) -> Router {
     use super::handlers::{
-        computer_cancel, computer_chat, computer_container_status, computer_progress,
-        computer_permission_resolve, computer_status, computer_stop, computer_vnc_status,
-        devcomputer_chat, devcomputer_handlers, pod_count, rcoder_progress,
+        computer_cancel, computer_chat, computer_container_status, computer_permission_resolve,
+        computer_progress, computer_status, computer_stop, computer_vnc_status, devcomputer_chat,
+        devcomputer_handlers, pod_count, rcoder_progress,
     };
     use shared_types::http_handlers;
 
@@ -231,8 +231,14 @@ pub fn create_agent_mgmt_router(
         .route("/agent-mgmt/agents/get", post(get_agent))
         .route("/agent-mgmt/agents/check", post(check_agent))
         .route("/agent-mgmt/agents/install", post(install_agent))
-        .route("/agent-mgmt/agents/install-from-url", post(install_from_url))
-        .route("/agent-mgmt/agents/install-from-npm", post(install_from_npm))
+        .route(
+            "/agent-mgmt/agents/install-from-url",
+            post(install_from_url),
+        )
+        .route(
+            "/agent-mgmt/agents/install-from-npm",
+            post(install_from_npm),
+        )
         .route("/agent-mgmt/agents/uninstall", post(uninstall_agent))
         .with_state(state)
 }
@@ -240,16 +246,18 @@ pub fn create_agent_mgmt_router(
 /// 创建 Swagger UI
 fn create_swagger_ui() -> SwaggerUi {
     use super::handlers::{
-        computer_cancel::__path_handle_computer_cancel, computer_chat::__path_handle_computer_chat,
+        agent_mgmt_handler::{
+            __path_check_agent, __path_get_agent, __path_install_from_npm, __path_install_from_url,
+            __path_list_agents, __path_uninstall_agent,
+        },
+        computer_cancel::__path_handle_computer_cancel,
+        computer_chat::__path_handle_computer_chat,
         computer_progress::__path_handle_computer_progress,
-        computer_status::__path_handle_computer_status, computer_stop::__path_handle_computer_stop,
+        computer_status::__path_handle_computer_status,
+        computer_stop::__path_handle_computer_stop,
         devcomputer_chat::__path_handle_devcomputer_chat,
         devcomputer_handlers::__path_devcomputer_progress,
         pod_count::__path_handle_pod_count,
-        agent_mgmt_handler::{
-            __path_list_agents, __path_get_agent, __path_check_agent,
-            __path_install_from_url, __path_install_from_npm, __path_uninstall_agent,
-        },
     };
 
     #[derive(OpenApi)]

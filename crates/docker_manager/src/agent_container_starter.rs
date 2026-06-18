@@ -3,8 +3,8 @@
 //! 从 DockerManager::start_agent_container() 提取。
 //! 职责：参数解析 → 旧容器清理 → 配置准备 → 委托 create_container → 健康检查
 
-use container_runtime_api::ContainerCreateParams;
 use chrono::Utc;
+use container_runtime_api::ContainerCreateParams;
 use shared_types::{ContainerBasicInfo, IsolationType, ServiceType};
 use std::str::FromStr;
 use tracing::{debug, info, warn};
@@ -30,12 +30,7 @@ impl<'a> AgentContainerStarter<'a> {
         Self { manager }
     }
 
-
-
-    pub async fn start(
-        &self,
-        params: ContainerCreateParams,
-    ) -> DockerResult<ContainerBasicInfo> {
+    pub async fn start(&self, params: ContainerCreateParams) -> DockerResult<ContainerBasicInfo> {
         let ContainerCreateParams {
             project_id,
             user_id,
@@ -246,9 +241,8 @@ impl<'a> AgentContainerStarter<'a> {
                     // pod_id 有值：根据 isolation_type 决定挂载级别
                     // 必须校验必填字段，遵循 Fail Fast 原则
                     let isolation = match isolation_type {
-                        Some(ref s) => IsolationType::from_str(s).map_err(|e| {
-                            DockerError::ContainerCreationError(e.to_string())
-                        })?,
+                        Some(ref s) => IsolationType::from_str(s)
+                            .map_err(|e| DockerError::ContainerCreationError(e.to_string()))?,
                         None => IsolationType::default(),
                     };
 
@@ -288,17 +282,17 @@ impl<'a> AgentContainerStarter<'a> {
                             // project 隔离需要 tenant_id、space_id 和 project_id
                             let tid = tenant_id.as_deref().ok_or_else(|| {
                                 DockerError::ContainerCreationError(
-                                    "tenant_id is required when pod_id is provided".to_string()
+                                    "tenant_id is required when pod_id is provided".to_string(),
                                 )
                             })?;
                             let sid = space_id.as_deref().ok_or_else(|| {
                                 DockerError::ContainerCreationError(
-                                    "space_id is required when pod_id is provided".to_string()
+                                    "space_id is required when pod_id is provided".to_string(),
                                 )
                             })?;
                             let proj = project_id.as_deref().ok_or_else(|| {
                                 DockerError::ContainerCreationError(
-                                    "project_id is required when pod_id is provided".to_string()
+                                    "project_id is required when pod_id is provided".to_string(),
                                 )
                             })?;
                             let sub = format!("{}/{}/{}", tid, sid, proj);
@@ -339,7 +333,8 @@ impl<'a> AgentContainerStarter<'a> {
                 // workspace_resolution 是容器内路径（如 /app/computer-project-workspace）
                 // host_sub 是子目录（如 tenant_abc）
                 // 拼接后在容器内创建目录，通过 docker-compose volume 自动同步到宿主机
-                let host_dir_to_create = std::path::PathBuf::from(&workspace_resolution).join(&host_sub);
+                let host_dir_to_create =
+                    std::path::PathBuf::from(&workspace_resolution).join(&host_sub);
                 if let Err(e) = std::fs::create_dir_all(&host_dir_to_create) {
                     warn!(
                         "[DOCKER_MGR] Failed to create workspace directory {}: {}",
@@ -589,7 +584,8 @@ impl<'a> AgentContainerStarter<'a> {
                 "📝 [DOCKER_MGR] Updating container metadata: container_id={}, user_id={:?}, service_type={:?}",
                 container_id, info.user_id, info.service_type
             );
-            self.manager.containers
+            self.manager
+                .containers
                 .insert(container_id.to_string(), info.clone())
                 .await;
 
@@ -606,11 +602,15 @@ impl<'a> AgentContainerStarter<'a> {
         // 5. 等待就绪并返回信息
         // 优先使用 pod_id 查找（复用场景），否则使用 container_id (project_id)
         let lookup_key = pod_id.as_deref().unwrap_or(&container_id);
-        let info = self.manager.get_agent_info(lookup_key).await?.ok_or_else(|| {
-            DockerError::ContainerStartError(
-                "unable to get info after container started".to_string(),
-            )
-        })?;
+        let info = self
+            .manager
+            .get_agent_info(lookup_key)
+            .await?
+            .ok_or_else(|| {
+                DockerError::ContainerStartError(
+                    "unable to get info after container started".to_string(),
+                )
+            })?;
 
         // 健康检查 - 如果失败则回滚容器
         match crate::health::wait_for_service_ready(&info.service_url).await {
@@ -641,10 +641,7 @@ impl<'a> AgentContainerStarter<'a> {
                 // 清理 pod_id 缓存条目（stop_container 只清理 container_id 对应的 key）
                 if let Some(ref pid) = pod_id {
                     self.manager.containers.remove(pid).await;
-                    debug!(
-                        "[DOCKER_MGR] Cleaned up pod_id cache entry: pod_id={}",
-                        pid
-                    );
+                    debug!("[DOCKER_MGR] Cleaned up pod_id cache entry: pod_id={}", pid);
                 }
 
                 // 返回原始健康检查错误
@@ -655,5 +652,4 @@ impl<'a> AgentContainerStarter<'a> {
             }
         }
     }
-
 }

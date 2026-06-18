@@ -53,7 +53,11 @@ pub async fn install_from_npm(
     // 1. 调用 npm install -g
     let output = tokio::time::timeout(
         Duration::from_secs(NPM_INSTALL_TIMEOUT_SECS),
-        Command::new("npm").arg("install").arg("-g").arg(package).output(),
+        Command::new("npm")
+            .arg("install")
+            .arg("-g")
+            .arg(package)
+            .output(),
     )
     .await
     .map_err(|_| AgentMgmtError::CommandTimeout(format!("npm install -g {package}")))?
@@ -95,9 +99,7 @@ pub async fn install_from_npm(
 
     // 3. 定位入口二进制(.bin/command 是 npm 标准的入口目录)
     let entrypoint = find_npm_entrypoint(&npm_root_path, package, command)?;
-    let entrypoint_canon = entrypoint
-        .canonicalize()
-        .map_err(AgentMgmtError::Io)?;
+    let entrypoint_canon = entrypoint.canonicalize().map_err(AgentMgmtError::Io)?;
 
     // 4. 在 bin_dir 中创建 symlink
     let link_path = path_manager.bin_dir().join(command);

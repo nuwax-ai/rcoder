@@ -658,6 +658,7 @@ async fn build_sse_stream_from_container_name(
     agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
     rcoder_prefix: &str,
     computer_prefix: &str,
+    activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
     // Get latest container IP from Docker API in real-time
     // 使用 container_name（如 computer-agent-runner-user_123）查询
@@ -716,6 +717,7 @@ async fn build_sse_stream_from_container_name(
         project_id,
         grpc_pool.clone(),
         locale,
+        activity_updater,
     )
     .await;
 
@@ -917,6 +919,13 @@ pub async fn agent_session_notification(
     let (project_id, container_name) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
+    // 构造活跃时间更新闭包（捕获 state 引用）
+    // Bug 5 修复：SSE 流收到非心跳事件时节流调用此闭包
+    let activity_updater: Arc<dyn Fn(&str) + Send + Sync> = {
+        let state = state.clone();
+        Arc::new(move |sid: &str| state.update_session_activity(sid))
+    };
+
     // 使用通用函数创建 SSE 响应流
     build_sse_stream_from_container_name(
         state.runtime(),
@@ -928,6 +937,7 @@ pub async fn agent_session_notification(
         "Agent",
         &state.container_prefix_rcoder,
         &state.container_prefix_computer,
+        activity_updater,
     )
     .await
 }
@@ -1025,6 +1035,13 @@ pub async fn computer_agent_progress_notification(
     let (project_id, container_name) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
+    // 构造活跃时间更新闭包（捕获 state 引用）
+    // Bug 5 修复：SSE 流收到非心跳事件时节流调用此闭包
+    let activity_updater: Arc<dyn Fn(&str) + Send + Sync> = {
+        let state = state.clone();
+        Arc::new(move |sid: &str| state.update_session_activity(sid))
+    };
+
     // 使用通用函数创建 SSE 响应流
     build_sse_stream_from_container_name(
         state.runtime(),
@@ -1036,6 +1053,7 @@ pub async fn computer_agent_progress_notification(
         "Computer Agent",
         &state.container_prefix_rcoder,
         &state.container_prefix_computer,
+        activity_updater,
     )
     .await
 }

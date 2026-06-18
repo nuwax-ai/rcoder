@@ -87,7 +87,12 @@ impl Composer {
             self.lines[self.cursor_row].push_str(paste_lines[0]);
 
             // 中间行作为新行插入
-            for (i, line) in paste_lines.iter().enumerate().skip(1).take(paste_lines.len() - 2) {
+            for (i, line) in paste_lines
+                .iter()
+                .enumerate()
+                .skip(1)
+                .take(paste_lines.len() - 2)
+            {
                 self.lines.insert(self.cursor_row + i, (*line).to_string());
             }
 
@@ -313,8 +318,8 @@ mod tests {
         c.insert_newline();
         c.insert_str("world");
         c.move_home(); // row=1, col=0
-        c.move_up();   // row=0, col=min(0, 5)=0
-        c.move_end();  // row=0, col=5 (end of "hello")
+        c.move_up(); // row=0, col=min(0, 5)=0
+        c.move_end(); // row=0, col=5 (end of "hello")
 
         c.delete(); // merge line 1 into line 0
         assert_eq!(c.lines, vec!["helloworld"]);

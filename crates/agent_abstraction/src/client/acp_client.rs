@@ -7,9 +7,9 @@ use anyhow::Result;
 use shared_types::{AgentLifecycle, ProjectAndAgentInfo, SessionEntry};
 
 use crate::session::AcpSessionManager;
+use crate::traits::PromptMessage;
 use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::session_registry::SessionRegistry;
-use crate::traits::PromptMessage;
 
 /// Completion signal for synchronizing prompt send/response.
 ///
@@ -112,15 +112,12 @@ where
     /// - The timeout expires before the agent finishes
     /// - The prompt send fails
     pub async fn send_prompt_and_wait(&self, prompt: impl Into<String>) -> Result<()> {
-        let signal = self
-            .completion_signal
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "send_prompt_and_wait requires a completion_signal; \
+        let signal = self.completion_signal.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "send_prompt_and_wait requires a completion_signal; \
                      configure it via AcpClientBuilder::completion_signal()"
-                )
-            })?;
+            )
+        })?;
 
         // Send the prompt
         self.send_prompt(prompt).await?;
@@ -152,9 +149,8 @@ where
         use shared_types::CancelNotificationRequestWrapper;
 
         // Build cancel notification using the constructor
-        let session_id = agent_client_protocol::schema::SessionId::new(Arc::from(
-            self.session_id.as_str(),
-        ));
+        let session_id =
+            agent_client_protocol::schema::SessionId::new(Arc::from(self.session_id.as_str()));
         let cancel_notification = CancelNotification::new(session_id);
 
         // Get the cancel_tx from the session

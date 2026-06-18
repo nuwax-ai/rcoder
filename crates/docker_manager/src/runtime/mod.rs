@@ -8,13 +8,13 @@ pub mod kubernetes_runtime;
 pub mod manager;
 
 #[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_backend_crd;
+#[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_pod;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_pvc;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_service;
-#[cfg(feature = "kubernetes")]
-pub(crate) mod k8s_backend_crd;
 
 pub use docker_runtime::DockerRuntime;
 #[cfg(feature = "kubernetes")]

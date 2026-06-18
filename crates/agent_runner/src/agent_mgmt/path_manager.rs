@@ -161,14 +161,16 @@ pub fn validate_command(command: &str) -> Result<(), String> {
 
 fn dirs_home() -> PathBuf {
     if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty() {
-            return PathBuf::from(home);
-        }
+        && !home.is_empty()
+    {
+        return PathBuf::from(home);
+    }
     // Windows fallback
     if let Ok(profile) = std::env::var("USERPROFILE")
-        && !profile.is_empty() {
-            return PathBuf::from(profile);
-        }
+        && !profile.is_empty()
+    {
+        return PathBuf::from(profile);
+    }
     PathBuf::from(DEFAULT_ACP_AGENT_INSTALL_DIR)
         .parent()
         .map(|p| p.to_path_buf())

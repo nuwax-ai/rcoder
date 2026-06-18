@@ -52,10 +52,7 @@ impl DockerUtils {
     ///
     /// # 错误
     /// 当 `project_id` 包含非法字符时返回错误（防止容器名注入）
-    pub fn generate_container_name(
-        prefix: &str,
-        project_id: &str,
-    ) -> Result<String, String> {
+    pub fn generate_container_name(prefix: &str, project_id: &str) -> Result<String, String> {
         // 验证 project_id 格式：仅允许字母、数字、下划线、连字符，长度 1-64
         if project_id.is_empty() || project_id.len() > 64 {
             return Err(format!(

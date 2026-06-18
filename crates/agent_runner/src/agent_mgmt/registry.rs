@@ -52,9 +52,7 @@ impl AgentRegistry {
     ///
     /// 通过检查每个非 builtin 条目的 binary_path 是否存在来判断是否残留。
     /// 返回被移除的条目数量。
-    fn heal_orphaned_entries(
-        map: &mut HashMap<String, HashMap<String, AgentManifest>>,
-    ) -> usize {
+    fn heal_orphaned_entries(map: &mut HashMap<String, HashMap<String, AgentManifest>>) -> usize {
         let mut removed_count = 0;
         for versions in map.values_mut() {
             versions.retain(|_vkey, manifest| {
@@ -114,7 +112,12 @@ impl AgentRegistry {
                 versions
                     .values()
                     .filter(|m| m.install_type != InstallType::Builtin)
-                    .max_by(|a, b| version_util::compare_versions(a.version.as_deref().unwrap_or("0.0.0"), b.version.as_deref().unwrap_or("0.0.0")))
+                    .max_by(|a, b| {
+                        version_util::compare_versions(
+                            a.version.as_deref().unwrap_or("0.0.0"),
+                            b.version.as_deref().unwrap_or("0.0.0"),
+                        )
+                    })
                     .cloned()
             })
             .collect()
@@ -126,7 +129,12 @@ impl AgentRegistry {
         let versions = guard.get(agent_id)?;
         versions
             .values()
-            .max_by(|a, b| version_util::compare_versions(a.version.as_deref().unwrap_or("0.0.0"), b.version.as_deref().unwrap_or("0.0.0")))
+            .max_by(|a, b| {
+                version_util::compare_versions(
+                    a.version.as_deref().unwrap_or("0.0.0"),
+                    b.version.as_deref().unwrap_or("0.0.0"),
+                )
+            })
             .cloned()
     }
 
@@ -151,10 +159,7 @@ impl AgentRegistry {
     /// 是否已安装（任何版本）
     pub fn contains(&self, agent_id: &str) -> bool {
         let guard = self.inner.lock();
-        guard
-            .get(agent_id)
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
+        guard.get(agent_id).map(|v| !v.is_empty()).unwrap_or(false)
     }
 
     /// 是否已安装指定版本
@@ -257,9 +262,12 @@ impl AgentRegistry {
                 .flat_map(|versions| versions.values().cloned())
                 .collect();
             v.sort_by(|a, b| {
-                a.agent_id
-                    .cmp(&b.agent_id)
-                    .then_with(|| version_util::compare_versions(a.version.as_deref().unwrap_or("0.0.0"), b.version.as_deref().unwrap_or("0.0.0")))
+                a.agent_id.cmp(&b.agent_id).then_with(|| {
+                    version_util::compare_versions(
+                        a.version.as_deref().unwrap_or("0.0.0"),
+                        b.version.as_deref().unwrap_or("0.0.0"),
+                    )
+                })
             });
             v
         };
@@ -284,7 +292,9 @@ impl AgentRegistry {
     }
 
     /// 从磁盘读取，按 (agent_id, version) 分组
-    fn read_from_disk(path: &std::path::Path) -> AgentMgmtResult<HashMap<String, HashMap<String, AgentManifest>>> {
+    fn read_from_disk(
+        path: &std::path::Path,
+    ) -> AgentMgmtResult<HashMap<String, HashMap<String, AgentManifest>>> {
         if !path.exists() {
             return Ok(HashMap::new());
         }
@@ -319,9 +329,7 @@ impl AgentRegistry {
             let version_str = m.version.as_deref().unwrap_or("0.0.0");
             match version_util::normalize_version(version_str) {
                 Ok(vkey) => {
-                    map.entry(m.agent_id.clone())
-                        .or_default()
-                        .insert(vkey, m);
+                    map.entry(m.agent_id.clone()).or_default().insert(vkey, m);
                 }
                 Err(e) => {
                     warn!(
@@ -347,11 +355,8 @@ mod tests {
     fn temp_pm() -> PathManager {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agent-mgmt-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agent-mgmt-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         PathManager::new_with_root(dir)
     }
@@ -394,7 +399,11 @@ mod tests {
     }
 
     /// 创建测试用 manifest，binary_path 指向临时目录内的真实路径（带版本）
-    fn sample_manifest_with_version_in(id: &str, version: &str, install_dir: &std::path::Path) -> AgentManifest {
+    fn sample_manifest_with_version_in(
+        id: &str,
+        version: &str,
+        install_dir: &std::path::Path,
+    ) -> AgentManifest {
         let mut m = sample_manifest_in(id, install_dir);
         m.version = Some(version.to_string());
         m
@@ -430,7 +439,10 @@ mod tests {
         let err = r
             .insert(sample_manifest_with_version("codex-acp", "1.0.0"))
             .unwrap_err();
-        assert!(matches!(err, AgentMgmtError::VersionAlreadyInstalled { .. }));
+        assert!(matches!(
+            err,
+            AgentMgmtError::VersionAlreadyInstalled { .. }
+        ));
     }
 
     #[test]
@@ -526,8 +538,10 @@ mod tests {
     #[test]
     fn upsert_overwrites() {
         let r = AgentRegistry::empty(temp_pm());
-        r.upsert(sample_manifest_with_version("a", "1.0.0")).unwrap();
-        r.upsert(sample_manifest_with_version("a", "1.0.0")).unwrap();
+        r.upsert(sample_manifest_with_version("a", "1.0.0"))
+            .unwrap();
+        r.upsert(sample_manifest_with_version("a", "1.0.0"))
+            .unwrap();
         assert_eq!(r.total(), 1);
     }
 
@@ -553,12 +567,24 @@ mod tests {
                 std::fs::write(&path, b"fake").unwrap();
             }
         }
-        r1.insert(sample_manifest_with_version_in("alpha", "1.0.0", &install_dir))
-            .unwrap();
-        r1.insert(sample_manifest_with_version_in("alpha", "2.0.0", &install_dir))
-            .unwrap();
-        r1.insert(sample_manifest_with_version_in("beta", "1.0.0", &install_dir))
-            .unwrap();
+        r1.insert(sample_manifest_with_version_in(
+            "alpha",
+            "1.0.0",
+            &install_dir,
+        ))
+        .unwrap();
+        r1.insert(sample_manifest_with_version_in(
+            "alpha",
+            "2.0.0",
+            &install_dir,
+        ))
+        .unwrap();
+        r1.insert(sample_manifest_with_version_in(
+            "beta",
+            "1.0.0",
+            &install_dir,
+        ))
+        .unwrap();
 
         // 重新加载
         let r2 = AgentRegistry::load(pm).unwrap();

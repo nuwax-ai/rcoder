@@ -88,7 +88,10 @@ pub async fn handle_computer_stop(
 
             match cancel_tx.send(cancel_request).await {
                 Ok(_) => {
-                    info!("[HTTP] Stop cancel signal sent, waiting: session_id={}", session_id);
+                    info!(
+                        "[HTTP] Stop cancel signal sent, waiting: session_id={}",
+                        session_id
+                    );
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(STOP_TIMEOUT_SECS),
                         result_rx,
@@ -96,15 +99,24 @@ pub async fn handle_computer_stop(
                     .await
                     {
                         Ok(Ok(result)) => {
-                            info!("[HTTP] Stop cancel result: session_id={}, result={:?}", session_id, result);
+                            info!(
+                                "[HTTP] Stop cancel result: session_id={}, result={:?}",
+                                session_id, result
+                            );
                         }
                         Ok(Err(_)) | Err(_) => {
-                            warn!("[HTTP] Stop cancel result not received: session_id={}", session_id);
+                            warn!(
+                                "[HTTP] Stop cancel result not received: session_id={}",
+                                session_id
+                            );
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("[HTTP] Stop cancel send failed: session_id={}, error={}", session_id, e);
+                    warn!(
+                        "[HTTP] Stop cancel send failed: session_id={}, error={}",
+                        session_id, e
+                    );
                 }
             }
         }
@@ -119,11 +131,20 @@ pub async fn handle_computer_stop(
             (true, get_error_message(SUCCESS, locale))
         } else {
             info!("[HTTP] Agent already cleaned up: project_id={}", project_id);
-            (true, get_i18n_message("success.agent_already_stopped", locale))
+            (
+                true,
+                get_i18n_message("success.agent_already_stopped", locale),
+            )
         }
     } else {
-        info!("[HTTP] Agent not found, returning success idempotently: project_id={}", project_id);
-        (true, get_i18n_message("success.agent_already_stopped", locale))
+        info!(
+            "[HTTP] Agent not found, returning success idempotently: project_id={}",
+            project_id
+        );
+        (
+            true,
+            get_i18n_message("success.agent_already_stopped", locale),
+        )
     };
 
     let response = ComputerAgentStopResponse {

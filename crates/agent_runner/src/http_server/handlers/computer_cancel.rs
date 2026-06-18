@@ -109,7 +109,10 @@ pub async fn handle_computer_cancel(
 
             match cancel_tx.send(cancel_request).await {
                 Ok(_) => {
-                    info!("[HTTP] Cancel signal sent, waiting for result: session_id={}", session_id);
+                    info!(
+                        "[HTTP] Cancel signal sent, waiting for result: session_id={}",
+                        session_id
+                    );
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(CANCEL_TIMEOUT_SECS),
                         result_rx,
@@ -117,10 +120,16 @@ pub async fn handle_computer_cancel(
                     .await
                     {
                         Ok(Ok(result)) => {
-                            info!("[HTTP] Cancel result: session_id={}, result={:?}", session_id, result);
+                            info!(
+                                "[HTTP] Cancel result: session_id={}, result={:?}",
+                                session_id, result
+                            );
                         }
                         Ok(Err(_)) => {
-                            warn!("[HTTP] Cancel result channel dropped: session_id={}", session_id);
+                            warn!(
+                                "[HTTP] Cancel result channel dropped: session_id={}",
+                                session_id
+                            );
                         }
                         Err(_) => {
                             warn!(

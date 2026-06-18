@@ -93,7 +93,11 @@ impl ProjectAdapter {
     ///
     /// # Errors
     /// 如果 `service_type` 未设置，返回错误（Fail Fast）。
-    pub fn insert(&self, project_id: String, info: Arc<ProjectAndContainerInfo>) -> anyhow::Result<()> {
+    pub fn insert(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+    ) -> anyhow::Result<()> {
         let container_key = info.container_key().to_string();
 
         // 读取旧 container_key（view: 读后立即释放锁）
@@ -115,15 +119,14 @@ impl ProjectAdapter {
         }
 
         // 新容器引用 +1（仅容器变更或新 project 时）— entry API 原子操作
-        if container_changed
-            && let Some(container) = info.container()
-        {
+        if container_changed && let Some(container) = info.container() {
             let st = match info.service_type() {
                 Some(st) => st,
                 None => {
                     tracing::error!(
                         "[STORAGE] service_type is None, cannot insert project: project_id={}, container_key={}",
-                        project_id, container_key
+                        project_id,
+                        container_key
                     );
                     return Err(anyhow::anyhow!(
                         "service_type is required for project insert: project_id={}",
@@ -240,9 +243,7 @@ impl ProjectAdapter {
     /// 读时清理孤儿条目：如果 session_index 指向的 project 不存在，自动清理。
     /// 同时验证 session 是否仍在 project 的 sessions 集合中，防止已清除的 session 被误访问。
     pub fn get_by_session_id(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
-        let pid = self
-            .session_index
-            .view(session_id, |_, v| v.1.clone())?;
+        let pid = self.session_index.view(session_id, |_, v| v.1.clone())?;
 
         match self.projects.view(&pid, |_, v| v.clone()) {
             Some(info) => {
@@ -274,32 +275,48 @@ impl ProjectAdapter {
     /// 向已有 project 追加 session（C1 修复推荐路径）
     ///
     /// 用于 chat 响应后只追加 session、不重建整个 ProjectAndContainerInfo 的场景。
-    /// 多步操作，使用 DashMap entry API 保证 sessions 集合更新的原子性。
     /// 多 session 并存语义：一个 project 可以有多个并发活跃 session。
+    ///
+    /// **非原子说明**：本方法跨 3 个 DashMap（projects + session_index + project_to_container），
+    /// 不是单步原子。设计上：
+    /// - project 不存在时**完全不写** session_index（避免孤儿条目）
+    /// - project 存在时先 entry 写 projects.sessions，再写 session_index
+    /// - 并发 remove(project) 的竞态由 `get_by_session_id` 读时清理兜底
     ///
     /// 返回 false 表示 project 不存在（调用方需要走 insert_with_session 完整路径）。
     pub fn add_session_to_project(&self, project_id: &str, session_id: &str) -> bool {
-        // 维护 session_index（追加，不清旧）
-        let ck = self
-            .project_to_container
-            .view(project_id, |_, v| v.clone())
-            .unwrap_or_default();
-        self.session_index
-            .insert(session_id.to_string(), (ck, project_id.to_string()));
-
-        // entry API: 把 sid 加入 sessions 集合 + 更新 latest
+        // entry API: 先检查 project 是否存在，存在时原子地把 sid 加入 sessions 集合
         let mut existed = false;
+        let mut ck_opt: Option<String> = None;
         if let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) {
             let info = Arc::make_mut(e.get_mut());
             info.add_session(session_id);
             existed = true;
+            // 顺便拿 container_key，避免后续再锁一次 project_to_container
+            ck_opt = Some(info.container_key().to_string());
         }
 
-        // 同步更新容器活跃时间
-        if let Some(ck) = self.project_to_container.view(project_id, |_, v| v.clone()) {
+        if !existed {
+            // project 不存在：不写 session_index，避免孤儿条目（修复 Bug 1）
+            return false;
+        }
+
+        // 维护 session_index（只在 project 存在时写）
+        // 兜底：若 info.container_key() 返回空（边界场景），从 project_to_container 取
+        let ck = ck_opt.unwrap_or_else(|| {
+            self.project_to_container
+                .view(project_id, |_, v| v.clone())
+                .unwrap_or_default()
+        });
+        self.session_index
+            .insert(session_id.to_string(), (ck.clone(), project_id.to_string()));
+
+        // 同步更新容器活跃时间（仅当 ck 非空）
+        if !ck.is_empty() {
             self.containers.view(&ck, |_, ce| ce.update_activity());
         }
-        existed
+
+        true
     }
 
     /// 插入项目并添加 session 映射（原子操作，消除 CAS 竞态）
@@ -340,7 +357,10 @@ impl ProjectAdapter {
     ///
     /// 历史问题：本方法非原子（write_session_index + entry 两步），并发调用会产生 session 互踩。
     /// 多 session 模型下，请改用 `insert_with_session` 走 add-only 路径。
-    #[deprecated(since = "0.0.0", note = "非原子且语义已变更，请用 `insert_with_session` 走多 session 路径")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "非原子且语义已变更，请用 `insert_with_session` 走多 session 路径"
+    )]
     pub fn update_session(&self, project_id: &str, session_id: &str) {
         // 走 add_session 语义，不再覆盖（兼容旧调用点 + 多 session）
         if let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) {
@@ -357,10 +377,7 @@ impl ProjectAdapter {
             .insert(session_id.to_string(), (ck, project_id.to_string()));
 
         // 更新容器活跃时间
-        if let Some(ck) = self
-            .project_to_container
-            .view(project_id, |_, v| v.clone())
-        {
+        if let Some(ck) = self.project_to_container.view(project_id, |_, v| v.clone()) {
             self.containers.view(&ck, |_, ce| ce.update_activity());
         }
     }
@@ -453,7 +470,8 @@ impl ProjectAdapter {
     /// 通过 session_id 获取容器名称（view: 两次锁获取均立即释放）
     pub fn get_container_name_by_session(&self, session_id: &str) -> Option<String> {
         let ck = self.session_index.view(session_id, |_, v| v.0.clone())?;
-        self.containers.view(&ck, |_, ce| ce.info().container_name.clone())
+        self.containers
+            .view(&ck, |_, ce| ce.info().container_name.clone())
     }
 
     // ========== 活动时间更新 ==========
@@ -544,7 +562,9 @@ impl ProjectAdapter {
         };
 
         // view() 获取 Arc（DashMap 读锁立即释放），通过 RwLock 更新字段
-        let existing = self.containers.view(&container.container_id, |_, ce| ce.clone());
+        let existing = self
+            .containers
+            .view(&container.container_id, |_, ce| ce.clone());
 
         match existing {
             Some(ce) => {
@@ -558,14 +578,20 @@ impl ProjectAdapter {
                         e.get().update(container.clone(), st);
                     }
                     Entry::Vacant(e) => {
-                        e.insert(Arc::new(ContainerEntry::with_ref_count(container.clone(), st, 0)));
+                        e.insert(Arc::new(ContainerEntry::with_ref_count(
+                            container.clone(),
+                            st,
+                            0,
+                        )));
                     }
                 }
                 // 维护反向索引：container_id → container_key
                 // 此时 container_key 可能尚未注册（insert 未调用），
                 // 先暂存 container_id 本身，insert 被调用时再更新为正确的 container_key。
-                self.container_id_to_key
-                    .insert(container.container_id.clone(), container.container_id.clone());
+                self.container_id_to_key.insert(
+                    container.container_id.clone(),
+                    container.container_id.clone(),
+                );
             }
         }
         Ok(())
@@ -574,7 +600,8 @@ impl ProjectAdapter {
     /// 获取容器信息（按 container_id 查找，O(1) 索引查找）
     pub fn get_container(&self, container_id: &str) -> Option<ContainerBasicInfo> {
         let container_key = self.container_id_to_key.get(container_id)?;
-        self.containers.view(container_key.value(), |_, ce| ce.info())
+        self.containers
+            .view(container_key.value(), |_, ce| ce.info())
     }
 
     /// 删除容器及其关联的所有项目（RAII 触发物理销毁）
@@ -582,7 +609,10 @@ impl ProjectAdapter {
     /// 返回 (容器是否存在, 删除的项目数)
     pub fn delete_container_with_projects(&self, container_id: &str) -> (bool, usize) {
         // 收集所有关联此容器的 project_id（通过索引 O(1) + O(n)）
-        let container_key = self.container_id_to_key.get(container_id).map(|r| r.value().clone());
+        let container_key = self
+            .container_id_to_key
+            .get(container_id)
+            .map(|r| r.value().clone());
         let project_ids: Vec<String> = match &container_key {
             Some(ck) => self
                 .project_to_container
@@ -648,10 +678,7 @@ impl ProjectAdapter {
 
     /// 获取所有容器信息
     pub fn get_all_container_records(&self) -> Vec<ContainerBasicInfo> {
-        self.containers
-            .iter()
-            .map(|e| e.value().info())
-            .collect()
+        self.containers.iter().map(|e| e.value().info()).collect()
     }
 
     /// 根据 container_id 获取关联的项目列表
@@ -695,10 +722,21 @@ impl ProjectAdapter {
     ///
     /// 注意：一个 user_id 可能关联多个 project，索引仅存储最新一个。
     /// 此方法保留全量遍历以确保返回完整结果。
-    pub fn find_projects_by_user_id(
-        &self,
-        user_id: &str,
-    ) -> Vec<Arc<ProjectAndContainerInfo>> {
+    ///
+    /// ## m4 文档：为何不用 HashSet 索引
+    ///
+    /// 候选优化：`user_id_to_project_id: DashMap<String, Arc<HashSet<String>>>`
+    /// 可以让本方法从 O(N) 降到 O(1)。
+    ///
+    /// 不做的理由：
+    /// 1. **生产实际场景**：ComputerAgentRunner 模式下，一个 user 通常只对应一个活跃 project
+    ///    （多 project 共存是边缘场景）。
+    /// 2. **维护成本**：多值索引的 insert/remove 需要额外同步逻辑（CQR 一致性），
+    ///    容易引入新 bug。
+    /// 3. **N 通常很小**：N 是 project 总数，即使几千个，O(N) 遍历也是微秒级。
+    ///
+    /// 如果未来 N 增长到数万或 user 多 project 成为主流，再考虑改造。
+    pub fn find_projects_by_user_id(&self, user_id: &str) -> Vec<Arc<ProjectAndContainerInfo>> {
         self.projects
             .iter()
             .filter(|e| e.value().user_id() == Some(user_id))
@@ -1068,7 +1106,11 @@ mod tests {
 
         // clear_session 清所有
         adapter.clear_session(project_id);
-        assert_eq!(adapter.session_index.len(), 0, "clear_session 应清所有 session 索引");
+        assert_eq!(
+            adapter.session_index.len(),
+            0,
+            "clear_session 应清所有 session 索引"
+        );
         let info = adapter.get(project_id).unwrap();
         assert_eq!(info.session_count(), 0);
         assert!(info.latest_session().is_none());
@@ -1079,7 +1121,11 @@ mod tests {
         assert_eq!(adapter.session_index.len(), 2);
 
         let _ = adapter.remove(project_id);
-        assert_eq!(adapter.session_index.len(), 0, "remove 应清理所有 session 索引");
+        assert_eq!(
+            adapter.session_index.len(),
+            0,
+            "remove 应清理所有 session 索引"
+        );
     }
 
     /// latest_session 在 remove latest 后自动退化到剩余 session
@@ -1268,14 +1314,10 @@ mod tests {
 
         let info = Arc::new(create_test_info_with_container("proj-A", "container-A"));
 
-        adapter
-            .insert("proj-A".to_string(), info.clone())
-            .unwrap();
+        adapter.insert("proj-A".to_string(), info.clone()).unwrap();
         assert_eq!(adapter.containers.len(), 1);
 
-        adapter
-            .insert("proj-A".to_string(), info.clone())
-            .unwrap();
+        adapter.insert("proj-A".to_string(), info.clone()).unwrap();
         assert_eq!(adapter.containers.len(), 1);
 
         adapter.remove("proj-A");
@@ -1329,7 +1371,11 @@ mod tests {
             .unwrap();
 
         let ce = adapter.containers.get("proj-1").unwrap();
-        assert_eq!(ce.value().ref_count(), 1, "save_container 更新不应改变 ref_count");
+        assert_eq!(
+            ce.value().ref_count(),
+            1,
+            "save_container 更新不应改变 ref_count"
+        );
         assert_eq!(ce.value().info().container_name, "updated-name");
         assert_eq!(ce.value().service_type(), ServiceType::ComputerAgentRunner);
     }
@@ -1520,7 +1566,11 @@ mod tests {
         }
 
         assert_eq!(adapter.len(), 0);
-        assert_eq!(adapter.containers.len(), 0, "container should be cleaned up");
+        assert_eq!(
+            adapter.containers.len(),
+            0,
+            "container should be cleaned up"
+        );
 
         let cleanups = drain_cleanup_requests(&rx);
         assert_eq!(
@@ -1595,11 +1645,7 @@ mod tests {
                 for i in 0..ITERS {
                     let info = Arc::new(create_test_info_with_container(pid, "battle-c"));
                     let sid = format!("sid-{}-{}", t, i);
-                    let _ = adapter.insert_with_session(
-                        pid.to_string(),
-                        info,
-                        Some(&sid),
-                    );
+                    let _ = adapter.insert_with_session(pid.to_string(), info, Some(&sid));
                     let _ = adapter.remove(pid);
                 }
             }));
@@ -1630,10 +1676,7 @@ mod tests {
                 barrier.wait();
                 for _ in 0..100 {
                     let result = adapter.remove("nonexistent-project");
-                    assert!(
-                        result.is_none(),
-                        "removing nonexistent should return None"
-                    );
+                    assert!(result.is_none(), "removing nonexistent should return None");
                 }
             }));
         }
@@ -1654,8 +1697,10 @@ mod tests {
 
         for i in 0..10 {
             let pid = format!("preload-{}", i);
-            let info =
-                Arc::new(create_test_info_with_container(&pid, &format!("c-pre-{}", i)));
+            let info = Arc::new(create_test_info_with_container(
+                &pid,
+                &format!("c-pre-{}", i),
+            ));
             adapter.insert(pid, info).unwrap();
         }
 
@@ -1774,7 +1819,11 @@ mod tests {
         }
 
         let cleanups = drain_cleanup_requests(&rx);
-        assert_eq!(cleanups.len(), 5, "5 rounds should produce 5 cleanup requests");
+        assert_eq!(
+            cleanups.len(),
+            5,
+            "5 rounds should produce 5 cleanup requests"
+        );
     }
 
     // ========== 索引一致性测试 ==========
@@ -1852,7 +1901,10 @@ mod tests {
 
         // 通过 user_id 查找容器
         let found = adapter.get_container_by_user_id("user-abc");
-        assert!(found.is_some(), "get_container_by_user_id 应通过索引找到容器");
+        assert!(
+            found.is_some(),
+            "get_container_by_user_id 应通过索引找到容器"
+        );
         assert_eq!(found.unwrap().container_id, "cid-user-1");
 
         // 不存在的 user_id
@@ -1894,7 +1946,10 @@ mod tests {
 
         // get_container_by_pod_id
         let found = adapter.get_container_by_pod_id("pod-abc");
-        assert!(found.is_some(), "get_container_by_pod_id 应通过索引找到容器");
+        assert!(
+            found.is_some(),
+            "get_container_by_pod_id 应通过索引找到容器"
+        );
 
         // find_projects_by_pod_id
         let projects = adapter.find_projects_by_pod_id("pod-abc");
@@ -2040,19 +2095,31 @@ mod tests {
         let info1 = create_shared_project("proj-1", "user-shared", &container);
         let info2 = create_shared_project("proj-2", "user-shared", &container);
 
-        adapter.insert("proj-1".to_string(), Arc::new(info1)).unwrap();
-        adapter.insert("proj-2".to_string(), Arc::new(info2)).unwrap();
+        adapter
+            .insert("proj-1".to_string(), Arc::new(info1))
+            .unwrap();
+        adapter
+            .insert("proj-2".to_string(), Arc::new(info2))
+            .unwrap();
 
         assert_eq!(adapter.containers.len(), 1, "共享容器应只有 1 个条目");
         assert!(adapter.container_id_to_key.contains_key("cid-shared"));
 
         // 移除 proj-1：容器不销毁（ref_count > 0），索引保留
         adapter.remove("proj-1");
-        assert_eq!(adapter.containers.len(), 1, "容器应保留（还有 proj-2 引用）");
+        assert_eq!(
+            adapter.containers.len(),
+            1,
+            "容器应保留（还有 proj-2 引用）"
+        );
 
         // 移除 proj-2：容器销毁（ref_count = 0），索引清理
         adapter.remove("proj-2");
-        assert_eq!(adapter.containers.len(), 0, "容器应在最后一个 project 移除后销毁");
+        assert_eq!(
+            adapter.containers.len(),
+            0,
+            "容器应在最后一个 project 移除后销毁"
+        );
         assert!(
             !adapter.container_id_to_key.contains_key("cid-shared"),
             "container_id_to_key 索引应在 RAII 清理后被清理"
@@ -2185,7 +2252,9 @@ mod tests {
         // 1. 初始状态：创建项目，添加 2 个 session
         let mut info = create_test_info_with_container(project_id, "container-v1");
         info.set_user_id(Some(user_id.to_string()));
-        adapter.insert(project_id.to_string(), Arc::new(info)).unwrap();
+        adapter
+            .insert(project_id.to_string(), Arc::new(info))
+            .unwrap();
         adapter.add_session_to_project(project_id, "session-1");
         adapter.add_session_to_project(project_id, "session-2");
 
@@ -2204,7 +2273,9 @@ mod tests {
         // 3. 插入新的 project（模拟容器重建）
         let mut new_info = create_test_info_with_container(project_id, "container-v2");
         new_info.set_user_id(Some(user_id.to_string()));
-        adapter.insert(project_id.to_string(), Arc::new(new_info)).unwrap();
+        adapter
+            .insert(project_id.to_string(), Arc::new(new_info))
+            .unwrap();
 
         // 4. 同步现有 session 到 session_index（修复逻辑）
         for sid in &existing_sessions {
@@ -2212,8 +2283,14 @@ mod tests {
         }
 
         // 5. 验证所有 session 都可查
-        assert!(adapter.get_by_session_id("session-1").is_some(), "session-1 应可查");
-        assert!(adapter.get_by_session_id("session-2").is_some(), "session-2 应可查");
+        assert!(
+            adapter.get_by_session_id("session-1").is_some(),
+            "session-1 应可查"
+        );
+        assert!(
+            adapter.get_by_session_id("session-2").is_some(),
+            "session-2 应可查"
+        );
 
         // 6. 验证 project 的 sessions 集合也正确
         let project = adapter.get(project_id).unwrap();
@@ -2221,7 +2298,10 @@ mod tests {
 
         // 7. 添加新 session（新请求）
         adapter.add_session_to_project(project_id, "session-3");
-        assert!(adapter.get_by_session_id("session-3").is_some(), "新 session-3 应可查");
+        assert!(
+            adapter.get_by_session_id("session-3").is_some(),
+            "新 session-3 应可查"
+        );
 
         let project = adapter.get(project_id).unwrap();
         assert_eq!(project.session_count(), 3, "project 应包含 3 个 session");

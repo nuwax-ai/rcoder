@@ -43,13 +43,24 @@ pub async fn install_from_url(
     crate::agent_mgmt::path_manager::validate_command(command)
         .map_err(AgentMgmtError::InvalidManifest)?;
 
-    info!("[agent_mgmt] url install: agent_id={}, url={}", agent_id, url);
+    info!(
+        "[agent_mgmt] url install: agent_id={}, url={}",
+        agent_id, url
+    );
 
     // 下载到临时文件(支持重试 + 断点续传)
-    let staging_path = path_manager.install_dir()
+    let staging_path = path_manager
+        .install_dir()
         .join(format!(".download-staging-{}", uuid::Uuid::new_v4()));
     let cancel = CancellationToken::new(); // install_from_url 不支持取消
-    download_to_file(url, &staging_path, shared_types::MAX_BINARY_SIZE, expected_sha256, &cancel).await?;
+    download_to_file(
+        url,
+        &staging_path,
+        shared_types::MAX_BINARY_SIZE,
+        expected_sha256,
+        &cancel,
+    )
+    .await?;
 
     // 文件大小（download_to_file 已校验，传递给 install_from_file）
     let file_size = std::fs::metadata(&staging_path)
@@ -107,9 +118,11 @@ pub async fn install_with_version_check(
     validate_version_format(version)?;
 
     // 0.5 获取 per-agent-version 安装锁
-    let state = lock_manager.get_or_create(agent_id, version).ok_or_else(|| {
-        AgentMgmtError::InvalidVersion(format!("invalid semver version: {}", version))
-    })?;
+    let state = lock_manager
+        .get_or_create(agent_id, version)
+        .ok_or_else(|| {
+            AgentMgmtError::InvalidVersion(format!("invalid semver version: {}", version))
+        })?;
     if force {
         // 强制模式：取消当前安装，等待锁
         state.cancel();
@@ -185,7 +198,9 @@ async fn do_install_with_version_check(
 
     info!(
         "[agent_mgmt] version check: agent_id={}, action={}, requested_version={}",
-        agent_id, action.as_str(), version
+        agent_id,
+        action.as_str(),
+        version
     );
 
     // 2. 匹配当前系统平台
@@ -214,9 +229,17 @@ async fn do_install_with_version_check(
 
     // 4. 下载到临时文件(支持重试 + 断点续传)
     let expected_sha256 = entry.sha256.as_deref().filter(|s| !s.is_empty());
-    let staging_path = path_manager.install_dir()
+    let staging_path = path_manager
+        .install_dir()
         .join(format!(".download-staging-{}", uuid::Uuid::new_v4()));
-    download_to_file(&entry.url, &staging_path, shared_types::MAX_BINARY_SIZE, expected_sha256, &cancel_token).await?;
+    download_to_file(
+        &entry.url,
+        &staging_path,
+        shared_types::MAX_BINARY_SIZE,
+        expected_sha256,
+        &cancel_token,
+    )
+    .await?;
 
     // 文件大小（download_to_file 已校验，传递给 install_from_file）
     let file_size = std::fs::metadata(&staging_path)
@@ -225,7 +248,10 @@ async fn do_install_with_version_check(
 
     // 5. 安装(复用 binary_installer::install_from_file，避免全量读入内存)
     let t_install = std::time::Instant::now();
-    debug!("[agent_mgmt] starting install_from_file: agent_id={}, file_size={}", agent_id, file_size);
+    debug!(
+        "[agent_mgmt] starting install_from_file: agent_id={}, file_size={}",
+        agent_id, file_size
+    );
     let response = binary_installer::install_from_file(
         registry,
         path_manager,
@@ -241,7 +267,10 @@ async fn do_install_with_version_check(
         },
     )
     .await;
-    debug!("[agent_mgmt] install_from_file completed: took {:?}", t_install.elapsed());
+    debug!(
+        "[agent_mgmt] install_from_file completed: took {:?}",
+        t_install.elapsed()
+    );
 
     // install_from_file 成功时已 rename 走了 staging，失败时需清理
     let _ = std::fs::remove_file(&staging_path);
@@ -261,11 +290,8 @@ async fn do_install_with_version_check(
 /// 校验版本格式:至少包含一个数字(如 "1.0.0", "v2", "1.2.3-beta")
 /// 校验版本格式：必须是合法的 semver（如 "1.0.0"、"v2.1.3-beta"）
 fn validate_version_format(version: &str) -> AgentMgmtResult<()> {
-    shared_types::version_util::parse_semver(version).ok_or_else(|| {
-        AgentMgmtError::InvalidVersion(format!(
-            "invalid semver: {version:?}"
-        ))
-    })?;
+    shared_types::version_util::parse_semver(version)
+        .ok_or_else(|| AgentMgmtError::InvalidVersion(format!("invalid semver: {version:?}")))?;
     Ok(())
 }
 
@@ -288,7 +314,9 @@ fn make_in_progress_response(agent_id: &str, version: Option<&str>) -> InstallAg
 }
 
 /// 构造 skip response(版本已是最新,不需要安装)
-fn make_skip_response(manifest: &crate::agent_mgmt::installer::AgentManifest) -> InstallAgentResponse {
+fn make_skip_response(
+    manifest: &crate::agent_mgmt::installer::AgentManifest,
+) -> InstallAgentResponse {
     InstallAgentResponse {
         agent_id: manifest.agent_id.clone(),
         status: shared_types_grpc::AgentInstallStatus::Available as i32,
@@ -533,8 +561,7 @@ mod tests {
         let dest = std::env::temp_dir().join("test-download-404.bin");
         let _ = std::fs::remove_file(&dest);
 
-        let result =
-            download_to_file(&url, &dest, 1024, None, &CancellationToken::new()).await;
+        let result = download_to_file(&url, &dest, 1024, None, &CancellationToken::new()).await;
 
         match result {
             Err(AgentMgmtError::InstallFailed(msg)) => {
@@ -650,7 +677,11 @@ mod tests {
                 let file_content = std::fs::read(&dest).unwrap();
                 assert_eq!(file_content, test_data());
                 // 文件被重新下载，不是续传
-                assert_ne!(&file_content[..30], &partial[..], "should be重新下载，不是续传");
+                assert_ne!(
+                    &file_content[..30],
+                    &partial[..],
+                    "should be重新下载，不是续传"
+                );
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&dest);

@@ -2,9 +2,7 @@
 
 use std::sync::Arc;
 
-use shared_types::grpc::{
-    ChatRequest as GrpcChatRequest, ChatResponse as GrpcChatResponse,
-};
+use shared_types::grpc::{ChatRequest as GrpcChatRequest, ChatResponse as GrpcChatResponse};
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 

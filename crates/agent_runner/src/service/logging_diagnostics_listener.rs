@@ -44,10 +44,7 @@ impl DiagnosticsListener for LoggingDiagnosticsListener {
     }
 
     fn on_process_error(&self, diagnostics: &ProcessDiagnostics) {
-        error!(
-            "[DIAG] agent process encountered error:\n{}",
-            diagnostics
-        );
+        error!("[DIAG] agent process encountered error:\n{}", diagnostics);
     }
 }
 
@@ -87,4 +84,3 @@ mod tests {
         listener.on_process_exited(&sample_diag(None));
     }
 }
-

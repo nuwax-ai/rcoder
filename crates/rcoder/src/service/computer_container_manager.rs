@@ -262,7 +262,10 @@ impl ComputerContainerManager {
 
         let container_info = runtime.create_container(params).await.map_err(|e| {
             let error_msg = e.to_string();
-            error!("[COMPUTER_CONTAINER] Failed to start container: {}", error_msg);
+            error!(
+                "[COMPUTER_CONTAINER] Failed to start container: {}",
+                error_msg
+            );
 
             AppError::with_message(
                 ERR_CONTAINER_ERROR,

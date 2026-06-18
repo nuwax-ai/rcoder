@@ -50,9 +50,9 @@ pub fn draw(
     let composer_height = composer.display_height();
 
     let chunks = Layout::vertical([
-        Constraint::Length(1),                  // StatusBar
-        Constraint::Min(5),                     // ChatArea
-        Constraint::Length(composer_height),    // Composer (dynamic)
+        Constraint::Length(1),               // StatusBar
+        Constraint::Min(5),                  // ChatArea
+        Constraint::Length(composer_height), // Composer (dynamic)
     ])
     .split(area);
 
@@ -253,7 +253,11 @@ fn draw_composer(
     }
 
     // 渲染多行内容
-    let lines: Vec<Line> = composer.lines.iter().map(|l| Line::from(l.as_str())).collect();
+    let lines: Vec<Line> = composer
+        .lines
+        .iter()
+        .map(|l| Line::from(l.as_str()))
+        .collect();
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
 
     // 如果光标行超出可见区域，滚动段落使其可见

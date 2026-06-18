@@ -4,13 +4,13 @@
 
 use crate::grpc::{GrpcChannelPool, GrpcError};
 use shared_types::ChatAgentConfig;
-use tonic::Status;
 use shared_types::grpc::{
     CancelRequest, CancelResponse, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, ResolvePermissionRequest as GrpcResolvePermissionRequest,
     ResolvePermissionResponse as GrpcResolvePermissionResponse,
 };
 use std::sync::Arc;
+use tonic::Status;
 use tracing::{debug, error, info};
 
 /// 通过 gRPC 发送 Chat 请求到 agent_runner (使用连接池)
@@ -34,8 +34,8 @@ pub async fn grpc_chat_with_pool(
     user_prompt: Option<String>,
     agent_config: Option<ChatAgentConfig>,
     service_type: Option<shared_types::ServiceType>,
-    user_id: Option<String>, // 新增：用于 ComputerAgentRunner 模式
-    is_devcomputer: bool,    // 🆕 是否是 DevComputer 接口请求
+    user_id: Option<String>,        // 新增：用于 ComputerAgentRunner 模式
+    is_devcomputer: bool,           // 🆕 是否是 DevComputer 接口请求
     agent_work_dir: Option<String>, // 🆕 自定义工作目录标识符
 ) -> Result<GrpcChatResponse, GrpcError> {
     info!(
@@ -67,7 +67,7 @@ pub async fn grpc_chat_with_pool(
         user_prompt,
         agent_config: agent_config.map(super::converters::to_grpc_chat_agent_config),
         service_type: service_type.map(|st| format!("{:?}", st)),
-        user_id, // 传递 user_id
+        user_id,        // 传递 user_id
         is_devcomputer, // 🆕 传递 is_devcomputer
         agent_work_dir, // 🆕 传递 agent_work_dir
     };

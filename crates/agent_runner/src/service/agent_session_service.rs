@@ -65,15 +65,16 @@ pub struct AgentSessionService {
 
 impl AgentSessionService {
     pub fn new(model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>) -> Self {
-        let session_manager = Arc::new(
-            AcpSessionManager::<StateAwareNotifier<AgentSessionRegistry>, AgentSessionRegistry>::with_dependencies(
-                Arc::new(StateAwareNotifier::new(AGENT_REGISTRY.clone())),
-                AGENT_REGISTRY.clone(),
-                model_env_resolver,
-                PERMISSION_MANAGER.clone(),
-                Some(Arc::new(LoggingDiagnosticsListener)),
-            ),
-        );
+        let session_manager = Arc::new(AcpSessionManager::<
+            StateAwareNotifier<AgentSessionRegistry>,
+            AgentSessionRegistry,
+        >::with_dependencies(
+            Arc::new(StateAwareNotifier::new(AGENT_REGISTRY.clone())),
+            AGENT_REGISTRY.clone(),
+            model_env_resolver,
+            PERMISSION_MANAGER.clone(),
+            Some(Arc::new(LoggingDiagnosticsListener)),
+        ));
 
         Self {
             worker: AcpAgentWorker::new(session_manager),
@@ -201,6 +202,16 @@ fn spawn_lifecycle_watcher(
             warn!(
                 "⚠️ [SACP] 新会话缺少 lifecycle_handle - project_id={}",
                 project_id
+            );
+        }
+
+        // Agent 子进程生命周期结束时，清理该 session 残留的 pending permission。
+        // 防止 Agent 在 await permission responder 时异常退出，导致 pending 永远无法被 consume 而泄漏。
+        let cancelled_permissions = PERMISSION_MANAGER.cancel_session_permissions(&session_id);
+        if cancelled_permissions > 0 {
+            warn!(
+                "🧹 [SACP] lifecycle ended, cleared {} leftover pending permission(s): project_id={}, session_id={}",
+                cancelled_permissions, project_id, session_id
             );
         }
 

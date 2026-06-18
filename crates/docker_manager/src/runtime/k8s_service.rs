@@ -20,9 +20,9 @@ use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "kubernetes")]
-use super::kubernetes_runtime::KubernetesRuntime;
-#[cfg(feature = "kubernetes")]
 use super::k8s_pod::K8sPodOps;
+#[cfg(feature = "kubernetes")]
+use super::kubernetes_runtime::KubernetesRuntime;
 
 /// Agent Runner HTTP 端口（使用 shared_types 共享常量）
 const AGENT_HTTP_PORT: u32 = HTTP_DEFAULT_PORT as u32;
@@ -132,9 +132,11 @@ impl K8sServiceOps for KubernetesRuntime {
                 ports: Some(vec![ServicePort {
                     name: Some("http".to_string()),
                     port: AGENT_HTTP_PORT as i32,
-                    target_port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                        AGENT_HTTP_PORT as i32,
-                    )),
+                    target_port: Some(
+                        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                            AGENT_HTTP_PORT as i32,
+                        ),
+                    ),
                     protocol: Some("TCP".to_string()),
                     ..Default::default()
                 }]),

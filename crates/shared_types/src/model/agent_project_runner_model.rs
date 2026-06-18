@@ -113,9 +113,7 @@ impl ProjectCoreState {
     pub fn remove_session(&mut self, session_id: &str) -> bool {
         let set = Arc::make_mut(&mut self.sessions);
         let removed = set.remove(session_id).is_some();
-        if removed
-            && self.latest_session.as_deref() == Some(session_id)
-        {
+        if removed && self.latest_session.as_deref() == Some(session_id) {
             self.latest_session = set.iter().next().cloned();
         }
         if removed {
@@ -362,7 +360,10 @@ impl ProjectAndContainerInfo {
     }
 
     /// 高效更新核心状态（已废弃，转发到 add_session）
-    #[deprecated(since = "0.0.0", note = "use `add_session` instead - 多 session 模型不再覆盖")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "use `add_session` instead - 多 session 模型不再覆盖"
+    )]
     pub fn update_session(&mut self, session_id: String) {
         self.add_session(session_id);
     }
@@ -462,7 +463,10 @@ impl ProjectAndContainerInfo {
     /// 历史语义：`set_session_id(Some(x))` 等价"覆盖为 x"。
     /// 新模型下转发为 `add_session(x)` —— **不再清除其他 session**。
     /// 若调用方依赖"覆盖"语义（清除旧 session），应显式调 `clear_all_sessions()` 后再 `add_session`。
-    #[deprecated(since = "0.0.0", note = "use `add_session` instead - 多 session 模型不再覆盖")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "use `add_session` instead - 多 session 模型不再覆盖"
+    )]
     pub fn set_session_id(&mut self, session_id: Option<String>) {
         if let Some(session_id) = session_id {
             self.add_session(session_id);

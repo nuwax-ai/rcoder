@@ -580,7 +580,6 @@ pub struct UninstallAgentResponse {
     pub removed_versions: Vec<String>,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

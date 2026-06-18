@@ -197,7 +197,10 @@ pub fn setup_shutdown_handler() -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             // Windows: 仅监听 Ctrl+C
             if let Ok(()) = tokio::signal::ctrl_c().await {
-                info!(signal = "Ctrl+C", "Received shutdown signal, starting graceful shutdown");
+                info!(
+                    signal = "Ctrl+C",
+                    "Received shutdown signal, starting graceful shutdown"
+                );
                 write_shutdown_log("Ctrl+C");
             }
 
@@ -321,7 +324,10 @@ fn terminate_children() {
             .filter(|&p| is_process_alive(p))
             .collect();
         if alive.is_empty() {
-            info!(elapsed_seconds = elapsed, "All descendant processes exited gracefully");
+            info!(
+                elapsed_seconds = elapsed,
+                "All descendant processes exited gracefully"
+            );
             return;
         }
         warn!(

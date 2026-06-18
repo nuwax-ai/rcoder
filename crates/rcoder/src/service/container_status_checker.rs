@@ -315,7 +315,7 @@ impl ContainerStatusChecker {
                         lookup_key
                     );
                     self.health_states.remove(lookup_key);
-                    self.state.grpc_pool.remove(&grpc_addr);
+                    self.state.grpc_pool.remove(&grpc_addr).await;
                     // 注意：不移除存储中的项目记录，由清理任务统一处理
                     return Err(e);
                 }
@@ -396,8 +396,7 @@ impl ContainerStatusChecker {
             .view(lookup_key, |_, health| {
                 if health.consecutive_failures >= self.config.failure_threshold
                     && let Some(first_failure) = health.first_failure_time
-                    && let Ok(skip_duration) =
-                        chrono::Duration::from_std(self.config.skip_duration)
+                    && let Ok(skip_duration) = chrono::Duration::from_std(self.config.skip_duration)
                 {
                     return now.signed_duration_since(first_failure) < skip_duration;
                 }
@@ -458,8 +457,14 @@ impl ContainerStatusChecker {
         };
 
         // 🔌 第1次失败或达到阈值时，清理 gRPC 连接池
+        // 用 spawn fire-and-forget：status_checker 是周期性任务，下次循环会重新检查，
+        // 不需要 remove 立即生效（与 chat 重试路径不同）
         if consecutive_failures == 1 || consecutive_failures == self.config.failure_threshold {
-            self.state.grpc_pool.remove(grpc_addr);
+            let pool = self.state.grpc_pool.clone();
+            let addr_owned = grpc_addr.to_string();
+            tokio::spawn(async move {
+                pool.remove(&addr_owned).await;
+            });
             info!(
                 "🔌 [STATUS_CHECKER] Already cleanup connection: {}",
                 grpc_addr

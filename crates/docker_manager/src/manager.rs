@@ -1,19 +1,15 @@
 use super::{
-    CleanupOptions, CleanupResult, ContainerQueryResultArc,
-    ContainerRemovalFailure, ContainerStatus, DockerContainerConfig, DockerContainerInfo,
-    DockerError, DockerManagerConfig, DockerResult,
+    CleanupOptions, CleanupResult, ContainerQueryResultArc, ContainerRemovalFailure,
+    ContainerStatus, DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig,
+    DockerResult,
 };
 use crate::container_state_actor::{ContainerStateActor, ContainerStateHandle};
 use anyhow::Result;
 use bollard::query_parameters::{
-    CreateImageOptions, InspectContainerOptions,
-    RemoveContainerOptions, RestartContainerOptions,
+    CreateImageOptions, InspectContainerOptions, RemoveContainerOptions, RestartContainerOptions,
     StopContainerOptions,
 };
-use bollard::{
-    API_DEFAULT_VERSION, Docker,
-    models::ContainerSummary,
-};
+use bollard::{API_DEFAULT_VERSION, Docker, models::ContainerSummary};
 use container_runtime_api::RemovedContainerInfo;
 use moka::future::Cache;
 use shared_types::{ContainerBasicInfo, ServiceType};
@@ -632,7 +628,6 @@ impl DockerManager {
             }
         }
     }
-
 
     /// 重启容器
     pub async fn restart_container(&self, project_id: &str) -> DockerResult<()> {

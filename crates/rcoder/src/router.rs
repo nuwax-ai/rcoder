@@ -78,7 +78,11 @@ pub struct AppState {
     /// 容器运行时（通过 DI 注入，替代全局 RuntimeManager::get()）
     pub runtime: Arc<dyn ContainerRuntime>,
     /// RAII 资源回收器接收端（在 start_cleanup_task 中取出并启动 ResourceReaper）
-    pub cleanup_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>>>>,
+    pub cleanup_rx: Arc<
+        std::sync::Mutex<
+            Option<tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>>,
+        >,
+    >,
     /// Agent 下载管理器（统一缓存）
     pub agent_download_manager: Arc<AgentDownloadManager>,
     /// 应用管理服务
@@ -102,27 +106,31 @@ impl AppState {
         // 初始化 Agent 下载管理器
         let cache_dir = std::env::var("AGENT_CACHE_DIR")
             .unwrap_or_else(|_| shared_types::AGENT_CACHE_DIR.to_string());
-        let agent_download_manager = Arc::new(
-            AgentDownloadManager::new(cache_dir)
-                .map_err(|e| anyhow::anyhow!("failed to initialize agent download manager: {}", e))?
-        );
+        let agent_download_manager =
+            Arc::new(AgentDownloadManager::new(cache_dir).map_err(|e| {
+                anyhow::anyhow!("failed to initialize agent download manager: {}", e)
+            })?);
 
         // 初始化应用管理服务（根据运行时类型选择）
-        let runtime_type = std::env::var("CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".to_string());
-        let app_service: Arc<dyn crate::app_manager::AppServiceTrait> = if runtime_type == "kubernetes" {
-            Arc::new(
-                crate::app_manager::k8s_service::K8sAppService::new(
-                    config.app_manager.clone(),
-                    runtime.clone(),
-                ).await
-                .map_err(|e| anyhow::anyhow!("failed to initialize K8s app service: {}", e))?
-            )
-        } else {
-            Arc::new(
-                crate::app_manager::service::AppService::new(config.app_manager.clone()).await
-                    .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?
-            )
-        };
+        let runtime_type =
+            std::env::var("CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".to_string());
+        let app_service: Arc<dyn crate::app_manager::AppServiceTrait> =
+            if runtime_type == "kubernetes" {
+                Arc::new(
+                    crate::app_manager::k8s_service::K8sAppService::new(
+                        config.app_manager.clone(),
+                        runtime.clone(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to initialize K8s app service: {}", e))?,
+                )
+            } else {
+                Arc::new(
+                    crate::app_manager::service::AppService::new(config.app_manager.clone())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
+                )
+            };
 
         Ok(Self {
             config,
@@ -160,7 +168,11 @@ impl AppState {
     /// # Errors
     /// 如果 `service_type` 未设置，透传错误。
     #[inline]
-    pub fn insert_project(&self, project_id: String, info: Arc<ProjectAndContainerInfo>) -> anyhow::Result<()> {
+    pub fn insert_project(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+    ) -> anyhow::Result<()> {
         self.projects.insert(project_id.clone(), info)
     }
 
@@ -216,7 +228,10 @@ impl AppState {
 
     /// 更新会话信息（已废弃，请用 `add_session_to_project` 或 `insert_project_with_session`）
     #[inline]
-    #[deprecated(since = "0.0.0", note = "非原子，请用 `add_session_to_project` 走多 session 路径")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "非原子，请用 `add_session_to_project` 走多 session 路径"
+    )]
     #[allow(deprecated)]
     pub fn update_session(&self, project_id: &str, session_id: &str) {
         self.projects.update_session(project_id, session_id);
@@ -232,11 +247,8 @@ impl AppState {
         new_session_id: &str,
         expected_current_session_id: Option<&str>,
     ) -> bool {
-        self.projects.update_session_atomic(
-            project_id,
-            new_session_id,
-            expected_current_session_id,
-        )
+        self.projects
+            .update_session_atomic(project_id, new_session_id, expected_current_session_id)
     }
 
     /// 清除会话信息（清所有 session，agent stop 场景）
@@ -269,10 +281,7 @@ impl AppState {
 /// 这些端点挂载在中间件之前，绕过 API Key 鉴权。
 fn create_internal_routes(state: Arc<AppState>) -> Router {
     Router::new()
-        .route(
-            "/internal/pod/ensure",
-            post(handler::internal_pod_ensure),
-        )
+        .route("/internal/pod/ensure", post(handler::internal_pod_ensure))
         .route(
             "/internal/session/{session_id}/resolve",
             get(handler::internal_session_resolve),
@@ -353,10 +362,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
 
     // DevComputer 调试路由 — 委托给 /computer/* 处理器，共享同一个容器
     let devcomputer_routes = Router::new()
-        .route(
-            "/devcomputer/chat",
-            post(handler::handle_devcomputer_chat),
-        )
+        .route("/devcomputer/chat", post(handler::handle_devcomputer_chat))
         .route(
             "/devcomputer/agent/stop",
             post(handler::devcomputer_agent_stop),
@@ -404,28 +410,16 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     // 此外 `RequestBodyLimitLayer` 是 tower 中间件,只读取 Content-Length 头,
     // 对 streaming 的 multipart body 不直接生效,但保留作为 defense-in-depth。
     let install_route = Router::new()
-        .route(
-            "/agent-mgmt/agents/install",
-            post(handler::install_agent),
-        )
+        .route("/agent-mgmt/agents/install", post(handler::install_agent))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             1024 * 1024 * 1024,
         ));
 
     let agent_mgmt_routes = Router::new()
-        .route(
-            "/agent-mgmt/agents/list",
-            post(handler::list_agents),
-        )
-        .route(
-            "/agent-mgmt/agents/get",
-            post(handler::get_agent),
-        )
-        .route(
-            "/agent-mgmt/agents/check",
-            post(handler::check_agent),
-        )
+        .route("/agent-mgmt/agents/list", post(handler::list_agents))
+        .route("/agent-mgmt/agents/get", post(handler::get_agent))
+        .route("/agent-mgmt/agents/check", post(handler::check_agent))
         .merge(install_route)
         .route(
             "/agent-mgmt/agents/install-from-url",
@@ -445,8 +439,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     let app_manager_state = Arc::new(app_manager::handlers::AppManagerState {
         app_service: state.app_service.clone(),
     });
-    let app_manager_routes = app_manager::routes::app_manager_routes()
-        .with_state(app_manager_state);
+    let app_manager_routes =
+        app_manager::routes::app_manager_routes().with_state(app_manager_state);
 
     let mut router = Router::new()
         .merge(health_routes)

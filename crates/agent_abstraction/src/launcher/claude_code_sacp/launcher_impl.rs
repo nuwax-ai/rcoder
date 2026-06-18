@@ -530,7 +530,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let abnormal_exit_flag = Arc::new(AtomicBool::new(false));
 
         // 🔥 新增：详细的退出信息（signal、exit_code），用于生成更有意义的错误消息
-        let exit_detail = Arc::new(tokio::sync::Mutex::new(None::<crate::launcher::lifecycle::ExitDetail>));
+        let exit_detail = Arc::new(tokio::sync::Mutex::new(
+            None::<crate::launcher::lifecycle::ExitDetail>,
+        ));
 
         // 共享的 session_id，用于连接失败时发送错误通知
         let session_id_shared = Arc::new(std::sync::Mutex::new(None::<String>));

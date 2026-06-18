@@ -76,12 +76,7 @@ pub async fn handle_ttyd_request(
         let cwd = std::path::Path::new("/home/user").join(project_id);
         let uri_str = new_uri.to_string();
         let separator = if uri_str.contains('?') { '&' } else { '?' };
-        let new_uri_str = format!(
-            "{}{}arg=--cwd&arg={}",
-            uri_str,
-            separator,
-            cwd.display()
-        );
+        let new_uri_str = format!("{}{}arg=--cwd&arg={}", uri_str, separator, cwd.display());
         new_uri_str.parse().map_err(|e| {
             error!("URI rewrite with cwd failed: {}", e);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
@@ -155,12 +150,7 @@ pub async fn handle_web_ttyd_request(
         let cwd = std::path::Path::new("/app/project_workspace").join(project_id);
         let uri_str = new_uri.to_string();
         let separator = if uri_str.contains('?') { '&' } else { '?' };
-        let new_uri_str = format!(
-            "{}{}arg=--cwd&arg={}",
-            uri_str,
-            separator,
-            cwd.display()
-        );
+        let new_uri_str = format!("{}{}arg=--cwd&arg={}", uri_str, separator, cwd.display());
         new_uri_str.parse().map_err(|e| {
             error!("URI rewrite with cwd failed: {}", e);
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
@@ -283,11 +273,7 @@ pub async fn handle_web_ttyd_upstream(
     ctx.vnc_target_ip = Some("127.0.0.1".to_string());
 
     // 创建 HTTP Peer 到本地 ttyd 端口
-    let mut peer = HttpPeer::new(
-        ("127.0.0.1", TTYD_PORT),
-        false,
-        "".to_string(),
-    );
+    let mut peer = HttpPeer::new(("127.0.0.1", TTYD_PORT), false, "".to_string());
 
     // ttyd WebSocket 长连接优化配置（与 agent-runner ttyd 一致）
     peer.options.connection_timeout = Some(Duration::from_secs(10));

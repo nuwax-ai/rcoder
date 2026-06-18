@@ -153,8 +153,7 @@ impl VncBackendResolver for CachedDockerResolver {
 mod tests {
     use super::*;
     use container_runtime_api::{
-        ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult,
-        RuntimeContainerInfo,
+        ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, RuntimeContainerInfo,
     };
     use shared_types::ContainerBasicInfo;
 

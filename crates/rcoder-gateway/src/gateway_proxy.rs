@@ -21,8 +21,8 @@ use crate::config::GatewayConfig;
 use crate::control_plane_client::ControlPlaneClient;
 use crate::identifier_extractor::IdentifierExtractor;
 use crate::route_table::{DataPlaneRoute, IdentifierSource, RouteType, build_route_table};
-use std::collections::HashMap;
 use crate::session_resolver::SessionResolver;
+use std::collections::HashMap;
 
 /// 请求路由目标
 #[derive(Debug, Clone)]
@@ -239,17 +239,16 @@ impl ProxyHttp for GatewayProxy {
                 let ensure_result = if route.read_only {
                     self.cluster_cache.get_only(&identifier).await
                 } else {
-                    self.cluster_cache.get_or_ensure(&identifier, route.service_type).await
+                    self.cluster_cache
+                        .get_or_ensure(&identifier, route.service_type)
+                        .await
                 };
 
                 match ensure_result {
                     Ok(_cluster_name) => {
                         // 直接构建 K8s Service FQDN，路由到 agent_runner
                         let fqdn = self.build_service_fqdn(&identifier, route.service_type);
-                        debug!(
-                            "[GATEWAY] {} → {} → agent_svc ({})",
-                            path, identifier, fqdn
-                        );
+                        debug!("[GATEWAY] {} → {} → agent_svc ({})", path, identifier, fqdn);
                         ctx.target = RouteTarget::AgentService(fqdn);
                     }
                     Err(e) => {

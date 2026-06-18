@@ -5,8 +5,7 @@
 use shared_types::grpc::{
     Attachment as GrpcAttachment, AttachmentSource as GrpcAttachmentSource,
     AudioAttachment as GrpcAudioAttachment, AutoReloadConfig as GrpcAutoReloadConfig, Base64Data,
-    ChatAgentConfig as GrpcChatAgentConfig,
-    ChatAgentServerConfig as GrpcChatAgentServerConfig,
+    ChatAgentConfig as GrpcChatAgentConfig, ChatAgentServerConfig as GrpcChatAgentServerConfig,
     ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
     ChatResponse as GrpcChatResponse, DocumentAttachment as GrpcDocumentAttachment,
     ImageAttachment as GrpcImageAttachment, ImageDimensions as GrpcImageDimensions,
@@ -39,8 +38,8 @@ pub fn to_grpc_chat_request(
     user_prompt: Option<String>,
     agent_config: Option<ChatAgentConfig>,
     service_type: Option<shared_types::ServiceType>,
-    user_id: Option<String>, // 新增：用于 ComputerAgentRunner 模式
-    is_devcomputer: bool,    // 🆕 是否是 DevComputer 接口请求
+    user_id: Option<String>,        // 新增：用于 ComputerAgentRunner 模式
+    is_devcomputer: bool,           // 🆕 是否是 DevComputer 接口请求
     agent_work_dir: Option<String>, // 🆕 自定义工作目录标识符
 ) -> GrpcChatRequest {
     GrpcChatRequest {
@@ -56,7 +55,7 @@ pub fn to_grpc_chat_request(
         user_prompt,
         agent_config: agent_config.map(to_grpc_chat_agent_config),
         service_type: service_type.map(|st| format!("{:?}", st)),
-        user_id, // 传递 user_id
+        user_id,        // 传递 user_id
         is_devcomputer, // 🆕 传递 is_devcomputer
         agent_work_dir, // 🆕 传递 agent_work_dir
     }
@@ -261,9 +260,7 @@ pub fn to_grpc_chat_agent_server_config(
             .platforms
             .map(|p| {
                 p.into_iter()
-                    .filter_map(|(k, v)| {
-                        serde_json::to_vec(&v).ok().map(|bytes| (k, bytes))
-                    })
+                    .filter_map(|(k, v)| serde_json::to_vec(&v).ok().map(|bytes| (k, bytes)))
                     .collect()
             })
             .unwrap_or_default(),

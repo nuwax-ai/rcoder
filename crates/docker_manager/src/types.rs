@@ -183,7 +183,7 @@ impl ContainerQueryResult {
             container_name: tuple.1,
             status: tuple.2,
             is_running: tuple.3,
-            container_ip: String::new(), // 默认为空，需要后续更新
+            container_ip: String::new(),    // 默认为空，需要后续更新
             created_at: chrono::Utc::now(), // 兼容旧代码，使用当前时间
         }
     }

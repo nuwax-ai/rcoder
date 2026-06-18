@@ -49,17 +49,26 @@ pub fn build_route_table() -> Router<RouteType> {
         .expect("route insert failed");
 
     // ── Computer Agent 数据面路由 ──
-    let computer_body = |field: &'static str, read_only: bool| RouteType::DataPlane(DataPlaneRoute {
-        identifier_field: field,
-        source: IdentifierSource::Body,
-        service_type: "ComputerAgentRunner",
-        read_only,
-    });
+    let computer_body = |field: &'static str, read_only: bool| {
+        RouteType::DataPlane(DataPlaneRoute {
+            identifier_field: field,
+            source: IdentifierSource::Body,
+            service_type: "ComputerAgentRunner",
+            read_only,
+        })
+    };
 
-    router.insert("/computer/chat", computer_body("user_id", false)).unwrap();
-    router.insert("/computer/agent/stop", computer_body("user_id", false)).unwrap();
     router
-        .insert("/computer/agent/session/cancel", computer_body("user_id", false))
+        .insert("/computer/chat", computer_body("user_id", false))
+        .unwrap();
+    router
+        .insert("/computer/agent/stop", computer_body("user_id", false))
+        .unwrap();
+    router
+        .insert(
+            "/computer/agent/session/cancel",
+            computer_body("user_id", false),
+        )
         .unwrap();
     router
         .insert("/computer/agent/status", computer_body("user_id", true)) // 只读
@@ -70,56 +79,74 @@ pub fn build_route_table() -> Router<RouteType> {
 
     // SSE progress：session_id 解析（只读，不触发 pod 创建）
     router
-        .insert("/computer/progress/{session_id}", RouteType::DataPlane(DataPlaneRoute {
-            identifier_field: "session_id",
-            source: IdentifierSource::Session,
-            service_type: "ComputerAgentRunner",
-            read_only: true,
-        }))
+        .insert(
+            "/computer/progress/{session_id}",
+            RouteType::DataPlane(DataPlaneRoute {
+                identifier_field: "session_id",
+                source: IdentifierSource::Session,
+                service_type: "ComputerAgentRunner",
+                read_only: true,
+            }),
+        )
         .unwrap();
 
     // ── RCoder Agent 数据面路由 ──
-    let rcoder_body = |field: &'static str, read_only: bool| RouteType::DataPlane(DataPlaneRoute {
-        identifier_field: field,
-        source: IdentifierSource::Body,
-        service_type: "RCoder",
-        read_only,
-    });
+    let rcoder_body = |field: &'static str, read_only: bool| {
+        RouteType::DataPlane(DataPlaneRoute {
+            identifier_field: field,
+            source: IdentifierSource::Body,
+            service_type: "RCoder",
+            read_only,
+        })
+    };
 
-    router.insert("/chat", rcoder_body("project_id", false)).unwrap();
+    router
+        .insert("/chat", rcoder_body("project_id", false))
+        .unwrap();
     router
         .insert("/agent/session/cancel", rcoder_body("project_id", false))
         .unwrap();
-    router.insert("/agent/stop", rcoder_body("project_id", false)).unwrap();
+    router
+        .insert("/agent/stop", rcoder_body("project_id", false))
+        .unwrap();
 
     // Agent status：path 参数提取（只读）
     router
-        .insert("/agent/status/{project_id}", RouteType::DataPlane(DataPlaneRoute {
-            identifier_field: "project_id",
-            source: IdentifierSource::Path("project_id".to_string()),
-            service_type: "RCoder",
-            read_only: true,
-        }))
+        .insert(
+            "/agent/status/{project_id}",
+            RouteType::DataPlane(DataPlaneRoute {
+                identifier_field: "project_id",
+                source: IdentifierSource::Path("project_id".to_string()),
+                service_type: "RCoder",
+                read_only: true,
+            }),
+        )
         .unwrap();
 
     // RCoder SSE progress：session_id 解析（只读）
     router
-        .insert("/agent/progress/{session_id}", RouteType::DataPlane(DataPlaneRoute {
-            identifier_field: "session_id",
-            source: IdentifierSource::Session,
-            service_type: "RCoder",
-            read_only: true,
-        }))
+        .insert(
+            "/agent/progress/{session_id}",
+            RouteType::DataPlane(DataPlaneRoute {
+                identifier_field: "session_id",
+                source: IdentifierSource::Session,
+                service_type: "RCoder",
+                read_only: true,
+            }),
+        )
         .unwrap();
 
     // ── Agent Management 数据面路由 ──
     router
-        .insert("/agent-mgmt/agents/{action}", RouteType::DataPlane(DataPlaneRoute {
-            identifier_field: "project_id",
-            source: IdentifierSource::Body,
-            service_type: "RCoder",
-            read_only: false,
-        }))
+        .insert(
+            "/agent-mgmt/agents/{action}",
+            RouteType::DataPlane(DataPlaneRoute {
+                identifier_field: "project_id",
+                source: IdentifierSource::Body,
+                service_type: "RCoder",
+                read_only: false,
+            }),
+        )
         .unwrap();
 
     // ── 控制面路由（不注册，由默认匹配处理）──

@@ -49,9 +49,8 @@ pub const COMPUTER_WORKSPACE_ROOT: &str = "/app/computer-project-workspace";
 
 /// 标识符验证正则：仅允许字母、数字、下划线、连字符
 /// 长度 1-64 字符
-static IDENTIFIER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").expect("identifier regex is valid")
-});
+static IDENTIFIER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").expect("identifier regex is valid"));
 
 /// 路径标识符验证错误
 #[derive(Debug, thiserror::Error)]

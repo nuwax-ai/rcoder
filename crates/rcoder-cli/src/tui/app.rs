@@ -79,7 +79,6 @@ pub struct App {
     pub session_id: String,
 
     // ── Prompt 生命周期 ──
-
     /// Prompt 代际计数器
     ///
     /// 每次调用 `handle_submit` 时递增。Spawned task 捕获当前值，
@@ -316,8 +315,7 @@ impl App {
             AppEvent::PromptEnded { error, .. } if self.chat.waiting => {
                 self.chat.commit_response(self.use_markdown);
                 if let Some(err) = error {
-                    self.chat
-                        .push_system_message(&format!("Error: {}", err));
+                    self.chat.push_system_message(&format!("Error: {}", err));
                 }
                 // 自动提交排队 prompt（如有）
                 if let Some(pending) = self.pending_prompt.take() {
@@ -525,8 +523,10 @@ impl App {
             // Enter: 确认选择
             KeyCode::Enter => {
                 if let Some(mut overlay) = self.permission_overlay.take() {
-                    let option_id =
-                        overlay.options.get(overlay.selected_index).map(|o| o.id.clone());
+                    let option_id = overlay
+                        .options
+                        .get(overlay.selected_index)
+                        .map(|o| o.id.clone());
                     if let Some(tx) = overlay.response_tx.take() {
                         let _ = tx.send(option_id);
                     }
@@ -617,10 +617,7 @@ impl App {
                 // 所以大多数情况下 waiting 已经是 false。
                 // ResetWaiting 处理的是 Agent 完全无响应的边界情况。
                 drop(tx.send(AppEvent::ResetWaiting(current_gen)));
-                drop(tx.send(AppEvent::Diagnostics(format!(
-                    "Prompt 失败: {}",
-                    e
-                ))));
+                drop(tx.send(AppEvent::Diagnostics(format!("Prompt 失败: {}", e))));
             }
         });
 

@@ -20,8 +20,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use shared_types::AutoReloadConfig;
 use shared_types::AgentBinarySnapshot;
+use shared_types::AutoReloadConfig;
 use tracing::{debug, info, warn};
 
 /// 解析 agent 命令对应的二进制文件路径
@@ -132,10 +132,7 @@ pub async fn wait_for_stability(
         last_snapshot = current_snapshot;
 
         if stable_count >= max_retries {
-            info!(
-                "[auto_reload] binary stabilized after {} checks",
-                attempt
-            );
+            info!("[auto_reload] binary stabilized after {} checks", attempt);
             return Ok(true);
         }
     }
@@ -316,13 +313,8 @@ mod tests {
         fs::write(&bin_path, "content").unwrap();
 
         let config = AutoReloadConfig::disabled();
-        let result = check_and_wait_for_reload(
-            bin_path.to_str().unwrap(),
-            tmp.path(),
-            &None,
-            &config,
-        )
-        .await;
+        let result =
+            check_and_wait_for_reload(bin_path.to_str().unwrap(), tmp.path(), &None, &config).await;
         assert!(result.is_none());
     }
 }

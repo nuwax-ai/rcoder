@@ -43,10 +43,7 @@ impl<'a> ContainerCreator<'a> {
     ///
     /// 由于 DockerContainerConfig 的 env_vars 字段会被 into_iter() 消耗，
     /// 需要提前提取所有需要的字段。
-    pub async fn create(
-        &self,
-        config: DockerContainerConfig,
-    ) -> DockerResult<DockerContainerInfo> {
+    pub async fn create(&self, config: DockerContainerConfig) -> DockerResult<DockerContainerInfo> {
         info!(
             "[CREATE] Starting container creation: project_id={}",
             config.project_id
@@ -217,10 +214,7 @@ impl<'a> ContainerCreator<'a> {
 
             self.manager
                 .containers
-                .insert(
-                    project_id.to_string(),
-                    info.clone(),
-                )
+                .insert(project_id.to_string(), info.clone())
                 .await;
 
             return Ok(Some(info));
@@ -239,7 +233,11 @@ impl<'a> ContainerCreator<'a> {
             );
         }
 
-        if let Err(e) = self.manager.stop_container_by_id(&result.container_id).await {
+        if let Err(e) = self
+            .manager
+            .stop_container_by_id(&result.container_id)
+            .await
+        {
             error!("[CREATE] Failed to delete old container: {}", e);
         }
 
@@ -476,8 +474,10 @@ fn build_host_config(
             if nano_cpus.is_finite() && nano_cpus >= 0.0 && nano_cpus <= i64::MAX as f64 {
                 config.nano_cpus = Some(nano_cpus as i64);
             } else {
-                warn!("[DOCKER_MGR] cpu_limit {} results in nano_cpus {} out of range, skipping",
-                      cpu_limit, nano_cpus);
+                warn!(
+                    "[DOCKER_MGR] cpu_limit {} results in nano_cpus {} out of range, skipping",
+                    cpu_limit, nano_cpus
+                );
             }
         }
     }

@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Multipart, Path, Query, State},
     Json,
+    extract::{Multipart, Path, Query, State},
 };
 use serde::Deserialize;
 use tracing::{info, instrument};
@@ -192,17 +192,13 @@ pub async fn start_app(
 ) -> Result<Json<HttpResult<AppInfo>>, AppError> {
     info!("启动应用: {}", app_id);
 
-    let app_info = state
-        .app_service
-        .start_app(&app_id)
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("已在运行") {
-                AppError::conflict(&e.to_string())
-            } else {
-                AppError::not_found(&e.to_string())
-            }
-        })?;
+    let app_info = state.app_service.start_app(&app_id).await.map_err(|e| {
+        if e.to_string().contains("已在运行") {
+            AppError::conflict(&e.to_string())
+        } else {
+            AppError::not_found(&e.to_string())
+        }
+    })?;
 
     Ok(Json(HttpResult::success(app_info)))
 }
@@ -228,17 +224,13 @@ pub async fn stop_app(
 ) -> Result<Json<HttpResult<AppInfo>>, AppError> {
     info!("停止应用: {}", app_id);
 
-    let app_info = state
-        .app_service
-        .stop_app(&app_id)
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("未在运行") {
-                AppError::conflict(&e.to_string())
-            } else {
-                AppError::not_found(&e.to_string())
-            }
-        })?;
+    let app_info = state.app_service.stop_app(&app_id).await.map_err(|e| {
+        if e.to_string().contains("未在运行") {
+            AppError::conflict(&e.to_string())
+        } else {
+            AppError::not_found(&e.to_string())
+        }
+    })?;
 
     Ok(Json(HttpResult::success(app_info)))
 }
@@ -426,23 +418,27 @@ pub async fn upload_file(
     let mut target_path: Option<String> = None;
 
     // 解析 multipart 数据
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        AppError::bad_request(&format!("解析上传文件失败: {}", e))
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::bad_request(&format!("解析上传文件失败: {}", e)))?
+    {
         let name = field.name().unwrap_or("").to_string();
 
         match name.as_str() {
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                let data = field.bytes().await.map_err(|e| {
-                    AppError::bad_request(&format!("读取文件数据失败: {}", e))
-                })?;
+                let data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::bad_request(&format!("读取文件数据失败: {}", e)))?;
                 file_data = Some(data.to_vec());
             }
             "target" => {
-                let data = field.text().await.map_err(|e| {
-                    AppError::bad_request(&format!("读取目标路径失败: {}", e))
-                })?;
+                let data = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::bad_request(&format!("读取目标路径失败: {}", e)))?;
                 target_path = Some(data);
             }
             _ => {

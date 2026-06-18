@@ -8,9 +8,9 @@
 //! - `utils` - 工具函数（normalize_path, rewrite_uri, set_common_headers 等）
 //! - `handlers` - 请求处理函数（VNC, ttyd, audio, IME, API proxy, port proxy）
 
+pub mod handlers;
 pub mod types;
 pub mod utils;
-pub mod handlers;
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -19,6 +19,7 @@ use dashmap::DashMap;
 use matchit::Router;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -57,6 +58,12 @@ pub struct PingoraProxyService {
     /// VNC 后端映射: user_id -> container_ip
     /// 用于 /computer/vnc/{user_id}/{project_id} 路由
     pub vnc_backends: Arc<DashMap<String, String>>,
+    /// VNC 用户活跃时间戳：user_id → Unix 秒（AtomicI64 无锁写入）
+    ///
+    /// 由 response_body_filter 在每个 VNC WS chunk 触发时（10s 节流）写入。
+    /// rcoder 后台任务每 30s 扫描，把"近期有 VNC 活动"的 user 续期到 storage，
+    /// 防止 cleanup_task 在用户使用 VNC 桌面期间误判 idle 并销毁容器。
+    pub vnc_activity: Arc<DashMap<String, AtomicI64>>,
     /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
     /// 用于 /api/{service_name}/{*path} 路由
     pub api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
@@ -79,6 +86,9 @@ pub struct PortProxy {
     pub metrics: Arc<ProxyMetrics>,
     /// VNC 后端映射: user_id -> container_ip
     vnc_backends: Arc<DashMap<String, String>>,
+    /// VNC 用户活跃时间戳（与 PingoraProxyService.vnc_activity 共享同一 Arc）
+    /// 由 response_body_filter 写入
+    vnc_activity: Arc<DashMap<String, AtomicI64>>,
     /// 路由表
     router: Router<RouteType>,
     /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
@@ -103,7 +113,10 @@ impl ProxyHttp for PortProxy {
         _ctx: &mut Self::CTX,
     ) -> PingoraResult<bool> {
         let req_header = session.req_header();
-        info!("🔍 [PINGORA] request_filter called: path={}", req_header.uri.path());
+        info!(
+            "🔍 [PINGORA] request_filter called: path={}",
+            req_header.uri.path()
+        );
         // 协议转换已移除，所有请求直接走正常代理流程
         Ok(false)
     }
@@ -115,7 +128,10 @@ impl ProxyHttp for PortProxy {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
-        info!("🔍 [PINGORA] upstream_request_filter called: path={}", upstream_request.uri.path());
+        info!(
+            "🔍 [PINGORA] upstream_request_filter called: path={}",
+            upstream_request.uri.path()
+        );
 
         // ========================================
         // API Key 验证（在所有路由处理之前）
@@ -137,27 +153,27 @@ impl ProxyHttp for PortProxy {
                 }
                 Err(shared_types::ApiKeyAuthError::Invalid) => {
                     warn!("🔒 [PINGORA_AUTH] Invalid API key for path: {}", path);
-                    return Err(pingora_core::Error::new(
-                        pingora_core::ErrorType::HTTPStatus(401),
-                    )
-                    .more_context("Invalid API key".to_string()));
+                    return Err(
+                        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(401))
+                            .more_context("Invalid API key".to_string()),
+                    );
                 }
                 Err(shared_types::ApiKeyAuthError::Missing) => {
                     warn!(
                         "🔒 [PINGORA_AUTH] Missing x-api-key header for path: {}",
                         path
                     );
-                    return Err(pingora_core::Error::new(
-                        pingora_core::ErrorType::HTTPStatus(401),
-                    )
-                    .more_context("Missing x-api-key header".to_string()));
+                    return Err(
+                        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(401))
+                            .more_context("Missing x-api-key header".to_string()),
+                    );
                 }
                 Err(shared_types::ApiKeyAuthError::ConfigError) => {
                     error!("🔒 [PINGORA_AUTH] Configuration error");
-                    return Err(pingora_core::Error::new(
-                        pingora_core::ErrorType::HTTPStatus(500),
-                    )
-                    .more_context("Internal configuration error".to_string()));
+                    return Err(
+                        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(500))
+                            .more_context("Internal configuration error".to_string()),
+                    );
                 }
             }
         }
@@ -174,8 +190,13 @@ impl ProxyHttp for PortProxy {
 
         match matched.value {
             RouteType::VncProxy => {
-                handlers::vnc::handle_vnc_request(upstream_request, &original_uri, matched.params, ctx)
-                    .await?;
+                handlers::vnc::handle_vnc_request(
+                    upstream_request,
+                    &original_uri,
+                    matched.params,
+                    ctx,
+                )
+                .await?;
             }
             RouteType::PortProxy => {
                 handlers::port_proxy::handle_port_proxy_request(
@@ -232,12 +253,21 @@ impl ProxyHttp for PortProxy {
                 .await?;
             }
             RouteType::TtydProxy => {
-                handlers::ttyd::handle_ttyd_request(upstream_request, &original_uri, matched.params, ctx)
-                    .await?;
+                handlers::ttyd::handle_ttyd_request(
+                    upstream_request,
+                    &original_uri,
+                    matched.params,
+                    ctx,
+                )
+                .await?;
             }
             RouteType::WebTtydProxy => {
-                handlers::ttyd::handle_web_ttyd_request(upstream_request, &original_uri, matched.params)
-                    .await?;
+                handlers::ttyd::handle_web_ttyd_request(
+                    upstream_request,
+                    &original_uri,
+                    matched.params,
+                )
+                .await?;
             }
         }
 
@@ -263,8 +293,13 @@ impl ProxyHttp for PortProxy {
 
         match matched.value {
             RouteType::VncProxy => {
-                handlers::vnc::handle_vnc_upstream(ctx, matched.params, &self.vnc_backends, &self.metrics)
-                    .await
+                handlers::vnc::handle_vnc_upstream(
+                    ctx,
+                    matched.params,
+                    &self.vnc_backends,
+                    &self.metrics,
+                )
+                .await
             }
             RouteType::PortProxy => {
                 handlers::port_proxy::handle_port_proxy_upstream(
@@ -304,20 +339,34 @@ impl ProxyHttp for PortProxy {
                 .await
             }
             RouteType::AudioProxy => {
-                handlers::audio::handle_audio_upstream(ctx, matched.params, &self.vnc_backends, &self.metrics)
-                    .await
+                handlers::audio::handle_audio_upstream(
+                    ctx,
+                    matched.params,
+                    &self.vnc_backends,
+                    &self.metrics,
+                )
+                .await
             }
             RouteType::ImeProxy => {
-                handlers::ime::handle_ime_upstream(ctx, matched.params, &self.vnc_backends, &self.metrics)
-                    .await
+                handlers::ime::handle_ime_upstream(
+                    ctx,
+                    matched.params,
+                    &self.vnc_backends,
+                    &self.metrics,
+                )
+                .await
             }
             RouteType::TtydProxy => {
-                handlers::ttyd::handle_ttyd_upstream(ctx, matched.params, &self.vnc_backends, &self.metrics)
-                    .await
+                handlers::ttyd::handle_ttyd_upstream(
+                    ctx,
+                    matched.params,
+                    &self.vnc_backends,
+                    &self.metrics,
+                )
+                .await
             }
             RouteType::WebTtydProxy => {
-                handlers::ttyd::handle_web_ttyd_upstream(ctx, matched.params, &self.metrics)
-                    .await
+                handlers::ttyd::handle_web_ttyd_upstream(ctx, matched.params, &self.metrics).await
             }
         }
     }
@@ -385,7 +434,9 @@ impl ProxyHttp for PortProxy {
 
         // 如果有目标端口，记录端口指标
         if let Some(port) = ctx.target_port {
-            self.metrics.record_response_port(port, &status_text, duration).await;
+            self.metrics
+                .record_response_port(port, &status_text, duration)
+                .await;
         }
 
         // 减少活跃连接数
@@ -418,7 +469,60 @@ impl ProxyHttp for PortProxy {
             ctx.error_body_buf.extend_from_slice(body_bytes);
         }
 
+        // 注意：VNC WS 流量跟踪**不放在这里**！
+        // upstream_response_body_filter 只在收到上游响应时触发一次（每个 chunk），
+        // **WebSocket upgrade 之后的 raw stream（UpgradedBody）不会触发此 hook**。
+        // VNC 活跃跟踪放在 response_body_filter（下游发送前过滤），后者对 UpgradedBody 也触发。
+        // 见 pingora-proxy 0.8 源码 proxy_h1.rs:723-740 和 proxy_custom.rs:618-627。
+
         Ok(None)
+    }
+
+    /// 下游响应体过滤（每个发送到客户端的 chunk 都触发，**包括 WS upgrade 后的 UpgradedBody**）
+    ///
+    /// 关键设计：本 hook 是 pingora 中唯一能在 WS upgrade 后持续被调用的 HTTP 层 hook。
+    /// VNC WS 流量（屏幕刷新、鼠标位置等）经过此 hook 时（节流 10s），写入 vnc_activity[user_id]。
+    /// rcoder 后台任务每 30s 扫描，对近期有 VNC 活动的 user 续期 storage 活跃时间，
+    /// 防止 cleanup_task 在用户使用 VNC 桌面期间误判 idle 并销毁容器。
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        _body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> PingoraResult<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // 只对设置了 ctx.user_id 的路由生效（目前仅 VNC）
+        if let Some(ref user_id) = ctx.user_id {
+            record_vnc_activity(&self.vnc_activity, user_id);
+        }
+        Ok(None)
+    }
+}
+
+/// VNC 活跃时间戳节流写入（10s 一次）
+///
+/// 独立函数便于单元测试。设计要点：
+/// - 用 entry API 原子化"检查 + 写入"，避免 get+insert TOCTOU
+/// - 已有条目距上次写入 < 10s 时跳过（节流，VNC 30fps 但 10s 内只写一次）
+/// - value 是 AtomicI64，写入只需 entry read lock + atomic store（无写锁竞争）
+pub fn record_vnc_activity(vnc_activity: &DashMap<String, AtomicI64>, user_id: &str) {
+    const THROTTLE_SECS: i64 = 10;
+    let now_secs = chrono::Utc::now().timestamp();
+
+    match vnc_activity.entry(user_id.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(e) => {
+            // 读 last_seen 决定是否需要更新（view 风格：闭包结束锁立即释放）
+            let last = e.get().load(Ordering::Relaxed);
+            if now_secs - last >= THROTTLE_SECS {
+                e.get().store(now_secs, Ordering::Relaxed);
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(e) => {
+            e.insert(AtomicI64::new(now_secs));
+        }
     }
 }
 
@@ -443,6 +547,7 @@ impl PingoraProxyService {
             metrics: Arc::new(ProxyMetrics::default()),
             health_map: Arc::new(RwLock::new(HashMap::new())),
             vnc_backends: Arc::new(DashMap::new()),
+            vnc_activity: Arc::new(DashMap::new()),
             api_key_manager: Arc::new(DashMap::new()),
             api_key_config: None, // 默认不启用 API Key 鉴权
         }
@@ -490,10 +595,41 @@ impl PingoraProxyService {
             use_round_robin: self.use_round_robin,
             metrics: self.metrics.clone(),
             vnc_backends: self.vnc_backends.clone(),
+            vnc_activity: self.vnc_activity.clone(),
             router,
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(),
         })
+    }
+
+    /// 获取 VNC 活跃时间快照（user_id → Unix 秒）
+    ///
+    /// 供 rcoder 后台任务每 30s 扫描使用。snapshot 后立即释放 DashMap 读锁，
+    /// 不跨 await 持锁。
+    pub fn vnc_activity_snapshot(&self) -> Vec<(String, i64)> {
+        self.vnc_activity
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// 清理过期的 VNC 活跃记录（避免 vnc_activity 无限增长）
+    ///
+    /// 删除 last_seen 在 `max_age_secs` 之前的条目。返回清理的条目数。
+    /// 两步操作：先 iter 收集 stale keys，再 remove（避免 iter+remove 死锁）。
+    pub fn evict_stale_vnc_activity(&self, max_age_secs: i64) -> usize {
+        let now = chrono::Utc::now().timestamp();
+        let stale: Vec<String> = self
+            .vnc_activity
+            .iter()
+            .filter(|e| now - e.value().load(Ordering::Relaxed) > max_age_secs)
+            .map(|e| e.key().clone())
+            .collect();
+        let count = stale.len();
+        for k in &stale {
+            self.vnc_activity.remove(k);
+        }
+        count
     }
 
     /// 获取后端数量
@@ -538,10 +674,9 @@ impl PingoraProxyService {
     /// 获取目标后端地址
     pub async fn get_target_backend(&self, port: u16) -> crate::ProxyResult<String> {
         let backends = self.backends.read().await;
-        backends
-            .get(&port)
-            .cloned()
-            .ok_or_else(|| crate::ProxyError::Backend(format!("backend service not found for port {}", port)))
+        backends.get(&port).cloned().ok_or_else(|| {
+            crate::ProxyError::Backend(format!("backend service not found for port {}", port))
+        })
     }
 
     /// 添加后端服务
@@ -627,16 +762,12 @@ impl PingoraProxyService {
         let mut results = HashMap::new();
         for (port, host) in &backends_snapshot {
             let addr = format!("{}:{}", host, port);
-            let state = match timeout(
-                Duration::from_millis(timeout_ms),
-                TcpStream::connect(&addr),
-            )
-            .await
-            {
-                Ok(Ok(_stream)) => HealthState::Healthy,
-                Ok(Err(_)) => HealthState::Unhealthy,
-                Err(_) => HealthState::Timeout,
-            };
+            let state =
+                match timeout(Duration::from_millis(timeout_ms), TcpStream::connect(&addr)).await {
+                    Ok(Ok(_stream)) => HealthState::Healthy,
+                    Ok(Err(_)) => HealthState::Unhealthy,
+                    Err(_) => HealthState::Timeout,
+                };
             results.insert(
                 *port,
                 HealthInfo {
@@ -745,6 +876,7 @@ impl Clone for PingoraProxyService {
             metrics: self.metrics.clone(),
             health_map: self.health_map.clone(),
             vnc_backends: self.vnc_backends.clone(),
+            vnc_activity: self.vnc_activity.clone(),
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(),
         }
@@ -763,6 +895,199 @@ mod tests {
         assert!(service.use_round_robin);
     }
 
+    // ========== VNC 活跃时间跟踪测试 ==========
+
+    #[test]
+    fn test_record_vnc_activity_first_write() {
+        // 首次写入：entry 不存在 → Vacant 分支 → insert
+        let map: DashMap<String, AtomicI64> = DashMap::new();
+        record_vnc_activity(&map, "user_A");
+        assert_eq!(map.len(), 1);
+        let ts = map.get("user_A").unwrap().load(Ordering::Relaxed);
+        assert!(ts > 0);
+    }
+
+    #[test]
+    fn test_record_vnc_activity_throttle() {
+        // 节流：10s 内重复调用不应更新时间戳
+        let map: DashMap<String, AtomicI64> = DashMap::new();
+
+        // 第一次写入
+        record_vnc_activity(&map, "user_A");
+        let first_ts = map.get("user_A").unwrap().load(Ordering::Relaxed);
+
+        // 立即第二次：不应更新（节流窗口内）
+        record_vnc_activity(&map, "user_A");
+        let second_ts = map.get("user_A").unwrap().load(Ordering::Relaxed);
+
+        assert_eq!(first_ts, second_ts, "10s 内重复调用不应更新");
+    }
+
+    #[test]
+    fn test_record_vnc_activity_force_update_after_throttle() {
+        // 模拟节流窗口外：手动设置一个旧时间戳，再调 record 应该更新
+        let map: DashMap<String, AtomicI64> = DashMap::new();
+        let old_ts = chrono::Utc::now().timestamp() - 100; // 100s 前
+        map.insert("user_A".to_string(), AtomicI64::new(old_ts));
+
+        record_vnc_activity(&map, "user_A");
+
+        let new_ts = map.get("user_A").unwrap().load(Ordering::Relaxed);
+        assert!(new_ts > old_ts, "节流窗口外应更新");
+        assert!(new_ts > old_ts + 50, "新时间戳应明显晚于旧时间戳");
+    }
+
+    #[test]
+    fn test_record_vnc_activity_concurrent_different_users() {
+        // 不同 user_id 应互不影响
+        let map: Arc<DashMap<String, AtomicI64>> = Arc::new(DashMap::new());
+
+        let mut handles = vec![];
+        for i in 0..10 {
+            let map = map.clone();
+            handles.push(std::thread::spawn(move || {
+                let user_id = format!("user_{}", i);
+                record_vnc_activity(&map, &user_id);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(map.len(), 10, "10 个不同 user 应有 10 个 entry");
+    }
+
+    #[test]
+    fn test_record_vnc_activity_concurrent_same_user() {
+        // 同一 user_id 并发调用：节流语义下应该只写一次（或少量次数）
+        let map: Arc<DashMap<String, AtomicI64>> = Arc::new(DashMap::new());
+
+        let mut handles = vec![];
+        for _ in 0..20 {
+            let map = map.clone();
+            handles.push(std::thread::spawn(move || {
+                record_vnc_activity(&map, "user_X");
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 所有 20 个线程在同一节流窗口内，最终只有一个时间戳
+        assert_eq!(map.len(), 1);
+        let ts = map.get("user_X").unwrap().load(Ordering::Relaxed);
+        assert!(ts > 0);
+    }
+
+    #[test]
+    fn test_vnc_activity_snapshot() {
+        let config = ProxyConfig::default();
+        let service = PingoraProxyService::new(config);
+
+        // 空 snapshot
+        assert!(service.vnc_activity_snapshot().is_empty());
+
+        // 添加 3 个 user
+        let now = chrono::Utc::now().timestamp();
+        service
+            .vnc_activity
+            .insert("user_A".to_string(), AtomicI64::new(now));
+        service
+            .vnc_activity
+            .insert("user_B".to_string(), AtomicI64::new(now - 100));
+        service
+            .vnc_activity
+            .insert("user_C".to_string(), AtomicI64::new(now - 200));
+
+        let snapshot = service.vnc_activity_snapshot();
+        assert_eq!(snapshot.len(), 3);
+
+        // snapshot 应该是 (user_id, ts) 对的集合
+        let users: Vec<_> = snapshot.iter().map(|(u, _)| u.as_str()).collect();
+        assert!(users.contains(&"user_A"));
+        assert!(users.contains(&"user_B"));
+        assert!(users.contains(&"user_C"));
+    }
+
+    #[test]
+    fn test_evict_stale_vnc_activity() {
+        let config = ProxyConfig::default();
+        let service = PingoraProxyService::new(config);
+
+        let now = chrono::Utc::now().timestamp();
+        // 3 个 user：1 个近期，2 个过期
+        service
+            .vnc_activity
+            .insert("active_user".to_string(), AtomicI64::new(now));
+        service
+            .vnc_activity
+            .insert("stale_user_1".to_string(), AtomicI64::new(now - 200));
+        service
+            .vnc_activity
+            .insert("stale_user_2".to_string(), AtomicI64::new(now - 300));
+
+        // max_age = 100s：清理 100s 前的
+        let evicted = service.evict_stale_vnc_activity(100);
+        assert_eq!(evicted, 2, "应清理 2 个过期条目");
+        assert_eq!(service.vnc_activity.len(), 1);
+        assert!(service.vnc_activity.contains_key("active_user"));
+        assert!(!service.vnc_activity.contains_key("stale_user_1"));
+        assert!(!service.vnc_activity.contains_key("stale_user_2"));
+    }
+
+    #[test]
+    fn test_evict_stale_vnc_activity_empty() {
+        let config = ProxyConfig::default();
+        let service = PingoraProxyService::new(config);
+        assert_eq!(service.evict_stale_vnc_activity(60), 0);
+    }
+
+    #[test]
+    fn test_evict_stale_vnc_activity_boundary() {
+        // 边界测试：last_seen 正好等于 max_age 边界
+        let config = ProxyConfig::default();
+        let service = PingoraProxyService::new(config);
+
+        let now = chrono::Utc::now().timestamp();
+        // now - 100，max_age = 100：now - last_seen = 100，不 > 100，不清理（严格大于）
+        service
+            .vnc_activity
+            .insert("boundary_user".to_string(), AtomicI64::new(now - 100));
+
+        let evicted = service.evict_stale_vnc_activity(100);
+        assert_eq!(evicted, 0, "严格大于语义，正好等于不清理");
+        assert!(service.vnc_activity.contains_key("boundary_user"));
+    }
+
+    #[test]
+    fn test_record_then_snapshot_then_evict_integration() {
+        // 集成测试：record → snapshot → evict 完整流程
+        let config = ProxyConfig::default();
+        let service = PingoraProxyService::new(config);
+
+        // Step 1: record 两个活跃 user
+        record_vnc_activity(&service.vnc_activity, "user_A");
+        record_vnc_activity(&service.vnc_activity, "user_B");
+
+        // Step 2: snapshot 应有 2 个
+        let snapshot = service.vnc_activity_snapshot();
+        assert_eq!(snapshot.len(), 2);
+
+        // Step 3: 手动让一个 user 变 stale（模拟 60s 没活动）
+        let old_ts = chrono::Utc::now().timestamp() - 120;
+        service
+            .vnc_activity
+            .get("user_A")
+            .unwrap()
+            .store(old_ts, Ordering::Relaxed);
+
+        // Step 4: evict 60s 前的（实际 max_age = 60s）
+        let evicted = service.evict_stale_vnc_activity(60);
+        assert_eq!(evicted, 1);
+        assert!(!service.vnc_activity.contains_key("user_A"));
+        assert!(service.vnc_activity.contains_key("user_B"));
+    }
+
     #[test]
     fn test_service_clone() {
         let config = ProxyConfig::default();
@@ -779,7 +1104,10 @@ mod tests {
         // 添加 VNC 后端
         service.add_vnc_backend("user1", "192.168.1.100");
         assert!(service.has_vnc_backend("user1"));
-        assert_eq!(service.get_vnc_backend("user1"), Some("192.168.1.100".to_string()));
+        assert_eq!(
+            service.get_vnc_backend("user1"),
+            Some("192.168.1.100".to_string())
+        );
         assert_eq!(service.vnc_backend_count(), 1);
 
         // 列出所有后端

@@ -38,27 +38,21 @@ impl SessionResolver {
     /// 解析 session_id → (identifier, service_type)
     pub async fn resolve(&self, session_id: &str) -> anyhow::Result<SessionInfo> {
         if let Some(info) = self.cache.get(session_id).await {
-            debug!(
-                "[SESSION] cache hit: {} → {}",
-                session_id, info.identifier
-            );
+            debug!("[SESSION] cache hit: {} → {}", session_id, info.identifier);
             return Ok(info);
         }
 
         debug!("[SESSION] cache miss: {}", session_id);
-        let resp = self
-            .control_client
-            .resolve_session(session_id)
-            .await?;
+        let resp = self.control_client.resolve_session(session_id).await?;
 
         if !resp.success {
             let msg = resp.message.unwrap_or_else(|| "unknown error".to_string());
             anyhow::bail!("session resolve failed for {}: {}", session_id, msg);
         }
 
-        let data = resp
-            .data
-            .ok_or_else(|| anyhow::anyhow!("session resolve returned no data for {}", session_id))?;
+        let data = resp.data.ok_or_else(|| {
+            anyhow::anyhow!("session resolve returned no data for {}", session_id)
+        })?;
 
         let info = SessionInfo {
             identifier: data.identifier.clone(),

@@ -53,9 +53,9 @@ fn setup_logging(verbose: u8, log_file: Option<&Path>) -> Option<WorkerGuard> {
     match log_file {
         Some(path) => {
             let dir = path.parent().unwrap_or_else(|| Path::new("."));
-            let file_name = path.file_name().unwrap_or_else(|| {
-                panic!("Invalid log file path: {:?}", path)
-            });
+            let file_name = path
+                .file_name()
+                .unwrap_or_else(|| panic!("Invalid log file path: {:?}", path));
             let file_appender = tracing_appender::rolling::never(dir, file_name);
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 

@@ -261,23 +261,24 @@ impl AgentSessionRegistry {
         };
 
         // 🔒 使用 entry API 原子性地更新 session_to_project
-        let old_project_for_session = match self.session_to_project.entry(new_session_id.to_string()) {
-            Entry::Occupied(mut entry) => {
-                // key 已存在，原子性地替换值
-                let old_project_id = entry.get().clone();
-                entry.insert(project_id.to_string());
-                if old_project_id != project_id {
-                    Some(old_project_id)
-                } else {
+        let old_project_for_session =
+            match self.session_to_project.entry(new_session_id.to_string()) {
+                Entry::Occupied(mut entry) => {
+                    // key 已存在，原子性地替换值
+                    let old_project_id = entry.get().clone();
+                    entry.insert(project_id.to_string());
+                    if old_project_id != project_id {
+                        Some(old_project_id)
+                    } else {
+                        None
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    // key 不存在，直接插入
+                    entry.insert(project_id.to_string());
                     None
                 }
-            }
-            Entry::Vacant(entry) => {
-                // key 不存在，直接插入
-                entry.insert(project_id.to_string());
-                None
-            }
-        };
+            };
 
         // ✅ 清理旧的 session_to_project 映射（原子操作）
         if let Some(ref old_sid) = old_session_id
@@ -666,8 +667,9 @@ impl AgentSessionRegistry {
                 {
                     oe.remove_entry();
                 }
-                if let Entry::Occupied(oe) =
-                    self.session_to_project.entry(expected_session_id.to_string())
+                if let Entry::Occupied(oe) = self
+                    .session_to_project
+                    .entry(expected_session_id.to_string())
                     && oe.get() == project_id
                 {
                     oe.remove_entry();
@@ -847,11 +849,7 @@ impl SessionRegistry for AgentSessionRegistry {
         });
     }
 
-    fn update_last_activity(
-        &self,
-        project_id: &str,
-        activity: chrono::DateTime<chrono::Utc>,
-    ) {
+    fn update_last_activity(&self, project_id: &str, activity: chrono::DateTime<chrono::Utc>) {
         self.try_update_agent_info(project_id, |info| {
             info.last_activity = activity;
             true
