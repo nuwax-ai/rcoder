@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // 导入 shared_types 以使用 ModelProviderConfig
 use shared_types::ModelProviderConfig;
@@ -109,10 +109,55 @@ impl ProxyHttp for PortProxy {
     /// 上游请求过滤阶段
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
+        // ========================================
+        // API Key 验证（在所有路由处理之前）
+        // ========================================
+        if let Some(ref api_key_config) = self.api_key_config {
+            let path = upstream_request.uri.path();
+
+            // 提取 x-api-key header
+            let api_key = session
+                .req_header()
+                .headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok());
+
+            // 验证 API Key（无锁同步验证）
+            match shared_types::ApiKeyValidator::validate(api_key_config, path, api_key) {
+                Ok(()) => {
+                    // 验证通过，继续处理
+                }
+                Err(shared_types::ApiKeyAuthError::Invalid) => {
+                    warn!("🔒 [PINGORA_AUTH] Invalid API key for path: {}", path);
+                    return Err(pingora_core::Error::new(
+                        pingora_core::ErrorType::HTTPStatus(401),
+                    )
+                    .more_context("Invalid API key".to_string()));
+                }
+                Err(shared_types::ApiKeyAuthError::Missing) => {
+                    warn!(
+                        "🔒 [PINGORA_AUTH] Missing x-api-key header for path: {}",
+                        path
+                    );
+                    return Err(pingora_core::Error::new(
+                        pingora_core::ErrorType::HTTPStatus(401),
+                    )
+                    .more_context("Missing x-api-key header".to_string()));
+                }
+                Err(shared_types::ApiKeyAuthError::ConfigError) => {
+                    error!("🔒 [PINGORA_AUTH] Configuration error");
+                    return Err(pingora_core::Error::new(
+                        pingora_core::ErrorType::HTTPStatus(500),
+                    )
+                    .more_context("Internal configuration error".to_string()));
+                }
+            }
+        }
+
         let path = Self::normalize_path(upstream_request.uri.path()).to_string();
 
         // 使用 matchit 匹配路由
@@ -138,8 +183,19 @@ impl ProxyHttp for PortProxy {
                 .await?;
             }
             RouteType::HealthCheck => {
-                // 健康检查：添加自定义头
-                upstream_request.insert_header("X-Health-Check", "true")?;
+                // 健康检查：代理到 Axum 的 /health 端点
+                // 这样既能验证 Pingora 正常运行，又能验证 Axum 正常运行
+                debug!(
+                    "🏥 Health check request: {} - proxying to Axum ({})",
+                    path, self.default_backend_port
+                );
+
+                // 修改请求路径为 /health
+                let health_uri = http::Uri::from_static("/health");
+                upstream_request.set_uri(health_uri);
+
+                // 设置目标端口为默认后端端口 (Axum)
+                ctx.target_port = Some(self.default_backend_port);
             }
             RouteType::ApiProxy => {
                 handlers::api_proxy::handle_api_proxy_request(
