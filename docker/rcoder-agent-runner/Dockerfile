@@ -44,6 +44,8 @@ RUN echo "Cache bust: ${CACHEBUST}" && npm install -g mcp-stdio-proxy@latest
 # 安装 agent-browser CLI（使用 npm 安装）
 RUN echo "Cache bust: ${CACHEBUST}" && \
     npm install -g agent-browser && \
+    mkdir -p /home/user/.config/agent-browser/chromium && \
+    chown -R user:user /home/user/.config/agent-browser && \
     agent-browser --version
 
 # 测试agent
