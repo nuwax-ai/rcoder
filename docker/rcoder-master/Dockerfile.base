@@ -139,6 +139,17 @@ RUN rm -f /etc/nginx/sites-enabled/default && \
     rm -f /etc/nginx/conf.d/default.conf
 
 # ============================================================================
+# 🔧 创建非 root 用户（用于 ttyd 等服务降权运行）
+# ============================================================================
+RUN useradd -ms /bin/bash user && \
+    usermod -aG sudo user && \
+    passwd -d user && \
+    echo "user ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers && \
+    mkdir -p /home/user && \
+    chown -R user:user /home/user && \
+    echo "✅ user 用户创建完成"
+
+# ============================================================================
 # 🖥️ ttyd - Web 终端（PTY → WebSocket，供前端 xterm.js 访问）
 # 多架构二进制（amd64 / arm64），从 GitHub release 下载
 # ============================================================================
