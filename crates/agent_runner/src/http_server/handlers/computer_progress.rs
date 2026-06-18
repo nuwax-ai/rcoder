@@ -182,31 +182,49 @@ pub async fn handle_computer_progress(
     };
 
     // 2. 创建新的消息订阅（DashMap 锁已释放，此处 await 安全）
-    let (message_rx, _cancel_token) = match session_data.create_new_connection(1000).await {
-        Ok(conn) => conn,
-        Err(e) => {
-            error!(
-                "❌ [HTTP] Failed to create session connection: session_id={}, error={}",
-                session_id, e
-            );
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(HttpResult::error_with_message(
-                    ERR_INTERNAL_SERVER_ERROR,
-                    locale,
-                    &format!(
-                        "{}: {}",
-                        get_i18n_message("error.internal_server_error", locale),
-                        e
-                    ),
-                )),
-            ));
-        }
-    };
+    let (replay_messages, message_rx, _cancel_token) =
+        match session_data.create_new_connection(1000).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!(
+                    "❌ [HTTP] Failed to create session connection: session_id={}, error={}",
+                    session_id, e
+                );
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(HttpResult::error_with_message(
+                        ERR_INTERNAL_SERVER_ERROR,
+                        locale,
+                        &format!(
+                            "{}: {}",
+                            get_i18n_message("error.internal_server_error", locale),
+                            e
+                        ),
+                    )),
+                ));
+            }
+        };
 
     // 3. 创建消息流和心跳流
     // UnifiedSessionMessage 已使用 #[serde(rename_all = "camelCase")], 序列化后符合 RCoder 约定
-    let message_stream = ReceiverStream::new(message_rx).map(|msg| {
+
+    // 📼 回放 ring buffer 中的历史消息
+    let replay_stream = futures_util::stream::iter(replay_messages.into_iter().map(|msg| {
+        let is_terminal = matches!(msg.message_type, SessionMessageType::SessionPromptEnd);
+        let json_str = match serde_json::to_string(&msg) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("[HTTP] Failed to serialize replay message: {}", e);
+                return (Ok(Event::default().data("{}")), false);
+            }
+        };
+        (
+            Ok(Event::default().event(msg.sub_type).data(json_str)),
+            is_terminal,
+        )
+    }));
+
+    let real_time_stream = ReceiverStream::new(message_rx).map(|msg| {
         let is_terminal = matches!(msg.message_type, SessionMessageType::SessionPromptEnd);
         let json_str = match serde_json::to_string(&msg) {
             Ok(s) => s,
@@ -220,6 +238,9 @@ pub async fn handle_computer_progress(
             is_terminal,
         )
     });
+
+    // 回放流 + 实时流
+    let message_stream = replay_stream.chain(real_time_stream);
 
     // 4. 创建心跳流（标记为非终端）
     let heartbeat_stream = create_heartbeat_stream(session_id.clone()).map(|event| (event, false));

@@ -104,8 +104,18 @@ pub async fn subscribe_progress(
             };
 
             match session_data.create_new_connection(100).await {
-                Ok((message_rx, cancellation_token)) => {
+                Ok((replay_messages, message_rx, cancellation_token)) => {
                     info!("📡 [gRPC] Session connection created successfully: {}", session_id_clone);
+
+                    // 📼 回放 ring buffer 中的历史消息
+                    for msg in replay_messages {
+                        let event = unified_message_to_progress_event(&msg);
+                        if tx.send(Ok(event)).await.is_err() {
+                            debug!("📡 [gRPC] Client disconnected during replay");
+                            session_data.close_current_connection().await;
+                            return;
+                        }
+                    }
 
                     let reason = run_stream_loop(
                         &session_id_clone,

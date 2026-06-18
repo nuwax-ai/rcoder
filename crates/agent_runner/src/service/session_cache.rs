@@ -135,6 +135,40 @@ impl SessionData {
         rx.await.unwrap_or(0)
     }
 
+    /// 获取 ring buffer 中所有消息的快照（非破坏性读取）
+    ///
+    /// 用于 SSE 连接建立时回放历史消息给新客户端
+    pub async fn replay_buffer(&self) -> Vec<UnifiedSessionMessage> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(SessionCommand::Replay { ack: tx })
+            .await
+            .is_err()
+        {
+            warn!("Failed to send replay command; worker has exited");
+            return vec![];
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// 清空 ring buffer 中所有消息
+    ///
+    /// 新对话开始时调用，防止回放过期的历史消息
+    pub async fn clear_message_buffer(&self) -> usize {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(SessionCommand::Clear { ack: tx })
+            .await
+            .is_err()
+        {
+            warn!("Failed to send clear command; worker has exited");
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
     /// 检查 worker 是否仍然存活
     ///
     /// 如果 worker panic 或正常退出，返回 false
@@ -181,7 +215,11 @@ impl SessionData {
     pub async fn create_new_connection(
         &self,
         buffer_size: usize,
-    ) -> Result<(mpsc::Receiver<UnifiedSessionMessage>, CancellationToken)> {
+    ) -> Result<(
+        Vec<UnifiedSessionMessage>,
+        mpsc::Receiver<UnifiedSessionMessage>,
+        CancellationToken,
+    )> {
         let start_time = std::time::Instant::now();
         debug!(
             "⏱️ [create_new_connection] Starting connection creation, buffer_size={}",
@@ -223,11 +261,30 @@ impl SessionData {
             setup_start.elapsed()
         );
 
+        // 📼 回放 ring buffer 中的历史消息（在设置 current_sender 之后）
+        // 确保快照包含设置 current_sender 之前缓冲的所有消息
+        // 时序保证：
+        // 1. 设置 current_sender 后，新消息会通过 channel 发送
+        // 2. replay_buffer() 获取的是设置 current_sender 之前缓冲的消息
+        // 3. 这些消息不会通过 current_sender 发送，所以需要回放
+        let replay_start = std::time::Instant::now();
+        let replay_messages = self.replay_buffer().await;
+        if !replay_messages.is_empty() {
+            info!(
+                "📼 [create_new_connection] Replaying {} buffered messages",
+                replay_messages.len()
+            );
+        }
+        debug!(
+            "⏱️ [create_new_connection] Replay took: {:?}",
+            replay_start.elapsed()
+        );
+
         debug!(
             "⏱️ [create_new_connection] Total connection creation took: {:?}",
             start_time.elapsed()
         );
-        Ok((rx, cancellation_token))
+        Ok((replay_messages, rx, cancellation_token))
     }
 
     /// 检查 worker 是否已完成 (non-blocking)
@@ -415,6 +472,29 @@ impl SessionWorker {
                 SessionCommand::MessageCount { ack } => {
                     let _ = ack.send(buffered_len);
                 }
+                SessionCommand::Replay { ack } => {
+                    let count = consumer.occupied_len();
+                    let mut snapshot = Vec::with_capacity(count);
+                    // Pop all items from ring buffer
+                    while let Some(msg) = consumer.try_pop() {
+                        snapshot.push(msg);
+                    }
+                    // Push them back (preserving order)
+                    let mut pushed_back = 0;
+                    for msg in &snapshot {
+                        if producer.try_push(msg.clone()).is_ok() {
+                            pushed_back += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    buffered_len = pushed_back;
+                    debug!(
+                        "📼 [SessionWorker] Replay: captured {} messages from ring buffer (occupied={}, pushed_back={})",
+                        snapshot.len(), count, pushed_back
+                    );
+                    let _ = ack.send(snapshot);
+                }
             }
         }
 
@@ -427,6 +507,7 @@ enum SessionCommand {
     Push { message: UnifiedSessionMessage },
     Clear { ack: oneshot::Sender<usize> },
     MessageCount { ack: oneshot::Sender<usize> },
+    Replay { ack: oneshot::Sender<Vec<UnifiedSessionMessage>> },
 }
 
 /// 便捷函数：添加SessionNotify消息（自动转换为统一格式）

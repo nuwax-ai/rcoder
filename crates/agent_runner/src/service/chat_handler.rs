@@ -428,6 +428,17 @@ pub async fn handle_chat_core(
             );
         } else if session_exists {
             info!("[ChatHandler] Reusing existing session: session_id={}", sid);
+            // 🧹 清空 ring buffer，防止回放过期的历史消息
+            // view() 在闭包返回后立即释放锁，无 Ref 暴露
+            if let Some(sd) = SESSION_CACHE.view(sid, |_, d| d.clone()) {
+                let cleared = sd.clear_message_buffer().await;
+                if cleared > 0 {
+                    info!(
+                        "[ChatHandler] Cleared {} stale messages from ring buffer for new conversation: session_id={}",
+                        cleared, sid
+                    );
+                }
+            }
         }
     }
 
