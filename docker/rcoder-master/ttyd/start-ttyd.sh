@@ -22,11 +22,14 @@ INDEX_PATH="${TTYD_INDEX:-/usr/local/share/ttyd/index.html}"
 CREDENTIAL="${TTYD_CREDENTIAL:-}"
 
 # ttyd -u/-g 接受数字 ID，不接受用户名；自动转换
+# 如果指定的用户不存在，自动回退到 root 用户
 USER_ID="$(id -u "${USER_NAME}" 2>/dev/null)"
 GROUP_ID="$(id -g "${USER_NAME}" 2>/dev/null)"
 if [ -z "${USER_ID}" ] || [ -z "${GROUP_ID}" ]; then
-    echo "❌ 用户 ${USER_NAME} 不存在"
-    exit 1
+    echo "⚠️  用户 ${USER_NAME} 不存在，使用 root 用户"
+    USER_NAME="root"
+    USER_ID=0
+    GROUP_ID=0
 fi
 
 AUTH_OPT=""
