@@ -396,12 +396,10 @@ impl ProjectAdapter {
     /// 顺序：先清理 session_index，再清理 projects，避免并发访问时出现不一致。
     pub fn clear_session(&self, project_id: &str) {
         // 先获取所有 session_id（用于后续清理 session_index）
-        let cleared_sids: Vec<String> =
-            if let Some(info) = self.projects.view(project_id, |_, v| v.sessions().into_iter().collect()) {
-                info
-            } else {
-                vec![]
-            };
+        let cleared_sids: Vec<String> = self
+            .projects
+            .view(project_id, |_, v| v.sessions().into_iter().collect())
+            .unwrap_or_default();
 
         // 先清理 session_index，防止并发访问时 get_by_session_id 返回已清除的 session
         for sid in &cleared_sids {
