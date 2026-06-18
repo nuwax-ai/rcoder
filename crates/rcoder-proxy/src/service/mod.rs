@@ -99,9 +99,11 @@ impl ProxyHttp for PortProxy {
     /// 请求过滤阶段：路由分发和请求处理
     async fn request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> PingoraResult<bool> {
+        let req_header = session.req_header();
+        info!("🔍 [PINGORA] request_filter called: path={}", req_header.uri.path());
         // 协议转换已移除，所有请求直接走正常代理流程
         Ok(false)
     }
@@ -113,6 +115,8 @@ impl ProxyHttp for PortProxy {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
+        info!("🔍 [PINGORA] upstream_request_filter called: path={}", upstream_request.uri.path());
+
         // ========================================
         // API Key 验证（在所有路由处理之前）
         // ========================================
@@ -248,6 +252,8 @@ impl ProxyHttp for PortProxy {
     ) -> PingoraResult<Box<HttpPeer>> {
         let req_header = session.req_header();
         let path = Self::normalize_path(req_header.uri.path());
+
+        info!("🔍 [PINGORA] upstream_peer called: path={}", path);
 
         // 使用 matchit 匹配路由
         let matched = self.router.at(path).map_err(|_| {

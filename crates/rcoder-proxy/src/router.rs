@@ -395,6 +395,18 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
             crate::ProxyError::RouteConfig(format!("ttyd route configuration error: {}", e))
         })?;
 
+    // Fallback: 匹配 /computer/ttyd/{user_id}/{project_id}（无额外路径段）
+    // matchit 的 {*path} 通配符需要至少一个字符，尾斜杠路径不匹配
+    router
+        .insert(
+            "/computer/ttyd/{user_id}/{project_id}",
+            RouteType::TtydProxy,
+        )
+        .map_err(|e| {
+            tracing::error!("[ROUTER] ttyd fallback route config failed: {}", e);
+            crate::ProxyError::RouteConfig(format!("ttyd fallback route configuration error: {}", e))
+        })?;
+
     // ========================================================================
     // 🖥️ Web ttyd 终端代理路由
     // ========================================================================
@@ -417,6 +429,18 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
         .map_err(|e| {
             tracing::error!("[ROUTER] Web ttyd route config failed: {}", e);
             crate::ProxyError::RouteConfig(format!("Web ttyd route configuration error: {}", e))
+        })?;
+
+    // Fallback: 匹配 /web/ttyd/{user_id}/{project_id}（无额外路径段）
+    // matchit 的 {*path} 通配符需要至少一个字符，尾斜杠路径不匹配
+    router
+        .insert(
+            "/web/ttyd/{user_id}/{project_id}",
+            RouteType::WebTtydProxy,
+        )
+        .map_err(|e| {
+            tracing::error!("[ROUTER] Web ttyd fallback route config failed: {}", e);
+            crate::ProxyError::RouteConfig(format!("Web ttyd fallback route configuration error: {}", e))
         })?;
 
     Ok(router)
