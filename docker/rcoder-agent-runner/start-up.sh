@@ -1745,6 +1745,57 @@ function start_ime_services() {
 
     log_success "IME passthrough services initialized"
 }
+
+# ============================================================================
+# 🖥️ ttyd Web 终端服务（PTY → WebSocket，给前端 xterm.js 用）
+# 不依赖 X11，可与 noVNC 并存：noVNC 看桌面，ttyd 敲命令
+# 降权到 user (uid 1000) 防止 -W 模式下浏览器直接以 root 跑命令
+# ============================================================================
+function start_ttyd_services() {
+    log "Starting ttyd web terminal service..."
+
+    # 检查开关（默认开，与 audio_server/ime_server 风格一致）
+    if [ "${ENABLE_TTYD:-true}" != "true" ]; then
+        log_warn "  ttyd is disabled (set ENABLE_TTYD=true to enable)"
+        return 0
+    fi
+
+    # 检查二进制（由 Dockerfile.base 注入）
+    if [ ! -x /usr/local/bin/ttyd ]; then
+        log_warn "  ttyd binary not found at /usr/local/bin/ttyd, skipping"
+        return 1
+    fi
+
+    # 检查启动脚本（由 Dockerfile 注入）
+    if [ ! -x /usr/local/bin/start-ttyd.sh ]; then
+        log_warn "  start-ttyd.sh not found, skipping"
+        return 1
+    fi
+
+    # 创建日志目录
+    local TTYD_LOG_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}/ttyd"
+    mkdir -p "$TTYD_LOG_DIR"
+    chmod 755 "$TTYD_LOG_DIR"
+    log_success "  ttyd log directory: $TTYD_LOG_DIR"
+
+    # 启动（与 ime/audio 同风格：nohup + 后台 + 写日志）
+    nohup /usr/local/bin/start-ttyd.sh > "$TTYD_LOG_DIR/ttyd.log" 2>&1 &
+
+    # 等待端口就绪（5 秒内）
+    local TTYD_PORT="${TTYD_PORT:-7681}"
+    if wait_for_port localhost "$TTYD_PORT" 5; then
+        log_success "  ttyd started"
+        log_success "  ttyd URL:        http://localhost:${TTYD_PORT}/"
+        log_success "  ttyd WebSocket:  ws://localhost:${TTYD_PORT}/ws"
+    else
+        log_warn "  ttyd port ${TTYD_PORT} not ready, check log: $TTYD_LOG_DIR/ttyd.log"
+        tail -20 "$TTYD_LOG_DIR/ttyd.log" 2>/dev/null || true
+        return 1
+    fi
+
+    return 0
+}
+
 # 设置VNC自动启动标志
 export VNC_AUTO_START=true
 
@@ -2155,6 +2206,11 @@ if [ -f /tmp/dbus-session-env ]; then
     source /tmp/dbus-session-env
     log_success "Loaded D-Bus session: $DBUS_SESSION_BUS_ADDRESS"
 fi
+
+# ========== 启动 ttyd Web 终端服务 ==========
+# ttyd 不依赖 X11，可以独立启动
+log "Starting ttyd web terminal service..."
+start_ttyd_services
 
 # 构建环境变量导出命令
 ENV_EXPORTS="export HOME=/home/user; \

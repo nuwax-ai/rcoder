@@ -139,6 +139,34 @@ RUN rm -f /etc/nginx/sites-enabled/default && \
     rm -f /etc/nginx/conf.d/default.conf
 
 # ============================================================================
+# 🖥️ ttyd - Web 终端（PTY → WebSocket，供前端 xterm.js 访问）
+# 多架构二进制（amd64 / arm64），从 GitHub release 下载
+# ============================================================================
+ARG TARGETARCH
+ARG TTYD_VERSION=1.7.7
+ARG CACHEBUST_TTYD=1
+
+RUN _ARCH="${TARGETARCH}"; \
+    if [ -z "${_ARCH}" ]; then _ARCH=$(dpkg --print-architecture); fi && \
+    echo "🔧 ttyd cache bust: ${CACHEBUST_TTYD}" && \
+    case "${_ARCH}" in \
+        "amd64") TTYD_BIN="ttyd.x86_64" ;; \
+        "arm64") TTYD_BIN="ttyd.aarch64" ;; \
+        *) echo "❌ Unsupported arch: ${_ARCH}" && exit 1 ;; \
+    esac && \
+    DOWNLOAD_URL="https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/${TTYD_BIN}" && \
+    echo "📦 Downloading ttyd ${TTYD_VERSION} for ${_ARCH} → ${TTYD_BIN}..." && \
+    curl -fsSL -o /usr/local/bin/ttyd "${DOWNLOAD_URL}" && \
+    chmod +x /usr/local/bin/ttyd && \
+    ttyd --version
+
+# 静态资源目录（index.html 由 Dockerfile 注入）
+RUN mkdir -p /usr/local/share/ttyd
+
+# ttyd 默认端口
+ENV TTYD_PORT=7681
+
+# ============================================================================
 # 基础镜像构建完成
 # ============================================================================
 # 此处不设置 ENTRYPOINT/CMD，由最终镜像设置

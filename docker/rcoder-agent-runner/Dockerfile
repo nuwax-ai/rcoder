@@ -34,9 +34,9 @@ ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium \
 # 使用构建参数破坏缓存（每次构建都获取最新版本的工具）
 ARG CACHEBUST=1
 
-# 安装 mcp-stdio-proxy（频繁更新的工具，放在最终镜像以加快构建）
+# 安装 mcp-stdio-proxy（使用 npm 安装，避免 Rust 编译问题）
 # 使用 CACHEBUST 变量触发缓存失效
-RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install mcp-stdio-proxy
+RUN echo "Cache bust: ${CACHEBUST}" && npm install -g mcp-stdio-proxy@latest
 
 # # 安装 claude-code-acp-rs CLI 工具
 # RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs --no-default-features --features otel,sacp-flush
@@ -203,6 +203,14 @@ COPY ime_server.py /usr/local/bin/ime_server.py
 RUN chmod +x /usr/local/bin/ime_server.py
 
 # ============================================================================
+# 🖥️ ttyd Web 终端配置
+# ============================================================================
+# 复制 ttyd 启动脚本和自定义前端页面
+COPY ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
+COPY ttyd/ttyd-index.html /usr/local/share/ttyd/index.html
+RUN chmod +x /usr/local/bin/start-ttyd.sh
+
+# ============================================================================
 # 🔧 eBPF 工具目录
 # ============================================================================
 # 复制整个 eBPF 工具目录到容器中
@@ -252,6 +260,9 @@ EXPOSE 6089
 
 # 暴露 IME 服务端口
 EXPOSE 6091
+
+# 暴露 ttyd Web 终端端口
+EXPOSE 7681
 
 # ============================================================================
 # 🚀 启动配置

@@ -145,9 +145,16 @@ RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest
 RUN mkdir -p /root/.config/opencode && \
     echo '{\n  "permission": {\n    "websearch": "deny",\n    "webfetch": "deny",\n    "question": "deny"\n  }\n}' > /root/.config/opencode/opencode.json
 
-
+# ============================================================================
+# 🖥️ ttyd Web 终端配置
+# ============================================================================
+# 复制 ttyd 启动脚本和自定义前端页面
+COPY docker/rcoder-master/ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
+COPY docker/rcoder-master/ttyd/ttyd-index.html /usr/local/share/ttyd/index.html
+RUN chmod +x /usr/local/bin/start-ttyd.sh
 
 # 暴露端口
 EXPOSE 8086
 EXPOSE 60000
 EXPOSE 80
+EXPOSE 7681

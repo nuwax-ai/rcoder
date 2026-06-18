@@ -146,6 +146,27 @@ pub enum RouteType {
     /// - `/computer/ttyd/user_123/proj_456/ws`    → 容器IP:7681/ws    (WebSocket)
     /// - `/computer/ttyd/user_123/proj_456/ws/token` → 容器IP:7681/ws/token
     TtydProxy,
+
+    /// 🖥️ Web ttyd 终端代理: /web/ttyd/{user_id}/{project_id}/{*path}
+    ///
+    /// **功能**: 代理到 rcoder 主服务自身的 ttyd 服务（HTTP + WebSocket 同端口 7681）
+    ///
+    /// **参数**:
+    /// - `user_id`: 用户标识符（用于日志和追踪）
+    /// - `project_id`: 项目标识符（用于设置工作目录）
+    /// - `path`: 剩余路径
+    ///   - `ws` 或 `ws/*` → WebSocket
+    ///   - 其他 → HTTP（ttyd-index.html 等静态资源）
+    ///
+    /// **目标**: 127.0.0.1:7681（rcoder-master 容器内的 ttyd 服务）
+    ///
+    /// **工作目录**: 通过 `--cwd` 参数设置为 `/app/project_workspace/{project_id}`
+    ///
+    /// **示例**:
+    /// - `/web/ttyd/user_123/proj_456/`         → 127.0.0.1:7681/ (ttyd-index.html, --cwd=/app/project_workspace/proj_456)
+    /// - `/web/ttyd/user_123/proj_456/ws`       → 127.0.0.1:7681/ws (WebSocket)
+    /// - `/web/ttyd/user_123/proj_456/ws/token` → 127.0.0.1:7681/ws/token
+    WebTtydProxy,
 }
 
 /// 创建路由表
@@ -374,6 +395,30 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
             crate::ProxyError::RouteConfig(format!("ttyd route configuration error: {}", e))
         })?;
 
+    // ========================================================================
+    // 🖥️ Web ttyd 终端代理路由
+    // ========================================================================
+    //
+    // 路径格式: /web/ttyd/{user_id}/{project_id}/{*path}
+    //
+    // 功能: 代理到 rcoder 主服务自身的 ttyd 服务（端口 7681，单端口双协议）
+    //       与 agent-runner 的 ttyd 代理不同，这里代理到本地 127.0.0.1:7681
+    //       并通过 --cwd 参数设置工作目录为 /app/project_workspace/{project_id}
+    //
+    // 示例:
+    // - /web/ttyd/user_123/proj_456/        → 127.0.0.1:7681/ (ttyd-index.html)
+    // - /web/ttyd/user_123/proj_456/ws     → 127.0.0.1:7681/ws (WebSocket)
+    //
+    router
+        .insert(
+            "/web/ttyd/{user_id}/{project_id}/{*path}",
+            RouteType::WebTtydProxy,
+        )
+        .map_err(|e| {
+            tracing::error!("[ROUTER] Web ttyd route config failed: {}", e);
+            crate::ProxyError::RouteConfig(format!("Web ttyd route configuration error: {}", e))
+        })?;
+
     Ok(router)
 }
 
@@ -425,6 +470,11 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
             "🖥️ ttyd web terminal proxy".to_string(),
             "Proxy to user's container ttyd service (single port 7681, HTTP + WebSocket)"
                 .to_string(),
+        ),
+        (
+            "/web/ttyd/{user_id}/{project_id}/{*path}".to_string(),
+            "🖥️ Web ttyd terminal proxy".to_string(),
+            "Proxy to rcoder main service ttyd (127.0.0.1:7681, --cwd=/app/project_workspace/{project_id})".to_string(),
         ),
     ]
 }
@@ -521,7 +571,7 @@ mod tests {
     #[test]
     fn test_get_routes_documentation() {
         let docs = get_routes_documentation();
-        assert_eq!(docs.len(), 8);
+        assert_eq!(docs.len(), 9);
 
         // 验证 VNC 路由文档
         assert!(docs[0].0.contains("vnc"));
@@ -554,6 +604,10 @@ mod tests {
         // 验证 ttyd 代理路由文档
         assert!(docs[7].0.contains("ttyd"));
         assert!(docs[7].1.contains("ttyd"));
+
+        // 验证 Web ttyd 代理路由文档
+        assert!(docs[8].0.contains("web/ttyd"));
+        assert!(docs[8].1.contains("Web"));
     }
 
     #[test]
@@ -565,10 +619,12 @@ mod tests {
         assert_eq!(RouteType::AudioProxy, RouteType::AudioProxy);
         assert_eq!(RouteType::ImeProxy, RouteType::ImeProxy);
         assert_eq!(RouteType::TtydProxy, RouteType::TtydProxy);
+        assert_eq!(RouteType::WebTtydProxy, RouteType::WebTtydProxy);
         assert_ne!(RouteType::VncProxy, RouteType::PortProxy);
         assert_ne!(RouteType::ApiProxy, RouteType::PortProxy);
         assert_ne!(RouteType::AudioProxy, RouteType::ImeProxy);
         assert_ne!(RouteType::TtydProxy, RouteType::VncProxy);
+        assert_ne!(RouteType::WebTtydProxy, RouteType::TtydProxy);
     }
 
     #[test]
@@ -580,6 +636,7 @@ mod tests {
         let audio = RouteType::AudioProxy;
         let ime = RouteType::ImeProxy;
         let ttyd = RouteType::TtydProxy;
+        let web_ttyd = RouteType::WebTtydProxy;
 
         let vnc_str = format!("{:?}", vnc);
         let port_str = format!("{:?}", port);
@@ -588,6 +645,7 @@ mod tests {
         let audio_str = format!("{:?}", audio);
         let ime_str = format!("{:?}", ime);
         let ttyd_str = format!("{:?}", ttyd);
+        let web_ttyd_str = format!("{:?}", web_ttyd);
 
         assert!(vnc_str.contains("VncProxy"));
         assert!(port_str.contains("PortProxy"));
@@ -596,6 +654,7 @@ mod tests {
         assert!(audio_str.contains("AudioProxy"));
         assert!(ime_str.contains("ImeProxy"));
         assert!(ttyd_str.contains("TtydProxy"));
+        assert!(web_ttyd_str.contains("WebTtydProxy"));
     }
 
     #[test]
@@ -703,5 +762,47 @@ mod tests {
         assert_eq!(audio_matched.params.get("path"), Some("ws"));
         assert_eq!(ime_matched.params.get("path"), Some("connect"));
         assert_eq!(ttyd_matched.params.get("path"), Some("ws"));
+    }
+
+    #[test]
+    fn test_web_ttyd_route_matching() {
+        let router = create_router().unwrap();
+
+        // 基本 WebSocket 路径
+        let matched = router.at("/web/ttyd/user_123/proj_456/ws").unwrap();
+        assert_eq!(*matched.value, RouteType::WebTtydProxy);
+        assert_eq!(matched.params.get("user_id"), Some("user_123"));
+        assert_eq!(matched.params.get("project_id"), Some("proj_456"));
+        assert_eq!(matched.params.get("path"), Some("ws"));
+
+        // index.html 路径
+        let matched = router
+            .at("/web/ttyd/user_123/proj_456/index.html")
+            .unwrap();
+        assert_eq!(*matched.value, RouteType::WebTtydProxy);
+        assert_eq!(matched.params.get("path"), Some("index.html"));
+
+        // 多级路径（ws/token）
+        let matched = router
+            .at("/web/ttyd/user_123/proj_456/ws/token")
+            .unwrap();
+        assert_eq!(*matched.value, RouteType::WebTtydProxy);
+        assert_eq!(matched.params.get("path"), Some("ws/token"));
+    }
+
+    #[test]
+    fn test_web_ttyd_and_computer_ttyd_not_conflict() {
+        let router = create_router().unwrap();
+
+        // 确保 web ttyd 和 computer ttyd 路由不会互相干扰
+        let web_matched = router.at("/web/ttyd/u/p/ws").unwrap();
+        assert_eq!(*web_matched.value, RouteType::WebTtydProxy);
+
+        let computer_matched = router.at("/computer/ttyd/u/p/ws").unwrap();
+        assert_eq!(*computer_matched.value, RouteType::TtydProxy);
+
+        // 路径参数各自正确解析
+        assert_eq!(web_matched.params.get("path"), Some("ws"));
+        assert_eq!(computer_matched.params.get("path"), Some("ws"));
     }
 }
