@@ -29,8 +29,18 @@ pub const GRPC_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024; // 128MB
 
 /// gRPC 请求超时（秒）
 ///
-/// Chat 等可能较慢的请求需要较长超时
+/// 用于 Channel 级别的兜底超时（连接池里的所有请求）。设为 5 分钟避免
+/// 极端慢请求被误杀；具体 RPC 的超时由各 handler 单独控制。
 pub const GRPC_REQUEST_TIMEOUT_SECS: u64 = 300;
+
+/// gRPC Chat RPC 超时（秒）
+///
+/// Chat RPC 是 fire-and-forget 语义：agent_runner 接受请求后立即返回 session_id，
+/// 实际进度通过 SubscribeProgress 流推送。300s 超时只会让 agent_runner 卡死时
+/// 客户端傻等 5 分钟，无法 SSE。30s 是合理的卡死检测窗口。
+///
+/// M1 修复：从 300s 降到 30s。
+pub const GRPC_CHAT_TIMEOUT_SECS: u64 = 30;
 
 /// CancelSession 请求超时（秒）
 ///

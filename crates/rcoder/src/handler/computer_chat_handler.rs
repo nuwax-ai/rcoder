@@ -724,8 +724,8 @@ pub(crate) async fn handle_computer_chat_internal(
 
                 // 更新活动时间
                 updated_info.update_activity();
-                // 设置 session_id
-                updated_info.set_session_id(Some(session_id.clone()));
+                // 添加 session（多 session 模型，不清除其他 session）
+                updated_info.add_session(session_id.clone());
 
                 // 更新扩展信息
                 updated_info.update_extended_from_request(
@@ -759,8 +759,8 @@ pub(crate) async fn handle_computer_chat_internal(
                 project_info.set_user_id(Some(user_id.clone()));
                 // 设置 pod_id（共享容器模式）
                 project_info.set_pod_id(request.pod_id.clone());
-                // 设置 session_id
-                project_info.set_session_id(Some(session_id.clone()));
+                // 添加 session（多 session 模型）
+                project_info.add_session(session_id.clone());
 
                 // 更新扩展信息（容器、模型配置等）
                 project_info.update_extended_from_request(
@@ -1121,15 +1121,19 @@ fn ensure_project_mapping_in_state(
     project_info.set_pod_id(request.pod_id.clone());
 
     // 🛡️ 关键修复：如果现有记录有 session_id，保留它
-    // 避免容器变更时丢失 session 状态，导致 CAS 更新失败
-    if let Some(ref existing) = existing_project
-        && let Some(existing_session_id) = existing.session_id()
-    {
-        project_info.update_session(existing_session_id.to_string());
-        debug!(
-            "🔄 [COMPUTER_CHAT] Preserved existing session_id: project_id={}, session_id={}",
-            project_id, existing_session_id
-        );
+    // 多 session 模型下：把 existing 的所有 session 都迁过来（容器变更场景）
+    if let Some(ref existing) = existing_project {
+        let existing_sessions = existing.sessions();
+        if !existing_sessions.is_empty() {
+            for sid in &existing_sessions {
+                project_info.add_session(sid.clone());
+            }
+            debug!(
+                "🔄 [COMPUTER_CHAT] Preserved {} existing session(s): project_id={}",
+                existing_sessions.len(),
+                project_id
+            );
+        }
     }
 
     // 更新容器信息

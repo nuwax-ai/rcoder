@@ -462,16 +462,21 @@ pub async fn handle_chat(
                 http_result.is_success()
             );
 
-            // 直接更新 session 映射（DashMap 单写，无 CAS 竞态）
-            state.update_session(&project_id, &session_id);
+            // C1 修复：用 add_session_to_project 走多 session 单步原子路径，
+            // 取代历史非原子的 update_session（write_session_index + entry 两步）。
+            // 多 session 模型：一个 project 可同时持多个活跃 session（多窗口场景）。
+            let added = state.add_session_to_project(&project_id, &session_id);
+            if !added {
+                warn!(
+                    "[CHAT] Project missing during session association, may have been concurrently removed: project_id={}, session_id={}",
+                    project_id, session_id
+                );
+            }
 
             info!(
                 "🔗 [SESSION_MAP] Associated session_id {} to project_id {}",
                 session_id, project_id
             );
-
-            // 更新项目活动时间
-            state.update_activity(&project_id);
 
             if http_result.is_success() {
                 info!(

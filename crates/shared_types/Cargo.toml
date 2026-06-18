@@ -59,6 +59,9 @@ axum-tracing-opentelemetry = { workspace = true }
 # 🚀 无锁配置热更新
 arc-swap = "1.8"
 
+# Persistent data structures for multi-session tracking (C2/M3 fix)
+im = { workspace = true }
+
 # i18n (国际化)
 shared_types_i18n = { path = "../shared_types_i18n" }
 

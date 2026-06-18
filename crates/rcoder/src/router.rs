@@ -206,14 +206,26 @@ impl AppState {
         self.projects.get_container_name_by_session(session_id)
     }
 
-    /// 更新会话信息
+    /// 向已有 project 追加 session（C1 修复推荐路径，多 session 模型）
+    ///
+    /// 单步原子，多 session 并存。返回 false 表示 project 不存在。
     #[inline]
+    pub fn add_session_to_project(&self, project_id: &str, session_id: &str) -> bool {
+        self.projects.add_session_to_project(project_id, session_id)
+    }
+
+    /// 更新会话信息（已废弃，请用 `add_session_to_project` 或 `insert_project_with_session`）
+    #[inline]
+    #[deprecated(since = "0.0.0", note = "非原子，请用 `add_session_to_project` 走多 session 路径")]
+    #[allow(deprecated)]
     pub fn update_session(&self, project_id: &str, session_id: &str) {
         self.projects.update_session(project_id, session_id);
     }
 
-    /// 原子更新会话信息（仅当当前 session_id 与预期相同时才更新）
+    /// 原子更新会话信息（已废弃，多 session 模型下 CAS 语义不再适用）
     #[inline]
+    #[deprecated(since = "0.0.0", note = "CAS 语义在多 session 模型下不再适用")]
+    #[allow(dead_code, deprecated)]
     pub fn update_session_atomic(
         &self,
         project_id: &str,
@@ -227,10 +239,16 @@ impl AppState {
         )
     }
 
-    /// 清除会话信息
+    /// 清除会话信息（清所有 session，agent stop 场景）
     #[inline]
     pub fn clear_session(&self, project_id: &str) {
         self.projects.clear_session(project_id);
+    }
+
+    /// 清除单个 session（保留 project 的其他 session）
+    #[inline]
+    pub fn clear_session_one(&self, project_id: &str, session_id: &str) -> bool {
+        self.projects.clear_session_one(project_id, session_id)
     }
 
     /// 更新项目活动时间，返回实际更新使用的时间戳

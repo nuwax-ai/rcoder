@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use im::HashSet as ImHashSet;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -43,8 +44,17 @@ pub struct ProjectCoreState {
     /// - RCoder 模式：当 pod_id 有值时，多个项目共享同一个容器
     /// - ComputerAgentRunner 模式：通常为 None（使用 user_id 共享）
     pub pod_id: Option<String>,
-    /// 会话ID，agent 服务启动时会创建一个会话ID
-    pub session_id: Option<String>,
+    /// 该 project 关联的所有 session_id 集合
+    ///
+    /// 一个 project 可以同时有多个活跃 session（多窗口/多标签场景）。
+    /// 使用 `Arc<im::HashSet>` 实现结构共享：每次更新返回新的 Arc，
+    /// 未变更部分零拷贝。读快照（cheap clone）用于无锁读路径。
+    pub sessions: Arc<ImHashSet<String>>,
+    /// 最近一次添加的 session_id（兼容旧 `session_id()` 单值读路径）
+    ///
+    /// 维护成本：add_session 时更新为 sid；remove_session 时若删的正是 latest，
+    /// 退化到任意剩余 session（iter 顺序无意义但稳定）或 None。
+    pub latest_session: Option<String>,
     /// 最后活动时间
     pub last_activity: DateTime<Utc>,
     /// 创建时间
@@ -58,7 +68,8 @@ impl ProjectCoreState {
             project_id,
             user_id: None,
             pod_id: None,
-            session_id: None,
+            sessions: Arc::new(ImHashSet::new()),
+            latest_session: None,
             last_activity: now,
             created_at: now,
         }
@@ -72,15 +83,62 @@ impl ProjectCoreState {
             project_id,
             user_id: Some(user_id),
             pod_id: None,
-            session_id: None,
+            sessions: Arc::new(ImHashSet::new()),
+            latest_session: None,
             last_activity: now,
             created_at: now,
         }
     }
 
-    /// 更新会话信息 - 高频操作
-    pub fn update_session(&mut self, session_id: String) {
-        self.session_id = Some(session_id);
+    /// 添加 session 到集合（C2 修复核心）
+    ///
+    /// - 不清除其他 session（一个 project 允许多个活跃 session 并存）
+    /// - 更新 `latest_session` 为本次添加的 sid
+    /// - 更新 `last_activity`
+    /// - `Arc<im::HashSet>` 的写时复制：仅 O(log n) 增量分配，未变更节点共享
+    pub fn add_session(&mut self, session_id: impl Into<String>) {
+        let sid = session_id.into();
+        // Arc::make_mut 在 ref_count==1 时原地修改，否则克隆内部 HashSet
+        let set = Arc::make_mut(&mut self.sessions);
+        set.insert(sid.clone());
+        self.latest_session = Some(sid);
+        self.last_activity = Utc::now();
+    }
+
+    /// 移除指定 session
+    ///
+    /// 返回 true 表示该 session 之前存在并已被移除。
+    /// 若移除的是 `latest_session`，从剩余 sessions 中任选一个作为新 latest
+    ///（im::HashSet 迭代顺序稳定但无意义，这里只是为了不返回 None 误误导读路径）。
+    pub fn remove_session(&mut self, session_id: &str) -> bool {
+        let set = Arc::make_mut(&mut self.sessions);
+        let removed = set.remove(session_id).is_some();
+        if removed
+            && self.latest_session.as_deref() == Some(session_id)
+        {
+            self.latest_session = set.iter().next().cloned();
+        }
+        if removed {
+            self.last_activity = Utc::now();
+        }
+        removed
+    }
+
+    /// 返回 sessions 的廉价快照（im::HashSet clone 是 O(1) Arc bump）
+    pub fn sessions(&self) -> ImHashSet<String> {
+        (*self.sessions).clone()
+    }
+
+    /// 当前活跃 session 数量
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// 清空所有 session
+    pub fn clear_all_sessions(&mut self) {
+        let set = Arc::make_mut(&mut self.sessions);
+        set.clear();
+        self.latest_session = None;
         self.last_activity = Utc::now();
     }
 
@@ -188,9 +246,21 @@ impl ProjectState {
         &self.core.project_id
     }
 
-    /// 获取会话ID的便捷方法
+    /// 获取最新 session_id 的便捷方法（多 session 模型下返回 latest_session）
+    ///
+    /// 兼容历史单 session 读路径。需要全量 sessions 请用 `sessions()`。
     pub fn session_id(&self) -> Option<&str> {
-        self.core.session_id.as_deref()
+        self.core.latest_session.as_deref()
+    }
+
+    /// 获取 sessions 集合的廉价快照
+    pub fn sessions(&self) -> ImHashSet<String> {
+        self.core.sessions()
+    }
+
+    /// 当前活跃 session 数量
+    pub fn session_count(&self) -> usize {
+        self.core.session_count()
     }
 
     /// 获取最后活动时间的便捷方法
@@ -226,11 +296,17 @@ impl ProjectAndContainerInfo {
         fields: ProjectExtendedFields,
     ) -> Self {
         let now = Utc::now();
+        // 兼容旧签名：session_id 参数被加入 sessions 集合
+        let mut sessions = ImHashSet::new();
+        if let Some(ref sid) = session_id {
+            sessions.insert(sid.clone());
+        }
         let core = ProjectCoreState {
             project_id,
             user_id,
             pod_id,
-            session_id,
+            sessions: Arc::new(sessions),
+            latest_session: session_id,
             last_activity: fields.last_activity.unwrap_or(now),
             created_at: fields.created_at.unwrap_or(now),
         };
@@ -246,11 +322,49 @@ impl ProjectAndContainerInfo {
         }
     }
 
-    /// 高效更新核心状态 - 新的推荐方法
-    pub fn update_session(&mut self, session_id: String) {
+    /// 添加 session（C2 修复核心 API）
+    ///
+    /// - 不清除其他 session（多 session 并存）
+    /// - 更新 latest_session
+    /// - 更新 last_activity
+    pub fn add_session(&mut self, session_id: impl Into<String>) {
         self.state.update_core(|core| {
-            core.update_session(session_id);
+            core.add_session(session_id);
         });
+    }
+
+    /// 移除指定 session
+    ///
+    /// 返回 true 表示该 session 之前存在。若移除的是 latest，自动重选。
+    pub fn remove_session(&mut self, session_id: &str) -> bool {
+        let mut removed = false;
+        self.state.update_core(|core| {
+            removed = core.remove_session(session_id);
+        });
+        removed
+    }
+
+    /// 返回 sessions 廉价快照
+    pub fn sessions(&self) -> ImHashSet<String> {
+        self.state.sessions()
+    }
+
+    /// 当前活跃 session 数量
+    pub fn session_count(&self) -> usize {
+        self.state.session_count()
+    }
+
+    /// 清空所有 session
+    pub fn clear_all_sessions(&mut self) {
+        self.state.update_core(|core| {
+            core.clear_all_sessions();
+        });
+    }
+
+    /// 高效更新核心状态（已废弃，转发到 add_session）
+    #[deprecated(since = "0.0.0", note = "use `add_session` instead - 多 session 模型不再覆盖")]
+    pub fn update_session(&mut self, session_id: String) {
+        self.add_session(session_id);
     }
 
     /// 高效更新活动时间
@@ -308,6 +422,11 @@ impl ProjectAndContainerInfo {
         self.state.session_id()
     }
 
+    /// 返回最新添加的 session_id（与 `session_id()` 等价，语义更明确）
+    pub fn latest_session(&self) -> Option<&str> {
+        self.state.core.latest_session.as_deref()
+    }
+
     pub fn last_activity(&self) -> DateTime<Utc> {
         self.state.last_activity()
     }
@@ -338,20 +457,25 @@ impl ProjectAndContainerInfo {
 
     // ========== 可变访问器（会触发写时复制） ==========
 
+    /// 设置 session_id（已废弃，转发到 add_session）
+    ///
+    /// 历史语义：`set_session_id(Some(x))` 等价"覆盖为 x"。
+    /// 新模型下转发为 `add_session(x)` —— **不再清除其他 session**。
+    /// 若调用方依赖"覆盖"语义（清除旧 session），应显式调 `clear_all_sessions()` 后再 `add_session`。
+    #[deprecated(since = "0.0.0", note = "use `add_session` instead - 多 session 模型不再覆盖")]
     pub fn set_session_id(&mut self, session_id: Option<String>) {
         if let Some(session_id) = session_id {
-            self.update_session(session_id);
+            self.add_session(session_id);
         }
     }
 
-    /// 清除会话ID（将 session_id 设置为 None）
+    /// 清除所有 session（已废弃，新代码请用 `clear_all_sessions`）
     ///
-    /// 用于 Agent 停止后清理会话状态
+    /// 历史语义：清除单一 session_id。
+    /// 新模型下"清除单一"已不适用，直接清空全部。
+    #[deprecated(since = "0.0.0", note = "use `clear_all_sessions` instead")]
     pub fn clear_session_id(&mut self) {
-        self.state.update_core(|core| {
-            core.session_id = None;
-            core.last_activity = chrono::Utc::now();
-        });
+        self.clear_all_sessions();
     }
 
     /// 设置用户ID（ComputerAgentRunner 模式专用）
@@ -412,5 +536,114 @@ impl ProjectAndContainerInfo {
             core.created_at = created_at;
             core.last_activity = last_activity;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_set_add_and_latest() {
+        let mut info = ProjectAndContainerInfo::new("p1".into());
+        assert_eq!(info.session_count(), 0);
+        assert!(info.session_id().is_none());
+        assert!(info.latest_session().is_none());
+
+        info.add_session("s1");
+        assert_eq!(info.session_count(), 1);
+        assert_eq!(info.latest_session(), Some("s1"));
+
+        info.add_session("s2");
+        assert_eq!(info.session_count(), 2);
+        assert_eq!(info.latest_session(), Some("s2"));
+        // session_id() 兼容读路径返回 latest
+        assert_eq!(info.session_id(), Some("s2"));
+
+        // sessions 快照包含两个
+        let snapshot = info.sessions();
+        assert!(snapshot.contains("s1"));
+        assert!(snapshot.contains("s2"));
+    }
+
+    #[test]
+    fn test_session_remove_and_latest_fallback() {
+        let mut info = ProjectAndContainerInfo::new("p1".into());
+        info.add_session("s1");
+        info.add_session("s2");
+        // latest 是 s2
+
+        let removed = info.remove_session("s2");
+        assert!(removed);
+        assert_eq!(info.session_count(), 1);
+        // 移除 latest 后退化到 s1
+        assert_eq!(info.latest_session(), Some("s1"));
+
+        // 移除最后一个
+        let removed2 = info.remove_session("s1");
+        assert!(removed2);
+        assert_eq!(info.session_count(), 0);
+        assert!(info.latest_session().is_none());
+
+        // 移除不存在的
+        let removed3 = info.remove_session("nonexistent");
+        assert!(!removed3);
+    }
+
+    #[test]
+    fn test_clear_all_sessions() {
+        let mut info = ProjectAndContainerInfo::new("p1".into());
+        info.add_session("s1");
+        info.add_session("s2");
+        info.add_session("s3");
+        assert_eq!(info.session_count(), 3);
+
+        info.clear_all_sessions();
+        assert_eq!(info.session_count(), 0);
+        assert!(info.latest_session().is_none());
+        assert!(info.sessions().is_empty());
+    }
+
+    /// 共享验证：Arc<im::HashSet> 的 clone 是 O(1)（仅 Arc 引用计数 bump）
+    #[test]
+    fn test_sessions_snapshot_is_cheap_clone() {
+        let mut info = ProjectAndContainerInfo::new("p1".into());
+        for i in 0..100 {
+            info.add_session(format!("s{}", i));
+        }
+        // 多次 clone 快照应该廉价
+        let snap1 = info.sessions();
+        let snap2 = info.sessions();
+        let snap3 = info.sessions();
+        assert_eq!(snap1.len(), 100);
+        assert_eq!(snap2.len(), 100);
+        assert_eq!(snap3.len(), 100);
+    }
+
+    /// Arc::make_mut 行为：ref_count > 1 时 clone，否则原地修改
+    #[test]
+    fn test_core_state_make_mut_behavior() {
+        let mut info = ProjectAndContainerInfo::new("p1".into());
+        info.add_session("s1");
+
+        // 通过 update_core 修改时，Arc 内部 make_mut
+        info.add_session("s2");
+        assert_eq!(info.session_count(), 2);
+    }
+
+    /// from_parts 兼容性：旧 session_id 参数自动转入 sessions 集合
+    #[test]
+    fn test_from_parts_legacy_session_id_arg() {
+        let info = ProjectAndContainerInfo::from_parts(
+            "p1".into(),
+            None,
+            None,
+            Some("legacy-session".into()),
+            None,
+            ProjectExtendedFields::default(),
+        );
+        assert_eq!(info.session_count(), 1);
+        assert_eq!(info.latest_session(), Some("legacy-session"));
+        assert_eq!(info.session_id(), Some("legacy-session"));
     }
 }
