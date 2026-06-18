@@ -41,10 +41,9 @@ RUN echo "Cache bust: ${CACHEBUST}" && npm install -g mcp-stdio-proxy@latest
 # # 安装 claude-code-acp-rs CLI 工具
 # RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs --no-default-features --features otel,sacp-flush
 
-# 安装 agent-browser CLI（仅安装命令行工具，不在构建期下载浏览器）
-RUN . /opt/cargo/env && \
-    echo "Cache bust: ${CACHEBUST}" && \
-    cargo install agent-browser && \
+# 安装 agent-browser CLI（使用 npm 安装）
+RUN echo "Cache bust: ${CACHEBUST}" && \
+    npm install -g agent-browser && \
     agent-browser --version
 
 # 测试agent
