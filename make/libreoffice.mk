@@ -104,6 +104,16 @@ docker-clean-libreoffice-downloads:
 	@rm -rf $(LIBREOFFICE_DOWNLOAD_DIR)
 	@echo "✅ LibreOffice 下载文件已清理"
 
+# 单独推送基础镜像到阿里云仓库（带重试，应对网络/TLS 抖动）
+# 用途: 构建已完成、仅推送失败时单独重试上传，无需重新构建整个镜像
+#       已成功上传的 blob 会自动 skip，只重传失败的层
+docker-push-agent-base:
+	@echo "📤 推送基础镜像到阿里云仓库（skopeo 内置重试 5 次，指数退避）..."
+	@skopeo copy --retry-times 5 \
+		docker-daemon:dev-rcoder-agent-base:latest \
+		docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder-agent-base:latest
+	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder-agent-base:latest"
+
 # 构建 agent-base 基础镜像（包含所有系统依赖，很少需要重新构建）
 docker-build-agent-base: docker-pre-download-libreoffice
 	@echo "🐳 构建 rcoder-agent-base 基础镜像..."
@@ -118,7 +128,5 @@ docker-build-agent-base: docker-pre-download-libreoffice
 		--build-arg CACHEBUST_NOVNC=$$(date +%s) \
 		-f Dockerfile.base -t dev-rcoder-agent-base:latest .
 	@echo "✅ rcoder-agent-base 基础镜像构建完成！"
-	@echo "📤 推送基础镜像到阿里云仓库..."
-	@skopeo copy docker-daemon:dev-rcoder-agent-base:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder-agent-base:latest
-	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder-agent-base:latest"
+	@$(MAKE) docker-push-agent-base
 	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"

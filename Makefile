@@ -8,7 +8,7 @@
 	dev-build-k8s dev-up-k8s dev-restart-k8s dev-down-k8s dev-logs-k8s \
 	dev-build-k8s-local dev-up-k8s-local dev-restart-k8s-local dev-down-k8s-local dev-logs-k8s-local dev-local-k8s \
 	docker-build docker-build-base docker-build-master docker-build-master-base \
-	docker-build-agent-runner docker-build-agent-base docker-build-agent-production \
+	docker-build-agent-runner docker-build-agent-base docker-build-agent-production docker-push-agent-base \
 	docker-pre-download-libreoffice docker-clean-libreoffice-downloads \
 	update-image-tag \
 	test test-unit test-integration test-all test-blocking \
@@ -73,6 +73,7 @@ help:
 	@echo "  make docker-build-master-base    - 仅构建 master-rcoder-base 基础镜像"
 	@echo "  make docker-build-agent-runner  - 仅构建 rcoder-agent-runner 镜像（启用 eBPF 调试）"
 	@echo "  make docker-build-agent-base     - 仅构建 rcoder-agent-base 基础镜像"
+	@echo "  make docker-push-agent-base      - 单独推送基础镜像到阿里云（带重试，推送失败可单独重试）"
 	@echo "  make docker-build-agent-production - 构建生产镜像（无 eBPF 工具，镜像更小）"
 	@echo "  make docker-pre-download-libreoffice - 预下载 LibreOffice（避免每次构建重新下载）"
 	@echo "  make docker-clean-libreoffice-downloads - 清理已下载的 LibreOffice 文件"
