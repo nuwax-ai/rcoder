@@ -478,24 +478,62 @@ impl ProxyHttp for PortProxy {
         Ok(None)
     }
 
-    /// 下游响应体过滤（每个发送到客户端的 chunk 都触发，**包括 WS upgrade 后的 UpgradedBody**）
+    /// 请求体过滤（方案 F：VNC 活跃跟踪主 hook）
     ///
-    /// 关键设计：本 hook 是 pingora 中唯一能在 WS upgrade 后持续被调用的 HTTP 层 hook。
-    /// VNC WS 流量（屏幕刷新、鼠标位置等）经过此 hook 时（节流 10s），写入 vnc_activity[user_id]。
-    /// rcoder 后台任务每 30s 扫描，对近期有 VNC 活动的 user 续期 storage 活跃时间，
-    /// 防止 cleanup_task 在用户使用 VNC 桌面期间误判 idle 并销毁容器。
+    /// pingora 源码 `proxy_h1.rs:970` 确认：**WS upgrade 后客户端→服务端的数据
+    /// （用户键盘/鼠标输入）经过 `request_body_filter`**。这是 VNC 活跃跟踪的最佳信号——
+    /// 只有用户实际操作时才触发，挂机不续期（屏幕保护/离开不刷新 last_activity）。
+    ///
+    /// 配合 `response_body_filter`（屏幕刷新方向）形成双向检测。
+    /// rcoder 后台任务每 30s 扫描 vnc_activity，续期 storage 活跃时间，
+    /// 防止 cleanup_task 误杀正在使用的 VNC 桌面容器。
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> PingoraResult<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(ref user_id) = ctx.user_id {
+            // 诊断日志：确认 request_body_filter 对 WS upgrade 后的客户端数据触发
+            debug!(
+                target: "vnc_diag",
+                "[VNC_DIAG] request_body_filter called: user_id={}, body_len={:?}, end_of_stream={}",
+                user_id,
+                body.as_ref().map(|b| b.len()),
+                end_of_stream
+            );
+            record_vnc_activity(&self.vnc_activity, user_id);
+        }
+        Ok(())
+    }
+
+    /// 下游响应体过滤（服务端→客户端方向，包括 WS upgrade 后的屏幕刷新数据）
+    ///
+    /// 与 `request_body_filter` 互补：用户挂机时屏幕仍会刷新（鼠标位置广播等），
+    /// 此 hook 也会续期。但 request_body_filter 是更精确的"用户在操作"信号。
     fn response_body_filter(
         &self,
         _session: &mut Session,
-        _body: &mut Option<bytes::Bytes>,
-        _end_of_stream: bool,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<Option<Duration>>
     where
         Self::CTX: Send + Sync,
     {
-        // 只对设置了 ctx.user_id 的路由生效（目前仅 VNC）
         if let Some(ref user_id) = ctx.user_id {
+            // 诊断日志：确认 response_body_filter 对 WS upgrade 后的数据触发
+            debug!(
+                target: "vnc_diag",
+                "[VNC_DIAG] response_body_filter called: user_id={}, body_len={:?}, end_of_stream={}",
+                user_id,
+                body.as_ref().map(|b| b.len()),
+                end_of_stream
+            );
             record_vnc_activity(&self.vnc_activity, user_id);
         }
         Ok(None)
@@ -508,6 +546,9 @@ impl ProxyHttp for PortProxy {
 /// - 用 entry API 原子化"检查 + 写入"，避免 get+insert TOCTOU
 /// - 已有条目距上次写入 < 10s 时跳过（节流，VNC 30fps 但 10s 内只写一次）
 /// - value 是 AtomicI64，写入只需 entry read lock + atomic store（无写锁竞争）
+///
+/// **诊断日志**：首次写入打 info（确认 hook 触发），实际更新打 debug（确认节流工作）。
+/// 确认 VNC activity 跟踪正常后可移除诊断日志。
 pub fn record_vnc_activity(vnc_activity: &DashMap<String, AtomicI64>, user_id: &str) {
     const THROTTLE_SECS: i64 = 10;
     let now_secs = chrono::Utc::now().timestamp();
@@ -518,10 +559,21 @@ pub fn record_vnc_activity(vnc_activity: &DashMap<String, AtomicI64>, user_id: &
             let last = e.get().load(Ordering::Relaxed);
             if now_secs - last >= THROTTLE_SECS {
                 e.get().store(now_secs, Ordering::Relaxed);
+                debug!(
+                    target: "vnc_diag",
+                    "[VNC_DIAG] record_vnc_activity updated: user_id={}, last={}, now={}, gap={}s",
+                    user_id, last, now_secs, now_secs - last
+                );
             }
+            // else: 节流窗口内，跳过
         }
         dashmap::mapref::entry::Entry::Vacant(e) => {
             e.insert(AtomicI64::new(now_secs));
+            info!(
+                target: "vnc_diag",
+                "[VNC_DIAG] record_vnc_activity FIRST WRITE: user_id={}, now={} — VNC activity tracking confirmed working",
+                user_id, now_secs
+            );
         }
     }
 }
