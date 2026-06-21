@@ -164,7 +164,7 @@ impl AgentCleaner {
     }
 
     /// 清理单个 agent
-    /// 返回 Ok(true) 表示销毁了容器，Ok(false) 表示只删除了记录
+    /// 返回 Ok(true) 表示销毁了容器，Ok(false) 表示只删除了记录、或跳过清理（竞态保护时项目仍活跃）
     async fn cleanup_agent(&self, project_id: &str) -> Result<bool> {
         info!("🧹 [cleaner] Starting cleanup agent: {}", project_id);
 
@@ -173,6 +173,19 @@ impl AgentCleaner {
             .state
             .get_project(project_id)
             .ok_or_else(|| anyhow::anyhow!("Agent does not exist: {}", project_id))?;
+
+        // 🛡️ 竞态保护：scanner 扫描到 cleaner 处理之间有时间差（gRPC 二次确认等），
+        // 期间 project 可能收到 keepalive/chat 刷新了 last_activity。
+        // 重新校验 idle_duration，避免误杀刚被保活的项目。
+        // （共享容器场景额外由 strategy 的 has_active_refs 兜底，这里覆盖独立容器场景）
+        let idle_secs = (Utc::now() - agent_info.last_activity()).num_seconds();
+        if idle_secs < self.config.idle_timeout.as_secs() as i64 {
+            info!(
+                "🔄 [cleaner] Project activity refreshed after scan, skip cleanup: project_id={}, idle_secs={}s",
+                project_id, idle_secs
+            );
+            return Ok(false);
+        }
 
         let service_type = agent_info.service_type().unwrap_or(ServiceType::RCoder);
 

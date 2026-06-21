@@ -1454,69 +1454,17 @@ pub async fn pod_keepalive(
         request.user_id, request.project_id, container_identifier
     );
 
-    // 2. 检查 存储中是否有记录，并更新活动时间
-    // 更新当前项目的 last_activity；共享容器场景下还需更新同容器下其他项目
-    let (previous_activity_time, current_activity_time, existed) = {
-        if let Some(existing_info) = state.get_project(&request.project_id) {
-            let prev = existing_info.last_activity().timestamp_millis().max(0) as u64;
-
-            // 获取实际更新的时间
-            let updated_time = state.update_activity(&request.project_id);
-            let current = updated_time
-                .map(|t| t.timestamp_millis().max(0) as u64)
-                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis().max(0) as u64);
-
-            // 更新同容器下其他项目的 last_activity（仅限共享容器场景）
-            if let Some(ref pod_id) = request.pod_id {
-                let related_projects = state.projects.find_projects_by_pod_id(pod_id);
-                for related in &related_projects {
-                    if related.project_id() != request.project_id {
-                        state.update_activity(related.project_id());
-                    }
-                }
-            }
-            // 非共享容器模式：每个项目独立，不需更新其他项目
-
-            (prev, current, true)
-        } else {
-            let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-            (0u64, now, false)
-        }
-    };
-
-    // 3. 获取或创建容器
-    let (container_info, created) = if !existed {
-        // 存储中没有记录，检查 Docker 中是否有容器
-        let existing_container =
-            ComputerContainerManager::get_container_info(&container_identifier, state.runtime())
-                .await?;
-
-        match existing_container {
-            Some(info) => {
-                // Docker 中有容器，检查并insert into storage
-                if !state.contains_project(&request.project_id) {
-                    let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
-                    project_info.set_user_id(Some(request.user_id.clone()));
-                    project_info.set_pod_id(request.pod_id.clone());
-                    project_info
-                        .set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
-                    project_info.set_container(Some(info.clone()));
-                    state
-                        .insert_project(request.project_id.clone(), Arc::new(project_info))
-                        .map_err(|e| {
-                            tracing::error!("[STORAGE] insert_project failed: {}", e);
-                            e
-                        })?;
-                    info!("[POD_KEEPALIVE] container already exists (Docker), updating 存储");
-                } else {
-                    info!(
-                        "[POD_KEEPALIVE] container already exists (Docker), 存储 already up to date"
-                    );
-                }
-                (info, false)
-            }
+    // 2. 先确认容器存在（Docker 查询），不存在直接返回错误
+    //
+    // 修复（顺序问题）：必须先确认容器存在，再刷新活动时间。
+    // 原实现先刷新 last_activity 再查 Docker，容器已被外部删除时会刷新僵尸记录的活动时间，
+    // 且 storage 残留指向不存在容器的 project 记录。
+    let container_info =
+        match ComputerContainerManager::get_container_info(&container_identifier, state.runtime())
+            .await?
+        {
+            Some(info) => info,
             None => {
-                // Docker 中也没有容器，返回错误而不是创建新容器
                 info!(
                     "❌ [POD_KEEPALIVE] container not found: container_identifier={}",
                     container_identifier
@@ -1526,21 +1474,60 @@ pub async fn pod_keepalive(
                     locale,
                 ));
             }
+        };
+
+    // 3. 刷新活动时间（容器已确认存在）
+    //
+    // existed 语义：storage 中是否已有该 project 的记录。
+    //   true  → 常规保活（update_activity 刷新 last_activity）
+    //   false → 首次保活/容器恢复后首次（insert_project 新建记录，last_activity=now）
+    //
+    // created 与 existed 互逆：created=!existed 表示"本次是否新建了 storage 记录"。
+    // 注意：keepalive 不创建容器（容器不存在直接返回错误），所以 created 不表示"容器是否新建"。
+    let (previous_activity_time, current_activity_time, existed) = {
+        if let Some(existing_info) = state.get_project(&request.project_id) {
+            // storage 有记录：刷新当前 project 的 last_activity
+            let prev = existing_info.last_activity().timestamp_millis().max(0) as u64;
+
+            // 仅刷新当前 project 的 last_activity。
+            // 共享容器（pod_id / user_id）的销毁判断由 cleanup_task 的 strategy 负责：
+            // 只要容器关联的任一 project 活跃，容器就不会被销毁（见
+            // computer_runner.rs 的 find_projects_by_user_id 和 rcoder.rs 的
+            // find_projects_by_pod_id）。因此 keepalive 无需越权同步刷新其他 project。
+            // 不活跃的 project 记录会被 cleanup 正常清理（但容器因活跃 project 保留）。
+            let updated_time = state.update_activity(&request.project_id);
+            let current = updated_time
+                .map(|t| t.timestamp_millis().max(0) as u64)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis().max(0) as u64);
+
+            (prev, current, true)
+        } else {
+            // storage 无记录：容器已确认存在（Docker 查询通过），补建 storage 记录
+            let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
+            project_info.set_user_id(Some(request.user_id.clone()));
+            project_info.set_pod_id(request.pod_id.clone());
+            project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+            project_info.set_container(Some(container_info.clone()));
+
+            let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+            state
+                .insert_project(request.project_id.clone(), Arc::new(project_info))
+                .map_err(|e| {
+                    tracing::error!("[STORAGE] insert_project failed: {}", e);
+                    e
+                })?;
+            info!(
+                "[POD_KEEPALIVE] storage record created (container already exists): project_id={}",
+                request.project_id
+            );
+
+            (0u64, now, false)
         }
-    } else {
-        // 存储中有记录，直接获取容器信息
-        let info = ComputerContainerManager::get_container_info(&container_identifier, state.runtime())
-            .await?
-            .ok_or_else(|| {
-                error!(
-                    "[POD_KEEPALIVE] Container status abnormal: 存储 has record but container not found in Docker"
-                );
-                AppError::internal_server_error("Container status abnormal")
-            })?;
-        (info, false)
     };
 
     // 4. 构建响应
+    let created = !existed;
     let pod_container_info = PodContainerInfo {
         container_id: container_info.container_id.clone(),
         status: container_info.status.clone(),
@@ -1550,8 +1537,9 @@ pub async fn pod_keepalive(
     let idle_timeout_seconds = state.config.cleanup_config.idle_timeout_seconds;
 
     let message = if created {
+        // storage 记录首次创建（容器本身早已存在，只是 storage 没记录）
         format!(
-            "Container auto created, {} minutes until auto cleanup",
+            "Container record created, {} minutes until auto cleanup",
             idle_timeout_seconds / 60
         )
     } else {

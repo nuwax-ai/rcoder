@@ -744,15 +744,19 @@ impl ProjectAdapter {
             .collect()
     }
 
-    /// 通过 pod_id 查找所有项目（O(1) 索引查找）
+    /// 通过 pod_id 查找所有项目
+    ///
+    /// **必须全量遍历**：cleanup strategy 用本方法判断共享容器（pod_id）是否有活跃引用，
+    /// 必须返回所有同 pod 的 project。`pod_id_to_project_id` 索引只存最后插入的 project_id
+    /// （insert 时覆盖），无法返回全部，所以这里用全量遍历（与 `find_projects_by_user_id` 对称）。
+    ///
+    /// O(N) 遍历，N 是 project 总数。N 通常很小（参考 `find_projects_by_user_id` 的 m4 文档）。
     pub fn find_projects_by_pod_id(&self, pod_id: &str) -> Vec<Arc<ProjectAndContainerInfo>> {
-        // 通过索引快速找到 project_id，再从 projects 获取完整信息
-        if let Some(project_id) = self.pod_id_to_project_id.get(pod_id)
-            && let Some(info) = self.projects.view(project_id.value(), |_, v| v.clone())
-        {
-            return vec![info];
-        }
-        vec![]
+        self.projects
+            .iter()
+            .filter(|e| e.value().pod_id() == Some(pod_id))
+            .map(|e| e.value().clone())
+            .collect()
     }
 
     // ========== 清理相关 ==========
@@ -1913,7 +1917,8 @@ mod tests {
 
     #[test]
     fn test_index_pod_id_lookup() {
-        // insert 后，get_container_by_pod_id 和 find_projects_by_pod_id 通过索引 O(1) 查找
+        // get_container_by_pod_id 通过索引 O(1) 查找（返回任一 project 的 container）；
+        // find_projects_by_pod_id 全量遍历返回所有同 pod project（cleanup strategy 依赖此行为）
         let adapter = make_adapter();
 
         let container = ContainerBasicInfo {
@@ -1959,6 +1964,64 @@ mod tests {
         // 不存在的 pod_id
         assert!(adapter.get_container_by_pod_id("nonexistent").is_none());
         assert!(adapter.find_projects_by_pod_id("nonexistent").is_empty());
+    }
+
+    /// 多 project 共享同一 pod_id 时，find_projects_by_pod_id 必须返回全部。
+    ///
+    /// 回归测试：原实现用 pod_id_to_project_id 索引（insert 时覆盖），
+    /// 只返回最后插入的 1 个，导致 cleanup strategy 误判"无活跃引用"误销毁容器。
+    /// 现改为全量遍历，必须返回所有同 pod project。
+    #[test]
+    fn test_find_projects_by_pod_id_multiple_projects() {
+        let adapter = make_adapter();
+
+        let container = ContainerBasicInfo {
+            container_id: "cid-shared".to_string(),
+            container_name: "shared-pod".to_string(),
+            container_ip: "10.0.0.5".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: String::new(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://shared".to_string(),
+        };
+
+        // 两个 project 共享 pod_id="pod-shared"（RCoder 共享容器模式）
+        for pid in ["proj-A", "proj-B"] {
+            let mut info = ProjectAndContainerInfo::from_parts(
+                pid.to_string(),
+                None,
+                Some("pod-shared".to_string()),
+                None,
+                Some(container.clone()),
+                ProjectExtendedFields {
+                    service_type: Some(ServiceType::RCoder),
+                    ..Default::default()
+                },
+            );
+            info.set_service_type(Some(ServiceType::RCoder));
+            adapter.insert(pid.to_string(), Arc::new(info)).unwrap();
+        }
+
+        // 关键断言：find_projects_by_pod_id 必须返回 2 个 project（不是索引覆盖后的 1 个）
+        let projects = adapter.find_projects_by_pod_id("pod-shared");
+        assert_eq!(
+            projects.len(),
+            2,
+            "find_projects_by_pod_id 必须返回所有同 pod project（全量遍历），不能只返回索引里的单个"
+        );
+
+        let project_ids: Vec<_> = projects.iter().map(|p| p.project_id()).collect();
+        assert!(project_ids.contains(&"proj-A"));
+        assert!(project_ids.contains(&"proj-B"));
+
+        // get_container_by_pod_id 仍通过索引返回（任一 project 的 container，共享同一容器）
+        let container_info = adapter.get_container_by_pod_id("pod-shared");
+        assert!(
+            container_info.is_some(),
+            "get_container_by_pod_id 应能找到共享容器"
+        );
     }
 
     #[test]
