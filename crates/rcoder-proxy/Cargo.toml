@@ -19,7 +19,6 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 dashmap = { workspace = true }
 matchit = { workspace = true }
-chrono = { workspace = true }
 
 # Pingora dependencies - 真正的 Pingora 库
 pingora = { workspace = true }

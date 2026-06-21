@@ -26,7 +26,7 @@ pub async fn handle_vnc_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,
     params: Params<'_, '_>,
-    ctx: &mut TrackingCtx,
+    ctx: &TrackingCtx,
 ) -> PingoraResult<()> {
     // 从路径参数中提取 user_id 和 project_id
     let user_id = params.get("user_id").ok_or_else(|| {
@@ -65,14 +65,6 @@ pub async fn handle_vnc_request(
     upstream_request.insert_header("X-VNC-Proxy", "pingora")?;
     upstream_request.insert_header("X-VNC-User-Id", user_id)?;
     upstream_request.insert_header("X-VNC-Project-Id", project_id)?;
-
-    // 把 user_id 存到 ctx，供后续 response_body_filter hook 识别"VNC 还在用"，
-    // 写入 vnc_activity[user_id] = now（节流 10s）。
-    // 这样 rcoder 后台任务能识别用户在用 VNC 桌面，防止 cleanup_task 误杀容器。
-    //
-    // 注意：必须用 response_body_filter（不是 upstream_response_body_filter），
-    // 因为 pingora 只对前者在 WS upgrade 后的 UpgradedBody 也触发（见 proxy_h1.rs:723）。
-    ctx.user_id = Some(user_id.to_string());
 
     Ok(())
 }

@@ -9,9 +9,8 @@ use crate::cleanup_task;
 use crate::config::AppConfig;
 use crate::router::AppState;
 use crate::service::{
-    ContainerStatusCheckerConfig, ContainerSyncConfig, VncActivitySyncConfig, VncSyncConfig,
-    start_container_status_checker, start_container_sync_task, start_vnc_activity_sync_task,
-    start_vnc_sync_task,
+    ContainerStatusCheckerConfig, ContainerSyncConfig, VncSyncConfig,
+    start_container_status_checker, start_container_sync_task, start_vnc_sync_task,
 };
 
 #[allow(dead_code)]
@@ -20,8 +19,6 @@ pub struct BackgroundTaskHandles {
     pub status_checker_handle: tokio::task::JoinHandle<()>,
     pub container_sync_handle: tokio::task::JoinHandle<()>,
     pub vnc_sync_handle: Option<tokio::task::JoinHandle<()>>,
-    /// VNC 活跃时间同步任务（防止 cleanup_task 销毁正在用 VNC 桌面的容器）
-    pub vnc_activity_sync_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub async fn start_all_background_tasks(
@@ -98,23 +95,10 @@ pub async fn start_all_background_tasks(
         None
     };
 
-    // VNC 活跃时间同步：扫描 pingora vnc_activity，防止 cleanup_task 销毁正在用 VNC 桌面的容器
-    let vnc_activity_sync_handle = if state.pingora_service.is_some() {
-        let config = VncActivitySyncConfig::default();
-        let handle = start_vnc_activity_sync_task(state.clone(), config);
-        info!(
-            "VNC activity sync started (interval: 30s, active_window: 60s) — protects VNC desktops from idle cleanup"
-        );
-        Some(handle)
-    } else {
-        None
-    };
-
     Ok(BackgroundTaskHandles {
         cleanup_handle,
         status_checker_handle,
         container_sync_handle,
         vnc_sync_handle,
-        vnc_activity_sync_handle,
     })
 }

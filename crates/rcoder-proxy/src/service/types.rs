@@ -222,11 +222,6 @@ pub struct TrackingCtx {
     pub upstream_status: Option<u16>,
     /// 错误响应体缓冲（仅在 4xx/5xx 时收集）
     pub error_body_buf: Vec<u8>,
-    /// 当前请求关联的 user_id（仅 VNC/audio/IME 等需要 user 标识的路由设置）
-    ///
-    /// 用途：response_body_filter 等 hook 识别"VNC 还在用"，写入 vnc_activity[user_id] = now
-    /// 防止 cleanup_task 在用户使用 VNC 桌面期间误判 idle 并销毁容器。
-    pub user_id: Option<String>,
 }
 
 impl Default for TrackingCtx {
@@ -248,7 +243,6 @@ impl TrackingCtx {
             api_service_name: None,
             upstream_status: None,
             error_body_buf: Vec::new(),
-            user_id: None,
         }
     }
 }
