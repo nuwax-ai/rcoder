@@ -195,9 +195,10 @@ mod tests {
     #[tokio::test]
     async fn test_load_or_default_for_service() {
         // 测试 RCoder
-        let rcoder_config =
-            AgentServersConfig::load_or_default_for_service(&shared_types::ServiceType::RCoder)
-                .await;
+        let rcoder_config = AgentServersConfig::load_or_default_for_service(
+            &shared_types::ServiceType::WebAgentRunner,
+        )
+        .await;
         assert!(!rcoder_config.agent_servers.is_empty());
 
         // 测试 ComputerAgentRunner
@@ -212,7 +213,7 @@ mod tests {
     fn test_default_for_service() {
         // 测试 RCoder
         let rcoder_config =
-            AgentServersConfig::default_for_service(&shared_types::ServiceType::RCoder);
+            AgentServersConfig::default_for_service(&shared_types::ServiceType::WebAgentRunner);
         assert!(!rcoder_config.agent_servers.is_empty());
 
         // 测试 ComputerAgentRunner

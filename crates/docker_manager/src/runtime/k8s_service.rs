@@ -27,6 +27,77 @@ use super::kubernetes_runtime::KubernetesRuntime;
 /// Agent Runner HTTP 端口（使用 shared_types 共享常量）
 const AGENT_HTTP_PORT: u32 = HTTP_DEFAULT_PORT as u32;
 
+/// K8s 标准标签前缀
+const LABEL_PREFIX: &str = "app.kubernetes.io";
+
+/// RCoder 自定义标签前缀
+const RCODER_LABEL_PREFIX: &str = "rcoder.io";
+
+/// 构建 K8s 标准标签
+///
+/// 根据 Kubernetes 推荐标签规范，为资源添加标准标签：
+/// - `app.kubernetes.io/name`: 应用名称（根据 ServiceType 动态生成）
+/// - `app.kubernetes.io/instance`: 实例标识（project_id 或 user_id）
+/// - `app.kubernetes.io/version`: 版本
+/// - `app.kubernetes.io/component`: 组件
+/// - `app.kubernetes.io/managed-by`: 管理者
+/// - `app.kubernetes.io/part-of`: 所属系统
+/// - `rcoder.io/service-type`: 服务类型
+/// - `rcoder.io/identifier`: 业务标识
+pub(crate) fn build_standard_labels(
+    identifier: &str,
+    service_type: &ServiceType,
+) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+
+    // K8s 推荐标签
+    // app.kubernetes.io/name: 应用名称，使用 service_type 的字符串表示
+    labels.insert(format!("{}/name", LABEL_PREFIX), service_type.to_string());
+    labels.insert(format!("{}/instance", LABEL_PREFIX), identifier.to_string());
+    labels.insert(format!("{}/version", LABEL_PREFIX), "v1".to_string());
+    labels.insert(format!("{}/component", LABEL_PREFIX), "agent".to_string());
+    labels.insert(
+        format!("{}/managed-by", LABEL_PREFIX),
+        "rcoder-runtime".to_string(),
+    );
+    labels.insert(format!("{}/part-of", LABEL_PREFIX), "rcoder".to_string());
+
+    // RCoder 自定义标签
+    labels.insert(
+        format!("{}/service-type", RCODER_LABEL_PREFIX),
+        service_type.to_string(),
+    );
+    labels.insert(
+        format!("{}/identifier", RCODER_LABEL_PREFIX),
+        identifier.to_string(),
+    );
+
+    labels
+}
+
+/// 构建 K8s Selector 标签
+///
+/// Selector 只包含必要的标签，用于精确匹配 Pod
+fn build_selector_labels(identifier: &str, service_type: &ServiceType) -> BTreeMap<String, String> {
+    let mut selector = BTreeMap::new();
+
+    // 使用标准标签进行选择
+    selector.insert(format!("{}/name", LABEL_PREFIX), service_type.to_string());
+    selector.insert(format!("{}/instance", LABEL_PREFIX), identifier.to_string());
+    selector.insert(
+        format!("{}/managed-by", LABEL_PREFIX),
+        "rcoder-runtime".to_string(),
+    );
+
+    // 使用自定义标签进行精确匹配
+    selector.insert(
+        format!("{}/identifier", RCODER_LABEL_PREFIX),
+        identifier.to_string(),
+    );
+
+    selector
+}
+
 /// K8s Service 生命周期管理 trait extension
 ///
 /// 为 `KubernetesRuntime` 添加 per-pod K8s Service 管理方法：
@@ -102,28 +173,13 @@ impl K8sServiceOps for KubernetesRuntime {
         }
 
         // 构建 selector labels（与 Pod labels 一致）
-        let identifier_label_key = match service_type {
-            ServiceType::ComputerAgentRunner => "user_id",
-            ServiceType::RCoder => "project_id",
-        };
-
-        let mut selector = BTreeMap::new();
-        selector.insert("managed-by".to_string(), "rcoder-runtime".to_string());
-        // identifier 直接作为 label value（K8s labels 允许下划线）
-        // 必须与 Pod labels 中的值一致（kubernetes_runtime.rs:374-378 使用原始 identifier）
-        selector.insert(identifier_label_key.to_string(), identifier.to_string());
+        let selector = build_selector_labels(identifier, service_type);
 
         let service = Service {
             metadata: ObjectMeta {
                 name: Some(svc_name.clone()),
                 namespace: Some(self.namespace.clone()),
-                labels: Some({
-                    let mut m = BTreeMap::new();
-                    m.insert("app".to_string(), "rcoder".to_string());
-                    m.insert("managed-by".to_string(), "rcoder-runtime".to_string());
-                    m.insert("service_type".to_string(), service_type.to_string());
-                    m
-                }),
+                labels: Some(build_standard_labels(identifier, service_type)),
                 ..Default::default()
             },
             spec: Some(ServiceSpec {

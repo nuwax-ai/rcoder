@@ -69,7 +69,7 @@ pub fn container_identity_from_name<'a>(
             computer_prefix.to_string(),
             ServiceType::ComputerAgentRunner,
         ),
-        (rcoder_prefix.to_string(), ServiceType::RCoder),
+        (rcoder_prefix.to_string(), ServiceType::WebAgentRunner),
     ];
     candidates.sort_by_key(|candidate| Reverse(candidate.0.len()));
     candidates.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
@@ -234,6 +234,6 @@ mod tests {
         let (identifier, service_type) =
             container_identity_from_name("rcoder-k8s-project-1", "rcoder-k8s", "computer").unwrap();
         assert_eq!(identifier, "project-1");
-        assert_eq!(service_type, ServiceType::RCoder);
+        assert_eq!(service_type, ServiceType::WebAgentRunner);
     }
 }

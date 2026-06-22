@@ -130,7 +130,7 @@ impl AgentHttpService for LocalAgentHttpService {
             attachments: request.attachments,
             data_source_attachments: request.data_source_attachments,
             model_config: request.model_provider,
-            service_type: ServiceType::RCoder,
+            service_type: ServiceType::WebAgentRunner,
             user_id: None,
             agent_config_override: request.agent_config,
             system_prompt_override: request.system_prompt,

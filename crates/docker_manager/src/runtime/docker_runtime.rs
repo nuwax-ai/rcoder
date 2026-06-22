@@ -67,7 +67,7 @@ impl ContainerRuntime for DockerRuntime {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         match service_type {
-            ServiceType::RCoder => self
+            ServiceType::WebAgentRunner => self
                 .inner
                 .get_agent_info(identifier)
                 .await
@@ -141,7 +141,7 @@ impl ContainerRuntime for DockerRuntime {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
         match service_type {
-            ServiceType::RCoder => self
+            ServiceType::WebAgentRunner => self
                 .inner
                 .stop_container(identifier)
                 .await

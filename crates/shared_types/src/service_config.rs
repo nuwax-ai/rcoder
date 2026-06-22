@@ -322,7 +322,7 @@ impl ServiceImageConfig {
         self.workspace_resolution_path
             .clone()
             .unwrap_or_else(|| match self.service_type {
-                ServiceType::RCoder => "/app/project_workspace".to_string(),
+                ServiceType::WebAgentRunner => "/app/project_workspace".to_string(),
                 ServiceType::ComputerAgentRunner => "/app/computer-project-workspace".to_string(),
             })
     }
@@ -451,12 +451,12 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
     };
 
     ServiceImageConfig {
-        service_type: ServiceType::RCoder,
+        service_type: ServiceType::WebAgentRunner,
         image: None, // 使用架构特定镜像
-        arm64_image: Some("registry.yichamao.com/rcoder:latest-arm64".to_string()),
-        amd64_image: Some("registry.yichamao.com/rcoder:latest-amd64".to_string()),
-        default_image: Some("registry.yichamao.com/rcoder:latest".to_string()),
-        image_tag_prefix: Some("rcoder-agent".to_string()),
+        arm64_image: Some("registry.yichamao.com/web-agent-runner:latest-arm64".to_string()),
+        amd64_image: Some("registry.yichamao.com/web-agent-runner:latest-amd64".to_string()),
+        default_image: Some("registry.yichamao.com/web-agent-runner:latest".to_string()),
+        image_tag_prefix: Some("web-agent-runner".to_string()),
         enabled: true, // 当前启用
         environment,
         mounts,
@@ -573,7 +573,7 @@ mod tests {
     fn test_mount_validation() {
         // 创建一个有挂载点的配置用于测试
         let config_with_mounts = ServiceImageConfig {
-            service_type: ServiceType::RCoder,
+            service_type: ServiceType::WebAgentRunner,
             image: None,
             arm64_image: Some("test-image:arm64".to_string()),
             amd64_image: Some("test-image:amd64".to_string()),
@@ -638,9 +638,9 @@ mod tests {
         let config = default_rcoder_service_config();
         let summary = config.get_summary();
 
-        assert!(summary.contains("rcoder"));
+        assert!(summary.contains("web-agent-runner"));
         assert!(summary.contains("Enabled: true"));
-        assert!(summary.contains("registry.yichamao.com/rcoder"));
+        assert!(summary.contains("registry.yichamao.com/web-agent-runner"));
     }
 
     #[test]
@@ -655,14 +655,14 @@ mod tests {
         // 测试没有 image_tag_prefix 时回退到 service_type 默认值
         let mut config = default_rcoder_service_config();
         config.image_tag_prefix = None;
-        assert_eq!(config.container_prefix(), "rcoder-agent");
+        assert_eq!(config.container_prefix(), "web-agent-runner");
     }
 
     #[test]
     fn test_container_prefix_rcoder() {
-        // RCoder 配置使用 rcoder-agent 前缀
+        // WebAgentRunner 配置使用 web-agent-runner 前缀
         let config = default_rcoder_service_config();
-        assert_eq!(config.container_prefix(), "rcoder-agent");
+        assert_eq!(config.container_prefix(), "web-agent-runner");
     }
 
     /// 测试 ServiceType::container_prefix() 与 ServiceConfig::container_prefix() 的差异

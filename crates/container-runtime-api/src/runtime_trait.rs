@@ -190,7 +190,7 @@ impl ContainerCreateParamsBuilder {
             project_id: self.project_id,
             user_id: self.user_id,
             host_workspace_path: self.host_workspace_path.unwrap_or_default(),
-            service_type: self.service_type.unwrap_or(ServiceType::RCoder),
+            service_type: self.service_type.unwrap_or(ServiceType::WebAgentRunner),
             resource_limits: self.resource_limits,
             pod_id: self.pod_id,
             isolation_type: self.isolation_type,
@@ -229,7 +229,7 @@ pub trait ContainerRuntime: Send + Sync {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        if matches!(service_type, ServiceType::RCoder) {
+        if matches!(service_type, ServiceType::WebAgentRunner) {
             return self.get_container_info(identifier).await;
         }
 

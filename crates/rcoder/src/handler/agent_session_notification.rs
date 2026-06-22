@@ -588,7 +588,7 @@ async fn validate_and_get_session_context(
             runtime
                 .find_container(
                     project_info.project_id(),
-                    &shared_types::ServiceType::RCoder,
+                    &shared_types::ServiceType::WebAgentRunner,
                 )
                 .await
         };
@@ -1261,7 +1261,7 @@ async fn get_container_sse_url(
     );
 
     if let Some(info) = runtime
-        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::RCoder)
+        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::WebAgentRunner)
         .await
         .map_err(|e| {
             error!("[CONTAINER] Failed to get container info: {}", e);

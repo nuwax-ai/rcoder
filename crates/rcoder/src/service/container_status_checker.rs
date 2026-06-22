@@ -358,7 +358,7 @@ impl ContainerStatusChecker {
                     false
                 }
             }
-            shared_types::ServiceType::RCoder => {
+            shared_types::ServiceType::WebAgentRunner => {
                 // RCoder 模式：使用 project_id 查找容器
                 match runtime
                     .find_container(container_info.project_id(), &service_type)

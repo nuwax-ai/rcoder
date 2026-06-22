@@ -25,65 +25,66 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+/// 容器创建参数
+///
+/// 封装容器创建所需的所有参数，避免函数参数过多
+#[derive(Debug, Clone)]
+pub struct ContainerCreateOptions {
+    /// 用户唯一标识符
+    pub user_id: String,
+    /// 可选的资源限额配置
+    pub resource_limits: Option<ServiceResourceLimits>,
+    /// 可选的容器唯一标识，若提供则使用此 ID 作为容器标识（实现容器复用）
+    pub pod_id: Option<String>,
+    /// 隔离类型
+    pub isolation_type: Option<String>,
+    /// 租户 ID
+    pub tenant_id: Option<String>,
+    /// 空间 ID
+    pub space_id: Option<String>,
+    /// 服务类型，决定创建哪种类型的容器
+    pub service_type: ServiceType,
+}
+
 /// Computer Agent Runner 容器管理服务
 ///
 /// 负责根据 `user_id` 获取或创建容器。
 /// 一个用户对应一个容器，容器内可以运行多个 project_id 的 Agent 实例。
+///
+/// 支持两种 ServiceType：
+/// - `ComputerAgentRunner`: 使用 user_id 作为容器标识
+/// - `WebAgentRunner`: 使用 project_id 作为容器标识
 pub struct ComputerContainerManager;
 
 impl ComputerContainerManager {
-    /// 根据 user_id 或 pod_id 获取或创建容器
+    /// 根据 user_id 或 pod_id 获取或创建容器（支持指定 ServiceType）
     ///
-    /// 容器命名规则: `computer-agent-runner-{pod_id}` 或 `computer-agent-runner-{user_id}`
-    /// 工作区路径: `/app/computer-project-workspace/{user_id}` 或基于 isolation 的路径
+    /// 容器命名规则:
+    /// - ComputerAgentRunner: `computer-agent-runner-{pod_id}` 或 `computer-agent-runner-{user_id}`
+    /// - WebAgentRunner: `web-agent-runner-{project_id}`
     ///
     /// # 参数
-    /// - `user_id`: 用户唯一标识符
-    /// - `resource_limits`: 可选的资源限额配置
-    /// - `pod_id`: 可选的容器唯一标识，若提供则使用此 ID 作为容器标识（实现容器复用）
-    /// - `isolation_type`: 隔离类型
-    /// - `tenant_id`: 租户 ID
-    /// - `space_id`: 空间 ID
+    /// - `options`: 容器创建选项
+    /// - `runtime`: 容器运行时
     ///
     /// # 返回
     /// 容器基本信息，包含容器 ID、IP 地址等
-    ///
-    /// # 示例
-    /// ```ignore
-    /// let container_info = ComputerContainerManager::get_or_create_container_for_user(
-    ///     "user_123",
-    ///     None,
-    ///     None,
-    ///     None,
-    ///     None,
-    ///     None,
-    /// ).await?;
-    /// println!("Container IP: {}", container_info.container_ip);
-    /// ```
-    pub async fn get_or_create_container_for_user(
-        user_id: &str,
-        resource_limits: Option<ServiceResourceLimits>,
-        pod_id: Option<&str>,
-        isolation_type: Option<&str>,
-        tenant_id: Option<&str>,
-        space_id: Option<&str>,
+    pub async fn get_or_create_container_for_user_with_type(
+        options: &ContainerCreateOptions,
         runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<ContainerBasicInfo, AppError> {
-        // 确定容器标识符：pod_id 有值时使用 pod_id，否则使用 user_id
-        let container_identifier = pod_id.unwrap_or(user_id);
+        // 确定容器标识符：pod_id 有值时使用 pod_id，否则根据 service_type 使用 user_id 或 project_id
+        let container_identifier = options.pod_id.as_deref().unwrap_or(&options.user_id);
 
         info!(
-            "🔍 [COMPUTER_CONTAINER] Getting/creating user container: user_id={}, pod_id={:?}, container_identifier={}",
-            user_id, pod_id, container_identifier
+            "🔍 [COMPUTER_CONTAINER] Getting/creating user container: user_id={}, pod_id={:?}, container_identifier={}, service_type={}",
+            options.user_id, options.pod_id, container_identifier, options.service_type
         );
 
         // 1. 尝试获取现有容器
         // 使用 container_identifier 作为容器标识进行查询
         if let Ok(Some(info)) = runtime
-            .get_container_info_by_identifier(
-                container_identifier,
-                &ServiceType::ComputerAgentRunner,
-            )
+            .get_container_info_by_identifier(container_identifier, &options.service_type)
             .await
         {
             // ✅ 关键修复: 先验证 IP 是否有效，再检查容器运行状态
@@ -96,10 +97,7 @@ impl ComputerContainerManager {
                 );
                 // 尝试清理已失效的容器
                 if let Err(e) = runtime
-                    .stop_container_by_identifier(
-                        container_identifier,
-                        &ServiceType::ComputerAgentRunner,
-                    )
+                    .stop_container_by_identifier(container_identifier, &options.service_type)
                     .await
                 {
                     warn!(
@@ -111,10 +109,7 @@ impl ComputerContainerManager {
             } else {
                 // IP 非空，进一步验证容器是否真的在运行
                 match runtime
-                    .is_container_running_by_identifier(
-                        container_identifier,
-                        &ServiceType::ComputerAgentRunner,
-                    )
+                    .is_container_running_by_identifier(container_identifier, &options.service_type)
                     .await
                 {
                     Ok(true) => {
@@ -132,7 +127,7 @@ impl ComputerContainerManager {
                         if let Err(e) = runtime
                             .stop_container_by_identifier(
                                 container_identifier,
-                                &ServiceType::ComputerAgentRunner,
+                                &options.service_type,
                             )
                             .await
                         {
@@ -156,19 +151,55 @@ impl ComputerContainerManager {
 
         // 2. 容器不存在或已停止，创建新容器
         info!(
-            "🏗️ [COMPUTER_CONTAINER] Creating new user container: container_identifier={}",
-            container_identifier
+            "🏗️ [COMPUTER_CONTAINER] Creating new user container: container_identifier={}, service_type={}",
+            container_identifier, options.service_type
         );
         Self::create_container_for_user(
-            user_id,
+            &options.user_id,
             runtime,
-            resource_limits,
-            pod_id,
-            isolation_type,
-            tenant_id,
-            space_id,
+            options.resource_limits.clone(),
+            options.pod_id.as_deref(),
+            options.isolation_type.as_deref(),
+            options.tenant_id.as_deref(),
+            options.space_id.as_deref(),
         )
         .await
+    }
+
+    /// 根据 user_id 或 pod_id 获取或创建容器（向后兼容，默认使用 ComputerAgentRunner）
+    ///
+    /// 容器命名规则: `computer-agent-runner-{pod_id}` 或 `computer-agent-runner-{user_id}`
+    /// 工作区路径: `/app/computer-project-workspace/{user_id}` 或基于 isolation 的路径
+    ///
+    /// # 参数
+    /// - `user_id`: 用户唯一标识符
+    /// - `resource_limits`: 可选的资源限额配置
+    /// - `pod_id`: 可选的容器唯一标识，若提供则使用此 ID 作为容器标识（实现容器复用）
+    /// - `isolation_type`: 隔离类型
+    /// - `tenant_id`: 租户 ID
+    /// - `space_id`: 空间 ID
+    ///
+    /// # 返回
+    /// 容器基本信息，包含容器 ID、IP 地址等
+    pub async fn get_or_create_container_for_user(
+        user_id: &str,
+        resource_limits: Option<ServiceResourceLimits>,
+        pod_id: Option<&str>,
+        isolation_type: Option<&str>,
+        tenant_id: Option<&str>,
+        space_id: Option<&str>,
+        runtime: &Arc<dyn ContainerRuntime>,
+    ) -> Result<ContainerBasicInfo, AppError> {
+        let options = ContainerCreateOptions {
+            user_id: user_id.to_string(),
+            resource_limits,
+            pod_id: pod_id.map(|s| s.to_string()),
+            isolation_type: isolation_type.map(|s| s.to_string()),
+            tenant_id: tenant_id.map(|s| s.to_string()),
+            space_id: space_id.map(|s| s.to_string()),
+            service_type: ServiceType::ComputerAgentRunner,
+        };
+        Self::get_or_create_container_for_user_with_type(&options, runtime).await
     }
 
     /// 强制为用户创建新容器（跳过检查）
@@ -337,17 +368,21 @@ impl ComputerContainerManager {
         Ok(user_workspace)
     }
 
-    /// 获取容器信息
+    /// 获取容器信息（支持指定 ServiceType）
     ///
-    /// 通过 user_id 查询容器是否存在
-    pub async fn get_container_info(
-        user_id: &str,
+    /// 通过 identifier 查询容器是否存在
+    pub async fn get_container_info_with_type(
+        identifier: &str,
         runtime: &Arc<dyn ContainerRuntime>,
+        service_type: &ServiceType,
     ) -> Result<Option<ContainerBasicInfo>, AppError> {
-        debug!("[COMPUTER_CONTAINER] get container: user_id={}", user_id);
+        debug!(
+            "[COMPUTER_CONTAINER] get container: identifier={}, service_type={}",
+            identifier, service_type
+        );
 
         runtime
-            .get_container_info_by_identifier(user_id, &ServiceType::ComputerAgentRunner)
+            .get_container_info_by_identifier(identifier, service_type)
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to query container info: {}", e);
@@ -356,6 +391,17 @@ impl ComputerContainerManager {
                     format!("Failed to query container info: {}", e),
                 )
             })
+    }
+
+    /// 获取容器信息（向后兼容，默认使用 ComputerAgentRunner）
+    ///
+    /// 通过 user_id 查询容器是否存在
+    pub async fn get_container_info(
+        user_id: &str,
+        runtime: &Arc<dyn ContainerRuntime>,
+    ) -> Result<Option<ContainerBasicInfo>, AppError> {
+        Self::get_container_info_with_type(user_id, runtime, &ServiceType::ComputerAgentRunner)
+            .await
     }
 }
 

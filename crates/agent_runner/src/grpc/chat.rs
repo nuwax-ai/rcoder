@@ -63,13 +63,13 @@ pub async fn chat(
         .as_ref()
         .and_then(|st| match st.as_str() {
             "ComputerAgentRunner" => Some(shared_types::ServiceType::ComputerAgentRunner),
-            "RCoder" => Some(shared_types::ServiceType::RCoder),
+            "RCoder" => Some(shared_types::ServiceType::WebAgentRunner),
             _ => {
                 warn!("[gRPC] Invalid service_type: {}, using default RCoder", st);
                 None
             }
         })
-        .unwrap_or(shared_types::ServiceType::RCoder);
+        .unwrap_or(shared_types::ServiceType::WebAgentRunner);
 
     // 确定用于拼接工作目录的标识符
     // HTTP 入口已保证：未传 agent_work_dir 时，用 project_id 赋值
@@ -87,7 +87,7 @@ pub async fn chat(
         shared_types::ServiceType::ComputerAgentRunner => {
             std::path::PathBuf::from("/home/user").join(&work_dir_id)
         }
-        shared_types::ServiceType::RCoder => {
+        shared_types::ServiceType::WebAgentRunner => {
             let tenant_id = std::env::var("TENANT_ID").ok();
             let space_id = std::env::var("SPACE_ID").ok();
             match (tenant_id, space_id) {

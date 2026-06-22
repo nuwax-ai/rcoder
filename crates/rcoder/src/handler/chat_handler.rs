@@ -18,14 +18,14 @@ use super::utils::{
 
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
 ///
-/// 1. 根据 project_id 检查或动态创建对应的容器（默认使用 ServiceType::RCoder）
+/// 1. 根据 project_id 检查或动态创建对应的容器（默认使用 ServiceType::WebAgentRunner）
 /// 2. 将原始聊天请求直接转发到容器内的 agent_runner 服务
 /// 3. 获取并返回 agent_runner 的处理结果
 ///
 /// 注意：
 /// - 所有参数处理（如 project_id、session_id 生成）都由 agent_runner 处理
 /// - RCoder 只负责容器管理和请求转发
-/// - 当前默认使用 ServiceType::RCoder，AgentRunner 模式正在开发中
+/// - 当前默认使用 ServiceType::WebAgentRunner，AgentRunner 模式正在开发中
 /// - Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 #[utoipa::path(
     post,
@@ -73,7 +73,7 @@ use super::utils::{
     tag = "chat",
     operation_id = "handle_chat",
     summary = "转发聊天消息到容器化 AI 服务",
-    description = "根据 project_id 动态管理容器（默认使用 ServiceType::RCoder），将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
+    description = "根据 project_id 动态管理容器（默认使用 ServiceType::WebAgentRunner），将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
 )]
 #[instrument(skip(state, request), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
 pub async fn handle_chat(
@@ -216,8 +216,8 @@ pub async fn handle_chat(
         project_id, request.agent_config
     );
 
-    // 第一步：获取或创建容器，默认使用 ServiceType::RCoder
-    let service_type = shared_types::ServiceType::RCoder;
+    // 第一步：获取或创建容器，默认使用 ServiceType::WebAgentRunner
+    let service_type = shared_types::ServiceType::WebAgentRunner;
     let container_info =
         crate::service::container_manager::ContainerManager::get_or_create_container(
             &project_id,
@@ -597,10 +597,10 @@ async fn forward_request_to_container_service(
             request.system_prompt.clone(),
             request.user_prompt.clone(),
             request.agent_config.clone(),
-            Some(shared_types::ServiceType::RCoder), // ✅ RCoder 模式使用 RCoder ServiceType
-            None,                                    // RCoder 模式不需要 user_id
-            false,                                   // /chat 接口不是 devcomputer
-            request.agent_work_dir.clone(),          // 🆕 传递 agent_work_dir
+            Some(shared_types::ServiceType::WebAgentRunner), // ✅ RCoder 模式使用 RCoder ServiceType
+            None,                                            // RCoder 模式不需要 user_id
+            false,                                           // /chat 接口不是 devcomputer
+            request.agent_work_dir.clone(),                  // 🆕 传递 agent_work_dir
         )
         .await
         {

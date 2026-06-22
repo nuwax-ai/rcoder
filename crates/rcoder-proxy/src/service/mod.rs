@@ -356,7 +356,13 @@ impl ProxyHttp for PortProxy {
                 .await
             }
             RouteType::WebTtydProxy => {
-                handlers::ttyd::handle_web_ttyd_upstream(ctx, matched.params, &self.metrics).await
+                handlers::ttyd::handle_web_ttyd_upstream(
+                    ctx,
+                    matched.params,
+                    &self.vnc_backends,
+                    &self.metrics,
+                )
+                .await
             }
         }
     }

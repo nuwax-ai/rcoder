@@ -161,7 +161,7 @@ impl AgentInstallStrategy for RcoderStrategy {
 pub fn create_strategy(service_type: &ServiceType) -> Option<Box<dyn AgentInstallStrategy>> {
     match service_type {
         ServiceType::ComputerAgentRunner => Some(Box::new(ComputerAgentRunnerStrategy)),
-        ServiceType::RCoder => Some(Box::new(RcoderStrategy)),
+        ServiceType::WebAgentRunner => Some(Box::new(RcoderStrategy)),
     }
 }
 
@@ -449,6 +449,6 @@ mod tests {
     #[test]
     fn create_strategy_returns_correct_type() {
         assert!(create_strategy(&ServiceType::ComputerAgentRunner).is_some());
-        assert!(create_strategy(&ServiceType::RCoder).is_some());
+        assert!(create_strategy(&ServiceType::WebAgentRunner).is_some());
     }
 }

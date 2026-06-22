@@ -460,7 +460,7 @@ impl DockerManager {
                                         container_name: info.container_name,
                                         container_ip,
                                         identifier: project_id,
-                                        service_type: info.service_type.unwrap_or(ServiceType::RCoder),
+                                        service_type: info.service_type.unwrap_or(ServiceType::WebAgentRunner),
                                     }), false))
                                 } else {
                                     Some((project_id, None, false))

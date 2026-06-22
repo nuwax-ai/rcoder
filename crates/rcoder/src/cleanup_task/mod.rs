@@ -110,13 +110,13 @@ pub async fn start_cleanup_task(
 
                     let service_type = project_info
                         .service_type()
-                        .unwrap_or(shared_types::ServiceType::RCoder);
+                        .unwrap_or(shared_types::ServiceType::WebAgentRunner);
                     let identifier = match service_type {
                         shared_types::ServiceType::ComputerAgentRunner => project_info
                             .user_id()
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| project_id.clone()),
-                        shared_types::ServiceType::RCoder => project_id.clone(),
+                        shared_types::ServiceType::WebAgentRunner => project_id.clone(),
                     };
 
                     if let Err(e) = runtime_for_k8s

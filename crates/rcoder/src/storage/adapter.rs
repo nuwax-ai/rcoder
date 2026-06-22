@@ -911,7 +911,7 @@ mod tests {
 
     fn create_test_info(project_id: &str) -> ProjectAndContainerInfo {
         let mut info = ProjectAndContainerInfo::new(project_id.to_string());
-        info.set_service_type(Some(ServiceType::RCoder));
+        info.set_service_type(Some(ServiceType::WebAgentRunner));
         info
     }
 
@@ -1352,7 +1352,7 @@ mod tests {
 
         // 第一次 save：创建新条目（ref_count=0）
         adapter
-            .save_container(&container, Some(ServiceType::RCoder))
+            .save_container(&container, Some(ServiceType::WebAgentRunner))
             .unwrap();
         assert_eq!(adapter.containers.len(), 1);
 
@@ -1767,7 +1767,7 @@ mod tests {
         assert_eq!(req.identifier, "proj-verify");
         assert_eq!(req.container_name, "c-verify");
         assert_eq!(req.container_ip, "127.0.0.1");
-        assert_eq!(req.service_type, ServiceType::RCoder);
+        assert_eq!(req.service_type, ServiceType::WebAgentRunner);
     }
 
     #[test]
@@ -1851,7 +1851,7 @@ mod tests {
 
         // save_container 注册容器
         adapter
-            .save_container(&container, Some(ServiceType::RCoder))
+            .save_container(&container, Some(ServiceType::WebAgentRunner))
             .unwrap();
 
         // insert 关联项目（container_key = project_id for RCoder without pod_id）
@@ -1940,11 +1940,11 @@ mod tests {
             None,
             Some(container),
             ProjectExtendedFields {
-                service_type: Some(ServiceType::RCoder),
+                service_type: Some(ServiceType::WebAgentRunner),
                 ..Default::default()
             },
         );
-        info.set_service_type(Some(ServiceType::RCoder));
+        info.set_service_type(Some(ServiceType::WebAgentRunner));
         adapter
             .insert("proj-1".to_string(), Arc::new(info))
             .unwrap();
@@ -1996,11 +1996,11 @@ mod tests {
                 None,
                 Some(container.clone()),
                 ProjectExtendedFields {
-                    service_type: Some(ServiceType::RCoder),
+                    service_type: Some(ServiceType::WebAgentRunner),
                     ..Default::default()
                 },
             );
-            info.set_service_type(Some(ServiceType::RCoder));
+            info.set_service_type(Some(ServiceType::WebAgentRunner));
             adapter.insert(pid.to_string(), Arc::new(info)).unwrap();
         }
 
@@ -2048,11 +2048,11 @@ mod tests {
             None,
             Some(container),
             ProjectExtendedFields {
-                service_type: Some(ServiceType::RCoder),
+                service_type: Some(ServiceType::WebAgentRunner),
                 ..Default::default()
             },
         );
-        info.set_service_type(Some(ServiceType::RCoder));
+        info.set_service_type(Some(ServiceType::WebAgentRunner));
         adapter
             .insert("proj-1".to_string(), Arc::new(info))
             .unwrap();

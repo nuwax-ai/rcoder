@@ -94,8 +94,8 @@ impl DockerContainerConfig {
     /// use docker_manager::DockerContainerConfig;
     /// use shared_types::ServiceType;
     ///
-    /// let config = DockerContainerConfig::new_for_service(ServiceType::RCoder);
-    /// assert_eq!(config.name_prefix, "rcoder-agent");
+    /// let config = DockerContainerConfig::new_for_service(ServiceType::WebAgentRunner);
+    /// assert_eq!(config.name_prefix, "web-agent-runner");
     ///
     /// let config = DockerContainerConfig::new_for_service(ServiceType::ComputerAgentRunner);
     /// assert_eq!(config.name_prefix, "computer-agent-runner");
@@ -129,7 +129,7 @@ impl DockerContainerConfig {
 impl Default for DockerContainerConfig {
     fn default() -> Self {
         // 默认使用 RCoder 服务
-        Self::new_for_service(shared_types::ServiceType::RCoder)
+        Self::new_for_service(shared_types::ServiceType::WebAgentRunner)
     }
 }
 
@@ -303,7 +303,7 @@ impl DockerContainerInfo {
                 // ComputerAgentRunner 模式优先使用 user_id
                 self.user_id.as_deref().unwrap_or(&self.project_id)
             }
-            Some(shared_types::ServiceType::RCoder) => {
+            Some(shared_types::ServiceType::WebAgentRunner) => {
                 // RCoder 模式使用 project_id
                 &self.project_id
             }

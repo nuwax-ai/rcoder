@@ -317,7 +317,7 @@ impl<'a> AgentContainerStarter<'a> {
                         }
                         // RCoder: 一个 project_id 对应一个容器
                         // 挂载: 宿主机 /project_workspace/{project_id} → 容器 /project_workspace/{project_id}
-                        ServiceType::RCoder => {
+                        ServiceType::WebAgentRunner => {
                             let pid = project_id.as_deref().unwrap_or("default");
                             (
                                 pid.to_string(),

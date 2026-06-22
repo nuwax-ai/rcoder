@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::router::AppState;
 use shared_types::{AppError, HttpResult, ServiceType};
@@ -50,7 +50,16 @@ pub async fn internal_pod_ensure(
     State(state): State<Arc<AppState>>,
     Json(request): Json<InternalEnsurePodRequest>,
 ) -> Result<Json<HttpResult<InternalEnsurePodResponse>>, AppError> {
-    let service_type = parse_service_type(&request.service_type);
+    let service_type = request.service_type.parse::<ServiceType>().map_err(|e| {
+        error!(
+            "[INTERNAL] invalid service_type '{}': {}",
+            request.service_type, e
+        );
+        AppError::with_message(
+            shared_types::error_codes::ERR_VALIDATION,
+            format!("invalid service_type: {}", e),
+        )
+    })?;
     let identifier = request.identifier.trim().to_string();
 
     if identifier.is_empty() {
@@ -92,6 +101,7 @@ pub async fn internal_pod_ensure(
                 tenant_id: None,
                 space_id: None,
                 isolation_type: None,
+                service_type: None,
             };
 
             let state_clone = state.clone();
@@ -123,7 +133,7 @@ pub async fn internal_pod_ensure(
                 &result.message,
             )))
         }
-        ServiceType::RCoder => {
+        ServiceType::WebAgentRunner => {
             // RCoder 容器由 chat_handler 在首次 /chat 时创建，
             // 此处返回 not_found 让网关回退到控制面透传。
             debug!(
@@ -156,7 +166,7 @@ pub async fn internal_session_resolve(
     let service_type = project_info
         .service_type()
         .map(|st| st.to_string())
-        .unwrap_or_else(|| "rcoder".to_string());
+        .unwrap_or_else(|| ServiceType::WebAgentRunner.to_string());
 
     debug!(
         "[INTERNAL] session resolved: {} → {} ({})",
@@ -167,20 +177,4 @@ pub async fn internal_session_resolve(
         identifier,
         service_type,
     })))
-}
-
-// ─── Helpers ──────────────────────────────────────────────────
-
-fn parse_service_type(s: &str) -> ServiceType {
-    match s {
-        "ComputerAgentRunner" => ServiceType::ComputerAgentRunner,
-        "RCoder" | "rcoder" => ServiceType::RCoder,
-        other => {
-            warn!(
-                "[INTERNAL] unknown service_type '{}', defaulting to RCoder",
-                other
-            );
-            ServiceType::RCoder
-        }
-    }
 }

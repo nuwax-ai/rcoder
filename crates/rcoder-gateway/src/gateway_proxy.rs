@@ -58,13 +58,7 @@ impl GatewayCtx {
     }
 }
 
-/// 根据 service_type 生成 K8s Service 名称前缀
-fn service_prefix(service_type: &str) -> &str {
-    match service_type {
-        "ComputerAgentRunner" => "computer-agent-runner",
-        _ => "rcoder-agent",
-    }
-}
+use shared_types::ServiceType;
 
 /// Agent Runner HTTP 端口
 const AGENT_HTTP_PORT: u16 = 8086;
@@ -140,11 +134,15 @@ impl GatewayProxy {
     }
 
     /// 根据 identifier 和 service_type 构建 K8s Service FQDN
-    fn build_service_fqdn(&self, identifier: &str, service_type: &str) -> String {
-        let prefix = service_prefix(service_type);
+    ///
+    /// FQDN 格式：`{service_type}-{identifier}-svc.{namespace}.svc.cluster.local`
+    /// 例如：`web-agent-runner-project-123-svc.default.svc.cluster.local`
+    ///
+    /// 使用 ServiceType 的 Display trait 获取字符串前缀
+    fn build_service_fqdn(&self, identifier: &str, service_type: ServiceType) -> String {
         format!(
             "{}-{}-svc.{}.svc.cluster.local",
-            prefix, identifier, self.config.namespace
+            service_type, identifier, self.config.namespace
         )
     }
 
@@ -240,14 +238,14 @@ impl ProxyHttp for GatewayProxy {
                     self.cluster_cache.get_only(&identifier).await
                 } else {
                     self.cluster_cache
-                        .get_or_ensure(&identifier, route.service_type)
+                        .get_or_ensure(&identifier, route.service_type.clone())
                         .await
                 };
 
                 match ensure_result {
                     Ok(_cluster_name) => {
                         // 直接构建 K8s Service FQDN，路由到 agent_runner
-                        let fqdn = self.build_service_fqdn(&identifier, route.service_type);
+                        let fqdn = self.build_service_fqdn(&identifier, route.service_type.clone());
                         debug!("[GATEWAY] {} → {} → agent_svc ({})", path, identifier, fqdn);
                         ctx.target = RouteTarget::AgentService(fqdn);
                     }

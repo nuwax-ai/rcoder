@@ -2,7 +2,7 @@
 //!
 //! 定期从 Runtime 同步容器的 IP 到 Pingora 的 vnc_backends 映射。
 //! 使用容器命名规则解析业务标识符：
-//! - RCoder: `rcoder-agent-{project_id}`
+//! - WebAgentRunner: `web-agent-runner-{project_id}`
 //! - ComputerAgentRunner: `computer-agent-runner-{user_id}`
 //!
 //! 解决服务重启后 VNC 映射丢失的问题，并支持容器重启后自动更新 IP。
@@ -186,7 +186,7 @@ async fn sync_vnc_backends(
             // 快照和清理之间可能有新容器被创建，直接删除会导致
             // 刚创建的容器后端被误移除
             let still_running = runtime
-                .is_container_running_by_identifier(user_id, &ServiceType::RCoder)
+                .is_container_running_by_identifier(user_id, &ServiceType::WebAgentRunner)
                 .await
                 .unwrap_or(false)
                 || runtime

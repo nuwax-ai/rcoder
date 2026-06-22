@@ -5265,6 +5265,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "shared_types",
  "tokio",
  "tracing",
  "tracing-subscriber",

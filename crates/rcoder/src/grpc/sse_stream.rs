@@ -402,7 +402,7 @@ pub async fn get_container_grpc_addr(
     );
 
     let agent_info = runtime
-        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::RCoder)
+        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::WebAgentRunner)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get container info: {}", e))?
         .ok_or_else(|| anyhow::anyhow!("Container info not found: project_id={}", project_id))?;

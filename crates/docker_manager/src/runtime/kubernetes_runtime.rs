@@ -30,8 +30,6 @@ use kube::client::Client;
 #[cfg(feature = "kubernetes")]
 use shared_types::{ContainerBasicInfo, ServiceResourceLimits, ServiceType};
 #[cfg(feature = "kubernetes")]
-use std::collections::BTreeMap;
-#[cfg(feature = "kubernetes")]
 use std::sync::Arc;
 #[cfg(feature = "kubernetes")]
 use tokio::sync::RwLock;
@@ -40,8 +38,10 @@ use tracing::{info, warn};
 
 #[cfg(feature = "kubernetes")]
 use super::{
-    k8s_backend_crd::K8sBackendCRDOps, k8s_pod::K8sPodOps, k8s_pvc::K8sPvcOps,
-    k8s_service::K8sServiceOps,
+    k8s_backend_crd::K8sBackendCRDOps,
+    k8s_pod::K8sPodOps,
+    k8s_pvc::K8sPvcOps,
+    k8s_service::{K8sServiceOps, build_standard_labels},
 };
 #[cfg(feature = "kubernetes")]
 use crate::types::DockerManagerConfig;
@@ -248,7 +248,7 @@ impl KubernetesRuntime {
         // 兜底：使用硬编码默认值（不应该到达这里，因为 multi_image_config 总是有默认值）
         warn!("[K8S] No image config found, using hardcoded fallback");
         match service_type {
-            ServiceType::RCoder => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
+            ServiceType::WebAgentRunner => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
             ServiceType::ComputerAgentRunner => {
                 "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest".to_string()
             }
@@ -366,21 +366,8 @@ impl ContainerRuntime for KubernetesRuntime {
         let service_type_str = service_type.to_string();
         let image = self.select_image(&service_type);
 
-        // Build labels using BTreeMap (required by k8s-openapi)
-        // Label 与 identifier 优先级一致：pod_id > user_id > project_id
-        let mut label_pairs = vec![
-            ("app".to_string(), "rcoder".to_string()),
-            ("managed-by".to_string(), "rcoder-runtime".to_string()),
-            ("service_type".to_string(), service_type_str.clone()),
-        ];
-        if pod_id.is_some() {
-            label_pairs.push(("pod_id".to_string(), identifier.clone()));
-        } else if user_id.is_some() {
-            label_pairs.push(("user_id".to_string(), identifier.clone()));
-        } else {
-            label_pairs.push(("project_id".to_string(), identifier.clone()));
-        }
-        let labels: BTreeMap<String, String> = label_pairs.into_iter().collect();
+        // Build labels using standard K8s labels
+        let labels = build_standard_labels(identifier, &service_type);
 
         // Build Pod object using k8s-openapi types
         // Note: Pod existence is already checked via cache above.
@@ -449,7 +436,9 @@ impl ContainerRuntime for KubernetesRuntime {
                     //     注意 rcoder-master 镜像本身没有 CMD/ENTRYPOINT，必须显式指定。
                     //   - ComputerAgentRunner 服务类型：使用镜像自己的 ENTRYPOINT（start-up.sh）。
                     command: match service_type {
-                        ServiceType::RCoder => Some(vec!["/app/bin/agent_runner".to_string()]),
+                        ServiceType::WebAgentRunner => {
+                            Some(vec!["/app/bin/agent_runner".to_string()])
+                        }
                         ServiceType::ComputerAgentRunner => None,
                     },
                     env: {
@@ -624,8 +613,11 @@ impl ContainerRuntime for KubernetesRuntime {
                     .creation_timestamp
                     .as_ref()
                     .map(|ts| {
-                        chrono::DateTime::from_timestamp(ts.0.as_second(), ts.0.subsec_nanosecond() as u32)
-                            .unwrap_or_else(Utc::now)
+                        chrono::DateTime::from_timestamp(
+                            ts.0.as_second(),
+                            ts.0.subsec_nanosecond() as u32,
+                        )
+                        .unwrap_or_else(Utc::now)
                     })
                     .unwrap_or_else(Utc::now);
 
@@ -686,20 +678,37 @@ impl ContainerRuntime for KubernetesRuntime {
             }
         }
 
-        // 2) Query by labels
-        for selector in [
+        // 2) Query by labels (使用新的标准标签)
+        let selector = format!("app.kubernetes.io/instance={}", identifier);
+        let pods = self
+            .pods()
+            .list(&ListParams::default().labels(&selector).limit(1))
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!(
+                    "Failed to list pods with selector '{}': {}",
+                    selector, e
+                ))
+            })?;
+
+        if let Some(pod) = pods.items.into_iter().next() {
+            return Ok(Some(Self::runtime_info_from_pod(&pod)));
+        }
+
+        // 3) 兼容旧标签查询（平滑迁移）
+        for old_selector in [
             format!("pod_id={}", identifier),
             format!("user_id={}", identifier),
             format!("project_id={}", identifier),
         ] {
             let pods = self
                 .pods()
-                .list(&ListParams::default().labels(&selector).limit(1))
+                .list(&ListParams::default().labels(&old_selector).limit(1))
                 .await
                 .map_err(|e| {
                     ContainerRuntimeError::K8sError(format!(
                         "Failed to list pods with selector '{}': {}",
-                        selector, e
+                        old_selector, e
                     ))
                 })?;
 
@@ -715,7 +724,7 @@ impl ContainerRuntime for KubernetesRuntime {
         // First check if pod exists with either service type to avoid unnecessary 404
         // Try both service types - one of them should have the pod
         let rcoder_exists = self
-            .find_container(project_id, &ServiceType::RCoder)
+            .find_container(project_id, &ServiceType::WebAgentRunner)
             .await?
             .is_some();
         let computer_exists = self
@@ -724,7 +733,7 @@ impl ContainerRuntime for KubernetesRuntime {
             .is_some();
 
         if rcoder_exists {
-            self.stop_container_by_identifier(project_id, &ServiceType::RCoder)
+            self.stop_container_by_identifier(project_id, &ServiceType::WebAgentRunner)
                 .await?;
             info!(
                 "[K8S] Pod for project {} deleted successfully (RCoder)",
@@ -848,7 +857,7 @@ impl ContainerRuntime for KubernetesRuntime {
 
     async fn is_container_running(&self, project_id: &str) -> ContainerRuntimeResult<bool> {
         Ok(self
-            .find_container(project_id, &ServiceType::RCoder)
+            .find_container(project_id, &ServiceType::WebAgentRunner)
             .await?
             .map(|p| p.status == ContainerRuntimeStatus::Running)
             .unwrap_or(false))
@@ -891,8 +900,11 @@ impl ContainerRuntime for KubernetesRuntime {
                     .creation_timestamp
                     .as_ref()
                     .map(|ts| {
-                        chrono::DateTime::from_timestamp(ts.0.as_second(), ts.0.subsec_nanosecond() as u32)
-                            .unwrap_or_else(Utc::now)
+                        chrono::DateTime::from_timestamp(
+                            ts.0.as_second(),
+                            ts.0.subsec_nanosecond() as u32,
+                        )
+                        .unwrap_or_else(Utc::now)
                     })
                     .unwrap_or_else(Utc::now),
             };
@@ -926,7 +938,7 @@ impl ContainerRuntime for KubernetesRuntime {
                         container_name: container_info.container_name.clone(),
                         container_ip: container_info.container_ip.clone(),
                         identifier: identifier.clone(),
-                        service_type: ServiceType::RCoder, // K8s 模式目前只有 RCoder
+                        service_type: ServiceType::WebAgentRunner, // K8s 模式目前只有 RCoder
                     });
                     info!(
                         "[K8S_SYNC] Removed stale pod from cache: {} (identifier={})",

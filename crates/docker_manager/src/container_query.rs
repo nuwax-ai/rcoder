@@ -660,7 +660,9 @@ impl DockerManager {
 
                 // 内部端口（默认）
                 let internal_port = match service_type {
-                    Some(shared_types::ServiceType::RCoder) => shared_types::GRPC_DEFAULT_PORT,
+                    Some(shared_types::ServiceType::WebAgentRunner) => {
+                        shared_types::GRPC_DEFAULT_PORT
+                    }
                     Some(shared_types::ServiceType::ComputerAgentRunner) => {
                         shared_types::HTTP_DEFAULT_PORT
                     }

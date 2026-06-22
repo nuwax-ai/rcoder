@@ -3,6 +3,7 @@
 //! 使用 matchit radix tree 匹配请求路径，区分数据面和控制面路由。
 
 use matchit::Router;
+use shared_types::ServiceType;
 
 /// 路由匹配结果
 #[derive(Debug, Clone)]
@@ -22,8 +23,8 @@ pub struct DataPlaneRoute {
     pub identifier_field: &'static str,
     /// 标识符提取来源
     pub source: IdentifierSource,
-    /// 对应的 service_type（ComputerAgentRunner 或 RCoder）
-    pub service_type: &'static str,
+    /// 对应的 service_type（ComputerAgentRunner 或 WebAgentRunner）
+    pub service_type: ServiceType,
     /// 只读路由（如 GET status），容器不存在时不应触发 pod 创建
     pub read_only: bool,
 }
@@ -53,7 +54,7 @@ pub fn build_route_table() -> Router<RouteType> {
         RouteType::DataPlane(DataPlaneRoute {
             identifier_field: field,
             source: IdentifierSource::Body,
-            service_type: "ComputerAgentRunner",
+            service_type: ServiceType::ComputerAgentRunner,
             read_only,
         })
     };
@@ -84,7 +85,7 @@ pub fn build_route_table() -> Router<RouteType> {
             RouteType::DataPlane(DataPlaneRoute {
                 identifier_field: "session_id",
                 source: IdentifierSource::Session,
-                service_type: "ComputerAgentRunner",
+                service_type: ServiceType::ComputerAgentRunner,
                 read_only: true,
             }),
         )
@@ -95,7 +96,7 @@ pub fn build_route_table() -> Router<RouteType> {
         RouteType::DataPlane(DataPlaneRoute {
             identifier_field: field,
             source: IdentifierSource::Body,
-            service_type: "RCoder",
+            service_type: ServiceType::WebAgentRunner,
             read_only,
         })
     };
@@ -117,7 +118,7 @@ pub fn build_route_table() -> Router<RouteType> {
             RouteType::DataPlane(DataPlaneRoute {
                 identifier_field: "project_id",
                 source: IdentifierSource::Path("project_id".to_string()),
-                service_type: "RCoder",
+                service_type: ServiceType::WebAgentRunner,
                 read_only: true,
             }),
         )
@@ -130,7 +131,7 @@ pub fn build_route_table() -> Router<RouteType> {
             RouteType::DataPlane(DataPlaneRoute {
                 identifier_field: "session_id",
                 source: IdentifierSource::Session,
-                service_type: "RCoder",
+                service_type: ServiceType::WebAgentRunner,
                 read_only: true,
             }),
         )
@@ -143,7 +144,7 @@ pub fn build_route_table() -> Router<RouteType> {
             RouteType::DataPlane(DataPlaneRoute {
                 identifier_field: "project_id",
                 source: IdentifierSource::Body,
-                service_type: "RCoder",
+                service_type: ServiceType::WebAgentRunner,
                 read_only: false,
             }),
         )
@@ -177,7 +178,7 @@ mod tests {
         match &result.value {
             RouteType::DataPlane(route) => {
                 assert_eq!(route.identifier_field, "user_id");
-                assert_eq!(route.service_type, "ComputerAgentRunner");
+                assert_eq!(route.service_type, ServiceType::ComputerAgentRunner);
             }
             _ => panic!("expected DataPlane"),
         }
@@ -224,7 +225,7 @@ mod tests {
         match &result.value {
             RouteType::DataPlane(route) => {
                 assert_eq!(route.identifier_field, "project_id");
-                assert_eq!(route.service_type, "RCoder");
+                assert_eq!(route.service_type, ServiceType::WebAgentRunner);
             }
             _ => panic!("expected DataPlane"),
         }

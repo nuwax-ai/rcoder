@@ -43,3 +43,6 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 matchit = { workspace = true }
 moka = { workspace = true }
+
+# Shared types
+shared_types = { path = "../shared_types" }

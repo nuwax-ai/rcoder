@@ -187,11 +187,13 @@ impl AgentCleaner {
             return Ok(false);
         }
 
-        let service_type = agent_info.service_type().unwrap_or(ServiceType::RCoder);
+        let service_type = agent_info
+            .service_type()
+            .unwrap_or(ServiceType::WebAgentRunner);
 
         // 2. 选择策略
         let strategy: &dyn super::strategies::CleanupStrategy = match service_type {
-            ServiceType::RCoder => &self.rcoder_strategy,
+            ServiceType::WebAgentRunner => &self.rcoder_strategy,
             ServiceType::ComputerAgentRunner => &self.computer_runner_strategy,
         };
 

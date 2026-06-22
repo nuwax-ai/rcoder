@@ -289,7 +289,7 @@ pub async fn list_agents(
     let service_type = if body.routing.user_id.is_some() || body.routing.pod_id.is_some() {
         ServiceType::ComputerAgentRunner
     } else {
-        ServiceType::RCoder
+        ServiceType::WebAgentRunner
     };
 
     let strategy = super::agent_install_strategy::create_strategy(&service_type);
@@ -761,7 +761,7 @@ pub async fn install_from_url(
     let service_type = if body.routing.user_id.is_some() || body.routing.pod_id.is_some() {
         ServiceType::ComputerAgentRunner
     } else {
-        ServiceType::RCoder
+        ServiceType::WebAgentRunner
     };
 
     let strategy =

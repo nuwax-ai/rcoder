@@ -345,7 +345,7 @@ impl DockerConfig {
             shared_types::service_config::default_rcoder_service_config()
         };
 
-        services.insert("rcoder".to_string(), rcoder_service);
+        services.insert("web-agent-runner".to_string(), rcoder_service);
 
         // 为 AgentRunner 服务使用默认配置
         services.insert(

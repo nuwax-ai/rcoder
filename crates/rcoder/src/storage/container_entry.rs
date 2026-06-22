@@ -132,7 +132,7 @@ mod tests {
                 created_at: Utc::now(),
                 service_url: "http://test".to_string(),
             },
-            ServiceType::RCoder,
+            ServiceType::WebAgentRunner,
         )
     }
 
@@ -182,7 +182,7 @@ mod tests {
                 created_at: Utc::now(),
                 service_url: "http://test".to_string(),
             },
-            ServiceType::RCoder,
+            ServiceType::WebAgentRunner,
             0,
         );
         assert_eq!(entry.ref_count(), 0);

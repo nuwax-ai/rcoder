@@ -94,7 +94,7 @@ where
             session_id_hint: None,
             system_prompt: None,
             agent_mode: AgentMode::Yolo,
-            service_type: shared_types::ServiceType::RCoder,
+            service_type: shared_types::ServiceType::WebAgentRunner,
             model_provider: None,
             model_env_resolver: None,
             permission_handler: None,

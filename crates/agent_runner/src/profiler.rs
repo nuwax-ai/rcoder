@@ -62,7 +62,8 @@ impl ProfilerConfig {
 ///
 /// 当 dropped 时自动停止 profiler
 pub struct ProfilerGuard {
-    _agent: Option<pyroscope::pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
+    _agent:
+        Option<pyroscope::pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
 }
 
 /// 初始化并启动 Pyroscope Profiler
@@ -93,7 +94,9 @@ pub fn init_pyroscope_profiler(config: ProfilerConfig) -> Result<ProfilerGuard> 
         "pyroscope-rs",
         env!("CARGO_PKG_VERSION"),
         pprof_backend(
-            PprofConfig { sample_rate: config.sample_rate },
+            PprofConfig {
+                sample_rate: config.sample_rate,
+            },
             BackendConfig::default(),
         ),
     )

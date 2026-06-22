@@ -29,7 +29,10 @@ async fn destroy_container_for_project(
     let runtime = state.runtime().clone();
 
     let container_info = runtime
-        .get_container_info_by_identifier(container_identifier, &shared_types::ServiceType::RCoder)
+        .get_container_info_by_identifier(
+            container_identifier,
+            &shared_types::ServiceType::WebAgentRunner,
+        )
         .await
         .ok()
         .flatten();
@@ -42,7 +45,10 @@ async fn destroy_container_for_project(
 
         // 停止容器（使用 container_identifier 构造正确的 pod name / container name）
         let stop_result = runtime
-            .stop_container_by_identifier(container_identifier, &shared_types::ServiceType::RCoder)
+            .stop_container_by_identifier(
+                container_identifier,
+                &shared_types::ServiceType::WebAgentRunner,
+            )
             .await;
 
         if let Err(e) = stop_result {

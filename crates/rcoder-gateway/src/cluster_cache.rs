@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use moka::future::Cache;
+use shared_types::ServiceType;
 use tracing::{debug, info};
 
 use crate::control_plane_client::{ControlPlaneClient, build_backend_cluster_name};
@@ -35,7 +36,7 @@ impl ClusterCache {
     pub async fn get_or_ensure(
         &self,
         identifier: &str,
-        service_type: &str,
+        service_type: ServiceType,
     ) -> anyhow::Result<String> {
         if let Some(cluster) = self.cache.get(identifier).await {
             debug!("[CACHE] hit: {} → {}", identifier, cluster);
@@ -48,7 +49,7 @@ impl ClusterCache {
         );
         let resp = self
             .control_client
-            .ensure_pod(identifier, service_type)
+            .ensure_pod(identifier, &service_type.to_string())
             .await?;
 
         if !resp.success {

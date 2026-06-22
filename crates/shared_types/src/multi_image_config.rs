@@ -267,7 +267,7 @@ impl Default for MultiImageConfig {
 
         // 添加默认的 RCoder 服务配置
         services.insert(
-            ServiceType::RCoder.to_string(),
+            ServiceType::WebAgentRunner.to_string(),
             crate::service_config::default_rcoder_service_config(),
         );
 
@@ -434,7 +434,7 @@ pub fn create_legacy_multi_image_config(
     };
 
     let mut services = HashMap::new();
-    services.insert(ServiceType::RCoder.to_string(), rcoder_config);
+    services.insert(ServiceType::WebAgentRunner.to_string(), rcoder_config);
 
     MultiImageConfig {
         global_defaults,
@@ -463,7 +463,7 @@ mod tests {
             ImageSelectionStrategy::ServiceOnly
         ));
         assert_eq!(config.services.len(), 2); // rcoder + computer-agent-runner
-        assert!(config.is_service_enabled(&ServiceType::RCoder));
+        assert!(config.is_service_enabled(&ServiceType::WebAgentRunner));
         assert!(config.is_service_enabled(&ServiceType::ComputerAgentRunner)); // 默认启用
 
         // 验证配置摘要
@@ -491,17 +491,17 @@ mod tests {
         // 测试服务启用/禁用
         assert!(
             config
-                .set_service_enabled(&ServiceType::RCoder, false)
+                .set_service_enabled(&ServiceType::WebAgentRunner, false)
                 .is_ok()
         );
-        assert!(!config.is_service_enabled(&ServiceType::RCoder));
+        assert!(!config.is_service_enabled(&ServiceType::WebAgentRunner));
 
         assert!(
             config
-                .set_service_enabled(&ServiceType::RCoder, true)
+                .set_service_enabled(&ServiceType::WebAgentRunner, true)
                 .is_ok()
         );
-        assert!(config.is_service_enabled(&ServiceType::RCoder));
+        assert!(config.is_service_enabled(&ServiceType::WebAgentRunner));
 
         // 测试不存在的服务
         assert!(
@@ -521,28 +521,31 @@ mod tests {
         );
 
         // 验证传统镜像配置被正确应用
-        let rcoder_config = config.get_service_config(&ServiceType::RCoder).unwrap();
+        let rcoder_config = config
+            .get_service_config(&ServiceType::WebAgentRunner)
+            .unwrap();
         assert_eq!(
             rcoder_config.image,
             Some("custom-registry.com/rcoder:latest".to_string())
         );
 
-        // 验证只有 RCoder 服务
+        // 验证只有 WebAgentRunner 服务
         assert_eq!(config.services.len(), 1);
-        assert!(config.services.contains_key("rcoder"));
+        assert!(config.services.contains_key("web-agent-runner"));
     }
 
     #[test]
     fn test_project_overrides() {
         let mut overrides = ProjectImageOverrides {
             images: HashMap::new(),
-            enabled_services: vec!["rcoder".to_string()],
+            enabled_services: vec!["web-agent-runner".to_string()],
             environment: HashMap::new(),
         };
 
-        overrides
-            .images
-            .insert("rcoder".to_string(), "custom-rcoder:latest".to_string());
+        overrides.images.insert(
+            "web-agent-runner".to_string(),
+            "custom-web-agent-runner:latest".to_string(),
+        );
         overrides
             .environment
             .insert("DEBUG".to_string(), "true".to_string());
@@ -552,12 +555,12 @@ mod tests {
         // 测试应用配置
         let mut service_config = default_rcoder_service_config();
         overrides
-            .apply_to_service_config(&ServiceType::RCoder, &mut service_config)
+            .apply_to_service_config(&ServiceType::WebAgentRunner, &mut service_config)
             .unwrap();
 
         assert_eq!(
             service_config.image,
-            Some("custom-rcoder:latest".to_string())
+            Some("custom-web-agent-runner:latest".to_string())
         );
         assert!(service_config.environment.contains_key("DEBUG"));
     }

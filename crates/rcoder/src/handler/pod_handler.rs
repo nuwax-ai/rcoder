@@ -18,6 +18,7 @@ use utoipa::{IntoParams, ToSchema};
 use super::utils::{I18nJsonOrQuery, I18nQuery, container_identity_from_name};
 use crate::router::AppState;
 use crate::service::ComputerContainerManager;
+use crate::service::computer_container_manager::ContainerCreateOptions;
 use crate::service::vnc_sync::sync_single_vnc_backend;
 use crate::{AppError, HttpResult};
 use shared_types::{
@@ -76,6 +77,52 @@ fn validate_resource_limits(limits: &PodResourceLimits) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// 解析 service_type 字符串为 ServiceType 枚举
+///
+/// 默认返回 ComputerAgentRunner（保持向后兼容）
+///
+/// # 参数
+/// * `raw` - 原始 service_type 字符串
+///
+/// # 返回
+/// Ok(ServiceType) 解析成功，Err(String) 解析失败
+fn parse_service_type(raw: Option<&str>) -> Result<ServiceType, String> {
+    match raw {
+        None | Some("") => Ok(ServiceType::ComputerAgentRunner),
+        Some(s) => s
+            .parse::<ServiceType>()
+            .map_err(|e| format!("invalid service_type: {}", e)),
+    }
+}
+
+/// 根据 ServiceType 确定容器标识符
+///
+/// - WebAgentRunner: 使用 project_id
+/// - ComputerAgentRunner: 使用 user_id (或 pod_id)
+///
+/// # 参数
+/// * `service_type` - 服务类型
+/// * `user_id` - 用户 ID
+/// * `project_id` - 项目 ID
+/// * `pod_id` - 容器 ID (可选，优先级最高)
+///
+/// # 返回
+/// 容器标识符字符串
+fn container_identifier_for_service(
+    service_type: &ServiceType,
+    user_id: &str,
+    project_id: &str,
+    pod_id: Option<&str>,
+) -> String {
+    if let Some(pid) = pod_id {
+        return pid.to_string();
+    }
+    match service_type {
+        ServiceType::WebAgentRunner => project_id.to_string(),
+        ServiceType::ComputerAgentRunner => user_id.to_string(),
+    }
 }
 
 /// K8s 存储大小单位
@@ -368,6 +415,13 @@ pub struct EnsurePodRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "tenant")]
     pub isolation_type: Option<String>,
+
+    /// 服务类型，决定创建哪种类型的容器
+    /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "computer-agent-runner")]
+    pub service_type: Option<String>,
 }
 
 /// Pod 资源限制配置
@@ -469,6 +523,13 @@ pub struct KeepalivePodRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "tenant")]
     pub isolation_type: Option<String>,
+
+    /// 服务类型，决定创建哪种类型的容器
+    /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "computer-agent-runner")]
+    pub service_type: Option<String>,
 }
 
 /// 容器保活响应
@@ -554,6 +615,13 @@ pub struct RestartPodRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "tenant")]
     pub isolation_type: Option<String>,
+
+    /// 服务类型，决定创建哪种类型的容器
+    /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "computer-agent-runner")]
+    pub service_type: Option<String>,
 }
 
 /// 重启容器响应
@@ -628,7 +696,7 @@ pub async fn pod_count(
         )
         .map(|(_, service_type)| service_type)
         {
-            Some(ServiceType::RCoder) => rcoder_count += 1,
+            Some(ServiceType::WebAgentRunner) => rcoder_count += 1,
             Some(ServiceType::ComputerAgentRunner) => computer_count += 1,
             None => {}
         }
@@ -720,14 +788,10 @@ pub async fn pod_list(
             rcoder_prefix,
             computer_prefix,
         );
-        let service_type = match container_identity
+        let service_type = container_identity
             .as_ref()
-            .map(|(_, service_type)| service_type)
-        {
-            Some(ServiceType::RCoder) => "RCoder",
-            Some(ServiceType::ComputerAgentRunner) => "ComputerAgentRunner",
-            None => "Unknown",
-        };
+            .map(|(_, service_type)| service_type.to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
 
         // 从容器名称提取 user_id（如果是 computer-agent-runner-{user_id}）
         let user_id = match container_identity {
@@ -878,9 +942,30 @@ pub async fn pod_ensure(
         ));
     }
 
+    // 1.2 解析 service_type
+    let service_type = match parse_service_type(request.service_type.as_deref()) {
+        Ok(st) => st,
+        Err(e) => {
+            error!("[POD_ENSURE] invalid service_type: {}", e);
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &e,
+            ));
+        }
+    };
+
+    // 1.3 根据 service_type 确定容器标识符
+    let container_identifier = container_identifier_for_service(
+        &service_type,
+        &request.user_id,
+        &request.project_id,
+        request.pod_id.as_deref(),
+    );
+
     info!(
-        "🚀 [POD_ENSURE] Ensuring container exists: user_id={}, project_id={}",
-        request.user_id, request.project_id
+        "🚀 [POD_ENSURE] Ensuring container exists: user_id={}, project_id={}, service_type={}, container_identifier={}",
+        request.user_id, request.project_id, service_type, container_identifier
     );
 
     // === 并发保护：检查是否有其他请求正在创建同一用户的容器 ===
@@ -894,13 +979,13 @@ pub async fn pod_ensure(
     // view() 在闭包返回后立即释放锁，无 Ref 暴露
     if let Some(elapsed) = state
         .pod_creating
-        .view(&request.user_id, |_, t| t.elapsed())
+        .view(&container_identifier, |_, t| t.elapsed())
     {
         // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
         if elapsed < std::time::Duration::from_secs(60) {
             info!(
-                "⏳ [POD_ENSURE] Container is being created, waiting for completion: user_id={}, elapsed={:?}",
-                request.user_id, elapsed
+                "⏳ [POD_ENSURE] Container is being created, waiting for completion: container_identifier={}, elapsed={:?}",
+                container_identifier, elapsed
             );
 
             let mut waited_container_info = None;
@@ -908,7 +993,7 @@ pub async fn pod_ensure(
             match tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 loop {
                     match rx.recv().await {
-                        Ok(created_user_id) if created_user_id == request.user_id => {
+                        Ok(created_user_id) if created_user_id == container_identifier => {
                             // 我们等待的容器已创建
                             break;
                         }
@@ -919,7 +1004,7 @@ pub async fn pod_ensure(
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             // 消息丢失，检查标记是否已移除
-                            if !state.pod_creating.contains_key(&request.user_id) {
+                            if !state.pod_creating.contains_key(&container_identifier) {
                                 break;
                             }
                             continue;
@@ -933,15 +1018,12 @@ pub async fn pod_ensure(
                     // 容器创建成功，获取容器信息
                     if let Ok(Some(info)) = state
                         .runtime()
-                        .get_container_info_by_identifier(
-                            &request.user_id,
-                            &shared_types::ServiceType::ComputerAgentRunner,
-                        )
+                        .get_container_info_by_identifier(&container_identifier, &service_type)
                         .await
                     {
                         info!(
-                            "✅ [POD_ENSURE] Wait succeeded, container ready: user_id={}, container_id={}",
-                            request.user_id, info.container_id
+                            "✅ [POD_ENSURE] Wait succeeded, container ready: container_identifier={}, container_id={}",
+                            container_identifier, info.container_id
                         );
                         waited_container_info = Some(info);
                     }
@@ -949,8 +1031,8 @@ pub async fn pod_ensure(
                 Err(_) => {
                     // 超时处理
                     warn!(
-                        "⚠️ [POD_ENSURE] Wait for container creation timeout (30s): user_id={}",
-                        request.user_id
+                        "⚠️ [POD_ENSURE] Wait for container creation timeout (30s): container_identifier={}",
+                        container_identifier
                     );
                 }
             }
@@ -959,11 +1041,15 @@ pub async fn pod_ensure(
             if let Some(info) = waited_container_info {
                 // 同步 VNC 后端映射
                 if let Some(ref pingora_service) = state.pingora_service {
-                    sync_single_vnc_backend(pingora_service, &request.user_id, &info.container_ip)
-                        .await;
+                    sync_single_vnc_backend(
+                        pingora_service,
+                        &container_identifier,
+                        &info.container_ip,
+                    )
+                    .await;
                     info!(
-                        "🔄 [POD_ENSURE] VNC backend mapping synced: user_id={} -> {}",
-                        request.user_id, info.container_ip
+                        "🔄 [POD_ENSURE] VNC backend mapping synced: container_identifier={} -> {}",
+                        container_identifier, info.container_ip
                     );
                 }
 
@@ -976,7 +1062,7 @@ pub async fn pod_ensure(
                     let mut pinfo = ProjectAndContainerInfo::new(request.project_id.clone());
                     pinfo.set_user_id(Some(request.user_id.clone()));
                     pinfo.set_pod_id(request.pod_id.clone());
-                    pinfo.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+                    pinfo.set_service_type(Some(service_type.clone()));
                     pinfo.set_container(Some(info.clone()));
                     pinfo
                 };
@@ -1007,8 +1093,8 @@ pub async fn pod_ensure(
             }
             // 等待超时，继续正常的创建流程（此时标记可能已过期被清理）
             warn!(
-                "⚠️ [POD_ENSURE] Wait for container creation timeout (30s), will continue to try creating: user_id={}",
-                request.user_id
+                "⚠️ [POD_ENSURE] Wait for container creation timeout (30s), will continue to try creating: container_identifier={}",
+                container_identifier
             );
         } else {
             // 标记过期，清理后继续
@@ -1016,7 +1102,7 @@ pub async fn pod_ensure(
                 "⚠️ [POD_ENSURE] Creation mark expired ({:?}), cleaning up and continuing",
                 elapsed
             );
-            state.pod_creating.remove(&request.user_id);
+            state.pod_creating.remove(&container_identifier);
         }
     }
 
@@ -1024,10 +1110,7 @@ pub async fn pod_ensure(
     let runtime = state.runtime().clone();
 
     let existing_container = runtime
-        .find_container(
-            &request.user_id,
-            &shared_types::ServiceType::ComputerAgentRunner,
-        )
+        .find_container(&container_identifier, &service_type)
         .await
         .map_err(|e| {
             error!("[POD_ENSURE] Failed to query container status: {}", e);
@@ -1053,12 +1136,8 @@ pub async fn pod_ensure(
 
             // 删除旧容器（使用 pod_id 优先的标识符，与创建时一致）
             // 如果删除失败（包括容器不存在等情况），返回错误让调用者知道
-            let container_identifier = request.pod_id.as_deref().unwrap_or(&request.user_id);
             runtime
-                .stop_container_by_identifier(
-                    container_identifier,
-                    &shared_types::ServiceType::ComputerAgentRunner,
-                )
+                .stop_container_by_identifier(&container_identifier, &service_type)
                 .await
                 .map_err(|e| {
                     error!(
@@ -1105,7 +1184,7 @@ pub async fn pod_ensure(
         // 🆕 设置创建标记，防止并发请求重复创建
         state
             .pod_creating
-            .insert(request.user_id.clone(), Instant::now());
+            .insert(container_identifier.clone(), Instant::now());
 
         // 创建新容器，最多重试 3 次
         let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
@@ -1120,13 +1199,17 @@ pub async fn pod_ensure(
         let max_attempts = 3;
 
         for attempt in 1..=max_attempts {
-            match ComputerContainerManager::get_or_create_container_for_user(
-                &request.user_id,
-                resource_limits.clone(),
-                request.pod_id.as_deref(),
-                request.isolation_type.as_deref(),
-                request.tenant_id.as_deref(),
-                request.space_id.as_deref(),
+            let options = ContainerCreateOptions {
+                user_id: request.user_id.clone(),
+                resource_limits: resource_limits.clone(),
+                pod_id: request.pod_id.clone(),
+                isolation_type: request.isolation_type.clone(),
+                tenant_id: request.tenant_id.clone(),
+                space_id: request.space_id.clone(),
+                service_type: service_type.clone(),
+            };
+            match ComputerContainerManager::get_or_create_container_for_user_with_type(
+                &options,
                 state.runtime(),
             )
             .await
@@ -1176,14 +1259,14 @@ pub async fn pod_ensure(
         match result {
             Some(info) => {
                 // 创建成功，清除标记
-                state.pod_creating.remove(&request.user_id);
+                state.pod_creating.remove(&container_identifier);
                 // 🚀 发送容器创建完成通知（唤醒等待方）
-                let _ = state.pod_created_tx.send(request.user_id.clone());
+                let _ = state.pod_created_tx.send(container_identifier.clone());
                 (info, true)
             }
             None => {
                 // 创建失败，也要清除标记
-                state.pod_creating.remove(&request.user_id);
+                state.pod_creating.remove(&container_identifier);
                 // 直接返回原始错误，保留具体的错误信息
                 return Err(last_error.unwrap_or_else(|| {
                     AppError::internal_server_error(
@@ -1195,10 +1278,7 @@ pub async fn pod_ensure(
     } else {
         // 获取现有容器的完整信息
         match runtime
-            .get_container_info_by_identifier(
-                &request.user_id,
-                &shared_types::ServiceType::ComputerAgentRunner,
-            )
+            .get_container_info_by_identifier(&container_identifier, &service_type)
             .await
         {
             Ok(Some(info)) => {
@@ -1209,18 +1289,15 @@ pub async fn pod_ensure(
                 // Docker API 确认容器在运行，但内部 map 还没同步
                 // 短暂等待让内部 map 同步，而不是直接重建
                 warn!(
-                    "⚠️ [POD_ENSURE] Container running but internal mapping not ready, waiting for sync: user_id={}",
-                    request.user_id
+                    "⚠️ [POD_ENSURE] Container running but internal mapping not ready, waiting for sync: container_identifier={}",
+                    container_identifier
                 );
 
                 let mut retry_info = None;
                 for retry_attempt in 1..=3 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     match runtime
-                        .get_container_info_by_identifier(
-                            &request.user_id,
-                            &shared_types::ServiceType::ComputerAgentRunner,
-                        )
+                        .get_container_info_by_identifier(&container_identifier, &service_type)
                         .await
                     {
                         Ok(Some(info)) => {
@@ -1242,8 +1319,8 @@ pub async fn pod_ensure(
                     None => {
                         // 3次重试后仍失败，才考虑重建
                         warn!(
-                            "⚠️ [POD_ENSURE] Wait for sync timeout, attempting to recreate: user_id={}",
-                            request.user_id
+                            "⚠️ [POD_ENSURE] Wait for sync timeout, attempting to recreate: container_identifier={}",
+                            container_identifier
                         );
 
                         let resource_limits =
@@ -1257,25 +1334,30 @@ pub async fn pod_ensure(
                         // 设置创建标记
                         state
                             .pod_creating
-                            .insert(request.user_id.clone(), std::time::Instant::now());
+                            .insert(container_identifier.clone(), std::time::Instant::now());
 
-                        let result = ComputerContainerManager::get_or_create_container_for_user(
-                            &request.user_id,
+                        let options = ContainerCreateOptions {
+                            user_id: request.user_id.clone(),
                             resource_limits,
-                            request.pod_id.as_deref(),
-                            request.isolation_type.as_deref(),
-                            request.tenant_id.as_deref(),
-                            request.space_id.as_deref(),
-                            state.runtime(),
-                        )
-                        .await;
+                            pod_id: request.pod_id.clone(),
+                            isolation_type: request.isolation_type.clone(),
+                            tenant_id: request.tenant_id.clone(),
+                            space_id: request.space_id.clone(),
+                            service_type: service_type.clone(),
+                        };
+                        let result =
+                            ComputerContainerManager::get_or_create_container_for_user_with_type(
+                                &options,
+                                state.runtime(),
+                            )
+                            .await;
 
                         // 清除创建标记
-                        state.pod_creating.remove(&request.user_id);
+                        state.pod_creating.remove(&container_identifier);
 
                         // 🚀 发送容器创建完成通知（唤醒等待方）
                         if result.is_ok() {
-                            let _ = state.pod_created_tx.send(request.user_id.clone());
+                            let _ = state.pod_created_tx.send(container_identifier.clone());
                         }
 
                         match result {
@@ -1288,8 +1370,8 @@ pub async fn pod_ensure(
                             }
                             Err(e) => {
                                 error!(
-                                    "❌ [POD_ENSURE] Container recreation failed: user_id={}, error={}",
-                                    request.user_id, e
+                                    "❌ [POD_ENSURE] Container recreation failed: container_identifier={}, error={}",
+                                    container_identifier, e
                                 );
                                 return Err(e);
                             }
@@ -1299,8 +1381,8 @@ pub async fn pod_ensure(
             }
             Err(e) => {
                 error!(
-                    "❌ [POD_ENSURE] Failed to get container full info: user_id={}, error={}",
-                    request.user_id, e
+                    "❌ [POD_ENSURE] Failed to get container full info: container_identifier={}, error={}",
+                    container_identifier, e
                 );
                 return Err(AppError::internal_server_error(&format!(
                     "Failed to get container full info: {}",
@@ -1315,13 +1397,13 @@ pub async fn pod_ensure(
     if created && let Some(ref pingora_service) = state.pingora_service {
         sync_single_vnc_backend(
             pingora_service,
-            &request.user_id,
+            &container_identifier,
             &container_info.container_ip,
         )
         .await;
         info!(
-            "🔄 [POD_ENSURE] VNC backend mapping synced: user_id={} -> {}",
-            request.user_id, container_info.container_ip
+            "🔄 [POD_ENSURE] VNC backend mapping synced: container_identifier={} -> {}",
+            container_identifier, container_info.container_ip
         );
     }
 
@@ -1337,7 +1419,7 @@ pub async fn pod_ensure(
         let mut info = ProjectAndContainerInfo::new(request.project_id.clone());
         info.set_user_id(Some(request.user_id.clone()));
         info.set_pod_id(request.pod_id.clone());
-        info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+        info.set_service_type(Some(service_type.clone()));
         info.set_container(Some(container_info.clone()));
         info
     };
@@ -1418,7 +1500,20 @@ pub async fn pod_keepalive(
         ));
     }
 
-    // 1.1 验证隔离参数完整性（当 pod_id 有值时）
+    // 1.1 解析 service_type
+    let service_type = match parse_service_type(request.service_type.as_deref()) {
+        Ok(st) => st,
+        Err(e) => {
+            error!("[POD_KEEPALIVE] invalid service_type: {}", e);
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &e,
+            ));
+        }
+    };
+
+    // 1.2 验证隔离参数完整性（当 pod_id 有值时）
     let container_identifier = if let Some(ref pod_id) = request.pod_id {
         if request.isolation_type.is_none()
             || request.tenant_id.is_none()
@@ -1446,7 +1541,8 @@ pub async fn pod_keepalive(
         }
         pod_id.clone()
     } else {
-        request.user_id.clone()
+        // 根据 service_type 确定容器标识符
+        container_identifier_for_service(&service_type, &request.user_id, &request.project_id, None)
     };
 
     info!(
@@ -1459,22 +1555,25 @@ pub async fn pod_keepalive(
     // 修复（顺序问题）：必须先确认容器存在，再刷新活动时间。
     // 原实现先刷新 last_activity 再查 Docker，容器已被外部删除时会刷新僵尸记录的活动时间，
     // 且 storage 残留指向不存在容器的 project 记录。
-    let container_info =
-        match ComputerContainerManager::get_container_info(&container_identifier, state.runtime())
-            .await?
-        {
-            Some(info) => info,
-            None => {
-                info!(
-                    "❌ [POD_KEEPALIVE] container not found: container_identifier={}",
-                    container_identifier
-                );
-                return Ok(HttpResult::error_with_locale(
-                    shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
-                    locale,
-                ));
-            }
-        };
+    let container_info = match ComputerContainerManager::get_container_info_with_type(
+        &container_identifier,
+        state.runtime(),
+        &service_type,
+    )
+    .await?
+    {
+        Some(info) => info,
+        None => {
+            info!(
+                "❌ [POD_KEEPALIVE] container not found: container_identifier={}",
+                container_identifier
+            );
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                locale,
+            ));
+        }
+    };
 
     // 3. 刷新活动时间（容器已确认存在）
     //
@@ -1629,14 +1728,39 @@ pub async fn pod_restart(
         ));
     }
 
+    // 1.2 解析 service_type
+    let service_type = match parse_service_type(request.service_type.as_deref()) {
+        Ok(st) => st,
+        Err(e) => {
+            error!("[POD_RESTART] invalid service_type: {}", e);
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &e,
+            ));
+        }
+    };
+
+    // 1.3 根据 service_type 确定容器标识符
+    let container_identifier = container_identifier_for_service(
+        &service_type,
+        &request.user_id,
+        &request.project_id,
+        request.pod_id.as_deref(),
+    );
+
     info!(
-        "🔄 [POD_RESTART] Restarting container: user_id={}, project_id={}",
-        request.user_id, request.project_id
+        "🔄 [POD_RESTART] Restarting container: user_id={}, project_id={}, service_type={}, container_identifier={}",
+        request.user_id, request.project_id, service_type, container_identifier
     );
 
     // 2. 检查容器是否存在
-    let existing_container =
-        ComputerContainerManager::get_container_info(&request.user_id, state.runtime()).await?;
+    let existing_container = ComputerContainerManager::get_container_info_with_type(
+        &container_identifier,
+        state.runtime(),
+        &service_type,
+    )
+    .await?;
     let was_existing = existing_container.is_some();
 
     // 3. 如果容器存在，先销毁
@@ -1659,12 +1783,8 @@ pub async fn pod_restart(
         let runtime = state.runtime().clone();
 
         // 使用 pod_id 优先的标识符停止容器（与创建时一致）
-        let container_identifier = request.pod_id.as_deref().unwrap_or(&request.user_id);
         if let Err(e) = runtime
-            .stop_container_by_identifier(
-                container_identifier,
-                &shared_types::ServiceType::ComputerAgentRunner,
-            )
+            .stop_container_by_identifier(&container_identifier, &service_type)
             .await
         {
             // 记录错误但继续尝试创建新容器
@@ -1695,25 +1815,22 @@ pub async fn pod_restart(
         for i in 0..10 {
             // 最多等待 5 秒 (10 * 500ms)
             match runtime
-                .find_container(
-                    &request.user_id,
-                    &shared_types::ServiceType::ComputerAgentRunner,
-                )
+                .find_container(&container_identifier, &service_type)
                 .await
             {
                 Ok(Some(_)) => {
                     if i == 0 {
                         info!(
-                            "⏳ [POD_RESTART] Container still exists, waiting for cleanup: user_id={}",
-                            request.user_id
+                            "⏳ [POD_RESTART] Container still exists, waiting for cleanup: container_identifier={}",
+                            container_identifier
                         );
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
                 Ok(None) => {
                     info!(
-                        "✅ [POD_RESTART] Confirmed container removed: user_id={}",
-                        request.user_id
+                        "✅ [POD_RESTART] Confirmed container removed: container_identifier={}",
+                        container_identifier
                     );
                     deletion_confirmed = true;
                     break;
@@ -1732,8 +1849,8 @@ pub async fn pod_restart(
 
         if !deletion_confirmed {
             warn!(
-                "⚠️ [POD_RESTART] Wait for container removal timeout, subsequent creation may fail: user_id={}",
-                request.user_id
+                "⚠️ [POD_RESTART] Wait for container removal timeout, subsequent creation may fail: container_identifier={}",
+                container_identifier
             );
         }
     }
@@ -1748,17 +1865,21 @@ pub async fn pod_restart(
 
     // 5. 强制创建新容器
     info!(
-        "🏗️ [POD_RESTART] Force creating new container: user_id={}",
-        request.user_id
+        "🏗️ [POD_RESTART] Force creating new container: container_identifier={}, service_type={}",
+        container_identifier, service_type
     );
 
-    let container_info = ComputerContainerManager::force_create_container_for_user(
-        &request.user_id,
+    let options = ContainerCreateOptions {
+        user_id: request.user_id.clone(),
         resource_limits,
-        request.pod_id.as_deref(),
-        request.isolation_type.as_deref(),
-        request.tenant_id.as_deref(),
-        request.space_id.as_deref(),
+        pod_id: request.pod_id.clone(),
+        isolation_type: request.isolation_type.clone(),
+        tenant_id: request.tenant_id.clone(),
+        space_id: request.space_id.clone(),
+        service_type: service_type.clone(),
+    };
+    let container_info = ComputerContainerManager::get_or_create_container_for_user_with_type(
+        &options,
         state.runtime(),
     )
     .await?;
@@ -1773,7 +1894,7 @@ pub async fn pod_restart(
     if let Some(ref pingora_service) = state.pingora_service {
         sync_single_vnc_backend(
             pingora_service,
-            &request.user_id,
+            &container_identifier,
             &container_info.container_ip,
         )
         .await;
@@ -1796,7 +1917,7 @@ pub async fn pod_restart(
             let mut info = ProjectAndContainerInfo::new(request.project_id.clone());
             info.set_user_id(Some(request.user_id.clone()));
             info.set_pod_id(request.pod_id.clone());
-            info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+            info.set_service_type(Some(service_type.clone()));
             info.set_container(Some(container_info.clone()));
             info
         };
@@ -1887,6 +2008,14 @@ pub struct PodStatusQuery {
     #[param(example = "tenant")]
     #[schema(example = "tenant")]
     pub isolation_type: Option<String>,
+
+    /// 服务类型，决定创建哪种类型的容器
+    /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "computer-agent-runner")]
+    #[schema(example = "computer-agent-runner")]
+    pub service_type: Option<String>,
 }
 
 /// 查询容器状态响应
@@ -1958,7 +2087,20 @@ pub async fn pod_status(
         ));
     }
 
-    // 1.1 验证隔离参数完整性（当 pod_id 有值时）
+    // 1.1 解析 service_type
+    let service_type = match parse_service_type(params.service_type.as_deref()) {
+        Ok(st) => st,
+        Err(e) => {
+            error!("[POD_STATUS] invalid service_type: {}", e);
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &e,
+            ));
+        }
+    };
+
+    // 1.2 验证隔离参数完整性（当 pod_id 有值时）
     let container_identifier = if let Some(ref pod_id) = params.pod_id {
         if params.isolation_type.is_none()
             || params.tenant_id.is_none()
@@ -2003,17 +2145,11 @@ pub async fn pod_status(
     // 优先级：pod_id > user_id > project_id
     let query_result = if let Some(ref identifier) = container_identifier {
         // 使用 pod_id 查找（多租户场景）
-        runtime
-            .find_container(identifier, &shared_types::ServiceType::ComputerAgentRunner)
-            .await
+        runtime.find_container(identifier, &service_type).await
     } else if let Some(ref user_id) = params.user_id {
-        runtime
-            .find_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
-            .await
+        runtime.find_container(user_id, &service_type).await
     } else if let Some(ref project_id) = params.project_id {
-        runtime
-            .find_container(project_id, &shared_types::ServiceType::RCoder)
-            .await
+        runtime.find_container(project_id, &service_type).await
     } else {
         // 防御性编程：理论上不会到达这里（已在上方验证至少有一个标识符）
         // 但为了安全起见，返回验证错误而不是 panic
@@ -2067,7 +2203,7 @@ pub async fn pod_status(
         && let Some(ref project_id) = params.project_id
     {
         match runtime
-            .find_container(project_id, &shared_types::ServiceType::RCoder)
+            .find_container(project_id, &shared_types::ServiceType::WebAgentRunner)
             .await
         {
             Ok(Some(result)) => {
@@ -2172,6 +2308,14 @@ pub struct VncStatusQuery {
     #[param(example = "tenant")]
     #[schema(example = "tenant")]
     pub isolation_type: Option<String>,
+
+    /// 服务类型，决定创建哪种类型的容器
+    /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
+    /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "computer-agent-runner")]
+    #[schema(example = "computer-agent-runner")]
+    pub service_type: Option<String>,
 }
 
 /// VNC 状态响应
@@ -2232,7 +2376,20 @@ pub async fn pod_vnc_status(
         .filter(|s| !s.trim().is_empty());
     let pod_id = params.pod_id.as_deref().filter(|s| !s.trim().is_empty());
 
-    // 1.1 验证隔离参数完整性（当 pod_id 有值时）
+    // 1.1 解析 service_type
+    let service_type = match parse_service_type(params.service_type.as_deref()) {
+        Ok(st) => st,
+        Err(e) => {
+            error!("[POD_VNC_STATUS] invalid service_type: {}", e);
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &e,
+            ));
+        }
+    };
+
+    // 1.2 验证隔离参数完整性（当 pod_id 有值时）
     if pod_id.is_some()
         && (params.isolation_type.is_none()
             || params.tenant_id.is_none()
@@ -2269,29 +2426,14 @@ pub async fn pod_vnc_status(
     // 优先级：pod_id > user_id > project_id
     let (lookup_user_id, container_info) = if let Some(pid) = pod_id {
         // 使用 pod_id 查找（多租户场景）
-        (
-            pid,
-            runtime
-                .find_container(pid, &shared_types::ServiceType::ComputerAgentRunner)
-                .await,
-        )
+        (pid, runtime.find_container(pid, &service_type).await)
     } else if let Some(uid) = user_id {
-        (
-            uid,
-            runtime
-                .find_container(uid, &shared_types::ServiceType::ComputerAgentRunner)
-                .await,
-        )
+        (uid, runtime.find_container(uid, &service_type).await)
     } else if let Some(pid) = project_id {
-        // 如果只有 project_id，通过 storage lookup关联的容器
+        // 如果只有 project_id，通过 storage lookup 关联的容器
         if state.projects.get_container_by_user_id(pid).is_some() {
             // project_id 可能实际上是 user_id
-            (
-                pid,
-                runtime
-                    .find_container(pid, &shared_types::ServiceType::ComputerAgentRunner)
-                    .await,
-            )
+            (pid, runtime.find_container(pid, &service_type).await)
         } else {
             (pid, Ok(None))
         }

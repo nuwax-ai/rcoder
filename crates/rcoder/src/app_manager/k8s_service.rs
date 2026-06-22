@@ -810,7 +810,7 @@ impl K8sAppService {
     ) -> Result<ContainerCreateParams> {
         let params = ContainerCreateParams::builder()
             .project_id(app_id.to_string())
-            .service_type(shared_types::ServiceType::RCoder)
+            .service_type(shared_types::ServiceType::WebAgentRunner)
             .host_workspace_path(format!("{}/{}", self.config.workspace_root, app_id))
             .build();
 
@@ -1054,7 +1054,10 @@ mod tests {
         // chrono: 2024-01-15T09:50:00.123456789+00:00
         let jiff_dt_part = jiff_str.trim_end_matches('Z');
         let chrono_dt_part = chrono_str.trim_end_matches("+00:00");
-        assert_eq!(jiff_dt_part, chrono_dt_part, "日期时间部分不一致:\n  jiff:  {jiff_str}\n  chrono: {chrono_str}");
+        assert_eq!(
+            jiff_dt_part, chrono_dt_part,
+            "日期时间部分不一致:\n  jiff:  {jiff_str}\n  chrono: {chrono_str}"
+        );
 
         // 验证都是 UTC 时区表示
         assert!(

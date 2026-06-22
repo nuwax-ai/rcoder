@@ -111,7 +111,7 @@ pub fn get_default_config_by_service_type(
     service_type: &shared_types::ServiceType,
 ) -> &'static EmbeddedConfig {
     match service_type {
-        shared_types::ServiceType::RCoder => &DEFAULT_CONFIG,
+        shared_types::ServiceType::WebAgentRunner => &DEFAULT_CONFIG,
         shared_types::ServiceType::ComputerAgentRunner => &COMPUTER_AGENT_CONFIG,
     }
 }
@@ -247,7 +247,8 @@ mod tests {
     #[test]
     fn test_get_default_config_by_service_type() {
         // 测试 RCoder 配置
-        let rcoder_config = get_default_config_by_service_type(&shared_types::ServiceType::RCoder);
+        let rcoder_config =
+            get_default_config_by_service_type(&shared_types::ServiceType::WebAgentRunner);
         assert!(
             rcoder_config
                 .agent_servers
@@ -273,7 +274,8 @@ mod tests {
     #[test]
     fn test_default_agent_servers_for_service() {
         // RCoder
-        let rcoder_servers = default_agent_servers_for_service(&shared_types::ServiceType::RCoder);
+        let rcoder_servers =
+            default_agent_servers_for_service(&shared_types::ServiceType::WebAgentRunner);
         assert!(!rcoder_servers.is_empty());
 
         // ComputerAgentRunner
@@ -286,7 +288,7 @@ mod tests {
     fn test_default_context_servers_for_service() {
         // RCoder - 基础 MCP servers
         let rcoder_contexts =
-            default_context_servers_for_service(&shared_types::ServiceType::RCoder);
+            default_context_servers_for_service(&shared_types::ServiceType::WebAgentRunner);
         assert!(rcoder_contexts.contains_key("fetch") || rcoder_contexts.contains_key("context7"));
 
         // ComputerAgentRunner - 增强 MCP servers
@@ -301,7 +303,7 @@ mod tests {
         // 测试 RCoder
         let agent = get_default_agent_for_service(
             CLAUDE_CODE_ACP_AGENT_ID,
-            &shared_types::ServiceType::RCoder,
+            &shared_types::ServiceType::WebAgentRunner,
         );
         assert!(agent.is_some());
 
@@ -313,8 +315,10 @@ mod tests {
         assert!(agent.is_some());
 
         // 测试不存在的 agent
-        let agent =
-            get_default_agent_for_service("non-existent-agent", &shared_types::ServiceType::RCoder);
+        let agent = get_default_agent_for_service(
+            "non-existent-agent",
+            &shared_types::ServiceType::WebAgentRunner,
+        );
         assert!(agent.is_none());
     }
 
@@ -322,11 +326,11 @@ mod tests {
     fn test_get_default_context_server_for_service() {
         // RCoder context server
         let rcoder_contexts =
-            default_context_servers_for_service(&shared_types::ServiceType::RCoder);
+            default_context_servers_for_service(&shared_types::ServiceType::WebAgentRunner);
         if let Some(first_server_name) = rcoder_contexts.keys().next() {
             let server = get_default_context_server_for_service(
                 first_server_name,
-                &shared_types::ServiceType::RCoder,
+                &shared_types::ServiceType::WebAgentRunner,
             );
             assert!(server.is_some());
         }
@@ -341,7 +345,7 @@ mod tests {
         // 测试不存在的 server
         let server = get_default_context_server_for_service(
             "non-existent-server",
-            &shared_types::ServiceType::RCoder,
+            &shared_types::ServiceType::WebAgentRunner,
         );
         assert!(server.is_none());
     }

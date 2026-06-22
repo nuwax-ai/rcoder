@@ -1108,7 +1108,7 @@ mod tests {
                 Some(user_id.to_string())
             },
             agent_mode: AgentMode::Ask,
-            service_type: shared_types::ServiceType::RCoder,
+            service_type: shared_types::ServiceType::WebAgentRunner,
             request_id: None,
             tool_approval_rules: None,
         }
@@ -1303,7 +1303,7 @@ mod tests {
             project_id: "proj1".to_string(),
             user_id: Some("user1".to_string()),
             agent_mode: AgentMode::Yolo,
-            service_type: shared_types::ServiceType::RCoder,
+            service_type: shared_types::ServiceType::WebAgentRunner,
             request_id: None,
             tool_approval_rules: rules,
         }

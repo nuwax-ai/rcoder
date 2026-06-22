@@ -99,7 +99,7 @@ impl TestRequestBuilder {
             request_id: self.request_id.clone(),
             attachments: self.attachments.clone(),
             data_source_attachments: vec![],
-            service_type: ServiceType::RCoder,
+            service_type: ServiceType::WebAgentRunner,
             user_id: None,
             system_prompt_override: None,
             user_prompt_template_override: None,
@@ -131,7 +131,7 @@ mod tests {
         assert_eq!(prompt.project_path, PathBuf::from("/tmp/test"));
         assert!(prompt.session_id.is_none());
         assert!(prompt.attachments.is_empty());
-        assert_eq!(prompt.service_type, ServiceType::RCoder);
+        assert_eq!(prompt.service_type, ServiceType::WebAgentRunner);
     }
 
     #[test]

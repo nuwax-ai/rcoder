@@ -102,7 +102,7 @@ fn test_model_env_bindings_have_priority_over_known_key_fallback() {
 
 #[test]
 fn test_default_config() {
-    let config = get_default_sacp_agent_config(None, &shared_types::ServiceType::RCoder);
+    let config = get_default_sacp_agent_config(None, &shared_types::ServiceType::WebAgentRunner);
     assert!(config.is_ok());
     let config = config.unwrap();
 
@@ -129,7 +129,8 @@ fn test_default_config_with_model_provider() {
         wire_api: None,
     };
 
-    let config = get_default_sacp_agent_config(Some(&provider), &shared_types::ServiceType::RCoder);
+    let config =
+        get_default_sacp_agent_config(Some(&provider), &shared_types::ServiceType::WebAgentRunner);
     assert!(config.is_ok());
     let config = config.unwrap();
 
@@ -150,7 +151,7 @@ fn test_default_config_with_model_provider() {
 
 #[test]
 fn test_default_config_disables_nonessential_traffic() {
-    let config = get_default_sacp_agent_config(None, &shared_types::ServiceType::RCoder);
+    let config = get_default_sacp_agent_config(None, &shared_types::ServiceType::WebAgentRunner);
     assert!(config.is_ok());
     let config = config.unwrap();
 
@@ -173,7 +174,8 @@ fn test_default_config_with_openai_provider() {
         wire_api: None,
     };
 
-    let config = get_default_sacp_agent_config(Some(&provider), &shared_types::ServiceType::RCoder);
+    let config =
+        get_default_sacp_agent_config(Some(&provider), &shared_types::ServiceType::WebAgentRunner);
     assert!(config.is_ok());
     let config = config.unwrap();
 
@@ -216,7 +218,8 @@ fn test_sensitive_env_vars_protection() {
         wire_api: None,
     };
 
-    let config = get_default_sacp_agent_config(Some(&provider), &shared_types::ServiceType::RCoder);
+    let config =
+        get_default_sacp_agent_config(Some(&provider), &shared_types::ServiceType::WebAgentRunner);
     assert!(config.is_ok());
     let config = config.unwrap();
 
@@ -255,7 +258,7 @@ fn test_default_config_with_proxy_model_env_resolver() {
 
     let config = get_default_sacp_agent_config_with_resolver(
         Some(&provider),
-        &shared_types::ServiceType::RCoder,
+        &shared_types::ServiceType::WebAgentRunner,
         &resolver,
         Some("svc-123"),
     )
@@ -288,7 +291,7 @@ fn test_proxy_model_env_resolver_requires_service_uuid() {
 
     let err = get_default_sacp_agent_config_with_resolver(
         Some(&provider),
-        &shared_types::ServiceType::RCoder,
+        &shared_types::ServiceType::WebAgentRunner,
         &resolver,
         None,
     )

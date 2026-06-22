@@ -12,18 +12,20 @@ use utoipa::ToSchema;
 /// 注意：不实现 Default trait，强制要求明确指定服务类型。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub enum ServiceType {
-    /// 标准 RCoder 服务 (当前使用)
+    /// Web Agent Runner 服务
     /// 提供完整的 AI 开发功能，包括项目管理、代码生成、文件操作等
-    RCoder,
-    /// Computer Agent Runner 服务 (新功能，后续开发使用)
+    /// 容器标识为 project_id，用于网页应用开发场景
+    WebAgentRunner,
+    /// Computer Agent Runner 服务
     /// 专注于代理运行和执行，提供轻量级的代理执行环境
+    /// 容器标识为 user_id，用于桌面应用开发场景
     ComputerAgentRunner,
 }
 
 impl std::fmt::Display for ServiceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServiceType::RCoder => write!(f, "rcoder"),
+            ServiceType::WebAgentRunner => write!(f, "web-agent-runner"),
             ServiceType::ComputerAgentRunner => write!(f, "computer-agent-runner"),
         }
     }
@@ -40,7 +42,7 @@ impl std::str::FromStr for ServiceType {
 
         // 精确匹配
         match s {
-            "rcoder" => Ok(ServiceType::RCoder),
+            "web-agent-runner" => Ok(ServiceType::WebAgentRunner),
             "computer-agent-runner" => Ok(ServiceType::ComputerAgentRunner),
             _ => Err(ServiceTypeError::InvalidServiceType(s.to_string())),
         }
@@ -51,11 +53,11 @@ impl ServiceType {
     /// 获取服务类型的描述
     pub fn description(&self) -> &str {
         match self {
-            ServiceType::RCoder => {
-                "Standard RCoder service, providing full AI development functionality"
+            ServiceType::WebAgentRunner => {
+                "Web Agent Runner service, providing full AI development functionality for web applications"
             }
             ServiceType::ComputerAgentRunner => {
-                "Computer Agent Runner service, focused on agent execution"
+                "Computer Agent Runner service, focused on agent execution for desktop applications"
             }
         }
     }
@@ -68,7 +70,7 @@ impl ServiceType {
     /// 直接调用本方法构造容器名可能导致与实际创建的容器名称不一致。
     pub fn container_prefix(&self) -> &str {
         match self {
-            ServiceType::RCoder => "rcoder-agent",
+            ServiceType::WebAgentRunner => "web-agent-runner",
             ServiceType::ComputerAgentRunner => "computer-agent-runner",
         }
     }
@@ -90,7 +92,9 @@ impl ServiceType {
 pub enum ServiceTypeError {
     #[error("service type cannot be empty")]
     EmptyServiceType,
-    #[error("unsupported service type '{0}', please use 'rcoder' or 'computer-agent-runner'")]
+    #[error(
+        "unsupported service type '{0}', please use 'web-agent-runner' or 'computer-agent-runner'"
+    )]
     InvalidServiceType(String),
     #[error("service type '{0}' is disabled")]
     ServiceDisabled(String),
@@ -98,7 +102,10 @@ pub enum ServiceTypeError {
 
 /// 获取所有支持的服务类型
 pub fn get_supported_service_types() -> Vec<String> {
-    vec!["rcoder".to_string(), "computer-agent-runner".to_string()]
+    vec![
+        "web-agent-runner".to_string(),
+        "computer-agent-runner".to_string(),
+    ]
 }
 
 /// 获取启用的服务类型列表
@@ -140,14 +147,14 @@ mod tests {
         let mut services = HashMap::new();
 
         services.insert(
-            "rcoder".to_string(),
+            "web-agent-runner".to_string(),
             ServiceImageConfig {
-                service_type: ServiceType::RCoder,
+                service_type: ServiceType::WebAgentRunner,
                 image: None,
-                arm64_image: Some("registry.yichamao.com/rcoder:arm64".to_string()),
-                amd64_image: Some("registry.yichamao.com/rcoder:amd64".to_string()),
+                arm64_image: Some("registry.yichamao.com/web-agent-runner:arm64".to_string()),
+                amd64_image: Some("registry.yichamao.com/web-agent-runner:amd64".to_string()),
                 default_image: None,
-                image_tag_prefix: Some("rcoder".to_string()),
+                image_tag_prefix: Some("web-agent-runner".to_string()),
                 enabled: true,
                 environment: HashMap::new(),
                 mounts: vec![],
@@ -214,13 +221,13 @@ mod tests {
 
     #[test]
     fn test_service_type_basic() {
-        assert_eq!(ServiceType::RCoder.to_string(), "rcoder");
+        assert_eq!(ServiceType::WebAgentRunner.to_string(), "web-agent-runner");
         assert_eq!(
             ServiceType::ComputerAgentRunner.to_string(),
             "computer-agent-runner"
         );
 
-        assert!(ServiceType::RCoder.description().contains("full"));
+        assert!(ServiceType::WebAgentRunner.description().contains("full"));
         assert!(
             ServiceType::ComputerAgentRunner
                 .description()
@@ -232,8 +239,8 @@ mod tests {
     fn test_service_type_from_str() {
         // 有效的服务类型
         assert_eq!(
-            "rcoder".parse::<ServiceType>().unwrap(),
-            ServiceType::RCoder
+            "web-agent-runner".parse::<ServiceType>().unwrap(),
+            ServiceType::WebAgentRunner
         );
         assert_eq!(
             "computer-agent-runner".parse::<ServiceType>().unwrap(),
@@ -252,8 +259,8 @@ mod tests {
     fn test_service_type_enabled() {
         let config = create_test_config();
 
-        // RCoder 应该启用
-        assert!(ServiceType::RCoder.is_enabled(&config));
+        // WebAgentRunner 应该启用
+        assert!(ServiceType::WebAgentRunner.is_enabled(&config));
 
         // ComputerAgentRunner 应该禁用
         assert!(!ServiceType::ComputerAgentRunner.is_enabled(&config));
@@ -263,7 +270,7 @@ mod tests {
     fn test_get_supported_service_types() {
         let types = get_supported_service_types();
         assert_eq!(types.len(), 2);
-        assert!(types.contains(&"rcoder".to_string()));
+        assert!(types.contains(&"web-agent-runner".to_string()));
         assert!(types.contains(&"computer-agent-runner".to_string()));
     }
 
@@ -273,13 +280,13 @@ mod tests {
         let enabled = get_enabled_service_types(&config);
 
         assert_eq!(enabled.len(), 1);
-        assert!(enabled.contains(&"rcoder".to_string()));
+        assert!(enabled.contains(&"web-agent-runner".to_string()));
         assert!(!enabled.contains(&"computer-agent-runner".to_string()));
     }
 
     #[test]
     fn test_service_type_serialization() {
-        let service = ServiceType::RCoder;
+        let service = ServiceType::WebAgentRunner;
         let serialized = serde_json::to_string(&service).unwrap();
         let deserialized: ServiceType = serde_json::from_str(&serialized).unwrap();
 
@@ -293,7 +300,7 @@ mod tests {
         let mut hasher1 = std::collections::hash_map::DefaultHasher::new();
         let mut hasher2 = std::collections::hash_map::DefaultHasher::new();
 
-        ServiceType::RCoder.hash(&mut hasher1);
+        ServiceType::WebAgentRunner.hash(&mut hasher1);
         ServiceType::ComputerAgentRunner.hash(&mut hasher2);
 
         assert_ne!(hasher1.finish(), hasher2.finish());

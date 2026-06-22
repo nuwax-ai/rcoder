@@ -183,7 +183,10 @@ pub fn convert_context_servers_sacp(
                 if let Some(env) = &c.env {
                     env.iter()
                         .map(|(k, v)| {
-                            agent_client_protocol::schema::v1::EnvVariable::new(k.clone(), v.clone())
+                            agent_client_protocol::schema::v1::EnvVariable::new(
+                                k.clone(),
+                                v.clone(),
+                            )
                         })
                         .collect()
                 } else {
@@ -205,7 +208,9 @@ pub fn convert_context_servers_sacp(
             // 注入镜像源环境变量（npx/bunx/uvx 子进程使用）
             for (key, val) in crate::mirror_env::collect_mirror_env_vars() {
                 if !env_vars.iter().any(|e| e.name == key) {
-                    env_vars.push(agent_client_protocol::schema::v1::EnvVariable::new(key, val));
+                    env_vars.push(agent_client_protocol::schema::v1::EnvVariable::new(
+                        key, val,
+                    ));
                 }
             }
 

@@ -216,7 +216,7 @@ pub fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(String, Str
     let (container_prefix_rcoder, container_prefix_computer) = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             let rcoder_prefix = selector
-                .get_service_config(&shared_types::ServiceType::RCoder)
+                .get_service_config(&shared_types::ServiceType::WebAgentRunner)
                 .await
                 .expect("Failed to get RCoder service config")
                 .container_prefix()

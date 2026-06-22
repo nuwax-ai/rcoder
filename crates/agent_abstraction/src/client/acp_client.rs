@@ -91,7 +91,7 @@ where
             self.project_id.clone(),
             std::path::PathBuf::from("."), // not used for prompt building
             uuid::Uuid::new_v4().to_string(),
-            shared_types::ServiceType::RCoder,
+            shared_types::ServiceType::WebAgentRunner,
         );
 
         self.session_manager

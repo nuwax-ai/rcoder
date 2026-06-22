@@ -268,12 +268,27 @@ mod tests {
 
     #[test]
     fn test_rcoder_pod_id_ref_count_with_active_projects() {
-        let proj_a =
-            create_test_project_with_pod("proj_A", "user_1", "pod_1", ServiceType::RCoder, 1800);
-        let proj_b =
-            create_test_project_with_pod("proj_B", "user_1", "pod_1", ServiceType::RCoder, 120);
-        let proj_c =
-            create_test_project_with_pod("proj_C", "user_1", "pod_1", ServiceType::RCoder, 1800);
+        let proj_a = create_test_project_with_pod(
+            "proj_A",
+            "user_1",
+            "pod_1",
+            ServiceType::WebAgentRunner,
+            1800,
+        );
+        let proj_b = create_test_project_with_pod(
+            "proj_B",
+            "user_1",
+            "pod_1",
+            ServiceType::WebAgentRunner,
+            120,
+        );
+        let proj_c = create_test_project_with_pod(
+            "proj_C",
+            "user_1",
+            "pod_1",
+            ServiceType::WebAgentRunner,
+            1800,
+        );
 
         let config = CleanupConfig {
             idle_timeout: Duration::from_secs(600),
@@ -302,12 +317,27 @@ mod tests {
 
     #[test]
     fn test_rcoder_pod_id_ref_count_all_idle() {
-        let proj_d =
-            create_test_project_with_pod("proj_D", "user_2", "pod_2", ServiceType::RCoder, 3600);
-        let proj_e =
-            create_test_project_with_pod("proj_E", "user_2", "pod_2", ServiceType::RCoder, 7200);
-        let proj_f =
-            create_test_project_with_pod("proj_F", "user_2", "pod_2", ServiceType::RCoder, 1800);
+        let proj_d = create_test_project_with_pod(
+            "proj_D",
+            "user_2",
+            "pod_2",
+            ServiceType::WebAgentRunner,
+            3600,
+        );
+        let proj_e = create_test_project_with_pod(
+            "proj_E",
+            "user_2",
+            "pod_2",
+            ServiceType::WebAgentRunner,
+            7200,
+        );
+        let proj_f = create_test_project_with_pod(
+            "proj_F",
+            "user_2",
+            "pod_2",
+            ServiceType::WebAgentRunner,
+            1800,
+        );
 
         let config = CleanupConfig {
             idle_timeout: Duration::from_secs(600),
@@ -333,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_rcoder_no_pod_id_always_destroy() {
-        let proj = create_test_project("proj_solo", "user_3", ServiceType::RCoder, 1800);
+        let proj = create_test_project("proj_solo", "user_3", ServiceType::WebAgentRunner, 1800);
 
         let config = CleanupConfig {
             idle_timeout: Duration::from_secs(600),

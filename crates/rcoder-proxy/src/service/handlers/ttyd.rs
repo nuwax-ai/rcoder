@@ -96,13 +96,13 @@ pub async fn handle_ttyd_request(
     Ok(())
 }
 
-/// 处理 Web ttyd 终端代理请求（代理到 rcoder 主服务的 ttyd）
+/// 处理 Web ttyd 终端代理请求（代理到动态创建的 RCoder 容器的 ttyd）
 ///
 /// 路径格式: `/web/ttyd/{user_id}/{project_id}/{*path}`
 ///
 /// 与 TtydProxy 的区别：
-/// - TtydProxy: 代理到 agent-runner 容器的 ttyd（动态 IP）
-/// - WebTtydProxy: 代理到 rcoder 主服务的 ttyd（固定 127.0.0.1:7681）
+/// - TtydProxy: 代理到 agent-runner 容器的 ttyd（动态 IP，挂载到 /home/user）
+/// - WebTtydProxy: 代理到 rcoder 容器的 ttyd（动态 IP，挂载到 /app/project_workspace）
 ///
 /// 工作目录：/app/project_workspace/{project_id}
 pub async fn handle_web_ttyd_request(
@@ -245,35 +245,63 @@ pub async fn handle_ttyd_upstream(
     Ok(Box::new(peer))
 }
 
-/// 处理 Web ttyd 终端的上游连接（代理到 rcoder 主服务）
+/// 处理 Web ttyd 终端的上游连接（代理到动态创建的 RCoder 容器）
 ///
 /// 路径格式: `/web/ttyd/{user_id}/{project_id}/{*path}`
 ///
 /// 与 TtydProxy 的区别：
 /// - TtydProxy: 代理到 agent-runner 容器（动态 IP，通过 user_id 查找）
-/// - WebTtydProxy: 代理到 rcoder 主服务（固定 127.0.0.1:7681）
+/// - WebTtydProxy: 代理到 rcoder 容器（动态 IP，通过 user_id 查找）
+///
+/// 两者都使用 vnc_backends 来查找动态创建的容器 IP
 pub async fn handle_web_ttyd_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,
+    vnc_backends: &Arc<DashMap<String, String>>,
     metrics: &Arc<ProxyMetrics>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let user_id = params.get("user_id").unwrap_or("unknown");
     let project_id = params.get("project_id").unwrap_or("");
 
     debug!(
-        "web ttyd proxy: user_id={}, project_id={} -> 127.0.0.1:{}",
-        user_id, project_id, TTYD_PORT
+        "web ttyd proxy: user_id={}, project_id={}",
+        user_id, project_id
     );
+
+    // 查找用户容器 IP（复用 vnc_backends DashMap）
+    let container_ip = match vnc_backends.get(user_id) {
+        Some(ip_ref) => ip_ref.value().clone(),
+        None => {
+            info!("routing {} to web ttyd", user_id);
+            return Err(
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
+                    format!(
+                        "web ttyd backend for user {} not found, please create container first",
+                        user_id
+                    ),
+                ),
+            );
+        }
+    };
 
     // 记录指标
     metrics.record_request();
     metrics.inc_active();
 
-    // 保存目标信息到上下文
-    ctx.vnc_target_ip = Some("127.0.0.1".to_string());
+    // 保存目标 IP 到上下文（用于响应过滤等）
+    ctx.vnc_target_ip = Some(container_ip.clone());
 
-    // 创建 HTTP Peer 到本地 ttyd 端口
-    let mut peer = HttpPeer::new(("127.0.0.1", TTYD_PORT), false, "".to_string());
+    debug!(
+        "web ttyd proxy: user_id={}, project_id={} -> {}:{}",
+        user_id, project_id, container_ip, TTYD_PORT
+    );
+
+    // 创建 HTTP Peer 到容器的 ttyd 端口
+    let mut peer = HttpPeer::new(
+        (container_ip.as_str(), TTYD_PORT),
+        false,          // 不使用 TLS
+        "".to_string(), // SNI
+    );
 
     // ttyd WebSocket 长连接优化配置（与 agent-runner ttyd 一致）
     peer.options.connection_timeout = Some(Duration::from_secs(10));
