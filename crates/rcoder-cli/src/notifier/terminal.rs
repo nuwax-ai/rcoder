@@ -5,7 +5,7 @@
 
 use agent_abstraction::PromptCompletionSignal;
 use agent_abstraction::SessionNotifier;
-use agent_client_protocol::schema::{ContentBlock, SessionUpdate, StopReason};
+use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, StopReason};
 use async_trait::async_trait;
 use shared_types::SessionNotify;
 
@@ -172,7 +172,7 @@ impl SessionNotifier for TerminalSessionNotifier {
         &self,
         _project_id: &str,
         session_id: &str,
-        error: agent_client_protocol::schema::Error,
+        error: agent_client_protocol::schema::v1::Error,
         _request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.formatter.error(&format!(

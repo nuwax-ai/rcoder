@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::{PromptRequest, ProtocolVersion, SessionId};
+use agent_client_protocol::schema::v1::{PromptRequest, SessionId};
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_config::ContextServerConfig;
 use tokio::sync::mpsc;
 

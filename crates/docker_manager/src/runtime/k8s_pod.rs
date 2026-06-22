@@ -117,7 +117,10 @@ impl K8sPodOps for KubernetesRuntime {
             created_at: metadata
                 .creation_timestamp
                 .as_ref()
-                .map(|ts| ts.0)
+                .map(|ts| {
+                    chrono::DateTime::from_timestamp(ts.0.as_second(), ts.0.subsec_nanosecond() as u32)
+                        .unwrap_or_else(Utc::now)
+                })
                 .unwrap_or_else(Utc::now),
         }
     }

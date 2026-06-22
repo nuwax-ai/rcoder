@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     CancelNotification, InitializeRequest, LoadSessionRequest, McpServer, NewSessionRequest,
     PromptRequest, RequestPermissionRequest, RequestPermissionResponse, SessionId,
     SessionNotification, SetSessionModeRequest,
@@ -180,7 +180,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     project_id
                 );
                 let init_request = InitializeRequest::new(VERSION)
-                    .client_info(agent_client_protocol::schema::Implementation::new(
+                    .client_info(agent_client_protocol::schema::v1::Implementation::new(
                         "rcoder-agent-runner",
                         env!("CARGO_PKG_VERSION"),
                     ));
@@ -548,7 +548,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                     .notify_prompt_end(
                                         &project_id_for_prompt,
                                         &session_id.to_string(),
-                                        agent_client_protocol::schema::StopReason::Cancelled,
+                                        agent_client_protocol::schema::v1::StopReason::Cancelled,
                                         Some(error_codes::get_i18n_message_default("error.session_cancelled")),
                                         None,
                                     )
@@ -746,7 +746,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                             .notify_prompt_end(
                                                 &project_id_for_prompt,
                                                 &session_id.to_string(),
-                                                agent_client_protocol::schema::StopReason::Cancelled,
+                                                agent_client_protocol::schema::v1::StopReason::Cancelled,
                                                 Some(error_codes::get_i18n_message_default("error.session_cancelled_timeout")),
                                                 request_id.clone(),
                                             )

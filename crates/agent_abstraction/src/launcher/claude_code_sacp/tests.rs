@@ -7,7 +7,7 @@ use super::mcp::{
 use super::types::SacpAgentLaunchConfig;
 use crate::launcher::model_env;
 use crate::launcher::model_env::ResolvedModelEnv;
-use agent_client_protocol::schema::McpServer;
+use agent_client_protocol::schema::v1::McpServer;
 use agent_config::ContextServerConfig;
 use shared_types::{ModelEnvBinding, ModelEnvBindingSource, ModelProviderConfig};
 use std::collections::HashMap;

@@ -4,7 +4,7 @@
 //! 关键：必须在 notify_prompt_end / notify_prompt_error 中触发 completion_signal。
 
 use agent_abstraction::{PromptCompletionSignal, SessionNotifier};
-use agent_client_protocol::schema::{ContentBlock, SessionUpdate, StopReason};
+use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, StopReason};
 use async_trait::async_trait;
 use shared_types::SessionNotify;
 use tokio::sync::mpsc;
@@ -70,7 +70,7 @@ impl SessionNotifier for TuiSessionNotifier {
         &self,
         _project_id: &str,
         session_id: &str,
-        error: agent_client_protocol::schema::Error,
+        error: agent_client_protocol::schema::v1::Error,
         _request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _ = self.tx.try_send(AppEvent::PromptEnded {

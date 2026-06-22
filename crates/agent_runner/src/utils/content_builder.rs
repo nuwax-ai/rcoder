@@ -2,7 +2,7 @@
 //!
 //! 将 Attachment 转换为 ACP 协议的 ContentBlock
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AudioContent, BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
     ImageContent, ResourceLink, TextContent, TextResourceContents,
 };

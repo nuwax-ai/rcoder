@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use agent_client_protocol::schema::{McpServer, McpServerStdio};
+use agent_client_protocol::schema::v1::{McpServer, McpServerStdio};
 use agent_config::ContextServerConfig;
 use tracing::{debug, info};
 
@@ -179,11 +179,11 @@ pub fn convert_context_servers_sacp(
                 server = server.args(final_args);
             }
 
-            let mut env_vars: Vec<agent_client_protocol::schema::EnvVariable> =
+            let mut env_vars: Vec<agent_client_protocol::schema::v1::EnvVariable> =
                 if let Some(env) = &c.env {
                     env.iter()
                         .map(|(k, v)| {
-                            agent_client_protocol::schema::EnvVariable::new(k.clone(), v.clone())
+                            agent_client_protocol::schema::v1::EnvVariable::new(k.clone(), v.clone())
                         })
                         .collect()
                 } else {
@@ -196,7 +196,7 @@ pub fn convert_context_servers_sacp(
                     .iter()
                     .any(|e| e.name == "DBUS_SESSION_BUS_ADDRESS")
             {
-                env_vars.push(agent_client_protocol::schema::EnvVariable::new(
+                env_vars.push(agent_client_protocol::schema::v1::EnvVariable::new(
                     "DBUS_SESSION_BUS_ADDRESS".to_string(),
                     addr.clone(),
                 ));
@@ -205,7 +205,7 @@ pub fn convert_context_servers_sacp(
             // 注入镜像源环境变量（npx/bunx/uvx 子进程使用）
             for (key, val) in crate::mirror_env::collect_mirror_env_vars() {
                 if !env_vars.iter().any(|e| e.name == key) {
-                    env_vars.push(agent_client_protocol::schema::EnvVariable::new(key, val));
+                    env_vars.push(agent_client_protocol::schema::v1::EnvVariable::new(key, val));
                 }
             }
 
@@ -216,7 +216,7 @@ pub fn convert_context_servers_sacp(
             if !env_vars.iter().any(|e| e.name == "PATH") {
                 let path_value = build_mcp_server_path_env();
                 if !path_value.is_empty() {
-                    env_vars.push(agent_client_protocol::schema::EnvVariable::new(
+                    env_vars.push(agent_client_protocol::schema::v1::EnvVariable::new(
                         "PATH".to_string(),
                         path_value,
                     ));
@@ -228,7 +228,7 @@ pub fn convert_context_servers_sacp(
             if !env_vars.iter().any(|e| e.name == "HOME")
                 && let Ok(home) = std::env::var("HOME")
             {
-                env_vars.push(agent_client_protocol::schema::EnvVariable::new(
+                env_vars.push(agent_client_protocol::schema::v1::EnvVariable::new(
                     "HOME".to_string(),
                     home,
                 ));
@@ -239,7 +239,7 @@ pub fn convert_context_servers_sacp(
             {
                 if !env_vars.iter().any(|e| e.name == "USERPROFILE") {
                     if let Ok(profile) = std::env::var("USERPROFILE") {
-                        env_vars.push(agent_client_protocol::schema::EnvVariable::new(
+                        env_vars.push(agent_client_protocol::schema::v1::EnvVariable::new(
                             "USERPROFILE".to_string(),
                             profile,
                         ));
@@ -247,7 +247,7 @@ pub fn convert_context_servers_sacp(
                 }
                 if !env_vars.iter().any(|e| e.name == "PATHEXT") {
                     if let Ok(pathext) = std::env::var("PATHEXT") {
-                        env_vars.push(agent_client_protocol::schema::EnvVariable::new(
+                        env_vars.push(agent_client_protocol::schema::v1::EnvVariable::new(
                             "PATHEXT".to_string(),
                             pathext,
                         ));

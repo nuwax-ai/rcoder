@@ -178,7 +178,7 @@ async fn run_stream_loop(
             _ = cancellation_token.cancelled() => {
                 info!("📡 [gRPC] Session connection cancelled, sending SessionPromptEnd: session_id={}", session_id);
 
-                use agent_client_protocol::schema::StopReason;
+                use agent_client_protocol::schema::v1::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
                 let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {

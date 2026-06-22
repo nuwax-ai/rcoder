@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_abstraction::{PermissionPrompt, PermissionRequestContext};
-use agent_client_protocol::schema::RequestPermissionRequest;
+use agent_client_protocol::schema::v1::RequestPermissionRequest;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
@@ -32,9 +32,9 @@ impl TuiPermissionPrompt {
 
     /// 将 ACP PermissionOptionKind 转换为人类可读文本
     fn render_option_kind(
-        kind: &agent_client_protocol::schema::PermissionOptionKind,
+        kind: &agent_client_protocol::schema::v1::PermissionOptionKind,
     ) -> &'static str {
-        use agent_client_protocol::schema::PermissionOptionKind;
+        use agent_client_protocol::schema::v1::PermissionOptionKind;
         match kind {
             PermissionOptionKind::AllowOnce => "Allow once",
             PermissionOptionKind::AllowAlways => "Allow always",

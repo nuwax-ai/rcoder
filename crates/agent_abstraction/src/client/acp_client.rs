@@ -145,12 +145,12 @@ where
     /// Sends a cancel request through the cancel channel. The agent
     /// should stop processing the current prompt.
     pub async fn cancel(&self) -> Result<()> {
-        use agent_client_protocol::schema::CancelNotification;
+        use agent_client_protocol::schema::v1::CancelNotification;
         use shared_types::CancelNotificationRequestWrapper;
 
         // Build cancel notification using the constructor
         let session_id =
-            agent_client_protocol::schema::SessionId::new(Arc::from(self.session_id.as_str()));
+            agent_client_protocol::schema::v1::SessionId::new(Arc::from(self.session_id.as_str()));
         let cancel_notification = CancelNotification::new(session_id);
 
         // Get the cancel_tx from the session

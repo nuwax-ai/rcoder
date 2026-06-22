@@ -38,7 +38,7 @@ test-blocking = []  # 启用测试用阻塞注入 (用于极端场景测试)
 otel = []  # 启用 OpenTelemetry 追踪功能
 
 # Pyroscope 连续性能分析
-pyroscope = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
+pyroscope = ["dep:pyroscope"]
 
 [dependencies]
 # Internal crates
@@ -133,7 +133,6 @@ arc-swap = "1.8"
 
 # Pyroscope Continuous Profiling
 pyroscope = { workspace = true, optional = true }
-pyroscope_pprofrs = { workspace = true, optional = true }
 
 # Unix 信号处理（用于僵尸进程回收，仅 Unix 平台）
 [target.'cfg(unix)'.dependencies]

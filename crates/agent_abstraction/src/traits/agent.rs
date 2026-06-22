@@ -1,6 +1,6 @@
 //! Agent trait definition.
 
-use agent_client_protocol::schema::McpServer;
+use agent_client_protocol::schema::v1::McpServer;
 use tracing::{debug, info};
 
 /// Agent startup configuration

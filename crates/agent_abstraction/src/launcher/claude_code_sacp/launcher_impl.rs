@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use agent_client_protocol::schema::{PromptRequest, SessionId};
+use agent_client_protocol::schema::v1::{PromptRequest, SessionId};
 use anyhow::{Context, Result};
 use process_wrap::tokio::CommandWrap;
 #[cfg(unix)]
@@ -627,7 +627,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                         "[SACP] Sending error notification to SSE stream: project_id={}, session_id={}",
                         project_id_clone, session_id
                     );
-                    let error = agent_client_protocol::schema::Error::new(
+                    let error = agent_client_protocol::schema::v1::Error::new(
                         1001,
                         format!("ACP connection failed: {}", e),
                     );

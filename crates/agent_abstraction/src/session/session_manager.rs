@@ -49,7 +49,7 @@
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
-use agent_client_protocol::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
+use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use chrono::Utc;

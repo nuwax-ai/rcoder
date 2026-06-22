@@ -102,7 +102,7 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         &self,
         project_id: &str,
         session_id: &str,
-        stop_reason: agent_client_protocol::schema::StopReason,
+        stop_reason: agent_client_protocol::schema::v1::StopReason,
         error_message: Option<String>,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -138,7 +138,7 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         &self,
         project_id: &str,
         session_id: &str,
-        error: agent_client_protocol::schema::Error,
+        error: agent_client_protocol::schema::v1::Error,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         error!(
@@ -165,7 +165,7 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         &self,
         project_id: &str,
         session_id: &str,
-        session_update: agent_client_protocol::schema::SessionUpdate,
+        session_update: agent_client_protocol::schema::v1::SessionUpdate,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!(

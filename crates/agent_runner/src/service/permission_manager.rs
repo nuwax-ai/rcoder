@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock};
 
 use agent_abstraction::{PermissionRequestContext, PermissionRequestHandler};
 use agent_client_protocol::Responder;
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome,
 };
@@ -597,15 +597,15 @@ fn match_tool_approval_rules(
         .kind
         .as_ref()
         .map(|k| match k {
-            agent_client_protocol::schema::ToolKind::Read => "Read",
-            agent_client_protocol::schema::ToolKind::Edit => "Edit",
-            agent_client_protocol::schema::ToolKind::Delete => "Delete",
-            agent_client_protocol::schema::ToolKind::Move => "Move",
-            agent_client_protocol::schema::ToolKind::Search => "Search",
-            agent_client_protocol::schema::ToolKind::Execute => "Execute",
-            agent_client_protocol::schema::ToolKind::Think => "Think",
-            agent_client_protocol::schema::ToolKind::Fetch => "Fetch",
-            agent_client_protocol::schema::ToolKind::SwitchMode => "SwitchMode",
+            agent_client_protocol::schema::v1::ToolKind::Read => "Read",
+            agent_client_protocol::schema::v1::ToolKind::Edit => "Edit",
+            agent_client_protocol::schema::v1::ToolKind::Delete => "Delete",
+            agent_client_protocol::schema::v1::ToolKind::Move => "Move",
+            agent_client_protocol::schema::v1::ToolKind::Search => "Search",
+            agent_client_protocol::schema::v1::ToolKind::Execute => "Execute",
+            agent_client_protocol::schema::v1::ToolKind::Think => "Think",
+            agent_client_protocol::schema::v1::ToolKind::Fetch => "Fetch",
+            agent_client_protocol::schema::v1::ToolKind::SwitchMode => "SwitchMode",
             _ => "Other",
         })
         .unwrap_or("Other")
@@ -1310,7 +1310,7 @@ mod tests {
     }
 
     fn make_execute_request(command: &str) -> RequestPermissionRequest {
-        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
         let fields = ToolCallUpdateFields::new()
             .kind(ToolKind::Execute)
             .title("bash")
@@ -1320,7 +1320,7 @@ mod tests {
     }
 
     fn make_read_request(tool_name: &str) -> RequestPermissionRequest {
-        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
         let fields = ToolCallUpdateFields::new()
             .kind(ToolKind::Read)
             .title(tool_name)

@@ -121,28 +121,7 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
     fi
 
 # ============================================================================
-# 📊 Pyroscope Agent - 持续剖析（已废弃，保留用于兼容性）
-# ============================================================================
-ARG INSTALL_PYROSCOPE=false
-RUN if [ "$INSTALL_PYROSCOPE" = "true" ]; then \
-    echo "📦 安装 Pyroscope Agent..."; \
-    apt-get update && \
-    apt-get install -y curl ca-certificates && \
-    echo "下载 Pyroscope Agent (v1.17.0)..." && \
-    curl -fsSL "https://github.com/grafana/pyroscope/releases/download/v1.17.0/pyroscope_1.17.0_linux_arm64.tar.gz" \
-    -o /tmp/pyroscope.tar.gz && \
-    echo "解压 Pyroscope Agent..." && \
-    tar -xzf /tmp/pyroscope.tar.gz -C /usr/local/bin/ && \
-    rm /tmp/pyroscope.tar.gz && \
-    chmod +x /usr/local/bin/pyroscope && \
-    echo "验证 Pyroscope Agent..." && \
-    pyroscope --version || echo "⚠️  Pyroscope 安装失败"; \
-    else \
-    echo "⚠️  Pyroscope 未安装"; \
-    fi
-
-# ============================================================================
-# 📊 Grafana Alloy - 持续性能数据采集（替代已废弃的 Pyroscope Agent）
+# 📊 Grafana Alloy - 持续性能数据采集
 # ============================================================================
 ARG INSTALL_ALLOY=false
 ARG ALLOY_VERSION=v1.12.2

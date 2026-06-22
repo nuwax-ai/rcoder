@@ -3,7 +3,7 @@
 //! 处理 POST /computer/agent/stop 请求
 //! 增强版：等待取消结果 + 清理 permissions + 完整生命周期清理
 
-use agent_client_protocol::schema::{CancelNotification, SessionId};
+use agent_client_protocol::schema::v1::{CancelNotification, SessionId};
 use axum::{Json, extract::State, http::HeaderMap};
 use std::sync::Arc;
 use tokio::sync::oneshot;

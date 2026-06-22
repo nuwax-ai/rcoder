@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::{CancelNotification, SessionId};
+use agent_client_protocol::schema::v1::{CancelNotification, SessionId};
 use dashmap::DashMap;
 use shared_types::{
     Attachment, CancelNotificationRequestWrapper, CancelResult, ChatAgentConfig, ChatPromptBuilder,
@@ -499,7 +499,7 @@ pub async fn handle_chat_core(
                 // 3. Notify SSE stream + clean SESSION_CACHE
                 if !old_session_id.is_empty() {
                     use crate::service::push_session_update_with_project;
-                    use agent_client_protocol::schema::StopReason;
+                    use agent_client_protocol::schema::v1::StopReason;
                     use shared_types::{SessionNotify, SessionPromptEnd};
 
                     let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {

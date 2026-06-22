@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::{RequestPermissionOutcome, RequestPermissionResponse};
+use agent_client_protocol::schema::v1::{RequestPermissionOutcome, RequestPermissionResponse};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 

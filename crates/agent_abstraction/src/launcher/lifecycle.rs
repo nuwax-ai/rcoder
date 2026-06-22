@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use agent_client_protocol::schema::SessionId;
+use agent_client_protocol::schema::v1::SessionId;
 use shared_types::{AgentLifecycle, ModelProviderConfig};
 
 use crate::diagnostics::{DiagnosticsListener, ProcessDiagnostics};

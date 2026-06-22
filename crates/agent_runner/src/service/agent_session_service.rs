@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use agent_abstraction::launcher::ModelRuntimeEnvResolver;
 use agent_abstraction::session::{AcpAgentWorker, AcpSessionManager, AgentWorker, WorkerRequest};
-use agent_client_protocol::schema::SessionId;
+use agent_client_protocol::schema::v1::SessionId;
 use anyhow::Result;
 use chrono::Utc;
 use dashmap::DashMap;

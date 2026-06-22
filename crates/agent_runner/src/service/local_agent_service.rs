@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::{CancelNotification, SessionId};
+use agent_client_protocol::schema::v1::{CancelNotification, SessionId};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use shared_types::{

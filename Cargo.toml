@@ -35,7 +35,7 @@ publish = false
 
 [workspace.dependencies]
 # ACP Protocol - 官方 SDK（完全 Send-safe，无需 LocalSet）
-agent-client-protocol = { version = "0.14" }
+agent-client-protocol = { version = "0.15" }
 
 # MCP 协议 - rmcp 官方库
 rmcp = { version = "1.7"}
@@ -59,24 +59,15 @@ axum = { version = "0.8", features = [
     "macros",
 ] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
-tonic = { version = "0.14.5", features = ["tls-native-roots"] }
-http = "1.0"
+tower-http = { version = "0.7", features = ["cors", "trace", "set-header"] }
+tonic = { version = "0.14.6", features = ["tls-native-roots"] }
+http = "1.4"
 http-body = "1.0"
 http-body-util = "0.1"
 
-# Database
-sqlx = { version = "0.8", features = [
-    "runtime-tokio-rustls",
-    "sqlite",
-    "chrono",
-    "uuid",
-] }
-duckdb = { version = "1.4", features = ["bundled"] }
-
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.148"
+serde_json = "1.0.150"
 schemars = { version = "1.2", features = ["derive"] }
 config = "0.15"
 
@@ -90,21 +81,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
 # OpenTelemetry (统一使用 0.30 以兼容 tracing-opentelemetry)
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = [
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = [
     "grpc-tonic",
     "http-proto",
 ] }
-tracing-opentelemetry = "0.32"
-axum-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.33"
+axum-tracing-opentelemetry = "0.38"
 
 # Prometheus Metrics
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 
 # UUID
-uuid = { version = "1.0", features = ["serde", "v4", "v7"] }
+uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
@@ -117,11 +108,11 @@ tokio-fs = "0.1"
 path-clean = "1.0"
 
 # Utilities
-dashmap = "6.0"
+dashmap = "6.2"
 futures = "0.3"
 futures-util = "0.3"
-itertools = "0.14"
-bytes = "1.11"
+itertools = "0.15"
+bytes = "1.12"
 arrayvec = "0.7"
 
 url = { version = "2.5", features = ["serde"] }
@@ -140,8 +131,8 @@ rust-embed = "8.0"
 zstd = "0.13"
 
 # Kubernetes
-kube = { version = "0.98", features = ["runtime", "client", "kube-runtime", "config"] }
-k8s-openapi = { version = "0.24", features = ["v1_32"] }
+kube = { version = "4.0", features = ["runtime", "client", "kube-runtime", "config"] }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
 
 
 # 构建工具
@@ -149,10 +140,10 @@ derive_builder = "0.20"
 
 # Zed 核心功能依赖
 libc = "0.2"
-nix = { version = "0.31.2", features = ["fs", "process", "term", "signal"] }
+nix = { version = "0.31.3", features = ["fs", "process", "term", "signal"] }
 unindent = "0.2"                                                   # 使用 crates.io 版本
 open = "5.0"                                                       # 使用 crates.io 版本
-git2 = "0.20.4"
+git2 = "0.21"
 tree-sitter-rust = "0.24"                                          # 使用 crates.io 版本
 
 
@@ -163,7 +154,7 @@ walkdir = "2.5"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # 项目依赖 - 保留核心功能
-aho-corasick = "1.0"
+aho-corasick = "1.1"
 base64 = "0.22"
 circular-buffer = "1.2"
 fancy-regex = "0.18"
@@ -173,19 +164,19 @@ image = "0.25"
 indexmap = "2.14"
 pathdiff = "0.2"
 postage = "0.5"
-regex = "1.0"
+regex = "1.12"
 semver = "1.0"
 shellexpand = "3.1"
 winnow = "1.0.3"
-shlex = "1.0"
+shlex = "2.0"
 smallvec = "1.15"
 
-toml = "0.9"
+toml = "1.1.2+spec-1.1.0"
 which = "8.0"
 
 
 # Dev dependencies for testing
-ctor = "0.13"
+ctor = "1.0.7"
 pretty_assertions = "1.4"
 tempfile = "3.24"
 rand = "0.10"
@@ -196,7 +187,7 @@ expect-test = "1.5"
 dirs = "6.0"
 
 # Archive utilities
-flate2 = "1.0"
+flate2 = "1.1"
 tar = "0.4"
 zip = "8.6"
 
@@ -223,9 +214,9 @@ bollard = { version = "0.21" }
 moka = { version = "0.12", features = ["future", "sync"] }
 
 # TUI
-ratatui = { version = "0.29", features = ["crossterm"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
-pulldown-cmark = "0.12"
+ratatui = { version = "0.30", features = ["crossterm"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+pulldown-cmark = "0.13"
 unicode-width = "0.2"
 
 # i18n (国际化)
@@ -235,8 +226,7 @@ rust-i18n = "4"
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }
 
 # Pyroscope Continuous Profiling
-pyroscope = "0.5"
-pyroscope_pprofrs = "0.2"
+pyroscope = { version = "2.0", features = ["backend-pprof-rs"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

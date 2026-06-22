@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::StopReason;
+use agent_client_protocol::schema::v1::StopReason;
 use shared_types::grpc::{StopAgentRequest, StopAgentResponse};
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};

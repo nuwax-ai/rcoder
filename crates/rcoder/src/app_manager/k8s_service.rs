@@ -992,7 +992,7 @@ impl super::AppServiceTrait for K8sAppService {
                         let timestamp = e
                             .last_timestamp
                             .as_ref()
-                            .map(|t| t.0.to_rfc3339())
+                            .map(|t| t.0.to_string())
                             .unwrap_or_default();
                         format!("[{}] {}: {}", timestamp, reason, message)
                     })
@@ -1022,5 +1022,68 @@ impl super::AppServiceTrait for K8sAppService {
 
     async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
         self.delete_file(app_id, file_path).await
+    }
+}
+
+#[cfg(all(test, feature = "kubernetes"))]
+mod tests {
+    /// 验证 jiff::Timestamp::to_string() 输出的格式与 chrono::DateTime::to_rfc3339() 兼容
+    ///
+    /// 已知差异：jiff 使用 `Z` 后缀，chrono 使用 `+00:00` 后缀，两者都是有效的 RFC 3339。
+    /// 对于 event 日志显示场景，差异无影响。
+    #[test]
+    fn jiff_timestamp_format_compatible_with_chrono_rfc3339() {
+        // 2024-01-15T10:30:00Z = 1705312200 seconds since epoch
+        let epoch_secs: i64 = 1705312200;
+        let nanos: i32 = 123456789;
+
+        // jiff 格式（通过 k8s_openapi 间接依赖）
+        let jiff_ts = k8s_openapi::jiff::Timestamp::new(epoch_secs, nanos).unwrap();
+        let jiff_str = jiff_ts.to_string();
+
+        // chrono 格式
+        let chrono_dt = chrono::DateTime::from_timestamp(epoch_secs, nanos as u32).unwrap();
+        let chrono_str = chrono_dt.to_rfc3339();
+
+        // 两者都应包含日期时间和时区信息
+        assert!(jiff_str.contains("2024-01-15"), "jiff: {jiff_str}");
+        assert!(chrono_str.contains("2024-01-15"), "chrono: {chrono_str}");
+
+        // 验证日期时间部分（秒精度）一致，忽略时区后缀差异
+        // jiff:   2024-01-15T09:50:00.123456789Z
+        // chrono: 2024-01-15T09:50:00.123456789+00:00
+        let jiff_dt_part = jiff_str.trim_end_matches('Z');
+        let chrono_dt_part = chrono_str.trim_end_matches("+00:00");
+        assert_eq!(jiff_dt_part, chrono_dt_part, "日期时间部分不一致:\n  jiff:  {jiff_str}\n  chrono: {chrono_str}");
+
+        // 验证都是 UTC 时区表示
+        assert!(
+            jiff_str.ends_with('Z') || jiff_str.ends_with("+00:00"),
+            "jiff 时区格式异常: {jiff_str}"
+        );
+        assert!(
+            chrono_str.ends_with('Z') || chrono_str.ends_with("+00:00"),
+            "chrono 时区格式异常: {chrono_str}"
+        );
+
+        // 打印完整格式供人工对比
+        println!("jiff:   {jiff_str}");
+        println!("chrono: {chrono_str}");
+    }
+
+    /// 验证零时间戳的格式
+    #[test]
+    fn jiff_timestamp_epoch_zero() {
+        let jiff_ts = k8s_openapi::jiff::Timestamp::new(0, 0).unwrap();
+        let jiff_str = jiff_ts.to_string();
+
+        let chrono_dt = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let chrono_str = chrono_dt.to_rfc3339();
+
+        assert!(jiff_str.starts_with("1970-01-01"), "jiff: {jiff_str}");
+        assert!(chrono_str.starts_with("1970-01-01"), "chrono: {chrono_str}");
+
+        println!("epoch zero - jiff:   {jiff_str}");
+        println!("epoch zero - chrono: {chrono_str}");
     }
 }

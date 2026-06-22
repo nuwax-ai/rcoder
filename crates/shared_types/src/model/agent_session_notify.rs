@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::{Error, SessionUpdate, StopReason};
+use agent_client_protocol::schema::v1::{Error, SessionUpdate, StopReason};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -309,7 +309,7 @@ fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{ContentChunk, SessionInfoUpdate, UsageUpdate};
+    use agent_client_protocol::schema::v1::{ContentChunk, SessionInfoUpdate, UsageUpdate};
 
     #[test]
     fn test_session_prompt_start_to_unified() {

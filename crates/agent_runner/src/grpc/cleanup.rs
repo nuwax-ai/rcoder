@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::StopReason;
+use agent_client_protocol::schema::v1::StopReason;
 use shared_types::{SessionNotify, SessionPromptEnd};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -157,7 +157,7 @@ pub async fn send_cancel_and_wait(
     session_id: &str,
     timeout_secs: u64,
 ) -> CancelAndWaitResult {
-    use agent_client_protocol::schema::{CancelNotification, SessionId};
+    use agent_client_protocol::schema::v1::{CancelNotification, SessionId};
     use std::time::Duration;
     use tokio::sync::oneshot;
 
