@@ -695,7 +695,9 @@ mod tests {
         assert_eq!(multi_config.services.len(), 2);
 
         // 验证 web-agent-runner 配置
-        let web_config = multi_config.get_service_config(&ServiceType::WebAgentRunner).unwrap();
+        let web_config = multi_config
+            .get_service_config(&ServiceType::WebAgentRunner)
+            .unwrap();
         assert_eq!(
             web_config.image,
             Some("nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest".to_string())
@@ -703,7 +705,9 @@ mod tests {
         assert!(web_config.enabled);
 
         // 验证 computer-agent-runner 配置
-        let computer_config = multi_config.get_service_config(&ServiceType::ComputerAgentRunner).unwrap();
+        let computer_config = multi_config
+            .get_service_config(&ServiceType::ComputerAgentRunner)
+            .unwrap();
         assert_eq!(
             computer_config.image,
             Some("dev-rcoder-agent-runner:latest".to_string())
@@ -769,7 +773,9 @@ mod tests {
         assert_eq!(multi_config.services.len(), 2);
 
         // 验证通过新的服务名称可以找到配置
-        let web_config = multi_config.get_service_config(&ServiceType::WebAgentRunner).unwrap();
+        let web_config = multi_config
+            .get_service_config(&ServiceType::WebAgentRunner)
+            .unwrap();
         assert_eq!(
             web_config.image,
             Some("nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest".to_string())
@@ -777,7 +783,9 @@ mod tests {
         assert!(web_config.enabled);
 
         // 验证 computer-agent-runner 配置
-        let computer_config = multi_config.get_service_config(&ServiceType::ComputerAgentRunner).unwrap();
+        let computer_config = multi_config
+            .get_service_config(&ServiceType::ComputerAgentRunner)
+            .unwrap();
         assert_eq!(
             computer_config.image,
             Some("dev-rcoder-agent-runner:latest".to_string())
