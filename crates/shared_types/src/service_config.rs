@@ -452,9 +452,9 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
 
     ServiceImageConfig {
         service_type: ServiceType::WebAgentRunner,
-        image: None, // 使用架构特定镜像
-        arm64_image: None, // 从配置文件加载
-        amd64_image: None, // 从配置文件加载
+        image: None,         // 使用架构特定镜像
+        arm64_image: None,   // 从配置文件加载
+        amd64_image: None,   // 从配置文件加载
         default_image: None, // 从配置文件加载
         image_tag_prefix: Some("web-agent-runner".to_string()),
         enabled: true, // 当前启用
@@ -507,9 +507,9 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
 
     ServiceImageConfig {
         service_type: ServiceType::ComputerAgentRunner,
-        image: None, // 使用架构特定镜像
-        arm64_image: None, // 从配置文件加载
-        amd64_image: None, // 从配置文件加载
+        image: None,         // 使用架构特定镜像
+        arm64_image: None,   // 从配置文件加载
+        amd64_image: None,   // 从配置文件加载
         default_image: None, // 从配置文件加载
         image_tag_prefix: Some("computer-agent-runner".to_string()),
         enabled: true, // 当前启用

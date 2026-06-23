@@ -151,8 +151,8 @@ mod tests {
             ServiceImageConfig {
                 service_type: ServiceType::WebAgentRunner,
                 image: None,
-                arm64_image: None, // 从配置文件加载
-                amd64_image: None, // 从配置文件加载
+                arm64_image: None,   // 从配置文件加载
+                amd64_image: None,   // 从配置文件加载
                 default_image: None, // 从配置文件加载
                 image_tag_prefix: Some("web-agent-runner".to_string()),
                 enabled: true,
@@ -178,8 +178,8 @@ mod tests {
             ServiceImageConfig {
                 service_type: ServiceType::ComputerAgentRunner,
                 image: None,
-                arm64_image: None, // 从配置文件加载
-                amd64_image: None, // 从配置文件加载
+                arm64_image: None,   // 从配置文件加载
+                amd64_image: None,   // 从配置文件加载
                 default_image: None, // 从配置文件加载
                 image_tag_prefix: Some("computer-agent-runner".to_string()),
                 enabled: false, // 默认禁用
