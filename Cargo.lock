@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "agent_runner"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agent-client-protocol",
  "agent_abstraction",
@@ -1174,7 +1174,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "container-runtime-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1737,7 +1737,7 @@ dependencies = [
 
 [[package]]
 name = "docker_manager"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1771,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "download_utils"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "flate2",
  "futures-util",
@@ -5159,7 +5159,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5251,7 +5251,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-gateway"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6136,7 +6136,7 @@ dependencies = [
 
 [[package]]
 name = "shared_types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -6180,7 +6180,7 @@ dependencies = [
 
 [[package]]
 name = "shared_types_grpc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "prost",
  "prost-types",

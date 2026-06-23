@@ -182,3 +182,92 @@ fn test_service_type_serde() {
 
     println!("✅ ServiceType serde test passed");
 }
+
+/// 测试从测试环境配置文件加载配置
+#[test]
+fn test_load_test_environment_config_file() {
+    let config_path = project_root().join("docker/config.test.yml");
+    if !config_path.exists() {
+        println!("⚠️ Test environment config file not found at {:?}, skipping test", config_path);
+        return;
+    }
+
+    println!("Loading test environment config from: {:?}", config_path);
+
+    let config_content = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|e| panic!("Failed to read config file at {:?}: {}", config_path, e));
+
+    // 解析 YAML 配置
+    let config: serde_yaml::Value = serde_yaml::from_str(&config_content)
+        .unwrap_or_else(|e| panic!("Failed to parse YAML config: {}", e));
+
+    // 提取 multi_image_config 部分
+    let multi_image_config = config
+        .get("docker_config")
+        .and_then(|dc| dc.get("multi_image_config"))
+        .expect("multi_image_config not found in config file");
+
+    // 为缺少 mounts 字段的服务添加默认值
+    let mut multi_image_config = multi_image_config.clone();
+    if let Some(services) = multi_image_config.get_mut("services") {
+        for (_key, service) in services.as_mapping_mut().unwrap() {
+            if service.get("mounts").is_none() {
+                service.as_mapping_mut().unwrap().insert(
+                    serde_yaml::Value::String("mounts".to_string()),
+                    serde_yaml::Value::Sequence(vec![]),
+                );
+            }
+            if service.get("work_dir").is_none() {
+                service.as_mapping_mut().unwrap().insert(
+                    serde_yaml::Value::String("work_dir".to_string()),
+                    serde_yaml::Value::String("/app".to_string()),
+                );
+            }
+            if service.get("network_mode").is_none() {
+                service.as_mapping_mut().unwrap().insert(
+                    serde_yaml::Value::String("network_mode".to_string()),
+                    serde_yaml::Value::String("bridge".to_string()),
+                );
+            }
+        }
+    }
+
+    // 转换为 MultiImageConfig
+    let multi_config: MultiImageConfig = serde_yaml::from_value(multi_image_config)
+        .unwrap_or_else(|e| panic!("Failed to parse multi_image_config: {}", e));
+
+    // 验证服务数量
+    assert_eq!(multi_config.services.len(), 2, "Expected 2 services");
+
+    // 验证配置有效
+    match multi_config.validate() {
+        Ok(()) => {
+            println!("✅ Test environment config validation passed");
+        }
+        Err(e) => {
+            println!("❌ Test environment config validation failed: {}", e);
+            // 打印每个服务的配置详情
+            for (service_key, service_config) in &multi_config.services {
+                println!(
+                    "  Service '{}': service_type={}, image={:?}, arm64_image={:?}, amd64_image={:?}, default_image={:?}, enabled={}",
+                    service_key,
+                    service_config.service_type,
+                    service_config.image,
+                    service_config.arm64_image,
+                    service_config.amd64_image,
+                    service_config.default_image,
+                    service_config.enabled
+                );
+            }
+            panic!("Config validation failed");
+        }
+    }
+
+    // 输出配置摘要
+    println!("✅ Test environment config loaded successfully:");
+    println!("  Services: {}", multi_config.services.len());
+    println!("  Registry prefix: {:?}", multi_config.global_defaults.registry_prefix);
+    for (key, svc) in &multi_config.services {
+        println!("  - {}: service_type={}, image={:?}, enabled={}", key, svc.service_type, svc.image, svc.enabled);
+    }
+}
