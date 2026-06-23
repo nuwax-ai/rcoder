@@ -55,7 +55,7 @@ docker_config:
     services:
       # RCoder 主服务配置（使用与主容器相同的镜像）
       web-agent-runner:
-        service_type: "RCoder"
+        service_type: "web-agent-runner"
         # 🎯 使用阿里云镜像
         image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest"
         arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest"
@@ -108,7 +108,7 @@ docker_config:
             resolve_from: "/app/logs"
       # ComputerAgentRunner 服务配置
       computer-agent-runner:
-        service_type: "ComputerAgentRunner"
+        service_type: "computer-agent-runner"
         # 🎯 使用本地构建的镜像（make docker-build-agent-runner 构建）
         image: "dev-rcoder-agent-runner:latest"
         arm64_image: "dev-rcoder-agent-runner:latest"
