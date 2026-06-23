@@ -12,18 +12,23 @@ port: 8090
 
 # 容器清理配置
 cleanup_config:
+  # 是否启用容器清理功能（默认禁用）
+  # 设置为 true 可以启用自动清理闲置容器
+  # - true: 启用（自动清理闲置容器）
+  # - false: 禁用（默认，更安全）
+  enabled: true
   # 闲置超时时间（秒），超过此时间未活动的容器将被清理
   # 默认值: 600 (10分钟)
-  idle_timeout_seconds: 300
+  idle_timeout_seconds: 600
   # 清理任务执行间隔（秒）
   # 默认值: 300 (5分钟)
-  cleanup_interval_seconds: 300
+  cleanup_interval_seconds: 500
   # Docker 容器停止超时时间（秒）
   # 默认值: 30
-  docker_stop_timeout_seconds: 10
+  docker_stop_timeout_seconds: 30
   # 容器最小保护时间（秒），刚启动的容器在此时间内不会被清理
   # 默认值: 300 (5分钟)
-  container_protection_seconds: 60
+  container_protection_seconds: 300
 
 # Pingora 反向代理配置
 proxy_config:
@@ -40,11 +45,6 @@ proxy_config:
 
 # Docker 配置
 docker_config:
-  # 网络基础名称（不含 project name 前缀）
-  # Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
-  # 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
-  network_base_name: "agent-network"
-
   # 多镜像配置系统
   multi_image_config:
     # 全局默认配置
@@ -128,9 +128,6 @@ docker_config:
           # 🔥 Agent 清理配置（闲置超时时间，秒）
           # 默认值: 3600 (1小时)
           RCODER_AGENT_IDLE_TIMEOUT_SECS: "3600"
-          # 🔥 Agent 并发会话槽位数量
-          # 默认值: 10
-          RCODER_AGENT_CONCURRENCY_LIMIT: "5"
           # 🖼️ 自定义壁纸配置
           # 通过挂载的 /app/assets 目录使用宿主机壁纸
           # 使用方法：在宿主机 ./wallpaper 目录放置 wallpaper.jpeg
@@ -144,7 +141,7 @@ docker_config:
         resource_limits:
           memory_limit: 4294967296 # 4GB
           cpu_limit: 2.0
-          swap_limit: 6442450944 # 6GB (实际 swap = 2GB)
+          swap_limit: 8589934592 # 8GB
 
         work_dir: "/app"
         network_mode: "bridge"
@@ -187,6 +184,10 @@ docker_config:
 
   # 其他 Docker 配置
   network_mode: "bridge"
+  # 网络基础名称（不含 project name 前缀）
+  # Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
+  # 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
+  network_base_name: "agent-network"
   work_dir: "/app"
   auto_cleanup: true
   container_ttl_seconds: 3600

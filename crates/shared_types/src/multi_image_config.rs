@@ -875,4 +875,78 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_config_with_rcoder_key_and_web_agent_runner_type() {
+        // 测试服务名称是 "rcoder"，但 service_type 字段是 "WebAgentRunner" 的配置
+        // 这是测试环境使用的配置格式
+        let config_json = r#"
+{
+  "global_defaults": {
+    "registry_prefix": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test"
+  },
+  "services": {
+    "rcoder": {
+      "service_type": "WebAgentRunner",
+      "image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder:latest",
+      "arm64_image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder:latest",
+      "amd64_image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder:latest",
+      "default_image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder:latest",
+      "image_tag_prefix": "rcoder",
+      "enabled": true,
+      "environment": {},
+      "mounts": [],
+      "command": [],
+      "resource_limits": {},
+      "work_dir": "/app",
+      "network_mode": "bridge"
+    },
+    "computer-agent-runner": {
+      "service_type": "ComputerAgentRunner",
+      "image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-computer-agent-runner:latest",
+      "arm64_image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-computer-agent-runner:latest",
+      "amd64_image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-computer-agent-runner:latest",
+      "default_image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-computer-agent-runner:latest",
+      "image_tag_prefix": "computer-agent-runner",
+      "enabled": true,
+      "environment": {},
+      "mounts": [],
+      "command": [],
+      "resource_limits": {},
+      "work_dir": "/app",
+      "network_mode": "bridge"
+    }
+  },
+  "selection_strategy": "ServiceOnly",
+  "cache_config": {
+    "enabled": true,
+    "ttl_seconds": 3600,
+    "max_entries": 50
+  }
+}
+"#;
+
+        let multi_config: MultiImageConfig = serde_json::from_str(config_json).unwrap();
+
+        // 验证服务数量
+        assert_eq!(multi_config.services.len(), 2);
+
+        // 验证通过 ServiceType 枚举可以找到配置
+        let web_config = multi_config.get_service_config(&ServiceType::WebAgentRunner);
+        assert!(web_config.is_some(), "Should find config for WebAgentRunner");
+        assert_eq!(
+            web_config.unwrap().image,
+            Some("nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder:latest".to_string())
+        );
+
+        let computer_config = multi_config.get_service_config(&ServiceType::ComputerAgentRunner);
+        assert!(computer_config.is_some(), "Should find config for ComputerAgentRunner");
+        assert_eq!(
+            computer_config.unwrap().image,
+            Some("nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-computer-agent-runner:latest".to_string())
+        );
+
+        // 验证配置有效
+        assert!(multi_config.validate().is_ok());
+    }
 }
