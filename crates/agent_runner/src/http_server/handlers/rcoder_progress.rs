@@ -163,10 +163,20 @@ pub async fn handle_rcoder_progress(
     // 1. 从 SESSION_CACHE 获取 session_data
     // 🛡️ 关键：先 clone Arc<SessionData>，立即释放 DashMap shard 读锁
     // view() 在闭包返回后立即释放锁，无 Ref 暴露
+    info!(
+        "[RCoder] Looking up session in SESSION_CACHE: session_id={}",
+        session_id
+    );
     let session_data = match SESSION_CACHE.view(&session_id, |_, d| d.clone()) {
-        Some(data) => data,
+        Some(data) => {
+            info!(
+                "[RCoder] SESSION_CACHE found for session_id={}",
+                session_id
+            );
+            data
+        },
         None => {
-            warn!(" [RCoder] Session not found: session_id={}", session_id);
+            warn!(" [RCoder] Session not found in SESSION_CACHE: session_id={}", session_id);
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(HttpResult::error_with_message(
@@ -182,6 +192,10 @@ pub async fn handle_rcoder_progress(
         }
     };
 
+    info!(
+        "[RCoder] Creating new SSE connection: session_id={}",
+        session_id
+    );
     // 2. 创建新的消息订阅（DashMap 锁已释放，此处 await 安全）
     let (replay_messages, message_rx, _cancel_token) =
         match session_data.create_new_connection(1000).await {

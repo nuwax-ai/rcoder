@@ -75,27 +75,35 @@ pub async fn subscribe_progress(
         tokio::spawn(async move {
             use dashmap::mapref::entry::Entry;
 
+            info!(
+                "[gRPC] Looking up session in SESSION_CACHE: session_id={}",
+                session_id_clone
+            );
             // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
             // view() 在闭包返回后立即释放锁，无 Ref 暴露
             let session_data = if let Some(existing) = SESSION_CACHE.view(&session_id_clone, |_, d| d.clone()) {
                 info!(
-                    "📦 [gRPC] SESSION_CACHE already exists, reusing: session_id={}",
+                    "📦 [gRPC] SESSION_CACHE found, reusing: session_id={}",
                     session_id_clone
                 );
                 existing
             } else {
+                info!(
+                    "🆕 [gRPC] SESSION_CACHE not found, creating new SessionData: session_id={}",
+                    session_id_clone
+                );
                 let session_data = crate::service::SessionData::new(1000).await;
                 match SESSION_CACHE.entry(session_id_clone.clone()) {
                     Entry::Occupied(entry) => {
                         info!(
-                            "📦 [gRPC] SESSION_CACHE already exists, reusing: session_id={}",
+                            "📦 [gRPC] SESSION_CACHE exists after creation, reusing: session_id={}",
                             session_id_clone
                         );
                         entry.get().clone()
                     }
                     Entry::Vacant(entry) => {
                         info!(
-                            "🆕 [gRPC] SESSION_CACHE does not exist, creating new: session_id={}",
+                            "🆕 [gRPC] SESSION_CACHE created successfully: session_id={}",
                             session_id_clone
                         );
                         entry.insert(session_data.clone());
@@ -104,9 +112,16 @@ pub async fn subscribe_progress(
                 }
             };
 
+            info!(
+                "[gRPC] Creating new SSE connection: session_id={}",
+                session_id_clone
+            );
             match session_data.create_new_connection(100).await {
                 Ok((replay_messages, message_rx, cancellation_token)) => {
-                    info!("📡 [gRPC] Session connection created successfully: {}", session_id_clone);
+                    info!(
+                        "📡 [gRPC] Session connection created successfully: session_id={}, replay_count={}",
+                        session_id_clone, replay_messages.len()
+                    );
 
                     // 📼 回放 ring buffer 中的历史消息
                     for msg in replay_messages {

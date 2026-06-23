@@ -420,10 +420,14 @@ pub async fn handle_chat_core(
     // 只在 session 不存在时才清理无效的 session_id
     if let Some(ref sid) = session_id {
         let session_exists = AGENT_REGISTRY.contains_session(sid);
+        info!(
+            "[ChatHandler] Step 4: session_id={}, session_exists_in_registry={}",
+            sid, session_exists
+        );
 
         if !session_exists && SESSION_CACHE.remove(sid).is_some() {
             info!(
-                "[ChatHandler] session does not exist, removing invalid session: session_id={}",
+                "[ChatHandler] session does not exist in registry, removed from SESSION_CACHE: session_id={}",
                 sid
             );
         } else if session_exists {
@@ -431,15 +435,33 @@ pub async fn handle_chat_core(
             // 🧹 清空 ring buffer，防止回放过期的历史消息
             // view() 在闭包返回后立即释放锁，无 Ref 暴露
             if let Some(sd) = SESSION_CACHE.view(sid, |_, d| d.clone()) {
+                info!(
+                    "[ChatHandler] SESSION_CACHE found for session_id={}, attempting to clear ring buffer",
+                    sid
+                );
                 let cleared = sd.clear_message_buffer().await;
                 if cleared > 0 {
                     info!(
                         "[ChatHandler] Cleared {} stale messages from ring buffer for new conversation: session_id={}",
                         cleared, sid
                     );
+                } else {
+                    info!(
+                        "[ChatHandler] Ring buffer already empty for session_id={}",
+                        sid
+                    );
                 }
+            } else {
+                info!(
+                    "[ChatHandler] SESSION_CACHE not found for session_id={}",
+                    sid
+                );
             }
         }
+    } else {
+        info!(
+            "[ChatHandler] Step 4: session_id is None, skipping clear logic"
+        );
     }
 
     // ========== 步骤 4.5: Auto-Reload 检测 ==========

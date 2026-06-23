@@ -627,6 +627,7 @@ impl ContainerRuntime for KubernetesRuntime {
                     container_ip: pod_ip,
                     status,
                     created_at,
+                    env_vars: None,
                 };
 
                 // Update cache if running
@@ -887,6 +888,18 @@ impl ContainerRuntime for KubernetesRuntime {
             let pod: Pod = p;
             let status = Self::extract_pod_status(&pod);
             let metadata = &pod.metadata;
+
+            // 从 Pod 的 labels 中提取环境变量信息
+            let mut env_vars = std::collections::HashMap::new();
+            if let Some(labels) = &metadata.labels {
+                if let Some(project_id) = labels.get("project_id") {
+                    env_vars.insert("PROJECT_ID".to_string(), project_id.clone());
+                }
+                if let Some(user_id) = labels.get("user_id") {
+                    env_vars.insert("USER_ID".to_string(), user_id.clone());
+                }
+            }
+
             let pod_info = RuntimeContainerInfo {
                 container_id: metadata.uid.clone().unwrap_or_default(),
                 container_name: metadata.name.clone().unwrap_or_default(),
@@ -907,6 +920,7 @@ impl ContainerRuntime for KubernetesRuntime {
                         .unwrap_or_else(Utc::now)
                     })
                     .unwrap_or_else(Utc::now),
+                env_vars: Some(env_vars),
             };
             result.push(pod_info);
         }

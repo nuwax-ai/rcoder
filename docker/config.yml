@@ -56,11 +56,11 @@ docker_config:
       # RCoder 主服务配置（使用与主容器相同的镜像）
       web-agent-runner:
         service_type: "web-agent-runner"
-        # 🎯 使用阿里云镜像
-        image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest"
-        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest"
-        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest"
-        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest"
+        # 🎯 使用本地构建的镜像（包含 agent-runner-start.sh 脚本）
+        image: "dev-master-rcoder:latest"
+        arm64_image: "dev-master-rcoder:latest"
+        amd64_image: "dev-master-rcoder:latest"
+        default_image: "dev-master-rcoder:latest"
         image_tag_prefix: "dev-master-rcoder"
         enabled: true
 
@@ -73,6 +73,8 @@ docker_config:
           API_PORT: "8086"
           PROJECT_WORKSPACE_BASE: "/app/project_workspace"
         command:
+          - "/bin/bash"
+          - "/app/agent-runner-start.sh"
           - "/app/bin/agent_runner"
           - "--port"
           - "8086"

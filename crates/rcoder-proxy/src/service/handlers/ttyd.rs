@@ -258,6 +258,7 @@ pub async fn handle_web_ttyd_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,
     vnc_backends: &Arc<DashMap<String, String>>,
+    project_backends: &Arc<DashMap<String, String>>,
     metrics: &Arc<ProxyMetrics>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let user_id = params.get("user_id").unwrap_or("unknown");
@@ -268,16 +269,21 @@ pub async fn handle_web_ttyd_upstream(
         user_id, project_id
     );
 
-    // 查找用户容器 IP（复用 vnc_backends DashMap）
-    let container_ip = match vnc_backends.get(user_id) {
-        Some(ip_ref) => ip_ref.value().clone(),
+    // 使用 project_id 查找容器 IP（优先使用 project_backends，其次使用 vnc_backends）
+    let container_ip = project_backends
+        .get(project_id)
+        .or_else(|| vnc_backends.get(project_id))
+        .map(|ip_ref| ip_ref.value().clone());
+
+    let container_ip = match container_ip {
+        Some(ip) => ip,
         None => {
-            info!("routing {} to web ttyd", user_id);
+            info!("routing {} to web ttyd", project_id);
             return Err(
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
                     format!(
-                        "web ttyd backend for user {} not found, please create container first",
-                        user_id
+                        "web ttyd backend for project {} not found, please create container first",
+                        project_id
                     ),
                 ),
             );

@@ -105,6 +105,18 @@ impl K8sPodOps for KubernetesRuntime {
     fn runtime_info_from_pod(pod: &Pod) -> RuntimeContainerInfo {
         let status = Self::extract_pod_status(pod);
         let metadata = &pod.metadata;
+
+        // 从 Pod 的 labels 中提取环境变量信息
+        let mut env_vars = std::collections::HashMap::new();
+        if let Some(labels) = &metadata.labels {
+            if let Some(project_id) = labels.get("project_id") {
+                env_vars.insert("PROJECT_ID".to_string(), project_id.clone());
+            }
+            if let Some(user_id) = labels.get("user_id") {
+                env_vars.insert("USER_ID".to_string(), user_id.clone());
+            }
+        }
+
         RuntimeContainerInfo {
             container_id: metadata.uid.clone().unwrap_or_default(),
             container_name: metadata.name.clone().unwrap_or_default(),
@@ -125,6 +137,7 @@ impl K8sPodOps for KubernetesRuntime {
                     .unwrap_or_else(Utc::now)
                 })
                 .unwrap_or_else(Utc::now),
+            env_vars: Some(env_vars),
         }
     }
 

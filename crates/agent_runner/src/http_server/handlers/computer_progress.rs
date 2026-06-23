@@ -162,10 +162,20 @@ pub async fn handle_computer_progress(
     // 之前直接在 Ref 上调用 create_new_connection().await，导致 DashMap 读锁跨 await 持有
     // 可能造成与 SESSION_CACHE.entry()/remove() 等写操作的死锁
     // view() 在闭包返回后立即释放锁，无 Ref 暴露
+    info!(
+        "[HTTP] Looking up session in SESSION_CACHE: session_id={}",
+        session_id
+    );
     let session_data = match SESSION_CACHE.view(&session_id, |_, d| d.clone()) {
-        Some(data) => data,
+        Some(data) => {
+            info!(
+                "[HTTP] SESSION_CACHE found for session_id={}",
+                session_id
+            );
+            data
+        },
         None => {
-            warn!(" [HTTP] Session not found: session_id={}", session_id);
+            warn!(" [HTTP] Session not found in SESSION_CACHE: session_id={}", session_id);
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(HttpResult::error_with_message(
@@ -181,6 +191,10 @@ pub async fn handle_computer_progress(
         }
     };
 
+    info!(
+        "[HTTP] Creating new SSE connection: session_id={}",
+        session_id
+    );
     // 2. 创建新的消息订阅（DashMap 锁已释放，此处 await 安全）
     let (replay_messages, message_rx, _cancel_token) =
         match session_data.create_new_connection(1000).await {

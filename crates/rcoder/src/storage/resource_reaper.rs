@@ -139,6 +139,13 @@ impl ResourceReaper {
         {
             pingora.remove_vnc_backend(&req.identifier);
         }
+
+        // 5. 清理 Pingora Project backend（WebAgentRunner）
+        if req.service_type == ServiceType::WebAgentRunner
+            && let Some(ref pingora) = self.pingora
+        {
+            pingora.remove_project_backend(&req.identifier);
+        }
     }
 }
 

@@ -11,8 +11,7 @@ use tracing::{info, warn};
 
 use crate::CancelNotificationRequestWrapper;
 use crate::http_server::router::AppState;
-use crate::service::AGENT_REGISTRY;
-use crate::service::PERMISSION_MANAGER;
+use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER, SESSION_CACHE};
 use shared_types::{
     ComputerAgentStopRequest, ComputerAgentStopResponse, HttpResult, I18nJsonOrQuery,
     error_codes::{ERR_VALIDATION, SUCCESS},
@@ -123,6 +122,18 @@ pub async fn handle_computer_stop(
 
         // 清理 session permissions
         PERMISSION_MANAGER.cancel_session_permissions(&session_id);
+
+        // 🧹 清空 ring buffer，防止停止后 SSE 流回放过期的历史消息
+        // agent stop 会销毁 agent，不需要保留 SSE 连接发送 SessionPromptEnd
+        if let Some(sd) = SESSION_CACHE.view(&session_id, |_, d| d.clone()) {
+            let cleared = sd.clear_message_buffer().await;
+            if cleared > 0 {
+                info!(
+                    "[HTTP] Cleared {} stale messages from ring buffer after stop: session_id={}",
+                    cleared, session_id
+                );
+            }
+        }
 
         // 从 AGENT_REGISTRY 移除
         let removed = AGENT_REGISTRY.remove_by_project(project_id).is_some();

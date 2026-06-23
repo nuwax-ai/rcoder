@@ -153,6 +153,10 @@ COPY docker/rcoder-master/ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
 COPY docker/rcoder-master/ttyd/ttyd-index.html /usr/local/share/ttyd/index.html
 RUN chmod +x /usr/local/bin/start-ttyd.sh
 
+# 复制 agent-runner 启动脚本（同时启动 ttyd 和 agent_runner）
+COPY docker/rcoder-master/agent-runner-start.sh /app/agent-runner-start.sh
+RUN chmod +x /app/agent-runner-start.sh
+
 # 暴露端口
 EXPOSE 8086
 EXPOSE 60000

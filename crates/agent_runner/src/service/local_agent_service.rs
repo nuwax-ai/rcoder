@@ -266,6 +266,18 @@ impl AgentHttpService for LocalAgentHttpService {
                 }
             }
 
+            // 🧹 清空 ring buffer，防止停止后 SSE 流回放过期的历史消息
+            // agent stop 会销毁 agent，不需要保留 SSE 连接发送 SessionPromptEnd
+            if let Some(sd) = SESSION_CACHE.view(&session_id, |_, d| d.clone()) {
+                let cleared = sd.clear_message_buffer().await;
+                if cleared > 0 {
+                    info!(
+                        "[LocalAgent] Cleared {} stale messages from ring buffer after stop: session_id={}",
+                        cleared, session_id
+                    );
+                }
+            }
+
             // 3. 从 AGENT_REGISTRY 移除 Agent
             AGENT_REGISTRY.remove_by_project(&request.project_id);
 
@@ -371,6 +383,10 @@ impl AgentHttpService for LocalAgentHttpService {
                 session_id
             );
         }
+
+        // 注意：不在这里清空 ring buffer 和关闭 SSE 连接
+        // 因为 cancel 后 Agent 还需要通过 SSE 发送 SessionPromptEnd 给客户端
+        // 清空 ring buffer 的逻辑在新对话开始时（chat_handler.rs）执行
 
         HttpResult::success(RcoderAgentCancelResponse {
             success: true,

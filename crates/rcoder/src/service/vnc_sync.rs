@@ -100,7 +100,25 @@ async fn sync_vnc_backends(
     let mut synced_count = 0;
     let mut updated_count = 0;
 
-    for container_info in containers {
+    for container_info in &containers {
+        // 从环境变量中获取 project_id（用于共享容器场景）
+        // 注意：这个逻辑必须在 user_id 检查之前，因为 user_id 可能为空
+        let project_id = container_info
+            .env_vars
+            .as_ref()
+            .and_then(|env| env.get("PROJECT_ID"))
+            .cloned()
+            .unwrap_or_default();
+
+        // 如果有 project_id，存储 project_id -> container_ip 的映射（用于 WebTtydProxy）
+        if !project_id.is_empty() && !container_info.container_ip.is_empty() {
+            debug!(
+                "➕ [VNC_SYNC] Adding project_id mapping: project_id={} -> {}",
+                project_id, container_info.container_ip
+            );
+            pingora_service.add_project_backend(&project_id, &container_info.container_ip);
+        }
+
         let user_id = container_identity_from_name(
             &container_info.container_name,
             rcoder_prefix,
@@ -211,10 +229,51 @@ async fn sync_vnc_backends(
         }
     }
 
-    if removed_count > 0 {
+    // === 清理已销毁容器的 project_backends 映射 ===
+    let current_project_backends = pingora_service.list_project_backends();
+
+    // 收集所有活跃的 project_id（从已获取的 containers 列表）
+    let active_project_ids: std::collections::HashSet<String> = containers
+        .iter()
+        .filter(|c| c.status == container_runtime_api::ContainerRuntimeStatus::Running)
+        .filter_map(|c| {
+            c.env_vars
+                .as_ref()
+                .and_then(|env| env.get("PROJECT_ID"))
+                .cloned()
+        })
+        .collect();
+
+    let mut removed_project_count = 0;
+    for project_id in current_project_backends.keys() {
+        if !active_project_ids.contains(project_id) {
+            // 🛡️ 防止竞态条件：在删除前做一次实时检查
+            let still_running = runtime
+                .is_container_running_by_identifier(project_id, &ServiceType::WebAgentRunner)
+                .await
+                .unwrap_or(false);
+
+            if still_running {
+                debug!(
+                    "🛡️ [VNC_SYNC] Keeping project backend despite snapshot miss (container still running): project_id={}",
+                    project_id
+                );
+                continue;
+            }
+
+            pingora_service.remove_project_backend(project_id);
+            removed_project_count += 1;
+            debug!(
+                "🗑️ [VNC_SYNC] Cleaning up already destroyed project mapping: project_id={}",
+                project_id
+            );
+        }
+    }
+
+    if removed_count > 0 || removed_project_count > 0 {
         info!(
-            "🗑️ [VNC_SYNC] Cleanup completed: removed={} mappings",
-            removed_count
+            "🗑️ [VNC_SYNC] Cleanup completed: removed_vnc={}, removed_project={}",
+            removed_count, removed_project_count
         );
     }
 }

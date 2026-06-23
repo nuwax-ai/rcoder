@@ -70,6 +70,8 @@ docker_config:
           API_PORT: "8086"
           PROJECT_WORKSPACE_BASE: "/app/project_workspace"
         command:
+          - "/bin/bash"
+          - "/app/agent-runner-start.sh"
           - "/app/bin/agent_runner"
           - "--port"
           - "8086"
@@ -81,8 +83,6 @@ docker_config:
 
         work_dir: "/app"
         network_mode: "bridge"
-
-
 
       # ComputerAgentRunner 服务配置
       computer-agent-runner:
@@ -109,7 +109,7 @@ docker_config:
           CUSTOM_WALLPAPER_PATH: "/app/assets/wallpaper.jpeg"
 
         command:
-          - "/usr/local/bin/agent_runner"
+          - "/app/bin/agent_runner"
           - "--port"
           - "8086"
 

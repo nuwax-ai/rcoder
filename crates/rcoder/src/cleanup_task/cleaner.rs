@@ -233,6 +233,18 @@ impl AgentCleaner {
                 )
                 .await?;
 
+            // 对于 WebAgentRunner 容器，同时清理 project_backends
+            // 因为 container_identifier 可能是 pod_id，而 project_backends 使用 project_id 作为 key
+            if service_type == ServiceType::WebAgentRunner
+                && let Some(ref pingora_service) = self.container_destroyer.pingora_service
+            {
+                let _: Option<String> = pingora_service.remove_project_backend(project_id);
+                debug!(
+                    "🧹 [cleaner] Cleaned up project_backends: project_id={}",
+                    project_id
+                );
+            }
+
             container_destroyed = true;
         }
 

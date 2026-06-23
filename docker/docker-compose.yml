@@ -14,6 +14,8 @@ services:
       - RUST_LOG=debug # 设置调试日志级别
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}
+      # 主容器禁用 ttyd（ttyd 在动态创建的容器中运行）
+      - ENABLE_TTYD=false
     volumes:
       # 挂载 Docker socket
       - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock

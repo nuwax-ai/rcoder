@@ -57,6 +57,8 @@ pub struct RuntimeContainerInfo {
     pub container_ip: String,
     pub status: ContainerRuntimeStatus,
     pub created_at: DateTime<Utc>,
+    /// 容器环境变量（可选，用于获取 project_id 等信息）
+    pub env_vars: Option<std::collections::HashMap<String, String>>,
 }
 
 /// 已被移除的容器信息（用于清理关联资源）

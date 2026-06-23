@@ -54,9 +54,12 @@ pub struct PingoraProxyService {
     pub metrics: Arc<ProxyMetrics>,
     /// 后端健康状态缓存
     pub health_map: Arc<RwLock<HashMap<u16, HealthInfo>>>,
-    /// VNC 后端映射: user_id -> container_ip
+    /// VNC 后端映射: user_id/pod_id -> container_ip
     /// 用于 /computer/vnc/{user_id}/{project_id} 路由
     pub vnc_backends: Arc<DashMap<String, String>>,
+    /// Project 后端映射: project_id -> container_ip
+    /// 用于 /web/ttyd/{user_id}/{project_id} 路由（共享容器场景）
+    pub project_backends: Arc<DashMap<String, String>>,
     /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
     /// 用于 /api/{service_name}/{*path} 路由
     pub api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
@@ -77,8 +80,10 @@ pub struct PortProxy {
     pub use_round_robin: bool,
     /// 指标
     pub metrics: Arc<ProxyMetrics>,
-    /// VNC 后端映射: user_id -> container_ip
+    /// VNC 后端映射: user_id/pod_id -> container_ip
     vnc_backends: Arc<DashMap<String, String>>,
+    /// Project 后端映射: project_id -> container_ip
+    project_backends: Arc<DashMap<String, String>>,
     /// 路由表
     router: Router<RouteType>,
     /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
@@ -360,6 +365,7 @@ impl ProxyHttp for PortProxy {
                     ctx,
                     matched.params,
                     &self.vnc_backends,
+                    &self.project_backends,
                     &self.metrics,
                 )
                 .await
@@ -490,6 +496,7 @@ impl PingoraProxyService {
             metrics: Arc::new(ProxyMetrics::default()),
             health_map: Arc::new(RwLock::new(HashMap::new())),
             vnc_backends: Arc::new(DashMap::new()),
+            project_backends: Arc::new(DashMap::new()),
             api_key_manager: Arc::new(DashMap::new()),
             api_key_config: None, // 默认不启用 API Key 鉴权
         }
@@ -537,6 +544,7 @@ impl PingoraProxyService {
             use_round_robin: self.use_round_robin,
             metrics: self.metrics.clone(),
             vnc_backends: self.vnc_backends.clone(),
+            project_backends: self.project_backends.clone(),
             router,
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(),
@@ -745,6 +753,32 @@ impl PingoraProxyService {
         removed.map(|(_, ip)| ip)
     }
 
+    /// 添加 Project 后端映射
+    ///
+    /// 用于 WebAgentRunner 容器，project_id 作为 key
+    pub fn add_project_backend(&self, project_id: &str, container_ip: &str) {
+        self.project_backends
+            .insert(project_id.to_string(), container_ip.to_string());
+        info!(
+            "Added project backend: project_id={} -> container_ip={}",
+            project_id, container_ip
+        );
+    }
+
+    /// 移除 Project 后端映射
+    ///
+    /// 当销毁 WebAgentRunner 容器时调用
+    pub fn remove_project_backend(&self, project_id: &str) -> Option<String> {
+        let removed = self.project_backends.remove(project_id);
+        if let Some((_, ip)) = &removed {
+            info!(
+                "removed project backend: project_id={} (was: {})",
+                project_id, ip
+            );
+        }
+        removed.map(|(_, ip)| ip)
+    }
+
     /// 获取 VNC 后端 IP
     pub fn get_vnc_backend(&self, user_id: &str) -> Option<String> {
         self.vnc_backends.get(user_id).map(|r| r.value().clone())
@@ -768,6 +802,21 @@ impl PingoraProxyService {
         self.vnc_backends.len()
     }
 
+    /// 列出所有 Project 后端映射
+    ///
+    /// 用于同步和清理逻辑
+    pub fn list_project_backends(&self) -> HashMap<String, String> {
+        self.project_backends
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
+    }
+
+    /// 获取 Project 后端数量
+    pub fn project_backend_count(&self) -> usize {
+        self.project_backends.len()
+    }
+
     // ========================================================================
     // 🔒 API 密钥管理方法
     // ========================================================================
@@ -787,6 +836,7 @@ impl Clone for PingoraProxyService {
             metrics: self.metrics.clone(),
             health_map: self.health_map.clone(),
             vnc_backends: self.vnc_backends.clone(),
+            project_backends: self.project_backends.clone(),
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(),
         }

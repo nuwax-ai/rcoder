@@ -125,6 +125,7 @@ impl ContainerRuntime for DockerRuntime {
                 crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s),
             },
             created_at: r.created_at,
+            env_vars: None, // 不填充环境变量（用于快速查找）
         }))
     }
 
@@ -230,6 +231,16 @@ impl DockerRuntime {
                 .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string()))?
                 .unwrap_or_default();
 
+            // 构建环境变量映射（包含 project_id 和 service_type）
+            let mut env_vars = std::collections::HashMap::new();
+            env_vars.insert("PROJECT_ID".to_string(), c.project_id.clone());
+            if let Some(ref user_id) = c.user_id {
+                env_vars.insert("USER_ID".to_string(), user_id.clone());
+            }
+            if let Some(ref service_type) = c.service_type {
+                env_vars.insert("SERVICE_TYPE".to_string(), service_type.to_string());
+            }
+
             result.push(RuntimeContainerInfo {
                 container_id: c.container_id,
                 container_name: c.container_name,
@@ -248,6 +259,7 @@ impl DockerRuntime {
                     crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s),
                 },
                 created_at: c.created_at,
+                env_vars: Some(env_vars),
             });
         }
         Ok(result)

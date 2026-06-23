@@ -72,12 +72,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# 安全校验：只允许 /home/USER_NAME_PLACEHOLDER/ 下的子目录
+# 安全校验：允许 /home/user/ 和 /app/project_workspace/ 下的子目录
 if [ -n "$TARGET_DIR" ] && [ -d "$TARGET_DIR" ]; then
     REAL_DIR=$(realpath "$TARGET_DIR" 2>/dev/null)
     HOME_PREFIX="/home/USER_NAME_PLACEHOLDER"
+    PROJECT_PREFIX="/app/project_workspace"
     case "$REAL_DIR" in
         "$HOME_PREFIX"|"$HOME_PREFIX"/*)
+            cd "$REAL_DIR" 2>/dev/null || cd "${HOME}" 2>/dev/null || true
+            ;;
+        "$PROJECT_PREFIX"|"$PROJECT_PREFIX"/*)
             cd "$REAL_DIR" 2>/dev/null || cd "${HOME}" 2>/dev/null || true
             ;;
         *)

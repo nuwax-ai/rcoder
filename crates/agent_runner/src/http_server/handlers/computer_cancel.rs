@@ -11,8 +11,7 @@ use tracing::{info, warn};
 
 use crate::CancelNotificationRequestWrapper;
 use crate::http_server::router::AppState;
-use crate::service::AGENT_REGISTRY;
-use crate::service::PERMISSION_MANAGER;
+use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER, SESSION_CACHE};
 use shared_types::{
     AppError, ComputerAgentCancelRequest, ComputerAgentCancelResponse, HttpResult, I18nJsonOrQuery,
     error_codes::ERR_VALIDATION, get_i18n_message,
@@ -156,6 +155,10 @@ pub async fn handle_computer_cancel(
 
     // 清理该 session 的 pending permissions
     PERMISSION_MANAGER.cancel_session_permissions(&session_id);
+
+    // 注意：不在这里清空 ring buffer 和关闭 SSE 连接
+    // 因为 cancel 后 Agent 还需要通过 SSE 发送 SessionPromptEnd 给客户端
+    // 清空 ring buffer 的逻辑在新对话开始时（chat_handler.rs）执行
 
     let response = ComputerAgentCancelResponse {
         success: true,

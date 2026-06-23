@@ -113,10 +113,16 @@ impl ContainerDestroyer {
             self.grpc_pool.remove(&old_grpc_addr).await;
         }
 
-        if *service_type == ServiceType::ComputerAgentRunner {
-            // 清理 Pingora VNC 后端
-            if let Some(ref pingora_service) = self.pingora_service {
+        if let Some(ref pingora_service) = self.pingora_service {
+            if *service_type == ServiceType::ComputerAgentRunner {
+                // 清理 Pingora VNC 后端
                 let _: Option<String> = pingora_service.remove_vnc_backend(container_identifier);
+            }
+
+            // 清理 Pingora Project 后端（WebAgentRunner 容器）
+            if *service_type == ServiceType::WebAgentRunner {
+                let _: Option<String> =
+                    pingora_service.remove_project_backend(container_identifier);
             }
         }
 
@@ -147,5 +153,89 @@ impl ContainerDestroyer {
         };
         self.destroy_with_reason(container_name, service_type, container_identifier, &reason)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcoder_proxy::PingoraProxyService;
+    use rcoder_proxy::config::ProxyConfig;
+
+    #[test]
+    fn test_project_backends_cleanup() {
+        // 创建 PingoraProxyService
+        let config = ProxyConfig::default();
+        let pingora_service = Arc::new(PingoraProxyService::new(config));
+
+        // 添加 project_backends 映射
+        pingora_service.add_project_backend("proj_123", "192.168.1.100");
+        pingora_service.add_project_backend("proj_456", "192.168.1.200");
+
+        // 验证映射已添加
+        assert_eq!(pingora_service.project_backend_count(), 2);
+
+        // 移除一个映射
+        let removed = pingora_service.remove_project_backend("proj_123");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap(), "192.168.1.100");
+
+        // 验证映射已移除
+        assert_eq!(pingora_service.project_backend_count(), 1);
+
+        // 验证另一个映射仍然存在
+        let backends = pingora_service.list_project_backends();
+        assert!(backends.contains_key("proj_456"));
+        assert_eq!(backends.get("proj_456").unwrap(), "192.168.1.200");
+    }
+
+    #[test]
+    fn test_vnc_backends_cleanup() {
+        // 创建 PingoraProxyService
+        let config = ProxyConfig::default();
+        let pingora_service = Arc::new(PingoraProxyService::new(config));
+
+        // 添加 vnc_backends 映射
+        pingora_service.add_vnc_backend("user_123", "192.168.1.100");
+        pingora_service.add_vnc_backend("user_456", "192.168.1.200");
+
+        // 验证映射已添加
+        assert_eq!(pingora_service.vnc_backend_count(), 2);
+
+        // 移除一个映射
+        let removed = pingora_service.remove_vnc_backend("user_123");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap(), "192.168.1.100");
+
+        // 验证映射已移除
+        assert_eq!(pingora_service.vnc_backend_count(), 1);
+
+        // 验证另一个映射仍然存在
+        let backends = pingora_service.list_vnc_backends();
+        assert!(backends.contains_key("user_456"));
+        assert_eq!(backends.get("user_456").unwrap(), "192.168.1.200");
+    }
+
+    #[test]
+    fn test_project_backends_and_vnc_backends_independent() {
+        // 创建 PingoraProxyService
+        let config = ProxyConfig::default();
+        let pingora_service = Arc::new(PingoraProxyService::new(config));
+
+        // 添加映射
+        pingora_service.add_project_backend("proj_123", "192.168.1.100");
+        pingora_service.add_vnc_backend("user_123", "192.168.1.200");
+
+        // 验证映射已添加
+        assert_eq!(pingora_service.project_backend_count(), 1);
+        assert_eq!(pingora_service.vnc_backend_count(), 1);
+
+        // 移除 project_backends 映射
+        pingora_service.remove_project_backend("proj_123");
+
+        // 验证 vnc_backends 映射仍然存在
+        assert_eq!(pingora_service.project_backend_count(), 0);
+        assert_eq!(pingora_service.vnc_backend_count(), 1);
+        assert!(pingora_service.list_vnc_backends().contains_key("user_123"));
     }
 }
