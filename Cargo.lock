@@ -6159,6 +6159,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "serde_yaml",
  "shared_types_grpc",
  "shared_types_i18n",
  "thiserror 2.0.18",
