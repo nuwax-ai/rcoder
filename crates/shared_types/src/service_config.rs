@@ -173,9 +173,21 @@ impl ServiceImageConfig {
             && self.amd64_image.is_none()
             && self.default_image.is_none()
         {
+            tracing::error!(
+                "[CONFIG_VALIDATION] Service type {} has no image configured! \
+                 image={:?}, arm64_image={:?}, amd64_image={:?}, default_image={:?}, \
+                 image_tag_prefix={:?}, enabled={}",
+                self.service_type,
+                self.image,
+                self.arm64_image,
+                self.amd64_image,
+                self.default_image,
+                self.image_tag_prefix,
+                self.enabled
+            );
             return ConfigValidationResult::Error(format!(
-                "Service type {} must have at least one image configured",
-                self.service_type
+                "Service type {} must have at least one image configured (image={:?}, arm64={:?}, amd64={:?}, default={:?})",
+                self.service_type, self.image, self.arm64_image, self.amd64_image, self.default_image
             ));
         }
 

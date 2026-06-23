@@ -652,7 +652,17 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
     tracing::debug!("config file loaded, size: {} bytes", config_content.len());
 
     let config: AppConfig = serde_yaml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
+        .map_err(|e| {
+            tracing::error!("[CONFIG] Failed to parse config file: {}", e);
+            // 打印配置文件的前 2000 个字符，帮助排查解析错误
+            let preview = if config_content.len() > 2000 {
+                format!("{}...(truncated)", &config_content[..2000])
+            } else {
+                config_content.clone()
+            };
+            tracing::error!("[CONFIG] Config file content preview:\n{}", preview);
+            anyhow::anyhow!("Failed to parse config file: {}", e)
+        })?;
 
     // 调试：打印解析后的多镜像配置
     if let Some(ref docker_config) = config.docker_config {
@@ -664,10 +674,14 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
             );
             for (service_key, service_config) in &multi_config.services {
                 tracing::info!(
-                    "[CONFIG]   Service '{}': arm64_image={:?}, amd64_image={:?}",
+                    "[CONFIG]   Service '{}': service_type={}, image={:?}, arm64_image={:?}, amd64_image={:?}, default_image={:?}, enabled={}",
                     service_key,
+                    service_config.service_type,
+                    service_config.image,
                     service_config.arm64_image,
-                    service_config.amd64_image
+                    service_config.amd64_image,
+                    service_config.default_image,
+                    service_config.enabled
                 );
                 tracing::debug!(
                     "  Service '{}' mount config (total {} mounts):",
