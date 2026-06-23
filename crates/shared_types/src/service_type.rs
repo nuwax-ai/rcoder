@@ -40,10 +40,16 @@ impl std::str::FromStr for ServiceType {
             return Err(ServiceTypeError::EmptyServiceType);
         }
 
-        // 精确匹配
+        // 支持多种格式：中划线（kebab-case）、大驼峰（PascalCase）、旧枚举名
         match s {
+            // 中划线格式（推荐）
             "web-agent-runner" => Ok(ServiceType::WebAgentRunner),
             "computer-agent-runner" => Ok(ServiceType::ComputerAgentRunner),
+            // 大驼峰格式（兼容旧配置）
+            "WebAgentRunner" => Ok(ServiceType::WebAgentRunner),
+            "ComputerAgentRunner" => Ok(ServiceType::ComputerAgentRunner),
+            // 旧枚举名（向后兼容）
+            "RCoder" | "rcoder" => Ok(ServiceType::WebAgentRunner),
             _ => Err(ServiceTypeError::InvalidServiceType(s.to_string())),
         }
     }
@@ -93,7 +99,7 @@ pub enum ServiceTypeError {
     #[error("service type cannot be empty")]
     EmptyServiceType,
     #[error(
-        "unsupported service type '{0}', please use 'web-agent-runner' or 'computer-agent-runner'"
+        "unsupported service type '{0}', please use 'web-agent-runner'/'WebAgentRunner'/'RCoder' or 'computer-agent-runner'/'ComputerAgentRunner'"
     )]
     InvalidServiceType(String),
     #[error("service type '{0}' is disabled")]
@@ -237,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_service_type_from_str() {
-        // 有效的服务类型
+        // 中划线格式（推荐）
         assert_eq!(
             "web-agent-runner".parse::<ServiceType>().unwrap(),
             ServiceType::WebAgentRunner
@@ -245,6 +251,26 @@ mod tests {
         assert_eq!(
             "computer-agent-runner".parse::<ServiceType>().unwrap(),
             ServiceType::ComputerAgentRunner
+        );
+
+        // 大驼峰格式（兼容旧配置）
+        assert_eq!(
+            "WebAgentRunner".parse::<ServiceType>().unwrap(),
+            ServiceType::WebAgentRunner
+        );
+        assert_eq!(
+            "ComputerAgentRunner".parse::<ServiceType>().unwrap(),
+            ServiceType::ComputerAgentRunner
+        );
+
+        // 旧枚举名（向后兼容）
+        assert_eq!(
+            "RCoder".parse::<ServiceType>().unwrap(),
+            ServiceType::WebAgentRunner
+        );
+        assert_eq!(
+            "rcoder".parse::<ServiceType>().unwrap(),
+            ServiceType::WebAgentRunner
         );
 
         // 未知类型应该返回错误
