@@ -822,9 +822,8 @@ mod tests {
             .expect("multi_image_config not found in config file");
 
         // 转换为 MultiImageConfig
-        let multi_config: MultiImageConfig =
-            serde_yaml::from_value(multi_image_config.clone())
-                .unwrap_or_else(|e| panic!("Failed to parse multi_image_config: {}", e));
+        let multi_config: MultiImageConfig = serde_yaml::from_value(multi_image_config.clone())
+            .unwrap_or_else(|e| panic!("Failed to parse multi_image_config: {}", e));
 
         // 验证服务数量
         assert_eq!(multi_config.services.len(), 2);
@@ -843,18 +842,25 @@ mod tests {
             .expect("computer-agent-runner config not found");
         assert!(computer_config.image.is_some());
         assert!(computer_config.enabled);
-        assert_eq!(computer_config.service_type, ServiceType::ComputerAgentRunner);
+        assert_eq!(
+            computer_config.service_type,
+            ServiceType::ComputerAgentRunner
+        );
 
         // 验证配置有效
         assert!(multi_config.validate().is_ok());
 
         // 验证通过 ServiceType 枚举可以找到配置
-        assert!(multi_config
-            .get_service_config(&ServiceType::WebAgentRunner)
-            .is_some());
-        assert!(multi_config
-            .get_service_config(&ServiceType::ComputerAgentRunner)
-            .is_some());
+        assert!(
+            multi_config
+                .get_service_config(&ServiceType::WebAgentRunner)
+                .is_some()
+        );
+        assert!(
+            multi_config
+                .get_service_config(&ServiceType::ComputerAgentRunner)
+                .is_some()
+        );
 
         // 输出配置摘要
         println!(
