@@ -203,7 +203,11 @@ impl ServiceImageConfig {
             );
             return ConfigValidationResult::Error(format!(
                 "Service type {} must have at least one image configured (image={:?}, arm64={:?}, amd64={:?}, default={:?})",
-                self.service_type, self.image, self.arm64_image, self.amd64_image, self.default_image
+                self.service_type,
+                self.image,
+                self.arm64_image,
+                self.amd64_image,
+                self.default_image
             ));
         }
 

@@ -53,7 +53,10 @@ fn test_load_local_config_file() {
     let web_config = multi_config
         .get_service_config(&ServiceType::WebAgentRunner)
         .expect("web-agent-runner config not found");
-    assert!(web_config.image.is_some(), "web-agent-runner image should be set");
+    assert!(
+        web_config.image.is_some(),
+        "web-agent-runner image should be set"
+    );
     assert!(web_config.enabled, "web-agent-runner should be enabled");
     assert_eq!(web_config.service_type, ServiceType::WebAgentRunner);
 
@@ -61,9 +64,18 @@ fn test_load_local_config_file() {
     let computer_config = multi_config
         .get_service_config(&ServiceType::ComputerAgentRunner)
         .expect("computer-agent-runner config not found");
-    assert!(computer_config.image.is_some(), "computer-agent-runner image should be set");
-    assert!(computer_config.enabled, "computer-agent-runner should be enabled");
-    assert_eq!(computer_config.service_type, ServiceType::ComputerAgentRunner);
+    assert!(
+        computer_config.image.is_some(),
+        "computer-agent-runner image should be set"
+    );
+    assert!(
+        computer_config.enabled,
+        "computer-agent-runner should be enabled"
+    );
+    assert_eq!(
+        computer_config.service_type,
+        ServiceType::ComputerAgentRunner
+    );
 
     // 验证配置有效
     assert!(multi_config.validate().is_ok(), "Config validation failed");
@@ -71,9 +83,15 @@ fn test_load_local_config_file() {
     // 输出配置摘要
     println!("✅ Local config loaded successfully:");
     println!("  Services: {}", multi_config.services.len());
-    println!("  Registry prefix: {:?}", multi_config.global_defaults.registry_prefix);
+    println!(
+        "  Registry prefix: {:?}",
+        multi_config.global_defaults.registry_prefix
+    );
     for (key, svc) in &multi_config.services {
-        println!("  - {}: service_type={}, image={:?}, enabled={}", key, svc.service_type, svc.image, svc.enabled);
+        println!(
+            "  - {}: service_type={}, image={:?}, enabled={}",
+            key, svc.service_type, svc.image, svc.enabled
+        );
     }
 }
 
@@ -134,14 +152,23 @@ fn test_service_name_compatibility() {
 
     // 验证通过 ServiceType 枚举可以找到配置
     let web_config = multi_config.get_service_config(&ServiceType::WebAgentRunner);
-    assert!(web_config.is_some(), "Should find config for WebAgentRunner");
+    assert!(
+        web_config.is_some(),
+        "Should find config for WebAgentRunner"
+    );
     assert_eq!(
         web_config.unwrap().image,
-        Some("nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder:latest".to_string())
+        Some(
+            "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder:latest"
+                .to_string()
+        )
     );
 
     let computer_config = multi_config.get_service_config(&ServiceType::ComputerAgentRunner);
-    assert!(computer_config.is_some(), "Should find config for ComputerAgentRunner");
+    assert!(
+        computer_config.is_some(),
+        "Should find config for ComputerAgentRunner"
+    );
     assert_eq!(
         computer_config.unwrap().image,
         Some("nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-computer-agent-runner:latest".to_string())
@@ -188,7 +215,10 @@ fn test_service_type_serde() {
 fn test_load_test_environment_config_file() {
     let config_path = project_root().join("docker/config.test.yml");
     if !config_path.exists() {
-        println!("⚠️ Test environment config file not found at {:?}, skipping test", config_path);
+        println!(
+            "⚠️ Test environment config file not found at {:?}, skipping test",
+            config_path
+        );
         return;
     }
 
@@ -241,8 +271,14 @@ fn test_load_test_environment_config_file() {
     // 输出配置摘要
     println!("✅ Test environment config loaded successfully:");
     println!("  Services: {}", multi_config.services.len());
-    println!("  Registry prefix: {:?}", multi_config.global_defaults.registry_prefix);
+    println!(
+        "  Registry prefix: {:?}",
+        multi_config.global_defaults.registry_prefix
+    );
     for (key, svc) in &multi_config.services {
-        println!("  - {}: service_type={}, image={:?}, enabled={}", key, svc.service_type, svc.image, svc.enabled);
+        println!(
+            "  - {}: service_type={}, image={:?}, enabled={}",
+            key, svc.service_type, svc.image, svc.enabled
+        );
     }
 }

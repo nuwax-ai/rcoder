@@ -933,14 +933,23 @@ mod tests {
 
         // 验证通过 ServiceType 枚举可以找到配置
         let web_config = multi_config.get_service_config(&ServiceType::WebAgentRunner);
-        assert!(web_config.is_some(), "Should find config for WebAgentRunner");
+        assert!(
+            web_config.is_some(),
+            "Should find config for WebAgentRunner"
+        );
         assert_eq!(
             web_config.unwrap().image,
-            Some("nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder:latest".to_string())
+            Some(
+                "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder:latest"
+                    .to_string()
+            )
         );
 
         let computer_config = multi_config.get_service_config(&ServiceType::ComputerAgentRunner);
-        assert!(computer_config.is_some(), "Should find config for ComputerAgentRunner");
+        assert!(
+            computer_config.is_some(),
+            "Should find config for ComputerAgentRunner"
+        );
         assert_eq!(
             computer_config.unwrap().image,
             Some("nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/rcoder-computer-agent-runner:latest".to_string())
