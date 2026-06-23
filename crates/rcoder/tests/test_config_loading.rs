@@ -207,33 +207,8 @@ fn test_load_test_environment_config_file() {
         .and_then(|dc| dc.get("multi_image_config"))
         .expect("multi_image_config not found in config file");
 
-    // 为缺少 mounts 字段的服务添加默认值
-    let mut multi_image_config = multi_image_config.clone();
-    if let Some(services) = multi_image_config.get_mut("services") {
-        for (_key, service) in services.as_mapping_mut().unwrap() {
-            if service.get("mounts").is_none() {
-                service.as_mapping_mut().unwrap().insert(
-                    serde_yaml::Value::String("mounts".to_string()),
-                    serde_yaml::Value::Sequence(vec![]),
-                );
-            }
-            if service.get("work_dir").is_none() {
-                service.as_mapping_mut().unwrap().insert(
-                    serde_yaml::Value::String("work_dir".to_string()),
-                    serde_yaml::Value::String("/app".to_string()),
-                );
-            }
-            if service.get("network_mode").is_none() {
-                service.as_mapping_mut().unwrap().insert(
-                    serde_yaml::Value::String("network_mode".to_string()),
-                    serde_yaml::Value::String("bridge".to_string()),
-                );
-            }
-        }
-    }
-
-    // 转换为 MultiImageConfig
-    let multi_config: MultiImageConfig = serde_yaml::from_value(multi_image_config)
+    // 转换为 MultiImageConfig（现在 mounts、work_dir、network_mode 都有默认值）
+    let multi_config: MultiImageConfig = serde_yaml::from_value(multi_image_config.clone())
         .unwrap_or_else(|e| panic!("Failed to parse multi_image_config: {}", e));
 
     // 验证服务数量

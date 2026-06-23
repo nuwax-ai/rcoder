@@ -16,6 +16,16 @@ fn default_computer_agent_runner_container_path_template() -> String {
     "/app/computer-project-workspace/{user_id}/{project_id}".to_string()
 }
 
+/// 容器工作目录的默认值
+fn default_work_dir() -> String {
+    "/app".to_string()
+}
+
+/// 容器网络模式的默认值
+fn default_network_mode() -> String {
+    "bridge".to_string()
+}
+
 /// 服务镜像配置
 ///
 /// 定义了每个服务类型的详细配置，包括镜像选择、环境变量和挂载点。
@@ -36,19 +46,25 @@ pub struct ServiceImageConfig {
     /// 是否启用该服务类型
     pub enabled: bool,
     /// 服务特定的环境变量
+    #[serde(default)]
     pub environment: HashMap<String, String>,
     /// 服务特定的挂载点
+    #[serde(default)]
     pub mounts: Vec<ServiceMountConfig>,
     /// 容器启动命令
+    #[serde(default)]
     pub command: Vec<String>,
     /// 容器入口点
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
     /// 容器资源限制配置
+    #[serde(default)]
     pub resource_limits: ServiceResourceLimits,
     /// 容器工作目录
+    #[serde(default = "default_work_dir")]
     pub work_dir: String,
     /// 容器网络模式
+    #[serde(default = "default_network_mode")]
     pub network_mode: String,
     /// 容器内挂载路径模板（支持变量替换）
     /// 默认值: "/app/project_workspace/{project_id}"
@@ -93,7 +109,7 @@ pub struct ServiceMountConfig {
 }
 
 /// 服务资源限制配置
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceResourceLimits {
     /// 内存限制（字节，支持浮点数输入）
     pub memory_limit: Option<f64>,
