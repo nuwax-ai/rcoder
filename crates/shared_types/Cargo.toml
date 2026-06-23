@@ -82,3 +82,6 @@ async-trait = { workspace = true }
 
 # gRPC types (extracted to shared_types_grpc)
 shared_types_grpc = { path = "../shared_types_grpc" }
+
+[dev-dependencies]
+serde_yaml = "=0.9.33"

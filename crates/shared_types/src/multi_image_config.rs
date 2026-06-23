@@ -795,4 +795,78 @@ mod tests {
         // 验证配置有效
         assert!(multi_config.validate().is_ok());
     }
+
+    #[test]
+    fn test_config_from_local_config_file() {
+        // 测试从本地配置文件 docker/config.yml 加载配置
+        // 这是本地开发测试使用的配置文件
+        // 使用相对路径读取项目根目录下的 docker/config.yml
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let config_path = std::path::Path::new(manifest_dir)
+            .ancestors()
+            .find(|p| p.join("docker/config.yml").exists())
+            .expect("Could not find project root with docker/config.yml")
+            .join("docker/config.yml");
+
+        let config_content = std::fs::read_to_string(&config_path)
+            .unwrap_or_else(|e| panic!("Failed to read config file at {:?}: {}", config_path, e));
+
+        // 解析 YAML 配置
+        let config: serde_yaml::Value = serde_yaml::from_str(&config_content)
+            .unwrap_or_else(|e| panic!("Failed to parse YAML config: {}", e));
+
+        // 提取 multi_image_config 部分
+        let multi_image_config = config
+            .get("docker_config")
+            .and_then(|dc| dc.get("multi_image_config"))
+            .expect("multi_image_config not found in config file");
+
+        // 转换为 MultiImageConfig
+        let multi_config: MultiImageConfig =
+            serde_yaml::from_value(multi_image_config.clone())
+                .unwrap_or_else(|e| panic!("Failed to parse multi_image_config: {}", e));
+
+        // 验证服务数量
+        assert_eq!(multi_config.services.len(), 2);
+
+        // 验证 web-agent-runner 配置
+        let web_config = multi_config
+            .get_service_config(&ServiceType::WebAgentRunner)
+            .expect("web-agent-runner config not found");
+        assert!(web_config.image.is_some());
+        assert!(web_config.enabled);
+        assert_eq!(web_config.service_type, ServiceType::WebAgentRunner);
+
+        // 验证 computer-agent-runner 配置
+        let computer_config = multi_config
+            .get_service_config(&ServiceType::ComputerAgentRunner)
+            .expect("computer-agent-runner config not found");
+        assert!(computer_config.image.is_some());
+        assert!(computer_config.enabled);
+        assert_eq!(computer_config.service_type, ServiceType::ComputerAgentRunner);
+
+        // 验证配置有效
+        assert!(multi_config.validate().is_ok());
+
+        // 验证通过 ServiceType 枚举可以找到配置
+        assert!(multi_config
+            .get_service_config(&ServiceType::WebAgentRunner)
+            .is_some());
+        assert!(multi_config
+            .get_service_config(&ServiceType::ComputerAgentRunner)
+            .is_some());
+
+        // 输出配置摘要
+        println!(
+            "✅ Local config loaded: {} services, registry_prefix={:?}",
+            multi_config.services.len(),
+            multi_config.global_defaults.registry_prefix
+        );
+        for (key, svc) in &multi_config.services {
+            println!(
+                "  - {}: service_type={}, image={:?}, enabled={}",
+                key, svc.service_type, svc.image, svc.enabled
+            );
+        }
+    }
 }
