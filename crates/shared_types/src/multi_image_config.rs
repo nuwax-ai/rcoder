@@ -9,6 +9,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
+/// 检查服务名称是否与 ServiceType 兼容
+///
+/// 支持旧的服务名称（如 "rcoder"）与新的 ServiceType（如 "web-agent-runner"）配对
+fn is_compatible_service_key(service_key: &str, service_type: &ServiceType) -> bool {
+    match service_type {
+        ServiceType::WebAgentRunner => {
+            // 兼容旧的服务名称 "rcoder"
+            service_key == "rcoder"
+        }
+        ServiceType::ComputerAgentRunner => {
+            // ComputerAgentRunner 没有旧名称
+            false
+        }
+    }
+}
+
 /// 多镜像配置结构
 ///
 /// 支持多种服务类型的 Docker 镜像配置系统，提供灵活的镜像选择策略。
@@ -118,11 +134,16 @@ impl MultiImageConfig {
 
         // 验证服务配置
         for (service_key, service_config) in &self.services {
-            // 验证服务名称一致性
-            if service_config.service_type.to_string() != *service_key {
+            // 验证服务名称一致性（兼容旧的服务名称）
+            // 允许服务名称与 service_type 的字符串表示不完全匹配
+            // 例如：服务名称 "rcoder" 可以与 service_type "web-agent-runner" 配对
+            let expected_key = service_config.service_type.to_string();
+            if service_key != &expected_key
+                && !is_compatible_service_key(service_key, &service_config.service_type)
+            {
                 return Err(ConfigError::ValidationError(format!(
-                    "Service key '{}' does not match service type '{}'",
-                    service_key, service_config.service_type
+                    "Service key '{}' does not match service type '{}' (expected '{}')",
+                    service_key, service_config.service_type, expected_key
                 )));
             }
 
@@ -155,9 +176,26 @@ impl MultiImageConfig {
     }
 
     /// 获取指定服务类型的配置
+    ///
+    /// 支持通过新的服务名称（如 "web-agent-runner"）或旧的服务名称（如 "rcoder"）查找配置
     pub fn get_service_config(&self, service_type: &ServiceType) -> Option<&ServiceImageConfig> {
+        // 1. 先尝试通过新的服务名称查找
         let service_key = service_type.to_string();
-        self.services.get(&service_key)
+        if let Some(config) = self.services.get(&service_key) {
+            return Some(config);
+        }
+
+        // 2. 如果找不到，尝试通过旧的服务名称查找
+        match service_type {
+            ServiceType::WebAgentRunner => {
+                // 兼容旧的服务名称 "rcoder"
+                self.services.get("rcoder")
+            }
+            ServiceType::ComputerAgentRunner => {
+                // ComputerAgentRunner 没有旧名称
+                None
+            }
+        }
     }
 
     /// 获取指定服务类型的可变配置
@@ -600,5 +638,79 @@ mod tests {
         // 测试自定义前缀
         config.global_defaults.registry_prefix = Some("my-registry.com".to_string());
         assert_eq!(config.get_registry_prefix(), "my-registry.com");
+    }
+
+    #[test]
+    fn test_config_file_loading() {
+        // 测试从 JSON 配置加载配置
+        let config_json = r#"
+{
+  "global_defaults": {
+    "registry_prefix": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev"
+  },
+  "services": {
+    "web-agent-runner": {
+      "service_type": "web-agent-runner",
+      "image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest",
+      "arm64_image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest",
+      "amd64_image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest",
+      "default_image": "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest",
+      "image_tag_prefix": "dev-master-rcoder",
+      "enabled": true,
+      "environment": {},
+      "mounts": [],
+      "command": [],
+      "resource_limits": {},
+      "work_dir": "/app",
+      "network_mode": "bridge"
+    },
+    "computer-agent-runner": {
+      "service_type": "computer-agent-runner",
+      "image": "dev-rcoder-agent-runner:latest",
+      "arm64_image": "dev-rcoder-agent-runner:latest",
+      "amd64_image": "dev-rcoder-agent-runner:latest",
+      "default_image": "dev-rcoder-agent-runner:latest",
+      "image_tag_prefix": "dev-rcoder-agent-runner",
+      "enabled": true,
+      "environment": {},
+      "mounts": [],
+      "command": [],
+      "resource_limits": {},
+      "work_dir": "/app",
+      "network_mode": "bridge"
+    }
+  },
+  "selection_strategy": "ServiceOnly",
+  "cache_config": {
+    "enabled": true,
+    "ttl_seconds": 3600,
+    "max_entries": 50
+  }
+}
+"#;
+
+        let multi_config: MultiImageConfig = serde_json::from_str(config_json).unwrap();
+
+        // 验证服务数量
+        assert_eq!(multi_config.services.len(), 2);
+
+        // 验证 web-agent-runner 配置
+        let web_config = multi_config.get_service_config(&ServiceType::WebAgentRunner).unwrap();
+        assert_eq!(
+            web_config.image,
+            Some("nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest".to_string())
+        );
+        assert!(web_config.enabled);
+
+        // 验证 computer-agent-runner 配置
+        let computer_config = multi_config.get_service_config(&ServiceType::ComputerAgentRunner).unwrap();
+        assert_eq!(
+            computer_config.image,
+            Some("dev-rcoder-agent-runner:latest".to_string())
+        );
+        assert!(computer_config.enabled);
+
+        // 验证配置有效
+        assert!(multi_config.validate().is_ok());
     }
 }

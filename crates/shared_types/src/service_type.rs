@@ -10,7 +10,12 @@ use utoipa::ToSchema;
 ///
 /// 定义了 RCoder 系统支持的服务类型，每个服务类型对应不同的 Docker 镜像和运行环境。
 /// 注意：不实现 Default trait，强制要求明确指定服务类型。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
+///
+/// 支持多种格式的序列化和反序列化：
+/// - 中划线格式（kebab-case）：web-agent-runner, computer-agent-runner
+/// - 大驼峰格式（PascalCase）：WebAgentRunner, ComputerAgentRunner
+/// - 旧枚举名（向后兼容）：RCoder, rcoder
+#[derive(Debug, Clone, PartialEq, Eq, Hash, ToSchema)]
 pub enum ServiceType {
     /// Web Agent Runner 服务
     /// 提供完整的 AI 开发功能，包括项目管理、代码生成、文件操作等
@@ -20,6 +25,27 @@ pub enum ServiceType {
     /// 专注于代理运行和执行，提供轻量级的代理执行环境
     /// 容器标识为 user_id，用于桌面应用开发场景
     ComputerAgentRunner,
+}
+
+// 自定义 Serialize 实现，输出中划线格式
+impl Serialize for ServiceType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+// 自定义 Deserialize 实现，支持多种格式
+impl<'de> Deserialize<'de> for ServiceType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<ServiceType>().map_err(serde::de::Error::custom)
+    }
 }
 
 impl std::fmt::Display for ServiceType {
