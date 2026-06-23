@@ -207,7 +207,7 @@ mod tests {
                 arm64_image: None,
                 amd64_image: None,
                 default_image: None,
-                registry_prefix: Some("registry.yichamao.com".to_string()),
+                registry_prefix: None, // 从配置文件加载
             },
             services,
             selection_strategy: ImageSelectionStrategy::ServiceOnly,
