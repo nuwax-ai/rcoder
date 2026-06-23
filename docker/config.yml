@@ -54,7 +54,7 @@ docker_config:
     # 服务镜像配置
     services:
       # RCoder 主服务配置（使用与主容器相同的镜像）
-      rcoder:
+      web-agent-runner:
         service_type: "RCoder"
         # 🎯 使用阿里云镜像
         image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest"

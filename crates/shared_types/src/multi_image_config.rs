@@ -215,7 +215,7 @@ impl MultiImageConfig {
         self.global_defaults
             .registry_prefix
             .clone()
-            .unwrap_or_else(|| "registry.yichamao.com".to_string())
+            .unwrap_or_default()
     }
 
     /// 应用全局默认配置到服务配置
@@ -283,7 +283,7 @@ impl Default for MultiImageConfig {
                 arm64_image: None,
                 amd64_image: None,
                 default_image: None,
-                registry_prefix: Some("registry.yichamao.com".to_string()),
+                registry_prefix: None, // 从配置文件加载
             },
             services,
             selection_strategy: ImageSelectionStrategy::ServiceOnly,
@@ -414,7 +414,7 @@ pub fn create_legacy_multi_image_config(
         arm64_image,
         amd64_image,
         default_image,
-        registry_prefix: Some("registry.yichamao.com".to_string()),
+        registry_prefix: None, // 从配置文件加载
     };
 
     // 如果设置了传统镜像配置，创建一个默认的 RCoder 服务配置
@@ -473,7 +473,13 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let config = MultiImageConfig::default();
+        let mut config = MultiImageConfig::default();
+
+        // 为测试设置镜像配置
+        for (_, service_config) in config.services.iter_mut() {
+            service_config.arm64_image = Some("test-image:arm64".to_string());
+            service_config.amd64_image = Some("test-image:amd64".to_string());
+        }
 
         // 有效配置应该通过验证
         assert!(config.validate().is_ok());
@@ -588,8 +594,8 @@ mod tests {
     fn test_registry_prefix() {
         let mut config = MultiImageConfig::default();
 
-        // 测试默认前缀
-        assert_eq!(config.get_registry_prefix(), "registry.yichamao.com");
+        // 测试默认前缀（空字符串）
+        assert_eq!(config.get_registry_prefix(), "");
 
         // 测试自定义前缀
         config.global_defaults.registry_prefix = Some("my-registry.com".to_string());

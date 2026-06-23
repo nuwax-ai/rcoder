@@ -151,9 +151,9 @@ mod tests {
             ServiceImageConfig {
                 service_type: ServiceType::WebAgentRunner,
                 image: None,
-                arm64_image: Some("registry.yichamao.com/web-agent-runner:arm64".to_string()),
-                amd64_image: Some("registry.yichamao.com/web-agent-runner:amd64".to_string()),
-                default_image: None,
+                arm64_image: None, // 从配置文件加载
+                amd64_image: None, // 从配置文件加载
+                default_image: None, // 从配置文件加载
                 image_tag_prefix: Some("web-agent-runner".to_string()),
                 enabled: true,
                 environment: HashMap::new(),
@@ -178,9 +178,9 @@ mod tests {
             ServiceImageConfig {
                 service_type: ServiceType::ComputerAgentRunner,
                 image: None,
-                arm64_image: Some("registry.yichamao.com/computer-agent-runner:arm64".to_string()),
-                amd64_image: Some("registry.yichamao.com/computer-agent-runner:amd64".to_string()),
-                default_image: None,
+                arm64_image: None, // 从配置文件加载
+                amd64_image: None, // 从配置文件加载
+                default_image: None, // 从配置文件加载
                 image_tag_prefix: Some("computer-agent-runner".to_string()),
                 enabled: false, // 默认禁用
                 environment: HashMap::new(),

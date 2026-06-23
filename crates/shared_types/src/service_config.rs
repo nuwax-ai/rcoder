@@ -453,9 +453,9 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
     ServiceImageConfig {
         service_type: ServiceType::WebAgentRunner,
         image: None, // 使用架构特定镜像
-        arm64_image: Some("registry.yichamao.com/web-agent-runner:latest-arm64".to_string()),
-        amd64_image: Some("registry.yichamao.com/web-agent-runner:latest-amd64".to_string()),
-        default_image: Some("registry.yichamao.com/web-agent-runner:latest".to_string()),
+        arm64_image: None, // 从配置文件加载
+        amd64_image: None, // 从配置文件加载
+        default_image: None, // 从配置文件加载
         image_tag_prefix: Some("web-agent-runner".to_string()),
         enabled: true, // 当前启用
         environment,
@@ -508,16 +508,10 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
     ServiceImageConfig {
         service_type: ServiceType::ComputerAgentRunner,
         image: None, // 使用架构特定镜像
-        arm64_image: Some(
-            "registry.yichamao.com/rcoder-computer-agent-runner:latest-arm64".to_string(),
-        ),
-        amd64_image: Some(
-            "registry.yichamao.com/rcoder-computer-agent-runner:latest-amd64".to_string(),
-        ),
-        default_image: Some(
-            "registry.yichamao.com/rcoder-computer-agent-runner:latest".to_string(),
-        ),
-        image_tag_prefix: Some("rcoder-computer-agent-runner".to_string()),
+        arm64_image: None, // 从配置文件加载
+        amd64_image: None, // 从配置文件加载
+        default_image: None, // 从配置文件加载
+        image_tag_prefix: Some("computer-agent-runner".to_string()),
         enabled: true, // 当前启用
         environment,
         mounts,
@@ -536,7 +530,11 @@ mod tests {
     use super::*;
     #[test]
     fn test_config_validation() {
-        let config = default_rcoder_service_config();
+        let mut config = default_rcoder_service_config();
+
+        // 为测试设置镜像配置
+        config.arm64_image = Some("test-image:arm64".to_string());
+        config.amd64_image = Some("test-image:amd64".to_string());
 
         // 有效配置
         assert!(matches!(config.validate(), ConfigValidationResult::Valid));
@@ -640,14 +638,14 @@ mod tests {
 
         assert!(summary.contains("web-agent-runner"));
         assert!(summary.contains("Enabled: true"));
-        assert!(summary.contains("registry.yichamao.com/web-agent-runner"));
+        // 镜像配置为空时，summary 不包含镜像地址
     }
 
     #[test]
     fn test_container_prefix_with_image_tag_prefix() {
         // 测试使用 image_tag_prefix 的情况
         let config = default_agent_runner_service_config();
-        assert_eq!(config.container_prefix(), "rcoder-computer-agent-runner");
+        assert_eq!(config.container_prefix(), "computer-agent-runner");
     }
 
     #[test]
@@ -669,7 +667,7 @@ mod tests {
     ///
     /// 这是导致 VNC 状态查询返回 CONTAINER_NOT_FOUND 的根因：
     /// - ServiceType::container_prefix() 返回硬编码的 "computer-agent-runner"
-    /// - ServiceConfig::container_prefix() 读取配置的 image_tag_prefix "rcoder-computer-agent-runner"
+    /// - ServiceConfig::container_prefix() 读取配置的 image_tag_prefix "computer-agent-runner"
     /// - 容器创建使用后者，而错误的查询代码使用前者，导致名称不匹配
     #[test]
     fn test_container_prefix_difference_causes_container_not_found() {
@@ -680,27 +678,19 @@ mod tests {
         // 配置化的 ServiceConfig 前缀（正确的创建方式）
         let config = default_agent_runner_service_config();
         let config_prefix = config.container_prefix();
-        assert_eq!(config_prefix, "rcoder-computer-agent-runner");
+        assert_eq!(config_prefix, "computer-agent-runner");
 
-        // 明确展示差异：两者不同！
-        assert_ne!(
+        // 两者应该相同
+        assert_eq!(
             service_type_prefix, config_prefix,
-            "ServiceType::container_prefix() 与 ServiceConfig::container_prefix() 应该不同"
+            "ServiceType::container_prefix() 与 ServiceConfig::container_prefix() 应该相同"
         );
 
         // 展示如果用错误的前缀构造容器名会导致什么问题
         let user_id = "1743762321";
-        let wrong_container_name = format!("{}-{}", service_type_prefix, user_id);
-        let correct_container_name = format!("{}-{}", config_prefix, user_id);
+        let container_name = format!("{}-{}", service_type_prefix, user_id);
 
-        assert_eq!(wrong_container_name, "computer-agent-runner-1743762321");
-        assert_eq!(
-            correct_container_name,
-            "rcoder-computer-agent-runner-1743762321"
-        );
-
-        // 如果用错误的名字去查询，当然找不到正确名字创建的容器
-        assert_ne!(wrong_container_name, correct_container_name);
+        assert_eq!(container_name, "computer-agent-runner-1743762321");
     }
 
     #[test]
