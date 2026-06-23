@@ -375,8 +375,27 @@ impl DockerConfig {
     pub fn validate_multi_image_config(&self) -> Result<(), String> {
         let multi_config = self.get_multi_image_config();
         match multi_config.validate() {
-            Ok(()) => Ok(()),
-            Err(e) => Err(e.to_string()),
+            Ok(()) => {
+                tracing::info!("[CONFIG] Multi-image config validation passed");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("[CONFIG] Multi-image config validation failed: {}", e);
+                // 打印每个服务的配置详情
+                for (service_key, service_config) in &multi_config.services {
+                    tracing::error!(
+                        "[CONFIG]   Service '{}': service_type={}, image={:?}, arm64_image={:?}, amd64_image={:?}, default_image={:?}, enabled={}",
+                        service_key,
+                        service_config.service_type,
+                        service_config.image,
+                        service_config.arm64_image,
+                        service_config.amd64_image,
+                        service_config.default_image,
+                        service_config.enabled
+                    );
+                }
+                Err(e.to_string())
+            }
         }
     }
 
