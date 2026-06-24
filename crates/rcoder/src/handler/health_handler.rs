@@ -1,39 +1,27 @@
 //! 健康检查处理器
 
 use axum::Json;
-use utoipa::ToSchema;
-
-/// 健康检查响应结构
-///
-/// 统一的服务健康检查响应格式
-#[derive(serde::Serialize, ToSchema)]
-pub struct HealthResponse {
-    /// 服务状态
-    #[schema(example = "healthy")]
-    pub status: String,
-    /// 时间戳
-    #[schema(example = "2024-01-15T10:30:00Z")]
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// 服务名称
-    #[schema(example = "rcoder-ai-service")]
-    pub service: String,
-}
+use shared_types::HttpResult;
 
 /// 健康检查端点
 ///
-/// 检查服务的健康状态
+/// 检查服务的健康状态，同时检查 HTTP 和 gRPC 服务是否就绪
 #[utoipa::path(
     get,
     path = "/health",
     responses(
-        (status = 200, description = "服务健康状态", body = HealthResponse)
+        (status = 200, description = "服务健康状态", body = HttpResult<shared_types::HealthCheckResponse>)
     ),
     tag = "system"
 )]
-pub async fn health_check() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "healthy".to_string(),
-        timestamp: chrono::Utc::now(),
-        service: "rcoder-ai-service".to_string(),
-    })
+pub async fn health_check() -> Json<HttpResult<shared_types::HealthCheckResponse>> {
+    // HTTP 服务：本端点正常响应即表示就绪
+    let http_ready = true;
+
+    // RCoder 主服务没有 gRPC 服务，所以 grpc_ready 为 true
+    let grpc_ready = true;
+
+    let health_response = shared_types::HealthCheckResponse::new("rcoder-ai-service", http_ready, grpc_ready);
+
+    Json(HttpResult::success(health_response))
 }

@@ -205,17 +205,26 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
 /// 健康检查端点
 ///
-/// 检查服务的健康状态
+/// 检查服务的健康状态，同时检查 HTTP 和 gRPC 服务是否就绪
 #[utoipa::path(
     get,
     path = "/health",
     responses(
-        (status = 200, description = "服务健康状态", body = shared_types::HealthResponse)
+        (status = 200, description = "服务健康状态", body = shared_types::HttpResult<shared_types::HealthCheckResponse>)
     ),
     tag = "system"
 )]
-pub async fn health_check() -> Json<shared_types::HealthResponse> {
-    Json(shared_types::HealthResponse::new("agent-runner"))
+pub async fn health_check() -> Json<shared_types::HttpResult<shared_types::HealthCheckResponse>> {
+    use crate::handler::health_handler::{build_health_response, check_grpc_port_simple};
+
+    // HTTP 服务：本端点正常响应即表示就绪
+    let http_ready = true;
+
+    // 检查 gRPC 端口是否就绪
+    let grpc_ready = check_grpc_port_simple().await;
+
+    // 使用统一的健康检查响应构建函数
+    Json(build_health_response("agent-runner", http_ready, grpc_ready))
 }
 
 /// P0-1: 构建 agent_mgmt 子路由(导出供集成测试使用)

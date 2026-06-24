@@ -103,6 +103,7 @@ pub use model::{
     ChatResponse,
     ContainerBasicInfo,
     DocumentAttachment,
+    HealthCheckResponse,
     HealthResponse,
     HttpResult,
     ImageAttachment,

@@ -601,7 +601,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
     components(
         schemas(
             // 响应结构体
-            handler::HealthResponse,
+            shared_types::HealthCheckResponse,
             shared_types::AgentChatRequest,
             shared_types::ChatResponse,
             shared_types::AgentStopResponse,

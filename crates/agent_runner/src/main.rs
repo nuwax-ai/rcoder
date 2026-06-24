@@ -396,9 +396,17 @@ async fn main() -> anyhow::Result<()> {
         let health_port = config.port; // 默认 8086，来自 --port 参数
         let _health_handle = tokio::spawn(async move {
             use axum::{Json, Router, routing::get};
+            use handler::health_handler::{build_health_response, check_grpc_port_simple};
 
-            async fn health_check() -> Json<shared_types::HealthResponse> {
-                Json(shared_types::HealthResponse::new("agent-runner"))
+            async fn health_check() -> Json<shared_types::HttpResult<shared_types::HealthCheckResponse>> {
+                // HTTP 服务：本端点正常响应即表示就绪
+                let http_ready = true;
+
+                // 检查 gRPC 端口是否就绪
+                let grpc_ready = check_grpc_port_simple().await;
+
+                // 使用统一的健康检查响应构建函数
+                Json(build_health_response("agent-runner", http_ready, grpc_ready))
             }
 
             let app = Router::new().route("/health", get(health_check));

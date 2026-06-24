@@ -8,22 +8,10 @@
 
 use crate::{DockerError, DockerResult};
 use reqwest::Client;
-use serde::Deserialize;
 use shared_types::HttpResult;
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
-
-/// agent-runner 健康检查数据结构
-#[derive(Deserialize)]
-struct HealthData {
-    /// 服务状态：healthy（完全就绪）、starting（启动中）
-    status: String,
-    /// HTTP 服务是否就绪
-    http_ready: bool,
-    /// gRPC 服务是否就绪
-    grpc_ready: bool,
-}
 
 /// HTTP 健康检查器
 pub struct HttpHealthChecker {
@@ -86,7 +74,7 @@ impl HttpHealthChecker {
             {
                 Ok(Ok(response)) if response.status().is_success() => {
                     // HTTP 状态码成功，进一步检查响应体
-                    match response.json::<HttpResult<HealthData>>().await {
+                    match response.json::<HttpResult<shared_types::HealthCheckResponse>>().await {
                         Ok(health_result) if health_result.code == "0000" => {
                             // 成功：code 为 "0000"
                             if let Some(health) = health_result.data {

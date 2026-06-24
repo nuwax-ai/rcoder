@@ -11,25 +11,8 @@
 #![allow(dead_code)]
 
 use axum::Json;
-use chrono::Utc;
 use shared_types::HttpResult;
 use tracing::info;
-use utoipa::ToSchema;
-
-/// 健康检查响应结构
-#[derive(serde::Serialize, ToSchema)]
-pub struct HealthResponse {
-    /// 服务状态：healthy（完全就绪）、starting（启动中）
-    pub status: String,
-    /// 时间戳
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// 服务名称
-    pub service: String,
-    /// HTTP 服务是否就绪
-    pub http_ready: bool,
-    /// gRPC 服务是否就绪（仅在启用 grpc-server feature 时有效）
-    pub grpc_ready: bool,
-}
 
 /// 健康检查端点
 ///
@@ -43,11 +26,11 @@ pub struct HealthResponse {
     get,
     path = "/health",
     responses(
-        (status = 200, description = "服务健康状态", body = HttpResult<HealthResponse>)
+        (status = 200, description = "服务健康状态", body = HttpResult<shared_types::HealthCheckResponse>)
     ),
     tag = "system"
 )]
-pub async fn health_check() -> Json<HttpResult<HealthResponse>> {
+pub async fn health_check() -> Json<HttpResult<shared_types::HealthCheckResponse>> {
     // HTTP 服务：本端点正常响应即表示就绪
     let http_ready = true;
 
@@ -59,26 +42,14 @@ pub async fn health_check() -> Json<HttpResult<HealthResponse>> {
     #[cfg(not(feature = "grpc-server"))]
     let grpc_ready = true;
 
-    let status = if grpc_ready {
-        "healthy".to_string()
-    } else {
-        "starting".to_string()
-    };
-
     // 输出详细的健康检查日志
     info!(
         "🏥 [HEALTH] Health check: http_ready={}, grpc_ready={}, status={}",
-        http_ready, grpc_ready, status
+        http_ready, grpc_ready, if grpc_ready { "healthy" } else { "starting" }
     );
 
     // 构建健康检查响应
-    let health_response = HealthResponse {
-        status,
-        timestamp: Utc::now(),
-        service: "rcoder-ai-service".to_string(),
-        http_ready,
-        grpc_ready,
-    };
+    let health_response = shared_types::HealthCheckResponse::new("agent-runner", http_ready, grpc_ready);
 
     // 根据 gRPC 就绪状态返回不同的结果
     if grpc_ready {
@@ -101,7 +72,7 @@ pub async fn health_check() -> Json<HttpResult<HealthResponse>> {
 /// 使用 TCP 连接检查，快速验证 gRPC 服务是否启动。
 /// 仅在启用 grpc-server feature 时使用。
 #[cfg(feature = "grpc-server")]
-async fn check_local_grpc_port() -> bool {
+pub async fn check_local_grpc_port() -> bool {
     use tokio::net::TcpStream;
     use tokio::time::{Duration, timeout};
     use tracing::debug;
@@ -121,6 +92,43 @@ async fn check_local_grpc_port() -> bool {
         Err(_) => {
             debug!("⏱️ [HEALTH] Local gRPC port check timeout: {}", addr);
             false
+        }
+    }
+}
+
+/// 检查本地 gRPC 端口是否可连接（简化版本，用于轻量健康检查）
+///
+/// 使用 TCP 连接检查，快速验证 gRPC 服务是否启动。
+/// 不检查 feature flag，直接检查端口。
+pub async fn check_grpc_port_simple() -> bool {
+    use tokio::net::TcpStream;
+    use tokio::time::{Duration, timeout};
+
+    let grpc_port = shared_types::GRPC_DEFAULT_PORT;
+    let addr = format!("127.0.0.1:{}", grpc_port);
+
+    match timeout(Duration::from_secs(1), TcpStream::connect(&addr)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(_)) => false,
+        Err(_) => false,
+    }
+}
+
+/// 构建健康检查响应
+///
+/// 统一的健康检查响应构建函数，供所有健康检查端点使用。
+pub fn build_health_response(service_name: &str, http_ready: bool, grpc_ready: bool) -> HttpResult<shared_types::HealthCheckResponse> {
+    let health_response = shared_types::HealthCheckResponse::new(service_name, http_ready, grpc_ready);
+
+    if grpc_ready {
+        HttpResult::success(health_response)
+    } else {
+        HttpResult {
+            code: "SERVICE_NOT_READY".to_string(),
+            message: "Service is starting, gRPC not ready".to_string(),
+            data: Some(health_response),
+            tid: None,
+            success: false,
         }
     }
 }
