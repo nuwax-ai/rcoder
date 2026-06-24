@@ -1201,6 +1201,7 @@ pub async fn pod_ensure(
         for attempt in 1..=max_attempts {
             let options = ContainerCreateOptions {
                 user_id: request.user_id.clone(),
+                project_id: request.project_id.clone(),
                 resource_limits: resource_limits.clone(),
                 pod_id: request.pod_id.clone(),
                 isolation_type: request.isolation_type.clone(),
@@ -1338,6 +1339,7 @@ pub async fn pod_ensure(
 
                         let options = ContainerCreateOptions {
                             user_id: request.user_id.clone(),
+                            project_id: request.project_id.clone(),
                             resource_limits,
                             pod_id: request.pod_id.clone(),
                             isolation_type: request.isolation_type.clone(),
@@ -1871,6 +1873,7 @@ pub async fn pod_restart(
 
     let options = ContainerCreateOptions {
         user_id: request.user_id.clone(),
+        project_id: request.project_id.clone(),
         resource_limits,
         pod_id: request.pod_id.clone(),
         isolation_type: request.isolation_type.clone(),

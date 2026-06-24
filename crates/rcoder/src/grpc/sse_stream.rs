@@ -93,11 +93,21 @@ pub async fn create_grpc_sse_stream(
 
             match client.get_status(status_request).await {
                 Ok(response) => {
-                    let status = response.into_inner().status;
-                    if status == "idle" {
+                    let status_response = response.into_inner();
+                    let status = status_response.status;
+                    let is_found = status_response.is_found;
+
+                    info!(
+                        "📊 [gRPC_SSE] GetStatus result: status={}, is_found={}, session_id={}",
+                        status, is_found, session_id_clone
+                    );
+
+                    // 只有当 session 确实存在且状态为 idle 时，才认为 Agent 空闲
+                    // 如果 session 不存在（is_found=false），继续建立流（可能是竞态条件，session 还未注册）
+                    if is_found && status == "idle" {
                         // Agent 闲置，发送 SessionPromptEnd 并关闭连接
                         info!(
-                            "💤 [gRPC_SSE] Agent is idle, sending SessionPromptEnd and closing: session_id={}",
+                            "💤 [gRPC_SSE] Agent is idle (confirmed), sending SessionPromptEnd and closing: session_id={}",
                             session_id_clone
                         );
                         let end_event = create_session_prompt_end_event(&session_id_clone);
@@ -108,6 +118,13 @@ pub async fn create_grpc_sse_stream(
                             );
                         }
                         return; // 直接结束，不建立流
+                    } else if !is_found {
+                        // session 不存在，可能是竞态条件（session 还未注册到 AGENT_REGISTRY）
+                        // 继续尝试建立流，让 SubscribeProgress 处理
+                        warn!(
+                            "⚠️ [gRPC_SSE] Session not found in registry, continuing to establish stream anyway: session_id={}",
+                            session_id_clone
+                        );
                     }
                     info!(
                         "🔄 [gRPC_SSE] Agent status is {}, continuing to establish stream: session_id={}",

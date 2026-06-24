@@ -247,9 +247,13 @@ pub async fn handle_chat(
             );
 
             // 检查是否需要更新扩展状态
+            // 重要：也需要检查 service_type 和 pod_id 是否需要更新
+            // 如果 service_type 或 pod_id 不匹配，需要更新以确保 container_key() 返回正确的值
             let needs_extended_update = existing_info.container().is_none()
                 || existing_info.model_provider().is_none()
-                || existing_info.request_id().is_none();
+                || existing_info.request_id().is_none()
+                || existing_info.service_type() != Some(service_type.clone())
+                || existing_info.pod_id() != request.pod_id.as_deref();
 
             if needs_extended_update {
                 // 创建更新后的信息

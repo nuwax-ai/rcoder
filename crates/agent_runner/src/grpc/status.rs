@@ -35,7 +35,7 @@ pub async fn get_status(
         } else {
             info!("📊 [gRPC] GetStatus: all parameters are empty, returning not_found");
             return Ok(Response::new(GetStatusResponse {
-                status: "idle".to_string(),
+                status: "not_found".to_string(),
                 is_found: false,
             }));
         };
@@ -50,10 +50,20 @@ pub async fn get_status(
                 };
                 (status_str, true)
             } else {
-                ("idle", false)
+                // project_id 存在但 agent_info 不存在
+                info!(
+                    "📊 [gRPC] GetStatus: project_id found but agent_info missing, returning not_found: pid={}",
+                    pid
+                );
+                ("not_found", false)
             }
         } else {
-            ("idle", false)
+            // session_id 在 AGENT_REGISTRY 中找不到
+            info!(
+                "📊 [gRPC] GetStatus: session_id not found in registry, returning not_found: session_id={}",
+                req.session_id
+            );
+            ("not_found", false)
         };
 
         info!(

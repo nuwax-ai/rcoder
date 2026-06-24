@@ -32,18 +32,21 @@ type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
 /// 检查 Agent 是否处于 idle 状态
 ///
-/// 返回 true 如果：
-/// - Agent 不存在，或
-/// - Agent 状态为 Idle，或
-/// - Agent 的 session_id 与当前请求的 session_id 不匹配
-async fn is_agent_idle(session_id: &str) -> bool {
+/// 返回 Some(true) 如果 Agent 确实处于 Idle 状态
+/// 返回 Some(false) 如果 Agent 处于活跃状态
+/// 返回 None 如果 Agent 不存在（可能是竞态条件，session 还未注册）
+async fn check_agent_idle(session_id: &str) -> Option<bool> {
     // 通过 session_id 获取 agent_info
     if let Some(info) = AGENT_REGISTRY.get_agent_info_by_session(session_id) {
         // 检查状态是否为 Idle，或者 session_id 是否匹配
-        info.status == AgentStatus::Idle || info.session_id.to_string() != session_id
+        Some(info.status == AgentStatus::Idle || info.session_id.to_string() != session_id)
     } else {
-        // Agent 不存在，视为 idle
-        true
+        // Agent 不存在，返回 None（可能是竞态条件）
+        warn!(
+            "⚠️ [HTTP] Agent not found in registry for session_id={}, possible race condition",
+            session_id
+        );
+        None
     }
 }
 
@@ -57,25 +60,47 @@ fn create_idle_end_event(session_id: &str) -> Event {
         sub_type: "end_turn".to_string(),
         data: serde_json::json!({
             "reason": "EndTurn",
-            "description": "Agent 当前无在执行任务"
+            "description": "Agent has no task in execution"
         }),
         timestamp: Utc::now(),
     };
 
-    let json_data = match serde_json::to_string(&unified_message) {
-        Ok(json) => json,
-        Err(e) => {
-            warn!(
-                "⚠️ [HTTP] 序列化 SessionPromptEnd 消息失败: session_id={}, error={}",
-                session_id, e
-            );
-            // 返回包含 session_id 的最小可用结构
-            format!(
-                r#"{{"sessionId":"{}","messageType":"sessionPromptEnd","subType":"end_turn","data":{{"reason":"EndTurn","description":"Agent 当前无在执行任务"}}}}"#,
-                session_id
-            )
-        }
+    let json_data = serde_json::to_string(&unified_message).unwrap_or_else(|e| {
+        warn!(
+            "[HTTP] Failed to serialize SessionPromptEnd message: session_id={}, error={}",
+            session_id, e
+        );
+        // 降级处理：返回最简 JSON
+        format!(r#"{{"sessionId":"{}","messageType":"sessionPromptEnd","subType":"end_turn"}}"#, session_id)
+    });
+
+    Event::default().event("end_turn").data(json_data)
+}
+
+/// 创建 Agent 不存在时的错误事件
+///
+/// 当 Agent 在 AGENT_REGISTRY 中不存在时，发送此事件通知前端
+/// 包含错误信息和 end_turn 消息，方便排查定位问题
+fn create_agent_not_found_event(session_id: &str) -> Event {
+    let unified_message = UnifiedSessionMessage {
+        session_id: session_id.to_string(),
+        message_type: SessionMessageType::SessionPromptEnd,
+        sub_type: "end_turn".to_string(),
+        data: serde_json::json!({
+            "reason": "AgentNotFound",
+            "description": format!("Agent not found in registry for session: {}", session_id)
+        }),
+        timestamp: Utc::now(),
     };
+
+    let json_data = serde_json::to_string(&unified_message).unwrap_or_else(|e| {
+        warn!(
+            "[HTTP] Failed to serialize AgentNotFound message: session_id={}, error={}",
+            session_id, e
+        );
+        // 降级处理：返回最简 JSON
+        format!(r#"{{"sessionId":"{}","messageType":"sessionPromptEnd","subType":"end_turn"}}"#, session_id)
+    });
 
     Event::default().event("end_turn").data(json_data)
 }
@@ -147,14 +172,34 @@ pub async fn handle_computer_progress(
     );
 
     // 0. 检查 Agent 状态（必须在 SESSION_CACHE 查找之前检查）
-    if is_agent_idle(&session_id).await {
-        info!(
-            "💤 [HTTP] Agent is idle, sending SessionPromptEnd and closing: session_id={}",
-            session_id
-        );
-        let end_event = create_idle_end_event(&session_id);
-        let stream: SseStream = Box::pin(futures_util::stream::iter([Ok(end_event)]));
-        return Ok(Sse::new(stream));
+    // 只有当 Agent 确实存在且处于 Idle 状态时，才发送 SessionPromptEnd
+    // 如果 Agent 不存在，发送错误信息 + end_turn 消息，然后关闭 SSE 连接
+    match check_agent_idle(&session_id).await {
+        Some(true) => {
+            info!(
+                "💤 [HTTP] Agent is idle (confirmed), sending SessionPromptEnd and closing: session_id={}",
+                session_id
+            );
+            let end_event = create_idle_end_event(&session_id);
+            let stream: SseStream = Box::pin(futures_util::stream::iter([Ok(end_event)]));
+            return Ok(Sse::new(stream));
+        }
+        Some(false) => {
+            info!(
+                "🔄 [HTTP] Agent is active, continuing to establish stream: session_id={}",
+                session_id
+            );
+        }
+        None => {
+            // Agent 不存在，发送错误信息 + end_turn 消息，然后关闭 SSE 连接
+            warn!(
+                "⚠️ [HTTP] Agent not found in registry, sending error and end_turn: session_id={}",
+                session_id
+            );
+            let error_event = create_agent_not_found_event(&session_id);
+            let stream: SseStream = Box::pin(futures_util::stream::iter([Ok(error_event)]));
+            return Ok(Sse::new(stream));
+        }
     }
 
     // 1. 从 SESSION_CACHE 获取 session_data
@@ -168,14 +213,14 @@ pub async fn handle_computer_progress(
     );
     let session_data = match SESSION_CACHE.view(&session_id, |_, d| d.clone()) {
         Some(data) => {
-            info!(
-                "[HTTP] SESSION_CACHE found for session_id={}",
+            info!("[HTTP] SESSION_CACHE found for session_id={}", session_id);
+            data
+        }
+        None => {
+            warn!(
+                " [HTTP] Session not found in SESSION_CACHE: session_id={}",
                 session_id
             );
-            data
-        },
-        None => {
-            warn!(" [HTTP] Session not found in SESSION_CACHE: session_id={}", session_id);
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(HttpResult::error_with_message(

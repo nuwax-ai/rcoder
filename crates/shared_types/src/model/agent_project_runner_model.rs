@@ -408,13 +408,19 @@ impl ProjectAndContainerInfo {
     /// 获取容器唯一标识
     ///
     /// 根据 service_type 返回不同的标识符：
-    /// - RCoder 模式：返回 pod_id（如果存在，共享容器），否则返回 project_id
+    /// - WebAgentRunner 模式：返回 pod_id（如果存在，共享容器），否则返回 project_id
     /// - ComputerAgentRunner 模式：返回 user_id（如果存在），否则回退到 project_id
+    ///
+    /// ## 重要说明
+    ///
+    /// 只有 `ComputerAgentRunner` 类型才使用 `user_id` 作为容器标识。
+    /// `WebAgentRunner` 类型使用 `project_id` 作为容器标识，即使 `user_id` 存在。
     pub fn container_key(&self) -> &str {
         match self.service_type() {
             Some(ServiceType::ComputerAgentRunner) => {
                 self.user_id().unwrap_or_else(|| self.project_id())
             }
+            // WebAgentRunner 或 service_type 未设置：使用 pod_id 或 project_id
             _ => self.pod_id().unwrap_or_else(|| self.project_id()),
         }
     }

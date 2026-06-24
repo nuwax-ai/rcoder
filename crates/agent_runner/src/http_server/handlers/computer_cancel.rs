@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use crate::CancelNotificationRequestWrapper;
 use crate::http_server::router::AppState;
-use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER, SESSION_CACHE};
+use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER};
 use shared_types::{
     AppError, ComputerAgentCancelRequest, ComputerAgentCancelResponse, HttpResult, I18nJsonOrQuery,
     error_codes::ERR_VALIDATION, get_i18n_message,

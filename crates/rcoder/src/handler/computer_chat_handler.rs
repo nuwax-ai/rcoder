@@ -330,19 +330,22 @@ pub(crate) async fn handle_computer_chat_internal(
             .pod_creating
             .insert(user_id.clone(), std::time::Instant::now());
 
-        let result = ComputerContainerManager::get_or_create_container_for_user(
-            &user_id,
-            request
+        let options = crate::service::computer_container_manager::ContainerCreateOptions {
+            user_id: user_id.clone(),
+            project_id: project_id.clone(),
+            resource_limits: request
                 .agent_config
                 .as_ref()
                 .and_then(|c| c.resource_limits.clone()),
-            request.pod_id.as_deref(),
-            request.isolation_type.as_deref(),
-            request.tenant_id.as_deref(),
-            request.space_id.as_deref(),
-            state.runtime(),
-        )
-        .await;
+            pod_id: request.pod_id.clone(),
+            isolation_type: request.isolation_type.clone(),
+            tenant_id: request.tenant_id.clone(),
+            space_id: request.space_id.clone(),
+            service_type: shared_types::ServiceType::ComputerAgentRunner,
+        };
+        let result =
+            ComputerContainerManager::get_or_create_container_for_user(&options, state.runtime())
+                .await;
 
         // 清除标记（无论成功还是失败）
         state.pod_creating.remove(&user_id);
@@ -388,16 +391,21 @@ pub(crate) async fn handle_computer_chat_internal(
                 e
             );
         }
-        ComputerContainerManager::force_create_container_for_user(
-            &user_id,
-            request
+        let options = crate::service::computer_container_manager::ContainerCreateOptions {
+            user_id: user_id.clone(),
+            project_id: user_id.clone(),  // ComputerAgentRunner 使用 user_id 作为 project_id
+            resource_limits: request
                 .agent_config
                 .as_ref()
                 .and_then(|c| c.resource_limits.clone()),
-            request.pod_id.as_deref(),
-            request.isolation_type.as_deref(),
-            request.tenant_id.as_deref(),
-            request.space_id.as_deref(),
+            pod_id: request.pod_id.clone(),
+            isolation_type: request.isolation_type.clone(),
+            tenant_id: request.tenant_id.clone(),
+            space_id: request.space_id.clone(),
+            service_type: shared_types::ServiceType::ComputerAgentRunner,
+        };
+        ComputerContainerManager::force_create_container_for_user(
+            &options,
             state.runtime(),
         )
         .await

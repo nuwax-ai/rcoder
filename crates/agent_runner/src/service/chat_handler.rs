@@ -459,9 +459,7 @@ pub async fn handle_chat_core(
             }
         }
     } else {
-        info!(
-            "[ChatHandler] Step 4: session_id is None, skipping clear logic"
-        );
+        info!("[ChatHandler] Step 4: session_id is None, skipping clear logic");
     }
 
     // ========== 步骤 4.5: Auto-Reload 检测 ==========

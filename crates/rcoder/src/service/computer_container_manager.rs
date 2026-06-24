@@ -32,6 +32,8 @@ use tracing::{debug, error, info, warn};
 pub struct ContainerCreateOptions {
     /// 用户唯一标识符
     pub user_id: String,
+    /// 项目唯一标识符（WebAgentRunner 使用 project_id 作为容器标识）
+    pub project_id: String,
     /// 可选的资源限额配置
     pub resource_limits: Option<ServiceResourceLimits>,
     /// 可选的容器唯一标识，若提供则使用此 ID 作为容器标识（实现容器复用）
@@ -74,7 +76,14 @@ impl ComputerContainerManager {
         runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<ContainerBasicInfo, AppError> {
         // 确定容器标识符：pod_id 有值时使用 pod_id，否则根据 service_type 使用 user_id 或 project_id
-        let container_identifier = options.pod_id.as_deref().unwrap_or(&options.user_id);
+        let container_identifier =
+            options
+                .pod_id
+                .as_deref()
+                .unwrap_or_else(|| match options.service_type {
+                    ServiceType::WebAgentRunner => &options.project_id,
+                    ServiceType::ComputerAgentRunner => &options.user_id,
+                });
 
         info!(
             "🔍 [COMPUTER_CONTAINER] Getting/creating user container: user_id={}, pod_id={:?}, container_identifier={}, service_type={}",
@@ -154,16 +163,7 @@ impl ComputerContainerManager {
             "🏗️ [COMPUTER_CONTAINER] Creating new user container: container_identifier={}, service_type={}",
             container_identifier, options.service_type
         );
-        Self::create_container_for_user(
-            &options.user_id,
-            runtime,
-            options.resource_limits.clone(),
-            options.pod_id.as_deref(),
-            options.isolation_type.as_deref(),
-            options.tenant_id.as_deref(),
-            options.space_id.as_deref(),
-        )
-        .await
+        Self::create_container_for_user(options, runtime).await
     }
 
     /// 根据 user_id 或 pod_id 获取或创建容器（向后兼容，默认使用 ComputerAgentRunner）
@@ -182,24 +182,10 @@ impl ComputerContainerManager {
     /// # 返回
     /// 容器基本信息，包含容器 ID、IP 地址等
     pub async fn get_or_create_container_for_user(
-        user_id: &str,
-        resource_limits: Option<ServiceResourceLimits>,
-        pod_id: Option<&str>,
-        isolation_type: Option<&str>,
-        tenant_id: Option<&str>,
-        space_id: Option<&str>,
+        options: &ContainerCreateOptions,
         runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<ContainerBasicInfo, AppError> {
-        let options = ContainerCreateOptions {
-            user_id: user_id.to_string(),
-            resource_limits,
-            pod_id: pod_id.map(|s| s.to_string()),
-            isolation_type: isolation_type.map(|s| s.to_string()),
-            tenant_id: tenant_id.map(|s| s.to_string()),
-            space_id: space_id.map(|s| s.to_string()),
-            service_type: ServiceType::ComputerAgentRunner,
-        };
-        Self::get_or_create_container_for_user_with_type(&options, runtime).await
+        Self::get_or_create_container_for_user_with_type(options, runtime).await
     }
 
     /// 强制为用户创建新容器（跳过检查）
@@ -207,54 +193,40 @@ impl ComputerContainerManager {
     /// 直接调用内部创建逻辑，用于重启等需要强制重建的场景。
     /// 调用前应确保旧容器已被移除。
     pub async fn force_create_container_for_user(
-        user_id: &str,
-        resource_limits: Option<ServiceResourceLimits>,
-        pod_id: Option<&str>,
-        isolation_type: Option<&str>,
-        tenant_id: Option<&str>,
-        space_id: Option<&str>,
+        options: &ContainerCreateOptions,
         runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<ContainerBasicInfo, AppError> {
-        let container_identifier = pod_id.unwrap_or(user_id);
+        let container_identifier = options.pod_id.as_deref().unwrap_or(&options.user_id);
         info!(
             "🏗️ [COMPUTER_CONTAINER] Force creating new user container: container_identifier={}",
             container_identifier
         );
 
-        Self::create_container_for_user(
-            user_id,
-            runtime,
-            resource_limits,
-            pod_id,
-            isolation_type,
-            tenant_id,
-            space_id,
-        )
-        .await
+        Self::create_container_for_user(options, runtime).await
     }
 
     /// 为用户创建容器
     ///
     /// 内部方法，负责实际的容器创建逻辑。
     async fn create_container_for_user(
-        user_id: &str,
+        options: &ContainerCreateOptions,
         runtime: &Arc<dyn ContainerRuntime>,
-        resource_limits: Option<ServiceResourceLimits>,
-        pod_id: Option<&str>,
-        isolation_type: Option<&str>,
-        tenant_id: Option<&str>,
-        space_id: Option<&str>,
     ) -> Result<ContainerBasicInfo, AppError> {
-        // 确定容器标识符：pod_id 有值时使用 pod_id，否则使用 user_id
-        let container_identifier = pod_id.unwrap_or(user_id);
+        // 确定容器标识符：
+        // - WebAgentRunner: 使用 project_id（通过 pod_id 或 user_id 传递）
+        // - ComputerAgentRunner: 使用 user_id
+        let container_identifier = match options.service_type {
+            ServiceType::WebAgentRunner => options.pod_id.as_deref().unwrap_or(&options.user_id),
+            ServiceType::ComputerAgentRunner => options.pod_id.as_deref().unwrap_or(&options.user_id),
+        };
 
         // 1. 准备用户级工作目录（仍需在 rcoder 容器内创建）
         // 在容器内创建目录，绑定挂载会自动同步到宿主机
-        Self::create_user_workspace(user_id).await?;
+        Self::create_user_workspace(&options.user_id).await?;
 
         info!(
             "📁 [COMPUTER_CONTAINER] User workspace prepared: /app/computer-project-workspace/{}",
-            user_id
+            options.user_id
         );
 
         // 2. 调用 DockerManager 启动容器
@@ -262,30 +234,30 @@ impl ComputerContainerManager {
         // 使用 container_identifier 作为 project_id（用于容器名称生成）
         let mut params_builder = ContainerCreateParams::builder()
             .project_id(container_identifier) // 用于容器名称生成和查找
-            .user_id(user_id) // user_id 用于容器内配置
+            .user_id(&options.user_id) // user_id 用于容器内配置
             .host_workspace_path("")
-            .service_type(ServiceType::ComputerAgentRunner);
+            .service_type(options.service_type.clone());
 
         // 只有在有资源限制时才设置
-        if let Some(limits) = resource_limits {
+        if let Some(ref limits) = options.resource_limits {
             // 提取 storage_size 用于 K8s PVC 创建
             if let Some(ref storage_size) = limits.storage_size {
                 params_builder = params_builder.storage_size(storage_size.clone());
             }
-            params_builder = params_builder.resource_limits(limits);
+            params_builder = params_builder.resource_limits(limits.clone());
         }
 
         // 设置可选的隔离参数
-        if let Some(pid) = pod_id {
+        if let Some(ref pid) = options.pod_id {
             params_builder = params_builder.pod_id(pid);
         }
-        if let Some(it) = isolation_type {
+        if let Some(ref it) = options.isolation_type {
             params_builder = params_builder.isolation_type(it);
         }
-        if let Some(tid) = tenant_id {
+        if let Some(ref tid) = options.tenant_id {
             params_builder = params_builder.tenant_id(tid);
         }
-        if let Some(sid) = space_id {
+        if let Some(ref sid) = options.space_id {
             params_builder = params_builder.space_id(sid);
         }
 
@@ -306,7 +278,7 @@ impl ComputerContainerManager {
 
         info!(
             "🚀 [COMPUTER_CONTAINER] User container created successfully: user_id={}, container_id={}, ip={}",
-            user_id, container_info.container_id, container_info.container_ip
+            options.user_id, container_info.container_id, container_info.container_ip
         );
 
         Ok(container_info)

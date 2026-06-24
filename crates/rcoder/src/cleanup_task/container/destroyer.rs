@@ -38,12 +38,14 @@ impl ContainerDestroyer {
     /// * `service_type` - 服务类型（用于决定是否清理 VNC 后端）
     /// * `container_identifier` - 容器标识符（project_id 或 user_id）
     /// * `reason` - 销毁原因
+    /// * `project_id` - 项目 ID（用于清理 project_backends，可选）
     pub async fn destroy_with_reason(
         &self,
         container_name: &str,
         service_type: &ServiceType,
         container_identifier: &str,
         reason: &DestroyReason,
+        project_id: Option<&str>,
     ) -> Result<()> {
         info!(
             "🔥 [destroyer] Starting container destruction: container_name={}, service_type={:?}, identifier={}, reason={}",
@@ -120,9 +122,15 @@ impl ContainerDestroyer {
             }
 
             // 清理 Pingora Project 后端（WebAgentRunner 容器）
-            if *service_type == ServiceType::WebAgentRunner {
-                let _: Option<String> =
-                    pingora_service.remove_project_backend(container_identifier);
+            // 使用 project_id 而不是 container_identifier，因为 container_identifier 可能是 pod_id
+            if *service_type == ServiceType::WebAgentRunner
+                && let Some(pid) = project_id
+            {
+                let _: Option<String> = pingora_service.remove_project_backend(pid);
+                debug!(
+                    "🧹 [destroyer] Cleaned up project_backends: project_id={}",
+                    pid
+                );
             }
         }
 
@@ -141,18 +149,26 @@ impl ContainerDestroyer {
     /// * `container_name` - 容器名称
     /// * `service_type` - 服务类型（用于决定是否清理 VNC 后端）
     /// * `container_identifier` - 容器标识符（project_id 或 user_id）
+    /// * `project_id` - 项目 ID（用于清理 project_backends，可选）
     pub async fn destroy(
         &self,
         container_name: &str,
         service_type: &ServiceType,
         container_identifier: &str,
+        project_id: Option<&str>,
     ) -> Result<()> {
         // 使用默认原因
         let reason = DestroyReason::ManualStop {
             source: "unknown".to_string(),
         };
-        self.destroy_with_reason(container_name, service_type, container_identifier, &reason)
-            .await
+        self.destroy_with_reason(
+            container_name,
+            service_type,
+            container_identifier,
+            &reason,
+            project_id,
+        )
+        .await
     }
 }
 

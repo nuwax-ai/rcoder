@@ -450,7 +450,7 @@ async fn validate_and_get_session_context(
     // ========== 阶段 2: 获取稳定的 container_name（不是 container_id） ==========
     // 🔧 关键修复：container_name 在容器重建后保持不变（如 computer-agent-runner-user_123）
     // 而 container_id 在每次容器重建后都会变化
-    let container_name = match state.get_container_name_by_session(session_id) {
+    let mut container_name = match state.get_container_name_by_session(session_id) {
         Some(name) => {
             debug!(
                 "🔍 [SSE_PROXY] Getting container name from storage: session_id={}, container_name={}",
@@ -562,7 +562,7 @@ async fn validate_and_get_session_context(
 
     // 🎯 优化策略：
     // 1. 首先检查内存中的 project_info.container() 是否已存在
-    // 2. 如果存在 → 跳过 Docker API 调用（内存信息由创建逻辑保证最新）
+    // 2. 如果存在 → 使用内存中的 container_name（它是最新的），跳过 Docker API 调用
     // 3. 如果不存在 → 调用 find_container_realtime 作为降级方案
     // 4. 后续会通过 gRPC GetStatus 进行最终健康检查
     if let Some(container) = project_info.container() {
@@ -570,8 +570,10 @@ async fn validate_and_get_session_context(
             "✅ [SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
             container.container_name, container.container_ip
         );
-        // 内存中有容器信息，跳过 Docker API 检查
-        // 后续会通过 gRPC GetStatus 进行健康检查
+        // 🎯 关键修复：使用内存中的 container_name（它是最新的）
+        // storage 中的 container_name 可能对应旧容器（如 user container）
+        // 内存中的 container_name 对应当前活跃的容器（如 project container）
+        container_name = container.container_name.clone();
     } else {
         // 内存中没有容器信息，调用 Docker API 实时查询
         warn!(
