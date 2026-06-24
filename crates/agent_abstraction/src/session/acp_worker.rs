@@ -69,7 +69,7 @@ where
             })?;
 
         // 3. 使用 PromptConfigAssembler 组装配置
-        let default_agent_id = "claude-code-acp-ts";
+        let default_agent_id = shared_types::DEFAULT_AGENT_ID;
 
         // 根据请求中的 service_type 加载对应配置
         let servers_config =

@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 非阻塞打印外部工具版本（不阻塞启动流程）
     spawn_tool_version_log("nuwaxcode", &["nuwaxcode", "-v"]);
-    spawn_tool_version_log("claude-code-acp-ts", &["claude-code-acp-ts", "-v"]);
+    spawn_tool_version_log(shared_types::DEFAULT_AGENT_ID, &[shared_types::DEFAULT_AGENT_ID, "-v"]);
 
     // 异步初始化内置 agent 版本缓存（不阻塞主流程）
     tokio::spawn(async {

@@ -34,7 +34,7 @@ pub async fn load_sacp_agent_config_with_resolver(
     // 复用旧版配置加载逻辑
     let config = AgentServersConfig::load_or_default_for_service(service_type).await;
 
-    if let Some(agent_config) = config.get_agent("claude-code-acp-ts") {
+    if let Some(agent_config) = config.get_agent(shared_types::DEFAULT_AGENT_ID) {
         debug!(
             "📋 [SACP] using default Agent config: {}",
             agent_config.agent_id
@@ -132,7 +132,7 @@ pub async fn load_sacp_agent_config_with_resolver(
             context_servers: config.context_servers.clone(),
         })
     } else {
-        warn!("[SACP] config not found for claude-code-acp-ts, using default config");
+        warn!("[SACP] config not found for {}, using default config", shared_types::DEFAULT_AGENT_ID);
         get_default_sacp_agent_config_with_resolver(
             model_provider,
             service_type,
@@ -202,22 +202,23 @@ pub fn get_default_sacp_agent_config_with_resolver(
         "1".to_string(),
     );
 
-    // Resolve the claude-code-acp-ts command path.
+    // Resolve the default agent command path.
     // Priority: CLAUDE_CODE_ACP_PATH env var > `which` crate lookup > bare command name.
     // Tauri apps may not inherit the user's shell PATH, so we try `which` crate to get
     // an absolute path at build/launch time.
     let command = if let Ok(path) = std::env::var("CLAUDE_CODE_ACP_PATH") {
         path
     } else {
-        match which::which("claude-code-acp-ts") {
+        match which::which(shared_types::DEFAULT_AGENT_ID) {
             Ok(resolved_path) => {
                 tracing::info!(
-                    "Resolved claude-code-acp-ts path via `which` crate: {}",
+                    "Resolved {} path via `which` crate: {}",
+                    shared_types::DEFAULT_AGENT_ID,
                     resolved_path.display()
                 );
                 resolved_path.to_string_lossy().to_string()
             }
-            Err(_) => "claude-code-acp-ts".to_string(),
+            Err(_) => shared_types::DEFAULT_AGENT_ID.to_string(),
         }
     };
 

@@ -355,8 +355,8 @@ pub async fn handle_chat_core(
             None
         }
     } else {
-        // 默认 agent: claude-code-acp-ts
-        if let Err(e) = checker::check_agent_exists("claude-code-acp-ts") {
+        // 默认 agent
+        if let Err(e) = checker::check_agent_exists(shared_types::DEFAULT_AGENT_ID) {
             error!("[ChatHandler] Default agent not found: {}", e);
             return ChatHandlerOutput::error(
                 project_id,
@@ -365,7 +365,7 @@ pub async fn handle_chat_core(
                 error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
             );
         }
-        checker::get_agent_version("claude-code-acp-ts").await
+        checker::get_agent_version(shared_types::DEFAULT_AGENT_ID).await
     };
     if let Some(ref v) = agent_version {
         info!("[ChatHandler] Agent version detected: {}", v);

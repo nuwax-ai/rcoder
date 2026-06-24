@@ -18,7 +18,7 @@ const DEFAULT_CONFIG_JSON: &str = include_str!("../../configs/default_agents.jso
 const COMPUTER_AGENT_CONFIG_JSON: &str = include_str!("../../configs/computer_agent_default.json");
 
 /// Claude Code ACP Agent 的默认 ID
-pub const CLAUDE_CODE_ACP_AGENT_ID: &str = "claude-code-acp-ts";
+pub const CLAUDE_CODE_ACP_AGENT_ID: &str = shared_types::DEFAULT_AGENT_ID;
 
 /// 默认配置的内部结构（用于 JSON 反序列化）
 #[derive(serde::Deserialize)]

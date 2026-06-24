@@ -450,14 +450,14 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let mut child = cmd_wrap
             .wrap(ProcessGroup::leader())
             .spawn()
-            .context("[SACP] Failed to start claude-code-acp-ts subprocess")?;
+            .context("[SACP] Failed to start ACP subprocess")?;
 
         #[cfg(windows)]
         let mut child = cmd_wrap
             .wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW_FLAG)))
             .wrap(JobObject)
             .spawn()
-            .context("[SACP] Failed to start claude-code-acp-ts subprocess")?;
+            .context("[SACP] Failed to start ACP subprocess")?;
 
         #[cfg(not(any(unix, windows)))]
         compile_error!("neither unix nor windows");

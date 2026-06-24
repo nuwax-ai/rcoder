@@ -102,10 +102,15 @@ pub const AGENT_CANCEL_CHANNEL_CAPACITY: usize = 1000;
 
 // === 内置 ACP Agent ===
 
+/// 默认 ACP agent 标识符
+///
+/// 当请求未指定 agent_id 时，使用此默认值。
+pub const DEFAULT_AGENT_ID: &str = "claude-code-acp-ts";
+
 /// 内置 ACP agent 标识符列表
 ///
 /// 容器构建时已预装，chat 接口跳过自动安装逻辑。
-pub const BUILTIN_AGENT_IDS: &[&str] = &["claude-code-acp-ts", "nuwaxcode"];
+pub const BUILTIN_AGENT_IDS: &[&str] = &[DEFAULT_AGENT_ID, "nuwaxcode"];
 
 /// 判断是否为内置 agent
 pub fn is_builtin_agent(agent_id: &str) -> bool {

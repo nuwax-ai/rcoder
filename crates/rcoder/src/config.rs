@@ -65,7 +65,7 @@ pub struct AppConfig {
 }
 
 fn default_agent_id() -> String {
-    "claude-code-acp-ts".to_string()
+    shared_types::DEFAULT_AGENT_ID.to_string()
 }
 
 /// 生成随机 API Key

@@ -368,9 +368,9 @@ impl ChatAgentConfig {
 }
 
 impl ChatAgentServerConfig {
-    /// 获取 Agent ID，默认返回 "claude-code-acp-ts"
+    /// 获取 Agent ID，默认返回内置 agent ID
     pub fn get_agent_id(&self) -> &str {
-        self.agent_id.as_deref().unwrap_or("claude-code-acp-ts")
+        self.agent_id.as_deref().unwrap_or(crate::DEFAULT_AGENT_ID)
     }
 
     /// Resolve and validate the permission approval mode.
