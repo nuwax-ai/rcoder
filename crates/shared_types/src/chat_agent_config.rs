@@ -97,46 +97,27 @@ pub struct ChatAgentConfig {
 /// 控制 Agent 二进制文件变化检测和自动重启行为。
 /// 主要用于 DevComputer 调试场景，开发者编译新 agent 后无需手动重启。
 ///
-/// # Stability Check
+/// Auto-Reload 配置（简化版）
 ///
-/// 为避免加载尚未写完的二进制（例如编译中途），检测逻辑会在
-/// `stability_check_ms` 内多次检查文件 mtime，只有当 mtime 不再变化
-/// 时才认为新二进制已就绪。
+/// 当 `enabled=true` 时，每次请求都会重启 ACP agent 进程，
+/// 并尝试通过 session_id 恢复历史上下文。
+///
+/// 适用场景：`/devcomputer/chat` 接口用于调试 ACP agent 功能，
+/// 每次请求都应使用最新的 agent 代码。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AutoReloadConfig {
     /// 是否启用自动重载
+    ///
+    /// 启用后，每次请求都会重启 ACP agent 进程，
+    /// 并尝试通过 session_id 恢复历史上下文。
     #[serde(default = "default_true")]
     pub enabled: bool,
-
-    /// 稳定性检查间隔（毫秒）
-    ///
-    /// 检测到 mtime 变化后，等待此时间再次检查，确认文件不再被写入。
-    /// 默认 500ms，高速编译场景可适当增大。
-    #[serde(default = "default_stability_check_ms")]
-    pub stability_check_ms: u64,
-
-    /// 稳定性检查重试次数
-    ///
-    /// 在 stability_check_ms 间隔内连续检测到 mtime 不变才算通过。
-    /// 默认 3 次。
-    #[serde(default = "default_stability_retries")]
-    pub stability_retries: u32,
-
-    /// 强制重载（忽略 stability check）
-    ///
-    /// 设为 true 时跳过稳定性检查，直接重载。
-    /// 仅在确定二进制已完整写入时使用。
-    #[serde(default)]
-    pub force: bool,
 }
 
 impl Default for AutoReloadConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            stability_check_ms: default_stability_check_ms(),
-            stability_retries: default_stability_retries(),
-            force: false,
         }
     }
 }
@@ -151,17 +132,8 @@ impl AutoReloadConfig {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            ..Default::default()
         }
     }
-}
-
-fn default_stability_check_ms() -> u64 {
-    500
-}
-
-fn default_stability_retries() -> u32 {
-    3
 }
 
 /// 单个 Agent 服务器配置

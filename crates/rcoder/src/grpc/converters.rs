@@ -220,9 +220,6 @@ pub fn to_grpc_chat_agent_config(config: ChatAgentConfig) -> GrpcChatAgentConfig
 fn to_grpc_auto_reload_config(config: AutoReloadConfig) -> GrpcAutoReloadConfig {
     GrpcAutoReloadConfig {
         enabled: config.enabled,
-        stability_check_ms: config.stability_check_ms,
-        stability_retries: config.stability_retries,
-        force: config.force,
     }
 }
 

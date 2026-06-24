@@ -51,17 +51,6 @@ pub fn convert_agent_config(grpc_config: GrpcChatAgentConfig) -> Result<ChatAgen
 pub fn convert_auto_reload_config(grpc_config: GrpcAutoReloadConfig) -> AutoReloadConfig {
     AutoReloadConfig {
         enabled: grpc_config.enabled,
-        stability_check_ms: if grpc_config.stability_check_ms == 0 {
-            500
-        } else {
-            grpc_config.stability_check_ms
-        },
-        stability_retries: if grpc_config.stability_retries == 0 {
-            3
-        } else {
-            grpc_config.stability_retries
-        },
-        force: grpc_config.force,
     }
 }
 

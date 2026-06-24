@@ -460,24 +460,15 @@ pub struct ChatContextServerConfig {
         ::prost::alloc::string::String,
     >,
 }
-/// 🆕 Auto-reload 热重载配置（DevComputer 调试模式）
+/// Auto-reload 热重载配置（简化版，用于 DevComputer 调试模式）
 ///
-/// 检测 agent 二进制文件变化并自动触发重载。
-/// stability check 防止加载编译中的不完整二进制。
+/// 当 enabled=true 时，每次请求都会重启 ACP agent 进程，
+/// 并尝试通过 session_id 恢复历史上下文。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AutoReloadConfig {
     /// 是否启用 auto-reload（默认 true）
     #[prost(bool, tag = "1")]
     pub enabled: bool,
-    /// 稳定性检查间隔（毫秒，默认 500）
-    #[prost(uint64, tag = "2")]
-    pub stability_check_ms: u64,
-    /// 连续稳定检查次数（默认 3）
-    #[prost(uint32, tag = "3")]
-    pub stability_retries: u32,
-    /// 强制重载（跳过稳定性检查）
-    #[prost(bool, tag = "4")]
-    pub force: bool,
 }
 /// 容器状态查询请求
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
