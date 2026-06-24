@@ -4,13 +4,62 @@
 //! - 静态检查(file_exists / executable / in_path)
 //! - 版本检测(执行 `<command> --version` 并解析输出)
 //! - 完整性检查(注册表条目与磁盘状态一致)
+//!
+//! 版本缓存:
+//! - 内置 agent 版本号在启动时缓存，避免每次请求都执行子进程
+//! - 非内置 agent 保持实时检测
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
-use shared_types::{AgentDetailInfo, AgentInstallStatus, InstallType, StaticCheckResult};
+use shared_types::{BUILTIN_AGENT_IDS, AgentDetailInfo, AgentInstallStatus, InstallType, StaticCheckResult};
+use tracing::info;
 
 use crate::agent_mgmt::installer::AgentManifest;
 use crate::agent_mgmt::path_manager::PathManager;
+
+/// 版本缓存（启动时填充，运行期间只读）
+///
+/// 使用 OnceLock<HashMap>，一次性初始化后只读，无需并发安全。
+static VERSION_CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// 初始化内置 agent 版本缓存（启动时调用）
+///
+/// 遍历内置 agent 列表，执行 `{command} -v` 检测版本号并缓存。
+/// 此函数应在服务启动时异步调用，不阻塞主流程。
+pub async fn init_builtin_agent_versions() {
+    let mut cache = HashMap::new();
+
+    for agent in BUILTIN_AGENT_IDS {
+        if let Some(version) = detect_agent_version(agent).await {
+            cache.insert(agent.to_string(), version.clone());
+            info!(
+                "📦 [VERSION_CACHE] Cached {} version: {}",
+                agent, version
+            );
+        }
+    }
+
+    // 一次性设置缓存
+    let _ = VERSION_CACHE.set(cache);
+}
+
+/// 获取 agent 版本（优先使用缓存）
+///
+/// 对于内置 agent，直接返回缓存的版本号（启动时已检测）。
+/// 对于非内置 agent，实时执行 `{command} -v` 检测。
+pub async fn get_agent_version(command: &str) -> Option<String> {
+    // 1. 先检查缓存
+    if let Some(cache) = VERSION_CACHE.get()
+        && let Some(version) = cache.get(command)
+    {
+        return Some(version.clone());
+    }
+
+    // 2. 缓存未命中，实时检测（非内置 agent）
+    detect_agent_version(command).await
+}
 
 pub struct AgentChecker {
     path_manager: PathManager,

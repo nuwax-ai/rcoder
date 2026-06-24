@@ -126,6 +126,11 @@ async fn main() -> anyhow::Result<()> {
     spawn_tool_version_log("nuwaxcode", &["nuwaxcode", "-v"]);
     spawn_tool_version_log("claude-code-acp-ts", &["claude-code-acp-ts", "-v"]);
 
+    // 异步初始化内置 agent 版本缓存（不阻塞主流程）
+    tokio::spawn(async {
+        crate::agent_mgmt::checker::init_builtin_agent_versions().await;
+    });
+
     // 解析命令行参数
     let cli_args = CliArgs::parse();
 

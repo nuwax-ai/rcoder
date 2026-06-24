@@ -347,7 +347,7 @@ pub async fn handle_chat_core(
                         error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
                     );
                 }
-                checker::detect_agent_version(command).await
+                checker::get_agent_version(command).await
             } else {
                 None
             }
@@ -365,7 +365,7 @@ pub async fn handle_chat_core(
                 error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
             );
         }
-        checker::detect_agent_version("claude-code-acp-ts").await
+        checker::get_agent_version("claude-code-acp-ts").await
     };
     if let Some(ref v) = agent_version {
         info!("[ChatHandler] Agent version detected: {}", v);
