@@ -550,11 +550,24 @@ impl ContainerRuntime for KubernetesRuntime {
         };
 
         let pp = PostParams::default();
-        self.pods().create(&pp, &pod).await.map_err(|e| {
-            ContainerRuntimeError::ContainerCreationError(format!("Failed to create pod: {}", e))
-        })?;
-
-        info!("[K8S] Pod {} created successfully", pod_name);
+        match self.pods().create(&pp, &pod).await {
+            Ok(_) => {
+                info!("[K8S] Pod {} created successfully", pod_name);
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                // Pod already exists (from a previous failed create_container attempt).
+                // Reuse the existing pod instead of failing.
+                warn!(
+                    "[K8S] Pod {} already exists (409), reusing existing pod",
+                    pod_name
+                );
+            }
+            Err(e) => {
+                return Err(ContainerRuntimeError::ContainerCreationError(
+                    format!("Failed to create pod: {}", e),
+                ));
+            }
+        }
 
         // Wait for pod to be ready
         self.wait_for_pod_ready(identifier, &service_type).await?;
@@ -562,8 +575,13 @@ impl ContainerRuntime for KubernetesRuntime {
         // Create K8s Service for Envoy Gateway routing
         self.create_agent_service(identifier, &service_type).await?;
 
-        // Create Backend CRD for Envoy Gateway discovery
-        self.create_backend_crd(identifier, &service_type).await?;
+        // Create Backend CRD for Envoy Gateway discovery (non-fatal if Envoy Gateway is not installed)
+        if let Err(e) = self.create_backend_crd(identifier, &service_type).await {
+            warn!(
+                "[K8S] Failed to create Backend CRD for {} (Envoy Gateway may not be installed): {} (continuing)",
+                identifier, e
+            );
+        }
 
         // Get pod info
         self.get_container_info_by_identifier(identifier, &service_type)
