@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rcoder
+  labels:
+    app: rcoder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rcoder
+  template:
+    metadata:
+      labels:
+        app: rcoder
+    spec:
+      serviceAccountName: rcoder-sa
+      containers:
+        - name: rcoder
+          image: rust:1.95
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/app/devspace_start.sh"]
+          ports:
+            - containerPort: 8290
+              name: http
+            - containerPort: 8088
+              name: pingora
+            - containerPort: 7681
+              name: ttyd
+          env:
+            - name: TZ
+              value: "Asia/Shanghai"
+            - name: DOCKER_SOCKET_PATH
+              value: "/var/run/docker.sock"
+            - name: ENABLE_TTYD
+              value: "false"
+            - name: CONTAINER_RUNTIME
+              value: "kubernetes"
+          volumeMounts:
+            - name: cargo-target
+              mountPath: /app/target
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: project-workspace
+              mountPath: /app/project_workspace
+            - name: logs
+              mountPath: /app/logs
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1000m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+      volumes:
+        - name: cargo-target
+          persistentVolumeClaim:
+            claimName: cargo-target-pvc
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+        - name: project-workspace
+          persistentVolumeClaim:
+            claimName: project-workspace-pvc
+        - name: logs
+          emptyDir: {}

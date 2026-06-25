@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cargo-target-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: local-path
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: project-workspace-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-path

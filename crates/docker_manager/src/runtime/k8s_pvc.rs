@@ -20,7 +20,7 @@ use k8s_openapi::api::core::v1::{
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 #[cfg(feature = "kubernetes")]
-use kube::api::{DeleteParams, ObjectMeta, PostParams};
+use kube::api::{ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
 use shared_types::ServiceType;
 #[cfg(feature = "kubernetes")]
@@ -69,23 +69,6 @@ pub(crate) trait K8sPvcOps {
     /// 保留用于 WaitForFirstConsumer 模式下切换为预绑定策略时使用。
     #[allow(dead_code)]
     async fn wait_for_pvc_bound(&self, pvc_name: &str) -> ContainerRuntimeResult<()>;
-
-    /// 删除 workspace PVC
-    ///
-    /// 调用前应先确保 Pod 已完全终止（通过 `wait_for_pod_terminated`），
-    /// 且 PVC 的 `pvc-protection` finalizer 已被移除（通过 `wait_for_pvc_removable`）。
-    async fn delete_workspace_pvc(
-        &self,
-        identifier: &str,
-        service_type: &ServiceType,
-    ) -> ContainerRuntimeResult<()>;
-
-    /// 等待 PVC 的 `pvc-protection` finalizer 被移除，使其可安全删除
-    ///
-    /// Pod 终止后，kubelet 卸载卷 → PVC controller 移除 finalizer，
-    /// 这个过程通常只需几秒，但 FUSE 卷可能因 unmount 缓慢而延迟。
-    /// 等待最多 15s，超时后仍允许调用方尝试删除（可能失败但不阻塞流程）。
-    async fn wait_for_pvc_removable(&self, pvc_name: &str) -> ContainerRuntimeResult<()>;
 }
 
 #[cfg(feature = "kubernetes")]
@@ -262,10 +245,6 @@ impl K8sPvcOps for KubernetesRuntime {
                 }
             }
         }
-
-        // 不等待 PVC Bound：WaitForFirstConsumer 存储类需要 Pod 调度后才会绑定 PVC
-        // 直接返回，让后续 Pod 创建触发 PVC 绑定
-        Ok(())
     }
 
     async fn wait_for_pvc_bound(&self, pvc_name: &str) -> ContainerRuntimeResult<()> {
@@ -294,91 +273,5 @@ impl K8sPvcOps for KubernetesRuntime {
             "PVC '{}' did not become Bound in time",
             pvc_name
         )))
-    }
-
-    async fn delete_workspace_pvc(
-        &self,
-        identifier: &str,
-        service_type: &ServiceType,
-    ) -> ContainerRuntimeResult<()> {
-        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-
-        match self
-            .pvcs()
-            .delete(&pvc_name, &DeleteParams::default())
-            .await
-        {
-            Ok(_) => {
-                info!("[K8S] PVC {} delete requested successfully", pvc_name);
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!("[K8S] PVC {} not found, already deleted", pvc_name);
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 409 => {
-                // PVC 仍有 finalizer（pvc-protection），删除请求已被 K8s 接受但会等待
-                // 这种情况不应发生（调用前应先等待 finalizer 移除），记录日志便于排查
-                info!(
-                    "[K8S] PVC {} has active finalizers (409 Conflict), delete will be deferred",
-                    pvc_name
-                );
-            }
-            Err(e) => {
-                warn!("[K8S] Failed to delete PVC '{}': {}", pvc_name, e);
-            }
-        }
-        Ok(())
-    }
-
-    async fn wait_for_pvc_removable(&self, pvc_name: &str) -> ContainerRuntimeResult<()> {
-        let timeout = std::time::Duration::from_secs(15);
-        let poll_interval = std::time::Duration::from_secs(1);
-        let start = std::time::Instant::now();
-
-        while start.elapsed() < timeout {
-            match self.pvcs().get(pvc_name).await {
-                Ok(pvc) => {
-                    let has_protection_finalizer = pvc
-                        .metadata
-                        .finalizers
-                        .as_ref()
-                        .map(|finalizers| {
-                            finalizers
-                                .iter()
-                                .any(|f| f == "kubernetes.io/pvc-protection")
-                        })
-                        .unwrap_or(false);
-
-                    if !has_protection_finalizer {
-                        info!(
-                            "[K8S] PVC {} protection finalizer removed ({:.1}s), safe to delete",
-                            pvc_name,
-                            start.elapsed().as_secs_f64()
-                        );
-                        return Ok(());
-                    }
-
-                    debug!(
-                        "[K8S] PVC {} still has pvc-protection finalizer, waiting ({:.0}s)...",
-                        pvc_name,
-                        start.elapsed().as_secs_f64()
-                    );
-                }
-                Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                    // PVC 已被自动删除（StorageClass 的 ReclaimPolicy=Delete 触发）
-                    info!("[K8S] PVC {} already deleted (404)", pvc_name);
-                    return Ok(());
-                }
-                Err(e) => {
-                    debug!("[K8S] Poll PVC {} returned {} (will retry)", pvc_name, e);
-                }
-            }
-            tokio::time::sleep(poll_interval).await;
-        }
-
-        warn!(
-            "[K8S] PVC {} pvc-protection finalizer not removed in 15s, will attempt delete anyway",
-            pvc_name
-        );
-        Ok(())
     }
 }
