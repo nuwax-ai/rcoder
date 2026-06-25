@@ -13,6 +13,12 @@ use tracing::{debug, info, warn};
 /// 根据服务类型选择合适的 Docker 镜像。
 /// 针对2种镜像的静态映射场景进行了优化，移除了不必要的缓存。
 /// 强制要求明确指定服务类型，不支持默认值。
+///
+/// # 配置兼容性
+///
+/// 支持老配置文件的兼容性：
+/// - 老配置中 services 的 key 可能是 `"rcoder"`，而不是 `"web-agent-runner"`
+/// - 本选择器会自动尝试两种 key 进行查找
 pub struct ImageSelector {
     /// 多镜像配置
     config: MultiImageConfig,
@@ -27,6 +33,31 @@ impl ImageSelector {
         debug!("created selector for: {}", platform);
 
         Self { config, platform }
+    }
+
+    /// 查找服务配置（支持老配置兼容）
+    ///
+    /// 支持两种 key 格式：
+    /// 1. 新格式：`"web-agent-runner"`, `"computer-agent-runner"`
+    /// 2. 老格式：`"rcoder"` (兼容 WebAgentRunner)
+    fn find_service_config(&self, service_type: &ServiceType) -> Option<&shared_types::ServiceImageConfig> {
+        // 1. 先尝试新的服务名称
+        let service_key = service_type.to_string();
+        if let Some(config) = self.config.services.get(&service_key) {
+            return Some(config);
+        }
+
+        // 2. 如果找不到，尝试老的服务名称
+        match service_type {
+            ServiceType::WebAgentRunner => {
+                // 兼容老配置中的 "rcoder" key
+                self.config.services.get("rcoder")
+            }
+            ServiceType::ComputerAgentRunner => {
+                // ComputerAgentRunner 没有老名称
+                None
+            }
+        }
     }
 
     /// 根据服务类型和项目配置选择镜像
@@ -61,6 +92,8 @@ impl ImageSelector {
     }
 
     /// 获取服务配置
+    ///
+    /// 支持老配置兼容性，会自动尝试新旧两种服务名称
     pub async fn get_service_config(
         &self,
         service_type: &ServiceType,
@@ -73,11 +106,10 @@ impl ImageSelector {
             )));
         }
 
-        // 从配置中获取服务配置
-        let service_key = service_type.to_string();
-        match self.config.services.get(&service_key) {
+        // 从配置中获取服务配置（支持老配置兼容）
+        match self.find_service_config(service_type) {
             Some(service_config) => {
-                info!("Get config succeeded: {}", service_key);
+                info!("Get config succeeded: {}", service_type);
                 Ok(service_config.clone())
             }
             None => Err(DockerError::ConfigurationError(format!(
@@ -88,6 +120,8 @@ impl ImageSelector {
     }
 
     /// 检查服务是否已启用和配置
+    ///
+    /// 支持老配置兼容性，会自动尝试新旧两种服务名称
     pub fn is_service_enabled(&self, service_type: &ServiceType) -> bool {
         let service_key = service_type.to_string();
         info!(
@@ -95,7 +129,8 @@ impl ImageSelector {
             service_type, service_key
         );
 
-        if let Some(service_config) = self.config.services.get(&service_key) {
+        // 使用 find_service_config 支持老配置兼容
+        if let Some(service_config) = self.find_service_config(service_type) {
             info!(
                 "[IMAGE_SELECTOR] Service found: enabled={}, arm64_image={:?}",
                 service_config.enabled, service_config.arm64_image
@@ -113,15 +148,15 @@ impl ImageSelector {
 
     /// 从服务特定配置选择镜像
     /// 简化版本：针对2种镜像的静态映射
+    ///
+    /// 支持老配置兼容性，会自动尝试新旧两种服务名称
     async fn select_service_image(
         &self,
         service_type: &ServiceType,
         _project_overrides: Option<&ProjectImageOverrides>,
     ) -> DockerResult<String> {
-        let service_key = service_type.to_string();
-
-        // 1. 优先使用服务特定配置
-        if let Some(service_config) = self.config.services.get(&service_key) {
+        // 1. 优先使用服务特定配置（支持老配置兼容）
+        if let Some(service_config) = self.find_service_config(service_type) {
             // 服务级通用镜像（最高优先级）
             if let Some(image) = &service_config.image {
                 debug!(" using image: {}", image);
@@ -149,7 +184,7 @@ impl ImageSelector {
         // 3. 配置错误：不应该发生，因为默认配置已经设置了镜像
         Err(DockerError::ConfigurationError(format!(
             "Service type '{}' has no available image config, please check the configuration file",
-            service_key
+            service_type
         )))
     }
 }
