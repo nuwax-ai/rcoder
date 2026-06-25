@@ -1,6 +1,5 @@
 //! HTTP 服务器启动与连接管理
 
-use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use tracing::{error, info};
@@ -39,8 +38,9 @@ pub async fn start_http_server(
                             let mut app_clone = app.clone();
 
                             tokio::spawn(async move {
-                                let mut http_builder = http1::Builder::new();
+                                let mut http_builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
                                 http_builder
+                                    .http1()
                                     .max_buf_size(128 * 1024)
                                     .preserve_header_case(true)
                                     .title_case_headers(false);
