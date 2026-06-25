@@ -833,22 +833,14 @@ impl ContainerRuntime for KubernetesRuntime {
             }
         }
 
-        // ── Step 3: Pod 已终止，等待 PVC finalizer 移除后删除 PVC ──
+        // ── Step 3: PVC 保留策略 ──
         //
-        // Pod 终止后，kubelet 会卸载 FUSE 卷并释放对 PVC 的引用，
-        // K8s PVC controller 随后移除 pvc-protection finalizer。
-        // 等待 finalizer 消失后再发起 PVC 删除，避免 PVC 卡 Terminating。
-        let step_start = std::time::Instant::now();
-        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-        self.wait_for_pvc_removable(&pvc_name).await?;
-        self.delete_workspace_pvc(identifier, service_type).await?;
+        // 不在 stop_container 时删除 PVC，原因：
+        // 1. pod_handler 检测到 Pending pod 会调用 stop + recreate，PVC 需要保留给新 pod 复用
+        // 2. 用户显式停止 workspace 时，PVC 应保留以便下次启动时数据不丢失
+        // 3. 孤立 PVC 的清理由启动时的 cleanup_all 负责（通过 label selector delete_collection）
         info!(
-            "[K8S] Step 3 (PVC cleanup) took {:.1}s",
-            step_start.elapsed().as_secs_f64()
-        );
-
-        info!(
-            "[K8S] Pod {} fully stopped, total time: {:.1}s",
+            "[K8S] Pod {} stopped (PVC preserved for reuse), total time: {:.1}s",
             pod_name,
             total_start.elapsed().as_secs_f64()
         );

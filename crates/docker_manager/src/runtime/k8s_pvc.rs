@@ -111,13 +111,24 @@ impl K8sPvcOps for KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
 
-        // Check if PVC already exists
-        let pvc_exists = match self.pvcs().get(&pvc_name).await {
-            Ok(_) => {
-                info!("[K8S] PVC {} already exists", pvc_name);
-                true
+        // Check if PVC already exists and its state
+        let pvc_status = match self.pvcs().get(&pvc_name).await {
+            Ok(pvc) => {
+                if pvc.metadata.deletion_timestamp.is_some() {
+                    // PVC is in Terminating state — it's being deleted.
+                    // We must wait for it to be fully removed before creating a new one,
+                    // otherwise the new pod will reference a PVC that's about to disappear.
+                    info!(
+                        "[K8S] PVC {} is in Terminating state, waiting for deletion to complete...",
+                        pvc_name
+                    );
+                    "terminating"
+                } else {
+                    info!("[K8S] PVC {} already exists and is active", pvc_name);
+                    "active"
+                }
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => false,
+            Err(kube::Error::Api(ae)) if ae.code == 404 => "not_found",
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "Failed to check PVC '{}': {}",
@@ -126,16 +137,61 @@ impl K8sPvcOps for KubernetesRuntime {
             }
         };
 
-        // If PVC already exists, return immediately
-        // WaitForFirstConsumer PVCs will be Bound once a Pod referencing them is scheduled
-        if pvc_exists {
-            info!(
-                "[K8S] PVC {} already exists, skipping Bound check (WaitForFirstConsumer)",
-                pvc_name
-            );
-            return Ok(());
+        match pvc_status {
+            "active" => {
+                // PVC exists and is not being deleted — reuse it.
+                // WaitForFirstConsumer PVCs will be Bound once a Pod referencing them is scheduled.
+                info!(
+                    "[K8S] PVC {} already exists, skipping Bound check (WaitForFirstConsumer)",
+                    pvc_name
+                );
+                return Ok(());
+            }
+            "terminating" => {
+                // PVC is being deleted — wait for it to be fully removed, then create a new one.
+                let wait_start = std::time::Instant::now();
+                let max_wait = std::time::Duration::from_secs(60);
+                loop {
+                    match self.pvcs().get(&pvc_name).await {
+                        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                            info!(
+                                "[K8S] PVC {} fully deleted after {:.1}s, will create new one",
+                                pvc_name,
+                                wait_start.elapsed().as_secs_f64()
+                            );
+                            break;
+                        }
+                        Ok(_) => {
+                            if wait_start.elapsed() > max_wait {
+                                // Force delete the PVC if it's stuck
+                                warn!(
+                                    "[K8S] PVC {} stuck in Terminating for {:.1}s, force deleting",
+                                    pvc_name,
+                                    wait_start.elapsed().as_secs_f64()
+                                );
+                                let dp = kube::api::DeleteParams {
+                                    grace_period_seconds: Some(0),
+                                    ..Default::default()
+                                };
+                                let _ = self.pvcs().delete(&pvc_name, &dp).await;
+                                // Wait a bit more for the API to reflect the deletion
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        Err(_) => {
+                            // On error, assume PVC is gone
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {
+                // "not_found" — PVC doesn't exist, will create below
+            }
         }
-        // If not found, create it (falls through to creation logic below)
+        // If not found or terminated, create it (falls through to creation logic below)
 
         let storage_size = storage_size.unwrap_or(DEFAULT_PVC_STORAGE_SIZE);
 
