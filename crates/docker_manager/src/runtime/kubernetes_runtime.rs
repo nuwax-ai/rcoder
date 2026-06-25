@@ -606,11 +606,10 @@ impl ContainerRuntime for KubernetesRuntime {
             ));
         }
 
-        // Query K8s API - 尝试多种标识查询（与 label 构建逻辑一致）
+        // Query K8s API - 使用标准 K8s 标签查询（与 build_standard_labels 一致）
         let search_queries = vec![
-            format!("pod_id={}", identifier),
-            format!("user_id={}", identifier),
-            format!("project_id={}", identifier),
+            format!("app.kubernetes.io/instance={}", identifier),
+            format!("rcoder.io/identifier={}", identifier),
         ];
 
         for query in search_queries {
