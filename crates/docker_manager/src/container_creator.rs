@@ -15,6 +15,7 @@
 //! 9. 返回容器信息
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, NetworkingConfig, PortBinding};
 use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
@@ -44,6 +45,7 @@ impl<'a> ContainerCreator<'a> {
     /// 由于 DockerContainerConfig 的 env_vars 字段会被 into_iter() 消耗，
     /// 需要提前提取所有需要的字段。
     pub async fn create(&self, config: DockerContainerConfig) -> DockerResult<DockerContainerInfo> {
+        let create_started = Instant::now();
         info!(
             "[CREATE] Starting container creation: project_id={}",
             config.project_id
@@ -84,7 +86,15 @@ impl<'a> ContainerCreator<'a> {
         self.cleanup_cache(container_identifier, &project_id).await;
 
         // 4. 确保镜像存在
+        let image_phase = Instant::now();
+        debug!("[CREATE] Ensuring image exists: {}", image);
         self.manager.ensure_image_exists(&image).await?;
+        info!(
+            "[CREATE] Image ready in {:?}: image={}, project_id={}",
+            image_phase.elapsed(),
+            image,
+            project_id
+        );
 
         // 5. 构建挂载点
         let mounts = build_mounts(&host_path, &container_path, &extra_mounts);
@@ -132,9 +142,22 @@ impl<'a> ContainerCreator<'a> {
         }
 
         // 10. 创建并启动容器
+        debug!(
+            "[CREATE] Docker API create_and_start: container_name={}, project_id={}, elapsed={:?}",
+            container_name,
+            project_id,
+            create_started.elapsed()
+        );
+        let docker_api_started = Instant::now();
         let container_id = self
             .docker_create_and_start(&container_name, container_body)
             .await?;
+        info!(
+            "[CREATE] Docker API create_and_start finished in {:?}: container_name={}, container_id={}",
+            docker_api_started.elapsed(),
+            container_name,
+            container_id
+        );
 
         // 11. 等待并健康检查
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -176,8 +199,11 @@ impl<'a> ContainerCreator<'a> {
             .await;
 
         info!(
-            "[CREATE] Container created and started: {} (ID: {}) - network {}",
-            container_name, container_id, container_network_name
+            "[CREATE] Container created and started: {} (ID: {}) - network {} (total {:?})",
+            container_name,
+            container_id,
+            container_network_name,
+            create_started.elapsed()
         );
 
         Ok(container_info)

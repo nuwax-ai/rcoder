@@ -9,7 +9,7 @@
 use crate::{DockerError, DockerResult};
 use reqwest::Client;
 use shared_types::HttpResult;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -63,7 +63,12 @@ impl HttpHealthChecker {
             health_path.unwrap_or("health").trim_start_matches('/')
         );
 
-        info!("🏥 [HEALTH] Health check started: {}", health_url);
+        info!(
+            "🏥 [HEALTH] Health check started: {} (max_attempts={}, timeout_per_attempt={}s)",
+            health_url, self.max_attempts, self.timeout_seconds
+        );
+
+        let health_started = Instant::now();
 
         for attempt in 0..self.max_attempts {
             match timeout(
@@ -79,16 +84,18 @@ impl HttpHealthChecker {
                             // 成功：code 为 "0000"
                             if let Some(health) = health_result.data {
                                 info!(
-                                    "✅ [HEALTH] Health check passed after {} attempts (status={}, http_ready={}, grpc_ready={})",
+                                    "✅ [HEALTH] Health check passed after {} attempts in {:?} (status={}, http_ready={}, grpc_ready={})",
                                     attempt + 1,
+                                    health_started.elapsed(),
                                     health.status,
                                     health.http_ready,
                                     health.grpc_ready
                                 );
                             } else {
                                 info!(
-                                    "✅ [HEALTH] Health check passed after {} attempts",
-                                    attempt + 1
+                                    "✅ [HEALTH] Health check passed after {} attempts in {:?}",
+                                    attempt + 1,
+                                    health_started.elapsed()
                                 );
                             }
                             return Ok(());
@@ -97,20 +104,22 @@ impl HttpHealthChecker {
                             // 服务未就绪：code 不是 "0000"
                             if let Some(health) = health_result.data {
                                 warn!(
-                                    "⏳ [HEALTH] Service not fully ready: code={}, message={}, status={}, http_ready={}, grpc_ready={}, waiting... ({}/{})",
+                                    "⏳ [HEALTH] Service not fully ready: code={}, message={}, status={}, http_ready={}, grpc_ready={}, elapsed={:?}, waiting... ({}/{})",
                                     health_result.code,
                                     health_result.message,
                                     health.status,
                                     health.http_ready,
                                     health.grpc_ready,
+                                    health_started.elapsed(),
                                     attempt + 1,
                                     self.max_attempts
                                 );
                             } else {
                                 warn!(
-                                    "⏳ [HEALTH] Service not fully ready: code={}, message={}, waiting... ({}/{})",
+                                    "⏳ [HEALTH] Service not fully ready: code={}, message={}, elapsed={:?}, waiting... ({}/{})",
                                     health_result.code,
                                     health_result.message,
+                                    health_started.elapsed(),
                                     attempt + 1,
                                     self.max_attempts
                                 );
@@ -151,12 +160,13 @@ impl HttpHealthChecker {
                 }
             }
 
-            // 每 10 次尝试输出一次 info 日志
-            if (attempt + 1) % 10 == 0 {
+            // 每 5 次尝试输出一次 info 进度日志
+            if (attempt + 1) % 5 == 0 {
                 info!(
-                    "⏳ [HEALTH] Still waiting for service to start... ({}/{})",
+                    "⏳ [HEALTH] Still waiting for service to start... ({}/{}), elapsed={:?}",
                     attempt + 1,
-                    self.max_attempts
+                    self.max_attempts,
+                    health_started.elapsed()
                 );
             }
 
@@ -164,8 +174,10 @@ impl HttpHealthChecker {
         }
 
         Err(DockerError::ContainerStartError(format!(
-            "Wait for service startup timeout: {} (attempted {} times)",
-            health_url, self.max_attempts
+            "Wait for service startup timeout: {} (attempted {} times, elapsed {:?})",
+            health_url,
+            self.max_attempts,
+            health_started.elapsed()
         )))
     }
 }

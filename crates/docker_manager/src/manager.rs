@@ -589,17 +589,27 @@ impl DockerManager {
 
     /// 确保镜像存在，如果不存在则拉取
     pub(crate) async fn ensure_image_exists(&self, image: &str) -> DockerResult<()> {
+        let inspect_started = std::time::Instant::now();
         debug!("Checking if image exists: {}", image);
 
         // 检查镜像是否存在
         match self.docker.inspect_image(image).await {
             Ok(_) => {
-                debug!("Image {} already exists", image);
+                debug!(
+                    "Image {} already exists (inspect {:?})",
+                    image,
+                    inspect_started.elapsed()
+                );
                 Ok(())
             }
             Err(_) => {
-                info!("Image {} not found, pulling...", image);
+                info!(
+                    "Image {} not found, pulling... (inspect {:?})",
+                    image,
+                    inspect_started.elapsed()
+                );
 
+                let pull_started = std::time::Instant::now();
                 let pull_options = CreateImageOptions {
                     from_image: Some(image.to_string()),
                     ..Default::default()
@@ -611,19 +621,24 @@ impl DockerManager {
                     match result {
                         Ok(progress) => {
                             if let Some(status) = progress.status {
-                                debug!("container status: {}", status);
+                                debug!("Image pull progress: {}", status);
                             }
                         }
                         Err(e) => {
                             return Err(DockerError::ImagePullError(format!(
-                                "Failed to pull image: {}",
+                                "Failed to pull image after {:?}: {}",
+                                pull_started.elapsed(),
                                 e
                             )));
                         }
                     }
                 }
 
-                info!("Image {} pull completed", image);
+                info!(
+                    "Image {} pull completed in {:?}",
+                    image,
+                    pull_started.elapsed()
+                );
                 Ok(())
             }
         }

@@ -23,6 +23,7 @@ use shared_types::error_codes::{ERR_CONTAINER_ERROR, ERR_WORKSPACE_ERROR};
 use shared_types::{ServiceResourceLimits, ServiceType};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// 容器创建参数
@@ -263,10 +264,24 @@ impl ComputerContainerManager {
 
         let params = params_builder.build();
 
+        let create_started = Instant::now();
+        info!(
+            "⏳ [COMPUTER_CONTAINER] runtime.create_container started: container_identifier={}, user_id={}, service_type={}",
+            container_identifier, options.user_id, options.service_type
+        );
+        debug!(
+            "🔧 [COMPUTER_CONTAINER] create_container params: container_identifier={}, pod_id={:?}, isolation_type={:?}, has_resource_limits={}",
+            container_identifier,
+            options.pod_id,
+            options.isolation_type,
+            options.resource_limits.is_some()
+        );
+
         let container_info = runtime.create_container(params).await.map_err(|e| {
             let error_msg = e.to_string();
             error!(
-                "[COMPUTER_CONTAINER] Failed to start container: {}",
+                "[COMPUTER_CONTAINER] runtime.create_container failed after {:?}: {}",
+                create_started.elapsed(),
                 error_msg
             );
 
@@ -277,8 +292,11 @@ impl ComputerContainerManager {
         })?;
 
         info!(
-            "🚀 [COMPUTER_CONTAINER] User container created successfully: user_id={}, container_id={}, ip={}",
-            options.user_id, container_info.container_id, container_info.container_ip
+            "🚀 [COMPUTER_CONTAINER] runtime.create_container finished in {:?}: user_id={}, container_id={}, ip={}",
+            create_started.elapsed(),
+            options.user_id,
+            container_info.container_id,
+            container_info.container_ip
         );
 
         Ok(container_info)

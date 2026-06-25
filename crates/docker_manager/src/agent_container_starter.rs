@@ -7,6 +7,7 @@ use chrono::Utc;
 use container_runtime_api::ContainerCreateParams;
 use shared_types::{ContainerBasicInfo, IsolationType, ServiceType};
 use std::str::FromStr;
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::manager::DockerManager;
@@ -43,6 +44,8 @@ impl<'a> AgentContainerStarter<'a> {
             space_id,
             storage_size: _, // Docker 模式忽略 storage_size，仅 K8s 模式使用
         } = params;
+
+        let start_phase = Instant::now();
 
         info!(
             "Starting Agent container: project_id={:?}, user_id={:?}, type={:?}, host_path={}, pod_id={:?}, isolation_type={:?}",
@@ -574,7 +577,20 @@ impl<'a> AgentContainerStarter<'a> {
             .build()
             .map_err(|e| DockerError::ContainerCreationError(e.to_string()))?;
 
+        let config_build_elapsed = start_phase.elapsed();
+        info!(
+            "[DOCKER_MGR] create_container starting: container_id={}, service_type={:?}, image={}, config_build_elapsed={:?}",
+            container_id, service_type, config.image, config_build_elapsed
+        );
+
+        let docker_create_started = Instant::now();
         self.manager.create_container(config).await?;
+        info!(
+            "[DOCKER_MGR] Docker create_container finished in {:?} (total {:?}): container_id={}",
+            docker_create_started.elapsed(),
+            start_phase.elapsed(),
+            container_id
+        );
 
         // 🆕 更新容器映射中的 user_id 和 service_type
         if let Some(mut info) = self.manager.containers.get(&container_id).await {
@@ -613,16 +629,31 @@ impl<'a> AgentContainerStarter<'a> {
             })?;
 
         // 健康检查 - 如果失败则回滚容器
+        info!(
+            "[DOCKER_MGR] Health check starting: container_id={}, service_url={}, elapsed_since_start={:?}",
+            container_id,
+            info.service_url,
+            start_phase.elapsed()
+        );
+        let health_started = Instant::now();
         match crate::health::wait_for_service_ready(&info.service_url).await {
             Ok(_) => {
-                info!("Agent container started: {}", info.service_url);
+                info!(
+                    "Agent container started: {} (health {:?}, total {:?})",
+                    info.service_url,
+                    health_started.elapsed(),
+                    start_phase.elapsed()
+                );
                 Ok(info)
             }
             Err(e) => {
                 // 健康检查失败，回滚：停止并删除孤儿容器
                 warn!(
-                    "[DOCKER_MGR] Health check failed for container {}: {}. Rolling back...",
-                    container_id, e
+                    "[DOCKER_MGR] Health check failed for container {} after {:?} (total {:?}): {}. Rolling back...",
+                    container_id,
+                    health_started.elapsed(),
+                    start_phase.elapsed(),
+                    e
                 );
 
                 // 尝试清理容器（忽略清理过程中的错误）

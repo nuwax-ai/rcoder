@@ -1182,9 +1182,15 @@ pub async fn pod_ensure(
     // 3. 获取或创建容器（带重试机制 + 标记）
     let (container_info, created) = if need_create {
         // 🆕 设置创建标记，防止并发请求重复创建
+        let create_started = Instant::now();
         state
             .pod_creating
-            .insert(container_identifier.clone(), Instant::now());
+            .insert(container_identifier.clone(), create_started);
+
+        info!(
+            "🔒 [POD_ENSURE] Creation marker set: container_identifier={}, user_id={}, project_id={}, max_attempts=3",
+            container_identifier, request.user_id, request.project_id
+        );
 
         // 创建新容器，最多重试 3 次
         let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
@@ -1199,6 +1205,15 @@ pub async fn pod_ensure(
         let max_attempts = 3;
 
         for attempt in 1..=max_attempts {
+            let attempt_started = Instant::now();
+            info!(
+                "🏗️ [POD_ENSURE] Container creation attempt {}/{} started: container_identifier={}, elapsed_since_marker={:?}",
+                attempt,
+                max_attempts,
+                container_identifier,
+                create_started.elapsed()
+            );
+
             let options = ContainerCreateOptions {
                 user_id: request.user_id.clone(),
                 project_id: request.project_id.clone(),
@@ -1216,17 +1231,14 @@ pub async fn pod_ensure(
             .await
             {
                 Ok(info) => {
-                    if attempt > 1 {
-                        info!(
-                            "✅ [POD_ENSURE] Container created successfully (attempt {}): container_id={}",
-                            attempt, info.container_id
-                        );
-                    } else {
-                        info!(
-                            "✅ [POD_ENSURE] Container created successfully: container_id={}",
-                            info.container_id
-                        );
-                    }
+                    info!(
+                        "✅ [POD_ENSURE] Container created successfully (attempt {}): container_id={}, ip={}, attempt_elapsed={:?}, total_elapsed={:?}",
+                        attempt,
+                        info.container_id,
+                        info.container_ip,
+                        attempt_started.elapsed(),
+                        create_started.elapsed()
+                    );
                     result = Some(info);
                     break;
                 }
@@ -1234,12 +1246,15 @@ pub async fn pod_ensure(
                     last_error = Some(e);
                     if attempt < max_attempts {
                         warn!(
-                            "⚠️ [POD_ENSURE] Container creation failed (attempt {}), will retry: {}",
+                            "⚠️ [POD_ENSURE] Container creation failed (attempt {}/{}), will retry: error={}, attempt_elapsed={:?}, total_elapsed={:?}",
                             attempt,
+                            max_attempts,
                             last_error
                                 .as_ref()
                                 .map(|e| e.to_string())
-                                .unwrap_or_else(|| "Unknown error".to_string())
+                                .unwrap_or_else(|| "Unknown error".to_string()),
+                            attempt_started.elapsed(),
+                            create_started.elapsed()
                         );
                         // 等待一段时间后重试（指数退避）
                         tokio::time::sleep(tokio::time::Duration::from_millis(
@@ -1248,8 +1263,13 @@ pub async fn pod_ensure(
                         .await;
                     } else {
                         error!(
-                            "[POD_ENSURE] Container creation failed (already retry {})",
-                            max_attempts
+                            "[POD_ENSURE] Container creation failed after {} attempts: error={}, total_elapsed={:?}",
+                            max_attempts,
+                            last_error
+                                .as_ref()
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "Unknown error".to_string()),
+                            create_started.elapsed()
                         );
                     }
                 }
@@ -1259,6 +1279,11 @@ pub async fn pod_ensure(
         // 返回结果或错误
         match result {
             Some(info) => {
+                debug!(
+                    "🔓 [POD_ENSURE] Clearing creation marker after success: container_identifier={}, total_elapsed={:?}",
+                    container_identifier,
+                    create_started.elapsed()
+                );
                 // 创建成功，清除标记
                 state.pod_creating.remove(&container_identifier);
                 // 🚀 发送容器创建完成通知（唤醒等待方）
@@ -1266,6 +1291,11 @@ pub async fn pod_ensure(
                 (info, true)
             }
             None => {
+                debug!(
+                    "🔓 [POD_ENSURE] Clearing creation marker after failure: container_identifier={}, total_elapsed={:?}",
+                    container_identifier,
+                    create_started.elapsed()
+                );
                 // 创建失败，也要清除标记
                 state.pod_creating.remove(&container_identifier);
                 // 直接返回原始错误，保留具体的错误信息
