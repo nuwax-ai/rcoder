@@ -1083,48 +1083,16 @@ impl ContainerRuntime for KubernetesRuntime {
             }
         }
 
-        // ── Step 4: 等待 PVC finalizer 移除后批量删除 PVC ──
-        let pvc_lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
-        let pvcs_to_clean: Vec<String> = self
-            .pvcs()
-            .list(&pvc_lp)
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::ConnectionError(format!(
-                    "Failed to list PVCs for cleanup: {}",
-                    e
-                ))
-            })?
-            .items
-            .iter()
-            .filter_map(|pvc| pvc.metadata.name.clone())
-            .collect();
-
+        // ── Step 4: PVC 清理策略 ──
+        //
+        // 不在 cleanup_all 中主动删除 PVC，原因：
+        // 1. Pod 删除时 K8s PropagationPolicy::Foreground 会级联清理关联的 PVC
+        // 2. 主动删除正在被 pod 使用的 PVC 会导致 PVC 卡在 Terminating 状态（pvc-protection finalizer）
+        // 3. 多副本部署时，cleanup_all 会误删其他 rcoder 实例正在使用的 PVC
+        // 4. Terminating PVC 会导致后续 create_container 失败（409 重试循环）
         info!(
-            "[K8S CLEANUP] Found {} managed PVCs to clean",
-            pvcs_to_clean.len()
+            "[K8S CLEANUP] PVC cleanup skipped — PVCs are cleaned up via K8s cascading deletion when pods are removed"
         );
-
-        for pvc_name in &pvcs_to_clean {
-            if let Err(e) = self.wait_for_pvc_removable(pvc_name).await {
-                tracing::warn!(
-                    "[K8S CLEANUP] PVC {} not removable: {} (force deleting)",
-                    pvc_name,
-                    e
-                );
-            }
-        }
-
-        match self
-            .pvcs()
-            .delete_collection(&DeleteParams::default(), &pvc_lp)
-            .await
-        {
-            Ok(_) => info!("[K8S CLEANUP] PVC delete_collection completed"),
-            Err(e) => {
-                tracing::warn!("[K8S CLEANUP] PVC delete_collection failed: {}", e);
-            }
-        }
 
         // 清理缓存
         self.pod_cache.write().await.clear();
