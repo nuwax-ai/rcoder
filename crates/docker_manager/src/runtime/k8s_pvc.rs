@@ -225,17 +225,43 @@ impl K8sPvcOps for KubernetesRuntime {
             status: None,
         };
 
-        self.pvcs()
-            .create(&PostParams::default(), &pvc)
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::ContainerCreationError(format!(
-                    "Failed to create PVC '{}': {}",
-                    pvc_name, e
-                ))
-            })?;
-
-        info!("[K8S] PVC {} created", pvc_name);
+        // Retry create up to 5 times to handle race condition:
+        // After force-delete, the PVC may still exist in "Deleting" state briefly.
+        // K8s returns 409 AlreadyExists in this case.
+        let create_start = std::time::Instant::now();
+        let max_create_wait = std::time::Duration::from_secs(30);
+        loop {
+            match self.pvcs().create(&PostParams::default(), &pvc).await {
+                Ok(pvc_created) => {
+                    info!(
+                        "[K8S] PVC {} created successfully",
+                        pvc_created.metadata.name.as_deref().unwrap_or("unknown")
+                    );
+                    return Ok(());
+                }
+                Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                    if create_start.elapsed() > max_create_wait {
+                        return Err(ContainerRuntimeError::ContainerCreationError(format!(
+                            "Failed to create PVC '{}': still exists after {:.1}s of retries",
+                            pvc_name,
+                            create_start.elapsed().as_secs_f64()
+                        )));
+                    }
+                    warn!(
+                        "[K8S] PVC {} still being deleted (409), retrying in 2s... (elapsed {:.1}s)",
+                        pvc_name,
+                        create_start.elapsed().as_secs_f64()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(e) => {
+                    return Err(ContainerRuntimeError::ContainerCreationError(format!(
+                        "Failed to create PVC '{}': {}",
+                        pvc_name, e
+                    )));
+                }
+            }
+        }
 
         // 不等待 PVC Bound：WaitForFirstConsumer 存储类需要 Pod 调度后才会绑定 PVC
         // 直接返回，让后续 Pod 创建触发 PVC 绑定
