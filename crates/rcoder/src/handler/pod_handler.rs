@@ -2509,6 +2509,19 @@ pub async fn pod_vnc_status(
         }));
     }
 
+    // 5.1 🎯 确保 VNC 代理路由已注册
+    // 解决竞态条件：VNC 服务已就绪，但代理路由尚未注册
+    // 在 handle_computer_chat 时会注册路由，但 VNC 状态检查可能在 chat 之前调用
+    if let Some(ref pingora_service) = state.pingora_service
+        && let Some(uid) = user_id
+    {
+        pingora_service.add_vnc_backend(uid, &result.container_ip);
+        debug!(
+            "🔗 [POD_VNC_STATUS] Ensured VNC backend registered: user_id={} -> {}",
+            uid, result.container_ip
+        );
+    }
+
     // 6. 构建 gRPC 地址
     // 直接使用步骤 3 find_container 获取的 container_ip，避免二次缓存查找失败
     // （find_container 实时查询 Docker API，get_container_info_by_identifier 只查内存缓存，

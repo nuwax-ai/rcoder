@@ -145,13 +145,27 @@ pub async fn get_vnc_status(
             .as_ref()
             .map(|t| t.port_check_timeout_millis)
             .unwrap_or(500);
+
+        // 1. 检查端口是否可达
         let novnc_port_ready = check_port_available(6080, port_check_timeout).await;
 
-        let vnc_ready = file_exists;
-        let novnc_ready = file_exists && novnc_port_ready;
+        // 2. 🎯 检查 WebSocket 代理是否真正可用（比仅检查端口更可靠）
+        // 端口可达 ≠ WebSocket 代理可用，需要验证 /websockify 路径返回 101
+        let websocket_ready = if novnc_port_ready {
+            super::utils::check_novnc_websocket_ready(6080, port_check_timeout).await
+        } else {
+            false
+        };
+
+        // 3. 综合判断：文件存在 + 端口可达 + WebSocket 可用
+        let vnc_ready = file_exists && novnc_port_ready && websocket_ready;
+        let novnc_ready = file_exists && novnc_port_ready && websocket_ready;
 
         let message = if vnc_ready && novnc_ready {
             shared_types_i18n::get_i18n_message("grpc.status.vnc_ready", locale)
+        } else if file_exists && novnc_port_ready && !websocket_ready {
+            // 端口可达但 WebSocket 不可用，代理可能还在启动
+            shared_types_i18n::get_i18n_message("grpc.status.vnc_port_unreachable", locale)
         } else if file_exists && !novnc_port_ready {
             shared_types_i18n::get_i18n_message("grpc.status.vnc_port_unreachable", locale)
         } else {
@@ -168,8 +182,8 @@ pub async fn get_vnc_status(
         };
 
         info!(
-            "✅ [GET_VNC_STATUS] Returning status: vnc_ready={}, novnc_ready={}, message={}, uptime={}s",
-            response.vnc_ready, response.novnc_ready, response.message, response.uptime_seconds
+            "✅ [GET_VNC_STATUS] Returning status: vnc_ready={}, novnc_ready={}, port_ready={}, websocket_ready={}, message={}, uptime={}s",
+            response.vnc_ready, response.novnc_ready, novnc_port_ready, websocket_ready, response.message, response.uptime_seconds
         );
 
         Ok(Response::new(response))
