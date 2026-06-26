@@ -38,6 +38,9 @@ RUN apt-get update && apt-get install -y \
     # protobuf 编译器（gRPC 项目必需）
     protobuf-compiler \
     libprotobuf-dev \
+    # 其他工具
+    vim \
+    htop \
     && rm -rf /var/lib/apt/lists/* \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone

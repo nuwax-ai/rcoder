@@ -22,7 +22,7 @@ pipelines:
 # We recommend to skip image building during development (devspace dev) as much as possible
 images:
   app:
-    image: rust:1.95
+    image: dev-master-rcoder-devspace:latest
     dockerfile: Dockerfile
     context: ./
 
@@ -38,7 +38,7 @@ deployments:
 dev:
   app:
     # Search for the container that runs this image
-    imageSelector: rust:1.95
+    imageSelector: dev-master-rcoder-devspace:latest
     # Sync files between the local filesystem and the development container
     sync:
       - path: .:/app
@@ -49,7 +49,6 @@ dev:
           - node_modules/
           - .idea/
           - .vscode/
-          - logs/
           - project_workspace/
           - docker/
           - k8s/

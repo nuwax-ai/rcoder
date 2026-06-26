@@ -17,7 +17,7 @@ spec:
       serviceAccountName: rcoder-sa
       containers:
         - name: rcoder
-          image: rust:1.95
+          image: dev-master-rcoder-devspace:latest
           imagePullPolicy: IfNotPresent
           command: ["/bin/bash", "/app/devspace_start.sh"]
           ports:
