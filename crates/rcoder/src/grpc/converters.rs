@@ -6,7 +6,7 @@ use shared_types::grpc::{
     Attachment as GrpcAttachment, AttachmentSource as GrpcAttachmentSource,
     AudioAttachment as GrpcAudioAttachment, AutoReloadConfig as GrpcAutoReloadConfig, Base64Data,
     ChatAgentConfig as GrpcChatAgentConfig, ChatAgentServerConfig as GrpcChatAgentServerConfig,
-    ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
+    ChatContextServerConfig as GrpcChatContextServerConfig,
     ChatResponse as GrpcChatResponse, DocumentAttachment as GrpcDocumentAttachment,
     ImageAttachment as GrpcImageAttachment, ImageDimensions as GrpcImageDimensions,
     ModelEnvBinding as GrpcModelEnvBinding, ModelEnvBindingSource as GrpcModelEnvBindingSource,
@@ -18,48 +18,6 @@ use shared_types::{
     AutoReloadConfig, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig,
     ModelEnvBinding, ModelEnvBindingSource,
 };
-
-/// 将内部 ChatRequest 转换为 gRPC ChatRequest
-///
-/// 注意：此函数目前未被使用，chat_client.rs 直接构建 GrpcChatRequest。
-/// 保留以备将来使用或重构。
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)] // 直接映射 ChatRequest 字段
-pub fn to_grpc_chat_request(
-    project_id: String,
-    session_id: String,
-    prompt: String,
-    attachments: Vec<Attachment>,
-    data_source_attachments: Vec<String>,
-    model_config: Option<ModelProviderConfig>,
-    request_id: Option<String>,
-    // 新增参数 (v2)
-    system_prompt: Option<String>,
-    user_prompt: Option<String>,
-    agent_config: Option<ChatAgentConfig>,
-    service_type: Option<shared_types::ServiceType>,
-    user_id: Option<String>,        // 新增：用于 ComputerAgentRunner 模式
-    is_devcomputer: bool,           // 🆕 是否是 DevComputer 接口请求
-    agent_work_dir: Option<String>, // 🆕 自定义工作目录标识符
-) -> GrpcChatRequest {
-    GrpcChatRequest {
-        project_id,
-        session_id,
-        prompt,
-        model_config: model_config.map(to_grpc_model_config),
-        attachments: attachments.into_iter().map(to_grpc_attachment).collect(),
-        request_id,
-        data_source_attachments,
-        // 新增字段 (v2)
-        system_prompt,
-        user_prompt,
-        agent_config: agent_config.map(to_grpc_chat_agent_config),
-        service_type: service_type.map(|st| st.to_string()),
-        user_id,        // 传递 user_id
-        is_devcomputer, // 🆕 传递 is_devcomputer
-        agent_work_dir, // 🆕 传递 agent_work_dir
-    }
-}
 
 /// 将 ModelProviderConfig 转换为 gRPC 格式
 pub fn to_grpc_model_config(config: ModelProviderConfig) -> GrpcModelProviderConfig {

@@ -224,17 +224,18 @@ pub async fn install_agent(
                     };
                 if !platforms.is_empty() {
                     let force = meta.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-                    return installer::url_installer::install_with_version_check(
-                        &state.lock_manager,
-                        &state.registry,
-                        &state.path_manager,
-                        &agent_id,
-                        &command,
-                        &meta_args,
-                        ver,
-                        &platforms,
+                    let params = installer::url_installer::VersionCheckInstallParams {
+                        lock_manager: &state.lock_manager,
+                        registry: &state.registry,
+                        path_manager: &state.path_manager,
+                        agent_id: &agent_id,
+                        command: &command,
+                        args: &meta_args,
+                        version: ver,
+                        platforms: &platforms,
                         force,
-                    )
+                    };
+                    return installer::url_installer::install_with_version_check(params)
                     .await
                     .map(|r| {
                         let shared = conversion::install_response_to_shared(&r);
@@ -336,18 +337,18 @@ pub async fn install_from_url(
     State(state): State<AgentMgmtHttpState>,
     Json(req): Json<shared_types::InstallFromUrlRequest>,
 ) -> Response {
-    match installer::url_installer::install_with_version_check(
-        &state.lock_manager,
-        &state.registry,
-        &state.path_manager,
-        &req.agent.agent_id,
-        &req.agent.command,
-        &req.agent.args,
-        req.agent.version.as_deref().unwrap_or(""),
-        &req.platforms,
-        req.force,
-    )
-    .await
+    let params = installer::url_installer::VersionCheckInstallParams {
+        lock_manager: &state.lock_manager,
+        registry: &state.registry,
+        path_manager: &state.path_manager,
+        agent_id: &req.agent.agent_id,
+        command: &req.agent.command,
+        args: &req.agent.args,
+        version: req.agent.version.as_deref().unwrap_or(""),
+        platforms: &req.platforms,
+        force: req.force,
+    };
+    match installer::url_installer::install_with_version_check(params).await
     {
         Ok(r) => {
             let shared = conversion::install_response_to_shared(&r);

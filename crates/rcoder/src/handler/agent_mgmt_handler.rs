@@ -219,9 +219,8 @@ async fn resolve_container_target(
 fn build_ctx(state: &Arc<AppState>) -> AgentMgmtForwardCtx {
     AgentMgmtForwardCtx::from_state(
         state.grpc_pool.clone(),
-        state.runtime.clone(),
-        state.container_prefix_rcoder.clone(),
-        state.container_prefix_computer.clone(),
+        state.config.app_manager.namespace.clone(),
+        state.cluster_domain.clone(),
         shared_types::current_request_locale(),
     )
 }

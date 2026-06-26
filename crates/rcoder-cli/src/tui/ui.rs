@@ -32,22 +32,36 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// TUI 渲染参数
+///
+/// 封装了渲染 TUI 界面所需的所有参数，
+/// 避免函数参数过多。
+pub struct DrawParams<'a> {
+    /// 聊天状态
+    pub chat: &'a ChatState,
+    /// 输入框组件
+    pub composer: &'a Composer,
+    /// 待发送的消息
+    pub pending_prompt: Option<&'a str>,
+    /// 权限弹窗覆盖层
+    pub permission_overlay: Option<&'a PermissionOverlay>,
+    /// 是否使用 Markdown 渲染
+    pub use_markdown: bool,
+    /// 项目 ID
+    pub project_id: &'a str,
+    /// 会话 ID
+    pub session_id: &'a str,
+}
+
 /// 渲染整个 TUI 界面
 ///
 /// 接收 App 的各个独立字段，避免 `self.terminal` 与 `self` 的借用冲突。
-#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
-    chat: &ChatState,
-    composer: &Composer,
-    pending_prompt: Option<&str>,
-    permission_overlay: Option<&PermissionOverlay>,
-    use_markdown: bool,
-    project_id: &str,
-    session_id: &str,
+    params: DrawParams<'_>,
 ) {
     let area = frame.area();
-    let composer_height = composer.display_height();
+    let composer_height = params.composer.display_height();
 
     let chunks = Layout::vertical([
         Constraint::Length(1),               // StatusBar
@@ -56,12 +70,12 @@ pub fn draw(
     ])
     .split(area);
 
-    draw_status_bar(frame, chat, project_id, session_id, chunks[0]);
-    draw_chat_area(frame, chat, use_markdown, chunks[1]);
-    draw_composer(frame, chat, composer, pending_prompt, chunks[2]);
+    draw_status_bar(frame, params.chat, params.project_id, params.session_id, chunks[0]);
+    draw_chat_area(frame, params.chat, params.use_markdown, chunks[1]);
+    draw_composer(frame, params.chat, params.composer, params.pending_prompt, chunks[2]);
 
     // 权限弹窗覆盖层
-    if let Some(overlay) = permission_overlay {
+    if let Some(overlay) = params.permission_overlay {
         draw_permission_overlay(frame, overlay, area);
     }
 }

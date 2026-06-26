@@ -13,34 +13,55 @@ use std::sync::Arc;
 use tonic::Status;
 use tracing::{debug, error, info};
 
+/// gRPC Chat 请求参数
+///
+/// 封装了发送 Chat 请求到 agent_runner 所需的所有参数，
+/// 避免函数参数过多，同时支持不同场景的扩展。
+pub struct GrpcChatParams {
+    /// 项目 ID
+    pub project_id: String,
+    /// 会话 ID（可选）
+    pub session_id: Option<String>,
+    /// 用户提示
+    pub prompt: String,
+    /// 附件列表
+    pub attachments: Vec<shared_types::Attachment>,
+    /// 数据源附件列表
+    pub data_source_attachments: Vec<String>,
+    /// 模型配置
+    pub model_config: Option<shared_types::ModelProviderConfig>,
+    /// 请求 ID
+    pub request_id: Option<String>,
+    /// 请求超时时间
+    pub request_timeout: Option<std::time::Duration>,
+    /// 系统提示（v2）
+    pub system_prompt: Option<String>,
+    /// 用户提示（v2）
+    pub user_prompt: Option<String>,
+    /// Agent 配置
+    pub agent_config: Option<ChatAgentConfig>,
+    /// 服务类型
+    pub service_type: Option<shared_types::ServiceType>,
+    /// 用户 ID（用于 ComputerAgentRunner 模式）
+    pub user_id: Option<String>,
+    /// 是否是 DevComputer 接口请求
+    pub is_devcomputer: bool,
+    /// 自定义工作目录标识符
+    pub agent_work_dir: Option<String>,
+}
+
 /// 通过 gRPC 发送 Chat 请求到 agent_runner (使用连接池)
 ///
 /// 返回 `Result<GrpcChatResponse, GrpcError>`，其中 `GrpcError` 包含
 /// 分类后的错误信息，便于调用方判断是否应该重试。
-#[allow(clippy::too_many_arguments)] // 直接映射 ChatRequest 字段，参数无法合并
 pub async fn grpc_chat_with_pool(
     pool: &Arc<GrpcChannelPool>,
     grpc_addr: &str,
-    project_id: String,
-    session_id: Option<String>,
-    prompt: String,
-    attachments: Vec<shared_types::Attachment>,
-    data_source_attachments: Vec<String>,
-    model_config: Option<shared_types::ModelProviderConfig>,
-    request_id: Option<String>,
-    request_timeout: Option<std::time::Duration>,
-    // 新增参数 (v2)
-    system_prompt: Option<String>,
-    user_prompt: Option<String>,
-    agent_config: Option<ChatAgentConfig>,
-    service_type: Option<shared_types::ServiceType>,
-    user_id: Option<String>,        // 新增：用于 ComputerAgentRunner 模式
-    is_devcomputer: bool,           // 🆕 是否是 DevComputer 接口请求
-    agent_work_dir: Option<String>, // 🆕 自定义工作目录标识符
+    params: GrpcChatParams,
 ) -> Result<GrpcChatResponse, GrpcError> {
     info!(
         " [gRPC_CHAT] Sending Chat request (connection pool): addr={}, project_id={}, is_devcomputer={}",
-        grpc_addr, project_id, is_devcomputer
+        grpc_addr, params.project_id, params.is_devcomputer
     );
 
     // 使用连接池获取客户端
@@ -52,24 +73,25 @@ pub async fn grpc_chat_with_pool(
 
     // 构建 gRPC 请求
     let grpc_request = GrpcChatRequest {
-        project_id,
-        session_id: session_id.unwrap_or_default(),
-        prompt,
-        model_config: model_config.map(super::converters::to_grpc_model_config),
-        attachments: attachments
+        project_id: params.project_id,
+        session_id: params.session_id.unwrap_or_default(),
+        prompt: params.prompt,
+        model_config: params.model_config.map(super::converters::to_grpc_model_config),
+        attachments: params
+            .attachments
             .into_iter()
             .map(super::converters::to_grpc_attachment)
             .collect(),
-        request_id,
-        data_source_attachments,
+        request_id: params.request_id,
+        data_source_attachments: params.data_source_attachments,
         // 新增字段 (v2)
-        system_prompt,
-        user_prompt,
-        agent_config: agent_config.map(super::converters::to_grpc_chat_agent_config),
-        service_type: service_type.map(|st| st.to_string()),
-        user_id,        // 传递 user_id
-        is_devcomputer, // 🆕 传递 is_devcomputer
-        agent_work_dir, // 🆕 传递 agent_work_dir
+        system_prompt: params.system_prompt,
+        user_prompt: params.user_prompt,
+        agent_config: params.agent_config.map(super::converters::to_grpc_chat_agent_config),
+        service_type: params.service_type.map(|st| st.to_string()),
+        user_id: params.user_id,        // 传递 user_id
+        is_devcomputer: params.is_devcomputer, // 🆕 传递 is_devcomputer
+        agent_work_dir: params.agent_work_dir, // 🆕 传递 agent_work_dir
     };
 
     debug!("[gRPC_CHAT] sendrequest: {:?}", grpc_request);
@@ -79,7 +101,7 @@ pub async fn grpc_chat_with_pool(
     let mut request = super::new_request_with_locale(grpc_request, locale);
 
     // ✅ 使用 Tonic 原生 API 设置请求超时
-    if let Some(timeout) = request_timeout {
+    if let Some(timeout) = params.request_timeout {
         request.set_timeout(timeout);
         debug!(" [gRPC_CHAT] request timeout: {:?}", timeout);
     }

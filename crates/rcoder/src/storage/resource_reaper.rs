@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use shared_types::{GRPC_DEFAULT_PORT, ServiceType};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use container_runtime_api::ContainerRuntime;
 
@@ -35,6 +35,10 @@ pub struct CleanupRequest {
     pub service_type: ServiceType,
     /// 容器 IP（gRPC 连接池清理用）
     pub container_ip: String,
+    /// K8s namespace（用于构建 K8s Service FQDN）
+    pub namespace: String,
+    /// K8s 集群域名
+    pub cluster_domain: String,
     /// 关联的 project_id 列表（日志用）
     pub project_ids: Vec<String>,
 }
@@ -49,6 +53,8 @@ pub struct ResourceReaper {
     grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
     pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     docker_manager: Option<Arc<docker_manager::DockerManager>>,
+    /// 是否是 K8s 运行时
+    is_kubernetes: bool,
 }
 
 impl ResourceReaper {
@@ -59,12 +65,16 @@ impl ResourceReaper {
         pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
         docker_manager: Option<Arc<docker_manager::DockerManager>>,
     ) -> Self {
+        // 判断是否是 K8s 运行时（通过 features flag）
+        let is_kubernetes = shared_types::is_kubernetes_runtime();
+
         Self {
             rx,
             runtime,
             grpc_pool,
             pingora,
             docker_manager,
+            is_kubernetes,
         }
     }
 
@@ -117,10 +127,23 @@ impl ResourceReaper {
         }
 
         // 2. 清理 gRPC 连接
-        if !req.container_ip.is_empty() {
-            let addr = format!("{}:{}", req.container_ip, GRPC_DEFAULT_PORT);
-            self.grpc_pool.remove(&addr).await;
-        }
+        let grpc_addr = if self.is_kubernetes {
+            // K8s 环境：使用 K8s Service FQDN
+            let svc_fqdn = crate::handler::utils::build_k8s_service_fqdn(
+                &req.container_name,
+                &req.namespace,
+                &req.cluster_domain,
+            );
+            format!("{}:{}", svc_fqdn, GRPC_DEFAULT_PORT)
+        } else {
+            // Docker 环境：使用容器 IP
+            if req.container_ip.is_empty() {
+                debug!("[REAPER] Container IP is empty, skipping gRPC cleanup");
+                return;
+            }
+            format!("{}:{}", req.container_ip, GRPC_DEFAULT_PORT)
+        };
+        self.grpc_pool.remove(&grpc_addr).await;
 
         // 3. 清理 DockerManager 缓存（Docker 模式）
         if let Some(ref dm) = self.docker_manager {

@@ -31,8 +31,7 @@ use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerMa
 use docker_manager::ContainerBasicInfo;
 
 use super::utils::{
-    I18nJsonOrQuery, build_computer_workspace_path, extract_grpc_addr_with_port,
-    get_locale_from_headers, get_realtime_container_ip, project_dir,
+    I18nJsonOrQuery, build_computer_workspace_path, get_locale_from_headers, project_dir,
 };
 
 /// 处理 Computer Agent 聊天请求
@@ -553,10 +552,16 @@ pub(crate) async fn handle_computer_chat_internal(
 
     // 6. 注册 VNC 后端到 Pingora（用于 WebSocket 代理）
     if let Some(ref pingora_service) = state.pingora_service {
-        pingora_service.add_vnc_backend(&user_id, &container_info.container_ip);
+        // 使用 K8s Service FQDN 而不是 Pod IP
+        let svc_fqdn = super::utils::build_k8s_service_fqdn(
+            &container_info.container_name,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
+        );
+        pingora_service.add_vnc_backend(&user_id, &svc_fqdn);
         debug!(
             "🔗 [COMPUTER_CHAT] VNC backend registered: user_id={} -> {}",
-            user_id, container_info.container_ip
+            user_id, svc_fqdn
         );
     }
 
@@ -564,21 +569,17 @@ pub(crate) async fn handle_computer_chat_internal(
     // 在转发请求前，主动查询 Agent 状态，确保状态是最新的。
     // 这有助于在容器重启后，确认 Agent 是否真正处于空闲状态。
     {
-        // 💫 使用实时 IP 获取，避免 restart 后 IP 过期的问题
+        // 使用 K8s Service FQDN 而不是 Pod IP
         let grpc_addr_result = async {
-            let container_ip = get_realtime_container_ip(
-                state.runtime(),
+            let svc_fqdn = super::utils::build_k8s_service_fqdn(
                 &container_info.container_name,
-                &container_info.container_ip,
-                &state.container_prefix_rcoder,
-                &state.container_prefix_computer,
-            )
-            .await
-            .map_err(|e| format!("IP resolution error: {}", e))?;
+                &state.config.app_manager.namespace,
+                &state.cluster_domain,
+            );
 
             Ok::<_, String>(format!(
                 "{}:{}",
-                container_ip,
+                svc_fqdn,
                 shared_types::GRPC_DEFAULT_PORT
             ))
         }
@@ -657,19 +658,18 @@ pub(crate) async fn handle_computer_chat_internal(
     // 🆕 自动查找 session_id 逻辑结束
 
     // 8. 转发请求到容器服务（使用 gRPC）
-    let result = forward_computer_request_to_container(
-        &request_for_forward, // 使用修改后的 request
-        &project_id,
-        &work_dir_id,
-        &container_info,
-        state.runtime(),
-        &state.grpc_pool,
+    let forward_params = ComputerForwardParams {
+        request: &request_for_forward,
+        project_id: &project_id,
+        work_dir_id: &work_dir_id,
+        container_info: &container_info,
+        grpc_pool: &state.grpc_pool,
         locale,
-        &state.container_prefix_rcoder,
-        &state.container_prefix_computer,
-        is_devcomputer, // 🆕 传递 is_devcomputer
-    )
-    .await;
+        is_devcomputer,
+        namespace: &state.config.app_manager.namespace,
+        cluster_domain: &state.cluster_domain,
+    };
+    let result = forward_computer_request_to_container(forward_params).await;
 
     // 8. 更新会话映射（填充所有三个映射表，保持一致性）
     // 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
@@ -822,81 +822,76 @@ pub(crate) async fn handle_computer_chat_internal(
 
 /// 转发请求到容器内的 agent_runner 服务（仅使用 gRPC）
 ///
+/// Computer Chat 转发请求参数
+///
+/// 封装了转发 Computer Chat 请求到容器服务所需的所有参数，
+/// 避免函数参数过多，同时支持不同场景的扩展。
+struct ComputerForwardParams<'a> {
+    /// Computer Chat 请求
+    request: &'a ComputerChatRequest,
+    /// 项目 ID
+    project_id: &'a str,
+    /// 工作目录 ID
+    work_dir_id: &'a str,
+    /// 容器信息
+    container_info: &'a ContainerBasicInfo,
+    /// gRPC 连接池
+    grpc_pool: &'a Arc<crate::grpc::GrpcChannelPool>,
+    /// 语言设置
+    locale: &'static str,
+    /// 是否是 DevComputer 接口请求
+    is_devcomputer: bool,
+    /// K8s namespace
+    namespace: &'a str,
+    /// K8s 集群域名
+    cluster_domain: &'a str,
+}
+
 /// 与 RCoder 的 forward_request_to_container_service 类似，
 /// 但专门用于 ComputerAgentRunner 模式。
-#[allow(clippy::too_many_arguments)]
 async fn forward_computer_request_to_container(
-    request: &ComputerChatRequest,
-    project_id: &str,
-    work_dir_id: &str,
-    container_info: &ContainerBasicInfo,
-    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
-    grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
-    locale: &'static str,
-    rcoder_prefix: &str,
-    computer_prefix: &str,
-    is_devcomputer: bool, // 🆕 是否是 DevComputer 接口请求
+    params: ComputerForwardParams<'_>,
 ) -> HttpResult<ChatResponse> {
     info!(
         "📤 [COMPUTER_FORWARD] Forwarding request to container (gRPC): user_id={}, project_id={}, session_id={:?}, container_id={}, is_devcomputer={}",
-        request.user_id,
-        project_id,
-        request.session_id,
-        container_info.container_id,
-        is_devcomputer
+        params.request.user_id,
+        params.project_id,
+        params.request.session_id,
+        params.container_info.container_id,
+        params.is_devcomputer
     );
 
     // 直接使用 gRPC 的健康检查机制，不额外检查容器状态
     // gRPC 连接失败会自动返回错误，由上层处理
 
-    // 从 service_url 提取 gRPC 地址
-    // 🆕 使用实时 IP 获取，避免 restart 后 IP 过期的问题
-    let mut grpc_addr = match get_realtime_container_ip(
-        runtime,
-        &container_info.container_name,
-        &container_info.container_ip,
-        rcoder_prefix,
-        computer_prefix,
-    )
-    .await
-    {
-        Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
-        Err(e) => {
-            warn!(
-                "⚠️ [COMPUTER_FORWARD] Real-time IP resolution failed: {}, trying to extract from service_url",
-                e
-            );
-            match extract_grpc_addr_with_port(
-                &container_info.service_url,
-                shared_types::GRPC_DEFAULT_PORT,
-            ) {
-                Ok(addr) => addr,
-                Err(e) => {
-                    error!("[COMPUTER_FORWARD] Failed to extract gRPC address: {}", e);
-                    return HttpResult::error_with_locale(
-                        shared_types::error_codes::ERR_GRPC_ADDR_ERROR,
-                        locale,
-                    );
-                }
-            }
-        }
-    };
+    // 使用 K8s Service FQDN 而不是 Pod IP
+    // 这样可以利用 K8s 的服务发现和负载均衡能力
+    let grpc_addr = super::utils::build_k8s_grpc_addr(
+        &params.container_info.container_name,
+        params.namespace,
+        params.cluster_domain,
+    );
+
+    debug!(
+        "📡 [COMPUTER_FORWARD] Using K8s Service FQDN for gRPC: {}",
+        grpc_addr
+    );
 
     debug!(
         "📡 [COMPUTER_FORWARD] gRPC address: {}, prompt_len={}, attachments={}",
         grpc_addr,
-        request.prompt.len(),
-        request.attachments.len()
+        params.request.prompt.len(),
+        params.request.attachments.len()
     );
 
     // Computer Agent Runner 的工作目录路径
     // 在容器内：/app/computer-project-workspace/{user_id}/{work_dir_id}
-    let project_workspace = match project_dir(&request.user_id, work_dir_id) {
+    let project_workspace = match project_dir(&params.request.user_id, params.work_dir_id) {
         Ok(path) => format!("{}/", path),
         Err(e) => {
             return HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
-                locale,
+                params.locale,
                 &e.to_string(),
             );
         }
@@ -912,28 +907,27 @@ async fn forward_computer_request_to_container(
     let mut last_error = None;
 
     for attempt in 1..=max_retries {
-        match crate::grpc::grpc_chat_with_pool(
-            grpc_pool,
-            &grpc_addr,
-            project_id.to_string(),
-            request.session_id.clone(),
-            request.prompt.clone(),
-            request.attachments.clone(),
-            request.data_source_attachments.clone(),
-            request.model_provider.clone(),
-            request.request_id.clone(),
-            Some(std::time::Duration::from_secs(
+        let grpc_params = crate::grpc::GrpcChatParams {
+            project_id: params.project_id.to_string(),
+            session_id: params.request.session_id.clone(),
+            prompt: params.request.prompt.clone(),
+            attachments: params.request.attachments.clone(),
+            data_source_attachments: params.request.data_source_attachments.clone(),
+            model_config: params.request.model_provider.clone(),
+            request_id: params.request.request_id.clone(),
+            request_timeout: Some(std::time::Duration::from_secs(
                 shared_types::GRPC_CHAT_TIMEOUT_SECS,
             )),
-            request.system_prompt.clone(),
-            request.user_prompt.clone(),
-            request.agent_config.clone(),
-            Some(shared_types::ServiceType::ComputerAgentRunner), // ✅ 传递正确的 ServiceType
-            Some(request.user_id.clone()), // ✅ 传递 user_id（ComputerAgentRunner 必需）
-            is_devcomputer,                // 🆕 传递 is_devcomputer
-            request.agent_work_dir.clone(), // 🆕 传递 agent_work_dir
-        )
-        .await
+            system_prompt: params.request.system_prompt.clone(),
+            user_prompt: params.request.user_prompt.clone(),
+            agent_config: params.request.agent_config.clone(),
+            service_type: Some(shared_types::ServiceType::ComputerAgentRunner),
+            user_id: Some(params.request.user_id.clone()),
+            is_devcomputer: params.is_devcomputer,
+            agent_work_dir: params.request.agent_work_dir.clone(),
+        };
+
+        match crate::grpc::grpc_chat_with_pool(params.grpc_pool, &grpc_addr, grpc_params).await
         {
             Ok(grpc_response) => {
                 if grpc_response.success {
@@ -971,33 +965,14 @@ async fn forward_computer_request_to_container(
                     info!(
                         "🔄 [COMPUTER_FORWARD] Detected retryable error, re-resolving container IP and retrying..."
                     );
-                    grpc_pool.remove(&grpc_addr).await;
+                    params.grpc_pool.remove(&grpc_addr).await;
 
-                    // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
-                    match get_realtime_container_ip(
-                        runtime,
-                        &container_info.container_name,
-                        &container_info.container_ip,
-                        rcoder_prefix,
-                        computer_prefix,
-                    )
-                    .await
-                    {
-                        Ok(ip) => {
-                            let new_addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
-                            info!(
-                                "🔄 [COMPUTER_FORWARD] Container IP re-resolved: {} -> {}",
-                                grpc_addr, new_addr
-                            );
-                            grpc_addr = new_addr;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "⚠️ [COMPUTER_FORWARD] Failed to re-resolve container IP, keeping old address: {}",
-                                e
-                            );
-                        }
-                    }
+                    // K8s Service FQDN 是稳定的，不需要重新解析
+                    // 直接使用原来的 FQDN 进行重试
+                    debug!(
+                        "🔄 [COMPUTER_FORWARD] Retrying with same K8s Service FQDN: {}",
+                        grpc_addr
+                    );
 
                     last_error = Some(anyhow::Error::from(grpc_err));
                     continue;
@@ -1019,14 +994,14 @@ async fn forward_computer_request_to_container(
     if let Some(e) = last_error {
         error!(
             "❌ [COMPUTER_FORWARD] gRPC final call failed: {}, user_id={}, project_id={}",
-            e, request.user_id, project_id
+            e, params.request.user_id, params.project_id
         );
 
         // gRPC 通信失败，直接返回错误
         // 注：业务错误码（如 Agent busy）现在由 agent_runner 通过 grpc_response.error_code 返回
-        HttpResult::error_with_locale(shared_types::error_codes::ERR_GRPC_ERROR, locale)
+        HttpResult::error_with_locale(shared_types::error_codes::ERR_GRPC_ERROR, params.locale)
     } else {
-        HttpResult::error_with_locale(shared_types::error_codes::ERR_UNKNOWN, locale)
+        HttpResult::error_with_locale(shared_types::error_codes::ERR_UNKNOWN, params.locale)
     }
 }
 

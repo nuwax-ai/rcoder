@@ -16,6 +16,12 @@ pub struct ContainerDestroyer {
     pub docker_manager: Arc<docker_manager::DockerManager>,
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
+    /// K8s namespace（用于构建 K8s Service FQDN）
+    pub namespace: String,
+    /// K8s 集群域名
+    pub cluster_domain: String,
+    /// 是否是 K8s 运行时
+    pub is_kubernetes: bool,
 }
 
 impl ContainerDestroyer {
@@ -23,11 +29,17 @@ impl ContainerDestroyer {
         docker_manager: Arc<docker_manager::DockerManager>,
         grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
         pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
+        namespace: String,
+        cluster_domain: String,
+        is_kubernetes: bool,
     ) -> Self {
         Self {
             docker_manager,
             grpc_pool,
             pingora_service,
+            namespace,
+            cluster_domain,
+            is_kubernetes,
         }
     }
 
@@ -110,10 +122,23 @@ impl ContainerDestroyer {
 
         // 4. 清理关联资源
         // 清理 gRPC 连接池中的旧连接（避免复用已失效的 TCP 连接）
-        if !container_ip.is_empty() {
-            let old_grpc_addr = format!("{}:{}", container_ip, shared_types::GRPC_DEFAULT_PORT);
-            self.grpc_pool.remove(&old_grpc_addr).await;
-        }
+        let grpc_addr = if self.is_kubernetes {
+            // K8s 环境：使用 K8s Service FQDN
+            let svc_fqdn = crate::handler::utils::build_k8s_service_fqdn(
+                container_name,
+                &self.namespace,
+                &self.cluster_domain,
+            );
+            format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
+        } else {
+            // Docker 环境：使用容器 IP
+            if container_ip.is_empty() {
+                debug!(" [destroyer] Container IP is empty, skipping gRPC cleanup");
+                return Ok(());
+            }
+            format!("{}:{}", container_ip, shared_types::GRPC_DEFAULT_PORT)
+        };
+        self.grpc_pool.remove(&grpc_addr).await;
 
         if let Some(ref pingora_service) = self.pingora_service {
             if *service_type == ServiceType::ComputerAgentRunner {

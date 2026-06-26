@@ -13,7 +13,7 @@ use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 #[cfg(feature = "kubernetes")]
 use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
-use shared_types::{GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, ServiceType};
+use shared_types::{GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT, ServiceType, TTYD_PORT};
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
 #[cfg(feature = "kubernetes")]
@@ -29,6 +29,12 @@ const AGENT_HTTP_PORT: u32 = HTTP_DEFAULT_PORT as u32;
 
 /// Agent Runner gRPC 端口（使用 shared_types 共享常量）
 const AGENT_GRPC_PORT: u32 = GRPC_DEFAULT_PORT as u32;
+
+/// Agent Runner noVNC 端口（使用 shared_types 共享常量）
+const AGENT_NOVNC_PORT: u32 = NOVNC_PORT as u32;
+
+/// Agent Runner ttyd 端口（使用 shared_types 共享常量）
+const AGENT_TTYD_PORT: u32 = TTYD_PORT as u32;
 
 /// K8s 标准标签前缀
 const LABEL_PREFIX: &str = "app.kubernetes.io";
@@ -121,8 +127,13 @@ pub(crate) trait K8sServiceOps {
 
     /// 创建 K8s ClusterIP Service，selector 匹配 agent_runner Pod
     ///
-    /// Service 暴露 HTTP 8086 和 gRPC 50051 端口，selector 使用与 Pod 相同的 labels
-    /// （`managed-by=rcoder-runtime` + identifier label）。
+    /// Service 暴露以下端口：
+    /// - HTTP 8086：健康检查、状态查询
+    /// - gRPC 50051：rcoder 与 agent-runner 通信
+    /// - noVNC 6080：Web VNC 访问
+    /// - ttyd 7681：Web 终端访问
+    ///
+    /// selector 使用与 Pod 相同的 labels（`managed-by=rcoder-runtime` + identifier label）。
     /// 创建前先检查是否已存在，已存在则跳过。
     async fn create_agent_service(
         &self,
@@ -206,6 +217,28 @@ impl K8sServiceOps for KubernetesRuntime {
                         target_port: Some(
                             k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
                                 AGENT_GRPC_PORT as i32,
+                            ),
+                        ),
+                        protocol: Some("TCP".to_string()),
+                        ..Default::default()
+                    },
+                    ServicePort {
+                        name: Some("novnc".to_string()),
+                        port: AGENT_NOVNC_PORT as i32,
+                        target_port: Some(
+                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                                AGENT_NOVNC_PORT as i32,
+                            ),
+                        ),
+                        protocol: Some("TCP".to_string()),
+                        ..Default::default()
+                    },
+                    ServicePort {
+                        name: Some("ttyd".to_string()),
+                        port: AGENT_TTYD_PORT as i32,
+                        target_port: Some(
+                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                                AGENT_TTYD_PORT as i32,
                             ),
                         ),
                         protocol: Some("TCP".to_string()),

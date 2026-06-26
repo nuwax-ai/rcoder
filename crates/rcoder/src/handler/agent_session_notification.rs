@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use super::utils::{I18nPath, container_identity_from_name, get_realtime_container_ip};
+use super::utils::{I18nPath, container_identity_from_name};
 use crate::{AppError, HttpResult};
 use axum::{
     extract::State,
@@ -647,79 +647,64 @@ async fn validate_and_get_session_context(
 
 /// 创建 SSE 响应流
 ///
+/// SSE 流构建参数
+///
+/// 封装了构建 gRPC SSE 流所需的所有参数，
+/// 避免函数参数过多，同时支持不同场景的扩展。
+struct SseStreamParams {
+    /// 容器名称
+    container_name: String,
+    /// 会话 ID
+    session_id: String,
+    /// 项目 ID
+    project_id: String,
+    /// gRPC 连接池
+    grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
+    /// 语言设置
+    locale: &'static str,
+    /// 服务类型（用于日志区分不同类型的 Agent）
+    service_type: shared_types::ServiceType,
+    /// 活动更新器
+    activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
+    /// K8s namespace
+    namespace: String,
+    /// K8s 集群域名
+    cluster_domain: String,
+}
+
 /// 这个函数被 agent_session_notification 和 computer_agent_progress_notification 共同使用
 /// 通过 container_name 创建 gRPC SSE 流
-#[allow(clippy::too_many_arguments)]
 async fn build_sse_stream_from_container_name(
-    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
-    container_name: String,
-    session_id: String,
-    project_id: String,
-    grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
-    locale: &'static str,
-    agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
-    rcoder_prefix: &str,
-    computer_prefix: &str,
-    activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
+    params: SseStreamParams,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
-    // Get latest container IP from Docker API in real-time
-    // 使用 container_name（如 computer-agent-runner-user_123）查询
-    // 因为 container_id 在容器重启后会改变，但 container_name 是稳定的
-    let container_ip = match get_realtime_container_ip(
-        runtime,
-        &container_name,
-        "", // 无 fallback_ip，直接使用 Docker API 查询结果
-        rcoder_prefix,
-        computer_prefix,
-    )
-    .await
-    {
-        Ok(ip) => {
-            if !ip.is_empty() {
-                info!(
-                    " [gRPC_SSE] Got container IP: container_name={}, ip={}",
-                    container_name, ip
-                );
-                ip
-            } else {
-                error!(
-                    " [gRPC_SSE] unable to get container IP: container_name={}",
-                    container_name
-                );
-                return Err(create_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "GRPC_CONNECTION_ERROR",
-                    "unable to get container IP address",
-                ));
-            }
-        }
-        Err(e) => {
-            error!(
-                " [gRPC_SSE] Failed to get real-time IP: container_name={}, error={}",
-                container_name, e
-            );
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "GRPC_CONNECTION_ERROR",
-                &format!("failed to get container IP: {}", e),
-            ));
-        }
-    };
+    // 使用 K8s Service FQDN 而不是 Pod IP
+    // 这样可以利用 K8s 的服务发现和负载均衡能力
+    let svc_fqdn = super::utils::build_k8s_service_fqdn(
+        &params.container_name,
+        &params.namespace,
+        &params.cluster_domain,
+    );
 
-    let grpc_addr = format!("{}:{}", container_ip, shared_types::GRPC_DEFAULT_PORT);
+    debug!(
+        "📡 [SSE] Using K8s Service FQDN for gRPC: {}",
+        svc_fqdn
+    );
+
+    // 使用 K8s Service FQDN 构建 gRPC 地址
+    let grpc_addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
     info!(
         " [gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
-        agent_type, grpc_addr, project_id
+        params.service_type, grpc_addr, params.project_id
     );
 
     // 创建 gRPC SSE 流
     let stream = crate::grpc::create_grpc_sse_stream(
         grpc_addr,
-        session_id.clone(),
-        project_id,
-        grpc_pool.clone(),
-        locale,
-        activity_updater,
+        params.session_id.clone(),
+        params.project_id,
+        params.grpc_pool.clone(),
+        params.locale,
+        params.activity_updater,
     )
     .await;
 
@@ -929,19 +914,18 @@ pub async fn agent_session_notification(
     };
 
     // 使用通用函数创建 SSE 响应流
-    build_sse_stream_from_container_name(
-        state.runtime(),
+    let params = SseStreamParams {
         container_name,
-        session_id.to_string(),
+        session_id: session_id.to_string(),
         project_id,
-        state.grpc_pool.clone(),
+        grpc_pool: state.grpc_pool.clone(),
         locale,
-        "Agent",
-        &state.container_prefix_rcoder,
-        &state.container_prefix_computer,
+        service_type: shared_types::ServiceType::WebAgentRunner,
         activity_updater,
-    )
-    .await
+        namespace: state.config.app_manager.namespace.clone(),
+        cluster_domain: state.cluster_domain.clone(),
+    };
+    build_sse_stream_from_container_name(params).await
 }
 
 #[utoipa::path(
@@ -1045,19 +1029,18 @@ pub async fn computer_agent_progress_notification(
     };
 
     // 使用通用函数创建 SSE 响应流
-    build_sse_stream_from_container_name(
-        state.runtime(),
+    let params = SseStreamParams {
         container_name,
-        session_id.to_string(),
+        session_id: session_id.to_string(),
         project_id,
-        state.grpc_pool.clone(),
+        grpc_pool: state.grpc_pool.clone(),
         locale,
-        "Computer Agent",
-        &state.container_prefix_rcoder,
-        &state.container_prefix_computer,
+        service_type: shared_types::ServiceType::ComputerAgentRunner,
         activity_updater,
-    )
-    .await
+        namespace: state.config.app_manager.namespace.clone(),
+        cluster_domain: state.cluster_domain.clone(),
+    };
+    build_sse_stream_from_container_name(params).await
 }
 
 /// 创建 SSE 代理流

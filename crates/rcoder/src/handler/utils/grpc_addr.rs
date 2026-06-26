@@ -7,8 +7,41 @@ use shared_types::GRPC_DEFAULT_PORT;
 use shared_types::ServiceType;
 use shared_types::error_codes::ERR_GRPC_ADDR_ERROR;
 use std::cmp::Reverse;
-use std::sync::Arc;
-use tracing::{debug, info};
+
+/// 构建 K8s Service FQDN
+///
+/// # 参数
+/// - `container_name`: 容器名称
+/// - `namespace`: K8s namespace
+/// - `cluster_domain`: K8s 集群域名（默认为 "cluster.local"）
+///
+/// # 返回
+/// K8s Service FQDN，格式如 `container-svc.namespace.svc.cluster.local`
+pub fn build_k8s_service_fqdn(
+    container_name: &str,
+    namespace: &str,
+    cluster_domain: &str,
+) -> String {
+    format!("{}-svc.{}.svc.{}", container_name, namespace, cluster_domain)
+}
+
+/// 构建 gRPC 地址（K8s Service FQDN）
+///
+/// # 参数
+/// - `container_name`: 容器名称
+/// - `namespace`: K8s namespace
+/// - `cluster_domain`: K8s 集群域名
+///
+/// # 返回
+/// gRPC 地址，格式如 `container-svc.namespace.svc.cluster.local:50051`
+pub fn build_k8s_grpc_addr(
+    container_name: &str,
+    namespace: &str,
+    cluster_domain: &str,
+) -> String {
+    let fqdn = build_k8s_service_fqdn(container_name, namespace, cluster_domain);
+    format!("{}:{}", fqdn, GRPC_DEFAULT_PORT)
+}
 
 /// 从 service_url 提取 gRPC 地址（使用指定端口）
 ///
@@ -92,48 +125,6 @@ pub fn container_identity_from_name<'a>(
 /// 使用容器名称（如 `computer-agent-runner-user_123`）查询，
 /// 因为 container_id 在容器重启后会改变，但 container_name 是稳定的。
 ///
-/// 查询顺序：Runtime find_container（带内部缓存）
-///
-/// # 参数
-/// - `container_name`: 容器名称
-/// - `fallback_ip`: 回退 IP 地址
-/// - `rcoder_prefix`: RCoder 服务的容器前缀（从配置读取）
-/// - `computer_prefix`: ComputerAgentRunner 服务的容器前缀（从配置读取）
-pub async fn get_realtime_container_ip(
-    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
-    container_name: &str,
-    fallback_ip: &str,
-    rcoder_prefix: &str,
-    computer_prefix: &str,
-) -> Result<String, String> {
-    let Some((identifier, service_type)) =
-        container_identity_from_name(container_name, rcoder_prefix, computer_prefix)
-    else {
-        return Ok(fallback_ip.to_string());
-    };
-
-    // 通过 Runtime 的 find_container 查询容器 IP
-    // find_container 会直接调用 Docker API 获取最新的容器信息
-    match runtime.find_container(identifier, &service_type).await {
-        Ok(Some(info)) if !info.container_ip.is_empty() => {
-            debug!(
-                "🔍 [IP_QUERY] Got container IP: container_name={}, ip={}",
-                container_name, info.container_ip
-            );
-            Ok(info.container_ip)
-        }
-        Ok(_) => {
-            // find_container 返回空或 IP 为空，使用 fallback
-            info!(
-                "⚠️ [IP_QUERY] find_container returned empty, using fallback: container_name={}",
-                container_name
-            );
-            Ok(fallback_ip.to_string())
-        }
-        Err(e) => Err(format!("runtime find_container failed: {}", e)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

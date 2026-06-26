@@ -68,6 +68,7 @@ pub struct K8sAppService {
     config: AppManagerConfig,
     runtime: Arc<dyn ContainerRuntime>,
     apps: tokio::sync::RwLock<HashMap<String, AppInfo>>,
+    cluster_domain: String,
     #[cfg(feature = "kubernetes")]
     kube_client: Option<kube::Client>,
 }
@@ -84,10 +85,14 @@ impl K8sAppService {
             }
         };
 
+        // K8s 集群域名配置
+        let cluster_domain = shared_types::get_k8s_cluster_domain();
+
         Ok(Self {
             config,
             runtime,
             apps: tokio::sync::RwLock::new(HashMap::new()),
+            cluster_domain,
             #[cfg(feature = "kubernetes")]
             kube_client,
         })
@@ -848,7 +853,7 @@ impl K8sAppService {
                 tcp: tcp_ports,
             },
             internal: InternalAccess {
-                domain: format!("{}-svc.{}.svc.cluster.local", app_id, self.config.namespace),
+                domain: format!("{}-svc.{}.svc.{}", app_id, self.config.namespace, self.cluster_domain),
                 short_domain: format!("{}-svc.{}", app_id, self.config.namespace),
                 ports: ports
                     .as_ref()

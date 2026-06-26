@@ -88,6 +88,8 @@ pub async fn start_all_background_tasks(
             state.container_prefix_rcoder.clone(),
             state.container_prefix_computer.clone(),
             state.runtime().clone(),
+            state.config.app_manager.namespace.clone(),
+            state.cluster_domain.clone(),
         );
         info!("VNC sync already started (interval: 5s, sync Docker container IP)");
         Some(handle)

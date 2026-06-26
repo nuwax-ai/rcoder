@@ -19,6 +19,54 @@ use crate::agent_mgmt::install_lock::InstallLockManager;
 use crate::agent_mgmt::path_manager::PathManager;
 use crate::agent_mgmt::registry::AgentRegistry;
 
+/// 版本检查安装参数
+///
+/// 封装了版本检查安装所需的所有参数，
+/// 避免函数参数过多。
+pub struct VersionCheckInstallParams<'a> {
+    /// 安装锁管理器
+    pub lock_manager: &'a InstallLockManager,
+    /// Agent 注册表
+    pub registry: &'a AgentRegistry,
+    /// 路径管理器
+    pub path_manager: &'a PathManager,
+    /// Agent ID
+    pub agent_id: &'a str,
+    /// 命令
+    pub command: &'a str,
+    /// 参数
+    pub args: &'a [String],
+    /// 版本
+    pub version: &'a str,
+    /// 平台配置
+    pub platforms: &'a std::collections::HashMap<String, shared_types::PlatformEntry>,
+    /// 是否强制安装
+    pub force: bool,
+}
+
+/// 实际安装参数
+///
+/// 封装了实际安装所需的所有参数，
+/// 避免函数参数过多。
+struct DoInstallParams<'a> {
+    /// 取消令牌
+    cancel_token: CancellationToken,
+    /// Agent 注册表
+    registry: &'a AgentRegistry,
+    /// 路径管理器
+    path_manager: &'a PathManager,
+    /// Agent ID
+    agent_id: &'a str,
+    /// 命令
+    command: &'a str,
+    /// 参数
+    args: &'a [String],
+    /// 版本
+    version: &'a str,
+    /// 平台配置
+    platforms: &'a std::collections::HashMap<String, shared_types::PlatformEntry>,
+}
+
 /// 从 URL 下载并安装(下载完成后,二进制/解压逻辑复用 `binary_installer`)
 pub async fn install_from_url(
     registry: &AgentRegistry,
@@ -97,37 +145,28 @@ pub async fn install_from_url(
 /// 2. 查注册表判断 action (installed/updated/skipped)
 /// 3. skipped → 直接返回现有信息
 /// 4. 匹配当前系统平台 → 查 platforms map → 下载 → 安装
-#[allow(clippy::too_many_arguments)]
 pub async fn install_with_version_check(
-    lock_manager: &InstallLockManager,
-    registry: &AgentRegistry,
-    path_manager: &PathManager,
-    agent_id: &str,
-    command: &str,
-    args: &[String],
-    version: &str,
-    platforms: &std::collections::HashMap<String, shared_types::PlatformEntry>,
-    force: bool,
+    params: VersionCheckInstallParams<'_>,
 ) -> AgentMgmtResult<InstallAgentResponse> {
-    crate::agent_mgmt::path_manager::validate_agent_id(agent_id)
+    crate::agent_mgmt::path_manager::validate_agent_id(params.agent_id)
         .map_err(AgentMgmtError::InvalidManifest)?;
-    crate::agent_mgmt::path_manager::validate_command(command)
+    crate::agent_mgmt::path_manager::validate_command(params.command)
         .map_err(AgentMgmtError::InvalidManifest)?;
 
     // 0. 版本格式校验(至少包含一个数字)
-    validate_version_format(version)?;
+    validate_version_format(params.version)?;
 
     // 0.5 获取 per-agent-version 安装锁
-    let state = lock_manager
-        .get_or_create(agent_id, version)
+    let state = params.lock_manager
+        .get_or_create(params.agent_id, params.version)
         .ok_or_else(|| {
-            AgentMgmtError::InvalidVersion(format!("invalid semver version: {}", version))
+            AgentMgmtError::InvalidVersion(format!("invalid semver version: {}", params.version))
         })?;
-    if force {
+    if params.force {
         // 强制模式：取消当前安装，等待锁
         state.cancel();
     }
-    let _guard = if force {
+    let _guard = if params.force {
         state.lock().await
     } else {
         match state.try_lock() {
@@ -137,32 +176,32 @@ pub async fn install_with_version_check(
                 let current_version = state.installing_version();
                 info!(
                     "[agent_mgmt] install in progress: agent_id={}, version={:?}, requested={}",
-                    agent_id, current_version, version
+                    params.agent_id, current_version, params.version
                 );
-                let mut resp = make_in_progress_response(agent_id, current_version.as_deref());
-                resp.previous_version = version.to_string();
+                let mut resp = make_in_progress_response(params.agent_id, current_version.as_deref());
+                resp.previous_version = params.version.to_string();
                 return Ok(resp);
             }
         }
     };
 
     // 标记安装开始，替换取消令牌（确保 force-cancel 后新安装使用干净的 token）
-    state.set_installing(version);
+    state.set_installing(params.version);
     let cancel_token = CancellationToken::new();
     state.replace_cancel_token(cancel_token.clone());
 
     // 执行安装（内部检查 cancel token）
-    let result = do_install_with_version_check(
+    let do_params = DoInstallParams {
         cancel_token,
-        registry,
-        path_manager,
-        agent_id,
-        command,
-        args,
-        version,
-        platforms,
-    )
-    .await;
+        registry: params.registry,
+        path_manager: params.path_manager,
+        agent_id: params.agent_id,
+        command: params.command,
+        args: params.args,
+        version: params.version,
+        platforms: params.platforms,
+    };
+    let result = do_install_with_version_check(do_params).await;
 
     // 安装完成（成功或失败），清除状态
     state.clear_installing();
@@ -171,24 +210,16 @@ pub async fn install_with_version_check(
 }
 
 /// 实际安装逻辑（从 install_with_version_check 中提取，便于锁管理）
-#[allow(clippy::too_many_arguments)]
 async fn do_install_with_version_check(
-    cancel_token: CancellationToken,
-    registry: &AgentRegistry,
-    path_manager: &PathManager,
-    agent_id: &str,
-    command: &str,
-    args: &[String],
-    version: &str,
-    platforms: &std::collections::HashMap<String, shared_types::PlatformEntry>,
+    params: DoInstallParams<'_>,
 ) -> AgentMgmtResult<InstallAgentResponse> {
     use crate::agent_mgmt::registry::normalize_platform_key;
 
     // 1. 版本检查：检查特定版本是否已安装（精确匹配）
-    if registry.contains_version(agent_id, version) {
-        let manifest = registry.get_version(agent_id, version).unwrap();
+    if params.registry.contains_version(params.agent_id, params.version) {
+        let manifest = params.registry.get_version(params.agent_id, params.version).unwrap();
         let mut resp = make_skip_response(&manifest);
-        resp.previous_version = version.to_string();
+        resp.previous_version = params.version.to_string();
         return Ok(resp);
     }
 
@@ -198,19 +229,19 @@ async fn do_install_with_version_check(
 
     info!(
         "[agent_mgmt] version check: agent_id={}, action={}, requested_version={}",
-        agent_id,
+        params.agent_id,
         action.as_str(),
-        version
+        params.version
     );
 
     // 2. 匹配当前系统平台
     let sys_info = shared_types::SystemInfo::current();
     let platform_key = normalize_platform_key(&sys_info.os, &sys_info.arch);
 
-    let entry = platforms.get(&platform_key).ok_or_else(|| {
+    let entry = params.platforms.get(&platform_key).ok_or_else(|| {
         AgentMgmtError::PlatformNotFound(format!(
             "{platform_key} (available: {:?})",
-            platforms.keys().collect::<Vec<_>>()
+            params.platforms.keys().collect::<Vec<_>>()
         ))
     })?;
 
@@ -224,12 +255,12 @@ async fn do_install_with_version_check(
 
     info!(
         "[agent_mgmt] platform install: agent_id={}, platform={}, url={}",
-        agent_id, platform_key, entry.url
+        params.agent_id, platform_key, entry.url
     );
 
     // 4. 下载到临时文件(支持重试 + 断点续传)
     let expected_sha256 = entry.sha256.as_deref().filter(|s| !s.is_empty());
-    let staging_path = path_manager
+    let staging_path = params.path_manager
         .install_dir()
         .join(format!(".download-staging-{}", uuid::Uuid::new_v4()));
     download_to_file(
@@ -237,7 +268,7 @@ async fn do_install_with_version_check(
         &staging_path,
         shared_types::MAX_BINARY_SIZE,
         expected_sha256,
-        &cancel_token,
+        &params.cancel_token,
     )
     .await?;
 
@@ -250,18 +281,18 @@ async fn do_install_with_version_check(
     let t_install = std::time::Instant::now();
     debug!(
         "[agent_mgmt] starting install_from_file: agent_id={}, file_size={}",
-        agent_id, file_size
+        params.agent_id, file_size
     );
     let response = binary_installer::install_from_file(
-        registry,
-        path_manager,
+        params.registry,
+        params.path_manager,
         binary_installer::InstallFileParams {
-            agent_id,
-            command,
-            args,
+            agent_id: params.agent_id,
+            command: params.command,
+            args: params.args,
             install_type: InstallType::Url,
             download_path: &staging_path,
-            version: Some(version),
+            version: Some(params.version),
             source: Some(&entry.url),
             file_size,
         },

@@ -87,6 +87,8 @@ pub struct AppState {
     pub agent_download_manager: Arc<AgentDownloadManager>,
     /// 应用管理服务
     pub app_service: Arc<dyn crate::app_manager::AppServiceTrait>,
+    /// K8s 集群域名（用于构建 K8s Service FQDN）
+    pub cluster_domain: String,
 }
 
 impl AppState {
@@ -98,7 +100,8 @@ impl AppState {
         container_prefix_computer: String,
         runtime: Arc<dyn ContainerRuntime>,
     ) -> anyhow::Result<Self> {
-        let (projects, cleanup_rx) = ProjectAdapter::new();
+        let cluster_domain = shared_types::get_k8s_cluster_domain();
+        let (projects, cleanup_rx) = ProjectAdapter::new(config.app_manager.namespace.clone(), cluster_domain.clone());
 
         // 创建容器创建完成通知通道（缓冲区大小 32，足够应对并发创建）
         let (pod_created_tx, _) = broadcast::channel(32);
@@ -111,11 +114,10 @@ impl AppState {
                 anyhow::anyhow!("failed to initialize agent download manager: {}", e)
             })?);
 
-        // 初始化应用管理服务（根据运行时类型选择）
-        let runtime_type =
-            std::env::var("CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".to_string());
-        let app_service: Arc<dyn crate::app_manager::AppServiceTrait> =
-            if runtime_type == "kubernetes" {
+        // 初始化应用管理服务（根据 features flag 选择）
+        let app_service: Arc<dyn crate::app_manager::AppServiceTrait> = {
+            #[cfg(feature = "kubernetes")]
+            {
                 Arc::new(
                     crate::app_manager::k8s_service::K8sAppService::new(
                         config.app_manager.clone(),
@@ -124,13 +126,16 @@ impl AppState {
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to initialize K8s app service: {}", e))?,
                 )
-            } else {
+            }
+            #[cfg(not(feature = "kubernetes"))]
+            {
                 Arc::new(
                     crate::app_manager::service::AppService::new(config.app_manager.clone())
                         .await
                         .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
                 )
-            };
+            }
+        };
 
         Ok(Self {
             config,
@@ -146,6 +151,7 @@ impl AppState {
             cleanup_rx: Arc::new(std::sync::Mutex::new(Some(cleanup_rx))),
             agent_download_manager,
             app_service,
+            cluster_domain,
         })
     }
 

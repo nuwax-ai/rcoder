@@ -1044,7 +1044,9 @@ pub async fn pod_ensure(
                     sync_single_vnc_backend(
                         pingora_service,
                         &container_identifier,
-                        &info.container_ip,
+                        &info.container_name,
+                        &state.config.app_manager.namespace,
+                        &state.cluster_domain,
                     )
                     .await;
                     info!(
@@ -1430,7 +1432,9 @@ pub async fn pod_ensure(
         sync_single_vnc_backend(
             pingora_service,
             &container_identifier,
-            &container_info.container_ip,
+            &container_info.container_name,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
         )
         .await;
         info!(
@@ -1928,7 +1932,9 @@ pub async fn pod_restart(
         sync_single_vnc_backend(
             pingora_service,
             &container_identifier,
-            &container_info.container_ip,
+            &container_info.container_name,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
         )
         .await;
         info!(
@@ -2457,7 +2463,7 @@ pub async fn pod_vnc_status(
 
     // 3. 定位容器
     // 优先级：pod_id > user_id > project_id
-    let (lookup_user_id, container_info) = if let Some(pid) = pod_id {
+    let (_lookup_user_id, container_info) = if let Some(pid) = pod_id {
         // 使用 pod_id 查找（多租户场景）
         (pid, runtime.find_container(pid, &service_type).await)
     } else if let Some(uid) = user_id {
@@ -2523,38 +2529,17 @@ pub async fn pod_vnc_status(
     }
 
     // 6. 构建 gRPC 地址
-    // 直接使用步骤 3 find_container 获取的 container_ip，避免二次缓存查找失败
-    // （find_container 实时查询 Docker API，get_container_info_by_identifier 只查内存缓存，
-    //   服务重启后缓存丢失会导致查找失败）
-    let container_ip = if !result.container_ip.is_empty() {
-        result.container_ip.clone()
-    } else {
-        // 缓存命中时 IP 可能为空，重新实时查询获取 IP
-        match runtime
-            .find_container(
-                lookup_user_id,
-                &shared_types::ServiceType::ComputerAgentRunner,
-            )
-            .await
-        {
-            Ok(Some(info)) if !info.container_ip.is_empty() => info.container_ip,
-            _ => {
-                error!(
-                    " [POD_VNC_STATUS] unable to get container IP: container_id={}",
-                    result.container_id
-                );
-                return Ok(HttpResult::error_with_locale(
-                    shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
-                    locale,
-                ));
-            }
-        }
-    };
-
-    let grpc_addr = format!("{}:{}", container_ip, shared_types::GRPC_DEFAULT_PORT);
+    // 使用 K8s Service FQDN 而不是 Pod IP
+    // 这样可以利用 K8s 的服务发现和负载均衡能力
+    let svc_fqdn = super::utils::build_k8s_service_fqdn(
+        &result.container_name,
+        &state.config.app_manager.namespace,
+        &state.cluster_domain,
+    );
+    let grpc_addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
 
     info!(
-        " [POD_VNC_STATUS] Checking gRPC connection: addr={}",
+        " [POD_VNC_STATUS] Using K8s Service FQDN for gRPC: {}",
         grpc_addr
     );
 

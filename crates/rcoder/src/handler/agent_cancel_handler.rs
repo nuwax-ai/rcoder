@@ -117,30 +117,45 @@ async fn get_container_for_cancel(
 }
 
 /// 转发取消请求到容器内的 agent_runner 服务
+/// Cancel 请求转发参数
+///
+/// 封装了转发 Cancel 请求到容器服务所需的所有参数，
+/// 避免函数参数过多。
+struct CancelForwardParams<'a> {
+    /// 项目 ID
+    project_id: &'a str,
+    /// 会话 ID（可选）
+    session_id: Option<&'a str>,
+    /// 容器信息
+    container_info: &'a ContainerBasicInfo,
+    /// gRPC 连接池
+    grpc_pool: &'a Arc<crate::grpc::GrpcChannelPool>,
+    /// 语言设置
+    locale: &'static str,
+    /// 容器运行时
+    runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
+    /// RCoder 容器前缀
+    rcoder_prefix: &'a str,
+    /// Computer 容器前缀
+    computer_prefix: &'a str,
+}
+
 ///
 /// 🎯 使用 gRPC CancelSession RPC 替代 HTTP 转发
-#[allow(clippy::too_many_arguments)]
 async fn forward_cancel_request_to_container_service(
-    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
-    project_id: &str,
-    session_id: Option<&str>,
-    container_info: &ContainerBasicInfo,
-    grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
-    locale: &'static str,
-    rcoder_prefix: &str,
-    computer_prefix: &str,
+    params: CancelForwardParams<'_>,
 ) -> Result<HttpResult<AgentCancelResponse>, AppError> {
-    let session_id_display = session_id
+    let session_id_display = params.session_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| "None".to_string());
     info!(
         "📤 [CANCEL_FORWARD] Forwarding cancel request to container (gRPC): project_id={}, session_id={}, container_id={}",
-        project_id, session_id_display, container_info.container_id
+        params.project_id, session_id_display, params.container_info.container_id
     );
 
     // 🎯 使用 gRPC 替代 HTTP
     // 从 service_url 提取 gRPC 地址
-    let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
+    let grpc_addr = extract_grpc_addr(&params.container_info.service_url)?;
 
     info!(
         "📡 [CANCEL_FORWARD] Sending gRPC cancel request to: {}, session_id={}",
@@ -148,16 +163,16 @@ async fn forward_cancel_request_to_container_service(
     );
 
     // 构建 session_id（如果未提供则使用空字符串，由 Agent Runner 根据 project_id 查找）
-    let session_id_str = session_id.unwrap_or("").to_string();
+    let session_id_str = params.session_id.unwrap_or("").to_string();
     let reason = "User requested cancellation".to_string();
 
     // 调用 gRPC CancelSession
     match crate::grpc::grpc_cancel_session_with_pool(
-        grpc_pool,
+        params.grpc_pool,
         &grpc_addr,
         session_id_str.clone(),
         reason,
-        project_id.to_string(),
+        params.project_id.to_string(),
         None, // 使用默认超时 (GRPC_CANCEL_SESSION_TIMEOUT_SECS)
     )
     .await
@@ -179,7 +194,7 @@ async fn forward_cancel_request_to_container_service(
                 error!("[CANCEL_FORWARD] gRPC cancelfailed: {}", error_msg);
                 Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_CANCEL_FAILED,
-                    locale,
+                    params.locale,
                 ))
             }
         }
@@ -196,17 +211,17 @@ async fn forward_cancel_request_to_container_service(
                             info!("[CANCEL_FORWARD] Session not found, cancel succeeded");
                             return Ok(HttpResult::success(AgentCancelResponse {
                                 success: true,
-                                session_id: session_id.unwrap_or("").to_string(),
+                                session_id: params.session_id.unwrap_or("").to_string(),
                             }));
                         }
                         Code::Unavailable => {
                             // Agent Worker 不可用，需要判断是容器已销毁还是临时故障
                             // 通过 Docker API 检查容器是否真的存在
                             let container_exists = check_container_exists_by_info(
-                                runtime,
-                                container_info,
-                                rcoder_prefix,
-                                computer_prefix,
+                                params.runtime,
+                                params.container_info,
+                                params.rcoder_prefix,
+                                params.computer_prefix,
                             )
                             .await;
 
@@ -217,7 +232,7 @@ async fn forward_cancel_request_to_container_service(
                                 );
                                 return Ok(HttpResult::success(AgentCancelResponse {
                                     success: true,
-                                    session_id: session_id.unwrap_or("").to_string(),
+                                    session_id: params.session_id.unwrap_or("").to_string(),
                                 }));
                             } else {
                                 // 容器存在但服务不可用（可能是临时故障），返回错误
@@ -226,7 +241,7 @@ async fn forward_cancel_request_to_container_service(
                                 );
                                 return Ok(HttpResult::error_with_locale(
                                     shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
-                                    locale,
+                                    params.locale,
                                 ));
                             }
                         }
@@ -245,7 +260,7 @@ async fn forward_cancel_request_to_container_service(
             // 其他 gRPC 通信失败（网络错误等）
             Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
-                locale,
+                params.locale,
             ))
         }
     }
@@ -343,17 +358,17 @@ async fn handle_session_cancel_internal_v2(
     };
 
     // 转发取消请求到容器服务
-    let result = forward_cancel_request_to_container_service(
-        state.runtime(),
-        &project_id, // 使用传入的 project_id
-        session_id.as_deref(),
-        &container_info,
-        &state.grpc_pool,
+    let cancel_params = CancelForwardParams {
+        project_id: &project_id,
+        session_id: session_id.as_deref(),
+        container_info: &container_info,
+        grpc_pool: &state.grpc_pool,
         locale,
-        &state.container_prefix_rcoder,
-        &state.container_prefix_computer,
-    )
-    .await;
+        runtime: state.runtime(),
+        rcoder_prefix: &state.container_prefix_rcoder,
+        computer_prefix: &state.container_prefix_computer,
+    };
+    let result = forward_cancel_request_to_container_service(cancel_params).await;
 
     match &result {
         Ok(_) => {

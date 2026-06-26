@@ -13,6 +13,31 @@ use shared_types::error_codes::{ERR_CONTAINER_ERROR, ERR_WORKSPACE_ERROR};
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
+/// 容器创建参数
+///
+/// 封装了创建容器所需的所有参数，
+/// 避免函数参数过多。
+pub struct ContainerCreateOptions<'a> {
+    /// 项目 ID
+    pub project_id: &'a str,
+    /// 服务类型
+    pub service_type: &'a shared_types::ServiceType,
+    /// 资源限制
+    pub request_resource_limits: Option<shared_types::ServiceResourceLimits>,
+    /// 容器唯一标识（可选，有值时优先使用）
+    pub pod_id: Option<&'a str>,
+    /// 隔离类型（可选，tenant/space 时路径不同）
+    pub isolation_type: Option<&'a str>,
+    /// 租户 ID（可选）
+    pub tenant_id: Option<&'a str>,
+    /// 空间 ID（可选）
+    pub space_id: Option<&'a str>,
+    /// 容器内工作路径
+    pub container_work_path: &'a str,
+    /// 容器运行时
+    pub runtime: &'a Arc<dyn ContainerRuntime>,
+}
+
 /// 通用容器管理服务
 pub struct ContainerManager;
 
@@ -28,44 +53,23 @@ impl ContainerManager {
     /// - `tenant_id`: 租户 ID（可选）
     /// - `space_id`: 空间 ID（可选）
     /// - `container_work_path`: 容器内工作路径
-    #[allow(clippy::too_many_arguments)] // 多租户 + 资源限制参数无法合并
     pub async fn get_or_create_container(
-        project_id: &str,
-        service_type: &shared_types::ServiceType,
-        request_resource_limits: Option<shared_types::ServiceResourceLimits>,
-        pod_id: Option<&str>,
-        isolation_type: Option<&str>,
-        tenant_id: Option<&str>,
-        space_id: Option<&str>,
-        container_work_path: &str,
-        runtime: &Arc<dyn ContainerRuntime>,
+        options: ContainerCreateOptions<'_>,
     ) -> Result<ContainerBasicInfo, AppError> {
         info!(
             "🔍 [CONTAINER_MGR] Starting container processing: project_id={}, service_type={:?}, pod_id={:?}, isolation_type={:?}",
-            project_id, service_type, pod_id, isolation_type
+            options.project_id, options.service_type, options.pod_id, options.isolation_type
         );
 
         // 确定容器标识符：pod_id 有值时使用 pod_id，否则使用 project_id
-        let container_identifier = pod_id.unwrap_or(project_id);
+        let container_identifier = options.pod_id.unwrap_or(options.project_id);
 
         // 检查或创建容器
-        let container_info = ensure_container_exists(
-            project_id,
-            container_identifier,
-            service_type,
-            request_resource_limits,
-            pod_id,
-            isolation_type,
-            tenant_id,
-            space_id,
-            container_work_path,
-            runtime,
-        )
-        .await?;
+        let container_info = ensure_container_exists(&options, container_identifier).await?;
 
         info!(
             "✅ [CONTAINER_MGR] Container ready: project_id={}, container_id={}, container_identifier={}",
-            project_id, container_info.container_id, container_identifier
+            options.project_id, container_info.container_id, container_identifier
         );
 
         Ok(container_info)
@@ -89,21 +93,12 @@ impl ContainerManager {
 }
 
 /// 根据 project_id 检查对应容器是否存在，不存在就动态创建容器
-#[allow(clippy::too_many_arguments)] // 多租户 + 资源限制参数
 async fn ensure_container_exists(
-    project_id: &str,
+    options: &ContainerCreateOptions<'_>,
     container_identifier: &str,
-    service_type: &shared_types::ServiceType,
-    request_resource_limits: Option<shared_types::ServiceResourceLimits>,
-    pod_id: Option<&str>,
-    isolation_type: Option<&str>,
-    tenant_id: Option<&str>,
-    space_id: Option<&str>,
-    container_work_path: &str,
-    runtime: &Arc<dyn ContainerRuntime>,
 ) -> Result<ContainerBasicInfo, AppError> {
     // 1. 尝试获取现有容器（使用 container_identifier 查找）
-    if let Ok(Some(info)) = runtime.get_container_info(container_identifier).await {
+    if let Ok(Some(info)) = options.runtime.get_container_info(container_identifier).await {
         info!(
             "[CONTAINER_MGR] container already exists: container_identifier={}, container_id={}",
             container_identifier, info.container_id
@@ -114,41 +109,20 @@ async fn ensure_container_exists(
     // 2. 创建新容器
     info!(
         "🏗️ [CONTAINER_MGR] Container does not exist, creating new container: container_identifier={}, service_type={:?}, pod_id={:?}",
-        container_identifier, service_type, pod_id
+        container_identifier, options.service_type, options.pod_id
     );
 
-    create_container_for_request(
-        project_id,
-        container_identifier,
-        service_type,
-        runtime,
-        request_resource_limits,
-        pod_id,
-        isolation_type,
-        tenant_id,
-        space_id,
-        container_work_path,
-    )
-    .await
+    create_container_for_request(options, container_identifier).await
 }
 
 /// 为请求创建容器
-#[allow(clippy::too_many_arguments)] // 多租户 + 资源限制参数
 async fn create_container_for_request(
-    project_id: &str,
+    options: &ContainerCreateOptions<'_>,
     container_identifier: &str,
-    service_type: &shared_types::ServiceType,
-    runtime: &Arc<dyn ContainerRuntime>,
-    request_resource_limits: Option<shared_types::ServiceResourceLimits>,
-    pod_id: Option<&str>,
-    isolation_type: Option<&str>,
-    tenant_id: Option<&str>,
-    space_id: Option<&str>,
-    container_work_path: &str,
 ) -> Result<ContainerBasicInfo, AppError> {
     // 1. 准备工作目录（在 rcoder 容器内创建）
     // 注意：container_work_path 已经是完整的路径
-    create_workspace_dir(container_work_path)
+    create_workspace_dir(options.container_work_path)
         .await
         .map_err(|e| {
             AppError::with_message(
@@ -159,39 +133,39 @@ async fn create_container_for_request(
 
     info!(
         "📁 [CONTAINER_MGR] Project workspace prepared: {}",
-        container_work_path
+        options.container_work_path
     );
 
     // 2. 调用容器运行时启动容器
     // 注意：project_id 始终使用实际的 project_id（不被 pod_id 覆盖）
     // 容器命名由 runtime 层通过 pod_id 处理
     let mut params_builder = ContainerCreateParams::builder()
-        .project_id(project_id)
+        .project_id(options.project_id)
         .host_workspace_path("") // 空字符串，表示不使用硬编码挂载
-        .service_type(service_type.clone());
+        .service_type(options.service_type.clone());
 
     // 只有在有资源限制时才设置
-    if let Some(limits) = request_resource_limits {
+    if let Some(limits) = options.request_resource_limits.clone() {
         params_builder = params_builder.resource_limits(limits);
     }
 
     // 设置可选的隔离参数（如果提供的话）
-    if let Some(pid) = pod_id {
+    if let Some(pid) = options.pod_id {
         params_builder = params_builder.pod_id(pid);
     }
-    if let Some(it) = isolation_type {
+    if let Some(it) = options.isolation_type {
         params_builder = params_builder.isolation_type(it);
     }
-    if let Some(tid) = tenant_id {
+    if let Some(tid) = options.tenant_id {
         params_builder = params_builder.tenant_id(tid);
     }
-    if let Some(sid) = space_id {
+    if let Some(sid) = options.space_id {
         params_builder = params_builder.space_id(sid);
     }
 
     let params = params_builder.build();
 
-    let container_info = runtime.create_container(params).await.map_err(|e| {
+    let container_info = options.runtime.create_container(params).await.map_err(|e| {
         error!("[CONTAINER_MGR] Failed to start container: {}", e);
         AppError::with_message(
             ERR_CONTAINER_ERROR,

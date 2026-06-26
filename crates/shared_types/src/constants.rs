@@ -14,6 +14,38 @@ pub const GRPC_DEFAULT_PORT: u16 = 50051;
 /// agent_runner HTTP 服务（健康检查等）端口
 pub const HTTP_DEFAULT_PORT: u16 = 8086;
 
+/// noVNC 服务端口
+///
+/// agent_runner noVNC 服务端口（Web VNC 访问）
+pub const NOVNC_PORT: u16 = 6080;
+
+/// ttyd Web 终端端口
+///
+/// agent_runner ttyd Web 终端端口
+pub const TTYD_PORT: u16 = 7681;
+
+// === K8s 配置 ===
+
+/// K8s 集群域名环境变量名
+pub const K8S_CLUSTER_DOMAIN_ENV: &str = "RCODER_K8S_CLUSTER_DOMAIN";
+
+/// K8s 默认集群域名
+pub const K8S_DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
+
+/// 获取 K8s 集群域名
+///
+/// 从环境变量 `RCODER_K8S_CLUSTER_DOMAIN` 获取，如果未设置则返回默认值 "cluster.local"
+pub fn get_k8s_cluster_domain() -> String {
+    std::env::var(K8S_CLUSTER_DOMAIN_ENV).unwrap_or_else(|_| K8S_DEFAULT_CLUSTER_DOMAIN.to_string())
+}
+
+/// 判断是否是 K8s 运行时（通过 features flag）
+///
+/// 返回 `true` 表示当前是 K8s 运行时，`false` 表示 Docker 运行时
+pub fn is_kubernetes_runtime() -> bool {
+    cfg!(feature = "kubernetes")
+}
+
 // === gRPC 超时配置 ===
 
 /// gRPC 连接超时（秒）

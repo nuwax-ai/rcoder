@@ -181,17 +181,18 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
                         })?;
                     if !platforms.is_empty() {
                         let force = force.unwrap_or(false);
-                        return url_installer::install_with_version_check(
-                            &self.lock_manager,
-                            &self.registry,
-                            &self.path_manager,
-                            &agent_id,
-                            &command,
-                            &args,
-                            ver,
-                            &platforms,
+                        let params = url_installer::VersionCheckInstallParams {
+                            lock_manager: &self.lock_manager,
+                            registry: &self.registry,
+                            path_manager: &self.path_manager,
+                            agent_id: &agent_id,
+                            command: &command,
+                            args: &args,
+                            version: ver,
+                            platforms: &platforms,
                             force,
-                        )
+                        };
+                        return url_installer::install_with_version_check(params)
                         .await
                         .map_err(Self::to_status)
                         .map(Response::new);

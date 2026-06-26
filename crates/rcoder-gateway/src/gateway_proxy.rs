@@ -72,6 +72,7 @@ pub struct GatewayProxy {
     config: Arc<GatewayConfig>,
     cluster_cache: Arc<ClusterCache>,
     session_resolver: Arc<SessionResolver>,
+    cluster_domain: String,
 }
 
 impl GatewayProxy {
@@ -82,9 +83,12 @@ impl GatewayProxy {
         let cluster_cache = Arc::new(ClusterCache::new(control_client.clone(), ttl));
         let session_resolver = Arc::new(SessionResolver::new(control_client, ttl));
 
+        // K8s 集群域名配置
+        let cluster_domain = shared_types::get_k8s_cluster_domain();
+
         info!(
-            "[GATEWAY] initialized, control={}, namespace={}",
-            config.control_plane_url, config.namespace
+            "[GATEWAY] initialized, control={}, namespace={}, cluster_domain={}",
+            config.control_plane_url, config.namespace, cluster_domain
         );
 
         Self {
@@ -92,6 +96,7 @@ impl GatewayProxy {
             config,
             cluster_cache,
             session_resolver,
+            cluster_domain,
         }
     }
 
@@ -141,8 +146,8 @@ impl GatewayProxy {
     /// 使用 ServiceType 的 Display trait 获取字符串前缀
     fn build_service_fqdn(&self, identifier: &str, service_type: ServiceType) -> String {
         format!(
-            "{}-{}-svc.{}.svc.cluster.local",
-            service_type, identifier, self.config.namespace
+            "{}-{}-svc.{}.svc.{}",
+            service_type, identifier, self.config.namespace, self.cluster_domain
         )
     }
 

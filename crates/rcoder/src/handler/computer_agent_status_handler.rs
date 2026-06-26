@@ -7,7 +7,7 @@ use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-use super::utils::{I18nJsonOrQuery, get_locale_from_headers, get_realtime_container_ip};
+use super::utils::{I18nJsonOrQuery, get_locale_from_headers};
 use crate::router::AppState;
 use crate::{AppError, HttpResult};
 use shared_types::{ComputerAgentStatusRequest, ComputerAgentStatusResponse};
@@ -196,29 +196,19 @@ pub async fn computer_agent_status(
     );
 
     // 4. 主动调用 gRPC GetStatus 确认 Agent 真实状态
-    // 使用实时 IP 获取，避免 restart 后 IP 过期
-    let grpc_addr = match get_realtime_container_ip(
-        state.runtime(),
+    // 使用 K8s Service FQDN 而不是 Pod IP
+    // 这样可以利用 K8s 的服务发现和负载均衡能力
+    let svc_fqdn = super::utils::build_k8s_service_fqdn(
         &container_info.container_name,
-        &container_info.container_ip,
-        &state.container_prefix_rcoder,
-        &state.container_prefix_computer,
-    )
-    .await
-    {
-        Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
-        Err(e) => {
-            error!(
-                "❌ [COMPUTER_AGENT_STATUS] Failed to get container IP: identifier={}, error={}",
-                identifier_str, e
-            );
-            // Early return: 直接 move request 的字段
-            return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
-                request.user_id.clone(),
-                project_id.to_string(),
-            )));
-        }
-    };
+        &state.config.app_manager.namespace,
+        &state.cluster_domain,
+    );
+    let grpc_addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
+
+    debug!(
+        "📡 [COMPUTER_AGENT_STATUS] Using K8s Service FQDN for gRPC: {}",
+        grpc_addr
+    );
 
     debug!(
         "📡 [COMPUTER_AGENT_STATUS] gRPC address: {}, project_id={}",
@@ -226,18 +216,16 @@ pub async fn computer_agent_status(
     );
 
     // 调用 gRPC GetStatus（带超时和重试，重试时自动重新获取 IP）
-    let grpc_response = match call_grpc_get_status_with_retry(
-        &state.grpc_pool,
-        state.runtime(),
-        &container_info.container_name,
-        &container_info.container_ip,
-        &state.container_prefix_rcoder,
-        &state.container_prefix_computer,
+    let get_status_params = GetStatusParams {
+        pool: &state.grpc_pool,
+        container_name: &container_info.container_name,
+        namespace: &state.config.app_manager.namespace,
         project_id,
-        GRPC_MAX_RETRIES,
+        max_retries: GRPC_MAX_RETRIES,
         locale,
-    )
-    .await
+        cluster_domain: &state.cluster_domain,
+    };
+    let grpc_response = match call_grpc_get_status_with_retry(get_status_params).await
     {
         Ok(response) => response,
         Err(e) => {
@@ -354,9 +342,15 @@ pub async fn computer_agent_status(
 ///
 /// # 参数
 /// - `pool`: gRPC 连接池
-/// - `grpc_addr`: gRPC 服务地址
+/// - `runtime`: 容器运行时
+/// - `container_name`: 容器名称
+/// - `fallback_ip`: 回退 IP 地址
+/// - `rcoder_prefix`: RCoder 容器前缀
+/// - `computer_prefix`: Computer 容器前缀
+/// - `namespace`: K8s namespace
 /// - `project_id`: 项目 ID
 /// - `max_retries`: 最大重试次数
+/// - `locale`: 语言设置
 ///
 /// # 返回
 /// - `Ok(status)`: 从 Agent 返回的状态字符串（可能的值取决于 Agent 实现，通常为 "idle", "busy", "error", "not_found" 等）
@@ -364,61 +358,68 @@ pub async fn computer_agent_status(
 ///
 /// # 重试策略
 /// - 仅对可重试的错误进行重试：Unavailable, DeadlineExceeded, Unknown, Internal
+///
+/// gRPC GetStatus 请求参数
+///
+/// 封装了调用 gRPC GetStatus 所需的所有参数，
+/// 避免函数参数过多。
+struct GetStatusParams<'a> {
+    /// gRPC 连接池
+    pool: &'a Arc<crate::grpc::GrpcChannelPool>,
+    /// 容器名称
+    container_name: &'a str,
+    /// K8s namespace
+    namespace: &'a str,
+    /// 项目 ID
+    project_id: &'a str,
+    /// 最大重试次数
+    max_retries: u32,
+    /// 语言设置
+    locale: &'static str,
+    /// K8s 集群域名
+    cluster_domain: &'a str,
+}
+
 /// - 使用指数退避：100ms, 200ms, 400ms
 /// - 失败后自动从连接池移除失败的连接，并重新获取容器 IP
-#[allow(clippy::too_many_arguments)]
 async fn call_grpc_get_status_with_retry(
-    pool: &Arc<crate::grpc::GrpcChannelPool>,
-    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
-    container_name: &str,
-    fallback_ip: &str,
-    rcoder_prefix: &str,
-    computer_prefix: &str,
-    project_id: &str,
-    max_retries: u32,
-    locale: &'static str,
+    params: GetStatusParams<'_>,
 ) -> anyhow::Result<shared_types::grpc::GetStatusResponse> {
     let mut last_error = None;
-    let mut grpc_addr = format!("{}:{}", fallback_ip, shared_types::GRPC_DEFAULT_PORT);
 
-    for attempt in 1..=max_retries {
-        // 重新获取最新容器 IP（每次重试时）
+    // 使用 K8s Service FQDN 而不是 Pod IP
+    // 这样可以利用 K8s 的服务发现和负载均衡能力
+    let svc_fqdn = super::utils::build_k8s_service_fqdn(
+        params.container_name,
+        params.namespace,
+        params.cluster_domain,
+    );
+    let grpc_addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
+
+    debug!(
+        "📡 [GRPC_GET_STATUS] Using K8s Service FQDN for gRPC: {}",
+        grpc_addr
+    );
+
+    for attempt in 1..=params.max_retries {
+        // K8s Service FQDN 是稳定的，不需要重新解析
+        // 直接使用原来的 FQDN 进行重试
         if attempt > 1 {
-            match get_realtime_container_ip(
-                runtime,
-                container_name,
-                fallback_ip,
-                rcoder_prefix,
-                computer_prefix,
-            )
-            .await
-            {
-                Ok(ip) => {
-                    let new_addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
-                    info!(
-                        "🔄 [GRPC_GET_STATUS] Container IP re-resolved: {} -> {}",
-                        grpc_addr, new_addr
-                    );
-                    grpc_addr = new_addr;
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ [GRPC_GET_STATUS] Failed to re-resolve container IP, keeping old address: {}",
-                        e
-                    );
-                }
-            }
+            debug!(
+                "🔄 [GRPC_GET_STATUS] Retrying with same K8s Service FQDN: {}",
+                grpc_addr
+            );
         }
 
-        match pool.get_client(&grpc_addr).await {
+        match params.pool.get_client(&grpc_addr).await {
             Ok(mut client) => {
                 let request = shared_types::grpc::GetStatusRequest {
-                    project_id: project_id.to_string(),
+                    project_id: params.project_id.to_string(),
                     session_id: String::new(), // 查询项目级别状态
                 };
 
                 // 设置超时
-                let mut tonic_request = crate::grpc::new_request_with_locale(request, locale);
+                let mut tonic_request = crate::grpc::new_request_with_locale(request, params.locale);
                 tonic_request
                     .set_timeout(std::time::Duration::from_secs(GRPC_REQUEST_TIMEOUT_SECS));
 
@@ -427,7 +428,7 @@ async fn call_grpc_get_status_with_retry(
                         let grpc_response = response.into_inner();
                         debug!(
                             "✅ [GRPC_GET_STATUS] Attempt {} succeeded: project_id={}, status={}, is_found={}",
-                            attempt, project_id, grpc_response.status, grpc_response.is_found
+                            attempt, params.project_id, grpc_response.status, grpc_response.is_found
                         );
                         return Ok(grpc_response);
                     }
@@ -441,16 +442,16 @@ async fn call_grpc_get_status_with_retry(
                                 | tonic::Code::Internal
                         );
 
-                        if should_retry && attempt < max_retries {
+                        if should_retry && attempt < params.max_retries {
                             warn!(
                                 "⚠️ [GRPC_GET_STATUS] Attempt {} failed (retryable): project_id={}, code={:?}, error={}",
                                 attempt,
-                                project_id,
+                                params.project_id,
                                 e.code(),
                                 e
                             );
                             // 从连接池移除失败的连接
-                            pool.remove(&grpc_addr).await;
+                            params.pool.remove(&grpc_addr).await;
                             last_error = Some(anyhow::anyhow!("gRPC call failed: {}", e));
 
                             // 指数退避: 100ms, 200ms, 400ms
@@ -461,7 +462,7 @@ async fn call_grpc_get_status_with_retry(
                             error!(
                                 "❌ [GRPC_GET_STATUS] Attempt {} failed (non-retryable or max retries reached): project_id={}, code={:?}, error={}",
                                 attempt,
-                                project_id,
+                                params.project_id,
                                 e.code(),
                                 e
                             );
@@ -476,9 +477,9 @@ async fn call_grpc_get_status_with_retry(
                     attempt, e
                 );
                 // 从连接池移除可能失效的连接
-                pool.remove(&grpc_addr).await;
+                params.pool.remove(&grpc_addr).await;
                 last_error = Some(e);
-                if attempt < max_retries {
+                if attempt < params.max_retries {
                     // 指数退避: 100ms, 200ms, 400ms
                     let delay_ms = 100 * (1 << (attempt - 1));
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;

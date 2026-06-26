@@ -249,16 +249,16 @@ impl App {
             ..
         } = *self;
         if let Err(e) = self.terminal.draw(|frame| {
-            ui::draw(
-                frame,
+            let params = ui::DrawParams {
                 chat,
                 composer,
-                pending_prompt.as_deref(),
-                permission_overlay.as_ref(),
+                pending_prompt: pending_prompt.as_deref(),
+                permission_overlay: permission_overlay.as_ref(),
                 use_markdown,
                 project_id,
                 session_id,
-            )
+            };
+            ui::draw(frame, params)
         }) {
             eprintln!("渲染失败: {}", e);
         }

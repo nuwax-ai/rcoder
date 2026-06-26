@@ -63,6 +63,9 @@ pub struct KubernetesRuntime {
 pub struct KubernetesRuntimeConfig {
     /// Namespace where pods are created
     pub namespace: String,
+    /// K8s cluster domain (default: "cluster.local")
+    /// 用于构建 K8s Service FQDN: <service>.<namespace>.svc.<cluster_domain>
+    pub cluster_domain: String,
     /// Pod cleanup TTL in seconds
     pub pod_ttl_seconds: Option<u64>,
     /// Default image pull secret (if needed)
@@ -97,6 +100,9 @@ impl KubernetesRuntime {
         let namespace =
             std::env::var("RCODER_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
 
+        // K8s 集群域名配置 (用于构建 Service FQDN)
+        let cluster_domain = shared_types::get_k8s_cluster_domain();
+
         // NFS 存储配置 (支持外部 NFS Server)
         let nfs_server = std::env::var("RCODER_K8S_NFS_SERVER")
             .unwrap_or_else(|_| "nfs-server.nfs-storage.svc.cluster.local".to_string());
@@ -108,8 +114,8 @@ impl KubernetesRuntime {
             .unwrap_or_else(|_| "ReadWriteMany".to_string());
 
         info!(
-            "[K8S] Kubernetes runtime initialized, namespace: {}",
-            namespace
+            "[K8S] Kubernetes runtime initialized, namespace: {}, cluster_domain: {}",
+            namespace, cluster_domain
         );
         info!(
             "[K8S] NFS storage: server={}, path={}, storage_class={}, access_mode={}",
@@ -121,6 +127,7 @@ impl KubernetesRuntime {
             namespace: namespace.clone(),
             config: KubernetesRuntimeConfig {
                 namespace: namespace.clone(),
+                cluster_domain,
                 pod_ttl_seconds: config.container_ttl_seconds,
                 image_pull_secret: std::env::var("RCODER_K8S_IMAGE_PULL_SECRET").ok(),
                 service_account_name: "rcoder-pods-sa".to_string(),
@@ -285,12 +292,32 @@ impl KubernetesRuntime {
         })
     }
 
+    /// 根据运行环境获取容器访问地址
+    ///
+    /// - K8s 环境：使用 K8s Service FQDN
+    /// - Docker 环境：使用容器 IP
+    fn get_container_access_address(&self, identifier: &str, service_type: &ServiceType, _container_ip: &str) -> String {
+        // K8s 环境：使用 K8s Service FQDN
+        let svc_name = self.agent_service_name(identifier, service_type).unwrap_or_else(|_| {
+            format!("{}-{}", service_type, identifier)
+        });
+        format!("{}.{}.svc.{}", svc_name, self.namespace, self.config.cluster_domain)
+    }
+
     /// Build container basic info from runtime container info
     async fn build_container_basic_info(
         &self,
         project_id: &str,
         pod_info: &RuntimeContainerInfo,
+        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        // 使用 K8s Service FQDN 而不是 Pod IP
+        let access_address = self.get_container_access_address(
+            &pod_info.container_name,
+            service_type,
+            &pod_info.container_ip,
+        );
+
         Ok(ContainerBasicInfo {
             container_id: pod_info.container_id.clone(),
             container_name: pod_info.container_name.clone(),
@@ -302,7 +329,7 @@ impl KubernetesRuntime {
             created_at: pod_info.created_at,
             service_url: format!(
                 "http://{}:{}",
-                pod_info.container_ip,
+                access_address,
                 shared_types::HTTP_DEFAULT_PORT
             ),
         })
@@ -601,8 +628,10 @@ impl ContainerRuntime for KubernetesRuntime {
         if let Some(cached) = self.pod_cache.read().await.get(identifier)
             && cached.status == ContainerRuntimeStatus::Running
         {
+            // get_container_info 只用于 WebAgentRunner
+            let service_type = shared_types::ServiceType::WebAgentRunner;
             return Ok(Some(
-                self.build_container_basic_info(identifier, cached).await?,
+                self.build_container_basic_info(identifier, cached, &service_type).await?,
             ));
         }
 
@@ -638,6 +667,9 @@ impl ContainerRuntime for KubernetesRuntime {
                     })
                     .unwrap_or_else(Utc::now);
 
+                // get_container_info 只用于 WebAgentRunner
+                let service_type = shared_types::ServiceType::WebAgentRunner;
+
                 let pod_info = RuntimeContainerInfo {
                     container_id: uid,
                     container_name: name,
@@ -656,7 +688,7 @@ impl ContainerRuntime for KubernetesRuntime {
                 }
 
                 return Ok(Some(
-                    self.build_container_basic_info(identifier, &pod_info)
+                    self.build_container_basic_info(identifier, &pod_info, &service_type)
                         .await?,
                 ));
             }

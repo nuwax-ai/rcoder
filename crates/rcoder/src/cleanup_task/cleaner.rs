@@ -35,6 +35,10 @@ impl AgentCleaner {
         let config_clone = config.clone();
         let state_clone = state.clone();
         let grpc_pool = state.grpc_pool.clone();
+        let namespace = state.config.app_manager.namespace.clone();
+
+        // 判断是否是 K8s 运行时（通过 features flag）
+        let is_kubernetes = shared_types::is_kubernetes_runtime();
 
         // 创建日志清理器（使用配置）
         let log_cleaner = super::logs::LogCleaner::new(
@@ -52,6 +56,9 @@ impl AgentCleaner {
                 docker_manager.clone(),
                 grpc_pool,
                 pingora_service,
+                namespace,
+                state.cluster_domain.clone(),
+                is_kubernetes,
             ),
             agent_scanner: {
                 use crate::cleanup_task::agent::AgentScanner;

@@ -48,6 +48,10 @@ pub struct ProjectAdapter {
     project_to_container: DashMap<String, String>,
     /// RAII 清理通道（unbounded，send 是同步的）
     cleanup_tx: tokio::sync::mpsc::UnboundedSender<CleanupRequest>,
+    /// K8s namespace（用于构建 K8s Service FQDN）
+    namespace: String,
+    /// K8s 集群域名
+    cluster_domain: String,
 
     // === 反向索引（CQRS：写入时维护，读取时 O(1)） ===
     /// container_id → container_key（按容器 ID 快速查找）
@@ -63,10 +67,12 @@ impl ProjectAdapter {
     ///
     /// 返回 (adapter, cleanup_receiver)。
     /// cleanup_receiver 需要传给 ResourceReaper 以处理容器销毁。
-    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<CleanupRequest>) {
+    pub fn new(namespace: String, cluster_domain: String) -> (Self, tokio::sync::mpsc::UnboundedReceiver<CleanupRequest>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter = Self {
             projects: DashMap::new(),
+            namespace,
+            cluster_domain,
             containers: DashMap::new(),
             session_index: DashMap::new(),
             project_to_container: DashMap::new(),
@@ -657,6 +663,8 @@ impl ProjectAdapter {
                 container_name: info.container_name,
                 service_type: entry.service_type(),
                 container_ip: info.container_ip,
+                namespace: self.namespace.clone(),
+                cluster_domain: self.cluster_domain.clone(),
                 project_ids,
             });
         }
@@ -874,6 +882,8 @@ impl ProjectAdapter {
                 container_name: info.container_name,
                 service_type: entry.service_type(),
                 container_ip: info.container_ip,
+                namespace: self.namespace.clone(),
+                cluster_domain: self.cluster_domain.clone(),
                 project_ids: vec![],
             });
         }

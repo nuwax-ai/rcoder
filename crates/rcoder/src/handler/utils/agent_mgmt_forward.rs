@@ -10,7 +10,6 @@
 //! 再包装成 `Stream<Item = Result<InstallAgentRequest, Status>>` 调 gRPC。
 
 use bytes::Bytes;
-use container_runtime_api::ContainerRuntime;
 use futures_util::stream;
 use shared_types::ProjectAndContainerInfo;
 use shared_types::grpc::agent_mgmt_service_client::AgentMgmtServiceClient;
@@ -36,7 +35,6 @@ use tonic::transport::Channel;
 use tracing::{debug, instrument, warn};
 
 use crate::grpc::GrpcChannelPool;
-use crate::handler::utils::grpc_addr::get_realtime_container_ip;
 
 /// 1MB chunk size(与 `shared_types::UPLOAD_CHUNK_SIZE` 对齐)
 const CHUNK_SIZE: usize = shared_types::UPLOAD_CHUNK_SIZE;
@@ -45,9 +43,10 @@ const CHUNK_SIZE: usize = shared_types::UPLOAD_CHUNK_SIZE;
 #[derive(Clone)]
 pub struct AgentMgmtForwardCtx {
     pub pool: Arc<GrpcChannelPool>,
-    pub runtime: Arc<dyn ContainerRuntime>,
-    pub rcoder_prefix: String,
-    pub computer_prefix: String,
+    /// K8s namespace（用于构建 K8s Service FQDN）
+    pub namespace: String,
+    /// K8s 集群域名
+    pub cluster_domain: String,
     /// 当前请求 locale(预留,目前未在转发层使用,保留供后续 i18n 错误消息注入)
     #[allow(dead_code)]
     pub locale: &'static str,
@@ -75,16 +74,14 @@ impl AgentMgmtForwardCtx {
     /// 从 `AppState` 构造转发上下文
     pub fn from_state(
         pool: Arc<GrpcChannelPool>,
-        runtime: Arc<dyn ContainerRuntime>,
-        rcoder_prefix: String,
-        computer_prefix: String,
+        namespace: String,
+        cluster_domain: String,
         locale: &'static str,
     ) -> Self {
         Self {
             pool,
-            runtime,
-            rcoder_prefix,
-            computer_prefix,
+            namespace,
+            cluster_domain,
             locale,
             endpoint_override: None,
         }
@@ -125,17 +122,15 @@ impl AgentMgmtForwardCtx {
             )
         })?;
 
-        let ip = get_realtime_container_ip(
-            &self.runtime,
+        // 使用 K8s Service FQDN 而不是 Pod IP
+        // 这样可以利用 K8s 的服务发现和负载均衡能力
+        let svc_fqdn = super::build_k8s_service_fqdn(
             &container.container_name,
-            &container.container_ip,
-            &self.rcoder_prefix,
-            &self.computer_prefix,
-        )
-        .await
-        .map_err(|e| AppError::with_message(ec::ERR_GRPC_ADDR_ERROR, e))?;
+            &self.namespace,
+            &self.cluster_domain,
+        );
 
-        let addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
+        let addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
 
         self.pool.get_mgmt_client(&addr).await.map_err(|e| {
             warn!("[agent_mgmt_forward] gRPC connect failed: addr={addr}, err={e}");

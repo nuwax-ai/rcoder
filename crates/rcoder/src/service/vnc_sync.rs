@@ -49,6 +49,8 @@ pub fn start_vnc_sync_task(
     rcoder_prefix: String,
     computer_prefix: String,
     runtime: Arc<dyn ContainerRuntime>,
+    namespace: String,
+    cluster_domain: String,
 ) -> tokio::task::JoinHandle<()> {
     info!(
         "🔄 [VNC_SYNC] Starting VNC backend sync task: interval={}s",
@@ -62,7 +64,7 @@ pub fn start_vnc_sync_task(
         // 无需手动调用 sync_vnc_backends，避免重复执行
         loop {
             interval.tick().await;
-            sync_vnc_backends(&pingora_service, &rcoder_prefix, &computer_prefix, &runtime).await;
+            sync_vnc_backends(&pingora_service, &rcoder_prefix, &computer_prefix, &runtime, &namespace, &cluster_domain).await;
         }
     })
 }
@@ -73,6 +75,8 @@ async fn sync_vnc_backends(
     rcoder_prefix: &str,
     computer_prefix: &str,
     runtime: &Arc<dyn ContainerRuntime>,
+    namespace: &str,
+    cluster_domain: &str,
 ) {
     let containers = match runtime.list_containers().await {
         Ok(list) => list,
@@ -110,13 +114,19 @@ async fn sync_vnc_backends(
             .cloned()
             .unwrap_or_default();
 
-        // 如果有 project_id，存储 project_id -> container_ip 的映射（用于 WebTtydProxy）
+        // 如果有 project_id，存储 project_id -> K8s Service FQDN 的映射（用于 WebTtydProxy）
         if !project_id.is_empty() && !container_info.container_ip.is_empty() {
+            // 使用 K8s Service FQDN 而不是 Pod IP
+            let svc_fqdn = crate::handler::utils::build_k8s_service_fqdn(
+                &container_info.container_name,
+                namespace,
+                cluster_domain,
+            );
             debug!(
                 "➕ [VNC_SYNC] Adding project_id mapping: project_id={} -> {}",
-                project_id, container_info.container_ip
+                project_id, svc_fqdn
             );
-            pingora_service.add_project_backend(&project_id, &container_info.container_ip);
+            pingora_service.add_project_backend(&project_id, &svc_fqdn);
         }
 
         let user_id = container_identity_from_name(
@@ -153,17 +163,24 @@ async fn sync_vnc_backends(
             continue;
         }
 
+        // 使用 K8s Service FQDN 而不是 Pod IP
+        let svc_fqdn = super::super::handler::utils::build_k8s_service_fqdn(
+            &container_info.container_name,
+            namespace,
+            cluster_domain,
+        );
+
         // 检查是否需要更新映射
         let needs_update = match pingora_service.get_vnc_backend(&user_id) {
-            Some(existing_ip) if existing_ip == container_ip => {
-                // IP 没有变化，无需更新
+            Some(existing_fqdn) if existing_fqdn == svc_fqdn => {
+                // FQDN 没有变化，无需更新
                 false
             }
-            Some(existing_ip) => {
-                // IP 变化了，需要更新
+            Some(existing_fqdn) => {
+                // FQDN 变化了，需要更新
                 debug!(
-                    "🔄 [VNC_SYNC] Container IP changed: user_id={}, old={}, new={}",
-                    user_id, existing_ip, container_ip
+                    "🔄 [VNC_SYNC] Container FQDN changed: user_id={}, old={}, new={}",
+                    user_id, existing_fqdn, svc_fqdn
                 );
                 true
             }
@@ -171,14 +188,14 @@ async fn sync_vnc_backends(
                 // 新容器，需要添加
                 debug!(
                     "➕ [VNC_SYNC] New container mapping: user_id={} -> {}",
-                    user_id, container_ip
+                    user_id, svc_fqdn
                 );
                 true
             }
         };
 
         if needs_update {
-            pingora_service.add_vnc_backend(&user_id, &container_ip);
+            pingora_service.add_vnc_backend(&user_id, &svc_fqdn);
             updated_count += 1;
         }
         synced_count += 1;
@@ -284,11 +301,19 @@ async fn sync_vnc_backends(
 pub async fn sync_single_vnc_backend(
     pingora_service: &Arc<PingoraProxyService>,
     user_id: &str,
-    container_ip: &str,
+    container_name: &str,
+    namespace: &str,
+    cluster_domain: &str,
 ) {
-    pingora_service.add_vnc_backend(user_id, container_ip);
+    // 使用 K8s Service FQDN 而不是 Pod IP
+    let svc_fqdn = super::super::handler::utils::build_k8s_service_fqdn(
+        container_name,
+        namespace,
+        cluster_domain,
+    );
+    pingora_service.add_vnc_backend(user_id, &svc_fqdn);
     debug!(
         "➕ [VNC_SYNC] Single container mapping updated: user_id={} -> {}",
-        user_id, container_ip
+        user_id, svc_fqdn
     );
 }
