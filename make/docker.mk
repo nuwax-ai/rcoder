@@ -87,10 +87,11 @@ docker-build-master-base:
 #
 # proxy 默认关闭：子进程会收到真实 MODEL_PROVIDER API key/base_url（如 nuwax-codex-acp 本地鉴权）。
 # 需要密钥经 Pingora 注入时，构建前设置例如：
-#   make dev-restart CARGO_FEATURES='--features ebpf-debug,pyroscope,otel,debug,kubernetes,proxy'
+#   make dev-restart CARGO_FEATURES='--features ebpf-debug,pyroscope,otel,debug,proxy'
 #
 # 本地开发调试默认开启上述功能（http-server / grpc-server 仍由 agent_runner 默认 features 提供）
-CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug,kubernetes
+# 注意：kubernetes feature 仅用于 K8s 环境，Docker Compose 模式不要启用
+CARGO_FEATURES ?= --features ebpf-debug,pyroscope,otel,debug
 
 # 构建 agent-runner 镜像（基于基础镜像，快速构建）
 docker-build-agent-runner:
