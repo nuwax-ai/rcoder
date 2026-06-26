@@ -419,7 +419,7 @@ pub struct SseErrorEvent {
 async fn validate_and_get_session_context(
     state: Arc<crate::router::AppState>,
     session_id: &str,
-) -> Result<(String, String), Response> {
+) -> Result<(String, String, String), Response> {
     // ========== 阶段 1: 获取项目信息（所有分支都需要） ==========
     // 🔧 优化：提前获取 project_info，避免后续重复查询
     // 同时获取 DockerManager（用于容器验证和降级查询）
@@ -636,13 +636,18 @@ async fn validate_and_get_session_context(
     // 🎯 优化：直接使用阶段 1 中已获取的 project_info，避免重复查询
     let project_id = project_info.project_id().to_string();
 
+    // 获取 container_ip（Docker 环境需要）
+    let container_ip = project_info.container()
+        .map(|c| c.container_ip.clone())
+        .unwrap_or_default();
+
     // 注意：由于阶段 3 已经处理了 project_info.container() 为 None 的情况
     // （通过 Docker API 降级查询），这里无需再次验证容器信息的完整性
     info!(
-        " [SSE_PROXY] All validations passed: session_id={}, project_id={}, container_name={}",
-        session_id, project_id, container_name
+        " [SSE_PROXY] All validations passed: session_id={}, project_id={}, container_name={}, container_ip={}",
+        session_id, project_id, container_name, container_ip
     );
-    Ok((project_id, container_name))
+    Ok((project_id, container_name, container_ip))
 }
 
 /// 创建 SSE 响应流
@@ -654,6 +659,8 @@ async fn validate_and_get_session_context(
 struct SseStreamParams {
     /// 容器名称
     container_name: String,
+    /// 容器 IP（Docker 环境使用）
+    container_ip: String,
     /// 会话 ID
     session_id: String,
     /// 项目 ID
@@ -677,21 +684,28 @@ struct SseStreamParams {
 async fn build_sse_stream_from_container_name(
     params: SseStreamParams,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
-    // 使用 K8s Service FQDN 而不是 Pod IP
-    // 这样可以利用 K8s 的服务发现和负载均衡能力
-    let svc_fqdn = super::utils::build_k8s_service_fqdn(
-        &params.container_name,
-        &params.namespace,
-        &params.cluster_domain,
-    );
-
-    debug!(
-        "📡 [SSE] Using K8s Service FQDN for gRPC: {}",
-        svc_fqdn
-    );
-
-    // 使用 K8s Service FQDN 构建 gRPC 地址
-    let grpc_addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
+    // 根据运行环境选择 gRPC 地址
+    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
+    // - Docker 环境：使用容器 IP（直接连接）
+    let grpc_addr = if shared_types::is_kubernetes_runtime() {
+        let svc_fqdn = super::utils::build_k8s_service_fqdn(
+            &params.container_name,
+            &params.namespace,
+            &params.cluster_domain,
+        );
+        debug!(
+            "📡 [SSE] Using K8s Service FQDN for gRPC: {}",
+            svc_fqdn
+        );
+        format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
+    } else {
+        let addr = format!("{}:{}", params.container_ip, shared_types::GRPC_DEFAULT_PORT);
+        debug!(
+            "📡 [SSE] Using container IP for gRPC: {}",
+            addr
+        );
+        addr
+    };
     info!(
         " [gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
         params.service_type, grpc_addr, params.project_id
@@ -903,7 +917,7 @@ pub async fn agent_session_notification(
     );
 
     // 使用核心验证函数获取上下文
-    let (project_id, container_name) =
+    let (project_id, container_name, container_ip) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
     // 构造活跃时间更新闭包（捕获 state 引用）
@@ -916,6 +930,7 @@ pub async fn agent_session_notification(
     // 使用通用函数创建 SSE 响应流
     let params = SseStreamParams {
         container_name,
+        container_ip,
         session_id: session_id.to_string(),
         project_id,
         grpc_pool: state.grpc_pool.clone(),
@@ -1018,7 +1033,7 @@ pub async fn computer_agent_progress_notification(
     );
 
     // 使用与 agent_session_notification 相同的验证逻辑
-    let (project_id, container_name) =
+    let (project_id, container_name, container_ip) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
     // 构造活跃时间更新闭包（捕获 state 引用）
@@ -1031,6 +1046,7 @@ pub async fn computer_agent_progress_notification(
     // 使用通用函数创建 SSE 响应流
     let params = SseStreamParams {
         container_name,
+        container_ip,
         session_id: session_id.to_string(),
         project_id,
         grpc_pool: state.grpc_pool.clone(),

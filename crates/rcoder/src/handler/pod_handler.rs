@@ -1045,6 +1045,7 @@ pub async fn pod_ensure(
                         pingora_service,
                         &container_identifier,
                         &info.container_name,
+                        &info.container_ip,
                         &state.config.app_manager.namespace,
                         &state.cluster_domain,
                     )
@@ -1433,6 +1434,7 @@ pub async fn pod_ensure(
             pingora_service,
             &container_identifier,
             &container_info.container_name,
+            &container_info.container_ip,
             &state.config.app_manager.namespace,
             &state.cluster_domain,
         )
@@ -1933,6 +1935,7 @@ pub async fn pod_restart(
             pingora_service,
             &container_identifier,
             &container_info.container_name,
+            &container_info.container_ip,
             &state.config.app_manager.namespace,
             &state.cluster_domain,
         )
@@ -2529,19 +2532,29 @@ pub async fn pod_vnc_status(
     }
 
     // 6. 构建 gRPC 地址
-    // 使用 K8s Service FQDN 而不是 Pod IP
-    // 这样可以利用 K8s 的服务发现和负载均衡能力
-    let svc_fqdn = super::utils::build_k8s_service_fqdn(
-        &result.container_name,
-        &state.config.app_manager.namespace,
-        &state.cluster_domain,
-    );
-    let grpc_addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
-
-    info!(
-        " [POD_VNC_STATUS] Using K8s Service FQDN for gRPC: {}",
-        grpc_addr
-    );
+    // 根据运行环境选择 gRPC 地址
+    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
+    // - Docker 环境：使用容器 IP（直接连接）
+    let grpc_addr = if shared_types::is_kubernetes_runtime() {
+        let svc_fqdn = super::utils::build_k8s_service_fqdn(
+            &result.container_name,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
+        );
+        let addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
+        info!(
+            " [POD_VNC_STATUS] Using K8s Service FQDN for gRPC: {}",
+            addr
+        );
+        addr
+    } else {
+        let addr = format!("{}:{}", result.container_ip, shared_types::GRPC_DEFAULT_PORT);
+        info!(
+            " [POD_VNC_STATUS] Using container IP for gRPC: {}",
+            addr
+        );
+        addr
+    };
 
     match state.grpc_pool.get_client(&grpc_addr).await {
         Ok(mut client) => {

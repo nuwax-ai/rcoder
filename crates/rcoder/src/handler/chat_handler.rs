@@ -575,19 +575,29 @@ async fn forward_request_to_container_service(
     );
 
     // 🎯 使用 gRPC 替代 HTTP
-    // 使用 K8s Service FQDN 而不是 Pod IP
-    // 这样可以利用 K8s 的服务发现和负载均衡能力
+    // 根据运行环境选择 gRPC 地址
+    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
+    // - Docker 环境：使用容器 IP（直接连接）
     let container_name = container_info.container_name.clone();
-    let grpc_addr = super::utils::build_k8s_grpc_addr(
-        &container_name,
-        ctx.namespace,
-        ctx.cluster_domain,
-    );
-
-    debug!(
-        "📡 [FORWARD] Using K8s Service FQDN for gRPC: {}",
-        grpc_addr
-    );
+    let grpc_addr = if shared_types::is_kubernetes_runtime() {
+        let addr = super::utils::build_k8s_grpc_addr(
+            &container_name,
+            ctx.namespace,
+            ctx.cluster_domain,
+        );
+        debug!(
+            "📡 [FORWARD] Using K8s Service FQDN for gRPC: {}",
+            addr
+        );
+        addr
+    } else {
+        let addr = format!("{}:{}", container_info.container_ip, shared_types::GRPC_DEFAULT_PORT);
+        debug!(
+            "📡 [FORWARD] Using container IP for gRPC: {}",
+            addr
+        );
+        addr
+    };
 
     debug!(
         "📡 [FORWARD] Sending gRPC request to: {}, prompt_length={}, attachments_count={}",

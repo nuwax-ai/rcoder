@@ -122,15 +122,19 @@ impl AgentMgmtForwardCtx {
             )
         })?;
 
-        // 使用 K8s Service FQDN 而不是 Pod IP
-        // 这样可以利用 K8s 的服务发现和负载均衡能力
-        let svc_fqdn = super::build_k8s_service_fqdn(
-            &container.container_name,
-            &self.namespace,
-            &self.cluster_domain,
-        );
-
-        let addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
+        // 根据运行环境选择 gRPC 地址
+        // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
+        // - Docker 环境：使用容器 IP（直接连接）
+        let addr = if shared_types::is_kubernetes_runtime() {
+            let svc_fqdn = super::build_k8s_service_fqdn(
+                &container.container_name,
+                &self.namespace,
+                &self.cluster_domain,
+            );
+            format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
+        } else {
+            format!("{}:{}", container.container_ip, shared_types::GRPC_DEFAULT_PORT)
+        };
 
         self.pool.get_mgmt_client(&addr).await.map_err(|e| {
             warn!("[agent_mgmt_forward] gRPC connect failed: addr={addr}, err={e}");

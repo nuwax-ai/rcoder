@@ -196,19 +196,29 @@ pub async fn computer_agent_status(
     );
 
     // 4. 主动调用 gRPC GetStatus 确认 Agent 真实状态
-    // 使用 K8s Service FQDN 而不是 Pod IP
-    // 这样可以利用 K8s 的服务发现和负载均衡能力
-    let svc_fqdn = super::utils::build_k8s_service_fqdn(
-        &container_info.container_name,
-        &state.config.app_manager.namespace,
-        &state.cluster_domain,
-    );
-    let grpc_addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
-
-    debug!(
-        "📡 [COMPUTER_AGENT_STATUS] Using K8s Service FQDN for gRPC: {}",
-        grpc_addr
-    );
+    // 根据运行环境选择 gRPC 地址
+    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
+    // - Docker 环境：使用容器 IP（直接连接）
+    let grpc_addr = if shared_types::is_kubernetes_runtime() {
+        let svc_fqdn = super::utils::build_k8s_service_fqdn(
+            &container_info.container_name,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
+        );
+        let addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
+        debug!(
+            "📡 [COMPUTER_AGENT_STATUS] Using K8s Service FQDN for gRPC: {}",
+            addr
+        );
+        addr
+    } else {
+        let addr = format!("{}:{}", container_info.container_ip, shared_types::GRPC_DEFAULT_PORT);
+        debug!(
+            "📡 [COMPUTER_AGENT_STATUS] Using container IP for gRPC: {}",
+            addr
+        );
+        addr
+    };
 
     debug!(
         "📡 [COMPUTER_AGENT_STATUS] gRPC address: {}, project_id={}",
@@ -219,6 +229,7 @@ pub async fn computer_agent_status(
     let get_status_params = GetStatusParams {
         pool: &state.grpc_pool,
         container_name: &container_info.container_name,
+        container_ip: &container_info.container_ip,
         namespace: &state.config.app_manager.namespace,
         project_id,
         max_retries: GRPC_MAX_RETRIES,
@@ -368,6 +379,8 @@ struct GetStatusParams<'a> {
     pool: &'a Arc<crate::grpc::GrpcChannelPool>,
     /// 容器名称
     container_name: &'a str,
+    /// 容器 IP（Docker 环境使用）
+    container_ip: &'a str,
     /// K8s namespace
     namespace: &'a str,
     /// 项目 ID
@@ -387,19 +400,29 @@ async fn call_grpc_get_status_with_retry(
 ) -> anyhow::Result<shared_types::grpc::GetStatusResponse> {
     let mut last_error = None;
 
-    // 使用 K8s Service FQDN 而不是 Pod IP
-    // 这样可以利用 K8s 的服务发现和负载均衡能力
-    let svc_fqdn = super::utils::build_k8s_service_fqdn(
-        params.container_name,
-        params.namespace,
-        params.cluster_domain,
-    );
-    let grpc_addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
-
-    debug!(
-        "📡 [GRPC_GET_STATUS] Using K8s Service FQDN for gRPC: {}",
-        grpc_addr
-    );
+    // 根据运行环境选择 gRPC 地址
+    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
+    // - Docker 环境：使用容器 IP（直接连接）
+    let grpc_addr = if shared_types::is_kubernetes_runtime() {
+        let svc_fqdn = super::utils::build_k8s_service_fqdn(
+            params.container_name,
+            params.namespace,
+            params.cluster_domain,
+        );
+        let addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
+        debug!(
+            "📡 [GRPC_GET_STATUS] Using K8s Service FQDN for gRPC: {}",
+            addr
+        );
+        addr
+    } else {
+        let addr = format!("{}:{}", params.container_ip, shared_types::GRPC_DEFAULT_PORT);
+        debug!(
+            "📡 [GRPC_GET_STATUS] Using container IP for gRPC: {}",
+            addr
+        );
+        addr
+    };
 
     for attempt in 1..=params.max_retries {
         // K8s Service FQDN 是稳定的，不需要重新解析

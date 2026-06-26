@@ -46,6 +46,100 @@ pub fn is_kubernetes_runtime() -> bool {
     cfg!(feature = "kubernetes")
 }
 
+/// 构建 K8s Service FQDN
+///
+/// # 参数
+/// - `container_name`: 容器名称
+/// - `namespace`: K8s namespace
+/// - `cluster_domain`: K8s 集群域名
+///
+/// # 返回
+/// K8s Service FQDN，格式如 `container-svc.namespace.svc.cluster.local`
+pub fn build_k8s_service_fqdn(
+    container_name: &str,
+    namespace: &str,
+    cluster_domain: &str,
+) -> String {
+    format!("{}-svc.{}.svc.{}", container_name, namespace, cluster_domain)
+}
+
+/// 构建后端地址
+///
+/// 根据运行环境自动选择后端地址：
+/// - K8s 环境：使用 K8s Service FQDN（格式：`container-svc.namespace.svc.cluster.local`）
+/// - Docker 环境：使用容器 IP（格式：`192.168.1.100`）
+///
+/// # 参数
+/// - `container_name`: 容器名称（用于 K8s Service FQDN 构建）
+/// - `container_ip`: 容器 IP（Docker 环境使用）
+/// - `namespace`: K8s namespace
+/// - `cluster_domain`: K8s 集群域名
+///
+/// # 返回
+/// 后端地址，格式如 `host`（不含端口）
+pub fn build_backend_addr(
+    container_name: &str,
+    container_ip: &str,
+    namespace: &str,
+    cluster_domain: &str,
+) -> String {
+    if is_kubernetes_runtime() {
+        // K8s 环境：使用 K8s Service FQDN
+        build_k8s_service_fqdn(container_name, namespace, cluster_domain)
+    } else {
+        // Docker 环境：使用容器 IP
+        container_ip.to_string()
+    }
+}
+
+/// 构建 gRPC 地址
+///
+/// 根据运行环境自动选择 gRPC 地址：
+/// - K8s 环境：使用 K8s Service FQDN（格式：`container-svc.namespace.svc.cluster.local:50051`）
+/// - Docker 环境：使用容器 IP（格式：`192.168.1.100:50051`）
+///
+/// # 参数
+/// - `container_name`: 容器名称（用于 K8s Service FQDN 构建）
+/// - `container_ip`: 容器 IP（Docker 环境使用）
+/// - `namespace`: K8s namespace
+/// - `cluster_domain`: K8s 集群域名
+///
+/// # 返回
+/// gRPC 地址，格式如 `host:port`
+pub fn build_grpc_addr(
+    container_name: &str,
+    container_ip: &str,
+    namespace: &str,
+    cluster_domain: &str,
+) -> String {
+    let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
+    format!("{}:{}", backend_addr, GRPC_DEFAULT_PORT)
+}
+
+/// 构建 HTTP 地址
+///
+/// 根据运行环境自动选择 HTTP 地址：
+/// - K8s 环境：使用 K8s Service FQDN（格式：`container-svc.namespace.svc.cluster.local:8086`）
+/// - Docker 环境：使用容器 IP（格式：`192.168.1.100:8086`）
+///
+/// # 参数
+/// - `container_name`: 容器名称（用于 K8s Service FQDN 构建）
+/// - `container_ip`: 容器 IP（Docker 环境使用）
+/// - `namespace`: K8s namespace
+/// - `cluster_domain`: K8s 集群域名
+///
+/// # 返回
+/// HTTP 地址，格式如 `host:port`
+pub fn build_http_addr(
+    container_name: &str,
+    container_ip: &str,
+    namespace: &str,
+    cluster_domain: &str,
+) -> String {
+    let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
+    format!("{}:{}", backend_addr, HTTP_DEFAULT_PORT)
+}
+
 // === gRPC 超时配置 ===
 
 /// gRPC 连接超时（秒）
