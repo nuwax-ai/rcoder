@@ -67,7 +67,7 @@ pub(crate) fn ensure_subprocess_path_env(
         let path = build_mcp_server_path_env();
         if !path.is_empty() {
             merged_envs.insert("PATH".to_string(), path);
-            debug!("[SACP] 📋 already built PATH (using existing PATH directory)");
+            debug!("[SACP] already built PATH (using existing PATH directory)");
         }
     }
     #[cfg(windows)]
@@ -180,7 +180,7 @@ fn ensure_windows_subprocess_env(merged_envs: &mut std::collections::HashMap<Str
     if !merged_envs.contains_key("PATHEXT") {
         if let Ok(pathext) = std::env::var("PATHEXT") {
             merged_envs.insert("PATHEXT".to_string(), pathext);
-            debug!("[SACP] 📋 PATHEXT already set");
+            debug!("[SACP] PATHEXT already set");
         }
     }
 }
@@ -310,7 +310,7 @@ pub(crate) fn apply_sensitive_model_env_fallback(
         return;
     }
 
-    info!("[SACP] 🔒 Model env resolver requested sensitive env replacement");
+    info!("[SACP] Model env resolver requested sensitive env replacement");
     for key in [
         ENV_ANTHROPIC_API_KEY,
         ENV_OPENAI_API_KEY,
@@ -319,7 +319,7 @@ pub(crate) fn apply_sensitive_model_env_fallback(
     ] {
         if env.contains_key(key) && !explicitly_bound_keys.contains(key) {
             env.insert(key.to_string(), resolved.api_key.clone());
-            info!("[SACP] 🔒 Replaced {} with resolver-provided API key", key);
+            info!("[SACP] Replaced {} with resolver-provided API key", key);
         }
     }
     for key in [
@@ -329,7 +329,7 @@ pub(crate) fn apply_sensitive_model_env_fallback(
     ] {
         if env.contains_key(key) && !explicitly_bound_keys.contains(key) {
             env.insert(key.to_string(), resolved.base_url.clone());
-            info!("[SACP] 🔒 Replaced {} with: {}", key, resolved.base_url);
+            info!("[SACP] Replaced {} with: {}", key, resolved.base_url);
         }
     }
 }

@@ -21,7 +21,7 @@ pub fn spawn_tool_version_log(name: &'static str, cmd: &'static [&'static str]) 
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if output.status.success() && !stdout.is_empty() {
-                    info!("📦 {} version: {}", name, stdout);
+                    info!("{} version: {}", name, stdout);
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                     let detail = if stderr.is_empty() {
@@ -29,7 +29,7 @@ pub fn spawn_tool_version_log(name: &'static str, cmd: &'static [&'static str]) 
                     } else {
                         stderr
                     };
-                    warn!("📦 {} version check failed: {}", name, detail);
+                    warn!("{} version check failed: {}", name, detail);
                 }
             }
             Err(e) => {

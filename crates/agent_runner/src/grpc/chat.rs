@@ -61,11 +61,10 @@ pub async fn chat(
     let service_type = req
         .service_type
         .as_ref()
-        .and_then(|st| match st.as_str() {
-            "ComputerAgentRunner" => Some(shared_types::ServiceType::ComputerAgentRunner),
-            "RCoder" => Some(shared_types::ServiceType::WebAgentRunner),
-            _ => {
-                warn!("[gRPC] Invalid service_type: {}, using default RCoder", st);
+        .and_then(|st| match st.parse::<shared_types::ServiceType>() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                warn!("[gRPC] Invalid service_type: {}, using default WebAgentRunner. Error: {}", st, e);
                 None
             }
         })

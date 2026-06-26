@@ -760,14 +760,14 @@ impl DockerManager {
                 }
                 Ok(Some(realtime_info)) => {
                     warn!(
-                        "⚠️ [FIND_CONTAINER] Container in DashMap marked Running but has empty IP, treating as stopped: container_name={}, container_id={}",
+                        "[FIND_CONTAINER] Container in DashMap marked Running but has empty IP, treating as stopped: container_name={}, container_id={}",
                         info.container_name, info.container_id
                     );
                     (realtime_info.container_ip, ContainerStatus::Stopped)
                 }
                 _ => {
                     warn!(
-                        "⚠️ [FIND_CONTAINER] Container in DashMap marked Running but not found via Docker API, treating as stopped: container_name={}, container_id={}",
+                        "[FIND_CONTAINER] Container in DashMap marked Running but not found via Docker API, treating as stopped: container_name={}, container_id={}",
                         info.container_name, info.container_id
                     );
                     (String::new(), ContainerStatus::Stopped)
@@ -791,7 +791,7 @@ impl DockerManager {
             Ok(config) => config.container_prefix().to_string(),
             Err(e) => {
                 warn!(
-                    "⚠️ [FIND_CONTAINER] Failed to get service config, using default prefix: service_type={:?}, error={}",
+                    "[FIND_CONTAINER] Failed to get service config, using default prefix: service_type={:?}, error={}",
                     service_type, e
                 );
                 service_type.container_prefix().to_string()
@@ -837,7 +837,7 @@ impl DockerManager {
                     })
                 ) {
                     warn!(
-                        "⚠️ [GET_AGENT_INFO] Container was externally deleted (status 404), cleaning up memory mapping: project_id={}, container_id={}",
+                        "[GET_AGENT_INFO] Container was externally deleted (status 404), cleaning up memory mapping: project_id={}, container_id={}",
                         project_id, container_info.container_id
                     );
                     self.containers.remove(project_id).await;
@@ -852,7 +852,7 @@ impl DockerManager {
         // 清理内存映射并返回 None，让上层调用者重新创建容器
         if network_ips.is_empty() {
             warn!(
-                "⚠️ [GET_AGENT_INFO] Container has no network info (may have been deleted), cleaning up memory mapping: project_id={}, container_id={}",
+                "[GET_AGENT_INFO] Container has no network info (may have been deleted), cleaning up memory mapping: project_id={}, container_id={}",
                 project_id, container_info.container_id
             );
             self.containers.remove(project_id).await;
@@ -978,7 +978,7 @@ impl DockerManager {
             Ok(config) => config.container_prefix().to_string(),
             Err(e) => {
                 warn!(
-                    "⚠️ [FIND_CONTAINER] Failed to get service config, using default prefix: service_type={:?}, error={}",
+                    "[FIND_CONTAINER] Failed to get service config, using default prefix: service_type={:?}, error={}",
                     service_type, e
                 );
                 service_type.container_prefix().to_string()
@@ -1065,7 +1065,7 @@ impl DockerManager {
                 {
                     // HOSTNAME 是容器 ID 的前 12 位
                     if container_id.starts_with(current_id) {
-                        info!("🚫 skip removing container: {}", container_id);
+                        info!("skip removing container: {}", container_id);
                         return false;
                     }
                 }

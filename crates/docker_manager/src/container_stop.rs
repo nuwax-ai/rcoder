@@ -484,7 +484,7 @@ pub fn get_container_patterns_for_enabled_services(
             let prefix = config.container_prefix();
             let pattern = format!("{}-*", prefix);
             tracing::debug!(
-                "🔍 [CLEANUP_PATTERN] Service type: {:?}, using prefix: {}, pattern: {}",
+                "[CLEANUP_PATTERN] Service type: {:?}, using prefix: {}, pattern: {}",
                 config.service_type,
                 prefix,
                 pattern
@@ -543,7 +543,7 @@ pub async fn startup_cleanup_all_enabled_services(
         return Ok(CleanupResult::default());
     }
 
-    info!("🧹 Starting cleanup container: {:?}", patterns);
+    info!("Starting cleanup container: {:?}", patterns);
     let start_time = Instant::now();
 
     // 并行清理多个服务类型的容器

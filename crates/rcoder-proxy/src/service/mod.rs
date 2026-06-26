@@ -109,7 +109,7 @@ impl ProxyHttp for PortProxy {
     ) -> PingoraResult<bool> {
         let req_header = session.req_header();
         info!(
-            "🔍 [PINGORA] request_filter called: path={}",
+            "[PINGORA] request_filter called: path={}",
             req_header.uri.path()
         );
         // 协议转换已移除，所有请求直接走正常代理流程
@@ -124,7 +124,7 @@ impl ProxyHttp for PortProxy {
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
         info!(
-            "🔍 [PINGORA] upstream_request_filter called: path={}",
+            "[PINGORA] upstream_request_filter called: path={}",
             upstream_request.uri.path()
         );
 
@@ -147,7 +147,7 @@ impl ProxyHttp for PortProxy {
                     // 验证通过，继续处理
                 }
                 Err(shared_types::ApiKeyAuthError::Invalid) => {
-                    warn!("🔒 [PINGORA_AUTH] Invalid API key for path: {}", path);
+                    warn!("[PINGORA_AUTH] Invalid API key for path: {}", path);
                     return Err(
                         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(401))
                             .more_context("Invalid API key".to_string()),
@@ -155,7 +155,7 @@ impl ProxyHttp for PortProxy {
                 }
                 Err(shared_types::ApiKeyAuthError::Missing) => {
                     warn!(
-                        "🔒 [PINGORA_AUTH] Missing x-api-key header for path: {}",
+                        "[PINGORA_AUTH] Missing x-api-key header for path: {}",
                         path
                     );
                     return Err(
@@ -164,7 +164,7 @@ impl ProxyHttp for PortProxy {
                     );
                 }
                 Err(shared_types::ApiKeyAuthError::ConfigError) => {
-                    error!("🔒 [PINGORA_AUTH] Configuration error");
+                    error!("[PINGORA_AUTH] Configuration error");
                     return Err(
                         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(500))
                             .more_context("Internal configuration error".to_string()),
@@ -206,7 +206,7 @@ impl ProxyHttp for PortProxy {
                 // 健康检查：代理到 Axum 的 /health 端点
                 // 这样既能验证 Pingora 正常运行，又能验证 Axum 正常运行
                 debug!(
-                    "🏥 Health check request: {} - proxying to Axum ({})",
+                    "Health check request: {} - proxying to Axum ({})",
                     path, self.default_backend_port
                 );
 
@@ -278,7 +278,7 @@ impl ProxyHttp for PortProxy {
         let req_header = session.req_header();
         let path = Self::normalize_path(req_header.uri.path());
 
-        info!("🔍 [PINGORA] upstream_peer called: path={}", path);
+        info!("[PINGORA] upstream_peer called: path={}", path);
 
         // 使用 matchit 匹配路由
         let matched = self.router.at(path).map_err(|_| {
@@ -408,7 +408,7 @@ impl ProxyHttp for PortProxy {
         // 只在 API 代理场景打印详细日志
         if ctx.upstream_host.is_some() {
             debug!(
-                "🔌 [API_PROXY] Connection established: ALPN={}, {}, reused={}",
+                "[API_PROXY] Connection established: ALPN={}, {}, reused={}",
                 alpn_str, tls_info, reused
             );
         }
@@ -447,7 +447,7 @@ impl ProxyHttp for PortProxy {
         // 只在 API 代理场景打印详细日志
         if ctx.upstream_host.is_some() {
             debug!(
-                "📥 [API_PROXY] Response: status={}, duration={:?}",
+                "[API_PROXY] Response: status={}, duration={:?}",
                 status_text, duration
             );
         }

@@ -37,12 +37,12 @@ pub async fn init_proxy(
     );
 
     info!("[Pingora] starting to initialize Pingora config...");
-    info!("🔧 [Pingora] listen port: {}", proxy_config.listen_port);
+    info!(" [Pingora] listen port: {}", proxy_config.listen_port);
     info!(
-        "🔧 [Pingora] Default backend port: {}",
+        " [Pingora] Default backend port: {}",
         proxy_config.default_backend_port
     );
-    info!("🔧 [Pingora] backend host: {}", proxy_config.backend_host);
+    info!(" [Pingora] backend host: {}", proxy_config.backend_host);
 
     let pingora_config = ProxyConfig {
         listen_port: proxy_config.listen_port,
@@ -67,7 +67,7 @@ pub async fn init_proxy(
     if proxy_config.health_check.enabled {
         let hc = &proxy_config.health_check;
         info!(
-            "🔧 [Pingora] Starting health check loop: interval={}s, timeout={}s",
+            " [Pingora] Starting health check loop: interval={}s, timeout={}s",
             hc.interval_seconds, hc.timeout_seconds
         );
         pingora_service.start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
@@ -77,7 +77,7 @@ pub async fn init_proxy(
     info!("[Pingora] starting Pingora server...");
     let (pingora_shutdown_tx, pingora_shutdown_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        info!("📍 [Pingora] calling server_manager.start()...");
+        info!(" [Pingora] calling server_manager.start()...");
         if let Err(e) = server_manager.start(pingora_shutdown_rx).await {
             error!("[Pingora] Pingora proxy start failed, error: {:?}", e);
         }
@@ -96,10 +96,10 @@ pub async fn init_proxy(
 pub fn log_proxy_info(config: &AppConfig) {
     if let Some(proxy_config) = &config.proxy_config {
         info!("Pingora proxy already started");
-        info!("📡 listenport: {}", proxy_config.listen_port);
+        info!(" listenport: {}", proxy_config.listen_port);
         info!("route: /proxy/{{port}}{{/path}} - example: /proxy/3000/api/users");
         info!("format: query port parameter to proxy request");
-        info!("💡 example:");
+        info!(" example:");
         info!(
             "   http://localhost:{}/proxy/{}/health → http://127.0.0.1:{}/health",
             proxy_config.listen_port, config.port, config.port

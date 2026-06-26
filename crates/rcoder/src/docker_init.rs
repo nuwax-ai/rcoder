@@ -69,7 +69,7 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
         }
 
         info!(
-            "🔍 [DEBUG] docker_config.network_base_name = {:?}",
+            " [DEBUG] docker_config.network_base_name = {:?}",
             docker_config.network_base_name
         );
         if let Some(ref network_base_name) = docker_config.network_base_name {
@@ -77,7 +77,7 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
             default_config.network_base_name = network_base_name.clone();
         } else {
             info!(
-                "⚠️ No network_base_name in config, using default: {}",
+                " No network_base_name in config, using default: {}",
                 default_config.network_base_name
             );
         }
@@ -106,7 +106,7 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
 
         default_config
     } else {
-        info!("⚠️ no Docker config, using default config");
+        info!(" no Docker config, using default config");
         docker_manager::DockerManagerConfig::default()
     }
 }
@@ -166,7 +166,7 @@ pub async fn startup_cleanup(config: &AppConfig) {
                         shared_types::get_enabled_service_types(&multi_image_config);
                     if result.successfully_removed > 0 {
                         info!(
-                            "✅ Startup cleanup completed, removed {} leftover containers (covering {} service types)",
+                            " Startup cleanup completed, removed {} leftover containers (covering {} service types)",
                             result.successfully_removed,
                             enabled_services.len()
                         );
@@ -235,7 +235,7 @@ pub fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(String, Str
 }
 
 fn show_docker_configuration_help(socket_path: &str) {
-    error!("📋 Docker config help:");
+    error!(" Docker config help:");
     error!("");
     error!("add to docker-compose.yml config:");
     error!("");
@@ -247,12 +247,12 @@ fn show_docker_configuration_help(socket_path: &str) {
     error!("      - {}:/var/run/docker.sock:ro", socket_path);
     error!("      - ./data/rcoder/project_workspace:/app/project_workspace");
     error!("");
-    error!("🔧 Docker socket path:");
+    error!(" Docker socket path:");
     error!(" Linux: /var/run/docker.sock");
     error!("  macOS + Docker Desktop: /var/run/docker.sock");
     error!("  Rootless Docker: /run/user/$UID/docker.sock");
     error!("");
-    error!("🛠️ troubleshooting:");
+    error!(" troubleshooting:");
     error!("1. check Docker: docker ps");
     error!("2. check socket file exists: ls -l {}", socket_path);
     error!("3. check docker group: groups $USER | grep docker");

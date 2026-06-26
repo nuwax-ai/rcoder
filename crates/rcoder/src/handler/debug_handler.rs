@@ -144,7 +144,7 @@ pub async fn debug_list_projects(
         })
         .collect();
 
-    info!("✅ [DEBUG_PROJECTS] Listed {} projects", result.len());
+    info!(" [DEBUG_PROJECTS] Listed {} projects", result.len());
 
     HttpResult::success(result)
 }
@@ -182,7 +182,7 @@ pub async fn debug_list_containers(
         })
         .collect();
 
-    info!("✅ [DEBUG_CONTAINERS] Listed {} containers", result.len());
+    info!(" [DEBUG_CONTAINERS] Listed {} containers", result.len());
 
     HttpResult::success(result)
 }

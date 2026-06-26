@@ -82,15 +82,15 @@ pub async fn check_local_grpc_port() -> bool {
 
     match timeout(Duration::from_secs(1), TcpStream::connect(&addr)).await {
         Ok(Ok(_)) => {
-            debug!("✅ [HEALTH] Local gRPC port check passed: {}", addr);
+            debug!("[HEALTH] Local gRPC port check passed: {}", addr);
             true
         }
         Ok(Err(e)) => {
-            debug!("❌ [HEALTH] Local gRPC port check failed {}: {}", addr, e);
+            debug!("[HEALTH] Local gRPC port check failed {}: {}", addr, e);
             false
         }
         Err(_) => {
-            debug!("⏱️ [HEALTH] Local gRPC port check timeout: {}", addr);
+            debug!("[HEALTH] Local gRPC port check timeout: {}", addr);
             false
         }
     }

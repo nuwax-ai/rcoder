@@ -54,7 +54,7 @@ pub fn to_grpc_chat_request(
         system_prompt,
         user_prompt,
         agent_config: agent_config.map(to_grpc_chat_agent_config),
-        service_type: service_type.map(|st| format!("{:?}", st)),
+        service_type: service_type.map(|st| st.to_string()),
         user_id,        // 传递 user_id
         is_devcomputer, // 🆕 传递 is_devcomputer
         agent_work_dir, // 🆕 传递 agent_work_dir

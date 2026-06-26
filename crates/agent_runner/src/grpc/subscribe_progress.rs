@@ -65,7 +65,7 @@ pub async fn subscribe_progress(
         let session_id = req.session_id.clone();
 
         info!(
-            "📡 [gRPC] SubscribeProgress started: session_id={}",
+            "[gRPC] SubscribeProgress started: session_id={}",
             session_id
         );
 
@@ -83,27 +83,27 @@ pub async fn subscribe_progress(
             // view() 在闭包返回后立即释放锁，无 Ref 暴露
             let session_data = if let Some(existing) = SESSION_CACHE.view(&session_id_clone, |_, d| d.clone()) {
                 info!(
-                    "📦 [gRPC] SESSION_CACHE found, reusing: session_id={}",
+                    "[gRPC] SESSION_CACHE found, reusing: session_id={}",
                     session_id_clone
                 );
                 existing
             } else {
                 info!(
-                    "🆕 [gRPC] SESSION_CACHE not found, creating new SessionData: session_id={}",
+                    "[gRPC] SESSION_CACHE not found, creating new SessionData: session_id={}",
                     session_id_clone
                 );
                 let session_data = crate::service::SessionData::new(1000).await;
                 match SESSION_CACHE.entry(session_id_clone.clone()) {
                     Entry::Occupied(entry) => {
                         info!(
-                            "📦 [gRPC] SESSION_CACHE exists after creation, reusing: session_id={}",
+                            "[gRPC] SESSION_CACHE exists after creation, reusing: session_id={}",
                             session_id_clone
                         );
                         entry.get().clone()
                     }
                     Entry::Vacant(entry) => {
                         info!(
-                            "🆕 [gRPC] SESSION_CACHE created successfully: session_id={}",
+                            "[gRPC] SESSION_CACHE created successfully: session_id={}",
                             session_id_clone
                         );
                         entry.insert(session_data.clone());
@@ -119,15 +119,19 @@ pub async fn subscribe_progress(
             match session_data.create_new_connection(100).await {
                 Ok((replay_messages, message_rx, cancellation_token)) => {
                     info!(
-                        "📡 [gRPC] Session connection created successfully: session_id={}, replay_count={}",
+                        "[gRPC] Session connection created successfully: session_id={}, replay_count={}",
                         session_id_clone, replay_messages.len()
                     );
 
                     // 📼 回放 ring buffer 中的历史消息
                     for msg in replay_messages {
                         let event = unified_message_to_progress_event(&msg);
+                        debug!(
+                            "[gRPC] Replaying ProgressEvent: session_id={}, message_type={}, sub_type={}, payload={}",
+                            session_id_clone, event.message_type, event.sub_type, event.payload
+                        );
                         if tx.send(Ok(event)).await.is_err() {
-                            debug!("📡 [gRPC] Client disconnected during replay");
+                            debug!("[gRPC] Client disconnected during replay");
                             session_data.close_current_connection().await;
                             return;
                         }
@@ -143,7 +147,7 @@ pub async fn subscribe_progress(
                     .await;
 
                     info!(
-                        "🔌 [gRPC] SubscribeProgress stream ended, cleaning up SSE sender: session_id={}, reason={}",
+                        "[gRPC] SubscribeProgress stream ended, cleaning up SSE sender: session_id={}, reason={}",
                         session_id_clone, reason
                     );
                     session_data.close_current_connection().await;
@@ -159,7 +163,7 @@ pub async fn subscribe_progress(
                         .await
                     {
                         warn!(
-                            "📡 [gRPC] Failed to send error status: session_id={}, error={}",
+                            "[gRPC] Failed to send error status: session_id={}, error={}",
                             session_id_clone, send_err
                         );
                     }
@@ -191,7 +195,7 @@ async fn run_stream_loop(
     loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => {
-                info!("📡 [gRPC] Session connection cancelled, sending SessionPromptEnd: session_id={}", session_id);
+                info!("[gRPC] Session connection cancelled, sending SessionPromptEnd: session_id={}", session_id);
 
                 use agent_client_protocol::schema::v1::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
@@ -206,7 +210,7 @@ async fn run_stream_loop(
                 let end_event = unified_message_to_progress_event(&unified_message);
 
                 if let Err(e) = tx.send(Ok(end_event)).await {
-                    warn!("📡 [gRPC] Failed to send SessionPromptEnd event: session_id={}, error={}", session_id, e);
+                    warn!("[gRPC] Failed to send SessionPromptEnd event: session_id={}, error={}", session_id, e);
                 }
 
                 return ExitReason::Cancelled;
@@ -223,21 +227,25 @@ async fn run_stream_loop(
                         );
 
                         let event = unified_message_to_progress_event(&unified_message);
+                        debug!(
+                            "[gRPC] Sending ProgressEvent: session_id={}, message_type={}, sub_type={}, payload={}",
+                            session_id, event.message_type, event.sub_type, event.payload
+                        );
                         if tx.send(Ok(event)).await.is_err() {
-                            debug!("📡 [gRPC] Client disconnected");
+                            debug!("[gRPC] Client disconnected");
                             return ExitReason::ClientDisconnected;
                         }
 
                         if is_terminal_message {
                             info!(
-                                "🔚 [gRPC] Received SessionPromptEnd, closing stream: session_id={}, sub_type={}",
+                                "[gRPC] Received SessionPromptEnd, closing stream: session_id={}, sub_type={}",
                                 session_id, unified_message.sub_type
                             );
                             return ExitReason::TerminalMessage;
                         }
                     }
                     None => {
-                        debug!("📡 [gRPC] Session channel closed, sending SessionPromptEnd event");
+                        debug!("[gRPC] Session channel closed, sending SessionPromptEnd event");
                         let end_event = ProgressEvent {
                             message_type: "SessionPromptEnd".to_string(),
                             sub_type: "end_turn".to_string(),
@@ -249,7 +257,7 @@ async fn run_stream_loop(
                             timestamp: chrono::Utc::now().timestamp_millis(),
                         };
                         if let Err(e) = tx.send(Ok(end_event)).await {
-                            warn!("📡 [gRPC] Failed to send SessionPromptEnd event: session_id={}, error={}", session_id, e);
+                            warn!("[gRPC] Failed to send SessionPromptEnd event: session_id={}, error={}", session_id, e);
                         }
                         return ExitReason::ChannelClosed;
                     }
@@ -259,7 +267,7 @@ async fn run_stream_loop(
                 // 检查空闲超时
                 if last_message_time.elapsed() > Duration::from_secs(IDLE_TIMEOUT_SECS) {
                     info!(
-                        "⏱️ [gRPC] Idle timeout ({}s) reached, closing stream: session_id={}",
+                        "[gRPC] Idle timeout ({}s) reached, closing stream: session_id={}",
                         IDLE_TIMEOUT_SECS, session_id
                     );
                     let timeout_event = ProgressEvent {
@@ -285,7 +293,7 @@ async fn run_stream_loop(
                 };
 
                 if tx.send(Ok(heartbeat)).await.is_err() {
-                    debug!("📡 [gRPC] Failed to send heartbeat; client disconnected");
+                    debug!("[gRPC] Failed to send heartbeat; client disconnected");
                     return ExitReason::HeartbeatFailed;
                 }
             }

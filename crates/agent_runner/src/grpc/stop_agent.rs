@@ -76,7 +76,7 @@ pub async fn stop_agent(
                 (status, session_id, cancel_tx)
             }
             None => {
-                info!("📭 [gRPC] Agent not found: project_id={}", project_id);
+                info!("[gRPC] Agent not found: project_id={}", project_id);
                 return Ok(Response::new(StopAgentResponse {
                     success: true,
                     result: "not_found".to_string(),
@@ -91,7 +91,7 @@ pub async fn stop_agent(
         };
 
         if agent_status == AgentStatus::Terminating {
-            info!("ℹ️ [gRPC] Agent is already stopping: project_id={}", project_id);
+            info!("[gRPC] Agent is already stopping: project_id={}", project_id);
 
             if !session_id.is_empty() {
                 send_session_prompt_end(

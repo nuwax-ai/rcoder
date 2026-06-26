@@ -33,7 +33,7 @@ pub async fn get_status(
         } else if !req.project_id.is_empty() {
             Some(req.project_id)
         } else {
-            info!("📊 [gRPC] GetStatus: all parameters are empty, returning not_found");
+            info!("[gRPC] GetStatus: all parameters are empty, returning not_found");
             return Ok(Response::new(GetStatusResponse {
                 status: "not_found".to_string(),
                 is_found: false,

@@ -46,7 +46,7 @@ pub static BLOCKING_CONFIG: std::sync::LazyLock<Arc<std::sync::RwLock<BlockingCo
 /// });
 /// ```
 pub fn inject_blocking(config: BlockingConfig) {
-    tracing::warn!("🧪 [TEST] Blocking config updated: {:?}", config);
+    tracing::warn!("[TEST] Blocking config updated: {:?}", config);
     let mut global = BLOCKING_CONFIG.write().unwrap();
     *global = config;
 }

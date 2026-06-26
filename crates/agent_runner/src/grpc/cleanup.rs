@@ -141,7 +141,7 @@ pub fn remove_agent_and_cleanup(project_id: &str) {
             });
         }
     } else {
-        warn!("⚠️ [gRPC] Agent not in Registry: project_id={}", project_id);
+        warn!("[gRPC] Agent not in Registry: project_id={}", project_id);
     }
 }
 

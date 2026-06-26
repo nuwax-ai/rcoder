@@ -70,7 +70,7 @@ impl GrpcChannelPool {
             .time_to_idle(Duration::from_secs(CHANNEL_TTL_SECS))
             .eviction_listener(|key, _value, cause| {
                 debug!(
-                    "🔌 [gRPC] moka evicted connection: addr={}, cause={:?}",
+                    " [gRPC] moka evicted connection: addr={}, cause={:?}",
                     key, cause
                 );
             })
@@ -116,7 +116,7 @@ impl GrpcChannelPool {
     async fn get_or_create_channel(&self, addr: &str) -> Result<Channel> {
         // 快速路径：moka get 是 lock-free 的
         if let Some(channel) = self.channels.get(addr).await {
-            debug!("📡 [gRPC] reuse connection: {}", addr);
+            debug!(" [gRPC] reuse connection: {}", addr);
             return Ok(channel);
         }
 
@@ -126,7 +126,7 @@ impl GrpcChannelPool {
         let channel = self
             .channels
             .try_get_with(addr_key, async move {
-                info!("🔌 [gRPC] creating connection: {}", addr);
+                info!(" [gRPC] creating connection: {}", addr);
                 let endpoint = format!("http://{}", addr);
                 Channel::from_shared(endpoint)
                     .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
@@ -143,7 +143,7 @@ impl GrpcChannelPool {
             })
             .await
             .map_err(|e| {
-                warn!("🔌 [gRPC] try_get_with failed: {}", e);
+                warn!(" [gRPC] try_get_with failed: {}", e);
                 anyhow::anyhow!("Failed to get or create channel: {}", e)
             })?;
 
@@ -164,14 +164,14 @@ impl GrpcChannelPool {
         let had = self.channels.contains_key(addr);
         self.channels.invalidate(addr).await;
         if had {
-            info!("🔌 [gRPC] removed connection: {}", addr);
+            info!(" [gRPC] removed connection: {}", addr);
         }
     }
 
     /// 清空所有连接
     pub fn clear(&self) {
         self.channels.invalidate_all();
-        info!("🔌 [gRPC] cleared all connections");
+        info!(" [gRPC] cleared all connections");
     }
 
     /// 获取当前连接数

@@ -72,7 +72,7 @@ impl AgentCleaner {
         match self.log_cleaner.cleanup_once().await {
             Ok(log_stats) => {
                 if log_stats.files_deleted > 0 || log_stats.failed_deletions > 0 {
-                    info!("🗑️ [cleaner] Cleanup completed: {}", log_stats.summary());
+                    info!(" [cleaner] Cleanup completed: {}", log_stats.summary());
                 }
             }
             Err(e) => {
@@ -135,11 +135,11 @@ impl AgentCleaner {
                             destroyed_containers.insert(name);
                         }
                     }
-                    info!("✅ [cleaner] Agent cleanup succeeded: {}", project_id);
+                    info!(" [cleaner] Agent cleanup succeeded: {}", project_id);
                 }
                 Err(e) => {
                     current_stats.failed_cleaned += 1;
-                    warn!("⚠️ [cleaner] Agent cleanup failed: {} - {}", project_id, e);
+                    warn!(" [cleaner] Agent cleanup failed: {} - {}", project_id, e);
                 }
             }
         }
@@ -154,11 +154,11 @@ impl AgentCleaner {
 
         let duration = start_time.elapsed();
         info!(
-            "✅ [cleaner] Cleanup completed, duration: {:.2}s, this run: {}",
+            " [cleaner] Cleanup completed, duration: {:.2}s, this run: {}",
             duration.as_secs_f64(),
             current_stats.summary()
         );
-        info!("📊 [cleaner] Stats: {}", self.stats.summary());
+        info!(" [cleaner] Stats: {}", self.stats.summary());
 
         Ok(current_stats)
     }
@@ -166,7 +166,7 @@ impl AgentCleaner {
     /// 清理单个 agent
     /// 返回 Ok(true) 表示销毁了容器，Ok(false) 表示只删除了记录、或跳过清理（竞态保护时项目仍活跃）
     async fn cleanup_agent(&self, project_id: &str) -> Result<bool> {
-        info!("🧹 [cleaner] Starting cleanup agent: {}", project_id);
+        info!(" [cleaner] Starting cleanup agent: {}", project_id);
 
         // 1. 获取项目信息
         let agent_info = self
@@ -181,7 +181,7 @@ impl AgentCleaner {
         let idle_secs = (Utc::now() - agent_info.last_activity()).num_seconds();
         if idle_secs < self.config.idle_timeout.as_secs() as i64 {
             info!(
-                "🔄 [cleaner] Project activity refreshed after scan, skip cleanup: project_id={}, idle_secs={}s",
+                " [cleaner] Project activity refreshed after scan, skip cleanup: project_id={}, idle_secs={}s",
                 project_id, idle_secs
             );
             return Ok(false);

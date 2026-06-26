@@ -108,7 +108,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
     {
         info!(
-            "[SACP] 🚀 LAUNCH FUNCTION CALLED: project_id={}, has_agent_server_override={}, has_model_provider={}, service_uuid={:?}",
+            "[SACP] LAUNCH FUNCTION CALLED: project_id={}, has_agent_server_override={}, has_model_provider={}, service_uuid={:?}",
             project_id,
             start_config.agent_server_override.is_some(),
             model_provider.is_some(),
@@ -168,7 +168,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     resolved,
                 );
                 debug!(
-                    "🔧 [SACP] Replaced custom env var template, model={}",
+                    "[SACP] Replaced custom env var template, model={}",
                     resolved.default_model
                 );
                 info!(
@@ -176,7 +176,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     bound_model_env_keys.len()
                 );
                 info!(
-                    "🎯 [SACP] Using custom Agent: agent_id={}, command={} {:?}",
+                    "[SACP] Using custom Agent: agent_id={}, command={} {:?}",
                     agent_server_override.get_agent_id(),
                     cmd,
                     args
@@ -197,7 +197,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     .collect();
                 if !unresolved_keys.is_empty() {
                     warn!(
-                        "[SACP] ⚠️ model_provider is None, {} env keys contain unresolved template placeholders: {:?}. Agent may fail due to invalid config.",
+                        "[SACP] model_provider is None, {} env keys contain unresolved template placeholders: {:?}. Agent may fail due to invalid config.",
                         unresolved_keys.len(),
                         unresolved_keys
                     );
@@ -207,7 +207,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     );
                 }
                 info!(
-                    "🎯 [SACP] Using custom Agent: agent_id={}, command={} {:?}",
+                    "[SACP] Using custom Agent: agent_id={}, command={} {:?}",
                     agent_server_override.get_agent_id(),
                     cmd,
                     args
@@ -217,7 +217,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         } else {
             // 使用默认配置
             info!(
-                "📋 [SACP] Using default Agent: {} {:?}",
+                "[SACP] Using default Agent: {} {:?}",
                 default_agent_config.command, default_agent_config.args
             );
             (
@@ -289,7 +289,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             info!("[SACP] using config file MCP servers");
             convert_context_servers_sacp(&default_agent_config.context_servers)
         } else {
-            info!("📝 [SACP] no config MCP servers");
+            info!("[SACP] no config MCP servers");
             Vec::new()
         };
 
@@ -337,12 +337,12 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     permission_config.to_string(),
                 );
                 info!(
-                    "[SACP] 🔒 Setting default OPENCODE_PERMISSION for nuwaxcode (agent_mode={:?}): {}",
+                    "[SACP] Setting default OPENCODE_PERMISSION for nuwaxcode (agent_mode={:?}): {}",
                     start_config.agent_mode, permission_config
                 );
             } else if let Some(perm) = merged_envs.get(ENV_OPENCODE_PERMISSION) {
                 info!(
-                    "[SACP] 🔒 Using request-provided OPENCODE_PERMISSION: {}",
+                    "[SACP] Using request-provided OPENCODE_PERMISSION: {}",
                     perm
                 );
             }
@@ -352,7 +352,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         // 🔍 调试：打印替换前的关键环境变量
         info!(
-            "[SACP] 🔍 Before UUID replacement: OPENAI_BASE_URL={}, ANTHROPIC_BASE_URL={}, service_uuid={:?}",
+            "[SACP] Before UUID replacement: OPENAI_BASE_URL={}, ANTHROPIC_BASE_URL={}, service_uuid={:?}",
             merged_envs
                 .get(ENV_OPENAI_BASE_URL)
                 .map(|s| s.as_str())
@@ -366,17 +366,17 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         // 替换 UUID 占位符
         if let Some(ref uuid) = service_uuid {
-            info!("[SACP] 🔍 Replacing {{SERVICE_UUID}} with: {}", uuid);
+            info!("[SACP] Replacing {{SERVICE_UUID}} with: {}", uuid);
             for (_key, value) in merged_envs.iter_mut() {
                 *value = value.replace("{SERVICE_UUID}", uuid);
             }
         } else {
-            warn!("[SACP] ⚠️ service_uuid is None, UUID placeholder will NOT be replaced!");
+            warn!("[SACP] service_uuid is None, UUID placeholder will NOT be replaced!");
         }
 
         // 🔍 调试：打印替换后的关键环境变量
         info!(
-            "[SACP] 🔍 After UUID replacement: OPENAI_BASE_URL={}, ANTHROPIC_BASE_URL={}",
+            "[SACP] After UUID replacement: OPENAI_BASE_URL={}, ANTHROPIC_BASE_URL={}",
             merged_envs
                 .get(ENV_OPENAI_BASE_URL)
                 .map(|s| s.as_str())
@@ -402,7 +402,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         // 📋 打印完整的子进程环境变量（用于调试代理 URL 问题）
         info!(
-            "[SACP] 📋 Subprocess environment variables ({} items):",
+            "[SACP] Subprocess environment variables ({} items):",
             merged_envs.len()
         );
         // 需要脱敏的环境变量 key 列表
@@ -422,9 +422,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 } else {
                     "***".to_string()
                 };
-                info!("[SACP] 📋   {} = {}", key, masked);
+                info!("[SACP]   {} = {}", key, masked);
             } else {
-                info!("[SACP] 📋   {} = {}", key, value);
+                info!("[SACP]   {} = {}", key, value);
             }
         }
 
@@ -433,7 +433,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // Windows: JobObject 管理进程树
         let full_command_line = format!("{} {}", command_path, command_args.join(" "));
         info!(
-            "[SACP] 🚀 Spawning subprocess: cmd=[{}], cwd={}",
+            "[SACP] Spawning subprocess: cmd=[{}], cwd={}",
             full_command_line,
             project_path.display()
         );
@@ -566,7 +566,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let diagnostics_listener_for_task = self.diagnostics_listener.clone();
         let connection_task_handle = tokio::spawn(async move {
             info!(
-                "[SACP] 🚀 Spawned ACP connection task, project_id={}",
+                "[SACP] Spawned ACP connection task, project_id={}",
                 spawn_project_id
             );
             let command_line_clone = spawn_command_line;
@@ -593,11 +593,11 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
             match &result {
                 Ok(_) => info!(
-                    "[SACP] ✅ ACP connection task completed successfully, project_id={}",
+                    "[SACP] ACP connection task completed successfully, project_id={}",
                     spawn_project_id
                 ),
                 Err(e) => error!(
-                    "[SACP] ❌ ACP connection task failed: {}, project_id={}",
+                    "[SACP] ACP connection task failed: {}, project_id={}",
                     e, spawn_project_id
                 ),
             }
@@ -687,7 +687,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     .map(|s| format!("; stderr: {}", s))
                     .unwrap_or_default();
                 error!(
-                    "[SACP] ⏰ Agent initialization timeout (60s), project_id={}, command=[{}], child_pid={}, stderr={}",
+                    "[SACP] Agent initialization timeout (60s), project_id={}, command=[{}], child_pid={}, stderr={}",
                     project_id, full_command_line, child_pid, stderr_info
                 );
                 // 超时后取消 spawned 任务，避免子进程泄漏

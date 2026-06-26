@@ -142,12 +142,12 @@ impl ContainerStatusChecker {
             self.state.projects.iter();
 
         if containers.is_empty() {
-            debug!("📭 [STATUS_CHECKER] No containers to check");
+            debug!(" [STATUS_CHECKER] No containers to check");
             return Ok(());
         }
 
         info!(
-            "🔍 [STATUS_CHECKER] Starting to check {} containers",
+            " [STATUS_CHECKER] Starting to check {} containers",
             containers.len()
         );
 
@@ -162,7 +162,7 @@ impl ContainerStatusChecker {
                 if self.should_skip_check(&lookup_key) {
                     skipped += 1;
                     debug!(
-                        "⏭️ [STATUS_CHECKER] Skipping check (recently failed): {}",
+                        " [STATUS_CHECKER] Skipping check (recently failed): {}",
                         lookup_key
                     );
                     None
@@ -204,7 +204,7 @@ impl ContainerStatusChecker {
         }
 
         info!(
-            "📊 [STATUS_CHECKER] Check completed: total={}, checked={}, skipped={}, updated={}, failed={}",
+            " [STATUS_CHECKER] Check completed: total={}, checked={}, skipped={}, updated={}, failed={}",
             total_count, checked, skipped, updated, failed
         );
 
@@ -224,7 +224,7 @@ impl ContainerStatusChecker {
             Some(c) => c,
             None => {
                 debug!(
-                    "⚠️ [STATUS_CHECKER] Container info not found: {}",
+                    " [STATUS_CHECKER] Container info not found: {}",
                     lookup_key
                 );
                 return Ok(false);
@@ -272,7 +272,7 @@ impl ContainerStatusChecker {
                     // 注意：使用 project_id 更新存储，而不是 lookup_key
                     if let Err(e) = update_project_activity(&project_id, &self.state).await {
                         warn!(
-                            "⚠️ [STATUS_CHECKER] Failed to update activity time: project_id={}, {}",
+                            " [STATUS_CHECKER] Failed to update activity time: project_id={}, {}",
                             project_id, e
                         );
                         return Ok(false);
@@ -284,7 +284,7 @@ impl ContainerStatusChecker {
                         "active",
                     );
                     debug!(
-                        "✅ [STATUS_CHECKER] Container is active, updated activity time and status: container_key={}, project_id={}",
+                        " [STATUS_CHECKER] Container is active, updated activity time and status: container_key={}, project_id={}",
                         lookup_key, project_id
                     );
                     Ok(true)
@@ -296,7 +296,7 @@ impl ContainerStatusChecker {
                         "idle",
                     );
                     debug!(
-                        "📭 [STATUS_CHECKER] Container is idle, updated status to Idle: container_key={}, project_id={}",
+                        " [STATUS_CHECKER] Container is idle, updated status to Idle: container_key={}, project_id={}",
                         lookup_key, project_id
                     );
                     Ok(false)
@@ -311,7 +311,7 @@ impl ContainerStatusChecker {
                 if !container_exists {
                     // 容器不存在，直接清理所有状态
                     info!(
-                        "🗑️ [STATUS_CHECKER] Container has been destroyed, cleaning up health state: {}",
+                        " [STATUS_CHECKER] Container has been destroyed, cleaning up health state: {}",
                         lookup_key
                     );
                     self.health_states.remove(lookup_key);
@@ -349,12 +349,12 @@ impl ContainerStatusChecker {
                         Ok(Some(_)) => true,
                         Ok(None) => false,
                         Err(e) => {
-                            debug!("⚠️ [STATUS_CHECKER] Failed to query container: {}", e);
+                            debug!(" [STATUS_CHECKER] Failed to query container: {}", e);
                             false
                         }
                     }
                 } else {
-                    debug!("⚠️ [STATUS_CHECKER] ComputerAgentRunner missing user_id");
+                    debug!(" [STATUS_CHECKER] ComputerAgentRunner missing user_id");
                     false
                 }
             }
@@ -367,7 +367,7 @@ impl ContainerStatusChecker {
                     Ok(Some(_)) => true,
                     Ok(None) => false,
                     Err(e) => {
-                        debug!("⚠️ [STATUS_CHECKER] Failed to query container: {}", e);
+                        debug!(" [STATUS_CHECKER] Failed to query container: {}", e);
                         false
                     }
                 }
@@ -376,12 +376,12 @@ impl ContainerStatusChecker {
 
         if exists {
             debug!(
-                "🔍 [STATUS_CHECKER] Runtime container exists, likely network issue: {} (service_type={:?})",
+                " [STATUS_CHECKER] Runtime container exists, likely network issue: {} (service_type={:?})",
                 grpc_addr, service_type
             );
         } else {
             info!(
-                "🔍 [STATUS_CHECKER] Runtime container does not exist (already destroyed): {} (service_type={:?})",
+                " [STATUS_CHECKER] Runtime container does not exist (already destroyed): {} (service_type={:?})",
                 grpc_addr, service_type
             );
         }
@@ -466,7 +466,7 @@ impl ContainerStatusChecker {
                 pool.remove(&addr_owned).await;
             });
             info!(
-                "🔌 [STATUS_CHECKER] Already cleanup connection: {}",
+                " [STATUS_CHECKER] Already cleanup connection: {}",
                 grpc_addr
             );
         }
@@ -476,27 +476,27 @@ impl ContainerStatusChecker {
             1 => {
                 // 首次失败：INFO 级别
                 info!(
-                    "❌ [STATUS_CHECKER] Container first query failed: {} - {}",
+                    " [STATUS_CHECKER] Container first query failed: {} - {}",
                     lookup_key, error
                 );
             }
             n if n < self.config.failure_threshold => {
                 // 持续失败但未达到阈值：DEBUG 级别
                 debug!(
-                    "❌ [STATUS_CHECKER] Container continuous failure ({}/{}): {}",
+                    " [STATUS_CHECKER] Container continuous failure ({}/{}): {}",
                     n, self.config.failure_threshold, lookup_key
                 );
             }
             n if n == self.config.failure_threshold => {
                 // 达到阈值：WARN 级别
                 warn!(
-                    "⚠️ [STATUS_CHECKER] Container continuous failures reached threshold, will skip check temporarily: {} (failures: {})",
+                    " [STATUS_CHECKER] Container continuous failures reached threshold, will skip check temporarily: {} (failures: {})",
                     lookup_key, n
                 );
             }
             _ => {
                 // 超过阈值后的偶发检查：DEBUG 级别
-                debug!("⏭️ [STATUS_CHECKER] Skipping check for: {}", lookup_key);
+                debug!(" [STATUS_CHECKER] Skipping check for: {}", lookup_key);
             }
         }
     }
@@ -538,13 +538,13 @@ impl ContainerStatusChecker {
         for key in keys_to_remove {
             if self.health_states.remove(&key).is_some() {
                 removed_count += 1;
-                debug!("🧹 [STATUS_CHECKER] Cleaned up stale health state: {}", key);
+                debug!(" [STATUS_CHECKER] Cleaned up stale health state: {}", key);
             }
         }
 
         if removed_count > 0 {
             info!(
-                "🧹 [STATUS_CHECKER] Cleaned up stale health states: removed={}",
+                " [STATUS_CHECKER] Cleaned up stale health states: removed={}",
                 removed_count
             );
         }
@@ -559,7 +559,7 @@ pub fn start_container_status_checker(
     state: Arc<AppState>,
 ) -> tokio::task::JoinHandle<()> {
     info!(
-        "🔍 [STATUS_CHECKER] Starting container status checker: interval={}s, failure_threshold={}, skip_duration={}s",
+        " [STATUS_CHECKER] Starting container status checker: interval={}s, failure_threshold={}, skip_duration={}s",
         config.check_interval.as_secs(),
         config.failure_threshold,
         config.skip_duration.as_secs()
@@ -579,7 +579,7 @@ pub fn start_container_status_checker(
 
             // 执行容器状态检查
             if let Err(e) = checker.check_all_containers().await {
-                warn!("⚠️ [STATUS_CHECKER] Container status check failed: {}", e);
+                warn!(" [STATUS_CHECKER] Container status check failed: {}", e);
             }
 
             // 定期清理过期的健康状态
@@ -620,7 +620,7 @@ async fn query_container_status(
     let status_response = response.into_inner();
 
     debug!(
-        "📊 [STATUS_CHECKER] Container status: user_id={}, is_active={}, active_tasks={}, status={}, last_activity={} ({})",
+        " [STATUS_CHECKER] Container status: user_id={}, is_active={}, active_tasks={}, status={}, last_activity={} ({})",
         user_id,
         status_response.is_active,
         status_response.active_tasks,

@@ -42,33 +42,68 @@ dev:
     # Sync files between the local filesystem and the development container
     sync:
       - path: .:/app
+        # 排除不需要同步的目录（提高同步效率）
         uploadExcludePaths:
+          # 编译产物（最大，133GB）
           - target/
+          # 版本控制
           - .git/
-          - "**/*.rs.bk"
-          - node_modules/
+          # IDE 配置
           - .idea/
           - .vscode/
+          # DevSpace 配置
+          - .devspace/
+          # 项目特定目录
           - project_workspace/
+          - computer-project-workspace/
+          - agent-cache/
+          # Docker 和 K8s 配置（容器内不需要）
           - docker/
           - k8s/
+          # 文档和测试数据
           - specs/
           - docs/
           - fixtures/
           - scripts/
+          # 包管理缓存
+          - node_modules/
           - npm/
-          - dist-workspace.toml
+          - .npm/
+          - .cache/
+          - cache/
+          # Cargo 配置
+          - .cargo/
+          # 其他配置目录
+          - .specify/
+          - .claude/
+          - .github/
+          # 日志目录（只排除根目录下的 logs）
+          - ./logs/
+          # 临时文件
+          - tmp/
           - "*.log"
           - "*.tmp"
           - "*.swp"
           - "*.swo"
           - ".DS_Store"
-          - "tmp/"
-          - "cache/"
-          - ".cache/"
-          - ".npm/"
-          - ".cargo/"
-          - "agent-cache/"
+          - "**/*.rs.bk"
+          - dist-workspace.toml
+        # 下载时也排除这些目录
+        downloadExcludePaths:
+          - target/
+          - .git/
+          - .idea/
+          - .vscode/
+          - .devspace/
+          - project_workspace/
+          - computer-project-workspace/
+          - agent-cache/
+          - docker/
+          - k8s/
+          - logs/
+          - tmp/
+        # 初始同步策略：preferLocal 表示本地文件优先
+        initialSync: preferLocal
     # Open a terminal and use the following command to start it
     terminal:
       command: bash -c 'cd /app && /app/devspace_start.sh'

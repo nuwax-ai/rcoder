@@ -136,7 +136,7 @@ impl AgentSessionService {
 
         if is_new_session {
             if let Some(ref handles) = session_handles {
-                debug!("🆕 New session, registering in AGENT_REGISTRY");
+                debug!("New session, registering in AGENT_REGISTRY");
 
                 let project_and_agent_info = ProjectAndAgentInfo {
                     project_id: project_id.clone(),
@@ -166,7 +166,7 @@ impl AgentSessionService {
                 );
             }
         } else {
-            debug!("♻️ Reusing session, no new slot needed (Agent already holds slot)");
+            debug!("Reusing session, no new slot needed (Agent already holds slot)");
         }
 
         SESSION_REQUEST_CONTEXT.insert(project_id.clone(), request_id.clone());

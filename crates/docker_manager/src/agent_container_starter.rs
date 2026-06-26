@@ -151,11 +151,11 @@ impl<'a> AgentContainerStarter<'a> {
                 .container_path(container_work_path.clone());
 
             debug!(
-                "📌 [DOCKER_MANAGER] Main mount: {} -> {}",
+                "[DOCKER_MANAGER] Main mount: {} -> {}",
                 host_workspace_path, container_work_path
             );
         } else {
-            debug!("📌 [DOCKER_MANAGER] Skip mount, no mounts config");
+            debug!("[DOCKER_MANAGER] Skip mount, no mounts config");
         }
 
         // 先获取借用字段，因为后续字段会被移动
@@ -361,14 +361,14 @@ impl<'a> AgentContainerStarter<'a> {
                 });
 
                 info!(
-                    "📌 [DOCKER_MGR] Auto workspace mount: {} -> {}",
+                    "[DOCKER_MGR] Auto workspace mount: {} -> {}",
                     host_mount.display(),
                     container_mount.display()
                 );
             }
             Err(e) => {
                 warn!(
-                    "⚠️ [DOCKER_MGR] Failed to resolve workspace host path, skipping auto mount: {}",
+                    "[DOCKER_MGR] Failed to resolve workspace host path, skipping auto mount: {}",
                     e
                 );
             }
@@ -597,7 +597,7 @@ impl<'a> AgentContainerStarter<'a> {
             info.user_id = user_id.map(|s| s.to_string());
             info.service_type = Some(service_type.clone());
             debug!(
-                "📝 [DOCKER_MGR] Updating container metadata: container_id={}, user_id={:?}, service_type={:?}",
+                "[DOCKER_MGR] Updating container metadata: container_id={}, user_id={:?}, service_type={:?}",
                 container_id, info.user_id, info.service_type
             );
             self.manager
@@ -609,7 +609,7 @@ impl<'a> AgentContainerStarter<'a> {
             if let Some(ref pid) = pod_id {
                 self.manager.containers.insert(pid.to_string(), info).await;
                 debug!(
-                    "📝 [DOCKER_MGR] Cached container under pod_id key: pod_id={}",
+                    "[DOCKER_MGR] Cached container under pod_id key: pod_id={}",
                     pid
                 );
             }

@@ -127,7 +127,7 @@ impl SessionNotifier for SseSessionNotifier {
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!(
-            "📤 [SseSessionNotifier] Received SessionUpdate from agent: project_id={}, session_id={}, update={:?}",
+            "[SseSessionNotifier] Received SessionUpdate from agent: project_id={}, session_id={}, update={:?}",
             project_id, session_id, session_update
         );
 

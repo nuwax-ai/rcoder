@@ -156,7 +156,7 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     // 使用 OnceLock 替代 env::set_var，避免多线程环境下的 UB（Rust 1.84+）
     if let Some(ref log_dir) = config.app_config.mcp_proxy_log_dir {
         agent_abstraction::launcher::set_mcp_proxy_log_dir(log_dir.clone());
-        info!("🔧 Set MCP_PROXY_LOG_DIR={}", log_dir);
+        info!("Set MCP_PROXY_LOG_DIR={}", log_dir);
     }
 
     // 创建关闭信号令牌

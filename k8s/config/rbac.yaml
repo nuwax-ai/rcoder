@@ -5,6 +5,13 @@ metadata:
   namespace: rcoder-dev
 
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rcoder-pods-sa
+  namespace: rcoder-dev
+
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -28,6 +35,9 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: rcoder-sa
+    namespace: rcoder-dev
+  - kind: ServiceAccount
+    name: rcoder-pods-sa
     namespace: rcoder-dev
 roleRef:
   kind: ClusterRole

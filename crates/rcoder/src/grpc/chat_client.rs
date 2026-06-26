@@ -39,7 +39,7 @@ pub async fn grpc_chat_with_pool(
     agent_work_dir: Option<String>, // 🆕 自定义工作目录标识符
 ) -> Result<GrpcChatResponse, GrpcError> {
     info!(
-        "🚀 [gRPC_CHAT] Sending Chat request (connection pool): addr={}, project_id={}, is_devcomputer={}",
+        " [gRPC_CHAT] Sending Chat request (connection pool): addr={}, project_id={}, is_devcomputer={}",
         grpc_addr, project_id, is_devcomputer
     );
 
@@ -66,7 +66,7 @@ pub async fn grpc_chat_with_pool(
         system_prompt,
         user_prompt,
         agent_config: agent_config.map(super::converters::to_grpc_chat_agent_config),
-        service_type: service_type.map(|st| format!("{:?}", st)),
+        service_type: service_type.map(|st| st.to_string()),
         user_id,        // 传递 user_id
         is_devcomputer, // 🆕 传递 is_devcomputer
         agent_work_dir, // 🆕 传递 agent_work_dir
@@ -81,7 +81,7 @@ pub async fn grpc_chat_with_pool(
     // ✅ 使用 Tonic 原生 API 设置请求超时
     if let Some(timeout) = request_timeout {
         request.set_timeout(timeout);
-        debug!("⏱️ [gRPC_CHAT] request timeout: {:?}", timeout);
+        debug!(" [gRPC_CHAT] request timeout: {:?}", timeout);
     }
 
     // 发送请求，使用 GrpcError 包装错误
@@ -93,7 +93,7 @@ pub async fn grpc_chat_with_pool(
     let chat_response = response.into_inner();
 
     info!(
-        "✅ [gRPC_CHAT] Received response: project_id={}, session_id={}, success={}",
+        " [gRPC_CHAT] Received response: project_id={}, session_id={}, success={}",
         chat_response.project_id, chat_response.session_id, chat_response.success
     );
 
@@ -124,7 +124,7 @@ pub async fn grpc_cancel_session_with_pool(
     request_timeout: Option<std::time::Duration>,
 ) -> Result<CancelResponse, GrpcError> {
     info!(
-        "🛑 [gRPC_CANCEL] Sending cancel session request (connection pool): addr={}, session_id={}, project_id={}",
+        " [gRPC_CANCEL] Sending cancel session request (connection pool): addr={}, session_id={}, project_id={}",
         grpc_addr, session_id, project_id
     );
 
@@ -151,7 +151,7 @@ pub async fn grpc_cancel_session_with_pool(
         std::time::Duration::from_secs(shared_types::GRPC_CANCEL_SESSION_TIMEOUT_SECS)
     });
     request.set_timeout(timeout);
-    debug!("⏱️ [gRPC_CANCEL] request timeout: {:?}", timeout);
+    debug!(" [gRPC_CANCEL] request timeout: {:?}", timeout);
 
     let response = client.cancel_session(request).await.map_err(|e| {
         error!("[gRPC_CANCEL] CancelSession RPC call failed: {}", e);
@@ -161,7 +161,7 @@ pub async fn grpc_cancel_session_with_pool(
     let cancel_response = response.into_inner();
 
     info!(
-        "✅ [gRPC_CANCEL] Received response: success={}, message={:?}",
+        " [gRPC_CANCEL] Received response: success={}, message={:?}",
         cancel_response.success, cancel_response.message
     );
 
@@ -218,7 +218,7 @@ pub async fn grpc_resolve_permission_with_pool(
         std::time::Duration::from_secs(shared_types::GRPC_RESOLVE_PERMISSION_TIMEOUT_SECS)
     });
     request.set_timeout(timeout);
-    debug!("⏱️ [gRPC_PERMISSION] request timeout: {:?}", timeout);
+    debug!(" [gRPC_PERMISSION] request timeout: {:?}", timeout);
 
     let response = client.resolve_permission(request).await.map_err(|e| {
         error!("[gRPC_PERMISSION] ResolvePermission RPC call failed: {}", e);
@@ -238,7 +238,7 @@ pub async fn grpc_stop_agent_with_pool(
     request_timeout: Option<std::time::Duration>,
 ) -> Result<shared_types::grpc::StopAgentResponse, GrpcError> {
     info!(
-        "🔄 [gRPC_STOP_AGENT] Sending stop Agent request (connection pool): addr={}, project_id={}, force={}",
+        " [gRPC_STOP_AGENT] Sending stop Agent request (connection pool): addr={}, project_id={}, force={}",
         grpc_addr, project_id, force
     );
 
@@ -265,7 +265,7 @@ pub async fn grpc_stop_agent_with_pool(
         std::time::Duration::from_secs(shared_types::GRPC_STOP_AGENT_TIMEOUT_SECS)
     });
     request.set_timeout(timeout);
-    debug!("⏱️ [gRPC_STOP_AGENT] request timeout: {:?}", timeout);
+    debug!(" [gRPC_STOP_AGENT] request timeout: {:?}", timeout);
 
     let response = client.stop_agent(request).await.map_err(|e| {
         error!("[gRPC_STOP_AGENT] StopAgent RPC call failed: {}", e);
@@ -275,7 +275,7 @@ pub async fn grpc_stop_agent_with_pool(
     let stop_response = response.into_inner();
 
     info!(
-        "✅ [gRPC_STOP_AGENT] Received response: result={}, success={}, message={:?}",
+        " [gRPC_STOP_AGENT] Received response: result={}, success={}, message={:?}",
         stop_response.result, stop_response.success, stop_response.message
     );
 

@@ -189,7 +189,7 @@ impl AgentHttpService for LocalAgentHttpService {
 
     /// 查询 Agent 状态
     async fn get_status(&self, project_id: &str) -> HttpResult<AgentStatusResponse> {
-        info!("🔍 [LocalAgent] Status query: project_id={}", project_id);
+        info!("[LocalAgent] Status query: project_id={}", project_id);
 
         if let Some(info) = AGENT_REGISTRY.get_agent_info(project_id) {
             // Agent 存在且活跃
@@ -204,14 +204,14 @@ impl AgentHttpService for LocalAgentHttpService {
             };
 
             info!(
-                "✅ [LocalAgent] Agent status: project_id={}, is_alive=true, status={:?}",
+                "[LocalAgent] Agent status: project_id={}, is_alive=true, status={:?}",
                 project_id, info.status
             );
 
             HttpResult::success(response)
         } else {
             // Agent 不存在
-            info!("📭 [LocalAgent] Agent not found: project_id={}", project_id);
+            info!("[LocalAgent] Agent not found: project_id={}", project_id);
 
             let response = AgentStatusResponse {
                 project_id: project_id.to_string(),

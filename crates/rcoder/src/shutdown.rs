@@ -82,14 +82,14 @@ pub async fn graceful_shutdown(
         info!("container cleanup completed");
     }
 
-    info!("🛑 RCoder graceful shutdown completed");
+    info!(" RCoder graceful shutdown completed");
 }
 
 async fn cleanup_all_containers(
     config: &crate::config::AppConfig,
     runtime: &Arc<dyn ContainerRuntime>,
 ) -> anyhow::Result<()> {
-    info!("🧹 starting cleanup of dynamically created containers...");
+    info!(" starting cleanup of dynamically created containers...");
 
     match docker_manager::runtime::RuntimeManager::runtime_type() {
         RuntimeType::Docker => {
@@ -112,7 +112,7 @@ async fn cleanup_all_containers(
                 Ok(result) => {
                     if result.successfully_removed > 0 {
                         info!(
-                            "🧹 Cleaned up {} containers (all enabled services)",
+                            " Cleaned up {} containers (all enabled services)",
                             result.successfully_removed
                         );
                     }

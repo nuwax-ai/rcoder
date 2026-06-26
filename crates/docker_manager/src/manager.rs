@@ -139,7 +139,7 @@ impl DockerManager {
         let main_network_name =
             match Self::detect_main_network_name_static(&docker, &config.network_base_name).await {
                 Ok(network_name) => {
-                    info!("detecting network: {}", network_name);
+                    info!("detected network: {}", network_name);
                     network_name
                 }
                 Err(e) => {
@@ -743,7 +743,7 @@ impl DockerManager {
         use crate::image_selector::ImageSelector;
         let selector = ImageSelector::new(self.config.multi_image_config.clone());
 
-        debug!(" ImageSelector: {:?}", service_type);
+        debug!("ImageSelector: {:?}", service_type);
         selector.select_image(service_type, project_overrides).await
     }
 
@@ -784,7 +784,7 @@ impl DockerManager {
         // 1.5 检查是否缓存了 None（空网络信息）
         if let Some(None) = self.api_cache.get_network(container_id).await {
             debug!(
-                "📭 [NETWORK] Cache hit (empty network): container_id={}",
+                "[NETWORK] Cache hit (empty network): container_id={}",
                 container_id
             );
             return Ok(HashMap::new());
@@ -800,7 +800,7 @@ impl DockerManager {
             })) => {
                 // 容器不存在 - 缓存空 HashMap
                 debug!(
-                    "📭 [NETWORK] Container does not exist, caching empty network: container_id={}",
+                    "[NETWORK] Container does not exist, caching empty network: container_id={}",
                     container_id
                 );
                 self.api_cache
@@ -937,7 +937,7 @@ impl DockerManager {
         options: CleanupOptions,
     ) -> DockerResult<CleanupResult> {
         info!(
-            "🔥 Starting cleanup container: count={}",
+            "Starting cleanup container: count={}",
             container_ids.len()
         );
 
@@ -955,7 +955,7 @@ impl DockerManager {
                 Ok(_) => {
                     result.successfully_removed += 1;
                     result.removed_container_ids.push(container_id.clone());
-                    info!("✅ Container cleanup succeeded: {}", container_id);
+                    info!("Container cleanup succeeded: {}", container_id);
                 }
                 Err(e) => {
                     result.failed_removals += 1;
@@ -966,7 +966,7 @@ impl DockerManager {
                             container_name: container_id.clone(), // 我们可能不知道名称，使用ID
                             error_message: e.to_string(),
                         });
-                    error!("❌ Container cleanup failed: {} - {}", container_id, e);
+                    error!("Container cleanup failed: {} - {}", container_id, e);
                 }
             }
         }
@@ -1004,14 +1004,14 @@ impl DockerManager {
             Some(status) if status.to_string() == "running" => {
                 if !options.force_remove_running {
                     info!(
-                        "⚠️ Container {} is running, skip (force=false)",
+                        "Container {} is running, skip (force=false)",
                         container_id
                     );
                     return Ok(());
                 }
 
                 if options.wait_for_graceful_stop {
-                    info!("🛑 Gracefully stopped container: {}", container_id);
+                    info!("Gracefully stopped container: {}", container_id);
                     if let Err(e) = self
                         .graceful_stop_container(container_id, options.stop_timeout_seconds)
                         .await
@@ -1129,7 +1129,7 @@ impl DockerManager {
         pattern: &str,
         options: CleanupOptions,
     ) -> DockerResult<CleanupResult> {
-        info!("🧹 Starting cleanup container: pattern={:?}", pattern);
+        info!("Starting cleanup container: pattern={:?}", pattern);
 
         // 第一步：查找匹配的容器
         let matched_containers = self.list_containers_with_pattern(pattern).await?;

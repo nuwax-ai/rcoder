@@ -426,7 +426,7 @@ async fn validate_and_get_session_context(
     let project_info = match state.get_by_session(session_id) {
         Some(info) => {
             debug!(
-                "🔍 [SSE_PROXY] Getting project info from memory: session_id={}, project_id={}",
+                " [SSE_PROXY] Getting project info from memory: session_id={}, project_id={}",
                 session_id,
                 info.project_id()
             );
@@ -434,7 +434,7 @@ async fn validate_and_get_session_context(
         }
         None => {
             error!(
-                "❌ [SSE_PROXY] Project info for session not found: session_id={}",
+                " [SSE_PROXY] Project info for session not found: session_id={}",
                 session_id
             );
             return Err(create_error_response(
@@ -453,7 +453,7 @@ async fn validate_and_get_session_context(
     let mut container_name = match state.get_container_name_by_session(session_id) {
         Some(name) => {
             debug!(
-                "🔍 [SSE_PROXY] Getting container name from storage: session_id={}, container_name={}",
+                " [SSE_PROXY] Getting container name from storage: session_id={}, container_name={}",
                 session_id, name
             );
             name
@@ -465,7 +465,7 @@ async fn validate_and_get_session_context(
             // 2. 测试环境脏数据
             // 3. 容器重建后 存储 未更新
             info!(
-                "🔄 [SSE_PROXY] session_id record not found in storage, executing fallback query: session_id={}, project_id={}",
+                " [SSE_PROXY] session_id record not found in storage, executing fallback query: session_id={}, project_id={}",
                 session_id,
                 project_info.project_id()
             );
@@ -485,7 +485,7 @@ async fn validate_and_get_session_context(
                         {
                             Ok(Some(info)) => {
                                 info!(
-                                    "✅ [SSE_PROXY] Fallback query succeeded: getting container via user_id in real-time: user_id={}, container_name={}",
+                                    " [SSE_PROXY] Fallback query succeeded: getting container via user_id in real-time: user_id={}, container_name={}",
                                     user_id, info.container_name
                                 );
                                 info.container_name
@@ -537,7 +537,7 @@ async fn validate_and_get_session_context(
                     match project_info.container() {
                         Some(container) => {
                             info!(
-                                "✅ [SSE_PROXY] Fallback query succeeded: got container name from project_info: container_name={}",
+                                " [SSE_PROXY] Fallback query succeeded: got container name from project_info: container_name={}",
                                 container.container_name
                             );
                             container.container_name.clone()
@@ -547,7 +547,7 @@ async fn validate_and_get_session_context(
                             // 这通常发生在容器刚创建但尚未写入 存储 的情况
                             // 阶段 3 会通过 Docker API 验证容器是否存在
                             warn!(
-                                "⚠️ [SSE_PROXY] No container info in project_info, using project_id as container name: project_id={}",
+                                " [SSE_PROXY] No container info in project_info, using project_id as container name: project_id={}",
                                 project_info.project_id()
                             );
                             project_info.project_id().to_string()
@@ -567,7 +567,7 @@ async fn validate_and_get_session_context(
     // 4. 后续会通过 gRPC GetStatus 进行最终健康检查
     if let Some(container) = project_info.container() {
         info!(
-            "✅ [SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
+            " [SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
             container.container_name, container.container_ip
         );
         // 🎯 关键修复：使用内存中的 container_name（它是最新的）
@@ -577,7 +577,7 @@ async fn validate_and_get_session_context(
     } else {
         // 内存中没有容器信息，调用 Docker API 实时查询
         warn!(
-            "⚠️ [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
+            " [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
             container_name
         );
         let computer_prefix = &state.container_prefix_computer;
@@ -598,7 +598,7 @@ async fn validate_and_get_session_context(
             Ok(Some(result)) => {
                 if result.status == container_runtime_api::ContainerRuntimeStatus::Running {
                     info!(
-                        "✅ [SSE_PROXY] Runtime query successful, container is running: container_name={}",
+                        " [SSE_PROXY] Runtime query successful, container is running: container_name={}",
                         container_name
                     );
                 } else {
@@ -611,7 +611,7 @@ async fn validate_and_get_session_context(
             }
             Ok(None) => {
                 error!(
-                    "❌ [SSE_PROXY] Container does not exist: container_name={}",
+                    " [SSE_PROXY] Container does not exist: container_name={}",
                     container_name
                 );
                 return Err(create_error_response(
@@ -621,7 +621,7 @@ async fn validate_and_get_session_context(
                 ));
             }
             Err(e) => {
-                error!("❌ [SSE_PROXY] Runtime query failed: {}", e);
+                error!(" [SSE_PROXY] Runtime query failed: {}", e);
                 return Err(create_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
@@ -639,7 +639,7 @@ async fn validate_and_get_session_context(
     // 注意：由于阶段 3 已经处理了 project_info.container() 为 None 的情况
     // （通过 Docker API 降级查询），这里无需再次验证容器信息的完整性
     info!(
-        "✅ [SSE_PROXY] All validations passed: session_id={}, project_id={}, container_name={}",
+        " [SSE_PROXY] All validations passed: session_id={}, project_id={}, container_name={}",
         session_id, project_id, container_name
     );
     Ok((project_id, container_name))
@@ -677,13 +677,13 @@ async fn build_sse_stream_from_container_name(
         Ok(ip) => {
             if !ip.is_empty() {
                 info!(
-                    "🔍 [gRPC_SSE] Got container IP: container_name={}, ip={}",
+                    " [gRPC_SSE] Got container IP: container_name={}, ip={}",
                     container_name, ip
                 );
                 ip
             } else {
                 error!(
-                    "❌ [gRPC_SSE] unable to get container IP: container_name={}",
+                    " [gRPC_SSE] unable to get container IP: container_name={}",
                     container_name
                 );
                 return Err(create_error_response(
@@ -695,7 +695,7 @@ async fn build_sse_stream_from_container_name(
         }
         Err(e) => {
             error!(
-                "❌ [gRPC_SSE] Failed to get real-time IP: container_name={}, error={}",
+                " [gRPC_SSE] Failed to get real-time IP: container_name={}, error={}",
                 container_name, e
             );
             return Err(create_error_response(
@@ -708,7 +708,7 @@ async fn build_sse_stream_from_container_name(
 
     let grpc_addr = format!("{}:{}", container_ip, shared_types::GRPC_DEFAULT_PORT);
     info!(
-        "🚀 [gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
+        " [gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
         agent_type, grpc_addr, project_id
     );
 
@@ -913,7 +913,7 @@ pub async fn agent_session_notification(
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
     info!(
-        "🔍 [SSE_PROXY] Received SSE connection request: session_id={:?}",
+        " [SSE_PROXY] Received SSE connection request: session_id={:?}",
         session_id
     );
 
@@ -1029,7 +1029,7 @@ pub async fn computer_agent_progress_notification(
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
     info!(
-        "🔍 [SSE_PROXY] Received Computer Agent SSE connection request: session_id={:?}",
+        " [SSE_PROXY] Received Computer Agent SSE connection request: session_id={:?}",
         session_id
     );
 
@@ -1072,7 +1072,7 @@ async fn create_sse_proxy_stream(
         let client = Client::new();
 
         info!(
-            "🔗 [SSE_PROXY] 开始连接容器SSE: url={}, session_id={}",
+            " [SSE_PROXY] 开始连接容器SSE: url={}, session_id={}",
             sse_url, session_id
         );
 
@@ -1086,7 +1086,7 @@ async fn create_sse_proxy_stream(
             Ok(response) => {
                 if response.status().is_success() {
                     info!(
-                        "✅ [SSE_PROXY] 成功连接到容器SSE: session_id={}",
+                        " [SSE_PROXY] 成功连接到容器SSE: session_id={}",
                         session_id
                     );
 
@@ -1107,7 +1107,7 @@ async fn create_sse_proxy_stream(
 
                                     if !event_data.is_empty() {
                                         debug!(
-                                            "📨 [SSE_PROXY] 透传SSE事件: session_id={}, event_len={}",
+                                            " [SSE_PROXY] 透传SSE事件: session_id={}, event_len={}",
                                             session_id,
                                             event_data.len()
                                         );
@@ -1119,7 +1119,7 @@ async fn create_sse_proxy_stream(
                                             && tx.send(Ok(event)).await.is_err()
                                         {
                                             warn!(
-                                                "⚠️ [SSE_PROXY] 客户端已断开连接: session_id={}",
+                                                " [SSE_PROXY] 客户端已断开连接: session_id={}",
                                                 session_id
                                             );
                                             break;
@@ -1129,7 +1129,7 @@ async fn create_sse_proxy_stream(
                             }
                             Err(e) => {
                                 error!(
-                                    "❌ [SSE_PROXY] 读取SSE流失败: session_id={}, error={}",
+                                    " [SSE_PROXY] 读取SSE流失败: session_id={}, error={}",
                                     session_id, e
                                 );
                                 break;
@@ -1138,7 +1138,7 @@ async fn create_sse_proxy_stream(
                     }
                 } else {
                     error!(
-                        "❌ [SSE_PROXY] 容器SSE连接失败: session_id={}, status={}",
+                        " [SSE_PROXY] 容器SSE连接失败: session_id={}, status={}",
                         session_id,
                         response.status()
                     );
@@ -1150,7 +1150,7 @@ async fn create_sse_proxy_stream(
                     ));
                     if let Err(send_err) = tx.send(Ok(error_event)).await {
                         warn!(
-                            "⚠️ [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
+                            " [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
                             session_id, send_err
                         );
                     }
@@ -1158,7 +1158,7 @@ async fn create_sse_proxy_stream(
             }
             Err(e) => {
                 error!(
-                    "❌ [SSE_PROXY] 无法连接到容器SSE: session_id={}, error={}",
+                    " [SSE_PROXY] 无法连接到容器SSE: session_id={}, error={}",
                     session_id, e
                 );
 
@@ -1168,7 +1168,7 @@ async fn create_sse_proxy_stream(
                     .data(format!("connection error: {}", e));
                 if let Err(send_err) = tx.send(Ok(error_event)).await {
                     warn!(
-                        "⚠️ [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
+                        " [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
                         session_id, send_err
                     );
                 }
@@ -1258,7 +1258,7 @@ async fn get_container_sse_url(
     session_id: &str,
 ) -> Result<String, AppError> {
     info!(
-        "🔍 [CONTAINER] 获取容器SSE端点: project_id={}, session_id={}",
+        " [CONTAINER] 获取容器SSE端点: project_id={}, session_id={}",
         project_id, session_id
     );
 

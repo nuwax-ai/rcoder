@@ -120,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
     let _pyroscope_guard: Option<()> = None;
 
     info!("Starting rcoder - AI-powered development platform");
-    info!("📦 agent-runner version: {}", env!("CARGO_PKG_VERSION"));
+    info!("agent-runner version: {}", env!("CARGO_PKG_VERSION"));
 
     // 非阻塞打印外部工具版本（不阻塞启动流程）
     spawn_tool_version_log("nuwaxcode", &["nuwaxcode", "-v"]);
@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）
     let _reaper_handle = process_reaper::start_process_reaper();
-    info!("🧹 [MAIN] Process reaper started (PID 1 mode)");
+    info!("[MAIN] Process reaper started (PID 1 mode)");
 
     // 🆕 从配置中获取 Agent 清理配置，或使用默认值
     let agent_cleanup_config = config.agent_cleanup.clone().unwrap_or_default();
@@ -149,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     info!(
-        "🧹 [MAIN] Agent cleanup config: idle_timeout={}s, cleanup_interval={}s",
+        "[MAIN] Agent cleanup config: idle_timeout={}s, cleanup_interval={}s",
         agent_cleanup_config.idle_timeout_secs, agent_cleanup_config.cleanup_interval_secs
     );
 
@@ -161,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
     // 🔒 创建共享的 API 密钥 DashMap
     let shared_api_key_manager =
         Arc::new(dashmap::DashMap::<String, shared_types::ModelProviderConfig>::new());
-    info!("🔑 [MAIN] Shared API key DashMap created");
+    info!("[MAIN] Shared API key DashMap created");
 
     #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
     let api_key_manager = Arc::new(api_key_manager::ApiKeyManager::from_shared(
@@ -174,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
     let model_env_resolver: Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> =
         create_model_env_resolver(&config);
     let agent_session_service = Arc::new(AgentSessionService::new(model_env_resolver));
-    info!("🔧 [MAIN] AgentSessionService created");
+    info!("[MAIN] AgentSessionService created");
 
     // 🆕 P0-1: 创建 Agent 管理注册表(从磁盘加载,失败则用空注册表 + 警告)
     // 注:用二进制自己的 `crate::agent_mgmt` 模块(与 router::AppState 同编译单元),
@@ -184,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
         match crate::agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone()) {
             Ok(r) => {
                 info!(
-                    "📋 [MAIN] Agent management registry loaded: total={}, builtin={}",
+                    "[MAIN] Agent management registry loaded: total={}, builtin={}",
                     r.total(),
                     r.builtin_count()
                 );
@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::warn!(
-                    "⚠️  [MAIN] Failed to load agent management registry, starting empty: {e}"
+                    "[MAIN] Failed to load agent management registry, starting empty: {e}"
                 );
                 std::sync::Arc::new(crate::agent_mgmt::AgentRegistry::empty(
                     agent_mgmt_path_manager.clone(),
@@ -207,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
         // 🔥 1. 可选：启动 gRPC 服务（当 grpc-server feature 启用时）
         #[cfg(feature = "grpc-server")]
         let grpc_handle = {
-            info!("ℹ️  HTTP server mode: starting HTTP + gRPC + Pingora");
+            info!("HTTP server mode: starting HTTP + gRPC + Pingora");
 
             let grpc_port = shared_types::GRPC_DEFAULT_PORT;
             let grpc_addr = format!("[::]:{}", grpc_port)
@@ -271,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
         // 无 gRPC 模式
         #[cfg(not(feature = "grpc-server"))]
         {
-            info!("ℹ️  HTTP server mode: starting HTTP + Pingora only (no gRPC)");
+            info!("HTTP server mode: starting HTTP + Pingora only (no gRPC)");
         }
 
         // 🔥 2. 创建 HttpServerConfig（包含所有配置）
@@ -299,29 +299,29 @@ async fn main() -> anyhow::Result<()> {
                             match result {
                                 Ok(_) => info!("gRPC service ended normally"),
                                 Err(e) if e.is_panic() => {
-                                    error!("🔴 gRPC service panicked: {:?}", e);
+                                    error!("gRPC service panicked: {:?}", e);
                                 }
                                 Err(e) if e.is_cancelled() => {
                                     info!("gRPC service was cancelled");
                                 }
                                 Err(e) => {
-                                    error!("⚠️ gRPC service ended with error: {:?}", e);
+                                    error!("gRPC service ended with error: {:?}", e);
                                 }
                             }
                         }
                         _ = tokio::signal::ctrl_c() => {
-                            info!("📨 Received shutdown signal, preparing graceful shutdown...");
+                            info!("Received shutdown signal, preparing graceful shutdown...");
                         }
                     }
                 }
                 None => {
                     // This should never happen if grpc-server feature is enabled
                     error!(
-                        "🔴 CRITICAL: gRPC handle is None despite grpc-server feature being enabled. This is a bug in initialization logic."
+                        "CRITICAL: gRPC handle is None despite grpc-server feature being enabled. This is a bug in initialization logic."
                     );
                     // Wait for ctrl_c instead of silently continuing
                     tokio::signal::ctrl_c().await?;
-                    info!("📨 Received shutdown signal, preparing graceful shutdown...");
+                    info!("Received shutdown signal, preparing graceful shutdown...");
                 }
             }
         }
@@ -329,7 +329,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "grpc-server"))]
         {
             tokio::signal::ctrl_c().await?;
-            info!("📨 Received shutdown signal, preparing graceful shutdown...");
+            info!("Received shutdown signal, preparing graceful shutdown...");
         }
 
         Ok(())
@@ -338,7 +338,7 @@ async fn main() -> anyhow::Result<()> {
     // 🔥 non-http-server 模式：启动 gRPC + Pingora（用于 Docker 容器内）
     #[cfg(not(feature = "http-server"))]
     {
-        info!("ℹ️  Container mode: starting gRPC + Pingora");
+        info!("Container mode: starting gRPC + Pingora");
 
         // 启动 gRPC 服务
         let grpc_port = shared_types::GRPC_DEFAULT_PORT;
@@ -418,7 +418,7 @@ async fn main() -> anyhow::Result<()> {
             let addr = format!("0.0.0.0:{}", health_port);
 
             info!(
-                "🏥 HTTP health check service started, listening on port: {}",
+                "HTTP health check service started, listening on port: {}",
                 health_port
             );
 
@@ -426,7 +426,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(l) => l,
                 Err(e) => {
                     error!(
-                        "❌ Failed to bind HTTP health check service: {} (port: {})",
+                        "Failed to bind HTTP health check service: {} (port: {})",
                         e, health_port
                     );
                     return;
@@ -446,25 +446,25 @@ async fn main() -> anyhow::Result<()> {
             if let Some(proxy_config) = &config.proxy_config {
                 Some(start_pingora(proxy_config, shared_api_key_manager.clone())?)
             } else {
-                info!("ℹ️  Pingora proxy service is not configured");
+                info!("Pingora proxy service is not configured");
                 None
             }
         };
 
         #[cfg(not(feature = "proxy"))]
         let pingora_result: Option<()> = {
-            info!("ℹ️  Pingora proxy service is disabled (proxy feature not enabled)");
+            info!("Pingora proxy service is disabled (proxy feature not enabled)");
             None
         };
 
         // 等待 gRPC 服务
         if let Err(e) = grpc_handle.await {
             if e.is_panic() {
-                error!("🔴 gRPC service panicked: {:?}", e);
+                error!("gRPC service panicked: {:?}", e);
             } else if e.is_cancelled() {
                 info!("gRPC service was cancelled");
             } else {
-                error!("⚠️ gRPC service ended with error: {:?}", e);
+                error!("gRPC service ended with error: {:?}", e);
             }
         }
 

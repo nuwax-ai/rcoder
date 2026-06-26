@@ -13,7 +13,7 @@ use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 #[cfg(feature = "kubernetes")]
 use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
-use shared_types::{HTTP_DEFAULT_PORT, ServiceType};
+use shared_types::{GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, ServiceType};
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
 #[cfg(feature = "kubernetes")]
@@ -26,6 +26,9 @@ use super::kubernetes_runtime::KubernetesRuntime;
 
 /// Agent Runner HTTP 端口（使用 shared_types 共享常量）
 const AGENT_HTTP_PORT: u32 = HTTP_DEFAULT_PORT as u32;
+
+/// Agent Runner gRPC 端口（使用 shared_types 共享常量）
+const AGENT_GRPC_PORT: u32 = GRPC_DEFAULT_PORT as u32;
 
 /// K8s 标准标签前缀
 const LABEL_PREFIX: &str = "app.kubernetes.io";
@@ -118,7 +121,7 @@ pub(crate) trait K8sServiceOps {
 
     /// 创建 K8s ClusterIP Service，selector 匹配 agent_runner Pod
     ///
-    /// Service 暴露 HTTP 8086 端口，selector 使用与 Pod 相同的 labels
+    /// Service 暴露 HTTP 8086 和 gRPC 50051 端口，selector 使用与 Pod 相同的 labels
     /// （`managed-by=rcoder-runtime` + identifier label）。
     /// 创建前先检查是否已存在，已存在则跳过。
     async fn create_agent_service(
@@ -185,17 +188,30 @@ impl K8sServiceOps for KubernetesRuntime {
             spec: Some(ServiceSpec {
                 type_: Some("ClusterIP".to_string()),
                 selector: Some(selector),
-                ports: Some(vec![ServicePort {
-                    name: Some("http".to_string()),
-                    port: AGENT_HTTP_PORT as i32,
-                    target_port: Some(
-                        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                            AGENT_HTTP_PORT as i32,
+                ports: Some(vec![
+                    ServicePort {
+                        name: Some("http".to_string()),
+                        port: AGENT_HTTP_PORT as i32,
+                        target_port: Some(
+                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                                AGENT_HTTP_PORT as i32,
+                            ),
                         ),
-                    ),
-                    protocol: Some("TCP".to_string()),
-                    ..Default::default()
-                }]),
+                        protocol: Some("TCP".to_string()),
+                        ..Default::default()
+                    },
+                    ServicePort {
+                        name: Some("grpc".to_string()),
+                        port: AGENT_GRPC_PORT as i32,
+                        target_port: Some(
+                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                                AGENT_GRPC_PORT as i32,
+                            ),
+                        ),
+                        protocol: Some("TCP".to_string()),
+                        ..Default::default()
+                    },
+                ]),
                 ..Default::default()
             }),
             status: None,

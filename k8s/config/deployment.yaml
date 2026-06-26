@@ -36,6 +36,12 @@ spec:
               value: "false"
             - name: CONTAINER_RUNTIME
               value: "kubernetes"
+            - name: RCODER_K8S_NAMESPACE
+              value: "rcoder-dev"
+            - name: RCODER_K8S_STORAGE_CLASS
+              value: "local-path"
+            - name: RCODER_K8S_PVC_ACCESS_MODE
+              value: "ReadWriteOnce"
           volumeMounts:
             - name: cargo-target
               mountPath: /app/target

@@ -349,30 +349,30 @@ pub fn normalize_windows_command_for_no_window(
             );
         }
         Some("cmd" | "bat") => {
-            info!("[SACP] 🔍 Windows detecting .cmd/.bat: {}", path);
-            info!("[SACP] 🔄 converting to node.exe + JS ...");
+            info!("[SACP] Windows detecting .cmd/.bat: {}", path);
+            info!("[SACP] converting to node.exe + JS ...");
             if let Some((node_path, js_args)) = resolve_windows_node_cli_command(&path, &args) {
                 info!("[SACP] conversion succeeded: {} + {:?}", node_path, js_args);
                 path = node_path;
                 args = js_args;
             } else {
                 warn!(
-                    "[SACP] ⚠️ conversion failed, will run original command (may show popup): {}",
+                    "[SACP] conversion failed, will run original command (may show popup): {}",
                     path
                 );
             }
         }
         Some(other) => {
             info!(
-                "[SACP] ℹ️ Windows detected other format .{}: {} - trying direct execution",
+                "[SACP] Windows detected other format .{}: {} - trying direct execution",
                 other, path
             );
         }
         None => {
-            info!("[SACP] 🔍 Windows detecting extension: {}", path);
+            info!("[SACP] Windows detecting extension: {}", path);
             if let Ok(resolved) = which::which(&path) {
                 let resolved_str = resolved.to_string_lossy().to_string();
-                info!("[SACP] 🔄 resolved: {}", resolved_str);
+                info!("[SACP] resolved: {}", resolved_str);
 
                 let resolved_ext = resolved
                     .extension()
@@ -385,7 +385,7 @@ pub fn normalize_windows_command_for_no_window(
                         path = resolved_str;
                     }
                     Some("cmd" | "bat") => {
-                        info!("[SACP] 🔍 detected .cmd/.bat, converting ...");
+                        info!("[SACP] detected .cmd/.bat, converting ...");
                         if let Some((node_path, js_args)) =
                             resolve_windows_node_cli_command(&resolved_str, &args)
                         {
@@ -393,16 +393,16 @@ pub fn normalize_windows_command_for_no_window(
                             path = node_path;
                             args = js_args;
                         } else {
-                            warn!("[SACP] ⚠️ conversion failed");
+                            warn!("[SACP] conversion failed");
                         }
                     }
                     _ => {
-                        info!("[SACP] ℹ️ unknown extension, keeping original");
+                        info!("[SACP] unknown extension, keeping original");
                         path = resolved_str;
                     }
                 }
             } else {
-                warn!("[SACP] ⚠️ unable to resolve path: {}", path);
+                warn!("[SACP] unable to resolve path: {}", path);
             }
         }
     }

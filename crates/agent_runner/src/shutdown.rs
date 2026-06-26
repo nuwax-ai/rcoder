@@ -45,7 +45,7 @@ pub fn set_panic_hook() {
 
         // 同时输出到 stderr（Docker 会捕获到容器日志）
         eprintln!("═══════════════════════════════════════════════════════════");
-        eprintln!("❌ [PANIC] agent_runner encountered a fatal error!");
+        eprintln!("[PANIC] agent_runner encountered a fatal error!");
         eprintln!("═══════════════════════════════════════════════════════════");
         if let Some(location) = panic_info.location() {
             eprintln!(
@@ -87,7 +87,7 @@ fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()>
         file,
         "═══════════════════════════════════════════════════════════"
     )?;
-    writeln!(file, "❌ [PANIC] agent_runner encountered a fatal error!")?;
+    writeln!(file, "[PANIC] agent_runner encountered a fatal error!")?;
     writeln!(file, "time: {}", now)?;
     writeln!(
         file,

@@ -48,7 +48,7 @@ impl ContainerDestroyer {
         project_id: Option<&str>,
     ) -> Result<()> {
         info!(
-            "🔥 [destroyer] Starting container destruction: container_name={}, service_type={:?}, identifier={}, reason={}",
+            " [destroyer] Starting container destruction: container_name={}, service_type={:?}, identifier={}, reason={}",
             container_name,
             service_type,
             container_identifier,
@@ -56,7 +56,7 @@ impl ContainerDestroyer {
         );
 
         // 输出详细原因
-        debug!("📋 [destroyer] destroy reason: {}", reason.description());
+        debug!(" [destroyer] destroy reason: {}", reason.description());
 
         // 1. 🔍 通过容器名称实时查询最新的容器信息
         // 这样可以获取最新的 container_id，避免使用缓存中过期的 ID
@@ -67,7 +67,7 @@ impl ContainerDestroyer {
         {
             Ok(Some(result)) => {
                 debug!(
-                    "✅ [destroyer] Found container: name={}, id={}, ip={}",
+                    " [destroyer] Found container: name={}, id={}, ip={}",
                     container_name, result.container_id, result.container_ip
                 );
                 (result.container_id, result.container_ip)
@@ -75,7 +75,7 @@ impl ContainerDestroyer {
             Ok(None) => {
                 // 容器不存在，可能已经被删除了，这不是错误
                 info!(
-                    "⚠️ [destroyer] Container does not exist, may have been deleted: name={}",
+                    " [destroyer] Container does not exist, may have been deleted: name={}",
                     container_name
                 );
                 return Ok(());
@@ -104,7 +104,7 @@ impl ContainerDestroyer {
             .remove_container_cache(container_identifier)
             .await;
         debug!(
-            "🧹 [destroyer] DockerManager memory cache cleaned: identifier={}",
+            " [destroyer] DockerManager memory cache cleaned: identifier={}",
             container_identifier
         );
 
@@ -128,14 +128,14 @@ impl ContainerDestroyer {
             {
                 let _: Option<String> = pingora_service.remove_project_backend(pid);
                 debug!(
-                    "🧹 [destroyer] Cleaned up project_backends: project_id={}",
+                    " [destroyer] Cleaned up project_backends: project_id={}",
                     pid
                 );
             }
         }
 
         info!(
-            "✅ [destroyer] Container destruction completed: container_name={}, actual_id={}, reason={}",
+            " [destroyer] Container destruction completed: container_name={}, actual_id={}, reason={}",
             container_name,
             actual_container_id,
             reason.as_str()

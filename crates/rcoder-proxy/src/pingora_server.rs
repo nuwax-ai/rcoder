@@ -77,7 +77,7 @@ impl PingoraServerManager {
     /// Pingora 服务器线程运行 `run_forever()`，由进程退出时 OS 清理。
     pub async fn start(&mut self, shutdown_rx: oneshot::Receiver<()>) -> Result<(), ProxyError> {
         info!("starting Pingora proxy server...");
-        info!("📡 listening on: 0.0.0.0:{}", self.config.listen_port);
+        info!("listening on: 0.0.0.0:{}", self.config.listen_port);
         info!("route: /proxy/{{port}}{{/path}}");
 
         // 创建 Pingora 服务器配置
@@ -110,16 +110,16 @@ impl PingoraServerManager {
 
         // 在独立线程中运行服务器（使用 std::thread 而不是 spawn_blocking）
         // spawn_blocking 在某些环境下可能有调度延迟问题
-        info!("🔧 created Pingora proxy service...");
+        info!("created Pingora proxy service...");
         let server_thread = std::thread::spawn(move || {
-            info!("🎯 Pingora proxy starting...");
+            info!("Pingora proxy starting...");
             my_server.run_forever();
         });
         info!("Pingora server already created");
 
         // 等待外部关闭信号（sender 被 drop 或显式发送信号都会触发）
         let _ = shutdown_rx.await;
-        info!("📴 shutdown signal received, Pingora proxy cleanup by OS");
+        info!("shutdown signal received, Pingora proxy cleanup by OS");
 
         // 不再 join 线程 — run_forever() 永不返回，join() 会导致永久阻塞
         // detach 线程，让进程退出时自动清理

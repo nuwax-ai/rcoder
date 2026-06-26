@@ -94,7 +94,7 @@ impl AgentInstaller for NpmInstaller {
         // Run npm install -g
         // 仅 nuwaxcode 使用官方源（--registry 参数优先级高于 .npmrc）
         let output = if package_name == "nuwaxcode" {
-            info!("🌐 nuwaxcode using registry: https://registry.npmjs.org/");
+            info!("nuwaxcode using registry: https://registry.npmjs.org/");
             self.run_command(
                 npm_cmd,
                 &[
@@ -180,7 +180,7 @@ impl AgentInstaller for NpmInstaller {
         // Run npm update -g
         // 仅 nuwaxcode 使用官方源（--registry 参数优先级高于 .npmrc）
         let output = if package_name == "nuwaxcode" {
-            info!("🌐 nuwaxcode using registry: https://registry.npmjs.org/");
+            info!("nuwaxcode using registry: https://registry.npmjs.org/");
             self.run_command(
                 npm_cmd,
                 &[

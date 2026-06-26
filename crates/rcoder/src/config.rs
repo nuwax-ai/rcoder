@@ -437,7 +437,7 @@ impl DockerConfig {
                 Ok(seconds) => self.container_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_CONTAINER_TTL '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_CONTAINER_TTL '{}': {}, using default",
                         val,
                         e
                     );
@@ -452,7 +452,7 @@ impl DockerConfig {
                 Ok(seconds) => self.api_timeout_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_API_TIMEOUT_SECONDS '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_API_TIMEOUT_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -467,7 +467,7 @@ impl DockerConfig {
                 Ok(seconds) => self.api_timeout_quick_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -482,7 +482,7 @@ impl DockerConfig {
                 Ok(seconds) => self.cache_status_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -497,7 +497,7 @@ impl DockerConfig {
                 Ok(seconds) => self.cache_network_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -512,7 +512,7 @@ impl DockerConfig {
                 Ok(capacity) => self.cache_max_capacity = Some(capacity),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_MAX_CAPACITY '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_CACHE_MAX_CAPACITY '{}': {}, using default",
                         val,
                         e
                     );
@@ -763,6 +763,6 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to write default config file: {}", e))?;
 
     info!("Created default config file: {}", CONFIG_FILE);
-    info!("🔑 Loaded API Key (not set)");
+    info!(" Loaded API Key (not set)");
     Ok(())
 }

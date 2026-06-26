@@ -20,7 +20,7 @@ pub async fn start_http_server(
     info!("  GET  /health - Health check");
     info!("  NOTE: Plan data is delivered via the unified /progress/{{session_id}} SSE stream");
 
-    info!("🔧 config HTTP max_buf_size = 128KB (to prevent HTTP 431 error)");
+    info!(" config HTTP max_buf_size = 128KB (to prevent HTTP 431 error)");
 
     let app = app.into_make_service();
     let mut shutdown_rx_clone = shutdown_tx.subscribe();
@@ -29,7 +29,7 @@ pub async fn start_http_server(
         loop {
             tokio::select! {
                 _ = shutdown_rx_clone.recv() => {
-                    info!("🛑 HTTP server closed");
+                    info!(" HTTP server closed");
                     break;
                 }
                 result = listener.accept() => {
