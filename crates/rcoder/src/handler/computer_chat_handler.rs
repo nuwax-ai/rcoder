@@ -962,9 +962,14 @@ async fn forward_computer_request_to_container(
                 let should_retry = grpc_err.should_retry();
 
                 if should_retry && attempt < max_retries {
+                    // 等待一段时间再重试，给 gRPC 服务启动时间
+                    let retry_delay = std::time::Duration::from_secs(3);
                     info!(
-                        "🔄 [COMPUTER_FORWARD] Detected retryable error, re-resolving container IP and retrying..."
+                        "🔄 [COMPUTER_FORWARD] Detected retryable error, waiting {:?} before retry...",
+                        retry_delay
                     );
+                    tokio::time::sleep(retry_delay).await;
+
                     params.grpc_pool.remove(&grpc_addr).await;
 
                     // K8s Service FQDN 是稳定的，不需要重新解析

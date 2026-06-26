@@ -475,7 +475,7 @@ impl K8sAppService {
         // 2. 应用内 API：应用提供文件管理 API，RCoder 通过 HTTP 调用
         //
         // 当前实现：读取 PVC 挂载目录
-        let code_dir = format!("{}/{}/code", self.config.workspace_root, app_id);
+        let code_dir = format!("{}/{}/code", self.config.get_workspace_root(), app_id);
 
         // 检查目录是否存在（如果 PVC 已挂载）
         let path = std::path::Path::new(&code_dir);
@@ -512,7 +512,7 @@ impl K8sAppService {
     pub async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
         let _app = self.get_app(app_id).await?;
 
-        let code_dir = format!("{}/{}/code", self.config.workspace_root, app_id);
+        let code_dir = format!("{}/{}/code", self.config.get_workspace_root(), app_id);
         let full_path = std::path::Path::new(&code_dir).join(file_path);
 
         // 安全检查：确保路径在应用目录内
@@ -551,7 +551,7 @@ impl K8sAppService {
         // 2. 应用内 API：应用提供文件上传 API，RCoder 通过 HTTP 调用
         //
         // 当前实现：写入 PVC 挂载目录
-        let code_dir = format!("{}/{}/code", self.config.workspace_root, app_id);
+        let code_dir = format!("{}/{}/code", self.config.get_workspace_root(), app_id);
         let file_path = format!("{}/{}", code_dir, target);
 
         // 确保目录存在
@@ -578,6 +578,16 @@ impl K8sAppService {
     /// 创建 HTTPRoute
     #[cfg(feature = "kubernetes")]
     async fn create_httproute(&self, app_id: &str, port: u16) -> Result<()> {
+        // 检查 Gateway 配置是否完整
+        let gateway_name = match &self.config.gateway_name {
+            Some(name) => name.clone(),
+            None => {
+                info!("Gateway name not configured, skipping HTTPRoute creation");
+                return Ok(());
+            }
+        };
+        let gateway_namespace = self.config.gateway_namespace.clone().unwrap_or_else(|| "default".to_string());
+
         if let Some(client) = &self.kube_client {
             // 使用 GroupVersionKind 动态获取 HTTPRoute 资源类型
             let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
@@ -599,8 +609,8 @@ impl K8sAppService {
                 },
                 "spec": {
                     "parentRefs": [{
-                        "name": self.config.gateway_name,
-                        "namespace": self.config.gateway_namespace
+                        "name": gateway_name,
+                        "namespace": gateway_namespace
                     }],
                     "rules": [{
                         "matches": [{
@@ -694,7 +704,7 @@ impl K8sAppService {
                                 .map(|p| p.name.clone())
                                 .unwrap_or_default(),
                             node_port: node_port as u16,
-                            access_url: format!("tcp://{}:{}", self.config.node_ip, node_port),
+                            access_url: format!("tcp://{}:{}", self.config.get_node_ip(), node_port),
                         });
                     }
                 }
@@ -728,7 +738,7 @@ impl K8sAppService {
                 },
                 spec: Some(PersistentVolumeClaimSpec {
                     access_modes: Some(vec!["ReadWriteOnce".to_string()]),
-                    storage_class_name: Some(self.config.storage_class.clone()),
+                    storage_class_name: self.config.storage_class.clone(),
                     resources: Some(VolumeResourceRequirements {
                         requests: Some(BTreeMap::from([(
                             "storage".to_string(),
@@ -816,7 +826,7 @@ impl K8sAppService {
         let params = ContainerCreateParams::builder()
             .project_id(app_id.to_string())
             .service_type(shared_types::ServiceType::WebAgentRunner)
-            .host_workspace_path(format!("{}/{}", self.config.workspace_root, app_id))
+            .host_workspace_path(format!("{}/{}", self.config.get_workspace_root(), app_id))
             .build();
 
         Ok(params)
@@ -836,7 +846,7 @@ impl K8sAppService {
                     .map(|p| TcpPortMapping {
                         name: p.name.clone(),
                         node_port: 0,
-                        access_url: format!("tcp://{}:0", self.config.node_ip),
+                        access_url: format!("tcp://{}:0", self.config.get_node_ip()),
                     })
                     .collect()
             })
@@ -847,7 +857,7 @@ impl K8sAppService {
                 http: http_port.map(|_| {
                     format!(
                         "http://{}:{}/apps/{}",
-                        self.config.node_ip, self.config.gateway_node_port, app_id
+                        self.config.get_node_ip(), self.config.get_gateway_node_port(), app_id
                     )
                 }),
                 tcp: tcp_ports,

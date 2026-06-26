@@ -664,7 +664,7 @@ impl AppService {
 
     /// 获取应用目录（容器内路径）
     fn get_container_app_dir(&self, app_id: &str) -> PathBuf {
-        PathBuf::from(&self.config.workspace_root).join(app_id)
+        PathBuf::from(self.config.get_workspace_root()).join(app_id)
     }
 
     /// 创建应用目录
@@ -729,7 +729,7 @@ impl AppService {
                     .map(|p| TcpPortMapping {
                         name: p.name.clone(),
                         node_port: 0, // TODO: 查询实际 NodePort
-                        access_url: format!("tcp://{}:0", self.config.node_ip),
+                        access_url: format!("tcp://{}:0", self.config.get_node_ip()),
                     })
                     .collect()
             })
@@ -740,7 +740,7 @@ impl AppService {
                 http: http_port.map(|_| {
                     format!(
                         "http://{}:{}/apps/{}",
-                        self.config.node_ip, self.config.gateway_node_port, app_id
+                        self.config.get_node_ip(), self.config.get_gateway_node_port(), app_id
                     )
                 }),
                 tcp: tcp_ports,

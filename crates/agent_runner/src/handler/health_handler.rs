@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use axum::Json;
+use axum::http::StatusCode;
 use shared_types::HttpResult;
 use tracing::info;
 
@@ -22,15 +23,19 @@ use tracing::info;
 ///
 /// 只有当所有启用的服务都就绪时，才返回 "healthy" 状态。
 /// 这样 RCoder 只需检查 HTTP /health 端点即可确保服务完全可用。
+///
+/// 重要：当 gRPC 未就绪时，返回 HTTP 503 状态码，这样 K8s readinessProbe
+/// 会认为 Pod 不是 Ready 的，避免 rcoder 过早连接 gRPC。
 #[utoipa::path(
     get,
     path = "/health",
     responses(
-        (status = 200, description = "服务健康状态", body = HttpResult<shared_types::HealthCheckResponse>)
+        (status = 200, description = "服务健康状态", body = HttpResult<shared_types::HealthCheckResponse>),
+        (status = 503, description = "服务未就绪", body = HttpResult<shared_types::HealthCheckResponse>)
     ),
     tag = "system"
 )]
-pub async fn health_check() -> Json<HttpResult<shared_types::HealthCheckResponse>> {
+pub async fn health_check() -> (StatusCode, Json<HttpResult<shared_types::HealthCheckResponse>>) {
     // HTTP 服务：本端点正常响应即表示就绪
     let http_ready = true;
 
@@ -51,19 +56,19 @@ pub async fn health_check() -> Json<HttpResult<shared_types::HealthCheckResponse
     // 构建健康检查响应
     let health_response = shared_types::HealthCheckResponse::new("agent-runner", http_ready, grpc_ready);
 
-    // 根据 gRPC 就绪状态返回不同的结果
+    // 根据 gRPC 就绪状态返回不同的 HTTP 状态码
     if grpc_ready {
-        Json(HttpResult::success(health_response))
+        (StatusCode::OK, Json(HttpResult::success(health_response)))
     } else {
-        // 服务未就绪，返回带 data 的错误响应
-        // 这样 RCoder 端可以获取 status、http_ready、grpc_ready 字段
-        Json(HttpResult {
+        // 服务未就绪，返回 HTTP 503 状态码
+        // 这样 K8s readinessProbe 会认为 Pod 不是 Ready 的
+        (StatusCode::SERVICE_UNAVAILABLE, Json(HttpResult {
             code: "SERVICE_NOT_READY".to_string(),
             message: "Service is starting, gRPC not ready".to_string(),
             data: Some(health_response),
             tid: None,
             success: false,
-        })
+        }))
     }
 }
 
