@@ -737,52 +737,65 @@ impl DockerManager {
     ) -> DockerResult<Option<ContainerQueryResult>> {
         // 1. 查 DashMap 缓存 (如果存在且运行中，通过容器名查询 IP)
         if let Some(info) = self.containers.get(project_id).await {
-            let is_running = matches!(info.status, ContainerStatus::Running);
-            if !is_running {
-                return Ok(Some(ContainerQueryResult::new(
-                    info.container_id.clone(),
-                    info.container_name.clone(),
-                    info.status.clone(),
-                    false,
-                    String::new(),
-                    info.created_at,
-                )));
+            // 🎯 验证 service_type 是否匹配
+            // 避免 WebAgentRunner 容器被错误地用于 ComputerAgentRunner 请求
+            if let Some(ref container_service_type) = info.service_type {
+                if container_service_type != service_type {
+                    debug!(
+                        "[FIND_CONTAINER] Service type mismatch: expected={:?}, found={:?}, container={}, skipping",
+                        service_type, container_service_type, info.container_name
+                    );
+                    // 继续查找，不返回这个容器
+                } else {
+                    // service_type 匹配，继续检查容器状态
+                    let is_running = matches!(info.status, ContainerStatus::Running);
+                    if !is_running {
+                        return Ok(Some(ContainerQueryResult::new(
+                            info.container_id.clone(),
+                            info.container_name.clone(),
+                            info.status.clone(),
+                            false,
+                            String::new(),
+                            info.created_at,
+                        )));
+                    }
+
+                    // 容器运行中，通过容器名查询获取 IP（Moka API 缓存优先，miss 时才调 Docker API）
+                    // 如果无法获取 IP（容器已被销毁但 DashMap 缓存未清理），标记为非运行状态
+                    let (container_ip, effective_status) = match self
+                        .find_container_realtime(&info.container_name)
+                        .await
+                    {
+                        Ok(Some(realtime_info)) if !realtime_info.container_ip.is_empty() => {
+                            (realtime_info.container_ip, info.status.clone())
+                        }
+                        Ok(Some(realtime_info)) => {
+                            warn!(
+                                "[FIND_CONTAINER] Container in DashMap marked Running but has empty IP, treating as stopped: container_name={}, container_id={}",
+                                info.container_name, info.container_id
+                            );
+                            (realtime_info.container_ip, ContainerStatus::Stopped)
+                        }
+                        _ => {
+                            warn!(
+                                "[FIND_CONTAINER] Container in DashMap marked Running but not found via Docker API, treating as stopped: container_name={}, container_id={}",
+                                info.container_name, info.container_id
+                            );
+                            (String::new(), ContainerStatus::Stopped)
+                        }
+                    };
+
+                    let is_running = matches!(effective_status, ContainerStatus::Running);
+                    return Ok(Some(ContainerQueryResult::new(
+                        info.container_id.clone(),
+                        info.container_name.clone(),
+                        effective_status,
+                        is_running,
+                        container_ip,
+                        info.created_at,
+                    )));
+                }
             }
-
-            // 容器运行中，通过容器名查询获取 IP（Moka API 缓存优先，miss 时才调 Docker API）
-            // 如果无法获取 IP（容器已被销毁但 DashMap 缓存未清理），标记为非运行状态
-            let (container_ip, effective_status) = match self
-                .find_container_realtime(&info.container_name)
-                .await
-            {
-                Ok(Some(realtime_info)) if !realtime_info.container_ip.is_empty() => {
-                    (realtime_info.container_ip, info.status.clone())
-                }
-                Ok(Some(realtime_info)) => {
-                    warn!(
-                        "[FIND_CONTAINER] Container in DashMap marked Running but has empty IP, treating as stopped: container_name={}, container_id={}",
-                        info.container_name, info.container_id
-                    );
-                    (realtime_info.container_ip, ContainerStatus::Stopped)
-                }
-                _ => {
-                    warn!(
-                        "[FIND_CONTAINER] Container in DashMap marked Running but not found via Docker API, treating as stopped: container_name={}, container_id={}",
-                        info.container_name, info.container_id
-                    );
-                    (String::new(), ContainerStatus::Stopped)
-                }
-            };
-
-            let is_running = matches!(effective_status, ContainerStatus::Running);
-            return Ok(Some(ContainerQueryResult::new(
-                info.container_id.clone(),
-                info.container_name.clone(),
-                effective_status,
-                is_running,
-                container_ip,
-                info.created_at,
-            )));
         }
 
         // 2. 实时查询 Docker API (构造名称)
