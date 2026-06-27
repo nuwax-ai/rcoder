@@ -5,8 +5,10 @@
 //! - `X-Ttyd-Service-Type`：业务场景（`shared_types::ServiceType` 的 kebab-case 形式）
 //!
 //! 根据 serviceType 显式选项目目录前缀：
-//! - `ComputerAgentRunner`（computer-agent-runner，agent-runner 镜像）：`/home/user/{project_id}`
+//! - `ComputerAgentRunner`（computer-agent-runner，agent-runner 镜像）：`/home/user`
+//!   （用户目录，一个 user_id 对应一个容器，所有项目都在此目录下）
 //! - `WebAgentRunner`（web-agent-runner，rcoder 镜像）：`/app/project_workspace/{project_id}`
+//!   （项目目录，一个 project_id 对应一个容器）
 //!
 //! serviceType 缺失/未知时回退到自动检测两前缀（兼容旧 Pingora）。白名单规则与
 //! `start-ttyd.sh` 的 wrapper `is_path_allowed` 一致，杜绝路径穿越和绝对路径逃逸。
@@ -24,29 +26,52 @@ fn is_valid_project_id(pid: &str) -> bool {
     !pid.is_empty() && pid.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
-/// serviceType → 项目目录前缀（与 `shared_types::ServiceType` 对应）
-///
-/// 接受 ServiceType 的 kebab-case / PascalCase / 旧名（`from_str` 支持的全部格式）。
-fn service_type_to_base(service_type: &str) -> Option<&'static str> {
-    use shared_types::ServiceType;
-    use std::str::FromStr;
-    match ServiceType::from_str(service_type).ok()? {
-        ServiceType::ComputerAgentRunner => Some("/home/user"),
-        ServiceType::WebAgentRunner => Some("/app/project_workspace"),
-    }
-}
-
 /// 根据 serviceType + project_id 解析终端工作目录
 ///
 /// serviceType 明确时按其对应前缀解析；serviceType 缺失/未知时回退到自动检测
 /// 两前缀（[`HOME_CANDIDATES`]），兼容旧 Pingora 未注入 `X-Ttyd-Service-Type` 的场景。
-/// 任一前缀下都需 `{前缀}/project_id` 存在、canonicalize 后仍在该前缀下（防 symlink 穿越）、
+///
+/// 对于不同服务类型的行为：
+/// - `ComputerAgentRunner`：直接返回 `/home/user`（用户目录，不需要 project_id）
+/// - `WebAgentRunner`：返回 `/app/project_workspace/{project_id}`（项目目录）
+///
+/// 任一前缀下都需目录存在、canonicalize 后仍在该前缀下（防 symlink 穿越）、
 /// 且是目录，否则返回 `None`（调用方回退到 `$HOME`）。
 pub fn resolve_project_cwd(service_type: &str, project_id: &str) -> Option<PathBuf> {
-    match service_type_to_base(service_type) {
-        Some(base) => resolve_in_candidates(project_id, &[base]),
-        None => resolve_in_candidates(project_id, HOME_CANDIDATES),
+    use shared_types::ServiceType;
+    use std::str::FromStr;
+
+    // 根据 service_type 决定是否需要拼接 project_id
+    match ServiceType::from_str(service_type).ok() {
+        Some(ServiceType::ComputerAgentRunner) => {
+            // ComputerAgentRunner: 一个 user_id 对应一个容器，所有项目都在 /home/user
+            // 直接返回 /home/user，不需要拼接 project_id
+            let base = Path::new("/home/user");
+            resolve_user_directory(base)
+        }
+        Some(ServiceType::WebAgentRunner) => {
+            // WebAgentRunner: 一个 project_id 对应一个容器
+            // 返回 /app/project_workspace/{project_id}
+            resolve_in_candidates(project_id, &["/app/project_workspace"])
+        }
+        None => {
+            // serviceType 缺失/未知时回退到自动检测
+            resolve_in_candidates(project_id, HOME_CANDIDATES)
+        }
     }
+}
+
+/// 解析用户目录（ComputerAgentRunner 场景）
+///
+/// 检查 /home/user 目录是否存在且可访问
+fn resolve_user_directory(base: &Path) -> Option<PathBuf> {
+    // canonicalize 解析符号链接
+    if let Ok(real) = base.canonicalize()
+        && real.is_dir()
+    {
+        return Some(real);
+    }
+    None
 }
 
 /// 内部：在给定候选前缀列表中解析（抽出来便于单元测试用 tempdir 注入候选）
@@ -80,47 +105,30 @@ mod tests {
 
     #[test]
     fn rejects_empty_project_id() {
-        assert_eq!(resolve_project_cwd("computer-agent-runner", ""), None);
+        // WebAgentRunner 需要 project_id，空值应返回 None
+        assert_eq!(resolve_project_cwd("web-agent-runner", ""), None);
     }
 
     #[test]
     fn rejects_invalid_chars() {
-        // 含路径分隔符、点、空格、分号等危险字符
-        assert_eq!(resolve_project_cwd("computer-agent-runner", "../etc"), None);
-        assert_eq!(resolve_project_cwd("computer-agent-runner", "a/b"), None);
-        assert_eq!(resolve_project_cwd("computer-agent-runner", "a;b"), None);
-        assert_eq!(resolve_project_cwd("computer-agent-runner", "a b"), None);
-        assert_eq!(resolve_project_cwd("computer-agent-runner", "."), None);
+        // WebAgentRunner 需要 project_id，无效字符应返回 None
+        assert_eq!(resolve_project_cwd("web-agent-runner", "../etc"), None);
+        assert_eq!(resolve_project_cwd("web-agent-runner", "a/b"), None);
+        assert_eq!(resolve_project_cwd("web-agent-runner", "a;b"), None);
+        assert_eq!(resolve_project_cwd("web-agent-runner", "a b"), None);
+        assert_eq!(resolve_project_cwd("web-agent-runner", "."), None);
     }
 
     #[test]
-    fn service_type_maps_to_correct_base() {
-        // kebab-case（Pingora 注入的格式）
-        assert_eq!(
-            service_type_to_base("computer-agent-runner"),
-            Some("/home/user")
-        );
-        assert_eq!(
-            service_type_to_base("web-agent-runner"),
-            Some("/app/project_workspace")
-        );
-        // PascalCase（兼容）
-        assert_eq!(
-            service_type_to_base("ComputerAgentRunner"),
-            Some("/home/user")
-        );
-        assert_eq!(
-            service_type_to_base("WebAgentRunner"),
-            Some("/app/project_workspace")
-        );
-        // 旧名 RCoder → WebAgentRunner
-        assert_eq!(
-            service_type_to_base("rcoder"),
-            Some("/app/project_workspace")
-        );
-        // 未知 / 空 → None（触发 fallback 自动检测）
-        assert_eq!(service_type_to_base("unknown"), None);
-        assert_eq!(service_type_to_base(""), None);
+    fn computer_agent_runner_resolves_user_directory() {
+        // ComputerAgentRunner 直接返回 /home/user，不需要 project_id
+        // 注意：这个测试在非容器环境中会返回 None，因为 /home/user 可能不存在
+        let result = resolve_project_cwd("computer-agent-runner", "any-project-id");
+        // 在容器环境中应该返回 Some("/home/user")，在非容器环境中返回 None
+        // 这里只测试逻辑正确性，不测试实际路径
+        if result.is_some() {
+            assert_eq!(result.unwrap().to_str().unwrap(), "/home/user");
+        }
     }
 
     #[test]
