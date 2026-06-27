@@ -301,18 +301,6 @@ impl Default for ContainerLookupService {
     }
 }
 
-impl Clone for ContainerLookupService {
-    fn clone(&self) -> Self {
-        Self {
-            projects: self.projects.iter().map(|r| (r.key().clone(), r.value().clone())).collect(),
-            containers: self.containers.iter().map(|r| (r.key().clone(), r.value().clone())).collect(),
-            project_to_container: self.project_to_container.iter().map(|r| (r.key().clone(), r.value().clone())).collect(),
-            user_id_to_project_id: self.user_id_to_project_id.iter().map(|r| (r.key().clone(), r.value().clone())).collect(),
-            pod_id_to_project_id: self.pod_id_to_project_id.iter().map(|r| (r.key().clone(), r.value().clone())).collect(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
