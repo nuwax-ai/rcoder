@@ -5,8 +5,8 @@
 //! - `X-Ttyd-Service-Type`：业务场景（`shared_types::ServiceType` 的 kebab-case 形式）
 //!
 //! 根据 serviceType 显式选项目目录前缀：
-//! - `ComputerAgentRunner`（computer-agent-runner，agent-runner 镜像）：`/home/user`
-//!   （用户目录，一个 user_id 对应一个容器，所有项目都在此目录下）
+//! - `ComputerAgentRunner`（computer-agent-runner，agent-runner 镜像）：`/home/user/{project_id}`
+//!   （用户目录挂载到 /home/user，项目子目录为 /home/user/{project_id}）
 //! - `WebAgentRunner`（web-agent-runner，rcoder 镜像）：`/app/project_workspace/{project_id}`
 //!   （项目目录，一个 project_id 对应一个容器）
 //!
@@ -41,17 +41,16 @@ pub fn resolve_project_cwd(service_type: &str, project_id: &str) -> Option<PathB
     use shared_types::ServiceType;
     use std::str::FromStr;
 
-    // 根据 service_type 决定是否需要拼接 project_id
+    // 根据 service_type 决定基础路径
     match ServiceType::from_str(service_type).ok() {
         Some(ServiceType::ComputerAgentRunner) => {
-            // ComputerAgentRunner: 一个 user_id 对应一个容器，所有项目都在 /home/user
-            // 直接返回 /home/user，不需要拼接 project_id
-            let base = Path::new("/home/user");
-            resolve_user_directory(base)
+            // ComputerAgentRunner: 一个 user_id 对应一个容器
+            // 项目目录: /home/user/{project_id}
+            resolve_in_candidates(project_id, &["/home/user"])
         }
         Some(ServiceType::WebAgentRunner) => {
             // WebAgentRunner: 一个 project_id 对应一个容器
-            // 返回 /app/project_workspace/{project_id}
+            // 项目目录: /app/project_workspace/{project_id}
             resolve_in_candidates(project_id, &["/app/project_workspace"])
         }
         None => {
@@ -59,19 +58,6 @@ pub fn resolve_project_cwd(service_type: &str, project_id: &str) -> Option<PathB
             resolve_in_candidates(project_id, HOME_CANDIDATES)
         }
     }
-}
-
-/// 解析用户目录（ComputerAgentRunner 场景）
-///
-/// 检查 /home/user 目录是否存在且可访问
-fn resolve_user_directory(base: &Path) -> Option<PathBuf> {
-    // canonicalize 解析符号链接
-    if let Ok(real) = base.canonicalize()
-        && real.is_dir()
-    {
-        return Some(real);
-    }
-    None
 }
 
 /// 内部：在给定候选前缀列表中解析（抽出来便于单元测试用 tempdir 注入候选）
@@ -121,13 +107,13 @@ mod tests {
 
     #[test]
     fn computer_agent_runner_resolves_user_directory() {
-        // ComputerAgentRunner 直接返回 /home/user，不需要 project_id
-        // 注意：这个测试在非容器环境中会返回 None，因为 /home/user 可能不存在
-        let result = resolve_project_cwd("computer-agent-runner", "any-project-id");
-        // 在容器环境中应该返回 Some("/home/user")，在非容器环境中返回 None
+        // ComputerAgentRunner 返回 /home/user/{project_id}
+        // 注意：这个测试在非容器环境中会返回 None，因为 /home/user/{project_id} 可能不存在
+        let result = resolve_project_cwd("computer-agent-runner", "1553211");
+        // 在容器环境中应该返回 Some("/home/user/1553211")，在非容器环境中返回 None
         // 这里只测试逻辑正确性，不测试实际路径
         if result.is_some() {
-            assert_eq!(result.unwrap().to_str().unwrap(), "/home/user");
+            assert_eq!(result.unwrap().to_str().unwrap(), "/home/user/1553211");
         }
     }
 

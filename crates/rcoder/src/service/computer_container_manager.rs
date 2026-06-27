@@ -197,10 +197,21 @@ impl ComputerContainerManager {
         options: &ContainerCreateOptions,
         runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<ContainerBasicInfo, AppError> {
-        let container_identifier = options.pod_id.as_deref().unwrap_or(&options.user_id);
+        // 确定容器标识符：
+        // - WebAgentRunner: 使用 project_id
+        // - ComputerAgentRunner: 使用 user_id
+        // - 如果有 pod_id，优先使用 pod_id（共享容器场景）
+        let container_identifier = match options.service_type {
+            ServiceType::WebAgentRunner => {
+                options.pod_id.as_deref().unwrap_or(&options.project_id)
+            }
+            ServiceType::ComputerAgentRunner => {
+                options.pod_id.as_deref().unwrap_or(&options.user_id)
+            }
+        };
         info!(
-            "🏗️ [COMPUTER_CONTAINER] Force creating new user container: container_identifier={}",
-            container_identifier
+            "🏗️ [COMPUTER_CONTAINER] Force creating new user container: container_identifier={}, service_type={}",
+            container_identifier, options.service_type
         );
 
         Self::create_container_for_user(options, runtime).await
@@ -214,11 +225,16 @@ impl ComputerContainerManager {
         runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<ContainerBasicInfo, AppError> {
         // 确定容器标识符：
-        // - WebAgentRunner: 使用 project_id（通过 pod_id 或 user_id 传递）
-        // - ComputerAgentRunner: 使用 user_id
+        // - WebAgentRunner: 使用 project_id（一个项目对应一个容器）
+        // - ComputerAgentRunner: 使用 user_id（一个用户对应一个容器）
+        // - 如果有 pod_id，优先使用 pod_id（共享容器场景）
         let container_identifier = match options.service_type {
-            ServiceType::WebAgentRunner => options.pod_id.as_deref().unwrap_or(&options.user_id),
-            ServiceType::ComputerAgentRunner => options.pod_id.as_deref().unwrap_or(&options.user_id),
+            ServiceType::WebAgentRunner => {
+                options.pod_id.as_deref().unwrap_or(&options.project_id)
+            }
+            ServiceType::ComputerAgentRunner => {
+                options.pod_id.as_deref().unwrap_or(&options.user_id)
+            }
         };
 
         // 1. 准备用户级工作目录（仍需在 rcoder 容器内创建）
