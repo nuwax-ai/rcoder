@@ -919,6 +919,11 @@ mod tests {
     use super::*;
     use shared_types::ProjectExtendedFields;
 
+    /// 测试用的 K8s namespace
+    const TEST_NAMESPACE: &str = "test-namespace";
+    /// 测试用的 K8s 集群域名
+    const TEST_CLUSTER_DOMAIN: &str = "test.cluster.local";
+
     fn create_test_info(project_id: &str) -> ProjectAndContainerInfo {
         let mut info = ProjectAndContainerInfo::new(project_id.to_string());
         info.set_service_type(Some(ServiceType::WebAgentRunner));
@@ -945,7 +950,7 @@ mod tests {
     }
 
     fn make_adapter() -> ProjectAdapter {
-        let (adapter, _) = ProjectAdapter::new();
+        let (adapter, _) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         adapter
     }
 
@@ -1168,7 +1173,7 @@ mod tests {
     /// 并发压测：8 线程 × 200 轮 add_session + clear_session_one，无 panic/deadlock
     #[test]
     fn test_concurrent_multi_session_add_and_clear() {
-        let (adapter, _rx) = ProjectAdapter::new();
+        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         const THREADS: usize = 8;
@@ -1444,7 +1449,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_insert_remove_no_deadlock() {
-        let (adapter, rx) = ProjectAdapter::new();
+        let (adapter, rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
         let rx = Arc::new(std::sync::Mutex::new(rx));
 
@@ -1495,7 +1500,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_same_project_insert_remove() {
-        let (adapter, _rx) = ProjectAdapter::new();
+        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         const THREADS: usize = 8;
@@ -1531,7 +1536,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_shared_container_remove() {
-        let (adapter, rx) = ProjectAdapter::new();
+        let (adapter, rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
         let rx = Arc::new(std::sync::Mutex::new(rx));
 
@@ -1598,7 +1603,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_session_update_and_remove() {
-        let (adapter, _rx) = ProjectAdapter::new();
+        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         let pid = "concurrent-session-proj";
@@ -1642,7 +1647,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_insert_with_session_and_remove() {
-        let (adapter, _rx) = ProjectAdapter::new();
+        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         const THREADS: usize = 4;
@@ -1676,7 +1681,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_remove_nonexistent() {
-        let (adapter, _rx) = ProjectAdapter::new();
+        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         const THREADS: usize = 8;
@@ -1706,7 +1711,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_stress_mixed_operations() {
-        let (adapter, _rx) = ProjectAdapter::new();
+        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         for i in 0..10 {
@@ -1761,7 +1766,7 @@ mod tests {
 
     #[test]
     fn test_raii_cleanup_request_content() {
-        let (adapter, rx) = ProjectAdapter::new();
+        let (adapter, rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let rx = Arc::new(std::sync::Mutex::new(rx));
 
         let info = Arc::new(create_test_info_with_container("proj-verify", "c-verify"));
@@ -1782,7 +1787,7 @@ mod tests {
 
     #[test]
     fn test_shared_container_ref_count_no_leak_under_reinsert() {
-        let (adapter, rx) = ProjectAdapter::new();
+        let (adapter, rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let rx = Arc::new(std::sync::Mutex::new(rx));
 
         let container = ContainerBasicInfo {
@@ -2150,7 +2155,7 @@ mod tests {
     #[test]
     fn test_index_consistency_under_raii() {
         // 验证 RAII 清理后索引一致性：多个 project 共享容器
-        let (adapter, _rx) = ProjectAdapter::new();
+        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
 
         let container = ContainerBasicInfo {
             container_id: "cid-shared".to_string(),
@@ -2378,5 +2383,51 @@ mod tests {
 
         let project = adapter.get(project_id).unwrap();
         assert_eq!(project.session_count(), 3, "project 应包含 3 个 session");
+    }
+}
+
+// ========== ContainerLookup trait 实现 ==========
+
+impl shared_types::ContainerLookup for ProjectAdapter {
+    /// 根据 user_id 查找容器 IP（ComputerAgentRunner 普通场景）
+    ///
+    /// 通过 user_id_to_project_id 索引找到 project_id，
+    /// 然后通过 project_to_container 索引找到 container_key，
+    /// 最后从 containers 中获取 container_ip。
+    fn find_by_user_id(&self, user_id: &str) -> Option<String> {
+        // 1. 通过 user_id_to_project_id 找到 project_id
+        let project_id = self.user_id_to_project_id.get(user_id)?;
+        // 2. 通过 project_to_container 找到 container_key
+        let container_key = self.project_to_container.get(project_id.value())?;
+        // 3. 从 containers 中获取 container_ip
+        self.containers.get(container_key.value())
+            .map(|entry| entry.info().container_ip.clone())
+    }
+
+    /// 根据 project_id 查找容器 IP（WebAgentRunner 普通场景）
+    ///
+    /// 通过 project_to_container 索引找到 container_key，
+    /// 然后从 containers 中获取 container_ip。
+    fn find_by_project_id(&self, project_id: &str) -> Option<String> {
+        // 1. 通过 project_to_container 找到 container_key
+        let container_key = self.project_to_container.get(project_id)?;
+        // 2. 从 containers 中获取 container_ip
+        self.containers.get(container_key.value())
+            .map(|entry| entry.info().container_ip.clone())
+    }
+
+    /// 根据 pod_id 和 service_type 查找容器 IP（共享容器场景）
+    ///
+    /// 通过 pod_id_to_project_id 索引找到 project_id，
+    /// 然后通过 project_to_container 索引找到 container_key，
+    /// 最后从 containers 中获取 container_ip。
+    fn find_by_pod_id(&self, pod_id: &str, _service_type: &shared_types::ServiceType) -> Option<String> {
+        // 1. 通过 pod_id_to_project_id 找到 project_id
+        let project_id = self.pod_id_to_project_id.get(pod_id)?;
+        // 2. 通过 project_to_container 找到 container_key
+        let container_key = self.project_to_container.get(project_id.value())?;
+        // 3. 从 containers 中获取 container_ip
+        self.containers.get(container_key.value())
+            .map(|entry| entry.info().container_ip.clone())
     }
 }

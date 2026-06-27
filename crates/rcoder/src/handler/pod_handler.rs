@@ -19,7 +19,7 @@ use super::utils::{I18nJsonOrQuery, I18nQuery, container_identity_from_name};
 use crate::router::AppState;
 use crate::service::ComputerContainerManager;
 use crate::service::computer_container_manager::ContainerCreateOptions;
-use crate::service::vnc_sync::sync_single_vnc_backend;
+// sync_single_vnc_backend 已移除，使用 ContainerLookupService 统一数据源
 use crate::{AppError, HttpResult};
 use shared_types::{
     ContainerBasicInfo, PodCountByServiceType, PodCountResponse, ProjectAndContainerInfo,
@@ -1039,22 +1039,7 @@ pub async fn pod_ensure(
 
             // 如果等待成功，直接使用已就绪的容器，跳过创建流程
             if let Some(info) = waited_container_info {
-                // 同步 VNC 后端映射
-                if let Some(ref pingora_service) = state.pingora_service {
-                    sync_single_vnc_backend(
-                        pingora_service,
-                        &container_identifier,
-                        &info.container_name,
-                        &info.container_ip,
-                        &state.config.app_manager.namespace,
-                        &state.cluster_domain,
-                    )
-                    .await;
-                    info!(
-                        " [POD_ENSURE] VNC backend mapping synced: container_identifier={} -> {}",
-                        container_identifier, info.container_ip
-                    );
-                }
+                // VNC 后端映射已通过 ContainerLookupService 统一管理，无需手动同步
 
                 // 更新存储 记录
                 let project_info = if let Some(existing) = state.get_project(&request.project_id) {
@@ -1427,23 +1412,7 @@ pub async fn pod_ensure(
         }
     };
 
-    // 4. 🆕 如果是新创建的容器，立即同步 VNC 后端映射
-    // 这消除了等待定时同步任务（最多 5 秒）的空窗期
-    if created && let Some(ref pingora_service) = state.pingora_service {
-        sync_single_vnc_backend(
-            pingora_service,
-            &container_identifier,
-            &container_info.container_name,
-            &container_info.container_ip,
-            &state.config.app_manager.namespace,
-            &state.cluster_domain,
-        )
-        .await;
-        info!(
-            " [POD_ENSURE] VNC backend mapping synced: container_identifier={} -> {}",
-            container_identifier, container_info.container_ip
-        );
-    }
+    // 4. VNC 后端映射已通过 ContainerLookupService 统一管理，无需手动同步
 
     // 5. 更新存储中的容器信息（用于后续保活）
     // 无论容器是新建还是已存在，都要确保 存储 记录是最新的
@@ -1928,23 +1897,7 @@ pub async fn pod_restart(
         container_info.container_id
     );
 
-    // 5. 🆕 立即同步 VNC 后端映射
-    // 这消除了等待定时同步任务（最多 5 秒）的空窗期
-    if let Some(ref pingora_service) = state.pingora_service {
-        sync_single_vnc_backend(
-            pingora_service,
-            &container_identifier,
-            &container_info.container_name,
-            &container_info.container_ip,
-            &state.config.app_manager.namespace,
-            &state.cluster_domain,
-        )
-        .await;
-        info!(
-            " [POD_RESTART] VNC backend mapping synced: user_id={} -> {}",
-            request.user_id, container_info.container_ip
-        );
-    }
+    // 5. VNC 后端映射已通过 ContainerLookupService 统一管理，无需手动同步
 
     // 6. 在 存储中记录容器信息
     {

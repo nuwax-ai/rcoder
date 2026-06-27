@@ -1,6 +1,22 @@
 mod container;
 mod model;
 
+// 容器条目模块
+pub mod container_entry;
+pub use container_entry::ContainerEntry;
+
+// 清理请求模块
+pub mod cleanup_request;
+pub use cleanup_request::CleanupRequest;
+
+// 存储类型模块
+pub mod storage_types;
+pub use storage_types::{IdleContainerInfo, StorageStats};
+
+// 容器查找服务模块
+pub mod container_lookup;
+pub use container_lookup::{ContainerLookup, ContainerLookupService};
+
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）
 pub mod flexible_string;
 pub mod version_util;

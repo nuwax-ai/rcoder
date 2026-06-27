@@ -183,6 +183,8 @@ mod tests {
             container_name: "agent-user-123".to_string(),
             service_type: ServiceType::ComputerAgentRunner,
             container_ip: "10.0.0.1".to_string(),
+            namespace: "test-namespace".to_string(),
+            cluster_domain: "test.cluster.local".to_string(),
             project_ids: vec!["proj-1".to_string()],
         };
         let debug_str = format!("{:?}", req);

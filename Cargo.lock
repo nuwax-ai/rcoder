@@ -6155,6 +6155,7 @@ dependencies = [
  "im",
  "opentelemetry",
  "opentelemetry_sdk",
+ "parking_lot",
  "reqwest",
  "semver",
  "serde",

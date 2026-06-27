@@ -9,8 +9,8 @@ use crate::cleanup_task;
 use crate::config::AppConfig;
 use crate::router::AppState;
 use crate::service::{
-    ContainerStatusCheckerConfig, ContainerSyncConfig, VncSyncConfig,
-    start_container_status_checker, start_container_sync_task, start_vnc_sync_task,
+    ContainerStatusCheckerConfig, ContainerSyncConfig,
+    start_container_status_checker, start_container_sync_task,
 };
 
 #[allow(dead_code)]
@@ -18,7 +18,6 @@ pub struct BackgroundTaskHandles {
     pub cleanup_handle: Option<tokio::task::JoinHandle<()>>,
     pub status_checker_handle: tokio::task::JoinHandle<()>,
     pub container_sync_handle: tokio::task::JoinHandle<()>,
-    pub vnc_sync_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub async fn start_all_background_tasks(
@@ -78,29 +77,11 @@ pub async fn start_all_background_tasks(
     );
     info!("Container status sync already started (interval: 60s, detect container)");
 
-    let vnc_sync_handle = if let Some(ref pingora_service) = state.pingora_service {
-        let vnc_sync_config = VncSyncConfig {
-            sync_interval: Duration::from_secs(5),
-        };
-        let handle = start_vnc_sync_task(
-            pingora_service.clone(),
-            vnc_sync_config,
-            state.container_prefix_rcoder.clone(),
-            state.container_prefix_computer.clone(),
-            state.runtime().clone(),
-            state.config.app_manager.namespace.clone(),
-            state.cluster_domain.clone(),
-        );
-        info!("VNC sync already started (interval: 5s, sync Docker container IP)");
-        Some(handle)
-    } else {
-        None
-    };
+    // VNC 后端映射已通过 ContainerLookupService 统一管理，无需定时同步任务
 
     Ok(BackgroundTaskHandles {
         cleanup_handle,
         status_checker_handle,
         container_sync_handle,
-        vnc_sync_handle,
     })
 }

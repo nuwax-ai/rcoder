@@ -65,6 +65,8 @@ pub struct PingoraProxyService {
     pub api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
     /// 🔒 API Key 鉴权配置（可选，用于 VNC 等路由的鉴权，使用 ArcSwap 实现无锁读取）
     pub api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
+    /// 容器查找服务（统一数据源）
+    container_lookup: Option<Arc<dyn shared_types::ContainerLookup>>,
 }
 
 /// 为了兼容现有接口，我们保留原来的 PortProxyService 别名
@@ -91,6 +93,8 @@ pub struct PortProxy {
     /// 🔒 API Key 鉴权配置（可选，用于 VNC 等路由的鉴权，使用 ArcSwap 实现无锁读取）
     #[allow(dead_code)]
     api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
+    /// 容器查找服务（统一数据源）
+    container_lookup: Option<Arc<dyn shared_types::ContainerLookup>>,
 }
 
 #[async_trait]
@@ -357,6 +361,7 @@ impl ProxyHttp for PortProxy {
                     matched.params,
                     &self.vnc_backends,
                     &self.metrics,
+                    &self.container_lookup,
                 )
                 .await
             }
@@ -367,6 +372,7 @@ impl ProxyHttp for PortProxy {
                     &self.vnc_backends,
                     &self.project_backends,
                     &self.metrics,
+                    &self.container_lookup,
                 )
                 .await
             }
@@ -499,7 +505,17 @@ impl PingoraProxyService {
             project_backends: Arc::new(DashMap::new()),
             api_key_manager: Arc::new(DashMap::new()),
             api_key_config: None, // 默认不启用 API Key 鉴权
+            container_lookup: None,
         }
+    }
+
+    /// 设置容器查找服务（统一数据源）
+    pub fn with_container_lookup(
+        mut self,
+        container_lookup: Arc<dyn shared_types::ContainerLookup>,
+    ) -> Self {
+        self.container_lookup = Some(container_lookup);
+        self
     }
 
     /// 设置负载均衡算法
@@ -548,6 +564,7 @@ impl PingoraProxyService {
             router,
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(),
+            container_lookup: self.container_lookup.clone(),
         })
     }
 
@@ -817,6 +834,51 @@ impl PingoraProxyService {
         self.project_backends.len()
     }
 
+    /// 查找容器 IP（统一入口）
+    ///
+    /// 优先使用 ContainerLookupService，回退到 vnc_backends/project_backends
+    pub fn find_container_ip(
+        &self,
+        service_type: &shared_types::ServiceType,
+        user_id: Option<&str>,
+        project_id: Option<&str>,
+        pod_id: Option<&str>,
+    ) -> Option<String> {
+        // 1. 优先使用 ContainerLookupService
+        if let Some(ref lookup) = self.container_lookup {
+            let result = lookup.find_container_ip(service_type, user_id, project_id, pod_id);
+            if result.is_some() {
+                return result;
+            }
+        }
+
+        // 2. 回退到 vnc_backends/project_backends（向后兼容）
+        // 优先使用 pod_id
+        if let Some(pid) = pod_id
+            && let Some(ip) = self.vnc_backends.get(pid)
+        {
+            return Some(ip.value().clone());
+        }
+
+        // 根据 ServiceType 选择路由键
+        match service_type {
+            shared_types::ServiceType::ComputerAgentRunner => {
+                if let Some(uid) = user_id {
+                    self.vnc_backends.get(uid).map(|r| r.value().clone())
+                } else {
+                    None
+                }
+            }
+            shared_types::ServiceType::WebAgentRunner => {
+                if let Some(pid) = project_id {
+                    self.project_backends.get(pid).map(|r| r.value().clone())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     // ========================================================================
     // 🔒 API 密钥管理方法
     // ========================================================================
@@ -839,6 +901,7 @@ impl Clone for PingoraProxyService {
             project_backends: self.project_backends.clone(),
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(),
+            container_lookup: self.container_lookup.clone(),
         }
     }
 }

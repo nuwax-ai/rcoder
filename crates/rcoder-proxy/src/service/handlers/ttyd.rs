@@ -186,6 +186,7 @@ pub async fn handle_ttyd_upstream(
     params: Params<'_, '_>,
     vnc_backends: &Arc<DashMap<String, String>>,
     metrics: &Arc<ProxyMetrics>,
+    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     // 从路径参数中提取 user_id
     let user_id = params.get("user_id").ok_or_else(|| {
@@ -200,9 +201,16 @@ pub async fn handle_ttyd_upstream(
         user_id, project_id
     );
 
-    // 查找用户容器 IP（复用 vnc_backends DashMap）
-    let container_ip = match vnc_backends.get(user_id) {
-        Some(ip_ref) => ip_ref.value().clone(),
+    // 查找用户容器 IP
+    // 优先使用 ContainerLookupService，回退到 vnc_backends
+    let container_ip = if let Some(lookup) = container_lookup {
+        lookup.find_by_user_id(user_id)
+    } else {
+        vnc_backends.get(user_id).map(|r| r.value().clone())
+    };
+
+    let container_ip = match container_ip {
+        Some(ip) => ip,
         None => {
             info!("routing {} to ttyd", user_id);
             return Err(
@@ -262,6 +270,7 @@ pub async fn handle_web_ttyd_upstream(
     vnc_backends: &Arc<DashMap<String, String>>,
     project_backends: &Arc<DashMap<String, String>>,
     metrics: &Arc<ProxyMetrics>,
+    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let user_id = params.get("user_id").unwrap_or("unknown");
     let project_id = params.get("project_id").unwrap_or("");
@@ -271,11 +280,16 @@ pub async fn handle_web_ttyd_upstream(
         user_id, project_id
     );
 
-    // 使用 project_id 查找容器 IP（优先使用 project_backends，其次使用 vnc_backends）
-    let container_ip = project_backends
-        .get(project_id)
-        .or_else(|| vnc_backends.get(project_id))
-        .map(|ip_ref| ip_ref.value().clone());
+    // 使用 project_id 查找容器 IP
+    // 优先使用 ContainerLookupService，回退到 project_backends/vnc_backends
+    let container_ip = if let Some(lookup) = container_lookup {
+        lookup.find_by_project_id(project_id)
+    } else {
+        project_backends
+            .get(project_id)
+            .or_else(|| vnc_backends.get(project_id))
+            .map(|ip_ref| ip_ref.value().clone())
+    };
 
     let container_ip = match container_ip {
         Some(ip) => ip,

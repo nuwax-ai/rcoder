@@ -322,9 +322,8 @@ fn make_project(addr: SocketAddr) -> ProjectAndContainerInfo {
 fn make_ctx(addr: SocketAddr) -> AgentMgmtForwardCtx {
     AgentMgmtForwardCtx::from_state(
         Arc::new(GrpcChannelPool::new()),
-        stub_runtime(),
-        "rcoder".to_string(),
-        "rcoder-computer-agent-runner".to_string(),
+        "test-namespace".to_string(),
+        "test.cluster.local".to_string(),
         "en-US",
     )
     .with_endpoint_override(addr)
