@@ -28,6 +28,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
+use shared_types::NOVNC_PORT;
 use utoipa::ToSchema;
 
 use super::utils::I18nPath;
@@ -97,9 +98,6 @@ pub struct DesktopErrorResponse {
     /// 项目 ID
     pub project_id: String,
 }
-
-/// noVNC 默认端口
-const NOVNC_PORT: u16 = 6080;
 
 /// 获取 VNC 桌面访问信息
 ///

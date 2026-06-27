@@ -13,7 +13,7 @@ use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 #[cfg(feature = "kubernetes")]
 use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
-use shared_types::{GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT, ServiceType, TTYD_PORT};
+use shared_types::{GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT, WS_TERMINAL_PORT, ServiceType};
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
 #[cfg(feature = "kubernetes")]
@@ -33,8 +33,8 @@ const AGENT_GRPC_PORT: u32 = GRPC_DEFAULT_PORT as u32;
 /// Agent Runner noVNC 端口（使用 shared_types 共享常量）
 const AGENT_NOVNC_PORT: u32 = NOVNC_PORT as u32;
 
-/// Agent Runner ttyd 端口（使用 shared_types 共享常量）
-const AGENT_TTYD_PORT: u32 = TTYD_PORT as u32;
+/// Agent Runner WS 终端中间层端口（agent_runner tokio-tungstenite 监听；Pingora TtydProxy 路由到此）
+const AGENT_WS_TERMINAL_PORT: u32 = WS_TERMINAL_PORT as u32;
 
 /// K8s 标准标签前缀
 const LABEL_PREFIX: &str = "app.kubernetes.io";
@@ -234,11 +234,11 @@ impl K8sServiceOps for KubernetesRuntime {
                         ..Default::default()
                     },
                     ServicePort {
-                        name: Some("ttyd".to_string()),
-                        port: AGENT_TTYD_PORT as i32,
+                        name: Some("ws-terminal".to_string()),
+                        port: AGENT_WS_TERMINAL_PORT as i32,
                         target_port: Some(
                             k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_TTYD_PORT as i32,
+                                AGENT_WS_TERMINAL_PORT as i32,
                             ),
                         ),
                         protocol: Some("TCP".to_string()),

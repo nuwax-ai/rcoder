@@ -2,6 +2,12 @@
 # Docker 镜像构建
 # ============================================================================
 
+# 镜像推送开关：构建后是否自动推送到阿里云仓库
+#   - false（默认）: 仅本地构建，不推送，适合 make dev-restart 快速构建
+#   - true          : 构建完成后自动推送
+# 用法: make dev-restart PUSH_IMAGE=true
+PUSH_IMAGE ?= false
+
 # Docker 镜像构建（仅构建镜像，不编译）
 # 串行构建镜像，避免资源竞争
 docker-build:
@@ -53,9 +59,13 @@ docker-build-master:
 		--build-arg CACHEBUST=$$(date +%s) \
 		-f docker/rcoder-master/Dockerfile -t dev-master-rcoder:latest .;)
 	@echo "✅ master-rcoder 镜像构建完成！"
-	@echo "📤 推送镜像到阿里云仓库..."
-	@skopeo copy docker-daemon:dev-master-rcoder:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest
-	@echo "✅ 镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest"
+	@if [ "$(PUSH_IMAGE)" = "true" ]; then \
+		echo "📤 推送镜像到阿里云仓库..."; \
+		skopeo copy docker-daemon:dev-master-rcoder:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest; \
+		echo "✅ 镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder:latest"; \
+	else \
+		echo "⏭️  跳过镜像推送（PUSH_IMAGE != true）。如需推送：make ... PUSH_IMAGE=true"; \
+	fi
 
 # 构建 master-base 基础镜像（包含所有运行时依赖，很少需要重新构建）
 docker-build-master-base:
@@ -64,9 +74,13 @@ docker-build-master-base:
 	@echo "⏳ 这可能需要较长时间（包含所有运行时依赖安装）..."
 	@docker build -f docker/rcoder-master/Dockerfile.base -t dev-master-rcoder-base:latest .
 	@echo "✅ master-rcoder-base 基础镜像构建完成！"
-	@echo "📤 推送基础镜像到阿里云仓库..."
-	@skopeo copy docker-daemon:dev-master-rcoder-base:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder-base:latest
-	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder-base:latest"
+	@if [ "$(PUSH_IMAGE)" = "true" ]; then \
+		echo "📤 推送基础镜像到阿里云仓库..."; \
+		skopeo copy docker-daemon:dev-master-rcoder-base:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder-base:latest; \
+		echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-master-rcoder-base:latest"; \
+	else \
+		echo "⏭️  跳过基础镜像推送（PUSH_IMAGE != true）。如需推送：make ... PUSH_IMAGE=true"; \
+	fi
 	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"
 
 # ============================================================================

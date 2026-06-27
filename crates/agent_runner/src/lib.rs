@@ -19,6 +19,9 @@ mod utils;
 #[cfg(feature = "http-server")]
 pub mod http_server;
 
+// ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
+pub mod ws_terminal;
+
 // 测试辅助模块 (仅在 testing feature 启用时编译)
 #[cfg(feature = "testing")]
 pub mod testing;

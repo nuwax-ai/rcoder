@@ -251,15 +251,12 @@ impl TrackingCtx {
 // 端口常量
 // ============================================================================
 
-/// noVNC 默认端口
-pub const NOVNC_PORT: u16 = 6080;
-
-/// 音频服务端口
+/// 音频服务端口（rcoder-proxy 专用，shared_types 未定义）
 pub const AUDIO_HTTP_PORT: u16 = 6090; // 音频静态文件服务
 pub const AUDIO_WS_PORT: u16 = 6089; // 音频 WebSocket 流
 
-/// IME 输入法服务端口
+/// IME 输入法服务端口（rcoder-proxy 专用，shared_types 未定义）
 pub const IME_PORT: u16 = 6091;
 
-/// ttyd Web 终端端口
-pub const TTYD_PORT: u16 = 7681;
+// 注：跨 crate 共享的端口常量（NOVNC_PORT、WS_TERMINAL_PORT、TTYD_PORT 等）统一定义在
+// `shared_types::constants`，本 crate 直接引用，不在本地重复定义。

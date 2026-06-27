@@ -9,9 +9,10 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::RequestHeader;
 use std::sync::Arc;
 use std::time::Duration;
+use shared_types::NOVNC_PORT;
 use tracing::{debug, error, info};
 
-use crate::service::types::{NOVNC_PORT, ProxyMetrics, TrackingCtx};
+use crate::service::types::{ProxyMetrics, TrackingCtx};
 use crate::service::utils;
 
 /// 处理 VNC WebSocket 代理请求

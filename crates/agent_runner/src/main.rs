@@ -36,6 +36,9 @@ mod utils;
 #[cfg(feature = "http-server")]
 mod http_server;
 
+// ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
+mod ws_terminal;
+
 pub use model::*;
 
 use config::{CliArgs, load_config_with_args};
@@ -273,6 +276,12 @@ async fn main() -> anyhow::Result<()> {
         {
             info!("HTTP server mode: starting HTTP + Pingora only (no gRPC)");
         }
+
+        // 🔥 1.5. 启动 ttyd WS 终端中间层（tokio-tungstenite：接浏览器 + 连本地 ttyd）
+        //         cd 逻辑由代码每次连接（含重连）控制，解决 WS 重连不进项目目录的问题
+        tokio::spawn(async move {
+            ws_terminal::start_ws_terminal().await;
+        });
 
         // 🔥 2. 创建 HttpServerConfig（包含所有配置）
         let http_config = HttpServerConfig {

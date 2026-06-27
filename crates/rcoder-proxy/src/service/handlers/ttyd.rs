@@ -14,9 +14,10 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::RequestHeader;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use shared_types::WS_TERMINAL_PORT;
+use tracing::{debug, error, info, warn};
 
-use crate::service::types::{ProxyMetrics, TTYD_PORT, TrackingCtx};
+use crate::service::types::{ProxyMetrics, TrackingCtx};
 use crate::service::utils;
 
 /// 处理 ttyd Web 终端代理请求
@@ -45,6 +46,16 @@ pub async fn handle_ttyd_request(
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
 
+    // 校验标识符合法性（防 header 注入：仅允许字母数字 _ -，非空且 <=64 字符）
+    if let Err(e) = shared_types::validate_identifier(user_id, "user_id") {
+        warn!("[TTYD] invalid user_id: {}", e);
+        return Err(pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400)));
+    }
+    if let Err(e) = shared_types::validate_identifier(project_id, "project_id") {
+        warn!("[TTYD] invalid project_id: {}", e);
+        return Err(pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400)));
+    }
+
     // 提取剩余路径（通配符部分）
     let remaining_path = params.get("path").unwrap_or("");
     let target_path = if remaining_path.is_empty() {
@@ -62,29 +73,13 @@ pub async fn handle_ttyd_request(
     let host = ctx.vnc_target_ip.as_deref().unwrap_or("127.0.0.1");
     upstream_request.insert_header("Host", host)?;
 
-    // 重写 URI
+    // 重写 URI（去掉 /computer/ttyd/{user_id}/{project_id} 前缀）
+    //
+    // 注：`arg=--cwd` 不再由 Pingora 注入。cd 改由 agent_runner 的 WS 中间层代码控制
+    // （见 `agent_runner/src/ws_terminal`：每次连接含重连都 connect 本地 ttyd 并注入 arg），
+    // 这样彻底摆脱了「upstream_request_filter 对 WS 只首次触发」导致的重连不 cd 问题。
+    // project_id 通过下方 `X-Ttyd-Project-Id` header 传递给 agent_runner。
     let new_uri = utils::rewrite_uri(original_uri, target_path)?;
-
-    // 注入 ttyd --url-arg：把 project_id 作为 --cwd 参数传给容器内 wrapper 脚本
-    // 容器内挂载: computer-project-workspace/{user_id} → /home/user
-    // 所以项目路径 = /home/user/{project_id}
-    let new_uri = if !project_id.is_empty()
-        && project_id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        let cwd = std::path::Path::new("/home/user").join(project_id);
-        let uri_str = new_uri.to_string();
-        let separator = if uri_str.contains('?') { '&' } else { '?' };
-        let new_uri_str = format!("{}{}arg=--cwd&arg={}", uri_str, separator, cwd.display());
-        new_uri_str.parse().map_err(|e| {
-            error!("URI rewrite with cwd failed: {}", e);
-            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
-        })?
-    } else {
-        new_uri
-    };
-
     upstream_request.set_uri(new_uri);
 
     // 设置代理标识头
@@ -92,6 +87,11 @@ pub async fn handle_ttyd_request(
     upstream_request.insert_header("X-Ttyd-Proxy", "pingora")?;
     upstream_request.insert_header("X-Ttyd-User-Id", user_id)?;
     upstream_request.insert_header("X-Ttyd-Project-Id", project_id)?;
+    // 告知 agent_runner 业务场景（ServiceType 的 Display = kebab-case），用于显式选 cwd 前缀
+    upstream_request.insert_header(
+        "X-Ttyd-Service-Type",
+        shared_types::ServiceType::ComputerAgentRunner.to_string(),
+    )?;
 
     Ok(())
 }
@@ -121,6 +121,16 @@ pub async fn handle_web_ttyd_request(
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
 
+    // 校验标识符合法性（防 header 注入：仅允许字母数字 _ -，非空且 <=64 字符）
+    if let Err(e) = shared_types::validate_identifier(user_id, "user_id") {
+        warn!("[WEB TTYD] invalid user_id: {}", e);
+        return Err(pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400)));
+    }
+    if let Err(e) = shared_types::validate_identifier(project_id, "project_id") {
+        warn!("[WEB TTYD] invalid project_id: {}", e);
+        return Err(pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400)));
+    }
+
     // 提取剩余路径（通配符部分）
     let remaining_path = params.get("path").unwrap_or("");
     let target_path = if remaining_path.is_empty() {
@@ -138,27 +148,12 @@ pub async fn handle_web_ttyd_request(
     upstream_request.insert_header("Host", "127.0.0.1")?;
 
     // 重写 URI（去掉 /web/ttyd/{user_id}/{project_id} 前缀）
+    //
+    // 注：`arg=--cwd` 不再由 Pingora 注入（同 computer ttyd）。cd 改由 agent_runner 的
+    // WS 中间层代码控制（见 agent_runner/src/ws_terminal：cwd.rs 自动检测
+    // `/home/user` 与 `/app/project_workspace` 两前缀）。project_id 通过下方
+    // `X-Ttyd-Project-Id` header 传递给 agent_runner。
     let new_uri = utils::rewrite_uri(original_uri, target_path)?;
-
-    // 注入 ttyd --url-arg：把 project_id 作为 --cwd 参数
-    // rcoder 主服务的工作目录：/app/project_workspace/{project_id}
-    let new_uri = if !project_id.is_empty()
-        && project_id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        let cwd = std::path::Path::new("/app/project_workspace").join(project_id);
-        let uri_str = new_uri.to_string();
-        let separator = if uri_str.contains('?') { '&' } else { '?' };
-        let new_uri_str = format!("{}{}arg=--cwd&arg={}", uri_str, separator, cwd.display());
-        new_uri_str.parse().map_err(|e| {
-            error!("URI rewrite with cwd failed: {}", e);
-            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
-        })?
-    } else {
-        new_uri
-    };
-
     upstream_request.set_uri(new_uri);
 
     // 设置代理标识头
@@ -166,6 +161,11 @@ pub async fn handle_web_ttyd_request(
     upstream_request.insert_header("X-Ttyd-Proxy", "pingora-web")?;
     upstream_request.insert_header("X-Ttyd-User-Id", user_id)?;
     upstream_request.insert_header("X-Ttyd-Project-Id", project_id)?;
+    // 告知 agent_runner 业务场景（ServiceType 的 Display = kebab-case），用于显式选 cwd 前缀
+    upstream_request.insert_header(
+        "X-Ttyd-Service-Type",
+        shared_types::ServiceType::WebAgentRunner.to_string(),
+    )?;
 
     Ok(())
 }
@@ -176,10 +176,11 @@ pub async fn handle_web_ttyd_request(
 ///
 /// 功能:
 /// - 根据 user_id 查找容器 IP
-/// - 创建到容器 ttyd 端口的 HTTP Peer
+/// - 创建到容器 agent_runner WS 终端中间层的 HTTP Peer（端口 `WS_TERMINAL_PORT`=17681）
 /// - 配置 WebSocket 长连接优化参数
 ///
-/// 客户端必须传子协议 `tty`（透传到 ttyd，否则 ttyd 不会 fork bash）。
+/// 注意：上游是 agent_runner 的 ws_terminal（不是 ttyd 本体）。ws_terminal 协商 `tty`
+/// 子协议后，再代理到容器内 ttyd（7681）。客户端仍须传子协议 `tty`。
 pub async fn handle_ttyd_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,
@@ -224,13 +225,13 @@ pub async fn handle_ttyd_upstream(
 
     debug!(
         "ttyd proxy: user_id={}, project_id={} -> {}:{}",
-        user_id, project_id, container_ip, TTYD_PORT
+        user_id, project_id, container_ip, WS_TERMINAL_PORT
     );
 
-    // 创建 HTTP Peer 到容器的 ttyd 端口
+    // 创建 HTTP Peer 到容器 agent_runner 的 WS 终端中间层端口（ttyd 本体仍 7681，由 agent_runner 内部连接）
     // Pingora 会自动处理 WebSocket upgrade
     let mut peer = HttpPeer::new(
-        (container_ip.as_str(), TTYD_PORT),
+        (container_ip.as_str(), WS_TERMINAL_PORT),
         false,          // 不使用 TLS
         "".to_string(), // SNI
     );
@@ -245,15 +246,16 @@ pub async fn handle_ttyd_upstream(
     Ok(Box::new(peer))
 }
 
-/// 处理 Web ttyd 终端的上游连接（代理到动态创建的 RCoder 容器）
+/// 处理 Web ttyd 终端的上游连接（代理到动态创建的 WebAgentRunner 容器）
 ///
 /// 路径格式: `/web/ttyd/{user_id}/{project_id}/{*path}`
 ///
-/// 与 TtydProxy 的区别：
-/// - TtydProxy: 代理到 agent-runner 容器（动态 IP，通过 user_id 查找）
-/// - WebTtydProxy: 代理到 rcoder 容器（动态 IP，通过 user_id 查找）
+/// WebAgentRunner 容器使用 rcoder 镜像，但内部跑的也是 agent-runner 模块
+/// （含 ws_terminal，监听 `WS_TERMINAL_PORT`=17681），与 ComputerAgentRunner 同构。
 ///
-/// 两者都使用 vnc_backends 来查找动态创建的容器 IP
+/// 与 TtydProxy 的区别仅在后端查找键：
+/// - TtydProxy（computer）：按 user_id 查 vnc_backends
+/// - WebTtydProxy（web）：按 project_id 优先查 project_backends，回退 vnc_backends
 pub async fn handle_web_ttyd_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,
@@ -299,12 +301,12 @@ pub async fn handle_web_ttyd_upstream(
 
     debug!(
         "web ttyd proxy: user_id={}, project_id={} -> {}:{}",
-        user_id, project_id, container_ip, TTYD_PORT
+        user_id, project_id, container_ip, WS_TERMINAL_PORT
     );
 
-    // 创建 HTTP Peer 到容器的 ttyd 端口
+    // 创建 HTTP Peer 到容器 agent_runner 的 WS 终端中间层端口（ttyd 本体仍 7681，由 agent_runner 内部连接）
     let mut peer = HttpPeer::new(
-        (container_ip.as_str(), TTYD_PORT),
+        (container_ip.as_str(), WS_TERMINAL_PORT),
         false,          // 不使用 TLS
         "".to_string(), // SNI
     );

@@ -19,10 +19,19 @@ pub const HTTP_DEFAULT_PORT: u16 = 8086;
 /// agent_runner noVNC 服务端口（Web VNC 访问）
 pub const NOVNC_PORT: u16 = 6080;
 
-/// ttyd Web 终端端口
+/// ttyd 本体端口（恒为 7681）
 ///
-/// agent_runner ttyd Web 终端端口
+/// 容器内 ttyd 进程监听端口。computer/web 两种 ttyd 场景下，agent_runner 的 ws 中间层
+/// （`WS_TERMINAL_PORT`=17681）都用此常量 connect 本地 ttyd；ttyd 本身不再对外，
+/// Pingora 只连 ws 中间层（17681）。
 pub const TTYD_PORT: u16 = 7681;
+
+/// agent_runner WS 终端中间层端口（computer ttyd 场景）
+///
+/// agent_runner 用 tokio-tungstenite 在浏览器和本地 ttyd 之间做 WS 中间控制层，监听此端口；
+/// Pingora 的 TtydProxy（/computer/ttyd/*）路由到此端口。ttyd 本体仍在 TTYD_PORT（7681），
+/// 仅 agent_runner 内部连接，不对外暴露（K8s Service 暴露此 17681 而非 ttyd 7681）。
+pub const WS_TERMINAL_PORT: u16 = 17681;
 
 // === K8s 配置 ===
 

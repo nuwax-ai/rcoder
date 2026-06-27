@@ -131,8 +131,8 @@ ringbuf = { workspace = true }
 # Atomic swap for sender replacement
 arc-swap = "1.8"
 
-# WebSocket client (用于检查 noVNC WebSocket 代理可用性)
-tokio-tungstenite = { version = "0.26", features = ["connect"] }
+# WebSocket：终端中间层（接浏览器 + 连本地 ttyd）+ noVNC 代理可用性检查
+tokio-tungstenite = { workspace = true }
 
 # Pyroscope Continuous Profiling
 pyroscope = { workspace = true, optional = true }

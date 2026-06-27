@@ -45,6 +45,10 @@ RUN apt-get update && apt-get install -y \
     libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# 使用国内镜像加速 rustup（避免 rust-lang.org 被墙，cargo build 下载 channel toml 失败）
+ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static/
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup/
+
 # 安装 Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
     . /root/.cargo/env && cargo --version
@@ -122,9 +126,9 @@ RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwax-file-server@latest
 
 
 
-# 使用国内镜像源加速下载
-#ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static/
-#ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup/
+# 使用国内镜像源加速下载（取消注释：rust-lang.org 被墙，第二阶段装 Rust 也需走 USTC）
+ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static/
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup/
 # 安装 Rust 并验证
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
     echo 'export PATH="/root/.cargo/bin:$PATH"' >> /root/.bashrc && \

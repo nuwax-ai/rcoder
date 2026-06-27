@@ -45,6 +45,32 @@ RUN apt-get update && apt-get install -y \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone
 
+# ============================================================================
+# ttyd Web 终端（本地开发测试用）
+# - agent_runner 的 ws_terminal 中间层会 connect 本地 ttyd（127.0.0.1:7681）做 cd 控制
+# - 与正式镜像（build_config/rcoder）保持一致，方便本地复现 web ttyd 场景
+# 下载走 gh-proxy 镜像（国内开发友好）
+# ============================================================================
+ARG TTYD_VERSION=1.7.7
+RUN _ARCH="$(dpkg --print-architecture)" && \
+    case "${_ARCH}" in \
+        "amd64") TTYD_BIN="ttyd.x86_64" ;; \
+        "arm64") TTYD_BIN="ttyd.aarch64" ;; \
+        *) echo "Unsupported architecture: ${_ARCH}" && exit 1 ;; \
+    esac && \
+    DOWNLOAD_URL="https://gh-proxy.org/https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/${TTYD_BIN}" && \
+    curl -fsSL -o /usr/local/bin/ttyd "${DOWNLOAD_URL}" && \
+    chmod +x /usr/local/bin/ttyd && \
+    mkdir -p /usr/local/share/ttyd && \
+    ttyd --version
+
+# ttyd 启动脚本 + 自定义前端页面（复用 rcoder-master 的，保持与正式镜像一致）
+COPY docker/rcoder-master/ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
+COPY docker/rcoder-master/ttyd/ttyd-index.html /usr/local/share/ttyd/index.html
+RUN chmod +x /usr/local/bin/start-ttyd.sh
+
+ENV TTYD_PORT=7681
+
 # 配置 Cargo 使用国内镜像源
 RUN mkdir -p /usr/local/cargo && \
     echo '[source.crates-io]' > /usr/local/cargo/config.toml && \

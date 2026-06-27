@@ -128,5 +128,9 @@ docker-build-agent-base: docker-pre-download-libreoffice
 		--build-arg CACHEBUST_NOVNC=$$(date +%s) \
 		-f Dockerfile.base -t dev-rcoder-agent-base:latest .
 	@echo "✅ rcoder-agent-base 基础镜像构建完成！"
-	@$(MAKE) docker-push-agent-base
+	@if [ "$(PUSH_IMAGE)" = "true" ]; then \
+		$(MAKE) docker-push-agent-base; \
+	else \
+		echo "⏭️  跳过基础镜像推送（PUSH_IMAGE != true）。如需推送：make ... PUSH_IMAGE=true"; \
+	fi
 	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"
