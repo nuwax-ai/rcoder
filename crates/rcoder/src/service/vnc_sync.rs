@@ -140,16 +140,37 @@ async fn sync_vnc_backends(
             pingora_service.add_project_backend(&project_id, &backend_addr);
         }
 
-        let user_id = container_identity_from_name(
+        // 从容器名称中提取标识符和服务类型
+        let identity = container_identity_from_name(
             &container_info.container_name,
             rcoder_prefix,
             computer_prefix,
-        )
-        .map(|(identifier, _service_type)| identifier.to_string())
-        .unwrap_or_default();
+        );
+
+        let (user_id, service_type) = match identity {
+            Some((id, st)) => (id.to_string(), st),
+            None => {
+                debug!(
+                    "⏭️ [VNC_SYNC] Skipping container without business identifier: {}",
+                    container_info.container_name
+                );
+                continue;
+            }
+        };
+
+        // 🎯 只处理 ComputerAgentRunner 类型的容器
+        // WebAgentRunner 的容器不应该映射到 VNC 后端（user_id 维度）
+        if service_type != ServiceType::ComputerAgentRunner {
+            debug!(
+                "⏭️ [VNC_SYNC] Skipping non-ComputerAgentRunner container: {} (service_type={:?})",
+                container_info.container_name, service_type
+            );
+            continue;
+        }
+
         if user_id.is_empty() {
             debug!(
-                "⏭️ [VNC_SYNC] Skipping container without business identifier: {}",
+                "⏭️ [VNC_SYNC] Skipping container with empty user_id: {}",
                 container_info.container_name
             );
             continue;
