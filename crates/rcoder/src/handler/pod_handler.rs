@@ -1048,6 +1048,8 @@ pub async fn pod_ensure(
                     pinfo
                 } else {
                     let mut pinfo = ProjectAndContainerInfo::new(request.project_id.clone());
+                    // 入口尽可能记录完整信息（user_id 对两类业务都记录）；
+                    // 是否参与 user_id 查找由 service_type 在使用方区分（见 adapter 索引门控与 find_projects_by_user_id）。
                     pinfo.set_user_id(Some(request.user_id.clone()));
                     pinfo.set_pod_id(request.pod_id.clone());
                     pinfo.set_service_type(Some(service_type.clone()));
@@ -1424,6 +1426,8 @@ pub async fn pod_ensure(
     } else {
         // 如果不存在记录，创建新记录
         let mut info = ProjectAndContainerInfo::new(request.project_id.clone());
+        // 入口尽可能记录完整信息（user_id 对两类业务都记录）；
+        // 是否参与 user_id 查找由 service_type 在使用方区分（见 adapter 索引门控与 find_projects_by_user_id）。
         info.set_user_id(Some(request.user_id.clone()));
         info.set_pod_id(request.pod_id.clone());
         info.set_service_type(Some(service_type.clone()));

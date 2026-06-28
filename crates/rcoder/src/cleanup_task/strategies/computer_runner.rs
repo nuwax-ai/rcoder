@@ -38,8 +38,11 @@ impl CleanupStrategy for ComputerRunnerStrategy {
             .and_then(|p| p.user_id().map(|s| s.to_string()))
             .ok_or_else(|| anyhow::anyhow!("Failed to get user_id: {}", project_id))?;
 
-        // 查询该用户的所有项目
-        let related_projects = context.state.projects.find_projects_by_user_id(&user_id);
+        // 查询该用户的所有 Computer 项目（按 service_type 过滤，排除 Web 项目干扰）
+        let related_projects = context
+            .state
+            .projects
+            .find_projects_by_user_id(&user_id, &shared_types::ServiceType::ComputerAgentRunner);
 
         // 检查是否还有其他活跃项目（排除当前项目）
         let has_active_refs = related_projects

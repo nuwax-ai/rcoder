@@ -162,7 +162,14 @@ impl ProjectAdapter {
                 .insert(container.container_id.clone(), container_key);
         }
         // user_id → project_id
-        if let Some(uid) = info.user_id() {
+        // ⚠️ 仅 ComputerAgentRunner 写入此索引：find_by_user_id 是 Computer 专属查询
+        // （无 pod_id 时容器由 user_id 确认）。入口对两类业务都记录 user_id（信息完整），
+        // 但 WebAgentRunner 容器由 pod_id/project_id 标识，不进入此索引——单值索引无法
+        // 同时容纳同 user 的两类项目，按 service_type 收敛为 Computer 专属，避免互相覆盖
+        // 导致 /computer/ttyd 串用或 404。
+        if info.service_type() == Some(ServiceType::ComputerAgentRunner)
+            && let Some(uid) = info.user_id()
+        {
             self.user_id_to_project_id
                 .insert(uid.to_string(), project_id.clone());
         }
@@ -188,7 +195,16 @@ impl ProjectAdapter {
         }
 
         // 2.1 清理反向索引
-        if let Some(uid) = info.user_id() {
+        // user_id 索引仅 ComputerAgentRunner 写入（见 insert）；且仅当索引仍指向当前被删
+        // project 时才移除，避免误删指向其他同 user 的 Computer 项目的索引条目。
+        if info.service_type() == Some(ServiceType::ComputerAgentRunner)
+            && let Some(uid) = info.user_id()
+            && self
+                .user_id_to_project_id
+                .get(uid)
+                .map(|p| p.value().as_str() == project_id)
+                .unwrap_or(false)
+        {
             self.user_id_to_project_id.remove(uid);
         }
         if let Some(pid) = info.pod_id() {
@@ -726,14 +742,18 @@ impl ProjectAdapter {
         info.container().cloned()
     }
 
-    /// 通过 user_id 查找所有项目
+    /// 通过 user_id 查找所有项目（按 service_type 过滤）
     ///
-    /// 注意：一个 user_id 可能关联多个 project，索引仅存储最新一个。
-    /// 此方法保留全量遍历以确保返回完整结果。
+    /// 入口（pod_ensure 等）对两类业务都记录 user_id（信息尽可能完整），
+    /// 此处按 `service_type` 过滤，避免不同 ServiceType 的项目互相干扰
+    /// （例如 Web 项目不该计入 Computer 容器的清理决策）。
+    ///
+    /// 注意：一个 user_id 可能关联多个 project，索引仅存储最新一个，
+    /// 故此处保留全量遍历以确保返回完整结果。
     ///
     /// ## m4 文档：为何不用 HashSet 索引
     ///
-    /// 候选优化：`user_id_to_project_id: DashMap<String, Arc<HashSet<String>>>`
+    /// 候选优化：`user_id_to_project_id: DashMap<(String, ServiceType), Arc<HashSet<String>>>`
     /// 可以让本方法从 O(N) 降到 O(1)。
     ///
     /// 不做的理由：
@@ -744,10 +764,17 @@ impl ProjectAdapter {
     /// 3. **N 通常很小**：N 是 project 总数，即使几千个，O(N) 遍历也是微秒级。
     ///
     /// 如果未来 N 增长到数万或 user 多 project 成为主流，再考虑改造。
-    pub fn find_projects_by_user_id(&self, user_id: &str) -> Vec<Arc<ProjectAndContainerInfo>> {
+    pub fn find_projects_by_user_id(
+        &self,
+        user_id: &str,
+        service_type: &ServiceType,
+    ) -> Vec<Arc<ProjectAndContainerInfo>> {
         self.projects
             .iter()
-            .filter(|e| e.value().user_id() == Some(user_id))
+            .filter(|e| {
+                e.value().user_id() == Some(user_id)
+                    && e.value().service_type().as_ref() == Some(service_type)
+            })
             .map(|e| e.value().clone())
             .collect()
     }
@@ -1930,6 +1957,107 @@ mod tests {
         assert!(adapter.get_container_by_user_id("nonexistent").is_none());
     }
 
+    /// 回归测试：Web 项目不得污染 user_id_to_project_id 索引
+    ///
+    /// 场景：user_id=6 同时存在 Computer（proj-A）和 Web（proj-B）两个业务。
+    /// `pod_ensure` 对两类业务都 `set_user_id`。若 Web 项目也写入 user_id 索引，
+    /// 后插入的 Web 会覆盖 Computer 的索引，导致 `find_by_user_id("6", Computer)`
+    /// 命中 Web 容器 → service_type 不匹配 → None（/computer/ttyd 串用/404）。
+    #[test]
+    fn test_user_id_index_not_polluted_by_web_project() {
+        use shared_types::ContainerLookup;
+        let adapter = make_adapter();
+
+        let mk_container = |cid: &str, ip: &str, pid: &str| ContainerBasicInfo {
+            container_id: cid.to_string(),
+            container_name: format!("container-{}", cid),
+            container_ip: ip.to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: pid.to_string(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: format!("http://{}", cid),
+        };
+
+        // Computer 项目（user_id 索引消费者）
+        let mut comp = ProjectAndContainerInfo::from_parts(
+            "proj-A".to_string(),
+            Some("user-6".to_string()),
+            None,
+            None,
+            Some(mk_container("cid-comp", "10.0.0.1", "proj-A")),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::ComputerAgentRunner),
+                ..Default::default()
+            },
+        );
+        comp.set_service_type(Some(ServiceType::ComputerAgentRunner));
+        adapter
+            .insert("proj-A".to_string(), Arc::new(comp))
+            .unwrap();
+
+        // Web 项目（同一 user_id=6，模拟 pod_ensure 对 Web 也 set_user_id）
+        let mut web = ProjectAndContainerInfo::from_parts(
+            "proj-B".to_string(),
+            Some("user-6".to_string()),
+            None,
+            None,
+            Some(mk_container("cid-web", "10.0.0.2", "proj-B")),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::WebAgentRunner),
+                ..Default::default()
+            },
+        );
+        web.set_service_type(Some(ServiceType::WebAgentRunner));
+        adapter
+            .insert("proj-B".to_string(), Arc::new(web))
+            .unwrap();
+
+        // 关键断言 1：user_id 索引仍指向 Computer 项目 proj-A，未被 Web 项目 proj-B 覆盖
+        assert_eq!(
+            adapter
+                .user_id_to_project_id
+                .get("user-6")
+                .map(|r| r.value().clone()),
+            Some("proj-A".to_string()),
+            "Web 项目不得污染 user_id 索引（find_by_user_id 只服务 Computer 查找）"
+        );
+
+        // 关键断言 2：find_by_user_id("6", Computer) → Computer 容器 IP（不串到 Web）
+        assert_eq!(
+            adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner),
+            Some("10.0.0.1".to_string()),
+            "Computer 查找应命中 Computer 容器，不被同 user 的 Web 项目影响"
+        );
+
+        // 关键断言 3：find_projects_by_user_id 按 service_type 过滤
+        // Web 项目虽记录了 user_id，但不应计入 Computer 的项目集合（避免 cleanup 误保活）
+        let comp_projects = adapter.find_projects_by_user_id("user-6", &ServiceType::ComputerAgentRunner);
+        assert_eq!(
+            comp_projects.iter().map(|p| p.project_id()).collect::<Vec<_>>(),
+            vec!["proj-A"],
+            "find_projects_by_user_id(Computer) 应只返回 Computer 项目"
+        );
+        let web_projects = adapter.find_projects_by_user_id("user-6", &ServiceType::WebAgentRunner);
+        assert_eq!(
+            web_projects.iter().map(|p| p.project_id()).collect::<Vec<_>>(),
+            vec!["proj-B"],
+            "find_projects_by_user_id(Web) 应只返回 Web 项目"
+        );
+
+        // 关键断言 4：删除 Web 项目不应误删 Computer 的 user_id 索引
+        adapter.remove("proj-B");
+        assert_eq!(
+            adapter
+                .user_id_to_project_id
+                .get("user-6")
+                .map(|r| r.value().clone()),
+            Some("proj-A".to_string()),
+            "删除 Web 项目不应误删 Computer 的 user_id 索引"
+        );
+    }
+
     #[test]
     fn test_index_pod_id_lookup() {
         // get_container_by_pod_id 通过索引 O(1) 查找（返回任一 project 的 container）；
@@ -2042,6 +2170,7 @@ mod tests {
     #[test]
     fn test_index_cleanup_on_remove() {
         // remove 后 user_id/pod_id 索引应被清理
+        // 注意：user_id 索引仅 ComputerAgentRunner 写入，故此处用 Computer 验证完整写入→清理路径
         let adapter = make_adapter();
 
         let container = ContainerBasicInfo {
@@ -2063,11 +2192,11 @@ mod tests {
             None,
             Some(container),
             ProjectExtendedFields {
-                service_type: Some(ServiceType::WebAgentRunner),
+                service_type: Some(ServiceType::ComputerAgentRunner),
                 ..Default::default()
             },
         );
-        info.set_service_type(Some(ServiceType::WebAgentRunner));
+        info.set_service_type(Some(ServiceType::ComputerAgentRunner));
         adapter
             .insert("proj-1".to_string(), Arc::new(info))
             .unwrap();
