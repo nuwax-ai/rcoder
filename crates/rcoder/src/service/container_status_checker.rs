@@ -220,7 +220,7 @@ impl ContainerStatusChecker {
         container_info: &Arc<shared_types::ProjectAndContainerInfo>,
     ) -> anyhow::Result<bool> {
         // 获取容器信息
-        let container = match container_info.container() {
+        let container = match container_info.container_info() {
             Some(c) => c,
             None => {
                 debug!(

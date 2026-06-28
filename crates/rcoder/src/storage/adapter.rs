@@ -111,10 +111,8 @@ impl ProjectAdapter {
         project_id: String,
         info: Arc<ProjectAndContainerInfo>,
     ) -> anyhow::Result<()> {
-        // logical_id（裸 logical id）：作 ContainerEntry.logical_id，供 RAII 清理 identifier 用。
-        let logical_id = info.container_key().to_string();
         // DashMap 键：优先 container_name（跨重建稳定、含 service_type 前缀防跨类型碰撞），
-        // 无容器信息时回退裸 logical_id（仅占位，不建容器条目，且 container_name 必含 prefix 不会与裸 id 相撞）。
+        // 无容器信息时回退裸 logical_id（仅占位，不建容器条目）。
         let key = container_entry_key(&info);
 
         // 读取旧键（view: 读后立即释放锁）
@@ -135,8 +133,12 @@ impl ProjectAdapter {
             self.dec_container_ref(&old);
         }
 
-        // 有容器信息时：Fail Fast 校验 service_type，然后增引用（键变）或刷新信息（键不变=重建）
-        if let Some(container) = info.container() {
+        // 取出 temp Arc（set_container 时建的临时条目）—— clone 出来释放 info 的借用
+        let temp_entry = info.container().cloned();
+        let mut info = info; // 取得所有权，便于后续 Arc::make_mut 回写共享 Arc
+
+        // 有容器信息时：Arc 共享逻辑——让 projects[pid] 与 containers[name] 共享同一 Arc
+        if let Some(temp_entry) = temp_entry {
             let st = match info.service_type() {
                 Some(st) => st,
                 None => {
@@ -152,29 +154,35 @@ impl ProjectAdapter {
                 }
             };
             if container_changed {
-                // 键变了：增引用（新容器条目，或共享容器的多 project 复用）
-                match self.containers.entry(key.clone()) {
+                // 键变了：把 temp Arc 共享到 containers[key]
+                let need_repoint = match self.containers.entry(key.clone()) {
                     Entry::Occupied(e) => {
-                        e.get().inc_ref();
+                        e.get().inc_ref(); // 另一 project 已有此容器，引用 +1
+                        Some(Arc::clone(e.get())) // 回指权威条目
                     }
                     Entry::Vacant(e) => {
-                        e.insert(Arc::new(ContainerEntry::new(
-                            container.clone(),
-                            st,
-                            logical_id.clone(),
-                        )));
+                        e.insert(Arc::clone(&temp_entry)); // 共享 temp Arc
+                        None // info 已持 temp，无需回指
                     }
+                };
+                if let Some(existing_arc) = need_repoint {
+                    Arc::make_mut(&mut info).set_container_arc(Some(existing_arc));
                 }
             } else {
-                // 键不变但容器可能已重建（container_name 不变、container_id/ip 变）→ 刷新条目信息，
-                // 否则 find_by_project_id/get_container 会返回旧 ip（容器重建陈旧问题）。
-                // 同时清理旧 container_id 的反向索引，避免 container_id_to_key 累积陈旧条目。
-                if let Some(entry) = self.containers.get(&key) {
-                    let old_cid = entry.info().container_id;
-                    if old_cid != container.container_id {
-                        self.container_id_to_key.remove(&old_cid);
-                        entry.update(container.clone(), st);
+                // 键不变（容器重建）：原地刷新 containers[key]（保持 Arc 身份不变），
+                // info 回指同一权威 Arc——后续 containers[name] 的刷新 info 自动可见。
+                if let Some(existing_ref) = self.containers.get(&key) {
+                    let existing_arc = Arc::clone(&*existing_ref);
+                    let old_cid = existing_ref.info().container_id;
+                    let new_cid = temp_entry.info().container_id;
+                    if old_cid != new_cid {
+                        existing_ref.update(temp_entry.info(), st);
                     }
+                    drop(existing_ref); // 释放读锁后再操作其他 map
+                    if old_cid != new_cid {
+                        self.container_id_to_key.remove(&old_cid);
+                    }
+                    Arc::make_mut(&mut info).set_container_arc(Some(existing_arc));
                 }
             }
         }
@@ -185,12 +193,11 @@ impl ProjectAdapter {
         self.projects.insert(project_id.clone(), info.clone());
 
         // 维护反向索引：container_id → 容器键
-        if let Some(container) = info.container() {
+        if let Some(c) = info.container_info() {
             self.container_id_to_key
-                .insert(container.container_id.clone(), key);
+                .insert(c.container_id.clone(), key);
         }
-        // user_id → project_id 集合（多值）：entry API 原子插入，or_insert_with 的 RefMut
-        // 在语句结束即释放，DashSet::insert 持的是 DashSet 内部锁，与 DashMap 分片锁互不嵌套。
+        // user_id → project_id 集合（多值）：entry API 原子插入
         if let Some(uid) = info.user_id() {
             self.user_id_to_project_ids
                 .entry(uid.to_string())
@@ -839,7 +846,7 @@ impl ProjectAdapter {
                     .projects
                     .iter()
                     .filter(|p| {
-                        p.container()
+                        p.container_info()
                             .map(|c| c.container_id == info.container_id)
                             .unwrap_or(false)
                     })
@@ -966,7 +973,7 @@ fn code_to_agent_status(code: i32, _name: &str) -> shared_types::AgentStatus {
 /// 注意：此键仅用于 DashMap 分组/refcount，**不等于** `ProjectAndContainerInfo::container_key()`
 /// （后者返回裸 logical id，供 RAII 清理 identifier 与外部消费者用）。
 fn container_entry_key(info: &ProjectAndContainerInfo) -> String {
-    match info.container() {
+    match info.container_info() {
         Some(c) => c.container_name.clone(),
         None => info.container_key().to_string(),
     }

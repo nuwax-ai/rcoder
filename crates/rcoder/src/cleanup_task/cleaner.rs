@@ -101,7 +101,7 @@ impl AgentCleaner {
             let container_name: Option<String> = self
                 .state
                 .get_project(&project_id)
-                .and_then(|info| info.container().map(|c| c.container_name.clone()));
+                .and_then(|info| info.container_info().map(|c| c.container_name.clone()));
 
             // 🛡️ 关键修复：项目可能已被本轮清理的共享容器连带删除
             // 例如：cleanup_agent("P1") 销毁共享容器后，delete_container_with_projects
@@ -217,7 +217,7 @@ impl AgentCleaner {
         // 4. 如果需要销毁容器
         let mut container_destroyed = false;
         if let Some(reason) = destroy_reason
-            && let Some(container_info) = agent_info.container()
+            && let Some(container_info) = agent_info.container_info()
         {
             let project_info = super::strategies::ProjectInfo {
                 project_id: agent_info.project_id().to_string(),
@@ -248,7 +248,7 @@ impl AgentCleaner {
         if container_destroyed {
             // 容器已销毁：删除容器记录及其关联的所有项目记录（避免孤立容器记录）
             let container_id = agent_info
-                .container()
+                .container_info()
                 .map(|c| c.container_id.clone())
                 .unwrap_or_default();
             let (deleted, project_count) = self

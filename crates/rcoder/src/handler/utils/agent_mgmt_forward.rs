@@ -115,7 +115,7 @@ impl AgentMgmtForwardCtx {
             });
         }
 
-        let container = project.container().ok_or_else(|| {
+        let container = project.container_info().ok_or_else(|| {
             AppError::with_message(
                 ec::ERR_AGENT_RUNNER_UNAVAILABLE,
                 format!("project {} has no container", project.project_id()),

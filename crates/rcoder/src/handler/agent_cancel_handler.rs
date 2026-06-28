@@ -87,7 +87,7 @@ async fn get_container_for_cancel(
             // ProjectAdapter.get() 内部会调用 get_container_for_project
             state
                 .get_project(project_id)
-                .and_then(|info| info.container().cloned())
+                .and_then(|info| info.container_info())
         }
         CancelIdentifier::User(user_id) => {
             // ComputerAgentRunner 模式：通过 user_id 查询容器

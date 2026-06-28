@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::{AgentStatus, ModelProviderConfig};
-use crate::ServiceType;
+use crate::{ContainerEntry, ServiceType};
 
 /// 容器基本信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,8 +162,9 @@ pub struct ProjectExtendedFields {
 pub struct ProjectExtendedState {
     /// 模型提供商配置
     pub model_provider: Option<ModelProviderConfig>,
-    /// container 容器信息，一个project_id 只能对应最多1个容器
-    pub container: Option<ContainerBasicInfo>,
+    /// container 容器信息（Arc 共享：与 ProjectAdapter.containers[name] 同一实例），
+    /// 一个 project_id 只能对应最多1个容器。
+    pub container: Option<Arc<ContainerEntry>>,
     /// 当前活跃的请求ID，用于标识用户请求
     pub request_id: Option<String>,
     /// Agent 服务状态
@@ -183,10 +184,10 @@ impl ProjectExtendedState {
         }
     }
 
-    /// 批量更新扩展状态
+    /// 批量更新扩展状态（container 接收已包装的 Arc<ContainerEntry>）
     pub fn update_from_request(
         &mut self,
-        container: Option<ContainerBasicInfo>,
+        container: Option<Arc<ContainerEntry>>,
         model_provider: Option<ModelProviderConfig>,
         request_id: Option<String>,
         service_type: Option<ServiceType>,
@@ -309,15 +310,17 @@ impl ProjectAndContainerInfo {
             created_at: fields.created_at.unwrap_or(now),
         };
         let mut extended = ProjectExtendedState::new();
-        extended.container = container;
         extended.request_id = fields.request_id;
         extended.service_type = fields.service_type;
-        Self {
+        let mut info = Self {
             state: ProjectState {
                 core: Arc::new(core),
                 extended: Arc::new(extended),
             },
-        }
+        };
+        // container 包装成 Arc<ContainerEntry>（此时 service_type / container_key 已就绪）
+        info.set_container(container);
+        info
     }
 
     /// 添加 session（C2 修复核心 API）
@@ -383,8 +386,17 @@ impl ProjectAndContainerInfo {
         request_id: Option<String>,
         service_type: Option<ServiceType>,
     ) {
+        // 容器信息包装成 Arc<ContainerEntry>（service_type 用入参或现有值）
+        let entry = container.map(|c| {
+            let st = service_type
+                .clone()
+                .or(self.service_type())
+                .unwrap_or(ServiceType::WebAgentRunner);
+            let logical_id = self.container_key().to_string();
+            Arc::new(ContainerEntry::new(c, st, logical_id))
+        });
         self.state.update_extended(|extended| {
-            extended.update_from_request(container, model_provider, request_id, service_type);
+            extended.update_from_request(entry, model_provider, request_id, service_type);
         });
     }
 }
@@ -449,8 +461,16 @@ impl ProjectAndContainerInfo {
         self.state.extended.model_provider.as_ref()
     }
 
-    pub fn container(&self) -> Option<&ContainerBasicInfo> {
+    /// 获取共享的容器条目引用（与 ProjectAdapter.containers[name] 同一 Arc 实例）。
+    /// 需要容器字段值时优先用 `container_info()`（owned clone）。
+    pub fn container(&self) -> Option<&Arc<ContainerEntry>> {
         self.state.extended.container.as_ref()
+    }
+
+    /// 获取容器信息的 owned 克隆（从共享 ContainerEntry 读出）。
+    /// 供只需 container_id / container_ip 等字段值的调用方使用。
+    pub fn container_info(&self) -> Option<ContainerBasicInfo> {
+        self.container().map(|e| e.info())
     }
 
     pub fn request_id(&self) -> Option<&str> {
@@ -510,9 +530,23 @@ impl ProjectAndContainerInfo {
         });
     }
 
+    /// 设置容器信息（接收裸 ContainerBasicInfo，内部包成 Arc<ContainerEntry>）。
+    /// Arc 在 insert 时与 ProjectAdapter.containers[name] 共享同一实例。
     pub fn set_container(&mut self, container: Option<ContainerBasicInfo>) {
+        let entry = container.map(|c| {
+            let st = self.service_type().unwrap_or(ServiceType::WebAgentRunner);
+            let logical_id = self.container_key().to_string();
+            Arc::new(ContainerEntry::new(c, st, logical_id))
+        });
         self.state.update_extended(|extended| {
-            extended.container = container;
+            extended.container = entry;
+        });
+    }
+
+    /// 直接设置共享的 Arc<ContainerEntry>（insert 在 Occupied/重建场景回写权威 Arc 用）。
+    pub fn set_container_arc(&mut self, entry: Option<Arc<ContainerEntry>>) {
+        self.state.update_extended(|extended| {
+            extended.container = entry;
         });
     }
 

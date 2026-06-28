@@ -533,8 +533,8 @@ async fn validate_and_get_session_context(
                     // - container_id, container_ip: 可能过时（容器重建后会变化）
                     //
                     // 阶段 3 会验证容器的真实存在性（通过内存信息或 Docker API）
-                    // 因此即使 project_info.container() 为 None，也可以继续执行
-                    match project_info.container() {
+                    // 因此即使 project_info.container_info() 为 None，也可以继续执行
+                    match project_info.container_info() {
                         Some(container) => {
                             info!(
                                 " [SSE_PROXY] Fallback query succeeded: got container name from project_info: container_name={}",
@@ -561,11 +561,11 @@ async fn validate_and_get_session_context(
     // ========== 阶段 3: 优先使用内存中的容器信息，避免不必要的 Docker API 调用 ==========
 
     // 🎯 优化策略：
-    // 1. 首先检查内存中的 project_info.container() 是否已存在
+    // 1. 首先检查内存中的 project_info.container_info() 是否已存在
     // 2. 如果存在 → 使用内存中的 container_name（它是最新的），跳过 Docker API 调用
     // 3. 如果不存在 → 调用 find_container_realtime 作为降级方案
     // 4. 后续会通过 gRPC GetStatus 进行最终健康检查
-    if let Some(container) = project_info.container() {
+    if let Some(container) = project_info.container_info() {
         info!(
             " [SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
             container.container_name, container.container_ip
@@ -637,11 +637,11 @@ async fn validate_and_get_session_context(
     let project_id = project_info.project_id().to_string();
 
     // 获取 container_ip（Docker 环境需要）
-    let container_ip = project_info.container()
+    let container_ip = project_info.container_info()
         .map(|c| c.container_ip.clone())
         .unwrap_or_default();
 
-    // 注意：由于阶段 3 已经处理了 project_info.container() 为 None 的情况
+    // 注意：由于阶段 3 已经处理了 project_info.container_info() 为 None 的情况
     // （通过 Docker API 降级查询），这里无需再次验证容器信息的完整性
     info!(
         " [SSE_PROXY] All validations passed: session_id={}, project_id={}, container_name={}, container_ip={}",

@@ -150,7 +150,7 @@ impl AgentScanner {
         }
 
         // 🆕 gRPC 二次确认：查询容器内 agent 的真实状态
-        if let Some(container) = agent.container() {
+        if let Some(container) = agent.container_info() {
             // 从 service_url 提取 gRPC 地址
             let grpc_addr = match crate::handler::utils::extract_grpc_addr_with_port(
                 &container.service_url,

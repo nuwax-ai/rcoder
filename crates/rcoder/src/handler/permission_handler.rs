@@ -43,7 +43,7 @@ fn rcoder_container(
 
     state
         .get_project(project_id)
-        .and_then(|info| info.container().cloned())
+        .and_then(|info| info.container_info())
         .ok_or_else(|| {
             AppError::with_message(
                 shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,

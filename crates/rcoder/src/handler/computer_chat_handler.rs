@@ -1103,7 +1103,7 @@ fn ensure_project_mapping_in_state(
     let existing_project = state.get_project(project_id);
     if let Some(ref existing) = existing_project {
         // 如果记录存在，检查容器ID是否变更
-        if let Some(existing_container) = existing.container() {
+        if let Some(existing_container) = existing.container_info() {
             if existing_container.container_id == container_info.container_id {
                 debug!(
                     "🔄 [COMPUTER_CHAT] project record already exists and container unchanged: project_id={}",
