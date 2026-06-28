@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use chrono::Utc;
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, InitializeRequest, LoadSessionRequest, McpServer, NewSessionRequest,
@@ -621,6 +622,9 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                             let prompt_future = cx.send_request(prompt_request).block_task();
                             tokio::pin!(prompt_future);
 
+                            // 诊断用：记录 prompt 开始时间，Response 到达时计算耗时
+                            let prompt_started = Utc::now();
+
                             // 取消后的超时保护：收到取消请求后最多等待 15 秒
                             let cancel_timeout = tokio::time::sleep(std::time::Duration::from_secs(3600)); // 初始设置一个很长的超时
                             tokio::pin!(cancel_timeout);
@@ -723,7 +727,18 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                                         // 继续等待 Prompt 响应（Agent 应该会因为取消而提前返回）
                                     }
                                     result = &mut prompt_future => {
-                                        // Prompt 响应完成
+                                        // Prompt 响应完成——记录 stop_reason + 耗时（诊断 agent 是否发了 Response）
+                                        let elapsed = Utc::now().signed_duration_since(prompt_started).num_seconds();
+                                        match &result {
+                                            Ok(resp) => debug!(
+                                                "[SACP] Prompt Response received: session_id={}, stop_reason={:?}, elapsed={}s",
+                                                session_id, resp.stop_reason, elapsed
+                                            ),
+                                            Err(e) => warn!(
+                                                "[SACP] Prompt Response error: session_id={}, error={:?}, elapsed={}s",
+                                                session_id, e, elapsed
+                                            ),
+                                        }
                                         break result;
                                     }
                                 }
