@@ -643,13 +643,6 @@ impl ProjectAdapter {
         Ok(())
     }
 
-    /// 获取容器信息（按 container_id 查找，O(1) 索引查找）
-    pub fn get_container(&self, container_id: &str) -> Option<ContainerBasicInfo> {
-        let container_key = self.container_id_to_key.get(container_id)?;
-        self.containers
-            .view(container_key.value(), |_, ce| ce.info())
-    }
-
     /// 删除容器及其关联的所有项目（RAII 触发物理销毁）
     ///
     /// 返回 (容器是否存在, 删除的项目数)
@@ -713,18 +706,6 @@ impl ProjectAdapter {
         (container_existed, count)
     }
 
-    /// 按服务类型获取所有容器
-    pub fn get_containers_by_service_type(
-        &self,
-        service_type: ServiceType,
-    ) -> Vec<ContainerBasicInfo> {
-        self.containers
-            .iter()
-            .filter(|e| e.value().service_type() == service_type)
-            .map(|e| e.value().info())
-            .collect()
-    }
-
     /// 获取所有容器信息
     pub fn get_all_container_records(&self) -> Vec<ContainerBasicInfo> {
         self.containers.iter().map(|e| e.value().info()).collect()
@@ -762,17 +743,29 @@ impl ProjectAdapter {
         user_id: &str,
         service_type: &ServiceType,
     ) -> Option<ContainerBasicInfo> {
-        self.find_projects_by_user_id(user_id, service_type)
+        let p = self
+            .find_projects_by_user_id(user_id, service_type)
             .into_iter()
-            .next()
-            .and_then(|p| p.container().cloned())
+            .next()?;
+        // 统一走 containers[name] 权威源（service_type 已由 find_projects_by_user_id 过滤）
+        self.container_info_by_project(p.project_id())
     }
 
     /// 通过 pod_id 获取容器信息（O(1) 索引查找）
     pub fn get_container_by_pod_id(&self, pod_id: &str) -> Option<ContainerBasicInfo> {
-        let project_id = self.pod_id_to_project_id.get(pod_id)?;
-        let info = self.projects.view(project_id.value(), |_, v| v.clone())?;
-        info.container().cloned()
+        let project_id = self.pod_id_to_project_id.get(pod_id)?.value().clone();
+        self.container_info_by_project(&project_id)
+    }
+
+    /// 通过 project_id 解析其唯一容器的信息（统一权威源 `containers[name]`）。
+    ///
+    /// project_id 与容器是 1:1（一个 project_id 永远只对应一个容器），故
+    /// `project_to_container[project_id] → containers[name]` 对有容器的 project 永远成立。
+    /// 所有容器信息查找（find_by_* / get_container_by_*）统一走此路径，
+    /// `projects[pid].container()` 仅作 project 自身视图快照，不作为查找依据。
+    fn container_info_by_project(&self, project_id: &str) -> Option<ContainerBasicInfo> {
+        let name = self.project_to_container.get(project_id)?.value().clone();
+        self.containers.get(&name).map(|e| e.info())
     }
 
     /// 通过 user_id 查找所有项目（按 service_type 过滤）
@@ -1913,44 +1906,6 @@ mod tests {
     // ========== 索引一致性测试 ==========
 
     #[test]
-    fn test_index_container_id_lookup() {
-        // save_container + insert 后，get_container 通过索引 O(1) 查找
-        let adapter = make_adapter();
-
-        let container = ContainerBasicInfo {
-            container_id: "cid-123".to_string(),
-            container_name: "test-container".to_string(),
-            container_ip: "10.0.0.1".to_string(),
-            internal_port: 8086,
-            external_port: 0,
-            project_id: "proj-1".to_string(),
-            status: "running".to_string(),
-            created_at: Utc::now(),
-            service_url: "http://test".to_string(),
-        };
-
-        // save_container 注册容器
-        adapter
-            .save_container(&container, Some(ServiceType::WebAgentRunner))
-            .unwrap();
-
-        // insert 关联项目（container_entry_key = container_name，与 save_container 同键）
-        let mut info = create_test_info("proj-1");
-        info.set_container(Some(container.clone()));
-        adapter
-            .insert("proj-1".to_string(), Arc::new(info))
-            .unwrap();
-
-        // get_container 通过索引查找
-        let found = adapter.get_container("cid-123");
-        assert!(found.is_some(), "get_container 应通过索引找到容器");
-        assert_eq!(found.unwrap().container_id, "cid-123");
-
-        // 不存在的 container_id
-        assert!(adapter.get_container("nonexistent").is_none());
-    }
-
-    #[test]
     fn test_index_user_id_lookup() {
         // insert 后，get_container_by_user_id 通过索引 O(1) 查找
         let adapter = make_adapter();
@@ -2408,6 +2363,85 @@ mod tests {
             "重建后旧 container_id 反向索引应被清理"
         );
         assert!(adapter.container_id_to_key.contains_key("cid-v2"));
+    }
+
+    /// 回归测试：所有容器查找路径统一走 containers[name] 权威源，结果一致；
+    /// 且容器重建后所有路径都返回新 IP（不出现「部分路径新鲜、部分陈旧」）。
+    #[test]
+    fn test_lookup_source_consistency() {
+        use shared_types::ContainerLookup;
+        let adapter = make_adapter();
+
+        let mk_proj = |cid: &str, ip: &str| {
+            let container = ContainerBasicInfo {
+                container_id: cid.to_string(),
+                container_name: "computer-agent-runner-6".to_string(),
+                container_ip: ip.to_string(),
+                internal_port: 8086,
+                external_port: 0,
+                project_id: String::new(),
+                status: "running".to_string(),
+                created_at: Utc::now(),
+                service_url: format!("http://{cid}"),
+            };
+            let mut p = ProjectAndContainerInfo::from_parts(
+                "proj-A".to_string(),
+                Some("6".to_string()),
+                None,
+                None,
+                Some(container),
+                ProjectExtendedFields {
+                    service_type: Some(ServiceType::ComputerAgentRunner),
+                    ..Default::default()
+                },
+            );
+            p.set_service_type(Some(ServiceType::ComputerAgentRunner));
+            p
+        };
+
+        adapter
+            .insert("proj-A".to_string(), Arc::new(mk_proj("cid-v1", "10.0.0.1")))
+            .unwrap();
+
+        let st = ServiceType::ComputerAgentRunner;
+        // 三条查找路径（user_id / project_id / get_container_by_user_id）返回同一 IP
+        assert_eq!(
+            adapter.find_by_user_id("6", &st),
+            adapter.find_by_project_id("proj-A", &st),
+            "find_by_user_id 与 find_by_project_id 应返回同一 IP"
+        );
+        assert_eq!(
+            adapter.find_by_user_id("6", &st),
+            adapter
+                .get_container_by_user_id("6", &st)
+                .map(|c| c.container_ip),
+            "find_by_user_id 与 get_container_by_user_id 应返回同一 IP"
+        );
+        assert_eq!(adapter.find_by_user_id("6", &st), Some("10.0.0.1".to_string()));
+
+        // 模拟容器重建：同 container_name、新 container_id/ip
+        adapter
+            .insert("proj-A".to_string(), Arc::new(mk_proj("cid-v2", "10.0.0.2")))
+            .unwrap();
+
+        // 重建后三条路径都应返回新 IP（权威源 containers[name] 已刷新）
+        assert_eq!(
+            adapter.find_by_user_id("6", &st),
+            Some("10.0.0.2".to_string()),
+            "重建后 find_by_user_id 应返回新 IP"
+        );
+        assert_eq!(
+            adapter.find_by_project_id("proj-A", &st),
+            Some("10.0.0.2".to_string()),
+            "重建后 find_by_project_id 应返回新 IP"
+        );
+        assert_eq!(
+            adapter
+                .get_container_by_user_id("6", &st)
+                .map(|c| c.container_ip),
+            Some("10.0.0.2".to_string()),
+            "重建后 get_container_by_user_id 应返回新 IP"
+        );
     }
 
     #[test]
@@ -2874,13 +2908,13 @@ impl shared_types::ContainerLookup for ProjectAdapter {
     ///
     /// user_id 是 1:N（一个 user 可有多个 project），无法用单值索引精确反查。
     /// 此处全量扫描（`find_projects_by_user_id`，已按 `service_type` 过滤）取任一
-    /// 匹配 project 的容器 IP——同 user 的 Computer 项目共享同一容器，任取一个即可。
-    /// O(N)，N 为 project 总数（通常很小）。
+    /// 匹配 project，再经 `container_info_by_project` 走 `containers[name]` 权威源取 IP——
+    /// 同 user 的 Computer 项目共享同一容器，任取一个即可。O(N)，N 为该 user 的 project 数。
     fn find_by_user_id(&self, user_id: &str, service_type: &shared_types::ServiceType) -> Option<String> {
-        self.find_projects_by_user_id(user_id, service_type)
-            .into_iter()
-            .next()
-            .and_then(|p| p.container().map(|c| c.container_ip.clone()))
+        // 委托 get_container_by_user_id（同一查找逻辑：扫描 + containers[name] 权威源），
+        // 仅取 container_ip。同 user 的 Computer 项目共享同一容器，任取一个即可。
+        self.get_container_by_user_id(user_id, service_type)
+            .map(|c| c.container_ip)
     }
 
     /// 根据 project_id 查找容器 IP（WebAgentRunner 普通场景）
