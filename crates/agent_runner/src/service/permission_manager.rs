@@ -584,11 +584,12 @@ fn cancelled_response() -> RequestPermissionResponse {
 
 /// 检查 tool_approval_rules 中是否有规则命中（首条命中即停）
 ///
-/// 匹配语义：
-/// - `tool_kind: None` → 不按 kind 过滤（通用规则，覆盖 Execute/Other/Read 等所有类别）
-/// - `tool_kind: Some(x)` → 仅匹配 kind == x 的工具
-/// - 匹配目标按【实际工具的 kind】决定：Execute（bash/shell）→ 命令内容；
-///   其他（含 MCP/Other）→ 工具名。这样一条 None 规则能同时正确匹配 bash 命令与 MCP 工具名。
+/// 匹配语义（与前端客户端统一的「双路径」标准，详见 docs/tool-approval-rules-spec.md）：
+/// - `tool_kind: None`（通用规则）→ 不按 kind 过滤，目标取【多字段任一命中】
+///   （command/cmd/script/input.command + tool_name/toolName + title + title 首词，去重跳空）
+/// - `tool_kind: Some(x)`（精确规则）→ 仅匹配 kind == x（大小写不敏感），目标取【单字段】
+///   （命令类 kind → command 族首个非空；其他 → tool_name 族首个非空，兜底 "tool"）
+/// - 多 patterns 之间 OR；多字段之间 OR；多 rules 顺序优先（首条命中即停）
 fn match_tool_approval_rules(
     context: &PermissionRequestContext,
     request: &RequestPermissionRequest,
@@ -617,30 +618,32 @@ fn match_tool_approval_rules(
         .unwrap_or("Other")
         .to_string();
 
-    // target 按【实际工具的 kind】决定（而非规则的 tool_kind）：
-    //   Execute（bash/shell）→ 命令内容；其他（含 MCP/Other）→ 工具名
-    // 这样一条 tool_kind=None 的通用规则能同时正确匹配 bash 命令与 MCP 工具名。
-    let target = if kind_str == "Execute" {
-        extract_command(request).unwrap_or_default()
-    } else {
-        extract_tool_name(request)
-    };
-
     for rule in rules {
-        // tool_kind: None → 不按 kind 过滤（通用规则，覆盖所有类别）
-        // tool_kind: Some(x) → 仅匹配 kind == x
-        if let Some(rule_kind) = rule.tool_kind.as_deref()
-            && kind_str != rule_kind
+        // kind 过滤：tool_kind: None → 不过滤；Some(x) → 大小写不敏感匹配 kind_str
+        let rule_kind = rule.tool_kind.as_deref();
+        if let Some(rk) = rule_kind
+            && !kind_str.eq_ignore_ascii_case(rk)
         {
             continue;
         }
 
-        // 通配符匹配（大小写不敏感，OR 逻辑）
+        // 选匹配目标：通用规则 → 多字段；显式 tool_kind → 单字段
+        let mut targets: Vec<String> = match rule_kind {
+            None => extract_all_targets(request),
+            Some(rk) => vec![extract_target_by_kind(request, rk)],
+        };
+        dedup_preserve_order(&mut targets);
+        if targets.is_empty() {
+            continue;
+        }
+
+        // 通配符匹配（大小写不敏感）：任一 pattern × 任一 target 命中即触发（OR）
         for pattern in &rule.patterns {
-            if pattern.is_empty() {
+            let pat = pattern.trim();
+            if pat.is_empty() {
                 continue;
             }
-            if glob_match(pattern, &target) {
+            if targets.iter().any(|t| glob_match(pat, t)) {
                 return Some(rule.action.clone());
             }
         }
@@ -659,39 +662,113 @@ fn glob_match(pattern: &str, target: &str) -> bool {
     glob.compile_matcher().is_match(target)
 }
 
-fn extract_tool_name(request: &RequestPermissionRequest) -> String {
-    request
-        .tool_call
-        .fields
-        .raw_input
-        .as_ref()
-        .and_then(|value| value.get("tool_name").or_else(|| value.get("toolName")))
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            request
-                .tool_call
-                .fields
-                .title
-                .as_deref()
-                .map(|title| title.split_whitespace().next().unwrap_or("tool"))
-        })
-        .unwrap_or("tool")
-        .to_string()
+/// raw_input 中视为「命令内容」的字段 key（按优先级），兼容不同 ACP agent 的命名
+const COMMAND_KEYS: &[&str] = &["command", "cmd", "script"];
+/// raw_input 中视为「工具名」的字段 key（按优先级）。
+/// `tool` 为 nuwaxcode MCP 工具实际使用的 key（日志验证）；
+/// `tool_name`/`toolName` 为防御性兼容（部分 agent 可能使用，nuwaxcode 未观察到）。
+const TOOL_NAME_KEYS: &[&str] = &["tool", "tool_name", "toolName"];
+
+/// 命令类 kind 集合：显式 tool_kind 命中这些值时，匹配目标取 command 族。
+/// `execute` 为 ACP 标准；`bash`/`terminal`/`shell`/`command` 兼容部分 agent 的自定义 kind 命名。
+fn is_command_like_kind(kind_lower: &str) -> bool {
+    matches!(
+        kind_lower,
+        "execute" | "bash" | "terminal" | "shell" | "command"
+    )
 }
 
+/// 收集 raw_input 中所有命令类字段值：
+/// `command`/`cmd`/`script` + 字符串 rawInput（整体视为命令）
+fn extract_command_values(request: &RequestPermissionRequest) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(raw) = request.tool_call.fields.raw_input.as_ref() {
+        // raw_input 本身为字符串时，整体视为命令
+        if let Some(s) = raw.as_str() {
+            push_nonempty(&mut values, s);
+        }
+        for key in COMMAND_KEYS {
+            if let Some(s) = raw.get(*key).and_then(|v| v.as_str()) {
+                push_nonempty(&mut values, s);
+            }
+        }
+    }
+    values
+}
+
+/// 收集所有工具名字段值：`tool_name`/`toolName` + `title` 首词
+fn extract_tool_name_values(request: &RequestPermissionRequest) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(raw) = request.tool_call.fields.raw_input.as_ref() {
+        for key in TOOL_NAME_KEYS {
+            if let Some(s) = raw.get(*key).and_then(|v| v.as_str()) {
+                push_nonempty(&mut values, s);
+            }
+        }
+    }
+    if let Some(title) = request.tool_call.fields.title.as_deref()
+        && let Some(first) = title.split_whitespace().next()
+    {
+        push_nonempty(&mut values, first);
+    }
+    values
+}
+
+/// 通用规则（tool_kind=None）的多字段目标：command 族 + tool_name 族 + title 完整。
+/// 身份类字段全纳入，鲁棒应对不同 ACP agent 上报结构差异（不赌信息放在哪个字段）。
+fn extract_all_targets(request: &RequestPermissionRequest) -> Vec<String> {
+    let mut targets = Vec::new();
+    targets.extend(extract_command_values(request));
+    targets.extend(extract_tool_name_values(request));
+    if let Some(title) = request.tool_call.fields.title.as_deref() {
+        push_nonempty(&mut targets, title);
+    }
+    targets
+}
+
+/// 显式 tool_kind 的单字段目标：
+/// 命令类 kind → command 族首个非空；其他 → tool_name 族首个非空（兜底 "tool"）
+fn extract_target_by_kind(request: &RequestPermissionRequest, rule_kind: &str) -> String {
+    if is_command_like_kind(&rule_kind.to_ascii_lowercase()) {
+        extract_command_values(request)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    } else {
+        extract_tool_name_values(request)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "tool".to_string())
+    }
+}
+
+/// 提取工具名（单值，首个非空，兜底 "tool"）。
+/// 供日志展示与权限上下文使用；规则匹配请用 `extract_tool_name_values`/`extract_all_targets`。
+fn extract_tool_name(request: &RequestPermissionRequest) -> String {
+    extract_tool_name_values(request)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "tool".to_string())
+}
+
+/// 提取命令内容（单值，首个非空）。
+/// 供日志展示与危险命令检测使用；规则匹配请用 `extract_command_values`/`extract_all_targets`。
 fn extract_command(request: &RequestPermissionRequest) -> Option<String> {
-    request
-        .tool_call
-        .fields
-        .raw_input
-        .as_ref()
-        .and_then(|value| {
-            value
-                .get("command")
-                .or_else(|| value.pointer("/input/command"))
-        })
-        .and_then(|value| value.as_str())
-        .map(|s| s.to_string())
+    extract_command_values(request).into_iter().next()
+}
+
+/// 将 trim 后非空的字符串加入 Vec
+fn push_nonempty(vec: &mut Vec<String>, s: &str) {
+    let trimmed = s.trim();
+    if !trimmed.is_empty() {
+        vec.push(trimmed.to_string());
+    }
+}
+
+/// 去重，保留首次出现的顺序
+fn dedup_preserve_order(vec: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    vec.retain(|s| seen.insert(s.clone()));
 }
 
 /// Hardcoded safety rules that always reject before any user-saved rule is consulted.
@@ -1352,6 +1429,61 @@ mod tests {
         RequestPermissionRequest::new("session1", tool_call, vec![])
     }
 
+    /// Execute 工具，命令放在指定的 raw_input key（command/cmd/script）
+    fn make_execute_request_with_field(command_key: &str, command: &str) -> RequestPermissionRequest {
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+        let raw = serde_json::json!({ command_key: command });
+        let fields = ToolCallUpdateFields::new()
+            .kind(ToolKind::Execute)
+            .title("bash")
+            .raw_input(raw);
+        let tool_call = ToolCallUpdate::new("tc1", fields);
+        RequestPermissionRequest::new("session1", tool_call, vec![])
+    }
+
+    /// Execute 工具，自定义 command + title（用于多字段任一命中测试）
+    fn make_execute_request_with_title(command: &str, title: &str) -> RequestPermissionRequest {
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+        let fields = ToolCallUpdateFields::new()
+            .kind(ToolKind::Execute)
+            .title(title)
+            .raw_input(serde_json::json!({ "command": command }));
+        let tool_call = ToolCallUpdate::new("tc1", fields);
+        RequestPermissionRequest::new("session1", tool_call, vec![])
+    }
+
+    /// 只有 title，raw_input 无身份字段（测 title 兜底匹配）
+    fn make_title_only_request(title: &str) -> RequestPermissionRequest {
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+        let fields = ToolCallUpdateFields::new()
+            .kind(ToolKind::Other)
+            .title(title)
+            .raw_input(serde_json::json!({ "some_arg": "value" }));
+        let tool_call = ToolCallUpdate::new("tc1", fields);
+        RequestPermissionRequest::new("session1", tool_call, vec![])
+    }
+
+    /// raw_input 为字符串（整体视为命令）
+    fn make_raw_string_request(raw: &str) -> RequestPermissionRequest {
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+        let fields = ToolCallUpdateFields::new()
+            .kind(ToolKind::Execute)
+            .raw_input(serde_json::json!(raw));
+        let tool_call = ToolCallUpdate::new("tc1", fields);
+        RequestPermissionRequest::new("session1", tool_call, vec![])
+    }
+
+    /// nuwaxcode MCP 工具真实形态：kind=Other，工具名在 rawInput.tool，title 为展示名
+    fn make_mcp_tool_request(tool: &str, title: &str) -> RequestPermissionRequest {
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+        let fields = ToolCallUpdateFields::new()
+            .kind(ToolKind::Other)
+            .title(title)
+            .raw_input(serde_json::json!({ "tool": tool, "code": "sample" }));
+        let tool_call = ToolCallUpdate::new("tc1", fields);
+        RequestPermissionRequest::new("session1", tool_call, vec![])
+    }
+
     #[test]
     fn tool_approval_rules_execute_matches_command() {
         let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
@@ -1622,6 +1754,129 @@ mod tests {
         assert_eq!(
             match_tool_approval_rules(&ctx, &req),
             Some(ToolApprovalAction::Ask) // 第 1 条命中，不进第 2 条
+        );
+    }
+
+    // === 多字段统一标准测试（tool_kind=None 通用规则走多字段任一命中）===
+
+    #[test]
+    fn tool_approval_rules_command_key_aliases() {
+        // 通用规则匹配命令的不同 key 变体（command/cmd/script）
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["rm *".to_string()],
+            action: ToolApprovalAction::Ask,
+            tool_kind: None,
+        }]));
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &make_execute_request("rm file")),
+            Some(ToolApprovalAction::Ask)
+        );
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &make_execute_request_with_field("cmd", "rm file")),
+            Some(ToolApprovalAction::Ask)
+        );
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &make_execute_request_with_field("script", "rm file")),
+            Some(ToolApprovalAction::Ask)
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_title_fallback() {
+        // 无 command/tool_name 时，靠 title 兜底匹配
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["*dangerous*".to_string()],
+            action: ToolApprovalAction::Ask,
+            tool_kind: None,
+        }]));
+        let req = make_title_only_request("some_dangerous_tool");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Ask)
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_multi_field_any_match() {
+        // 多字段任一命中：pattern 命中 title 但不命中 command
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["*secret_tool*".to_string()],
+            action: ToolApprovalAction::Deny,
+            tool_kind: None,
+        }]));
+        // command="ls"（不匹配），title="secret_tool_name"（匹配）
+        let req = make_execute_request_with_title("ls", "secret_tool_name");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Deny)
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_kind_case_insensitive() {
+        // tool_kind 大小写不敏感：tool_kind="execute" 匹配 kind=Execute
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["rm *".to_string()],
+            action: ToolApprovalAction::Ask,
+            tool_kind: Some("execute".to_string()), // 小写
+        }]));
+        let req = make_execute_request("rm file"); // kind=Execute
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Ask)
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_explicit_command_kind_reads_cmd() {
+        // 显式命令类 tool_kind → 取 command 族（含 cmd/script 变体）
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["rm *".to_string()],
+            action: ToolApprovalAction::Deny,
+            tool_kind: Some("Execute".to_string()),
+        }]));
+        // 命令在 cmd key，显式 Execute 应取到（command 族首个非空）
+        let req = make_execute_request_with_field("cmd", "rm file");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Deny)
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_raw_string_input() {
+        // raw_input 为字符串时，整体视为命令
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["rm *".to_string()],
+            action: ToolApprovalAction::Ask,
+            tool_kind: None,
+        }]));
+        let req = make_raw_string_request("rm file");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Ask)
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_mcp_tool_field_matched() {
+        // nuwaxcode MCP 工具真实形态：工具名在 rawInput.tool（electron-dev.log 验证）
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["*get_stock_data".to_string()],
+            action: ToolApprovalAction::Ask,
+            tool_kind: None,
+        }]));
+        // 有 title 时，tool 与 title 都能命中
+        let req = make_mcp_tool_request("get_stock_data", "A_get_stock_data");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Ask)
+        );
+        // title 为空时，靠 rawInput.tool 仍能命中（验证 tool 字段独立有效）
+        let req_no_title = make_mcp_tool_request("get_stock_data", "");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req_no_title),
+            Some(ToolApprovalAction::Ask)
         );
     }
 }
