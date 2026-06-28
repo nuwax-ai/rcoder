@@ -13,6 +13,10 @@ pub use storage_types::{IdleContainerInfo, StorageStats};
 pub mod container_lookup;
 pub use container_lookup::ContainerLookup;
 
+// 容器条目模块（refcount + 活跃时间跟踪）
+pub mod container_entry;
+pub use container_entry::ContainerEntry;
+
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）
 pub mod flexible_string;
 pub mod version_util;

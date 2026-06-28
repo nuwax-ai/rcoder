@@ -6,11 +6,10 @@
 //! - RAII 清理（移除 project 时自动销毁无引用的容器）
 
 mod adapter;
-mod container_entry;
 mod resource_reaper;
 mod types;
 
 pub use adapter::ProjectAdapter;
-pub use container_entry::ContainerEntry;
+pub use shared_types::ContainerEntry;
 pub use resource_reaper::{CleanupRequest, ResourceReaper};
 pub use types::{IdleContainerInfo, StorageStats};

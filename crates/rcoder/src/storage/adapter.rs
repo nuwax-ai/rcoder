@@ -20,7 +20,7 @@ use dashmap::mapref::entry::Entry;
 use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
 use tracing::{debug, info};
 
-use super::container_entry::ContainerEntry;
+use shared_types::ContainerEntry;
 use super::resource_reaper::CleanupRequest;
 use super::types::{IdleContainerInfo, StorageStats};
 
