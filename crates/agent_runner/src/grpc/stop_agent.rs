@@ -60,6 +60,9 @@ pub async fn stop_agent(
         );
 
         let cancelled_permissions = PERMISSION_MANAGER.cancel_project_permissions(&project_id);
+        if let Some(info) = AGENT_REGISTRY.get_agent_info(&project_id) {
+            PERMISSION_MANAGER.clear_session_state(&info.session_id.to_string());
+        }
         if cancelled_permissions > 0 {
             info!(
                 "[gRPC] cancelled {} pending permission request(s): project_id={}",

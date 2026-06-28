@@ -61,9 +61,20 @@ struct PermissionRule {
     compiled: Option<regex::Regex>,
 }
 
+/// per-session 动态权限状态（key = session_id）。
+/// 复用 session 时，PermissionRequestContext 是旧 start_config 的快照（agent_mode/tool_approval_rules 已过期），
+/// 通过此状态表覆盖，让每次请求携带的新值在 handler 决策时生效。
+#[derive(Debug, Clone)]
+struct SessionPermissionState {
+    agent_mode: AgentMode,
+    tool_approval_rules: Option<Vec<shared_types::ToolApprovalRule>>,
+}
+
 pub struct PermissionManager {
     pending: Mutex<HashMap<PendingKey, PendingPermission>>,
     rules: DashMap<RuleKey, Vec<PermissionRule>>,
+    /// per-session 动态权限状态（key = session_id）。
+    session_state: DashMap<String, SessionPermissionState>,
 }
 
 impl Default for PermissionManager {
@@ -71,6 +82,7 @@ impl Default for PermissionManager {
         Self {
             pending: Mutex::new(HashMap::new()),
             rules: DashMap::new(),
+            session_state: DashMap::new(),
         }
     }
 }
@@ -261,6 +273,77 @@ impl PermissionManager {
             count, session_id
         );
         count
+    }
+
+    /// 注册/更新某 session 的动态权限状态（upsert）。
+    /// 由 agent_session_service 在每次请求处理时调用（新 session 注册、复用 session 更新）。
+    /// 复用 session 时 PermissionRequestContext 是旧 start_config 快照，需通过此表覆盖
+    /// agent_mode/tool_approval_rules，让每次请求携带的新值在 handler 决策时生效。
+    pub fn upsert_session_state(
+        &self,
+        session_id: &str,
+        agent_mode: AgentMode,
+        tool_approval_rules: Option<Vec<shared_types::ToolApprovalRule>>,
+    ) {
+        use dashmap::mapref::entry::Entry;
+        let trimmed = session_id.trim();
+        if trimmed.is_empty() {
+            warn!(
+                "[Permission] upsert_session_state called with empty session_id, ignoring"
+            );
+            return;
+        }
+        match self.session_state.entry(trimmed.to_string()) {
+            Entry::Occupied(mut occ) => {
+                let prev_mode = occ.get().agent_mode;
+                occ.insert(SessionPermissionState {
+                    agent_mode,
+                    tool_approval_rules,
+                });
+                info!(
+                    "[Permission] session_state updated: session_id={}, prev_mode={:?}, new_mode={:?}",
+                    trimmed, prev_mode, agent_mode
+                );
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(SessionPermissionState {
+                    agent_mode,
+                    tool_approval_rules,
+                });
+                info!(
+                    "[Permission] session_state registered: session_id={}, agent_mode={:?}",
+                    trimmed, agent_mode
+                );
+            }
+        }
+    }
+
+    /// 清除某 session 的动态权限状态（session 结束/取消时调用，防止 DashMap 泄漏）。
+    pub fn clear_session_state(&self, session_id: &str) {
+        if let Some((_, removed)) = self.session_state.remove(session_id) {
+            info!(
+                "[Permission] session_state cleared: session_id={}, agent_mode={:?}",
+                session_id, removed.agent_mode
+            );
+        }
+    }
+
+    /// 取 effective PermissionRequestContext：优先用 session_state 覆盖 agent_mode/tool_approval_rules，
+    /// 未命中则返回原 context（fallback 旧行为）。返回值含来源标注（日志用）。
+    fn effective_context_for(
+        &self,
+        session_id: &str,
+        context: PermissionRequestContext,
+    ) -> (PermissionRequestContext, &'static str) {
+        match self.session_state.get(session_id) {
+            Some(state) => {
+                let mut c = context;
+                c.agent_mode = state.agent_mode;
+                c.tool_approval_rules = state.tool_approval_rules.clone();
+                (c, "session_state")
+            }
+            None => (context, "context"),
+        }
     }
 
     pub fn cancel_project_permissions(&self, project_id: &str) -> usize {
@@ -456,9 +539,14 @@ impl PermissionRequestHandler for PermissionManager {
             command: extract_command(&request),
         };
 
+        // 优先用 per-session 动态状态覆盖 context 的固化值（复用 session 时 context 已过期）。
+        let (effective_context, mode_source) =
+            self.effective_context_for(&info.session_id, context);
+
         info!(
-            "[Permission] Received permission request: session_id={}, tool_call_id={}, tool={}, command={:?}, agent_mode={:?}",
-            info.session_id, info.tool_call_id, info.tool_name, info.command, context.agent_mode
+            "[Permission] Received permission request: session_id={}, tool_call_id={}, tool={}, command={:?}, agent_mode={:?}, source={}",
+            info.session_id, info.tool_call_id, info.tool_name, info.command,
+            effective_context.agent_mode, mode_source
         );
 
         // 危险命令仅记录日志（观测/审计）：不拦截、不强制审批、不 deny——
@@ -471,7 +559,7 @@ impl PermissionRequestHandler for PermissionManager {
         }
 
         if let Some(decision) =
-            self.rule_decision(&context, &info.tool_name, info.command.as_deref())
+            self.rule_decision(&effective_context, &info.tool_name, info.command.as_deref())
         {
             let preferred = match decision {
                 RuleDecision::Allow => [
@@ -487,7 +575,7 @@ impl PermissionRequestHandler for PermissionManager {
         }
 
         // tool_approval_rules 匹配（首条命中即停）
-        if let Some(action) = match_tool_approval_rules(&context, &request) {
+        if let Some(action) = match_tool_approval_rules(&effective_context, &request) {
             info!(
                 "[Permission] tool_approval_rules matched: session_id={}, tool_call_id={}, action={:?}",
                 info.session_id, info.tool_call_id, action
@@ -516,13 +604,13 @@ impl PermissionRequestHandler for PermissionManager {
                 ToolApprovalAction::Ask => {
                     // 与 Ask 模式相同: 推 SSE 到前端
                     return self
-                        .push_permission_to_frontend(context, request, responder, &info)
+                        .push_permission_to_frontend(effective_context, request, responder, &info)
                         .await;
                 }
             }
         }
 
-        if context.agent_mode == AgentMode::Yolo {
+        if effective_context.agent_mode == AgentMode::Yolo {
             info!(
                 "[Permission] Yolo mode, auto-approving: session_id={}, tool_call_id={}, tool={}",
                 info.session_id, info.tool_call_id, info.tool_name
@@ -542,7 +630,7 @@ impl PermissionRequestHandler for PermissionManager {
             info.session_id, info.tool_call_id, info.tool_name
         );
 
-        self.push_permission_to_frontend(context, request, responder, &info)
+        self.push_permission_to_frontend(effective_context, request, responder, &info)
             .await
     }
 }
@@ -1876,5 +1964,52 @@ mod tests {
             match_tool_approval_rules(&ctx, &req_no_title),
             Some(ToolApprovalAction::Ask)
         );
+    }
+
+    // === per-session 动态权限状态（复用 session 时动态切换 agent_mode/tool_approval_rules）===
+
+    #[test]
+    fn upsert_session_state_overrides_context_agent_mode() {
+        // upsert 后，effective_context 应覆盖 context 的 agent_mode
+        let pm = PermissionManager::default();
+        pm.upsert_session_state("ses1", AgentMode::Yolo, None);
+        let ctx = test_context("proj1", "user1"); // agent_mode = Ask
+        let (effective, source) = pm.effective_context_for("ses1", ctx);
+        assert_eq!(effective.agent_mode, AgentMode::Yolo);
+        assert_eq!(source, "session_state");
+    }
+
+    #[test]
+    fn upsert_session_state_overwrites_on_second_call() {
+        // 二次 upsert 覆盖前值
+        let pm = PermissionManager::default();
+        pm.upsert_session_state("ses1", AgentMode::Ask, None);
+        pm.upsert_session_state("ses1", AgentMode::Yolo, None);
+        let ctx = test_context("proj1", "user1");
+        let (effective, _) = pm.effective_context_for("ses1", ctx);
+        assert_eq!(effective.agent_mode, AgentMode::Yolo);
+    }
+
+    #[test]
+    fn clear_session_state_falls_back_to_context() {
+        // clear 后回退到 context（旧行为）
+        let pm = PermissionManager::default();
+        pm.upsert_session_state("ses1", AgentMode::Yolo, None);
+        pm.clear_session_state("ses1");
+        let ctx = test_context("proj1", "user1"); // Ask
+        let (effective, source) = pm.effective_context_for("ses1", ctx);
+        assert_eq!(effective.agent_mode, AgentMode::Ask);
+        assert_eq!(source, "context");
+    }
+
+    #[test]
+    fn upsert_session_state_ignores_empty_session_id() {
+        // 空 session_id 不写入（不 panic）
+        let pm = PermissionManager::default();
+        pm.upsert_session_state("   ", AgentMode::Yolo, None);
+        let ctx = test_context("proj1", "user1");
+        let (effective, source) = pm.effective_context_for("   ", ctx);
+        assert_eq!(source, "context");
+        assert_eq!(effective.agent_mode, AgentMode::Ask);
     }
 }

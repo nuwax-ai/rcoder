@@ -12,7 +12,7 @@ use agent_client_protocol::schema::v1::SessionId;
 use anyhow::Result;
 use chrono::Utc;
 use dashmap::DashMap;
-use shared_types::ModelProviderConfig;
+use shared_types::{AgentMode, ModelProviderConfig, ToolApprovalRule};
 use tracing::{debug, error, info, warn};
 
 use crate::model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo};
@@ -134,6 +134,17 @@ impl AgentSessionService {
         let is_new_session = worker_response.is_new_session;
         let response_session_id = worker_response.session_id.clone();
 
+        // 注册/更新 per-session 动态权限状态：复用 session 时 PermissionRequestContext 是旧快照，
+        // 通过此状态表让本次请求的 agent_mode/tool_approval_rules 在 handler 决策时生效。
+        {
+            let (mode, rules) = extract_mode_and_rules(&request.prompt_message);
+            PERMISSION_MANAGER.upsert_session_state(&response_session_id, mode, rules);
+            debug!(
+                "Registered session permission state: session_id={}, is_new={}, mode={:?}",
+                response_session_id, is_new_session, mode
+            );
+        }
+
         if is_new_session {
             if let Some(ref handles) = session_handles {
                 debug!("New session, registering in AGENT_REGISTRY");
@@ -214,6 +225,8 @@ fn spawn_lifecycle_watcher(
                 cancelled_permissions, project_id, session_id
             );
         }
+        // 同时清理该 session 的动态权限状态（防止 session_state 泄漏）。
+        PERMISSION_MANAGER.clear_session_state(&session_id);
 
         AGENT_REGISTRY.remove_by_project_if_session_matches(&project_id, &session_id);
         info!(
@@ -221,4 +234,21 @@ fn spawn_lifecycle_watcher(
             project_id, session_id
         );
     });
+}
+
+/// 从请求的 prompt_message 提取 effective agent_mode / tool_approval_rules。
+/// 逻辑与 acp_worker.rs 构造 start_config 时一致（agent_config_override.agent_server）。
+/// 缺失时 fallback (Yolo, None)，与 PermissionRequestContext 默认行为对齐。
+fn extract_mode_and_rules(
+    prompt_message: &agent_abstraction::PromptMessage,
+) -> (AgentMode, Option<Vec<ToolApprovalRule>>) {
+    if let Some(ref override_cfg) = prompt_message.agent_config_override
+        && let Some(ref agent_server) = override_cfg.agent_server
+    {
+        let mode = agent_server.agent_mode().unwrap_or(AgentMode::Yolo);
+        let rules = agent_server.tool_approval_rules.clone();
+        (mode, rules)
+    } else {
+        (AgentMode::Yolo, None)
+    }
 }

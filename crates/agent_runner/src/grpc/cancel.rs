@@ -63,6 +63,7 @@ pub async fn cancel_session(
 
         let cancelled_permissions =
             PERMISSION_MANAGER.cancel_session_permissions(&actual_session_id);
+        PERMISSION_MANAGER.clear_session_state(&actual_session_id);
         if cancelled_permissions > 0 {
             info!(
                 "[gRPC] cancelled {} pending permission request(s): session_id={}",

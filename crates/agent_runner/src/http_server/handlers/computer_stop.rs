@@ -122,6 +122,7 @@ pub async fn handle_computer_stop(
 
         // 清理 session permissions
         PERMISSION_MANAGER.cancel_session_permissions(&session_id);
+        PERMISSION_MANAGER.clear_session_state(&session_id);
 
         // 🧹 清空 ring buffer，防止停止后 SSE 流回放过期的历史消息
         // agent stop 会销毁 agent，不需要保留 SSE 连接发送 SessionPromptEnd
