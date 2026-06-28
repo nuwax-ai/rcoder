@@ -344,7 +344,7 @@ message ToolApprovalRule {
   repeated string patterns = 1;
   // 审批动作: "ask" | "allow" | "deny"
   string action = 2;
-  // ACP ToolKind 过滤（可选），不传默认 "Execute"
+  // ACP ToolKind 过滤（可选），不传表示不按 kind 过滤（匹配所有类别）
   optional string tool_kind = 3;
 }
 

@@ -48,7 +48,7 @@ POST /devcomputer/chat
 |------|------|------|--------|------|
 | `patterns` | `string[]` | 是 | - | 通配符模式列表（大小写不敏感，任一命中即触发，空数组则该规则不匹配任何工具） |
 | `action` | `string` | 是 | - | `"ask"`、`"allow"` 或 `"deny"` |
-| `tool_kind` | `string` | 否 | `"Execute"` | ACP ToolKind 过滤，决定匹配目标 |
+| `tool_kind` | `string` | 否 | 不传=不过滤 | ACP ToolKind 过滤；不传表示通用规则（覆盖所有类别），传值则仅匹配该 kind |
 
 #### `action` 取值说明
 
@@ -60,24 +60,22 @@ POST /devcomputer/chat
 
 #### `tool_kind` 取值与匹配目标
 
-`tool_kind` 对应 ACP 协议的 `ToolKind` 枚举，决定通配符匹配什么内容：
+`tool_kind` 对应 ACP 协议的 `ToolKind` 枚举，控制 kind 过滤与匹配目标：
 
-| `tool_kind` | 匹配目标 | 说明 |
-|-------------|---------|------|
-| `"Execute"`（默认） | `tool_call.raw_input.command` | Bash/Shell 命令内容 |
-| `"Read"` | `tool_call.raw_input.tool_name` | 工具名称 |
-| `"Edit"` | `tool_call.raw_input.tool_name` | 工具名称 |
-| `"Delete"` | `tool_call.raw_input.tool_name` | 工具名称 |
-| `"Move"` | `tool_call.raw_input.tool_name` | 工具名称 |
-| `"Search"` | `tool_call.raw_input.tool_name` | 工具名称 |
-| `"Think"` | `tool_call.raw_input.tool_name` | 工具名称 |
-| `"Fetch"` | `tool_call.raw_input.tool_name` | 工具名称 |
-| `"SwitchMode"` | `tool_call.raw_input.tool_name` | 工具名称 |
-| `"Other"` | `tool_call.raw_input.tool_name` | 工具名称 |
+- **不传（通用规则）**：不按 kind 过滤，一条规则覆盖所有类别工具（Execute / Read / Other 等）。匹配目标按**实际工具的 kind** 自动选择（见下表），这样同一条规则既能匹配 bash 命令，也能匹配 MCP 工具名。
+- **传具体值**：仅匹配该 kind 的工具，其余跳过。
+
+匹配目标（由**实际工具的 kind** 决定，而非规则配置）：
+
+| 实际工具 `kind` | 匹配目标 | 说明 |
+|-----------------|---------|------|
+| `Execute` | `tool_call.raw_input.command` | Bash/Shell 命令内容 |
+| `Read` / `Edit` / `Delete` / `Move` / `Search` / `Think` / `Fetch` / `SwitchMode` / `Other` | `tool_call.raw_input.tool_name` | 工具名称（含 MCP 工具；MCP 工具的 kind 通常为 `Other`） |
 
 **设计原理**：
 - `Execute` 类型的工具（bash/shell），用户关心的是**执行什么命令**，所以匹配命令内容
-- 其他类型的工具，用户关心的是**调用什么工具**，所以匹配工具名称
+- 其他类型的工具（含 MCP），用户关心的是**调用什么工具**，所以匹配工具名称
+- 不传 `tool_kind` 为「通用规则」语义，避免为 bash 和 MCP 分别写两条规则
 
 #### 通配符语法
 
@@ -128,7 +126,7 @@ POST /devcomputer/chat
 }
 ```
 
-> `tool_kind` 不传 → 默认 `"Execute"` → 匹配 `raw_input.command`
+> `tool_kind` 不传 → 通用规则（不按 kind 过滤）→ 对 bash 命令（实际 kind=Execute）匹配 `raw_input.command`
 
 ### 场景 2: ASK 模式 + 只读命令自动放行
 
@@ -177,8 +175,8 @@ POST /devcomputer/chat
 }
 ```
 
-> 第 1 条: `tool_kind=Execute`(默认) → 匹配命令内容中的 `rm -rf *` / `sudo *`
-> 第 2 条: `tool_kind=Delete` → 匹配工具名称中的 `*delete*` / `*drop*` / `*truncate*` → 直接拒绝
+> 第 1 条: `tool_kind` 不传（通用规则）→ 对 bash 命令（实际 kind=Execute）匹配命令内容中的 `rm -rf *` / `sudo *`
+> 第 2 条: `tool_kind=Delete` → 仅匹配 Delete 工具名称中的 `*delete*` / `*drop*` / `*truncate*` → 直接拒绝
 
 ### 场景 4: ASK 模式 + 混合（Read 放行 + Edit 审批）
 
@@ -282,10 +280,10 @@ POST /devcomputer/chat
 
 对于 `tool_approval_rules` 中的每条规则，按以下步骤匹配：
 
-1. **检查 tool_kind 是否匹配**: 将规则的 `tool_kind`（默认 `"Execute"`）与 Agent 请求中的 `tool_call.kind` 比较，不匹配则跳过此规则
-2. **提取匹配目标**:
-   - `tool_kind == "Execute"` → 取 `tool_call.raw_input.command`
-   - 其他 → 取 `tool_call.raw_input.tool_name`（回退: `toolName` → `title` 首词 → `"tool"`）
+1. **kind 过滤**: 规则的 `tool_kind` 若为具体值，则与 Agent 请求中实际工具的 `tool_call.kind` 比较，不匹配则跳过此规则；若 `tool_kind` 不传（通用规则），则不过滤，对所有类别继续匹配
+2. **提取匹配目标**（按**实际工具的 kind** 决定）:
+   - 实际 kind == `"Execute"` → 取 `tool_call.raw_input.command`
+   - 其他（含 MCP 工具，kind 通常为 `Other`）→ 取 `tool_call.raw_input.tool_name`（回退: `toolName` → `title` 首词 → `"tool"`）
 3. **通配符匹配**: 用 `patterns` 中的每个通配符（大小写不敏感）匹配目标字符串，任一命中即触发
 4. **返回 action**: 首条命中规则的 `action` 决定行为
 
@@ -410,15 +408,17 @@ RequestPermissionRequest
 Read | Edit | Delete | Move | Search | Execute | Think | Fetch | SwitchMode | Other
 ```
 
-> **注意**: `kind` 是按**操作类型**分类的，不能区分 Bash 工具和 MCP 工具。
-> 例如 `Execute` 可能是 bash `rm -rf`，也可能是 MCP 的 `run_query`。
-> 但 `kind` 足以决定**匹配什么内容**：`Execute` 匹配命令内容，其他匹配工具名称。
+> **注意**: `kind` 是按**操作类型**分类的，与工具来源（内置 Bash / MCP）无关。
+> MCP 工具在 ACP 中通常不设 `kind`，会被兜底为 `Other`（`#[serde(other)]` + `#[default]`）。
+> 因此：`Execute` 通常是 bash 命令，MCP 工具通常是 `Other`。
+> 规则匹配目标由**实际工具的 kind** 决定：`Execute` 匹配命令内容，其他（含 MCP）匹配工具名称。
+> 若希望一条规则同时覆盖 bash 与 MCP，将 `tool_kind` 留空（通用规则）即可。
 
 **字段提取规则**：
 
 | 匹配场景 | 提取字段 | 备选字段 |
 |---------|---------|---------|
-| 工具类型过滤 | `tool_call.kind` | 为空时当作 `"Other"` |
+| kind 过滤（`tool_kind` 不传时跳过此步） | `tool_call.kind` | 为空时当作 `"Other"` |
 | Execute 匹配目标 | `tool_call.raw_input.command` | - |
 | 其他类型匹配目标 | `tool_call.raw_input.tool_name` | `raw_input.toolName` → `title` 首词 → `"tool"` |
 
@@ -449,7 +449,7 @@ pub struct ToolApprovalRule {
     pub patterns: Vec<String>,
     /// 审批动作: "ask" | "allow" | "deny"
     pub action: ToolApprovalAction,
-    /// ACP ToolKind 过滤（可选），不传默认 "Execute"
+    /// ACP ToolKind 过滤（可选），不传表示不按 kind 过滤（匹配所有类别）
     #[serde(default)]
     pub tool_kind: Option<String>,
 }
@@ -488,23 +488,22 @@ pub enum ToolApprovalAction {
 
 ```
 function match_approval_rules(request, rules):
-    for rule in rules:
-        rule_tool_kind = rule.tool_kind ?? "Execute"
+    // 匹配目标按【实际工具的 kind】决定（而非规则的 tool_kind）
+    actual_kind = request.tool_call.kind ?? "Other"
+    if actual_kind == "Execute":
+        target = request.tool_call.raw_input.command ?? ""
+    else:
+        target = request.tool_call.raw_input.tool_name
+             ?? request.tool_call.raw_input.toolName
+             ?? first_word(request.tool_call.title)
+             ?? "tool"
 
-        // ① 检查 tool_kind 是否匹配
-        if request.tool_call.kind != rule_tool_kind:
+    for rule in rules:
+        // ① kind 过滤：tool_kind 不传 = 通用规则（不过滤）；传具体值则精确匹配
+        if rule.tool_kind != null and actual_kind != rule.tool_kind:
             continue
 
-        // ② 根据 tool_kind 提取匹配目标
-        if rule_tool_kind == "Execute":
-            target = request.tool_call.raw_input.command ?? ""
-        else:
-            target = request.tool_call.raw_input.tool_name
-                 ?? request.tool_call.raw_input.toolName
-                 ?? first_word(request.tool_call.title)
-                 ?? "tool"
-
-        // ③ 通配符匹配（大小写不敏感）
+        // ② 通配符匹配（大小写不敏感）
         for pattern in rule.patterns:
             regex = glob_to_regex(pattern)  // 通配符转正则
             if regex_match(regex, target, case_insensitive=true):

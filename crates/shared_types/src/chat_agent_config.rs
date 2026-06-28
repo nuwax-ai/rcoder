@@ -200,14 +200,14 @@ pub struct ChatAgentServerConfig {
 ///
 /// 用于精细控制工具审批行为，规则独立于 agent_mode，按配置的 action 生效。
 /// - `patterns` 使用 glob 通配符语法（大小写不敏感）
-/// - `tool_kind` 决定匹配目标：Execute 匹配命令内容，其他匹配工具名称
+/// - `tool_kind` 决定 kind 过滤：Some(x) 仅匹配 kind=x；None 不过滤（覆盖所有类别）。匹配目标按实际工具 kind：Execute→命令内容，其他→工具名
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ToolApprovalRule {
     /// 通配符模式列表（大小写不敏感，任一命中即触发，OR 逻辑）
     pub patterns: Vec<String>,
     /// 审批动作: "ask" | "allow" | "deny"
     pub action: ToolApprovalAction,
-    /// ACP ToolKind 过滤（可选），不传默认 "Execute"
+    /// ACP ToolKind 过滤（可选），None 表示不按 kind 过滤（匹配所有类别）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_kind: Option<String>,
 }

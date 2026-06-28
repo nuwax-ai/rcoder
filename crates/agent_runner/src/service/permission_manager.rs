@@ -583,6 +583,12 @@ fn cancelled_response() -> RequestPermissionResponse {
 }
 
 /// 检查 tool_approval_rules 中是否有规则命中（首条命中即停）
+///
+/// 匹配语义：
+/// - `tool_kind: None` → 不按 kind 过滤（通用规则，覆盖 Execute/Other/Read 等所有类别）
+/// - `tool_kind: Some(x)` → 仅匹配 kind == x 的工具
+/// - 匹配目标按【实际工具的 kind】决定：Execute（bash/shell）→ 命令内容；
+///   其他（含 MCP/Other）→ 工具名。这样一条 None 规则能同时正确匹配 bash 命令与 MCP 工具名。
 fn match_tool_approval_rules(
     context: &PermissionRequestContext,
     request: &RequestPermissionRequest,
@@ -611,18 +617,23 @@ fn match_tool_approval_rules(
         .unwrap_or("Other")
         .to_string();
 
+    // target 按【实际工具的 kind】决定（而非规则的 tool_kind）：
+    //   Execute（bash/shell）→ 命令内容；其他（含 MCP/Other）→ 工具名
+    // 这样一条 tool_kind=None 的通用规则能同时正确匹配 bash 命令与 MCP 工具名。
+    let target = if kind_str == "Execute" {
+        extract_command(request).unwrap_or_default()
+    } else {
+        extract_tool_name(request)
+    };
+
     for rule in rules {
-        let rule_kind = rule.tool_kind.as_deref().unwrap_or("Execute");
-        if kind_str != rule_kind {
+        // tool_kind: None → 不按 kind 过滤（通用规则，覆盖所有类别）
+        // tool_kind: Some(x) → 仅匹配 kind == x
+        if let Some(rule_kind) = rule.tool_kind.as_deref()
+            && kind_str != rule_kind
+        {
             continue;
         }
-
-        // 根据 tool_kind 提取匹配目标
-        let target = if rule_kind == "Execute" {
-            extract_command(request).unwrap_or_default()
-        } else {
-            extract_tool_name(request)
-        };
 
         // 通配符匹配（大小写不敏感，OR 逻辑）
         for pattern in &rule.patterns {
@@ -1329,12 +1340,24 @@ mod tests {
         RequestPermissionRequest::new("session1", tool_call, vec![])
     }
 
+    fn make_other_request(tool_name: &str) -> RequestPermissionRequest {
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+        // 真实 MCP 工具的形态：kind=Other，工具名通过 title 传递；
+        // raw_input 是工具自有参数（通常不含 tool_name 字段，由 extract_tool_name 回退到 title）
+        let fields = ToolCallUpdateFields::new()
+            .kind(ToolKind::Other)
+            .title(tool_name)
+            .raw_input(serde_json::json!({"arg": "sample"}));
+        let tool_call = ToolCallUpdate::new("tc1", fields);
+        RequestPermissionRequest::new("session1", tool_call, vec![])
+    }
+
     #[test]
     fn tool_approval_rules_execute_matches_command() {
         let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
             patterns: vec!["rm -rf *".to_string()],
             action: ToolApprovalAction::Ask,
-            tool_kind: None, // defaults to Execute
+            tool_kind: None, // 通用规则：不按 kind 过滤，此处匹配 Execute 工具的命令
         }]));
 
         let req = make_execute_request("rm -rf /tmp/cache");
@@ -1465,6 +1488,140 @@ mod tests {
         assert_eq!(
             match_tool_approval_rules(&ctx, &make_execute_request("ls -la")),
             None
+        );
+    }
+
+    // === MCP / Other 工具规则匹配（本次修复核心）===
+
+    #[test]
+    fn tool_approval_rules_other_matches_with_none_kind() {
+        // 核心修复目标：MCP 工具(kind=Other) + tool_kind=None 的通用规则 → 命中
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["mcp__*".to_string()],
+            action: ToolApprovalAction::Ask,
+            tool_kind: None,
+        }]));
+
+        let req = make_other_request("mcp__github__create_issue");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Ask)
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_other_matches_explicit_other() {
+        // MCP 工具 + 显式 tool_kind=Other → 命中
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["mcp__*".to_string()],
+            action: ToolApprovalAction::Ask,
+            tool_kind: Some("Other".to_string()),
+        }]));
+
+        let req = make_other_request("mcp__github__create_issue");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Ask)
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_other_skips_explicit_execute() {
+        // MCP 工具(kind=Other) + 显式 tool_kind=Execute → 不命中（精确匹配）
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["*".to_string()],
+            action: ToolApprovalAction::Deny,
+            tool_kind: Some("Execute".to_string()),
+        }]));
+
+        let req = make_other_request("mcp__github__create_issue");
+        assert_eq!(match_tool_approval_rules(&ctx, &req), None);
+    }
+
+    #[test]
+    fn tool_approval_rules_other_skips_explicit_read() {
+        // MCP 工具(kind=Other) + 显式 tool_kind=Read → 不命中（精确匹配）
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["*".to_string()],
+            action: ToolApprovalAction::Allow,
+            tool_kind: Some("Read".to_string()),
+        }]));
+
+        let req = make_other_request("mcp__github__read_items");
+        assert_eq!(match_tool_approval_rules(&ctx, &req), None);
+    }
+
+    #[test]
+    fn tool_approval_rules_none_covers_both_execute_and_other() {
+        // 一条 None 规则同时覆盖 bash 命令和 MCP 工具名
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["mcp__*".to_string(), "rm -rf *".to_string()],
+            action: ToolApprovalAction::Ask,
+            tool_kind: None,
+        }]));
+
+        // MCP 工具（Other）→ target=tool_name → 匹配 "mcp__*"
+        let req_mcp = make_other_request("mcp__github__create_issue");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req_mcp),
+            Some(ToolApprovalAction::Ask)
+        );
+
+        // bash 命令（Execute）→ target=command → 匹配 "rm -rf *"
+        let req_bash = make_execute_request("rm -rf /tmp/cache");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req_bash),
+            Some(ToolApprovalAction::Ask)
+        );
+
+        // target 选择正确性：MCP 工具名走 tool_name 分支，不会拿去和命令 pattern 比对
+        // "rm_helper_tool" 既不匹配 "mcp__*" 也不匹配 "rm -rf *"（后者要求空格分隔）
+        let req_mcp_rm = make_other_request("rm_helper_tool");
+        assert_eq!(match_tool_approval_rules(&ctx, &req_mcp_rm), None);
+    }
+
+    #[test]
+    fn tool_approval_rules_target_selection_isolated() {
+        // 隔离验证 target 选择：pattern 只能命中对应分支的目标
+        let ctx = make_request_context_with_rules(Some(vec![shared_types::ToolApprovalRule {
+            patterns: vec!["sudo *".to_string()],
+            action: ToolApprovalAction::Deny,
+            tool_kind: None,
+        }]));
+
+        // Execute 工具 → 走 command → "sudo apt install" 命中
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &make_execute_request("sudo apt install")),
+            Some(ToolApprovalAction::Deny)
+        );
+
+        // Other 工具 → 走 tool_name → "sudo_tool" 不匹配 "sudo *"（要求空格分隔）
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &make_other_request("sudo_tool")),
+            None
+        );
+    }
+
+    #[test]
+    fn tool_approval_rules_first_match_wins_mixed() {
+        // 首条命中即停：混合 kind 规则
+        let ctx = make_request_context_with_rules(Some(vec![
+            shared_types::ToolApprovalRule {
+                patterns: vec!["mcp__*".to_string()],
+                action: ToolApprovalAction::Ask,
+                tool_kind: None,
+            },
+            shared_types::ToolApprovalRule {
+                patterns: vec!["*".to_string()],
+                action: ToolApprovalAction::Deny,
+                tool_kind: None,
+            },
+        ]));
+
+        let req = make_other_request("mcp__github__create_issue");
+        assert_eq!(
+            match_tool_approval_rules(&ctx, &req),
+            Some(ToolApprovalAction::Ask) // 第 1 条命中，不进第 2 条
         );
     }
 }

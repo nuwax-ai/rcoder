@@ -425,7 +425,7 @@ pub struct ToolApprovalRule {
     /// 审批动作: "ask" | "allow" | "deny"
     #[prost(string, tag = "2")]
     pub action: ::prost::alloc::string::String,
-    /// ACP ToolKind 过滤（可选），不传默认 "Execute"
+    /// ACP ToolKind 过滤（可选），不传表示不按 kind 过滤（匹配所有类别）
     #[prost(string, optional, tag = "3")]
     pub tool_kind: ::core::option::Option<::prost::alloc::string::String>,
 }
