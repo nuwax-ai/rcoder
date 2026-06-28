@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::model::AgentStatus;
-use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
+use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER, SESSION_CACHE};
 
 /// 清理配置
 #[derive(Debug, Clone)]
@@ -271,6 +271,8 @@ impl AgentCleaner {
                         "Agent removed from Registry: project_id={}, session_id={}",
                         project_id, session_id
                     );
+                    // 清理该 session 的动态权限状态（复用 session 没有 lifecycle watcher，idle cleanup 兜底防泄漏）。
+                    PERMISSION_MANAGER.clear_session_state(&session_id);
 
                     if let Some(stop_handle) = agent_info.stop_handle {
                         info!(

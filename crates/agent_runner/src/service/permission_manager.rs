@@ -2012,4 +2012,27 @@ mod tests {
         assert_eq!(source, "context");
         assert_eq!(effective.agent_mode, AgentMode::Ask);
     }
+
+    #[test]
+    fn upsert_session_state_overrides_context_tool_approval_rules() {
+        // upsert 后，effective_context 应覆盖 context 的 tool_approval_rules（不仅 agent_mode）
+        let pm = PermissionManager::default();
+        pm.upsert_session_state(
+            "ses1",
+            AgentMode::Yolo,
+            Some(vec![shared_types::ToolApprovalRule {
+                patterns: vec!["*get_stock_data".to_string()],
+                action: ToolApprovalAction::Ask,
+                tool_kind: None,
+            }]),
+        );
+        let ctx = test_context("proj1", "user1"); // tool_approval_rules: None
+        let (effective, source) = pm.effective_context_for("ses1", ctx);
+        assert_eq!(source, "session_state");
+        let rules = effective
+            .tool_approval_rules
+            .expect("rules should be overridden by session_state");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].patterns, vec!["*get_stock_data".to_string()]);
+    }
 }

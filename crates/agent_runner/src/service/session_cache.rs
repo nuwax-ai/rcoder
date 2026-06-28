@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use crate::service::PERMISSION_MANAGER;
 use crate::{SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
 use dashmap::DashMap;
@@ -653,6 +654,9 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
 
             // 更新 AGENT_REGISTRY 中的映射关系
             let _ = AGENT_REGISTRY.update_session(project_id, session_id);
+
+            // 清理旧 session_id 的动态权限状态（session_id 变更后旧 state 不再被引用，防泄漏）。
+            PERMISSION_MANAGER.clear_session_state(&old_session_id);
 
             if cleared_count > 0 {
                 info!(
