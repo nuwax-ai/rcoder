@@ -111,16 +111,20 @@ impl ProjectAdapter {
         project_id: String,
         info: Arc<ProjectAndContainerInfo>,
     ) -> anyhow::Result<()> {
-        let container_key = info.container_key().to_string();
+        // logical_id（裸 logical id）：作 ContainerEntry.logical_id，供 RAII 清理 identifier 用。
+        let logical_id = info.container_key().to_string();
+        // DashMap 键：优先 container_name（跨重建稳定、含 service_type 前缀防跨类型碰撞），
+        // 无容器信息时回退裸 logical_id（仅占位，不建容器条目，且 container_name 必含 prefix 不会与裸 id 相撞）。
+        let key = container_entry_key(&info);
 
-        // 读取旧 container_key（view: 读后立即释放锁）
+        // 读取旧键（view: 读后立即释放锁）
         let old_ck = self
             .projects
-            .view(&project_id, |_, v| v.container_key().to_string());
+            .view(&project_id, |_, v| container_entry_key(v));
 
         // 容器是否变更
         let container_changed = match &old_ck {
-            Some(old) => *old != container_key,
+            Some(old) => *old != key,
             None => true, // 新 project，需要 inc_ref
         };
 
@@ -131,15 +135,15 @@ impl ProjectAdapter {
             self.dec_container_ref(&old);
         }
 
-        // 新容器引用 +1（仅容器变更或新 project 时）— entry API 原子操作
-        if container_changed && let Some(container) = info.container() {
+        // 有容器信息时：Fail Fast 校验 service_type，然后增引用（键变）或刷新信息（键不变=重建）
+        if let Some(container) = info.container() {
             let st = match info.service_type() {
                 Some(st) => st,
                 None => {
                     tracing::error!(
-                        "[STORAGE] service_type is None, cannot insert project: project_id={}, container_key={}",
+                        "[STORAGE] service_type is None, cannot insert project: project_id={}, key={}",
                         project_id,
-                        container_key
+                        key
                     );
                     return Err(anyhow::anyhow!(
                         "service_type is required for project insert: project_id={}",
@@ -147,26 +151,43 @@ impl ProjectAdapter {
                     ));
                 }
             };
-            match self.containers.entry(container_key.clone()) {
-                Entry::Occupied(e) => {
-                    e.get().inc_ref();
+            if container_changed {
+                // 键变了：增引用（新容器条目，或共享容器的多 project 复用）
+                match self.containers.entry(key.clone()) {
+                    Entry::Occupied(e) => {
+                        e.get().inc_ref();
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(Arc::new(ContainerEntry::new(
+                            container.clone(),
+                            st,
+                            logical_id.clone(),
+                        )));
+                    }
                 }
-                Entry::Vacant(e) => {
-                    e.insert(Arc::new(ContainerEntry::new(container.clone(), st)));
+            } else {
+                // 键不变但容器可能已重建（container_name 不变、container_id/ip 变）→ 刷新条目信息，
+                // 否则 find_by_project_id/get_container 会返回旧 ip（容器重建陈旧问题）。
+                // 同时清理旧 container_id 的反向索引，避免 container_id_to_key 累积陈旧条目。
+                if let Some(entry) = self.containers.get(&key) {
+                    let old_cid = entry.info().container_id;
+                    if old_cid != container.container_id {
+                        self.container_id_to_key.remove(&old_cid);
+                        entry.update(container.clone(), st);
+                    }
                 }
             }
         }
 
         // 写入主存储和索引
         self.project_to_container
-            .insert(project_id.clone(), container_key.clone());
+            .insert(project_id.clone(), key.clone());
         self.projects.insert(project_id.clone(), info.clone());
 
-        // 维护反向索引
-        // container_id → container_key（更新 save_container 暂存的值）
+        // 维护反向索引：container_id → 容器键
         if let Some(container) = info.container() {
             self.container_id_to_key
-                .insert(container.container_id.clone(), container_key);
+                .insert(container.container_id.clone(), key);
         }
         // user_id → project_id 集合（多值）：entry API 原子插入，or_insert_with 的 RefMut
         // 在语句结束即释放，DashSet::insert 持的是 DashSet 内部锁，与 DashMap 分片锁互不嵌套。
@@ -315,8 +336,8 @@ impl ProjectAdapter {
             let info = Arc::make_mut(e.get_mut());
             info.add_session(session_id);
             existed = true;
-            // 顺便拿 container_key，避免后续再锁一次 project_to_container
-            ck_opt = Some(info.container_key().to_string());
+            // 顺便拿容器键（container_name 或 logical_id 回退），避免后续再锁一次 project_to_container
+            ck_opt = Some(container_entry_key(info));
         }
 
         if !existed {
@@ -325,7 +346,7 @@ impl ProjectAdapter {
         }
 
         // 维护 session_index（只在 project 存在时写）
-        // 兜底：若 info.container_key() 返回空（边界场景），从 project_to_container 取
+        // 兜底：若键为空（边界场景），从 project_to_container 取
         let ck = ck_opt.unwrap_or_else(|| {
             self.project_to_container
                 .view(project_id, |_, v| v.clone())
@@ -509,7 +530,7 @@ impl ProjectAdapter {
             let info = Arc::make_mut(e.get_mut());
             info.update_activity();
             result = Some(info.last_activity());
-            container_key = Some(info.container_key().to_string());
+            container_key = Some(container_entry_key(info));
         }
 
         // entry 已释放，安全访问 containers map
@@ -584,10 +605,11 @@ impl ProjectAdapter {
             }
         };
 
-        // view() 获取 Arc（DashMap 读锁立即释放），通过 RwLock 更新字段
+        // view() 获取 Arc（DashMap 读锁立即释放），通过 RwLock 更新字段。
+        // 键用 container_name（与 insert 的 container_entry_key 一致）。
         let existing = self
             .containers
-            .view(&container.container_id, |_, ce| ce.clone());
+            .view(&container.container_name, |_, ce| ce.clone());
 
         match existing {
             Some(ce) => {
@@ -595,25 +617,26 @@ impl ProjectAdapter {
             }
             None => {
                 // 使用 entry() API 原子插入，避免 view()+insert() 的 TOCTOU 竞态
-                match self.containers.entry(container.container_id.clone()) {
+                match self.containers.entry(container.container_name.clone()) {
                     Entry::Occupied(e) => {
                         // 并发插入：另一个线程已插入，直接更新
                         e.get().update(container.clone(), st);
                     }
                     Entry::Vacant(e) => {
+                        // logical_id 占位：save_container 早于 insert 时 logical_id 未知，
+                        // 先用 container_id 占位，insert 会建带正确 logical_id 的条目。
                         e.insert(Arc::new(ContainerEntry::with_ref_count(
                             container.clone(),
                             st,
+                            container.container_id.clone(),
                             0,
                         )));
                     }
                 }
-                // 维护反向索引：container_id → container_key
-                // 此时 container_key 可能尚未注册（insert 未调用），
-                // 先暂存 container_id 本身，insert 被调用时再更新为正确的 container_key。
+                // 维护反向索引：container_id → 容器键（container_name）
                 self.container_id_to_key.insert(
                     container.container_id.clone(),
-                    container.container_id.clone(),
+                    container.container_name.clone(),
                 );
             }
         }
@@ -671,12 +694,13 @@ impl ProjectAdapter {
         if let Some(ck) = ck_to_remove
             && let Entry::Occupied(e) = self.containers.entry(ck)
         {
-            let (container_key, entry) = e.remove_entry();
+            let (_container_key, entry) = e.remove_entry();
             // 清理反向索引
             let info = entry.info();
             self.container_id_to_key.remove(&info.container_id);
+            // identifier 用裸 logical_id（清理链路按 logical id）
             let _ = self.cleanup_tx.send(CleanupRequest {
-                identifier: container_key,
+                identifier: entry.logical_id().to_string(),
                 container_name: info.container_name,
                 service_type: entry.service_type(),
                 container_ip: info.container_ip,
@@ -894,7 +918,7 @@ impl ProjectAdapter {
         // dec_ref 在 entry 写锁范围内，与后续 remove_entry 原子
         let remaining = entry.get().dec_ref();
         if remaining == 0 {
-            let (ck, entry) = entry.remove_entry();
+            let (_ck, entry) = entry.remove_entry();
             let info = entry.info();
             // 清理反向索引
             self.container_id_to_key.remove(&info.container_id);
@@ -902,8 +926,10 @@ impl ProjectAdapter {
                 "[STORAGE] RAII: container refcount=0, sending cleanup for {}",
                 info.container_name
             );
+            // identifier 用裸 logical_id（清理链路按 logical id：stop_container_by_identifier/
+            // remove_vnc_backend/remove_project_backend/remove_container_cache），而非 DashMap 键
             let _ = self.cleanup_tx.send(CleanupRequest {
-                identifier: ck,
+                identifier: entry.logical_id().to_string(),
                 container_name: info.container_name,
                 service_type: entry.service_type(),
                 container_ip: info.container_ip,
@@ -936,6 +962,20 @@ fn code_to_agent_status(code: i32, _name: &str) -> shared_types::AgentStatus {
         2 => shared_types::AgentStatus::Terminating,
         3 => shared_types::AgentStatus::Pending,
         _ => shared_types::AgentStatus::Idle,
+    }
+}
+
+/// 计算 `containers` DashMap 的键：有容器信息用 `container_name`（真实容器名、跨重建稳定、
+/// 含 service_type 前缀 `computer-agent-runner-`/`web-agent-runner-` 天然防跨类型碰撞）；
+/// 无容器信息时回退裸 `logical_id`（仅占位，不会建容器条目，且 container_name 必含 prefix
+/// 不会与裸 id 相撞）。
+///
+/// 注意：此键仅用于 DashMap 分组/refcount，**不等于** `ProjectAndContainerInfo::container_key()`
+/// （后者返回裸 logical id，供 RAII 清理 identifier 与外部消费者用）。
+fn container_entry_key(info: &ProjectAndContainerInfo) -> String {
+    match info.container() {
+        Some(c) => c.container_name.clone(),
+        None => info.container_key().to_string(),
     }
 }
 
@@ -1376,8 +1416,8 @@ mod tests {
     fn test_save_container_update() {
         let adapter = make_adapter();
 
-        // container_key 对于 RCoder 是 pod_id 或 project_id
-        // 这里使用 project_id 作为 container_id，确保 save_container 和 insert 使用相同的 key
+        // containers DashMap 以 container_name 为键；save_container 与 insert 都用 container_name，
+        // 故此处 container_name 与 insert 的 info.container().container_name 必须一致才能命中同一条目。
         let container = ContainerBasicInfo {
             container_id: "proj-1".to_string(),
             container_name: "save-test".to_string(),
@@ -1403,24 +1443,24 @@ mod tests {
             .insert("proj-1".to_string(), Arc::new(info))
             .unwrap();
 
-        // 验证 ref_count = 1
-        let ce = adapter.containers.get("proj-1").unwrap();
+        // 验证 ref_count = 1（键为 container_name "save-test"）
+        let ce = adapter.containers.get("save-test").unwrap();
         assert_eq!(ce.value().ref_count(), 1);
 
-        // 第二次 save：更新已有条目，ref_count 应保持不变
+        // 第二次 save：更新已有条目（保持 container_name 不变以命中同一条目），ref_count 应保持不变
         let mut updated_container = container.clone();
-        updated_container.container_name = "updated-name".to_string();
+        updated_container.container_ip = "10.0.0.2".to_string();
         adapter
             .save_container(&updated_container, Some(ServiceType::ComputerAgentRunner))
             .unwrap();
 
-        let ce = adapter.containers.get("proj-1").unwrap();
+        let ce = adapter.containers.get("save-test").unwrap();
         assert_eq!(
             ce.value().ref_count(),
             1,
             "save_container 更新不应改变 ref_count"
         );
-        assert_eq!(ce.value().info().container_name, "updated-name");
+        assert_eq!(ce.value().info().container_ip, "10.0.0.2");
         assert_eq!(ce.value().service_type(), ServiceType::ComputerAgentRunner);
     }
 
@@ -1894,7 +1934,7 @@ mod tests {
             .save_container(&container, Some(ServiceType::WebAgentRunner))
             .unwrap();
 
-        // insert 关联项目（container_key = project_id for RCoder without pod_id）
+        // insert 关联项目（container_entry_key = container_name，与 save_container 同键）
         let mut info = create_test_info("proj-1");
         info.set_container(Some(container.clone()));
         adapter
@@ -2113,24 +2153,27 @@ mod tests {
         adapter.insert("proj-A".to_string(), Arc::new(mk_proj("proj-A"))).unwrap();
         adapter.insert("proj-C".to_string(), Arc::new(mk_proj("proj-C"))).unwrap();
 
-        // 两项目共享同一容器条目（container_key=user_id="6"）
+        // 两项目共享同一容器条目（键为 container_name "computer-container"）
         assert_eq!(adapter.containers.len(), 1, "两个 Computer 项目应共享同一容器条目");
-        assert_eq!(adapter.containers.get("user-6").unwrap().ref_count(), 2);
+        assert_eq!(
+            adapter.containers.get("computer-container").unwrap().ref_count(),
+            2
+        );
 
-        // 删除被索引的 proj-C（索引指向最后插入的 proj-C）
+        // 删除 proj-C：容器仍存活（proj-A 引用，refcount=1）
         adapter.remove("proj-C");
-        // 容器仍存活（proj-A 引用，refcount=1）
         assert_eq!(adapter.containers.len(), 1, "容器应仍存活（proj-A 引用）");
-        assert_eq!(adapter.containers.get("user-6").unwrap().ref_count(), 1);
+        assert_eq!(
+            adapter.containers.get("computer-container").unwrap().ref_count(),
+            1
+        );
 
-        // ⚠️ find_by_user_id 此时是否还能找到容器？
+        // find_by_user_id 走 find_projects_by_user_id 扫描，proj-A 仍引用容器 → 应仍能找到
         let result = adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner);
-        eprintln!("DIAG find_by_user_id after removing indexed proj-C = {:?}", result);
-        // 期望：仍能找到（proj-A 引用着容器）。实际受索引单值限制可能为 None。
         assert_eq!(
             result,
             Some("10.0.0.9".to_string()),
-            "删除被索引项目后，user 6 仍有 proj-A 引用容器，find_by_user_id 应能找到"
+            "删除 proj-C 后，user 6 仍有 proj-A 引用容器，find_by_user_id 应能找到"
         );
     }
 
@@ -2178,9 +2221,12 @@ mod tests {
         );
         adapter.insert("proj-B".to_string(), Arc::new(mk_proj("proj-B", "user-B"))).unwrap();
 
-        // 两个 user 共享同一容器条目（refcount=2）
+        // 两个 user 共享同一容器条目（refcount=2）。键为 container_name "computer-shared"。
         assert_eq!(adapter.containers.len(), 1, "两个 user 应共享同一容器条目");
-        assert_eq!(adapter.containers.get("pod-shared").unwrap().ref_count(), 2);
+        assert_eq!(
+            adapter.containers.get("computer-shared").unwrap().ref_count(),
+            2
+        );
 
         // 任一 user 查询都能命中共享容器
         use shared_types::ContainerLookup;
@@ -2196,11 +2242,172 @@ mod tests {
         // 删除一个 user 的项目：容器仍存活（另一个 user 还在用）
         adapter.remove("proj-A");
         assert_eq!(adapter.containers.len(), 1, "容器应仍存活（user-B 还在用）");
-        assert_eq!(adapter.containers.get("pod-shared").unwrap().ref_count(), 1);
+        assert_eq!(
+            adapter.containers.get("computer-shared").unwrap().ref_count(),
+            1
+        );
 
         // 删除最后一个：容器销毁
         adapter.remove("proj-B");
         assert_eq!(adapter.containers.len(), 0, "最后一个 user 移除后容器应销毁");
+    }
+
+    /// 回归测试：同 logical id 跨 ServiceType 不碰撞（container_name 键天然含 service_type 前缀）
+    ///
+    /// Computer user_id="6" 与 Web project_id="6" 共存。旧方案（裸 logical id 键）会撞键导致
+    /// refcount 跨类型混算、查找互串；新方案（container_name 键）两条目独立。
+    #[test]
+    fn test_cross_service_type_no_key_collision() {
+        use shared_types::ContainerLookup;
+        let adapter = make_adapter();
+
+        let mk = |name: &str, ip: &str| ContainerBasicInfo {
+            container_id: format!("cid-{name}"),
+            container_name: name.to_string(),
+            container_ip: ip.to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: String::new(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: format!("http://{name}"),
+        };
+
+        // Computer 项目：user_id="6"，container_name 含 computer 前缀
+        let mut comp = ProjectAndContainerInfo::from_parts(
+            "proj-comp".to_string(),
+            Some("6".to_string()),
+            None,
+            None,
+            Some(mk("computer-agent-runner-6", "10.0.0.1")),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::ComputerAgentRunner),
+                ..Default::default()
+            },
+        );
+        comp.set_service_type(Some(ServiceType::ComputerAgentRunner));
+        adapter
+            .insert("proj-comp".to_string(), Arc::new(comp))
+            .unwrap();
+
+        // Web 项目：project_id="6"，container_name 含 web 前缀
+        let mut web = ProjectAndContainerInfo::from_parts(
+            "6".to_string(),
+            None,
+            None,
+            None,
+            Some(mk("web-agent-runner-6", "10.0.0.2")),
+            ProjectExtendedFields {
+                service_type: Some(ServiceType::WebAgentRunner),
+                ..Default::default()
+            },
+        );
+        web.set_service_type(Some(ServiceType::WebAgentRunner));
+        adapter.insert("6".to_string(), Arc::new(web)).unwrap();
+
+        // 两个独立容器条目（键不同：container_name 含 service_type 前缀）
+        assert_eq!(
+            adapter.containers.len(),
+            2,
+            "同 logical id=\"6\" 不同 service_type 应各自独立条目（不撞键）"
+        );
+        assert!(adapter.containers.contains_key("computer-agent-runner-6"));
+        assert!(adapter.containers.contains_key("web-agent-runner-6"));
+
+        // 查找互不串
+        assert_eq!(
+            adapter.find_by_user_id("6", &ServiceType::ComputerAgentRunner),
+            Some("10.0.0.1".to_string()),
+            "Computer 查找应命中 Computer 容器"
+        );
+        assert_eq!(
+            adapter.find_by_project_id("6", &ServiceType::WebAgentRunner),
+            Some("10.0.0.2".to_string()),
+            "Web 查找应命中 Web 容器"
+        );
+
+        // RAII：删除 Computer 项目，仅销毁 Computer 容器，Web 容器不受影响
+        adapter.remove("proj-comp");
+        assert_eq!(adapter.containers.len(), 1, "Web 容器应仍存活");
+        assert!(adapter.containers.contains_key("web-agent-runner-6"));
+        assert!(!adapter.containers.contains_key("computer-agent-runner-6"));
+    }
+
+    /// 回归测试：跨重建稳定（container_name 确定性，重建不误增条目/不误动 refcount）
+    ///
+    /// 容器重建：container_id 变，但 container_name 不变（确定性命名）。
+    /// 用 container_name 作键时，同 name 重复 insert → container_changed=false → 不触发 dec/inc。
+    #[test]
+    fn test_container_recreation_stability() {
+        let adapter = make_adapter();
+
+        let mk_proj = |cid: &str| {
+            let container = ContainerBasicInfo {
+                container_id: cid.to_string(),
+                container_name: "computer-agent-runner-6".to_string(),
+                container_ip: "10.0.0.1".to_string(),
+                internal_port: 8086,
+                external_port: 0,
+                project_id: String::new(),
+                status: "running".to_string(),
+                created_at: Utc::now(),
+                service_url: "http://c".to_string(),
+            };
+            let mut p = ProjectAndContainerInfo::from_parts(
+                "proj-A".to_string(),
+                Some("6".to_string()),
+                None,
+                None,
+                Some(container),
+                ProjectExtendedFields {
+                    service_type: Some(ServiceType::ComputerAgentRunner),
+                    ..Default::default()
+                },
+            );
+            p.set_service_type(Some(ServiceType::ComputerAgentRunner));
+            p
+        };
+
+        adapter
+            .insert("proj-A".to_string(), Arc::new(mk_proj("cid-v1")))
+            .unwrap();
+        assert_eq!(adapter.containers.len(), 1);
+        assert_eq!(
+            adapter.containers.get("computer-agent-runner-6").unwrap().ref_count(),
+            1
+        );
+
+        // 模拟容器重建：container_id 变（cid-v1→cid-v2），container_name 不变
+        adapter
+            .insert("proj-A".to_string(), Arc::new(mk_proj("cid-v2")))
+            .unwrap();
+        assert_eq!(
+            adapter.containers.len(),
+            1,
+            "重建（同 container_name）不应新增容器条目"
+        );
+        assert_eq!(
+            adapter.containers.get("computer-agent-runner-6").unwrap().ref_count(),
+            1,
+            "重建（同 container_name）refcount 应保持不变（不误触发 RAII）"
+        );
+        // 容器条目信息应刷新到新的 container_id（修复容器重建陈旧问题）
+        assert_eq!(
+            adapter
+                .containers
+                .get("computer-agent-runner-6")
+                .unwrap()
+                .info()
+                .container_id,
+            "cid-v2",
+            "重建后容器条目应刷新为新 container_id，find_by_project_id 才能拿到新 ip"
+        );
+        // 旧 container_id 的反向索引应被清理（不累积陈旧条目）
+        assert!(
+            !adapter.container_id_to_key.contains_key("cid-v1"),
+            "重建后旧 container_id 反向索引应被清理"
+        );
+        assert!(adapter.container_id_to_key.contains_key("cid-v2"));
     }
 
     #[test]

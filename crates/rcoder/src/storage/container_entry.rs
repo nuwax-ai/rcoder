@@ -13,7 +13,7 @@ use parking_lot::RwLock;
 use chrono::{DateTime, Utc};
 use shared_types::{ContainerBasicInfo, ServiceType};
 
-/// 容器条目（存储在 DashMap 中，container_key 为 key）
+/// 容器条目（存储在 DashMap 中，container_name 为 key）
 ///
 /// 通过 `Arc` 共享，确保引用计数和活跃时间在所有持有者之间一致。
 pub struct ContainerEntry {
@@ -21,6 +21,10 @@ pub struct ContainerEntry {
     info: RwLock<ContainerBasicInfo>,
     /// 服务类型（RwLock: 允许通过 Arc 更新）
     service_type: RwLock<ServiceType>,
+    /// 逻辑标识（Computer→user_id/pod_id，Web→project_id/pod_id）。
+    /// 容器生命周期内稳定，供 RAII 清理作 `CleanupRequest.identifier`
+    /// （清理链路按 logical id，而非 DashMap 的 container_name 键）。
+    logical_id: String,
     /// 引用计数：有多少 project 引用此容器
     ref_count: AtomicUsize,
     /// 最后活跃时间（Unix 秒，原子更新，无锁）
@@ -29,11 +33,12 @@ pub struct ContainerEntry {
 
 impl ContainerEntry {
     /// 创建新条目，ref_count 初始为 1
-    pub fn new(info: ContainerBasicInfo, service_type: ServiceType) -> Self {
+    pub fn new(info: ContainerBasicInfo, service_type: ServiceType, logical_id: String) -> Self {
         let now = Utc::now().timestamp();
         Self {
             info: RwLock::new(info),
             service_type: RwLock::new(service_type),
+            logical_id,
             ref_count: AtomicUsize::new(1),
             last_activity_ts: AtomicI64::new(now),
         }
@@ -43,12 +48,14 @@ impl ContainerEntry {
     pub fn with_ref_count(
         info: ContainerBasicInfo,
         service_type: ServiceType,
+        logical_id: String,
         ref_count: usize,
     ) -> Self {
         let now = Utc::now().timestamp();
         Self {
             info: RwLock::new(info),
             service_type: RwLock::new(service_type),
+            logical_id,
             ref_count: AtomicUsize::new(ref_count),
             last_activity_ts: AtomicI64::new(now),
         }
@@ -64,7 +71,12 @@ impl ContainerEntry {
         self.service_type.read().clone()
     }
 
-    /// 更新容器信息和服务类型
+    /// 获取逻辑标识（RAII 清理 identifier 用）
+    pub fn logical_id(&self) -> &str {
+        &self.logical_id
+    }
+
+    /// 更新容器信息和服务类型（logical_id 在容器生命周期内稳定，不更新）
     pub fn update(&self, new_info: ContainerBasicInfo, new_service_type: ServiceType) {
         *self.info.write() = new_info;
         *self.service_type.write() = new_service_type;
@@ -109,6 +121,7 @@ impl std::fmt::Debug for ContainerEntry {
         f.debug_struct("ContainerEntry")
             .field("container_name", &self.info())
             .field("service_type", &self.service_type())
+            .field("logical_id", &self.logical_id)
             .field("ref_count", &self.ref_count())
             .field("last_activity", &self.last_activity())
             .finish()
@@ -133,6 +146,7 @@ mod tests {
                 service_url: "http://test".to_string(),
             },
             ServiceType::WebAgentRunner,
+            "proj-1".to_string(),
         )
     }
 
@@ -183,9 +197,11 @@ mod tests {
                 service_url: "http://test".to_string(),
             },
             ServiceType::WebAgentRunner,
+            "proj-1".to_string(),
             0,
         );
         assert_eq!(entry.ref_count(), 0);
+        assert_eq!(entry.logical_id(), "proj-1");
     }
 
     #[test]
