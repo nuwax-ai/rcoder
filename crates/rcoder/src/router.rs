@@ -59,7 +59,13 @@ pub struct AppState {
     /// 应用配置
     pub config: AppConfig,
     /// 项目适配器 - 纯 DashMap 内存存储 + RAII 自动资源回收
-    pub projects: ProjectAdapter,
+    ///
+    /// 使用 `Arc<ProjectAdapter>` 共享同一实例：
+    /// - AppState 业务逻辑通过 `state.projects.method()` 访问（Arc 自动 deref）
+    /// - 同一 `Arc` 作为 `Arc<dyn ContainerLookup>` 注入 Pingora 代理层，
+    ///   使 /web/ttyd、/computer/ttyd 等路由能解析容器 IP
+    ///   （DashMap 的 clone 是深拷贝，必须共享同一 Arc 实例才能保证数据一致）
+    pub projects: Arc<ProjectAdapter>,
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     /// gRPC 连接池（用于与 agent_runner 通信）
@@ -92,6 +98,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: AppConfig,
         pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
@@ -99,9 +106,12 @@ impl AppState {
         container_prefix_rcoder: String,
         container_prefix_computer: String,
         runtime: Arc<dyn ContainerRuntime>,
+        projects: Arc<ProjectAdapter>,
+        cleanup_rx: tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>,
     ) -> anyhow::Result<Self> {
+        // ProjectAdapter 由调用方（main.rs）提前创建并注入，
+        // 以便同一 Arc 实例可同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层。
         let cluster_domain = shared_types::get_k8s_cluster_domain();
-        let (projects, cleanup_rx) = ProjectAdapter::new(config.app_manager.namespace.clone(), cluster_domain.clone());
 
         // 创建容器创建完成通知通道（缓冲区大小 32，足够应对并发创建）
         let (pod_created_tx, _) = broadcast::channel(32);

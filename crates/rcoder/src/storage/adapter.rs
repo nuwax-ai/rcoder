@@ -2394,26 +2394,48 @@ impl shared_types::ContainerLookup for ProjectAdapter {
     /// 通过 user_id_to_project_id 索引找到 project_id，
     /// 然后通过 project_to_container 索引找到 container_key，
     /// 最后从 containers 中获取 container_ip。
-    fn find_by_user_id(&self, user_id: &str) -> Option<String> {
-        // 1. 通过 user_id_to_project_id 找到 project_id
-        let project_id = self.user_id_to_project_id.get(user_id)?;
-        // 2. 通过 project_to_container 找到 container_key
-        let container_key = self.project_to_container.get(project_id.value())?;
-        // 3. 从 containers 中获取 container_ip
-        self.containers.get(container_key.value())
-            .map(|entry| entry.info().container_ip.clone())
+    ///
+    /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None，
+    /// 避免同一 user_id 下不同 ServiceType 容器互相串用。
+    fn find_by_user_id(&self, user_id: &str, service_type: &shared_types::ServiceType) -> Option<String> {
+        // 索引链查找：每步 clone 出 key 后立即释放读锁，避免跨 map 同时持锁
+        let project_id = self.user_id_to_project_id.get(user_id)?.value().clone();
+        let container_key = self.project_to_container.get(&project_id)?.value().clone();
+        let entry = self.containers.get(&container_key)?;
+        // 校验 service_type，防止串用
+        if entry.service_type() != *service_type {
+            debug!(
+                "[CONTAINER_LOOKUP] service_type mismatch: expected={:?}, found={:?}, user_id={}",
+                service_type,
+                entry.service_type(),
+                user_id
+            );
+            return None;
+        }
+        Some(entry.info().container_ip.clone())
     }
 
     /// 根据 project_id 查找容器 IP（WebAgentRunner 普通场景）
     ///
     /// 通过 project_to_container 索引找到 container_key，
     /// 然后从 containers 中获取 container_ip。
-    fn find_by_project_id(&self, project_id: &str) -> Option<String> {
-        // 1. 通过 project_to_container 找到 container_key
-        let container_key = self.project_to_container.get(project_id)?;
-        // 2. 从 containers 中获取 container_ip
-        self.containers.get(container_key.value())
-            .map(|entry| entry.info().container_ip.clone())
+    ///
+    /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
+    fn find_by_project_id(&self, project_id: &str, service_type: &shared_types::ServiceType) -> Option<String> {
+        // clone 出 container_key 后立即释放 project_to_container 读锁
+        let container_key = self.project_to_container.get(project_id)?.value().clone();
+        let entry = self.containers.get(&container_key)?;
+        // 校验 service_type，防止串用
+        if entry.service_type() != *service_type {
+            debug!(
+                "[CONTAINER_LOOKUP] service_type mismatch: expected={:?}, found={:?}, project_id={}",
+                service_type,
+                entry.service_type(),
+                project_id
+            );
+            return None;
+        }
+        Some(entry.info().container_ip.clone())
     }
 
     /// 根据 pod_id 和 service_type 查找容器 IP（共享容器场景）
@@ -2421,13 +2443,24 @@ impl shared_types::ContainerLookup for ProjectAdapter {
     /// 通过 pod_id_to_project_id 索引找到 project_id，
     /// 然后通过 project_to_container 索引找到 container_key，
     /// 最后从 containers 中获取 container_ip。
-    fn find_by_pod_id(&self, pod_id: &str, _service_type: &shared_types::ServiceType) -> Option<String> {
-        // 1. 通过 pod_id_to_project_id 找到 project_id
-        let project_id = self.pod_id_to_project_id.get(pod_id)?;
-        // 2. 通过 project_to_container 找到 container_key
-        let container_key = self.project_to_container.get(project_id.value())?;
-        // 3. 从 containers 中获取 container_ip
-        self.containers.get(container_key.value())
-            .map(|entry| entry.info().container_ip.clone())
+    ///
+    /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None，
+    /// 避免同一 pod_id 下跨 ServiceType 容器互相串用。
+    fn find_by_pod_id(&self, pod_id: &str, service_type: &shared_types::ServiceType) -> Option<String> {
+        // 索引链查找：每步 clone 出 key 后立即释放读锁，避免跨 map 同时持锁
+        let project_id = self.pod_id_to_project_id.get(pod_id)?.value().clone();
+        let container_key = self.project_to_container.get(&project_id)?.value().clone();
+        let entry = self.containers.get(&container_key)?;
+        // 校验 service_type，防止串用
+        if entry.service_type() != *service_type {
+            debug!(
+                "[CONTAINER_LOOKUP] service_type mismatch: expected={:?}, found={:?}, pod_id={}",
+                service_type,
+                entry.service_type(),
+                pod_id
+            );
+            return None;
+        }
+        Some(entry.info().container_ip.clone())
     }
 }

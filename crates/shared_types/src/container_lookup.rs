@@ -14,14 +14,26 @@ use crate::container_entry::ContainerEntry;
 ///
 /// 统一数据源，避免 Pingora 代理层自己维护容器映射。
 /// ProjectAdapter 和 ContainerLookupService 都实现这个 trait。
+///
+/// ## service_type 校验
+///
+/// 所有查找方法都会校验命中容器的 `service_type` 是否与请求一致，
+/// 不一致则返回 `None`（跳过该容器）。这能避免同一 user_id / pod_id 下
+/// 不同 ServiceType 容器互相串用（例如 user_id=6 同时存在 Computer 和 Web 容器）。
 pub trait ContainerLookup: Send + Sync {
     /// 根据 user_id 查找容器 IP（ComputerAgentRunner 普通场景）
-    fn find_by_user_id(&self, user_id: &str) -> Option<String>;
+    ///
+    /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
+    fn find_by_user_id(&self, user_id: &str, service_type: &ServiceType) -> Option<String>;
 
     /// 根据 project_id 查找容器 IP（WebAgentRunner 普通场景）
-    fn find_by_project_id(&self, project_id: &str) -> Option<String>;
+    ///
+    /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
+    fn find_by_project_id(&self, project_id: &str, service_type: &ServiceType) -> Option<String>;
 
     /// 根据 pod_id 和 service_type 查找容器 IP（共享容器场景）
+    ///
+    /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
     fn find_by_pod_id(&self, pod_id: &str, service_type: &ServiceType) -> Option<String>;
 
     /// 查找容器 IP（统一入口）
@@ -50,7 +62,7 @@ pub trait ContainerLookup: Send + Sync {
         match service_type {
             ServiceType::ComputerAgentRunner => {
                 if let Some(uid) = user_id {
-                    let result = self.find_by_user_id(uid);
+                    let result = self.find_by_user_id(uid, service_type);
                     if result.is_some() {
                         debug!(
                             "[CONTAINER_LOOKUP] Found by user_id: user_id={}",
@@ -64,7 +76,7 @@ pub trait ContainerLookup: Send + Sync {
             }
             ServiceType::WebAgentRunner => {
                 if let Some(pid) = project_id {
-                    let result = self.find_by_project_id(pid);
+                    let result = self.find_by_project_id(pid, service_type);
                     if result.is_some() {
                         debug!(
                             "[CONTAINER_LOOKUP] Found by project_id: project_id={}",
@@ -110,26 +122,61 @@ impl ContainerLookupService {
     }
 
     /// 根据 user_id 查找容器 IP（ComputerAgentRunner 普通场景）
-    pub fn find_by_user_id(&self, user_id: &str) -> Option<String> {
-        let project_id = self.user_id_to_project_id.get(user_id)?;
-        let container_key = self.project_to_container.get(project_id.value())?;
-        self.containers.get(container_key.value())
-            .map(|entry| entry.container_ip())
+    ///
+    /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
+    pub fn find_by_user_id(&self, user_id: &str, service_type: &ServiceType) -> Option<String> {
+        // 索引链查找：每步 clone 出 key 后立即释放读锁，避免跨 map 同时持锁
+        let project_id = self.user_id_to_project_id.get(user_id)?.value().clone();
+        let container_key = self.project_to_container.get(&project_id)?.value().clone();
+        let entry = self.containers.get(&container_key)?;
+        if entry.service_type() != *service_type {
+            debug!(
+                "[CONTAINER_LOOKUP] service_type mismatch: expected={:?}, found={:?}, user_id={}",
+                service_type,
+                entry.service_type(),
+                user_id
+            );
+            return None;
+        }
+        Some(entry.container_ip())
     }
 
     /// 根据 project_id 查找容器 IP（WebAgentRunner 普通场景）
-    pub fn find_by_project_id(&self, project_id: &str) -> Option<String> {
-        let container_key = self.project_to_container.get(project_id)?;
-        self.containers.get(container_key.value())
-            .map(|entry| entry.container_ip())
+    ///
+    /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
+    pub fn find_by_project_id(&self, project_id: &str, service_type: &ServiceType) -> Option<String> {
+        let container_key = self.project_to_container.get(project_id)?.value().clone();
+        let entry = self.containers.get(&container_key)?;
+        if entry.service_type() != *service_type {
+            debug!(
+                "[CONTAINER_LOOKUP] service_type mismatch: expected={:?}, found={:?}, project_id={}",
+                service_type,
+                entry.service_type(),
+                project_id
+            );
+            return None;
+        }
+        Some(entry.container_ip())
     }
 
     /// 根据 pod_id 和 service_type 查找容器 IP（共享容器场景）
-    pub fn find_by_pod_id(&self, pod_id: &str, _service_type: &ServiceType) -> Option<String> {
-        let project_id = self.pod_id_to_project_id.get(pod_id)?;
-        let container_key = self.project_to_container.get(project_id.value())?;
-        self.containers.get(container_key.value())
-            .map(|entry| entry.container_ip())
+    ///
+    /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
+    pub fn find_by_pod_id(&self, pod_id: &str, service_type: &ServiceType) -> Option<String> {
+        // 索引链查找：每步 clone 出 key 后立即释放读锁，避免跨 map 同时持锁
+        let project_id = self.pod_id_to_project_id.get(pod_id)?.value().clone();
+        let container_key = self.project_to_container.get(&project_id)?.value().clone();
+        let entry = self.containers.get(&container_key)?;
+        if entry.service_type() != *service_type {
+            debug!(
+                "[CONTAINER_LOOKUP] service_type mismatch: expected={:?}, found={:?}, pod_id={}",
+                service_type,
+                entry.service_type(),
+                pod_id
+            );
+            return None;
+        }
+        Some(entry.container_ip())
     }
 
     /// 查找容器 IP（统一入口）
@@ -158,7 +205,7 @@ impl ContainerLookupService {
         match service_type {
             ServiceType::ComputerAgentRunner => {
                 if let Some(uid) = user_id {
-                    let result = self.find_by_user_id(uid);
+                    let result = self.find_by_user_id(uid, service_type);
                     if result.is_some() {
                         debug!(
                             "[CONTAINER_LOOKUP] Found by user_id: user_id={}",
@@ -172,7 +219,7 @@ impl ContainerLookupService {
             }
             ServiceType::WebAgentRunner => {
                 if let Some(pid) = project_id {
-                    let result = self.find_by_project_id(pid);
+                    let result = self.find_by_project_id(pid, service_type);
                     if result.is_some() {
                         debug!(
                             "[CONTAINER_LOOKUP] Found by project_id: project_id={}",
@@ -325,91 +372,104 @@ mod tests {
     fn test_find_by_user_id() {
         let service = ContainerLookupService::new();
 
-        // 创建项目信息
+        // 创建 ComputerAgentRunner 项目信息
         let mut info = ProjectAndContainerInfo::new("proj-1".to_string());
         info.set_user_id(Some("user-1".to_string()));
+        info.set_service_type(Some(ServiceType::ComputerAgentRunner));
         info.set_container(Some(make_container_info("container-1", "10.0.0.1")));
         let info = Arc::new(info);
 
         service.insert_project("proj-1".to_string(), info);
 
-        // 查找
-        let result = service.find_by_user_id("user-1");
+        // 匹配 service_type：查找成功
+        let result = service.find_by_user_id("user-1", &ServiceType::ComputerAgentRunner);
         assert_eq!(result, Some("10.0.0.1".to_string()));
+
+        // service_type 不匹配：返回 None（防串用）
+        let result = service.find_by_user_id("user-1", &ServiceType::WebAgentRunner);
+        assert_eq!(result, None);
     }
 
     #[test]
     fn test_find_by_project_id() {
         let service = ContainerLookupService::new();
 
-        // 创建项目信息
+        // 创建 WebAgentRunner 项目信息
         let mut info = ProjectAndContainerInfo::new("proj-1".to_string());
+        info.set_service_type(Some(ServiceType::WebAgentRunner));
         info.set_container(Some(make_container_info("container-1", "10.0.0.1")));
         let info = Arc::new(info);
 
         service.insert_project("proj-1".to_string(), info);
 
-        // 查找
-        let result = service.find_by_project_id("proj-1");
+        // 匹配 service_type：查找成功
+        let result = service.find_by_project_id("proj-1", &ServiceType::WebAgentRunner);
         assert_eq!(result, Some("10.0.0.1".to_string()));
+
+        // service_type 不匹配：返回 None
+        let result = service.find_by_project_id("proj-1", &ServiceType::ComputerAgentRunner);
+        assert_eq!(result, None);
     }
 
     #[test]
     fn test_find_by_pod_id() {
         let service = ContainerLookupService::new();
 
-        // 创建项目信息
+        // 创建共享容器项目信息（WebAgentRunner）
         let mut info = ProjectAndContainerInfo::new("proj-1".to_string());
         info.set_pod_id(Some("pod-1".to_string()));
+        info.set_service_type(Some(ServiceType::WebAgentRunner));
         info.set_container(Some(make_container_info("container-1", "10.0.0.1")));
         let info = Arc::new(info);
 
         service.insert_project("proj-1".to_string(), info);
 
-        // 查找
-        let result = service.find_by_pod_id("pod-1", &ServiceType::ComputerAgentRunner);
+        // 匹配 service_type：查找成功
+        let result = service.find_by_pod_id("pod-1", &ServiceType::WebAgentRunner);
         assert_eq!(result, Some("10.0.0.1".to_string()));
+
+        // service_type 不匹配：返回 None（跨类型共享 pod_id 防串用）
+        let result = service.find_by_pod_id("pod-1", &ServiceType::ComputerAgentRunner);
+        assert_eq!(result, None);
     }
 
     #[test]
     fn test_find_container_ip() {
         let service = ContainerLookupService::new();
 
-        // 创建项目信息
-        let mut info = ProjectAndContainerInfo::new("proj-1".to_string());
-        info.set_user_id(Some("user-1".to_string()));
-        info.set_container(Some(make_container_info("container-1", "10.0.0.1")));
-        let info = Arc::new(info);
+        // Computer 项目（user_id 索引）
+        let mut comp = ProjectAndContainerInfo::new("proj-comp".to_string());
+        comp.set_user_id(Some("user-1".to_string()));
+        comp.set_service_type(Some(ServiceType::ComputerAgentRunner));
+        comp.set_container(Some(make_container_info("container-1", "10.0.0.1")));
+        service.insert_project("proj-comp".to_string(), Arc::new(comp));
 
-        service.insert_project("proj-1".to_string(), info);
+        // Web 项目（project_id 索引）
+        let mut web = ProjectAndContainerInfo::new("proj-web".to_string());
+        web.set_service_type(Some(ServiceType::WebAgentRunner));
+        web.set_container(Some(make_container_info("container-2", "10.0.0.2")));
+        service.insert_project("proj-web".to_string(), Arc::new(web));
 
-        // 查找（ComputerAgentRunner 场景）
-        let result = service.find_container_ip(
-            &ServiceType::ComputerAgentRunner,
-            Some("user-1"),
-            None,
-            None,
+        // Computer 场景：按 user_id 查
+        assert_eq!(
+            service.find_container_ip(&ServiceType::ComputerAgentRunner, Some("user-1"), None, None),
+            Some("10.0.0.1".to_string())
         );
-        assert_eq!(result, Some("10.0.0.1".to_string()));
-
-        // 查找（WebAgentRunner 场景）
-        let result = service.find_container_ip(
-            &ServiceType::WebAgentRunner,
-            None,
-            Some("proj-1"),
-            None,
+        // Web 场景：按 project_id 查
+        assert_eq!(
+            service.find_container_ip(&ServiceType::WebAgentRunner, None, Some("proj-web"), None),
+            Some("10.0.0.2".to_string())
         );
-        assert_eq!(result, Some("10.0.0.1".to_string()));
     }
 
     #[test]
     fn test_not_found() {
         let service = ContainerLookupService::new();
 
-        let result = service.find_by_user_id("nonexistent");
+        let result = service.find_by_user_id("nonexistent", &ServiceType::ComputerAgentRunner);
         assert_eq!(result, None);
 
-        let result = service.find_by_project_id("nonexistent");
+        let result = service.find_by_project_id("nonexistent", &ServiceType::WebAgentRunner);
         assert_eq!(result, None);
     }
 
@@ -420,6 +480,7 @@ mod tests {
         // 创建项目信息
         let mut info = ProjectAndContainerInfo::new("proj-1".to_string());
         info.set_user_id(Some("user-1".to_string()));
+        info.set_service_type(Some(ServiceType::ComputerAgentRunner));
         info.set_container(Some(make_container_info("container-1", "10.0.0.1")));
         let info = Arc::new(info);
 
@@ -429,10 +490,10 @@ mod tests {
         service.remove_project("proj-1");
 
         // 验证已删除
-        let result = service.find_by_user_id("user-1");
+        let result = service.find_by_user_id("user-1", &ServiceType::ComputerAgentRunner);
         assert_eq!(result, None);
 
-        let result = service.find_by_project_id("proj-1");
+        let result = service.find_by_project_id("proj-1", &ServiceType::WebAgentRunner);
         assert_eq!(result, None);
     }
 }

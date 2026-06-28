@@ -36,9 +36,26 @@ async fn main() -> anyhow::Result<()> {
     docker_init::init_docker_manager(&bootstrap_result.config).await?;
     docker_init::startup_cleanup(&bootstrap_result.config).await;
 
+    // 提前创建 ProjectAdapter，以便同一 Arc 实例同时作为
+    // Arc<dyn ContainerLookup> 注入 Pingora 代理层（统一容器 IP 数据源）
+    // 和作为 AppState.projects 共享给业务逻辑。
+    let cluster_domain = shared_types::get_k8s_cluster_domain();
+    let (projects, cleanup_rx) = ProjectAdapter::new(
+        bootstrap_result.config.app_manager.namespace.clone(),
+        cluster_domain.clone(),
+    );
+    let projects = Arc::new(projects);
+
+    // 克隆同一 Arc 实例供 Pingora 代理层使用（共享 DashMap 数据）。
+    // 必须先得到具体类型 Arc<ProjectAdapter>，再在其上做 unsized coercion
+    // 到 trait object，避免类型推断把 clone 的类型参数反向绑定为 dyn。
+    let projects_for_lookup = Arc::clone(&projects);
+    let container_lookup: Arc<dyn shared_types::ContainerLookup> = projects_for_lookup;
+
     let proxy_result = proxy_init::init_proxy(
         &bootstrap_result.config,
         Arc::clone(&bootstrap_result.api_key_config),
+        container_lookup,
     )
     .await;
     proxy_init::log_proxy_info(&bootstrap_result.config);
@@ -82,6 +99,8 @@ async fn main() -> anyhow::Result<()> {
             container_prefix_rcoder,
             container_prefix_computer,
             runtime,
+            projects,
+            cleanup_rx,
         )
         .await?,
     );

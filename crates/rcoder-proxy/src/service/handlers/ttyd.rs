@@ -202,9 +202,9 @@ pub async fn handle_ttyd_upstream(
     );
 
     // 查找用户容器 IP
-    // 优先使用 ContainerLookupService，回退到 vnc_backends
+    // 优先使用 ContainerLookupService（校验 service_type，防串用），回退到 vnc_backends
     let container_ip = if let Some(lookup) = container_lookup {
-        lookup.find_by_user_id(user_id)
+        lookup.find_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
     } else {
         vnc_backends.get(user_id).map(|r| r.value().clone())
     };
@@ -281,9 +281,9 @@ pub async fn handle_web_ttyd_upstream(
     );
 
     // 使用 project_id 查找容器 IP
-    // 优先使用 ContainerLookupService，回退到 project_backends/vnc_backends
+    // 优先使用 ContainerLookupService（校验 service_type，防串用），回退到 project_backends/vnc_backends
     let container_ip = if let Some(lookup) = container_lookup {
-        lookup.find_by_project_id(project_id)
+        lookup.find_by_project_id(project_id, &shared_types::ServiceType::WebAgentRunner)
     } else {
         project_backends
             .get(project_id)

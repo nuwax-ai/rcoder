@@ -70,6 +70,24 @@ impl PingoraServerManager {
         self
     }
 
+    /// 设置容器查找服务（统一数据源）
+    ///
+    /// 注入共享的容器查找服务（通常是 `Arc<ProjectAdapter>`），
+    /// 使 Pingora 代理层（/web/ttyd、/computer/ttyd 等路由）能通过
+    /// user_id / project_id / pod_id 解析容器 IP，无需自己维护映射。
+    ///
+    /// # 参数
+    ///
+    /// * `lookup` - 共享的 `Arc<dyn ContainerLookup>`
+    pub fn with_container_lookup(
+        mut self,
+        lookup: Arc<dyn shared_types::ContainerLookup>,
+    ) -> Self {
+        let new_service = (*self.service).clone().with_container_lookup(lookup);
+        self.service = Arc::new(new_service);
+        self
+    }
+
     /// 启动 Pingora 服务器
     ///
     /// 接受一个 `shutdown_rx` 用于接收外部关闭信号。
