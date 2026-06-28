@@ -365,10 +365,9 @@ POST /devcomputer/chat
 
 ### 7.1 容器环境下的审批策略
 
-所有命令在容器内执行，不存在需要自动拒绝的"危险命令"。`rm -rf /` 等操作在容器内只影响容器自身，不会影响宿主机。因此：
-- 不设置硬编码安全规则自动拒绝
-- 所有命令的审批与否完全由 `tool_approval_rules` 和 `agent_mode` 决定
-- 用户可以通过 `ask` 规则对敏感操作进行人工审批
+所有命令在容器内执行，`rm -rf /` 等操作只影响容器自身、不会影响宿主机，因此**不自动拒绝（deny）任何命令**——审批完全由 `tool_approval_rules` 和 `agent_mode` 决定。
+- rcoder 对 `rm -rf /`、`sudo rm -rf $HOME` 等极端命令会通过 `is_dangerous_command` **打印 warn 日志（观测/审计）**，但**不拦截、不强制审批、不 deny**，命令继续走正常决策链；
+- 用户如需对危险命令强制审批，可在 `tool_approval_rules` 配置（如 `rm -rf * → ask`）。
 
 ### 7.2 `deny` 动作的使用场景
 

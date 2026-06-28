@@ -461,15 +461,13 @@ impl PermissionRequestHandler for PermissionManager {
             info.session_id, info.tool_call_id, info.tool_name, info.command, context.agent_mode
         );
 
-        // Priority 1: Dangerous-command rejection (cannot be overridden by any rule)
+        // 危险命令仅记录日志（观测/审计）：不拦截、不强制审批、不 deny——
+        // 审批完全由后续 rule_decision / tool_approval_rules / agent_mode 决定。
         if is_dangerous_command(info.command.as_deref()) {
-            info!(
-                "[Permission] dangerous command detected, forcing frontend approval: session_id={}, tool_call_id={}, command={:?}",
+            warn!(
+                "[Permission] dangerous command detected (log only, 不拦截): session_id={}, tool_call_id={}, command={:?}",
                 info.session_id, info.tool_call_id, info.command
             );
-            return self
-                .push_permission_to_frontend(context, request, responder, &info)
-                .await;
         }
 
         if let Some(decision) =

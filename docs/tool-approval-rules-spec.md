@@ -115,13 +115,14 @@ match_tool_approval_rules(request, rules):
 ## 7. 在权限决策链中的位置
 
 ```text
-① 危险命令硬编码拦截（仅 command，最高优先级，不可覆盖）
+① 危险命令仅记录日志（仅 command；warn 日志，不拦截、不强制审批、不 deny；不影响后续决策）
 ② 用户保存的规则（RuleStore，前端勾「总是允许/拒绝」持久化）
 ③ tool_approval_rules（本规范）        ← 首条命中即停
 ④ agent_mode 兜底（yolo = 放行，ask = 推前端）
 ```
 
-危险命令检测（①）只对 command 生效，MCP 工具（无 command）直接落到 ③。
+- 危险命令检测（①）只对 command 生效，命中后**仅打 warn 日志（观测/审计），不拦截、不改变决策**——审批完全由 ②③④ 决定，与容器环境「不自动拒绝危险命令、审批完全配置驱动」的立场一致。
+- 如需对危险命令强制审批，用户可在 `tool_approval_rules` 配置（如 `rm -rf * → ask`）。
 
 ## 8. 实现对齐
 
@@ -157,4 +158,4 @@ match_tool_approval_rules(request, rules):
 ## 10. 取舍说明
 
 - **鲁棒 vs 精确**：通用规则（多字段）偏鲁棒，可能误命中（如某 pattern 恰好出现在 title/tool_name）。追求精确的场景用显式 `tool_kind` 收紧到单字段。
-- **危险命令不可覆盖**：即使规则配 `allow`，`rm -rf /` 等危险命令仍被 ① 强制推前端审批。
+- **危险命令仅记录日志**：`rm -rf /` 等极端命令会打 warn 日志（观测），但**不拦截、不改变决策**——审批完全由 `tool_approval_rules` 和 `agent_mode` 决定；如需强制审批，配 `rm -rf * → ask`。
