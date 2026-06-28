@@ -91,8 +91,10 @@ async fn get_container_for_cancel(
         }
         CancelIdentifier::User(user_id) => {
             // ComputerAgentRunner 模式：通过 user_id 查询容器
-            // 使用新添加的 get_container_by_user_id 方法
-            state.projects.get_container_by_user_id(user_id)
+            state.projects.get_container_by_user_id(
+                user_id,
+                &shared_types::ServiceType::ComputerAgentRunner,
+            )
         }
         CancelIdentifier::Pod(pod_id) => {
             // 共享容器模式：通过 pod_id 查询容器

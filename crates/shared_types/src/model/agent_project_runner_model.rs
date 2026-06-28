@@ -409,17 +409,20 @@ impl ProjectAndContainerInfo {
     ///
     /// 根据 service_type 返回不同的标识符：
     /// - WebAgentRunner 模式：返回 pod_id（如果存在，共享容器），否则返回 project_id
-    /// - ComputerAgentRunner 模式：返回 user_id（如果存在），否则回退到 project_id
+    /// - ComputerAgentRunner 模式：返回 pod_id（共享容器）→ user_id（per-user 容器）→ project_id（兜底）
     ///
     /// ## 重要说明
     ///
-    /// 只有 `ComputerAgentRunner` 类型才使用 `user_id` 作为容器标识。
-    /// `WebAgentRunner` 类型使用 `project_id` 作为容器标识，即使 `user_id` 存在。
+    /// `ComputerAgentRunner` 默认用 `user_id`（无 pod_id 时容器由 user_id 确认）；
+    /// 若提供 `pod_id`，则多个 user 可共享同一容器（pod_id 作为 container_key，
+    /// 与容器创建侧 `agent_container_starter` 的 container_id 选择一致）。
+    /// `WebAgentRunner` 用 `pod_id` 或 `project_id`，不使用 `user_id`。
     pub fn container_key(&self) -> &str {
         match self.service_type() {
-            Some(ServiceType::ComputerAgentRunner) => {
-                self.user_id().unwrap_or_else(|| self.project_id())
-            }
+            Some(ServiceType::ComputerAgentRunner) => self
+                .pod_id()
+                .or_else(|| self.user_id())
+                .unwrap_or_else(|| self.project_id()),
             // WebAgentRunner 或 service_type 未设置：使用 pod_id 或 project_id
             _ => self.pod_id().unwrap_or_else(|| self.project_id()),
         }
@@ -574,6 +577,28 @@ mod tests {
         let snapshot = info.sessions();
         assert!(snapshot.contains("s1"));
         assert!(snapshot.contains("s2"));
+    }
+
+    #[test]
+    fn test_container_key_by_service_type() {
+        // ComputerAgentRunner 无 pod_id：用 user_id（per-user 容器）
+        let mut comp = ProjectAndContainerInfo::new("proj-1".into());
+        comp.set_service_type(Some(ServiceType::ComputerAgentRunner));
+        comp.set_user_id(Some("user-6".into()));
+        assert_eq!(comp.container_key(), "user-6");
+
+        // ComputerAgentRunner 有 pod_id：用 pod_id（共享容器，跨 user 复用）
+        comp.set_pod_id(Some("pod-shared".into()));
+        assert_eq!(comp.container_key(), "pod-shared");
+
+        // WebAgentRunner 无 pod_id：用 project_id
+        let mut web = ProjectAndContainerInfo::new("proj-web".into());
+        web.set_service_type(Some(ServiceType::WebAgentRunner));
+        assert_eq!(web.container_key(), "proj-web");
+
+        // WebAgentRunner 有 pod_id：用 pod_id（共享容器）
+        web.set_pod_id(Some("pod-web".into()));
+        assert_eq!(web.container_key(), "pod-web");
     }
 
     #[test]

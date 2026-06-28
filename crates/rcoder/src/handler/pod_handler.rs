@@ -2430,7 +2430,11 @@ pub async fn pod_vnc_status(
         (uid, runtime.find_container(uid, &service_type).await)
     } else if let Some(pid) = project_id {
         // 如果只有 project_id，通过 storage lookup 关联的容器
-        if state.projects.get_container_by_user_id(pid).is_some() {
+        if state
+            .projects
+            .get_container_by_user_id(pid, &service_type)
+            .is_some()
+        {
             // project_id 可能实际上是 user_id
             (pid, runtime.find_container(pid, &service_type).await)
         } else {

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use dashmap::DashSet;
 use dashmap::mapref::entry::Entry;
 use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
 use tracing::{debug, info};
@@ -32,7 +33,7 @@ use super::types::{IdleContainerInfo, StorageStats};
 ///
 /// 为避免全量遍历，维护 3 个反向索引：
 /// - `container_id_to_key`: container_id → container_key（O(1) 按容器 ID 查找）
-/// - `user_id_to_project_id`: user_id → project_id（O(1) 按用户 ID 查找）
+/// - `user_id_to_project_ids`: user_id → project_id 集合（多值，按用户 ID 查找其全部 project）
 /// - `pod_id_to_project_id`: pod_id → project_id（O(1) 按 pod ID 查找）
 ///
 /// 索引在 `insert`、`remove`、`save_container`、`delete_container_with_projects` 中同步维护。
@@ -56,8 +57,14 @@ pub struct ProjectAdapter {
     // === 反向索引（CQRS：写入时维护，读取时 O(1)） ===
     /// container_id → container_key（按容器 ID 快速查找）
     container_id_to_key: DashMap<String, String>,
-    /// user_id → project_id（按用户 ID 快速查找）
-    user_id_to_project_id: DashMap<String, String>,
+    /// user_id → project_id 集合（多值索引）
+    ///
+    /// user_id 是 1:N（一个 user 可关联多个 project），用 DashSet 存全部 project_id。
+    /// 服务于：
+    /// - `find_projects_by_user_id`（cleanup 判断容器能否销毁需枚举该 user 的全部 project）
+    /// - `find_by_user_id` / `get_container_by_user_id`（取任一即可，同 user 的同 ServiceType
+    ///   项目共享同一容器）
+    user_id_to_project_ids: DashMap<String, DashSet<String>>,
     /// pod_id → project_id（按 pod ID 快速查找）
     pod_id_to_project_id: DashMap<String, String>,
 }
@@ -78,7 +85,7 @@ impl ProjectAdapter {
             project_to_container: DashMap::new(),
             cleanup_tx: tx,
             container_id_to_key: DashMap::new(),
-            user_id_to_project_id: DashMap::new(),
+            user_id_to_project_ids: DashMap::new(),
             pod_id_to_project_id: DashMap::new(),
         };
         info!("[STORAGE] ProjectAdapter initialized (DashMap, RAII enabled)");
@@ -161,17 +168,13 @@ impl ProjectAdapter {
             self.container_id_to_key
                 .insert(container.container_id.clone(), container_key);
         }
-        // user_id → project_id
-        // ⚠️ 仅 ComputerAgentRunner 写入此索引：find_by_user_id 是 Computer 专属查询
-        // （无 pod_id 时容器由 user_id 确认）。入口对两类业务都记录 user_id（信息完整），
-        // 但 WebAgentRunner 容器由 pod_id/project_id 标识，不进入此索引——单值索引无法
-        // 同时容纳同 user 的两类项目，按 service_type 收敛为 Computer 专属，避免互相覆盖
-        // 导致 /computer/ttyd 串用或 404。
-        if info.service_type() == Some(ServiceType::ComputerAgentRunner)
-            && let Some(uid) = info.user_id()
-        {
-            self.user_id_to_project_id
-                .insert(uid.to_string(), project_id.clone());
+        // user_id → project_id 集合（多值）：entry API 原子插入，or_insert_with 的 RefMut
+        // 在语句结束即释放，DashSet::insert 持的是 DashSet 内部锁，与 DashMap 分片锁互不嵌套。
+        if let Some(uid) = info.user_id() {
+            self.user_id_to_project_ids
+                .entry(uid.to_string())
+                .or_default()
+                .insert(project_id.clone());
         }
         // pod_id → project_id
         if let Some(pid) = info.pod_id() {
@@ -195,17 +198,15 @@ impl ProjectAdapter {
         }
 
         // 2.1 清理反向索引
-        // user_id 索引仅 ComputerAgentRunner 写入（见 insert）；且仅当索引仍指向当前被删
-        // project 时才移除，避免误删指向其他同 user 的 Computer 项目的索引条目。
-        if info.service_type() == Some(ServiceType::ComputerAgentRunner)
-            && let Some(uid) = info.user_id()
-            && self
-                .user_id_to_project_id
-                .get(uid)
-                .map(|p| p.value().as_str() == project_id)
-                .unwrap_or(false)
+        // user_id：entry API 在单个 OccupiedEntry guard 内完成「从 DashSet 移除 project_id
+        // + 判空 + 摘除整个 user_id 条目」，原子且无并发 insert 竞态。
+        if let Some(uid) = info.user_id()
+            && let Entry::Occupied(e) = self.user_id_to_project_ids.entry(uid.to_string())
         {
-            self.user_id_to_project_id.remove(uid);
+            e.get().remove(project_id); // DashSet::remove 是 &self
+            if e.get().is_empty() {
+                e.remove_entry(); // 集合空才摘除 user_id → DashSet 条目
+            }
         }
         if let Some(pid) = info.pod_id() {
             self.pod_id_to_project_id.remove(pid);
@@ -728,11 +729,19 @@ impl ProjectAdapter {
 
     // ========== ComputerAgentRunner 模式 ==========
 
-    /// 通过 user_id 获取容器信息（O(1) 索引查找）
-    pub fn get_container_by_user_id(&self, user_id: &str) -> Option<ContainerBasicInfo> {
-        let project_id = self.user_id_to_project_id.get(user_id)?;
-        let info = self.projects.view(project_id.value(), |_, v| v.clone())?;
-        info.container().cloned()
+    /// 通过 user_id 获取容器信息（需指定 service_type）
+    ///
+    /// user_id 是 1:N（一个 user 可有多个 project），走多值索引 `find_projects_by_user_id`
+    /// 取任一匹配 project 的容器——同 user 同 ServiceType 的项目共享同一容器，任取一个即可。
+    pub fn get_container_by_user_id(
+        &self,
+        user_id: &str,
+        service_type: &ServiceType,
+    ) -> Option<ContainerBasicInfo> {
+        self.find_projects_by_user_id(user_id, service_type)
+            .into_iter()
+            .next()
+            .and_then(|p| p.container().cloned())
     }
 
     /// 通过 pod_id 获取容器信息（O(1) 索引查找）
@@ -744,38 +753,27 @@ impl ProjectAdapter {
 
     /// 通过 user_id 查找所有项目（按 service_type 过滤）
     ///
-    /// 入口（pod_ensure 等）对两类业务都记录 user_id（信息尽可能完整），
-    /// 此处按 `service_type` 过滤，避免不同 ServiceType 的项目互相干扰
-    /// （例如 Web 项目不该计入 Computer 容器的清理决策）。
+    /// 走多值索引 `user_id_to_project_ids`（user_id → 全部 project_id），再逐个解析并按
+    /// `service_type` 过滤。复杂度 O(该 user 的 project 数)，优于全量遍历。
     ///
-    /// 注意：一个 user_id 可能关联多个 project，索引仅存储最新一个，
-    /// 故此处保留全量遍历以确保返回完整结果。
-    ///
-    /// ## m4 文档：为何不用 HashSet 索引
-    ///
-    /// 候选优化：`user_id_to_project_id: DashMap<(String, ServiceType), Arc<HashSet<String>>>`
-    /// 可以让本方法从 O(N) 降到 O(1)。
-    ///
-    /// 不做的理由：
-    /// 1. **生产实际场景**：ComputerAgentRunner 模式下，一个 user 通常只对应一个活跃 project
-    ///    （多 project 共存是边缘场景）。
-    /// 2. **维护成本**：多值索引的 insert/remove 需要额外同步逻辑（CQR 一致性），
-    ///    容易引入新 bug。
-    /// 3. **N 通常很小**：N 是 project 总数，即使几千个，O(N) 遍历也是微秒级。
-    ///
-    /// 如果未来 N 增长到数万或 user 多 project 成为主流，再考虑改造。
+    /// 用途：cleanup strategy 判断容器能否销毁时，需枚举该 user 的全部同 ServiceType
+    /// project 检查闲置状态；`find_by_user_id` / `get_container_by_user_id` 也委托本方法
+    /// 取任一（同 user 同 ServiceType 项目共享同一容器）。
     pub fn find_projects_by_user_id(
         &self,
         user_id: &str,
         service_type: &ServiceType,
     ) -> Vec<Arc<ProjectAndContainerInfo>> {
-        self.projects
-            .iter()
-            .filter(|e| {
-                e.value().user_id() == Some(user_id)
-                    && e.value().service_type().as_ref() == Some(service_type)
-            })
-            .map(|e| e.value().clone())
+        // 先从多值索引取出该 user 的全部 project_id（Ref 在语句结束释放）
+        let project_ids: Vec<String> = match self.user_id_to_project_ids.get(user_id) {
+            Some(set_ref) => set_ref.iter().map(|e| e.key().clone()).collect(),
+            None => return vec![],
+        };
+        // 逐个解析 project，按 service_type 过滤
+        project_ids
+            .into_iter()
+            .filter_map(|pid| self.projects.view(&pid, |_, v| v.clone()))
+            .filter(|p| p.service_type().as_ref() == Some(service_type))
             .collect()
     }
 
@@ -924,7 +922,7 @@ impl std::fmt::Debug for ProjectAdapter {
             .field("containers", &self.containers.len())
             .field("sessions", &self.session_index.len())
             .field("idx_container_id", &self.container_id_to_key.len())
-            .field("idx_user_id", &self.user_id_to_project_id.len())
+            .field("idx_user_id", &self.user_id_to_project_ids.len())
             .field("idx_pod_id", &self.pod_id_to_project_id.len())
             .finish()
     }
@@ -1946,7 +1944,7 @@ mod tests {
             .unwrap();
 
         // 通过 user_id 查找容器
-        let found = adapter.get_container_by_user_id("user-abc");
+        let found = adapter.get_container_by_user_id("user-abc", &ServiceType::ComputerAgentRunner);
         assert!(
             found.is_some(),
             "get_container_by_user_id 应通过索引找到容器"
@@ -1954,15 +1952,17 @@ mod tests {
         assert_eq!(found.unwrap().container_id, "cid-user-1");
 
         // 不存在的 user_id
-        assert!(adapter.get_container_by_user_id("nonexistent").is_none());
+        assert!(adapter
+            .get_container_by_user_id("nonexistent", &ServiceType::ComputerAgentRunner)
+            .is_none());
     }
 
-    /// 回归测试：Web 项目不得污染 user_id_to_project_id 索引
+    /// 回归测试：同 user_id 下不同 ServiceType 项目按 service_type 隔离查找
     ///
     /// 场景：user_id=6 同时存在 Computer（proj-A）和 Web（proj-B）两个业务。
-    /// `pod_ensure` 对两类业务都 `set_user_id`。若 Web 项目也写入 user_id 索引，
-    /// 后插入的 Web 会覆盖 Computer 的索引，导致 `find_by_user_id("6", Computer)`
-    /// 命中 Web 容器 → service_type 不匹配 → None（/computer/ttyd 串用/404）。
+    /// 多值索引 `user_id_to_project_ids` 同时收录两类项目的 project_id（信息完整），
+    /// 查询侧（find_by_user_id / find_projects_by_user_id）按 service_type 过滤，
+    /// 确保不串用、且 Web 项目不计入 Computer 容器的清理决策。
     #[test]
     fn test_user_id_index_not_polluted_by_web_project() {
         use shared_types::ContainerLookup;
@@ -2014,17 +2014,24 @@ mod tests {
             .insert("proj-B".to_string(), Arc::new(web))
             .unwrap();
 
-        // 关键断言 1：user_id 索引仍指向 Computer 项目 proj-A，未被 Web 项目 proj-B 覆盖
+        // 关键断言 1：多值索引 user-6 同时收录两类业务的 project（信息完整）
+        let collected: Vec<String> = adapter
+            .user_id_to_project_ids
+            .get("user-6")
+            .map(|s| s.iter().map(|e| e.key().clone()).collect())
+            .unwrap_or_default();
         assert_eq!(
-            adapter
-                .user_id_to_project_id
-                .get("user-6")
-                .map(|r| r.value().clone()),
-            Some("proj-A".to_string()),
-            "Web 项目不得污染 user_id 索引（find_by_user_id 只服务 Computer 查找）"
+            collected
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            ["proj-A".to_string(), "proj-B".to_string()]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            "多值索引应同时收录 Computer 和 Web 项目（同 user_id）"
         );
 
-        // 关键断言 2：find_by_user_id("6", Computer) → Computer 容器 IP（不串到 Web）
+        // 关键断言 2：find_by_user_id("6", Computer) → Computer 容器 IP（按 service_type 过滤，不串到 Web）
         assert_eq!(
             adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner),
             Some("10.0.0.1".to_string()),
@@ -2046,16 +2053,154 @@ mod tests {
             "find_projects_by_user_id(Web) 应只返回 Web 项目"
         );
 
-        // 关键断言 4：删除 Web 项目不应误删 Computer 的 user_id 索引
+        // 关键断言 4：删除 Web 项目后，user-6 的索引集合应只剩 proj-A（Computer）
         adapter.remove("proj-B");
+        let remaining: Vec<String> = adapter
+            .user_id_to_project_ids
+            .get("user-6")
+            .map(|s| s.iter().map(|e| e.key().clone()).collect())
+            .unwrap_or_default();
         assert_eq!(
-            adapter
-                .user_id_to_project_id
-                .get("user-6")
-                .map(|r| r.value().clone()),
-            Some("proj-A".to_string()),
-            "删除 Web 项目不应误删 Computer 的 user_id 索引"
+            remaining,
+            vec!["proj-A".to_string()],
+            "删除 Web 项目后，user-6 索引集合应只剩 Computer 项目 proj-A"
         );
+        // 且 Computer 查找仍正常
+        assert_eq!(
+            adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner),
+            Some("10.0.0.1".to_string()),
+            "删除 Web 项目后，Computer 查找应仍命中 Computer 容器"
+        );
+    }
+
+    /// 验证 user_id 索引单值限制（诊断用）：
+    /// user 6 有两个 Computer 项目 proj-A/proj-C（共享同一容器，refcount=2）。
+    /// user_id 索引单值，指向最后插入的 proj-C。删除 proj-C 后索引被清，
+    /// 但 proj-A 仍引用容器（refcount=1）——此时 find_by_user_id 应仍能找到容器。
+    #[test]
+    fn test_find_by_user_id_after_indexed_project_removed() {
+        use shared_types::ContainerLookup;
+        let adapter = make_adapter();
+
+        let mk_container = || ContainerBasicInfo {
+            container_id: "cid-shared".to_string(),
+            container_name: "computer-container".to_string(),
+            container_ip: "10.0.0.9".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: String::new(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://shared".to_string(),
+        };
+
+        let mk_proj = |pid: &str| {
+            let mut p = ProjectAndContainerInfo::from_parts(
+                pid.to_string(),
+                Some("user-6".to_string()),
+                None,
+                None,
+                Some(mk_container()),
+                ProjectExtendedFields {
+                    service_type: Some(ServiceType::ComputerAgentRunner),
+                    ..Default::default()
+                },
+            );
+            p.set_service_type(Some(ServiceType::ComputerAgentRunner));
+            p
+        };
+
+        adapter.insert("proj-A".to_string(), Arc::new(mk_proj("proj-A"))).unwrap();
+        adapter.insert("proj-C".to_string(), Arc::new(mk_proj("proj-C"))).unwrap();
+
+        // 两项目共享同一容器条目（container_key=user_id="6"）
+        assert_eq!(adapter.containers.len(), 1, "两个 Computer 项目应共享同一容器条目");
+        assert_eq!(adapter.containers.get("user-6").unwrap().ref_count(), 2);
+
+        // 删除被索引的 proj-C（索引指向最后插入的 proj-C）
+        adapter.remove("proj-C");
+        // 容器仍存活（proj-A 引用，refcount=1）
+        assert_eq!(adapter.containers.len(), 1, "容器应仍存活（proj-A 引用）");
+        assert_eq!(adapter.containers.get("user-6").unwrap().ref_count(), 1);
+
+        // ⚠️ find_by_user_id 此时是否还能找到容器？
+        let result = adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner);
+        eprintln!("DIAG find_by_user_id after removing indexed proj-C = {:?}", result);
+        // 期望：仍能找到（proj-A 引用着容器）。实际受索引单值限制可能为 None。
+        assert_eq!(
+            result,
+            Some("10.0.0.9".to_string()),
+            "删除被索引项目后，user 6 仍有 proj-A 引用容器，find_by_user_id 应能找到"
+        );
+    }
+
+    /// Computer pod_id 共享容器：不同 user 通过同一 pod_id 共享一个容器。
+    /// 验证 container_key=pod_id → 共享容器条目（refcount）+ RAII 正确。
+    #[test]
+    fn test_computer_pod_id_shared_container() {
+        let adapter = make_adapter();
+
+        let shared = ContainerBasicInfo {
+            container_id: "cid-shared-pod".to_string(),
+            container_name: "computer-shared".to_string(),
+            container_ip: "10.0.0.7".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: String::new(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: "http://shared".to_string(),
+        };
+
+        // user-A、user-B 各自一个 Computer 项目，通过 pod_id="pod-shared" 共享容器
+        let mk_proj = |pid: &str, uid: &str| {
+            let mut p = ProjectAndContainerInfo::from_parts(
+                pid.to_string(),
+                Some(uid.to_string()),
+                Some("pod-shared".to_string()),
+                None,
+                Some(shared.clone()),
+                ProjectExtendedFields {
+                    service_type: Some(ServiceType::ComputerAgentRunner),
+                    ..Default::default()
+                },
+            );
+            p.set_service_type(Some(ServiceType::ComputerAgentRunner));
+            p
+        };
+
+        adapter.insert("proj-A".to_string(), Arc::new(mk_proj("proj-A", "user-A"))).unwrap();
+        // container_key = pod_id（Computer 有 pod_id 时），故与 user-B 共享同一容器条目
+        assert_eq!(
+            adapter.get("proj-A").unwrap().container_key(),
+            "pod-shared",
+            "Computer 有 pod_id 时 container_key 应为 pod_id"
+        );
+        adapter.insert("proj-B".to_string(), Arc::new(mk_proj("proj-B", "user-B"))).unwrap();
+
+        // 两个 user 共享同一容器条目（refcount=2）
+        assert_eq!(adapter.containers.len(), 1, "两个 user 应共享同一容器条目");
+        assert_eq!(adapter.containers.get("pod-shared").unwrap().ref_count(), 2);
+
+        // 任一 user 查询都能命中共享容器
+        use shared_types::ContainerLookup;
+        assert_eq!(
+            adapter.find_by_user_id("user-A", &ServiceType::ComputerAgentRunner),
+            Some("10.0.0.7".to_string())
+        );
+        assert_eq!(
+            adapter.find_by_user_id("user-B", &ServiceType::ComputerAgentRunner),
+            Some("10.0.0.7".to_string())
+        );
+
+        // 删除一个 user 的项目：容器仍存活（另一个 user 还在用）
+        adapter.remove("proj-A");
+        assert_eq!(adapter.containers.len(), 1, "容器应仍存活（user-B 还在用）");
+        assert_eq!(adapter.containers.get("pod-shared").unwrap().ref_count(), 1);
+
+        // 删除最后一个：容器销毁
+        adapter.remove("proj-B");
+        assert_eq!(adapter.containers.len(), 0, "最后一个 user 移除后容器应销毁");
     }
 
     #[test]
@@ -2202,14 +2347,14 @@ mod tests {
             .unwrap();
 
         // 索引存在
-        assert!(adapter.user_id_to_project_id.contains_key("user-cleanup"));
+        assert!(adapter.user_id_to_project_ids.contains_key("user-cleanup"));
         assert!(adapter.pod_id_to_project_id.contains_key("pod-cleanup"));
         assert!(adapter.container_id_to_key.contains_key("cid-cleanup"));
 
         // remove 后索引应被清理
         adapter.remove("proj-1");
         assert!(
-            !adapter.user_id_to_project_id.contains_key("user-cleanup"),
+            !adapter.user_id_to_project_ids.contains_key("user-cleanup"),
             "user_id 索引应在 remove 后被清理"
         );
         assert!(
@@ -2258,7 +2403,7 @@ mod tests {
 
         // 索引存在
         assert!(adapter.container_id_to_key.contains_key("cid-del"));
-        assert!(adapter.user_id_to_project_id.contains_key("user-del"));
+        assert!(adapter.user_id_to_project_ids.contains_key("user-del"));
 
         // delete_container_with_projects 清理所有
         // 注意：remove 已通过 RAII 清理了容器（ref_count=0），所以 existed=false
@@ -2272,7 +2417,7 @@ mod tests {
             "container_id_to_key 索引应在 delete_container_with_projects 后被清理"
         );
         assert!(
-            !adapter.user_id_to_project_id.contains_key("user-del"),
+            !adapter.user_id_to_project_ids.contains_key("user-del"),
             "user_id 索引应在 delete_container_with_projects 后被清理"
         );
         assert!(
@@ -2332,7 +2477,7 @@ mod tests {
             "container_id_to_key 索引应在 RAII 清理后被清理"
         );
         assert!(
-            !adapter.user_id_to_project_id.contains_key("user-shared"),
+            !adapter.user_id_to_project_ids.contains_key("user-shared"),
             "user_id 索引应在 remove 后被清理"
         );
     }
@@ -2520,28 +2665,15 @@ mod tests {
 impl shared_types::ContainerLookup for ProjectAdapter {
     /// 根据 user_id 查找容器 IP（ComputerAgentRunner 普通场景）
     ///
-    /// 通过 user_id_to_project_id 索引找到 project_id，
-    /// 然后通过 project_to_container 索引找到 container_key，
-    /// 最后从 containers 中获取 container_ip。
-    ///
-    /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None，
-    /// 避免同一 user_id 下不同 ServiceType 容器互相串用。
+    /// user_id 是 1:N（一个 user 可有多个 project），无法用单值索引精确反查。
+    /// 此处全量扫描（`find_projects_by_user_id`，已按 `service_type` 过滤）取任一
+    /// 匹配 project 的容器 IP——同 user 的 Computer 项目共享同一容器，任取一个即可。
+    /// O(N)，N 为 project 总数（通常很小）。
     fn find_by_user_id(&self, user_id: &str, service_type: &shared_types::ServiceType) -> Option<String> {
-        // 索引链查找：每步 clone 出 key 后立即释放读锁，避免跨 map 同时持锁
-        let project_id = self.user_id_to_project_id.get(user_id)?.value().clone();
-        let container_key = self.project_to_container.get(&project_id)?.value().clone();
-        let entry = self.containers.get(&container_key)?;
-        // 校验 service_type，防止串用
-        if entry.service_type() != *service_type {
-            debug!(
-                "[CONTAINER_LOOKUP] service_type mismatch: expected={:?}, found={:?}, user_id={}",
-                service_type,
-                entry.service_type(),
-                user_id
-            );
-            return None;
-        }
-        Some(entry.info().container_ip.clone())
+        self.find_projects_by_user_id(user_id, service_type)
+            .into_iter()
+            .next()
+            .and_then(|p| p.container().map(|c| c.container_ip.clone()))
     }
 
     /// 根据 project_id 查找容器 IP（WebAgentRunner 普通场景）

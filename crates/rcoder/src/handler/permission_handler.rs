@@ -57,7 +57,9 @@ fn computer_container(
     input: &ResolvePermissionRequestDto,
 ) -> Result<ContainerBasicInfo, AppError> {
     if let Some(user_id) = input.user_id.as_deref().filter(|s| !s.trim().is_empty())
-        && let Some(container) = state.projects.get_container_by_user_id(user_id)
+        && let Some(container) = state
+            .projects
+            .get_container_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
     {
         return Ok(container);
     }
