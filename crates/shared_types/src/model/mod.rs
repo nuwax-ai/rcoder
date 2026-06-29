@@ -23,4 +23,4 @@ pub use computer_agent_model::*;
 pub use health_response::*;
 pub use http_result::*;
 pub use model_provider::{ModelApiProtocol, ModelProviderConfig, ModelProviderSafeInfo};
-pub use pod_types::{PodCountByServiceType, PodCountResponse};
+pub use pod_types::{PodCountByServiceType, PodCountResponse, VncStatusResponse};

@@ -141,6 +141,7 @@ pub use model::{
     SessionPromptStart,
     TextAttachment,
     UnifiedSessionMessage,
+    VncStatusResponse,
 };
 
 // 导出多镜像配置相关类型

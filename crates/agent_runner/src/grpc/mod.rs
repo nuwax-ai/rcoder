@@ -11,7 +11,7 @@ mod permission;
 mod status;
 mod stop_agent;
 mod subscribe_progress;
-mod utils;
+pub(crate) mod utils;
 
 use std::sync::Arc;
 

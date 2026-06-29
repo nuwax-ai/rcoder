@@ -23,7 +23,7 @@ use crate::service::computer_container_manager::ContainerCreateOptions;
 use crate::{AppError, HttpResult};
 use shared_types::{
     ContainerBasicInfo, PodCountByServiceType, PodCountResponse, ProjectAndContainerInfo,
-    ServiceResourceLimits, ServiceType,
+    ServiceResourceLimits, ServiceType, VncStatusResponse,
 };
 
 // ============================================================================
@@ -2317,29 +2317,8 @@ pub struct VncStatusQuery {
     pub service_type: Option<String>,
 }
 
-/// VNC 状态响应
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct VncStatusResponse {
-    /// VNC 是否已就绪
-    #[schema(example = true)]
-    pub vnc_ready: bool,
-
-    /// noVNC 是否已就绪
-    #[schema(example = true)]
-    pub novnc_ready: bool,
-
-    /// 状态描述消息
-    #[schema(example = "VNC 服务已就绪")]
-    pub message: String,
-
-    /// 容器启动时长（秒）
-    #[schema(example = 120)]
-    pub uptime_seconds: i64,
-
-    /// 容器 ID
-    #[schema(example = "abc123def456")]
-    pub container_id: String,
-}
+// VncStatusResponse 已下沉到 shared_types（crates/shared_types/src/model/pod_types.rs），
+// 供 rcoder 与 agent_runner 共享；此处通过 `use shared_types::VncStatusResponse` 引入。
 
 /// 查询容器 VNC 服务状态
 ///
@@ -2474,8 +2453,8 @@ pub async fn pod_vnc_status(
             vnc_ready: false,
             novnc_ready: false,
             message: "Container not running".to_string(),
-            uptime_seconds: 0,
-            container_id: result.container_id,
+            uptime_seconds: Some(0),
+            container_id: Some(result.container_id),
         }));
     }
 
@@ -2509,11 +2488,12 @@ pub async fn pod_vnc_status(
         );
         addr
     } else {
-        let addr = format!("{}:{}", result.container_ip, shared_types::GRPC_DEFAULT_PORT);
-        info!(
-            " [POD_VNC_STATUS] Using container IP for gRPC: {}",
-            addr
+        let addr = format!(
+            "{}:{}",
+            result.container_ip,
+            shared_types::GRPC_DEFAULT_PORT
         );
+        info!(" [POD_VNC_STATUS] Using container IP for gRPC: {}", addr);
         addr
     };
 
@@ -2539,8 +2519,8 @@ pub async fn pod_vnc_status(
                         vnc_ready: resp.vnc_ready,
                         novnc_ready: resp.novnc_ready,
                         message: resp.message,
-                        uptime_seconds: resp.uptime_seconds,
-                        container_id: result.container_id,
+                        uptime_seconds: Some(resp.uptime_seconds),
+                        container_id: Some(result.container_id),
                     }))
                 }
                 Err(e) => {

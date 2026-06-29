@@ -19,6 +19,14 @@ pub const HTTP_DEFAULT_PORT: u16 = 8086;
 /// agent_runner noVNC 服务端口（Web VNC 访问）
 pub const NOVNC_PORT: u16 = 6080;
 
+/// Xvnc RFB 后端端口
+///
+/// 容器内 Xvnc 进程监听的 RFB（Remote Frame Buffer）端口，websockify
+/// （NOVNC_PORT=6080）代理到此端口。VNC 状态探测必须读到该端口返回的
+/// RFB 协议版本串（`RFB 003.00x\n`）才能证明 Xvnc 真在处理连接——
+/// 仅 TCP connect 成功（端口 listen）不能排除 Xvnc 卡死/僵尸。
+pub const XVNC_RFB_PORT: u16 = 5900;
+
 /// ttyd 本体端口（恒为 7681）
 ///
 /// 容器内 ttyd 进程监听端口。computer/web 两种 ttyd 场景下，agent_runner 的 ws 中间层
@@ -69,7 +77,10 @@ pub fn build_k8s_service_fqdn(
     namespace: &str,
     cluster_domain: &str,
 ) -> String {
-    format!("{}-svc.{}.svc.{}", container_name, namespace, cluster_domain)
+    format!(
+        "{}-svc.{}.svc.{}",
+        container_name, namespace, cluster_domain
+    )
 }
 
 /// 构建后端地址

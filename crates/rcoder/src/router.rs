@@ -678,7 +678,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::PodStatusQuery,
             handler::PodStatusResponse,
             handler::VncStatusQuery,
-            handler::VncStatusResponse,
+            shared_types::VncStatusResponse,
             // Pingora 代理相关结构体
             handler::ProxyResponse,
             handler::ProxyStatus,

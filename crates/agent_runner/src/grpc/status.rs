@@ -13,7 +13,7 @@ use crate::router::AppState;
 use crate::service::AGENT_REGISTRY;
 
 use super::locale::locale_from_grpc_request;
-use super::utils::check_port_available;
+use super::utils::probe_vnc_readiness;
 
 #[instrument(skip(_app_state, request))]
 pub async fn get_status(
@@ -136,9 +136,6 @@ pub async fn get_vnc_status(
             req.user_id, req.project_id
         );
 
-        let vnc_ready_file = std::path::Path::new("/tmp/vnc_ready");
-        let file_exists = vnc_ready_file.exists();
-
         let port_check_timeout = app_state
             .config
             .grpc_timeouts
@@ -146,44 +143,28 @@ pub async fn get_vnc_status(
             .map(|t| t.port_check_timeout_millis)
             .unwrap_or(500);
 
-        // 1. 检查端口是否可达
-        let novnc_port_ready = check_port_available(6080, port_check_timeout).await;
-
-        // 2. 🎯 检查 WebSocket 代理是否真正可用（比仅检查端口更可靠）
-        // 端口可达 ≠ WebSocket 代理可用，需要验证 /websockify 路径返回 101
-        let websocket_ready = if novnc_port_ready {
-            super::utils::check_novnc_websocket_ready(6080, port_check_timeout).await
-        } else {
-            false
-        };
-
-        // 3. 综合判断：文件存在 + 端口可达 + WebSocket 可用
-        let vnc_ready = file_exists && novnc_port_ready && websocket_ready;
-        let novnc_ready = file_exists && novnc_port_ready && websocket_ready;
-
-        let message = if vnc_ready && novnc_ready {
-            shared_types_i18n::get_i18n_message("grpc.status.vnc_ready", locale)
-        } else if file_exists && novnc_port_ready && !websocket_ready {
-            // 端口可达但 WebSocket 不可用，代理可能还在启动
-            shared_types_i18n::get_i18n_message("grpc.status.vnc_port_unreachable", locale)
-        } else if file_exists && !novnc_port_ready {
-            shared_types_i18n::get_i18n_message("grpc.status.vnc_port_unreachable", locale)
-        } else {
-            shared_types_i18n::get_i18n_message("grpc.status.vnc_not_ready", locale)
-        };
+        // 复用共享探测逻辑（noVNC 前端层 + Xvnc RFB 后端层 + i18n message），
+        // 与 HTTP `/computer/agent/vnc-status` 保持 vnc_ready/novnc_ready/message 语义一致。
+        let probed = probe_vnc_readiness(port_check_timeout, locale).await;
 
         let uptime_seconds = get_uptime_seconds();
 
         let response = GetVncStatusResponse {
-            vnc_ready,
-            novnc_ready,
-            message: message.clone(),
+            vnc_ready: probed.vnc_ready,
+            novnc_ready: probed.novnc_ready,
+            message: probed.message.clone(),
             uptime_seconds,
         };
 
         info!(
-            "✅ [GET_VNC_STATUS] Returning status: vnc_ready={}, novnc_ready={}, port_ready={}, websocket_ready={}, message={}, uptime={}s",
-            response.vnc_ready, response.novnc_ready, novnc_port_ready, websocket_ready, response.message, response.uptime_seconds
+            "✅ [GET_VNC_STATUS] Returning status: vnc_ready={}, novnc_ready={}, port_ready={}, websocket_ready={}, rfb_ready={}, message={}, uptime={}s",
+            response.vnc_ready,
+            response.novnc_ready,
+            probed.novnc_port_ready,
+            probed.novnc_websocket_ready,
+            probed.rfb_ready,
+            response.message,
+            response.uptime_seconds
         );
 
         Ok(Response::new(response))
