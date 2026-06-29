@@ -113,6 +113,9 @@ async fn handle_conn(stream: tokio::net::TcpStream, peer: SocketAddr) {
         peer, service_type, project_id
     );
 
+    // 计入活跃终端连接：覆盖整个 handle_terminal（含其全部 return 路径），
+    // 函数返回时 guard drop → 计数 -1。GetContainerStatus 据此判定容器在用、拦下空闲清理。
+    let _conn_guard = super::TerminalConnGuard::new();
     proxy::handle_terminal(ws, &service_type, &project_id).await;
 }
 

@@ -192,12 +192,22 @@ pub async fn get_vnc_status(
 }
 
 fn get_active_tasks_count() -> i32 {
-    let count = AGENT_REGISTRY
+    let agent_count = AGENT_REGISTRY
         .iter_agents()
         .filter(|entry| entry.value().status == AgentStatus::Active)
-        .count();
+        .count() as i32;
 
-    count as i32
+    // 终端 WS 连接也算「容器在用」：终端流量本身不计入 agent active task，
+    // 这里把它叠加进 active_tasks，使 idle cleaner 的 gRPC 二次确认能拦下「终端在用」的容器。
+    // （http-server 关闭时 start_ws_terminal 不被启动，无连接被 accept，计数自然为 0。）
+    let terminal_count = crate::ws_terminal::active_terminal_count() as i32;
+
+    debug!(
+        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}",
+        agent_count, terminal_count
+    );
+
+    agent_count + terminal_count
 }
 
 fn get_uptime_seconds() -> i64 {
