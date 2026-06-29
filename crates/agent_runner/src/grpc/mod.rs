@@ -12,6 +12,7 @@ mod status;
 mod stop_agent;
 mod subscribe_progress;
 pub(crate) mod utils;
+pub(crate) mod vnc_probe;
 
 use std::sync::Arc;
 

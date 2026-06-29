@@ -13,7 +13,7 @@ use crate::router::AppState;
 use crate::service::AGENT_REGISTRY;
 
 use super::locale::locale_from_grpc_request;
-use super::utils::probe_vnc_readiness;
+use super::vnc_probe::probe_vnc_readiness;
 
 #[instrument(skip(_app_state, request))]
 pub async fn get_status(

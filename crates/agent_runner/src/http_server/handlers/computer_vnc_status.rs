@@ -5,7 +5,7 @@
 use axum::{Json, extract::State, http::HeaderMap};
 use std::sync::Arc;
 
-use crate::grpc::utils::probe_vnc_readiness;
+use crate::grpc::vnc_probe::probe_vnc_readiness;
 use crate::http_server::router::AppState;
 use shared_types::{AppError, HttpResult, VncStatusResponse};
 
