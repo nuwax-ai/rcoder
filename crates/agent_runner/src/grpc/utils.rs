@@ -106,21 +106,40 @@ pub async fn check_vnc_rfb_ready(port: u16, timeout_millis: u64) -> bool {
 }
 
 async fn check_vnc_rfb_ready_inner(port: u16) -> std::io::Result<bool> {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await?;
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).await?;
 
-    let mut buf = [0u8; RFB_PROTOCOL_VERSION_LEN];
-    // read_exact 要求正好读满 12 字节；Xvnc 健康时一定发 12 字节，
-    // 不足或对端提前断流（UnexpectedEof）会返回 Err → 外层判 false。
-    stream.read_exact(&mut buf).await?;
+    // 1. 读 server 协议版本（12 字节，RFB 是 server-first）
+    let mut ver = [0u8; RFB_PROTOCOL_VERSION_LEN];
+    s.read_exact(&mut ver).await?;
+    if !ver.starts_with(b"RFB ") {
+        return Ok(false);
+    }
 
-    // 主动关闭，不留半连接。忽略关闭错误（对端已 RST 也无所谓）。
-    let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+    // 2. 发 client 协议版本。⚠️ 必须完成完整握手——只读版本串就断开会被
+    //    TigerVNC 计为"安全失败"，累积触发 "Too many security failures" 锁定，
+    //    拒绝前端正常连接（websockify 报 Target closed）。
+    s.write_all(b"RFB 003.003\n").await?;
 
-    // 校验前缀 `RFB `（不校验具体版本号，兼容 003.007/008/009）
-    Ok(buf.starts_with(b"RFB "))
+    // 3. 读 security type（RFB 3.3：4 字节，1=None）
+    let mut sec = [0u8; 4];
+    s.read_exact(&mut sec).await?;
+    if sec != [0, 0, 0, 1] {
+        // 非 None（0=连接被拒/锁定，或需认证）→ Xvnc 不可免密连接
+        return Ok(false);
+    }
+
+    // 4. 发 ClientInit（shared=1）。不发会被计为半握手 → 安全失败。
+    s.write_all(&[0x01]).await?;
+
+    // 5. 读 ServerInit（24 字节）。读到即完整握手成功，Xvnc 视为正常连接，不计安全失败。
+    let mut init = [0u8; 24];
+    s.read_exact(&mut init).await?;
+
+    let _ = s.shutdown().await;
+    Ok(true)
 }
 
 /// VNC 探测结果
@@ -192,15 +211,27 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn rfb_ready_returns_true_on_valid_version_string() {
-        use tokio::io::AsyncWriteExt;
+    async fn rfb_ready_returns_true_on_complete_handshake() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        // 假 Xvnc：完整 RFB 3.3 None 握手（版本→安全None→ClientInit→ServerInit）。
+        // 完整握手不计"安全失败"，避免触发 TigerVNC "Too many security failures" 锁定。
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let _ = sock.write_all(b"RFB 003.008\n").await;
+                let _ = sock.write_all(b"RFB 003.003\n").await; // server 版本
+                let mut cv = [0u8; 12];
+                if sock.read_exact(&mut cv).await.is_err() {
+                    continue;
+                }
+                let _ = sock.write_all(&[0, 0, 0, 1]).await; // security=None
+                let mut ci = [0u8; 1];
+                if sock.read_exact(&mut ci).await.is_err() {
+                    continue;
+                }
+                let _ = sock.write_all(&[0u8; 24]).await; // ServerInit
             }
         });
 

@@ -203,26 +203,10 @@ function wait_for_novnc_ready() {
     done
 }
 
-# 检查 Xvnc 5900 能否完成 RFB 协议握手（单次探测，非轮询）
-#
-# RFB 是 server-first 协议：Xvnc accept 后必须主动发 12 字节版本串 "RFB 003.00x\n"。
-# 读不到 = Xvnc 卡死/僵尸（虽然 accept 成功、listen socket 还在）。
-#
-# 与 wait_for_port（nc -z 只验 TCP 半开）的区别：本函数验应用层协议数据，
-# 是穿透“端口在但服务卡死”盲区的唯一手段——
-# 这正是 websockify 连后端 5900 失败、前端报 Target closed 的根因。
-#
-# 返回值：0=RFB 握手成功, 1=失败/超时
-function check_xvnc_rfb_ready() {
-    local rfb_port="${1:-5900}"
-    local version
-    # nc -w 2：2 秒读写超时（本机 loopback，Xvnc 健康时 RFB 串瞬间到达）
-    # head -c 12：只读前 12 字节（协议版本串长度，避免读到版本串后卡在等客户端响应）
-    # </dev/null：立即给 nc stdin 发 EOF，防止 nc 等待输入而挂起
-    # 卡死的 Xvnc 会 accept 但不发数据，nc -w 2 在 2 秒后超时退出 → 读不到 → 返回 1
-    version=$(nc -w 2 127.0.0.1 "$rfb_port" </dev/null 2>/dev/null | head -c 12 | tr -d '\0')
-    [ -n "$version" ] && echo "$version" | grep -q "^RFB "
-}
+# 注：原 check_xvnc_rfb_ready（nc 连 5900 读 RFB 版本串后断开）已移除——
+# 这种 RFB 半握手会被 TigerVNC 计为"安全失败"，累积触发 "Too many security failures"
+# 锁定，拒绝前端正常连接（websockify 报 Target closed）。
+# Xvnc 卡死/僵尸改由 check_vnc_health 的 xdpyinfo（X11 层，走 X 协议不碰 RFB）检测。
 
 # 等待文件存在，最长等待 $2 秒（默认 5 秒）
 # 用法: wait_for_file "filepath" [timeout_seconds]
@@ -1178,18 +1162,20 @@ function check_vnc_health() {
     # 检查 VNC 服务健康状态 (as root)
     # 返回值：0=健康, 1=noVNC 异常(Xvnc 正常), 2=Xvnc 崩溃/卡死(需要重建整个显示栈)
     #
-    # 五关逐层加强，重点穿透“进程在 + 端口 listen 但服务卡死”盲区：
+    # ⚠️ 禁止连 5900 端口做探测（wait_for_port 5900 / nc / RFB 半握手都不行）：
+    #    TigerVNC 把任何不完整的 RFB 连接计为"安全失败"，累积后触发
+    #    "Too many security failures" 锁定，拒绝前端正常连接（websockify 报 Target closed）。
+    #    改用 xdpyinfo（X11 层）检测卡死——它走 X 协议、不碰 RFB，不会触发该锁定。
+    #
+    # 三关：
     #   ① Xvnc 进程存活且非僵尸(Z)/非卡死(D)
-    #   ② 5900 端口可达
-    #   ③ 5900 RFB 应用层握手（核心：websockify 报 Target closed 的根因）
-    #   ④ X11 display 层验证
-    #   ⑤ noVNC 前端 WebSocket 握手
+    #   ② X11 display 层验证（xdpyinfo，检测事件循环卡死）
+    #   ③ noVNC 前端 WebSocket 握手
     if [ "$VNC_AUTO_START" != "true" ]; then
         return 0
     fi
 
     # ① Xvnc 进程存活且非僵尸(Z)/非卡死(D 状态=不可中断睡眠)
-    #    pgrep -x 按精确进程名匹配；僵尸进程仍在进程表，需用 ps stat 排除
     local xvnc_pid xvnc_stat
     xvnc_pid=$(pgrep -x "Xvnc" | head -1)
     if [ -z "$xvnc_pid" ]; then
@@ -1216,30 +1202,14 @@ function check_vnc_health() {
             ;;
     esac
 
-    # ② 5900 端口可达（nc -z TCP 半开探测）
-    if ! wait_for_port localhost 5900 3; then
-        log_warn "check_vnc_health: Xvnc alive (pid=$xvnc_pid) but 5900 not listening"
-        rm -f /tmp/vnc_ready
-        return 2
-    fi
-
-    # ③ 5900 RFB 应用层握手（核心：针对本次 bug）
-    #    accept 成功但读不到 RFB 版本串 = Xvnc 卡死/僵尸
-    if ! check_xvnc_rfb_ready; then
-        log_error "check_vnc_health: Xvnc pid $xvnc_pid accepts 5900 but does NOT speak RFB (frozen/hung)"
-        rm -f /tmp/vnc_ready
-        return 2
-    fi
-
-    # ④ X11 display 层验证（补充保险：RFB ok 但 X 协议层也可能单独卡死）
+    # ② X11 display 层验证（检测 Xvnc 事件循环卡死；走 X 协议，不碰 RFB/5900）
     if ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; then
-        log_error "check_vnc_health: Xvnc RFB ok but xdpyinfo fails (X11 display frozen)"
+        log_error "check_vnc_health: Xvnc pid $xvnc_pid X11 display frozen (xdpyinfo fails)"
         rm -f /tmp/vnc_ready
         return 2
     fi
 
-    # ⑤ noVNC 前端代理：从 netstat|grep 升级为真 WebSocket 握手
-    #    旧 netstat 只看 listen socket，websockify 卡死也通过；wait_for_novnc_ready 验真 WS 升级
+    # ③ noVNC 前端代理：从 netstat|grep 升级为真 WebSocket 握手
     if ! wait_for_novnc_ready 5; then
         log_warn "check_vnc_health: Xvnc healthy but noVNC WebSocket proxy down"
         rm -f /tmp/vnc_ready
