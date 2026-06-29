@@ -788,7 +788,7 @@ RCoder AI 服务 API
 "#,
         title = "RCoder AI API",
         version = "1.0.0",
-        license(name = "MIT OR Apache-2.0", url = "https://opensource.org/licenses/MIT"),
+        license(name = "Apache-2.0", url = "https://www.apache.org/licenses/LICENSE-2.0"),
         contact(
             name = "RCoder Team",
             email = "team@rcoder.com",

@@ -37,16 +37,16 @@ chrono = { workspace = true }
 
 # Utilities
 dashmap = { workspace = true }
-moka = { version = "0.12", features = ["future"] }
+moka = { workspace = true, features = ["future"] }
 
 # Shared types
-shared_types = { path = "../shared_types" }
+shared_types = { workspace = true }
 
 # gRPC client (for health checks)
 tonic = { workspace = true }
 
 # Runtime API (always needed)
-container-runtime-api = { path = "../container-runtime-api" }
+container-runtime-api = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }

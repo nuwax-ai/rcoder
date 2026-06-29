@@ -45,4 +45,4 @@ matchit = { workspace = true }
 moka = { workspace = true }
 
 # Shared types
-shared_types = { path = "../shared_types" }
+shared_types = { workspace = true }

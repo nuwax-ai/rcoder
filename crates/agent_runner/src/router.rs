@@ -147,7 +147,7 @@ agent_runner 主要通过 gRPC 提供服务：
 "#,
         title = "RCoder AI API",
         version = "2.0.0",
-        license(name = "MIT OR Apache-2.0", url = "https://opensource.org/licenses/MIT"),
+        license(name = "Apache-2.0", url = "https://www.apache.org/licenses/LICENSE-2.0"),
         contact(
             name = "RCoder Team",
             email = "team@rcoder.com",

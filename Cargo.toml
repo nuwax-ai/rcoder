@@ -27,7 +27,7 @@ rust.variant_size_differences = "warn"
 version = "0.1.2"
 edition = "2024"
 authors = ["soddy <soddygo@qq.com>"]
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 description = "Rust-based AI agent framework"
 homepage = "https://github.com/nuwax-ai/rcoder"
 repository = "https://github.com/nuwax-ai/rcoder"
@@ -35,10 +35,10 @@ publish = false
 
 [workspace.dependencies]
 # ACP Protocol - 官方 SDK（完全 Send-safe，无需 LocalSet）
-agent-client-protocol = { version = "0.15" }
+agent-client-protocol = { version = "1.0" }
 
 # MCP 协议 - rmcp 官方库
-rmcp = { version = "1.7"}
+rmcp = { version = "1.8"}
 
 piper = "0.2"
 
@@ -47,7 +47,10 @@ clap = { version = "4.6", features = ["derive", "env"] }
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
 async-trait = "0.1"
+pin-project-lite = "0.2"
 
 # HTTP server
 axum = { version = "0.8", features = [
@@ -60,19 +63,30 @@ axum = { version = "0.8", features = [
 ] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace", "set-header"] }
+hyper = { version = "1.8", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 tonic = { version = "0.14.6", features = ["tls-native-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tonic-prost-build = "0.14"
 http = "1.4"
 http-body = "1.0"
 http-body-util = "0.1"
 
 # WebSocket（终端中间层：接浏览器 + 连本地 ttyd）
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.29"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
+serde_yaml = "=0.9.33"
+serde_urlencoded = "0.7"
 schemars = { version = "1.2", features = ["derive"] }
 config = "0.15"
+
+# Validation
+garde = { version = "0.22.1", features = ["derive"] }
 
 # Error handling
 anyhow = "1.0"
@@ -83,7 +97,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
-# OpenTelemetry (统一使用 0.30 以兼容 tracing-opentelemetry)
+# OpenTelemetry
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", features = [
@@ -117,6 +131,10 @@ futures-util = "0.3"
 itertools = "0.15"
 bytes = "1.12"
 arrayvec = "0.7"
+arc-swap = "1.9"
+md5 = "0.8"
+process-wrap = { version = "9.0", features = ["tokio1", "process-group", "job-object"] }
+windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
 url = { version = "2.5", features = ["serde"] }
 
@@ -159,7 +177,7 @@ reqwest = { version = "0.13", features = ["json", "stream"] }
 # 项目依赖 - 保留核心功能
 aho-corasick = "1.1"
 base64 = "0.22"
-circular-buffer = "1.2"
+circular-buffer = "2.0"
 fancy-regex = "0.18"
 fuzzy = "0.0.1"
 globset = "0.4"
@@ -182,6 +200,7 @@ which = "8.0"
 ctor = "1.0.7"
 pretty_assertions = "1.4"
 tempfile = "3.24"
+filetime = "0.2"
 rand = "0.10"
 tokio-test = "0.4"
 expect-test = "1.5"
@@ -192,7 +211,7 @@ dirs = "6.0"
 # Archive utilities
 flate2 = "1.1"
 tar = "0.4"
-zip = "8.6"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 utoipa = { version = "5.4", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
@@ -227,6 +246,15 @@ rust-i18n = "4"
 
 # Internal crates
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }
+shared_types = { path = "crates/shared_types" }
+shared_types_grpc = { path = "crates/shared_types_grpc" }
+shared_types_i18n = { path = "crates/shared_types_i18n" }
+agent_config = { path = "crates/agent_config" }
+agent_abstraction = { path = "crates/agent_abstraction" }
+docker_manager = { path = "crates/docker_manager" }
+rcoder-proxy = { path = "crates/rcoder-proxy" }
+container-runtime-api = { path = "crates/container-runtime-api" }
+download_utils = { path = "crates/download_utils" }
 
 # Pyroscope Continuous Profiling
 pyroscope = { version = "2.0", features = ["backend-pprof-rs"] }

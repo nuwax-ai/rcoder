@@ -30,34 +30,34 @@ ebpf-debug = ["docker_manager/ebpf-debug"]
 kubernetes = ["docker_manager/kubernetes", "shared_types/kubernetes", "kube", "k8s-openapi"]
 
 [dev-dependencies]
-filetime = "0.2"
+filetime = { workspace = true }
 
 [dependencies]
 # Internal crates
-shared_types = { path = "../shared_types" }
-rcoder-proxy = { path = "../rcoder-proxy" }
-container-runtime-api = { path = "../container-runtime-api" }
-download_utils = { path = "../download_utils" }
+shared_types = { workspace = true }
+rcoder-proxy = { workspace = true }
+container-runtime-api = { workspace = true }
+download_utils = { workspace = true }
 
 # 🚀 无锁配置热更新
-arc-swap = "1.8"
-docker_manager = { path = "../docker_manager" }
+arc-swap = { workspace = true }
+docker_manager = { workspace = true }
 rcoder-telemetry = { workspace = true }
 
 clap = { workspace = true }
-async-trait = "0.1"
-parking_lot = "0.12"
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
 tempfile = { workspace = true }
 
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace", "set-header", "limit"] }
-hyper = { version = "1.8", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 futures = { workspace = true }
-tokio-stream = "0.1"
-async-stream = "0.3"
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
 
 # gRPC Client
 tonic = { workspace = true }
@@ -65,11 +65,11 @@ tonic = { workspace = true }
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_yaml = "=0.9.33"
-serde_urlencoded = "0.7"
+serde_yaml = { workspace = true }
+serde_urlencoded = { workspace = true }
 
 # Validation
-garde = { version = "0.22.1", features = ["derive"] }
+garde = { workspace = true }
 regex = { workspace = true }
 
 # Parsing
@@ -88,14 +88,14 @@ tracing-subscriber = { workspace = true, features = [
     "env-filter",
     "json",
 ] }
-tracing-appender = "0.2"
+tracing-appender = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 dashmap = { workspace = true }
 notify = { workspace = true }
-bytes = "1.0"
+bytes = { workspace = true }
 futures-util = { workspace = true }
-piper = "0.2"
+piper = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
@@ -120,7 +120,7 @@ ringbuf = { workspace = true }
 
 # Random and hashing
 rand = { workspace = true }
-md5 = "0.8"
+md5 = { workspace = true }
 
 # Cache
 moka = { workspace = true }
