@@ -98,7 +98,11 @@ async fn ensure_container_exists(
     container_identifier: &str,
 ) -> Result<ContainerBasicInfo, AppError> {
     // 1. 尝试获取现有容器（使用 container_identifier 查找）
-    if let Ok(Some(info)) = options.runtime.get_container_info(container_identifier).await {
+    if let Ok(Some(info)) = options
+        .runtime
+        .get_container_info(container_identifier)
+        .await
+    {
         info!(
             "[CONTAINER_MGR] container already exists: container_identifier={}, container_id={}",
             container_identifier, info.container_id
@@ -165,13 +169,17 @@ async fn create_container_for_request(
 
     let params = params_builder.build();
 
-    let container_info = options.runtime.create_container(params).await.map_err(|e| {
-        error!("[CONTAINER_MGR] Failed to start container: {}", e);
-        AppError::with_message(
-            ERR_CONTAINER_ERROR,
-            format!("Failed to start container: {}", e),
-        )
-    })?;
+    let container_info = options
+        .runtime
+        .create_container(params)
+        .await
+        .map_err(|e| {
+            error!("[CONTAINER_MGR] Failed to start container: {}", e);
+            AppError::with_message(
+                ERR_CONTAINER_ERROR,
+                format!("Failed to start container: {}", e),
+            )
+        })?;
 
     info!(
         "🚀 [CONTAINER_MGR] Container created successfully: container_identifier={}, container_id={}, ip={}",

@@ -26,9 +26,9 @@ use axum::{
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
+use shared_types::NOVNC_PORT;
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
-use shared_types::NOVNC_PORT;
 use utoipa::ToSchema;
 
 use super::utils::I18nPath;

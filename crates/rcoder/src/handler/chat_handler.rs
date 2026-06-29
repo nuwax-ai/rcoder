@@ -12,9 +12,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 
-use super::utils::{
-    I18nJsonOrQuery, build_workspace_path, get_locale_from_headers,
-};
+use super::utils::{I18nJsonOrQuery, build_workspace_path, get_locale_from_headers};
 
 /// 转发请求的上下文参数
 ///
@@ -259,8 +257,10 @@ pub async fn handle_chat(
         runtime: state.runtime(),
     };
     let container_info =
-        crate::service::container_manager::ContainerManager::get_or_create_container(container_options)
-            .await?;
+        crate::service::container_manager::ContainerManager::get_or_create_container(
+            container_options,
+        )
+        .await?;
 
     // 第二步：获取或创建 ProjectAndContainerInfo - 使用 存储
     let _ = {
@@ -483,12 +483,8 @@ pub async fn handle_chat(
         computer_prefix: &state.container_prefix_computer,
         locale,
     };
-    let result = forward_request_to_container_service(
-        &request_for_forward,
-        &container_info,
-        &ctx,
-    )
-    .await;
+    let result =
+        forward_request_to_container_service(&request_for_forward, &container_info, &ctx).await;
     info!(
         "[CHAT] Container request completed: success={}",
         result.is_ok()
@@ -580,22 +576,17 @@ async fn forward_request_to_container_service(
     // - Docker 环境：使用容器 IP（直接连接）
     let container_name = container_info.container_name.clone();
     let grpc_addr = if shared_types::is_kubernetes_runtime() {
-        let addr = super::utils::build_k8s_grpc_addr(
-            &container_name,
-            ctx.namespace,
-            ctx.cluster_domain,
-        );
-        debug!(
-            "📡 [FORWARD] Using K8s Service FQDN for gRPC: {}",
-            addr
-        );
+        let addr =
+            super::utils::build_k8s_grpc_addr(&container_name, ctx.namespace, ctx.cluster_domain);
+        debug!("📡 [FORWARD] Using K8s Service FQDN for gRPC: {}", addr);
         addr
     } else {
-        let addr = format!("{}:{}", container_info.container_ip, shared_types::GRPC_DEFAULT_PORT);
-        debug!(
-            "📡 [FORWARD] Using container IP for gRPC: {}",
-            addr
+        let addr = format!(
+            "{}:{}",
+            container_info.container_ip,
+            shared_types::GRPC_DEFAULT_PORT
         );
+        debug!("📡 [FORWARD] Using container IP for gRPC: {}", addr);
         addr
     };
 
@@ -631,8 +622,7 @@ async fn forward_request_to_container_service(
             agent_work_dir: request.agent_work_dir.clone(),
         };
 
-        match crate::grpc::grpc_chat_with_pool(ctx.grpc_pool, &grpc_addr, params).await
-        {
+        match crate::grpc::grpc_chat_with_pool(ctx.grpc_pool, &grpc_addr, params).await {
             Ok(grpc_response) => {
                 if grpc_response.success {
                     // 转换为内部 ChatResponse

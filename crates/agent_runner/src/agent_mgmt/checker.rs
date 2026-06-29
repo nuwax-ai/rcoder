@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use shared_types::{BUILTIN_AGENT_IDS, AgentDetailInfo, AgentInstallStatus, InstallType, StaticCheckResult};
+use shared_types::{
+    AgentDetailInfo, AgentInstallStatus, BUILTIN_AGENT_IDS, InstallType, StaticCheckResult,
+};
 use tracing::info;
 
 use crate::agent_mgmt::installer::AgentManifest;
@@ -34,10 +36,7 @@ pub async fn init_builtin_agent_versions() {
     for agent in BUILTIN_AGENT_IDS {
         if let Some(version) = detect_agent_version(agent).await {
             cache.insert(agent.to_string(), version.clone());
-            info!(
-                "📦 [VERSION_CACHE] Cached {} version: {}",
-                agent, version
-            );
+            info!("📦 [VERSION_CACHE] Cached {} version: {}", agent, version);
         }
     }
 

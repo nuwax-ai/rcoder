@@ -21,7 +21,8 @@ pub async fn health_check() -> Json<HttpResult<shared_types::HealthCheckResponse
     // RCoder 主服务没有 gRPC 服务，所以 grpc_ready 为 true
     let grpc_ready = true;
 
-    let health_response = shared_types::HealthCheckResponse::new("rcoder-ai-service", http_ready, grpc_ready);
+    let health_response =
+        shared_types::HealthCheckResponse::new("rcoder-ai-service", http_ready, grpc_ready);
 
     Json(HttpResult::success(health_response))
 }

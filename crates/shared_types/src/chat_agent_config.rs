@@ -116,9 +116,7 @@ pub struct AutoReloadConfig {
 
 impl Default for AutoReloadConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-        }
+        Self { enabled: true }
     }
 }
 
@@ -130,9 +128,7 @@ impl AutoReloadConfig {
 
     /// 创建一个禁用的配置
     pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-        }
+        Self { enabled: false }
     }
 }
 

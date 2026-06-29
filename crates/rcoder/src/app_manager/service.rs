@@ -740,7 +740,9 @@ impl AppService {
                 http: http_port.map(|_| {
                     format!(
                         "http://{}:{}/apps/{}",
-                        self.config.get_node_ip(), self.config.get_gateway_node_port(), app_id
+                        self.config.get_node_ip(),
+                        self.config.get_gateway_node_port(),
+                        app_id
                     )
                 }),
                 tcp: tcp_ports,

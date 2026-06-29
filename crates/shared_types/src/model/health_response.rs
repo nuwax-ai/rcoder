@@ -64,7 +64,11 @@ impl HealthCheckResponse {
     /// 创建健康检查详细响应
     pub fn new(service: impl Into<String>, http_ready: bool, grpc_ready: bool) -> Self {
         Self {
-            status: if grpc_ready { "healthy".to_string() } else { "starting".to_string() },
+            status: if grpc_ready {
+                "healthy".to_string()
+            } else {
+                "starting".to_string()
+            },
             timestamp: Utc::now(),
             service: service.into(),
             http_ready,

@@ -71,7 +71,10 @@ fn create_idle_end_event(session_id: &str) -> Event {
             session_id, e
         );
         // 降级处理：返回最简 JSON
-        format!(r#"{{"sessionId":"{}","messageType":"sessionPromptEnd","subType":"end_turn"}}"#, session_id)
+        format!(
+            r#"{{"sessionId":"{}","messageType":"sessionPromptEnd","subType":"end_turn"}}"#,
+            session_id
+        )
     });
 
     Event::default().event("end_turn").data(json_data)
@@ -99,7 +102,10 @@ fn create_agent_not_found_event(session_id: &str) -> Event {
             session_id, e
         );
         // 降级处理：返回最简 JSON
-        format!(r#"{{"sessionId":"{}","messageType":"sessionPromptEnd","subType":"end_turn"}}"#, session_id)
+        format!(
+            r#"{{"sessionId":"{}","messageType":"sessionPromptEnd","subType":"end_turn"}}"#,
+            session_id
+        )
     });
 
     Event::default().event("end_turn").data(json_data)

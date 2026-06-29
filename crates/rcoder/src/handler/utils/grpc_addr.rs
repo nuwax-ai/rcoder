@@ -22,7 +22,10 @@ pub fn build_k8s_service_fqdn(
     namespace: &str,
     cluster_domain: &str,
 ) -> String {
-    format!("{}-svc.{}.svc.{}", container_name, namespace, cluster_domain)
+    format!(
+        "{}-svc.{}.svc.{}",
+        container_name, namespace, cluster_domain
+    )
 }
 
 /// 构建 gRPC 地址（K8s Service FQDN）
@@ -34,11 +37,7 @@ pub fn build_k8s_service_fqdn(
 ///
 /// # 返回
 /// gRPC 地址，格式如 `container-svc.namespace.svc.cluster.local:50051`
-pub fn build_k8s_grpc_addr(
-    container_name: &str,
-    namespace: &str,
-    cluster_domain: &str,
-) -> String {
+pub fn build_k8s_grpc_addr(container_name: &str, namespace: &str, cluster_domain: &str) -> String {
     let fqdn = build_k8s_service_fqdn(container_name, namespace, cluster_domain);
     format!("{}:{}", fqdn, GRPC_DEFAULT_PORT)
 }

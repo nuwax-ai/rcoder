@@ -127,7 +127,10 @@ async fn main() -> anyhow::Result<()> {
 
     // 非阻塞打印外部工具版本（不阻塞启动流程）
     spawn_tool_version_log("nuwaxcode", &["nuwaxcode", "-v"]);
-    spawn_tool_version_log(shared_types::DEFAULT_AGENT_ID, &[shared_types::DEFAULT_AGENT_ID, "-v"]);
+    spawn_tool_version_log(
+        shared_types::DEFAULT_AGENT_ID,
+        &[shared_types::DEFAULT_AGENT_ID, "-v"],
+    );
 
     // 异步初始化内置 agent 版本缓存（不阻塞主流程）
     tokio::spawn(async {
@@ -412,7 +415,8 @@ async fn main() -> anyhow::Result<()> {
             use axum::{Json, Router, routing::get};
             use handler::health_handler::{build_health_response, check_grpc_port_simple};
 
-            async fn health_check() -> Json<shared_types::HttpResult<shared_types::HealthCheckResponse>> {
+            async fn health_check()
+            -> Json<shared_types::HttpResult<shared_types::HealthCheckResponse>> {
                 // HTTP 服务：本端点正常响应即表示就绪
                 let http_ready = true;
 
@@ -420,7 +424,11 @@ async fn main() -> anyhow::Result<()> {
                 let grpc_ready = check_grpc_port_simple().await;
 
                 // 使用统一的健康检查响应构建函数
-                Json(build_health_response("agent-runner", http_ready, grpc_ready))
+                Json(build_health_response(
+                    "agent-runner",
+                    http_ready,
+                    grpc_ready,
+                ))
             }
 
             let app = Router::new().route("/health", get(health_check));

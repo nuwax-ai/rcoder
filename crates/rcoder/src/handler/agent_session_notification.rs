@@ -637,7 +637,8 @@ async fn validate_and_get_session_context(
     let project_id = project_info.project_id().to_string();
 
     // 获取 container_ip（Docker 环境需要）
-    let container_ip = project_info.container_info()
+    let container_ip = project_info
+        .container_info()
         .map(|c| c.container_ip.clone())
         .unwrap_or_default();
 
@@ -693,17 +694,15 @@ async fn build_sse_stream_from_container_name(
             &params.namespace,
             &params.cluster_domain,
         );
-        debug!(
-            "📡 [SSE] Using K8s Service FQDN for gRPC: {}",
-            svc_fqdn
-        );
+        debug!("📡 [SSE] Using K8s Service FQDN for gRPC: {}", svc_fqdn);
         format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
     } else {
-        let addr = format!("{}:{}", params.container_ip, shared_types::GRPC_DEFAULT_PORT);
-        debug!(
-            "📡 [SSE] Using container IP for gRPC: {}",
-            addr
+        let addr = format!(
+            "{}:{}",
+            params.container_ip,
+            shared_types::GRPC_DEFAULT_PORT
         );
+        debug!("📡 [SSE] Using container IP for gRPC: {}", addr);
         addr
     };
     info!(
@@ -1084,10 +1083,7 @@ async fn create_sse_proxy_stream(
         {
             Ok(response) => {
                 if response.status().is_success() {
-                    info!(
-                        " [SSE_PROXY] 成功连接到容器SSE: session_id={}",
-                        session_id
-                    );
+                    info!(" [SSE_PROXY] 成功连接到容器SSE: session_id={}", session_id);
 
                     let mut stream = response.bytes_stream();
                     let mut buffer = Vec::new();

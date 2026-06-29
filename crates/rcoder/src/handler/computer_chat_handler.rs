@@ -392,7 +392,7 @@ pub(crate) async fn handle_computer_chat_internal(
         }
         let options = crate::service::computer_container_manager::ContainerCreateOptions {
             user_id: user_id.clone(),
-            project_id: user_id.clone(),  // ComputerAgentRunner 使用 user_id 作为 project_id
+            project_id: user_id.clone(), // ComputerAgentRunner 使用 user_id 作为 project_id
             resource_limits: request
                 .agent_config
                 .as_ref()
@@ -403,18 +403,15 @@ pub(crate) async fn handle_computer_chat_internal(
             space_id: request.space_id.clone(),
             service_type: shared_types::ServiceType::ComputerAgentRunner,
         };
-        ComputerContainerManager::force_create_container_for_user(
-            &options,
-            state.runtime(),
-        )
-        .await
-        .map_err(|e| {
-            error!("[COMPUTER_CHAT] Force recreate container failed: {}", e);
-            AppError::with_message(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                format!("Container recreation failed: {}", e),
-            )
-        })?
+        ComputerContainerManager::force_create_container_for_user(&options, state.runtime())
+            .await
+            .map_err(|e| {
+                error!("[COMPUTER_CHAT] Force recreate container failed: {}", e);
+                AppError::with_message(
+                    shared_types::error_codes::ERR_CONTAINER_ERROR,
+                    format!("Container recreation failed: {}", e),
+                )
+            })?
     } else {
         container_info
     };
@@ -585,7 +582,11 @@ pub(crate) async fn handle_computer_chat_internal(
                 );
                 format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
             } else {
-                format!("{}:{}", container_info.container_ip, shared_types::GRPC_DEFAULT_PORT)
+                format!(
+                    "{}:{}",
+                    container_info.container_ip,
+                    shared_types::GRPC_DEFAULT_PORT
+                )
             };
 
             Ok::<_, String>(addr)
@@ -886,7 +887,11 @@ async fn forward_computer_request_to_container(
         );
         addr
     } else {
-        let addr = format!("{}:{}", params.container_info.container_ip, shared_types::GRPC_DEFAULT_PORT);
+        let addr = format!(
+            "{}:{}",
+            params.container_info.container_ip,
+            shared_types::GRPC_DEFAULT_PORT
+        );
         debug!(
             "📡 [COMPUTER_FORWARD] Using container IP for gRPC: {}",
             addr
@@ -944,8 +949,7 @@ async fn forward_computer_request_to_container(
             agent_work_dir: params.request.agent_work_dir.clone(),
         };
 
-        match crate::grpc::grpc_chat_with_pool(params.grpc_pool, &grpc_addr, grpc_params).await
-        {
+        match crate::grpc::grpc_chat_with_pool(params.grpc_pool, &grpc_addr, grpc_params).await {
             Ok(grpc_response) => {
                 if grpc_response.success {
                     let chat_response = crate::grpc::grpc_response_to_chat_response(grpc_response);

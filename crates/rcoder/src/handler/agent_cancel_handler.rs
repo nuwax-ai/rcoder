@@ -91,10 +91,9 @@ async fn get_container_for_cancel(
         }
         CancelIdentifier::User(user_id) => {
             // ComputerAgentRunner 模式：通过 user_id 查询容器
-            state.projects.get_container_by_user_id(
-                user_id,
-                &shared_types::ServiceType::ComputerAgentRunner,
-            )
+            state
+                .projects
+                .get_container_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
         }
         CancelIdentifier::Pod(pod_id) => {
             // 共享容器模式：通过 pod_id 查询容器
@@ -147,7 +146,8 @@ struct CancelForwardParams<'a> {
 async fn forward_cancel_request_to_container_service(
     params: CancelForwardParams<'_>,
 ) -> Result<HttpResult<AgentCancelResponse>, AppError> {
-    let session_id_display = params.session_id
+    let session_id_display = params
+        .session_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| "None".to_string());
     info!(

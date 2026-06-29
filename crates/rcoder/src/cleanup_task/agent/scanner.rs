@@ -135,10 +135,7 @@ impl AgentScanner {
                 status,
                 Some(AgentStatus::Active) | Some(AgentStatus::Pending)
             ) {
-                debug!(
-                    " [scanner] Not timeout, status active, skip: {:?}",
-                    status
-                );
+                debug!(" [scanner] Not timeout, status active, skip: {:?}", status);
                 return false;
             }
             return false;

@@ -36,7 +36,8 @@ impl Default for AppManagerConfig {
         Self {
             enabled: true,
             workspace_root: std::env::var("RCODER_WORKSPACE_ROOT").ok(),
-            namespace: std::env::var("RCODER_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string()),
+            namespace: std::env::var("RCODER_K8S_NAMESPACE")
+                .unwrap_or_else(|_| "default".to_string()),
             gateway_name: std::env::var("RCODER_K8S_GATEWAY_NAME").ok(),
             gateway_namespace: std::env::var("RCODER_K8S_GATEWAY_NAMESPACE").ok(),
             node_ip: std::env::var("RCODER_K8S_NODE_IP").ok(),
@@ -62,17 +63,23 @@ impl AppManagerConfig {
 
     /// 获取节点 IP
     pub fn get_node_ip(&self) -> String {
-        self.node_ip.clone().unwrap_or_else(|| "127.0.0.1".to_string())
+        self.node_ip
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string())
     }
 
     /// 获取 Gateway 名称
     pub fn get_gateway_name(&self) -> String {
-        self.gateway_name.clone().unwrap_or_else(|| "nuwax-gateway".to_string())
+        self.gateway_name
+            .clone()
+            .unwrap_or_else(|| "nuwax-gateway".to_string())
     }
 
     /// 获取 Gateway 命名空间
     pub fn get_gateway_namespace(&self) -> String {
-        self.gateway_namespace.clone().unwrap_or_else(|| "default".to_string())
+        self.gateway_namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string())
     }
 
     /// 获取 Gateway NodePort

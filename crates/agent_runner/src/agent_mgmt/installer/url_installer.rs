@@ -157,7 +157,8 @@ pub async fn install_with_version_check(
     validate_version_format(params.version)?;
 
     // 0.5 获取 per-agent-version 安装锁
-    let state = params.lock_manager
+    let state = params
+        .lock_manager
         .get_or_create(params.agent_id, params.version)
         .ok_or_else(|| {
             AgentMgmtError::InvalidVersion(format!("invalid semver version: {}", params.version))
@@ -178,7 +179,8 @@ pub async fn install_with_version_check(
                     "[agent_mgmt] install in progress: agent_id={}, version={:?}, requested={}",
                     params.agent_id, current_version, params.version
                 );
-                let mut resp = make_in_progress_response(params.agent_id, current_version.as_deref());
+                let mut resp =
+                    make_in_progress_response(params.agent_id, current_version.as_deref());
                 resp.previous_version = params.version.to_string();
                 return Ok(resp);
             }
@@ -216,8 +218,14 @@ async fn do_install_with_version_check(
     use crate::agent_mgmt::registry::normalize_platform_key;
 
     // 1. 版本检查：检查特定版本是否已安装（精确匹配）
-    if params.registry.contains_version(params.agent_id, params.version) {
-        let manifest = params.registry.get_version(params.agent_id, params.version).unwrap();
+    if params
+        .registry
+        .contains_version(params.agent_id, params.version)
+    {
+        let manifest = params
+            .registry
+            .get_version(params.agent_id, params.version)
+            .unwrap();
         let mut resp = make_skip_response(&manifest);
         resp.previous_version = params.version.to_string();
         return Ok(resp);
@@ -260,7 +268,8 @@ async fn do_install_with_version_check(
 
     // 4. 下载到临时文件(支持重试 + 断点续传)
     let expected_sha256 = entry.sha256.as_deref().filter(|s| !s.is_empty());
-    let staging_path = params.path_manager
+    let staging_path = params
+        .path_manager
         .install_dir()
         .join(format!(".download-staging-{}", uuid::Uuid::new_v4()));
     download_to_file(

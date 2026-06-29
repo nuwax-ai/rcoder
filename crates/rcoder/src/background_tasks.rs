@@ -9,8 +9,8 @@ use crate::cleanup_task;
 use crate::config::AppConfig;
 use crate::router::AppState;
 use crate::service::{
-    ContainerStatusCheckerConfig, ContainerSyncConfig,
-    start_container_status_checker, start_container_sync_task,
+    ContainerStatusCheckerConfig, ContainerSyncConfig, start_container_status_checker,
+    start_container_sync_task,
 };
 
 #[allow(dead_code)]

@@ -193,9 +193,9 @@ impl AgentMgmtService for AgentMgmtServiceImpl {
                             force,
                         };
                         return url_installer::install_with_version_check(params)
-                        .await
-                        .map_err(Self::to_status)
-                        .map(Response::new);
+                            .await
+                            .map_err(Self::to_status)
+                            .map(Response::new);
                     }
                 }
                 // 旧模式: 单个 source_url

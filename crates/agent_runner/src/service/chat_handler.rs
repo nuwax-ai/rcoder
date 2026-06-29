@@ -518,8 +518,8 @@ pub async fn handle_chat_core(
                     error_message: Some("Auto-reload: restarting agent".into()),
                     request_id: None,
                 });
-                let _ = push_session_update_with_project(&project_id, &old_session_id, notify)
-                    .await;
+                let _ =
+                    push_session_update_with_project(&project_id, &old_session_id, notify).await;
 
                 // view() 在闭包返回后立即释放锁，无 Ref 暴露
                 if let Some(sd) = SESSION_CACHE.view(&old_session_id, |_, d| d.clone()) {

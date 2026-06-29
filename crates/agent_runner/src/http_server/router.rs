@@ -224,7 +224,11 @@ pub async fn health_check() -> Json<shared_types::HttpResult<shared_types::Healt
     let grpc_ready = check_grpc_port_simple().await;
 
     // 使用统一的健康检查响应构建函数
-    Json(build_health_response("agent-runner", http_ready, grpc_ready))
+    Json(build_health_response(
+        "agent-runner",
+        http_ready,
+        grpc_ready,
+    ))
 }
 
 /// P0-1: 构建 agent_mgmt 子路由(导出供集成测试使用)

@@ -406,9 +406,7 @@ impl SessionWorker {
                 SessionCommand::Push { message } => {
                     debug!(
                         "[SessionWorker] Push message: message_type={:?}, sub_type={}, data={}",
-                        message.message_type,
-                        message.sub_type,
-                        message.data
+                        message.message_type, message.sub_type, message.data
                     );
 
                     let should_buffer = !matches!(

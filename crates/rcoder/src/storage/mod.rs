@@ -10,6 +10,6 @@ mod resource_reaper;
 mod types;
 
 pub use adapter::ProjectAdapter;
-pub use shared_types::ContainerEntry;
 pub use resource_reaper::{CleanupRequest, ResourceReaper};
+pub use shared_types::ContainerEntry;
 pub use types::{IdleContainerInfo, StorageStats};

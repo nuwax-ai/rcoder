@@ -212,7 +212,11 @@ pub async fn computer_agent_status(
         );
         addr
     } else {
-        let addr = format!("{}:{}", container_info.container_ip, shared_types::GRPC_DEFAULT_PORT);
+        let addr = format!(
+            "{}:{}",
+            container_info.container_ip,
+            shared_types::GRPC_DEFAULT_PORT
+        );
         debug!(
             "📡 [COMPUTER_AGENT_STATUS] Using container IP for gRPC: {}",
             addr
@@ -236,8 +240,7 @@ pub async fn computer_agent_status(
         locale,
         cluster_domain: &state.cluster_domain,
     };
-    let grpc_response = match call_grpc_get_status_with_retry(get_status_params).await
-    {
+    let grpc_response = match call_grpc_get_status_with_retry(get_status_params).await {
         Ok(response) => response,
         Err(e) => {
             warn!(
@@ -416,11 +419,12 @@ async fn call_grpc_get_status_with_retry(
         );
         addr
     } else {
-        let addr = format!("{}:{}", params.container_ip, shared_types::GRPC_DEFAULT_PORT);
-        debug!(
-            "📡 [GRPC_GET_STATUS] Using container IP for gRPC: {}",
-            addr
+        let addr = format!(
+            "{}:{}",
+            params.container_ip,
+            shared_types::GRPC_DEFAULT_PORT
         );
+        debug!("📡 [GRPC_GET_STATUS] Using container IP for gRPC: {}", addr);
         addr
     };
 
@@ -442,7 +446,8 @@ async fn call_grpc_get_status_with_retry(
                 };
 
                 // 设置超时
-                let mut tonic_request = crate::grpc::new_request_with_locale(request, params.locale);
+                let mut tonic_request =
+                    crate::grpc::new_request_with_locale(request, params.locale);
                 tonic_request
                     .set_timeout(std::time::Duration::from_secs(GRPC_REQUEST_TIMEOUT_SECS));
 
@@ -451,7 +456,10 @@ async fn call_grpc_get_status_with_retry(
                         let grpc_response = response.into_inner();
                         debug!(
                             "✅ [GRPC_GET_STATUS] Attempt {} succeeded: project_id={}, status={}, is_found={}",
-                            attempt, params.project_id, grpc_response.status, grpc_response.is_found
+                            attempt,
+                            params.project_id,
+                            grpc_response.status,
+                            grpc_response.is_found
                         );
                         return Ok(grpc_response);
                     }

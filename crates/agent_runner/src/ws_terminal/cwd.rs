@@ -23,7 +23,10 @@ const HOME_CANDIDATES: &[&str] = &["/home/user", "/app/project_workspace"];
 /// 与 Pingora 侧 `ttyd.rs` 的校验、wrapper 的白名单保持一致，
 /// 从源头拒绝 `..`、`/`、绝对路径等危险输入。
 fn is_valid_project_id(pid: &str) -> bool {
-    !pid.is_empty() && pid.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    !pid.is_empty()
+        && pid
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 /// 根据 serviceType + project_id 解析终端工作目录
@@ -148,11 +151,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let pid = "proj-3";
         fs::create_dir_all(tmp.path().join(pid)).unwrap();
-        let resolved = resolve_in_candidates(
-            pid,
-            &["/this/does/not/exist", tmp.path().to_str().unwrap()],
-        )
-        .expect("应跳过不存在的前缀,命中第二个");
+        let resolved =
+            resolve_in_candidates(pid, &["/this/does/not/exist", tmp.path().to_str().unwrap()])
+                .expect("应跳过不存在的前缀,命中第二个");
         assert_eq!(resolved, tmp.path().join(pid).canonicalize().unwrap());
     }
 

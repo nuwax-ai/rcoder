@@ -133,7 +133,11 @@ impl AgentMgmtForwardCtx {
             );
             format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
         } else {
-            format!("{}:{}", container.container_ip, shared_types::GRPC_DEFAULT_PORT)
+            format!(
+                "{}:{}",
+                container.container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            )
         };
 
         self.pool.get_mgmt_client(&addr).await.map_err(|e| {

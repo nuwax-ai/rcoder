@@ -16,12 +16,12 @@ use std::time::Duration;
 
 use axum::http::HeaderValue;
 use axum::http::header::SEC_WEBSOCKET_PROTOCOL;
+use shared_types::{TTYD_PORT, WS_TERMINAL_PORT};
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{
     Callback, ErrorResponse, Request, Response,
 };
-use shared_types::{TTYD_PORT, WS_TERMINAL_PORT};
 use tracing::{error, info, warn};
 
 use crate::ws_terminal::proxy;
@@ -169,8 +169,10 @@ impl Callback for HandshakeCallback {
             .map(|s| s.split(',').any(|p| p.trim() == TTYD_SUBPROTO))
             .unwrap_or(false);
         if wants_tty {
-            resp.headers_mut()
-                .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(TTYD_SUBPROTO));
+            resp.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_static(TTYD_SUBPROTO),
+            );
         }
 
         Ok(resp)

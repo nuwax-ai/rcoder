@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
 use crate::ServiceType;
+use serde::{Deserialize, Serialize};
 
 /// 存储统计信息
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

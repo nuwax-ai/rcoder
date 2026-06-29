@@ -586,7 +586,11 @@ impl K8sAppService {
                 return Ok(());
             }
         };
-        let gateway_namespace = self.config.gateway_namespace.clone().unwrap_or_else(|| "default".to_string());
+        let gateway_namespace = self
+            .config
+            .gateway_namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
 
         if let Some(client) = &self.kube_client {
             // 使用 GroupVersionKind 动态获取 HTTPRoute 资源类型
@@ -704,7 +708,11 @@ impl K8sAppService {
                                 .map(|p| p.name.clone())
                                 .unwrap_or_default(),
                             node_port: node_port as u16,
-                            access_url: format!("tcp://{}:{}", self.config.get_node_ip(), node_port),
+                            access_url: format!(
+                                "tcp://{}:{}",
+                                self.config.get_node_ip(),
+                                node_port
+                            ),
                         });
                     }
                 }
@@ -857,13 +865,18 @@ impl K8sAppService {
                 http: http_port.map(|_| {
                     format!(
                         "http://{}:{}/apps/{}",
-                        self.config.get_node_ip(), self.config.get_gateway_node_port(), app_id
+                        self.config.get_node_ip(),
+                        self.config.get_gateway_node_port(),
+                        app_id
                     )
                 }),
                 tcp: tcp_ports,
             },
             internal: InternalAccess {
-                domain: format!("{}-svc.{}.svc.{}", app_id, self.config.namespace, self.cluster_domain),
+                domain: format!(
+                    "{}-svc.{}.svc.{}",
+                    app_id, self.config.namespace, self.cluster_domain
+                ),
                 short_domain: format!("{}-svc.{}", app_id, self.config.namespace),
                 ports: ports
                     .as_ref()

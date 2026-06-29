@@ -223,10 +223,7 @@ impl ContainerStatusChecker {
         let container = match container_info.container_info() {
             Some(c) => c,
             None => {
-                debug!(
-                    " [STATUS_CHECKER] Container info not found: {}",
-                    lookup_key
-                );
+                debug!(" [STATUS_CHECKER] Container info not found: {}", lookup_key);
                 return Ok(false);
             }
         };

@@ -76,7 +76,9 @@ pub async fn grpc_chat_with_pool(
         project_id: params.project_id,
         session_id: params.session_id.unwrap_or_default(),
         prompt: params.prompt,
-        model_config: params.model_config.map(super::converters::to_grpc_model_config),
+        model_config: params
+            .model_config
+            .map(super::converters::to_grpc_model_config),
         attachments: params
             .attachments
             .into_iter()
@@ -87,9 +89,11 @@ pub async fn grpc_chat_with_pool(
         // 新增字段 (v2)
         system_prompt: params.system_prompt,
         user_prompt: params.user_prompt,
-        agent_config: params.agent_config.map(super::converters::to_grpc_chat_agent_config),
+        agent_config: params
+            .agent_config
+            .map(super::converters::to_grpc_chat_agent_config),
         service_type: params.service_type.map(|st| st.to_string()),
-        user_id: params.user_id,        // 传递 user_id
+        user_id: params.user_id,               // 传递 user_id
         is_devcomputer: params.is_devcomputer, // 🆕 传递 is_devcomputer
         agent_work_dir: params.agent_work_dir, // 🆕 传递 agent_work_dir
     };

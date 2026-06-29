@@ -202,9 +202,7 @@ impl ComputerContainerManager {
         // - ComputerAgentRunner: 使用 user_id
         // - 如果有 pod_id，优先使用 pod_id（共享容器场景）
         let container_identifier = match options.service_type {
-            ServiceType::WebAgentRunner => {
-                options.pod_id.as_deref().unwrap_or(&options.project_id)
-            }
+            ServiceType::WebAgentRunner => options.pod_id.as_deref().unwrap_or(&options.project_id),
             ServiceType::ComputerAgentRunner => {
                 options.pod_id.as_deref().unwrap_or(&options.user_id)
             }
@@ -229,9 +227,7 @@ impl ComputerContainerManager {
         // - ComputerAgentRunner: 使用 user_id（一个用户对应一个容器）
         // - 如果有 pod_id，优先使用 pod_id（共享容器场景）
         let container_identifier = match options.service_type {
-            ServiceType::WebAgentRunner => {
-                options.pod_id.as_deref().unwrap_or(&options.project_id)
-            }
+            ServiceType::WebAgentRunner => options.pod_id.as_deref().unwrap_or(&options.project_id),
             ServiceType::ComputerAgentRunner => {
                 options.pod_id.as_deref().unwrap_or(&options.user_id)
             }

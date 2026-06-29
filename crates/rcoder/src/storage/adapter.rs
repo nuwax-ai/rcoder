@@ -20,9 +20,9 @@ use dashmap::mapref::entry::Entry;
 use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
 use tracing::{debug, info};
 
-use shared_types::ContainerEntry;
 use super::resource_reaper::CleanupRequest;
 use super::types::{IdleContainerInfo, StorageStats};
+use shared_types::ContainerEntry;
 
 /// 项目适配器
 ///
@@ -74,7 +74,10 @@ impl ProjectAdapter {
     ///
     /// 返回 (adapter, cleanup_receiver)。
     /// cleanup_receiver 需要传给 ResourceReaper 以处理容器销毁。
-    pub fn new(namespace: String, cluster_domain: String) -> (Self, tokio::sync::mpsc::UnboundedReceiver<CleanupRequest>) {
+    pub fn new(
+        namespace: String,
+        cluster_domain: String,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<CleanupRequest>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter = Self {
             projects: DashMap::new(),
@@ -194,8 +197,7 @@ impl ProjectAdapter {
 
         // 维护反向索引：container_id → 容器键
         if let Some(c) = info.container_info() {
-            self.container_id_to_key
-                .insert(c.container_id.clone(), key);
+            self.container_id_to_key.insert(c.container_id.clone(), key);
         }
         // user_id → project_id 集合（多值）：entry API 原子插入
         if let Some(uid) = info.user_id() {
@@ -1015,7 +1017,8 @@ mod tests {
     }
 
     fn make_adapter() -> ProjectAdapter {
-        let (adapter, _) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, _) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         adapter
     }
 
@@ -1238,7 +1241,8 @@ mod tests {
     /// 并发压测：8 线程 × 200 轮 add_session + clear_session_one，无 panic/deadlock
     #[test]
     fn test_concurrent_multi_session_add_and_clear() {
-        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, _rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         const THREADS: usize = 8;
@@ -1514,7 +1518,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_insert_remove_no_deadlock() {
-        let (adapter, rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
         let rx = Arc::new(std::sync::Mutex::new(rx));
 
@@ -1565,7 +1570,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_same_project_insert_remove() {
-        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, _rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         const THREADS: usize = 8;
@@ -1601,7 +1607,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_shared_container_remove() {
-        let (adapter, rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
         let rx = Arc::new(std::sync::Mutex::new(rx));
 
@@ -1668,7 +1675,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_session_update_and_remove() {
-        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, _rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         let pid = "concurrent-session-proj";
@@ -1712,7 +1720,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_insert_with_session_and_remove() {
-        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, _rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         const THREADS: usize = 4;
@@ -1746,7 +1755,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_remove_nonexistent() {
-        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, _rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         const THREADS: usize = 8;
@@ -1776,7 +1786,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_stress_mixed_operations() {
-        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, _rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let adapter = Arc::new(adapter);
 
         for i in 0..10 {
@@ -1831,7 +1842,8 @@ mod tests {
 
     #[test]
     fn test_raii_cleanup_request_content() {
-        let (adapter, rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let rx = Arc::new(std::sync::Mutex::new(rx));
 
         let info = Arc::new(create_test_info_with_container("proj-verify", "c-verify"));
@@ -1852,7 +1864,8 @@ mod tests {
 
     #[test]
     fn test_shared_container_ref_count_no_leak_under_reinsert() {
-        let (adapter, rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
         let rx = Arc::new(std::sync::Mutex::new(rx));
 
         let container = ContainerBasicInfo {
@@ -1954,9 +1967,11 @@ mod tests {
         assert_eq!(found.unwrap().container_id, "cid-user-1");
 
         // 不存在的 user_id
-        assert!(adapter
-            .get_container_by_user_id("nonexistent", &ServiceType::ComputerAgentRunner)
-            .is_none());
+        assert!(
+            adapter
+                .get_container_by_user_id("nonexistent", &ServiceType::ComputerAgentRunner)
+                .is_none()
+        );
     }
 
     /// 回归测试：同 user_id 下不同 ServiceType 项目按 service_type 隔离查找
@@ -2012,9 +2027,7 @@ mod tests {
             },
         );
         web.set_service_type(Some(ServiceType::WebAgentRunner));
-        adapter
-            .insert("proj-B".to_string(), Arc::new(web))
-            .unwrap();
+        adapter.insert("proj-B".to_string(), Arc::new(web)).unwrap();
 
         // 关键断言 1：多值索引 user-6 同时收录两类业务的 project（信息完整）
         let collected: Vec<String> = adapter
@@ -2042,15 +2055,22 @@ mod tests {
 
         // 关键断言 3：find_projects_by_user_id 按 service_type 过滤
         // Web 项目虽记录了 user_id，但不应计入 Computer 的项目集合（避免 cleanup 误保活）
-        let comp_projects = adapter.find_projects_by_user_id("user-6", &ServiceType::ComputerAgentRunner);
+        let comp_projects =
+            adapter.find_projects_by_user_id("user-6", &ServiceType::ComputerAgentRunner);
         assert_eq!(
-            comp_projects.iter().map(|p| p.project_id()).collect::<Vec<_>>(),
+            comp_projects
+                .iter()
+                .map(|p| p.project_id())
+                .collect::<Vec<_>>(),
             vec!["proj-A"],
             "find_projects_by_user_id(Computer) 应只返回 Computer 项目"
         );
         let web_projects = adapter.find_projects_by_user_id("user-6", &ServiceType::WebAgentRunner);
         assert_eq!(
-            web_projects.iter().map(|p| p.project_id()).collect::<Vec<_>>(),
+            web_projects
+                .iter()
+                .map(|p| p.project_id())
+                .collect::<Vec<_>>(),
             vec!["proj-B"],
             "find_projects_by_user_id(Web) 应只返回 Web 项目"
         );
@@ -2112,13 +2132,25 @@ mod tests {
             p
         };
 
-        adapter.insert("proj-A".to_string(), Arc::new(mk_proj("proj-A"))).unwrap();
-        adapter.insert("proj-C".to_string(), Arc::new(mk_proj("proj-C"))).unwrap();
+        adapter
+            .insert("proj-A".to_string(), Arc::new(mk_proj("proj-A")))
+            .unwrap();
+        adapter
+            .insert("proj-C".to_string(), Arc::new(mk_proj("proj-C")))
+            .unwrap();
 
         // 两项目共享同一容器条目（键为 container_name "computer-container"）
-        assert_eq!(adapter.containers.len(), 1, "两个 Computer 项目应共享同一容器条目");
         assert_eq!(
-            adapter.containers.get("computer-container").unwrap().ref_count(),
+            adapter.containers.len(),
+            1,
+            "两个 Computer 项目应共享同一容器条目"
+        );
+        assert_eq!(
+            adapter
+                .containers
+                .get("computer-container")
+                .unwrap()
+                .ref_count(),
             2
         );
 
@@ -2126,7 +2158,11 @@ mod tests {
         adapter.remove("proj-C");
         assert_eq!(adapter.containers.len(), 1, "容器应仍存活（proj-A 引用）");
         assert_eq!(
-            adapter.containers.get("computer-container").unwrap().ref_count(),
+            adapter
+                .containers
+                .get("computer-container")
+                .unwrap()
+                .ref_count(),
             1
         );
 
@@ -2174,19 +2210,27 @@ mod tests {
             p
         };
 
-        adapter.insert("proj-A".to_string(), Arc::new(mk_proj("proj-A", "user-A"))).unwrap();
+        adapter
+            .insert("proj-A".to_string(), Arc::new(mk_proj("proj-A", "user-A")))
+            .unwrap();
         // container_key = pod_id（Computer 有 pod_id 时），故与 user-B 共享同一容器条目
         assert_eq!(
             adapter.get("proj-A").unwrap().container_key(),
             "pod-shared",
             "Computer 有 pod_id 时 container_key 应为 pod_id"
         );
-        adapter.insert("proj-B".to_string(), Arc::new(mk_proj("proj-B", "user-B"))).unwrap();
+        adapter
+            .insert("proj-B".to_string(), Arc::new(mk_proj("proj-B", "user-B")))
+            .unwrap();
 
         // 两个 user 共享同一容器条目（refcount=2）。键为 container_name "computer-shared"。
         assert_eq!(adapter.containers.len(), 1, "两个 user 应共享同一容器条目");
         assert_eq!(
-            adapter.containers.get("computer-shared").unwrap().ref_count(),
+            adapter
+                .containers
+                .get("computer-shared")
+                .unwrap()
+                .ref_count(),
             2
         );
 
@@ -2205,13 +2249,21 @@ mod tests {
         adapter.remove("proj-A");
         assert_eq!(adapter.containers.len(), 1, "容器应仍存活（user-B 还在用）");
         assert_eq!(
-            adapter.containers.get("computer-shared").unwrap().ref_count(),
+            adapter
+                .containers
+                .get("computer-shared")
+                .unwrap()
+                .ref_count(),
             1
         );
 
         // 删除最后一个：容器销毁
         adapter.remove("proj-B");
-        assert_eq!(adapter.containers.len(), 0, "最后一个 user 移除后容器应销毁");
+        assert_eq!(
+            adapter.containers.len(),
+            0,
+            "最后一个 user 移除后容器应销毁"
+        );
     }
 
     /// 回归测试：同 logical id 跨 ServiceType 不碰撞（container_name 键天然含 service_type 前缀）
@@ -2335,7 +2387,11 @@ mod tests {
             .unwrap();
         assert_eq!(adapter.containers.len(), 1);
         assert_eq!(
-            adapter.containers.get("computer-agent-runner-6").unwrap().ref_count(),
+            adapter
+                .containers
+                .get("computer-agent-runner-6")
+                .unwrap()
+                .ref_count(),
             1
         );
 
@@ -2349,7 +2405,11 @@ mod tests {
             "重建（同 container_name）不应新增容器条目"
         );
         assert_eq!(
-            adapter.containers.get("computer-agent-runner-6").unwrap().ref_count(),
+            adapter
+                .containers
+                .get("computer-agent-runner-6")
+                .unwrap()
+                .ref_count(),
             1,
             "重建（同 container_name）refcount 应保持不变（不误触发 RAII）"
         );
@@ -2407,7 +2467,10 @@ mod tests {
         };
 
         adapter
-            .insert("proj-A".to_string(), Arc::new(mk_proj("cid-v1", "10.0.0.1")))
+            .insert(
+                "proj-A".to_string(),
+                Arc::new(mk_proj("cid-v1", "10.0.0.1")),
+            )
             .unwrap();
 
         let st = ServiceType::ComputerAgentRunner;
@@ -2424,11 +2487,17 @@ mod tests {
                 .map(|c| c.container_ip),
             "find_by_user_id 与 get_container_by_user_id 应返回同一 IP"
         );
-        assert_eq!(adapter.find_by_user_id("6", &st), Some("10.0.0.1".to_string()));
+        assert_eq!(
+            adapter.find_by_user_id("6", &st),
+            Some("10.0.0.1".to_string())
+        );
 
         // 模拟容器重建：同 container_name、新 container_id/ip
         adapter
-            .insert("proj-A".to_string(), Arc::new(mk_proj("cid-v2", "10.0.0.2")))
+            .insert(
+                "proj-A".to_string(),
+                Arc::new(mk_proj("cid-v2", "10.0.0.2")),
+            )
             .unwrap();
 
         // 重建后三条路径都应返回新 IP（权威源 containers[name] 已刷新）
@@ -2677,7 +2746,8 @@ mod tests {
     #[test]
     fn test_index_consistency_under_raii() {
         // 验证 RAII 清理后索引一致性：多个 project 共享容器
-        let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+        let (adapter, _rx) =
+            ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
 
         let container = ContainerBasicInfo {
             container_id: "cid-shared".to_string(),
@@ -2917,7 +2987,11 @@ impl shared_types::ContainerLookup for ProjectAdapter {
     /// 此处全量扫描（`find_projects_by_user_id`，已按 `service_type` 过滤）取任一
     /// 匹配 project，再经 `container_info_by_project` 走 `containers[name]` 权威源取 IP——
     /// 同 user 的 Computer 项目共享同一容器，任取一个即可。O(N)，N 为该 user 的 project 数。
-    fn find_by_user_id(&self, user_id: &str, service_type: &shared_types::ServiceType) -> Option<String> {
+    fn find_by_user_id(
+        &self,
+        user_id: &str,
+        service_type: &shared_types::ServiceType,
+    ) -> Option<String> {
         // 委托 get_container_by_user_id（同一查找逻辑：扫描 + containers[name] 权威源），
         // 仅取 container_ip。同 user 的 Computer 项目共享同一容器，任取一个即可。
         self.get_container_by_user_id(user_id, service_type)
@@ -2930,7 +3004,11 @@ impl shared_types::ContainerLookup for ProjectAdapter {
     /// 然后从 containers 中获取 container_ip。
     ///
     /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
-    fn find_by_project_id(&self, project_id: &str, service_type: &shared_types::ServiceType) -> Option<String> {
+    fn find_by_project_id(
+        &self,
+        project_id: &str,
+        service_type: &shared_types::ServiceType,
+    ) -> Option<String> {
         // clone 出 container_key 后立即释放 project_to_container 读锁
         let container_key = self.project_to_container.get(project_id)?.value().clone();
         let entry = self.containers.get(&container_key)?;
@@ -2955,7 +3033,11 @@ impl shared_types::ContainerLookup for ProjectAdapter {
     ///
     /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None，
     /// 避免同一 pod_id 下跨 ServiceType 容器互相串用。
-    fn find_by_pod_id(&self, pod_id: &str, service_type: &shared_types::ServiceType) -> Option<String> {
+    fn find_by_pod_id(
+        &self,
+        pod_id: &str,
+        service_type: &shared_types::ServiceType,
+    ) -> Option<String> {
         // 索引链查找：每步 clone 出 key 后立即释放读锁，避免跨 map 同时持锁
         let project_id = self.pod_id_to_project_id.get(pod_id)?.value().clone();
         let container_key = self.project_to_container.get(&project_id)?.value().clone();

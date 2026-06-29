@@ -64,7 +64,10 @@ pub async fn chat(
         .and_then(|st| match st.parse::<shared_types::ServiceType>() {
             Ok(t) => Some(t),
             Err(e) => {
-                warn!("[gRPC] Invalid service_type: {}, using default WebAgentRunner. Error: {}", st, e);
+                warn!(
+                    "[gRPC] Invalid service_type: {}, using default WebAgentRunner. Error: {}",
+                    st, e
+                );
                 None
             }
         })

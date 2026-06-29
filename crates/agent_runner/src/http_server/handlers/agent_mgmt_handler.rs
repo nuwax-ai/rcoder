@@ -236,12 +236,12 @@ pub async fn install_agent(
                         force,
                     };
                     return installer::url_installer::install_with_version_check(params)
-                    .await
-                    .map(|r| {
-                        let shared = conversion::install_response_to_shared(&r);
-                        Json(HttpResult::success(shared)).into_response()
-                    })
-                    .unwrap_or_else(error_to_response);
+                        .await
+                        .map(|r| {
+                            let shared = conversion::install_response_to_shared(&r);
+                            Json(HttpResult::success(shared)).into_response()
+                        })
+                        .unwrap_or_else(error_to_response);
                 }
             }
             // 旧模式: 单个 source_url
@@ -348,8 +348,7 @@ pub async fn install_from_url(
         platforms: &req.platforms,
         force: req.force,
     };
-    match installer::url_installer::install_with_version_check(params).await
-    {
+    match installer::url_installer::install_with_version_check(params).await {
         Ok(r) => {
             let shared = conversion::install_response_to_shared(&r);
             Json(HttpResult::success(shared)).into_response()

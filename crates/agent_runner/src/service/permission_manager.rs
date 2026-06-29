@@ -288,9 +288,7 @@ impl PermissionManager {
         use dashmap::mapref::entry::Entry;
         let trimmed = session_id.trim();
         if trimmed.is_empty() {
-            warn!(
-                "[Permission] upsert_session_state called with empty session_id, ignoring"
-            );
+            warn!("[Permission] upsert_session_state called with empty session_id, ignoring");
             return;
         }
         match self.session_state.entry(trimmed.to_string()) {
@@ -545,8 +543,12 @@ impl PermissionRequestHandler for PermissionManager {
 
         info!(
             "[Permission] Received permission request: session_id={}, tool_call_id={}, tool={}, command={:?}, agent_mode={:?}, source={}",
-            info.session_id, info.tool_call_id, info.tool_name, info.command,
-            effective_context.agent_mode, mode_source
+            info.session_id,
+            info.tool_call_id,
+            info.tool_name,
+            info.command,
+            effective_context.agent_mode,
+            mode_source
         );
 
         // 危险命令仅记录日志（观测/审计）：不拦截、不强制审批、不 deny——
@@ -1516,7 +1518,10 @@ mod tests {
     }
 
     /// Execute 工具，命令放在指定的 raw_input key（command/cmd/script）
-    fn make_execute_request_with_field(command_key: &str, command: &str) -> RequestPermissionRequest {
+    fn make_execute_request_with_field(
+        command_key: &str,
+        command: &str,
+    ) -> RequestPermissionRequest {
         use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
         let raw = serde_json::json!({ command_key: command });
         let fields = ToolCallUpdateFields::new()

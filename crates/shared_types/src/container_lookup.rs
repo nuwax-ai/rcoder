@@ -60,10 +60,7 @@ pub trait ContainerLookup: Send + Sync {
                 if let Some(uid) = user_id {
                     let result = self.find_by_user_id(uid, service_type);
                     if result.is_some() {
-                        debug!(
-                            "[CONTAINER_LOOKUP] Found by user_id: user_id={}",
-                            uid
-                        );
+                        debug!("[CONTAINER_LOOKUP] Found by user_id: user_id={}", uid);
                     }
                     result
                 } else {
@@ -74,10 +71,7 @@ pub trait ContainerLookup: Send + Sync {
                 if let Some(pid) = project_id {
                     let result = self.find_by_project_id(pid, service_type);
                     if result.is_some() {
-                        debug!(
-                            "[CONTAINER_LOOKUP] Found by project_id: project_id={}",
-                            pid
-                        );
+                        debug!("[CONTAINER_LOOKUP] Found by project_id: project_id={}", pid);
                     }
                     result
                 } else {

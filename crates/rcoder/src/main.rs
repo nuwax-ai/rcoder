@@ -29,8 +29,18 @@ async fn main() -> anyhow::Result<()> {
 
     let runtime_type = RuntimeType::from_env();
     let is_kubernetes = shared_types::is_kubernetes_runtime();
-    info!("Runtime type: {:?}, is_kubernetes_runtime: {}", runtime_type, is_kubernetes);
-    info!("🔧 [STARTUP] Container runtime: {}", if is_kubernetes { "Kubernetes" } else { "Docker" });
+    info!(
+        "Runtime type: {:?}, is_kubernetes_runtime: {}",
+        runtime_type, is_kubernetes
+    );
+    info!(
+        "🔧 [STARTUP] Container runtime: {}",
+        if is_kubernetes {
+            "Kubernetes"
+        } else {
+            "Docker"
+        }
+    );
 
     docker_init::init_path_resolver(runtime_type).await?;
     docker_init::init_docker_manager(&bootstrap_result.config).await?;

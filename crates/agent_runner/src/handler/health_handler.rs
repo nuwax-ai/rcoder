@@ -35,7 +35,10 @@ use tracing::info;
     ),
     tag = "system"
 )]
-pub async fn health_check() -> (StatusCode, Json<HttpResult<shared_types::HealthCheckResponse>>) {
+pub async fn health_check() -> (
+    StatusCode,
+    Json<HttpResult<shared_types::HealthCheckResponse>>,
+) {
     // HTTP 服务：本端点正常响应即表示就绪
     let http_ready = true;
 
@@ -50,11 +53,14 @@ pub async fn health_check() -> (StatusCode, Json<HttpResult<shared_types::Health
     // 输出详细的健康检查日志
     info!(
         "🏥 [HEALTH] Health check: http_ready={}, grpc_ready={}, status={}",
-        http_ready, grpc_ready, if grpc_ready { "healthy" } else { "starting" }
+        http_ready,
+        grpc_ready,
+        if grpc_ready { "healthy" } else { "starting" }
     );
 
     // 构建健康检查响应
-    let health_response = shared_types::HealthCheckResponse::new("agent-runner", http_ready, grpc_ready);
+    let health_response =
+        shared_types::HealthCheckResponse::new("agent-runner", http_ready, grpc_ready);
 
     // 根据 gRPC 就绪状态返回不同的 HTTP 状态码
     if grpc_ready {
@@ -62,13 +68,16 @@ pub async fn health_check() -> (StatusCode, Json<HttpResult<shared_types::Health
     } else {
         // 服务未就绪，返回 HTTP 503 状态码
         // 这样 K8s readinessProbe 会认为 Pod 不是 Ready 的
-        (StatusCode::SERVICE_UNAVAILABLE, Json(HttpResult {
-            code: "SERVICE_NOT_READY".to_string(),
-            message: "Service is starting, gRPC not ready".to_string(),
-            data: Some(health_response),
-            tid: None,
-            success: false,
-        }))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HttpResult {
+                code: "SERVICE_NOT_READY".to_string(),
+                message: "Service is starting, gRPC not ready".to_string(),
+                data: Some(health_response),
+                tid: None,
+                success: false,
+            }),
+        )
     }
 }
 
@@ -122,8 +131,13 @@ pub async fn check_grpc_port_simple() -> bool {
 /// 构建健康检查响应
 ///
 /// 统一的健康检查响应构建函数，供所有健康检查端点使用。
-pub fn build_health_response(service_name: &str, http_ready: bool, grpc_ready: bool) -> HttpResult<shared_types::HealthCheckResponse> {
-    let health_response = shared_types::HealthCheckResponse::new(service_name, http_ready, grpc_ready);
+pub fn build_health_response(
+    service_name: &str,
+    http_ready: bool,
+    grpc_ready: bool,
+) -> HttpResult<shared_types::HealthCheckResponse> {
+    let health_response =
+        shared_types::HealthCheckResponse::new(service_name, http_ready, grpc_ready);
 
     if grpc_ready {
         HttpResult::success(health_response)
