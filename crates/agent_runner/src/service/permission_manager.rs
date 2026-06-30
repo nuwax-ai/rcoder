@@ -617,13 +617,15 @@ impl PermissionRequestHandler for PermissionManager {
                 "[Permission] Yolo mode, auto-approving: session_id={}, tool_call_id={}, tool={}",
                 info.session_id, info.tool_call_id, info.tool_name
             );
+            // 用 AllowOnce 而非 AllowAlways：AllowOnce 仅本次放行，不污染 nuwaxcode 的权限记忆。
+            // 若首选 AllowAlways，nuwaxcode 会把它当作"永久放行"持久化，之后即便把 agent_mode 切回
+            // Ask，nuwaxcode 也不再发起 permission request → rcoder 收不到 → 审批 SSE 无法触发
+            // （即 "ask→yolo→ask 第三次不弹审批" 的根因）。AllowOnce 保证 yolo 仅"每次自动批"，
+            // 让 agent_mode 切换始终可逆。
             return respond_with_preferred_option(
                 &request,
                 responder,
-                &[
-                    PermissionOptionKind::AllowAlways,
-                    PermissionOptionKind::AllowOnce,
-                ],
+                &[PermissionOptionKind::AllowOnce],
             );
         }
 
