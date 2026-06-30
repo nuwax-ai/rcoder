@@ -7,17 +7,19 @@
 use std::path::Path;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use shared_types::TTYD_PORT;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::ws_terminal::cwd;
 
@@ -29,6 +31,24 @@ const TTYD_CONNECT_RETRIES: u32 = 3;
 
 /// 每次重试间隔
 const TTYD_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// 向 browser 方向发送的 keepalive 帧间隔（秒）。
+///
+/// 终端空闲时 ttyd 是被动协议、无任何下行，会导致上游 java 透明代理
+/// (clientIdle, readerIdle=600s) 读空闲超时主动断连。中间层每 30s 主动向 browser
+/// 发一帧 keepalive，经 pingora→java 回传，刷新 java 读空闲；同时兜底刷新前端
+/// 「无消息」判活（见 EmbeddedConsoleTerminal，已移除该判活，此处作双保险）。
+///
+/// **契约（跨仓库）**：此值必须显著小于 java 端 `ComputerProxyServerContainer.
+/// readTimeoutSeconds`(=600s)，否则 keepalive 来不及刷新 readerIdle、静默失效。
+/// 若调整 java 该值，须同步核对此处。
+const KEEPALIVE_INTERVAL_SECS: u64 = 30;
+
+/// keepalive 帧载荷：单字节 0x90。
+///
+/// 选 0x90 因 ttyd 协议未使用该 cmd（OUTPUT=0x30），前端 decodeTtydMessage 对非
+/// 0x30 帧返回空串、不写入 xterm，对终端显示零副作用。
+const KEEPALIVE_PAYLOAD: &[u8] = &[0x90];
 
 /// 处理一条「浏览器 → ttyd」的代理连接
 ///
@@ -205,16 +225,51 @@ where
         let _ = b_sink.close().await;
     };
 
-    // b(ttyd) → a(browser)
+    // b(ttyd) → a(browser)，并周期注入 keepalive
+    //
+    // 终端空闲时 ttyd 无任何下行，会带来两个问题：
+    //   1. 前端若以「无消息」判活会超时（已在 EmbeddedConsoleTerminal 移除，留作兜底）
+    //   2. 上游 java 透明代理 clientIdle(readerIdle=600s) 读空闲 → 主动断连
+    // 每 KEEPALIVE_INTERVAL_SECS 向 browser 方向发一帧 keepalive：字节 0x90 非
+    // OUTPUT(0x30)，前端 decodeTtydMessage 返回空串、不写入 xterm（零副作用）；该帧
+    // 经 pingora→java→browser 回传，刷新 java clientIdle 读空闲，避免空闲 600s 被断。
+    //
+    // 契约：此帧仅对 ttyd wireProtocol 客户端安全。ws_terminal 只服务 ttyd 终端链路
+    // （协商 'tty' 子协议、转发本地 ttyd），上游所有连接前端必为 wireProtocol='ttyd'
+    // （见 nuwax TTYD_TERMINAL_WIRE_PROTOCOL），故 0x90 必被前端忽略、不会污染显示。
     let ba = async {
-        while let Some(msg) = b_src.next().await {
-            match msg {
-                Ok(m) => {
-                    if a_sink.send(m).await.is_err() {
+        let mut ticker = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let _ = ticker.tick().await; // 丢弃首次立即触发（连接刚建立，无需立刻保活）
+        let mut first_keepalive = true; // 首次 info 确认保活已生效，其后 trace 避免刷屏
+        loop {
+            tokio::select! {
+                msg = b_src.next() => match msg {
+                    Some(Ok(m)) => {
+                        if a_sink.send(m).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) | None => break,
+                },
+                _ = ticker.tick() => {
+                    if a_sink
+                        .send(Message::Binary(Bytes::from_static(KEEPALIVE_PAYLOAD)))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
+                    if first_keepalive {
+                        info!(
+                            "[WS_TERMINAL] keepalive active (interval={}s)",
+                            KEEPALIVE_INTERVAL_SECS
+                        );
+                        first_keepalive = false;
+                    } else {
+                        trace!("[WS_TERMINAL] keepalive sent");
+                    }
                 }
-                Err(_) => break,
             }
         }
         let _ = a_sink.close().await;
@@ -266,5 +321,79 @@ mod tests {
             url,
             "ws://127.0.0.1:7681/ws?arg=--cwd&arg=/home/user/proj-1"
         );
+    }
+
+    /// 集成测试：relay 必须把 ttyd 真实输出转发到 browser，并在空闲时注入 keepalive。
+    ///
+    /// 两条本地 loopback WS 连接模拟「browser ↔ relay ↔ ttyd」：a_client 给 relay 当
+    /// browser、b_client 当 ttyd；各自对端 a_server/b_server 由测试控制，分别读取转发
+    /// 结果与注入 ttyd 输出。
+    ///
+    /// 时间控制：不能用 `start_paused`（会让转发步骤的真实 IO 被虚拟 timeout 抢先误判）。
+    /// 改为「转发用真实时间，仅 keepalive 阶段 `pause`+`advance` 快进」，既稳定又无需
+    /// 真实等待 30s。
+    #[tokio::test]
+    async fn relay_forwards_ttyd_data_and_injects_keepalive_when_idle() {
+        use futures_util::StreamExt;
+        use tokio::net::TcpListener;
+
+        // 建立一对 loopback WS 连接：(client 连到 listener, listener accept 出的 server)
+        async fn mk_pair() -> (
+            WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+            WebSocketStream<TcpStream>,
+        ) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (s, _) = listener.accept().await.unwrap();
+                tokio_tungstenite::accept_async(s).await.unwrap()
+            });
+            let (client, _) =
+                tokio_tungstenite::connect_async(format!("ws://{addr}")).await.unwrap();
+            (client, server.await.unwrap())
+        }
+
+        // a=browser（a_server 读 keepalive + 转发数据）；b=ttyd（b_server 模拟 ttyd 输出）
+        let (a_client, mut a_server) = mk_pair().await;
+        let (b_client, mut b_server) = mk_pair().await;
+
+        // 模拟 ttyd 真实输出
+        b_server
+            .send(Message::Binary(Bytes::copy_from_slice(b"real-data")))
+            .await
+            .unwrap();
+
+        let relay = tokio::spawn(relay(a_client, b_client));
+
+        // 1. ttyd 数据应被原样透传到 browser（真实时间：数据已在 buffer，宽松 timeout 兜底）
+        let forwarded = tokio::time::timeout(Duration::from_secs(10), a_server.next())
+            .await
+            .expect("转发 ttyd 数据超时")
+            .expect("a_server 流提前关闭");
+        match forwarded {
+            Ok(Message::Binary(d)) => assert_eq!(d.as_ref(), b"real-data"),
+            other => panic!("期望 Binary 转发数据，实际 {other:?}"),
+        }
+
+        // 2. 空闲后应收到 keepalive：暂停时钟并快进到 ticker 触发之后
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(KEEPALIVE_INTERVAL_SECS + 5)).await;
+        let keepalive = tokio::time::timeout(Duration::from_secs(10), a_server.next())
+            .await
+            .expect("keepalive 帧超时未到达")
+            .expect("a_server 流提前关闭");
+        match keepalive {
+            Ok(Message::Binary(d)) => assert_eq!(d.as_ref(), KEEPALIVE_PAYLOAD),
+            other => panic!("期望 keepalive Binary，实际 {other:?}"),
+        }
+        tokio::time::resume();
+
+        // 3. 对端全部关闭后 relay 应能自行结束（验证不泄漏 task）
+        drop(a_server);
+        drop(b_server);
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("relay 未在超时内结束（疑似 task 泄漏）")
+            .expect("relay task panic");
     }
 }

@@ -145,3 +145,5 @@ nix = { workspace = true, features = ["signal", "process"] }
 # 集成测试用:解析响应 body
 http-body-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+# 集成测试用:tokio::time 虚拟时钟（pause/advance 快进），避免 keepalive 30s 真实等待
+tokio = { workspace = true, features = ["test-util"] }
