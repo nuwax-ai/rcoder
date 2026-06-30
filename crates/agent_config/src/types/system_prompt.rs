@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn test_default_system_prompt_loaded() {
         // 验证默认提示词被正确加载
-        assert!(!DEFAULT_SYSTEM_PROMPT.is_empty());
+        // (include_str! 的非空性编译期已知，clippy::const_is_empty 视为冗余，故不再断言 is_empty)
         assert!(DEFAULT_SYSTEM_PROMPT.contains("<SYSTEM_INSTRUCTIONS>"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("</SYSTEM_INSTRUCTIONS>"));
     }

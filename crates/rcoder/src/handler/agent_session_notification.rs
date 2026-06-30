@@ -51,6 +51,12 @@ pub struct SessionNotificationParams {
     #[param(example = "project")]
     #[serde(default)]
     pub isolation_type: Option<String>,
+    /// 客户端消费游标（可选）：重连时带上最后收到的 seq（`ProgressEvent.seq`），
+    /// rcoder 只补齐 seq > last_seq 的消息（增量补齐，消除重复）。
+    /// 缺省 = 补齐该 session 全量历史（首次连接合理；重连建议前端带上）。
+    #[param(example = "12")]
+    #[serde(default)]
+    pub last_seq: Option<u64>,
 }
 
 /// SSE 进度事件（用于 OpenAPI 文档）
@@ -678,6 +684,11 @@ struct SseStreamParams {
     namespace: String,
     /// K8s 集群域名
     cluster_domain: String,
+    /// Session 共享流注册表（每 session 一条 agent_runner 流，多 SSE 客户端 fan-out 共享）
+    registry: Arc<crate::grpc::SessionStreamRegistry>,
+    /// 客户端消费游标（从 Last-Event-ID header 或 ?last_seq= query 读取），
+    /// 用于增量补齐；缺省 0 = 补齐该 session 全量历史（首次连接合理，重连应由前端带 last_seq）。
+    last_seq: u64,
 }
 
 /// 这个函数被 agent_session_notification 和 computer_agent_progress_notification 共同使用
@@ -712,12 +723,13 @@ async fn build_sse_stream_from_container_name(
 
     // 创建 gRPC SSE 流
     let stream = crate::grpc::create_grpc_sse_stream(
+        params.registry.clone(),
         grpc_addr,
         params.session_id.clone(),
-        params.project_id,
         params.grpc_pool.clone(),
         params.locale,
         params.activity_updater,
+        params.last_seq,
     )
     .await;
 
@@ -907,6 +919,7 @@ eventSource.onerror = (error) => {
 pub async fn agent_session_notification(
     I18nPath(params): I18nPath<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
@@ -927,6 +940,13 @@ pub async fn agent_session_notification(
     };
 
     // 使用通用函数创建 SSE 响应流
+    // 优先用 Last-Event-ID header（浏览器 EventSource 断线重连自动带），其次 ?last_seq= query
+    let last_seq = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .or(params.last_seq)
+        .unwrap_or(0);
     let params = SseStreamParams {
         container_name,
         container_ip,
@@ -938,6 +958,8 @@ pub async fn agent_session_notification(
         activity_updater,
         namespace: state.config.app_manager.namespace.clone(),
         cluster_domain: state.cluster_domain.clone(),
+        registry: state.session_stream_registry.clone(),
+        last_seq,
     };
     build_sse_stream_from_container_name(params).await
 }
@@ -1023,6 +1045,7 @@ pub async fn agent_session_notification(
 pub async fn computer_agent_progress_notification(
     I18nPath(params): I18nPath<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
@@ -1043,6 +1066,13 @@ pub async fn computer_agent_progress_notification(
     };
 
     // 使用通用函数创建 SSE 响应流
+    // 优先用 Last-Event-ID header（浏览器 EventSource 断线重连自动带），其次 ?last_seq= query
+    let last_seq = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .or(params.last_seq)
+        .unwrap_or(0);
     let params = SseStreamParams {
         container_name,
         container_ip,
@@ -1054,6 +1084,8 @@ pub async fn computer_agent_progress_notification(
         activity_updater,
         namespace: state.config.app_manager.namespace.clone(),
         cluster_domain: state.cluster_domain.clone(),
+        registry: state.session_stream_registry.clone(),
+        last_seq,
     };
     build_sse_stream_from_container_name(params).await
 }

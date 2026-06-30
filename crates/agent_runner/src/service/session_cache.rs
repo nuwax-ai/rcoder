@@ -60,10 +60,13 @@ pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock
 const COMMAND_CHANNEL_BUFFER_SIZE: usize = 1000;
 
 /// Session数据包装 - 极简版本，专注消息传输
+/// 当前活跃 SSE 连接的发送端（每条消息带 session 级单调 seq，见 SessionWorker::run 的 Push 分支）。
+type CurrentSender = Arc<tokio::sync::Mutex<Option<mpsc::Sender<(u64, UnifiedSessionMessage)>>>>;
+
 pub struct SessionData {
     command_tx: mpsc::Sender<SessionCommand>,
     // 🎯 极简优化：直接存储当前连接，无需命令传递
-    current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
+    current_sender: CurrentSender,
     current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
     // 🔒 Critical fix: 存储 worker JoinHandle，用于检测 panic
     worker_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -136,14 +139,16 @@ impl SessionData {
         rx.await.unwrap_or(0)
     }
 
-    /// 获取 ring buffer 中所有消息的快照（非破坏性读取）
+    /// 增量回放 ring buffer：只返回 seq > from_seq 的消息（非破坏性读取，buffer 内容不变）。
     ///
-    /// 用于 SSE 连接建立时回放历史消息给新客户端
-    pub async fn replay_buffer(&self) -> Vec<UnifiedSessionMessage> {
+    /// 用于 SSE 连接建立时按订阅方的消费游标补齐缺失消息：
+    /// - from_seq = 0：全量回放（首次订阅 / 向后兼容旧行为）。
+    /// - from_seq = N：只补 N 之后的消息，已收过的不重发（消除重复）。
+    pub async fn replay_since(&self, from_seq: u64) -> Vec<(u64, UnifiedSessionMessage)> {
         let (tx, rx) = oneshot::channel();
         if self
             .command_tx
-            .send(SessionCommand::Replay { ack: tx })
+            .send(SessionCommand::ReplaySince { from_seq, ack: tx })
             .await
             .is_err()
         {
@@ -216,9 +221,10 @@ impl SessionData {
     pub async fn create_new_connection(
         &self,
         buffer_size: usize,
+        from_seq: u64,
     ) -> Result<(
-        Vec<UnifiedSessionMessage>,
-        mpsc::Receiver<UnifiedSessionMessage>,
+        Vec<(u64, UnifiedSessionMessage)>,
+        mpsc::Receiver<(u64, UnifiedSessionMessage)>,
         CancellationToken,
     )> {
         let start_time = std::time::Instant::now();
@@ -269,7 +275,7 @@ impl SessionData {
         // 2. replay_buffer() 获取的是设置 current_sender 之前缓冲的消息
         // 3. 这些消息不会通过 current_sender 发送，所以需要回放
         let replay_start = std::time::Instant::now();
-        let replay_messages = self.replay_buffer().await;
+        let replay_messages = self.replay_since(from_seq).await;
         if !replay_messages.is_empty() {
             info!(
                 "[create_new_connection] Replaying {} buffered messages",
@@ -359,7 +365,7 @@ struct SessionWorker {
     max_size: usize,
     command_rx: mpsc::Receiver<SessionCommand>,
     // 🎯 极简优化：直接共享连接状态，无需命令传递
-    current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
+    current_sender: CurrentSender,
     current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
 }
 
@@ -367,7 +373,7 @@ impl SessionWorker {
     fn spawn(
         max_size: usize,
         command_rx: mpsc::Receiver<SessionCommand>,
-        current_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<UnifiedSessionMessage>>>>,
+        current_sender: CurrentSender,
         current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
     ) -> tokio::task::JoinHandle<()> {
         let start_time = std::time::Instant::now();
@@ -398,8 +404,14 @@ impl SessionWorker {
     }
 
     async fn run(mut self) {
-        let (mut producer, mut consumer) = HeapRb::new(self.max_size).split();
+        // ring buffer 存 (seq, message)：seq 是 session 级单调递增的序号，
+        // 供订阅方增量 replay 与去重（见 SessionCommand::ReplaySince）。
+        let (mut producer, mut consumer) =
+            HeapRb::<(u64, UnifiedSessionMessage)>::new(self.max_size).split();
         let mut buffered_len = 0usize;
+        // session 级单调递增的消息序号。注意：Clear 命令清空 ring buffer 内容但【不重置】
+        // next_seq——否则新一轮 prompt 的 seq 从 1 重来，会与订阅方持有的 last_seq 撞车导致漏发。
+        let mut next_seq: u64 = 1;
 
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
@@ -414,12 +426,22 @@ impl SessionWorker {
                         crate::model::SessionMessageType::Heartbeat
                     );
 
+                    // 入 buffer 的消息分配 session 级单调 seq；Heartbeat 等不入 buffer 的消息用
+                    // seq=0（哨兵：订阅方据此跳过去重，不更新消费游标）。
+                    let seq = if should_buffer {
+                        let s = next_seq;
+                        next_seq += 1;
+                        s
+                    } else {
+                        0
+                    };
+
                     if should_buffer {
                         if producer.is_full() {
                             let _ = consumer.try_pop();
                             buffered_len = buffered_len.saturating_sub(1);
                         }
-                        if producer.try_push(message.clone()).is_ok() {
+                        if producer.try_push((seq, message.clone())).is_ok() {
                             buffered_len += 1;
                         } else {
                             warn!("Ring buffer push failed; real-time delivery only");
@@ -431,7 +453,7 @@ impl SessionWorker {
                     let mut current_sender_guard = self.current_sender.lock().await;
                     if let Some(sender) = current_sender_guard.as_mut() {
                         use tokio::sync::mpsc::error::TrySendError;
-                        if let Err(send_err) = sender.try_send(message.clone()) {
+                        if let Err(send_err) = sender.try_send((seq, message.clone())) {
                             match send_err {
                                 TrySendError::Full(_) => {
                                     // buffer 满（客户端暂时慢）：不禁用 sender，等客户端消费后恢复
@@ -463,6 +485,7 @@ impl SessionWorker {
                     }
                 }
                 SessionCommand::Clear { ack } => {
+                    // 仅清空 ring buffer 内容；next_seq 保持单调（见 run 开头注释），不随 clear 重置。
                     let mut cleared = 0usize;
                     while consumer.try_pop().is_some() {
                         cleared += 1;
@@ -473,28 +496,20 @@ impl SessionWorker {
                 SessionCommand::MessageCount { ack } => {
                     let _ = ack.send(buffered_len);
                 }
-                SessionCommand::Replay { ack } => {
-                    let count = consumer.occupied_len();
-                    let mut snapshot = Vec::with_capacity(count);
-                    // Pop all items from ring buffer
-                    while let Some(msg) = consumer.try_pop() {
-                        snapshot.push(msg);
-                    }
-                    // Push them back (preserving order)
-                    let mut pushed_back = 0;
-                    for msg in &snapshot {
-                        if producer.try_push(msg.clone()).is_ok() {
-                            pushed_back += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    buffered_len = pushed_back;
+                SessionCommand::ReplaySince { from_seq, ack } => {
+                    // 非破坏性读取：用 consumer.iter() 扫描，不 pop，ring buffer 内容与顺序不变。
+                    // 只返回 seq > from_seq 的消息（增量补齐），消除"已收过的消息被重放"的重复。
+                    let occupied = consumer.occupied_len();
+                    let snapshot: Vec<(u64, UnifiedSessionMessage)> = consumer
+                        .iter()
+                        .filter(|(s, _)| *s > from_seq)
+                        .cloned()
+                        .collect();
                     debug!(
-                        "[SessionWorker] Replay: captured {} messages from ring buffer (occupied={}, pushed_back={})",
+                        "[SessionWorker] ReplaySince: from_seq={}, matched {} of {} buffered messages (non-destructive)",
+                        from_seq,
                         snapshot.len(),
-                        count,
-                        pushed_back
+                        occupied
                     );
                     let _ = ack.send(snapshot);
                 }
@@ -516,8 +531,10 @@ enum SessionCommand {
     MessageCount {
         ack: oneshot::Sender<usize>,
     },
-    Replay {
-        ack: oneshot::Sender<Vec<UnifiedSessionMessage>>,
+    /// 增量 replay：只返回 ring buffer 中 seq > from_seq 的消息（非破坏性读取）。
+    ReplaySince {
+        from_seq: u64,
+        ack: oneshot::Sender<Vec<(u64, UnifiedSessionMessage)>>,
     },
 }
 
@@ -680,5 +697,93 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             );
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SessionMessageType;
+    use chrono::Utc;
+
+    fn make_msg(sub_type: &str) -> UnifiedSessionMessage {
+        UnifiedSessionMessage {
+            session_id: "test-session".to_string(),
+            message_type: SessionMessageType::AgentSessionUpdate,
+            sub_type: sub_type.to_string(),
+            data: serde_json::json!({}),
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_since_returns_only_messages_after_from_seq() {
+        let sd = SessionData::new(64).await;
+        sd.push_message(make_msg("a")); // seq 1
+        sd.push_message(make_msg("b")); // seq 2
+        sd.push_message(make_msg("c")); // seq 3
+
+        let got: Vec<u64> = sd.replay_since(1).await.into_iter().map(|(s, _)| s).collect();
+        assert_eq!(got, vec![2, 3], "replay_since(1) must return only seq>1");
+    }
+
+    #[tokio::test]
+    async fn seq_keeps_monotonic_across_clear() {
+        let sd = SessionData::new(64).await;
+        sd.push_message(make_msg("a")); // seq 1
+        sd.push_message(make_msg("b")); // seq 2
+        let cleared = sd.clear_message_buffer().await;
+        assert_eq!(cleared, 2);
+        sd.push_message(make_msg("c")); // seq 必须为 3（不随 clear 重置）
+
+        let got: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
+        assert_eq!(got, vec![3], "seq must remain monotonic after clear");
+    }
+
+    #[tokio::test]
+    async fn replay_since_is_non_destructive() {
+        let sd = SessionData::new(64).await;
+        sd.push_message(make_msg("a"));
+        sd.push_message(make_msg("b"));
+
+        let first: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
+        let second: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
+        assert_eq!(first, second);
+        assert_eq!(first, vec![1, 2], "replay must not drain the buffer");
+    }
+
+    fn make_heartbeat() -> UnifiedSessionMessage {
+        UnifiedSessionMessage {
+            session_id: "test-session".to_string(),
+            message_type: SessionMessageType::Heartbeat,
+            sub_type: "ping".to_string(),
+            data: serde_json::json!({}),
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_not_buffered_and_does_not_advance_seq() {
+        let sd = SessionData::new(64).await;
+        sd.push_message(make_heartbeat()); // Heartbeat：不入 ring，seq=0，不递增 next_seq
+        sd.push_message(make_msg("a")); // seq 1
+        sd.push_message(make_heartbeat());
+        sd.push_message(make_msg("b")); // seq 2（Heartbeat 不占 seq 号）
+
+        let got: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
+        assert_eq!(got, vec![1, 2], "Heartbeat must not be buffered; seq must skip it");
+    }
+
+    #[tokio::test]
+    async fn ring_overflow_drops_oldest_and_keeps_seq_contiguous() {
+        let sd = SessionData::new(3).await; // 容量 3
+        sd.push_message(make_msg("a")); // seq 1
+        sd.push_message(make_msg("b")); // seq 2
+        sd.push_message(make_msg("c")); // seq 3
+        sd.push_message(make_msg("d")); // seq 4，挤掉 seq1
+        sd.push_message(make_msg("e")); // seq 5，挤掉 seq2
+
+        let got: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
+        assert_eq!(got, vec![3, 4, 5], "ring overflow drops oldest, seq stays contiguous");
     }
 }

@@ -982,6 +982,7 @@ fn container_entry_key(info: &ProjectAndContainerInfo) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // impl ContainerLookup for ProjectAdapter 定义在本 tests 之后（历史结构，移动 77 行风险大于收益）
 mod tests {
     use super::*;
     use shared_types::ProjectExtendedFields;

@@ -41,6 +41,7 @@ use rcoder::handler::utils::{
 
 /// 不会调 Docker API 的桩实现,仅满足 trait 形状。
 /// `find_container` 返回 `Ok(None)`,让 `get_realtime_container_ip` 走 fallback 分支。
+#[allow(dead_code)] // 测试桩预留，待 agent_mgmt 转发相关测试补齐后启用
 struct StubRuntime;
 
 #[async_trait]
@@ -82,6 +83,7 @@ impl ContainerRuntime for StubRuntime {
     }
 }
 
+#[allow(dead_code)]
 fn stub_runtime() -> Arc<dyn ContainerRuntime> {
     Arc::new(StubRuntime)
 }

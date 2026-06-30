@@ -70,6 +70,9 @@ pub struct AppState {
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     /// gRPC 连接池（用于与 agent_runner 通信）
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
+    /// Session 级共享 SSE 流注册表（每 session 一条 agent_runner SubscribeProgress 流，
+    /// 多 HTTP SSE 客户端 fan-out 共享，消除重复推送；配合 agent_runner 的 seq 增量 replay）
+    pub session_stream_registry: Arc<crate::grpc::SessionStreamRegistry>,
     /// 🆕 可热更新的 API Key 配置（使用 ArcSwap 实现无锁读取）
     pub api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
     /// 🆕 容器创建中标记: user_id -> 创建开始时间
@@ -152,6 +155,7 @@ impl AppState {
             projects,
             pingora_service: pingora,
             grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
+            session_stream_registry: Arc::new(crate::grpc::SessionStreamRegistry::new()),
             api_key_config,
             pod_creating: Arc::new(DashMap::new()),
             pod_created_tx: Arc::new(pod_created_tx),

@@ -320,6 +320,7 @@ pub async fn devcomputer_notify_resolved(
 pub async fn devcomputer_agent_progress_notification(
     params: I18nPath<SessionNotificationParams>,
     state: State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
-    computer_agent_progress_notification(params, state).await
+    computer_agent_progress_notification(params, state, headers).await
 }

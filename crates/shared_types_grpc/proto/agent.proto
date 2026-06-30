@@ -108,6 +108,9 @@ message ChatResponse {
 
 message ProgressRequest {
   string session_id = 1;
+  // 客户端最后收到的 seq；订阅方带上以请求增量 replay（只回放 seq > from_seq 的消息）。
+  // 缺省（None / 0）= 全量回放（向后兼容旧行为）。
+  optional uint64 from_seq = 2;
 }
 
 // ProgressEvent 进度事件（简化版：完全透传 ACP JSON）
@@ -126,6 +129,11 @@ message ProgressEvent {
   string payload = 3;
   // 可选的请求 ID，用于关联请求和响应
   optional string request_id = 4;
+  // 消息序号（session 级单调递增）。语义：
+  // - seq >= 1：真实消息序号，订阅方据此去重与增量补齐（只接受 seq > 已收最大值的消息）。
+  // - seq == 0：哨兵值——合成消息（cancel/idle_timeout/channel_closed 等）或旧版本，
+  //   订阅方无条件转发，不参与去重、不更新消费游标。
+  uint64 seq = 5;
   // 时间戳 (使用 Unix timestamp，单位：毫秒)
   int64 timestamp = 11;
 }

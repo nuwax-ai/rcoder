@@ -63,6 +63,9 @@ pub async fn subscribe_progress(
     shared_types::scope_request_locale(locale, async move {
         let req = request.into_inner();
         let session_id = req.session_id.clone();
+        // 订阅方的消费游标：只回放 seq > from_seq 的消息（增量补齐）。
+        // 缺省（None / 0）= 全量回放（向后兼容）。
+        let from_seq = req.from_seq.unwrap_or(0);
 
         info!(
             "[gRPC] SubscribeProgress started: session_id={}",
@@ -116,7 +119,7 @@ pub async fn subscribe_progress(
                 "[gRPC] Creating new SSE connection: session_id={}",
                 session_id_clone
             );
-            match session_data.create_new_connection(100).await {
+            match session_data.create_new_connection(100, from_seq).await {
                 Ok((replay_messages, message_rx, cancellation_token)) => {
                     info!(
                         "[gRPC] Session connection created successfully: session_id={}, replay_count={}",
@@ -124,8 +127,8 @@ pub async fn subscribe_progress(
                     );
 
                     // 📼 回放 ring buffer 中的历史消息
-                    for msg in replay_messages {
-                        let event = unified_message_to_progress_event(&msg);
+                    for (seq, msg) in replay_messages {
+                        let event = unified_message_to_progress_event(seq, &msg);
                         debug!(
                             "[gRPC] Replaying ProgressEvent: session_id={}, message_type={}, sub_type={}, payload={}",
                             session_id_clone, event.message_type, event.sub_type, event.payload
@@ -185,7 +188,7 @@ pub async fn subscribe_progress(
 /// 独立函数避免了 `tokio::select!` 宏展开导致的 definite-assignment 盲区。
 async fn run_stream_loop(
     session_id: &str,
-    mut message_rx: tokio::sync::mpsc::Receiver<shared_types::UnifiedSessionMessage>,
+    mut message_rx: tokio::sync::mpsc::Receiver<(u64, shared_types::UnifiedSessionMessage)>,
     cancellation_token: tokio_util::sync::CancellationToken,
     tx: &mpsc::Sender<Result<ProgressEvent, Status>>,
     locale: &'static str,
@@ -207,7 +210,7 @@ async fn run_stream_loop(
                     request_id: None,
                 });
                 let unified_message = notify.to_unified_message();
-                let end_event = unified_message_to_progress_event(&unified_message);
+                let end_event = unified_message_to_progress_event(0, &unified_message);
 
                 if let Err(e) = tx.send(Ok(end_event)).await {
                     warn!("[gRPC] Failed to send SessionPromptEnd event: session_id={}, error={}", session_id, e);
@@ -217,7 +220,7 @@ async fn run_stream_loop(
             }
             msg = message_rx.recv() => {
                 match msg {
-                    Some(unified_message) => {
+                    Some((seq, unified_message)) => {
                         // 重置空闲超时计时器
                         last_message_time = Instant::now();
 
@@ -226,7 +229,7 @@ async fn run_stream_loop(
                             crate::model::SessionMessageType::SessionPromptEnd
                         );
 
-                        let event = unified_message_to_progress_event(&unified_message);
+                        let event = unified_message_to_progress_event(seq, &unified_message);
                         debug!(
                             "[gRPC] Sending ProgressEvent: session_id={}, message_type={}, sub_type={}, payload={}",
                             session_id, event.message_type, event.sub_type, event.payload
@@ -254,6 +257,7 @@ async fn run_stream_loop(
                                 shared_types_i18n::get_i18n_message("grpc.subscribe.no_active_task", locale)
                             ),
                             request_id: None,
+                            seq: 0,
                             timestamp: chrono::Utc::now().timestamp_millis(),
                         };
                         if let Err(e) = tx.send(Ok(end_event)).await {
@@ -278,6 +282,7 @@ async fn run_stream_loop(
                             shared_types_i18n::get_i18n_message("grpc.subscribe.idle_timeout", locale)
                         ),
                         request_id: None,
+                        seq: 0,
                         timestamp: chrono::Utc::now().timestamp_millis(),
                     };
                     let _ = tx.send(Ok(timeout_event)).await;
@@ -289,6 +294,7 @@ async fn run_stream_loop(
                     sub_type: "ping".to_string(),
                     payload: r#"{"type":"heartbeat","message":"keep-alive"}"#.to_string(),
                     request_id: None,
+                    seq: 0,
                     timestamp: chrono::Utc::now().timestamp_millis(),
                 };
 
@@ -302,6 +308,7 @@ async fn run_stream_loop(
 }
 
 fn unified_message_to_progress_event(
+    seq: u64,
     message: &shared_types::UnifiedSessionMessage,
 ) -> ProgressEvent {
     let timestamp = message.timestamp.timestamp_millis();
@@ -315,6 +322,7 @@ fn unified_message_to_progress_event(
             .get("request_id")
             .and_then(|v| v.as_str())
             .map(String::from),
+        seq,
         timestamp,
     }
 }

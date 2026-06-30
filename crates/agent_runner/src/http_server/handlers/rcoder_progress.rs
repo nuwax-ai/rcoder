@@ -249,7 +249,7 @@ pub async fn handle_rcoder_progress(
     );
     // 2. 创建新的消息订阅（DashMap 锁已释放，此处 await 安全）
     let (replay_messages, message_rx, _cancel_token) =
-        match session_data.create_new_connection(1000).await {
+        match session_data.create_new_connection(1000, 0).await {
             Ok(conn) => conn,
             Err(e) => {
                 error!(
@@ -274,7 +274,8 @@ pub async fn handle_rcoder_progress(
     // 3. 创建消息流和心跳流
 
     // 📼 回放 ring buffer 中的历史消息
-    let replay_stream = futures_util::stream::iter(replay_messages.into_iter().map(|msg| {
+    let replay_stream = futures_util::stream::iter(replay_messages.into_iter().map(|(seq, msg)| {
+        let _ = seq; // HTTP server 直接序列化 UnifiedSessionMessage（无 seq 字段），与 gRPC ProgressEvent 不同
         let is_terminal = matches!(msg.message_type, SessionMessageType::SessionPromptEnd);
         let json_str = match serde_json::to_string(&msg) {
             Ok(s) => s,
@@ -289,7 +290,8 @@ pub async fn handle_rcoder_progress(
         )
     }));
 
-    let real_time_stream = ReceiverStream::new(message_rx).map(|msg| {
+    let real_time_stream = ReceiverStream::new(message_rx).map(|(seq, msg)| {
+        let _ = seq;
         let is_terminal = matches!(msg.message_type, SessionMessageType::SessionPromptEnd);
         let json_str = match serde_json::to_string(&msg) {
             Ok(s) => s,

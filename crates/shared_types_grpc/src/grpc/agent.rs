@@ -80,6 +80,10 @@ pub struct ChatResponse {
 pub struct ProgressRequest {
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
+    /// 客户端最后收到的 seq；订阅方带上以请求增量 replay（只回放 seq > from_seq 的消息）。
+    /// 缺省（None / 0）= 全量回放（向后兼容旧行为）。
+    #[prost(uint64, optional, tag = "2")]
+    pub from_seq: ::core::option::Option<u64>,
 }
 /// ProgressEvent 进度事件（简化版：完全透传 ACP JSON）
 ///
@@ -103,6 +107,13 @@ pub struct ProgressEvent {
     /// 可选的请求 ID，用于关联请求和响应
     #[prost(string, optional, tag = "4")]
     pub request_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// 消息序号（session 级单调递增）。语义：
+    ///
+    /// * seq >= 1：真实消息序号，订阅方据此去重与增量补齐（只接受 seq > 已收最大值的消息）。
+    /// * seq == 0：哨兵值——合成消息（cancel/idle_timeout/channel_closed 等）或旧版本，
+    ///   订阅方无条件转发，不参与去重、不更新消费游标。
+    #[prost(uint64, tag = "5")]
+    pub seq: u64,
     /// 时间戳 (使用 Unix timestamp，单位：毫秒)
     #[prost(int64, tag = "11")]
     pub timestamp: i64,
