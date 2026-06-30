@@ -7,7 +7,7 @@
 # ============================================================================
 
 # 全局 ARG 声明（必须在第一个 FROM 之前，才能在后续 FROM 中使用）
-ARG BASE_IMAGE=master-rcoder-base:latest
+ARG BASE_IMAGE=dev-master-rcoder-base:latest
 
 # ============================================================================
 # 第一阶段：构建 Rust 项目
@@ -44,6 +44,10 @@ RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# 使用国内镜像加速 rustup（避免 rust-lang.org 被墙，cargo build 下载 channel toml 失败）
+ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static/
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup/
 
 # 安装 Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
@@ -97,6 +101,9 @@ ARG CACHEBUST=1
 # agent install
 RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 
+# 安装 codex-acp（Codex ACP 代理）
+RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
+
 # # 安装 claude-code-acp-ts（从源码构建，用于测试）
 # # 使用 npm pack + npm install -g <tarball> 确保复制文件而非 symlink
 # RUN echo "Cache bust: ${CACHEBUST}" && \
@@ -116,13 +123,46 @@ RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest
 # 安装 nuwax-file-server（文件服务器）
 RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwax-file-server@latest
 
+
+
+
+# 使用国内镜像源加速下载（取消注释：rust-lang.org 被墙，第二阶段装 Rust 也需走 USTC）
+ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static/
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup/
+# 安装 Rust 并验证
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    echo 'export PATH="/root/.cargo/bin:$PATH"' >> /root/.bashrc && \
+    export PATH="/root/.cargo/bin:$PATH" && \
+    which cargo && cargo --version
+
+# 设置 PATH 环境变量（确保后续命令能找到 cargo）
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 复制 cargo 镜像配置文件（使用国内镜像加速）
+COPY .cargo/config.toml /root/.cargo/config.toml
+# 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
+RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest
+
+
+
 # 配置 nuwaxcode - 禁用 websearch, webfetch 和 question 权限
 RUN mkdir -p /root/.config/opencode && \
     echo '{\n  "permission": {\n    "websearch": "deny",\n    "webfetch": "deny",\n    "question": "deny"\n  }\n}' > /root/.config/opencode/opencode.json
 
+# ============================================================================
+# 🖥️ ttyd Web 终端配置
+# ============================================================================
+# 复制 ttyd 启动脚本和自定义前端页面
+COPY docker/rcoder-master/ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
+COPY docker/rcoder-master/ttyd/ttyd-index.html /usr/local/share/ttyd/index.html
+RUN chmod +x /usr/local/bin/start-ttyd.sh
 
+# 复制 agent-runner 启动脚本（同时启动 ttyd 和 agent_runner）
+COPY docker/rcoder-master/agent-runner-start.sh /app/agent-runner-start.sh
+RUN chmod +x /app/agent-runner-start.sh
 
 # 暴露端口
 EXPOSE 8086
 EXPOSE 60000
 EXPOSE 80
+EXPOSE 7681

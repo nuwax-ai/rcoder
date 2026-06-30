@@ -2,10 +2,16 @@
 //!
 //! 定期从运行时同步容器状态。
 //! 在 K8s 模式下通过 Runtime API 获取 Pod 状态；在 Docker 模式下同样通过 Runtime 抽象层访问。
+//!
+//! 注意：本模块由 binary (main.rs) 使用，lib 内部不直接调用。
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+use container_runtime_api::ContainerRuntime;
 
 use crate::grpc::GrpcChannelPool;
 
@@ -35,6 +41,7 @@ impl Default for ContainerSyncConfig {
 pub fn start_container_sync_task(
     config: ContainerSyncConfig,
     grpc_pool: Arc<GrpcChannelPool>,
+    runtime: Arc<dyn ContainerRuntime>,
 ) -> tokio::task::JoinHandle<()> {
     info!(
         "🔄 [CONTAINER_SYNC] Starting container state sync task: interval={}s",
@@ -47,15 +54,6 @@ pub fn start_container_sync_task(
 
         loop {
             interval.tick().await;
-
-            // 获取全局 Runtime
-            let runtime = match docker_manager::runtime::RuntimeManager::get().await {
-                Ok(rt) => rt,
-                Err(e) => {
-                    warn!("[CONTAINER_SYNC] Failed to get runtime: {}", e);
-                    continue;
-                }
-            };
 
             // 同步缓存状态 - 清理失效的容器记录
             debug!("[CONTAINER_SYNC] Syncing container states...");
@@ -77,7 +75,7 @@ pub fn start_container_sync_task(
                                     container.container_ip,
                                     shared_types::GRPC_DEFAULT_PORT
                                 );
-                                grpc_pool.remove(&grpc_addr);
+                                grpc_pool.remove(&grpc_addr).await;
                             }
                         }
                     }

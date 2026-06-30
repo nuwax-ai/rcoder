@@ -22,3 +22,14 @@ docker/logs
 
 # Stakpak session files
 .stakpak/session*
+crates/agent_runner/config.yml
+
+# npm package binaries (generated during CI)
+npm/*/rcoder-cli
+npm/*/rcoder-cli.exe
+
+docker/app-workspace/*
+
+
+# Ignore DevSpace cache and log folder
+.devspace/

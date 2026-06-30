@@ -21,11 +21,6 @@
         "template": "{user_prompt}",
         "enabled": false
       },
-      "installation": {
-        "package_manager": "npm",
-        "package_name": "claude-code-acp-ts@latest",
-        "version": "latest"
-      },
       "enabled": true,
       "metadata": {
         "description": "Claude Code ACP Agent - Default configuration",

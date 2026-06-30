@@ -1,6 +1,11 @@
+// 顶层 router 仅 AppState 被 grpc/main 使用；create_router/ApiDoc 等已迁至
+// http_server::router，保留这里的实现以兼容现有引用。抑制 dead_code 警告。
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
-use crate::agent_runtime::AgentRuntime;
+use crate::agent_mgmt::{AgentRegistry, PathManager};
+use crate::service::AgentSessionService;
 use crate::{config::AppConfig, handler};
 use axum::{Router, response::IntoResponse, routing::get};
 use dashmap::DashMap;
@@ -27,16 +32,8 @@ pub struct AppState {
     /// 应用配置
     pub config: AppConfig,
 
-    /// 🆕 Agent Runtime（新架构）
-    ///
-    /// **推荐**: 使用 `agent_runtime.send().await` 发送任务
-    /// - 支持自动重启
-    /// - 提供健康状态检查
-    /// - 线程安全的原子操作
-    pub local_task_sender: Arc<AgentRuntime>,
-
-    /// 🆕 Agent Runtime（用于健康检查和状态监控）
-    pub agent_runtime: Arc<AgentRuntime>,
+    /// Agent 会话服务
+    pub agent_session_service: Arc<AgentSessionService>,
 
     /// Pingora 代理服务引用（用于读取真实指标）
     #[cfg(feature = "proxy")]
@@ -52,6 +49,11 @@ pub struct AppState {
 
     /// 🔒 project_id -> service_uuid 映射（用于清理时查找对应的配置）
     pub project_uuid_map: Arc<DashMap<String, String>>,
+
+    /// Agent 管理注册表(P0-1)
+    pub agent_mgmt_registry: Arc<AgentRegistry>,
+    /// Agent 安装目录管理(P0-1)
+    pub agent_mgmt_path_manager: PathManager,
 }
 
 /// 创建 Axum 路由
@@ -109,7 +111,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
     components(
         schemas(
             // 响应结构体
-            handler::HealthResponse,
+            shared_types::HealthResponse,
+            shared_types::HealthCheckResponse,
         )
     ),
     tags(
@@ -144,7 +147,7 @@ agent_runner 主要通过 gRPC 提供服务：
 "#,
         title = "RCoder AI API",
         version = "2.0.0",
-        license(name = "MIT OR Apache-2.0", url = "https://opensource.org/licenses/MIT"),
+        license(name = "Apache-2.0", url = "https://www.apache.org/licenses/LICENSE-2.0"),
         contact(
             name = "RCoder Team",
             email = "team@rcoder.com",

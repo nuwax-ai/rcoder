@@ -8,7 +8,8 @@ use super::{CleanupContext, CleanupStrategy, DestroyReason, ProjectInfo};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use duckdb_manager::ProjectRecord;
+use shared_types::ProjectAndContainerInfo;
+use std::sync::Arc;
 use tracing::info;
 
 /// ComputerAgentRunner 清理策略
@@ -37,13 +38,16 @@ impl CleanupStrategy for ComputerRunnerStrategy {
             .and_then(|p| p.user_id().map(|s| s.to_string()))
             .ok_or_else(|| anyhow::anyhow!("Failed to get user_id: {}", project_id))?;
 
-        // 查询该用户的所有项目
-        let related_projects = context.state.projects.find_projects_by_user_id(&user_id);
+        // 查询该用户的所有 Computer 项目（按 service_type 过滤，排除 Web 项目干扰）
+        let related_projects = context
+            .state
+            .projects
+            .find_projects_by_user_id(&user_id, &shared_types::ServiceType::ComputerAgentRunner);
 
         // 检查是否还有其他活跃项目（排除当前项目）
         let has_active_refs = related_projects
             .iter()
-            .any(|p| p.project_id != project_id && is_project_active(p, &context.config));
+            .any(|p| p.project_id() != project_id && is_project_active(p, &context.config));
 
         if has_active_refs {
             // 还有其他活跃项目，不销毁容器
@@ -57,7 +61,7 @@ impl CleanupStrategy for ComputerRunnerStrategy {
             let now = Utc::now();
             let max_idle_duration = related_projects
                 .iter()
-                .map(|p| (now - p.last_activity).num_seconds())
+                .map(|p| (now - p.last_activity()).num_seconds())
                 .max()
                 .unwrap_or(0);
 
@@ -91,10 +95,10 @@ impl CleanupStrategy for ComputerRunnerStrategy {
 /// 这与 scanner 的 idle 判断标准一致，避免出现 scanner 认为项目未超时
 /// 但策略却认为项目不活跃的矛盾情况。
 pub fn is_project_active(
-    project: &ProjectRecord,
+    project: &Arc<ProjectAndContainerInfo>,
     config: &crate::cleanup_task::config::CleanupConfig,
 ) -> bool {
     let now = Utc::now();
-    let idle_duration = now - project.last_activity;
+    let idle_duration = now - project.last_activity();
     idle_duration.num_seconds() < config.idle_timeout.as_secs() as i64
 }

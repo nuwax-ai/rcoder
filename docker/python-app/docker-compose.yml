@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  python-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rcoder-python-app
+    ports:
+      - "8080:80"       # Nginx HTTP
+      - "8443:443"      # Nginx HTTPS
+      - "9000:5000"     # Python 应用直连
+      - "3000:3000"     # Node.js 应用直连
+      - "5432:5432"     # PostgreSQL
+      - "2379:2379"     # etcd 客户端端口
+      - "2380:2380"     # etcd 对等端口
+    volumes:
+      - ./src:/app/src                # 应用代码
+      - ./data/postgres:/app/data/postgresql  # PostgreSQL 数据
+      - ./data/etcd:/app/data/etcd    # etcd 数据
+      - ./logs:/var/log/supervisor    # 日志
+      - ./config:/app/config          # 配置文件
+    environment:
+      - POSTGRES_USER=appuser
+      - POSTGRES_PASSWORD=apppassword
+      - POSTGRES_DB=appdb
+      - FLASK_ENV=production
+      - NODE_ENV=production
+      - PYTHONUNBUFFERED=1
+      - ETCD_NAME=etcd-node-1
+      - ETCD_ENDPOINTS=http://localhost:2379
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - rcoder-network
+
+networks:
+  rcoder-network:
+    driver: bridge

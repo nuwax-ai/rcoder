@@ -53,6 +53,7 @@
 
 mod claude_code_sacp;
 pub mod lifecycle;
+pub mod model_env;
 #[cfg(windows)]
 mod windows_launch;
 
@@ -61,11 +62,16 @@ mod windows_launch;
 // ============================================================================
 
 pub use lifecycle::AgentLifecycleGuard;
+pub use model_env::{
+    DirectModelRuntimeEnvResolver, ModelRuntimeEnvResolver, ProxyModelRuntimeEnvResolver,
+    ResolvedModelEnv, direct_model_runtime_env_resolver,
+};
 
 // 直接导出 SACP 类型
 pub use claude_code_sacp::{
     SacpAgentLaunchConfig, SacpClaudeCodeLauncher, SacpLauncherConnectionInfo,
     convert_context_servers_sacp, get_default_sacp_agent_config, load_sacp_agent_config,
+    set_mcp_proxy_log_dir,
 };
 
 // ============================================================================

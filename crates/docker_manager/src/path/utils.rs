@@ -46,6 +46,10 @@ pub async fn get_host_path_resolver() -> DockerResult<HostPathResolver> {
 
 /// 标准化路径（移除冗余的 `.` 和 `..` 组件）
 ///
+/// # 安全行为
+/// - **绝对路径**: 根目录处的 `..` 被忽略（无法逃逸根目录）
+/// - **相对路径**: 前导 `..` 被保留，调用方可据此检测路径逃逸尝试
+///
 /// # Arguments
 /// * `path` - 要标准化的路径
 ///
@@ -59,19 +63,44 @@ pub async fn get_host_path_resolver() -> DockerResult<HostPathResolver> {
 ///
 /// let normalized = normalize_path(Path::new("/app/./project/../project/src"));
 /// assert_eq!(normalized, Path::new("/app/project/src"));
+///
+/// // 相对路径中的前导 `..` 被保留
+/// let normalized = normalize_path(Path::new("../../../etc/passwd"));
+/// assert_eq!(normalized, Path::new("../../../etc/passwd"));
 /// ```
 pub fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
     let mut components = Vec::new();
+    let mut is_absolute = false;
 
     for component in path.components() {
         match component {
-            std::path::Component::CurDir => {
+            Component::RootDir => {
+                is_absolute = true;
+                components.push(component);
+            }
+            #[cfg(windows)]
+            Component::Prefix(_) => {
+                is_absolute = true;
+                components.push(component);
+            }
+            Component::CurDir => {
                 // 跳过 `.`
             }
-            std::path::Component::ParentDir => {
+            Component::ParentDir => {
                 // 处理 `..`
-                if !components.is_empty() {
-                    components.pop();
+                match components.last() {
+                    // 已有正常组件可以回退（不能回退到 RootDir 或 Prefix 之前）
+                    Some(Component::Normal(_)) => {
+                        components.pop();
+                    }
+                    // 相对路径：保留前导 `..`，供调用方检测路径逃逸
+                    None | Some(Component::ParentDir) if !is_absolute => {
+                        components.push(component);
+                    }
+                    // 绝对路径根目录处的 `..` 或紧跟 `..` 后的 `..`：忽略
+                    _ => {}
                 }
             }
             other => {
@@ -80,7 +109,11 @@ pub fn normalize_path(path: &Path) -> PathBuf {
         }
     }
 
-    components.iter().collect()
+    if components.is_empty() {
+        PathBuf::from(".")
+    } else {
+        components.iter().collect()
+    }
 }
 
 #[cfg(test)]
@@ -120,5 +153,43 @@ mod tests {
         let path = Path::new("project/./src/../lib");
         let normalized = normalize_path(path);
         assert_eq!(normalized, Path::new("project/lib"));
+    }
+
+    #[test]
+    fn test_normalize_path_absolute_root_parent() {
+        // 绝对路径根目录处的 `..` 被忽略，不逃逸根目录
+        let path = Path::new("/../etc/passwd");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("/etc/passwd"));
+    }
+
+    #[test]
+    fn test_normalize_path_relative_leading_parent_preserved() {
+        // 相对路径的前导 `..` 被保留，供调用方检测路径逃逸
+        let path = Path::new("../../../etc/passwd");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("../../../etc/passwd"));
+    }
+
+    #[test]
+    fn test_normalize_path_relative_mixed_parents() {
+        // 相对路径中混合 `..` 和正常组件
+        let path = Path::new("../foo/../bar");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("../bar"));
+    }
+
+    #[test]
+    fn test_normalize_path_empty_relative() {
+        let path = Path::new(".");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("."));
+    }
+
+    #[test]
+    fn test_normalize_path_only_parents() {
+        let path = Path::new("../..");
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, Path::new("../.."));
     }
 }

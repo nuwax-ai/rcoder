@@ -2,7 +2,7 @@
 //!
 //! 提供测试用的构造器和辅助工具
 
-use crate::proxy_agent::AgentRequest;
+use crate::service::AgentRequest;
 use agent_abstraction::PromptMessage;
 use shared_types::{Attachment, ServiceType};
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 /// use agent_runner::testing::fixtures::TestRequestBuilder;
 ///
 /// // 创建基础测试请求
-/// let (req, resp_rx) = TestRequestBuilder::new()
+/// let req = TestRequestBuilder::new()
 ///     .project_id("test-project")
 ///     .content("Hello, Agent!")
 ///     .build();
@@ -99,20 +99,17 @@ impl TestRequestBuilder {
             request_id: self.request_id.clone(),
             attachments: self.attachments.clone(),
             data_source_attachments: vec![],
-            service_type: ServiceType::RCoder,
+            service_type: ServiceType::WebAgentRunner,
+            user_id: None,
             system_prompt_override: None,
             user_prompt_template_override: None,
             agent_config_override: None,
+            is_devcomputer: false,
         }
     }
 
     /// 构建测试请求
-    pub fn build(
-        self,
-    ) -> (
-        AgentRequest,
-        tokio::sync::oneshot::Receiver<crate::model::ChatPromptResponse>,
-    ) {
+    pub fn build(self) -> AgentRequest {
         let prompt_message = self.build_prompt_message();
         AgentRequest::new(prompt_message, None)
     }
@@ -134,7 +131,7 @@ mod tests {
         assert_eq!(prompt.project_path, PathBuf::from("/tmp/test"));
         assert!(prompt.session_id.is_none());
         assert!(prompt.attachments.is_empty());
-        assert_eq!(prompt.service_type, ServiceType::RCoder);
+        assert_eq!(prompt.service_type, ServiceType::WebAgentRunner);
     }
 
     #[test]
@@ -201,12 +198,10 @@ mod tests {
     }
 
     #[test]
-    fn test_test_request_builder_build_returns_receiver() {
-        // 验证 build() 返回的接收器可用
-        let (_req, mut rx) = TestRequestBuilder::new().build();
-
-        // 验证接收器尚未收到消息
-        assert!(rx.try_recv().is_err(), "接收器应该为空");
+    fn test_test_request_builder_build_returns_agent_request() {
+        let request = TestRequestBuilder::new().build();
+        assert_eq!(request.prompt_message.project_id, "test-project");
+        assert_eq!(request.prompt_message.content, "Hello, Agent!");
     }
 
     #[test]

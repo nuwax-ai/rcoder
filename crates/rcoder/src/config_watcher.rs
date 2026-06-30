@@ -80,11 +80,15 @@ impl ConfigWatcher {
             }
         })?;
 
-        watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
+        // 监控父目录而非文件本身，以兼容编辑器的原子保存（write-to-temp + rename）
+        // 原子保存会产生 Remove 事件导致文件级 watcher 丢失跟踪
+        let parent_dir = config_path.parent().unwrap_or(&config_path);
+        let file_name = config_path.file_name().map(|n| n.to_os_string());
+        watcher.watch(parent_dir, RecursiveMode::NonRecursive)?;
 
         info!(
-            "📁 [CONFIG_WATCHER] Starting config file watch: {:?}",
-            config_path
+            "📁 [CONFIG_WATCHER] Starting config file watch: {:?} (parent dir: {:?})",
+            config_path, parent_dir
         );
 
         // 克隆必要的数据以在 tokio 任务中使用
@@ -95,18 +99,53 @@ impl ConfigWatcher {
         tokio::spawn(async move {
             loop {
                 if let Some(event) = rx.recv().await {
-                    // 只处理修改事件
-                    if matches!(event.kind, EventKind::Modify(_)) {
-                        // 添加短暂延迟，避免文件未完全写入
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    // 过滤：只处理目标配置文件的事件
+                    if let Some(ref name) = file_name {
+                        let event_matches = event.paths.iter().any(|p| {
+                            p.file_name()
+                                .map(|n| n == name.as_os_str())
+                                .unwrap_or(false)
+                        });
+                        if !event_matches {
+                            continue;
+                        }
+                    }
 
-                        if let Err(e) = Self::reload_config(
-                            &config_path_clone,
-                            Arc::clone(&api_key_config_clone),
-                        )
-                        .await
-                        {
-                            warn!(" [CONFIG_WATCHER] config reload failed: {}", e);
+                    // 只处理修改和创建事件（原子保存会产生 Create 事件）
+                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                        // 使用重试机制确保文件完全写入
+                        // 某些编辑器（如 vim）的原子保存可能需要更长时间
+                        let max_retries = 3;
+                        let mut retry_delay = Duration::from_millis(100);
+
+                        for attempt in 1..=max_retries {
+                            tokio::time::sleep(retry_delay).await;
+
+                            match Self::reload_config(
+                                &config_path_clone,
+                                Arc::clone(&api_key_config_clone),
+                            )
+                            .await
+                            {
+                                Ok(_) => break,
+                                Err(e) => {
+                                    if attempt == max_retries {
+                                        warn!(
+                                            " [CONFIG_WATCHER] config reload failed after {} attempts: {}",
+                                            max_retries, e
+                                        );
+                                    } else {
+                                        warn!(
+                                            " [CONFIG_WATCHER] config reload attempt {}/{} failed: {}, retrying in {}ms",
+                                            attempt,
+                                            max_retries,
+                                            e,
+                                            retry_delay.as_millis()
+                                        );
+                                        retry_delay *= 2; // 指数退避
+                                    }
+                                }
+                            }
                         }
                     }
                 }

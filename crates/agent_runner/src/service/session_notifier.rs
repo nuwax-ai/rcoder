@@ -9,7 +9,8 @@ use shared_types::{
     AgentSessionUpdate, SessionNotify, SessionPromptEnd, SessionPromptError, SessionPromptStart,
 };
 
-use super::push_session_update_with_project;
+use super::{SESSION_CACHE, push_session_update_with_project};
+use tracing::{debug, info};
 
 /// SSE 消息推送器
 ///
@@ -37,6 +38,39 @@ impl SessionNotifier for SseSessionNotifier {
         session_id: &str,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 🧹 新任务开始时清空 ring buffer，防止回放过期的历史消息
+        // 这是清空 ring buffer 的最佳时机：
+        // 1. cancel/stop 后不能清空，因为需要通过 SSE 发送 SessionPromptEnd 给客户端
+        // 2. 在新任务开始时清空，确保不会回放上一次对话的消息
+        info!(
+            "[SseSessionNotifier] notify_prompt_start called: project_id={}, session_id={}",
+            project_id, session_id
+        );
+
+        if let Some(sd) = SESSION_CACHE.view(session_id, |_, d| d.clone()) {
+            info!(
+                "[SseSessionNotifier] SESSION_CACHE found for session_id={}, attempting to clear ring buffer",
+                session_id
+            );
+            let cleared = sd.clear_message_buffer().await;
+            if cleared > 0 {
+                info!(
+                    "[SseSessionNotifier] Cleared {} stale messages from ring buffer at prompt start: session_id={}",
+                    cleared, session_id
+                );
+            } else {
+                info!(
+                    "[SseSessionNotifier] Ring buffer already empty for session_id={}",
+                    session_id
+                );
+            }
+        } else {
+            info!(
+                "[SseSessionNotifier] SESSION_CACHE not found for session_id={}, skipping clear (new session)",
+                session_id
+            );
+        }
+
         let notify = SessionNotify::SessionPromptStart(SessionPromptStart {
             session_id: session_id.to_string(),
             request_id,
@@ -51,7 +85,7 @@ impl SessionNotifier for SseSessionNotifier {
         &self,
         project_id: &str,
         session_id: &str,
-        stop_reason: agent_client_protocol::schema::StopReason,
+        stop_reason: agent_client_protocol::schema::v1::StopReason,
         error_message: Option<String>,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -71,7 +105,7 @@ impl SessionNotifier for SseSessionNotifier {
         &self,
         project_id: &str,
         session_id: &str,
-        error: agent_client_protocol::schema::Error,
+        error: agent_client_protocol::schema::v1::Error,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let notify = SessionNotify::SessionPromptError(SessionPromptError {
@@ -89,9 +123,14 @@ impl SessionNotifier for SseSessionNotifier {
         &self,
         project_id: &str,
         session_id: &str,
-        session_update: agent_client_protocol::schema::SessionUpdate,
+        session_update: agent_client_protocol::schema::v1::SessionUpdate,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(
+            "[SseSessionNotifier] Received SessionUpdate from agent: project_id={}, session_id={}, update={:?}",
+            project_id, session_id, session_update
+        );
+
         let notify = SessionNotify::AgentSessionUpdate(Box::new(AgentSessionUpdate {
             session_id: session_id.to_string(),
             session_update,

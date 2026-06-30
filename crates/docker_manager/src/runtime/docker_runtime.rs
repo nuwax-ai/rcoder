@@ -41,6 +41,10 @@ impl ContainerRuntime for DockerRuntime {
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        // start_agent_container 被标记为 deprecated 是因为返回的 container_id 可能过期，
+        // 但 ContainerRuntime trait 的调用方应通过 find_container 获取最新信息，
+        // 因此在 runtime 适配层使用是安全的。
+        #[allow(deprecated)]
         self.inner
             .start_agent_container(params)
             .await
@@ -63,7 +67,7 @@ impl ContainerRuntime for DockerRuntime {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         match service_type {
-            ServiceType::RCoder => self
+            ServiceType::WebAgentRunner => self
                 .inner
                 .get_agent_info(identifier)
                 .await
@@ -118,11 +122,10 @@ impl ContainerRuntime for DockerRuntime {
                 crate::types::ContainerStatus::Dead => ContainerRuntimeStatus::Failed,
                 crate::types::ContainerStatus::Removing => ContainerRuntimeStatus::Failed,
                 crate::types::ContainerStatus::Exited => ContainerRuntimeStatus::Failed,
-                crate::types::ContainerStatus::Unknown(s) => {
-                    ContainerRuntimeStatus::Unknown(s)
-                }
+                crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s),
             },
-            created_at: chrono::Utc::now(),
+            created_at: r.created_at,
+            env_vars: None, // 不填充环境变量（用于快速查找）
         }))
     }
 
@@ -139,7 +142,7 @@ impl ContainerRuntime for DockerRuntime {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
         match service_type {
-            ServiceType::RCoder => self
+            ServiceType::WebAgentRunner => self
                 .inner
                 .stop_container(identifier)
                 .await
@@ -208,13 +211,9 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     async fn health_check(&self) -> ContainerRuntimeResult<()> {
-        self.inner
-            .get_docker_client()
-            .ping()
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::ConnectionError(format!("Docker ping failed: {}", e))
-            })?;
+        self.inner.get_docker_client().ping().await.map_err(|e| {
+            ContainerRuntimeError::ConnectionError(format!("Docker ping failed: {}", e))
+        })?;
         Ok(())
     }
 }
@@ -232,6 +231,16 @@ impl DockerRuntime {
                 .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string()))?
                 .unwrap_or_default();
 
+            // 构建环境变量映射（包含 project_id 和 service_type）
+            let mut env_vars = std::collections::HashMap::new();
+            env_vars.insert("PROJECT_ID".to_string(), c.project_id.clone());
+            if let Some(ref user_id) = c.user_id {
+                env_vars.insert("USER_ID".to_string(), user_id.clone());
+            }
+            if let Some(ref service_type) = c.service_type {
+                env_vars.insert("SERVICE_TYPE".to_string(), service_type.to_string());
+            }
+
             result.push(RuntimeContainerInfo {
                 container_id: c.container_id,
                 container_name: c.container_name,
@@ -247,11 +256,10 @@ impl DockerRuntime {
                     crate::types::ContainerStatus::Dead => ContainerRuntimeStatus::Failed,
                     crate::types::ContainerStatus::Removing => ContainerRuntimeStatus::Failed,
                     crate::types::ContainerStatus::Exited => ContainerRuntimeStatus::Failed,
-                    crate::types::ContainerStatus::Unknown(s) => {
-                        ContainerRuntimeStatus::Unknown(s)
-                    }
+                    crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s),
                 },
                 created_at: c.created_at,
+                env_vars: Some(env_vars),
             });
         }
         Ok(result)

@@ -5,13 +5,15 @@
 //! 2. 从PROJECT_AND_AGENT_INFO_MAP中移除
 //! 3. AgentLifecycleGuard自动drop并清理资源
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::model::AgentStatus;
-use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
+use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER, SESSION_CACHE};
 
 /// 清理配置
 #[derive(Debug, Clone)]
@@ -101,10 +103,8 @@ impl AgentCleaner {
             // 如果session_id不在活跃映射中，则为孤立session
             if !active_session_ids.contains(&session_id) {
                 // 检查session中是否有消息
-                if let Some(session_data_ref) = SESSION_CACHE.get(&session_id) {
-                    let session_data = session_data_ref.clone();
-                    drop(session_data_ref);
-
+                // view() 在闭包返回后立即释放锁，无 Ref 暴露
+                if let Some(session_data) = SESSION_CACHE.view(&session_id, |_, d| d.clone()) {
                     let message_count = session_data.message_count().await;
 
                     if message_count > 0 {
@@ -196,9 +196,9 @@ impl AgentCleaner {
             }
         }
 
-        // 执行清理 - RAII版：直接从 MAP 中移除，AgentLifecycleGuard 会自动清理
+        // 执行清理：先从 Registry 移除，再显式停止对应 Agent 子进程。
         for project_id in agents_to_remove {
-            match self.cleanup_agent_raii(&project_id) {
+            match self.cleanup_agent_explicit_stop(&project_id).await {
                 Ok(_) => {
                     success_count += 1;
                     info!("Agent cleaned successfully: {}", project_id);
@@ -246,17 +246,15 @@ impl AgentCleaner {
         })
     }
 
-    /// 基于RAII的简化清理方法
-    /// 只需要从MAP中移除agent，AgentLifecycleGuard会自动清理所有资源
-    fn cleanup_agent_raii(&self, project_id: &str) -> Result<()> {
-        debug!("Starting RAII cleanup for agent: {}", project_id);
+    /// 显式停止 Agent 子进程并清理 Registry。
+    ///
+    /// Registry 中的 lifecycle handle 只是一个 Arc 克隆，删除 Registry 不能保证这是最后
+    /// 一个引用。这里主动调用 graceful_stop，避免 idle cleanup 后子进程继续存活。
+    async fn cleanup_agent_explicit_stop(&self, project_id: &str) -> Result<()> {
+        debug!("Starting explicit cleanup for agent: {}", project_id);
 
         // 使用统一 Registry 检查并移除（内部自动同步清理所有映射）
         if AGENT_REGISTRY.contains_project(project_id) {
-            // 通过统一 Registry 移除，自动清理：
-            // - agent_info_map
-            // - project_to_session 映射
-            // - session_to_project 反向映射
             let removed = AGENT_REGISTRY.remove_by_project(project_id);
 
             // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
@@ -266,13 +264,36 @@ impl AgentCleaner {
                 project_id
             );
 
-            if removed.is_some() {
-                info!(
-                    "Agent removed from Registry; AgentLifecycleGuard will clean up resources automatically: {}",
-                    project_id
-                );
-            } else {
-                warn!("Tried to remove agent but it was not found: {}", project_id);
+            match removed {
+                Some(agent_info) => {
+                    let session_id = agent_info.session_id.to_string();
+                    info!(
+                        "Agent removed from Registry: project_id={}, session_id={}",
+                        project_id, session_id
+                    );
+                    // 清理该 session 的动态权限状态（复用 session 没有 lifecycle watcher，idle cleanup 兜底防泄漏）。
+                    PERMISSION_MANAGER.clear_session_state(&session_id);
+
+                    if let Some(stop_handle) = agent_info.stop_handle {
+                        info!(
+                            "Requesting Agent process stop: project_id={}, session_id={}",
+                            project_id, session_id
+                        );
+                        stop_handle.graceful_stop().await?;
+                        info!(
+                            "Agent process stop completed: project_id={}, session_id={}",
+                            project_id, session_id
+                        );
+                    } else {
+                        warn!(
+                            "Agent removed from Registry without stop_handle: project_id={}, session_id={}",
+                            project_id, session_id
+                        );
+                    }
+                }
+                None => {
+                    warn!("Tried to remove agent but it was not found: {}", project_id);
+                }
             }
         } else {
             warn!("Agent not found in Registry: {}", project_id);

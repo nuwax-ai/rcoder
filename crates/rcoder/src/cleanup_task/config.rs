@@ -1,5 +1,7 @@
 //! 清理任务配置和统计
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 

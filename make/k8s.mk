@@ -2,8 +2,8 @@
 # K8s 开发/部署 Makefile (Kustomize)
 # ============================================================================
 
-IMAGE ?= rcoder:test-k8s
-K8S_IMAGE_REGISTRY ?= nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest
+IMAGE ?= dev-rcoder:test-k8s
+K8S_IMAGE_REGISTRY ?= nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder:latest
 KUSTOMIZE_DIR ?= k8s/manifests
 ROLLOUT_TIMEOUT ?= 180s
 
@@ -32,9 +32,8 @@ dev-build-k8s: docker-build-master-base
 	@echo "✅ K8s 镜像构建完成！"
 	@echo ""
 	@echo "📤 推送镜像到阿里云仓库..."
-	@docker tag $(IMAGE) $(K8S_IMAGE_REGISTRY)
-	@skopeo copy docker-daemon:$(K8S_IMAGE_REGISTRY) docker://$(K8S_IMAGE_REGISTRY)
-	@echo "✅ 镜像已推送到 $(K8S_IMAGE_REGISTRY)"
+	@skopeo copy docker-daemon:$(IMAGE) docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder:latest
+	@echo "✅ 镜像已推送到 nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder:latest"
 	@$(MAKE) -s --no-print-directory _k8s-import-image
 	@$(MAKE) -s --no-print-directory _k8s-rollout-restart
 	@echo ""
@@ -172,8 +171,8 @@ kustomize-build:
 # ============================================================================
 
 K8S_LOCAL_NAMESPACE := rcoder-local
-K8S_LOCAL_IMAGE ?= rcoder-local:latest
-K8S_LOCAL_AGENT_IMAGE ?= rcoder-agent-runner-local:latest
+K8S_LOCAL_IMAGE ?= dev-rcoder-local:latest
+K8S_LOCAL_AGENT_IMAGE ?= dev-rcoder-agent-runner-local:latest
 
 # 构建本地 K8s 测试镜像（不推送到远程仓库）
 dev-build-k8s-local:
@@ -182,16 +181,16 @@ dev-build-k8s-local:
 	@docker build -f docker/rcoder-master/Dockerfile -t $(K8S_LOCAL_IMAGE) --build-arg CARGO_FLAGS="--features kubernetes" .
 	@echo "📦 [2/2] 构建 agent-runner..."
 	@echo "  步骤 1: 在 Docker 中编译 agent_runner 二进制..."
-	@docker build -f docker/rcoder-agent-runner/Dockerfile.build -t rcoder-agent-runner-build-local .
+	@docker build -f docker/rcoder-agent-runner/Dockerfile.build -t dev-rcoder-agent-runner-build-local .
 	@mkdir -p docker/rcoder-agent-runner/bin
-	@docker create --name build-container-local rcoder-agent-runner-build-local 2>/dev/null || true
+	@docker create --name build-container-local dev-rcoder-agent-runner-build-local 2>/dev/null || true
 	@docker cp build-container-local:/build/target/release/agent_runner docker/rcoder-agent-runner/bin/agent_runner
 	@docker rm build-container-local
-	@docker rmi rcoder-agent-runner-build-local
+	@docker rmi dev-rcoder-agent-runner-build-local
 	@echo "  步骤 2: 构建最终 agent-runner 镜像..."
 	@cd docker/rcoder-agent-runner && docker build -f Dockerfile --build-arg INSTALL_EBPF_TOOLS=false -t $(K8S_LOCAL_AGENT_IMAGE) .
 	@echo "✅ 本地镜像构建完成！"
-	@docker images | grep -E "rcoder-local|rcoder-agent-runner-local"
+	@docker images | grep -E "dev-rcoder-local|dev-rcoder-agent-runner-local"
 
 # 启动本地 K8s 测试（OrbStack 自动共享 Docker 镜像，无需手动 import）
 dev-up-k8s-local:

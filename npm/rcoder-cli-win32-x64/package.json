@@ -1,0 +1,22 @@
+{
+  "name": "rcoder-cli-windows-x64",
+  "version": "0.0.0",
+  "description": "RCoder CLI binary for win32-x64",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "rcoder-cli.exe"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuwax-ai/rcoder.git"
+  }
+}

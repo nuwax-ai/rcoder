@@ -61,6 +61,13 @@ pub struct RcoderChatRequest {
     /// Agent 运行时配置（Agent 服务器 + MCP 服务器）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_config: Option<ChatAgentConfig>,
+
+    /// Agent 工作目录标识符（可选）
+    /// 用于替代 project_id 参与工作目录路径拼接
+    /// 未提供时使用 project_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "custom_workspace_123")]
+    pub agent_work_dir: Option<String>,
 }
 
 /// RCoder Agent 取消任务请求

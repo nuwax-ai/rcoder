@@ -27,10 +27,19 @@ fn get_trace_id_from_context() -> Option<String> {
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct HttpResult<T> {
+    /// 业务状态码。`"0000"` 表示成功,其他码对应 `error_codes` 模块中常量(前缀如 `ERR_*`)。
+    #[schema(example = "0000")]
     pub code: String,
+    /// 人类可读消息(根据请求 `Accept-Language` 多语言化)
+    #[schema(example = "success")]
     pub message: String,
+    /// 业务数据。成功时为 `Some(T)`,失败时为 `None`
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
+    /// 当前请求的 OpenTelemetry trace id,失败排查时提供给后端
+    #[schema(example = "a1b2c3d4e5f6g7h8")]
     pub tid: Option<String>,
+    /// 是否成功的便捷字段(由 `code == "0000"` 推导,序列化时计算)
     #[serde(skip)]
     pub success: bool,
 }

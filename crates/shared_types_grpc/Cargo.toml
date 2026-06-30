@@ -1,0 +1,20 @@
+[package]
+name = "shared_types_grpc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# gRPC
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+# Serialization (for MaskedModelConfig)
+serde = { workspace = true }
+url = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

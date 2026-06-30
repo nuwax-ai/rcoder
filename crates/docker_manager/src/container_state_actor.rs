@@ -89,13 +89,13 @@ impl ContainerStateActor {
     ///
     /// 这个方法应该在 `tokio::spawn` 中调用
     pub async fn run(mut self) {
-        debug!("🚀 [ACTOR] ContainerStateActor started");
+        debug!("[ACTOR] ContainerStateActor started");
 
         while let Some(cmd) = self.receiver.recv().await {
             self.handle_command(cmd);
         }
 
-        debug!("🛑 [ACTOR] ContainerStateActor stopped (all senders dropped)");
+        debug!("[ACTOR] ContainerStateActor stopped (all senders dropped)");
     }
 
     /// 处理单个命令

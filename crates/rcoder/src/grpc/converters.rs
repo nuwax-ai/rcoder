@@ -4,53 +4,20 @@
 
 use shared_types::grpc::{
     Attachment as GrpcAttachment, AttachmentSource as GrpcAttachmentSource,
-    AudioAttachment as GrpcAudioAttachment, Base64Data, ChatAgentConfig as GrpcChatAgentConfig,
-    ChatAgentServerConfig as GrpcChatAgentServerConfig,
-    ChatContextServerConfig as GrpcChatContextServerConfig, ChatRequest as GrpcChatRequest,
-    ChatResponse as GrpcChatResponse, DocumentAttachment as GrpcDocumentAttachment,
-    ImageAttachment as GrpcImageAttachment, ImageDimensions as GrpcImageDimensions,
+    AudioAttachment as GrpcAudioAttachment, AutoReloadConfig as GrpcAutoReloadConfig, Base64Data,
+    ChatAgentConfig as GrpcChatAgentConfig, ChatAgentServerConfig as GrpcChatAgentServerConfig,
+    ChatContextServerConfig as GrpcChatContextServerConfig, ChatResponse as GrpcChatResponse,
+    DocumentAttachment as GrpcDocumentAttachment, ImageAttachment as GrpcImageAttachment,
+    ImageDimensions as GrpcImageDimensions, ModelEnvBinding as GrpcModelEnvBinding,
+    ModelEnvBindingSource as GrpcModelEnvBindingSource,
     ModelProviderConfig as GrpcModelProviderConfig, ProgressEvent,
     TextAttachment as GrpcTextAttachment, attachment, attachment_source,
 };
 use shared_types::{Attachment, AttachmentSource, ModelProviderConfig, UnifiedSessionMessage};
-use shared_types::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
-
-/// 将内部 ChatRequest 转换为 gRPC ChatRequest
-///
-/// 注意：此函数目前未被使用，chat_client.rs 直接构建 GrpcChatRequest。
-/// 保留以备将来使用或重构。
-#[allow(dead_code)]
-pub fn to_grpc_chat_request(
-    project_id: String,
-    session_id: String,
-    prompt: String,
-    attachments: Vec<Attachment>,
-    data_source_attachments: Vec<String>,
-    model_config: Option<ModelProviderConfig>,
-    request_id: Option<String>,
-    // 新增参数 (v2)
-    system_prompt: Option<String>,
-    user_prompt: Option<String>,
-    agent_config: Option<ChatAgentConfig>,
-    service_type: Option<shared_types::ServiceType>,
-    user_id: Option<String>, // 新增：用于 ComputerAgentRunner 模式
-) -> GrpcChatRequest {
-    GrpcChatRequest {
-        project_id,
-        session_id,
-        prompt,
-        model_config: model_config.map(to_grpc_model_config),
-        attachments: attachments.into_iter().map(to_grpc_attachment).collect(),
-        request_id,
-        data_source_attachments,
-        // 新增字段 (v2)
-        system_prompt,
-        user_prompt,
-        agent_config: agent_config.map(to_grpc_chat_agent_config),
-        service_type: service_type.map(|st| format!("{:?}", st)),
-        user_id, // 传递 user_id
-    }
-}
+use shared_types::{
+    AutoReloadConfig, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig,
+    ModelEnvBinding, ModelEnvBindingSource,
+};
 
 /// 将 ModelProviderConfig 转换为 gRPC 格式
 pub fn to_grpc_model_config(config: ModelProviderConfig) -> GrpcModelProviderConfig {
@@ -62,6 +29,7 @@ pub fn to_grpc_model_config(config: ModelProviderConfig) -> GrpcModelProviderCon
         api_base: Some(config.base_url),
         requires_openai_auth: Some(config.requires_openai_auth),
         api_protocol: config.api_protocol,
+        wire_api: config.wire_api,
     }
 }
 
@@ -159,6 +127,7 @@ pub fn from_grpc_progress_event(
         "SessionPromptStart" => SessionMessageType::SessionPromptStart,
         "SessionPromptEnd" => SessionMessageType::SessionPromptEnd,
         "AgentSessionUpdate" => SessionMessageType::AgentSessionUpdate,
+        "AcpRequestPermission" => SessionMessageType::AcpRequestPermission,
         "Heartbeat" => SessionMessageType::Heartbeat,
         _ => SessionMessageType::AgentSessionUpdate, // 默认为 AgentSessionUpdate
     };
@@ -201,6 +170,14 @@ pub fn to_grpc_chat_agent_config(config: ChatAgentConfig) -> GrpcChatAgentConfig
             .into_iter()
             .map(|(k, v)| (k, to_grpc_chat_context_server_config(v)))
             .collect(),
+        auto_reload: config.auto_reload.map(to_grpc_auto_reload_config),
+    }
+}
+
+/// 将 AutoReloadConfig 转换为 gRPC 格式
+fn to_grpc_auto_reload_config(config: AutoReloadConfig) -> GrpcAutoReloadConfig {
+    GrpcAutoReloadConfig {
+        enabled: config.enabled,
     }
 }
 
@@ -214,6 +191,50 @@ pub fn to_grpc_chat_agent_server_config(
         args: config.args.unwrap_or_default(),
         env: config.env.unwrap_or_default(),
         metadata: config.metadata.unwrap_or_default(),
+        model_env_bindings: config
+            .model_env_bindings
+            .into_iter()
+            .map(to_grpc_model_env_binding)
+            .collect(),
+        agent_mode: config.agent_mode,
+        tool_approval_rules: config
+            .tool_approval_rules
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| shared_types::grpc::ToolApprovalRule {
+                patterns: r.patterns,
+                action: serde_json::to_value(&r.action)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default(),
+                tool_kind: r.tool_kind,
+            })
+            .collect(),
+        version: config.version,
+        platforms: config
+            .platforms
+            .map(|p| {
+                p.into_iter()
+                    .filter_map(|(k, v)| serde_json::to_vec(&v).ok().map(|bytes| (k, bytes)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn to_grpc_model_env_binding(binding: ModelEnvBinding) -> GrpcModelEnvBinding {
+    GrpcModelEnvBinding {
+        env_key: binding.env_key,
+        source: to_grpc_model_env_binding_source(binding.source) as i32,
+    }
+}
+
+fn to_grpc_model_env_binding_source(source: ModelEnvBindingSource) -> GrpcModelEnvBindingSource {
+    match source {
+        ModelEnvBindingSource::ApiKey => GrpcModelEnvBindingSource::ApiKey,
+        ModelEnvBindingSource::BaseUrl => GrpcModelEnvBindingSource::BaseUrl,
+        ModelEnvBindingSource::DefaultModel => GrpcModelEnvBindingSource::DefaultModel,
+        ModelEnvBindingSource::ProviderName => GrpcModelEnvBindingSource::ProviderName,
     }
 }
 

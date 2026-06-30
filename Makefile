@@ -7,8 +7,10 @@
 	dev-build dev-up dev-restart dev-down dev-logs \
 	dev-build-k8s dev-up-k8s dev-restart-k8s dev-down-k8s dev-logs-k8s \
 	dev-build-k8s-local dev-up-k8s-local dev-restart-k8s-local dev-down-k8s-local dev-logs-k8s-local dev-local-k8s \
+	devspace-init devspace-dev devspace-build devspace-down devspace-purge devspace-logs devspace-enter devspace-help \
+	k8s-run run-in-container \
 	docker-build docker-build-base docker-build-master docker-build-master-base \
-	docker-build-agent-runner docker-build-agent-base docker-build-agent-production \
+	docker-build-agent-runner docker-build-agent-base docker-build-agent-production docker-push-agent-base \
 	docker-pre-download-libreoffice docker-clean-libreoffice-downloads \
 	update-image-tag \
 	test test-unit test-integration test-all test-blocking \
@@ -21,6 +23,7 @@
 include make/docker.mk
 include make/libreoffice.mk
 include make/dev.mk
+include make/devspace.mk
 include make/k8s.mk
 include make/k8s-offline.mk
 include make/test.mk
@@ -73,6 +76,7 @@ help:
 	@echo "  make docker-build-master-base    - 仅构建 master-rcoder-base 基础镜像"
 	@echo "  make docker-build-agent-runner  - 仅构建 rcoder-agent-runner 镜像（启用 eBPF 调试）"
 	@echo "  make docker-build-agent-base     - 仅构建 rcoder-agent-base 基础镜像"
+	@echo "  make docker-push-agent-base      - 单独推送基础镜像到阿里云（带重试，推送失败可单独重试）"
 	@echo "  make docker-build-agent-production - 构建生产镜像（无 eBPF 工具，镜像更小）"
 	@echo "  make docker-pre-download-libreoffice - 预下载 LibreOffice（避免每次构建重新下载）"
 	@echo "  make docker-clean-libreoffice-downloads - 清理已下载的 LibreOffice 文件"
@@ -83,6 +87,17 @@ help:
 	@echo "  make dev-restart    - 重启开发模式容器（重新构建镜像并启动）"
 	@echo "  make dev-down       - 停止开发模式容器"
 	@echo "  make dev-logs       - 查看开发模式容器日志"
+	@echo ""
+	@echo "🚀 DevSpace 开发模式（推荐）："
+	@echo "  make devspace-init    - 初始化 DevSpace（首次使用）"
+	@echo "  make devspace-dev     - 启动开发模式（自动同步）"
+	@echo "  make devspace-build   - 构建 DevSpace 镜像"
+	@echo "  make devspace-down    - 停止 DevSpace"
+	@echo "  make devspace-purge   - 清理所有 DevSpace 资源"
+	@echo "  make devspace-logs    - 查看日志"
+	@echo "  make devspace-enter   - 进入容器（交互式）"
+	@echo "  make devspace-run     - 在容器内运行 rcoder 服务"
+	@echo "  make devspace-help    - 显示 DevSpace 帮助"
 	@echo ""
 	@echo "☸️  K8s 开发模式命令："
 	@echo "  make dev-build-k8s  - 构建 K8s 镜像（启用 kubernetes feature）"
@@ -115,7 +130,7 @@ help:
 	@echo "  make agent-runner-up        - 启动 agent_runner HTTP server（前台运行）"
 	@echo "  make agent-runner-logs      - 查看日志"
 	@echo ""
-	@echo "  变量: AGENT_RUNNER_PORT=8086 AGENT_RUNNER_GRPC=yes AGENT_RUNNER_PROJECTS_DIR=./project_workspace"
+	@echo "  变量: AGENT_RUNNER_PORT=8286 AGENT_RUNNER_GRPC=no AGENT_RUNNER_PROXY=no AGENT_RUNNER_PROJECTS_DIR=./project_workspace"
 	@echo ""
 	@echo "🧪 测试命令："
 	@echo "  make test           - 运行所有测试"
@@ -124,11 +139,23 @@ help:
 	@echo "  make test-blocking  - 运行极端场景测试（包含阻塞）"
 	@echo "  make test-all       - 运行完整测试套件（所有 features）"
 	@echo ""
-	@echo "开发模式工作流程："
-	@echo "  1. make dev-build    # 首次：构建所有 Docker 镜像（容器内编译）"
-	@echo "  2. make dev-up       # 启动容器"
-	@echo "  3. 修改代码后: make dev-restart  # 重新构建镜像+重启容器"
+	@echo "开发模式工作流程（推荐使用 DevSpace）："
+	@echo "  DevSpace 模式（增量编译、自动同步）："
+	@echo "    1. make devspace-dev     # 启动开发模式（自动同步）"
+	@echo "    2. make devspace-run     # 在容器内运行 rcoder 服务"
+	@echo "    3. 修改代码              # 自动同步到容器"
+	@echo "    4. Ctrl+C                # 停止服务"
+	@echo ""
+	@echo "  或者手动进入容器："
+	@echo "    1. make devspace-dev     # 启动开发模式"
+	@echo "    2. make devspace-enter   # 进入容器"
+	@echo "    3. cargo run --bin rcoder --features ebpf-debug,pyroscope,otel,debug,kubernetes -- --port 8290"
+	@echo ""
+	@echo "  传统 Docker 模式："
+	@echo "    1. make dev-build    # 首次：构建所有 Docker 镜像（容器内编译）"
+	@echo "    2. make dev-up       # 启动容器"
+	@echo "    3. 修改代码后: make dev-restart  # 重新构建镜像+重启容器"
 	@echo ""
 	@echo "💡 提示："
-	@echo "  - dev-build: 在 Docker 容器内编译，确保 Linux 兼容性"
-	@echo "  - dev-restart: 每次代码修改都需要重新构建镜像（容器内重新编译）"
+	@echo "  - DevSpace: 增量编译、自动同步，开发体验更好"
+	@echo "  - Docker: 每次代码修改都需要重新构建镜像（容器内重新编译）"

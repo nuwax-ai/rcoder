@@ -2,7 +2,9 @@
 //!
 //! 使用 Axum SSE 代理处理 SSE 消息，实现高效的 SSE 转发
 
-use super::utils::{I18nPath, get_realtime_container_ip};
+#![allow(dead_code)]
+
+use super::utils::{I18nPath, container_identity_from_name};
 use crate::{AppError, HttpResult};
 use axum::{
     extract::State,
@@ -33,16 +35,28 @@ pub struct SessionNotificationParams {
     pub pod_id: Option<String>,
     /// 租户ID（可选）
     #[param(example = "tenant_001")]
-    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     pub tenant_id: Option<String>,
     /// 空间ID（可选）
     #[param(example = "space_001")]
-    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     pub space_id: Option<String>,
     /// 隔离类型（可选），如 "project", "tenant", "space"
     #[param(example = "project")]
     #[serde(default)]
     pub isolation_type: Option<String>,
+    /// 客户端消费游标（可选）：重连时带上最后收到的 seq（`ProgressEvent.seq`），
+    /// rcoder 只补齐 seq > last_seq 的消息（增量补齐，消除重复）。
+    /// 缺省 = 补齐该 session 全量历史（首次连接合理；重连建议前端带上）。
+    #[param(example = "12")]
+    #[serde(default)]
+    pub last_seq: Option<u64>,
 }
 
 /// SSE 进度事件（用于 OpenAPI 文档）
@@ -411,14 +425,14 @@ pub struct SseErrorEvent {
 async fn validate_and_get_session_context(
     state: Arc<crate::router::AppState>,
     session_id: &str,
-) -> Result<(String, String), Response> {
+) -> Result<(String, String, String), Response> {
     // ========== 阶段 1: 获取项目信息（所有分支都需要） ==========
     // 🔧 优化：提前获取 project_info，避免后续重复查询
     // 同时获取 DockerManager（用于容器验证和降级查询）
     let project_info = match state.get_by_session(session_id) {
         Some(info) => {
             debug!(
-                "🔍 [SSE_PROXY] Getting project info from memory: session_id={}, project_id={}",
+                " [SSE_PROXY] Getting project info from memory: session_id={}, project_id={}",
                 session_id,
                 info.project_id()
             );
@@ -426,7 +440,7 @@ async fn validate_and_get_session_context(
         }
         None => {
             error!(
-                "❌ [SSE_PROXY] Project info for session not found: session_id={}",
+                " [SSE_PROXY] Project info for session not found: session_id={}",
                 session_id
             );
             return Err(create_error_response(
@@ -437,56 +451,47 @@ async fn validate_and_get_session_context(
         }
     };
 
-    let runtime = match docker_manager::runtime::RuntimeManager::get().await {
-        Ok(rt) => rt,
-        Err(e) => {
-            error!("[SSE_PROXY] Failed to get runtime: {}", e);
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
-                "Unable to access runtime service. Please contact administrator.",
-            ));
-        }
-    };
+    let runtime = state.runtime().clone();
 
     // ========== 阶段 2: 获取稳定的 container_name（不是 container_id） ==========
     // 🔧 关键修复：container_name 在容器重建后保持不变（如 computer-agent-runner-user_123）
     // 而 container_id 在每次容器重建后都会变化
-    let container_name = match state.get_container_name_by_session(session_id) {
+    let mut container_name = match state.get_container_name_by_session(session_id) {
         Some(name) => {
             debug!(
-                "🔍 [SSE_PROXY] Getting container name from DuckDB: session_id={}, container_name={}",
+                " [SSE_PROXY] Getting container name from storage: session_id={}, container_name={}",
                 session_id, name
             );
             name
         }
         None => {
-            // 🔄 DuckDB 中没有记录，触发降级查询
+            // 🔄 存储 中没有记录，触发降级查询
             // 可能原因：
-            // 1. 新 session 尚未写入 DuckDB（正常情况）
+            // 1. 新 session 尚未写入 存储（正常情况）
             // 2. 测试环境脏数据
-            // 3. 容器重建后 DuckDB 未更新
+            // 3. 容器重建后 存储 未更新
             info!(
-                "🔄 [SSE_PROXY] session_id record not found in DuckDB, executing fallback query: session_id={}, project_id={}",
+                " [SSE_PROXY] session_id record not found in storage, executing fallback query: session_id={}, project_id={}",
                 session_id,
                 project_info.project_id()
             );
 
             // 根据 service_type 选择不同的查询策略
-            let resolved_container_name = match project_info.service_type() {
+
+            match project_info.service_type() {
                 Some(shared_types::ServiceType::ComputerAgentRunner) => {
                     // ComputerAgentRunner 模式：通过 user_id 查询容器
                     if let Some(user_id) = project_info.user_id() {
                         match runtime
                             .get_container_info_by_identifier(
-                                &user_id,
+                                user_id,
                                 &shared_types::ServiceType::ComputerAgentRunner,
                             )
                             .await
                         {
                             Ok(Some(info)) => {
                                 info!(
-                                    "✅ [SSE_PROXY] Fallback query succeeded: getting container via user_id in real-time: user_id={}, container_name={}",
+                                    " [SSE_PROXY] Fallback query succeeded: getting container via user_id in real-time: user_id={}, container_name={}",
                                     user_id, info.container_name
                                 );
                                 info.container_name
@@ -529,79 +534,77 @@ async fn validate_and_get_session_context(
                 _ => {
                     // RCoder 模式：从 project_info 获取容器名称，或使用 project_id 作为容器名称
                     //
-                    // ⚠️ 注意：project_info 从 DuckDB 读取，可能包含部分过时数据
+                    // ⚠️ 注意：project_info 从 存储 读取，可能包含部分过时数据
                     // - container_name: 稳定不变（容器重建后仍有效）
                     // - container_id, container_ip: 可能过时（容器重建后会变化）
                     //
                     // 阶段 3 会验证容器的真实存在性（通过内存信息或 Docker API）
-                    // 因此即使 project_info.container() 为 None，也可以继续执行
-                    match project_info.container() {
+                    // 因此即使 project_info.container_info() 为 None，也可以继续执行
+                    match project_info.container_info() {
                         Some(container) => {
                             info!(
-                                "✅ [SSE_PROXY] Fallback query succeeded: got container name from project_info (DuckDB): container_name={}",
+                                " [SSE_PROXY] Fallback query succeeded: got container name from project_info: container_name={}",
                                 container.container_name
                             );
                             container.container_name.clone()
                         }
                         None => {
                             // project_info 中没有容器信息，使用 project_id 作为容器名称
-                            // 这通常发生在容器刚创建但尚未写入 DuckDB 的情况
+                            // 这通常发生在容器刚创建但尚未写入 存储 的情况
                             // 阶段 3 会通过 Docker API 验证容器是否存在
                             warn!(
-                                "⚠️ [SSE_PROXY] No container info in project_info, using project_id as container name: project_id={}",
+                                " [SSE_PROXY] No container info in project_info, using project_id as container name: project_id={}",
                                 project_info.project_id()
                             );
                             project_info.project_id().to_string()
                         }
                     }
                 }
-            };
-
-            resolved_container_name
+            }
         }
     };
 
     // ========== 阶段 3: 优先使用内存中的容器信息，避免不必要的 Docker API 调用 ==========
 
     // 🎯 优化策略：
-    // 1. 首先检查内存中的 project_info.container() 是否已存在
-    // 2. 如果存在 → 跳过 Docker API 调用（内存信息由创建逻辑保证最新）
+    // 1. 首先检查内存中的 project_info.container_info() 是否已存在
+    // 2. 如果存在 → 使用内存中的 container_name（它是最新的），跳过 Docker API 调用
     // 3. 如果不存在 → 调用 find_container_realtime 作为降级方案
     // 4. 后续会通过 gRPC GetStatus 进行最终健康检查
-    if let Some(container) = project_info.container() {
+    if let Some(container) = project_info.container_info() {
         info!(
-            "✅ [SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
+            " [SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
             container.container_name, container.container_ip
         );
-        // 内存中有容器信息，跳过 Docker API 检查
-        // 后续会通过 gRPC GetStatus 进行健康检查
+        // 🎯 关键修复：使用内存中的 container_name（它是最新的）
+        // storage 中的 container_name 可能对应旧容器（如 user container）
+        // 内存中的 container_name 对应当前活跃的容器（如 project container）
+        container_name = container.container_name.clone();
     } else {
         // 内存中没有容器信息，调用 Docker API 实时查询
         warn!(
-            "⚠️ [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
+            " [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
             container_name
         );
-        // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
         let computer_prefix = &state.container_prefix_computer;
         let rcoder_prefix = &state.container_prefix_rcoder;
-        let query = if let Some(id) = container_name.strip_prefix(&format!("{}-", computer_prefix)) {
-            runtime
-                .find_container(id, &shared_types::ServiceType::ComputerAgentRunner)
-                .await
-        } else if let Some(id) = container_name.strip_prefix(&format!("{}-", rcoder_prefix)) {
-            runtime
-                .find_container(id, &shared_types::ServiceType::RCoder)
-                .await
+        let query = if let Some((id, service_type)) =
+            container_identity_from_name(&container_name, rcoder_prefix, computer_prefix)
+        {
+            runtime.find_container(id, &service_type).await
         } else {
             runtime
-                .find_container(project_info.project_id(), &shared_types::ServiceType::RCoder)
+                .find_container(
+                    project_info.project_id(),
+                    &shared_types::ServiceType::WebAgentRunner,
+                )
                 .await
         };
         match query {
             Ok(Some(result)) => {
                 if result.status == container_runtime_api::ContainerRuntimeStatus::Running {
                     info!(
-                        "✅ [SSE_PROXY] Runtime query successful, container is running: container_name={}",
+                        " [SSE_PROXY] Runtime query successful, container is running: container_name={}",
                         container_name
                     );
                 } else {
@@ -614,7 +617,7 @@ async fn validate_and_get_session_context(
             }
             Ok(None) => {
                 error!(
-                    "❌ [SSE_PROXY] Container does not exist: container_name={}",
+                    " [SSE_PROXY] Container does not exist: container_name={}",
                     container_name
                 );
                 return Err(create_error_response(
@@ -624,7 +627,7 @@ async fn validate_and_get_session_context(
                 ));
             }
             Err(e) => {
-                error!("❌ [SSE_PROXY] Runtime query failed: {}", e);
+                error!(" [SSE_PROXY] Runtime query failed: {}", e);
                 return Err(create_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
@@ -639,85 +642,94 @@ async fn validate_and_get_session_context(
     // 🎯 优化：直接使用阶段 1 中已获取的 project_info，避免重复查询
     let project_id = project_info.project_id().to_string();
 
-    // 注意：由于阶段 3 已经处理了 project_info.container() 为 None 的情况
+    // 获取 container_ip（Docker 环境需要）
+    let container_ip = project_info
+        .container_info()
+        .map(|c| c.container_ip.clone())
+        .unwrap_or_default();
+
+    // 注意：由于阶段 3 已经处理了 project_info.container_info() 为 None 的情况
     // （通过 Docker API 降级查询），这里无需再次验证容器信息的完整性
     info!(
-        "✅ [SSE_PROXY] All validations passed: session_id={}, project_id={}, container_name={}",
-        session_id, project_id, container_name
+        " [SSE_PROXY] All validations passed: session_id={}, project_id={}, container_name={}, container_ip={}",
+        session_id, project_id, container_name, container_ip
     );
-    Ok((project_id, container_name))
+    Ok((project_id, container_name, container_ip))
 }
 
 /// 创建 SSE 响应流
 ///
+/// SSE 流构建参数
+///
+/// 封装了构建 gRPC SSE 流所需的所有参数，
+/// 避免函数参数过多，同时支持不同场景的扩展。
+struct SseStreamParams {
+    /// 容器名称
+    container_name: String,
+    /// 容器 IP（Docker 环境使用）
+    container_ip: String,
+    /// 会话 ID
+    session_id: String,
+    /// 项目 ID
+    project_id: String,
+    /// gRPC 连接池
+    grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
+    /// 语言设置
+    locale: &'static str,
+    /// 服务类型（用于日志区分不同类型的 Agent）
+    service_type: shared_types::ServiceType,
+    /// 活动更新器
+    activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
+    /// K8s namespace
+    namespace: String,
+    /// K8s 集群域名
+    cluster_domain: String,
+    /// Session 共享流注册表（每 session 一条 agent_runner 流，多 SSE 客户端 fan-out 共享）
+    registry: Arc<crate::grpc::SessionStreamRegistry>,
+    /// 客户端消费游标（从 Last-Event-ID header 或 ?last_seq= query 读取），
+    /// 用于增量补齐；缺省 0 = 补齐该 session 全量历史（首次连接合理，重连应由前端带 last_seq）。
+    last_seq: u64,
+}
+
 /// 这个函数被 agent_session_notification 和 computer_agent_progress_notification 共同使用
 /// 通过 container_name 创建 gRPC SSE 流
 async fn build_sse_stream_from_container_name(
-    container_name: String,
-    session_id: String,
-    project_id: String,
-    grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
-    locale: &'static str,
-    agent_type: &str, // 用于日志区分 "Agent" 或 "Computer Agent"
-    rcoder_prefix: &str,
-    computer_prefix: &str,
+    params: SseStreamParams,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
-    // Get latest container IP from Docker API in real-time
-    // 使用 container_name（如 computer-agent-runner-user_123）查询
-    // 因为 container_id 在容器重启后会改变，但 container_name 是稳定的
-    let container_ip = match get_realtime_container_ip(
-        &container_name,
-        "", // 无 fallback_ip，直接使用 Docker API 查询结果
-        rcoder_prefix,
-        computer_prefix,
-    )
-    .await
-    {
-        Ok(ip) => {
-            if !ip.is_empty() {
-                info!(
-                    "🔍 [gRPC_SSE] Got container IP: container_name={}, ip={}",
-                    container_name, ip
-                );
-                ip
-            } else {
-                error!(
-                    "❌ [gRPC_SSE] unable to get container IP: container_name={}",
-                    container_name
-                );
-                return Err(create_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "GRPC_CONNECTION_ERROR",
-                    "unable to get container IP address",
-                ));
-            }
-        }
-        Err(e) => {
-            error!(
-                "❌ [gRPC_SSE] Failed to get real-time IP: container_name={}, error={}",
-                container_name, e
-            );
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "GRPC_CONNECTION_ERROR",
-                &format!("failed to get container IP: {}", e),
-            ));
-        }
+    // 根据运行环境选择 gRPC 地址
+    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
+    // - Docker 环境：使用容器 IP（直接连接）
+    let grpc_addr = if shared_types::is_kubernetes_runtime() {
+        let svc_fqdn = super::utils::build_k8s_service_fqdn(
+            &params.container_name,
+            &params.namespace,
+            &params.cluster_domain,
+        );
+        debug!("📡 [SSE] Using K8s Service FQDN for gRPC: {}", svc_fqdn);
+        format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
+    } else {
+        let addr = format!(
+            "{}:{}",
+            params.container_ip,
+            shared_types::GRPC_DEFAULT_PORT
+        );
+        debug!("📡 [SSE] Using container IP for gRPC: {}", addr);
+        addr
     };
-
-    let grpc_addr = format!("{}:{}", container_ip, shared_types::GRPC_DEFAULT_PORT);
     info!(
-        "🚀 [gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
-        agent_type, grpc_addr, project_id
+        " [gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
+        params.service_type, grpc_addr, params.project_id
     );
 
     // 创建 gRPC SSE 流
     let stream = crate::grpc::create_grpc_sse_stream(
+        params.registry.clone(),
         grpc_addr,
-        session_id.clone(),
-        project_id,
-        grpc_pool.clone(),
-        locale,
+        params.session_id.clone(),
+        params.grpc_pool.clone(),
+        params.locale,
+        params.activity_updater,
+        params.last_seq,
     )
     .await;
 
@@ -729,7 +741,6 @@ async fn build_sse_stream_from_container_name(
 }
 
 /// Agent 会话 SSE 通知处理器
-
 ///
 /// 此接口直接返回 SSE 流，实现从容器到客户端的实时消息转发
 ///
@@ -908,30 +919,49 @@ eventSource.onerror = (error) => {
 pub async fn agent_session_notification(
     I18nPath(params): I18nPath<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
     info!(
-        "🔍 [SSE_PROXY] Received SSE connection request: session_id={:?}",
+        " [SSE_PROXY] Received SSE connection request: session_id={:?}",
         session_id
     );
 
     // 使用核心验证函数获取上下文
-    let (project_id, container_name) =
+    let (project_id, container_name, container_ip) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
+    // 构造活跃时间更新闭包（捕获 state 引用）
+    // Bug 5 修复：SSE 流收到非心跳事件时节流调用此闭包
+    let activity_updater: Arc<dyn Fn(&str) + Send + Sync> = {
+        let state = state.clone();
+        Arc::new(move |sid: &str| state.update_session_activity(sid))
+    };
+
     // 使用通用函数创建 SSE 响应流
-    build_sse_stream_from_container_name(
+    // 优先用 Last-Event-ID header（浏览器 EventSource 断线重连自动带），其次 ?last_seq= query
+    let last_seq = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .or(params.last_seq)
+        .unwrap_or(0);
+    let params = SseStreamParams {
         container_name,
-        session_id.to_string(),
+        container_ip,
+        session_id: session_id.to_string(),
         project_id,
-        state.grpc_pool.clone(),
+        grpc_pool: state.grpc_pool.clone(),
         locale,
-        "Agent",
-        &state.container_prefix_rcoder,
-        &state.container_prefix_computer,
-    )
-    .await
+        service_type: shared_types::ServiceType::WebAgentRunner,
+        activity_updater,
+        namespace: state.config.app_manager.namespace.clone(),
+        cluster_domain: state.cluster_domain.clone(),
+        registry: state.session_stream_registry.clone(),
+        last_seq,
+    };
+    build_sse_stream_from_container_name(params).await
 }
 
 #[utoipa::path(
@@ -1015,30 +1045,49 @@ pub async fn agent_session_notification(
 pub async fn computer_agent_progress_notification(
     I18nPath(params): I18nPath<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
     info!(
-        "🔍 [SSE_PROXY] Received Computer Agent SSE connection request: session_id={:?}",
+        " [SSE_PROXY] Received Computer Agent SSE connection request: session_id={:?}",
         session_id
     );
 
     // 使用与 agent_session_notification 相同的验证逻辑
-    let (project_id, container_name) =
+    let (project_id, container_name, container_ip) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
+    // 构造活跃时间更新闭包（捕获 state 引用）
+    // Bug 5 修复：SSE 流收到非心跳事件时节流调用此闭包
+    let activity_updater: Arc<dyn Fn(&str) + Send + Sync> = {
+        let state = state.clone();
+        Arc::new(move |sid: &str| state.update_session_activity(sid))
+    };
+
     // 使用通用函数创建 SSE 响应流
-    build_sse_stream_from_container_name(
+    // 优先用 Last-Event-ID header（浏览器 EventSource 断线重连自动带），其次 ?last_seq= query
+    let last_seq = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .or(params.last_seq)
+        .unwrap_or(0);
+    let params = SseStreamParams {
         container_name,
-        session_id.to_string(),
+        container_ip,
+        session_id: session_id.to_string(),
         project_id,
-        state.grpc_pool.clone(),
+        grpc_pool: state.grpc_pool.clone(),
         locale,
-        "Computer Agent",
-        &state.container_prefix_rcoder,
-        &state.container_prefix_computer,
-    )
-    .await
+        service_type: shared_types::ServiceType::ComputerAgentRunner,
+        activity_updater,
+        namespace: state.config.app_manager.namespace.clone(),
+        cluster_domain: state.cluster_domain.clone(),
+        registry: state.session_stream_registry.clone(),
+        last_seq,
+    };
+    build_sse_stream_from_container_name(params).await
 }
 
 /// 创建 SSE 代理流
@@ -1053,7 +1102,7 @@ async fn create_sse_proxy_stream(
         let client = Client::new();
 
         info!(
-            "🔗 [SSE_PROXY] 开始连接容器SSE: url={}, session_id={}",
+            " [SSE_PROXY] 开始连接容器SSE: url={}, session_id={}",
             sse_url, session_id
         );
 
@@ -1066,10 +1115,7 @@ async fn create_sse_proxy_stream(
         {
             Ok(response) => {
                 if response.status().is_success() {
-                    info!(
-                        "✅ [SSE_PROXY] 成功连接到容器SSE: session_id={}",
-                        session_id
-                    );
+                    info!(" [SSE_PROXY] 成功连接到容器SSE: session_id={}", session_id);
 
                     let mut stream = response.bytes_stream();
                     let mut buffer = Vec::new();
@@ -1088,7 +1134,7 @@ async fn create_sse_proxy_stream(
 
                                     if !event_data.is_empty() {
                                         debug!(
-                                            "📨 [SSE_PROXY] 透传SSE事件: session_id={}, event_len={}",
+                                            " [SSE_PROXY] 透传SSE事件: session_id={}, event_len={}",
                                             session_id,
                                             event_data.len()
                                         );
@@ -1100,7 +1146,7 @@ async fn create_sse_proxy_stream(
                                             && tx.send(Ok(event)).await.is_err()
                                         {
                                             warn!(
-                                                "⚠️ [SSE_PROXY] 客户端已断开连接: session_id={}",
+                                                " [SSE_PROXY] 客户端已断开连接: session_id={}",
                                                 session_id
                                             );
                                             break;
@@ -1110,7 +1156,7 @@ async fn create_sse_proxy_stream(
                             }
                             Err(e) => {
                                 error!(
-                                    "❌ [SSE_PROXY] 读取SSE流失败: session_id={}, error={}",
+                                    " [SSE_PROXY] 读取SSE流失败: session_id={}, error={}",
                                     session_id, e
                                 );
                                 break;
@@ -1119,18 +1165,19 @@ async fn create_sse_proxy_stream(
                     }
                 } else {
                     error!(
-                        "❌ [SSE_PROXY] 容器SSE连接失败: session_id={}, status={}",
+                        " [SSE_PROXY] 容器SSE连接失败: session_id={}, status={}",
                         session_id,
                         response.status()
                     );
 
                     // 发送错误事件
-                    let error_event = Event::default()
-                        .event("error")
-                        .data(format!("container connection failed: {}", response.status()));
+                    let error_event = Event::default().event("error").data(format!(
+                        "container connection failed: {}",
+                        response.status()
+                    ));
                     if let Err(send_err) = tx.send(Ok(error_event)).await {
                         warn!(
-                            "⚠️ [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
+                            " [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
                             session_id, send_err
                         );
                     }
@@ -1138,7 +1185,7 @@ async fn create_sse_proxy_stream(
             }
             Err(e) => {
                 error!(
-                    "❌ [SSE_PROXY] 无法连接到容器SSE: session_id={}, error={}",
+                    " [SSE_PROXY] 无法连接到容器SSE: session_id={}, error={}",
                     session_id, e
                 );
 
@@ -1148,7 +1195,7 @@ async fn create_sse_proxy_stream(
                     .data(format!("connection error: {}", e));
                 if let Err(send_err) = tx.send(Ok(error_event)).await {
                     warn!(
-                        "⚠️ [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
+                        " [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
                         session_id, send_err
                     );
                 }
@@ -1173,10 +1220,10 @@ fn create_passthrough_event(event_text: &str) -> Option<Event> {
 
     // 解析SSE消息的各个部分
     for line in event_text.lines() {
-        if line.starts_with("event:") {
-            event_type = Some(line[6..].trim().to_string());
-        } else if line.starts_with("data:") {
-            data_lines.push(line[5..].trim());
+        if let Some(value) = line.strip_prefix("event:") {
+            event_type = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data_lines.push(value.trim());
         }
     }
 
@@ -1201,7 +1248,7 @@ fn create_error_response(status: StatusCode, code: &str, message: &str) -> Respo
     let locale = shared_types::current_request_locale();
     let mapped_code = map_error_code_for_locale(code);
     let localized_message = shared_types::get_error_message(mapped_code, locale);
-    let error_body = HttpResult::<()>::error(code, &localized_message);
+    let error_body = HttpResult::<()>::error(mapped_code, &localized_message);
     let json_body = serde_json::to_string(&error_body).unwrap_or_default();
 
     debug!(
@@ -1232,24 +1279,18 @@ fn map_error_code_for_locale(code: &str) -> &str {
 
 /// 获取容器的 SSE 端点 URL
 async fn get_container_sse_url(
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     project_id: &str,
     _agent_info: &ProjectAndContainerInfo,
     session_id: &str,
 ) -> Result<String, AppError> {
     info!(
-        "🔍 [CONTAINER] 获取容器SSE端点: project_id={}, session_id={}",
+        " [CONTAINER] 获取容器SSE端点: project_id={}, session_id={}",
         project_id, session_id
     );
 
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| {
-            error!("[CONTAINER] Failed to get runtime: {}", e);
-            AppError::internal_server_error(&format!("Failed to get runtime: {}", e))
-        })?;
-
     if let Some(info) = runtime
-        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::RCoder)
+        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::WebAgentRunner)
         .await
         .map_err(|e| {
             error!("[CONTAINER] Failed to get container info: {}", e);

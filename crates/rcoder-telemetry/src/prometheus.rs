@@ -8,7 +8,16 @@ use metrics::{
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
+use thiserror::Error;
 use tracing::info;
+
+/// Telemetry 模块错误类型
+#[derive(Error, Debug)]
+pub enum TelemetryError {
+    /// Prometheus recorder 安装失败
+    #[error("Failed to install Prometheus recorder: {0}")]
+    PrometheusInstall(String),
+}
 
 // ============= 指标名称常量 =============
 
@@ -39,21 +48,23 @@ pub const AGENT_ACTIVE_TASKS: &str = "agent_active_tasks";
 ///
 /// 返回 `PrometheusHandle`，可通过 `render()` 方法获取 Prometheus 格式的指标文本。
 ///
+/// # Errors
+///
+/// 如果 Prometheus recorder 安装失败，返回 `TelemetryError::PrometheusInstall`。
+///
 /// # Example
 ///
 /// ```no_run
 /// use rcoder_telemetry::prometheus::init_prometheus;
 ///
-/// fn main() {
-///     let handle = init_prometheus().expect("Failed to init prometheus");
-///     let metrics_text = handle.render();
-///     println!("{}", metrics_text);
-/// }
+/// let handle = init_prometheus().expect("Failed to init prometheus");
+/// let metrics_text = handle.render();
+/// println!("{}", metrics_text);
 /// ```
-pub fn init_prometheus() -> anyhow::Result<PrometheusHandle> {
+pub fn init_prometheus() -> Result<PrometheusHandle, TelemetryError> {
     let handle = PrometheusBuilder::new()
         .install_recorder()
-        .map_err(|e| anyhow::anyhow!("Failed to install Prometheus recorder: {}", e))?;
+        .map_err(|e| TelemetryError::PrometheusInstall(e.to_string()))?;
 
     // 注册指标描述
     register_metric_descriptions();

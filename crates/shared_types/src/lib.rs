@@ -1,18 +1,32 @@
-// 在 crate 根级别初始化 i18n
-// fallback 设置为默认语言 en-US，保持一致性
-rust_i18n::i18n!("locales", fallback = "en-US");
-
 mod container;
 mod model;
 
+// 清理请求模块
+pub mod cleanup_request;
+pub use cleanup_request::CleanupRequest;
+
+// 存储类型模块
+pub mod storage_types;
+pub use storage_types::{IdleContainerInfo, StorageStats};
+
+// 容器查找接口模块
+pub mod container_lookup;
+pub use container_lookup::ContainerLookup;
+
+// 容器条目模块（refcount + 活跃时间跟踪）
+pub mod container_entry;
+pub use container_entry::ContainerEntry;
+
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）
 pub mod flexible_string;
+pub mod version_util;
 
-// i18n 国际化模块
-pub mod i18n;
-pub use i18n::{
-    DEFAULT_LOCALE, SUPPORTED_LOCALES, get_locale, parse_accept_language, set_locale, t, t_default,
+// i18n 国际化模块 — 重导出自 shared_types_i18n（过渡期兼容）
+pub use shared_types_i18n::{
+    DEFAULT_LOCALE, SUPPORTED_LOCALES, get_locale, i18n, parse_accept_language, set_locale, t,
+    t_default,
 };
+
 pub mod request_locale;
 pub use request_locale::{current_request_locale, scope_request_locale};
 
@@ -22,7 +36,10 @@ pub use i18n_extractors::I18nJsonOrQuery;
 
 // Chat Agent 配置模块
 mod chat_agent_config;
-pub use chat_agent_config::{ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig};
+pub use chat_agent_config::{
+    AgentMode, AutoReloadConfig, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig,
+    ModelEnvBinding, ModelEnvBindingSource, ToolApprovalAction, ToolApprovalRule, VALID_TOOL_KINDS,
+};
 
 // API Key 验证器模块
 pub mod api_key_validator;
@@ -30,36 +47,55 @@ pub use api_key_validator::{ApiKeyAuthConfig, ApiKeyAuthError, ApiKeyValidator};
 
 // 新增多镜像配置相关模块
 pub mod multi_image_config;
+pub mod permission_types;
 pub mod service_config;
 pub mod service_type;
+pub use permission_types::{
+    PermissionResolveRequest, ResolvePermissionHttpRequest, ResolvePermissionRequestDto,
+    ResolvePermissionResponseDto,
+};
 
 // 常量定义模块
 pub mod constants;
 pub use constants::*;
 
-// 错误码定义模块
-pub mod error_codes;
-pub use error_codes::{get_error_message, get_i18n_message, get_i18n_message_default};
+// 错误码定义模块 — 重导出自 shared_types_i18n（过渡期兼容）
+pub use shared_types_i18n::{
+    ERR_AGENT_BUSY, ERR_AGENT_ERROR, ERR_AGENT_MGMT_ALREADY_INSTALLED, ERR_AGENT_MGMT_ARCHIVE_BOMB,
+    ERR_AGENT_MGMT_BINARY_TOO_LARGE, ERR_AGENT_MGMT_BUILTIN_PROTECTED, ERR_AGENT_MGMT_CHECK_FAILED,
+    ERR_AGENT_MGMT_CHECKSUM_MISMATCH, ERR_AGENT_MGMT_COMMAND_TIMEOUT, ERR_AGENT_MGMT_DISK_FULL,
+    ERR_AGENT_MGMT_INSTALL_CANCELLED, ERR_AGENT_MGMT_INSTALL_FAILED, ERR_AGENT_MGMT_INVALID_CHUNK,
+    ERR_AGENT_MGMT_INVALID_MANIFEST, ERR_AGENT_MGMT_INVALID_VERSION, ERR_AGENT_MGMT_NOT_FOUND,
+    ERR_AGENT_MGMT_PATH_TRAVERSAL, ERR_AGENT_MGMT_PERMISSION_DENIED,
+    ERR_AGENT_MGMT_PLATFORM_NOT_FOUND, ERR_AGENT_MGMT_STREAM_TRUNCATED,
+    ERR_AGENT_MGMT_UNINSTALL_FAILED, ERR_AGENT_MGMT_UNKNOWN_AGENT, ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
+    ERR_AGENT_NOT_FOUND, ERR_AGENT_RUNNER_UNAVAILABLE, ERR_API_KEY_AUTH_FAILED, ERR_CANCEL_FAILED,
+    ERR_CONFLICT, ERR_CONTAINER_ERROR, ERR_CONTAINER_NOT_FOUND, ERR_GRPC_ADDR_ERROR,
+    ERR_GRPC_ERROR, ERR_HTTP_FALLBACK_FAILED, ERR_INTERNAL_SERVER_ERROR, ERR_INVALID_PARAMS,
+    ERR_INVALID_RESOURCE_LIMITS, ERR_NOT_FOUND, ERR_PERMISSION_EXPIRED, ERR_PERMISSION_NOT_FOUND,
+    ERR_PERMISSION_RESOLVE_FAILED, ERR_PROJECT_NOT_FOUND, ERR_PROXY_DISABLED,
+    ERR_PROXY_SERVICE_UNAVAILABLE, ERR_RESUME_FAILED, ERR_RETRY_EXHAUSTED, ERR_SERVICE_UNAVAILABLE,
+    ERR_SESSION_NOT_FOUND, ERR_STOP_FAILED, ERR_TOO_MANY_REQUESTS, ERR_UNKNOWN, ERR_VALIDATION,
+    ERR_WORKSPACE_ERROR, SUCCESS, error_codes, get_error_description, get_error_message,
+    get_i18n_message, get_i18n_message_default,
+};
 
 // Validation 模块
 pub mod validation;
-pub use validation::garde_err_to_app_error;
+pub use validation::{garde_err_to_app_error, validate_identifier};
 
-// gRPC 模块
-pub mod grpc {
-    // 包含生成的代码，路径相对于当前文件
-    include!("grpc/agent.rs");
-}
+// gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
+pub use shared_types_grpc::grpc;
 
-// 导出 URL 脱敏工具函数
-pub mod grpc_mask;
-pub use grpc_mask::mask_url;
+// 导出 URL 脱敏工具函数（re-export from shared_types_grpc）
+pub use shared_types_grpc::mask_url;
 
-// 导出 gRPC 脱敏包装器
-pub mod grpc_wrapper;
-pub use grpc_wrapper::MaskedModelConfig;
+// 导出 gRPC 脱敏包装器（重导出自 shared_types_grpc）
+pub use shared_types_grpc::MaskedModelConfig;
 
 pub use model::{
+    AcpRequestPermission,
+    AgentBinarySnapshot,
     AgentLifecycle,
     AgentLifecycleGuard,
     AgentSessionUpdate,
@@ -83,6 +119,7 @@ pub use model::{
     ChatResponse,
     ContainerBasicInfo,
     DocumentAttachment,
+    HealthCheckResponse,
     HealthResponse,
     HttpResult,
     ImageAttachment,
@@ -90,8 +127,11 @@ pub use model::{
     ModelApiProtocol,
     ModelProviderConfig,
     ModelProviderSafeInfo,
+    PodCountByServiceType,
+    PodCountResponse,
     ProjectAndAgentInfo,
     ProjectAndContainerInfo,
+    ProjectExtendedFields,
     // Session trait
     SessionEntry,
     SessionMessageType,
@@ -101,6 +141,7 @@ pub use model::{
     SessionPromptStart,
     TextAttachment,
     UnifiedSessionMessage,
+    VncStatusResponse,
 };
 
 // 导出多镜像配置相关类型
@@ -140,4 +181,13 @@ pub mod rcoder_agent_types;
 pub use rcoder_agent_types::*;
 
 // 通用 HTTP Handlers（基于 trait）
+pub mod agent_mgmt_types;
 pub mod http_handlers;
+pub use agent_mgmt_types::{
+    AGENT_CACHE_DIR, AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus,
+    CheckAgentRequest, CheckAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR, GetAgentRequest,
+    InstallAction, InstallAgentResponse, InstallBinaryRequest, InstallFromPackageManagerRequest,
+    InstallFromUrlRequest, InstallType, ListAgentsRequest, ListAgentsResponse, MAX_BINARY_SIZE,
+    MAX_EXTRACTED_SIZE, PlatformEntry, RoutingParams, StaticCheckResult, SystemInfo,
+    UPLOAD_CHUNK_SIZE, URL_DOWNLOAD_TIMEOUT_SECS, UninstallAgentRequest, UninstallAgentResponse,
+};

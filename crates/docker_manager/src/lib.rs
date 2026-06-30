@@ -10,7 +10,10 @@ pub mod types;
 pub mod utils;
 
 // 新增模块
+pub mod agent_container_starter;
 pub mod container_builder;
+pub mod container_creator;
+pub mod container_query;
 pub mod health;
 pub mod network;
 pub mod runtime_selection;
@@ -259,8 +262,9 @@ pub mod global {
     ///
     /// 支持 Docker 和 Kubernetes 运行时
     #[cfg(feature = "kubernetes")]
-    pub async fn get_global_runtime(
-    ) -> container_runtime_api::ContainerRuntimeResult<Arc<dyn container_runtime_api::ContainerRuntime>> {
+    pub async fn get_global_runtime() -> container_runtime_api::ContainerRuntimeResult<
+        Arc<dyn container_runtime_api::ContainerRuntime>,
+    > {
         crate::runtime::RuntimeManager::get().await
     }
 

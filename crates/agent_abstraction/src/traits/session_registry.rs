@@ -56,8 +56,9 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use dashmap::mapref::entry::Entry;
-use shared_types::SessionEntry;
+use shared_types::{AgentStatus, SessionEntry};
 
 /// 会话注册表 trait
 ///
@@ -170,6 +171,31 @@ pub trait SessionRegistry: Send + Sync + 'static {
     /// }
     /// ```
     fn entry(&self, project_id: String) -> Entry<'_, String, Self::Entry>;
+
+    // ========== Agent 状态更新方法（R-1 新增） ==========
+
+    /// 更新 agent 状态（如 Active → Idle）
+    ///
+    /// 默认实现为空操作（no-op），需要状态追踪的实现应覆盖此方法。
+    /// `StateAwareNotifier` 通过此方法更新状态，避免直接依赖具体的全局注册表。
+    ///
+    /// # Arguments
+    /// * `project_id` - 项目 ID
+    /// * `status` - 新的 Agent 状态
+    fn update_agent_status(&self, _project_id: &str, _status: AgentStatus) {
+        // Default no-op — implementations that need status tracking should override
+    }
+
+    /// 更新最后活动时间
+    ///
+    /// 默认实现为空操作（no-op），需要活动追踪的实现应覆盖此方法。
+    ///
+    /// # Arguments
+    /// * `project_id` - 项目 ID
+    /// * `activity` - 最后活动时间
+    fn update_last_activity(&self, _project_id: &str, _activity: DateTime<Utc>) {
+        // Default no-op — implementations that need activity tracking should override
+    }
 }
 
 /// SessionRegistry 的 Arc 包装器实现
@@ -212,5 +238,13 @@ impl<R: SessionRegistry> SessionRegistry for Arc<R> {
 
     fn entry(&self, project_id: String) -> Entry<'_, String, Self::Entry> {
         (**self).entry(project_id)
+    }
+
+    fn update_agent_status(&self, project_id: &str, status: AgentStatus) {
+        (**self).update_agent_status(project_id, status)
+    }
+
+    fn update_last_activity(&self, project_id: &str, activity: DateTime<Utc>) {
+        (**self).update_last_activity(project_id, activity)
     }
 }

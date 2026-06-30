@@ -33,10 +33,8 @@ impl NpmInstaller {
     async fn get_npm_command(&self) -> &'static str {
         if self.prefer_pnpm && which::which("pnpm").is_ok() {
             "pnpm"
-        } else if which::which("npm").is_ok() {
-            "npm"
         } else {
-            "npm" // Default, will fail if not available
+            "npm" // Default, will fail at exec time if not available
         }
     }
 
@@ -44,10 +42,10 @@ impl NpmInstaller {
     fn parse_installed_version(&self, output: &str) -> Option<String> {
         // npm list output format: "package@version"
         for line in output.lines() {
-            if line.contains('@') {
-                if let Some(version) = line.split('@').last() {
-                    return Some(version.trim().to_string());
-                }
+            if line.contains('@')
+                && let Some(version) = line.split('@').next_back()
+            {
+                return Some(version.trim().to_string());
             }
         }
         None
@@ -96,7 +94,7 @@ impl AgentInstaller for NpmInstaller {
         // Run npm install -g
         // 仅 nuwaxcode 使用官方源（--registry 参数优先级高于 .npmrc）
         let output = if package_name == "nuwaxcode" {
-            info!("🌐 nuwaxcode using registry: https://registry.npmjs.org/");
+            info!("nuwaxcode using registry: https://registry.npmjs.org/");
             self.run_command(
                 npm_cmd,
                 &[
@@ -182,7 +180,7 @@ impl AgentInstaller for NpmInstaller {
         // Run npm update -g
         // 仅 nuwaxcode 使用官方源（--registry 参数优先级高于 .npmrc）
         let output = if package_name == "nuwaxcode" {
-            info!("🌐 nuwaxcode using registry: https://registry.npmjs.org/");
+            info!("nuwaxcode using registry: https://registry.npmjs.org/");
             self.run_command(
                 npm_cmd,
                 &[

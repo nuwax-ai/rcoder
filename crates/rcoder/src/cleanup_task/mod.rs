@@ -51,19 +51,47 @@ pub async fn start_cleanup_task(
         }
     };
 
+    // 启动 ResourceReaper（消费 cleanup_rx，处理 RAII 容器销毁请求）
+    {
+        let reaper_rx = match state.cleanup_rx.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(e) => {
+                tracing::error!("[REAPER] cleanup_rx mutex poisoned: {}", e);
+                return Err(anyhow::anyhow!("cleanup_rx mutex poisoned: {}", e));
+            }
+        };
+
+        let reaper_rx = match reaper_rx {
+            Some(rx) => rx,
+            None => {
+                tracing::error!(
+                    "[REAPER] cleanup_rx already consumed, ResourceReaper can only be started once"
+                );
+                return Err(anyhow::anyhow!("ResourceReaper can only be started once"));
+            }
+        };
+
+        let reaper = crate::storage::ResourceReaper::new(
+            reaper_rx,
+            state.runtime().clone(),
+            state.grpc_pool.clone(),
+            state.pingora_service.clone(),
+            docker_manager.clone(),
+        );
+        tokio::spawn(reaper.run());
+        tracing::info!(
+            "[REAPER] ResourceReaper started (docker_manager={})",
+            docker_manager.is_some()
+        );
+    }
+
     if docker_manager.is_none() {
         let state_for_k8s = state.clone();
+        let runtime_for_k8s = state.runtime().clone();
         return Ok(tokio::task::spawn(async move {
             let mut interval = tokio::time::interval(config.cleanup_interval);
             loop {
                 interval.tick().await;
-                let runtime = match docker_manager::runtime::RuntimeManager::get().await {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        tracing::warn!("[CLEANUP_TASK] failed to get runtime: {}", e);
-                        continue;
-                    }
-                };
                 let idle_threshold = match chrono::Duration::from_std(config.idle_timeout) {
                     Ok(v) => v,
                     Err(e) => {
@@ -72,8 +100,7 @@ pub async fn start_cleanup_task(
                     }
                 };
                 let now = chrono::Utc::now();
-                let projects: Vec<(String, Arc<shared_types::ProjectAndContainerInfo>)> =
-                    state_for_k8s.projects.iter().collect();
+                let projects = state_for_k8s.projects.iter();
 
                 for (project_id, project_info) in projects {
                     let idle = now.signed_duration_since(project_info.last_activity());
@@ -83,16 +110,16 @@ pub async fn start_cleanup_task(
 
                     let service_type = project_info
                         .service_type()
-                        .unwrap_or(shared_types::ServiceType::RCoder);
+                        .unwrap_or(shared_types::ServiceType::WebAgentRunner);
                     let identifier = match service_type {
                         shared_types::ServiceType::ComputerAgentRunner => project_info
                             .user_id()
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| project_id.clone()),
-                        shared_types::ServiceType::RCoder => project_id.clone(),
+                        shared_types::ServiceType::WebAgentRunner => project_id.clone(),
                     };
 
-                    if let Err(e) = runtime
+                    if let Err(e) = runtime_for_k8s
                         .stop_container_by_identifier(&identifier, &service_type)
                         .await
                     {
@@ -119,12 +146,18 @@ pub async fn start_cleanup_task(
 
     let pingora_service = state.pingora_service.clone();
 
-    let mut cleaner = AgentCleaner::new(
-        config,
-        state,
-        docker_manager.expect("docker_manager checked above"),
-        pingora_service,
-    );
+    // docker_manager 在此处一定为 Some（is_none 分支已 return）
+    let dm = match docker_manager {
+        Some(dm) => dm,
+        None => {
+            tracing::error!("[CLEANUP_TASK] docker_manager is None, cannot create AgentCleaner");
+            return Err(anyhow::anyhow!(
+                "docker_manager is None, cannot create AgentCleaner"
+            ));
+        }
+    };
+
+    let mut cleaner = AgentCleaner::new(config, state, dm, pingora_service);
 
     Ok(tokio::task::spawn(async move {
         cleaner.run().await;

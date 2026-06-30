@@ -173,12 +173,14 @@ impl AgentServersConfig {
     pub fn get_context_server(&self, name: &str) -> Option<&ContextServerConfig> {
         self.context_servers.get(name)
     }
+}
 
-    /// 创建默认配置
-    ///
-    /// 从 `configs/default_agents.json` 加载的配置（编译时嵌入）。
-    /// 修改 JSON 文件后重新编译即可生效。
-    pub fn default() -> Self {
+/// 创建默认配置
+///
+/// 从 `configs/default_agents.json` 加载的配置（编译时嵌入）。
+/// 修改 JSON 文件后重新编译即可生效。
+impl Default for AgentServersConfig {
+    fn default() -> Self {
         Self {
             agent_servers: default_agent_servers(),
             context_servers: default_context_servers(),
@@ -193,9 +195,10 @@ mod tests {
     #[tokio::test]
     async fn test_load_or_default_for_service() {
         // 测试 RCoder
-        let rcoder_config =
-            AgentServersConfig::load_or_default_for_service(&shared_types::ServiceType::RCoder)
-                .await;
+        let rcoder_config = AgentServersConfig::load_or_default_for_service(
+            &shared_types::ServiceType::WebAgentRunner,
+        )
+        .await;
         assert!(!rcoder_config.agent_servers.is_empty());
 
         // 测试 ComputerAgentRunner
@@ -210,7 +213,7 @@ mod tests {
     fn test_default_for_service() {
         // 测试 RCoder
         let rcoder_config =
-            AgentServersConfig::default_for_service(&shared_types::ServiceType::RCoder);
+            AgentServersConfig::default_for_service(&shared_types::ServiceType::WebAgentRunner);
         assert!(!rcoder_config.agent_servers.is_empty());
 
         // 测试 ComputerAgentRunner

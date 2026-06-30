@@ -85,7 +85,7 @@ impl ContainerKey {
     /// 获取对应的 ServiceType
     pub fn service_type(&self) -> ServiceType {
         match self {
-            ContainerKey::Project(_) => ServiceType::RCoder,
+            ContainerKey::Project(_) => ServiceType::WebAgentRunner,
             ContainerKey::User(_) => ServiceType::ComputerAgentRunner,
         }
     }
@@ -320,7 +320,7 @@ impl UnifiedContainerInfo {
         Self {
             key: ContainerKey::Project(project_id),
             container,
-            service_type: ServiceType::RCoder,
+            service_type: ServiceType::WebAgentRunner,
             created_at: now,
             last_activity: now,
             session_id: None,
@@ -412,7 +412,7 @@ impl UnifiedContainerInfo {
             idle_duration > ChronoDuration::from_std(idle_timeout).unwrap_or(ChronoDuration::MAX);
 
         match self.service_type {
-            ServiceType::RCoder => {
+            ServiceType::WebAgentRunner => {
                 // RCoder 模式：检查自身状态
                 let is_idle_status = matches!(self.status, Some(AgentStatus::Idle) | None);
                 is_idle_status && is_timeout
@@ -459,7 +459,7 @@ mod tests {
     fn create_mock_container_basic_info(project_id: &str) -> ContainerBasicInfo {
         ContainerBasicInfo {
             container_id: format!("container_{}", project_id),
-            container_name: format!("rcoder-agent-{}", project_id),
+            container_name: format!("web-agent-runner-{}", project_id),
             container_ip: "172.17.0.2".to_string(),
             internal_port: 8086,
             external_port: 8086,
@@ -474,7 +474,7 @@ mod tests {
     fn test_container_key_project() {
         let key = ContainerKey::from_project("proj_123".to_string());
         assert_eq!(key.as_str(), "proj_123");
-        assert_eq!(key.service_type(), ServiceType::RCoder);
+        assert_eq!(key.service_type(), ServiceType::WebAgentRunner);
         assert!(key.is_project());
         assert!(!key.is_user());
         assert_eq!(key.to_string(), "project:proj_123");
@@ -562,7 +562,7 @@ mod tests {
         let info = UnifiedContainerInfo::new_rcoder("proj_123".to_string(), container);
 
         assert!(matches!(info.key, ContainerKey::Project(_)));
-        assert_eq!(info.service_type, ServiceType::RCoder);
+        assert_eq!(info.service_type, ServiceType::WebAgentRunner);
         assert!(info.projects.is_none());
         assert_eq!(info.container_ip(), "172.17.0.2");
     }

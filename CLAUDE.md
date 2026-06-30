@@ -148,6 +148,31 @@ make update-image-tag
 - **内部网络通信**: 容器间通过 Docker 内部网络直接通信，无需端口映射
 - **路径自动解析**: 自动检测容器内路径到宿主机路径的映射
 
+### K8s Pod/PVC 生命周期管理
+
+K8s 模式下，Pod 和 PVC 的停止流程需要严格顺序，否则会导致 Terminating 卡死：
+
+```
+stop_container_by_identifier()
+  ├─ Step 1: pods().delete()       // 发送删除请求（graceful, 60s grace period）
+  ├─ Step 2: wait_for_pod_terminated()  // 轮询等待 Pod 消失（404），超时 90s 后 force-delete
+  ├─ Step 3: wait_for_pvc_removable()   // 等待 pvc-protection finalizer 移除（30s）
+  └─ Step 4: delete_workspace_pvc()     // 安全删除 PVC
+```
+
+**历史问题**: 早期版本在 `pods().delete()` 后立即调用 `delete_workspace_pvc()`，此时 Pod 还在运行、JuiceFS FUSE 卷仍被挂载，导致 PVC 的 `pvc-protection` finalizer 无法移除 → Pod 和 PVC 双双卡死在 Terminating。
+
+**关键文件**：
+- `crates/docker_manager/src/runtime/kubernetes_runtime.rs` - 核心：`stop_container_by_identifier()`
+- `crates/docker_manager/src/runtime/k8s_pod.rs` - Pod 生命周期：`K8sPodOps` trait（wait_for_pod_ready, wait_for_pod_terminated）
+- `crates/docker_manager/src/runtime/k8s_pvc.rs` - PVC 生命周期：`K8sPvcOps` trait（ensure_workspace_pvc, wait_for_pvc_removable, delete_workspace_pvc）
+- `crates/agent_runner/src/shutdown.rs` - 进程优雅关闭：`terminate_children()`（SIGTERM → 3s → SIGKILL）
+
+**Pod 停止时的三道防线**：
+1. **preStop lifecycle hook**: `sync && sleep 2`，在 SIGTERM 前 flush FUSE 写入 buffer
+2. **agent_runner shutdown handler**: 构建进程树，递归收集所有后代 + 孤儿进程（ppid=1），叶子优先 SIGTERM → 等待 3s → SIGKILL
+3. **wait_for_pod_terminated**: 等待 Pod 从 API Server 消失（404），超时后 `gracePeriodSeconds=0` 强制删除
+
 ### 容器工作空间路径
 | 隔离类型 | RCoder 路径 | Computer 路径 |
 |---------|------------|--------------|
@@ -254,6 +279,8 @@ RUST_LOG=rcoder=debug,tower_http=debug cargo run
 RUST_LOG=debug make dev-up
 ```
 
+> 💡 **K8s/devspace 下 rcoder 日志写文件、不写 stdout**，`kubectl logs` 几乎为空。详见下文「本地 K8s 测试（devspace + OrbStack）」章节。
+
 ### 容器调试
 ```bash
 # 查看容器状态
@@ -275,6 +302,52 @@ docker network inspect rcoder_agent-network
 # 测试容器间连通性
 docker exec <container1> ping <container2_ip>
 ```
+
+### 本地 K8s 测试（devspace + OrbStack）
+
+用 `devspace dev` 启动本地 K8s 环境（OrbStack 提供 k8s），默认服务端口 `8290`，namespace `rcoder-dev`，context `orbstack`。
+
+**Pod / Service 命名规则**：
+- rcoder 主服务 Pod：`rcoder-devspace-*`，Service `rcoder-service:8290`
+- ComputerAgentRunner Pod：`dev-rcoder-agent-runner-{user_id}`，每个 Pod 配一个 headless Service `{pod-name}-svc`
+- WebAgentRunner Pod：`dev-master-rcoder-{project_id}`，同样配 `{pod-name}-svc`
+- 容器间 gRPC 地址：`{pod-name}-svc.rcoder-dev.svc.cluster.local:50051`
+
+**⚠️ 日志查看（重要，避免踩坑）**：
+- **rcoder 日志写文件、不写 stdout** → `kubectl logs <rcoder-pod>` 几乎为空，别误以为"没执行/没日志"。默认级别就是 debug（`RUST_LOG` 不设也有）。
+- 正确方式是查 pod 内日志文件（按天滚动、JSON 格式）：
+```bash
+RCODER_POD=$(kubectl get pod -n rcoder-dev -o name | grep rcoder-devspace | head -1 | sed 's|pod/||')
+
+# 按关键词查 rcoder 日志
+kubectl exec -n rcoder-dev $RCODER_POD -- grep -a "RESOURCE_LIMITS\|CHAT\|ERROR" /app/logs/rcoder.$(date +%Y-%m-%d) | tail -20
+
+# 提取 JSON 行的 timestamp + message 字段（更易读）
+kubectl exec -n rcoder-dev $RCODER_POD -- grep -a "RESOURCE_LIMITS" /app/logs/rcoder.$(date +%Y-%m-%d) \
+  | python3 -c "import sys,json
+for l in sys.stdin:
+    d=json.loads(l); print(d.get('timestamp','')[:19], d['fields'].get('message',''))"
+```
+- **agent_runner Pod 日志在 stdout**，`kubectl logs <agent-runner-pod>` 可直接看。
+
+**测试与验证**：
+```bash
+# 健康检查
+curl http://127.0.0.1:8290/health
+
+# 创建 Pod（不带 resource_limits → 验证 configmap 兜底生效）
+curl -X POST http://127.0.0.1:8290/computer/pod/ensure \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"test-u","project_id":"test-p"}'
+
+# 查 Pod resources（K8s 核心：应非空 {cpu,memory}，来自 /app/config.yml 默认值）
+kubectl get pod -n rcoder-dev dev-rcoder-agent-runner-test-u \
+  -o jsonpath='{.spec.containers[0].resources}{"\n"}'
+```
+
+**配置来源**：devspace 部署**无独立 configmap**，`ServiceImageConfig.resource_limits` 等来自镜像内 `/app/config.yml`（ComputerAgentRunner=4GB/2核/8GB swap，WebAgentRunner=2GB/2核/4GB swap）。
+
+**代码热重载**：devspace 会把本地源码 sync 到 pod，但 rcoder 以 `cargo run` 启动、**不自动热重载**——改代码后需重启 rcoder 进程才能生效（devspace 侧重启，或 `kubectl delete pod` 让 Deployment 重建并重新 `cargo run` 编译新代码）。
 
 ## 开发工作流程
 

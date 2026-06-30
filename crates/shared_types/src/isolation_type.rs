@@ -12,25 +12,21 @@ use utoipa::ToSchema;
 /// - Tenant: 租户隔离，同一租户下的所有用户共享容器
 /// - Space: 空间隔离，同一租户同一空间下的用户共享容器
 /// - Project: 项目隔离，每个项目独立容器（默认行为）
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema, Default)]
 pub enum IsolationType {
     /// 租户隔离：同一租户共用一个容器
     Tenant,
     /// 空间隔离：同一租户同一空间共用一个容器
     Space,
     /// 项目隔离：每个项目独立容器（当前默认逻辑）
+    #[default]
     Project,
 }
 
-impl Default for IsolationType {
-    fn default() -> Self {
-        IsolationType::Project
-    }
-}
+impl std::str::FromStr for IsolationType {
+    type Err = IsolationTypeError;
 
-impl IsolationType {
-    /// 从字符串解析隔离类型
-    pub fn from_str(s: &str) -> Result<Self, IsolationTypeError> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "tenant" => Ok(IsolationType::Tenant),
             "space" => Ok(IsolationType::Space),
@@ -38,7 +34,9 @@ impl IsolationType {
             _ => Err(IsolationTypeError::InvalidIsolationType(s.to_string())),
         }
     }
+}
 
+impl IsolationType {
     /// 获取隔离类型的字符串表示
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -70,16 +68,32 @@ impl std::fmt::Display for IsolationType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_from_str_valid() {
-        assert_eq!(IsolationType::from_str("tenant").unwrap(), IsolationType::Tenant);
-        assert_eq!(IsolationType::from_str("space").unwrap(), IsolationType::Space);
-        assert_eq!(IsolationType::from_str("project").unwrap(), IsolationType::Project);
+        assert_eq!(
+            IsolationType::from_str("tenant").unwrap(),
+            IsolationType::Tenant
+        );
+        assert_eq!(
+            IsolationType::from_str("space").unwrap(),
+            IsolationType::Space
+        );
+        assert_eq!(
+            IsolationType::from_str("project").unwrap(),
+            IsolationType::Project
+        );
 
         // 大小写不敏感
-        assert_eq!(IsolationType::from_str("TENANT").unwrap(), IsolationType::Tenant);
-        assert_eq!(IsolationType::from_str("Space").unwrap(), IsolationType::Space);
+        assert_eq!(
+            IsolationType::from_str("TENANT").unwrap(),
+            IsolationType::Tenant
+        );
+        assert_eq!(
+            IsolationType::from_str("Space").unwrap(),
+            IsolationType::Space
+        );
     }
 
     #[test]

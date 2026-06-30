@@ -1,4 +1,5 @@
 use clap::Parser;
+#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,9 +8,11 @@ use tracing::{error, info, warn};
 // 🆕 使用共享的遥测模块
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
-mod agent_runtime;
+mod agent_mgmt;
 mod api_key_manager;
+mod auto_reload;
 mod config;
+#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 mod grpc;
 mod handler;
 mod model;
@@ -26,212 +29,54 @@ mod otel_tracing;
 
 mod router;
 mod service;
+mod shutdown;
 mod utils;
 
 // HTTP 服务器模块 (仅在 http-server feature 启用时)
 #[cfg(feature = "http-server")]
 mod http_server;
 
-use agent_runtime::AgentRuntime;
+// ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
+mod ws_terminal;
+
+pub use model::*;
+
 use config::{CliArgs, load_config_with_args};
-use model::*;
 use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
-#[cfg(feature = "proxy")]
-use rcoder_proxy::{PingoraServerManager, ProxyConfig};
+#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 use router::AppState;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::panic;
-use std::path::PathBuf;
-#[cfg(unix)]
-use tokio::signal::unix::{SignalKind, signal};
+use service::AgentSessionService;
+use shutdown::{set_panic_hook, setup_shutdown_handler};
+use utils::spawn_tool_version_log;
 
-/// 🔥 设置自定义 Panic Hook
-///
-/// 当 agent_runner panic 时，将完整的 panic 信息（包括 backtrace）写入日志文件
-/// 这样即使容器被销毁，也能通过挂载的日志目录找到崩溃原因
-fn set_panic_hook() {
-    let default_hook = panic::take_hook();
-
-    panic::set_hook(Box::new(move |panic_info| {
-        // 🔥 立即写入日志文件（不依赖 tracing，确保在 panic 时也能写入）
-        if let Err(e) = write_panic_to_file(panic_info) {
-            // 如果文件写入失败，尝试输出到 stderr
-            eprintln!("❌ [PANIC] Failed to write panic log file: {}", e);
-        }
-
-        // 🔥 同时输出到 stderr（Docker 会捕获到容器日志）
-        eprintln!("═══════════════════════════════════════════════════════════");
-        eprintln!("❌ [PANIC] agent_runner encountered a fatal error!");
-        eprintln!("═══════════════════════════════════════════════════════════");
-        if let Some(location) = panic_info.location() {
-            eprintln!(
-                "panic.location: {}:{}:{}",
-                location.file(),
-                location.line(),
-                location.column()
+fn create_model_env_resolver(
+    config: &config::AppConfig,
+) -> Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> {
+    #[cfg(feature = "proxy")]
+    {
+        if let Some(proxy_config) = &config.proxy_config {
+            let proxy_base_url_template = format!(
+                "http://localhost:{}/api/{{SERVICE_UUID}}",
+                proxy_config.listen_port
+            );
+            info!(
+                "🔒 [MAIN] Proxy model env enabled: {}",
+                proxy_base_url_template
+            );
+            return Arc::new(
+                agent_abstraction::launcher::ProxyModelRuntimeEnvResolver::new(
+                    proxy_base_url_template,
+                ),
             );
         }
-        eprintln!("panic.payload: {}", panic_info);
-        eprintln!("═══════════════════════════════════════════════════════════");
-
-        // 调用默认 hook（会终止进程）
-        default_hook(panic_info);
-    }));
-}
-
-/// 将 panic 信息写入日志文件
-fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()> {
-    // 🔥 日志文件路径：/app/container-logs/agent_runner_panic.log（使用已有的挂载目录）
-    let log_path = PathBuf::from("/app/container-logs/agent_runner_panic.log");
-
-    // 确保目录存在
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
     }
 
-    // 打开文件（追加模式）
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-
-    // 获取当前时间
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-
-    // 写入 panic 信息
-    writeln!(
-        file,
-        "═══════════════════════════════════════════════════════════"
-    )?;
-    writeln!(file, "❌ [PANIC] agent_runner encountered a fatal error!")?;
-    writeln!(file, "time: {}", now)?;
-    writeln!(
-        file,
-        "═══════════════════════════════════════════════════════════"
-    )?;
-    if let Some(location) = panic_info.location() {
-        writeln!(
-            file,
-            "panic.location: {}:{}:{}",
-            location.file(),
-            location.line(),
-            location.column()
-        )?;
-    }
-    writeln!(file, "panic.payload: {}", panic_info)?;
-
-    // 写入 backtrace（如果启用）
-    #[cfg(feature = "backtrace")]
-    {
-        if let Ok(backtrace) = std::backtrace::Backtrace::capture() {
-            writeln!(file, "Backtrace:\n{}", backtrace)?;
-        }
+    #[cfg(not(feature = "proxy"))]
+    if config.proxy_config.is_some() {
+        warn!("Proxy config is present, but proxy feature is not enabled; using direct model env");
     }
 
-    writeln!(
-        file,
-        "═══════════════════════════════════════════════════════════\n"
-    )?;
-
-    // 强制刷新到磁盘
-    file.flush()?;
-
-    eprintln!("✅ Panic info written to: {}", log_path.display());
-
-    Ok(())
-}
-
-/// 🔥 设置优雅关闭信号处理器
-///
-/// 监听系统信号，实现优雅关闭：
-/// - Unix: SIGTERM (Docker stop) + SIGINT (Ctrl+C)
-/// - Windows: Ctrl+C
-fn setup_shutdown_handler() -> tokio::task::JoinHandle<()> {
-    #[cfg(unix)]
-    {
-        tokio::spawn(async move {
-            // 监听 SIGTERM（Docker stop）
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("❌ [SIGNAL] Failed to register SIGTERM handler: {}", e);
-                    return;
-                }
-            };
-
-            // 监听 SIGINT（Ctrl+C）
-            let mut sigint = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("❌ [SIGNAL] Failed to register SIGINT handler: {}", e);
-                    return;
-                }
-            };
-
-            tokio::select! {
-                _ = sigterm.recv() => {
-                    eprintln!("📨 [SIGNAL] Received SIGTERM (Docker stop), starting graceful shutdown...");
-                    write_shutdown_log("SIGTERM");
-                }
-                _ = sigint.recv() => {
-                    eprintln!("📨 [SIGNAL] Received SIGINT (Ctrl+C), starting graceful shutdown...");
-                    write_shutdown_log("SIGINT");
-                }
-            }
-
-            eprintln!("🧹 [SIGNAL] Cleaning up resources...");
-            eprintln!("✅ [SIGNAL] Graceful shutdown completed, exiting");
-            std::process::exit(0);
-        })
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::spawn(async move {
-            // Windows: 仅监听 Ctrl+C
-            if let Ok(()) = tokio::signal::ctrl_c().await {
-                eprintln!("📨 [SIGNAL] Received Ctrl+C, starting graceful shutdown...");
-                write_shutdown_log("Ctrl+C");
-            }
-
-            eprintln!("🧹 [SIGNAL] Cleaning up resources...");
-            eprintln!("✅ [SIGNAL] Graceful shutdown completed, exiting");
-            std::process::exit(0);
-        })
-    }
-}
-
-/// 将关闭事件写入日志文件
-fn write_shutdown_log(signal: &str) {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let log_path = PathBuf::from("/app/container-logs/agent_runner_shutdown.log");
-
-    if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-        let _ = writeln!(
-            file,
-            "═══════════════════════════════════════════════════════════"
-        );
-        let _ = writeln!(
-            file,
-            "📨 [SHUTDOWN] agent_runner received a shutdown signal"
-        );
-        let _ = writeln!(file, "signal: {}", signal);
-        let _ = writeln!(file, "time: {}", now);
-        let _ = writeln!(
-            file,
-            "═══════════════════════════════════════════════════════════\n"
-        );
-        let _ = file.flush();
-        eprintln!("✅ Shutdown info written to: {}", log_path.display());
-    }
+    Arc::new(agent_abstraction::launcher::DirectModelRuntimeEnvResolver)
 }
 
 // 路由创建函数已移动到 handler 模块
@@ -255,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
     // 🆕 Initializing telemetry system（使用 rcoder-telemetry，包含控制台 + 文件日志）
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
-    let telemetry = Arc::new(telemetry);
+    let _telemetry = Arc::new(telemetry);
 
     // 🆕 Pyroscope Profiler 初始化（可选：需要 pyroscope feature）
     #[cfg(feature = "pyroscope")]
@@ -278,6 +123,19 @@ async fn main() -> anyhow::Result<()> {
     let _pyroscope_guard: Option<()> = None;
 
     info!("Starting rcoder - AI-powered development platform");
+    info!("agent-runner version: {}", env!("CARGO_PKG_VERSION"));
+
+    // 非阻塞打印外部工具版本（不阻塞启动流程）
+    spawn_tool_version_log("nuwaxcode", &["nuwaxcode", "-v"]);
+    spawn_tool_version_log(
+        shared_types::DEFAULT_AGENT_ID,
+        &[shared_types::DEFAULT_AGENT_ID, "-v"],
+    );
+
+    // 异步初始化内置 agent 版本缓存（不阻塞主流程）
+    tokio::spawn(async {
+        crate::agent_mgmt::checker::init_builtin_agent_versions().await;
+    });
 
     // 解析命令行参数
     let cli_args = CliArgs::parse();
@@ -285,27 +143,9 @@ async fn main() -> anyhow::Result<()> {
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args);
 
-    // 🔥 初始化并发限制（从配置读取）
-    if let Some(ref concurrency_config) = config.agent_concurrency {
-        agent_runtime::init_concurrency_limit(concurrency_config.concurrency_limit);
-    }
-
-    // 🔥 创建 AgentRuntime（新架构）
-    let (agent_runtime, task_receiver) = AgentRuntime::new(1000);
-    let agent_runtime = Arc::new(agent_runtime);
-    info!("🔧 [MAIN] AgentRuntime created");
-
-    // 🔥 启动 Worker（在主运行时中，无需独立线程）
-    agent_runtime.start(task_receiver).await;
-    info!("📌 [MAIN] Agent Worker started");
-
-    // 🔥 启动健康检查和重启任务
-    let health_monitor = spawn_health_monitor(agent_runtime.clone());
-    info!("[MAIN] Worker health monitor started");
-
     // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）
     let _reaper_handle = process_reaper::start_process_reaper();
-    info!("🧹 [MAIN] Process reaper started (PID 1 mode)");
+    info!("[MAIN] Process reaper started (PID 1 mode)");
 
     // 🆕 从配置中获取 Agent 清理配置，或使用默认值
     let agent_cleanup_config = config.agent_cleanup.clone().unwrap_or_default();
@@ -315,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     info!(
-        "🧹 [MAIN] Agent cleanup config: idle_timeout={}s, cleanup_interval={}s",
+        "[MAIN] Agent cleanup config: idle_timeout={}s, cleanup_interval={}s",
         agent_cleanup_config.idle_timeout_secs, agent_cleanup_config.cleanup_interval_secs
     );
 
@@ -327,29 +167,53 @@ async fn main() -> anyhow::Result<()> {
     // 🔒 创建共享的 API 密钥 DashMap
     let shared_api_key_manager =
         Arc::new(dashmap::DashMap::<String, shared_types::ModelProviderConfig>::new());
-    info!("🔑 [MAIN] Shared API key DashMap created");
+    info!("[MAIN] Shared API key DashMap created");
 
-    // 🔥 创建 ApiKeyManager 包装器（包装共享 DashMap，消除双重存储）
+    #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
     let api_key_manager = Arc::new(api_key_manager::ApiKeyManager::from_shared(
         shared_api_key_manager.clone(),
     ));
 
-    // 🔒 project_id -> service_uuid 映射
+    #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
     let project_uuid_map: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+
+    let model_env_resolver: Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> =
+        create_model_env_resolver(&config);
+    let agent_session_service = Arc::new(AgentSessionService::new(model_env_resolver));
+    info!("[MAIN] AgentSessionService created");
+
+    // 🆕 P0-1: 创建 Agent 管理注册表(从磁盘加载,失败则用空注册表 + 警告)
+    // 注:用二进制自己的 `crate::agent_mgmt` 模块(与 router::AppState 同编译单元),
+    //     lib 和 binary 是两个独立 crate,类型不能混用。
+    let agent_mgmt_path_manager = crate::agent_mgmt::PathManager::new();
+    let agent_mgmt_registry =
+        match crate::agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone()) {
+            Ok(r) => {
+                info!(
+                    "[MAIN] Agent management registry loaded: total={}, builtin={}",
+                    r.total(),
+                    r.builtin_count()
+                );
+                std::sync::Arc::new(r)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[MAIN] Failed to load agent management registry, starting empty: {e}"
+                );
+                std::sync::Arc::new(crate::agent_mgmt::AgentRegistry::empty(
+                    agent_mgmt_path_manager.clone(),
+                ))
+            }
+        };
 
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
     {
         use http_server::{HttpServerConfig, start_http_server};
-        use proxy_agent::set_unlimited_mode;
-
-        // 设置为无限制模式（HTTP Server 部署，不限制槽位）
-        set_unlimited_mode(true);
-
         // 🔥 1. 可选：启动 gRPC 服务（当 grpc-server feature 启用时）
         #[cfg(feature = "grpc-server")]
         let grpc_handle = {
-            info!("ℹ️  HTTP server mode: starting HTTP + gRPC + Pingora");
+            info!("HTTP server mode: starting HTTP + gRPC + Pingora");
 
             let grpc_port = shared_types::GRPC_DEFAULT_PORT;
             let grpc_addr = format!("[::]:{}", grpc_port)
@@ -360,13 +224,14 @@ async fn main() -> anyhow::Result<()> {
             let grpc_state = Arc::new(AppState {
                 sessions: Arc::new(DashMap::new()),
                 config: config.clone(),
-                local_task_sender: agent_runtime.clone(),
-                agent_runtime: agent_runtime.clone(),
+                agent_session_service: agent_session_service.clone(),
                 #[cfg(feature = "proxy")]
                 pingora_service: None,
                 api_key_manager: api_key_manager.clone(),
                 shared_api_key_manager: shared_api_key_manager.clone(),
                 project_uuid_map: project_uuid_map.clone(),
+                agent_mgmt_registry: agent_mgmt_registry.clone(),
+                agent_mgmt_path_manager: agent_mgmt_path_manager.clone(),
             });
 
             // gRPC 消息大小限制
@@ -376,6 +241,12 @@ async fn main() -> anyhow::Result<()> {
             .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
             .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
+            // P0-1: Agent 管理 gRPC 服务
+            let agent_mgmt_service = crate::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+                agent_mgmt_registry.clone(),
+                agent_mgmt_path_manager.clone(),
+            );
+
             let handle = tokio::spawn(async move {
                 info!("gRPC service started, listening on port: {}", grpc_port);
                 info!("gRPC endpoints (port {}):", grpc_port);
@@ -383,8 +254,16 @@ async fn main() -> anyhow::Result<()> {
                 info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
                 info!("  agent.AgentService/CancelSession - gRPC cancel");
                 info!("  agent.AgentService/GetStatus - gRPC status");
+                info!("  agent.AgentMgmtService/* - agent management (P0-1)");
                 if let Err(e) = tonic::transport::Server::builder()
                     .add_service(grpc_service)
+                    .add_service(
+                        shared_types::grpc::agent_mgmt_service_server::AgentMgmtServiceServer::new(
+                            agent_mgmt_service,
+                        )
+                        .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+                        .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE),
+                    )
                     .serve(grpc_addr)
                     .await
                 {
@@ -398,15 +277,23 @@ async fn main() -> anyhow::Result<()> {
         // 无 gRPC 模式
         #[cfg(not(feature = "grpc-server"))]
         {
-            info!("ℹ️  HTTP server mode: starting HTTP + Pingora only (no gRPC)");
+            info!("HTTP server mode: starting HTTP + Pingora only (no gRPC)");
         }
+
+        // 🔥 1.5. 启动 ttyd WS 终端中间层（tokio-tungstenite：接浏览器 + 连本地 ttyd）
+        //         cd 逻辑由代码每次连接（含重连）控制，解决 WS 重连不进项目目录的问题
+        tokio::spawn(async move {
+            ws_terminal::start_ws_terminal().await;
+        });
 
         // 🔥 2. 创建 HttpServerConfig（包含所有配置）
         let http_config = HttpServerConfig {
             port: config.port,
             app_config: config.clone(),
-            agent_runtime: agent_runtime.clone(),
+            agent_session_service: agent_session_service.clone(),
             shared_api_key_manager: shared_api_key_manager.clone(),
+            agent_mgmt_registry: Some(agent_mgmt_registry.clone()),
+            agent_mgmt_path_manager: Some(agent_mgmt_path_manager.clone()),
         };
 
         // 🔥 3. 启动 HTTP 服务器（内部会启动 Pingora）
@@ -417,12 +304,36 @@ async fn main() -> anyhow::Result<()> {
 
         #[cfg(feature = "grpc-server")]
         {
-            tokio::select! {
-                _ = grpc_handle.unwrap() => {
-                    info!("gRPC service ended unexpectedly, shutting down...");
+            match grpc_handle {
+                Some(handle) => {
+                    tokio::select! {
+                        result = handle => {
+                            match result {
+                                Ok(_) => info!("gRPC service ended normally"),
+                                Err(e) if e.is_panic() => {
+                                    error!("gRPC service panicked: {:?}", e);
+                                }
+                                Err(e) if e.is_cancelled() => {
+                                    info!("gRPC service was cancelled");
+                                }
+                                Err(e) => {
+                                    error!("gRPC service ended with error: {:?}", e);
+                                }
+                            }
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("Received shutdown signal, preparing graceful shutdown...");
+                        }
+                    }
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("📨 Received shutdown signal, preparing graceful shutdown...");
+                None => {
+                    // This should never happen if grpc-server feature is enabled
+                    error!(
+                        "CRITICAL: gRPC handle is None despite grpc-server feature being enabled. This is a bug in initialization logic."
+                    );
+                    // Wait for ctrl_c instead of silently continuing
+                    tokio::signal::ctrl_c().await?;
+                    info!("Received shutdown signal, preparing graceful shutdown...");
                 }
             }
         }
@@ -430,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "grpc-server"))]
         {
             tokio::signal::ctrl_c().await?;
-            info!("📨 Received shutdown signal, preparing graceful shutdown...");
+            info!("Received shutdown signal, preparing graceful shutdown...");
         }
 
         Ok(())
@@ -439,7 +350,7 @@ async fn main() -> anyhow::Result<()> {
     // 🔥 non-http-server 模式：启动 gRPC + Pingora（用于 Docker 容器内）
     #[cfg(not(feature = "http-server"))]
     {
-        info!("ℹ️  Container mode: starting gRPC + Pingora");
+        info!("Container mode: starting gRPC + Pingora");
 
         // 启动 gRPC 服务
         let grpc_port = shared_types::GRPC_DEFAULT_PORT;
@@ -451,13 +362,14 @@ async fn main() -> anyhow::Result<()> {
         let grpc_state = Arc::new(AppState {
             sessions: Arc::new(DashMap::new()),
             config: config.clone(),
-            local_task_sender: agent_runtime.clone(),
-            agent_runtime: agent_runtime.clone(),
+            agent_session_service: agent_session_service.clone(),
             #[cfg(feature = "proxy")]
             pingora_service: None,
             api_key_manager: api_key_manager.clone(),
             shared_api_key_manager: shared_api_key_manager.clone(),
             project_uuid_map: project_uuid_map.clone(),
+            agent_mgmt_registry: agent_mgmt_registry.clone(),
+            agent_mgmt_path_manager: agent_mgmt_path_manager.clone(),
         });
 
         // gRPC 消息大小限制
@@ -467,6 +379,12 @@ async fn main() -> anyhow::Result<()> {
         .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
+        // P0-1: Agent 管理 gRPC 服务
+        let agent_mgmt_service = crate::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+            agent_mgmt_registry.clone(),
+            agent_mgmt_path_manager.clone(),
+        );
+
         let grpc_handle = tokio::spawn(async move {
             info!("gRPC service started, listening on port: {}", grpc_port);
             info!("gRPC endpoints (port {}):", grpc_port);
@@ -474,8 +392,16 @@ async fn main() -> anyhow::Result<()> {
             info!("  agent.AgentService/SubscribeProgress - gRPC progress stream");
             info!("  agent.AgentService/CancelSession - gRPC cancel");
             info!("  agent.AgentService/GetStatus - gRPC status");
+            info!("  agent.AgentMgmtService/* - agent management (P0-1)");
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(grpc_service)
+                .add_service(
+                    shared_types::grpc::agent_mgmt_service_server::AgentMgmtServiceServer::new(
+                        agent_mgmt_service,
+                    )
+                    .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE),
+                )
                 .serve(grpc_addr)
                 .await
             {
@@ -487,16 +413,29 @@ async fn main() -> anyhow::Result<()> {
         let health_port = config.port; // 默认 8086，来自 --port 参数
         let _health_handle = tokio::spawn(async move {
             use axum::{Json, Router, routing::get};
+            use handler::health_handler::{build_health_response, check_grpc_port_simple};
 
-            async fn health_check() -> Json<shared_types::HealthResponse> {
-                Json(shared_types::HealthResponse::new("agent-runner"))
+            async fn health_check()
+            -> Json<shared_types::HttpResult<shared_types::HealthCheckResponse>> {
+                // HTTP 服务：本端点正常响应即表示就绪
+                let http_ready = true;
+
+                // 检查 gRPC 端口是否就绪
+                let grpc_ready = check_grpc_port_simple().await;
+
+                // 使用统一的健康检查响应构建函数
+                Json(build_health_response(
+                    "agent-runner",
+                    http_ready,
+                    grpc_ready,
+                ))
             }
 
             let app = Router::new().route("/health", get(health_check));
             let addr = format!("0.0.0.0:{}", health_port);
 
             info!(
-                "🏥 HTTP health check service started, listening on port: {}",
+                "HTTP health check service started, listening on port: {}",
                 health_port
             );
 
@@ -504,7 +443,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(l) => l,
                 Err(e) => {
                     error!(
-                        "❌ Failed to bind HTTP health check service: {} (port: {})",
+                        "Failed to bind HTTP health check service: {} (port: {})",
                         e, health_port
                     );
                     return;
@@ -522,21 +461,29 @@ async fn main() -> anyhow::Result<()> {
             use proxy_agent::start_pingora;
 
             if let Some(proxy_config) = &config.proxy_config {
-                Some(start_pingora(proxy_config, shared_api_key_manager.clone()))
+                Some(start_pingora(proxy_config, shared_api_key_manager.clone())?)
             } else {
-                info!("ℹ️  Pingora proxy service is not configured");
+                info!("Pingora proxy service is not configured");
                 None
             }
         };
 
         #[cfg(not(feature = "proxy"))]
         let pingora_result: Option<()> = {
-            info!("ℹ️  Pingora proxy service is disabled (proxy feature not enabled)");
+            info!("Pingora proxy service is disabled (proxy feature not enabled)");
             None
         };
 
         // 等待 gRPC 服务
-        let _ = grpc_handle.await;
+        if let Err(e) = grpc_handle.await {
+            if e.is_panic() {
+                error!("gRPC service panicked: {:?}", e);
+            } else if e.is_cancelled() {
+                info!("gRPC service was cancelled");
+            } else {
+                error!("gRPC service ended with error: {:?}", e);
+            }
+        }
 
         // 停止 Pingora 服务
         #[cfg(feature = "proxy")]
@@ -549,51 +496,4 @@ async fn main() -> anyhow::Result<()> {
 
         Ok(())
     }
-}
-
-/// 🔥 健康监控任务 (新架构)
-///
-/// 定期检查 Agent Worker 健康状态，自动重启不健康的 Worker
-async fn spawn_health_monitor(runtime: Arc<AgentRuntime>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        let mut consecutive_failures: u32 = 0;
-        const MAX_RESTART_ATTEMPTS: u32 = 5;
-        const RESTART_COOLDOWN_SECS: u64 = 60;
-
-        info!("[HealthMonitor] Health monitor started");
-
-        loop {
-            interval.tick().await;
-
-            // 检查健康状态
-            if !runtime.check_health().await {
-                error!("[HealthMonitor] Worker reported unhealthy");
-
-                // 检查冷却期
-                if consecutive_failures >= MAX_RESTART_ATTEMPTS {
-                    warn!(
-                        "⏳ [HealthMonitor] {} consecutive restart failures, entering cooldown",
-                        consecutive_failures
-                    );
-                    tokio::time::sleep(Duration::from_secs(RESTART_COOLDOWN_SECS)).await;
-                    consecutive_failures = 0;
-                    info!("[HealthMonitor] Cooldown ended, reset failure counter");
-                }
-
-                // 创建新的通道
-                let (new_tx, new_rx) = tokio::sync::mpsc::channel(1000);
-
-                // 重启 worker
-                runtime.restart(new_rx).await;
-                consecutive_failures += 1;
-                info!(
-                    "🔄 [HealthMonitor] Worker restart completed (attempt #{})",
-                    consecutive_failures
-                );
-            } else {
-                consecutive_failures = 0;
-            }
-        }
-    })
 }

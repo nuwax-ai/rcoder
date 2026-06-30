@@ -8,10 +8,10 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tracing::{error, info};
 
-use crate::runtime_selection::RuntimeType;
+use super::DockerRuntime;
 #[cfg(feature = "kubernetes")]
 use super::KubernetesRuntime;
-use super::DockerRuntime;
+use crate::runtime_selection::RuntimeType;
 use crate::types::DockerManagerConfig;
 
 /// Global runtime instance
@@ -30,23 +30,22 @@ impl RuntimeManager {
         let runtime: Arc<dyn ContainerRuntime> = match runtime_type {
             RuntimeType::Docker => {
                 info!("[RUNTIME] Initializing Docker runtime");
-                let docker_manager = crate::DockerManager::new(config.clone())
-                    .await
-                    .map_err(|e| {
-                        container_runtime_api::ContainerRuntimeError::ConnectionError(
-                            e.to_string(),
-                        )
-                    })?;
+                let docker_manager =
+                    crate::DockerManager::new(config.clone())
+                        .await
+                        .map_err(|e| {
+                            container_runtime_api::ContainerRuntimeError::ConnectionError(
+                                e.to_string(),
+                            )
+                        })?;
                 Arc::new(DockerRuntime::new(Arc::new(docker_manager)))
             }
             #[cfg(feature = "kubernetes")]
             RuntimeType::Kubernetes => {
                 info!("[RUNTIME] Initializing Kubernetes runtime");
-                let k8s_runtime = KubernetesRuntime::new(config.clone())
-                    .await
-                    .map_err(|e| {
-                        container_runtime_api::ContainerRuntimeError::K8sError(e.to_string())
-                    })?;
+                let k8s_runtime = KubernetesRuntime::new(config.clone()).await.map_err(|e| {
+                    container_runtime_api::ContainerRuntimeError::K8sError(e.to_string())
+                })?;
                 Arc::new(k8s_runtime)
             }
             #[cfg(not(feature = "kubernetes"))]
@@ -77,8 +76,7 @@ impl RuntimeManager {
     }
 
     /// Get the global runtime instance
-    pub async fn get(
-    ) -> container_runtime_api::ContainerRuntimeResult<Arc<dyn ContainerRuntime>> {
+    pub async fn get() -> container_runtime_api::ContainerRuntimeResult<Arc<dyn ContainerRuntime>> {
         RUNTIME_INSTANCE.get().cloned().ok_or_else(|| {
             container_runtime_api::ContainerRuntimeError::ConfigurationError(
                 "Runtime not initialized. Call RuntimeManager::init() first.".to_string(),

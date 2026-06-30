@@ -1,7 +1,12 @@
+// router 整体由 binary (main.rs) 使用，lib 内不直接调用 create_router / ApiDoc 等。
+// 抑制 dead_code 以避免 lib 维度误报。
+#![allow(dead_code)]
+
 use arc_swap::ArcSwap;
+use container_runtime_api::ContainerRuntime;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use tokio::sync::broadcast;
 
 use axum::{
     Router,
@@ -16,6 +21,8 @@ use serde::Serialize;
 use shared_types::ProjectAndContainerInfo;
 
 use crate::{
+    agent_download::AgentDownloadManager,
+    app_manager,
     config::{ApiKeyAuthConfig, AppConfig},
     handler,
     storage::ProjectAdapter,
@@ -51,43 +58,121 @@ pub struct SessionInfo {
 pub struct AppState {
     /// 应用配置
     pub config: AppConfig,
-    /// 项目适配器 - 统一管理项目、会话和容器数据（替代原有的 3 个 DashMap）
-    pub projects: ProjectAdapter,
+    /// 项目适配器 - 纯 DashMap 内存存储 + RAII 自动资源回收
+    ///
+    /// 使用 `Arc<ProjectAdapter>` 共享同一实例：
+    /// - AppState 业务逻辑通过 `state.projects.method()` 访问（Arc 自动 deref）
+    /// - 同一 `Arc` 作为 `Arc<dyn ContainerLookup>` 注入 Pingora 代理层，
+    ///   使 /web/ttyd、/computer/ttyd 等路由能解析容器 IP
+    ///   （DashMap 的 clone 是深拷贝，必须共享同一 Arc 实例才能保证数据一致）
+    pub projects: Arc<ProjectAdapter>,
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     /// gRPC 连接池（用于与 agent_runner 通信）
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
+    /// Session 级共享 SSE 流注册表（每 session 一条 agent_runner SubscribeProgress 流，
+    /// 多 HTTP SSE 客户端 fan-out 共享，消除重复推送；配合 agent_runner 的 seq 增量 replay）
+    pub session_stream_registry: Arc<crate::grpc::SessionStreamRegistry>,
     /// 🆕 可热更新的 API Key 配置（使用 ArcSwap 实现无锁读取）
     pub api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
     /// 🆕 容器创建中标记: user_id -> 创建开始时间
     /// 用于防止并发 pod_ensure 请求互相干扰（无锁方案）
     pub pod_creating: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    /// 🚀 容器创建完成通知通道（替代轮询等待）
+    /// 当容器创建完成时，发送 user_id 通知等待方
+    pub pod_created_tx: Arc<broadcast::Sender<String>>,
     /// 🆕 容器前缀（从配置读取，启动时初始化）
     pub container_prefix_rcoder: String,
     pub container_prefix_computer: String,
+    /// 容器运行时（通过 DI 注入，替代全局 RuntimeManager::get()）
+    pub runtime: Arc<dyn ContainerRuntime>,
+    /// RAII 资源回收器接收端（在 start_cleanup_task 中取出并启动 ResourceReaper）
+    pub cleanup_rx: Arc<
+        std::sync::Mutex<
+            Option<tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>>,
+        >,
+    >,
+    /// Agent 下载管理器（统一缓存）
+    pub agent_download_manager: Arc<AgentDownloadManager>,
+    /// 应用管理服务
+    pub app_service: Arc<dyn crate::app_manager::AppServiceTrait>,
+    /// K8s 集群域名（用于构建 K8s Service FQDN）
+    pub cluster_domain: String,
 }
 
 impl AppState {
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
         config: AppConfig,
         pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
         api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
         container_prefix_rcoder: String,
         container_prefix_computer: String,
+        runtime: Arc<dyn ContainerRuntime>,
+        projects: Arc<ProjectAdapter>,
+        cleanup_rx: tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>,
     ) -> anyhow::Result<Self> {
-        let projects = ProjectAdapter::new()
-            .map_err(|e| anyhow::anyhow!("Failed to initialize ProjectAdapter: {}", e))?;
+        // ProjectAdapter 由调用方（main.rs）提前创建并注入，
+        // 以便同一 Arc 实例可同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层。
+        let cluster_domain = shared_types::get_k8s_cluster_domain();
+
+        // 创建容器创建完成通知通道（缓冲区大小 32，足够应对并发创建）
+        let (pod_created_tx, _) = broadcast::channel(32);
+
+        // 初始化 Agent 下载管理器
+        let cache_dir = std::env::var("AGENT_CACHE_DIR")
+            .unwrap_or_else(|_| shared_types::AGENT_CACHE_DIR.to_string());
+        let agent_download_manager =
+            Arc::new(AgentDownloadManager::new(cache_dir).map_err(|e| {
+                anyhow::anyhow!("failed to initialize agent download manager: {}", e)
+            })?);
+
+        // 初始化应用管理服务（根据 features flag 选择）
+        let app_service: Arc<dyn crate::app_manager::AppServiceTrait> = {
+            #[cfg(feature = "kubernetes")]
+            {
+                Arc::new(
+                    crate::app_manager::k8s_service::K8sAppService::new(
+                        config.app_manager.clone(),
+                        runtime.clone(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to initialize K8s app service: {}", e))?,
+                )
+            }
+            #[cfg(not(feature = "kubernetes"))]
+            {
+                Arc::new(
+                    crate::app_manager::service::AppService::new(config.app_manager.clone())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
+                )
+            }
+        };
 
         Ok(Self {
             config,
             projects,
             pingora_service: pingora,
             grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
+            session_stream_registry: Arc::new(crate::grpc::SessionStreamRegistry::new()),
             api_key_config,
             pod_creating: Arc::new(DashMap::new()),
+            pod_created_tx: Arc::new(pod_created_tx),
             container_prefix_rcoder,
             container_prefix_computer,
+            runtime,
+            cleanup_rx: Arc::new(std::sync::Mutex::new(Some(cleanup_rx))),
+            agent_download_manager,
+            app_service,
+            cluster_domain,
         })
+    }
+
+    /// 获取容器运行时引用（替代 RuntimeManager::get()）
+    #[inline]
+    pub fn runtime(&self) -> &Arc<dyn ContainerRuntime> {
+        &self.runtime
     }
 
     // ========== 向后兼容的便捷方法 ==========
@@ -99,11 +184,31 @@ impl AppState {
     }
 
     /// 插入项目信息（替代 project_and_agent_map.insert）
+    ///
+    /// # Errors
+    /// 如果 `service_type` 未设置，透传错误。
     #[inline]
-    pub fn insert_project(&self, project_id: String, info: Arc<ProjectAndContainerInfo>) {
-        if let Err(e) = self.projects.insert(project_id.clone(), info) {
-            tracing::error!("Failed to insert project {}: {}", project_id, e);
-        }
+    pub fn insert_project(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+    ) -> anyhow::Result<()> {
+        self.projects.insert(project_id.clone(), info)
+    }
+
+    /// 插入项目并设置 session 映射（单次原子写入，消除 CAS 竞态）
+    ///
+    /// # Errors
+    /// 如果 `service_type` 未设置，透传错误。
+    #[inline]
+    pub fn insert_project_with_session(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        self.projects
+            .insert_with_session(project_id, info, Some(session_id))
     }
 
     /// 删除项目（替代 project_and_agent_map.remove）
@@ -133,31 +238,49 @@ impl AppState {
         self.projects.get_container_name_by_session(session_id)
     }
 
-    /// 更新会话信息
+    /// 向已有 project 追加 session（C1 修复推荐路径，多 session 模型）
+    ///
+    /// 单步原子，多 session 并存。返回 false 表示 project 不存在。
     #[inline]
-    pub fn update_session(&self, project_id: &str, session_id: &str) {
-        if let Err(e) = self.projects.update_session(project_id, session_id) {
-            tracing::error!(
-                "Failed to update session: project_id={}, session_id={}, error={}",
-                project_id,
-                session_id,
-                e
-            );
-        }
+    pub fn add_session_to_project(&self, project_id: &str, session_id: &str) -> bool {
+        self.projects.add_session_to_project(project_id, session_id)
     }
 
-    /// 清除会话信息（将 session_id 设置为 NULL）
-    ///
-    /// 用于 Agent 停止后清理会话状态
+    /// 更新会话信息（已废弃，请用 `add_session_to_project` 或 `insert_project_with_session`）
+    #[inline]
+    #[deprecated(
+        since = "0.0.0",
+        note = "非原子，请用 `add_session_to_project` 走多 session 路径"
+    )]
+    #[allow(deprecated)]
+    pub fn update_session(&self, project_id: &str, session_id: &str) {
+        self.projects.update_session(project_id, session_id);
+    }
+
+    /// 原子更新会话信息（已废弃，多 session 模型下 CAS 语义不再适用）
+    #[inline]
+    #[deprecated(since = "0.0.0", note = "CAS 语义在多 session 模型下不再适用")]
+    #[allow(dead_code, deprecated)]
+    pub fn update_session_atomic(
+        &self,
+        project_id: &str,
+        new_session_id: &str,
+        expected_current_session_id: Option<&str>,
+    ) -> bool {
+        self.projects
+            .update_session_atomic(project_id, new_session_id, expected_current_session_id)
+    }
+
+    /// 清除会话信息（清所有 session，agent stop 场景）
     #[inline]
     pub fn clear_session(&self, project_id: &str) {
-        if let Err(e) = self.projects.clear_session(project_id) {
-            tracing::error!(
-                "Failed to clear session: project_id={}, error={}",
-                project_id,
-                e
-            );
-        }
+        self.projects.clear_session(project_id);
+    }
+
+    /// 清除单个 session（保留 project 的其他 session）
+    #[inline]
+    pub fn clear_session_one(&self, project_id: &str, session_id: &str) -> bool {
+        self.projects.clear_session_one(project_id, session_id)
     }
 
     /// 更新项目活动时间，返回实际更新使用的时间戳
@@ -173,6 +296,19 @@ impl AppState {
     }
 }
 
+/// 内部 API 路由（供 rcoder-gateway 调用）
+///
+/// 这些端点挂载在中间件之前，绕过 API Key 鉴权。
+fn create_internal_routes(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/internal/pod/ensure", post(handler::internal_pod_ensure))
+        .route(
+            "/internal/session/{session_id}/resolve",
+            get(handler::internal_session_resolve),
+        )
+        .with_state(state)
+}
+
 /// 创建 Axum 路由
 pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>>) -> Router {
     let api_routes = Router::new()
@@ -183,6 +319,10 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             get(handler::agent_session_notification),
         )
         .route("/agent/session/cancel", post(handler::agent_session_cancel))
+        .route(
+            "/agent/notify-resolved",
+            post(handler::agent_notify_resolved),
+        )
         .route("/agent/stop", post(handler::agent_stop))
         .route("/agent/status/{project_id}", get(handler::agent_status))
         .with_state(state.clone());
@@ -198,6 +338,10 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route(
             "/computer/agent/session/cancel",
             post(handler::computer_agent_session_cancel),
+        )
+        .route(
+            "/computer/notify-resolved",
+            post(handler::computer_notify_resolved),
         )
         // 进度流复用现有的 agent_session_notification
         .route(
@@ -236,10 +380,35 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route("/proxy/config", get(handler::proxy_config))
         .with_state(state.clone());
 
+    // DevComputer 调试路由 — 委托给 /computer/* 处理器，共享同一个容器
+    let devcomputer_routes = Router::new()
+        .route("/devcomputer/chat", post(handler::handle_devcomputer_chat))
+        .route(
+            "/devcomputer/agent/stop",
+            post(handler::devcomputer_agent_stop),
+        )
+        .route(
+            "/devcomputer/agent/status",
+            post(handler::devcomputer_agent_status),
+        )
+        .route(
+            "/devcomputer/agent/session/cancel",
+            post(handler::devcomputer_agent_session_cancel),
+        )
+        .route(
+            "/devcomputer/notify-resolved",
+            post(handler::devcomputer_notify_resolved),
+        )
+        .route(
+            "/devcomputer/progress/{session_id}",
+            get(handler::devcomputer_agent_progress_notification),
+        )
+        .with_state(state.clone());
+
     // 调试路由（仅用于开发和问题排查，需要 feature flag "debug" 启用）
     #[cfg(feature = "debug")]
     let debug_routes = Router::new()
-        .route("/debug/sql", post(handler::debug_sql_query))
+        .route("/debug/sql", get(handler::debug_dump_summary))
         .route("/debug/projects", get(handler::debug_list_projects))
         .route("/debug/containers", get(handler::debug_list_containers))
         .route("/debug/storage/stats", get(handler::debug_storage_stats))
@@ -250,11 +419,57 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route("/health", get(handler::health_check))
         .with_state(state.clone());
 
+    // P0-5: Agent Management 路由(全部 POST + body 解析)
+    // - 简单 JSON 端点使用 I18nJsonOrQuery(同时支持 JSON body 和 ?project_id=xxx query)
+    // - install 端点使用 multipart/form-data(file + metadata JSON 字段)
+    //
+    // ⚠️ install 路由的 body 限制必须在 Router 层挂,而不是 MethodRouter 层。
+    // axum 的 `Multipart` 提取器通过 `with_limited_body()` 读取
+    // `DefaultBodyLimitKind` 扩展(Request 上挂的 layer 才生效),`MethodRouter::layer`
+    // 出来的 MethodRouter 不携带这个扩展,无法被 multipart 识别。
+    // 此外 `RequestBodyLimitLayer` 是 tower 中间件,只读取 Content-Length 头,
+    // 对 streaming 的 multipart body 不直接生效,但保留作为 defense-in-depth。
+    let install_route = Router::new()
+        .route("/agent-mgmt/agents/install", post(handler::install_agent))
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            1024 * 1024 * 1024,
+        ));
+
+    let agent_mgmt_routes = Router::new()
+        .route("/agent-mgmt/agents/list", post(handler::list_agents))
+        .route("/agent-mgmt/agents/get", post(handler::get_agent))
+        .route("/agent-mgmt/agents/check", post(handler::check_agent))
+        .merge(install_route)
+        .route(
+            "/agent-mgmt/agents/install-from-url",
+            post(handler::install_from_url),
+        )
+        .route(
+            "/agent-mgmt/agents/install-from-npm",
+            post(handler::install_from_npm),
+        )
+        .route(
+            "/agent-mgmt/agents/uninstall",
+            post(handler::uninstall_agent),
+        )
+        .with_state(state.clone());
+
+    // 应用管理路由
+    let app_manager_state = Arc::new(app_manager::handlers::AppManagerState {
+        app_service: state.app_service.clone(),
+    });
+    let app_manager_routes =
+        app_manager::routes::app_manager_routes().with_state(app_manager_state);
+
     let mut router = Router::new()
         .merge(health_routes)
         .merge(api_routes)
         .merge(computer_routes)
-        .merge(proxy_api_routes);
+        .merge(devcomputer_routes)
+        .merge(proxy_api_routes)
+        .merge(agent_mgmt_routes)
+        .merge(app_manager_routes);
 
     // 仅在启用 debug feature 时添加调试路由
     #[cfg(feature = "debug")]
@@ -280,8 +495,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     router
         .merge(create_swagger_ui())
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB body 大小限制
-        .layer(HttpMetricsLayer::new()) // 🆕 HTTP 指标中间件
-        // 🆕 添加 API Key 鉴权中间件（支持热更新）
+        .layer(HttpMetricsLayer::new()) // HTTP 指标中间件
+        // API Key 鉴权中间件（支持热更新）
         .layer(axum::middleware::from_fn(move |req, next| {
             crate::middleware::api_key_middleware::api_key_middleware_handler(
                 Arc::clone(&api_key_config),
@@ -290,6 +505,28 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             )
         }))
         .layer(axum::middleware::from_fn(locale_context_middleware))
+        // 内部 API（供 rcoder-gateway 调用，绕过 API Key 鉴权）
+        .merge(create_internal_routes(state))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-frame-options"),
+            axum::http::HeaderValue::from_static("DENY"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-content-type-options"),
+            axum::http::HeaderValue::from_static("nosniff"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("strict-transport-security"),
+            axum::http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("referrer-policy"),
+            axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::HeaderName::from_static("x-xss-protection"),
+            axum::http::HeaderValue::from_static("0"),
+        ))
 }
 
 /// Prometheus 指标处理器
@@ -322,17 +559,20 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::handle_chat,
         handler::agent_session_notification,
         handler::agent_session_cancel,
+        handler::agent_notify_resolved,
         handler::agent_stop,
         handler::agent_status,
         handler::handle_computer_chat,
         handler::computer_agent_stop,
         handler::computer_agent_status, // 🆕 新增
         handler::computer_agent_session_cancel,
+        handler::computer_notify_resolved,
         handler::computer_agent_progress_notification,
         handler::computer_desktop_vnc,
         handler::computer_desktop_proxy,
         handler::computer_audio_proxy,
         handler::computer_ime_proxy,
+        handler::computer_ttyd_proxy,
         handler::pod_count,
         handler::pod_list,
         handler::pod_ensure,
@@ -347,11 +587,41 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::proxy_to_port,
         handler::proxy_to_port_with_path,
         handler::proxy_with_query_params,
+        // P0-4: Agent Management 转发层
+        handler::list_agents,
+        handler::get_agent,
+        handler::check_agent,
+        handler::install_agent,
+        handler::install_from_url,
+        handler::install_from_npm,
+        handler::uninstall_agent,
+        // DevComputer 调试接口
+        handler::handle_devcomputer_chat,
+        handler::devcomputer_agent_stop,
+        handler::devcomputer_agent_status,
+        handler::devcomputer_agent_session_cancel,
+        handler::devcomputer_notify_resolved,
+        handler::devcomputer_agent_progress_notification,
+        // 应用管理接口
+        app_manager::handlers::create_app,
+        app_manager::handlers::query_apps,
+        app_manager::handlers::get_app,
+        app_manager::handlers::update_app,
+        app_manager::handlers::delete_app,
+        app_manager::handlers::start_app,
+        app_manager::handlers::stop_app,
+        app_manager::handlers::restart_app,
+        app_manager::handlers::get_app_logs,
+        app_manager::handlers::get_app_health,
+        app_manager::handlers::get_app_stats,
+        app_manager::handlers::get_app_events,
+        app_manager::handlers::upload_file,
+        app_manager::handlers::list_files,
     ),
     components(
         schemas(
             // 响应结构体
-            handler::HealthResponse,
+            shared_types::HealthCheckResponse,
             shared_types::AgentChatRequest,
             shared_types::ChatResponse,
             shared_types::AgentStopResponse,
@@ -380,6 +650,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             // 会话消息相关结构体
             shared_types::UnifiedSessionMessage,
             shared_types::SessionMessageType,
+            // Permission 相关结构体
+            shared_types::ResolvePermissionResponseDto,
             // Computer Agent 相关结构体
             shared_types::ComputerChatRequest,
             shared_types::ComputerAgentStopRequest,
@@ -390,11 +662,12 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::VncProxyPathParams,
             handler::AudioProxyPathParams,
             handler::ImeProxyPathParams,
+            handler::TtydProxyPathParams,
             handler::DesktopAccessResponse,
             handler::DesktopErrorResponse,
             // Pod 容器管理相关结构体
-            handler::PodCountResponse,
-            handler::PodCountByServiceType,
+            shared_types::PodCountResponse,
+            shared_types::PodCountByServiceType,
             handler::PodListQuery,
             handler::PodListResponse,
             handler::PodDetailInfo,
@@ -409,7 +682,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::PodStatusQuery,
             handler::PodStatusResponse,
             handler::VncStatusQuery,
-            handler::VncStatusResponse,
+            shared_types::VncStatusResponse,
             // Pingora 代理相关结构体
             handler::ProxyResponse,
             handler::ProxyStatus,
@@ -422,6 +695,41 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::BackendInfo,
             handler::PortStats,
             handler::HealthCheckConfig,
+            // P0-4: Agent Management 类型
+            shared_types::AgentInfo,
+            shared_types::AgentDetailInfo,
+            shared_types::AgentInstallStatus,
+            shared_types::InstallType,
+            shared_types::InstallAction,
+            shared_types::PlatformEntry,
+            shared_types::ListAgentsRequest,
+            shared_types::ListAgentsResponse,
+            shared_types::CheckAgentRequest,
+            shared_types::CheckAgentResponse,
+            shared_types::AgentIdentity,
+            shared_types::InstallFromUrlRequest,
+            shared_types::InstallFromPackageManagerRequest,
+            shared_types::InstallAgentResponse,
+            shared_types::UninstallAgentRequest,
+            shared_types::UninstallAgentResponse,
+            shared_types::StaticCheckResult,
+            shared_types::SystemInfo,
+            shared_types::RoutingParams,
+            shared_types::GetAgentRequest,
+            // multipart 特有类型(rcoder 本地)
+            handler::InstallMetadataBody,
+            handler::InstallMultipartBody,
+            // 应用管理相关结构体
+            app_manager::models::CreateAppRequest,
+            app_manager::models::AppInfo,
+            app_manager::models::AppStatus,
+            app_manager::models::QueryAppsRequest,
+            app_manager::models::UpdateAppRequest,
+            app_manager::models::LogParams,
+            app_manager::models::LogEntry,
+            app_manager::models::ResourceStats,
+            app_manager::models::HealthInfo,
+            app_manager::models::PaginatedResponse<app_manager::models::AppInfo>,
         )
     ),
     tags(
@@ -431,6 +739,9 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         (name = "computer", description = "Computer Agent 桌面与聊天接口"),
         (name = "pod", description = "Pod 容器管理接口，支持容器监控、启动和保活"),
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
+        (name = "agent-mgmt", description = "Agent 二进制安装/卸载/检查接口(P0-4: rcoder 转发到 agent_runner 容器)"),
+        (name = "devcomputer", description = "DevComputer 调试接口（与 /computer 共享容器，自动注入 auto_reload 配置）"),
+        (name = "应用管理", description = "应用容器管理接口，支持创建、启动、停止、删除应用"),
     ),
     info(
         description = r#"
@@ -481,7 +792,7 @@ RCoder AI 服务 API
 "#,
         title = "RCoder AI API",
         version = "1.0.0",
-        license(name = "MIT OR Apache-2.0", url = "https://opensource.org/licenses/MIT"),
+        license(name = "Apache-2.0", url = "https://www.apache.org/licenses/LICENSE-2.0"),
         contact(
             name = "RCoder Team",
             email = "team@rcoder.com",

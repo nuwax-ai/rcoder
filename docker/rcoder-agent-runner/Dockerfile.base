@@ -232,10 +232,10 @@ COPY downloads /tmp/downloads
 RUN echo "Installing LibreOffice..." && \
     case "${TARGETARCH}" in \
     "amd64") \
-        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.5/deb/x86_64/${LIBREOFFICE_FILE}" \
+        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.7/deb/x86_64/${LIBREOFFICE_FILE}" \
         ;; \
     "arm64") \
-        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.5/deb/aarch64/${LIBREOFFICE_FILE}" \
+        LIBREOFFICE_URL="https://download.documentfoundation.org/libreoffice/stable/25.8.7/deb/aarch64/${LIBREOFFICE_FILE}" \
         ;; \
     *) echo "❌ Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac && \
@@ -769,10 +769,21 @@ RUN apt-get update && apt-get install -y \
 ENV RUSTUP_HOME=/opt/rustup \
     CARGO_HOME=/opt/cargo \
     PATH="/opt/cargo/bin:$PATH"
+
+# 使用国内镜像源加速下载
+#ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static/
+#ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup/
+# 安装 Rust 并验证
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-    chmod -R 755 /opt/rustup /opt/cargo && \
-    # 确保 user 可以使用 cargo
-    chmod -R o+rX /opt/cargo /opt/rustup
+    echo 'export PATH="/root/.cargo/bin:$PATH"' >> /root/.bashrc && \
+    export PATH="/root/.cargo/bin:$PATH" && \
+    which cargo && cargo --version
+
+# 设置 PATH 环境变量（确保后续命令能找到 cargo）
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 复制 cargo 镜像配置文件（使用国内镜像加速）
+COPY .cargo/config.toml /root/.cargo/config.toml
 
 # 安装 uv 到全局路径（需要 root）
 # 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
@@ -872,6 +883,44 @@ USER root
 RUN echo "📦 Updating skeleton directory with user configs..." && \
     cp -a /home/user/. /etc/skel-user-desktop/ && \
     echo "✅ Skeleton directory updated at /etc/skel-user-desktop"
+
+# ============================================================================
+# 🖥️ ttyd - Web 终端（PTY → WebSocket，供前端 xterm.js 访问）
+# 多架构二进制（amd64 / arm64），从 GitHub release 下载
+# 与 noVNC 性质相同（Web 网关类），放 base 层
+# ============================================================================
+# 重新声明 ARG（FROM 之后必须重新声明才能在 stage 内使用）
+ARG USE_GITHUB_MIRROR
+ARG TARGETARCH
+ARG TTYD_VERSION=1.7.7
+ARG CACHEBUST_TTYD=1
+
+RUN _ARCH="${TARGETARCH}"; \
+    if [ -z "${_ARCH}" ]; then _ARCH=$(dpkg --print-architecture); fi && \
+    echo "🔧 ttyd cache bust: ${CACHEBUST_TTYD}" && \
+    if [ "$USE_GITHUB_MIRROR" = "true" ]; then \
+        GH_HOST="https://gh-proxy.org/"; \
+        GH_PATH="https://github.com/"; \
+    else \
+        GH_HOST=""; \
+        GH_PATH="https://github.com/"; \
+    fi && \
+    case "${_ARCH}" in \
+        "amd64") TTYD_BIN="ttyd.x86_64" ;; \
+        "arm64") TTYD_BIN="ttyd.aarch64" ;; \
+        *) echo "❌ Unsupported arch: ${_ARCH}" && exit 1 ;; \
+    esac && \
+    DOWNLOAD_URL="${GH_HOST}${GH_PATH}tsl0922/ttyd/releases/download/${TTYD_VERSION}/${TTYD_BIN}" && \
+    echo "📦 Downloading ttyd ${TTYD_VERSION} for ${_ARCH} → ${TTYD_BIN}..." && \
+    curl -fsSL -o /usr/local/bin/ttyd "${DOWNLOAD_URL}" && \
+    chmod +x /usr/local/bin/ttyd && \
+    ttyd --version
+
+# 静态资源目录（demo 用的 index.html 由 Dockerfile 注入）
+RUN mkdir -p /usr/local/share/ttyd
+
+# ttyd 默认端口
+ENV TTYD_PORT=7681
 
 # ============================================================================
 # 基础镜像构建完成

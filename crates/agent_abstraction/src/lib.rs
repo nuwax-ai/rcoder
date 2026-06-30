@@ -64,6 +64,8 @@
 //! - **通过 SessionRegistry trait**: 在 `agent_abstraction` 内部使用（会话管理逻辑）
 
 pub mod acp;
+pub mod client;
+pub mod diagnostics;
 pub mod error;
 pub mod launcher;
 pub mod mirror_env;
@@ -73,14 +75,22 @@ pub mod traits;
 
 // Re-export types from submodules
 pub use acp::{CancelNotificationRequestWrapper, CancelResult};
+pub use client::{AcpClient, AcpClientBuilder, PromptCompletionSignal};
+pub use diagnostics::{DiagnosticsListener, NoopDiagnosticsListener, ProcessDiagnostics};
 pub use error::AgentAbstractionError;
 pub use launcher::{
-    AgentLaunchConfig, AgentLifecycleGuard, ClaudeCodeLauncher, LauncherConnectionInfoComplete,
-    convert_context_servers, get_default_agent_config, load_agent_config,
+    AgentLaunchConfig, AgentLifecycleGuard, ClaudeCodeLauncher, DirectModelRuntimeEnvResolver,
+    LauncherConnectionInfoComplete, ModelRuntimeEnvResolver, ProxyModelRuntimeEnvResolver,
+    ResolvedModelEnv, convert_context_servers, direct_model_runtime_env_resolver,
+    get_default_agent_config, load_agent_config,
 };
 pub use session::{
     AcpAgentWorker, AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse,
 };
 pub use traits::agent::{AgentStartConfig, PromptMessage};
+pub use traits::permission_handler::{
+    InteractivePermissionHandler, PermissionPrompt, PermissionRequestContext,
+    PermissionRequestHandler, YoloPermissionRequestHandler,
+};
 pub use traits::session_notifier::SessionNotifier;
 pub use traits::session_registry::SessionRegistry;

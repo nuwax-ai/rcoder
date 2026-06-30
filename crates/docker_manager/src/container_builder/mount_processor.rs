@@ -119,10 +119,7 @@ impl MountProcessor {
             .collect();
 
         let processed = processed?;
-        info!(
-            "Mount processing completed: {} mounts",
-            processed.len()
-        );
+        info!("Mount processing completed: {} mounts", processed.len());
 
         Ok(processed)
     }

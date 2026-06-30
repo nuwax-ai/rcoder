@@ -1,0 +1,50 @@
+[package]
+name = "download_utils"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "HTTP download utilities with retry, resume, and SHA-256 verification"
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Stream processing
+futures-util = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Crypto (SHA-256)
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# UUID (for temp files)
+uuid = { workspace = true }
+
+# Archive extraction
+flate2 = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

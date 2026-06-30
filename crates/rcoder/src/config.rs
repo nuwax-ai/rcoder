@@ -1,3 +1,7 @@
+// 配置模块由 binary (main.rs) 通过 CLI args 使用；lib 内部不直接调用
+// load_config* 与一些 helper 方法，故抑制 dead_code。
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -55,10 +59,13 @@ pub struct AppConfig {
     /// API Key 鉴权配置
     #[serde(default)]
     pub api_key_auth: ApiKeyAuthConfig,
+    /// 应用管理配置
+    #[serde(default)]
+    pub app_manager: crate::app_manager::AppManagerConfig,
 }
 
 fn default_agent_id() -> String {
-    "claude-code-acp-ts".to_string()
+    shared_types::DEFAULT_AGENT_ID.to_string()
 }
 
 /// 生成随机 API Key
@@ -84,6 +91,40 @@ pub struct HealthCheckConfig {
     pub unhealthy_threshold: u32,
 }
 
+/// 代理 HTTP 客户端配置（用于协议转换时连接上游 API）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyHttpClientConfig {
+    /// 请求超时（秒），默认 600（10 分钟，AI 请求可能很长）
+    #[serde(default = "default_http_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    /// 连接建立超时（秒），默认 10
+    #[serde(default = "default_http_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+    /// 连接池空闲超时（秒），默认 90
+    #[serde(default = "default_http_pool_idle_timeout_seconds")]
+    pub pool_idle_timeout_seconds: u64,
+}
+
+fn default_http_request_timeout_seconds() -> u64 {
+    600
+}
+fn default_http_connect_timeout_seconds() -> u64 {
+    10
+}
+fn default_http_pool_idle_timeout_seconds() -> u64 {
+    90
+}
+
+impl Default for ProxyHttpClientConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_seconds: 600,
+            connect_timeout_seconds: 10,
+            pool_idle_timeout_seconds: 90,
+        }
+    }
+}
+
 /// 反向代理配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -97,6 +138,9 @@ pub struct ProxyConfig {
     pub port_param: String,
     /// 健康检查配置
     pub health_check: HealthCheckConfig,
+    /// HTTP 客户端配置（用于协议转换时连接上游 API）
+    #[serde(default)]
+    pub http_client: ProxyHttpClientConfig,
 }
 
 /// 日志清理配置
@@ -228,6 +272,7 @@ impl Default for AppConfig {
                 enabled: false,
                 api_key: generate_random_api_key(),
             },
+            app_manager: crate::app_manager::AppManagerConfig::default(),
         }
     }
 }
@@ -240,6 +285,7 @@ impl Default for ProxyConfig {
             backend_host: "127.0.0.1".to_string(),
             port_param: "port".to_string(),
             health_check: HealthCheckConfig::default(),
+            http_client: ProxyHttpClientConfig::default(),
         }
     }
 }
@@ -299,7 +345,7 @@ impl DockerConfig {
             shared_types::service_config::default_rcoder_service_config()
         };
 
-        services.insert("rcoder".to_string(), rcoder_service);
+        services.insert("web-agent-runner".to_string(), rcoder_service);
 
         // 为 AgentRunner 服务使用默认配置
         services.insert(
@@ -329,8 +375,27 @@ impl DockerConfig {
     pub fn validate_multi_image_config(&self) -> Result<(), String> {
         let multi_config = self.get_multi_image_config();
         match multi_config.validate() {
-            Ok(()) => Ok(()),
-            Err(e) => Err(e.to_string()),
+            Ok(()) => {
+                tracing::info!("[CONFIG] Multi-image config validation passed");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("[CONFIG] Multi-image config validation failed: {}", e);
+                // 打印每个服务的配置详情
+                for (service_key, service_config) in &multi_config.services {
+                    tracing::error!(
+                        "[CONFIG]   Service '{}': service_type={}, image={:?}, arm64_image={:?}, amd64_image={:?}, default_image={:?}, enabled={}",
+                        service_key,
+                        service_config.service_type,
+                        service_config.image,
+                        service_config.arm64_image,
+                        service_config.amd64_image,
+                        service_config.default_image,
+                        service_config.enabled
+                    );
+                }
+                Err(e.to_string())
+            }
         }
     }
 
@@ -372,7 +437,7 @@ impl DockerConfig {
                 Ok(seconds) => self.container_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_CONTAINER_TTL '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_CONTAINER_TTL '{}': {}, using default",
                         val,
                         e
                     );
@@ -387,7 +452,7 @@ impl DockerConfig {
                 Ok(seconds) => self.api_timeout_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_API_TIMEOUT_SECONDS '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_API_TIMEOUT_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -402,7 +467,7 @@ impl DockerConfig {
                 Ok(seconds) => self.api_timeout_quick_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -417,7 +482,7 @@ impl DockerConfig {
                 Ok(seconds) => self.cache_status_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -432,7 +497,7 @@ impl DockerConfig {
                 Ok(seconds) => self.cache_network_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -447,7 +512,7 @@ impl DockerConfig {
                 Ok(capacity) => self.cache_max_capacity = Some(capacity),
                 Err(e) => {
                     tracing::warn!(
-                        "⚠️ [CONFIG] Failed to parse RCODER_CACHE_MAX_CAPACITY '{}': {}, using default",
+                        " [CONFIG] Failed to parse RCODER_CACHE_MAX_CAPACITY '{}': {}, using default",
                         val,
                         e
                     );
@@ -565,10 +630,13 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     }
 
     // 配置验证
-    if let Some(docker_config) = &config.docker_config {
-        if let Err(e) = docker_config.validate_multi_image_config() {
-            return Err(anyhow::anyhow!("Docker configuration validation failed: {}", e));
-        }
+    if let Some(docker_config) = &config.docker_config
+        && let Err(e) = docker_config.validate_multi_image_config()
+    {
+        return Err(anyhow::anyhow!(
+            "Docker configuration validation failed: {}",
+            e
+        ));
     }
 
     info!(
@@ -596,22 +664,43 @@ pub fn load_config() -> anyhow::Result<AppConfig> {
 
 /// 从文件加载配置
 fn load_config_from_file() -> anyhow::Result<AppConfig> {
-    let config_content =
-        fs::read_to_string(CONFIG_FILE).map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
+    let config_content = fs::read_to_string(CONFIG_FILE)
+        .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
-    tracing::debug!("config file content: {}", config_content);
+    // 安全修复：移除完整配置内容的 debug 日志，避免泄露 API Key 等敏感信息
+    tracing::debug!("config file loaded, size: {} bytes", config_content.len());
 
-    let config: AppConfig = serde_yaml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
+    let config: AppConfig = serde_yaml::from_str(&config_content).map_err(|e| {
+        tracing::error!("[CONFIG] Failed to parse config file: {}", e);
+        // 打印配置文件的前 2000 个字符，帮助排查解析错误
+        let preview = if config_content.len() > 2000 {
+            format!("{}...(truncated)", &config_content[..2000])
+        } else {
+            config_content.clone()
+        };
+        tracing::error!("[CONFIG] Config file content preview:\n{}", preview);
+        anyhow::anyhow!("Failed to parse config file: {}", e)
+    })?;
 
     // 调试：打印解析后的多镜像配置
     if let Some(ref docker_config) = config.docker_config {
         tracing::info!("[CONFIG] docker_config is Some, checking multi_image_config");
         if let Some(ref multi_config) = docker_config.multi_image_config {
-            tracing::info!("[CONFIG] multi_image_config is Some, services count: {}", multi_config.services.len());
+            tracing::info!(
+                "[CONFIG] multi_image_config is Some, services count: {}",
+                multi_config.services.len()
+            );
             for (service_key, service_config) in &multi_config.services {
-                tracing::info!("[CONFIG]   Service '{}': arm64_image={:?}, amd64_image={:?}",
-                    service_key, service_config.arm64_image, service_config.amd64_image);
+                tracing::info!(
+                    "[CONFIG]   Service '{}': service_type={}, image={:?}, arm64_image={:?}, amd64_image={:?}, default_image={:?}, enabled={}",
+                    service_key,
+                    service_config.service_type,
+                    service_config.image,
+                    service_config.arm64_image,
+                    service_config.amd64_image,
+                    service_config.default_image,
+                    service_config.enabled
+                );
                 tracing::debug!(
                     "  Service '{}' mount config (total {} mounts):",
                     service_key,
@@ -641,8 +730,8 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
 pub fn load_api_key_config_from_file(
     config_path: &std::path::Path,
 ) -> anyhow::Result<ApiKeyAuthConfig> {
-    let config_content =
-        fs::read_to_string(config_path).map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
+    let config_content = fs::read_to_string(config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
     let config: AppConfig = serde_yaml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
@@ -659,7 +748,8 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
 
     // 创建配置文件目录（如果不存在）
     if let Some(parent) = std::path::Path::new(CONFIG_FILE).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
     }
 
     // 使用嵌入式配置文件
@@ -673,6 +763,6 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to write default config file: {}", e))?;
 
     info!("Created default config file: {}", CONFIG_FILE);
-    info!("🔑 Loaded API Key (not set)");
+    info!(" Loaded API Key (not set)");
     Ok(())
 }

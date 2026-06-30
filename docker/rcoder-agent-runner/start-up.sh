@@ -203,6 +203,11 @@ function wait_for_novnc_ready() {
     done
 }
 
+# 注：原 check_xvnc_rfb_ready（nc 连 5900 读 RFB 版本串后断开）已移除——
+# 这种 RFB 半握手会被 TigerVNC 计为"安全失败"，累积触发 "Too many security failures"
+# 锁定，拒绝前端正常连接（websockify 报 Target closed）。
+# Xvnc 卡死/僵尸改由 check_vnc_health 的 xdpyinfo（X11 层，走 X 协议不碰 RFB）检测。
+
 # 等待文件存在，最长等待 $2 秒（默认 5 秒）
 # 用法: wait_for_file "filepath" [timeout_seconds]
 function wait_for_file() {
@@ -1155,22 +1160,65 @@ function apply_xfce_wallpaper() {
 
 function check_vnc_health() {
     # 检查 VNC 服务健康状态 (as root)
-    # 返回值：0=健康, 1=noVNC 异常(Xvnc 正常), 2=Xvnc 崩溃(需要重建整个显示栈)
-    if [ "$VNC_AUTO_START" = "true" ]; then
-        # 检查 Xvnc 进程（根基：X11 server + VNC server）
-        if ! pgrep -f "Xvnc" >/dev/null 2>&1; then
-            log_warn "Xvnc process not running (X11 display lost)"
-            return 2
-        fi
-
-        # 检查 noVNC 代理端口
-        if ! netstat -tuln 2>/dev/null | grep -q ":6080 "; then
-            log_warn "noVNC proxy not listening on port 6080"
-            return 1
-        fi
-
+    # 返回值：0=健康, 1=noVNC 异常(Xvnc 正常), 2=Xvnc 崩溃/卡死(需要重建整个显示栈)
+    #
+    # ⚠️ 禁止连 5900 端口做探测（wait_for_port 5900 / nc / RFB 半握手都不行）：
+    #    TigerVNC 把任何不完整的 RFB 连接计为"安全失败"，累积后触发
+    #    "Too many security failures" 锁定，拒绝前端正常连接（websockify 报 Target closed）。
+    #    改用 xdpyinfo（X11 层）检测卡死——它走 X 协议、不碰 RFB，不会触发该锁定。
+    #
+    # 三关：
+    #   ① Xvnc 进程存活且非僵尸(Z)/非卡死(D)
+    #   ② X11 display 层验证（xdpyinfo，检测事件循环卡死）
+    #   ③ noVNC 前端代理端口可达（6080，端口探测避免 WS 升级触发 websockify 连 5900）
+    if [ "$VNC_AUTO_START" != "true" ]; then
         return 0
     fi
+
+    # ① Xvnc 进程存活且非僵尸(Z)/非卡死(D 状态=不可中断睡眠)
+    local xvnc_pid xvnc_stat
+    xvnc_pid=$(pgrep -x "Xvnc" | head -1)
+    if [ -z "$xvnc_pid" ]; then
+        log_warn "check_vnc_health: no Xvnc process found"
+        rm -f /tmp/vnc_ready
+        return 2
+    fi
+    xvnc_stat=$(ps -o stat= -p "$xvnc_pid" 2>/dev/null)
+    if [ -z "$xvnc_stat" ]; then
+        log_warn "check_vnc_health: Xvnc pid $xvnc_pid disappeared (race)"
+        rm -f /tmp/vnc_ready
+        return 2
+    fi
+    case "$xvnc_stat" in
+        Z*|*Z*)
+            log_error "check_vnc_health: Xvnc pid $xvnc_pid is ZOMBIE (stat=$xvnc_stat)"
+            rm -f /tmp/vnc_ready
+            return 2
+            ;;
+        D*|*D*)
+            log_error "check_vnc_health: Xvnc pid $xvnc_pid STUCK in D state (stat=$xvnc_stat)"
+            rm -f /tmp/vnc_ready
+            return 2
+            ;;
+    esac
+
+    # ② X11 display 层验证（检测 Xvnc 事件循环卡死；走 X 协议，不碰 RFB/5900）
+    if ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; then
+        log_error "check_vnc_health: Xvnc pid $xvnc_pid X11 display frozen (xdpyinfo fails)"
+        rm -f /tmp/vnc_ready
+        return 2
+    fi
+
+    # ③ noVNC 前端代理端口可达（6080）。
+    # ⚠️ 不做 WS 升级：websockify 是 WS↔TCP proxy，WS 升级会触发它连后端 5900，
+    #    半握手被 TigerVNC 计为"安全失败"触发锁定。代理是否就绪由端口判断，
+    #    Xvnc 后端服务可用性由 rcoder 代码侧完整 RFB 握手（check_vnc_rfb_ready）验证。
+    if ! wait_for_port localhost 6080 3; then
+        log_warn "check_vnc_health: Xvnc healthy but noVNC proxy port 6080 down"
+        rm -f /tmp/vnc_ready
+        return 1
+    fi
+
     return 0
 }
 
@@ -1745,6 +1793,57 @@ function start_ime_services() {
 
     log_success "IME passthrough services initialized"
 }
+
+# ============================================================================
+# 🖥️ ttyd Web 终端服务（PTY → WebSocket，给前端 xterm.js 用）
+# 不依赖 X11，可与 noVNC 并存：noVNC 看桌面，ttyd 敲命令
+# 降权到 user (uid 1000) 防止 -W 模式下浏览器直接以 root 跑命令
+# ============================================================================
+function start_ttyd_services() {
+    log "Starting ttyd web terminal service..."
+
+    # 检查开关（默认开，与 audio_server/ime_server 风格一致）
+    if [ "${ENABLE_TTYD:-true}" != "true" ]; then
+        log_warn "  ttyd is disabled (set ENABLE_TTYD=true to enable)"
+        return 0
+    fi
+
+    # 检查二进制（由 Dockerfile.base 注入）
+    if [ ! -x /usr/local/bin/ttyd ]; then
+        log_warn "  ttyd binary not found at /usr/local/bin/ttyd, skipping"
+        return 1
+    fi
+
+    # 检查启动脚本（由 Dockerfile 注入）
+    if [ ! -x /usr/local/bin/start-ttyd.sh ]; then
+        log_warn "  start-ttyd.sh not found, skipping"
+        return 1
+    fi
+
+    # 创建日志目录
+    local TTYD_LOG_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}/ttyd"
+    mkdir -p "$TTYD_LOG_DIR"
+    chmod 755 "$TTYD_LOG_DIR"
+    log_success "  ttyd log directory: $TTYD_LOG_DIR"
+
+    # 启动（与 ime/audio 同风格：nohup + 后台 + 写日志）
+    nohup /usr/local/bin/start-ttyd.sh > "$TTYD_LOG_DIR/ttyd.log" 2>&1 &
+
+    # 等待端口就绪（5 秒内）
+    local TTYD_PORT="${TTYD_PORT:-7681}"
+    if wait_for_port localhost "$TTYD_PORT" 5; then
+        log_success "  ttyd started"
+        log_success "  ttyd URL:        http://localhost:${TTYD_PORT}/"
+        log_success "  ttyd WebSocket:  ws://localhost:${TTYD_PORT}/ws"
+    else
+        log_warn "  ttyd port ${TTYD_PORT} not ready, check log: $TTYD_LOG_DIR/ttyd.log"
+        tail -20 "$TTYD_LOG_DIR/ttyd.log" 2>/dev/null || true
+        return 1
+    fi
+
+    return 0
+}
+
 # 设置VNC自动启动标志
 export VNC_AUTO_START=true
 
@@ -2156,6 +2255,11 @@ if [ -f /tmp/dbus-session-env ]; then
     log_success "Loaded D-Bus session: $DBUS_SESSION_BUS_ADDRESS"
 fi
 
+# ========== 启动 ttyd Web 终端服务 ==========
+# ttyd 不依赖 X11，可以独立启动
+log "Starting ttyd web terminal service..."
+start_ttyd_services
+
 # 构建环境变量导出命令
 ENV_EXPORTS="export HOME=/home/user; \
 export DISPLAY=:0; \
@@ -2167,7 +2271,7 @@ export INPUT_METHOD=fcitx; \
 export LANG=C.UTF-8; \
 export LC_ALL=C.UTF-8; \
 export BROWSER=/usr/bin/chromium-browser-launcher; \
-export PATH=/usr/local/bin:/opt/cargo/bin:\$PATH"
+export PATH=/home/user/acp-agent:/usr/local/bin:/opt/cargo/bin:\$PATH"
 
 # 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）
 # 否则执行默认的 agent_runner

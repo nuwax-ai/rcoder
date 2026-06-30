@@ -13,10 +13,10 @@ struct MetadataMapInjector<'a>(&'a mut MetadataMap);
 
 impl Injector for MetadataMapInjector<'_> {
     fn set(&mut self, key: &str, value: String) {
-        if let Ok(key) = MetadataKey::from_bytes(key.as_bytes()) {
-            if let Ok(value) = MetadataValue::try_from(&value) {
-                self.0.insert(key, value);
-            }
+        if let Ok(key) = MetadataKey::from_bytes(key.as_bytes())
+            && let Ok(value) = MetadataValue::try_from(&value)
+        {
+            self.0.insert(key, value);
         }
     }
 }
@@ -109,10 +109,10 @@ pub struct HttpHeaderInjector<'a>(pub &'a mut http::HeaderMap);
 
 impl Injector for HttpHeaderInjector<'_> {
     fn set(&mut self, key: &str, value: String) {
-        if let Ok(name) = http::header::HeaderName::from_bytes(key.as_bytes()) {
-            if let Ok(value) = http::header::HeaderValue::from_str(&value) {
-                self.0.insert(name, value);
-            }
+        if let Ok(name) = http::header::HeaderName::from_bytes(key.as_bytes())
+            && let Ok(value) = http::header::HeaderValue::from_str(&value)
+        {
+            self.0.insert(name, value);
         }
     }
 }

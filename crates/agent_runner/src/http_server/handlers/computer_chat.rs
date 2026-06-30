@@ -2,7 +2,7 @@
 //!
 //! 处理 POST /computer/chat 请求
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{Json, extract::State, http::HeaderMap};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -37,30 +37,31 @@ pub async fn handle_computer_chat(
     headers: HeaderMap,
     I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerChatRequest>,
 ) -> Result<Json<HttpResult<ChatResponse>>, shared_types::AppError> {
+    handle_computer_chat_internal(State(state), headers, I18nJsonOrQuery(request), false).await
+}
+
+/// Computer Chat 内部处理函数
+///
+/// 支持 `is_devcomputer` 参数，用于区分 `/computer/chat` 和 `/devcomputer/chat` 请求
+pub(crate) async fn handle_computer_chat_internal(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerChatRequest>,
+    is_devcomputer: bool,
+) -> Result<Json<HttpResult<ChatResponse>>, shared_types::AppError> {
     let locale = locale_from_headers(&headers);
     info!(
-        "📨 [HTTP] Received Computer Chat request:\n\
-         ├─ user_id: {:?}\n\
-         ├─ project_id: {:?}\n\
-         ├─ session_id: {:?}\n\
-         ├─ request_id: {:?}\n\
-         ├─ prompt ({}chars): {:?}\n\
-         ├─ pod_id: {:?}\n\
-         ├─ tenant_id: {:?}\n\
-         ├─ space_id: {:?}\n\
-         ├─ isolation_type: {:?}\n\
-         ├─ attachments: {:?}\n\
-         ├─ data_source_attachments: {:?}\n\
-         ├─ model_provider: {:#?}\n\
-         ├─ agent_config: {:#?}\n\
-         ├─ system_prompt: {:?}\n\
-         └─ user_prompt: {:?}",
+        "[HTTP] Received {} Chat request: user_id={}, project_id={:?}, session_id={:?}, request_id={:?}, prompt_len={}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}, attachments={:?}, data_source_attachments={:?}, model_provider={:#?}, agent_config={:#?}, system_prompt_len={}, user_prompt_len={}",
+        if is_devcomputer {
+            "DevComputer"
+        } else {
+            "Computer"
+        },
         request.user_id,
         request.project_id,
         request.session_id,
         request.request_id,
         request.prompt.len(),
-        request.prompt,
         request.pod_id,
         request.tenant_id,
         request.space_id,
@@ -69,8 +70,8 @@ pub async fn handle_computer_chat(
         request.data_source_attachments,
         request.model_provider,
         request.agent_config,
-        request.system_prompt,
-        request.user_prompt
+        request.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0),
+        request.user_prompt.as_ref().map(|s| s.len()).unwrap_or(0)
     );
 
     // 1. 验证必填字段
@@ -91,6 +92,19 @@ pub async fn handle_computer_chat(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
 
+    // 确定用于拼接工作目录的标识符
+    // agent_work_dir 用于替代 project_id 参与工作目录路径拼接
+    let work_dir_id = request
+        .agent_work_dir
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| project_id.clone());
+
+    // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）
+    if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+        return Err(shared_types::AppError::with_message(ERR_VALIDATION, &e));
+    }
+
     // 3. 自动查找现有 session_id (如果未提供)
     let session_id = request.session_id.or_else(|| {
         AGENT_REGISTRY
@@ -100,8 +114,8 @@ pub async fn handle_computer_chat(
 
     // 4. 创建项目工作目录（使用配置中的 projects_dir，支持外部配置）
     // Docker 挂载：宿主机 /computer-project-workspace/{user_id} → 容器 /home/user
-    // Agent 工作目录：/home/user/{project_id}
-    let project_dir = state.config.projects_dir.join(&project_id);
+    // Agent 工作目录：/home/user/{work_dir_id}
+    let project_dir = state.config.projects_dir.join(&work_dir_id);
 
     if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
         let error_msg = format!(
@@ -132,15 +146,16 @@ pub async fn handle_computer_chat(
         data_source_attachments: request.data_source_attachments,
         model_config: request.model_provider,
         service_type: ServiceType::ComputerAgentRunner,
+        user_id: Some(user_id),
         agent_config_override: request.agent_config,
         system_prompt_override: request.system_prompt,
         user_prompt_template_override: request.user_prompt,
-        skip_slot_limit: true, // HTTP Server 部署，跳过槽位限制
+        is_devcomputer,
     };
 
     // 7. 构建 ChatHandlerContext
     let context = ChatHandlerContext {
-        agent_runtime: state.agent_runtime.clone(),
+        agent_session_service: state.agent_session_service.clone(),
         shared_api_key_manager: state.shared_api_key_manager.clone(),
         project_uuid_map: state.project_uuid_map.clone(),
     };
@@ -149,23 +164,19 @@ pub async fn handle_computer_chat(
     let output = handle_chat_core(input, &context).await;
 
     // 🔧 关键修复：将 session 写入 SESSION_CACHE（SSE 进度流需要从这里读取）
+    // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
     let session_id_str = output.session_id.clone();
-    match SESSION_CACHE.entry(session_id_str.clone()) {
-        Entry::Occupied(entry) => {
-            info!(
-                "[HTTP] SESSION_CACHE already exists, reusing: session_id={}",
-                session_id_str
-            );
-            entry.get().clone()
-        }
-        Entry::Vacant(entry) => {
-            let data = SessionData::new(1000);
-            info!(
-                "[HTTP] SESSION_CACHE created: session_id={}",
-                session_id_str
-            );
-            entry.insert(data.clone());
-            data
+    if SESSION_CACHE.contains_key(&session_id_str) {
+        // 已存在，无需创建
+    } else {
+        let data = SessionData::new(1000).await;
+        match SESSION_CACHE.entry(session_id_str.clone()) {
+            Entry::Occupied(_entry) => {
+                // 其他任务已创建，丢弃我们创建的 data
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(data);
+            }
         }
     };
 
@@ -177,13 +188,21 @@ pub async fn handle_computer_chat(
         request_id: Some(request_id),
         need_fallback: None,
         fallback_reason: None,
+        reloaded: if output.reloaded { Some(true) } else { None },
+        agent_version: output.agent_version.clone(),
     };
 
     // 10. 根据执行结果返回成功或错误
     if output.error.is_some() || !output.success {
         error!(
-            "❌ [HTTP] Computer Chat failed: session_id={}, error={:?}",
-            response.session_id, response.error
+            "❌ [HTTP] {} Chat failed: session_id={}, error={:?}",
+            if is_devcomputer {
+                "DevComputer"
+            } else {
+                "Computer"
+            },
+            response.session_id,
+            response.error
         );
         // 返回成功的 HTTP 状态码，但 HttpResult 包含错误信息
         // 这与 rcoder 的行为一致：HTTP 200 + HttpResult.error
@@ -203,8 +222,14 @@ pub async fn handle_computer_chat(
     }
 
     info!(
-        "✅ [HTTP] Computer Chat response: session_id={}, error={:?}",
-        response.session_id, response.error
+        "✅ [HTTP] {} Chat response: session_id={}, error={:?}",
+        if is_devcomputer {
+            "DevComputer"
+        } else {
+            "Computer"
+        },
+        response.session_id,
+        response.error
     );
 
     Ok(Json(HttpResult::success(response)))
