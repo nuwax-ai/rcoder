@@ -332,6 +332,11 @@ pub async fn handle_chat(
                 request.request_id.clone(),
                 Some(service_type.clone()),
             );
+            new_info.set_scope(
+                request.tenant_id.clone(),
+                request.space_id.clone(),
+                request.isolation_type.clone(),
+            );
 
             let arc_info = Arc::new(new_info);
             state

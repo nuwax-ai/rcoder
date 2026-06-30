@@ -109,6 +109,7 @@ pub async fn handle_web_ttyd_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,
     params: Params<'_, '_>,
+    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
 ) -> PingoraResult<()> {
     // 从路径参数中提取 user_id 和 project_id
     let user_id = params.get("user_id").ok_or_else(|| {
@@ -166,6 +167,27 @@ pub async fn handle_web_ttyd_request(
         "X-Ttyd-Service-Type",
         shared_types::ServiceType::WebAgentRunner.to_string(),
     )?;
+
+    // 按 project_id 反查项目归属 scope，注入 tenant/space header，供 agent_runner 解析
+    // 共享容器（tenant/space 隔离）的三级 cwd。反查失败（None）则不注入，agent_runner
+    // 侧安全降级为单级路径（见 ws_terminal::cwd）。
+    if let Some(lookup) = container_lookup {
+        if let Some(scope) =
+            lookup.find_project_scope(project_id, &shared_types::ServiceType::WebAgentRunner)
+        {
+            if let Some(tid) = scope.tenant_id {
+                upstream_request.insert_header("X-Ttyd-Tenant-Id", tid)?;
+            }
+            if let Some(sid) = scope.space_id {
+                upstream_request.insert_header("X-Ttyd-Space-Id", sid)?;
+            }
+        } else {
+            debug!(
+                "[WEB TTYD] find_project_scope miss: project_id={} (agent_runner will fall back to single-level cwd)",
+                project_id
+            );
+        }
+    }
 
     Ok(())
 }

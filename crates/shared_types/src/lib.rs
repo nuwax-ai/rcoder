@@ -11,7 +11,7 @@ pub use storage_types::{IdleContainerInfo, StorageStats};
 
 // 容器查找接口模块
 pub mod container_lookup;
-pub use container_lookup::ContainerLookup;
+pub use container_lookup::{ContainerLookup, ProjectScope};
 
 // 容器条目模块（refcount + 活跃时间跟踪）
 pub mod container_entry;

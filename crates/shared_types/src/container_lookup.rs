@@ -7,6 +7,21 @@ use tracing::debug;
 
 use crate::ServiceType;
 
+/// 按 project_id 反查的项目归属 scope（共享容器隔离场景）。
+///
+/// `tenant_id`/`space_id` 齐全表示项目处于 tenant/space 共享容器，对应三级工作目录
+/// `/app/project_workspace/{tenant}/{space}/{project}`；缺失则回退单级
+/// `/app/project_workspace/{project}`。`isolation_type` 仅作记录，不参与路径决策。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectScope {
+    /// 租户 ID
+    pub tenant_id: Option<String>,
+    /// 空间 ID
+    pub space_id: Option<String>,
+    /// 隔离类型（tenant/space/project）
+    pub isolation_type: Option<String>,
+}
+
 /// 容器查找接口（trait）
 ///
 /// 统一数据源，避免 Pingora 代理层自己维护容器映射。`ProjectAdapter` 实现此 trait。
@@ -31,6 +46,17 @@ pub trait ContainerLookup: Send + Sync {
     ///
     /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
     fn find_by_pod_id(&self, pod_id: &str, service_type: &ServiceType) -> Option<String>;
+
+    /// 按 project_id 反查项目归属 scope（tenant_id/space_id/isolation_type）。
+    ///
+    /// 命中项目的 service_type 必须与 `service_type` 一致，否则返回 None（防串用）。
+    /// 供 Pingora 注入 `X-Ttyd-Tenant-Id`/`X-Ttyd-Space-Id`，agent_runner 据此解析终端 cwd。
+    /// 反查失败（返回 None）时调用方应安全降级（agent_runner 回退单级路径）。
+    fn find_project_scope(
+        &self,
+        project_id: &str,
+        service_type: &ServiceType,
+    ) -> Option<ProjectScope>;
 
     /// 查找容器 IP（统一入口）
     ///

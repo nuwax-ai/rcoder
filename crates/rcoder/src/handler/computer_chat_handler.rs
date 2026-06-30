@@ -789,6 +789,11 @@ pub(crate) async fn handle_computer_chat_internal(
                     request.request_id.clone(),
                     Some(shared_types::ServiceType::ComputerAgentRunner),
                 );
+                project_info.set_scope(
+                    request.tenant_id.clone(),
+                    request.space_id.clone(),
+                    request.isolation_type.clone(),
+                );
 
                 // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态
                 state
@@ -1160,6 +1165,11 @@ fn ensure_project_mapping_in_state(
         request.model_provider.clone(),
         request.request_id.clone(),
         Some(shared_types::ServiceType::ComputerAgentRunner),
+    );
+    project_info.set_scope(
+        request.tenant_id.clone(),
+        request.space_id.clone(),
+        request.isolation_type.clone(),
     );
 
     // immediately insert project record

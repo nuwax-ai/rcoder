@@ -5,11 +5,12 @@
 //! 彻底摆脱 Pingora `upstream_request_filter` 对 WS 只首次触发的结构性缺陷。
 
 use std::path::Path;
+use std::str::FromStr;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use shared_types::TTYD_PORT;
+use shared_types::{ServiceType, TTYD_PORT};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::MissedTickBehavior;
@@ -59,13 +60,48 @@ pub async fn handle_terminal(
     browser_ws: WebSocketStream<TcpStream>,
     service_type: &str,
     project_id: &str,
+    tenant_id: &str,
+    space_id: &str,
 ) {
-    let cwd = cwd::resolve_project_cwd(service_type, project_id);
+    let cwd = cwd::resolve_project_cwd(service_type, project_id, tenant_id, space_id);
+
+    // cwd 解析失败的降级策略（按 service_type 区分）：
+    // - WebAgentRunner：项目目录必须在 /app/project_workspace 下，进 /home/user 毫无意义。
+    //   解析失败（目录不存在 / tenant-space 反查缺失）→ **fail-closed**，关连接并明确告知
+    //   前端"项目目录不可用"，避免误导用户进入空白家目录。
+    // - ComputerAgentRunner / service_type 未知：/home/user 是 user 家目录，可作合理默认
+    //   （**fail-open**），落 ttyd 默认目录，至少保留可用 shell。
+    match &cwd {
+        Some(p) => info!(
+            "[WS_TERMINAL] connecting ttyd: service_type={}, project_id={}, tenant_id={}, space_id={}, cwd={}",
+            service_type, project_id, tenant_id, space_id, p.display()
+        ),
+        None => {
+            let is_web = matches!(
+                ServiceType::from_str(service_type),
+                Ok(ServiceType::WebAgentRunner)
+            );
+            if is_web {
+                warn!(
+                    "[WS_TERMINAL] project workspace not found, closing (fail-closed): service_type={}, project_id={}, tenant_id={}, space_id={}",
+                    service_type, project_id, tenant_id, space_id
+                );
+                close_with_reason(
+                    browser_ws,
+                    CloseCode::Error,
+                    "Project workspace not found, please retry",
+                )
+                .await;
+                return;
+            }
+            warn!(
+                "[WS_TERMINAL] cwd resolved None, falling back to ttyd default home: service_type={}, project_id={}",
+                service_type, project_id
+            );
+        }
+    }
+
     let url = build_ttyd_url(cwd.as_deref());
-    info!(
-        "[WS_TERMINAL] connecting ttyd {} (service_type={}, project_id={}, cwd={:?})",
-        url, service_type, project_id, cwd
-    );
 
     // ttyd（libwebsockets）要求 WS 握手带子协议 `tty`，否则路由到 http-only 空壳、消息全丢。
     // 浏览器侧由 ws_terminal 协商 tty；agent_runner 作为 client 连 ttyd 也必须显式带上。

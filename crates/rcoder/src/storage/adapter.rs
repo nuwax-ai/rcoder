@@ -2572,6 +2572,42 @@ mod tests {
         assert!(adapter.find_projects_by_pod_id("nonexistent").is_empty());
     }
 
+    /// find_project_scope 按 project_id 反查 tenant/space/isolation，并校验 service_type 防串用。
+    #[test]
+    fn test_find_project_scope() {
+        use shared_types::ContainerLookup; // trait 方法需在作用域
+        let adapter = make_adapter();
+
+        let mut info = create_test_info_with_container("proj-scope", "c-scope");
+        info.set_scope(
+            Some("t1".to_string()),
+            Some("s1".to_string()),
+            Some("space".to_string()),
+        );
+        adapter
+            .insert("proj-scope".to_string(), Arc::new(info))
+            .unwrap();
+
+        // 命中：service_type 匹配 → 返回 scope
+        let scope = adapter
+            .find_project_scope("proj-scope", &ServiceType::WebAgentRunner)
+            .expect("应命中 scope");
+        assert_eq!(scope.tenant_id.as_deref(), Some("t1"));
+        assert_eq!(scope.space_id.as_deref(), Some("s1"));
+        assert_eq!(scope.isolation_type.as_deref(), Some("space"));
+
+        // service_type 不匹配（ComputerAgentRunner）→ None（防串用）
+        assert_eq!(
+            adapter.find_project_scope("proj-scope", &ServiceType::ComputerAgentRunner),
+            None
+        );
+        // 不存在的 project_id → None
+        assert_eq!(
+            adapter.find_project_scope("nonexistent", &ServiceType::WebAgentRunner),
+            None
+        );
+    }
+
     /// 多 project 共享同一 pod_id 时，find_projects_by_pod_id 必须返回全部。
     ///
     /// 回归测试：原实现用 pod_id_to_project_id 索引（insert 时覆盖），
@@ -3054,5 +3090,33 @@ impl shared_types::ContainerLookup for ProjectAdapter {
             return None;
         }
         Some(entry.info().container_ip.clone())
+    }
+
+    /// 按 project_id 反查项目归属 scope（tenant_id/space_id/isolation_type）。
+    ///
+    /// 直接查 `projects` map（O(1)），不走 container 索引链。命中项目的 service_type
+    /// 必须与入参一致（防串用，与 find_by_project_id 同策略）。供 Pingora 注入
+    /// `X-Ttyd-Tenant-Id`/`X-Ttyd-Space-Id`，agent_runner 据此解析终端 cwd。
+    fn find_project_scope(
+        &self,
+        project_id: &str,
+        service_type: &shared_types::ServiceType,
+    ) -> Option<shared_types::ProjectScope> {
+        let info = self.projects.get(project_id)?;
+        // 校验 service_type，防止跨 ServiceType 串用
+        if info.service_type().as_ref() != Some(service_type) {
+            debug!(
+                "[CONTAINER_LOOKUP] find_project_scope service_type mismatch: expected={:?}, found={:?}, project_id={}",
+                service_type,
+                info.service_type(),
+                project_id
+            );
+            return None;
+        }
+        Some(shared_types::ProjectScope {
+            tenant_id: info.tenant_id().map(str::to_string),
+            space_id: info.space_id().map(str::to_string),
+            isolation_type: info.isolation_type().map(str::to_string),
+        })
     }
 }

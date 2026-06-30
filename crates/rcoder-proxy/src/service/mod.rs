@@ -265,6 +265,7 @@ impl ProxyHttp for PortProxy {
                     upstream_request,
                     &original_uri,
                     matched.params,
+                    &self.container_lookup,
                 )
                 .await?;
             }

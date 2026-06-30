@@ -1133,6 +1133,11 @@ pub async fn pod_ensure(
                     pinfo.set_user_id(Some(request.user_id.clone()));
                     pinfo.set_pod_id(request.pod_id.clone());
                     pinfo.set_service_type(Some(service_type.clone()));
+                    pinfo.set_scope(
+                        request.tenant_id.clone(),
+                        request.space_id.clone(),
+                        request.isolation_type.clone(),
+                    );
                     pinfo.set_container(Some(info.clone()));
                     pinfo
                 };
@@ -1505,6 +1510,11 @@ pub async fn pod_ensure(
         info.set_user_id(Some(request.user_id.clone()));
         info.set_pod_id(request.pod_id.clone());
         info.set_service_type(Some(service_type.clone()));
+        info.set_scope(
+            request.tenant_id.clone(),
+            request.space_id.clone(),
+            request.isolation_type.clone(),
+        );
         info.set_container(Some(container_info.clone()));
         info
     };
@@ -1691,6 +1701,11 @@ pub async fn pod_keepalive(
             project_info.set_user_id(Some(request.user_id.clone()));
             project_info.set_pod_id(request.pod_id.clone());
             project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+            project_info.set_scope(
+                request.tenant_id.clone(),
+                request.space_id.clone(),
+                request.isolation_type.clone(),
+            );
             project_info.set_container(Some(container_info.clone()));
 
             let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -1987,6 +2002,11 @@ pub async fn pod_restart(
             info.set_user_id(Some(request.user_id.clone()));
             info.set_pod_id(request.pod_id.clone());
             info.set_service_type(Some(service_type.clone()));
+            info.set_scope(
+                request.tenant_id.clone(),
+                request.space_id.clone(),
+                request.isolation_type.clone(),
+            );
             info.set_container(Some(container_info.clone()));
             info
         };

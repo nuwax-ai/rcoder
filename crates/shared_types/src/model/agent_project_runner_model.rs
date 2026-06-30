@@ -44,6 +44,13 @@ pub struct ProjectCoreState {
     /// - RCoder 模式：当 pod_id 有值时，多个项目共享同一个容器
     /// - ComputerAgentRunner 模式：通常为 None（使用 user_id 共享）
     pub pod_id: Option<String>,
+    /// 租户 ID（多租户隔离）：共享容器（tenant/space 隔离）下项目所属租户。
+    /// 用于按 project_id 反查项目归属（如终端 cwd 三级路径解析）。None=非共享/未知。
+    pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离）：共享容器下项目所属空间（tenant 下的二级分组）。
+    pub space_id: Option<String>,
+    /// 隔离类型（tenant/space/project）。仅作记录与日志；cwd 路径决策依据 tenant/space 的有无。
+    pub isolation_type: Option<String>,
     /// 该 project 关联的所有 session_id 集合
     ///
     /// 一个 project 可以同时有多个活跃 session（多窗口/多标签场景）。
@@ -68,6 +75,9 @@ impl ProjectCoreState {
             project_id,
             user_id: None,
             pod_id: None,
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
             sessions: Arc::new(ImHashSet::new()),
             latest_session: None,
             last_activity: now,
@@ -83,6 +93,9 @@ impl ProjectCoreState {
             project_id,
             user_id: Some(user_id),
             pod_id: None,
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
             sessions: Arc::new(ImHashSet::new()),
             latest_session: None,
             last_activity: now,
@@ -155,6 +168,12 @@ pub struct ProjectExtendedFields {
     pub service_type: Option<ServiceType>,
     pub last_activity: Option<DateTime<Utc>>,
     pub created_at: Option<DateTime<Utc>>,
+    /// 租户 ID（共享容器隔离）：用于 from_parts 构造时回填 ProjectCoreState.tenant_id
+    pub tenant_id: Option<String>,
+    /// 空间 ID（共享容器隔离）
+    pub space_id: Option<String>,
+    /// 隔离类型（tenant/space/project）
+    pub isolation_type: Option<String>,
 }
 
 /// 这些字段相对稳定，不需要频繁更新
@@ -304,6 +323,9 @@ impl ProjectAndContainerInfo {
             project_id,
             user_id,
             pod_id,
+            tenant_id: fields.tenant_id,
+            space_id: fields.space_id,
+            isolation_type: fields.isolation_type,
             sessions: Arc::new(sessions),
             latest_session: session_id,
             last_activity: fields.last_activity.unwrap_or(now),
@@ -417,6 +439,21 @@ impl ProjectAndContainerInfo {
         self.state.core.pod_id.as_deref()
     }
 
+    /// 获取租户 ID（共享容器隔离下项目所属租户）
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.state.core.tenant_id.as_deref()
+    }
+
+    /// 获取空间 ID（共享容器隔离下项目所属空间）
+    pub fn space_id(&self) -> Option<&str> {
+        self.state.core.space_id.as_deref()
+    }
+
+    /// 获取隔离类型（tenant/space/project）
+    pub fn isolation_type(&self) -> Option<&str> {
+        self.state.core.isolation_type.as_deref()
+    }
+
     /// 获取容器唯一标识
     ///
     /// 根据 service_type 返回不同的标识符：
@@ -515,6 +552,24 @@ impl ProjectAndContainerInfo {
     pub fn set_user_id(&mut self, user_id: Option<String>) {
         self.state.update_core(|core| {
             core.user_id = user_id;
+        });
+    }
+
+    /// 设置项目归属 scope（tenant/space/isolation）。
+    ///
+    /// 共享容器（tenant/space 隔离）下，终端 cwd 等运行时查询需要按 project_id 反查
+    /// 这三个值（见 `ContainerLookup::find_project_scope`）。scope 是 project 创建时
+    /// 确定的稳定属性，重复 set 幂等无害。走 `update_core` 写时复制。
+    pub fn set_scope(
+        &mut self,
+        tenant_id: Option<String>,
+        space_id: Option<String>,
+        isolation_type: Option<String>,
+    ) {
+        self.state.update_core(|core| {
+            core.tenant_id = tenant_id;
+            core.space_id = space_id;
+            core.isolation_type = isolation_type;
         });
     }
 

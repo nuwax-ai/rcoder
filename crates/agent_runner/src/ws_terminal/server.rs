@@ -32,6 +32,8 @@ const TTYD_SUBPROTO: &str = "tty";
 /// Pingora 注入的 project_id 请求头（见 rcoder-proxy `ttyd.rs` 的 `X-Ttyd-Project-Id`）
 const PROJECT_ID_HEADER: &str = "x-ttyd-project-id";
 const SERVICE_TYPE_HEADER: &str = "x-ttyd-service-type";
+const TENANT_ID_HEADER: &str = "x-ttyd-tenant-id";
+const SPACE_ID_HEADER: &str = "x-ttyd-space-id";
 
 /// 启动 WS 终端中间层
 ///
@@ -85,9 +87,13 @@ async fn handle_conn(stream: tokio::net::TcpStream, peer: SocketAddr) {
     // 通过 Arc<Mutex<Option<_>>> 把握手 callback 读到的 project_id / service_type 传出 accept_hdr_async
     let project_id_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let service_type_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let tenant_id_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let space_id_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let cb = HandshakeCallback {
         project_id: project_id_slot.clone(),
         service_type: service_type_slot.clone(),
+        tenant_id: tenant_id_slot.clone(),
+        space_id: space_id_slot.clone(),
     };
 
     let ws = match accept_hdr_async(stream, cb).await {
@@ -108,15 +114,25 @@ async fn handle_conn(stream: tokio::net::TcpStream, peer: SocketAddr) {
         .ok()
         .and_then(|g| g.clone())
         .unwrap_or_default();
+    let tenant_id = tenant_id_slot
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default();
+    let space_id = space_id_slot
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default();
     info!(
-        "[WS_TERMINAL] {} connected (service_type={}, project_id={})",
-        peer, service_type, project_id
+        "[WS_TERMINAL] {} connected (service_type={}, project_id={}, tenant_id={}, space_id={})",
+        peer, service_type, project_id, tenant_id, space_id
     );
 
     // 计入活跃终端连接：覆盖整个 handle_terminal（含其全部 return 路径），
     // 函数返回时 guard drop → 计数 -1。GetContainerStatus 据此判定容器在用、拦下空闲清理。
     let _conn_guard = super::TerminalConnGuard::new();
-    proxy::handle_terminal(ws, &service_type, &project_id).await;
+    proxy::handle_terminal(ws, &service_type, &project_id, &tenant_id, &space_id).await;
 }
 
 /// 轮询等待本地端口可达（ttyd readiness 检查）
@@ -139,6 +155,8 @@ async fn wait_for_port(port: u16, per_try_ms: u64, retries: u32) -> bool {
 struct HandshakeCallback {
     project_id: Arc<Mutex<Option<String>>>,
     service_type: Arc<Mutex<Option<String>>>,
+    tenant_id: Arc<Mutex<Option<String>>>,
+    space_id: Arc<Mutex<Option<String>>>,
 }
 
 impl Callback for HandshakeCallback {
@@ -157,6 +175,22 @@ impl Callback for HandshakeCallback {
             .get(SERVICE_TYPE_HEADER)
             .and_then(|v| v.to_str().ok())
             && let Ok(mut g) = self.service_type.lock()
+        {
+            *g = Some(v.to_string());
+        }
+        if let Some(v) = req
+            .headers()
+            .get(TENANT_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            && let Ok(mut g) = self.tenant_id.lock()
+        {
+            *g = Some(v.to_string());
+        }
+        if let Some(v) = req
+            .headers()
+            .get(SPACE_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            && let Ok(mut g) = self.space_id.lock()
         {
             *g = Some(v.to_string());
         }
