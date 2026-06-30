@@ -23,7 +23,7 @@ use std::time::Duration;
 use shared_types::{NOVNC_PORT, XVNC_RFB_PORT};
 use shared_types_i18n::get_i18n_message;
 
-use super::utils::{check_novnc_websocket_ready, check_port_available};
+use super::utils::check_port_available;
 
 /// RFB 协议版本串长度（`RFB 003.00x\n` 共 12 字节，RFC 6143 §7.1.1）
 const RFB_PROTOCOL_VERSION_LEN: usize = 12;
@@ -235,11 +235,10 @@ pub async fn probe_vnc_readiness(timeout_millis: u64, locale: &str) -> VncProbeR
     let file_exists = Path::new("/tmp/vnc_ready").exists();
 
     let novnc_port_ready = check_port_available(NOVNC_PORT, timeout_millis).await;
-    let novnc_websocket_ready = if novnc_port_ready {
-        check_novnc_websocket_ready(NOVNC_PORT, timeout_millis).await
-    } else {
-        false
-    };
+    // ⚠️ 不做 WebSocket 升级探测：websockify 是 WS↔TCP proxy，WS 升级会触发它连后端 5900，
+    //    探测方立即 close 会造成 RFB 半握手 → TigerVNC "Too many security failures" 锁定，
+    //    拒绝前端正常连接。websockify 进程在（6080 listen）即 WS 就绪，无需升级探测。
+    let novnc_websocket_ready = novnc_port_ready;
     let rfb_ready = check_vnc_rfb_ready(XVNC_RFB_PORT, timeout_millis).await;
 
     let novnc_ready = file_exists && novnc_port_ready && novnc_websocket_ready;

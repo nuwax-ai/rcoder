@@ -1170,7 +1170,7 @@ function check_vnc_health() {
     # 三关：
     #   ① Xvnc 进程存活且非僵尸(Z)/非卡死(D)
     #   ② X11 display 层验证（xdpyinfo，检测事件循环卡死）
-    #   ③ noVNC 前端 WebSocket 握手
+    #   ③ noVNC 前端代理端口可达（6080，端口探测避免 WS 升级触发 websockify 连 5900）
     if [ "$VNC_AUTO_START" != "true" ]; then
         return 0
     fi
@@ -1209,9 +1209,12 @@ function check_vnc_health() {
         return 2
     fi
 
-    # ③ noVNC 前端代理：从 netstat|grep 升级为真 WebSocket 握手
-    if ! wait_for_novnc_ready 5; then
-        log_warn "check_vnc_health: Xvnc healthy but noVNC WebSocket proxy down"
+    # ③ noVNC 前端代理端口可达（6080）。
+    # ⚠️ 不做 WS 升级：websockify 是 WS↔TCP proxy，WS 升级会触发它连后端 5900，
+    #    半握手被 TigerVNC 计为"安全失败"触发锁定。代理是否就绪由端口判断，
+    #    Xvnc 后端服务可用性由 rcoder 代码侧完整 RFB 握手（check_vnc_rfb_ready）验证。
+    if ! wait_for_port localhost 6080 3; then
+        log_warn "check_vnc_health: Xvnc healthy but noVNC proxy port 6080 down"
         rm -f /tmp/vnc_ready
         return 1
     fi
