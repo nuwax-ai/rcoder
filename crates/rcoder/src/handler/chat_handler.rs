@@ -12,6 +12,8 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 
+use super::pod_handler::resolve_resource_limits_from_config;
+
 use super::utils::{I18nJsonOrQuery, build_workspace_path, get_locale_from_headers};
 
 /// 转发请求的上下文参数
@@ -245,10 +247,11 @@ pub async fn handle_chat(
     let container_options = crate::service::container_manager::ContainerCreateOptions {
         project_id: &project_id,
         service_type: &service_type,
-        request_resource_limits: request
-            .agent_config
-            .as_ref()
-            .and_then(|c| c.resource_limits.clone()),
+        request_resource_limits: resolve_resource_limits_from_config(
+            &state,
+            &service_type,
+            request.agent_config.as_ref().and_then(|c| c.resource_limits.clone()),
+        ),
         pod_id: request.pod_id.as_deref(),
         isolation_type: request.isolation_type.as_deref(),
         tenant_id: request.tenant_id.as_deref(),
@@ -471,6 +474,75 @@ pub async fn handle_chat(
         Some(session_id_to_use.clone())
     };
     // 🆕 自动查找 session_id 逻辑结束
+
+    // 2.5 主动探测 agent_runner gRPC 是否就绪
+    // K8s 下容器刚创建时 Pod 虽已 Ready，但 agent_runner 的 gRPC server 可能仍在启动，
+    // 直接转发 Chat RPC 会 transport error。这里仿照 computer_chat_handler 做状态探活，
+    // 并加重试以真正等待 gRPC server 就绪（正常情况下首次即成功，无额外延迟）。
+    {
+        let grpc_addr = if shared_types::is_kubernetes_runtime() {
+            let svc_fqdn = super::utils::build_k8s_service_fqdn(
+                &container_info.container_name,
+                &state.config.app_manager.namespace,
+                &state.cluster_domain,
+            );
+            format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
+        } else {
+            format!(
+                "{}:{}",
+                container_info.container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            )
+        };
+
+        debug!(
+            "[CHAT] Probing agent_runner readiness before forward: addr={}",
+            grpc_addr
+        );
+        const MAX_PROBE_ATTEMPTS: u32 = 6;
+        for attempt in 1..=MAX_PROBE_ATTEMPTS {
+            let status_req = shared_types::grpc::GetStatusRequest {
+                project_id: project_id.clone(),
+                session_id: String::new(),
+            };
+            let mut grpc_request = crate::grpc::new_request_with_locale(status_req, locale);
+            grpc_request.set_timeout(std::time::Duration::from_secs(3));
+
+            let probed = match state.grpc_pool.get_client(&grpc_addr).await {
+                Ok(mut client) => match client.get_status(grpc_request).await {
+                    Ok(resp) => {
+                        debug!(
+                            "📊 [CHAT] Agent ready: project_id={}, status={}, attempt={}",
+                            project_id,
+                            resp.into_inner().status,
+                            attempt
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        warn!(
+                            "⚠️ [CHAT] Agent status probe failed (attempt {}/{}): {}",
+                            attempt, MAX_PROBE_ATTEMPTS, e
+                        );
+                        false
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "⚠️ [CHAT] Agent status probe get_client failed (attempt {}/{}): {}",
+                        attempt, MAX_PROBE_ATTEMPTS, e
+                    );
+                    false
+                }
+            };
+
+            if probed || attempt == MAX_PROBE_ATTEMPTS {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+        // 探活失败不阻止请求，保留原有降级行为（由后续 Chat RPC 自行处理）
+    }
 
     // 第三步：转发请求到容器服务（使用全局连接池）
     info!("[CHAT] Forwarding request to container service");

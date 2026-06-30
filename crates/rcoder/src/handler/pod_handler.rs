@@ -79,6 +79,86 @@ fn validate_resource_limits(limits: &PodResourceLimits) -> Result<(), String> {
     Ok(())
 }
 
+/// 解析最终生效的资源限制：API 入参优先，缺失字段回退到 configmap 中
+/// 该 service_type 的默认配置。
+///
+/// 背景：Backend 调用容器创建相关接口（`/chat`、`/computer/chat`、`/pod/ensure`、
+/// `/pod/restart`）时通常不传 `resource_limits`，直接用 `None` 创建 Pod 会得到
+/// 无 requests/limits 的容器（K8s 下 resources 全空）。这里以
+/// `ServiceImageConfig.resource_limits`（来自 configmap）兜底，并通过 `merge_with`
+/// 做字段级合并——API 显式传入的字段优先，未传字段回退默认值。
+///
+/// 公共核心：直接接受 `ServiceResourceLimits`，供 `/chat`、`/computer/chat` 等
+/// 已持有 `ServiceResourceLimits` 的入口复用；`/pod/*` 入口用 `PodResourceLimits`，
+/// 由 [`resolve_resource_limits`] 做类型转换后委托本函数。
+pub(crate) fn resolve_resource_limits_from_config(
+    state: &AppState,
+    service_type: &ServiceType,
+    api_limits: Option<ServiceResourceLimits>,
+) -> Option<ServiceResourceLimits> {
+    // configmap 中该 service_type 的默认资源限制（保底）
+    // 注意：get_multi_image_config 返回 owned MultiImageConfig，需先绑定再借用，
+    // 并在闭包内 clone 出 owned ServiceResourceLimits，避免返回指向临时值的悬垂引用。
+    let default_limits = state
+        .config
+        .docker_config
+        .as_ref()
+        .and_then(|dc| {
+            let multi_config = dc.get_multi_image_config();
+            multi_config
+                .get_service_config(service_type)
+                .map(|c| c.resource_limits.clone())
+        });
+
+    // 来源标记，便于排查“资源限制静默丢失”问题（none=Pod 将无 resources，需警惕）
+    let source = match (&default_limits, &api_limits) {
+        (Some(_), Some(_)) => "merged(api+configmap)",
+        (Some(_), None) => "configmap",
+        (None, Some(_)) => "api",
+        (None, None) => "none",
+    };
+
+    // 字段级合并：API 字段优先，None 回退默认值
+    let result = match (default_limits, api_limits) {
+        (Some(default), Some(api)) => Some(default.merge_with(&api)),
+        (Some(default), None) => Some(default),
+        (None, api) => api,
+    };
+
+    // 记录最终生效的 memory/cpu（仅这两个字段进 K8s container resources；
+    // swap_limit/storage_size 不进 container resources，故不在此记录）
+    let mem = result
+        .as_ref()
+        .and_then(|l| l.memory_limit)
+        .map(|b| format!("{:.1}Gi", b / 1024.0 / 1024.0 / 1024.0));
+    let cpu = result.as_ref().and_then(|l| l.cpu_limit);
+    info!(
+        "[RESOURCE_LIMITS] service_type={:?}, source={}, memory={}, cpu={}",
+        service_type,
+        source,
+        mem.as_deref().unwrap_or("none"),
+        cpu.map(|c| c.to_string()).as_deref().unwrap_or("none"),
+    );
+
+    result
+}
+
+/// `/pod/ensure`、`/pod/restart` 接口的 resource_limits 是 `PodResourceLimits` 类型，
+/// 这里先转成 `ServiceResourceLimits`，再委托 [`resolve_resource_limits_from_config`] 合并。
+fn resolve_resource_limits(
+    state: &AppState,
+    service_type: &ServiceType,
+    api_limits: Option<PodResourceLimits>,
+) -> Option<ServiceResourceLimits> {
+    let api_limits = api_limits.map(|limits| ServiceResourceLimits {
+        memory_limit: limits.memory,
+        cpu_limit: limits.cpu,
+        swap_limit: limits.swap,
+        storage_size: limits.storage_size,
+    });
+    resolve_resource_limits_from_config(state, service_type, api_limits)
+}
+
 /// 解析 service_type 字符串为 ServiceType 枚举
 ///
 /// 默认返回 ComputerAgentRunner（保持向后兼容）
@@ -1183,12 +1263,8 @@ pub async fn pod_ensure(
         );
 
         // 创建新容器，最多重试 3 次
-        let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
-            memory_limit: limits.memory,
-            cpu_limit: limits.cpu,
-            swap_limit: limits.swap,
-            storage_size: limits.storage_size,
-        });
+        let resource_limits =
+            resolve_resource_limits(&state, &service_type, request.resource_limits);
 
         let mut last_error = None;
         let mut result = None;
@@ -1344,13 +1420,11 @@ pub async fn pod_ensure(
                             container_identifier
                         );
 
-                        let resource_limits =
-                            request.resource_limits.map(|limits| ServiceResourceLimits {
-                                memory_limit: limits.memory,
-                                cpu_limit: limits.cpu,
-                                swap_limit: limits.swap,
-                                storage_size: limits.storage_size,
-                            });
+                        let resource_limits = resolve_resource_limits(
+                            &state,
+                            &service_type,
+                            request.resource_limits,
+                        );
 
                         // 设置创建标记
                         state
@@ -1866,13 +1940,9 @@ pub async fn pod_restart(
         }
     }
 
-    // 4. 定义资源限制
-    let resource_limits = request.resource_limits.map(|limits| ServiceResourceLimits {
-        memory_limit: limits.memory,
-        cpu_limit: limits.cpu,
-        swap_limit: limits.swap,
-        storage_size: limits.storage_size,
-    });
+    // 4. 定义资源限制（API 入参优先，缺失字段回退 configmap 默认值）
+    let resource_limits =
+        resolve_resource_limits(&state, &service_type, request.resource_limits);
 
     // 5. 强制创建新容器
     info!(

@@ -30,6 +30,8 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::{AppError, HttpResult, router::AppState, service::ComputerContainerManager};
 use docker_manager::ContainerBasicInfo;
 
+use super::pod_handler::resolve_resource_limits_from_config;
+
 use super::utils::{
     I18nJsonOrQuery, build_computer_workspace_path, get_locale_from_headers, project_dir,
 };
@@ -332,10 +334,11 @@ pub(crate) async fn handle_computer_chat_internal(
         let options = crate::service::computer_container_manager::ContainerCreateOptions {
             user_id: user_id.clone(),
             project_id: project_id.clone(),
-            resource_limits: request
-                .agent_config
-                .as_ref()
-                .and_then(|c| c.resource_limits.clone()),
+            resource_limits: resolve_resource_limits_from_config(
+                &state,
+                &shared_types::ServiceType::ComputerAgentRunner,
+                request.agent_config.as_ref().and_then(|c| c.resource_limits.clone()),
+            ),
             pod_id: request.pod_id.clone(),
             isolation_type: request.isolation_type.clone(),
             tenant_id: request.tenant_id.clone(),
@@ -393,10 +396,11 @@ pub(crate) async fn handle_computer_chat_internal(
         let options = crate::service::computer_container_manager::ContainerCreateOptions {
             user_id: user_id.clone(),
             project_id: user_id.clone(), // ComputerAgentRunner 使用 user_id 作为 project_id
-            resource_limits: request
-                .agent_config
-                .as_ref()
-                .and_then(|c| c.resource_limits.clone()),
+            resource_limits: resolve_resource_limits_from_config(
+                &state,
+                &shared_types::ServiceType::ComputerAgentRunner,
+                request.agent_config.as_ref().and_then(|c| c.resource_limits.clone()),
+            ),
             pod_id: request.pod_id.clone(),
             isolation_type: request.isolation_type.clone(),
             tenant_id: request.tenant_id.clone(),
