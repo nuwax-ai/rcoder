@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
 
 use agent_abstraction::{PermissionRequestContext, PermissionRequestHandler};
 use agent_client_protocol::Responder;
@@ -24,17 +23,6 @@ pub static PERMISSION_MANAGER: LazyLock<Arc<PermissionManager>> =
 
 type PendingKey = (String, String);
 type RuleKey = (String, String, String);
-
-/// 最近审批跟随 TTL：用户审批某 tool_call_id 后，TTL 内同 tool_call_id 的后续 permission
-/// 自动跟随该决策。
-///
-/// 背景：nuwaxcode 对一次工具调用会先后发起多个 permission（如 external_directory 路径预检
-/// 与 bash 工具执行），共用同一 tool_call_id，且严格按顺序——第1个被审批后才会发第2个。
-/// 前端按 tool_call_id 只弹一个审批框、用户只审批一次，但 rcoder 若把每个 permission 当
-/// 独立审批点，第2个（bash）就会因无人审批而卡死。此处把"同一次调用的多个 permission"
-/// 视为一次操作：用户审批第1个后，后续同 tool_call_id 的 permission 自动套用同一决策，
-/// 让 agent 立即继续。
-const RECENT_RESOLUTION_TTL: Duration = Duration::from_secs(60);
 
 struct PendingPermission {
     request: RequestPermissionRequest,
@@ -87,9 +75,11 @@ pub struct PermissionManager {
     rules: DashMap<RuleKey, Vec<PermissionRule>>,
     /// per-session 动态权限状态（key = session_id）。
     session_state: DashMap<String, SessionPermissionState>,
-    /// 最近审批决策：(session_id, tool_call_id) → (option kind, 时刻)。
-    /// 供同 tool_call_id 的后续 permission 自动跟随（见 RECENT_RESOLUTION_TTL）。
-    recent_resolutions: Mutex<HashMap<PendingKey, (PermissionOptionKind, Instant)>>,
+    /// 最近审批决策：(session_id, tool_call_id) → option kind。
+    /// 供同 tool_call_id 的后续 permission 自动跟随（一次调用统一审批）。不设 TTL：清理靠
+    /// "新 chat 请求 cancel 上轮 session"（agent_session_service::process_request）与显式
+    /// cancel/stop、lifecycle 结束，统一走 cancel_session_permissions / clear_session_state。
+    recent_resolutions: DashMap<PendingKey, PermissionOptionKind>,
 }
 
 impl Default for PermissionManager {
@@ -98,7 +88,7 @@ impl Default for PermissionManager {
             pending: Mutex::new(HashMap::new()),
             rules: DashMap::new(),
             session_state: DashMap::new(),
-            recent_resolutions: Mutex::new(HashMap::new()),
+            recent_resolutions: DashMap::new(),
         }
     }
 }
@@ -243,9 +233,7 @@ impl PermissionManager {
             Ok(()) => {
                 // 记录最近决策，供同 tool_call_id 的后续 permission 自动跟随（如 ext 审批后到达的 bash）。
                 if let Some(kind) = recent_kind {
-                    self.recent_resolutions
-                        .lock()
-                        .insert(recent_key, (kind, Instant::now()));
+                    self.recent_resolutions.insert(recent_key, kind);
                 }
                 info!(
                     "[Permission] Permission resolved successfully: session_id={}, tool_call_id={}, rule_saved={}",
@@ -294,9 +282,8 @@ impl PermissionManager {
             .collect();
         let count = Self::remove_and_respond(&mut guard, &keys);
         drop(guard);
-        // 一并清理该 session 的最近审批记录（防 HashMap 泄漏）
+        // 一并清理该 session 的最近审批记录（防内存泄漏）
         self.recent_resolutions
-            .lock()
             .retain(|(sid, _), _| sid != session_id);
         info!(
             "[Permission] Cancelled {} pending permissions for session: {}",
@@ -354,6 +341,9 @@ impl PermissionManager {
                 session_id, removed.agent_mode
             );
         }
+        // 一并清理该 session 的最近审批记录（防内存泄漏，与 cancel_session_permissions 对齐）
+        self.recent_resolutions
+            .retain(|(sid, _), _| sid != session_id);
     }
 
     /// 取 effective PermissionRequestContext：优先用 session_state 覆盖 agent_mode/tool_approval_rules，
@@ -648,19 +638,15 @@ impl PermissionRequestHandler for PermissionManager {
         // 则自动套用同一决策，不再 push 前端、不进 pending，让 agent 立即继续。
         // 位置在 rule_decision / tool_approval_rules 之后：用户显式配置的 deny/allow 规则优先，
         // 规则未命中才走"同 tool_call_id 跟随"，避免规则被跟随绕过。
+        // 不设 TTL：recent 在"新 chat 请求"/显式 cancel/lifecycle 结束时统一清理。
         {
             let key = (info.session_id.clone(), info.tool_call_id.clone());
-            let mut recent = self.recent_resolutions.lock();
-            if let Some((kind, ts)) = recent.get(&key).cloned() {
-                if ts.elapsed() < RECENT_RESOLUTION_TTL {
-                    drop(recent);
-                    info!(
-                        "[Permission] auto-follow recent resolution: session_id={}, tool_call_id={}, tool={}, kind={:?}",
-                        info.session_id, info.tool_call_id, info.tool_name, kind
-                    );
-                    return respond_with_preferred_option(&request, responder, &[kind]);
-                }
-                recent.remove(&key); // 过期惰性清理
+            if let Some(kind) = self.recent_resolutions.view(&key, |_, v| *v) {
+                info!(
+                    "[Permission] auto-follow recent resolution: session_id={}, tool_call_id={}, tool={}, kind={:?}",
+                    info.session_id, info.tool_call_id, info.tool_name, kind
+                );
+                return respond_with_preferred_option(&request, responder, &[kind]);
             }
         }
 

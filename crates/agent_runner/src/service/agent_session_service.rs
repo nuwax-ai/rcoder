@@ -90,6 +90,22 @@ impl AgentSessionService {
             project_id, request_id
         );
 
+        // 新 chat 请求进来：清理该 session 上轮残留的 pending permission + 最近审批记录。
+        // 旧轮若卡在 permission 等待（如 ext+bash 未审批完），新轮开始时整体 cancel，
+        // 避免残留阻塞或 recent 误跟随到新轮。这也替代了 recent 的 TTL 清理（不设 TTL，
+        // 改由"新请求清理"保证不泄漏）。
+        if let Some(sid) = request.prompt_message.session_id.as_deref()
+            && !sid.trim().is_empty()
+        {
+            let cancelled = PERMISSION_MANAGER.cancel_session_permissions(sid);
+            if cancelled > 0 {
+                info!(
+                    "🧹 [SACP] 新请求清理上轮 pending permission: session_id={}, count={}",
+                    sid, cancelled
+                );
+            }
+        }
+
         let attachment_blocks = if !request.prompt_message.attachments.is_empty() {
             match ContentBuilder::attachments_to_content_blocks(
                 &request.prompt_message.attachments,
