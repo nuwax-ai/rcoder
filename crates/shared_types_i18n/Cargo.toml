@@ -1,0 +1,12 @@
+[package]
+name = "shared_types_i18n"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+# i18n (国际化)
+rust-i18n = { workspace = true }

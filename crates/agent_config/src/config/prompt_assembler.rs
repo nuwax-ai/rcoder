@@ -65,10 +65,10 @@ impl PromptConfigAssembler {
     /// 逻辑：入参有值则使用入参，否则使用默认配置
     pub fn get_system_prompt(&self, agent_id: &str) -> String {
         // 入参有值且非空，直接使用
-        if let Some(ref sp) = self.system_prompt {
-            if !sp.is_empty() {
-                return sp.clone();
-            }
+        if let Some(ref sp) = self.system_prompt
+            && !sp.is_empty()
+        {
+            return sp.clone();
         }
 
         // 使用默认配置
@@ -83,19 +83,18 @@ impl PromptConfigAssembler {
     /// 3. 都没有，直接返回原始输入
     pub fn apply_user_prompt(&self, agent_id: &str, user_input: &str) -> String {
         // 入参有模板且非空，使用入参模板
-        if let Some(ref template) = self.user_prompt_template {
-            if !template.is_empty() {
-                return template.replace("{user_prompt}", user_input);
-            }
+        if let Some(ref template) = self.user_prompt_template
+            && !template.is_empty()
+        {
+            return template.replace("{user_prompt}", user_input);
         }
 
         // 检查默认配置中的 user_prompt 模板
-        if let Some(agent) = self.default_config.get_agent(agent_id) {
-            if let Some(ref prompt_config) = agent.user_prompt {
-                if prompt_config.enabled {
-                    return prompt_config.apply(user_input);
-                }
-            }
+        if let Some(agent) = self.default_config.get_agent(agent_id)
+            && let Some(ref prompt_config) = agent.user_prompt
+            && prompt_config.enabled
+        {
+            return prompt_config.apply(user_input);
         }
 
         // 无模板，直接返回原始输入
@@ -116,10 +115,10 @@ impl PromptConfigAssembler {
             .unwrap_or_default();
 
         // 如果入参有 agent_server 配置，合并覆盖
-        if let Some(ref config) = self.agent_config {
-            if let Some(ref agent_server) = config.agent_server {
-                return self.merge_agent_config(&default_agent, agent_server);
-            }
+        if let Some(ref config) = self.agent_config
+            && let Some(ref agent_server) = config.agent_server
+        {
+            return self.merge_agent_config(&default_agent, agent_server);
         }
 
         // 使用默认配置
@@ -175,23 +174,23 @@ impl PromptConfigAssembler {
     /// 注意：即使提供了 agent_config，但 context_servers 为空时，仍使用默认配置
     pub fn get_context_servers(&self) -> HashMap<String, ContextServerConfig> {
         // 入参有非空的 MCP 配置，使用入参
-        if let Some(ref config) = self.agent_config {
-            if config.has_context_servers() {
-                return config
-                    .context_servers
-                    .iter()
-                    .map(|(name, chat_config)| {
-                        let ctx_config = ContextServerConfig {
-                            source: chat_config.source.clone(),
-                            enabled: chat_config.enabled,
-                            command: chat_config.command.clone(),
-                            args: chat_config.args.clone(),
-                            env: chat_config.env.clone(),
-                        };
-                        (name.clone(), ctx_config)
-                    })
-                    .collect();
-            }
+        if let Some(ref config) = self.agent_config
+            && config.has_context_servers()
+        {
+            return config
+                .context_servers
+                .iter()
+                .map(|(name, chat_config)| {
+                    let ctx_config = ContextServerConfig {
+                        source: chat_config.source.clone(),
+                        enabled: chat_config.enabled,
+                        command: chat_config.command.clone(),
+                        args: chat_config.args.clone(),
+                        env: chat_config.env.clone(),
+                    };
+                    (name.clone(), ctx_config)
+                })
+                .collect();
         }
 
         // context_servers 为空或未提供，使用默认配置
@@ -202,10 +201,10 @@ impl PromptConfigAssembler {
     ///
     /// 逻辑：入参有指定则使用入参，否则使用默认
     pub fn get_agent_id(&self, default_agent_id: &str) -> String {
-        if let Some(ref config) = self.agent_config {
-            if let Some(ref agent_server) = config.agent_server {
-                return agent_server.get_agent_id().to_string();
-            }
+        if let Some(ref config) = self.agent_config
+            && let Some(ref agent_server) = config.agent_server
+        {
+            return agent_server.get_agent_id().to_string();
         }
         default_agent_id.to_string()
     }
@@ -305,6 +304,7 @@ mod tests {
             agent_server: None,
             context_servers,
             resource_limits: None,
+            auto_reload: None,
         };
 
         let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
@@ -333,13 +333,11 @@ mod tests {
         let agent_config = ChatAgentConfig {
             agent_server: Some(shared_types::ChatAgentServerConfig {
                 agent_id: Some("custom-agent".to_string()),
-                command: None,
-                args: None,
-                env: None,
-                metadata: None,
+                ..Default::default()
             }),
             context_servers: HashMap::new(),
             resource_limits: None,
+            auto_reload: None,
         };
 
         let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));
@@ -365,14 +363,12 @@ mod tests {
 
         let agent_config = ChatAgentConfig {
             agent_server: Some(shared_types::ChatAgentServerConfig {
-                agent_id: None,
-                command: None,
-                args: None,
                 env: Some(override_env),
-                metadata: None,
+                ..Default::default()
             }),
             context_servers: HashMap::new(),
             resource_limits: None,
+            auto_reload: None,
         };
 
         let assembler = PromptConfigAssembler::new(config).with_agent_config(Some(agent_config));

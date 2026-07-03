@@ -3,9 +3,9 @@
 //! 这些类型用于 Agent (RCoder Service) 的 HTTP REST API，
 //! 由 rcoder 和 agent_runner 共享使用
 
+use garde::Validate;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use garde::Validate;
 
 use crate::{Attachment, ChatAgentConfig, ModelProviderConfig};
 
@@ -62,13 +62,21 @@ pub struct AgentChatRequest {
 
     /// 租户 ID (可选)
     /// 用于多租户场景下的数据隔离
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::flexible_string::flexible_string"
+    )]
     #[schema(example = "tenant_001")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID (可选)
     /// 用于区分租户下的不同空间
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::flexible_string::flexible_string"
+    )]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
 
@@ -77,6 +85,13 @@ pub struct AgentChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "project")]
     pub isolation_type: Option<String>,
+
+    /// Agent 工作目录标识符（可选）
+    /// 用于替代 project_id 参与工作目录路径拼接
+    /// 未提供时使用 project_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "custom_workspace_123")]
+    pub agent_work_dir: Option<String>,
 }
 
 /// Agent 取消会话请求
@@ -105,13 +120,21 @@ pub struct AgentCancelRequest {
 
     /// 租户 ID (可选)
     #[garde(skip)]
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::flexible_string::flexible_string"
+    )]
     #[schema(example = "tenant_001")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID (可选)
     #[garde(skip)]
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::flexible_string::flexible_string"
+    )]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
 
@@ -159,13 +182,21 @@ pub struct AgentStopRequest {
 
     /// 租户 ID (可选)
     #[garde(skip)]
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::flexible_string::flexible_string"
+    )]
     #[schema(example = "tenant_001")]
     pub tenant_id: Option<String>,
 
     /// 空间 ID (可选)
     #[garde(skip)]
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::flexible_string::flexible_string"
+    )]
     #[schema(example = "space_xyz")]
     pub space_id: Option<String>,
 

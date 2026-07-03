@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+
+[package.metadata.dist]
+dist = false
 
 [lib]
 name = "agent_runner"
@@ -24,7 +28,7 @@ grpc-server = []
 
 # Pingora 代理模式：API Key 和 Base URL 使用占位符，由 Pingora 代理注入真实值
 # Windows 不支持 Pingora，禁用此 feature 时直接使用真实的 API Key 和 Base URL
-proxy = ["agent_abstraction/proxy", "dep:rcoder-proxy"]
+proxy = ["dep:rcoder-proxy"]
 
 # 测试相关 features
 testing = ["test-blocking"]
@@ -34,21 +38,24 @@ test-blocking = []  # 启用测试用阻塞注入 (用于极端场景测试)
 otel = []  # 启用 OpenTelemetry 追踪功能
 
 # Pyroscope 连续性能分析
-pyroscope = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
+pyroscope = ["dep:pyroscope"]
 
 [dependencies]
 # Internal crates
-shared_types = { path = "../shared_types" }
-agent_config = { path = "../agent_config" }
-agent_abstraction = { path = "../agent_abstraction" }
-rcoder-proxy = { path = "../rcoder-proxy", optional = true }
+shared_types = { workspace = true }
+shared_types_grpc = { workspace = true }
+shared_types_i18n = { workspace = true }
+agent_config = { workspace = true }
+agent_abstraction = { workspace = true }
+download_utils = { workspace = true }
+rcoder-proxy = { workspace = true, optional = true }
 rcoder-telemetry = { workspace = true }
 
 clap = { workspace = true }
 # ACP Protocol - 官方 SDK（完全 Send-safe，无需 LocalSet）
 agent-client-protocol = { workspace = true }
-async-trait = "0.1"
-parking_lot = "0.12"
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
 tempfile = { workspace = true }
 
 # HTTP server
@@ -56,8 +63,8 @@ axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace", "limit"] }
 futures = { workspace = true }
-tokio-stream = "0.1"
-async-stream = "0.3"
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
 
 # gRPC Server
 tonic = { workspace = true }
@@ -65,7 +72,10 @@ tonic = { workspace = true }
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_yaml = "0.9"
+serde_yaml = { workspace = true }
+regex = { workspace = true }
+globset = { workspace = true }
+shlex = { workspace = true }
 
 derive_builder = { workspace = true }
 
@@ -80,16 +90,23 @@ tracing-subscriber = { workspace = true, features = [
     "env-filter",
     "json",
 ] }
-tracing-appender = "0.2"
+tracing-appender = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 dashmap = { workspace = true }
-bytes = "1.0"
+bytes = { workspace = true }
 futures-util = { workspace = true }
-piper = "0.2"
+piper = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
+
+# Archive extraction (binary_installer) with path-traversal + zip-bomb protection
+hex = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
 
 # OpenTelemetry
 opentelemetry = { workspace = true }
@@ -100,23 +117,33 @@ axum-tracing-opentelemetry = { workspace = true }
 # File system
 tokio-fs = { workspace = true }
 path-clean = { workspace = true }
+which = { workspace = true }
 
 # OpenAPI documentation
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 
 # Validation
-garde = { version = "0.22.1", features = ["derive"] }
+garde = { workspace = true }
 
 ringbuf = { workspace = true }
 
 # Atomic swap for sender replacement
-arc-swap = "1.8"
+arc-swap = { workspace = true }
+
+# WebSocket：终端中间层（接浏览器 + 连本地 ttyd）+ noVNC 代理可用性检查
+tokio-tungstenite = { workspace = true }
 
 # Pyroscope Continuous Profiling
 pyroscope = { workspace = true, optional = true }
-pyroscope_pprofrs = { workspace = true, optional = true }
 
 # Unix 信号处理（用于僵尸进程回收，仅 Unix 平台）
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
+
+[dev-dependencies]
+# 集成测试用:解析响应 body
+http-body-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+# 集成测试用:tokio::time 虚拟时钟（pause/advance 快进），避免 keepalive 30s 真实等待
+tokio = { workspace = true, features = ["test-util"] }

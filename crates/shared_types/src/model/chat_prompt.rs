@@ -25,6 +25,9 @@ pub struct ChatPrompt {
     /// 必填：服务类型选择 (强制要求指定)
     /// "rcoder" 或 "agent-runner"，不允许为空
     pub service_type: crate::ServiceType,
+    /// 可选用户 ID，ComputerAgentRunner 权限审批链路使用
+    #[builder(default)]
+    pub user_id: Option<String>,
     /// 可选的请求ID，用于标识和追踪请求
     #[builder(default)]
     pub request_id: Option<String>,
@@ -50,6 +53,14 @@ pub struct ChatPrompt {
     /// 包含 Agent 服务器配置和 MCP 服务器配置
     #[builder(default)]
     pub agent_config_override: Option<ChatAgentConfig>,
+
+    /// 是否是 DevComputer 接口请求
+    ///
+    /// 用于 `{PREFIX_WORKSPACE_DIR}` 变量解析：
+    /// - `true`：LOG_DIR 解析为 `/home/user/`
+    /// - `false`：LOG_DIR 解析为 `/app/container-logs`
+    #[builder(default)]
+    pub is_devcomputer: bool,
 }
 
 /// 返回用户 prompt 的提示,一定有project_id ,session_id ,否则报错
@@ -59,7 +70,7 @@ pub struct ChatPromptResponse {
     pub project_id: String,
     /// agent 的会话ID ,可能没有,如果没有,agent使用自动创建会话,返回会话id
     pub session_id: String,
-    /// 错误码（如 "9010", "VALIDATION_ERROR"，成功时为 "0000"）
+    /// 错误码（如 "9010", "ERR_VALIDATION"，成功时为 "0000"）
     pub code: String,
     /// 错误信息，如果有的话
     pub error: Option<String>,

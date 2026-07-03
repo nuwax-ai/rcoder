@@ -1,0 +1,22 @@
+{
+  "name": "rcoder-cli-linux-arm64",
+  "version": "0.0.0",
+  "description": "RCoder CLI binary for linux-arm64",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "rcoder-cli"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuwax-ai/rcoder.git"
+  }
+}

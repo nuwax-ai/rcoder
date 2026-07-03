@@ -27,11 +27,11 @@ impl FromStr for ModelApiProtocol {
     }
 }
 
-impl ToString for ModelApiProtocol {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for ModelApiProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModelApiProtocol::Anthropic => "Anthropic".to_string(),
-            ModelApiProtocol::OpenAI => "Openai".to_string(),
+            ModelApiProtocol::Anthropic => f.write_str("Anthropic"),
+            ModelApiProtocol::OpenAI => f.write_str("Openai"),
         }
     }
 }
@@ -61,6 +61,11 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "openai")]
     pub api_protocol: Option<String>,
+    /// 线路 API 格式: "chat" 表示 Chat Completions API, "response" 表示 Responses API (默认)
+    /// 当 wire_api == "chat" 时，代理会将 Responses API 请求转换为 Chat API 请求
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "chat")]
+    pub wire_api: Option<String>,
 }
 
 impl ModelProviderConfig {
@@ -83,13 +88,13 @@ impl ModelProviderConfig {
     }
 
     /// 获取脱敏后的 API Key（只显示前4位和后4位）
+    /// 使用 char-based 切片避免 UTF-8 边界 panic
     fn mask_api_key(&self) -> String {
-        if self.api_key.len() > 8 {
-            format!(
-                "{}***{}",
-                &self.api_key[..4],
-                &self.api_key[self.api_key.len() - 4..]
-            )
+        let chars: Vec<char> = self.api_key.chars().collect();
+        if chars.len() > 8 {
+            let prefix: String = chars[..4].iter().collect();
+            let suffix: String = chars[chars.len() - 4..].iter().collect();
+            format!("{}***{}", prefix, suffix)
         } else {
             "***".to_string()
         }
@@ -99,19 +104,20 @@ impl ModelProviderConfig {
 /// 实现 Display trait，方便日志打印（自动对 API Key 和 URL 进行脱敏）
 impl fmt::Display for ModelProviderConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // 对 base_url 进行脱敏（使用 grpc_mask::mask_url）
-        let masked_base_url = crate::grpc_mask::mask_url(&self.base_url);
+        // 对 base_url 进行脱敏（使用 shared_types_grpc::mask_url）
+        let masked_base_url = shared_types_grpc::mask_url(&self.base_url);
 
         write!(
             f,
-            "{{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}}}",
+            "{{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}, wire_api: {}}}",
             self.id,
             self.name,
             self.default_model,
             masked_base_url,
             self.mask_api_key(),
             self.requires_openai_auth,
-            self.api_protocol.as_deref().unwrap_or("None")
+            self.api_protocol.as_deref().unwrap_or("None"),
+            self.wire_api.as_deref().unwrap_or("None")
         )
     }
 }
@@ -120,19 +126,20 @@ impl fmt::Display for ModelProviderConfig {
 impl fmt::Debug for ModelProviderConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // 对 base_url 进行脱敏
-        let masked_base_url = crate::grpc_mask::mask_url(&self.base_url);
+        let masked_base_url = shared_types_grpc::mask_url(&self.base_url);
 
         // 使用与 Display 相同的脱敏格式
         write!(
             f,
-            "ModelProviderConfig {{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}}}",
+            "ModelProviderConfig {{id: {}, name: {}, model: {}, base_url: {}, api_key: {}, requires_openai_auth: {}, api_protocol: {}, wire_api: {}}}",
             self.id,
             self.name,
             self.default_model,
             masked_base_url,
             self.mask_api_key(),
             self.requires_openai_auth,
-            self.api_protocol.as_deref().unwrap_or("None")
+            self.api_protocol.as_deref().unwrap_or("None"),
+            self.wire_api.as_deref().unwrap_or("None")
         )
     }
 }

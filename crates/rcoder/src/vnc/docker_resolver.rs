@@ -10,14 +10,16 @@
 //! **当前状态**: 作为备选方案保留，未被主动使用。
 //!
 //! **原因**: Pingora 的 `upstream_peer` 方法是同步的，无法直接调用异步 Docker API。
-//! 当前系统使用 `vnc_sync` 定时同步任务来维护 VNC 后端映射。
+//! 当前系统使用 `ContainerLookupService` 统一管理容器映射。
 //!
 //! **未来用途**: 如果 Pingora 支持异步上游解析，或使用其他支持异步的代理服务，
 //! 可以直接使用此解析器。
 
 use async_trait::async_trait;
+use container_runtime_api::ContainerRuntime;
 use moka::future::Cache;
 use rcoder_proxy::{VncBackendInfo, VncBackendResolver, VncResolveError};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -40,22 +42,18 @@ const DEFAULT_CACHE_TTL_SECS: u64 = 5;
 pub struct CachedDockerResolver {
     /// 缓存：user_id -> VncBackendInfo
     cache: Cache<String, VncBackendInfo>,
-}
-
-impl Default for CachedDockerResolver {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// 容器运行时（通过 DI 注入）
+    runtime: Arc<dyn ContainerRuntime>,
 }
 
 impl CachedDockerResolver {
     /// 创建带默认 TTL（5 秒）的解析器
-    pub fn new() -> Self {
-        Self::with_ttl(Duration::from_secs(DEFAULT_CACHE_TTL_SECS))
+    pub fn new(runtime: Arc<dyn ContainerRuntime>) -> Self {
+        Self::with_ttl(Duration::from_secs(DEFAULT_CACHE_TTL_SECS), runtime)
     }
 
     /// 创建带自定义 TTL 的解析器
-    pub fn with_ttl(ttl: Duration) -> Self {
+    pub fn with_ttl(ttl: Duration, runtime: Arc<dyn ContainerRuntime>) -> Self {
         let cache = Cache::builder()
             .time_to_live(ttl)
             .max_capacity(10_000) // 最多缓存 10000 个用户
@@ -66,21 +64,18 @@ impl CachedDockerResolver {
             ttl.as_secs()
         );
 
-        Self { cache }
+        Self { cache, runtime }
     }
 
     /// 直接从 runtime 查询容器信息（不走缓存）
     async fn query_runtime(&self, user_id: &str) -> Result<VncBackendInfo, VncResolveError> {
-        let runtime = docker_manager::runtime::RuntimeManager::get()
-            .await
-            .map_err(|e| {
-                warn!("[VNC_RESOLVER] Failed to get runtime: {}", e);
-                VncResolveError::QueryFailed(format!("Failed to get runtime: {}", e))
-            })?;
-
         // ComputerAgentRunner 模式：使用 user_id 作为容器标识
-        let container_info = runtime
-            .get_container_info_by_identifier(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+        let container_info = self
+            .runtime
+            .get_container_info_by_identifier(
+                user_id,
+                &shared_types::ServiceType::ComputerAgentRunner,
+            )
             .await
             .map_err(|e| {
                 warn!(
@@ -157,17 +152,65 @@ impl VncBackendResolver for CachedDockerResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use container_runtime_api::{
+        ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, RuntimeContainerInfo,
+    };
+    use shared_types::ContainerBasicInfo;
+
+    /// 用于测试的最小 ContainerRuntime 实现
+    struct StubRuntime;
+
+    #[async_trait]
+    impl ContainerRuntime for StubRuntime {
+        async fn create_container(
+            &self,
+            _params: ContainerCreateParams,
+        ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+            Err(ContainerRuntimeError::ContainerNotFound("stub".into()))
+        }
+        async fn get_container_info(
+            &self,
+            _project_id: &str,
+        ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+            Ok(None)
+        }
+        async fn find_container(
+            &self,
+            _project_id: &str,
+            _service_type: &shared_types::ServiceType,
+        ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+            Ok(None)
+        }
+        async fn stop_container(&self, _project_id: &str) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn is_container_running(&self, _project_id: &str) -> ContainerRuntimeResult<bool> {
+            Ok(false)
+        }
+        async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
+            Ok(vec![])
+        }
+        async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+    }
+
+    fn stub_runtime() -> Arc<dyn ContainerRuntime> {
+        Arc::new(StubRuntime)
+    }
 
     #[test]
-    fn test_default_resolver() {
-        let resolver = CachedDockerResolver::default();
-        // 仅验证创建成功
+    fn test_resolver_creation() {
+        let resolver = CachedDockerResolver::new(stub_runtime());
         assert!(std::mem::size_of_val(&resolver) > 0);
     }
 
     #[test]
     fn test_custom_ttl() {
-        let resolver = CachedDockerResolver::with_ttl(Duration::from_secs(10));
+        let resolver = CachedDockerResolver::with_ttl(Duration::from_secs(10), stub_runtime());
         assert!(std::mem::size_of_val(&resolver) > 0);
     }
 }

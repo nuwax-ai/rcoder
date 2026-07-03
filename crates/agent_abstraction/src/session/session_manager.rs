@@ -49,18 +49,22 @@
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
+use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use chrono::Utc;
-use agent_client_protocol::schema::{ContentBlock, PromptRequest, SessionId, TextContent};
 use shared_types::{
     AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo, SessionEntry,
 };
 use tracing::{debug, error, info};
 
 use crate::PromptMessage;
-use crate::launcher::ClaudeCodeLauncher;
-use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
+use crate::diagnostics::DiagnosticsListener;
+use crate::launcher::{ClaudeCodeLauncher, ModelRuntimeEnvResolver};
+use crate::traits::{
+    AgentStartConfig, PermissionRequestHandler, SessionNotifier, SessionRegistry,
+    YoloPermissionRequestHandler,
+};
 
 /// ACP 会话管理器 (SACP 版本)
 ///
@@ -77,6 +81,12 @@ pub struct AcpSessionManager<N: SessionNotifier, R: SessionRegistry> {
     registry: Arc<R>,
     /// 会话通知器
     notifier: Arc<N>,
+    /// 模型运行时环境解析策略
+    model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+    /// ACP permission request handler.
+    permission_handler: Arc<dyn PermissionRequestHandler>,
+    /// 进程诊断监听器（可选，注入自 AcpClientBuilder）
+    diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
 }
 
 impl<N: SessionNotifier + 'static, R: SessionRegistry> AcpSessionManager<N, R>
@@ -89,7 +99,41 @@ where
     /// - `notifier`: 会话通知器
     /// - `registry`: 会话注册表（通常注入 AGENT_REGISTRY）
     pub fn new(notifier: Arc<N>, registry: Arc<R>) -> Self {
-        Self { registry, notifier }
+        Self::with_model_env_resolver(
+            notifier,
+            registry,
+            crate::launcher::direct_model_runtime_env_resolver(),
+        )
+    }
+
+    pub fn with_model_env_resolver(
+        notifier: Arc<N>,
+        registry: Arc<R>,
+        model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+    ) -> Self {
+        Self::with_dependencies(
+            notifier,
+            registry,
+            model_env_resolver,
+            Arc::new(YoloPermissionRequestHandler),
+            None,
+        )
+    }
+
+    pub fn with_dependencies(
+        notifier: Arc<N>,
+        registry: Arc<R>,
+        model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+        permission_handler: Arc<dyn PermissionRequestHandler>,
+        diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
+    ) -> Self {
+        Self {
+            registry,
+            notifier,
+            model_env_resolver,
+            permission_handler,
+            diagnostics_listener,
+        }
     }
 
     /// 获取会话信息
@@ -131,6 +175,7 @@ where
     ///
     /// - 如果是相对路径，先与当前目录拼接
     /// - 去除路径中的 "./"（CurDir 组件）
+    /// - 解析 ".."（ParentDir）：绝对路径弹出上一个普通组件，相对路径保留
     pub fn normalize_path(path: &PathBuf) -> PathBuf {
         let joined_path = if path.is_absolute() {
             path.clone()
@@ -138,10 +183,25 @@ where
             std::env::current_dir().unwrap_or_default().join(path)
         };
 
-        joined_path
-            .components()
-            .filter(|c| !matches!(c, Component::CurDir))
-            .collect()
+        let mut components = Vec::new();
+        for c in joined_path.components() {
+            match c {
+                Component::CurDir => {} // skip .
+                Component::ParentDir => {
+                    // 绝对路径：弹出最后一个普通组件，防止目录穿越
+                    // 相对路径：保留 ..（由调用方负责处理）
+                    if joined_path.is_absolute() {
+                        if let Some(Component::Normal(_)) = components.last() {
+                            components.pop();
+                        }
+                    } else {
+                        components.push(c);
+                    }
+                }
+                _ => components.push(c),
+            }
+        }
+        components.iter().collect()
     }
 
     /// 确保项目目录存在
@@ -285,13 +345,15 @@ where
         start_config: AgentStartConfig,
         service_uuid: Option<String>,
     ) -> Result<R::Entry> {
-        info!(
-            "Creating Agent session, project ID: {}",
-            project_id
-        );
+        info!("Creating Agent session, project ID: {}", project_id);
 
         // 创建 SACP 启动器
-        let launcher = ClaudeCodeLauncher::new(self.notifier.clone());
+        let launcher = ClaudeCodeLauncher::with_diagnostics_listener(
+            self.notifier.clone(),
+            self.model_env_resolver.clone(),
+            self.permission_handler.clone(),
+            self.diagnostics_listener.clone(),
+        );
 
         // 记录是否使用了 resume（仅用于日志）
         let has_resume = start_config.resume_session_id.is_some();
@@ -335,6 +397,7 @@ where
             last_activity: now,
             created_at: now,
             stop_handle: lifecycle_handle,
+            agent_binary_snapshot: None,
         };
 
         // 返回 agent_info（不插入 registry，由调用方处理）

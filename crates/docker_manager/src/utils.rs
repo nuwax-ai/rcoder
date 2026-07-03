@@ -49,8 +49,27 @@ impl DockerUtils {
     }
 
     /// 生成容器名称：使用 project_id 而不是随机 UUID，便于管理和调试
-    pub fn generate_container_name(prefix: &str, project_id: &str) -> String {
-        format!("{}-{}", prefix, project_id)
+    ///
+    /// # 错误
+    /// 当 `project_id` 包含非法字符时返回错误（防止容器名注入）
+    pub fn generate_container_name(prefix: &str, project_id: &str) -> Result<String, String> {
+        // 验证 project_id 格式：仅允许字母、数字、下划线、连字符，长度 1-64
+        if project_id.is_empty() || project_id.len() > 64 {
+            return Err(format!(
+                "project_id 长度无效（需 1-64 字符）: '{}'",
+                project_id
+            ));
+        }
+        if !project_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "project_id 包含非法字符: '{}'，仅允许字母、数字、下划线和连字符",
+                project_id
+            ));
+        }
+        Ok(format!("{}-{}", prefix, project_id))
     }
 
     /// 从环境变量加载 Docker 配置

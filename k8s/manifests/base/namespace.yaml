@@ -1,5 +1,0 @@
-# Namespace for RCoder
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: nuwax-rcoder

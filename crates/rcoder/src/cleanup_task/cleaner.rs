@@ -35,6 +35,10 @@ impl AgentCleaner {
         let config_clone = config.clone();
         let state_clone = state.clone();
         let grpc_pool = state.grpc_pool.clone();
+        let namespace = state.config.app_manager.namespace.clone();
+
+        // 判断是否是 K8s 运行时（通过 features flag）
+        let is_kubernetes = shared_types::is_kubernetes_runtime();
 
         // 创建日志清理器（使用配置）
         let log_cleaner = super::logs::LogCleaner::new(
@@ -52,6 +56,9 @@ impl AgentCleaner {
                 docker_manager.clone(),
                 grpc_pool,
                 pingora_service,
+                namespace,
+                state.cluster_domain.clone(),
+                is_kubernetes,
             ),
             agent_scanner: {
                 use crate::cleanup_task::agent::AgentScanner;
@@ -72,10 +79,7 @@ impl AgentCleaner {
         match self.log_cleaner.cleanup_once().await {
             Ok(log_stats) => {
                 if log_stats.files_deleted > 0 || log_stats.failed_deletions > 0 {
-                    info!(
-                        "🗑️ [cleaner] Cleanup completed: {}",
-                        log_stats.summary()
-                    );
+                    info!(" [cleaner] Cleanup completed: {}", log_stats.summary());
                 }
             }
             Err(e) => {
@@ -97,20 +101,33 @@ impl AgentCleaner {
             let container_name: Option<String> = self
                 .state
                 .get_project(&project_id)
-                .and_then(|info| info.container().map(|c| c.container_name.clone()));
+                .and_then(|info| info.container_info().map(|c| c.container_name.clone()));
 
-            if let Some(ref name) = container_name {
-                if destroyed_containers.contains(name) {
-                    // 容器已被销毁，只需删除项目记录
-                    self.state.remove_project(&project_id);
-                    current_stats.total_cleaned += 1;
-                    current_stats.success_cleaned += 1;
-                    info!(
-                        "[cleaner] Container already destroyed, removed project record only: project_id={}",
-                        project_id
-                    );
-                    continue;
-                }
+            // 🛡️ 关键修复：项目可能已被本轮清理的共享容器连带删除
+            // 例如：cleanup_agent("P1") 销毁共享容器后，delete_container_with_projects
+            // 会同时删除 P1 和 P2 的 DB 记录。当循环到 P2 时，项目已不存在。
+            if container_name.is_none() && !self.state.contains_project(&project_id) {
+                info!(
+                    "[cleaner] Project already removed (likely by shared container cleanup): project_id={}",
+                    project_id
+                );
+                current_stats.total_cleaned += 1;
+                current_stats.success_cleaned += 1;
+                continue;
+            }
+
+            if let Some(ref name) = container_name
+                && destroyed_containers.contains(name)
+            {
+                // 容器已被销毁，只需删除项目记录
+                self.state.remove_project(&project_id);
+                current_stats.total_cleaned += 1;
+                current_stats.success_cleaned += 1;
+                info!(
+                    "[cleaner] Container already destroyed, removed project record only: project_id={}",
+                    project_id
+                );
+                continue;
             }
 
             current_stats.total_cleaned += 1;
@@ -125,11 +142,11 @@ impl AgentCleaner {
                             destroyed_containers.insert(name);
                         }
                     }
-                    info!("[cleaner] Agent cleanupsucceeded: {}", project_id);
+                    info!(" [cleaner] Agent cleanup succeeded: {}", project_id);
                 }
                 Err(e) => {
                     current_stats.failed_cleaned += 1;
-                    warn!("[cleaner] Agent cleanupfailed: {} - {}", project_id, e);
+                    warn!(" [cleaner] Agent cleanup failed: {} - {}", project_id, e);
                 }
             }
         }
@@ -144,19 +161,19 @@ impl AgentCleaner {
 
         let duration = start_time.elapsed();
         info!(
-            "✅ [cleaner] Cleanup completed, duration: {:.2}s, this run: {}",
+            " [cleaner] Cleanup completed, duration: {:.2}s, this run: {}",
             duration.as_secs_f64(),
             current_stats.summary()
         );
-        info!("[cleaner] stats: {}", self.stats.summary());
+        info!(" [cleaner] Stats: {}", self.stats.summary());
 
         Ok(current_stats)
     }
 
     /// 清理单个 agent
-    /// 返回 Ok(true) 表示销毁了容器，Ok(false) 表示只删除了记录
+    /// 返回 Ok(true) 表示销毁了容器，Ok(false) 表示只删除了记录、或跳过清理（竞态保护时项目仍活跃）
     async fn cleanup_agent(&self, project_id: &str) -> Result<bool> {
-        info!("[cleaner] startingcleanup agent: {}", project_id);
+        info!(" [cleaner] Starting cleanup agent: {}", project_id);
 
         // 1. 获取项目信息
         let agent_info = self
@@ -164,11 +181,26 @@ impl AgentCleaner {
             .get_project(project_id)
             .ok_or_else(|| anyhow::anyhow!("Agent does not exist: {}", project_id))?;
 
-        let service_type = agent_info.service_type().unwrap_or(ServiceType::RCoder);
+        // 🛡️ 竞态保护：scanner 扫描到 cleaner 处理之间有时间差（gRPC 二次确认等），
+        // 期间 project 可能收到 keepalive/chat 刷新了 last_activity。
+        // 重新校验 idle_duration，避免误杀刚被保活的项目。
+        // （共享容器场景额外由 strategy 的 has_active_refs 兜底，这里覆盖独立容器场景）
+        let idle_secs = (Utc::now() - agent_info.last_activity()).num_seconds();
+        if idle_secs < self.config.idle_timeout.as_secs() as i64 {
+            info!(
+                " [cleaner] Project activity refreshed after scan, skip cleanup: project_id={}, idle_secs={}s",
+                project_id, idle_secs
+            );
+            return Ok(false);
+        }
+
+        let service_type = agent_info
+            .service_type()
+            .unwrap_or(ServiceType::WebAgentRunner);
 
         // 2. 选择策略
         let strategy: &dyn super::strategies::CleanupStrategy = match service_type {
-            ServiceType::RCoder => &self.rcoder_strategy,
+            ServiceType::WebAgentRunner => &self.rcoder_strategy,
             ServiceType::ComputerAgentRunner => &self.computer_runner_strategy,
         };
 
@@ -184,39 +216,57 @@ impl AgentCleaner {
 
         // 4. 如果需要销毁容器
         let mut container_destroyed = false;
-        if let Some(reason) = destroy_reason {
-            if let Some(container_info) = agent_info.container() {
-                let project_info = super::strategies::ProjectInfo {
-                    project_id: agent_info.project_id().to_string(),
-                    user_id: agent_info.user_id().map(|s| s.to_string()),
-                    pod_id: agent_info.pod_id().map(|s| s.to_string()),
-                    last_activity: agent_info.last_activity(),
-                };
+        if let Some(reason) = destroy_reason
+            && let Some(container_info) = agent_info.container_info()
+        {
+            let project_info = super::strategies::ProjectInfo {
+                project_id: agent_info.project_id().to_string(),
+                user_id: agent_info.user_id().map(|s| s.to_string()),
+                pod_id: agent_info.pod_id().map(|s| s.to_string()),
+                last_activity: agent_info.last_activity(),
+            };
 
-                let container_identifier = strategy.get_container_identifier(&project_info)?;
+            let container_identifier = strategy.get_container_identifier(&project_info)?;
 
-                // 🔧 使用容器名称而不是 container_id 来销毁容器
-                // 容器名称更稳定，不会因为容器重启而改变
-                // Docker API 的 remove_container 既接受 ID 也接受名称
-                self.container_destroyer
-                    .destroy_with_reason(
-                        &container_info.container_name,
-                        &service_type,
-                        &container_identifier,
-                        &reason,
-                    )
-                    .await?;
+            // 🔧 使用容器名称而不是 container_id 来销毁容器
+            // 容器名称更稳定，不会因为容器重启而改变
+            // Docker API 的 remove_container 既接受 ID 也接受名称
+            self.container_destroyer
+                .destroy_with_reason(
+                    &container_info.container_name,
+                    &service_type,
+                    &container_identifier,
+                    &reason,
+                    Some(project_id),
+                )
+                .await?;
 
-                container_destroyed = true;
-            }
+            container_destroyed = true;
         }
 
-        // 5. 从存储中移除项目记录（始终执行）
-        self.state.remove_project(project_id);
-        info!(
-            "[cleaner] already removed project: project_id={}",
-            project_id
-        );
+        // 5. 从存储中移除记录
+        if container_destroyed {
+            // 容器已销毁：删除容器记录及其关联的所有项目记录（避免孤立容器记录）
+            let container_id = agent_info
+                .container_info()
+                .map(|c| c.container_id.clone())
+                .unwrap_or_default();
+            let (deleted, project_count) = self
+                .state
+                .projects
+                .delete_container_with_projects(&container_id);
+            info!(
+                "[cleaner] Deleted container and {} associated projects from storage: container_id={}, container_deleted={}",
+                project_count, container_id, deleted
+            );
+        } else {
+            // 容器未销毁（仅超时等原因）：只删除当前项目记录
+            self.state.remove_project(project_id);
+            info!(
+                "[cleaner] Removed project record only (container not destroyed): project_id={}",
+                project_id
+            );
+        }
 
         Ok(container_destroyed)
     }
@@ -237,13 +287,15 @@ impl AgentCleaner {
                 Err(e) => warn!("[cleaner] Cleanup failed: {}", e),
             }
 
-            // 定期输出 DuckDB 内存使用统计
+            // 定期输出存储统计信息
             memory_log_counter += 1;
             if memory_log_counter >= MEMORY_LOG_INTERVAL {
                 memory_log_counter = 0;
-                if let Ok(stats) = self.state.projects.get_memory_stats() {
-                    debug!("[cleaner] DuckDB Memory Stats:\n{}", stats);
-                }
+                let stats = self.state.projects.get_stats();
+                debug!(
+                    "[cleaner] Storage Stats: projects={}, containers={}, sessions={}",
+                    stats.total_projects, stats.total_containers, stats.active_sessions
+                );
             }
         }
     }

@@ -3,6 +3,8 @@
 //! 提供便捷的 HTTP 服务器启动 API
 //! 支持 HTTP REST API 和可选的 Pingora 代理服务
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,13 +13,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::agent_runtime::AgentRuntime;
 use crate::config::AppConfig;
 use crate::http_server::router::{AppState, create_router};
-use crate::proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
-use crate::proxy_agent::set_unlimited_mode;
 #[cfg(feature = "proxy")]
 use crate::proxy_agent::start_pingora;
+use crate::service::AgentSessionService;
 
 /// HTTP 服务器配置
 pub struct HttpServerConfig {
@@ -25,10 +25,14 @@ pub struct HttpServerConfig {
     pub port: u16,
     /// 应用配置
     pub app_config: AppConfig,
-    /// Agent 运行时
-    pub agent_runtime: Arc<AgentRuntime>,
+    /// Agent 会话服务
+    pub agent_session_service: Arc<AgentSessionService>,
     /// 共享 API Key Manager
     pub shared_api_key_manager: Arc<dashmap::DashMap<String, shared_types::ModelProviderConfig>>,
+    /// P0-1: Agent 管理注册表(可选,启用 /agent-mgmt/* 路由)
+    pub agent_mgmt_registry: Option<Arc<crate::agent_mgmt::AgentRegistry>>,
+    /// P0-1: Agent 安装目录管理(可选,启用 /agent-mgmt/* 路由)
+    pub agent_mgmt_path_manager: Option<crate::agent_mgmt::PathManager>,
 }
 
 /// HTTP 服务器控制柄
@@ -101,16 +105,16 @@ impl HttpServerHandle {
 /// # 示例
 ///
 /// ```no_run
-/// use agent_runner::{AgentRuntime, start_http_server, HttpServerConfig, AppConfig, ProxyConfig, HealthCheckConfig};
+/// use agent_runner::{AgentSessionService, start_http_server, HttpServerConfig, AppConfig, ProxyConfig, HealthCheckConfig};
 /// use std::sync::Arc;
 /// use std::path::PathBuf;
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     // 创建 Agent Runtime
-///     let (runtime, receiver) = AgentRuntime::new(1000);
-///     let runtime = Arc::new(runtime);
-///     runtime.start(receiver).await;
+///     // 创建 Agent Session Service
+///     let agent_session_service = Arc::new(AgentSessionService::new(
+///         agent_abstraction::launcher::direct_model_runtime_env_resolver(),
+///     ));
 ///
 ///     // 配置 HTTP Server
 ///     let config = HttpServerConfig {
@@ -124,12 +128,20 @@ impl HttpServerHandle {
 ///                 default_backend_port: 8080,
 ///                 backend_host: "127.0.0.1".to_string(),
 ///                 port_param: "port".to_string(),
-///                 health_check: HealthCheckConfig::default(),
+///                 health_check: HealthCheckConfig {
+///                     enabled: true,
+///                     interval_seconds: 5,
+///                     timeout_seconds: 1,
+///                     healthy_threshold: 2,
+///                     unhealthy_threshold: 3,
+///                 },
 ///             }),
 ///             ..Default::default()
 ///         },
-///         agent_runtime: runtime,
+///         agent_session_service,
 ///         shared_api_key_manager: Arc::new(dashmap::DashMap::new()),
+///         agent_mgmt_registry: None,    // P0-1: 不启用 /agent-mgmt/* 路由
+///         agent_mgmt_path_manager: None,
 ///     };
 ///
 ///     // 启动 HTTP Server
@@ -140,17 +152,12 @@ impl HttpServerHandle {
 /// }
 /// ```
 pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHandle> {
-    // 设置 mcp-proxy 日志目录环境变量（如果配置了的话）
+    // 设置 mcp-proxy 日志目录（如果配置了的话）
+    // 使用 OnceLock 替代 env::set_var，避免多线程环境下的 UB（Rust 1.84+）
     if let Some(ref log_dir) = config.app_config.mcp_proxy_log_dir {
-        // SAFETY: 在服务启动时设置环境变量是安全的，此时尚未启动多线程任务
-        unsafe {
-            std::env::set_var("MCP_PROXY_LOG_DIR", log_dir);
-        }
-        info!("🔧 Set MCP_PROXY_LOG_DIR={}", log_dir);
+        agent_abstraction::launcher::set_mcp_proxy_log_dir(log_dir.clone());
+        info!("Set MCP_PROXY_LOG_DIR={}", log_dir);
     }
-
-    // 设置无限制模式（HTTP Server 部署不限制槽位）
-    set_unlimited_mode(true);
 
     // 创建关闭信号令牌
     let shutdown_token = CancellationToken::new();
@@ -158,44 +165,10 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     #[cfg(feature = "proxy")]
     let pingora_result = Arc::new(tokio::sync::Mutex::new(None));
 
-    // 1. 启动 Agent 清理任务
-    let cleanup_config = CleanupConfig {
-        idle_timeout: Duration::from_secs(
-            config
-                .app_config
-                .agent_cleanup
-                .clone()
-                .unwrap_or_default()
-                .idle_timeout_secs,
-        ),
-        cleanup_interval: Duration::from_secs(
-            config
-                .app_config
-                .agent_cleanup
-                .clone()
-                .unwrap_or_default()
-                .cleanup_interval_secs,
-        ),
-    };
-    info!(
-        "🧹 [HTTP] Agent cleanup config: idle_timeout={}s, cleanup_interval={}s",
-        cleanup_config.idle_timeout.as_secs(),
-        cleanup_config.cleanup_interval.as_secs()
-    );
-    let cleanup_token = shutdown_token.child_token();
-    join_set.lock().await.spawn(async move {
-        tokio::select! {
-            _ = start_cleanup_task(cleanup_config) => {}
-            _ = cleanup_token.cancelled() => {
-                info!("Cleanup task received shutdown signal");
-            }
-        }
-    });
-
-    // 2. 启动 Pingora 代理服务（如果配置了且启用了 proxy feature）
+    // 1. 启动 Pingora 代理服务（如果配置了且启用了 proxy feature）
     #[cfg(feature = "proxy")]
     if let Some(proxy_config) = &config.app_config.proxy_config {
-        let result = start_pingora(proxy_config, config.shared_api_key_manager.clone());
+        let result = start_pingora(proxy_config, config.shared_api_key_manager.clone())?;
         // 保存 Pingora 结果以便后续调用 stop
         *pingora_result.lock().await = Some(result);
     } else {
@@ -205,17 +178,30 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     #[cfg(not(feature = "proxy"))]
     info!("Pingora proxy service is disabled (proxy feature not enabled)");
 
-    // 3. 创建 HTTP 应用状态
-    let state = Arc::new(AppState::new(
+    // 2. 创建 HTTP 应用状态
+    let mut state = AppState::new(
         config.app_config.clone(),
-        config.agent_runtime,
+        config.agent_session_service,
         config.shared_api_key_manager,
-    ));
+    );
 
-    // 4. 创建路由
+    // 2.5 P0-1: 启用 agent_mgmt 路由(若提供)
+    if let (Some(registry), Some(pm)) = (
+        config.agent_mgmt_registry.clone(),
+        config.agent_mgmt_path_manager.clone(),
+    ) {
+        state = state.with_agent_mgmt(registry, pm);
+        info!("P0-1: agent-mgmt HTTP routes enabled");
+    } else {
+        info!("P0-1: agent-mgmt HTTP routes disabled (no registry/path_manager)");
+    }
+
+    let state = Arc::new(state);
+
+    // 3. 创建路由
     let app = create_router(state.clone());
 
-    // 5. 绑定地址并启动 HTTP 服务器
+    // 4. 绑定地址并启动 HTTP 服务器
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
@@ -237,7 +223,7 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
     info!("  GET  /health - Health check");
     info!("  GET  /api/docs - Swagger API documentation");
 
-    // 6. 启动 HTTP 服务任务
+    // 5. 启动 HTTP 服务任务
     let http_token = shutdown_token.child_token();
     // 将 listener 和 app 移入任务中
     let http_app = app;

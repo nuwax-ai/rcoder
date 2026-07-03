@@ -1,0 +1,38 @@
+{
+  "name": "rcoder-cli",
+  "version": "0.0.0",
+  "description": "RCoder CLI - AI-powered development platform",
+  "main": "./bin/cli.js",
+  "bin": {
+    "rcoder-cli": "./bin/cli.js"
+  },
+  "optionalDependencies": {
+    "rcoder-cli-linux-x64": "0.0.0",
+    "rcoder-cli-linux-arm64": "0.0.0",
+    "rcoder-cli-darwin-x64": "0.0.0",
+    "rcoder-cli-darwin-arm64": "0.0.0",
+    "rcoder-cli-windows-x64": "0.0.0"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/nuwax-ai/rcoder",
+  "keywords": [
+    "rcoder",
+    "cli",
+    "ai",
+    "agent",
+    "development"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuwax-ai/rcoder.git"
+  }
+}

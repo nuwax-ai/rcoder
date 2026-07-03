@@ -1,0 +1,575 @@
+syntax = "proto3";
+package agent;
+
+// Agent 核心服务
+service AgentService {
+  // 聊天对话接口 (Unary)
+  rpc Chat(ChatRequest) returns (ChatResponse);
+
+  // 订阅会话进度流 (Server Streaming)
+  // 替代原有的 /agent/progress/{session_id} SSE 接口
+  rpc SubscribeProgress(ProgressRequest) returns (stream ProgressEvent);
+
+  // 取消会话任务 (Unary)
+  rpc CancelSession(CancelRequest) returns (CancelResponse);
+
+  // Resolve a pending ACP permission request (Unary)
+  rpc ResolvePermission(ResolvePermissionRequest) returns (ResolvePermissionResponse);
+
+  // 获取 Agent 状态 (Unary)
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // 停止特定 project_id 的 Agent (Unary)
+  // 用于 ComputerAgentRunner 模式：停止单个项目的 Agent，不销毁容器
+  rpc StopAgent(StopAgentRequest) returns (StopAgentResponse);
+
+  // 查询容器状态 (Unary)
+  // 专门用于容器生命周期管理，返回容器活跃状态和任务信息
+  rpc GetContainerStatus(GetContainerStatusRequest) returns (GetContainerStatusResponse);
+
+  // 查询 VNC 服务状态 (Unary)
+  // 用于检测容器内 VNC/noVNC 服务是否已启动就绪
+  rpc GetVncStatus(GetVncStatusRequest) returns (GetVncStatusResponse);
+}
+
+// === Agent Management Service (P0-1) ===
+//
+// 部署在 agent_runner 容器内,提供安装/卸载/检查 agent 二进制的能力。
+// 二进制上传通过 client streaming(InstallAgent) 走 1MB chunk。
+service AgentMgmtService {
+  // 列出已安装的 agent
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+
+  // 上传二进制(支持单文件/tar.gz/zip,client streaming)
+  rpc InstallAgent(stream InstallAgentRequest) returns (InstallAgentResponse);
+
+  // 卸载 agent
+  rpc UninstallAgent(UninstallAgentRequest) returns (UninstallAgentResponse);
+
+  // 检查指定 agent 状态
+  rpc CheckAgent(CheckAgentRequest) returns (CheckAgentResponse);
+
+  // 查询单个 agent 详情(快速)
+  rpc GetAgent(GetAgentRequest) returns (GetAgentResponse);
+}
+
+// === ChatRequest/Response ===
+
+message ChatRequest {
+  string project_id = 1;
+  string session_id = 2;
+  string prompt = 3;
+  // 模型配置
+  optional ModelProviderConfig model_config = 4;
+  // 附件列表
+  repeated Attachment attachments = 5;
+  // 请求ID
+  optional string request_id = 6;
+  // 数据源附件 (JSON 字符串数组)
+  repeated string data_source_attachments = 7;
+
+  // === 新增字段 (v2) ===
+  // 系统提示词（可选，覆盖默认配置）
+  optional string system_prompt = 8;
+  // 用户提示词模板（可选，支持 {user_prompt} 变量替换）
+  optional string user_prompt = 9;
+  // Agent 运行时配置（可选，包含 Agent 服务器和 MCP 服务器配置）
+  optional ChatAgentConfig agent_config = 10;
+  // 服务类型（可选，"RCoder" 或 "ComputerAgentRunner"，默认 "RCoder"）
+  optional string service_type = 11;
+  // 用户ID（可选，ComputerAgentRunner 模式必填）
+  optional string user_id = 12;
+  // 🆕 是否是 DevComputer 接口请求（用于 {PREFIX_WORKSPACE_DIR} 变量解析）
+  bool is_devcomputer = 13;
+  // 🆕 自定义工作目录标识符（可选，用于替代 project_id 参与工作目录拼接）
+  optional string agent_work_dir = 14;
+}
+
+message ChatResponse {
+  string project_id = 1;
+  string session_id = 2;
+  bool success = 3;
+  optional string error = 4;
+  optional string request_id = 5;
+  optional string error_code = 6; // 🆕 业务错误码（如 "9010", "ERR_VALIDATION"）
+
+  // 🆕 Resume 失败标识 (用于 rcoder 层降级处理)
+  bool need_fallback = 7; // true 表示需要降级重试
+  optional string fallback_reason = 8; // 降级原因：如 "session_not_found"
+
+  // 🆕 Auto-reload 标识（DevComputer 调试模式下 agent 二进制变化时触发）
+  bool reloaded = 9; // true 表示本次请求触发了 agent 热重载
+
+  // 🆕 Agent 版本号（可选，检测失败时为空）
+  optional string agent_version = 10;
+}
+
+// === Progress Streaming ===
+
+message ProgressRequest {
+  string session_id = 1;
+  // 客户端最后收到的 seq；订阅方带上以请求增量 replay（只回放 seq > from_seq 的消息）。
+  // 缺省（None / 0）= 全量回放（向后兼容旧行为）。
+  optional uint64 from_seq = 2;
+}
+
+// ProgressEvent 进度事件（简化版：完全透传 ACP JSON）
+//
+// 设计理念：不再尝试映射 ACP 到固定的事件类型，而是直接透传 ACP 消息的 JSON
+// 优势：
+// 1. 零字段丢失：完整保留 ACP 结构
+// 2. 零维护成本：ACP 协议更新时后端无需修改
+// 3. 前端灵活性：前端可按需解析任意字段
+message ProgressEvent {
+  // 消息主类型：SessionPromptStart, SessionPromptEnd, AgentSessionUpdate, Heartbeat
+  string message_type = 1;
+  // 消息子类型：agent_message_chunk, tool_call, plan, end_turn 等
+  string sub_type = 2;
+  // ACP 消息的完整 JSON 载荷
+  string payload = 3;
+  // 可选的请求 ID，用于关联请求和响应
+  optional string request_id = 4;
+  // 消息序号（session 级单调递增）。语义：
+  // - seq >= 1：真实消息序号，订阅方据此去重与增量补齐（只接受 seq > 已收最大值的消息）。
+  // - seq == 0：哨兵值——合成消息（cancel/idle_timeout/channel_closed 等）或旧版本，
+  //   订阅方无条件转发，不参与去重、不更新消费游标。
+  uint64 seq = 5;
+  // 时间戳 (使用 Unix timestamp，单位：毫秒)
+  int64 timestamp = 11;
+}
+
+// === Cancel Session ===
+
+message CancelRequest {
+  string session_id = 1; // 可选，为空时使用 project_id 查找
+  string reason = 2;
+  string project_id = 3; // 用于按项目取消（当 session_id 为空时）
+}
+
+// 取消结果类型（对应 Rust CancelResult）
+enum CancelResultType {
+  CANCEL_RESULT_UNSPECIFIED = 0;
+  CANCEL_RESULT_SUCCESS = 1;
+  CANCEL_RESULT_FAILED = 2;
+  CANCEL_RESULT_TIMEOUT = 3;
+}
+
+message CancelResponse {
+  bool success = 1;
+  CancelResultType result = 2;
+  optional string message = 3;
+}
+
+// === Resolve Permission ===
+
+message ResolvePermissionRequest {
+  string session_id = 1;
+  string tool_call_id = 2;
+  optional string option_id = 3;
+  bool cancelled = 4;
+  bool save_rule = 5;
+  string project_id = 6;
+  optional string user_id = 7;
+  optional string pod_id = 8;
+  optional string tenant_id = 9;
+  optional string space_id = 10;
+  optional string isolation_type = 11;
+}
+
+message ResolvePermissionResponse {
+  bool success = 1;
+  string session_id = 2;
+  string tool_call_id = 3;
+  optional string outcome_json = 4;
+  bool rule_saved = 5;
+  optional string error_code = 6;
+  optional string message = 7;
+}
+
+// === Get Status ===
+
+message GetStatusRequest {
+  string project_id = 1;
+  string session_id = 2; // 新增：支持通过 session_id 查询
+}
+
+message GetStatusResponse {
+  string status = 1; // "idle", "busy", "error"
+  bool is_found = 2; // Agent 是否存在于 Registry
+}
+
+// === Stop Agent ===
+
+message StopAgentRequest {
+  // 项目 ID (必填)
+  string project_id = 1;
+  // 可选的停止原因
+  optional string reason = 2;
+  // 是否强制停止（不等待当前任务完成）
+  bool force = 3;
+}
+
+message StopAgentResponse {
+  bool success = 1;
+  // 停止结果：stopped, not_found, already_stopped, error
+  string result = 2;
+  // 可选的详细消息
+  optional string message = 3;
+  // 被停止的 Agent 的项目 ID
+  string project_id = 4;
+}
+
+// === Model Provider Config ===
+
+message ModelProviderConfig {
+  // 模型配置唯一标识（必须保留原始值，用于会话复用判断）
+  string id = 1;
+  // 提供商名称 (如: glm, anthropic, openai, qwen)
+  string provider = 2;
+  // 默认模型名称
+  string model = 3;
+  // API 密钥
+  optional string api_key = 4;
+  // API 基础 URL
+  optional string api_base = 5;
+  // 是否需要 OpenAI 兼容的认证
+  optional bool requires_openai_auth = 6;
+  // 模型接口协议类型 (anthropic/openai)
+  optional string api_protocol = 7;
+  // 线路 API 格式: "chat" 表示 Chat Completions API, "response" 表示 Responses API
+  optional string wire_api = 8;
+}
+
+// === Attachment 相关定义 ===
+
+// 附件数据源
+message AttachmentSource {
+  oneof source {
+    string file_path = 1; // 文件路径
+    Base64Data base64 = 2; // Base64 编码数据
+    string url = 3; // URL 链接
+  }
+}
+
+message Base64Data {
+  string data = 1;
+  string mime_type = 2;
+}
+
+// 图像尺寸
+message ImageDimensions {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+// 文本附件
+message TextAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  optional string filename = 3;
+  optional string description = 4;
+}
+
+// 图像附件
+message ImageAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  string mime_type = 3;
+  optional string filename = 4;
+  optional string description = 5;
+  optional ImageDimensions dimensions = 6;
+}
+
+// 音频附件
+message AudioAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  string mime_type = 3;
+  optional string filename = 4;
+  optional string description = 5;
+  optional double duration = 6; // 时长（秒）
+}
+
+// 文档附件
+message DocumentAttachment {
+  string id = 1;
+  AttachmentSource source = 2;
+  string mime_type = 3;
+  optional string filename = 4;
+  optional string description = 5;
+  optional uint64 size = 6; // 文件大小（字节）
+}
+
+// 附件枚举（使用 oneof 区分类型）
+message Attachment {
+  oneof attachment_type {
+    TextAttachment text = 1;
+    ImageAttachment image = 2;
+    AudioAttachment audio = 3;
+    DocumentAttachment document = 4;
+  }
+}
+
+// === Chat Agent 配置 (v2) ===
+
+// Agent 运行时配置
+message ChatAgentConfig {
+  // 单个 Agent 服务器配置（可选）
+  optional ChatAgentServerConfig agent_server = 1;
+  // MCP 服务器配置（多个）
+  map<string, ChatContextServerConfig> context_servers = 2;
+  // 🆕 Auto-reload 配置（可选，DevComputer 调试模式下启用）
+  optional AutoReloadConfig auto_reload = 3;
+}
+
+// 单个 Agent 服务器配置
+message ChatAgentServerConfig {
+  // Agent 标识符（可选，默认 "claude-code-acp"）
+  optional string agent_id = 1;
+  // 执行命令
+  optional string command = 2;
+  // 命令参数
+  repeated string args = 3;
+  // 环境变量
+  map<string, string> env = 4;
+  // 元数据
+  map<string, string> metadata = 5;
+  // 模型环境变量显式绑定规则
+  repeated ModelEnvBinding model_env_bindings = 6;
+  // Permission approval mode: "yolo" (default) or "ask"
+  optional string agent_mode = 7;
+  // 工具审批规则（可选）
+  repeated ToolApprovalRule tool_approval_rules = 8;
+  // 期望安装的版本号（semver 格式，与 platforms 配合使用）
+  optional string version = 9;
+  // 多平台下载地址（PlatformEntry JSON 序列化，key = "{os}-{arch}"）
+  map<string, bytes> platforms = 10;
+}
+
+// 工具审批规则
+message ToolApprovalRule {
+  // 通配符模式列表（大小写不敏感，任一命中即触发）
+  repeated string patterns = 1;
+  // 审批动作: "ask" | "allow" | "deny"
+  string action = 2;
+  // ACP ToolKind 过滤（可选），不传表示不按 kind 过滤（匹配所有类别）
+  optional string tool_kind = 3;
+}
+
+message ModelEnvBinding {
+  // Agent 子进程环境变量名
+  string env_key = 1;
+  // 绑定来源
+  ModelEnvBindingSource source = 2;
+}
+
+enum ModelEnvBindingSource {
+  MODEL_ENV_BINDING_SOURCE_UNSPECIFIED = 0;
+  MODEL_ENV_BINDING_SOURCE_API_KEY = 1;
+  MODEL_ENV_BINDING_SOURCE_BASE_URL = 2;
+  MODEL_ENV_BINDING_SOURCE_DEFAULT_MODEL = 3;
+  MODEL_ENV_BINDING_SOURCE_PROVIDER_NAME = 4;
+}
+
+// MCP 服务器配置
+message ChatContextServerConfig {
+  // 服务器来源类型: "custom" 或 "local"
+  string source = 1;
+  // 是否启用
+  bool enabled = 2;
+  // 执行命令 (如 "bunx", "uvx", "npx")
+  optional string command = 3;
+  // 命令参数
+  repeated string args = 4;
+  // 环境变量
+  map<string, string> env = 5;
+}
+
+// Auto-reload 热重载配置（简化版，用于 DevComputer 调试模式）
+//
+// 当 enabled=true 时，每次请求都会重启 ACP agent 进程，
+// 并尝试通过 session_id 恢复历史上下文。
+message AutoReloadConfig {
+  // 是否启用 auto-reload（默认 true）
+  bool enabled = 1;
+}
+
+// === Get Container Status ===
+
+// 容器状态查询请求
+message GetContainerStatusRequest {
+  // 用户ID
+  string user_id = 1;
+  // 项目ID
+  string project_id = 2;
+}
+
+// 容器状态响应
+message GetContainerStatusResponse {
+  // 容器是否活跃（有活跃任务）
+  bool is_active = 1;
+  // 活跃任务数
+  int32 active_tasks = 2;
+  // 容器运行时长（秒）
+  int64 uptime_seconds = 3;
+  // 状态描述：Active, Idle, Processing
+  string status = 4;
+  // 可选：CPU 使用率（百分比，0-100）
+  optional double cpu_percent = 5;
+  // 可选：内存使用（MB）
+  optional int64 memory_mb = 6;
+}
+
+// === Get VNC Status ===
+
+// VNC 状态查询请求
+message GetVncStatusRequest {
+  // 用户ID（可选，用于日志记录）
+  optional string user_id = 1;
+  // 项目ID（可选，用于日志记录）
+  optional string project_id = 2;
+}
+
+// VNC 状态响应
+message GetVncStatusResponse {
+  // VNC 是否已就绪（x11vnc 进程 + 5900 端口）
+  bool vnc_ready = 1;
+  // noVNC 是否已就绪（6080 端口）
+  bool novnc_ready = 2;
+  // 状态描述消息
+  string message = 3;
+  // 容器启动时间（秒）
+  int64 uptime_seconds = 4;
+}
+
+// === Agent Management Messages (P0-1) ===
+
+message SystemInfo {
+  string os = 1;
+  string arch = 2;
+  string platform = 3;
+}
+
+enum InstallType {
+  INSTALL_TYPE_UNSPECIFIED = 0;
+  INSTALL_TYPE_BUILTIN = 1;
+  INSTALL_TYPE_BINARY = 2;
+  INSTALL_TYPE_NPM = 3;
+  INSTALL_TYPE_URL = 4;
+}
+
+enum AgentInstallStatus {
+  AGENT_INSTALL_STATUS_UNSPECIFIED = 0;
+  AGENT_INSTALL_STATUS_AVAILABLE = 1;
+  AGENT_INSTALL_STATUS_BROKEN = 2;
+  AGENT_INSTALL_STATUS_NOT_INSTALLED = 3;
+}
+
+message AgentInfo {
+  string agent_id = 1;
+  InstallType install_type = 2;
+  AgentInstallStatus status = 3;
+  optional string version = 4;
+  optional string binary_path = 5;
+  optional int64 installed_at = 6;
+}
+
+message StaticCheckResult {
+  bool file_exists = 1;
+  bool executable = 2;
+  bool in_path = 3;
+}
+
+message AgentDetailInfo {
+  string agent_id = 1;
+  InstallType install_type = 2;
+  bool installed = 3;
+  AgentInstallStatus status = 4;
+  optional string version = 5;
+  bool version_check_supported = 6;
+  StaticCheckResult static_checks = 7;
+}
+
+message ListAgentsRequest {
+  // reserved 防止 field number 被复用(proto 3 允许空 message)
+  reserved 1;
+}
+
+message ListAgentsResponse {
+  SystemInfo system_info = 1;
+  repeated AgentInfo agents = 2;
+  int32 total = 3;
+  string install_dir = 4;
+}
+
+message CheckAgentRequest {
+  string agent_id = 1;
+  optional string version = 2;
+}
+
+message CheckAgentResponse {
+  SystemInfo system_info = 1;
+  AgentDetailInfo agent = 2;
+}
+
+message GetAgentRequest {
+  string agent_id = 1;
+  optional string version = 2;
+}
+
+message GetAgentResponse {
+  bool found = 1;
+  AgentDetailInfo agent = 2; // 仅当 found=true 有效
+}
+
+message UninstallAgentRequest {
+  string agent_id = 1;
+  optional string version = 4;
+}
+
+message UninstallAgentResponse {
+  bool uninstalled = 1;
+  InstallType install_type = 2;
+  string agent_id = 3;
+  repeated string removed_versions = 5;
+}
+
+// 上传 binary 用的 streaming request
+// 首包携带 metadata,后续包只携带 data
+message InstallAgentRequest {
+  // 首包用
+  message Metadata {
+    optional string agent_id = 1;
+    optional string command = 2;
+    repeated string args = 3;
+    optional string sha256 = 4;
+    // 扩展字段(P0-1):用于 URL / NPM / ARCHIVE 安装
+    optional InstallType install_type = 5;        // 缺省 BINARY
+    optional string source_url = 6;               // URL 安装时必填
+    optional string npm_package = 7;             // NPM 安装时必填(@scope/name)
+    // === 多平台版本管理(install-from-url 新模式) ===
+    optional string version = 8;                 // 期望安装的版本号(semver)
+    optional string platforms = 9;               // HashMap<String, PlatformEntry> 的 JSON 序列化(字符串)
+    optional bool force = 10;                    // 强制重新安装(取消正在进行的安装)
+  }
+  // 元数据(只首包携带)
+  Metadata metadata = 1;
+  // 后续 chunk 的数据(二进制/URL 下载/npm 元数据均可,URL/npm 模式下 data 通常为空)
+  bytes data = 2;
+}
+
+message InstallAgentResponse {
+  string agent_id = 1;
+  AgentInstallStatus status = 2;
+  string binary_path = 3;
+  string file_type = 4;
+  optional int32 file_count = 5;
+  int64 file_size = 6;
+  optional string version = 7;
+  optional string source_url = 8;
+  // === 多平台版本管理响应字段 ===
+  string action = 20;              // "installed" / "updated" / "skipped"
+  bool installed = 21;             // 本次是否实际安装
+  string previous_version = 22;    // 更新前版本(首次安装为空)
+  string platform = 23;            // 实际匹配的平台 key(如 "linux-x86_64")
+}

@@ -10,6 +10,7 @@ use tokio::time::timeout;
 use tracing::debug;
 
 /// Agent 状态检查器
+#[derive(Clone)]
 pub struct AgentStatusChecker {
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
 }
@@ -38,11 +39,11 @@ impl AgentStatusChecker {
         {
             Ok(Ok(is_active)) => Ok(is_active),
             Ok(Err(e)) => {
-                debug!("⚠️ [status_checker] gRPC Query failed: {}", e);
+                debug!(" [status_checker] gRPC Query failed: {}", e);
                 Ok(false) // Query failed，允许清理
             }
             Err(_) => {
-                debug!("⏰ [status_checker] gRPC timeout");
+                debug!(" [status_checker] gRPC timeout");
                 Ok(false) // 超时，允许清理
             }
         }
@@ -65,7 +66,7 @@ impl AgentStatusChecker {
         let status = response.into_inner();
 
         debug!(
-            "📊 [status_checker] Container status: is_active={}, active_tasks={}",
+            " [status_checker] Container status: is_active={}, active_tasks={}",
             status.is_active, status.active_tasks
         );
 

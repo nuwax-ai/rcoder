@@ -21,4 +21,10 @@ pub struct ChatResponse {
     /// 降级原因（如 "session_not_found"）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// 是否触发了 agent 二进制热重载（DevComputer 调试模式）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reloaded: Option<bool>,
+    /// agent 版本号（可选，检测失败时为 None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
 }

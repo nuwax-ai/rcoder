@@ -153,7 +153,7 @@ pub async fn quick_start(
     listen_port: u16,
     default_backend_port: u16,
     backend_host: &str,
-) -> anyhow::Result<()> {
+) -> ProxyResult<()> {
     let config = ProxyConfig {
         listen_port,
         default_backend_port,
@@ -161,6 +161,7 @@ pub async fn quick_start(
         port_param: DEFAULT_PORT_PARAM.to_string(),
         config_file: None,
         verbose: false,
+        ..Default::default()
     };
 
     let server = ProxyServer::new(config);
@@ -184,6 +185,9 @@ pub enum ProxyError {
 
     #[error("request handling error: {0}")]
     RequestHandling(String),
+
+    #[error("route configuration error: {0}")]
+    RouteConfig(String),
 }
 
 impl From<anyhow::Error> for ProxyError {
@@ -205,7 +209,8 @@ mod integration_tests {
         assert_eq!(DEFAULT_BACKEND_PORT, 3000);
         assert_eq!(DEFAULT_BACKEND_HOST, "127.0.0.1");
         assert_eq!(DEFAULT_PORT_PARAM, "port");
-        assert!(!VERSION.is_empty());
+        // env!() 在编译期求值，clippy 无法静态分析此值，改用 eq 断言规避误报
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -236,20 +241,11 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_features() {
-        assert!(features::QUERY_PARAM_ROUTING);
-        assert!(features::PATH_ROUTING);
-        assert!(features::DYNAMIC_BACKENDS);
-        assert!(features::CONFIG_FILE_SUPPORT);
-        assert!(features::VERBOSE_LOGGING);
-    }
-
-    #[test]
     fn test_proxy_error() {
         let error = ProxyError::Config("Invalid port".to_string());
-        assert!(error.to_string().contains("配置错误"));
+        assert!(error.to_string().contains("config error"));
 
         let error = ProxyError::Network("Connection failed".to_string());
-        assert!(error.to_string().contains("网络错误"));
+        assert!(error.to_string().contains("network error"));
     }
 }

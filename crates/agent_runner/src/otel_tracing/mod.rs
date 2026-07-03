@@ -54,7 +54,7 @@ impl Default for TraceConfig {
 /// - `TELEMETRY_PROMETHEUS_ENABLED`: 是否启用 Prometheus（默认 true）
 pub async fn init_tracing(config: TraceConfig) -> anyhow::Result<rcoder_telemetry::TelemetryGuard> {
     if !config.enabled {
-        info!("📍 [OTel] Tracing is disabled");
+        info!("[OTel] Tracing is disabled");
         // 即使追踪禁用，仍然Initializing Prometheus（如果启用）
         if config.prometheus_enabled {
             return rcoder_telemetry::init_prometheus_only(&config.service_name);
@@ -290,7 +290,7 @@ impl RequestSpan {
 
 impl Drop for RequestSpan {
     fn drop(&mut self) {
-        info!("📍 [OTel] Span closed");
+        info!("[OTel] Span closed");
     }
 }
 
@@ -325,7 +325,7 @@ pub fn child_span(_parent: &RequestSpan, name: &str, attributes: &[(&str, String
         span.set_attribute(key.to_string(), value.clone());
     }
 
-    info!("📍 [OTel] Child span created: {}", name);
+    info!("[OTel] Child span created: {}", name);
 
     RequestSpan { span }
 }

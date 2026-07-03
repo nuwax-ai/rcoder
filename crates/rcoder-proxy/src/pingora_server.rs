@@ -2,7 +2,7 @@
 //!
 //! 提供基于 Pingora 库的完整反向代理服务器启动功能，支持 HTTP/1.1 和 HTTP/2。
 
-use anyhow::Result;
+use crate::ProxyError;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -70,21 +70,40 @@ impl PingoraServerManager {
         self
     }
 
+    /// 设置容器查找服务（统一数据源）
+    ///
+    /// 注入共享的容器查找服务（通常是 `Arc<ProjectAdapter>`），
+    /// 使 Pingora 代理层（/web/ttyd、/computer/ttyd 等路由）能通过
+    /// user_id / project_id / pod_id 解析容器 IP，无需自己维护映射。
+    ///
+    /// # 参数
+    ///
+    /// * `lookup` - 共享的 `Arc<dyn ContainerLookup>`
+    pub fn with_container_lookup(
+        mut self,
+        lookup: Arc<dyn shared_types::ContainerLookup>,
+    ) -> Self {
+        let new_service = (*self.service).clone().with_container_lookup(lookup);
+        self.service = Arc::new(new_service);
+        self
+    }
+
     /// 启动 Pingora 服务器
     ///
     /// 接受一个 `shutdown_rx` 用于接收外部关闭信号。
     /// 当 `shutdown_rx` 收到信号（或 sender 被 drop）时，`start()` 返回。
     /// Pingora 服务器线程运行 `run_forever()`，由进程退出时 OS 清理。
-    pub async fn start(&mut self, shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
+    pub async fn start(&mut self, shutdown_rx: oneshot::Receiver<()>) -> Result<(), ProxyError> {
         info!("starting Pingora proxy server...");
-        info!("📡 listening on: 0.0.0.0:{}", self.config.listen_port);
+        info!("listening on: 0.0.0.0:{}", self.config.listen_port);
         info!("route: /proxy/{{port}}{{/path}}");
 
         // 创建 Pingora 服务器配置
         let opt = Opt::default();
 
         // 创建 Pingora 服务器
-        let mut my_server = Server::new(Some(opt))?;
+        let mut my_server = Server::new(Some(opt))
+            .map_err(|e| ProxyError::Config(format!("Failed to create Pingora server: {}", e)))?;
         my_server.bootstrap();
 
         // 创建代理服务实例
@@ -109,16 +128,16 @@ impl PingoraServerManager {
 
         // 在独立线程中运行服务器（使用 std::thread 而不是 spawn_blocking）
         // spawn_blocking 在某些环境下可能有调度延迟问题
-        info!("🔧 created Pingora proxy service...");
+        info!("created Pingora proxy service...");
         let server_thread = std::thread::spawn(move || {
-            info!("🎯 Pingora proxy starting...");
+            info!("Pingora proxy starting...");
             my_server.run_forever();
         });
         info!("Pingora server already created");
 
         // 等待外部关闭信号（sender 被 drop 或显式发送信号都会触发）
         let _ = shutdown_rx.await;
-        info!("📴 shutdown signal received, Pingora proxy cleanup by OS");
+        info!("shutdown signal received, Pingora proxy cleanup by OS");
 
         // 不再 join 线程 — run_forever() 永不返回，join() 会导致永久阻塞
         // detach 线程，让进程退出时自动清理
@@ -144,6 +163,15 @@ impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
 
     fn new_ctx(&self) -> Self::CTX {
         crate::service::TrackingCtx::new()
+    }
+
+    async fn request_filter(
+        &self,
+        session: &mut pingora_proxy::Session,
+        ctx: &mut Self::CTX,
+    ) -> PingoraResult<bool> {
+        // 委托给内部的 PortProxy 实现（协议转换拦截）
+        self.inner.request_filter(session, ctx).await
     }
 
     async fn upstream_peer(
@@ -211,7 +239,7 @@ impl pingora_proxy::ProxyHttp for ProxyServiceWrapper {
 /// 注意：此函数启动后会阻塞直到进程退出，因为内部创建的 shutdown 通道
 /// 的 sender 会在函数结束时立即 drop，导致 `start()` 立即返回。
 /// 如需长时间运行，请使用 `PingoraServerManager::new()` + `start(shutdown_rx)` 组合。
-pub async fn start_pingora_proxy(config: ProxyConfig) -> Result<()> {
+pub async fn start_pingora_proxy(config: ProxyConfig) -> Result<(), ProxyError> {
     let (_shutdown_tx, shutdown_rx) = oneshot::channel();
     let mut manager = PingoraServerManager::new(config);
     manager.start(shutdown_rx).await

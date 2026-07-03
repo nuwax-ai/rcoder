@@ -1,0 +1,444 @@
+# Release CI - 正式版本发布
+# 触发条件: push tag (如 v1.0.0, 1.0.0)
+# npm tag: latest
+
+name: Release
+
+permissions:
+  "contents": "write"
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  # ============================================================
+  # Step 1: 计划发布
+  # ============================================================
+  plan:
+    runs-on: "ubuntu-22.04"
+    outputs:
+      val: ${{ steps.plan.outputs.manifest }}
+      tag: ${{ github.ref_name }}
+      tag-flag: ${{ format('--tag={0}', github.ref_name) }}
+      version: ${{ steps.version.outputs.version }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Install dist
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5; do
+            curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Cache dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/dist
+
+      - id: plan
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s/version = \".*\"/version = \"$VERSION\"/" crates/rcoder-cli/Cargo.toml
+
+          dist host --steps=create --tag=${{ github.ref_name }} --output-format=json > plan-dist-manifest.json
+          echo "dist ran successfully"
+          cat plan-dist-manifest.json
+          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: "Upload dist-manifest.json"
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-plan-dist-manifest
+          path: plan-dist-manifest.json
+
+  # ============================================================
+  # Step 2: 构建平台二进制
+  # ============================================================
+  build-local-artifacts:
+    name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
+    needs:
+      - plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container && matrix.container.image || null }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      RUSTUP_TOOLCHAIN: "1.91.0"
+    steps:
+      - name: enable windows longpaths
+        run: |
+          git config --global core.longpaths true
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust non-interactively if not already installed
+        if: ${{ matrix.container }}
+        run: |
+          if ! command -v cargo > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Install dist
+        run: ${{ matrix.install_dist.run }}
+
+      - name: Ensure dist in PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+
+      - name: Install dependencies
+        run: |
+          ${{ matrix.packages_install }}
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ]; then
+            PROTOC_ARCH="linux-aarch_64"
+          else
+            PROTOC_ARCH="linux-x86_64"
+          fi
+          curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-${PROTOC_ARCH}.zip"
+          unzip "protoc-25.1-${PROTOC_ARCH}.zip" -d $HOME/.local
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Build artifacts
+        shell: bash
+        run: |
+          VERSION="${{ needs.plan.outputs.version }}"
+          sed -i.bak "s/version = \".*\"/version = \"$VERSION\"/" crates/rcoder-cli/Cargo.toml
+          rm -f crates/rcoder-cli/Cargo.toml.bak
+
+          dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          echo "dist ran successfully"
+
+      - id: cargo-dist
+        name: Post-build
+        shell: bash
+        run: |
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+
+      - name: "Upload artifacts"
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+
+  # ============================================================
+  # Step 3: 构建全局产物
+  # ============================================================
+  build-global-artifacts:
+    needs:
+      - plan
+      - build-local-artifacts
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install cached dist
+        uses: actions/download-artifact@v8
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+
+      - run: chmod +x ~/.cargo/bin/dist
+
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+
+      - id: cargo-dist
+        shell: bash
+        run: |
+          VERSION="${{ needs.plan.outputs.version }}"
+          sed -i "s/version = \".*\"/version = \"$VERSION\"/" crates/rcoder-cli/Cargo.toml
+
+          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          echo "dist ran successfully"
+
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+
+      - name: "Upload artifacts"
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-build-global
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+
+  # ============================================================
+  # Step 4: 创建 GitHub Release
+  # ============================================================
+  host:
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+    if: ${{ always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: "ubuntu-22.04"
+    outputs:
+      val: ${{ steps.host.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install cached dist
+        uses: actions/download-artifact@v8
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+
+      - run: chmod +x ~/.cargo/bin/dist
+
+      - name: Fetch artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+
+      - id: host
+        shell: bash
+        run: |
+          VERSION="${{ needs.plan.outputs.version }}"
+          sed -i "s/version = \".*\"/version = \"$VERSION\"/" crates/rcoder-cli/Cargo.toml
+
+          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          echo "artifacts uploaded and released successfully"
+          cat dist-manifest.json
+          echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: "Upload dist-manifest.json"
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-dist-manifest
+          path: dist-manifest.json
+
+      - name: "Download GitHub Artifacts"
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Cleanup
+        run: |
+          rm -f artifacts/*-dist-manifest.json
+
+      - name: Create GitHub Release
+        env:
+          PRERELEASE_FLAG: ""
+          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
+          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
+          RELEASE_COMMIT: "${{ github.sha }}"
+        run: |
+          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+
+  # ============================================================
+  # Step 5: 发布 npm 包 (@latest)
+  # ============================================================
+  publish-npm:
+    needs:
+      - plan
+      - host
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20.x'
+          registry-url: 'https://registry.npmjs.org'
+
+      # 下载 GitHub Release 中的二进制文件
+      - name: Download release assets
+        run: |
+          mkdir -p binaries
+          cd binaries
+
+          # 下载各平台二进制
+          gh release download "${{ needs.plan.outputs.tag }}" \
+            --pattern "*.tar.xz" \
+            --pattern "*.zip" \
+            --repo ${{ github.repository }}
+
+          ls -la
+
+      # 解压二进制文件到平台包目录
+      - name: Extract binaries
+        run: |
+          VERSION="${{ env.VERSION }}"
+
+          # 更新所有 package.json 版本
+          for dir in npm/*/; do
+            if [ -f "$dir/package.json" ]; then
+              jq --arg v "$VERSION" '.version = $v' "$dir/package.json" > "$dir/package.json.tmp"
+              mv "$dir/package.json.tmp" "$dir/package.json"
+            fi
+          done
+
+          # 更新主包的 optionalDependencies 版本（平台包使用非 scoped 唯一包名）
+          jq --arg v "$VERSION" '
+            .optionalDependencies["rcoder-cli-linux-x64"] = $v |
+            .optionalDependencies["rcoder-cli-linux-arm64"] = $v |
+            .optionalDependencies["rcoder-cli-darwin-x64"] = $v |
+            .optionalDependencies["rcoder-cli-darwin-arm64"] = $v |
+            .optionalDependencies["rcoder-cli-windows-x64"] = $v
+          ' npm/rcoder-cli/package.json > npm/rcoder-cli/package.json.tmp
+          mv npm/rcoder-cli/package.json.tmp npm/rcoder-cli/package.json
+
+          # 解压 Linux x64（tarball 带顶层目录，需 strip 1 层）
+          mkdir -p npm/rcoder-cli-linux-x64
+          tar -xf binaries/rcoder-cli-x86_64-unknown-linux-gnu.tar.xz --strip-components=1 -C npm/rcoder-cli-linux-x64
+
+          # 解压 Linux arm64
+          mkdir -p npm/rcoder-cli-linux-arm64
+          tar -xf binaries/rcoder-cli-aarch64-unknown-linux-gnu.tar.xz --strip-components=1 -C npm/rcoder-cli-linux-arm64
+
+          # 解压 macOS x64
+          mkdir -p npm/rcoder-cli-darwin-x64
+          tar -xf binaries/rcoder-cli-x86_64-apple-darwin.tar.xz --strip-components=1 -C npm/rcoder-cli-darwin-x64
+
+          # 解压 macOS arm64
+          mkdir -p npm/rcoder-cli-darwin-arm64
+          tar -xf binaries/rcoder-cli-aarch64-apple-darwin.tar.xz --strip-components=1 -C npm/rcoder-cli-darwin-arm64
+
+          # 解压 Windows x64
+          mkdir -p npm/rcoder-cli-win32-x64
+          unzip binaries/rcoder-cli-x86_64-pc-windows-msvc.zip -d npm/rcoder-cli-win32-x64
+
+          # 显示结果
+          echo "=== Package contents ==="
+          for dir in npm/*/; do
+            echo "--- $dir ---"
+            ls -la "$dir"
+          done
+
+      # 发布平台包
+      - name: Publish platform packages
+        run: |
+          npm config set //registry.npmjs.org/:_authToken ${{ secrets.NPM_TOKEN }}
+
+          failures=0
+          for pkg in npm/rcoder-cli-*; do
+            if [ -f "$pkg/package.json" ]; then
+              pkgName=$(jq -r '.name' "$pkg/package.json")
+              echo "Packing $pkgName..."
+              cd "$pkg"
+              tarball=$(npm pack 2>/dev/null)
+              cd -
+              echo "Publishing $pkgName with latest tag..."
+              if ! npm publish "$pkg/$tarball" --access public --tag latest --registry https://registry.npmjs.org; then
+                echo "ERROR: Failed to publish $pkgName"
+                failures=$((failures+1))
+              fi
+              rm -f "$pkg/$tarball"
+            fi
+          done
+
+          if [ "$failures" -ne 0 ]; then
+            echo "ERROR: $failures npm package(s) failed to publish"
+            exit 1
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # 发布主包
+      - name: Publish main package
+        run: |
+          echo "Publishing rcoder-cli..."
+          cd npm/rcoder-cli
+          tarball=$(npm pack 2>/dev/null)
+          cd -
+          npm publish "npm/rcoder-cli/$tarball" --access public --tag latest --registry https://registry.npmjs.org
+          rm -f "npm/rcoder-cli/$tarball"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ============================================================
+  # Step 6: 发布公告
+  # ============================================================
+  announce:
+    needs:
+      - plan
+      - host
+      - publish-npm
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-npm.result == 'skipped' || needs.publish-npm.result == 'success') }}
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive

@@ -1,26 +1,41 @@
-# rcoder 配置文件
-# 该文件在首次启动时自动生成
+# RCoder 本地 Docker 容器测试配置
+# 用于在 docker-compose 启动的容器中测试动态启动子容器
 
-# 默认使用的 Agent ID
-default_agent_id: claude-code-acp-ts
+# 默认使用的 AI 代理类型 (Claude/Codex)
+default_agent: "Claude"
 
 # 项目工作目录
-projects_dir: ./project_workspace
+projects_dir: "/app/project_workspace"
 
-# 主服务端口
-port: 8086
+# 主服务端口（会被环境变量 RCODER_PORT 覆盖）
+port: 8090
+
+# 容器清理配置
+cleanup_config:
+  # 是否启用容器清理功能（默认禁用）
+  # 设置为 true 可以启用自动清理闲置容器
+  # - true: 启用（自动清理闲置容器）
+  # - false: 禁用（默认，更安全）
+  enabled: true
+  # 闲置超时时间（秒），超过此时间未活动的容器将被清理
+  # 默认值: 600 (10分钟)
+  idle_timeout_seconds: 600
+  # 清理任务执行间隔（秒）
+  # 默认值: 300 (5分钟)
+  cleanup_interval_seconds: 500
+  # Docker 容器停止超时时间（秒）
+  # 默认值: 30
+  docker_stop_timeout_seconds: 30
+  # 容器最小保护时间（秒），刚启动的容器在此时间内不会被清理
+  # 默认值: 300 (5分钟)
+  container_protection_seconds: 300
 
 # Pingora 反向代理配置
 proxy_config:
-  # 代理服务监听端口 (用于接收外部请求)
   listen_port: 8088
-  # 默认后端服务端口 (当请求未指定端口时使用)
-  default_backend_port: 8086
-  # 后端服务主机地址
+  default_backend_port: 8090
   backend_host: "127.0.0.1"
-  # URL 中端口参数的名称 (用于从路径中提取端口号)
   port_param: "port"
-  # 健康检查配置
   health_check:
     enabled: true
     interval_seconds: 5
@@ -28,56 +43,167 @@ proxy_config:
     healthy_threshold: 2
     unhealthy_threshold: 3
 
-# Agent 清理配置
-# 如果省略此配置块，将使用以下默认值：
-#   - idle_timeout_secs: 300 (5分钟)
-#   - cleanup_interval_secs: 30 (30秒)
-agent_cleanup:
-  # Agent 闲置超时时间（秒）
-  # Agent 在闲置超过此时间后会被自动清理以释放资源
-  # 有效范围: 10 - 86400 秒（10秒 - 24小时）
-  # 可通过环境变量 RCODER_AGENT_IDLE_TIMEOUT_SECS 覆盖
-  idle_timeout_secs: 300
-  # 清理检查间隔（秒）
-  # 系统每隔此时间检查一次是否有闲置的 Agent 需要清理
-  # 有效范围: 5 - 3600 秒（5秒 - 1小时）
-  # 可通过环境变量 RCODER_AGENT_CLEANUP_INTERVAL_SECS 覆盖
-  cleanup_interval_secs: 30
+# Docker 配置
+docker_config:
+  # 多镜像配置系统
+  multi_image_config:
+    # 全局默认配置
+    global_defaults:
+      registry_prefix: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev"
 
-# gRPC 超时配置
-# 如果省略此配置块，将使用以下默认值：
-#   - cancel_session_timeout_secs: 30 (30秒)
-#   - acp_session_create_timeout_secs: 100 (100秒)
-#   - agent_cancel_timeout_secs: 10 (10秒)
-#   - port_check_timeout_millis: 500 (500毫秒)
-grpc_timeouts:
-  # 取消会话超时（秒）
-  # gRPC 取消会话请求的最大等待时间
-  # 有效范围: 5 - 300 秒
-  # 可通过环境变量 RCODER_CANCEL_SESSION_TIMEOUT_SECS 覆盖
-  cancel_session_timeout_secs: 30
-  # ACP 会话创建超时（秒）
-  # Agent 创建新会话的最大等待时间（MCP 工具较多时可能需要更长时间）
-  # 有效范围: 10 - 300 秒
-  # 可通过环境变量 RCODER_ACP_SESSION_CREATE_TIMEOUT_SECS 覆盖
-  acp_session_create_timeout_secs: 100
-  # Agent 取消调用超时（秒）
-  # Agent 内部取消操作的最大等待时间
-  # 有效范围: 5 - 60 秒
-  # 可通过环境变量 RCODER_AGENT_CANCEL_TIMEOUT_SECS 覆盖
-  agent_cancel_timeout_secs: 10
-  # 端口检查超时（毫秒）
-  # 检查端口可用性的最大等待时间
-  # 有效范围: 100 - 10000 毫秒
-  # 可通过环境变量 RCODER_PORT_CHECK_TIMEOUT_MILLIS 覆盖
-  port_check_timeout_millis: 500
+    # 服务镜像配置
+    services:
+      # RCoder 主服务配置（使用与主容器相同的镜像）
+      web-agent-runner:
+        service_type: "web-agent-runner"
+        # 🎯 使用本地构建的镜像（包含 agent-runner-start.sh 脚本）
+        image: "dev-master-rcoder:latest"
+        arm64_image: "dev-master-rcoder:latest"
+        amd64_image: "dev-master-rcoder:latest"
+        default_image: "dev-master-rcoder:latest"
+        image_tag_prefix: "dev-master-rcoder"
+        enabled: true
 
-# Agent 并发配置
-# 如果省略此配置块，将使用以下默认值：
-#   - concurrency_limit: 10 (10个并发会话)
-agent_concurrency:
-  # Agent 并发会话槽位数量
-  # 决定可以同时处理的 Agent 会话数量
-  # 有效范围: >= 1
-  # 可通过环境变量 RCODER_AGENT_CONCURRENCY_LIMIT 覆盖
-  concurrency_limit: 10
+        # rcoder 容器内用于反向解析宿主机路径的基准路径
+        workspace_resolution_path: "/app/project_workspace"
+
+        environment:
+          RUST_LOG: "debug"
+          SERVICE_MODE: "full"
+          API_PORT: "8086"
+          PROJECT_WORKSPACE_BASE: "/app/project_workspace"
+        command:
+          - "/bin/bash"
+          - "/app/agent-runner-start.sh"
+          - "/app/bin/agent_runner"
+          - "--port"
+          - "8086"
+
+        resource_limits:
+          memory_limit: 2147483648 # 2GB
+          cpu_limit: 2.0
+          swap_limit: 4294967296 # 4GB
+
+        work_dir: "/app"
+        network_mode: "bridge"
+
+        # 🎯 主挂载：项目工作目录
+        # 宿主机: /project_workspace/{project_id} → 容器: /app/project_workspace/{project_id}
+        # 注意：当 pod_id 存在时，会根据 isolation_type 动态调整挂载路径
+        #   - space: /app/project_workspace/{tenant_id}/{space_id}
+        #   - tenant: /app/project_workspace/{tenant_id}
+        #   - project: /app/project_workspace/{tenant_id}/{space_id}/{project_id}
+        mounts:
+          # - container_path: "/app/project_workspace/{project_id}"
+          #   host_path: "{resolved_path}/{project_id}"
+          #   read_only: false
+          #   mount_type: "bind"
+          #   resolve_from: "/app/project_workspace"
+          # 动态挂载：日志目录 (使用变量替换)
+          # resolve_from: 指定从哪个容器内路径解析宿主机基础路径
+          # {resolved_path}: 解析后的宿主机基础路径
+          # {log_dir_name}: 日志目录名（container_name-timestamp）
+          - container_path: "/app/logs"
+            host_path: "{resolved_path}/page-logs/{log_dir_name}"
+            read_only: false
+            mount_type: "bind"
+            resolve_from: "/app/logs"
+      # ComputerAgentRunner 服务配置
+      computer-agent-runner:
+        service_type: "computer-agent-runner"
+        # 🎯 使用本地构建的镜像（make docker-build-agent-runner 构建）
+        image: "dev-rcoder-agent-runner:latest"
+        arm64_image: "dev-rcoder-agent-runner:latest"
+        amd64_image: "dev-rcoder-agent-runner:latest"
+        default_image: "dev-rcoder-agent-runner:latest"
+        image_tag_prefix: "dev-rcoder-agent-runner"
+        enabled: true
+
+        # rcoder 容器内用于反向解析宿主机路径的基准路径
+        workspace_resolution_path: "/app/computer-project-workspace"
+
+        environment:
+          RUST_LOG: "debug"
+          SERVICE_MODE: "agent-only"
+          AGENT_PORT: "8086"
+          PROJECT_WORKSPACE_BASE: "/home/user"
+          # 🔥 Agent 清理配置（闲置超时时间，秒）
+          # 默认值: 3600 (1小时)
+          RCODER_AGENT_IDLE_TIMEOUT_SECS: "3600"
+          # 🖼️ 自定义壁纸配置
+          # 通过挂载的 /app/assets 目录使用宿主机壁纸
+          # 使用方法：在宿主机 ./wallpaper 目录放置 wallpaper.jpeg
+          # CUSTOM_WALLPAPER_PATH: "/app/assets/wallpaper.jpeg"
+
+        command:
+          - "/usr/local/bin/agent_runner"
+          - "--port"
+          - "8086"
+
+        resource_limits:
+          memory_limit: 4294967296 # 4GB
+          cpu_limit: 2.0
+          swap_limit: 8589934592 # 8GB
+
+        work_dir: "/app"
+        network_mode: "bridge"
+
+        mounts:
+          # 🎯 主挂载：用户主目录（持久化 VNC 桌面数据）
+          # 宿主机: /computer-project-workspace/{user_id} → 容器: /home/user
+          - container_path: "/home/user"
+            host_path: "{resolved_path}/{user_id}"
+            read_only: false
+            mount_type: "bind"
+            resolve_from: "/app/computer-project-workspace"
+          # 动态挂载：日志目录 (使用变量替换)
+          # resolve_from: 指定从哪个容器内路径解析宿主机基础路径
+          # {resolved_path}: 解析后的宿主机基础路径
+          # {log_dir_name}: 日志目录名（container_name-timestamp）
+          # 🔥 panic 日志也会写入此目录 (agent_runner_panic.log)
+          - container_path: "/app/container-logs"
+            host_path: "{resolved_path}/{log_dir_name}"
+            read_only: false
+            mount_type: "bind"
+            resolve_from: "/app/logs/container"
+          # 🖼️ 自定义壁纸挂载
+          # 将宿主机 ./wallpaper 目录挂载到容器内
+          # rcoder 主服务已将 wallpaper 挂载到 /app/assets
+          - container_path: "/app/assets"
+            host_path: "{resolved_path}"
+            read_only: true
+            mount_type: "bind"
+            resolve_from: "/app/assets"
+
+    # 镜像选择策略
+    selection_strategy: "ServiceOnly"
+
+    # 缓存配置
+    cache_config:
+      enabled: true
+      ttl_seconds: 3600
+      max_entries: 50
+
+  # 其他 Docker 配置
+  network_mode: "bridge"
+  # 网络基础名称（不含 project name 前缀）
+  # Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
+  # 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
+  network_base_name: "agent-network"
+  work_dir: "/app"
+  auto_cleanup: true
+  container_ttl_seconds: 3600
+
+# API Key 鉴权配置（可选）
+api_key_auth:
+  # 是否启用 API Key 鉴权（默认关闭）
+  # 启用后，所有 HTTP 请求必须携带正确的 x-api-key header
+  # 豁免端点：/health, /metrics, /api/docs, /proxy/status, /proxy/stats
+  enabled: false
+
+  # API Key 值（首次生成时自动创建随机密钥）
+  # 格式：sk-{32位十六进制字符串}
+  # 示例：sk-a1b2c3d4e5f6789012345678abcdef01
+  # 可以通过环境变量 RCODER_API_KEY 覆盖此配置
+  # 生产环境请务必修改此密钥或使用环境变量
+  api_key: "YOUR_API_KEY_HERE_CHANGE_THIS"

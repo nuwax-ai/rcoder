@@ -8,7 +8,7 @@ description.workspace = true
 publish = false
 
 [dependencies]
-shared_types = { path = "../shared_types" }
+shared_types = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }

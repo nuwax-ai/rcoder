@@ -16,6 +16,15 @@ fn default_computer_agent_runner_container_path_template() -> String {
     "/app/computer-project-workspace/{user_id}/{project_id}".to_string()
 }
 
+/// 容器工作目录的默认值
+fn default_work_dir() -> String {
+    "/app".to_string()
+}
+
+/// 容器网络模式的默认值
+fn default_network_mode() -> String {
+    "bridge".to_string()
+}
 
 /// 服务镜像配置
 ///
@@ -37,19 +46,25 @@ pub struct ServiceImageConfig {
     /// 是否启用该服务类型
     pub enabled: bool,
     /// 服务特定的环境变量
+    #[serde(default)]
     pub environment: HashMap<String, String>,
     /// 服务特定的挂载点
+    #[serde(default)]
     pub mounts: Vec<ServiceMountConfig>,
     /// 容器启动命令
+    #[serde(default)]
     pub command: Vec<String>,
     /// 容器入口点
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
     /// 容器资源限制配置
+    #[serde(default)]
     pub resource_limits: ServiceResourceLimits,
     /// 容器工作目录
+    #[serde(default = "default_work_dir")]
     pub work_dir: String,
     /// 容器网络模式
+    #[serde(default = "default_network_mode")]
     pub network_mode: String,
     /// 容器内挂载路径模板（支持变量替换）
     /// 默认值: "/app/project_workspace/{project_id}"
@@ -94,7 +109,7 @@ pub struct ServiceMountConfig {
 }
 
 /// 服务资源限制配置
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceResourceLimits {
     /// 内存限制（字节，支持浮点数输入）
     pub memory_limit: Option<f64>,
@@ -102,6 +117,12 @@ pub struct ServiceResourceLimits {
     pub cpu_limit: Option<f64>,
     /// 交换空间限制（字节，支持浮点数输入）
     pub swap_limit: Option<f64>,
+    /// PVC 存储空间大小（仅 K8s 模式生效，Docker 模式忽略）
+    ///
+    /// 格式：`<数字><单位>`，支持 Mi/Gi/Ti（二进制）和 M/G/T（十进制）
+    /// 范围：最小 1Gi，最大 100Ti，默认 50Gi
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_size: Option<String>,
 }
 
 impl ServiceResourceLimits {
@@ -143,6 +164,10 @@ impl ServiceResourceLimits {
             memory_limit: override_limits.memory_limit.or(self.memory_limit),
             cpu_limit: override_limits.cpu_limit.or(self.cpu_limit),
             swap_limit: override_limits.swap_limit.or(self.swap_limit),
+            storage_size: override_limits
+                .storage_size
+                .clone()
+                .or_else(|| self.storage_size.clone()),
         }
     }
 }
@@ -164,37 +189,54 @@ impl ServiceImageConfig {
             && self.amd64_image.is_none()
             && self.default_image.is_none()
         {
+            tracing::error!(
+                "[CONFIG_VALIDATION] Service type {} has no image configured! \
+                 image={:?}, arm64_image={:?}, amd64_image={:?}, default_image={:?}, \
+                 image_tag_prefix={:?}, enabled={}",
+                self.service_type,
+                self.image,
+                self.arm64_image,
+                self.amd64_image,
+                self.default_image,
+                self.image_tag_prefix,
+                self.enabled
+            );
             return ConfigValidationResult::Error(format!(
-                "Service type {} must have at least one image configured",
-                self.service_type
+                "Service type {} must have at least one image configured (image={:?}, arm64={:?}, amd64={:?}, default={:?})",
+                self.service_type,
+                self.image,
+                self.arm64_image,
+                self.amd64_image,
+                self.default_image
             ));
         }
 
         // 验证镜像名称格式
-        for image_name in [
+        for image in [
             &self.image,
             &self.arm64_image,
             &self.amd64_image,
             &self.default_image,
-        ] {
-            if let Some(image) = image_name {
-                if image.trim().is_empty() {
-                    return ConfigValidationResult::Warning(format!(
-                        "Service type {} has empty image name",
-                        self.service_type
-                    ));
-                }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if image.trim().is_empty() {
+                return ConfigValidationResult::Warning(format!(
+                    "Service type {} has empty image name",
+                    self.service_type
+                ));
+            }
 
-                // 验证镜像名称格式（简单的格式检查）
-                if !image
-                    .chars()
-                    .all(|c: char| c.is_alphanumeric() || "/:.-_".contains(c))
-                {
-                    return ConfigValidationResult::Warning(format!(
-                        "Service type {} image name '{}' may contain invalid characters",
-                        self.service_type, image
-                    ));
-                }
+            // 验证镜像名称格式（简单的格式检查）
+            if !image
+                .chars()
+                .all(|c: char| c.is_alphanumeric() || "/:.-_".contains(c))
+            {
+                return ConfigValidationResult::Warning(format!(
+                    "Service type {} image name '{}' may contain invalid characters",
+                    self.service_type, image
+                ));
             }
         }
 
@@ -309,12 +351,12 @@ impl ServiceImageConfig {
     /// 优先使用显式配置的 workspace_resolution_path，
     /// 未配置时根据 service_type 使用默认值。
     pub fn effective_workspace_resolution_path(&self) -> String {
-        self.workspace_resolution_path.clone().unwrap_or_else(|| {
-            match self.service_type {
-                ServiceType::RCoder => "/app/project_workspace".to_string(),
+        self.workspace_resolution_path
+            .clone()
+            .unwrap_or_else(|| match self.service_type {
+                ServiceType::WebAgentRunner => "/app/project_workspace".to_string(),
                 ServiceType::ComputerAgentRunner => "/app/computer-project-workspace".to_string(),
-            }
-        })
+            })
     }
 
     /// 获取 workspace 在 sub-container 内的挂载路径
@@ -368,7 +410,9 @@ impl ServiceMountConfig {
     /// 验证挂载点配置
     pub fn validate(&self) -> ConfigValidationResult {
         if self.container_path.trim().is_empty() {
-            return ConfigValidationResult::Error("Container mount path cannot be empty".to_string());
+            return ConfigValidationResult::Error(
+                "Container mount path cannot be empty".to_string(),
+            );
         }
 
         if self.host_path.trim().is_empty() {
@@ -435,15 +479,16 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
         memory_limit: Some(2_000_000_000.0), // 2GB
         cpu_limit: Some(2.0),                // 2 核
         swap_limit: Some(4_000_000_000.0),   // 4GB
+        storage_size: None,                  // K8s 模式下使用默认值 10Gi
     };
 
     ServiceImageConfig {
-        service_type: ServiceType::RCoder,
-        image: None, // 使用架构特定镜像
-        arm64_image: Some("registry.yichamao.com/rcoder:latest-arm64".to_string()),
-        amd64_image: Some("registry.yichamao.com/rcoder:latest-amd64".to_string()),
-        default_image: Some("registry.yichamao.com/rcoder:latest".to_string()),
-        image_tag_prefix: Some("rcoder-agent".to_string()),
+        service_type: ServiceType::WebAgentRunner,
+        image: None,         // 使用架构特定镜像
+        arm64_image: None,   // 从配置文件加载
+        amd64_image: None,   // 从配置文件加载
+        default_image: None, // 从配置文件加载
+        image_tag_prefix: Some("web-agent-runner".to_string()),
         enabled: true, // 当前启用
         environment,
         mounts,
@@ -463,7 +508,10 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
     environment.insert("RUST_LOG".to_string(), "debug".to_string());
     environment.insert("SERVICE_MODE".to_string(), "agent-only".to_string());
     environment.insert("AGENT_PORT".to_string(), "8086".to_string());
-    environment.insert("PROJECT_WORKSPACE_BASE".to_string(), "/home/user".to_string());
+    environment.insert(
+        "PROJECT_WORKSPACE_BASE".to_string(),
+        "/home/user".to_string(),
+    );
 
     // 🔥 Agent 清理配置（通过环境变量控制）
     // 设置为 3600 秒（1小时），用户可以在 docker/config.yml 中覆盖此值
@@ -486,21 +534,16 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
         memory_limit: Some(4_000_000_000.0), // 4GB
         cpu_limit: Some(3.0),                // 3 核
         swap_limit: Some(8_000_000_000.0),   // 8GB
+        storage_size: None,                  // K8s 模式下使用默认值 10Gi
     };
 
     ServiceImageConfig {
         service_type: ServiceType::ComputerAgentRunner,
-        image: None, // 使用架构特定镜像
-        arm64_image: Some(
-            "registry.yichamao.com/rcoder-computer-agent-runner:latest-arm64".to_string(),
-        ),
-        amd64_image: Some(
-            "registry.yichamao.com/rcoder-computer-agent-runner:latest-amd64".to_string(),
-        ),
-        default_image: Some(
-            "registry.yichamao.com/rcoder-computer-agent-runner:latest".to_string(),
-        ),
-        image_tag_prefix: Some("rcoder-computer-agent-runner".to_string()),
+        image: None,         // 使用架构特定镜像
+        arm64_image: None,   // 从配置文件加载
+        amd64_image: None,   // 从配置文件加载
+        default_image: None, // 从配置文件加载
+        image_tag_prefix: Some("computer-agent-runner".to_string()),
         enabled: true, // 当前启用
         environment,
         mounts,
@@ -519,7 +562,11 @@ mod tests {
     use super::*;
     #[test]
     fn test_config_validation() {
-        let config = default_rcoder_service_config();
+        let mut config = default_rcoder_service_config();
+
+        // 为测试设置镜像配置
+        config.arm64_image = Some("test-image:arm64".to_string());
+        config.amd64_image = Some("test-image:amd64".to_string());
 
         // 有效配置
         assert!(matches!(config.validate(), ConfigValidationResult::Valid));
@@ -556,7 +603,7 @@ mod tests {
     fn test_mount_validation() {
         // 创建一个有挂载点的配置用于测试
         let config_with_mounts = ServiceImageConfig {
-            service_type: ServiceType::RCoder,
+            service_type: ServiceType::WebAgentRunner,
             image: None,
             arm64_image: Some("test-image:arm64".to_string()),
             amd64_image: Some("test-image:amd64".to_string()),
@@ -577,6 +624,7 @@ mod tests {
                 memory_limit: None,
                 cpu_limit: None,
                 swap_limit: None,
+                storage_size: None,
             },
             work_dir: "/app".to_string(),
             network_mode: "bridge".to_string(),
@@ -620,16 +668,16 @@ mod tests {
         let config = default_rcoder_service_config();
         let summary = config.get_summary();
 
-        assert!(summary.contains("rcoder"));
+        assert!(summary.contains("web-agent-runner"));
         assert!(summary.contains("Enabled: true"));
-        assert!(summary.contains("registry.yichamao.com/rcoder"));
+        // 镜像配置为空时，summary 不包含镜像地址
     }
 
     #[test]
     fn test_container_prefix_with_image_tag_prefix() {
         // 测试使用 image_tag_prefix 的情况
         let config = default_agent_runner_service_config();
-        assert_eq!(config.container_prefix(), "rcoder-computer-agent-runner");
+        assert_eq!(config.container_prefix(), "computer-agent-runner");
     }
 
     #[test]
@@ -637,21 +685,21 @@ mod tests {
         // 测试没有 image_tag_prefix 时回退到 service_type 默认值
         let mut config = default_rcoder_service_config();
         config.image_tag_prefix = None;
-        assert_eq!(config.container_prefix(), "rcoder-agent");
+        assert_eq!(config.container_prefix(), "web-agent-runner");
     }
 
     #[test]
     fn test_container_prefix_rcoder() {
-        // RCoder 配置使用 rcoder-agent 前缀
+        // WebAgentRunner 配置使用 web-agent-runner 前缀
         let config = default_rcoder_service_config();
-        assert_eq!(config.container_prefix(), "rcoder-agent");
+        assert_eq!(config.container_prefix(), "web-agent-runner");
     }
 
     /// 测试 ServiceType::container_prefix() 与 ServiceConfig::container_prefix() 的差异
     ///
     /// 这是导致 VNC 状态查询返回 CONTAINER_NOT_FOUND 的根因：
     /// - ServiceType::container_prefix() 返回硬编码的 "computer-agent-runner"
-    /// - ServiceConfig::container_prefix() 读取配置的 image_tag_prefix "rcoder-computer-agent-runner"
+    /// - ServiceConfig::container_prefix() 读取配置的 image_tag_prefix "computer-agent-runner"
     /// - 容器创建使用后者，而错误的查询代码使用前者，导致名称不匹配
     #[test]
     fn test_container_prefix_difference_causes_container_not_found() {
@@ -662,27 +710,19 @@ mod tests {
         // 配置化的 ServiceConfig 前缀（正确的创建方式）
         let config = default_agent_runner_service_config();
         let config_prefix = config.container_prefix();
-        assert_eq!(config_prefix, "rcoder-computer-agent-runner");
+        assert_eq!(config_prefix, "computer-agent-runner");
 
-        // 明确展示差异：两者不同！
-        assert_ne!(
+        // 两者应该相同
+        assert_eq!(
             service_type_prefix, config_prefix,
-            "ServiceType::container_prefix() 与 ServiceConfig::container_prefix() 应该不同"
+            "ServiceType::container_prefix() 与 ServiceConfig::container_prefix() 应该相同"
         );
 
         // 展示如果用错误的前缀构造容器名会导致什么问题
         let user_id = "1743762321";
-        let wrong_container_name = format!("{}-{}", service_type_prefix, user_id);
-        let correct_container_name = format!("{}-{}", config_prefix, user_id);
+        let container_name = format!("{}-{}", service_type_prefix, user_id);
 
-        assert_eq!(wrong_container_name, "computer-agent-runner-1743762321");
-        assert_eq!(
-            correct_container_name,
-            "rcoder-computer-agent-runner-1743762321"
-        );
-
-        // 如果用错误的名字去查询，当然找不到正确名字创建的容器
-        assert_ne!(wrong_container_name, correct_container_name);
+        assert_eq!(container_name, "computer-agent-runner-1743762321");
     }
 
     #[test]
@@ -691,6 +731,7 @@ mod tests {
             memory_limit: Some(1_000_000_000.0), // 1GB
             cpu_limit: Some(2.0),
             swap_limit: Some(2_000_000_000.0), // 2GB
+            storage_size: None,
         };
         assert!(valid.validate().is_ok());
     }
@@ -701,6 +742,7 @@ mod tests {
             memory_limit: Some(256_000_000.0), // 256MB - 太小
             cpu_limit: None,
             swap_limit: None,
+            storage_size: None,
         };
         assert!(invalid.validate().is_err());
         assert!(invalid.validate().unwrap_err().contains("at least 512MB"));
@@ -712,6 +754,7 @@ mod tests {
             memory_limit: Some(100_000_000_000.0), // 100GB - 太大
             cpu_limit: None,
             swap_limit: None,
+            storage_size: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -728,6 +771,7 @@ mod tests {
             memory_limit: None,
             cpu_limit: Some(0.1), // 太小
             swap_limit: None,
+            storage_size: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -744,6 +788,7 @@ mod tests {
             memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: None,
             swap_limit: Some(1_000_000_000.0), // 1GB - swap < memory
+            storage_size: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -760,18 +805,21 @@ mod tests {
             memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: Some(2.0),
             swap_limit: Some(4_000_000_000.0), // 4GB
+            storage_size: None,
         };
 
         let override_limits = ServiceResourceLimits {
             memory_limit: Some(4_000_000_000.0), // 覆盖：4GB
             cpu_limit: None,                     // 不覆盖
             swap_limit: Some(8_000_000_000.0),   // 覆盖：8GB
+            storage_size: Some("20Gi".to_string()),
         };
 
         let merged = default_limits.merge_with(&override_limits);
         assert_eq!(merged.memory_limit, Some(4_000_000_000.0));
         assert_eq!(merged.cpu_limit, Some(2.0)); // 保留默认
         assert_eq!(merged.swap_limit, Some(8_000_000_000.0));
+        assert_eq!(merged.storage_size, Some("20Gi".to_string()));
     }
 
     #[test]
@@ -780,12 +828,14 @@ mod tests {
             memory_limit: Some(2_000_000_000.0), // 2GB
             cpu_limit: Some(2.0),
             swap_limit: Some(4_000_000_000.0), // 4GB
+            storage_size: Some("10Gi".to_string()),
         };
 
         let override_limits = ServiceResourceLimits {
             memory_limit: None,
             cpu_limit: None,
             swap_limit: None,
+            storage_size: None,
         };
 
         let merged = default_limits.merge_with(&override_limits);
@@ -793,20 +843,27 @@ mod tests {
         assert_eq!(merged.memory_limit, Some(2_000_000_000.0));
         assert_eq!(merged.cpu_limit, Some(2.0));
         assert_eq!(merged.swap_limit, Some(4_000_000_000.0));
+        assert_eq!(merged.storage_size, Some("10Gi".to_string()));
     }
 
     #[test]
     fn test_workspace_resolution_path_rcoder() {
         let config = default_rcoder_service_config();
         // 未显式配置时，从 container_path_template 推导
-        assert_eq!(config.effective_workspace_resolution_path(), "/app/project_workspace");
+        assert_eq!(
+            config.effective_workspace_resolution_path(),
+            "/app/project_workspace"
+        );
     }
 
     #[test]
     fn test_workspace_resolution_path_computer_agent_runner() {
         let config = default_agent_runner_service_config();
         // 未显式配置时，从 container_path_template 推导
-        assert_eq!(config.effective_workspace_resolution_path(), "/app/computer-project-workspace");
+        assert_eq!(
+            config.effective_workspace_resolution_path(),
+            "/app/computer-project-workspace"
+        );
     }
 
     #[test]
@@ -835,6 +892,9 @@ mod tests {
         let mut config = default_rcoder_service_config();
         config.environment.remove("PROJECT_WORKSPACE_BASE");
         // 无环境变量时回退到 effective_workspace_resolution_path
-        assert_eq!(config.workspace_container_path(), config.effective_workspace_resolution_path());
+        assert_eq!(
+            config.workspace_container_path(),
+            config.effective_workspace_resolution_path()
+        );
     }
 }

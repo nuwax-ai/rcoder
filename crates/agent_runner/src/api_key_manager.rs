@@ -3,6 +3,9 @@
 //! 在内存中存储 API 密钥配置，支持通过服务名称快速查询。
 //! 密钥配置通过 gRPC 从 rcoder 主服务传递到 agent_runner。
 //!
+//! 注意：当前 manager 由 binary 通过 gRPC 处理流程注入，lib 内部不直接调用
+//! get/store/remove 等方法，故抑制 dead_code 警告。
+//!
 //! ## 使用示例
 //!
 //! ```rust
@@ -20,6 +23,7 @@
 //!     requires_openai_auth: false,
 //!     default_model: "claude-3-5-sonnet-20241022".to_string(),
 //!     api_protocol: Some("anthropic".to_string()),
+//!     wire_api: None,
 //! };
 //! manager.store_config("anthropic", config);
 //!
@@ -28,6 +32,8 @@
 //!     println!("API Key: {}", key);
 //! }
 //! ```
+
+#![allow(dead_code)]
 
 use dashmap::DashMap;
 use shared_types::ModelProviderConfig;
@@ -118,6 +124,7 @@ impl ApiKeyManager {
     ///     requires_openai_auth: false,
     ///     default_model: "claude-3-5-sonnet-20241022".to_string(),
     ///     api_protocol: Some("anthropic".to_string()),
+    ///     wire_api: None,
     /// };
     /// manager.store_config("svc-uuid-123", config);
     /// ```
@@ -141,7 +148,7 @@ impl ApiKeyManager {
     ///
     /// 如果找到配置则返回 `Some(ModelProviderConfig)`，否则返回 `None`。
     pub fn get(&self, service_name: &str) -> Option<ModelProviderConfig> {
-        self.shared.get(service_name).map(|r| r.value().clone())
+        self.shared.view(service_name, |_, config| config.clone())
     }
 
     /// 获取 API 密钥
@@ -191,7 +198,7 @@ impl ApiKeyManager {
 
     /// 清空所有配置
     pub fn clear(&self) {
-        info!("🔑 [API_KEY_MANAGER] Cleared all configs");
+        info!("[API_KEY_MANAGER] Cleared all configs");
         self.shared.clear();
     }
 
@@ -219,6 +226,7 @@ mod tests {
             requires_openai_auth: name == "openai",
             default_model: "test-model".to_string(),
             api_protocol: Some(name.to_string()),
+            wire_api: None,
         }
     }
 

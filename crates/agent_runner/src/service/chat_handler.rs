@@ -8,22 +8,23 @@
 //! - **DashMap Entry API**: 避免读写锁竞态条件
 //! - **Fail Fast**: 尽早暴露问题，便于定位修复
 
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_client_protocol::schema::v1::{CancelNotification, SessionId};
 use dashmap::DashMap;
 use shared_types::{
     Attachment, CancelNotificationRequestWrapper, CancelResult, ChatAgentConfig, ChatPromptBuilder,
     ModelProviderConfig, ServiceType, error_codes,
 };
-use agent_client_protocol::schema::{CancelNotification, SessionId};
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::AgentRuntime;
-use crate::agent_runtime::WorkerState;
-use crate::proxy_agent::AgentRequest;
-use crate::service::{AGENT_REGISTRY, PendingGuard, SESSION_CACHE};
+use crate::service::{
+    AGENT_REGISTRY, AgentRequest, AgentSessionService, PendingGuard, SESSION_CACHE,
+};
 
 /// Chat Handler 输入参数
 ///
@@ -48,14 +49,20 @@ pub struct ChatHandlerInput {
     pub model_config: Option<ModelProviderConfig>,
     /// 服务类型
     pub service_type: ServiceType,
+    /// 用户 ID（ComputerAgentRunner 模式使用）
+    pub user_id: Option<String>,
     /// Agent 配置覆盖（可选）
     pub agent_config_override: Option<ChatAgentConfig>,
     /// 系统提示覆盖（可选）
     pub system_prompt_override: Option<String>,
     /// 用户提示模板覆盖（可选）
     pub user_prompt_template_override: Option<String>,
-    /// 是否跳过槽位限制（HTTP Server 宿主机部署时为 true）
-    pub skip_slot_limit: bool,
+    /// 是否是 DevComputer 接口请求
+    ///
+    /// 用于 `{PREFIX_WORKSPACE_DIR}` 变量解析：
+    /// - `true`：LOG_DIR 解析为 `/home/user/`
+    /// - `false`：LOG_DIR 解析为 `/app/container-logs`
+    pub is_devcomputer: bool,
 }
 
 /// Chat Handler 输出结果
@@ -79,6 +86,10 @@ pub struct ChatHandlerOutput {
     pub need_fallback: bool,
     /// 降级原因（可选）
     pub fallback_reason: Option<String>,
+    /// 是否触发了 agent 二进制热重载
+    pub reloaded: bool,
+    /// agent 版本号（可选，检测失败时为 None）
+    pub agent_version: Option<String>,
 }
 
 impl ChatHandlerOutput {
@@ -98,6 +109,8 @@ impl ChatHandlerOutput {
             request_id: None,
             need_fallback: false,
             fallback_reason: None,
+            reloaded: false,
+            agent_version: None,
         }
     }
 
@@ -112,6 +125,8 @@ impl ChatHandlerOutput {
             request_id: None,
             need_fallback: false,
             fallback_reason: None,
+            reloaded: false,
+            agent_version: None,
         }
     }
 }
@@ -120,8 +135,8 @@ impl ChatHandlerOutput {
 ///
 /// 包含处理 chat 请求所需的运行时依赖
 pub struct ChatHandlerContext {
-    /// Agent 运行时
-    pub agent_runtime: Arc<AgentRuntime>,
+    /// Agent 会话服务
+    pub agent_session_service: Arc<AgentSessionService>,
     /// 共享的 API 密钥管理器
     pub shared_api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
     /// project_id -> UUID 映射
@@ -317,41 +332,79 @@ pub async fn handle_chat_core(
         AGENT_REGISTRY.get_agent_info(&project_id)
     });
 
-    // ========== 步骤2: 检查 Agent Busy 状态，如果忙则取消当前任务 ==========
-    use crate::model::AgentStatus;
-    if let Some(agent_info) = agent_info_ref {
-        if agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending {
-            info!(
-                "[ChatHandler] Agent Busy, cancelling current task: project_id={}, status={:?}, session_id={:?}",
-                project_id, agent_info.status, session_id
-            );
-
-            // 获取 cancel_tx 和 session_id，并释放 DashMap 读锁（防死锁）
-            let cancel_tx = agent_info.cancel_tx.clone();
-            // 优先使用请求中的 session_id，如果为空则从 agent_info 中获取
-            let actual_session_id = session_id
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| agent_info.session_id.to_string());
-            drop(agent_info);
-
-            // 取消当前任务
-            if let Err(cancel_error) =
-                cancel_current_task(&cancel_tx, &actual_session_id, &project_id).await
-            {
-                // 取消失败，返回错误
-                error!(
-                    "[ChatHandler] Failed to cancel current task: project_id={}, error={:?}",
-                    project_id, cancel_error
-                );
-                return cancel_error;
+    // ========== 步骤1.5: 检查 agent 二进制是否存在 + 版本检测 ==========
+    use crate::agent_mgmt::checker;
+    let agent_version = if let Some(ref agent_config) = input.agent_config_override {
+        if let Some(ref server) = agent_config.agent_server {
+            if let Some(ref command) = server.command {
+                if let Err(e) = checker::check_agent_exists(command) {
+                    error!("[ChatHandler] Agent not found: {}", e);
+                    return ChatHandlerOutput::error(
+                        project_id,
+                        session_id.unwrap_or_default(),
+                        e,
+                        error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
+                    );
+                }
+                checker::get_agent_version(command).await
+            } else {
+                None
             }
-
-            info!(
-                "[ChatHandler] Current task cancelled, proceeding with new request: project_id={}",
-                project_id
+        } else {
+            None
+        }
+    } else {
+        // 默认 agent
+        if let Err(e) = checker::check_agent_exists(shared_types::DEFAULT_AGENT_ID) {
+            error!("[ChatHandler] Default agent not found: {}", e);
+            return ChatHandlerOutput::error(
+                project_id,
+                session_id.unwrap_or_default(),
+                e,
+                error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
             );
         }
+        checker::get_agent_version(shared_types::DEFAULT_AGENT_ID).await
+    };
+    if let Some(ref v) = agent_version {
+        info!("[ChatHandler] Agent version detected: {}", v);
+    }
+
+    // ========== 步骤2: 检查 Agent Busy 状态，如果忙则取消当前任务 ==========
+    use crate::model::AgentStatus;
+    if let Some(agent_info) = agent_info_ref
+        && (agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending)
+    {
+        info!(
+            "[ChatHandler] Agent Busy, cancelling current task: project_id={}, status={:?}, session_id={:?}",
+            project_id, agent_info.status, session_id
+        );
+
+        // 获取 cancel_tx 和 session_id，并释放 DashMap 读锁（防死锁）
+        let cancel_tx = agent_info.cancel_tx.clone();
+        // 优先使用请求中的 session_id，如果为空则从 agent_info 中获取
+        let actual_session_id = session_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| agent_info.session_id.to_string());
+        drop(agent_info);
+
+        // 取消当前任务
+        if let Err(cancel_error) =
+            cancel_current_task(&cancel_tx, &actual_session_id, &project_id).await
+        {
+            // 取消失败，返回错误
+            error!(
+                "[ChatHandler] Failed to cancel current task: project_id={}, error={:?}",
+                project_id, cancel_error
+            );
+            return cancel_error;
+        }
+
+        info!(
+            "[ChatHandler] Current task cancelled, proceeding with new request: project_id={}",
+            project_id
+        );
     }
 
     // ========== 步骤3: 创建 PendingGuard（RAII）==========
@@ -366,14 +419,121 @@ pub async fn handle_chat_core(
     // 只在 session 不存在时才清理无效的 session_id
     if let Some(ref sid) = session_id {
         let session_exists = AGENT_REGISTRY.contains_session(sid);
+        info!(
+            "[ChatHandler] Step 4: session_id={}, session_exists_in_registry={}",
+            sid, session_exists
+        );
 
         if !session_exists && SESSION_CACHE.remove(sid).is_some() {
             info!(
-                "[ChatHandler] session does not exist, removing invalid session: session_id={}",
+                "[ChatHandler] session does not exist in registry, removed from SESSION_CACHE: session_id={}",
                 sid
             );
         } else if session_exists {
             info!("[ChatHandler] Reusing existing session: session_id={}", sid);
+            // 🧹 清空 ring buffer，防止回放过期的历史消息
+            // view() 在闭包返回后立即释放锁，无 Ref 暴露
+            if let Some(sd) = SESSION_CACHE.view(sid, |_, d| d.clone()) {
+                info!(
+                    "[ChatHandler] SESSION_CACHE found for session_id={}, attempting to clear ring buffer",
+                    sid
+                );
+                let cleared = sd.clear_message_buffer().await;
+                if cleared > 0 {
+                    info!(
+                        "[ChatHandler] Cleared {} stale messages from ring buffer for new conversation: session_id={}",
+                        cleared, sid
+                    );
+                } else {
+                    info!(
+                        "[ChatHandler] Ring buffer already empty for session_id={}",
+                        sid
+                    );
+                }
+            } else {
+                info!(
+                    "[ChatHandler] SESSION_CACHE not found for session_id={}",
+                    sid
+                );
+            }
+        }
+    } else {
+        info!("[ChatHandler] Step 4: session_id is None, skipping clear logic");
+    }
+
+    // ========== 步骤 4.5: Auto-Reload 检测（简化版） ==========
+    // 当 auto_reload.enabled=true 时，强制重启 ACP agent 进程。
+    // 重启后传入 resume_session_id 尝试恢复历史上下文。
+    let mut was_reloaded = false;
+    let mut old_session_id_for_resume = None;
+
+    if let Some(agent_config) = &input.agent_config_override
+        && let Some(auto_reload_config) = &agent_config.auto_reload
+        && auto_reload_config.enabled
+        && let Some(agent_server) = &agent_config.agent_server
+        && let Some(_command) = agent_server.command.as_deref()
+    {
+        // Re-lookup from registry (original binding may have been consumed in Step 2)
+        let agent_info_for_reload = AGENT_REGISTRY.get_agent_info(&project_id);
+
+        if let Some(agent_info) = agent_info_for_reload {
+            // Extract needed data, then IMMEDIATELY drop Ref before .await
+            let stop_handle = agent_info.stop_handle.clone();
+            let old_session_id = agent_info.session_id.to_string();
+            drop(agent_info); // Release DashMap read lock BEFORE .await
+
+            // 保存旧 session_id 用于 resume
+            if !old_session_id.is_empty() {
+                old_session_id_for_resume = Some(old_session_id.clone());
+            }
+
+            info!(
+                "[ChatHandler] Auto-reload: forcing restart, project_id={}, old_session_id={}",
+                project_id, old_session_id
+            );
+
+            // 1. Stop old agent subprocess
+            if let Some(handle) = &stop_handle
+                && let Err(e) = handle.graceful_stop().await
+            {
+                warn!(
+                    "[ChatHandler] graceful_stop failed during reload: {}, forcing cancel",
+                    e
+                );
+                handle.cancel(); // CancellationToken fallback — infallible, no process signal dependency
+            }
+
+            // 2. Remove from AGENT_REGISTRY
+            AGENT_REGISTRY.remove_by_project(&project_id);
+
+            // 3. Notify SSE stream + clean SESSION_CACHE
+            if !old_session_id.is_empty() {
+                use crate::service::push_session_update_with_project;
+                use agent_client_protocol::schema::v1::StopReason;
+                use shared_types::{SessionNotify, SessionPromptEnd};
+
+                let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                    session_id: old_session_id.clone(),
+                    stop_reason: StopReason::EndTurn,
+                    error_message: Some("Auto-reload: restarting agent".into()),
+                    request_id: None,
+                });
+                let _ =
+                    push_session_update_with_project(&project_id, &old_session_id, notify).await;
+
+                // view() 在闭包返回后立即释放锁，无 Ref 暴露
+                if let Some(sd) = SESSION_CACHE.view(&old_session_id, |_, d| d.clone()) {
+                    sd.close_current_connection().await;
+                }
+                SESSION_CACHE.remove(&old_session_id);
+            }
+
+            was_reloaded = true;
+            info!(
+                "[ChatHandler] Auto-reload complete, will create new session: \
+                 project_id={}, resume_session_id={:?}",
+                project_id, old_session_id_for_resume
+            );
         }
     }
 
@@ -385,35 +545,46 @@ pub async fn handle_chat_core(
     );
 
     // 确保目录存在
-    if !project_dir.exists() {
-        if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
-            error!("[ChatHandler] Failed to create project directory: {}", e);
-            return ChatHandlerOutput::error(
-                project_id,
-                session_id.unwrap_or_default(),
-                format!(
-                    "{}: {}",
-                    error_codes::get_i18n_message_default("error.create_project_dir_failed"),
-                    e
-                ),
-                error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-            );
-        }
+    if !project_dir.exists()
+        && let Err(e) = tokio::fs::create_dir_all(&project_dir).await
+    {
+        error!("[ChatHandler] Failed to create project directory: {}", e);
+        return ChatHandlerOutput::error(
+            project_id,
+            session_id.unwrap_or_default(),
+            format!(
+                "{}: {}",
+                error_codes::get_i18n_message_default("error.create_project_dir_failed"),
+                e
+            ),
+            error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
+        );
     }
 
     // ========== 步骤6: 构建 ChatPrompt 和 PromptMessage ==========
+
+    // 如果是 auto_reload 重启，使用旧 session_id 作为 resume_session_id
+    let session_id_for_prompt = if was_reloaded {
+        old_session_id_for_resume.clone()
+    } else {
+        session_id.clone()
+    };
+
     let chat_prompt = match ChatPromptBuilder::default()
         .project_id(project_id.clone())
         .project_path(project_dir)
-        .session_id(session_id.clone())
+        .session_id(session_id_for_prompt)
         .prompt(input.prompt)
         .attachments(input.attachments)
         .data_source_attachments(input.data_source_attachments)
         .service_type(input.service_type)
+        .user_id(input.user_id)
         .request_id(request_id.clone())
+        .model_provider(input.model_config.clone())
         .system_prompt_override(input.system_prompt_override)
         .user_prompt_template_override(input.user_prompt_template_override)
         .agent_config_override(input.agent_config_override)
+        .is_devcomputer(input.is_devcomputer)
         .build()
     {
         Ok(prompt) => prompt,
@@ -446,7 +617,7 @@ pub async fn handle_chat_core(
     };
 
     // 存储 API 配置到共享 DashMap
-    if let (Some(ref provider), Some(ref service_uuid_ref)) =
+    if let (Some(provider), Some(ref service_uuid_ref)) =
         (model_provider.as_ref(), service_uuid.as_ref())
     {
         debug!(
@@ -462,7 +633,7 @@ pub async fn handle_chat_core(
         // 存储 ModelProviderConfig 到共享 DashMap（使用 UUID 作为 key）
         context
             .shared_api_key_manager
-            .insert(service_uuid_ref.to_string(), (*provider).clone());
+            .insert(service_uuid_ref.to_string(), provider.clone());
 
         // 存储 project_id -> UUID 映射（用于后续清理时查找）
         context
@@ -479,51 +650,19 @@ pub async fn handle_chat_core(
         warn!("[ChatHandler] No model config provided; falling back to env vars or defaults");
     }
 
-    // ========== 步骤8: 检查 Worker 状态 ==========
-    match context.agent_runtime.state() {
-        WorkerState::Running => {
-            // 正常操作，继续处理
-        }
-        WorkerState::Starting => {
-            warn!("[ChatHandler] Agent Worker is starting; request may be delayed");
-        }
-        WorkerState::Stopping | WorkerState::Stopped => {
-            // PendingGuard 自动清理（在 drop 时）
-            error!("[ChatHandler] Agent Worker unavailable");
-            return ChatHandlerOutput::error(
-                project_id,
-                session_id.unwrap_or_default(),
-                error_codes::get_i18n_message_default("error.agent_worker_unavailable"),
-                error_codes::ERR_SERVICE_UNAVAILABLE.to_string(),
-            );
-        }
-    }
-
-    // ========== 步骤9: 发送任务到 Agent Worker ==========
+    // ========== 步骤8: 直接调用 Agent 会话服务 ==========
     // 创建请求并设置 UUID 和密钥管理器
-    let (agent_request, chat_prompt_rx) = AgentRequest::new(prompt_message, model_provider);
-    let agent_request = agent_request
+    let agent_request = AgentRequest::new(prompt_message, model_provider)
         .with_service_uuid(service_uuid)
-        .with_key_manager(Some(context.shared_api_key_manager.clone()))
-        .with_skip_slot_limit(input.skip_slot_limit);
+        .with_key_manager(Some(context.shared_api_key_manager.clone()));
 
-    if let Err(e) = context.agent_runtime.send(agent_request).await {
-        // PendingGuard 自动清理（在 drop 时）
-        error!("[ChatHandler] Failed to send task: {}", e);
-        return ChatHandlerOutput::error(
-            project_id,
-            session_id.unwrap_or_default(),
-            format!(
-                "{}: {}",
-                error_codes::get_i18n_message_default("error.send_task_failed"),
-                e
-            ),
-            error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-        );
-    }
-
-    // ========== 步骤10: 等待响应（5 分钟超时）==========
-    match tokio::time::timeout(std::time::Duration::from_secs(300), chat_prompt_rx).await {
+    // ========== 步骤9: 等待响应（5 分钟超时）==========
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        context.agent_session_service.process_request(agent_request),
+    )
+    .await
+    {
         Ok(Ok(response)) => {
             let output = ChatHandlerOutput {
                 project_id: response.project_id,
@@ -538,11 +677,13 @@ pub async fn handle_chat_core(
                 request_id: Some(request_id),
                 need_fallback: false,
                 fallback_reason: None,
+                reloaded: was_reloaded,
+                agent_version,
             };
 
             info!(
-                "[ChatHandler] Chat completed: success={}, session_id={}",
-                output.success, output.session_id
+                "[ChatHandler] Chat completed: success={}, session_id={}, reloaded={}",
+                output.success, output.session_id, output.reloaded
             );
 
             // 只有请求成功时才提交 PendingGuard 保留 Pending 状态
@@ -555,7 +696,7 @@ pub async fn handle_chat_core(
         }
         Ok(Err(e)) => {
             // PendingGuard 自动清理（在 drop 时）
-            error!("[ChatHandler] Chat response channel dropped: {}", e);
+            error!("[ChatHandler] Agent session processing failed: {}", e);
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
@@ -569,7 +710,10 @@ pub async fn handle_chat_core(
         }
         Err(_elapsed) => {
             // PendingGuard 自动清理（在 drop 时）
-            error!("[ChatHandler] ⏰ Chat request timeout (300s): project_id={}", project_id);
+            error!(
+                "[ChatHandler] ⏰ Chat request timeout (300s): project_id={}",
+                project_id
+            );
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),

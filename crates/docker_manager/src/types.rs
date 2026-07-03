@@ -94,8 +94,8 @@ impl DockerContainerConfig {
     /// use docker_manager::DockerContainerConfig;
     /// use shared_types::ServiceType;
     ///
-    /// let config = DockerContainerConfig::new_for_service(ServiceType::RCoder);
-    /// assert_eq!(config.name_prefix, "rcoder-agent");
+    /// let config = DockerContainerConfig::new_for_service(ServiceType::WebAgentRunner);
+    /// assert_eq!(config.name_prefix, "web-agent-runner");
     ///
     /// let config = DockerContainerConfig::new_for_service(ServiceType::ComputerAgentRunner);
     /// assert_eq!(config.name_prefix, "computer-agent-runner");
@@ -129,7 +129,7 @@ impl DockerContainerConfig {
 impl Default for DockerContainerConfig {
     fn default() -> Self {
         // 默认使用 RCoder 服务
-        Self::new_for_service(shared_types::ServiceType::RCoder)
+        Self::new_for_service(shared_types::ServiceType::WebAgentRunner)
     }
 }
 
@@ -149,6 +149,8 @@ pub struct ContainerQueryResult {
     pub is_running: bool,
     /// 容器 IP 地址（用于 gRPC 健康检查）
     pub container_ip: String,
+    /// 容器创建时间
+    pub created_at: DateTime<Utc>,
 }
 
 /// 容器实时查询结果的 Arc 包装（用于缓存）
@@ -162,6 +164,7 @@ impl ContainerQueryResult {
         status: ContainerStatus,
         is_running: bool,
         container_ip: String,
+        created_at: DateTime<Utc>,
     ) -> Self {
         Self {
             container_id,
@@ -169,6 +172,7 @@ impl ContainerQueryResult {
             status,
             is_running,
             container_ip,
+            created_at,
         }
     }
 
@@ -179,7 +183,8 @@ impl ContainerQueryResult {
             container_name: tuple.1,
             status: tuple.2,
             is_running: tuple.3,
-            container_ip: String::new(), // 默认为空，需要后续更新
+            container_ip: String::new(),    // 默认为空，需要后续更新
+            created_at: chrono::Utc::now(), // 兼容旧代码，使用当前时间
         }
     }
 
@@ -190,6 +195,7 @@ impl ContainerQueryResult {
         status: ContainerStatus,
         is_running: bool,
         container_ip: String,
+        created_at: DateTime<Utc>,
     ) -> Self {
         Self {
             container_id,
@@ -197,6 +203,7 @@ impl ContainerQueryResult {
             status,
             is_running,
             container_ip,
+            created_at,
         }
     }
 
@@ -296,7 +303,7 @@ impl DockerContainerInfo {
                 // ComputerAgentRunner 模式优先使用 user_id
                 self.user_id.as_deref().unwrap_or(&self.project_id)
             }
-            Some(shared_types::ServiceType::RCoder) => {
+            Some(shared_types::ServiceType::WebAgentRunner) => {
                 // RCoder 模式使用 project_id
                 &self.project_id
             }
@@ -358,18 +365,18 @@ impl From<String> for ContainerStatus {
     }
 }
 
-impl ToString for ContainerStatus {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for ContainerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ContainerStatus::Creating => "created".to_string(),
-            ContainerStatus::Running => "running".to_string(),
-            ContainerStatus::Stopped => "stopped".to_string(),
-            ContainerStatus::Paused => "paused".to_string(),
-            ContainerStatus::Restarting => "restarting".to_string(),
-            ContainerStatus::Removing => "removing".to_string(),
-            ContainerStatus::Exited => "exited".to_string(),
-            ContainerStatus::Dead => "dead".to_string(),
-            ContainerStatus::Unknown(s) => s.clone(),
+            ContainerStatus::Creating => f.write_str("created"),
+            ContainerStatus::Running => f.write_str("running"),
+            ContainerStatus::Stopped => f.write_str("stopped"),
+            ContainerStatus::Paused => f.write_str("paused"),
+            ContainerStatus::Restarting => f.write_str("restarting"),
+            ContainerStatus::Removing => f.write_str("removing"),
+            ContainerStatus::Exited => f.write_str("exited"),
+            ContainerStatus::Dead => f.write_str("dead"),
+            ContainerStatus::Unknown(s) => f.write_str(s),
         }
     }
 }
@@ -491,7 +498,7 @@ impl Default for DockerManagerConfig {
 
             cache_status_ttl_seconds: default_cache_status_ttl(), // 默认 10 秒
             cache_network_ttl_seconds: default_cache_network_ttl(), // 默认 15 秒
-            cache_max_capacity: default_cache_max_capacity(), // 默认 10000
+            cache_max_capacity: default_cache_max_capacity(),     // 默认 10000
         }
     }
 }

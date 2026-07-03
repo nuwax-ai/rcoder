@@ -94,7 +94,7 @@ pub async fn agent_status(
         project_id
     );
 
-    // 从 DuckDB 存储中获取 Agent 信息
+    // 从 存储中获取 Agent 信息
     if let Some(agent_info) = state.get_project(project_id) {
         let response = AgentStatusResponse {
             project_id: agent_info.project_id().to_string(),

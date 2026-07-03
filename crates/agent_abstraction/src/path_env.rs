@@ -1,6 +1,9 @@
 //! 子进程环境变量管理 - 供 Agent 子进程使用
 //!
 //! 提供 PATH 环境变量构建函数，供 rcoder 启动 Claude Code 等 Agent 时使用。
+//! find_in_path/find_bin_dir 为通用工具函数，当前未被引用，保留供未来使用。
+
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 
@@ -39,23 +42,19 @@ fn find_bin_dir(executable: &str) -> Option<String> {
         // 如果父目录是 "cmd"，尝试找同级的 "bin" 目录
         // 例如: D:\Program Files\Git\cmd -> D:\Program Files\Git\bin
         if parent_str.to_lowercase().ends_with("cmd") {
-            let bin_dir = parent
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| {
-                    if n.eq_ignore_ascii_case("cmd") {
-                        parent
-                            .parent()
-                            .map(|p| p.join("bin").to_string_lossy().to_string())
-                    } else {
-                        None
-                    }
-                })
-                .flatten();
-            if let Some(bin) = bin_dir {
-                if PathBuf::from(&bin).join("bash.exe").exists() {
-                    return Some(bin);
+            let bin_dir = parent.file_name().and_then(|n| n.to_str()).and_then(|n| {
+                if n.eq_ignore_ascii_case("cmd") {
+                    parent
+                        .parent()
+                        .map(|p| p.join("bin").to_string_lossy().to_string())
+                } else {
+                    None
                 }
+            });
+            if let Some(bin) = bin_dir
+                && PathBuf::from(&bin).join("bash.exe").exists()
+            {
+                return Some(bin);
             }
         }
 

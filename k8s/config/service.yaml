@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rcoder-service
+spec:
+  type: ClusterIP
+  selector:
+    app: rcoder
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8290
+      targetPort: 8290
+    - name: pingora
+      protocol: TCP
+      port: 8088
+      targetPort: 8088
+    - name: ttyd
+      protocol: TCP
+      port: 7681
+      targetPort: 7681

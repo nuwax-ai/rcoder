@@ -1,0 +1,156 @@
+version: v2beta1
+name: rcodergit
+
+# This is a list of `pipelines` that DevSpace can execute (you can define your own)
+pipelines:
+  # This is the pipeline for the main command: `devspace dev` (or `devspace run-pipeline dev`)
+  dev:
+    run: |-
+      run_dependencies --all       # 1. Deploy any projects this project needs (see "dependencies")
+      ensure_pull_secrets --all    # 2. Ensure pull secrets
+      create_deployments --all     # 3. Deploy Helm charts and manifests specfied as "deployments"
+      start_dev app                # 4. Start dev mode "app" (see "dev" section)
+  # You can run this pipeline via `devspace deploy` (or `devspace run-pipeline deploy`)
+  deploy:
+    run: |-
+      run_dependencies --all                            # 1. Deploy any projects this project needs (see "dependencies")
+      ensure_pull_secrets --all                         # 2. Ensure pull secrets
+      build_images --all -t $(git describe --always)    # 3. Build, tag (git commit hash) and push all images (see "images")
+      create_deployments --all                          # 4. Deploy Helm charts and manifests specfied as "deployments"
+
+# This is a list of `images` that DevSpace can build for this project
+# We recommend to skip image building during development (devspace dev) as much as possible
+images:
+  app:
+    image: dev-master-rcoder-devspace:latest
+    dockerfile: Dockerfile
+    context: ./
+
+# This is a list of `deployments` that DevSpace can create for this project
+deployments:
+  app:
+    # This deployment uses `kubectl` but you can also define `helm` deployments
+    kubectl:
+      manifests:
+        - k8s/config
+
+# This is a list of `dev` containers that are based on the containers created by your deployments
+dev:
+  app:
+    # Search for the container that runs this image
+    imageSelector: dev-master-rcoder-devspace:latest
+    # Sync files between the local filesystem and the development container
+    sync:
+      - path: .:/app
+        # 排除不需要同步的目录（提高同步效率）
+        uploadExcludePaths:
+          # 编译产物（最大，133GB）
+          - target/
+          # 版本控制
+          - .git/
+          # IDE 配置
+          - .idea/
+          - .vscode/
+          # DevSpace 配置
+          - .devspace/
+          # 项目特定目录
+          - project_workspace/
+          - computer-project-workspace/
+          - agent-cache/
+          # Docker 和 K8s 配置（容器内不需要）
+          - docker/
+          - k8s/
+          # 文档和测试数据
+          - specs/
+          - docs/
+          - fixtures/
+          - scripts/
+          # 包管理缓存
+          - node_modules/
+          - npm/
+          - .npm/
+          - .cache/
+          - cache/
+          # Cargo 配置
+          - .cargo/
+          # 其他配置目录
+          - .specify/
+          - .claude/
+          - .github/
+          # 日志目录（只排除根目录下的 logs）
+          - ./logs/
+          # 临时文件
+          - tmp/
+          - "*.log"
+          - "*.tmp"
+          - "*.swp"
+          - "*.swo"
+          - ".DS_Store"
+          - "**/*.rs.bk"
+          - dist-workspace.toml
+        # 下载时也排除这些目录
+        downloadExcludePaths:
+          - target/
+          - .git/
+          - .idea/
+          - .vscode/
+          - .devspace/
+          - project_workspace/
+          - computer-project-workspace/
+          - agent-cache/
+          - docker/
+          - k8s/
+          - logs/
+          - tmp/
+        # 初始同步策略：preferLocal 表示本地文件优先
+        initialSync: preferLocal
+    # Open a terminal and use the following command to start it
+    terminal:
+      command: bash -c 'cd /app && /app/devspace_start.sh'
+    # Inject a lightweight SSH server into the container (so your IDE can connect to the remote dev env)
+    ssh:
+      enabled: true
+    # Make the following commands from my local machine available inside the dev container
+    proxyCommands:
+      - command: devspace
+      - command: kubectl
+      - command: helm
+      - gitCredentials: true
+    # Forward the following ports to be able access your application via localhost
+    ports:
+      - port: "8290:8290"
+      - port: "8289:8088"
+      - port: "7681:7681"
+    # Open the following URLs once they return an HTTP status code other than 502 or 503
+    open:
+      - url: http://localhost:8290
+
+# Use the `commands` section to define repeatable dev workflows for this project
+commands:
+  # 安装系统依赖
+  install-deps:
+    command: "devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && /usr/bin/apt-get update && /usr/bin/apt-get install -y build-essential cmake pkg-config protobuf-compiler libprotobuf-dev'"
+    description: "安装编译依赖"
+
+  # 运行 rcoder 服务
+  run:
+    command: "devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && CONTAINER_RUNTIME=kubernetes cargo run --bin rcoder --features ebpf-debug,pyroscope,otel,debug,kubernetes -- --port 8290'"
+    description: "编译并运行 rcoder 服务"
+
+  # 只编译
+  build:
+    command: "devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && cargo build --release --bin rcoder --features ebpf-debug,pyroscope,otel,debug,kubernetes'"
+    description: "编译 rcoder"
+
+  # 运行测试
+  test:
+    command: "devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && cargo test'"
+    description: "运行测试"
+
+# Define dependencies to other projects with a devspace.yaml
+# dependencies:
+#   api:
+#     git: https://...  # Git-based dependencies
+#     tag: v1.0.0
+#   ui:
+#     path: ./ui        # Path-based dependencies (for monorepos)

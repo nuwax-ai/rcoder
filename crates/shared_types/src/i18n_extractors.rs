@@ -5,12 +5,7 @@
 
 use std::collections::HashMap;
 
-use axum::{
-    extract::{
-        FromRequest, Json, Request,
-        rejection::JsonRejection,
-    },
-};
+use axum::extract::{FromRequest, Json, Request, rejection::JsonRejection};
 use axum::http::Uri;
 use serde::de::DeserializeOwned;
 
@@ -62,15 +57,16 @@ where
         match Json::<T>::from_request(req, state).await {
             Ok(Json(json_value)) => {
                 // 4. JSON 存在，合并两者（JSON 优先）
-                let json_value_as_value = serde_json::to_value(&json_value)
-                    .unwrap_or(serde_json::Value::Null);
+                let json_value_as_value =
+                    serde_json::to_value(&json_value).unwrap_or(serde_json::Value::Null);
                 let merged = deep_merge(query_value, json_value_as_value);
                 // 反序列化为 T
-                let result = serde_json::from_value(merged)
-                    .map_err(|_| AppError::with_i18n_key(
+                let result = serde_json::from_value(merged).map_err(|_| {
+                    AppError::with_i18n_key(
                         crate::error_codes::ERR_INVALID_PARAMS,
                         "error.invalid_params",
-                    ))?;
+                    )
+                })?;
                 Ok(Self(result))
             }
             Err(_) => {
@@ -82,11 +78,12 @@ where
                     ));
                 }
                 // 使用 query string 反序列化
-                let result = serde_json::from_value(query_value)
-                    .map_err(|_| AppError::with_i18n_key(
+                let result = serde_json::from_value(query_value).map_err(|_| {
+                    AppError::with_i18n_key(
                         crate::error_codes::ERR_INVALID_PARAMS,
                         "error.invalid_params",
-                    ))?;
+                    )
+                })?;
                 Ok(Self(result))
             }
         }
@@ -135,7 +132,9 @@ where
     /// let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
     /// ```
     pub fn validate_into_app_error(self) -> Result<Self, AppError> {
-        self.0.validate().map_err(crate::validation::garde_err_to_app_error)?;
+        self.0
+            .validate()
+            .map_err(crate::validation::garde_err_to_app_error)?;
         Ok(self)
     }
 }

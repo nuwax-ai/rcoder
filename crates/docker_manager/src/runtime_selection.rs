@@ -56,15 +56,20 @@ impl RuntimeType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // 使用全局互斥锁确保环境变量测试串行执行
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_runtime_type_from_env_docker() {
-        // SAFETY: Test-only environment variable manipulation, runs in serial
+        let _lock = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Test-only environment variable manipulation, protected by mutex
         unsafe {
             env::set_var("CONTAINER_RUNTIME", "docker");
         }
         assert_eq!(RuntimeType::from_env(), RuntimeType::Docker);
-        // SAFETY: Test-only environment variable cleanup, runs in serial
+        // SAFETY: Test-only environment variable cleanup, protected by mutex
         unsafe {
             env::remove_var("CONTAINER_RUNTIME");
         }
@@ -72,12 +77,13 @@ mod tests {
 
     #[test]
     fn test_runtime_type_from_env_kubernetes() {
-        // SAFETY: Test-only environment variable manipulation, runs in serial
+        let _lock = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Test-only environment variable manipulation, protected by mutex
         unsafe {
             env::set_var("CONTAINER_RUNTIME", "kubernetes");
         }
         assert_eq!(RuntimeType::from_env(), RuntimeType::Kubernetes);
-        // SAFETY: Test-only environment variable cleanup, runs in serial
+        // SAFETY: Test-only environment variable cleanup, protected by mutex
         unsafe {
             env::remove_var("CONTAINER_RUNTIME");
         }
@@ -85,12 +91,13 @@ mod tests {
 
     #[test]
     fn test_runtime_type_from_env_k8s() {
-        // SAFETY: Test-only environment variable manipulation, runs in serial
+        let _lock = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Test-only environment variable manipulation, protected by mutex
         unsafe {
             env::set_var("CONTAINER_RUNTIME", "k8s");
         }
         assert_eq!(RuntimeType::from_env(), RuntimeType::Kubernetes);
-        // SAFETY: Test-only environment variable cleanup, runs in serial
+        // SAFETY: Test-only environment variable cleanup, protected by mutex
         unsafe {
             env::remove_var("CONTAINER_RUNTIME");
         }
@@ -98,7 +105,8 @@ mod tests {
 
     #[test]
     fn test_runtime_type_from_env_default() {
-        // SAFETY: Test-only environment variable cleanup, runs in serial
+        let _lock = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Test-only environment variable cleanup, protected by mutex
         unsafe {
             env::remove_var("CONTAINER_RUNTIME");
         }
@@ -107,12 +115,13 @@ mod tests {
 
     #[test]
     fn test_runtime_type_from_env_unknown() {
-        // SAFETY: Test-only environment variable manipulation, runs in serial
+        let _lock = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Test-only environment variable manipulation, protected by mutex
         unsafe {
             env::set_var("CONTAINER_RUNTIME", "unknown");
         }
         assert_eq!(RuntimeType::from_env(), RuntimeType::Docker);
-        // SAFETY: Test-only environment variable cleanup, runs in serial
+        // SAFETY: Test-only environment variable cleanup, protected by mutex
         unsafe {
             env::remove_var("CONTAINER_RUNTIME");
         }

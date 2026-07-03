@@ -30,6 +30,13 @@ pub struct ProxyConfig {
     /// 启用详细日志
     #[structopt(long)]
     pub verbose: bool,
+
+    /// 请求超时（秒），None 使用默认 600
+    pub request_timeout_seconds: Option<u64>,
+    /// 连接建立超时（秒），None 使用默认 10
+    pub connect_timeout_seconds: Option<u64>,
+    /// 连接池空闲超时（秒），None 使用默认 90
+    pub pool_idle_timeout_seconds: Option<u64>,
 }
 
 impl Default for ProxyConfig {
@@ -41,6 +48,9 @@ impl Default for ProxyConfig {
             port_param: "port".to_string(),
             config_file: None,
             verbose: false,
+            request_timeout_seconds: None,
+            connect_timeout_seconds: None,
+            pool_idle_timeout_seconds: None,
         }
     }
 }

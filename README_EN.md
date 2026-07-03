@@ -478,7 +478,7 @@ docker exec -it <container_id> /bin/bash
 
 ## License
 
-This project is dual-licensed under MIT or Apache-2.0. See [LICENSE](LICENSE) for details.
+This project is licensed under Apache-2.0. See [LICENSE](LICENSE) for details.
 
 ## Contributing
 

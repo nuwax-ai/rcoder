@@ -1,16 +1,18 @@
+use agent_client_protocol::schema::v1::{Error, SessionUpdate, StopReason};
 use chrono::{DateTime, Utc};
-use agent_client_protocol::schema::{Error, SessionUpdate, StopReason};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use utoipa::ToSchema;
 
 /// 消息主类型枚举
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionMessageType {
-    SessionPromptStart, // 用户发送 prompt 开始
-    SessionPromptEnd,   // Agent 执行结束
-    AgentSessionUpdate, // Agent 执行过程中的更新
-    Heartbeat,          // SSE 连接心跳消息
+    SessionPromptStart,   // 用户发送 prompt 开始
+    SessionPromptEnd,     // Agent 执行结束
+    AgentSessionUpdate,   // Agent 执行过程中的更新
+    AcpRequestPermission, // ACP tool permission approval request
+    Heartbeat,            // SSE 连接心跳消息
 }
 
 /// 统一的会话消息结构
@@ -65,6 +67,18 @@ pub struct AgentSessionUpdate {
     pub request_id: Option<String>,
 }
 
+/// ACP permission request that needs user approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpRequestPermission {
+    pub session_id: String,
+    pub request_permission_request: serde_json::Value,
+    pub tool_call_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub save_rule: Option<serde_json::Value>,
+    /// 可选的请求ID，用于标识对应的用户请求
+    pub request_id: Option<String>,
+}
+
 /// 需要发给前端的消息通知类型
 #[derive(Debug, Clone, Serialize)]
 pub enum SessionNotify {
@@ -72,6 +86,7 @@ pub enum SessionNotify {
     SessionPromptStart(SessionPromptStart),
     SessionPromptEnd(SessionPromptEnd),
     SessionPromptError(SessionPromptError),
+    AcpRequestPermission(Box<AcpRequestPermission>),
 }
 
 impl SessionNotify {
@@ -158,6 +173,28 @@ impl SessionNotify {
                     timestamp,
                 }
             }
+            SessionNotify::AcpRequestPermission(permission) => {
+                let mut data = serde_json::json!({
+                    "request_permission_request": permission.request_permission_request,
+                    "tool_call_id": permission.tool_call_id,
+                });
+
+                if let Some(save_rule) = permission.save_rule {
+                    data["save_rule"] = save_rule;
+                }
+
+                if let Some(request_id) = &permission.request_id {
+                    data["request_id"] = serde_json::Value::String(request_id.clone());
+                }
+
+                UnifiedSessionMessage {
+                    session_id: permission.session_id,
+                    message_type: SessionMessageType::AcpRequestPermission,
+                    sub_type: "request_permission".to_string(),
+                    data,
+                    timestamp,
+                }
+            }
         }
     }
 }
@@ -205,6 +242,18 @@ fn stop_reason_to_description(reason: &StopReason) -> &'static str {
     }
 }
 
+/// 将 SessionUpdate 附属载荷序列化为 JSON（用于 SSE `data`）
+fn session_update_payload<T: serde::Serialize>(context: &'static str, v: &T) -> serde_json::Value {
+    serde_json::to_value(v).unwrap_or_else(|e| {
+        warn!(
+            context,
+            error = %e,
+            "session_update_to_parts: serde_json::to_value failed for SessionUpdate payload"
+        );
+        serde_json::json!({})
+    })
+}
+
 /// 将 SessionUpdate 转换为 (sub_type, data) 元组
 fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value) {
     match update {
@@ -227,27 +276,40 @@ fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value)
             serde_json::json!(tool_call_update),
         ),
         SessionUpdate::Plan(plan) => ("plan".to_string(), serde_json::json!(plan)),
-        SessionUpdate::AvailableCommandsUpdate(available_commands) => (
+        SessionUpdate::AvailableCommandsUpdate(v) => (
             "available_commands_update".to_string(),
-            serde_json::json!({
-                "available_commands": available_commands
-            }),
+            session_update_payload("available_commands_update", &v),
         ),
-        SessionUpdate::CurrentModeUpdate(current_mode_id) => (
+        SessionUpdate::CurrentModeUpdate(v) => (
             "current_mode_update".to_string(),
-            serde_json::json!({
-                "current_mode_id": current_mode_id
-            }),
+            session_update_payload("current_mode_update", &v),
         ),
-        // 处理未来可能添加的新更新类型
-        _ => ("unknown_update".to_string(), serde_json::json!({})),
+        SessionUpdate::ConfigOptionUpdate(v) => (
+            "config_option_update".to_string(),
+            session_update_payload("config_option_update", &v),
+        ),
+        SessionUpdate::SessionInfoUpdate(v) => (
+            "session_info_update".to_string(),
+            session_update_payload("session_info_update", &v),
+        ),
+        SessionUpdate::UsageUpdate(v) => (
+            "usage_update".to_string(),
+            session_update_payload("usage_update", &v),
+        ),
+        // #[non_exhaustive] 与未来协议新增变体
+        _ => {
+            warn!(
+                "session_update_to_parts: unmapped SessionUpdate variant (upgrade ACP mapper or extend match)"
+            );
+            ("unknown_update".to_string(), serde_json::json!({}))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::ContentChunk;
+    use agent_client_protocol::schema::v1::{ContentChunk, SessionInfoUpdate, UsageUpdate};
 
     #[test]
     fn test_session_prompt_start_to_unified() {
@@ -259,10 +321,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptStart),
-            true
-        );
+        assert!(matches!(
+            unified.message_type,
+            SessionMessageType::SessionPromptStart
+        ));
         assert_eq!(unified.sub_type, "prompt_start");
         assert_eq!(unified.data, serde_json::json!({}));
     }
@@ -277,10 +339,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptStart),
-            true
-        );
+        assert!(matches!(
+            unified.message_type,
+            SessionMessageType::SessionPromptStart
+        ));
         assert_eq!(unified.sub_type, "prompt_start");
         assert_eq!(unified.data["request_id"], "req_123456789");
     }
@@ -297,13 +359,13 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
-            true
-        );
+        assert!(matches!(
+            unified.message_type,
+            SessionMessageType::SessionPromptEnd
+        ));
         assert_eq!(unified.sub_type, "end_turn");
         assert_eq!(unified.data["reason"], "EndTurn");
-        assert_eq!(unified.data["description"], "正常结束");
+        assert_eq!(unified.data["description"], "Normal end");
         assert!(
             !unified
                 .data
@@ -326,13 +388,13 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
-            true
-        );
+        assert!(matches!(
+            unified.message_type,
+            SessionMessageType::SessionPromptEnd
+        ));
         assert_eq!(unified.sub_type, "cancelled");
         assert_eq!(unified.data["reason"], "Cancelled");
-        assert_eq!(unified.data["description"], "用户取消");
+        assert_eq!(unified.data["description"], "User cancelled");
         assert_eq!(unified.data["error_message"], "Connection timeout");
         assert!(!unified.data.as_object().unwrap().contains_key("request_id"));
     }
@@ -349,13 +411,13 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
-            true
-        );
+        assert!(matches!(
+            unified.message_type,
+            SessionMessageType::SessionPromptEnd
+        ));
         assert_eq!(unified.sub_type, "cancelled");
         assert_eq!(unified.data["reason"], "Cancelled");
-        assert_eq!(unified.data["description"], "用户取消");
+        assert_eq!(unified.data["description"], "User cancelled");
         assert_eq!(unified.data["error_message"], "Connection timeout");
         assert_eq!(unified.data["request_id"], "req_123456789");
     }
@@ -374,10 +436,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::AgentSessionUpdate),
-            true
-        );
+        assert!(matches!(
+            unified.message_type,
+            SessionMessageType::AgentSessionUpdate
+        ));
         assert_eq!(unified.sub_type, "agent_message_chunk");
 
         // ACP 0.8 中 ContentChunk 的格式：{"content": {"text": "...", "type": "text"}}
@@ -401,15 +463,47 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::AgentSessionUpdate),
-            true
-        );
+        assert!(matches!(
+            unified.message_type,
+            SessionMessageType::AgentSessionUpdate
+        ));
         assert_eq!(unified.sub_type, "agent_message_chunk");
         // ACP 0.8 中 ContentChunk 的格式：{"content": {"text": "...", "type": "text"}}
         assert_eq!(unified.data["content"]["text"], "Hello, World!");
         assert_eq!(unified.data["content"]["type"], "text");
         assert_eq!(unified.data["request_id"], "req_123456789");
+    }
+
+    #[test]
+    fn test_session_info_update_to_unified() {
+        let update =
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title("minesweeper-task"));
+        let notify = SessionNotify::AgentSessionUpdate(Box::new(AgentSessionUpdate {
+            session_id: "test_session".to_string(),
+            session_update: update,
+            request_id: None,
+        }));
+
+        let unified = notify.to_unified_message();
+
+        assert_eq!(unified.sub_type, "session_info_update");
+        assert_eq!(unified.data["title"], "minesweeper-task");
+    }
+
+    #[test]
+    fn test_usage_update_to_unified() {
+        let update = SessionUpdate::UsageUpdate(UsageUpdate::new(1024, 200_000));
+        let notify = SessionNotify::AgentSessionUpdate(Box::new(AgentSessionUpdate {
+            session_id: "test_session".to_string(),
+            session_update: update,
+            request_id: None,
+        }));
+
+        let unified = notify.to_unified_message();
+
+        assert_eq!(unified.sub_type, "usage_update");
+        assert_eq!(unified.data["used"], 1024);
+        assert_eq!(unified.data["size"], 200_000);
     }
 
     #[test]
@@ -423,10 +517,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
-            true
-        );
+        assert!(matches!(
+            unified.message_type,
+            SessionMessageType::SessionPromptEnd
+        ));
         assert_eq!(unified.sub_type, "error");
 
         // 验证 data 直接包含 code 和 message 字段
@@ -447,10 +541,10 @@ mod tests {
         let unified = notify.to_unified_message();
 
         assert_eq!(unified.session_id, "test_session");
-        assert_eq!(
-            matches!(unified.message_type, SessionMessageType::SessionPromptEnd),
-            true
-        );
+        assert!(matches!(
+            unified.message_type,
+            SessionMessageType::SessionPromptEnd
+        ));
         assert_eq!(unified.sub_type, "error");
 
         // 验证 data 直接包含 code 和 message 字段

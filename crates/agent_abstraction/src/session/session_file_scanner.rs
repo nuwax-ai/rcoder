@@ -95,7 +95,7 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
 
     if !projects_dir.exists() {
         debug!(
-            "🔍 [FILE_SCAN] Projects directory does not exist: {}",
+            "[FILE_SCAN] Projects directory does not exist: {}",
             projects_dir.display()
         );
         return session_ids;
@@ -104,7 +104,7 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
     // 使用异步 I/O 遍历目录
     let Ok(mut dir_entries) = tokio::fs::read_dir(&projects_dir).await else {
         warn!(
-            "🔍 [FILE_SCAN] Unable to read project directory: {}",
+            "[FILE_SCAN] Unable to read project directory: {}",
             projects_dir.display()
         );
         return session_ids;
@@ -121,26 +121,26 @@ async fn scan_project_sessions(project_path: &str) -> HashSet<String> {
         {
             let Ok(mut files) = tokio::fs::read_dir(entry.path()).await else {
                 warn!(
-                    "🔍 [file_scanner] Unable to scan session directory: {}",
+                    "[file_scanner] Unable to scan session directory: {}",
                     entry.path().display()
                 );
                 continue;
             };
 
             while let Ok(Some(file)) = files.next_entry().await {
-                if let Some(filename) = file.file_name().to_str() {
-                    if filename.ends_with(".jsonl") {
-                        // 提取 session_id（去掉 .jsonl 后缀）
-                        let session_id = filename.trim_end_matches(".jsonl").to_string();
-                        session_ids.insert(session_id);
-                    }
+                if let Some(filename) = file.file_name().to_str()
+                    && filename.ends_with(".jsonl")
+                {
+                    // 提取 session_id（去掉 .jsonl 后缀）
+                    let session_id = filename.trim_end_matches(".jsonl").to_string();
+                    session_ids.insert(session_id);
                 }
             }
         }
     }
 
     debug!(
-        "🔍 [FILE_SCAN] Scan completed: project_path={}, found {} sessions",
+        "[FILE_SCAN] Scan completed: project_path={}, found {} sessions",
         project_path,
         session_ids.len()
     );
@@ -156,7 +156,7 @@ async fn invalidate_project_cache(project_dir_name: &str) {
     let cache = get_file_scan_cache();
 
     debug!(
-        "🔄 [FILE_WATCH] Detected project directory change: {}, clearing cache",
+        "[FILE_WATCH] Detected project directory change: {}, clearing cache",
         project_dir_name
     );
 
@@ -179,12 +179,12 @@ pub fn start_file_watcher() {
     let projects_dir = get_projects_dir();
 
     // 创建目录（如果不存在）
-    if !projects_dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&projects_dir) {
-            warn!("[filelisten] Unable to create projects directory: {}", e);
-            WATCHER_STARTED.store(false, Ordering::SeqCst);
-            return;
-        }
+    if !projects_dir.exists()
+        && let Err(e) = std::fs::create_dir_all(&projects_dir)
+    {
+        warn!("[filelisten] Unable to create projects directory: {}", e);
+        WATCHER_STARTED.store(false, Ordering::SeqCst);
+        return;
     }
 
     // 创建异步通道
@@ -240,7 +240,7 @@ pub fn start_file_watcher() {
     }
 
     info!(
-        "👁️ [filelisten] startinglistendirectory: {}",
+        "[filelisten] startinglistendirectory: {}",
         projects_dir.display()
     );
 
@@ -281,7 +281,7 @@ pub fn start_file_watcher() {
                            } => {
                                if !pending_dirs.is_empty() {
                                    debug!(
-                                       "📁 [FILE_WATCH] Debounce triggered, refreshing {} project directories",
+                                       "[FILE_WATCH] Debounce triggered, refreshing {} project directories",
                                        pending_dirs.len()
                                    );
                                    // 刷新所有待处理的项目目录
@@ -310,7 +310,7 @@ pub fn stop_file_watcher() {
         *guard = None;
     }
 
-    info!("🛑 [filelisten] File watcher already stopped");
+    info!("[filelisten] File watcher already stopped");
 }
 
 /// 通过文件扫描检查 session 是否存在（带缓存）
@@ -324,7 +324,7 @@ pub async fn check_session_file_exists(session_id: &str, project_path: &str) -> 
     if let Some(session_ids) = cache.get(project_path).await {
         let exists = session_ids.contains(session_id);
         debug!(
-            "🔍 [FILE_SCAN_CACHE] session={} -> {}",
+            "[FILE_SCAN_CACHE] session={} -> {}",
             session_id,
             if exists { "exists" } else { "not found" }
         );
@@ -333,7 +333,7 @@ pub async fn check_session_file_exists(session_id: &str, project_path: &str) -> 
 
     // 缓存未命中，执行扫描
     debug!(
-        "🔍 [FILE_SCAN] Cache miss, scanning directory: project_path={}",
+        "[FILE_SCAN] Cache miss, scanning directory: project_path={}",
         project_path
     );
     let session_ids = scan_project_sessions(project_path).await;

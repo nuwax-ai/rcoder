@@ -2,7 +2,7 @@
 # LibreOffice 预下载配置（避免每次构建都重新下载）
 # ============================================================================
 # LibreOffice 版本（必须与 Dockerfile.base 保持一致）
-LIBREOFFICE_VERSION := 25.8.5
+LIBREOFFICE_VERSION := 25.8.7
 
 # 下载目录（相对于项目根目录）
 LIBREOFFICE_DOWNLOAD_DIR := docker/rcoder-agent-runner/downloads
@@ -104,10 +104,20 @@ docker-clean-libreoffice-downloads:
 	@rm -rf $(LIBREOFFICE_DOWNLOAD_DIR)
 	@echo "✅ LibreOffice 下载文件已清理"
 
+# 单独推送基础镜像到阿里云仓库（带重试，应对网络/TLS 抖动）
+# 用途: 构建已完成、仅推送失败时单独重试上传，无需重新构建整个镜像
+#       已成功上传的 blob 会自动 skip，只重传失败的层
+docker-push-agent-base:
+	@echo "📤 推送基础镜像到阿里云仓库（skopeo 内置重试 5 次，指数退避）..."
+	@skopeo copy --retry-times 5 \
+		docker-daemon:dev-rcoder-agent-base:latest \
+		docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder-agent-base:latest
+	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-rcoder-agent-base:latest"
+
 # 构建 agent-base 基础镜像（包含所有系统依赖，很少需要重新构建）
 docker-build-agent-base: docker-pre-download-libreoffice
 	@echo "🐳 构建 rcoder-agent-base 基础镜像..."
-	@echo "📍 镜像名称: rcoder-agent-base:latest"
+	@echo "📍 镜像名称: dev-rcoder-agent-base:latest"
 	@echo "📦 LibreOffice: $(LIBREOFFICE_VERSION) ($(LIBREOFFICE_ARCH))"
 	@echo "⏳ 这可能需要较长时间（包含所有系统依赖安装）..."
 	@# CACHEBUST_NOVNC: 传入时间戳强制每次重新克隆 noVNC
@@ -116,10 +126,11 @@ docker-build-agent-base: docker-pre-download-libreoffice
 		docker buildx build --platform linux/$(LIBREOFFICE_ARCH) --load \
 		--build-arg LIBREOFFICE_FILE=$(LIBREOFFICE_FILE) \
 		--build-arg CACHEBUST_NOVNC=$$(date +%s) \
-		-f Dockerfile.base -t rcoder-agent-base:latest .
+		-f Dockerfile.base -t dev-rcoder-agent-base:latest .
 	@echo "✅ rcoder-agent-base 基础镜像构建完成！"
-	@echo "📤 推送基础镜像到阿里云仓库..."
-	@docker tag rcoder-agent-base:latest nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-base:latest
-	@skopeo copy docker-daemon:nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-base:latest docker://nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-base:latest
-	@echo "✅ 基础镜像已推送: nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-base:latest"
+	@if [ "$(PUSH_IMAGE)" = "true" ]; then \
+		$(MAKE) docker-push-agent-base; \
+	else \
+		echo "⏭️  跳过基础镜像推送（PUSH_IMAGE != true）。如需推送：make ... PUSH_IMAGE=true"; \
+	fi
 	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"

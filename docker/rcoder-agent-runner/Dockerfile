@@ -13,6 +13,14 @@ FROM ${BASE_IMAGE}
 # 设置工作目录
 WORKDIR /home/user
 
+# 创建自定义 ACP Agent 目录（devcomputer 调试用）
+# 开发者将编译好的可执行文件放在 /home/user/acp-agent/{name}/{name} 下
+# 通过 bind mount 从宿主机 workspace 同步
+RUN mkdir -p /home/user/acp-agent
+
+# 将自定义 ACP Agent 目录加入 PATH（使 which codex-acp 等命令可用）
+ENV PATH="/home/user/acp-agent:$PATH"
+
 # agent-browser 默认配置（独立 Chromium profile，避免与 MCP 锁冲突）
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium \
     AGENT_BROWSER_PROFILE=/home/user/.config/agent-browser/chromium \
@@ -26,22 +34,28 @@ ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium \
 # 使用构建参数破坏缓存（每次构建都获取最新版本的工具）
 ARG CACHEBUST=1
 
-# 安装 mcp-stdio-proxy（频繁更新的工具，放在最终镜像以加快构建）
+# 安装 mcp-stdio-proxy（使用 npm 安装，避免 Rust 编译问题）
 # 使用 CACHEBUST 变量触发缓存失效
-RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install mcp-stdio-proxy
+RUN echo "Cache bust: ${CACHEBUST}" && npm install -g mcp-stdio-proxy@latest
 
 # # 安装 claude-code-acp-rs CLI 工具
 # RUN . /opt/cargo/env && echo "Cache bust: ${CACHEBUST}" && cargo install claude-code-acp-rs --no-default-features --features otel,sacp-flush
 
-# 安装 agent-browser CLI（仅安装命令行工具，不在构建期下载浏览器）
-RUN . /opt/cargo/env && \
-    echo "Cache bust: ${CACHEBUST}" && \
-    cargo install agent-browser && \
+# 安装 agent-browser CLI（使用 npm 安装）
+RUN echo "Cache bust: ${CACHEBUST}" && \
+    npm install -g agent-browser && \
+    mkdir -p /home/user/.config/agent-browser/chromium && \
+    chown -R user:user /home/user/.config/agent-browser && \
     agent-browser --version
 
 # 测试agent
 RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 
+# 安装 codex-acp（Codex ACP 代理）
+RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
+
+# 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
+RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest
 
 # 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
 # 使用 CACHEBUST 变量触发缓存失效
@@ -97,9 +111,9 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
 # 安装 FlameGraph 工具
 RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
     if [ "${USE_GITHUB_MIRROR}" = "true" ]; then \
-        git clone ${GITHUB_MIRROR_URL}brendangregg/FlameGraph /tmp/FlameGraph; \
+    git clone ${GITHUB_MIRROR_URL}brendangregg/FlameGraph /tmp/FlameGraph; \
     else \
-        git clone https://github.com/brendangregg/FlameGraph /tmp/FlameGraph; \
+    git clone https://github.com/brendangregg/FlameGraph /tmp/FlameGraph; \
     fi && \
     cp /tmp/FlameGraph/*.pl /usr/local/bin/ \
     && rm -rf /tmp/FlameGraph \
@@ -107,28 +121,7 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
     fi
 
 # ============================================================================
-# 📊 Pyroscope Agent - 持续剖析（已废弃，保留用于兼容性）
-# ============================================================================
-ARG INSTALL_PYROSCOPE=false
-RUN if [ "$INSTALL_PYROSCOPE" = "true" ]; then \
-    echo "📦 安装 Pyroscope Agent..."; \
-    apt-get update && \
-    apt-get install -y curl ca-certificates && \
-    echo "下载 Pyroscope Agent (v1.17.0)..." && \
-    curl -fsSL "https://github.com/grafana/pyroscope/releases/download/v1.17.0/pyroscope_1.17.0_linux_arm64.tar.gz" \
-    -o /tmp/pyroscope.tar.gz && \
-    echo "解压 Pyroscope Agent..." && \
-    tar -xzf /tmp/pyroscope.tar.gz -C /usr/local/bin/ && \
-    rm /tmp/pyroscope.tar.gz && \
-    chmod +x /usr/local/bin/pyroscope && \
-    echo "验证 Pyroscope Agent..." && \
-    pyroscope --version || echo "⚠️  Pyroscope 安装失败"; \
-    else \
-    echo "⚠️  Pyroscope 未安装"; \
-    fi
-
-# ============================================================================
-# 📊 Grafana Alloy - 持续性能数据采集（替代已废弃的 Pyroscope Agent）
+# 📊 Grafana Alloy - 持续性能数据采集
 # ============================================================================
 ARG INSTALL_ALLOY=false
 ARG ALLOY_VERSION=v1.12.2
@@ -190,6 +183,14 @@ COPY ime_server.py /usr/local/bin/ime_server.py
 RUN chmod +x /usr/local/bin/ime_server.py
 
 # ============================================================================
+# 🖥️ ttyd Web 终端配置
+# ============================================================================
+# 复制 ttyd 启动脚本和自定义前端页面
+COPY ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
+COPY ttyd/ttyd-index.html /usr/local/share/ttyd/index.html
+RUN chmod +x /usr/local/bin/start-ttyd.sh
+
+# ============================================================================
 # 🔧 eBPF 工具目录
 # ============================================================================
 # 复制整个 eBPF 工具目录到容器中
@@ -239,6 +240,9 @@ EXPOSE 6089
 
 # 暴露 IME 服务端口
 EXPOSE 6091
+
+# 暴露 ttyd Web 终端端口
+EXPOSE 7681
 
 # ============================================================================
 # 🚀 启动配置

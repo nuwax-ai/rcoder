@@ -6,8 +6,8 @@
 //! - Stack trace sampling
 
 use anyhow::{Context, Result};
-use pyroscope::PyroscopeAgent;
-use pyroscope_pprofrs::{PprofConfig, pprof_backend};
+use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
+use pyroscope::pyroscope::PyroscopeAgentBuilder;
 use tracing::{debug, info};
 
 /// Profiler 配置
@@ -62,7 +62,8 @@ impl ProfilerConfig {
 ///
 /// 当 dropped 时自动停止 profiler
 pub struct ProfilerGuard {
-    _agent: Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
+    _agent:
+        Option<pyroscope::pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
 }
 
 /// 初始化并启动 Pyroscope Profiler
@@ -85,13 +86,22 @@ pub fn init_pyroscope_profiler(config: ProfilerConfig) -> Result<ProfilerGuard> 
     info!("  CPU profiling: {}", config.enable_cpu);
     info!("  Memory profiling: {}", config.enable_memory);
 
-    // 使用正确的 API: builder() -> backend() -> build()
-    let agent = PyroscopeAgent::builder(config.server_url, config.application_name)
-        .backend(pprof_backend(
-            PprofConfig::new().sample_rate(config.sample_rate),
-        ))
-        .build()
-        .context("Failed to build Pyroscope agent")?;
+    // pyroscope 2.0 API: PyroscopeAgentBuilder::new()
+    let agent = PyroscopeAgentBuilder::new(
+        config.server_url,
+        config.application_name,
+        config.sample_rate,
+        "pyroscope-rs",
+        env!("CARGO_PKG_VERSION"),
+        pprof_backend(
+            PprofConfig {
+                sample_rate: config.sample_rate,
+            },
+            BackendConfig::default(),
+        ),
+    )
+    .build()
+    .context("Failed to build Pyroscope agent")?;
 
     // 启动 profiling，返回 PyroscopeAgent<PyroscopeAgentRunning>
     let agent_running = agent

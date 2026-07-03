@@ -57,6 +57,8 @@ pub struct RuntimeContainerInfo {
     pub container_ip: String,
     pub status: ContainerRuntimeStatus,
     pub created_at: DateTime<Utc>,
+    /// 容器环境变量（可选，用于获取 project_id 等信息）
+    pub env_vars: Option<std::collections::HashMap<String, String>>,
 }
 
 /// 已被移除的容器信息（用于清理关联资源）
@@ -108,6 +110,9 @@ pub struct ContainerCreateParams {
     pub tenant_id: Option<String>,
     /// Space identifier (for multi-tenant scenarios)
     pub space_id: Option<String>,
+    /// PVC storage size (K8s resource format, e.g., "10Gi", "100Mi")
+    /// Only effective in K8s mode, Docker mode ignores this parameter
+    pub storage_size: Option<String>,
 }
 
 impl ContainerCreateParams {
@@ -128,6 +133,7 @@ pub struct ContainerCreateParamsBuilder {
     isolation_type: Option<String>,
     tenant_id: Option<String>,
     space_id: Option<String>,
+    storage_size: Option<String>,
 }
 
 impl ContainerCreateParamsBuilder {
@@ -176,19 +182,23 @@ impl ContainerCreateParamsBuilder {
         self
     }
 
+    pub fn storage_size(mut self, storage_size: impl Into<String>) -> Self {
+        self.storage_size = Some(storage_size.into());
+        self
+    }
+
     pub fn build(self) -> ContainerCreateParams {
         ContainerCreateParams {
             project_id: self.project_id,
             user_id: self.user_id,
-            host_workspace_path: self
-                .host_workspace_path
-                .unwrap_or_else(|| String::new()),
-            service_type: self.service_type.unwrap_or(ServiceType::RCoder),
+            host_workspace_path: self.host_workspace_path.unwrap_or_default(),
+            service_type: self.service_type.unwrap_or(ServiceType::WebAgentRunner),
             resource_limits: self.resource_limits,
             pod_id: self.pod_id,
             isolation_type: self.isolation_type,
             tenant_id: self.tenant_id,
             space_id: self.space_id,
+            storage_size: self.storage_size,
         }
     }
 }
@@ -221,7 +231,7 @@ pub trait ContainerRuntime: Send + Sync {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        if matches!(service_type, ServiceType::RCoder) {
+        if matches!(service_type, ServiceType::WebAgentRunner) {
             return self.get_container_info(identifier).await;
         }
 

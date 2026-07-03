@@ -1,10 +1,11 @@
 [package]
 name = "rcoder-telemetry"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 description = "Shared telemetry module for rcoder services (Prometheus + OTLP)"
-authors = ["soddy"]
-license = "MIT"
+publish = false
 
 [dependencies]
 # OpenTelemetry
@@ -30,12 +31,12 @@ tonic = { workspace = true }
 # 其他
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
-tracing-appender = "0.2"
+tracing-appender = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
-pin-project-lite = "0.2"
+pin-project-lite = { workspace = true }
 
 [features]
 default = []

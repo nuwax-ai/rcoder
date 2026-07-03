@@ -54,15 +54,17 @@ impl HostPathResolver {
             ContainerSelfInspector::new(socket_path)
                 .await
                 .map_err(|e| {
-                    DockerError::ConfigurationError(format!("failed to create container self-inspector: {}", e))
+                    DockerError::ConfigurationError(format!(
+                        "failed to create container self-inspector: {}",
+                        e
+                    ))
                 })?,
         );
 
         // 获取所有挂载点信息
-        let mounts = inspector
-            .get_all_mounts()
-            .await
-            .map_err(|e| DockerError::ConfigurationError(format!("failed to get mount points: {}", e)))?;
+        let mounts = inspector.get_all_mounts().await.map_err(|e| {
+            DockerError::ConfigurationError(format!("failed to get mount points: {}", e))
+        })?;
 
         if mounts.is_empty() {
             return Err(DockerError::ConfigurationError(
@@ -76,7 +78,7 @@ impl HostPathResolver {
             .map(|(cp, hp)| (PathBuf::from(cp), PathBuf::from(hp)))
             .collect();
         // 按容器路径长度降序排列，确保最具体的路径优先匹配
-        all_mounts.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
+        all_mounts.sort_by_key(|m| std::cmp::Reverse(m.0.as_os_str().len()));
 
         info!(
             "[HostPathResolver] Cached {} mount points (sorted by path length descending):",
@@ -250,7 +252,9 @@ impl HostPathResolver {
                 .verify_docker_connection()
                 .await
                 .map(|_| true)
-                .map_err(|e| DockerError::ConnectionError(format!("Docker connection check failed: {}", e)))
+                .map_err(|e| {
+                    DockerError::ConnectionError(format!("Docker connection check failed: {}", e))
+                })
         } else {
             Ok(false)
         }

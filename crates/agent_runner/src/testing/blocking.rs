@@ -46,12 +46,12 @@ pub static BLOCKING_CONFIG: std::sync::LazyLock<Arc<std::sync::RwLock<BlockingCo
 /// });
 /// ```
 pub fn inject_blocking(config: BlockingConfig) {
-    tracing::warn!("🧪 [TEST] Blocking config updated: {:?}", config);
+    tracing::warn!("[TEST] Blocking config updated: {:?}", config);
     let mut global = BLOCKING_CONFIG.write().unwrap();
     *global = config;
 }
 
-/// 检查并执行阻塞 (在 agent_worker_with_heartbeat 中调用)
+/// 检查并执行阻塞 (在 AgentSessionService 请求路径中调用)
 ///
 /// # Arguments
 ///
@@ -62,26 +62,28 @@ pub fn inject_blocking(config: BlockingConfig) {
 /// ```rust
 /// # use agent_runner::testing::blocking::maybe_block;
 /// # async fn test() {
-/// // 在 agent_worker_with_heartbeat 中调用
+/// // 在 AgentSessionService 请求路径中调用
 /// maybe_block("prompt").await;
 /// # }
 /// ```
 pub async fn maybe_block(blocking_type: &str) {
-    let config = BLOCKING_CONFIG.read().unwrap();
-
-    let should_block = match blocking_type {
-        "new_session" => config.block_new_session,
-        "prompt" => config.block_prompt,
-        _ => false,
+    let (should_block, block_duration) = {
+        let config = BLOCKING_CONFIG.read().unwrap();
+        let should_block = match blocking_type {
+            "new_session" => config.block_new_session,
+            "prompt" => config.block_prompt,
+            _ => false,
+        };
+        (should_block, config.block_duration)
     };
 
     if should_block {
         tracing::warn!(
             "🧪 [TEST] Injected blocking: {}, duration: {:?}",
             blocking_type,
-            config.block_duration
+            block_duration
         );
-        tokio::time::sleep(config.block_duration).await;
+        tokio::time::sleep(block_duration).await;
     }
 }
 

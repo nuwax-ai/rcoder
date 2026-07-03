@@ -2,6 +2,8 @@
 //!
 //! 转发取消请求到容器内的 agent_runner 服务
 
+#![allow(dead_code)]
+
 use axum::extract::State;
 use axum::http::HeaderMap;
 use serde::Deserialize;
@@ -11,9 +13,13 @@ use utoipa::ToSchema;
 
 use crate::router::AppState;
 use docker_manager::ContainerBasicInfo;
-use shared_types::{AppError, AgentCancelRequest, AgentCancelResponse, ComputerAgentCancelRequest, HttpResult};
+use shared_types::{
+    AgentCancelRequest, AgentCancelResponse, AppError, ComputerAgentCancelRequest, HttpResult,
+};
 
-use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
+use super::utils::{
+    I18nJsonOrQuery, container_identity_from_name, extract_grpc_addr, get_locale_from_headers,
+};
 
 /// Computer Agent 取消任务的查询参数（仅用于测试）
 #[derive(Debug, Deserialize, ToSchema)]
@@ -32,10 +38,16 @@ pub struct ComputerCancelQuery {
     #[serde(default)]
     pub pod_id: Option<String>,
     /// 租户ID（可选）
-    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     pub tenant_id: Option<String>,
     /// 空间ID（可选）
-    #[serde(default, deserialize_with = "shared_types::flexible_string::flexible_string")]
+    #[serde(
+        default,
+        deserialize_with = "shared_types::flexible_string::flexible_string"
+    )]
     pub space_id: Option<String>,
     /// 隔离类型（可选），如 "project", "tenant", "space"
     #[serde(default)]
@@ -53,8 +65,8 @@ enum CancelIdentifier {
     Pod(String),
 }
 
-/// 统一的容器查询函数 - 通过 DuckDB 查询
-async fn get_container_for_cancel_duckdb(
+/// 统一的容器查询函数
+async fn get_container_for_cancel(
     state: &AppState,
     identifier: &CancelIdentifier,
 ) -> Result<Option<ContainerBasicInfo>, AppError> {
@@ -75,12 +87,13 @@ async fn get_container_for_cancel_duckdb(
             // ProjectAdapter.get() 内部会调用 get_container_for_project
             state
                 .get_project(project_id)
-                .and_then(|info| info.container().cloned())
+                .and_then(|info| info.container_info())
         }
         CancelIdentifier::User(user_id) => {
             // ComputerAgentRunner 模式：通过 user_id 查询容器
-            // 使用新添加的 get_container_by_user_id 方法
-            state.projects.get_container_by_user_id(user_id)
+            state
+                .projects
+                .get_container_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
         }
         CancelIdentifier::Pod(pod_id) => {
             // 共享容器模式：通过 pod_id 查询容器
@@ -105,28 +118,46 @@ async fn get_container_for_cancel_duckdb(
 }
 
 /// 转发取消请求到容器内的 agent_runner 服务
+/// Cancel 请求转发参数
+///
+/// 封装了转发 Cancel 请求到容器服务所需的所有参数，
+/// 避免函数参数过多。
+struct CancelForwardParams<'a> {
+    /// 项目 ID
+    project_id: &'a str,
+    /// 会话 ID（可选）
+    session_id: Option<&'a str>,
+    /// 容器信息
+    container_info: &'a ContainerBasicInfo,
+    /// gRPC 连接池
+    grpc_pool: &'a Arc<crate::grpc::GrpcChannelPool>,
+    /// 语言设置
+    locale: &'static str,
+    /// 容器运行时
+    runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
+    /// RCoder 容器前缀
+    rcoder_prefix: &'a str,
+    /// Computer 容器前缀
+    computer_prefix: &'a str,
+}
+
 ///
 /// 🎯 使用 gRPC CancelSession RPC 替代 HTTP 转发
 async fn forward_cancel_request_to_container_service(
-    project_id: &str,
-    session_id: Option<&str>,
-    container_info: &ContainerBasicInfo,
-    grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
-    locale: &'static str,
-    rcoder_prefix: &str,
-    computer_prefix: &str,
+    params: CancelForwardParams<'_>,
 ) -> Result<HttpResult<AgentCancelResponse>, AppError> {
-    let session_id_display = session_id
+    let session_id_display = params
+        .session_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| "None".to_string());
     info!(
         "📤 [CANCEL_FORWARD] Forwarding cancel request to container (gRPC): project_id={}, session_id={}, container_id={}",
-        project_id, session_id_display, container_info.container_id
+        params.project_id, session_id_display, params.container_info.container_id
     );
 
     // 🎯 使用 gRPC 替代 HTTP
     // 从 service_url 提取 gRPC 地址
-    let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
+    let grpc_addr = extract_grpc_addr(&params.container_info.service_url)?;
 
     info!(
         "📡 [CANCEL_FORWARD] Sending gRPC cancel request to: {}, session_id={}",
@@ -134,16 +165,17 @@ async fn forward_cancel_request_to_container_service(
     );
 
     // 构建 session_id（如果未提供则使用空字符串，由 Agent Runner 根据 project_id 查找）
-    let session_id_str = session_id.unwrap_or("").to_string();
+    let session_id_str = params.session_id.unwrap_or("").to_string();
     let reason = "User requested cancellation".to_string();
 
     // 调用 gRPC CancelSession
     match crate::grpc::grpc_cancel_session_with_pool(
-        grpc_pool,
+        params.grpc_pool,
         &grpc_addr,
         session_id_str.clone(),
         reason,
-        project_id.to_string(),
+        params.project_id.to_string(),
+        None, // 使用默认超时 (GRPC_CANCEL_SESSION_TIMEOUT_SECS)
     )
     .await
     {
@@ -164,62 +196,74 @@ async fn forward_cancel_request_to_container_service(
                 error!("[CANCEL_FORWARD] gRPC cancelfailed: {}", error_msg);
                 Ok(HttpResult::error_with_locale(
                     shared_types::error_codes::ERR_CANCEL_FAILED,
-                    locale,
+                    params.locale,
                 ))
             }
         }
-        Err(e) => {
-            error!("[CANCEL_FORWARD] gRPC call failed: {}", e);
+        Err(grpc_err) => {
+            error!("[CANCEL_FORWARD] gRPC call failed: {}", grpc_err);
 
-            // 检查特定的 gRPC 错误码并分类处理
-            if let Some(status) = crate::grpc::extract_grpc_status(&e) {
-                use tonic::Code;
-                match status.code() {
-                    Code::NotFound => {
-                        // 会话或 Agent 不存在，返回成功（幂等设计）
-                        info!("[CANCEL_FORWARD] Session not found, cancel succeeded");
-                        return Ok(HttpResult::success(AgentCancelResponse {
-                            success: true,
-                            session_id: session_id.unwrap_or("").to_string(),
-                        }));
-                    }
-                    Code::Unavailable => {
-                        // Agent Worker 不可用，需要判断是容器已销毁还是临时故障
-                        // 通过 Docker API 检查容器是否真的存在
-                        let container_exists = check_container_exists_by_info(container_info, rcoder_prefix, computer_prefix).await;
-
-                        if !container_exists {
-                            // 容器已销毁，取消目标已达成（幂等设计）
-                            info!(
-                                "[CANCEL_FORWARD] container already destroyed, cancel request already completed"
-                            );
+            // 使用 GrpcError 枚举进行错误分类处理
+            match &grpc_err {
+                crate::grpc::GrpcError::Status(status) => {
+                    use tonic::Code;
+                    match status.code() {
+                        Code::NotFound => {
+                            // 会话或 Agent 不存在，返回成功（幂等设计）
+                            info!("[CANCEL_FORWARD] Session not found, cancel succeeded");
                             return Ok(HttpResult::success(AgentCancelResponse {
                                 success: true,
-                                session_id: session_id.unwrap_or("").to_string(),
+                                session_id: params.session_id.unwrap_or("").to_string(),
                             }));
-                        } else {
-                            // 容器存在但服务不可用（可能是临时故障），返回错误
-                            warn!(
-                                "[CANCEL_FORWARD] Agent Worker unavailable (container exists, may be temporary failure)"
-                            );
-                            return Ok(HttpResult::error_with_locale(
-                                shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
-                                locale,
-                            ));
+                        }
+                        Code::Unavailable => {
+                            // Agent Worker 不可用，需要判断是容器已销毁还是临时故障
+                            // 通过 Docker API 检查容器是否真的存在
+                            let container_exists = check_container_exists_by_info(
+                                params.runtime,
+                                params.container_info,
+                                params.rcoder_prefix,
+                                params.computer_prefix,
+                            )
+                            .await;
+
+                            if !container_exists {
+                                // 容器已销毁，取消目标已达成（幂等设计）
+                                info!(
+                                    "[CANCEL_FORWARD] container already destroyed, cancel request already completed"
+                                );
+                                return Ok(HttpResult::success(AgentCancelResponse {
+                                    success: true,
+                                    session_id: params.session_id.unwrap_or("").to_string(),
+                                }));
+                            } else {
+                                // 容器存在但服务不可用（可能是临时故障），返回错误
+                                warn!(
+                                    "[CANCEL_FORWARD] Agent Worker unavailable (container exists, may be temporary failure)"
+                                );
+                                return Ok(HttpResult::error_with_locale(
+                                    shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
+                                    params.locale,
+                                ));
+                            }
+                        }
+                        other_code => {
+                            // 其他 gRPC 状态码
+                            error!("[CANCEL_FORWARD] gRPC error code: {:?}", other_code);
                         }
                     }
-                    other_code => {
-                        // 其他 gRPC 状态码
-                        error!("[CANCEL_FORWARD] gRPC error code: {:?}", other_code);
-                    }
+                }
+                crate::grpc::GrpcError::Transport(_) => {
+                    // 连接层错误，通常是网络问题
+                    error!("[CANCEL_FORWARD] gRPC transport error: {}", grpc_err);
                 }
             }
 
             // 其他 gRPC 通信失败（网络错误等）
-            return Ok(HttpResult::error_with_locale(
+            Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
-                locale,
-            ));
+                params.locale,
+            ))
         }
     }
 }
@@ -232,63 +276,41 @@ async fn forward_cancel_request_to_container_service(
 ///
 /// 使用容器名称而非 ID，因为容器重启后 ID 会变，但名称不变
 async fn check_container_exists_by_info(
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     container_info: &ContainerBasicInfo,
     rcoder_prefix: &str,
     computer_prefix: &str,
 ) -> bool {
-    match docker_manager::runtime::RuntimeManager::get().await {
-        Ok(runtime) => {
-            // 使用配置化的前缀，而不是硬编码的 ServiceType::container_prefix()
+    let query = if let Some((identifier, service_type)) = container_identity_from_name(
+        &container_info.container_name,
+        rcoder_prefix,
+        computer_prefix,
+    ) {
+        runtime
+            .get_container_info_by_identifier(identifier, &service_type)
+            .await
+    } else {
+        return true;
+    };
 
-            let query = if let Some(identifier) = container_info
-                .container_name
-                .strip_prefix(&format!("{}-", computer_prefix))
-            {
-                runtime
-                    .get_container_info_by_identifier(
-                        identifier,
-                        &shared_types::ServiceType::ComputerAgentRunner,
-                    )
-                    .await
-            } else if let Some(identifier) = container_info
-                .container_name
-                .strip_prefix(&format!("{}-", rcoder_prefix))
-            {
-                runtime
-                    .get_container_info_by_identifier(identifier, &shared_types::ServiceType::RCoder)
-                    .await
-            } else {
-                return true;
-            };
-
-            match query {
-                Ok(Some(info)) => {
-                    debug!(
-                        "🔍 [CANCEL_FORWARD] Runtime container exists: name={}, id={}",
-                        info.container_name, info.container_id
-                    );
-                    true
-                }
-                Ok(None) => {
-                    info!(
-                        "🔍 [CANCEL_FORWARD] Runtime container not found (already destroyed): {}",
-                        container_info.container_name
-                    );
-                    false
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ [CANCEL_FORWARD] Failed to query runtime container status: {}, conservatively assuming container exists",
-                        e
-                    );
-                    true
-                }
-            }
+    match query {
+        Ok(Some(info)) => {
+            debug!(
+                "🔍 [CANCEL_FORWARD] Runtime container exists: name={}, id={}",
+                info.container_name, info.container_id
+            );
+            true
+        }
+        Ok(None) => {
+            info!(
+                "🔍 [CANCEL_FORWARD] Runtime container not found (already destroyed): {}",
+                container_info.container_name
+            );
+            false
         }
         Err(e) => {
-            // 无法获取 runtime，保守地认为容器存在
             warn!(
-                "[CANCEL_FORWARD] Failed to get runtime: {}, conservatively assuming container exists",
+                "⚠️ [CANCEL_FORWARD] Failed to query runtime container status: {}, conservatively assuming container exists",
                 e
             );
             true
@@ -298,7 +320,7 @@ async fn check_container_exists_by_info(
 
 /// 内部核心处理函数 v2：处理会话取消请求（支持多种服务类型）
 ///
-/// 使用 DuckDB 统一查询，支持 RCoder 和 ComputerAgentRunner 两种模式
+/// 使用 storage lookup，支持 RCoder 和 ComputerAgentRunner 两种模式
 async fn handle_session_cancel_internal_v2(
     state: &AppState,
     identifier: CancelIdentifier,
@@ -323,7 +345,7 @@ async fn handle_session_cancel_internal_v2(
     );
 
     // 获取容器（不创建）
-    let container_info = get_container_for_cancel_duckdb(state, &identifier).await?;
+    let container_info = get_container_for_cancel(state, &identifier).await?;
 
     // 如果容器不存在，说明任务已经结束或从未启动，直接返回成功
     let Some(container_info) = container_info else {
@@ -338,16 +360,17 @@ async fn handle_session_cancel_internal_v2(
     };
 
     // 转发取消请求到容器服务
-    let result = forward_cancel_request_to_container_service(
-        &project_id, // 使用传入的 project_id
-        session_id.as_deref(),
-        &container_info,
-        &state.grpc_pool,
+    let cancel_params = CancelForwardParams {
+        project_id: &project_id,
+        session_id: session_id.as_deref(),
+        container_info: &container_info,
+        grpc_pool: &state.grpc_pool,
         locale,
-        &state.container_prefix_rcoder,
-        &state.container_prefix_computer,
-    )
-    .await;
+        runtime: state.runtime(),
+        rcoder_prefix: &state.container_prefix_rcoder,
+        computer_prefix: &state.container_prefix_computer,
+    };
+    let result = forward_cancel_request_to_container_service(cancel_params).await;
 
     match &result {
         Ok(_) => {
@@ -448,7 +471,10 @@ pub async fn agent_session_cancel(
 
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request.project_id.as_ref().expect("validated: project_id is required and non-empty");
+    let project_id = request
+        .project_id
+        .as_ref()
+        .expect("validated: project_id is required and non-empty");
 
     info!(
         "🚫 [CANCEL] Agent cancel request: project_id={}, session_id={:?}",
@@ -536,7 +562,7 @@ pub async fn agent_session_cancel(
     summary = "转发 Computer Agent 任务取消请求（支持 user_id）",
     description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 或 pod_id 定位用户容器"
 )]
-#[instrument(skip(state), fields(user_id = ?request.user_id.as_ref().map(|s| s.as_str()), project_id = %request.project_id, pod_id = ?request.pod_id.as_ref().map(|s| s.as_str())))]
+#[instrument(skip(state), fields(user_id = ?request.user_id.as_deref(), project_id = %request.project_id, pod_id = ?request.pod_id.as_deref()))]
 pub async fn computer_agent_session_cancel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -545,8 +571,16 @@ pub async fn computer_agent_session_cancel(
     let locale = get_locale_from_headers(&headers);
 
     // 验证 user_id 或 pod_id 至少有一个
-    let has_user_id = request.user_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    let has_pod_id = request.pod_id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let has_user_id = request
+        .user_id
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_pod_id = request
+        .pod_id
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     if !has_user_id && !has_pod_id {
         error!("[COMPUTER_CANCEL] user_id or pod_id is required");
         return Ok(HttpResult::error_with_locale(

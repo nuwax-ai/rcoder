@@ -1,6 +1,6 @@
 //! Agent trait definition.
 
-use agent_client_protocol::schema::McpServer;
+use agent_client_protocol::schema::v1::McpServer;
 use tracing::{debug, info};
 
 /// Agent startup configuration
@@ -27,6 +27,12 @@ pub struct AgentStartConfig {
     /// Service type (for loading corresponding config, required)
     pub service_type: shared_types::ServiceType,
 
+    /// User ID, mainly used by ComputerAgentRunner permission routing.
+    pub user_id: Option<String>,
+
+    /// Permission approval mode.
+    pub agent_mode: shared_types::AgentMode,
+
     /// Session ID for resuming sessions
     ///
     /// When resuming a previous session, pass the previous session_id,
@@ -49,6 +55,16 @@ pub struct AgentStartConfig {
     ///
     /// Maximum wait time for Agent internal cancel operations
     pub agent_cancel_timeout_secs: Option<u64>,
+
+    /// 工具审批规则（来自请求参数）
+    pub tool_approval_rules: Option<Vec<shared_types::ToolApprovalRule>>,
+
+    /// 🆕 是否是 DevComputer 接口请求
+    ///
+    /// 用于 `{PREFIX_WORKSPACE_DIR}` 变量解析：
+    /// - `true`（devcomputer）：LOG_DIR 解析为 `/home/user/`（方便开发调试）
+    /// - `false`（computer）：LOG_DIR 解析为 `/app/container-logs`
+    pub is_devcomputer: bool,
 }
 
 impl AgentStartConfig {
@@ -62,10 +78,14 @@ impl AgentStartConfig {
             mcp_servers: Vec::new(),
             extra_meta: None,
             service_type,
+            user_id: None,
+            agent_mode: shared_types::AgentMode::Yolo,
             resume_session_id: None,
             agent_server_override: None,
             acp_session_create_timeout_secs: None,
             agent_cancel_timeout_secs: None,
+            tool_approval_rules: None,
+            is_devcomputer: false,
         }
     }
 
@@ -96,6 +116,18 @@ impl AgentStartConfig {
         self
     }
 
+    /// Set user ID.
+    pub fn with_user_id(mut self, user_id: Option<String>) -> Self {
+        self.user_id = user_id.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Set permission approval mode.
+    pub fn with_agent_mode(mut self, agent_mode: shared_types::AgentMode) -> Self {
+        self.agent_mode = agent_mode;
+        self
+    }
+
     /// Set session ID for resuming sessions
     pub fn with_resume_session_id(mut self, session_id: String) -> Self {
         self.resume_session_id = Some(session_id);
@@ -120,6 +152,23 @@ impl AgentStartConfig {
     /// 🆕 Set Agent cancel call timeout
     pub fn with_agent_cancel_timeout(mut self, timeout_secs: u64) -> Self {
         self.agent_cancel_timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    /// Set tool approval rules
+    pub fn with_tool_approval_rules(
+        mut self,
+        rules: Option<Vec<shared_types::ToolApprovalRule>>,
+    ) -> Self {
+        self.tool_approval_rules = rules;
+        self
+    }
+
+    /// 🆕 Set is_devcomputer flag
+    ///
+    /// 用于 `{PREFIX_WORKSPACE_DIR}` 变量解析逻辑
+    pub fn with_is_devcomputer(mut self, is_devcomputer: bool) -> Self {
+        self.is_devcomputer = is_devcomputer;
         self
     }
 
@@ -150,7 +199,7 @@ impl AgentStartConfig {
             );
             debug!(
                 "[ACP] system_prompt content (first 200 chars): \"{}\"",
-                &system_prompt[..system_prompt.len().min(200)]
+                system_prompt.chars().take(200).collect::<String>()
             );
         } else {
             info!("[ACP] No system_prompt to send to agent");
@@ -237,7 +286,7 @@ impl AgentStartConfig {
             );
             debug!(
                 "[ACP] system_prompt content (first 200 chars): \"{}\"",
-                &system_prompt[..system_prompt.len().min(200)]
+                system_prompt.chars().take(200).collect::<String>()
             );
         }
 
@@ -299,6 +348,9 @@ pub struct PromptMessage {
     /// Service type
     pub service_type: shared_types::ServiceType,
 
+    /// User ID, mainly used by ComputerAgentRunner permission routing.
+    pub user_id: Option<String>,
+
     // === New fields (v2) ===
     /// System prompt override
     ///
@@ -314,6 +366,13 @@ pub struct PromptMessage {
     ///
     /// Contains Agent server configuration and MCP server configuration
     pub agent_config_override: Option<shared_types::ChatAgentConfig>,
+
+    /// 是否是 DevComputer 接口请求
+    ///
+    /// 用于 `{PREFIX_WORKSPACE_DIR}` 变量解析：
+    /// - `true`：LOG_DIR 解析为 `/home/user/`
+    /// - `false`：LOG_DIR 解析为 `/app/container-logs`
+    pub is_devcomputer: bool,
 }
 
 impl PromptMessage {
@@ -334,10 +393,12 @@ impl PromptMessage {
             attachments: Vec::new(),
             data_source_attachments: Vec::new(),
             service_type,
+            user_id: None,
             // New fields default to None
             system_prompt_override: None,
             user_prompt_template_override: None,
             agent_config_override: None,
+            is_devcomputer: false,
         }
     }
 
@@ -379,17 +440,24 @@ impl PromptMessage {
         self.agent_config_override = config;
         self
     }
+
+    /// Set user ID.
+    pub fn with_user_id(mut self, user_id: Option<String>) -> Self {
+        self.user_id = user_id.filter(|s| !s.trim().is_empty());
+        self
+    }
 }
 
 /// Convert from ChatPrompt to PromptMessage
 impl From<shared_types::ChatPrompt> for PromptMessage {
     fn from(chat_prompt: shared_types::ChatPrompt) -> Self {
         info!(
-            "[agent_abstraction] Converting ChatPrompt to PromptMessage, project_id={:?}, session_id={:?}, has_model_provider={}, has_agent_config_override={}",
+            "[agent_abstraction] Converting ChatPrompt to PromptMessage, project_id={:?}, session_id={:?}, has_model_provider={}, has_agent_config_override={}, is_devcomputer={}",
             chat_prompt.project_id,
             chat_prompt.session_id,
             chat_prompt.model_provider.is_some(),
             chat_prompt.agent_config_override.is_some(),
+            chat_prompt.is_devcomputer,
         );
 
         Self {
@@ -404,10 +472,12 @@ impl From<shared_types::ChatPrompt> for PromptMessage {
             attachments: chat_prompt.attachments,
             data_source_attachments: chat_prompt.data_source_attachments,
             service_type: chat_prompt.service_type,
+            user_id: chat_prompt.user_id,
             // Map new fields
             system_prompt_override: chat_prompt.system_prompt_override,
             user_prompt_template_override: chat_prompt.user_prompt_template_override,
             agent_config_override: chat_prompt.agent_config_override,
+            is_devcomputer: chat_prompt.is_devcomputer,
         }
     }
 }

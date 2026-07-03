@@ -1,0 +1,309 @@
+# Release Beta CI - 测试版本发布
+# 触发条件: push beta tag (如 v1.0.0-beta.1, 1.0.0-beta.1)
+# npm tag: beta
+
+name: Release Beta
+
+permissions:
+  "contents": "write"
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+-beta*'
+      - 'v[0-9]+.[0-9]+.[0-9]+-beta*'
+
+jobs:
+  # ============================================================
+  # Step 1: 提取版本信息并生成构建矩阵
+  # ============================================================
+  plan:
+    runs-on: "ubuntu-22.04"
+    outputs:
+      tag: ${{ github.ref_name }}
+      version: ${{ steps.version.outputs.version }}
+      base-version: ${{ steps.version.outputs.base-version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          BASE_VERSION="${VERSION%%-*}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "base-version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate matrix
+        id: matrix
+        run: |
+          # 使用 cargo-dist 生成构建矩阵
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+
+          BASE_VERSION="${{ steps.version.outputs.base-version }}"
+          sed -i "s/version = \".*\"/version = \"$BASE_VERSION\"/" crates/rcoder-cli/Cargo.toml
+
+          dist host --steps=create --tag=v$BASE_VERSION --output-format=json > plan-dist-manifest.json
+
+          # 提取矩阵配置
+          MATRIX=$(jq -c '.ci.github.artifacts_matrix' plan-dist-manifest.json)
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: plan-manifest
+          path: plan-dist-manifest.json
+
+  # ============================================================
+  # Step 2: 并行构建各平台二进制
+  # ============================================================
+  build:
+    name: build (${{ join(matrix.targets, ', ') }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container && matrix.container.image || null }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RUSTUP_TOOLCHAIN: "1.91.0"
+    steps:
+      - name: enable windows longpaths
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust non-interactively if not already installed
+        if: ${{ matrix.container }}
+        run: |
+          if ! command -v cargo > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ]; then
+            PROTOC_ARCH="linux-aarch_64"
+          else
+            PROTOC_ARCH="linux-x86_64"
+          fi
+          curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-${PROTOC_ARCH}.zip"
+          unzip "protoc-25.1-${PROTOC_ARCH}.zip" -d $HOME/.local
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Install dist
+        run: ${{ matrix.install_dist.run }}
+
+      - name: Ensure dist in PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Fetch plan manifest
+        uses: actions/download-artifact@v7
+        with:
+          name: plan-manifest
+          path: target/distrib/
+
+      - name: Install dependencies
+        run: ${{ matrix.packages_install }}
+
+      - name: Build artifacts
+        shell: bash
+        run: |
+          BASE_VERSION="${{ needs.plan.outputs.base-version }}"
+          sed -i.bak "s/version = \".*\"/version = \"$BASE_VERSION\"/" crates/rcoder-cli/Cargo.toml
+          rm -f crates/rcoder-cli/Cargo.toml.bak
+
+          dist build --tag=v$BASE_VERSION --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ join(matrix.targets, '_') }}
+          path: ${{ steps.collect.outputs.paths }}
+
+  # ============================================================
+  # Step 3: 创建 GitHub Release 并发布 npm
+  # ============================================================
+  release:
+    needs: [plan, build]
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20.x'
+          registry-url: 'https://registry.npmjs.org'
+
+      # 下载所有构建产物
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: build-*
+          path: artifacts/
+          merge-multiple: true
+
+      # 创建 GitHub Release
+      - name: Create GitHub Release
+        run: |
+          echo "Creating prerelease: $TAG"
+          gh release create "$TAG" \
+            --prerelease \
+            --title "Beta Release $TAG" \
+            --notes "Beta release for testing" \
+            artifacts/*.tar.xz artifacts/*.zip
+
+      # 准备 npm 包
+      - name: Prepare npm packages
+        run: |
+          VERSION="${{ env.VERSION }}"
+
+          # 更新所有 package.json 版本
+          for dir in npm/*/; do
+            if [ -f "$dir/package.json" ]; then
+              jq --arg v "$VERSION" '.version = $v' "$dir/package.json" > "$dir/package.json.tmp"
+              mv "$dir/package.json.tmp" "$dir/package.json"
+            fi
+          done
+
+          # 更新主包的 optionalDependencies 版本（平台包使用非 scoped 唯一包名）
+          jq --arg v "$VERSION" '
+            .optionalDependencies["rcoder-cli-linux-x64"] = $v |
+            .optionalDependencies["rcoder-cli-linux-arm64"] = $v |
+            .optionalDependencies["rcoder-cli-darwin-x64"] = $v |
+            .optionalDependencies["rcoder-cli-darwin-arm64"] = $v |
+            .optionalDependencies["rcoder-cli-windows-x64"] = $v
+          ' npm/rcoder-cli/package.json > npm/rcoder-cli/package.json.tmp
+          mv npm/rcoder-cli/package.json.tmp npm/rcoder-cli/package.json
+
+      # 解压二进制文件
+      - name: Extract binaries
+        run: |
+          ls -la artifacts/
+
+          # 解压 Linux x64（tarball 带顶层目录，需 strip 1 层）
+          mkdir -p npm/rcoder-cli-linux-x64
+          tar -xf artifacts/rcoder-cli-x86_64-unknown-linux-gnu.tar.xz --strip-components=1 -C npm/rcoder-cli-linux-x64
+
+          # 解压 Linux arm64
+          mkdir -p npm/rcoder-cli-linux-arm64
+          tar -xf artifacts/rcoder-cli-aarch64-unknown-linux-gnu.tar.xz --strip-components=1 -C npm/rcoder-cli-linux-arm64
+
+          # 解压 macOS x64
+          mkdir -p npm/rcoder-cli-darwin-x64
+          tar -xf artifacts/rcoder-cli-x86_64-apple-darwin.tar.xz --strip-components=1 -C npm/rcoder-cli-darwin-x64
+
+          # 解压 macOS arm64
+          mkdir -p npm/rcoder-cli-darwin-arm64
+          tar -xf artifacts/rcoder-cli-aarch64-apple-darwin.tar.xz --strip-components=1 -C npm/rcoder-cli-darwin-arm64
+
+          # 解压 Windows x64
+          mkdir -p npm/rcoder-cli-win32-x64
+          unzip artifacts/rcoder-cli-x86_64-pc-windows-msvc.zip -d npm/rcoder-cli-win32-x64
+
+          # 显示结果
+          echo "=== Package contents ==="
+          for dir in npm/*/; do
+            if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
+              echo "--- $dir ---"
+              ls -la "$dir" | head -5
+            fi
+          done
+
+      # 发布 npm 包
+      - name: Publish npm packages
+        run: |
+          npm config set //registry.npmjs.org/:_authToken ${{ secrets.NPM_TOKEN }}
+
+          mkdir -p /tmp/npm-packages
+
+          # 使用 npm pack 打包，然后 npm publish <tarball> 发布
+          # 这样可以跳过 git 验证
+          failures=0
+          for pkg in npm/rcoder-cli-*; do
+            if [ -f "$pkg/package.json" ]; then
+              pkgName=$(jq -r '.name' "$pkg/package.json")
+              echo "Packing $pkgName..."
+              cd "$pkg"
+              tarball=$(npm pack 2>/dev/null)
+              cd -
+              echo "Publishing $pkgName with beta tag..."
+              if ! npm publish "$pkg/$tarball" --tag beta --registry https://registry.npmjs.org --access public; then
+                echo "ERROR: Failed to publish $pkgName"
+                failures=$((failures+1))
+              fi
+              rm -f "$pkg/$tarball"
+            fi
+          done
+
+          # 发布主包
+          echo "Packing rcoder-cli..."
+          cd npm/rcoder-cli
+          tarball=$(npm pack 2>/dev/null)
+          cd -
+          echo "Publishing rcoder-cli with beta tag..."
+          npm publish "npm/rcoder-cli/$tarball" --tag beta --registry https://registry.npmjs.org
+          rm -f "npm/rcoder-cli/$tarball"
+
+          if [ "$failures" -ne 0 ]; then
+            echo "ERROR: $failures npm package(s) failed to publish"
+            exit 1
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ============================================================
+  # Step 4: 发布公告
+  # ============================================================
+  announce:
+    needs: [plan, release]
+    runs-on: "ubuntu-22.04"
+    steps:
+      - name: Summary
+        run: |
+          echo "## Beta Release Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.plan.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag**: ${{ needs.plan.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **npm tag**: beta" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Install with:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "npm install -g rcoder-cli@beta" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

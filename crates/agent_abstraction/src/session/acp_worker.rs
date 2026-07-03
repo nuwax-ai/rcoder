@@ -12,7 +12,7 @@ use std::sync::Arc;
 use agent_config::{AgentServersConfig, PromptConfigAssembler};
 use anyhow::Result;
 use shared_types::{ProjectAndAgentInfo, SessionEntry};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::{AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};
 use crate::launcher::convert_context_servers;
@@ -52,13 +52,13 @@ where
         let project_path = request.project_path().clone();
 
         info!(
-            "📨 AcpAgentWorker received request, project_id: {}",
+            "AcpAgentWorker received request, project_id: {}",
             project_id
         );
 
         // 1. 路径规范化
         let normalized_path = AcpSessionManager::<N, R>::normalize_path(&project_path);
-        debug!("📂 path: {:?}", normalized_path);
+        debug!("path: {:?}", normalized_path);
 
         // 2. 确保项目目录存在
         AcpSessionManager::<N, R>::ensure_project_dir(&normalized_path)
@@ -69,7 +69,7 @@ where
             })?;
 
         // 3. 使用 PromptConfigAssembler 组装配置
-        let default_agent_id = "claude-code-acp-ts";
+        let default_agent_id = shared_types::DEFAULT_AGENT_ID;
 
         // 根据请求中的 service_type 加载对应配置
         let servers_config =
@@ -83,7 +83,7 @@ where
 
         // 🆕 获取用户指定的 agent_id（如果有）
         let agent_id = assembler.get_agent_id(default_agent_id);
-        debug!("🎯 Resolved Agent ID: {}", agent_id);
+        debug!("Resolved Agent ID: {}", agent_id);
 
         // 获取最终的系统提示词（入参有值则使用入参，否则使用默认配置）
         // 🆕 使用实际 agent_id 而不是 default_agent_id
@@ -94,7 +94,7 @@ where
             assembler.apply_user_prompt(&agent_id, &request.prompt_message.content);
 
         info!(
-            "📝 Prompt processing - System prompt: has_override={}, length={} | User prompt: has_template={}, original_len={}, final_len={}",
+            "Prompt processing - System prompt: has_override={}, length={} | User prompt: has_template={}, original_len={}, final_len={}",
             assembler.has_system_prompt_override(),
             system_prompt.len(),
             assembler.has_user_prompt_template_override(),
@@ -103,13 +103,13 @@ where
         );
 
         debug!(
-            "📝 System prompt: has_override={}, length={}, content={}",
+            "System prompt: has_override={}, length={}, content={}",
             assembler.has_system_prompt_override(),
             system_prompt.len(),
             system_prompt
         );
         debug!(
-            "📝 User prompt: has_template={}, original_len={}, final_len={}, final_content={}",
+            "User prompt: has_template={}, original_len={}, final_len={}, final_content={}",
             assembler.has_user_prompt_template_override(),
             request.prompt_message.content.len(),
             final_user_prompt.len(),
@@ -119,30 +119,45 @@ where
         // 获取 MCP 服务器配置（入参有值则使用入参，否则使用默认配置）
         let context_servers = assembler.get_context_servers();
         debug!(
-            "🔌 MCP server config: has_override={}, count={}",
+            "MCP server config: has_override={}, count={}",
             assembler.has_agent_config_override(),
             context_servers.len()
         );
 
         // 将 context_servers 转换为 ACP 协议的 McpServer 格式
         let mcp_servers = convert_context_servers(&context_servers);
-        debug!("🔌 MCP servers: {}", mcp_servers.len());
+        debug!("MCP servers: {}", mcp_servers.len());
 
         // 构建 AgentStartConfig 并传递 MCP 服务器、service_type
         let mut start_config = AgentStartConfig::new(request.prompt_message.service_type.clone())
             .with_system_prompt(system_prompt)
-            .with_mcp_servers(mcp_servers);
+            .with_mcp_servers(mcp_servers)
+            .with_user_id(request.prompt_message.user_id.clone())
+            .with_is_devcomputer(request.prompt_message.is_devcomputer);
 
         // 🆕 如果用户指定了 agent_server 配置，添加到 start_config
         // 注意：这里直接使用用户传入的配置，由 launcher 层负责与默认配置合并
-        if let Some(ref override_config) = request.prompt_message.agent_config_override {
-            if let Some(ref agent_server) = override_config.agent_server {
-                debug!(
-                    "📝 Using user-specified Agent server config: command={:?}, args={:?}",
-                    agent_server.command, agent_server.args
+        if let Some(ref override_config) = request.prompt_message.agent_config_override
+            && let Some(ref agent_server) = override_config.agent_server
+        {
+            debug!(
+                "Using user-specified Agent server config: command={:?}, args={:?}",
+                agent_server.command, agent_server.args
+            );
+            if let Err(err) = agent_server.agent_mode() {
+                warn!(
+                    "[ACP] Invalid agent_mode, falling back to yolo: project_id={}, error={}",
+                    request.prompt_message.project_id, err
                 );
-                start_config = start_config.with_agent_server_override(agent_server.clone());
             }
+            start_config = start_config.with_agent_mode(
+                agent_server
+                    .agent_mode()
+                    .unwrap_or(shared_types::AgentMode::Yolo),
+            );
+            start_config = start_config.with_agent_server_override(agent_server.clone());
+            start_config =
+                start_config.with_tool_approval_rules(agent_server.tool_approval_rules.clone());
         }
 
         // Resume 策略：直接传递 session_id，由 LoadSessionRequest 在 Agent 层面检查
@@ -185,21 +200,21 @@ where
 
         // 使用 SessionEntry trait 方法访问会话信息
         info!(
-            "✅ Session ready, session_id: {}, is_new: {}",
+            "Session ready, session_id: {}, is_new: {}",
             session_entry.session_id(),
             is_new
         );
 
         // 6. 构建 Prompt 请求
         let prompt_request = if let Some(ref attachment_blocks) = request.attachment_blocks {
-            debug!("📎 Built Prompt request with attachments");
+            debug!("Built Prompt request with attachments");
             AcpSessionManager::<N, R>::build_prompt_request_with_attachments(
                 &prompt_message,
                 session_entry.session_id().clone(),
                 attachment_blocks.clone(),
             )?
         } else {
-            debug!("📝 Built text Prompt request");
+            debug!("Built text Prompt request");
             AcpSessionManager::<N, R>::build_text_prompt_request(
                 &prompt_message,
                 session_entry.session_id().clone(),

@@ -1,0 +1,48 @@
+[package]
+name = "rcoder-gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Stateless gateway for K8s deployment: header injection + Envoy Gateway routing"
+publish = false
+
+[package.metadata.dist]
+dist = false
+
+[[bin]]
+name = "rcoder-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Pingora (proxy engine)
+pingora = { workspace = true }
+pingora-core = { workspace = true }
+pingora-http = { workspace = true }
+pingora-proxy = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP client (for rcoder-control calls)
+reqwest = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+matchit = { workspace = true }
+moka = { workspace = true }
+
+# Shared types
+shared_types = { workspace = true }

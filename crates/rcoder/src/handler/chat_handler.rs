@@ -4,27 +4,54 @@
 
 use anyhow::Result;
 use axum::{extract::State, http::HeaderMap};
-use serde::{Deserialize, Serialize};
-use shared_types::{AgentChatRequest, ChatAgentConfig, IsolationType, ModelProviderConfig, ProjectAndContainerInfo};
+use shared_types::{AgentChatRequest, IsolationType, ProjectAndContainerInfo};
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
-use utoipa::ToSchema;
 
 use crate::{router::AppState, *};
 use docker_manager::ContainerBasicInfo;
 
-use super::utils::{I18nJsonOrQuery, extract_grpc_addr_with_port, get_locale_from_headers, build_workspace_path};
+use super::pod_handler::resolve_resource_limits_from_config;
+
+use super::utils::{I18nJsonOrQuery, build_workspace_path, get_locale_from_headers};
+
+/// 转发请求的上下文参数
+///
+/// 封装了转发请求到容器服务所需的所有参数，
+/// 避免函数参数过多，同时支持不同 ServiceType 的业务场景。
+///
+/// 注意：runtime、rcoder_prefix、computer_prefix 字段
+/// 当前在 forward_request_to_container_service 中未使用，
+/// 但保留用于未来扩展不同 ServiceType 的业务逻辑。
+#[allow(dead_code)]
+struct ForwardContext<'a> {
+    /// gRPC 连接池
+    grpc_pool: &'a Arc<crate::grpc::GrpcChannelPool>,
+    /// K8s namespace
+    namespace: &'a str,
+    /// K8s 集群域名
+    cluster_domain: &'a str,
+    /// 容器运行时（用于不同 ServiceType 的容器管理）
+    runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
+    /// RCoder 容器前缀（用于 WebAgentRunner 场景）
+    rcoder_prefix: &'a str,
+    /// Computer 容器前缀（用于 ComputerAgentRunner 场景）
+    computer_prefix: &'a str,
+    /// 语言设置
+    locale: &'static str,
+}
 
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
 ///
-/// 1. 根据 project_id 检查或动态创建对应的容器（默认使用 ServiceType::RCoder）
+/// 1. 根据 project_id 检查或动态创建对应的容器（默认使用 ServiceType::WebAgentRunner）
 /// 2. 将原始聊天请求直接转发到容器内的 agent_runner 服务
 /// 3. 获取并返回 agent_runner 的处理结果
 ///
 /// 注意：
 /// - 所有参数处理（如 project_id、session_id 生成）都由 agent_runner 处理
 /// - RCoder 只负责容器管理和请求转发
-/// - 当前默认使用 ServiceType::RCoder，AgentRunner 模式正在开发中
+/// - 当前默认使用 ServiceType::WebAgentRunner，AgentRunner 模式正在开发中
 /// - Resume 会话的降级逻辑已在 agent_runner 层通过 list_sessions API 预检查处理
 #[utoipa::path(
     post,
@@ -72,7 +99,7 @@ use super::utils::{I18nJsonOrQuery, extract_grpc_addr_with_port, get_locale_from
     tag = "chat",
     operation_id = "handle_chat",
     summary = "转发聊天消息到容器化 AI 服务",
-    description = "根据 project_id 动态管理容器（默认使用 ServiceType::RCoder），将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
+    description = "根据 project_id 动态管理容器（默认使用 ServiceType::WebAgentRunner），将原始聊天请求直接转发到容器内的 agent_runner 服务进行处理"
 )]
 #[instrument(skip(state, request), fields(project_id = ?request.project_id, session_id = ?request.session_id))]
 pub async fn handle_chat(
@@ -91,6 +118,23 @@ pub async fn handle_chat(
             project_id
         }
     };
+
+    // 确定用于拼接工作目录的标识符
+    // agent_work_dir 用于替代 project_id 参与工作目录路径拼接
+    let work_dir_id = request
+        .agent_work_dir
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| project_id.clone());
+
+    // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）
+    if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+        return Ok(HttpResult::error_with_message(
+            shared_types::error_codes::ERR_VALIDATION,
+            locale,
+            &e,
+        ));
+    }
 
     // ========== 隔离类型参数校验 ==========
     // IF pod_id IS NOT NULL THEN isolation_type, tenant_id, space_id 必须非空
@@ -121,15 +165,21 @@ pub async fn handle_chat(
         }
 
         // 验证 isolation_type 值有效（大小写不敏感）
-        if let Some(ref it) = request.isolation_type {
-            if IsolationType::from_str(it).is_err() {
-                error!("[CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project", it);
-                return Ok(HttpResult::error_with_message(
-                    shared_types::error_codes::ERR_VALIDATION,
-                    locale,
-                    &format!("invalid isolation_type '{}', expected: tenant, space, project", it),
-                ));
-            }
+        if let Some(ref it) = request.isolation_type
+            && IsolationType::from_str(it).is_err()
+        {
+            error!(
+                "[CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project",
+                it
+            );
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &format!(
+                    "invalid isolation_type '{}', expected: tenant, space, project",
+                    it
+                ),
+            ));
         }
 
         // 记录验证通过的参数（此时 pod_id, isolation_type, tenant_id, space_id 必定为 Some）
@@ -148,14 +198,15 @@ pub async fn handle_chat(
 
     // ========== 构建工作空间路径 ==========
     // 根据 isolation_type 确定容器内工作目录：
-    // - tenant/space: /app/project_workspace/{tenant_id}/{space_id}/{project_id}
-    // - project 或默认: /app/project_workspace/{project_id}
+    // - tenant/space: /app/project_workspace/{tenant_id}/{space_id}/{work_dir_id}
+    // - project 或默认: /app/project_workspace/{work_dir_id}
     let container_work_path = build_workspace_path(
         request.isolation_type.as_deref(),
         request.tenant_id.as_deref(),
         request.space_id.as_deref(),
-        &project_id,
-    );
+        &work_dir_id,
+    )
+    .map_err(|e| AppError::validation_error(&e.to_string()))?;
 
     info!(
         "📁 [CHAT] Workspace path determined: {} (isolation_type={})",
@@ -164,12 +215,12 @@ pub async fn handle_chat(
     );
 
     // 验证资源限制配置
-    if let Some(ref agent_config) = request.agent_config {
-        if let Some(ref resource_limits) = agent_config.resource_limits {
-            resource_limits.validate().map_err(|e| {
-                AppError::validation_error(&format!("Invalid resource limits: {}", e))
-            })?;
-        }
+    if let Some(ref agent_config) = request.agent_config
+        && let Some(ref resource_limits) = agent_config.resource_limits
+    {
+        resource_limits
+            .validate()
+            .map_err(|e| AppError::validation_error(&format!("Invalid resource limits: {}", e)))?;
     }
 
     info!(
@@ -191,30 +242,32 @@ pub async fn handle_chat(
         project_id, request.agent_config
     );
 
-    // 第一步：获取或创建容器，默认使用 ServiceType::RCoder
-    let service_type = shared_types::ServiceType::RCoder;
+    // 第一步：获取或创建容器，默认使用 ServiceType::WebAgentRunner
+    let service_type = shared_types::ServiceType::WebAgentRunner;
+    let container_options = crate::service::container_manager::ContainerCreateOptions {
+        project_id: &project_id,
+        service_type: &service_type,
+        request_resource_limits: resolve_resource_limits_from_config(
+            &state,
+            &service_type,
+            request.agent_config.as_ref().and_then(|c| c.resource_limits.clone()),
+        ),
+        pod_id: request.pod_id.as_deref(),
+        isolation_type: request.isolation_type.as_deref(),
+        tenant_id: request.tenant_id.as_deref(),
+        space_id: request.space_id.as_deref(),
+        container_work_path: &container_work_path,
+        runtime: state.runtime(),
+    };
     let container_info =
         crate::service::container_manager::ContainerManager::get_or_create_container(
-            &project_id,
-            &service_type,
-            request
-                .agent_config
-                .as_ref()
-                .and_then(|c| c.resource_limits.clone()),
-            request.pod_id.as_deref(),
-            request.isolation_type.as_deref(),
-            request.tenant_id.as_deref(),
-            request.space_id.as_deref(),
-            &container_work_path,
+            container_options,
         )
         .await?;
 
-    // 第二步：获取或创建 ProjectAndContainerInfo - 使用 DuckDB 存储
+    // 第二步：获取或创建 ProjectAndContainerInfo - 使用 存储
     let _ = {
-        info!(
-            "[CHAT] Getting/creating project: project_id={}",
-            project_id
-        );
+        info!("[CHAT] Getting/creating project: project_id={}", project_id);
 
         // 检查项目是否存在
         if let Some(existing_info) = state.get_project(&project_id) {
@@ -224,9 +277,13 @@ pub async fn handle_chat(
             );
 
             // 检查是否需要更新扩展状态
-            let needs_extended_update = existing_info.container().is_none()
+            // 重要：也需要检查 service_type 和 pod_id 是否需要更新
+            // 如果 service_type 或 pod_id 不匹配，需要更新以确保 container_key() 返回正确的值
+            let needs_extended_update = existing_info.container_info().is_none()
                 || existing_info.model_provider().is_none()
-                || existing_info.request_id().is_none();
+                || existing_info.request_id().is_none()
+                || existing_info.service_type() != Some(service_type.clone())
+                || existing_info.pod_id() != request.pod_id.as_deref();
 
             if needs_extended_update {
                 // 创建更新后的信息
@@ -244,7 +301,12 @@ pub async fn handle_chat(
                 mutable_info.update_activity();
 
                 let arc_info = Arc::new(mutable_info);
-                state.insert_project(project_id.clone(), arc_info.clone());
+                state
+                    .insert_project(project_id.clone(), arc_info.clone())
+                    .map_err(|e| {
+                        tracing::error!("[STORAGE] insert_project failed: {}", e);
+                        e
+                    })?;
 
                 info!(
                     "✅ [CHAT] Project info fully updated: project_id={}, container_id={}",
@@ -255,17 +317,11 @@ pub async fn handle_chat(
             } else {
                 // 只需要更新活动时间
                 state.update_activity(&project_id);
-                info!(
-                    "[CHAT] Activity time updated: project_id={}",
-                    project_id
-                );
+                info!("[CHAT] Activity time updated: project_id={}", project_id);
                 existing_info
             }
         } else {
-            info!(
-                "[CHAT] Creating new project: project_id={}",
-                project_id
-            );
+            info!("[CHAT] Creating new project: project_id={}", project_id);
 
             // 创建新的 ProjectAndContainerInfo
             let mut new_info = ProjectAndContainerInfo::new(project_id.clone());
@@ -276,9 +332,19 @@ pub async fn handle_chat(
                 request.request_id.clone(),
                 Some(service_type.clone()),
             );
+            new_info.set_scope(
+                request.tenant_id.clone(),
+                request.space_id.clone(),
+                request.isolation_type.clone(),
+            );
 
             let arc_info = Arc::new(new_info);
-            state.insert_project(project_id.clone(), arc_info.clone());
+            state
+                .insert_project(project_id.clone(), arc_info.clone())
+                .map_err(|e| {
+                    tracing::error!("[STORAGE] insert_project failed: {}", e);
+                    e
+                })?;
 
             info!(
                 "✅ [CHAT] Project info created: project_id={}, container_id={}",
@@ -293,6 +359,81 @@ pub async fn handle_chat(
     // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理
     state.update_activity(&project_id);
     debug!("[CHAT] Updated activity time: project_id={}", project_id);
+
+    // 自动安装检查：如果 agent_server 携带 platforms，必须同时提供 agent_id、command、version
+    // 内置 agent（容器预装）跳过安装逻辑
+    if let Some(ref agent_config) = request.agent_config
+        && let Some(ref server) = agent_config.agent_server
+        && let Some(ref platforms) = server.platforms
+    {
+        // agent_id 必填且非空
+        let agent_id = match server.agent_id.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(id) => id,
+            None => {
+                error!("[CHAT] Validation failed: agent_id is required when platforms is provided");
+                return Ok(HttpResult::error_with_message(
+                    shared_types::error_codes::ERR_VALIDATION,
+                    locale,
+                    "agent_id is required and cannot be empty when platforms is provided",
+                ));
+            }
+        };
+
+        if !shared_types::is_builtin_agent(agent_id) {
+            let command = match server.command.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(c) => c,
+                None => {
+                    error!(
+                        "[CHAT] Validation failed: command is required when platforms is provided"
+                    );
+                    return Ok(HttpResult::error_with_message(
+                        shared_types::error_codes::ERR_VALIDATION,
+                        locale,
+                        "command is required and cannot be empty when platforms is provided",
+                    ));
+                }
+            };
+            let version = match server.version.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(v) => v,
+                None => {
+                    error!(
+                        "[CHAT] Validation failed: version is required when platforms is provided"
+                    );
+                    return Ok(HttpResult::error_with_message(
+                        shared_types::error_codes::ERR_VALIDATION,
+                        locale,
+                        "version is required and cannot be empty when platforms is provided",
+                    ));
+                }
+            };
+            let args = server.args.as_deref().unwrap_or(&[]);
+
+            info!(
+                "📦 [CHAT] Auto-install: agent_id={}, version={}, args={:?}",
+                agent_id, version, args
+            );
+
+            let install_req = super::agent_install_strategy::AgentInstallRequest {
+                agent_id,
+                command,
+                args,
+                version,
+                platforms,
+            };
+            super::agent_install_strategy::ensure_agent_installed(
+                &state,
+                &project_id,
+                &install_req,
+                &service_type,
+            )
+            .await?;
+        } else {
+            debug!(
+                "📦 [CHAT] Builtin agent detected, skipping install: agent_id={}",
+                agent_id
+            );
+        }
+    }
 
     // 🆕 自动查找 session_id 逻辑
     // 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id
@@ -335,65 +476,145 @@ pub async fn handle_chat(
     request_for_forward.session_id = if session_id_to_use.is_empty() {
         None
     } else {
-        Some(session_id_to_use)
+        Some(session_id_to_use.clone())
     };
     // 🆕 自动查找 session_id 逻辑结束
 
+    // 2.5 主动探测 agent_runner gRPC 是否就绪
+    // K8s 下容器刚创建时 Pod 虽已 Ready，但 agent_runner 的 gRPC server 可能仍在启动，
+    // 直接转发 Chat RPC 会 transport error。这里仿照 computer_chat_handler 做状态探活，
+    // 并加重试以真正等待 gRPC server 就绪（正常情况下首次即成功，无额外延迟）。
+    {
+        let grpc_addr = if shared_types::is_kubernetes_runtime() {
+            let svc_fqdn = super::utils::build_k8s_service_fqdn(
+                &container_info.container_name,
+                &state.config.app_manager.namespace,
+                &state.cluster_domain,
+            );
+            format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
+        } else {
+            format!(
+                "{}:{}",
+                container_info.container_ip,
+                shared_types::GRPC_DEFAULT_PORT
+            )
+        };
+
+        debug!(
+            "[CHAT] Probing agent_runner readiness before forward: addr={}",
+            grpc_addr
+        );
+        const MAX_PROBE_ATTEMPTS: u32 = 6;
+        for attempt in 1..=MAX_PROBE_ATTEMPTS {
+            let status_req = shared_types::grpc::GetStatusRequest {
+                project_id: project_id.clone(),
+                session_id: String::new(),
+            };
+            let mut grpc_request = crate::grpc::new_request_with_locale(status_req, locale);
+            grpc_request.set_timeout(std::time::Duration::from_secs(3));
+
+            let probed = match state.grpc_pool.get_client(&grpc_addr).await {
+                Ok(mut client) => match client.get_status(grpc_request).await {
+                    Ok(resp) => {
+                        debug!(
+                            "📊 [CHAT] Agent ready: project_id={}, status={}, attempt={}",
+                            project_id,
+                            resp.into_inner().status,
+                            attempt
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        warn!(
+                            "⚠️ [CHAT] Agent status probe failed (attempt {}/{}): {}",
+                            attempt, MAX_PROBE_ATTEMPTS, e
+                        );
+                        false
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "⚠️ [CHAT] Agent status probe get_client failed (attempt {}/{}): {}",
+                        attempt, MAX_PROBE_ATTEMPTS, e
+                    );
+                    false
+                }
+            };
+
+            if probed || attempt == MAX_PROBE_ATTEMPTS {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+        // 探活失败不阻止请求，保留原有降级行为（由后续 Chat RPC 自行处理）
+    }
+
     // 第三步：转发请求到容器服务（使用全局连接池）
     info!("[CHAT] Forwarding request to container service");
-    let result = forward_request_to_container_service(
-        &request_for_forward,
-        &container_info,
-        &state.grpc_pool,
-        &state.container_prefix_rcoder,
-        &state.container_prefix_computer,
+    let ctx = ForwardContext {
+        grpc_pool: &state.grpc_pool,
+        namespace: &state.config.app_manager.namespace,
+        cluster_domain: &state.cluster_domain,
+        runtime: state.runtime(),
+        rcoder_prefix: &state.container_prefix_rcoder,
+        computer_prefix: &state.container_prefix_computer,
         locale,
-    )
-    .await;
-    info!("[CHAT] Container request completed: success={}", result.is_ok());
+    };
+    let result =
+        forward_request_to_container_service(&request_for_forward, &container_info, &ctx).await;
+    info!(
+        "[CHAT] Container request completed: success={}",
+        result.is_ok()
+    );
 
-    // 响应后状态更新 - 使用 DuckDB 存储
+    // 响应后状态更新 - 使用 存储
     // 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
     // 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
-    if let Ok(http_result) = &result {
-        if let Some(chat_response) = &http_result.data {
-            let session_id = chat_response.session_id.clone();
+    if let Ok(http_result) = &result
+        && let Some(chat_response) = &http_result.data
+    {
+        let session_id = chat_response.session_id.clone();
 
-            // 只有当 session_id 非空时才更新映射
-            if !session_id.is_empty() {
-                info!(
-                    "📊 [CHAT] Received chat response, starting state update: session_id={}, success={}",
-                    session_id,
-                    http_result.is_success()
+        // 只有当 session_id 非空时才更新映射
+        if !session_id.is_empty() {
+            info!(
+                "📊 [CHAT] Received chat response, starting state update: session_id={}, success={}",
+                session_id,
+                http_result.is_success()
+            );
+
+            // C1 修复：用 add_session_to_project 走多 session 单步原子路径，
+            // 取代历史非原子的 update_session（write_session_index + entry 两步）。
+            // 多 session 模型：一个 project 可同时持多个活跃 session（多窗口场景）。
+            let added = state.add_session_to_project(&project_id, &session_id);
+            if !added {
+                warn!(
+                    "[CHAT] Project missing during session association, may have been concurrently removed: project_id={}, session_id={}",
+                    project_id, session_id
                 );
+            }
 
-                // 更新会话信息（同时更新 session_id 和 session-to-container 映射）
+            info!(
+                "🔗 [SESSION_MAP] Associated session_id {} to project_id {}",
+                session_id, project_id
+            );
+
+            if http_result.is_success() {
                 info!(
-                    "🔗 [SESSION_MAP] Associated session_id {} to project_id {}",
-                    session_id, project_id
+                    "🎯 [CHAT] All state updates completed: project_id={}, session_id={}",
+                    project_id, session_id
                 );
-                state.update_session(&project_id, &session_id);
-
-                // 更新项目活动时间
-                state.update_activity(&project_id);
-
-                if http_result.is_success() {
-                    info!(
-                        "🎯 [CHAT] All state updates completed: project_id={}, session_id={}",
-                        project_id, session_id
-                    );
-                } else {
-                    warn!(
-                        "⚠️ [CHAT] Request failed but session mapping saved: project_id={}, session_id={}, code={}, message={}",
-                        project_id, session_id, http_result.code, http_result.message
-                    );
-                }
+            } else {
+                warn!(
+                    "⚠️ [CHAT] Request failed but session mapping saved: project_id={}, session_id={}, code={}, message={}",
+                    project_id, session_id, http_result.code, http_result.message
+                );
             }
         }
     }
 
     if result.as_ref().map_or(true, |r| {
-        !r.is_success() && r.data.as_ref().map_or(true, |d| d.session_id.is_empty())
+        !r.is_success() && r.data.as_ref().is_none_or(|d| d.session_id.is_empty())
     }) {
         error!("[CHAT] Container returned error: {:?}", result);
     }
@@ -409,10 +630,7 @@ pub async fn handle_chat(
 async fn forward_request_to_container_service(
     request: &AgentChatRequest,
     container_info: &ContainerBasicInfo,
-    grpc_pool: &Arc<crate::grpc::GrpcChannelPool>,
-    rcoder_prefix: &str,
-    computer_prefix: &str,
-    locale: &'static str,
+    ctx: &ForwardContext<'_>,
 ) -> Result<crate::HttpResult<ChatResponse>, crate::AppError> {
     let project_id = if let Some(id) = &request.project_id {
         id.clone()
@@ -420,7 +638,7 @@ async fn forward_request_to_container_service(
         error!("[FORWARD]session project_id is required");
         return Ok(crate::HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
-            locale,
+            ctx.locale,
         ));
     };
 
@@ -430,22 +648,23 @@ async fn forward_request_to_container_service(
     );
 
     // 🎯 使用 gRPC 替代 HTTP
-    // 使用实时 IP 获取，避免容器重建后 IP 变化导致连接失败
-    // 直接使用 container_info.container_name（创建时已确定，无需重新拼接）
+    // 根据运行环境选择 gRPC 地址
+    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
+    // - Docker 环境：使用容器 IP（直接连接）
     let container_name = container_info.container_name.clone();
-    let mut grpc_addr = match super::utils::get_realtime_container_ip(
-        &container_name,
-        &container_info.container_ip,
-        rcoder_prefix,
-        computer_prefix,
-    )
-    .await
-    {
-        Ok(ip) => format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT),
-        Err(e) => {
-            warn!("[FORWARD] Real-time IP resolution failed: {}, falling back to service_url", e);
-            extract_grpc_addr_with_port(&container_info.service_url, shared_types::GRPC_DEFAULT_PORT)?
-        }
+    let grpc_addr = if shared_types::is_kubernetes_runtime() {
+        let addr =
+            super::utils::build_k8s_grpc_addr(&container_name, ctx.namespace, ctx.cluster_domain);
+        debug!("📡 [FORWARD] Using K8s Service FQDN for gRPC: {}", addr);
+        addr
+    } else {
+        let addr = format!(
+            "{}:{}",
+            container_info.container_ip,
+            shared_types::GRPC_DEFAULT_PORT
+        );
+        debug!("📡 [FORWARD] Using container IP for gRPC: {}", addr);
+        addr
     };
 
     debug!(
@@ -460,26 +679,27 @@ async fn forward_request_to_container_service(
     let mut last_error = None;
 
     for attempt in 1..=max_retries {
-        match crate::grpc::grpc_chat_with_pool(
-            grpc_pool,
-            &grpc_addr,
-            project_id.clone(),
-            request.session_id.clone(),
-            request.prompt.clone(),
-            request.attachments.clone(),
-            request.data_source_attachments.clone(),
-            request.model_provider.clone(),
-            request.request_id.clone(),
-            Some(std::time::Duration::from_secs(300)), // 5 分钟超时，避免永久阻塞
-            // 新增参数 (v2)
-            request.system_prompt.clone(),
-            request.user_prompt.clone(),
-            request.agent_config.clone(),
-            Some(shared_types::ServiceType::RCoder), // ✅ RCoder 模式使用 RCoder ServiceType
-            None,                                    // RCoder 模式不需要 user_id
-        )
-        .await
-        {
+        let params = crate::grpc::GrpcChatParams {
+            project_id: project_id.clone(),
+            session_id: request.session_id.clone(),
+            prompt: request.prompt.clone(),
+            attachments: request.attachments.clone(),
+            data_source_attachments: request.data_source_attachments.clone(),
+            model_config: request.model_provider.clone(),
+            request_id: request.request_id.clone(),
+            request_timeout: Some(std::time::Duration::from_secs(
+                shared_types::GRPC_CHAT_TIMEOUT_SECS,
+            )),
+            system_prompt: request.system_prompt.clone(),
+            user_prompt: request.user_prompt.clone(),
+            agent_config: request.agent_config.clone(),
+            service_type: Some(shared_types::ServiceType::WebAgentRunner),
+            user_id: None,
+            is_devcomputer: false,
+            agent_work_dir: request.agent_work_dir.clone(),
+        };
+
+        match crate::grpc::grpc_chat_with_pool(ctx.grpc_pool, &grpc_addr, params).await {
             Ok(grpc_response) => {
                 if grpc_response.success {
                     // 转换为内部 ChatResponse
@@ -504,56 +724,43 @@ async fn forward_request_to_container_service(
                     return Ok(crate::HttpResult::error(&error_code, &error_msg));
                 }
             }
-            Err(e) => {
+            Err(grpc_err) => {
                 warn!(
                     "⚠️ [FORWARD] gRPC call failed (attempt {}/{}): {}",
-                    attempt, max_retries, e
+                    attempt, max_retries, grpc_err
                 );
 
-                // ✅ 使用错误分类判断是否应该重试
-                let should_retry = crate::grpc::should_retry_error(&e);
+                // ✅ 使用 GrpcError 的 should_retry 方法，无需 downcast_ref
+                let should_retry = grpc_err.should_retry();
 
                 if should_retry && attempt < max_retries {
                     // 可重试错误：清理连接池并重新获取 IP 后重试
-                    info!("🔄 [FORWARD] Detected retryable error, re-resolving container IP and retrying...");
-                    grpc_pool.remove(&grpc_addr);
+                    info!(
+                        "🔄 [FORWARD] Detected retryable error, retrying with K8s Service FQDN..."
+                    );
+                    ctx.grpc_pool.remove(&grpc_addr).await;
 
-                    // 重新获取最新容器 IP（容器可能已重建，IP 可能变化）
-                    match super::utils::get_realtime_container_ip(
-                        &container_name,
-                        &container_info.container_ip,
-                        rcoder_prefix,
-                        computer_prefix,
-                    )
-                    .await
-                    {
-                        Ok(ip) => {
-                            let new_addr = format!("{}:{}", ip, shared_types::GRPC_DEFAULT_PORT);
-                            info!(
-                                "🔄 [FORWARD] Container IP re-resolved: {} -> {}",
-                                grpc_addr, new_addr
-                            );
-                            grpc_addr = new_addr;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "⚠️ [FORWARD] Failed to re-resolve container IP, keeping old address: {}",
-                                e
-                            );
-                        }
-                    }
+                    // K8s Service FQDN 是稳定的，不需要重新解析
+                    // 直接使用原来的 FQDN 进行重试
+                    debug!(
+                        "🔄 [FORWARD] Retrying with same K8s Service FQDN: {}",
+                        grpc_addr
+                    );
 
-                    last_error = Some(e);
+                    last_error = Some(anyhow::Error::from(grpc_err));
                     continue;
                 } else if !should_retry {
                     // 不可重试错误：直接返回
-                    error!("[FORWARD] Detected non-retryable error, stopped retry: {}", e);
-                    last_error = Some(e);
+                    error!(
+                        "[FORWARD] Detected non-retryable error, stopped retry: {}",
+                        grpc_err
+                    );
+                    last_error = Some(anyhow::Error::from(grpc_err));
                     break;
                 }
 
                 // 最后一次尝试失败
-                last_error = Some(e);
+                last_error = Some(anyhow::Error::from(grpc_err));
             }
         }
     }
@@ -567,13 +774,13 @@ async fn forward_request_to_container_service(
         // 这里只处理真正的 gRPC 通信层错误
         Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_GRPC_ERROR,
-            locale,
+            ctx.locale,
         ))
     } else {
         // 理论上不会走到这里，除非 max_retries < 1
         Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_GRPC_ERROR,
-            locale,
+            ctx.locale,
         ))
     }
 }
