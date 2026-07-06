@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Canvas Sync POC — Viewer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #1e1e1e; color: #ddd;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  #bar {
+    padding: 8px 12px; background: #252526; border-bottom: 1px solid #333;
+    display: flex; gap: 12px; align-items: center; font-size: 13px; flex: 0 0 auto;
+  }
+  #url { flex: 1; color: #9cdcfe; font-family: ui-monospace, monospace;
+         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge { padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+  #status.connecting { background: #cca35a; color: #000; }
+  #status.open { background: #4ec9b0; color: #000; }
+  #status.closed { background: #f48771; color: #000; }
+  #fps { color: #888; min-width: 56px; text-align: right; }
+  #wrap { flex: 1; position: relative; display: flex; align-items: center; justify-content: center;
+          overflow: hidden; padding: 12px; }
+  #canvas {
+    max-width: 100%; max-height: 100%; background: #fff;
+    box-shadow: 0 0 24px rgba(0,0,0,.5); cursor: crosshair;
+    user-select: none; -webkit-user-select: none; touch-action: none;
+    outline: none;
+  }
+  #cursor {
+    position: fixed; width: 14px; height: 14px;
+    border: 2px solid #ffe000; border-radius: 50%;
+    pointer-events: none; transform: translate(-50%, -50%);
+    display: none; mix-blend-mode: difference; z-index: 10;
+  }
+  #hint {
+    position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: #888; pointer-events: none; text-align: center;
+  }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <span class="badge connecting" id="status">connecting</span>
+    <span id="url">about:blank</span>
+    <span id="fps">0 fps</span>
+  </div>
+  <div id="wrap">
+    <canvas id="canvas" tabindex="0"></canvas>
+    <div id="cursor"></div>
+    <div id="hint">在画面上点击 / 滚动 / 打字 — 操作会实时同步到容器内的 Chrome</div>
+  </div>
+  <script src="/viewer.js"></script>
+</body>
+</html>

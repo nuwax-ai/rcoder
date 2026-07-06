@@ -1,0 +1,16 @@
+name: canvas-sync-poc
+
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dev-canvas-sync-poc:latest
+    container_name: rcoder-canvas-sync-poc
+    ports:
+      - "9223:9223"
+    environment:
+      - TZ=Asia/Shanghai
+      # 可选覆盖:连外部 Chrome 而非容器内自启的
+      # - CHROME_URL=http://host.docker.internal:9222
+    restart: "no"
