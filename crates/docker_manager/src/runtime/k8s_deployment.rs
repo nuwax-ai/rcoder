@@ -529,20 +529,33 @@ impl KubernetesRuntime {
             .await
             .map_err(|e| ContainerRuntimeError::K8sError(format!("create deployment: {e}")))?;
         info!("[K8S-APP] Deployment created for app: {app_id}");
-        // 5. HTTPRoute（HTTP 端口）
+        // 5. HTTPRoute（HTTP 端口）—— 失败降级：app 主体（Deployment）已创建不可回滚，
+        // HTTPRoute 属暴露层（依赖 Gateway/CRD），失败时 warn + 跳过，不阻塞 app 创建。
+        // 避免"Deployment 已建 + create_app 整体失败"导致调用方重试时 name 冲突。
         let mut external_ports: Vec<AppPortStatus> = vec![];
         if let (Some(ports), Some(gw), Some(gw_ns)) =
             (params.ports.as_ref(), gateway_name, gateway_namespace)
             && let Some(http_port) = ports.iter().find(|p| p.expose_type == ExposeType::Http)
         {
-            self.create_app_httproute(app_id, gw, gw_ns, http_port.port)
-                .await?;
-            external_ports.push(AppPortStatus {
-                name: http_port.name.clone(),
-                port: http_port.port,
-                expose_type: ExposeType::Http,
-                external_port: None,
-            });
+            match self
+                .create_app_httproute(app_id, gw, gw_ns, http_port.port)
+                .await
+            {
+                Ok(_) => {
+                    external_ports.push(AppPortStatus {
+                        name: http_port.name.clone(),
+                        port: http_port.port,
+                        expose_type: ExposeType::Http,
+                        external_port: None,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[K8S-APP] HTTPRoute 创建失败，app 主体已创建但 HTTP 入口暂不可用（待 Gateway/CRD 就绪后 reconcile）: {}",
+                        e
+                    );
+                }
+            }
         }
         // 6. NodePort（TCP 端口）
         if let Some(ports) = params.ports.as_ref() {
