@@ -644,31 +644,46 @@ impl KubernetesRuntime {
             Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
         self.ignore_404(routes.delete(&self.app_http_route_name(app_id), &dp).await)
             .await?;
-        // 等 app Pod 终止（best-effort，超时不阻塞）——Deployment 已删，Pod 进入 Terminating，
-        // 等其消失后再让上层清理工作空间子目录，避免 Pod 还在写时删目录导致写入失败。
-        self.wait_for_app_pod_gone(app_id, std::time::Duration::from_secs(30))
+        // 等 app Pod 容器退出（best-effort，超时不阻塞）。Deployment 已删 → Pod 收到 SIGTERM，
+        // 容器秒级退出（不再写文件）。Pod 对象完全消失需等 graceful period（默认 30s），但容器
+        // 退出即代表不再写，故等 phase != Running 而非 Pod gone，兼顾安全与速度。
+        self.wait_for_app_pod_stopped(app_id, std::time::Duration::from_secs(15))
             .await;
         info!("[K8S-APP] K8s resources deleted for app: {app_id}");
         Ok(())
     }
 
-    /// 等 app Pod 全部终止（按 rcoder.io/app-id label 轮询），best-effort：超时或 API 错误
-    /// 不阻塞删除流程（仅 warn），因为 app 复用共享 PVC 子目录，残留 Pod 写入影响可控。
-    async fn wait_for_app_pod_gone(&self, app_id: &str, timeout: std::time::Duration) {
+    /// 等 app Pod 容器全部退出（按 rcoder.io/app-id label 轮询 Pod phase），best-effort：
+    /// 容器退出（phase != Running）或 Pod 消失即返回；超时/API 错误仅 warn 不阻塞删除
+    /// （app 复用共享 PVC 子目录，残留写入影响可控）。
+    async fn wait_for_app_pod_stopped(&self, app_id: &str, timeout: std::time::Duration) {
         let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
         let start = std::time::Instant::now();
         loop {
             match self.pods_api().list(&lp).await {
-                Ok(pods) if pods.items.is_empty() => return,
-                Ok(_) => {}
+                Ok(pods) => {
+                    // 仍有 Running 容器（未退出）→ 继续等；否则（全退出/无 Pod）→ 安全清理
+                    let still_running = pods.items.iter().any(|p| {
+                        p.status
+                            .as_ref()
+                            .and_then(|s| s.phase.as_deref())
+                            .is_some_and(|ph| ph == "Running")
+                    });
+                    if !still_running {
+                        return;
+                    }
+                }
                 Err(e) => {
-                    tracing::warn!("[K8S-APP] wait_for_app_pod_gone list 失败，跳过等待: {}", e);
+                    tracing::warn!(
+                        "[K8S-APP] wait_for_app_pod_stopped list 失败，跳过等待: {}",
+                        e
+                    );
                     return;
                 }
             }
             if start.elapsed() >= timeout {
                 tracing::warn!(
-                    "[K8S-APP] wait_for_app_pod_gone 超时 {}s，Pod 可能仍在终止（继续清理）",
+                    "[K8S-APP] wait_for_app_pod_stopped 超时 {}s，容器可能仍在退出（继续清理）",
                     timeout.as_secs()
                 );
                 return;
