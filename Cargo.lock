@@ -1141,6 +1141,7 @@ dependencies = [
  "shared_types",
  "thiserror 2.0.18",
  "utoipa",
+ "winnow 1.0.3",
 ]
 
 [[package]]

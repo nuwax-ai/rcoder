@@ -206,12 +206,7 @@ mod tests {
                 mounts: vec![],
                 command: vec![],
                 entrypoint: None,
-                resource_limits: ServiceResourceLimits {
-                    memory_limit: None,
-                    cpu_limit: None,
-                    swap_limit: None,
-                    storage_size: None,
-                },
+                resource_limits: ServiceResourceLimits::new(None, None, None, None, None),
                 work_dir: "/app".to_string(),
                 network_mode: "bridge".to_string(),
                 container_path_template: "/app/project_workspace/{project_id}".to_string(),
@@ -233,12 +228,7 @@ mod tests {
                 mounts: vec![],
                 command: vec![],
                 entrypoint: None,
-                resource_limits: ServiceResourceLimits {
-                    memory_limit: None,
-                    cpu_limit: None,
-                    swap_limit: None,
-                    storage_size: None,
-                },
+                resource_limits: ServiceResourceLimits::new(None, None, None, None, None),
                 work_dir: "/app".to_string(),
                 network_mode: "bridge".to_string(),
                 container_path_template: "/app/computer-project-workspace/{user_id}/{project_id}"

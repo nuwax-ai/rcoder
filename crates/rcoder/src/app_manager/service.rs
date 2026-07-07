@@ -31,9 +31,6 @@ use shared_types::ServiceType;
 use super::config::{AppAccessMode, AppManagerConfig};
 use super::models::*;
 
-/// 容器名称前缀（与 `ServiceType::UserApp::container_prefix()` 对齐）
-const CONTAINER_PREFIX: &str = "rcoder-app";
-
 /// 应用管理服务（Docker / K8s 统一）
 pub struct AppService {
     config: AppManagerConfig,
@@ -88,6 +85,18 @@ impl AppService {
             request.name, app_id, self.config.access_mode
         );
 
+        // 0. 校验资源限制格式（K8s Quantity: storage / ephemeral_storage）
+        if let Some(ref resources) = request.resources {
+            if let Some(ref s) = resources.storage {
+                crate::handler::pod_handler::validate_k8s_storage_size(s)
+                    .map_err(|e| anyhow::anyhow!("invalid storage '{}': {}", s, e))?;
+            }
+            if let Some(ref es) = resources.ephemeral_storage {
+                crate::handler::pod_handler::validate_k8s_storage_size(es)
+                    .map_err(|e| anyhow::anyhow!("invalid ephemeral_storage '{}': {}", es, e))?;
+            }
+        }
+
         // 1. 创建应用工作空间目录（code/data/logs）
         self.create_app_dirs(&app_id).await?;
 
@@ -110,12 +119,36 @@ impl AppService {
         self.register_pingora_backends(&app_id, &request, &container_info.container_ip)
             .await;
 
-        // 5. 实时查询运行时状态（拿到真实 node_port / host_port 用于访问地址）
+        // 5. 实时查询运行时状态（K8s 用于拿真实 node_port；Docker 模式不还原端口语义）
         let runtime_status = self.fetch_runtime_status(&app_id).await;
-        let ports = runtime_status
+
+        // 端口状态：以请求端口为准（expose_type 语义完整），合并运行时返回的 external_port
+        // （K8s node_port）。Docker 模式 get_deployment_status 不还原端口语义，Tcp 的 host_port
+        // 留空（已知限制：Docker Tcp 对外端口需通过 docker inspect port_bindings 另查）。
+        let mut ports: Vec<AppPortStatus> = request
+            .ports
             .as_ref()
-            .map(|s| s.ports.clone())
+            .map(|ps| {
+                ps.iter()
+                    .map(|p| AppPortStatus {
+                        name: p.name.clone(),
+                        port: p.port,
+                        expose_type: map_expose_type(&p.expose_type),
+                        external_port: None,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
+        if let Some(status) = &runtime_status {
+            for rt_p in &status.ports {
+                let Some(ep) = rt_p.external_port else {
+                    continue;
+                };
+                if let Some(ap) = ports.iter_mut().find(|p| p.name == rt_p.name) {
+                    ap.external_port = Some(ep);
+                }
+            }
+        }
 
         // 6. 构建访问信息 + 健康信息
         let access = self.build_access_info(&app_id, &ports);
@@ -182,12 +215,12 @@ impl AppService {
             }
         }
 
-        // 排序（仅 app_id 可用）
+        // 排序（仅 app_id 可用；默认升序，Desc 时降序）
         if let Some(sort_by) = &request.sort_by
             && (sort_by == "app_id" || sort_by == "name")
         {
             items.sort_by(|a, b| a.app_id.cmp(&b.app_id));
-            if request.sort_order == Some(SortOrder::Asc) {
+            if request.sort_order == Some(SortOrder::Desc) {
                 items.reverse();
             }
         }
@@ -245,6 +278,7 @@ impl AppService {
     /// 删除应用
     #[instrument(skip(self))]
     pub async fn delete_app(&self, app_id: &str) -> Result<()> {
+        validate_app_id(app_id)?;
         info!("[APP] 删除应用: {}", app_id);
 
         // 1. Docker 模式：清理 Pingora backend
@@ -303,6 +337,7 @@ impl AppService {
     /// 获取应用日志（读取共享工作空间 logs/app.log）
     #[instrument(skip(self))]
     pub async fn get_app_logs(&self, app_id: &str, params: LogParams) -> Result<Vec<LogEntry>> {
+        validate_app_id(app_id)?;
         let log_file = self
             .get_container_app_dir(app_id)
             .join("logs")
@@ -313,14 +348,25 @@ impl AppService {
         let content = fs::read_to_string(&log_file)
             .await
             .with_context(|| format!("读取日志失败: {:?}", log_file))?;
+        // 日志来源是文件而非 docker stdout 流；时间戳用文件 mtime（最后写入时间）
+        let timestamp = match fs::metadata(&log_file).await {
+            Ok(m) => m
+                .modified()
+                .map(|t| {
+                    let dt: chrono::DateTime<Utc> = t.into();
+                    dt.to_rfc3339()
+                })
+                .unwrap_or_else(|_| Utc::now().to_rfc3339()),
+            Err(_) => Utc::now().to_rfc3339(),
+        };
         let tail = params.tail.unwrap_or(1000) as usize;
         let lines: Vec<&str> = content.lines().collect();
         let start = lines.len().saturating_sub(tail);
         Ok(lines[start..]
             .iter()
             .map(|line| LogEntry {
-                timestamp: Utc::now().to_rfc3339(),
-                stream: "stdout".to_string(),
+                timestamp: timestamp.clone(),
+                stream: "file".to_string(),
                 message: line.to_string(),
             })
             .collect())
@@ -354,6 +400,7 @@ impl AppService {
         file_data: Vec<u8>,
         target: &str,
     ) -> Result<UploadResult> {
+        validate_app_id(app_id)?;
         let file_path = self.get_container_app_dir(app_id).join("code").join(target);
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -369,6 +416,7 @@ impl AppService {
     /// 列出文件
     #[instrument(skip(self))]
     pub async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>> {
+        validate_app_id(app_id)?;
         let code_dir = self.get_container_app_dir(app_id).join("code");
         if !code_dir.exists() {
             return Ok(vec![]);
@@ -396,6 +444,7 @@ impl AppService {
     /// 删除文件
     #[instrument(skip(self))]
     pub async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
+        validate_app_id(app_id)?;
         let app_dir = self.get_container_app_dir(app_id);
         let full_path = app_dir.join("code").join(file_path);
 
@@ -442,6 +491,16 @@ impl AppService {
             })
             .unwrap_or_default();
 
+        // Exec 健康检查当前未支持（AppHealthCheck 无 command 字段），Fail Fast 拒绝，
+        // 避免静默丢弃用户配置（K8s build_probe 对 Exec 返回 None → 容器被视为永远健康）
+        if let Some(hc) = &request.health_check
+            && matches!(hc.check_type, HealthCheckType::Exec)
+        {
+            anyhow::bail!(
+                "Exec 健康检查暂不支持（AppHealthCheck 缺少 command 字段），请改用 Http/Tcp"
+            );
+        }
+
         // 健康检查：models::HealthCheckConfig → AppHealthCheck
         let health_check = request.health_check.as_ref().map(|hc| AppHealthCheck {
             check_type: map_health_check_type(&hc.check_type),
@@ -456,6 +515,7 @@ impl AppService {
             cpu: r.cpu.clone(),
             memory: r.memory.clone(),
             storage: r.storage.clone(),
+            ephemeral_storage: r.ephemeral_storage.clone(),
         });
 
         // 宿主机工作空间路径（Docker 模式 bind mount 源；K8s 模式 runtime 用 subPath，忽略此值）
@@ -541,7 +601,7 @@ impl AppService {
                         p.port
                     )
                 });
-                let name = format!("{}-{}", CONTAINER_PREFIX, app_id);
+                let name = format!("{}-{}", ServiceType::UserApp.container_prefix(), app_id);
                 (http, name.clone(), name)
             }
             AppAccessMode::Kubernetes => {
@@ -554,7 +614,7 @@ impl AppService {
                     )
                 });
                 let cluster_domain = shared_types::get_k8s_cluster_domain();
-                let svc = format!("{}-{}-svc", CONTAINER_PREFIX, app_id);
+                let svc = format!("{}-{}-svc", ServiceType::UserApp.container_prefix(), app_id);
                 let fqdn = format!("{}.{}.svc.{}", svc, self.config.namespace, cluster_domain);
                 (http, fqdn, format!("{}.{}", svc, self.config.namespace))
             }
@@ -666,6 +726,24 @@ impl AppService {
 // 自由函数辅助
 // ============================================================================
 
+/// 校验 app_id 格式（create_app 生成 `app-` + 8 个十六进制字符）
+///
+/// app_id 直接来自 HTTP 路径参数，会流入文件系统路径拼接（delete/upload/logs/list）。
+/// 此校验是路径穿越的纵深防御（Fail Fast）：拒绝 `..`、绝对路径、非法格式，
+/// 避免恶意 app_id 触达工作空间目录之外。
+fn validate_app_id(app_id: &str) -> Result<()> {
+    let rest = app_id
+        .strip_prefix("app-")
+        .ok_or_else(|| anyhow::anyhow!("invalid app_id: {app_id} (expected prefix 'app-')"))?;
+    if rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "invalid app_id: {app_id} (expected 'app-' + 8 hex chars)"
+        ))
+    }
+}
+
 /// 运行时 phase → 应用状态枚举
 fn phase_to_status(phase: &str) -> AppStatus {
     match phase {
@@ -682,7 +760,11 @@ fn health_from_status(status: &DeploymentStatus) -> HealthInfo {
     HealthInfo {
         status: status.phase.clone(),
         instance: Some(InstanceInfo {
-            name: format!("{}-{}", CONTAINER_PREFIX, status.app_id),
+            name: format!(
+                "{}-{}",
+                ServiceType::UserApp.container_prefix(),
+                status.app_id
+            ),
             phase: status.phase.clone(),
             ready: status.ready_replicas > 0,
             restart_count: status.restart_count,

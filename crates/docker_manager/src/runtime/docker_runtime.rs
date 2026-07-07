@@ -257,7 +257,7 @@ impl ContainerRuntime for DockerRuntime {
                 "create_deployment requires image_override".to_string(),
             )
         })?;
-        let container_name = format!("rcoder-app-{app_id}");
+        let container_name = app_deployment_name(&app_id);
 
         // env（env + secrets 合并；Docker 模式无 Secret 概念）
         let mut env_map: HashMap<String, String> = HashMap::new();
@@ -302,7 +302,9 @@ impl ContainerRuntime for DockerRuntime {
         };
 
         // 加入主网络（与 rcoder 同网络，Pingora 才能通过 container_ip 访问）
-        let network_mode = self.inner.detect_main_network_name().await.ok();
+        // 同时保留网络名，供 start 后按网卡定位 container_ip（多网卡时避免 values().next() 取错）
+        let main_network = self.inner.detect_main_network_name().await.ok();
+        let network_mode = main_network.clone();
 
         let host_config = HostConfig {
             mounts,
@@ -344,17 +346,33 @@ impl ContainerRuntime for DockerRuntime {
             .await
             .map_err(|e| ContainerRuntimeError::ContainerStartError(e.to_string()))?;
 
-        let inspect = client
-            .inspect_container(&created.id, None)
-            .await
-            .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string()))?;
-        let ip = inspect
-            .network_settings
-            .as_ref()
-            .and_then(|n| n.networks.as_ref())
-            .and_then(|nets| nets.values().next())
-            .and_then(|e| e.ip_address.clone())
-            .unwrap_or_default();
+        // 短轮询等待 container_ip 就绪（容器刚 start，IP 可能尚未分配）。
+        // 优先取主网络网卡的 IP，回退任意网卡；最多重试 6 次 × 200ms。
+        let preferred = main_network.as_deref();
+        let ip = {
+            let mut ip = String::new();
+            for attempt in 0..6u32 {
+                match client.inspect_container(&created.id, None).await {
+                    Ok(inspect) => {
+                        ip = extract_container_ip(&inspect, preferred);
+                        if !ip.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[APP-DOCKER] inspect container {} for ip failed (attempt {attempt}): {}",
+                            created.id,
+                            e
+                        );
+                    }
+                }
+                if attempt < 5 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            ip
+        };
 
         Ok(ContainerBasicInfo {
             container_id: created.id.clone(),
@@ -371,7 +389,7 @@ impl ContainerRuntime for DockerRuntime {
 
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         use bollard::query_parameters::{StartContainerOptions, StopContainerOptions};
-        let name = format!("rcoder-app-{app_id}");
+        let name = app_deployment_name(app_id);
         let client = self.inner.get_docker_client();
         if replicas == 0 {
             client
@@ -395,7 +413,7 @@ impl ContainerRuntime for DockerRuntime {
 
     async fn restart_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         use bollard::query_parameters::{StartContainerOptions, StopContainerOptions};
-        let name = format!("rcoder-app-{app_id}");
+        let name = app_deployment_name(app_id);
         let client = self.inner.get_docker_client();
         let _ = client
             .stop_container(
@@ -415,7 +433,7 @@ impl ContainerRuntime for DockerRuntime {
 
     async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         use bollard::query_parameters::RemoveContainerOptions;
-        let name = format!("rcoder-app-{app_id}");
+        let name = app_deployment_name(app_id);
         let client = self.inner.get_docker_client();
         let _ = client
             .remove_container(
@@ -433,7 +451,7 @@ impl ContainerRuntime for DockerRuntime {
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
-        let name = format!("rcoder-app-{app_id}");
+        let name = app_deployment_name(app_id);
         let client = self.inner.get_docker_client();
         let inspect = match client.inspect_container(&name, None).await {
             Ok(i) => i,
@@ -453,13 +471,7 @@ impl ContainerRuntime for DockerRuntime {
             .as_ref()
             .and_then(|s| s.running)
             .unwrap_or(false);
-        let ip = inspect
-            .network_settings
-            .as_ref()
-            .and_then(|n| n.networks.as_ref())
-            .and_then(|nets| nets.values().next())
-            .and_then(|e| e.ip_address.clone())
-            .unwrap_or_default();
+        let ip = extract_container_ip(&inspect, None);
         Ok(Some(DeploymentStatus {
             app_id: app_id.to_string(),
             replicas: if running { 1 } else { 0 },
@@ -526,4 +538,40 @@ impl DockerRuntime {
         }
         Ok(result)
     }
+}
+
+/// UserApp 容器/Deployment 命名（单一来源，与 K8s 侧 `KubernetesRuntime::app_deployment_name` 对称）。
+///
+/// 前缀取自 `ServiceType::UserApp::container_prefix()`，避免散落硬编码；改前缀只需改一处。
+fn app_deployment_name(app_id: &str) -> String {
+    format!("{}-{app_id}", ServiceType::UserApp.container_prefix())
+}
+
+/// 从容器 inspect 结果提取 IP：优先取 `preferred_network` 网卡，回退任意网卡。
+///
+/// Docker 容器可能同时连接多个网络（主网络 + 自定义），`networks.values().next()`
+/// 会非确定性地取一个。优先按主网络名定位，确保拿到 Pingora backend 应指向的 IP。
+fn extract_container_ip(
+    inspect: &bollard::models::ContainerInspectResponse,
+    preferred_network: Option<&str>,
+) -> String {
+    let Some(nets) = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|n| n.networks.as_ref())
+    else {
+        return String::new();
+    };
+    if let Some(net) = preferred_network
+        && let Some(entry) = nets.get(net)
+        && let Some(ip) = entry.ip_address.as_ref()
+        && !ip.is_empty()
+    {
+        return ip.clone();
+    }
+    nets.values()
+        .next()
+        .and_then(|e| e.ip_address.clone())
+        .filter(|ip| !ip.is_empty())
+        .unwrap_or_default()
 }

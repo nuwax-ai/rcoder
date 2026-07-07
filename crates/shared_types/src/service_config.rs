@@ -123,9 +123,37 @@ pub struct ServiceResourceLimits {
     /// 范围：最小 1Gi，最大 100Ti，默认 10Gi
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_size: Option<String>,
+    /// 临时存储限制（overlay 可写层，仅 K8s 模式生效）
+    ///
+    /// 限制容器根文件系统可写层 + emptyDir 等临时存储的写入量（区别于 storage_size 管 PVC）。
+    /// 与 storage_size 是两个独立配额，不会合并；格式同 storage_size；未指定时回退到 storage_size 的值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_storage_limit: Option<String>,
 }
 
 impl ServiceResourceLimits {
+    /// 构造资源限制配置
+    ///
+    /// 所有参数均为 `Option`，未限制的资源传 `None`。
+    /// - K8s 模式下 `storage_size` 管 PVC，`ephemeral_storage_limit` 管 overlay 可写层（未指定时回退到 `storage_size`）
+    /// - Docker 模式忽略 `storage_size` / `ephemeral_storage_limit`
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        memory_limit: Option<f64>,
+        cpu_limit: Option<f64>,
+        swap_limit: Option<f64>,
+        storage_size: Option<String>,
+        ephemeral_storage_limit: Option<String>,
+    ) -> Self {
+        Self {
+            memory_limit,
+            cpu_limit,
+            swap_limit,
+            storage_size,
+            ephemeral_storage_limit,
+        }
+    }
+
     /// 验证资源限制的合理性
     pub fn validate(&self) -> Result<(), String> {
         // 内存限制：512MB ~ 64GB
@@ -168,6 +196,10 @@ impl ServiceResourceLimits {
                 .storage_size
                 .clone()
                 .or_else(|| self.storage_size.clone()),
+            ephemeral_storage_limit: override_limits
+                .ephemeral_storage_limit
+                .clone()
+                .or_else(|| self.ephemeral_storage_limit.clone()),
         }
     }
 }
@@ -477,12 +509,13 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
     ];
 
     // 默认资源限制
-    let resource_limits = ServiceResourceLimits {
-        memory_limit: Some(2_000_000_000.0), // 2GB
-        cpu_limit: Some(2.0),                // 2 核
-        swap_limit: Some(4_000_000_000.0),   // 4GB
-        storage_size: None,                  // None → 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
-    };
+    let resource_limits = ServiceResourceLimits::new(
+        Some(2_000_000_000.0), // 2GB
+        Some(2.0),             // 2 核
+        Some(4_000_000_000.0), // 4GB
+        None,                  // storage_size: 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
+        None,                  // ephemeral_storage_limit: 回退到 storage_size
+    );
 
     ServiceImageConfig {
         service_type: ServiceType::WebAgentRunner,
@@ -532,12 +565,13 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
     ];
 
     // 默认资源限制（ComputerAgentRunner 可能需要更多资源）
-    let resource_limits = ServiceResourceLimits {
-        memory_limit: Some(4_000_000_000.0), // 4GB
-        cpu_limit: Some(3.0),                // 3 核
-        swap_limit: Some(8_000_000_000.0),   // 8GB
-        storage_size: None,                  // None → 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
-    };
+    let resource_limits = ServiceResourceLimits::new(
+        Some(4_000_000_000.0), // 4GB
+        Some(3.0),             // 3 核
+        Some(8_000_000_000.0), // 8GB
+        None,                  // storage_size: 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
+        None,                  // ephemeral_storage_limit: 回退到 storage_size
+    );
 
     ServiceImageConfig {
         service_type: ServiceType::ComputerAgentRunner,
@@ -622,12 +656,7 @@ mod tests {
             }],
             command: vec![],
             entrypoint: None,
-            resource_limits: ServiceResourceLimits {
-                memory_limit: None,
-                cpu_limit: None,
-                swap_limit: None,
-                storage_size: None,
-            },
+            resource_limits: ServiceResourceLimits::new(None, None, None, None, None),
             work_dir: "/app".to_string(),
             network_mode: "bridge".to_string(),
             container_path_template: "/app/project_workspace/{project_id}".to_string(),
@@ -734,6 +763,7 @@ mod tests {
             cpu_limit: Some(2.0),
             swap_limit: Some(2_000_000_000.0), // 2GB
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(valid.validate().is_ok());
     }
@@ -745,6 +775,7 @@ mod tests {
             cpu_limit: None,
             swap_limit: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(invalid.validate().is_err());
         assert!(invalid.validate().unwrap_err().contains("at least 512MB"));
@@ -757,6 +788,7 @@ mod tests {
             cpu_limit: None,
             swap_limit: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -774,6 +806,7 @@ mod tests {
             cpu_limit: Some(0.1), // 太小
             swap_limit: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -791,6 +824,7 @@ mod tests {
             cpu_limit: None,
             swap_limit: Some(1_000_000_000.0), // 1GB - swap < memory
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -808,6 +842,7 @@ mod tests {
             cpu_limit: Some(2.0),
             swap_limit: Some(4_000_000_000.0), // 4GB
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
 
         let override_limits = ServiceResourceLimits {
@@ -815,6 +850,7 @@ mod tests {
             cpu_limit: None,                     // 不覆盖
             swap_limit: Some(8_000_000_000.0),   // 覆盖：8GB
             storage_size: Some("20Gi".to_string()),
+            ephemeral_storage_limit: None,
         };
 
         let merged = default_limits.merge_with(&override_limits);
@@ -831,6 +867,7 @@ mod tests {
             cpu_limit: Some(2.0),
             swap_limit: Some(4_000_000_000.0), // 4GB
             storage_size: Some("10Gi".to_string()),
+            ephemeral_storage_limit: None,
         };
 
         let override_limits = ServiceResourceLimits {
@@ -838,6 +875,7 @@ mod tests {
             cpu_limit: None,
             swap_limit: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
 
         let merged = default_limits.merge_with(&override_limits);

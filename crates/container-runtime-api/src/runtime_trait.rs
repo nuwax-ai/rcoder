@@ -7,6 +7,9 @@ use shared_types::{ContainerBasicInfo, ServiceResourceLimits, ServiceType};
 use std::collections::HashMap;
 use thiserror::Error;
 use utoipa::ToSchema;
+use winnow::ascii::float;
+use winnow::prelude::*;
+use winnow::token::rest;
 
 /// Container runtime errors
 #[derive(Error, Debug)]
@@ -138,6 +141,9 @@ pub struct AppResourceRequirements {
     pub cpu: Option<String>,
     pub memory: Option<String>,
     pub storage: Option<String>,
+    /// 临时存储限制（overlay 可写层，K8s ephemeral-storage）
+    /// 未指定时回退到 storage 值
+    pub ephemeral_storage: Option<String>,
 }
 
 /// 应用端口运行时状态（含实际分配的对外端口）
@@ -537,68 +543,98 @@ pub trait ContainerRuntime: Send + Sync {
 }
 
 // ============================================================================
-// 资源数量解析 helper（K8s Quantity 风格字符串 → 字节数/核数）
+// K8s Quantity 解析（winnow 实现）
+//
+// 当前 K8s 模式把 Quantity 字符串直接塞进 `Quantity(...)`（不解析），Docker 模式忽略
+// ephemeral；此函数作为 pub 工具，供未来"Docker 模式支持 ephemeral / 显示实际字节 /
+// 统一校验"等场景使用（parse 成功即合法 Quantity）。
 // ============================================================================
 
-/// 解析内存数量（"512Mi", "1Gi", "1024" 等）为字节数
+/// 解析 K8s 内存 Quantity（`"512Mi"`、`"1Gi"`、`"1e9"`、`"1024"` 等）为字节数
+///
+/// 基于 winnow，完整支持 K8s Quantity 规范（apimachinery/pkg/api/resource）：
+/// - **BinarySI**：`Ki`/`Mi`/`Gi`/`Ti`/`Pi`/`Ei`（1024 进制）
+/// - **DecimalSI**：`k`/`M`/`G`/`T`/`P`/`E`（1000 进制，**`k` 为小写**）+ `m`（毫）
+/// - **DecimalExponent**：`e`/`E`[+-]?digits（科学计数法，如 `1e9`，由 `float` 直接解析）
+/// - 纯数字（字节）+ 小数（如 `1.5`）
+///
+/// 非法格式（大写 `K`、负数、未识别后缀、非有限/溢出）返回 `None`。
 pub fn parse_memory_quantity(quantity: &str) -> Option<u64> {
-    let quantity = quantity.trim();
-    if let Some(num_str) = quantity.strip_suffix("Ki") {
-        num_str.parse::<f64>().ok().map(|n| (n * 1024.0) as u64)
-    } else if let Some(num_str) = quantity.strip_suffix("Mi") {
-        num_str
-            .parse::<f64>()
-            .ok()
-            .map(|n| (n * 1024.0 * 1024.0) as u64)
-    } else if let Some(num_str) = quantity.strip_suffix("Gi") {
-        num_str
-            .parse::<f64>()
-            .ok()
-            .map(|n| (n * 1024.0 * 1024.0 * 1024.0) as u64)
-    } else if let Some(num_str) = quantity.strip_suffix("Ti") {
-        num_str
-            .parse::<f64>()
-            .ok()
-            .map(|n| (n * 1024.0 * 1024.0 * 1024.0 * 1024.0) as u64)
-    } else if let Some(num_str) = quantity.strip_suffix('K') {
-        num_str.parse::<f64>().ok().map(|n| (n * 1000.0) as u64)
-    } else if let Some(num_str) = quantity.strip_suffix('M') {
-        num_str
-            .parse::<f64>()
-            .ok()
-            .map(|n| (n * 1000.0 * 1000.0) as u64)
-    } else if let Some(num_str) = quantity.strip_suffix('G') {
-        num_str
-            .parse::<f64>()
-            .ok()
-            .map(|n| (n * 1000.0 * 1000.0 * 1000.0) as u64)
-    } else {
-        quantity.parse::<u64>().ok()
+    let trimmed = quantity.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut input = trimmed;
+    // float 已涵盖 DecimalExponent（"1e9" → 1e9），故后缀查表无需再处理 e/E 分支
+    // turbofish 指定 Error=()：解析结果经 `.ok()` 转 Option，不关心错误细节
+    let value: f64 = float::<_, f64, ()>.parse_next(&mut input).ok()?;
+    let suffix: &str = rest::<_, ()>.parse_next(&mut input).ok()?;
+    let multiplier = suffix_to_multiplier(suffix)?;
+    let bytes = value * multiplier;
+    if !bytes.is_finite() || bytes < 0.0 {
+        return None;
+    }
+    Some(bytes.round() as u64)
+}
+
+/// K8s Quantity 后缀 → 乘数；未识别后缀（含大写 `K`）返回 `None`
+fn suffix_to_multiplier(suffix: &str) -> Option<f64> {
+    match suffix {
+        "" => Some(1.0),
+        // BinarySI（1024 进制）
+        "Ki" => Some(1024.0),
+        "Mi" => Some(1024f64.powi(2)),
+        "Gi" => Some(1024f64.powi(3)),
+        "Ti" => Some(1024f64.powi(4)),
+        "Pi" => Some(1024f64.powi(5)),
+        "Ei" => Some(1024f64.powi(6)),
+        // DecimalSI（1000 进制）；K8s 用小写 k，大写 K 非法
+        "k" => Some(1e3),
+        "M" => Some(1e6),
+        "G" => Some(1e9),
+        "T" => Some(1e12),
+        "P" => Some(1e15),
+        "E" => Some(1e18),
+        // 毫（DecimalSI）；内存少用但 K8s 支持，结果按需 round
+        "m" => Some(1e-3),
+        _ => None,
     }
 }
 
-/// 解析 CPU 数量（"1", "500m", "0.5"）为核数
-pub fn parse_cpu_quantity(quantity: &str) -> Option<f64> {
-    let quantity = quantity.trim();
-    if let Some(milli) = quantity.strip_suffix('m') {
-        milli.parse::<f64>().ok().map(|n| n / 1000.0)
-    } else {
-        quantity.parse::<f64>().ok()
-    }
-}
+#[cfg(test)]
+mod quantity_tests {
+    use super::*;
 
-impl AppResourceRequirements {
-    /// 转换为 ServiceResourceLimits（f64 bytes/cores，Docker 模式用）
-    pub fn to_service_resource_limits(&self) -> ServiceResourceLimits {
-        ServiceResourceLimits {
-            memory_limit: self
-                .memory
-                .as_deref()
-                .and_then(parse_memory_quantity)
-                .map(|b| b as f64),
-            cpu_limit: self.cpu.as_deref().and_then(parse_cpu_quantity),
-            swap_limit: None,
-            storage_size: self.storage.clone(),
-        }
+    #[test]
+    fn parses_binary_si() {
+        assert_eq!(parse_memory_quantity("1Ki"), Some(1024));
+        assert_eq!(parse_memory_quantity("1Mi"), Some(1024 * 1024));
+        assert_eq!(parse_memory_quantity("1Gi"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_memory_quantity("2Gi"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory_quantity("1Pi"), Some(1024u64.pow(5)));
+    }
+
+    #[test]
+    fn parses_decimal_si() {
+        assert_eq!(parse_memory_quantity("1k"), Some(1_000));
+        assert_eq!(parse_memory_quantity("1M"), Some(1_000_000));
+        assert_eq!(parse_memory_quantity("1G"), Some(1_000_000_000));
+    }
+
+    #[test]
+    fn parses_decimal_exponent_and_plain() {
+        assert_eq!(parse_memory_quantity("1e9"), Some(1_000_000_000));
+        assert_eq!(parse_memory_quantity("1024"), Some(1024));
+        assert_eq!(parse_memory_quantity("1.5"), Some(2)); // 1.5 字节 round → 2
+    }
+
+    #[test]
+    fn rejects_invalid() {
+        assert_eq!(parse_memory_quantity("5K"), None); // 大写 K 非法（K8s 用 k）
+        assert_eq!(parse_memory_quantity("-5Gi"), None); // 负数
+        assert_eq!(parse_memory_quantity("1Xi"), None); // 未识别后缀
+        assert_eq!(parse_memory_quantity(""), None);
+        assert_eq!(parse_memory_quantity("   "), None);
+        assert_eq!(parse_memory_quantity("abc"), None);
     }
 }

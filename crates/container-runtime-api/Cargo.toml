@@ -14,3 +14,4 @@ thiserror = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 utoipa = { workspace = true }
+winnow = { workspace = true }

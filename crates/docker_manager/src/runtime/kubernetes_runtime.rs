@@ -283,6 +283,16 @@ impl KubernetesRuntime {
             requests.insert("cpu".to_string(), Quantity(format!("{}", cpu)));
             lims.insert("cpu".to_string(), Quantity(format!("{}", cpu)));
         }
+        // ephemeral-storage：限制 overlay 可写层（/tmp、容器可写层等）。
+        // 与 PVC 的 storage_size 是两个独立配额；未显式指定时回退到 storage_size 值。
+        let es = limits
+            .ephemeral_storage_limit
+            .clone()
+            .or_else(|| limits.storage_size.clone());
+        if let Some(es_qty) = es {
+            requests.insert("ephemeral-storage".to_string(), Quantity(es_qty.clone()));
+            lims.insert("ephemeral-storage".to_string(), Quantity(es_qty));
+        }
 
         if requests.is_empty() && lims.is_empty() {
             return None;
@@ -424,6 +434,16 @@ impl ContainerRuntime for KubernetesRuntime {
         // 每个项目/用户使用独立的 PVC，底层由 NFS Subdir External Provisioner
         // 自动在 NFS Server 上创建子目录，实现存储隔离和自动回收
         let pvc_name = self.workspace_pvc_name(identifier, &service_type)?;
+
+        // 取 service 配置：决定 workspace 挂载路径（K8s 模式 computer→/home/user,
+        // web→/app/project_workspace），并用于下方透传 service_config.environment。
+        // 复用 select_image 同款途径（multi_image_config.get_service_config）。
+        let multi_config = &self.config.docker_manager_config.multi_image_config;
+        let service_config = multi_config.get_service_config(&service_type);
+        let workspace_mount_path = service_config
+            .map(|sc| sc.workspace_container_path())
+            .unwrap_or_else(|| "/app/project_workspace".to_string());
+
         let volumes = Some(vec![Volume {
             name: "workspace".to_string(),
             persistent_volume_claim: Some(
@@ -436,7 +456,7 @@ impl ContainerRuntime for KubernetesRuntime {
         }]);
         let volume_mounts = Some(vec![VolumeMount {
             name: "workspace".to_string(),
-            mount_path: "/app/project_workspace".to_string(),
+            mount_path: workspace_mount_path,
             read_only: Some(false),
             ..Default::default()
         }]);
@@ -522,6 +542,29 @@ impl ContainerRuntime for KubernetesRuntime {
                                 value: Some(it.clone()),
                                 ..Default::default()
                             });
+                        }
+                        // 透传 service_config.environment
+                        // (PROJECT_WORKSPACE_BASE/RUST_LOG/SERVICE_MODE/AGENT_PORT 等,
+                        //  让 sub-container 行为与 Docker 模式一致)。跳过已硬编码的同名 env。
+                        if let Some(sc) = service_config {
+                            const RESERVED: [&str; 6] = [
+                                "PROJECT_ID",
+                                "USER_ID",
+                                "SERVICE_TYPE",
+                                "TENANT_ID",
+                                "SPACE_ID",
+                                "ISOLATION_TYPE",
+                            ];
+                            for (k, v) in &sc.environment {
+                                if RESERVED.contains(&k.as_str()) {
+                                    continue;
+                                }
+                                env_vars.push(EnvVar {
+                                    name: k.clone(),
+                                    value: Some(v.clone()),
+                                    ..Default::default()
+                                });
+                            }
                         }
                         Some(env_vars)
                     },

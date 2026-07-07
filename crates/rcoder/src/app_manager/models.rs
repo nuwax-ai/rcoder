@@ -43,8 +43,11 @@ pub struct ResourceLimits {
     pub cpu: Option<String>,
     /// 内存: "512Mi", "1Gi"
     pub memory: Option<String>,
-    /// 存储: "10Gi"（仅 K8s）
+    /// 存储: "10Gi"（仅 K8s，UserApp 用于 ephemeral-storage 回退）
     pub storage: Option<String>,
+    /// 临时存储限制（overlay 可写层，K8s ephemeral-storage）
+    /// 未指定时回退到 storage 值
+    pub ephemeral_storage: Option<String>,
 }
 
 /// 端口配置

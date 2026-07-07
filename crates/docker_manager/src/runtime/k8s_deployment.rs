@@ -39,6 +39,9 @@ use std::collections::BTreeMap;
 use tracing::info;
 
 #[cfg(feature = "kubernetes")]
+use shared_types::ServiceType;
+
+#[cfg(feature = "kubernetes")]
 use super::kubernetes_runtime::KubernetesRuntime;
 
 #[cfg(feature = "kubernetes")]
@@ -47,35 +50,41 @@ const APP_MANAGED_BY: &str = "rcoder-app-manager";
 const APP_LABEL_PREFIX: &str = "app.kubernetes.io";
 #[cfg(feature = "kubernetes")]
 const RCODER_LABEL_PREFIX: &str = "rcoder.io";
+/// UserApp Pod 主容器名：build_app_deployment 创建、deployment_to_status 按此名定位状态
+#[cfg(feature = "kubernetes")]
+const APP_CONTAINER_NAME: &str = "app";
 
 /// UserApp K8s 资源命名 + 创建/伸缩/重启/删除/查询（pub(crate)，由 ContainerRuntime
 /// trait 的 Deployment 方法转调，rcoder 通过 trait 调用）。
 #[cfg(feature = "kubernetes")]
 impl KubernetesRuntime {
-    /// app_id → Deployment 名
+    /// app_id → Deployment 名（其余 app 资源名基于此）
+    ///
+    /// 前缀取自 `ServiceType::UserApp::container_prefix()`（单一来源），与 Docker 侧
+    /// `docker_runtime::app_deployment_name` 对称，避免硬编码散落；改前缀只需改一处。
     pub fn app_deployment_name(&self, app_id: &str) -> String {
-        format!("rcoder-app-{app_id}")
+        format!("{}-{app_id}", ServiceType::UserApp.container_prefix())
     }
 
     fn app_config_name(&self, app_id: &str) -> String {
-        format!("rcoder-app-{app_id}-config")
+        format!("{}-config", self.app_deployment_name(app_id))
     }
 
     fn app_secret_name(&self, app_id: &str) -> String {
-        format!("rcoder-app-{app_id}-secret")
+        format!("{}-secret", self.app_deployment_name(app_id))
     }
 
     /// app ClusterIP Service 名（供 HTTPRoute backendRef / 集群内访问）
     pub fn app_service_name(&self, app_id: &str) -> String {
-        format!("rcoder-app-{app_id}-svc")
+        format!("{}-svc", self.app_deployment_name(app_id))
     }
 
     fn app_http_route_name(&self, app_id: &str) -> String {
-        format!("rcoder-app-{app_id}-route")
+        format!("{}-route", self.app_deployment_name(app_id))
     }
 
     fn app_nodeport_name(&self, app_id: &str) -> String {
-        format!("rcoder-app-{app_id}-nodeport")
+        format!("{}-nodeport", self.app_deployment_name(app_id))
     }
 
     /// app workspace PVC 名（复用 rcoder-workspace RWX PVC）
@@ -211,6 +220,16 @@ impl KubernetesRuntime {
             if let Some(mem) = &req.memory {
                 limits.insert("memory".to_string(), Quantity(mem.clone()));
             }
+            // ephemeral-storage：限制 overlay 可写层。优先 ephemeral_storage，回退 storage。
+            // 修复此前 storage 字段被完全忽略的问题：UserApp 复用共享 PVC subPath 无独立配额,
+            // storage 现用于限制 overlay 可写层（与 ephemeral_storage 同义）。
+            let es = req
+                .ephemeral_storage
+                .clone()
+                .or_else(|| req.storage.clone());
+            if let Some(es_val) = es {
+                limits.insert("ephemeral-storage".to_string(), Quantity(es_val));
+            }
             if limits.is_empty() {
                 None
             } else {
@@ -271,7 +290,7 @@ impl KubernetesRuntime {
         }]);
 
         let container = K8sContainer {
-            name: "app".to_string(),
+            name: APP_CONTAINER_NAME.to_string(),
             image: Some(image),
             image_pull_policy: Some("IfNotPresent".to_string()),
             command: params.command.clone(),
@@ -566,37 +585,60 @@ impl KubernetesRuntime {
 
     /// 删除 UserApp 的全部 K8s 资源（Deployment/Service/NodePort/HTTPRoute/ConfigMap/Secret）
     /// 不删 PVC（app 复用 rcoder-workspace 共享 PVC，由 app_manager 在子目录层清理）。
+    ///
+    /// 任一资源删除返回非 404 错误（如 API Server 不可达、权限拒绝）立即透传，调用方
+    /// （app_manager）据此决定是否继续清理工作空间目录，避免"集群资源还在但数据已删"
+    /// 的不一致。404 视为已删除（幂等），忽略。
     pub async fn delete_app_resources(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         let dp = DeleteParams::default();
-        // 404 视为已删除，不报错
-        let _ = self
-            .deployments_api()
-            .delete(&self.app_deployment_name(app_id), &dp)
-            .await;
-        let _ = self
-            .services_api()
-            .delete(&self.app_service_name(app_id), &dp)
-            .await;
-        let _ = self
-            .services_api()
-            .delete(&self.app_nodeport_name(app_id), &dp)
-            .await;
-        let _ = self
-            .configmaps_api()
-            .delete(&self.app_config_name(app_id), &dp)
-            .await;
-        let _ = self
-            .secrets_api()
-            .delete(&self.app_secret_name(app_id), &dp)
-            .await;
+        self.ignore_404(
+            self.deployments_api()
+                .delete(&self.app_deployment_name(app_id), &dp)
+                .await,
+        )
+        .await?;
+        self.ignore_404(
+            self.services_api()
+                .delete(&self.app_service_name(app_id), &dp)
+                .await,
+        )
+        .await?;
+        self.ignore_404(
+            self.services_api()
+                .delete(&self.app_nodeport_name(app_id), &dp)
+                .await,
+        )
+        .await?;
+        self.ignore_404(
+            self.configmaps_api()
+                .delete(&self.app_config_name(app_id), &dp)
+                .await,
+        )
+        .await?;
+        self.ignore_404(
+            self.secrets_api()
+                .delete(&self.app_secret_name(app_id), &dp)
+                .await,
+        )
+        .await?;
         // HTTPRoute（动态资源）
         let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
         let api_resource = ApiResource::from_gvk(&gvk);
         let routes: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
-        let _ = routes.delete(&self.app_http_route_name(app_id), &dp).await;
+        self.ignore_404(routes.delete(&self.app_http_route_name(app_id), &dp).await)
+            .await?;
         info!("[K8S-APP] K8s resources deleted for app: {app_id}");
         Ok(())
+    }
+
+    /// 仅容忍 404（视为已删除/幂等），其余 K8s 错误透传
+    async fn ignore_404<T>(&self, r: Result<T, kube::Error>) -> ContainerRuntimeResult<()> {
+        match r {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+            Err(e) => Err(ContainerRuntimeError::K8sError(format!("delete: {e}"))),
+        }
     }
 
     /// 查询单个 app 的运行时状态（实时查 Deployment + Pod）
@@ -659,7 +701,7 @@ impl KubernetesRuntime {
             "Starting".to_string()
         };
 
-        // 关联 Pod 信息（取一个）
+        // 关联 Pod 信息（取一个；app 当前为单副本）
         let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
         let (pod_ip, node, restart_count, started_at) = match self.pods_api().list(&lp).await {
             Ok(pods) => pods
@@ -668,36 +710,76 @@ impl KubernetesRuntime {
                 .next()
                 .and_then(|p| {
                     let st = p.status?;
-                    let cs = st.container_statuses.and_then(|mut v| v.pop())?;
+                    // 按容器名取 "app" 容器状态（防御 sidecar 注入后 pop() 取错容器）
+                    let cs = st
+                        .container_statuses
+                        .and_then(|v| v.into_iter().find(|c| c.name == APP_CONTAINER_NAME))?;
+                    // started_at：从 container state.running 提取实际启动时间
+                    let started_at = cs
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.running.as_ref())
+                        .and_then(|r| r.started_at.as_ref())
+                        .map(|t| t.0.to_string());
                     Some((
                         st.pod_ip.unwrap_or_default(),
                         p.spec.and_then(|s| s.node_name).unwrap_or_default(),
                         cs.restart_count as u32,
-                        cs.last_state.as_ref().map(|_| String::new()),
+                        started_at,
                     ))
                 })
                 .unwrap_or_default(),
             Err(_) => (String::new(), String::new(), 0, None),
         };
 
-        // 端口状态（从 Deployment spec 的 container ports 推导；external_port 需查 Service/NodePort）
+        // TCP 端口的 node_port：查 NodePort Service，按 port name 关联（name 与 container port 一致）
+        // 在 NodePort Service 中的端口 = Tcp（external_port = node_port）；不在的 = Http。
+        let tcp_nodeports: std::collections::HashMap<String, u16> = self
+            .services_api()
+            .get(&self.app_nodeport_name(app_id))
+            .await
+            .ok()
+            .and_then(|svc| svc.spec)
+            .and_then(|s| s.ports)
+            .map(|ports| {
+                ports
+                    .into_iter()
+                    .filter_map(|p| {
+                        let name = p.name.unwrap_or_default();
+                        let np = p.node_port.map(|n| n as u16)?;
+                        Some((name, np))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 端口状态：从 Deployment spec 的 container ports 推导，
+        // expose_type / external_port 由 NodePort Service 还原（Http 端口经 Gateway，不 per-port 分配）
         let ports = spec
             .and_then(|s| s.template.spec.as_ref())
             .and_then(|s| s.containers.first())
             .and_then(|c| c.ports.as_ref())
             .map(|ps| {
                 ps.iter()
-                    .map(|p| AppPortStatus {
-                        name: p.name.clone().unwrap_or_default(),
-                        port: p.container_port as u16,
-                        expose_type: ExposeType::Http, // 精确类型需查 Service，此处兜底
-                        external_port: None,
+                    .map(|p| {
+                        let name = p.name.clone().unwrap_or_default();
+                        let (expose_type, external_port) =
+                            if let Some(np) = tcp_nodeports.get(&name) {
+                                (ExposeType::Tcp, Some(*np))
+                            } else {
+                                (ExposeType::Http, None)
+                            };
+                        AppPortStatus {
+                            name,
+                            port: p.container_port as u16,
+                            expose_type,
+                            external_port,
+                        }
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
 
-        let _ = started_at; // TODO: 从 Pod status.startTime 提取
         DeploymentStatus {
             app_id: app_id.to_string(),
             replicas,
@@ -710,7 +792,7 @@ impl KubernetesRuntime {
             },
             node: if node.is_empty() { None } else { Some(node) },
             restart_count,
-            started_at: None,
+            started_at,
             ports,
         }
     }

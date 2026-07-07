@@ -25,7 +25,11 @@ fn health_from_runtime(info: &AppRuntimeInfo) -> HealthInfo {
     HealthInfo {
         status: info.phase.clone(),
         instance: Some(InstanceInfo {
-            name: format!("rcoder-app-{}", info.app_id),
+            name: format!(
+                "{}-{}",
+                shared_types::ServiceType::UserApp.container_prefix(),
+                info.app_id
+            ),
             phase: info.phase.clone(),
             ready: info.ready_replicas > 0,
             restart_count: info.restart_count,

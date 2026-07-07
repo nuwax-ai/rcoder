@@ -146,11 +146,14 @@ fn resolve_resource_limits(
     service_type: &ServiceType,
     api_limits: Option<PodResourceLimits>,
 ) -> Option<ServiceResourceLimits> {
-    let api_limits = api_limits.map(|limits| ServiceResourceLimits {
-        memory_limit: limits.memory,
-        cpu_limit: limits.cpu,
-        swap_limit: limits.swap,
-        storage_size: limits.storage_size,
+    let api_limits = api_limits.map(|limits| {
+        ServiceResourceLimits::new(
+            limits.memory,
+            limits.cpu,
+            limits.swap,
+            limits.storage_size,
+            limits.ephemeral_storage_limit,
+        )
     });
     resolve_resource_limits_from_config(state, service_type, api_limits)
 }
@@ -201,115 +204,30 @@ fn container_identifier_for_service(
     }
 }
 
-/// K8s 存储大小单位
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StorageUnit {
-    /// 兆字节（二进制，1 Mi = 1024 Ki）
-    Mi,
-    /// 吉字节（二进制，1 Gi = 1024 Mi）
-    Gi,
-    /// 太字节（二进制，1 Ti = 1024 Gi）
-    Ti,
-    /// 兆字节（十进制，1 M = 1000 KB）
-    M,
-    /// 吉字节（十进制，1 G = 1000 MB）
-    G,
-    /// 太字节（十进制，1 T = 1000 GB）
-    T,
-}
-
-impl StorageUnit {
-    /// 转换为 Gi（吉字节，二进制）
-    fn to_gi(self, value: f64) -> f64 {
-        match self {
-            StorageUnit::Ti => value * 1024.0,
-            StorageUnit::Gi => value,
-            StorageUnit::Mi => value / 1024.0,
-            // 十进制单位转换为二进制
-            StorageUnit::T => value * 1000.0 / 1024.0,
-            StorageUnit::G => value * 1000.0 / 1024.0,
-            StorageUnit::M => value / 1024.0,
-        }
-    }
-}
-
-/// 解析 K8s 资源格式的存储大小
+/// 验证 K8s 存储大小格式与范围
 ///
-/// 支持的格式：`<数字><单位>`
-/// - 二进制单位：Mi, Gi, Ti
-/// - 十进制单位：M, G, T
-///
-/// # 示例
-/// - "10Gi" → (10.0, Gi)
-/// - "100Mi" → (100.0, Mi)
-/// - "1.5Ti" → (1.5, Ti)
-fn parse_k8s_storage_size(input: &str) -> Result<(f64, StorageUnit), String> {
-    use winnow::ascii::float;
-    use winnow::combinator::alt;
-    use winnow::prelude::*;
-
-    // 解析单位后缀
-    // 使用字符串字面量直接调用 .parse_next()，这是 winnow 的惯用方式
-    fn unit_parser(input: &mut &str) -> winnow::ModalResult<StorageUnit> {
-        alt((
-            "Ti".value(StorageUnit::Ti),
-            "Gi".value(StorageUnit::Gi),
-            "Mi".value(StorageUnit::Mi),
-            'T'.value(StorageUnit::T),
-            'G'.value(StorageUnit::G),
-            'M'.value(StorageUnit::M),
-        ))
-        .parse_next(input)
-    }
-
-    // 解析数字 + 单位
-    fn storage_parser(input: &mut &str) -> winnow::ModalResult<(f64, StorageUnit)> {
-        let num = float.parse_next(input)?;
-        let unit = unit_parser.parse_next(input)?;
-        Ok((num, unit))
-    }
-
-    // 执行解析
-    let mut parser = storage_parser;
-    parser.parse(input).map_err(|_| {
-        format!(
-            "invalid storage_size format: '{}', expected format: <number><unit> (e.g., 10Gi, 100Mi)",
-            input
-        )
-    })
-}
-
-/// 验证 K8s 存储大小格式
-///
-/// 支持的格式：数字 + 单位后缀
-/// - Mi, Gi, Ti（二进制单位）
-/// - M, G, T（十进制单位）
+/// 格式：任意合法 K8s Quantity（`10Gi`、`100Mi`、`1Ti`、`1e12`、纯数字字节等），
+/// 由 `container_runtime_api::parse_memory_quantity`（winnow）解析，支持完整 K8s Quantity 规范。
+/// 范围：1Gi ≤ value ≤ 100Ti（与 PVC 配额约束一致）。
 ///
 /// # 参数
-/// * `storage_size` - 存储大小字符串（如 "10Gi", "100Mi"）
+/// * `storage_size` - 存储大小字符串（K8s Quantity）
 ///
 /// # 返回
 /// Ok(()) 验证通过，Err(String) 返回错误信息
-fn validate_k8s_storage_size(storage_size: &str) -> Result<(), String> {
-    let (num, unit) = parse_k8s_storage_size(storage_size)?;
-
-    if num <= 0.0 {
-        return Err("storage_size must be greater than 0".to_string());
-    }
-
-    // 转换为 Gi 进行范围检查
-    let gi_value = unit.to_gi(num);
-
-    // 最小 1Gi
-    if gi_value < 1.0 {
+pub(crate) fn validate_k8s_storage_size(storage_size: &str) -> Result<(), String> {
+    let bytes = container_runtime_api::parse_memory_quantity(storage_size).ok_or_else(|| {
+        format!(
+            "invalid storage_size '{storage_size}': expected K8s quantity (e.g., 10Gi, 100Mi, 1Ti)"
+        )
+    })?;
+    let gi = bytes as f64 / 1024f64.powi(3);
+    if gi < 1.0 {
         return Err("storage_size must be at least 1Gi".to_string());
     }
-
-    // 最大 100Ti
-    if gi_value > 100.0 * 1024.0 {
+    if gi > 100.0 * 1024.0 {
         return Err("storage_size cannot exceed 100Ti".to_string());
     }
-
     Ok(())
 }
 
@@ -522,12 +440,20 @@ pub struct PodResourceLimits {
     /// - 十进制单位：`M`（兆字节）、`G`（吉字节）、`T`（太字节）
     ///
     /// 范围：最小 1Gi，最大 100Ti
-    /// 默认值：50Gi（未指定时）
+    /// 默认值：10Gi（未指定时）
     ///
     /// 示例："10Gi", "100Mi", "1.5Ti"
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "10Gi")]
     pub storage_size: Option<String>,
+
+    /// 临时存储限制（overlay 可写层，仅 K8s 模式生效）
+    ///
+    /// 限制容器根文件系统可写层 + emptyDir 等临时存储的写入量（区别于 storage_size 管 PVC）。
+    /// 与 storage_size 是两个独立配额，不会合并；未指定时回退到 storage_size 的值。范围/格式同 storage_size。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "10Gi")]
+    pub ephemeral_storage_limit: Option<String>,
 }
 
 /// 启动容器响应
@@ -2650,6 +2576,7 @@ mod tests {
             cpu: Some(2.0),
             swap: Some(6442450944.0),
             storage_size: Some("10Gi".to_string()),
+            ephemeral_storage_limit: None,
         };
 
         let json = serde_json::to_string(&limits).unwrap();
@@ -2683,6 +2610,7 @@ mod tests {
             cpu: Some(2.0),
             swap: Some(6442450944.0), // 6GB
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_ok());
     }
@@ -2694,6 +2622,7 @@ mod tests {
             cpu: None,
             swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_ok());
     }
@@ -2705,6 +2634,7 @@ mod tests {
             cpu: Some(0.0),
             swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_err());
     }
@@ -2716,6 +2646,7 @@ mod tests {
             cpu: Some(-1.0),
             swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_err());
     }
@@ -2727,6 +2658,7 @@ mod tests {
             cpu: Some(200.0),
             swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_err());
     }
@@ -2738,6 +2670,7 @@ mod tests {
             cpu: None,
             swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_err());
     }
@@ -2749,6 +2682,7 @@ mod tests {
             cpu: None,
             swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_err());
     }
@@ -2760,6 +2694,7 @@ mod tests {
             cpu: None,
             swap: Some(4_294_967_296.0), // 4GB
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_err());
     }
@@ -2771,6 +2706,7 @@ mod tests {
             cpu: None,
             swap: Some(256_000_000.0), // 256MB
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_err());
     }
@@ -2783,6 +2719,7 @@ mod tests {
             cpu: Some(0.1),
             swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_ok());
 
@@ -2792,6 +2729,7 @@ mod tests {
             cpu: Some(0.01),
             swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(validate_resource_limits(&limits).is_ok());
     }
