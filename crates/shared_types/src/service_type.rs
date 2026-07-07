@@ -25,6 +25,11 @@ pub enum ServiceType {
     /// 专注于代理运行和执行，提供轻量级的代理执行环境
     /// 容器标识为 user_id，用于桌面应用开发场景
     ComputerAgentRunner,
+    /// 用户应用（UserApp）
+    /// 由 app_manager 托管的用户业务应用（Java/Python/Go/前端等），区别于 agent。
+    /// 容器标识为 app_id；镜像/命令/端口由调用方提供，不走 select_image。
+    /// K8s 模式下对应 Deployment（而非 agent 的裸 Pod）。
+    UserApp,
 }
 
 // 自定义 Serialize 实现，输出中划线格式
@@ -53,6 +58,7 @@ impl std::fmt::Display for ServiceType {
         match self {
             ServiceType::WebAgentRunner => write!(f, "web-agent-runner"),
             ServiceType::ComputerAgentRunner => write!(f, "computer-agent-runner"),
+            ServiceType::UserApp => write!(f, "user-app"),
         }
     }
 }
@@ -71,11 +77,14 @@ impl std::str::FromStr for ServiceType {
             // 中划线格式（推荐）
             "web-agent-runner" => Ok(ServiceType::WebAgentRunner),
             "computer-agent-runner" => Ok(ServiceType::ComputerAgentRunner),
+            "user-app" => Ok(ServiceType::UserApp),
             // 大驼峰格式（兼容旧配置）
             "WebAgentRunner" => Ok(ServiceType::WebAgentRunner),
             "ComputerAgentRunner" => Ok(ServiceType::ComputerAgentRunner),
+            "UserApp" => Ok(ServiceType::UserApp),
             // 旧枚举名（向后兼容）
             "RCoder" | "rcoder" => Ok(ServiceType::WebAgentRunner),
+            "application" | "app" => Ok(ServiceType::UserApp),
             _ => Err(ServiceTypeError::InvalidServiceType(s.to_string())),
         }
     }
@@ -91,6 +100,9 @@ impl ServiceType {
             ServiceType::ComputerAgentRunner => {
                 "Computer Agent Runner service, focused on agent execution for desktop applications"
             }
+            ServiceType::UserApp => {
+                "User application managed by app_manager (long-running service owned by the user, not an agent)"
+            }
         }
     }
 
@@ -104,6 +116,7 @@ impl ServiceType {
         match self {
             ServiceType::WebAgentRunner => "web-agent-runner",
             ServiceType::ComputerAgentRunner => "computer-agent-runner",
+            ServiceType::UserApp => "rcoder-app",
         }
     }
 
@@ -125,7 +138,7 @@ pub enum ServiceTypeError {
     #[error("service type cannot be empty")]
     EmptyServiceType,
     #[error(
-        "unsupported service type '{0}', please use 'web-agent-runner'/'WebAgentRunner'/'RCoder' or 'computer-agent-runner'/'ComputerAgentRunner'"
+        "unsupported service type '{0}', please use 'web-agent-runner'/'WebAgentRunner'/'RCoder', 'computer-agent-runner'/'ComputerAgentRunner', or 'user-app'/'UserApp'/'application'"
     )]
     InvalidServiceType(String),
     #[error("service type '{0}' is disabled")]
@@ -137,6 +150,7 @@ pub fn get_supported_service_types() -> Vec<String> {
     vec![
         "web-agent-runner".to_string(),
         "computer-agent-runner".to_string(),
+        "user-app".to_string(),
     ]
 }
 
@@ -258,6 +272,7 @@ mod tests {
             ServiceType::ComputerAgentRunner.to_string(),
             "computer-agent-runner"
         );
+        assert_eq!(ServiceType::UserApp.to_string(), "user-app");
 
         assert!(ServiceType::WebAgentRunner.description().contains("full"));
         assert!(
@@ -265,6 +280,7 @@ mod tests {
                 .description()
                 .contains("execution")
         );
+        assert!(ServiceType::UserApp.description().contains("app_manager"));
     }
 
     #[test]
@@ -299,6 +315,14 @@ mod tests {
             ServiceType::WebAgentRunner
         );
 
+        // UserApp 多格式
+        assert_eq!("user-app".parse::<ServiceType>().unwrap(), ServiceType::UserApp);
+        assert_eq!("UserApp".parse::<ServiceType>().unwrap(), ServiceType::UserApp);
+        assert_eq!(
+            "application".parse::<ServiceType>().unwrap(),
+            ServiceType::UserApp
+        );
+
         // 未知类型应该返回错误
         assert!("unknown".parse::<ServiceType>().is_err());
 
@@ -321,9 +345,10 @@ mod tests {
     #[test]
     fn test_get_supported_service_types() {
         let types = get_supported_service_types();
-        assert_eq!(types.len(), 2);
+        assert_eq!(types.len(), 3);
         assert!(types.contains(&"web-agent-runner".to_string()));
         assert!(types.contains(&"computer-agent-runner".to_string()));
+        assert!(types.contains(&"user-app".to_string()));
     }
 
     #[test]

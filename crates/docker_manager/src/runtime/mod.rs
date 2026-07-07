@@ -10,6 +10,8 @@ pub mod manager;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_backend_crd;
 #[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_deployment;
+#[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_pod;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_pvc;

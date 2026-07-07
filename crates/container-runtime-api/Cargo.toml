@@ -12,3 +12,5 @@ shared_types = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+utoipa = { workspace = true }

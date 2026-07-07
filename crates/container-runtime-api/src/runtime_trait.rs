@@ -2,8 +2,11 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use shared_types::{ContainerBasicInfo, ServiceResourceLimits, ServiceType};
+use std::collections::HashMap;
 use thiserror::Error;
+use utoipa::ToSchema;
 
 /// Container runtime errors
 #[derive(Error, Debug)]
@@ -86,6 +89,90 @@ impl From<ContainerRuntimeStatus> for String {
     }
 }
 
+// ============================================================================
+// 应用（UserApp）相关类型
+// ============================================================================
+
+/// 应用端口暴露类型
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub enum ExposeType {
+    /// HTTP 服务（K8s 经 Gateway HTTPRoute，Docker 经 Pingora /proxy）
+    Http,
+    /// TCP 服务（K8s 经 NodePort，Docker 经 port_bindings）
+    Tcp,
+}
+
+/// 应用端口规格（创建时由调用方提供）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AppPortSpec {
+    /// 端口名称
+    pub name: String,
+    /// 容器端口
+    pub port: u16,
+    /// 暴露类型
+    pub expose_type: ExposeType,
+}
+
+/// 健康检查类型
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub enum HealthCheckType {
+    Http,
+    Tcp,
+    Exec,
+    None,
+}
+
+/// 应用健康检查配置
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AppHealthCheck {
+    pub check_type: HealthCheckType,
+    pub path: Option<String>,
+    pub port: Option<u16>,
+    pub initial_delay_seconds: Option<u32>,
+    pub period_seconds: Option<u32>,
+}
+
+/// 应用资源需求（字符串格式：cpu="1"/"500m"，memory="512Mi"/"1Gi"，storage="10Gi"）
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct AppResourceRequirements {
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+    pub storage: Option<String>,
+}
+
+/// 应用端口运行时状态（含实际分配的对外端口）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AppPortStatus {
+    pub name: String,
+    pub port: u16,
+    pub expose_type: ExposeType,
+    /// K8s: NodePort；Docker: host_port；未暴露则为 None
+    pub external_port: Option<u16>,
+}
+
+/// Deployment 运行时状态（供 app_manager 实时查询，rcoder 无状态化读路径的数据载体）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeploymentStatus {
+    /// 应用 ID（app_id）
+    pub app_id: String,
+    /// 期望副本数
+    pub replicas: i32,
+    /// 就绪副本数
+    pub ready_replicas: i32,
+    /// 阶段：Running/Stopped/Starting/Error 等
+    pub phase: String,
+    /// Pod IP（K8s）/ 容器 IP（Docker）
+    pub pod_ip: Option<String>,
+    /// 所在节点（K8s）
+    pub node: Option<String>,
+    /// 重启次数
+    pub restart_count: u32,
+    /// 启动时间（RFC3339）
+    pub started_at: Option<String>,
+    /// 端口状态
+    pub ports: Vec<AppPortStatus>,
+}
+
 /// Parameters for creating a container
 ///
 /// Bundles all parameters needed for container creation to avoid
@@ -113,6 +200,24 @@ pub struct ContainerCreateParams {
     /// PVC storage size (K8s resource format, e.g., "10Gi", "100Mi")
     /// Only effective in K8s mode, Docker mode ignores this parameter
     pub storage_size: Option<String>,
+
+    // ===== UserApp 专用字段（agent 路径不传，全 Option 向后兼容）=====
+    /// 镜像覆盖（UserApp 必填，优先于 ServiceType 驱动的 select_image）
+    pub image_override: Option<String>,
+    /// 启动命令（UserApp 用，agent 路径由 ServiceType 决定）
+    pub command: Option<Vec<String>>,
+    /// 启动参数
+    pub args: Option<Vec<String>>,
+    /// 用户环境变量（额外注入；K8s 模式进 ConfigMap）
+    pub env: Option<HashMap<String, String>>,
+    /// 敏感环境变量（K8s 模式进 Secret，Docker 模式合并进 env）
+    pub secrets: Option<HashMap<String, String>>,
+    /// 端口配置（UserApp 用）
+    pub ports: Option<Vec<AppPortSpec>>,
+    /// 健康检查配置（UserApp 用）
+    pub health_check: Option<AppHealthCheck>,
+    /// 应用资源需求（字符串格式；与 resource_limits 二选一，UserApp 专用）
+    pub app_resources: Option<AppResourceRequirements>,
 }
 
 impl ContainerCreateParams {
@@ -134,6 +239,14 @@ pub struct ContainerCreateParamsBuilder {
     tenant_id: Option<String>,
     space_id: Option<String>,
     storage_size: Option<String>,
+    image_override: Option<String>,
+    command: Option<Vec<String>>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    secrets: Option<HashMap<String, String>>,
+    ports: Option<Vec<AppPortSpec>>,
+    health_check: Option<AppHealthCheck>,
+    app_resources: Option<AppResourceRequirements>,
 }
 
 impl ContainerCreateParamsBuilder {
@@ -187,6 +300,46 @@ impl ContainerCreateParamsBuilder {
         self
     }
 
+    pub fn image_override(mut self, image: impl Into<String>) -> Self {
+        self.image_override = Some(image.into());
+        self
+    }
+
+    pub fn command(mut self, command: Vec<String>) -> Self {
+        self.command = Some(command);
+        self
+    }
+
+    pub fn args(mut self, args: Vec<String>) -> Self {
+        self.args = Some(args);
+        self
+    }
+
+    pub fn env(mut self, env: HashMap<String, String>) -> Self {
+        self.env = Some(env);
+        self
+    }
+
+    pub fn secrets(mut self, secrets: HashMap<String, String>) -> Self {
+        self.secrets = Some(secrets);
+        self
+    }
+
+    pub fn ports(mut self, ports: Vec<AppPortSpec>) -> Self {
+        self.ports = Some(ports);
+        self
+    }
+
+    pub fn health_check(mut self, health_check: AppHealthCheck) -> Self {
+        self.health_check = Some(health_check);
+        self
+    }
+
+    pub fn app_resources(mut self, resources: AppResourceRequirements) -> Self {
+        self.app_resources = Some(resources);
+        self
+    }
+
     pub fn build(self) -> ContainerCreateParams {
         ContainerCreateParams {
             project_id: self.project_id,
@@ -199,6 +352,14 @@ impl ContainerCreateParamsBuilder {
             tenant_id: self.tenant_id,
             space_id: self.space_id,
             storage_size: self.storage_size,
+            image_override: self.image_override,
+            command: self.command,
+            args: self.args,
+            env: self.env,
+            secrets: self.secrets,
+            ports: self.ports,
+            health_check: self.health_check,
+            app_resources: self.app_resources,
         }
     }
 }
@@ -312,4 +473,136 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// Health check - verify runtime is accessible
     async fn health_check(&self) -> ContainerRuntimeResult<()>;
+
+    // ====================================================================
+    // Deployment 生命周期（UserApp 专用，agent 路径不调用）
+    //
+    // K8s 由 KubernetesRuntime 实现真实 Deployment 操作；
+    // Docker 由 DockerRuntime 做等价语义映射（容器 create/stop/start）。
+    // 默认实现返回 ConfigurationError，强制具体 runtime 按需实现。
+    // ====================================================================
+
+    /// 创建并启动一个 Deployment（K8s）或等价容器（Docker）
+    async fn create_deployment(
+        &self,
+        params: ContainerCreateParams,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let _ = params;
+        Err(ContainerRuntimeError::ConfigurationError(
+            "create_deployment not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// 伸缩 Deployment 副本数（K8s scale；Docker: 0=stop, >=1=start）
+    async fn scale_deployment(
+        &self,
+        app_id: &str,
+        replicas: i32,
+    ) -> ContainerRuntimeResult<()> {
+        let _ = (app_id, replicas);
+        Err(ContainerRuntimeError::ConfigurationError(
+            "scale_deployment not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// 触发滚动重启（K8s rollout annotation；Docker: stop+start）
+    async fn restart_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        let _ = app_id;
+        Err(ContainerRuntimeError::ConfigurationError(
+            "restart_deployment not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// 删除 Deployment 及其关联资源（Service/HTTPRoute/ConfigMap/Secret 等）
+    async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        let _ = app_id;
+        Err(ContainerRuntimeError::ConfigurationError(
+            "delete_deployment not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// 实时查询 Deployment 运行时状态（供 app_manager 无状态化读路径）
+    async fn get_deployment_status(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
+        let _ = app_id;
+        Err(ContainerRuntimeError::ConfigurationError(
+            "get_deployment_status not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// 列出当前 runtime 托管的所有 UserApp Deployment（供对账接口）
+    async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "list_deployments not supported by this runtime".to_string(),
+        ))
+    }
+}
+
+// ============================================================================
+// 资源数量解析 helper（K8s Quantity 风格字符串 → 字节数/核数）
+// ============================================================================
+
+/// 解析内存数量（"512Mi", "1Gi", "1024" 等）为字节数
+pub fn parse_memory_quantity(quantity: &str) -> Option<u64> {
+    let quantity = quantity.trim();
+    if let Some(num_str) = quantity.strip_suffix("Ki") {
+        num_str.parse::<f64>().ok().map(|n| (n * 1024.0) as u64)
+    } else if let Some(num_str) = quantity.strip_suffix("Mi") {
+        num_str
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1024.0 * 1024.0) as u64)
+    } else if let Some(num_str) = quantity.strip_suffix("Gi") {
+        num_str
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1024.0 * 1024.0 * 1024.0) as u64)
+    } else if let Some(num_str) = quantity.strip_suffix("Ti") {
+        num_str
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1024.0 * 1024.0 * 1024.0 * 1024.0) as u64)
+    } else if let Some(num_str) = quantity.strip_suffix('K') {
+        num_str.parse::<f64>().ok().map(|n| (n * 1000.0) as u64)
+    } else if let Some(num_str) = quantity.strip_suffix('M') {
+        num_str
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1000.0 * 1000.0) as u64)
+    } else if let Some(num_str) = quantity.strip_suffix('G') {
+        num_str
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1000.0 * 1000.0 * 1000.0) as u64)
+    } else {
+        quantity.parse::<u64>().ok()
+    }
+}
+
+/// 解析 CPU 数量（"1", "500m", "0.5"）为核数
+pub fn parse_cpu_quantity(quantity: &str) -> Option<f64> {
+    let quantity = quantity.trim();
+    if let Some(milli) = quantity.strip_suffix('m') {
+        milli.parse::<f64>().ok().map(|n| n / 1000.0)
+    } else {
+        quantity.parse::<f64>().ok()
+    }
+}
+
+impl AppResourceRequirements {
+    /// 转换为 ServiceResourceLimits（f64 bytes/cores，Docker 模式用）
+    pub fn to_service_resource_limits(&self) -> ServiceResourceLimits {
+        ServiceResourceLimits {
+            memory_limit: self
+                .memory
+                .as_deref()
+                .and_then(parse_memory_quantity)
+                .map(|b| b as f64),
+            cpu_limit: self.cpu.as_deref().and_then(parse_cpu_quantity),
+            swap_limit: None,
+            storage_size: self.storage.clone(),
+        }
+    }
 }

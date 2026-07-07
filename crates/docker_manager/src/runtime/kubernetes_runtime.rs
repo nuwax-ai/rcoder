@@ -10,7 +10,7 @@ use chrono::Utc;
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
     ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, RemovedContainerInfo, RuntimeContainerInfo,
+    ContainerRuntimeStatus, DeploymentStatus, RemovedContainerInfo, RuntimeContainerInfo,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
@@ -255,7 +255,9 @@ impl KubernetesRuntime {
         // 兜底：使用硬编码默认值（不应该到达这里，因为 multi_image_config 总是有默认值）
         warn!("[K8S] No image config found, using hardcoded fallback");
         match service_type {
-            ServiceType::WebAgentRunner => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
+            // UserApp 实际走 create_deployment（image_override），不走 create_container/select_image
+            // 此处兜底与 WebAgentRunner 共用，仅为 match 穷尽
+            ServiceType::WebAgentRunner | ServiceType::UserApp => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
             ServiceType::ComputerAgentRunner => {
                 "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest".to_string()
             }
@@ -354,6 +356,9 @@ impl ContainerRuntime for KubernetesRuntime {
             tenant_id,
             space_id,
             storage_size,
+            // UserApp 专用字段（image_override/...）由 create_deployment 处理，
+            // agent 的 create_container 路径忽略
+            ..
         } = params;
 
         // 确定容器标识符：pod_id > user_id > project_id（与 Docker 模式一致）
@@ -466,7 +471,9 @@ impl ContainerRuntime for KubernetesRuntime {
                         ServiceType::WebAgentRunner => {
                             Some(vec!["/app/bin/agent_runner".to_string()])
                         }
-                        ServiceType::ComputerAgentRunner => None,
+                        // ComputerAgentRunner / UserApp 用镜像自带 ENTRYPOINT/CMD
+                        // （UserApp 实际走 create_deployment，不经此路径）
+                        ServiceType::ComputerAgentRunner | ServiceType::UserApp => None,
                     },
                     env: {
                         let mut env_vars = vec![
@@ -1142,5 +1149,70 @@ impl ContainerRuntime for KubernetesRuntime {
             ContainerRuntimeError::ConnectionError(format!("K8s health check failed: {}", e))
         })?;
         Ok(())
+    }
+
+    // ===== Deployment 生命周期（UserApp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====
+    async fn create_deployment(
+        &self,
+        params: ContainerCreateParams,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        // app_id 占据 project_id 字段位
+        let app_id = params.project_id.clone().ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError(
+                "create_deployment requires project_id (app_id)".to_string(),
+            )
+        })?;
+        let gateway_name = std::env::var("RCODER_K8S_GATEWAY_NAME").ok();
+        let gateway_namespace = std::env::var("RCODER_K8S_GATEWAY_NAMESPACE").ok();
+        self.create_app_resources(
+            &app_id,
+            &params,
+            gateway_name.as_deref(),
+            gateway_namespace.as_deref(),
+        )
+        .await?;
+        Ok(ContainerBasicInfo {
+            container_id: self.app_deployment_name(&app_id),
+            container_name: self.app_deployment_name(&app_id),
+            container_ip: String::new(),
+            internal_port: 0,
+            external_port: 0,
+            project_id: app_id.clone(),
+            status: "Starting".to_string(),
+            created_at: Utc::now(),
+            service_url: format!(
+                "http://{}.{}.svc.{}",
+                self.app_service_name(&app_id),
+                self.namespace,
+                self.config.cluster_domain
+            ),
+        })
+    }
+
+    async fn scale_deployment(
+        &self,
+        app_id: &str,
+        replicas: i32,
+    ) -> ContainerRuntimeResult<()> {
+        self.scale_app(app_id, replicas).await
+    }
+
+    async fn restart_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        self.restart_app(app_id).await
+    }
+
+    async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        self.delete_app_resources(app_id).await
+    }
+
+    async fn get_deployment_status(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
+        self.get_app_status(app_id).await
+    }
+
+    async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
+        self.list_app_status().await
     }
 }

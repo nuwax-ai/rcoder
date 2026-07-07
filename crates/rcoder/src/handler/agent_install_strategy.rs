@@ -162,6 +162,8 @@ pub fn create_strategy(service_type: &ServiceType) -> Option<Box<dyn AgentInstal
     match service_type {
         ServiceType::ComputerAgentRunner => Some(Box::new(ComputerAgentRunnerStrategy)),
         ServiceType::WebAgentRunner => Some(Box::new(RcoderStrategy)),
+        // UserApp 不是 agent，无 agent install strategy（由 app_manager 独立托管）
+        ServiceType::UserApp => None,
     }
 }
 

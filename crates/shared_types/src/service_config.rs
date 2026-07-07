@@ -356,6 +356,8 @@ impl ServiceImageConfig {
             .unwrap_or_else(|| match self.service_type {
                 ServiceType::WebAgentRunner => "/app/project_workspace".to_string(),
                 ServiceType::ComputerAgentRunner => "/app/computer-project-workspace".to_string(),
+                // UserApp 复用 rcoder-workspace PVC 的 apps subPath（部署侧挂到 /app/app-workspace）
+                ServiceType::UserApp => "/app/app-workspace".to_string(),
             })
     }
 

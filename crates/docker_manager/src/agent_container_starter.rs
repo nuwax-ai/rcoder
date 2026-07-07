@@ -43,6 +43,9 @@ impl<'a> AgentContainerStarter<'a> {
             tenant_id,
             space_id,
             storage_size: _, // Docker 模式忽略 storage_size，仅 K8s 模式使用
+            // UserApp 专用字段（image_override/command/env/ports/...）由
+            // DockerRuntime::create_deployment 处理，agent 路径忽略
+            ..
         } = params;
 
         let start_phase = Instant::now();
@@ -92,11 +95,12 @@ impl<'a> AgentContainerStarter<'a> {
                         )
                     })?
                 }
-                ServiceType::WebAgentRunner => {
+                // UserApp 的 container_id = app_id（由 app_manager 放入 project_id 字段位）
+                ServiceType::WebAgentRunner | ServiceType::UserApp => {
                     // WebAgentRunner 使用 project_id
                     project_id.clone().ok_or_else(|| {
                         DockerError::ConfigurationError(
-                            "project_id is required for WebAgentRunner".to_string(),
+                            "project_id is required for WebAgentRunner/UserApp".to_string(),
                         )
                     })?
                 }
@@ -330,9 +334,9 @@ impl<'a> AgentContainerStarter<'a> {
                                 std::path::PathBuf::from(&workspace_container),
                             )
                         }
-                        // RCoder: 一个 project_id 对应一个容器
+                        // RCoder/UserApp: 一个 project_id/app_id 对应一个容器
                         // 挂载: 宿主机 /project_workspace/{project_id} → 容器 /project_workspace/{project_id}
-                        ServiceType::WebAgentRunner => {
+                        ServiceType::WebAgentRunner | ServiceType::UserApp => {
                             let pid = project_id.as_deref().unwrap_or("default");
                             (
                                 pid.to_string(),

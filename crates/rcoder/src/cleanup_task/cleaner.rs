@@ -202,6 +202,8 @@ impl AgentCleaner {
         let strategy: &dyn super::strategies::CleanupStrategy = match service_type {
             ServiceType::WebAgentRunner => &self.rcoder_strategy,
             ServiceType::ComputerAgentRunner => &self.computer_runner_strategy,
+            // UserApp 不注册到 projects 表，cleanup_task 不会处理；兜底用 rcoder 策略
+            ServiceType::UserApp => &self.rcoder_strategy,
         };
 
         // 3. 检查是否需要销毁容器，并获取销毁原因

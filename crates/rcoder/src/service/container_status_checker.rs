@@ -369,6 +369,8 @@ impl ContainerStatusChecker {
                     }
                 }
             }
+            // UserApp 不参与 agent 健康检查（由 app_manager 独立管理），视为不存在
+            shared_types::ServiceType::UserApp => false,
         };
 
         if exists {

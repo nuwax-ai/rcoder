@@ -200,7 +200,7 @@ fn container_identifier_for_service(
         return pid.to_string();
     }
     match service_type {
-        ServiceType::WebAgentRunner => project_id.to_string(),
+        ServiceType::WebAgentRunner | ServiceType::UserApp => project_id.to_string(),
         ServiceType::ComputerAgentRunner => user_id.to_string(),
     }
 }
@@ -778,6 +778,8 @@ pub async fn pod_count(
         {
             Some(ServiceType::WebAgentRunner) => rcoder_count += 1,
             Some(ServiceType::ComputerAgentRunner) => computer_count += 1,
+            // UserApp 容器不计入 agent 统计
+            Some(ServiceType::UserApp) => {}
             None => {}
         }
     }

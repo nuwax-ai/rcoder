@@ -57,6 +57,10 @@ impl ImageSelector {
                 // ComputerAgentRunner 没有老名称
                 None
             }
+            ServiceType::UserApp => {
+                // UserApp 镜像由调用方提供，不走镜像选择
+                None
+            }
         }
     }
 

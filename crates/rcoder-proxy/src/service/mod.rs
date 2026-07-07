@@ -877,6 +877,8 @@ impl PingoraProxyService {
                     None
                 }
             }
+            // UserApp 不走 VNC/project backend 查找，它经 /proxy/{port} 的 backends map 路由
+            shared_types::ServiceType::UserApp => None,
         }
     }
 

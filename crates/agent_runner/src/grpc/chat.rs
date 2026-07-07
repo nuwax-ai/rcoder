@@ -89,7 +89,8 @@ pub async fn chat(
         shared_types::ServiceType::ComputerAgentRunner => {
             std::path::PathBuf::from("/home/user").join(&work_dir_id)
         }
-        shared_types::ServiceType::WebAgentRunner => {
+        // UserApp 不由 agent_runner 托管；兜底走 WebAgentRunner 路径（运行时不应进入）
+        shared_types::ServiceType::WebAgentRunner | shared_types::ServiceType::UserApp => {
             let tenant_id = std::env::var("TENANT_ID").ok();
             let space_id = std::env::var("SPACE_ID").ok();
             match (tenant_id, space_id) {

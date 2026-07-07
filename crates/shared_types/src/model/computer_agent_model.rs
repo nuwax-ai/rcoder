@@ -412,6 +412,10 @@ impl UnifiedContainerInfo {
             idle_duration > ChronoDuration::from_std(idle_timeout).unwrap_or(ChronoDuration::MAX);
 
         match self.service_type {
+            ServiceType::UserApp => {
+                // UserApp 由 app_manager/Java 管理生命周期，不参与 agent 闲置清理
+                false
+            }
             ServiceType::WebAgentRunner => {
                 // RCoder 模式：检查自身状态
                 let is_idle_status = matches!(self.status, Some(AgentStatus::Idle) | None);

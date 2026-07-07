@@ -64,8 +64,9 @@ pub fn resolve_project_cwd(
             // per-user 容器：项目目录恒为单级 /home/user/{project_id}
             resolve_in_candidates(project_id, &[HOME_PREFIX])
         }
-        Some(ServiceType::WebAgentRunner) => {
+        Some(ServiceType::WebAgentRunner) | Some(ServiceType::UserApp) => {
             // 共享容器三级优先，单项目隔离单级兜底
+            // UserApp 不由 agent_runner 托管，此处仅兜底（运行时不应进入）
             let prefixes = build_web_prefixes(tenant, space);
             let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
             resolve_in_candidates(project_id, &refs)

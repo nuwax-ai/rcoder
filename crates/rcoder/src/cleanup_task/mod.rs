@@ -116,7 +116,9 @@ pub async fn start_cleanup_task(
                             .user_id()
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| project_id.clone()),
-                        shared_types::ServiceType::WebAgentRunner => project_id.clone(),
+                        // UserApp identifier=app_id（占 project_id 位）
+                        shared_types::ServiceType::WebAgentRunner
+                        | shared_types::ServiceType::UserApp => project_id.clone(),
                     };
 
                     if let Err(e) = runtime_for_k8s
