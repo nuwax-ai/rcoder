@@ -540,6 +540,15 @@ pub trait ContainerRuntime: Send + Sync {
             "list_deployments not supported by this runtime".to_string(),
         ))
     }
+
+    /// 校验 app 管理前置条件（启动时 Fail Fast，防静默失败）
+    ///
+    /// K8s 模式探测 RBAC（list deployments，403 则明确报错指向 ClusterRole 缺权限）；
+    /// Docker 模式默认 Ok。失败返回错误，调用方（AppService::new）据此 log warn 不阻塞启动
+    /// （避免 API Server 临时不可达导致 rcoder 启动卡死）。
+    async fn validate_app_prerequisites(&self) -> ContainerRuntimeResult<()> {
+        Ok(())
+    }
 }
 
 // ============================================================================

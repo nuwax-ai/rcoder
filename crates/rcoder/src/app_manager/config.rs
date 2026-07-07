@@ -108,12 +108,13 @@ impl AppManagerConfig {
     /// 获取工作空间根目录
     ///
     /// Docker 模式: 使用配置的 workspace_root（宿主机路径）
-    /// K8s 模式: 如果未配置，使用默认的 PVC 挂载点 `/app/app-workspace`
+    /// K8s 模式: 如果未配置，使用默认 `/app/project_workspace/apps`——匹配 rcoder Pod 的
+    /// workspace 挂载点（rcoder-workspace PVC 的 `workspace` subPath → /app/project_workspace），
+    /// 其下 `{app_id}` 子目录与 app Pod（subPath `workspace/apps/{app_id}` → /app）共享同一 PVC 物理路径。
     pub fn get_workspace_root(&self) -> String {
-        self.workspace_root.clone().unwrap_or_else(|| {
-            // K8s 模式下，使用默认的工作空间路径（PVC 挂载点）
-            "/app/app-workspace".to_string()
-        })
+        self.workspace_root
+            .clone()
+            .unwrap_or_else(|| "/app/project_workspace/apps".to_string())
     }
 
     /// 获取节点 IP

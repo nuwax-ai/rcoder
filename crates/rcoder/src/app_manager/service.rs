@@ -67,6 +67,15 @@ impl AppService {
             }
         }
 
+        // K8s 模式：启动校验前置条件（RBAC 等）。失败 log warn 不阻塞（Fail Fast 暴露部署侧
+        // RBAC 缺失，而非运行时创建 app 才 403）。Docker 模式 trait 默认 Ok，跳过。
+        if config.access_mode == AppAccessMode::Kubernetes {
+            match runtime.validate_app_prerequisites().await {
+                Ok(_) => info!("[APP] K8s 前置校验通过（RBAC/apps/deployments 可访问）"),
+                Err(e) => warn!("[APP] K8s 启动前置校验失败，app 管理可能无法工作: {}", e),
+            }
+        }
+
         Ok(Self {
             config,
             runtime,
@@ -578,20 +587,11 @@ impl AppService {
     /// 构建访问信息（按 access_mode 分支）
     fn build_access_info(&self, app_id: &str, ports: &[AppPortStatus]) -> AccessInfo {
         let http_port = ports.iter().find(|p| p.expose_type == RtExposeType::Http);
-        let tcp_ports: Vec<TcpPortMapping> = ports
-            .iter()
-            .filter(|p| p.expose_type == RtExposeType::Tcp)
-            .map(|p| {
-                let ext = p.external_port.unwrap_or(0);
-                TcpPortMapping {
-                    name: p.name.clone(),
-                    node_port: ext,
-                    access_url: format!("tcp://{}:{}", self.config.get_external_host(), ext),
-                }
-            })
-            .collect();
 
-        let (http_url, domain, short_domain) = match self.config.access_mode {
+        // K8s 模式：rcoder 在 Pod 内不知 Gateway 的外部入口（LB/NodePort），故只返回
+        // HTTPRoute path（/apps/{app_id}）+ TCP 的 NodePort 数字，外部完整 URL 由调用方
+        // （Java）用自己知道的入口拼。Docker 模式：Pingora /proxy + external_host（开发环境）。
+        let (http_url, tcp_ports, domain, short_domain) = match self.config.access_mode {
             AppAccessMode::Docker => {
                 let http = http_port.map(|p| {
                     format!(
@@ -601,22 +601,49 @@ impl AppService {
                         p.port
                     )
                 });
+                let tcp_ports: Vec<TcpPortMapping> = ports
+                    .iter()
+                    .filter(|p| p.expose_type == RtExposeType::Tcp)
+                    .map(|p| {
+                        let ext = p.external_port.unwrap_or(0);
+                        TcpPortMapping {
+                            name: p.name.clone(),
+                            node_port: ext,
+                            access_url: format!(
+                                "tcp://{}:{}",
+                                self.config.get_external_host(),
+                                ext
+                            ),
+                        }
+                    })
+                    .collect();
                 let name = format!("{}-{}", ServiceType::UserApp.container_prefix(), app_id);
-                (http, name.clone(), name)
+                (http, tcp_ports, name.clone(), name)
             }
             AppAccessMode::Kubernetes => {
-                let http = http_port.map(|_| {
-                    format!(
-                        "http://{}:{}/apps/{}",
-                        self.config.get_node_ip(),
-                        self.config.get_gateway_node_port(),
-                        app_id
-                    )
-                });
+                let http = http_port.map(|_| format!("/apps/{}", app_id));
+                let tcp_ports: Vec<TcpPortMapping> = ports
+                    .iter()
+                    .filter(|p| p.expose_type == RtExposeType::Tcp)
+                    .map(|p| {
+                        let ext = p.external_port.unwrap_or(0);
+                        TcpPortMapping {
+                            name: p.name.clone(),
+                            node_port: ext,
+                            // host 由调用方拼（rcoder 不知外部入口）；node_port 为真实 NodePort
+                            access_url: format!("tcp://<gateway>:{ext}"),
+                        }
+                    })
+                    .collect();
                 let cluster_domain = shared_types::get_k8s_cluster_domain();
                 let svc = format!("{}-{}-svc", ServiceType::UserApp.container_prefix(), app_id);
                 let fqdn = format!("{}.{}.svc.{}", svc, self.config.namespace, cluster_domain);
-                (http, fqdn, format!("{}.{}", svc, self.config.namespace))
+                (
+                    http,
+                    tcp_ports,
+                    fqdn,
+                    format!("{}.{}", svc, self.config.namespace),
+                )
             }
         };
 

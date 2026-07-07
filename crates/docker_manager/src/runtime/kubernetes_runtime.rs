@@ -1215,8 +1215,14 @@ impl ContainerRuntime for KubernetesRuntime {
                 "create_deployment requires project_id (app_id)".to_string(),
             )
         })?;
-        let gateway_name = std::env::var("RCODER_K8S_GATEWAY_NAME").ok();
-        let gateway_namespace = std::env::var("RCODER_K8S_GATEWAY_NAMESPACE").ok();
+        // Gateway 配置：env 注入优先，未注入则用默认（nuwax-gateway / default，匹配部署现状），
+        // 避免部署侧未配 env 时静默跳过 HTTPRoute 创建。
+        let gateway_name = std::env::var("RCODER_K8S_GATEWAY_NAME")
+            .ok()
+            .or_else(|| Some("nuwax-gateway".to_string()));
+        let gateway_namespace = std::env::var("RCODER_K8S_GATEWAY_NAMESPACE")
+            .ok()
+            .or_else(|| Some("default".to_string()));
         self.create_app_resources(
             &app_id,
             &params,
@@ -1263,5 +1269,28 @@ impl ContainerRuntime for KubernetesRuntime {
 
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
         self.list_app_status().await
+    }
+
+    async fn validate_app_prerequisites(&self) -> ContainerRuntimeResult<()> {
+        // RBAC 探测：list deployments（limit 1）。403 = ClusterRole 缺 apps/deployments 权限。
+        // 明确报错指向部署侧 RBAC，避免创建 app 时静默 403。
+        use k8s_openapi::api::apps::v1::Deployment;
+        use kube::api::{Api, ListParams};
+        let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), &self.namespace);
+        match deploy_api.list(&ListParams::default().limit(1)).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 403 => Err(ContainerRuntimeError::ConfigurationError(
+                "RBAC 403：rcoder ServiceAccount 缺 apps/deployments 权限，app 管理将无法创建 Deployment。\
+                 请在 ClusterRole 补 deployments/httproutes/configmaps/secrets 权限"
+                    .to_string(),
+            )),
+            Err(e) => {
+                tracing::warn!(
+                    "[K8S-APP] 前置校验 list deployments 失败（非 403，可能 API Server 暂时不可达，跳过）: {}",
+                    e
+                );
+                Ok(())
+            }
+        }
     }
 }

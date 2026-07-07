@@ -7,7 +7,7 @@
 //! `rcoder-runtime` 物理隔离——cleanup_task 基于 `projects` 内存表扫描，UserApp
 //! 不进该表；label 差异作为第二道防线（供对账接口 list，及防御未来按 label 的扫描）。
 //!
-//! 存储复用 rcoder-workspace RWX PVC + subPath `apps/{app_id}`（rcoder Pod 与 app
+//! 存储复用 rcoder-workspace RWX PVC + subPath `workspace/apps/{app_id}`（rcoder Pod 与 app
 //! Pod 共享，app_manager 文件管理直接读写）。
 
 #[cfg(feature = "kubernetes")]
@@ -272,7 +272,10 @@ impl KubernetesRuntime {
             ..Default::default()
         }]);
 
-        // workspace PVC 挂载（复用 rcoder-workspace RWX，subPath apps/{app_id} → /app）
+        // workspace PVC 挂载（复用 rcoder-workspace RWX，subPath workspace/apps/{app_id} → /app）
+        // subPath 带 workspace 前缀以复用 rcoder Pod 已挂的 `workspace` subPath：
+        // rcoder /app/project_workspace = PVC `/workspace`，故 rcoder /app/project_workspace/apps/{app_id}
+        // = PVC `/workspace/apps/{app_id}` = app Pod /app，共享读写。
         let volumes = Some(vec![Volume {
             name: "app-workspace".to_string(),
             persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
@@ -284,7 +287,7 @@ impl KubernetesRuntime {
         let volume_mounts = Some(vec![VolumeMount {
             name: "app-workspace".to_string(),
             mount_path: "/app".to_string(),
-            sub_path: Some(format!("apps/{app_id}")),
+            sub_path: Some(format!("workspace/apps/{app_id}")),
             read_only: Some(false),
             ..Default::default()
         }]);
