@@ -7,9 +7,9 @@ use matchit::Params;
 use pingora_core::Result as PingoraResult;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::RequestHeader;
+use shared_types::NOVNC_PORT;
 use std::sync::Arc;
 use std::time::Duration;
-use shared_types::NOVNC_PORT;
 use tracing::{debug, error, info};
 
 use crate::service::types::{ProxyMetrics, TrackingCtx};

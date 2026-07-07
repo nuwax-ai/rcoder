@@ -306,8 +306,14 @@ mod tests {
         );
 
         // UserApp 多格式
-        assert_eq!("user-app".parse::<ServiceType>().unwrap(), ServiceType::UserApp);
-        assert_eq!("UserApp".parse::<ServiceType>().unwrap(), ServiceType::UserApp);
+        assert_eq!(
+            "user-app".parse::<ServiceType>().unwrap(),
+            ServiceType::UserApp
+        );
+        assert_eq!(
+            "UserApp".parse::<ServiceType>().unwrap(),
+            ServiceType::UserApp
+        );
         assert_eq!(
             "application".parse::<ServiceType>().unwrap(),
             ServiceType::UserApp

@@ -136,7 +136,10 @@ mod tests {
     #[test]
     fn rejects_invalid_chars() {
         // WebAgentRunner 需要 project_id，无效字符应返回 None
-        assert_eq!(resolve_project_cwd("web-agent-runner", "../etc", "", ""), None);
+        assert_eq!(
+            resolve_project_cwd("web-agent-runner", "../etc", "", ""),
+            None
+        );
         assert_eq!(resolve_project_cwd("web-agent-runner", "a/b", "", ""), None);
         assert_eq!(resolve_project_cwd("web-agent-runner", "a;b", "", ""), None);
         assert_eq!(resolve_project_cwd("web-agent-runner", "a b", "", ""), None);

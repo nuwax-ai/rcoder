@@ -723,7 +723,12 @@ mod tests {
         sd.push_message(make_msg("b")); // seq 2
         sd.push_message(make_msg("c")); // seq 3
 
-        let got: Vec<u64> = sd.replay_since(1).await.into_iter().map(|(s, _)| s).collect();
+        let got: Vec<u64> = sd
+            .replay_since(1)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
         assert_eq!(got, vec![2, 3], "replay_since(1) must return only seq>1");
     }
 
@@ -736,7 +741,12 @@ mod tests {
         assert_eq!(cleared, 2);
         sd.push_message(make_msg("c")); // seq 必须为 3（不随 clear 重置）
 
-        let got: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
+        let got: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
         assert_eq!(got, vec![3], "seq must remain monotonic after clear");
     }
 
@@ -746,8 +756,18 @@ mod tests {
         sd.push_message(make_msg("a"));
         sd.push_message(make_msg("b"));
 
-        let first: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
-        let second: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
+        let first: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        let second: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
         assert_eq!(first, second);
         assert_eq!(first, vec![1, 2], "replay must not drain the buffer");
     }
@@ -770,8 +790,17 @@ mod tests {
         sd.push_message(make_heartbeat());
         sd.push_message(make_msg("b")); // seq 2（Heartbeat 不占 seq 号）
 
-        let got: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
-        assert_eq!(got, vec![1, 2], "Heartbeat must not be buffered; seq must skip it");
+        let got: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(
+            got,
+            vec![1, 2],
+            "Heartbeat must not be buffered; seq must skip it"
+        );
     }
 
     #[tokio::test]
@@ -783,7 +812,16 @@ mod tests {
         sd.push_message(make_msg("d")); // seq 4，挤掉 seq1
         sd.push_message(make_msg("e")); // seq 5，挤掉 seq2
 
-        let got: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
-        assert_eq!(got, vec![3, 4, 5], "ring overflow drops oldest, seq stays contiguous");
+        let got: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(
+            got,
+            vec![3, 4, 5],
+            "ring overflow drops oldest, seq stays contiguous"
+        );
     }
 }

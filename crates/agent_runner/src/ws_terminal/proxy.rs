@@ -74,7 +74,11 @@ pub async fn handle_terminal(
     match &cwd {
         Some(p) => info!(
             "[WS_TERMINAL] connecting ttyd: service_type={}, project_id={}, tenant_id={}, space_id={}, cwd={}",
-            service_type, project_id, tenant_id, space_id, p.display()
+            service_type,
+            project_id,
+            tenant_id,
+            space_id,
+            p.display()
         ),
         None => {
             let is_web = matches!(
@@ -384,8 +388,9 @@ mod tests {
                 let (s, _) = listener.accept().await.unwrap();
                 tokio_tungstenite::accept_async(s).await.unwrap()
             });
-            let (client, _) =
-                tokio_tungstenite::connect_async(format!("ws://{addr}")).await.unwrap();
+            let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+                .await
+                .unwrap();
             (client, server.await.unwrap())
         }
 

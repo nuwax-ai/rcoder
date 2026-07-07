@@ -274,21 +274,22 @@ pub async fn handle_rcoder_progress(
     // 3. 创建消息流和心跳流
 
     // 📼 回放 ring buffer 中的历史消息
-    let replay_stream = futures_util::stream::iter(replay_messages.into_iter().map(|(seq, msg)| {
-        let _ = seq; // HTTP server 直接序列化 UnifiedSessionMessage（无 seq 字段），与 gRPC ProgressEvent 不同
-        let is_terminal = matches!(msg.message_type, SessionMessageType::SessionPromptEnd);
-        let json_str = match serde_json::to_string(&msg) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("[RCoder] Failed to serialize replay message: {}", e);
-                return (Ok(Event::default().data("{}")), false);
-            }
-        };
-        (
-            Ok(Event::default().event(msg.sub_type).data(json_str)),
-            is_terminal,
-        )
-    }));
+    let replay_stream =
+        futures_util::stream::iter(replay_messages.into_iter().map(|(seq, msg)| {
+            let _ = seq; // HTTP server 直接序列化 UnifiedSessionMessage（无 seq 字段），与 gRPC ProgressEvent 不同
+            let is_terminal = matches!(msg.message_type, SessionMessageType::SessionPromptEnd);
+            let json_str = match serde_json::to_string(&msg) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("[RCoder] Failed to serialize replay message: {}", e);
+                    return (Ok(Event::default().data("{}")), false);
+                }
+            };
+            (
+                Ok(Event::default().event(msg.sub_type).data(json_str)),
+                is_terminal,
+            )
+        }));
 
     let real_time_stream = ReceiverStream::new(message_rx).map(|(seq, msg)| {
         let _ = seq;

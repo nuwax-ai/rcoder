@@ -79,10 +79,7 @@ impl PingoraServerManager {
     /// # 参数
     ///
     /// * `lookup` - 共享的 `Arc<dyn ContainerLookup>`
-    pub fn with_container_lookup(
-        mut self,
-        lookup: Arc<dyn shared_types::ContainerLookup>,
-    ) -> Self {
+    pub fn with_container_lookup(mut self, lookup: Arc<dyn shared_types::ContainerLookup>) -> Self {
         let new_service = (*self.service).clone().with_container_lookup(lookup);
         self.service = Arc::new(new_service);
         self

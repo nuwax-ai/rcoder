@@ -158,10 +158,7 @@ impl ProxyHttp for PortProxy {
                     );
                 }
                 Err(shared_types::ApiKeyAuthError::Missing) => {
-                    warn!(
-                        "[PINGORA_AUTH] Missing x-api-key header for path: {}",
-                        path
-                    );
+                    warn!("[PINGORA_AUTH] Missing x-api-key header for path: {}", path);
                     return Err(
                         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(401))
                             .more_context("Missing x-api-key header".to_string()),

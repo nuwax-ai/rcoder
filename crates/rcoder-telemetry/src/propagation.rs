@@ -2,8 +2,8 @@
 //!
 //! 提供跨服务的 trace context 传播功能，支持 gRPC 和 HTTP。
 
-use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use opentelemetry::Context;
+use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing::debug;

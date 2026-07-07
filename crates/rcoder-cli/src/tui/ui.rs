@@ -56,10 +56,7 @@ pub struct DrawParams<'a> {
 /// 渲染整个 TUI 界面
 ///
 /// 接收 App 的各个独立字段，避免 `self.terminal` 与 `self` 的借用冲突。
-pub fn draw(
-    frame: &mut Frame,
-    params: DrawParams<'_>,
-) {
+pub fn draw(frame: &mut Frame, params: DrawParams<'_>) {
     let area = frame.area();
     let composer_height = params.composer.display_height();
 
@@ -70,9 +67,21 @@ pub fn draw(
     ])
     .split(area);
 
-    draw_status_bar(frame, params.chat, params.project_id, params.session_id, chunks[0]);
+    draw_status_bar(
+        frame,
+        params.chat,
+        params.project_id,
+        params.session_id,
+        chunks[0],
+    );
     draw_chat_area(frame, params.chat, params.use_markdown, chunks[1]);
-    draw_composer(frame, params.chat, params.composer, params.pending_prompt, chunks[2]);
+    draw_composer(
+        frame,
+        params.chat,
+        params.composer,
+        params.pending_prompt,
+        chunks[2],
+    );
 
     // 权限弹窗覆盖层
     if let Some(overlay) = params.permission_overlay {

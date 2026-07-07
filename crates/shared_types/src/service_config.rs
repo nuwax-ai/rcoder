@@ -513,8 +513,8 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
         Some(2_000_000_000.0), // 2GB
         Some(2.0),             // 2 核
         Some(4_000_000_000.0), // 4GB
-        None,                  // storage_size: 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
-        None,                  // ephemeral_storage_limit: 回退到 storage_size
+        None, // storage_size: 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
+        None, // ephemeral_storage_limit: 回退到 storage_size
     );
 
     ServiceImageConfig {
@@ -569,8 +569,8 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
         Some(4_000_000_000.0), // 4GB
         Some(3.0),             // 3 核
         Some(8_000_000_000.0), // 8GB
-        None,                  // storage_size: 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
-        None,                  // ephemeral_storage_limit: 回退到 storage_size
+        None, // storage_size: 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
+        None, // ephemeral_storage_limit: 回退到 storage_size
     );
 
     ServiceImageConfig {

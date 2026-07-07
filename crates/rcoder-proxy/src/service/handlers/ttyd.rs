@@ -12,9 +12,9 @@ use matchit::Params;
 use pingora_core::Result as PingoraResult;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::RequestHeader;
+use shared_types::WS_TERMINAL_PORT;
 use std::sync::Arc;
 use std::time::Duration;
-use shared_types::WS_TERMINAL_PORT;
 use tracing::{debug, error, info, warn};
 
 use crate::service::types::{ProxyMetrics, TrackingCtx};
@@ -49,11 +49,15 @@ pub async fn handle_ttyd_request(
     // 校验标识符合法性（防 header 注入：仅允许字母数字 _ -，非空且 <=64 字符）
     if let Err(e) = shared_types::validate_identifier(user_id, "user_id") {
         warn!("[TTYD] invalid user_id: {}", e);
-        return Err(pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400)));
+        return Err(pingora_core::Error::new(
+            pingora_core::ErrorType::HTTPStatus(400),
+        ));
     }
     if let Err(e) = shared_types::validate_identifier(project_id, "project_id") {
         warn!("[TTYD] invalid project_id: {}", e);
-        return Err(pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400)));
+        return Err(pingora_core::Error::new(
+            pingora_core::ErrorType::HTTPStatus(400),
+        ));
     }
 
     // 提取剩余路径（通配符部分）
@@ -125,11 +129,15 @@ pub async fn handle_web_ttyd_request(
     // 校验标识符合法性（防 header 注入：仅允许字母数字 _ -，非空且 <=64 字符）
     if let Err(e) = shared_types::validate_identifier(user_id, "user_id") {
         warn!("[WEB TTYD] invalid user_id: {}", e);
-        return Err(pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400)));
+        return Err(pingora_core::Error::new(
+            pingora_core::ErrorType::HTTPStatus(400),
+        ));
     }
     if let Err(e) = shared_types::validate_identifier(project_id, "project_id") {
         warn!("[WEB TTYD] invalid project_id: {}", e);
-        return Err(pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400)));
+        return Err(pingora_core::Error::new(
+            pingora_core::ErrorType::HTTPStatus(400),
+        ));
     }
 
     // 提取剩余路径（通配符部分）

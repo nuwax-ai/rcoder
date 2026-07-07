@@ -132,7 +132,10 @@ pub async fn load_sacp_agent_config_with_resolver(
             context_servers: config.context_servers.clone(),
         })
     } else {
-        warn!("[SACP] config not found for {}, using default config", shared_types::DEFAULT_AGENT_ID);
+        warn!(
+            "[SACP] config not found for {}, using default config",
+            shared_types::DEFAULT_AGENT_ID
+        );
         get_default_sacp_agent_config_with_resolver(
             model_provider,
             service_type,
