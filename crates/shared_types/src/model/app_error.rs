@@ -131,7 +131,8 @@ fn status_from_code(code: &str) -> axum::http::StatusCode {
         ec::ERR_VALIDATION | ec::ERR_INVALID_PARAMS => axum::http::StatusCode::BAD_REQUEST,
         ec::ERR_API_KEY_AUTH_FAILED => axum::http::StatusCode::UNAUTHORIZED,
         ec::ERR_TOO_MANY_REQUESTS => axum::http::StatusCode::TOO_MANY_REQUESTS,
-        ec::ERR_SESSION_NOT_FOUND
+        ec::ERR_NOT_FOUND
+        | ec::ERR_SESSION_NOT_FOUND
         | ec::ERR_CONTAINER_NOT_FOUND
         | ec::ERR_PROJECT_NOT_FOUND
         | ec::ERR_AGENT_MGMT_NOT_FOUND

@@ -523,6 +523,14 @@ pub async fn delete_file(
         .app_service
         .delete_file(&app_id, &request.path)
         .await
-        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+        .map_err(|e| {
+            let msg = e.to_string();
+            // "不存在"（文件 / code 目录）→ 404（配合 not_found 语义）；其它（权限/IO）→ 500
+            if msg.contains("不存在") {
+                AppError::not_found(&msg)
+            } else {
+                AppError::internal_server_error(&msg)
+            }
+        })?;
     Ok(Json(HttpResult::success("文件删除成功".to_string())))
 }

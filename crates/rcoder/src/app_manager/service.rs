@@ -455,17 +455,23 @@ impl AppService {
     pub async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
         validate_app_id(app_id)?;
         let app_dir = self.get_container_app_dir(app_id);
-        let full_path = app_dir.join("code").join(file_path);
-
-        // 安全检查：确保路径在应用 code 目录内
-        let canonical_path = full_path.canonicalize()?;
-        let code_dir = app_dir.join("code").canonicalize()?;
-        if !canonical_path.starts_with(&code_dir) {
-            return Err(anyhow::anyhow!("路径不在应用目录内"));
+        let code_dir = app_dir.join("code");
+        if !code_dir.exists() {
+            return Err(anyhow::anyhow!("应用 code 目录不存在"));
         }
-        if !canonical_path.exists() {
+        let full_path = code_dir.join(file_path);
+        // 先 exists 守卫，避免 canonicalize 对不存在路径抛 OS 错误（导致 500 而非 404）
+        if !full_path.exists() {
             return Err(anyhow::anyhow!("文件不存在: {}", file_path));
         }
+
+        // 安全检查：canonicalize 后确保路径仍在 code 目录内（防 ../ 穿越到外部）
+        let canonical_path = full_path.canonicalize()?;
+        let canonical_code_dir = code_dir.canonicalize()?;
+        if !canonical_path.starts_with(&canonical_code_dir) {
+            return Err(anyhow::anyhow!("路径不在应用目录内"));
+        }
+
         if canonical_path.is_dir() {
             fs::remove_dir_all(&canonical_path).await?;
         } else {
