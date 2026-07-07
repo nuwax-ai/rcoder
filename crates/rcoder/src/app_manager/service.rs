@@ -673,6 +673,10 @@ impl AppService {
         request: &CreateAppRequest,
         container_ip: &str,
     ) -> Vec<u16> {
+        // K8s 模式 HTTP 走 Gateway（HTTPRoute），不经 Pingora /proxy——跳过注册
+        if self.config.access_mode != AppAccessMode::Docker {
+            return vec![];
+        }
         let Some(pingora) = &self.pingora else {
             return vec![];
         };
@@ -710,6 +714,10 @@ impl AppService {
 
     /// Docker 模式：清理 app 曾注册的 Pingora backend
     async fn unregister_pingora_backends(&self, app_id: &str) {
+        // K8s 模式未注册过 Pingora backend，跳过
+        if self.config.access_mode != AppAccessMode::Docker {
+            return;
+        }
         let Some(pingora) = &self.pingora else {
             return;
         };
