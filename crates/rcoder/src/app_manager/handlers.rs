@@ -41,6 +41,16 @@ fn health_from_runtime(info: &AppRuntimeInfo) -> HealthInfo {
     }
 }
 
+/// app 操作错误映射：错误信息含"不存在"→ 404（Java 据此触发 create 重建），其它→ 500。
+fn map_app_error(e: anyhow::Error) -> AppError {
+    let msg = e.to_string();
+    if msg.contains("不存在") {
+        AppError::not_found(&msg)
+    } else {
+        AppError::internal_server_error(&msg)
+    }
+}
+
 // ============================================================================
 // 应用生命周期
 // ============================================================================
@@ -232,7 +242,7 @@ pub async fn start_app(
         .app_service
         .start_app(&app_id)
         .await
-        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -259,7 +269,7 @@ pub async fn stop_app(
         .app_service
         .stop_app(&app_id)
         .await
-        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -286,7 +296,7 @@ pub async fn restart_app(
         .app_service
         .restart_app(&app_id)
         .await
-        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -523,14 +533,6 @@ pub async fn delete_file(
         .app_service
         .delete_file(&app_id, &request.path)
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            // "不存在"（文件 / code 目录）→ 404（配合 not_found 语义）；其它（权限/IO）→ 500
-            if msg.contains("不存在") {
-                AppError::not_found(&msg)
-            } else {
-                AppError::internal_server_error(&msg)
-            }
-        })?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success("文件删除成功".to_string())))
 }

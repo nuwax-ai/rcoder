@@ -153,7 +153,9 @@ impl AppService {
                 let Some(ep) = rt_p.external_port else {
                     continue;
                 };
-                if let Some(ap) = ports.iter_mut().find(|p| p.name == rt_p.name) {
+                // 按 port 匹配 external_port（Docker get_deployment_status 的 name 是
+                // tcp-{port}，与请求 name 不一致；port 唯一，K8s/Docker 通用）
+                if let Some(ap) = ports.iter_mut().find(|p| p.port == rt_p.port) {
                     ap.external_port = Some(ep);
                 }
             }
@@ -313,6 +315,8 @@ impl AppService {
     /// 启动应用（scale replicas = 1）
     #[instrument(skip(self))]
     pub async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+        validate_app_id(app_id)?;
+        self.ensure_app_exists(app_id).await?;
         self.runtime
             .scale_deployment(app_id, 1)
             .await
@@ -324,6 +328,8 @@ impl AppService {
     /// 停止应用（scale replicas = 0）
     #[instrument(skip(self))]
     pub async fn stop_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+        validate_app_id(app_id)?;
+        self.ensure_app_exists(app_id).await?;
         self.runtime
             .scale_deployment(app_id, 0)
             .await
@@ -335,6 +341,8 @@ impl AppService {
     /// 重启应用（rollout restart）
     #[instrument(skip(self))]
     pub async fn restart_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+        validate_app_id(app_id)?;
+        self.ensure_app_exists(app_id).await?;
         self.runtime
             .restart_deployment(app_id)
             .await
@@ -570,6 +578,16 @@ impl AppService {
                 None
             }
         }
+    }
+
+    /// 确认 app 存在（集群中有 Deployment/容器），不存在返回"应用不存在"错误。
+    /// 调用方（start/stop/restart）据此返回 404，方便 Java 区分并触发 create 重建，
+    /// 而非收到 generic 500 误以为系统故障。
+    async fn ensure_app_exists(&self, app_id: &str) -> Result<()> {
+        if self.fetch_runtime_status(app_id).await.is_none() {
+            return Err(anyhow::anyhow!("应用不存在: {}", app_id));
+        }
+        Ok(())
     }
 
     /// DeploymentStatus → AppRuntimeInfo（含访问地址构建）

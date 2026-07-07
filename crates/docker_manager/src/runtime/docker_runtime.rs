@@ -5,9 +5,9 @@
 
 use async_trait::async_trait;
 use container_runtime_api::{
-    ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, DeploymentStatus, ExposeType, RemovedContainerInfo,
-    RuntimeContainerInfo,
+    AppPortStatus, ContainerCreateParams, ContainerRuntime, ContainerRuntimeError,
+    ContainerRuntimeResult, ContainerRuntimeStatus, DeploymentStatus, ExposeType,
+    RemovedContainerInfo, RuntimeContainerInfo,
 };
 use moka::future::Cache;
 use shared_types::{ContainerBasicInfo, ServiceType};
@@ -472,6 +472,8 @@ impl ContainerRuntime for DockerRuntime {
             .and_then(|s| s.running)
             .unwrap_or(false);
         let ip = extract_container_ip(&inspect, None);
+        // 提前借用 inspect 提取 ports（避免下方 inspect.state 消费后借用冲突）
+        let ports = extract_container_ports(&inspect);
         Ok(Some(DeploymentStatus {
             app_id: app_id.to_string(),
             replicas: if running { 1 } else { 0 },
@@ -480,8 +482,8 @@ impl ContainerRuntime for DockerRuntime {
             pod_ip: if ip.is_empty() { None } else { Some(ip) },
             node: None,
             restart_count: inspect.restart_count.unwrap_or(0) as u32,
-            started_at: inspect.state.and_then(|s| s.started_at),
-            ports: vec![],
+            started_at: inspect.state.as_ref().and_then(|s| s.started_at.clone()),
+            ports,
         }))
     }
 
@@ -574,4 +576,39 @@ fn extract_container_ip(
         .and_then(|e| e.ip_address.clone())
         .filter(|ip| !ip.is_empty())
         .unwrap_or_default()
+}
+
+/// 从容器 inspect 提取 TCP 端口状态（Docker port_bindings → host_port）。
+///
+/// Docker 仅对 TCP 端口做 port_bindings（create_deployment 时），HTTP 端口走 Pingora
+/// 不做 binding，故此处只还原 TCP；name 用 `tcp-{port}`（Docker 无端口名概念，调用方
+/// 按 port 而非 name 匹配 external_port）。
+fn extract_container_ports(
+    inspect: &bollard::models::ContainerInspectResponse,
+) -> Vec<AppPortStatus> {
+    let Some(ports_map) = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|n| n.ports.as_ref())
+    else {
+        return vec![];
+    };
+    ports_map
+        .iter()
+        .filter_map(|(key, bindings)| {
+            // key 形如 "80/tcp"
+            let port: u16 = key.trim_end_matches("/tcp").parse().ok()?;
+            let host_port = bindings
+                .as_ref()
+                .and_then(|b| b.first())
+                .and_then(|pb| pb.host_port.as_deref())
+                .and_then(|s| s.parse::<u16>().ok())?;
+            Some(AppPortStatus {
+                name: format!("tcp-{port}"),
+                port,
+                expose_type: ExposeType::Tcp,
+                external_port: Some(host_port),
+            })
+        })
+        .collect()
 }

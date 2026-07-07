@@ -644,8 +644,37 @@ impl KubernetesRuntime {
             Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
         self.ignore_404(routes.delete(&self.app_http_route_name(app_id), &dp).await)
             .await?;
+        // 等 app Pod 终止（best-effort，超时不阻塞）——Deployment 已删，Pod 进入 Terminating，
+        // 等其消失后再让上层清理工作空间子目录，避免 Pod 还在写时删目录导致写入失败。
+        self.wait_for_app_pod_gone(app_id, std::time::Duration::from_secs(30))
+            .await;
         info!("[K8S-APP] K8s resources deleted for app: {app_id}");
         Ok(())
+    }
+
+    /// 等 app Pod 全部终止（按 rcoder.io/app-id label 轮询），best-effort：超时或 API 错误
+    /// 不阻塞删除流程（仅 warn），因为 app 复用共享 PVC 子目录，残留 Pod 写入影响可控。
+    async fn wait_for_app_pod_gone(&self, app_id: &str, timeout: std::time::Duration) {
+        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
+        let start = std::time::Instant::now();
+        loop {
+            match self.pods_api().list(&lp).await {
+                Ok(pods) if pods.items.is_empty() => return,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("[K8S-APP] wait_for_app_pod_gone list 失败，跳过等待: {}", e);
+                    return;
+                }
+            }
+            if start.elapsed() >= timeout {
+                tracing::warn!(
+                    "[K8S-APP] wait_for_app_pod_gone 超时 {}s，Pod 可能仍在终止（继续清理）",
+                    timeout.as_secs()
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
     }
 
     /// 仅容忍 404（视为已删除/幂等），其余 K8s 错误透传
