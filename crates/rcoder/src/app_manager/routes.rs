@@ -17,6 +17,7 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
         // 应用生命周期
         .route("/api/v1/apps", post(handlers::create_app))
         .route("/api/v1/apps/query", post(handlers::query_apps))
+        .route("/api/v1/apps/runtime", get(handlers::list_app_runtimes))
         .route("/api/v1/apps/{app_id}", get(handlers::get_app))
         .route("/api/v1/apps/{app_id}/update", post(handlers::update_app))
         .route("/api/v1/apps/{app_id}/delete", post(handlers::delete_app))

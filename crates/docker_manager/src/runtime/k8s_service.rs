@@ -13,7 +13,9 @@ use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 #[cfg(feature = "kubernetes")]
 use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
-use shared_types::{GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT, WS_TERMINAL_PORT, ServiceType};
+use shared_types::{
+    GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT, ServiceType, WS_TERMINAL_PORT,
+};
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
 #[cfg(feature = "kubernetes")]

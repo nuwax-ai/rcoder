@@ -337,7 +337,10 @@ pub(crate) async fn handle_computer_chat_internal(
             resource_limits: resolve_resource_limits_from_config(
                 &state,
                 &shared_types::ServiceType::ComputerAgentRunner,
-                request.agent_config.as_ref().and_then(|c| c.resource_limits.clone()),
+                request
+                    .agent_config
+                    .as_ref()
+                    .and_then(|c| c.resource_limits.clone()),
             ),
             pod_id: request.pod_id.clone(),
             isolation_type: request.isolation_type.clone(),
@@ -399,7 +402,10 @@ pub(crate) async fn handle_computer_chat_internal(
             resource_limits: resolve_resource_limits_from_config(
                 &state,
                 &shared_types::ServiceType::ComputerAgentRunner,
-                request.agent_config.as_ref().and_then(|c| c.resource_limits.clone()),
+                request
+                    .agent_config
+                    .as_ref()
+                    .and_then(|c| c.resource_limits.clone()),
             ),
             pod_id: request.pod_id.clone(),
             isolation_type: request.isolation_type.clone(),

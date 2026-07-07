@@ -936,10 +936,7 @@ impl DockerManager {
         container_ids: Vec<String>,
         options: CleanupOptions,
     ) -> DockerResult<CleanupResult> {
-        info!(
-            "Starting cleanup container: count={}",
-            container_ids.len()
-        );
+        info!("Starting cleanup container: count={}", container_ids.len());
 
         let start_time = Instant::now();
         let mut result = CleanupResult {
@@ -1003,10 +1000,7 @@ impl DockerManager {
         {
             Some(status) if status.to_string() == "running" => {
                 if !options.force_remove_running {
-                    info!(
-                        "Container {} is running, skip (force=false)",
-                        container_id
-                    );
+                    info!("Container {} is running, skip (force=false)", container_id);
                     return Ok(());
                 }
 

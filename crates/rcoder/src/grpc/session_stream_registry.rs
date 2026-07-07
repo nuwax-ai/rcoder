@@ -9,14 +9,14 @@
 //! - HTTP 客户端按各自的消费游标从 ring 增量补齐，并跳过 broadcast 中 `seq <= 已收最大值`
 //!   的重叠消息（补齐与订阅之间的窗口去重）。
 
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use ringbuf::traits::{Consumer, Observer, Producer};
 use ringbuf::HeapRb;
+use ringbuf::traits::{Consumer, Observer, Producer};
 use shared_types::grpc::{GetStatusRequest, ProgressEvent, ProgressRequest};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use tonic::Code;
 use tracing::{debug, error, info, warn};
 
-use super::new_request_with_locale;
 use super::GrpcChannelPool;
+use super::new_request_with_locale;
 
 /// broadcast 每个 receiver 的缓冲（高频 agent_message_chunk 时给慢消费者足够窗口）
 const BROADCAST_CAPACITY: usize = 256;
@@ -102,7 +102,8 @@ impl SessionStreamRegistry {
             if existing.matches_addr(grpc_addr) && existing.is_alive() {
                 return existing;
             }
-            self.streams.remove_if(session_id, |_, v| Arc::ptr_eq(v, &existing));
+            self.streams
+                .remove_if(session_id, |_, v| Arc::ptr_eq(v, &existing));
         }
 
         // 锁内创建（含 spawn 后台 task 的 await）；此时无并发创建者，安全。
@@ -114,7 +115,8 @@ impl SessionStreamRegistry {
             activity_updater,
         )
         .await;
-        self.streams.insert(session_id.to_string(), new_stream.clone());
+        self.streams
+            .insert(session_id.to_string(), new_stream.clone());
         new_stream
     }
 
@@ -262,8 +264,9 @@ impl SharedStream {
         let end_ev = Arc::new(ProgressEvent {
             message_type: "SessionPromptEnd".to_string(),
             sub_type: "stream_ended".to_string(),
-            payload: r#"{"reason":"StreamEnded","description":"Session stream replaced or cleaned up"}"#
-                .to_string(),
+            payload:
+                r#"{"reason":"StreamEnded","description":"Session stream replaced or cleaned up"}"#
+                    .to_string(),
             request_id: None,
             seq: 0,
             timestamp: now_millis(),
@@ -636,7 +639,11 @@ mod tests {
         shared.dispatch_event(arc_event(0, "synthetic")); // seq=0 合成消息：不入 ring、不更新 last_seq
 
         assert_eq!(shared.last_seq(), 2, "seq=0 must not update last_seq");
-        let got: Vec<u64> = shared.replay_since(0).into_iter().map(|ev| ev.seq).collect();
+        let got: Vec<u64> = shared
+            .replay_since(0)
+            .into_iter()
+            .map(|ev| ev.seq)
+            .collect();
         assert_eq!(got, vec![1, 2], "only seq>0 events enter ring");
     }
 

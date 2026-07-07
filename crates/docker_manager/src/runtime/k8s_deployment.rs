@@ -11,11 +11,9 @@
 //! Pod 共享，app_manager 文件管理直接读写）。
 
 #[cfg(feature = "kubernetes")]
-use async_trait::async_trait;
-#[cfg(feature = "kubernetes")]
 use container_runtime_api::{
-    AppPortSpec, AppPortStatus, ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult,
-    DeploymentStatus, ExposeType,
+    AppPortSpec, AppPortStatus, ContainerCreateParams, ContainerRuntimeError,
+    ContainerRuntimeResult, DeploymentStatus, ExposeType,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
@@ -38,7 +36,7 @@ use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
 #[cfg(feature = "kubernetes")]
-use tracing::{info, warn};
+use tracing::info;
 
 #[cfg(feature = "kubernetes")]
 use super::kubernetes_runtime::KubernetesRuntime;
@@ -90,17 +88,20 @@ impl KubernetesRuntime {
     /// 构建 app 专用 label（与 agent 物理隔离）
     fn build_app_labels(&self, app_id: &str) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
-        labels.insert(
-            format!("{}/name", APP_LABEL_PREFIX),
-            "user-app".to_string(),
-        );
+        labels.insert(format!("{}/name", APP_LABEL_PREFIX), "user-app".to_string());
         labels.insert(format!("{}/instance", APP_LABEL_PREFIX), app_id.to_string());
         labels.insert(
             format!("{}/managed-by", APP_LABEL_PREFIX),
             APP_MANAGED_BY.to_string(),
         );
-        labels.insert(format!("{}/part-of", APP_LABEL_PREFIX), "rcoder".to_string());
-        labels.insert(format!("{}/app-id", RCODER_LABEL_PREFIX), app_id.to_string());
+        labels.insert(
+            format!("{}/part-of", APP_LABEL_PREFIX),
+            "rcoder".to_string(),
+        );
+        labels.insert(
+            format!("{}/app-id", RCODER_LABEL_PREFIX),
+            app_id.to_string(),
+        );
         labels
     }
 
@@ -227,25 +228,23 @@ impl KubernetesRuntime {
         });
 
         // 环境变量（ConfigMap + Secret 通过 envFrom 引用）
-        let env_from = {
-            let mut refs = Vec::new();
-            // ConfigMap 只有在 env 非空时才建；这里总是引用（create 时已建则引用安全）
-            refs.push(EnvFromSource {
+        // ConfigMap/Secret 均设 optional=true：只有 env/secrets 非空时才建，引用安全。
+        let env_from = Some(vec![
+            EnvFromSource {
                 config_map_ref: Some(ConfigMapEnvSource {
                     name: self.app_config_name(app_id),
                     optional: Some(true),
                 }),
                 ..Default::default()
-            });
-            refs.push(EnvFromSource {
+            },
+            EnvFromSource {
                 secret_ref: Some(SecretEnvSource {
                     name: self.app_secret_name(app_id),
                     optional: Some(true),
                 }),
                 ..Default::default()
-            });
-            Some(refs)
-        };
+            },
+        ]);
 
         // 额外直接注入 APP_ID 环境变量
         let env = Some(vec![EnvVar {
@@ -411,8 +410,9 @@ impl KubernetesRuntime {
         routes
             .create(
                 &PostParams::default(),
-                &serde_json::from_value(route)
-                    .map_err(|e| ContainerRuntimeError::K8sError(format!("parse httproute: {e}")))?,
+                &serde_json::from_value(route).map_err(|e| {
+                    ContainerRuntimeError::K8sError(format!("parse httproute: {e}"))
+                })?,
             )
             .await
             .map_err(|e| ContainerRuntimeError::K8sError(format!("create httproute: {e}")))?;
@@ -467,10 +467,7 @@ impl KubernetesRuntime {
             for (i, p) in ports.iter().enumerate() {
                 if let Some(np) = p.node_port {
                     result.push(AppPortStatus {
-                        name: tcp_ports
-                            .get(i)
-                            .map(|p| p.name.clone())
-                            .unwrap_or_default(),
+                        name: tcp_ports.get(i).map(|p| p.name.clone()).unwrap_or_default(),
                         port: p.port as u16,
                         expose_type: ExposeType::Tcp,
                         external_port: Some(np as u16),
@@ -514,16 +511,16 @@ impl KubernetesRuntime {
         let mut external_ports: Vec<AppPortStatus> = vec![];
         if let (Some(ports), Some(gw), Some(gw_ns)) =
             (params.ports.as_ref(), gateway_name, gateway_namespace)
+            && let Some(http_port) = ports.iter().find(|p| p.expose_type == ExposeType::Http)
         {
-            if let Some(http_port) = ports.iter().find(|p| p.expose_type == ExposeType::Http) {
-                self.create_app_httproute(app_id, gw, gw_ns, http_port.port).await?;
-                external_ports.push(AppPortStatus {
-                    name: http_port.name.clone(),
-                    port: http_port.port,
-                    expose_type: ExposeType::Http,
-                    external_port: None,
-                });
-            }
+            self.create_app_httproute(app_id, gw, gw_ns, http_port.port)
+                .await?;
+            external_ports.push(AppPortStatus {
+                name: http_port.name.clone(),
+                port: http_port.port,
+                expose_type: ExposeType::Http,
+                external_port: None,
+            });
         }
         // 6. NodePort（TCP 端口）
         if let Some(ports) = params.ports.as_ref() {
@@ -572,11 +569,26 @@ impl KubernetesRuntime {
     pub async fn delete_app_resources(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         let dp = DeleteParams::default();
         // 404 视为已删除，不报错
-        let _ = self.deployments_api().delete(&self.app_deployment_name(app_id), &dp).await;
-        let _ = self.services_api().delete(&self.app_service_name(app_id), &dp).await;
-        let _ = self.services_api().delete(&self.app_nodeport_name(app_id), &dp).await;
-        let _ = self.configmaps_api().delete(&self.app_config_name(app_id), &dp).await;
-        let _ = self.secrets_api().delete(&self.app_secret_name(app_id), &dp).await;
+        let _ = self
+            .deployments_api()
+            .delete(&self.app_deployment_name(app_id), &dp)
+            .await;
+        let _ = self
+            .services_api()
+            .delete(&self.app_service_name(app_id), &dp)
+            .await;
+        let _ = self
+            .services_api()
+            .delete(&self.app_nodeport_name(app_id), &dp)
+            .await;
+        let _ = self
+            .configmaps_api()
+            .delete(&self.app_config_name(app_id), &dp)
+            .await;
+        let _ = self
+            .secrets_api()
+            .delete(&self.app_secret_name(app_id), &dp)
+            .await;
         // HTTPRoute（动态资源）
         let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
         let api_resource = ApiResource::from_gvk(&gvk);
@@ -588,7 +600,10 @@ impl KubernetesRuntime {
     }
 
     /// 查询单个 app 的运行时状态（实时查 Deployment + Pod）
-    pub async fn get_app_status(&self, app_id: &str) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
+    pub async fn get_app_status(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
         let name = self.app_deployment_name(app_id);
         let deploy = match self.deployments_api().get(&name).await {
             Ok(d) => d,
@@ -596,7 +611,7 @@ impl KubernetesRuntime {
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "get deployment: {e}"
-                )))
+                )));
             }
         };
         Ok(Some(self.deployment_to_status(app_id, &deploy).await))
@@ -604,10 +619,8 @@ impl KubernetesRuntime {
 
     /// 列出所有 rcoder-app-manager 托管的 app 状态（对账用）
     pub async fn list_app_status(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
-        let lp = ListParams::default().labels(&format!(
-            "{}/managed-by={APP_MANAGED_BY}",
-            APP_LABEL_PREFIX
-        ));
+        let lp = ListParams::default()
+            .labels(&format!("{}/managed-by={APP_MANAGED_BY}", APP_LABEL_PREFIX));
         let deploys = self
             .deployments_api()
             .list(&lp)
@@ -647,10 +660,7 @@ impl KubernetesRuntime {
         };
 
         // 关联 Pod 信息（取一个）
-        let lp = ListParams::default().labels(&format!(
-            "{}/app-id={app_id}",
-            RCODER_LABEL_PREFIX
-        ));
+        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
         let (pod_ip, node, restart_count, started_at) = match self.pods_api().list(&lp).await {
             Ok(pods) => pods
                 .items
@@ -693,7 +703,11 @@ impl KubernetesRuntime {
             replicas,
             ready_replicas,
             phase,
-            pod_ip: if pod_ip.is_empty() { None } else { Some(pod_ip) },
+            pod_ip: if pod_ip.is_empty() {
+                None
+            } else {
+                Some(pod_ip)
+            },
             node: if node.is_empty() { None } else { Some(node) },
             restart_count,
             started_at: None,

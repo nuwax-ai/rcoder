@@ -295,7 +295,10 @@ mod tests {
         let ev = make_event("SessionPromptEnd", 0); // 终端 + seq=0 合成消息
 
         let cont = forward_to_client(&tx, &ev, "s1", &mut last_seq).await;
-        assert!(!cont, "SessionPromptEnd must stop the forward task (avoid hang)");
+        assert!(
+            !cont,
+            "SessionPromptEnd must stop the forward task (avoid hang)"
+        );
         assert_eq!(last_seq, 10, "seq=0 must not advance last_seq");
     }
 

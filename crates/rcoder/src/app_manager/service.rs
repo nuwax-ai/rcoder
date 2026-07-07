@@ -1,133 +1,81 @@
-//! 应用管理服务层
+//! 应用管理服务层（统一 Docker / K8s 后端，无状态）
+//!
+//! rcoder 是无状态的应用 pod 引擎：
+//! - 写操作（create/start/stop/restart/delete）转调 [`ContainerRuntime`] 的 Deployment 能力；
+//! - 读操作（get/query/list）实时查集群，返回 [`AppRuntimeInfo`]；
+//! - 业务元数据（name/image/command/env 等）由调用方（Java）持久化，rcoder 不存。
+//!
+//! K8s 模式下 `create_deployment` 一并创建 ConfigMap/Secret/Service/HTTPRoute/NodePort；
+//! Docker 模式下 `create_deployment` 创建容器并加入主网络，本服务额外为 HTTP 端口注册
+//! Pingora backend（`/proxy/{port}` → container_ip），TCP 端口由 runtime 做 port_bindings。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use bollard::Docker;
-use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
-use bollard::query_parameters::{
-    CreateContainerOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
-};
 use chrono::Utc;
 use dashmap::DashMap;
 use docker_manager::path::HostPathResolver;
-use futures::StreamExt;
 use moka::sync::Cache;
 use tokio::fs;
-use tracing::{error, info, instrument, warn};
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use super::config::AppManagerConfig;
+use container_runtime_api::{
+    AppHealthCheck, AppPortSpec, AppResourceRequirements, ContainerCreateParams, ContainerRuntime,
+    DeploymentStatus, ExposeType as RtExposeType, HealthCheckType as RtHealthCheckType,
+};
+use rcoder_proxy::PingoraProxyService;
+use shared_types::ServiceType;
+
+use super::config::{AppAccessMode, AppManagerConfig};
 use super::models::*;
 
-/// 容器名称前缀
+/// 容器名称前缀（与 `ServiceType::UserApp::container_prefix()` 对齐）
 const CONTAINER_PREFIX: &str = "rcoder-app";
 
-/// 工作空间根目录（容器内路径）
-const WORKSPACE_ROOT: &str = "/app/app-workspace";
-
-/// 计算 CPU 使用率
-fn calculate_cpu_percent(stats: &bollard::models::ContainerStatsResponse) -> f64 {
-    let cpu_stats = match &stats.cpu_stats {
-        Some(s) => s,
-        None => return 0.0,
-    };
-    let precpu_stats = match &stats.precpu_stats {
-        Some(s) => s,
-        None => return 0.0,
-    };
-
-    let cpu_usage = cpu_stats
-        .cpu_usage
-        .as_ref()
-        .and_then(|u| u.total_usage)
-        .unwrap_or(0);
-    let precpu_usage = precpu_stats
-        .cpu_usage
-        .as_ref()
-        .and_then(|u| u.total_usage)
-        .unwrap_or(0);
-
-    let cpu_delta = cpu_usage as f64 - precpu_usage as f64;
-    let system_cpu_delta = cpu_stats.system_cpu_usage.unwrap_or(0) as f64
-        - precpu_stats.system_cpu_usage.unwrap_or(0) as f64;
-    let number_cpus = cpu_stats.online_cpus.unwrap_or(1) as f64;
-
-    if system_cpu_delta > 0.0 && cpu_delta >= 0.0 {
-        (cpu_delta / system_cpu_delta) * number_cpus * 100.0
-    } else {
-        0.0
-    }
-}
-
-/// 计算网络使用
-fn calculate_network_usage(stats: &bollard::models::ContainerStatsResponse) -> (u64, u64) {
-    let mut rx_bytes = 0u64;
-    let mut tx_bytes = 0u64;
-
-    if let Some(networks) = &stats.networks {
-        for net in networks.values() {
-            rx_bytes += net.rx_bytes.unwrap_or(0);
-            tx_bytes += net.tx_bytes.unwrap_or(0);
-        }
-    }
-
-    (rx_bytes, tx_bytes)
-}
-
-/// 应用管理服务 (Docker 模式)
+/// 应用管理服务（Docker / K8s 统一）
 pub struct AppService {
     config: AppManagerConfig,
-    docker: Docker,
-    /// 路径解析器缓存（单例）
+    runtime: Arc<dyn ContainerRuntime>,
+    /// Pingora 代理（Docker 模式用于注册 HTTP backend；K8s 模式通常为 None）
+    pingora: Option<Arc<PingoraProxyService>>,
+    /// 路径解析器缓存（单例；Docker 模式将 rcoder 容器内路径解析为宿主机路径）
     path_resolver: Cache<String, Arc<HostPathResolver>>,
-    /// 应用信息存储（并发安全，支持遍历）
-    apps: Arc<DashMap<String, AppInfo>>,
-}
-
-/// 生成容器名称
-fn container_name(app_id: &str) -> String {
-    format!("{}-{}", CONTAINER_PREFIX, app_id)
-}
-
-/// 生成应用目录路径（容器内）
-fn app_workspace_path(app_id: &str) -> PathBuf {
-    let path = PathBuf::from(WORKSPACE_ROOT).join(app_id);
-    tracing::debug!(
-        "[app_workspace_path] WORKSPACE_ROOT={}, app_id={}, result={:?}",
-        WORKSPACE_ROOT,
-        app_id,
-        path
-    );
-    path
+    /// Docker 模式 Pingora backend 端口登记（app_id → 注册的 HTTP 端口列表）
+    ///
+    /// 这是**操作副作用的临时缓存**（非业务元数据）：delete 时需要知道曾注册过哪些端口
+    /// 才能清理 Pingora backend。rcoder 重启后丢失可接受（Docker 模式定位为开发环境）。
+    pingora_ports: DashMap<String, Vec<u16>>,
 }
 
 impl AppService {
     /// 创建新的应用管理服务
-    pub async fn new(config: AppManagerConfig) -> Result<Self> {
-        let docker = Docker::connect_with_local_defaults().context("连接 Docker 失败")?;
-
-        // 路径解析器缓存（单例）
+    pub async fn new(
+        config: AppManagerConfig,
+        runtime: Arc<dyn ContainerRuntime>,
+        pingora: Option<Arc<PingoraProxyService>>,
+    ) -> Result<Self> {
         let path_resolver: Cache<String, Arc<HostPathResolver>> =
             Cache::builder().max_capacity(1).build();
 
-        // 初始化路径解析器
+        // 初始化路径解析器（失败不致命，Docker 模式回退到容器内路径）
         match HostPathResolver::new().await {
             Ok(resolver) => {
-                info!("路径解析器初始化成功");
+                info!("[APP] 路径解析器初始化成功");
                 path_resolver.insert("default".to_string(), Arc::new(resolver));
             }
             Err(e) => {
-                warn!("路径解析器初始化失败，将使用容器内路径: {}", e);
+                warn!("[APP] 路径解析器初始化失败，将使用容器内路径: {}", e);
             }
         }
 
         Ok(Self {
             config,
-            docker,
+            runtime,
+            pingora,
             path_resolver,
-            apps: Arc::new(DashMap::new()),
+            pingora_ports: DashMap::new(),
         })
     }
 
@@ -135,94 +83,110 @@ impl AppService {
     #[instrument(skip(self, request))]
     pub async fn create_app(&self, request: CreateAppRequest) -> Result<AppInfo> {
         let app_id = format!("app-{}", &Uuid::new_v4().to_string()[..8]);
-        info!("创建应用: {} ({})", request.name, app_id);
+        info!(
+            "[APP] 创建应用: {} ({}, mode={:?})",
+            request.name, app_id, self.config.access_mode
+        );
 
-        // 创建应用目录（容器内路径）
+        // 1. 创建应用工作空间目录（code/data/logs）
         self.create_app_dirs(&app_id).await?;
 
-        // 获取宿主机路径（用于容器挂载）
-        let host_app_dir = self.get_host_app_dir(&app_id);
-        info!("宿主机应用目录: {:?}", host_app_dir);
+        // 2. 构建容器创建参数（UserApp）
+        let params = self.build_container_params(&app_id, &request)?;
 
-        // 构建应用信息
-        let now = Utc::now().to_rfc3339();
-        let app_info = AppInfo {
-            app_id: app_id.clone(),
-            name: request.name.clone(),
-            status: AppStatus::Created,
-            image: request.image.clone(),
-            command: request.command.clone().unwrap_or_default(),
-            replicas: 0,
-            access: self.build_access_info(&app_id, &request.ports),
-            health: HealthInfo {
+        // 3. 创建 Deployment / 容器（K8s 含 ConfigMap/Secret/Service/HTTPRoute/NodePort）
+        let container_info = self
+            .runtime
+            .create_deployment(params)
+            .await
+            .map_err(|e| anyhow::anyhow!("创建应用失败: {}", e))
+            .context(format!("[APP] create_deployment 失败 app_id={app_id}"))?;
+        info!(
+            "[APP] 应用资源创建成功: {} (container={})",
+            app_id, container_info.container_name
+        );
+
+        // 4. Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/{port} → container_ip）
+        self.register_pingora_backends(&app_id, &request, &container_info.container_ip)
+            .await;
+
+        // 5. 实时查询运行时状态（拿到真实 node_port / host_port 用于访问地址）
+        let runtime_status = self.fetch_runtime_status(&app_id).await;
+        let ports = runtime_status
+            .as_ref()
+            .map(|s| s.ports.clone())
+            .unwrap_or_default();
+
+        // 6. 构建访问信息 + 健康信息
+        let access = self.build_access_info(&app_id, &ports);
+        let health = runtime_status
+            .as_ref()
+            .map(health_from_status)
+            .unwrap_or(HealthInfo {
                 status: "Unknown".to_string(),
                 instance: None,
                 probes: None,
-            },
+            });
+
+        let now = Utc::now().to_rfc3339();
+        Ok(AppInfo {
+            app_id: app_id.clone(),
+            name: request.name.clone(),
+            status: AppStatus::Running,
+            image: request.image.clone(),
+            command: request.command.clone().unwrap_or_default(),
+            replicas: 1,
+            access,
+            health,
             resources: request.resources.clone(),
             env: request.env.clone().unwrap_or_default(),
             created_at: now.clone(),
             updated_at: now,
-        };
-
-        // 创建容器
-        let container_name = container_name(&app_id);
-        let container_config = self.build_container_config(&app_id, &request);
-
-        match self
-            .docker
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: Some(container_name.clone()),
-                    platform: String::new(),
-                }),
-                container_config,
-            )
-            .await
-        {
-            Ok(response) => {
-                info!("容器创建成功: {}", response.id);
-            }
-            Err(e) => {
-                error!("容器创建失败: {}", e);
-                return Err(anyhow::anyhow!("容器创建失败: {}", e));
-            }
-        }
-
-        // 保存应用信息
-        self.apps.insert(app_id.clone(), app_info.clone());
-
-        Ok(app_info)
+        })
     }
 
-    /// 查询应用列表
+    /// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
+    #[instrument(skip(self))]
+    pub async fn list_app_runtimes(&self) -> Result<Vec<AppRuntimeInfo>> {
+        let statuses = self
+            .runtime
+            .list_deployments()
+            .await
+            .map_err(|e| anyhow::anyhow!("列出应用失败: {}", e))?;
+        Ok(statuses
+            .into_iter()
+            .map(|s| self.build_runtime_info(s))
+            .collect())
+    }
+
+    /// 查询应用列表（实时查集群 + 过滤/分页）
     #[instrument(skip(self, request))]
     pub async fn query_apps(
         &self,
         request: QueryAppsRequest,
-    ) -> Result<PaginatedResponse<AppInfo>> {
-        let mut items: Vec<AppInfo> = self.apps.iter().map(|r| r.value().clone()).collect();
+    ) -> Result<PaginatedResponse<AppRuntimeInfo>> {
+        let mut items = self.list_app_runtimes().await?;
 
-        // 过滤
+        // 过滤（仅 status/app_ids 为运行时字段，可生效；name/created_at 需业务元数据，跳过）
         if let Some(filters) = &request.filters {
             if let Some(status) = &filters.status {
                 items.retain(|app| status.contains(&app.status));
             }
-            if let Some(name) = &filters.name {
-                items.retain(|app| app.name.contains(name));
-            }
             if let Some(app_ids) = &filters.app_ids {
                 items.retain(|app| app_ids.contains(&app.app_id));
             }
+            if filters.name.is_some() || filters.created_at.is_some() {
+                warn!(
+                    "[APP] query_apps 的 name/created_at 过滤需要业务元数据，rcoder 无状态已忽略"
+                );
+            }
         }
 
-        // 排序
-        if let Some(sort_by) = &request.sort_by {
-            match sort_by.as_str() {
-                "name" => items.sort_by(|a, b| a.name.cmp(&b.name)),
-                "created_at" => items.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
-                _ => {}
-            }
+        // 排序（仅 app_id 可用）
+        if let Some(sort_by) = &request.sort_by
+            && (sort_by == "app_id" || sort_by == "name")
+        {
+            items.sort_by(|a, b| a.app_id.cmp(&b.app_id));
             if request.sort_order == Some(SortOrder::Asc) {
                 items.reverse();
             }
@@ -234,7 +198,6 @@ impl AppService {
         let page_size = request.page_size.unwrap_or(20).min(100);
         let start = ((page - 1) * page_size) as usize;
         let end = (start + page_size as usize).min(items.len());
-
         let paged_items = if start < items.len() {
             items[start..end].to_vec()
         } else {
@@ -252,229 +215,135 @@ impl AppService {
         })
     }
 
-    /// 获取应用详情
+    /// 获取应用运行时详情（实时查集群）
     #[instrument(skip(self))]
-    pub async fn get_app(&self, app_id: &str) -> Result<AppInfo> {
-        self.apps
-            .get(app_id)
-            .map(|r| r.value().clone())
-            .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))
+    pub async fn get_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+        let status = self
+            .fetch_runtime_status(app_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
+        Ok(self.build_runtime_info(status))
     }
 
     /// 更新应用配置
-    #[instrument(skip(self, request))]
-    pub async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> Result<AppInfo> {
-        let mut entry = self
-            .apps
-            .get_mut(app_id)
-            .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
-
-        let app = entry.value_mut();
-
-        if let Some(name) = request.name {
-            app.name = name;
-        }
-        if let Some(image) = request.image {
-            app.image = image;
-        }
-        if let Some(command) = request.command {
-            app.command = command;
-        }
-        if let Some(env) = request.env {
-            app.env.extend(env);
-        }
-        if let Some(resources) = request.resources {
-            app.resources = Some(resources);
-        }
-
-        app.updated_at = Utc::now().to_rfc3339();
-
-        Ok(app.clone())
+    ///
+    /// rcoder 无状态：不持久化业务元数据，也无法在缺少旧 spec 的情况下重建 Deployment。
+    /// 此接口返回当前运行时状态；如需应用变更（image/env 等），调用方应 delete + create。
+    #[instrument(skip(self))]
+    pub async fn update_app(
+        &self,
+        app_id: &str,
+        _request: UpdateAppRequest,
+    ) -> Result<AppRuntimeInfo> {
+        warn!(
+            "[APP] update_app: rcoder 无状态，业务元数据由调用方持久化；如需应用变更请 delete + create (app_id={})",
+            app_id
+        );
+        self.get_app(app_id).await
     }
 
     /// 删除应用
     #[instrument(skip(self))]
     pub async fn delete_app(&self, app_id: &str) -> Result<()> {
-        // 停止并删除容器
-        let container_name = container_name(app_id);
-        let _ = self
-            .docker
-            .remove_container(
-                &container_name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
+        info!("[APP] 删除应用: {}", app_id);
 
-        // 删除应用信息
-        self.apps
-            .remove(app_id)
-            .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
+        // 1. Docker 模式：清理 Pingora backend
+        self.unregister_pingora_backends(app_id).await;
 
-        // 删除应用目录（容器内路径）
+        // 2. 删除 Deployment 及关联资源（K8s: Service/HTTPRoute/NodePort/ConfigMap/Secret）
+        self.runtime
+            .delete_deployment(app_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("删除应用失败: {}", e))?;
+
+        // 3. 清理工作空间目录（共享存储子目录，安全）
         let app_dir = self.get_container_app_dir(app_id);
-        if app_dir.exists() {
-            fs::remove_dir_all(&app_dir).await?;
+        if app_dir.exists()
+            && let Err(e) = fs::remove_dir_all(&app_dir).await
+        {
+            warn!("[APP] 清理应用目录失败 {:?}: {}", app_dir, e);
         }
 
         Ok(())
     }
 
-    /// 启动应用
+    /// 启动应用（scale replicas = 1）
     #[instrument(skip(self))]
-    pub async fn start_app(&self, app_id: &str) -> Result<AppInfo> {
-        let mut entry = self
-            .apps
-            .get_mut(app_id)
-            .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
-
-        let app = entry.value_mut();
-
-        if app.status == AppStatus::Running {
-            return Err(anyhow::anyhow!("应用已在运行"));
-        }
-
-        // 启动容器
-        let container_name = container_name(app_id);
-        match self
-            .docker
-            .start_container(&container_name, None::<StartContainerOptions>)
+    pub async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+        self.runtime
+            .scale_deployment(app_id, 1)
             .await
-        {
-            Ok(_) => {
-                info!("容器启动成功: {}", container_name);
-                app.status = AppStatus::Running;
-                app.replicas = 1;
-                app.updated_at = Utc::now().to_rfc3339();
-            }
-            Err(e) => {
-                error!("容器启动失败: {}", e);
-                app.status = AppStatus::Error;
-                return Err(anyhow::anyhow!("容器启动失败: {}", e));
-            }
-        }
-
-        Ok(app.clone())
+            .map_err(|e| anyhow::anyhow!("启动应用失败: {}", e))?;
+        info!("[APP] 应用已启动 (scale=1): {}", app_id);
+        self.get_app(app_id).await
     }
 
-    /// 停止应用
+    /// 停止应用（scale replicas = 0）
     #[instrument(skip(self))]
-    pub async fn stop_app(&self, app_id: &str) -> Result<AppInfo> {
-        let mut entry = self
-            .apps
-            .get_mut(app_id)
-            .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
-
-        let app = entry.value_mut();
-
-        if app.status != AppStatus::Running {
-            return Err(anyhow::anyhow!("应用未在运行"));
-        }
-
-        // 停止容器
-        let container_name = container_name(app_id);
-        match self
-            .docker
-            .stop_container(
-                &container_name,
-                Some(StopContainerOptions {
-                    t: Some(10),
-                    signal: Some(String::new()),
-                }),
-            )
+    pub async fn stop_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+        self.runtime
+            .scale_deployment(app_id, 0)
             .await
-        {
-            Ok(_) => {
-                info!("容器停止成功: {}", container_name);
-                app.status = AppStatus::Stopped;
-                app.replicas = 0;
-                app.updated_at = Utc::now().to_rfc3339();
-            }
-            Err(e) => {
-                error!("容器停止失败: {}", e);
-                return Err(anyhow::anyhow!("容器停止失败: {}", e));
-            }
-        }
-
-        Ok(app.clone())
+            .map_err(|e| anyhow::anyhow!("停止应用失败: {}", e))?;
+        info!("[APP] 应用已停止 (scale=0): {}", app_id);
+        self.get_app(app_id).await
     }
 
-    /// 重启应用
+    /// 重启应用（rollout restart）
     #[instrument(skip(self))]
-    pub async fn restart_app(&self, app_id: &str) -> Result<AppInfo> {
-        let mut entry = self
-            .apps
-            .get_mut(app_id)
-            .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
-
-        let app = entry.value_mut();
-
-        // 重启容器
-        let container_name = container_name(app_id);
-
-        // 先停止
-        let _ = self
-            .docker
-            .stop_container(
-                &container_name,
-                Some(StopContainerOptions {
-                    t: Some(10),
-                    signal: Some(String::new()),
-                }),
-            )
-            .await;
-
-        // 再启动
-        match self
-            .docker
-            .start_container(&container_name, None::<StartContainerOptions>)
+    pub async fn restart_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+        self.runtime
+            .restart_deployment(app_id)
             .await
-        {
-            Ok(_) => {
-                info!("容器重启成功: {}", container_name);
-                app.status = AppStatus::Running;
-                app.replicas = 1;
-                app.updated_at = Utc::now().to_rfc3339();
-            }
-            Err(e) => {
-                error!("容器重启失败: {}", e);
-                app.status = AppStatus::Error;
-                return Err(anyhow::anyhow!("容器重启失败: {}", e));
-            }
-        }
-
-        Ok(app.clone())
+            .map_err(|e| anyhow::anyhow!("重启应用失败: {}", e))?;
+        info!("[APP] 应用已重启 (rollout): {}", app_id);
+        self.get_app(app_id).await
     }
 
-    /// 获取应用日志
+    /// 获取应用日志（读取共享工作空间 logs/app.log）
     #[instrument(skip(self))]
     pub async fn get_app_logs(&self, app_id: &str, params: LogParams) -> Result<Vec<LogEntry>> {
-        let _app = self.get_app(app_id).await?;
-
-        let log_dir = self.get_container_app_dir(app_id).join("logs");
-        let log_file = log_dir.join("app.log");
-
+        let log_file = self
+            .get_container_app_dir(app_id)
+            .join("logs")
+            .join("app.log");
         if !log_file.exists() {
             return Ok(vec![]);
         }
-
-        let content = fs::read_to_string(&log_file).await?;
+        let content = fs::read_to_string(&log_file)
+            .await
+            .with_context(|| format!("读取日志失败: {:?}", log_file))?;
         let tail = params.tail.unwrap_or(1000) as usize;
         let lines: Vec<&str> = content.lines().collect();
         let start = lines.len().saturating_sub(tail);
-
-        let entries = lines[start..]
+        Ok(lines[start..]
             .iter()
             .map(|line| LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 stream: "stdout".to_string(),
                 message: line.to_string(),
             })
-            .collect();
+            .collect())
+    }
 
-        Ok(entries)
+    /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
+    #[instrument(skip(self))]
+    pub async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats> {
+        let status = self
+            .fetch_runtime_status(app_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
+        Ok(ResourceStats {
+            restart_count: status.restart_count,
+            ..Default::default()
+        })
+    }
+
+    /// 获取应用事件（best-effort：当前返回空，TODO 接 K8s events）
+    #[instrument(skip(self))]
+    pub async fn get_app_events(&self, app_id: &str) -> Result<Vec<String>> {
+        let _ = app_id;
+        Ok(vec![])
     }
 
     /// 上传文件
@@ -485,18 +354,11 @@ impl AppService {
         file_data: Vec<u8>,
         target: &str,
     ) -> Result<UploadResult> {
-        let _app = self.get_app(app_id).await?;
-
-        let app_dir = self.get_container_app_dir(app_id);
-        let file_path = app_dir.join("code").join(target);
-
-        // 确保父目录存在
+        let file_path = self.get_container_app_dir(app_id).join("code").join(target);
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-
         fs::write(&file_path, &file_data).await?;
-
         Ok(UploadResult {
             file_path: target.to_string(),
             file_size: file_data.len() as u64,
@@ -507,16 +369,12 @@ impl AppService {
     /// 列出文件
     #[instrument(skip(self))]
     pub async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>> {
-        let _app = self.get_app(app_id).await?;
-
         let code_dir = self.get_container_app_dir(app_id).join("code");
         if !code_dir.exists() {
             return Ok(vec![]);
         }
-
         let mut files = Vec::new();
         let mut entries = fs::read_dir(&code_dir).await?;
-
         while let Some(entry) = entries.next_entry().await? {
             let metadata = entry.metadata().await?;
             files.push(FileInfo {
@@ -532,142 +390,269 @@ impl AppService {
                     .unwrap_or_default(),
             });
         }
-
         Ok(files)
     }
 
     /// 删除文件
     #[instrument(skip(self))]
     pub async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
-        let _app = self.get_app(app_id).await?;
-
         let app_dir = self.get_container_app_dir(app_id);
         let full_path = app_dir.join("code").join(file_path);
 
-        // 安全检查：确保路径在应用目录内
+        // 安全检查：确保路径在应用 code 目录内
         let canonical_path = full_path.canonicalize()?;
         let code_dir = app_dir.join("code").canonicalize()?;
         if !canonical_path.starts_with(&code_dir) {
             return Err(anyhow::anyhow!("路径不在应用目录内"));
         }
-
         if !canonical_path.exists() {
             return Err(anyhow::anyhow!("文件不存在: {}", file_path));
         }
-
         if canonical_path.is_dir() {
             fs::remove_dir_all(&canonical_path).await?;
         } else {
             fs::remove_file(&canonical_path).await?;
         }
-
-        info!("文件已删除: {}", file_path);
+        info!("[APP] 文件已删除: {}", file_path);
         Ok(())
     }
 
-    /// 获取资源使用情况
-    #[instrument(skip(self))]
-    pub async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats> {
-        let _app = self.get_app(app_id).await?;
-
-        let container_name = container_name(app_id);
-
-        // 使用 Docker stats API 获取实时资源使用
-        use bollard::query_parameters::StatsOptionsBuilder;
-
-        let options = StatsOptionsBuilder::default()
-            .stream(false)
-            .one_shot(true)
-            .build();
-
-        let mut stats_stream = self.docker.stats(&container_name, Some(options));
-
-        if let Some(result) = stats_stream.next().await {
-            match result {
-                Ok(stats) => {
-                    // 计算 CPU 使用率
-                    let cpu_percent = calculate_cpu_percent(&stats);
-
-                    // 内存使用
-                    let memory_stats = stats.memory_stats.as_ref();
-                    let memory_usage = memory_stats.and_then(|m| m.usage).unwrap_or(0);
-                    let memory_limit = memory_stats.and_then(|m| m.limit).unwrap_or(0);
-                    let memory_percent = if memory_limit > 0 {
-                        (memory_usage as f64 / memory_limit as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-
-                    // 网络使用
-                    let (rx_bytes, tx_bytes) = calculate_network_usage(&stats);
-
-                    Ok(ResourceStats {
-                        cpu: CpuStats {
-                            usage_percent: cpu_percent,
-                            usage_cores: cpu_percent / 100.0,
-                            limit_cores: 1.0,
-                        },
-                        memory: MemoryStats {
-                            usage_bytes: memory_usage,
-                            usage_percent: memory_percent,
-                            limit_bytes: memory_limit,
-                        },
-                        network: NetworkStats { rx_bytes, tx_bytes },
-                        restart_count: 0,
-                    })
-                }
-                Err(e) => {
-                    warn!("查询容器资源失败: {}", e);
-                    Err(anyhow::anyhow!("查询容器资源失败: {}", e))
-                }
-            }
-        } else {
-            Err(anyhow::anyhow!("无法获取容器资源信息"))
-        }
-    }
-
-    /// 获取应用事件
-    #[instrument(skip(self))]
-    pub async fn get_app_events(&self, app_id: &str) -> Result<Vec<String>> {
-        let _app = self.get_app(app_id).await?;
-
-        // Docker 模式下，可以从容器状态变化中提取事件
-        // 暂时返回空列表
-        Ok(vec![])
-    }
-
-    // ============================================================================
+    // ========================================================================
     // 辅助方法
-    // ============================================================================
+    // ========================================================================
 
-    /// 获取应用目录（宿主机路径）
-    ///
-    /// 使用缓存的路径解析器将容器内路径转换为宿主机路径
-    fn get_host_app_dir(&self, app_id: &str) -> PathBuf {
-        let container_path = app_workspace_path(app_id);
-        tracing::debug!(
-            "[get_host_app_dir] app_id={}, container_path={:?}",
-            app_id,
-            container_path
-        );
+    /// 构建 ContainerCreateParams（UserApp）
+    fn build_container_params(
+        &self,
+        app_id: &str,
+        request: &CreateAppRequest,
+    ) -> Result<ContainerCreateParams> {
+        // 端口：models::PortConfig → container_runtime_api::AppPortSpec
+        let ports: Vec<AppPortSpec> = request
+            .ports
+            .as_ref()
+            .map(|ps| {
+                ps.iter()
+                    .map(|p| AppPortSpec {
+                        name: p.name.clone(),
+                        port: p.port,
+                        expose_type: map_expose_type(&p.expose_type),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        // 从缓存获取路径解析器
-        if let Some(resolver) = self.path_resolver.get("default") {
-            let result = resolver.resolve_to_host_path(&container_path);
-            tracing::debug!("[get_host_app_dir] resolve result={:?}", result);
-            result.unwrap_or(container_path)
-        } else {
-            tracing::warn!("[get_host_app_dir] path_resolver not available, using container_path");
-            container_path
+        // 健康检查：models::HealthCheckConfig → AppHealthCheck
+        let health_check = request.health_check.as_ref().map(|hc| AppHealthCheck {
+            check_type: map_health_check_type(&hc.check_type),
+            path: hc.path.clone(),
+            port: hc.port,
+            initial_delay_seconds: None,
+            period_seconds: None,
+        });
+
+        // 资源：models::ResourceLimits → AppResourceRequirements
+        let app_resources = request.resources.as_ref().map(|r| AppResourceRequirements {
+            cpu: r.cpu.clone(),
+            memory: r.memory.clone(),
+            storage: r.storage.clone(),
+        });
+
+        // 宿主机工作空间路径（Docker 模式 bind mount 源；K8s 模式 runtime 用 subPath，忽略此值）
+        let host_workspace_path = self.get_host_app_dir(app_id).to_string_lossy().to_string();
+
+        let mut builder = ContainerCreateParams::builder()
+            .project_id(app_id.to_string())
+            .service_type(ServiceType::UserApp)
+            .host_workspace_path(host_workspace_path)
+            .image_override(request.image.clone())
+            .env(request.env.clone().unwrap_or_default())
+            .secrets(request.secrets.clone().unwrap_or_default())
+            .ports(ports);
+
+        // command 仅在非空时设置（空 vec 会覆盖镜像 CMD）
+        if let Some(cmd) = request.command.clone()
+            && !cmd.is_empty()
+        {
+            builder = builder.command(cmd);
+        }
+        if let Some(hc) = health_check {
+            builder = builder.health_check(hc);
+        }
+        if let Some(ar) = app_resources {
+            builder = builder.app_resources(ar);
+        }
+
+        Ok(builder.build())
+    }
+
+    /// 实时查询单个应用运行时状态（None 表示不存在）
+    async fn fetch_runtime_status(&self, app_id: &str) -> Option<DeploymentStatus> {
+        match self.runtime.get_deployment_status(app_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("[APP] 查询运行时状态失败 app_id={}: {}", app_id, e);
+                None
+            }
         }
     }
 
-    /// 获取应用目录（容器内路径）
+    /// DeploymentStatus → AppRuntimeInfo（含访问地址构建）
+    fn build_runtime_info(&self, status: DeploymentStatus) -> AppRuntimeInfo {
+        let access = self.build_access_info(&status.app_id, &status.ports);
+        AppRuntimeInfo {
+            status: phase_to_status(&status.phase),
+            access,
+            app_id: status.app_id,
+            phase: status.phase,
+            replicas: status.replicas,
+            ready_replicas: status.ready_replicas,
+            restart_count: status.restart_count,
+            pod_ip: status.pod_ip,
+            node: status.node,
+            started_at: status.started_at,
+            ports: status.ports,
+        }
+    }
+
+    /// 构建访问信息（按 access_mode 分支）
+    fn build_access_info(&self, app_id: &str, ports: &[AppPortStatus]) -> AccessInfo {
+        let http_port = ports.iter().find(|p| p.expose_type == RtExposeType::Http);
+        let tcp_ports: Vec<TcpPortMapping> = ports
+            .iter()
+            .filter(|p| p.expose_type == RtExposeType::Tcp)
+            .map(|p| {
+                let ext = p.external_port.unwrap_or(0);
+                TcpPortMapping {
+                    name: p.name.clone(),
+                    node_port: ext,
+                    access_url: format!("tcp://{}:{}", self.config.get_external_host(), ext),
+                }
+            })
+            .collect();
+
+        let (http_url, domain, short_domain) = match self.config.access_mode {
+            AppAccessMode::Docker => {
+                let http = http_port.map(|p| {
+                    format!(
+                        "http://{}:{}/proxy/{}",
+                        self.config.get_external_host(),
+                        self.config.get_pingora_listen_port(),
+                        p.port
+                    )
+                });
+                let name = format!("{}-{}", CONTAINER_PREFIX, app_id);
+                (http, name.clone(), name)
+            }
+            AppAccessMode::Kubernetes => {
+                let http = http_port.map(|_| {
+                    format!(
+                        "http://{}:{}/apps/{}",
+                        self.config.get_node_ip(),
+                        self.config.get_gateway_node_port(),
+                        app_id
+                    )
+                });
+                let cluster_domain = shared_types::get_k8s_cluster_domain();
+                let svc = format!("{}-{}-svc", CONTAINER_PREFIX, app_id);
+                let fqdn = format!("{}.{}.svc.{}", svc, self.config.namespace, cluster_domain);
+                (http, fqdn, format!("{}.{}", svc, self.config.namespace))
+            }
+        };
+
+        AccessInfo {
+            external: ExternalAccess {
+                http: http_url,
+                tcp: tcp_ports,
+            },
+            internal: InternalAccess {
+                domain,
+                short_domain,
+                ports: ports
+                    .iter()
+                    .map(|p| InternalPort {
+                        name: p.name.clone(),
+                        port: p.port,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    /// Docker 模式：为 HTTP 端口注册 Pingora backend，返回注册的端口列表
+    async fn register_pingora_backends(
+        &self,
+        app_id: &str,
+        request: &CreateAppRequest,
+        container_ip: &str,
+    ) -> Vec<u16> {
+        let Some(pingora) = &self.pingora else {
+            return vec![];
+        };
+        if container_ip.is_empty() {
+            warn!(
+                "[APP] Docker 模式 container_ip 为空，跳过 Pingora backend 注册: {}",
+                app_id
+            );
+            return vec![];
+        }
+        let http_ports: Vec<u16> = request
+            .ports
+            .as_ref()
+            .map(|ps| {
+                ps.iter()
+                    .filter(|p| p.expose_type == ExposeType::Http)
+                    .map(|p| p.port)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for port in &http_ports {
+            pingora.add_backend(*port, container_ip.to_string()).await;
+        }
+        if !http_ports.is_empty() {
+            self.pingora_ports
+                .insert(app_id.to_string(), http_ports.clone());
+            info!(
+                "[APP] Pingora backend 已注册: {} ports={:?} -> {}",
+                app_id, http_ports, container_ip
+            );
+        }
+        http_ports
+    }
+
+    /// Docker 模式：清理 app 曾注册的 Pingora backend
+    async fn unregister_pingora_backends(&self, app_id: &str) {
+        let Some(pingora) = &self.pingora else {
+            return;
+        };
+        if let Some((_, ports)) = self.pingora_ports.remove(app_id) {
+            for port in &ports {
+                pingora.remove_backend(*port).await;
+            }
+            info!("[APP] Pingora backend 已清理: {} ports={:?}", app_id, ports);
+        }
+    }
+
+    /// 获取应用目录（rcoder 视角：workspace_root/app_id）
     fn get_container_app_dir(&self, app_id: &str) -> PathBuf {
         PathBuf::from(self.config.get_workspace_root()).join(app_id)
     }
 
-    /// 创建应用目录
+    /// 获取应用目录的宿主机路径（Docker bind mount 源）
+    ///
+    /// Docker 模式：rcoder 通常也运行在容器内，需经 HostPathResolver 将容器内路径
+    /// 转为宿主机路径；解析失败回退到原路径。K8s 模式此值不被使用。
+    fn get_host_app_dir(&self, app_id: &str) -> PathBuf {
+        let p = self.get_container_app_dir(app_id);
+        if let Some(resolver) = self.path_resolver.get("default") {
+            resolver.resolve_to_host_path(&p).unwrap_or(p)
+        } else {
+            p
+        }
+    }
+
+    /// 创建应用工作空间子目录
     async fn create_app_dirs(&self, app_id: &str) -> Result<()> {
         let app_dir = self.get_container_app_dir(app_id);
         fs::create_dir_all(app_dir.join("code")).await?;
@@ -675,95 +660,55 @@ impl AppService {
         fs::create_dir_all(app_dir.join("logs")).await?;
         Ok(())
     }
+}
 
-    /// 构建容器配置
-    fn build_container_config(
-        &self,
-        app_id: &str,
-        request: &CreateAppRequest,
-    ) -> ContainerCreateBody {
-        // 使用宿主机路径进行挂载
-        let host_app_dir = self.get_host_app_dir(app_id);
+// ============================================================================
+// 自由函数辅助
+// ============================================================================
 
-        // 构建挂载点
-        let mounts = vec![Mount {
-            target: Some("/app".to_string()),
-            source: Some(host_app_dir.to_string_lossy().to_string()),
-            typ: Some(MountType::BIND),
-            ..Default::default()
-        }];
-
-        // 构建环境变量
-        let env: Vec<String> = request
-            .env
-            .as_ref()
-            .map(|env| env.iter().map(|(k, v)| format!("{}={}", k, v)).collect())
-            .unwrap_or_default();
-
-        // 构建主机配置
-        let host_config = HostConfig {
-            mounts: Some(mounts),
-            ..Default::default()
-        };
-
-        ContainerCreateBody {
-            image: Some(request.image.clone()),
-            cmd: request.command.clone(),
-            env: Some(env),
-            host_config: Some(host_config),
-            ..Default::default()
-        }
+/// 运行时 phase → 应用状态枚举
+fn phase_to_status(phase: &str) -> AppStatus {
+    match phase {
+        "Running" => AppStatus::Running,
+        "Stopped" | "ScaledDown" => AppStatus::Stopped,
+        "Starting" | "Pending" | "Creating" => AppStatus::Starting,
+        "Error" | "Failed" => AppStatus::Error,
+        _ => AppStatus::Created,
     }
+}
 
-    /// 构建访问信息
-    fn build_access_info(&self, app_id: &str, ports: &Option<Vec<PortConfig>>) -> AccessInfo {
-        let http_port = ports
-            .as_ref()
-            .and_then(|p| p.iter().find(|p| p.expose_type == ExposeType::Http));
+/// 由 DeploymentStatus 派生健康信息
+fn health_from_status(status: &DeploymentStatus) -> HealthInfo {
+    HealthInfo {
+        status: status.phase.clone(),
+        instance: Some(InstanceInfo {
+            name: format!("{}-{}", CONTAINER_PREFIX, status.app_id),
+            phase: status.phase.clone(),
+            ready: status.ready_replicas > 0,
+            restart_count: status.restart_count,
+            node: status.node.clone().unwrap_or_default(),
+            ip: status.pod_ip.clone().unwrap_or_default(),
+            started_at: status.started_at.clone(),
+        }),
+        probes: None,
+    }
+}
 
-        let tcp_ports: Vec<TcpPortMapping> = ports
-            .as_ref()
-            .map(|p| {
-                p.iter()
-                    .filter(|p| p.expose_type == ExposeType::Tcp)
-                    .map(|p| TcpPortMapping {
-                        name: p.name.clone(),
-                        node_port: 0, // TODO: 查询实际 NodePort
-                        access_url: format!("tcp://{}:0", self.config.get_node_ip()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+/// models::ExposeType → container_runtime_api::ExposeType
+fn map_expose_type(e: &ExposeType) -> RtExposeType {
+    match e {
+        ExposeType::Http => RtExposeType::Http,
+        ExposeType::Tcp => RtExposeType::Tcp,
+    }
+}
 
-        AccessInfo {
-            external: ExternalAccess {
-                http: http_port.map(|_| {
-                    format!(
-                        "http://{}:{}/apps/{}",
-                        self.config.get_node_ip(),
-                        self.config.get_gateway_node_port(),
-                        app_id
-                    )
-                }),
-                tcp: tcp_ports,
-            },
-            internal: InternalAccess {
-                // Docker 模式：使用容器名称作为内部域名
-                domain: format!("rcoder-app-{}", app_id),
-                short_domain: format!("rcoder-app-{}", app_id),
-                ports: ports
-                    .as_ref()
-                    .map(|p| {
-                        p.iter()
-                            .map(|p| InternalPort {
-                                name: p.name.clone(),
-                                port: p.port,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            },
-        }
+/// models::HealthCheckType → container_runtime_api::HealthCheckType
+fn map_health_check_type(t: &HealthCheckType) -> RtHealthCheckType {
+    match t {
+        HealthCheckType::Http => RtHealthCheckType::Http,
+        HealthCheckType::Tcp => RtHealthCheckType::Tcp,
+        HealthCheckType::Exec => RtHealthCheckType::Exec,
+        HealthCheckType::None => RtHealthCheckType::None,
     }
 }
 
@@ -773,15 +718,22 @@ impl super::AppServiceTrait for AppService {
         self.create_app(request).await
     }
 
-    async fn query_apps(&self, request: QueryAppsRequest) -> Result<PaginatedResponse<AppInfo>> {
+    async fn query_apps(
+        &self,
+        request: QueryAppsRequest,
+    ) -> Result<PaginatedResponse<AppRuntimeInfo>> {
         self.query_apps(request).await
     }
 
-    async fn get_app(&self, app_id: &str) -> Result<AppInfo> {
+    async fn list_app_runtimes(&self) -> Result<Vec<AppRuntimeInfo>> {
+        self.list_app_runtimes().await
+    }
+
+    async fn get_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
         self.get_app(app_id).await
     }
 
-    async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> Result<AppInfo> {
+    async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> Result<AppRuntimeInfo> {
         self.update_app(app_id, request).await
     }
 
@@ -789,15 +741,15 @@ impl super::AppServiceTrait for AppService {
         self.delete_app(app_id).await
     }
 
-    async fn start_app(&self, app_id: &str) -> Result<AppInfo> {
+    async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
         self.start_app(app_id).await
     }
 
-    async fn stop_app(&self, app_id: &str) -> Result<AppInfo> {
+    async fn stop_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
         self.stop_app(app_id).await
     }
 
-    async fn restart_app(&self, app_id: &str) -> Result<AppInfo> {
+    async fn restart_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
         self.restart_app(app_id).await
     }
 

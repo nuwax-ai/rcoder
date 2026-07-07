@@ -494,11 +494,7 @@ pub trait ContainerRuntime: Send + Sync {
     }
 
     /// 伸缩 Deployment 副本数（K8s scale；Docker: 0=stop, >=1=start）
-    async fn scale_deployment(
-        &self,
-        app_id: &str,
-        replicas: i32,
-    ) -> ContainerRuntimeResult<()> {
+    async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         let _ = (app_id, replicas);
         Err(ContainerRuntimeError::ConfigurationError(
             "scale_deployment not supported by this runtime".to_string(),

@@ -298,12 +298,20 @@ impl KubernetesRuntime {
     ///
     /// - K8s 环境：使用 K8s Service FQDN
     /// - Docker 环境：使用容器 IP
-    fn get_container_access_address(&self, identifier: &str, service_type: &ServiceType, _container_ip: &str) -> String {
+    fn get_container_access_address(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        _container_ip: &str,
+    ) -> String {
         // K8s 环境：使用 K8s Service FQDN
-        let svc_name = self.agent_service_name(identifier, service_type).unwrap_or_else(|_| {
-            format!("{}-{}", service_type, identifier)
-        });
-        format!("{}.{}.svc.{}", svc_name, self.namespace, self.config.cluster_domain)
+        let svc_name = self
+            .agent_service_name(identifier, service_type)
+            .unwrap_or_else(|_| format!("{}-{}", service_type, identifier));
+        format!(
+            "{}.{}.svc.{}",
+            svc_name, self.namespace, self.config.cluster_domain
+        )
     }
 
     /// Build container basic info from runtime container info
@@ -597,9 +605,10 @@ impl ContainerRuntime for KubernetesRuntime {
                 );
             }
             Err(e) => {
-                return Err(ContainerRuntimeError::ContainerCreationError(
-                    format!("Failed to create pod: {}", e),
-                ));
+                return Err(ContainerRuntimeError::ContainerCreationError(format!(
+                    "Failed to create pod: {}",
+                    e
+                )));
             }
         }
 
@@ -638,7 +647,8 @@ impl ContainerRuntime for KubernetesRuntime {
             // get_container_info 只用于 WebAgentRunner
             let service_type = shared_types::ServiceType::WebAgentRunner;
             return Ok(Some(
-                self.build_container_basic_info(identifier, cached, &service_type).await?,
+                self.build_container_basic_info(identifier, cached, &service_type)
+                    .await?,
             ));
         }
 
@@ -1189,11 +1199,7 @@ impl ContainerRuntime for KubernetesRuntime {
         })
     }
 
-    async fn scale_deployment(
-        &self,
-        app_id: &str,
-        replicas: i32,
-    ) -> ContainerRuntimeResult<()> {
+    async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         self.scale_app(app_id, replicas).await
     }
 

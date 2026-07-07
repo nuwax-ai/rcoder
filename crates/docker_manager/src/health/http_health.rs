@@ -79,7 +79,10 @@ impl HttpHealthChecker {
             {
                 Ok(Ok(response)) if response.status().is_success() => {
                     // HTTP 状态码成功，进一步检查响应体
-                    match response.json::<HttpResult<shared_types::HealthCheckResponse>>().await {
+                    match response
+                        .json::<HttpResult<shared_types::HealthCheckResponse>>()
+                        .await
+                    {
                         Ok(health_result) if health_result.code == "0000" => {
                             // 成功：code 为 "0000"
                             if let Some(health) = health_result.data {

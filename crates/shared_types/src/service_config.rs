@@ -120,7 +120,7 @@ pub struct ServiceResourceLimits {
     /// PVC 存储空间大小（仅 K8s 模式生效，Docker 模式忽略）
     ///
     /// 格式：`<数字><单位>`，支持 Mi/Gi/Ti（二进制）和 M/G/T（十进制）
-    /// 范围：最小 1Gi，最大 100Ti，默认 50Gi
+    /// 范围：最小 1Gi，最大 100Ti，默认 10Gi
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_size: Option<String>,
 }
@@ -481,7 +481,7 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
         memory_limit: Some(2_000_000_000.0), // 2GB
         cpu_limit: Some(2.0),                // 2 核
         swap_limit: Some(4_000_000_000.0),   // 4GB
-        storage_size: None,                  // K8s 模式下使用默认值 10Gi
+        storage_size: None,                  // None → 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
     };
 
     ServiceImageConfig {
@@ -536,7 +536,7 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
         memory_limit: Some(4_000_000_000.0), // 4GB
         cpu_limit: Some(3.0),                // 3 核
         swap_limit: Some(8_000_000_000.0),   // 8GB
-        storage_size: None,                  // K8s 模式下使用默认值 10Gi
+        storage_size: None,                  // None → 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
     };
 
     ServiceImageConfig {

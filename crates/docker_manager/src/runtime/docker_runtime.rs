@@ -5,9 +5,9 @@
 
 use async_trait::async_trait;
 use container_runtime_api::{
-    AppPortStatus, ContainerCreateParams, ContainerRuntime, ContainerRuntimeError,
-    ContainerRuntimeResult, ContainerRuntimeStatus, DeploymentStatus, ExposeType,
-    RemovedContainerInfo, RuntimeContainerInfo,
+    ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
+    ContainerRuntimeStatus, DeploymentStatus, ExposeType, RemovedContainerInfo,
+    RuntimeContainerInfo,
 };
 use moka::future::Cache;
 use shared_types::{ContainerBasicInfo, ServiceType};
@@ -318,7 +318,11 @@ impl ContainerRuntime for DockerRuntime {
         let config = ContainerCreateBody {
             image: Some(image),
             cmd: params.command.clone(),
-            env: if env_vec.is_empty() { None } else { Some(env_vec) },
+            env: if env_vec.is_empty() {
+                None
+            } else {
+                Some(env_vec)
+            },
             labels: Some(labels),
             host_config: Some(host_config),
             ..Default::default()
@@ -433,14 +437,22 @@ impl ContainerRuntime for DockerRuntime {
         let client = self.inner.get_docker_client();
         let inspect = match client.inspect_container(&name, None).await {
             Ok(i) => i,
-            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
                 return Ok(None);
             }
             Err(e) => {
-                return Err(ContainerRuntimeError::ConnectionError(format!("inspect: {e}")))
+                return Err(ContainerRuntimeError::ConnectionError(format!(
+                    "inspect: {e}"
+                )));
             }
         };
-        let running = inspect.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+        let running = inspect
+            .state
+            .as_ref()
+            .and_then(|s| s.running)
+            .unwrap_or(false);
         let ip = inspect
             .network_settings
             .as_ref()

@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// 应用端口运行时状态（来自 container-runtime-api，含实际分配的对外端口）
+pub use container_runtime_api::AppPortStatus;
+
 // ============================================================================
 // 请求模型
 // ============================================================================
@@ -173,6 +176,10 @@ pub enum AppStatus {
 }
 
 /// 应用信息
+///
+/// 仅在 `create_app` 时返回完整字段（rcoder 此时持有请求参数）。
+/// 后续读路径（get/start/stop/restart）返回 [`AppRuntimeInfo`]——rcoder 是无状态的应用
+/// pod 引擎，业务元数据（name/image/command/env 等）由调用方（Java）持久化。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppInfo {
     pub app_id: String,
@@ -187,6 +194,37 @@ pub struct AppInfo {
     pub env: HashMap<String, String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// 应用运行时信息（rcoder 实时从集群查询）
+///
+/// 只含运行时字段（phase/副本/Pod IP/端口状态/访问地址），**不含业务元数据**。
+/// 由 [`crate::app_manager::AppService`] 调用 `ContainerRuntime::get_deployment_status` /
+/// `list_deployments` 实时组装，rcoder 重启后仍可查询（真正无状态）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AppRuntimeInfo {
+    /// 应用 ID
+    pub app_id: String,
+    /// 应用状态（由运行时 phase 映射）
+    pub status: AppStatus,
+    /// 运行时阶段原始值：Running/Stopped/Starting/Error 等
+    pub phase: String,
+    /// 期望副本数
+    pub replicas: i32,
+    /// 就绪副本数
+    pub ready_replicas: i32,
+    /// 重启次数
+    pub restart_count: u32,
+    /// Pod IP（K8s）/ 容器 IP（Docker）
+    pub pod_ip: Option<String>,
+    /// 所在节点（仅 K8s）
+    pub node: Option<String>,
+    /// 启动时间（RFC3339）
+    pub started_at: Option<String>,
+    /// 端口运行时状态（含实际分配的对外端口：K8s NodePort / Docker host_port）
+    pub ports: Vec<AppPortStatus>,
+    /// 访问信息
+    pub access: AccessInfo,
 }
 
 /// 访问信息

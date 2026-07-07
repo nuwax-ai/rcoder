@@ -7,43 +7,56 @@ use super::models::*;
 
 /// 应用服务 trait
 ///
-/// 定义应用生命周期管理的统一接口，支持 Docker 和 K8s 两种实现
+/// 定义应用生命周期管理的统一接口。rcoder 是无状态的应用 pod 引擎：
+/// - 写操作（create/start/stop/restart/delete）转调 `ContainerRuntime` 的 Deployment 能力；
+/// - 读操作（get/query/list_runtimes）实时查集群，返回 [`AppRuntimeInfo`]（运行时数据），
+///   业务元数据由调用方（Java）持久化。
 #[async_trait]
 pub trait AppServiceTrait: Send + Sync {
-    /// 创建应用
+    /// 创建应用（返回完整 [`AppInfo`]，rcoder 此时持有请求参数）
     async fn create_app(&self, request: CreateAppRequest) -> Result<AppInfo>;
 
-    /// 查询应用列表
-    async fn query_apps(&self, request: QueryAppsRequest) -> Result<PaginatedResponse<AppInfo>>;
+    /// 查询应用列表（实时查集群 + 过滤/分页；仅 status/app_ids 过滤生效，
+    /// name/created_at 过滤需要业务元数据，由 Java 侧完成）
+    async fn query_apps(
+        &self,
+        request: QueryAppsRequest,
+    ) -> Result<PaginatedResponse<AppRuntimeInfo>>;
 
-    /// 获取应用详情
-    async fn get_app(&self, app_id: &str) -> Result<AppInfo>;
+    /// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
+    ///
+    /// 供 Java 在 rcoder/自身重启后对账（rcoder 不持久化 app 元数据）。
+    async fn list_app_runtimes(&self) -> Result<Vec<AppRuntimeInfo>>;
 
-    /// 更新应用配置
-    async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> Result<AppInfo>;
+    /// 获取应用运行时详情（实时查集群）
+    async fn get_app(&self, app_id: &str) -> Result<AppRuntimeInfo>;
 
-    /// 删除应用
+    /// 更新应用配置（rcoder 无状态：仅返回运行时数据，业务字段更新由 Java 持久化；
+    /// 若需要重建 Deployment，调用方应 delete + create）
+    async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> Result<AppRuntimeInfo>;
+
+    /// 删除应用（删除 Deployment 及关联资源 + 清理工作空间目录）
     async fn delete_app(&self, app_id: &str) -> Result<()>;
 
-    /// 启动应用
-    async fn start_app(&self, app_id: &str) -> Result<AppInfo>;
+    /// 启动应用（scale replicas = 1）
+    async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo>;
 
-    /// 停止应用
-    async fn stop_app(&self, app_id: &str) -> Result<AppInfo>;
+    /// 停止应用（scale replicas = 0）
+    async fn stop_app(&self, app_id: &str) -> Result<AppRuntimeInfo>;
 
-    /// 重启应用
-    async fn restart_app(&self, app_id: &str) -> Result<AppInfo>;
+    /// 重启应用（rollout restart）
+    async fn restart_app(&self, app_id: &str) -> Result<AppRuntimeInfo>;
 
-    /// 获取应用日志
+    /// 获取应用日志（读取共享工作空间的 logs/app.log）
     async fn get_app_logs(&self, app_id: &str, params: LogParams) -> Result<Vec<LogEntry>>;
 
-    /// 获取资源使用情况
+    /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
     async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats>;
 
-    /// 获取应用事件
+    /// 获取应用事件（best-effort：当前返回空，TODO 接 K8s events）
     async fn get_app_events(&self, app_id: &str) -> Result<Vec<String>>;
 
-    /// 上传文件
+    /// 上传文件（写入共享工作空间 code 目录）
     async fn upload_file(
         &self,
         app_id: &str,
@@ -51,9 +64,9 @@ pub trait AppServiceTrait: Send + Sync {
         target: &str,
     ) -> Result<UploadResult>;
 
-    /// 列出文件
+    /// 列出文件（读取共享工作空间 code 目录）
     async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>>;
 
-    /// 删除文件
+    /// 删除文件（限应用 code 目录内）
     async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()>;
 }

@@ -667,9 +667,7 @@ impl DockerManager {
                         shared_types::HTTP_DEFAULT_PORT
                     }
                     // UserApp 端口不固定，此处仅兜底；实际端口由 app_manager 管理
-                    Some(shared_types::ServiceType::UserApp) => {
-                        shared_types::GRPC_DEFAULT_PORT
-                    }
+                    Some(shared_types::ServiceType::UserApp) => shared_types::GRPC_DEFAULT_PORT,
                     None => shared_types::GRPC_DEFAULT_PORT,
                 };
 

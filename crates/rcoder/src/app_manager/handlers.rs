@@ -20,6 +20,23 @@ pub struct AppManagerState {
     pub app_service: Arc<dyn super::AppServiceTrait>,
 }
 
+/// 由运行时信息派生健康信息（AppRuntimeInfo → HealthInfo）
+fn health_from_runtime(info: &AppRuntimeInfo) -> HealthInfo {
+    HealthInfo {
+        status: info.phase.clone(),
+        instance: Some(InstanceInfo {
+            name: format!("rcoder-app-{}", info.app_id),
+            phase: info.phase.clone(),
+            ready: info.ready_replicas > 0,
+            restart_count: info.restart_count,
+            node: info.node.clone().unwrap_or_default(),
+            ip: info.pod_ip.clone().unwrap_or_default(),
+            started_at: info.started_at.clone(),
+        }),
+        probes: None,
+    }
+}
+
 // ============================================================================
 // 应用生命周期
 // ============================================================================
@@ -41,24 +58,22 @@ pub async fn create_app(
     State(state): State<Arc<AppManagerState>>,
     Json(request): Json<CreateAppRequest>,
 ) -> Result<Json<HttpResult<AppInfo>>, AppError> {
-    info!("创建应用: {}", request.name);
-
+    info!("[APP] 创建应用: {}", request.name);
     let app_info = state
         .app_service
         .create_app(request)
         .await
         .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
-
     Ok(Json(HttpResult::success(app_info)))
 }
 
-/// 查询应用列表
+/// 查询应用列表（实时查集群 + 过滤/分页；仅 status/app_ids 过滤生效）
 #[utoipa::path(
     post,
     path = "/api/v1/apps/query",
     request_body = QueryAppsRequest,
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<AppInfo>>)
+        (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<AppRuntimeInfo>>)
     ),
     tag = "应用管理"
 )]
@@ -66,19 +81,41 @@ pub async fn create_app(
 pub async fn query_apps(
     State(state): State<Arc<AppManagerState>>,
     Json(request): Json<QueryAppsRequest>,
-) -> Result<Json<HttpResult<PaginatedResponse<AppInfo>>>, AppError> {
-    info!("查询应用列表");
-
+) -> Result<Json<HttpResult<PaginatedResponse<AppRuntimeInfo>>>, AppError> {
+    info!("[APP] 查询应用列表");
     let response = state
         .app_service
         .query_apps(request)
         .await
         .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
-
     Ok(Json(HttpResult::success(response)))
 }
 
-/// 获取应用详情
+/// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
+///
+/// 供 Java 在 rcoder/自身重启后对账（rcoder 不持久化 app 元数据）。
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/runtime",
+    responses(
+        (status = 200, description = "对账成功", body = HttpResult<Vec<AppRuntimeInfo>>)
+    ),
+    tag = "应用管理"
+)]
+#[instrument(skip(state))]
+pub async fn list_app_runtimes(
+    State(state): State<Arc<AppManagerState>>,
+) -> Result<Json<HttpResult<Vec<AppRuntimeInfo>>>, AppError> {
+    info!("[APP] 对账查询：列出所有应用运行时状态");
+    let runtimes = state
+        .app_service
+        .list_app_runtimes()
+        .await
+        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+    Ok(Json(HttpResult::success(runtimes)))
+}
+
+/// 获取应用运行时详情（实时查集群）
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}",
@@ -86,7 +123,7 @@ pub async fn query_apps(
         ("app_id" = String, Path, description = "应用 ID")
     ),
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<AppInfo>),
+        (status = 200, description = "查询成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "应用管理"
@@ -95,19 +132,20 @@ pub async fn query_apps(
 pub async fn get_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-) -> Result<Json<HttpResult<AppInfo>>, AppError> {
-    info!("获取应用详情: {}", app_id);
-
-    let app_info = state
+) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    info!("[APP] 获取应用运行时详情: {}", app_id);
+    let runtime = state
         .app_service
         .get_app(&app_id)
         .await
         .map_err(|e| AppError::not_found(&e.to_string()))?;
-
-    Ok(Json(HttpResult::success(app_info)))
+    Ok(Json(HttpResult::success(runtime)))
 }
 
 /// 更新应用配置
+///
+/// rcoder 无状态：仅返回当前运行时状态。如需应用变更（image/env 等），调用方应
+/// delete + create。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/update",
@@ -116,7 +154,7 @@ pub async fn get_app(
     ),
     request_body = UpdateAppRequest,
     responses(
-        (status = 200, description = "更新成功", body = HttpResult<AppInfo>),
+        (status = 200, description = "更新成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "应用管理"
@@ -126,16 +164,14 @@ pub async fn update_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
     Json(request): Json<UpdateAppRequest>,
-) -> Result<Json<HttpResult<AppInfo>>, AppError> {
-    info!("更新应用配置: {}", app_id);
-
-    let app_info = state
+) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    info!("[APP] 更新应用配置: {}", app_id);
+    let runtime = state
         .app_service
         .update_app(&app_id, request)
         .await
         .map_err(|e| AppError::not_found(&e.to_string()))?;
-
-    Ok(Json(HttpResult::success(app_info)))
+    Ok(Json(HttpResult::success(runtime)))
 }
 
 /// 删除应用
@@ -156,14 +192,12 @@ pub async fn delete_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    info!("删除应用: {}", app_id);
-
+    info!("[APP] 删除应用: {}", app_id);
     state
         .app_service
         .delete_app(&app_id)
         .await
-        .map_err(|e| AppError::not_found(&e.to_string()))?;
-
+        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
     Ok(Json(HttpResult::success("删除成功".to_string())))
 }
 
@@ -171,7 +205,7 @@ pub async fn delete_app(
 // 应用操作
 // ============================================================================
 
-/// 启动应用
+/// 启动应用（scale replicas = 1）
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/start",
@@ -179,9 +213,8 @@ pub async fn delete_app(
         ("app_id" = String, Path, description = "应用 ID")
     ),
     responses(
-        (status = 200, description = "启动成功", body = HttpResult<AppInfo>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>),
-        (status = 409, description = "应用已在运行", body = HttpResult<String>)
+        (status = 200, description = "启动成功", body = HttpResult<AppRuntimeInfo>),
+        (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "应用管理"
 )]
@@ -189,21 +222,17 @@ pub async fn delete_app(
 pub async fn start_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-) -> Result<Json<HttpResult<AppInfo>>, AppError> {
-    info!("启动应用: {}", app_id);
-
-    let app_info = state.app_service.start_app(&app_id).await.map_err(|e| {
-        if e.to_string().contains("已在运行") {
-            AppError::conflict(&e.to_string())
-        } else {
-            AppError::not_found(&e.to_string())
-        }
-    })?;
-
-    Ok(Json(HttpResult::success(app_info)))
+) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    info!("[APP] 启动应用: {}", app_id);
+    let runtime = state
+        .app_service
+        .start_app(&app_id)
+        .await
+        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+    Ok(Json(HttpResult::success(runtime)))
 }
 
-/// 停止应用
+/// 停止应用（scale replicas = 0）
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/stop",
@@ -211,9 +240,8 @@ pub async fn start_app(
         ("app_id" = String, Path, description = "应用 ID")
     ),
     responses(
-        (status = 200, description = "停止成功", body = HttpResult<AppInfo>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>),
-        (status = 409, description = "应用未在运行", body = HttpResult<String>)
+        (status = 200, description = "停止成功", body = HttpResult<AppRuntimeInfo>),
+        (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "应用管理"
 )]
@@ -221,21 +249,17 @@ pub async fn start_app(
 pub async fn stop_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-) -> Result<Json<HttpResult<AppInfo>>, AppError> {
-    info!("停止应用: {}", app_id);
-
-    let app_info = state.app_service.stop_app(&app_id).await.map_err(|e| {
-        if e.to_string().contains("未在运行") {
-            AppError::conflict(&e.to_string())
-        } else {
-            AppError::not_found(&e.to_string())
-        }
-    })?;
-
-    Ok(Json(HttpResult::success(app_info)))
+) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    info!("[APP] 停止应用: {}", app_id);
+    let runtime = state
+        .app_service
+        .stop_app(&app_id)
+        .await
+        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+    Ok(Json(HttpResult::success(runtime)))
 }
 
-/// 重启应用
+/// 重启应用（rollout restart）
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/restart",
@@ -243,7 +267,7 @@ pub async fn stop_app(
         ("app_id" = String, Path, description = "应用 ID")
     ),
     responses(
-        (status = 200, description = "重启成功", body = HttpResult<AppInfo>),
+        (status = 200, description = "重启成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "应用管理"
@@ -252,16 +276,14 @@ pub async fn stop_app(
 pub async fn restart_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-) -> Result<Json<HttpResult<AppInfo>>, AppError> {
-    info!("重启应用: {}", app_id);
-
-    let app_info = state
+) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    info!("[APP] 重启应用: {}", app_id);
+    let runtime = state
         .app_service
         .restart_app(&app_id)
         .await
-        .map_err(|e| AppError::not_found(&e.to_string()))?;
-
-    Ok(Json(HttpResult::success(app_info)))
+        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+    Ok(Json(HttpResult::success(runtime)))
 }
 
 // ============================================================================
@@ -289,18 +311,16 @@ pub async fn get_app_logs(
     Path(app_id): Path<String>,
     Query(params): Query<LogParams>,
 ) -> Result<Json<HttpResult<Vec<LogEntry>>>, AppError> {
-    info!("获取应用日志: {}", app_id);
-
+    info!("[APP] 获取应用日志: {}", app_id);
     let logs = state
         .app_service
         .get_app_logs(&app_id, params)
         .await
         .map_err(|e| AppError::not_found(&e.to_string()))?;
-
     Ok(Json(HttpResult::success(logs)))
 }
 
-/// 获取应用健康状态
+/// 获取应用健康状态（由运行时状态派生）
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/health",
@@ -318,18 +338,16 @@ pub async fn get_app_health(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<HealthInfo>>, AppError> {
-    info!("获取应用健康状态: {}", app_id);
-
-    let app_info = state
+    info!("[APP] 获取应用健康状态: {}", app_id);
+    let runtime = state
         .app_service
         .get_app(&app_id)
         .await
         .map_err(|e| AppError::not_found(&e.to_string()))?;
-
-    Ok(Json(HttpResult::success(app_info.health)))
+    Ok(Json(HttpResult::success(health_from_runtime(&runtime))))
 }
 
-/// 获取应用资源使用
+/// 获取应用资源使用（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/stats",
@@ -347,18 +365,16 @@ pub async fn get_app_stats(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<ResourceStats>>, AppError> {
-    info!("获取应用资源使用: {}", app_id);
-
+    info!("[APP] 获取应用资源使用: {}", app_id);
     let stats = state
         .app_service
         .get_app_stats(&app_id)
         .await
         .map_err(|e| AppError::not_found(&e.to_string()))?;
-
     Ok(Json(HttpResult::success(stats)))
 }
 
-/// 获取应用事件
+/// 获取应用事件（best-effort：当前返回空，TODO 接 K8s events）
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/events",
@@ -376,14 +392,12 @@ pub async fn get_app_events(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<Vec<String>>>, AppError> {
-    info!("获取应用事件: {}", app_id);
-
+    info!("[APP] 获取应用事件: {}", app_id);
     let events = state
         .app_service
         .get_app_events(&app_id)
         .await
         .map_err(|e| AppError::not_found(&e.to_string()))?;
-
     Ok(Json(HttpResult::success(events)))
 }
 
@@ -411,7 +425,7 @@ pub async fn upload_file(
     Path(app_id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Json<HttpResult<UploadResult>>, AppError> {
-    info!("上传文件: {}", app_id);
+    info!("[APP] 上传文件: {}", app_id);
 
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
@@ -424,7 +438,6 @@ pub async fn upload_file(
         .map_err(|e| AppError::bad_request(&format!("解析上传文件失败: {}", e)))?
     {
         let name = field.name().unwrap_or("").to_string();
-
         match name.as_str() {
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
@@ -441,9 +454,7 @@ pub async fn upload_file(
                     .map_err(|e| AppError::bad_request(&format!("读取目标路径失败: {}", e)))?;
                 target_path = Some(data);
             }
-            _ => {
-                // 忽略未知字段
-            }
+            _ => {}
         }
     }
 
@@ -452,7 +463,6 @@ pub async fn upload_file(
     let name = file_name.unwrap_or_else(|| "uploaded_file".to_string());
     let target = target_path.unwrap_or_else(|| format!("code/{}", name));
 
-    // 调用服务层上传文件
     let result = state
         .app_service
         .upload_file(&app_id, data, &target)
@@ -480,14 +490,12 @@ pub async fn list_files(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<Vec<FileInfo>>>, AppError> {
-    info!("列出文件: {}", app_id);
-
+    info!("[APP] 列出文件: {}", app_id);
     let files = state
         .app_service
         .list_files(&app_id)
         .await
         .map_err(|e| AppError::not_found(&e.to_string()))?;
-
     Ok(Json(HttpResult::success(files)))
 }
 
@@ -506,13 +514,11 @@ pub async fn delete_file(
     Json(request): Json<DeleteFileRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
     let app_id = request.app_id.clone();
-    info!("删除文件: {}/{}", app_id, request.path);
-
+    info!("[APP] 删除文件: {}/{}", app_id, request.path);
     state
         .app_service
         .delete_file(&app_id, &request.path)
         .await
         .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
-
     Ok(Json(HttpResult::success("文件删除成功".to_string())))
 }

@@ -127,28 +127,16 @@ impl AppState {
                 anyhow::anyhow!("failed to initialize agent download manager: {}", e)
             })?);
 
-        // 初始化应用管理服务（根据 features flag 选择）
-        let app_service: Arc<dyn crate::app_manager::AppServiceTrait> = {
-            #[cfg(feature = "kubernetes")]
-            {
-                Arc::new(
-                    crate::app_manager::k8s_service::K8sAppService::new(
-                        config.app_manager.clone(),
-                        runtime.clone(),
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to initialize K8s app service: {}", e))?,
-                )
-            }
-            #[cfg(not(feature = "kubernetes"))]
-            {
-                Arc::new(
-                    crate::app_manager::service::AppService::new(config.app_manager.clone())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
-                )
-            }
-        };
+        // 初始化应用管理服务（Docker / K8s 统一构造，运行时由 access_mode 决定行为）
+        let app_service: Arc<dyn crate::app_manager::AppServiceTrait> = Arc::new(
+            crate::app_manager::service::AppService::new(
+                config.app_manager.clone(),
+                runtime.clone(),
+                pingora.clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
+        );
 
         Ok(Self {
             config,
@@ -722,6 +710,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             // 应用管理相关结构体
             app_manager::models::CreateAppRequest,
             app_manager::models::AppInfo,
+            app_manager::models::AppRuntimeInfo,
             app_manager::models::AppStatus,
             app_manager::models::QueryAppsRequest,
             app_manager::models::UpdateAppRequest,
@@ -729,7 +718,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             app_manager::models::LogEntry,
             app_manager::models::ResourceStats,
             app_manager::models::HealthInfo,
-            app_manager::models::PaginatedResponse<app_manager::models::AppInfo>,
+            app_manager::models::PaginatedResponse<app_manager::models::AppRuntimeInfo>,
+            container_runtime_api::AppPortStatus,
         )
     ),
     tags(

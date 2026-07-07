@@ -99,16 +99,12 @@ pub(crate) fn resolve_resource_limits_from_config(
     // configmap 中该 service_type 的默认资源限制（保底）
     // 注意：get_multi_image_config 返回 owned MultiImageConfig，需先绑定再借用，
     // 并在闭包内 clone 出 owned ServiceResourceLimits，避免返回指向临时值的悬垂引用。
-    let default_limits = state
-        .config
-        .docker_config
-        .as_ref()
-        .and_then(|dc| {
-            let multi_config = dc.get_multi_image_config();
-            multi_config
-                .get_service_config(service_type)
-                .map(|c| c.resource_limits.clone())
-        });
+    let default_limits = state.config.docker_config.as_ref().and_then(|dc| {
+        let multi_config = dc.get_multi_image_config();
+        multi_config
+            .get_service_config(service_type)
+            .map(|c| c.resource_limits.clone())
+    });
 
     // 来源标记，便于排查“资源限制静默丢失”问题（none=Pod 将无 resources，需警惕）
     let source = match (&default_limits, &api_limits) {
@@ -1427,11 +1423,8 @@ pub async fn pod_ensure(
                             container_identifier
                         );
 
-                        let resource_limits = resolve_resource_limits(
-                            &state,
-                            &service_type,
-                            request.resource_limits,
-                        );
+                        let resource_limits =
+                            resolve_resource_limits(&state, &service_type, request.resource_limits);
 
                         // 设置创建标记
                         state
@@ -1958,8 +1951,7 @@ pub async fn pod_restart(
     }
 
     // 4. 定义资源限制（API 入参优先，缺失字段回退 configmap 默认值）
-    let resource_limits =
-        resolve_resource_limits(&state, &service_type, request.resource_limits);
+    let resource_limits = resolve_resource_limits(&state, &service_type, request.resource_limits);
 
     // 5. 强制创建新容器
     info!(

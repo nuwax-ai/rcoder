@@ -250,7 +250,10 @@ pub async fn handle_chat(
         request_resource_limits: resolve_resource_limits_from_config(
             &state,
             &service_type,
-            request.agent_config.as_ref().and_then(|c| c.resource_limits.clone()),
+            request
+                .agent_config
+                .as_ref()
+                .and_then(|c| c.resource_limits.clone()),
         ),
         pod_id: request.pod_id.as_deref(),
         isolation_type: request.isolation_type.as_deref(),

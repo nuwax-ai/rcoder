@@ -43,8 +43,8 @@ impl<'a> AgentContainerStarter<'a> {
             tenant_id,
             space_id,
             storage_size: _, // Docker 模式忽略 storage_size，仅 K8s 模式使用
-            // UserApp 专用字段（image_override/command/env/ports/...）由
-            // DockerRuntime::create_deployment 处理，agent 路径忽略
+                             // UserApp 专用字段（image_override/command/env/ports/...）由
+                             // DockerRuntime::create_deployment 处理，agent 路径忽略
             ..
         } = params;
 

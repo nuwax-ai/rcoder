@@ -5,9 +5,11 @@
 
 /// 默认 PVC 存储大小（当请求未指定 storage_size 时使用）
 ///
-/// 50GB 配合 Ceph RBD 存储驱动，会强制限制用户数据大小。
+/// 10Gi 配合 cephfs 共享存储，作为「接口入参 resource_limits.storage_size」与
+/// 「config.yml resource_limits.storage_size」均未指定时的最终兜底
+/// （详见 K8sPvcOps::ensure_workspace_pvc）。
 #[cfg(feature = "kubernetes")]
-const DEFAULT_PVC_STORAGE_SIZE: &str = "50Gi";
+const DEFAULT_PVC_STORAGE_SIZE: &str = "10Gi";
 
 #[cfg(feature = "kubernetes")]
 use async_trait::async_trait;
