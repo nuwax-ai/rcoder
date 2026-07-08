@@ -12,6 +12,9 @@ services:
       - TZ=Asia/Shanghai
       - RCODER_PORT=${RCODER_PORT:-8090}
       - RUST_LOG=debug # 设置调试日志级别
+      # app_manager（UserApp）Docker 模式工作空间根（app-workspace 挂在 /app/app-workspace）；
+      # 不设则默认 /app/project_workspace/apps，与挂载点不符，文件管理/storage 会路径错
+      - RCODER_WORKSPACE_ROOT=/app/app-workspace
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}
       # 主容器禁用 ttyd（ttyd 在动态创建的容器中运行）

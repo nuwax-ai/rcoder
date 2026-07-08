@@ -49,6 +49,12 @@ spec:
               value: "project-workspace-pvc"
             - name: RCODER_WORKSPACE_ROOT
               value: "/app/project_workspace/workspace/apps"
+            # UserApp HTTP 端口经 Gateway（HTTPRoute）。本地 devspace 无真实 gateway 时
+            # HTTPRoute 创建会成功但 ResolvedRefs=False；TCP/存储/生命周期验证不受影响。
+            - name: RCODER_K8S_GATEWAY_NAME
+              value: "nuwax-gateway"
+            - name: RCODER_K8S_GATEWAY_NAMESPACE
+              value: "default"
           volumeMounts:
             - name: cargo-target
               mountPath: /app/target

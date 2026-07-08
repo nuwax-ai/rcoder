@@ -19,11 +19,11 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
-  # UserApp HTTPRoute（app_manager，经 Gateway）
+  # UserApp HTTPRoute（app_manager，经 Gateway；SSA apply 需 patch/update）
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes"]
-    verbs: ["create", "delete", "deletecollection", "get", "list", "watch"]
-  # UserApp env ConfigMap / 敏感变量 Secret（app_manager）
+    verbs: ["create", "delete", "deletecollection", "get", "list", "watch", "patch", "update"]
+  # UserApp env ConfigMap / 敏感变量 Secret（app_manager；SSA apply 需 patch/update）
   - apiGroups: [""]
     resources: ["configmaps", "secrets"]
-    verbs: ["create", "delete", "deletecollection", "get", "list", "watch"]
+    verbs: ["create", "delete", "deletecollection", "get", "list", "watch", "patch", "update"]
