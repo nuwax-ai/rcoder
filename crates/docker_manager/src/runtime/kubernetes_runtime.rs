@@ -814,9 +814,23 @@ impl ContainerRuntime for KubernetesRuntime {
     async fn get_container_info_by_identifier(
         &self,
         identifier: &str,
-        _service_type: &ServiceType,
+        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        self.get_container_info(identifier).await
+        let info = self.get_container_info(identifier).await?;
+        if info.is_some() {
+            // Self-heal：异常创建（如 OrbStack sandbox 超时）可能留下"pod 在、svc 丢"的不一致
+            // 状态——pod 重试后起来了，但 create_agent_service 那步没跑完。后续 Chat 走 svc
+            // FQDN `{pod}-svc:50051` 会 transport error → GRPC_ERROR。
+            // create_agent_service 幂等（先 get，存在即返回，缺失才建），此处补建缺失的 svc，
+            // 避免人工删 pod 介入。失败仅 warn（get 是读操作，svc 自愈失败不应阻塞读）。
+            if let Err(e) = self.create_agent_service(identifier, service_type).await {
+                warn!(
+                    "[K8S] self-heal: 补建 agent service 失败 identifier={}, service_type={:?} (non-fatal): {}",
+                    identifier, service_type, e
+                );
+            }
+        }
+        Ok(info)
     }
 
     async fn find_container(
