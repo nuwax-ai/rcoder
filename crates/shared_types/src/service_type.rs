@@ -248,7 +248,10 @@ mod tests {
     #[test]
     fn web_uses_project_id() {
         let st = ServiceType::WebAgentRunner;
-        assert_eq!(st.container_identifier(None, Some("u1"), Some("p1")), Ok("p1"));
+        assert_eq!(
+            st.container_identifier(None, Some("u1"), Some("p1")),
+            Ok("p1")
+        );
         // user_id 给了也不用
         assert_eq!(
             st.container_identifier(None, Some("u1"), None),
@@ -267,7 +270,10 @@ mod tests {
     #[test]
     fn computer_uses_user_id() {
         let st = ServiceType::ComputerAgentRunner;
-        assert_eq!(st.container_identifier(None, Some("u7"), Some("p1")), Ok("u7"));
+        assert_eq!(
+            st.container_identifier(None, Some("u7"), Some("p1")),
+            Ok("u7")
+        );
         assert_eq!(
             st.container_identifier(None, None, Some("p1")),
             Err(MissingIdentifier::UserId)
