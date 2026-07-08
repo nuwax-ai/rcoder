@@ -681,8 +681,9 @@ impl ContainerRuntime for KubernetesRuntime {
                         pod_name, existing_st, service_type
                     );
                     // stop_container_by_identifier 删 pod+svc+backend（PVC 保留，新 pod 复用数据）
-                    if let Err(e) =
-                        self.stop_container_by_identifier(identifier, &service_type).await
+                    if let Err(e) = self
+                        .stop_container_by_identifier(identifier, &service_type)
+                        .await
                     {
                         warn!(
                             "[K8S] Failed to stop mismatched pod {}: {} (will retry create anyway)",
@@ -818,14 +819,21 @@ impl ContainerRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         let info = self.get_container_info(identifier).await?;
         if info.is_some() {
-            // Self-heal：异常创建（如 OrbStack sandbox 超时）可能留下"pod 在、svc 丢"的不一致
-            // 状态——pod 重试后起来了，但 create_agent_service 那步没跑完。后续 Chat 走 svc
-            // FQDN `{pod}-svc:50051` 会 transport error → GRPC_ERROR。
-            // create_agent_service 幂等（先 get，存在即返回，缺失才建），此处补建缺失的 svc，
-            // 避免人工删 pod 介入。失败仅 warn（get 是读操作，svc 自愈失败不应阻塞读）。
+            // Self-heal：异常创建（如 OrbStack sandbox 超时）可能留下"pod 在、svc/backend 丢"
+            // 的不一致状态——pod 重试后起来了，但 create_agent_service / create_backend_crd 那
+            // 几步没跑完。后续 Chat 走 svc FQDN `{pod}-svc:50051` 会 transport error → GRPC_ERROR；
+            // 外部 Envoy 路由（VNC/终端）也因缺 backend CRD 进不来。
+            // 两者均幂等（先 get，存在即返回，缺失才建），此处补建缺失资源，避免人工删 pod 介入。
+            // 失败仅 warn（get 是读操作，自愈失败不应阻塞读；Envoy 未装时 backend CRD 也会 warn）。
             if let Err(e) = self.create_agent_service(identifier, service_type).await {
                 warn!(
                     "[K8S] self-heal: 补建 agent service 失败 identifier={}, service_type={:?} (non-fatal): {}",
+                    identifier, service_type, e
+                );
+            }
+            if let Err(e) = self.create_backend_crd(identifier, service_type).await {
+                warn!(
+                    "[K8S] self-heal: 补建 backend CRD 失败 identifier={}, service_type={:?} (non-fatal): {}",
                     identifier, service_type, e
                 );
             }
