@@ -274,6 +274,12 @@ impl ContainerRuntime for DockerRuntime {
         labels.insert("managed-by".to_string(), "rcoder-app-manager".to_string());
         labels.insert("app-id".to_string(), app_id.clone());
         labels.insert("service-type".to_string(), ServiceType::UserApp.to_string());
+        if let Some(t) = &params.tenant_id {
+            labels.insert("tenant".to_string(), t.clone());
+        }
+        if let Some(s) = &params.space_id {
+            labels.insert("space".to_string(), s.clone());
+        }
 
         // TCP port_bindings（host_port=None 让 Docker 自动分配）
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();

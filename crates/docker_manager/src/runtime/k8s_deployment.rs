@@ -30,7 +30,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 #[cfg(feature = "kubernetes")]
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 #[cfg(feature = "kubernetes")]
@@ -94,8 +94,18 @@ impl KubernetesRuntime {
             .unwrap_or_else(|_| format!("{}-rcoder-workspace", self.namespace))
     }
 
-    /// 构建 app 专用 label（与 agent 物理隔离）
-    fn build_app_labels(&self, app_id: &str) -> BTreeMap<String, String> {
+    /// 构建 app 专用 label（与 agent 物理隔离）。
+    ///
+    /// `tenant_id`/`space_id` 作为可选标签加入（供 label 过滤/对账）。
+    /// **注意**：Deployment/Service 的 `.spec.selector` 必须用稳定 core（不含 tenant/space），
+    /// 因为 selector 创建后不可变；tenant/space 若变更会导致 SSA apply 冲突。故 selector 一律
+    /// 调 `build_app_labels(app_id, None, None)` 取 core，metadata/template 才用 full。
+    fn build_app_labels(
+        &self,
+        app_id: &str,
+        tenant_id: Option<&str>,
+        space_id: Option<&str>,
+    ) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
         labels.insert(format!("{}/name", APP_LABEL_PREFIX), "user-app".to_string());
         labels.insert(format!("{}/instance", APP_LABEL_PREFIX), app_id.to_string());
@@ -111,7 +121,24 @@ impl KubernetesRuntime {
             format!("{}/app-id", RCODER_LABEL_PREFIX),
             app_id.to_string(),
         );
+        if let Some(t) = tenant_id {
+            labels.insert(format!("{}/tenant", RCODER_LABEL_PREFIX), t.to_string());
+        }
+        if let Some(s) = space_id {
+            labels.insert(format!("{}/space", RCODER_LABEL_PREFIX), s.to_string());
+        }
         labels
+    }
+
+    /// Server-Side Apply 参数：`field_manager=rcoder-app-manager` 标识字段 owner，
+    /// `force=true` 允许从其他 manager 接管字段（controller 应总是 force，见 operator-rs）。
+    /// 让 create-or-update 自然合一：不存在则创建，存在则按字段级三方合并收敛。
+    fn ssa_patch_params() -> PatchParams {
+        PatchParams {
+            field_manager: Some(APP_MANAGED_BY.to_string()),
+            force: true,
+            ..Default::default()
+        }
     }
 
     fn pods_api(&self) -> Api<k8s_openapi::api::core::v1::Pod> {
@@ -134,34 +161,44 @@ impl KubernetesRuntime {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
-    /// 创建 ConfigMap（存 env，非敏感）
-    async fn create_app_configmap(
+    /// apply ConfigMap（存 env，非敏感）—— SSA create-or-update
+    async fn apply_app_configmap(
         &self,
         app_id: &str,
         env: &std::collections::HashMap<String, String>,
+        tenant_id: Option<&str>,
+        space_id: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         let cm = ConfigMap {
             metadata: ObjectMeta {
                 name: Some(self.app_config_name(app_id)),
                 namespace: Some(self.namespace.clone()),
-                labels: Some(self.build_app_labels(app_id)),
+                labels: Some(self.build_app_labels(app_id, tenant_id, space_id)),
                 ..Default::default()
             },
             data: Some(env.clone().into_iter().collect()),
             ..Default::default()
         };
+        let body = serde_json::to_value(&cm)
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize configmap: {e}")))?;
         self.configmaps_api()
-            .create(&PostParams::default(), &cm)
+            .patch(
+                &self.app_config_name(app_id),
+                &Self::ssa_patch_params(),
+                &Patch::Apply(body),
+            )
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("create configmap: {e}")))?;
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply configmap: {e}")))?;
         Ok(())
     }
 
-    /// 创建 Secret（存 secrets，敏感）
-    async fn create_app_secret(
+    /// apply Secret（存 secrets，敏感）—— SSA create-or-update
+    async fn apply_app_secret(
         &self,
         app_id: &str,
         secrets: &std::collections::HashMap<String, String>,
+        tenant_id: Option<&str>,
+        space_id: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         // K8s Secret data 需要 base64；StringData 更方便
         use k8s_openapi::api::core::v1::Secret;
@@ -169,16 +206,22 @@ impl KubernetesRuntime {
             metadata: ObjectMeta {
                 name: Some(self.app_secret_name(app_id)),
                 namespace: Some(self.namespace.clone()),
-                labels: Some(self.build_app_labels(app_id)),
+                labels: Some(self.build_app_labels(app_id, tenant_id, space_id)),
                 ..Default::default()
             },
             string_data: Some(secrets.clone().into_iter().collect()),
             ..Default::default()
         };
+        let body = serde_json::to_value(&secret)
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize secret: {e}")))?;
         self.secrets_api()
-            .create(&PostParams::default(), &secret)
+            .patch(
+                &self.app_secret_name(app_id),
+                &Self::ssa_patch_params(),
+                &Patch::Apply(body),
+            )
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("create secret: {e}")))?;
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply secret: {e}")))?;
         Ok(())
     }
 
@@ -194,7 +237,11 @@ impl KubernetesRuntime {
             )
         })?;
 
-        let labels = self.build_app_labels(app_id);
+        let tenant_id = params.tenant_id.as_deref();
+        let space_id = params.space_id.as_deref();
+        // selector 用稳定 core（创建后不可变），metadata/template 用 full（含 tenant/space）
+        let selector_labels = self.build_app_labels(app_id, None, None);
+        let full_labels = self.build_app_labels(app_id, tenant_id, space_id);
 
         // 端口
         let ports: Vec<ContainerPort> = params
@@ -319,18 +366,18 @@ impl KubernetesRuntime {
             metadata: ObjectMeta {
                 name: Some(self.app_deployment_name(app_id)),
                 namespace: Some(self.namespace.clone()),
-                labels: Some(labels.clone()),
+                labels: Some(full_labels.clone()),
                 ..Default::default()
             },
             spec: Some(DeploymentSpec {
                 replicas: Some(1),
                 selector: LabelSelector {
-                    match_labels: Some(labels.clone()),
+                    match_labels: Some(selector_labels),
                     ..Default::default()
                 },
                 template: PodTemplateSpec {
                     metadata: Some(ObjectMeta {
-                        labels: Some(labels),
+                        labels: Some(full_labels),
                         ..Default::default()
                     }),
                     spec: Some(pod_spec),
@@ -342,8 +389,8 @@ impl KubernetesRuntime {
         Ok(deployment)
     }
 
-    /// 创建 ClusterIP Service（暴露 app 端口，供 HTTPRoute backendRef / 集群内访问）
-    async fn create_app_service(
+    /// apply ClusterIP Service（暴露 app 端口）—— SSA create-or-update
+    async fn apply_app_service(
         &self,
         app_id: &str,
         params: &ContainerCreateParams,
@@ -366,35 +413,46 @@ impl KubernetesRuntime {
         if ports.is_empty() {
             return Ok(());
         }
+        let tenant_id = params.tenant_id.as_deref();
+        let space_id = params.space_id.as_deref();
         let svc = Service {
             metadata: ObjectMeta {
                 name: Some(self.app_service_name(app_id)),
                 namespace: Some(self.namespace.clone()),
-                labels: Some(self.build_app_labels(app_id)),
+                labels: Some(self.build_app_labels(app_id, tenant_id, space_id)),
                 ..Default::default()
             },
             spec: Some(ServiceSpec {
                 type_: Some("ClusterIP".to_string()),
-                selector: Some(self.build_app_labels(app_id)),
+                // selector 用稳定 core（创建后不可变）
+                selector: Some(self.build_app_labels(app_id, None, None)),
                 ports: Some(ports),
                 ..Default::default()
             }),
             ..Default::default()
         };
+        let body = serde_json::to_value(&svc)
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize service: {e}")))?;
         self.services_api()
-            .create(&PostParams::default(), &svc)
+            .patch(
+                &self.app_service_name(app_id),
+                &Self::ssa_patch_params(),
+                &Patch::Apply(body),
+            )
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("create app service: {e}")))?;
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply app service: {e}")))?;
         Ok(())
     }
 
-    /// 创建 HTTPRoute（HTTP 端口 → Gateway），path prefix `/apps/{app_id}`
-    async fn create_app_httproute(
+    /// apply HTTPRoute（HTTP 端口 → Gateway）—— SSA create-or-update，path prefix `/apps/{app_id}`
+    async fn apply_app_httproute(
         &self,
         app_id: &str,
         gateway_name: &str,
         gateway_namespace: &str,
         http_port: u16,
+        tenant_id: Option<&str>,
+        space_id: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
         let api_resource = ApiResource::from_gvk(&gvk);
@@ -407,7 +465,7 @@ impl KubernetesRuntime {
             "metadata": {
                 "name": self.app_http_route_name(app_id),
                 "namespace": self.namespace,
-                "labels": self.build_app_labels(app_id),
+                "labels": self.build_app_labels(app_id, tenant_id, space_id),
             },
             "spec": {
                 "parentRefs": [{
@@ -430,22 +488,24 @@ impl KubernetesRuntime {
         });
 
         routes
-            .create(
-                &PostParams::default(),
-                &serde_json::from_value(route).map_err(|e| {
-                    ContainerRuntimeError::K8sError(format!("parse httproute: {e}"))
-                })?,
+            .patch(
+                &self.app_http_route_name(app_id),
+                &Self::ssa_patch_params(),
+                &Patch::Apply(route),
             )
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("create httproute: {e}")))?;
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply httproute: {e}")))?;
         Ok(())
     }
 
-    /// 创建 NodePort Service（TCP 端口对外暴露），返回实际分配的 node_port 列表
-    async fn create_app_nodeport(
+    /// apply NodePort Service（TCP 端口对外暴露）—— SSA create-or-update，
+    /// 返回实际分配的 node_port 列表（server 分配，apply 后从返回对象读取）
+    async fn apply_app_nodeport(
         &self,
         app_id: &str,
         tcp_ports: &[AppPortSpec],
+        tenant_id: Option<&str>,
+        space_id: Option<&str>,
     ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
         if tcp_ports.is_empty() {
             return Ok(vec![]);
@@ -464,22 +524,29 @@ impl KubernetesRuntime {
             metadata: ObjectMeta {
                 name: Some(self.app_nodeport_name(app_id)),
                 namespace: Some(self.namespace.clone()),
-                labels: Some(self.build_app_labels(app_id)),
+                labels: Some(self.build_app_labels(app_id, tenant_id, space_id)),
                 ..Default::default()
             },
             spec: Some(ServiceSpec {
                 type_: Some("NodePort".to_string()),
-                selector: Some(self.build_app_labels(app_id)),
+                // selector 用稳定 core（创建后不可变）
+                selector: Some(self.build_app_labels(app_id, None, None)),
                 ports: Some(service_ports),
                 ..Default::default()
             }),
             ..Default::default()
         };
+        let body = serde_json::to_value(&svc)
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize nodeport: {e}")))?;
         let created = self
             .services_api()
-            .create(&PostParams::default(), &svc)
+            .patch(
+                &self.app_nodeport_name(app_id),
+                &Self::ssa_patch_params(),
+                &Patch::Apply(body),
+            )
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("create nodeport: {e}")))?;
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply nodeport: {e}")))?;
 
         // 提取实际分配的 node_port
         let mut result = vec![];
@@ -500,7 +567,29 @@ impl KubernetesRuntime {
         Ok(result)
     }
 
-    /// 创建 UserApp 的全部 K8s 资源：ConfigMap/Secret/Deployment/Service/HTTPRoute/NodePort
+    /// apply Deployment（SSA create-or-update）。抽出供 create_app_resources 与
+    /// patch_deployment（Phase 3）复用。
+    async fn apply_app_deployment(
+        &self,
+        app_id: &str,
+        params: &ContainerCreateParams,
+    ) -> ContainerRuntimeResult<()> {
+        let deployment = self.build_app_deployment(app_id, params)?;
+        let body = serde_json::to_value(&deployment)
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize deployment: {e}")))?;
+        self.deployments_api()
+            .patch(
+                &self.app_deployment_name(app_id),
+                &Self::ssa_patch_params(),
+                &Patch::Apply(body),
+            )
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("apply deployment: {e}")))?;
+        Ok(())
+    }
+
+    /// 创建 UserApp 的全部 K8s 资源（SSA apply，幂等 create-or-update）：
+    /// ConfigMap/Secret/Service/Deployment/HTTPRoute/NodePort。
     pub async fn create_app_resources(
         &self,
         app_id: &str,
@@ -508,27 +597,27 @@ impl KubernetesRuntime {
         gateway_name: Option<&str>,
         gateway_namespace: Option<&str>,
     ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
+        let tenant_id = params.tenant_id.as_deref();
+        let space_id = params.space_id.as_deref();
         // 1. ConfigMap（env）
         if let Some(env) = &params.env
             && !env.is_empty()
         {
-            self.create_app_configmap(app_id, env).await?;
+            self.apply_app_configmap(app_id, env, tenant_id, space_id)
+                .await?;
         }
         // 2. Secret（secrets）
         if let Some(secrets) = &params.secrets
             && !secrets.is_empty()
         {
-            self.create_app_secret(app_id, secrets).await?;
+            self.apply_app_secret(app_id, secrets, tenant_id, space_id)
+                .await?;
         }
         // 3. Service（ClusterIP，所有端口；HTTPRoute 用它做 backendRef）
-        self.create_app_service(app_id, params).await?;
-        // 4. Deployment
-        let deployment = self.build_app_deployment(app_id, params)?;
-        self.deployments_api()
-            .create(&PostParams::default(), &deployment)
-            .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("create deployment: {e}")))?;
-        info!("[K8S-APP] Deployment created for app: {app_id}");
+        self.apply_app_service(app_id, params).await?;
+        // 4. Deployment（SSA apply）
+        self.apply_app_deployment(app_id, params).await?;
+        info!("[K8S-APP] Deployment applied for app: {app_id}");
         // 5. HTTPRoute（HTTP 端口）—— 失败降级：app 主体（Deployment）已创建不可回滚，
         // HTTPRoute 属暴露层（依赖 Gateway/CRD），失败时 warn + 跳过，不阻塞 app 创建。
         // 避免"Deployment 已建 + create_app 整体失败"导致调用方重试时 name 冲突。
@@ -538,7 +627,7 @@ impl KubernetesRuntime {
             && let Some(http_port) = ports.iter().find(|p| p.expose_type == ExposeType::Http)
         {
             match self
-                .create_app_httproute(app_id, gw, gw_ns, http_port.port)
+                .apply_app_httproute(app_id, gw, gw_ns, http_port.port, tenant_id, space_id)
                 .await
             {
                 Ok(_) => {
@@ -551,7 +640,7 @@ impl KubernetesRuntime {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "[K8S-APP] HTTPRoute 创建失败，app 主体已创建但 HTTP 入口暂不可用（待 Gateway/CRD 就绪后 reconcile）: {}",
+                        "[K8S-APP] HTTPRoute apply 失败，app 主体已创建但 HTTP 入口暂不可用（待 Gateway/CRD 就绪后 reconcile）: {}",
                         e
                     );
                 }
@@ -564,7 +653,9 @@ impl KubernetesRuntime {
                 .filter(|p| p.expose_type == ExposeType::Tcp)
                 .cloned()
                 .collect();
-            let nodeports = self.create_app_nodeport(app_id, &tcp_ports).await?;
+            let nodeports = self
+                .apply_app_nodeport(app_id, &tcp_ports, tenant_id, space_id)
+                .await?;
             external_ports.extend(nodeports);
         }
         Ok(external_ports)
