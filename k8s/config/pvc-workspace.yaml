@@ -1,0 +1,14 @@
+# app 工作空间共享卷（app_manager 的 UserApp 复用此 PVC 的 workspace/apps/{app_id} subPath）。
+# 名称须与 rcoder env RCODER_WORKSPACE_PVC_NAME 一致（deployment.yaml 已注入）。
+# 单文档（见 rbac.yaml 顶部说明）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: project-workspace-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-path

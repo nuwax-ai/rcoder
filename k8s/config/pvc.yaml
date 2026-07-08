@@ -1,3 +1,5 @@
+# cargo 构建缓存卷（rcoder 容器 /app/target 持久化，加速增量编译）。
+# 单文档（见 rbac.yaml 顶部说明）。app 工作空间卷见 pvc-workspace.yaml。
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -8,17 +10,4 @@ spec:
   resources:
     requests:
       storage: 20Gi
-  storageClassName: local-path
-
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: project-workspace-pvc
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
   storageClassName: local-path
