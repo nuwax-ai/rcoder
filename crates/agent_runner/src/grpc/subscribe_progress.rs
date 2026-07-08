@@ -20,9 +20,9 @@ use super::locale::locale_from_grpc_request;
 pub type SubscribeProgressStream =
     Pin<Box<dyn Stream<Item = Result<ProgressEvent, Status>> + Send>>;
 
-/// 空闲超时时间（5分钟）
+/// 空闲超时时间（30分钟）
 /// 如果在这个时间内没有收到任何真实消息（不包括心跳），则关闭流
-const IDLE_TIMEOUT_SECS: u64 = 300;
+const IDLE_TIMEOUT_SECS: u64 = 1800;
 
 /// 流退出原因，每个变体对应一个明确的退出路径
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
