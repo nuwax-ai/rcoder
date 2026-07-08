@@ -581,6 +581,73 @@ impl ContainerRuntime for DockerRuntime {
         }
         Ok(out)
     }
+
+    async fn stream_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+    ) -> ContainerRuntimeResult<container_runtime_api::mpsc::Receiver<ContainerLogEntry>> {
+        use bollard::container::LogOutput;
+        use bollard::query_parameters::LogsOptions;
+        use futures_util::StreamExt;
+
+        let name = app_deployment_name(app_id);
+        let client = self.inner.get_docker_client();
+        let app_id = app_id.to_string();
+        let timestamps = true;
+        let opts = LogsOptions {
+            stdout: true,
+            stderr: true,
+            tail: if tail > 0 {
+                tail.to_string()
+            } else {
+                "all".to_string()
+            },
+            follow: true,
+            timestamps,
+            ..Default::default()
+        };
+        let mut stream = client.logs(&name, Some(opts));
+        let (tx, rx) = container_runtime_api::mpsc::channel::<ContainerLogEntry>(64);
+        tokio::spawn(async move {
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(log) => {
+                        let stream_name = match &log {
+                            LogOutput::StdErr { .. } => "stderr",
+                            _ => "stdout",
+                        };
+                        let bytes = log.into_bytes();
+                        let text = String::from_utf8_lossy(&bytes);
+                        for line in text.lines() {
+                            let (ts, msg) =
+                                container_runtime_api::split_log_timestamp(line, timestamps);
+                            let entry = ContainerLogEntry {
+                                timestamp: ts,
+                                stream: stream_name.to_string(),
+                                message: msg,
+                            };
+                            if tx.send(entry).await.is_err() {
+                                return; // 客户端断开，receiver 已 drop
+                            }
+                        }
+                    }
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => {
+                        tracing::warn!("[DOCKER-APP] log stream 容器不存在: {app_id}");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("[DOCKER-APP] log stream 读失败 (终止): {e}");
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(rx)
+    }
 }
 
 impl DockerRuntime {

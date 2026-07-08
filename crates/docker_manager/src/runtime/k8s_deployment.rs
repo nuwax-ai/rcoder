@@ -1015,6 +1015,72 @@ impl KubernetesRuntime {
             .collect())
     }
 
+    /// 启动日志流（follow）：返回 mpsc::Receiver。内部 spawn 任务读 K8s `log_stream(follow)`，
+    /// 逐行 send 到 channel。receiver drop（客户端断开）→ send 出错 → 任务退出释放日志源。
+    pub async fn stream_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+    ) -> ContainerRuntimeResult<container_runtime_api::mpsc::Receiver<ContainerLogEntry>> {
+        use futures_util::{AsyncBufReadExt, StreamExt};
+        use kube::api::LogParams;
+
+        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
+        let pods = self.pods_api().list(&lp).await.map_err(|e| {
+            ContainerRuntimeError::K8sError(format!("list pods for log stream: {e}"))
+        })?;
+        let pod_name = pods
+            .items
+            .into_iter()
+            .next()
+            .and_then(|p| p.metadata.name.clone())
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(format!(
+                    "app {app_id} 当前无运行 Pod（可能已 stopped）"
+                ))
+            })?;
+        let timestamps = true;
+        let log_lp = LogParams {
+            tail_lines: if tail > 0 { Some(tail as i64) } else { None },
+            follow: true,
+            timestamps,
+            ..Default::default()
+        };
+        let reader = self
+            .pods_api()
+            .log_stream(&pod_name, &log_lp)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("log_stream: {e}")))?;
+        let (tx, rx) = container_runtime_api::mpsc::channel::<ContainerLogEntry>(64);
+        tokio::spawn(async move {
+            // kube log_stream 返回 futures_util::AsyncBufRead；lines() 返回 Stream<Item=io::Result<String>>。
+            // Box::pin 保证 Unpin（lines 需 Self: Unpin）。
+            let reader = Box::pin(reader);
+            let mut lines = reader.lines();
+            while let Some(result) = lines.next().await {
+                match result {
+                    Ok(line) => {
+                        let (ts, msg) =
+                            container_runtime_api::split_log_timestamp(&line, timestamps);
+                        let entry = ContainerLogEntry {
+                            timestamp: ts,
+                            stream: "stdout".to_string(),
+                            message: msg,
+                        };
+                        if tx.send(entry).await.is_err() {
+                            break; // 客户端断开，receiver 已 drop
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[K8S-APP] log_stream 读行失败 (终止流): {e}");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(rx)
+    }
+
     /// Deployment 对象 → DeploymentStatus（含关联 Pod 的实时信息）
     async fn deployment_to_status(&self, app_id: &str, deploy: &Deployment) -> DeploymentStatus {
         let spec = deploy.spec.as_ref();

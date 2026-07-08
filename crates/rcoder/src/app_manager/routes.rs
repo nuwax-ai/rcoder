@@ -28,6 +28,10 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
         // 查询接口
         .route("/api/v1/apps/{app_id}/logs", get(handlers::get_app_logs))
         .route(
+            "/api/v1/apps/{app_id}/logs/stream",
+            get(handlers::stream_app_logs),
+        )
+        .route(
             "/api/v1/apps/{app_id}/health",
             get(handlers::get_app_health),
         )

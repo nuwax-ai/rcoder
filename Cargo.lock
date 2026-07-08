@@ -1140,6 +1140,7 @@ dependencies = [
  "serde",
  "shared_types",
  "thiserror 2.0.18",
+ "tokio",
  "utoipa",
  "winnow 1.0.3",
 ]

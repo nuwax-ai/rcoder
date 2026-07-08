@@ -62,6 +62,13 @@ pub trait AppServiceTrait: Send + Sync {
     /// 获取应用日志（读取共享工作空间的 logs/app.log）
     async fn get_app_logs(&self, app_id: &str, params: LogParams) -> Result<Vec<LogEntry>>;
 
+    /// 启动日志流（follow），返回 mpsc::Receiver 供 WS handler 桥接（v2 §11）
+    async fn stream_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+    ) -> Result<container_runtime_api::mpsc::Receiver<container_runtime_api::ContainerLogEntry>>;
+
     /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
     async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats>;
 

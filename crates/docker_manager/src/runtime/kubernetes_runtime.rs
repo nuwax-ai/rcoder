@@ -1337,6 +1337,14 @@ impl ContainerRuntime for KubernetesRuntime {
         self.app_logs(app_id, tail, timestamps).await
     }
 
+    async fn stream_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+    ) -> ContainerRuntimeResult<container_runtime_api::mpsc::Receiver<ContainerLogEntry>> {
+        self.stream_app_logs(app_id, tail).await
+    }
+
     async fn validate_app_prerequisites(&self) -> ContainerRuntimeResult<()> {
         // RBAC 探测：list deployments（limit 1）。403 = ClusterRole 缺 apps/deployments 权限。
         // 明确报错指向部署侧 RBAC，避免创建 app 时静默 403。

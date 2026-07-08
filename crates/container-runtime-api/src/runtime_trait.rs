@@ -11,6 +11,8 @@ use winnow::ascii::float;
 use winnow::prelude::*;
 use winnow::token::rest;
 
+pub use tokio::sync::mpsc;
+
 /// Container runtime errors
 #[derive(Error, Debug)]
 pub enum ContainerRuntimeError {
@@ -584,6 +586,23 @@ pub trait ContainerRuntime: Send + Sync {
         let _ = (app_id, tail, timestamps);
         Err(ContainerRuntimeError::ConfigurationError(
             "get_app_logs not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// 启动日志**流**（follow），返回一个 mpsc::Receiver。
+    ///
+    /// runtime 内部 spawn 任务读取容器日志源（K8s `log_stream(follow)` / Docker `logs(follow)`），
+    /// 逐行 send 到 channel。**receiver drop 即取消**：客户端断开 → handler 退出 → receiver 析构
+    /// → runtime 任务的 send 出错 → 任务终止并释放日志源（服务端停止 follow）。
+    /// `tail` 为起始历史行数（0 = 不取历史，仅 follow 新行）。
+    async fn stream_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+    ) -> ContainerRuntimeResult<mpsc::Receiver<ContainerLogEntry>> {
+        let _ = (app_id, tail);
+        Err(ContainerRuntimeError::ConfigurationError(
+            "stream_app_logs not supported by this runtime".to_string(),
         ))
     }
 

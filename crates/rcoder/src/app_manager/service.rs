@@ -571,6 +571,22 @@ impl AppService {
             .collect())
     }
 
+    /// 启动日志流（follow），返回 mpsc::Receiver 供 WS handler 桥接（v2 §11）。
+    /// receiver drop 即取消：客户端断开 → handler 退出 → receiver 析构 → runtime 任务终止。
+    pub async fn stream_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+    ) -> Result<container_runtime_api::mpsc::Receiver<container_runtime_api::ContainerLogEntry>>
+    {
+        validate_app_id(app_id)?;
+        self.runtime
+            .stream_app_logs(app_id, tail)
+            .await
+            .map_err(|e| anyhow::anyhow!("启动日志流失败: {}", e))
+            .with_context(|| format!("[APP] stream_app_logs 失败 app_id={app_id}"))
+    }
+
     /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
     #[instrument(skip(self))]
     pub async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats> {
@@ -1284,6 +1300,15 @@ impl super::AppServiceTrait for AppService {
 
     async fn get_app_logs(&self, app_id: &str, params: LogParams) -> Result<Vec<LogEntry>> {
         self.get_app_logs(app_id, params).await
+    }
+
+    async fn stream_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+    ) -> Result<container_runtime_api::mpsc::Receiver<container_runtime_api::ContainerLogEntry>>
+    {
+        self.stream_app_logs(app_id, tail).await
     }
 
     async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats> {
