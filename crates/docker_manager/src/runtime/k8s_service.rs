@@ -135,7 +135,7 @@ pub(crate) trait K8sServiceOps {
     /// - noVNC 6080：Web VNC 访问
     /// - ttyd 7681：Web 终端访问
     ///
-    /// selector 使用与 Pod 相同的 labels（`managed-by=rcoder-runtime` + identifier label）。
+    /// selector 使用与 Pod 相同的 labels（`app.kubernetes.io/managed-by=rcoder-runtime` + identifier label）。
     /// 创建前先检查是否已存在，已存在则跳过。
     async fn create_agent_service(
         &self,

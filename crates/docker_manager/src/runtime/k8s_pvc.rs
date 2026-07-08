@@ -187,7 +187,7 @@ impl K8sPvcOps for KubernetesRuntime {
                 labels: Some({
                     let mut m = BTreeMap::new();
                     m.insert("app".to_string(), "rcoder".to_string());
-                    m.insert("managed-by".to_string(), "rcoder-runtime".to_string());
+                    m.insert("app.kubernetes.io/managed-by".to_string(), "rcoder-runtime".to_string());
                     m.insert("service_type".to_string(), service_type.to_string());
                     m
                 }),
