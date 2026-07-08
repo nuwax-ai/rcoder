@@ -802,6 +802,15 @@ impl AppService {
         if let Some(ar) = app_resources {
             builder = builder.app_resources(ar);
         }
+        // tenant/space：进 ContainerCreateParams → build_app_labels 打 rcoder.io/tenant、
+        // rcoder.io/space label（供对账/过滤）。此前 create 路径漏设，导致 create 出来的
+        // 资源缺这两个 label（只有 update 路径 build_container_params_from_update 设了）。
+        if let Some(t) = request.tenant_id.clone() {
+            builder = builder.tenant_id(t);
+        }
+        if let Some(s) = request.space_id.clone() {
+            builder = builder.space_id(s);
+        }
 
         Ok(builder.build())
     }
