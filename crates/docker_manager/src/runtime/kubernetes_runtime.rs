@@ -380,18 +380,14 @@ impl ContainerRuntime for KubernetesRuntime {
             ..
         } = params;
 
-        // 确定容器标识符：pod_id > user_id > project_id（与 Docker 模式一致）
+        // 确定容器标识符（复用 ServiceType::container_identifier 单一事实源，
+        // 与 docker 模式 / handler 层保持一致）。identifier 借自 pod_id/user_id/project_id 之一。
+        // ⚠️ 不要在此重写优先级逻辑，否则会与 handler 层不一致 → ensure/chat 造出不同名 pod+PVC。
         let project_id_val = project_id.clone().unwrap_or_default();
         let user_id_val = user_id.clone().unwrap_or_default();
-        let identifier = pod_id
-            .as_ref()
-            .or(user_id.as_ref())
-            .or(project_id.as_ref())
-            .ok_or_else(|| {
-                ContainerRuntimeError::ConfigurationError(
-                    "At least one of pod_id, user_id, or project_id must be provided".to_string(),
-                )
-            })?;
+        let identifier: &str = service_type
+            .container_identifier(pod_id.as_deref(), user_id.as_deref(), project_id.as_deref())
+            .map_err(|e| ContainerRuntimeError::ConfigurationError(e.to_string()))?;
 
         // Pod 名称：统一使用 pod_name() helper（含 RFC 1123 下划线清理）
         let pod_name = self.pod_name(identifier, &service_type)?;
@@ -492,14 +488,30 @@ impl ContainerRuntime for KubernetesRuntime {
                     // image 更新由主 Deployment 触发拉取（用户做 rollout restart 时），
                     // 主服务用新 image 启动后，动态 pod 跟着用同样的 image 引用。
                     image_pull_policy: Some("IfNotPresent".to_string()),
-                    // 启动命令由 orchestration 层显式指定，避免依赖镜像默认行为：
-                    //   - RCoder 服务类型：运行 agent_runner binary（gRPC 50051 + HTTP 8086）。
-                    //     注意 rcoder-master 镜像本身没有 CMD/ENTRYPOINT，必须显式指定。
-                    //   - ComputerAgentRunner 服务类型：使用镜像自己的 ENTRYPOINT（start-up.sh）。
+                    // 启动命令：
+                    //   - WebAgentRunner：从 config.yml 的 web-agent-runner.command 读取
+                    //     （与 docker-compose 一致）。配置里的 /app/agent-runner-start.sh wrapper
+                    //     会先 nohup 拉起 ttyd(7681)，再 exec agent_runner；agent_runner 的
+                    //     ws_terminal 中间层(17681)依赖 ttyd 就绪后才会 bind。若不读配置而裸跑
+                    //     agent_runner，ttyd 不启动 -> ws_terminal 等 7681 超时 abort ->
+                    //     /computer/terminal 终端 WS 连不上。配置缺失时回退裸 agent_runner
+                    //     （保留旧行为，至少 pod 能起；rcoder-master 镜像本身没有 CMD/ENTRYPOINT）。
+                    //   - ComputerAgentRunner：刻意用 None 走镜像自带 ENTRYPOINT(start-up.sh)。
+                    //     注意 config.yml 里 computer-agent-runner.command 写的是裸 agent_runner，
+                    //     那是给 docker 运行时用的；K8s 下若改读它会绕过 start-up.sh，丢失 ttyd/VNC，
+                    //     因此这里不复用 config.command。
                     command: match service_type {
-                        ServiceType::WebAgentRunner => {
-                            Some(vec!["/app/bin/agent_runner".to_string()])
-                        }
+                        ServiceType::WebAgentRunner => Some(
+                            service_config
+                                .and_then(|sc| {
+                                    if sc.command.is_empty() {
+                                        None
+                                    } else {
+                                        Some(sc.command.clone())
+                                    }
+                                })
+                                .unwrap_or_else(|| vec!["/app/bin/agent_runner".to_string()]),
+                        ),
                         // ComputerAgentRunner / UserApp 用镜像自带 ENTRYPOINT/CMD
                         // （UserApp 实际走 create_deployment，不经此路径）
                         ServiceType::ComputerAgentRunner | ServiceType::UserApp => None,

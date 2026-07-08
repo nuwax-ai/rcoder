@@ -79,33 +79,11 @@ impl<'a> AgentContainerStarter<'a> {
         // 3. 准备配置
         use crate::container_builder::ContainerConfigBuilder;
 
-        // 确定用于构建容器配置的主 ID
-        // 优先级：pod_id > user_id/project_id（根据 service_type）
-        let container_id: String = if let Some(ref pid) = pod_id {
-            // 共享容器场景：使用 pod_id
-            pid.clone()
-        } else {
-            // 非共享容器场景：根据 service_type 决定
-            match service_type {
-                ServiceType::ComputerAgentRunner => {
-                    // Computer Agent Runner 使用 user_id
-                    user_id.clone().ok_or_else(|| {
-                        DockerError::ConfigurationError(
-                            "user_id is required for ComputerAgentRunner".to_string(),
-                        )
-                    })?
-                }
-                // UserApp 的 container_id = app_id（由 app_manager 放入 project_id 字段位）
-                ServiceType::WebAgentRunner | ServiceType::UserApp => {
-                    // WebAgentRunner 使用 project_id
-                    project_id.clone().ok_or_else(|| {
-                        DockerError::ConfigurationError(
-                            "project_id is required for WebAgentRunner/UserApp".to_string(),
-                        )
-                    })?
-                }
-            }
-        };
+        // 确定用于构建容器配置的主 ID（复用 ServiceType::container_identifier 单一事实源）
+        let container_id: String = service_type
+            .container_identifier(pod_id.as_deref(), user_id.as_deref(), project_id.as_deref())
+            .map_err(|e| DockerError::ConfigurationError(e.to_string()))?
+            .to_string();
 
         // 解析容器内工作目录路径
         let mut variables = std::collections::HashMap::new();

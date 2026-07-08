@@ -195,13 +195,12 @@ fn container_identifier_for_service(
     project_id: &str,
     pod_id: Option<&str>,
 ) -> String {
-    if let Some(pid) = pod_id {
-        return pid.to_string();
-    }
-    match service_type {
-        ServiceType::WebAgentRunner | ServiceType::UserApp => project_id.to_string(),
-        ServiceType::ComputerAgentRunner => user_id.to_string(),
-    }
+    // 复用 ServiceType::container_identifier（单一事实源）。user_id/project_id 由调用方
+    // 保证非空（pod_ensure 已校验），故此处不会返回 Err。
+    service_type
+        .container_identifier(pod_id, Some(user_id), Some(project_id))
+        .expect("user_id/project_id guaranteed non-empty by caller validation")
+        .to_string()
 }
 
 /// 验证 K8s 存储大小格式与范围

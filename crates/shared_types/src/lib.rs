@@ -154,7 +154,8 @@ pub use service_config::{
     default_agent_runner_service_config, default_rcoder_service_config,
 };
 pub use service_type::{
-    ServiceType, ServiceTypeError, get_enabled_service_types, get_supported_service_types,
+    MissingIdentifier, ServiceType, ServiceTypeError, get_enabled_service_types,
+    get_supported_service_types,
 };
 
 // 隔离类型模块

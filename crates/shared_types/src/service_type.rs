@@ -90,6 +90,20 @@ impl std::str::FromStr for ServiceType {
     }
 }
 
+/// 计算容器标识符时缺少必需字段（由 [`ServiceType::container_identifier`] 返回）。
+///
+/// 各运行时（docker / k8s）调用方应将其 `map_err` 转成各自的错误类型
+/// （`DockerError::ConfigurationError` / `ContainerRuntimeError::ConfigurationError`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MissingIdentifier {
+    /// `ComputerAgentRunner` 需要 `user_id`
+    #[error("user_id is required for ComputerAgentRunner")]
+    UserId,
+    /// `WebAgentRunner` / `UserApp` 需要 `project_id`
+    #[error("project_id is required for WebAgentRunner/UserApp")]
+    ProjectId,
+}
+
 impl ServiceType {
     /// 获取服务类型的描述
     pub fn description(&self) -> &str {
@@ -128,6 +142,36 @@ impl ServiceType {
         } else {
             tracing::warn!("Service '{}' not found in config", service_key);
             false
+        }
+    }
+
+    /// 计算容器标识符（docker / k8s / handler 三处复用的**单一事实源**）。
+    ///
+    /// 优先级：
+    ///   - `pod_id` 存在（共享容器场景）→ 返回 `pod_id`
+    ///   - 否则按 service_type：
+    ///       [`ComputerAgentRunner`](ServiceType::ComputerAgentRunner) → `user_id`
+    ///       [`WebAgentRunner`](ServiceType::WebAgentRunner) | [`UserApp`](ServiceType::UserApp) → `project_id`
+    ///
+    /// 缺必需字段时返回 `Err(MissingIdentifier)`，由调用方转成各自的错误类型。
+    /// 返回借用（零分配）；调用方需要 owned 字符串自行 `.to_string()`。
+    ///
+    /// ⚠️ 不要在各运行时里重写这段优先级逻辑，否则会导致 ensure 与 chat 为同一项目
+    ///   造出不同名 pod + 不同 PVC（如 `rcoder-k8s-{user_id}` vs `rcoder-k8s-{project_id}`）。
+    pub fn container_identifier<'a>(
+        &self,
+        pod_id: Option<&'a str>,
+        user_id: Option<&'a str>,
+        project_id: Option<&'a str>,
+    ) -> Result<&'a str, MissingIdentifier> {
+        if let Some(pid) = pod_id {
+            return Ok(pid);
+        }
+        match self {
+            ServiceType::ComputerAgentRunner => user_id.ok_or(MissingIdentifier::UserId),
+            ServiceType::WebAgentRunner | ServiceType::UserApp => {
+                project_id.ok_or(MissingIdentifier::ProjectId)
+            }
         }
     }
 }
@@ -183,6 +227,67 @@ mod tests {
     use super::*;
     use crate::MultiImageConfig;
     use std::collections::HashMap;
+
+    // ---- container_identifier 单一事实源测试 ----
+
+    #[test]
+    fn pod_id_takes_priority_over_others() {
+        // 共享容器场景：pod_id 存在时一律用它，无视 service_type
+        for st in [
+            ServiceType::WebAgentRunner,
+            ServiceType::ComputerAgentRunner,
+            ServiceType::UserApp,
+        ] {
+            assert_eq!(
+                st.container_identifier(Some("shared-pod"), Some("u1"), Some("p1")),
+                Ok("shared-pod")
+            );
+        }
+    }
+
+    #[test]
+    fn web_uses_project_id() {
+        let st = ServiceType::WebAgentRunner;
+        assert_eq!(st.container_identifier(None, Some("u1"), Some("p1")), Ok("p1"));
+        // user_id 给了也不用
+        assert_eq!(
+            st.container_identifier(None, Some("u1"), None),
+            Err(MissingIdentifier::ProjectId)
+        );
+    }
+
+    #[test]
+    fn userapp_uses_project_id() {
+        assert_eq!(
+            ServiceType::UserApp.container_identifier(None, None, Some("app-9")),
+            Ok("app-9")
+        );
+    }
+
+    #[test]
+    fn computer_uses_user_id() {
+        let st = ServiceType::ComputerAgentRunner;
+        assert_eq!(st.container_identifier(None, Some("u7"), Some("p1")), Ok("u7"));
+        assert_eq!(
+            st.container_identifier(None, None, Some("p1")),
+            Err(MissingIdentifier::UserId)
+        );
+    }
+
+    #[test]
+    fn missing_identifier_display_is_stable() {
+        // 错误信息被各运行时 map_err 后透传，保持稳定便于排错
+        assert_eq!(
+            MissingIdentifier::UserId.to_string(),
+            "user_id is required for ComputerAgentRunner",
+        );
+        assert_eq!(
+            MissingIdentifier::ProjectId.to_string(),
+            "project_id is required for WebAgentRunner/UserApp",
+        );
+    }
+
+    // ---- 原 service_type 测试 ----
 
     fn create_test_config() -> MultiImageConfig {
         use crate::multi_image_config::{
