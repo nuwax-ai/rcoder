@@ -605,6 +605,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::get_app_events,
         app_manager::handlers::upload_file,
         app_manager::handlers::list_files,
+        app_manager::handlers::delete_file,
+        app_manager::handlers::list_app_runtimes,
     ),
     components(
         schemas(
@@ -719,6 +721,11 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             app_manager::models::ResourceStats,
             app_manager::models::HealthInfo,
             app_manager::models::PaginatedResponse<app_manager::models::AppRuntimeInfo>,
+            app_manager::models::Condition,
+            app_manager::models::DeleteAppRequest,
+            app_manager::models::QueryStorageRequest,
+            app_manager::models::StorageFilters,
+            app_manager::models::StorageInfo,
             container_runtime_api::AppPortStatus,
         )
     ),

@@ -41,18 +41,21 @@ fn health_from_runtime(info: &AppRuntimeInfo) -> HealthInfo {
     }
 }
 
-/// app 操作错误映射：
-/// - 含"不存在"→ 404（Java 据此触发 create 重建）
-/// - 含"不支持"→ 400（请求语义不被支持，如 in-place 更新）
-/// - 其它 → 500（系统/集群故障）
+/// app 操作错误映射（v2 §12）：
+/// 1. service 层抛出的 [`AppOperationError`]（带码）→ 按 code 精确映射 HTTP + retryable；
+/// 2. 未带码的 anyhow 错误 → 保留字符串匹配向后兼容，其余兜底为 `ERR_BACKEND_ERROR`
+///    （通常可重试，详见 `is_retryable_code`）。
 fn map_app_error(e: anyhow::Error) -> AppError {
+    if let Some(op_err) = e.downcast_ref::<AppOperationError>() {
+        return AppError::with_message(op_err.code, op_err.message.clone());
+    }
     let msg = e.to_string();
     if msg.contains("不存在") {
-        AppError::not_found(&msg)
+        AppError::with_message(shared_types::ERR_APP_NOT_FOUND, msg)
     } else if msg.contains("不支持") {
-        AppError::bad_request(&msg)
+        AppError::with_message(shared_types::ERR_OPERATION_NOT_SUPPORTED, msg)
     } else {
-        AppError::internal_server_error(&msg)
+        AppError::with_message(shared_types::ERR_BACKEND_ERROR, msg)
     }
 }
 

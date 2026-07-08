@@ -631,8 +631,9 @@ impl AppService {
         self.fetch_runtime_status_or_err(app_id).await.map(|_| ())
     }
 
-    /// DeploymentStatus → AppRuntimeInfo（含访问地址构建）
+    /// DeploymentStatus → AppRuntimeInfo（含访问地址构建 + conditions 派生）
     fn build_runtime_info(&self, status: DeploymentStatus) -> AppRuntimeInfo {
+        let conditions = derive_conditions(&status);
         let access = self.build_access_info(&status.app_id, &status.ports);
         AppRuntimeInfo {
             status: phase_to_status(&status.phase),
@@ -647,6 +648,7 @@ impl AppService {
             node: status.node,
             started_at: status.started_at,
             ports: status.ports,
+            conditions,
         }
     }
 
@@ -853,6 +855,66 @@ fn phase_to_status(phase: &str) -> AppStatus {
         "Starting" | "Pending" | "Creating" => AppStatus::Starting,
         "Error" | "Failed" => AppStatus::Error,
         _ => AppStatus::Created,
+    }
+}
+
+/// 从 message 中提取简短机器码原因（CrashLoopBackOff / ImagePullBackOff 等）
+fn extract_reason(msg: &str) -> Option<&str> {
+    const KNOWN: &[&str] = &[
+        "CrashLoopBackOff",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "CreateContainerConfigError",
+        "CreateContainerError",
+        "InvalidImageName",
+        "RunContainerError",
+        "StartError",
+        "OOMKilled",
+    ];
+    KNOWN.iter().find(|k| msg.contains(*k)).copied()
+}
+
+/// 由 DeploymentStatus 派生 conditions（见设计文档 §6.3 派生表）
+///
+/// 与 headline 的 `AppStatus` 同源、不矛盾：`status` 给 Java 做状态机判断，
+/// `conditions[]` 给人/前端做细粒度诊断。`last_transition_time` 在无状态下不持久
+/// 追踪（rcoder 不持有上一时刻状态），统一为 `None`。
+fn derive_conditions(status: &DeploymentStatus) -> Vec<Condition> {
+    let app_status = phase_to_status(&status.phase);
+    let mk = |t: &str, s: &str, reason: Option<&str>, msg: Option<String>| Condition {
+        r#type: t.to_string(),
+        status: s.to_string(),
+        reason: reason.map(str::to_string),
+        message: msg,
+        last_transition_time: None,
+    };
+    match app_status {
+        AppStatus::Error => {
+            let reason = status
+                .message
+                .as_deref()
+                .and_then(extract_reason)
+                .unwrap_or("Error");
+            vec![
+                mk("Error", "True", Some(reason), status.message.clone()),
+                mk("Ready", "False", Some("Error"), None),
+            ]
+        }
+        AppStatus::Running => vec![
+            mk("Ready", "True", None, None),
+            mk("Available", "True", None, None),
+        ],
+        AppStatus::Stopped => vec![
+            mk("Ready", "False", Some("ScaledDown"), None),
+            mk("Available", "False", Some("ScaledDown"), None),
+        ],
+        AppStatus::Starting => vec![
+            mk("Progressing", "True", Some("Starting"), None),
+            mk("Ready", "False", Some("Starting"), None),
+        ],
+        AppStatus::Stopping => vec![mk("Progressing", "True", Some("Stopping"), None)],
+        AppStatus::Deleting => vec![mk("Progressing", "True", Some("Deleting"), None)],
+        AppStatus::Created => vec![mk("Ready", "False", Some("Created"), None)],
     }
 }
 

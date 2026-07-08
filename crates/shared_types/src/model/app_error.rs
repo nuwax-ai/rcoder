@@ -136,23 +136,31 @@ fn status_from_code(code: &str) -> axum::http::StatusCode {
         | ec::ERR_CONTAINER_NOT_FOUND
         | ec::ERR_PROJECT_NOT_FOUND
         | ec::ERR_AGENT_MGMT_NOT_FOUND
-        | ec::ERR_AGENT_MGMT_UNKNOWN_AGENT => axum::http::StatusCode::NOT_FOUND,
+        | ec::ERR_AGENT_MGMT_UNKNOWN_AGENT
+        | ec::ERR_APP_NOT_FOUND
+        | ec::ERR_FILE_NOT_FOUND => axum::http::StatusCode::NOT_FOUND,
         ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED => axum::http::StatusCode::FORBIDDEN,
-        ec::ERR_AGENT_MGMT_ALREADY_INSTALLED => axum::http::StatusCode::CONFLICT,
+        ec::ERR_AGENT_MGMT_ALREADY_INSTALLED
+        | ec::ERR_CONFLICT
+        | ec::ERR_APP_ALREADY_EXISTS
+        | ec::ERR_INVALID_STATE => axum::http::StatusCode::CONFLICT,
         ec::ERR_AGENT_MGMT_INVALID_MANIFEST
         | ec::ERR_AGENT_MGMT_INVALID_CHUNK
         | ec::ERR_AGENT_MGMT_CHECKSUM_MISMATCH
         | ec::ERR_AGENT_MGMT_PATH_TRAVERSAL
         | ec::ERR_AGENT_MGMT_BINARY_TOO_LARGE
         | ec::ERR_AGENT_MGMT_ARCHIVE_BOMB
-        | ec::ERR_AGENT_MGMT_UNSUPPORTED_TYPE => axum::http::StatusCode::BAD_REQUEST,
+        | ec::ERR_AGENT_MGMT_UNSUPPORTED_TYPE
+        | ec::ERR_OPERATION_NOT_SUPPORTED => axum::http::StatusCode::BAD_REQUEST,
         ec::ERR_AGENT_MGMT_COMMAND_TIMEOUT => axum::http::StatusCode::GATEWAY_TIMEOUT,
         ec::ERR_AGENT_MGMT_PERMISSION_DENIED => axum::http::StatusCode::FORBIDDEN,
         ec::ERR_AGENT_MGMT_DISK_FULL => axum::http::StatusCode::INSUFFICIENT_STORAGE,
         ec::ERR_AGENT_MGMT_STREAM_TRUNCATED => axum::http::StatusCode::BAD_REQUEST,
-        ec::ERR_SERVICE_UNAVAILABLE | ec::ERR_AGENT_RUNNER_UNAVAILABLE => {
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
-        }
+        ec::ERR_IMAGE_PULL_FAILED => axum::http::StatusCode::BAD_GATEWAY,
+        ec::ERR_SERVICE_UNAVAILABLE
+        | ec::ERR_AGENT_RUNNER_UNAVAILABLE
+        | ec::ERR_RESOURCE_EXHAUSTED => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ec::ERR_BACKEND_ERROR => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

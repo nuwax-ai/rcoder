@@ -1,9 +1,15 @@
 //! 应用管理服务数据模型
 
 use std::collections::HashMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+
+use shared_types::error_codes::{
+    ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_FILE_NOT_FOUND,
+    ERR_INVALID_STATE, ERR_OPERATION_NOT_SUPPORTED,
+};
 
 /// 应用端口运行时状态（来自 container-runtime-api，含实际分配的对外端口）
 pub use container_runtime_api::AppPortStatus;
@@ -133,9 +139,13 @@ pub enum SortOrder {
 }
 
 /// 更新应用请求
+///
+/// 全字段可选（部分更新，SSA 幂等 apply）。`ports`/`health_check` 为整段替换语义
+/// （由 SSA + orphan 扫描保证）。注意：`name` 在 K8s 后端不可改（Deployment 名固定），
+/// 改 name 会被拒绝（`ERR_OPERATION_NOT_SUPPORTED`）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateAppRequest {
-    /// 应用名称
+    /// 应用名称（K8s 后端不可改）
     pub name: Option<String>,
     /// 容器镜像
     pub image: Option<String>,
@@ -147,6 +157,10 @@ pub struct UpdateAppRequest {
     pub secrets: Option<HashMap<String, String>>,
     /// 资源限制
     pub resources: Option<ResourceLimits>,
+    /// 端口配置（整段替换）
+    pub ports: Option<Vec<PortConfig>>,
+    /// 健康检查配置
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 /// 日志查询参数
@@ -176,6 +190,26 @@ pub enum AppStatus {
     Stopped,
     Error,
     Deleting,
+}
+
+/// 条件（K8s conditions 风格，read 时由 DeploymentStatus 派生，用于诊断）
+///
+/// 与 headline 的 [`AppStatus`] 同源派生、不矛盾：`status` 给 Java 做状态机判断，
+/// `conditions[]` 给人/前端做细粒度诊断（如区分 CrashLoopBackOff vs ImagePullBackOff）。
+/// `last_transition_time` 在无状态下不持久追踪，通常为 `None`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct Condition {
+    /// 条件类型：Ready / Available / Progressing / Error
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// True / False / Unknown
+    pub status: String,
+    /// 简短机器码（原因）：CrashLoopBackOff / ImagePullBackOff / ScaledDown / Starting ...
+    pub reason: Option<String>,
+    /// 人读描述
+    pub message: Option<String>,
+    /// 最近一次状态变迁时间（RFC3339）；无状态下通常为 None
+    pub last_transition_time: Option<String>,
 }
 
 /// 应用信息
@@ -232,6 +266,8 @@ pub struct AppRuntimeInfo {
     pub ports: Vec<AppPortStatus>,
     /// 访问信息
     pub access: AccessInfo,
+    /// 诊断条件（read 时由 DeploymentStatus 派生，见 [`Condition`]）
+    pub conditions: Vec<Condition>,
 }
 
 /// 访问信息
@@ -376,3 +412,107 @@ pub struct FileInfo {
     pub is_dir: bool,
     pub modified_at: String,
 }
+
+// ============================================================================
+// 存储管理（v2 §5.4）—— 删应用默认保留数据，由这组接口显式管理残留
+// ============================================================================
+
+/// 删除应用请求
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct DeleteAppRequest {
+    /// 是否同时清空持久存储（默认 `false`：只删计算面，保留数据面）
+    #[serde(default)]
+    pub purge: Option<bool>,
+}
+
+/// 存储查询请求（**强制分页，无全量模式**——扫存储后端代价高）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueryStorageRequest {
+    /// 页码（必填，从 1 开始）
+    pub page: u32,
+    /// 每页数量（必填，上限 100）
+    pub page_size: u32,
+    /// 过滤条件
+    pub filters: Option<StorageFilters>,
+}
+
+/// 存储过滤条件
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct StorageFilters {
+    /// `true` = 只返回"有数据、无对应运行应用"的孤儿存储
+    pub orphan_only: Option<bool>,
+    /// 按 app_id 精确过滤（最省扫描）
+    pub app_ids: Option<Vec<String>>,
+    /// 按租户过滤
+    pub tenant_id: Option<String>,
+    /// 按空间过滤
+    pub space_id: Option<String>,
+}
+
+/// 存储信息（**不含 `size_bytes`**——CephFS 上不能用 du，见设计文档 §5.4）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StorageInfo {
+    /// 应用 ID
+    pub app_id: String,
+    /// 目录是否存在
+    pub exists: bool,
+    /// app 根路径（rcoder 视角）
+    pub path: String,
+    /// 最近修改时间（RFC3339）
+    pub modified_at: Option<String>,
+    /// 是否孤儿（无对应运行应用）
+    pub is_orphan: bool,
+}
+
+// ============================================================================
+// 错误（v2 §12）—— service 层抛出，handler 层 downcast 取 code 精确映射 HTTP
+// ============================================================================
+
+/// app 操作级错误（携带业务错误码，供 handler 精确映射 HTTP 与 retryable）。
+///
+/// service 层抛出此错误（`.into()` 转 `anyhow::Error`），handler 的 `map_app_error`
+/// 通过 `downcast_ref` 取出 code；未携带此类型的 anyhow 错误兜底为 `ERR_BACKEND_ERROR`。
+/// `retryable` 既是错误码的固有属性（见 `shared_types::error_codes::is_retryable_code`），
+/// 不在响应体重复（HttpResult 不变）。
+#[derive(Debug)]
+pub struct AppOperationError {
+    /// 业务错误码（ERR_* 常量）
+    pub code: &'static str,
+    /// 人读错误信息
+    pub message: String,
+}
+
+impl AppOperationError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self::new(ERR_APP_NOT_FOUND, msg)
+    }
+    pub fn already_exists(msg: impl Into<String>) -> Self {
+        Self::new(ERR_APP_ALREADY_EXISTS, msg)
+    }
+    pub fn invalid_state(msg: impl Into<String>) -> Self {
+        Self::new(ERR_INVALID_STATE, msg)
+    }
+    pub fn not_supported(msg: impl Into<String>) -> Self {
+        Self::new(ERR_OPERATION_NOT_SUPPORTED, msg)
+    }
+    pub fn file_not_found(msg: impl Into<String>) -> Self {
+        Self::new(ERR_FILE_NOT_FOUND, msg)
+    }
+    pub fn backend(msg: impl Into<String>) -> Self {
+        Self::new(ERR_BACKEND_ERROR, msg)
+    }
+}
+
+impl fmt::Display for AppOperationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}] {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AppOperationError {}
