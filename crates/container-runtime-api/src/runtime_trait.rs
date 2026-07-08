@@ -116,6 +116,11 @@ pub struct AppPortSpec {
     pub port: u16,
     /// 暴露类型
     pub expose_type: ExposeType,
+    /// HTTP 端口：是否 strip 前缀（EG URLRewrite ReplacePrefixMatch /apps/{id} → /）。
+    /// None/false=保留完整路径（默认）；true=后端收到 strip 后的路径。
+    /// 仅对 expose_type=Http 生效；TCP 忽略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strip_prefix: Option<bool>,
 }
 
 /// 健康检查类型

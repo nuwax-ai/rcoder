@@ -744,6 +744,7 @@ impl AppService {
                         name: p.name.clone(),
                         port: p.port,
                         expose_type: map_expose_type(&p.expose_type),
+                        strip_prefix: p.strip_prefix,
                     })
                     .collect()
             })
@@ -839,6 +840,7 @@ impl AppService {
                         name: p.name.clone(),
                         port: p.port,
                         expose_type: map_expose_type(&p.expose_type),
+                        strip_prefix: p.strip_prefix,
                     })
                     .collect()
             })

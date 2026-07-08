@@ -449,19 +449,40 @@ impl KubernetesRuntime {
     }
 
     /// apply HTTPRoute（HTTP 端口 → Gateway）—— SSA create-or-update，path prefix `/apps/{app_id}`
+    ///
+    /// `http_port.strip_prefix=true` 时加 URLRewrite filter（ReplacePrefixMatch），让 EG 把
+    /// `/apps/{id}/api` → `/api` 再转发给后端（与 Docker Pingora 模式行为对齐：
+    /// Docker `/proxy/{port}/api` → 后端收到 `/api`，天然 strip）。
     async fn apply_app_httproute(
         &self,
         app_id: &str,
+        http_port: &AppPortSpec,
         gateway_name: &str,
         gateway_namespace: &str,
-        http_port: u16,
         tenant_id: Option<&str>,
         space_id: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
+        let port = http_port.port;
+        let strip_prefix = http_port.strip_prefix.unwrap_or(false);
         let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
         let api_resource = ApiResource::from_gvk(&gvk);
         let routes: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
+
+        // strip_prefix=true → URLRewrite ReplacePrefixMatch：`/apps/{id}/api` → `/api`
+        let filters = if strip_prefix {
+            serde_json::json!([{
+                "type": "URLRewrite",
+                "urlRewrite": {
+                    "path": {
+                        "type": "ReplacePrefixMatch",
+                        "replacePrefixMatch": "/"
+                    }
+                }
+            }])
+        } else {
+            serde_json::json!([])
+        };
 
         let route = serde_json::json!({
             "apiVersion": "gateway.networking.k8s.io/v1",
@@ -483,9 +504,10 @@ impl KubernetesRuntime {
                             "value": format!("/apps/{app_id}")
                         }
                     }],
+                    "filters": filters,
                     "backendRefs": [{
                         "name": self.app_service_name(app_id),
-                        "port": http_port as i32,
+                        "port": port as i32,
                     }]
                 }]
             }
@@ -641,7 +663,7 @@ impl KubernetesRuntime {
             && let Some(http_port) = ports.iter().find(|p| p.expose_type == ExposeType::Http)
         {
             match self
-                .apply_app_httproute(app_id, gw, gw_ns, http_port.port, tenant_id, space_id)
+                .apply_app_httproute(app_id, http_port, gw, gw_ns, tenant_id, space_id)
                 .await
             {
                 Ok(_) => {
