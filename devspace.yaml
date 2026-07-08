@@ -8,6 +8,9 @@ pipelines:
     run: |-
       run_dependencies --all       # 1. Deploy any projects this project needs (see "dependencies")
       ensure_pull_secrets --all    # 2. Ensure pull secrets
+      # 2.5 确保 Envoy Gateway 就绪（幂等）。EG CRD 必须在 rcoder 启动前装好，
+      # 否则 rcoder 运行时创建 HTTPRoute 会因 CRD 不存在而 warn 跳过（外部 HTTP 不可达）
+      bash k8s/scripts/install-envoy-gateway.sh || echo "⚠️ Envoy Gateway 安装失败（HTTPRoute 外部访问不可用，rcoder 仍会启动）"
       create_deployments --all     # 3. Deploy Helm charts and manifests specfied as "deployments"
       start_dev app                # 4. Start dev mode "app" (see "dev" section)
   # You can run this pipeline via `devspace deploy` (or `devspace run-pipeline deploy`)

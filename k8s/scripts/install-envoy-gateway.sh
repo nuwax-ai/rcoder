@@ -42,7 +42,8 @@ helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
   --version "${EG_VERSION}" \
   -n "${EG_NS}" \
   --create-namespace \
-  --wait
+  --wait \
+  --timeout 5m
 echo "  ✓ EG controller 已装（${EG_NS}）"
 
 # 2. GatewayClass（EG Helm 默认创建 envoy-gateway；幂等确保存在）
