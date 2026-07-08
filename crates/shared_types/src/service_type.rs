@@ -150,8 +150,8 @@ impl ServiceType {
     /// 优先级：
     ///   - `pod_id` 存在（共享容器场景）→ 返回 `pod_id`
     ///   - 否则按 service_type：
-    ///       [`ComputerAgentRunner`](ServiceType::ComputerAgentRunner) → `user_id`
-    ///       [`WebAgentRunner`](ServiceType::WebAgentRunner) | [`UserApp`](ServiceType::UserApp) → `project_id`
+    ///     - [`ComputerAgentRunner`](ServiceType::ComputerAgentRunner) → `user_id`
+    ///     - [`WebAgentRunner`](ServiceType::WebAgentRunner) | [`UserApp`](ServiceType::UserApp) → `project_id`
     ///
     /// 缺必需字段时返回 `Err(MissingIdentifier)`，由调用方转成各自的错误类型。
     /// 返回借用（零分配）；调用方需要 owned 字符串自行 `.to_string()`。
