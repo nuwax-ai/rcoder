@@ -734,6 +734,9 @@ impl AppService {
         app_id: &str,
         request: &CreateAppRequest,
     ) -> Result<ContainerCreateParams> {
+        // image 校验：禁止 latest（v2 §13.2）
+        validate_image(&request.image)?;
+
         // 端口：models::PortConfig → container_runtime_api::AppPortSpec
         let ports: Vec<AppPortSpec> = request
             .ports
@@ -830,6 +833,8 @@ impl AppService {
                 "update 需要 image（rcoder 无状态，无法保留旧 image）",
             )
         })?;
+        // image 校验：禁止 latest（v2 §13.2）
+        validate_image(&image)?;
 
         let ports: Vec<AppPortSpec> = request
             .ports
@@ -1136,6 +1141,50 @@ fn validate_app_id(app_id: &str) -> Result<()> {
             "invalid app_id: {app_id} (expected 'app-' + 8 hex chars)"
         ))
     }
+}
+
+/// 校验镜像引用（v2 §13.2）。
+///
+/// 禁止 `latest`（nya 教训：缓存污染、无法回滚）。允许的格式：
+/// - `repo/name:tag`（如 `nginx:1.25`）
+/// - `repo/name@sha256:...`（digest）
+/// - `registry.example.com/ns/name:v1.0.0`
+///
+/// 不通过 → `ERR_VALIDATION`
+fn validate_image(image: &str) -> std::result::Result<(), AppOperationError> {
+    let trimmed = image.trim();
+    if trimmed.is_empty() {
+        return Err(AppOperationError::new(
+            shared_types::ERR_VALIDATION,
+            "image 不能为空",
+        ));
+    }
+    // digest 引用（@sha256:...）—— 最精确，直接放行
+    if trimmed.contains('@') {
+        return Ok(());
+    }
+    // 取最后一段（去掉 registry 前缀）
+    let last_segment = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    // 检查 tag（冒号后的部分）
+    if let Some(tag) = last_segment.rsplit_once(':').map(|(_, t)| t) {
+        if tag.eq_ignore_ascii_case("latest") {
+            return Err(AppOperationError::new(
+                shared_types::ERR_VALIDATION,
+                format!(
+                    "image 禁止使用 :latest 标签（缓存污染、无法回滚）。请指定明确 tag 或 digest：{image}"
+                ),
+            ));
+        }
+    } else {
+        // 无 tag 也无 digest —— 隐式 latest，拒绝
+        return Err(AppOperationError::new(
+            shared_types::ERR_VALIDATION,
+            format!(
+                "image 必须显式指定 tag 或 digest（禁止隐式 latest）：{image}。例如 nginx:1.25 或 nginx@sha256:..."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// 从 PortConfig 列表提取 HTTP 端口号（供 Pingora backend 注册，create/update 共用）
