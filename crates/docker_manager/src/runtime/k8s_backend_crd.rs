@@ -100,7 +100,7 @@ impl K8sBackendCRDOps for KubernetesRuntime {
         backend.metadata.labels = Some({
             let mut m = BTreeMap::new();
             m.insert("app".to_string(), "rcoder".to_string());
-            m.insert("managed-by".to_string(), "rcoder-runtime".to_string());
+            m.insert("app.kubernetes.io/managed-by".to_string(), "rcoder-runtime".to_string());
             m
         });
         backend.data = serde_json::json!({

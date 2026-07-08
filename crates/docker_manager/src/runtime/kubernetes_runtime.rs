@@ -47,7 +47,11 @@ use super::{
 #[cfg(feature = "kubernetes")]
 use crate::types::DockerManagerConfig;
 #[cfg(feature = "kubernetes")]
-const RUNTIME_MANAGED_LABEL: &str = "managed-by=rcoder-runtime";
+// 全键：Pod/Service 经 build_standard_labels 写入的是 app.kubernetes.io/managed-by
+// （K8s 惯例）。裸 key "managed-by" 只历史性地写在 PVC/Backend CRD 上，
+// 会导致 cleanup_all/list_containers 的 label selector 匹配不到 Pod/Service（空跑）。
+// 此处与 PVC/Backend CRD 的 label 写入一并对齐到全键。
+const RUNTIME_MANAGED_LABEL: &str = "app.kubernetes.io/managed-by=rcoder-runtime";
 
 /// Kubernetes runtime implementation using kube-rs
 #[cfg(feature = "kubernetes")]
@@ -653,12 +657,49 @@ impl ContainerRuntime for KubernetesRuntime {
                 info!("[K8S] Pod {} created successfully", pod_name);
             }
             Err(kube::Error::Api(ae)) if ae.code == 409 => {
-                // Pod already exists (from a previous failed create_container attempt).
-                // Reuse the existing pod instead of failing.
-                warn!(
-                    "[K8S] Pod {} already exists (409), reusing existing pod",
-                    pod_name
-                );
+                // 同名 Pod 已存在。校验其 service_type：历史 identifier bug 可能造出
+                // 错类型 pod 撞了本请求的 identifier（如旧 chat 用 user_id 命名的 web pod
+                // 撞了 computer 的 user_id identifier，pod 名都是 rcoder-k8s-{user_id}）。
+                // 不匹配则删旧重建，避免 computer 请求复用到无 VNC 的 web pod。
+                let existing_st: Option<ServiceType> = match self.pods().get(&pod_name).await {
+                    Ok(p) => p
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|l| l.get("rcoder.io/service-type"))
+                        .and_then(|v| v.parse::<ServiceType>().ok()),
+                    Err(_) => None,
+                };
+                if existing_st.as_ref() == Some(&service_type) {
+                    warn!(
+                        "[K8S] Pod {} already exists (409), service_type={:?} matches, reusing",
+                        pod_name, service_type
+                    );
+                } else {
+                    warn!(
+                        "[K8S] Pod {} exists (409) but service_type mismatch (existing={:?}, requested={:?}); deleting stale pod and recreating",
+                        pod_name, existing_st, service_type
+                    );
+                    // stop_container_by_identifier 删 pod+svc+backend（PVC 保留，新 pod 复用数据）
+                    if let Err(e) =
+                        self.stop_container_by_identifier(identifier, &service_type).await
+                    {
+                        warn!(
+                            "[K8S] Failed to stop mismatched pod {}: {} (will retry create anyway)",
+                            pod_name, e
+                        );
+                    }
+                    self.pods().create(&pp, &pod).await.map_err(|e| {
+                        ContainerRuntimeError::ContainerCreationError(format!(
+                            "Failed to recreate pod after service_type mismatch: {}",
+                            e
+                        ))
+                    })?;
+                    info!(
+                        "[K8S] Pod {} recreated with correct service_type={:?}",
+                        pod_name, service_type
+                    );
+                }
             }
             Err(e) => {
                 return Err(ContainerRuntimeError::ContainerCreationError(format!(
