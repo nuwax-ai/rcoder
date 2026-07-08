@@ -167,6 +167,9 @@ pub struct DeploymentStatus {
     pub ready_replicas: i32,
     /// 阶段：Running/Stopped/Starting/Error 等
     pub phase: String,
+    /// 阶段附加信息（如失败原因：CrashLoopBackOff / ImagePullBackOff / 容器退出码等）。
+    /// phase=Error 时必填，便于调用方定位"服务为啥没起来"。
+    pub message: Option<String>,
     /// Pod IP（K8s）/ 容器 IP（Docker）
     pub pod_ip: Option<String>,
     /// 所在节点（K8s）
@@ -177,6 +180,17 @@ pub struct DeploymentStatus {
     pub started_at: Option<String>,
     /// 端口状态
     pub ports: Vec<AppPortStatus>,
+}
+
+/// 容器日志条目（运行时层；app_manager 层另映射为带 ToSchema 的 LogEntry 暴露给 API）
+#[derive(Debug, Clone)]
+pub struct ContainerLogEntry {
+    /// 时间戳（RFC3339；关闭 timestamps 时为 None）
+    pub timestamp: Option<String>,
+    /// 流：stdout / stderr
+    pub stream: String,
+    /// 日志内容（不含末尾换行）
+    pub message: String,
 }
 
 /// Parameters for creating a container
@@ -541,6 +555,23 @@ pub trait ContainerRuntime: Send + Sync {
         ))
     }
 
+    /// 拉取 app 容器的 stdout/stderr 日志（最近 `tail` 行）。
+    ///
+    /// K8s 经 Pod logs API（按 app-id label 定位 Pod）；Docker 经 `docker logs`。
+    /// `timestamps=true` 时 K8s/Docker 在每行前缀 RFC3339 时间戳，由实现解析回 timestamp 字段。
+    /// **`follow` 流式当前未实现**（返回 tail 快照），SSE/WebSocket 流式留待后续增强。
+    async fn get_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+        timestamps: bool,
+    ) -> ContainerRuntimeResult<Vec<ContainerLogEntry>> {
+        let _ = (app_id, tail, timestamps);
+        Err(ContainerRuntimeError::ConfigurationError(
+            "get_app_logs not supported by this runtime".to_string(),
+        ))
+    }
+
     /// 校验 app 管理前置条件（启动时 Fail Fast，防静默失败）
     ///
     /// K8s 模式探测 RBAC（list deployments，403 则明确报错指向 ClusterRole 缺权限）；
@@ -584,6 +615,21 @@ pub fn parse_memory_quantity(quantity: &str) -> Option<u64> {
         return None;
     }
     Some(bytes.round() as u64)
+}
+
+/// 拆分带时间戳的容器日志行。
+///
+/// `timestamps=true` 时 K8s `logs` 与 `docker logs` 行格式均为 `<RFC3339> <message>`
+/// （首个空格分隔时间戳与内容），返回 `(Some(ts), msg)`；否则返回 `(None, 整行)`。
+/// 两种 runtime 共用此解析，避免逻辑重复。
+pub fn split_log_timestamp(line: &str, timestamps: bool) -> (Option<String>, String) {
+    if timestamps && let Some(idx) = line.find(' ') {
+        let (ts, rest) = line.split_at(idx);
+        // rest 以 ' '（单字节 ASCII）开头，跳过 1 字节后必落在字符边界
+        let msg = if rest.len() > 1 { &rest[1..] } else { "" };
+        return (Some(ts.to_string()), msg.to_string());
+    }
+    (None, line.to_string())
 }
 
 /// K8s Quantity 后缀 → 乘数；未识别后缀（含大写 `K`）返回 `None`

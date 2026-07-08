@@ -12,7 +12,7 @@
 
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
-    AppPortSpec, AppPortStatus, ContainerCreateParams, ContainerRuntimeError,
+    AppPortSpec, AppPortStatus, ContainerCreateParams, ContainerLogEntry, ContainerRuntimeError,
     ContainerRuntimeResult, DeploymentStatus, ExposeType,
 };
 #[cfg(feature = "kubernetes")]
@@ -746,6 +746,56 @@ impl KubernetesRuntime {
         Ok(out)
     }
 
+    /// 拉取 app Pod 的 stdout/stderr 日志（最近 `tail` 行）。
+    /// 按 `rcoder.io/app-id` label 定位 Pod；`timestamps=true` 时 K8s 在每行前缀 RFC3339。
+    /// K8s logs API 合并 stdout/stderr 返回，stream 统一记 "stdout"。
+    pub async fn app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+        timestamps: bool,
+    ) -> ContainerRuntimeResult<Vec<ContainerLogEntry>> {
+        use kube::api::LogParams;
+        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
+        let pods = self
+            .pods_api()
+            .list(&lp)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("list pods for logs: {e}")))?;
+        // 无 Pod（app stopped / 副本缩为 0）→ 返回空，与 Docker 侧"容器不存在→空日志"一致，
+        // 避免 stopped app 查日志被误报 404（应用还在，只是当前无运行实例）。
+        let Some(pod_name) = pods
+            .items
+            .into_iter()
+            .next()
+            .and_then(|p| p.metadata.name.clone())
+        else {
+            return Ok(vec![]);
+        };
+        let log_lp = LogParams {
+            tail_lines: Some(tail as i64),
+            timestamps,
+            ..Default::default()
+        };
+        let raw = self
+            .pods_api()
+            .logs(&pod_name, &log_lp)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("pod logs: {e}")))?;
+        // K8s logs API 合并 stdout/stderr，stream 统一记 "stdout"
+        Ok(raw
+            .lines()
+            .map(|l| {
+                let (ts, msg) = container_runtime_api::split_log_timestamp(l, timestamps);
+                ContainerLogEntry {
+                    timestamp: ts,
+                    stream: "stdout".to_string(),
+                    message: msg,
+                }
+            })
+            .collect())
+    }
+
     /// Deployment 对象 → DeploymentStatus（含关联 Pod 的实时信息）
     async fn deployment_to_status(&self, app_id: &str, deploy: &Deployment) -> DeploymentStatus {
         let spec = deploy.spec.as_ref();
@@ -753,43 +803,53 @@ impl KubernetesRuntime {
         let replicas = spec.and_then(|s| s.replicas).unwrap_or(0);
         let ready_replicas = status.and_then(|s| s.ready_replicas).unwrap_or(0);
 
+        // 关联 Pod 信息（取一个；app 当前为单副本）。先于 phase 计算：需要用容器状态
+        // （CrashLoopBackOff / ImagePullBackOff / 非 0 退出）判定启动失败 → phase=Error。
+        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
+        let (pod_ip, node, restart_count, started_at, error_message) =
+            match self.pods_api().list(&lp).await {
+                Ok(pods) => pods
+                    .items
+                    .into_iter()
+                    .next()
+                    .and_then(|p| {
+                        let st = p.status?;
+                        // 按容器名取 "app" 容器状态（防御 sidecar 注入后 pop() 取错容器）
+                        let cs = st
+                            .container_statuses
+                            .and_then(|v| v.into_iter().find(|c| c.name == APP_CONTAINER_NAME))?;
+                        // started_at：从 container state.running 提取实际启动时间
+                        let started_at = cs
+                            .state
+                            .as_ref()
+                            .and_then(|s| s.running.as_ref())
+                            .and_then(|r| r.started_at.as_ref())
+                            .map(|t| t.0.to_string());
+                        // 启动失败原因（CrashLoop / 镜像拉取失败 / 异常退出）；正常拉起的中间态
+                        // （ContainerCreating）不在此列，不会被误判为 Error。
+                        let error_message = container_error_message(&cs);
+                        Some((
+                            st.pod_ip.unwrap_or_default(),
+                            p.spec.and_then(|s| s.node_name).unwrap_or_default(),
+                            cs.restart_count as u32,
+                            started_at,
+                            error_message,
+                        ))
+                    })
+                    .unwrap_or_default(),
+                Err(_) => (String::new(), String::new(), 0, None, None),
+            };
+
+        // phase：replicas=0 → Stopped；容器启动失败 → Error（优先于 ready 判定，避免
+        // CrashLoop 期间偶发 ready_replicas>0 被误报 Running）；就绪副本达标 → Running；否则 Starting。
         let phase = if replicas == 0 {
             "Stopped".to_string()
+        } else if error_message.is_some() {
+            "Error".to_string()
         } else if ready_replicas >= replicas && ready_replicas > 0 {
             "Running".to_string()
         } else {
             "Starting".to_string()
-        };
-
-        // 关联 Pod 信息（取一个；app 当前为单副本）
-        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
-        let (pod_ip, node, restart_count, started_at) = match self.pods_api().list(&lp).await {
-            Ok(pods) => pods
-                .items
-                .into_iter()
-                .next()
-                .and_then(|p| {
-                    let st = p.status?;
-                    // 按容器名取 "app" 容器状态（防御 sidecar 注入后 pop() 取错容器）
-                    let cs = st
-                        .container_statuses
-                        .and_then(|v| v.into_iter().find(|c| c.name == APP_CONTAINER_NAME))?;
-                    // started_at：从 container state.running 提取实际启动时间
-                    let started_at = cs
-                        .state
-                        .as_ref()
-                        .and_then(|s| s.running.as_ref())
-                        .and_then(|r| r.started_at.as_ref())
-                        .map(|t| t.0.to_string());
-                    Some((
-                        st.pod_ip.unwrap_or_default(),
-                        p.spec.and_then(|s| s.node_name).unwrap_or_default(),
-                        cs.restart_count as u32,
-                        started_at,
-                    ))
-                })
-                .unwrap_or_default(),
-            Err(_) => (String::new(), String::new(), 0, None),
         };
 
         // TCP 端口的 node_port：查 NodePort Service，按 port name 关联（name 与 container port 一致）
@@ -845,6 +905,7 @@ impl KubernetesRuntime {
             replicas,
             ready_replicas,
             phase,
+            message: error_message,
             pod_ip: if pod_ip.is_empty() {
                 None
             } else {
@@ -856,6 +917,70 @@ impl KubernetesRuntime {
             ports,
         }
     }
+}
+
+/// 从容器状态提取"启动失败"原因（供 phase=Error 的 message）。
+///
+/// 命中条件（任一）：
+/// - `state.waiting.reason` ∈ {CrashLoopBackOff, ImagePullBackOff, ErrImagePull,
+///   CreateContainerConfigError, CreateContainerError, InvalidImageName, RunContainerError,
+///   StartError}（`ContainerCreating` 是正常拉起中间态，不在此列，不会被误判）
+/// - `state.terminated.exit_code != 0`（容器异常退出）
+///
+/// CrashLoop 时当前 `state=waiting`，真实退出码在 `last_state.terminated`，一并附带，
+/// 便于定位"挂在哪一次退出、退出码多少"。
+fn container_error_message(cs: &k8s_openapi::api::core::v1::ContainerStatus) -> Option<String> {
+    let state = cs.state.as_ref()?;
+    const BAD_WAITING: &[&str] = &[
+        "CrashLoopBackOff",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "CreateContainerConfigError",
+        "CreateContainerError",
+        "InvalidImageName",
+        "RunContainerError",
+        "StartError",
+    ];
+    if let Some(w) = state.waiting.as_ref()
+        && let Some(reason) = w.reason.as_ref()
+        && BAD_WAITING.contains(&reason.as_str())
+    {
+        let detail = w
+            .message
+            .as_ref()
+            .filter(|m| !m.is_empty())
+            .map(|m| format!(": {m}"))
+            .unwrap_or_default();
+        let term = cs
+            .last_state
+            .as_ref()
+            .and_then(|ls| ls.terminated.as_ref())
+            .map(|t| {
+                format!(
+                    " (last exit={}, reason={})",
+                    t.exit_code,
+                    t.reason.as_deref().unwrap_or("")
+                )
+            })
+            .unwrap_or_default();
+        return Some(format!("{reason}{detail}{term}"));
+    }
+    if let Some(t) = state.terminated.as_ref()
+        && t.exit_code != 0
+    {
+        let reason = t.reason.as_deref().unwrap_or("");
+        let msg = t
+            .message
+            .as_ref()
+            .filter(|m| !m.is_empty())
+            .map(|m| format!(": {m}"))
+            .unwrap_or_default();
+        return Some(format!(
+            "terminated: exit code={exit}, reason={reason}{msg}",
+            exit = t.exit_code
+        ));
+    }
+    None
 }
 
 /// 健康检查配置 → K8s Probe

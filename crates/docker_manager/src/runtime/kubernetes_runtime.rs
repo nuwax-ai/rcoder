@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
-    ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, DeploymentStatus, RemovedContainerInfo, RuntimeContainerInfo,
+    ContainerCreateParams, ContainerLogEntry, ContainerRuntime, ContainerRuntimeError,
+    ContainerRuntimeResult, ContainerRuntimeStatus, DeploymentStatus, RemovedContainerInfo,
+    RuntimeContainerInfo,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
@@ -1269,6 +1270,15 @@ impl ContainerRuntime for KubernetesRuntime {
 
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
         self.list_app_status().await
+    }
+
+    async fn get_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+        timestamps: bool,
+    ) -> ContainerRuntimeResult<Vec<ContainerLogEntry>> {
+        self.app_logs(app_id, tail, timestamps).await
     }
 
     async fn validate_app_prerequisites(&self) -> ContainerRuntimeResult<()> {

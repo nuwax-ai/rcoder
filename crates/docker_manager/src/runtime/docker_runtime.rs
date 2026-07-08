@@ -5,9 +5,9 @@
 
 use async_trait::async_trait;
 use container_runtime_api::{
-    AppPortStatus, ContainerCreateParams, ContainerRuntime, ContainerRuntimeError,
-    ContainerRuntimeResult, ContainerRuntimeStatus, DeploymentStatus, ExposeType,
-    RemovedContainerInfo, RuntimeContainerInfo,
+    AppPortStatus, ContainerCreateParams, ContainerLogEntry, ContainerRuntime,
+    ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus, DeploymentStatus,
+    ExposeType, RemovedContainerInfo, RuntimeContainerInfo,
 };
 use moka::future::Cache;
 use shared_types::{ContainerBasicInfo, ServiceType};
@@ -479,6 +479,7 @@ impl ContainerRuntime for DockerRuntime {
             replicas: if running { 1 } else { 0 },
             ready_replicas: if running { 1 } else { 0 },
             phase: if running { "Running" } else { "Stopped" }.to_string(),
+            message: None,
             pod_ip: if ip.is_empty() { None } else { Some(ip) },
             node: None,
             restart_count: inspect.restart_count.unwrap_or(0) as u32,
@@ -491,6 +492,59 @@ impl ContainerRuntime for DockerRuntime {
         // TODO: Docker 模式对账接口——按 label managed-by=rcoder-app-manager list containers。
         // Docker 模式主要用于开发，对账需求低；MVP 返回空，后续按需补 bollard list_containers 过滤。
         Ok(vec![])
+    }
+
+    async fn get_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+        timestamps: bool,
+    ) -> ContainerRuntimeResult<Vec<ContainerLogEntry>> {
+        use bollard::container::LogOutput;
+        use bollard::query_parameters::LogsOptions;
+        use futures_util::StreamExt;
+
+        let name = app_deployment_name(app_id);
+        let client = self.inner.get_docker_client();
+        let opts = LogsOptions {
+            stdout: true,
+            stderr: true,
+            tail: tail.to_string(),
+            timestamps,
+            ..Default::default()
+        };
+        let mut stream = client.logs(&name, Some(opts));
+        let mut out: Vec<ContainerLogEntry> = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(log) => {
+                    // 按 bollard LogOutput 变体区分 stdout/stderr（StdIn/Console 归 stdout）
+                    let stream_name = match &log {
+                        LogOutput::StdErr { .. } => "stderr",
+                        _ => "stdout",
+                    };
+                    let bytes = log.into_bytes();
+                    let text = String::from_utf8_lossy(&bytes);
+                    for line in text.lines() {
+                        let (ts, msg) =
+                            container_runtime_api::split_log_timestamp(line, timestamps);
+                        out.push(ContainerLogEntry {
+                            timestamp: ts,
+                            stream: stream_name.to_string(),
+                            message: msg,
+                        });
+                    }
+                }
+                // 容器不存在（已删）→ 空日志，与 get_deployment_status 的 Ok(None) 语义对齐
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => return Ok(vec![]),
+                Err(e) => {
+                    return Err(ContainerRuntimeError::DockerError(format!("logs: {e}")));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
