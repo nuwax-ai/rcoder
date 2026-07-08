@@ -513,6 +513,21 @@ pub trait ContainerRuntime: Send + Sync {
         ))
     }
 
+    /// 更新一个已存在的 Deployment/容器（全量替换 desired state）。
+    ///
+    /// K8s：SSA re-apply 全部资源（幂等）+ 清理不再需要的端口/配置资源（orphan）。
+    /// Docker：image/command/env 变化需重建容器（force-remove + create）。
+    /// 返回新的 ContainerBasicInfo（Docker 含新 container_ip，供 service 层重注 pingora）。
+    async fn patch_deployment(
+        &self,
+        params: ContainerCreateParams,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let _ = params;
+        Err(ContainerRuntimeError::ConfigurationError(
+            "patch_deployment not supported by this runtime".to_string(),
+        ))
+    }
+
     /// 伸缩 Deployment 副本数（K8s scale；Docker: 0=stop, >=1=start）
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         let _ = (app_id, replicas);

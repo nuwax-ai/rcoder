@@ -1261,6 +1261,50 @@ impl ContainerRuntime for KubernetesRuntime {
         })
     }
 
+    async fn patch_deployment(
+        &self,
+        params: ContainerCreateParams,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let app_id = params.project_id.clone().ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError(
+                "patch_deployment requires project_id (app_id)".to_string(),
+            )
+        })?;
+        let gateway_name = std::env::var("RCODER_K8S_GATEWAY_NAME")
+            .ok()
+            .or_else(|| Some("nuwax-gateway".to_string()));
+        let gateway_namespace = std::env::var("RCODER_K8S_GATEWAY_NAMESPACE")
+            .ok()
+            .or_else(|| Some("default".to_string()));
+        // SSA re-apply 全部资源（幂等 create-or-update，收敛到新 desired state）
+        self.create_app_resources(
+            &app_id,
+            &params,
+            gateway_name.as_deref(),
+            gateway_namespace.as_deref(),
+        )
+        .await?;
+        // 清理 update 后不再需要的端口/配置资源（HTTPRoute/NodePort/ConfigMap/Secret orphan）
+        self.cleanup_orphan_port_resources(&app_id, &params).await?;
+        info!("[K8S-APP] Deployment patched for app: {app_id}");
+        Ok(ContainerBasicInfo {
+            container_id: self.app_deployment_name(&app_id),
+            container_name: self.app_deployment_name(&app_id),
+            container_ip: String::new(),
+            internal_port: 0,
+            external_port: 0,
+            project_id: app_id.clone(),
+            status: "Starting".to_string(),
+            created_at: Utc::now(),
+            service_url: format!(
+                "http://{}.{}.svc.{}",
+                self.app_service_name(&app_id),
+                self.namespace,
+                self.config.cluster_domain
+            ),
+        })
+    }
+
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         self.scale_app(app_id, replicas).await
     }

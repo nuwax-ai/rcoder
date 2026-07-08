@@ -164,10 +164,10 @@ pub async fn get_app(
     Ok(Json(HttpResult::success(runtime)))
 }
 
-/// 更新应用配置
+/// 更新应用（全量替换 desired state）
 ///
-/// rcoder 无状态：仅返回当前运行时状态。如需应用变更（image/env 等），调用方应
-/// delete + create。
+/// rcoder 无状态：调用方需发送完整新状态（`image` 必填）。K8s SSA re-apply 幂等，
+/// Docker 重建容器；工作空间目录保留。详见设计文档 §5.2。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/update",

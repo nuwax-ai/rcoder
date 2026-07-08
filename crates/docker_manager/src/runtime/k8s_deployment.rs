@@ -744,6 +744,62 @@ impl KubernetesRuntime {
         Ok(())
     }
 
+    /// 清理 update 后不再需要的端口/配置资源（orphan）。
+    ///
+    /// SSA re-apply 只创建当前 desired 的资源；若 HTTP/TCP 端口被移除、或 env/secrets 被清空，
+    /// 旧的 HTTPRoute / NodePort Service / ConfigMap / Secret 会残留。本方法按 desired 状态
+    /// 清理这些 orphan（404 视为已删，幂等）。供 patch_deployment 调用。
+    pub async fn cleanup_orphan_port_resources(
+        &self,
+        app_id: &str,
+        params: &ContainerCreateParams,
+    ) -> ContainerRuntimeResult<()> {
+        let has_http = params
+            .ports
+            .as_ref()
+            .is_some_and(|ps| ps.iter().any(|p| p.expose_type == ExposeType::Http));
+        let has_tcp = params
+            .ports
+            .as_ref()
+            .is_some_and(|ps| ps.iter().any(|p| p.expose_type == ExposeType::Tcp));
+        let has_env = params.env.as_ref().is_some_and(|e| !e.is_empty());
+        let has_secrets = params.secrets.as_ref().is_some_and(|s| !s.is_empty());
+        let dp = DeleteParams::default();
+        if !has_http {
+            let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
+            let api_resource = ApiResource::from_gvk(&gvk);
+            let routes: Api<DynamicObject> =
+                Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
+            self.ignore_404(routes.delete(&self.app_http_route_name(app_id), &dp).await)
+                .await?;
+        }
+        if !has_tcp {
+            self.ignore_404(
+                self.services_api()
+                    .delete(&self.app_nodeport_name(app_id), &dp)
+                    .await,
+            )
+            .await?;
+        }
+        if !has_env {
+            self.ignore_404(
+                self.configmaps_api()
+                    .delete(&self.app_config_name(app_id), &dp)
+                    .await,
+            )
+            .await?;
+        }
+        if !has_secrets {
+            self.ignore_404(
+                self.secrets_api()
+                    .delete(&self.app_secret_name(app_id), &dp)
+                    .await,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// 等 app Pod 容器全部退出（按 rcoder.io/app-id label 轮询 Pod phase），best-effort：
     /// 容器退出（phase != Running）或 Pod 消失即返回；超时/API 错误仅 warn 不阻塞删除
     /// （app 复用共享 PVC 子目录，残留写入影响可控）。

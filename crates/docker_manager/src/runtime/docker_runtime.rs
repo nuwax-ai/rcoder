@@ -393,6 +393,35 @@ impl ContainerRuntime for DockerRuntime {
         })
     }
 
+    /// 更新 UserApp 容器：Docker 不支持 in-place 改 image/env/command，必须重建。
+    /// force-remove 旧容器（best-effort，不存在则忽略）后用新 params 走 create_deployment。
+    /// 工作空间目录不在 runtime 层（由 service 层管理），重建不丢数据。
+    async fn patch_deployment(
+        &self,
+        params: ContainerCreateParams,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        use bollard::query_parameters::RemoveContainerOptions;
+        let app_id = params.project_id.clone().ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError(
+                "patch_deployment requires project_id (app_id)".to_string(),
+            )
+        })?;
+        let name = app_deployment_name(&app_id);
+        let client = self.inner.get_docker_client();
+        // 旧容器 best-effort 强删（image/env/command 变了必须重建；不存在则忽略错误）
+        let _ = client
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        // 用新 params 重建（复用 create_deployment 全套逻辑：mount/env/labels/ports/start）
+        self.create_deployment(params).await
+    }
+
     async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         use bollard::query_parameters::{StartContainerOptions, StopContainerOptions};
         let name = app_deployment_name(app_id);

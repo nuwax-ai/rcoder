@@ -125,7 +125,8 @@ impl AppService {
         );
 
         // 4. Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/{port} → container_ip）
-        self.register_pingora_backends(&app_id, &request, &container_info.container_ip)
+        let http_ports = http_port_numbers(&request.ports);
+        self.register_pingora_backends(&app_id, &http_ports, &container_info.container_ip)
             .await;
 
         // 5. 实时查询运行时状态（K8s 用于拿真实 node_port；Docker 模式不还原端口语义）
@@ -280,17 +281,34 @@ impl AppService {
     /// **当前不支持 in-place 更新**（Fail Fast 拒绝，而非静默返回当前状态假装成功）：
     /// rcoder 无状态不持久化业务元数据，无法在缺少旧 spec 时做安全 patch；
     /// `UpdateAppRequest` 也不含 ports/health_check，无法 delete+create 完整重建。
-    /// 调用方如需变更（image/env 等），应 delete + create。
-    #[instrument(skip(self, _request))]
+    /// 更新应用（v2 §5.2，全量替换 desired state）。
+    ///
+    /// rcoder 无状态：不持有旧 desired state，故本操作为**全量替换**——调用方需发送完整
+    /// 新状态（`image` 必填）。K8s 走 SSA re-apply（幂等）+ orphan 端口/配置清理；
+    /// Docker 重建容器（image/env/command 变化必须重建），工作空间目录保留。
+    #[instrument(skip(self, request))]
     pub async fn update_app(
         &self,
         app_id: &str,
-        _request: UpdateAppRequest,
+        request: UpdateAppRequest,
     ) -> Result<AppRuntimeInfo> {
-        Err(anyhow::anyhow!(
-            "rcoder 无状态，不支持 in-place 更新；请 delete + create 重建应用 (app_id={})",
-            app_id
-        ))
+        validate_app_id(app_id)?;
+        self.ensure_app_exists(app_id).await?;
+        let params = self.build_container_params_from_update(app_id, &request)?;
+        // Docker 模式：旧容器 IP 即将失效，先注销 Pingora backend（K8s no-op）
+        self.unregister_pingora_backends(app_id).await;
+        let info = self
+            .runtime
+            .patch_deployment(params)
+            .await
+            .map_err(|e| anyhow::anyhow!("更新应用失败: {}", e))
+            .with_context(|| format!("[APP] patch_deployment 失败 app_id={app_id}"))?;
+        // Docker 模式：新容器 IP，重新注册 Pingora backend（K8s no-op）
+        let http_ports = http_port_numbers(&request.ports);
+        self.register_pingora_backends(app_id, &http_ports, &info.container_ip)
+            .await;
+        info!("[APP] 应用已更新: {}", app_id);
+        self.get_app(app_id).await
     }
 
     /// 删除应用
@@ -596,6 +614,85 @@ impl AppService {
         Ok(builder.build())
     }
 
+    /// UpdateAppRequest → ContainerCreateParams（全量替换语义，image 必填）。
+    /// 与 build_container_params 平行；image 缺失 → ERR_VALIDATION
+    /// （rcoder 无状态，无法保留旧 image，调用方必须发完整新状态）。
+    fn build_container_params_from_update(
+        &self,
+        app_id: &str,
+        request: &UpdateAppRequest,
+    ) -> Result<ContainerCreateParams> {
+        let image = request.image.clone().ok_or_else(|| {
+            AppOperationError::new(
+                shared_types::ERR_VALIDATION,
+                "update 需要 image（rcoder 无状态，无法保留旧 image）",
+            )
+        })?;
+
+        let ports: Vec<AppPortSpec> = request
+            .ports
+            .as_ref()
+            .map(|ps| {
+                ps.iter()
+                    .map(|p| AppPortSpec {
+                        name: p.name.clone(),
+                        port: p.port,
+                        expose_type: map_expose_type(&p.expose_type),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(hc) = &request.health_check
+            && matches!(hc.check_type, HealthCheckType::Exec)
+        {
+            anyhow::bail!(
+                "Exec 健康检查暂不支持（AppHealthCheck 缺少 command 字段），请改用 Http/Tcp"
+            );
+        }
+        let health_check = request.health_check.as_ref().map(|hc| AppHealthCheck {
+            check_type: map_health_check_type(&hc.check_type),
+            path: hc.path.clone(),
+            port: hc.port,
+            initial_delay_seconds: None,
+            period_seconds: None,
+        });
+        let app_resources = request.resources.as_ref().map(|r| AppResourceRequirements {
+            cpu: r.cpu.clone(),
+            memory: r.memory.clone(),
+            storage: r.storage.clone(),
+            ephemeral_storage: r.ephemeral_storage.clone(),
+        });
+        let host_workspace_path = self.get_host_app_dir(app_id).to_string_lossy().to_string();
+
+        let mut builder = ContainerCreateParams::builder()
+            .project_id(app_id.to_string())
+            .service_type(ServiceType::UserApp)
+            .host_workspace_path(host_workspace_path)
+            .image_override(image)
+            .env(request.env.clone().unwrap_or_default())
+            .secrets(request.secrets.clone().unwrap_or_default())
+            .ports(ports);
+        if let Some(t) = request.tenant_id.clone() {
+            builder = builder.tenant_id(t);
+        }
+        if let Some(s) = request.space_id.clone() {
+            builder = builder.space_id(s);
+        }
+        if let Some(cmd) = request.command.clone()
+            && !cmd.is_empty()
+        {
+            builder = builder.command(cmd);
+        }
+        if let Some(hc) = health_check {
+            builder = builder.health_check(hc);
+        }
+        if let Some(ar) = app_resources {
+            builder = builder.app_resources(ar);
+        }
+        Ok(builder.build())
+    }
+
     /// 实时查询单个应用运行时状态（None 表示不存在）
     async fn fetch_runtime_status(&self, app_id: &str) -> Option<DeploymentStatus> {
         match self.runtime.get_deployment_status(app_id).await {
@@ -738,7 +835,7 @@ impl AppService {
     async fn register_pingora_backends(
         &self,
         app_id: &str,
-        request: &CreateAppRequest,
+        http_ports: &[u16],
         container_ip: &str,
     ) -> Vec<u16> {
         // K8s 模式 HTTP 走 Gateway（HTTPRoute），不经 Pingora /proxy——跳过注册
@@ -755,29 +852,18 @@ impl AppService {
             );
             return vec![];
         }
-        let http_ports: Vec<u16> = request
-            .ports
-            .as_ref()
-            .map(|ps| {
-                ps.iter()
-                    .filter(|p| p.expose_type == ExposeType::Http)
-                    .map(|p| p.port)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        for port in &http_ports {
+        for port in http_ports {
             pingora.add_backend(*port, container_ip.to_string()).await;
         }
         if !http_ports.is_empty() {
             self.pingora_ports
-                .insert(app_id.to_string(), http_ports.clone());
+                .insert(app_id.to_string(), http_ports.to_vec());
             info!(
                 "[APP] Pingora backend 已注册: {} ports={:?} -> {}",
                 app_id, http_ports, container_ip
             );
         }
-        http_ports
+        http_ports.to_vec()
     }
 
     /// Docker 模式：清理 app 曾注册的 Pingora backend
@@ -845,6 +931,19 @@ fn validate_app_id(app_id: &str) -> Result<()> {
             "invalid app_id: {app_id} (expected 'app-' + 8 hex chars)"
         ))
     }
+}
+
+/// 从 PortConfig 列表提取 HTTP 端口号（供 Pingora backend 注册，create/update 共用）
+fn http_port_numbers(ports: &Option<Vec<PortConfig>>) -> Vec<u16> {
+    ports
+        .as_ref()
+        .map(|ps| {
+            ps.iter()
+                .filter(|p| p.expose_type == ExposeType::Http)
+                .map(|p| p.port)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 运行时 phase → 应用状态枚举

@@ -140,14 +140,15 @@ pub enum SortOrder {
 
 /// 更新应用请求
 ///
-/// 全字段可选（部分更新，SSA 幂等 apply）。`ports`/`health_check` 为整段替换语义
-/// （由 SSA + orphan 扫描保证）。注意：`name` 在 K8s 后端不可改（Deployment 名固定），
-/// 改 name 会被拒绝（`ERR_OPERATION_NOT_SUPPORTED`）。
+/// **rcoder 无状态**：不持有旧 desired state，无法做"部分字段保留"。因此本请求语义为
+/// **全量替换**——调用方（Java，desired state 的 source of truth）需发送完整新状态。
+/// `image` 必填（无法保留旧 image）；`ports`/`health_check` 为整段替换。
+/// `tenant_id`/`space_id` 携带以保持资源 label（rcoder 不主动修改租户归属）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateAppRequest {
-    /// 应用名称（K8s 后端不可改）
+    /// 应用名称（仅元数据，不影响 K8s 资源命名；rcoder 忽略）
     pub name: Option<String>,
-    /// 容器镜像
+    /// 容器镜像（**必填**，rcoder 无状态无法保留旧 image；缺失 → ERR_VALIDATION）
     pub image: Option<String>,
     /// 启动命令
     pub command: Option<Vec<String>>,
@@ -161,6 +162,10 @@ pub struct UpdateAppRequest {
     pub ports: Option<Vec<PortConfig>>,
     /// 健康检查配置
     pub health_check: Option<HealthCheckConfig>,
+    /// 租户 ID（携带以保持 label）
+    pub tenant_id: Option<String>,
+    /// 空间 ID（携带以保持 label）
+    pub space_id: Option<String>,
 }
 
 /// 日志查询参数

@@ -31,8 +31,8 @@ pub trait AppServiceTrait: Send + Sync {
     /// 获取应用运行时详情（实时查集群）
     async fn get_app(&self, app_id: &str) -> Result<AppRuntimeInfo>;
 
-    /// 更新应用配置（rcoder 无状态：仅返回运行时数据，业务字段更新由 Java 持久化；
-    /// 若需要重建 Deployment，调用方应 delete + create）
+    /// 更新应用（全量替换 desired state）。rcoder 无状态，调用方需发送完整新状态
+    /// （`image` 必填）。K8s SSA re-apply 幂等；Docker 重建容器。详见 v2 设计 §5.2。
     async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> Result<AppRuntimeInfo>;
 
     /// 删除应用（删除 Deployment 及关联资源 + 清理工作空间目录）
