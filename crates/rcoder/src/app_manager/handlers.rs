@@ -418,7 +418,7 @@ pub async fn get_app_stats(
 pub async fn get_app_events(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-) -> Result<Json<HttpResult<Vec<String>>>, AppError> {
+) -> Result<Json<HttpResult<Vec<container_runtime_api::AppEventInfo>>>, AppError> {
     info!("[APP] 获取应用事件: {}", app_id);
     let events = state
         .app_service
@@ -426,6 +426,49 @@ pub async fn get_app_events(
         .await
         .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(events)))
+}
+
+/// 文件日志查询参数
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct FileLogQuery {
+    /// 日志文件路径（app 根相对，如 "logs/app.log"）
+    pub path: String,
+    /// 返回最后 N 行（默认 100）
+    pub tail: Option<u32>,
+}
+
+/// 读取应用文件日志（从 workspace PVC 读，适用不写 stdout 的应用）
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/logs/file",
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("path" = String, Query, description = "日志文件路径（app 根相对，如 logs/app.log）"),
+        ("tail" = Option<u32>, Query, description = "返回最后 N 行，默认 100")
+    ),
+    responses(
+        (status = 200, description = "查询成功", body = HttpResult<Vec<LogEntry>>),
+        (status = 404, description = "文件/应用不存在", body = HttpResult<String>)
+    ),
+    tag = "应用管理"
+)]
+#[instrument(skip(state))]
+pub async fn get_app_file_logs(
+    State(state): State<Arc<AppManagerState>>,
+    Path(app_id): Path<String>,
+    Query(params): Query<FileLogQuery>,
+) -> Result<Json<HttpResult<Vec<LogEntry>>>, AppError> {
+    let tail = params.tail.unwrap_or(100);
+    info!(
+        "[APP] 读取文件日志: {} path={} tail={}",
+        app_id, params.path, tail
+    );
+    let logs = state
+        .app_service
+        .get_app_file_logs(&app_id, &params.path, tail)
+        .await
+        .map_err(map_app_error)?;
+    Ok(Json(HttpResult::success(logs)))
 }
 
 // ============================================================================

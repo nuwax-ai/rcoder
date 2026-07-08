@@ -200,6 +200,24 @@ pub struct ContainerLogEntry {
     pub message: String,
 }
 
+/// K8s Event 信息（来自 events API，供 app 诊断）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct AppEventInfo {
+    /// 事件类型：Normal / Warning
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// 原因简码：Pulled / Created / Started / Failed / BackOff / FailedScheduling ...
+    pub reason: String,
+    /// 人读描述
+    pub message: String,
+    /// 最近发生时间（RFC3339）
+    pub timestamp: String,
+    /// 关联对象名（如 pod 名）
+    pub object: String,
+    /// 发生次数
+    pub count: i32,
+}
+
 /// Parameters for creating a container
 ///
 /// Bundles all parameters needed for container creation to avoid
@@ -609,6 +627,13 @@ pub trait ContainerRuntime: Send + Sync {
         Err(ContainerRuntimeError::ConfigurationError(
             "stream_app_logs not supported by this runtime".to_string(),
         ))
+    }
+
+    /// 查询 app 相关的 K8s Events（Pod 调度/拉取/启动/崩溃事件）。
+    /// 默认返回空（Docker 模式无 events 概念）。
+    async fn get_app_events(&self, app_id: &str) -> ContainerRuntimeResult<Vec<AppEventInfo>> {
+        let _ = app_id;
+        Ok(vec![])
     }
 
     /// 校验 app 管理前置条件（启动时 Fail Fast，防静默失败）

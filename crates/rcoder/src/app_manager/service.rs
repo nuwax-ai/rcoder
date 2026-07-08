@@ -601,11 +601,68 @@ impl AppService {
         })
     }
 
-    /// 获取应用事件（best-effort：当前返回空，TODO 接 K8s events）
+    /// 获取应用事件（K8s Events API：调度/拉取/启动/崩溃）
     #[instrument(skip(self))]
-    pub async fn get_app_events(&self, app_id: &str) -> Result<Vec<String>> {
-        let _ = app_id;
-        Ok(vec![])
+    pub async fn get_app_events(
+        &self,
+        app_id: &str,
+    ) -> Result<Vec<container_runtime_api::AppEventInfo>> {
+        validate_app_id(app_id)?;
+        self.runtime
+            .get_app_events(app_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("查询事件失败: {}", e))
+            .with_context(|| format!("[APP] get_app_events 失败 app_id={app_id}"))
+    }
+
+    /// 读取应用文件日志（从 workspace PVC 的 logs/ 目录直接读，不依赖 K8s Pod log API）。
+    ///
+    /// 适用：不写 stdout 而写文件的应用（Java Spring Boot → logs/application.log 等）。
+    /// 路径相对 app 根（如 "logs/app.log"），有 path traversal 防护。
+    #[instrument(skip(self))]
+    pub async fn get_app_file_logs(
+        &self,
+        app_id: &str,
+        file_path: &str,
+        tail: u32,
+    ) -> Result<Vec<LogEntry>> {
+        validate_app_id(app_id)?;
+        let app_dir = self.get_container_app_dir(app_id);
+        let target = app_dir.join(file_path);
+
+        // path traversal 防护（与 upload/delete_file 一致）
+        let canonical_target = match target.canonicalize() {
+            Ok(c) => c,
+            Err(_) => {
+                return Err(AppOperationError::file_not_found(format!(
+                    "日志文件不存在: {file_path}"
+                ))
+                .into());
+            }
+        };
+        let canonical_root = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
+        if !canonical_target.starts_with(&canonical_root) {
+            return Err(AppOperationError::new(
+                shared_types::ERR_VALIDATION,
+                format!("path traversal 拒绝: {file_path}"),
+            )
+            .into());
+        }
+
+        // 读文件，取最后 tail 行
+        let content = tokio::fs::read_to_string(&canonical_target)
+            .await
+            .map_err(|e| anyhow::anyhow!("读取日志文件失败 '{}': {}", file_path, e))?;
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines.len().saturating_sub(tail as usize);
+        Ok(lines[start..]
+            .iter()
+            .map(|line| LogEntry {
+                timestamp: String::new(),
+                stream: "file".to_string(),
+                message: line.to_string(),
+            })
+            .collect())
     }
 
     /// 上传文件
@@ -734,9 +791,6 @@ impl AppService {
         app_id: &str,
         request: &CreateAppRequest,
     ) -> Result<ContainerCreateParams> {
-        // image 校验：禁止 latest（v2 §13.2）
-        validate_image(&request.image)?;
-
         // 端口：models::PortConfig → container_runtime_api::AppPortSpec
         let ports: Vec<AppPortSpec> = request
             .ports
@@ -833,8 +887,6 @@ impl AppService {
                 "update 需要 image（rcoder 无状态，无法保留旧 image）",
             )
         })?;
-        // image 校验：禁止 latest（v2 §13.2）
-        validate_image(&image)?;
 
         let ports: Vec<AppPortSpec> = request
             .ports
@@ -1143,50 +1195,6 @@ fn validate_app_id(app_id: &str) -> Result<()> {
     }
 }
 
-/// 校验镜像引用（v2 §13.2）。
-///
-/// 禁止 `latest`（nya 教训：缓存污染、无法回滚）。允许的格式：
-/// - `repo/name:tag`（如 `nginx:1.25`）
-/// - `repo/name@sha256:...`（digest）
-/// - `registry.example.com/ns/name:v1.0.0`
-///
-/// 不通过 → `ERR_VALIDATION`
-fn validate_image(image: &str) -> std::result::Result<(), AppOperationError> {
-    let trimmed = image.trim();
-    if trimmed.is_empty() {
-        return Err(AppOperationError::new(
-            shared_types::ERR_VALIDATION,
-            "image 不能为空",
-        ));
-    }
-    // digest 引用（@sha256:...）—— 最精确，直接放行
-    if trimmed.contains('@') {
-        return Ok(());
-    }
-    // 取最后一段（去掉 registry 前缀）
-    let last_segment = trimmed.rsplit('/').next().unwrap_or(trimmed);
-    // 检查 tag（冒号后的部分）
-    if let Some(tag) = last_segment.rsplit_once(':').map(|(_, t)| t) {
-        if tag.eq_ignore_ascii_case("latest") {
-            return Err(AppOperationError::new(
-                shared_types::ERR_VALIDATION,
-                format!(
-                    "image 禁止使用 :latest 标签（缓存污染、无法回滚）。请指定明确 tag 或 digest：{image}"
-                ),
-            ));
-        }
-    } else {
-        // 无 tag 也无 digest —— 隐式 latest，拒绝
-        return Err(AppOperationError::new(
-            shared_types::ERR_VALIDATION,
-            format!(
-                "image 必须显式指定 tag 或 digest（禁止隐式 latest）：{image}。例如 nginx:1.25 或 nginx@sha256:..."
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// 从 PortConfig 列表提取 HTTP 端口号（供 Pingora backend 注册，create/update 共用）
 fn http_port_numbers(ports: &Option<Vec<PortConfig>>) -> Vec<u16> {
     ports
@@ -1383,8 +1391,20 @@ impl super::AppServiceTrait for AppService {
         self.get_app_stats(app_id).await
     }
 
-    async fn get_app_events(&self, app_id: &str) -> Result<Vec<String>> {
+    async fn get_app_events(
+        &self,
+        app_id: &str,
+    ) -> Result<Vec<container_runtime_api::AppEventInfo>> {
         self.get_app_events(app_id).await
+    }
+
+    async fn get_app_file_logs(
+        &self,
+        app_id: &str,
+        file_path: &str,
+        tail: u32,
+    ) -> Result<Vec<LogEntry>> {
+        self.get_app_file_logs(app_id, file_path, tail).await
     }
 
     async fn upload_file(

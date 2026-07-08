@@ -1122,6 +1122,49 @@ impl KubernetesRuntime {
         Ok(rx)
     }
 
+    /// 查询 app 相关的 K8s Events（调度/拉取/启动/崩溃）。
+    /// 过滤 involvedObject.name 以 deployment 名开头的 events，按时间倒序，取最近 50 条。
+    pub async fn app_events(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Vec<container_runtime_api::AppEventInfo>> {
+        use k8s_openapi::api::core::v1::Event;
+        let deploy_name = self.app_deployment_name(app_id);
+        let events: Api<Event> = Api::namespaced(self.client.clone(), &self.namespace);
+        // list namespace 内所有 events（K8s 默认保留 ~1h，数量有限）
+        let list = events
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("list events: {e}")))?;
+        let mut result: Vec<_> = list
+            .items
+            .into_iter()
+            .filter_map(|ev| {
+                let name = ev.involved_object.name.as_ref()?;
+                // 只要关联对象名以 deployment 名开头（覆盖 Pod rcoder-app-{id}-xxx + Deployment 本身）
+                if !name.starts_with(&deploy_name) {
+                    return None;
+                }
+                Some(container_runtime_api::AppEventInfo {
+                    event_type: ev.type_.clone().unwrap_or_else(|| "Normal".to_string()),
+                    reason: ev.reason.clone().unwrap_or_default(),
+                    message: ev.message.clone().unwrap_or_default(),
+                    timestamp: ev
+                        .last_timestamp
+                        .as_ref()
+                        .map(|t| t.0.to_string())
+                        .unwrap_or_default(),
+                    object: name.clone(),
+                    count: ev.count.unwrap_or(1),
+                })
+            })
+            .collect();
+        // 按时间倒序
+        result.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        result.truncate(50);
+        Ok(result)
+    }
+
     /// Deployment 对象 → DeploymentStatus（含关联 Pod 的实时信息）
     async fn deployment_to_status(&self, app_id: &str, deploy: &Deployment) -> DeploymentStatus {
         let spec = deploy.spec.as_ref();

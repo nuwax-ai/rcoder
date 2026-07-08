@@ -72,8 +72,19 @@ pub trait AppServiceTrait: Send + Sync {
     /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
     async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats>;
 
-    /// 获取应用事件（best-effort：当前返回空，TODO 接 K8s events）
-    async fn get_app_events(&self, app_id: &str) -> Result<Vec<String>>;
+    /// 获取应用事件（K8s Events API：调度/拉取/启动/崩溃）
+    async fn get_app_events(
+        &self,
+        app_id: &str,
+    ) -> Result<Vec<container_runtime_api::AppEventInfo>>;
+
+    /// 读取应用文件日志（从 workspace PVC 读，适用不写 stdout 的应用）
+    async fn get_app_file_logs(
+        &self,
+        app_id: &str,
+        file_path: &str,
+        tail: u32,
+    ) -> Result<Vec<LogEntry>>;
 
     /// 上传文件（写入共享工作空间 code 目录）
     async fn upload_file(
