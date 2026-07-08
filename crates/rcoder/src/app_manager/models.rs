@@ -66,8 +66,8 @@ pub struct PortConfig {
     /// 暴露类型
     pub expose_type: ExposeType,
     /// [HTTP 端口] 是否 strip `/apps/{app_id}` 前缀（EG URLRewrite）。
-    /// - `None`/`false`（默认）：后端收到完整路径 `/apps/{id}/api`，由 app 自行处理
-    /// - `true`：EG 把前缀替换为 `/`，后端收到 `/api`（适合静态服务/不感知前缀的 app）
+    /// - `None`/`true`（默认）：EG strip 前缀，后端收到 `/api`（与 Docker Pingora 一致）
+    /// - `false`：保留完整路径 `/apps/{id}/api`，由 app 自行处理
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strip_prefix: Option<bool>,
 }

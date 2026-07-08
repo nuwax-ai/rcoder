@@ -463,7 +463,9 @@ impl KubernetesRuntime {
         space_id: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         let port = http_port.port;
-        let strip_prefix = http_port.strip_prefix.unwrap_or(false);
+        // 默认 true（与 Docker Pingora 模式一致：后端收到 clean path）。
+        // 显式传 false 才保留 /apps/{id} 前缀。
+        let strip_prefix = http_port.strip_prefix.unwrap_or(true);
         let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
         let api_resource = ApiResource::from_gvk(&gvk);
         let routes: Api<DynamicObject> =
