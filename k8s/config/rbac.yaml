@@ -11,7 +11,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources:
-      ["pods", "pods/log", "pods/exec", "services", "endpoints", "persistentvolumeclaims"]
+      ["pods", "pods/log", "pods/exec", "services", "endpoints", "persistentvolumeclaims", "events"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets"]
