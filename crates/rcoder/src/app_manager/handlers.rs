@@ -196,30 +196,33 @@ pub async fn update_app(
     Ok(Json(HttpResult::success(runtime)))
 }
 
-/// 删除应用
+/// 删除应用（默认保留持久存储；body `{"purge": true}` 一键连数据面一起清空）
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/delete",
     params(
         ("app_id" = String, Path, description = "应用 ID")
     ),
+    request_body = DeleteAppRequest,
     responses(
         (status = 200, description = "删除成功", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "应用管理"
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state, body))]
 pub async fn delete_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
+    body: Option<Json<DeleteAppRequest>>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    info!("[APP] 删除应用: {}", app_id);
+    let purge = body.and_then(|Json(r)| r.purge).unwrap_or(false);
+    info!("[APP] 删除应用: {} (purge={})", app_id, purge);
     state
         .app_service
-        .delete_app(&app_id)
+        .delete_app(&app_id, purge)
         .await
-        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success("删除成功".to_string())))
 }
 

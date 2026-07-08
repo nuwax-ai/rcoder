@@ -36,7 +36,7 @@ use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
 #[cfg(feature = "kubernetes")]
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(feature = "kubernetes")]
 use shared_types::ServiceType;
@@ -735,6 +735,9 @@ impl KubernetesRuntime {
             Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
         self.ignore_404(routes.delete(&self.app_http_route_name(app_id), &dp).await)
             .await?;
+        // orphan 扫描兜底：删除所有带本 app label 的残留计算资源（防前面按名删除中途
+        // 失败留孤儿）。best-effort，list/delete 错误仅 warn，不阻塞删除主流程。不扫 PVC。
+        self.cleanup_labeled_orphans(app_id).await;
         // 等 app Pod 容器退出（best-effort，超时不阻塞）。Deployment 已删 → Pod 收到 SIGTERM，
         // 容器秒级退出（不再写文件）。Pod 对象完全消失需等 graceful period（默认 30s），但容器
         // 退出即代表不再写，故等 phase != Running 而非 Pod gone，兼顾安全与速度。
@@ -742,6 +745,75 @@ impl KubernetesRuntime {
             .await;
         info!("[K8S-APP] K8s resources deleted for app: {app_id}");
         Ok(())
+    }
+
+    /// label 扫描兜底（operator-rs delete_orphaned_resources 思路）：
+    /// list 所有带 `instance={app_id}, managed-by=rcoder-app-manager` 的计算资源并删除残留。
+    ///
+    /// 供 delete_app_resources 末尾调用，保证不留孤儿（哪怕前面按名删除部分失败）。
+    /// **不扫 PVC**（共享 PVC 不带 app 标签，且不可删）。best-effort：错误仅 warn。
+    async fn cleanup_labeled_orphans(&self, app_id: &str) {
+        let selector = format!(
+            "{}/instance={app_id},{}/managed-by={APP_MANAGED_BY}",
+            APP_LABEL_PREFIX, APP_LABEL_PREFIX
+        );
+        let lp = ListParams::default().labels(&selector);
+        let dp = DeleteParams::default();
+
+        // Deployment
+        if let Ok(list) = self.deployments_api().list(&lp).await {
+            for it in list.items {
+                if let Some(name) = it.metadata.name.as_ref() {
+                    let _ = self.deployments_api().delete(name, &dp).await;
+                }
+            }
+        } else {
+            warn!("[K8S-APP] orphan 扫描 list deployments 失败 (ignored): {app_id}");
+        }
+        // Service（含 ClusterIP + NodePort，按 label 一并清）
+        if let Ok(list) = self.services_api().list(&lp).await {
+            for it in list.items {
+                if let Some(name) = it.metadata.name.as_ref() {
+                    let _ = self.services_api().delete(name, &dp).await;
+                }
+            }
+        } else {
+            warn!("[K8S-APP] orphan 扫描 list services 失败 (ignored): {app_id}");
+        }
+        // ConfigMap
+        if let Ok(list) = self.configmaps_api().list(&lp).await {
+            for it in list.items {
+                if let Some(name) = it.metadata.name.as_ref() {
+                    let _ = self.configmaps_api().delete(name, &dp).await;
+                }
+            }
+        } else {
+            warn!("[K8S-APP] orphan 扫描 list configmaps 失败 (ignored): {app_id}");
+        }
+        // Secret
+        if let Ok(list) = self.secrets_api().list(&lp).await {
+            for it in list.items {
+                if let Some(name) = it.metadata.name.as_ref() {
+                    let _ = self.secrets_api().delete(name, &dp).await;
+                }
+            }
+        } else {
+            warn!("[K8S-APP] orphan 扫描 list secrets 失败 (ignored): {app_id}");
+        }
+        // HTTPRoute（动态资源）
+        let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
+        let api_resource = ApiResource::from_gvk(&gvk);
+        let routes: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
+        if let Ok(list) = routes.list(&lp).await {
+            for it in list.items {
+                if let Some(name) = it.metadata.name.as_ref() {
+                    let _ = routes.delete(name, &dp).await;
+                }
+            }
+        } else {
+            warn!("[K8S-APP] orphan 扫描 list httproutes 失败 (ignored): {app_id}");
+        }
     }
 
     /// 清理 update 后不再需要的端口/配置资源（orphan）。

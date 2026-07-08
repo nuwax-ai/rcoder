@@ -35,8 +35,8 @@ pub trait AppServiceTrait: Send + Sync {
     /// （`image` 必填）。K8s SSA re-apply 幂等；Docker 重建容器。详见 v2 设计 §5.2。
     async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> Result<AppRuntimeInfo>;
 
-    /// 删除应用（删除 Deployment 及关联资源 + 清理工作空间目录）
-    async fn delete_app(&self, app_id: &str) -> Result<()>;
+    /// 删除应用（删计算资源；持久存储默认保留，purge=true 才清空数据面。v2 §5.3）
+    async fn delete_app(&self, app_id: &str, purge: bool) -> Result<()>;
 
     /// 启动应用（scale replicas = 1）
     async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo>;

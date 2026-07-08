@@ -311,27 +311,37 @@ impl AppService {
         self.get_app(app_id).await
     }
 
-    /// 删除应用
+    /// 删除应用（v2 §5.3：默认保留持久存储，purge=true 才清空数据面）。
     #[instrument(skip(self))]
-    pub async fn delete_app(&self, app_id: &str) -> Result<()> {
+    pub async fn delete_app(&self, app_id: &str, purge: bool) -> Result<()> {
         validate_app_id(app_id)?;
-        info!("[APP] 删除应用: {}", app_id);
+        info!("[APP] 删除应用: {} (purge={})", app_id, purge);
 
         // 1. Docker 模式：清理 Pingora backend
         self.unregister_pingora_backends(app_id).await;
 
-        // 2. 删除 Deployment 及关联资源（K8s: Service/HTTPRoute/NodePort/ConfigMap/Secret）
+        // 2. 删除计算资源（K8s: Deployment/Service/HTTPRoute/NodePort/ConfigMap/Secret
+        //    + label orphan 扫描兜底；Docker: 容器）。持久存储默认保留。
         self.runtime
             .delete_deployment(app_id)
             .await
             .map_err(|e| anyhow::anyhow!("删除应用失败: {}", e))?;
 
-        // 3. 清理工作空间目录（共享存储子目录，安全）
-        let app_dir = self.get_container_app_dir(app_id);
-        if app_dir.exists()
-            && let Err(e) = fs::remove_dir_all(&app_dir).await
-        {
-            warn!("[APP] 清理应用目录失败 {:?}: {}", app_dir, e);
+        // 3. 仅 purge=true 时清空持久存储（code/data/logs 目录）。
+        //    默认保留：应用可重建，数据不可再生（v2 §5.3 数据安全）。
+        if purge {
+            let app_dir = self.get_container_app_dir(app_id);
+            if app_dir.exists()
+                && let Err(e) = fs::remove_dir_all(&app_dir).await
+            {
+                warn!("[APP] purge 清理应用目录失败 {:?}: {}", app_dir, e);
+            }
+            info!("[APP] 已清空应用持久存储: {}", app_id);
+        } else {
+            info!(
+                "[APP] 保留应用持久存储（如需清空传 purge=true）: {}",
+                app_id
+            );
         }
 
         Ok(())
@@ -1081,8 +1091,8 @@ impl super::AppServiceTrait for AppService {
         self.update_app(app_id, request).await
     }
 
-    async fn delete_app(&self, app_id: &str) -> Result<()> {
-        self.delete_app(app_id).await
+    async fn delete_app(&self, app_id: &str, purge: bool) -> Result<()> {
+        self.delete_app(app_id, purge).await
     }
 
     async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
