@@ -188,6 +188,8 @@ pub struct AppInfo {
     pub app_id: String,
     pub name: String,
     pub status: AppStatus,
+    /// 阶段附加信息（phase=Error 时为失败原因，如 CrashLoopBackOff）
+    pub message: Option<String>,
     pub image: String,
     pub command: Vec<String>,
     pub replicas: u32,
@@ -212,6 +214,8 @@ pub struct AppRuntimeInfo {
     pub status: AppStatus,
     /// 运行时阶段原始值：Running/Stopped/Starting/Error 等
     pub phase: String,
+    /// 阶段附加信息（phase=Error 时为失败原因，如 CrashLoopBackOff / 容器退出码）
+    pub message: Option<String>,
     /// 期望副本数
     pub replicas: i32,
     /// 就绪副本数

@@ -172,11 +172,20 @@ impl AppService {
                 probes: None,
             });
 
+        // status：用刚查到的运行时 phase 映射（不再硬编码 Running）——刚创建的 Pod 通常
+        // 还是 Starting，甚至镜像拉取失败已 Error；返回真实状态避免"status=Running 但
+        // health=Starting/Error"自相矛盾。message 带 phase=Error 的失败原因。
+        let (status, message) = match &runtime_status {
+            Some(s) => (phase_to_status(&s.phase), s.message.clone()),
+            None => (AppStatus::Starting, None),
+        };
+
         let now = Utc::now().to_rfc3339();
         Ok(AppInfo {
             app_id: app_id.clone(),
             name: request.name.clone(),
-            status: AppStatus::Running,
+            status,
+            message,
             image: request.image.clone(),
             command: request.command.clone().unwrap_or_default(),
             replicas: 1,
@@ -259,31 +268,29 @@ impl AppService {
         })
     }
 
-    /// 获取应用运行时详情（实时查集群）
+    /// 获取应用运行时详情（实时查集群；精确区分 404 与 500）
     #[instrument(skip(self))]
     pub async fn get_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
-        let status = self
-            .fetch_runtime_status(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
+        let status = self.fetch_runtime_status_or_err(app_id).await?;
         Ok(self.build_runtime_info(status))
     }
 
     /// 更新应用配置
     ///
-    /// rcoder 无状态：不持久化业务元数据，也无法在缺少旧 spec 的情况下重建 Deployment。
-    /// 此接口返回当前运行时状态；如需应用变更（image/env 等），调用方应 delete + create。
-    #[instrument(skip(self))]
+    /// **当前不支持 in-place 更新**（Fail Fast 拒绝，而非静默返回当前状态假装成功）：
+    /// rcoder 无状态不持久化业务元数据，无法在缺少旧 spec 时做安全 patch；
+    /// `UpdateAppRequest` 也不含 ports/health_check，无法 delete+create 完整重建。
+    /// 调用方如需变更（image/env 等），应 delete + create。
+    #[instrument(skip(self, _request))]
     pub async fn update_app(
         &self,
         app_id: &str,
         _request: UpdateAppRequest,
     ) -> Result<AppRuntimeInfo> {
-        warn!(
-            "[APP] update_app: rcoder 无状态，业务元数据由调用方持久化；如需应用变更请 delete + create (app_id={})",
+        Err(anyhow::anyhow!(
+            "rcoder 无状态，不支持 in-place 更新；请 delete + create 重建应用 (app_id={})",
             app_id
-        );
-        self.get_app(app_id).await
+        ))
     }
 
     /// 删除应用
@@ -351,40 +358,27 @@ impl AppService {
         self.get_app(app_id).await
     }
 
-    /// 获取应用日志（读取共享工作空间 logs/app.log）
+    /// 获取应用日志（实时拉容器 stdout/stderr：K8s Pod logs / docker logs）。
+    ///
+    /// `follow` 流式当前未实现（runtime 返回 tail 快照），`since` 暂未透传；
+    /// SSE/WebSocket 实时流留待后续增强。
     #[instrument(skip(self))]
     pub async fn get_app_logs(&self, app_id: &str, params: LogParams) -> Result<Vec<LogEntry>> {
         validate_app_id(app_id)?;
-        let log_file = self
-            .get_container_app_dir(app_id)
-            .join("logs")
-            .join("app.log");
-        if !log_file.exists() {
-            return Ok(vec![]);
-        }
-        let content = fs::read_to_string(&log_file)
+        let tail = params.tail.unwrap_or(1000);
+        let timestamps = params.timestamps.unwrap_or(true);
+        let entries = self
+            .runtime
+            .get_app_logs(app_id, tail, timestamps)
             .await
-            .with_context(|| format!("读取日志失败: {:?}", log_file))?;
-        // 日志来源是文件而非 docker stdout 流；时间戳用文件 mtime（最后写入时间）
-        let timestamp = match fs::metadata(&log_file).await {
-            Ok(m) => m
-                .modified()
-                .map(|t| {
-                    let dt: chrono::DateTime<Utc> = t.into();
-                    dt.to_rfc3339()
-                })
-                .unwrap_or_else(|_| Utc::now().to_rfc3339()),
-            Err(_) => Utc::now().to_rfc3339(),
-        };
-        let tail = params.tail.unwrap_or(1000) as usize;
-        let lines: Vec<&str> = content.lines().collect();
-        let start = lines.len().saturating_sub(tail);
-        Ok(lines[start..]
-            .iter()
-            .map(|line| LogEntry {
-                timestamp: timestamp.clone(),
-                stream: "file".to_string(),
-                message: line.to_string(),
+            .map_err(|e| anyhow::anyhow!("读取日志失败: {}", e))
+            .with_context(|| format!("[APP] get_app_logs 失败 app_id={app_id}"))?;
+        Ok(entries
+            .into_iter()
+            .map(|e| LogEntry {
+                timestamp: e.timestamp.unwrap_or_default(),
+                stream: e.stream,
+                message: e.message,
             })
             .collect())
     }
@@ -392,10 +386,7 @@ impl AppService {
     /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
     #[instrument(skip(self))]
     pub async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats> {
-        let status = self
-            .fetch_runtime_status(app_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("应用不存在: {}", app_id))?;
+        let status = self.fetch_runtime_status_or_err(app_id).await?;
         Ok(ResourceStats {
             restart_count: status.restart_count,
             ..Default::default()
@@ -418,9 +409,20 @@ impl AppService {
         target: &str,
     ) -> Result<UploadResult> {
         validate_app_id(app_id)?;
-        let file_path = self.get_container_app_dir(app_id).join("code").join(target);
+        // target 相对 app 根目录（设计 §8.4：默认 "code/{name}"，也可写 data/ logs/）。
+        let app_dir = self.get_container_app_dir(app_id);
+        // 先确保 app 根存在，便于 canonicalize 取真实基准路径
+        fs::create_dir_all(&app_dir).await?;
+        let file_path = app_dir.join(target);
+        // 防穿越：canonicalize 父目录（已存在）后校验仍在 app 目录内，与 delete_file 对称。
+        // 拦截两类攻击：绝对路径 target（PathBuf::join 遇绝对路径会替换基准）与 ../../ 上跳。
+        let canonical_app_dir = app_dir.canonicalize()?;
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent).await?;
+            let canonical_parent = parent.canonicalize()?;
+            if !canonical_parent.starts_with(&canonical_app_dir) {
+                return Err(anyhow::anyhow!("路径不在应用目录内"));
+            }
         }
         fs::write(&file_path, &file_data).await?;
         Ok(UploadResult {
@@ -430,20 +432,45 @@ impl AppService {
         })
     }
 
-    /// 列出文件
+    /// 列出文件（app 根目录，或其子目录如 "code"/"data"/"logs"）。
+    ///
+    /// `subpath` 为 None/空 → 列 app 根；否则列 `app_dir/{subpath}`。返回的 `path` 字段是
+    /// **app-root-relative**（如 "code/app.jar"），可直接作为 upload 的 target / delete 的 path，
+    /// 与这两个接口的约定一致。防穿越：子目录 canonicalize 后必须仍在 app 目录内。
     #[instrument(skip(self))]
-    pub async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>> {
+    pub async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> Result<Vec<FileInfo>> {
         validate_app_id(app_id)?;
-        let code_dir = self.get_container_app_dir(app_id).join("code");
-        if !code_dir.exists() {
+        let app_dir = self.get_container_app_dir(app_id);
+        if !app_dir.exists() {
             return Ok(vec![]);
         }
+        let canonical_app_dir = app_dir.canonicalize()?;
+        // subpath 归一化：去尾部 '/'，空 → 列 app 根
+        let sub = subpath
+            .map(|p| p.trim_end_matches('/'))
+            .filter(|p| !p.is_empty());
+        let target_dir = match sub {
+            Some(p) => {
+                let full = app_dir.join(p);
+                if !full.exists() {
+                    return Ok(vec![]);
+                }
+                let canonical_full = full.canonicalize()?;
+                if !canonical_full.starts_with(&canonical_app_dir) {
+                    return Err(anyhow::anyhow!("路径不在应用目录内"));
+                }
+                canonical_full
+            }
+            None => canonical_app_dir,
+        };
+        // 返回 app-root-relative 路径（sub 存在时前缀 "sub/"）
+        let rel_prefix = sub.map(|p| format!("{p}/")).unwrap_or_default();
         let mut files = Vec::new();
-        let mut entries = fs::read_dir(&code_dir).await?;
+        let mut entries = fs::read_dir(&target_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let metadata = entry.metadata().await?;
             files.push(FileInfo {
-                path: entry.file_name().to_string_lossy().to_string(),
+                path: format!("{rel_prefix}{}", entry.file_name().to_string_lossy()),
                 size: metadata.len(),
                 is_dir: metadata.is_dir(),
                 modified_at: metadata
@@ -462,21 +489,21 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
         validate_app_id(app_id)?;
+        // file_path 相对 app 根目录（与 upload_file 的 target 同约定：可指向 code/ data/ logs/）
         let app_dir = self.get_container_app_dir(app_id);
-        let code_dir = app_dir.join("code");
-        if !code_dir.exists() {
-            return Err(anyhow::anyhow!("应用 code 目录不存在"));
+        if !app_dir.exists() {
+            return Err(anyhow::anyhow!("应用目录不存在"));
         }
-        let full_path = code_dir.join(file_path);
+        let full_path = app_dir.join(file_path);
         // 先 exists 守卫，避免 canonicalize 对不存在路径抛 OS 错误（导致 500 而非 404）
         if !full_path.exists() {
             return Err(anyhow::anyhow!("文件不存在: {}", file_path));
         }
 
-        // 安全检查：canonicalize 后确保路径仍在 code 目录内（防 ../ 穿越到外部）
+        // 安全检查：canonicalize 后确保路径仍在 app 目录内（防 ../ 穿越到外部）
         let canonical_path = full_path.canonicalize()?;
-        let canonical_code_dir = code_dir.canonicalize()?;
-        if !canonical_path.starts_with(&canonical_code_dir) {
+        let canonical_app_dir = app_dir.canonicalize()?;
+        if !canonical_path.starts_with(&canonical_app_dir) {
             return Err(anyhow::anyhow!("路径不在应用目录内"));
         }
 
@@ -580,14 +607,28 @@ impl AppService {
         }
     }
 
+    /// 实时查状态，精确区分两种"查不到"：Ok(None)=集群中真不存在 → "应用不存在"(→404)；
+    /// Err=API Server 不可达/RBAC 拒绝 → "查询应用状态失败"(→500)。
+    ///
+    /// 供需要精确错误分类的读路径（get_app/get_app_stats/ensure_app_exists）使用，
+    /// 替代会塌缩错误的 `fetch_runtime_status`（后者仅供 create_app 这类 None 可接受的场景）。
+    /// 若误用 fetch_runtime_status，瞬时 API 错误会被当成"应用不存在"→404，触发 Java 误重建。
+    async fn fetch_runtime_status_or_err(&self, app_id: &str) -> Result<DeploymentStatus> {
+        match self.runtime.get_deployment_status(app_id).await {
+            Ok(Some(s)) => Ok(s),
+            Ok(None) => Err(anyhow::anyhow!("应用不存在: {}", app_id)),
+            Err(e) => {
+                warn!("[APP] 查询应用状态失败 app_id={}: {}", app_id, e);
+                Err(anyhow::anyhow!("查询应用状态失败: {}", e))
+            }
+        }
+    }
+
     /// 确认 app 存在（集群中有 Deployment/容器），不存在返回"应用不存在"错误。
     /// 调用方（start/stop/restart）据此返回 404，方便 Java 区分并触发 create 重建，
     /// 而非收到 generic 500 误以为系统故障。
     async fn ensure_app_exists(&self, app_id: &str) -> Result<()> {
-        if self.fetch_runtime_status(app_id).await.is_none() {
-            return Err(anyhow::anyhow!("应用不存在: {}", app_id));
-        }
-        Ok(())
+        self.fetch_runtime_status_or_err(app_id).await.map(|_| ())
     }
 
     /// DeploymentStatus → AppRuntimeInfo（含访问地址构建）
@@ -598,6 +639,7 @@ impl AppService {
             access,
             app_id: status.app_id,
             phase: status.phase,
+            message: status.message,
             replicas: status.replicas,
             ready_replicas: status.ready_replicas,
             restart_count: status.restart_count,
@@ -915,8 +957,8 @@ impl super::AppServiceTrait for AppService {
         self.upload_file(app_id, file_data, target).await
     }
 
-    async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>> {
-        self.list_files(app_id).await
+    async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> Result<Vec<FileInfo>> {
+        self.list_files(app_id, subpath).await
     }
 
     async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {

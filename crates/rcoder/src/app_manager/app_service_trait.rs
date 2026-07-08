@@ -64,9 +64,9 @@ pub trait AppServiceTrait: Send + Sync {
         target: &str,
     ) -> Result<UploadResult>;
 
-    /// 列出文件（读取共享工作空间 code 目录）
-    async fn list_files(&self, app_id: &str) -> Result<Vec<FileInfo>>;
+    /// 列出文件（app 根或其子目录 code/data/logs；subpath=None 列 app 根）
+    async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> Result<Vec<FileInfo>>;
 
-    /// 删除文件（限应用 code 目录内）
+    /// 删除文件（app 根相对路径，可指向 code/data/logs 下任意文件）
     async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()>;
 }

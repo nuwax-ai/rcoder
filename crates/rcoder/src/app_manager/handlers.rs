@@ -41,11 +41,16 @@ fn health_from_runtime(info: &AppRuntimeInfo) -> HealthInfo {
     }
 }
 
-/// app 操作错误映射：错误信息含"不存在"→ 404（Java 据此触发 create 重建），其它→ 500。
+/// app 操作错误映射：
+/// - 含"不存在"→ 404（Java 据此触发 create 重建）
+/// - 含"不支持"→ 400（请求语义不被支持，如 in-place 更新）
+/// - 其它 → 500（系统/集群故障）
 fn map_app_error(e: anyhow::Error) -> AppError {
     let msg = e.to_string();
     if msg.contains("不存在") {
         AppError::not_found(&msg)
+    } else if msg.contains("不支持") {
+        AppError::bad_request(&msg)
     } else {
         AppError::internal_server_error(&msg)
     }
@@ -152,7 +157,7 @@ pub async fn get_app(
         .app_service
         .get_app(&app_id)
         .await
-        .map_err(|e| AppError::not_found(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -184,7 +189,7 @@ pub async fn update_app(
         .app_service
         .update_app(&app_id, request)
         .await
-        .map_err(|e| AppError::not_found(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -330,7 +335,7 @@ pub async fn get_app_logs(
         .app_service
         .get_app_logs(&app_id, params)
         .await
-        .map_err(|e| AppError::not_found(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(logs)))
 }
 
@@ -357,7 +362,7 @@ pub async fn get_app_health(
         .app_service
         .get_app(&app_id)
         .await
-        .map_err(|e| AppError::not_found(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(health_from_runtime(&runtime))))
 }
 
@@ -384,7 +389,7 @@ pub async fn get_app_stats(
         .app_service
         .get_app_stats(&app_id)
         .await
-        .map_err(|e| AppError::not_found(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(stats)))
 }
 
@@ -411,7 +416,7 @@ pub async fn get_app_events(
         .app_service
         .get_app_events(&app_id)
         .await
-        .map_err(|e| AppError::not_found(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(events)))
 }
 
@@ -486,16 +491,24 @@ pub async fn upload_file(
     Ok(Json(HttpResult::success(result)))
 }
 
+/// 列出文件查询参数
+#[derive(Debug, Deserialize, Default, ToSchema)]
+pub struct ListFilesQuery {
+    /// 子目录（相对 app 根，如 "code"/"data"/"logs"；默认列 app 根）
+    pub path: Option<String>,
+}
+
 /// 列出文件
 #[utoipa::path(
     get,
     path = "/api/v1/apps/{app_id}/files",
     params(
-        ("app_id" = String, Path, description = "应用 ID")
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("path" = Option<String>, Query, description = "子目录（相对 app 根，如 code/data/logs；默认列 app 根）")
     ),
     responses(
         (status = 200, description = "查询成功", body = HttpResult<Vec<FileInfo>>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 404, description = "应用/路径不存在", body = HttpResult<String>)
     ),
     tag = "应用管理"
 )]
@@ -503,31 +516,43 @@ pub async fn upload_file(
 pub async fn list_files(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
+    Query(q): Query<ListFilesQuery>,
 ) -> Result<Json<HttpResult<Vec<FileInfo>>>, AppError> {
-    info!("[APP] 列出文件: {}", app_id);
+    info!("[APP] 列出文件: {} (subpath={:?})", app_id, q.path);
     let files = state
         .app_service
-        .list_files(&app_id)
+        .list_files(&app_id, q.path.as_deref())
         .await
-        .map_err(|e| AppError::not_found(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(files)))
 }
 
 /// 删除文件请求
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct DeleteFileRequest {
-    /// 应用 ID
-    pub app_id: String,
-    /// 文件路径
+    /// 文件路径（app 根相对，如 "code/app.jar"，可指向 code/data/logs 下任意文件）
     pub path: String,
 }
 
 /// 删除文件
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/files/delete",
+    params(
+        ("app_id" = String, Path, description = "应用 ID")
+    ),
+    request_body = DeleteFileRequest,
+    responses(
+        (status = 200, description = "删除成功", body = HttpResult<String>),
+        (status = 404, description = "文件/应用不存在", body = HttpResult<String>)
+    ),
+    tag = "应用管理"
+)]
 pub async fn delete_file(
     State(state): State<Arc<AppManagerState>>,
+    Path(app_id): Path<String>,
     Json(request): Json<DeleteFileRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    let app_id = request.app_id.clone();
     info!("[APP] 删除文件: {}/{}", app_id, request.path);
     state
         .app_service
