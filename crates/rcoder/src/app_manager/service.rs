@@ -347,6 +347,166 @@ impl AppService {
         Ok(())
     }
 
+    // ===== 持久存储管理（v2 §5.4）=====
+    // 删应用默认保留数据；这组接口让 Java 显式管理残留存储。
+    // StorageInfo 不含 size_bytes——CephFS 上不能用 du（详见设计文档 §5.4）。
+
+    /// 查询单个应用的持久存储状态（O(1) stat，不递归）。
+    pub async fn get_app_storage(&self, app_id: &str) -> Result<StorageInfo> {
+        validate_app_id(app_id)?;
+        let app_dir = self.get_container_app_dir(app_id);
+        let metadata = tokio::fs::metadata(&app_dir).await.ok();
+        let exists = metadata.is_some();
+        let modified_at = metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+        let is_orphan = self.is_storage_orphan(app_id).await;
+        Ok(StorageInfo {
+            app_id: app_id.to_string(),
+            exists,
+            path: app_dir.to_string_lossy().to_string(),
+            modified_at,
+            is_orphan,
+        })
+    }
+
+    /// 清空应用的持久存储。安全约束：仅当 app 计算资源已不存在时允许（否则 INVALID_STATE）。
+    pub async fn delete_app_storage(&self, app_id: &str) -> Result<()> {
+        validate_app_id(app_id)?;
+        match self.runtime.get_deployment_status(app_id).await {
+            Ok(Some(_)) => {
+                return Err(AppOperationError::invalid_state(format!(
+                    "应用 {app_id} 仍存在，请先 delete 再清空存储（避免损坏在用数据）"
+                ))
+                .into());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("[APP] 查询应用状态失败 app_id={}: {}", app_id, e);
+                return Err(AppOperationError::backend(format!("查询应用状态失败: {e}")).into());
+            }
+        }
+        let app_dir = self.get_container_app_dir(app_id);
+        if app_dir.exists()
+            && let Err(e) = fs::remove_dir_all(&app_dir).await
+        {
+            return Err(anyhow::anyhow!("清空存储失败: {}", e));
+        }
+        info!("[APP] 已清空应用存储: {}", app_id);
+        Ok(())
+    }
+
+    /// 分页查询持久存储（强制分页，无全量模式）。
+    /// 过滤：orphan_only、app_ids 生效；tenant_id/space_id 在无状态下不支持（rcoder 不持
+    /// app→租户映射），提供则 warn 忽略。
+    pub async fn query_storage(
+        &self,
+        request: QueryStorageRequest,
+    ) -> Result<PaginatedResponse<StorageInfo>> {
+        if request.page == 0 {
+            return Err(
+                AppOperationError::new(shared_types::ERR_VALIDATION, "page 从 1 开始").into(),
+            );
+        }
+        if request.page_size == 0 || request.page_size > 100 {
+            return Err(AppOperationError::new(
+                shared_types::ERR_VALIDATION,
+                "page_size 须在 1..=100",
+            )
+            .into());
+        }
+        let filters = request.filters.unwrap_or_default();
+        if filters.tenant_id.is_some() || filters.space_id.is_some() {
+            warn!(
+                "[APP] query_storage 的 tenant_id/space_id 过滤在无状态下不支持（rcoder 不持 app→租户映射），已忽略"
+            );
+        }
+        // 现有 app 集合（供 is_orphan），一次 list 调用
+        let existing: std::collections::HashSet<String> = self
+            .runtime
+            .list_deployments()
+            .await
+            .map_err(|e| anyhow::anyhow!("列出应用失败: {}", e))?
+            .into_iter()
+            .map(|s| s.app_id)
+            .collect();
+        // 单层列 workspace_root（不递归）
+        let workspace_root = self.config.get_workspace_root();
+        let mut entries: Vec<String> = match tokio::fs::read_dir(workspace_root).await {
+            Ok(mut rd) => {
+                let mut v = vec![];
+                while let Ok(Some(de)) = rd.next_entry().await {
+                    if de.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
+                        && let Some(name) = de.file_name().to_str().map(|s| s.to_string())
+                    {
+                        v.push(name);
+                    }
+                }
+                v
+            }
+            Err(_) => vec![],
+        };
+        entries.sort();
+        let app_ids_filter = filters.app_ids.as_deref();
+        let filtered: Vec<String> = entries
+            .into_iter()
+            .filter(|app_id| {
+                if let Some(ids) = app_ids_filter
+                    && !ids.iter().any(|x| x == app_id)
+                {
+                    return false;
+                }
+                if filters.orphan_only.unwrap_or(false) && existing.contains(app_id) {
+                    return false;
+                }
+                true
+            })
+            .collect();
+        let total = filtered.len() as u64;
+        let page = request.page as usize;
+        let page_size = request.page_size as usize;
+        let start = page.saturating_sub(1) * page_size;
+        let paged: Vec<String> = filtered.into_iter().skip(start).take(page_size).collect();
+
+        let mut items = Vec::with_capacity(paged.len());
+        for app_id in paged {
+            let app_dir = self.get_container_app_dir(&app_id);
+            let is_orphan = !existing.contains(&app_id);
+            let metadata = tokio::fs::metadata(&app_dir).await.ok();
+            let modified_at = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+            items.push(StorageInfo {
+                app_id,
+                exists: metadata.is_some(),
+                path: app_dir.to_string_lossy().to_string(),
+                modified_at,
+                is_orphan,
+            });
+        }
+        let total_pages = if total == 0 {
+            1
+        } else {
+            total.div_ceil(page_size as u64) as u32
+        };
+        Ok(PaginatedResponse {
+            items,
+            pagination: Pagination {
+                page: request.page,
+                page_size: request.page_size,
+                total,
+                total_pages,
+            },
+        })
+    }
+
+    /// 存储是否为孤儿（无对应运行应用）。Ok(None)=orphan；Ok(Some)/Err=非 orphan（保守）。
+    async fn is_storage_orphan(&self, app_id: &str) -> bool {
+        matches!(self.runtime.get_deployment_status(app_id).await, Ok(None))
+    }
+
     /// 启动应用（scale replicas = 1）
     #[instrument(skip(self))]
     pub async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
@@ -1093,6 +1253,21 @@ impl super::AppServiceTrait for AppService {
 
     async fn delete_app(&self, app_id: &str, purge: bool) -> Result<()> {
         self.delete_app(app_id, purge).await
+    }
+
+    async fn get_app_storage(&self, app_id: &str) -> Result<StorageInfo> {
+        self.get_app_storage(app_id).await
+    }
+
+    async fn delete_app_storage(&self, app_id: &str) -> Result<()> {
+        self.delete_app_storage(app_id).await
+    }
+
+    async fn query_storage(
+        &self,
+        request: QueryStorageRequest,
+    ) -> Result<PaginatedResponse<StorageInfo>> {
+        self.query_storage(request).await
     }
 
     async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {

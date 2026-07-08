@@ -43,4 +43,14 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             "/api/v1/apps/{app_id}/files/delete",
             post(handlers::delete_file),
         )
+        // 持久存储管理（v2 §5.4）
+        .route(
+            "/api/v1/apps/{app_id}/storage",
+            get(handlers::get_app_storage),
+        )
+        .route(
+            "/api/v1/apps/{app_id}/storage/delete",
+            post(handlers::delete_app_storage),
+        )
+        .route("/api/v1/apps/storage/query", post(handlers::query_storage))
 }

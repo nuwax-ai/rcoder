@@ -38,6 +38,18 @@ pub trait AppServiceTrait: Send + Sync {
     /// 删除应用（删计算资源；持久存储默认保留，purge=true 才清空数据面。v2 §5.3）
     async fn delete_app(&self, app_id: &str, purge: bool) -> Result<()>;
 
+    /// 查询单个应用持久存储状态（v2 §5.4，O(1) stat，不含 size_bytes）
+    async fn get_app_storage(&self, app_id: &str) -> Result<StorageInfo>;
+
+    /// 清空应用持久存储（仅当 app 已 delete 时允许，否则 INVALID_STATE）
+    async fn delete_app_storage(&self, app_id: &str) -> Result<()>;
+
+    /// 分页查询持久存储（强制分页，无全量模式）
+    async fn query_storage(
+        &self,
+        request: QueryStorageRequest,
+    ) -> Result<PaginatedResponse<StorageInfo>>;
+
     /// 启动应用（scale replicas = 1）
     async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo>;
 

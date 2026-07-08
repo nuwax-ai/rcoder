@@ -567,3 +567,86 @@ pub async fn delete_file(
         .map_err(map_app_error)?;
     Ok(Json(HttpResult::success("文件删除成功".to_string())))
 }
+
+// ============================================================================
+// 持久存储管理（v2 §5.4）
+// ============================================================================
+
+/// 查询应用持久存储状态
+#[utoipa::path(
+    get,
+    path = "/api/v1/apps/{app_id}/storage",
+    params(("app_id" = String, Path, description = "应用 ID")),
+    responses(
+        (status = 200, description = "查询成功", body = HttpResult<StorageInfo>),
+        (status = 404, description = "应用不存在", body = HttpResult<String>)
+    ),
+    tag = "应用管理"
+)]
+#[instrument(skip(state))]
+pub async fn get_app_storage(
+    State(state): State<Arc<AppManagerState>>,
+    Path(app_id): Path<String>,
+) -> Result<Json<HttpResult<StorageInfo>>, AppError> {
+    info!("[APP] 查询应用存储: {}", app_id);
+    let info = state
+        .app_service
+        .get_app_storage(&app_id)
+        .await
+        .map_err(map_app_error)?;
+    Ok(Json(HttpResult::success(info)))
+}
+
+/// 清空应用持久存储（仅当 app 已 delete 时允许，否则 409 INVALID_STATE）
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/storage/delete",
+    params(("app_id" = String, Path, description = "应用 ID")),
+    responses(
+        (status = 200, description = "清空成功", body = HttpResult<String>),
+        (status = 404, description = "应用不存在", body = HttpResult<String>),
+        (status = 409, description = "应用仍存在，需先 delete", body = HttpResult<String>)
+    ),
+    tag = "应用管理"
+)]
+#[instrument(skip(state))]
+pub async fn delete_app_storage(
+    State(state): State<Arc<AppManagerState>>,
+    Path(app_id): Path<String>,
+) -> Result<Json<HttpResult<String>>, AppError> {
+    info!("[APP] 清空应用存储: {}", app_id);
+    state
+        .app_service
+        .delete_app_storage(&app_id)
+        .await
+        .map_err(map_app_error)?;
+    Ok(Json(HttpResult::success("存储已清空".to_string())))
+}
+
+/// 分页查询持久存储（强制分页，无全量模式）
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/storage/query",
+    request_body = QueryStorageRequest,
+    responses(
+        (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<StorageInfo>>),
+        (status = 400, description = "分页参数错误", body = HttpResult<String>)
+    ),
+    tag = "应用管理"
+)]
+#[instrument(skip(state, request))]
+pub async fn query_storage(
+    State(state): State<Arc<AppManagerState>>,
+    Json(request): Json<QueryStorageRequest>,
+) -> Result<Json<HttpResult<PaginatedResponse<StorageInfo>>>, AppError> {
+    info!(
+        "[APP] 查询存储列表: page={} page_size={}",
+        request.page, request.page_size
+    );
+    let resp = state
+        .app_service
+        .query_storage(request)
+        .await
+        .map_err(map_app_error)?;
+    Ok(Json(HttpResult::success(resp)))
+}
