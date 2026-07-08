@@ -87,7 +87,7 @@ pub async fn create_app(
         .app_service
         .create_app(request)
         .await
-        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(app_info)))
 }
 
@@ -111,7 +111,7 @@ pub async fn query_apps(
         .app_service
         .query_apps(request)
         .await
-        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(response)))
 }
 
@@ -135,7 +135,7 @@ pub async fn list_app_runtimes(
         .app_service
         .list_app_runtimes()
         .await
-        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+        .map_err(map_app_error)?;
     Ok(Json(HttpResult::success(runtimes)))
 }
 
@@ -494,7 +494,7 @@ pub async fn upload_file(
         .app_service
         .upload_file(&app_id, data, &target)
         .await
-        .map_err(|e| AppError::internal_server_error(&e.to_string()))?;
+        .map_err(map_app_error)?;
 
     Ok(Json(HttpResult::success(result)))
 }

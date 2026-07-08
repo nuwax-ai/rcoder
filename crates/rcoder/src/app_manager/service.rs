@@ -94,15 +94,23 @@ impl AppService {
             request.name, app_id, self.config.access_mode
         );
 
-        // 0. 校验资源限制格式（K8s Quantity: storage / ephemeral_storage）
+        // 0. 校验资源限制格式（K8s Quantity: storage / ephemeral_storage）→ ERR_VALIDATION
         if let Some(ref resources) = request.resources {
             if let Some(ref s) = resources.storage {
-                crate::handler::pod_handler::validate_k8s_storage_size(s)
-                    .map_err(|e| anyhow::anyhow!("invalid storage '{}': {}", s, e))?;
+                crate::handler::pod_handler::validate_k8s_storage_size(s).map_err(|e| {
+                    AppOperationError::new(
+                        shared_types::ERR_VALIDATION,
+                        format!("invalid storage '{}': {}", s, e),
+                    )
+                })?;
             }
             if let Some(ref es) = resources.ephemeral_storage {
-                crate::handler::pod_handler::validate_k8s_storage_size(es)
-                    .map_err(|e| anyhow::anyhow!("invalid ephemeral_storage '{}': {}", es, e))?;
+                crate::handler::pod_handler::validate_k8s_storage_size(es).map_err(|e| {
+                    AppOperationError::new(
+                        shared_types::ERR_VALIDATION,
+                        format!("invalid ephemeral_storage '{}': {}", es, e),
+                    )
+                })?;
             }
         }
 
@@ -277,10 +285,6 @@ impl AppService {
     }
 
     /// 更新应用配置
-    ///
-    /// **当前不支持 in-place 更新**（Fail Fast 拒绝，而非静默返回当前状态假装成功）：
-    /// rcoder 无状态不持久化业务元数据，无法在缺少旧 spec 时做安全 patch；
-    /// `UpdateAppRequest` 也不含 ports/health_check，无法 delete+create 完整重建。
     /// 更新应用（v2 §5.2，全量替换 desired state）。
     ///
     /// rcoder 无状态：不持有旧 desired state，故本操作为**全量替换**——调用方需发送完整
@@ -750,9 +754,11 @@ impl AppService {
         if let Some(hc) = &request.health_check
             && matches!(hc.check_type, HealthCheckType::Exec)
         {
-            anyhow::bail!(
-                "Exec 健康检查暂不支持（AppHealthCheck 缺少 command 字段），请改用 Http/Tcp"
-            );
+            return Err(AppOperationError::new(
+                shared_types::ERR_VALIDATION,
+                "Exec 健康检查暂不支持（AppHealthCheck 缺少 command 字段），请改用 Http/Tcp",
+            )
+            .into());
         }
 
         // 健康检查：models::HealthCheckConfig → AppHealthCheck
@@ -832,9 +838,11 @@ impl AppService {
         if let Some(hc) = &request.health_check
             && matches!(hc.check_type, HealthCheckType::Exec)
         {
-            anyhow::bail!(
-                "Exec 健康检查暂不支持（AppHealthCheck 缺少 command 字段），请改用 Http/Tcp"
-            );
+            return Err(AppOperationError::new(
+                shared_types::ERR_VALIDATION,
+                "Exec 健康检查暂不支持（AppHealthCheck 缺少 command 字段），请改用 Http/Tcp",
+            )
+            .into());
         }
         let health_check = request.health_check.as_ref().map(|hc| AppHealthCheck {
             check_type: map_health_check_type(&hc.check_type),
@@ -899,10 +907,10 @@ impl AppService {
     async fn fetch_runtime_status_or_err(&self, app_id: &str) -> Result<DeploymentStatus> {
         match self.runtime.get_deployment_status(app_id).await {
             Ok(Some(s)) => Ok(s),
-            Ok(None) => Err(anyhow::anyhow!("应用不存在: {}", app_id)),
+            Ok(None) => Err(AppOperationError::not_found(format!("应用不存在: {app_id}")).into()),
             Err(e) => {
                 warn!("[APP] 查询应用状态失败 app_id={}: {}", app_id, e);
-                Err(anyhow::anyhow!("查询应用状态失败: {}", e))
+                Err(AppOperationError::backend(format!("查询应用状态失败: {e}")).into())
             }
         }
     }

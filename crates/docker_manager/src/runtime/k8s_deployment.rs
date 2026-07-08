@@ -378,6 +378,10 @@ impl KubernetesRuntime {
                 template: PodTemplateSpec {
                     metadata: Some(ObjectMeta {
                         labels: Some(full_labels),
+                        // env/secrets 改的是 ConfigMap/Secret 数据，env_from 引用名不变 →
+                        // 不触发 rollout。此 annotation 让"内容变 → hash 变 → spec 变 → 自动
+                        // rollout"，使 env 更新对运行中 Pod 生效（K8s 标准模式）。
+                        annotations: Some(config_hash_annotations(params)),
                         ..Default::default()
                     }),
                     spec: Some(pod_spec),
@@ -548,18 +552,28 @@ impl KubernetesRuntime {
             .await
             .map_err(|e| ContainerRuntimeError::K8sError(format!("apply nodeport: {e}")))?;
 
-        // 提取实际分配的 node_port
+        // 提取实际分配的 node_port：按 name（回退 port 号）关联，避免 server 返回顺序与
+        // 请求顺序不一致时 name 与 external_port 配错。
+        use std::collections::HashMap;
         let mut result = vec![];
         if let Some(spec) = created.spec
             && let Some(ports) = spec.ports
         {
-            for (i, p) in ports.iter().enumerate() {
-                if let Some(np) = p.node_port {
+            let np_by_key: HashMap<String, u16> = ports
+                .iter()
+                .filter_map(|p| {
+                    let np = p.node_port? as u16;
+                    let key = p.name.clone().unwrap_or_else(|| format!("{}", p.port));
+                    Some((key, np))
+                })
+                .collect();
+            for req in tcp_ports {
+                if let Some(&np) = np_by_key.get(&req.name) {
                     result.push(AppPortStatus {
-                        name: tcp_ports.get(i).map(|p| p.name.clone()).unwrap_or_default(),
-                        port: p.port as u16,
+                        name: req.name.clone(),
+                        port: req.port,
                         expose_type: ExposeType::Tcp,
-                        external_port: Some(np as u16),
+                        external_port: Some(np),
                     });
                 }
             }
@@ -1017,7 +1031,10 @@ impl KubernetesRuntime {
 
     /// 启动日志流（follow）：返回 mpsc::Receiver。内部 spawn 任务读 K8s `log_stream(follow)`，
     /// 逐行 send 到 channel。receiver drop（客户端断开）→ send 出错 → 任务退出释放日志源。
-    pub async fn stream_app_logs(
+    ///
+    /// 命名 `_inner` 与同文件 `app_logs`/`scale_app`/`restart_app` 约定一致（trait 同名方法
+    /// 转调不同名的 inherent，避免 trait impl 内 self.同名() 依赖方法解析优先级）。
+    pub async fn stream_app_logs_inner(
         &self,
         app_id: &str,
         tail: u32,
@@ -1266,6 +1283,38 @@ fn container_error_message(cs: &k8s_openapi::api::core::v1::ContainerStatus) -> 
         ));
     }
     None
+}
+
+/// 计算 env+secrets 内容的 hash，注入 pod template annotation。
+///
+/// 作用：env/secrets 走 ConfigMap/Secret，改内容时 `env_from` 引用名不变 → Deployment spec
+/// 不变 → 不触发 rollout → 新 env 到不了运行中 Pod。此 hash 进 pod template，内容变即
+/// annotation 变 → spec 变 → 自动 rollout。DefaultHasher 跨进程确定（固定 key），故同
+/// 内容多次 apply 的 hash 稳定，不会引发误 rollout。
+#[cfg(feature = "kubernetes")]
+fn config_hash_annotations(
+    params: &container_runtime_api::ContainerCreateParams,
+) -> BTreeMap<String, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    for map in [params.env.as_ref(), params.secrets.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let mut items: Vec<_> = map.iter().collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in items {
+            k.hash(&mut h);
+            v.hash(&mut h);
+        }
+    }
+    let mut ann = BTreeMap::new();
+    ann.insert(
+        "rcoder.io/config-hash".to_string(),
+        format!("{:016x}", h.finish()),
+    );
+    ann
 }
 
 /// 健康检查配置 → K8s Probe

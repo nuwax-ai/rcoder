@@ -524,9 +524,63 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
-        // TODO: Docker 模式对账接口——按 label managed-by=rcoder-app-manager list containers。
-        // Docker 模式主要用于开发，对账需求低；MVP 返回空，后续按需补 bollard list_containers 过滤。
-        Ok(vec![])
+        // Docker 模式对账：按 label managed-by=rcoder-app-manager list 容器（含 stopped），
+        // 从 ContainerSummary 组装 DeploymentStatus。供 /apps/runtime 与 query_storage 的
+        // is_orphan 判定（无此实现则 Docker 模式所有 app 被误判 orphan）。
+        use bollard::models::ContainerSummaryStateEnum;
+        use bollard::query_parameters::ListContainersOptionsBuilder;
+        let client = self.inner.get_docker_client();
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec!["managed-by=rcoder-app-manager".to_string()],
+        );
+        let opts = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+        let summaries = client
+            .list_containers(Some(opts))
+            .await
+            .map_err(|e| ContainerRuntimeError::ConnectionError(format!("list containers: {e}")))?;
+        let mut out = Vec::with_capacity(summaries.len());
+        for s in summaries {
+            let Some(labels) = &s.labels else { continue };
+            let Some(app_id) = labels.get("app-id").cloned() else {
+                continue;
+            };
+            let running = s.state == Some(ContainerSummaryStateEnum::RUNNING);
+            let ports: Vec<AppPortStatus> = s
+                .ports
+                .as_ref()
+                .map(|ps| {
+                    ps.iter()
+                        .filter_map(|p| {
+                            let ext = p.public_port?;
+                            Some(AppPortStatus {
+                                name: String::new(),
+                                port: p.private_port,
+                                expose_type: ExposeType::Tcp,
+                                external_port: Some(ext),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(DeploymentStatus {
+                app_id,
+                replicas: if running { 1 } else { 0 },
+                ready_replicas: if running { 1 } else { 0 },
+                phase: if running { "Running" } else { "Stopped" }.to_string(),
+                message: None,
+                pod_ip: None,
+                node: None,
+                restart_count: 0,
+                started_at: None,
+                ports,
+            });
+        }
+        Ok(out)
     }
 
     async fn get_app_logs(

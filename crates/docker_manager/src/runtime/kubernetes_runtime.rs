@@ -1342,7 +1342,7 @@ impl ContainerRuntime for KubernetesRuntime {
         app_id: &str,
         tail: u32,
     ) -> ContainerRuntimeResult<container_runtime_api::mpsc::Receiver<ContainerLogEntry>> {
-        self.stream_app_logs(app_id, tail).await
+        self.stream_app_logs_inner(app_id, tail).await
     }
 
     async fn validate_app_prerequisites(&self) -> ContainerRuntimeResult<()> {
