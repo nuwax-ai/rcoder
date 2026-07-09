@@ -341,7 +341,7 @@ pub(crate) async fn handle_computer_chat_internal(
                     .agent_config
                     .as_ref()
                     .and_then(|c| c.resource_limits.clone()),
-            ),
+            )?,
             pod_id: request.pod_id.clone(),
             isolation_type: request.isolation_type.clone(),
             tenant_id: request.tenant_id.clone(),
@@ -406,7 +406,7 @@ pub(crate) async fn handle_computer_chat_internal(
                     .agent_config
                     .as_ref()
                     .and_then(|c| c.resource_limits.clone()),
-            ),
+            )?,
             pod_id: request.pod_id.clone(),
             isolation_type: request.isolation_type.clone(),
             tenant_id: request.tenant_id.clone(),

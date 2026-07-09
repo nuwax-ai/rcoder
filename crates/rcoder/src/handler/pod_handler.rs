@@ -19,6 +19,7 @@ use super::utils::{I18nJsonOrQuery, I18nQuery, container_identity_from_name};
 use crate::router::AppState;
 use crate::service::ComputerContainerManager;
 use crate::service::computer_container_manager::ContainerCreateOptions;
+use docker_manager::runtime_selection::RuntimeType;
 // sync_single_vnc_backend 已移除，使用 ContainerLookupService 统一数据源
 use crate::{AppError, HttpResult};
 use shared_types::{
@@ -85,8 +86,13 @@ fn validate_resource_limits(limits: &ServiceResourceLimits) -> Result<(), String
 /// 背景：Backend 调用容器创建相关接口（`/chat`、`/computer/chat`、`/pod/ensure`、
 /// `/pod/restart`）时通常不传 `resource_limits`，直接用 `None` 创建 Pod 会得到
 /// 无 requests/limits 的容器（K8s 下 resources 全空）。这里以
-/// `ServiceImageConfig.resource_limits`（来自 configmap）兜底，并通过 `merge_with`
-/// 做字段级合并——API 显式传入的字段优先，未传字段回退默认值。
+/// 默认资源限制的来源按运行时分家（docker/k8s 完全分家 + Fail Fast）:
+/// - **K8s 模式**:`kubernetes_config.services[].resource_limits` 是 agent 容器**唯一真源**;
+///   service 未配置 → 直接报错(拒绝降级 docker_config,避免"改了 k8s 配置却不生效"的双份真源困惑)。
+/// - **Docker 模式**:读 `docker_config.multi_image_config`（K8s 段对 docker 无意义）。
+///
+/// 无论来源，最终都与 API 显式传入的 `api_limits` 经 `merge_with` 做字段级合并——
+/// API 字段优先，未传字段回退默认值。
 ///
 /// 公共核心：直接接受 `ServiceResourceLimits`，所有入口（`/chat`、`/computer/chat`、
 /// `/pod/ensure`、`/pod/restart`）统一用 `ServiceResourceLimits`，直接复用本函数。
@@ -94,23 +100,53 @@ pub(crate) fn resolve_resource_limits_from_config(
     state: &AppState,
     service_type: &ServiceType,
     api_limits: Option<ServiceResourceLimits>,
-) -> Option<ServiceResourceLimits> {
-    // configmap 中该 service_type 的默认资源限制（保底）
-    // 注意：get_multi_image_config 返回 owned MultiImageConfig，需先绑定再借用，
-    // 并在闭包内 clone 出 owned ServiceResourceLimits，避免返回指向临时值的悬垂引用。
-    let default_limits = state.config.docker_config.as_ref().and_then(|dc| {
-        let multi_config = dc.get_multi_image_config();
-        multi_config
-            .get_service_config(service_type)
-            .map(|c| c.resource_limits.clone())
-    });
+) -> Result<Option<ServiceResourceLimits>, AppError> {
+    // docker/k8s 完全分家 + Fail Fast:
+    // - K8s 模式:kubernetes_config.resource_limits 是 agent 容器唯一真源。service 未配置 =
+    //   配置错误,直接报错(拒绝降级 docker_config,避免双份真源困惑)。
+    // - Docker 模式:读 docker_config(K8s 段对 docker 无意义)。
+    let (default_limits, default_source) = if RuntimeType::from_env().is_kubernetes() {
+        let k8s_limits = state
+            .config
+            .kubernetes_config
+            .as_ref()
+            .and_then(|kc| kc.get_service_config(service_type))
+            .map(|sc| sc.resource_limits.clone());
+        match k8s_limits {
+            Some(l) => (Some(l), "k8s_config"),
+            None => {
+                error!(
+                    "[RESOURCE_LIMITS] K8s 模式下 kubernetes_config 未配置 service {:?} 的 \
+                     resource_limits,拒绝降级到 docker_config(完全分家)。请在 config.yml 的 \
+                     kubernetes_config.services 段补全该 service。",
+                    service_type
+                );
+                return Err(AppError::with_message(
+                    shared_types::error_codes::ERR_VALIDATION,
+                    format!(
+                        "K8s mode requires resource_limits for service {service_type:?} in kubernetes_config.services"
+                    ),
+                ));
+            }
+        }
+    } else {
+        // 注意：get_multi_image_config 返回 owned MultiImageConfig，需先绑定再借用，
+        // clone 出 owned ServiceResourceLimits，避免悬垂引用。
+        let docker_limits = state.config.docker_config.as_ref().and_then(|dc| {
+            let multi_config = dc.get_multi_image_config();
+            multi_config
+                .get_service_config(service_type)
+                .map(|c| c.resource_limits.clone())
+        });
+        (docker_limits, "docker_config")
+    };
 
     // 来源标记，便于排查“资源限制静默丢失”问题（none=Pod 将无 resources，需警惕）
     let source = match (&default_limits, &api_limits) {
-        (Some(_), Some(_)) => "merged(api+configmap)",
-        (Some(_), None) => "configmap",
-        (None, Some(_)) => "api",
-        (None, None) => "none",
+        (Some(_), Some(_)) => format!("merged(api+{default_source})"),
+        (Some(_), None) => default_source.to_string(),
+        (None, Some(_)) => "api".to_string(),
+        (None, None) => "none".to_string(),
     };
 
     // 字段级合并：API 字段优先，None 回退默认值
@@ -135,7 +171,7 @@ pub(crate) fn resolve_resource_limits_from_config(
         cpu.map(|c| c.to_string()).as_deref().unwrap_or("none"),
     );
 
-    result
+    Ok(result)
 }
 
 /// 解析 service_type 字符串为 ServiceType 枚举
@@ -1134,7 +1170,7 @@ pub async fn pod_ensure(
 
         // 创建新容器，最多重试 3 次
         let resource_limits =
-            resolve_resource_limits_from_config(&state, &service_type, request.resource_limits);
+            resolve_resource_limits_from_config(&state, &service_type, request.resource_limits)?;
 
         let mut last_error = None;
         let mut result = None;
@@ -1291,7 +1327,7 @@ pub async fn pod_ensure(
                         );
 
                         let resource_limits =
-                            resolve_resource_limits_from_config(&state, &service_type, request.resource_limits);
+                            resolve_resource_limits_from_config(&state, &service_type, request.resource_limits)?;
 
                         // 设置创建标记
                         state
@@ -1818,7 +1854,7 @@ pub async fn pod_restart(
     }
 
     // 4. 定义资源限制（API 入参优先，缺失字段回退 configmap 默认值）
-    let resource_limits = resolve_resource_limits_from_config(&state, &service_type, request.resource_limits);
+    let resource_limits = resolve_resource_limits_from_config(&state, &service_type, request.resource_limits)?;
 
     // 5. 强制创建新容器
     info!(

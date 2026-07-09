@@ -254,7 +254,7 @@ pub async fn handle_chat(
                 .agent_config
                 .as_ref()
                 .and_then(|c| c.resource_limits.clone()),
-        ),
+        )?,
         pod_id: request.pod_id.as_deref(),
         isolation_type: request.isolation_type.as_deref(),
         tenant_id: request.tenant_id.as_deref(),
