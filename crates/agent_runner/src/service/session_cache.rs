@@ -645,7 +645,25 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             0
         }
         Some(old_session_id) => {
-            // session_id 发生变化，需要清理旧 session 的数据
+            // 🛡️ 区分"合法正向迁移"与"过期 sessionId 反向顶替"。
+            // 传入 sid 若不是当前 project 的活跃 session（已被新 session 顶替后从
+            // session_to_project 移除 / 属于别的 project / 从未注册），说明是 agent
+            // 用过期 sessionId 推来的迟到通知（如技能加载后的 available_commands_update）。
+            // 此时只把消息 buffer 到该 sid，绝不反向改写 project 映射、不 cancel
+            // 当前正在工作的真实 SSE（否则前端会收到 sub=cancelled）。
+            let is_current_active = AGENT_REGISTRY
+                .get_project_by_session(session_id)
+                .map(|p| p == project_id)
+                .unwrap_or(false);
+            if !is_current_active {
+                info!(
+                    "Stale session_id ignored, skip migration (buffer-only): project_id={}, mapped={}, incoming={}",
+                    project_id, old_session_id, session_id
+                );
+                return 0;
+            }
+
+            // 合法正向迁移（传入 sid 是当前 project 的活跃 session）：保留原有清理逻辑
             info!(
                 "Detected project session change: project_id={}, old_session_id={}, new_session_id={}",
                 project_id, old_session_id, session_id
@@ -823,5 +841,47 @@ mod tests {
             vec![3, 4, 5],
             "ring overflow drops oldest, seq stays contiguous"
         );
+    }
+
+    fn make_agent_info(project_id: &str, session_id: &str) -> shared_types::ProjectAndAgentInfo {
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        shared_types::ProjectAndAgentInfo {
+            project_id: project_id.to_string(),
+            session_id: agent_client_protocol::schema::v1::SessionId::new(Arc::from(session_id)),
+            prompt_tx: mpsc::channel(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY).0,
+            cancel_tx: mpsc::channel(shared_types::AGENT_CANCEL_CHANNEL_CAPACITY).0,
+            model_provider: None,
+            request_id: None,
+            status: shared_types::AgentStatus::Idle,
+            last_activity: Utc::now(),
+            created_at: Utc::now(),
+            stop_handle: None,
+            agent_binary_snapshot: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_project_session_ignores_stale_session_id() {
+        // C-slim 回归保护：agent 用过期/陌生 sessionId 推消息时，
+        // 不得反向改写 project 映射、不得 cancel 当前正在工作的真实 SSE。
+        let project = "cslim_stale_proj";
+        let real_sid = "ses_real_active";
+        let stale_sid = "753cf1fd-stale-not-registered";
+
+        let registry = &crate::service::AGENT_REGISTRY;
+        registry.remove_by_project(project); // 幂等清理残留
+        registry.register(project, real_sid, make_agent_info(project, real_sid));
+
+        // stale_sid 从未注册 → get_project_by_session(stale_sid)=None → 只 buffer，返回 0
+        let cleared = ensure_project_session(project, stale_sid).await;
+        assert_eq!(cleared, 0, "stale sid must be ignored (buffer-only, no migration)");
+        assert_eq!(
+            registry.get_session_by_project(project).as_deref(),
+            Some(real_sid),
+            "active session mapping must NOT be overwritten by a stale sid"
+        );
+
+        registry.remove_by_project(project);
     }
 }
