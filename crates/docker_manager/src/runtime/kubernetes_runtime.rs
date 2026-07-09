@@ -135,7 +135,10 @@ impl KubernetesRuntime {
                 cluster_domain,
                 pod_ttl_seconds: config.container_ttl_seconds,
                 image_pull_secret: std::env::var("RCODER_K8S_IMAGE_PULL_SECRET").ok(),
-                service_account_name: "rcoder-pods-sa".to_string(),
+                // agent-runner Pod 的 ServiceAccount 名（helm 注入 RCODER_AGENT_RUNNER_SA）。
+                // 兜底 rcoder-pods-sa 以兼容未注入该 env 的旧 chart，不破现有部署。
+                service_account_name: std::env::var("RCODER_AGENT_RUNNER_SA")
+                    .unwrap_or_else(|_| "rcoder-pods-sa".to_string()),
                 nfs_server,
                 nfs_path,
                 storage_class,
