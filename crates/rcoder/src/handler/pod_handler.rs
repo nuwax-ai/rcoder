@@ -37,7 +37,7 @@ use shared_types::{
 ///
 /// # 返回
 /// Ok(()) 验证通过，Err(String) 返回错误信息
-fn validate_resource_limits(limits: &PodResourceLimits) -> Result<(), String> {
+fn validate_resource_limits(limits: &ServiceResourceLimits) -> Result<(), String> {
     // 验证 CPU 限制
     if let Some(cpu) = limits.cpu {
         if cpu <= 0.0 {
@@ -88,9 +88,8 @@ fn validate_resource_limits(limits: &PodResourceLimits) -> Result<(), String> {
 /// `ServiceImageConfig.resource_limits`（来自 configmap）兜底，并通过 `merge_with`
 /// 做字段级合并——API 显式传入的字段优先，未传字段回退默认值。
 ///
-/// 公共核心：直接接受 `ServiceResourceLimits`，供 `/chat`、`/computer/chat` 等
-/// 已持有 `ServiceResourceLimits` 的入口复用；`/pod/*` 入口用 `PodResourceLimits`，
-/// 由 [`resolve_resource_limits`] 做类型转换后委托本函数。
+/// 公共核心：直接接受 `ServiceResourceLimits`，所有入口（`/chat`、`/computer/chat`、
+/// `/pod/ensure`、`/pod/restart`）统一用 `ServiceResourceLimits`，直接复用本函数。
 pub(crate) fn resolve_resource_limits_from_config(
     state: &AppState,
     service_type: &ServiceType,
@@ -125,9 +124,9 @@ pub(crate) fn resolve_resource_limits_from_config(
     // swap_limit/storage_size 不进 container resources，故不在此记录）
     let mem = result
         .as_ref()
-        .and_then(|l| l.memory_limit)
+        .and_then(|l| l.memory)
         .map(|b| format!("{:.1}Gi", b / 1024.0 / 1024.0 / 1024.0));
-    let cpu = result.as_ref().and_then(|l| l.cpu_limit);
+    let cpu = result.as_ref().and_then(|l| l.cpu);
     info!(
         "[RESOURCE_LIMITS] service_type={:?}, source={}, memory={}, cpu={}",
         service_type,
@@ -137,25 +136,6 @@ pub(crate) fn resolve_resource_limits_from_config(
     );
 
     result
-}
-
-/// `/pod/ensure`、`/pod/restart` 接口的 resource_limits 是 `PodResourceLimits` 类型，
-/// 这里先转成 `ServiceResourceLimits`，再委托 [`resolve_resource_limits_from_config`] 合并。
-fn resolve_resource_limits(
-    state: &AppState,
-    service_type: &ServiceType,
-    api_limits: Option<PodResourceLimits>,
-) -> Option<ServiceResourceLimits> {
-    let api_limits = api_limits.map(|limits| {
-        ServiceResourceLimits::new(
-            limits.memory,
-            limits.cpu,
-            limits.swap,
-            limits.storage_size,
-            limits.ephemeral_storage_limit,
-        )
-    });
-    resolve_resource_limits_from_config(state, service_type, api_limits)
 }
 
 /// 解析 service_type 字符串为 ServiceType 枚举
@@ -379,7 +359,7 @@ pub struct EnsurePodRequest {
 
     /// 可选的资源限制配置
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource_limits: Option<PodResourceLimits>,
+    pub resource_limits: Option<ServiceResourceLimits>,
 
     /// 容器唯一标识，若传值则使用此 ID 标识容器，实现容器复用
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,44 +395,6 @@ pub struct EnsurePodRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
-}
-
-/// Pod 资源限制配置
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct PodResourceLimits {
-    /// 内存限制 (bytes), 例如 4GB = 4294967296，支持浮点数输入
-    #[schema(example = 4294967296.0)]
-    pub memory: Option<f64>,
-
-    /// CPU 限制（核心数）, 例如 1.5 表示 1.5 核
-    #[schema(example = 2.0)]
-    pub cpu: Option<f64>,
-
-    /// 交换空间限制 (bytes), 例如 2GB = 2147483648，支持浮点数输入
-    #[schema(example = 2147483648.0)]
-    pub swap: Option<f64>,
-
-    /// PVC 存储空间大小（仅 K8s 模式生效，Docker 模式忽略）
-    ///
-    /// 格式：`<数字><单位>`，支持以下单位：
-    /// - 二进制单位：`Mi`（兆字节）、`Gi`（吉字节）、`Ti`（太字节）
-    /// - 十进制单位：`M`（兆字节）、`G`（吉字节）、`T`（太字节）
-    ///
-    /// 范围：最小 1Gi，最大 100Ti
-    /// 默认值：10Gi（未指定时）
-    ///
-    /// 示例："10Gi", "100Mi", "1.5Ti"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "10Gi")]
-    pub storage_size: Option<String>,
-
-    /// 临时存储限制（overlay 可写层，仅 K8s 模式生效）
-    ///
-    /// 限制容器根文件系统可写层 + emptyDir 等临时存储的写入量（区别于 storage_size 管 PVC）。
-    /// 与 storage_size 是两个独立配额，不会合并；未指定时回退到 storage_size 的值。范围/格式同 storage_size。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "10Gi")]
-    pub ephemeral_storage_limit: Option<String>,
 }
 
 /// 启动容器响应
@@ -587,7 +529,7 @@ pub struct RestartPodRequest {
 
     /// 可选的资源限制配置
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource_limits: Option<PodResourceLimits>,
+    pub resource_limits: Option<ServiceResourceLimits>,
 
     /// 容器唯一标识，若传值则使用此 ID 标识容器，实现容器复用
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1192,7 +1134,7 @@ pub async fn pod_ensure(
 
         // 创建新容器，最多重试 3 次
         let resource_limits =
-            resolve_resource_limits(&state, &service_type, request.resource_limits);
+            resolve_resource_limits_from_config(&state, &service_type, request.resource_limits);
 
         let mut last_error = None;
         let mut result = None;
@@ -1349,7 +1291,7 @@ pub async fn pod_ensure(
                         );
 
                         let resource_limits =
-                            resolve_resource_limits(&state, &service_type, request.resource_limits);
+                            resolve_resource_limits_from_config(&state, &service_type, request.resource_limits);
 
                         // 设置创建标记
                         state
@@ -1876,7 +1818,7 @@ pub async fn pod_restart(
     }
 
     // 4. 定义资源限制（API 入参优先，缺失字段回退 configmap 默认值）
-    let resource_limits = resolve_resource_limits(&state, &service_type, request.resource_limits);
+    let resource_limits = resolve_resource_limits_from_config(&state, &service_type, request.resource_limits);
 
     // 5. 强制创建新容器
     info!(
@@ -2570,7 +2512,7 @@ mod tests {
 
     #[test]
     fn test_pod_resource_limits_serialization() {
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: Some(4294967296.0),
             cpu: Some(2.0),
             swap: Some(6442450944.0),
@@ -2604,7 +2546,7 @@ mod tests {
 
     #[test]
     fn test_validate_resource_limits_valid() {
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: Some(4294967296.0), // 4GB
             cpu: Some(2.0),
             swap: Some(6442450944.0), // 6GB
@@ -2616,7 +2558,7 @@ mod tests {
 
     #[test]
     fn test_validate_resource_limits_none_values() {
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: None,
             cpu: None,
             swap: None,
@@ -2628,7 +2570,7 @@ mod tests {
 
     #[test]
     fn test_validate_resource_limits_cpu_zero() {
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: None,
             cpu: Some(0.0),
             swap: None,
@@ -2640,7 +2582,7 @@ mod tests {
 
     #[test]
     fn test_validate_resource_limits_cpu_negative() {
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: None,
             cpu: Some(-1.0),
             swap: None,
@@ -2652,7 +2594,7 @@ mod tests {
 
     #[test]
     fn test_validate_resource_limits_cpu_too_large() {
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: None,
             cpu: Some(200.0),
             swap: None,
@@ -2664,7 +2606,7 @@ mod tests {
 
     #[test]
     fn test_validate_resource_limits_memory_too_small() {
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: Some(256_000_000.0), // 256MB
             cpu: None,
             swap: None,
@@ -2676,7 +2618,7 @@ mod tests {
 
     #[test]
     fn test_validate_resource_limits_memory_too_large() {
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: Some(256_000_000_000.0), // 256GB
             cpu: None,
             swap: None,
@@ -2688,7 +2630,7 @@ mod tests {
 
     #[test]
     fn test_validate_resource_limits_swap_less_than_memory() {
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: Some(8_589_934_592.0), // 8GB
             cpu: None,
             swap: Some(4_294_967_296.0), // 4GB
@@ -2700,7 +2642,7 @@ mod tests {
 
     #[test]
     fn test_validate_resource_limits_swap_too_small() {
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: None,
             cpu: None,
             swap: Some(256_000_000.0), // 256MB
@@ -2713,7 +2655,7 @@ mod tests {
     #[test]
     fn test_validate_resource_limits_cpu_boundary() {
         // 测试边界值：0.1 应该失败（小于等于 0）
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: None,
             cpu: Some(0.1),
             swap: None,
@@ -2723,7 +2665,7 @@ mod tests {
         assert!(validate_resource_limits(&limits).is_ok());
 
         // 测试边界值：0.01 应该通过
-        let limits = PodResourceLimits {
+        let limits = ServiceResourceLimits {
             memory: None,
             cpu: Some(0.01),
             swap: None,

@@ -2,7 +2,8 @@
 //!
 //! 使用 Builder 模式构建 DockerContainerConfig
 
-use crate::{DockerContainerConfig, DockerResult, MountPoint, ResourceLimits};
+use crate::{DockerContainerConfig, DockerResult, MountPoint};
+use shared_types::ServiceResourceLimits;
 use std::collections::HashMap;
 use tracing::debug;
 
@@ -36,7 +37,7 @@ pub struct ContainerConfigBuilder {
     port_bindings: HashMap<String, String>,
     network_mode: Option<String>,
     auto_remove: bool,
-    resource_limits: Option<ResourceLimits>,
+    resource_limits: Option<ServiceResourceLimits>,
     extra_mounts: Vec<MountPoint>,
     command: Option<Vec<String>>,
     entrypoint: Option<Vec<String>>,
@@ -150,7 +151,7 @@ impl ContainerConfigBuilder {
     }
 
     /// 设置资源限制
-    pub fn resource_limits(mut self, limits: ResourceLimits) -> Self {
+    pub fn resource_limits(mut self, limits: ServiceResourceLimits) -> Self {
         self.resource_limits = Some(limits);
         self
     }
@@ -328,10 +329,12 @@ mod tests {
 
     #[test]
     fn test_builder_with_resource_limits() {
-        let limits = ResourceLimits {
-            memory_limit: Some((512 * 1024 * 1024) as f64), // 512MB
-            cpu_limit: Some(1.0),
-            swap_limit: None,
+        let limits = ServiceResourceLimits {
+            memory: Some((512 * 1024 * 1024) as f64), // 512MB
+            cpu: Some(1.0),
+            swap: None,
+            storage_size: None,
+            ephemeral_storage_limit: None,
         };
 
         let config = ContainerConfigBuilder::new("test-project")
@@ -341,10 +344,7 @@ mod tests {
 
         assert!(config.resource_limits.is_some());
         let resource_limits = config.resource_limits.unwrap();
-        assert_eq!(
-            resource_limits.memory_limit,
-            Some((512 * 1024 * 1024) as f64)
-        );
-        assert_eq!(resource_limits.cpu_limit, Some(1.0));
+        assert_eq!(resource_limits.memory, Some((512 * 1024 * 1024) as f64));
+        assert_eq!(resource_limits.cpu, Some(1.0));
     }
 }

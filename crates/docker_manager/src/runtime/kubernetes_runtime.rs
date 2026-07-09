@@ -276,14 +276,14 @@ impl KubernetesRuntime {
         let mut lims: std::collections::BTreeMap<String, Quantity> =
             std::collections::BTreeMap::new();
 
-        if let Some(memory) = limits.memory_limit {
+        if let Some(memory) = limits.memory {
             // memory_limit is in bytes, convert to Mi
             let mem_mb = (memory / (1024.0 * 1024.0)) as i64;
             // Quantity is a string wrapper, construct directly with formatted string
             requests.insert("memory".to_string(), Quantity(format!("{}Mi", mem_mb)));
             lims.insert("memory".to_string(), Quantity(format!("{}Mi", mem_mb)));
         }
-        if let Some(cpu) = limits.cpu_limit {
+        if let Some(cpu) = limits.cpu {
             // cpu_limit is core count, format as decimal string
             requests.insert("cpu".to_string(), Quantity(format!("{}", cpu)));
             lims.insert("cpu".to_string(), Quantity(format!("{}", cpu)));

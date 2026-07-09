@@ -457,7 +457,7 @@ fn build_host_config(
     mounts: Vec<Mount>,
     port_bindings: HashMap<String, Option<Vec<PortBinding>>>,
     auto_remove: bool,
-    resource_limits: Option<&crate::types::ResourceLimits>,
+    resource_limits: Option<&shared_types::ServiceResourceLimits>,
 ) -> HostConfig {
     let mut config = HostConfig {
         mounts: Some(mounts),
@@ -479,23 +479,23 @@ fn build_host_config(
     };
 
     if let Some(limits) = resource_limits {
-        config.memory = limits.memory_limit.and_then(|v| {
+        config.memory = limits.memory.and_then(|v| {
             if v.is_finite() && v >= 0.0 && v <= i64::MAX as f64 {
                 Some(v as i64)
             } else {
-                warn!("[DOCKER_MGR] memory_limit {} out of range, skipping", v);
+                warn!("[DOCKER_MGR] memory {} out of range, skipping", v);
                 None
             }
         });
-        config.memory_swap = limits.swap_limit.and_then(|v| {
+        config.memory_swap = limits.swap.and_then(|v| {
             if v.is_finite() && v >= 0.0 && v <= i64::MAX as f64 {
                 Some(v as i64)
             } else {
-                warn!("[DOCKER_MGR] swap_limit {} out of range, skipping", v);
+                warn!("[DOCKER_MGR] swap {} out of range, skipping", v);
                 None
             }
         });
-        if let Some(cpu_limit) = limits.cpu_limit {
+        if let Some(cpu_limit) = limits.cpu {
             let nano_cpus = cpu_limit * 1e9;
             if nano_cpus.is_finite() && nano_cpus >= 0.0 && nano_cpus <= i64::MAX as f64 {
                 config.nano_cpus = Some(nano_cpus as i64);

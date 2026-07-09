@@ -174,11 +174,9 @@ impl<'a> AgentContainerStarter<'a> {
             None => limits,
         };
 
-        builder = builder.resource_limits(crate::types::ResourceLimits {
-            memory_limit: final_resource_limits.memory_limit,
-            cpu_limit: final_resource_limits.cpu_limit,
-            swap_limit: final_resource_limits.swap_limit,
-        });
+        // final_resource_limits 已是 ServiceResourceLimits，直接传给 builder
+        // （Docker 只用 memory/cpu/swap，storage 字段随 struct 携带但 build_host_config 不读）
+        builder = builder.resource_limits(final_resource_limits);
 
         // 添加环境变量
         // 处理其他环境变量中的模板（先处理，因为后续需要使用 project_id/user_id 的值）

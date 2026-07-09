@@ -667,7 +667,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::PodListResponse,
             handler::PodDetailInfo,
             handler::EnsurePodRequest,
-            handler::PodResourceLimits,
+            shared_types::ServiceResourceLimits,
             handler::EnsurePodResponse,
             handler::PodContainerInfo,
             handler::KeepalivePodRequest,

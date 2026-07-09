@@ -112,11 +112,17 @@ pub struct ServiceMountConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceResourceLimits {
     /// 内存限制（字节，支持浮点数输入）
-    pub memory_limit: Option<f64>,
-    /// CPU 限制（核心数）
-    pub cpu_limit: Option<f64>,
-    /// 交换空间限制（字节，支持浮点数输入）
-    pub swap_limit: Option<f64>,
+    ///
+    /// 注：字段名 `memory`（对齐 /computer/pod/ensure 基准）；serde alias `memory_limit`
+    /// 兼容旧 config.yml 键名与旧 HTTP 请求，反序列化两种写法都接受。
+    #[serde(alias = "memory_limit")]
+    pub memory: Option<f64>,
+    /// CPU 限制（核心数）。alias `cpu_limit` 兼容旧命名。
+    #[serde(alias = "cpu_limit")]
+    pub cpu: Option<f64>,
+    /// 交换空间限制（字节，支持浮点数输入）。alias `swap_limit` 兼容旧命名。
+    #[serde(alias = "swap_limit")]
+    pub swap: Option<f64>,
     /// PVC 存储空间大小（仅 K8s 模式生效，Docker 模式忽略）
     ///
     /// 格式：`<数字><单位>`，支持 Mi/Gi/Ti（二进制）和 M/G/T（十进制）
@@ -139,16 +145,16 @@ impl ServiceResourceLimits {
     /// - Docker 模式忽略 `storage_size` / `ephemeral_storage_limit`
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        memory_limit: Option<f64>,
-        cpu_limit: Option<f64>,
-        swap_limit: Option<f64>,
+        memory: Option<f64>,
+        cpu: Option<f64>,
+        swap: Option<f64>,
         storage_size: Option<String>,
         ephemeral_storage_limit: Option<String>,
     ) -> Self {
         Self {
-            memory_limit,
-            cpu_limit,
-            swap_limit,
+            memory,
+            cpu,
+            swap,
             storage_size,
             ephemeral_storage_limit,
         }
@@ -157,7 +163,7 @@ impl ServiceResourceLimits {
     /// 验证资源限制的合理性
     pub fn validate(&self) -> Result<(), String> {
         // 内存限制：512MB ~ 64GB
-        if let Some(memory) = self.memory_limit {
+        if let Some(memory) = self.memory {
             if memory < 512_000_000.0 {
                 return Err("memory_limit must be at least 512MB".to_string());
             }
@@ -167,7 +173,7 @@ impl ServiceResourceLimits {
         }
 
         // CPU 限制：0.5 ~ 32 核
-        if let Some(cpu) = self.cpu_limit {
+        if let Some(cpu) = self.cpu {
             if cpu < 0.5 {
                 return Err("cpu_limit must be at least 0.5 cores".to_string());
             }
@@ -177,7 +183,7 @@ impl ServiceResourceLimits {
         }
 
         // Swap 应该 >= 内存
-        if let (Some(memory), Some(swap)) = (self.memory_limit, self.swap_limit)
+        if let (Some(memory), Some(swap)) = (self.memory, self.swap)
             && swap < memory
         {
             return Err("swap_limit should be >= memory_limit".to_string());
@@ -189,9 +195,9 @@ impl ServiceResourceLimits {
     /// 合并资源限制（override_limits 覆盖 self 中的字段）
     pub fn merge_with(&self, override_limits: &ServiceResourceLimits) -> Self {
         Self {
-            memory_limit: override_limits.memory_limit.or(self.memory_limit),
-            cpu_limit: override_limits.cpu_limit.or(self.cpu_limit),
-            swap_limit: override_limits.swap_limit.or(self.swap_limit),
+            memory: override_limits.memory.or(self.memory),
+            cpu: override_limits.cpu.or(self.cpu),
+            swap: override_limits.swap.or(self.swap),
             storage_size: override_limits
                 .storage_size
                 .clone()
@@ -596,6 +602,37 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// serde alias 兼容：旧字段名（memory_limit/cpu_limit/swap_limit）经 alias 反序列化到
+    /// 新字段（memory/cpu/swap）。保证 config.yml 旧键名 + 旧 HTTP 请求不破坏。
+    #[test]
+    fn test_resource_limits_serde_alias() {
+        // 旧字段名（config.yml 现状）经 alias 解析到新字段
+        let json_old = r#"{"memory_limit":1e9,"cpu_limit":2.0,"swap_limit":2e9}"#;
+        let limits_old: ServiceResourceLimits = serde_json::from_str(json_old).unwrap();
+        assert_eq!(limits_old.memory, Some(1e9));
+        assert_eq!(limits_old.cpu, Some(2.0));
+        assert_eq!(limits_old.swap, Some(2e9));
+
+        // 新字段名直接解析
+        let json_new = r#"{"memory":1e9,"cpu":2.0,"swap":2e9}"#;
+        let limits_new: ServiceResourceLimits = serde_json::from_str(json_new).unwrap();
+        assert_eq!(limits_new.memory, Some(1e9));
+        assert_eq!(limits_new.cpu, Some(2.0));
+        assert_eq!(limits_new.swap, Some(2e9));
+
+        // 序列化用新字段名（不带 _limit）
+        let s = serde_json::to_string(&limits_old).unwrap();
+        assert!(
+            s.contains("\"memory\""),
+            "serialized should use new field name: {s}"
+        );
+        assert!(
+            !s.contains("memory_limit"),
+            "serialized should not use alias: {s}"
+        );
+    }
+
     #[test]
     fn test_config_validation() {
         let mut config = default_rcoder_service_config();
@@ -759,9 +796,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_valid() {
         let valid = ServiceResourceLimits {
-            memory_limit: Some(1_000_000_000.0), // 1GB
-            cpu_limit: Some(2.0),
-            swap_limit: Some(2_000_000_000.0), // 2GB
+            memory: Some(1_000_000_000.0), // 1GB
+            cpu: Some(2.0),
+            swap: Some(2_000_000_000.0), // 2GB
             storage_size: None,
             ephemeral_storage_limit: None,
         };
@@ -771,9 +808,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_small() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(256_000_000.0), // 256MB - 太小
-            cpu_limit: None,
-            swap_limit: None,
+            memory: Some(256_000_000.0), // 256MB - 太小
+            cpu: None,
+            swap: None,
             storage_size: None,
             ephemeral_storage_limit: None,
         };
@@ -784,9 +821,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_large() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(100_000_000_000.0), // 100GB - 太大
-            cpu_limit: None,
-            swap_limit: None,
+            memory: Some(100_000_000_000.0), // 100GB - 太大
+            cpu: None,
+            swap: None,
             storage_size: None,
             ephemeral_storage_limit: None,
         };
@@ -802,9 +839,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_cpu_too_small() {
         let invalid = ServiceResourceLimits {
-            memory_limit: None,
-            cpu_limit: Some(0.1), // 太小
-            swap_limit: None,
+            memory: None,
+            cpu: Some(0.1), // 太小
+            swap: None,
             storage_size: None,
             ephemeral_storage_limit: None,
         };
@@ -820,9 +857,9 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_swap_less_than_memory() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0), // 2GB
-            cpu_limit: None,
-            swap_limit: Some(1_000_000_000.0), // 1GB - swap < memory
+            memory: Some(2_000_000_000.0), // 2GB
+            cpu: None,
+            swap: Some(1_000_000_000.0), // 1GB - swap < memory
             storage_size: None,
             ephemeral_storage_limit: None,
         };
@@ -838,51 +875,51 @@ mod tests {
     #[test]
     fn test_resource_limits_merge() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0), // 2GB
-            cpu_limit: Some(2.0),
-            swap_limit: Some(4_000_000_000.0), // 4GB
+            memory: Some(2_000_000_000.0), // 2GB
+            cpu: Some(2.0),
+            swap: Some(4_000_000_000.0), // 4GB
             storage_size: None,
             ephemeral_storage_limit: None,
         };
 
         let override_limits = ServiceResourceLimits {
-            memory_limit: Some(4_000_000_000.0), // 覆盖：4GB
-            cpu_limit: None,                     // 不覆盖
-            swap_limit: Some(8_000_000_000.0),   // 覆盖：8GB
+            memory: Some(4_000_000_000.0), // 覆盖：4GB
+            cpu: None,                     // 不覆盖
+            swap: Some(8_000_000_000.0),   // 覆盖：8GB
             storage_size: Some("20Gi".to_string()),
             ephemeral_storage_limit: None,
         };
 
         let merged = default_limits.merge_with(&override_limits);
-        assert_eq!(merged.memory_limit, Some(4_000_000_000.0));
-        assert_eq!(merged.cpu_limit, Some(2.0)); // 保留默认
-        assert_eq!(merged.swap_limit, Some(8_000_000_000.0));
+        assert_eq!(merged.memory, Some(4_000_000_000.0));
+        assert_eq!(merged.cpu, Some(2.0)); // 保留默认
+        assert_eq!(merged.swap, Some(8_000_000_000.0));
         assert_eq!(merged.storage_size, Some("20Gi".to_string()));
     }
 
     #[test]
     fn test_resource_limits_merge_all_none() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0), // 2GB
-            cpu_limit: Some(2.0),
-            swap_limit: Some(4_000_000_000.0), // 4GB
+            memory: Some(2_000_000_000.0), // 2GB
+            cpu: Some(2.0),
+            swap: Some(4_000_000_000.0), // 4GB
             storage_size: Some("10Gi".to_string()),
             ephemeral_storage_limit: None,
         };
 
         let override_limits = ServiceResourceLimits {
-            memory_limit: None,
-            cpu_limit: None,
-            swap_limit: None,
+            memory: None,
+            cpu: None,
+            swap: None,
             storage_size: None,
             ephemeral_storage_limit: None,
         };
 
         let merged = default_limits.merge_with(&override_limits);
         // 所有字段都应该保留默认值
-        assert_eq!(merged.memory_limit, Some(2_000_000_000.0));
-        assert_eq!(merged.cpu_limit, Some(2.0));
-        assert_eq!(merged.swap_limit, Some(4_000_000_000.0));
+        assert_eq!(merged.memory, Some(2_000_000_000.0));
+        assert_eq!(merged.cpu, Some(2.0));
+        assert_eq!(merged.swap, Some(4_000_000_000.0));
         assert_eq!(merged.storage_size, Some("10Gi".to_string()));
     }
 

@@ -26,8 +26,8 @@ pub struct DockerContainerConfig {
     pub network_mode: String,
     /// 自动删除
     pub auto_remove: bool,
-    /// 资源限制
-    pub resource_limits: Option<ResourceLimits>,
+    /// 资源限制（复用 shared_types::ServiceResourceLimits，全仓库资源类型统一）
+    pub resource_limits: Option<shared_types::ServiceResourceLimits>,
     /// 额外的挂载点
     pub extra_mounts: Vec<MountPoint>,
     /// 启动命令
@@ -62,17 +62,6 @@ pub struct MountPoint {
     pub container_path: String,
     /// 是否只读
     pub read_only: bool,
-}
-
-/// 资源限制配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceLimits {
-    /// 内存限制 (字节，支持浮点数)
-    pub memory_limit: Option<f64>,
-    /// CPU 限制
-    pub cpu_limit: Option<f64>,
-    /// 交换空间限制 (字节，支持浮点数)
-    pub swap_limit: Option<f64>,
 }
 
 impl DockerContainerConfig {
