@@ -71,15 +71,18 @@ make dev-up         # 启动开发容器
 
 ### 开发环境命令
 ```bash
-# 启动开发模式容器
-make dev-build      # 首次：构建 Docker 镜像
+# 首次部署（端口 8090）
+make dev-build      # 构建 Docker 镜像 dev-master-rcoder:latest
 make dev-up         # 启动容器
-make dev-restart    # 代码修改后重启容器
 
-# 查看容器日志
+# 日常开发：改 Rust 源码后秒级热编译（推荐！详见下文「本地 Docker Compose 测试」）
+make dev-hot
+
+# 全量重建（改 Dockerfile / Cargo.toml 依赖 / 非 Rust 改动时才用，10+ 分钟）
+make dev-restart
+
+# 日志 / 停止
 make dev-logs
-
-# 停止开发容器
 make dev-down
 ```
 
@@ -302,6 +305,55 @@ docker network inspect rcoder_agent-network
 # 测试容器间连通性
 docker exec <container1> ping <container2_ip>
 ```
+
+### 本地 Docker Compose 测试（端口 8090）
+
+用 `make dev-up` 启动 Docker Compose 模式（OrbStack 提供 docker），默认服务端口 `8090`，主容器 `rcoder-rcoder-1`，network `rcoder_default`。
+
+**首次部署**：
+```bash
+make dev-build      # 构建 Docker 镜像 dev-master-rcoder:latest
+make dev-up         # 启动容器
+```
+
+**日常开发（推荐：容器内热编译）**：
+
+`docker-compose.yml` 已挂载仓库源码到 `/app/src` + cargo/target 缓存 volume。改 Rust 源码后用 `make dev-hot` 秒级生效，**不用 `make dev-restart` 全量重建（10+ 分钟）**：
+```bash
+make dev-hot        # 容器内 cargo build --release --bin rcoder + mv 替换 binary + docker restart
+                    # 首次较慢（补 cmake/protoc + 全量编译），之后增量秒级（<2min）
+```
+脚本：`docker/dev-hot-build.sh`。改 Dockerfile / `Cargo.toml` 依赖 / 非 Rust 文件时仍需 `make dev-restart`。
+
+**日志查看**（rcoder 同时写文件 + stdout）：
+```bash
+make dev-logs       # docker logs（stdout）
+# 或查文件（按天滚动、JSON 格式，与 K8s 同款）
+docker exec rcoder-rcoder-1 grep -a "ERROR\|\[APP" /app/logs/rcoder.$(date +%Y-%m-%d) | tail -20
+```
+
+**端口 / 容器 / 网络**：
+- 主服务：`rcoder-rcoder-1`，端口 `8090`
+- Pingora 代理：宿主机 `8089` → 容器 `8088`（app HTTP 端口经 `/proxy/{port}` 暴露）
+- 网络：`rcoder_default`（动态 app 容器加入，pingora 通过 container_ip 访问）
+- app 工作空间：容器 `/app/app-workspace/{app_id}`，宿主机 `docker/app-workspace/`
+
+**app_manager（UserApp）Docker 模式要点**：
+- HTTP 端口：Pingora `/proxy/{port}` → container_ip:port；`access.http = http://127.0.0.1:8088/proxy/{port}`（宿主机访问把端口换成 8089）
+- TCP 端口：Docker 自动分配 host_port（`access.tcp.node_port`）
+- app 容器名：`rcoder-app-{app_id}`，label `managed-by=rcoder-app-manager`
+- ⚠️ rcoder 重启后 pingora 内存路由丢失（HTTP 端口需重建 app 才恢复，已知限制）
+
+**Docker Compose vs K8s（devspace）对照**：
+
+| 维度 | Docker Compose | K8s（devspace，详见下文） |
+|---|---|---|
+| 启动 | `make dev-up` | `devspace dev` |
+| 服务端口 | 8090 | 8290 |
+| HTTP 暴露 | Pingora `/proxy/{port}` | Envoy Gateway HTTPRoute `/apps/{id}` |
+| 热重载 | `make dev-hot`（秒级热编译） | devspace sync（rcoder 不自动重启，需 `kubectl delete pod`） |
+| app 计算单元 | 单容器 | Deployment + Pod |
+| 日志 | stdout + 文件 | 文件（`kubectl logs` 几乎空） |
 
 ### 本地 K8s 测试（devspace + OrbStack）
 

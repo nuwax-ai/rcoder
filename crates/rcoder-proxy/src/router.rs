@@ -258,6 +258,21 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
             crate::ProxyError::RouteConfig(format!("Port proxy route configuration error: {}", e))
         })?;
 
+    // 兜底：访问 app 根路径 /proxy/{port}（无尾随 path，如 http://host:port/proxy/80）。
+    // matchit 的 {*path} 要求至少 1 个字符，/proxy/{port}/{*path} 无法匹配 2 段路径，
+    // 单独注册 /proxy/{port} 让根路径访问能命中 PortProxy（handler L48-52 已把空 path
+    // 归一为 "/"，转发到 backend 根），否则 /proxy/80 → route not found → 404，
+    // app 根路径完全不可达。
+    router
+        .insert("/proxy/{port}", RouteType::PortProxy)
+        .map_err(|e| {
+            tracing::error!("[ROUTER] port proxy root route config failed: {}", e);
+            crate::ProxyError::RouteConfig(format!(
+                "Port proxy root route configuration error: {}",
+                e
+            ))
+        })?;
+
     // ========================================================================
     // 健康检查路由
     // ========================================================================
@@ -469,6 +484,12 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
             "Dynamic routing to backend service on specified port".to_string(),
         ),
         (
+            "/proxy/{port}".to_string(),
+            "Port reverse proxy (root)".to_string(),
+            "Fallback for app root path (no trailing path); matchit {*path} requires >=1 char"
+                .to_string(),
+        ),
+        (
             "/health".to_string(),
             "Health check".to_string(),
             "Returns Pingora proxy service health status".to_string(),
@@ -601,7 +622,7 @@ mod tests {
     #[test]
     fn test_get_routes_documentation() {
         let docs = get_routes_documentation();
-        assert_eq!(docs.len(), 9);
+        assert_eq!(docs.len(), 10);
 
         // 验证 VNC 路由文档
         assert!(docs[0].0.contains("vnc"));
@@ -611,33 +632,37 @@ mod tests {
         assert!(docs[1].0.contains("proxy"));
         assert!(docs[1].1.contains("Port"));
 
+        // 验证端口代理根路径兜底文档
+        assert!(docs[2].0.contains("proxy"));
+        assert!(docs[2].1.contains("Port"));
+
         // 验证健康检查路由文档
-        assert!(docs[2].0.contains("health"));
-        assert!(docs[2].1.contains("Health"));
+        assert!(docs[3].0.contains("health"));
+        assert!(docs[3].1.contains("Health"));
 
         // 验证 API 代理路由文档
-        assert!(docs[3].0.contains("api"));
-        assert!(docs[3].1.contains("API"));
-
-        // 验证 API 代理 fallback 路由文档
         assert!(docs[4].0.contains("api"));
         assert!(docs[4].1.contains("API"));
 
+        // 验证 API 代理 fallback 路由文档
+        assert!(docs[5].0.contains("api"));
+        assert!(docs[5].1.contains("API"));
+
         // 验证音频代理路由文档
-        assert!(docs[5].0.contains("audio"));
-        assert!(docs[5].1.contains("Audio"));
+        assert!(docs[6].0.contains("audio"));
+        assert!(docs[6].1.contains("Audio"));
 
         // 验证 IME 代理路由文档
-        assert!(docs[6].0.contains("ime"));
-        assert!(docs[6].1.contains("IME"));
+        assert!(docs[7].0.contains("ime"));
+        assert!(docs[7].1.contains("IME"));
 
         // 验证 ttyd 代理路由文档
-        assert!(docs[7].0.contains("ttyd"));
-        assert!(docs[7].1.contains("ttyd"));
+        assert!(docs[8].0.contains("ttyd"));
+        assert!(docs[8].1.contains("ttyd"));
 
         // 验证 Web ttyd 代理路由文档
-        assert!(docs[8].0.contains("web/ttyd"));
-        assert!(docs[8].1.contains("Web"));
+        assert!(docs[9].0.contains("web/ttyd"));
+        assert!(docs[9].1.contains("Web"));
     }
 
     #[test]
