@@ -15,8 +15,9 @@ use container_runtime_api::{
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
-    Container as K8sContainer, ContainerPort, EnvVar, LocalObjectReference, PersistentVolumeClaim,
-    Pod, PodSecurityContext, PodSpec, Probe, ResourceRequirements, Service, Volume, VolumeMount,
+    ConfigMapVolumeSource, Container as K8sContainer, ContainerPort, EmptyDirVolumeSource, EnvVar,
+    LocalObjectReference, PersistentVolumeClaim, PersistentVolumeClaimVolumeSource, Pod,
+    PodSecurityContext, PodSpec, Probe, ResourceRequirements, Service, Volume, VolumeMount,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -29,7 +30,10 @@ use kube::api::{Api, DeleteParams, DynamicObject, ListParams, ObjectMeta, PostPa
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
 #[cfg(feature = "kubernetes")]
-use shared_types::{ContainerBasicInfo, ServiceResourceLimits, ServiceType};
+use shared_types::{
+    ContainerBasicInfo, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec, K8sVolumeType,
+    ServiceResourceLimits, ServiceType,
+};
 #[cfg(feature = "kubernetes")]
 use std::sync::Arc;
 #[cfg(feature = "kubernetes")]
@@ -87,6 +91,8 @@ pub struct KubernetesRuntimeConfig {
     pub access_mode: String,
     /// DockerManagerConfig for image selection (包含 multi_image_config)
     pub docker_manager_config: DockerManagerConfig,
+    /// K8s 运行时专用配置(自包含 image/env/command/卷/sidecar;K8s 构建器只读它)
+    pub kubernetes_config: shared_types::KubernetesConfig,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -127,13 +133,19 @@ impl KubernetesRuntime {
             nfs_server, nfs_path, storage_class, access_mode
         );
 
+        // 先取出 kubernetes_config(克隆),之后把 config 整体 move 进 docker_manager_config,
+        // 避免克隆整个 DockerManagerConfig(含 multi_image_config 的 HashMap)。
+        let kubernetes_config = config.kubernetes_config.clone();
+        // pod_ttl_seconds 是 Copy,move 前读取即可。
+        let pod_ttl_seconds = config.container_ttl_seconds;
+
         Ok(Self {
             client,
             namespace: namespace.clone(),
             config: KubernetesRuntimeConfig {
                 namespace: namespace.clone(),
                 cluster_domain,
-                pod_ttl_seconds: config.container_ttl_seconds,
+                pod_ttl_seconds,
                 image_pull_secret: std::env::var("RCODER_K8S_IMAGE_PULL_SECRET").ok(),
                 // agent-runner Pod 的 ServiceAccount 名（helm 注入 RCODER_AGENT_RUNNER_SA）。
                 // 兜底 rcoder-pods-sa 以兼容未注入该 env 的旧 chart，不破现有部署。
@@ -144,6 +156,7 @@ impl KubernetesRuntime {
                 storage_class,
                 access_mode,
                 docker_manager_config: config,
+                kubernetes_config,
             },
             pod_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
         })
@@ -163,19 +176,24 @@ impl KubernetesRuntime {
         &self,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
+        // 完全分家:pod/PVC 命名前缀优先读 kubernetes_config(自包含 image_tag_prefix),
+        // 回退 multi_image_config(过渡期),再回退 service_type.container_prefix() 默认。
+        // 避免命名漂移:k8s 配置改了前缀,pod 与 PVC 必须同步用新前缀。
+        if let Some(k8s_cfg) = self.config.kubernetes_config.get_service_config(service_type) {
+            return Ok(k8s_cfg.container_prefix().to_string());
+        }
         let service_key = service_type.to_string();
-        self.config
+        if let Some(config) = self
+            .config
             .docker_manager_config
             .multi_image_config
             .services
             .get(&service_key)
-            .map(|config| config.container_prefix().to_string())
-            .ok_or_else(|| {
-                ContainerRuntimeError::ConfigurationError(format!(
-                    "Service config not found for service_type={}",
-                    service_type
-                ))
-            })
+        {
+            return Ok(config.container_prefix().to_string());
+        }
+        // 最后兜底:service_type 默认前缀(避免命名查询因配置缺失而硬失败)
+        Ok(service_type.container_prefix().to_string())
     }
 
     pub(crate) fn sanitize_k8s_name_part(input: &str) -> String {
@@ -194,9 +212,13 @@ impl KubernetesRuntime {
             .to_string()
     }
 
-    /// Select image based on service type, using multi_image_config from ConfigMap
+    /// Select image based on service type.
+    ///
+    /// 优先级:env(RCODER_DOCKER_IMAGE* / RCODER_DOCKER_IMAGE_COMPUTER)> `kubernetes_config`
+    /// (完全分家后的主数据源)> `multi_image_config`(docker_config,过渡期安全兜底,
+    /// 避免旧 chart 未带 kubernetes_config 时选不到镜像)> 硬编码默认值。
     fn select_image(&self, service_type: &ServiceType) -> String {
-        // 优先使用环境变量（允许运行时覆盖）
+        // 1. 优先使用环境变量（允许运行时覆盖;deployment.yaml 注入）
         // 注意：ComputerAgentRunner 必须优先检查 RCODER_DOCKER_IMAGE_COMPUTER
         match service_type {
             ServiceType::ComputerAgentRunner => {
@@ -232,14 +254,31 @@ impl KubernetesRuntime {
             }
         }
 
-        // 使用 multi_image_config 配置
-        let multi_config = &self.config.docker_manager_config.multi_image_config;
-        let service_key = service_type.to_string();
+        // 2. 从 kubernetes_config(完全分家后的主数据源)按平台选镜像
+        if let Some(svc) = self.config.kubernetes_config.get_service_config(service_type) {
+            let arch = std::env::consts::ARCH;
+            let platform = if arch == "aarch64" || arch == "arm64" {
+                "linux/arm64"
+            } else {
+                "linux/amd64"
+            };
+            if let Some(image) = svc.get_image_for_platform(platform) {
+                info!("[K8S] Using image from kubernetes_config: {}", image);
+                return image;
+            }
+        }
 
-        if let Some(service_config) = multi_config.services.get(&service_key) {
+        // 3. 过渡期安全兜底:回退到 docker_config.multi_image_config
+        // (旧 chart / 旧 config.yml 未带 kubernetes_config 段时,避免选不到镜像)
+        warn!(
+            "[K8S] kubernetes_config has no image for {}, falling back to multi_image_config (legacy)",
+            service_type
+        );
+        let multi_config = &self.config.docker_manager_config.multi_image_config;
+        if let Some(service_config) = multi_config.get_service_config(service_type) {
             // 优先使用 image 字段
             if let Some(ref image) = service_config.image {
-                info!("[K8S] Using image from multi_image_config: {}", image);
+                info!("[K8S] Using image from multi_image_config (fallback): {}", image);
                 return image.clone();
             }
             // 使用架构特定镜像
@@ -250,17 +289,17 @@ impl KubernetesRuntime {
                 service_config.amd64_image.clone()
             };
             if let Some(img) = image {
-                info!("[K8S] Using architecture-specific image: {}", img);
+                info!("[K8S] Using architecture-specific image (fallback): {}", img);
                 return img.to_string();
             }
             // 使用默认镜像
             if let Some(ref img) = service_config.default_image {
-                info!("[K8S] Using default image: {}", img);
+                info!("[K8S] Using default image (fallback): {}", img);
                 return img.clone();
             }
         }
 
-        // 兜底：使用硬编码默认值（不应该到达这里，因为 multi_image_config 总是有默认值）
+        // 4. 硬编码兜底(env 与 config 都没给)
         warn!("[K8S] No image config found, using hardcoded fallback");
         match service_type {
             // UserApp 实际走 create_deployment（image_override），不走 create_container/select_image
@@ -310,6 +349,117 @@ impl KubernetesRuntime {
             requests: Some(requests),
             limits: Some(lims),
         })
+    }
+
+    // ---- kubernetes_config → kube 对象翻译函数(完全分家:卷/挂载/sidecar 由配置驱动) ----
+
+    /// 翻译 kubernetes_config 卷规格 → kube `Volume`
+    ///
+    /// - 卷名 "workspace" 被拒(builder 硬编码占用)+告警
+    /// - HostPath 被策略禁用 → 跳过+告警
+    /// - Pvc/ConfigMap 缺 claim_name/config_map_name → 跳过+告警
+    /// - 返回 None 表示该卷被丢弃(调用方 flat_map 跳过)
+    fn translate_k8s_volume(spec: &K8sVolumeSpec) -> Option<Volume> {
+        // 卷名冲突保护:workspace 由 builder 硬编码管理
+        if spec.name == "workspace" {
+            warn!(
+                "[K8S] config volume name 'workspace' is reserved (builder-managed), skipping"
+            );
+            return None;
+        }
+        match spec.volume_type {
+            K8sVolumeType::EmptyDir => {
+                let mut ed = EmptyDirVolumeSource::default();
+                if let Some(sl) = &spec.size_limit {
+                    ed.size_limit = Some(Quantity(sl.clone()));
+                }
+                Some(Volume {
+                    name: spec.name.clone(),
+                    empty_dir: Some(ed),
+                    ..Default::default()
+                })
+            }
+            K8sVolumeType::Pvc => {
+                let Some(claim_name) = spec.claim_name.clone() else {
+                    warn!(
+                        "[K8S] pvc volume '{}' missing claim_name, skipping",
+                        spec.name
+                    );
+                    return None;
+                };
+                Some(Volume {
+                    name: spec.name.clone(),
+                    persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                        claim_name,
+                        read_only: Some(spec.read_only),
+                    }),
+                    ..Default::default()
+                })
+            }
+            K8sVolumeType::ConfigMap => {
+                let Some(cm_name) = spec.config_map_name.clone() else {
+                    warn!(
+                        "[K8S] configMap volume '{}' missing config_map_name, skipping",
+                        spec.name
+                    );
+                    return None;
+                };
+                Some(Volume {
+                    name: spec.name.clone(),
+                    config_map: Some(ConfigMapVolumeSource {
+                        name: cm_name,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            }
+            K8sVolumeType::HostPath => {
+                // 策略禁用:hostPath 绑宿主机路径,动态 agent pod 多节点漂移不安全。
+                warn!(
+                    "[K8S] hostPath volume '{}' is forbidden by policy, skipping",
+                    spec.name
+                );
+                None
+            }
+        }
+    }
+
+    /// 翻译 kubernetes_config 卷挂载规格 → kube `VolumeMount`
+    fn translate_k8s_volume_mount(spec: &K8sVolumeMountSpec) -> VolumeMount {
+        VolumeMount {
+            name: spec.name.clone(),
+            mount_path: spec.mount_path.clone(),
+            sub_path: spec.sub_path.clone(),
+            read_only: Some(spec.read_only),
+            ..Default::default()
+        }
+    }
+
+    /// 翻译 kubernetes_config sidecar 规格 → kube `Container`(与主 agent 同 Pod)
+    fn translate_k8s_sidecar(spec: &K8sSidecarSpec) -> K8sContainer {
+        K8sContainer {
+            name: spec.name.clone(),
+            image: Some(spec.image.clone()),
+            // 用户硬性要求:imagePullPolicy 必须 IfNotPresent(动态 pod 频繁创建,节点已缓存)
+            image_pull_policy: Some(
+                spec.image_pull_policy
+                    .clone()
+                    .unwrap_or_else(|| "IfNotPresent".to_string()),
+            ),
+            command: if spec.command.is_empty() {
+                None
+            } else {
+                Some(spec.command.clone())
+            },
+            volume_mounts: Some(
+                spec.volume_mounts
+                    .iter()
+                    .map(Self::translate_k8s_volume_mount)
+                    .collect(),
+            ),
+            resources: Self::build_resource_requirements(&spec.resources),
+            ..Default::default()
+        }
     }
 
     /// 根据运行环境获取容器访问地址
@@ -456,32 +606,61 @@ impl ContainerRuntime for KubernetesRuntime {
                 (self.workspace_pvc_name(identifier, &service_type)?, None)
             };
 
-        // 取 service 配置：决定 workspace 挂载路径（K8s 模式 computer→/home/user,
-        // web→/app/project_workspace），并用于下方透传 service_config.environment。
-        // 复用 select_image 同款途径（multi_image_config.get_service_config）。
-        let multi_config = &self.config.docker_manager_config.multi_image_config;
-        let service_config = multi_config.get_service_config(&service_type);
-        let workspace_mount_path = service_config
-            .map(|sc| sc.workspace_container_path())
-            .unwrap_or_else(|| "/app/project_workspace".to_string());
+        // 取 service 配置(完全分家):K8s 优先读 kubernetes_config;docker_config.multi_image_config
+        // 仅作过渡期安全兜底(旧 chart 未带 kubernetes_config 段时,保留 workspace 路径/command/env 行为)。
+        // volumes / volume_mounts / sidecars 只来自 kubernetes_config(docker_config 无此概念)。
+        let k8s_service = self.config.kubernetes_config.get_service_config(&service_type);
+        let docker_service = self
+            .config
+            .docker_manager_config
+            .multi_image_config
+            .get_service_config(&service_type);
 
-        let volumes = Some(vec![Volume {
+        // workspace 挂载路径(K8s 模式 computer→/home/user, web→/app/project_workspace)
+        let workspace_mount_path = k8s_service
+            .map(|sc| sc.workspace_container_path())
+            .or_else(|| docker_service.map(|sc| sc.workspace_container_path()))
+            .unwrap_or_else(|| match service_type {
+                ServiceType::ComputerAgentRunner => "/home/user".to_string(),
+                _ => "/app/project_workspace".to_string(),
+            });
+
+        // 构建 volumes: 硬编码 workspace PVC(保留) + 翻译 kubernetes_config 额外卷
+        let mut volumes_vec: Vec<Volume> = vec![Volume {
             name: "workspace".to_string(),
-            persistent_volume_claim: Some(
-                k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-                    claim_name: workspace_pvc.clone(),
-                    read_only: Some(false),
-                },
-            ),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: workspace_pvc.clone(),
+                read_only: Some(false),
+            }),
             ..Default::default()
-        }]);
-        let volume_mounts = Some(vec![VolumeMount {
+        }];
+        let extra_volumes: Vec<K8sVolumeSpec> =
+            k8s_service.map(|s| s.volumes.clone()).unwrap_or_default();
+        for v in extra_volumes.iter().flat_map(Self::translate_k8s_volume) {
+            volumes_vec.push(v);
+        }
+
+        // 构建 volume_mounts: workspace 挂载 + 翻译 kubernetes_config 额外挂载(挂到 agent 容器)
+        let mut volume_mounts_vec: Vec<VolumeMount> = vec![VolumeMount {
             name: "workspace".to_string(),
             mount_path: workspace_mount_path,
             sub_path: workspace_sub_path, // computer→Some(user_id)，web→None
             read_only: Some(false),
             ..Default::default()
-        }]);
+        }];
+        let extra_mounts: Vec<K8sVolumeMountSpec> = k8s_service
+            .map(|s| s.volume_mounts.clone())
+            .unwrap_or_default();
+        for m in extra_mounts.iter().map(Self::translate_k8s_volume_mount) {
+            volume_mounts_vec.push(m);
+        }
+
+        let volumes = Some(volumes_vec);
+        let volume_mounts = Some(volume_mounts_vec);
+
+        // sidecar 容器(只来自 kubernetes_config):如 log-collector tail 容器内日志到 stdout
+        let sidecars: Vec<K8sSidecarSpec> =
+            k8s_service.map(|s| s.sidecars.clone()).unwrap_or_default();
 
         // Build image pull secrets if configured
         let image_pull_secrets = self.config.image_pull_secret.as_ref().map(|secret| {
@@ -505,7 +684,9 @@ impl ContainerRuntime for KubernetesRuntime {
                     ..Default::default()
                 }),
                 termination_grace_period_seconds: Some(60),
-                containers: vec![K8sContainer {
+                containers: {
+                    // 主 agent 容器 + 翻译自 kubernetes_config 的 sidecar(如 log-collector)
+                    let mut containers_vec = vec![K8sContainer {
                     name: "agent".to_string(),
                     image: Some(image),
                     // IfNotPresent: 动态 pod 频繁创建（每 chat/computer-chat 一个），
@@ -526,8 +707,10 @@ impl ContainerRuntime for KubernetesRuntime {
                     //     那是给 docker 运行时用的；K8s 下若改读它会绕过 start-up.sh，丢失 ttyd/VNC，
                     //     因此这里不复用 config.command。
                     command: match service_type {
-                        ServiceType::WebAgentRunner => Some(
-                            service_config
+                        ServiceType::WebAgentRunner => {
+                            // 优先 kubernetes_config.command;过渡期回退 docker_config.command;
+                            // 都缺则裸跑 agent_runner(保留旧行为,至少 pod 能起)。
+                            let cmd = k8s_service
                                 .and_then(|sc| {
                                     if sc.command.is_empty() {
                                         None
@@ -535,8 +718,18 @@ impl ContainerRuntime for KubernetesRuntime {
                                         Some(sc.command.clone())
                                     }
                                 })
-                                .unwrap_or_else(|| vec!["/app/bin/agent_runner".to_string()]),
-                        ),
+                                .or_else(|| {
+                                    docker_service.and_then(|sc| {
+                                        if sc.command.is_empty() {
+                                            None
+                                        } else {
+                                            Some(sc.command.clone())
+                                        }
+                                    })
+                                })
+                                .unwrap_or_else(|| vec!["/app/bin/agent_runner".to_string()]);
+                            Some(cmd)
+                        }
                         // ComputerAgentRunner / UserApp 用镜像自带 ENTRYPOINT/CMD
                         // （UserApp 实际走 create_deployment，不经此路径）
                         ServiceType::ComputerAgentRunner | ServiceType::UserApp => None,
@@ -581,28 +774,39 @@ impl ContainerRuntime for KubernetesRuntime {
                                 ..Default::default()
                             });
                         }
-                        // 透传 service_config.environment
+                        // 透传 service environment
                         // (PROJECT_WORKSPACE_BASE/RUST_LOG/SERVICE_MODE/AGENT_PORT 等,
                         //  让 sub-container 行为与 Docker 模式一致)。跳过已硬编码的同名 env。
-                        if let Some(sc) = service_config {
-                            const RESERVED: [&str; 6] = [
-                                "PROJECT_ID",
-                                "USER_ID",
-                                "SERVICE_TYPE",
-                                "TENANT_ID",
-                                "SPACE_ID",
-                                "ISOLATION_TYPE",
-                            ];
+                        // 合并顺序:docker_config 兜底 → kubernetes_config 覆盖(K8s 主)。
+                        const RESERVED: [&str; 6] = [
+                            "PROJECT_ID",
+                            "USER_ID",
+                            "SERVICE_TYPE",
+                            "TENANT_ID",
+                            "SPACE_ID",
+                            "ISOLATION_TYPE",
+                        ];
+                        let mut merged_env: std::collections::HashMap<String, String> =
+                            std::collections::HashMap::new();
+                        if let Some(sc) = docker_service {
                             for (k, v) in &sc.environment {
-                                if RESERVED.contains(&k.as_str()) {
-                                    continue;
-                                }
-                                env_vars.push(EnvVar {
-                                    name: k.clone(),
-                                    value: Some(v.clone()),
-                                    ..Default::default()
-                                });
+                                merged_env.insert(k.clone(), v.clone());
                             }
+                        }
+                        if let Some(sc) = k8s_service {
+                            for (k, v) in &sc.environment {
+                                merged_env.insert(k.clone(), v.clone());
+                            }
+                        }
+                        for (k, v) in &merged_env {
+                            if RESERVED.contains(&k.as_str()) {
+                                continue;
+                            }
+                            env_vars.push(EnvVar {
+                                name: k.clone(),
+                                value: Some(v.clone()),
+                                ..Default::default()
+                            });
                         }
                         Some(env_vars)
                     },
@@ -664,7 +868,13 @@ impl ContainerRuntime for KubernetesRuntime {
                         ..Default::default()
                     }),
                     ..Default::default()
-                }],
+                }];
+                    // sidecar(只来自 kubernetes_config.services[].sidecars)。
+                    // 无配置时 pod = 仅 agent(干净基线)。log-collector 等采集器在 configmap 声明。
+                    containers_vec
+                        .extend(sidecars.iter().map(Self::translate_k8s_sidecar));
+                    containers_vec
+                },
                 restart_policy: Some("Never".to_string()),
                 service_account_name: Some(self.config.service_account_name.clone()),
                 ..Default::default()
@@ -1457,5 +1667,238 @@ impl ContainerRuntime for KubernetesRuntime {
                 Ok(())
             }
         }
+    }
+}
+
+/// 纯函数单元测试:translate_k8s_volume / translate_k8s_volume_mount / translate_k8s_sidecar。
+///
+/// 这些函数编码了 K8s 动态 pod 的**安全策略**,必须测:
+/// - HostPath 禁用(返回 None 跳过)
+/// - 卷名 "workspace" 冲突拒绝(builder 硬编码占用)
+/// - Pvc/ConfigMap 缺必要字段跳过
+/// - sidecar image_pull_policy 默认 IfNotPresent(用户硬性要求)
+///
+/// 注:select_image / create_container 装配是 &self 方法,依赖 K8s client,此处不覆盖
+/// (整个 runtime/ 目录的集成测试是后续议题)。
+#[cfg(all(test, feature = "kubernetes"))]
+mod tests {
+    use super::*;
+
+    // ---- translate_k8s_volume ----
+
+    #[test]
+    fn test_translate_volume_emptydir_default() {
+        let spec = K8sVolumeSpec {
+            name: "container-logs".into(),
+            volume_type: K8sVolumeType::EmptyDir,
+            ..Default::default()
+        };
+        let v = KubernetesRuntime::translate_k8s_volume(&spec).expect("emptyDir should translate");
+        assert_eq!(v.name, "container-logs");
+        let ed = v.empty_dir.expect("empty_dir should be set");
+        assert!(ed.size_limit.is_none(), "no size_limit configured");
+        // 其它卷源都不该出现
+        assert!(v.persistent_volume_claim.is_none());
+        assert!(v.config_map.is_none());
+    }
+
+    #[test]
+    fn test_translate_volume_emptydir_with_size_limit() {
+        let spec = K8sVolumeSpec {
+            name: "scratch".into(),
+            volume_type: K8sVolumeType::EmptyDir,
+            size_limit: Some("1Gi".into()),
+            ..Default::default()
+        };
+        let v = KubernetesRuntime::translate_k8s_volume(&spec).expect("emptyDir should translate");
+        let ed = v.empty_dir.expect("empty_dir set");
+        assert_eq!(ed.size_limit.as_ref().expect("size_limit set").0, "1Gi");
+    }
+
+    #[test]
+    fn test_translate_volume_pvc_ok() {
+        let spec = K8sVolumeSpec {
+            name: "data".into(),
+            volume_type: K8sVolumeType::Pvc,
+            claim_name: Some("my-pvc".into()),
+            read_only: true,
+            ..Default::default()
+        };
+        let v = KubernetesRuntime::translate_k8s_volume(&spec).expect("pvc should translate");
+        let pvc = v
+            .persistent_volume_claim
+            .expect("persistent_volume_claim set");
+        assert_eq!(pvc.claim_name, "my-pvc");
+        assert_eq!(pvc.read_only, Some(true));
+        assert!(v.empty_dir.is_none());
+    }
+
+    #[test]
+    fn test_translate_volume_pvc_missing_claim_name_skipped() {
+        let spec = K8sVolumeSpec {
+            name: "data".into(),
+            volume_type: K8sVolumeType::Pvc,
+            // 无 claim_name
+            ..Default::default()
+        };
+        assert!(
+            KubernetesRuntime::translate_k8s_volume(&spec).is_none(),
+            "pvc without claim_name must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_translate_volume_configmap_ok() {
+        let spec = K8sVolumeSpec {
+            name: "cfg".into(),
+            volume_type: K8sVolumeType::ConfigMap,
+            config_map_name: Some("my-cm".into()),
+            ..Default::default()
+        };
+        let v =
+            KubernetesRuntime::translate_k8s_volume(&spec).expect("configMap should translate");
+        let cm = v.config_map.expect("config_map set");
+        assert_eq!(cm.name, "my-cm");
+    }
+
+    #[test]
+    fn test_translate_volume_configmap_missing_name_skipped() {
+        let spec = K8sVolumeSpec {
+            name: "cfg".into(),
+            volume_type: K8sVolumeType::ConfigMap,
+            ..Default::default()
+        };
+        assert!(
+            KubernetesRuntime::translate_k8s_volume(&spec).is_none(),
+            "configMap without config_map_name must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_translate_volume_hostpath_forbidden() {
+        // HostPath 被策略禁用 → 必须跳过(None),即使配了也要被拒绝
+        let spec = K8sVolumeSpec {
+            name: "forbidden".into(),
+            volume_type: K8sVolumeType::HostPath,
+            ..Default::default()
+        };
+        assert!(
+            KubernetesRuntime::translate_k8s_volume(&spec).is_none(),
+            "hostPath must be forbidden (policy)"
+        );
+    }
+
+    #[test]
+    fn test_translate_volume_workspace_name_reserved() {
+        // "workspace" 卷名被 builder 硬编码占用 → 任何类型的同名卷都该被拒
+        for vt in [
+            K8sVolumeType::EmptyDir,
+            K8sVolumeType::Pvc,
+            K8sVolumeType::ConfigMap,
+        ] {
+            let spec = K8sVolumeSpec {
+                name: "workspace".into(),
+                volume_type: vt,
+                claim_name: Some("x".into()),
+                config_map_name: Some("y".into()),
+                ..Default::default()
+            };
+            assert!(
+                KubernetesRuntime::translate_k8s_volume(&spec).is_none(),
+                "volume name 'workspace' is reserved, must be rejected for {:?}",
+                vt
+            );
+        }
+    }
+
+    // ---- translate_k8s_volume_mount ----
+
+    #[test]
+    fn test_translate_volume_mount_basic() {
+        let spec = K8sVolumeMountSpec {
+            name: "container-logs".into(),
+            mount_path: "/app/container-logs".into(),
+            ..Default::default()
+        };
+        let m = KubernetesRuntime::translate_k8s_volume_mount(&spec);
+        assert_eq!(m.name, "container-logs");
+        assert_eq!(m.mount_path, "/app/container-logs");
+        assert_eq!(m.sub_path, None);
+        assert_eq!(m.read_only, Some(false), "default read_only=false");
+    }
+
+    #[test]
+    fn test_translate_volume_mount_with_subpath_readonly() {
+        let spec = K8sVolumeMountSpec {
+            name: "data".into(),
+            mount_path: "/data".into(),
+            sub_path: Some("user-123".into()),
+            read_only: true,
+        };
+        let m = KubernetesRuntime::translate_k8s_volume_mount(&spec);
+        assert_eq!(m.sub_path.as_deref(), Some("user-123"));
+        assert_eq!(m.read_only, Some(true));
+    }
+
+    // ---- translate_k8s_sidecar ----
+
+    #[test]
+    fn test_translate_sidecar_defaults_and_image_pull_policy() {
+        let spec = K8sSidecarSpec {
+            name: "log-collector".into(),
+            image: "registry/alpine:3.22.4".into(),
+            command: vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()],
+            volume_mounts: vec![K8sVolumeMountSpec {
+                name: "container-logs".into(),
+                mount_path: "/app/container-logs".into(),
+                read_only: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let c = KubernetesRuntime::translate_k8s_sidecar(&spec);
+        assert_eq!(c.name, "log-collector");
+        assert_eq!(c.image.as_deref(), Some("registry/alpine:3.22.4"));
+        // 用户硬性要求:image_pull_policy 缺省必须 IfNotPresent
+        assert_eq!(
+            c.image_pull_policy.as_deref(),
+            Some("IfNotPresent"),
+            "image_pull_policy must default to IfNotPresent"
+        );
+        // command 非空 → Some
+        assert_eq!(c.command.as_deref(), Some(&["/bin/sh".to_string(), "-c".to_string(), "sleep 1".to_string()][..]));
+        // volume_mounts 翻译
+        let mounts = c.volume_mounts.expect("volume_mounts set");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, "container-logs");
+        assert_eq!(mounts[0].read_only, Some(true));
+        // resources 全 None → build_resource_requirements 返回 None
+        assert!(c.resources.is_none());
+    }
+
+    #[test]
+    fn test_translate_sidecar_empty_command_becomes_none() {
+        let spec = K8sSidecarSpec {
+            name: "s".into(),
+            image: "img".into(),
+            ..Default::default()
+        };
+        let c = KubernetesRuntime::translate_k8s_sidecar(&spec);
+        assert!(
+            c.command.is_none(),
+            "empty command should yield None (use image ENTRYPOINT/CMD)"
+        );
+    }
+
+    #[test]
+    fn test_translate_sidecar_explicit_image_pull_policy_honored() {
+        let spec = K8sSidecarSpec {
+            name: "s".into(),
+            image: "img".into(),
+            image_pull_policy: Some("Always".into()),
+            ..Default::default()
+        };
+        let c = KubernetesRuntime::translate_k8s_sidecar(&spec);
+        assert_eq!(c.image_pull_policy.as_deref(), Some("Always"));
     }
 }

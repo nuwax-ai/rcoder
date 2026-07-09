@@ -60,6 +60,19 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
         let app_multi_config = docker_config.get_multi_image_config();
         default_config.multi_image_config = app_multi_config;
 
+        // K8s 运行时专用配置(docker 模式不读;K8s 模式从 config.yml 的 kubernetes_config 段取)
+        default_config.kubernetes_config = config
+            .kubernetes_config
+            .clone()
+            .unwrap_or_default();
+        if !default_config.kubernetes_config.services.is_empty() {
+            info!(
+                "[K8S] loaded kubernetes_config from config.yml: {} service(s), registry_prefix={:?}",
+                default_config.kubernetes_config.services.len(),
+                default_config.kubernetes_config.global_defaults.registry_prefix
+            );
+        }
+
         default_config.auto_cleanup = docker_config
             .auto_cleanup
             .unwrap_or(default_config.auto_cleanup);
@@ -107,7 +120,18 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
         default_config
     } else {
         info!(" no Docker config, using default config");
-        docker_manager::DockerManagerConfig::default()
+        // 即使无 docker_config,K8s 模式仍可能独立提供 kubernetes_config
+        let k8s_cfg = config.kubernetes_config.clone().unwrap_or_default();
+        if !k8s_cfg.services.is_empty() {
+            info!(
+                "[K8S] loaded kubernetes_config (no docker_config branch): {} service(s)",
+                k8s_cfg.services.len()
+            );
+        }
+        docker_manager::DockerManagerConfig {
+            kubernetes_config: k8s_cfg,
+            ..Default::default()
+        }
     }
 }
 

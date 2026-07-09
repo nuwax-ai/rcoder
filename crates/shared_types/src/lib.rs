@@ -50,6 +50,8 @@ pub mod multi_image_config;
 pub mod permission_types;
 pub mod service_config;
 pub mod service_type;
+// K8s 运行时专用配置(与 docker_config 分家)
+pub mod k8s_config;
 pub use permission_types::{
     PermissionResolveRequest, ResolvePermissionHttpRequest, ResolvePermissionRequestDto,
     ResolvePermissionResponseDto,
@@ -154,6 +156,10 @@ pub use multi_image_config::{
 pub use service_config::{
     ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits,
     default_agent_runner_service_config, default_rcoder_service_config,
+};
+pub use k8s_config::{
+    K8sGlobalDefaults, K8sServiceConfig, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec,
+    K8sVolumeType, KubernetesConfig,
 };
 pub use service_type::{
     MissingIdentifier, ServiceType, ServiceTypeError, get_enabled_service_types,

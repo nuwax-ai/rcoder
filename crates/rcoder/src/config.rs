@@ -51,8 +51,14 @@ pub struct AppConfig {
     pub port: u16,
     /// 反向代理配置
     pub proxy_config: Option<ProxyConfig>,
-    /// Docker 配置
+    /// Docker 配置(docker 运行时读,K8s 不读)
     pub docker_config: Option<DockerConfig>,
+    /// K8s 运行时配置(K8s 运行时读,docker 不读;与 docker_config 完全分家)
+    ///
+    /// docker 部署下此键缺失 → None;AppConfig 无 deny_unknown_fields,
+    /// 故 docker 部署即使误带 kubernetes_config 键也不会报错(被忽略)。
+    #[serde(default)]
+    pub kubernetes_config: Option<shared_types::KubernetesConfig>,
     /// 容器清理配置
     #[serde(default)]
     pub cleanup_config: CleanupConfigSettings,
@@ -267,6 +273,7 @@ impl Default for AppConfig {
             port: 8087,
             proxy_config: Some(ProxyConfig::default()),
             docker_config: Some(DockerConfig::default()),
+            kubernetes_config: None,
             cleanup_config: CleanupConfigSettings::default(),
             api_key_auth: ApiKeyAuthConfig {
                 enabled: false,

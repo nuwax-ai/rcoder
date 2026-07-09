@@ -391,6 +391,13 @@ pub struct DockerManagerConfig {
     /// 多镜像配置（从 rcoder 配置传递，始终有值）
     pub multi_image_config: shared_types::MultiImageConfig,
 
+    /// K8s 运行时专用配置(从 rcoder 配置传递;docker 模式下为空默认值,不被读取)
+    ///
+    /// 与 `multi_image_config`(docker 用)分家:K8s 构建器只读本字段,
+    /// docker 运行时只读 `multi_image_config`。docker 部署下为 `KubernetesConfig::default()`(空)。
+    #[serde(default)]
+    pub kubernetes_config: shared_types::KubernetesConfig,
+
     /// 网络基础名称（不含 project name 前缀）
     /// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
     /// 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
@@ -480,6 +487,7 @@ impl Default for DockerManagerConfig {
             container_ttl_seconds: Some(3600), // 1小时
 
             multi_image_config: shared_types::create_default_multi_image_config(), // 默认多镜像配置
+            kubernetes_config: shared_types::KubernetesConfig::default(), // K8s 模式从 config.yml 填充;docker 模式空默认
             network_base_name: crate::RCODER_NETWORK_BASE_NAME.to_string(), // 默认网络基础名称
 
             api_timeout_seconds: default_api_timeout(), // 默认 10 秒
