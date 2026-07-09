@@ -1,0 +1,227 @@
+# rcoder 主配置 ConfigMap —— 本地 devspace 测试用
+#
+# 为什么用 ConfigMap 而非 devspace sync 的根 config.yml:
+#   完全模拟 prod helm 的注入方式(build-agent-docker/templates/rcoder/configmap.yaml
+#   渲染 config.yml → deployment subPath 挂载到 /app/config.yml),让本地能验证
+#   新增的 kubernetes_config 段(image/env/command/卷/sidecar 全自包含)及其驱动的
+#   container-logs emptyDir + log-collector sidecar 链路。
+#
+# 与根 config.yml 的差异:此处 data.config.yml = 根 config.yml 全文 + 追加 kubernetes_config 段。
+# docker_config 段保留(过渡期兜底 + agent 容器 resource_limits 实际仍读它,见 pod_handler.rs
+# resolve_resource_limits_from_config);K8s 运行时主路径改读 kubernetes_config。
+#
+# 镜像用本地构建名(OrbStack docker/k8s 共享镜像仓库,imagePullPolicy: IfNotPresent 直接命中):
+#   web=dev-master-rcoder:latest, computer=dev-rcoder-agent-runner:latest, sidecar=alpine:3.22.4
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rcoder-config
+  labels:
+    app: rcoder
+data:
+  config.yml: |
+    # RCoder 本地 devspace k8s 测试配置(含 kubernetes_config 段)
+    default_agent: "Claude"
+    projects_dir: "/app/project_workspace"
+    # 端口会被命令行 --port 8290 覆盖(devspace run 命令)
+    port: 8290
+
+    cleanup_config:
+      enabled: true
+      idle_timeout_seconds: 600
+      cleanup_interval_seconds: 500
+      docker_stop_timeout_seconds: 30
+      container_protection_seconds: 300
+
+    proxy_config:
+      listen_port: 8088
+      default_backend_port: 8290
+      backend_host: "127.0.0.1"
+      port_param: "port"
+      health_check:
+        enabled: true
+        interval_seconds: 5
+        timeout_seconds: 1
+        healthy_threshold: 2
+        unhealthy_threshold: 3
+
+    # ──────────────────────────────────────────────────────────────────
+    # docker_config:docker 运行时主路径;K8s 模式下作过渡期兜底
+    # (K8s 选镜像/命名优先读下面的 kubernetes_config;agent 容器 resource_limits 仍读此处)
+    # ──────────────────────────────────────────────────────────────────
+    docker_config:
+      multi_image_config:
+        global_defaults:
+          registry_prefix: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev"
+        services:
+          web-agent-runner:
+            service_type: "web-agent-runner"
+            image: "dev-master-rcoder:latest"
+            arm64_image: "dev-master-rcoder:latest"
+            amd64_image: "dev-master-rcoder:latest"
+            default_image: "dev-master-rcoder:latest"
+            image_tag_prefix: "dev-master-rcoder"
+            enabled: true
+            workspace_resolution_path: "/app/project_workspace"
+            environment:
+              RUST_LOG: "debug"
+              SERVICE_MODE: "full"
+              API_PORT: "8086"
+              PROJECT_WORKSPACE_BASE: "/app/project_workspace"
+            command:
+              - "/bin/bash"
+              - "/app/agent-runner-start.sh"
+              - "/app/bin/agent_runner"
+              - "--port"
+              - "8086"
+            resource_limits:
+              memory_limit: 2147483648
+              cpu_limit: 2.0
+              swap_limit: 4294967296
+            work_dir: "/app"
+            network_mode: "bridge"
+            mounts: []
+          computer-agent-runner:
+            service_type: "computer-agent-runner"
+            image: "dev-rcoder-agent-runner:latest"
+            arm64_image: "dev-rcoder-agent-runner:latest"
+            amd64_image: "dev-rcoder-agent-runner:latest"
+            default_image: "dev-rcoder-agent-runner:latest"
+            image_tag_prefix: "dev-rcoder-agent-runner"
+            enabled: true
+            workspace_resolution_path: "/app/computer-project-workspace"
+            environment:
+              RUST_LOG: "debug"
+              SERVICE_MODE: "agent-only"
+              AGENT_PORT: "8086"
+              PROJECT_WORKSPACE_BASE: "/home/user"
+              RCODER_AGENT_IDLE_TIMEOUT_SECS: "3600"
+            command:
+              - "/usr/local/bin/agent_runner"
+              - "--port"
+              - "8086"
+            resource_limits:
+              memory_limit: 4294967296
+              cpu_limit: 2.0
+              swap_limit: 8589934592
+            work_dir: "/app"
+            network_mode: "bridge"
+            mounts: []
+        selection_strategy: "ServiceOnly"
+        cache_config:
+          enabled: true
+          ttl_seconds: 3600
+          max_entries: 50
+      network_mode: "bridge"
+      network_base_name: "agent-network"
+      work_dir: "/app"
+      auto_cleanup: true
+      container_ttl_seconds: 3600
+
+    # ──────────────────────────────────────────────────────────────────
+    # kubernetes_config:K8s 运行时主路径(完全分家)
+    # 卷/挂载/sidecar 只来自这里;无此段则 pod=仅 workspace PVC + 仅 agent
+    # ──────────────────────────────────────────────────────────────────
+    kubernetes_config:
+      global_defaults:
+        registry_prefix: ""
+      services:
+        web-agent-runner:
+          service_type: "web-agent-runner"
+          image: "dev-master-rcoder:latest"
+          arm64_image: "dev-master-rcoder:latest"
+          amd64_image: "dev-master-rcoder:latest"
+          default_image: "dev-master-rcoder:latest"
+          image_tag_prefix: "dev-master-rcoder"
+          enabled: true
+          workspace_resolution_path: "/app/project_workspace"
+          environment:
+            RUST_LOG: "debug"
+            SERVICE_MODE: "full"
+            API_PORT: "8086"
+            PROJECT_WORKSPACE_BASE: "/app/project_workspace"
+          command:
+            - "/bin/bash"
+            - "/app/agent-runner-start.sh"
+            - "/app/bin/agent_runner"
+            - "--port"
+            - "8086"
+          resource_limits:
+            memory_limit: 2147483648
+            cpu_limit: 2.0
+            swap_limit: 4294967296
+            storage_size: "10Gi"
+          volumes:
+            - name: "container-logs"
+              volume_type: "emptyDir"
+          volume_mounts:
+            - name: "container-logs"
+              mount_path: "/app/container-logs"
+              read_only: false
+          sidecars:
+            - name: "log-collector"
+              image: "alpine:3.22.4"
+              image_pull_policy: "IfNotPresent"
+              # tail 容器内 *.log → sidecar stdout → 节点 fluent-bit → Loki
+              # /tmp/tailed 去重,避免重复 tail 同一文件;sleep 10 周期重扫新文件
+              command:
+                - "/bin/sh"
+                - "-c"
+                - "while true; do for f in $(find /app/container-logs -type f -name '*.log' 2>/dev/null); do grep -qxF \"$f\" /tmp/tailed 2>/dev/null || { echo \"$f\" >> /tmp/tailed; echo \"=== $f ===\"; tail -n+1 -f \"$f\" 2>/dev/null & }; done; sleep 10; done"
+              volume_mounts:
+                - name: "container-logs"
+                  mount_path: "/app/container-logs"
+                  read_only: true
+              resources:
+                memory_limit: 134217728
+                cpu_limit: 0.2
+        computer-agent-runner:
+          service_type: "computer-agent-runner"
+          image: "dev-rcoder-agent-runner:latest"
+          arm64_image: "dev-rcoder-agent-runner:latest"
+          amd64_image: "dev-rcoder-agent-runner:latest"
+          default_image: "dev-rcoder-agent-runner:latest"
+          image_tag_prefix: "dev-rcoder-agent-runner"
+          enabled: true
+          # computer 沙箱共享 PVC 挂到 /home/user(subPath=user_id)
+          workspace_resolution_path: "/app/computer-project-workspace"
+          environment:
+            RUST_LOG: "debug"
+            SERVICE_MODE: "agent-only"
+            AGENT_PORT: "8086"
+            PROJECT_WORKSPACE_BASE: "/home/user"
+            RCODER_AGENT_IDLE_TIMEOUT_SECS: "3600"
+            RCODER_AGENT_CONCURRENCY_LIMIT: "10"
+            ENABLE_NUWAX_AGENT: "false"
+          # command 缺省:走镜像 ENTRYPOINT(start-up.sh,含 ttyd/VNC)
+          resource_limits:
+            memory_limit: 4294967296
+            cpu_limit: 2.0
+            swap_limit: 8589934592
+            storage_size: "10Gi"
+          volumes:
+            - name: "container-logs"
+              volume_type: "emptyDir"
+          volume_mounts:
+            - name: "container-logs"
+              mount_path: "/app/container-logs"
+              read_only: false
+          sidecars:
+            - name: "log-collector"
+              image: "alpine:3.22.4"
+              image_pull_policy: "IfNotPresent"
+              command:
+                - "/bin/sh"
+                - "-c"
+                - "while true; do for f in $(find /app/container-logs -type f -name '*.log' 2>/dev/null); do grep -qxF \"$f\" /tmp/tailed 2>/dev/null || { echo \"$f\" >> /tmp/tailed; echo \"=== $f ===\"; tail -n+1 -f \"$f\" 2>/dev/null & }; done; sleep 10; done"
+              volume_mounts:
+                - name: "container-logs"
+                  mount_path: "/app/container-logs"
+                  read_only: true
+              resources:
+                memory_limit: 134217728
+                cpu_limit: 0.2
+
+    api_key_auth:
+      enabled: false
+      api_key: "YOUR_API_KEY_HERE_CHANGE_THIS"

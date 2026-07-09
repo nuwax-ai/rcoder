@@ -64,6 +64,12 @@ spec:
               mountPath: /app/project_workspace
             - name: logs
               mountPath: /app/logs
+            # rcoder 主配置(模拟 prod helm:ConfigMap subPath 挂载为单文件)
+            # 提供 config.yml(含 kubernetes_config 段),覆盖 devspace sync 的根 config.yml
+            - name: rcoder-config
+              mountPath: /app/config.yml
+              subPath: config.yml
+              readOnly: true
           resources:
             requests:
               memory: "2Gi"
@@ -83,3 +89,6 @@ spec:
             claimName: project-workspace-pvc
         - name: logs
           emptyDir: {}
+        - name: rcoder-config
+          configMap:
+            name: rcoder-config

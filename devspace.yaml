@@ -91,6 +91,9 @@ dev:
           - ".DS_Store"
           - "**/*.rs.bk"
           - dist-workspace.toml
+          # rcoder 主配置由 ConfigMap 挂载(k8s/config/configmap.yaml → /app/config.yml),
+          # 排除出 sync 避免与只读挂载冲突;根 config.yml 仅 docker-compose 模式使用
+          - config.yml
         # 下载时也排除这些目录
         downloadExcludePaths:
           - target/
@@ -105,6 +108,7 @@ dev:
           - k8s/
           - logs/
           - tmp/
+          - config.yml
         # 初始同步策略：preferLocal 表示本地文件优先
         initialSync: preferLocal
     # Open a terminal and use the following command to start it
@@ -149,6 +153,28 @@ commands:
   test:
     command: "devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && cargo test'"
     description: "运行测试"
+
+  # ---- rcoder 服务快速迭代(无需重建镜像)----
+  # 工作流:本地改码 → devspace sync 自动推到 /app → devspace run svc-restart
+  #         (pod 内增量编译 + 后台重启)。脚本:repo 根 dev-rcoder.sh(随 sync 进 pod)。
+  svc-build:
+    command: "devspace enter --namespace=rcoder-dev -- bash /app/dev-rcoder.sh build"
+    description: "pod 内增量编译 rcoder(debug,k8s features)"
+  svc-start:
+    command: "devspace enter --namespace=rcoder-dev -- bash /app/dev-rcoder.sh start"
+    description: "后台启动 rcoder(PID:/tmp/rcoder.pid,脱离 exec 会话)"
+  svc-stop:
+    command: "devspace enter --namespace=rcoder-dev -- bash /app/dev-rcoder.sh stop"
+    description: "停止 rcoder"
+  svc-restart:
+    command: "devspace enter --namespace=rcoder-dev -- bash /app/dev-rcoder.sh restart"
+    description: "改码后:增量编译 + 后台重启 rcoder(主用)"
+  svc-status:
+    command: "devspace enter --namespace=rcoder-dev -- bash /app/dev-rcoder.sh status"
+    description: "rcoder 进程状态 + /health 探活"
+  svc-logs:
+    command: "devspace enter --namespace=rcoder-dev -- bash /app/dev-rcoder.sh logs 100"
+    description: "tail rcoder 日志(/app/logs/rcoder.YYYY-MM-DD)"
 
 # Define dependencies to other projects with a devspace.yaml
 # dependencies:
