@@ -37,8 +37,9 @@ pub struct CreateAppRequest {
     pub ports: Option<Vec<PortConfig>>,
     /// 健康检查配置
     pub health_check: Option<HealthCheckConfig>,
-    /// 多租户字段
+    /// 租户 ID（多租户场景）
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户场景）
     pub space_id: Option<String>,
 }
 
@@ -132,7 +133,9 @@ pub struct AppFilters {
 /// 时间范围
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DateRange {
+    /// 起始时间（RFC3339）
     pub start: String,
+    /// 结束时间（RFC3339）
     pub end: String,
 }
 
@@ -229,19 +232,31 @@ pub struct Condition {
 /// pod 引擎，业务元数据（name/image/command/env 等）由调用方（Java）持久化。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppInfo {
+    /// 应用 ID
     pub app_id: String,
+    /// 应用名称
     pub name: String,
+    /// 应用状态
     pub status: AppStatus,
     /// 阶段附加信息（phase=Error 时为失败原因，如 CrashLoopBackOff）
     pub message: Option<String>,
+    /// 容器镜像
     pub image: String,
+    /// 启动命令
     pub command: Vec<String>,
+    /// 副本数
     pub replicas: u32,
+    /// 访问信息
     pub access: AccessInfo,
+    /// 健康信息
     pub health: HealthInfo,
+    /// 资源限制
     pub resources: Option<ResourceLimits>,
+    /// 环境变量
     pub env: HashMap<String, String>,
+    /// 创建时间（RFC3339）
     pub created_at: String,
+    /// 更新时间（RFC3339）
     pub updated_at: String,
 }
 
@@ -283,7 +298,9 @@ pub struct AppRuntimeInfo {
 /// 访问信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccessInfo {
+    /// 外部访问（HTTP 地址 / TCP NodePort）
     pub external: ExternalAccess,
+    /// 内部访问（集群内 FQDN / 端口）
     pub internal: InternalAccess,
 }
 
@@ -299,127 +316,180 @@ pub struct ExternalAccess {
 /// TCP 端口映射
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TcpPortMapping {
+    /// 端口名称
     pub name: String,
+    /// NodePort 端口号
     pub node_port: u16,
+    /// 访问地址
     pub access_url: String,
 }
 
 /// 内部访问
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InternalAccess {
+    /// 集群内完整域名（FQDN）
     pub domain: String,
+    /// 简写域名
     pub short_domain: String,
+    /// 内部端口列表
     pub ports: Vec<InternalPort>,
 }
 
 /// 内部端口
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InternalPort {
+    /// 端口名称
     pub name: String,
+    /// 端口号
     pub port: u16,
 }
 
 /// 健康信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthInfo {
+    /// 健康状态：Running/Starting/Unhealthy 等
     pub status: String,
+    /// 实例信息（Pod 详情）
     pub instance: Option<InstanceInfo>,
+    /// Probe 探针结果
     pub probes: Option<ProbeInfo>,
 }
 
 /// 实例信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InstanceInfo {
+    /// 实例名称（Pod 名）
     pub name: String,
+    /// 运行阶段
     pub phase: String,
+    /// 是否就绪
     pub ready: bool,
+    /// 重启次数
     pub restart_count: u32,
+    /// 所在节点
     pub node: String,
+    /// Pod IP
     pub ip: String,
+    /// 启动时间（RFC3339）
     pub started_at: Option<String>,
 }
 
 /// Probe 信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProbeInfo {
+    /// Liveness 探针状态
     pub liveness: ProbeStatus,
+    /// Readiness 探针状态
     pub readiness: ProbeStatus,
 }
 
 /// Probe 状态
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProbeStatus {
+    /// 探针结果
     pub status: String,
+    /// 最近检查时间（RFC3339）
     pub last_checked: Option<String>,
 }
 
 /// 日志条目
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LogEntry {
+    /// 时间戳（RFC3339；文件日志无时间戳则为空）
     pub timestamp: String,
+    /// 日志流：stdout / stderr / file
     pub stream: String,
+    /// 日志内容
     pub message: String,
 }
 
 /// 资源使用
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ResourceStats {
+    /// CPU 使用
     pub cpu: CpuStats,
+    /// 内存使用
     pub memory: MemoryStats,
+    /// 网络使用
     pub network: NetworkStats,
+    /// 重启次数
     pub restart_count: u32,
 }
 
+/// CPU 使用统计
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct CpuStats {
+    /// CPU 使用率 (0-100)
     pub usage_percent: f64,
+    /// CPU 使用核数
     pub usage_cores: f64,
+    /// CPU 限制核数
     pub limit_cores: f64,
 }
 
+/// 内存使用统计
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct MemoryStats {
+    /// 内存使用（字节）
     pub usage_bytes: u64,
+    /// 内存使用率 (0-100)
     pub usage_percent: f64,
+    /// 内存限制（字节）
     pub limit_bytes: u64,
 }
 
+/// 网络使用统计
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct NetworkStats {
+    /// 网络接收字节数
     pub rx_bytes: u64,
+    /// 网络发送字节数
     pub tx_bytes: u64,
 }
 
 /// 分页响应
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PaginatedResponse<T> {
+    /// 数据条目
     pub items: Vec<T>,
+    /// 分页信息
     pub pagination: Pagination,
 }
 
 /// 分页信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Pagination {
+    /// 当前页码
     pub page: u32,
+    /// 每页数量
     pub page_size: u32,
+    /// 总条目数
     pub total: u64,
+    /// 总页数
     pub total_pages: u32,
 }
 
 /// 文件上传结果
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UploadResult {
+    /// 文件路径（app 根相对）
     pub file_path: String,
+    /// 文件大小（字节）
     pub file_size: u64,
+    /// 上传时间（RFC3339）
     pub uploaded_at: String,
 }
 
 /// 文件信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FileInfo {
+    /// 文件路径（app 根相对）
     pub path: String,
+    /// 文件大小（字节）
     pub size: u64,
+    /// 是否目录
     pub is_dir: bool,
+    /// 最后修改时间（RFC3339）
     pub modified_at: String,
 }
 
