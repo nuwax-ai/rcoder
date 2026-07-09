@@ -400,8 +400,15 @@ impl ContainerRuntime for KubernetesRuntime {
         // The PVC is backed by NFS Subdir External Provisioner which automatically
         // creates NFS subdirectory per PVC for isolation and automatic cleanup
         // Note: ensure_workspace_pvc waits for PVC Bound state before returning
-        self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
-            .await?;
+        //
+        // ComputerAgentRunner 例外：复用共享 rcoder-computer-workspace PVC（subPath=user_id → /home/user），
+        // 不为每个 user 新建独立空 PVC——否则沙箱 /home/user 看不到 file-server scaffold 的文件
+        // （file-server 写到共享卷 /{user_id}/{cId}，cId=project_id）。{user_id} 目录由
+        // create_user_workspace 在 create_container 之前创建，故 subPath 挂载必然命中。
+        if !matches!(service_type, ServiceType::ComputerAgentRunner) {
+            self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
+                .await?;
+        }
 
         // Check if pod already exists and is running
         if let Some(cached) = self.pod_cache.read().await.get(identifier)
@@ -431,10 +438,20 @@ impl ContainerRuntime for KubernetesRuntime {
             .as_ref()
             .and_then(Self::build_resource_requirements);
 
-        // Build workspace volume using PVC (NFS-backed persistent storage)
-        // 每个项目/用户使用独立的 PVC，底层由 NFS Subdir External Provisioner
-        // 自动在 NFS Server 上创建子目录，实现存储隔离和自动回收
-        let pvc_name = self.workspace_pvc_name(identifier, &service_type)?;
+        // Build workspace volume:
+        // - ComputerAgentRunner: 共享 rcoder-computer-workspace PVC + subPath=user_id
+        //   → 沙箱 /home/user/{cId} = 主pod /app/computer-project-workspace/{user_id}/{cId}
+        // - WebAgentRunner: 每项目独立 PVC（NFS subdir 隔离），无 subPath
+        let (workspace_pvc, workspace_sub_path) =
+            if matches!(service_type, ServiceType::ComputerAgentRunner) {
+                let shared = std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME")
+                    .unwrap_or_else(|_| format!("{}-rcoder-computer-workspace", self.namespace));
+                // subPath 必须等于 file-server/rcoder 建目录用的 user_id（cId 的父级）。
+                // 用原始 user_id（非 sanitize），与 file-server createWorkspace(userId) 完全一致。
+                (shared, Some(user_id_val.to_string()))
+            } else {
+                (self.workspace_pvc_name(identifier, &service_type)?, None)
+            };
 
         // 取 service 配置：决定 workspace 挂载路径（K8s 模式 computer→/home/user,
         // web→/app/project_workspace），并用于下方透传 service_config.environment。
@@ -449,7 +466,7 @@ impl ContainerRuntime for KubernetesRuntime {
             name: "workspace".to_string(),
             persistent_volume_claim: Some(
                 k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-                    claim_name: pvc_name.clone(),
+                    claim_name: workspace_pvc.clone(),
                     read_only: Some(false),
                 },
             ),
@@ -458,6 +475,7 @@ impl ContainerRuntime for KubernetesRuntime {
         let volume_mounts = Some(vec![VolumeMount {
             name: "workspace".to_string(),
             mount_path: workspace_mount_path,
+            sub_path: workspace_sub_path, // computer→Some(user_id)，web→None
             read_only: Some(false),
             ..Default::default()
         }]);
