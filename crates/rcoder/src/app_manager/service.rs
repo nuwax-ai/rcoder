@@ -12,7 +12,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use chrono::Utc;
 use dashmap::DashMap;
 use docker_manager::path::HostPathResolver;
@@ -23,7 +22,8 @@ use uuid::Uuid;
 
 use container_runtime_api::{
     AppHealthCheck, AppPortSpec, AppResourceRequirements, ContainerCreateParams, ContainerRuntime,
-    DeploymentStatus, ExposeType as RtExposeType, HealthCheckType as RtHealthCheckType,
+    ContainerRuntimeError, DeploymentStatus, ExposeType as RtExposeType,
+    HealthCheckType as RtHealthCheckType,
 };
 use rcoder_proxy::PingoraProxyService;
 use shared_types::ServiceType;
@@ -52,7 +52,7 @@ impl AppService {
         config: AppManagerConfig,
         runtime: Arc<dyn ContainerRuntime>,
         pingora: Option<Arc<PingoraProxyService>>,
-    ) -> Result<Self> {
+    ) -> AppResult<Self> {
         let path_resolver: Cache<String, Arc<HostPathResolver>> =
             Cache::builder().max_capacity(1).build();
 
@@ -87,7 +87,7 @@ impl AppService {
 
     /// 创建应用
     #[instrument(skip(self, request))]
-    pub async fn create_app(&self, request: CreateAppRequest) -> Result<AppInfo> {
+    pub async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
         let app_id = format!("app-{}", &Uuid::new_v4().to_string()[..8]);
         info!(
             "[APP] 创建应用: {} ({}, mode={:?})",
@@ -98,18 +98,15 @@ impl AppService {
         if let Some(ref resources) = request.resources {
             if let Some(ref s) = resources.storage {
                 crate::handler::pod_handler::validate_k8s_storage_size(s).map_err(|e| {
-                    AppOperationError::new(
-                        shared_types::ERR_VALIDATION,
-                        format!("invalid storage '{}': {}", s, e),
-                    )
+                    AppOperationError::Validation(format!("invalid storage '{}': {}", s, e))
                 })?;
             }
             if let Some(ref es) = resources.ephemeral_storage {
                 crate::handler::pod_handler::validate_k8s_storage_size(es).map_err(|e| {
-                    AppOperationError::new(
-                        shared_types::ERR_VALIDATION,
-                        format!("invalid ephemeral_storage '{}': {}", es, e),
-                    )
+                    AppOperationError::Validation(format!(
+                        "invalid ephemeral_storage '{}': {}",
+                        es, e
+                    ))
                 })?;
             }
         }
@@ -125,8 +122,12 @@ impl AppService {
             .runtime
             .create_deployment(params)
             .await
-            .map_err(|e| anyhow::anyhow!("创建应用失败: {}", e))
-            .context(format!("[APP] create_deployment 失败 app_id={app_id}"))?;
+            .map_err(|e| {
+                map_runtime_error(
+                    &format!("[APP] create_deployment 失败 app_id={app_id}"),
+                    e,
+                )
+            })?;
         info!(
             "[APP] 应用资源创建成功: {} (container={})",
             app_id, container_info.container_name
@@ -209,12 +210,12 @@ impl AppService {
 
     /// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
     #[instrument(skip(self))]
-    pub async fn list_app_runtimes(&self) -> Result<Vec<AppRuntimeInfo>> {
+    pub async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
         let statuses = self
             .runtime
             .list_deployments()
             .await
-            .map_err(|e| anyhow::anyhow!("列出应用失败: {}", e))?;
+            .map_err(|e| map_runtime_error("[APP] list_deployments 失败", e))?;
         Ok(statuses
             .into_iter()
             .map(|s| self.build_runtime_info(s))
@@ -226,7 +227,7 @@ impl AppService {
     pub async fn query_apps(
         &self,
         request: QueryAppsRequest,
-    ) -> Result<PaginatedResponse<AppRuntimeInfo>> {
+    ) -> AppResult<PaginatedResponse<AppRuntimeInfo>> {
         let mut items = self.list_app_runtimes().await?;
 
         // 过滤（仅 status/app_ids 为运行时字段，可生效；name/created_at 需业务元数据，跳过）
@@ -279,7 +280,7 @@ impl AppService {
 
     /// 获取应用运行时详情（实时查集群；精确区分 404 与 500）
     #[instrument(skip(self))]
-    pub async fn get_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+    pub async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         let status = self.fetch_runtime_status_or_err(app_id).await?;
         Ok(self.build_runtime_info(status))
     }
@@ -295,7 +296,7 @@ impl AppService {
         &self,
         app_id: &str,
         request: UpdateAppRequest,
-    ) -> Result<AppRuntimeInfo> {
+    ) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
         self.ensure_app_exists(app_id).await?;
         let params = self.build_container_params_from_update(app_id, &request)?;
@@ -305,8 +306,12 @@ impl AppService {
             .runtime
             .patch_deployment(params)
             .await
-            .map_err(|e| anyhow::anyhow!("更新应用失败: {}", e))
-            .with_context(|| format!("[APP] patch_deployment 失败 app_id={app_id}"))?;
+            .map_err(|e| {
+                map_runtime_error(
+                    &format!("[APP] patch_deployment 失败 app_id={app_id}"),
+                    e,
+                )
+            })?;
         // Docker 模式：新容器 IP，重新注册 Pingora backend（K8s no-op）
         let http_ports = http_port_numbers(&request.ports);
         self.register_pingora_backends(app_id, &http_ports, &info.container_ip)
@@ -317,7 +322,7 @@ impl AppService {
 
     /// 删除应用（v2 §5.3：默认保留持久存储，purge=true 才清空数据面）。
     #[instrument(skip(self))]
-    pub async fn delete_app(&self, app_id: &str, purge: bool) -> Result<()> {
+    pub async fn delete_app(&self, app_id: &str, purge: bool) -> AppResult<()> {
         validate_app_id(app_id)?;
         info!("[APP] 删除应用: {} (purge={})", app_id, purge);
 
@@ -329,7 +334,12 @@ impl AppService {
         self.runtime
             .delete_deployment(app_id)
             .await
-            .map_err(|e| anyhow::anyhow!("删除应用失败: {}", e))?;
+            .map_err(|e| {
+                map_runtime_error(
+                    &format!("[APP] delete_deployment 失败 app_id={app_id}"),
+                    e,
+                )
+            })?;
 
         // 3. 仅 purge=true 时清空持久存储（code/data/logs 目录）。
         //    默认保留：应用可重建，数据不可再生（v2 §5.3 数据安全）。
@@ -356,7 +366,7 @@ impl AppService {
     // StorageInfo 不含 size_bytes——CephFS 上不能用 du（详见设计文档 §5.4）。
 
     /// 查询单个应用的持久存储状态（O(1) stat，不递归）。
-    pub async fn get_app_storage(&self, app_id: &str) -> Result<StorageInfo> {
+    pub async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo> {
         validate_app_id(app_id)?;
         let app_dir = self.get_container_app_dir(app_id);
         let metadata = tokio::fs::metadata(&app_dir).await.ok();
@@ -376,26 +386,25 @@ impl AppService {
     }
 
     /// 清空应用的持久存储。安全约束：仅当 app 计算资源已不存在时允许（否则 INVALID_STATE）。
-    pub async fn delete_app_storage(&self, app_id: &str) -> Result<()> {
+    pub async fn delete_app_storage(&self, app_id: &str) -> AppResult<()> {
         validate_app_id(app_id)?;
         match self.runtime.get_deployment_status(app_id).await {
             Ok(Some(_)) => {
-                return Err(AppOperationError::invalid_state(format!(
+                return Err(AppOperationError::InvalidState(format!(
                     "应用 {app_id} 仍存在，请先 delete 再清空存储（避免损坏在用数据）"
-                ))
-                .into());
+                )));
             }
             Ok(None) => {}
             Err(e) => {
                 warn!("[APP] 查询应用状态失败 app_id={}: {}", app_id, e);
-                return Err(AppOperationError::backend(format!("查询应用状态失败: {e}")).into());
+                return Err(AppOperationError::Backend(format!("查询应用状态失败: {e}")));
             }
         }
         let app_dir = self.get_container_app_dir(app_id);
         if app_dir.exists()
             && let Err(e) = fs::remove_dir_all(&app_dir).await
         {
-            return Err(anyhow::anyhow!("清空存储失败: {}", e));
+            return Err(map_io_error("清空存储失败", e, false));
         }
         info!("[APP] 已清空应用存储: {}", app_id);
         Ok(())
@@ -407,18 +416,12 @@ impl AppService {
     pub async fn query_storage(
         &self,
         request: QueryStorageRequest,
-    ) -> Result<PaginatedResponse<StorageInfo>> {
+    ) -> AppResult<PaginatedResponse<StorageInfo>> {
         if request.page == 0 {
-            return Err(
-                AppOperationError::new(shared_types::ERR_VALIDATION, "page 从 1 开始").into(),
-            );
+            return Err(AppOperationError::Validation("page 从 1 开始".to_string()));
         }
         if request.page_size == 0 || request.page_size > 100 {
-            return Err(AppOperationError::new(
-                shared_types::ERR_VALIDATION,
-                "page_size 须在 1..=100",
-            )
-            .into());
+            return Err(AppOperationError::Validation("page_size 须在 1..=100".to_string()));
         }
         let filters = request.filters.unwrap_or_default();
         if filters.tenant_id.is_some() || filters.space_id.is_some() {
@@ -431,13 +434,13 @@ impl AppService {
             .runtime
             .list_deployments()
             .await
-            .map_err(|e| anyhow::anyhow!("列出应用失败: {}", e))?
+            .map_err(|e| map_runtime_error("[APP] list_deployments 失败", e))?
             .into_iter()
             .map(|s| s.app_id)
             .collect();
         // 单层列 workspace_root（不递归）
         let workspace_root = self.config.get_workspace_root();
-        let mut entries: Vec<String> = match tokio::fs::read_dir(workspace_root).await {
+        let mut entries: Vec<String> = match tokio::fs::read_dir(&workspace_root).await {
             Ok(mut rd) => {
                 let mut v = vec![];
                 while let Ok(Some(de)) = rd.next_entry().await {
@@ -449,7 +452,14 @@ impl AppService {
                 }
                 v
             }
-            Err(_) => vec![],
+            Err(e) => {
+                // workspace_root 不可读（权限/缺失）→ 保守返回空页，但落日志可见
+                warn!(
+                    "[APP] query_storage 读取工作空间目录失败 {}: {}",
+                    workspace_root, e
+                );
+                vec![]
+            }
         };
         entries.sort();
         let app_ids_filter = filters.app_ids.as_deref();
@@ -508,44 +518,61 @@ impl AppService {
 
     /// 存储是否为孤儿（无对应运行应用）。Ok(None)=orphan；Ok(Some)/Err=非 orphan（保守）。
     async fn is_storage_orphan(&self, app_id: &str) -> bool {
-        matches!(self.runtime.get_deployment_status(app_id).await, Ok(None))
+        match self.runtime.get_deployment_status(app_id).await {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(e) => {
+                // 瞬时 API 错误保守视为"非 orphan"（避免误删在用数据），但落日志可见
+                warn!("[APP] is_storage_orphan 查询状态失败 app_id={}: {}", app_id, e);
+                false
+            }
+        }
     }
 
     /// 启动应用（scale replicas = 1）
     #[instrument(skip(self))]
-    pub async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+    pub async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
         self.ensure_app_exists(app_id).await?;
         self.runtime
             .scale_deployment(app_id, 1)
             .await
-            .map_err(|e| anyhow::anyhow!("启动应用失败: {}", e))?;
+            .map_err(|e| {
+                map_runtime_error(&format!("[APP] scale_deployment 失败 app_id={app_id}"), e)
+            })?;
         info!("[APP] 应用已启动 (scale=1): {}", app_id);
         self.get_app(app_id).await
     }
 
     /// 停止应用（scale replicas = 0）
     #[instrument(skip(self))]
-    pub async fn stop_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+    pub async fn stop_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
         self.ensure_app_exists(app_id).await?;
         self.runtime
             .scale_deployment(app_id, 0)
             .await
-            .map_err(|e| anyhow::anyhow!("停止应用失败: {}", e))?;
+            .map_err(|e| {
+                map_runtime_error(&format!("[APP] scale_deployment 失败 app_id={app_id}"), e)
+            })?;
         info!("[APP] 应用已停止 (scale=0): {}", app_id);
         self.get_app(app_id).await
     }
 
     /// 重启应用（rollout restart）
     #[instrument(skip(self))]
-    pub async fn restart_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+    pub async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
         self.ensure_app_exists(app_id).await?;
         self.runtime
             .restart_deployment(app_id)
             .await
-            .map_err(|e| anyhow::anyhow!("重启应用失败: {}", e))?;
+            .map_err(|e| {
+                map_runtime_error(
+                    &format!("[APP] restart_deployment 失败 app_id={app_id}"),
+                    e,
+                )
+            })?;
         info!("[APP] 应用已重启 (rollout): {}", app_id);
         self.get_app(app_id).await
     }
@@ -555,7 +582,7 @@ impl AppService {
     /// `follow` 流式当前未实现（runtime 返回 tail 快照），`since` 暂未透传；
     /// SSE/WebSocket 实时流留待后续增强。
     #[instrument(skip(self))]
-    pub async fn get_app_logs(&self, app_id: &str, params: LogParams) -> Result<Vec<LogEntry>> {
+    pub async fn get_app_logs(&self, app_id: &str, params: LogParams) -> AppResult<Vec<LogEntry>> {
         validate_app_id(app_id)?;
         let tail = params.tail.unwrap_or(1000);
         let timestamps = params.timestamps.unwrap_or(true);
@@ -563,8 +590,9 @@ impl AppService {
             .runtime
             .get_app_logs(app_id, tail, timestamps)
             .await
-            .map_err(|e| anyhow::anyhow!("读取日志失败: {}", e))
-            .with_context(|| format!("[APP] get_app_logs 失败 app_id={app_id}"))?;
+            .map_err(|e| {
+                map_runtime_error(&format!("[APP] get_app_logs 失败 app_id={app_id}"), e)
+            })?;
         Ok(entries
             .into_iter()
             .map(|e| LogEntry {
@@ -581,19 +609,20 @@ impl AppService {
         &self,
         app_id: &str,
         tail: u32,
-    ) -> Result<container_runtime_api::mpsc::Receiver<container_runtime_api::ContainerLogEntry>>
+    ) -> AppResult<container_runtime_api::mpsc::Receiver<container_runtime_api::ContainerLogEntry>>
     {
         validate_app_id(app_id)?;
         self.runtime
             .stream_app_logs(app_id, tail)
             .await
-            .map_err(|e| anyhow::anyhow!("启动日志流失败: {}", e))
-            .with_context(|| format!("[APP] stream_app_logs 失败 app_id={app_id}"))
+            .map_err(|e| {
+                map_runtime_error(&format!("[APP] stream_app_logs 失败 app_id={app_id}"), e)
+            })
     }
 
     /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
     #[instrument(skip(self))]
-    pub async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats> {
+    pub async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats> {
         let status = self.fetch_runtime_status_or_err(app_id).await?;
         Ok(ResourceStats {
             restart_count: status.restart_count,
@@ -606,13 +635,14 @@ impl AppService {
     pub async fn get_app_events(
         &self,
         app_id: &str,
-    ) -> Result<Vec<container_runtime_api::AppEventInfo>> {
+    ) -> AppResult<Vec<container_runtime_api::AppEventInfo>> {
         validate_app_id(app_id)?;
         self.runtime
             .get_app_events(app_id)
             .await
-            .map_err(|e| anyhow::anyhow!("查询事件失败: {}", e))
-            .with_context(|| format!("[APP] get_app_events 失败 app_id={app_id}"))
+            .map_err(|e| {
+                map_runtime_error(&format!("[APP] get_app_events 失败 app_id={app_id}"), e)
+            })
     }
 
     /// 读取应用文件日志（从 workspace PVC 的 logs/ 目录直接读，不依赖 K8s Pod log API）。
@@ -625,7 +655,7 @@ impl AppService {
         app_id: &str,
         file_path: &str,
         tail: u32,
-    ) -> Result<Vec<LogEntry>> {
+    ) -> AppResult<Vec<LogEntry>> {
         validate_app_id(app_id)?;
         let app_dir = self.get_container_app_dir(app_id);
         let target = app_dir.join(file_path);
@@ -634,25 +664,22 @@ impl AppService {
         let canonical_target = match target.canonicalize() {
             Ok(c) => c,
             Err(_) => {
-                return Err(AppOperationError::file_not_found(format!(
+                return Err(AppOperationError::FileNotFound(format!(
                     "日志文件不存在: {file_path}"
-                ))
-                .into());
+                )));
             }
         };
         let canonical_root = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
         if !canonical_target.starts_with(&canonical_root) {
-            return Err(AppOperationError::new(
-                shared_types::ERR_VALIDATION,
-                format!("path traversal 拒绝: {file_path}"),
-            )
-            .into());
+            return Err(AppOperationError::Validation(format!(
+                "path traversal 拒绝: {file_path}"
+            )));
         }
 
         // 读文件，取最后 tail 行
         let content = tokio::fs::read_to_string(&canonical_target)
             .await
-            .map_err(|e| anyhow::anyhow!("读取日志文件失败 '{}': {}", file_path, e))?;
+            .map_err(|e| map_io_error(&format!("读取日志文件失败 '{file_path}'"), e, true))?;
         let lines: Vec<&str> = content.lines().collect();
         let start = lines.len().saturating_sub(tail as usize);
         Ok(lines[start..]
@@ -672,24 +699,34 @@ impl AppService {
         app_id: &str,
         file_data: Vec<u8>,
         target: &str,
-    ) -> Result<UploadResult> {
+    ) -> AppResult<UploadResult> {
         validate_app_id(app_id)?;
         // target 相对 app 根目录（设计 §8.4：默认 "code/{name}"，也可写 data/ logs/）。
         let app_dir = self.get_container_app_dir(app_id);
         // 先确保 app 根存在，便于 canonicalize 取真实基准路径
-        fs::create_dir_all(&app_dir).await?;
+        fs::create_dir_all(&app_dir)
+            .await
+            .map_err(|e| map_io_error("创建应用目录失败", e, false))?;
         let file_path = app_dir.join(target);
         // 防穿越：canonicalize 父目录（已存在）后校验仍在 app 目录内，与 delete_file 对称。
         // 拦截两类攻击：绝对路径 target（PathBuf::join 遇绝对路径会替换基准）与 ../../ 上跳。
-        let canonical_app_dir = app_dir.canonicalize()?;
+        let canonical_app_dir = app_dir
+            .canonicalize()
+            .map_err(|e| map_io_error("解析应用目录失败", e, false))?;
         if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent).await?;
-            let canonical_parent = parent.canonicalize()?;
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| map_io_error("创建父目录失败", e, false))?;
+            let canonical_parent = parent
+                .canonicalize()
+                .map_err(|e| map_io_error("解析父目录失败", e, false))?;
             if !canonical_parent.starts_with(&canonical_app_dir) {
-                return Err(anyhow::anyhow!("路径不在应用目录内"));
+                return Err(AppOperationError::Validation("路径不在应用目录内".to_string()));
             }
         }
-        fs::write(&file_path, &file_data).await?;
+        fs::write(&file_path, &file_data)
+            .await
+            .map_err(|e| map_io_error("写入文件失败", e, true))?;
         Ok(UploadResult {
             file_path: target.to_string(),
             file_size: file_data.len() as u64,
@@ -703,13 +740,15 @@ impl AppService {
     /// **app-root-relative**（如 "code/app.jar"），可直接作为 upload 的 target / delete 的 path，
     /// 与这两个接口的约定一致。防穿越：子目录 canonicalize 后必须仍在 app 目录内。
     #[instrument(skip(self))]
-    pub async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> Result<Vec<FileInfo>> {
+    pub async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> AppResult<Vec<FileInfo>> {
         validate_app_id(app_id)?;
         let app_dir = self.get_container_app_dir(app_id);
         if !app_dir.exists() {
             return Ok(vec![]);
         }
-        let canonical_app_dir = app_dir.canonicalize()?;
+        let canonical_app_dir = app_dir
+            .canonicalize()
+            .map_err(|e| map_io_error("解析应用目录失败", e, false))?;
         // subpath 归一化：去尾部 '/'，空 → 列 app 根
         let sub = subpath
             .map(|p| p.trim_end_matches('/'))
@@ -720,9 +759,11 @@ impl AppService {
                 if !full.exists() {
                     return Ok(vec![]);
                 }
-                let canonical_full = full.canonicalize()?;
+                let canonical_full = full
+                    .canonicalize()
+                    .map_err(|e| map_io_error("解析子目录失败", e, false))?;
                 if !canonical_full.starts_with(&canonical_app_dir) {
-                    return Err(anyhow::anyhow!("路径不在应用目录内"));
+                    return Err(AppOperationError::Validation("路径不在应用目录内".to_string()));
                 }
                 canonical_full
             }
@@ -731,9 +772,18 @@ impl AppService {
         // 返回 app-root-relative 路径（sub 存在时前缀 "sub/"）
         let rel_prefix = sub.map(|p| format!("{p}/")).unwrap_or_default();
         let mut files = Vec::new();
-        let mut entries = fs::read_dir(&target_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let metadata = entry.metadata().await?;
+        let mut entries = fs::read_dir(&target_dir)
+            .await
+            .map_err(|e| map_io_error("读取目录失败", e, false))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| map_io_error("遍历目录失败", e, false))?
+        {
+            let metadata = entry
+                .metadata()
+                .await
+                .map_err(|e| map_io_error("读取文件元数据失败", e, false))?;
             files.push(FileInfo {
                 path: format!("{rel_prefix}{}", entry.file_name().to_string_lossy()),
                 size: metadata.len(),
@@ -752,30 +802,42 @@ impl AppService {
 
     /// 删除文件
     #[instrument(skip(self))]
-    pub async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
+    pub async fn delete_file(&self, app_id: &str, file_path: &str) -> AppResult<()> {
         validate_app_id(app_id)?;
         // file_path 相对 app 根目录（与 upload_file 的 target 同约定：可指向 code/ data/ logs/）
         let app_dir = self.get_container_app_dir(app_id);
         if !app_dir.exists() {
-            return Err(anyhow::anyhow!("应用目录不存在"));
+            return Err(AppOperationError::NotFound(format!(
+                "应用目录不存在: {app_id}"
+            )));
         }
         let full_path = app_dir.join(file_path);
         // 先 exists 守卫，避免 canonicalize 对不存在路径抛 OS 错误（导致 500 而非 404）
         if !full_path.exists() {
-            return Err(anyhow::anyhow!("文件不存在: {}", file_path));
+            return Err(AppOperationError::FileNotFound(format!(
+                "文件不存在: {file_path}"
+            )));
         }
 
         // 安全检查：canonicalize 后确保路径仍在 app 目录内（防 ../ 穿越到外部）
-        let canonical_path = full_path.canonicalize()?;
-        let canonical_app_dir = app_dir.canonicalize()?;
+        let canonical_path = full_path
+            .canonicalize()
+            .map_err(|e| map_io_error("解析文件路径失败", e, false))?;
+        let canonical_app_dir = app_dir
+            .canonicalize()
+            .map_err(|e| map_io_error("解析应用目录失败", e, false))?;
         if !canonical_path.starts_with(&canonical_app_dir) {
-            return Err(anyhow::anyhow!("路径不在应用目录内"));
+            return Err(AppOperationError::Validation("路径不在应用目录内".to_string()));
         }
 
         if canonical_path.is_dir() {
-            fs::remove_dir_all(&canonical_path).await?;
+            fs::remove_dir_all(&canonical_path)
+                .await
+                .map_err(|e| map_io_error("删除目录失败", e, false))?;
         } else {
-            fs::remove_file(&canonical_path).await?;
+            fs::remove_file(&canonical_path)
+                .await
+                .map_err(|e| map_io_error("删除文件失败", e, true))?;
         }
         info!("[APP] 文件已删除: {}", file_path);
         Ok(())
@@ -790,7 +852,7 @@ impl AppService {
         &self,
         app_id: &str,
         request: &CreateAppRequest,
-    ) -> Result<ContainerCreateParams> {
+    ) -> AppResult<ContainerCreateParams> {
         // 端口：models::PortConfig → container_runtime_api::AppPortSpec
         let ports: Vec<AppPortSpec> = request
             .ports
@@ -812,11 +874,10 @@ impl AppService {
         if let Some(hc) = &request.health_check
             && matches!(hc.check_type, HealthCheckType::Exec)
         {
-            return Err(AppOperationError::new(
-                shared_types::ERR_VALIDATION,
-                "Exec 健康检查暂不支持（AppHealthCheck 缺少 command 字段），请改用 Http/Tcp",
-            )
-            .into());
+            return Err(AppOperationError::Validation(
+                "Exec 健康检查暂不支持（AppHealthCheck 缺少 command 字段），请改用 Http/Tcp"
+                    .to_string(),
+            ));
         }
 
         // 健康检查：models::HealthCheckConfig → AppHealthCheck
@@ -880,11 +941,10 @@ impl AppService {
         &self,
         app_id: &str,
         request: &UpdateAppRequest,
-    ) -> Result<ContainerCreateParams> {
+    ) -> AppResult<ContainerCreateParams> {
         let image = request.image.clone().ok_or_else(|| {
-            AppOperationError::new(
-                shared_types::ERR_VALIDATION,
-                "update 需要 image（rcoder 无状态，无法保留旧 image）",
+            AppOperationError::Validation(
+                "update 需要 image（rcoder 无状态，无法保留旧 image）".to_string(),
             )
         })?;
 
@@ -906,11 +966,10 @@ impl AppService {
         if let Some(hc) = &request.health_check
             && matches!(hc.check_type, HealthCheckType::Exec)
         {
-            return Err(AppOperationError::new(
-                shared_types::ERR_VALIDATION,
-                "Exec 健康检查暂不支持（AppHealthCheck 缺少 command 字段），请改用 Http/Tcp",
-            )
-            .into());
+            return Err(AppOperationError::Validation(
+                "Exec 健康检查暂不支持（AppHealthCheck 缺少 command 字段），请改用 Http/Tcp"
+                    .to_string(),
+            ));
         }
         let health_check = request.health_check.as_ref().map(|hc| AppHealthCheck {
             check_type: map_health_check_type(&hc.check_type),
@@ -972,13 +1031,13 @@ impl AppService {
     /// 供需要精确错误分类的读路径（get_app/get_app_stats/ensure_app_exists）使用，
     /// 替代会塌缩错误的 `fetch_runtime_status`（后者仅供 create_app 这类 None 可接受的场景）。
     /// 若误用 fetch_runtime_status，瞬时 API 错误会被当成"应用不存在"→404，触发 Java 误重建。
-    async fn fetch_runtime_status_or_err(&self, app_id: &str) -> Result<DeploymentStatus> {
+    async fn fetch_runtime_status_or_err(&self, app_id: &str) -> AppResult<DeploymentStatus> {
         match self.runtime.get_deployment_status(app_id).await {
             Ok(Some(s)) => Ok(s),
-            Ok(None) => Err(AppOperationError::not_found(format!("应用不存在: {app_id}")).into()),
+            Ok(None) => Err(AppOperationError::NotFound(format!("应用不存在: {app_id}"))),
             Err(e) => {
                 warn!("[APP] 查询应用状态失败 app_id={}: {}", app_id, e);
-                Err(AppOperationError::backend(format!("查询应用状态失败: {e}")).into())
+                Err(AppOperationError::Backend(format!("查询应用状态失败: {e}")))
             }
         }
     }
@@ -986,14 +1045,41 @@ impl AppService {
     /// 确认 app 存在（集群中有 Deployment/容器），不存在返回"应用不存在"错误。
     /// 调用方（start/stop/restart）据此返回 404，方便 Java 区分并触发 create 重建，
     /// 而非收到 generic 500 误以为系统故障。
-    async fn ensure_app_exists(&self, app_id: &str) -> Result<()> {
+    async fn ensure_app_exists(&self, app_id: &str) -> AppResult<()> {
         self.fetch_runtime_status_or_err(app_id).await.map(|_| ())
     }
 
     /// DeploymentStatus → AppRuntimeInfo（含访问地址构建 + conditions 派生）
     fn build_runtime_info(&self, status: DeploymentStatus) -> AppRuntimeInfo {
         let conditions = derive_conditions(&status);
-        let access = self.build_access_info(&status.app_id, &status.ports);
+
+        // Docker 模式：runtime ports 只含 TCP（get_deployment_status 仅读 port_bindings，
+        // HTTP 端口无 binding 故丢失）。从 pingora_ports 补全 HTTP 端口，保证 get 路径
+        // 的 ports 字段与 access 与 create 路径一致（K8s 模式 status.ports 已含 HTTP，
+        // 无需补）。pingora_ports 是内存态，rcoder 重启后丢失（已知限制，HTTP 路由同丢）。
+        let ports = if self.config.access_mode == AppAccessMode::Docker {
+            let mut merged = status.ports.clone();
+            if let Some(http_list) = self.pingora_ports.get(&status.app_id) {
+                let http_ports: Vec<u16> = http_list.value().clone();
+                // drop Ref guard，避免后续借用 self 时持有 DashMap 读锁
+                drop(http_list);
+                for hp in http_ports {
+                    if !merged.iter().any(|p| p.port == hp) {
+                        merged.push(AppPortStatus {
+                            name: format!("http-{hp}"),
+                            port: hp,
+                            expose_type: RtExposeType::Http,
+                            external_port: None,
+                        });
+                    }
+                }
+            }
+            merged
+        } else {
+            status.ports
+        };
+
+        let access = self.build_access_info(&status.app_id, &ports);
         AppRuntimeInfo {
             status: phase_to_status(&status.phase),
             access,
@@ -1006,7 +1092,7 @@ impl AppService {
             pod_ip: status.pod_ip,
             node: status.node,
             started_at: status.started_at,
-            ports: status.ports,
+            ports,
             conditions,
         }
     }
@@ -1164,11 +1250,17 @@ impl AppService {
     }
 
     /// 创建应用工作空间子目录
-    async fn create_app_dirs(&self, app_id: &str) -> Result<()> {
+    async fn create_app_dirs(&self, app_id: &str) -> AppResult<()> {
         let app_dir = self.get_container_app_dir(app_id);
-        fs::create_dir_all(app_dir.join("code")).await?;
-        fs::create_dir_all(app_dir.join("data")).await?;
-        fs::create_dir_all(app_dir.join("logs")).await?;
+        fs::create_dir_all(app_dir.join("code"))
+            .await
+            .map_err(|e| map_io_error("创建 code 目录失败", e, false))?;
+        fs::create_dir_all(app_dir.join("data"))
+            .await
+            .map_err(|e| map_io_error("创建 data 目录失败", e, false))?;
+        fs::create_dir_all(app_dir.join("logs"))
+            .await
+            .map_err(|e| map_io_error("创建 logs 目录失败", e, false))?;
         Ok(())
     }
 }
@@ -1177,21 +1269,53 @@ impl AppService {
 // 自由函数辅助
 // ============================================================================
 
+/// ContainerRuntimeError → AppOperationError 精确映射。
+///
+/// `ctx` = 动作前缀（如 "[APP] create_deployment 失败 app_id=app-xxx"），拼入 message。
+/// thiserror variant 无 source，`{e}` 即 variant Display（含原始 daemon message）。
+fn map_runtime_error(ctx: &str, e: ContainerRuntimeError) -> AppOperationError {
+    match e {
+        // 容器/deployment 不存在 = app 不存在（404）
+        ContainerRuntimeError::ContainerNotFound(_) => {
+            AppOperationError::NotFound(format!("{ctx}: {e}"))
+        }
+        // 其余 8 类（Connection/Creation/Start/Stop/Configuration/Timeout/K8s/Docker）
+        // 都是后端运行时/基础设施问题，客户端不可恢复，归 Backend(500)。
+        // ConfigurationError 在 runtime 是内部前置条件（params 缺字段），非用户输入，
+        // 归 Backend 最保守，避免误判 400。
+        _ => AppOperationError::Backend(format!("{ctx}: {e}")),
+    }
+}
+
+/// io::Error → AppOperationError 精确映射。
+///
+/// `is_file_op=true`（read_to_string/write/remove_file）：NotFound → FileNotFound(404)
+/// `is_file_op=false`（create_dir_all/metadata/canonicalize/read_dir/remove_dir_all）：→ Backend
+/// （目录层 NotFound 通常已被上游 app_dir.exists() 守卫拦截，漏到这属异常，归 Backend）
+fn map_io_error(ctx: &str, e: std::io::Error, is_file_op: bool) -> AppOperationError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound if is_file_op => {
+            AppOperationError::FileNotFound(format!("{ctx}: {e}"))
+        }
+        _ => AppOperationError::Backend(format!("{ctx}: {e}")),
+    }
+}
+
 /// 校验 app_id 格式（create_app 生成 `app-` + 8 个十六进制字符）
 ///
 /// app_id 直接来自 HTTP 路径参数，会流入文件系统路径拼接（delete/upload/logs/list）。
 /// 此校验是路径穿越的纵深防御（Fail Fast）：拒绝 `..`、绝对路径、非法格式，
 /// 避免恶意 app_id 触达工作空间目录之外。
-fn validate_app_id(app_id: &str) -> Result<()> {
-    let rest = app_id
-        .strip_prefix("app-")
-        .ok_or_else(|| anyhow::anyhow!("invalid app_id: {app_id} (expected prefix 'app-')"))?;
+fn validate_app_id(app_id: &str) -> AppResult<()> {
+    let rest = app_id.strip_prefix("app-").ok_or_else(|| {
+        AppOperationError::Validation(format!("invalid app_id: {app_id} (expected prefix 'app-')"))
+    })?;
     if rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        Err(anyhow::anyhow!(
+        Err(AppOperationError::Validation(format!(
             "invalid app_id: {app_id} (expected 'app-' + 8 hex chars)"
-        ))
+        )))
     }
 }
 
@@ -1320,61 +1444,61 @@ fn map_health_check_type(t: &HealthCheckType) -> RtHealthCheckType {
 
 #[async_trait::async_trait]
 impl super::AppServiceTrait for AppService {
-    async fn create_app(&self, request: CreateAppRequest) -> Result<AppInfo> {
+    async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
         self.create_app(request).await
     }
 
     async fn query_apps(
         &self,
         request: QueryAppsRequest,
-    ) -> Result<PaginatedResponse<AppRuntimeInfo>> {
+    ) -> AppResult<PaginatedResponse<AppRuntimeInfo>> {
         self.query_apps(request).await
     }
 
-    async fn list_app_runtimes(&self) -> Result<Vec<AppRuntimeInfo>> {
+    async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
         self.list_app_runtimes().await
     }
 
-    async fn get_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+    async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         self.get_app(app_id).await
     }
 
-    async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> Result<AppRuntimeInfo> {
+    async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> AppResult<AppRuntimeInfo> {
         self.update_app(app_id, request).await
     }
 
-    async fn delete_app(&self, app_id: &str, purge: bool) -> Result<()> {
+    async fn delete_app(&self, app_id: &str, purge: bool) -> AppResult<()> {
         self.delete_app(app_id, purge).await
     }
 
-    async fn get_app_storage(&self, app_id: &str) -> Result<StorageInfo> {
+    async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo> {
         self.get_app_storage(app_id).await
     }
 
-    async fn delete_app_storage(&self, app_id: &str) -> Result<()> {
+    async fn delete_app_storage(&self, app_id: &str) -> AppResult<()> {
         self.delete_app_storage(app_id).await
     }
 
     async fn query_storage(
         &self,
         request: QueryStorageRequest,
-    ) -> Result<PaginatedResponse<StorageInfo>> {
+    ) -> AppResult<PaginatedResponse<StorageInfo>> {
         self.query_storage(request).await
     }
 
-    async fn start_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+    async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         self.start_app(app_id).await
     }
 
-    async fn stop_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+    async fn stop_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         self.stop_app(app_id).await
     }
 
-    async fn restart_app(&self, app_id: &str) -> Result<AppRuntimeInfo> {
+    async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         self.restart_app(app_id).await
     }
 
-    async fn get_app_logs(&self, app_id: &str, params: LogParams) -> Result<Vec<LogEntry>> {
+    async fn get_app_logs(&self, app_id: &str, params: LogParams) -> AppResult<Vec<LogEntry>> {
         self.get_app_logs(app_id, params).await
     }
 
@@ -1382,19 +1506,19 @@ impl super::AppServiceTrait for AppService {
         &self,
         app_id: &str,
         tail: u32,
-    ) -> Result<container_runtime_api::mpsc::Receiver<container_runtime_api::ContainerLogEntry>>
+    ) -> AppResult<container_runtime_api::mpsc::Receiver<container_runtime_api::ContainerLogEntry>>
     {
         self.stream_app_logs(app_id, tail).await
     }
 
-    async fn get_app_stats(&self, app_id: &str) -> Result<ResourceStats> {
+    async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats> {
         self.get_app_stats(app_id).await
     }
 
     async fn get_app_events(
         &self,
         app_id: &str,
-    ) -> Result<Vec<container_runtime_api::AppEventInfo>> {
+    ) -> AppResult<Vec<container_runtime_api::AppEventInfo>> {
         self.get_app_events(app_id).await
     }
 
@@ -1403,7 +1527,7 @@ impl super::AppServiceTrait for AppService {
         app_id: &str,
         file_path: &str,
         tail: u32,
-    ) -> Result<Vec<LogEntry>> {
+    ) -> AppResult<Vec<LogEntry>> {
         self.get_app_file_logs(app_id, file_path, tail).await
     }
 
@@ -1412,15 +1536,15 @@ impl super::AppServiceTrait for AppService {
         app_id: &str,
         file_data: Vec<u8>,
         target: &str,
-    ) -> Result<UploadResult> {
+    ) -> AppResult<UploadResult> {
         self.upload_file(app_id, file_data, target).await
     }
 
-    async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> Result<Vec<FileInfo>> {
+    async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> AppResult<Vec<FileInfo>> {
         self.list_files(app_id, subpath).await
     }
 
-    async fn delete_file(&self, app_id: &str, file_path: &str) -> Result<()> {
+    async fn delete_file(&self, app_id: &str, file_path: &str) -> AppResult<()> {
         self.delete_file(app_id, file_path).await
     }
 }

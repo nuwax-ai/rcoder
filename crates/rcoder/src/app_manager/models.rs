@@ -8,7 +8,7 @@ use utoipa::ToSchema;
 
 use shared_types::error_codes::{
     ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_FILE_NOT_FOUND,
-    ERR_INVALID_STATE, ERR_OPERATION_NOT_SUPPORTED,
+    ERR_INVALID_STATE, ERR_OPERATION_NOT_SUPPORTED, ERR_VALIDATION,
 };
 
 /// 应用端口运行时状态（来自 container-runtime-api，含实际分配的对外端口）
@@ -545,54 +545,68 @@ pub struct StorageInfo {
 }
 
 // ============================================================================
-// 错误（v2 §12）—— service 层抛出，handler 层 downcast 取 code 精确映射 HTTP
+// 错误（v2 §12）—— service 层抛出强类型错误，handler 用 From 直接转 AppError
 // ============================================================================
 
-/// app 操作级错误（携带业务错误码，供 handler 精确映射 HTTP 与 retryable）。
+/// app 操作级错误（携带业务错误码，供 handler 精确映射 HTTP）。
 ///
-/// service 层抛出此错误（`.into()` 转 `anyhow::Error`），handler 的 `map_app_error`
-/// 通过 `downcast_ref` 取出 code；未携带此类型的 anyhow 错误兜底为 `ERR_BACKEND_ERROR`。
-/// `retryable` 既是错误码的固有属性（见 `shared_types::error_codes::is_retryable_code`），
-/// 不在响应体重复（HttpResult 不变）。
+/// 每个错误场景一个 variant，`code()`/`message()` 用 match 实现，编译器强制穷举
+/// （新增 variant 时所有 match 编译报错，OCP）。message 含完整因果链，由 service
+/// 层在构造时拼入。handler 通过 `impl From<AppOperationError> for AppError` 直接转换，
+/// 无需 downcast / 字符串匹配。
 #[derive(Debug)]
-pub struct AppOperationError {
-    /// 业务错误码（ERR_* 常量）
-    pub code: &'static str,
-    /// 人读错误信息
-    pub message: String,
+pub enum AppOperationError {
+    /// 应用不存在（404 ERR_APP_NOT_FOUND）
+    NotFound(String),
+    /// 应用已存在（409 ERR_APP_ALREADY_EXISTS）
+    AlreadyExists(String),
+    /// 操作状态非法，如未 delete 就清空存储（409 ERR_INVALID_STATE）
+    InvalidState(String),
+    /// 操作不支持（400 ERR_OPERATION_NOT_SUPPORTED）
+    NotSupported(String),
+    /// 文件/目录不存在（404 ERR_FILE_NOT_FOUND）
+    FileNotFound(String),
+    /// 请求参数校验失败（400 ERR_VALIDATION）
+    Validation(String),
+    /// 后端运行时错误（500 ERR_BACKEND_ERROR，兜底）
+    Backend(String),
 }
 
 impl AppOperationError {
-    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
+    /// 业务错误码（ERR_* 常量）
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => ERR_APP_NOT_FOUND,
+            Self::AlreadyExists(_) => ERR_APP_ALREADY_EXISTS,
+            Self::InvalidState(_) => ERR_INVALID_STATE,
+            Self::NotSupported(_) => ERR_OPERATION_NOT_SUPPORTED,
+            Self::FileNotFound(_) => ERR_FILE_NOT_FOUND,
+            Self::Validation(_) => ERR_VALIDATION,
+            Self::Backend(_) => ERR_BACKEND_ERROR,
         }
     }
-    pub fn not_found(msg: impl Into<String>) -> Self {
-        Self::new(ERR_APP_NOT_FOUND, msg)
-    }
-    pub fn already_exists(msg: impl Into<String>) -> Self {
-        Self::new(ERR_APP_ALREADY_EXISTS, msg)
-    }
-    pub fn invalid_state(msg: impl Into<String>) -> Self {
-        Self::new(ERR_INVALID_STATE, msg)
-    }
-    pub fn not_supported(msg: impl Into<String>) -> Self {
-        Self::new(ERR_OPERATION_NOT_SUPPORTED, msg)
-    }
-    pub fn file_not_found(msg: impl Into<String>) -> Self {
-        Self::new(ERR_FILE_NOT_FOUND, msg)
-    }
-    pub fn backend(msg: impl Into<String>) -> Self {
-        Self::new(ERR_BACKEND_ERROR, msg)
+
+    /// 人读错误信息（含完整因果链，由 service 构造时拼入）
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotFound(m)
+            | Self::AlreadyExists(m)
+            | Self::InvalidState(m)
+            | Self::NotSupported(m)
+            | Self::FileNotFound(m)
+            | Self::Validation(m)
+            | Self::Backend(m) => m,
+        }
     }
 }
 
 impl fmt::Display for AppOperationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {}", self.code, self.message)
+        write!(f, "[{}] {}", self.code(), self.message())
     }
 }
 
 impl std::error::Error for AppOperationError {}
+
+/// app_manager 服务统一返回类型（减少签名噪音）
+pub type AppResult<T> = std::result::Result<T, AppOperationError>;

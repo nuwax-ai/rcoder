@@ -83,7 +83,10 @@ impl axum::response::IntoResponse for AppError {
         let (code, internal_message, i18n_key) = match self {
             AppError::AnyhowError(e) => (
                 crate::error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-                Some(e.to_string()),
+                // {e:#} = anyhow alternate Display，展开完整因果链（顶层 context → 底层根因）。
+                // to_string() 只返回顶层 context，会吞掉底层错误（如 bollard/容器错误），
+                // 违反 Fail Fast：调用方/运维只看到 "[APP] create_deployment 失败"，看不到根因。
+                Some(format!("{e:#}")),
                 None,
             ),
             AppError::IoError(e) => (

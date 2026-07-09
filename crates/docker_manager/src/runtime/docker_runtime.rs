@@ -324,7 +324,7 @@ impl ContainerRuntime for DockerRuntime {
         };
 
         let config = ContainerCreateBody {
-            image: Some(image),
+            image: Some(image.clone()),
             cmd: params.command.clone(),
             env: if env_vec.is_empty() {
                 None
@@ -346,11 +346,27 @@ impl ContainerRuntime for DockerRuntime {
                 config,
             )
             .await
-            .map_err(|e| ContainerRuntimeError::ContainerCreationError(e.to_string()))?;
+            .map_err(|e| {
+                // Fail Fast：打印 bollard 原始错误（含 daemon status_code/message），
+                // 避免 service 层 context 吞掉根因（见 service.rs create_app 错误链）
+                tracing::error!(
+                    "[APP-DOCKER] create_container 失败 name={}, image={}: {e:?}",
+                    container_name,
+                    image
+                );
+                ContainerRuntimeError::ContainerCreationError(e.to_string())
+            })?;
         client
             .start_container(&created.id, None::<StartContainerOptions>)
             .await
-            .map_err(|e| ContainerRuntimeError::ContainerStartError(e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!(
+                    "[APP-DOCKER] start_container 失败 name={}, id={}: {e:?}",
+                    container_name,
+                    created.id
+                );
+                ContainerRuntimeError::ContainerStartError(e.to_string())
+            })?;
 
         // 短轮询等待 container_ip 就绪（容器刚 start，IP 可能尚未分配）。
         // 优先取主网络网卡的 IP，回退任意网卡；最多重试 6 次 × 200ms。

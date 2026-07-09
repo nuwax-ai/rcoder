@@ -43,21 +43,13 @@ fn health_from_runtime(info: &AppRuntimeInfo) -> HealthInfo {
     }
 }
 
-/// app 操作错误映射（v2 §12）：
-/// 1. service 层抛出的 [`AppOperationError`]（带码）→ 按 code 精确映射 HTTP + retryable；
-/// 2. 未带码的 anyhow 错误 → 保留字符串匹配向后兼容，其余兜底为 `ERR_BACKEND_ERROR`
-///    （通常可重试，详见 `is_retryable_code`）。
-fn map_app_error(e: anyhow::Error) -> AppError {
-    if let Some(op_err) = e.downcast_ref::<AppOperationError>() {
-        return AppError::with_message(op_err.code, op_err.message.clone());
-    }
-    let msg = e.to_string();
-    if msg.contains("不存在") {
-        AppError::with_message(shared_types::ERR_APP_NOT_FOUND, msg)
-    } else if msg.contains("不支持") {
-        AppError::with_message(shared_types::ERR_OPERATION_NOT_SUPPORTED, msg)
-    } else {
-        AppError::with_message(shared_types::ERR_BACKEND_ERROR, msg)
+/// app 操作错误 → HTTP 响应错误（v2 §12）。
+///
+/// service 层返回强类型 [`AppOperationError`]（variant 携带错误码），handler 通过 From
+/// 直接转换——错误码在 service 抛出点确定（Fail Fast），无需 downcast / 字符串匹配。
+impl From<AppOperationError> for AppError {
+    fn from(e: AppOperationError) -> Self {
+        AppError::with_message(e.code(), e.message().to_string())
     }
 }
 
@@ -87,7 +79,7 @@ pub async fn create_app(
         .app_service
         .create_app(request)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(app_info)))
 }
 
@@ -111,7 +103,7 @@ pub async fn query_apps(
         .app_service
         .query_apps(request)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(response)))
 }
 
@@ -135,7 +127,7 @@ pub async fn list_app_runtimes(
         .app_service
         .list_app_runtimes()
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(runtimes)))
 }
 
@@ -162,7 +154,7 @@ pub async fn get_app(
         .app_service
         .get_app(&app_id)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -194,7 +186,7 @@ pub async fn update_app(
         .app_service
         .update_app(&app_id, request)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -224,7 +216,7 @@ pub async fn delete_app(
         .app_service
         .delete_app(&app_id, purge)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success("删除成功".to_string())))
 }
 
@@ -255,7 +247,7 @@ pub async fn start_app(
         .app_service
         .start_app(&app_id)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -282,7 +274,7 @@ pub async fn stop_app(
         .app_service
         .stop_app(&app_id)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -309,7 +301,7 @@ pub async fn restart_app(
         .app_service
         .restart_app(&app_id)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(runtime)))
 }
 
@@ -343,7 +335,7 @@ pub async fn get_app_logs(
         .app_service
         .get_app_logs(&app_id, params)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(logs)))
 }
 
@@ -370,7 +362,7 @@ pub async fn get_app_health(
         .app_service
         .get_app(&app_id)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(health_from_runtime(&runtime))))
 }
 
@@ -397,7 +389,7 @@ pub async fn get_app_stats(
         .app_service
         .get_app_stats(&app_id)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(stats)))
 }
 
@@ -424,7 +416,7 @@ pub async fn get_app_events(
         .app_service
         .get_app_events(&app_id)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(events)))
 }
 
@@ -467,7 +459,7 @@ pub async fn get_app_file_logs(
         .app_service
         .get_app_file_logs(&app_id, &params.path, tail)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(logs)))
 }
 
@@ -537,7 +529,7 @@ pub async fn upload_file(
         .app_service
         .upload_file(&app_id, data, &target)
         .await
-        .map_err(map_app_error)?;
+        ?;
 
     Ok(Json(HttpResult::success(result)))
 }
@@ -574,7 +566,7 @@ pub async fn list_files(
         .app_service
         .list_files(&app_id, q.path.as_deref())
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(files)))
 }
 
@@ -609,7 +601,7 @@ pub async fn delete_file(
         .app_service
         .delete_file(&app_id, &request.path)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success("文件删除成功".to_string())))
 }
 
@@ -638,7 +630,7 @@ pub async fn get_app_storage(
         .app_service
         .get_app_storage(&app_id)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(info)))
 }
 
@@ -664,7 +656,7 @@ pub async fn delete_app_storage(
         .app_service
         .delete_app_storage(&app_id)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success("存储已清空".to_string())))
 }
 
@@ -692,7 +684,7 @@ pub async fn query_storage(
         .app_service
         .query_storage(request)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(Json(HttpResult::success(resp)))
 }
 
@@ -734,7 +726,7 @@ pub async fn stream_app_logs(
         .app_service
         .stream_app_logs(&app_id, tail)
         .await
-        .map_err(map_app_error)?;
+        ?;
     Ok(ws.on_upgrade(move |mut socket: WebSocket| async move {
         while let Some(entry) = rx.recv().await {
             let json = serde_json::to_string(&LogEntry {
