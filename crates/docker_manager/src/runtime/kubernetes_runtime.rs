@@ -683,7 +683,7 @@ impl ContainerRuntime for KubernetesRuntime {
                     run_as_non_root: Some(false),
                     ..Default::default()
                 }),
-                termination_grace_period_seconds: Some(60),
+                termination_grace_period_seconds: Some(15),
                 containers: {
                     // 主 agent 容器 + 翻译自 kubernetes_config 的 sidecar(如 log-collector)
                     let mut containers_vec = vec![K8sContainer {
@@ -749,6 +749,12 @@ impl ContainerRuntime for KubernetesRuntime {
                             EnvVar {
                                 name: "SERVICE_TYPE".to_string(),
                                 value: Some(service_type_str.clone()),
+                                ..Default::default()
+                            },
+                            // 部署模式标识: start-up.sh 据此 source extra (K8s 下 /home/user 是 PVC, 跳过 bind mount 权限修复)
+                            EnvVar {
+                                name: "DEPLOY_MODE".to_string(),
+                                value: Some("k8s".to_string()),
                                 ..Default::default()
                             },
                         ];
@@ -1204,7 +1210,7 @@ impl ContainerRuntime for KubernetesRuntime {
             );
         }
 
-        // ── Step 1: 发送 Pod 删除请求（graceful，grace period = 60s）──
+        // ── Step 1: 发送 Pod 删除请求（graceful，grace period = 15s）──
         //
         // 使用 Foreground propagation 确保 Pod 的子资源先于 Pod 被删除。
         // 注意：pods().delete() 是立即返回的异步 API 调用，
@@ -1212,7 +1218,7 @@ impl ContainerRuntime for KubernetesRuntime {
         let step_start = std::time::Instant::now();
         let dp = DeleteParams {
             propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
-            grace_period_seconds: Some(60),
+            grace_period_seconds: Some(15),
             ..Default::default()
         };
 
@@ -1220,7 +1226,7 @@ impl ContainerRuntime for KubernetesRuntime {
             Ok(_either) => {
                 // _either: Left(Pod) = 立即删除 / Right(name) = 等待终止
                 info!(
-                    "[K8S] Pod {} delete requested (graceful, 60s), took {:.1}s",
+                    "[K8S] Pod {} delete requested (graceful, 15s), took {:.1}s",
                     pod_name,
                     step_start.elapsed().as_secs_f64()
                 );
@@ -1449,7 +1455,7 @@ impl ContainerRuntime for KubernetesRuntime {
         // ── Step 2: 批量删除 Pod（graceful, Foreground 传播）──
         let dp = DeleteParams {
             propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
-            grace_period_seconds: Some(30),
+            grace_period_seconds: Some(15),
             ..Default::default()
         };
 

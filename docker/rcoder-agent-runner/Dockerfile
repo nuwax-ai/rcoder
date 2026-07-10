@@ -166,6 +166,11 @@ RUN chmod +x /usr/local/bin/agent_runner
 COPY ./start-up.sh /root/
 RUN chmod +x /root/start-up.sh
 
+# 复制部署模式差异脚本 (Docker Compose / K8s 通用引导 + 差异实现)
+# start-up.sh 按 DEPLOY_MODE source 这些脚本, 提供 fix_mount_permissions
+COPY ./start-up-common.sh ./start-up-docker-extra.sh ./start-up-k8s-extra.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/start-up-common.sh /usr/local/bin/start-up-docker-extra.sh /usr/local/bin/start-up-k8s-extra.sh
+
 # 复制中文输入法修复脚本（容器内运行 fix-ime 命令）
 COPY ./fix-chrome-ime-final.sh /usr/local/bin/fix-ime
 RUN chmod +x /usr/local/bin/fix-ime

@@ -209,6 +209,9 @@ impl<'a> AgentContainerStarter<'a> {
             builder = builder.env("ISOLATION_TYPE", it);
         }
 
+        // 部署模式标识: start-up.sh 据此 source extra (Docker Compose 下 /home/user 是 bind mount, 需修权限)
+        builder = builder.env("DEPLOY_MODE", "docker");
+
         // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配
 
         // 设置网络

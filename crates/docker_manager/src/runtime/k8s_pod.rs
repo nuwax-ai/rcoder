@@ -261,7 +261,7 @@ impl K8sPodOps for KubernetesRuntime {
     }
 
     async fn wait_for_pod_terminated(&self, pod_name: &str) -> ContainerRuntimeResult<()> {
-        let timeout = std::time::Duration::from_secs(75);
+        let timeout = std::time::Duration::from_secs(30);
         let poll_interval = std::time::Duration::from_secs(1);
         let start = std::time::Instant::now();
 

@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     set_panic_hook();
 
     // 🔥 设置信号处理器，实现优雅关闭（Docker stop、Ctrl+C）
-    let _shutdown_handle = setup_shutdown_handler();
+    setup_shutdown_handler();
 
     // ✅ 初始化 Rustls CryptoProvider（必须在最前面，在任何可能使用 TLS 的代码之前）
     // 🔥 如果这里失败，会导致 panic，但 panic hook 会捕获并记录

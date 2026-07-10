@@ -69,6 +69,14 @@ fi
 
 
 # ============================================================================
+# 🎯 加载部署模式 extra (Docker Compose / K8s 差异函数, 如 fix_mount_permissions)
+# 提供 fix_mount_permissions: Docker 修权限 / K8s no-op (PVC 由 fsGroup 管理)
+# DEPLOY_MODE 由 rcoder 创建容器时注入 (kubernetes_runtime.rs / agent_container_starter.rs)
+# ============================================================================
+source /usr/local/bin/start-up-common.sh
+
+
+# ============================================================================
 # 🎯 动态时区设置（支持通过 TZ 环境变量自定义时区）
 # 默认时区为 Asia/Shanghai（在 Dockerfile 中配置）
 # 启动时如果检测到 TZ 环境变量，则更新系统时区
@@ -384,6 +392,17 @@ function initialize_user_home() {
         log_success "User home directory already initialized"
     fi
 
+    # ========== 无条件确保 .npmrc 存在（国内镜像源）==========
+    # /home/user 被宿主机挂载时 .npmrc 会丢失，且上方 need_restore 检测条件不含 .npmrc
+    # （只要 Desktop/.bashrc/.bunfig.toml/.claude/.config 存在就不会触发恢复）
+    # 因此每次启动都强制恢复，确保 user 用户使用国内 npm 源
+    # 注意：即使此文件丢失，/usr/etc/npmrc 系统级配置仍可兜底（见 Dockerfile.base）
+    if [ -f "$SKEL_DIR/.npmrc" ]; then
+        cp -a "$SKEL_DIR/.npmrc" "$USER_HOME/.npmrc"
+        chown user:user "$USER_HOME/.npmrc" 2>/dev/null || true
+        log_success "  .npmrc ensured (国内镜像源 registry=https://registry.npmmirror.com)"
+    fi
+
     # ========== 额外保护：确保 XFCE Panel 配置始终有效 ==========
     # 即使上面的恢复逻辑没有触发，也检查 Panel 配置是否完整
     # 关键修复：XFCE 会在运行时重写 panel.xml，可能保存损坏的配置
@@ -457,6 +476,30 @@ function initialize_user_home() {
         mkdir -p "$(dirname "$XFCE_DESKTOP_XML")"
         cp -f "$XFCE_DESKTOP_SYSTEM" "$XFCE_DESKTOP_XML"
         log_success "  xfce4-desktop.xml pre-configured from system (fixes wallpaper scaling)"
+    fi
+
+    # ========== 无条件补齐桌面系统图标 (每次启动确保预设图标存在) ==========
+    # 与下方 launcher 补齐同理, 属于"系统预设, 每次启动确保存在"。
+    # 语义: 只补缺失的, 不删除用户自定义图标, 不覆盖用户改过的同名图标:
+    #   - 用户删了图标 (链接不存在)              → 补
+    #   - 链接损坏 (目标无效, -e 跟踪失败)        → 补
+    #   - 用户保留或改过 (存在且有效)             → 不动
+    # 背景: /home/user 是持久化 PVC (rcoder-computer-workspace/{user_id}),
+    #       用户删图标会被 PVC 保留; 而上方 need_restore 只在"目录不存在"时触发,
+    #       删图标后 Desktop 目录还在 → 不触发 → 桌面图标必须靠这里无条件补齐才能恢复。
+    if [ -d "$SKEL_DIR/Desktop" ]; then
+        for skel_icon in "$SKEL_DIR/Desktop/"*.desktop; do
+            [ -e "$skel_icon" ] || continue            # glob 无匹配时跳过
+            local icon_name="$(basename "$skel_icon")"
+            local user_icon="$USER_HOME/Desktop/$icon_name"
+            if [ ! -e "$user_icon" ]; then              # 不存在或链接损坏 → 补
+                mkdir -p "$USER_HOME/Desktop"
+                cp -a "$skel_icon" "$user_icon"         # -a 保留符号链接 (复制链接本身, 非目标)
+                chmod +x "$user_icon" 2>/dev/null || true
+                chown user:user "$user_icon" 2>/dev/null || true
+                log_success "  Desktop icon ensured (was missing): $icon_name"
+            fi
+        done
     fi
 
     # 确保 Panel launcher 目录存在且内容完整（强制恢复）
@@ -585,49 +628,13 @@ EOF
     log_success "  Chromium set as default web browser (mimeapps.list)"
     log_success "  BROWSER env set to: $BROWSER"
 
-    # ========== 修复挂载目录的权限（优化版 - 避免递归遍历大量文件） ==========
-    # 优化说明：
-    # 1. 容器以 root 身份运行，通过 HOME=/home/user 设置环境变量
-    # 2. root 用户可以访问任何文件，不需要递归 chown
-    # 3. 只需要确保关键目录的基本权限即可
-    log "Fixing permissions for mounted directories (optimized)..."
-
-    # 确保必要目录存在
+    # 确保必要目录存在 (两类部署通用)
     mkdir -p "$USER_HOME/.cache" /app /tmp/mesa_shader_cache "${CONTAINER_LOGS_DIR:-/app/container-logs}"
 
-    # ========== 方案 1: 只修复顶层目录所有权（非递归，<0.1秒） ==========
-    log "Fixing ownership for top-level directories (non-recursive)..."
-    chown user:user "$USER_HOME" 2>/dev/null || true
-    chown user:user "$USER_HOME/.config" 2>/dev/null || true
-    chown user:user "$USER_HOME/.cache" 2>/dev/null || true
-    chown user:user "$USER_HOME/Desktop" 2>/dev/null || true
-
-    # ========== 方案 2: 只递归修复 XFCE 配置目录（文件少，~0.1秒） ==========
-    # XFCE 配置文件需要正确的所有者才能被 xfce4-session 正确加载
-    # 同时设置 other 读权限让 root 用户也能访问（一次性完成，避免重复遍历）
-    if [ -d "$USER_HOME/.config/xfce4" ]; then
-        find "$USER_HOME/.config/xfce4" \( -type f -o -type d \) \
-            -exec chown user:user {} + \
-            -exec chmod o+rX {} + 2>/dev/null || true
-        log_success "  XFCE config ownership and permissions fixed"
-    fi
-
-    # ========== 方案 3: 通过 chmod 让 root 用户也能访问（容器内以 root 运行） ==========
-    # 由于容器以 root 运行，只需要确保 other 有读权限即可
-    # 为了安全性和性能，只对必要的目录递归处理
-    log "Setting read permissions for root access..."
-
-    # Desktop 目录递归处理（文件少）
-    if [ -d "$USER_HOME/Desktop" ]; then
-        chmod -R o+rX "$USER_HOME/Desktop" 2>/dev/null || true
-    fi
-
-    # .cache 和 .local 可能包含大量文件，只修复顶层目录（非递归）
-    for dir in "$USER_HOME/.cache" "$USER_HOME/.local" "$USER_HOME/.config"; do
-        if [ -d "$dir" ]; then
-            chmod o+rX "$dir" 2>/dev/null || true
-        fi
-    done
+    # 修复挂载目录权限: 由 start-up-common.sh 按 DEPLOY_MODE 提供的 fix_mount_permissions 执行
+    #   - Docker Compose (bind mount): chown/chmod 修被宿主机改坏的 owner
+    #   - K8s (PVC subPath): no-op, 权限由 fsGroup 管理
+    fix_mount_permissions "$USER_HOME"
 
     # ========== 保护敏感目录（如果存在）==========
     # 确保 SSH 私钥等敏感文件权限严格
@@ -749,7 +756,7 @@ function start_display_and_desktop() {
     # 注意: CompressLevel/QualityLevel 是 VNC 客户端参数，不是 Xvnc 服务端参数
     #       真正的压缩配置在 noVNC 客户端侧 (rfb.js 的 compressionLevel/qualityLevel)
     log "Starting Xvnc :0 (background initialization)..."
-    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared >/tmp/xvnc.log 2>&1 &
+    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvnc :0 -geometry 1400x1050 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared >/tmp/xvnc.log 2>&1 &
 
 
 	# ========== 关键修复：清理 Chromium 进程和锁文件 ==========
@@ -774,10 +781,8 @@ function start_display_and_desktop() {
 	echo "export CHROMIUM_USER_DATA_DIR='${CHROMIUM_USER_DATA_DIR}'" >> /etc/environment
 	echo "export CHROMIUM_USER_DATA_DIR='${CHROMIUM_USER_DATA_DIR}'" >> /etc/profile.d/chromium-env.sh
 
-	# 4.1 agent-browser 使用独立 profile，避免与 MCP 的 Chromium 争抢锁
-	AGENT_BROWSER_PROFILE="${AGENT_BROWSER_PROFILE:-/home/user/.config/agent-browser/chromium}"
-	export AGENT_BROWSER_PROFILE
-	log_success "agent-browser configured with isolated profile: $AGENT_BROWSER_PROFILE"
+	# 4.1 agent-browser 默认配置来自 Dockerfile ENV
+	log_success "agent-browser configured for shared profile: $AGENT_BROWSER_PROFILE"
 
 	# 5. 清理 Chromium profile 锁文件（SingletonLock）
 	if [ -d "$CHROMIUM_USER_DATA_DIR" ]; then
@@ -795,17 +800,6 @@ function start_display_and_desktop() {
 		find "$CHROMIUM_USER_DATA_DIR" -name "lockfile" -type f -delete 2>/dev/null || true
 
 		log_success "Chromium lock files cleaned from: $CHROMIUM_USER_DATA_DIR"
-	fi
-
-	# 5.1 清理 agent-browser 独立 profile 锁文件（如果与 MCP profile 不同）
-	if [ "$AGENT_BROWSER_PROFILE" != "$CHROMIUM_USER_DATA_DIR" ]; then
-		mkdir -p "$AGENT_BROWSER_PROFILE"
-		rm -f "$AGENT_BROWSER_PROFILE/SingletonLock" || true
-		rm -f "$AGENT_BROWSER_PROFILE/SingletonSocket" || true
-		rm -f "$AGENT_BROWSER_PROFILE/SingletonCookie" || true
-		find "$AGENT_BROWSER_PROFILE" -name "*.lock" -type f -delete 2>/dev/null || true
-		find "$AGENT_BROWSER_PROFILE" -name "lockfile" -type f -delete 2>/dev/null || true
-		log_success "agent-browser lock files cleaned from: $AGENT_BROWSER_PROFILE"
 	fi
 
 	# 6. 清理 /tmp 中的 Chromium 临时文件
@@ -1017,7 +1011,7 @@ function apply_xfce_wallpaper() {
     # ========== 2. 等待 xfconf-query 可用 ==========
     local counter=0
     while ! DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l >/dev/null 2>&1; do
-        sleep 1
+        sleep 0.3
         ((counter++))
         if ((counter > 30)); then
             log_warn " Timeout waiting for XFCE desktop xfconf, skipping wallpaper"
@@ -1106,7 +1100,7 @@ function apply_xfce_wallpaper() {
     local render_counter=0
     local render_detected=false
 
-    while ((render_counter < 60)); do  # 最长等待 30 秒
+    while ((render_counter < 16)); do  # 最长等待 8 秒
         # 检测根窗口是否已设置背景图 (xfdesktop 设置壁纸后会更新这个属性)
         if DISPLAY=:0 xprop -root _XROOTPMAP_ID 2>/dev/null | grep -q "pixmap id"; then
             render_detected=true
@@ -1247,7 +1241,7 @@ function restart_full_display_stack() {
     # 4. 重启 Xvnc
     log "Restarting Xvnc :0 ..."
     HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache \
-        Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared \
+        Xvnc :0 -geometry 1400x1050 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared \
         >/tmp/xvnc.log 2>&1 &
 
     # 5. 等待 X11 display 就绪
@@ -1918,6 +1912,12 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
     ) &
     ime_pid=$!
 
+    # 4.5 ttyd Web 终端（不依赖 X11，独立启动）
+    (
+        start_ttyd_services
+    ) &
+    ttyd_pid=$!
+
     # 5. 应用 XFCE 壁纸（后台）
     (
         apply_xfce_wallpaper
@@ -1926,7 +1926,7 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
 
     # 等待所有并行服务启动完成
     log "Waiting for all services to start..."
-    wait $vnc_pid $mcp_pid $audio_pid $ime_pid $wallpaper_pid 2>/dev/null || true
+    wait $vnc_pid $mcp_pid $audio_pid $ime_pid $ttyd_pid $wallpaper_pid 2>/dev/null || true
     log_success "All X11-dependent services started!"
 
     # 🆕 启动 VNC 就绪标记轮询任务（后台）
@@ -2255,11 +2255,6 @@ if [ -f /tmp/dbus-session-env ]; then
     log_success "Loaded D-Bus session: $DBUS_SESSION_BUS_ADDRESS"
 fi
 
-# ========== 启动 ttyd Web 终端服务 ==========
-# ttyd 不依赖 X11，可以独立启动
-log "Starting ttyd web terminal service..."
-start_ttyd_services
-
 # 构建环境变量导出命令
 ENV_EXPORTS="export HOME=/home/user; \
 export DISPLAY=:0; \
@@ -2271,7 +2266,7 @@ export INPUT_METHOD=fcitx; \
 export LANG=C.UTF-8; \
 export LC_ALL=C.UTF-8; \
 export BROWSER=/usr/bin/chromium-browser-launcher; \
-export PATH=/home/user/acp-agent:/usr/local/bin:/opt/cargo/bin:\$PATH"
+export PATH=/usr/local/bin:/opt/cargo/bin:\$PATH"
 
 # 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）
 # 否则执行默认的 agent_runner
