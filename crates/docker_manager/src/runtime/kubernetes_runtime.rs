@@ -844,31 +844,21 @@ impl ContainerRuntime for KubernetesRuntime {
                         success_threshold: Some(1),
                         ..Default::default()
                     }),
+                    // readiness_probe: initialDelay/period 用 1s, agent_runner /health 一返回 200 即 Ready。
+                    // 原 initialDelay=3+period=3 会把首次成功探测拖到 ~3-6s (create 阶段慢)。
+                    // 实测 startupProbe + readiness period=3 有 handoff 延迟 (startup 通过后还要等 readiness 的 3s 边界),
+                    // 不如直接 readiness period=1: 每 1s 探一次, /health=200 后 ~1s 内 Ready。
+                    // 稳态每秒一次 /health GET 开销可忽略; failure_threshold=20 容忍启动期 503, 不被误杀。
                     readiness_probe: Some(Probe {
                         http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
                             path: Some("/health".to_string()),
                             port: IntOrString::Int(8086),
                             ..Default::default()
                         }),
-                        initial_delay_seconds: Some(3),
-                        period_seconds: Some(3),
+                        initial_delay_seconds: Some(1),
+                        period_seconds: Some(1),
                         timeout_seconds: Some(3),
                         failure_threshold: Some(20),
-                        success_threshold: Some(1),
-                        ..Default::default()
-                    }),
-                    // startup_probe: 启动期每 1s 探 /health, agent_runner gRPC 一绑定即 Ready,
-                    // 避免 readiness_probe initialDelay=3 + period=3 把首次成功探测拖到 ~3-6s (create 阶段慢)。
-                    // 启动通过后交回 readiness_probe(period=3) 管稳态, 不增加稳态探针开销。
-                    startup_probe: Some(Probe {
-                        http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                            path: Some("/health".to_string()),
-                            port: IntOrString::Int(8086),
-                            ..Default::default()
-                        }),
-                        period_seconds: Some(1),
-                        timeout_seconds: Some(1),
-                        failure_threshold: Some(10),
                         success_threshold: Some(1),
                         ..Default::default()
                     }),
