@@ -857,6 +857,21 @@ impl ContainerRuntime for KubernetesRuntime {
                         success_threshold: Some(1),
                         ..Default::default()
                     }),
+                    // startup_probe: 启动期每 1s 探 /health, agent_runner gRPC 一绑定即 Ready,
+                    // 避免 readiness_probe initialDelay=3 + period=3 把首次成功探测拖到 ~3-6s (create 阶段慢)。
+                    // 启动通过后交回 readiness_probe(period=3) 管稳态, 不增加稳态探针开销。
+                    startup_probe: Some(Probe {
+                        http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                            path: Some("/health".to_string()),
+                            port: IntOrString::Int(8086),
+                            ..Default::default()
+                        }),
+                        period_seconds: Some(1),
+                        timeout_seconds: Some(1),
+                        failure_threshold: Some(10),
+                        success_threshold: Some(1),
+                        ..Default::default()
+                    }),
                     // preStop lifecycle hook: 在 kubelet 发送 SIGTERM 之前执行，
                     // 确保 JuiceFS FUSE 卷上的写入 buffer flush 到磁盘，
                     // 减少 FUSE unmount 卡住的概率

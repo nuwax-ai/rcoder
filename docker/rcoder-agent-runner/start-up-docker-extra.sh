@@ -24,11 +24,15 @@ fix_mount_permissions() {
         log_success "  XFCE config ownership and permissions fixed"
     fi
 
-    # 方案 3: Desktop 递归 o+rX (文件少); .cache/.local/.config 仅顶层 (避免遍历大量文件)
-    [ -d "$USER_HOME/Desktop" ] && chmod -R o+rX "$USER_HOME/Desktop" 2>/dev/null || true
-    for dir in "$USER_HOME/.cache" "$USER_HOME/.local" "$USER_HOME/.config"; do
-        [ -d "$dir" ] && chmod o+rX "$dir" 2>/dev/null || true
-    done
+    # 方案 3: Desktop 递归 o+rX + 顶层 chmod = 给 other/root 的【读权限】(非所有权), 后台跑不阻塞 agent_runner exec。
+    #   方案1/2 的 chown(所有权) 已同步完成, 桌面 user 启动即可读写自己的文件; 这里的 chmod 仅影响 other 读权限,
+    #   桌面渲染图标时才读 Desktop 文件, 后台 ~20ms 会在 xfdesktop 渲染前完成, 无感知。
+    (
+        [ -d "$USER_HOME/Desktop" ] && chmod -R o+rX "$USER_HOME/Desktop" 2>/dev/null
+        for dir in "$USER_HOME/.cache" "$USER_HOME/.local" "$USER_HOME/.config"; do
+            [ -d "$dir" ] && chmod o+rX "$dir" 2>/dev/null
+        done
+    ) &
 
     log_success "Permissions fixed (Docker Compose - no recursive chown on large dirs)"
 }

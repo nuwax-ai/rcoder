@@ -2222,32 +2222,11 @@ source /etc/profile.d/ime-env.sh 2>/dev/null || true
 wait_for_file /tmp/dbus-session-env 5 || log_warn "D-Bus session file not ready"
 
 
-# ========== 等待 MCP Proxy 服务就绪 ==========
-# MCP Proxy 已在后台并行启动，这里只需等待端口就绪
-# 由于是并行启动，通常很快就会就绪
-log "Waiting for MCP Proxy service to be ready..."
-MCP_PROXY_PORT=18099
-MCP_PROXY_TIMEOUT=30  # 并行启动后，超时时间从 60s 降至 30s
-
-# 使用 wait_for_port 智能等待端口就绪
-if wait_for_port 127.0.0.1 $MCP_PROXY_PORT $MCP_PROXY_TIMEOUT; then
-    # 端口就绪后，使用 curl 发送 JSON-RPC 请求验证 MCP 服务是否真正可用
-    # 注意：mcp-proxy convert 是持续运行的进程会导致 5 秒超时，改用 curl 直接测试 HTTP 端点
-    MCP_TEST_RESULT=$(curl -s --max-time 3 -X POST "http://127.0.0.1:$MCP_PROXY_PORT" \
-        -H "Content-Type: application/json" \
-        -H "Accept: application/json, text/event-stream" \
-        -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 2>/dev/null)
-
-    if echo "$MCP_TEST_RESULT" | grep -q '"tools"'; then
-        log_success "MCP Proxy is fully ready on port $MCP_PROXY_PORT"
-    else
-        log_warn "MCP Proxy port is open but service not fully initialized, continuing anyway"
-        log_warn "Response: $MCP_TEST_RESULT"
-    fi
-else
-    log_warn "MCP Proxy not ready after ${MCP_PROXY_TIMEOUT}s, starting agent_runner anyway"
-    log_warn "Agent may need to retry MCP connections on first use"
-fi
+# ========== MCP Proxy：不在 readiness 关键路径，不阻塞 agent_runner 启动 ==========
+# MCP Proxy 仍在下方后台子 shell (X11 就绪后启动, ~line 1867) 里拉起，这里不再 wait_for_port。
+# 原因：agent_runner 的 /health 只查 HTTP+gRPC:50051，不依赖 MCP；而 wait_for_port 18099
+# 实际要等 "X11 就绪 + MCP 起来"，会把 exec agent_runner 拖后数秒 → restart create 阶段变慢。
+# MCP 未就绪时由 agent_runner 内部重试逻辑兜底（用户首次调 agent 通常已在重启数秒后，MCP 已就绪）。
 
 # 加载 D-Bus 会话环境
 if [ -f /tmp/dbus-session-env ]; then
