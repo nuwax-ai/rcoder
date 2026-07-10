@@ -262,7 +262,9 @@ impl K8sPodOps for KubernetesRuntime {
 
     async fn wait_for_pod_terminated(&self, pod_name: &str) -> ContainerRuntimeResult<()> {
         let timeout = std::time::Duration::from_secs(30);
-        let poll_interval = std::time::Duration::from_secs(1);
+        // 细化轮询: 容器秒退后 pod 对象仍要 ~2-3s 才从 API 消失(kubelet 清理)。
+        // 1s 轮询会多等最多 1s; 300ms 既及时察觉删除, 又不给 API server 压力(最多 ~100 次廉价 GET)。
+        let poll_interval = std::time::Duration::from_millis(300);
         let start = std::time::Instant::now();
 
         while start.elapsed() < timeout {
@@ -292,7 +294,7 @@ impl K8sPodOps for KubernetesRuntime {
 
         // 超时：force-delete（gracePeriodSeconds=0 立即杀死容器）
         warn!(
-            "[K8S] Pod {} did not terminate within 75s, issuing force-delete",
+            "[K8S] Pod {} did not terminate within 30s, issuing force-delete",
             pod_name
         );
         let force_dp = DeleteParams {
