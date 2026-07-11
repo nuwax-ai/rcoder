@@ -558,7 +558,10 @@ impl ContainerRuntime for KubernetesRuntime {
         // 不为每个 user 新建独立空 PVC——否则沙箱 /home/user 看不到 file-server scaffold 的文件
         // （file-server 写到共享卷 /{user_id}/{cId}，cId=project_id）。{user_id} 目录由
         // create_user_workspace 在 create_container 之前创建，故 subPath 挂载必然命中。
-        if !matches!(service_type, ServiceType::ComputerAgentRunner) {
+        // WebAgentRunner 同样例外：复用共享 rcoder-workspace PVC（subPath 见下方卷选取），
+        // 不为每个项目新建独立空 PVC——否则 CephFS 下每卷隔离，终端 pod 看不到主 pod 写入的
+        // 项目文件（/app/project_workspace/{projectId}），ws_terminal fail-closed。
+        if !matches!(service_type, ServiceType::ComputerAgentRunner | ServiceType::WebAgentRunner) {
             self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
                 .await?;
         }
@@ -594,17 +597,32 @@ impl ContainerRuntime for KubernetesRuntime {
         // Build workspace volume:
         // - ComputerAgentRunner: 共享 rcoder-computer-workspace PVC + subPath=user_id
         //   → 沙箱 /home/user/{cId} = 主pod /app/computer-project-workspace/{user_id}/{cId}
-        // - WebAgentRunner: 每项目独立 PVC（NFS subdir 隔离），无 subPath
-        let (workspace_pvc, workspace_sub_path) =
-            if matches!(service_type, ServiceType::ComputerAgentRunner) {
+        // - WebAgentRunner: 共享 rcoder-workspace PVC + subPath（默认 workspace）
+        //   → <PVC>/{subPath}/{projectId} = 容器内 /app/project_workspace/{projectId}，
+        //   与主 rcoder pod 的 /app/project_workspace 挂载严格对齐（项目文件双向可见）。
+        //   旧逻辑建每项目独立 PVC（CephFS 每卷隔离 → 空卷），终端 fail-closed。
+        // - 其它（未来 ServiceType）: 每项目独立 PVC 兜底。
+        let (workspace_pvc, workspace_sub_path) = match service_type {
+            ServiceType::ComputerAgentRunner => {
                 let shared = std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME")
                     .unwrap_or_else(|_| format!("{}-rcoder-computer-workspace", self.namespace));
                 // subPath 必须等于 file-server/rcoder 建目录用的 user_id（cId 的父级）。
                 // 用原始 user_id（非 sanitize），与 file-server createWorkspace(userId) 完全一致。
                 (shared, Some(user_id_val.to_string()))
-            } else {
-                (self.workspace_pvc_name(identifier, &service_type)?, None)
-            };
+            }
+            ServiceType::WebAgentRunner => {
+                let shared = std::env::var("RCODER_WORKSPACE_PVC_NAME")
+                    .unwrap_or_else(|_| format!("{}-rcoder-workspace", self.namespace));
+                // subPath 与主 rcoder pod project_workspace 挂载的 subPath 一致（chart 单一 value
+                // RCODER_WORKSPACE_SUBPATH 驱动，默认 "workspace"）。空值兜底为 "workspace"。
+                let sub_path = std::env::var("RCODER_WORKSPACE_SUBPATH")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "workspace".to_string());
+                (shared, Some(sub_path))
+            }
+            _ => (self.workspace_pvc_name(identifier, &service_type)?, None),
+        };
 
         // 取 service 配置(完全分家):K8s 优先读 kubernetes_config;docker_config.multi_image_config
         // 仅作过渡期安全兜底(旧 chart 未带 kubernetes_config 段时,保留 workspace 路径/command/env 行为)。
