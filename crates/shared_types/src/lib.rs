@@ -59,6 +59,8 @@ pub use permission_types::{
 
 // 常量定义模块
 pub mod constants;
+// 工作区路径常量 (单一事实源, 所有 crate 共用: rcoder/docker_manager/agent_runner)
+pub mod paths;
 pub use constants::*;
 
 // 错误码定义模块 — 重导出自 shared_types_i18n（过渡期兼容）

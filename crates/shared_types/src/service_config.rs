@@ -8,12 +8,15 @@ use std::collections::HashMap;
 
 /// 容器路径模板的默认值
 fn default_container_path_template() -> String {
-    "/app/project_workspace/{project_id}".to_string()
+    format!("{}{{project_id}}", crate::paths::WORKSPACE_ROOT)
 }
 
 /// Computer Agent Runner 容器路径模板的默认值
 fn default_computer_agent_runner_container_path_template() -> String {
-    "/app/computer-project-workspace/{user_id}/{project_id}".to_string()
+    format!(
+        "{}{{user_id}}/{{project_id}}",
+        crate::paths::COMPUTER_WORKSPACE_ROOT
+    )
 }
 
 /// 容器工作目录的默认值
@@ -414,8 +417,8 @@ impl ServiceImageConfig {
         self.workspace_resolution_path
             .clone()
             .unwrap_or_else(|| match self.service_type {
-                ServiceType::WebAgentRunner => "/app/project_workspace".to_string(),
-                ServiceType::ComputerAgentRunner => "/app/computer-project-workspace".to_string(),
+                ServiceType::WebAgentRunner => crate::paths::WORKSPACE_ROOT.to_string(),
+                ServiceType::ComputerAgentRunner => crate::paths::COMPUTER_WORKSPACE_ROOT.to_string(),
                 // UserApp 复用 rcoder-workspace PVC 的 apps subPath（部署侧挂到 /app/app-workspace）
                 ServiceType::UserApp => "/app/app-workspace".to_string(),
             })

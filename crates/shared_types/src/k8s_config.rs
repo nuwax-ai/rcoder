@@ -213,8 +213,8 @@ impl K8sServiceConfig {
     /// 根据 service_type 产生默认的 workspace_resolution_path
     fn default_workspace_resolution_path(service_type: &ServiceType) -> String {
         match service_type {
-            ServiceType::WebAgentRunner => "/app/project_workspace".to_string(),
-            ServiceType::ComputerAgentRunner => "/app/computer-project-workspace".to_string(),
+            ServiceType::WebAgentRunner => crate::paths::WORKSPACE_ROOT.to_string(),
+            ServiceType::ComputerAgentRunner => crate::paths::COMPUTER_WORKSPACE_ROOT.to_string(),
             ServiceType::UserApp => "/app/app-workspace".to_string(),
         }
     }

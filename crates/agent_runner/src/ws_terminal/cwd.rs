@@ -19,11 +19,12 @@
 
 use std::path::{Path, PathBuf};
 
+use shared_types::paths::WORKSPACE_ROOT;
+
 /// ComputerAgentRunner 容器内项目目录前缀（per-user 容器，不受隔离模式影响）
 const HOME_PREFIX: &str = "/home/user";
 
-/// WebAgentRunner 容器内工作区根（其下按隔离模式分单级/三级）
-const WEB_WORKSPACE_PREFIX: &str = "/app/project_workspace";
+// WebAgentRunner 工作区根用 shared_types::paths::WORKSPACE_ROOT (单一事实源, 不再本地定义)
 
 /// project_id 合法字符集：字母数字、`-`、`_`
 ///
@@ -92,9 +93,9 @@ fn build_web_prefixes(tenant: Option<&str>, space: Option<&str>) -> Vec<String> 
         .filter(|s| is_valid_project_id(s))
         .zip(space.filter(|s| is_valid_project_id(s)));
     if let Some((t, s)) = valid_pair {
-        out.push(format!("{WEB_WORKSPACE_PREFIX}/{t}/{s}"));
+        out.push(format!("{WORKSPACE_ROOT}/{t}/{s}"));
     }
-    out.push(WEB_WORKSPACE_PREFIX.to_string());
+    out.push(WORKSPACE_ROOT.to_string());
     out
 }
 

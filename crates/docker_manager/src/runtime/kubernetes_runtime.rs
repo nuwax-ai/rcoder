@@ -35,6 +35,8 @@ use shared_types::{
     ServiceResourceLimits, ServiceType,
 };
 #[cfg(feature = "kubernetes")]
+use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
+#[cfg(feature = "kubernetes")]
 use std::sync::Arc;
 #[cfg(feature = "kubernetes")]
 use tokio::sync::RwLock;
@@ -115,20 +117,36 @@ fn agent_workspace_quota_dir(
     project_id: &str,
     user_id: &str,
 ) -> Option<String> {
-    // 与 paths.rs::WORKSPACE_ROOT / COMPUTER_WORKSPACE_ROOT 对齐 (rcoder 主容器视角)
-    const WEB_ROOT: &str = "/app/project_workspace";
-    const COMPUTER_ROOT: &str = "/app/computer-project-workspace";
+    // 标识符校验防路径穿越 (与 rcoder::handler::utils::paths::build_workspace_path 一致,
+    // 复用 shared_types::validation::validate_identifier: 仅 [a-zA-Z0-9_-], 1-64 字符, 拒 . /)。
+    // 不通过则放弃配额 (None), 绝不设到可能穿越的错误目录 (如 project_id="../etc")。
+    use shared_types::validation::validate_identifier;
     let iso = isolation_type.map(str::to_lowercase);
     match service_type {
-        ServiceType::WebAgentRunner => match iso.as_deref() {
-            Some("tenant") | Some("space") => {
-                let tid = tenant_id?;
-                let sid = space_id?;
-                Some(format!("{WEB_ROOT}/{tid}/{sid}/{project_id}"))
+        ServiceType::WebAgentRunner => {
+            if validate_identifier(project_id, "project_id").is_err() {
+                return None;
             }
-            _ => Some(format!("{WEB_ROOT}/{project_id}")),
-        },
-        ServiceType::ComputerAgentRunner => Some(format!("{COMPUTER_ROOT}/{user_id}")),
+            match iso.as_deref() {
+                Some("tenant") | Some("space") => {
+                    let tid = tenant_id?;
+                    let sid = space_id?;
+                    if validate_identifier(tid, "tenant_id").is_err()
+                        || validate_identifier(sid, "space_id").is_err()
+                    {
+                        return None;
+                    }
+                    Some(format!("{WORKSPACE_ROOT}/{tid}/{sid}/{project_id}"))
+                }
+                _ => Some(format!("{WORKSPACE_ROOT}/{project_id}")),
+            }
+        }
+        ServiceType::ComputerAgentRunner => {
+            if validate_identifier(user_id, "user_id").is_err() {
+                return None;
+            }
+            Some(format!("{COMPUTER_WORKSPACE_ROOT}/{user_id}"))
+        }
         _ => None,
     }
 }

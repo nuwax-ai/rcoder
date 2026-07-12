@@ -8,44 +8,10 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-/// 容器内 RCoder 项目工作空间的根目录
-///
-/// 容器内的目录结构（isolation_type=project）：
-/// ```text
-/// /app/project_workspace/
-/// └── {project_id}/
-///     └── (项目文件)
-/// ```
-///
-/// 容器内的目录结构（isolation_type=tenant/space）：
-/// ```text
-/// /app/project_workspace/
-/// └── {tenant_id}/
-///     └── {space_id}/
-///         └── {project_id}/
-///             └── (项目文件)
-/// ```
-pub const WORKSPACE_ROOT: &str = "/app/project_workspace";
-
-/// 容器内 Computer Use 项目工作空间的根目录
-///
-/// 容器内的目录结构（isolation_type=project）：
-/// ```text
-/// /app/computer-project-workspace/
-/// └── {user_id}/
-///     └── {project_id}/
-///         └── (项目文件)
-/// ```
-///
-/// 容器内的目录结构（isolation_type=tenant/space）：
-/// ```text
-/// /app/computer-project-workspace/
-/// └── {tenant_id}/
-///     └── {space_id}/
-///         └── {project_id}/
-///             └── (项目文件)
-/// ```
-pub const COMPUTER_WORKSPACE_ROOT: &str = "/app/computer-project-workspace";
+// 路径常量已下沉到 shared_types::paths (单一事实源, 所有 crate 共用)。
+// 这里 re-export 保持本模块 API (paths::WORKSPACE_ROOT / paths::COMPUTER_WORKSPACE_ROOT) 不破坏。
+// 文档与目录结构见 crates/shared_types/src/paths.rs。
+pub use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
 
 /// 标识符验证正则：仅允许字母、数字、下划线、连字符
 /// 长度 1-64 字符
