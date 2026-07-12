@@ -95,6 +95,44 @@ fn parse_quantity_to_bytes(s: &str) -> Option<u64> {
     s.parse::<u64>().ok()
 }
 
+/// 计算 rcoder 主容器内 agent 工作区子目录 (用于 CephFS 配额)。
+/// 逻辑与 `rcoder::handler::utils::paths::build_workspace_path` /
+/// `build_computer_workspace_path` 保持一致 (单一事实源在那边; 此处复刻是因为
+/// docker_manager 不能反向依赖 rcoder crate)。返回的是 **rcoder 主容器视角** 路径
+/// (不是 agent sub-container 的 /home/user)。
+///
+/// - web 共享容器 (isolation=tenant/space): 三级 `{tenant}/{space}/{project}` (per-project)
+/// - web 普通隔离 (project): 单级 `{project}`
+/// - computer: per-user `{user_id}` (与 subPath=user_id 挂载边界对齐, 限该用户所有 project 总和)
+/// - pod_id 不参与路径决策 (只影响容器名/缓存键)
+/// - 共享容器下 handler 强制 tenant_id/space_id 非空; 若脏数据缺失则返回 None (放弃配额, 不设到错误目录)
+#[cfg(feature = "kubernetes")]
+fn agent_workspace_quota_dir(
+    service_type: &ServiceType,
+    isolation_type: Option<&str>,
+    tenant_id: Option<&str>,
+    space_id: Option<&str>,
+    project_id: &str,
+    user_id: &str,
+) -> Option<String> {
+    // 与 paths.rs::WORKSPACE_ROOT / COMPUTER_WORKSPACE_ROOT 对齐 (rcoder 主容器视角)
+    const WEB_ROOT: &str = "/app/project_workspace";
+    const COMPUTER_ROOT: &str = "/app/computer-project-workspace";
+    let iso = isolation_type.map(str::to_lowercase);
+    match service_type {
+        ServiceType::WebAgentRunner => match iso.as_deref() {
+            Some("tenant") | Some("space") => {
+                let tid = tenant_id?;
+                let sid = space_id?;
+                Some(format!("{WEB_ROOT}/{tid}/{sid}/{project_id}"))
+            }
+            _ => Some(format!("{WEB_ROOT}/{project_id}")),
+        },
+        ServiceType::ComputerAgentRunner => Some(format!("{COMPUTER_ROOT}/{user_id}")),
+        _ => None,
+    }
+}
+
 /// Kubernetes runtime implementation using kube-rs
 #[cfg(feature = "kubernetes")]
 pub struct KubernetesRuntime {
@@ -667,20 +705,19 @@ impl ContainerRuntime for KubernetesRuntime {
         //       致其只落 ephemeral-storage, PVC 子目录写入不限。rcoder 已挂共享 PVC 根 (web
         //       /app/project_workspace, computer /app/computer-project-workspace), 用 xattr::set
         //       (libc setxattr -> CephFS MDS 强制) 对 agent 子目录设 ceph.quota.max_bytes。
+        //       子目录规则 (含 web 共享容器 tenant/space/project 三级) 见 agent_workspace_quota_dir。
         //       需 cephx 挂载用户 (csi-cephfs-node, mds=allow rw) 对该目录有 write 权限。
         //       失败只 warn 不阻断 (配额设不上退化为不限, 不崩 rcoder)。
         if let Some(ref ss) = storage_size {
             if let Some(bytes) = parse_quantity_to_bytes(ss) {
-                let quota_dir = match service_type {
-                    ServiceType::WebAgentRunner => {
-                        format!("/app/project_workspace/{}", project_id_val)
-                    }
-                    ServiceType::ComputerAgentRunner => {
-                        format!("/app/computer-project-workspace/{}", user_id_val)
-                    }
-                    _ => String::new(),
-                };
-                if !quota_dir.is_empty() {
+                if let Some(quota_dir) = agent_workspace_quota_dir(
+                    &service_type,
+                    isolation_type.as_deref(),
+                    tenant_id.as_deref(),
+                    space_id.as_deref(),
+                    &project_id_val,
+                    &user_id_val,
+                ) {
                     let _ = std::fs::create_dir_all(&quota_dir);
                     if let Err(e) = xattr::set(
                         &quota_dir,
