@@ -85,7 +85,8 @@ RUN apt-get update && \
     xclip \
     wget software-properties-common \
     # Suna dependencies:
-    poppler-utils wkhtmltopdf antiword unrtf catdoc gawk file jq csvkit xmlstarlet zip unzip tmux vim tree rsync && \
+    poppler-utils wkhtmltopdf antiword unrtf catdoc gawk file jq csvkit xmlstarlet zip unzip tmux vim tree rsync \
+    gvfs libglib2.0-bin && \
     # Configure X11 wrapper to allow any user:
     sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config && \
     # Set the default terminal
@@ -502,10 +503,12 @@ RUN mkdir -p /home/user/Desktop /usr/share/applications && \
     printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Terminal\nComment=Terminal Emulator\nExec=xfce4-terminal\nIcon=utilities-terminal\nTerminal=false\nCategories=System;TerminalEmulator;" > /usr/share/applications/user-terminal.desktop && \
     printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Visual Studio Code\nComment=Code Editor\nExec=/usr/bin/code --no-sandbox --user-data-dir=/home/user/.config/Code\nIcon=vscode\nTerminal=false\nCategories=Development;IDE;" > /usr/share/applications/user-vscode.desktop && \
     chmod 644 /usr/share/applications/user-terminal.desktop /usr/share/applications/user-vscode.desktop && \
-    # Create symbolic links from Desktop to system apps (安全软链接)
-    ln -sf /usr/share/applications/user-terminal.desktop /home/user/Desktop/terminal.desktop && \
-    ln -sf /usr/share/applications/user-vscode.desktop /home/user/Desktop/vscode.desktop && \
-    ln -sf /usr/share/applications/chromium-browser.desktop /home/user/Desktop/chromium.desktop && \
+    # 桌面图标用实体副本 (符号链接会被 rsync munge 成 /rsyncd-munged/ 死链 +
+    # xfdesktop/GIO 对符号链接判 untrusted; 实体文件两类问题一并规避)
+    cp /usr/share/applications/user-terminal.desktop /home/user/Desktop/terminal.desktop && \
+    cp /usr/share/applications/user-vscode.desktop /home/user/Desktop/vscode.desktop && \
+    cp /usr/share/applications/chromium-browser.desktop /home/user/Desktop/chromium.desktop && \
+    chmod 755 /home/user/Desktop/*.desktop && \
     chown -R user:user /home/user/Desktop
 
 # ========== 创建骨架目录 /etc/skel-user-desktop ==========

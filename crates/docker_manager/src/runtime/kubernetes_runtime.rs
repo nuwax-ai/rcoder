@@ -57,6 +57,44 @@ use crate::types::DockerManagerConfig;
 // 此处与 PVC/Backend CRD 的 label 写入一并对齐到全键。
 const RUNTIME_MANAGED_LABEL: &str = "app.kubernetes.io/managed-by=rcoder-runtime";
 
+/// 解析 K8s quantity 字符串为字节数 (`"10Gi"` -> 10737418240, `"500M"` -> 500000000)。
+/// 用于 CephFS 目录配额 (ceph.quota.max_bytes 需字节数)。未识别格式返回 None。
+#[cfg(feature = "kubernetes")]
+fn parse_quantity_to_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // 二进制后缀 (Ki/Mi/Gi/Ti/Pi/Ei)
+    for (suffix, unit) in [
+        ("Ei", 1u64 << 60),
+        ("Pi", 1u64 << 50),
+        ("Ti", 1u64 << 40),
+        ("Gi", 1u64 << 30),
+        ("Mi", 1u64 << 20),
+        ("Ki", 1u64 << 10),
+    ] {
+        if let Some(num) = s.strip_suffix(suffix) {
+            return num.parse::<u64>().ok().map(|n| n.saturating_mul(unit));
+        }
+    }
+    // 十进制后缀 (E/P/T/G/M/K)
+    for (suffix, unit) in [
+        ("E", 1_000_000_000_000_000_000u64),
+        ("P", 1_000_000_000_000_000),
+        ("T", 1_000_000_000_000),
+        ("G", 1_000_000_000),
+        ("M", 1_000_000),
+        ("K", 1_000),
+    ] {
+        if let Some(num) = s.strip_suffix(suffix) {
+            return num.parse::<u64>().ok().map(|n| n.saturating_mul(unit));
+        }
+    }
+    // 纯数字 (字节)
+    s.parse::<u64>().ok()
+}
+
 /// Kubernetes runtime implementation using kube-rs
 #[cfg(feature = "kubernetes")]
 pub struct KubernetesRuntime {
@@ -623,6 +661,47 @@ impl ContainerRuntime for KubernetesRuntime {
             }
             _ => (self.workspace_pvc_name(identifier, &service_type)?, None),
         };
+
+        // ===== 复用接口 storage_size 设 CephFS 工作区配额 (rcoder 集中, 不依赖 agent pod) =====
+        // 背景: storage_size 原本语义是 PVC 大小, 但 Web/Computer 跳过 ensure_workspace_pvc 复用共享 PVC,
+        //       致其只落 ephemeral-storage, PVC 子目录写入不限。rcoder 已挂共享 PVC 根 (web
+        //       /app/project_workspace, computer /app/computer-project-workspace), 直接 setfattr
+        //       对 agent 子目录设 ceph.quota.max_bytes。需 ① rcoder 镜像装 attr ② cephx 挂载用户
+        //       (csi-cephfs-node, mds=allow rw) 对该目录有 write 权限 — CephFS quota 设置需 write 权限。
+        //       失败只 warn 不阻断 (配额设不上退化为不限, 不崩 rcoder)。
+        if let Some(ref ss) = storage_size {
+            if let Some(bytes) = parse_quantity_to_bytes(ss) {
+                let quota_dir = match service_type {
+                    ServiceType::WebAgentRunner => {
+                        format!("/app/project_workspace/{}", project_id_val)
+                    }
+                    ServiceType::ComputerAgentRunner => {
+                        format!("/app/computer-project-workspace/{}", user_id_val)
+                    }
+                    _ => String::new(),
+                };
+                if !quota_dir.is_empty() {
+                    let _ = std::fs::create_dir_all(&quota_dir);
+                    let status = std::process::Command::new("setfattr")
+                        .args([
+                            "-n",
+                            "ceph.quota.max_bytes",
+                            "-v",
+                            &bytes.to_string(),
+                            &quota_dir,
+                        ])
+                        .status();
+                    if !matches!(status, Ok(s) if s.success()) {
+                        warn!(
+                            "set CephFS quota failed on {} (cephx 缺 'p' / 非 cephfs / setfattr 未装?)",
+                            quota_dir
+                        );
+                    }
+                }
+            } else {
+                warn!("parse storage_size {:?} failed, skip CephFS quota", ss);
+            }
+        }
 
         // 取 service 配置(完全分家):K8s 优先读 kubernetes_config;docker_config.multi_image_config
         // 仅作过渡期安全兜底(旧 chart 未带 kubernetes_config 段时,保留 workspace 路径/command/env 行为)。

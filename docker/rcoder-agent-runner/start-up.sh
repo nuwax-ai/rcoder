@@ -315,8 +315,8 @@ function initialize_user_home() {
         if [ -d "$SKEL_DIR/Desktop" ]; then
             # 先删除现有的 .desktop 文件（可能是损坏的软链接）
             rm -f "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
-            # 强制复制桌面图标
-            cp -a "$SKEL_DIR/Desktop/"*.desktop "$USER_HOME/Desktop/" 2>/dev/null || true
+            # 强制复制桌面图标 (-L 复制实体, 规避 rsync munge 死链 + xfdesktop untrusted)
+            cp -aL "$SKEL_DIR/Desktop/"*.desktop "$USER_HOME/Desktop/" 2>/dev/null || true
             # 设置可执行权限
             chmod +x "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
             log_success "  Desktop icons restored (forced overwrite)"
@@ -493,8 +493,9 @@ function initialize_user_home() {
             local icon_name="$(basename "$skel_icon")"
             local user_icon="$USER_HOME/Desktop/$icon_name"
             if [ ! -e "$user_icon" ]; then              # 不存在或链接损坏 → 补
+                rm -f "$user_icon" 2>/dev/null || true      # 清 /rsyncd-munged/ 等历史断链 (cp -a 跟随断链 dst 会失败)
                 mkdir -p "$USER_HOME/Desktop"
-                cp -a "$skel_icon" "$user_icon"         # -a 保留符号链接 (复制链接本身, 非目标)
+                cp -aL "$skel_icon" "$user_icon"           # -L 复制实体 (符号链接会被 munge 死链 + xfdesktop untrusted)
                 chmod +x "$user_icon" 2>/dev/null || true
                 chown user:user "$user_icon" 2>/dev/null || true
                 log_success "  Desktop icon ensured (was missing): $icon_name"
@@ -730,6 +731,36 @@ function start_vnc_services() {
 	echo "$(date +%s)" > /tmp/novnc_port_ready
 	log_success "noVNC port ready marker written to /tmp/novnc_port_ready"
 	return 0
+}
+
+# ========== 桌面图标信任化 (xfdesktop 双击实体 .desktop 仍可能弹 untrusted) ==========
+# 三层: 1) 实体 + 属主 user + 可执行  2) gio set metadata::trusted (GIO 通用, 需 D-Bus session)
+#        3) 兜底禁 Thunar launch-confirm (恢复被删的 ae73d82 逻辑)
+# 需在 X11 + D-Bus 起来后 (start_vnc_services 成功后) 调用。任何一层失败都不阻断启动。
+function trust_desktop_icons() {
+    local f
+    # 1) 实体 + 属主 user + 可执行 (xfdesktop 较宽容的信任条件)
+    for f in /home/user/Desktop/*.desktop; do
+        [ -f "$f" ] || continue
+        chown user:user "$f" 2>/dev/null || true
+        chmod 755 "$f" 2>/dev/null || true
+    done
+    # 2) gio set metadata::trusted true (GIO 通用, 对 xfdesktop + Thunar 都生效; 需 D-Bus session)
+    if command -v gio >/dev/null 2>&1; then
+        local oh=$HOME od=$DISPLAY odb=${DBUS_SESSION_BUS_ADDRESS:-}
+        export HOME=/home/user DISPLAY=${DISPLAY:-:0}
+        for f in /home/user/Desktop/*.desktop; do
+            [ -f "$f" ] || continue
+            gio set "$f" metadata::trusted true 2>/dev/null || true
+        done
+        export HOME=$oh DISPLAY=$od
+        [ -n "$odb" ] && export DBUS_SESSION_BUS_ADDRESS=$odb || unset DBUS_SESSION_BUS_ADDRESS
+    fi
+    # 3) 兜底: 禁 Thunar 启动确认 (对 Thunar 内双击生效)
+    if command -v xfconf-query >/dev/null 2>&1; then
+        HOME=/home/user xfconf-query -c thunar -p /misc-executable-launch-confirm -s false 2>/dev/null || true
+    fi
+    log_success "Desktop icons trusted"
 }
 
 function start_display_and_desktop() {
@@ -1887,6 +1918,8 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             log_success "VNC services started successfully!"
             log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
             log_success "Direct VNC port: 5900"
+            # 桌面图标信任化 (xfdesktop 起来后; 后台延迟调用, 不阻塞主流程)
+            ( sleep 3 && trust_desktop_icons ) &
         else
             log_error "VNC services failed to start, /tmp/novnc_port_ready will NOT be written"
         fi
