@@ -737,15 +737,16 @@ impl ContainerRuntime for KubernetesRuntime {
                     &user_id_val,
                 ) {
                     let _ = std::fs::create_dir_all(&quota_dir);
-                    if let Err(e) = xattr::set(
+                    match xattr::set(
                         &quota_dir,
                         "ceph.quota.max_bytes",
                         bytes.to_string().as_bytes(),
                     ) {
-                        warn!(
+                        Ok(()) => info!("CephFS quota set: {} = {} bytes", quota_dir, bytes),
+                        Err(e) => warn!(
                             "set CephFS quota failed on {} (cephx 缺 write / 非 cephfs / 目录不存在?): {}",
                             quota_dir, e
-                        );
+                        ),
                     }
                 }
             } else {
