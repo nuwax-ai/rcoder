@@ -182,12 +182,10 @@ impl ServiceResourceLimits {
             }
         }
 
-        // Swap 应该 >= 内存
-        if let (Some(memory), Some(swap)) = (self.memory, self.swap)
-            && swap < memory
-        {
-            return Err("swap_limit should be >= memory_limit".to_string());
-        }
+        // 注:swap 与 memory 的关系校验已移除——改为在 resolve 阶段由
+        // [`ServiceResourceLimits::normalize_swap`] 自动规整(swap < memory 时
+        // 上调到 memory × 2),避免上游误传 swap<memory 直接阻塞业务。
+        // 详见该函数文档。
 
         Ok(())
     }
@@ -207,6 +205,30 @@ impl ServiceResourceLimits {
                 .clone()
                 .or_else(|| self.ephemeral_storage_limit.clone()),
         }
+    }
+
+    /// 规整 swap 上限:若 `swap < memory`,自动上调到 `memory × 2`。
+    ///
+    /// # 背景
+    /// cgroup `memory.memsw.limit`(Docker `--memory-swap`、K8s 同义)是
+    /// **memory + swap 的总和**,语义上必须 ≥ memory。上游(如 Backend)偶尔会误传
+    /// `swap < memory`(典型场景:把 swap 按核数 `perUserCpuCores × 1GiB` 估算,
+    /// 而 memory 按 `perUserMemoryGB × 1GiB` 估算,当核数 < 内存 GB 数时 swap 反而更小)。
+    /// 与其在 validate 阶段硬性拒绝阻塞业务,这里按 `memory × 2` 兜底——既满足
+    /// cgroup 约束,又留出 1×memory 的交换空间。
+    ///
+    /// 仅在 memory 与 swap 均 `Some` 且 `swap < memory` 时生效;其余情况原样返回。
+    ///
+    /// # 返回
+    /// `(规整后的 Self, 是否发生了修正)` —— 调用方据 `bool` 决定是否打 warn 日志。
+    pub fn normalize_swap(mut self) -> (Self, bool) {
+        if let (Some(memory), Some(swap)) = (self.memory, self.swap)
+            && swap < memory
+        {
+            self.swap = Some(memory * 2.0);
+            return (self, true);
+        }
+        (self, false)
     }
 }
 
@@ -855,21 +877,34 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_limits_validation_invalid_swap_less_than_memory() {
-        let invalid = ServiceResourceLimits {
+    fn test_resource_limits_normalize_swap_less_than_memory() {
+        // swap < memory 不再导致 validate 失败(已改为自动规整)
+        let rl = ServiceResourceLimits {
             memory: Some(2_000_000_000.0), // 2GB
             cpu: None,
-            swap: Some(1_000_000_000.0), // 1GB - swap < memory
+            swap: Some(1_000_000_000.0),   // 1GB < memory
             storage_size: None,
             ephemeral_storage_limit: None,
         };
-        assert!(invalid.validate().is_err());
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .contains("should be >= memory_limit")
-        );
+        assert!(rl.validate().is_ok());
+
+        // normalize_swap:swap < memory → swap = memory × 2
+        let (fixed, changed) = rl.normalize_swap();
+        assert!(changed);
+        assert_eq!(fixed.swap, Some(4_000_000_000.0));
+        assert_eq!(fixed.memory, Some(2_000_000_000.0)); // memory 不变
+
+        // swap >= memory 时不修正
+        let ok = ServiceResourceLimits {
+            memory: Some(2_000_000_000.0),
+            cpu: None,
+            swap: Some(4_000_000_000.0),
+            storage_size: None,
+            ephemeral_storage_limit: None,
+        };
+        let (same, changed2) = ok.normalize_swap();
+        assert!(!changed2);
+        assert_eq!(same.swap, Some(4_000_000_000.0));
     }
 
     #[test]

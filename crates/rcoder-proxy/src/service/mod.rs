@@ -295,6 +295,7 @@ impl ProxyHttp for PortProxy {
                     matched.params,
                     &self.vnc_backends,
                     &self.metrics,
+                    &self.container_lookup,
                 )
                 .await
             }

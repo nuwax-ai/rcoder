@@ -234,9 +234,10 @@ pub(crate) async fn handle_computer_chat_internal(
         && let Err(e) = resource_limits.validate()
     {
         error!("[COMPUTER_CHAT] Resource limits validation failed: {}", e);
-        return Ok(HttpResult::error_with_locale(
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
             locale,
+            &format!("Resource limits invalid: {}", e),
         ));
     }
 

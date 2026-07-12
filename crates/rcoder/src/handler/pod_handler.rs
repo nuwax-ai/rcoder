@@ -59,17 +59,13 @@ fn validate_resource_limits(limits: &ServiceResourceLimits) -> Result<(), String
         }
     }
 
-    // 验证 swap 限制
-    if let Some(swap) = limits.swap {
-        if swap < 512_000_000.0 {
-            return Err("swap must be at least 512MB".to_string());
-        }
-        // swap 必须 >= memory（如果两者都设置了）
-        if let (Some(memory), Some(swap_val)) = (limits.memory, limits.swap)
-            && swap_val < memory
-        {
-            return Err("swap should be >= memory".to_string());
-        }
+    // 验证 swap 下限。
+    // 注:swap 与 memory 的关系不再校验——改为 resolve 阶段 normalize_swap 自动规整
+    // (swap < memory 时上调到 memory × 2),避免上游误传 swap<memory 直接阻塞业务。
+    if let Some(swap) = limits.swap
+        && swap < 512_000_000.0
+    {
+        return Err("swap must be at least 512MB".to_string());
     }
 
     // 验证 storage_size 格式（K8s 资源格式）
@@ -78,6 +74,51 @@ fn validate_resource_limits(limits: &ServiceResourceLimits) -> Result<(), String
     }
 
     Ok(())
+}
+
+/// 容器创建/复用成功后注册 VNC backend 到 pingora 的 `vnc_backends`(显式注册)。
+///
+/// 背景:pingora `handle_vnc_upstream` 优先走 ContainerLookupService 动态查项目存储
+/// (容器存在即可达,与 ttyd 一致、runtime 无关),**回退**到本处填充的 `vnc_backends`
+/// 显式注册。显式注册作为兜底数据源——即使项目存储尚未写入或临时查不到,只要注册过
+/// 也能解析(双保险)。在 pod/ensure、pod/restart 创建/复用容器后调用本函数主动注册。
+///
+/// - K8s:用 headless Service FQDN(`{container_name}-svc.{ns}.svc.{cluster_domain}`),
+///   走 Service 负载均衡,Pod 重建 IP 变也不影响路由。
+/// - Docker:用容器 IP。
+/// - 幂等:`add_vnc_backend` 内部 `DashMap::insert` 覆盖语义,restart 重建后自动替换旧地址。
+///
+/// # 关于 `service_type` 参数(扩展性预留)
+/// 当前 VNC 路由按 `user_id` 索引,且**仅 ComputerAgentRunner 使用 VNC**,故本参数现仅用于
+/// 日志区分业务场景,不改 key 策略。将来 WebAgentRunner 等其它 service 也支持 VNC 时,需同步:
+/// 1. pingora `vnc_backends` 的 key 从纯 `user_id` 改为按 service_type 分桶或复合 key
+///    (避免同一 user_id 下不同 service_type 容器互相覆盖);
+/// 2. `handle_vnc_upstream`(`rcoder-proxy/src/service/handlers/vnc.rs`)按 service_type 路由;
+/// 3. HTTP 路径(当前 `/computer/vnc/{user}/{proj}/websockify`)扩展 service_type 段。
+///
+/// 届时只需在本函数内决定 key 策略,调用方签名不变(开放-封闭)。
+fn register_vnc_backend(
+    state: &AppState,
+    user_id: &str,
+    container_info: &ContainerBasicInfo,
+    service_type: &ServiceType,
+) {
+    if let Some(ref pingora) = state.pingora_service {
+        let backend_addr = if shared_types::is_kubernetes_runtime() {
+            super::utils::build_k8s_service_fqdn(
+                &container_info.container_name,
+                &state.config.app_manager.namespace,
+                &state.cluster_domain,
+            )
+        } else {
+            container_info.container_ip.clone()
+        };
+        pingora.add_vnc_backend(user_id, &backend_addr);
+        debug!(
+            "🔗 [POD] VNC backend registered: service_type={:?}, user_id={} -> {}",
+            service_type, user_id, backend_addr
+        );
+    }
 }
 
 /// 解析最终生效的资源限制：API 入参优先，缺失字段回退到 configmap 中
@@ -155,6 +196,27 @@ pub(crate) fn resolve_resource_limits_from_config(
         (Some(default), None) => Some(default),
         (None, api) => api,
     };
+
+    // swap 规整:swap < memory 时自动上调到 memory × 2(上游误传兜底,见
+    // ServiceResourceLimits::normalize_swap)。在 merge 之后做,基于最终生效值判断。
+    let (result, swap_fixed) = match result {
+        Some(rl) => {
+            let (fixed, changed) = rl.normalize_swap();
+            (Some(fixed), changed)
+        }
+        None => (None, false),
+    };
+    if swap_fixed
+        && let Some(ref r) = result
+    {
+        warn!(
+            "[RESOURCE_LIMITS] service_type={:?}: swap < memory,自动修正 swap = memory × 2 \
+             (memory={:.1}Gi → swap={:.1}Gi)",
+            service_type,
+            r.memory.unwrap_or(0.0) / 1024.0 / 1024.0 / 1024.0,
+            r.swap.unwrap_or(0.0) / 1024.0 / 1024.0 / 1024.0,
+        );
+    }
 
     // 记录最终生效的 memory/cpu（仅这两个字段进 K8s container resources；
     // swap_limit/storage_size 不进 container resources，故不在此记录）
@@ -1020,7 +1082,8 @@ pub async fn pod_ensure(
 
             // 如果等待成功，直接使用已就绪的容器，跳过创建流程
             if let Some(info) = waited_container_info {
-                // VNC 后端映射已通过 ContainerLookupService 统一管理，无需手动同步
+                // 容器已就绪(由并发请求创建),注册 VNC backend
+                register_vnc_backend(&state, &request.user_id, &info, &service_type);
 
                 // 更新存储 记录
                 let project_info = if let Some(existing) = state.get_project(&request.project_id) {
@@ -1391,7 +1454,8 @@ pub async fn pod_ensure(
         }
     };
 
-    // 4. VNC 后端映射已通过 ContainerLookupService 统一管理，无需手动同步
+    // 4. 注册 VNC backend 到 pingora(容器已就绪,无论新建还是复用)
+    register_vnc_backend(&state, &request.user_id, &container_info, &service_type);
 
     // 5. 更新存储中的容器信息（用于后续保活）
     // 无论容器是新建还是已存在，都要确保 存储 记录是最新的
@@ -1883,7 +1947,8 @@ pub async fn pod_restart(
         container_info.container_id
     );
 
-    // 5. VNC 后端映射已通过 ContainerLookupService 统一管理，无需手动同步
+    // 5. 注册 VNC backend 到 pingora(新容器已创建,覆盖旧地址)
+    register_vnc_backend(&state, &request.user_id, &container_info, &service_type);
 
     // 6. 在 存储中记录容器信息
     {
@@ -2673,7 +2738,8 @@ mod tests {
             storage_size: None,
             ephemeral_storage_limit: None,
         };
-        assert!(validate_resource_limits(&limits).is_err());
+        // swap<memory 已改为 resolve 阶段 normalize_swap 自动规整,validate 不再拒绝
+        assert!(validate_resource_limits(&limits).is_ok());
     }
 
     #[test]

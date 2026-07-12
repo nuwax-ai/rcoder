@@ -77,7 +77,9 @@ pub async fn start_all_background_tasks(
     );
     info!("Container status sync already started (interval: 60s, detect container)");
 
-    // VNC 后端映射已通过 ContainerLookupService 统一管理，无需定时同步任务
+    // VNC 后端解析:pingora handle_vnc_upstream 优先查 ContainerLookupService(动态查项目
+    // 存储,与 ttyd 一致、runtime 无关),回退 vnc_backends 显式注册(chat / pod_ensure /
+    // pod_restart / pod_vnc_status 创建容器时 add_vnc_backend)。无定时同步任务。
 
     Ok(BackgroundTaskHandles {
         cleanup_handle,
