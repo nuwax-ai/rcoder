@@ -1023,24 +1023,6 @@ mod tests {
         adapter
     }
 
-    /// 测试辅助:按当前编译 feature 给出期望的 backend 地址
-    /// (K8s = headless Service FQDN,Docker = 容器 IP),与 `resolve_backend_addr` 对齐。
-    fn expected_addr(
-        adapter: &ProjectAdapter,
-        container_name: &str,
-        container_ip: &str,
-    ) -> String {
-        if shared_types::is_kubernetes_runtime() {
-            shared_types::build_k8s_service_fqdn(
-                container_name,
-                &adapter.namespace,
-                &adapter.cluster_domain,
-            )
-        } else {
-            container_ip.to_string()
-        }
-    }
-
     #[test]
     fn test_project_crud() {
         let adapter = make_adapter();
@@ -2068,7 +2050,11 @@ mod tests {
         // 关键断言 2：find_by_user_id("6", Computer) → Computer 容器 IP（按 service_type 过滤，不串到 Web）
         assert_eq!(
             adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner),
-            Some(expected_addr(&adapter, "container-cid-comp", "10.0.0.1")),
+            Some(adapter.resolve_backend_addr(&mk_container(
+                "cid-comp",
+                "10.0.0.1",
+                "proj-A",
+            ))),
             "Computer 查找应命中 Computer 容器，不被同 user 的 Web 项目影响"
         );
 
@@ -2109,7 +2095,11 @@ mod tests {
         // 且 Computer 查找仍正常
         assert_eq!(
             adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner),
-            Some(expected_addr(&adapter, "container-cid-comp", "10.0.0.1")),
+            Some(adapter.resolve_backend_addr(&mk_container(
+                "cid-comp",
+                "10.0.0.1",
+                "proj-A",
+            ))),
             "删除 Web 项目后，Computer 查找应仍命中 Computer 容器"
         );
     }
@@ -2189,7 +2179,7 @@ mod tests {
         let result = adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner);
         assert_eq!(
             result,
-            Some(expected_addr(&adapter, "computer-container", "10.0.0.9")),
+            Some(adapter.resolve_backend_addr(&mk_container())),
             "删除 proj-C 后，user 6 仍有 proj-A 引用容器，find_by_user_id 应能找到"
         );
     }
@@ -2257,11 +2247,11 @@ mod tests {
         use shared_types::ContainerLookup;
         assert_eq!(
             adapter.find_by_user_id("user-A", &ServiceType::ComputerAgentRunner),
-            Some(expected_addr(&adapter, "computer-shared", "10.0.0.7"))
+            Some(adapter.resolve_backend_addr(&shared))
         );
         assert_eq!(
             adapter.find_by_user_id("user-B", &ServiceType::ComputerAgentRunner),
-            Some(expected_addr(&adapter, "computer-shared", "10.0.0.7"))
+            Some(adapter.resolve_backend_addr(&shared))
         );
 
         // 删除一个 user 的项目：容器仍存活（另一个 user 还在用）
@@ -2350,12 +2340,12 @@ mod tests {
         // 查找互不串
         assert_eq!(
             adapter.find_by_user_id("6", &ServiceType::ComputerAgentRunner),
-            Some(expected_addr(&adapter, "computer-agent-runner-6", "10.0.0.1")),
+            Some(adapter.resolve_backend_addr(&mk("computer-agent-runner-6", "10.0.0.1"))),
             "Computer 查找应命中 Computer 容器"
         );
         assert_eq!(
             adapter.find_by_project_id("6", &ServiceType::WebAgentRunner),
-            Some(expected_addr(&adapter, "web-agent-runner-6", "10.0.0.2")),
+            Some(adapter.resolve_backend_addr(&mk("web-agent-runner-6", "10.0.0.2"))),
             "Web 查找应命中 Web 容器"
         );
 
