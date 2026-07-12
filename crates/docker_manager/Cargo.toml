@@ -54,11 +54,13 @@ async-trait = { workspace = true }
 # Kubernetes runtime support (feature-gated)
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
+# CephFS 目录配额: xattr 设 ceph.quota.max_bytes (libc setxattr, kubernetes feature 门控)
+xattr = { version = "1", optional = true }
 
 [features]
 default = []
 # Kubernetes runtime support
-kubernetes = ["kube", "k8s-openapi"]
+kubernetes = ["kube", "k8s-openapi", "xattr"]
 # 🔧 eBPF 调试模式：启用容器特权，允许使用 eBPF 诊断工具
 # 警告：仅在开发调试时使用，生产环境请勿启用
 ebpf-debug = []

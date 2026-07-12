@@ -665,9 +665,9 @@ impl ContainerRuntime for KubernetesRuntime {
         // ===== 复用接口 storage_size 设 CephFS 工作区配额 (rcoder 集中, 不依赖 agent pod) =====
         // 背景: storage_size 原本语义是 PVC 大小, 但 Web/Computer 跳过 ensure_workspace_pvc 复用共享 PVC,
         //       致其只落 ephemeral-storage, PVC 子目录写入不限。rcoder 已挂共享 PVC 根 (web
-        //       /app/project_workspace, computer /app/computer-project-workspace), 直接 setfattr
-        //       对 agent 子目录设 ceph.quota.max_bytes。需 ① rcoder 镜像装 attr ② cephx 挂载用户
-        //       (csi-cephfs-node, mds=allow rw) 对该目录有 write 权限 — CephFS quota 设置需 write 权限。
+        //       /app/project_workspace, computer /app/computer-project-workspace), 用 xattr::set
+        //       (libc setxattr -> CephFS MDS 强制) 对 agent 子目录设 ceph.quota.max_bytes。
+        //       需 cephx 挂载用户 (csi-cephfs-node, mds=allow rw) 对该目录有 write 权限。
         //       失败只 warn 不阻断 (配额设不上退化为不限, 不崩 rcoder)。
         if let Some(ref ss) = storage_size {
             if let Some(bytes) = parse_quantity_to_bytes(ss) {
@@ -682,19 +682,14 @@ impl ContainerRuntime for KubernetesRuntime {
                 };
                 if !quota_dir.is_empty() {
                     let _ = std::fs::create_dir_all(&quota_dir);
-                    let status = std::process::Command::new("setfattr")
-                        .args([
-                            "-n",
-                            "ceph.quota.max_bytes",
-                            "-v",
-                            &bytes.to_string(),
-                            &quota_dir,
-                        ])
-                        .status();
-                    if !matches!(status, Ok(s) if s.success()) {
+                    if let Err(e) = xattr::set(
+                        &quota_dir,
+                        "ceph.quota.max_bytes",
+                        bytes.to_string().as_bytes(),
+                    ) {
                         warn!(
-                            "set CephFS quota failed on {} (cephx 缺 'p' / 非 cephfs / setfattr 未装?)",
-                            quota_dir
+                            "set CephFS quota failed on {} (cephx 缺 write / 非 cephfs / 目录不存在?): {}",
+                            quota_dir, e
                         );
                     }
                 }

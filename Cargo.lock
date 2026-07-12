@@ -1697,6 +1697,7 @@ dependencies = [
  "tonic",
  "tracing",
  "uuid",
+ "xattr",
 ]
 
 [[package]]
