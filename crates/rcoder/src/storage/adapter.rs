@@ -1023,6 +1023,24 @@ mod tests {
         adapter
     }
 
+    /// 测试辅助:按当前编译 feature 给出期望的 backend 地址
+    /// (K8s = headless Service FQDN,Docker = 容器 IP),与 `resolve_backend_addr` 对齐。
+    fn expected_addr(
+        adapter: &ProjectAdapter,
+        container_name: &str,
+        container_ip: &str,
+    ) -> String {
+        if shared_types::is_kubernetes_runtime() {
+            shared_types::build_k8s_service_fqdn(
+                container_name,
+                &adapter.namespace,
+                &adapter.cluster_domain,
+            )
+        } else {
+            container_ip.to_string()
+        }
+    }
+
     #[test]
     fn test_project_crud() {
         let adapter = make_adapter();
@@ -2050,7 +2068,7 @@ mod tests {
         // 关键断言 2：find_by_user_id("6", Computer) → Computer 容器 IP（按 service_type 过滤，不串到 Web）
         assert_eq!(
             adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner),
-            Some("10.0.0.1".to_string()),
+            Some(expected_addr(&adapter, "container-cid-comp", "10.0.0.1")),
             "Computer 查找应命中 Computer 容器，不被同 user 的 Web 项目影响"
         );
 
@@ -2091,7 +2109,7 @@ mod tests {
         // 且 Computer 查找仍正常
         assert_eq!(
             adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner),
-            Some("10.0.0.1".to_string()),
+            Some(expected_addr(&adapter, "container-cid-comp", "10.0.0.1")),
             "删除 Web 项目后，Computer 查找应仍命中 Computer 容器"
         );
     }
@@ -2171,7 +2189,7 @@ mod tests {
         let result = adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner);
         assert_eq!(
             result,
-            Some("10.0.0.9".to_string()),
+            Some(expected_addr(&adapter, "computer-container", "10.0.0.9")),
             "删除 proj-C 后，user 6 仍有 proj-A 引用容器，find_by_user_id 应能找到"
         );
     }
@@ -2239,11 +2257,11 @@ mod tests {
         use shared_types::ContainerLookup;
         assert_eq!(
             adapter.find_by_user_id("user-A", &ServiceType::ComputerAgentRunner),
-            Some("10.0.0.7".to_string())
+            Some(expected_addr(&adapter, "computer-shared", "10.0.0.7"))
         );
         assert_eq!(
             adapter.find_by_user_id("user-B", &ServiceType::ComputerAgentRunner),
-            Some("10.0.0.7".to_string())
+            Some(expected_addr(&adapter, "computer-shared", "10.0.0.7"))
         );
 
         // 删除一个 user 的项目：容器仍存活（另一个 user 还在用）
@@ -2332,12 +2350,12 @@ mod tests {
         // 查找互不串
         assert_eq!(
             adapter.find_by_user_id("6", &ServiceType::ComputerAgentRunner),
-            Some("10.0.0.1".to_string()),
+            Some(expected_addr(&adapter, "computer-agent-runner-6", "10.0.0.1")),
             "Computer 查找应命中 Computer 容器"
         );
         assert_eq!(
             adapter.find_by_project_id("6", &ServiceType::WebAgentRunner),
-            Some("10.0.0.2".to_string()),
+            Some(expected_addr(&adapter, "web-agent-runner-6", "10.0.0.2")),
             "Web 查找应命中 Web 容器"
         );
 
@@ -2475,22 +2493,20 @@ mod tests {
             .unwrap();
 
         let st = ServiceType::ComputerAgentRunner;
-        // 三条查找路径（user_id / project_id / get_container_by_user_id）返回同一 IP
+        // 三条查找路径（user_id / project_id / get_container_by_user_id）应解析到同一
+        // backend addr（K8s 模式为 Service FQDN，Docker 模式为容器 IP，统一由
+        // resolve_backend_addr 决定）。
         assert_eq!(
             adapter.find_by_user_id("6", &st),
             adapter.find_by_project_id("proj-A", &st),
-            "find_by_user_id 与 find_by_project_id 应返回同一 IP"
+            "find_by_user_id 与 find_by_project_id 应返回同一 backend addr"
         );
         assert_eq!(
             adapter.find_by_user_id("6", &st),
             adapter
                 .get_container_by_user_id("6", &st)
-                .map(|c| c.container_ip),
-            "find_by_user_id 与 get_container_by_user_id 应返回同一 IP"
-        );
-        assert_eq!(
-            adapter.find_by_user_id("6", &st),
-            Some("10.0.0.1".to_string())
+                .map(|c| adapter.resolve_backend_addr(&c)),
+            "find_by_user_id 与 get_container_by_user_id 应解析到同一 backend addr"
         );
 
         // 模拟容器重建：同 container_name、新 container_id/ip
@@ -2501,23 +2517,20 @@ mod tests {
             )
             .unwrap();
 
-        // 重建后三条路径都应返回新 IP（权威源 containers[name] 已刷新）
+        // 重建后权威源 containers[name] 已刷新：Docker 模式 find_by_* 返回新 IP，
+        // K8s 模式 FQDN 基于 container_name（不变）；两条 find 路径仍应一致，
+        // 且底层 container_ip 已刷新为新值。
         assert_eq!(
             adapter.find_by_user_id("6", &st),
-            Some("10.0.0.2".to_string()),
-            "重建后 find_by_user_id 应返回新 IP"
-        );
-        assert_eq!(
             adapter.find_by_project_id("proj-A", &st),
-            Some("10.0.0.2".to_string()),
-            "重建后 find_by_project_id 应返回新 IP"
+            "重建后 find_by_user_id 与 find_by_project_id 仍应一致"
         );
         assert_eq!(
             adapter
                 .get_container_by_user_id("6", &st)
                 .map(|c| c.container_ip),
             Some("10.0.0.2".to_string()),
-            "重建后 get_container_by_user_id 应返回新 IP"
+            "重建后权威源 container_ip 应刷新为新 IP"
         );
     }
 
@@ -3015,6 +3028,28 @@ mod tests {
     }
 }
 
+// ========== pingora backend 地址解析 ==========
+
+impl ProjectAdapter {
+    /// 解析 pingora 反向代理的 backend 地址。
+    ///
+    /// - K8s:headless Service FQDN(`{container_name}-svc.{ns}.svc.{domain}`),经 K8s DNS
+    ///   解析;Pod 重建后 Service selector 选到新 Pod,DNS 自动指向新 IP,客户端重连即
+    ///   恢复,无需 rcoder 重注册/重查(与 `register_vnc_backend` 的 vnc_backends 对齐)。
+    /// - Docker:容器 IP(直连)。
+    fn resolve_backend_addr(&self, info: &shared_types::ContainerBasicInfo) -> String {
+        if shared_types::is_kubernetes_runtime() {
+            shared_types::build_k8s_service_fqdn(
+                &info.container_name,
+                &self.namespace,
+                &self.cluster_domain,
+            )
+        } else {
+            info.container_ip.clone()
+        }
+    }
+}
+
 // ========== ContainerLookup trait 实现 ==========
 
 impl shared_types::ContainerLookup for ProjectAdapter {
@@ -3032,7 +3067,7 @@ impl shared_types::ContainerLookup for ProjectAdapter {
         // 委托 get_container_by_user_id（同一查找逻辑：扫描 + containers[name] 权威源），
         // 仅取 container_ip。同 user 的 Computer 项目共享同一容器，任取一个即可。
         self.get_container_by_user_id(user_id, service_type)
-            .map(|c| c.container_ip)
+            .map(|c| self.resolve_backend_addr(&c))
     }
 
     /// 根据 project_id 查找容器 IP（WebAgentRunner 普通场景）
@@ -3059,7 +3094,7 @@ impl shared_types::ContainerLookup for ProjectAdapter {
             );
             return None;
         }
-        Some(entry.info().container_ip.clone())
+        Some(self.resolve_backend_addr(&entry.info()))
     }
 
     /// 根据 pod_id 和 service_type 查找容器 IP（共享容器场景）
@@ -3089,7 +3124,7 @@ impl shared_types::ContainerLookup for ProjectAdapter {
             );
             return None;
         }
-        Some(entry.info().container_ip.clone())
+        Some(self.resolve_backend_addr(&entry.info()))
     }
 
     /// 按 project_id 反查项目归属 scope（tenant_id/space_id/isolation_type）。
