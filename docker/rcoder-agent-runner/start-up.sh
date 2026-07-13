@@ -771,6 +771,11 @@ function trust_desktop_icons() {
     if command -v xfconf-query >/dev/null 2>&1; then
         HOME=/home/user xfconf-query -c thunar -p /misc-executable-launch-confirm -s false 2>/dev/null || true
     fi
+    # 4) xfdesktop restart (刷新 GDesktopAppInfo 缓存; gio set 后旧 xfdesktop 进程仍缓存 untrusted,
+    #    --reload 不刷 GDesktopAppInfo, 必须 kill+restart 新进程读 metadata::trusted + checksum)
+    killall xfdesktop 2>/dev/null || true
+    sleep 1
+    DISPLAY=${DISPLAY:-:0} HOME=/home/user nohup xfdesktop >/dev/null 2>&1 &
     log_success "Desktop icons trusted"
 }
 
