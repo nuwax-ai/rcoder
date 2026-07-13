@@ -753,12 +753,15 @@ function trust_desktop_icons() {
         chown user:user "$f" 2>/dev/null || true
         chmod 755 "$f" 2>/dev/null || true
     done
-    # 2) gio set metadata::trusted true (GIO 通用, 对 xfdesktop + Thunar 都生效; 需 D-Bus session)
+    # 2) gio set metadata::trusted + xfce-exe-checksum (XFCE 4.18 五件套: uid(user) + 755 + checksum + trusted)
     if command -v gio >/dev/null 2>&1; then
         local oh=$HOME od=$DISPLAY odb=${DBUS_SESSION_BUS_ADDRESS:-}
         export HOME=/home/user DISPLAY=${DISPLAY:-:0}
+        [ -f /tmp/dbus-session-env ] && . /tmp/dbus-session-env     # 关键: gio set 要 DBUS 连 gvfsd, 否则 not supported
         for f in /home/user/Desktop/*.desktop; do
             [ -f "$f" ] || continue
+            local cksum=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+            [ -n "$cksum" ] && gio set "$f" metadata::xfce-exe-checksum "$cksum" 2>/dev/null || true
             gio set "$f" metadata::trusted true 2>/dev/null || true
         done
         export HOME=$oh DISPLAY=$od
