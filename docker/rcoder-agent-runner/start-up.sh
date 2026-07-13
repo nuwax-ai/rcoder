@@ -503,6 +503,14 @@ function initialize_user_home() {
         done
     fi
 
+    # 无条件确保桌面图标可执行 + 属主 (X 启动前; 补齐段只补缺失/断链,
+    # rsync 同步带过来的旧图标 (644) 会跳过补齐 → xfdesktop 读到 644 弹 mark executable。
+    # 这里无条件 chmod 兜底, 保证 xfdesktop 启动时桌面图标一定 755)
+    if [ -d "$USER_HOME/Desktop" ]; then
+        chmod 755 "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
+        chown user:user "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
+    fi
+
     # 确保 Panel launcher 目录存在且内容完整（强制恢复）
     # 注意：每次启动都检查并恢复，防止用户删除后 XFCE 保存损坏状态
     local XFCE_PANEL_DIR="$USER_HOME/.config/xfce4/panel"
