@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # ============================================================================
-# 本地 devspace 一次性确保 Cilium Gateway (替代旧 Envoy Gateway)
+# 确保共享 Cilium Gateway (class=cilium)
 # ----------------------------------------------------------------------------
-# 用途：本地 OrbStack/devspace 测试 rcoder UserApp 的 HTTPRoute（外部 HTTP 访问
-#       /apps/{app_id}）。确保 Cilium Gateway 就绪后，devspace 重启无需重跑；
-#       rcoder 创建的 HTTPRoute 会被 Cilium Gateway 自动路由到 app Service。
+# ⚠️ 适用场景：仅 "orb VM 自建裸 k3s + Cilium(KPR)" 或生产裸 K3s 集群。
+#    OrbStack 托管 k8s 用不了：默认 CNI=Flannel，官方不支持换 CNI，且不暴露
+#    禁 kube-proxy 的接口（Cilium Gateway API 硬依赖 kubeProxyReplacement=true）。
+#    本地日常 devspace 改用 install-envoy-gateway.sh（EG 独立 controller，不碰
+#    CNI/kube-proxy，OrbStack 原生支持）。HTTPRoute 是标准 CR、controller 无关，
+#    本地 EG 验证 rcoder 网关逻辑 = 生产 Cilium 验证，等价。
+#
+# 用途：确保 Cilium Gateway 就绪后，rcoder 创建的 HTTPRoute 会被自动路由到
+#       app Service。
 #
 # 用法：
 #   bash k8s/scripts/install-cilium-gateway.sh           # 确保 Gateway 资源

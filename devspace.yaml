@@ -8,8 +8,10 @@ pipelines:
     run: |-
       run_dependencies --all       # 1. Deploy any projects this project needs (see "dependencies")
       ensure_pull_secrets --all    # 2. Ensure pull secrets
-      # 2.5 确保 Envoy Gateway 就绪（幂等）。EG CRD 必须在 rcoder 启动前装好，
-      # 否则 rcoder 运行时创建 HTTPRoute 会因 CRD 不存在而 warn 跳过（外部 HTTP 不可达）
+      # 2.5 确保 Envoy Gateway 就绪（本地 devspace 用 EG；生产用 Cilium 生态 +
+      #     Cilium Gateway，见 build-agent-docker/k8s。HTTPRoute 标准 CR、controller 无关）。
+      #     幂等；EG CRD 必须在 rcoder 启动前装好，否则运行时创建 HTTPRoute 会因
+      #     CRD 不存在而 warn 跳过（外部 HTTP 不可达）
       bash k8s/scripts/install-envoy-gateway.sh || echo "⚠️ Envoy Gateway 安装失败（HTTPRoute 外部访问不可用，rcoder 仍会启动）"
       build_images --all           # 3. 构建镜像（智能增量：本地不存在 / Dockerfile / context 变化才真正构建，已存在且未变则秒过缓存检查）
       create_deployments --all     # 4. Deploy Helm charts and manifests specfied as "deployments"
