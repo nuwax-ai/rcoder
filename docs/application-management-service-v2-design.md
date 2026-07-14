@@ -76,7 +76,7 @@ RCoder 对外提供一套 REST API，让调用方（Java 业务服务）管理**
 
 - **不学 Epinio 用 Helm 部署**：Helm 是 K8s-only，无法复用到 Docker 后端。RCoder 用 `Backend` trait 直接 create Deployment/Service/Ingress（K8s）与 container/network（Docker）。
 - **不学 Epinio 用 in-memory map 存异步部署状态**（`deployments.go::asyncDeployJobs`）：这是 Epinio 的真实弱点（重启全丢）。RCoder 的"异步"由 Deployment 自身状态承载，见 §7.3。
-- **不学 nya 的 `latest` tag + 无删除路径**：v2 必须有显式 image 标签意识（由调用方在 `image` 字段带 tag）和完整删除路径。
+- **不学 nya 的无删除路径**：v2 必须有完整删除路径。（nya 的 `latest` tag 教训——无法回滚、缓存污染——客观存在，但 v2 当前阶段**暂不强制 image 标签**，原因见 §13.2。）
 
 ---
 
@@ -318,7 +318,7 @@ POST /apps/storage/query
 // 创建（v1 已有，v2 增 ephemeral_storage + 多租户字段，不动结构）
 pub struct CreateAppRequest {
     pub name: String,
-    pub image: String,                       // 必须带 tag/digest，禁止 latest（见 §13.2）
+    pub image: String,                       // 镜像引用；当前阶段允许 latest（运维未具备版本化发布，见 §13.2）
     pub command: Option<Vec<String>>,
     pub env: Option<HashMap<String, String>>,
     pub secrets: Option<HashMap<String, String>>,
@@ -581,7 +581,7 @@ RCoder 进程重启后：
 
 | code | HTTP | 场景 |
 |---|---|---|
-| `ERR_VALIDATION` | 400 | 参数缺失/非法（如 image 带 latest、path traversal、port 重复） |
+| `ERR_VALIDATION` | 400 | 参数缺失/非法（如 path traversal、port 重复、资源 Quantity 非法） |
 | `ERR_OPERATION_NOT_SUPPORTED` | 400 | K8s 后端尝试改不可变字段（如 name） |
 | `ERR_APP_NOT_FOUND` | 404 | 应用不存在（Deployment 404） |
 | `ERR_FILE_NOT_FOUND` | 404 | 文件管理目标不存在 |
@@ -615,7 +615,9 @@ operator-rs 没做好的"retryable vs terminal"分类，v2 用 `is_retryable_cod
 
 ### 13.2 镜像与命名约束
 
-- `image` **禁止 `latest`**：必须是 `repo/name:tag` 或 `@sha256:...`。nya 的 `latest` 教训——无法回滚、缓存污染。
+- `image` **当前阶段允许 `latest`**（无 tag 时 K8s/Docker 默认补 `:latest`）。原因：现阶段尚未具备按版本号发布应用镜像的完整运维能力（无 CI 产出 `:semver` / `@sha256`、无版本化发布流程），所有发布的应用镜像统一用 `latest` tag，强制 tag/digest 会阻塞全部调用方。代码不做 `latest` 校验（曾短暂加入后移除，见 commit 2378e22）。
+  - nya 的 `latest` 教训（无法回滚、节点镜像缓存不一致、缓存污染）是真实的运维风险，**留作未来收紧的依据**。
+  - **演进触发**：当具备版本化发布能力（CI 产出 `:semver` / `@sha256`、调用方按版本发布）后，在此重新启用"禁止 latest / 必须带 tag"校验，并迁移现有 `latest` 引用。
 - `app_id` / `name`：DNS-1123 label 合规（`[a-z0-9]([-a-z0-9]*[a-z0-9])?`），Epinio 也这么校验。
 
 ---
@@ -666,7 +668,7 @@ operator-rs 没做好的"retryable vs terminal"分类，v2 用 `is_retryable_cod
 
 1. **`GET /apps/{id}` 只返回 observed（`AppRuntimeInfo`）**，desired 合并视图交给 Java —— 与 v1 文档不同（v1 期望 GET 返回完整 desired+observed）。
 2. **K8s namespace 策略**：默认统一 `rcoder-apps` + label 隔离，不按租户分 namespace。
-3. **`image` 禁止 `latest`** —— 强约束，可能影响现有调用方习惯。
+3. ~~**`image` 禁止 `latest`**~~ —— **已决策：当前阶段允许 `latest`**（运维未具备版本化发布能力，应用镜像统一用 latest；详见 §13.2）。未来具备版本发布能力后再收紧为强约束。
 
 ---
 
@@ -674,5 +676,5 @@ operator-rs 没做好的"retryable vs terminal"分类，v2 用 `is_retryable_cod
 
 - Epinio：`/Users/soddy/Documents/git-workspace/epinio`（关键文件：`pkg/api/core/v1/models/app.go`、`internal/application/application.go::fetch`、`pkg/api/core/v1/errors/errors.go`、`internal/api/v1/router.go`）
 - operator-rs：`/Users/soddy/Documents/git-workspace/operator-rs`（关键文件：`crates/stackable-operator/src/client/mod.rs::apply_patch`、`.../cluster_resources.rs::delete_orphaned_resources`、`.../status/condition/mod.rs::compute_conditions`）
-- nya：`/Users/soddy/Documents/git-workspace/nya`（参考：URL 命名约定、Helm 模板化、event-bus 编排；反面教材：无对账 / latest tag / 无删除）
+- nya：`/Users/soddy/Documents/git-workspace/nya`（参考：URL 命名约定、Helm 模板化、event-bus 编排；反面教材：无对账 / 无删除）
 - kubert：`/Users/soddy/Documents/git-workspace/kubert`（**不采纳**；控制器专用，与 axum 冲突）

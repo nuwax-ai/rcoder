@@ -259,13 +259,23 @@ impl KubernetesRuntime {
             .unwrap_or_default();
 
         // 资源
+        // ⚙️ requests/limits 解耦:requests 设超小固定值(仅作 scheduler 调度保障量),
+        //    limits 保留配置上限。原实现只设 limits → K8s 自动补 requests=limits(大值)
+        //    → scheduler 严格按大 requests 预订 → 节点迅速占满 → Pod Pending。
+        //    requests 小 → 支持大量 Pod 超卖调度;limits 大 → 单 Pod 突发不受限(swap+limits 兜底)。
+        //    值与 agent-runner (kubernetes_runtime.rs build_resource_requirements) 保持一致。
         let resources = params.app_resources.as_ref().and_then(|req| {
             let mut limits = BTreeMap::new();
+            let mut requests = BTreeMap::new();
             if let Some(cpu) = &req.cpu {
                 limits.insert("cpu".to_string(), Quantity(cpu.clone()));
+                // cpu 可压缩:requests 设极小 5m,突发靠 limits(最多 throttle)。
+                requests.insert("cpu".to_string(), Quantity("5m".to_string()));
             }
             if let Some(mem) = &req.memory {
                 limits.insert("memory".to_string(), Quantity(mem.clone()));
+                // memory requests 设极小 64Mi(pod 开 swap,内存吃紧可换出不易 OOM)。
+                requests.insert("memory".to_string(), Quantity("64Mi".to_string()));
             }
             // ephemeral-storage：限制 overlay 可写层。优先 ephemeral_storage，回退 storage。
             // 修复此前 storage 字段被完全忽略的问题：UserApp 复用共享 PVC subPath 无独立配额,
@@ -276,11 +286,14 @@ impl KubernetesRuntime {
                 .or_else(|| req.storage.clone());
             if let Some(es_val) = es {
                 limits.insert("ephemeral-storage".to_string(), Quantity(es_val));
+                // overlay 实际写入少(数据在共享 PVC subPath),requests 给 512Mi 调度保障。
+                requests.insert("ephemeral-storage".to_string(), Quantity("512Mi".to_string()));
             }
             if limits.is_empty() {
                 None
             } else {
                 Some(ResourceRequirements {
+                    requests: Some(requests),
                     limits: Some(limits),
                     ..Default::default()
                 })

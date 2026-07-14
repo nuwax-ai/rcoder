@@ -412,16 +412,29 @@ impl KubernetesRuntime {
         let mut lims: std::collections::BTreeMap<String, Quantity> =
             std::collections::BTreeMap::new();
 
+        // ⚙️ requests/limits 解耦:requests 设超小固定值(仅作 scheduler 调度保障量),
+        //    limits 保留配置上限(实际突发由 cgroup 兜底)。
+        //    背景:agent-runner 是 AI 代理,常态空闲等响应,资源利用率低;
+        //    若 requests=limits(大值),scheduler 严格按 requests 预订 → 节点迅速占满 → Pod Pending。
+        //    requests 小 → 支持大量 Pod 超卖调度;limits 大 → 单 Pod 突发不受限(最多 throttle/evict,不崩)。
+        //    如需调整,改下方固定值即可(memory/cpu 可压缩性不同,见各字段注释)。
         if let Some(memory) = limits.memory {
             // memory_limit is in bytes, convert to Mi
             let mem_mb = (memory / (1024.0 * 1024.0)) as i64;
-            // Quantity is a string wrapper, construct directly with formatted string
-            requests.insert("memory".to_string(), Quantity(format!("{}Mi", mem_mb)));
+            // memory requests 设极小 64Mi:pod 开启了 swap,内存吃紧可换出不易 OOM;
+            // requests 仅作 scheduler 调度保障,运行时实际可用到 limits 上限(swap + limits 双兜底)。
+            // ⚠️ 代价:节点内存严重紧张时,低 requests + 高实际占用的 pod 可能被优先 evict;
+            //    集群内存余量充足(实测 13~34%)且有 swap,风险可控;若频繁被 evict 再调大。
+            requests.insert("memory".to_string(), Quantity("64Mi".to_string()));
             lims.insert("memory".to_string(), Quantity(format!("{}Mi", mem_mb)));
         }
         if let Some(cpu) = limits.cpu {
             // cpu_limit is core count, format as decimal string
-            requests.insert("cpu".to_string(), Quantity(format!("{}", cpu)));
+            // cpu 可压缩:requests 设极小 5m,突发靠 limits(最多 throttle 变慢,不崩)。
+            // ⚠️ cpu.shares 按 requests 算,5m 权重极低:节点 CPU 严重争抢时此 pod 会被深度 throttle
+            //    (可能慢到 healthcheck 失败/启动超时)。集群 CPU 实测仅 5~7% 闲置,日常可轻松用超 requests;
+            //    若遇 pod 启动超时或 healthcheck 失败,先排查是否 CPU 饿死,必要时调大(如 50m)。
+            requests.insert("cpu".to_string(), Quantity("5m".to_string()));
             lims.insert("cpu".to_string(), Quantity(format!("{}", cpu)));
         }
         // ephemeral-storage：限制 overlay 可写层（/tmp、容器可写层等）。
@@ -431,7 +444,8 @@ impl KubernetesRuntime {
             .clone()
             .or_else(|| limits.storage_size.clone());
         if let Some(es_qty) = es {
-            requests.insert("ephemeral-storage".to_string(), Quantity(es_qty.clone()));
+            // overlay 实际写入很少(业务数据在 PVC),requests 给 512Mi 调度保障,limits 保留配置上限。
+            requests.insert("ephemeral-storage".to_string(), Quantity("512Mi".to_string()));
             lims.insert("ephemeral-storage".to_string(), Quantity(es_qty));
         }
 
