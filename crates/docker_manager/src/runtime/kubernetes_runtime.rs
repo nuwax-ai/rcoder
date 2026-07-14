@@ -740,33 +740,39 @@ impl ContainerRuntime for KubernetesRuntime {
         //       子目录规则 (含 web 共享容器 tenant/space/project 三级) 见 agent_workspace_quota_dir。
         //       需 cephx 挂载用户 (csi-cephfs-node, mds=allow rw) 对该目录有 write 权限。
         //       失败只 warn 不阻断 (配额设不上退化为不限, 不崩 rcoder)。
-        if let Some(ref ss) = storage_size {
-            if let Some(bytes) = parse_quantity_to_bytes(ss) {
-                if let Some(quota_dir) = agent_workspace_quota_dir(
-                    &service_type,
-                    isolation_type.as_deref(),
-                    tenant_id.as_deref(),
-                    space_id.as_deref(),
-                    &project_id_val,
-                    &user_id_val,
-                ) {
-                    let _ = std::fs::create_dir_all(&quota_dir);
-                    match xattr::set(
-                        &quota_dir,
-                        "ceph.quota.max_bytes",
-                        bytes.to_string().as_bytes(),
-                    ) {
-                        Ok(()) => info!("CephFS quota set: {} = {} bytes", quota_dir, bytes),
-                        Err(e) => warn!(
-                            "set CephFS quota failed on {} (cephx 缺 write / 非 cephfs / 目录不存在?): {}",
-                            quota_dir, e
-                        ),
-                    }
-                }
-            } else {
-                warn!("parse storage_size {:?} failed, skip CephFS quota", ss);
-            }
-        }
+        // ⚠️ 2026-07-15 DISABLED: setfattr ceph.quota.max_bytes 在 kernel cephfs mount 下
+        // Permission denied (kernel client virtual xattr 限制, 非 caps; client.admin allow * 也 denied)。
+        // 旧版 caps allow rw 时意外成功设了 per-user 10Gi quota, 致 userId 写超 EDQUOT (errno 122)。
+        // 已手动 setfattr -x 清除所有 userId 旧 quota 止血。
+        // 后续配额方案: 改用 ceph fs subvolume resize (Rook CSI 原生 quota, 非 setfattr)。
+        //
+        // if let Some(ref ss) = storage_size {
+        //     if let Some(bytes) = parse_quantity_to_bytes(ss) {
+        //         if let Some(quota_dir) = agent_workspace_quota_dir(
+        //             &service_type,
+        //             isolation_type.as_deref(),
+        //             tenant_id.as_deref(),
+        //             space_id.as_deref(),
+        //             &project_id_val,
+        //             &user_id_val,
+        //         ) {
+        //             let _ = std::fs::create_dir_all(&quota_dir);
+        //             match xattr::set(
+        //                 &quota_dir,
+        //                 "ceph.quota.max_bytes",
+        //                 bytes.to_string().as_bytes(),
+        //             ) {
+        //                 Ok(()) => info!("CephFS quota set: {} = {} bytes", quota_dir, bytes),
+        //                 Err(e) => warn!(
+        //                     "set CephFS quota failed on {} (cephx 缺 write / 非 cephfs / 目录不存在?): {}",
+        //                     quota_dir, e
+        //                 ),
+        //             }
+        //         }
+        //     } else {
+        //         warn!("parse storage_size {:?} failed, skip CephFS quota", ss);
+        //     }
+        // }
 
         // 取 service 配置(完全分家):K8s 优先读 kubernetes_config;docker_config.multi_image_config
         // 仅作过渡期安全兜底(旧 chart 未带 kubernetes_config 段时,保留 workspace 路径/command/env 行为)。
