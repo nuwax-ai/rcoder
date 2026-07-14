@@ -498,7 +498,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     result = lines.next_line() => {
                         match result {
                             Ok(Some(line)) if !line.trim().is_empty() => {
-                                warn!("[SACP] Claude Code Agent stderr: {}", line.trim());
+                                warn!("[SACP] ACP Agent stderr: {}", line.trim());
                                 // 存储 stderr 输出，用于错误传播
                                 if let Ok(mut buf) = stderr_output_clone.lock() {
                                     buf.push(line.trim().to_string());
