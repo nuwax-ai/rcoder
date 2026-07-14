@@ -1,0 +1,14 @@
+# computer-agent-runner 共享工作空间卷（所有 computer agent pod 挂此 PVC，按 user_id subPath 隔离）。
+# 名称须与 rcoder env RCODER_COMPUTER_WORKSPACE_PVC_NAME 一致（deployment.yaml 注入）。
+# 单文档（见 rbac.yaml 顶部说明）。web 工作空间卷见 pvc-workspace.yaml。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: computer-workspace-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce        # 本地 local-path 只支持 RWO；orbstack 单节点，多 pod 同节点共享等同 RWX
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-path

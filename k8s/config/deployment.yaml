@@ -49,6 +49,11 @@ spec:
               value: "project-workspace-pvc"
             - name: RCODER_WORKSPACE_ROOT
               value: "/app/project_workspace/workspace/apps"
+            # computer-agent-runner 共享存储：所有 computer agent pod 挂此 PVC，
+            # 按 user_id subPath 隔离（挂载点 /home/user）。rcoder 默认名 {ns}-rcoder-computer-workspace，
+            # 这里用 env 覆盖成静态名 computer-workspace-pvc（与 web 对称，不硬编码 namespace）。
+            - name: RCODER_COMPUTER_WORKSPACE_PVC_NAME
+              value: "computer-workspace-pvc"
             # UserApp HTTP 端口经 Gateway（HTTPRoute，标准 CR，controller 无关）。
             # 本地 devspace 用 Envoy Gateway（OrbStack 原生），生产用 Cilium Gateway，
             # 两者 gatewayClassName 不同但 Gateway 同名 nuwax-gateway/default。
