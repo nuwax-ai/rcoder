@@ -13,7 +13,7 @@
 
 ---
 
-## ✅ 待办 1: 清理 Envoy Backend CRD 残留代码(就绪,低风险)
+## ✅ 待办 1: 清理 Envoy Backend CRD 残留代码(✅ 已完成 commit `1a52f64`)
 
 ### 背景(为什么)
 集群已从 Envoy Gateway 迁移到 **Cilium Gateway**(见 build-agent-docker 的 GW①~GW⑥ 与 commit `1cc3296`)。Envoy 的 `backends.gateway.envoyproxy.io` CRD 已从集群卸载(`kubectl get crd backends.gateway.envoyproxy.io` → NotFound),rcoder SA 也丢了对应 RBAC。
@@ -102,6 +102,29 @@ rcoder 创建 agent 时,本应按接口入参 `storage_size` 给每个用户/age
 
 ---
 
+## 🔧 待办 3: K8s self-heal service_type 一致性(需设计,中风险)
+
+### 背景(为什么)
+`get_container_info_by_identifier`(`crates/docker_manager/src/runtime/kubernetes_runtime.rs:1212-1239`) 的 self-heal 用【入参 service_type】调 `create_agent_service`,而 service_url 用【真实 Pod 名】。入参 ≠ 真实 Pod service_type 时,造出名字错位 + selector 不命中的**孤儿 Service**(`delete_agent_service` 同样推不出名字 → 删不掉,持续泄漏)。
+
+### 触发条件(罕见)
+- identifier 跨类型碰撞:Computer 用 user_id、Web 用 project_id、pod_id 通吃(`ServiceType::container_identifier`)
+- 硬编码调用点:`sse_stream.rs:249` / `agent_session_notification.rs:1293` / `agent_mgmt_handler.rs:185` 被错类型容器用
+
+### 修复方向(方案 A,推荐)
+self-heal 分支改读 Pod label `rcoder.io/service-type`(`ServiceType: FromStr` 可反解析),读不到时 fallback 入参 service_type(兼容旧无 label Pod)。
+- 现成先例:`create_container` 409 冲突路径(kubernetes_runtime.rs:1068-1076)已做完全相同的 label 读取。
+- P0(Backend CRD 清理,commit `1a52f64`)后,self-heal 只剩 `create_agent_service`,修复面小。
+
+### 不做(P3a identifier trait 方法)
+规划时曾考虑加 `K8sServiceOps::agent_service_name_from_pod_name` trait 方法区分"业务 id 入口"vs"Pod 名入口"。但 P1(地址构建统一到 shared_types,commit `3b79c0f`)后,`get_container_access_address` 已改用 `shared_types::build_k8s_service_fqdn`,`agent_service_name` 只剩 create/delete 业务 id 路径在用——双前缀误用风险已根除,加方法是纯整洁无实际收益。**跳过**。
+
+### 完成标准
+- [ ] self-heal 用 Pod label 真实 service_type,fallback 入参
+- [ ] 测试:模拟 service_type 不一致场景,验证不造孤儿 Service
+
+---
+
 ## 🟡 待办 4: 低优先代码 TODO(2 处占位,可顺手)
 
 `grep` 出的代码内 TODO,均为功能占位,非阻塞:
@@ -113,6 +136,10 @@ rcoder 创建 agent 时,本应按接口入参 `storage_size` 给每个用户/age
 ---
 
 ## 附:近期已完成(勿重复做)
+- **service_url 双前缀 bug 修复**(commit `c840f05`): K8s permission/cancel/stop transport error 根因;service_url 复用 shared_types::build_k8s_service_fqdn
+- **P0 Backend CRD 残留清理**(commit `1a52f64`): 删 k8s_backend_crd.rs + 4 处调用点,消除 Envoy CRD 403 噪声
+- **P1 地址构建统一**(commit `3b79c0f`): 14 处内联 if/else → shared_types::build_backend_addr/build_grpc_addr,净减 171 行
+- **P2 UserApp service_url 统一 + 魔数 8086**(commit `2101255`): UserApp 用 build_k8s_service_fqdn(app_deployment_name);魔数 → HTTP_DEFAULT_PORT
 - ②-b setfattr 集中配额 → **已禁用**(见待办 2)
 - Envoy→Cilium Gateway 迁移(GW①~GW⑥,build-agent-docker 侧)+ chart 内 envoy/streaming 死配置清理(commit `1cc3296` / `85`)
 - rcoder 启动/grace 优化 P1/P3/P4/P5(销毁 60s→~4.5s)
