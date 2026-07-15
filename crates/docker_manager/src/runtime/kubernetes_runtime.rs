@@ -26,7 +26,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
 use kube::Config;
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, DeleteParams, DynamicObject, ListParams, ObjectMeta, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
 #[cfg(feature = "kubernetes")]
@@ -45,7 +45,6 @@ use tracing::{debug, info, warn};
 
 #[cfg(feature = "kubernetes")]
 use super::{
-    k8s_backend_crd::K8sBackendCRDOps,
     k8s_pod::K8sPodOps,
     k8s_pvc::K8sPvcOps,
     k8s_service::{K8sServiceOps, build_standard_labels},
@@ -1120,14 +1119,6 @@ impl ContainerRuntime for KubernetesRuntime {
         // Create K8s Service for Envoy Gateway routing
         self.create_agent_service(identifier, &service_type).await?;
 
-        // Create Backend CRD for Envoy Gateway discovery (non-fatal if Envoy Gateway is not installed)
-        if let Err(e) = self.create_backend_crd(identifier, &service_type).await {
-            warn!(
-                "[K8S] Failed to create Backend CRD for {} (Envoy Gateway may not be installed): {} (continuing)",
-                identifier, e
-            );
-        }
-
         // Get pod info
         self.get_container_info_by_identifier(identifier, &service_type)
             .await?
@@ -1216,21 +1207,14 @@ impl ContainerRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         let info = self.get_container_info(identifier).await?;
         if info.is_some() {
-            // Self-heal：异常创建（如 OrbStack sandbox 超时）可能留下"pod 在、svc/backend 丢"
-            // 的不一致状态——pod 重试后起来了，但 create_agent_service / create_backend_crd 那
-            // 几步没跑完。后续 Chat 走 svc FQDN `{pod}-svc:50051` 会 transport error → GRPC_ERROR；
-            // 外部 Envoy 路由（VNC/终端）也因缺 backend CRD 进不来。
-            // 两者均幂等（先 get，存在即返回，缺失才建），此处补建缺失资源，避免人工删 pod 介入。
-            // 失败仅 warn（get 是读操作，自愈失败不应阻塞读；Envoy 未装时 backend CRD 也会 warn）。
+            // Self-heal：异常创建（如 OrbStack sandbox 超时）可能留下"pod 在、svc 丢"
+            // 的不一致状态——pod 重试后起来了，但 create_agent_service 那步没跑完。
+            // 后续 Chat 走 svc FQDN `{pod}-svc:50051` 会 transport error → GRPC_ERROR。
+            // create_agent_service 幂等（先 get，存在即返回，缺失才建），此处补建，避免人工删 pod 介入。
+            // 失败仅 warn（get 是读操作，自愈失败不应阻塞读）。
             if let Err(e) = self.create_agent_service(identifier, service_type).await {
                 warn!(
                     "[K8S] self-heal: 补建 agent service 失败 identifier={}, service_type={:?} (non-fatal): {}",
-                    identifier, service_type, e
-                );
-            }
-            if let Err(e) = self.create_backend_crd(identifier, service_type).await {
-                warn!(
-                    "[K8S] self-heal: 补建 backend CRD 失败 identifier={}, service_type={:?} (non-fatal): {}",
                     identifier, service_type, e
                 );
             }
@@ -1352,17 +1336,7 @@ impl ContainerRuntime for KubernetesRuntime {
             pod_name, identifier, service_type
         );
 
-        // ── Step 0: 删除 Backend CRD + K8s Service（Envoy Gateway 清理）──
-        //
-        // 先删除 Backend CRD，让 Envoy 停止向该 Pod 路由新流量；
-        // 再删除 K8s Service，移除 DNS 条目。两者均在 Pod 终止前完成，
-        // 确保流量不再进入即将销毁的 Pod。
-        if let Err(e) = self.delete_backend_crd(identifier).await {
-            warn!(
-                "[K8S] Failed to delete Backend CRD for {}: {} (continuing)",
-                identifier, e
-            );
-        }
+        // ── Step 0: 删除 K8s Service（移除 DNS 条目，在 Pod 终止前完成，确保流量不再进入即将销毁的 Pod）──
         if let Err(e) = self.delete_agent_service(identifier, service_type).await {
             warn!(
                 "[K8S] Failed to delete Service for {}: {} (continuing)",
@@ -1552,31 +1526,12 @@ impl ContainerRuntime for KubernetesRuntime {
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
         let total_start = std::time::Instant::now();
         info!(
-            "[K8S_CLEANUP] Starting cleanup_all — sequential Backend CRD → Service → Pod → PVC deletion"
+            "[K8S_CLEANUP] Starting cleanup_all — sequential Service → Pod → PVC deletion"
         );
 
         let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
 
-        // ── Step 0: 批量删除 Backend CRD（停止 Envoy 路由）──
-        let backends: Api<DynamicObject> = Api::namespaced_with(
-            self.client.clone(),
-            &self.namespace,
-            &super::k8s_backend_crd::backend_api_resource(),
-        );
-        match backends
-            .delete_collection(&DeleteParams::default(), &lp)
-            .await
-        {
-            Ok(_) => info!("[K8S_CLEANUP] Backend CRD delete_collection requested"),
-            Err(e) => {
-                tracing::warn!(
-                    "[K8S_CLEANUP] Backend CRD delete_collection failed: {} (continuing)",
-                    e
-                );
-            }
-        }
-
-        // ── Step 0.5: 批量删除 K8s Service ──
+        // ── Step 0: 批量删除 K8s Service ──
         let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
         match services
             .delete_collection(&DeleteParams::default(), &lp)
