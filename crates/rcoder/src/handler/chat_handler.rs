@@ -488,20 +488,13 @@ pub async fn handle_chat(
     // 直接转发 Chat RPC 会 transport error。这里仿照 computer_chat_handler 做状态探活，
     // 并加重试以真正等待 gRPC server 就绪（正常情况下首次即成功，无额外延迟）。
     {
-        let grpc_addr = if shared_types::is_kubernetes_runtime() {
-            let svc_fqdn = super::utils::build_k8s_service_fqdn(
-                &container_info.container_name,
-                &state.config.app_manager.namespace,
-                &state.cluster_domain,
-            );
-            format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
-        } else {
-            format!(
-                "{}:{}",
-                container_info.container_ip,
-                shared_types::GRPC_DEFAULT_PORT
-            )
-        };
+        // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
+        let grpc_addr = shared_types::build_grpc_addr(
+            &container_info.container_name,
+            &container_info.container_ip,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
+        );
 
         debug!(
             "[CHAT] Probing agent_runner readiness before forward: addr={}",
@@ -651,24 +644,13 @@ async fn forward_request_to_container_service(
     );
 
     // 🎯 使用 gRPC 替代 HTTP
-    // 根据运行环境选择 gRPC 地址
-    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
-    // - Docker 环境：使用容器 IP（直接连接）
-    let container_name = container_info.container_name.clone();
-    let grpc_addr = if shared_types::is_kubernetes_runtime() {
-        let addr =
-            super::utils::build_k8s_grpc_addr(&container_name, ctx.namespace, ctx.cluster_domain);
-        debug!("📡 [FORWARD] Using K8s Service FQDN for gRPC: {}", addr);
-        addr
-    } else {
-        let addr = format!(
-            "{}:{}",
-            container_info.container_ip,
-            shared_types::GRPC_DEFAULT_PORT
-        );
-        debug!("📡 [FORWARD] Using container IP for gRPC: {}", addr);
-        addr
-    };
+    // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
+    let grpc_addr = shared_types::build_grpc_addr(
+        &container_info.container_name,
+        &container_info.container_ip,
+        ctx.namespace,
+        ctx.cluster_domain,
+    );
 
     debug!(
         "📡 [FORWARD] Sending gRPC request to: {}, prompt_length={}, attachments_count={}",

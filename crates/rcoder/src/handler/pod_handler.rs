@@ -104,15 +104,13 @@ fn register_vnc_backend(
     service_type: &ServiceType,
 ) {
     if let Some(ref pingora) = state.pingora_service {
-        let backend_addr = if shared_types::is_kubernetes_runtime() {
-            super::utils::build_k8s_service_fqdn(
-                &container_info.container_name,
-                &state.config.app_manager.namespace,
-                &state.cluster_domain,
-            )
-        } else {
-            container_info.container_ip.clone()
-        };
+        // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
+        let backend_addr = shared_types::build_backend_addr(
+            &container_info.container_name,
+            &container_info.container_ip,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
+        );
         pingora.add_vnc_backend(user_id, &backend_addr);
         debug!(
             "🔗 [POD] VNC backend registered: service_type={:?}, user_id={} -> {}",
@@ -2524,30 +2522,13 @@ pub async fn pod_vnc_status(
     }
 
     // 6. 构建 gRPC 地址
-    // 根据运行环境选择 gRPC 地址
-    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
-    // - Docker 环境：使用容器 IP（直接连接）
-    let grpc_addr = if shared_types::is_kubernetes_runtime() {
-        let svc_fqdn = super::utils::build_k8s_service_fqdn(
-            &result.container_name,
-            &state.config.app_manager.namespace,
-            &state.cluster_domain,
-        );
-        let addr = format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT);
-        info!(
-            " [POD_VNC_STATUS] Using K8s Service FQDN for gRPC: {}",
-            addr
-        );
-        addr
-    } else {
-        let addr = format!(
-            "{}:{}",
-            result.container_ip,
-            shared_types::GRPC_DEFAULT_PORT
-        );
-        info!(" [POD_VNC_STATUS] Using container IP for gRPC: {}", addr);
-        addr
-    };
+    // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
+    let grpc_addr = shared_types::build_grpc_addr(
+        &result.container_name,
+        &result.container_ip,
+        &state.config.app_manager.namespace,
+        &state.cluster_domain,
+    );
 
     match state.grpc_pool.get_client(&grpc_addr).await {
         Ok(mut client) => {

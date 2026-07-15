@@ -8,39 +8,6 @@ use shared_types::ServiceType;
 use shared_types::error_codes::ERR_GRPC_ADDR_ERROR;
 use std::cmp::Reverse;
 
-/// 构建 K8s Service FQDN
-///
-/// # 参数
-/// - `container_name`: 容器名称
-/// - `namespace`: K8s namespace
-/// - `cluster_domain`: K8s 集群域名（默认为 "cluster.local"）
-///
-/// # 返回
-/// K8s Service FQDN，格式如 `container-svc.namespace.svc.cluster.local`
-pub fn build_k8s_service_fqdn(
-    container_name: &str,
-    namespace: &str,
-    cluster_domain: &str,
-) -> String {
-    // 转发 shared_types 单一事实源,统一 docker_manager / rcoder 各 handler 的 FQDN 格式,
-    // 避免两处独立实现漂移(曾因此导致 service_url 双前缀 bug)。
-    shared_types::build_k8s_service_fqdn(container_name, namespace, cluster_domain)
-}
-
-/// 构建 gRPC 地址（K8s Service FQDN）
-///
-/// # 参数
-/// - `container_name`: 容器名称
-/// - `namespace`: K8s namespace
-/// - `cluster_domain`: K8s 集群域名
-///
-/// # 返回
-/// gRPC 地址，格式如 `container-svc.namespace.svc.cluster.local:50051`
-pub fn build_k8s_grpc_addr(container_name: &str, namespace: &str, cluster_domain: &str) -> String {
-    let fqdn = build_k8s_service_fqdn(container_name, namespace, cluster_domain);
-    format!("{}:{}", fqdn, GRPC_DEFAULT_PORT)
-}
-
 /// 从 service_url 提取 gRPC 地址（使用指定端口）
 ///
 /// # 参数
@@ -186,7 +153,7 @@ mod tests {
         // KubernetesRuntime::get_container_access_address)。
         // 回归钉死: 不能再出现 {prefix}-{prefix}-{id}-svc 双前缀
         // (生产 bug: service_url 多出 rcoder-k8s- 前缀 → permission/cancel/stop transport error)。
-        let fqdn = build_k8s_service_fqdn(
+        let fqdn = shared_types::build_k8s_service_fqdn(
             "rcoder-computer-agent-runner-1784107191",
             "nuwax-k8s-prod",
             "cluster.local",

@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use shared_types::{GRPC_DEFAULT_PORT, ServiceType};
+use shared_types::ServiceType;
 use tracing::{debug, info, warn};
 
 use container_runtime_api::ContainerRuntime;
@@ -127,22 +127,18 @@ impl ResourceReaper {
         }
 
         // 2. 清理 gRPC 连接
-        let grpc_addr = if self.is_kubernetes {
-            // K8s 环境：使用 K8s Service FQDN
-            let svc_fqdn = crate::handler::utils::build_k8s_service_fqdn(
-                &req.container_name,
-                &req.namespace,
-                &req.cluster_domain,
-            );
-            format!("{}:{}", svc_fqdn, GRPC_DEFAULT_PORT)
-        } else {
-            // Docker 环境：使用容器 IP
-            if req.container_ip.is_empty() {
-                debug!("[REAPER] Container IP is empty, skipping gRPC cleanup");
-                return;
-            }
-            format!("{}:{}", req.container_ip, GRPC_DEFAULT_PORT)
-        };
+        // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）；
+        // Docker 模式下 container_ip 为空时无法定位连接，跳过清理（K8s 用 FQDN，不受影响）
+        if !self.is_kubernetes && req.container_ip.is_empty() {
+            debug!("[REAPER] Container IP is empty, skipping gRPC cleanup");
+            return;
+        }
+        let grpc_addr = shared_types::build_grpc_addr(
+            &req.container_name,
+            &req.container_ip,
+            &req.namespace,
+            &req.cluster_domain,
+        );
         self.grpc_pool.remove(&grpc_addr).await;
 
         // 3. 清理 DockerManager 缓存（Docker 模式）

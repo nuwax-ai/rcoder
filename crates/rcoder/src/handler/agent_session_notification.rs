@@ -696,26 +696,13 @@ struct SseStreamParams {
 async fn build_sse_stream_from_container_name(
     params: SseStreamParams,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
-    // 根据运行环境选择 gRPC 地址
-    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
-    // - Docker 环境：使用容器 IP（直接连接）
-    let grpc_addr = if shared_types::is_kubernetes_runtime() {
-        let svc_fqdn = super::utils::build_k8s_service_fqdn(
-            &params.container_name,
-            &params.namespace,
-            &params.cluster_domain,
-        );
-        debug!("📡 [SSE] Using K8s Service FQDN for gRPC: {}", svc_fqdn);
-        format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
-    } else {
-        let addr = format!(
-            "{}:{}",
-            params.container_ip,
-            shared_types::GRPC_DEFAULT_PORT
-        );
-        debug!("📡 [SSE] Using container IP for gRPC: {}", addr);
-        addr
-    };
+    // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
+    let grpc_addr = shared_types::build_grpc_addr(
+        &params.container_name,
+        &params.container_ip,
+        &params.namespace,
+        &params.cluster_domain,
+    );
     info!(
         " [gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
         params.service_type, grpc_addr, params.project_id

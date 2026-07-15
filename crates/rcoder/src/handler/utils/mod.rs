@@ -15,8 +15,7 @@ pub use agent_mgmt_forward::{
 };
 #[allow(unused_imports)]
 pub use grpc_addr::{
-    build_k8s_grpc_addr, build_k8s_service_fqdn, container_identity_from_name, extract_grpc_addr,
-    extract_grpc_addr_with_port,
+    container_identity_from_name, extract_grpc_addr, extract_grpc_addr_with_port,
 };
 pub use i18n_extractors::{I18nJsonOrQuery, I18nPath, I18nQuery};
 pub use locale::get_locale_from_headers;

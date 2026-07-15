@@ -560,18 +560,13 @@ pub(crate) async fn handle_computer_chat_internal(
 
     // 6. 注册 VNC 后端到 Pingora（用于 WebSocket 代理）
     if let Some(ref pingora_service) = state.pingora_service {
-        // 根据运行环境选择地址
-        // - K8s 环境：使用 K8s Service FQDN
-        // - Docker 环境：使用容器 IP
-        let backend_addr = if shared_types::is_kubernetes_runtime() {
-            super::utils::build_k8s_service_fqdn(
-                &container_info.container_name,
-                &state.config.app_manager.namespace,
-                &state.cluster_domain,
-            )
-        } else {
-            container_info.container_ip.clone()
-        };
+        // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
+        let backend_addr = shared_types::build_backend_addr(
+            &container_info.container_name,
+            &container_info.container_ip,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
+        );
         pingora_service.add_vnc_backend(&user_id, &backend_addr);
         debug!(
             "🔗 [COMPUTER_CHAT] VNC backend registered: user_id={} -> {}",
@@ -585,20 +580,13 @@ pub(crate) async fn handle_computer_chat_internal(
     {
         // 根据运行环境选择 gRPC 地址
         let grpc_addr_result = async {
-            let addr = if shared_types::is_kubernetes_runtime() {
-                let svc_fqdn = super::utils::build_k8s_service_fqdn(
-                    &container_info.container_name,
-                    &state.config.app_manager.namespace,
-                    &state.cluster_domain,
-                );
-                format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
-            } else {
-                format!(
-                    "{}:{}",
-                    container_info.container_ip,
-                    shared_types::GRPC_DEFAULT_PORT
-                )
-            };
+            // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
+            let addr = shared_types::build_grpc_addr(
+                &container_info.container_name,
+                &container_info.container_ip,
+                &state.config.app_manager.namespace,
+                &state.cluster_domain,
+            );
 
             Ok::<_, String>(addr)
         }
@@ -888,32 +876,13 @@ async fn forward_computer_request_to_container(
     // 直接使用 gRPC 的健康检查机制，不额外检查容器状态
     // gRPC 连接失败会自动返回错误，由上层处理
 
-    // 根据运行环境选择 gRPC 地址
-    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
-    // - Docker 环境：使用容器 IP（直接连接）
-    let grpc_addr = if shared_types::is_kubernetes_runtime() {
-        let addr = super::utils::build_k8s_grpc_addr(
-            &params.container_info.container_name,
-            params.namespace,
-            params.cluster_domain,
-        );
-        debug!(
-            "📡 [COMPUTER_FORWARD] Using K8s Service FQDN for gRPC: {}",
-            addr
-        );
-        addr
-    } else {
-        let addr = format!(
-            "{}:{}",
-            params.container_info.container_ip,
-            shared_types::GRPC_DEFAULT_PORT
-        );
-        debug!(
-            "📡 [COMPUTER_FORWARD] Using container IP for gRPC: {}",
-            addr
-        );
-        addr
-    };
+    // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
+    let grpc_addr = shared_types::build_grpc_addr(
+        &params.container_info.container_name,
+        &params.container_info.container_ip,
+        params.namespace,
+        params.cluster_domain,
+    );
 
     debug!(
         "📡 [COMPUTER_FORWARD] gRPC address: {}, prompt_len={}, attachments={}",
