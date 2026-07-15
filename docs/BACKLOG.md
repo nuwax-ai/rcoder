@@ -135,6 +135,35 @@ self-heal 分支改读 Pod label `rcoder.io/service-type`(`ServiceType: FromStr`
 
 ---
 
+## 🔧 待办 5: 路径拼接改用 PathBuf::join(需设计,中风险)
+
+### 背景(为什么)
+`container_path_template` 路径生成全链路是**纯字符串操作**,没用 `PathBuf`:
+- default 模板(`crates/shared_types/src/service_config.rs:10-12`): `format!("{}{{project_id}}", WORKSPACE_ROOT)` → 缺 `/`,产出 `/app/project_workspace{project_id}`(同理 `{user_id}` 前也缺 `/`)
+- `resolve_container_path`(`service_config.rs:462`): `resolved.replace("{key}", value)` 纯字符串替换,返回裸 `String`
+
+症状: 4 个 `container_path_test` 预存失败(default 模板缺 `/`)。**补 `/` 只是补字符串,根本问题(用字符串操作路径)没解决**——跨平台分隔符、重复 `/`、下游继续拼等问题都挡不住。
+
+### 正确方向(PathBuf::join,不是补 /)
+路径段用 `PathBuf::join`(系统规则):跨平台分隔符、不缺/不重复 `/`、下游可继续 `.join()`。
+
+两条路(需评审择一):
+- **A(彻底)**: 废弃字符串模板,改结构化配置(root + segments)+ `PathBuf::join`。最干净,但 config.yml 的 `container_path_template` 字段属 breaking change。
+- **B(兼容)**: 保留模板配置(用户自定义),`resolve_container_path` 把替换结果喂 `PathBuf` 规范化(`PathBuf::from(resolved)` + 去重复 `/`),default 用 `join` 生成。保留灵活性,路径正确性交 `PathBuf`。
+
+### 涉及
+- `crates/shared_types/src/service_config.rs`: `default_container_path_template` / `resolve_container_path`
+- `crates/shared_types/src/paths.rs`: `WORKSPACE_ROOT` / `COMPUTER_WORKSPACE_ROOT` 常量
+- 下游所有用 `resolve_container_path` 结果处(评估 `String` → `PathBuf` 的影响面)
+
+### 完成标准
+- [ ] 选定 A 或 B + 写 spec
+- [ ] resolve 用 `PathBuf`,跨平台 + 不缺/不重复分隔符
+- [ ] `container_path_test` 4 个预存失败转绿
+- [ ] 评估 config.yml 自定义模板的兼容性
+
+---
+
 ## 附:近期已完成(勿重复做)
 - **service_url 双前缀 bug 修复**(commit `c840f05`): K8s permission/cancel/stop transport error 根因;service_url 复用 shared_types::build_k8s_service_fqdn
 - **P0 Backend CRD 残留清理**(commit `1a52f64`): 删 k8s_backend_crd.rs + 4 处调用点,消除 Envoy CRD 403 噪声
