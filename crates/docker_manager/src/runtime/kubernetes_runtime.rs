@@ -41,7 +41,7 @@ use std::sync::Arc;
 #[cfg(feature = "kubernetes")]
 use tokio::sync::RwLock;
 #[cfg(feature = "kubernetes")]
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "kubernetes")]
 use super::{
@@ -570,24 +570,22 @@ impl KubernetesRuntime {
         }
     }
 
-    /// 根据运行环境获取容器访问地址
-    ///
-    /// - K8s 环境：使用 K8s Service FQDN
-    /// - Docker 环境：使用容器 IP
-    fn get_container_access_address(
-        &self,
-        identifier: &str,
-        service_type: &ServiceType,
-        _container_ip: &str,
-    ) -> String {
-        // K8s 环境：使用 K8s Service FQDN
-        let svc_name = self
-            .agent_service_name(identifier, service_type)
-            .unwrap_or_else(|_| format!("{}-{}", service_type, identifier));
-        format!(
-            "{}.{}.svc.{}",
-            svc_name, self.namespace, self.config.cluster_domain
-        )
+    /// 获取 K8s 模式 agent 容器的访问地址(Service FQDN)。
+    /// Docker 模式不经过此函数(走 docker_runtime,用容器 IP)。
+    fn get_container_access_address(&self, identifier: &str) -> String {
+        // identifier 是完整 Pod 名(pod_info.container_name = {prefix}-{业务id}),
+        // 真实 agent Service 名 = "{pod_name}-svc"(create_agent_service 创建)。
+        // 复用 shared_types::build_k8s_service_fqdn 统一 FQDN 格式(与 rcoder 侧 handler、
+        // 实际 K8s Service 名对齐)。不要过 agent_service_name/pod_name —— 那会再叠一层
+        // service_container_prefix,产生 {prefix}-{prefix}-{id}-svc 双前缀(生产 bug 根因:
+        // service_url 多出 rcoder-k8s- 前缀 → permission/cancel/stop transport error)。
+        let fqdn = shared_types::build_k8s_service_fqdn(
+            identifier,
+            &self.namespace,
+            &self.config.cluster_domain,
+        );
+        debug!("[K8S] agent access address: identifier={} -> {}", identifier, fqdn);
+        fqdn
     }
 
     /// Build container basic info from runtime container info
@@ -595,14 +593,10 @@ impl KubernetesRuntime {
         &self,
         project_id: &str,
         pod_info: &RuntimeContainerInfo,
-        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
-        // 使用 K8s Service FQDN 而不是 Pod IP
-        let access_address = self.get_container_access_address(
-            &pod_info.container_name,
-            service_type,
-            &pod_info.container_ip,
-        );
+        // service_url = {container_name}-svc:container_name 是 Pod 实际名(已含类型前缀),
+        // 不需要 service_type(容器信息本就不含此字段)。
+        let access_address = self.get_container_access_address(&pod_info.container_name);
 
         Ok(ContainerBasicInfo {
             container_id: pod_info.container_id.clone(),
@@ -1152,11 +1146,8 @@ impl ContainerRuntime for KubernetesRuntime {
         if let Some(cached) = self.pod_cache.read().await.get(identifier)
             && cached.status == ContainerRuntimeStatus::Running
         {
-            // get_container_info 只用于 WebAgentRunner
-            let service_type = shared_types::ServiceType::WebAgentRunner;
             return Ok(Some(
-                self.build_container_basic_info(identifier, cached, &service_type)
-                    .await?,
+                self.build_container_basic_info(identifier, cached).await?,
             ));
         }
 
@@ -1192,9 +1183,6 @@ impl ContainerRuntime for KubernetesRuntime {
                     })
                     .unwrap_or_else(Utc::now);
 
-                // get_container_info 只用于 WebAgentRunner
-                let service_type = shared_types::ServiceType::WebAgentRunner;
-
                 let pod_info = RuntimeContainerInfo {
                     container_id: uid,
                     container_name: name,
@@ -1213,8 +1201,7 @@ impl ContainerRuntime for KubernetesRuntime {
                 }
 
                 return Ok(Some(
-                    self.build_container_basic_info(identifier, &pod_info, &service_type)
-                        .await?,
+                    self.build_container_basic_info(identifier, &pod_info).await?,
                 ));
             }
         }

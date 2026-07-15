@@ -22,10 +22,9 @@ pub fn build_k8s_service_fqdn(
     namespace: &str,
     cluster_domain: &str,
 ) -> String {
-    format!(
-        "{}-svc.{}.svc.{}",
-        container_name, namespace, cluster_domain
-    )
+    // 转发 shared_types 单一事实源,统一 docker_manager / rcoder 各 handler 的 FQDN 格式,
+    // 避免两处独立实现漂移(曾因此导致 service_url 双前缀 bug)。
+    shared_types::build_k8s_service_fqdn(container_name, namespace, cluster_domain)
 }
 
 /// 构建 gRPC 地址（K8s Service FQDN）
@@ -178,6 +177,29 @@ mod tests {
         // 测试空字符串
         let result = extract_grpc_addr("");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_k8s_service_fqdn_format() {
+        // 固化 K8s service_url host 契约: {container_name}-svc.{ns}.svc.{domain}
+        // 必须与 K8s 实际 Service 名一致(见 docker_manager
+        // KubernetesRuntime::get_container_access_address)。
+        // 回归钉死: 不能再出现 {prefix}-{prefix}-{id}-svc 双前缀
+        // (生产 bug: service_url 多出 rcoder-k8s- 前缀 → permission/cancel/stop transport error)。
+        let fqdn = build_k8s_service_fqdn(
+            "rcoder-computer-agent-runner-1784107191",
+            "nuwax-k8s-prod",
+            "cluster.local",
+        );
+        assert_eq!(
+            fqdn,
+            "rcoder-computer-agent-runner-1784107191-svc.nuwax-k8s-prod.svc.cluster.local"
+        );
+        // 关键: 仅单层 -svc 后缀, 绝无额外前缀
+        assert!(
+            !fqdn.contains("rcoder-k8s-"),
+            "service FQDN must not carry double prefix, got: {fqdn}"
+        );
     }
 
     #[test]
