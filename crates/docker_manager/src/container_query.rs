@@ -882,8 +882,8 @@ impl DockerManager {
                 DockerError::ConnectionError("Container not connected to any network".to_string())
             })?;
 
-        // 3. 构建服务 URL (Agent 内部默认监听 8086)
-        let server_url = format!("http://{}:8086", container_ip);
+        // 3. 构建服务 URL (Agent 内部默认监听 HTTP_DEFAULT_PORT=8086)
+        let server_url = format!("http://{}:{}", container_ip, shared_types::HTTP_DEFAULT_PORT);
 
         // 4. 转换并返回
         Ok(Some(ContainerBasicInfo {

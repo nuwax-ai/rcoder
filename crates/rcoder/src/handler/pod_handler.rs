@@ -880,7 +880,7 @@ pub async fn pod_list(
                 .unwrap_or_else(|| docker_container.container_ip.clone()),
             service_url: stored_record
                 .map(|r| r.service_url.clone())
-                .unwrap_or_else(|| format!("http://{}:{}", docker_container.container_ip, 8086)),
+                .unwrap_or_else(|| format!("http://{}:{}", docker_container.container_ip, shared_types::HTTP_DEFAULT_PORT)),
             status: String::from(docker_container.status.clone()),
             service_type: service_type.to_string(),
             project_id,

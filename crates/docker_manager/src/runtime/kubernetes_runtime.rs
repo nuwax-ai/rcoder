@@ -1667,11 +1667,15 @@ impl ContainerRuntime for KubernetesRuntime {
             project_id: app_id.clone(),
             status: "Starting".to_string(),
             created_at: Utc::now(),
+            // UserApp service_url: 传 app_deployment_name(不含 -svc),由 build_k8s_service_fqdn
+            // 追加单层 -svc。【不要】传 app_service_name(已含 -svc) → -svc-svc 双后缀。
             service_url: format!(
-                "http://{}.{}.svc.{}",
-                self.app_service_name(&app_id),
-                self.namespace,
-                self.config.cluster_domain
+                "http://{}",
+                shared_types::build_k8s_service_fqdn(
+                    &self.app_deployment_name(&app_id),
+                    &self.namespace,
+                    &self.config.cluster_domain,
+                ),
             ),
         })
     }
@@ -1711,11 +1715,15 @@ impl ContainerRuntime for KubernetesRuntime {
             project_id: app_id.clone(),
             status: "Starting".to_string(),
             created_at: Utc::now(),
+            // UserApp service_url: 传 app_deployment_name(不含 -svc),由 build_k8s_service_fqdn
+            // 追加单层 -svc。【不要】传 app_service_name(已含 -svc) → -svc-svc 双后缀。
             service_url: format!(
-                "http://{}.{}.svc.{}",
-                self.app_service_name(&app_id),
-                self.namespace,
-                self.config.cluster_domain
+                "http://{}",
+                shared_types::build_k8s_service_fqdn(
+                    &self.app_deployment_name(&app_id),
+                    &self.namespace,
+                    &self.config.cluster_domain,
+                ),
             ),
         })
     }
