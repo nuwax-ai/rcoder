@@ -43,6 +43,8 @@ pub fn timestamp_prefix() -> String {
 }
 
 /// 异步把一行 (已含前缀) append 到指定文件。
+/// 注意: 把"内容 + 换行"合并成单次 write_all, 配合 O_APPEND 保证原子追加,
+/// 避免 stdout/stderr 两个管道 task 并发写同一日志文件时行间交错粘连。
 pub async fn append_line(path: &Path, line: &str) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
@@ -53,12 +55,12 @@ pub async fn append_line(path: &Path, line: &str) -> AppResult<()> {
         .open(path)
         .await
         .map_err(|e| AppError::system(format!("open dev log {}: {e}", path.display())))?;
-    file.write_all(line.as_bytes())
+    // 单次写 (内容+\n), O_APPEND 下原子追加
+    let mut buf: Vec<u8> = line.as_bytes().to_vec();
+    buf.push(b'\n');
+    file.write_all(&buf)
         .await
         .map_err(|e| AppError::system(format!("write dev log: {e}")))?;
-    file.write_all(b"\n")
-        .await
-        .map_err(|e| AppError::system(format!("write dev log nl: {e}")))?;
     Ok(())
 }
 
@@ -74,6 +76,30 @@ where
         while let Ok(Some(line)) = lines.next_line().await {
             let prefixed = format!("{}{}", timestamp_prefix(), line);
             // 主+临时都写; 单流失败不阻塞另一流
+            let _ = append_line(&main_path, &prefixed).await;
+            let _ = append_line(&temp_path, &prefixed).await;
+        }
+    })
+}
+
+/// 同 [`spawn_log_pipe`], 额外把**原始行**(不含时间戳)tee 到 stderr 环形缓冲,
+/// 供启动失败时分类 (借鉴 vite-rs: stderr/stdout 分流, vite 错误走 stderr)。
+pub fn spawn_log_pipe_with_ring<R>(
+    reader: R,
+    main_path: PathBuf,
+    temp_path: PathBuf,
+    ring: std::sync::Arc<super::error_classify::StderrRing>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            // 原始行入环形缓冲 (供错误分类)
+            super::error_classify::ring_push(&ring, &line);
+            // 带时间戳写日志
+            let prefixed = format!("{}{}", timestamp_prefix(), line);
             let _ = append_line(&main_path, &prefixed).await;
             let _ = append_line(&temp_path, &prefixed).await;
         }

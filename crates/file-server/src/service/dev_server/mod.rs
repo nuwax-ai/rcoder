@@ -8,10 +8,12 @@
 //! - 存活轮询超时后仍返回成功 (nuwax 行为)
 //! - keep-alive 被动探活, 无空闲自动停止
 
+pub mod error_classify;
 pub mod log;
 pub mod port_pool;
 pub mod process;
 
+pub use error_classify::{StderrRing, ViteStartupError, STDERR_RING_CAP};
 pub use log::{read_dev_log, ReadDevLogResult};
 pub use port_pool::{PortAllocation, PortPool, PortPoolStatus};
 pub use process::{is_process_running, is_project_alive, kill_process_group, now_ms};
@@ -181,19 +183,28 @@ impl DevServerManager {
         let pid = child
             .id()
             .ok_or_else(|| AppError::system("spawned child has no pid"))?;
-        // 日志管道 (fire-and-forget)
+        // stderr 环形缓冲 (启动期保留末尾若干行, 供早退时结构化错误分类)
+        let stderr_ring: Arc<StderrRing> = Arc::new(Mutex::new(
+            std::collections::VecDeque::with_capacity(STDERR_RING_CAP),
+        ));
+        // 日志管道 (fire-and-forget): stdout 仅写日志; stderr 额外 tee 到 ring (借鉴 vite-rs 分流)
         if let Some(out) = stdout {
             log::spawn_log_pipe(out, main_log.clone(), temp_log.clone());
         }
         if let Some(err) = stderr {
-            log::spawn_log_pipe(err, main_log.clone(), temp_log.clone());
+            log::spawn_log_pipe_with_ring(
+                err,
+                main_log.clone(),
+                temp_log.clone(),
+                stderr_ring.clone(),
+            );
         }
         // 丢弃 Child 句柄 (kill_on_drop=false → 进程独立存活, 靠 pid 杀)
         drop(child);
 
-        // 就绪轮询 (在登记到 map 之前): 进程早退 → 立即判失败 (端口经 AllocGuard 自动释放),
-        // 避免把"启动失败已死的 vite"当成成功 (vite-rs 靠 sleep 2s 掩盖了这个 bug)
-        self.poll_alive(pid, port, base_path).await?;
+        // 就绪轮询 (在登记到 map 之前): 进程早退 → 读 stderr ring 分类成结构化错误;
+        // 端口经 AllocGuard 自动释放。避免把"启动失败已死的 vite"当成成功。
+        self.poll_alive(pid, port, base_path, &stderr_ring).await?;
 
         lock(&self.processes)?.insert(
             project_id.to_string(),
@@ -211,18 +222,23 @@ impl DevServerManager {
         Ok(StartedDev { pid, port })
     }
 
-    /// 就绪轮询: 进程早退 → Err; HTTP 就绪 → Ok; 超时但进程仍在 → Ok (nuwax 宽松)。
-    async fn poll_alive(&self, pid: u32, port: u16, base_path: Option<&str>) -> AppResult<()> {
+    /// 就绪轮询: 进程早退 → Err (读 stderr ring 分类成结构化错误); HTTP 就绪 → Ok;
+    /// 超时但进程仍在 → Ok (nuwax 宽松)。
+    async fn poll_alive(
+        &self,
+        pid: u32,
+        port: u16,
+        base_path: Option<&str>,
+        stderr_ring: &Arc<StderrRing>,
+    ) -> AppResult<()> {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let max = self.config.dev_alive_max_wait_ms;
         let timeout = self.config.dev_alive_check_timeout_ms;
         let mut elapsed = 1000u64;
         while elapsed < max {
-            // 进程已退出 (端口冲突 / 配置错 / 依赖缺失) → 立即失败
+            // 进程已退出 (端口冲突 / 配置错 / 依赖缺失) → 读 stderr 分类成可操作错误
             if !is_process_running(pid) {
-                return Err(AppError::system(format!(
-                    "dev server (pid {pid}) exited during startup — 检查 dev 日志 (端口冲突/配置错误/依赖缺失)"
-                )));
+                return Err(early_exit_err(pid, port, stderr_ring));
             }
             if is_project_alive(port, base_path, timeout).await {
                 return Ok(());
@@ -230,11 +246,9 @@ impl DevServerManager {
             tokio::time::sleep(Duration::from_secs(1)).await;
             elapsed += 1000;
         }
-        // 超时: 进程仍存活但未响应 HTTP → 按 nuwax 宽松返回成功; 若已死则报错
+        // 超时: 进程仍存活但未响应 HTTP → 按 nuwax 宽松返回成功; 若已死则分类报错
         if !is_process_running(pid) {
-            return Err(AppError::system(format!(
-                "dev server (pid {pid}) exited during startup"
-            )));
+            return Err(early_exit_err(pid, port, stderr_ring));
         }
         tracing::warn!(
             "dev server on port {port} (pid {pid}) 未在 {max}ms 内响应 HTTP, 进程仍在 — 返回成功 (nuwax 宽松)"
@@ -357,6 +371,12 @@ impl Drop for AllocGuard<'_> {
 
 fn ldrtemp(ldir: &Path, now: i64) -> PathBuf {
     ldir.join(log::temp_log_name(now))
+}
+
+/// 进程早退时: 收集 stderr ring → 分类成结构化 [`ViteStartupError`] → 转 [`AppError`]。
+fn early_exit_err(pid: u32, port: u16, ring: &Arc<StderrRing>) -> AppError {
+    let lines = error_classify::ring_collect(ring);
+    ViteStartupError::classify(&lines).into_app_error(pid, port)
 }
 
 /// 读 package.json 的 scripts.dev (对齐 nuwax startDevUtils)。
