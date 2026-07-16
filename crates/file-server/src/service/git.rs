@@ -285,3 +285,82 @@ pub fn file_content_at_ref(
         None => Ok(None),
     }
 }
+
+// ── status ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatusResult {
+    pub current: Option<String>,
+    pub staged: Vec<String>,
+    pub modified: Vec<String>,
+    pub created: Vec<String>,
+    pub deleted: Vec<String>,
+    pub untracked: Vec<String>,
+}
+
+/// 工作区状态 (对齐 nuwax status; gix status platform 折叠到 5-bucket)。
+/// IndexWorktree Modification 暂统一归 modified (worktree delete 的细分需 gix_status EntryStatus, 后续精确)。
+pub fn get_status(repo: &gix::Repository) -> AppResult<StatusResult> {
+    let current = repo
+        .head_name()
+        .ok()
+        .flatten()
+        .and_then(|n| shorten_ref(&n.to_string()));
+    let mut r = StatusResult {
+        current,
+        staged: vec![],
+        modified: vec![],
+        created: vec![],
+        deleted: vec![],
+        untracked: vec![],
+    };
+    let mut iter = repo
+        .status(gix::progress::Discard)
+        .map_err(|e| map_git_err(e, "git status"))?
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .into_iter(None)
+        .map_err(|e| map_git_err(e, "git status into_iter"))?;
+    while let Some(item) = iter
+        .next()
+        .transpose()
+        .map_err(|e| map_git_err(e, "git status item"))?
+    {
+        match item {
+            gix::status::Item::TreeIndex(change) => {
+                let (loc, is_add, is_del) = match &change {
+                    gix::diff::index::ChangeRef::Addition { location, .. } => (location, true, false),
+                    gix::diff::index::ChangeRef::Deletion { location, .. } => (location, false, true),
+                    gix::diff::index::ChangeRef::Modification { location, .. } => (location, false, false),
+                    gix::diff::index::ChangeRef::Rewrite { location, .. } => (location, false, false),
+                };
+                let s = loc.to_string();
+                r.staged.push(s.clone());
+                if is_add {
+                    r.created.push(s);
+                } else if is_del {
+                    r.deleted.push(s);
+                }
+            }
+            gix::status::Item::IndexWorktree(change) => match change {
+                gix::status::index_worktree::Item::Modification { rela_path, .. } => {
+                    r.modified.push(rela_path.to_string());
+                }
+                gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
+                    r.untracked.push(entry.rela_path.to_string());
+                }
+                _ => {}
+            },
+        }
+    }
+    for v in [
+        &mut r.staged,
+        &mut r.modified,
+        &mut r.created,
+        &mut r.deleted,
+        &mut r.untracked,
+    ] {
+        v.sort();
+        v.dedup();
+    }
+    Ok(r)
+}

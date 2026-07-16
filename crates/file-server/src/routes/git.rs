@@ -17,6 +17,7 @@ pub fn router() -> Router<AppState> {
         .route("/tags", get(tags))
         .route("/log", get(log_history))
         .route("/file-content", post(file_content))
+        .route("/status", get(status))
 }
 
 #[derive(Deserialize)]
@@ -184,4 +185,36 @@ struct FileContentQuery {
     #[serde(rename = "ref")]
     ref_: Option<String>,
     file_path: String,
+}
+
+/// `GET /api/git/status` (对齐 nuwax status 5-bucket + conflicted/ahead/behind/tracking 固定值)
+async fn status(
+    State(state): State<AppState>,
+    Query(q): Query<GitQuery>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve(&q, &state)?;
+    let result = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::get_status(&repo)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "logId": log_id,
+        "current": result.current,
+        "staged": result.staged,
+        "modified": result.modified,
+        "created": result.created,
+        "deleted": result.deleted,
+        "untracked": result.untracked,
+        "conflicted": [],
+        "ahead": 0,
+        "behind": 0,
+        "tracking": null,
+    })))
 }
