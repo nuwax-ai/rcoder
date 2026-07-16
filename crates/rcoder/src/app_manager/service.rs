@@ -86,13 +86,27 @@ impl AppService {
             );
         }
 
-        Ok(Self {
+        let svc = Self {
             config,
             runtime,
             pingora,
             path_resolver,
             pingora_ports: DashMap::new(),
-        })
+        };
+        // K8s Pingora 模式：启动时从集群重建 Pingora backends——修复 pingora_ports 内存态
+        // 丢失导致的重启 silent 404（list_deployments 的 expose_type 已由 Deployment annotation
+        // 准确还原）。失败不阻塞启动（warn，待下次 create/update 恢复）。
+        if svc.config.access_mode == AppAccessMode::Kubernetes
+            && svc.config.http_expose == HttpExpose::Pingora
+        {
+            if let Err(e) = svc.rebuild_pingora_backends().await {
+                warn!(
+                    "[APP] Pingora backends 重建失败（重启后 HTTP 暂不可达，待下次 create/update 恢复）: {}",
+                    e
+                );
+            }
+        }
+        Ok(svc)
     }
 
     /// 创建应用
@@ -1223,6 +1237,40 @@ impl AppService {
             }
             info!("[APP] Pingora backend 已清理: {} ports={:?}", app_id, ports);
         }
+    }
+
+    /// 启动时重建 Pingora backends（K8s Pingora 模式，修复重启后 pingora_ports 内存态丢失）。
+    /// 从集群列出所有托管 app，按 expose_type（Deployment annotation 还原）重新注册 HTTP 端口的 backend。
+    async fn rebuild_pingora_backends(&self) -> AppResult<()> {
+        let statuses = self
+            .runtime
+            .list_deployments()
+            .await
+            .map_err(|e| map_runtime_error("[APP] rebuild list_deployments 失败", e))?;
+        let mut count = 0;
+        for status in &statuses {
+            let http_ports: Vec<u16> = status
+                .ports
+                .iter()
+                .filter(|p| p.expose_type == RtExposeType::Http)
+                .map(|p| p.port)
+                .collect();
+            if http_ports.is_empty() {
+                continue;
+            }
+            // register 内部按 access_mode 选 host（K8s=svc FQDN）；container_ip 传空（K8s 不用）
+            let registered = self
+                .register_pingora_backends(&status.app_id, &http_ports, "")
+                .await;
+            if !registered.is_empty() {
+                count += 1;
+            }
+        }
+        info!(
+            "[APP] Pingora backends 重建完成: {count} 个 app（集群共 {} 个托管 app）",
+            statuses.len()
+        );
+        Ok(())
     }
 
     /// 获取应用目录（rcoder 视角：workspace_root/app_id）

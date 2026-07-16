@@ -383,6 +383,9 @@ impl KubernetesRuntime {
                 name: Some(self.app_deployment_name(app_id)),
                 namespace: Some(self.namespace.clone()),
                 labels: Some(full_labels.clone()),
+                // 记录每个端口的 expose_type（"port:type,..."），供读路径/重启重建还原——
+                // 不依赖 NodePort，TCP 不对外时也能准确区分 Http/Tcp
+                annotations: encode_port_expose_annotations(params),
                 ..Default::default()
             },
             spec: Some(DeploymentSpec {
@@ -1243,8 +1246,7 @@ impl KubernetesRuntime {
             "Starting".to_string()
         };
 
-        // TCP 端口的 node_port：查 NodePort Service，按 port name 关联（name 与 container port 一致）
-        // 在 NodePort Service 中的端口 = Tcp（external_port = node_port）；不在的 = Http。
+        // TCP 端口的 node_port：查 NodePort Service，按 port name 关联（TCP 对外时用）
         let tcp_nodeports: std::collections::HashMap<String, u16> = self
             .services_api()
             .get(&self.app_nodeport_name(app_id))
@@ -1264,8 +1266,18 @@ impl KubernetesRuntime {
             })
             .unwrap_or_default();
 
-        // 端口状态：从 Deployment spec 的 container ports 推导，
-        // expose_type / external_port 由 NodePort Service 还原（Http 端口经 Gateway，不 per-port 分配）
+        // port → expose_type：优先从 Deployment annotation rcoder.io/port-expose 还原
+        // （create 时写入，TCP 不对外也能准确区分）；缺失（旧 app）回退 NodePort 推导。
+        let port_expose: std::collections::HashMap<u16, ExposeType> = deploy
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(PORT_EXPOSE_ANNOTATION))
+            .map(|s| parse_port_expose(s))
+            .unwrap_or_default();
+
+        // 端口状态：从 Deployment spec 的 container ports 推导；
+        // expose_type 优先用 annotation（准确），回退 NodePort 推导（旧 app 兼容）。
         let ports = spec
             .and_then(|s| s.template.spec.as_ref())
             .and_then(|s| s.containers.first())
@@ -1274,15 +1286,21 @@ impl KubernetesRuntime {
                 ps.iter()
                     .map(|p| {
                         let name = p.name.clone().unwrap_or_default();
-                        let (expose_type, external_port) =
-                            if let Some(np) = tcp_nodeports.get(&name) {
-                                (ExposeType::Tcp, Some(*np))
-                            } else {
-                                (ExposeType::Http, None)
-                            };
+                        let port = p.container_port as u16;
+                        let (expose_type, external_port) = match port_expose.get(&port) {
+                            Some(ExposeType::Tcp) => {
+                                (ExposeType::Tcp, tcp_nodeports.get(&name).copied())
+                            }
+                            Some(ExposeType::Http) => (ExposeType::Http, None),
+                            // 回退：无 annotation（旧 app）—— 在 NodePort Service 里 = Tcp，否则 Http
+                            None => tcp_nodeports.get(&name).map_or(
+                                (ExposeType::Http, None),
+                                |np| (ExposeType::Tcp, Some(*np)),
+                            ),
+                        };
                         AppPortStatus {
                             name,
-                            port: p.container_port as u16,
+                            port,
                             expose_type,
                             external_port,
                         }
@@ -1372,6 +1390,54 @@ fn container_error_message(cs: &k8s_openapi::api::core::v1::ContainerStatus) -> 
         ));
     }
     None
+}
+
+/// Deployment annotation key：记录每个端口的 expose_type（"port:type,..."），
+/// 供读路径/重启重建还原（不依赖 NodePort，TCP 不对外时也能准确区分 Http/Tcp）。
+#[cfg(feature = "kubernetes")]
+const PORT_EXPOSE_ANNOTATION: &str = "rcoder.io/port-expose";
+
+/// ports → annotation（`rcoder.io/port-expose: "80:http,5432:tcp"`）；无端口返 None。
+#[cfg(feature = "kubernetes")]
+fn encode_port_expose_annotations(
+    params: &ContainerCreateParams,
+) -> Option<BTreeMap<String, String>> {
+    let ports = params.ports.as_ref()?;
+    if ports.is_empty() {
+        return None;
+    }
+    let val = ports
+        .iter()
+        .map(|p| format!("{}:{}", p.port, expose_type_str(&p.expose_type)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut m = BTreeMap::new();
+    m.insert(PORT_EXPOSE_ANNOTATION.to_string(), val);
+    Some(m)
+}
+
+/// 解析 "port:type,..." → port→expose_type 映射（容错：非法条目跳过）。
+#[cfg(feature = "kubernetes")]
+fn parse_port_expose(s: &str) -> std::collections::HashMap<u16, ExposeType> {
+    s.split(',')
+        .filter_map(|entry| {
+            let mut it = entry.split(':');
+            let port: u16 = it.next()?.trim().parse().ok()?;
+            let et = match it.next()?.trim() {
+                "tcp" => ExposeType::Tcp,
+                _ => ExposeType::Http,
+            };
+            Some((port, et))
+        })
+        .collect()
+}
+
+#[cfg(feature = "kubernetes")]
+fn expose_type_str(e: &ExposeType) -> &'static str {
+    match e {
+        ExposeType::Http => "http",
+        ExposeType::Tcp => "tcp",
+    }
 }
 
 /// 计算 env+secrets 内容的 hash，注入 pod template annotation。
