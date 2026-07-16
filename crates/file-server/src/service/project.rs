@@ -186,3 +186,101 @@ async fn project_dir_nonempty(p: &Path) -> bool {
         Err(_) => false,
     }
 }
+
+// ── upload-project (zip 解压覆盖) ───────────────────────────────────────────────
+
+pub struct UploadProjectResult {
+    pub project_id: String,
+    pub code_version: String,
+}
+
+/// 上传项目 zip: 存到 version zip + 清空项目目录 + 解压覆盖 (对齐 nuwax uploadProject, 简化)。
+pub async fn upload_project(
+    resolver: &dyn WorkspaceResolver,
+    config: &Config,
+    ctx: &ProjectContext,
+    code_version: &str,
+    zip_data: Vec<u8>,
+) -> AppResult<UploadProjectResult> {
+    let project_id = ctx.project_id.trim();
+    if project_id.is_empty() {
+        return Err(AppError::validation("Project ID cannot be empty"));
+    }
+    if code_version.trim().is_empty() {
+        return Err(AppError::validation("Code version cannot be empty"));
+    }
+    let version = crate::service::version::parse_version(code_version)?;
+    let project_path = resolver.resolve_project(ctx);
+
+    // 存上传 zip 到版本 zip
+    let zip_path = crate::service::version::version_zip_path(config, project_id, version);
+    if let Some(parent) = zip_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(&zip_path, &zip_data).await?;
+
+    // 清空项目目录 + 解压覆盖
+    let _ = fs::remove_dir_all(&project_path).await;
+    fs::create_dir_all(&project_path).await?;
+    crate::service::zip::extract_to(zip_path, project_path.clone()).await?;
+
+    Ok(UploadProjectResult {
+        project_id: project_id.to_string(),
+        code_version: code_version.to_string(),
+    })
+}
+
+// ── export-project (zip 文件流) ─────────────────────────────────────────────────
+
+/// 导出项目 zip: exportType=LATEST 或 zip 不存在时重打; 可选写 cpage_config.json (打包后删)。
+/// 返回 zip 路径, 由 handler 流式响应。
+pub async fn export_project(
+    resolver: &dyn WorkspaceResolver,
+    config: &Config,
+    ctx: &ProjectContext,
+    code_version: &str,
+    export_type: Option<&str>,
+    cpage_config: Option<&serde_json::Value>,
+) -> AppResult<std::path::PathBuf> {
+    let project_id = ctx.project_id.trim();
+    if project_id.is_empty() {
+        return Err(AppError::validation("Project ID cannot be empty"));
+    }
+    let version = crate::service::version::parse_version(code_version)?;
+    let project_path = resolver.resolve_project(ctx);
+    if !fs::try_exists(&project_path).await.unwrap_or(false) {
+        return Err(AppError::resource("Project does not exist"));
+    }
+    let zip_path = crate::service::version::version_zip_path(config, project_id, version);
+    // 可选写 cpage_config.json (打包后删除)
+    let config_path = project_path.join("cpage_config.json");
+    let config_written = if let Some(cfg) = cpage_config {
+        fs::write(&config_path, serde_json::to_vec(cfg).unwrap_or_default())
+            .await
+            .ok()
+            .map(|_| config_path.clone())
+    } else {
+        None
+    };
+    let need_repack = export_type == Some("LATEST")
+        || !fs::try_exists(&zip_path).await.unwrap_or(false);
+    let repack_result = if need_repack {
+        crate::service::zip::pack_dir(
+            project_path.clone(),
+            zip_path.clone(),
+            config.traverse_exclude_dirs.clone(),
+            config.backup_traverse_exclude_files.clone(),
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    if let Some(p) = &config_written {
+        let _ = fs::remove_file(p).await;
+    }
+    repack_result?;
+    if !fs::try_exists(&zip_path).await.unwrap_or(false) {
+        return Err(AppError::system("Exported zip file does not exist"));
+    }
+    Ok(zip_path)
+}

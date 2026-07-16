@@ -53,6 +53,17 @@ pub async fn get_project_content(
     })
 }
 
+/// 纯遍历 (不 filter cpage_config / 不 detect framework), 供 get-by-version 复用。
+pub async fn list_files(
+    root: &Path,
+    config: &Config,
+    proxy_path: Option<&str>,
+) -> AppResult<Vec<FileEntry>> {
+    let mut files = Vec::new();
+    traverse(root, root, config, proxy_path, &mut files).await?;
+    Ok(files)
+}
+
 async fn traverse(
     root: &Path,
     dir: &Path,

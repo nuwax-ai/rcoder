@@ -56,3 +56,6 @@ base64 = { workspace = true }
 
 # Zip 解压/打包 (模板/upload/export/skills)
 zip = { workspace = true }
+
+# HTTP client (push-skills url fetch)
+reqwest = { workspace = true }
