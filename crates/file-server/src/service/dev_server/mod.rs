@@ -147,24 +147,26 @@ impl DevServerManager {
         let main_log = ldir.join(log::main_log_name());
         let temp_log = ldrtemp(&ldir, now);
 
-        // 命令: override env 优先 (测试/调试用), 否则从 package.json 读 dev script
-        let (cmd, env_extra) = match std::env::var("DEV_SERVER_OVERRIDE_CMD") {
-            Ok(ovr) if !ovr.trim().is_empty() => (
-                ovr.replace("{PORT}", &port.to_string())
-                    .replace("{BASE}", base_path.unwrap_or("/").trim_end_matches('/')),
-                Vec::new(),
-            ),
-            _ => {
+        // 命令: override env (运维控制, 非用户输入 → sh -c 安全) 优先;
+        // 否则从 package.json 读 dev script → arg 数组 (用户输入经此路径, 避免注入)
+        let ovr = std::env::var("DEV_SERVER_OVERRIDE_CMD")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let (child, stdout, stderr) = match ovr {
+            Some(ovr) => {
+                let cmd = ovr
+                    .replace("{PORT}", &port.to_string())
+                    .replace("{BASE}", base_path.unwrap_or("/").trim_end_matches('/'));
+                process::spawn_override_shell(&cmd, project_path)?
+            }
+            None => {
                 let dev_script = read_dev_script(project_path)?;
                 self.write_npmrc(project_path).await?;
                 // node_modules 缺失则 install (失败不阻塞, 与 nuwax 宽松一致)
                 if !project_path.join("node_modules").exists() {
-                    let install_cmd = format!(
-                        "cd '{}' && pnpm install --prefer-offline",
-                        project_path.display()
-                    );
                     let _ = process::run_command_to_log(
-                        &install_cmd,
+                        "pnpm",
+                        &["install", "--prefer-offline"],
                         project_path,
                         &main_log,
                         &temp_log,
@@ -172,11 +174,10 @@ impl DevServerManager {
                     )
                     .await;
                 }
-                process::build_dev_command(&dev_script, port, base_path)?
+                let dev_args = process::build_dev_args(&dev_script, port, base_path)?;
+                process::spawn_dev(dev_args.program, &dev_args.args, project_path, &dev_args.env_extra)?
             }
         };
-
-        let (child, stdout, stderr) = process::spawn_dev(&cmd, project_path, &env_extra)?;
         let pid = child
             .id()
             .ok_or_else(|| AppError::system("spawned child has no pid"))?;
@@ -350,34 +351,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_cmd_vite_with_base() {
-        let (cmd, env) = build_dev_command_test("vite", 4001, Some("foo")).unwrap();
-        assert!(cmd.contains("exec npx vite"));
-        assert!(cmd.contains("--port 4001"));
-        assert!(cmd.contains("--strictPort"));
-        assert!(cmd.contains("--host 0.0.0.0"));
-        assert!(cmd.contains("--base /foo/"));
-        assert!(env.is_empty());
+    fn build_args_vite_with_base() {
+        let d = build_args_test("vite", 4001, Some("foo")).unwrap();
+        assert_eq!(d.program, "npx");
+        assert!(d.args.iter().any(|a| a == "vite"));
+        assert!(d.args.iter().any(|a| a == "4001"));
+        assert!(d.args.iter().any(|a| a == "--strictPort"));
+        assert!(d.args.iter().any(|a| a == "0.0.0.0"));
+        assert!(d.args.iter().any(|a| a == "--base"));
+        assert!(d.args.iter().any(|a| a == "/foo/"));
+        assert!(d.env_extra.is_empty());
     }
 
     #[test]
-    fn build_cmd_next_sets_base_env() {
-        let (cmd, env) = build_dev_command_test("next dev", 4002, Some("bar")).unwrap();
-        assert!(cmd.contains("next dev -p 4002"));
-        assert!(env.iter().any(|(k, v)| k == "BASE_PATH" && v == "/bar/"));
+    fn build_args_next_sets_base_env() {
+        let d = build_args_test("next dev", 4002, Some("bar")).unwrap();
+        assert_eq!(d.program, "npx");
+        assert!(d.args.iter().any(|a| a == "next"));
+        assert!(d.args.iter().any(|a| a == "4002"));
+        assert!(d
+            .env_extra
+            .iter()
+            .any(|(k, v)| k == "BASE_PATH" && v == "/bar/"));
     }
 
     #[test]
-    fn build_cmd_rejects_unsupported() {
-        assert!(build_dev_command_test("webpack serve", 4003, None).is_err());
+    fn build_args_rejects_unsupported() {
+        assert!(build_args_test("webpack serve", 4003, None).is_err());
     }
 
-    // 直接调 process::build_dev_command (避免命名冲突)
-    fn build_dev_command_test(
+    fn build_args_test(
         script: &str,
         port: u16,
         base: Option<&str>,
-    ) -> AppResult<(String, Vec<(String, String)>)> {
-        process::build_dev_command(script, port, base)
+    ) -> AppResult<process::DevArgs> {
+        process::build_dev_args(script, port, base)
     }
 }

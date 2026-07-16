@@ -1,5 +1,6 @@
 //! 业务服务层。
 
+pub mod build_error;
 pub mod code;
 pub mod dev_server;
 pub mod fs_util;

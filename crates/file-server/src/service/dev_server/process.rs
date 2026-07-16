@@ -16,34 +16,54 @@ use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 use crate::error::{AppError, AppResult};
 
-/// 构造 dev server 启动命令 (vite/next) + 额外 env (对齐 nuwax ExtraArgsUtils)。
-/// 返回 (full_command, env_extra)。
-pub fn build_dev_command(
+/// dev server 启动参数 (program + args + env_extra)。
+pub struct DevArgs {
+    pub program: &'static str,
+    pub args: Vec<String>,
+    pub env_extra: Vec<(String, String)>,
+}
+
+/// 构造 dev server 启动参数 (vite/next)。用 arg 数组而非 shell 字符串拼接, 避免注入
+/// (base_path 来自用户, 经 sh -c 拼接会注入)。
+pub fn build_dev_args(
     dev_script: &str,
     port: u16,
     base_path: Option<&str>,
-) -> AppResult<(String, Vec<(String, String)>)> {
+) -> AppResult<DevArgs> {
     let lower = dev_script.to_ascii_lowercase();
     let base = base_path.map(normalize_base_path);
     let mut env_extra: Vec<(String, String)> = Vec::new();
-    let cmd = if lower.contains("vite") {
-        let mut c = format!("exec npx vite --port {port} --strictPort --host 0.0.0.0");
+    let port_str = port.to_string();
+    let args: Vec<String> = if lower.contains("vite") {
+        let mut a = vec![
+            "vite".into(),
+            "--port".into(),
+            port_str,
+            "--strictPort".into(),
+            "--host".into(),
+            "0.0.0.0".into(),
+        ];
         if let Some(b) = &base {
-            c.push_str(&format!(" --base {b}"));
+            a.push("--base".into());
+            a.push(b.clone());
         }
-        c
+        a
     } else if lower.contains("next") {
         if let Some(b) = &base {
             env_extra.push(("NEXT_PUBLIC_BASE_PATH".into(), b.clone()));
             env_extra.push(("BASE_PATH".into(), b.clone()));
         }
-        format!("exec npx next dev -p {port}")
+        vec!["next".into(), "dev".into(), "-p".into(), port_str]
     } else {
         return Err(AppError::business(format!(
             "unsupported dev script (must contain vite or next): {dev_script}"
         )));
     };
-    Ok((cmd, env_extra))
+    Ok(DevArgs {
+        program: "npx",
+        args,
+        env_extra,
+    })
 }
 
 /// 规范化 basePath 为 `/x/` 形式 (对齐 nuwax)。
@@ -81,22 +101,48 @@ fn minimal_env(extra: &[(String, String)]) -> Vec<(String, String)> {
     env
 }
 
-/// spawn detached dev server (sh -c "exec ...")。
-/// 返回 (child, stdout, stderr); 调用方负责取走 stdout/stderr 起日志管道。
-pub fn spawn_dev(
+/// spawn detached dev server (运维专用 override, sh -c 整条命令)。
+/// 仅 `DEV_SERVER_OVERRIDE_CMD` (部署时运维设置, 非外部用户输入) 走此路径,
+/// 故 shell 拼接无注入风险。用户输入路径必须走 [`spawn_dev`] (arg 数组)。
+pub fn spawn_override_shell(
     full_command: &str,
     cwd: &Path,
-    env_extra: &[(String, String)],
 ) -> AppResult<(Child, Option<ChildStdout>, Option<ChildStderr>)> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(full_command);
+    cmd.current_dir(cwd);
+    cmd.env_clear();
+    cmd.envs(minimal_env(&[]));
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError::system(format!("spawn override dev server failed: {e}")))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    Ok((child, stdout, stderr))
+}
+
+/// spawn detached dev server (arg 数组, 无 shell; 进程组 + 丢弃 Child 句柄)。
+/// 返回 (child, stdout, stderr); 调用方负责取走 stdout/stderr 起日志管道。
+pub fn spawn_dev(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env_extra: &[(String, String)],
+) -> AppResult<(Child, Option<ChildStdout>, Option<ChildStderr>)> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
     cmd.current_dir(cwd);
     cmd.env_clear();
     cmd.envs(minimal_env(env_extra));
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    // 新进程组 (unix): child.pid == pgid, 后续 kill(-pid) 杀整组
+    // 新进程组 (unix): child.pid == pgid, 后续 kill(-pid) 杀整组 (含 vite 子进程)
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd
@@ -107,16 +153,18 @@ pub fn spawn_dev(
     Ok((child, stdout, stderr))
 }
 
-/// 运行一次性命令 (install/preprocess), stdout/stderr 管道到日志, 阻塞等待。
+/// 运行一次性命令 (install/build/preprocess), arg 数组 + stdout/stderr 管道到日志, 阻塞等待。
+/// 用 current_dir 替代 `cd ... &&`, arg 数组替代 shell 拼接; 错误为类型化 io::Error/退出码。
 pub async fn run_command_to_log(
-    full_command: &str,
+    program: &str,
+    args: &[&str],
     cwd: &Path,
     main_log: &Path,
     temp_log: &Path,
     timeout_secs: u64,
 ) -> AppResult<()> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(full_command);
+    let mut cmd = Command::new(program);
+    cmd.args(args);
     cmd.current_dir(cwd);
     // install 继承当前 env (pnpm store 等), 仅删 CI/NPM_CONFIG_PRODUCTION
     if let Ok(p) = std::env::var("PATH") {

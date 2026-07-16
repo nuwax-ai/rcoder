@@ -24,6 +24,8 @@ pub fn router() -> Router<AppState> {
         .route("/keep-alive", get(keep_alive))
         .route("/port-pool-status", get(port_pool_status))
         .route("/get-dev-log", get(get_dev_log))
+        .route("/build", get(build_project))
+        .route("/parse-build-error", axum::routing::post(parse_build_error))
 }
 
 #[derive(Deserialize)]
@@ -210,4 +212,125 @@ async fn get_dev_log(
         "startIndex": result.start_index,
         "logFileName": result.log_file_name,
     })))
+}
+
+/// `GET /api/build/build` (对齐 nuwax buildProject): install + build + 拷贝 dist。
+async fn build_project(
+    State(state): State<AppState>,
+    Query(q): Query<BuildQuery>,
+) -> Result<Json<Value>, AppError> {
+    let path = project_path(&state, &q);
+    if !path.exists() {
+        return Err(AppError::resource("project does not exist"));
+    }
+    let log_dir = crate::service::dev_server::log::log_dir(&state.config, &q.project_id);
+    tokio::fs::create_dir_all(&log_dir)
+        .await
+        .map_err(|e| AppError::system(format!("create build log dir: {e}")))?;
+    let now = crate::service::dev_server::now_ms();
+    let main_log = log_dir.join(crate::service::dev_server::log::main_log_name());
+    let temp_log = log_dir.join(crate::service::dev_server::log::temp_log_name(now));
+    let timeout = state.config.dev_command_timeout_secs;
+
+    // 读 scripts.build
+    let pkg_content = tokio::fs::read_to_string(path.join("package.json"))
+        .await
+        .map_err(|e| AppError::business(format!("read package.json: {e}")))?;
+    let pkg: Value = serde_json::from_str(&pkg_content)
+        .map_err(|e| AppError::business(format!("parse package.json: {e}")))?;
+    let build_script = pkg
+        .get("scripts")
+        .and_then(|s| s.get("build"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("vite build");
+    let base = q.base_path.as_deref().unwrap_or("/");
+
+    // install (arg 数组, 无 shell 拼接; 失败继续, 与 nuwax 宽松一致)
+    let _ = crate::service::dev_server::process::run_command_to_log(
+        "pnpm",
+        &["install", "--prefer-offline"],
+        &path,
+        &main_log,
+        &temp_log,
+        timeout,
+    )
+    .await;
+    // build (vite: pnpm exec vite build --base X; 否则 pnpm run build)
+    let build_args: Vec<&str> = if build_script.to_ascii_lowercase().contains("vite") {
+        vec!["exec", "vite", "build", "--base", base, "--debug", "--debug"]
+    } else {
+        vec!["run", "build"]
+    };
+    crate::service::dev_server::process::run_command_to_log(
+        "pnpm",
+        &build_args,
+        &path,
+        &main_log,
+        &temp_log,
+        timeout,
+    )
+    .await?;
+
+    // 拷贝 dist → {DIST_TARGET_DIR}/{projectId}/dist/ (Rust fs, 无 rm -rf shell;
+    // 错误为类型化 io::Error, 路径经 PathBuf::join 无注入)
+    let dst = state.config.dist_target_dir.join(&q.project_id).join("dist");
+    let src = path.join("dist");
+    if !src.exists() {
+        return Err(AppError::business("build produced no dist directory"));
+    }
+    let src2 = src.clone();
+    let dst2 = dst.clone();
+    tokio::task::spawn_blocking(move || copy_dir_all(&src2, &dst2))
+        .await
+        .map_err(|e| AppError::system(format!("copy dist join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Build completed",
+        "projectId": q.project_id,
+    })))
+}
+
+/// 递归拷贝目录 (替代 `rm -rf && cp -R`); 目标存在则先清空, 保留 symlink。
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> Result<(), AppError> {
+    use std::fs;
+    if dst.exists() {
+        fs::remove_dir_all(dst)
+            .map_err(|e| AppError::system(format!("remove old dist {}: {e}", dst.display())))?;
+    }
+    fs::create_dir_all(dst)
+        .map_err(|e| AppError::system(format!("create dist {}: {e}", dst.display())))?;
+    for entry in fs::read_dir(src)
+        .map_err(|e| AppError::system(format!("read dist {}: {e}", src.display())))?
+    {
+        let entry = entry.map_err(|e| AppError::system(format!("read dir entry: {e}")))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| AppError::system(format!("file type: {e}")))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)
+                .map_err(|e| AppError::system(format!("copy {}: {e}", from.display())))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ParseErrorBody {
+    #[allow(dead_code)]
+    project_id: Option<String>,
+    error_message: String,
+}
+
+/// `POST /api/build/parse-build-error` (对齐 nuwax BuildErrorParser)。
+async fn parse_build_error(
+    State(_state): State<AppState>,
+    Json(body): Json<ParseErrorBody>,
+) -> Result<Json<Value>, AppError> {
+    let msg = crate::service::build_error::parse(&body.error_message);
+    Ok(Json(json!({ "success": true, "message": msg })))
 }
