@@ -5,9 +5,10 @@
 //! - 读操作（get/query/list）实时查集群，返回 [`AppRuntimeInfo`]；
 //! - 业务元数据（name/image/command/env 等）由调用方（Java）持久化，rcoder 不存。
 //!
-//! K8s 模式下 `create_deployment` 一并创建 ConfigMap/Secret/Service/HTTPRoute/NodePort；
-//! Docker 模式下 `create_deployment` 创建容器并加入主网络，本服务额外为 HTTP 端口注册
-//! Pingora backend（`/proxy/{port}` → container_ip），TCP 端口由 runtime 做 port_bindings。
+//! K8s 模式 `create_deployment` 创建 ConfigMap/Secret/ClusterIP Service/Deployment；
+//! HTTP 入口按 `http_expose`：Pingora（默认，两后端统一，本服务注册 Pingora backend
+//! `/proxy/{port}` → 后端 host：Docker container_ip / K8s ClusterIP FQDN）或 Gateway
+//! （可选，K8s 建 HTTPRoute `/apps/{id}`）。TCP 初期不对外。Docker 模式建容器入主网络。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use uuid::Uuid;
 use container_runtime_api::{
     AppHealthCheck, AppPortSpec, AppResourceRequirements, ContainerCreateParams, ContainerRuntime,
     ContainerRuntimeError, DeploymentStatus, ExposeType as RtExposeType,
-    HealthCheckType as RtHealthCheckType,
+    HealthCheckType as RtHealthCheckType, HttpExpose,
 };
 use rcoder_proxy::PingoraProxyService;
 use shared_types::ServiceType;
@@ -76,6 +77,15 @@ impl AppService {
             }
         }
 
+        // 无效组合告警（Fail Fast）：Docker 无 HTTPRoute/gateway 概念，gateway 模式不可用。
+        // 不阻塞启动（便于临时切回 pingora），但 HTTP 将不可访问。
+        if config.access_mode == AppAccessMode::Docker && config.http_expose == HttpExpose::Gateway
+        {
+            warn!(
+                "[APP] 无效组合 access_mode=docker + http_expose=gateway：Docker 无 HTTPRoute，gateway 模式不可用，HTTP 将不可访问；请设 RCODER_APP_HTTP_EXPOSE=pingora"
+            );
+        }
+
         Ok(Self {
             config,
             runtime,
@@ -109,6 +119,18 @@ impl AppService {
                     ))
                 })?;
             }
+        }
+
+        // 0.5 校验端口：HTTP 端口 ≤ 1（access 只报单个 path；gateway 模式 HTTPRoute 也仅支持单 HTTP 端口）
+        let http_port_count = request
+            .ports
+            .as_ref()
+            .map(|ps| ps.iter().filter(|p| p.expose_type == ExposeType::Http).count())
+            .unwrap_or(0);
+        if http_port_count > 1 {
+            return Err(AppOperationError::Validation(format!(
+                "最多支持 1 个 HTTP 端口（当前 {http_port_count} 个）；多 HTTP 端口待 access 支持 list"
+            )));
         }
 
         // 1. 创建应用工作空间目录（code/data/logs）
@@ -1039,11 +1061,14 @@ impl AppService {
     fn build_runtime_info(&self, status: DeploymentStatus) -> AppRuntimeInfo {
         let conditions = derive_conditions(&status);
 
-        // Docker 模式：runtime ports 只含 TCP（get_deployment_status 仅读 port_bindings，
-        // HTTP 端口无 binding 故丢失）。从 pingora_ports 补全 HTTP 端口，保证 get 路径
-        // 的 ports 字段与 access 与 create 路径一致（K8s 模式 status.ports 已含 HTTP，
-        // 无需补）。pingora_ports 是内存态，rcoder 重启后丢失（已知限制，HTTP 路由同丢）。
-        let ports = if self.config.access_mode == AppAccessMode::Docker {
+        // Pingora 模式（不论 Docker/K8s）：runtime status 只含 TCP（HTTP 端口无 binding），
+        // 从 pingora_ports 补全 HTTP 端口，保证 get 路径的 ports/access 与 create 一致。
+        // Gateway 模式：K8s status.ports 已含 HTTP（HTTPRoute backendRef），无需补。
+        // ⚠️ 重启风险（pingora_ports 内存态丢失，已知限制）：
+        //   - Docker：HTTP 端口补不出 → access.external.http = null（Java 可感知降级）
+        //   - K8s Pingora：status.ports（containerPort）仍含 HTTP → access 返有效 /proxy/{port}，
+        //     但 Pingora backend 未重注册 → 访问 404（静默坏路径）。根治：启动从 containerPorts 重建 backends（TODO）
+        let ports = if self.config.http_expose == HttpExpose::Pingora {
             let mut merged = status.ports.clone();
             if let Some(http_list) = self.pingora_ports.get(&status.app_id) {
                 let http_ports: Vec<u16> = http_list.value().clone();
@@ -1083,64 +1108,30 @@ impl AppService {
         }
     }
 
-    /// 构建访问信息（按 access_mode 分支）
+    /// 构建访问信息（按 `http_expose` 决定 HTTP path；一律只返 path，host 由 Java 拼）
     fn build_access_info(&self, app_id: &str, ports: &[AppPortStatus]) -> AccessInfo {
         let http_port = ports.iter().find(|p| p.expose_type == RtExposeType::Http);
 
-        // K8s 模式：rcoder 在 Pod 内不知 Gateway 的外部入口（LB/NodePort），故只返回
-        // HTTPRoute path（/apps/{app_id}）+ TCP 的 NodePort 数字，外部完整 URL 由调用方
-        // （Java）用自己知道的入口拼。Docker 模式：Pingora /proxy + external_host（开发环境）。
-        let (http_url, tcp_ports, domain, short_domain) = match self.config.access_mode {
+        // 一律只返 path，host 由 Java 拼（Java 必然已知 RCoder / gateway 入口，否则访问不了）：
+        // - Pingora 模式（默认，两后端统一）：/proxy/{port}
+        // - Gateway 模式（K8s 可选）：/apps/{app_id}
+        // TCP 初期不对外（external.tcp 空）；internal 始终给 ClusterIP FQDN / 容器名。
+        let http_url = match self.config.http_expose {
+            HttpExpose::Pingora => http_port.map(|p| format!("/proxy/{}", p.port)),
+            HttpExpose::Gateway => http_port.map(|_| format!("/apps/{}", app_id)),
+        };
+
+        // internal domain：K8s = ClusterIP Service FQDN；Docker = 容器名（= 资源名）
+        let (domain, short_domain) = match self.config.access_mode {
             AppAccessMode::Docker => {
-                let http = http_port.map(|p| {
-                    format!(
-                        "http://{}:{}/proxy/{}",
-                        self.config.get_external_host(),
-                        self.config.get_pingora_listen_port(),
-                        p.port
-                    )
-                });
-                let tcp_ports: Vec<TcpPortMapping> = ports
-                    .iter()
-                    .filter(|p| p.expose_type == RtExposeType::Tcp)
-                    .map(|p| {
-                        let ext = p.external_port.unwrap_or(0);
-                        TcpPortMapping {
-                            name: p.name.clone(),
-                            node_port: ext,
-                            access_url: format!(
-                                "tcp://{}:{}",
-                                self.config.get_external_host(),
-                                ext
-                            ),
-                        }
-                    })
-                    .collect();
                 let name = format!("{}-{}", ServiceType::UserApp.container_prefix(), app_id);
-                (http, tcp_ports, name.clone(), name)
+                (name.clone(), name)
             }
             AppAccessMode::Kubernetes => {
-                let http = http_port.map(|_| format!("/apps/{}", app_id));
-                let tcp_ports: Vec<TcpPortMapping> = ports
-                    .iter()
-                    .filter(|p| p.expose_type == RtExposeType::Tcp)
-                    .map(|p| {
-                        let ext = p.external_port.unwrap_or(0);
-                        TcpPortMapping {
-                            name: p.name.clone(),
-                            node_port: ext,
-                            // host 由调用方拼（rcoder 不知外部入口）；node_port 为真实 NodePort
-                            access_url: format!("tcp://<gateway>:{ext}"),
-                        }
-                    })
-                    .collect();
                 let cluster_domain = shared_types::get_k8s_cluster_domain();
                 let svc = format!("{}-{}-svc", ServiceType::UserApp.container_prefix(), app_id);
-                let fqdn = format!("{}.{}.svc.{}", svc, self.config.namespace, cluster_domain);
                 (
-                    http,
-                    tcp_ports,
-                    fqdn,
+                    format!("{}.{}.svc.{}", svc, self.config.namespace, cluster_domain),
                     format!("{}.{}", svc, self.config.namespace),
                 )
             }
@@ -1149,7 +1140,7 @@ impl AppService {
         AccessInfo {
             external: ExternalAccess {
                 http: http_url,
-                tcp: tcp_ports,
+                tcp: vec![], // TCP 初期不对外
             },
             internal: InternalAccess {
                 domain,
@@ -1165,45 +1156,62 @@ impl AppService {
         }
     }
 
-    /// Docker 模式：为 HTTP 端口注册 Pingora backend，返回注册的端口列表
+    /// 为 HTTP 端口注册 Pingora backend（Pingora 模式，Docker/K8s 统一）。
+    /// backend host 按后端：Docker=container_ip，K8s=ClusterIP Service FQDN（Pod 内 kube-dns 解析）。
+    /// Gateway 模式不注册（HTTP 走 HTTPRoute）。
     async fn register_pingora_backends(
         &self,
         app_id: &str,
         http_ports: &[u16],
         container_ip: &str,
     ) -> Vec<u16> {
-        // K8s 模式 HTTP 走 Gateway（HTTPRoute），不经 Pingora /proxy——跳过注册
-        if self.config.access_mode != AppAccessMode::Docker {
+        // Gateway 模式 HTTP 走 HTTPRoute，不经 Pingora——跳过
+        if self.config.http_expose == HttpExpose::Gateway {
             return vec![];
         }
         let Some(pingora) = &self.pingora else {
             return vec![];
         };
-        if container_ip.is_empty() {
-            warn!(
-                "[APP] Docker 模式 container_ip 为空，跳过 Pingora backend 注册: {}",
-                app_id
-            );
-            return vec![];
-        }
+        // backend host：Docker 用 container_ip；K8s 用 ClusterIP Service FQDN（container_ip 为空）
+        let backend_host = match self.config.access_mode {
+            AppAccessMode::Docker => {
+                if container_ip.is_empty() {
+                    warn!(
+                        "[APP] Docker 模式 container_ip 为空，跳过 Pingora backend 注册: {}",
+                        app_id
+                    );
+                    return vec![];
+                }
+                container_ip.to_string()
+            }
+            AppAccessMode::Kubernetes => {
+                let cluster_domain = shared_types::get_k8s_cluster_domain();
+                format!(
+                    "{}-{}-svc.{}.svc.{}",
+                    ServiceType::UserApp.container_prefix(),
+                    app_id,
+                    self.config.namespace,
+                    cluster_domain
+                )
+            }
+        };
         for port in http_ports {
-            pingora.add_backend(*port, container_ip.to_string()).await;
+            pingora.add_backend(*port, backend_host.clone()).await;
         }
         if !http_ports.is_empty() {
             self.pingora_ports
                 .insert(app_id.to_string(), http_ports.to_vec());
             info!(
                 "[APP] Pingora backend 已注册: {} ports={:?} -> {}",
-                app_id, http_ports, container_ip
+                app_id, http_ports, backend_host
             );
         }
         http_ports.to_vec()
     }
 
-    /// Docker 模式：清理 app 曾注册的 Pingora backend
+    /// 清理 app 曾注册的 Pingora backend（Pingora 模式）。Gateway 模式未注册过，直接返回。
     async fn unregister_pingora_backends(&self, app_id: &str) {
-        // K8s 模式未注册过 Pingora backend，跳过
-        if self.config.access_mode != AppAccessMode::Docker {
+        if self.config.http_expose == HttpExpose::Gateway {
             return;
         }
         let Some(pingora) = &self.pingora else {

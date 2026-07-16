@@ -10,8 +10,8 @@ use chrono::Utc;
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
     ContainerCreateParams, ContainerLogEntry, ContainerRuntime, ContainerRuntimeError,
-    ContainerRuntimeResult, ContainerRuntimeStatus, DeploymentStatus, RemovedContainerInfo,
-    RuntimeContainerInfo,
+    ContainerRuntimeResult, ContainerRuntimeStatus, DeploymentStatus, HttpExpose,
+    RemovedContainerInfo, RuntimeContainerInfo,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
@@ -631,6 +631,31 @@ impl KubernetesRuntime {
             ),
         })
     }
+}
+
+/// 读取 app 暴露相关 env 配置（create/patch 共用，DRY）：
+/// gateway_name/gateway_namespace env 注入优先（兜底 nuwax-gateway/default），
+/// http_expose 从 RCODER_APP_HTTP_EXPOSE 读取（默认 pingora；无效值 warn 回退，Fail Fast）。
+/// 与 app_manager::config 同源，保证 service 层与 K8s 后端一致。
+#[cfg(feature = "kubernetes")]
+fn read_app_expose_env() -> (Option<String>, Option<String>, HttpExpose) {
+    let gateway_name = std::env::var("RCODER_K8S_GATEWAY_NAME")
+        .ok()
+        .or_else(|| Some("nuwax-gateway".to_string()));
+    let gateway_namespace = std::env::var("RCODER_K8S_GATEWAY_NAMESPACE")
+        .ok()
+        .or_else(|| Some("default".to_string()));
+    let http_expose = match std::env::var("RCODER_APP_HTTP_EXPOSE").ok().as_deref() {
+        Some("gateway") => HttpExpose::Gateway,
+        Some("pingora") | None => HttpExpose::Pingora,
+        Some(other) => {
+            tracing::warn!(
+                "未识别的 RCODER_APP_HTTP_EXPOSE={other:?}，回退 pingora（合法值: pingora|gateway）"
+            );
+            HttpExpose::Pingora
+        }
+    };
+    (gateway_name, gateway_namespace, http_expose)
 }
 
 #[cfg(feature = "kubernetes")]
@@ -1667,17 +1692,13 @@ impl ContainerRuntime for KubernetesRuntime {
         })?;
         // Gateway 配置：env 注入优先，未注入则用默认（nuwax-gateway / default，匹配部署现状），
         // 避免部署侧未配 env 时静默跳过 HTTPRoute 创建。
-        let gateway_name = std::env::var("RCODER_K8S_GATEWAY_NAME")
-            .ok()
-            .or_else(|| Some("nuwax-gateway".to_string()));
-        let gateway_namespace = std::env::var("RCODER_K8S_GATEWAY_NAMESPACE")
-            .ok()
-            .or_else(|| Some("default".to_string()));
+        let (gateway_name, gateway_namespace, http_expose) = read_app_expose_env();
         self.create_app_resources(
             &app_id,
             &params,
             gateway_name.as_deref(),
             gateway_namespace.as_deref(),
+            http_expose,
         )
         .await?;
         Ok(ContainerBasicInfo {
@@ -1711,18 +1732,14 @@ impl ContainerRuntime for KubernetesRuntime {
                 "patch_deployment requires project_id (app_id)".to_string(),
             )
         })?;
-        let gateway_name = std::env::var("RCODER_K8S_GATEWAY_NAME")
-            .ok()
-            .or_else(|| Some("nuwax-gateway".to_string()));
-        let gateway_namespace = std::env::var("RCODER_K8S_GATEWAY_NAMESPACE")
-            .ok()
-            .or_else(|| Some("default".to_string()));
+        let (gateway_name, gateway_namespace, http_expose) = read_app_expose_env();
         // SSA re-apply 全部资源（幂等 create-or-update，收敛到新 desired state）
         self.create_app_resources(
             &app_id,
             &params,
             gateway_name.as_deref(),
             gateway_namespace.as_deref(),
+            http_expose,
         )
         .await?;
         // 清理 update 后不再需要的端口/配置资源（HTTPRoute/NodePort/ConfigMap/Secret orphan）

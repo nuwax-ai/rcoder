@@ -98,13 +98,27 @@ impl From<ContainerRuntimeStatus> for String {
 // 应用（UserApp）相关类型
 // ============================================================================
 
-/// 应用端口暴露类型
+/// 应用端口暴露类型（只描述协议；对外暴露机制由 [`HttpExpose`] 决定）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub enum ExposeType {
-    /// HTTP 服务（K8s 经 Gateway HTTPRoute，Docker 经 Pingora /proxy）
+    /// HTTP 服务
     Http,
-    /// TCP 服务（K8s 经 NodePort，Docker 经 port_bindings）
+    /// TCP 服务（初期仅集群内访问，不对外）
     Tcp,
+}
+
+/// 应用 HTTP 服务的对外暴露模式（全局配置 `http_expose`，默认 [`HttpExpose::Pingora`]）。
+///
+/// 决定 HTTP 端口走 RCoder 内置 Pingora 代理还是外部 Gateway HTTPRoute。
+/// TCP 端口初期不对外（不论此值），只给 internal ClusterIP FQDN。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpExpose {
+    /// 走 RCoder 内置 Pingora 代理（`/proxy/{port}`）—— K8s/Docker 两后端统一，默认。
+    #[default]
+    Pingora,
+    /// 走外部 Gateway HTTPRoute（`/apps/{app_id}`）—— 仅 K8s 可选；Docker 无此模式（始终 Pingora）。
+    Gateway,
 }
 
 /// 应用端口规格（创建时由调用方提供）

@@ -1,11 +1,30 @@
 //! 应用管理服务配置
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
-/// 应用对外暴露模式（决定 `build_access_info` 生成的访问地址格式）
+use container_runtime_api::HttpExpose;
+
+/// 从 env `RCODER_APP_HTTP_EXPOSE` 读取 HTTP 暴露策略（pingora|gateway，默认 pingora）。
+/// 无效值 warn 后回退 Pingora（Fail Fast：显眼告警，避免静默走错模式）。
+/// **必须与 `docker_manager::kubernetes_runtime` 同源读取**，保证 service 层与 K8s 后端一致。
+fn http_expose_from_env() -> HttpExpose {
+    match std::env::var("RCODER_APP_HTTP_EXPOSE").ok().as_deref() {
+        Some("gateway") => HttpExpose::Gateway,
+        Some("pingora") | None => HttpExpose::Pingora,
+        Some(other) => {
+            warn!(
+                "未识别的 RCODER_APP_HTTP_EXPOSE={other:?}，回退 pingora（合法值: pingora|gateway）"
+            );
+            HttpExpose::Pingora
+        }
+    }
+}
+
+/// 应用后端运行时模式（Docker / Kubernetes）—— 仅决定资源形态（容器 vs Deployment）。
 ///
-/// - `Docker`：HTTP 经 Pingora `/proxy/{port}`，TCP 经 host_port（port_bindings）
-/// - `Kubernetes`：HTTP 经 Gateway HTTPRoute `/apps/{app_id}`，TCP 经 NodePort
+/// 注意：HTTP 对外暴露机制由 [`HttpExpose`]（`http_expose` 配置）决定，不再绑死后端模式；
+/// TCP 初期不对外。详见设计文档 §8。
 ///
 /// 默认由编译期 feature 决定（kubernetes → Kubernetes，否则 Docker），
 /// 可被环境变量 `RCODER_APP_ACCESS_MODE` 覆盖，便于双后端运行时切换。
@@ -65,15 +84,15 @@ pub struct AppManagerConfig {
     pub storage_class: Option<String>,
 
     // ===== Layer 5 接线字段 =====
-    /// 对外暴露模式（Docker / Kubernetes）
+    /// 后端运行时模式（Docker / Kubernetes）
     pub access_mode: AppAccessMode,
 
-    /// 对外主机地址（Docker 模式用于拼 Pingora / host_port 访问 URL；
-    /// 未配置时回退到 node_ip 或 127.0.0.1）
-    pub external_host: Option<String>,
-
-    /// Pingora 监听端口（Docker 模式 HTTP 访问入口）
-    pub pingora_listen_port: Option<u16>,
+    /// HTTP 服务对外暴露策略（v2 D10）：Pingora（默认，两后端统一）/ Gateway（可选，HTTPRoute）。
+    /// 决定 HTTP 端口走 RCoder 内置 Pingora（`/proxy/{port}`）还是外部 Gateway（`/apps/{id}`）。
+    /// **只从 env `RCODER_APP_HTTP_EXPOSE` 读取**（serde skip，禁止 config.yml 覆盖）——
+    /// 保证与 docker_manager K8s 后端（也读 env）同源一致。
+    #[serde(skip, default = "http_expose_from_env")]
+    pub http_expose: HttpExpose,
 
     /// 工作空间 PVC 名（K8s 模式，app 复用的 RWX PVC；运行时也直接读 env
     /// `RCODER_WORKSPACE_PVC_NAME`，此处仅作可观测/兜底）
@@ -95,10 +114,7 @@ impl Default for AppManagerConfig {
                 .and_then(|s| s.parse().ok()),
             storage_class: std::env::var("RCODER_K8S_STORAGE_CLASS").ok(),
             access_mode: AppAccessMode::default(),
-            external_host: std::env::var("RCODER_EXTERNAL_HOST").ok(),
-            pingora_listen_port: std::env::var("RCODER_PINGORA_LISTEN_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok()),
+            http_expose: http_expose_from_env(),
             workspace_pvc_name: std::env::var("RCODER_WORKSPACE_PVC_NAME").ok(),
         }
     }
@@ -122,19 +138,6 @@ impl AppManagerConfig {
         self.node_ip
             .clone()
             .unwrap_or_else(|| "127.0.0.1".to_string())
-    }
-
-    /// 获取对外主机地址（Docker 模式优先；回退到 node_ip）
-    pub fn get_external_host(&self) -> String {
-        self.external_host
-            .clone()
-            .or_else(|| self.node_ip.clone())
-            .unwrap_or_else(|| "127.0.0.1".to_string())
-    }
-
-    /// 获取 Pingora 监听端口（Docker 模式 HTTP 入口）
-    pub fn get_pingora_listen_port(&self) -> u16 {
-        self.pingora_listen_port.unwrap_or(8088)
     }
 
     /// 获取 Gateway 名称

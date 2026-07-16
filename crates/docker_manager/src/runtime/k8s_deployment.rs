@@ -13,7 +13,7 @@
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
     AppPortSpec, AppPortStatus, ContainerCreateParams, ContainerLogEntry, ContainerRuntimeError,
-    ContainerRuntimeResult, DeploymentStatus, ExposeType,
+    ContainerRuntimeResult, DeploymentStatus, ExposeType, HttpExpose,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
@@ -543,7 +543,9 @@ impl KubernetesRuntime {
     }
 
     /// apply NodePort Service（TCP 端口对外暴露）—— SSA create-or-update，
-    /// 返回实际分配的 node_port 列表（server 分配，apply 后从返回对象读取）
+    /// 返回实际分配的 node_port 列表（server 分配，apply 后从返回对象读取）。
+    /// 当前 TCP 初期不对外，此函数暂未被调用（保留供未来启用）。
+    #[allow(dead_code)]
     async fn apply_app_nodeport(
         &self,
         app_id: &str,
@@ -650,6 +652,7 @@ impl KubernetesRuntime {
         params: &ContainerCreateParams,
         gateway_name: Option<&str>,
         gateway_namespace: Option<&str>,
+        http_expose: HttpExpose,
     ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
         let tenant_id = params.tenant_id.as_deref();
         let space_id = params.space_id.as_deref();
@@ -672,46 +675,49 @@ impl KubernetesRuntime {
         // 4. Deployment（SSA apply）
         self.apply_app_deployment(app_id, params).await?;
         info!("[K8S-APP] Deployment applied for app: {app_id}");
-        // 5. HTTPRoute（HTTP 端口）—— 失败降级：app 主体（Deployment）已创建不可回滚，
-        // HTTPRoute 属暴露层（依赖 Gateway/CRD），失败时 warn + 跳过，不阻塞 app 创建。
-        // 避免"Deployment 已建 + create_app 整体失败"导致调用方重试时 name 冲突。
+        // 5. HTTP 入口 —— 按 http_expose：
+        //    - Gateway 模式：apply HTTPRoute（path /apps/{id}），失败降级 warn 不阻塞
+        //      （app 主体已创建不可回滚；避免重试 name 冲突）
+        //    - Pingora 模式（默认）：不建 HTTPRoute（走 RCoder 内置 Pingora /proxy/{port}）
+        //    两种模式都登记 HTTP 端口状态（external_port=None，保持返回结构；access 实际由 service.rs 从 request.ports / status.ports 生成）。
         let mut external_ports: Vec<AppPortStatus> = vec![];
-        if let (Some(ports), Some(gw), Some(gw_ns)) =
-            (params.ports.as_ref(), gateway_name, gateway_namespace)
+        if let Some(ports) = params.ports.as_ref()
             && let Some(http_port) = ports.iter().find(|p| p.expose_type == ExposeType::Http)
         {
-            match self
-                .apply_app_httproute(app_id, http_port, gw, gw_ns, tenant_id, space_id)
-                .await
+            if http_expose == HttpExpose::Gateway
+                && let (Some(gw), Some(gw_ns)) = (gateway_name, gateway_namespace)
             {
-                Ok(_) => {
-                    external_ports.push(AppPortStatus {
-                        name: http_port.name.clone(),
-                        port: http_port.port,
-                        expose_type: ExposeType::Http,
-                        external_port: None,
-                    });
+                match self
+                    .apply_app_httproute(app_id, http_port, gw, gw_ns, tenant_id, space_id)
+                    .await
+                {
+                    Ok(_) => {
+                        external_ports.push(AppPortStatus {
+                            name: http_port.name.clone(),
+                            port: http_port.port,
+                            expose_type: ExposeType::Http,
+                            external_port: None,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[K8S-APP] HTTPRoute apply 失败，app 主体已创建但 HTTP 入口暂不可用（待 Gateway/CRD 就绪后 reconcile）: {}",
+                            e
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "[K8S-APP] HTTPRoute apply 失败，app 主体已创建但 HTTP 入口暂不可用（待 Gateway/CRD 就绪后 reconcile）: {}",
-                        e
-                    );
-                }
+            } else {
+                // Pingora 模式：不建 HTTPRoute（走 RCoder 内置 Pingora），仅登记端口状态保持返回结构
+                external_ports.push(AppPortStatus {
+                    name: http_port.name.clone(),
+                    port: http_port.port,
+                    expose_type: ExposeType::Http,
+                    external_port: None,
+                });
             }
         }
-        // 6. NodePort（TCP 端口）
-        if let Some(ports) = params.ports.as_ref() {
-            let tcp_ports: Vec<AppPortSpec> = ports
-                .iter()
-                .filter(|p| p.expose_type == ExposeType::Tcp)
-                .cloned()
-                .collect();
-            let nodeports = self
-                .apply_app_nodeport(app_id, &tcp_ports, tenant_id, space_id)
-                .await?;
-            external_ports.extend(nodeports);
-        }
+        // 6. TCP 端口：初期不对外（仅 ClusterIP 集群内访问，见步骤 3 apply_app_service）。
+        //    apply_app_nodeport 保留供未来启用 TCP 对外暴露时调用。
         Ok(external_ports)
     }
 
