@@ -1,6 +1,7 @@
 //! 路由层。
 
 pub mod build;
+pub mod computer;
 pub mod git;
 pub mod project;
 
@@ -21,4 +22,9 @@ pub fn git_router() -> Router<AppState> {
 /// `/api/build` 路由 (对齐 nuwax buildRoutes; dev server 生命周期 + 端口池 + 日志)。
 pub fn build_router() -> Router<AppState> {
     build::router()
+}
+
+/// `/api/computer` 路由 (对齐 nuwax computerRoutes)。
+pub fn computer_router() -> Router<AppState> {
+    computer::router()
 }
