@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::AppState;
 use crate::error::AppError;
 use crate::response;
 use crate::service::{
@@ -15,7 +16,6 @@ use crate::service::{
     upload as upload_service, version as version_service,
 };
 use crate::workspace::ProjectContext;
-use crate::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -32,7 +32,10 @@ pub fn router() -> Router<AppState> {
         .route("/upload-project", post(upload_project))
         .route("/backup-current-version", post(backup_current_version))
         .route("/rollback-version", post(rollback_version))
-        .route("/get-project-content-by-version", get(get_project_content_by_version))
+        .route(
+            "/get-project-content-by-version",
+            get(get_project_content_by_version),
+        )
         .route("/export-project", post(export_project))
         .route("/push-skills-to-workspace", post(push_skills_to_workspace))
 }
@@ -247,13 +250,19 @@ async fn copy_project(
         project_id: body.source_project_id.trim().to_string(),
         tenant_id: body.source_tenant_id.clone().or_else(|| common_t.clone()),
         space_id: body.source_space_id.clone().or_else(|| common_s.clone()),
-        isolation_type: body.source_isolation_type.clone().or_else(|| common_i.clone()),
+        isolation_type: body
+            .source_isolation_type
+            .clone()
+            .or_else(|| common_i.clone()),
     };
     let target_ctx = ProjectContext {
         project_id: body.target_project_id.trim().to_string(),
         tenant_id: body.target_tenant_id.clone().or_else(|| common_t.clone()),
         space_id: body.target_space_id.clone().or_else(|| common_s.clone()),
-        isolation_type: body.target_isolation_type.clone().or_else(|| common_i.clone()),
+        isolation_type: body
+            .target_isolation_type
+            .clone()
+            .or_else(|| common_i.clone()),
     };
     let result =
         project_service::copy_project(&*state.resolver, &state.config, &source_ctx, &target_ctx)
@@ -465,7 +474,12 @@ async fn specified_files_update(
             *c = code_service::decode_uri_component(c);
         }
     }
-    let ctx = ctx_from(&project_id, body.tenant_id, body.space_id, body.isolation_type);
+    let ctx = ctx_from(
+        &project_id,
+        body.tenant_id,
+        body.space_id,
+        body.isolation_type,
+    );
     let result = code_service::specified_files_update(
         &*state.resolver,
         &state.config,
@@ -524,7 +538,12 @@ async fn all_files_update(
             *c = code_service::decode_uri_component(c);
         }
     }
-    let ctx = ctx_from(&project_id, body.tenant_id, body.space_id, body.isolation_type);
+    let ctx = ctx_from(
+        &project_id,
+        body.tenant_id,
+        body.space_id,
+        body.isolation_type,
+    );
     let result = code_service::all_files_update(
         &*state.resolver,
         &state.config,
@@ -607,7 +626,9 @@ async fn backup_current_version(
     Json(body): Json<BackupVersionBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if state.config.git_enabled {
-        return Ok(response::deprecated("此接口已废弃,请使用 Git 版本管理 API（/api/git/*）"));
+        return Ok(response::deprecated(
+            "此接口已废弃,请使用 Git 版本管理 API（/api/git/*）",
+        ));
     }
     let project_id = body.project_id.trim().to_string();
     if project_id.is_empty() {
@@ -616,7 +637,12 @@ async fn backup_current_version(
     if body.code_version.trim().is_empty() {
         return Err(AppError::validation("codeVersion cannot be empty"));
     }
-    let ctx = ctx_from(&project_id, body.tenant_id, body.space_id, body.isolation_type);
+    let ctx = ctx_from(
+        &project_id,
+        body.tenant_id,
+        body.space_id,
+        body.isolation_type,
+    );
     let result = version_service::backup_current_version(
         &*state.resolver,
         &state.config,
@@ -653,13 +679,20 @@ async fn rollback_version(
     Json(body): Json<RollbackBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if state.config.git_enabled {
-        return Ok(response::deprecated("此接口已废弃,请使用 /api/git/rollback 进行版本回滚"));
+        return Ok(response::deprecated(
+            "此接口已废弃,请使用 /api/git/rollback 进行版本回滚",
+        ));
     }
     let project_id = body.project_id.trim().to_string();
     if project_id.is_empty() {
         return Err(AppError::validation("Project ID cannot be empty"));
     }
-    let ctx = ctx_from(&project_id, body.tenant_id, body.space_id, body.isolation_type);
+    let ctx = ctx_from(
+        &project_id,
+        body.tenant_id,
+        body.space_id,
+        body.isolation_type,
+    );
     let result = version_service::rollback_version(
         &*state.resolver,
         &state.config,
@@ -759,7 +792,12 @@ async fn export_project(
     if project_id.is_empty() {
         return Err(AppError::validation("Project ID cannot be empty"));
     }
-    let ctx = ctx_from(&project_id, body.tenant_id, body.space_id, body.isolation_type);
+    let ctx = ctx_from(
+        &project_id,
+        body.tenant_id,
+        body.space_id,
+        body.isolation_type,
+    );
     let zip_path = project_service::export_project(
         &*state.resolver,
         &state.config,
@@ -831,8 +869,7 @@ async fn push_skills_to_workspace(
     }
     let project_id = project_id.ok_or_else(|| AppError::validation("projectId is required"))?;
     let ctx = ctx_from(project_id.trim(), tenant, space, iso);
-    let result =
-        skills_service::push_skills(&*state.resolver, &ctx, zip_data, skill_urls).await?;
+    let result = skills_service::push_skills(&*state.resolver, &ctx, zip_data, skill_urls).await?;
     Ok(Json(json!({
         "success": true,
         "message": "Skills pushed to workspace",

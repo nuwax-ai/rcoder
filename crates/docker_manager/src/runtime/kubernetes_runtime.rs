@@ -30,12 +30,12 @@ use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
 #[cfg(feature = "kubernetes")]
+use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
+#[cfg(feature = "kubernetes")]
 use shared_types::{
     ContainerBasicInfo, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec, K8sVolumeType,
     ServiceResourceLimits, ServiceType,
 };
-#[cfg(feature = "kubernetes")]
-use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
 #[cfg(feature = "kubernetes")]
 use std::sync::Arc;
 #[cfg(feature = "kubernetes")]
@@ -272,7 +272,11 @@ impl KubernetesRuntime {
         // 完全分家:pod/PVC 命名前缀优先读 kubernetes_config(自包含 image_tag_prefix),
         // 回退 multi_image_config(过渡期),再回退 service_type.container_prefix() 默认。
         // 避免命名漂移:k8s 配置改了前缀,pod 与 PVC 必须同步用新前缀。
-        if let Some(k8s_cfg) = self.config.kubernetes_config.get_service_config(service_type) {
+        if let Some(k8s_cfg) = self
+            .config
+            .kubernetes_config
+            .get_service_config(service_type)
+        {
             return Ok(k8s_cfg.container_prefix().to_string());
         }
         let service_key = service_type.to_string();
@@ -348,7 +352,11 @@ impl KubernetesRuntime {
         }
 
         // 2. 从 kubernetes_config(完全分家后的主数据源)按平台选镜像
-        if let Some(svc) = self.config.kubernetes_config.get_service_config(service_type) {
+        if let Some(svc) = self
+            .config
+            .kubernetes_config
+            .get_service_config(service_type)
+        {
             let arch = std::env::consts::ARCH;
             let platform = if arch == "aarch64" || arch == "arm64" {
                 "linux/arm64"
@@ -371,7 +379,10 @@ impl KubernetesRuntime {
         if let Some(service_config) = multi_config.get_service_config(service_type) {
             // 优先使用 image 字段
             if let Some(ref image) = service_config.image {
-                info!("[K8S] Using image from multi_image_config (fallback): {}", image);
+                info!(
+                    "[K8S] Using image from multi_image_config (fallback): {}",
+                    image
+                );
                 return image.clone();
             }
             // 使用架构特定镜像
@@ -382,7 +393,10 @@ impl KubernetesRuntime {
                 service_config.amd64_image.clone()
             };
             if let Some(img) = image {
-                info!("[K8S] Using architecture-specific image (fallback): {}", img);
+                info!(
+                    "[K8S] Using architecture-specific image (fallback): {}",
+                    img
+                );
                 return img.to_string();
             }
             // 使用默认镜像
@@ -444,7 +458,10 @@ impl KubernetesRuntime {
             .or_else(|| limits.storage_size.clone());
         if let Some(es_qty) = es {
             // overlay 实际写入很少(业务数据在 PVC),requests 给 512Mi 调度保障,limits 保留配置上限。
-            requests.insert("ephemeral-storage".to_string(), Quantity("512Mi".to_string()));
+            requests.insert(
+                "ephemeral-storage".to_string(),
+                Quantity("512Mi".to_string()),
+            );
             lims.insert("ephemeral-storage".to_string(), Quantity(es_qty));
         }
 
@@ -469,9 +486,7 @@ impl KubernetesRuntime {
     fn translate_k8s_volume(spec: &K8sVolumeSpec) -> Option<Volume> {
         // 卷名冲突保护:workspace 由 builder 硬编码管理
         if spec.name == "workspace" {
-            warn!(
-                "[K8S] config volume name 'workspace' is reserved (builder-managed), skipping"
-            );
+            warn!("[K8S] config volume name 'workspace' is reserved (builder-managed), skipping");
             return None;
         }
         match spec.volume_type {
@@ -583,7 +598,10 @@ impl KubernetesRuntime {
             &self.namespace,
             &self.config.cluster_domain,
         );
-        debug!("[K8S] agent access address: identifier={} -> {}", identifier, fqdn);
+        debug!(
+            "[K8S] agent access address: identifier={} -> {}",
+            identifier, fqdn
+        );
         fqdn
     }
 
@@ -662,7 +680,10 @@ impl ContainerRuntime for KubernetesRuntime {
         // WebAgentRunner 同样例外：复用共享 rcoder-workspace PVC（subPath 见下方卷选取），
         // 不为每个项目新建独立空 PVC——否则 CephFS 下每卷隔离，终端 pod 看不到主 pod 写入的
         // 项目文件（/app/project_workspace/{projectId}），ws_terminal fail-closed。
-        if !matches!(service_type, ServiceType::ComputerAgentRunner | ServiceType::WebAgentRunner) {
+        if !matches!(
+            service_type,
+            ServiceType::ComputerAgentRunner | ServiceType::WebAgentRunner
+        ) {
             self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
                 .await?;
         }
@@ -770,7 +791,10 @@ impl ContainerRuntime for KubernetesRuntime {
         // 取 service 配置(完全分家):K8s 优先读 kubernetes_config;docker_config.multi_image_config
         // 仅作过渡期安全兜底(旧 chart 未带 kubernetes_config 段时,保留 workspace 路径/command/env 行为)。
         // volumes / volume_mounts / sidecars 只来自 kubernetes_config(docker_config 无此概念)。
-        let k8s_service = self.config.kubernetes_config.get_service_config(&service_type);
+        let k8s_service = self
+            .config
+            .kubernetes_config
+            .get_service_config(&service_type);
         let docker_service = self
             .config
             .docker_manager_config
@@ -848,203 +872,202 @@ impl ContainerRuntime for KubernetesRuntime {
                 containers: {
                     // 主 agent 容器 + 翻译自 kubernetes_config 的 sidecar(如 log-collector)
                     let mut containers_vec = vec![K8sContainer {
-                    name: "agent".to_string(),
-                    image: Some(image),
-                    // IfNotPresent: 动态 pod 频繁创建（每 chat/computer-chat 一个），
-                    // 节点已缓存就直接用，避免每次都去 registry 验 token/manifest。
-                    // image 更新由主 Deployment 触发拉取（用户做 rollout restart 时），
-                    // 主服务用新 image 启动后，动态 pod 跟着用同样的 image 引用。
-                    image_pull_policy: Some("IfNotPresent".to_string()),
-                    // 启动命令：
-                    //   - WebAgentRunner：从 config.yml 的 web-agent-runner.command 读取
-                    //     （与 docker-compose 一致）。配置里的 /app/agent-runner-start.sh wrapper
-                    //     会先 nohup 拉起 ttyd(7681)，再 exec agent_runner；agent_runner 的
-                    //     ws_terminal 中间层(17681)依赖 ttyd 就绪后才会 bind。若不读配置而裸跑
-                    //     agent_runner，ttyd 不启动 -> ws_terminal 等 7681 超时 abort ->
-                    //     /computer/terminal 终端 WS 连不上。配置缺失时回退裸 agent_runner
-                    //     （保留旧行为，至少 pod 能起；rcoder-master 镜像本身没有 CMD/ENTRYPOINT）。
-                    //   - ComputerAgentRunner：刻意用 None 走镜像自带 ENTRYPOINT(start-up.sh)。
-                    //     注意 config.yml 里 computer-agent-runner.command 写的是裸 agent_runner，
-                    //     那是给 docker 运行时用的；K8s 下若改读它会绕过 start-up.sh，丢失 ttyd/VNC，
-                    //     因此这里不复用 config.command。
-                    command: match service_type {
-                        ServiceType::WebAgentRunner => {
-                            // 优先 kubernetes_config.command;过渡期回退 docker_config.command;
-                            // 都缺则裸跑 agent_runner(保留旧行为,至少 pod 能起)。
-                            let cmd = k8s_service
-                                .and_then(|sc| {
-                                    if sc.command.is_empty() {
-                                        None
-                                    } else {
-                                        Some(sc.command.clone())
-                                    }
-                                })
-                                .or_else(|| {
-                                    docker_service.and_then(|sc| {
+                        name: "agent".to_string(),
+                        image: Some(image),
+                        // IfNotPresent: 动态 pod 频繁创建（每 chat/computer-chat 一个），
+                        // 节点已缓存就直接用，避免每次都去 registry 验 token/manifest。
+                        // image 更新由主 Deployment 触发拉取（用户做 rollout restart 时），
+                        // 主服务用新 image 启动后，动态 pod 跟着用同样的 image 引用。
+                        image_pull_policy: Some("IfNotPresent".to_string()),
+                        // 启动命令：
+                        //   - WebAgentRunner：从 config.yml 的 web-agent-runner.command 读取
+                        //     （与 docker-compose 一致）。配置里的 /app/agent-runner-start.sh wrapper
+                        //     会先 nohup 拉起 ttyd(7681)，再 exec agent_runner；agent_runner 的
+                        //     ws_terminal 中间层(17681)依赖 ttyd 就绪后才会 bind。若不读配置而裸跑
+                        //     agent_runner，ttyd 不启动 -> ws_terminal 等 7681 超时 abort ->
+                        //     /computer/terminal 终端 WS 连不上。配置缺失时回退裸 agent_runner
+                        //     （保留旧行为，至少 pod 能起；rcoder-master 镜像本身没有 CMD/ENTRYPOINT）。
+                        //   - ComputerAgentRunner：刻意用 None 走镜像自带 ENTRYPOINT(start-up.sh)。
+                        //     注意 config.yml 里 computer-agent-runner.command 写的是裸 agent_runner，
+                        //     那是给 docker 运行时用的；K8s 下若改读它会绕过 start-up.sh，丢失 ttyd/VNC，
+                        //     因此这里不复用 config.command。
+                        command: match service_type {
+                            ServiceType::WebAgentRunner => {
+                                // 优先 kubernetes_config.command;过渡期回退 docker_config.command;
+                                // 都缺则裸跑 agent_runner(保留旧行为,至少 pod 能起)。
+                                let cmd = k8s_service
+                                    .and_then(|sc| {
                                         if sc.command.is_empty() {
                                             None
                                         } else {
                                             Some(sc.command.clone())
                                         }
                                     })
-                                })
-                                .unwrap_or_else(|| vec!["/app/bin/agent_runner".to_string()]);
-                            Some(cmd)
-                        }
-                        // ComputerAgentRunner / UserApp 用镜像自带 ENTRYPOINT/CMD
-                        // （UserApp 实际走 create_deployment，不经此路径）
-                        ServiceType::ComputerAgentRunner | ServiceType::UserApp => None,
-                    },
-                    env: {
-                        let mut env_vars = vec![
-                            EnvVar {
-                                name: "PROJECT_ID".to_string(),
-                                value: Some(project_id_val.to_string()),
-                                ..Default::default()
-                            },
-                            EnvVar {
-                                name: "USER_ID".to_string(),
-                                value: Some(user_id_val.to_string()),
-                                ..Default::default()
-                            },
-                            EnvVar {
-                                name: "SERVICE_TYPE".to_string(),
-                                value: Some(service_type_str.clone()),
-                                ..Default::default()
-                            },
-                            // 部署模式标识: start-up.sh 据此 source extra (K8s 下 /home/user 是 PVC, 跳过 bind mount 权限修复)
-                            EnvVar {
-                                name: "DEPLOY_MODE".to_string(),
-                                value: Some("k8s".to_string()),
-                                ..Default::default()
-                            },
-                        ];
-                        // 多租户环境变量（agent_runner 用于构建工作目录路径）
-                        if let Some(ref tid) = tenant_id {
-                            env_vars.push(EnvVar {
-                                name: "TENANT_ID".to_string(),
-                                value: Some(tid.clone()),
-                                ..Default::default()
-                            });
-                        }
-                        if let Some(ref sid) = space_id {
-                            env_vars.push(EnvVar {
-                                name: "SPACE_ID".to_string(),
-                                value: Some(sid.clone()),
-                                ..Default::default()
-                            });
-                        }
-                        if let Some(ref it) = isolation_type {
-                            env_vars.push(EnvVar {
-                                name: "ISOLATION_TYPE".to_string(),
-                                value: Some(it.clone()),
-                                ..Default::default()
-                            });
-                        }
-                        // 透传 service environment
-                        // (PROJECT_WORKSPACE_BASE/RUST_LOG/SERVICE_MODE/AGENT_PORT 等,
-                        //  让 sub-container 行为与 Docker 模式一致)。跳过已硬编码的同名 env。
-                        // 合并顺序:docker_config 兜底 → kubernetes_config 覆盖(K8s 主)。
-                        const RESERVED: [&str; 6] = [
-                            "PROJECT_ID",
-                            "USER_ID",
-                            "SERVICE_TYPE",
-                            "TENANT_ID",
-                            "SPACE_ID",
-                            "ISOLATION_TYPE",
-                        ];
-                        let mut merged_env: std::collections::HashMap<String, String> =
-                            std::collections::HashMap::new();
-                        if let Some(sc) = docker_service {
-                            for (k, v) in &sc.environment {
-                                merged_env.insert(k.clone(), v.clone());
+                                    .or_else(|| {
+                                        docker_service.and_then(|sc| {
+                                            if sc.command.is_empty() {
+                                                None
+                                            } else {
+                                                Some(sc.command.clone())
+                                            }
+                                        })
+                                    })
+                                    .unwrap_or_else(|| vec!["/app/bin/agent_runner".to_string()]);
+                                Some(cmd)
                             }
-                        }
-                        if let Some(sc) = k8s_service {
-                            for (k, v) in &sc.environment {
-                                merged_env.insert(k.clone(), v.clone());
-                            }
-                        }
-                        for (k, v) in &merged_env {
-                            if RESERVED.contains(&k.as_str()) {
-                                continue;
-                            }
-                            env_vars.push(EnvVar {
-                                name: k.clone(),
-                                value: Some(v.clone()),
-                                ..Default::default()
-                            });
-                        }
-                        Some(env_vars)
-                    },
-                    ports: Some(vec![
-                        ContainerPort {
-                            container_port: shared_types::GRPC_DEFAULT_PORT as i32,
-                            name: Some("grpc".to_string()),
-                            ..Default::default()
+                            // ComputerAgentRunner / UserApp 用镜像自带 ENTRYPOINT/CMD
+                            // （UserApp 实际走 create_deployment，不经此路径）
+                            ServiceType::ComputerAgentRunner | ServiceType::UserApp => None,
                         },
-                        // HTTP health check port for agent_runner
-                        ContainerPort {
-                            container_port: 8086,
-                            name: Some("http".to_string()),
-                            ..Default::default()
+                        env: {
+                            let mut env_vars = vec![
+                                EnvVar {
+                                    name: "PROJECT_ID".to_string(),
+                                    value: Some(project_id_val.to_string()),
+                                    ..Default::default()
+                                },
+                                EnvVar {
+                                    name: "USER_ID".to_string(),
+                                    value: Some(user_id_val.to_string()),
+                                    ..Default::default()
+                                },
+                                EnvVar {
+                                    name: "SERVICE_TYPE".to_string(),
+                                    value: Some(service_type_str.clone()),
+                                    ..Default::default()
+                                },
+                                // 部署模式标识: start-up.sh 据此 source extra (K8s 下 /home/user 是 PVC, 跳过 bind mount 权限修复)
+                                EnvVar {
+                                    name: "DEPLOY_MODE".to_string(),
+                                    value: Some("k8s".to_string()),
+                                    ..Default::default()
+                                },
+                            ];
+                            // 多租户环境变量（agent_runner 用于构建工作目录路径）
+                            if let Some(ref tid) = tenant_id {
+                                env_vars.push(EnvVar {
+                                    name: "TENANT_ID".to_string(),
+                                    value: Some(tid.clone()),
+                                    ..Default::default()
+                                });
+                            }
+                            if let Some(ref sid) = space_id {
+                                env_vars.push(EnvVar {
+                                    name: "SPACE_ID".to_string(),
+                                    value: Some(sid.clone()),
+                                    ..Default::default()
+                                });
+                            }
+                            if let Some(ref it) = isolation_type {
+                                env_vars.push(EnvVar {
+                                    name: "ISOLATION_TYPE".to_string(),
+                                    value: Some(it.clone()),
+                                    ..Default::default()
+                                });
+                            }
+                            // 透传 service environment
+                            // (PROJECT_WORKSPACE_BASE/RUST_LOG/SERVICE_MODE/AGENT_PORT 等,
+                            //  让 sub-container 行为与 Docker 模式一致)。跳过已硬编码的同名 env。
+                            // 合并顺序:docker_config 兜底 → kubernetes_config 覆盖(K8s 主)。
+                            const RESERVED: [&str; 6] = [
+                                "PROJECT_ID",
+                                "USER_ID",
+                                "SERVICE_TYPE",
+                                "TENANT_ID",
+                                "SPACE_ID",
+                                "ISOLATION_TYPE",
+                            ];
+                            let mut merged_env: std::collections::HashMap<String, String> =
+                                std::collections::HashMap::new();
+                            if let Some(sc) = docker_service {
+                                for (k, v) in &sc.environment {
+                                    merged_env.insert(k.clone(), v.clone());
+                                }
+                            }
+                            if let Some(sc) = k8s_service {
+                                for (k, v) in &sc.environment {
+                                    merged_env.insert(k.clone(), v.clone());
+                                }
+                            }
+                            for (k, v) in &merged_env {
+                                if RESERVED.contains(&k.as_str()) {
+                                    continue;
+                                }
+                                env_vars.push(EnvVar {
+                                    name: k.clone(),
+                                    value: Some(v.clone()),
+                                    ..Default::default()
+                                });
+                            }
+                            Some(env_vars)
                         },
-                    ]),
-                    resources,
-                    volume_mounts,
-                    liveness_probe: Some(Probe {
-                        http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                            path: Some("/health".to_string()),
-                            port: IntOrString::Int(8086),
+                        ports: Some(vec![
+                            ContainerPort {
+                                container_port: shared_types::GRPC_DEFAULT_PORT as i32,
+                                name: Some("grpc".to_string()),
+                                ..Default::default()
+                            },
+                            // HTTP health check port for agent_runner
+                            ContainerPort {
+                                container_port: 8086,
+                                name: Some("http".to_string()),
+                                ..Default::default()
+                            },
+                        ]),
+                        resources,
+                        volume_mounts,
+                        liveness_probe: Some(Probe {
+                            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                                path: Some("/health".to_string()),
+                                port: IntOrString::Int(8086),
+                                ..Default::default()
+                            }),
+                            initial_delay_seconds: Some(30),
+                            period_seconds: Some(10),
+                            timeout_seconds: Some(3),
+                            failure_threshold: Some(3),
+                            success_threshold: Some(1),
                             ..Default::default()
                         }),
-                        initial_delay_seconds: Some(30),
-                        period_seconds: Some(10),
-                        timeout_seconds: Some(3),
-                        failure_threshold: Some(3),
-                        success_threshold: Some(1),
-                        ..Default::default()
-                    }),
-                    // readiness_probe: initialDelay/period 用 1s, agent_runner /health 一返回 200 即 Ready。
-                    // 原 initialDelay=3+period=3 会把首次成功探测拖到 ~3-6s (create 阶段慢)。
-                    // 实测 startupProbe + readiness period=3 有 handoff 延迟 (startup 通过后还要等 readiness 的 3s 边界),
-                    // 不如直接 readiness period=1: 每 1s 探一次, /health=200 后 ~1s 内 Ready。
-                    // 稳态每秒一次 /health GET 开销可忽略; failure_threshold=20 容忍启动期 503, 不被误杀。
-                    readiness_probe: Some(Probe {
-                        http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                            path: Some("/health".to_string()),
-                            port: IntOrString::Int(8086),
+                        // readiness_probe: initialDelay/period 用 1s, agent_runner /health 一返回 200 即 Ready。
+                        // 原 initialDelay=3+period=3 会把首次成功探测拖到 ~3-6s (create 阶段慢)。
+                        // 实测 startupProbe + readiness period=3 有 handoff 延迟 (startup 通过后还要等 readiness 的 3s 边界),
+                        // 不如直接 readiness period=1: 每 1s 探一次, /health=200 后 ~1s 内 Ready。
+                        // 稳态每秒一次 /health GET 开销可忽略; failure_threshold=20 容忍启动期 503, 不被误杀。
+                        readiness_probe: Some(Probe {
+                            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                                path: Some("/health".to_string()),
+                                port: IntOrString::Int(8086),
+                                ..Default::default()
+                            }),
+                            initial_delay_seconds: Some(1),
+                            period_seconds: Some(1),
+                            timeout_seconds: Some(3),
+                            failure_threshold: Some(20),
+                            success_threshold: Some(1),
                             ..Default::default()
                         }),
-                        initial_delay_seconds: Some(1),
-                        period_seconds: Some(1),
-                        timeout_seconds: Some(3),
-                        failure_threshold: Some(20),
-                        success_threshold: Some(1),
-                        ..Default::default()
-                    }),
-                    // preStop lifecycle hook: 在 kubelet 发送 SIGTERM 之前执行，
-                    // 确保 JuiceFS FUSE 卷上的写入 buffer flush 到磁盘，
-                    // 减少 FUSE unmount 卡住的概率
-                    lifecycle: Some(k8s_openapi::api::core::v1::Lifecycle {
-                        pre_stop: Some(k8s_openapi::api::core::v1::LifecycleHandler {
-                            exec: Some(k8s_openapi::api::core::v1::ExecAction {
-                                command: Some(vec![
-                                    "sh".to_string(),
-                                    "-c".to_string(),
-                                    "sync && sleep 2".to_string(),
-                                ]),
+                        // preStop lifecycle hook: 在 kubelet 发送 SIGTERM 之前执行，
+                        // 确保 JuiceFS FUSE 卷上的写入 buffer flush 到磁盘，
+                        // 减少 FUSE unmount 卡住的概率
+                        lifecycle: Some(k8s_openapi::api::core::v1::Lifecycle {
+                            pre_stop: Some(k8s_openapi::api::core::v1::LifecycleHandler {
+                                exec: Some(k8s_openapi::api::core::v1::ExecAction {
+                                    command: Some(vec![
+                                        "sh".to_string(),
+                                        "-c".to_string(),
+                                        "sync && sleep 2".to_string(),
+                                    ]),
+                                }),
+                                ..Default::default()
                             }),
                             ..Default::default()
                         }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                }];
+                    }];
                     // sidecar(只来自 kubernetes_config.services[].sidecars)。
                     // 无配置时 pod = 仅 agent(干净基线)。log-collector 等采集器在 configmap 声明。
-                    containers_vec
-                        .extend(sidecars.iter().map(Self::translate_k8s_sidecar));
+                    containers_vec.extend(sidecars.iter().map(Self::translate_k8s_sidecar));
                     containers_vec
                 },
                 restart_policy: Some("Never".to_string()),
@@ -1192,7 +1215,8 @@ impl ContainerRuntime for KubernetesRuntime {
                 }
 
                 return Ok(Some(
-                    self.build_container_basic_info(identifier, &pod_info).await?,
+                    self.build_container_basic_info(identifier, &pod_info)
+                        .await?,
                 ));
             }
         }
@@ -1525,9 +1549,7 @@ impl ContainerRuntime for KubernetesRuntime {
 
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
         let total_start = std::time::Instant::now();
-        info!(
-            "[K8S_CLEANUP] Starting cleanup_all — sequential Service → Pod → PVC deletion"
-        );
+        info!("[K8S_CLEANUP] Starting cleanup_all — sequential Service → Pod → PVC deletion");
 
         let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
 
@@ -1884,8 +1906,7 @@ mod tests {
             config_map_name: Some("my-cm".into()),
             ..Default::default()
         };
-        let v =
-            KubernetesRuntime::translate_k8s_volume(&spec).expect("configMap should translate");
+        let v = KubernetesRuntime::translate_k8s_volume(&spec).expect("configMap should translate");
         let cm = v.config_map.expect("config_map set");
         assert_eq!(cm.name, "my-cm");
     }
@@ -1995,7 +2016,16 @@ mod tests {
             "image_pull_policy must default to IfNotPresent"
         );
         // command 非空 → Some
-        assert_eq!(c.command.as_deref(), Some(&["/bin/sh".to_string(), "-c".to_string(), "sleep 1".to_string()][..]));
+        assert_eq!(
+            c.command.as_deref(),
+            Some(
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 1".to_string()
+                ][..]
+            )
+        );
         // volume_mounts 翻译
         let mounts = c.volume_mounts.expect("volume_mounts set");
         assert_eq!(mounts.len(), 1);

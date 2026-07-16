@@ -875,7 +875,10 @@ mod tests {
 
         // stale_sid 从未注册 → get_project_by_session(stale_sid)=None → 只 buffer，返回 0
         let cleared = ensure_project_session(project, stale_sid).await;
-        assert_eq!(cleared, 0, "stale sid must be ignored (buffer-only, no migration)");
+        assert_eq!(
+            cleared, 0,
+            "stale sid must be ignored (buffer-only, no migration)"
+        );
         assert_eq!(
             registry.get_session_by_project(project).as_deref(),
             Some(real_sid),

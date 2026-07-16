@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
-use file_server::{handler, AppState, Config, LocalWorkspaceResolver};
+use axum::{Router, routing::get};
+use file_server::{AppState, Config, LocalWorkspaceResolver, handler};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 

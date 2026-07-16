@@ -7,10 +7,10 @@
 //! ```
 //! HTTP 状态码由错误类型决定 (见 [`AppError::status_code`])。
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 业务错误, 对应 nuwax 的 AppError 子类族。
 #[derive(Debug)]

@@ -287,7 +287,10 @@ impl KubernetesRuntime {
             if let Some(es_val) = es {
                 limits.insert("ephemeral-storage".to_string(), Quantity(es_val));
                 // overlay 实际写入少(数据在共享 PVC subPath),requests 给 512Mi 调度保障。
-                requests.insert("ephemeral-storage".to_string(), Quantity("512Mi".to_string()));
+                requests.insert(
+                    "ephemeral-storage".to_string(),
+                    Quantity("512Mi".to_string()),
+                );
             }
             if limits.is_empty() {
                 None

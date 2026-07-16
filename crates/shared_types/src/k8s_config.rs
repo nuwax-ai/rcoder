@@ -329,12 +329,27 @@ mod tests {
 
     #[test]
     fn test_volume_type_parse_tolerant() {
-        assert_eq!("emptyDir".parse::<K8sVolumeType>().unwrap(), K8sVolumeType::EmptyDir);
-        assert_eq!("empty_dir".parse::<K8sVolumeType>().unwrap(), K8sVolumeType::EmptyDir);
-        assert_eq!("EMPTYDIR".parse::<K8sVolumeType>().unwrap(), K8sVolumeType::EmptyDir);
+        assert_eq!(
+            "emptyDir".parse::<K8sVolumeType>().unwrap(),
+            K8sVolumeType::EmptyDir
+        );
+        assert_eq!(
+            "empty_dir".parse::<K8sVolumeType>().unwrap(),
+            K8sVolumeType::EmptyDir
+        );
+        assert_eq!(
+            "EMPTYDIR".parse::<K8sVolumeType>().unwrap(),
+            K8sVolumeType::EmptyDir
+        );
         assert_eq!("pvc".parse::<K8sVolumeType>().unwrap(), K8sVolumeType::Pvc);
-        assert_eq!("configMap".parse::<K8sVolumeType>().unwrap(), K8sVolumeType::ConfigMap);
-        assert_eq!("hostPath".parse::<K8sVolumeType>().unwrap(), K8sVolumeType::HostPath);
+        assert_eq!(
+            "configMap".parse::<K8sVolumeType>().unwrap(),
+            K8sVolumeType::ConfigMap
+        );
+        assert_eq!(
+            "hostPath".parse::<K8sVolumeType>().unwrap(),
+            K8sVolumeType::HostPath
+        );
         assert!("bogus".parse::<K8sVolumeType>().is_err());
     }
 
@@ -381,7 +396,10 @@ sidecars:
 "#;
         let cfg: K8sServiceConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.service_type, ServiceType::WebAgentRunner);
-        assert_eq!(cfg.image.as_deref(), Some("registry.example.com/rcoder:latest"));
+        assert_eq!(
+            cfg.image.as_deref(),
+            Some("registry.example.com/rcoder:latest")
+        );
         assert!(cfg.enabled);
         assert_eq!(cfg.container_prefix(), "rcoder-k8s");
         // PROJECT_WORKSPACE_BASE 优先
@@ -459,8 +477,10 @@ sidecars:
         assert_eq!(cfg2.workspace_container_path(), "/custom/ws");
         // PROJECT_WORKSPACE_BASE 环境变量最高优先
         let mut cfg3 = cfg.clone();
-        cfg3.environment
-            .insert("PROJECT_WORKSPACE_BASE".to_string(), "/from/env".to_string());
+        cfg3.environment.insert(
+            "PROJECT_WORKSPACE_BASE".to_string(),
+            "/from/env".to_string(),
+        );
         assert_eq!(cfg3.workspace_container_path(), "/from/env");
     }
 
@@ -497,7 +517,10 @@ sidecars:
         assert_eq!(sc.image_pull_policy.as_deref(), Some("IfNotPresent"));
         // shell 元字符必须原样保留(YAML 双引号里 \" 还原成 ")
         let cmd = &sc.command[2];
-        assert!(cmd.contains("$(find /app/container-logs -type f -name '*.log'"), "cmd: {cmd}");
+        assert!(
+            cmd.contains("$(find /app/container-logs -type f -name '*.log'"),
+            "cmd: {cmd}"
+        );
         assert!(cmd.contains("\"$f\""), "double-quote must survive: {cmd}");
         assert!(cmd.contains(">> /tmp/tailed"), "cmd: {cmd}");
         assert!(cmd.contains("=== $f ==="), "cmd: {cmd}");
@@ -527,16 +550,28 @@ sidecars:
             sidecars: vec![],
         };
         // image 优先
-        assert_eq!(cfg.get_image_for_platform("linux/arm64"), Some("generic".to_string()));
+        assert_eq!(
+            cfg.get_image_for_platform("linux/arm64"),
+            Some("generic".to_string())
+        );
         // 无 image → 架构特定 → default
         let mut cfg2 = cfg.clone();
         cfg2.image = None;
-        assert_eq!(cfg2.get_image_for_platform("linux/arm64"), Some("arm".to_string()));
-        assert_eq!(cfg2.get_image_for_platform("linux/amd64"), Some("amd".to_string()));
+        assert_eq!(
+            cfg2.get_image_for_platform("linux/arm64"),
+            Some("arm".to_string())
+        );
+        assert_eq!(
+            cfg2.get_image_for_platform("linux/amd64"),
+            Some("amd".to_string())
+        );
         // 无架构特定 → default
         let mut cfg3 = cfg2.clone();
         cfg3.arm64_image = None;
-        assert_eq!(cfg3.get_image_for_platform("linux/arm64"), Some("def".to_string()));
+        assert_eq!(
+            cfg3.get_image_for_platform("linux/arm64"),
+            Some("def".to_string())
+        );
     }
 
     /// 测试辅助:构造一个全 Option 字段为 None、集合为空的 K8sServiceConfig

@@ -151,6 +151,10 @@ pub use model::{
 };
 
 // 导出多镜像配置相关类型
+pub use k8s_config::{
+    K8sGlobalDefaults, K8sServiceConfig, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec,
+    K8sVolumeType, KubernetesConfig,
+};
 pub use multi_image_config::{
     GlobalImageDefaults, ImageCacheConfig, ImageSelectionStrategy, MultiImageConfig,
     ProjectImageOverrides, create_default_multi_image_config, create_legacy_multi_image_config,
@@ -158,10 +162,6 @@ pub use multi_image_config::{
 pub use service_config::{
     ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits,
     default_agent_runner_service_config, default_rcoder_service_config,
-};
-pub use k8s_config::{
-    K8sGlobalDefaults, K8sServiceConfig, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec,
-    K8sVolumeType, KubernetesConfig,
 };
 pub use service_type::{
     MissingIdentifier, ServiceType, ServiceTypeError, get_enabled_service_types,

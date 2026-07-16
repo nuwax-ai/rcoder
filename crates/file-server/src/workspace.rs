@@ -102,9 +102,11 @@ impl WorkspaceResolver for LocalWorkspaceResolver {
             non_empty(&ctx.space_id),
             non_empty(&ctx.isolation_type),
         ) {
-            (Some(tenant), Some(space), Some(_)) => {
-                self.project_root.join(tenant).join(space).join(&ctx.project_id)
-            }
+            (Some(tenant), Some(space), Some(_)) => self
+                .project_root
+                .join(tenant)
+                .join(space)
+                .join(&ctx.project_id),
             // 单级: {root}/{project}
             _ => self.project_root.join(&ctx.project_id),
         }

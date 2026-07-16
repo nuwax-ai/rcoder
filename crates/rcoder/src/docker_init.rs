@@ -61,15 +61,15 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
         default_config.multi_image_config = app_multi_config;
 
         // K8s 运行时专用配置(docker 模式不读;K8s 模式从 config.yml 的 kubernetes_config 段取)
-        default_config.kubernetes_config = config
-            .kubernetes_config
-            .clone()
-            .unwrap_or_default();
+        default_config.kubernetes_config = config.kubernetes_config.clone().unwrap_or_default();
         if !default_config.kubernetes_config.services.is_empty() {
             info!(
                 "[K8S] loaded kubernetes_config from config.yml: {} service(s), registry_prefix={:?}",
                 default_config.kubernetes_config.services.len(),
-                default_config.kubernetes_config.global_defaults.registry_prefix
+                default_config
+                    .kubernetes_config
+                    .global_defaults
+                    .registry_prefix
             );
         }
 

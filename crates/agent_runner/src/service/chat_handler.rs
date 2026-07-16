@@ -361,10 +361,7 @@ pub async fn handle_chat_core(
                     && !version.is_empty()
                     && !agent_provisioning::is_agent_installed(&install_root, agent_id, version)
                 {
-                    let has_platforms = server
-                        .platforms
-                        .as_ref()
-                        .is_some_and(|p| !p.is_empty());
+                    let has_platforms = server.platforms.as_ref().is_some_and(|p| !p.is_empty());
                     if has_platforms {
                         // 能自装：下载 + 解压到 install_root
                         warn!(

@@ -26,7 +26,9 @@ pub async fn push_skills(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     if zip_data.is_none() && skill_urls.is_empty() {
-        return Err(AppError::validation("file or skillUrls cannot both be empty"));
+        return Err(AppError::validation(
+            "file or skillUrls cannot both be empty",
+        ));
     }
     let project_path = resolver.resolve_project(ctx);
     if !fs::try_exists(&project_path).await.unwrap_or(false) {

@@ -34,9 +34,9 @@ fn env_list(key: &str, default: &str) -> Vec<String> {
 /// 附件上传白名单 (对齐 nuwax `projectRoutes.js` ATTACHMENT_ALLOWED_EXTENSIONS, 硬编码)。
 fn default_attachment_extensions() -> Vec<String> {
     [
-        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".md",
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico", ".avif",
-        ".zip", ".rar", ".7z", ".tar", ".gz", ".mp4", ".mov", ".avi", ".mp3", ".wav",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".md", ".png", ".jpg",
+        ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico", ".avif", ".zip", ".rar", ".7z", ".tar",
+        ".gz", ".mp4", ".mov", ".avi", ".mp3", ".wav",
     ]
     .iter()
     .map(|s| s.to_string())

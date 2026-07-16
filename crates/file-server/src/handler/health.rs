@@ -5,7 +5,7 @@
 //! 因此 `status: "ok"` 字段不可缺 (对齐 nuwax `routes/router.js`)。
 
 use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `GET /health`
 pub async fn health() -> Json<Value> {

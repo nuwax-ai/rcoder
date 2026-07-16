@@ -2,7 +2,7 @@
 
 use axum::Json;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 把任意可序列化 payload 包成 `{success:true, ...payload}` (字段平铺)。
 pub fn success<T: Serialize>(payload: T) -> Json<Value> {

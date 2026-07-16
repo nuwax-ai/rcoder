@@ -418,7 +418,9 @@ impl ServiceImageConfig {
             .clone()
             .unwrap_or_else(|| match self.service_type {
                 ServiceType::WebAgentRunner => crate::paths::WORKSPACE_ROOT.to_string(),
-                ServiceType::ComputerAgentRunner => crate::paths::COMPUTER_WORKSPACE_ROOT.to_string(),
+                ServiceType::ComputerAgentRunner => {
+                    crate::paths::COMPUTER_WORKSPACE_ROOT.to_string()
+                }
                 // UserApp 复用 rcoder-workspace PVC 的 apps subPath（部署侧挂到 /app/app-workspace）
                 ServiceType::UserApp => "/app/app-workspace".to_string(),
             })
@@ -885,7 +887,7 @@ mod tests {
         let rl = ServiceResourceLimits {
             memory: Some(2_000_000_000.0), // 2GB
             cpu: None,
-            swap: Some(1_000_000_000.0),   // 1GB < memory
+            swap: Some(1_000_000_000.0), // 1GB < memory
             storage_size: None,
             ephemeral_storage_limit: None,
         };

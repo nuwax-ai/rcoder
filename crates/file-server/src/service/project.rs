@@ -104,7 +104,9 @@ pub async fn create_project(
         .await
     } else {
         let _ = fs::remove_dir_all(&project_path).await;
-        return Err(AppError::system(format!("Template not found: {template_name}")));
+        return Err(AppError::system(format!(
+            "Template not found: {template_name}"
+        )));
     };
     if let Err(e) = deploy {
         let _ = fs::remove_dir_all(&project_path).await;
@@ -149,7 +151,9 @@ pub async fn copy_project(
         return Err(AppError::business("Source project does not exist"));
     }
     if project_dir_nonempty(&target_path).await {
-        return Err(AppError::business("Target project directory already exists"));
+        return Err(AppError::business(
+            "Target project directory already exists",
+        ));
     }
     fs::create_dir_all(&target_path).await?;
     if let Err(e) = crate::service::fs_util::copy_dir_filtered(
@@ -262,8 +266,8 @@ pub async fn export_project(
     } else {
         None
     };
-    let need_repack = export_type == Some("LATEST")
-        || !fs::try_exists(&zip_path).await.unwrap_or(false);
+    let need_repack =
+        export_type == Some("LATEST") || !fs::try_exists(&zip_path).await.unwrap_or(false);
     let repack_result = if need_repack {
         crate::service::zip::pack_dir(
             project_path.clone(),

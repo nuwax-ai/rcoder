@@ -62,8 +62,7 @@ pub fn decode_uri_component(s: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8(out)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn hex_digit(b: u8) -> Option<u8> {
@@ -109,7 +108,11 @@ fn diff_content_by_lines(existing: &str, new: &str) -> (String, i64) {
             changes += 1;
         }
     }
-    let newline = if existing.contains("\r\n") { "\r\n" } else { "\n" };
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     (out.join(newline), changes)
 }
 
@@ -174,7 +177,12 @@ pub async fn specified_files_update(
             )));
         }
         if op_l == "rename"
-            && op.rename_from.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && op
+                .rename_from
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
         {
             return Err(AppError::validation(format!(
                 "files[{i}].renameFrom cannot be empty (rename operation requires)"
@@ -214,7 +222,10 @@ pub async fn specified_files_update(
             }
             "delete" => {
                 if fs::try_exists(&target).await.unwrap_or(false) {
-                    let is_dir = fs::metadata(&target).await.map(|m| m.is_dir()).unwrap_or(false);
+                    let is_dir = fs::metadata(&target)
+                        .await
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
                     if is_dir {
                         let _ = fs::remove_dir_all(&target).await;
                     } else {
@@ -310,7 +321,11 @@ pub async fn all_files_update(
         let is_binary = file.binary == Some(true);
         let is_text = file.binary == Some(false);
         let size_exceeded = file.size_exceeded.unwrap_or(false);
-        let has_contents = file.contents.as_deref().map(|c| !c.is_empty()).unwrap_or(false);
+        let has_contents = file
+            .contents
+            .as_deref()
+            .map(|c| !c.is_empty())
+            .unwrap_or(false);
         // (C) 二进制
         if is_binary {
             if fs::try_exists(&target).await.unwrap_or(false) {
@@ -396,7 +411,14 @@ async fn prune_walk(
             if exclude_dirs.iter().any(|d| d == &name) {
                 continue;
             }
-            Box::pin(prune_walk(root, &full, keep_set, exclude_dirs, protected_files)).await?;
+            Box::pin(prune_walk(
+                root,
+                &full,
+                keep_set,
+                exclude_dirs,
+                protected_files,
+            ))
+            .await?;
         } else if ft.is_file() {
             // 保护: 隐藏文件 / 内容排除名单
             if name.starts_with('.') {

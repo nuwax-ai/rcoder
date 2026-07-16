@@ -20,8 +20,8 @@ pub async fn extract_to(zip_path: PathBuf, dst: PathBuf) -> AppResult<()> {
 fn extract_blocking(zip_path: &Path, dst: &Path) -> AppResult<()> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| AppError::file(format!("zip open failed: {e}")))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| AppError::file(format!("zip parse failed: {e}")))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| AppError::file(format!("zip parse failed: {e}")))?;
     std::fs::create_dir_all(dst)?;
     for i in 0..archive.len() {
         let mut entry = archive

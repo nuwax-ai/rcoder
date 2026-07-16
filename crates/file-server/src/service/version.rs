@@ -108,7 +108,9 @@ pub async fn rollback_version(
     let cur = parse_version(code_version)?;
     let to = parse_version(rollback_to)?;
     if to >= cur {
-        return Err(AppError::validation("rollbackTo must be less than codeVersion"));
+        return Err(AppError::validation(
+            "rollbackTo must be less than codeVersion",
+        ));
     }
     let project_path = resolver.resolve_project(ctx);
     if !fs::try_exists(&project_path).await.unwrap_or(false) {
