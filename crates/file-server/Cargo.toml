@@ -59,3 +59,6 @@ zip = { workspace = true }
 
 # HTTP client (push-skills url fetch)
 reqwest = { workspace = true }
+
+# Git (gix, 纯 Rust)
+gix = { workspace = true }

@@ -2,6 +2,7 @@
 
 pub mod code;
 pub mod fs_util;
+pub mod git;
 pub mod project;
 pub mod skills;
 pub mod tree;
