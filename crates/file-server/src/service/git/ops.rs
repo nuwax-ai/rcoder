@@ -286,7 +286,7 @@ fn apply_tree_to_worktree(
     let new_backing = new_index.path_backing();
     // 写所有 target 文件到 worktree
     for entry in new_index.entries() {
-        let path = entry.path_in(&new_backing);
+        let path = entry.path_in(new_backing);
         let blob = repo
             .find_blob(entry.id)
             .map_err(|e| map_git_err(e, "git find_blob (checkout)"))?;
@@ -303,7 +303,7 @@ fn apply_tree_to_worktree(
             .map_err(|e| map_git_err(e, "git index_from_tree (old)"))?;
         let old_backing = old_index.path_backing();
         for entry in old_index.entries() {
-            let path = entry.path_in(&old_backing);
+            let path = entry.path_in(old_backing);
             if new_index
                 .entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted)
                 .is_none()

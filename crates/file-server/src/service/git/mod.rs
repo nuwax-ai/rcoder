@@ -119,7 +119,7 @@ pub fn ensure_gitignore(path: &Path) -> AppResult<()> {
     let existing: Vec<&str> = current.lines().map(str::trim).collect();
     let mut to_append = Vec::new();
     for entry in DEFAULT_GITIGNORE_ENTRIES {
-        if !existing.iter().any(|l| *l == *entry) {
+        if !existing.contains(entry) {
             to_append.push(*entry);
         }
     }

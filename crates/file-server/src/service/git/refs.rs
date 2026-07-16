@@ -37,8 +37,6 @@ pub fn delete_branch(repo: &gix::Repository, name: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 切换分支: 见 [`crate::service::git::ops::switch_branch`] (实现在 ops 模块)。
-
 /// 创建标签 (对齐 nuwax createTag; message 非空 → annotated, 否则 lightweight)。
 pub fn create_tag(repo: &gix::Repository, name: &str, message: Option<&str>) -> AppResult<()> {
     let head_id = repo

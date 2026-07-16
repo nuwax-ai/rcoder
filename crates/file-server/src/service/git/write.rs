@@ -98,7 +98,7 @@ pub fn commit_indexed(
         if entry.stage() != gix::index::entry::Stage::Unconflicted {
             continue;
         }
-        let path = entry.path_in(&path_backing);
+        let path = entry.path_in(path_backing);
         let kind = match entry.mode {
             gix::index::entry::Mode::FILE => gix::object::tree::EntryKind::Blob,
             gix::index::entry::Mode::FILE_EXECUTABLE => {
