@@ -135,7 +135,20 @@ pub fn ensure_repo(path: &Path) -> AppResult<gix::Repository> {
     if is_git_repo(path) {
         gix::open(path).map_err(|e| AppError::system(format!("git open failed: {e}")))
     } else {
-        gix::init(path).map_err(|e| AppError::system(format!("git init failed: {e}")))
+        let repo = gix::init(path).map_err(|e| AppError::system(format!("git init failed: {e}")))?;
+        // 新 repo 无 .git/index 文件, 从空 tree 创建空 index (否则首次 stage 的 open_index 失败)
+        let empty_id = repo
+            .head_tree_id_or_empty()
+            .map_err(|e| AppError::system(format!("git head_tree: {e}")))?
+            .detach();
+        let mut idx = repo
+            .index_from_tree(&empty_id)
+            .map_err(|e| AppError::system(format!("git index_from_tree: {e}")))?;
+        idx.remove_tree();
+        idx
+            .write(gix::index::write::Options::default())
+            .map_err(|e| AppError::system(format!("git index write: {e}")))?;
+        Ok(repo)
     }
 }
 

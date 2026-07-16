@@ -18,6 +18,11 @@ pub fn router() -> Router<AppState> {
         .route("/log", get(log_history))
         .route("/file-content", post(file_content))
         .route("/status", get(status))
+        .route("/init", post(init))
+        .route("/add", post(add))
+        .route("/commit", post(commit))
+        .route("/unstage", post(unstage))
+        .route("/discard", post(discard))
 }
 
 #[derive(Deserialize)]
@@ -216,5 +221,213 @@ async fn status(
         "ahead": 0,
         "behind": 0,
         "tracking": null,
+    })))
+}
+
+// ── 写操作 ──────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWriteBody {
+    workspace_type: String,
+    project_id: Option<String>,
+    user_id: Option<String>,
+    c_id: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    space_id: Option<String>,
+    #[serde(default)]
+    isolation_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FilesBody {
+    #[serde(flatten)]
+    base: GitWriteBody,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitBody {
+    #[serde(flatten)]
+    base: GitWriteBody,
+    message: String,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+    #[serde(default)]
+    author_name: Option<String>,
+    #[serde(default)]
+    author_email: Option<String>,
+}
+
+fn resolve_body(
+    state: &AppState,
+    body: &GitWriteBody,
+) -> Result<(std::path::PathBuf, String), AppError> {
+    let project_ctx = body.project_id.clone().map(|id| ProjectContext {
+        project_id: id,
+        tenant_id: body.tenant_id.clone(),
+        space_id: body.space_id.clone(),
+        isolation_type: body.isolation_type.clone(),
+    });
+    let computer_ctx = match (&body.user_id, &body.c_id) {
+        (Some(u), Some(c)) => Some(ComputerContext {
+            user_id: u.clone(),
+            cid: c.clone(),
+        }),
+        _ => None,
+    };
+    let target = git::resolve_target(
+        &*state.resolver,
+        &body.workspace_type,
+        project_ctx.as_ref(),
+        computer_ctx.as_ref(),
+    )?;
+    Ok((target.path().to_path_buf(), target.log_id()))
+}
+
+/// `POST /api/git/init`
+async fn init(
+    State(state): State<AppState>,
+    Json(body): Json<GitWriteBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body)?;
+    let an = state.config.git_default_author_name.clone();
+    let ae = state.config.git_default_author_email.clone();
+    let already = tokio::task::spawn_blocking(move || git::init_repo(&path, &an, &ae))
+        .await
+        .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Git repository initialized",
+        "logId": log_id,
+        "alreadyExists": already,
+    })))
+}
+
+/// `POST /api/git/add`
+async fn add(
+    State(state): State<AppState>,
+    Json(body): Json<FilesBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let files = body.files.unwrap_or_default();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::stage_files(&repo, &files)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Files staged successfully",
+        "logId": log_id,
+    })))
+}
+
+/// `POST /api/git/commit`
+async fn commit(
+    State(state): State<AppState>,
+    Json(body): Json<CommitBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let message = body.message;
+    let files = body.files.unwrap_or_default();
+    let an = body
+        .author_name
+        .unwrap_or_else(|| state.config.git_default_author_name.clone());
+    let ae = body
+        .author_email
+        .unwrap_or_else(|| state.config.git_default_author_email.clone());
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<String>, AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::stage_files(&repo, &files)?;
+        let st = git::get_status(&repo)?;
+        if st.staged.is_empty() {
+            return Ok(None);
+        }
+        let hash = git::commit_indexed(&repo, &message, &an, &ae)?;
+        Ok(Some(hash))
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    match result {
+        Some(hash) => Ok(Json(json!({
+            "success": true,
+            "message": "Commit successful",
+            "logId": log_id,
+            "commit": hash,
+            "summary": { "changes": 1 },
+        }))),
+        None => Ok(Json(json!({
+            "success": true,
+            "message": "Nothing to commit",
+            "logId": log_id,
+            "nothingToCommit": true,
+        }))),
+    }
+}
+
+/// `POST /api/git/unstage`
+async fn unstage(
+    State(state): State<AppState>,
+    Json(body): Json<FilesBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let files = body.files.unwrap_or_default();
+    let all = files.is_empty();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::unstage_files(&repo, &files)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Files unstaged successfully",
+        "logId": log_id,
+        "files": if all { "all" } else { "" },
+    })))
+}
+
+/// `POST /api/git/discard`
+async fn discard(
+    State(state): State<AppState>,
+    Json(body): Json<FilesBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let files = body.files.unwrap_or_default();
+    let count = files.len();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::discard_files(&repo, &files)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Changes discarded successfully",
+        "logId": log_id,
+        "discardedCount": count,
     })))
 }
