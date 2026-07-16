@@ -62,3 +62,6 @@ reqwest = { workspace = true }
 
 # Git (gix, 纯 Rust)
 gix = { workspace = true }
+
+# Unix 进程信号 (dev server 进程组 kill)
+nix = { workspace = true }

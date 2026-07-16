@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{Router, routing::get};
-use file_server::{AppState, Config, LocalWorkspaceResolver, handler};
+use file_server::{AppState, Config, DevServerManager, LocalWorkspaceResolver, handler};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -26,15 +26,18 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
+    let config = Arc::new(Config::from_env());
     let state = AppState {
         resolver: Arc::new(LocalWorkspaceResolver::from_env()),
-        config: Arc::new(Config::from_env()),
+        dev_server: Arc::new(DevServerManager::new(config.clone())),
+        config,
     };
 
     let app = Router::<AppState>::new()
         .route("/health", get(handler::health))
         .nest("/api/project", file_server::routes::project_api_router())
         .nest("/api/git", file_server::routes::git_router())
+        .nest("/api/build", file_server::routes::build_router())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

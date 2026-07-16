@@ -22,6 +22,13 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_port(key: &str, default: u16) -> u16 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
 fn env_list(key: &str, default: &str) -> Vec<String> {
     std::env::var(key)
         .unwrap_or_else(|_| default.to_string())
@@ -77,6 +84,30 @@ pub struct Config {
     // —— 模板 ——
     pub init_project_name_react: String,
     pub init_project_name_vue3: String,
+
+    // —— Dev server 进程管理 (对齐 nuwax processManager) ——
+    pub deployment_mode: String,
+    pub fast_restart_enabled: bool,
+    pub computer_log_dir: PathBuf,
+    pub template_cache_dir: PathBuf,
+    pub node_modules_local_dir: PathBuf,
+    pub bash_path: String,
+    /// 端口池范围 [start, end] (对齐 nuwax portPool 硬编码 4000-55000)。
+    pub dev_port_range_start: u16,
+    pub dev_port_range_end: u16,
+    /// 端口池保留区 (跳过, 对齐 nuwax 8000-9000)。
+    pub dev_port_reserved_start: u16,
+    pub dev_port_reserved_end: u16,
+    /// 存活探活单次超时 ms (对齐 nuwax 1500)。
+    pub dev_alive_check_timeout_ms: u64,
+    /// 存活轮询上限 ms (对齐 nuwax 30000; 超时仍返回成功)。
+    pub dev_alive_max_wait_ms: u64,
+    /// stop 后等进程退出轮询间隔 ms (对齐 nuwax 100)。
+    pub dev_stop_check_interval_ms: u64,
+    /// stop 后最大轮询次数 (对齐 nuwax 50, 合计 5s)。
+    pub dev_stop_max_attempts: u32,
+    /// build/install 命令超时秒 (对齐 nuwax 10min)。
+    pub dev_command_timeout_secs: u64,
 }
 
 impl Config {
@@ -118,6 +149,21 @@ impl Config {
             git_default_author_email: env_str("GIT_DEFAULT_AUTHOR_EMAIL", "git@nuwax.com"),
             init_project_name_react: env_str("INIT_PROJECT_NAME_REACT", "react-vite-template"),
             init_project_name_vue3: env_str("INIT_PROJECT_NAME_VUE3", "vue3-vite-template"),
+            deployment_mode: env_str("DEPLOYMENT_MODE", "docker-compose"),
+            fast_restart_enabled: env_bool("FAST_RESTART_ENABLED", false),
+            computer_log_dir: PathBuf::from(env_str("COMPUTER_LOG_DIR", "/app/logs/computer_logs")),
+            template_cache_dir: PathBuf::from(env_str("TEMPLATE_CACHE_DIR", "/local-cache/templates")),
+            node_modules_local_dir: PathBuf::from(env_str("NODE_MODULES_LOCAL_DIR", "/local-cache/node-modules")),
+            bash_path: env_str("BASH_PATH", ""),
+            dev_port_range_start: env_port("DEV_PORT_RANGE_START", 4000),
+            dev_port_range_end: env_port("DEV_PORT_RANGE_END", 55000),
+            dev_port_reserved_start: env_port("DEV_PORT_RESERVED_START", 8000),
+            dev_port_reserved_end: env_port("DEV_PORT_RESERVED_END", 9000),
+            dev_alive_check_timeout_ms: env_u64("DEV_ALIVE_CHECK_TIMEOUT_MS", 1500),
+            dev_alive_max_wait_ms: env_u64("DEV_ALIVE_MAX_WAIT_MS", 30000),
+            dev_stop_check_interval_ms: env_u64("DEV_STOP_CHECK_INTERVAL_MS", 100),
+            dev_stop_max_attempts: env_u64("DEV_STOP_MAX_ATTEMPTS", 50) as u32,
+            dev_command_timeout_secs: env_u64("DEV_COMMAND_TIMEOUT_SECS", 600),
         }
     }
 
