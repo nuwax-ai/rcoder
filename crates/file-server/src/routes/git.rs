@@ -23,6 +23,7 @@ pub fn router() -> Router<AppState> {
         .route("/commit", post(commit))
         .route("/unstage", post(unstage))
         .route("/discard", post(discard))
+        .route("/diff", post(diff))
         .route("/branch-create", post(branch_create))
         .route("/branch-delete", post(branch_delete))
         .route("/tag-create", post(tag_create))
@@ -433,6 +434,59 @@ async fn discard(
         "message": "Changes discarded successfully",
         "logId": log_id,
         "discardedCount": count,
+    })))
+}
+
+// ── diff ───────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiffBody {
+    #[serde(flatten)]
+    base: GitWriteBody,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+}
+
+/// `POST /api/git/diff` (对齐 nuwax diff; source: worktree|staged|commit, 默认 worktree)。
+async fn diff(
+    State(state): State<AppState>,
+    Json(body): Json<DiffBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let source = git::DiffSource::parse(&body.source)?;
+    let params = git::DiffParams {
+        source,
+        from: body.from.clone(),
+        to: body.to.clone(),
+        paths: body.paths.clone().unwrap_or_default(),
+    };
+    let result = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::compute_diff(&repo, &params)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "logId": log_id,
+        "source": body.source,
+        "diff": result.diff,
+        "summary": {
+            "files": result.files,
+            "insertions": result.insertions,
+            "deletions": result.deletions,
+        },
     })))
 }
 

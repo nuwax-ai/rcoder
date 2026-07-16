@@ -3,10 +3,12 @@
 //! 拆分: 本模块 (公共) / [`read`] (读) / [`write`] (写); 后续 diff/reset/checkout 再加子模块。
 //! gix 同步库且 `Repository` `!Send`, 函数均同步; axum handler 经 `spawn_blocking` 调用。
 
+pub mod diff;
 pub mod read;
 pub mod refs;
 pub mod write;
 
+pub use diff::*;
 pub use read::*;
 pub use refs::*;
 pub use write::*;
