@@ -1,6 +1,6 @@
 //! Git refs CRUD (branch/tag create/delete/switch)。
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 
 use super::map_git_err;
 
@@ -37,13 +37,7 @@ pub fn delete_branch(repo: &gix::Repository, name: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 切换分支 (对齐 nuwax switchBranch)。
-/// TODO: 需更新 HEAD symbolic ref + gix_worktree_state::checkout 重置 worktree, 当前未实现。
-pub fn switch_branch(_repo: &gix::Repository, _name: &str) -> AppResult<()> {
-    Err(AppError::system(
-        "switch_branch not yet implemented (需 gix checkout worktree 组合)",
-    ))
-}
+/// 切换分支: 见 [`crate::service::git::ops::switch_branch`] (实现在 ops 模块)。
 
 /// 创建标签 (对齐 nuwax createTag; message 非空 → annotated, 否则 lightweight)。
 pub fn create_tag(repo: &gix::Repository, name: &str, message: Option<&str>) -> AppResult<()> {

@@ -24,8 +24,12 @@ pub fn router() -> Router<AppState> {
         .route("/unstage", post(unstage))
         .route("/discard", post(discard))
         .route("/diff", post(diff))
+        .route("/reset", post(reset))
+        .route("/checkout", post(checkout))
+        .route("/revert", post(revert))
         .route("/branch-create", post(branch_create))
         .route("/branch-delete", post(branch_delete))
+        .route("/branch-switch", post(branch_switch))
         .route("/tag-create", post(tag_create))
         .route("/tag-delete", post(tag_delete))
 }
@@ -490,6 +494,137 @@ async fn diff(
     })))
 }
 
+// ── reset / checkout / revert ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetBody {
+    #[serde(flatten)]
+    base: GitWriteBody,
+    target: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetBody {
+    #[serde(flatten)]
+    base: GitWriteBody,
+    target: String,
+    #[serde(default)]
+    mode: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevertBody {
+    #[serde(flatten)]
+    base: GitWriteBody,
+    target: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    author_name: Option<String>,
+    #[serde(default)]
+    author_email: Option<String>,
+}
+
+/// `POST /api/git/reset` (对齐 nuwax reset; mode: soft|mixed|hard, 默认 mixed)。
+async fn reset(
+    State(state): State<AppState>,
+    Json(body): Json<ResetBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let target = body.target.clone();
+    let mode = git::ResetMode::parse(&body.mode)?;
+    let mode_label = body.mode.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::reset(&repo, &target, mode)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("Reset ({}) to {} successful", mode_label, body.target),
+        "logId": log_id,
+        "target": body.target,
+        "mode": mode_label,
+        "previousHead": outcome.previous_head,
+    })))
+}
+
+/// `POST /api/git/checkout` (对齐 nuwax checkout; 恢复 target 整棵 tree, 不删多余文件, 不动 HEAD)。
+async fn checkout(
+    State(state): State<AppState>,
+    Json(body): Json<TargetBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let target = body.target.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::checkout_tree(&repo, &target)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("Checkout files from {} successful", body.target),
+        "logId": log_id,
+        "target": body.target,
+    })))
+}
+
+/// `POST /api/git/revert` (对齐 nuwax revert; 把 tree 重置到 target 但用新 commit 保留历史)。
+async fn revert(
+    State(state): State<AppState>,
+    Json(body): Json<RevertBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let target = body.target.clone();
+    let message = body.message.clone();
+    let an = body
+        .author_name
+        .unwrap_or_else(|| state.config.git_default_author_name.clone());
+    let ae = body
+        .author_email
+        .unwrap_or_else(|| state.config.git_default_author_email.clone());
+    let outcome = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::revert_to_commit(&repo, &target, message.as_deref(), &an, &ae)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    match outcome.commit {
+        Some(hash) => Ok(Json(json!({
+            "success": true,
+            "message": "Revert successful",
+            "logId": log_id,
+            "commit": hash,
+            "target": outcome.target,
+            "previousHead": outcome.previous_head,
+        }))),
+        None => Ok(Json(json!({
+            "success": true,
+            "message": "Nothing to revert, already at target state",
+            "logId": log_id,
+            "nothingToCommit": true,
+            "target": outcome.target,
+        }))),
+    }
+}
+
 // ── branch / tag CRUD ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -615,5 +750,27 @@ async fn tag_delete(
         "message": "Tag deleted successfully",
         "logId": log_id,
         "tagName": body.tag_name,
+    })))
+}
+
+/// `POST /api/git/branch-switch` (对齐 nuwax switchBranch; 切到已存在分支)。
+async fn branch_switch(
+    State(state): State<AppState>,
+    Json(body): Json<BranchNameBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let name = body.branch_name.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::switch_branch(&repo, &name)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Branch switched successfully",
+        "logId": log_id,
+        "branchName": body.branch_name,
     })))
 }
