@@ -119,12 +119,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent_provisioning"
+version = "0.1.2"
+dependencies = [
+ "chrono",
+ "dashmap",
+ "download_utils",
+ "serde",
+ "serde_json",
+ "shared_types",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "agent_runner"
 version = "0.1.2"
 dependencies = [
  "agent-client-protocol",
  "agent_abstraction",
  "agent_config",
+ "agent_provisioning",
  "anyhow",
  "arc-swap",
  "async-stream",
@@ -5073,6 +5091,7 @@ dependencies = [
 name = "rcoder"
 version = "0.1.2"
 dependencies = [
+ "agent_provisioning",
  "anyhow",
  "arc-swap",
  "async-stream",

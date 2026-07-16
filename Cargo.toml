@@ -13,6 +13,7 @@ default-members = [
     "crates/rcoder-cli",
     "crates/rcoder-gateway",
     "crates/download_utils",
+    "crates/agent_provisioning",
 ]
 
 
@@ -255,6 +256,7 @@ shared_types_grpc = { path = "crates/shared_types_grpc" }
 shared_types_i18n = { path = "crates/shared_types_i18n" }
 agent_config = { path = "crates/agent_config" }
 agent_abstraction = { path = "crates/agent_abstraction" }
+agent_provisioning = { path = "crates/agent_provisioning" }
 docker_manager = { path = "crates/docker_manager" }
 rcoder-proxy = { path = "crates/rcoder-proxy" }
 container-runtime-api = { path = "crates/container-runtime-api" }

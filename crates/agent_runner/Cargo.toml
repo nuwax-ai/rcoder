@@ -47,6 +47,7 @@ shared_types_grpc = { workspace = true }
 shared_types_i18n = { workspace = true }
 agent_config = { workspace = true }
 agent_abstraction = { workspace = true }
+agent_provisioning = { workspace = true }
 download_utils = { workspace = true }
 rcoder-proxy = { workspace = true, optional = true }
 rcoder-telemetry = { workspace = true }

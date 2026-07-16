@@ -331,7 +331,7 @@ fn read_registry_from_file(
         )
     })?;
 
-    let manifests: Vec<crate::agent_download::registry_update::AgentManifest> =
+    let manifests: Vec<agent_provisioning::AgentManifest> =
         serde_json::from_str(&data).map_err(|e| {
             AppError::with_message(
                 ec::ERR_INTERNAL_SERVER_ERROR,
@@ -792,8 +792,8 @@ pub async fn install_from_url(
         .as_deref()
         .ok_or_else(|| AppError::with_message(ec::ERR_VALIDATION, "version is required"))?;
 
-    let (download_result, platform_key) = super::agent_install_strategy::do_install_from_url(
-        &state,
+    let (download_result, platform_key) = agent_provisioning::install_agent(
+        &state.agent_download_manager,
         &body.agent.agent_id,
         version,
         &body.agent.command,

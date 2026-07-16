@@ -32,7 +32,11 @@ pub trait AppServiceTrait: Send + Sync {
 
     /// 更新应用（全量替换 desired state）。rcoder 无状态，调用方需发送完整新状态
     /// （`image` 必填）。K8s SSA re-apply 幂等；Docker 重建容器。详见 v2 设计 §5.2。
-    async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> AppResult<AppRuntimeInfo>;
+    async fn update_app(
+        &self,
+        app_id: &str,
+        request: UpdateAppRequest,
+    ) -> AppResult<AppRuntimeInfo>;
 
     /// 删除应用（删计算资源；持久存储默认保留，purge=true 才清空数据面。v2 §5.3）
     async fn delete_app(&self, app_id: &str, purge: bool) -> AppResult<()>;

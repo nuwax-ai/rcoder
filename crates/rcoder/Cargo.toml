@@ -38,6 +38,7 @@ shared_types = { workspace = true }
 rcoder-proxy = { workspace = true }
 container-runtime-api = { workspace = true }
 download_utils = { workspace = true }
+agent_provisioning = { workspace = true }
 
 # 🚀 无锁配置热更新
 arc-swap = { workspace = true }

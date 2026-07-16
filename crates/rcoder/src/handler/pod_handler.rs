@@ -204,9 +204,7 @@ pub(crate) fn resolve_resource_limits_from_config(
         }
         None => (None, false),
     };
-    if swap_fixed
-        && let Some(ref r) = result
-    {
+    if swap_fixed && let Some(ref r) = result {
         warn!(
             "[RESOURCE_LIMITS] service_type={:?}: swap < memory,自动修正 swap = memory × 2 \
              (memory={:.1}Gi → swap={:.1}Gi)",
@@ -880,7 +878,13 @@ pub async fn pod_list(
                 .unwrap_or_else(|| docker_container.container_ip.clone()),
             service_url: stored_record
                 .map(|r| r.service_url.clone())
-                .unwrap_or_else(|| format!("http://{}:{}", docker_container.container_ip, shared_types::HTTP_DEFAULT_PORT)),
+                .unwrap_or_else(|| {
+                    format!(
+                        "http://{}:{}",
+                        docker_container.container_ip,
+                        shared_types::HTTP_DEFAULT_PORT
+                    )
+                }),
             status: String::from(docker_container.status.clone()),
             service_type: service_type.to_string(),
             project_id,
@@ -1387,8 +1391,11 @@ pub async fn pod_ensure(
                             container_identifier
                         );
 
-                        let resource_limits =
-                            resolve_resource_limits_from_config(&state, &service_type, request.resource_limits)?;
+                        let resource_limits = resolve_resource_limits_from_config(
+                            &state,
+                            &service_type,
+                            request.resource_limits,
+                        )?;
 
                         // 设置创建标记
                         state
@@ -1916,7 +1923,8 @@ pub async fn pod_restart(
     }
 
     // 4. 定义资源限制（API 入参优先，缺失字段回退 configmap 默认值）
-    let resource_limits = resolve_resource_limits_from_config(&state, &service_type, request.resource_limits)?;
+    let resource_limits =
+        resolve_resource_limits_from_config(&state, &service_type, request.resource_limits)?;
 
     // 5. 强制创建新容器
     info!(

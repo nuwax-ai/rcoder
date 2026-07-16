@@ -14,9 +14,7 @@ pub use agent_mgmt_forward::{
     status_to_app_error, uninstall_agent,
 };
 #[allow(unused_imports)]
-pub use grpc_addr::{
-    container_identity_from_name, extract_grpc_addr, extract_grpc_addr_with_port,
-};
+pub use grpc_addr::{container_identity_from_name, extract_grpc_addr, extract_grpc_addr_with_port};
 pub use i18n_extractors::{I18nJsonOrQuery, I18nPath, I18nQuery};
 pub use locale::get_locale_from_headers;
 pub use paths::{

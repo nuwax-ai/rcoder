@@ -1,10 +1,7 @@
 //! Agent 下载管理器
 //!
-//! 负责将 Agent 下载到统一缓存目录，并复制到 agent-runner 的安装目录。
+//! 负责将 Agent 下载到统一缓存目录，并复制/解压到安装目录。
 //! 使用 `download_utils` crate 提供的下载和解压功能。
-
-pub mod error;
-pub mod registry_update;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +13,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use error::AgentDownloadError;
+use crate::error::AgentDownloadError;
 
 /// Validate that an identifier (agent_id or version) is safe for path construction.
 ///
@@ -244,6 +241,14 @@ impl AgentDownloadManager {
         None
     }
 
+    /// 判断目录是否存在且非空
+    async fn is_non_empty_dir(path: &Path) -> bool {
+        match tokio::fs::read_dir(path).await {
+            Ok(mut it) => it.next_entry().await.map(|e| e.is_some()).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// 从缓存复制到目标目录并解压
     ///
     /// 支持 tar.gz 和 zip 格式的自动解压。
@@ -276,7 +281,19 @@ impl AgentDownloadManager {
             )));
         }
 
-        // 如果目标已存在，先删除（确保干净复制）
+        // 目标已存在且非空 → 已安装，跳过复制
+        // （避免重复解压；更重要的是避免删除"正被 agent 进程读取"的 bundle，引发并发竞态）
+        if target.exists() && Self::is_non_empty_dir(&target).await {
+            info!(
+                agent_id = %agent_id,
+                version = %version,
+                target = %target.display(),
+                "copy_to_target: target already installed, skipping"
+            );
+            return Ok(target);
+        }
+
+        // 目标存在但为空 / 不完整 → 删除后重新解压（确保干净复制）
         if target.exists() {
             tokio::fs::remove_dir_all(&target).await?;
         }

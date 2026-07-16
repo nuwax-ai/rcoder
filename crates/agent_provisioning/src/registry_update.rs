@@ -1,6 +1,6 @@
 //! Registry 更新函数
 //!
-//! 用于 rcoder 更新 agent-runner 的 registry.json 文件。
+//! 更新安装目录下的 registry.json 文件。
 //! 使用与 agent_runner 兼容的 JSON 格式。
 
 use std::path::Path;
@@ -30,7 +30,7 @@ pub struct AgentManifest {
     pub installed_at: i64,
 }
 
-/// 更新 agent-runner 的 registry.json
+/// 更新安装目录下的 registry.json
 ///
 /// 将新安装的 agent 信息写入 registry，支持多版本。
 /// 写入的格式与 agent_runner 的 Vec<AgentManifest> 兼容。

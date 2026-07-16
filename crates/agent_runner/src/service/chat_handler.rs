@@ -346,6 +346,80 @@ pub async fn handle_chat_core(
                         error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
                     );
                 }
+
+                // 兜底自装：bundle 缺失时（正常情况 rcoder 已装好，走不到这里）主动安装。
+                // 判据布局无关：{install_root}/{agent_id}/{version} 目录存在且非空。
+                // 这样把"bundle 缺失 → spawn node 崩溃 → ACP InitializeRequest 50s 超时"
+                // 变成"自装成功 / fail-fast 明确报错"。
+                let install_root = crate::agent_mgmt::path_manager::PathManager::new()
+                    .install_dir()
+                    .to_path_buf();
+                let agent_id = server.agent_id.as_deref().unwrap_or("");
+                let version = server.version.as_deref().unwrap_or("");
+                let can_self_install = !agent_id.is_empty()
+                    && !version.is_empty()
+                    && server.platforms.as_ref().is_some_and(|p| !p.is_empty());
+
+                if can_self_install
+                    && !agent_provisioning::is_agent_installed(&install_root, agent_id, version)
+                {
+                    warn!(
+                        "[ChatHandler] bundle missing, triggering fallback self-install: \
+                         agent_id={}, version={}, install_root={}",
+                        agent_id,
+                        version,
+                        install_root.display()
+                    );
+                    let cache_dir = install_root
+                        .parent()
+                        .map(|p| p.join(".acp-agent-cache"))
+                        .unwrap_or_else(|| PathBuf::from("/tmp/.acp-agent-cache"));
+                    let mgr = match agent_provisioning::AgentDownloadManager::new(cache_dir) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!(
+                                "[ChatHandler] fallback self-install: cache dir init failed: {}",
+                                e
+                            );
+                            return ChatHandlerOutput::error(
+                                project_id,
+                                session_id.unwrap_or_default(),
+                                format!("agent cache dir unavailable: {}", e),
+                                error_codes::ERR_AGENT_MGMT_INSTALL_FAILED.to_string(),
+                            );
+                        }
+                    };
+                    let args = server.args.clone().unwrap_or_default();
+                    let platforms = server.platforms.clone().unwrap_or_default();
+                    if let Err(e) = agent_provisioning::install_agent(
+                        &mgr,
+                        agent_id,
+                        version,
+                        command,
+                        &args,
+                        &platforms,
+                        &install_root,
+                    )
+                    .await
+                    {
+                        error!(
+                            "[ChatHandler] fallback self-install FAILED: agent_id={}, \
+                             version={}, error={:?}",
+                            agent_id, version, e
+                        );
+                        return ChatHandlerOutput::error(
+                            project_id,
+                            session_id.unwrap_or_default(),
+                            format!("agent bundle missing and self-install failed: {}", e),
+                            error_codes::ERR_AGENT_MGMT_INSTALL_FAILED.to_string(),
+                        );
+                    }
+                    warn!(
+                        "[ChatHandler] fallback self-install OK: agent_id={}, version={}",
+                        agent_id, version
+                    );
+                }
+
                 checker::get_agent_version(command).await
             } else {
                 None

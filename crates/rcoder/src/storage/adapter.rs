@@ -2050,11 +2050,7 @@ mod tests {
         // 关键断言 2：find_by_user_id("6", Computer) → Computer 容器 IP（按 service_type 过滤，不串到 Web）
         assert_eq!(
             adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner),
-            Some(adapter.resolve_backend_addr(&mk_container(
-                "cid-comp",
-                "10.0.0.1",
-                "proj-A",
-            ))),
+            Some(adapter.resolve_backend_addr(&mk_container("cid-comp", "10.0.0.1", "proj-A",))),
             "Computer 查找应命中 Computer 容器，不被同 user 的 Web 项目影响"
         );
 
@@ -2095,11 +2091,7 @@ mod tests {
         // 且 Computer 查找仍正常
         assert_eq!(
             adapter.find_by_user_id("user-6", &ServiceType::ComputerAgentRunner),
-            Some(adapter.resolve_backend_addr(&mk_container(
-                "cid-comp",
-                "10.0.0.1",
-                "proj-A",
-            ))),
+            Some(adapter.resolve_backend_addr(&mk_container("cid-comp", "10.0.0.1", "proj-A",))),
             "删除 Web 项目后，Computer 查找应仍命中 Computer 容器"
         );
     }

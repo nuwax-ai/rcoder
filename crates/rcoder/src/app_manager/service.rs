@@ -118,16 +118,9 @@ impl AppService {
         let params = self.build_container_params(&app_id, &request)?;
 
         // 3. 创建 Deployment / 容器（K8s 含 ConfigMap/Secret/Service/HTTPRoute/NodePort）
-        let container_info = self
-            .runtime
-            .create_deployment(params)
-            .await
-            .map_err(|e| {
-                map_runtime_error(
-                    &format!("[APP] create_deployment 失败 app_id={app_id}"),
-                    e,
-                )
-            })?;
+        let container_info = self.runtime.create_deployment(params).await.map_err(|e| {
+            map_runtime_error(&format!("[APP] create_deployment 失败 app_id={app_id}"), e)
+        })?;
         info!(
             "[APP] 应用资源创建成功: {} (container={})",
             app_id, container_info.container_name
@@ -302,16 +295,9 @@ impl AppService {
         let params = self.build_container_params_from_update(app_id, &request)?;
         // Docker 模式：旧容器 IP 即将失效，先注销 Pingora backend（K8s no-op）
         self.unregister_pingora_backends(app_id).await;
-        let info = self
-            .runtime
-            .patch_deployment(params)
-            .await
-            .map_err(|e| {
-                map_runtime_error(
-                    &format!("[APP] patch_deployment 失败 app_id={app_id}"),
-                    e,
-                )
-            })?;
+        let info = self.runtime.patch_deployment(params).await.map_err(|e| {
+            map_runtime_error(&format!("[APP] patch_deployment 失败 app_id={app_id}"), e)
+        })?;
         // Docker 模式：新容器 IP，重新注册 Pingora backend（K8s no-op）
         let http_ports = http_port_numbers(&request.ports);
         self.register_pingora_backends(app_id, &http_ports, &info.container_ip)
@@ -331,15 +317,9 @@ impl AppService {
 
         // 2. 删除计算资源（K8s: Deployment/Service/HTTPRoute/NodePort/ConfigMap/Secret
         //    + label orphan 扫描兜底；Docker: 容器）。持久存储默认保留。
-        self.runtime
-            .delete_deployment(app_id)
-            .await
-            .map_err(|e| {
-                map_runtime_error(
-                    &format!("[APP] delete_deployment 失败 app_id={app_id}"),
-                    e,
-                )
-            })?;
+        self.runtime.delete_deployment(app_id).await.map_err(|e| {
+            map_runtime_error(&format!("[APP] delete_deployment 失败 app_id={app_id}"), e)
+        })?;
 
         // 3. 仅 purge=true 时清空持久存储（code/data/logs 目录）。
         //    默认保留：应用可重建，数据不可再生（v2 §5.3 数据安全）。
@@ -421,7 +401,9 @@ impl AppService {
             return Err(AppOperationError::Validation("page 从 1 开始".to_string()));
         }
         if request.page_size == 0 || request.page_size > 100 {
-            return Err(AppOperationError::Validation("page_size 须在 1..=100".to_string()));
+            return Err(AppOperationError::Validation(
+                "page_size 须在 1..=100".to_string(),
+            ));
         }
         let filters = request.filters.unwrap_or_default();
         if filters.tenant_id.is_some() || filters.space_id.is_some() {
@@ -523,7 +505,10 @@ impl AppService {
             Ok(Some(_)) => false,
             Err(e) => {
                 // 瞬时 API 错误保守视为"非 orphan"（避免误删在用数据），但落日志可见
-                warn!("[APP] is_storage_orphan 查询状态失败 app_id={}: {}", app_id, e);
+                warn!(
+                    "[APP] is_storage_orphan 查询状态失败 app_id={}: {}",
+                    app_id, e
+                );
                 false
             }
         }
@@ -564,15 +549,9 @@ impl AppService {
     pub async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
         self.ensure_app_exists(app_id).await?;
-        self.runtime
-            .restart_deployment(app_id)
-            .await
-            .map_err(|e| {
-                map_runtime_error(
-                    &format!("[APP] restart_deployment 失败 app_id={app_id}"),
-                    e,
-                )
-            })?;
+        self.runtime.restart_deployment(app_id).await.map_err(|e| {
+            map_runtime_error(&format!("[APP] restart_deployment 失败 app_id={app_id}"), e)
+        })?;
         info!("[APP] 应用已重启 (rollout): {}", app_id);
         self.get_app(app_id).await
     }
@@ -637,12 +616,9 @@ impl AppService {
         app_id: &str,
     ) -> AppResult<Vec<container_runtime_api::AppEventInfo>> {
         validate_app_id(app_id)?;
-        self.runtime
-            .get_app_events(app_id)
-            .await
-            .map_err(|e| {
-                map_runtime_error(&format!("[APP] get_app_events 失败 app_id={app_id}"), e)
-            })
+        self.runtime.get_app_events(app_id).await.map_err(|e| {
+            map_runtime_error(&format!("[APP] get_app_events 失败 app_id={app_id}"), e)
+        })
     }
 
     /// 读取应用文件日志（从 workspace PVC 的 logs/ 目录直接读，不依赖 K8s Pod log API）。
@@ -721,7 +697,9 @@ impl AppService {
                 .canonicalize()
                 .map_err(|e| map_io_error("解析父目录失败", e, false))?;
             if !canonical_parent.starts_with(&canonical_app_dir) {
-                return Err(AppOperationError::Validation("路径不在应用目录内".to_string()));
+                return Err(AppOperationError::Validation(
+                    "路径不在应用目录内".to_string(),
+                ));
             }
         }
         fs::write(&file_path, &file_data)
@@ -740,7 +718,11 @@ impl AppService {
     /// **app-root-relative**（如 "code/app.jar"），可直接作为 upload 的 target / delete 的 path，
     /// 与这两个接口的约定一致。防穿越：子目录 canonicalize 后必须仍在 app 目录内。
     #[instrument(skip(self))]
-    pub async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> AppResult<Vec<FileInfo>> {
+    pub async fn list_files(
+        &self,
+        app_id: &str,
+        subpath: Option<&str>,
+    ) -> AppResult<Vec<FileInfo>> {
         validate_app_id(app_id)?;
         let app_dir = self.get_container_app_dir(app_id);
         if !app_dir.exists() {
@@ -763,7 +745,9 @@ impl AppService {
                     .canonicalize()
                     .map_err(|e| map_io_error("解析子目录失败", e, false))?;
                 if !canonical_full.starts_with(&canonical_app_dir) {
-                    return Err(AppOperationError::Validation("路径不在应用目录内".to_string()));
+                    return Err(AppOperationError::Validation(
+                        "路径不在应用目录内".to_string(),
+                    ));
                 }
                 canonical_full
             }
@@ -827,7 +811,9 @@ impl AppService {
             .canonicalize()
             .map_err(|e| map_io_error("解析应用目录失败", e, false))?;
         if !canonical_path.starts_with(&canonical_app_dir) {
-            return Err(AppOperationError::Validation("路径不在应用目录内".to_string()));
+            return Err(AppOperationError::Validation(
+                "路径不在应用目录内".to_string(),
+            ));
         }
 
         if canonical_path.is_dir() {
@@ -1463,7 +1449,11 @@ impl super::AppServiceTrait for AppService {
         self.get_app(app_id).await
     }
 
-    async fn update_app(&self, app_id: &str, request: UpdateAppRequest) -> AppResult<AppRuntimeInfo> {
+    async fn update_app(
+        &self,
+        app_id: &str,
+        request: UpdateAppRequest,
+    ) -> AppResult<AppRuntimeInfo> {
         self.update_app(app_id, request).await
     }
 

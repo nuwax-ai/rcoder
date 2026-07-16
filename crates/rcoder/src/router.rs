@@ -21,12 +21,12 @@ use serde::Serialize;
 use shared_types::ProjectAndContainerInfo;
 
 use crate::{
-    agent_download::AgentDownloadManager,
     app_manager,
     config::{ApiKeyAuthConfig, AppConfig},
     handler,
     storage::ProjectAdapter,
 };
+use agent_provisioning::AgentDownloadManager;
 use rcoder_telemetry::{HttpMetricsLayer, TelemetryGuard};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
