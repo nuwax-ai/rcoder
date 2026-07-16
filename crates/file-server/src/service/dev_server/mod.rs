@@ -191,6 +191,10 @@ impl DevServerManager {
         // 丢弃 Child 句柄 (kill_on_drop=false → 进程独立存活, 靠 pid 杀)
         drop(child);
 
+        // 就绪轮询 (在登记到 map 之前): 进程早退 → 立即判失败 (端口经 AllocGuard 自动释放),
+        // 避免把"启动失败已死的 vite"当成成功 (vite-rs 靠 sleep 2s 掩盖了这个 bug)
+        self.poll_alive(pid, port, base_path).await?;
+
         lock(&self.processes)?.insert(
             project_id.to_string(),
             DevProcess {
@@ -202,28 +206,40 @@ impl DevServerManager {
                 temp_log_name: log::temp_log_name(now),
             },
         );
-        std::mem::forget(port_alloc); // 分配成功, 不释放
-
-        // 存活轮询 (先等 1s, 每 1s 探一次, 最多 max_wait; 超时仍返回成功 — nuwax 行为)
-        self.poll_alive(port, base_path).await;
+        std::mem::forget(port_alloc); // 分配成功且就绪, 不释放
 
         Ok(StartedDev { pid, port })
     }
 
-    /// 存活轮询 (对齐 nuwax: 先 sleep 1s, 每 1s 探活, 最多 max_wait_ms; 超时不报错)。
-    async fn poll_alive(&self, port: u16, base_path: Option<&str>) {
+    /// 就绪轮询: 进程早退 → Err; HTTP 就绪 → Ok; 超时但进程仍在 → Ok (nuwax 宽松)。
+    async fn poll_alive(&self, pid: u32, port: u16, base_path: Option<&str>) -> AppResult<()> {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let max = self.config.dev_alive_max_wait_ms;
         let timeout = self.config.dev_alive_check_timeout_ms;
         let mut elapsed = 1000u64;
         while elapsed < max {
+            // 进程已退出 (端口冲突 / 配置错 / 依赖缺失) → 立即失败
+            if !is_process_running(pid) {
+                return Err(AppError::system(format!(
+                    "dev server (pid {pid}) exited during startup — 检查 dev 日志 (端口冲突/配置错误/依赖缺失)"
+                )));
+            }
             if is_project_alive(port, base_path, timeout).await {
-                return;
+                return Ok(());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             elapsed += 1000;
         }
-        tracing::warn!("dev server on port {port} not alive after {max}ms (返回成功, nuwax 宽松行为)");
+        // 超时: 进程仍存活但未响应 HTTP → 按 nuwax 宽松返回成功; 若已死则报错
+        if !is_process_running(pid) {
+            return Err(AppError::system(format!(
+                "dev server (pid {pid}) exited during startup"
+            )));
+        }
+        tracing::warn!(
+            "dev server on port {port} (pid {pid}) 未在 {max}ms 内响应 HTTP, 进程仍在 — 返回成功 (nuwax 宽松)"
+        );
+        Ok(())
     }
 
     /// stop-dev (对齐 nuwax stopDevServerByProjectId; 杀整组 + 释放端口 + 清 temp 日志)。
@@ -231,16 +247,32 @@ impl DevServerManager {
         let proc = lock(&self.processes)?.remove(project_id);
         let killed = match proc {
             Some(p) => {
-                let ok = kill_process_group(p.pid);
+                let pid = p.pid;
+                let ok = kill_process_group(pid);
+                // SIGTERM 宽限期 (默认 5s); 仍存活则 SIGKILL 强杀, 避免残留
                 process::wait_for_stop(
-                    p.pid,
+                    pid,
                     self.config.dev_stop_check_interval_ms,
                     self.config.dev_stop_max_attempts,
                 )
                 .await;
+                let mut killed = ok;
+                if is_process_running(pid) {
+                    tracing::warn!(
+                        "dev server (pid {pid}) 未在 SIGTERM 宽限期退出, 升级 SIGKILL"
+                    );
+                    process::kill_process_group_force(pid);
+                    process::wait_for_stop(
+                        pid,
+                        self.config.dev_stop_check_interval_ms,
+                        self.config.dev_stop_max_attempts,
+                    )
+                    .await;
+                    killed = !is_process_running(pid);
+                }
                 self.port_pool.release(project_id);
                 log::cleanup_temp_logs(&p.log_dir).await;
-                vec![KilledPid { pid: p.pid, killed: ok }]
+                vec![KilledPid { pid, killed }]
             }
             None => vec![],
         };
@@ -358,6 +390,9 @@ mod tests {
         assert!(d.args.iter().any(|a| a == "4001"));
         assert!(d.args.iter().any(|a| a == "--strictPort"));
         assert!(d.args.iter().any(|a| a == "0.0.0.0"));
+        // --clearScreen false 抑制 ANSI 清屏转义污染日志
+        assert!(d.args.iter().any(|a| a == "--clearScreen"));
+        assert!(d.args.windows(2).any(|w| w[0] == "--clearScreen" && w[1] == "false"));
         assert!(d.args.iter().any(|a| a == "--base"));
         assert!(d.args.iter().any(|a| a == "/foo/"));
         assert!(d.env_extra.is_empty());

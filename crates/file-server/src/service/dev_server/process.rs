@@ -42,6 +42,9 @@ pub fn build_dev_args(
             "--strictPort".into(),
             "--host".into(),
             "0.0.0.0".into(),
+            // 抑制 ANSI 清屏转义码 (否则污染日志管道), 对齐 vite-rs
+            "--clearScreen".into(),
+            "false".into(),
         ];
         if let Some(b) = &base {
             a.push("--base".into());
@@ -237,6 +240,15 @@ pub fn kill_process_group(pid: u32) -> bool {
     match kill(pgid, Signal::SIGTERM) {
         Ok(()) => true,
         Err(_) => kill(Pid::from_raw(pid as i32), Signal::SIGTERM).is_ok(),
+    }
+}
+
+/// 强杀进程组 (SIGKILL 升级): SIGTERM 宽限期后进程仍存活时调用, 优先 kill(-pid) SIGKILL, 降级 kill(pid)。
+pub fn kill_process_group_force(pid: u32) -> bool {
+    let pgid = Pid::from_raw(-(pid as i32));
+    match kill(pgid, Signal::SIGKILL) {
+        Ok(()) => true,
+        Err(_) => kill(Pid::from_raw(pid as i32), Signal::SIGKILL).is_ok(),
     }
 }
 
