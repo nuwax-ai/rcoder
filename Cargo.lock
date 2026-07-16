@@ -1904,6 +1904,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "file-server"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "chrono",
+ "encoding_rs",
+ "mime_guess",
+ "serde",
+ "serde_json",
+ "shared_types",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-http 0.7.0",
+ "tracing",
+ "tracing-subscriber",
+ "zip 8.6.0",
+]
+
+[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

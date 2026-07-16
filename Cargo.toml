@@ -241,6 +241,10 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 pulldown-cmark = "0.13"
 unicode-width = "0.2"
 
+# 编码检测 / content-type 推断 (file-server)
+encoding_rs = "0.8"
+mime_guess = "2"
+
 # i18n (国际化)
 rust-i18n = "4"
 

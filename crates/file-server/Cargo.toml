@@ -1,0 +1,58 @@
+[package]
+name = "file-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Rust file-server (tree/git/build/dev/upload/skills) — replaces nuwax-file-server, lives in rcoder pod"
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "file_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "file-server"
+path = "src/main.rs"
+
+[dependencies]
+# 共享类型 (WORKSPACE_ROOT / COMPUTER_WORKSPACE_ROOT 常量)
+shared_types = { workspace = true }
+
+# Web 框架
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# 异步运行时
+tokio = { workspace = true, features = ["full"] }
+
+# 日志
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# 序列化
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# 错误处理
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# 时间 (错误响应 timestamp)
+chrono = { workspace = true }
+
+# 编码检测 / content-type 推断
+encoding_rs = { workspace = true }
+mime_guess = { workspace = true }
+
+# Base64 编码 (图片内联)
+base64 = { workspace = true }
+
+# Zip 解压/打包 (模板/upload/export/skills)
+zip = { workspace = true }
