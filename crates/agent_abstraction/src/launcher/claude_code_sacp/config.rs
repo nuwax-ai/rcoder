@@ -8,8 +8,9 @@ use tracing::{debug, warn};
 use super::env::render_model_template;
 use super::types::{
     ENV_AGENT_SDK_SKIP_VERSION_CHECK, ENV_ANTHROPIC_API_KEY, ENV_ANTHROPIC_BASE_URL,
-    ENV_ANTHROPIC_MODEL, ENV_DISABLE_NONESSENTIAL, ENV_OPENAI_API_KEY, ENV_OPENAI_BASE_URL,
-    ENV_OPENCODE_MODEL, ENV_RUST_LOG, SacpAgentLaunchConfig,
+    ENV_ANTHROPIC_MODEL, ENV_DISABLE_ERROR_REPORTING, ENV_DISABLE_GROWTHBOOK,
+    ENV_DISABLE_NONESSENTIAL, ENV_OPENAI_API_KEY, ENV_OPENAI_BASE_URL, ENV_OPENCODE_MODEL,
+    ENV_RUST_LOG, SacpAgentLaunchConfig,
 };
 use crate::launcher::model_env::{DirectModelRuntimeEnvResolver, ModelRuntimeEnvResolver};
 
@@ -80,6 +81,10 @@ pub async fn load_sacp_agent_config_with_resolver(
             ENV_AGENT_SDK_SKIP_VERSION_CHECK.to_string(),
             "1".to_string(),
         );
+        // 双保险：显式禁用错误上报与 GrowthBook 特性开关轮询，
+        // 防止 claude 版本变化导致总开关 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 覆盖不全
+        resolved_env.insert(ENV_DISABLE_ERROR_REPORTING.to_string(), "1".to_string());
+        resolved_env.insert(ENV_DISABLE_GROWTHBOOK.to_string(), "1".to_string());
 
         // debug: 打印最终环境变量（API Key 已脱敏）
         let mask_key = |v: &String| -> String {
@@ -92,7 +97,8 @@ pub async fn load_sacp_agent_config_with_resolver(
         debug!(
             "[SACP] Final env config: command={}, ANTHROPIC_API_KEY={}, ANTHROPIC_BASE_URL={}, ANTHROPIC_MODEL={}, \
              OPENAI_API_KEY={}, OPENAI_BASE_URL={}, OPENCODE_MODEL={}, \
-             RUST_LOG={}, CLAUDE_CODE_MAX_TOKENS={}, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC={}",
+             RUST_LOG={}, CLAUDE_CODE_MAX_TOKENS={}, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC={}, \
+             DISABLE_ERROR_REPORTING={}, DISABLE_GROWTHBOOK={}",
             agent_config.command,
             resolved_env
                 .get("ANTHROPIC_API_KEY")
@@ -122,6 +128,12 @@ pub async fn load_sacp_agent_config_with_resolver(
                 .unwrap_or(&"<unset>".to_string()),
             resolved_env
                 .get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+                .unwrap_or(&"<unset>".to_string()),
+            resolved_env
+                .get("DISABLE_ERROR_REPORTING")
+                .unwrap_or(&"<unset>".to_string()),
+            resolved_env
+                .get("DISABLE_GROWTHBOOK")
                 .unwrap_or(&"<unset>".to_string()),
         );
 
@@ -204,6 +216,9 @@ pub fn get_default_sacp_agent_config_with_resolver(
         ENV_AGENT_SDK_SKIP_VERSION_CHECK.to_string(),
         "1".to_string(),
     );
+    // 双保险：显式禁用错误上报与 GrowthBook 特性开关轮询，防止 claude 版本变化导致总开关覆盖不全
+    env.insert(ENV_DISABLE_ERROR_REPORTING.to_string(), "1".to_string());
+    env.insert(ENV_DISABLE_GROWTHBOOK.to_string(), "1".to_string());
 
     // Resolve the default agent command path.
     // Priority: CLAUDE_CODE_ACP_PATH env var > `which` crate lookup > bare command name.
