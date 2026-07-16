@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::<AppState>::new()
         .route("/health", get(handler::health))
         .nest("/api/project", file_server::routes::project_api_router())
+        .nest("/api/git", file_server::routes::git_router())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
