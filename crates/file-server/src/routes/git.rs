@@ -23,6 +23,10 @@ pub fn router() -> Router<AppState> {
         .route("/commit", post(commit))
         .route("/unstage", post(unstage))
         .route("/discard", post(discard))
+        .route("/branch-create", post(branch_create))
+        .route("/branch-delete", post(branch_delete))
+        .route("/tag-create", post(tag_create))
+        .route("/tag-delete", post(tag_delete))
 }
 
 #[derive(Deserialize)]
@@ -429,5 +433,133 @@ async fn discard(
         "message": "Changes discarded successfully",
         "logId": log_id,
         "discardedCount": count,
+    })))
+}
+
+// ── branch / tag CRUD ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchCreateBody {
+    #[serde(flatten)]
+    base: GitWriteBody,
+    branch_name: String,
+    #[serde(default)]
+    start_point: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchNameBody {
+    #[serde(flatten)]
+    base: GitWriteBody,
+    branch_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TagCreateBody {
+    #[serde(flatten)]
+    base: GitWriteBody,
+    tag_name: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TagNameBody {
+    #[serde(flatten)]
+    base: GitWriteBody,
+    tag_name: String,
+}
+
+/// `POST /api/git/branch-create`
+async fn branch_create(
+    State(state): State<AppState>,
+    Json(body): Json<BranchCreateBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let name = body.branch_name.clone();
+    let sp = body.start_point.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::create_branch(&repo, &name, sp.as_deref())
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Branch created successfully",
+        "logId": log_id,
+        "branchName": body.branch_name,
+    })))
+}
+
+/// `POST /api/git/branch-delete`
+async fn branch_delete(
+    State(state): State<AppState>,
+    Json(body): Json<BranchNameBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let name = body.branch_name.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let repo = git::ensure_repo(&path)?;
+        if git::is_current_branch(&repo, &name)? {
+            return Err(AppError::business("cannot delete the current branch"));
+        }
+        git::delete_branch(&repo, &name)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Branch deleted successfully",
+        "logId": log_id,
+        "branchName": body.branch_name,
+    })))
+}
+
+/// `POST /api/git/tag-create`
+async fn tag_create(
+    State(state): State<AppState>,
+    Json(body): Json<TagCreateBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let name = body.tag_name.clone();
+    let msg = body.message.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let repo = git::ensure_repo(&path)?;
+        git::create_tag(&repo, &name, msg.as_deref())
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Tag created successfully",
+        "logId": log_id,
+        "tagName": body.tag_name,
+    })))
+}
+
+/// `POST /api/git/tag-delete`
+async fn tag_delete(
+    State(state): State<AppState>,
+    Json(body): Json<TagNameBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let name = body.tag_name.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let repo = git::ensure_repo(&path)?;
+        git::delete_tag(&repo, &name)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Tag deleted successfully",
+        "logId": log_id,
+        "tagName": body.tag_name,
     })))
 }
