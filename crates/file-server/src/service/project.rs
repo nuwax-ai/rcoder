@@ -78,9 +78,15 @@ pub async fn create_project(
     if project_id.is_empty() {
         return Err(AppError::validation("Project ID cannot be empty"));
     }
+    // templateType 白名单 (对齐 nuwax: 仅允许 react/vue3)
+    if !matches!(template_type, "react" | "vue3") {
+        return Err(AppError::validation(format!(
+            "templateType must be react or vue3, got '{template_type}'"
+        )));
+    }
     let template_name = match template_type {
         "vue3" => config.init_project_name_vue3.as_str(),
-        // 默认 react (对齐 nuwax templateType 默认)
+        // react
         _ => config.init_project_name_react.as_str(),
     };
     let project_path = resolver.resolve_project(ctx);

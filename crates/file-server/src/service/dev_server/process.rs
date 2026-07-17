@@ -281,6 +281,52 @@ pub async fn wait_for_stop(pid: u32, interval_ms: u64, max_attempts: u32) {
     }
 }
 
+/// 系统级扫描某 project_id 的所有相关 pid (对齐 nuwax findPidsByProjectId)。
+/// `ps -Ao pid,command -ww` → 精确匹配 `/{projectId}` 子串; 空则宽松匹配 `{projectId}`。
+/// ps 不存在/失败返回空 (调用方仍可用内存 Map 的 pid 兜底)。
+pub async fn find_pids_by_project_id(project_id: &str) -> Vec<u32> {
+    let out = Command::new("ps")
+        .arg("-Ao")
+        .arg("pid,command")
+        .arg("-ww")
+        .output()
+        .await;
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let precise_needle = format!("/{project_id}");
+    let mut pids: Vec<u32> = Vec::new();
+    // 精确匹配
+    for line in text.lines() {
+        if line.contains(&precise_needle)
+            && let Some(pid) = parse_pid_from_line(line)
+        {
+            pids.push(pid);
+        }
+    }
+    // 精确为空 → 宽松兜底
+    if pids.is_empty() {
+        for line in text.lines() {
+            if line.contains(project_id)
+                && let Some(pid) = parse_pid_from_line(line)
+            {
+                pids.push(pid);
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// 从 `ps` 输出行提取首列 pid。
+fn parse_pid_from_line(line: &str) -> Option<u32> {
+    let trimmed = line.trim_start();
+    let pid_str = trimmed.split_whitespace().next()?;
+    pid_str.parse().ok()
+}
+
 /// HTTP 探活 dev server (对齐 nuwax isProjectAlive): GET 127.0.0.1:port{basePath}, 2xx/3xx 存活。
 pub async fn is_project_alive(port: u16, base_path: Option<&str>, timeout_ms: u64) -> bool {
     let base = base_path.map(normalize_base_path).unwrap_or_default();

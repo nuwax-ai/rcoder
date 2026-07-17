@@ -143,6 +143,7 @@ pub async fn get_content_by_version(
     ctx: &ProjectContext,
     code_version: &str,
     proxy_path: Option<&str>,
+    command: Option<&str>,
 ) -> AppResult<Vec<crate::service::tree::FileEntry>> {
     let project_id = ctx.project_id.trim();
     if project_id.is_empty() {
@@ -165,7 +166,13 @@ pub async fn get_content_by_version(
     crate::service::zip::extract_to(zip, his_dir.clone()).await?;
 
     // 遍历 (无论成败都清理临时目录)
-    let files_result = crate::service::tree::list_files(&his_dir, config, proxy_path).await;
+    let mut files_result = crate::service::tree::list_files(&his_dir, config, proxy_path).await;
     let _ = fs::remove_dir_all(&his_dir).await;
+    // command != "cpage_config" 时过滤 cpage_config.json (对齐 nuwax getContentUtils)
+    if let Ok(files) = files_result.as_mut()
+        && command != Some("cpage_config")
+    {
+        files.retain(|f| f.name != "cpage_config.json");
+    }
     files_result
 }

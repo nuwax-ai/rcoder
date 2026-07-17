@@ -48,10 +48,11 @@ pub async fn push_skills_at(
             "file or skillUrls cannot both be empty",
         ));
     }
-    let claude_skills = workspace.join(".claude").join("skills");
-    let claude_agents = workspace.join(".claude").join("agents");
-    fs::create_dir_all(&claude_skills).await?;
-    fs::create_dir_all(&claude_agents).await?;
+    // 权威 agent 目录 = .agents (对齐 nuwax AgentWorkspaceUtils PRIMARY_AGENT_TYPE="agents")
+    let primary_skills = workspace.join(".agents").join("skills");
+    let primary_agents = workspace.join(".agents").join("agents");
+    fs::create_dir_all(&primary_skills).await?;
+    fs::create_dir_all(&primary_agents).await?;
 
     // 收集 zip 来源 (上传 + url fetch)
     let mut sources: Vec<Vec<u8>> = Vec::new();
@@ -81,7 +82,7 @@ pub async fn push_skills_at(
             while let Some(entry) = entries.next_entry().await? {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let src = entry.path();
-                let dst = claude_skills.join(&name);
+                let dst = primary_skills.join(&name);
                 let _ = fs::remove_dir_all(&dst).await;
                 if copy_entry(&src, &dst).await.is_ok() {
                     updated.push(name);
@@ -129,16 +130,17 @@ fn find_skills_dir(root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// 以 `.claude` 为权威源, 同步 skills/agents 到 `.agents/.opencode/.codex` (对齐 nuwax syncAgents)。
+/// 以 `.agents` 为权威源, 全量 fan-out skills/agents 到 `.claude/.opencode/.codex`
+/// (对齐 nuwax AgentWorkspaceUtils syncAgents; PRIMARY_AGENT_TYPE="agents")。
 async fn sync_agents(project_path: &Path) -> AppResult<()> {
-    let primary_skills = project_path.join(".claude").join("skills");
-    let primary_agents = project_path.join(".claude").join("agents");
-    for agent_root in [".agents", ".opencode", ".codex"] {
+    let primary_skills = project_path.join(".agents").join("skills");
+    let primary_agents = project_path.join(".agents").join("agents");
+    for agent_root in [".claude", ".opencode", ".codex"] {
         let t_root = project_path.join(agent_root);
         fs::create_dir_all(&t_root).await?;
         let t_skills = t_root.join("skills");
         let t_agents = t_root.join("agents");
-        // skills
+        // skills (先 rm 再 copy, 全量覆盖)
         let _ = fs::remove_dir_all(&t_skills).await;
         fs::create_dir_all(&t_skills).await?;
         if fs::try_exists(&primary_skills).await.unwrap_or(false) {

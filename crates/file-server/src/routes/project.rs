@@ -718,6 +718,8 @@ struct GetByVersionParams {
     code_version: String,
     proxy_path: Option<String>,
     #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
     tenant_id: Option<String>,
     #[serde(default)]
     space_id: Option<String>,
@@ -752,6 +754,7 @@ async fn get_project_content_by_version(
         &ctx,
         &params.code_version,
         params.proxy_path.as_deref(),
+        params.command.as_deref(),
     )
     .await
     {

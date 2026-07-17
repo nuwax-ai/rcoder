@@ -108,6 +108,8 @@ pub struct Config {
     pub dev_stop_max_attempts: u32,
     /// build/install 命令超时秒 (对齐 nuwax 10min)。
     pub dev_command_timeout_secs: u64,
+    /// build 全局并发上限 (对齐 nuwax MAX_BUILD_CONCURRENCY, 默认 20)。
+    pub max_build_concurrency: usize,
 }
 
 impl Config {
@@ -164,6 +166,7 @@ impl Config {
             dev_stop_check_interval_ms: env_u64("DEV_STOP_CHECK_INTERVAL_MS", 100),
             dev_stop_max_attempts: env_u64("DEV_STOP_MAX_ATTEMPTS", 50) as u32,
             dev_command_timeout_secs: env_u64("DEV_COMMAND_TIMEOUT_SECS", 600),
+            max_build_concurrency: env_u64("MAX_BUILD_CONCURRENCY", 20) as usize,
         }
     }
 

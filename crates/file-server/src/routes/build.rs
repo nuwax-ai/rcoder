@@ -167,17 +167,21 @@ async fn keep_alive(
         .dev_server
         .keep_alive(&q.project_id, pid, q.port, base, &path)
         .await?;
+    // pid/port: 重启分支用新值, alive 分支用查询入参 (对齐 nuwax)
+    let out_pid = result.pid.unwrap_or(pid);
+    let out_port = result.port.unwrap_or(q.port);
     let mut resp = json!({
         "success": true,
         "projectId": q.project_id,
-        "pid": pid,
-        "port": q.port,
+        "pid": out_pid,
+        "port": out_port,
     });
     if result.alive && result.action.is_none() {
         resp["message"] = json!("Development server is alive");
     }
     if let Some(action) = result.action {
-        resp["message"] = json!("Development server restarted");
+        // nuwax 重启分支透传 startDevServer 的 message
+        resp["message"] = json!("Development server started");
         resp["action"] = json!(action);
     }
     Ok(Json(resp))
@@ -243,7 +247,19 @@ async fn build_project(
         .and_then(|s| s.get("build"))
         .and_then(|v| v.as_str())
         .unwrap_or("vite build");
-    let base = q.base_path.as_deref().unwrap_or("/");
+    // basePath 规范化 (补首尾 /, 对齐 nuwax; vite --base 需尾斜杠)
+    let base = normalize_build_base(q.base_path.as_deref());
+
+    // 并发控制: 全局信号量 + 项目级互斥 (对齐 nuwax buildingProjects + MAX_BUILD_CONCURRENCY)
+    let (sem, building) = build_concurrency(state.config.max_build_concurrency);
+    {
+        let mut b = building.lock().expect("building set lock");
+        if b.contains(&q.project_id) {
+            return Err(AppError::business("This project is being built"));
+        }
+        b.insert(q.project_id.clone());
+    }
+    let _permit = sem.acquire().await.expect("build sem acquire");
 
     // install (arg 数组, 无 shell 拼接; 失败继续, 与 nuwax 宽松一致)
     let _ = crate::service::dev_server::process::run_command_to_log(
@@ -257,11 +273,11 @@ async fn build_project(
     .await;
     // build (vite: pnpm exec vite build --base X; 否则 pnpm run build)
     let build_args: Vec<&str> = if build_script.to_ascii_lowercase().contains("vite") {
-        vec!["exec", "vite", "build", "--base", base, "--debug", "--debug"]
+        vec!["exec", "vite", "build", "--base", &base, "--debug", "--debug"]
     } else {
         vec!["run", "build"]
     };
-    crate::service::dev_server::process::run_command_to_log(
+    let build_result = crate::service::dev_server::process::run_command_to_log(
         "pnpm",
         &build_args,
         &path,
@@ -269,7 +285,15 @@ async fn build_project(
         &temp_log,
         timeout,
     )
-    .await?;
+    .await;
+    // 释放项目级锁 (drop _permit + 显式 remove)
+    building.lock().expect("building set lock").remove(&q.project_id);
+    if build_result.is_err() {
+        // 失败: 读 build 日志用 build_error 解析友好消息 (对齐 nuwax BuildErrorParser)
+        let log_content = tokio::fs::read_to_string(&temp_log).await.unwrap_or_default();
+        let friendly = crate::service::build_error::parse(&log_content);
+        return Err(AppError::system(friendly));
+    }
 
     // 拷贝 dist → {DIST_TARGET_DIR}/{projectId}/dist/ (Rust fs, 无 rm -rf shell;
     // 错误为类型化 io::Error, 路径经 PathBuf::join 无注入)
@@ -288,6 +312,35 @@ async fn build_project(
         "message": "Build completed",
         "projectId": q.project_id,
     })))
+}
+
+/// build basePath 规范化 (对齐 nuwax: 补首尾 `/`; vite --base 需尾斜杠)。
+fn normalize_build_base(b: Option<&str>) -> String {
+    let b = b.map(str::trim).unwrap_or("/").to_string();
+    if b.is_empty() {
+        return "/".to_string();
+    }
+    let mut s = if b.starts_with('/') { b } else { format!("/{b}") };
+    if !s.ends_with('/') {
+        s.push('/');
+    }
+    s
+}
+
+/// 全局 build 并发: 信号量(全局上限) + 正在构建项目集合(项目级互斥)。
+/// 进程级单例 (OnceLock), 对齐 nuwax 模块级 buildingProjects/currentBuilds。
+fn build_concurrency(
+    max: usize,
+) -> (
+    &'static tokio::sync::Semaphore,
+    &'static std::sync::Mutex<std::collections::HashSet<String>>,
+) {
+    use std::sync::OnceLock;
+    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    static BUILDING: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let sem = SEM.get_or_init(|| tokio::sync::Semaphore::new(max.max(1)));
+    let building = BUILDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    (sem, building)
 }
 
 /// 递归拷贝目录 (替代 `rm -rf && cp -R`); 目标存在则先清空, 保留 symlink。

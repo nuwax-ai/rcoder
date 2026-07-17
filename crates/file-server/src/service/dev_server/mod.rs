@@ -64,6 +64,10 @@ pub struct KilledPid {
 pub struct KeepAliveResult {
     pub alive: bool,
     pub action: Option<String>,
+    /// 重启分支返回新启动的 pid/port (对齐 nuwax 透传 startDevServer 返回值);
+    /// alive 分支为 None (调用方用查询入参的 pid/port)。
+    pub pid: Option<u32>,
+    pub port: Option<u16>,
 }
 
 /// 启动锁守卫: drop 时自动从 starting 集合移除 (防 early return 泄漏)。
@@ -256,40 +260,46 @@ impl DevServerManager {
         Ok(())
     }
 
-    /// stop-dev (对齐 nuwax stopDevServerByProjectId; 杀整组 + 释放端口 + 清 temp 日志)。
+    /// stop-dev (对齐 nuwax stopDevServerByProjectId; 系统级 pid 扫描 + 杀整组 +
+    /// 释放端口 + 清 temp 日志)。候选 pid = 内存 Map pid ∪ `ps` 扫描 pid (去重)。
     pub async fn stop_dev(&self, project_id: &str) -> AppResult<StoppedDev> {
         let proc = lock(&self.processes)?.remove(project_id);
-        let killed = match proc {
-            Some(p) => {
-                let pid = p.pid;
-                let ok = kill_process_group(pid);
-                // SIGTERM 宽限期 (默认 5s); 仍存活则 SIGKILL 强杀, 避免残留
+        // 候选 pid: 内存 Map + 系统扫描 (去重)
+        let mut candidates: Vec<u32> = Vec::new();
+        if let Some(p) = &proc {
+            candidates.push(p.pid);
+        }
+        candidates.extend(process::find_pids_by_project_id(project_id).await);
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        let mut killed: Vec<KilledPid> = Vec::new();
+        for pid in candidates {
+            let ok = kill_process_group(pid);
+            process::wait_for_stop(
+                pid,
+                self.config.dev_stop_check_interval_ms,
+                self.config.dev_stop_max_attempts,
+            )
+            .await;
+            let mut k = ok;
+            if is_process_running(pid) {
+                tracing::warn!("dev server (pid {pid}) 未在 SIGTERM 宽限期退出, 升级 SIGKILL");
+                process::kill_process_group_force(pid);
                 process::wait_for_stop(
                     pid,
                     self.config.dev_stop_check_interval_ms,
                     self.config.dev_stop_max_attempts,
                 )
                 .await;
-                let mut killed = ok;
-                if is_process_running(pid) {
-                    tracing::warn!(
-                        "dev server (pid {pid}) 未在 SIGTERM 宽限期退出, 升级 SIGKILL"
-                    );
-                    process::kill_process_group_force(pid);
-                    process::wait_for_stop(
-                        pid,
-                        self.config.dev_stop_check_interval_ms,
-                        self.config.dev_stop_max_attempts,
-                    )
-                    .await;
-                    killed = !is_process_running(pid);
-                }
-                self.port_pool.release(project_id);
-                log::cleanup_temp_logs(&p.log_dir).await;
-                vec![KilledPid { pid, killed }]
+                k = !is_process_running(pid);
             }
-            None => vec![],
-        };
+            killed.push(KilledPid { pid, killed: k });
+        }
+        if let Some(p) = proc {
+            self.port_pool.release(project_id);
+            log::cleanup_temp_logs(&p.log_dir).await;
+        }
         Ok(StoppedDev { killed_pids: killed })
     }
 
@@ -316,14 +326,21 @@ impl DevServerManager {
         let alive =
             is_project_alive(port, base_path, self.config.dev_alive_check_timeout_ms).await;
         if alive {
-            return Ok(KeepAliveResult { alive: true, action: None });
+            return Ok(KeepAliveResult {
+                alive: true,
+                action: None,
+                pid: None,
+                port: None,
+            });
         }
-        // 不存活 → 重启
+        // 不存活 → 重启, 返回新 pid/port (对齐 nuwax 透传 startDevServer 返回值)
         self.stop_dev(project_id).await?;
-        self.start_dev(project_id, project_path, base_path).await?;
+        let started = self.start_dev(project_id, project_path, base_path).await?;
         Ok(KeepAliveResult {
             alive: true,
             action: Some("start".into()),
+            pid: Some(started.pid),
+            port: Some(started.port),
         })
     }
 
