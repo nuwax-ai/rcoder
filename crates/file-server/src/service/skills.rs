@@ -132,7 +132,7 @@ fn find_skills_dir(root: &Path) -> Option<PathBuf> {
 
 /// 以 `.agents` 为权威源, 全量 fan-out skills/agents 到 `.claude/.opencode/.codex`
 /// (对齐 nuwax AgentWorkspaceUtils syncAgents; PRIMARY_AGENT_TYPE="agents")。
-async fn sync_agents(project_path: &Path) -> AppResult<()> {
+pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     let primary_skills = project_path.join(".agents").join("skills");
     let primary_agents = project_path.join(".agents").join("agents");
     for agent_root in [".claude", ".opencode", ".codex"] {

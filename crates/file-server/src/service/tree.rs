@@ -192,42 +192,141 @@ fn is_image(path: &Path, exts: &[String]) -> bool {
     }
 }
 
-/// 框架检测 (对齐 nuwax frameworkDetectorUtils): 读 package.json dependencies。
+/// 框架检测 (对齐 nuwax frameworkDetectorUtils):
+/// - frontend: react 优先; vue/vue-router/@vue/cli-service → 按版本号 vue2/vue3/vue
+/// - devFramework: 只看配置文件, nextjs 优先于 vite
 async fn detect_framework(project_path: &Path) -> (String, String) {
-    let pkg_path = project_path.join("package.json");
-    let (frontend, dev) = match fs::read_to_string(&pkg_path).await {
-        Ok(text) => {
-            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-            let deps = collect_dep_names(&v);
-            let frontend = if deps.iter().any(|d| d == "react" || d == "react-dom") {
-                "react"
-            } else if deps.iter().any(|d| d == "vue") {
-                "vue3"
-            } else {
-                "other"
-            };
-            let dev = if deps.iter().any(|d| d == "vite") {
-                "vite"
-            } else if deps.iter().any(|d| d == "next") {
-                "nextjs"
-            } else {
-                "other"
-            };
-            (frontend.to_string(), dev.to_string())
-        }
-        Err(_) => ("other".to_string(), "other".to_string()),
-    };
+    let frontend = detect_frontend_framework(project_path).await;
+    let dev = detect_dev_framework(project_path).await;
     (frontend, dev)
 }
 
-fn collect_dep_names(pkg: &serde_json::Value) -> Vec<String> {
-    let mut names = Vec::new();
-    for key in ["dependencies", "devDependencies", "peerDependencies"] {
+/// frontend 检测 (对齐 nuwax detectFrontendFramework):
+/// react/react-dom → "react"; vue 系 → parse_vue_major_version 取首个可解析版本 → "vue2"/"vue3"/"vue"; 否则 "other"。
+async fn detect_frontend_framework(project_path: &Path) -> String {
+    let pkg_path = project_path.join("package.json");
+    let Ok(text) = fs::read_to_string(&pkg_path).await else {
+        return "other".to_string();
+    };
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    // 合并 dependencies + devDependencies (对齐 nuwax)
+    let merged = merge_dep_map(&v);
+    // react 优先
+    if merged.contains_key("react") || merged.contains_key("react-dom") {
+        return "react".to_string();
+    }
+    // vue 系: 依次对 vue / vue-router / @vue/cli-service 取首个可解析主版本
+    if merged.contains_key("vue")
+        || merged.contains_key("vue-router")
+        || merged.contains_key("@vue/cli-service")
+    {
+        for key in ["vue", "vue-router", "@vue/cli-service"] {
+            if let Some(ver) = merged.get(key)
+                && let Some(major) = parse_vue_major_version(ver)
+            {
+                return format!("vue{major}");
+            }
+        }
+        return "vue".to_string();
+    }
+    "other".to_string()
+}
+
+/// devFramework 检测 (对齐 nuwax detectDevFramework): 只看配置文件, nextjs 优先。
+async fn detect_dev_framework(project_path: &Path) -> String {
+    for f in ["next.config.js", "next.config.ts", "next.config.mjs", "next.config.cjs"] {
+        if project_path.join(f).exists() {
+            return "nextjs".to_string();
+        }
+    }
+    for f in ["vite.config.js", "vite.config.ts", "vite.config.mjs", "vite.config.cjs"] {
+        if project_path.join(f).exists() {
+            return "vite".to_string();
+        }
+    }
+    "other".to_string()
+}
+
+/// 合并 dependencies + devDependencies 为 {name: version} 映射 (对齐 nuwax 合并范围)。
+fn merge_dep_map(pkg: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for key in ["dependencies", "devDependencies"] {
         if let Some(obj) = pkg.get(key).and_then(|v| v.as_object()) {
-            for k in obj.keys() {
-                names.push(k.clone());
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    map.insert(k.clone(), s.to_string());
+                }
             }
         }
     }
-    names
+    map
+}
+
+/// 解析 vue 依赖主版本 (对齐 nuwax parseVueMajorVersion):
+/// - 处理 npm alias: `npm:vue@^3.4.0` → `^3.4.0`
+/// - 正则 `(?:^|[^\d])v?(\d+)(?:\.|x|\b)` 取首个独立数字段
+/// - 非标准 (workspace/file/git/url) 返回 None
+fn parse_vue_major_version(raw: &str) -> Option<u32> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    // npm alias: npm:<name>@<version>
+    let s = if let Some(rest) = regex_alias_version(&s) {
+        rest.to_string()
+    } else {
+        s
+    };
+    // 排除非标准来源
+    if s.starts_with("workspace:")
+        || s.starts_with("file:")
+        || s.starts_with("git:")
+        || s.starts_with("git+")
+        || s.starts_with("http:")
+        || s.starts_with("https:")
+    {
+        return None;
+    }
+    let re = regex::Regex::new(r"(?:^|[^\d])v?(\d+)(?:[\.x]|\b)").ok()?;
+    re.captures(&s)
+        .and_then(|c| c.get(1).and_then(|m| m.as_str().parse::<u32>().ok()))
+}
+
+/// 提取 `npm:pkg@<version>` 中的 `<version>` 部分。
+fn regex_alias_version(s: &str) -> Option<&str> {
+    let re = regex::Regex::new(r"^npm:[^@]+@(.+)$").ok()?;
+    re.captures(s).and_then(|c| c.get(1).map(|m| m.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_vue_major_version_handles_caret_tilde() {
+        assert_eq!(parse_vue_major_version("^3.4.0"), Some(3));
+        assert_eq!(parse_vue_major_version("~2.7.16"), Some(2));
+        assert_eq!(parse_vue_major_version("3.0.0"), Some(3));
+        assert_eq!(parse_vue_major_version("v3.2.0"), Some(3));
+    }
+
+    #[test]
+    fn parse_vue_major_version_handles_x_and_plain() {
+        assert_eq!(parse_vue_major_version("2.x"), Some(2));
+        assert_eq!(parse_vue_major_version("3"), Some(3));
+    }
+
+    #[test]
+    fn parse_vue_major_version_handles_npm_alias() {
+        assert_eq!(parse_vue_major_version("npm:vue@^3.4.0"), Some(3));
+        assert_eq!(parse_vue_major_version("npm:vue@~2.7.0"), Some(2));
+    }
+
+    #[test]
+    fn parse_vue_major_version_rejects_nonstandard() {
+        assert_eq!(parse_vue_major_version("workspace:*"), None);
+        assert_eq!(parse_vue_major_version("file:../vue"), None);
+        assert_eq!(parse_vue_major_version("git+https://x"), None);
+        assert_eq!(parse_vue_major_version(""), None);
+    }
 }

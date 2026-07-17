@@ -57,11 +57,41 @@ async fn bytes_field(field: axum::extract::multipart::Field<'_>) -> Result<Vec<u
         .map_err(|e| AppError::validation(format!("read multipart file: {e}")))
 }
 
+/// `.zip` 扩展名校验 (对齐 nuwax: 仅允许 zip)。
+fn validate_zip_ext(filename: Option<&str>) -> Result<(), AppError> {
+    let ext = filename
+        .and_then(|n| {
+            std::path::Path::new(n)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase())
+        })
+        .unwrap_or_default();
+    if ext == "zip" {
+        Ok(())
+    } else {
+        Err(AppError::validation("Only zip files are supported"))
+    }
+}
+
 fn ws_path(state: &AppState, user_id: &str, cid: &str) -> PathBuf {
     state.resolver.resolve_computer(&ComputerContext {
         user_id: user_id.to_string(),
         cid: cid.to_string(),
     })
+}
+
+/// computer 目标路径: `customTargetDir` trim 后非空则用之, 否则回退默认工作区 (对齐 nuwax)。
+fn resolve_computer_target(
+    state: &AppState,
+    user_id: &str,
+    cid: &str,
+    custom_target_dir: Option<&str>,
+) -> PathBuf {
+    match custom_target_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(ct) => PathBuf::from(ct),
+        None => ws_path(state, user_id, cid),
+    }
 }
 
 #[derive(Deserialize)]
@@ -403,7 +433,8 @@ struct ZipBody {
     exclude_dirs: Option<Vec<String>>,
 }
 
-/// 打包 computer 工作区为 zip 字节流返回。
+/// 打包 computer 工作区为 zip 字节流返回 (download 用强过滤: dot-segment + 符号链接 + 硬链接,
+/// 对齐 nuwax downloadAllFiles entry filter)。
 async fn pack_workspace(state: &AppState, user_id: &str, cid: &str, exclude: Vec<String>) -> AppResult<Response> {
     let src = ws_path(state, user_id, cid);
     if !src.exists() {
@@ -418,8 +449,13 @@ async fn pack_workspace(state: &AppState, user_id: &str, cid: &str, exclude: Vec
             .map(|d| d.as_millis())
             .unwrap_or(0)
     ));
-    let excludes = state.config.zip_workspace_exclude.clone();
-    zip::pack_dir(src.clone(), tmp.clone(), exclude, excludes).await?;
+    let opts = zip::PackOpts {
+        exclude_dirs: exclude,
+        exclude_files: state.config.zip_workspace_exclude.clone(),
+        skip_dot_segments: false,
+        skip_hardlinks: false,
+    };
+    zip::pack_download(src, tmp.clone(), opts).await?;
     let bytes = tokio::fs::read(&tmp).await?;
     let _ = tokio::fs::remove_file(&tmp).await;
     let filename = format!("{user_id}-{cid}.zip");
@@ -617,14 +653,17 @@ async fn upload_files(
     })))
 }
 
-/// `POST /api/computer/import-project` (对齐 nuwax computer importProject; 上传 zip 解压到工作区)。
+/// `POST /api/computer/import-project` (对齐 nuwax computer importProject):
+/// 上传 zip → 解压 + removeTopLevelDir + 白名单保留合并到工作区。
 async fn import_project(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     let mut user_id = None;
     let mut cid = None;
+    let mut custom_target_dir = None;
     let mut data: Option<Vec<u8>> = None;
+    let mut file_name = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -633,33 +672,27 @@ async fn import_project(
         match field.name().unwrap_or("") {
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
-            "file" => data = Some(bytes_field(field).await?),
+            "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
+            "file" => {
+                file_name = field.file_name().map(|s| s.to_string());
+                data = Some(bytes_field(field).await?);
+            }
             _ => {}
         }
     }
     let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
     let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
-    let data = data.ok_or_else(|| AppError::validation("file (zip) is required"))?;
-    let ws = ws_path(&state, &user_id, &cid);
-    tokio::fs::create_dir_all(&ws).await?;
-    // 写临时 zip 再解压 (zip::extract_to 内部用 safe_zip_entry 防穿越)
-    let tmp = std::env::temp_dir().join(format!(
-        "computer-import-{}-{}-{}.zip",
-        user_id,
-        cid,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-    tokio::fs::write(&tmp, data).await?;
-    let result = zip::extract_to(tmp.clone(), ws.clone()).await;
-    let _ = tokio::fs::remove_file(&tmp).await;
-    result?;
+    let data = data.ok_or_else(|| AppError::validation("file is required"))?;
+    validate_zip_ext(file_name.as_deref())?;
+    let target_dir = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref());
+    tokio::fs::create_dir_all(&target_dir).await?;
+    let res = crate::service::computer_ws::import_project(&target_dir, data).await?;
     Ok(Json(json!({
         "success": true,
         "message": "Project imported successfully",
-        "workspaceRoot": ws.display().to_string(),
+        "userId": user_id,
+        "cId": cid,
+        "targetDir": res.target_dir,
     })))
 }
 
@@ -691,9 +724,9 @@ async fn cleanup_build_artifacts(
     })))
 }
 
-/// `POST /api/computer/create-workspace` (对齐 nuwax createWorkspace; 基础版:
-/// mkdir 工作区 + skills/agents 目录, 可选解压 skills zip)。
-/// v2 的 agent hook 配置 (claude/codex/opencode) 待后续补。
+/// `POST /api/computer/create-workspace` (对齐 nuwax createWorkspace; v1):
+/// mkdir 工作区 + `.agents/{skills,agents}` 装配 + 可选 skill zip 合并 + syncAgents。
+/// v2 的 agent hook 配置 (claude/codex/opencode mcp/hooks/permissions) 见 Task (Batch E)。
 async fn create_workspace(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -701,6 +734,7 @@ async fn create_workspace(
     let mut user_id = None;
     let mut cid = None;
     let mut skill_zip: Option<Vec<u8>> = None;
+    let mut file_name = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -709,47 +743,26 @@ async fn create_workspace(
         match field.name().unwrap_or("") {
             "userId" => user_id = Some(text_field(field).await?),
             "cId" => cid = Some(text_field(field).await?),
-            "file" => skill_zip = Some(bytes_field(field).await?),
+            "file" => {
+                file_name = field.file_name().map(|s| s.to_string());
+                skill_zip = Some(bytes_field(field).await?);
+            }
             _ => {}
         }
     }
     let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
     let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    if skill_zip.is_some() {
+        validate_zip_ext(file_name.as_deref())?;
+    }
     let ws = ws_path(&state, &user_id, &cid);
     tokio::fs::create_dir_all(&ws).await?;
-    tokio::fs::create_dir_all(ws.join("skills")).await?;
-    tokio::fs::create_dir_all(ws.join("agents")).await?;
-    // 可选: 解压 skills zip 到工作区 (zip 内找 skills/ 移到 ws/skills)
-    if let Some(data) = skill_zip {
-        let tmp = std::env::temp_dir().join(format!(
-            "computer-create-{}-{}-{}.zip",
-            user_id,
-            cid,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        ));
-        tokio::fs::write(&tmp, data).await?;
-        let extract_dst = ws.join(".tmp-skill-extract");
-        tokio::fs::create_dir_all(&extract_dst).await?;
-        let r = zip::extract_to(tmp.clone(), extract_dst.clone()).await;
-        let _ = tokio::fs::remove_file(&tmp).await;
-        r?;
-        // 把解压出的 skills/<name> 移到 ws/skills/
-        if let Ok(mut rd) = tokio::fs::read_dir(extract_dst.join("skills")).await {
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let name = entry.file_name();
-                let dst = ws.join("skills").join(&name);
-                let _ = tokio::fs::rename(entry.path(), &dst).await;
-            }
-        }
-        let _ = tokio::fs::remove_dir_all(&extract_dst).await;
-    }
+    let res = crate::service::computer_ws::create_workspace(&ws, skill_zip).await?;
     Ok(Json(json!({
         "success": true,
-        "message": "Workspace created successfully",
-        "workspaceRoot": ws.display().to_string(),
+        "message": res.message,
+        "workspaceRoot": res.workspace_root,
+        "updatedSkills": res.updated_skills,
     })))
 }
 

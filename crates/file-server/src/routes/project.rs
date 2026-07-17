@@ -132,7 +132,7 @@ async fn get_project_content(
 #[serde(rename_all = "camelCase")]
 struct DeleteParams {
     project_id: String,
-    #[allow(dead_code)]
+    #[serde(default)]
     pid: Option<String>,
     tenant_id: Option<String>,
     space_id: Option<String>,
@@ -147,6 +147,11 @@ async fn delete_project(
     let project_id = params.project_id.trim().to_string();
     if project_id.is_empty() {
         return Err(AppError::validation("Project ID cannot be empty"));
+    }
+    // 停 dev server (对齐 nuwax: pid 可用时 stopDevServer, 失败不阻塞)
+    if let Some(p) = params.pid.as_deref().and_then(|s| s.trim().parse::<u32>().ok()) {
+        tracing::debug!(project_id = %project_id, pid = p, "delete-project: stop dev server");
+        let _ = state.dev_server.stop_dev(&project_id).await;
     }
     let ctx = ProjectContext {
         project_id: project_id.clone(),
@@ -570,6 +575,7 @@ async fn upload_project(
     let mut project_id = None;
     let mut code_version = None;
     let mut data: Option<Vec<u8>> = None;
+    let mut pid = None;
     let mut tenant = None;
     let mut space = None;
     let mut iso = None;
@@ -583,6 +589,7 @@ async fn upload_project(
             "projectId" => project_id = Some(text_field(field).await?),
             "codeVersion" => code_version = Some(text_field(field).await?),
             "file" => data = Some(bytes_field(field).await?),
+            "pid" => pid = text_field(field).await.ok(),
             "tenantId" => tenant = Some(text_field(field).await?),
             "spaceId" => space = Some(text_field(field).await?),
             "isolationType" => iso = Some(text_field(field).await?),
@@ -593,6 +600,11 @@ async fn upload_project(
     let code_version =
         code_version.ok_or_else(|| AppError::validation("codeVersion is required"))?;
     let data = data.ok_or_else(|| AppError::validation("Please upload a zip file"))?;
+    // 停旧版 dev server (对齐 nuwax: pid 可用时 stopDevServer, 失败不阻塞)
+    if let Some(p) = pid.as_deref().and_then(|s| s.trim().parse::<u32>().ok()) {
+        tracing::debug!(project_id = %project_id, pid = p, "upload-project: stop old dev server");
+        let _ = state.dev_server.stop_dev(project_id.trim()).await;
+    }
     let ctx = ctx_from(project_id.trim(), tenant, space, iso);
     let result =
         project_service::upload_project(&*state.resolver, &state.config, &ctx, &code_version, data)

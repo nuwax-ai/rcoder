@@ -2,6 +2,7 @@
 
 pub mod build_error;
 pub mod code;
+pub mod computer_ws;
 pub mod dev_server;
 pub mod fs_util;
 pub mod git;

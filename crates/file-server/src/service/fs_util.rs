@@ -42,9 +42,21 @@ pub async fn copy_dir_filtered(
     Ok(())
 }
 
-/// 写 `.npmrc` 到项目根 (对齐 nuwax `createPnpmNpmrc`; 简化: 固定 npmmirror registry)。
+/// 写 `.npmrc` 到项目根 (对齐 nuwax `createPnpmNpmrc`):
+/// 固定 `package-import-method=copy` (JuiceFS/FUSE 上 hardlink 会失败) +
+/// `auto-install-peers=true` + npmmirror registry + 可选 `store-dir` (环境变量设置时)。
 pub async fn write_npmrc(project_path: &Path) -> AppResult<()> {
-    const NPMRC: &str = "registry=https://registry.npmmirror.com/\n";
-    fs::write(project_path.join(".npmrc"), NPMRC).await?;
+    let store_dir_line = match (
+        std::env::var("npm_config_store_dir").ok(),
+        std::env::var("PNPM_STORE_DIR").ok(),
+    ) {
+        (Some(s), _) if !s.trim().is_empty() => format!("store-dir={}\n", s.trim()),
+        (_, Some(s)) if !s.trim().is_empty() => format!("store-dir={}\n", s.trim()),
+        _ => String::new(),
+    };
+    let content = format!(
+        "# pnpm 优化配置\n# 自动生成\npackage-import-method=copy\nauto-install-peers=true\nregistry=https://registry.npmmirror.com/\n{store_dir_line}"
+    );
+    fs::write(project_path.join(".npmrc"), content).await?;
     Ok(())
 }

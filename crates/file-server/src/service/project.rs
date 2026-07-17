@@ -234,6 +234,10 @@ pub async fn upload_project(
     fs::create_dir_all(&project_path).await?;
     crate::service::zip::extract_to(zip_path, project_path.clone()).await?;
 
+    // 后处理 (对齐 nuwax uploadProject): 单顶层目录上提 + 写 .npmrc
+    crate::service::computer_ws::remove_top_level_dir(&project_path, &["__MACOSX"]).await;
+    let _ = crate::service::fs_util::write_npmrc(&project_path).await;
+
     Ok(UploadProjectResult {
         project_id: project_id.to_string(),
         code_version: code_version.to_string(),
