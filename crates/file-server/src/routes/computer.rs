@@ -38,6 +38,8 @@ pub fn router() -> Router<AppState> {
         .route("/cleanup-build-artifacts", post(cleanup_build_artifacts))
         .route("/create-workspace", post(create_workspace))
         .route("/push-skills-to-workspace", post(push_skills_to_workspace))
+        .route("/init-project-template", post(init_project_template))
+        .route("/build-agent-package", post(build_agent_package))
 }
 
 async fn text_field(field: axum::extract::multipart::Field<'_>) -> Result<String, AppError> {
@@ -798,5 +800,175 @@ async fn push_skills_to_workspace(
     })))
 }
 
-// 待实现 (低频/复杂): create-workspace-v2 agent hook 配置 / init-project-template /
-// build-agent-package
+// ── init-project-template (解压模板 zip + 可选 git init) ──────────────────────────
+
+/// `POST /api/computer/init-project-template` (对齐 nuwax initProjectTemplate)。
+/// multipart: userId, cId, file(模板 zip), enableGit。解压到工作区 + 可选 git init。
+async fn init_project_template(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let mut user_id = None;
+    let mut cid = None;
+    let mut data: Option<Vec<u8>> = None;
+    let mut enable_git = false;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "userId" => user_id = Some(text_field(field).await?),
+            "cId" => cid = Some(text_field(field).await?),
+            "file" => data = Some(bytes_field(field).await?),
+            "enableGit" => {
+                enable_git = matches!(
+                    text_field(field).await?.trim().to_lowercase().as_str(),
+                    "true" | "1" | "yes"
+                );
+            }
+            _ => {}
+        }
+    }
+    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
+    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    let data = data.ok_or_else(|| AppError::validation("file (template zip) is required"))?;
+    let ws = ws_path(&state, &user_id, &cid);
+    tokio::fs::create_dir_all(&ws).await?;
+    // 解压模板
+    let tmp = std::env::temp_dir().join(format!(
+        "computer-init-{}-{}-{}.zip",
+        user_id,
+        cid,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    tokio::fs::write(&tmp, data).await?;
+    let r = zip::extract_to(tmp.clone(), ws.clone()).await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    r?;
+    // 可选 git init
+    let git_inited = if enable_git {
+        let an = state.config.git_default_author_name.clone();
+        let ae = state.config.git_default_author_email.clone();
+        let _ = crate::service::git::init_repo(&ws, &an, &ae);
+        true
+    } else {
+        false
+    };
+    Ok(Json(json!({
+        "success": true,
+        "message": "Project template initialized",
+        "workspaceRoot": ws.display().to_string(),
+        "gitInited": git_inited,
+    })))
+}
+
+// ── build-agent-package (打包 agent 分发产物) ────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildAgentBody {
+    user_id: String,
+    c_id: String,
+    agent_id: String,
+    version: String,
+}
+
+/// `POST /api/computer/build-agent-package` (对齐 nuwax buildAgentPackage)。
+/// 递归找含 scripts/package-platforms.mjs 的目录 → pnpm install →
+/// `node scripts/package-platforms.mjs agent-{id} {ver} {dir}/dist-packages --print-artifacts`
+/// → 解析 stdout 中产物文件名 (agent-{id}-{platform}-{ver}.{ext})。
+async fn build_agent_package(
+    State(state): State<AppState>,
+    Json(body): Json<BuildAgentBody>,
+) -> Result<Json<Value>, AppError> {
+    let ws = ws_path(&state, &body.user_id, &body.c_id);
+    if !ws.exists() {
+        return Err(AppError::resource("workspace does not exist"));
+    }
+    // 递归找 package-platforms.mjs 所在目录 (跳过 node_modules/dist)
+    let pkg_dir = find_first(&ws, "package.json").await; // 用 package.json 定位项目目录
+    let pkg_dir = pkg_dir.ok_or_else(|| {
+        AppError::business("no package.json found in workspace (build-agent-package)")
+    })?;
+    let script = pkg_dir.join("scripts").join("package-platforms.mjs");
+    if !script.exists() {
+        return Err(AppError::business(format!(
+            "scripts/package-platforms.mjs not found in {}",
+            pkg_dir.display()
+        )));
+    }
+    let timeout = state.config.dev_command_timeout_secs;
+    // pnpm install (含 devDependencies)
+    let (_, _, code) = run_capture(
+        "pnpm",
+        &["install"],
+        &pkg_dir,
+        timeout,
+    )
+    .await?;
+    if code != 0 {
+        return Err(AppError::system(format!(
+            "pnpm install failed (exit {code})"
+        )));
+    }
+    // 打包
+    let dist_packages = pkg_dir.join("dist-packages");
+    let agent_name = format!("agent-{}", body.agent_id);
+    let (stdout, stderr, code) = run_capture(
+        "node",
+        &[
+            "scripts/package-platforms.mjs",
+            &agent_name,
+            &body.version,
+            &dist_packages.to_string_lossy(),
+            "--print-artifacts",
+        ],
+        &pkg_dir,
+        timeout,
+    )
+    .await?;
+    if code != 0 {
+        return Err(AppError::system(format!(
+            "package-platforms.mjs failed (exit {code}): {stderr}"
+        )));
+    }
+    // 解析产物: stdout 中以 .tar.gz/.tar.bz2/.zip/.tgz 结尾的行
+    let artifacts = parse_artifacts(&stdout, &body.agent_id, &body.version);
+    Ok(Json(json!({
+        "success": true,
+        "artifacts": artifacts,
+        "stdout": stdout,
+    })))
+}
+
+/// 从 package-platforms stdout 解析产物列表: {path, fileName, platform}。
+fn parse_artifacts(stdout: &str, agent_id: &str, version: &str) -> Vec<Value> {
+    let prefix = format!("agent-{agent_id}-");
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let t = line.trim();
+        if !(t.ends_with(".tar.gz") || t.ends_with(".tar.bz2") || t.ends_with(".zip") || t.ends_with(".tgz")) {
+            continue;
+        }
+        let file_name = t.rsplit('/').next().unwrap_or(t).to_string();
+        // platform 从文件名 agent-{id}-{platform}-{version}.{ext} 提取
+        let platform = file_name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.rsplit_once(&format!("-{version}")))
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        out.push(json!({
+            "path": t,
+            "fileName": file_name,
+            "platform": platform,
+        }));
+    }
+    out
+}
+
+// 待实现 (低频/复杂): create-workspace-v2 agent hook 配置 (claude/codex/opencode
+// 的 hook/MCP/permission 配置写入, nuwax 专属 agent 装配逻辑)。
