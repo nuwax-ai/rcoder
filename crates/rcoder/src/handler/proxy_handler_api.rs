@@ -294,7 +294,7 @@ pub async fn proxy_config(
     get,
     path = "/proxy/{port}",
     tag = "proxy",
-    summary = "重定向到 Pingora 代理（无路径）",
+    summary = "Pingora 代理 - 访问部署的应用服务（无路径，重定向）",
     description = r#"
 重定向请求到 Pingora 代理服务，无额外路径。
 
@@ -383,9 +383,18 @@ pub async fn proxy_to_port(
     get,
     path = "/proxy/{port}/{*path}",
     tag = "proxy",
-    summary = "重定向到 Pingora 代理（含路径）",
+    summary = "Pingora 代理 - 访问部署的应用服务（含路径）",
     description = r#"
 重定向请求到 Pingora 代理服务，包含完整路径信息。
+
+## 访问部署的应用服务（重点）
+通过 `POST /api/v1/apps` 部署的应用（HTTP 端口），其访问入口 `access.external.http` 返回
+`/proxy/{port}`，即本接口。用法：`GET /proxy/{应用的 HTTP 端口}/{路径}` → 经 Pingora 代理到应用后端
+（K8s 转发到 `{app_id}-svc:{port}`，Docker 转发到 container_ip:{port}）。
+
+> 例：app HTTP 端口 8080，`GET /apps/{id}` 返回 `access.external.http = "/proxy/8080"`，
+> 访问该应用：`GET /proxy/8080/api/users` → Pingora 代理到应用 `:8080/api/users`。
+> host（RCoder 入口）由调用方持有，详见应用管理手册 §1.7。
 
 ## 工作原理
 此接口会返回 307 重定向，将请求转发到 Pingora 代理服务的实际端口和路径。
