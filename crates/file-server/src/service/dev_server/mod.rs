@@ -194,7 +194,10 @@ impl DevServerManager {
             None => {
                 let dev_script = read_dev_script(project_path)?;
                 self.write_npmrc(project_path).await?;
-                // node_modules 缺失则 install (失败不阻塞, 与 nuwax 宽松一致)
+                // 对齐 nuwax K8s 快路径 (restartDevUtils shouldUseFastRestart):
+                // 永不 removeNodeModules (那是 nuwax 非 K8s 全路径才做的); node_modules 存在则
+                // 直接复用 (更快, 省去增量 pnpm install), 仅缺失时才 install。
+                // → 重启 dev server 不删前端 vite 项目缓存, 与 K8s 分支一致。
                 if !project_path.join("node_modules").exists() {
                     let _ = process::run_command_to_log(
                         "pnpm",
