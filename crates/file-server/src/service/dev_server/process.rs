@@ -318,9 +318,17 @@ fn parse_pid_from_line(line: &str) -> Option<u32> {
 
 /// HTTP 探活 dev server (对齐 nuwax isProjectAlive): GET 127.0.0.1:port{basePath}, 仅 2xx 视为存活。
 /// (nuwax aliveJudge 仅 200-299; 3xx 如反代 302 到登录页不能误判存活)
+///
+/// 路径必须与 vite `--base` 一致且**保留尾斜杠**: vite 对 `/proxy/41000` 返回 404,
+/// 对 `/proxy/41000/` 返回 200。base_path 缺省时 vite --base 默认 `/proxy/{port}/`
+/// (见 build_dev_args), 探活须用同一路径, 否则永远探不到 200 → poll 跑满超时、
+/// keep-alive 误判重启。
 pub async fn is_project_alive(port: u16, base_path: Option<&str>, timeout_ms: u64) -> bool {
-    let base = base_path.map(normalize_base_path).unwrap_or_default();
-    let url = format!("http://127.0.0.1:{port}{}", base.trim_end_matches('/'));
+    let base = match base_path.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b) => normalize_base_path(b),
+        None => format!("/proxy/{port}/"),
+    };
+    let url = format!("http://127.0.0.1:{port}{base}");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .redirect(reqwest::redirect::Policy::none())
