@@ -12,17 +12,17 @@
 
 use std::path::{Path, PathBuf};
 
+use axum::Router;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use serde::Deserialize;
 use tower::util::ServiceExt;
 use tower_http::services::ServeFile;
 
-use crate::workspace::{ComputerContext, ProjectContext};
 use crate::AppState;
+use crate::workspace::{ComputerContext, ProjectContext};
 
 /// CORS 头配置 (两套路由不同)。
 struct CorsConfig {
@@ -98,7 +98,12 @@ async fn serve_computer(
         return cors_404(&req, &COMPUTER_CORS);
     }
     // customTargetDir 非空 → 完全覆盖根 (对齐 nuwax, 不拼 user/cId)
-    let root = match q.custom_target_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let root = match q
+        .custom_target_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(ct) => PathBuf::from(ct),
         None => state.resolver.resolve_computer(&ComputerContext {
             user_id: user_id.to_string(),

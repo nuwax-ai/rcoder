@@ -11,7 +11,9 @@ pub fn parse(error_message: &str) -> String {
     let patterns: &[(Pattern, &str)] = &[
         // 模块缺失: Cannot find module 'X' / Can't resolve 'X' (引号可选, 覆盖裸名场景)
         (
-            Pattern::new(r#"(?:Cannot find module|Can't resolve|Module not found)[^\n]*?['"`]?([A-Za-z0-9_@/.\-]+)['"`]?"#),
+            Pattern::new(
+                r#"(?:Cannot find module|Can't resolve|Module not found)[^\n]*?['"`]?([A-Za-z0-9_@/.\-]+)['"`]?"#,
+            ),
             "Module not found: {1}. 请确认依赖已安装 (pnpm install) 或导入路径正确。",
         ),
         // TS 类型/编译错: error TS1234:
@@ -20,13 +22,12 @@ pub fn parse(error_message: &str) -> String {
             "TypeScript 编译错误 (TS{1}):{2}",
         ),
         // 语法错
-        (
-            Pattern::new(r"SyntaxError:([^\n]*)"),
-            "语法错误:{1}",
-        ),
+        (Pattern::new(r"SyntaxError:([^\n]*)"), "语法错误:{1}"),
         // 依赖安装失败
         (
-            Pattern::new(r#"(?:ERR_PNPM|npm ERR!).*?(?:no matching version|not found)[^\n]*['"`]?([A-Za-z0-9_@/.\-]+)['"`]?"#),
+            Pattern::new(
+                r#"(?:ERR_PNPM|npm ERR!).*?(?:no matching version|not found)[^\n]*['"`]?([A-Za-z0-9_@/.\-]+)['"`]?"#,
+            ),
             "依赖安装失败: 找不到包 {1} 的匹配版本。",
         ),
     ];
@@ -35,8 +36,7 @@ pub fn parse(error_message: &str) -> String {
             return apply_template(template, caps);
         }
     }
-    "Build failed, please check the detailed error information in the dev/build log."
-        .to_string()
+    "Build failed, please check the detailed error information in the dev/build log.".to_string()
 }
 
 fn apply_template(template: &str, caps: regex::Captures<'_>) -> String {

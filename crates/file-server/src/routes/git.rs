@@ -4,12 +4,12 @@ use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::error::AppError;
 use crate::service::git;
 use crate::workspace::{ComputerContext, ProjectContext};
-use crate::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -124,7 +124,9 @@ async fn tags(
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
     let latest = tags.last().cloned();
-    Ok(Json(json!({ "success": true, "logId": log_id, "tags": tags, "latest": latest })))
+    Ok(Json(
+        json!({ "success": true, "logId": log_id, "tags": tags, "latest": latest }),
+    ))
 }
 
 /// `GET /api/git/log`
@@ -147,7 +149,9 @@ async fn log_history(
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
     let total = commits.len();
-    Ok(Json(json!({ "success": true, "logId": log_id, "commits": commits, "total": total })))
+    Ok(Json(
+        json!({ "success": true, "logId": log_id, "commits": commits, "total": total }),
+    ))
 }
 
 #[derive(Deserialize)]

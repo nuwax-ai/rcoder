@@ -66,8 +66,11 @@ pub async fn append_line(path: &Path, line: &str) -> AppResult<()> {
 
 /// 把 child 的一个 stdout/stderr 流管道到主+临时日志, 每行加时间戳前缀。
 /// 返回的 JoinHandle 供调用方跟踪 (通常 fire-and-forget)。
-pub fn spawn_log_pipe<R>(reader: R, main_path: PathBuf, temp_path: PathBuf)
--> tokio::task::JoinHandle<()>
+pub fn spawn_log_pipe<R>(
+    reader: R,
+    main_path: PathBuf,
+    temp_path: PathBuf,
+) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {

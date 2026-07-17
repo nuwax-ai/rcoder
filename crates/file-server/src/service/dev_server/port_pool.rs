@@ -36,12 +36,7 @@ pub struct PortPool {
 }
 
 impl PortPool {
-    pub fn new(
-        range_start: u16,
-        range_end: u16,
-        reserved_start: u16,
-        reserved_end: u16,
-    ) -> Self {
+    pub fn new(range_start: u16, range_end: u16, reserved_start: u16, reserved_end: u16) -> Self {
         Self {
             allocated: Mutex::new(HashMap::new()),
             range_start,
@@ -79,10 +74,7 @@ impl PortPool {
 
     /// 释放端口 (从 Map 移除)。返回被释放的端口 (无则 None)。
     pub fn release(&self, project_id: &str) -> Option<u16> {
-        self.allocated
-            .lock()
-            .ok()?
-            .remove(project_id)
+        self.allocated.lock().ok()?.remove(project_id)
     }
 
     /// 当前分配快照。

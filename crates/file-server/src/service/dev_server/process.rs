@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::Local;
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
@@ -31,17 +31,10 @@ pub struct DevArgs {
 /// URL → ws 自然连回反代; ws 监听路径 = `--base` 本身。故 **base 必须等于完整代理路径**
 /// (带尾 `/`, 如 `/proxy/{port}/foo/`), 否则资源/ws 全 404。port 由本进程分配, 故 base
 /// 为空时默认 `/proxy/{port}/`, 让 HMR 开箱即用。
-pub fn build_dev_args(
-    dev_script: &str,
-    port: u16,
-    base_path: Option<&str>,
-) -> AppResult<DevArgs> {
+pub fn build_dev_args(dev_script: &str, port: u16, base_path: Option<&str>) -> AppResult<DevArgs> {
     let lower = dev_script.to_ascii_lowercase();
     // base 为空 → 默认完整代理路径 /proxy/{port}/ (HMR 依赖)
-    let base = match base_path
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    let base = match base_path.map(str::trim).filter(|s| !s.is_empty()) {
         Some(b) => normalize_base_path(b),
         None => format!("/proxy/{port}/"),
     };
@@ -232,11 +225,7 @@ where
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let prefixed = format!(
-            "[{}] {}",
-            Local::now().format("%Y/%m/%d %H:%M:%S"),
-            line
-        );
+        let prefixed = format!("[{}] {}", Local::now().format("%Y/%m/%d %H:%M:%S"), line);
         let _ = super::log::append_line(&main, &prefixed).await;
         let _ = super::log::append_line(&temp, &prefixed).await;
     }

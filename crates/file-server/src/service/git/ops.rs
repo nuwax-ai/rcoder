@@ -34,7 +34,8 @@ impl ResetMode {
 
     /// 解析为 ResetMode, 错误转 AppError::validation (兼容 handler `?`)。
     pub fn parse(s: &str) -> AppResult<Self> {
-        s.parse::<Self>().map_err(|e| AppError::validation(e.to_string()))
+        s.parse::<Self>()
+            .map_err(|e| AppError::validation(e.to_string()))
     }
 }
 
@@ -236,9 +237,7 @@ pub fn switch_branch(repo: &gix::Repository, name: &str) -> AppResult<()> {
     let branch_ref = repo
         .find_reference(&branch_full)
         .map_err(|e| map_git_err(e, "git find_reference (branch not found)"))?;
-    let target_id = branch_ref
-        .id()
-        .detach();
+    let target_id = branch_ref.id().detach();
     let target_tree_id = repo
         .find_commit(target_id)
         .map_err(|e| map_git_err(e, "git find_commit branch"))?
@@ -263,7 +262,11 @@ pub fn switch_branch(repo: &gix::Repository, name: &str) -> AppResult<()> {
 
 /// 移动当前分支 ref → target_id (对齐 nuwax writeRef force=true)。
 /// HEAD 须是 symbolic (在某分支上); detached → BusinessError。
-fn move_branch_ref(repo: &gix::Repository, target_id: gix::hash::ObjectId, log_msg: &str) -> AppResult<()> {
+fn move_branch_ref(
+    repo: &gix::Repository,
+    target_id: gix::hash::ObjectId,
+    log_msg: &str,
+) -> AppResult<()> {
     let branch_full = repo
         .head_name()
         .ok()

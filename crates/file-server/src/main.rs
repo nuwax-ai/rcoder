@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
 async fn shutdown_signal(dev_server: Arc<DevServerManager>) {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(e) => {

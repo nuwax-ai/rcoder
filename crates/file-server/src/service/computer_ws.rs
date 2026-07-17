@@ -12,7 +12,15 @@ use tokio::fs;
 use crate::error::{AppError, AppResult};
 
 /// 导入项目时保留的目录/文件 (对齐 nuwax IMPORT_PROJECT_PRESERVED_ENTRIES)。
-const IMPORT_PRESERVED: &[&str] = &[".git", ".agents", ".claude", ".codex", ".opencode", ".tmp", ".logs"];
+const IMPORT_PRESERVED: &[&str] = &[
+    ".git",
+    ".agents",
+    ".claude",
+    ".codex",
+    ".opencode",
+    ".tmp",
+    ".logs",
+];
 
 /// `.dynamic_add.lock` 标记 (对齐 nuwax DYNAMIC_ADD_LOCK; 含此锁的 skill 子目录不删)。
 const DYNAMIC_ADD_LOCK: &str = ".dynamic_add.lock";
@@ -300,7 +308,11 @@ pub async fn create_workspace(
 
 /// 处理单个 skillUrl: 下载 zip → 解压 → 集成 skill 目录到 skills_dir
 /// (对齐 nuwax createWorkspace skillUrls: 若含 skills/ 目录则取其子目录, 否则取顶层非隐藏目录)。
-async fn process_skill_url(url: &str, skills_dir: &Path, workspace: &Path) -> AppResult<Vec<String>> {
+async fn process_skill_url(
+    url: &str,
+    skills_dir: &Path,
+    workspace: &Path,
+) -> AppResult<Vec<String>> {
     let data = crate::service::skills::fetch_url(url).await?;
     let extract_root = temp_sibling(workspace, "skill_url_extract");
     fs::create_dir_all(&extract_root).await?;
@@ -391,7 +403,10 @@ async fn preserve_locked_skills(
 }
 
 /// 还原保留的 skill 子目录。
-async fn restore_locked_skills(preserved: &(PathBuf, Vec<String>), skills_dir: &Path) -> AppResult<()> {
+async fn restore_locked_skills(
+    preserved: &(PathBuf, Vec<String>),
+    skills_dir: &Path,
+) -> AppResult<()> {
     let (temp, names) = preserved;
     if temp.as_os_str().is_empty() || names.is_empty() {
         return Ok(());
@@ -496,7 +511,15 @@ mod tests {
     fn preserved_entries_match_nuwax() {
         // 7 项白名单 (对齐 nuwax IMPORT_PROJECT_PRESERVED_ENTRIES)
         assert_eq!(IMPORT_PRESERVED.len(), 7);
-        for e in [".git", ".agents", ".claude", ".codex", ".opencode", ".tmp", ".logs"] {
+        for e in [
+            ".git",
+            ".agents",
+            ".claude",
+            ".codex",
+            ".opencode",
+            ".tmp",
+            ".logs",
+        ] {
             assert!(IMPORT_PRESERVED.contains(&e), "missing {e}");
         }
     }
@@ -504,8 +527,12 @@ mod tests {
     #[tokio::test]
     async fn remove_top_level_dir_lifts_single_dir() {
         let tmp = std::env::temp_dir().join(format!("fs_rtl_{}", now_nanos()));
-        fs::create_dir_all(tmp.join("only").join("deep")).await.unwrap();
-        fs::write(tmp.join("only").join("a.txt"), "x").await.unwrap();
+        fs::create_dir_all(tmp.join("only").join("deep"))
+            .await
+            .unwrap();
+        fs::write(tmp.join("only").join("a.txt"), "x")
+            .await
+            .unwrap();
         remove_top_level_dir(&tmp, &[]).await;
         assert!(tmp.join("a.txt").exists());
         assert!(tmp.join("deep").is_dir());
@@ -527,22 +554,23 @@ mod tests {
     async fn import_project_preserves_dotgit() {
         let tmp = std::env::temp_dir().join(format!("fs_imp_{}", now_nanos()));
         // 现有工作区含 .git (需保留) 和 old.txt (应被覆盖)
-        fs::create_dir_all(tmp.join(".git").join("refs")).await.unwrap();
-        fs::write(tmp.join(".git").join("HEAD"), "ref").await.unwrap();
+        fs::create_dir_all(tmp.join(".git").join("refs"))
+            .await
+            .unwrap();
+        fs::write(tmp.join(".git").join("HEAD"), "ref")
+            .await
+            .unwrap();
         fs::write(tmp.join("old.txt"), "old").await.unwrap();
         // 打包新 zip: src/ 下含 new.txt (单顶层 src → 上提)
         let zip_root = std::env::temp_dir().join(format!("fs_zip_{}", now_nanos()));
         fs::create_dir_all(zip_root.join("src")).await.unwrap();
-        fs::write(zip_root.join("src").join("new.txt"), "new").await.unwrap();
+        fs::write(zip_root.join("src").join("new.txt"), "new")
+            .await
+            .unwrap();
         let zip_path = zip_root.join("out.zip");
-        crate::service::zip::pack_dir(
-            zip_root.clone(),
-            zip_path.clone(),
-            Vec::new(),
-            Vec::new(),
-        )
-        .await
-        .unwrap();
+        crate::service::zip::pack_dir(zip_root.clone(), zip_path.clone(), Vec::new(), Vec::new())
+            .await
+            .unwrap();
         let zip_data = fs::read(&zip_path).await.unwrap();
         let _ = import_project(&tmp, zip_data).await.unwrap();
         // .git 保留, old.txt 被移除, new.txt 出现
@@ -556,7 +584,9 @@ mod tests {
     #[tokio::test]
     async fn create_workspace_writes_agents_skills() {
         let tmp = std::env::temp_dir().join(format!("fs_cw_{}", now_nanos()));
-        let res = create_workspace(&tmp, None, Vec::new(), None).await.unwrap();
+        let res = create_workspace(&tmp, None, Vec::new(), None)
+            .await
+            .unwrap();
         assert!(tmp.join(".agents").join("skills").is_dir());
         assert!(tmp.join(".agents").join("agents").is_dir());
         // 无 file → 早退 message

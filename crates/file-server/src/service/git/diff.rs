@@ -138,7 +138,10 @@ fn collect_commit_changes(
                     .map_err(|e| map_git_err(e, "git parent tree"))?
                     .id()
                     .detach(),
-                None => repo.head_tree_id_or_empty().map_err(|e| map_git_err(e, "git empty tree"))?.detach(),
+                None => repo
+                    .head_tree_id_or_empty()
+                    .map_err(|e| map_git_err(e, "git empty tree"))?
+                    .detach(),
             }
         }
     };
@@ -175,7 +178,11 @@ fn collect_commit_changes(
         let path = path.to_string();
         let old = read_blob(repo, old_id)?;
         let new = read_blob(repo, new_id)?;
-        out.push(FileChange { path, old: Side { bytes: old }, new: Side { bytes: new } });
+        out.push(FileChange {
+            path,
+            old: Side { bytes: old },
+            new: Side { bytes: new },
+        });
     }
     Ok(out)
 }
@@ -189,7 +196,13 @@ fn collect_worktree_changes(repo: &gix::Repository) -> AppResult<Vec<FileChange>
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     // 工作区 diff = HEAD ↔ 工作区: 覆盖 staged + modified + created + deleted
-    for f in st.staged.iter().chain(&st.modified).chain(&st.created).chain(&st.deleted) {
+    for f in st
+        .staged
+        .iter()
+        .chain(&st.modified)
+        .chain(&st.created)
+        .chain(&st.deleted)
+    {
         if !seen.insert(f.clone()) {
             continue;
         }
@@ -255,11 +268,20 @@ fn render_changes(
         if !rendered.binary && rendered.hunks.is_empty() {
             continue;
         }
-        let header = assemble_header(&ch.path, ch.old.bytes.is_some(), ch.new.bytes.is_some(), &old_hash, &new_hash);
+        let header = assemble_header(
+            &ch.path,
+            ch.old.bytes.is_some(),
+            ch.new.bytes.is_some(),
+            &old_hash,
+            &new_hash,
+        );
         if rendered.binary {
             // 二进制: 只出文件头 + "Binary files ... differ", 无 hunk
             diff.push_str(&header);
-            diff.push_str(&format!("Binary files a/{} and b/{} differ\n", ch.path, ch.path));
+            diff.push_str(&format!(
+                "Binary files a/{} and b/{} differ\n",
+                ch.path, ch.path
+            ));
         } else {
             diff.push_str(&header);
             diff.push_str(&rendered.hunks);
@@ -297,10 +319,20 @@ fn render_blob_diff(old: Option<&[u8]>, new: Option<&[u8]>) -> AppResult<Rendere
     let ob = old.unwrap_or(&[]);
     let nb = new.unwrap_or(&[]);
     if is_binary(ob) || is_binary(nb) {
-        return Ok(Rendered { hunks: String::new(), insertions: 0, deletions: 0, binary: true });
+        return Ok(Rendered {
+            hunks: String::new(),
+            insertions: 0,
+            deletions: 0,
+            binary: true,
+        });
     }
     if ob == nb {
-        return Ok(Rendered { hunks: String::new(), insertions: 0, deletions: 0, binary: false });
+        return Ok(Rendered {
+            hunks: String::new(),
+            insertions: 0,
+            deletions: 0,
+            binary: false,
+        });
     }
     let a = sources::byte_lines(ob);
     let b = sources::byte_lines(nb);
@@ -315,11 +347,22 @@ fn render_blob_diff(old: Option<&[u8]>, new: Option<&[u8]>) -> AppResult<Rendere
     .consume()
     .map_err(|e| AppError::system(format!("git unified diff render: {e}")))?;
     let (ins, del) = count_changes(&hunks);
-    Ok(Rendered { hunks, insertions: ins, deletions: del, binary: false })
+    Ok(Rendered {
+        hunks,
+        insertions: ins,
+        deletions: del,
+        binary: false,
+    })
 }
 
 /// 拼装 git CLI 风格文件头 (对齐 nuwax makeDiffPatch part d)。
-fn assemble_header(path: &str, has_old: bool, has_new: bool, old_hash: &str, new_hash: &str) -> String {
+fn assemble_header(
+    path: &str,
+    has_old: bool,
+    has_new: bool,
+    old_hash: &str,
+    new_hash: &str,
+) -> String {
     let mut h = String::new();
     h.push_str(&format!("diff --git a/{path} b/{path}\n"));
     if !has_old {
@@ -331,14 +374,31 @@ fn assemble_header(path: &str, has_old: bool, has_new: bool, old_hash: &str, new
     } else {
         h.push_str(&format!("index {old_hash}..{new_hash} 100644\n"));
     }
-    h.push_str(&format!("--- {}\n", if has_old { format!("a/{path}") } else { "/dev/null".to_string() }));
-    h.push_str(&format!("+++ {}\n", if has_new { format!("b/{path}") } else { "/dev/null".to_string() }));
+    h.push_str(&format!(
+        "--- {}\n",
+        if has_old {
+            format!("a/{path}")
+        } else {
+            "/dev/null".to_string()
+        }
+    ));
+    h.push_str(&format!(
+        "+++ {}\n",
+        if has_new {
+            format!("b/{path}")
+        } else {
+            "/dev/null".to_string()
+        }
+    ));
     h
 }
 
 // ── 读取 helper ─────────────────────────────────────────────────────────────────
 
-fn read_blob(repo: &gix::Repository, id: Option<gix::hash::ObjectId>) -> AppResult<Option<Vec<u8>>> {
+fn read_blob(
+    repo: &gix::Repository,
+    id: Option<gix::hash::ObjectId>,
+) -> AppResult<Option<Vec<u8>>> {
     match id {
         Some(id) => {
             let blob = repo
@@ -377,9 +437,14 @@ fn read_head_blob(
     }
 }
 
-fn read_index_blob(repo: &gix::Repository, index: &gix::index::File, path: &str) -> Option<Vec<u8>> {
+fn read_index_blob(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    path: &str,
+) -> Option<Vec<u8>> {
     let bstr_path = gix::path::into_bstr(std::path::PathBuf::from(path));
-    let entry = index.entry_by_path_and_stage(bstr_path.as_ref(), gix::index::entry::Stage::Unconflicted)?;
+    let entry = index
+        .entry_by_path_and_stage(bstr_path.as_ref(), gix::index::entry::Stage::Unconflicted)?;
     let blob = repo.find_blob(entry.id).ok()?;
     Some(blob.data.to_vec())
 }

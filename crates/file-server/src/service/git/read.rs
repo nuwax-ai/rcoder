@@ -34,9 +34,7 @@ pub fn list_tags(repo: &gix::Repository) -> AppResult<Vec<String>> {
     let refs = repo
         .references()
         .map_err(|e| map_git_err(e, "git references"))?;
-    let iter = refs
-        .tags()
-        .map_err(|e| map_git_err(e, "git tags"))?;
+    let iter = refs.tags().map_err(|e| map_git_err(e, "git tags"))?;
     for r in iter {
         let r = r.map_err(|e| map_git_err(e, "git tag iter"))?;
         let name = r.name().as_bstr().to_string();
@@ -97,9 +95,7 @@ pub fn log_history(
             .message_raw()
             .map_err(|e| map_git_err(e, "git message"))?
             .to_string();
-        let author = commit
-            .author()
-            .map_err(|e| map_git_err(e, "git author"))?;
+        let author = commit.author().map_err(|e| map_git_err(e, "git author"))?;
         let secs = commit
             .time()
             .map_err(|e| map_git_err(e, "git commit time"))?

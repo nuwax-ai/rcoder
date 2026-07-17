@@ -49,12 +49,30 @@ const PLATFORM_ENV_SCRIPT_PATH: &str = "hooks/platform-env.sh";
 
 /// opencode-hooks-plugin/dist 下所有 .js (对齐 nuwax assets/opencode-hooks-plugin/dist)。
 const OPENCODE_HOOKS_PLUGIN_FILES: &[(&str, &[u8])] = &[
-    ("config.js", include_bytes!("../../assets/opencode-hooks-plugin/dist/config.js")),
-    ("events.js", include_bytes!("../../assets/opencode-hooks-plugin/dist/events.js")),
-    ("executor.js", include_bytes!("../../assets/opencode-hooks-plugin/dist/executor.js")),
-    ("index.js", include_bytes!("../../assets/opencode-hooks-plugin/dist/index.js")),
-    ("matcher.js", include_bytes!("../../assets/opencode-hooks-plugin/dist/matcher.js")),
-    ("types.js", include_bytes!("../../assets/opencode-hooks-plugin/dist/types.js")),
+    (
+        "config.js",
+        include_bytes!("../../assets/opencode-hooks-plugin/dist/config.js"),
+    ),
+    (
+        "events.js",
+        include_bytes!("../../assets/opencode-hooks-plugin/dist/events.js"),
+    ),
+    (
+        "executor.js",
+        include_bytes!("../../assets/opencode-hooks-plugin/dist/executor.js"),
+    ),
+    (
+        "index.js",
+        include_bytes!("../../assets/opencode-hooks-plugin/dist/index.js"),
+    ),
+    (
+        "matcher.js",
+        include_bytes!("../../assets/opencode-hooks-plugin/dist/matcher.js"),
+    ),
+    (
+        "types.js",
+        include_bytes!("../../assets/opencode-hooks-plugin/dist/types.js"),
+    ),
 ];
 
 /// opencode-platform-env-plugin 入口 (对齐 nuwax assets/opencode-platform-env-plugin)。
@@ -96,10 +114,18 @@ struct HooksStatus {
 /// 空输入 → 未尝试 (attempted=false); 解析失败 → attempted=true + error; 成功 → 规范化 hooksMap (可能为 None)。
 fn parse_hooks_config_with_status(hooks_config: Option<&str>) -> HooksStatus {
     let Some(s) = hooks_config else {
-        return HooksStatus { attempted: false, hooks_map: None, error: None };
+        return HooksStatus {
+            attempted: false,
+            hooks_map: None,
+            error: None,
+        };
     };
     if s.trim().is_empty() {
-        return HooksStatus { attempted: false, hooks_map: None, error: None };
+        return HooksStatus {
+            attempted: false,
+            hooks_map: None,
+            error: None,
+        };
     }
     match serde_json::from_str::<Value>(s) {
         Ok(parsed) => HooksStatus {
@@ -121,10 +147,14 @@ fn normalize_hooks_map(hooks_map: &Value) -> Option<Map<String, Value>> {
     let obj = hooks_map.as_object()?;
     let mut normalized = Map::new();
     for (event_name, matcher_groups) in obj {
-        let Some(groups_arr) = matcher_groups.as_array() else { continue };
+        let Some(groups_arr) = matcher_groups.as_array() else {
+            continue;
+        };
         let mut groups: Vec<Value> = Vec::new();
         for group in groups_arr {
-            let Some(group_obj) = group.as_object() else { continue };
+            let Some(group_obj) = group.as_object() else {
+                continue;
+            };
             let raw_handlers = group_obj.get("hooks").and_then(|h| h.as_array());
             let mut handlers: Vec<Value> = Vec::new();
             if let Some(raw_arr) = raw_handlers {
@@ -145,7 +175,11 @@ fn normalize_hooks_map(hooks_map: &Value) -> Option<Map<String, Value>> {
             normalized.insert(event_name.clone(), Value::Array(groups));
         }
     }
-    if normalized.is_empty() { None } else { Some(normalized) }
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 /// 把单个 handler 规范化为 object (对齐 nuwax parseHookHandlerObject):
@@ -193,9 +227,8 @@ fn shell_single_quote(value: &str) -> String {
 
 /// 将 header 值中的 `$ENV_VAR` 转为 bash 运行时展开形式 `${ENV_VAR}` (对齐 nuwax toBashEnvExpandable)。
 fn to_bash_env_expandable(value: &str) -> String {
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)").expect("env var regex")
-    });
+    static RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)").expect("env var regex"));
     RE.replace_all(value, |caps: &regex::Captures| format!("${{{}}}", &caps[1]))
         .to_string()
 }
@@ -277,7 +310,9 @@ fn normalize_codex_command(command: &str) -> String {
 
 /// Codex hook 脚本路径解析前缀 (对齐 nuwax buildCodexHookCommand)。
 fn build_codex_hook_command(script_name: &str) -> String {
-    format!("bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.codex/hooks/{script_name}\"")
+    format!(
+        "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.codex/hooks/{script_name}\""
+    )
 }
 
 /// 构建 curl header 参数数组 (对齐 nuwax buildCurlHeaderArgs)。
@@ -340,7 +375,11 @@ async fn write_file_atomic(target: &Path, content: &str, mode: Option<u32>) -> A
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("file");
-    let tmp = dir.join(format!(".{basename}.{}.{}.tmp", std::process::id(), now_nanos()));
+    let tmp = dir.join(format!(
+        ".{basename}.{}.{}.tmp",
+        std::process::id(),
+        now_nanos()
+    ));
     fs::write(&tmp, content).await?;
     if let Some(m) = mode {
         set_mode(&tmp, m).await?;
@@ -391,17 +430,23 @@ async fn transform_hooks_for_codex(
             tracing::warn!(event = %event_name, "Skipping unsupported Codex hook event");
             continue;
         }
-        let Some(groups_arr) = matcher_groups.as_array() else { continue };
+        let Some(groups_arr) = matcher_groups.as_array() else {
+            continue;
+        };
         let mut transformed_groups: Vec<Value> = Vec::new();
 
         for group in groups_arr {
-            let Some(group_obj) = group.as_object() else { continue };
+            let Some(group_obj) = group.as_object() else {
+                continue;
+            };
             let raw_handlers = group_obj.get("hooks").and_then(|h| h.as_array());
             let mut transformed_handlers: Vec<Value> = Vec::new();
 
             if let Some(raw_arr) = raw_handlers {
                 for handler in raw_arr {
-                    let Some(handler_obj) = handler.as_object() else { continue };
+                    let Some(handler_obj) = handler.as_object() else {
+                        continue;
+                    };
                     let htype = handler_obj
                         .get("type")
                         .and_then(|v| v.as_str())
@@ -452,7 +497,8 @@ async fn transform_hooks_for_codex(
                             "timeout".to_string(),
                             Value::Number(serde_json::Number::from(timeout)),
                         );
-                        if let Some(sm) = handler_obj.get("statusMessage").filter(|v| !v.is_null()) {
+                        if let Some(sm) = handler_obj.get("statusMessage").filter(|v| !v.is_null())
+                        {
                             new_handler.insert("statusMessage".to_string(), sm.clone());
                         }
                         transformed_handlers.push(Value::Object(new_handler));
@@ -485,7 +531,11 @@ async fn transform_hooks_for_codex(
         }
     }
 
-    if codex_hooks.is_empty() { Ok(None) } else { Ok(Some(codex_hooks)) }
+    if codex_hooks.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(codex_hooks))
+    }
 }
 
 // ── OpenCode 插件安装 (installOpencodeHooksPlugin / installOpencodePlatformEnvPlugin) ──
@@ -500,9 +550,13 @@ async fn install_opencode_hooks_plugin(opencode_plugins_dir: &Path) -> AppResult
         fs::write(target_plugin_root.join(name), content).await?;
     }
     let entry_file = opencode_plugins_dir.join(OPENCODE_PLUGIN_ENTRY);
-    let entry_content = format!("export {{ default }} from \"./{OPENCODE_PLUGIN_DIR}/dist/index.js\";\n");
+    let entry_content =
+        format!("export {{ default }} from \"./{OPENCODE_PLUGIN_DIR}/dist/index.js\";\n");
     write_file_atomic(&entry_file, &entry_content, None).await?;
-    tracing::info!(entry = OPENCODE_PLUGIN_ENTRY, "Installed opencode-hooks-plugin into .opencode/plugins");
+    tracing::info!(
+        entry = OPENCODE_PLUGIN_ENTRY,
+        "Installed opencode-hooks-plugin into .opencode/plugins"
+    );
     Ok(true)
 }
 
@@ -520,7 +574,9 @@ async fn install_opencode_platform_env_plugin(opencode_plugins_dir: &Path) -> Ap
 
 /// 判断 hookScripts 是否含 platform-env 脚本 (对齐 nuwax hasPlatformEnvScript)。
 fn has_platform_env_script(hook_scripts: Option<&[HookScript]>) -> bool {
-    let Some(scripts) = hook_scripts else { return false };
+    let Some(scripts) = hook_scripts else {
+        return false;
+    };
     scripts.iter().any(|s| s.path == PLATFORM_ENV_SCRIPT_PATH)
 }
 
@@ -579,8 +635,14 @@ async fn clear_hook_artifacts(workspace: &Path) -> AppResult<()> {
     let targets: [PathBuf; 6] = [
         workspace.join(".codex").join("hooks.json"),
         workspace.join(".codex").join("hooks"),
-        workspace.join(".opencode").join("plugins").join(OPENCODE_PLUGIN_ENTRY),
-        workspace.join(".opencode").join("plugins").join(OPENCODE_PLUGIN_DIR),
+        workspace
+            .join(".opencode")
+            .join("plugins")
+            .join(OPENCODE_PLUGIN_ENTRY),
+        workspace
+            .join(".opencode")
+            .join("plugins")
+            .join(OPENCODE_PLUGIN_DIR),
         workspace
             .join(".opencode")
             .join("plugins")
@@ -628,9 +690,11 @@ async fn stage_runtime_hook_artifacts(
     hooks_map: &Map<String, Value>,
     install_platform_env: bool,
 ) -> AppResult<StagedRuntime> {
-    let staging_root = workspace
-        .join(".tmp")
-        .join(format!("hook-staging-{}-{}", now_nanos(), std::process::id()));
+    let staging_root = workspace.join(".tmp").join(format!(
+        "hook-staging-{}-{}",
+        now_nanos(),
+        std::process::id()
+    ));
     let codex_staging_root = staging_root.join("codex");
     let codex_hooks_dir = codex_staging_root.join("hooks");
     let opencode_plugins_staging = staging_root.join("opencode").join("plugins");
@@ -667,15 +731,21 @@ async fn apply_staged_runtime_hook_artifacts(
 
     // Codex hooks 目录 (含 http wrapper 脚本)
     let staged_codex_hooks_dir = staged.codex_staging_root.join("hooks");
-    if fs::try_exists(&staged_codex_hooks_dir).await.unwrap_or(false) {
+    if fs::try_exists(&staged_codex_hooks_dir)
+        .await
+        .unwrap_or(false)
+    {
         let _ = fs::remove_dir_all(&codex_hooks_target).await;
         fs::rename(&staged_codex_hooks_dir, &codex_hooks_target).await?;
     }
 
     // .codex/hooks.json
     if let Some(codex_hooks) = &staged.codex_hooks {
-        write_json_file_atomic(&codex_root.join("hooks.json"), &json!({ "hooks": codex_hooks }))
-            .await?;
+        write_json_file_atomic(
+            &codex_root.join("hooks.json"),
+            &json!({ "hooks": codex_hooks }),
+        )
+        .await?;
         tracing::info!(
             events = ?codex_hooks.keys().collect::<Vec<_>>(),
             "Written .codex/hooks.json"
@@ -688,7 +758,11 @@ async fn apply_staged_runtime_hook_artifacts(
         let staged_plugins = staged.staging_root.join("opencode").join("plugins");
         let staged_entry = staged_plugins.join(OPENCODE_PLUGIN_ENTRY);
         if fs::try_exists(&staged_entry).await.unwrap_or(false) {
-            fs::copy(&staged_entry, opencode_plugins_target.join(OPENCODE_PLUGIN_ENTRY)).await?;
+            fs::copy(
+                &staged_entry,
+                opencode_plugins_target.join(OPENCODE_PLUGIN_ENTRY),
+            )
+            .await?;
         }
         let staged_plugin_dir = staged_plugins.join(OPENCODE_PLUGIN_DIR);
         if fs::try_exists(&staged_plugin_dir).await.unwrap_or(false) {
@@ -708,8 +782,11 @@ async fn apply_staged_runtime_hook_artifacts(
             .join("plugins")
             .join(OPENCODE_PLATFORM_ENV_PLUGIN_ENTRY);
         if fs::try_exists(&staged_pe).await.unwrap_or(false) {
-            fs::copy(&staged_pe, opencode_plugins_target.join(OPENCODE_PLATFORM_ENV_PLUGIN_ENTRY))
-                .await?;
+            fs::copy(
+                &staged_pe,
+                opencode_plugins_target.join(OPENCODE_PLATFORM_ENV_PLUGIN_ENTRY),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -738,7 +815,10 @@ pub async fn write_agent_hook_configs(workspace: &Path, opts: HookConfigInput) -
         .as_deref()
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    let has_scripts = hook_scripts.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+    let has_scripts = hook_scripts
+        .as_ref()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
 
     if hooks_status.attempted && hooks_status.error.is_some() {
         tracing::error!(
@@ -775,10 +855,7 @@ pub async fn write_agent_hook_configs(workspace: &Path, opts: HookConfigInput) -
     let should_update_scripts = has_scripts;
     let install_platform_env = has_platform_env_script(hook_scripts.as_deref());
 
-    if !should_update_mcp
-        && !should_update_hooks
-        && !should_update_perms
-        && !should_update_scripts
+    if !should_update_mcp && !should_update_hooks && !should_update_perms && !should_update_scripts
     {
         return Ok(());
     }
@@ -846,7 +923,8 @@ async fn apply_hook_configs(
     if flags.should_update_hooks
         && let Some(hm) = hooks_map
     {
-        let staged = stage_runtime_hook_artifacts(workspace, hm, flags.install_platform_env).await?;
+        let staged =
+            stage_runtime_hook_artifacts(workspace, hm, flags.install_platform_env).await?;
         *staging_out = Some(staged.staging_root.clone());
         staged_runtime = Some(staged);
     }
@@ -892,7 +970,8 @@ async fn apply_hook_configs(
                     next_settings.remove("hooks");
                 }
             }
-            if flags.should_update_perms && !corrupt
+            if flags.should_update_perms
+                && !corrupt
                 && let Some(perms) = permissions
             {
                 next_settings.insert("permissions".to_string(), perms.clone());
@@ -948,7 +1027,8 @@ mod tests {
 
     #[test]
     fn parse_hooks_status_valid_normalizes() {
-        let input = r#"{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"echo hi"}]}]}"#;
+        let input =
+            r#"{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"echo hi"}]}]}"#;
         let s = parse_hooks_config_with_status(Some(input));
         assert!(s.attempted);
         assert!(s.error.is_none());
@@ -959,7 +1039,8 @@ mod tests {
     #[test]
     fn normalize_hooks_map_drops_empty_groups() {
         // hooks 为空数组 → 整组丢弃
-        let v: Value = serde_json::from_str(r#"{"PreToolUse":[{"matcher":"*","hooks":[]}]}"#).unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"PreToolUse":[{"matcher":"*","hooks":[]}]}"#).unwrap();
         assert!(normalize_hooks_map(&v).is_none());
     }
 
@@ -972,9 +1053,18 @@ mod tests {
         .unwrap();
         let hm = normalize_hooks_map(&v).expect("some");
         let groups = hm.get("PreToolUse").unwrap().as_array().unwrap();
-        let handlers = groups[0].as_object().unwrap().get("hooks").unwrap().as_array().unwrap();
+        let handlers = groups[0]
+            .as_object()
+            .unwrap()
+            .get("hooks")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(handlers.len(), 1);
-        assert_eq!(handlers[0].get("type").and_then(|v| v.as_str()), Some("command"));
+        assert_eq!(
+            handlers[0].get("type").and_then(|v| v.as_str()),
+            Some("command")
+        );
     }
 
     #[test]
@@ -1107,25 +1197,50 @@ mod tests {
 
         // .mcp.json
         let mcp_data: Value =
-            serde_json::from_str(&fs::read_to_string(tmp.join(".mcp.json")).await.unwrap()).unwrap();
-        assert_eq!(mcp_data.get("mcpServers").unwrap().get("filesystem").unwrap().get("command"), Some(&json!("npx")));
+            serde_json::from_str(&fs::read_to_string(tmp.join(".mcp.json")).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            mcp_data
+                .get("mcpServers")
+                .unwrap()
+                .get("filesystem")
+                .unwrap()
+                .get("command"),
+            Some(&json!("npx"))
+        );
 
         // .claude/settings.json: hooks + permissions
-        let settings: Value =
-            serde_json::from_str(&fs::read_to_string(tmp.join(".claude").join("settings.json")).await.unwrap())
-                .unwrap();
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".claude").join("settings.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert!(settings.get("hooks").unwrap().get("PreToolUse").is_some());
         assert!(settings.get("permissions").unwrap().get("allow").is_some());
 
         // .codex/hooks.json: http 转 command wrapper
-        let codex: Value =
-            serde_json::from_str(&fs::read_to_string(tmp.join(".codex").join("hooks.json")).await.unwrap())
-                .unwrap();
+        let codex: Value = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".codex").join("hooks.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let handlers = codex["hooks"]["PreToolUse"][1]["hooks"].as_array().unwrap();
         assert_eq!(handlers[0]["type"], "command");
-        assert!(handlers[0]["command"].as_str().unwrap().contains("http-hook-0.sh"));
+        assert!(
+            handlers[0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("http-hook-0.sh")
+        );
         // wrapper 脚本写入 .codex/hooks/
-        assert!(tmp.join(".codex").join("hooks").join("http-hook-0.sh").is_file());
+        assert!(
+            tmp.join(".codex")
+                .join("hooks")
+                .join("http-hook-0.sh")
+                .is_file()
+        );
 
         // hook 外挂脚本 (含路径校验, 0o755)
         let check = tmp.join(".claude").join("hooks").join("check.sh");
@@ -1138,19 +1253,26 @@ mod tests {
         }
 
         // opencode 插件 (platform-env 因含 platform-env.sh 触发)
-        assert!(tmp.join(".opencode").join("plugins").join(OPENCODE_PLUGIN_ENTRY).is_file());
-        assert!(tmp
-            .join(".opencode")
-            .join("plugins")
-            .join(OPENCODE_PLUGIN_DIR)
-            .join("dist")
-            .join("index.js")
-            .is_file());
-        assert!(tmp
-            .join(".opencode")
-            .join("plugins")
-            .join(OPENCODE_PLATFORM_ENV_PLUGIN_ENTRY)
-            .is_file());
+        assert!(
+            tmp.join(".opencode")
+                .join("plugins")
+                .join(OPENCODE_PLUGIN_ENTRY)
+                .is_file()
+        );
+        assert!(
+            tmp.join(".opencode")
+                .join("plugins")
+                .join(OPENCODE_PLUGIN_DIR)
+                .join("dist")
+                .join("index.js")
+                .is_file()
+        );
+        assert!(
+            tmp.join(".opencode")
+                .join("plugins")
+                .join(OPENCODE_PLATFORM_ENV_PLUGIN_ENTRY)
+                .is_file()
+        );
 
         // staging 目录已清理
         let tmp_dir = tmp.join(".tmp");
@@ -1188,7 +1310,8 @@ mod tests {
         .unwrap();
 
         let mcp: Value =
-            serde_json::from_str(&fs::read_to_string(tmp.join(".mcp.json")).await.unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(tmp.join(".mcp.json")).await.unwrap())
+                .unwrap();
         assert!(mcp["mcpServers"]["new"].is_object());
         // 旧 entry 被覆盖 (mcp 是整文件重写, 对齐 nuwax)
         assert!(mcp["mcpServers"]["old"].is_null());

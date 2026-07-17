@@ -22,9 +22,7 @@ pub fn create_branch(
         Some(sp) => repo
             .rev_parse_single(sp)
             .map_err(|e| map_git_err(e, "git rev_parse startPoint"))?,
-        None => repo
-            .head_id()
-            .map_err(|e| map_git_err(e, "git head_id"))?,
+        None => repo.head_id().map_err(|e| map_git_err(e, "git head_id"))?,
     };
     let full = format!("refs/heads/{name}");
     repo.reference(

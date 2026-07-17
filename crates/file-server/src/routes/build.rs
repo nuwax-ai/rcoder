@@ -9,11 +9,11 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::error::AppError;
 use crate::workspace::ProjectContext;
-use crate::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -172,7 +172,9 @@ async fn keep_alive(
     Query(q): Query<KeepAliveQuery>,
 ) -> Result<Json<Value>, AppError> {
     // 对齐 nuwax buildRoutes: projectId/pid/port/basePath 必填校验
-    let pid = q.pid.ok_or_else(|| AppError::validation("pid is required"))?;
+    let pid = q
+        .pid
+        .ok_or_else(|| AppError::validation("pid is required"))?;
     let base_str = q
         .base_path
         .as_deref()
@@ -308,17 +310,26 @@ async fn build_project(
     )
     .await;
     // 释放项目级锁 (drop _permit + 显式 remove)
-    building.lock().expect("building set lock").remove(&q.project_id);
+    building
+        .lock()
+        .expect("building set lock")
+        .remove(&q.project_id);
     if build_result.is_err() {
         // 失败: 读 build 日志用 build_error 解析友好消息 (对齐 nuwax BuildErrorParser)
-        let log_content = tokio::fs::read_to_string(&temp_log).await.unwrap_or_default();
+        let log_content = tokio::fs::read_to_string(&temp_log)
+            .await
+            .unwrap_or_default();
         let friendly = crate::service::build_error::parse(&log_content);
         return Err(AppError::system(friendly));
     }
 
     // 拷贝 dist → {DIST_TARGET_DIR}/{projectId}/dist/ (Rust fs, 无 rm -rf shell;
     // 错误为类型化 io::Error, 路径经 PathBuf::join 无注入)
-    let dst = state.config.dist_target_dir.join(&q.project_id).join("dist");
+    let dst = state
+        .config
+        .dist_target_dir
+        .join(&q.project_id)
+        .join("dist");
     let src = path.join("dist");
     if !src.exists() {
         return Err(AppError::business("build produced no dist directory"));
@@ -341,7 +352,11 @@ fn normalize_build_base(b: Option<&str>) -> String {
     if b.is_empty() {
         return "/".to_string();
     }
-    let mut s = if b.starts_with('/') { b } else { format!("/{b}") };
+    let mut s = if b.starts_with('/') {
+        b
+    } else {
+        format!("/{b}")
+    };
     if !s.ends_with('/') {
         s.push('/');
     }
@@ -358,7 +373,8 @@ fn build_concurrency(
 ) {
     use std::sync::OnceLock;
     static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-    static BUILDING: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    static BUILDING: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        OnceLock::new();
     let sem = SEM.get_or_init(|| tokio::sync::Semaphore::new(max.max(1)));
     let building = BUILDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     (sem, building)

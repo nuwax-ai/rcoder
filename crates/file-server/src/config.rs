@@ -154,8 +154,14 @@ impl Config {
             deployment_mode: env_str("DEPLOYMENT_MODE", "docker-compose"),
             fast_restart_enabled: env_bool("FAST_RESTART_ENABLED", false),
             computer_log_dir: PathBuf::from(env_str("COMPUTER_LOG_DIR", "/app/logs/computer_logs")),
-            template_cache_dir: PathBuf::from(env_str("TEMPLATE_CACHE_DIR", "/local-cache/templates")),
-            node_modules_local_dir: PathBuf::from(env_str("NODE_MODULES_LOCAL_DIR", "/local-cache/node-modules")),
+            template_cache_dir: PathBuf::from(env_str(
+                "TEMPLATE_CACHE_DIR",
+                "/local-cache/templates",
+            )),
+            node_modules_local_dir: PathBuf::from(env_str(
+                "NODE_MODULES_LOCAL_DIR",
+                "/local-cache/node-modules",
+            )),
             bash_path: env_str("BASH_PATH", ""),
             dev_port_range_start: env_port("DEV_PORT_RANGE_START", 4000),
             dev_port_range_end: env_port("DEV_PORT_RANGE_END", 55000),

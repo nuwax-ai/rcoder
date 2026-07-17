@@ -13,8 +13,8 @@ pub mod log;
 pub mod port_pool;
 pub mod process;
 
-pub use error_classify::{StderrRing, ViteStartupError, STDERR_RING_CAP};
-pub use log::{read_dev_log, ReadDevLogResult};
+pub use error_classify::{STDERR_RING_CAP, StderrRing, ViteStartupError};
+pub use log::{ReadDevLogResult, read_dev_log};
 pub use port_pool::{PortAllocation, PortPool, PortPoolStatus};
 pub use process::{is_process_running, is_project_alive, kill_process_group, now_ms};
 
@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::error::{AppError, AppResult};
 use crate::Config;
+use crate::error::{AppError, AppResult};
 
 /// 运行中的 dev server 记录 (内存状态)。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -128,7 +128,8 @@ impl DevServerManager {
             starting: &self.starting,
             project_id: project_id.to_string(),
         };
-        self.start_dev_inner(project_id, project_path, base_path).await
+        self.start_dev_inner(project_id, project_path, base_path)
+            .await
     }
 
     async fn start_dev_inner(
@@ -139,7 +140,10 @@ impl DevServerManager {
     ) -> AppResult<StartedDev> {
         // 幂等: 已运行则返回现有 pid/port
         if let Some(p) = lock(&self.processes)?.get(project_id).cloned() {
-            return Ok(StartedDev { pid: p.pid, port: p.port });
+            return Ok(StartedDev {
+                pid: p.pid,
+                port: p.port,
+            });
         }
 
         let port = self.port_pool.allocate(project_id)?;
@@ -203,7 +207,12 @@ impl DevServerManager {
                     .await;
                 }
                 let dev_args = process::build_dev_args(&dev_script, port, base_path)?;
-                process::spawn_dev(dev_args.program, &dev_args.args, project_path, &dev_args.env_extra)?
+                process::spawn_dev(
+                    dev_args.program,
+                    &dev_args.args,
+                    project_path,
+                    &dev_args.env_extra,
+                )?
             }
         };
         let pid = child
@@ -322,7 +331,9 @@ impl DevServerManager {
             self.port_pool.release(project_id);
             log::cleanup_temp_logs(&p.log_dir).await;
         }
-        Ok(StoppedDev { killed_pids: killed })
+        Ok(StoppedDev {
+            killed_pids: killed,
+        })
     }
 
     /// restart-dev = stop + start。
@@ -345,8 +356,7 @@ impl DevServerManager {
         base_path: Option<&str>,
         project_path: &Path,
     ) -> AppResult<KeepAliveResult> {
-        let alive =
-            is_project_alive(port, base_path, self.config.dev_alive_check_timeout_ms).await;
+        let alive = is_project_alive(port, base_path, self.config.dev_alive_check_timeout_ms).await;
         if alive {
             return Ok(KeepAliveResult {
                 alive: true,
@@ -494,7 +504,8 @@ fn read_dev_script(project_path: &Path) -> AppResult<String> {
 }
 
 fn lock<T>(m: &Mutex<T>) -> AppResult<std::sync::MutexGuard<'_, T>> {
-    m.lock().map_err(|e| AppError::system(format!("mutex poisoned: {e}")))
+    m.lock()
+        .map_err(|e| AppError::system(format!("mutex poisoned: {e}")))
 }
 
 #[cfg(test)]
@@ -511,7 +522,11 @@ mod tests {
         assert!(d.args.iter().any(|a| a == "0.0.0.0"));
         // --clearScreen false 抑制 ANSI 清屏转义污染日志
         assert!(d.args.iter().any(|a| a == "--clearScreen"));
-        assert!(d.args.windows(2).any(|w| w[0] == "--clearScreen" && w[1] == "false"));
+        assert!(
+            d.args
+                .windows(2)
+                .any(|w| w[0] == "--clearScreen" && w[1] == "false")
+        );
         assert!(d.args.iter().any(|a| a == "--base"));
         assert!(d.args.iter().any(|a| a == "/foo/"));
         assert!(d.env_extra.is_empty());
@@ -523,10 +538,11 @@ mod tests {
         assert_eq!(d.program, "npx");
         assert!(d.args.iter().any(|a| a == "next"));
         assert!(d.args.iter().any(|a| a == "4002"));
-        assert!(d
-            .env_extra
-            .iter()
-            .any(|(k, v)| k == "BASE_PATH" && v == "/bar/"));
+        assert!(
+            d.env_extra
+                .iter()
+                .any(|(k, v)| k == "BASE_PATH" && v == "/bar/")
+        );
     }
 
     #[test]
@@ -542,11 +558,7 @@ mod tests {
         assert!(d.args.iter().any(|a| a == "/proxy/4005/"));
     }
 
-    fn build_args_test(
-        script: &str,
-        port: u16,
-        base: Option<&str>,
-    ) -> AppResult<process::DevArgs> {
+    fn build_args_test(script: &str, port: u16, base: Option<&str>) -> AppResult<process::DevArgs> {
         process::build_dev_args(script, port, base)
     }
 

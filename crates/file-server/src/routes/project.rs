@@ -149,7 +149,11 @@ async fn delete_project(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     // 停 dev server (对齐 nuwax: pid 可用时 stopDevServer, 失败不阻塞)
-    if let Some(p) = params.pid.as_deref().and_then(|s| s.trim().parse::<u32>().ok()) {
+    if let Some(p) = params
+        .pid
+        .as_deref()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
         tracing::debug!(project_id = %project_id, pid = p, "delete-project: stop dev server");
         let _ = state.dev_server.stop_dev(&project_id).await;
     }

@@ -94,7 +94,9 @@ fn capture_port(s: &str) -> Option<u16> {
 }
 
 fn is_node_missing(s: &str) -> bool {
-    let re = Regex::new(r"(?i)(?:npx|node): (?:command )?not found|no such file or directory.*npx|enoent.*spawn|cannot run node");
+    let re = Regex::new(
+        r"(?i)(?:npx|node): (?:command )?not found|no such file or directory.*npx|enoent.*spawn|cannot run node",
+    );
     match re {
         Ok(re) => re.is_match(s),
         Err(_) => false,
@@ -157,19 +159,28 @@ mod tests {
 
     #[test]
     fn classifies_port_in_use() {
-        let e = ViteStartupError::classify(&lines("VITE v5 ready\nError: Port 5173 is in use, trying another one..."));
+        let e = ViteStartupError::classify(&lines(
+            "VITE v5 ready\nError: Port 5173 is in use, trying another one...",
+        ));
         assert_eq!(e, ViteStartupError::PortInUse { port: 5173 });
     }
 
     #[test]
     fn classifies_dependency_missing() {
         let e = ViteStartupError::classify(&lines("Error: Cannot find module 'react-dom'"));
-        assert_eq!(e, ViteStartupError::DependencyMissing { module: "react-dom".into() });
+        assert_eq!(
+            e,
+            ViteStartupError::DependencyMissing {
+                module: "react-dom".into()
+            }
+        );
     }
 
     #[test]
     fn classifies_resolve_import() {
-        let e = ViteStartupError::classify(&lines("x Failed to resolve import \"@/foo\" from App.tsx."));
+        let e = ViteStartupError::classify(&lines(
+            "x Failed to resolve import \"@/foo\" from App.tsx.",
+        ));
         match e {
             ViteStartupError::DependencyMissing { module } => assert_eq!(module, "@/foo"),
             other => panic!("expected DependencyMissing, got {other:?}"),
@@ -196,8 +207,14 @@ mod tests {
 
     #[test]
     fn app_error_messages_are_actionable() {
-        let msg = ViteStartupError::DependencyMissing { module: "foo".into() }.into_app_error(123, 4000);
-        let s = match msg { AppError::System(m) => m, _ => panic!("expected System") };
+        let msg = ViteStartupError::DependencyMissing {
+            module: "foo".into(),
+        }
+        .into_app_error(123, 4000);
+        let s = match msg {
+            AppError::System(m) => m,
+            _ => panic!("expected System"),
+        };
         assert!(s.contains("foo"));
         assert!(s.contains("pnpm install"));
     }

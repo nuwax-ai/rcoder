@@ -80,7 +80,9 @@ pub fn resolve_target(
             let ctx = computer_ctx
                 .ok_or_else(|| AppError::validation("taskAgent mode requires userId and cId"))?;
             if ctx.user_id.trim().is_empty() || ctx.cid.trim().is_empty() {
-                return Err(AppError::validation("taskAgent mode requires userId and cId"));
+                return Err(AppError::validation(
+                    "taskAgent mode requires userId and cId",
+                ));
             }
             let path = resolver.resolve_computer(ctx);
             Ok(GitTarget::TaskAgent {
@@ -128,7 +130,10 @@ fn gitignore_entries() -> Vec<String> {
             .map(|x| x.trim().to_string())
             .filter(|x| !x.is_empty())
             .collect(),
-        _ => DEFAULT_GITIGNORE_ENTRIES.iter().map(|s| s.to_string()).collect(),
+        _ => DEFAULT_GITIGNORE_ENTRIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     }
 }
 
@@ -166,7 +171,8 @@ pub fn ensure_repo(path: &Path) -> AppResult<gix::Repository> {
     if is_git_repo(path) {
         gix::open(path).map_err(|e| AppError::system(format!("git open failed: {e}")))
     } else {
-        let repo = gix::init(path).map_err(|e| AppError::system(format!("git init failed: {e}")))?;
+        let repo =
+            gix::init(path).map_err(|e| AppError::system(format!("git init failed: {e}")))?;
         // 新 repo 无 .git/index 文件, 从空 tree 创建空 index (否则首次 stage 的 open_index 失败)
         let empty_id = repo
             .head_tree_id_or_empty()
@@ -176,8 +182,7 @@ pub fn ensure_repo(path: &Path) -> AppResult<gix::Repository> {
             .index_from_tree(&empty_id)
             .map_err(|e| AppError::system(format!("git index_from_tree: {e}")))?;
         idx.remove_tree();
-        idx
-            .write(gix::index::write::Options::default())
+        idx.write(gix::index::write::Options::default())
             .map_err(|e| AppError::system(format!("git index write: {e}")))?;
         Ok(repo)
     }
