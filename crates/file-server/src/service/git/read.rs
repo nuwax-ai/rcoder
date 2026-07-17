@@ -112,8 +112,9 @@ pub fn log_history(
 }
 
 fn iso_from_secs(secs: i64) -> String {
+    // 对齐 nuwax `new Date(ts*1000).toISOString()` → "YYYY-MM-DDTHH:mm:ss.sssZ" (毫秒 + UTC Z)
     chrono::DateTime::from_timestamp(secs, 0)
-        .map(|dt| dt.to_rfc3339())
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_default()
 }
 

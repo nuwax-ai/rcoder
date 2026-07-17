@@ -99,9 +99,9 @@ pub(super) async fn files_update(
         &body.c_id,
         body.custom_target_dir.as_deref(),
     );
-    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        return Err(AppError::resource("workspace does not exist"));
-    }
+    // 工作区不存在 → 创建 (对齐 nuwax computerFileUtils.updateFiles: !existsSync → mkdirSync recursive)。
+    // 首次向全新 user/cId 工作区写入不应失败。
+    tokio::fs::create_dir_all(&path).await?;
     // decodeURIComponent 文本内容 (对齐 nuwax safeDecodePath)
     for op in body.files.iter_mut() {
         if let Some(c) = op.contents.as_mut()

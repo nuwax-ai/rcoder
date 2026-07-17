@@ -356,10 +356,12 @@ fn apply_tree_to_worktree(
     Ok(())
 }
 
-/// clean-tree 检查: 有 staged/modified 跟踪变更 → BusinessError (revert/switch/branch-create 前置)。
+/// clean-tree 检查: 有 staged/modified/deleted 跟踪变更 → BusinessError (revert/switch/branch-create 前置)。
+/// 对齐 nuwax `beforeMatrix.some(([f,H,W,S]) => H===0&&S===0 ? false : W!==1||S!==1)` ——
+/// workdir 删除的跟踪文件 (H=1,W=0) 也算未提交变更, 须阻止; 仅未跟踪文件 (H=0,S=0) 不阻止。
 pub(crate) fn clean_tree_check(repo: &gix::Repository) -> AppResult<()> {
     let st = get_status(repo)?;
-    if !st.staged.is_empty() || !st.modified.is_empty() {
+    if !st.staged.is_empty() || !st.modified.is_empty() || !st.deleted.is_empty() {
         return Err(AppError::business(
             "working tree has uncommitted changes (stage or discard first)",
         ));

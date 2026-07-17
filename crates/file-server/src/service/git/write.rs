@@ -232,10 +232,13 @@ pub fn discard_files(repo: &gix::Repository, files: &[String]) -> AppResult<Disc
     let st = get_status(repo)?;
     let staged_set: HashSet<String> = st.staged.iter().cloned().collect();
     let to_discard: Vec<String> = if files.is_empty() {
+        // 空 files → discard 全部变更 (对齐 nuwax discard: tracked-modified/deleted + staged-new
+        // + **untracked**; 漏 untracked 会导致 discard-all 后仍有未跟踪文件残留)
         st.modified
             .iter()
             .chain(st.deleted.iter())
             .chain(st.staged.iter())
+            .chain(st.untracked.iter())
             .cloned()
             .collect()
     } else {
