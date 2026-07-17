@@ -1,0 +1,364 @@
+//! git 写路由: init / add / commit / unstage / discard / diff / reset / checkout / revert。
+
+use axum::Json;
+use axum::extract::State;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use super::{GitWriteBody, resolve_body};
+use crate::AppState;
+use crate::error::AppError;
+use crate::service::git;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct FilesBody {
+    #[serde(flatten)]
+    pub base: GitWriteBody,
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CommitBody {
+    #[serde(flatten)]
+    pub base: GitWriteBody,
+    pub message: String,
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
+    #[serde(default)]
+    pub author_name: Option<String>,
+    #[serde(default)]
+    pub author_email: Option<String>,
+}
+
+/// `POST /api/git/init`
+pub(super) async fn init(
+    State(state): State<AppState>,
+    Json(body): Json<GitWriteBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body)?;
+    let an = state.config.git_default_author_name.clone();
+    let ae = state.config.git_default_author_email.clone();
+    let already = tokio::task::spawn_blocking(move || git::init_repo(&path, &an, &ae))
+        .await
+        .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": if already { "Git repository already initialized" } else { "Git repository initialized successfully" },
+        "logId": log_id,
+        "alreadyExists": already,
+    })))
+}
+
+/// `POST /api/git/add`
+pub(super) async fn add(
+    State(state): State<AppState>,
+    Json(body): Json<FilesBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let files = body.files.unwrap_or_default();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::stage_files(&repo, &files)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Files staged successfully",
+        "logId": log_id,
+    })))
+}
+
+/// `POST /api/git/commit`
+pub(super) async fn commit(
+    State(state): State<AppState>,
+    Json(body): Json<CommitBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let message = body.message;
+    let files = body.files.unwrap_or_default();
+    let an = body
+        .author_name
+        .unwrap_or_else(|| state.config.git_default_author_name.clone());
+    let ae = body
+        .author_email
+        .unwrap_or_else(|| state.config.git_default_author_email.clone());
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<String>, AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::stage_files(&repo, &files)?;
+        let st = git::get_status(&repo)?;
+        if st.staged.is_empty() {
+            return Ok(None);
+        }
+        let hash = git::commit_indexed(&repo, &message, &an, &ae)?;
+        Ok(Some(hash))
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    match result {
+        Some(hash) => Ok(Json(json!({
+            "success": true,
+            "message": "Commit successful",
+            "logId": log_id,
+            "commit": hash,
+            "summary": { "changes": 1 },
+        }))),
+        None => Ok(Json(json!({
+            "success": true,
+            "message": "Nothing to commit",
+            "logId": log_id,
+            "nothingToCommit": true,
+        }))),
+    }
+}
+
+/// `POST /api/git/unstage`
+pub(super) async fn unstage(
+    State(state): State<AppState>,
+    Json(body): Json<FilesBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let files = body.files.unwrap_or_default();
+    let all = files.is_empty();
+    let files_echo = files.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::unstage_files(&repo, &files)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    let (message, files_val): (&str, Value) = if all {
+        ("All files unstaged successfully", json!("all"))
+    } else {
+        ("Specified files unstaged successfully", json!(files_echo))
+    };
+    Ok(Json(json!({
+        "success": true,
+        "message": message,
+        "logId": log_id,
+        "files": files_val,
+    })))
+}
+
+/// `POST /api/git/discard`
+pub(super) async fn discard(
+    State(state): State<AppState>,
+    Json(body): Json<FilesBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let files = body.files.unwrap_or_default();
+    let buckets = tokio::task::spawn_blocking(move || -> Result<git::DiscardBuckets, AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::discard_files(&repo, &files)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Changes discarded successfully",
+        "logId": log_id,
+        "discardedCount": buckets.len(),
+        "trackedFiles": buckets.tracked_files,
+        "newFiles": buckets.new_files,
+        "untrackedFiles": buckets.untracked_files,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DiffBody {
+    #[serde(flatten)]
+    pub base: GitWriteBody,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+}
+
+/// `POST /api/git/diff` (对齐 nuwax diff; source: worktree|staged|commit, 默认 worktree)。
+pub(super) async fn diff(
+    State(state): State<AppState>,
+    Json(body): Json<DiffBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let source = git::DiffSource::parse(&body.source)?;
+    let params = git::DiffParams {
+        source,
+        from: body.from.clone(),
+        to: body.to.clone(),
+        paths: body.paths.clone().unwrap_or_default(),
+    };
+    let result = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::compute_diff(&repo, &params)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "logId": log_id,
+        "source": body.source,
+        "diff": result.diff,
+        "summary": {
+            "files": result.files,
+            "insertions": result.insertions,
+            "deletions": result.deletions,
+        },
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TargetBody {
+    #[serde(flatten)]
+    pub base: GitWriteBody,
+    pub target: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ResetBody {
+    #[serde(flatten)]
+    pub base: GitWriteBody,
+    pub target: String,
+    #[serde(default)]
+    pub mode: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RevertBody {
+    #[serde(flatten)]
+    pub base: GitWriteBody,
+    pub target: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub author_name: Option<String>,
+    #[serde(default)]
+    pub author_email: Option<String>,
+}
+
+/// `POST /api/git/reset` (对齐 nuwax reset; mode: soft|mixed|hard, 默认 mixed)。
+pub(super) async fn reset(
+    State(state): State<AppState>,
+    Json(body): Json<ResetBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let target = body.target.clone();
+    let mode = git::ResetMode::parse(&body.mode)?;
+    let mode_label = mode.to_string();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::reset(&repo, &target, mode)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("Reset ({}) to {} successful", mode_label, body.target),
+        "logId": log_id,
+        "target": body.target,
+        "mode": mode_label,
+        "previousHead": outcome.previous_head,
+    })))
+}
+
+/// `POST /api/git/checkout` (对齐 nuwax checkout; 恢复 target 整棵 tree, 不删多余文件, 不动 HEAD)。
+pub(super) async fn checkout(
+    State(state): State<AppState>,
+    Json(body): Json<TargetBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let target = body.target.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::checkout_tree(&repo, &target)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("Checkout files from {} successful", body.target),
+        "logId": log_id,
+        "target": body.target,
+    })))
+}
+
+/// `POST /api/git/revert` (对齐 nuwax revert; 把 tree 重置到 target 但用新 commit 保留历史)。
+pub(super) async fn revert(
+    State(state): State<AppState>,
+    Json(body): Json<RevertBody>,
+) -> Result<Json<Value>, AppError> {
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let target = body.target.clone();
+    let message = body.message.clone();
+    let an = body
+        .author_name
+        .unwrap_or_else(|| state.config.git_default_author_name.clone());
+    let ae = body
+        .author_email
+        .unwrap_or_else(|| state.config.git_default_author_email.clone());
+    let outcome = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
+        if !path.exists() {
+            return Err(AppError::resource("workspace does not exist"));
+        }
+        let repo = git::ensure_repo(&path)?;
+        git::ensure_gitignore(&path)?;
+        git::revert_to_commit(&repo, &target, message.as_deref(), &an, &ae)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    match outcome.commit {
+        Some(hash) => Ok(Json(json!({
+            "success": true,
+            "message": "Revert successful",
+            "logId": log_id,
+            "commit": hash,
+            "target": outcome.target,
+            "previousHead": outcome.previous_head,
+        }))),
+        None => Ok(Json(json!({
+            "success": true,
+            "message": "Nothing to revert, already at target state",
+            "logId": log_id,
+            "nothingToCommit": true,
+            "target": outcome.target,
+        }))),
+    }
+}
