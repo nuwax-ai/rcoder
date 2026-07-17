@@ -3,6 +3,7 @@
 
 use axum::Json;
 use axum::extract::State;
+use garde::Validate;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -11,42 +12,53 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::service::git;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BranchCreateBody {
     #[serde(flatten)]
+    #[garde(skip)]
     pub base: GitWriteBody,
+    #[garde(length(min = 1))]
     pub branch_name: String,
     #[serde(default)]
+    #[garde(skip)]
     pub start_point: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BranchNameBody {
     #[serde(flatten)]
+    #[garde(skip)]
     pub base: GitWriteBody,
+    #[garde(length(min = 1))]
     pub branch_name: String,
     /// branch-delete 强制删除未合并分支 (对齐 nuwax deleteBranch force)。
     #[serde(default)]
+    #[garde(skip)]
     pub force: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TagCreateBody {
     #[serde(flatten)]
+    #[garde(skip)]
     pub base: GitWriteBody,
+    #[garde(length(min = 1))]
     pub tag_name: String,
     #[serde(default)]
+    #[garde(skip)]
     pub message: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TagNameBody {
     #[serde(flatten)]
+    #[garde(skip)]
     pub base: GitWriteBody,
+    #[garde(length(min = 1))]
     pub tag_name: String,
 }
 
@@ -55,6 +67,7 @@ pub(super) async fn branch_create(
     State(state): State<AppState>,
     Json(body): Json<BranchCreateBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let name = body.branch_name.clone();
     let sp = body.start_point.clone();
@@ -79,6 +92,7 @@ pub(super) async fn branch_delete(
     State(state): State<AppState>,
     Json(body): Json<BranchNameBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let name = body.branch_name.clone();
     let force = body.force.unwrap_or(false);
@@ -104,6 +118,7 @@ pub(super) async fn tag_create(
     State(state): State<AppState>,
     Json(body): Json<TagCreateBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let name = body.tag_name.clone();
     let msg = body.message.clone();
@@ -129,6 +144,7 @@ pub(super) async fn tag_delete(
     State(state): State<AppState>,
     Json(body): Json<TagNameBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let name = body.tag_name.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
@@ -150,6 +166,7 @@ pub(super) async fn branch_switch(
     State(state): State<AppState>,
     Json(body): Json<BranchNameBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let name = body.branch_name.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {

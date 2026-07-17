@@ -182,6 +182,17 @@ impl IntoResponse for AppError {
     }
 }
 
+/// garde 校验错误 (Report) → AppError::validation (对齐 shared_types::garde_err_to_app_error,
+/// 但返回 file-server 本地的 AppError)。消息形如 "field: <rule message>; field2: ..."。
+pub fn from_garde(report: garde::Report) -> AppError {
+    let msg = report
+        .iter()
+        .map(|(path, err)| format!("{path}: {}", err.message()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    AppError::validation(msg)
+}
+
 /// `?` 传播: io 错误按 kind 细分 (对齐 nuwax classifyIoError:
 /// NotFound→RESOURCE(404), PermissionDenied→PERMISSION(403),
 /// ConnectionRefused→NETWORK(502), 其余→SYSTEM(500))。

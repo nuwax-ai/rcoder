@@ -40,6 +40,9 @@ tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 
+# 校验 (声明式 #[derive(Validate)] + #[garde(...)], 与 shared_types/rcoder 一致)
+garde = { workspace = true, features = ["derive"] }
+
 # 错误处理
 anyhow = { workspace = true }
 thiserror = { workspace = true }

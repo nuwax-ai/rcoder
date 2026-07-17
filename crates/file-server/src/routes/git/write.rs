@@ -2,6 +2,7 @@
 
 use axum::Json;
 use axum::extract::State;
+use garde::Validate;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -19,17 +20,22 @@ pub(super) struct FilesBody {
     pub files: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CommitBody {
     #[serde(flatten)]
+    #[garde(skip)]
     pub base: GitWriteBody,
+    #[garde(length(min = 1))]
     pub message: String,
     #[serde(default)]
+    #[garde(skip)]
     pub files: Option<Vec<String>>,
     #[serde(default)]
+    #[garde(skip)]
     pub author_name: Option<String>,
     #[serde(default)]
+    #[garde(skip)]
     pub author_email: Option<String>,
 }
 
@@ -81,6 +87,7 @@ pub(super) async fn commit(
     State(state): State<AppState>,
     Json(body): Json<CommitBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let message = body.message;
     let files = body.files.unwrap_or_default();
@@ -234,35 +241,45 @@ pub(super) async fn diff(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TargetBody {
     #[serde(flatten)]
+    #[garde(skip)]
     pub base: GitWriteBody,
+    #[garde(length(min = 1))]
     pub target: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ResetBody {
     #[serde(flatten)]
+    #[garde(skip)]
     pub base: GitWriteBody,
+    #[garde(length(min = 1))]
     pub target: String,
     #[serde(default)]
+    #[garde(skip)]
     pub mode: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct RevertBody {
     #[serde(flatten)]
+    #[garde(skip)]
     pub base: GitWriteBody,
+    #[garde(length(min = 1))]
     pub target: String,
     #[serde(default)]
+    #[garde(skip)]
     pub message: Option<String>,
     #[serde(default)]
+    #[garde(skip)]
     pub author_name: Option<String>,
     #[serde(default)]
+    #[garde(skip)]
     pub author_email: Option<String>,
 }
 
@@ -271,6 +288,7 @@ pub(super) async fn reset(
     State(state): State<AppState>,
     Json(body): Json<ResetBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let target = body.target.clone();
     let mode = git::ResetMode::parse(&body.mode)?;
@@ -300,6 +318,7 @@ pub(super) async fn checkout(
     State(state): State<AppState>,
     Json(body): Json<TargetBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let target = body.target.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
@@ -325,6 +344,7 @@ pub(super) async fn revert(
     State(state): State<AppState>,
     Json(body): Json<RevertBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let target = body.target.clone();
     let message = body.message.clone();
