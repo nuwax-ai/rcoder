@@ -582,6 +582,29 @@ RCoder 进程重启后：
 | K8s | `/app/project_workspace/apps/{app_id}`（复用 rcoder workspace PVC subPath） | `/app` |
 | Docker | `{RCODER_WORKSPACE_ROOT}/{app_id}` | `/app`（bind-mount） |
 
+### 10.4 upload 压缩包自动解压（v2 新增）
+
+`POST /apps/{id}/upload` 支持单文件 + 压缩包，**魔数判断**（`download_utils::detect_file_type`，不靠文件名后缀，`app.jar.zip` 也能识别为 zip）：
+
+| 上传内容 | 判断 | target 语义 | 行为 |
+|---|---|---|---|
+| **zip / tar.gz** | 魔数（`PK\x03\x04` / `\x1f\x8b`） | **解压目录**（如 `code/`） | 解压到 `target/` 下，保留压缩包内目录结构；可选 `flatten=true` 剥单层 wrapper 目录 |
+| **其它**（单文件：jar/二进制/脚本） | unknown | **文件路径**（如 `code/app.jar`） | 存为 `target` |
+
+**响应** `UploadResult` 新增 `extracted_count: Option<usize>`（压缩包解压文件数；单文件为 None / 省略）。
+
+**安全防护**（复用 `download_utils`，不引新库）：
+- **zip slip**：`sanitize_entry_path` 拒压缩包内 `..`/绝对路径/NUL + `ensure_within` canonicalize 校验每条目在 dest 内。
+- **压缩炸弹**：`MAX_EXTRACTED_SIZE = 1GiB`（解压总字节超限 → `ERR_VALIDATION`）。
+- **符号链接**：tar.gz 跳过（防 symlink 逃逸）。
+- **target path traversal**：`validate_upload_target` 在 `create_dir_all` **前**拒 target 含 `..`/绝对路径/空（避免副作用在工作空间外创建目录）；叠加 §10.2 的 canonicalize + starts_with。
+- **body limit**：upload 路由单独挂 1GiB `DefaultBodyLimit`（覆盖全局 50MB）。
+- **解压**：`spawn_blocking`（同步 IO 不阻塞 tokio）；临时文件 `tempfile::NamedTempFile`（解压后自动删）。
+
+**错误映射**：解压失败（zip slip / 超 1GiB / 无效压缩包 / IO）→ `ArchiveError` → `ERR_VALIDATION`（400），经 `map_archive_error`。
+
+**不自动 restart**：upload/解压后不重启 app（与现有一致），Java 按需调 `POST /apps/{id}/restart`。
+
 ---
 
 ## 11. 日志流（D8，WebSocket）
