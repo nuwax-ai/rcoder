@@ -1,163 +1,34 @@
-//! `/api/project` 路由 (对齐 nuwax projectRoutes + codeRoutes, 二级路径不冲突)。
+//! project 增删改/上传路由: delete / create / copy / upload-single / upload-batch /
+//! upload-attachment / upload-project / push-skills。
 
+use axum::Json;
 use axum::extract::{Multipart, Query, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
+use super::{bytes_field, ctx_from, text_field, validate_zip_ext};
 use crate::AppState;
 use crate::error::AppError;
-use crate::response;
 use crate::service::{
-    code as code_service, project as project_service, skills as skills_service, tree,
-    upload as upload_service, version as version_service,
+    project as project_service, skills as skills_service, upload as upload_service,
 };
 use crate::workspace::ProjectContext;
-
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/get-project-content", get(get_project_content))
-        // nuwax delete-project 用 GET (反直觉, 但保持兼容)
-        .route("/delete-project", get(delete_project))
-        .route("/create-project", post(create_project))
-        .route("/copy-project", post(copy_project))
-        .route("/upload-single-file", post(upload_single_file))
-        .route("/upload-batch-files", post(upload_batch_files))
-        .route("/upload-attachment-file", post(upload_attachment_file))
-        .route("/specified-files-update", post(specified_files_update))
-        .route("/all-files-update", post(all_files_update))
-        .route("/upload-project", post(upload_project))
-        .route("/backup-current-version", post(backup_current_version))
-        .route("/rollback-version", post(rollback_version))
-        .route(
-            "/get-project-content-by-version",
-            get(get_project_content_by_version),
-        )
-        .route("/export-project", post(export_project))
-        .route("/push-skills-to-workspace", post(push_skills_to_workspace))
-}
-
-fn ctx_from(
-    project_id: &str,
-    tenant: Option<String>,
-    space: Option<String>,
-    iso: Option<String>,
-) -> ProjectContext {
-    ProjectContext {
-        project_id: project_id.to_string(),
-        tenant_id: tenant,
-        space_id: space,
-        isolation_type: iso,
-    }
-}
-
-async fn text_field(field: axum::extract::multipart::Field<'_>) -> Result<String, AppError> {
-    field
-        .text()
-        .await
-        .map_err(|e| AppError::validation(format!("read multipart field: {e}")))
-}
-
-async fn bytes_field(field: axum::extract::multipart::Field<'_>) -> Result<Vec<u8>, AppError> {
-    field
-        .bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| AppError::validation(format!("read multipart file: {e}")))
-}
-
-/// `.zip` 扩展名校验 (对齐 nuwax multer fileFilter: 仅允许 zip)。
-fn validate_zip_ext(filename: Option<&str>) -> Result<(), AppError> {
-    let ext = filename
-        .and_then(|n| {
-            std::path::Path::new(n)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_ascii_lowercase())
-        })
-        .unwrap_or_default();
-    if ext == "zip" {
-        Ok(())
-    } else {
-        Err(AppError::validation("Only zip files are supported"))
-    }
-}
-
-// ── get-project-content ──────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GetContentParams {
-    project_id: String,
-    command: Option<String>,
-    proxy_path: Option<String>,
-    tenant_id: Option<String>,
-    space_id: Option<String>,
-    isolation_type: Option<String>,
-}
-
-/// `GET /api/project/get-project-content`
-async fn get_project_content(
-    State(state): State<AppState>,
-    Query(params): Query<GetContentParams>,
-) -> Response {
-    let project_id = params.project_id.trim();
-    if project_id.is_empty() {
-        return AppError::validation("Project ID cannot be empty").into_response();
-    }
-    let ctx = ProjectContext {
-        project_id: project_id.to_string(),
-        tenant_id: params.tenant_id.clone(),
-        space_id: params.space_id.clone(),
-        isolation_type: params.isolation_type.clone(),
-    };
-    let project_path = state.resolver.resolve_project(&ctx);
-
-    if !tokio::fs::try_exists(&project_path).await.unwrap_or(false) {
-        return AppError::validation("Project does not exist").into_response();
-    }
-
-    match tree::get_project_content(
-        &project_path,
-        &state.config,
-        params.command.as_deref(),
-        params.proxy_path.as_deref(),
-    )
-    .await
-    {
-        Ok(content) => Json(json!({
-            "success": true,
-            "files": content.files,
-            "frontendFramework": content.frontend_framework,
-            "devFramework": content.dev_framework,
-        }))
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            response::failure_msg(&e.to_string()),
-        )
-            .into_response(),
-    }
-}
 
 // ── delete-project ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DeleteParams {
-    project_id: String,
+pub(super) struct DeleteParams {
+    pub project_id: String,
     #[serde(default)]
-    pid: Option<String>,
-    tenant_id: Option<String>,
-    space_id: Option<String>,
-    isolation_type: Option<String>,
+    pub pid: Option<String>,
+    pub tenant_id: Option<String>,
+    pub space_id: Option<String>,
+    pub isolation_type: Option<String>,
 }
 
 /// `GET /api/project/delete-project`
-async fn delete_project(
+pub(super) async fn delete_project(
     State(state): State<AppState>,
     Query(params): Query<DeleteParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -203,16 +74,16 @@ async fn delete_project(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateProjectBody {
-    project_id: String,
-    template_type: Option<String>,
-    tenant_id: Option<String>,
-    space_id: Option<String>,
-    isolation_type: Option<String>,
+pub(super) struct CreateProjectBody {
+    pub project_id: String,
+    pub template_type: Option<String>,
+    pub tenant_id: Option<String>,
+    pub space_id: Option<String>,
+    pub isolation_type: Option<String>,
 }
 
 /// `POST /api/project/create-project`
-async fn create_project(
+pub(super) async fn create_project(
     State(state): State<AppState>,
     Json(body): Json<CreateProjectBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -241,31 +112,31 @@ async fn create_project(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CopyProjectBody {
-    source_project_id: String,
-    target_project_id: String,
+pub(super) struct CopyProjectBody {
+    pub source_project_id: String,
+    pub target_project_id: String,
     #[serde(default)]
-    tenant_id: Option<String>,
+    pub tenant_id: Option<String>,
     #[serde(default)]
-    space_id: Option<String>,
+    pub space_id: Option<String>,
     #[serde(default)]
-    isolation_type: Option<String>,
+    pub isolation_type: Option<String>,
     #[serde(default)]
-    source_tenant_id: Option<String>,
+    pub source_tenant_id: Option<String>,
     #[serde(default)]
-    source_space_id: Option<String>,
+    pub source_space_id: Option<String>,
     #[serde(default)]
-    source_isolation_type: Option<String>,
+    pub source_isolation_type: Option<String>,
     #[serde(default)]
-    target_tenant_id: Option<String>,
+    pub target_tenant_id: Option<String>,
     #[serde(default)]
-    target_space_id: Option<String>,
+    pub target_space_id: Option<String>,
     #[serde(default)]
-    target_isolation_type: Option<String>,
+    pub target_isolation_type: Option<String>,
 }
 
 /// `POST /api/project/copy-project` (源/目标各自隔离上下文, 缺省回退公共字段)
-async fn copy_project(
+pub(super) async fn copy_project(
     State(state): State<AppState>,
     Json(body): Json<CopyProjectBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -308,7 +179,7 @@ async fn copy_project(
 // ── upload-single-file (multipart) ───────────────────────────────────────────────
 
 /// `POST /api/project/upload-single-file`
-async fn upload_single_file(
+pub(super) async fn upload_single_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -363,7 +234,7 @@ async fn upload_single_file(
 // ── upload-batch-files (multipart) ───────────────────────────────────────────────
 
 /// `POST /api/project/upload-batch-files`
-async fn upload_batch_files(
+pub(super) async fn upload_batch_files(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -421,7 +292,7 @@ async fn upload_batch_files(
 // ── upload-attachment-file (multipart) ───────────────────────────────────────────
 
 /// `POST /api/project/upload-attachment-file`
-async fn upload_attachment_file(
+pub(super) async fn upload_attachment_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -470,129 +341,10 @@ async fn upload_attachment_file(
     })))
 }
 
-// ── specified-files-update (JSON) ────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SpecifiedBody {
-    project_id: String,
-    code_version: String,
-    files: Vec<code_service::FileOp>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    space_id: Option<String>,
-    #[serde(default)]
-    isolation_type: Option<String>,
-}
-
-/// `POST /api/project/specified-files-update` (create/delete/rename/modify 增量)
-async fn specified_files_update(
-    State(state): State<AppState>,
-    Json(mut body): Json<SpecifiedBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
-    // 路由层 decodeURIComponent (对齐 nuwax codeRoutes, 非空 string 才解, 失败保留原串)
-    for op in body.files.iter_mut() {
-        if let Some(c) = op.contents.as_mut()
-            && !c.is_empty()
-        {
-            *c = code_service::decode_uri_component(c);
-        }
-    }
-    let ctx = ctx_from(
-        &project_id,
-        body.tenant_id,
-        body.space_id,
-        body.isolation_type,
-    );
-    let result = code_service::specified_files_update(
-        &*state.resolver,
-        &state.config,
-        &ctx,
-        &body.code_version,
-        &body.files,
-    )
-    .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Specified files updated successfully",
-        "projectId": result.project_id,
-        "filesCount": result.files_count,
-    })))
-}
-
-// ── all-files-update (JSON) ──────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AllFilesBody {
-    project_id: String,
-    code_version: String,
-    files: Vec<code_service::FileEntry>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    space_id: Option<String>,
-    #[serde(default)]
-    isolation_type: Option<String>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    base_path: Option<String>, // nuwax 接收但未使用
-    #[allow(dead_code)]
-    #[serde(default)]
-    pid: Option<String>,
-}
-
-/// `POST /api/project/all-files-update` (全量覆盖 + 清理缺失)
-async fn all_files_update(
-    State(state): State<AppState>,
-    Json(mut body): Json<AllFilesBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
-    // decodeURIComponent: 仅 text 内容 (binary base64 跳过, 安全加固)
-    for f in body.files.iter_mut() {
-        if f.binary == Some(true) {
-            continue;
-        }
-        if let Some(c) = f.contents.as_mut()
-            && !c.is_empty()
-        {
-            *c = code_service::decode_uri_component(c);
-        }
-    }
-    let ctx = ctx_from(
-        &project_id,
-        body.tenant_id,
-        body.space_id,
-        body.isolation_type,
-    );
-    let result = code_service::all_files_update(
-        &*state.resolver,
-        &state.config,
-        &ctx,
-        &body.code_version,
-        &body.files,
-    )
-    .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Files submitted successfully",
-        "projectId": result.project_id,
-        "restarted": false,
-    })))
-}
-
 // ── upload-project (multipart zip) ──────────────────────────────────────────────
 
 /// `POST /api/project/upload-project` (上传 zip 覆盖项目)
-async fn upload_project(
+pub(super) async fn upload_project(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -653,238 +405,10 @@ async fn upload_project(
     })))
 }
 
-// ── backup-current-version (GIT_ENABLED → deprecated) ───────────────────────────
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BackupVersionBody {
-    project_id: String,
-    code_version: String,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    space_id: Option<String>,
-    #[serde(default)]
-    isolation_type: Option<String>,
-}
-
-/// `POST /api/project/backup-current-version`
-async fn backup_current_version(
-    State(state): State<AppState>,
-    Json(body): Json<BackupVersionBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    if state.config.git_enabled {
-        return Ok(response::deprecated(
-            "此接口已废弃,请使用 Git 版本管理 API（/api/git/*）",
-        ));
-    }
-    let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
-    if body.code_version.trim().is_empty() {
-        return Err(AppError::validation("codeVersion cannot be empty"));
-    }
-    let ctx = ctx_from(
-        &project_id,
-        body.tenant_id,
-        body.space_id,
-        body.isolation_type,
-    );
-    let result = version_service::backup_current_version(
-        &*state.resolver,
-        &state.config,
-        &ctx,
-        &body.code_version,
-    )
-    .await?;
-    Ok(Json(json!({
-        "success": true,
-        "projectId": result.project_id,
-        "zipPath": result.zip_path,
-    })))
-}
-
-// ── rollback-version (GIT_ENABLED → deprecated) ─────────────────────────────────
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RollbackBody {
-    project_id: String,
-    code_version: String,
-    rollback_to: String,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    space_id: Option<String>,
-    #[serde(default)]
-    isolation_type: Option<String>,
-}
-
-/// `POST /api/project/rollback-version`
-async fn rollback_version(
-    State(state): State<AppState>,
-    Json(body): Json<RollbackBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    if state.config.git_enabled {
-        return Ok(response::deprecated(
-            "此接口已废弃,请使用 /api/git/rollback 进行版本回滚",
-        ));
-    }
-    let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
-    let ctx = ctx_from(
-        &project_id,
-        body.tenant_id,
-        body.space_id,
-        body.isolation_type,
-    );
-    let result = version_service::rollback_version(
-        &*state.resolver,
-        &state.config,
-        &ctx,
-        &body.code_version,
-        &body.rollback_to,
-    )
-    .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Project rolled back successfully",
-        "newVersion": result.new_version,
-        "rollbackTo": result.rollback_to,
-    })))
-}
-
-// ── get-project-content-by-version (GIT_ENABLED → deprecated, 自捕错误) ──────────
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GetByVersionParams {
-    project_id: String,
-    code_version: String,
-    proxy_path: Option<String>,
-    #[serde(default)]
-    command: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    space_id: Option<String>,
-    #[serde(default)]
-    isolation_type: Option<String>,
-}
-
-/// `GET /api/project/get-project-content-by-version`
-async fn get_project_content_by_version(
-    State(state): State<AppState>,
-    Query(params): Query<GetByVersionParams>,
-) -> Response {
-    if state.config.git_enabled {
-        return response::deprecated(
-            "此接口已废弃,请使用 /api/git/log + /api/git/diff 查看历史版本内容",
-        )
-        .into_response();
-    }
-    let project_id = params.project_id.trim();
-    if project_id.is_empty() {
-        return AppError::validation("Project ID cannot be empty").into_response();
-    }
-    let ctx = ProjectContext {
-        project_id: project_id.to_string(),
-        tenant_id: params.tenant_id.clone(),
-        space_id: params.space_id.clone(),
-        isolation_type: params.isolation_type.clone(),
-    };
-    match version_service::get_content_by_version(
-        &*state.resolver,
-        &state.config,
-        &ctx,
-        &params.code_version,
-        params.proxy_path.as_deref(),
-        params.command.as_deref(),
-    )
-    .await
-    {
-        Ok(files) => Json(json!({ "success": true, "files": files })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            response::failure_msg(&e.to_string()),
-        )
-            .into_response(),
-    }
-}
-
-// ── export-project (zip 文件流) ─────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ExportBody {
-    project_id: String,
-    code_version: String,
-    #[serde(default)]
-    export_type: Option<String>,
-    #[serde(default)]
-    config: Option<serde_json::Value>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    space_id: Option<String>,
-    #[serde(default)]
-    isolation_type: Option<String>,
-}
-
-/// `POST /api/project/export-project` (返回 application/zip 文件流)
-async fn export_project(
-    State(state): State<AppState>,
-    Json(body): Json<ExportBody>,
-) -> Result<Response, AppError> {
-    let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
-    let ctx = ctx_from(
-        &project_id,
-        body.tenant_id,
-        body.space_id,
-        body.isolation_type,
-    );
-    let zip_path = project_service::export_project(
-        &*state.resolver,
-        &state.config,
-        &ctx,
-        &body.code_version,
-        body.export_type.as_deref(),
-        body.config.as_ref(),
-    )
-    .await?;
-    let bytes = tokio::fs::read(&zip_path).await?;
-    let filename = zip_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("project.zip");
-    Ok((
-        StatusCode::OK,
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/zip"),
-            ),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
-                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
-            ),
-        ],
-        bytes,
-    )
-        .into_response())
-}
-
 // ── push-skills-to-workspace (multipart: file zip 和/或 skillUrls) ───────────────
 
 /// `POST /api/project/push-skills-to-workspace`
-async fn push_skills_to_workspace(
+pub(super) async fn push_skills_to_workspace(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
