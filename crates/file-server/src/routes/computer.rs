@@ -36,7 +36,9 @@ pub fn router() -> Router<AppState> {
         .route("/import-project", post(import_project))
         .route("/cleanup-build-artifacts", post(cleanup_build_artifacts))
         .route("/create-workspace", post(create_workspace))
+        .route("/create-workspace-v2", post(create_workspace_v2))
         .route("/push-skills-to-workspace", post(push_skills_to_workspace))
+        .route("/push-skills-to-workspace-v2", post(push_skills_to_workspace))
         .route("/init-project-template", post(init_project_template))
         .route("/build-agent-package", post(build_agent_package))
 }
@@ -872,7 +874,78 @@ async fn create_workspace(
     }
     let ws = ws_path(&state, &user_id, &cid);
     tokio::fs::create_dir_all(&ws).await?;
-    let res = crate::service::computer_ws::create_workspace(&ws, skill_zip).await?;
+    let res = crate::service::computer_ws::create_workspace(&ws, skill_zip, Vec::new(), None).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": res.message,
+        "workspaceRoot": res.workspace_root,
+        "updatedSkills": res.updated_skills,
+    })))
+}
+
+// ── create-workspace-v2 (multipart + skillUrls + mcp/hooks/permissions/hookScripts) ──
+
+/// `POST /api/computer/create-workspace-v2` (对齐 nuwax create-workspace-v2):
+/// multipart: userId, cId, file, skillUrls, mcpServersConfig, hooksConfig,
+/// permissionsConfig, hookScripts。skillUrls/hookScripts 若为 JSON 字符串则解析。
+/// 复用 computer_ws::create_workspace + write_agent_hook_configs。
+async fn create_workspace_v2(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let mut user_id = None;
+    let mut cid = None;
+    let mut skill_zip: Option<Vec<u8>> = None;
+    let mut file_name = None;
+    let mut skill_urls: Vec<String> = Vec::new();
+    let mut mcp_servers_config: Option<String> = None;
+    let mut hooks_config: Option<String> = None;
+    let mut permissions_config: Option<String> = None;
+    let mut hook_scripts_raw: Option<String> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "userId" => user_id = Some(text_field(field).await?),
+            "cId" => cid = Some(text_field(field).await?),
+            "file" => {
+                file_name = field.file_name().map(|s| s.to_string());
+                skill_zip = Some(bytes_field(field).await?);
+            }
+            "skillUrls" => {
+                let t = text_field(field).await?;
+                if let Ok(urls) = serde_json::from_str::<Vec<String>>(&t) {
+                    skill_urls.extend(urls);
+                } else {
+                    skill_urls.push(t);
+                }
+            }
+            "mcpServersConfig" => mcp_servers_config = Some(text_field(field).await?),
+            "hooksConfig" => hooks_config = Some(text_field(field).await?),
+            "permissionsConfig" => permissions_config = Some(text_field(field).await?),
+            "hookScripts" => hook_scripts_raw = Some(text_field(field).await?),
+            _ => {}
+        }
+    }
+    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
+    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    if skill_zip.is_some() {
+        validate_zip_ext(file_name.as_deref())?;
+    }
+    // hookScripts: JSON 字符串 → Vec<HookScript>, 解析失败 → None (对齐 nuwax)
+    let hook_scripts = hook_scripts_raw
+        .and_then(|s| serde_json::from_str::<Vec<crate::service::agent_hooks::HookScript>>(&s).ok());
+    let hook_input = crate::service::agent_hooks::HookConfigInput {
+        mcp_servers_config,
+        hooks_config,
+        permissions_config,
+        hook_scripts,
+    };
+    let ws = ws_path(&state, &user_id, &cid);
+    tokio::fs::create_dir_all(&ws).await?;
+    let res = crate::service::computer_ws::create_workspace(&ws, skill_zip, skill_urls, Some(hook_input)).await?;
     Ok(Json(json!({
         "success": true,
         "message": res.message,
@@ -1173,6 +1246,3 @@ mod tests {
         assert_eq!(utf8_percent_encode("中文.zip"), "%E4%B8%AD%E6%96%87.zip");
     }
 }
-
-// 待实现 (低频/复杂): create-workspace-v2 agent hook 配置 (claude/codex/opencode
-// 的 hook/MCP/permission 配置写入, nuwax 专属 agent 装配逻辑)。

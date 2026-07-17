@@ -1,5 +1,6 @@
 //! 业务服务层。
 
+pub mod agent_hooks;
 pub mod build_error;
 pub mod code;
 pub mod computer_ws;

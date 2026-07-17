@@ -164,13 +164,21 @@ pub struct CreateWorkspaceResult {
     pub updated_skills: Vec<String>,
 }
 
-/// create-workspace 核心 (对齐 nuwax createWorkspace; v1 仅 userId/cId/file):
+/// create-workspace 核心 (对齐 nuwax createWorkspace):
 /// 1. ensure `.agents/{skills,agents}`
 /// 2. 保留含 `.dynamic_add.lock` 的 skill 子目录
 /// 3. rm + 重建 `.agents/{skills,agents}`, 还原保留 skills
-/// 4. 若有 file: 校验 `.zip` + 解压 + 移动 skills/ 子目录与 agents/ 整目录
-/// 5. syncAgents
-pub async fn create_workspace(workspace: &Path, skill_zip: Option<Vec<u8>>) -> AppResult<CreateWorkspaceResult> {
+/// 4. 写入 agent hook 配置 (claude/codex/opencode mcp/hooks/permissions/hookScripts; best-effort)
+/// 5. 若无 file 且无 skillUrls → syncAgents + 早退
+/// 6. file: 校验 `.zip` + 解压 + 移动 skills/ 子目录与 agents/ 整目录
+/// 7. skillUrls: 逐个下载解压, 集成 skill 目录 (skills/<name> 或顶层 <name>)
+/// 8. syncAgents
+pub async fn create_workspace(
+    workspace: &Path,
+    skill_zip: Option<Vec<u8>>,
+    skill_urls: Vec<String>,
+    hook_config: Option<crate::service::agent_hooks::HookConfigInput>,
+) -> AppResult<CreateWorkspaceResult> {
     let (skills_dir, agents_dir) = ensure_primary_agent_dirs(workspace).await?;
 
     // 保留含 .dynamic_add.lock 的 skill 子目录 (agents 无此逻辑)
@@ -185,9 +193,27 @@ pub async fn create_workspace(workspace: &Path, skill_zip: Option<Vec<u8>>) -> A
     // 还原保留 skills
     restore_locked_skills(&preserved, &skills_dir).await?;
 
+    // 写入 agent hook 配置 (best-effort: 内部吞错不破坏 workspace 创建, 对齐 nuwax try/catch)
+    let _ = crate::service::agent_hooks::write_agent_hook_configs(
+        workspace,
+        hook_config.unwrap_or_default(),
+    )
+    .await;
+
     let mut updated_skills: Vec<String> = Vec::new();
     let mut updated_dirs: Vec<&str> = Vec::new();
     let had_file = skill_zip.is_some();
+    let has_urls = !skill_urls.is_empty();
+
+    // 无 file 且无 skillUrls → syncAgents + 早退 (对齐 nuwax)
+    if !had_file && !has_urls {
+        crate::service::skills::sync_agents(workspace).await?;
+        return Ok(CreateWorkspaceResult {
+            message: "Workspace created (no uploaded file, no skills and agents)".to_string(),
+            workspace_root: workspace.to_string_lossy().to_string(),
+            updated_skills,
+        });
+    }
 
     if let Some(data) = skill_zip {
         // 解压到临时目录 (zip 内找 skills/ + agents/)
@@ -236,12 +262,27 @@ pub async fn create_workspace(workspace: &Path, skill_zip: Option<Vec<u8>>) -> A
         let _ = fs::remove_dir_all(&extract_root).await;
     }
 
+    // skillUrls: 逐个下载解压, 集成 skill 目录 (对齐 nuwax createWorkspace skillUrls 循环)
+    for url in &skill_urls {
+        match process_skill_url(url, &skills_dir, workspace).await {
+            Ok(names) => {
+                if !names.is_empty() {
+                    if !updated_dirs.contains(&"skills") {
+                        updated_dirs.push("skills");
+                    }
+                    updated_skills.extend(names);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(url = %url, error = %e, "skill url processing failed");
+            }
+        }
+    }
+
     // syncAgents: .agents → .claude/.opencode/.codex
     crate::service::skills::sync_agents(workspace).await?;
 
-    let message = if !had_file {
-        "Workspace created (no uploaded file, no skills and agents)".to_string()
-    } else if updated_dirs.is_empty() {
+    let message = if updated_dirs.is_empty() {
         "Workspace created successfully (skills and agents directories not found)".to_string()
     } else {
         format!(
@@ -255,6 +296,53 @@ pub async fn create_workspace(workspace: &Path, skill_zip: Option<Vec<u8>>) -> A
         workspace_root: workspace.to_string_lossy().to_string(),
         updated_skills,
     })
+}
+
+/// 处理单个 skillUrl: 下载 zip → 解压 → 集成 skill 目录到 skills_dir
+/// (对齐 nuwax createWorkspace skillUrls: 若含 skills/ 目录则取其子目录, 否则取顶层非隐藏目录)。
+async fn process_skill_url(url: &str, skills_dir: &Path, workspace: &Path) -> AppResult<Vec<String>> {
+    let data = crate::service::skills::fetch_url(url).await?;
+    let extract_root = temp_sibling(workspace, "skill_url_extract");
+    fs::create_dir_all(&extract_root).await?;
+    let tmp_zip = extract_root.join("src.zip");
+    let extract_res: AppResult<()> = async {
+        fs::write(&tmp_zip, &data).await?;
+        crate::service::zip::extract_to(tmp_zip.clone(), extract_root.clone()).await
+    }
+    .await;
+    if let Err(e) = extract_res {
+        let _ = fs::remove_dir_all(&extract_root).await;
+        return Err(e);
+    }
+    // 候选 skill 目录: 优先 skills/ 子目录, 否则顶层非隐藏目录 (对齐 nuwax)
+    let skills_sub = extract_root.join("skills");
+    let base = if skills_sub.is_dir() {
+        skills_sub
+    } else {
+        extract_root.clone()
+    };
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(mut rd) = fs::read_dir(&base).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                candidates.push((name, entry.path()));
+            }
+        }
+    }
+    fs::create_dir_all(skills_dir).await?;
+    let mut updated = Vec::new();
+    for (name, src) in candidates {
+        let dst = skills_dir.join(&name);
+        let _ = fs::remove_dir_all(&dst).await;
+        move_dir(&src, &dst).await?;
+        updated.push(name);
+    }
+    let _ = fs::remove_dir_all(&extract_root).await;
+    Ok(updated)
 }
 
 /// 创建权威 agent 目录 `.agents/{skills,agents}` (对齐 nuwax ensurePrimaryAgentDirs;
@@ -468,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn create_workspace_writes_agents_skills() {
         let tmp = std::env::temp_dir().join(format!("fs_cw_{}", now_nanos()));
-        let res = create_workspace(&tmp, None).await.unwrap();
+        let res = create_workspace(&tmp, None, Vec::new(), None).await.unwrap();
         assert!(tmp.join(".agents").join("skills").is_dir());
         assert!(tmp.join(".agents").join("agents").is_dir());
         // 无 file → 早退 message

@@ -96,7 +96,7 @@ pub async fn push_skills_at(
     Ok(updated)
 }
 
-async fn fetch_url(url: &str) -> AppResult<Vec<u8>> {
+pub async fn fetch_url(url: &str) -> AppResult<Vec<u8>> {
     let resp = reqwest::get(url)
         .await
         .map_err(|e| AppError::network(format!("fetch skill url failed: {e}")))?;
