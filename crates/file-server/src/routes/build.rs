@@ -275,13 +275,17 @@ async fn build_project(
     // 并发控制: 全局信号量 + 项目级互斥 (对齐 nuwax buildingProjects + MAX_BUILD_CONCURRENCY)
     let (sem, building) = build_concurrency(state.config.max_build_concurrency);
     {
-        let mut b = building.lock().expect("building set lock");
+        // poison 恢复: 另一 build 请求若 panic 毒化了锁, 取回内部数据继续而非连锁 panic
+        let mut b = building.lock().unwrap_or_else(|e| e.into_inner());
         if b.contains(&q.project_id) {
             return Err(AppError::business("This project is being built"));
         }
         b.insert(q.project_id.clone());
     }
-    let _permit = sem.acquire().await.expect("build sem acquire");
+    let _permit = sem
+        .acquire()
+        .await
+        .expect("build sem acquire (semaphore never closed)");
 
     // install (对齐 nuwax: 失败则整体 build 失败, 透传 "Dependency installation failed")
     crate::service::dev_server::process::run_command_to_log(
@@ -312,7 +316,7 @@ async fn build_project(
     // 释放项目级锁 (drop _permit + 显式 remove)
     building
         .lock()
-        .expect("building set lock")
+        .unwrap_or_else(|e| e.into_inner())
         .remove(&q.project_id);
     if build_result.is_err() {
         // 失败: 读 build 日志用 build_error 解析友好消息 (对齐 nuwax BuildErrorParser)
