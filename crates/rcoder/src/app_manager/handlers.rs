@@ -439,12 +439,13 @@ pub async fn upload_file(
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
     let mut target_path: Option<String> = None;
+    let mut flatten = false; // 压缩包上传：是否剥单层 wrapper 目录（默认 false 保留结构）
 
     // 解析 multipart 数据
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| AppError::bad_request(&format!("解析上传文件失败: {}", e)))?
+        .map_err(|e| AppError::bad_request(&format!("failed to parse upload: {}", e)))?
     {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
@@ -453,28 +454,35 @@ pub async fn upload_file(
                 let data = field
                     .bytes()
                     .await
-                    .map_err(|e| AppError::bad_request(&format!("读取文件数据失败: {}", e)))?;
+                    .map_err(|e| AppError::bad_request(&format!("failed to read file data: {}", e)))?;
                 file_data = Some(data.to_vec());
             }
             "target" => {
                 let data = field
                     .text()
                     .await
-                    .map_err(|e| AppError::bad_request(&format!("读取目标路径失败: {}", e)))?;
+                    .map_err(|e| AppError::bad_request(&format!("failed to read target path: {}", e)))?;
                 target_path = Some(data);
+            }
+            "flatten" => {
+                let data = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::bad_request(&format!("failed to read flatten: {}", e)))?;
+                flatten = data == "true";
             }
             _ => {}
         }
     }
 
     // 验证必需字段
-    let data = file_data.ok_or_else(|| AppError::bad_request("缺少 file 字段"))?;
+    let data = file_data.ok_or_else(|| AppError::bad_request("missing file field"))?;
     let name = file_name.unwrap_or_else(|| "uploaded_file".to_string());
     let target = target_path.unwrap_or_else(|| format!("code/{}", name));
 
     let result = state
         .app_service
-        .upload_file(&app_id, data, &target)
+        .upload_file(&app_id, data, &target, flatten)
         .await?;
 
     Ok(Json(HttpResult::success(result)))

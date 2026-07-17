@@ -95,6 +95,7 @@ pub trait AppServiceTrait: Send + Sync {
         app_id: &str,
         file_data: Vec<u8>,
         target: &str,
+        flatten: bool,
     ) -> AppResult<UploadResult>;
 
     /// 列出文件（app 根或其子目录 code/data/logs；subpath=None 列 app 根）

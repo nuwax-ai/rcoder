@@ -472,12 +472,15 @@ pub struct Pagination {
 /// 文件上传结果
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UploadResult {
-    /// 文件路径（app 根相对）
+    /// 文件路径（单文件=target；压缩包=解压目录，app 根相对）
     pub file_path: String,
-    /// 文件大小（字节）
+    /// 文件大小（字节；单文件=文件大小，压缩包=压缩包大小）
     pub file_size: u64,
     /// 上传时间（RFC3339）
     pub uploaded_at: String,
+    /// 压缩包解压文件数（仅压缩包上传时返回；单文件为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extracted_count: Option<usize>,
 }
 
 /// 文件信息
