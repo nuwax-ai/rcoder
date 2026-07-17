@@ -122,9 +122,18 @@ async fn stop_dev(
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<Value>, AppError> {
     let stopped = state.dev_server.stop_dev(&q.project_id).await?;
+    // message 对齐 nuwax stopDevUtils: 全杀 "Stopped" / 部分杀 "Partially stopped..." / 无候选 "No running process found"
+    let all_killed = stopped.killed_pids.iter().all(|k| k.killed);
+    let message = if stopped.killed_pids.is_empty() {
+        "No running process found"
+    } else if all_killed {
+        "Stopped"
+    } else {
+        "Partially stopped but continue execution"
+    };
     Ok(Json(json!({
         "success": true,
-        "message": "Stopped",
+        "message": message,
         "projectId": q.project_id,
         "pid": null,
         "killedPids": stopped.killed_pids,
@@ -162,12 +171,18 @@ async fn keep_alive(
     State(state): State<AppState>,
     Query(q): Query<KeepAliveQuery>,
 ) -> Result<Json<Value>, AppError> {
+    // 对齐 nuwax buildRoutes: projectId/pid/port/basePath 必填校验
+    let pid = q.pid.ok_or_else(|| AppError::validation("pid is required"))?;
+    let base_str = q
+        .base_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::validation("basePath is required"))?;
     let path = project_path_keep(&state, &q);
-    let base = q.base_path.as_deref();
-    let pid = q.pid.unwrap_or(0);
     let result = state
         .dev_server
-        .keep_alive(&q.project_id, pid, q.port, base, &path)
+        .keep_alive(&q.project_id, pid, q.port, Some(base_str), &path)
         .await?;
     // pid/port: 重启分支用新值, alive 分支用查询入参 (对齐 nuwax)
     let out_pid = result.pid.unwrap_or(pid);
@@ -194,7 +209,7 @@ async fn port_pool_status(State(state): State<AppState>) -> Result<Json<Value>, 
     let status = state.dev_server.port_pool_status()?;
     Ok(Json(json!({
         "success": true,
-        "message": "Port pool status",
+        "message": "Get port pool status successfully",
         "portRange": status.port_range,
         "totalAllocated": status.total_allocated,
         "allocations": status.allocations,
@@ -212,11 +227,14 @@ async fn get_dev_log(
         .await?;
     Ok(Json(json!({
         "success": true,
-        "message": "Dev log fetched",
+        "message": "Get log successfully",
         "logs": result.logs,
         "totalLines": result.total_lines,
         "startIndex": result.start_index,
         "logFileName": result.log_file_name,
+        // Rust 无缓存层, 固定 false (对齐 nuwax getDevLog 字段)
+        "cacheHit": false,
+        "fileTooLarge": false,
     })))
 }
 
@@ -248,7 +266,7 @@ async fn build_project(
         .get("scripts")
         .and_then(|s| s.get("build"))
         .and_then(|v| v.as_str())
-        .unwrap_or("vite build");
+        .ok_or_else(|| AppError::business("Project missing build script"))?;
     // basePath 规范化 (补首尾 /, 对齐 nuwax; vite --base 需尾斜杠)
     let base = normalize_build_base(q.base_path.as_deref());
 
@@ -263,8 +281,8 @@ async fn build_project(
     }
     let _permit = sem.acquire().await.expect("build sem acquire");
 
-    // install (arg 数组, 无 shell 拼接; 失败继续, 与 nuwax 宽松一致)
-    let _ = crate::service::dev_server::process::run_command_to_log(
+    // install (对齐 nuwax: 失败则整体 build 失败, 透传 "Dependency installation failed")
+    crate::service::dev_server::process::run_command_to_log(
         "pnpm",
         &["install", "--prefer-offline"],
         &path,
@@ -272,10 +290,11 @@ async fn build_project(
         &temp_log,
         timeout,
     )
-    .await;
+    .await
+    .map_err(|e| AppError::system(format!("Dependency installation failed: {e}")))?;
     // build (vite: pnpm exec vite build --base X; 否则 pnpm run build)
     let build_args: Vec<&str> = if build_script.to_ascii_lowercase().contains("vite") {
-        vec!["exec", "vite", "build", "--base", &base, "--debug", "--debug"]
+        vec!["exec", "vite", "build", "--base", &base, "--debug"]
     } else {
         vec!["run", "build"]
     };
@@ -376,8 +395,9 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> Result<(), AppE
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ParseErrorBody {
+    /// 必填校验 (对齐 nuwax buildRoutes projectId 校验; handler 不读, 仅供 serde 强制存在)
     #[allow(dead_code)]
-    project_id: Option<String>,
+    project_id: String,
     error_message: String,
 }
 

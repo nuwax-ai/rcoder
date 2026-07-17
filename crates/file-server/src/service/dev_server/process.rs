@@ -327,7 +327,8 @@ fn parse_pid_from_line(line: &str) -> Option<u32> {
     pid_str.parse().ok()
 }
 
-/// HTTP 探活 dev server (对齐 nuwax isProjectAlive): GET 127.0.0.1:port{basePath}, 2xx/3xx 存活。
+/// HTTP 探活 dev server (对齐 nuwax isProjectAlive): GET 127.0.0.1:port{basePath}, 仅 2xx 视为存活。
+/// (nuwax aliveJudge 仅 200-299; 3xx 如反代 302 到登录页不能误判存活)
 pub async fn is_project_alive(port: u16, base_path: Option<&str>, timeout_ms: u64) -> bool {
     let base = base_path.map(normalize_base_path).unwrap_or_default();
     let url = format!("http://127.0.0.1:{port}{}", base.trim_end_matches('/'));
@@ -338,8 +339,14 @@ pub async fn is_project_alive(port: u16, base_path: Option<&str>, timeout_ms: u6
     let Ok(client) = client else {
         return false;
     };
-    match client.get(&url).send().await {
-        Ok(resp) => resp.status().is_success() || resp.status().is_redirection(),
+    // 对齐 nuwax: 自定义 User-Agent, 便于服务端区分探活流量
+    match client
+        .get(&url)
+        .header("User-Agent", "xagi-keepalive-check")
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().is_success(),
         Err(_) => false,
     }
 }

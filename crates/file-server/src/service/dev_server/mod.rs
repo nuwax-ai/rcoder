@@ -162,6 +162,24 @@ impl DevServerManager {
         let ovr = std::env::var("DEV_SERVER_OVERRIDE_CMD")
             .ok()
             .filter(|s| !s.trim().is_empty());
+        // dev-inject / design-mode 注入 (业务需要: 让前端可用 design 模式);
+        // 失败仅记日志不阻塞 dev server 启动 (对齐 nuwax processManager 的 set +e 宽松语义)。
+        if let Err(e) = process::run_command_to_log(
+            "sh",
+            &[
+                "-c",
+                "set +e; pnpm dlx @xagi/dev-inject@latest install --framework; pnpm dlx @xagi/vite-plugin-design-mode@latest install; set -e",
+            ],
+            project_path,
+            &main_log,
+            &temp_log,
+            self.config.dev_command_timeout_secs,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "dev-inject/design-mode preCmd failed (non-blocking)");
+        }
+
         let (child, stdout, stderr) = match ovr {
             Some(ovr) => {
                 let cmd = ovr
