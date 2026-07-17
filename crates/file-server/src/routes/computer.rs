@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use axum::extract::{Query, State};
+use axum::extract::{Multipart, Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::{AppError, AppResult};
+use crate::path_safety;
 use crate::service::{code as code_service, tree, zip};
 use crate::workspace::ComputerContext;
 use crate::AppState;
@@ -31,6 +32,26 @@ pub fn router() -> Router<AppState> {
         .route("/download-all-files", get(download_all_files))
         .route("/files-update", post(files_update))
         .route("/all-files-update", post(all_files_update))
+        .route("/upload-file", post(upload_file))
+        .route("/upload-files", post(upload_files))
+        .route("/import-project", post(import_project))
+        .route("/cleanup-build-artifacts", post(cleanup_build_artifacts))
+        .route("/create-workspace", post(create_workspace))
+}
+
+async fn text_field(field: axum::extract::multipart::Field<'_>) -> Result<String, AppError> {
+    field
+        .text()
+        .await
+        .map_err(|e| AppError::validation(format!("read multipart field: {e}")))
+}
+
+async fn bytes_field(field: axum::extract::multipart::Field<'_>) -> Result<Vec<u8>, AppError> {
+    field
+        .bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| AppError::validation(format!("read multipart file: {e}")))
 }
 
 fn ws_path(state: &AppState, user_id: &str, cid: &str) -> PathBuf {
@@ -507,6 +528,227 @@ async fn all_files_update(
     })))
 }
 
-// 下批实现 (依赖 resolver+ctx 改造或复杂逻辑): upload-file / upload-files /
-// import-project / create-workspace[-v2] / push-skills-to-workspace[-v2] /
-// init-project-template / build-agent-package / cleanup-build-artifacts
+// ── upload-file / upload-files (multipart, path 制, 无版本备份) ───────────────────
+
+/// `POST /api/computer/upload-file` (对齐 nuwax computer uploadFile; multipart)。
+async fn upload_file(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let mut user_id = None;
+    let mut cid = None;
+    let mut file_path = None;
+    let mut data: Option<Vec<u8>> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "userId" => user_id = Some(text_field(field).await?),
+            "cId" => cid = Some(text_field(field).await?),
+            "filePath" => file_path = Some(text_field(field).await?),
+            "file" => data = Some(bytes_field(field).await?),
+            _ => {}
+        }
+    }
+    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
+    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    let file_path = file_path.ok_or_else(|| AppError::validation("filePath is required"))?;
+    let data = data.ok_or_else(|| AppError::validation("file is required"))?;
+    let ws = ws_path(&state, &user_id, &cid);
+    let target = path_safety::ensure_within(&ws, &file_path)?;
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&target, data).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "File uploaded successfully",
+        "filePath": file_path,
+    })))
+}
+
+/// `POST /api/computer/upload-files` (对齐 nuwax computer uploadFiles; 多文件 multipart)。
+async fn upload_files(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let mut user_id = None;
+    let mut cid = None;
+    let mut file_paths: Vec<String> = Vec::new();
+    let mut files_vec: Vec<Vec<u8>> = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "userId" => user_id = Some(text_field(field).await?),
+            "cId" => cid = Some(text_field(field).await?),
+            "filePaths" => file_paths.push(text_field(field).await?),
+            "files" => files_vec.push(bytes_field(field).await?),
+            _ => {}
+        }
+    }
+    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
+    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    if file_paths.len() != files_vec.len() {
+        return Err(AppError::validation("filePaths and files count mismatch"));
+    }
+    let ws = ws_path(&state, &user_id, &cid);
+    let mut written = Vec::new();
+    for (fp, data) in file_paths.iter().zip(files_vec) {
+        let target = path_safety::ensure_within(&ws, fp)?;
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&target, data).await?;
+        written.push(fp.clone());
+    }
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("{} files uploaded", written.len()),
+        "fileCount": written.len(),
+        "files": written,
+    })))
+}
+
+/// `POST /api/computer/import-project` (对齐 nuwax computer importProject; 上传 zip 解压到工作区)。
+async fn import_project(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let mut user_id = None;
+    let mut cid = None;
+    let mut data: Option<Vec<u8>> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "userId" => user_id = Some(text_field(field).await?),
+            "cId" => cid = Some(text_field(field).await?),
+            "file" => data = Some(bytes_field(field).await?),
+            _ => {}
+        }
+    }
+    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
+    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    let data = data.ok_or_else(|| AppError::validation("file (zip) is required"))?;
+    let ws = ws_path(&state, &user_id, &cid);
+    tokio::fs::create_dir_all(&ws).await?;
+    // 写临时 zip 再解压 (zip::extract_to 内部用 safe_zip_entry 防穿越)
+    let tmp = std::env::temp_dir().join(format!(
+        "computer-import-{}-{}-{}.zip",
+        user_id,
+        cid,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    tokio::fs::write(&tmp, data).await?;
+    let result = zip::extract_to(tmp.clone(), ws.clone()).await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    result?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Project imported successfully",
+        "workspaceRoot": ws.display().to_string(),
+    })))
+}
+
+/// `POST /api/computer/cleanup-build-artifacts` (对齐 nuwax cleanupBuildArtifacts; 删 dist-packages)。
+async fn cleanup_build_artifacts(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Map<String, Value>>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = body
+        .get("userId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::validation("userId is required"))?;
+    let cid = body
+        .get("cId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::validation("cId is required"))?;
+    let dist = ws_path(&state, user_id, cid).join("dist-packages");
+    let mut removed = false;
+    if dist.exists() {
+        tokio::fs::remove_dir_all(&dist)
+            .await
+            .map_err(|e| AppError::system(format!("cleanup dist-packages failed: {e}")))?;
+        removed = true;
+    }
+    Ok(Json(json!({
+        "success": true,
+        "message": "Build artifacts cleaned",
+        "removed": removed,
+    })))
+}
+
+/// `POST /api/computer/create-workspace` (对齐 nuwax createWorkspace; 基础版:
+/// mkdir 工作区 + skills/agents 目录, 可选解压 skills zip)。
+/// v2 的 agent hook 配置 (claude/codex/opencode) 待后续补。
+async fn create_workspace(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let mut user_id = None;
+    let mut cid = None;
+    let mut skill_zip: Option<Vec<u8>> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "userId" => user_id = Some(text_field(field).await?),
+            "cId" => cid = Some(text_field(field).await?),
+            "file" => skill_zip = Some(bytes_field(field).await?),
+            _ => {}
+        }
+    }
+    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
+    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    let ws = ws_path(&state, &user_id, &cid);
+    tokio::fs::create_dir_all(&ws).await?;
+    tokio::fs::create_dir_all(ws.join("skills")).await?;
+    tokio::fs::create_dir_all(ws.join("agents")).await?;
+    // 可选: 解压 skills zip 到工作区 (zip 内找 skills/ 移到 ws/skills)
+    if let Some(data) = skill_zip {
+        let tmp = std::env::temp_dir().join(format!(
+            "computer-create-{}-{}-{}.zip",
+            user_id,
+            cid,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        tokio::fs::write(&tmp, data).await?;
+        let extract_dst = ws.join(".tmp-skill-extract");
+        tokio::fs::create_dir_all(&extract_dst).await?;
+        let r = zip::extract_to(tmp.clone(), extract_dst.clone()).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        r?;
+        // 把解压出的 skills/<name> 移到 ws/skills/
+        if let Ok(mut rd) = tokio::fs::read_dir(extract_dst.join("skills")).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name();
+                let dst = ws.join("skills").join(&name);
+                let _ = tokio::fs::rename(entry.path(), &dst).await;
+            }
+        }
+        let _ = tokio::fs::remove_dir_all(&extract_dst).await;
+    }
+    Ok(Json(json!({
+        "success": true,
+        "message": "Workspace created successfully",
+        "workspaceRoot": ws.display().to_string(),
+    })))
+}
+
+// 待实现 (复杂/低频): create-workspace-v2 agent hook 配置 / push-skills-to-workspace[-v2]
+// (skills_service 需 path 制改造) / init-project-template / build-agent-package
