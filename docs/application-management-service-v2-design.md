@@ -509,7 +509,7 @@ TCP 服务（如容器内 PostgreSQL）**初期不支持对外**：
 ```rust
 pub struct AccessInfo {
     pub external: ExternalAccess {
-        pub http: Option<String>,        // Pingora: path "/proxy/{port}"
+        pub http: Option<String>,        // Pingora: path "/proxy/apps/{app_id}/{port}"
                                          // Gateway: path "/apps/{app_id}"
         pub tcp: Vec<TcpPortMapping>,    // 初期为空（TCP 不对外）
     },
@@ -522,6 +522,25 @@ pub struct AccessInfo {
 ```
 
 > ⚠️ **无状态下的已知限制**：Pingora backend 注册表（`pingora_ports`）是内存态，rcoder 重启后丢失。重启后**读路径**（get/query/runtime）的 `external.http` 会变 `null`；**create 响应不受影响**（用请求端口生成）。Java 应以 create 响应地址为准或自行缓存。两后端同理（除非后续把端口映射持久化）。
+
+### 8.6 应用访问入口（Pingora 代理路径）
+
+部署的应用通过 RCoder 内置 Pingora 代理访问。`access.external.http` 返回的 path（`/proxy/apps/{app_id}/{port}`）即访问入口：
+
+```
+GET {Pingora入口}/proxy/apps/{app_id}/{port}/{path}
+  → Pingora 按 (app_id, port) 查 app_backends 注册表
+  → 转发到应用后端（K8s: {app_id}-svc:{port}，Docker: container_ip:{port}）
+```
+
+- **{Pingora入口}**：Pingora 监听端口（默认 8088），host 由 Java 拼（Java 已知 RCoder 入口）。
+- **{app_id}**：应用 ID（如 `app-order-svc`）。
+- **{port}**：应用的 HTTP 端口（如 8080）。
+- **{path}**：应用内的路径（如 `/api/users`）。
+
+> 此路径**按 (app_id, port) 路由**（非通用 `/proxy/{port}`），解决多 app 同端口冲突。未注册的 (app_id, port) → 502（Fail Fast，无兜底）。
+>
+> swagger 中也有对应的 axum 重定向接口（`GET /proxy/apps/{app_id}/{port}/{*path}`，tag「应用管理」），返回 307 到 Pingora 端口。**生产建议直接访问 Pingora 端口**。
 
 ---
 
