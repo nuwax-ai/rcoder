@@ -74,6 +74,26 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
+// ── encodeURIComponent (对齐 JS encodeURIComponent) ─────────────────────────────
+// 保留 [A-Za-z0-9-_.!~*'()], 其余按 UTF-8 字节百分号编码 (多字节字符逐字节, 与 JS 一致)。
+
+pub fn encode_uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            )
+        {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 // ── diffContentByLines (行级对齐合并; 换行符继承 existing; changes=0 跳写) ──
 
 fn diff_content_by_lines(existing: &str, new: &str) -> (String, i64) {
@@ -133,6 +153,15 @@ fn normalize_relative(name: &str) -> String {
 }
 
 // ── specifiedFilesUpdate ────────────────────────────────────────────────────────
+
+/// modify 策略 (project 与 computer 路由口径不同):
+/// - `Diff`: 行级 diff 合并 (project specifiedFilesUpdate; 换行符继承 existing)。
+/// - `ByteCompare`: 字节相等跳写, 不等直写 (computer updateFiles; 避免 \r\n 归一改内容)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ModifyStrategy {
+    Diff,
+    ByteCompare,
+}
 
 pub struct SpecifiedResult {
     pub project_id: String,
@@ -201,7 +230,7 @@ pub async fn specified_files_update(
     }
     version::backup_project(config, project_id, &project_path, code_version).await?;
 
-    apply_file_ops(&project_path, files).await?;
+    apply_file_ops(&project_path, files, ModifyStrategy::Diff).await?;
     Ok(SpecifiedResult {
         project_id: project_id.to_string(),
         files_count: files.len(),
@@ -209,8 +238,12 @@ pub async fn specified_files_update(
 }
 
 /// 文件操作核心 (path 制, 无版本备份): create/delete/rename/modify, 路径防穿越。
-/// project 路由 (specified_files_update) 与 computer 路由共用此核心。
-pub async fn apply_file_ops(base: &Path, files: &[FileOp]) -> AppResult<()> {
+/// project 路由 (specified_files_update, Diff) 与 computer 路由 (ByteCompare) 共用此核心。
+pub async fn apply_file_ops(
+    base: &Path,
+    files: &[FileOp],
+    strategy: ModifyStrategy,
+) -> AppResult<()> {
     for op in files {
         let op_l = op.operation.to_lowercase();
         let Some(target) = safe_within_or_skip(base, &op.name) else {
@@ -262,13 +295,26 @@ pub async fn apply_file_ops(base: &Path, files: &[FileOp]) -> AppResult<()> {
                 if !fs::try_exists(&target).await.unwrap_or(false) {
                     continue;
                 }
-                let existing = fs::read_to_string(&target).await.unwrap_or_default();
                 let new = op.contents.as_deref().unwrap_or("");
-                let (final_content, changes) = diff_content_by_lines(&existing, new);
-                if changes == 0 {
-                    continue; // 内容未变跳写, 避免 HMR
+                match strategy {
+                    ModifyStrategy::ByteCompare => {
+                        // computer updateFiles: 字节相等跳写, 不等直写 (避免 \r\n 归一改内容)
+                        let existing = fs::read(&target).await.unwrap_or_default();
+                        if existing == new.as_bytes() {
+                            continue;
+                        }
+                        fs::write(&target, new).await?;
+                    }
+                    ModifyStrategy::Diff => {
+                        // project specifiedFilesUpdate: 行级 diff 合并, 换行符继承 existing
+                        let existing = fs::read_to_string(&target).await.unwrap_or_default();
+                        let (final_content, changes) = diff_content_by_lines(&existing, new);
+                        if changes == 0 {
+                            continue; // 内容未变跳写, 避免 HMR
+                        }
+                        fs::write(&target, final_content).await?;
+                    }
                 }
-                fs::write(&target, final_content).await?;
             }
             _ => {}
         }
@@ -497,6 +543,21 @@ mod tests {
         assert_eq!(decode_uri_component("hello%20world"), "hello world");
         assert_eq!(decode_uri_component("plain"), "plain");
         assert_eq!(decode_uri_component("bad%ZZ"), "bad%ZZ"); // 非法保留
+    }
+
+    #[test]
+    fn encode_uri_component_matches_js() {
+        // 保留 unreserved + !~*'()
+        assert_eq!(encode_uri_component("a-b.c_1!~*'()"), "a-b.c_1!~*'()");
+        // 空格 → %20, 斜杠 → %2F
+        assert_eq!(encode_uri_component("a b/c"), "a%20b%2Fc");
+        // 中文逐字节 (中 = E4 B8 AD)
+        assert_eq!(encode_uri_component("中"), "%E4%B8%AD");
+        // 互逆
+        assert_eq!(
+            decode_uri_component(&encode_uri_component("a b/中文")),
+            "a b/中文"
+        );
     }
 
     #[test]

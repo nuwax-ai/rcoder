@@ -144,7 +144,8 @@ async fn traverse_meta(
                 binary: None,
                 size_exceeded: None,
                 contents: None,
-                file_proxy_url: proxy_path.map(|p| format!("{p}/{relative}")),
+                file_proxy_url: proxy_path
+                    .map(|p| format!("{p}/{}", encode_path_segments(&relative))),
                 is_link: Some(is_link),
             });
         }
@@ -259,6 +260,15 @@ fn relative_path(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
 }
 
+/// 相对路径逐段 encodeURIComponent (对齐 nuwax traverseDirectory 的 fileProxyUrl 构造:
+/// `relativePath.split("/").map(encodeURIComponent).join("/")`)。
+fn encode_path_segments(rel: &str) -> String {
+    rel.split('/')
+        .map(crate::service::code::encode_uri_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// 二进制检测: 含 NUL 或控制字符 (除 \t \n \r) → 二进制 (对齐 nuwax isBinaryFile)。
 fn is_binary(bytes: &[u8]) -> bool {
     for &b in bytes {
@@ -324,12 +334,22 @@ async fn detect_frontend_framework(project_path: &Path) -> String {
 
 /// devFramework 检测 (对齐 nuwax detectDevFramework): 只看配置文件, nextjs 优先。
 async fn detect_dev_framework(project_path: &Path) -> String {
-    for f in ["next.config.js", "next.config.ts", "next.config.mjs", "next.config.cjs"] {
+    for f in [
+        "next.config.js",
+        "next.config.ts",
+        "next.config.mjs",
+        "next.config.cjs",
+    ] {
         if project_path.join(f).exists() {
             return "nextjs".to_string();
         }
     }
-    for f in ["vite.config.js", "vite.config.ts", "vite.config.mjs", "vite.config.cjs"] {
+    for f in [
+        "vite.config.js",
+        "vite.config.ts",
+        "vite.config.mjs",
+        "vite.config.cjs",
+    ] {
         if project_path.join(f).exists() {
             return "vite".to_string();
         }

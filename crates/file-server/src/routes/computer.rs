@@ -13,13 +13,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::error::{AppError, AppResult};
 use crate::path_safety;
-use crate::service::{code as code_service, skills as skills_service, tree, zip};
+use crate::service::{code as code_service, pnpm_config, skills as skills_service, tree, zip};
 use crate::workspace::ComputerContext;
-use crate::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -38,7 +38,10 @@ pub fn router() -> Router<AppState> {
         .route("/create-workspace", post(create_workspace))
         .route("/create-workspace-v2", post(create_workspace_v2))
         .route("/push-skills-to-workspace", post(push_skills_to_workspace))
-        .route("/push-skills-to-workspace-v2", post(push_skills_to_workspace))
+        .route(
+            "/push-skills-to-workspace-v2",
+            post(push_skills_to_workspace),
+        )
         .route("/init-project-template", post(init_project_template))
         .route("/build-agent-package", post(build_agent_package))
 }
@@ -120,14 +123,17 @@ async fn get_file_list(
         return Ok(Json(json!({ "success": true, "files": [] })));
     }
     let mut files = tree::list_files_meta(&path, &state.config, q.proxy_path.as_deref()).await?;
-    // fileProxyUrl 追加 ?customTargetDir (对齐 nuwax)
+    // fileProxyUrl 追加 ?customTargetDir (对齐 nuwax; 值需 encodeURIComponent)
     if let Some(ct) = q
         .custom_target_dir
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let suffix = format!("?customTargetDir={ct}");
+        let suffix = format!(
+            "?customTargetDir={}",
+            code_service::encode_uri_component(ct)
+        );
         for f in files.iter_mut() {
             if let Some(u) = f.file_proxy_url.as_mut() {
                 u.push_str(&suffix);
@@ -241,9 +247,7 @@ async fn latest_log_file(dir: &Path) -> AppResult<Option<PathBuf>> {
         if let Ok(meta) = entry.metadata().await
             && meta.is_file()
         {
-            let mtime = meta
-                .modified()
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             if latest.as_ref().is_none_or(|(t, _)| mtime > *t) {
                 latest = Some((mtime, entry.path()));
             }
@@ -263,7 +267,8 @@ struct ExecCommandBody {
 }
 
 /// `POST /api/computer/execute-command` (对齐 nuwax executeCommand; shell 执行 + 超时 + 捕获输出)。
-/// command 是 agent 提供的 shell 命令串, 故经 sh -c (与 nuwax child_process.exec 一致)。
+/// command 是 agent 提供的 shell 命令串, 故经 shell -c (与 nuwax child_process.exec 一致)。
+/// shell 优先用 `BASH_PATH` (未配置则 sh); stdout/stderr 截断到 50MB (对齐 nuwax maxBuffer)。
 async fn execute_command(
     State(state): State<AppState>,
     Json(body): Json<ExecCommandBody>,
@@ -272,8 +277,16 @@ async fn execute_command(
     if !cwd.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
+    if body.command.trim().is_empty() {
+        return Err(AppError::validation("command cannot be empty"));
+    }
     let timeout_secs = state.config.dev_command_timeout_secs;
-    let mut cmd = tokio::process::Command::new("sh");
+    // shell: BASH_PATH 非空则用之, 否则 sh (对齐 nuwax execOptions.shell)
+    let shell = {
+        let b = state.config.bash_path.trim();
+        if b.is_empty() { "sh" } else { b }
+    };
+    let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-c").arg(&body.command);
     cmd.current_dir(&cwd);
     cmd.env("NODE_ENV", "development");
@@ -285,12 +298,12 @@ async fn execute_command(
     let child = cmd
         .spawn()
         .map_err(|e| AppError::system(format!("execute-command spawn failed: {e}")))?;
-    let out = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-        .await;
+    let out =
+        tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
     match out {
         Ok(Ok(o)) => {
-            let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+            let stdout = cap_50mb(String::from_utf8_lossy(&o.stdout));
+            let stderr = cap_50mb(String::from_utf8_lossy(&o.stderr));
             let code = o.status.code().unwrap_or(-1);
             Ok(Json(json!({
                 "success": code == 0,
@@ -299,7 +312,9 @@ async fn execute_command(
                 "exitCode": code,
             })))
         }
-        Ok(Err(e)) => Err(AppError::system(format!("execute-command wait failed: {e}"))),
+        Ok(Err(e)) => Err(AppError::system(format!(
+            "execute-command wait failed: {e}"
+        ))),
         Err(_) => Ok(Json(json!({
             "success": false,
             "stdout": "",
@@ -307,6 +322,21 @@ async fn execute_command(
             "exitCode": -1,
         }))),
     }
+}
+
+/// 输出截断到 50MB (对齐 nuwax exec maxBuffer 50 * 1024 * 1024), 防止超大输出 OOM。
+fn cap_50mb(cow: std::borrow::Cow<'_, str>) -> String {
+    const MAX: usize = 50 * 1024 * 1024;
+    let s = cow.into_owned();
+    if s.len() <= MAX {
+        return s;
+    }
+    // 按字节边界截断 (MAX 处可能落在多字节字符中间, 取 char_boundary 安全边界)
+    let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 // ── install-project ─────────────────────────────────────────────────────────────
@@ -330,9 +360,14 @@ async fn install_project(
         return Err(AppError::resource("workspace does not exist"));
     }
     let lang = body.programming_language.to_ascii_lowercase();
+    let skip = package_search_skip_dirs(&state.config.zip_workspace_exclude);
     let (program, args, project_dir): (&str, Vec<&str>, Option<PathBuf>) = match lang.as_str() {
         "typescript" | "ts" => {
-            let dir = find_first(&ws, "package.json").await;
+            // projectDir = findPackageScript || findNodeProjectDir (对齐 nuwax)
+            let dir = match find_package_script(&ws, &skip).await {
+                Some(d) => Some(d),
+                None => find_first(&ws, "package.json").await,
+            };
             (
                 "pnpm",
                 vec![
@@ -360,13 +395,20 @@ async fn install_project(
         other => {
             return Err(AppError::validation(format!(
                 "unsupported programmingLanguage: {other}"
-            )))
+            )));
         }
     };
     let project_dir = project_dir.ok_or_else(|| {
-        AppError::business("project manifest (package.json / pyproject.toml / requirements.txt) not found")
+        AppError::business(
+            "project manifest (package.json / pyproject.toml / requirements.txt) not found",
+        )
     })?;
     let timeout = state.config.dev_command_timeout_secs;
+    // pnpm install 前准备 .npmrc (package-import-method=copy + built-deps sanitize + 3 行),
+    // best-effort (失败仅 warn, 不阻断 install; 对齐 nuwax ensurePnpmInstallConfig)
+    if program == "pnpm" {
+        pnpm_config::ensure_pnpm_install_config(&project_dir).await;
+    }
     let (stdout, stderr, code) = run_capture(program, &args, &project_dir, timeout).await?;
     Ok(Json(json!({
         "success": code == 0,
@@ -392,12 +434,7 @@ async fn find_first(root: &Path, manifest: &str) -> Option<PathBuf> {
             continue;
         };
         while let Ok(Some(entry)) = rd.next_entry().await {
-            if entry
-                .file_type()
-                .await
-                .map(|t| t.is_dir())
-                .unwrap_or(false)
-            {
+            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name();
                 // 跳过常见大目录
                 if matches!(
@@ -408,6 +445,43 @@ async fn find_first(root: &Path, manifest: &str) -> Option<PathBuf> {
                 }
                 q.push_back(entry.path());
             }
+        }
+    }
+    None
+}
+
+/// build-agent-package / cleanup / install 定位项目目录时的搜索跳过集合
+/// (对齐 nuwax PACKAGE_SEARCH_SKIP_DIRS = ZIP_WORKSPACE_EXCLUDE ∪ {dist-packages})。
+fn package_search_skip_dirs(zip_workspace_exclude: &[String]) -> Vec<String> {
+    let mut v = zip_workspace_exclude.to_vec();
+    if !v.iter().any(|d| d == "dist-packages") {
+        v.push("dist-packages".to_string());
+    }
+    v
+}
+
+/// 递归查找含 `scripts/package-platforms.mjs` 的目录 (对齐 nuwax findPackageScript)。
+/// 深度优先, 跳过 skip_dirs 命中的目录名。
+async fn find_package_script(root: &Path, skip_dirs: &[String]) -> Option<PathBuf> {
+    if root.join("scripts").join("package-platforms.mjs").exists() {
+        return Some(root.to_path_buf());
+    }
+    let Ok(mut rd) = tokio::fs::read_dir(root).await else {
+        return None;
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let Ok(ft) = entry.file_type().await else {
+            continue;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if skip_dirs.iter().any(|d| d == &name) {
+            continue;
+        }
+        if let Some(found) = Box::pin(find_package_script(&entry.path(), skip_dirs)).await {
+            return Some(found);
         }
     }
     None
@@ -437,7 +511,8 @@ async fn run_capture(
     let child = cmd
         .spawn()
         .map_err(|e| AppError::system(format!("spawn {program} failed: {e}")))?;
-    let out = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+    let out =
+        tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
     match out {
         Ok(Ok(o)) => Ok((
             String::from_utf8_lossy(&o.stdout).into_owned(),
@@ -445,7 +520,11 @@ async fn run_capture(
             o.status.code().unwrap_or(-1),
         )),
         Ok(Err(e)) => Err(AppError::system(format!("{program} wait failed: {e}"))),
-        Err(_) => Ok((String::new(), format!("timed out after {timeout_secs}s"), -1)),
+        Err(_) => Ok((
+            String::new(),
+            format!("timed out after {timeout_secs}s"),
+            -1,
+        )),
     }
 }
 
@@ -509,6 +588,8 @@ fn utf8_percent_encode(s: &str) -> String {
 
 /// `POST /api/computer/zip-workspace` (对齐 nuwax zipWorkspace):
 /// 无顶层前缀; 工作区不存在则报错; 文件名 `${userId}_${cId}.zip` + UTF-8 filename*。
+/// 过滤: ZIP_WORKSPACE_EXCLUDE (强制) + 调用方 excludeDirs (补充) 合并, 对任意路径段匹配
+/// (目录与文件同集合); 跳过符号链接; **无** dot-segment 过滤 (保留 .gitignore/.npmrc 等)。
 async fn zip_workspace(
     State(state): State<AppState>,
     Json(body): Json<ZipBody>,
@@ -518,12 +599,24 @@ async fn zip_workspace(
         return Err(AppError::resource("workspace does not exist"));
     }
     let tmp = computer_tmp_zip(&body.user_id, &body.c_id);
+    // mandatory(ZIP_WORKSPACE_EXCLUDE) ∪ extra(调用方 excludeDirs); 同时填 dirs 与 files,
+    // 等价 nuwax archive.directory 的 "任一路径段命中集合则跳过" (对目录与文件同集合)。
+    let merged: Vec<String> = state
+        .config
+        .zip_workspace_exclude
+        .iter()
+        .cloned()
+        .chain(body.exclude_dirs.unwrap_or_default())
+        .collect();
     let opts = zip::PackOpts {
-        exclude_dirs: body.exclude_dirs.unwrap_or_default(),
-        exclude_files: state.config.zip_workspace_exclude.clone(),
-        ..Default::default()
+        exclude_dirs: merged.clone(),
+        exclude_files: merged,
+        // 不用 pack_download: 关闭 dot-segment/hardlink 过滤 (nuwax zipWorkspace 保留 .gitignore)
+        skip_dot_segments: false,
+        skip_hardlinks: false,
+        path_prefix: None,
     };
-    zip::pack_download(src, tmp.clone(), opts).await?;
+    zip::pack_with_opts(src, tmp.clone(), opts).await?;
     let bytes = tokio::fs::read(&tmp).await?;
     let _ = tokio::fs::remove_file(&tmp).await;
     let filename = format!("{}_{}.zip", body.user_id, body.c_id);
@@ -549,8 +642,13 @@ async fn download_all_files(
         return Ok(zip_response(&filename, bytes));
     }
 
+    // 过滤对齐 nuwax downloadAllFiles: excludeDirs=TRAVERSE_EXCLUDE_DIRS,
+    // excludeFiles=CONTENT_TRAVERSE_EXCLUDE_FILES, 叠加 pack_download 的 dot-segment +
+    // 符号链接/硬链接过滤。**非** zip_workspace_exclude (后者当文件名匹配, 目录如
+    // node_modules/dist 不被排除 → zip 爆体积)。
     let opts = zip::PackOpts {
-        exclude_files: state.config.zip_workspace_exclude.clone(),
+        exclude_dirs: state.config.traverse_exclude_dirs.clone(),
+        exclude_files: state.config.content_traverse_exclude_files.clone(),
         path_prefix: Some(prefix),
         ..Default::default()
     };
@@ -558,9 +656,11 @@ async fn download_all_files(
     let max = state.config.download_max_file_size_bytes;
     let src_for_size = src.clone();
     let opts_for_size = opts.clone();
-    let size = tokio::task::spawn_blocking(move || zip::downloadable_size_blocking(&src_for_size, &opts_for_size))
-        .await
-        .map_err(|e| AppError::system(format!("size calc join: {e}")))?;
+    let size = tokio::task::spawn_blocking(move || {
+        zip::downloadable_size_blocking(&src_for_size, &opts_for_size)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("size calc join: {e}")))?;
     if size > max {
         let cur_mb = size / 1024 / 1024;
         let max_mb = max / 1024 / 1024;
@@ -592,7 +692,12 @@ async fn files_update(
     State(state): State<AppState>,
     Json(mut body): Json<FilesUpdateBody>,
 ) -> Result<Json<Value>, AppError> {
-    let path = resolve_computer_target(&state, &body.user_id, &body.c_id, body.custom_target_dir.as_deref());
+    let path = resolve_computer_target(
+        &state,
+        &body.user_id,
+        &body.c_id,
+        body.custom_target_dir.as_deref(),
+    );
     if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -605,7 +710,13 @@ async fn files_update(
         }
     }
     let count = body.files.len();
-    code_service::apply_file_ops(&path, &body.files).await?;
+    // computer updateFiles: modify 用字节比较 (非 project 的行级 diff; 对齐 nuwax)
+    code_service::apply_file_ops(
+        &path,
+        &body.files,
+        code_service::ModifyStrategy::ByteCompare,
+    )
+    .await?;
     Ok(Json(json!({
         "success": true,
         "message": "User files updated successfully",
@@ -805,6 +916,7 @@ async fn import_project(
 
 /// `POST /api/computer/cleanup-build-artifacts` (对齐 nuwax cleanupBuildArtifacts; 删 dist-packages)。
 /// 返回 {success, cleaned} (字段 cleaned, 非 removed; 无 message)。
+/// 递归找 scripts/package-platforms.mjs 所在 projectDir, 删其 dist-packages (对齐 nuwax)。
 async fn cleanup_build_artifacts(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Map<String, Value>>,
@@ -826,7 +938,12 @@ async fn cleanup_build_artifacts(
     if !ws.exists() {
         return Ok(Json(json!({ "success": true, "cleaned": false })));
     }
-    let dist = ws.join("dist-packages");
+    let skip = package_search_skip_dirs(&state.config.zip_workspace_exclude);
+    let project_dir = match find_package_script(&ws, &skip).await {
+        Some(d) => d,
+        None => return Ok(Json(json!({ "success": true, "cleaned": false }))),
+    };
+    let dist = project_dir.join("dist-packages");
     let cleaned = if dist.exists() {
         match tokio::fs::remove_dir_all(&dist).await {
             Ok(()) => true,
@@ -874,7 +991,8 @@ async fn create_workspace(
     }
     let ws = ws_path(&state, &user_id, &cid);
     tokio::fs::create_dir_all(&ws).await?;
-    let res = crate::service::computer_ws::create_workspace(&ws, skill_zip, Vec::new(), None).await?;
+    let res =
+        crate::service::computer_ws::create_workspace(&ws, skill_zip, Vec::new(), None).await?;
     Ok(Json(json!({
         "success": true,
         "message": res.message,
@@ -935,8 +1053,9 @@ async fn create_workspace_v2(
         validate_zip_ext(file_name.as_deref())?;
     }
     // hookScripts: JSON 字符串 → Vec<HookScript>, 解析失败 → None (对齐 nuwax)
-    let hook_scripts = hook_scripts_raw
-        .and_then(|s| serde_json::from_str::<Vec<crate::service::agent_hooks::HookScript>>(&s).ok());
+    let hook_scripts = hook_scripts_raw.and_then(|s| {
+        serde_json::from_str::<Vec<crate::service::agent_hooks::HookScript>>(&s).ok()
+    });
     let hook_input = crate::service::agent_hooks::HookConfigInput {
         mcp_servers_config,
         hooks_config,
@@ -945,7 +1064,9 @@ async fn create_workspace_v2(
     };
     let ws = ws_path(&state, &user_id, &cid);
     tokio::fs::create_dir_all(&ws).await?;
-    let res = crate::service::computer_ws::create_workspace(&ws, skill_zip, skill_urls, Some(hook_input)).await?;
+    let res =
+        crate::service::computer_ws::create_workspace(&ws, skill_zip, skill_urls, Some(hook_input))
+            .await?;
     Ok(Json(json!({
         "success": true,
         "message": res.message,
@@ -993,9 +1114,16 @@ async fn push_skills_to_workspace(
         return Err(AppError::resource("workspace does not exist"));
     }
     let updated = skills_service::push_skills_at(&ws, zip_data, skill_urls).await?;
+    // message 对齐 nuwax pushSkillsToWorkspace: 有 skills → "Pushed N skills: a, b";
+    // 无 → "No valid skill directories found in file or skillUrls"
+    let message = if updated.is_empty() {
+        "No valid skill directories found in file or skillUrls".to_string()
+    } else {
+        format!("Pushed {} skills: {}", updated.len(), updated.join(", "))
+    };
     Ok(Json(json!({
         "success": true,
-        "message": "Skills pushed to workspace",
+        "message": message,
         "workspaceRoot": ws.display().to_string(),
         "updatedSkills": updated,
     })))
@@ -1088,27 +1216,17 @@ async fn build_agent_package(
     if !ws.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
-    // 递归找 package-platforms.mjs 所在目录 (跳过 node_modules/dist)
-    let pkg_dir = find_first(&ws, "package.json").await; // 用 package.json 定位项目目录
-    let pkg_dir = pkg_dir.ok_or_else(|| {
-        AppError::business("no package.json found in workspace (build-agent-package)")
-    })?;
-    let script = pkg_dir.join("scripts").join("package-platforms.mjs");
-    if !script.exists() {
-        return Err(AppError::business(format!(
-            "scripts/package-platforms.mjs not found in {}",
-            pkg_dir.display()
-        )));
-    }
+    // 递归找 scripts/package-platforms.mjs 所在目录 (对齐 nuwax findPackageScript;
+    // skip ZIP_WORKSPACE_EXCLUDE ∪ {dist-packages}, 而非仅 package.json)
+    let skip = package_search_skip_dirs(&state.config.zip_workspace_exclude);
+    let pkg_dir = find_package_script(&ws, &skip)
+        .await
+        .ok_or_else(|| AppError::business("package-platforms.mjs not found in workspace"))?;
     let timeout = state.config.dev_command_timeout_secs;
-    // pnpm install (含 devDependencies)
-    let (_, _, code) = run_capture(
-        "pnpm",
-        &["install"],
-        &pkg_dir,
-        timeout,
-    )
-    .await?;
+    // pnpm install 前准备 .npmrc (best-effort, 对齐 nuwax runPnpmInstall → ensurePnpmInstallConfig)
+    pnpm_config::ensure_pnpm_install_config(&pkg_dir).await;
+    // pnpm install (含 devDependencies; esbuild/typescript 在 devDependencies 中)
+    let (_, _, code) = run_capture("pnpm", &["install"], &pkg_dir, timeout).await?;
     if code != 0 {
         return Err(AppError::system(format!(
             "pnpm install failed (exit {code})"
@@ -1146,7 +1264,11 @@ fn parse_artifacts(stdout: &str, workspace: &Path) -> Vec<Value> {
     let mut out = Vec::new();
     for line in stdout.lines() {
         let t = line.trim();
-        if !(t.ends_with(".tar.gz") || t.ends_with(".tar.bz2") || t.ends_with(".zip") || t.ends_with(".tgz")) {
+        if !(t.ends_with(".tar.gz")
+            || t.ends_with(".tar.bz2")
+            || t.ends_with(".zip")
+            || t.ends_with(".tgz"))
+        {
             continue;
         }
         // t 可能是相对路径或绝对路径; 统一转 workspace 相对
@@ -1233,7 +1355,10 @@ mod tests {
 
     #[test]
     fn extract_platform_returns_none_when_no_version() {
-        assert_eq!(extract_platform_from_filename("agent-foo-linux-x64.zip"), None);
+        assert_eq!(
+            extract_platform_from_filename("agent-foo-linux-x64.zip"),
+            None
+        );
         assert_eq!(extract_platform_from_filename("nope.zip"), None);
     }
 

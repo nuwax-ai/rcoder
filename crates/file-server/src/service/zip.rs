@@ -94,7 +94,8 @@ pub async fn pack_download(src: PathBuf, zip_path: PathBuf, opts: PackOpts) -> A
     pack_with_opts(src, zip_path, o).await
 }
 
-async fn pack_with_opts(src: PathBuf, zip_path: PathBuf, opts: PackOpts) -> AppResult<()> {
+/// 异步打包 (自定义 opts; 供 zip-workspace 等需要弱过滤、但无 dot-segment 过滤的场景)。
+pub async fn pack_with_opts(src: PathBuf, zip_path: PathBuf, opts: PackOpts) -> AppResult<()> {
     tokio::task::spawn_blocking(move || pack_blocking(&src, &zip_path, &opts))
         .await
         .map_err(|e| AppError::system(format!("zip pack task join error: {e}")))??;
@@ -131,9 +132,8 @@ fn walk_and_add(
         }
         let path = entry.path();
         // 用 symlink_metadata (lstat) 探测真实类型, 拒绝跟随符号链接 (对齐 nuwax lstatSync)
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
-            AppError::system(format!("read metadata {}: {e}", path.display()))
-        })?;
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| AppError::system(format!("read metadata {}: {e}", path.display())))?;
         // 符号链接一律跳过 (对齐 nuwax isSymbolicLink)
         if meta.file_type().is_symlink() {
             continue;
@@ -251,4 +251,97 @@ pub async fn write_empty_zip(zip_path: PathBuf, dir_entry_name: String) -> AppRe
     .await
     .map_err(|e| AppError::system(format!("empty zip task join error: {e}")))??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn unique_tmp(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("fs_{prefix}_{nanos}"))
+    }
+
+    /// 构造工作区树: src/index.js + node_modules/pkg.js + dist/index.html + .gitignore + package-lock.yaml。
+    fn make_tree(root: &Path) {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("src/index.js"), "x").unwrap();
+        fs::write(root.join("node_modules/pkg.js"), "x").unwrap();
+        fs::write(root.join("dist/index.html"), "x").unwrap();
+        fs::write(root.join(".gitignore"), "node_modules").unwrap();
+        fs::write(root.join("package-lock.yaml"), "x").unwrap();
+    }
+
+    fn entry_names(zip_path: &Path) -> Vec<String> {
+        let f = fs::File::open(zip_path).unwrap();
+        let mut z = zip::ZipArchive::new(f).unwrap();
+        (0..z.len())
+            .filter_map(|i| z.by_index(i).ok().map(|e| e.name().to_string()))
+            .collect()
+    }
+
+    /// download-all-files 口径: traverse_exclude_dirs + content excludes + dot-segment 过滤。
+    /// 锁定 P0 #1: node_modules/dist 目录被排除 + dot 文件(.gitignore)/lock 被排除。
+    #[test]
+    fn download_excludes_dirs_dotfiles_and_locks() {
+        let src = unique_tmp("zipsrc_dl");
+        let out = unique_tmp("zipout_dl");
+        make_tree(&src);
+        let opts = PackOpts {
+            exclude_dirs: vec!["node_modules".into(), "dist".into()],
+            exclude_files: vec!["package-lock.yaml".into()],
+            skip_dot_segments: true,
+            skip_hardlinks: false,
+            path_prefix: Some("u_c/".into()),
+        };
+        let _ = pack_blocking(&src, &out, &opts);
+        let names = entry_names(&out);
+        assert!(names.contains(&"u_c/src/index.js".to_string()), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains("node_modules")),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|n| n.contains("dist/")), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains(".gitignore")), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains("package-lock.yaml")),
+            "{names:?}"
+        );
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_file(&out);
+    }
+
+    /// zip-workspace 口径: 合并集填 dirs+files, **无** dot-segment 过滤。
+    /// 锁定 P0 #2: .gitignore 被保留 (非 pack_download), node_modules/dist 仍排除。
+    #[test]
+    fn workspace_keeps_gitignore_excludes_dirs() {
+        let src = unique_tmp("zipsrc_ws");
+        let out = unique_tmp("zipout_ws");
+        make_tree(&src);
+        let merged = vec!["node_modules".into(), "dist".into(), ".git".into()];
+        let opts = PackOpts {
+            exclude_dirs: merged.clone(),
+            exclude_files: merged,
+            skip_dot_segments: false,
+            skip_hardlinks: false,
+            path_prefix: None,
+        };
+        let _ = pack_blocking(&src, &out, &opts);
+        let names = entry_names(&out);
+        assert!(names.contains(&"src/index.js".to_string()), "{names:?}");
+        assert!(names.contains(&".gitignore".to_string()), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains("node_modules")),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|n| n.contains("dist/")), "{names:?}");
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_file(&out);
+    }
 }

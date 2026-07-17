@@ -7,6 +7,7 @@ pub mod computer_ws;
 pub mod dev_server;
 pub mod fs_util;
 pub mod git;
+pub mod pnpm_config;
 pub mod project;
 pub mod skills;
 pub mod tree;

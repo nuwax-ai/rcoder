@@ -36,9 +36,9 @@ tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# 序列化
+# 序列化 (preserve_order: package.json round-trip 保序, 对齐 nuwax JSON.stringify)
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
 
 # 错误处理
 anyhow = { workspace = true }
