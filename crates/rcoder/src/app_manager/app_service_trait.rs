@@ -39,7 +39,12 @@ pub trait AppServiceTrait: Send + Sync {
     ) -> AppResult<AppRuntimeInfo>;
 
     /// 删除应用（删计算资源；持久存储默认保留，purge=true 才清空数据面。v2 §5.3）
-    async fn delete_app(&self, app_id: &str, purge: bool) -> AppResult<()>;
+    async fn delete_app(
+        &self,
+        app_id: &str,
+        purge: bool,
+        expected_resource_version: Option<&str>,
+    ) -> AppResult<()>;
 
     /// 查询单个应用持久存储状态（v2 §5.4，O(1) stat，不含 size_bytes）
     async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo>;

@@ -190,9 +190,14 @@ pub async fn delete_app(
     Path(app_id): Path<String>,
     body: Option<Json<DeleteAppRequest>>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    let purge = body.and_then(|Json(r)| r.purge).unwrap_or(false);
+    let (purge, expected_rv) = body
+        .map(|Json(r)| (r.purge.unwrap_or(false), r.expected_resource_version))
+        .unwrap_or((false, None));
     info!("[APP] 删除应用: {} (purge={})", app_id, purge);
-    state.app_service.delete_app(&app_id, purge).await?;
+    state
+        .app_service
+        .delete_app(&app_id, purge, expected_rv.as_deref())
+        .await?;
     Ok(Json(HttpResult::success("删除成功".to_string())))
 }
 

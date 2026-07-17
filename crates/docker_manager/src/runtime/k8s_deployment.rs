@@ -1324,6 +1324,7 @@ impl KubernetesRuntime {
             restart_count,
             started_at,
             ports,
+            resource_version: deploy.metadata.resource_version.clone(),
         }
     }
 }

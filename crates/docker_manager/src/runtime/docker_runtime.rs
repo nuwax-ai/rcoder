@@ -536,6 +536,7 @@ impl ContainerRuntime for DockerRuntime {
             restart_count: inspect.restart_count.unwrap_or(0) as u32,
             started_at: inspect.state.as_ref().and_then(|s| s.started_at.clone()),
             ports,
+            resource_version: None,
         }))
     }
 
@@ -594,6 +595,7 @@ impl ContainerRuntime for DockerRuntime {
                 restart_count: 0,
                 started_at: None,
                 ports,
+                resource_version: None,
             });
         }
         Ok(out)

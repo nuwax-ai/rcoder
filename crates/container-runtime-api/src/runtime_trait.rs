@@ -201,6 +201,9 @@ pub struct DeploymentStatus {
     pub started_at: Option<String>,
     /// 端口状态
     pub ports: Vec<AppPortStatus>,
+    /// K8s Deployment.resourceVersion（乐观锁用，update/delete 校验 expected_resource_version）。
+    /// Docker 无此概念，填 None（开发环境不校验乐观锁）。
+    pub resource_version: Option<String>,
 }
 
 /// 容器日志条目（运行时层；app_manager 层另映射为带 ToSchema 的 LogEntry 暴露给 API）

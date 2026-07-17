@@ -114,7 +114,20 @@ impl AppService {
     /// 创建应用
     #[instrument(skip(self, request))]
     pub async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
-        let app_id = format!("app-{}", &Uuid::new_v4().to_string()[..8]);
+        // app_id：外部指定（app- + DNS-1123，校验 + 唯一性）or 自动生成
+        let app_id = match &request.app_id {
+            Some(id) => {
+                validate_app_id(id)?;
+                // 唯一性：已存在 → ERR_APP_ALREADY_EXISTS（防止 SSA force=true 静默覆盖）
+                if let Ok(Some(_)) = self.runtime.get_deployment_status(id).await {
+                    return Err(AppOperationError::AlreadyExists(format!(
+                        "app already exists: {id}"
+                    )));
+                }
+                id.clone()
+            }
+            None => format!("app-{}", &Uuid::new_v4().to_string()[..8]),
+        };
         info!(
             "[APP] 创建应用: {} ({}, mode={:?})",
             request.name, app_id, self.config.access_mode
@@ -342,7 +355,17 @@ impl AppService {
         request: UpdateAppRequest,
     ) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
-        self.ensure_app_exists(app_id).await?;
+        let current = self.fetch_runtime_status_or_err(app_id).await?;
+        // 乐观锁：expected_resource_version 不匹配 → 409 Conflict
+        // （Docker resource_version=None → 跳过校验，开发环境 last-write-wins 可接受）
+        if let Some(expected) = &request.expected_resource_version
+            && let Some(actual) = &current.resource_version
+            && expected != actual
+        {
+            return Err(AppOperationError::Conflict(format!(
+                "resource version mismatch: expected={expected}, actual={actual}"
+            )));
+        }
         let params = self.build_container_params_from_update(app_id, &request)?;
         // Docker 模式：旧容器 IP 即将失效，先注销 Pingora backend（K8s no-op）
         self.unregister_pingora_backends(app_id).await;
@@ -359,8 +382,24 @@ impl AppService {
 
     /// 删除应用（v2 §5.3：默认保留持久存储，purge=true 才清空数据面）。
     #[instrument(skip(self))]
-    pub async fn delete_app(&self, app_id: &str, purge: bool) -> AppResult<()> {
+    pub async fn delete_app(
+        &self,
+        app_id: &str,
+        purge: bool,
+        expected_resource_version: Option<&str>,
+    ) -> AppResult<()> {
         validate_app_id(app_id)?;
+        // 乐观锁（同 update_app）：expected 不匹配 → 409 Conflict
+        if let Some(expected) = expected_resource_version {
+            let current = self.fetch_runtime_status_or_err(app_id).await?;
+            if let Some(actual) = &current.resource_version
+                && expected != actual
+            {
+                return Err(AppOperationError::Conflict(format!(
+                    "resource version mismatch: expected={expected}, actual={actual}"
+                )));
+            }
+        }
         info!("[APP] 删除应用: {} (purge={})", app_id, purge);
 
         // 1. Docker 模式：清理 Pingora backend
@@ -1214,6 +1253,7 @@ impl AppService {
             started_at: status.started_at,
             ports,
             conditions,
+            resource_version: status.resource_version,
         }
     }
 
@@ -1492,16 +1532,31 @@ fn validate_upload_target(target: &str) -> AppResult<()> {
 /// 此校验是路径穿越的纵深防御（Fail Fast）：拒绝 `..`、绝对路径、非法格式，
 /// 避免恶意 app_id 触达工作空间目录之外。
 fn validate_app_id(app_id: &str) -> AppResult<()> {
+    // 必须 app- 前缀（统一，和自动生成一致）
     let rest = app_id.strip_prefix("app-").ok_or_else(|| {
-        AppOperationError::Validation(format!("invalid app_id: {app_id} (expected prefix 'app-')"))
+        AppOperationError::Validation("invalid app_id: must start with 'app-'".to_string())
     })?;
-    if rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err(AppOperationError::Validation(format!(
-            "invalid app_id: {app_id} (expected 'app-' + 8 hex chars)"
-        )))
+    if rest.is_empty() {
+        return Err(AppOperationError::Validation(
+            "invalid app_id: empty after 'app-'".to_string(),
+        ));
     }
+    // DNS-1123 label 合规（[a-z0-9]([-a-z0-9]*[a-z0-9])?，≤63；支持 app-order-svc 等业务名）
+    if rest.len() > 63
+        || !rest
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(AppOperationError::Validation(format!(
+            "invalid app_id: must be DNS-1123 label (lowercase alphanumeric or '-', got '{rest}')"
+        )));
+    }
+    if rest.starts_with('-') || rest.ends_with('-') {
+        return Err(AppOperationError::Validation(
+            "invalid app_id: must not start/end with '-'".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// 从 PortConfig 列表提取 HTTP 端口号（供 Pingora backend 注册，create/update 共用）
@@ -1656,8 +1711,14 @@ impl super::AppServiceTrait for AppService {
         self.update_app(app_id, request).await
     }
 
-    async fn delete_app(&self, app_id: &str, purge: bool) -> AppResult<()> {
-        self.delete_app(app_id, purge).await
+    async fn delete_app(
+        &self,
+        app_id: &str,
+        purge: bool,
+        expected_resource_version: Option<&str>,
+    ) -> AppResult<()> {
+        self.delete_app(app_id, purge, expected_resource_version)
+            .await
     }
 
     async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo> {

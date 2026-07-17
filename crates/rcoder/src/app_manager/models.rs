@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use shared_types::error_codes::{
-    ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_FILE_NOT_FOUND,
-    ERR_INVALID_STATE, ERR_OPERATION_NOT_SUPPORTED, ERR_VALIDATION,
+    ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_CONFLICT,
+    ERR_FILE_NOT_FOUND, ERR_INVALID_STATE, ERR_OPERATION_NOT_SUPPORTED, ERR_VALIDATION,
 };
 
 /// 应用端口运行时状态（来自 container-runtime-api，含实际分配的对外端口）
@@ -21,6 +21,9 @@ pub use container_runtime_api::AppPortStatus;
 /// 创建应用请求
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAppRequest {
+    /// 应用 ID（可选，外部指定；格式 `app-` + DNS-1123，如 `app-order-svc`；None=自动生成）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
     /// 应用名称
     pub name: String,
     /// 容器镜像
@@ -174,6 +177,10 @@ pub struct UpdateAppRequest {
     pub tenant_id: Option<String>,
     /// 空间 ID（携带以保持 label）
     pub space_id: Option<String>,
+    /// 乐观锁：传入 `GET /apps/{id}` 返回的 `resource_version`；不匹配 → 409 ERR_CONFLICT。
+    /// 不传 = 不校验（向后兼容）。Docker 模式 resource_version=None，忽略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_resource_version: Option<String>,
 }
 
 /// 日志查询参数
@@ -293,6 +300,10 @@ pub struct AppRuntimeInfo {
     pub access: AccessInfo,
     /// 诊断条件（read 时由 DeploymentStatus 派生，见 [`Condition`]）
     pub conditions: Vec<Condition>,
+    /// 乐观锁用（K8s Deployment.resourceVersion；Docker=None）。
+    /// update/delete 时作为 `expected_resource_version` 传入校验。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_version: Option<String>,
 }
 
 /// 访问信息
@@ -506,6 +517,10 @@ pub struct DeleteAppRequest {
     /// 是否同时清空持久存储（默认 `false`：只删计算面，保留数据面）
     #[serde(default)]
     pub purge: Option<bool>,
+    /// 乐观锁：传入 `GET /apps/{id}` 返回的 `resource_version`；不匹配 → 409 ERR_CONFLICT。
+    /// 不传 = 不校验（向后兼容）。Docker 模式忽略。
+    #[serde(default)]
+    pub expected_resource_version: Option<String>,
 }
 
 /// 存储查询请求（**强制分页，无全量模式**——扫存储后端代价高）
@@ -573,6 +588,8 @@ pub enum AppOperationError {
     Validation(String),
     /// 后端运行时错误（500 ERR_BACKEND_ERROR，兜底）
     Backend(String),
+    /// 乐观锁冲突（409 ERR_CONFLICT）—— expected_resource_version 不匹配
+    Conflict(String),
 }
 
 impl AppOperationError {
@@ -586,6 +603,7 @@ impl AppOperationError {
             Self::FileNotFound(_) => ERR_FILE_NOT_FOUND,
             Self::Validation(_) => ERR_VALIDATION,
             Self::Backend(_) => ERR_BACKEND_ERROR,
+            Self::Conflict(_) => ERR_CONFLICT,
         }
     }
 
@@ -598,7 +616,8 @@ impl AppOperationError {
             | Self::NotSupported(m)
             | Self::FileNotFound(m)
             | Self::Validation(m)
-            | Self::Backend(m) => m,
+            | Self::Backend(m)
+            | Self::Conflict(m) => m,
         }
     }
 }
