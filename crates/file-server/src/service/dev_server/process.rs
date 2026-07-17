@@ -25,17 +25,30 @@ pub struct DevArgs {
 
 /// 构造 dev server 启动参数 (vite/next)。用 arg 数组而非 shell 字符串拼接, 避免注入
 /// (base_path 来自用户, 经 sh -c 拼接会注入)。
+///
+/// HMR 机制 (调研 nuwax + vite 5.4 源码结论): 不注入 server.hmr, 靠 vite 默认行为 +
+/// 反代透传 ws。vite HMR 客户端从 `@vite/client` 脚本 origin (= 反代 origin) 自动推出 ws
+/// URL → ws 自然连回反代; ws 监听路径 = `--base` 本身。故 **base 必须等于完整代理路径**
+/// (带尾 `/`, 如 `/proxy/{port}/foo/`), 否则资源/ws 全 404。port 由本进程分配, 故 base
+/// 为空时默认 `/proxy/{port}/`, 让 HMR 开箱即用。
 pub fn build_dev_args(
     dev_script: &str,
     port: u16,
     base_path: Option<&str>,
 ) -> AppResult<DevArgs> {
     let lower = dev_script.to_ascii_lowercase();
-    let base = base_path.map(normalize_base_path);
+    // base 为空 → 默认完整代理路径 /proxy/{port}/ (HMR 依赖)
+    let base = match base_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(b) => normalize_base_path(b),
+        None => format!("/proxy/{port}/"),
+    };
     let mut env_extra: Vec<(String, String)> = Vec::new();
     let port_str = port.to_string();
     let args: Vec<String> = if lower.contains("vite") {
-        let mut a = vec![
+        vec![
             "vite".into(),
             "--port".into(),
             port_str,
@@ -45,17 +58,13 @@ pub fn build_dev_args(
             // 抑制 ANSI 清屏转义码 (否则污染日志管道), 对齐 vite-rs
             "--clearScreen".into(),
             "false".into(),
-        ];
-        if let Some(b) = &base {
-            a.push("--base".into());
-            a.push(b.clone());
-        }
-        a
+            // base = 完整代理路径 (vite 资源前缀 + HMR ws 路径, 二者同源)
+            "--base".into(),
+            base,
+        ]
     } else if lower.contains("next") {
-        if let Some(b) = &base {
-            env_extra.push(("NEXT_PUBLIC_BASE_PATH".into(), b.clone()));
-            env_extra.push(("BASE_PATH".into(), b.clone()));
-        }
+        env_extra.push(("NEXT_PUBLIC_BASE_PATH".into(), base.clone()));
+        env_extra.push(("BASE_PATH".into(), base));
         vec!["next".into(), "dev".into(), "-p".into(), port_str]
     } else {
         return Err(AppError::business(format!(

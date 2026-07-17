@@ -435,6 +435,14 @@ mod tests {
         assert!(build_args_test("webpack serve", 4003, None).is_err());
     }
 
+    #[test]
+    fn build_args_default_base_is_full_proxy_path() {
+        // base 为空时默认 /proxy/{port}/ (HMR 依赖: base 必须是完整代理路径)
+        let d = build_args_test("vite", 4005, None).unwrap();
+        assert!(d.args.iter().any(|a| a == "--base"));
+        assert!(d.args.iter().any(|a| a == "/proxy/4005/"));
+    }
+
     fn build_args_test(
         script: &str,
         port: u16,
