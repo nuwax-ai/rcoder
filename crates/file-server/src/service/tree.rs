@@ -24,6 +24,8 @@ pub struct FileEntry {
     pub contents: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_proxy_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_link: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -62,6 +64,92 @@ pub async fn list_files(
     let mut files = Vec::new();
     traverse(root, root, config, proxy_path, &mut files).await?;
     Ok(files)
+}
+
+/// 轻量元信息遍历 (对齐 nuwax computer `traverseDirectory`): **不读文件内容**,
+/// 仅返回 `{name, isDir, fileProxyUrl, isLink}` (binary/sizeExceeded/contents 均省略)。
+/// 供 computer get-file-list 使用 (避免为列目录读取全部文件内容)。
+pub async fn list_files_meta(
+    root: &Path,
+    config: &Config,
+    proxy_path: Option<&str>,
+) -> AppResult<Vec<FileEntry>> {
+    let mut files = Vec::new();
+    traverse_meta(root, root, config, proxy_path, &mut files).await?;
+    Ok(files)
+}
+
+async fn traverse_meta(
+    root: &Path,
+    dir: &Path,
+    config: &Config,
+    proxy_path: Option<&str>,
+    out: &mut Vec<FileEntry>,
+) -> AppResult<()> {
+    let mut entries = fs::read_dir(dir).await?;
+    let mut items: Vec<(String, PathBuf, bool, bool)> = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 隐藏文件 (除 .gitignore) 跳过 (对齐 nuwax computer traverseDirectory)
+        if name.starts_with('.') && name != ".gitignore" {
+            continue;
+        }
+        let ft = entry.file_type().await?;
+        let path = entry.path();
+        let is_link = ft.is_symlink();
+        if ft.is_dir() {
+            if config.traverse_exclude_dirs.iter().any(|d| d == &name) {
+                continue;
+            }
+            items.push((name, path, true, is_link));
+        } else if ft.is_file() {
+            if config
+                .content_traverse_exclude_files
+                .iter()
+                .any(|f| f == &name)
+            {
+                continue;
+            }
+            items.push((name, path, false, is_link));
+        }
+    }
+    // 排序: 目录在前, 名字大小写不敏感 (对齐 nuwax localeCompare)
+    items.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
+
+    for (_name, path, is_dir, is_link) in items {
+        let relative = relative_path(root, &path);
+        if is_dir {
+            let mut sub = Vec::new();
+            Box::pin(traverse_meta(root, &path, config, proxy_path, &mut sub)).await?;
+            if sub.is_empty() {
+                out.push(FileEntry {
+                    name: relative,
+                    is_dir: true,
+                    binary: None,
+                    size_exceeded: None,
+                    contents: None,
+                    file_proxy_url: None,
+                    is_link: Some(is_link),
+                });
+            } else {
+                out.extend(sub);
+            }
+        } else {
+            out.push(FileEntry {
+                name: relative.to_string(),
+                is_dir: false,
+                binary: None,
+                size_exceeded: None,
+                contents: None,
+                file_proxy_url: proxy_path.map(|p| format!("{p}/{relative}")),
+                is_link: Some(is_link),
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn traverse(
@@ -117,6 +205,7 @@ async fn traverse(
                     size_exceeded: None,
                     contents: None,
                     file_proxy_url: None,
+                    is_link: None,
                 });
             } else {
                 out.extend(sub);
@@ -160,6 +249,7 @@ async fn build_file_entry(
         size_exceeded: Some(size_exceeded),
         contents,
         file_proxy_url: proxy_path.map(|p| format!("{p}/{relative}")),
+        is_link: None,
     })
 }
 

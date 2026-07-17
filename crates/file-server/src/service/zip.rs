@@ -59,6 +59,8 @@ pub struct PackOpts {
     pub skip_dot_segments: bool,
     /// 跳过硬链接 (nlink>1, 仅 downloadAllFiles)。
     pub skip_hardlinks: bool,
+    /// 每个 entry 名前缀 (downloadAllFiles 的 `${userId}_${cId}/` 顶层目录前缀)。
+    pub path_prefix: Option<String>,
 }
 
 /// 异步把 `src` 目录打包成 zip 到 `zip_path` (备份/export 用弱过滤: 仅排除名 + 符号链接;
@@ -77,6 +79,7 @@ pub async fn pack_dir(
             exclude_files,
             skip_dot_segments: false,
             skip_hardlinks: false,
+            path_prefix: None,
         },
     )
     .await
@@ -153,9 +156,14 @@ fn walk_and_add(
                 .unwrap_or_else(|_| Path::new(""))
                 .to_string_lossy()
                 .replace('\\', "/");
+            // entry 名加 path_prefix (downloadAllFiles 顶层目录前缀)
+            let entry_name = match &opts.path_prefix {
+                Some(p) => format!("{p}{rel}"),
+                None => rel,
+            };
             let opts_zip = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
-            zip.start_file(&rel, opts_zip)
+            zip.start_file(&entry_name, opts_zip)
                 .map_err(|e| AppError::file(format!("zip start_file failed: {e}")))?;
             let mut input = std::fs::File::open(&path)?;
             std::io::copy(&mut input, zip)?;
@@ -176,4 +184,71 @@ fn hardlinked(meta: &std::fs::Metadata) -> bool {
         let _ = meta;
         false
     }
+}
+
+/// 按 opts 过滤规则求目录下可下载文件总字节 (对齐 nuwax calculateDownloadableDirectorySize;
+/// dot-segment + 符号链接 + 硬链接 + 排除名)。同步 IO, 调用方宜 spawn_blocking。
+pub fn downloadable_size_blocking(src: &Path, opts: &PackOpts) -> u64 {
+    sum_sizes(src, opts)
+}
+
+fn sum_sizes(dir: &Path, opts: &PackOpts) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if opts.skip_dot_segments && name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            if opts.exclude_dirs.iter().any(|d| d == &name) {
+                continue;
+            }
+            total += sum_sizes(&path, opts);
+        } else if meta.is_file() {
+            if opts.exclude_files.iter().any(|f| f == &name) {
+                continue;
+            }
+            if opts.skip_hardlinks && hardlinked(&meta) {
+                continue;
+            }
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// 异步写一个仅含单个目录条目 `dir_entry_name/` 的空 zip (downloadAllFiles 空目录兜底)。
+pub async fn write_empty_zip(zip_path: PathBuf, dir_entry_name: String) -> AppResult<()> {
+    tokio::task::spawn_blocking(move || -> AppResult<()> {
+        if let Some(parent) = zip_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(&zip_path)
+            .map_err(|e| AppError::file(format!("create empty zip failed: {e}")))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let name = if dir_entry_name.ends_with('/') {
+            dir_entry_name
+        } else {
+            format!("{dir_entry_name}/")
+        };
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.add_directory(&name, opts)
+            .map_err(|e| AppError::file(format!("zip add_directory failed: {e}")))?;
+        zip.finish()
+            .map_err(|e| AppError::file(format!("zip finish failed: {e}")))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::system(format!("empty zip task join error: {e}")))??;
+    Ok(())
 }
