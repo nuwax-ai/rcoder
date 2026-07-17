@@ -69,6 +69,23 @@ async fn bytes_field(field: axum::extract::multipart::Field<'_>) -> Result<Vec<u
         .map_err(|e| AppError::validation(format!("read multipart file: {e}")))
 }
 
+/// `.zip` 扩展名校验 (对齐 nuwax multer fileFilter: 仅允许 zip)。
+fn validate_zip_ext(filename: Option<&str>) -> Result<(), AppError> {
+    let ext = filename
+        .and_then(|n| {
+            std::path::Path::new(n)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase())
+        })
+        .unwrap_or_default();
+    if ext == "zip" {
+        Ok(())
+    } else {
+        Err(AppError::validation("Only zip files are supported"))
+    }
+}
+
 // ── get-project-content ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -166,10 +183,10 @@ async fn delete_project(
     let result = project_service::delete_project(&*state.resolver, &state.config, &ctx).await?;
 
     let message = if result.failed.is_empty() {
-        "Project deleted successfully".to_string()
+        format!("Project {project_id} deleted successfully")
     } else {
         format!(
-            "Project deleted, but {} directories deleted failed",
+            "Project {project_id} deleted, but {} directories deleted failed",
             result.failed.len()
         )
     };
@@ -215,7 +232,7 @@ async fn create_project(
             .await?;
     Ok(Json(json!({
         "success": true,
-        "message": "Project created successfully",
+        "message": format!("Project {project_id} created successfully"),
         "projectPath": result.project_path,
     })))
 }
@@ -278,7 +295,10 @@ async fn copy_project(
             .await?;
     Ok(Json(json!({
         "success": true,
-        "message": "Project copied successfully",
+        "message": format!(
+            "Project {} successfully copied to {}",
+            result.source_project_id, result.target_project_id
+        ),
         "sourceProjectId": result.source_project_id,
         "targetProjectId": result.target_project_id,
         "targetProjectPath": result.target_project_path,
@@ -579,6 +599,7 @@ async fn upload_project(
     let mut project_id = None;
     let mut code_version = None;
     let mut data: Option<Vec<u8>> = None;
+    let mut file_name = None;
     let mut pid = None;
     let mut tenant = None;
     let mut space = None;
@@ -592,7 +613,10 @@ async fn upload_project(
         match name.as_str() {
             "projectId" => project_id = Some(text_field(field).await?),
             "codeVersion" => code_version = Some(text_field(field).await?),
-            "file" => data = Some(bytes_field(field).await?),
+            "file" => {
+                file_name = field.file_name().map(|s| s.to_string());
+                data = Some(bytes_field(field).await?);
+            }
             "pid" => pid = text_field(field).await.ok(),
             "tenantId" => tenant = Some(text_field(field).await?),
             "spaceId" => space = Some(text_field(field).await?),
@@ -604,6 +628,14 @@ async fn upload_project(
     let code_version =
         code_version.ok_or_else(|| AppError::validation("codeVersion is required"))?;
     let data = data.ok_or_else(|| AppError::validation("Please upload a zip file"))?;
+    // 扩展名 (仅 zip) + 大小上限校验 (对齐 nuwax multer fileFilter/limits)
+    validate_zip_ext(file_name.as_deref())?;
+    if data.len() as u64 > state.config.upload_max_file_size_bytes {
+        return Err(AppError::validation(format!(
+            "File size exceeds limit (max {} bytes)",
+            state.config.upload_max_file_size_bytes
+        )));
+    }
     // 停旧版 dev server (对齐 nuwax: pid 可用时 stopDevServer, 失败不阻塞)
     if let Some(p) = pid.as_deref().and_then(|s| s.trim().parse::<u32>().ok()) {
         tracing::debug!(project_id = %project_id, pid = p, "upload-project: stop old dev server");
@@ -615,7 +647,7 @@ async fn upload_project(
             .await?;
     Ok(Json(json!({
         "success": true,
-        "message": "Project uploaded successfully",
+        "message": format!("Project {} uploaded successfully", result.project_id),
         "projectId": result.project_id,
         "codeVersion": result.code_version,
     })))

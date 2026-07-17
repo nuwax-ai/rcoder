@@ -48,11 +48,45 @@ pub async fn backup_project(
     Ok(Some(zip_path))
 }
 
-/// 从版本 zip 恢复 (清空项目目录 + 解压覆盖, 对齐 nuwax `restoreProjectFromZip`)。
-pub async fn restore_from_zip(project_path: &Path, zip_path: &Path) -> AppResult<()> {
-    fs::remove_dir_all(project_path).await?;
-    fs::create_dir_all(project_path).await?;
+/// 从版本 zip 恢复 (对齐 nuwax `restoreProjectFromZip`): 清空项目目录但**保留** excluded
+/// 目录 (TRAVERSE_EXCLUDE_DIRS, 如 node_modules/.git) 与 excluded 文件
+/// (BACKUP_TRAVERSE_EXCLUDE_FILES, 如 lock 文件), 再解压 zip 覆盖。
+/// (版本 zip 本身不含这些条目, 故保留它们可避免 rollback 后重装依赖。)
+pub async fn restore_from_zip(
+    project_path: &Path,
+    zip_path: &Path,
+    exclude_dirs: &[String],
+    exclude_files: &[String],
+) -> AppResult<()> {
+    clear_dir_keep_excluded(project_path, exclude_dirs, exclude_files).await?;
     crate::service::zip::extract_to(zip_path.to_path_buf(), project_path.to_path_buf()).await
+}
+
+/// 清空目录内容, 但保留名字命中 exclude_dirs (目录) / exclude_files (文件) 的顶层条目
+/// (对齐 nuwax restoreProjectFromZip 的 "keep excluded" 清理)。个别删除失败忽略。
+async fn clear_dir_keep_excluded(
+    dir: &Path,
+    exclude_dirs: &[String],
+    exclude_files: &[String],
+) -> AppResult<()> {
+    let mut rd = fs::read_dir(dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let ft = entry.file_type().await?;
+        if ft.is_dir() && exclude_dirs.iter().any(|d| d == &name) {
+            continue;
+        }
+        if ft.is_file() && exclude_files.iter().any(|f| f == &name) {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if ft.is_dir() {
+            fs::remove_dir_all(&path).await
+        } else {
+            fs::remove_file(&path).await
+        };
+    }
+    Ok(())
 }
 
 // ── backup-current-version ──────────────────────────────────────────────────────
@@ -122,12 +156,32 @@ pub async fn rollback_version(
             "Rollback version v{to} zip not found"
         )));
     }
-    // 当前版本若未备份, 先备份
+    // 当前版本若未备份, 先备份 (避免覆盖已有备份)
     let cur_zip = version_zip_path(config, project_id, cur);
     if !fs::try_exists(&cur_zip).await.unwrap_or(false) {
         backup_project(config, project_id, &project_path, code_version).await?;
     }
-    restore_from_zip(&project_path, &target_zip).await?;
+    // 从目标版本恢复; 失败则尝试从刚才备份的当前版本恢复 (对齐 nuwax rollbackVersion catch)
+    if let Err(e) = restore_from_zip(
+        &project_path,
+        &target_zip,
+        &config.traverse_exclude_dirs,
+        &config.backup_traverse_exclude_files,
+    )
+    .await
+    {
+        if fs::try_exists(&cur_zip).await.unwrap_or(false) {
+            tracing::warn!(error = %e, "rollback restore failed, restoring current version backup");
+            let _ = restore_from_zip(
+                &project_path,
+                &cur_zip,
+                &config.traverse_exclude_dirs,
+                &config.backup_traverse_exclude_files,
+            )
+            .await;
+        }
+        return Err(e);
+    }
     Ok(RollbackResult {
         new_version: cur,
         rollback_to: to,
@@ -175,4 +229,53 @@ pub async fn get_content_by_version(
         files.retain(|f| f.name != "cpage_config.json");
     }
     files_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn clear_dir_keep_excluded_preserves_excluded_entries() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("fs_ver_{nanos}"));
+        tokio::fs::create_dir_all(dir.join("node_modules"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.join("src")).await.unwrap();
+        tokio::fs::create_dir_all(dir.join(".git")).await.unwrap();
+        tokio::fs::write(dir.join("src/app.js"), "x").await.unwrap();
+        tokio::fs::write(dir.join("package-lock.yaml"), "x")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("README.md"), "x").await.unwrap();
+
+        clear_dir_keep_excluded(
+            &dir,
+            &["node_modules".into(), ".git".into()],
+            &["package-lock.yaml".into()],
+        )
+        .await
+        .unwrap();
+
+        // excluded 保留 (node_modules / .git 目录 + lock 文件)
+        assert!(dir.join("node_modules").exists());
+        assert!(dir.join(".git").exists());
+        assert!(dir.join("package-lock.yaml").exists());
+        // 非 excluded 删除
+        assert!(!dir.join("src").exists());
+        assert!(!dir.join("README.md").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn parse_version_validates_number() {
+        assert!(parse_version("abc").is_err());
+        assert_eq!(parse_version("12").unwrap(), 12);
+        assert_eq!(parse_version(" 3 ").unwrap(), 3);
+    }
 }

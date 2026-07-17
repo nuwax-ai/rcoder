@@ -120,9 +120,19 @@ pub async fn create_project(
     }
 
     // TODO(Task 1.4): copyNodeModulesFromCache (模板缓存加速)
-    // TODO(Task 1.3): GIT_ENABLED → git init + commit
     // npmrc 写失败不致命
     let _ = crate::service::fs_util::write_npmrc(&project_path).await;
+    // GIT_ENABLED → git init + commit("init project: {id}") (对齐 nuwax createProject)
+    if config.git_enabled
+        && let Err(e) = crate::service::git::init_and_commit(
+            &project_path,
+            &format!("init project: {project_id}"),
+            &config.git_default_author_name,
+            &config.git_default_author_email,
+        )
+    {
+        tracing::warn!(error = %e, "git init/commit after create failed (skipping)");
+    }
 
     Ok(CreateResult {
         project_path: project_path.to_string_lossy().to_string(),
@@ -174,7 +184,17 @@ pub async fn copy_project(
         return Err(e);
     }
     let _ = crate::service::fs_util::write_npmrc(&target_path).await;
-    // TODO(Task 1.3): GIT init + commit
+    // GIT_ENABLED → git init + commit("copy project: {src} -> {tgt}") (对齐 nuwax copyProject)
+    if config.git_enabled
+        && let Err(e) = crate::service::git::init_and_commit(
+            &target_path,
+            &format!("copy project: {source_id} -> {target_id}"),
+            &config.git_default_author_name,
+            &config.git_default_author_email,
+        )
+    {
+        tracing::warn!(error = %e, "git init/commit after copy failed (skipping)");
+    }
 
     Ok(CopyResult {
         source_project_id: source_id.to_string(),
@@ -204,7 +224,12 @@ pub struct UploadProjectResult {
     pub code_version: String,
 }
 
-/// 上传项目 zip: 存到 version zip + 清空项目目录 + 解压覆盖 (对齐 nuwax uploadProject, 简化)。
+/// 上传项目 zip 部署 (对齐 nuwax uploadProject):
+/// 1. 项目目录非空 → 备份当前到 `v{version-1}.zip` (该版本 zip 不存在且非 GIT 模式时),
+///    再清空项目目录; (空目录则直接部署, 不备份。)
+/// 2. 解压上传 zip 到项目目录 (上传 zip **不**存为版本 zip)。
+/// 3. 单顶层目录上提 + 移除 node_modules + 写 .npmrc。
+/// 4. GIT_ENABLED → git init + commit(`upload project v{version}`)。
 pub async fn upload_project(
     resolver: &dyn WorkspaceResolver,
     config: &Config,
@@ -222,26 +247,80 @@ pub async fn upload_project(
     let version = crate::service::version::parse_version(code_version)?;
     let project_path = resolver.resolve_project(ctx);
 
-    // 存上传 zip 到版本 zip
-    let zip_path = crate::service::version::version_zip_path(config, project_id, version);
-    if let Some(parent) = zip_path.parent() {
-        fs::create_dir_all(parent).await?;
+    // 1. 非空 → 备份当前为 v{version-1} (若无) + 清空
+    if project_dir_nonempty(&project_path).await {
+        if version >= 1 && !config.git_enabled {
+            let prev_zip =
+                crate::service::version::version_zip_path(config, project_id, version - 1);
+            if !try_exists(&prev_zip).await {
+                if let Some(parent) = prev_zip.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                crate::service::zip::pack_dir(
+                    project_path.clone(),
+                    prev_zip,
+                    config.traverse_exclude_dirs.clone(),
+                    config.backup_traverse_exclude_files.clone(),
+                )
+                .await?;
+            }
+        }
+        let _ = fs::remove_dir_all(&project_path).await;
     }
-    fs::write(&zip_path, &zip_data).await?;
 
-    // 清空项目目录 + 解压覆盖
-    let _ = fs::remove_dir_all(&project_path).await;
+    // 2. 解压上传 zip (写临时 zip → 解压 → 删临时)
     fs::create_dir_all(&project_path).await?;
-    crate::service::zip::extract_to(zip_path, project_path.clone()).await?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("upload-{project_id}-{version}-{nanos}.zip"));
+    fs::write(&tmp, &zip_data).await?;
+    let extract_r = crate::service::zip::extract_to(tmp.clone(), project_path.clone()).await;
+    let _ = fs::remove_file(&tmp).await;
+    extract_r?;
 
-    // 后处理 (对齐 nuwax uploadProject): 单顶层目录上提 + 写 .npmrc
+    // 3. 单顶层目录上提 + 移除 node_modules + .npmrc
     crate::service::computer_ws::remove_top_level_dir(&project_path, &["__MACOSX"]).await;
+    remove_node_modules(&project_path).await;
     let _ = crate::service::fs_util::write_npmrc(&project_path).await;
+
+    // 4. GIT_ENABLED → init + commit
+    if config.git_enabled
+        && let Err(e) = crate::service::git::init_and_commit(
+            &project_path,
+            &format!("upload project v{version}"),
+            &config.git_default_author_name,
+            &config.git_default_author_email,
+        )
+    {
+        tracing::warn!(error = %e, "git init/commit after upload failed (skipping)");
+    }
 
     Ok(UploadProjectResult {
         project_id: project_id.to_string(),
         code_version: code_version.to_string(),
     })
+}
+
+/// 移除项目下的 node_modules (对齐 nuwax removeNodeModules): 存在则删;
+/// 符号链接只删链接本身 (保留目标作缓存), 普通目录递归删。不存在则 no-op。
+async fn remove_node_modules(project_path: &Path) {
+    let nm = project_path.join("node_modules");
+    // symlink_metadata 探测真实类型 (不跟随 symlink)
+    let Ok(meta) = fs::symlink_metadata(&nm).await else {
+        return;
+    };
+    let r = if meta.file_type().is_symlink() {
+        fs::remove_file(&nm).await
+    } else if meta.is_dir() {
+        fs::remove_dir_all(&nm).await
+    } else {
+        Ok(())
+    };
+    if let Err(e) = r {
+        tracing::warn!(error = %e, "remove node_modules failed");
+    }
 }
 
 // ── export-project (zip 文件流) ─────────────────────────────────────────────────
@@ -266,7 +345,18 @@ pub async fn export_project(
         return Err(AppError::resource("Project does not exist"));
     }
     let zip_path = crate::service::version::version_zip_path(config, project_id, version);
-    // 可选写 cpage_config.json (打包后删除)
+    // 非 LATEST: 用现成历史 zip; 不存在则 404 (不重打, 对齐 nuwax exportProject)。
+    // LATEST: 写 cpage_config.json (可选) → 重打 → 删除 cpage_config.json。
+    if export_type != Some("LATEST") {
+        if !fs::try_exists(&zip_path).await.unwrap_or(false) {
+            return Err(AppError::resource(format!(
+                "Specified version zip file does not exist: {}",
+                zip_path.display()
+            )));
+        }
+        return Ok(zip_path);
+    }
+    // LATEST 重打: 写 cpage_config.json (打包后删除, 避免污染项目目录)
     let config_path = project_path.join("cpage_config.json");
     let config_written = if let Some(cfg) = cpage_config {
         fs::write(&config_path, serde_json::to_vec(cfg).unwrap_or_default())
@@ -276,19 +366,13 @@ pub async fn export_project(
     } else {
         None
     };
-    let need_repack =
-        export_type == Some("LATEST") || !fs::try_exists(&zip_path).await.unwrap_or(false);
-    let repack_result = if need_repack {
-        crate::service::zip::pack_dir(
-            project_path.clone(),
-            zip_path.clone(),
-            config.traverse_exclude_dirs.clone(),
-            config.backup_traverse_exclude_files.clone(),
-        )
-        .await
-    } else {
-        Ok(())
-    };
+    let repack_result = crate::service::zip::pack_dir(
+        project_path.clone(),
+        zip_path.clone(),
+        config.traverse_exclude_dirs.clone(),
+        config.backup_traverse_exclude_files.clone(),
+    )
+    .await;
     if let Some(p) = &config_written {
         let _ = fs::remove_file(p).await;
     }

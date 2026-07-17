@@ -156,6 +156,24 @@ pub fn init_repo(path: &Path, author_name: &str, author_email: &str) -> AppResul
     Ok(already)
 }
 
+/// 初始化 (幂等) + stage 全部变更 + 提交 (对齐 nuwax gitService.init + commit 组合,
+/// 用于 createProject/copyProject/uploadProject 在 GIT_ENABLED 下首次落地工作区)。
+/// 与 [`init_repo`] 区别: 总是 stage all + 用自定义 message 提交 (非 "Initial commit")。
+pub fn init_and_commit(
+    path: &Path,
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+) -> AppResult<()> {
+    let repo = super::ensure_repo(path)?;
+    super::ensure_gitignore(path)?;
+    // stage 全部变更 (addAll: modified + untracked + deleted)
+    stage_files(&repo, &[])?;
+    // 提交 (无变更也会产生提交, 与 nuwax 一致; commit 失败 best-effort 不阻断业务)
+    let _ = commit_indexed(&repo, message, author_name, author_email);
+    Ok(())
+}
+
 /// unstage (对齐 nuwax unstage): files 空 → unstage 全部 staged; 否则逐个从 index 移除。
 pub fn unstage_files(repo: &gix::Repository, files: &[String]) -> AppResult<()> {
     let mut index = repo
