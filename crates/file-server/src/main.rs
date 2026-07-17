@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         .nest("/api/git", file_server::routes::git_router())
         .nest("/api/build", file_server::routes::build_router())
         .nest("/api/computer", file_server::routes::computer_router())
+        .nest("/api/page", file_server::routes::page_router())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

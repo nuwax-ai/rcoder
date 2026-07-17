@@ -63,7 +63,7 @@ axum = { version = "0.8", features = [
     "macros",
 ] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["cors", "trace", "set-header"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "set-header", "fs"] }
 hyper = { version = "1.8", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 tonic = { version = "0.14.6", features = ["tls-native-roots"] }

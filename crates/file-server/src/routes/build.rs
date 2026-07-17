@@ -26,6 +26,8 @@ pub fn router() -> Router<AppState> {
         .route("/get-dev-log", get(get_dev_log))
         .route("/build", get(build_project))
         .route("/parse-build-error", axum::routing::post(parse_build_error))
+        .route("/get-log-cache-stats", get(get_log_cache_stats))
+        .route("/clear-all-log-cache", get(clear_all_log_cache))
 }
 
 #[derive(Deserialize)]
@@ -386,4 +388,32 @@ async fn parse_build_error(
 ) -> Result<Json<Value>, AppError> {
     let msg = crate::service::build_error::parse(&body.error_message);
     Ok(Json(json!({ "success": true, "message": msg })))
+}
+
+// ── 日志缓存接口 (对齐 nuwax logCacheManager; Rust 无缓存层, 返回固定 stats) ────
+
+/// `GET /api/build/get-log-cache-stats` (对齐 nuwax; Rust 无缓存层 → 返回 disabled 形态)。
+async fn get_log_cache_stats(State(_state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "success": true,
+        "message": "Get log cache statistics successfully",
+        "stats": {
+            "enabled": false,
+            "cacheSize": 0,
+            "maxCacheEntries": 100,
+            "cacheDuration": 300000,
+            "maxFileSizeMB": "0.00",
+            "totalCacheSizeMB": "0.00",
+            "NODE_ENV": std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string()),
+            "LOG_CACHE_ENABLED": std::env::var("LOG_CACHE_ENABLED").unwrap_or_else(|_| "false".to_string()),
+        }
+    }))
+}
+
+/// `GET /api/build/clear-all-log-cache` (对齐 nuwax; Rust 无缓存层 → no-op)。
+async fn clear_all_log_cache(State(_state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "success": true,
+        "message": "All log caches have been cleared",
+    }))
 }

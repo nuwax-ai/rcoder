@@ -4,6 +4,7 @@ pub mod build;
 pub mod computer;
 pub mod git;
 pub mod project;
+pub mod static_files;
 
 use axum::Router;
 
@@ -24,7 +25,12 @@ pub fn build_router() -> Router<AppState> {
     build::router()
 }
 
-/// `/api/computer` 路由 (对齐 nuwax computerRoutes)。
+/// `/api/computer` 路由 (对齐 nuwax computerRoutes; 含 static 子路由)。
 pub fn computer_router() -> Router<AppState> {
-    computer::router()
+    computer::router().merge(static_files::computer_static_route())
+}
+
+/// `/api/page` 路由 (对齐 nuwax server.js 顶层 `/api/page/static`)。
+pub fn page_router() -> Router<AppState> {
+    static_files::page_router()
 }
