@@ -201,9 +201,19 @@ pub async fn specified_files_update(
     }
     version::backup_project(config, project_id, &project_path, code_version).await?;
 
+    apply_file_ops(&project_path, files).await?;
+    Ok(SpecifiedResult {
+        project_id: project_id.to_string(),
+        files_count: files.len(),
+    })
+}
+
+/// 文件操作核心 (path 制, 无版本备份): create/delete/rename/modify, 路径防穿越。
+/// project 路由 (specified_files_update) 与 computer 路由共用此核心。
+pub async fn apply_file_ops(base: &Path, files: &[FileOp]) -> AppResult<()> {
     for op in files {
         let op_l = op.operation.to_lowercase();
-        let Some(target) = safe_within_or_skip(&project_path, &op.name) else {
+        let Some(target) = safe_within_or_skip(base, &op.name) else {
             tracing::warn!(path = %op.name, "unsafe path, skipping");
             continue;
         };
@@ -213,10 +223,10 @@ pub async fn specified_files_update(
                     if !fs::try_exists(&target).await.unwrap_or(false) {
                         fs::create_dir_all(&target).await?;
                     }
+                } else if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).await?;
+                    fs::write(&target, op.contents.as_deref().unwrap_or("")).await?;
                 } else {
-                    if let Some(parent) = target.parent() {
-                        fs::create_dir_all(parent).await?;
-                    }
                     fs::write(&target, op.contents.as_deref().unwrap_or("")).await?;
                 }
             }
@@ -237,7 +247,7 @@ pub async fn specified_files_update(
                 let Some(from) = op.rename_from.as_deref() else {
                     continue;
                 };
-                let Some(old) = safe_within_or_skip(&project_path, from) else {
+                let Some(old) = safe_within_or_skip(base, from) else {
                     tracing::warn!(path = %from, "unsafe rename source, skipping");
                     continue;
                 };
@@ -263,10 +273,7 @@ pub async fn specified_files_update(
             _ => {}
         }
     }
-    Ok(SpecifiedResult {
-        project_id: project_id.to_string(),
-        files_count: files.len(),
-    })
+    Ok(())
 }
 
 // ── allFilesUpdate ──────────────────────────────────────────────────────────────
@@ -295,8 +302,17 @@ pub async fn all_files_update(
     }
     version::backup_project(config, project_id, &project_path, code_version).await?;
 
+    apply_all_files(&project_path, config, files).await?;
+    Ok(AllResult {
+        project_id: project_id.to_string(),
+    })
+}
+
+/// 全量覆盖核心 (path 制, 无版本备份): is_dir/rename/binary/text + prune 缺失 + 重建空目录。
+/// project 路由 (all_files_update) 与 computer 路由共用。
+pub async fn apply_all_files(base: &Path, config: &Config, files: &[FileEntry]) -> AppResult<()> {
     for file in files {
-        let Some(target) = safe_within_or_skip(&project_path, &file.name) else {
+        let Some(target) = safe_within_or_skip(base, &file.name) else {
             tracing::warn!(path = %file.name, "unsafe path, skipping");
             continue;
         };
@@ -309,7 +325,7 @@ pub async fn all_files_update(
         }
         // (B) rename
         if let Some(from) = file.rename_from.as_deref()
-            && let Some(old) = safe_within_or_skip(&project_path, from)
+            && let Some(old) = safe_within_or_skip(base, from)
             && fs::try_exists(&old).await.unwrap_or(false)
         {
             if let Some(parent) = target.parent() {
@@ -364,7 +380,7 @@ pub async fn all_files_update(
         .map(|f| normalize_relative(&f.name))
         .collect();
     prune_missing_files(
-        &project_path,
+        base,
         &keep_set,
         &config.traverse_exclude_dirs,
         &config.content_traverse_exclude_files,
@@ -373,15 +389,13 @@ pub async fn all_files_update(
     // 重建前端提交的空目录 (prune 只删文件)
     for file in files {
         if file.is_dir == Some(true) {
-            let dir_path = project_path.join(normalize_relative(&file.name));
+            let dir_path = base.join(normalize_relative(&file.name));
             if !fs::try_exists(&dir_path).await.unwrap_or(false) {
                 let _ = fs::create_dir_all(&dir_path).await;
             }
         }
     }
-    Ok(AllResult {
-        project_id: project_id.to_string(),
-    })
+    Ok(())
 }
 
 // ── pruneMissingFiles ───────────────────────────────────────────────────────────

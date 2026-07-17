@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::{AppError, AppResult};
-use crate::service::{tree, zip};
+use crate::service::{code as code_service, tree, zip};
 use crate::workspace::ComputerContext;
 use crate::AppState;
 
@@ -29,6 +29,8 @@ pub fn router() -> Router<AppState> {
         .route("/install-project", post(install_project))
         .route("/zip-workspace", post(zip_workspace))
         .route("/download-all-files", get(download_all_files))
+        .route("/files-update", post(files_update))
+        .route("/all-files-update", post(all_files_update))
 }
 
 fn ws_path(state: &AppState, user_id: &str, cid: &str) -> PathBuf {
@@ -432,6 +434,79 @@ async fn download_all_files(
     pack_workspace(&state, &q.user_id, &q.c_id, vec![]).await
 }
 
-// 下批实现 (依赖 resolver+ctx 改造): files-update / upload-file / upload-files /
+// ── files-update / all-files-update (复用 code_service path 制核心, 无 zip 版本备份) ──
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FilesUpdateBody {
+    user_id: String,
+    c_id: String,
+    files: Vec<code_service::FileOp>,
+}
+
+/// `POST /api/computer/files-update` (对齐 nuwax computer updateFiles; 增量 create/delete/rename/modify)。
+async fn files_update(
+    State(state): State<AppState>,
+    Json(mut body): Json<FilesUpdateBody>,
+) -> Result<Json<Value>, AppError> {
+    let path = ws_path(&state, &body.user_id, &body.c_id);
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Err(AppError::resource("workspace does not exist"));
+    }
+    // decodeURIComponent 文本内容 (对齐 nuwax safeDecodePath)
+    for op in body.files.iter_mut() {
+        if let Some(c) = op.contents.as_mut()
+            && !c.is_empty()
+        {
+            *c = code_service::decode_uri_component(c);
+        }
+    }
+    let count = body.files.len();
+    code_service::apply_file_ops(&path, &body.files).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Files updated successfully",
+        "filesCount": count,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AllFilesUpdateBody {
+    user_id: String,
+    c_id: String,
+    files: Vec<code_service::FileEntry>,
+}
+
+/// `POST /api/computer/all-files-update` (全量覆盖 + 清理缺失)。
+async fn all_files_update(
+    State(state): State<AppState>,
+    Json(mut body): Json<AllFilesUpdateBody>,
+) -> Result<Json<Value>, AppError> {
+    let path = ws_path(&state, &body.user_id, &body.c_id);
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Err(AppError::resource("workspace does not exist"));
+    }
+    // decodeURIComponent: 仅文本 (binary base64 跳过)
+    for f in body.files.iter_mut() {
+        if f.binary == Some(true) {
+            continue;
+        }
+        if let Some(c) = f.contents.as_mut()
+            && !c.is_empty()
+        {
+            *c = code_service::decode_uri_component(c);
+        }
+    }
+    let count = body.files.len();
+    code_service::apply_all_files(&path, &state.config, &body.files).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "All files updated successfully",
+        "filesCount": count,
+    })))
+}
+
+// 下批实现 (依赖 resolver+ctx 改造或复杂逻辑): upload-file / upload-files /
 // import-project / create-workspace[-v2] / push-skills-to-workspace[-v2] /
 // init-project-template / build-agent-package / cleanup-build-artifacts
