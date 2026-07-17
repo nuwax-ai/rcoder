@@ -142,7 +142,7 @@ async fn serve_from_root(root: &Path, rest: &str, cors: &CorsConfig, req: Reques
     let serve = ServeFile::new(full);
     match serve.oneshot(req).await {
         Ok(resp) => add_cors_headers(resp.into_response(), origin.as_deref(), cors),
-        Err(_) => cors_404_static(cors),
+        Err(_) => cors_404_static(origin.as_deref(), cors),
     }
 }
 
@@ -198,10 +198,10 @@ fn cors_404(req: &Request, cors: &CorsConfig) -> Response {
     )
 }
 
-fn cors_404_static(cors: &CorsConfig) -> Response {
+fn cors_404_static(origin: Option<&str>, cors: &CorsConfig) -> Response {
     add_cors_headers(
         (StatusCode::NOT_FOUND, "Not Found").into_response(),
-        None,
+        origin,
         cors,
     )
 }

@@ -106,10 +106,53 @@ impl AppError {
     }
 }
 
-/// 当前 CST(UTC+8) RFC3339 时间字符串 (对齐 nuwax errorHandler timestamp)。
-fn now_cst_rfc3339() -> String {
+/// 当前 CST(UTC+8) 时间字符串 `YYYY/MM/DD HH:MM:SS` (对齐 nuwax getCSTTimestampString)。
+fn now_cst_timestamp() -> String {
     let cst = chrono::Utc::now() + chrono::Duration::hours(8);
-    cst.format("%Y-%m-%dT%H:%M:%S%.3f+08:00").to_string()
+    cst.format("%Y/%m/%d %H:%M:%S").to_string()
+}
+
+// ── 请求级 requestId (task_local, 由请求中间件 scope 注入; error 响应体回填) ──────
+
+tokio::task_local! {
+    /// 当前请求的 requestId (对齐 nuwax req.requestId); 未在请求上下文内 → 回退 "unknown"。
+    pub static REQUEST_ID: String;
+}
+
+/// 取当前请求 requestId (task_local 未设置时回退 "unknown")。
+pub fn current_request_id() -> String {
+    REQUEST_ID
+        .try_with(|v| v.clone())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// 生成 requestId (对齐 nuwax generateRequestId: 短 base36 串; 无 rand 依赖,
+/// 用 纳秒 ^ 原子计数器 ^ pid 混合保证单进程内唯一, 供日志/响应关联)。
+pub fn generate_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = nanos ^ (n << 12) ^ (std::process::id() as u64).wrapping_mul(2654435761);
+    base36(mixed)
+}
+
+/// u64 → base36 字符串。
+fn base36(mut n: u64) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut s: Vec<u8> = Vec::new();
+    while n > 0 {
+        s.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    s.reverse();
+    String::from_utf8(s).unwrap_or_else(|_| "0".to_string())
 }
 
 impl std::fmt::Display for AppError {
@@ -126,23 +169,72 @@ impl IntoResponse for AppError {
         let mut error = json!({
             "type": typ,
             "message": message,
-            "timestamp": now_cst_rfc3339(),
-            // TODO: 由请求中间件注入 X-Request-Id 并回填
-            "requestId": "unknown",
+            "timestamp": now_cst_timestamp(),
+            "requestId": current_request_id(),
         });
         if let Some(d) = self.details() {
             error["details"] = d.clone();
         }
-        let body = json!({ "success": false, "code": typ, "error": error });
+        // code 恒 "UNKNOWN_ERROR" (对齐 nuwax: AppError 不设 code, formatErrorResponse
+        // 兜底 UNKNOWN_ERROR; 具体类型在 error.type)。
+        let body = json!({ "success": false, "code": "UNKNOWN_ERROR", "error": error });
         (status, Json(body)).into_response()
     }
 }
 
-/// `?` 传播: io 错误 → SystemError。
+/// `?` 传播: io 错误按 kind 细分 (对齐 nuwax classifyIoError:
+/// NotFound→RESOURCE(404), PermissionDenied→PERMISSION(403),
+/// ConnectionRefused→NETWORK(502), 其余→SYSTEM(500))。
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
-        AppError::System(format!("io error: {e}"))
+        match e.kind() {
+            std::io::ErrorKind::NotFound => AppError::Resource(format!("io error: {e}")),
+            std::io::ErrorKind::PermissionDenied => AppError::Permission(format!("io error: {e}")),
+            std::io::ErrorKind::ConnectionRefused => AppError::Network(format!("io error: {e}")),
+            _ => AppError::System(format!("io error: {e}")),
+        }
     }
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_error_classifies_by_kind() {
+        match AppError::from(std::io::Error::from(std::io::ErrorKind::NotFound)) {
+            AppError::Resource(_) => {}
+            other => panic!("expected Resource, got {other:?}"),
+        }
+        match AppError::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)) {
+            AppError::Permission(_) => {}
+            other => panic!("expected Permission, got {other:?}"),
+        }
+        match AppError::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)) {
+            AppError::Network(_) => {}
+            other => panic!("expected Network, got {other:?}"),
+        }
+        match AppError::from(std::io::Error::from(std::io::ErrorKind::AlreadyExists)) {
+            AppError::System(_) => {}
+            other => panic!("expected System, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generate_request_id_is_base36_and_unique() {
+        let a = generate_request_id();
+        let b = generate_request_id();
+        assert!(!a.is_empty());
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+        // 连续两次应不同 (计数器递增)
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn current_request_id_fallback_without_scope() {
+        // task_local 未 scope 时回退 "unknown"
+        assert_eq!(current_request_id(), "unknown");
+    }
+}

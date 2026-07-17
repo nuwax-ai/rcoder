@@ -242,16 +242,12 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!("fs_ver_{nanos}"));
-        tokio::fs::create_dir_all(dir.join("node_modules"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(dir.join("src")).await.unwrap();
-        tokio::fs::create_dir_all(dir.join(".git")).await.unwrap();
-        tokio::fs::write(dir.join("src/app.js"), "x").await.unwrap();
-        tokio::fs::write(dir.join("package-lock.yaml"), "x")
-            .await
-            .unwrap();
-        tokio::fs::write(dir.join("README.md"), "x").await.unwrap();
+        fs::create_dir_all(dir.join("node_modules")).await.unwrap();
+        fs::create_dir_all(dir.join("src")).await.unwrap();
+        fs::create_dir_all(dir.join(".git")).await.unwrap();
+        fs::write(dir.join("src/app.js"), "x").await.unwrap();
+        fs::write(dir.join("package-lock.yaml"), "x").await.unwrap();
+        fs::write(dir.join("README.md"), "x").await.unwrap();
 
         clear_dir_keep_excluded(
             &dir,
@@ -269,7 +265,7 @@ mod tests {
         assert!(!dir.join("src").exists());
         assert!(!dir.join("README.md").exists());
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let _ = fs::remove_dir_all(&dir).await;
     }
 
     #[test]

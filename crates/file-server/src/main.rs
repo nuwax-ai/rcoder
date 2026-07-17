@@ -2,7 +2,12 @@
 
 use std::sync::Arc;
 
+use axum::extract::Request;
+use axum::http::HeaderValue;
+use axum::middleware::{Next, from_fn};
+use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
+use file_server::error::{AppError, REQUEST_ID, generate_request_id};
 use file_server::{AppState, Config, DevServerManager, LocalWorkspaceResolver, handler};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -42,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
         .nest("/api/build", file_server::routes::build_router())
         .nest("/api/computer", file_server::routes::computer_router())
         .nest("/api/page", file_server::routes::page_router())
+        // 未匹配路由 → JSON ResourceError (对齐 nuwax notFoundHandler)
+        .fallback(not_found)
+        .layer(from_fn(request_id_layer))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -53,6 +61,25 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal(dev_server))
         .await?;
     Ok(())
+}
+
+/// 请求中间件: 生成 requestId → task_local scope 注入 (error 响应体回填) +
+/// 响应头 `X-Request-Id` (对齐 nuwax req.requestId + 日志关联)。
+async fn request_id_layer(req: Request, next: Next) -> Response {
+    let id = generate_request_id();
+    let resp = REQUEST_ID.scope(id.clone(), next.run(req)).await;
+    let mut resp = resp;
+    if let Ok(v) = HeaderValue::from_str(&id) {
+        resp.headers_mut().insert("x-request-id", v);
+    }
+    resp
+}
+
+/// 未匹配路由兜底 (对齐 nuwax notFoundHandler): JSON ResourceError
+/// `{success:false, code:"UNKNOWN_ERROR", error:{type:"RESOURCE_ERROR", message:"Path not found: {path}", ...}}`。
+async fn not_found(req: Request) -> Response {
+    let path = req.uri().path().to_string();
+    AppError::resource(format!("Path not found: {path}")).into_response()
 }
 
 /// 接收 SIGINT / SIGTERM → 优雅停止所有 dev server (SIGTERM→等→SIGKILL + 还端口 + 清日志)。
