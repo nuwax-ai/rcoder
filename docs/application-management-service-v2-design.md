@@ -157,11 +157,11 @@ v1 → v2 真实变更（均与 HTTP 方法无关）：
 
 | 方法 | 路径 | 说明 | 成功码 |
 |---|---|---|---|
-| `POST` | `/apps` | 创建应用（创建子资源后立即返回 `Starting`） | 201 |
+| `POST` | `/apps` | 创建应用（可选 `app_id` 外部指定；创建子资源后立即返回 `Starting`） | 201 |
 | `POST` | `/apps/query` | 列出应用运行时（body: `QueryAppsRequest`：filters / pagination / sort） | 200 |
 | `GET` | `/apps/{id}` | 获取运行时详情（仅 observed；见 §6.1） | 200 |
-| `POST` | `/apps/{id}/update` | 部分更新（SSA apply；image/env/ports/health_check/resources 均可） | 200 |
-| `POST` | `/apps/{id}/delete` | 删除（有序 GC + orphan 扫描） | 200 |
+| `POST` | `/apps/{id}/update` | 部分更新（SSA apply；可选 `expected_resource_version` 乐观锁，不匹配→409） | 200 |
+| `POST` | `/apps/{id}/delete` | 删除（有序 GC + orphan 扫描；可选 `expected_resource_version` 乐观锁） | 200 |
 
 > 对账专用端点（无状态引擎的关键，rcoder/Java 重启后用）：
 
