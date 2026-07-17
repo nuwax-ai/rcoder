@@ -191,7 +191,7 @@ v1 → v2 真实变更（均与 HTTP 方法无关）：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/apps/{id}/upload`（multipart，`file` + `target`） | 上传文件到 `target`（app 根相对，如 `code/app.jar`） |
+| `POST` | `/apps/{id}/upload`（multipart，`file` + `target` + 可选 `flatten`） | 上传文件/压缩包到 `target`（app 根相对）。**自动判断（魔数）**：zip/tar.gz 解压到 `target` 目录；其它按单文件存 `target`（如 `code/app.jar`）。`flatten=true` 剥单层 wrapper 目录 |
 | `GET` | `/apps/{id}/files`（query: `path`） | 列出 `path` 下的文件（默认 app 根） |
 | `POST` | `/apps/{id}/files/delete`（body: `{ "path": "code/app.jar" }`） | 删除文件（app 根相对路径） |
 
