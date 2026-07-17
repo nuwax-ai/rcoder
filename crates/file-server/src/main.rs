@@ -32,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
         dev_server: Arc::new(DevServerManager::new(config.clone())),
         config,
     };
+    // clone Arc 给 graceful shutdown 闭包 (state 会被 with_state 消费)
+    let dev_server = state.dev_server.clone();
 
     let app = Router::<AppState>::new()
         .route("/health", get(handler::health))
@@ -47,6 +49,37 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("file-server listening on {addr}");
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(dev_server))
+        .await?;
     Ok(())
+}
+
+/// 接收 SIGINT / SIGTERM → 优雅停止所有 dev server (SIGTERM→等→SIGKILL + 还端口 + 清日志)。
+/// 信号处理器安装失败时降级为仅 ctrl_c;全程无 unwrap/expect (生产规范)。
+async fn shutdown_signal(dev_server: Arc<DevServerManager>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "install SIGTERM handler failed, fallback to ctrl_c only");
+                let _ = tokio::signal::ctrl_c().await;
+                dev_server.shutdown_all().await;
+                return;
+            }
+        };
+        // 真正 await 信号到达 (SIGTERM 的 recv future 必须被 poll, 否则闭包会瞬间返回)
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT, shutting down dev servers"),
+            _ = term.recv() => tracing::info!("received SIGTERM, shutting down dev servers"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("received interrupt, shutting down dev servers");
+    }
+    dev_server.shutdown_all().await;
 }

@@ -143,7 +143,11 @@ impl DevServerManager {
         }
 
         let port = self.port_pool.allocate(project_id)?;
-        let port_alloc = AllocGuard { pool: &self.port_pool, project_id: project_id.to_string() };
+        let mut port_alloc = AllocGuard {
+            pool: &self.port_pool,
+            project_id: project_id.to_string(),
+            armed: true,
+        };
 
         let ldir = log::log_dir(&self.config, project_id);
         tokio::fs::create_dir_all(&ldir)
@@ -221,7 +225,7 @@ impl DevServerManager {
                 temp_log_name: log::temp_log_name(now),
             },
         );
-        std::mem::forget(port_alloc); // 分配成功且就绪, 不释放
+        port_alloc.disarm(); // 分配成功且就绪, 不再归还端口 (Drop 变 no-op)
 
         Ok(StartedDev { pid, port })
     }
@@ -373,16 +377,76 @@ impl DevServerManager {
             .map_err(|e| AppError::system(format!("write .npmrc: {e}")))?;
         Ok(())
     }
+
+    /// 全量优雅停止 (供 main.rs graceful shutdown 调用):
+    /// 逐个项目走完整 `stop_dev` 流程 (SIGTERM → 等 → SIGKILL + ps 扫描 + 还端口 + 清日志)。
+    /// 幂等: 进程已不在也安全返回; 单项失败记 warn 不中断其余。
+    pub async fn shutdown_all(&self) {
+        let snapshot: Vec<String> = lock(&self.processes)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        if snapshot.is_empty() {
+            return;
+        }
+        tracing::info!("shutdown_all: stopping {} dev server(s)", snapshot.len());
+        for project_id in snapshot {
+            if let Err(e) = self.stop_dev(&project_id).await {
+                tracing::warn!(%project_id, "shutdown_all stop failed: {e}");
+            }
+        }
+    }
 }
 
-/// 端口分配守卫: drop 时归还 (仅 start 失败时生效; 成功时 forget)。
+/// Drop 兜底: 正常路径 (graceful shutdown) 已由 `shutdown_all` 清空实例表;
+/// 此处只防 "panic / Arc 提前释放 / shutdown_all 未触发" 残留。
+///
+/// 约束: `Drop::drop` 不能 `.await`, 无法给 SIGTERM grace 宽限期 ——
+/// 发 SIGTERM 后无等待地 SIGKILL 等价于直接 SIGKILL, 故此处省去无意义的 SIGTERM,
+/// 直接对进程组 SIGKILL, 确保进程终止并还端口、清表。
+///
+/// ⚠️ 不覆盖场景: file-server 自身被 SIGKILL 强杀时进程直接终止, **Drop 不会执行**,
+/// detached 的 dev server 仍会成孤儿 —— 这是 detached 模型的固有局限, 只能靠
+/// 容器/编排层 (Pod 退出回收) 兜底。正常重启走 SIGTERM → `shutdown_all` 路径已覆盖。
+impl Drop for DevServerManager {
+    fn drop(&mut self) {
+        let Ok(procs) = self.processes.get_mut() else {
+            return;
+        };
+        if procs.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            "DevServerManager dropped with {} live dev server(s) — best-effort SIGKILL",
+            procs.len()
+        );
+        for (project_id, p) in procs.iter() {
+            // 兜底硬杀: SIGKILL 进程组 (无法 await, 故不走 SIGTERM→等→SIGKILL 升级)
+            if !process::kill_process_group_force(p.pid) {
+                tracing::warn!(%project_id, pid = p.pid, "SIGKILL failed in Drop");
+            }
+            self.port_pool.release(project_id);
+        }
+        procs.clear();
+    }
+}
+
+/// 端口分配守卫: drop 时归还 (仅 start 失败路径生效; 成功路径调 `disarm()` 使 Drop 变 no-op)。
 struct AllocGuard<'a> {
     pool: &'a PortPool,
     project_id: String,
+    armed: bool,
+}
+impl AllocGuard<'_> {
+    /// 解除武装: 分配成功且就绪后调用, 使后续 Drop 不再归还端口 (取代 `mem::forget`)。
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 impl Drop for AllocGuard<'_> {
     fn drop(&mut self) {
-        self.pool.release(&self.project_id);
+        if self.armed {
+            self.pool.release(&self.project_id);
+        }
     }
 }
 
@@ -466,5 +530,33 @@ mod tests {
         base: Option<&str>,
     ) -> AppResult<process::DevArgs> {
         process::build_dev_args(script, port, base)
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_empty_is_noop() {
+        // 空实例表 → 立即返回, 不 panic
+        let mgr = DevServerManager::new(Arc::new(Config::from_env()));
+        mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn drop_with_stale_entry_does_not_panic() {
+        // 塞一个不可能存活的 pid: Drop 对其 SIGKILL 返回 false 但不 panic, 仍还端口 + 清表
+        let mgr = DevServerManager::new(Arc::new(Config::from_env()));
+        {
+            let mut procs = mgr.processes.lock().unwrap();
+            procs.insert(
+                "ghost".to_string(),
+                DevProcess {
+                    pid: 999_999,
+                    port: 0,
+                    project_id: "ghost".to_string(),
+                    started_at: 0,
+                    log_dir: PathBuf::from("/tmp/nonexistent-fs-test"),
+                    temp_log_name: "ghost.log".to_string(),
+                },
+            );
+        }
+        drop(mgr); // 不 panic 即通过
     }
 }
