@@ -448,7 +448,9 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         app_service: state.app_service.clone(),
     });
     let app_manager_routes =
-        app_manager::routes::app_manager_routes().with_state(app_manager_state);
+        app_manager::routes::app_manager_routes()
+            .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GiB（upload 压缩包，覆盖全局 50MB）
+            .with_state(app_manager_state);
 
     let mut router = Router::new()
         .merge(health_routes)

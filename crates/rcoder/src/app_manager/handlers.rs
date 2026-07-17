@@ -469,7 +469,7 @@ pub async fn upload_file(
                     .text()
                     .await
                     .map_err(|e| AppError::bad_request(&format!("failed to read flatten: {}", e)))?;
-                flatten = data == "true";
+                flatten = data == "true" || data == "1";
             }
             _ => {}
         }

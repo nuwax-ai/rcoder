@@ -89,7 +89,7 @@ pub trait AppServiceTrait: Send + Sync {
         tail: u32,
     ) -> AppResult<Vec<LogEntry>>;
 
-    /// 上传文件（写入共享工作空间 code 目录）
+    /// 上传文件 / 压缩包（魔数判断：zip/tar.gz → 解压到 target 目录；单文件存 target；flatten 剥 wrapper）
     async fn upload_file(
         &self,
         app_id: &str,

@@ -733,6 +733,10 @@ impl AppService {
         flatten: bool,
     ) -> AppResult<UploadResult> {
         validate_app_id(app_id)?;
+        validate_upload_target(target)?; // create_dir_all 前拦截 ../ 与绝对路径（避免副作用泄漏）
+        if file_data.is_empty() {
+            return Err(AppOperationError::Validation("file data is empty".to_string()));
+        }
         let app_dir = self.get_container_app_dir(app_id);
         fs::create_dir_all(&app_dir)
             .await
@@ -742,9 +746,10 @@ impl AppService {
             .map_err(|e| map_io_error("failed to resolve app dir", e, false))?;
 
         // 魔数判断压缩包类型（不靠文件名后缀，app.jar.zip 也能识别为 zip）
-        match detect_file_type(&file_data) {
+        let file_type = detect_file_type(&file_data);
+        match file_type {
             "zip" | "tar.gz" => {
-                self.extract_archive(app_id, file_data, target, flatten, &canonical_app_dir)
+                self.extract_archive(app_id, file_data, file_type, target, flatten, &canonical_app_dir)
                     .await
             }
             _ => {
@@ -782,6 +787,7 @@ impl AppService {
         &self,
         app_id: &str,
         file_data: Vec<u8>,
+        file_type: &str,
         target: &str,
         flatten: bool,
         canonical_app_dir: &std::path::Path,
@@ -801,7 +807,7 @@ impl AppService {
         }
 
         let file_size = file_data.len() as u64;
-        let file_type = detect_file_type(&file_data).to_string();
+        let file_type = file_type.to_string(); // 由 upload_file 传入（避免重复 detect）
         let dest_clone = canonical_dest.clone();
         // spawn_blocking：写临时文件 + 解压（同步 IO，不阻塞 tokio；TempPath 闭包结束自动删）
         let count = tokio::task::spawn_blocking(
@@ -1453,6 +1459,31 @@ fn map_archive_error(e: ArchiveError) -> AppOperationError {
         }
         ArchiveError::Io(e) => map_io_error("archive IO error", e, true),
     }
+}
+
+/// 校验 upload target（app 根相对路径）。
+///
+/// 拒绝空 / 绝对路径 / 含 `..` 组件——在 `create_dir_all` **之前**拦截，避免 path traversal
+/// 副作用（target 含 `../` 时 create_dir_all 会先在工作空间外创建目录，虽后续 `starts_with`
+/// 拒绝，但目录已落盘）。
+fn validate_upload_target(target: &str) -> AppResult<()> {
+    if target.trim_end_matches('/').is_empty() {
+        return Err(AppOperationError::Validation("target must not be empty".to_string()));
+    }
+    if target.starts_with('/') {
+        return Err(AppOperationError::Validation(
+            "target must be relative (app-root-relative)".to_string(),
+        ));
+    }
+    if std::path::Path::new(target)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(AppOperationError::Validation(
+            "target must not contain '..'".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// 校验 app_id 格式（create_app 生成 `app-` + 8 个十六进制字符）
