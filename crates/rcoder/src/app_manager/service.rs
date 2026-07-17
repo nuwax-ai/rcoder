@@ -1144,7 +1144,7 @@ impl AppService {
         // - Gateway 模式（K8s 可选）：/apps/{app_id}
         // TCP 初期不对外（external.tcp 空）；internal 始终给 ClusterIP FQDN / 容器名。
         let http_url = match self.config.http_expose {
-            HttpExpose::Pingora => http_port.map(|p| format!("/proxy/{}", p.port)),
+            HttpExpose::Pingora => http_port.map(|p| format!("/proxy/apps/{}/{}", app_id, p.port)),
             HttpExpose::Gateway => http_port.map(|_| format!("/apps/{}", app_id)),
         };
 
@@ -1223,7 +1223,7 @@ impl AppService {
             }
         };
         for port in http_ports {
-            pingora.add_backend(*port, backend_host.clone()).await;
+            pingora.add_app_backend(app_id, *port, backend_host.clone());
         }
         if !http_ports.is_empty() {
             self.pingora_ports
@@ -1246,7 +1246,7 @@ impl AppService {
         };
         if let Some((_, ports)) = self.pingora_ports.remove(app_id) {
             for port in &ports {
-                pingora.remove_backend(*port).await;
+                pingora.remove_app_backend(app_id, *port);
             }
             info!("[APP] Pingora backend 已清理: {} ports={:?}", app_id, ports);
         }

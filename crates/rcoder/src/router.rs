@@ -574,6 +574,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::proxy_config,
         handler::proxy_to_port,
         handler::proxy_to_port_with_path,
+        handler::proxy_to_app_with_path,
         handler::proxy_with_query_params,
         // P0-4: Agent Management 转发层
         handler::list_agents,

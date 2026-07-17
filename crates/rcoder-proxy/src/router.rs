@@ -56,6 +56,17 @@ pub enum RouteType {
     /// - `/proxy/3000/`
     PortProxy,
 
+    /// app 专用端口反向代理: `/proxy/apps/{app_id}/{port}/{*path}`
+    ///
+    /// - `app_id`: 应用 ID（定位具体 app，解决多 app 同端口冲突）
+    /// - `port`: app 的 HTTP 端口
+    /// - `path`: 剩余路径
+    ///
+    /// **目标**: app_manager 部署的应用（K8s→`{app_id}-svc:{port}`，Docker→container_ip:{port}）
+    ///
+    /// **示例**: `/proxy/apps/app-1a2b3c4d/8080/api/users`
+    AppPortProxy,
+
     /// 健康检查: `/health`
     ///
     /// **功能**: 返回 Pingora 代理服务的健康状态
@@ -269,6 +280,28 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
             tracing::error!("[ROUTER] port proxy root route config failed: {}", e);
             crate::ProxyError::RouteConfig(format!(
                 "Port proxy root route configuration error: {}",
+                e
+            ))
+        })?;
+
+    // app 专用端口代理（按 app_id+port 路由，解决多 app 同端口冲突）：
+    // /proxy/apps/{app_id}/{port}/{path} -> 对应 app 的后端（app_backends 表）
+    router
+        .insert("/proxy/apps/{app_id}/{port}/{*path}", RouteType::AppPortProxy)
+        .map_err(|e| {
+            tracing::error!("[ROUTER] app port proxy route config failed: {}", e);
+            crate::ProxyError::RouteConfig(format!(
+                "App port proxy route configuration error: {}",
+                e
+            ))
+        })?;
+    // 兜底：/proxy/apps/{app_id}/{port}（无尾随 path）
+    router
+        .insert("/proxy/apps/{app_id}/{port}", RouteType::AppPortProxy)
+        .map_err(|e| {
+            tracing::error!("[ROUTER] app port proxy root route config failed: {}", e);
+            crate::ProxyError::RouteConfig(format!(
+                "App port proxy root route configuration error: {}",
                 e
             ))
         })?;

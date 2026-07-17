@@ -60,6 +60,9 @@ pub struct PingoraProxyService {
     /// Project 后端映射: project_id -> container_ip
     /// 用于 /web/ttyd/{user_id}/{project_id} 路由（共享容器场景）
     pub project_backends: Arc<DashMap<String, String>>,
+    /// app 后端映射: (app_id, port) -> host
+    /// 用于 /proxy/apps/{app_id}/{port} 路由（app_manager 部署的应用，按 app_id+port 路由避免同端口冲突）
+    pub app_backends: Arc<DashMap<(String, u16), String>>,
     /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
     /// 用于 /api/{service_name}/{*path} 路由
     pub api_key_manager: Arc<DashMap<String, ModelProviderConfig>>,
@@ -86,6 +89,8 @@ pub struct PortProxy {
     vnc_backends: Arc<DashMap<String, String>>,
     /// Project 后端映射: project_id -> container_ip
     project_backends: Arc<DashMap<String, String>>,
+    /// app 后端映射: (app_id, port) -> host（/proxy/apps/{app_id}/{port} 路由）
+    app_backends: Arc<DashMap<(String, u16), String>>,
     /// 路由表
     router: Router<RouteType>,
     /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
@@ -203,6 +208,14 @@ impl ProxyHttp for PortProxy {
                 )
                 .await?;
             }
+            RouteType::AppPortProxy => {
+                handlers::app_port_proxy::handle_app_port_proxy_request(
+                    upstream_request,
+                    &original_uri,
+                    matched.params,
+                )
+                .await?;
+            }
             RouteType::HealthCheck => {
                 // 健康检查：代理到 Axum 的 /health 端点
                 // 这样既能验证 Pingora 正常运行，又能验证 Axum 正常运行
@@ -305,6 +318,15 @@ impl ProxyHttp for PortProxy {
                     matched.params,
                     &self.backends,
                     &self.backend_host,
+                    &self.metrics,
+                )
+                .await
+            }
+            RouteType::AppPortProxy => {
+                handlers::app_port_proxy::handle_app_port_proxy_upstream(
+                    ctx,
+                    matched.params,
+                    &self.app_backends,
                     &self.metrics,
                 )
                 .await
@@ -502,6 +524,7 @@ impl PingoraProxyService {
             health_map: Arc::new(RwLock::new(HashMap::new())),
             vnc_backends: Arc::new(DashMap::new()),
             project_backends: Arc::new(DashMap::new()),
+            app_backends: Arc::new(DashMap::new()),
             api_key_manager: Arc::new(DashMap::new()),
             api_key_config: None, // 默认不启用 API Key 鉴权
             container_lookup: None,
@@ -560,6 +583,7 @@ impl PingoraProxyService {
             metrics: self.metrics.clone(),
             vnc_backends: self.vnc_backends.clone(),
             project_backends: self.project_backends.clone(),
+            app_backends: self.app_backends.clone(),
             router,
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(),
@@ -627,6 +651,26 @@ impl PingoraProxyService {
         if backends.remove(&port).is_some() {
             info!("removed route: {}", port);
         }
+    }
+
+    /// 添加 app 后端（按 app_id+port 路由，用于 /proxy/apps/{app_id}/{port}）。
+    /// 同步（DashMap），与 vnc/project 一致。
+    pub fn add_app_backend(&self, app_id: &str, port: u16, host: String) {
+        self.app_backends
+            .insert((app_id.to_string(), port), host.clone());
+        info!(" app proxy route: {app_id}:{port} -> {host}");
+    }
+
+    /// 移除 app 后端（按 app_id+port）。返回是否曾存在。
+    pub fn remove_app_backend(&self, app_id: &str, port: u16) -> bool {
+        let removed = self
+            .app_backends
+            .remove(&(app_id.to_string(), port))
+            .is_some();
+        if removed {
+            info!("removed app proxy route: {app_id}:{port}");
+        }
+        removed
     }
 
     /// 列出所有后端服务
@@ -900,6 +944,7 @@ impl Clone for PingoraProxyService {
             health_map: self.health_map.clone(),
             vnc_backends: self.vnc_backends.clone(),
             project_backends: self.project_backends.clone(),
+            app_backends: self.app_backends.clone(),
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(),
             container_lookup: self.container_lookup.clone(),
