@@ -256,15 +256,24 @@ pub(super) async fn install_project(
     if program == "pnpm" {
         pnpm_config::ensure_pnpm_install_config(&project_dir).await;
     }
-    let (stdout, stderr, code) = run_capture(program, &args, &project_dir, timeout).await?;
+    let (_stdout, stderr, code) = run_capture(program, &args, &project_dir, timeout).await?;
+    // 失败 → SystemError 500 (对齐 nuwax installProjectDependencies:
+    // throw SystemError(`Project dependencies install failed: ${stderr||stdout}`))
+    if code != 0 {
+        let detail = if stderr.trim().is_empty() {
+            _stdout
+        } else {
+            stderr
+        };
+        return Err(AppError::system(format!(
+            "Project dependencies install failed: {detail}"
+        )));
+    }
     Ok(Json(json!({
-        "success": code == 0,
-        "message": if code == 0 { "Project dependencies installed successfully" } else { "install failed" },
+        "success": true,
+        "message": "Project dependencies installed successfully",
         "projectDir": project_dir.display().to_string(),
         "programmingLanguage": lang,
-        "stdout": stdout,
-        "stderr": stderr,
-        "exitCode": code,
     })))
 }
 

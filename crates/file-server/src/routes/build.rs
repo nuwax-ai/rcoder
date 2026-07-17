@@ -274,18 +274,19 @@ async fn build_project(
 
     // 并发控制: 全局信号量 + 项目级互斥 (对齐 nuwax buildingProjects + MAX_BUILD_CONCURRENCY)
     let (sem, building) = build_concurrency(state.config.max_build_concurrency);
+    // 全局并发上限: 立即拒绝 (对齐 nuwax "Concurrency is full, please try again later";
+    // 非排队等待 — 排队会挂起到请求超时, nuwax 是立即 BusinessError)
+    let _permit = sem
+        .try_acquire()
+        .map_err(|_| AppError::business("Concurrency is full, please try again later"))?;
+    // 项目级互斥: 同一项目正在 build 则拒绝 (poison 恢复: 另一请求 panic 毒化锁时取回数据)
     {
-        // poison 恢复: 另一 build 请求若 panic 毒化了锁, 取回内部数据继续而非连锁 panic
         let mut b = building.lock().unwrap_or_else(|e| e.into_inner());
         if b.contains(&q.project_id) {
             return Err(AppError::business("This project is being built"));
         }
         b.insert(q.project_id.clone());
     }
-    let _permit = sem
-        .acquire()
-        .await
-        .expect("build sem acquire (semaphore never closed)");
 
     // install (对齐 nuwax: 失败则整体 build 失败, 透传 "Dependency installation failed")
     crate::service::dev_server::process::run_command_to_log(
