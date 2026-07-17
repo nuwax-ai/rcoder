@@ -135,13 +135,14 @@ async fn log_history(
     let (path, log_id) = resolve(&q.base, &state)?;
     let max_count = q.max_count.unwrap_or(50).clamp(1, 500);
     let skip = q.skip.unwrap_or(0);
+    let branch = q.branch.clone();
     let commits = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         if !path.exists() {
             return Err(AppError::resource("workspace does not exist"));
         }
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;
-        git::log_history(&repo, max_count, skip)
+        git::log_history(&repo, max_count, skip, branch.as_deref())
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
@@ -156,25 +157,34 @@ struct GitLogQuery {
     base: GitQuery,
     max_count: Option<usize>,
     skip: Option<usize>,
+    /// 指定分支 (对齐 nuwax git.log ref); 默认 HEAD。
+    #[serde(default)]
+    branch: Option<String>,
 }
 
-/// `POST /api/git/file-content`
+/// `POST /api/git/file-content` (对齐 nuwax fileContent; 从 **body** 取 {ref, filePath})。
+/// ref ∈ {worktree, staged, ""} → 直接读 workdir 文件 (不查 git); 否则读 ref 处 blob。
 async fn file_content(
     State(state): State<AppState>,
-    Query(q): Query<FileContentQuery>,
+    Json(body): Json<FileContentBody>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve(&q.base, &state)?;
-    let ref_spec = q.ref_.clone().unwrap_or_else(|| "HEAD".to_string());
-    let file_path = q.file_path.clone();
-    let ref_spec_c = ref_spec.clone();
-    let file_path_c = file_path.clone();
+    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let ref_spec = body.ref_.clone().unwrap_or_else(|| "HEAD".to_string());
+    let file_path = body.file_path.clone();
+    let read_worktree = matches!(ref_spec.as_str(), "worktree" | "staged" | "");
+    let ref_c = ref_spec.clone();
+    let fp_c = file_path.clone();
     let content = tokio::task::spawn_blocking(move || -> Result<String, AppError> {
         if !path.exists() {
             return Err(AppError::resource("workspace does not exist"));
         }
+        if read_worktree {
+            let full = crate::path_safety::ensure_within(&path, &fp_c)?;
+            return Ok(std::fs::read_to_string(&full).unwrap_or_default());
+        }
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;
-        match git::file_content_at_ref(&repo, &ref_spec_c, &file_path_c)? {
+        match git::file_content_at_ref(&repo, &ref_c, &fp_c)? {
             Some(c) => Ok(c),
             None => Ok(String::new()),
         }
@@ -192,11 +202,11 @@ async fn file_content(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FileContentQuery {
+struct FileContentBody {
     #[serde(flatten)]
-    base: GitQuery,
+    base: GitWriteBody,
     /// nuwax 字段名 `ref` (Rust 关键字, 用 ref_ + serde rename)
-    #[serde(rename = "ref")]
+    #[serde(rename = "ref", default)]
     ref_: Option<String>,
     file_path: String,
 }
@@ -312,7 +322,7 @@ async fn init(
         .map_err(|e| AppError::system(format!("git join: {e}")))??;
     Ok(Json(json!({
         "success": true,
-        "message": "Git repository initialized",
+        "message": if already { "Git repository already initialized" } else { "Git repository initialized successfully" },
         "logId": log_id,
         "alreadyExists": already,
     })))
@@ -397,6 +407,7 @@ async fn unstage(
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let files = body.files.unwrap_or_default();
     let all = files.is_empty();
+    let files_echo = files.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         if !path.exists() {
             return Err(AppError::resource("workspace does not exist"));
@@ -407,11 +418,16 @@ async fn unstage(
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    let (message, files_val): (&str, Value) = if all {
+        ("All files unstaged successfully", json!("all"))
+    } else {
+        ("Specified files unstaged successfully", json!(files_echo))
+    };
     Ok(Json(json!({
         "success": true,
-        "message": "Files unstaged successfully",
+        "message": message,
         "logId": log_id,
-        "files": if all { "all" } else { "" },
+        "files": files_val,
     })))
 }
 
@@ -422,8 +438,7 @@ async fn discard(
 ) -> Result<Json<Value>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let files = body.files.unwrap_or_default();
-    let count = files.len();
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+    let buckets = tokio::task::spawn_blocking(move || -> Result<git::DiscardBuckets, AppError> {
         if !path.exists() {
             return Err(AppError::resource("workspace does not exist"));
         }
@@ -437,7 +452,10 @@ async fn discard(
         "success": true,
         "message": "Changes discarded successfully",
         "logId": log_id,
-        "discardedCount": count,
+        "discardedCount": buckets.len(),
+        "trackedFiles": buckets.tracked_files,
+        "newFiles": buckets.new_files,
+        "untrackedFiles": buckets.untracked_files,
     })))
 }
 
@@ -536,7 +554,7 @@ async fn reset(
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let target = body.target.clone();
     let mode = git::ResetMode::parse(&body.mode)?;
-    let mode_label = body.mode.clone();
+    let mode_label = mode.to_string();
     let outcome = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         if !path.exists() {
             return Err(AppError::resource("workspace does not exist"));
@@ -643,6 +661,9 @@ struct BranchNameBody {
     #[serde(flatten)]
     base: GitWriteBody,
     branch_name: String,
+    /// branch-delete 强制删除未合并分支 (对齐 nuwax deleteBranch force)。
+    #[serde(default)]
+    force: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -674,13 +695,14 @@ async fn branch_create(
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;
-        git::create_branch(&repo, &name, sp.as_deref())
+        // switch=true: 创建后立即 checkout (对齐 nuwax git.branch checkout:true)
+        git::create_branch(&repo, &name, sp.as_deref(), true)
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
     Ok(Json(json!({
         "success": true,
-        "message": "Branch created successfully",
+        "message": "Branch created and switched to",
         "logId": log_id,
         "branchName": body.branch_name,
     })))
@@ -693,12 +715,13 @@ async fn branch_delete(
 ) -> Result<Json<Value>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let name = body.branch_name.clone();
+    let force = body.force.unwrap_or(false);
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let repo = git::ensure_repo(&path)?;
         if git::is_current_branch(&repo, &name)? {
             return Err(AppError::business("cannot delete the current branch"));
         }
-        git::delete_branch(&repo, &name)
+        git::delete_branch(&repo, &name, force)
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
@@ -718,9 +741,12 @@ async fn tag_create(
     let (path, log_id) = resolve_body(&state, &body.base)?;
     let name = body.tag_name.clone();
     let msg = body.message.clone();
+    let an = state.config.git_default_author_name.clone();
+    let ae = state.config.git_default_author_email.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let repo = git::ensure_repo(&path)?;
-        git::create_tag(&repo, &name, msg.as_deref())
+        // annotated tag 的 tagger 用 config author (对齐 nuwax getDefaultAuthor)
+        git::create_tag(&repo, &name, msg.as_deref(), &an, &ae)
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;

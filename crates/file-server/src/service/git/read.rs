@@ -57,17 +57,25 @@ pub struct CommitInfo {
 }
 
 /// 提交历史 (对齐 nuwax logHistory; first-parent)。
+/// `branch` 非空 → 从该 ref 起 walk (对齐 nuwax git.log({ ref: branch })); 默认 HEAD。
 pub fn log_history(
     repo: &gix::Repository,
     max_count: usize,
     skip: usize,
+    branch: Option<&str>,
 ) -> AppResult<Vec<CommitInfo>> {
-    let head_id = repo
-        .head_id()
-        .map_err(|e| map_git_err(e, "git head_id"))?
-        .detach();
+    let start_id = match branch {
+        Some(b) if !b.trim().is_empty() => repo
+            .rev_parse_single(b)
+            .map_err(|e| map_git_err(e, "git rev_parse branch"))?
+            .detach(),
+        _ => repo
+            .head_id()
+            .map_err(|e| map_git_err(e, "git head_id"))?
+            .detach(),
+    };
     let walk = repo
-        .rev_walk([head_id])
+        .rev_walk([start_id])
         .first_parent_only()
         .all()
         .map_err(|e| map_git_err(e, "git walk all"))?;
@@ -203,7 +211,18 @@ pub fn get_status(repo: &gix::Repository) -> AppResult<StatusResult> {
             }
             gix::status::Item::IndexWorktree(change) => match change {
                 gix::status::index_worktree::Item::Modification { rela_path, .. } => {
-                    r.modified.push(rela_path.to_string());
+                    // workdir 文件不存在 → workdir 删除归 deleted, 否则 modified
+                    // (对齐 nuwax W===0&&S!==0 → deleted 桶)
+                    let s = rela_path.to_string();
+                    let deleted = repo
+                        .workdir()
+                        .map(|w| !w.join(&s).exists())
+                        .unwrap_or(false);
+                    if deleted {
+                        r.deleted.push(s);
+                    } else {
+                        r.modified.push(s);
+                    }
                 }
                 gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
                     r.untracked.push(entry.rela_path.to_string());

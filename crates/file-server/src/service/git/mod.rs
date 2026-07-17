@@ -112,15 +112,40 @@ pub fn is_git_repo(path: &Path) -> bool {
     path.join(".git").exists()
 }
 
+/// env 布尔 (对齐 nuwax config env 开关)。
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
+        Err(_) => default,
+    }
+}
+
+/// 解析 .gitignore 条目列表: env `GIT_GITIGNORE_ENTRIES`(`|` 分隔) 覆盖默认 (对齐 nuwax appConfig)。
+fn gitignore_entries() -> Vec<String> {
+    match std::env::var("GIT_GITIGNORE_ENTRIES") {
+        Ok(s) if !s.trim().is_empty() => s
+            .split('|')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        _ => DEFAULT_GITIGNORE_ENTRIES.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 /// 确保 `.gitignore` 含必要条目 (对齐 nuwax ensureGitignore, append-only)。
+/// env `GIT_AUTO_GITIGNORE=false` 可整体关闭 (对齐 nuwax gitUtils GIT_AUTO_GITIGNORE)。
 pub fn ensure_gitignore(path: &Path) -> AppResult<()> {
+    if !env_bool("GIT_AUTO_GITIGNORE", true) {
+        return Ok(());
+    }
     let gitignore = path.join(".gitignore");
     let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
-    let existing: Vec<&str> = current.lines().map(str::trim).collect();
-    let mut to_append = Vec::new();
-    for entry in DEFAULT_GITIGNORE_ENTRIES {
-        if !existing.contains(entry) {
-            to_append.push(*entry);
+    let existing: Vec<String> = current.lines().map(|l| l.trim().to_string()).collect();
+    let entries = gitignore_entries();
+    let mut to_append: Vec<&str> = Vec::new();
+    for entry in &entries {
+        if !existing.iter().any(|e| e == entry) {
+            to_append.push(entry);
         }
     }
     if to_append.is_empty() {

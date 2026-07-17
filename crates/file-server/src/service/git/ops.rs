@@ -23,14 +23,47 @@ pub enum ResetMode {
 }
 
 impl ResetMode {
+    /// 小写字符串形式 (Display / FromStr 共用, 集中维护避免与变体定义分散)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Soft => "soft",
+            Self::Mixed => "mixed",
+            Self::Hard => "hard",
+        }
+    }
+
+    /// 解析为 ResetMode, 错误转 AppError::validation (兼容 handler `?`)。
     pub fn parse(s: &str) -> AppResult<Self> {
+        s.parse::<Self>().map_err(|e| AppError::validation(e.to_string()))
+    }
+}
+
+impl std::fmt::Display for ResetMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// FromStr 解析错误。
+#[derive(Debug, Clone)]
+pub struct ResetModeParseError(pub String);
+
+impl std::fmt::Display for ResetModeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mode must be soft|mixed|hard, got {}", self.0)
+    }
+}
+
+impl std::error::Error for ResetModeParseError {}
+
+impl std::str::FromStr for ResetMode {
+    type Err = ResetModeParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "" | "mixed" => Ok(Self::Mixed),
             "soft" => Ok(Self::Soft),
             "hard" => Ok(Self::Hard),
-            other => Err(AppError::validation(format!(
-                "mode must be soft|mixed|hard, got {other}"
-            ))),
+            other => Err(ResetModeParseError(other.to_string())),
         }
     }
 }
@@ -320,8 +353,8 @@ fn apply_tree_to_worktree(
     Ok(())
 }
 
-/// clean-tree 检查: 有 staged/modified 跟踪变更 → BusinessError (revert/switch 前置)。
-fn clean_tree_check(repo: &gix::Repository) -> AppResult<()> {
+/// clean-tree 检查: 有 staged/modified 跟踪变更 → BusinessError (revert/switch/branch-create 前置)。
+pub(crate) fn clean_tree_check(repo: &gix::Repository) -> AppResult<()> {
     let st = get_status(repo)?;
     if !st.staged.is_empty() || !st.modified.is_empty() {
         return Err(AppError::business(

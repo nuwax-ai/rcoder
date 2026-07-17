@@ -1,5 +1,7 @@
 //! Git 写操作 (stage/commit)。
 
+use std::collections::HashSet;
+
 use crate::error::{AppError, AppResult};
 
 use super::map_git_err;
@@ -177,9 +179,29 @@ pub fn unstage_files(repo: &gix::Repository, files: &[String]) -> AppResult<()> 
     Ok(())
 }
 
+/// discard 分桶结果 (对齐 nuwax discard 响应明细)。
+#[derive(Debug, Default, Clone)]
+pub struct DiscardBuckets {
+    pub tracked_files: Vec<String>,
+    pub new_files: Vec<String>,
+    pub untracked_files: Vec<String>,
+}
+
+impl DiscardBuckets {
+    pub fn len(&self) -> usize {
+        self.tracked_files.len() + self.new_files.len() + self.untracked_files.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// discard (对齐 nuwax discard): files 空 → discard 全部 modified/staged/deleted。
-/// HEAD 有该文件 → 恢复到 worktree; HEAD 无 → 删除 worktree 文件 (untracked/staged-new)。
-pub fn discard_files(repo: &gix::Repository, files: &[String]) -> AppResult<()> {
+/// - HEAD 有该文件 (tracked, modified/deleted) → 恢复 worktree 到 HEAD + `stage_path` 同步 index
+/// - HEAD 无 (untracked/staged-new) → 删除 worktree + `stage_path` 同步 index (移除 staged-new entry)
+///
+/// 返回三桶明细 (trackedFiles / newFiles / untrackedFiles), 与 nuwax 一致。
+pub fn discard_files(repo: &gix::Repository, files: &[String]) -> AppResult<DiscardBuckets> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
@@ -189,8 +211,9 @@ pub fn discard_files(repo: &gix::Repository, files: &[String]) -> AppResult<()> 
     let tree = repo
         .find_tree(head_tree_id)
         .map_err(|e| map_git_err(e, "git find_tree"))?;
+    let st = get_status(repo)?;
+    let staged_set: HashSet<String> = st.staged.iter().cloned().collect();
     let to_discard: Vec<String> = if files.is_empty() {
-        let st = get_status(repo)?;
         st.modified
             .iter()
             .chain(st.deleted.iter())
@@ -200,12 +223,14 @@ pub fn discard_files(repo: &gix::Repository, files: &[String]) -> AppResult<()> 
     } else {
         files.to_vec()
     };
+    let mut buckets = DiscardBuckets::default();
     for f in &to_discard {
         match tree
             .lookup_entry_by_path(f)
             .map_err(|e| map_git_err(e, "git lookup_entry_by_path"))?
         {
             Some(entry) => {
+                // tracked (modified/deleted): 恢复 worktree 到 HEAD 内容 + 同步 index
                 let blob = repo
                     .find_blob(entry.id())
                     .map_err(|e| map_git_err(e, "git find_blob"))?;
@@ -214,12 +239,20 @@ pub fn discard_files(repo: &gix::Repository, files: &[String]) -> AppResult<()> 
                     let _ = std::fs::create_dir_all(p);
                 }
                 std::fs::write(&dest, &blob.data)?;
+                stage_path(repo, f)?;
+                buckets.tracked_files.push(f.clone());
             }
             None => {
-                // HEAD 无此文件 → untracked/staged-new, 删除 worktree 副本
+                // untracked / staged-new: 删 worktree + 同步 index (移除 staged-new entry)
                 let _ = std::fs::remove_file(workdir.join(f));
+                stage_path(repo, f)?;
+                if staged_set.contains(f) {
+                    buckets.new_files.push(f.clone());
+                } else {
+                    buckets.untracked_files.push(f.clone());
+                }
             }
         }
     }
-    Ok(())
+    Ok(buckets)
 }

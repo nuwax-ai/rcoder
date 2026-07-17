@@ -148,7 +148,7 @@ impl Config {
             ),
             git_enabled: env_bool("GIT_ENABLED", false),
             git_default_author_name: env_str("GIT_DEFAULT_AUTHOR_NAME", "Nuwax File Server"),
-            git_default_author_email: env_str("GIT_DEFAULT_AUTHOR_EMAIL", "git@nuwax.com"),
+            git_default_author_email: env_str("GIT_DEFAULT_AUTHOR_EMAIL", "git@nuwax.local"),
             init_project_name_react: env_str("INIT_PROJECT_NAME_REACT", "react-vite-template"),
             init_project_name_vue3: env_str("INIT_PROJECT_NAME_VUE3", "vue3-vite-template"),
             deployment_mode: env_str("DEPLOYMENT_MODE", "docker-compose"),
