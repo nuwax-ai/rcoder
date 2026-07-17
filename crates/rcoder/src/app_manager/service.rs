@@ -146,6 +146,19 @@ impl AppService {
                 "最多支持 1 个 HTTP 端口（当前 {http_port_count} 个）；多 HTTP 端口待 access 支持 list"
             )));
         }
+        // 0.5b 端口号唯一：避免 K8s annotation 解码歧义（同 port 不同 type 会被 HashMap 折叠）
+        // 及 Pingora backend key(port) 冲突。Fail Fast 在源头拒绝。
+        if let Some(ports) = &request.ports {
+            let mut seen = std::collections::HashSet::new();
+            for p in ports {
+                if !seen.insert(p.port) {
+                    return Err(AppOperationError::Validation(format!(
+                        "端口 {} 重复：每个端口号只能出现一次",
+                        p.port
+                    )));
+                }
+            }
+        }
 
         // 1. 创建应用工作空间目录（code/data/logs）
         self.create_app_dirs(&app_id).await?;
@@ -1242,6 +1255,11 @@ impl AppService {
     /// 启动时重建 Pingora backends（K8s Pingora 模式，修复重启后 pingora_ports 内存态丢失）。
     /// 从集群列出所有托管 app，按 expose_type（Deployment annotation 还原）重新注册 HTTP 端口的 backend。
     async fn rebuild_pingora_backends(&self) -> AppResult<()> {
+        // pingora 未配置（proxy_config 未配）→ 无 backend 可注册；显式说明，避免"0 个 app"被误读为"集群无应用"
+        if self.pingora.is_none() {
+            info!("[APP] Pingora 未启用（proxy_config 未配），跳过 backends 重建");
+            return Ok(());
+        }
         let statuses = self
             .runtime
             .list_deployments()

@@ -1406,9 +1406,13 @@ fn encode_port_expose_annotations(
     if ports.is_empty() {
         return None;
     }
-    let val = ports
+    // 按 port 排序后编码——避免调用方端口顺序差异触发 SSA 无谓 reconcile（顺序无关 → 字符串稳定）
+    let mut entries: Vec<(u16, &ExposeType)> =
+        ports.iter().map(|p| (p.port, &p.expose_type)).collect();
+    entries.sort_by_key(|(port, _)| *port);
+    let val = entries
         .iter()
-        .map(|p| format!("{}:{}", p.port, expose_type_str(&p.expose_type)))
+        .map(|(port, et)| format!("{}:{}", port, expose_type_str(et)))
         .collect::<Vec<_>>()
         .join(",");
     let mut m = BTreeMap::new();
