@@ -9,11 +9,132 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::workspace::ProjectContext;
+
+// ── 类型化响应 (取代 serde_json::json! 字面量; camelCase 由 serde 统一保证) ──────
+mod response {
+    use serde::Serialize;
+
+    use crate::service::dev_server::log::LogLine;
+    use crate::service::dev_server::{DevProcess, KilledPid, PortAllocation};
+
+    /// start-dev / restart-dev 共用 (对齐 nuwax: {success, message, projectId, pid, port})
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct DevStarted {
+        pub success: bool,
+        pub message: String,
+        pub project_id: String,
+        pub pid: u32,
+        pub port: u16,
+    }
+
+    /// stop-dev (pid 恒 null: Option 不加 skip_serializing_if → 序列化为 null, 对齐现 json!)
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct DevStopped {
+        pub success: bool,
+        pub message: String,
+        pub project_id: String,
+        pub pid: Option<u32>,
+        pub killed_pids: Vec<KilledPid>,
+    }
+
+    /// list-dev
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct DevList {
+        pub success: bool,
+        pub list: Vec<DevProcess>,
+    }
+
+    /// keep-alive (action 仅重启分支有 → None 时省略, 匹配现 json! 条件追加行为)
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct KeepAlive {
+        pub success: bool,
+        pub project_id: String,
+        pub pid: u32,
+        pub port: u16,
+        pub message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub action: Option<String>,
+    }
+
+    /// port-pool-status
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PortPool {
+        pub success: bool,
+        pub message: String,
+        pub port_range: String,
+        pub total_allocated: usize,
+        pub allocations: Vec<PortAllocation>,
+    }
+
+    /// get-dev-log
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct DevLog {
+        pub success: bool,
+        pub message: String,
+        pub logs: Vec<LogLine>,
+        pub total_lines: usize,
+        pub start_index: usize,
+        pub log_file_name: String,
+        pub cache_hit: bool,
+        pub file_too_large: bool,
+    }
+
+    /// build
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct BuildDone {
+        pub success: bool,
+        pub message: String,
+        pub project_id: String,
+    }
+
+    /// parse-build-error / clear-all-log-cache 共用 {success, message}
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Simple {
+        pub success: bool,
+        pub message: String,
+    }
+
+    /// get-log-cache-stats (stats 内含 SCREAMING_SNAKE 键 → 逐字段 rename)
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct LogCacheStats {
+        pub success: bool,
+        pub message: String,
+        pub stats: LogCacheStatsData,
+    }
+
+    #[derive(Serialize)]
+    pub struct LogCacheStatsData {
+        pub enabled: bool,
+        #[serde(rename = "cacheSize")]
+        pub cache_size: u64,
+        #[serde(rename = "maxCacheEntries")]
+        pub max_cache_entries: u64,
+        #[serde(rename = "cacheDuration")]
+        pub cache_duration: u64,
+        #[serde(rename = "maxFileSizeMB")]
+        pub max_file_size_mb: String,
+        #[serde(rename = "totalCacheSizeMB")]
+        pub total_cache_size_mb: String,
+        #[serde(rename = "NODE_ENV")]
+        pub node_env: String,
+        #[serde(rename = "LOG_CACHE_ENABLED")]
+        pub log_cache_enabled: String,
+    }
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -100,27 +221,27 @@ fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> PathBuf {
 async fn start_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<response::DevStarted>, AppError> {
     let path = project_path(&state, &q);
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
         .start_dev(&q.project_id, &path, base)
         .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Development server started",
-        "projectId": q.project_id,
-        "pid": started.pid,
-        "port": started.port,
-    })))
+    Ok(Json(response::DevStarted {
+        success: true,
+        message: "Development server started".to_string(),
+        project_id: q.project_id,
+        pid: started.pid,
+        port: started.port,
+    }))
 }
 
 /// `GET /api/build/stop-dev` (对齐 nuwax stop-dev)。
 async fn stop_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<response::DevStopped>, AppError> {
     let stopped = state.dev_server.stop_dev(&q.project_id).await?;
     // message 对齐 nuwax stopDevUtils: 全杀 "Stopped" / 部分杀 "Partially stopped..." / 无候选 "No running process found"
     let all_killed = stopped.killed_pids.iter().all(|k| k.killed);
@@ -131,46 +252,49 @@ async fn stop_dev(
     } else {
         "Partially stopped but continue execution"
     };
-    Ok(Json(json!({
-        "success": true,
-        "message": message,
-        "projectId": q.project_id,
-        "pid": null,
-        "killedPids": stopped.killed_pids,
-    })))
+    Ok(Json(response::DevStopped {
+        success: true,
+        message: message.to_string(),
+        project_id: q.project_id,
+        pid: None,
+        killed_pids: stopped.killed_pids,
+    }))
 }
 
 /// `GET /api/build/restart-dev` (对齐 nuwax restart-dev)。
 async fn restart_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<response::DevStarted>, AppError> {
     let path = project_path(&state, &q);
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
         .restart_dev(&q.project_id, &path, base)
         .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Development server restart successfully",
-        "projectId": q.project_id,
-        "pid": started.pid,
-        "port": started.port,
-    })))
+    Ok(Json(response::DevStarted {
+        success: true,
+        message: "Development server restart successfully".to_string(),
+        project_id: q.project_id,
+        pid: started.pid,
+        port: started.port,
+    }))
 }
 
 /// `GET /api/build/list-dev` (对齐 nuwax list-dev)。
-async fn list_dev(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn list_dev(State(state): State<AppState>) -> Result<Json<response::DevList>, AppError> {
     let list = state.dev_server.list_dev()?;
-    Ok(Json(json!({ "success": true, "list": list })))
+    Ok(Json(response::DevList {
+        success: true,
+        list,
+    }))
 }
 
 /// `GET /api/build/keep-alive` (对齐 nuwax keep-alive)。
 async fn keep_alive(
     State(state): State<AppState>,
     Query(q): Query<KeepAliveQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<response::KeepAlive>, AppError> {
     // 对齐 nuwax buildRoutes: projectId/pid/port/basePath 必填校验
     let pid = q
         .pid
@@ -189,62 +313,63 @@ async fn keep_alive(
     // pid/port: 重启分支用新值, alive 分支用查询入参 (对齐 nuwax)
     let out_pid = result.pid.unwrap_or(pid);
     let out_port = result.port.unwrap_or(q.port);
-    let mut resp = json!({
-        "success": true,
-        "projectId": q.project_id,
-        "pid": out_pid,
-        "port": out_port,
-    });
-    if result.alive && result.action.is_none() {
-        resp["message"] = json!("Development server is alive");
-    }
-    if let Some(action) = result.action {
-        // nuwax 重启分支透传 startDevServer 的 message
-        resp["message"] = json!("Development server started");
-        resp["action"] = json!(action);
-    }
-    Ok(Json(resp))
+    // message/action: 重启分支 (action Some) → "started" + action; 否则 alive → "is alive"
+    let (message, action) = if let Some(act) = result.action {
+        ("Development server started".to_string(), Some(act))
+    } else {
+        ("Development server is alive".to_string(), None)
+    };
+    Ok(Json(response::KeepAlive {
+        success: true,
+        project_id: q.project_id,
+        pid: out_pid,
+        port: out_port,
+        message,
+        action,
+    }))
 }
 
 /// `GET /api/build/port-pool-status` (对齐 nuwax port-pool-status)。
-async fn port_pool_status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn port_pool_status(
+    State(state): State<AppState>,
+) -> Result<Json<response::PortPool>, AppError> {
     let status = state.dev_server.port_pool_status()?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Get port pool status successfully",
-        "portRange": status.port_range,
-        "totalAllocated": status.total_allocated,
-        "allocations": status.allocations,
-    })))
+    Ok(Json(response::PortPool {
+        success: true,
+        message: "Get port pool status successfully".to_string(),
+        port_range: status.port_range,
+        total_allocated: status.total_allocated,
+        allocations: status.allocations,
+    }))
 }
 
 /// `GET /api/build/get-dev-log` (对齐 nuwax get-dev-log)。
 async fn get_dev_log(
     State(state): State<AppState>,
     Query(q): Query<DevLogQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<response::DevLog>, AppError> {
     let result = state
         .dev_server
         .read_dev_log(&q.project_id, q.start_index, &q.log_type)
         .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Get log successfully",
-        "logs": result.logs,
-        "totalLines": result.total_lines,
-        "startIndex": result.start_index,
-        "logFileName": result.log_file_name,
+    Ok(Json(response::DevLog {
+        success: true,
+        message: "Get log successfully".to_string(),
+        logs: result.logs,
+        total_lines: result.total_lines,
+        start_index: result.start_index,
+        log_file_name: result.log_file_name,
         // Rust 无缓存层, 固定 false (对齐 nuwax getDevLog 字段)
-        "cacheHit": false,
-        "fileTooLarge": false,
-    })))
+        cache_hit: false,
+        file_too_large: false,
+    }))
 }
 
 /// `GET /api/build/build` (对齐 nuwax buildProject): install + build + 拷贝 dist。
 async fn build_project(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<response::BuildDone>, AppError> {
     let path = project_path(&state, &q);
     if !path.exists() {
         return Err(AppError::resource("project does not exist"));
@@ -344,11 +469,11 @@ async fn build_project(
     tokio::task::spawn_blocking(move || copy_dir_all(&src2, &dst2))
         .await
         .map_err(|e| AppError::system(format!("copy dist join: {e}")))??;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Build completed",
-        "projectId": q.project_id,
-    })))
+    Ok(Json(response::BuildDone {
+        success: true,
+        message: "Build completed".to_string(),
+        project_id: q.project_id.clone(),
+    }))
 }
 
 /// build basePath 规范化 (对齐 nuwax: 补首尾 `/`; vite --base 需尾斜杠)。
@@ -426,35 +551,39 @@ struct ParseErrorBody {
 async fn parse_build_error(
     State(_state): State<AppState>,
     Json(body): Json<ParseErrorBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<response::Simple>, AppError> {
     let msg = crate::service::build_error::parse(&body.error_message);
-    Ok(Json(json!({ "success": true, "message": msg })))
+    Ok(Json(response::Simple {
+        success: true,
+        message: msg,
+    }))
 }
 
 // ── 日志缓存接口 (对齐 nuwax logCacheManager; Rust 无缓存层, 返回固定 stats) ────
 
 /// `GET /api/build/get-log-cache-stats` (对齐 nuwax; Rust 无缓存层 → 返回 disabled 形态)。
-async fn get_log_cache_stats(State(_state): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "success": true,
-        "message": "Get log cache statistics successfully",
-        "stats": {
-            "enabled": false,
-            "cacheSize": 0,
-            "maxCacheEntries": 100,
-            "cacheDuration": 300000,
-            "maxFileSizeMB": "0.00",
-            "totalCacheSizeMB": "0.00",
-            "NODE_ENV": std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string()),
-            "LOG_CACHE_ENABLED": std::env::var("LOG_CACHE_ENABLED").unwrap_or_else(|_| "false".to_string()),
-        }
-    }))
+async fn get_log_cache_stats(State(_state): State<AppState>) -> Json<response::LogCacheStats> {
+    Json(response::LogCacheStats {
+        success: true,
+        message: "Get log cache statistics successfully".to_string(),
+        stats: response::LogCacheStatsData {
+            enabled: false,
+            cache_size: 0,
+            max_cache_entries: 100,
+            cache_duration: 300000,
+            max_file_size_mb: "0.00".to_string(),
+            total_cache_size_mb: "0.00".to_string(),
+            node_env: std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string()),
+            log_cache_enabled: std::env::var("LOG_CACHE_ENABLED")
+                .unwrap_or_else(|_| "false".to_string()),
+        },
+    })
 }
 
 /// `GET /api/build/clear-all-log-cache` (对齐 nuwax; Rust 无缓存层 → no-op)。
-async fn clear_all_log_cache(State(_state): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "success": true,
-        "message": "All log caches have been cleared",
-    }))
+async fn clear_all_log_cache(State(_state): State<AppState>) -> Json<response::Simple> {
+    Json(response::Simple {
+        success: true,
+        message: "All log caches have been cleared".to_string(),
+    })
 }
