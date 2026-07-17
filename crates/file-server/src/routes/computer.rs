@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::error::{AppError, AppResult};
 use crate::path_safety;
-use crate::service::{code as code_service, tree, zip};
+use crate::service::{code as code_service, skills as skills_service, tree, zip};
 use crate::workspace::ComputerContext;
 use crate::AppState;
 
@@ -37,6 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/import-project", post(import_project))
         .route("/cleanup-build-artifacts", post(cleanup_build_artifacts))
         .route("/create-workspace", post(create_workspace))
+        .route("/push-skills-to-workspace", post(push_skills_to_workspace))
 }
 
 async fn text_field(field: axum::extract::multipart::Field<'_>) -> Result<String, AppError> {
@@ -750,5 +751,52 @@ async fn create_workspace(
     })))
 }
 
-// 待实现 (复杂/低频): create-workspace-v2 agent hook 配置 / push-skills-to-workspace[-v2]
-// (skills_service 需 path 制改造) / init-project-template / build-agent-package
+// ── push-skills-to-workspace (multipart: file zip 和/或 skillUrls) ────────────────
+
+/// `POST /api/computer/push-skills-to-workspace` (对齐 nuwax pushSkillsToWorkspace;
+/// 复用 skills_service::push_skills_at, 推到 .claude/skills + syncAgents)。
+async fn push_skills_to_workspace(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let mut user_id = None;
+    let mut cid = None;
+    let mut zip_data: Option<Vec<u8>> = None;
+    let mut skill_urls: Vec<String> = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "userId" => user_id = Some(text_field(field).await?),
+            "cId" => cid = Some(text_field(field).await?),
+            "file" => zip_data = Some(bytes_field(field).await?),
+            "skillUrls" => {
+                let t = text_field(field).await?;
+                if let Ok(urls) = serde_json::from_str::<Vec<String>>(&t) {
+                    skill_urls.extend(urls);
+                } else {
+                    skill_urls.push(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
+    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    let ws = ws_path(&state, &user_id, &cid);
+    if !tokio::fs::try_exists(&ws).await.unwrap_or(false) {
+        return Err(AppError::resource("workspace does not exist"));
+    }
+    let updated = skills_service::push_skills_at(&ws, zip_data, skill_urls).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Skills pushed to workspace",
+        "workspaceRoot": ws.display().to_string(),
+        "updatedSkills": updated,
+    })))
+}
+
+// 待实现 (低频/复杂): create-workspace-v2 agent hook 配置 / init-project-template /
+// build-agent-package

@@ -25,17 +25,31 @@ pub async fn push_skills(
     if project_id.is_empty() {
         return Err(AppError::validation("Project ID cannot be empty"));
     }
+    let project_path = resolver.resolve_project(ctx);
+    if !fs::try_exists(&project_path).await.unwrap_or(false) {
+        return Err(AppError::resource("Project does not exist"));
+    }
+    let updated = push_skills_at(&project_path, zip_data, skill_urls).await?;
+    Ok(PushResult {
+        project_path: project_path.to_string_lossy().to_string(),
+        updated_skills: updated,
+    })
+}
+
+/// 推送 skills 核心 (path 制): 解压 zip/url → .claude/skills, 再 sync_agents。
+/// project 路由 (push_skills) 与 computer 路由共用。
+pub async fn push_skills_at(
+    workspace: &Path,
+    zip_data: Option<Vec<u8>>,
+    skill_urls: Vec<String>,
+) -> AppResult<Vec<String>> {
     if zip_data.is_none() && skill_urls.is_empty() {
         return Err(AppError::validation(
             "file or skillUrls cannot both be empty",
         ));
     }
-    let project_path = resolver.resolve_project(ctx);
-    if !fs::try_exists(&project_path).await.unwrap_or(false) {
-        return Err(AppError::resource("Project does not exist"));
-    }
-    let claude_skills = project_path.join(".claude").join("skills");
-    let claude_agents = project_path.join(".claude").join("agents");
+    let claude_skills = workspace.join(".claude").join("skills");
+    let claude_agents = workspace.join(".claude").join("agents");
     fs::create_dir_all(&claude_skills).await?;
     fs::create_dir_all(&claude_agents).await?;
 
@@ -77,11 +91,8 @@ pub async fn push_skills(
         let _ = fs::remove_dir_all(&extract_root).await;
     }
 
-    sync_agents(&project_path).await?;
-    Ok(PushResult {
-        project_path: project_path.to_string_lossy().to_string(),
-        updated_skills: updated,
-    })
+    sync_agents(workspace).await?;
+    Ok(updated)
 }
 
 async fn fetch_url(url: &str) -> AppResult<Vec<u8>> {
