@@ -1957,6 +1957,8 @@ dependencies = [
  "encoding_rs",
  "gix",
  "mime_guess",
+ "nix 0.31.3",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
