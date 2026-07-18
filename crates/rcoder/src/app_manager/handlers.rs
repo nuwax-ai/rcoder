@@ -456,24 +456,21 @@ pub async fn upload_file(
         match name.as_str() {
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                let data = field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::bad_request(&format!("failed to read file data: {}", e)))?;
+                let data = field.bytes().await.map_err(|e| {
+                    AppError::bad_request(&format!("failed to read file data: {}", e))
+                })?;
                 file_data = Some(data.to_vec());
             }
             "target" => {
-                let data = field
-                    .text()
-                    .await
-                    .map_err(|e| AppError::bad_request(&format!("failed to read target path: {}", e)))?;
+                let data = field.text().await.map_err(|e| {
+                    AppError::bad_request(&format!("failed to read target path: {}", e))
+                })?;
                 target_path = Some(data);
             }
             "flatten" => {
-                let data = field
-                    .text()
-                    .await
-                    .map_err(|e| AppError::bad_request(&format!("failed to read flatten: {}", e)))?;
+                let data = field.text().await.map_err(|e| {
+                    AppError::bad_request(&format!("failed to read flatten: {}", e))
+                })?;
                 flatten = data == "true" || data == "1";
             }
             _ => {}

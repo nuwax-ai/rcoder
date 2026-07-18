@@ -287,7 +287,10 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
     // app 专用端口代理（按 app_id+port 路由，解决多 app 同端口冲突）：
     // /proxy/apps/{app_id}/{port}/{path} -> 对应 app 的后端（app_backends 表）
     router
-        .insert("/proxy/apps/{app_id}/{port}/{*path}", RouteType::AppPortProxy)
+        .insert(
+            "/proxy/apps/{app_id}/{port}/{*path}",
+            RouteType::AppPortProxy,
+        )
         .map_err(|e| {
             tracing::error!("[ROUTER] app port proxy route config failed: {}", e);
             crate::ProxyError::RouteConfig(format!(

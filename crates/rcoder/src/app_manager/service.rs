@@ -27,7 +27,9 @@ use container_runtime_api::{
     ContainerRuntimeError, DeploymentStatus, ExposeType as RtExposeType,
     HealthCheckType as RtHealthCheckType, HttpExpose,
 };
-use download_utils::{detect_file_type, extract_tar_gz, extract_zip, normalize_extracted_dir, ArchiveError};
+use download_utils::{
+    ArchiveError, detect_file_type, extract_tar_gz, extract_zip, normalize_extracted_dir,
+};
 use rcoder_proxy::PingoraProxyService;
 use shared_types::ServiceType;
 
@@ -154,7 +156,11 @@ impl AppService {
         let http_port_count = request
             .ports
             .as_ref()
-            .map(|ps| ps.iter().filter(|p| p.expose_type == ExposeType::Http).count())
+            .map(|ps| {
+                ps.iter()
+                    .filter(|p| p.expose_type == ExposeType::Http)
+                    .count()
+            })
             .unwrap_or(0);
         if http_port_count > 1 {
             return Err(AppOperationError::Validation(format!(
@@ -183,7 +189,10 @@ impl AppService {
 
         // 3. 创建 Deployment / 容器（K8s 含 ConfigMap/Secret/Service/HTTPRoute/NodePort）
         let container_info = self.runtime.create_deployment(params).await.map_err(|e| {
-            map_runtime_error(&format!("[APP] create_deployment failed app_id={app_id}"), e)
+            map_runtime_error(
+                &format!("[APP] create_deployment failed app_id={app_id}"),
+                e,
+            )
         })?;
         info!(
             "[APP] 应用资源创建成功: {} (container={})",
@@ -408,7 +417,10 @@ impl AppService {
         // 2. 删除计算资源（K8s: Deployment/Service/HTTPRoute/NodePort/ConfigMap/Secret
         //    + label orphan 扫描兜底；Docker: 容器）。持久存储默认保留。
         self.runtime.delete_deployment(app_id).await.map_err(|e| {
-            map_runtime_error(&format!("[APP] delete_deployment failed app_id={app_id}"), e)
+            map_runtime_error(
+                &format!("[APP] delete_deployment failed app_id={app_id}"),
+                e,
+            )
         })?;
 
         // 3. 仅 purge=true 时清空持久存储（code/data/logs 目录）。
@@ -467,7 +479,9 @@ impl AppService {
             Ok(None) => {}
             Err(e) => {
                 warn!("[APP] 查询应用状态失败 app_id={}: {}", app_id, e);
-                return Err(AppOperationError::Backend(format!("failed to query app status: {e}")));
+                return Err(AppOperationError::Backend(format!(
+                    "failed to query app status: {e}"
+                )));
             }
         }
         let app_dir = self.get_container_app_dir(app_id);
@@ -488,7 +502,9 @@ impl AppService {
         request: QueryStorageRequest,
     ) -> AppResult<PaginatedResponse<StorageInfo>> {
         if request.page == 0 {
-            return Err(AppOperationError::Validation("page starts from 1".to_string()));
+            return Err(AppOperationError::Validation(
+                "page starts from 1".to_string(),
+            ));
         }
         if request.page_size == 0 || request.page_size > 100 {
             return Err(AppOperationError::Validation(
@@ -640,7 +656,10 @@ impl AppService {
         validate_app_id(app_id)?;
         self.ensure_app_exists(app_id).await?;
         self.runtime.restart_deployment(app_id).await.map_err(|e| {
-            map_runtime_error(&format!("[APP] restart_deployment failed app_id={app_id}"), e)
+            map_runtime_error(
+                &format!("[APP] restart_deployment failed app_id={app_id}"),
+                e,
+            )
         })?;
         info!("[APP] 应用已重启 (rollout): {}", app_id);
         self.get_app(app_id).await
@@ -745,7 +764,9 @@ impl AppService {
         // 读文件，取最后 tail 行
         let content = tokio::fs::read_to_string(&canonical_target)
             .await
-            .map_err(|e| map_io_error(&format!("failed to read log file '{file_path}'"), e, true))?;
+            .map_err(|e| {
+                map_io_error(&format!("failed to read log file '{file_path}'"), e, true)
+            })?;
         let lines: Vec<&str> = content.lines().collect();
         let start = lines.len().saturating_sub(tail as usize);
         Ok(lines[start..]
@@ -774,7 +795,9 @@ impl AppService {
         validate_app_id(app_id)?;
         validate_upload_target(target)?; // create_dir_all 前拦截 ../ 与绝对路径（避免副作用泄漏）
         if file_data.is_empty() {
-            return Err(AppOperationError::Validation("file data is empty".to_string()));
+            return Err(AppOperationError::Validation(
+                "file data is empty".to_string(),
+            ));
         }
         let app_dir = self.get_container_app_dir(app_id);
         fs::create_dir_all(&app_dir)
@@ -788,8 +811,15 @@ impl AppService {
         let file_type = detect_file_type(&file_data);
         match file_type {
             "zip" | "tar.gz" => {
-                self.extract_archive(app_id, file_data, file_type, target, flatten, &canonical_app_dir)
-                    .await
+                self.extract_archive(
+                    app_id,
+                    file_data,
+                    file_type,
+                    target,
+                    flatten,
+                    &canonical_app_dir,
+                )
+                .await
             }
             _ => {
                 // 单文件分支（target=文件路径，app 根相对）
@@ -849,8 +879,8 @@ impl AppService {
         let file_type = file_type.to_string(); // 由 upload_file 传入（避免重复 detect）
         let dest_clone = canonical_dest.clone();
         // spawn_blocking：写临时文件 + 解压（同步 IO，不阻塞 tokio；TempPath 闭包结束自动删）
-        let count = tokio::task::spawn_blocking(
-            move || -> std::result::Result<usize, ArchiveError> {
+        let count =
+            tokio::task::spawn_blocking(move || -> std::result::Result<usize, ArchiveError> {
                 let mut tmp = tempfile::NamedTempFile::new()?;
                 tmp.write_all(&file_data)?;
                 let tmp_path = tmp.into_temp_path();
@@ -861,11 +891,10 @@ impl AppService {
                         "unsupported: {file_type}"
                     ))),
                 }
-            },
-        )
-        .await
-        .map_err(|e| AppOperationError::Backend(format!("extraction task failed: {e}")))?
-        .map_err(map_archive_error)?;
+            })
+            .await
+            .map_err(|e| AppOperationError::Backend(format!("extraction task failed: {e}")))?
+            .map_err(map_archive_error)?;
 
         if flatten {
             normalize_extracted_dir(&canonical_dest).map_err(map_archive_error)?;
@@ -1100,7 +1129,8 @@ impl AppService {
     ) -> AppResult<ContainerCreateParams> {
         let image = request.image.clone().ok_or_else(|| {
             AppOperationError::Validation(
-                "update requires image (rcoder is stateless, cannot retain previous image)".to_string(),
+                "update requires image (rcoder is stateless, cannot retain previous image)"
+                    .to_string(),
             )
         })?;
 
@@ -1190,10 +1220,14 @@ impl AppService {
     async fn fetch_runtime_status_or_err(&self, app_id: &str) -> AppResult<DeploymentStatus> {
         match self.runtime.get_deployment_status(app_id).await {
             Ok(Some(s)) => Ok(s),
-            Ok(None) => Err(AppOperationError::NotFound(format!("app does not exist: {app_id}"))),
+            Ok(None) => Err(AppOperationError::NotFound(format!(
+                "app does not exist: {app_id}"
+            ))),
             Err(e) => {
                 warn!("[APP] 查询应用状态失败 app_id={}: {}", app_id, e);
-                Err(AppOperationError::Backend(format!("failed to query app status: {e}")))
+                Err(AppOperationError::Backend(format!(
+                    "failed to query app status: {e}"
+                )))
             }
         }
     }
@@ -1508,7 +1542,9 @@ fn map_archive_error(e: ArchiveError) -> AppOperationError {
 /// 拒绝，但目录已落盘）。
 fn validate_upload_target(target: &str) -> AppResult<()> {
     if target.trim_end_matches('/').is_empty() {
-        return Err(AppOperationError::Validation("target must not be empty".to_string()));
+        return Err(AppOperationError::Validation(
+            "target must not be empty".to_string(),
+        ));
     }
     if target.starts_with('/') {
         return Err(AppOperationError::Validation(

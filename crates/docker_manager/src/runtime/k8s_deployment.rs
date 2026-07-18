@@ -1293,10 +1293,11 @@ impl KubernetesRuntime {
                             }
                             Some(ExposeType::Http) => (ExposeType::Http, None),
                             // 回退：无 annotation（旧 app）—— 在 NodePort Service 里 = Tcp，否则 Http
-                            None => tcp_nodeports.get(&name).map_or(
-                                (ExposeType::Http, None),
-                                |np| (ExposeType::Tcp, Some(*np)),
-                            ),
+                            None => tcp_nodeports
+                                .get(&name)
+                                .map_or((ExposeType::Http, None), |np| {
+                                    (ExposeType::Tcp, Some(*np))
+                                }),
                         };
                         AppPortStatus {
                             name,
