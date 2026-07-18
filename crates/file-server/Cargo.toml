@@ -53,6 +53,9 @@ garde = { workspace = true, features = ["derive"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
+# async trait (WorkspaceResolver trait async 化, 阶段2 SubvolumeWorkspaceResolver)
+async-trait = { workspace = true }
+
 # 时间 (错误响应 timestamp)
 chrono = { workspace = true }
 

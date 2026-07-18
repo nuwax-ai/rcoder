@@ -48,7 +48,7 @@ pub async fn specified_files_update(
     version::parse_version(code_version)?; // 校验为数字
     let validated_ops = validate_file_ops(files)?;
 
-    let project_path = resolver.resolve_project(ctx)?;
+    let project_path = resolver.resolve_project(ctx).await?;
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }

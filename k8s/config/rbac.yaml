@@ -13,6 +13,10 @@ rules:
     resources:
       ["pods", "pods/log", "pods/exec", "services", "endpoints", "persistentvolumeclaims", "events"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+  # persistentvolumes: 读 PV csi.volumeAttributes.subvolumePath(阶段2 rcoder 挂根聚合访问 agent subvolume)
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

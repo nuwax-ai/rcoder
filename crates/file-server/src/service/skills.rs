@@ -27,7 +27,7 @@ pub async fn push_skills(
     if project_id.is_empty() {
         return Err(AppError::validation("Project ID cannot be empty"));
     }
-    let project_path = resolver.resolve_project(ctx)?;
+    let project_path = resolver.resolve_project(ctx).await?;
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }

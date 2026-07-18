@@ -53,13 +53,14 @@ fn computer_ctx(q: &GitQuery) -> Option<ComputerContext> {
 }
 
 /// GET 路由解析: GitQuery → (workspace path, logId)。
-pub(super) fn resolve(q: &GitQuery, state: &AppState) -> Result<(PathBuf, String), AppError> {
+pub(super) async fn resolve(q: &GitQuery, state: &AppState) -> Result<(PathBuf, String), AppError> {
     let target = git::resolve_target(
         &*state.resolver,
         q.workspace_type.as_deref().unwrap_or(""),
         project_ctx(q).as_ref(),
         computer_ctx(q).as_ref(),
-    )?;
+    )
+    .await?;
     Ok((target.path().to_path_buf(), target.log_id()))
 }
 
@@ -80,7 +81,7 @@ pub(crate) struct GitWriteBody {
 }
 
 /// POST 路由解析: GitWriteBody → (workspace path, logId)。
-pub(super) fn resolve_body(
+pub(super) async fn resolve_body(
     state: &AppState,
     body: &GitWriteBody,
 ) -> Result<(PathBuf, String), AppError> {
@@ -102,6 +103,7 @@ pub(super) fn resolve_body(
         &body.workspace_type,
         project_ctx.as_ref(),
         computer_ctx.as_ref(),
-    )?;
+    )
+    .await?;
     Ok((target.path().to_path_buf(), target.log_id()))
 }

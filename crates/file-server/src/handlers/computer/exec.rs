@@ -34,7 +34,7 @@ pub(crate) async fn execute_command(
     State(state): State<AppState>,
     Json(body): Json<ExecCommandBody>,
 ) -> Result<Json<Value>, AppError> {
-    let cwd = ws_path(&state, &body.user_id, &body.c_id)?;
+    let cwd = ws_path(&state, &body.user_id, &body.c_id).await?;
     if !cwd.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -91,7 +91,7 @@ pub(crate) async fn get_logs(
     State(state): State<AppState>,
     Query(q): Query<GetLogsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let log_dir = resolve_computer_target(&state, &q.user_id, &q.c_id, None)?.join(".logs");
+    let log_dir = resolve_computer_target(&state, &q.user_id, &q.c_id, None).await?.join(".logs");
     let empty_resp = |msg: &str| {
         Json(json!({
             "success": true,
@@ -179,7 +179,7 @@ pub(crate) async fn install_project(
     State(state): State<AppState>,
     Json(body): Json<InstallBody>,
 ) -> Result<Json<Value>, AppError> {
-    let ws = ws_path(&state, &body.user_id, &body.c_id)?;
+    let ws = ws_path(&state, &body.user_id, &body.c_id).await?;
     if !ws.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -278,7 +278,7 @@ pub(crate) async fn build_agent_package(
     State(state): State<AppState>,
     Json(body): Json<BuildAgentBody>,
 ) -> Result<Json<Value>, AppError> {
-    let ws = ws_path(&state, &body.user_id, &body.c_id)?;
+    let ws = ws_path(&state, &body.user_id, &body.c_id).await?;
     if !ws.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -345,7 +345,8 @@ pub(crate) async fn cleanup_build_artifacts(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
-    )?;
+    )
+    .await?;
     if !ws.exists() {
         return Ok(Json(json!({ "success": true, "cleaned": false })));
     }

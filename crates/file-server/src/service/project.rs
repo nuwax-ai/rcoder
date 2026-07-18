@@ -36,7 +36,7 @@ pub async fn delete_project(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     // HTTP handler 已在请求带 pid 时先停止旧 dev server；service 只负责目录事务。
-    let project_path = resolver.resolve_project(ctx)?;
+    let project_path = resolver.resolve_project(ctx).await?;
     let targets = [
         config.upload_project_dir.join(project_id),
         project_path,
@@ -89,7 +89,7 @@ pub async fn create_project(
         // react
         _ => config.init_project_name_react.as_str(),
     };
-    let project_path = resolver.resolve_project(ctx)?;
+    let project_path = resolver.resolve_project(ctx).await?;
     if try_exists(&project_path).await? {
         return Err(AppError::business("Project directory already exists"));
     }
@@ -162,8 +162,8 @@ pub async fn copy_project(
             "sourceProjectId and targetProjectId cannot be empty",
         ));
     }
-    let source_path = resolver.resolve_project(source_ctx)?;
-    let target_path = resolver.resolve_project(target_ctx)?;
+    let source_path = resolver.resolve_project(source_ctx).await?;
+    let target_path = resolver.resolve_project(target_ctx).await?;
     if !try_exists(&source_path).await? {
         return Err(AppError::business("Source project does not exist"));
     }
@@ -259,7 +259,7 @@ pub async fn upload_project(
         return Err(AppError::validation("Code version cannot be empty"));
     }
     let version = crate::service::version::parse_version(code_version)?;
-    let project_path = resolver.resolve_project(ctx)?;
+    let project_path = resolver.resolve_project(ctx).await?;
 
     let parent = project_path
         .parent()
@@ -385,7 +385,7 @@ pub async fn export_project(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     let version = crate::service::version::parse_version(code_version)?;
-    let project_path = resolver.resolve_project(ctx)?;
+    let project_path = resolver.resolve_project(ctx).await?;
     if !try_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }

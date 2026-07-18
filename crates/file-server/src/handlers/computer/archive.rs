@@ -90,7 +90,7 @@ pub(crate) async fn zip_workspace(
     State(state): State<AppState>,
     Json(body): Json<ZipBody>,
 ) -> Result<Response, AppError> {
-    let src = ws_path(&state, &body.user_id, &body.c_id)?;
+    let src = ws_path(&state, &body.user_id, &body.c_id).await?;
     if !src.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -133,7 +133,7 @@ pub(crate) async fn download_all_files(
     State(state): State<AppState>,
     Query(q): Query<UserCidQuery>,
 ) -> Result<Response, AppError> {
-    let src = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())?;
+    let src = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref()).await?;
     let prefix = format!("{}_{}/", q.user_id, q.c_id);
     let filename = format!("{}_{}.zip", q.user_id, q.c_id);
     let tmp = computer_tmp_zip(&state).await?;

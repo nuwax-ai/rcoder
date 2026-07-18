@@ -114,7 +114,7 @@ pub async fn backup_current_version(
     if project_id.is_empty() {
         return Err(AppError::validation("Project ID cannot be empty"));
     }
-    let project_path = resolver.resolve_project(ctx)?;
+    let project_path = resolver.resolve_project(ctx).await?;
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
@@ -153,7 +153,7 @@ pub async fn rollback_version(
             "rollbackTo must be less than codeVersion",
         ));
     }
-    let project_path = resolver.resolve_project(ctx)?;
+    let project_path = resolver.resolve_project(ctx).await?;
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
@@ -216,7 +216,7 @@ pub async fn get_content_by_version(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     let version = parse_version(code_version)?;
-    let project_path = resolver.resolve_project(ctx)?;
+    let project_path = resolver.resolve_project(ctx).await?;
     let zip = version_zip_path(config, project_id, version);
     if !crate::service::fs_util::path_exists(&zip).await? {
         return Err(AppError::resource(format!(

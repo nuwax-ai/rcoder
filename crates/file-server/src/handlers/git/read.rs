@@ -22,7 +22,7 @@ pub(crate) async fn branches(
     State(state): State<AppState>,
     Query(q): Query<GitQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve(&q, &state)?;
+    let (path, log_id) = resolve(&q, &state).await?;
     let (branches, current) = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         if !path.exists() {
             return Err(AppError::resource("workspace does not exist"));
@@ -61,7 +61,7 @@ pub(crate) async fn tags(
     State(state): State<AppState>,
     Query(q): Query<GitQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve(&q, &state)?;
+    let (path, log_id) = resolve(&q, &state).await?;
     let tags = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         if !path.exists() {
             return Err(AppError::resource("workspace does not exist"));
@@ -110,7 +110,7 @@ pub(crate) async fn log_history(
     State(state): State<AppState>,
     Query(q): Query<GitLogQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve(&q.base, &state)?;
+    let (path, log_id) = resolve(&q.base, &state).await?;
     let max_count = q.max_count.unwrap_or(50).clamp(1, 500);
     let skip = q.skip.unwrap_or(0);
     let branch = q.branch.clone();
@@ -155,7 +155,7 @@ pub(crate) async fn file_content(
     State(state): State<AppState>,
     Json(body): Json<FileContentBody>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let ref_spec = body.ref_.clone().unwrap_or_else(|| "HEAD".to_string());
     let file_path = body.file_path.clone();
     let read_worktree = matches!(ref_spec.as_str(), "worktree" | "staged" | "");
@@ -209,7 +209,7 @@ pub(crate) async fn status(
     State(state): State<AppState>,
     Query(q): Query<GitQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve(&q, &state)?;
+    let (path, log_id) = resolve(&q, &state).await?;
     let result = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         if !path.exists() {
             return Err(AppError::resource("workspace does not exist"));

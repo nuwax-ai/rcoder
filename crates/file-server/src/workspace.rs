@@ -2,18 +2,25 @@
 //!
 //! - 阶段 1 [`LocalWorkspaceResolver`]: 读环境变量, 等价 nuwax-file-server 现状
 //!   (本地 fs 直读; rcoder 与 file-server 同 pod 挂共享 PVC subPath)。
-//! - 阶段 2 `SubvolumeWorkspaceResolver` (后续 task): 经 `ContainerRuntime` 拿
-//!   PV `subvolumePath` → `/app/cephfs-root/{subvolumePath}` 聚合访问 agent 数据。
+//! - 阶段 2 [`SubvolumeWorkspaceResolver`]: 经 rcoder 注入的 [`WorkspacePathResolver`]
+//!   拿 per-agent PVC 的 subvolume 聚合路径 → `{cephfs-root}/{subvolumePath}/{leaf}`。
 //!
 //! 路径规则对齐 nuwax `projectPathUtils.js`:
 //! - web/page: tenant+space+isolationType 均非空 → 三级, 否则单级
 //!   (对齐 `shouldUseIsolationPath`: 三者都非空才启用; `isolationType` 仅作开关不进路径)
 //! - computer/task: 固定二级 (userId/cId)
+//!
+//! 阶段 2 (Subvolume) 数据布局: per-agent PVC (CephFS subvolume) 吸收多租户层级 ——
+//! project leaf={projectId} (tenant/space 进 PVC 身份), computer leaf={cid} (user_id 进 PVC 身份)。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
+use shared_types::ServiceType;
+use tracing::warn;
 
 use crate::error::{AppError, AppResult};
 
@@ -51,12 +58,14 @@ pub struct ComputerContext {
 /// 工作区路径解析抽象 (阶段 1 本地 / 阶段 2 subvolume 聚合)。
 ///
 /// 实现需 `Send + Sync` 以便经 `Arc<dyn WorkspaceResolver>` 注入 axum `AppState`。
+/// 方法为 `async` (阶段 2 Subvolume 要 async 调 rcoder 经 K8s API 读 PV subvolumePath)。
+#[async_trait]
 pub trait WorkspaceResolver: Send + Sync {
     /// 解析 web/page 项目工作区绝对路径。
-    fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf>;
+    async fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf>;
 
     /// 解析 computer/task 工作区绝对路径。
-    fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf>;
+    async fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf>;
 }
 
 /// 阶段 1 实现: 读环境变量的本地路径解析, 等价 nuwax-file-server 现状。
@@ -101,8 +110,9 @@ fn validated_identifier<'a>(value: &'a str, field: &str) -> AppResult<&'a str> {
     Ok(value)
 }
 
+#[async_trait]
 impl WorkspaceResolver for LocalWorkspaceResolver {
-    fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf> {
+    async fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf> {
         let project_id = validated_identifier(&ctx.project_id, "projectId")?;
         // 对齐 nuwax `shouldUseIsolationPath`: tenant+space+isolationType 均非空才三级
         let path = match (
@@ -121,12 +131,93 @@ impl WorkspaceResolver for LocalWorkspaceResolver {
         Ok(path)
     }
 
-    fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf> {
+    async fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf> {
         // 二级: {root}/{user}/{cid} (对齐 nuwax gitService.js)
         Ok(self
             .computer_root
             .join(validated_identifier(&ctx.user_id, "userId")?)
             .join(validated_identifier(&ctx.cid, "cId")?))
+    }
+}
+
+/// 阶段 2: identifier+service_type → rcoder 可访问 workspace 聚合路径的窄解析器。
+///
+/// file-server 不依赖 container-runtime-api; 由 rcoder 实现此 trait (内部包
+/// `ContainerRuntime::resolve_workspace_path`, 返回 `{cephfs_root}/{subvolumePath}`
+/// 完整聚合路径), 经 [`SubvolumeWorkspaceResolver`] 注入。返回 `None` 表示该 runtime
+/// 不提供聚合视角 (Docker 模式), 调用方降级到 Local。
+#[async_trait]
+pub trait WorkspacePathResolver: Send + Sync {
+    async fn resolve(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> AppResult<Option<PathBuf>>;
+}
+
+/// 阶段 2 实现: 经 rcoder 注入的 [`WorkspacePathResolver`] 拿 per-agent PVC 的 subvolume
+/// 聚合路径, 拼上 leaf → `{cephfs-root}/{subvolumePath}/{leaf}`。
+///
+/// 多租户 tenant/space 被 per-project PVC 吸收 (PVC 身份=project), leaf 不含 tenant/space;
+/// computer PVC per-user, leaf 不含 user_id。resolve 返回 None (Docker 模式 / K8s API 抖动 /
+/// PVC 未 Bound) → 降级到内置 [`LocalWorkspaceResolver`] (fail-open, 不阻断服务)。
+pub struct SubvolumeWorkspaceResolver {
+    path_resolver: Arc<dyn WorkspacePathResolver>,
+    fallback: LocalWorkspaceResolver,
+}
+
+impl SubvolumeWorkspaceResolver {
+    /// `path_resolver` 由 rcoder 注入 (包 `ContainerRuntime::resolve_workspace_path`)。
+    /// `fallback` 用 [`LocalWorkspaceResolver::from_env`] (Local 语义)。
+    pub fn new(path_resolver: Arc<dyn WorkspacePathResolver>) -> Self {
+        Self {
+            path_resolver,
+            fallback: LocalWorkspaceResolver::from_env(),
+        }
+    }
+}
+
+#[async_trait]
+impl WorkspaceResolver for SubvolumeWorkspaceResolver {
+    async fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf> {
+        let project_id = validated_identifier(&ctx.project_id, "projectId")?;
+        match self
+            .path_resolver
+            .resolve(project_id, &ServiceType::WebAgentRunner)
+            .await?
+        {
+            // {cephfs-root}/{subvolumePath}/{projectId} (tenant/space 被 per-project PVC 吸收)
+            Some(subvolume_base) => Ok(subvolume_base.join(project_id)),
+            None => {
+                warn!(
+                    "SubvolumeWorkspaceResolver: runtime returned None for project {}, \
+                     falling back to LocalWorkspaceResolver",
+                    project_id
+                );
+                self.fallback.resolve_project(ctx).await
+            }
+        }
+    }
+
+    async fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf> {
+        let user_id = validated_identifier(&ctx.user_id, "userId")?;
+        let cid = validated_identifier(&ctx.cid, "cId")?;
+        match self
+            .path_resolver
+            .resolve(user_id, &ServiceType::ComputerAgentRunner)
+            .await?
+        {
+            // {cephfs-root}/{subvolumePath}/{cid} (user_id 被 per-user PVC 吸收)
+            Some(subvolume_base) => Ok(subvolume_base.join(cid)),
+            None => {
+                warn!(
+                    "SubvolumeWorkspaceResolver: runtime returned None for user {}, \
+                     falling back to LocalWorkspaceResolver",
+                    user_id
+                );
+                self.fallback.resolve_computer(ctx).await
+            }
+        }
     }
 }
 
@@ -141,8 +232,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn resolve_project_single_level_when_no_isolation() {
+    #[tokio::test]
+    async fn resolve_project_single_level_when_no_isolation() {
         let r = resolver();
         let ctx = ProjectContext {
             project_id: "proj-1".into(),
@@ -151,13 +242,13 @@ mod tests {
             isolation_type: None,
         };
         assert_eq!(
-            r.resolve_project(&ctx).expect("resolve project"),
+            r.resolve_project(&ctx).await.expect("resolve project"),
             PathBuf::from("/app/project_workspace/proj-1")
         );
     }
 
-    #[test]
-    fn resolve_project_three_level_when_all_isolation_fields_present() {
+    #[tokio::test]
+    async fn resolve_project_three_level_when_all_isolation_fields_present() {
         let r = resolver();
         let ctx = ProjectContext {
             project_id: "proj-1".into(),
@@ -166,13 +257,13 @@ mod tests {
             isolation_type: Some("tenant".into()),
         };
         assert_eq!(
-            r.resolve_project(&ctx).expect("resolve project"),
+            r.resolve_project(&ctx).await.expect("resolve project"),
             PathBuf::from("/app/project_workspace/tenant-a/space-b/proj-1")
         );
     }
 
-    #[test]
-    fn resolve_project_falls_back_single_when_only_tenant() {
+    #[tokio::test]
+    async fn resolve_project_falls_back_single_when_only_tenant() {
         let r = resolver();
         let ctx = ProjectContext {
             project_id: "proj-1".into(),
@@ -181,13 +272,13 @@ mod tests {
             isolation_type: Some("tenant".into()),
         };
         assert_eq!(
-            r.resolve_project(&ctx).expect("resolve project"),
+            r.resolve_project(&ctx).await.expect("resolve project"),
             PathBuf::from("/app/project_workspace/proj-1")
         );
     }
 
-    #[test]
-    fn resolve_project_falls_back_single_when_isolation_type_missing() {
+    #[tokio::test]
+    async fn resolve_project_falls_back_single_when_isolation_type_missing() {
         // 对齐 nuwax: tenant+space 非空但 isolationType 空 → 仍单级
         let r = resolver();
         let ctx = ProjectContext {
@@ -197,13 +288,13 @@ mod tests {
             isolation_type: None,
         };
         assert_eq!(
-            r.resolve_project(&ctx).expect("resolve project"),
+            r.resolve_project(&ctx).await.expect("resolve project"),
             PathBuf::from("/app/project_workspace/proj-1")
         );
     }
 
-    #[test]
-    fn resolve_project_falls_back_single_when_blank_isolation() {
+    #[tokio::test]
+    async fn resolve_project_falls_back_single_when_blank_isolation() {
         // 空白字符串视为未设置
         let r = resolver();
         let ctx = ProjectContext {
@@ -213,26 +304,26 @@ mod tests {
             isolation_type: Some("".into()),
         };
         assert_eq!(
-            r.resolve_project(&ctx).expect("resolve project"),
+            r.resolve_project(&ctx).await.expect("resolve project"),
             PathBuf::from("/app/project_workspace/proj-1")
         );
     }
 
-    #[test]
-    fn resolve_computer_two_level() {
+    #[tokio::test]
+    async fn resolve_computer_two_level() {
         let r = resolver();
         let ctx = ComputerContext {
             user_id: "user-1".into(),
             cid: "cid-1".into(),
         };
         assert_eq!(
-            r.resolve_computer(&ctx).expect("resolve computer"),
+            r.resolve_computer(&ctx).await.expect("resolve computer"),
             PathBuf::from("/app/computer-project-workspace/user-1/cid-1")
         );
     }
 
-    #[test]
-    fn resolver_rejects_path_traversal_identifiers() {
+    #[tokio::test]
+    async fn resolver_rejects_path_traversal_identifiers() {
         let resolver = resolver();
         let project = ProjectContext {
             project_id: "../outside".into(),
@@ -240,7 +331,7 @@ mod tests {
             space_id: None,
             isolation_type: None,
         };
-        assert!(resolver.resolve_project(&project).is_err());
+        assert!(resolver.resolve_project(&project).await.is_err());
 
         let tenant = ProjectContext {
             project_id: "project".into(),
@@ -248,12 +339,12 @@ mod tests {
             space_id: Some("space".into()),
             isolation_type: Some("tenant".into()),
         };
-        assert!(resolver.resolve_project(&tenant).is_err());
+        assert!(resolver.resolve_project(&tenant).await.is_err());
 
         let computer = ComputerContext {
             user_id: "user".into(),
             cid: "../../outside".into(),
         };
-        assert!(resolver.resolve_computer(&computer).is_err());
+        assert!(resolver.resolve_computer(&computer).await.is_err());
     }
 }

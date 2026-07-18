@@ -69,7 +69,7 @@ pub(crate) async fn branch_create(
     Json(body): Json<BranchCreateBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.branch_name.clone();
     let sp = body.start_point.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
@@ -95,7 +95,7 @@ pub(crate) async fn branch_delete(
     Json(body): Json<BranchNameBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.branch_name.clone();
     let force = body.force.unwrap_or(false);
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
@@ -122,7 +122,7 @@ pub(crate) async fn tag_create(
     Json(body): Json<TagCreateBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.tag_name.clone();
     let msg = body.message.clone();
     let an = state.config.git_default_author_name.clone();
@@ -149,7 +149,7 @@ pub(crate) async fn tag_delete(
     Json(body): Json<TagNameBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.tag_name.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let repo = git::ensure_repo(&path)?;
@@ -172,7 +172,7 @@ pub(crate) async fn branch_switch(
     Json(body): Json<BranchNameBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.branch_name.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let repo = git::ensure_repo(&path)?;

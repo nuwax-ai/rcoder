@@ -45,7 +45,7 @@ pub(crate) async fn init(
     State(state): State<AppState>,
     Json(body): Json<GitWriteBody>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve_body(&state, &body)?;
+    let (path, log_id) = resolve_body(&state, &body).await?;
     let already = tokio::task::spawn_blocking(move || git::init_repo_only(&path))
         .await
         .map_err(|e| AppError::system(format!("git join: {e}")))??;
@@ -63,7 +63,7 @@ pub(crate) async fn add(
     State(state): State<AppState>,
     Json(body): Json<FilesBody>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         if !path.exists() {
@@ -89,7 +89,7 @@ pub(crate) async fn commit(
     Json(body): Json<CommitBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let message = body.message;
     let files = body.files.unwrap_or_default();
     let an = body
@@ -137,7 +137,7 @@ pub(crate) async fn unstage(
     State(state): State<AppState>,
     Json(body): Json<FilesBody>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
     let all = files.is_empty();
     let files_echo = files.clone();
@@ -170,7 +170,7 @@ pub(crate) async fn discard(
     State(state): State<AppState>,
     Json(body): Json<FilesBody>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
     let buckets = tokio::task::spawn_blocking(move || -> Result<git::DiscardBuckets, AppError> {
         if !path.exists() {
@@ -214,7 +214,7 @@ pub(crate) async fn diff(
     State(state): State<AppState>,
     Json(body): Json<DiffBody>,
 ) -> Result<Json<Value>, AppError> {
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let source = git::DiffSource::parse(&body.source)?;
     let params = git::DiffParams {
         source,
@@ -296,7 +296,7 @@ pub(crate) async fn reset(
     Json(body): Json<ResetBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let target = body.target.clone();
     let mode = git::ResetMode::parse(&body.mode)?;
     let mode_label = mode.to_string();
@@ -327,7 +327,7 @@ pub(crate) async fn checkout(
     Json(body): Json<TargetBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let target = body.target.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         if !path.exists() {
@@ -354,7 +354,7 @@ pub(crate) async fn revert(
     Json(body): Json<RevertBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    let (path, log_id) = resolve_body(&state, &body.base)?;
+    let (path, log_id) = resolve_body(&state, &body.base).await?;
     let target = body.target.clone();
     let message = body.message.clone();
     let an = body

@@ -75,7 +75,7 @@ impl GitTarget {
 }
 
 /// 解析 workspaceType + 路径 (对齐 nuwax resolveAndCheck)。
-pub fn resolve_target(
+pub async fn resolve_target(
     resolver: &dyn WorkspaceResolver,
     workspace_type: &str,
     project_ctx: Option<&ProjectContext>,
@@ -90,7 +90,7 @@ pub fn resolve_target(
                     "taskAgent mode requires userId and cId",
                 ));
             }
-            let path = resolver.resolve_computer(ctx)?;
+            let path = resolver.resolve_computer(ctx).await?;
             if !path.exists() {
                 return Err(AppError::resource("Computer workspace does not exist"));
             }
@@ -106,7 +106,7 @@ pub fn resolve_target(
             if ctx.project_id.trim().is_empty() {
                 return Err(AppError::validation("pageApp mode requires projectId"));
             }
-            let path = resolver.resolve_project(ctx)?;
+            let path = resolver.resolve_project(ctx).await?;
             if !path.exists() {
                 return Err(AppError::resource("Project does not exist"));
             }
@@ -253,8 +253,8 @@ mod tests {
     use super::*;
     use crate::workspace::LocalWorkspaceResolver;
 
-    #[test]
-    fn resolve_target_rejects_missing_workspace_without_creating_it() {
+    #[tokio::test]
+    async fn resolve_target_rejects_missing_workspace_without_creating_it() {
         let root =
             std::env::temp_dir().join(format!("file-server-git-resolve-{}", std::process::id()));
         let project_root = root.join("projects");
@@ -267,7 +267,7 @@ mod tests {
             isolation_type: None,
         };
 
-        let error = match resolve_target(&resolver, "pageApp", Some(&context), None) {
+        let error = match resolve_target(&resolver, "pageApp", Some(&context), None).await {
             Ok(_) => panic!("missing workspace must be rejected"),
             Err(error) => error,
         };

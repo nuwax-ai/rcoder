@@ -13,7 +13,10 @@ pub mod server;
 pub mod service;
 pub mod workspace;
 
-pub use workspace::{ComputerContext, LocalWorkspaceResolver, ProjectContext, WorkspaceResolver};
+pub use workspace::{
+    ComputerContext, LocalWorkspaceResolver, ProjectContext, SubvolumeWorkspaceResolver,
+    WorkspacePathResolver, WorkspaceResolver,
+};
 
 use std::sync::Arc;
 

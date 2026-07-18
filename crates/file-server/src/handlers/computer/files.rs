@@ -74,7 +74,7 @@ pub(crate) async fn get_file_list(
     Query(q): Query<UserCidQuery>,
 ) -> Result<Json<Value>, AppError> {
     let path =
-        resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())?;
+        resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref()).await?;
     // 对齐 nuwax: 目录不存在 → 返回空数组 (非报错)
     if !crate::service::fs_util::path_exists(&path).await? {
         return Ok(Json(json!({ "success": true, "files": [] })));
@@ -108,7 +108,7 @@ pub(crate) async fn delete_workspace(
     State(state): State<AppState>,
     Json(body): Json<DeleteWorkspaceBody>,
 ) -> Result<Json<Value>, AppError> {
-    let path = ws_path(&state, &body.user_id, &body.c_id)?;
+    let path = ws_path(&state, &body.user_id, &body.c_id).await?;
     // 不存在视为已删除 (对齐 nuwax, 只 warn)
     if path.exists() {
         tokio::fs::remove_dir_all(&path)
@@ -141,7 +141,8 @@ pub(crate) async fn files_update(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
-    )?;
+    )
+    .await?;
     // 工作区不存在 → 创建 (对齐 nuwax computerFileUtils.updateFiles: !existsSync → mkdirSync recursive)。
     // 首次向全新 user/cId 工作区写入不应失败。
     tokio::fs::create_dir_all(&path).await?;
@@ -211,7 +212,7 @@ pub(crate) async fn upload_file(
     let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
     let file_path = file_path.ok_or_else(|| AppError::validation("filePath is required"))?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
-    let ws = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref())?;
+    let ws = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref()).await?;
     let target = path_safety::ensure_within(&ws, &file_path)?;
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -267,7 +268,7 @@ pub(crate) async fn upload_files(
     if file_paths.len() != files_vec.len() {
         return Err(AppError::validation("filePaths and files count mismatch"));
     }
-    let ws = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref())?;
+    let ws = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref()).await?;
     let total = file_paths.len();
     let mut success_count = 0usize;
     let mut results: Vec<Value> = Vec::new();
@@ -365,7 +366,7 @@ pub(crate) async fn import_project(
     let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     validate_zip_ext(file_name.as_deref())?;
-    let target_dir = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref())?;
+    let target_dir = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref()).await?;
     tokio::fs::create_dir_all(&target_dir).await?;
     let res = crate::service::computer_ws::import_project(&target_dir, data.path()).await?;
     Ok(Json(json!({

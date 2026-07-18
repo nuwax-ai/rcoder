@@ -121,7 +121,7 @@ pub(crate) async fn create_workspace(
     if skill_zip.is_some() {
         validate_zip_ext(file_name.as_deref())?;
     }
-    let ws = ws_path(&state, &user_id, &cid)?;
+    let ws = ws_path(&state, &user_id, &cid).await?;
     tokio::fs::create_dir_all(&ws).await?;
     let res = crate::service::computer_ws::create_workspace(
         &ws,
@@ -204,7 +204,7 @@ pub(crate) async fn create_workspace_v2(
         permissions_config,
         hook_scripts,
     };
-    let ws = ws_path(&state, &user_id, &cid)?;
+    let ws = ws_path(&state, &user_id, &cid).await?;
     tokio::fs::create_dir_all(&ws).await?;
     let res = crate::service::computer_ws::create_workspace(
         &ws,
@@ -277,7 +277,7 @@ async fn push_skills_to_workspace_impl(
     state
         .skill_downloader
         .validate_url_count(skill_urls.len())?;
-    let ws = ws_path(&state, &user_id, &cid)?;
+    let ws = ws_path(&state, &user_id, &cid).await?;
     if !crate::service::fs_util::path_exists(&ws).await? {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -345,7 +345,7 @@ pub(crate) async fn init_project_template(
     let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
     let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
     let data = data.ok_or_else(|| AppError::validation("file (template zip) is required"))?;
-    let ws = ws_path(&state, &user_id, &cid)?;
+    let ws = ws_path(&state, &user_id, &cid).await?;
     tokio::fs::create_dir_all(&ws).await?;
     zip::extract_to(data.path().to_path_buf(), ws.clone()).await?;
     // git 双开关: GIT_ENABLED && enableGit → init + initial commit (对齐 nuwax)

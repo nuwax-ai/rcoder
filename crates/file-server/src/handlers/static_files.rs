@@ -72,12 +72,16 @@ pub(crate) async fn serve_page(
     if project_id.trim().is_empty() {
         return cors_404(&req, &PAGE_CORS);
     }
-    let root = match state.resolver.resolve_project(&ProjectContext {
-        project_id: project_id.to_string(),
-        tenant_id: None,
-        space_id: None,
-        isolation_type: None,
-    }) {
+    let root = match state
+        .resolver
+        .resolve_project(&ProjectContext {
+            project_id: project_id.to_string(),
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
+        })
+        .await
+    {
         Ok(root) => root,
         Err(error) => return error.into_response(),
     };
@@ -112,10 +116,14 @@ pub(crate) async fn serve_computer(
         return cors_404(&req, &COMPUTER_CORS);
     }
     // customTargetDir 非空 → 完全覆盖根 (对齐 nuwax, 不拼 user/cId)
-    let default_root = match state.resolver.resolve_computer(&ComputerContext {
-        user_id: user_id.to_string(),
-        cid: c_id.to_string(),
-    }) {
+    let default_root = match state
+        .resolver
+        .resolve_computer(&ComputerContext {
+            user_id: user_id.to_string(),
+            cid: c_id.to_string(),
+        })
+        .await
+    {
         Ok(root) => root,
         Err(error) => return error.into_response(),
     };

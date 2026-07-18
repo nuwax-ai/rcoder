@@ -24,21 +24,24 @@ pub(crate) mod workspace;
 
 // ── 跨组共享 helper (子模块经 super:: 访问) ──────────────────────────────────────
 
-fn ws_path(state: &AppState, user_id: &str, cid: &str) -> Result<PathBuf, AppError> {
-    state.resolver.resolve_computer(&ComputerContext {
-        user_id: user_id.to_string(),
-        cid: cid.to_string(),
-    })
+async fn ws_path(state: &AppState, user_id: &str, cid: &str) -> Result<PathBuf, AppError> {
+    state
+        .resolver
+        .resolve_computer(&ComputerContext {
+            user_id: user_id.to_string(),
+            cid: cid.to_string(),
+        })
+        .await
 }
 
 /// computer 目标路径: `customTargetDir` trim 后非空则用之, 否则回退默认工作区 (对齐 nuwax)。
-fn resolve_computer_target(
+async fn resolve_computer_target(
     state: &AppState,
     user_id: &str,
     cid: &str,
     custom_target_dir: Option<&str>,
 ) -> Result<PathBuf, AppError> {
-    let default_path = ws_path(state, user_id, cid)?;
+    let default_path = ws_path(state, user_id, cid).await?;
     Ok(
         match custom_target_dir.map(str::trim).filter(|s| !s.is_empty()) {
             Some(ct) => PathBuf::from(ct),

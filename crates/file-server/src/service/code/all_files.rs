@@ -34,7 +34,7 @@ pub async fn all_files_update(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     version::parse_version(code_version)?;
-    let project_path = resolver.resolve_project(ctx)?;
+    let project_path = resolver.resolve_project(ctx).await?;
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }

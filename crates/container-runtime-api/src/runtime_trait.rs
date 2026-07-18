@@ -536,6 +536,20 @@ pub trait ContainerRuntime: Send + Sync {
     /// Health check - verify runtime is accessible
     async fn health_check(&self) -> ContainerRuntimeResult<()>;
 
+    /// 解析 agent workspace 在 rcoder 主进程可访问的路径 (阶段2 挂根聚合)。
+    ///
+    /// K8s 模式: 返回 per-agent PVC 的 CephFS subvolume 聚合路径
+    ///   `{RCODER_CEPHFS_ROOT}/{subvolumePath}` (rcoder 静态 PV 挂根, 访问 agent 数据;
+    ///   file-server 经此读 tree/git/skills, 不启动 agent pod 也能服务)。
+    /// Docker 模式: 不提供聚合视角, 用默认 None (file-server 走 LocalWorkspaceResolver)。
+    async fn resolve_workspace_path(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        Ok(None)
+    }
+
     // ====================================================================
     // Deployment 生命周期（UserApp 专用，agent 路径不调用）
     //

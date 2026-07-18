@@ -1736,7 +1736,6 @@ dependencies = [
  "tonic",
  "tracing",
  "uuid",
- "xattr",
 ]
 
 [[package]]
@@ -1957,6 +1956,7 @@ name = "file-server"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64",
  "bytes 1.12.0",

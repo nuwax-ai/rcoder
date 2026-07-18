@@ -16,8 +16,8 @@ use container_runtime_api::{
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
     ConfigMapVolumeSource, Container as K8sContainer, ContainerPort, EmptyDirVolumeSource, EnvVar,
-    LocalObjectReference, PersistentVolumeClaim, PersistentVolumeClaimVolumeSource, Pod,
-    PodSecurityContext, PodSpec, Probe, ResourceRequirements, Service, Volume, VolumeMount,
+    LocalObjectReference, PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimVolumeSource,
+    Pod, PodSecurityContext, PodSpec, Probe, ResourceRequirements, Service, Volume, VolumeMount,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -29,8 +29,6 @@ use kube::Config;
 use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
-#[cfg(feature = "kubernetes")]
-use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
 #[cfg(feature = "kubernetes")]
 use shared_types::{
     ContainerBasicInfo, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec, K8sVolumeType,
@@ -58,98 +56,6 @@ use crate::types::DockerManagerConfig;
 // 此处与 PVC/Backend CRD 的 label 写入一并对齐到全键。
 const RUNTIME_MANAGED_LABEL: &str = "app.kubernetes.io/managed-by=rcoder-runtime";
 
-/// 解析 K8s quantity 字符串为字节数 (`"10Gi"` -> 10737418240, `"500M"` -> 500000000)。
-/// 用于 CephFS 目录配额 (ceph.quota.max_bytes 需字节数)。未识别格式返回 None。
-#[cfg(feature = "kubernetes")]
-fn parse_quantity_to_bytes(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // 二进制后缀 (Ki/Mi/Gi/Ti/Pi/Ei)
-    for (suffix, unit) in [
-        ("Ei", 1u64 << 60),
-        ("Pi", 1u64 << 50),
-        ("Ti", 1u64 << 40),
-        ("Gi", 1u64 << 30),
-        ("Mi", 1u64 << 20),
-        ("Ki", 1u64 << 10),
-    ] {
-        if let Some(num) = s.strip_suffix(suffix) {
-            return num.parse::<u64>().ok().map(|n| n.saturating_mul(unit));
-        }
-    }
-    // 十进制后缀 (E/P/T/G/M/K)
-    for (suffix, unit) in [
-        ("E", 1_000_000_000_000_000_000u64),
-        ("P", 1_000_000_000_000_000),
-        ("T", 1_000_000_000_000),
-        ("G", 1_000_000_000),
-        ("M", 1_000_000),
-        ("K", 1_000),
-    ] {
-        if let Some(num) = s.strip_suffix(suffix) {
-            return num.parse::<u64>().ok().map(|n| n.saturating_mul(unit));
-        }
-    }
-    // 纯数字 (字节)
-    s.parse::<u64>().ok()
-}
-
-/// 计算 rcoder 主容器内 agent 工作区子目录 (用于 CephFS 配额)。
-/// 逻辑与 `rcoder::handler::utils::paths::build_workspace_path` /
-/// `build_computer_workspace_path` 保持一致 (单一事实源在那边; 此处复刻是因为
-/// docker_manager 不能反向依赖 rcoder crate)。返回的是 **rcoder 主容器视角** 路径
-/// (不是 agent sub-container 的 /home/user)。
-///
-/// - web 共享容器 (isolation=tenant/space): 三级 `{tenant}/{space}/{project}` (per-project)
-/// - web 普通隔离 (project): 单级 `{project}`
-/// - computer: per-user `{user_id}` (与 subPath=user_id 挂载边界对齐, 限该用户所有 project 总和)
-/// - pod_id 不参与路径决策 (只影响容器名/缓存键)
-/// - 共享容器下 handler 强制 tenant_id/space_id 非空; 若脏数据缺失则返回 None (放弃配额, 不设到错误目录)
-#[cfg(feature = "kubernetes")]
-fn agent_workspace_quota_dir(
-    service_type: &ServiceType,
-    isolation_type: Option<&str>,
-    tenant_id: Option<&str>,
-    space_id: Option<&str>,
-    project_id: &str,
-    user_id: &str,
-) -> Option<String> {
-    // 标识符校验防路径穿越 (与 rcoder::handler::utils::paths::build_workspace_path 一致,
-    // 复用 shared_types::validation::validate_identifier: 仅 [a-zA-Z0-9_-], 1-64 字符, 拒 . /)。
-    // 不通过则放弃配额 (None), 绝不设到可能穿越的错误目录 (如 project_id="../etc")。
-    use shared_types::validation::validate_identifier;
-    let iso = isolation_type.map(str::to_lowercase);
-    match service_type {
-        ServiceType::WebAgentRunner => {
-            if validate_identifier(project_id, "project_id").is_err() {
-                return None;
-            }
-            match iso.as_deref() {
-                Some("tenant") | Some("space") => {
-                    let tid = tenant_id?;
-                    let sid = space_id?;
-                    if validate_identifier(tid, "tenant_id").is_err()
-                        || validate_identifier(sid, "space_id").is_err()
-                    {
-                        return None;
-                    }
-                    Some(format!("{WORKSPACE_ROOT}/{tid}/{sid}/{project_id}"))
-                }
-                _ => Some(format!("{WORKSPACE_ROOT}/{project_id}")),
-            }
-        }
-        ServiceType::ComputerAgentRunner => {
-            if validate_identifier(user_id, "user_id").is_err() {
-                return None;
-            }
-            Some(format!("{COMPUTER_WORKSPACE_ROOT}/{user_id}"))
-        }
-        _ => None,
-    }
-}
-
 /// Kubernetes runtime implementation using kube-rs
 #[cfg(feature = "kubernetes")]
 pub struct KubernetesRuntime {
@@ -158,6 +64,10 @@ pub struct KubernetesRuntime {
     pub(crate) config: KubernetesRuntimeConfig,
     /// Cache for pod information (using RwLock to avoid DashMap deadlocks)
     pub(crate) pod_cache: Arc<RwLock<std::collections::HashMap<String, RuntimeContainerInfo>>>,
+    /// identifier -> CephFS subvolumePath 缓存 (resolve_subvolume_path 用)。
+    /// subvolumePath 对 PVC 不可变 → 缓存只冷启动填充, 永不失效。
+    /// 阶段2: rcoder 挂根聚合访问 agent subvolume (/app/cephfs-root/{subvolumePath}/...)。
+    pub(crate) subvolume_path_cache: Arc<RwLock<std::collections::HashMap<String, String>>>,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -252,6 +162,7 @@ impl KubernetesRuntime {
                 kubernetes_config,
             },
             pod_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            subvolume_path_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
         })
     }
 
@@ -263,6 +174,13 @@ impl KubernetesRuntime {
     /// Get the PVC API
     pub(crate) fn pvcs(&self) -> Api<PersistentVolumeClaim> {
         Api::namespaced(self.client.clone(), &self.namespace)
+    }
+
+    /// Get the PV API (cluster-scoped)
+    ///
+    /// 阶段2: 读 PV `csi.volumeAttributes.subvolumePath` (rcoder 挂根聚合)。
+    pub(crate) fn pvs(&self) -> Api<PersistentVolume> {
+        Api::<PersistentVolume>::all(self.client.clone())
     }
 
     pub(crate) fn service_container_prefix(
@@ -693,25 +611,13 @@ impl ContainerRuntime for KubernetesRuntime {
         // Pod 名称：统一使用 pod_name() helper（含 RFC 1123 下划线清理）
         let pod_name = self.pod_name(identifier, &service_type)?;
 
-        // Ensure workspace PVC exists first (NFS-backed, each project/user gets its own PVC)
-        // The PVC is backed by NFS Subdir External Provisioner which automatically
-        // creates NFS subdirectory per PVC for isolation and automatic cleanup
-        // Note: ensure_workspace_pvc waits for PVC Bound state before returning
-        //
-        // ComputerAgentRunner 例外：复用共享 rcoder-computer-workspace PVC（subPath=user_id → /home/user），
-        // 不为每个 user 新建独立空 PVC——否则沙箱 /home/user 看不到 file-server scaffold 的文件
-        // （file-server 写到共享卷 /{user_id}/{cId}，cId=project_id）。{user_id} 目录由
-        // create_user_workspace 在 create_container 之前创建，故 subPath 挂载必然命中。
-        // WebAgentRunner 同样例外：复用共享 rcoder-workspace PVC（subPath 见下方卷选取），
-        // 不为每个项目新建独立空 PVC——否则 CephFS 下每卷隔离，终端 pod 看不到主 pod 写入的
-        // 项目文件（/app/project_workspace/{projectId}），ws_terminal fail-closed。
-        if !matches!(
-            service_type,
-            ServiceType::ComputerAgentRunner | ServiceType::WebAgentRunner
-        ) {
-            self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
-                .await?;
-        }
+        // 阶段2: 所有 service_type 走 per-agent PVC (cephfs SC, CephFS subvolume)。
+        // 配额由 requests.storage 经 ceph-csi 服务端设 (subvolume create --size), 绕开
+        // client setfattr → 根治 2026-07-15 EDQUOT 事故 (xattr 不可靠已退役)。
+        // PVC 创建后永不删除 (数据安全硬约束); pod handler Pending recreate 时 ensure 的
+        // "active" 分支复用同一 PVC, 不重建。
+        self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
+            .await?;
 
         // Check if pod already exists and is running
         if let Some(cached) = self.pod_cache.read().await.get(identifier)
@@ -741,77 +647,15 @@ impl ContainerRuntime for KubernetesRuntime {
             .as_ref()
             .and_then(Self::build_resource_requirements);
 
-        // Build workspace volume:
-        // - ComputerAgentRunner: 共享 rcoder-computer-workspace PVC + subPath=user_id
-        //   → 沙箱 /home/user/{cId} = 主pod /app/computer-project-workspace/{user_id}/{cId}
-        // - WebAgentRunner: 共享 rcoder-workspace PVC + subPath（默认 workspace）
-        //   → <PVC>/{subPath}/{projectId} = 容器内 /app/project_workspace/{projectId}，
-        //   与主 rcoder pod 的 /app/project_workspace 挂载严格对齐（项目文件双向可见）。
-        //   旧逻辑建每项目独立 PVC（CephFS 每卷隔离 → 空卷），终端 fail-closed。
-        // - 其它（未来 ServiceType）: 每项目独立 PVC 兜底。
-        let (workspace_pvc, workspace_sub_path) = match service_type {
-            ServiceType::ComputerAgentRunner => {
-                let shared = std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME")
-                    .unwrap_or_else(|_| format!("{}-rcoder-computer-workspace", self.namespace));
-                // subPath 必须等于 file-server/rcoder 建目录用的 user_id（cId 的父级）。
-                // 用原始 user_id（非 sanitize），与 file-server createWorkspace(userId) 完全一致。
-                (shared, Some(user_id_val.to_string()))
-            }
-            ServiceType::WebAgentRunner => {
-                let shared = std::env::var("RCODER_WORKSPACE_PVC_NAME")
-                    .unwrap_or_else(|_| format!("{}-rcoder-workspace", self.namespace));
-                // subPath 与主 rcoder pod project_workspace 挂载的 subPath 一致（chart 单一 value
-                // RCODER_WORKSPACE_SUBPATH 驱动，默认 "workspace"）。空值兜底为 "workspace"。
-                let sub_path = std::env::var("RCODER_WORKSPACE_SUBPATH")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "workspace".to_string());
-                (shared, Some(sub_path))
-            }
-            _ => (self.workspace_pvc_name(identifier, &service_type)?, None),
-        };
+        // 阶段2: 每 agent 一个独立 per-agent PVC (CephFS subvolume, 已由上方 ensure 创建)。
+        // agent pod 挂自己 PVC (subPath=None —— subvolume 已是天然边界), 数据落 PVC 根的
+        // {projectId}/{cid}/{app_id} leaf, agent 侧挂载路径不变 (web=/app/project_workspace,
+        // computer=/home/user)。rcoder 经挂根聚合 (/app/cephfs-root/{subvolumePath}/{leaf}) 访问。
+        let workspace_pvc = self.workspace_pvc_name(identifier, &service_type)?;
+        let workspace_sub_path: Option<String> = None;
 
-        // ===== 复用接口 storage_size 设 CephFS 工作区配额 (rcoder 集中, 不依赖 agent pod) =====
-        // 背景: storage_size 原本语义是 PVC 大小, 但 Web/Computer 跳过 ensure_workspace_pvc 复用共享 PVC,
-        //       致其只落 ephemeral-storage, PVC 子目录写入不限。rcoder 已挂共享 PVC 根 (web
-        //       /app/project_workspace, computer /app/computer-project-workspace), 用 xattr::set
-        //       (libc setxattr -> CephFS MDS 强制) 对 agent 子目录设 ceph.quota.max_bytes。
-        //       子目录规则 (含 web 共享容器 tenant/space/project 三级) 见 agent_workspace_quota_dir。
-        //       需 cephx 挂载用户 (csi-cephfs-node, mds=allow rw) 对该目录有 write 权限。
-        //       失败只 warn 不阻断 (配额设不上退化为不限, 不崩 rcoder)。
-        // ⚠️ 2026-07-15 DISABLED: setfattr ceph.quota.max_bytes 在 kernel cephfs mount 下
-        // Permission denied (kernel client virtual xattr 限制, 非 caps; client.admin allow * 也 denied)。
-        // 旧版 caps allow rw 时意外成功设了 per-user 10Gi quota, 致 userId 写超 EDQUOT (errno 122)。
-        // 已手动 setfattr -x 清除所有 userId 旧 quota 止血。
-        // 后续配额方案: 改用 ceph fs subvolume resize (Rook CSI 原生 quota, 非 setfattr)。
-        //
-        // if let Some(ref ss) = storage_size {
-        //     if let Some(bytes) = parse_quantity_to_bytes(ss) {
-        //         if let Some(quota_dir) = agent_workspace_quota_dir(
-        //             &service_type,
-        //             isolation_type.as_deref(),
-        //             tenant_id.as_deref(),
-        //             space_id.as_deref(),
-        //             &project_id_val,
-        //             &user_id_val,
-        //         ) {
-        //             let _ = std::fs::create_dir_all(&quota_dir);
-        //             match xattr::set(
-        //                 &quota_dir,
-        //                 "ceph.quota.max_bytes",
-        //                 bytes.to_string().as_bytes(),
-        //             ) {
-        //                 Ok(()) => info!("CephFS quota set: {} = {} bytes", quota_dir, bytes),
-        //                 Err(e) => warn!(
-        //                     "set CephFS quota failed on {} (cephx 缺 write / 非 cephfs / 目录不存在?): {}",
-        //                     quota_dir, e
-        //                 ),
-        //             }
-        //         }
-        //     } else {
-        //         warn!("parse storage_size {:?} failed, skip CephFS quota", ss);
-        //     }
-        // }
+        // (阶段2: xattr 目录配额已退役 —— 改用 per-agent subvolume PVC + CSI 服务端配额。
+        //  parse_quantity_to_bytes / agent_workspace_quota_dir / xattr crate 已删, 见 Task 2.3)
 
         // 取 service 配置(完全分家):K8s 优先读 kubernetes_config;docker_config.multi_image_config
         // 仅作过渡期安全兜底(旧 chart 未带 kubernetes_config 段时,保留 workspace 路径/command/env 行为)。
@@ -1677,6 +1521,22 @@ impl ContainerRuntime for KubernetesRuntime {
             ContainerRuntimeError::ConnectionError(format!("K8s health check failed: {}", e))
         })?;
         Ok(())
+    }
+
+    async fn resolve_workspace_path(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        // 阶段2: rcoder 静态 PV 挂 CephFS 根 → {RCODER_CEPHFS_ROOT}/{subvolumePath}
+        // (subvolumePath 形如 /volumes/csi/<uuid>/<subuuid>, fs 根绝对路径)。
+        // file-server 经此聚合路径访问 agent 数据 (tree/git/skills), 不启动 agent pod。
+        let cephfs_root =
+            std::env::var("RCODER_CEPHFS_ROOT").unwrap_or_else(|_| "/app/cephfs-root".to_string());
+        let subvolume_path = self.resolve_subvolume_path(identifier, service_type).await?;
+        // subvolumePath 以 / 开头 (fs 绝对路径); trim 防御性处理确保单斜杠拼接
+        let sub = subvolume_path.trim_start_matches('/');
+        Ok(Some(format!("{cephfs_root}/{sub}")))
     }
 
     // ===== Deployment 生命周期（UserApp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====

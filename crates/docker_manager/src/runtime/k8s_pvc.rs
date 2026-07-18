@@ -39,8 +39,12 @@ use super::kubernetes_runtime::KubernetesRuntime;
 /// - PVC 命名 (`workspace_pvc_name`)
 /// - PVC 创建 (`ensure_workspace_pvc`)
 /// - PVC 绑定等待 (`wait_for_pvc_bound`)
-/// - PVC 删除 (`delete_workspace_pvc`)
-/// - PVC finalizer 检查 (`wait_for_pvc_removable`)
+/// - subvolume 路径解析 (`resolve_subvolume_path`, 阶段2 rcoder 挂根聚合)
+/// - PVC 配额扩容 (`resize_workspace_pvc`, 阶段2 配额调整)
+///
+/// 注: 不提供 PVC 删除方法 (数据安全硬约束: PVC 永不删除, 见
+/// `stop_container_by_identifier` / `cleanup_all` 的保留策略)。配额靠 resize,
+/// 不靠删 PVC 回收。
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 pub(crate) trait K8sPvcOps {
@@ -71,6 +75,32 @@ pub(crate) trait K8sPvcOps {
     /// 保留用于 WaitForFirstConsumer 模式下切换为预绑定策略时使用。
     #[allow(dead_code)]
     async fn wait_for_pvc_bound(&self, pvc_name: &str) -> ContainerRuntimeResult<()>;
+
+    /// 解析 identifier 对应 workspace PVC 的 CephFS subvolume 路径
+    ///
+    /// 读 PVC (`spec.volumeName`) → PV (`csi.volumeAttributes.subvolumePath`)。
+    /// subvolumePath 形如 `/volumes/csi/<uuid>/<subuuid>` (CephFS fs 根绝对路径),
+    /// 对 PVC 不可变 → 结果缓存 (`subvolume_path_cache`), 永不失效。
+    /// 用于阶段2 rcoder 挂根聚合 (`/app/cephfs-root/{subvolumePath}/...`) 访问 agent 数据。
+    async fn resolve_subvolume_path(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String>;
+
+    /// 扩容 workspace PVC (CephFS subvolume 配额调整)
+    ///
+    /// patch PVC `spec.resources.requests.storage` → ceph-csi external-resizer 自动
+    /// 调 `ceph fs subvolume resize` (SC `allowVolumeExpansion=true`)。只扩不能缩。
+    /// 阶段2 配额管理: 初始 `ensure_workspace_pvc` 设 requests.storage (subvolume create --size),
+    /// 本方法调调整 (subvolume resize)。
+    #[allow(dead_code)]
+    async fn resize_workspace_pvc(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        new_size: &str,
+    ) -> ContainerRuntimeResult<()>;
 }
 
 #[cfg(feature = "kubernetes")]
@@ -278,5 +308,94 @@ impl K8sPvcOps for KubernetesRuntime {
             "PVC '{}' did not become Bound in time",
             pvc_name
         )))
+    }
+
+    async fn resolve_subvolume_path(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        // cache hit (subvolumePath 对 PVC 不可变 → 永不失效)
+        if let Some(cached) = self
+            .subvolume_path_cache
+            .read()
+            .await
+            .get(identifier)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        let pvc = self.pvcs().get(&pvc_name).await.map_err(|e| {
+            ContainerRuntimeError::K8sError(format!("Failed to get PVC '{}': {}", pvc_name, e))
+        })?;
+        let pv_name = pvc
+            .spec
+            .as_ref()
+            .and_then(|s| s.volume_name.clone())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(format!(
+                    "PVC '{}' not Bound yet (volumeName empty), cannot resolve subvolumePath",
+                    pvc_name
+                ))
+            })?;
+        let pv = self.pvs().get(&pv_name).await.map_err(|e| {
+            ContainerRuntimeError::K8sError(format!("Failed to get PV '{}': {}", pv_name, e))
+        })?;
+        // csi.volumeAttributes["subvolumePath"] (字段名待 Task 2.5 实测确认;
+        // 兜底 rootPath, 部分 ceph-csi 版本用此 key)
+        let vol_attrs = pv
+            .spec
+            .as_ref()
+            .and_then(|s| s.csi.as_ref())
+            .and_then(|csi| csi.volume_attributes.as_ref());
+        let subvolume_path = vol_attrs
+            .and_then(|a| a.get("subvolumePath").cloned())
+            .or_else(|| vol_attrs.and_then(|a| a.get("rootPath").cloned()))
+            .ok_or_else(|| {
+                ContainerRuntimeError::K8sError(format!(
+                    "PV '{}' csi.volumeAttributes has no subvolumePath/rootPath",
+                    pv_name
+                ))
+            })?;
+        self.subvolume_path_cache
+            .write()
+            .await
+            .insert(identifier.to_string(), subvolume_path.clone());
+        debug!(
+            "[K8S] resolved subvolumePath for {}: {} (PVC {} -> PV {})",
+            identifier, subvolume_path, pvc_name, pv_name
+        );
+        Ok(subvolume_path)
+    }
+
+    async fn resize_workspace_pvc(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        new_size: &str,
+    ) -> ContainerRuntimeResult<()> {
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        // merge patch spec.resources.requests.storage → ceph-csi external-resizer
+        // 自动调 `ceph fs subvolume resize` (SC allowVolumeExpansion=true)
+        let patch = serde_json::json!({
+            "spec": { "resources": { "requests": { "storage": new_size } } }
+        });
+        let pp = kube::api::PatchParams::default();
+        self.pvcs()
+            .patch(&pvc_name, &pp, &kube::api::Patch::Merge(&patch))
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!(
+                    "Failed to patch PVC '{}' requests.storage to {}: {}",
+                    pvc_name, new_size, e
+                ))
+            })?;
+        info!(
+            "[K8S] PVC {} resize requested -> {} (ceph-csi auto subvolume resize)",
+            pvc_name, new_size
+        );
+        Ok(())
     }
 }

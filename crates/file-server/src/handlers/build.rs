@@ -190,22 +190,28 @@ fn default_log_type() -> String {
     "temp".to_string()
 }
 
-fn project_path(state: &AppState, q: &BuildQuery) -> AppResult<PathBuf> {
-    state.resolver.resolve_project(&ProjectContext {
-        project_id: q.project_id.clone(),
-        tenant_id: q.tenant_id.clone(),
-        space_id: q.space_id.clone(),
-        isolation_type: q.isolation_type.clone(),
-    })
+async fn project_path(state: &AppState, q: &BuildQuery) -> AppResult<PathBuf> {
+    state
+        .resolver
+        .resolve_project(&ProjectContext {
+            project_id: q.project_id.clone(),
+            tenant_id: q.tenant_id.clone(),
+            space_id: q.space_id.clone(),
+            isolation_type: q.isolation_type.clone(),
+        })
+        .await
 }
 
-fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> AppResult<PathBuf> {
-    state.resolver.resolve_project(&ProjectContext {
-        project_id: q.project_id.clone(),
-        tenant_id: q.tenant_id.clone(),
-        space_id: q.space_id.clone(),
-        isolation_type: q.isolation_type.clone(),
-    })
+async fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> AppResult<PathBuf> {
+    state
+        .resolver
+        .resolve_project(&ProjectContext {
+            project_id: q.project_id.clone(),
+            tenant_id: q.tenant_id.clone(),
+            space_id: q.space_id.clone(),
+            isolation_type: q.isolation_type.clone(),
+        })
+        .await
 }
 
 /// `GET /api/build/start-dev` (对齐 nuwax start-dev)。
@@ -220,7 +226,7 @@ pub(crate) async fn start_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<response::DevStarted>, AppError> {
-    let path = project_path(&state, &q)?;
+    let path = project_path(&state, &q).await?;
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
@@ -283,7 +289,7 @@ pub(crate) async fn restart_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<response::DevStarted>, AppError> {
-    let path = project_path(&state, &q)?;
+    let path = project_path(&state, &q).await?;
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
@@ -337,7 +343,7 @@ pub(crate) async fn keep_alive(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::validation("basePath is required"))?;
-    let path = project_path_keep(&state, &q)?;
+    let path = project_path_keep(&state, &q).await?;
     let result = state
         .dev_server
         .keep_alive(&q.project_id, pid, q.port, Some(base_str), &path)
@@ -451,7 +457,7 @@ pub(crate) async fn build_project(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<response::BuildDone>, AppError> {
-    let path = project_path(&state, &q)?;
+    let path = project_path(&state, &q).await?;
     if !path.exists() {
         return Err(AppError::resource("project does not exist"));
     }

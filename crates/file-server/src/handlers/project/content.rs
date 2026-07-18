@@ -47,7 +47,7 @@ pub(crate) async fn get_project_content(
         space_id: params.space_id.clone(),
         isolation_type: params.isolation_type.clone(),
     };
-    let project_path = match state.resolver.resolve_project(&ctx) {
+    let project_path = match state.resolver.resolve_project(&ctx).await {
         Ok(path) => path,
         Err(error) => return error.into_response(),
     };
