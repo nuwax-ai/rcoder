@@ -62,6 +62,11 @@ async fn resolve_dst_with_retry(
 ///
 /// env 未设 / runtime 无聚合视角 (Docker 模式) → 静默跳过 (兼容现状, 不破坏非 K8s/未启用场景)。
 /// mv 失败只 warn 不阻断 (数据仍在共享, agent 启动空 PVC, 可重试)。
+///
+/// **dst_at_root=true (Computer)**: **逐子项 rename** (遍历 src `{user_id}` 子项, 逐个 rename 到
+/// per-user PVC 根, skip 已存在)。原因: Computer agent 启动会装 `acp-agent` 到 PVC 根 (`/home/user`),
+/// rename 整个 `{user_id} → PVC 根` 会 ENOTEMPTY; 逐子项迁项目 `{cid}` (不存在 → 成功), agent 装的
+/// acp-agent 已存在自动 skip。Web/UserApp 不受影响 (单 leaf rename, dst 不存在, 不碰 agent 写)。
 pub async fn lazy_migrate(
     runtime: &Arc<dyn ContainerRuntime>,
     shared_pvc_env: &str,
@@ -79,24 +84,11 @@ pub async fn lazy_migrate(
         return;
     };
     // per-agent dst base: {cephfs_root}/{per-agent-subvol}; 等 PVC Bound
-    // (UserApp create_deployment 不等 Pod Ready, PVC 可能刚 ensure 未 Bound → 重试;
-    //  Web/Computer create_container 等 Pod Ready, 首次即 Bound, 不实际重试)
     let dst_base = match resolve_dst_with_retry(runtime, identifier, service_type).await {
         Some(base) => PathBuf::from(base),
         None => return, // Docker 模式或 PVC 长时间未 Bound, 跳过
     };
-    let dst = if dst_at_root {
-        dst_base // computer: PVC 根 (per-user 吸收 user_id)
-    } else {
-        dst_base.join(leaf) // web/UserApp: {subvol}/{leaf}
-    };
-    // 幂等: dst 非空 → 已迁移, 跳过
-    if let Ok(mut rd) = tokio::fs::read_dir(&dst).await
-        && rd.next_entry().await.ok().flatten().is_some()
-    {
-        return;
-    }
-    // 共享 src: {cephfs_root}/{shared-subvol}/{subpath}/{leaf}
+    // 共享 src base: {cephfs_root}/{shared-subvol}
     let src_base = match runtime.resolve_workspace_path_by_pvcname(&shared_pvc).await {
         Ok(Some(base)) => PathBuf::from(base),
         _ => return,
@@ -106,6 +98,21 @@ pub async fn lazy_migrate(
         src = src.join(s);
     }
     src = src.join(leaf);
+
+    if dst_at_root {
+        // Computer: 逐子项 rename (src/{user_id}/* → dst/{subvol}/* = per-user PVC 根)
+        migrate_children(&src, &dst_base, identifier).await;
+        return;
+    }
+
+    // Web/UserApp: 单 leaf rename (src → dst={subvol}/{leaf})
+    let dst = dst_base.join(leaf);
+    // 幂等: dst({leaf})非空 → 已迁移, 跳过
+    if let Ok(mut rd) = tokio::fs::read_dir(&dst).await
+        && rd.next_entry().await.ok().flatten().is_some()
+    {
+        return;
+    }
     // src 不存在 → 新项目 (无旧数据), 跳过
     if tokio::fs::metadata(&src).await.is_err() {
         return;
@@ -127,3 +134,44 @@ pub async fn lazy_migrate(
         ),
     }
 }
+
+/// Computer 逐子项迁移: 遍历 src (`{shared}/{user_id}`) 子项, 逐个 rename 到 dst (per-user PVC 根),
+/// **skip 已存在** (agent 启动装的 `acp-agent` 等 / 已迁子项)。
+///
+/// 避免 rename 整个 `{user_id}` 目录到非空 PVC 根 (ENOTEMPTY)。项目 `{cid}` 不存在 → 成功;
+/// agent 装的 `acp-agent` 已存在 → skip (per-user PVC 用 agent 新装的)。幂等: 已迁/已存在 skip。
+async fn migrate_children(src: &std::path::Path, dst: &std::path::Path, identifier: &str) {
+    let mut rd = match tokio::fs::read_dir(src).await {
+        Ok(rd) => rd,
+        Err(_) => return, // src 不存在 → 新 user (无旧数据), 跳过
+    };
+    let mut migrated = 0u32;
+    let mut skipped = 0u32;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let dst_item = dst.join(entry.file_name());
+        if dst_item.exists() {
+            skipped += 1; // 已存在 (agent 新装 acp-agent / 已迁), skip
+            continue;
+        }
+        match tokio::fs::rename(entry.path(), &dst_item).await {
+            Ok(()) => migrated += 1,
+            Err(e) => warn!(
+                "[MIGRATE] 逐子项 rename {} -> {} failed: {} (skip, 继续其他子项)",
+                entry.path().display(),
+                dst_item.display(),
+                e
+            ),
+        }
+    }
+    if migrated > 0 || skipped > 0 {
+        info!(
+            "[MIGRATE] {} 逐子项迁移 (迁 {}, skip 已存在 {}): {} -> {}",
+            identifier,
+            migrated,
+            skipped,
+            src.display(),
+            dst.display()
+        );
+    }
+}
+
