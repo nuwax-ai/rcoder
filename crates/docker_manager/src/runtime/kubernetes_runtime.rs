@@ -611,13 +611,14 @@ impl ContainerRuntime for KubernetesRuntime {
         // Pod 名称：统一使用 pod_name() helper（含 RFC 1123 下划线清理）
         let pod_name = self.pod_name(identifier, &service_type)?;
 
-        // 阶段2: 所有 service_type 走 per-agent PVC (cephfs SC, CephFS subvolume)。
-        // 配额由 requests.storage 经 ceph-csi 服务端设 (subvolume create --size), 绕开
-        // client setfattr → 根治 2026-07-15 EDQUOT 事故 (xattr 不可靠已退役)。
-        // PVC 创建后永不删除 (数据安全硬约束); pod handler Pending recreate 时 ensure 的
-        // "active" 分支复用同一 PVC, 不重建。
-        self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
-            .await?;
+        // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
+        // 仅隔离容器 (pod_id=None, project/user 级) 走 per-agent PVC。共享容器 (pod_id=Some,
+        // 多 project 复用一个 pod 省资源) 保持共享 PVC (非 per-agent 隔离目标, 选项A):
+        // Pod 挂共享 PVC + subPath, file-server Local 读共享 /{tenant}/{space}/{project}, lazy mv skip。
+        if pod_id.is_none() {
+            self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
+                .await?;
+        }
 
         // Check if pod already exists and is running
         if let Some(cached) = self.pod_cache.read().await.get(identifier)
@@ -647,12 +648,28 @@ impl ContainerRuntime for KubernetesRuntime {
             .as_ref()
             .and_then(Self::build_resource_requirements);
 
-        // 阶段2: 每 agent 一个独立 per-agent PVC (CephFS subvolume, 已由上方 ensure 创建)。
-        // agent pod 挂自己 PVC (subPath=None —— subvolume 已是天然边界), 数据落 PVC 根的
-        // {projectId}/{cid}/{app_id} leaf, agent 侧挂载路径不变 (web=/app/project_workspace,
-        // computer=/home/user)。rcoder 经挂根聚合 (/app/cephfs-root/{subvolumePath}/{leaf}) 访问。
-        let workspace_pvc = self.workspace_pvc_name(identifier, &service_type)?;
-        let workspace_sub_path: Option<String> = None;
+        // workspace PVC:
+        // - 隔离容器 (pod_id=None): per-agent PVC (阶段2, subPath=None, subvolume 天然边界)
+        // - 共享容器 (pod_id=Some): 保持共享 PVC + subPath (选项A — 共享容器非 per-agent 隔离目标;
+        //   Pod 挂共享 subPath, file-server Local 读共享 /{tenant}/{space}/{project}, lazy mv skip)
+        let (workspace_pvc, workspace_sub_path): (String, Option<String>) = match (&pod_id, &service_type) {
+            (Some(_), ServiceType::WebAgentRunner) => (
+                std::env::var("RCODER_WORKSPACE_PVC_NAME")
+                    .unwrap_or_else(|_| format!("{}-rcoder-workspace", self.namespace)),
+                Some(
+                    std::env::var("RCODER_WORKSPACE_SUBPATH")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "workspace".to_string()),
+                ),
+            ),
+            (Some(_), ServiceType::ComputerAgentRunner) => (
+                std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME")
+                    .unwrap_or_else(|_| format!("{}-rcoder-computer-workspace", self.namespace)),
+                Some(user_id_val.clone()),
+            ),
+            _ => (self.workspace_pvc_name(identifier, &service_type)?, None),
+        };
 
         // (阶段2: xattr 目录配额已退役 —— 改用 per-agent subvolume PVC + CSI 服务端配额。
         //  parse_quantity_to_bytes / agent_workspace_quota_dir / xattr crate 已删, 见 Task 2.3)
