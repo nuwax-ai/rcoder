@@ -102,13 +102,12 @@ impl AppService {
         // 准确还原）。失败不阻塞启动（warn，待下次 create/update 恢复）。
         if svc.config.access_mode == AppAccessMode::Kubernetes
             && svc.config.http_expose == HttpExpose::Pingora
+            && let Err(e) = svc.rebuild_pingora_backends().await
         {
-            if let Err(e) = svc.rebuild_pingora_backends().await {
-                warn!(
-                    "[APP] Pingora backends 重建失败（重启后 HTTP 暂不可达，待下次 create/update 恢复）: {}",
-                    e
-                );
-            }
+            warn!(
+                "[APP] Pingora backends 重建失败（重启后 HTTP 暂不可达，待下次 create/update 恢复）: {}",
+                e
+            );
         }
         Ok(svc)
     }
@@ -185,7 +184,7 @@ impl AppService {
         self.create_app_dirs(&app_id).await?;
 
         // 2. 构建容器创建参数（UserApp）
-        let params = self.build_container_params(&app_id, &request)?;
+        let params = self.build_container_params(&app_id, &request).await?;
 
         // 3. 创建 Deployment / 容器（K8s 含 ConfigMap/Secret/Service/HTTPRoute/NodePort）
         let container_info = self.runtime.create_deployment(params).await.map_err(|e| {
@@ -375,7 +374,7 @@ impl AppService {
                 "resource version mismatch: expected={expected}, actual={actual}"
             )));
         }
-        let params = self.build_container_params_from_update(app_id, &request)?;
+        let params = self.build_container_params_from_update(app_id, &request).await?;
         // Docker 模式：旧容器 IP 即将失效，先注销 Pingora backend（K8s no-op）
         self.unregister_pingora_backends(app_id).await;
         let info = self.runtime.patch_deployment(params).await.map_err(|e| {
@@ -426,7 +425,7 @@ impl AppService {
         // 3. 仅 purge=true 时清空持久存储（code/data/logs 目录）。
         //    默认保留：应用可重建，数据不可再生（v2 §5.3 数据安全）。
         if purge {
-            let app_dir = self.get_container_app_dir(app_id);
+            let app_dir = self.get_container_app_dir(app_id).await;
             if app_dir.exists()
                 && let Err(e) = fs::remove_dir_all(&app_dir).await
             {
@@ -450,7 +449,7 @@ impl AppService {
     /// 查询单个应用的持久存储状态（O(1) stat，不递归）。
     pub async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo> {
         validate_app_id(app_id)?;
-        let app_dir = self.get_container_app_dir(app_id);
+        let app_dir = self.get_container_app_dir(app_id).await;
         let metadata = tokio::fs::metadata(&app_dir).await.ok();
         let exists = metadata.is_some();
         let modified_at = metadata
@@ -484,7 +483,7 @@ impl AppService {
                 )));
             }
         }
-        let app_dir = self.get_container_app_dir(app_id);
+        let app_dir = self.get_container_app_dir(app_id).await;
         if app_dir.exists()
             && let Err(e) = fs::remove_dir_all(&app_dir).await
         {
@@ -526,29 +525,11 @@ impl AppService {
             .into_iter()
             .map(|s| s.app_id)
             .collect();
-        // 单层列 workspace_root（不递归）
-        let workspace_root = self.config.get_workspace_root();
-        let mut entries: Vec<String> = match tokio::fs::read_dir(&workspace_root).await {
-            Ok(mut rd) => {
-                let mut v = vec![];
-                while let Ok(Some(de)) = rd.next_entry().await {
-                    if de.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
-                        && let Some(name) = de.file_name().to_str().map(|s| s.to_string())
-                    {
-                        v.push(name);
-                    }
-                }
-                v
-            }
-            Err(e) => {
-                // workspace_root 不可读（权限/缺失）→ 保守返回空页，但落日志可见
-                warn!(
-                    "[APP] query_storage 读取工作空间目录失败 {}: {}",
-                    workspace_root, e
-                );
-                vec![]
-            }
-        };
+        // 阶段2 per-app PVC: app 数据在各自 per-app PVC (rcoder 经挂根聚合访问), workspace_root
+        // 不再含 app 目录 → app 列表来自 list_deployments (existing, Deployment by label),
+        // 不 read_dir(workspace_root)。orphan 检测 (read_dir 找不在 Deployment 的目录) 在
+        // per-agent 模式失效 (数据跨 PVC); existing 内全为非 orphan。
+        let mut entries: Vec<String> = existing.iter().cloned().collect();
         entries.sort();
         let app_ids_filter = filters.app_ids.as_deref();
         let filtered: Vec<String> = entries
@@ -573,7 +554,7 @@ impl AppService {
 
         let mut items = Vec::with_capacity(paged.len());
         for app_id in paged {
-            let app_dir = self.get_container_app_dir(&app_id);
+            let app_dir = self.get_container_app_dir(&app_id).await;
             let is_orphan = !existing.contains(&app_id);
             let metadata = tokio::fs::metadata(&app_dir).await.ok();
             let modified_at = metadata
@@ -742,7 +723,7 @@ impl AppService {
         tail: u32,
     ) -> AppResult<Vec<LogEntry>> {
         validate_app_id(app_id)?;
-        let app_dir = self.get_container_app_dir(app_id);
+        let app_dir = self.get_container_app_dir(app_id).await;
         let target = app_dir.join(file_path);
 
         // path traversal 防护（与 upload/delete_file 一致）
@@ -799,7 +780,7 @@ impl AppService {
                 "file data is empty".to_string(),
             ));
         }
-        let app_dir = self.get_container_app_dir(app_id);
+        let app_dir = self.get_container_app_dir(app_id).await;
         fs::create_dir_all(&app_dir)
             .await
             .map_err(|e| map_io_error("failed to create app dir", e, false))?;
@@ -861,7 +842,7 @@ impl AppService {
         flatten: bool,
         canonical_app_dir: &std::path::Path,
     ) -> AppResult<UploadResult> {
-        let app_dir = self.get_container_app_dir(app_id);
+        let app_dir = self.get_container_app_dir(app_id).await;
         let dest = app_dir.join(target.trim_end_matches('/'));
         fs::create_dir_all(&dest)
             .await
@@ -923,7 +904,7 @@ impl AppService {
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>> {
         validate_app_id(app_id)?;
-        let app_dir = self.get_container_app_dir(app_id);
+        let app_dir = self.get_container_app_dir(app_id).await;
         if !app_dir.exists() {
             return Ok(vec![]);
         }
@@ -988,7 +969,7 @@ impl AppService {
     pub async fn delete_file(&self, app_id: &str, file_path: &str) -> AppResult<()> {
         validate_app_id(app_id)?;
         // file_path 相对 app 根目录（与 upload_file 的 target 同约定：可指向 code/ data/ logs/）
-        let app_dir = self.get_container_app_dir(app_id);
+        let app_dir = self.get_container_app_dir(app_id).await;
         if !app_dir.exists() {
             return Err(AppOperationError::NotFound(format!(
                 "app dir does not exist: {app_id}"
@@ -1033,7 +1014,7 @@ impl AppService {
     // ========================================================================
 
     /// 构建 ContainerCreateParams（UserApp）
-    fn build_container_params(
+    async fn build_container_params(
         &self,
         app_id: &str,
         request: &CreateAppRequest,
@@ -1083,7 +1064,7 @@ impl AppService {
         });
 
         // 宿主机工作空间路径（Docker 模式 bind mount 源；K8s 模式 runtime 用 subPath，忽略此值）
-        let host_workspace_path = self.get_host_app_dir(app_id).to_string_lossy().to_string();
+        let host_workspace_path = self.get_host_app_dir(app_id).await.to_string_lossy().to_string();
 
         let mut builder = ContainerCreateParams::builder()
             .project_id(app_id.to_string())
@@ -1104,6 +1085,11 @@ impl AppService {
             builder = builder.health_check(hc);
         }
         if let Some(ar) = app_resources {
+            // 阶段2: storage 落 per-app PVC requests.storage (CSI 服务端 subvolume 配额);
+            // ephemeral_storage 仍限 overlay 可写层。
+            if let Some(ss) = ar.storage.clone() {
+                builder = builder.storage_size(ss);
+            }
             builder = builder.app_resources(ar);
         }
         // tenant/space：进 ContainerCreateParams → build_app_labels 打 rcoder.io/tenant、
@@ -1122,7 +1108,7 @@ impl AppService {
     /// UpdateAppRequest → ContainerCreateParams（全量替换语义，image 必填）。
     /// 与 build_container_params 平行；image 缺失 → ERR_VALIDATION
     /// （rcoder 无状态，无法保留旧 image，调用方必须发完整新状态）。
-    fn build_container_params_from_update(
+    async fn build_container_params_from_update(
         &self,
         app_id: &str,
         request: &UpdateAppRequest,
@@ -1170,7 +1156,7 @@ impl AppService {
             storage: r.storage.clone(),
             ephemeral_storage: r.ephemeral_storage.clone(),
         });
-        let host_workspace_path = self.get_host_app_dir(app_id).to_string_lossy().to_string();
+        let host_workspace_path = self.get_host_app_dir(app_id).await.to_string_lossy().to_string();
 
         let mut builder = ContainerCreateParams::builder()
             .project_id(app_id.to_string())
@@ -1195,6 +1181,11 @@ impl AppService {
             builder = builder.health_check(hc);
         }
         if let Some(ar) = app_resources {
+            // 阶段2: storage 落 per-app PVC requests.storage (CSI 服务端 subvolume 配额);
+            // ephemeral_storage 仍限 overlay 可写层。
+            if let Some(ss) = ar.storage.clone() {
+                builder = builder.storage_size(ss);
+            }
             builder = builder.app_resources(ar);
         }
         Ok(builder.build())
@@ -1447,17 +1438,29 @@ impl AppService {
         Ok(())
     }
 
-    /// 获取应用目录（rcoder 视角：workspace_root/app_id）
-    fn get_container_app_dir(&self, app_id: &str) -> PathBuf {
-        PathBuf::from(self.config.get_workspace_root()).join(app_id)
+    /// 获取应用目录（rcoder 视角）。
+    ///
+    /// 阶段2 per-app PVC: K8s 模式经 `resolve_workspace_path` 拿 per-app subvolume 聚合路径
+    /// (`{cephfs_root}/{subvolumePath}/{app_id}`); Docker 模式 / K8s 未就绪 / 解析失败 →
+    /// fallback 静态拼 (`workspace_root/app_id`, 兼容共享 PVC)。返回 `PathBuf` (非 Result),
+    /// 调用方只需 `.await`, 不需 `?` (路径不可用不致命, 由后续 fs 操作自然报错)。
+    async fn get_container_app_dir(&self, app_id: &str) -> PathBuf {
+        match self
+            .runtime
+            .resolve_workspace_path(app_id, &ServiceType::UserApp)
+            .await
+        {
+            Ok(Some(base)) => PathBuf::from(base).join(app_id),
+            _ => PathBuf::from(self.config.get_workspace_root()).join(app_id),
+        }
     }
 
     /// 获取应用目录的宿主机路径（Docker bind mount 源）
     ///
     /// Docker 模式：rcoder 通常也运行在容器内，需经 HostPathResolver 将容器内路径
     /// 转为宿主机路径；解析失败回退到原路径。K8s 模式此值不被使用。
-    fn get_host_app_dir(&self, app_id: &str) -> PathBuf {
-        let p = self.get_container_app_dir(app_id);
+    async fn get_host_app_dir(&self, app_id: &str) -> PathBuf {
+        let p = self.get_container_app_dir(app_id).await;
         if let Some(resolver) = self.path_resolver.get("default") {
             resolver.resolve_to_host_path(&p).unwrap_or(p)
         } else {
@@ -1467,7 +1470,7 @@ impl AppService {
 
     /// 创建应用工作空间子目录
     async fn create_app_dirs(&self, app_id: &str) -> AppResult<()> {
-        let app_dir = self.get_container_app_dir(app_id);
+        let app_dir = self.get_container_app_dir(app_id).await;
         fs::create_dir_all(app_dir.join("code"))
             .await
             .map_err(|e| map_io_error("failed to create code dir", e, false))?;

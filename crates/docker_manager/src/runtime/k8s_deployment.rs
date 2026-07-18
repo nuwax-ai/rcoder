@@ -42,6 +42,7 @@ use tracing::{info, warn};
 use shared_types::ServiceType;
 
 #[cfg(feature = "kubernetes")]
+use super::k8s_pvc::K8sPvcOps;
 use super::kubernetes_runtime::KubernetesRuntime;
 
 #[cfg(feature = "kubernetes")]
@@ -87,11 +88,10 @@ impl KubernetesRuntime {
         format!("{}-nodeport", self.app_deployment_name(app_id))
     }
 
-    /// app workspace PVC 名（复用 rcoder-workspace RWX PVC）
-    /// 从 env `RCODER_WORKSPACE_PVC_NAME` 读，兜底 `{namespace}-rcoder-workspace`
-    fn app_workspace_pvc_name(&self) -> String {
-        std::env::var("RCODER_WORKSPACE_PVC_NAME")
-            .unwrap_or_else(|_| format!("{}-rcoder-workspace", self.namespace))
+    /// app workspace PVC 名（阶段2 per-app PVC, 复用 K8sPvcOps::workspace_pvc_name 单一事实源,
+    /// 与 agent 路径 create_container + resolve_subvolume_path 同名, 根除漂移）
+    fn app_workspace_pvc_name(&self, app_id: &str) -> ContainerRuntimeResult<String> {
+        self.workspace_pvc_name(app_id, &ServiceType::UserApp)
     }
 
     /// 构建 app 专用 label（与 agent 物理隔离）。
@@ -335,14 +335,13 @@ impl KubernetesRuntime {
             ..Default::default()
         }]);
 
-        // workspace PVC 挂载（复用 rcoder-workspace RWX，subPath workspace/apps/{app_id} → /app）
-        // subPath 带 workspace 前缀以复用 rcoder Pod 已挂的 `workspace` subPath：
-        // rcoder /app/project_workspace = PVC `/workspace`，故 rcoder /app/project_workspace/apps/{app_id}
-        // = PVC `/workspace/apps/{app_id}` = app Pod /app，共享读写。
+        // 阶段2: per-app PVC (CephFS subvolume, 已由 create_app_resources ensure 创建)。
+        // app Pod 挂自己 PVC (subPath=None —— subvolume 已是天然边界), 数据落 PVC 根 {app_id}。
+        // rcoder 经挂根聚合 ({cephfs_root}/{subvolumePath}/{app_id}) 访问。
         let volumes = Some(vec![Volume {
             name: "app-workspace".to_string(),
             persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                claim_name: self.app_workspace_pvc_name(),
+                claim_name: self.app_workspace_pvc_name(app_id)?,
                 read_only: Some(false),
             }),
             ..Default::default()
@@ -350,7 +349,7 @@ impl KubernetesRuntime {
         let volume_mounts = Some(vec![VolumeMount {
             name: "app-workspace".to_string(),
             mount_path: "/app".to_string(),
-            sub_path: Some(format!("workspace/apps/{app_id}")),
+            sub_path: None,
             read_only: Some(false),
             ..Default::default()
         }]);
@@ -659,6 +658,10 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
         let tenant_id = params.tenant_id.as_deref();
         let space_id = params.space_id.as_deref();
+        // 0. workspace PVC (阶段2 per-app CephFS subvolume; 配额由 requests.storage 经 CSI 服务端设,
+        //    绕开 client setfattr)。PVC 永不删除 (数据安全), 重建时 ensure "active" 分支复用。
+        self.ensure_workspace_pvc(app_id, &ServiceType::UserApp, params.storage_size.as_deref())
+            .await?;
         // 1. ConfigMap（env）
         if let Some(env) = &params.env
             && !env.is_empty()
