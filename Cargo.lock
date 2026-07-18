@@ -6187,6 +6187,7 @@ dependencies = [
  "derive_builder",
  "docker_manager",
  "download_utils",
+ "file-server",
  "filetime",
  "futures 0.3.32",
  "futures-util",

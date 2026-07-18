@@ -4,6 +4,7 @@ mod cleanup_task;
 mod config;
 mod config_watcher;
 mod docker_init;
+mod file_server_embed;
 mod handler;
 mod middleware;
 mod proxy_init;
@@ -100,6 +101,18 @@ async fn main() -> anyhow::Result<()> {
     let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get container runtime: {}", e))?;
+
+    // 阶段2 方案C: rcoder 同进程嵌入 file-server (env 开关 RCODER_EMBED_FILE_SERVER, 灰度)。
+    // 启用时 rcoder 进程内 spawn file-server (端口 60000), 经 SubvolumeWorkspaceResolver
+    // 复用本进程 ContainerRuntime 解析 per-agent subvolume 聚合路径 (file-server 不加 kube 依赖)。
+    // 配套: start-services.sh 须检查本 env, 嵌入时不再单独启 file-server 二进制 (避免端口冲突)。
+    let embed_file_server = matches!(
+        std::env::var("RCODER_EMBED_FILE_SERVER").ok().as_deref(),
+        Some("true") | Some("1")
+    );
+    if embed_file_server {
+        file_server_embed::spawn_embedded_file_server(Arc::clone(&runtime)).await;
+    }
 
     let state = Arc::new(
         AppState::new(
