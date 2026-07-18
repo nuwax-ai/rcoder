@@ -29,13 +29,14 @@ impl AgentCleaner {
     pub fn new(
         config: super::config::CleanupConfig,
         state: Arc<crate::router::AppState>,
-        docker_manager: Arc<docker_manager::DockerManager>,
         pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     ) -> Self {
         let config_clone = config.clone();
         let state_clone = state.clone();
         let grpc_pool = state.grpc_pool.clone();
         let namespace = state.config.app_manager.namespace.clone();
+        // 运行时抽象 (Docker / K8s) —— destroyer 物理销毁走它, 使 AgentCleaner 跨模式复用
+        let runtime = state.runtime().clone();
 
         // 判断是否是 K8s 运行时（通过 features flag）
         let is_kubernetes = shared_types::is_kubernetes_runtime();
@@ -53,7 +54,7 @@ impl AgentCleaner {
             rcoder_strategy: super::strategies::rcoder::RCoderStrategy,
             computer_runner_strategy: super::strategies::computer_runner::ComputerRunnerStrategy,
             container_destroyer: super::container::ContainerDestroyer::new(
-                docker_manager.clone(),
+                runtime,
                 grpc_pool,
                 pingora_service,
                 namespace,
@@ -240,6 +241,7 @@ impl AgentCleaner {
                     &container_identifier,
                     &reason,
                     Some(project_id),
+                    &container_info.container_ip,
                 )
                 .await?;
 

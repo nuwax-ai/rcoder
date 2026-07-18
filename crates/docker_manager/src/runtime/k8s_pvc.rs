@@ -212,6 +212,10 @@ impl K8sPvcOps for KubernetesRuntime {
                         }
                     }
                 }
+                // PVC 已删 (404/强删/error), 将重建新 PVC (新 CephFS subvolume UUID) →
+                // invalidate subvolPath 缓存 (旧 subvolPath 不再对应此 PVC; 不清则 resolve 命中脏值,
+                // rcoder 经挂根读老 subvol 而 pod 挂新 PVC → 数据面分裂)
+                self.subvolume_path_cache.write().await.remove(&pvc_name);
             }
             _ => {
                 // "not_found" — PVC doesn't exist, will create below

@@ -207,7 +207,7 @@ impl AppService {
             &app_id,
             &ServiceType::UserApp,
             &app_id,
-            false,
+            true, // dst=per-app PVC 根 (app pod 挂 PVC 根到 /app, rcoder 写 PVC 根)
         )
         .await;
 
@@ -1454,17 +1454,18 @@ impl AppService {
     /// 获取应用目录（rcoder 视角）。
     ///
     /// 阶段2 per-app PVC: K8s 模式经 `resolve_workspace_path` 拿 per-app subvolume 聚合路径
-    /// (`{cephfs_root}/{subvolumePath}/{app_id}`); Docker 模式 / K8s 未就绪 / 解析失败 →
-    /// fallback 静态拼 (`workspace_root/app_id`, 兼容共享 PVC)。返回 `PathBuf` (非 Result),
-    /// 调用方只需 `.await`, 不需 `?` (路径不可用不致命, 由后续 fs 操作自然报错)。
+    /// (`{cephfs_root}/{subvolumePath}` = per-app PVC 根); UserApp pod 挂 per-app PVC 根到 /app
+    /// (subPath=None), 故 rcoder 写 PVC 根 (不 join app_id, app 数据 {subvol}/code 等, app pod
+    /// /app/code 对齐)。Docker/K8s 未就绪 → fallback 共享 `workspace_root/{app_id}` (= apps/{app_id})。
+    /// 返回 `PathBuf` (非 Result), 调用方只需 `.await` (路径不可用由后续 fs 自然报错)。
     async fn get_container_app_dir(&self, app_id: &str) -> PathBuf {
         match self
             .runtime
             .resolve_workspace_path(app_id, &ServiceType::UserApp)
             .await
         {
-            Ok(Some(base)) => PathBuf::from(base).join(app_id),
-            _ => PathBuf::from(self.config.get_workspace_root()).join(app_id),
+            Ok(Some(base)) => PathBuf::from(base), // K8s per-agent: per-app PVC 根 (不 join app_id)
+            _ => PathBuf::from(self.config.get_workspace_root()).join(app_id), // fallback 共享 apps/{app_id}
         }
     }
 
