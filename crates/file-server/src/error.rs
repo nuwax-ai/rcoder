@@ -134,9 +134,9 @@ pub fn generate_request_id() -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0);
-    let mixed = nanos ^ (n << 12) ^ (std::process::id() as u64).wrapping_mul(2654435761);
+    let mixed = nanos ^ (n << 12) ^ u64::from(std::process::id()).wrapping_mul(2_654_435_761);
     base36(mixed)
 }
 

@@ -240,37 +240,55 @@ where
 /// 杀进程组 (对齐 nuwax killProcess): 优先 kill(-pid) SIGTERM, 降级 kill(pid)。
 /// 返回是否成功送出信号。
 pub fn kill_process_group(pid: u32) -> bool {
-    let pgid = Pid::from_raw(-(pid as i32));
+    let Some(process_pid) = system_pid(pid) else {
+        return false;
+    };
+    let pgid = Pid::from_raw(-process_pid.as_raw());
     match kill(pgid, Signal::SIGTERM) {
         Ok(()) => true,
-        Err(_) => kill(Pid::from_raw(pid as i32), Signal::SIGTERM).is_ok(),
+        Err(_) => kill(process_pid, Signal::SIGTERM).is_ok(),
     }
 }
 
 /// 强杀进程组 (SIGKILL 升级): SIGTERM 宽限期后进程仍存活时调用, 优先 kill(-pid) SIGKILL, 降级 kill(pid)。
 pub fn kill_process_group_force(pid: u32) -> bool {
-    let pgid = Pid::from_raw(-(pid as i32));
+    let Some(process_pid) = system_pid(pid) else {
+        return false;
+    };
+    let pgid = Pid::from_raw(-process_pid.as_raw());
     match kill(pgid, Signal::SIGKILL) {
         Ok(()) => true,
-        Err(_) => kill(Pid::from_raw(pid as i32), Signal::SIGKILL).is_ok(),
+        Err(_) => kill(process_pid, Signal::SIGKILL).is_ok(),
     }
 }
 
 /// 读取进程组 ID，用于 stop 去重：同一 Vite/pnpm 进程树只需 kill 一次。
 pub fn process_group_id(pid: u32) -> Option<u32> {
-    getpgid(Some(Pid::from_raw(pid as i32)))
+    getpgid(Some(system_pid(pid)?))
         .ok()
-        .map(|pgid| pgid.as_raw() as u32)
+        .and_then(|pgid| u32::try_from(pgid.as_raw()).ok())
 }
 
 /// 进程是否仍在运行 (kill pid 0 探活; 对齐 nuwax isProcessRunning)。
 pub fn is_process_running(pid: u32) -> bool {
+    let Some(process_pid) = system_pid(pid) else {
+        return false;
+    };
     // kill(pid, None) == 信号 0, 不实际杀, 仅探测
-    match kill(Pid::from_raw(pid as i32), None) {
+    match kill(process_pid, None) {
         Ok(()) => true,
         Err(nix::errno::Errno::EPERM) => true, // 存在但无权限
         Err(_) => false,
     }
+}
+
+/// 将 Tokio 返回的无符号 PID 安全转换为 Unix `pid_t`。
+/// PID 0 代表当前进程组，不允许作为外部子进程 PID 使用。
+fn system_pid(pid: u32) -> Option<Pid> {
+    i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .map(Pid::from_raw)
 }
 
 /// 轮询等待进程退出 (对齐 nuwax waitForProcessStop)。
@@ -356,4 +374,16 @@ pub async fn is_project_alive(port: u16, base_path: Option<&str>, timeout_ms: u6
 /// 当前时间毫秒 (chrono, 非 std::time 获取以保持可测)。
 pub fn now_ms() -> i64 {
     Local::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::system_pid;
+
+    #[test]
+    fn system_pid_rejects_values_outside_positive_pid_t_range() {
+        assert!(system_pid(0).is_none());
+        assert!(system_pid(u32::MAX).is_none());
+        assert_eq!(system_pid(1).map(nix::unistd::Pid::as_raw), Some(1));
+    }
 }

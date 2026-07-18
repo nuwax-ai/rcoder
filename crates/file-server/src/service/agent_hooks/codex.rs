@@ -42,7 +42,10 @@ fn parse_timeout_seconds(value: &Value, default_sec: u32) -> u32 {
         _ => None,
     };
     match n {
-        Some(x) if x.is_finite() && x > 0.0 => (x.min(86_400.0)) as u32,
+        Some(x) if x.is_finite() && x > 0.0 => {
+            let seconds = std::time::Duration::from_secs_f64(x.min(86_400.0)).as_secs();
+            u32::try_from(seconds).unwrap_or(default_sec)
+        }
         _ => default_sec,
     }
 }

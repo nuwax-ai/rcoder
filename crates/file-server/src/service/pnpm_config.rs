@@ -179,7 +179,7 @@ async fn sanitize_pnpm_workspace_built_deps(project_dir: &Path) -> AppResult<()>
         Err(_) => return Ok(()),
     };
     let mut result: Vec<&str> = Vec::new();
-    let mut skip_until_indent: i64 = -1;
+    let mut skip_until_indent: Option<usize> = None;
     let mut removed: Vec<&str> = Vec::new();
     for line in content.split('\n') {
         let trimmed = line.trim_start();
@@ -188,15 +188,15 @@ async fn sanitize_pnpm_workspace_built_deps(project_dir: &Path) -> AppResult<()>
             removed.push(key);
             let inline = trimmed[key.len() + 1..].trim();
             if inline.is_empty() || inline == "|" || inline == ">" {
-                skip_until_indent = indent as i64;
+                skip_until_indent = Some(indent);
             }
             continue;
         }
-        if skip_until_indent >= 0 {
-            if trimmed.is_empty() || (indent as i64) > skip_until_indent {
+        if let Some(parent_indent) = skip_until_indent {
+            if trimmed.is_empty() || indent > parent_indent {
                 continue;
             }
-            skip_until_indent = -1;
+            skip_until_indent = None;
         }
         result.push(line);
     }

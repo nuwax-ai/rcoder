@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::HeaderValue;
 use axum::middleware::{Next, from_fn};
@@ -29,11 +30,12 @@ async fn main() -> anyhow::Result<()> {
 
     let port = std::env::var(ENV_PORT)
         .or_else(|_| std::env::var("PORT"))
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+        .map_or_else(
+            |_| Ok(DEFAULT_PORT),
+            |value| value.parse().context("parse file-server listen port"),
+        )?;
 
-    let config = Arc::new(Config::from_env());
+    let config = Arc::new(Config::from_env().context("load file-server configuration")?);
     let state = AppState {
         resolver: Arc::new(LocalWorkspaceResolver::from_env()),
         dev_server: Arc::new(DevServerManager::new(config.clone())),
@@ -44,8 +46,8 @@ async fn main() -> anyhow::Result<()> {
     };
     // clone Arc 给 graceful shutdown 闭包 (state 会被 with_state 消费)
     let dev_server = state.dev_server.clone();
-    let request_body_limit =
-        usize::try_from(state.config.request_body_max_bytes).unwrap_or(usize::MAX);
+    let request_body_limit = usize::try_from(state.config.request_body_max_bytes)
+        .context("REQUEST_BODY_MAX_BYTES exceeds platform usize")?;
 
     let (api_router, openapi) = file_server::routes::api_router().split_for_parts();
     let app = api_router

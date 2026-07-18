@@ -136,9 +136,9 @@ impl LogCacheManager {
             .unwrap_or(0);
         Ok(CacheStats {
             enabled: self.enabled,
-            cache_size: entries.len() as u64,
-            max_cache_entries: self.max_entries as u64,
-            cache_duration: self.duration.as_millis() as u64,
+            cache_size: u64::try_from(entries.len()).unwrap_or(u64::MAX),
+            max_cache_entries: u64::try_from(self.max_entries).unwrap_or(u64::MAX),
+            cache_duration: u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX),
             max_file_size_bytes,
             total_cache_size_bytes,
         })

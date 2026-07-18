@@ -77,17 +77,14 @@ pub async fn write_agent_hook_configs(workspace: &Path, opts: HookConfigInput) -
 
     let has_mcp_input = mcp_servers_config
         .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
+        .is_some_and(|value| !value.trim().is_empty());
     let hooks_status = parse_hooks_config_with_status(hooks_config.as_deref());
     let has_perms_input = permissions_config
         .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
+        .is_some_and(|value| !value.trim().is_empty());
     let has_scripts = hook_scripts
         .as_ref()
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|scripts| !scripts.is_empty());
 
     if hooks_status.attempted && hooks_status.error.is_some() {
         tracing::error!(
@@ -139,9 +136,9 @@ pub async fn write_agent_hook_configs(workspace: &Path, opts: HookConfigInput) -
             should_update_scripts,
             install_platform_env,
         },
-        &mcp_servers,
-        &hooks_status.hooks_map,
-        &permissions,
+        mcp_servers.as_ref(),
+        hooks_status.hooks_map.as_ref(),
+        permissions.as_ref(),
         hook_scripts.as_deref(),
         &mut staging_root,
     )
@@ -176,9 +173,9 @@ struct ApplyFlags {
 async fn apply_hook_configs(
     workspace: &Path,
     flags: ApplyFlags,
-    mcp_servers: &Option<Value>,
-    hooks_map: &Option<Map<String, Value>>,
-    permissions: &Option<Value>,
+    mcp_servers: Option<&Value>,
+    hooks_map: Option<&Map<String, Value>>,
+    permissions: Option<&Value>,
     hook_scripts: Option<&[HookScript]>,
     staging_out: &mut Option<PathBuf>,
 ) -> AppResult<()> {

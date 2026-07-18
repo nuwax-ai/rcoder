@@ -65,31 +65,46 @@ pub async fn push_skills_at(
 
     let mut updated = Vec::new();
     for (i, data) in sources.iter().enumerate() {
-        let extract_root = temp_dir(&format!("fs-skills-{i}"));
+        let extract_root = temp_dir(&format!("fs-skills-{i}")).await?;
         let temp_zip = extract_root.join("src.zip");
-        let extract_result: AppResult<()> = async {
+        let source_result: AppResult<Vec<String>> = async {
             fs::write(&temp_zip, data).await?;
-            crate::service::zip::extract_to(temp_zip.clone(), extract_root.clone()).await
-        }
-        .await;
-        if let Err(e) = extract_result {
-            let _ = fs::remove_dir_all(&extract_root).await;
-            return Err(e);
-        }
-        // 找 skills 目录 (根 skills/ 或一层子 skills/)
-        if let Some(skills_dir) = find_skills_dir(&extract_root) {
-            let mut entries = fs::read_dir(&skills_dir).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let src = entry.path();
-                let dst = primary_skills.join(&name);
-                let _ = fs::remove_dir_all(&dst).await;
-                if copy_entry(&src, &dst).await.is_ok() {
-                    updated.push(name);
+            crate::service::zip::extract_to(temp_zip.clone(), extract_root.clone()).await?;
+
+            let mut imported = Vec::new();
+            // 找 skills 目录 (根 skills/ 或一层子目录 skills/)
+            if let Some(skills_dir) = find_skills_dir(&extract_root).await? {
+                let mut entries = fs::read_dir(&skills_dir).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let src = entry.path();
+                    let dst = primary_skills.join(&name);
+                    remove_dir_if_exists(&dst).await?;
+                    copy_entry(&src, &dst).await?;
+                    imported.push(name);
                 }
             }
+            Ok(imported)
         }
-        let _ = fs::remove_dir_all(&extract_root).await;
+        .await;
+
+        let cleanup_result = fs::remove_dir_all(&extract_root).await;
+        match source_result {
+            Ok(imported) => {
+                cleanup_result?;
+                updated.extend(imported);
+            }
+            Err(error) => {
+                if let Err(cleanup_error) = cleanup_result {
+                    tracing::warn!(
+                        path = %extract_root.display(),
+                        error = %cleanup_error,
+                        "clean up failed skill import directory"
+                    );
+                }
+                return Err(error);
+            }
+        }
     }
 
     sync_agents(workspace).await?;
@@ -114,20 +129,19 @@ pub async fn fetch_url(url: &str) -> AppResult<Vec<u8>> {
 }
 
 /// 在 extract_root 下找 skills 目录 (优先根 skills/, 再查一层子目录 skills/)。
-fn find_skills_dir(root: &Path) -> Option<PathBuf> {
+async fn find_skills_dir(root: &Path) -> AppResult<Option<PathBuf>> {
     let direct = root.join("skills");
-    if direct.is_dir() {
-        return Some(direct);
+    if fs::try_exists(&direct).await? {
+        return Ok(Some(direct));
     }
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let sub = entry.path().join("skills");
-            if sub.is_dir() {
-                return Some(sub);
-            }
+    let mut entries = fs::read_dir(root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let sub = entry.path().join("skills");
+        if fs::try_exists(&sub).await? {
+            return Ok(Some(sub));
         }
     }
-    None
+    Ok(None)
 }
 
 /// 以 `.agents` 为权威源, 全量 fan-out skills/agents 到 `.claude/.opencode/.codex`
@@ -171,12 +185,43 @@ async fn copy_entry(src: &Path, dst: &Path) -> AppResult<()> {
     }
 }
 
-fn temp_dir(prefix: &str) -> PathBuf {
+async fn remove_dir_if_exists(path: &Path) -> AppResult<()> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn temp_dir(prefix: &str) -> AppResult<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let p = std::env::temp_dir().join(format!("{prefix}_{nanos}"));
-    let _ = std::fs::create_dir_all(&p);
-    p
+    let path = std::env::temp_dir().join(format!("{prefix}_{nanos}"));
+    fs::create_dir_all(&path).await?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn finds_nested_skills_directory_without_blocking_io() {
+        let root = temp_dir("file-server-skills-test")
+            .await
+            .expect("create test directory");
+        let expected = root.join("bundle").join("skills");
+        fs::create_dir_all(&expected)
+            .await
+            .expect("create skills fixture");
+
+        let found = find_skills_dir(&root).await.expect("scan skills directory");
+        assert_eq!(found, Some(expected));
+
+        fs::remove_dir_all(root)
+            .await
+            .expect("remove test directory");
+    }
 }

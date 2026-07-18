@@ -580,14 +580,14 @@ mod tests {
     #[tokio::test]
     async fn shutdown_all_empty_is_noop() {
         // 空实例表 → 立即返回, 不 panic
-        let mgr = DevServerManager::new(Arc::new(Config::from_env()));
+        let mgr = DevServerManager::new(Arc::new(Config::from_env().expect("test config")));
         mgr.shutdown_all().await;
     }
 
     #[tokio::test]
     async fn drop_with_stale_entry_does_not_panic() {
         // 塞一个不可能存活的 pid: Drop 对其 SIGKILL 返回 false 但不 panic, 仍还端口 + 清表
-        let mgr = DevServerManager::new(Arc::new(Config::from_env()));
+        let mgr = DevServerManager::new(Arc::new(Config::from_env().expect("test config")));
         {
             let mut procs = mgr.processes.lock().unwrap();
             procs.insert(

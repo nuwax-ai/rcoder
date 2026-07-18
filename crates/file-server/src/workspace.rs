@@ -90,17 +90,17 @@ impl LocalWorkspaceResolver {
 }
 
 /// 取 trim 后非空的字符串; 空白视为未设置 (对齐 nuwax `normalizeValue`)。
-fn non_empty(s: &Option<String>) -> Option<&str> {
-    s.as_deref().map(str::trim).filter(|v| !v.is_empty())
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 impl WorkspaceResolver for LocalWorkspaceResolver {
     fn resolve_project(&self, ctx: &ProjectContext) -> PathBuf {
         // 对齐 nuwax `shouldUseIsolationPath`: tenant+space+isolationType 均非空才三级
         match (
-            non_empty(&ctx.tenant_id),
-            non_empty(&ctx.space_id),
-            non_empty(&ctx.isolation_type),
+            non_empty(ctx.tenant_id.as_deref()),
+            non_empty(ctx.space_id.as_deref()),
+            non_empty(ctx.isolation_type.as_deref()),
         ) {
             (Some(tenant), Some(space), Some(_)) => self
                 .project_root

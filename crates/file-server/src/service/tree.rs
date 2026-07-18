@@ -340,7 +340,7 @@ async fn detect_dev_framework(project_path: &Path) -> String {
         "next.config.mjs",
         "next.config.cjs",
     ] {
-        if project_path.join(f).exists() {
+        if fs::try_exists(project_path.join(f)).await.unwrap_or(false) {
             return "nextjs".to_string();
         }
     }
@@ -350,7 +350,7 @@ async fn detect_dev_framework(project_path: &Path) -> String {
         "vite.config.mjs",
         "vite.config.cjs",
     ] {
-        if project_path.join(f).exists() {
+        if fs::try_exists(project_path.join(f)).await.unwrap_or(false) {
             return "vite".to_string();
         }
     }
