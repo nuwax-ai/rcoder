@@ -17,14 +17,14 @@ use tracing::{debug, info, warn};
 /// resolve per-agent dst 聚合路径, 等 PVC Bound (重试)。
 ///
 /// UserApp `create_deployment` 不等 Pod Ready, PVC 刚 ensure 可能未 Bound
-/// (WaitForFirstConsumer 需 Pod 调度)。重试几秒等 ceph-csi provision 完成。
-/// Web/Computer `create_container` 等 Pod Ready, 首次即 Bound, 不实际重试。
+/// (WaitForFirstConsumer 需 Pod 调度)。重试等 ceph-csi provision 完成 (典型秒级,
+/// 慢调度可达 30s+)。Web/Computer `create_container` 等 Pod Ready, 首次即 Bound, 不实际重试。
 async fn resolve_dst_with_retry(
     runtime: &Arc<dyn ContainerRuntime>,
     identifier: &str,
     service_type: &ServiceType,
 ) -> Option<String> {
-    const MAX_RETRIES: u32 = 6;
+    const MAX_RETRIES: u32 = 30;
     for attempt in 0..MAX_RETRIES {
         match runtime.resolve_workspace_path(identifier, service_type).await {
             Ok(Some(base)) => return Some(base),
@@ -83,12 +83,7 @@ pub async fn lazy_migrate(
     else {
         return;
     };
-    // per-agent dst base: {cephfs_root}/{per-agent-subvol}; 等 PVC Bound
-    let dst_base = match resolve_dst_with_retry(runtime, identifier, service_type).await {
-        Some(base) => PathBuf::from(base),
-        None => return, // Docker 模式或 PVC 长时间未 Bound, 跳过
-    };
-    // 共享 src base: {cephfs_root}/{shared-subvol}
+    // 共享 src base: {cephfs_root}/{shared-subvol} (共享 PVC 早已 Bound, resolve 快 + cache 命中)
     let src_base = match runtime.resolve_workspace_path_by_pvcname(&shared_pvc).await {
         Ok(Some(base)) => PathBuf::from(base),
         _ => return,
@@ -98,6 +93,17 @@ pub async fn lazy_migrate(
         src = src.join(s);
     }
     src = src.join(leaf);
+    // src 不存在 → 新项目/无旧数据 (UserApp 新应用常态, 见 application-management-service-v2-design.md;
+    // 新 project/user 同理), 早退。提前检查避免新项目白等 dst resolve (per-agent PVC 等 Bound
+    // 重试最长 60s), 性能关键 —— 新应用 create_app 不该被迁移逻辑阻塞。
+    if tokio::fs::metadata(&src).await.is_err() {
+        return;
+    }
+    // per-agent dst base: {cephfs_root}/{per-agent-subvol}; 等 PVC Bound (仅旧数据迁移才需)
+    let dst_base = match resolve_dst_with_retry(runtime, identifier, service_type).await {
+        Some(base) => PathBuf::from(base),
+        None => return, // Docker 模式或 PVC 长时间未 Bound, 跳过 (数据仍在共享)
+    };
 
     if dst_at_root {
         // Computer: 逐子项 rename (src/{user_id}/* → dst/{subvol}/* = per-user PVC 根)
@@ -111,10 +117,6 @@ pub async fn lazy_migrate(
     if let Ok(mut rd) = tokio::fs::read_dir(&dst).await
         && rd.next_entry().await.ok().flatten().is_some()
     {
-        return;
-    }
-    // src 不存在 → 新项目 (无旧数据), 跳过
-    if tokio::fs::metadata(&src).await.is_err() {
         return;
     }
     // mv (经挂根同 mount rename, 瞬间 MDS 元数据, 无重复; 共享子目录自动空)
