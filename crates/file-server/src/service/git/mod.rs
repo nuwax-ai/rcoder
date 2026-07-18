@@ -90,7 +90,7 @@ pub fn resolve_target(
                     "taskAgent mode requires userId and cId",
                 ));
             }
-            let path = resolver.resolve_computer(ctx);
+            let path = resolver.resolve_computer(ctx)?;
             if !path.exists() {
                 return Err(AppError::resource("Computer workspace does not exist"));
             }
@@ -106,7 +106,7 @@ pub fn resolve_target(
             if ctx.project_id.trim().is_empty() {
                 return Err(AppError::validation("pageApp mode requires projectId"));
             }
-            let path = resolver.resolve_project(ctx);
+            let path = resolver.resolve_project(ctx)?;
             if !path.exists() {
                 return Err(AppError::resource("Project does not exist"));
             }

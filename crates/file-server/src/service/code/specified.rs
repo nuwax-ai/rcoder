@@ -13,7 +13,7 @@ use crate::path_safety::safe_within_or_skip;
 use crate::service::version;
 use crate::workspace::{ProjectContext, WorkspaceResolver};
 
-use super::types::FileOp;
+use super::types::{FileOp, FileOperation};
 
 /// modify 策略 (project 与 computer 路由口径不同):
 /// - `Diff`: 行级 diff 合并 (project specifiedFilesUpdate; 换行符继承 existing)。
@@ -46,15 +46,15 @@ pub async fn specified_files_update(
         return Err(AppError::validation("codeVersion cannot be empty"));
     }
     version::parse_version(code_version)?; // 校验为数字
-    validate_file_ops(files)?;
+    let validated_ops = validate_file_ops(files)?;
 
-    let project_path = resolver.resolve_project(ctx);
+    let project_path = resolver.resolve_project(ctx)?;
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
     version::backup_project(config, project_id, &project_path, code_version).await?;
 
-    apply_file_ops(&project_path, files, ModifyStrategy::Diff).await?;
+    apply_validated_file_ops(&project_path, &validated_ops, ModifyStrategy::Diff).await?;
     Ok(SpecifiedResult {
         project_id: project_id.to_string(),
         files_count: files.len(),
@@ -62,7 +62,8 @@ pub async fn specified_files_update(
 }
 
 /// 在产生任何文件副作用之前校验增量操作结构。
-pub fn validate_file_ops(files: &[FileOp]) -> AppResult<()> {
+fn validate_file_ops(files: &[FileOp]) -> AppResult<Vec<ValidatedFileOp<'_>>> {
+    let mut validated = Vec::with_capacity(files.len());
     for (i, op) in files.iter().enumerate() {
         if op.operation.trim().is_empty() {
             return Err(AppError::validation_with(
@@ -76,13 +77,12 @@ pub fn validate_file_ops(files: &[FileOp]) -> AppResult<()> {
                 json!({ "field": format!("files[{i}].name") }),
             ));
         }
-        let op_l = op.operation.to_lowercase();
-        if !matches!(op_l.as_str(), "create" | "delete" | "rename" | "modify") {
-            return Err(AppError::validation(format!(
+        let operation = op.operation.parse::<FileOperation>().map_err(|_| {
+            AppError::validation(format!(
                 "files[{i}].operation must be one of create, delete, rename or modify"
-            )));
-        }
-        if op_l == "rename"
+            ))
+        })?;
+        if operation == FileOperation::Rename
             && op
                 .rename_from
                 .as_deref()
@@ -94,13 +94,22 @@ pub fn validate_file_ops(files: &[FileOp]) -> AppResult<()> {
                 "files[{i}].renameFrom cannot be empty (rename operation requires)"
             )));
         }
-        if op_l == "modify" && op.contents.is_none() {
+        if operation == FileOperation::Modify && op.contents.is_none() {
             return Err(AppError::validation(format!(
                 "files[{i}].contents must be a string (modify operation requires)"
             )));
         }
+        validated.push(ValidatedFileOp {
+            operation,
+            input: op,
+        });
     }
-    Ok(())
+    Ok(validated)
+}
+
+struct ValidatedFileOp<'a> {
+    operation: FileOperation,
+    input: &'a FileOp,
 }
 
 /// 文件操作核心 (path 制, 无版本备份): create/delete/rename/modify, 路径防穿越。
@@ -110,15 +119,23 @@ pub async fn apply_file_ops(
     files: &[FileOp],
     strategy: ModifyStrategy,
 ) -> AppResult<()> {
-    validate_file_ops(files)?;
-    for op in files {
-        let op_l = op.operation.to_lowercase();
+    let validated_ops = validate_file_ops(files)?;
+    apply_validated_file_ops(base, &validated_ops, strategy).await
+}
+
+async fn apply_validated_file_ops(
+    base: &Path,
+    files: &[ValidatedFileOp<'_>],
+    strategy: ModifyStrategy,
+) -> AppResult<()> {
+    for validated in files {
+        let op = validated.input;
         let Some(target) = safe_within_or_skip(base, &op.name) else {
             tracing::warn!(path = %op.name, "unsafe path, skipping");
             continue;
         };
-        match op_l.as_str() {
-            "create" => {
+        match validated.operation {
+            FileOperation::Create => {
                 if op.is_dir == Some(true) {
                     if !crate::service::fs_util::path_exists(&target).await? {
                         fs::create_dir_all(&target).await?;
@@ -130,7 +147,7 @@ pub async fn apply_file_ops(
                     fs::write(&target, op.contents.as_deref().unwrap_or("")).await?;
                 }
             }
-            "delete" => {
+            FileOperation::Delete => {
                 if crate::service::fs_util::path_exists(&target).await? {
                     let is_dir = fs::metadata(&target)
                         .await
@@ -143,7 +160,7 @@ pub async fn apply_file_ops(
                     }
                 }
             }
-            "rename" => {
+            FileOperation::Rename => {
                 let Some(from) = op.rename_from.as_deref() else {
                     continue;
                 };
@@ -158,7 +175,7 @@ pub async fn apply_file_ops(
                     fs::rename(&old, &target).await?;
                 }
             }
-            "modify" => {
+            FileOperation::Modify => {
                 if !crate::service::fs_util::path_exists(&target).await? {
                     continue;
                 }
@@ -193,7 +210,6 @@ pub async fn apply_file_ops(
                     }
                 }
             }
-            _ => {}
         }
     }
     Ok(())

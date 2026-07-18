@@ -1,4 +1,4 @@
-//! 健康检查端点。
+//! 健康检查 HTTP handlers。
 //!
 //! 契约: 返回 HTTP 200 + `{ "status": "ok", ... }`。
 //! `start-services.sh` 周期 curl 此端点, 连续失败会 kill + 重启 file-server,

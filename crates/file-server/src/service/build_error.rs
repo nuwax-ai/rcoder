@@ -1,8 +1,28 @@
 //! 构建错误解析，输出格式与 nuwax `BuildErrorParser` 保持一致。
 
 use std::path::Path;
+use std::sync::LazyLock;
 
 use regex::Regex;
+
+static FILE_INFO_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"file:\s*([^\n]+):(\d+):(\d+)"));
+static ERROR_KIND_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_regex(r"(Parse error|SyntaxError|TypeError|ReferenceError|Unexpected token)")
+});
+static ERROR_DESCRIPTION_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_regex(r"(?:Parse error|SyntaxError|TypeError|ReferenceError)[^:]*:\s*([^\n]+)")
+});
+static HTML_TITLE_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"html\.match\(/<title>\(\.\*\?\)</title>/i\)"));
+static SYNTAX_ERROR_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"Parse error|SyntaxError|Unexpected token"));
+static RESOLVE_MODULE_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"Cannot resolve module|Module not found"));
+static TYPE_ERROR_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"Type error|Type '.*' is not assignable"));
+static MISSING_MODULE_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"Cannot find module|Module not found"));
 
 struct FileInfo {
     path: String,
@@ -28,7 +48,7 @@ pub fn parse(error_message: &str) -> String {
 }
 
 fn extract_file_info(message: &str) -> Option<FileInfo> {
-    let captures = captures(r"file:\s*([^\n]+):(\d+):(\d+)", message)?;
+    let captures = captures(&FILE_INFO_RE, message)?;
     Some(FileInfo {
         path: captures.get(1)?.as_str().trim().to_string(),
         line: captures.get(2)?.as_str().parse().ok()?,
@@ -37,29 +57,23 @@ fn extract_file_info(message: &str) -> Option<FileInfo> {
 }
 
 fn extract_error_details(message: &str) -> ErrorDetails {
-    let kind = captures(
-        r"(Parse error|SyntaxError|TypeError|ReferenceError|Unexpected token)",
-        message,
-    )
-    .and_then(|captures| captures.get(1).map(|value| value.as_str().to_string()))
-    .unwrap_or_else(|| "Build error".to_string());
-    let description = captures(
-        r"(?:Parse error|SyntaxError|TypeError|ReferenceError)[^:]*:\s*([^\n]+)",
-        message,
-    )
-    .and_then(|captures| {
-        captures
-            .get(1)
-            .map(|value| value.as_str().trim().to_string())
-    })
-    .or_else(|| {
-        message
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty() && !line.contains("file:") && !line.contains("at "))
-            .map(ToOwned::to_owned)
-    })
-    .unwrap_or_else(|| message.to_string());
+    let kind = captures(&ERROR_KIND_RE, message)
+        .and_then(|captures| captures.get(1).map(|value| value.as_str().to_string()))
+        .unwrap_or_else(|| "Build error".to_string());
+    let description = captures(&ERROR_DESCRIPTION_RE, message)
+        .and_then(|captures| {
+            captures
+                .get(1)
+                .map(|value| value.as_str().trim().to_string())
+        })
+        .or_else(|| {
+            message
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.contains("file:") && !line.contains("at "))
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| message.to_string());
     ErrorDetails {
         kind,
         message: description,
@@ -68,7 +82,7 @@ fn extract_error_details(message: &str) -> ErrorDetails {
 
 fn error_suggestions(message: &str) -> Vec<Suggestion> {
     let mut suggestions = Vec::new();
-    if is_match(r"html\.match\(/<title>\(\.\*\?\)</title>/i\)", message) {
+    if is_match(&HTML_TITLE_RE, message) {
         suggestions.push(Suggestion {
             message: "In regular expressions, the angle brackets of HTML tags need to be escaped. Please modify `</title>` to `</title>`",
             example: Some((
@@ -77,25 +91,25 @@ fn error_suggestions(message: &str) -> Vec<Suggestion> {
             )),
         });
     }
-    if is_match(r"Parse error|SyntaxError|Unexpected token", message) {
+    if is_match(&SYNTAX_ERROR_RE, message) {
         suggestions.push(Suggestion {
             message: "Check the code syntax, ensure that the parentheses, quotes, semicolons, etc. are correctly paired",
             example: None,
         });
     }
-    if is_match(r"Cannot resolve module|Module not found", message) {
+    if is_match(&RESOLVE_MODULE_RE, message) {
         suggestions.push(Suggestion {
             message: "Check the import path to ensure that the module file exists",
             example: None,
         });
     }
-    if is_match(r"Type error|Type '.*' is not assignable", message) {
+    if is_match(&TYPE_ERROR_RE, message) {
         suggestions.push(Suggestion {
             message: "Check the variable type definition, ensure that the type matches",
             example: None,
         });
     }
-    if is_match(r"Cannot find module|Module not found", message) {
+    if is_match(&MISSING_MODULE_RE, message) {
         suggestions.push(Suggestion {
             message: "Run `pnpm install` to install the missing dependency package",
             example: None,
@@ -158,22 +172,20 @@ fn basename(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-fn is_match(pattern: &str, value: &str) -> bool {
-    Regex::new(pattern)
-        .map(|regex| regex.is_match(value))
-        .unwrap_or_else(|error| {
-            tracing::error!(%error, %pattern, "invalid built-in build-error regex");
-            false
-        })
-}
-
-fn captures<'a>(pattern: &str, value: &'a str) -> Option<regex::Captures<'a>> {
+fn compile_regex(pattern: &'static str) -> Option<Regex> {
     Regex::new(pattern)
         .map_err(|error| {
             tracing::error!(%error, %pattern, "invalid built-in build-error regex");
         })
-        .ok()?
-        .captures(value)
+        .ok()
+}
+
+fn is_match(regex: &Option<Regex>, value: &str) -> bool {
+    regex.as_ref().is_some_and(|regex| regex.is_match(value))
+}
+
+fn captures<'a>(regex: &Option<Regex>, value: &'a str) -> Option<regex::Captures<'a>> {
+    regex.as_ref()?.captures(value)
 }
 
 #[cfg(test)]

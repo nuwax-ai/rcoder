@@ -90,6 +90,13 @@ pub(super) async fn install(
     let stderr_result = stderr_task.await.map_err(|error| InstallError::Wait {
         source: std::io::Error::other(format!("pnpm stderr reader task failed: {error}")),
     })?;
+    let stream_errors: Vec<String> = [stdout_result.error.clone(), stderr_result.error.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+    for error in &stream_errors {
+        tracing::warn!(%error, "pnpm output stream was not captured completely");
+    }
     let mut summary = stderr_result.summary;
     summary.merge(stdout_result.summary);
     if status.success() {
@@ -108,7 +115,12 @@ pub(super) async fn install(
         });
     }
 
-    let combined = format!("{}\n{}", stderr_result.tail, stdout_result.tail);
+    let combined = format!(
+        "{}\n{}\n{}",
+        stderr_result.tail,
+        stdout_result.tail,
+        stream_errors.join("\n")
+    );
     let (kind, code, message) = classify_failure(&summary, &combined);
     tracing::warn!(
         cwd = %cwd.display(),
@@ -147,6 +159,7 @@ async fn terminate_and_reap(child: &mut tokio::process::Child, pid: Option<u32>)
 struct StreamResult {
     summary: InstallSummary,
     tail: String,
+    error: Option<String>,
 }
 
 async fn read_stream<R>(stream: R, logs: Option<&LogFiles>, parse_protocol: bool) -> StreamResult
@@ -155,32 +168,46 @@ where
 {
     let mut result = StreamResult::default();
     let mut lines = BufReader::new(stream).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut write_logs = logs.is_some();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) => {
+                result.error = Some(format!("read pnpm output failed: {error}"));
+                break;
+            }
+        };
         push_bounded(&mut result.tail, &line);
         let observed = if parse_protocol {
             observe_event(&line, &mut result.summary)
         } else {
             ObservedLine::Unstructured
         };
-        if let Some(logs) = logs {
-            match observed {
+        if write_logs && let Some(logs) = logs {
+            let write_result = match observed {
                 ObservedLine::Rendered(rendered) => write_log_line(logs, &rendered).await,
                 ObservedLine::Unstructured => write_log_line(logs, &line).await,
-                ObservedLine::Suppressed => {}
+                ObservedLine::Suppressed => Ok(()),
+            };
+            if let Err(error) = write_result {
+                result.error = Some(format!("write pnpm log failed: {error}"));
+                // 继续排空 child 管道并解析协议，但不再对每一行重复触发相同日志错误。
+                write_logs = false;
             }
         }
     }
     result
 }
 
-async fn write_log_line(files: &LogFiles, line_value: &str) {
+async fn write_log_line(files: &LogFiles, line_value: &str) -> crate::error::AppResult<()> {
     let line_value = format!(
         "[{}] {}",
         Local::now().format("%Y/%m/%d %H:%M:%S"),
         line_value
     );
-    let _ = log::append_line(&files.main, &line_value).await;
-    let _ = log::append_line(&files.temporary, &line_value).await;
+    log::append_line(&files.main, &line_value).await?;
+    log::append_line(&files.temporary, &line_value).await
 }
 
 fn push_bounded(buffer: &mut String, line: &str) {

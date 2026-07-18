@@ -135,14 +135,15 @@ pub async fn read_dev_log(
     dir: &Path,
     start_index: usize,
     log_type: &str,
+    max_bytes: u64,
 ) -> AppResult<ReadDevLogResult> {
     let file_name = if log_type == "main" {
         main_log_name()
     } else {
-        latest_temp_log(dir).await.unwrap_or_else(main_log_name)
+        latest_temp_log(dir).await?.unwrap_or_else(main_log_name)
     };
     let path = dir.join(&file_name);
-    if !path.exists() {
+    if !tokio::fs::try_exists(&path).await? {
         return Ok(ReadDevLogResult {
             logs: vec![],
             total_lines: 0,
@@ -150,9 +151,8 @@ pub async fn read_dev_log(
             log_file_name: file_name,
         });
     }
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| AppError::system(format!("read dev log: {e}")))?;
+    let content =
+        crate::service::fs_util::read_to_string_bounded(&path, max_bytes, "dev log").await?;
     // JS `String.split("\n")` 会保留末尾空行；保持 totalLines/行号完全一致。
     let all: Vec<&str> = content.split('\n').collect();
     let total = all.len();
@@ -177,7 +177,7 @@ pub async fn snapshot_dev_log(dir: &Path, log_type: &str) -> AppResult<Option<Lo
     let file_name = if log_type == "main" {
         main_log_name()
     } else {
-        latest_temp_log(dir).await.unwrap_or_else(main_log_name)
+        latest_temp_log(dir).await?.unwrap_or_else(main_log_name)
     };
     let path = dir.join(&file_name);
     let metadata = match tokio::fs::metadata(&path).await {
@@ -228,10 +228,21 @@ pub fn slice_log_result(full: &ReadDevLogResult, start_index: usize) -> ReadDevL
 }
 
 /// 目录下最新的 `dev-temp-*.log` (按文件名内时间戳降序)。
-async fn latest_temp_log(dir: &Path) -> Option<String> {
-    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+async fn latest_temp_log(dir: &Path) -> AppResult<Option<String>> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::system(format!(
+                "read dev log directory {}: {error}",
+                dir.display()
+            )));
+        }
+    };
     let mut temps: Vec<(i64, String)> = Vec::new();
-    while let Ok(Some(e)) = entries.next_entry().await {
+    while let Some(e) = entries.next_entry().await.map_err(|error| {
+        AppError::system(format!("scan dev log directory {}: {error}", dir.display()))
+    })? {
         let name = e.file_name().to_string_lossy().into_owned();
         if let Some(ms) = name
             .strip_prefix("dev-temp-")
@@ -242,7 +253,7 @@ async fn latest_temp_log(dir: &Path) -> Option<String> {
         }
     }
     temps.sort_by_key(|&(ms, _)| std::cmp::Reverse(ms));
-    temps.into_iter().next().map(|(_, n)| n)
+    Ok(temps.into_iter().next().map(|(_, n)| n))
 }
 
 /// 脱敏敏感路径 (对齐 nuwax sanitizeSensitivePaths): 把绝对工作区路径替换为相对。

@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
 
+use crate::error::{AppError, AppResult};
+
 /// env: web/page 工作区根目录 (对齐 nuwax `PROJECT_SOURCE_DIR`)。
 const ENV_PROJECT_SOURCE_DIR: &str = "PROJECT_SOURCE_DIR";
 /// env: computer/task 工作区根目录 (对齐 nuwax `COMPUTER_WORKSPACE_DIR`)。
@@ -51,10 +53,10 @@ pub struct ComputerContext {
 /// 实现需 `Send + Sync` 以便经 `Arc<dyn WorkspaceResolver>` 注入 axum `AppState`。
 pub trait WorkspaceResolver: Send + Sync {
     /// 解析 web/page 项目工作区绝对路径。
-    fn resolve_project(&self, ctx: &ProjectContext) -> PathBuf;
+    fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf>;
 
     /// 解析 computer/task 工作区绝对路径。
-    fn resolve_computer(&self, ctx: &ComputerContext) -> PathBuf;
+    fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf>;
 }
 
 /// 阶段 1 实现: 读环境变量的本地路径解析, 等价 nuwax-file-server 现状。
@@ -79,8 +81,7 @@ impl LocalWorkspaceResolver {
         }
     }
 
-    /// 测试专用: 显式指定根目录 (绕过环境变量)。
-    #[cfg(test)]
+    /// 显式指定根目录；供配置文件启动和嵌入式 lib 调用。
     pub fn new(project_root: PathBuf, computer_root: PathBuf) -> Self {
         Self {
             project_root,
@@ -94,27 +95,38 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn validated_identifier<'a>(value: &'a str, field: &str) -> AppResult<&'a str> {
+    let value = value.trim();
+    shared_types::validate_identifier(value, field).map_err(AppError::validation)?;
+    Ok(value)
+}
+
 impl WorkspaceResolver for LocalWorkspaceResolver {
-    fn resolve_project(&self, ctx: &ProjectContext) -> PathBuf {
+    fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf> {
+        let project_id = validated_identifier(&ctx.project_id, "projectId")?;
         // 对齐 nuwax `shouldUseIsolationPath`: tenant+space+isolationType 均非空才三级
-        match (
+        let path = match (
             non_empty(ctx.tenant_id.as_deref()),
             non_empty(ctx.space_id.as_deref()),
             non_empty(ctx.isolation_type.as_deref()),
         ) {
             (Some(tenant), Some(space), Some(_)) => self
                 .project_root
-                .join(tenant)
-                .join(space)
-                .join(&ctx.project_id),
+                .join(validated_identifier(tenant, "tenantId")?)
+                .join(validated_identifier(space, "spaceId")?)
+                .join(project_id),
             // 单级: {root}/{project}
-            _ => self.project_root.join(&ctx.project_id),
-        }
+            _ => self.project_root.join(project_id),
+        };
+        Ok(path)
     }
 
-    fn resolve_computer(&self, ctx: &ComputerContext) -> PathBuf {
+    fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf> {
         // 二级: {root}/{user}/{cid} (对齐 nuwax gitService.js)
-        self.computer_root.join(&ctx.user_id).join(&ctx.cid)
+        Ok(self
+            .computer_root
+            .join(validated_identifier(&ctx.user_id, "userId")?)
+            .join(validated_identifier(&ctx.cid, "cId")?))
     }
 }
 
@@ -139,7 +151,7 @@ mod tests {
             isolation_type: None,
         };
         assert_eq!(
-            r.resolve_project(&ctx),
+            r.resolve_project(&ctx).expect("resolve project"),
             PathBuf::from("/app/project_workspace/proj-1")
         );
     }
@@ -154,7 +166,7 @@ mod tests {
             isolation_type: Some("tenant".into()),
         };
         assert_eq!(
-            r.resolve_project(&ctx),
+            r.resolve_project(&ctx).expect("resolve project"),
             PathBuf::from("/app/project_workspace/tenant-a/space-b/proj-1")
         );
     }
@@ -169,7 +181,7 @@ mod tests {
             isolation_type: Some("tenant".into()),
         };
         assert_eq!(
-            r.resolve_project(&ctx),
+            r.resolve_project(&ctx).expect("resolve project"),
             PathBuf::from("/app/project_workspace/proj-1")
         );
     }
@@ -185,7 +197,7 @@ mod tests {
             isolation_type: None,
         };
         assert_eq!(
-            r.resolve_project(&ctx),
+            r.resolve_project(&ctx).expect("resolve project"),
             PathBuf::from("/app/project_workspace/proj-1")
         );
     }
@@ -201,7 +213,7 @@ mod tests {
             isolation_type: Some("".into()),
         };
         assert_eq!(
-            r.resolve_project(&ctx),
+            r.resolve_project(&ctx).expect("resolve project"),
             PathBuf::from("/app/project_workspace/proj-1")
         );
     }
@@ -214,8 +226,34 @@ mod tests {
             cid: "cid-1".into(),
         };
         assert_eq!(
-            r.resolve_computer(&ctx),
+            r.resolve_computer(&ctx).expect("resolve computer"),
             PathBuf::from("/app/computer-project-workspace/user-1/cid-1")
         );
+    }
+
+    #[test]
+    fn resolver_rejects_path_traversal_identifiers() {
+        let resolver = resolver();
+        let project = ProjectContext {
+            project_id: "../outside".into(),
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
+        };
+        assert!(resolver.resolve_project(&project).is_err());
+
+        let tenant = ProjectContext {
+            project_id: "project".into(),
+            tenant_id: Some("../tenant".into()),
+            space_id: Some("space".into()),
+            isolation_type: Some("tenant".into()),
+        };
+        assert!(resolver.resolve_project(&tenant).is_err());
+
+        let computer = ComputerContext {
+            user_id: "user".into(),
+            cid: "../../outside".into(),
+        };
+        assert!(resolver.resolve_computer(&computer).is_err());
     }
 }

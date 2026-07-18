@@ -2,42 +2,22 @@
 //!
 //! - `PathBuf::join` 对**绝对路径**参数会替换 base → 天然拦截绝对路径注入
 //!   (如 `base.join("/etc/passwd")` 直接得到 `/etc/passwd`, 落在 base 外即被拒);
-//! - `Path::components` 原生识别 `..` (`Component::ParentDir`) → 拦截目录穿越;
+//! - `path-clean` 按成熟的词法规约规则消除 `.`/`..`，不访问文件系统;
 //! - 规范化后用 `starts_with` 比较 → 确保落在 base 下。
 //!
 //! 全程不依赖文件系统存在性 (不 `canonicalize`), 不做字符串 `replace` / 手动 `split`。
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+
+use path_clean::PathClean;
 
 use crate::error::{AppError, AppResult};
-
-/// 用 `Path::components` 词法规范化 (消除 `.`/`..`, 不碰文件系统)。
-fn normalize(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                result.pop();
-            }
-            // RootDir / Prefix (绝对锚点): 重置并压入, 与 PathBuf::join 绝对路径替换语义一致
-            Component::RootDir | Component::Prefix(_) => {
-                result = PathBuf::new();
-                result.push(comp.as_os_str());
-            }
-            Component::Normal(name) => {
-                result.push(name);
-            }
-        }
-    }
-    result
-}
 
 /// 业务文件路径校验: `relative` 解析后必须落在 `base` 下, 越界返回 `Err`。
 /// 对齐 nuwax `uploadSingleFile` (抛错风格)。
 pub fn ensure_within(base: &Path, relative: &str) -> AppResult<PathBuf> {
-    let target = normalize(&base.join(relative));
-    let normalized_base = normalize(base);
+    let target = base.join(relative).clean();
+    let normalized_base = base.clean();
     if target.starts_with(&normalized_base) {
         Ok(target)
     } else {
@@ -50,8 +30,8 @@ pub fn ensure_within(base: &Path, relative: &str) -> AppResult<PathBuf> {
 /// 业务文件路径校验 (跳过风格): 越界返回 `None`, 由调用方决定跳过。
 /// 对齐 nuwax `specifiedFilesUpdate` / `uploadBatchFiles`。
 pub fn safe_within_or_skip(base: &Path, relative: &str) -> Option<PathBuf> {
-    let target = normalize(&base.join(relative));
-    let normalized_base = normalize(base);
+    let target = base.join(relative).clean();
+    let normalized_base = base.clean();
     if target.starts_with(&normalized_base) {
         Some(target)
     } else {
@@ -60,10 +40,10 @@ pub fn safe_within_or_skip(base: &Path, relative: &str) -> Option<PathBuf> {
 }
 
 /// Zip 解压条目路径校验 (对齐 nuwax `assertSafeZipEntryPath`)。
-/// `join` 拦截绝对路径, `components` 拦截 `..`, `starts_with` 兜底。
+/// `join` 拦截绝对路径，`path-clean` 规约 `..`，`starts_with` 兜底。
 pub fn safe_zip_entry(extract_path: &Path, entry_name: &str) -> AppResult<PathBuf> {
-    let target = normalize(&extract_path.join(entry_name));
-    let normalized_base = normalize(extract_path);
+    let target = extract_path.join(entry_name).clean();
+    let normalized_base = extract_path.clean();
     if target == normalized_base || target.starts_with(&normalized_base) {
         Ok(target)
     } else {

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use crate::error::{AppError, AppResult};
+use crate::service::skill_download::SkillDownloader;
 use crate::workspace::{ProjectContext, WorkspaceResolver};
 
 pub struct PushResult {
@@ -18,18 +19,19 @@ pub struct PushResult {
 pub async fn push_skills(
     resolver: &dyn WorkspaceResolver,
     ctx: &ProjectContext,
-    zip_data: Option<Vec<u8>>,
+    zip_path: Option<&Path>,
     skill_urls: Vec<String>,
+    downloader: &SkillDownloader,
 ) -> AppResult<PushResult> {
     let project_id = ctx.project_id.trim();
     if project_id.is_empty() {
         return Err(AppError::validation("Project ID cannot be empty"));
     }
-    let project_path = resolver.resolve_project(ctx);
+    let project_path = resolver.resolve_project(ctx)?;
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
-    let updated = push_skills_at(&project_path, zip_data, skill_urls).await?;
+    let updated = push_skills_at(&project_path, zip_path, skill_urls, downloader).await?;
     Ok(PushResult {
         project_path: project_path.to_string_lossy().to_string(),
         updated_skills: updated,
@@ -40,10 +42,11 @@ pub async fn push_skills(
 /// project 路由 (push_skills) 与 computer 路由共用。
 pub async fn push_skills_at(
     workspace: &Path,
-    zip_data: Option<Vec<u8>>,
+    zip_path: Option<&Path>,
     skill_urls: Vec<String>,
+    downloader: &SkillDownloader,
 ) -> AppResult<Vec<String>> {
-    if zip_data.is_none() && skill_urls.is_empty() {
+    if zip_path.is_none() && skill_urls.is_empty() {
         return Err(AppError::validation(
             "file or skillUrls cannot both be empty",
         ));
@@ -54,78 +57,42 @@ pub async fn push_skills_at(
     fs::create_dir_all(&primary_skills).await?;
     fs::create_dir_all(&primary_agents).await?;
 
-    // 收集 zip 来源 (上传 + url fetch)
-    let mut sources: Vec<Vec<u8>> = Vec::new();
-    if let Some(d) = zip_data {
-        sources.push(d);
+    let mut updated = Vec::new();
+    if let Some(source) = zip_path {
+        updated.extend(import_skill_archive(workspace, &primary_skills, source).await?);
     }
     for url in skill_urls {
-        sources.push(fetch_url(&url).await?);
-    }
-
-    let mut updated = Vec::new();
-    for (i, data) in sources.iter().enumerate() {
-        let extract_root = temp_dir(&format!("fs-skills-{i}")).await?;
-        let temp_zip = extract_root.join("src.zip");
-        let source_result: AppResult<Vec<String>> = async {
-            fs::write(&temp_zip, data).await?;
-            crate::service::zip::extract_to(temp_zip.clone(), extract_root.clone()).await?;
-
-            let mut imported = Vec::new();
-            // 找 skills 目录 (根 skills/ 或一层子目录 skills/)
-            if let Some(skills_dir) = find_skills_dir(&extract_root).await? {
-                let mut entries = fs::read_dir(&skills_dir).await?;
-                while let Some(entry) = entries.next_entry().await? {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let src = entry.path();
-                    let dst = primary_skills.join(&name);
-                    remove_dir_if_exists(&dst).await?;
-                    copy_entry(&src, &dst).await?;
-                    imported.push(name);
-                }
-            }
-            Ok(imported)
-        }
-        .await;
-
-        let cleanup_result = fs::remove_dir_all(&extract_root).await;
-        match source_result {
-            Ok(imported) => {
-                cleanup_result?;
-                updated.extend(imported);
-            }
-            Err(error) => {
-                if let Err(cleanup_error) = cleanup_result {
-                    tracing::warn!(
-                        path = %extract_root.display(),
-                        error = %cleanup_error,
-                        "clean up failed skill import directory"
-                    );
-                }
-                return Err(error);
-            }
-        }
+        let downloaded = downloader.download(&url).await?;
+        updated.extend(import_skill_archive(workspace, &primary_skills, downloaded.path()).await?);
     }
 
     sync_agents(workspace).await?;
     Ok(updated)
 }
 
-pub async fn fetch_url(url: &str) -> AppResult<Vec<u8>> {
-    let resp = reqwest::get(url)
-        .await
-        .map_err(|e| AppError::network(format!("fetch skill url failed: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(AppError::network(format!(
-            "fetch {url} returned status {}",
-            resp.status()
-        )));
+async fn import_skill_archive(
+    workspace: &Path,
+    primary_skills: &Path,
+    source: &Path,
+) -> AppResult<Vec<String>> {
+    let parent = workspace.parent().unwrap_or(workspace).to_path_buf();
+    let extract_guard = crate::service::temp_file::tempdir_in(parent, ".skills-extract-").await?;
+    let extract_root = extract_guard.path().join("content");
+    fs::create_dir_all(&extract_root).await?;
+    crate::service::zip::extract_to(source.to_path_buf(), extract_root.clone()).await?;
+    let mut imported = Vec::new();
+    if let Some(skills_dir) = find_skills_dir(&extract_root).await? {
+        let mut entries = fs::read_dir(&skills_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let src = entry.path();
+            let dst = primary_skills.join(&name);
+            remove_dir_if_exists(&dst).await?;
+            copy_entry(&src, &dst).await?;
+            imported.push(name);
+        }
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| AppError::network(format!("read skill url failed: {e}")))?;
-    Ok(bytes.to_vec())
+    Ok(imported)
 }
 
 /// 在 extract_root 下找 skills 目录 (优先根 skills/, 再查一层子目录 skills/)。
@@ -193,25 +160,14 @@ async fn remove_dir_if_exists(path: &Path) -> AppResult<()> {
     }
 }
 
-async fn temp_dir(prefix: &str) -> AppResult<PathBuf> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("{prefix}_{nanos}"));
-    fs::create_dir_all(&path).await?;
-    Ok(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn finds_nested_skills_directory_without_blocking_io() {
-        let root = temp_dir("file-server-skills-test")
-            .await
-            .expect("create test directory");
+        let root_guard = tempfile::tempdir().expect("create test directory");
+        let root = root_guard.path().to_path_buf();
         let expected = root.join("bundle").join("skills");
         fs::create_dir_all(&expected)
             .await
@@ -219,9 +175,5 @@ mod tests {
 
         let found = find_skills_dir(&root).await.expect("scan skills directory");
         assert_eq!(found, Some(expected));
-
-        fs::remove_dir_all(root)
-            .await
-            .expect("remove test directory");
     }
 }

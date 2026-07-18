@@ -4,10 +4,30 @@
 //!   每个 entry 经 [`crate::path_safety::safe_zip_entry`] 校验 (Zip Slip 防御)。
 //! - 打包同理 (备份/export/download), 支持排除目录/文件名 + 符号链接/硬链接过滤。
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
 use crate::path_safety::safe_zip_entry;
+
+/// 防止压缩炸弹耗尽 Pod 临时盘。上传文件本身最大 1 GiB；解压后允许最多 4 GiB，
+/// 但任一文件仍不得超过 1 GiB。
+const MAX_EXTRACTED_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_EXTRACTED_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ZIP_ENTRY_COUNT: usize = 100_000;
+
+#[derive(Clone, Copy)]
+struct ExtractionLimits {
+    total_bytes: u64,
+    file_bytes: u64,
+    entry_count: usize,
+}
+
+const EXTRACTION_LIMITS: ExtractionLimits = ExtractionLimits {
+    total_bytes: MAX_EXTRACTED_TOTAL_BYTES,
+    file_bytes: MAX_EXTRACTED_FILE_BYTES,
+    entry_count: MAX_ZIP_ENTRY_COUNT,
+};
 
 /// 异步解压 `zip_path` 到 `dst`。
 pub async fn extract_to(zip_path: PathBuf, dst: PathBuf) -> AppResult<()> {
@@ -18,13 +38,28 @@ pub async fn extract_to(zip_path: PathBuf, dst: PathBuf) -> AppResult<()> {
 }
 
 fn extract_blocking(zip_path: &Path, dst: &Path) -> AppResult<()> {
+    extract_blocking_with_limits(zip_path, dst, EXTRACTION_LIMITS)
+}
+
+fn extract_blocking_with_limits(
+    zip_path: &Path,
+    dst: &Path,
+    limits: ExtractionLimits,
+) -> AppResult<()> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| AppError::file(format!("zip open failed: {e}")))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| AppError::file(format!("zip parse failed: {e}")))?;
+    if archive.len() > limits.entry_count {
+        return Err(AppError::validation(format!(
+            "zip contains too many entries (max {})",
+            limits.entry_count
+        )));
+    }
     std::fs::create_dir_all(dst)?;
+    let mut extracted_bytes = 0_u64;
     for i in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(i)
             .map_err(|e| AppError::file(format!("zip entry {i} read failed: {e}")))?;
         let name = entry.name().to_string();
@@ -39,12 +74,41 @@ fn extract_blocking(zip_path: &Path, dst: &Path) -> AppResult<()> {
         if entry.is_dir() {
             std::fs::create_dir_all(&target)?;
         } else {
+            if entry.size() > limits.file_bytes {
+                return Err(AppError::validation(format!(
+                    "zip entry {name} exceeds extracted file limit (max {} bytes)",
+                    limits.file_bytes
+                )));
+            }
+            let remaining = limits
+                .total_bytes
+                .checked_sub(extracted_bytes)
+                .ok_or_else(|| AppError::validation("zip extracted size exceeds limit"))?;
+            if entry.size() > remaining {
+                return Err(AppError::validation(format!(
+                    "zip extracted size exceeds limit (max {} bytes)",
+                    limits.total_bytes
+                )));
+            }
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             let mut out = std::fs::File::create(&target)
                 .map_err(|e| AppError::file(format!("create file failed: {e}")))?;
-            std::io::copy(&mut entry, &mut out)?;
+            // 不只信任 central directory 中的 entry.size()；按实际解压字节再次限流。
+            let copy_limit = remaining
+                .min(limits.file_bytes)
+                .checked_add(1)
+                .ok_or_else(|| AppError::validation("zip extraction limit overflow"))?;
+            let copied = std::io::copy(&mut entry.take(copy_limit), &mut out)?;
+            if copied >= copy_limit {
+                return Err(AppError::validation(format!(
+                    "zip entry {name} or extracted total exceeds size limit"
+                )));
+            }
+            extracted_bytes = extracted_bytes
+                .checked_add(copied)
+                .ok_or_else(|| AppError::validation("zip extracted size overflow"))?;
         }
     }
     Ok(())
@@ -257,6 +321,7 @@ pub async fn write_empty_zip(zip_path: PathBuf, dir_entry_name: String) -> AppRe
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
 
     fn unique_tmp(prefix: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -284,6 +349,33 @@ mod tests {
         (0..z.len())
             .filter_map(|i| z.by_index(i).ok().map(|e| e.name().to_string()))
             .collect()
+    }
+
+    #[test]
+    fn extraction_rejects_actual_content_over_limit() {
+        let source = unique_tmp("zip_limit_source");
+        let destination = unique_tmp("zip_limit_destination");
+        let file = fs::File::create(&source).expect("create zip fixture");
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file("large.txt", zip::write::SimpleFileOptions::default())
+            .expect("start zip entry");
+        writer.write_all(b"two bytes").expect("write zip entry");
+        writer.finish().expect("finish zip fixture");
+
+        let result = extract_blocking_with_limits(
+            &source,
+            &destination,
+            ExtractionLimits {
+                total_bytes: 1,
+                file_bytes: 1,
+                entry_count: 1,
+            },
+        );
+
+        assert!(result.is_err());
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_dir_all(destination);
     }
 
     /// download-all-files 口径: traverse_exclude_dirs + content excludes + dot-segment 过滤。

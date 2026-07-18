@@ -1,47 +1,21 @@
-//! `/api/git` 路由 (对齐 nuwax gitRoutes; gix 操作经 spawn_blocking 调用)。
+//! `/api/git` HTTP handlers (对齐 nuwax gitRoutes; gix 操作经 spawn_blocking 调用)。
 //!
 //! 拆分: [`read`] (branches / tags / log / file-content / status) / [`write`]
 //! (init / add / commit / unstage / discard / diff / reset / checkout / revert) /
 //! [`refs`] (branch-create / branch-delete / branch-switch / tag-create / tag-delete)。
-//! 本 mod.rs 装 router + 共享 base 结构 (GitQuery / GitWriteBody) + 路径解析 helper。
+//! 本 mod.rs 提供共享 base 结构 (GitQuery / GitWriteBody) + 路径解析 helper。
 
 use std::path::PathBuf;
-
-use serde::Deserialize;
-use utoipa_axum::router::OpenApiRouter;
-use utoipa_axum::routes;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::service::git;
 use crate::workspace::{ComputerContext, ProjectContext};
+use serde::Deserialize;
 
-mod read;
-mod refs;
-mod write;
-
-pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
-        .routes(routes!(read::branches))
-        .routes(routes!(read::tags))
-        .routes(routes!(read::log_history))
-        .routes(routes!(read::file_content))
-        .routes(routes!(read::status))
-        .routes(routes!(write::init))
-        .routes(routes!(write::add))
-        .routes(routes!(write::commit))
-        .routes(routes!(write::unstage))
-        .routes(routes!(write::discard))
-        .routes(routes!(write::diff))
-        .routes(routes!(write::reset))
-        .routes(routes!(write::checkout))
-        .routes(routes!(write::revert))
-        .routes(routes!(refs::branch_create))
-        .routes(routes!(refs::branch_delete))
-        .routes(routes!(refs::branch_switch))
-        .routes(routes!(refs::tag_create))
-        .routes(routes!(refs::tag_delete))
-}
+pub(crate) mod read;
+pub(crate) mod refs;
+pub(crate) mod write;
 
 // ── 共享 base 结构 + 路径解析 (子模块经 super:: 访问) ─────────────────────────────
 
@@ -49,7 +23,7 @@ pub fn router() -> OpenApiRouter<AppState> {
 #[derive(Deserialize, utoipa::IntoParams, utoipa::ToSchema)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct GitQuery {
+pub(crate) struct GitQuery {
     pub workspace_type: Option<String>,
     pub project_id: Option<String>,
     pub user_id: Option<String>,
@@ -92,7 +66,7 @@ pub(super) fn resolve(q: &GitQuery, state: &AppState) -> Result<(PathBuf, String
 /// POST 路由公共 body (写操作基类, 被 FilesBody / CommitBody 等经 serde flatten 复用)。
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct GitWriteBody {
+pub(crate) struct GitWriteBody {
     pub workspace_type: String,
     pub project_id: Option<String>,
     pub user_id: Option<String>,

@@ -8,7 +8,7 @@ use tokio::fs;
 use crate::error::{AppError, AppResult};
 
 use super::IMPORT_PRESERVED;
-use super::helpers::{move_dir, remove_top_level_dir, temp_sibling};
+use super::helpers::{move_dir, remove_top_level_dir};
 
 pub struct ImportResult {
     pub user_id: String,
@@ -23,41 +23,25 @@ pub struct ImportResult {
 /// 4. 清空 target 非白名单条目
 /// 5. 合并 extractRoot → target (跳过白名单名), 失败则从 backupDir 回滚
 /// 6. 清理 backupDir + extractRoot
-pub async fn import_project(target_dir: &Path, zip_data: Vec<u8>) -> AppResult<ImportResult> {
-    // 临时解压目录 (target 父目录下, 便于同设备 rename)
-    let extract_root = temp_sibling(target_dir, "import_extract");
+pub async fn import_project(target_dir: &Path, zip_path: &Path) -> AppResult<ImportResult> {
+    let parent = target_dir
+        .parent()
+        .ok_or_else(|| AppError::system("computer workspace has no parent"))?;
+    let extract_guard =
+        crate::service::temp_file::tempdir_in(parent.to_path_buf(), ".import-extract-").await?;
+    let extract_root = extract_guard.path().join("content");
     fs::create_dir_all(&extract_root).await?;
-    // ZIP 必须放在解压目录之外，否则会被 merge_extracted 当作项目文件复制到工作区。
-    let tmp_zip = temp_sibling(target_dir, "import_source").with_extension("zip");
     // 解压 (zip::extract_to 内部 safe_zip_entry 防穿越)
-    let extract_res: AppResult<()> = async {
-        fs::write(&tmp_zip, &zip_data).await?;
-        crate::service::zip::extract_to(tmp_zip.clone(), extract_root.clone()).await
-    }
-    .await;
-    let remove_zip_result = fs::remove_file(&tmp_zip).await;
-    if let Err(e) = extract_res {
-        let _ = fs::remove_dir_all(&extract_root).await;
-        return Err(e);
-    }
-    if let Err(error) = remove_zip_result
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        let _ = fs::remove_dir_all(&extract_root).await;
-        return Err(AppError::system(format!(
-            "remove import archive {}: {error}",
-            tmp_zip.display()
-        )));
-    }
+    let extract_res =
+        crate::service::zip::extract_to(zip_path.to_path_buf(), extract_root.clone()).await;
+    extract_res?;
     // 单顶层目录上提
-    if let Err(error) = remove_top_level_dir(&extract_root, &[]).await {
-        let _ = fs::remove_dir_all(&extract_root).await;
-        return Err(error);
-    }
+    remove_top_level_dir(&extract_root, &[]).await?;
 
     // 备份 target 非白名单条目 (移动到 backupDir)
-    let backup_dir = temp_sibling(target_dir, "import_backup");
-    let _ = fs::remove_dir_all(&backup_dir).await;
+    let backup_guard =
+        crate::service::temp_file::tempdir_in(parent.to_path_buf(), ".import-backup-").await?;
+    let backup_dir = backup_guard.path().join("content");
     backup_except_preserved(target_dir, &backup_dir).await?;
 
     // 清空 target 非白名单条目 (此时 target 仅剩白名单)
@@ -69,13 +53,8 @@ pub async fn import_project(target_dir: &Path, zip_data: Vec<u8>) -> AppResult<I
         // 回滚: 清空刚合并的非白名单条目 + 从备份恢复
         let _ = clear_except_preserved(target_dir).await;
         let _ = restore_from_backup(&backup_dir, target_dir).await;
-        let _ = fs::remove_dir_all(&extract_root).await;
-        let _ = fs::remove_dir_all(&backup_dir).await;
         return Err(merge_err);
     }
-    // 成功: 清理
-    let _ = fs::remove_dir_all(&extract_root).await;
-    let _ = fs::remove_dir_all(&backup_dir).await;
 
     Ok(ImportResult {
         user_id: String::new(),
@@ -193,8 +172,7 @@ mod tests {
         crate::service::zip::pack_dir(zip_root.clone(), zip_path.clone(), Vec::new(), Vec::new())
             .await
             .unwrap();
-        let zip_data = fs::read(&zip_path).await.unwrap();
-        let _ = import_project(&tmp, zip_data).await.unwrap();
+        let _ = import_project(&tmp, &zip_path).await.unwrap();
         // .git 保留, old.txt 被移除, new.txt 出现
         assert!(tmp.join(".git").join("HEAD").exists());
         assert!(!tmp.join("old.txt").exists());

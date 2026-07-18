@@ -1,8 +1,7 @@
-//! computer 执行类路由: execute-command / install-project / get-logs /
+//! computer 执行类 handlers: execute-command / install-project / get-logs /
 //! build-agent-package / cleanup-build-artifacts + 命令执行/产物解析辅助。
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use axum::extract::State;
 use serde::Deserialize;
@@ -14,13 +13,14 @@ use crate::extract::{AppJson as Json, AppQuery as Query};
 use crate::service::pnpm::{self, InstallOptions};
 use crate::service::pnpm_config;
 
+use super::process_capture::{capture_command, run_capture};
 use super::{resolve_computer_target, ws_path};
 
 // ── execute-command ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ExecCommandBody {
+pub(crate) struct ExecCommandBody {
     user_id: String,
     c_id: String,
     command: String,
@@ -30,11 +30,11 @@ pub(super) struct ExecCommandBody {
 /// command 是 agent 提供的 shell 命令串, 故经 shell -c (与 nuwax child_process.exec 一致)。
 /// shell 优先用 `BASH_PATH` (未配置则 sh); stdout/stderr 截断到 50MB (对齐 nuwax maxBuffer)。
 #[utoipa::path(post, path = "/execute-command", request_body = ExecCommandBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
-pub(super) async fn execute_command(
+pub(crate) async fn execute_command(
     State(state): State<AppState>,
     Json(body): Json<ExecCommandBody>,
 ) -> Result<Json<Value>, AppError> {
-    let cwd = ws_path(&state, &body.user_id, &body.c_id);
+    let cwd = ws_path(&state, &body.user_id, &body.c_id)?;
     if !cwd.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -53,60 +53,14 @@ pub(super) async fn execute_command(
     cmd.env("NODE_ENV", "development");
     cmd.env_remove("CI");
     cmd.env_remove("NPM_CONFIG_PRODUCTION");
-    // 输出捕获 (maxBuffer 50MB 对齐 nuwax)
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let child = cmd
-        .spawn()
-        .map_err(|e| AppError::system(format!("execute-command spawn failed: {e}")))?;
-    let child_pid = child.id();
-    let out =
-        tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
-    match out {
-        Ok(Ok(o)) => {
-            let stdout = cap_50mb(String::from_utf8_lossy(&o.stdout));
-            let stderr = cap_50mb(String::from_utf8_lossy(&o.stderr));
-            let code = o.status.code().unwrap_or(-1);
-            Ok(Json(json!({
-                // TS 外层响应始终 success=true，命令结果由 exitCode 表示。
-                "success": true,
-                "stdout": stdout,
-                "stderr": stderr,
-                "exitCode": code,
-            })))
-        }
-        Ok(Err(e)) => Err(AppError::system(format!(
-            "execute-command wait failed: {e}"
-        ))),
-        Err(_) => {
-            if let Some(pid) = child_pid {
-                crate::service::dev_server::process::kill_process_group_force(pid);
-            }
-            Ok(Json(json!({
-                "success": true,
-                "stdout": "",
-                "stderr": format!("command timed out after {timeout_secs}s"),
-                "exitCode": -1,
-            })))
-        }
-    }
-}
-
-/// 输出截断到 50MB (对齐 nuwax exec maxBuffer 50 * 1024 * 1024), 防止超大输出 OOM。
-fn cap_50mb(cow: std::borrow::Cow<'_, str>) -> String {
-    const MAX: usize = 50 * 1024 * 1024;
-    let s = cow.into_owned();
-    if s.len() <= MAX {
-        return s;
-    }
-    // 按字节边界截断 (MAX 处可能落在多字节字符中间, 取 char_boundary 安全边界)
-    let mut end = MAX;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
+    let result = capture_command(&mut cmd, "execute-command", timeout_secs).await?;
+    Ok(Json(json!({
+        // TS 外层响应始终 success=true，命令结果由 exitCode 表示。
+        "success": true,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exitCode": result.exit_code,
+    })))
 }
 
 // ── get-logs ────────────────────────────────────────────────────────────────────
@@ -114,7 +68,7 @@ fn cap_50mb(cow: std::borrow::Cow<'_, str>) -> String {
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct GetLogsQuery {
+pub(crate) struct GetLogsQuery {
     user_id: String,
     c_id: String,
     #[serde(default = "default_tail_lines")]
@@ -133,11 +87,11 @@ fn default_tail_lines() -> usize {
     responses(crate::openapi::JsonApiResponses),
     tag = "Computer"
 )]
-pub(super) async fn get_logs(
+pub(crate) async fn get_logs(
     State(state): State<AppState>,
     Query(q): Query<GetLogsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let log_dir = resolve_computer_target(&state, &q.user_id, &q.c_id, None).join(".logs");
+    let log_dir = resolve_computer_target(&state, &q.user_id, &q.c_id, None)?.join(".logs");
     let empty_resp = |msg: &str| {
         Json(json!({
             "success": true,
@@ -160,9 +114,12 @@ pub(super) async fn get_logs(
         .and_then(|n| n.to_str())
         .unwrap_or("log")
         .to_string();
-    let content = tokio::fs::read_to_string(&latest)
-        .await
-        .map_err(|e| AppError::system(format!("read log {}: {e}", latest.display())))?;
+    let content = crate::service::fs_util::read_to_string_bounded(
+        &latest,
+        state.config.log_read_max_bytes,
+        "computer log",
+    )
+    .await?;
     // 过滤空行 (对齐 nuwax filter(l => l.length > 0))
     let all: Vec<&str> = content.split('\n').filter(|l| !l.is_empty()).collect();
     let total = all.len();
@@ -209,7 +166,7 @@ async fn latest_log_file(dir: &Path) -> AppResult<Option<PathBuf>> {
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct InstallBody {
+pub(crate) struct InstallBody {
     user_id: String,
     c_id: String,
     programming_language: String,
@@ -218,11 +175,11 @@ pub(super) struct InstallBody {
 /// `POST /api/computer/install-project` (对齐 nuwax installProjectDependencies)。
 /// typescript → 递归找 package.json 目录 pnpm install; python → 找 requirements/pyproject pip install。
 #[utoipa::path(post, path = "/install-project", request_body = InstallBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
-pub(super) async fn install_project(
+pub(crate) async fn install_project(
     State(state): State<AppState>,
     Json(body): Json<InstallBody>,
 ) -> Result<Json<Value>, AppError> {
-    let ws = ws_path(&state, &body.user_id, &body.c_id);
+    let ws = ws_path(&state, &body.user_id, &body.c_id)?;
     if !ws.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -305,7 +262,7 @@ pub(super) async fn install_project(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct BuildAgentBody {
+pub(crate) struct BuildAgentBody {
     user_id: String,
     c_id: String,
     agent_id: String,
@@ -317,11 +274,11 @@ pub(super) struct BuildAgentBody {
 /// `node scripts/package-platforms.mjs agent-{id} {ver} {dir}/dist-packages --print-artifacts`
 /// → 解析 stdout 中产物 (path 转 workspace 相对, platform 从文件名提取)。响应无 stdout。
 #[utoipa::path(post, path = "/build-agent-package", request_body = BuildAgentBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
-pub(super) async fn build_agent_package(
+pub(crate) async fn build_agent_package(
     State(state): State<AppState>,
     Json(body): Json<BuildAgentBody>,
 ) -> Result<Json<Value>, AppError> {
-    let ws = ws_path(&state, &body.user_id, &body.c_id);
+    let ws = ws_path(&state, &body.user_id, &body.c_id)?;
     if !ws.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -368,7 +325,7 @@ pub(super) async fn build_agent_package(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct CleanupBuildArtifactsBody {
+pub(crate) struct CleanupBuildArtifactsBody {
     user_id: String,
     c_id: String,
     #[serde(default)]
@@ -379,7 +336,7 @@ pub(super) struct CleanupBuildArtifactsBody {
 /// 返回 {success, cleaned} (字段 cleaned, 非 removed; 无 message)。
 /// 递归找 scripts/package-platforms.mjs 所在 projectDir, 删其 dist-packages (对齐 nuwax)。
 #[utoipa::path(post, path = "/cleanup-build-artifacts", request_body = CleanupBuildArtifactsBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
-pub(super) async fn cleanup_build_artifacts(
+pub(crate) async fn cleanup_build_artifacts(
     State(state): State<AppState>,
     Json(body): Json<CleanupBuildArtifactsBody>,
 ) -> Result<Json<Value>, AppError> {
@@ -388,7 +345,7 @@ pub(super) async fn cleanup_build_artifacts(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
-    );
+    )?;
     if !ws.exists() {
         return Ok(Json(json!({ "success": true, "cleaned": false })));
     }
@@ -480,55 +437,6 @@ async fn find_package_script(root: &Path, skip_dirs: &[String]) -> Option<PathBu
     None
 }
 
-/// 运行命令并捕获输出 (超时退出码 -1)。
-async fn run_capture(
-    program: &str,
-    args: &[&str],
-    cwd: &Path,
-    timeout_secs: u64,
-) -> AppResult<(String, String, i32)> {
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args);
-    cmd.current_dir(cwd);
-    if let Ok(p) = std::env::var("PATH") {
-        cmd.env("PATH", p);
-    }
-    if let Ok(h) = std::env::var("HOME") {
-        cmd.env("HOME", h);
-    }
-    cmd.env_remove("CI");
-    cmd.env_remove("NPM_CONFIG_PRODUCTION");
-    cmd.env("NODE_ENV", "development");
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let child = cmd
-        .spawn()
-        .map_err(|e| AppError::system(format!("spawn {program} failed: {e}")))?;
-    let child_pid = child.id();
-    let out =
-        tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
-    match out {
-        Ok(Ok(o)) => Ok((
-            String::from_utf8_lossy(&o.stdout).into_owned(),
-            String::from_utf8_lossy(&o.stderr).into_owned(),
-            o.status.code().unwrap_or(-1),
-        )),
-        Ok(Err(e)) => Err(AppError::system(format!("{program} wait failed: {e}"))),
-        Err(_) => {
-            if let Some(pid) = child_pid {
-                crate::service::dev_server::process::kill_process_group_force(pid);
-            }
-            Ok((
-                String::new(),
-                format!("timed out after {timeout_secs}s"),
-                -1,
-            ))
-        }
-    }
-}
-
 /// 从 package-platforms stdout 解析产物列表: {path (workspace 相对), fileName, platform}。
 /// path 对齐 nuwax: 相对 workspace 目录, 路径分隔符转 `/`。
 fn parse_artifacts(stdout: &str, workspace: &Path) -> Vec<Value> {
@@ -577,15 +485,11 @@ fn extract_platform_from_filename(file_name: &str) -> Option<String> {
     if parts.len() < 4 {
         return None;
     }
-    // 找最后一个版本段 (形如 x.y.z)
+    // 找最后一个完整 semver 版本段。版本语义与 package.json 检测共用 node-semver，
+    // 避免在这里再维护一套按 `.` 分段的数字解析。
     let mut version_idx = None;
     for (i, p) in parts.iter().enumerate().rev() {
-        let is_version = p
-            .split('.')
-            .all(|seg| seg.bytes().all(|b| b.is_ascii_digit()))
-            && p.contains('.')
-            && !p.is_empty();
-        if is_version {
+        if node_semver::Version::parse(p).is_ok() {
             version_idx = Some(i);
             break;
         }

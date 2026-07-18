@@ -10,21 +10,23 @@
 //! - Codex/OpenCode 运行时产物先在 `.tmp/hook-staging-*` staging 目录预生成, 成功后再替换工作区,
 //!   缩小半更新窗口
 //! - 原子写 (staging tmp + rename) + 损坏 JSON 保护 (解析失败保留旧文件)
-//! - hook 脚本路径校验防穿越 (限定在 `.claude/` 下)
+//! - hook 脚本路径校验防穿越与配置覆盖 (限定在 `.claude/hooks/` 下)
 //!
 //! hook 配置是 schemaless 的嵌套 JSON, 用 `serde_json::Value` 透传处理。
 //!
-//! 子模块: [`parse`] (hooks 解析) / [`codex`] (Codex 转换 + shell 辅助) /
+//! 子模块: [`claude`] (Claude Code settings/scripts) / [`parse`] (hooks 解析) /
+//! [`codex`] (Codex 转换 + shell 辅助) /
 //! [`opencode`] (vendored 插件) / [`scripts`] (外挂脚本) / [`staging`] (staging 预生成) /
 //! [`io_util`] (原子写) / [`types`] (输入类型)。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Map, Value, json};
 use tokio::fs;
 
 use crate::error::AppResult;
 
+mod claude;
 mod codex;
 mod io_util;
 mod opencode;
@@ -35,38 +37,21 @@ mod types;
 
 pub use types::{HookConfigInput, HookScript};
 
+use claude::{SettingsUpdate, apply_settings, replace_hook_scripts};
 use io_util::write_json_file_atomic;
 use opencode::{has_platform_env_script, install_opencode_platform_env_plugin};
 use parse::parse_hooks_config_with_status;
-use scripts::write_hook_scripts;
 use staging::{
     StagedRuntime, apply_staged_runtime_hook_artifacts, clear_hook_artifacts,
     stage_runtime_hook_artifacts,
 };
 
-// ── .claude/settings.json 读取 (readClaudeSettings) ──────────────────────────────
-
-/// 读取 .claude/settings.json (对齐 nuwax readClaudeSettings):
-/// 不存在 → 空 object + 非 corrupt; 解析失败/非 object → 空 object + corrupt。
-async fn read_claude_settings(settings_path: &Path) -> (Value, bool) {
-    if !fs::try_exists(settings_path).await.unwrap_or(false) {
-        return (Value::Object(Map::new()), false);
-    }
-    match fs::read_to_string(settings_path).await {
-        Ok(content) => match serde_json::from_str::<Value>(&content) {
-            Ok(v) if v.is_object() => (v, false),
-            _ => (Value::Object(Map::new()), true),
-        },
-        Err(_) => (Value::Object(Map::new()), true),
-    }
-}
-
 // ── 主入口 (writeAgentHookConfigs) ───────────────────────────────────────────────
 
 /// 写入 Claude Code / Codex / OpenCode 三套 Hook 相关配置 (对齐 nuwax writeAgentHookConfigs)。
 ///
-/// 仅在对应配置解析成功时才清除并重写; 任何 FS 错误按 nuwax 语义 best-effort 记录, 不向上抛
-/// (避免破坏 workspace 创建主流程)。staging 目录在所有路径下都会被清理。
+/// 仅在对应配置解析成功时才清除并重写。文件系统错误立即返回；workspace 创建调用方
+/// 可以显式选择 best-effort。staging 目录由 `TempDir` 在所有退出路径自动清理。
 pub async fn write_agent_hook_configs(workspace: &Path, opts: HookConfigInput) -> AppResult<()> {
     let HookConfigInput {
         mcp_servers_config,
@@ -126,35 +111,31 @@ pub async fn write_agent_hook_configs(workspace: &Path, opts: HookConfigInput) -
         return Ok(());
     }
 
-    let mut staging_root: Option<PathBuf> = None;
     let result = apply_hook_configs(
         workspace,
-        ApplyFlags {
-            should_update_mcp,
-            should_update_hooks,
-            should_update_perms,
-            should_update_scripts,
-            install_platform_env,
+        PreparedHookUpdate {
+            flags: ApplyFlags {
+                should_update_mcp,
+                should_update_hooks,
+                should_update_perms,
+                should_update_scripts,
+                install_platform_env,
+            },
+            mcp_servers: mcp_servers.as_ref(),
+            hooks_map: hooks_status.hooks_map.as_ref(),
+            permissions: permissions.as_ref(),
+            hook_scripts: hook_scripts.as_deref(),
         },
-        mcp_servers.as_ref(),
-        hooks_status.hooks_map.as_ref(),
-        permissions.as_ref(),
-        hook_scripts.as_deref(),
-        &mut staging_root,
     )
     .await;
 
-    // finally: 清理 staging 目录 (无论成功失败)
-    if let Some(root) = staging_root {
-        let _ = fs::remove_dir_all(&root).await;
-    }
-
-    // nuwax: catch 后仅记录, 不向上抛 (best-effort, 不破坏 workspace 创建)
+    // create_workspace 调用方仍可选择 best-effort；本层返回错误，避免底层失败被静默吞掉。
     if let Err(e) = result {
         tracing::error!(
             error = %e,
             "Failed to write agent hook configs, keeping previous files when possible"
         );
+        return Err(e);
     }
     Ok(())
 }
@@ -167,20 +148,24 @@ struct ApplyFlags {
     install_platform_env: bool,
 }
 
-/// 实际 FS 写入逻辑 (对齐 nuwax writeAgentHookConfigs 的 try 块)。
-/// `staging_out` 在创建 staging 时回填, 供外层 finally 清理 (即便中途 `?` 提前返回)。
-#[allow(clippy::too_many_arguments)]
-async fn apply_hook_configs(
-    workspace: &Path,
+struct PreparedHookUpdate<'a> {
     flags: ApplyFlags,
-    mcp_servers: Option<&Value>,
-    hooks_map: Option<&Map<String, Value>>,
-    permissions: Option<&Value>,
-    hook_scripts: Option<&[HookScript]>,
-    staging_out: &mut Option<PathBuf>,
-) -> AppResult<()> {
+    mcp_servers: Option<&'a Value>,
+    hooks_map: Option<&'a Map<String, Value>>,
+    permissions: Option<&'a Value>,
+    hook_scripts: Option<&'a [HookScript]>,
+}
+
+/// 实际 FS 写入逻辑 (对齐 nuwax writeAgentHookConfigs 的 try 块)。
+async fn apply_hook_configs(workspace: &Path, update: PreparedHookUpdate<'_>) -> AppResult<()> {
+    let PreparedHookUpdate {
+        flags,
+        mcp_servers,
+        hooks_map,
+        permissions,
+        hook_scripts,
+    } = update;
     let claude_dir = workspace.join(".claude");
-    let settings_path = claude_dir.join("settings.json");
     let mut staged_runtime: Option<StagedRuntime> = None;
 
     fs::create_dir_all(&claude_dir).await?;
@@ -191,7 +176,6 @@ async fn apply_hook_configs(
     {
         let staged =
             stage_runtime_hook_artifacts(workspace, hm, flags.install_platform_env).await?;
-        *staging_out = Some(staged.staging_root.clone());
         staged_runtime = Some(staged);
     }
 
@@ -214,55 +198,24 @@ async fn apply_hook_configs(
 
     // 4. .claude/settings.json (hooks + permissions)
     if flags.should_update_hooks || flags.should_update_perms {
-        let (settings, corrupt) = read_claude_settings(&settings_path).await;
-        if corrupt && !flags.should_update_hooks {
-            tracing::warn!(settings = %settings_path.display(), "Corrupt .claude/settings.json, skipping settings update");
-        } else {
-            if flags.should_update_perms && corrupt {
-                tracing::warn!(
-                    settings = %settings_path.display(),
-                    "Corrupt .claude/settings.json, rewriting hooks without preserving old fields"
-                );
-            }
-            let mut next_settings = if corrupt {
-                Map::new()
-            } else {
-                settings.as_object().cloned().unwrap_or_default()
-            };
-            if flags.should_update_hooks {
-                if let Some(hm) = hooks_map {
-                    next_settings.insert("hooks".to_string(), Value::Object(hm.clone()));
-                } else {
-                    next_settings.remove("hooks");
-                }
-            }
-            if flags.should_update_perms
-                && !corrupt
-                && let Some(perms) = permissions
-            {
-                next_settings.insert("permissions".to_string(), perms.clone());
-            }
-            if !next_settings.is_empty() {
-                write_json_file_atomic(&settings_path, &Value::Object(next_settings)).await?;
-                tracing::info!("Written .claude/settings.json");
-            } else if fs::try_exists(&settings_path).await.unwrap_or(false) {
-                let _ = fs::remove_file(&settings_path).await;
-            }
-        }
+        apply_settings(
+            workspace,
+            SettingsUpdate {
+                hooks: flags.should_update_hooks.then_some(hooks_map),
+                permissions: flags.should_update_perms.then_some(permissions).flatten(),
+            },
+        )
+        .await?;
     }
 
     // 5. hook 外挂脚本 + 可选 platform-env 插件
     if flags.should_update_scripts {
-        let claude_hooks_dir = claude_dir.join("hooks");
-        if fs::try_exists(&claude_hooks_dir).await.unwrap_or(false) {
-            let _ = fs::remove_dir_all(&claude_hooks_dir).await;
-        }
         if let Some(scripts) = hook_scripts {
-            write_hook_scripts(&claude_dir, scripts).await?;
+            replace_hook_scripts(workspace, scripts).await?;
         }
         if flags.install_platform_env {
             let opencode_plugins_dir = workspace.join(".opencode").join("plugins");
-            let _ = install_opencode_platform_env_plugin(&opencode_plugins_dir).await?;
+            install_opencode_platform_env_plugin(&opencode_plugins_dir).await?;
         }
     }
 
@@ -272,15 +225,14 @@ async fn apply_hook_configs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use io_util::now_nanos;
     use opencode::{
         OPENCODE_PLATFORM_ENV_PLUGIN_ENTRY, OPENCODE_PLUGIN_DIR, OPENCODE_PLUGIN_ENTRY,
     };
 
     #[tokio::test]
     async fn write_agent_hook_configs_end_to_end() {
-        let tmp = std::env::temp_dir().join(format!("fs_hook_{}", now_nanos()));
-        fs::create_dir_all(&tmp).await.unwrap();
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let tmp = temp.path();
 
         let hooks = r#"{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"./check.sh"}]},{"hooks":[{"type":"http","url":"https://hook.example.com/cb","timeout":5,"headers":{"X-Token":"$SECRET"}}]}]}"#;
         let mcp = r#"{"filesystem":{"command":"npx","args":["-y","@fs/mcp"]}}"#;
@@ -297,7 +249,7 @@ mod tests {
         ];
 
         write_agent_hook_configs(
-            &tmp,
+            tmp,
             HookConfigInput {
                 mcp_servers_config: Some(mcp.to_string()),
                 hooks_config: Some(hooks.to_string()),
@@ -393,14 +345,12 @@ mod tests {
             let remaining: Vec<_> = std::fs::read_dir(&tmp_dir).unwrap().collect();
             assert!(remaining.is_empty(), "staging dir not cleaned");
         }
-
-        let _ = fs::remove_dir_all(&tmp).await;
     }
 
     #[tokio::test]
     async fn write_agent_hook_configs_invalid_hooks_keeps_existing() {
-        let tmp = std::env::temp_dir().join(format!("fs_hook2_{}", now_nanos()));
-        fs::create_dir_all(&tmp).await.unwrap();
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let tmp = temp.path();
         // 预置旧 .mcp.json
         fs::write(
             tmp.join(".mcp.json"),
@@ -411,7 +361,7 @@ mod tests {
 
         // 无效 hooksConfig + 有效 mcp: 应更新 mcp, 不动 hooks 产物
         write_agent_hook_configs(
-            &tmp,
+            tmp,
             HookConfigInput {
                 mcp_servers_config: Some(r#"{"new":{"command":"y"}}"#.to_string()),
                 hooks_config: Some("{bad json".to_string()),
@@ -430,27 +380,151 @@ mod tests {
         assert!(mcp["mcpServers"]["old"].is_null());
         // 无 .codex/hooks.json (hooks 无效未触发)
         assert!(!tmp.join(".codex").join("hooks.json").exists());
+    }
 
-        let _ = fs::remove_dir_all(&tmp).await;
+    #[tokio::test]
+    async fn permissions_only_update_preserves_existing_hooks() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let tmp = temp.path();
+        write_agent_hook_configs(
+            tmp,
+            HookConfigInput {
+                hooks_config: Some(
+                    r#"{"Stop":[{"hooks":[{"type":"command","command":"echo stop"}]}]}"#
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write hooks");
+        write_agent_hook_configs(
+            tmp,
+            HookConfigInput {
+                permissions_config: Some(r#"{"allow":["Bash"]}"#.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write permissions");
+
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".claude/settings.json"))
+                .await
+                .expect("read settings"),
+        )
+        .expect("parse settings");
+        assert!(settings["hooks"]["Stop"].is_array());
+        assert_eq!(settings["permissions"]["allow"][0], "Bash");
+        assert!(tmp.join(".codex/hooks.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn empty_hooks_config_clears_only_hook_artifacts() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let tmp = temp.path();
+        write_agent_hook_configs(
+            tmp,
+            HookConfigInput {
+                hooks_config: Some(
+                    r#"{"Stop":[{"hooks":[{"type":"command","command":"echo stop"}]}]}"#
+                        .to_string(),
+                ),
+                permissions_config: Some(r#"{"allow":["Bash"]}"#.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write initial hooks");
+        write_agent_hook_configs(
+            tmp,
+            HookConfigInput {
+                hooks_config: Some("{}".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("clear hooks");
+
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".claude/settings.json"))
+                .await
+                .expect("read settings"),
+        )
+        .expect("parse settings");
+        assert!(settings.get("hooks").is_none());
+        assert_eq!(settings["permissions"]["allow"][0], "Bash");
+        assert!(!tmp.join(".codex/hooks.json").exists());
+        assert!(
+            !tmp.join(".opencode/plugins/opencode-hooks-plugin.js")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_settings_is_preserved_on_permissions_only_update() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let tmp = temp.path();
+        let settings_path = tmp.join(".claude/settings.json");
+        fs::create_dir_all(settings_path.parent().expect("settings parent"))
+            .await
+            .expect("create settings directory");
+        let corrupt = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command"}]}]}"#;
+        fs::write(&settings_path, corrupt)
+            .await
+            .expect("write corrupt settings");
+
+        write_agent_hook_configs(
+            tmp,
+            HookConfigInput {
+                permissions_config: Some(r#"{"allow":["Bash"]}"#.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("skip corrupt settings");
+        assert_eq!(
+            fs::read_to_string(settings_path)
+                .await
+                .expect("read preserved settings"),
+            corrupt
+        );
     }
 
     #[tokio::test]
     async fn write_agent_hook_configs_traversal_script_skipped() {
-        let tmp = std::env::temp_dir().join(format!("fs_hook3_{}", now_nanos()));
-        fs::create_dir_all(&tmp).await.unwrap();
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let tmp = temp.path();
+        fs::create_dir_all(tmp.join(".claude"))
+            .await
+            .expect("create claude directory");
+        fs::write(tmp.join(".claude/settings.json"), "{\"model\":\"sonnet\"}")
+            .await
+            .expect("write settings fixture");
         write_agent_hook_configs(
-            &tmp,
+            tmp,
             HookConfigInput {
-                hook_scripts: Some(vec![HookScript {
-                    path: "../escape.sh".to_string(),
-                    content: "pwn".to_string(),
-                }]),
+                hook_scripts: Some(vec![
+                    HookScript {
+                        path: "../escape.sh".to_string(),
+                        content: "pwn".to_string(),
+                    },
+                    HookScript {
+                        path: "settings.json".to_string(),
+                        content: "overwritten".to_string(),
+                    },
+                ]),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
         assert!(!tmp.parent().unwrap().join("escape.sh").exists());
-        let _ = fs::remove_dir_all(&tmp).await;
+        assert_eq!(
+            fs::read_to_string(tmp.join(".claude/settings.json"))
+                .await
+                .expect("read preserved settings"),
+            "{\"model\":\"sonnet\"}"
+        );
     }
 }

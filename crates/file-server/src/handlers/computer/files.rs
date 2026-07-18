@@ -1,4 +1,4 @@
-//! computer 文件类路由: get-file-list / delete-workspace / files-update /
+//! computer 文件类 handlers: get-file-list / delete-workspace / files-update /
 //! upload-file / upload-files / import-project。
 
 use std::path::Path;
@@ -14,12 +14,12 @@ use crate::path_safety;
 use crate::service::{code as code_service, tree};
 
 use super::{
-    UserCidQuery, bytes_field, resolve_computer_target, text_field, validate_zip_ext, ws_path,
+    UserCidQuery, file_field, resolve_computer_target, text_field, validate_zip_ext, ws_path,
 };
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct DeleteWorkspaceBody {
+pub(crate) struct DeleteWorkspaceBody {
     user_id: String,
     c_id: String,
 }
@@ -69,11 +69,12 @@ pub struct ImportProjectForm {
     responses(crate::openapi::JsonApiResponses),
     tag = "Computer"
 )]
-pub(super) async fn get_file_list(
+pub(crate) async fn get_file_list(
     State(state): State<AppState>,
     Query(q): Query<UserCidQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref());
+    let path =
+        resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())?;
     // 对齐 nuwax: 目录不存在 → 返回空数组 (非报错)
     if !crate::service::fs_util::path_exists(&path).await? {
         return Ok(Json(json!({ "success": true, "files": [] })));
@@ -103,11 +104,11 @@ pub(super) async fn get_file_list(
 
 /// `POST /api/computer/delete-workspace` (对齐 nuwax deleteWorkspace; 目录不存在也返回 deleted)。
 #[utoipa::path(post, path = "/delete-workspace", request_body = DeleteWorkspaceBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
-pub(super) async fn delete_workspace(
+pub(crate) async fn delete_workspace(
     State(state): State<AppState>,
     Json(body): Json<DeleteWorkspaceBody>,
 ) -> Result<Json<Value>, AppError> {
-    let path = ws_path(&state, &body.user_id, &body.c_id);
+    let path = ws_path(&state, &body.user_id, &body.c_id)?;
     // 不存在视为已删除 (对齐 nuwax, 只 warn)
     if path.exists() {
         tokio::fs::remove_dir_all(&path)
@@ -121,7 +122,7 @@ pub(super) async fn delete_workspace(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct FilesUpdateBody {
+pub(crate) struct FilesUpdateBody {
     user_id: String,
     c_id: String,
     files: Vec<code_service::FileOp>,
@@ -131,7 +132,7 @@ pub(super) struct FilesUpdateBody {
 
 /// `POST /api/computer/files-update` (对齐 nuwax computer updateFiles; 增量 create/delete/rename/modify)。
 #[utoipa::path(post, path = "/files-update", request_body = FilesUpdateBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
-pub(super) async fn files_update(
+pub(crate) async fn files_update(
     State(state): State<AppState>,
     Json(mut body): Json<FilesUpdateBody>,
 ) -> Result<Json<Value>, AppError> {
@@ -140,7 +141,7 @@ pub(super) async fn files_update(
         &body.user_id,
         &body.c_id,
         body.custom_target_dir.as_deref(),
-    );
+    )?;
     // 工作区不存在 → 创建 (对齐 nuwax computerFileUtils.updateFiles: !existsSync → mkdirSync recursive)。
     // 首次向全新 user/cId 工作区写入不应失败。
     tokio::fs::create_dir_all(&path).await?;
@@ -174,7 +175,7 @@ pub(super) async fn files_update(
 /// `POST /api/computer/upload-file` (对齐 nuwax computer uploadFile; multipart)。
 /// 返回 {success, message, fileSize} (不返回 filePath/originalname)。
 #[utoipa::path(post, path = "/upload-file", request_body(content = UploadFileForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
-pub(super) async fn upload_file(
+pub(crate) async fn upload_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
@@ -182,7 +183,7 @@ pub(super) async fn upload_file(
     let mut cid = None;
     let mut file_path = None;
     let mut custom_target_dir = None;
-    let mut data: Option<Vec<u8>> = None;
+    let mut data = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -194,7 +195,14 @@ pub(super) async fn upload_file(
             "filePath" => file_path = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
             "file" => {
-                data = Some(bytes_field(field, state.config.upload_single_file_size_bytes).await?)
+                data = Some(
+                    file_field(
+                        field,
+                        state.config.upload_max_file_size_bytes,
+                        &state.config.upload_project_dir.join("temp"),
+                    )
+                    .await?,
+                )
             }
             _ => {}
         }
@@ -203,13 +211,13 @@ pub(super) async fn upload_file(
     let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
     let file_path = file_path.ok_or_else(|| AppError::validation("filePath is required"))?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
-    let ws = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref());
+    let ws = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref())?;
     let target = path_safety::ensure_within(&ws, &file_path)?;
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let file_size = data.len();
-    tokio::fs::write(&target, data).await?;
+    let file_size = data.size();
+    crate::service::temp_file::copy_file(data.path(), &target).await?;
     Ok(Json(json!({
         "success": true,
         "message": "File uploaded successfully",
@@ -220,7 +228,7 @@ pub(super) async fn upload_file(
 /// `POST /api/computer/upload-files` (对齐 nuwax computer uploadFiles; 多文件 multipart)。
 /// 返回 {success, message, totalCount, successCount, failCount, results:[{success,filePath,originalname?,message?,fileSize?,error?}]}。
 #[utoipa::path(post, path = "/upload-files", request_body(content = UploadFilesForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
-pub(super) async fn upload_files(
+pub(crate) async fn upload_files(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
@@ -228,7 +236,7 @@ pub(super) async fn upload_files(
     let mut cid = None;
     let mut custom_target_dir = None;
     let mut file_paths: Vec<String> = Vec::new();
-    let mut files_vec: Vec<(Option<String>, Vec<u8>)> = Vec::new();
+    let mut files_vec = Vec::new();
     while let Some(field) = multipart
         .next_field()
         .await
@@ -243,7 +251,12 @@ pub(super) async fn upload_files(
                 let original = field.file_name().map(|s| s.to_string());
                 files_vec.push((
                     original,
-                    bytes_field(field, state.config.upload_single_file_size_bytes).await?,
+                    file_field(
+                        field,
+                        state.config.upload_max_file_size_bytes,
+                        &state.config.upload_project_dir.join("temp"),
+                    )
+                    .await?,
                 ));
             }
             _ => {}
@@ -254,11 +267,11 @@ pub(super) async fn upload_files(
     if file_paths.len() != files_vec.len() {
         return Err(AppError::validation("filePaths and files count mismatch"));
     }
-    let ws = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref());
+    let ws = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref())?;
     let total = file_paths.len();
     let mut success_count = 0usize;
     let mut results: Vec<Value> = Vec::new();
-    for (fp, (original, data)) in file_paths.iter().zip(files_vec) {
+    for (fp, (original, data)) in file_paths.iter().zip(&files_vec) {
         let target = match path_safety::ensure_within(&ws, fp) {
             Ok(t) => t,
             Err(_) => {
@@ -271,8 +284,8 @@ pub(super) async fn upload_files(
                 continue;
             }
         };
-        let file_size = data.len();
-        match write_file_create_parent(&target, data).await {
+        let file_size = data.size();
+        match write_file_create_parent(&target, data.path()).await {
             Ok(()) => {
                 success_count += 1;
                 results.push(json!({
@@ -305,11 +318,10 @@ pub(super) async fn upload_files(
 }
 
 /// 写文件 (父目录自动创建); 用于 upload-files 单文件隔离错误。
-async fn write_file_create_parent(target: &Path, data: Vec<u8>) -> Result<(), std::io::Error> {
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(target, data).await
+async fn write_file_create_parent(target: &Path, source: &Path) -> Result<(), AppError> {
+    crate::service::temp_file::copy_file(source, target)
+        .await
+        .map(|_| ())
 }
 
 // ── import-project ──────────────────────────────────────────────────────────────
@@ -317,14 +329,14 @@ async fn write_file_create_parent(target: &Path, data: Vec<u8>) -> Result<(), st
 /// `POST /api/computer/import-project` (对齐 nuwax computer importProject):
 /// 上传 zip → 解压 + removeTopLevelDir + 白名单保留合并到工作区。
 #[utoipa::path(post, path = "/import-project", request_body(content = ImportProjectForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
-pub(super) async fn import_project(
+pub(crate) async fn import_project(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     let mut user_id = None;
     let mut cid = None;
     let mut custom_target_dir = None;
-    let mut data: Option<Vec<u8>> = None;
+    let mut data = None;
     let mut file_name = None;
     while let Some(field) = multipart
         .next_field()
@@ -337,7 +349,14 @@ pub(super) async fn import_project(
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                data = Some(bytes_field(field, state.config.upload_max_file_size_bytes).await?);
+                data = Some(
+                    file_field(
+                        field,
+                        state.config.upload_max_file_size_bytes,
+                        &state.config.upload_project_dir.join("temp"),
+                    )
+                    .await?,
+                );
             }
             _ => {}
         }
@@ -346,9 +365,9 @@ pub(super) async fn import_project(
     let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     validate_zip_ext(file_name.as_deref())?;
-    let target_dir = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref());
+    let target_dir = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref())?;
     tokio::fs::create_dir_all(&target_dir).await?;
-    let res = crate::service::computer_ws::import_project(&target_dir, data).await?;
+    let res = crate::service::computer_ws::import_project(&target_dir, data.path()).await?;
     Ok(Json(json!({
         "success": true,
         "message": "Project imported successfully",

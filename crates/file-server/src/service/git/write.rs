@@ -13,6 +13,7 @@ use gix::index::{
     write::Options as IndexWriteOptions,
 };
 use gix::object::tree::EntryKind as TreeEntryKind;
+use gix::objs::Write;
 use gix::path::into_bstr;
 
 use crate::error::{AppError, AppResult};
@@ -72,12 +73,14 @@ fn stage_file(repo: &Repository, worktree_path: &str) -> AppResult<()> {
     let bstr_path: &BStr = bstr_owned.as_ref();
     let metadata = std::fs::symlink_metadata(&abs).ok();
     if let Some(metadata) = metadata {
-        let (data, mode) = if metadata.file_type().is_symlink() {
+        let (blob_id, mode) = if metadata.file_type().is_symlink() {
             let target = std::fs::read_link(&abs)?;
-            (
-                into_bstr(target).into_owned().as_slice().to_vec(),
-                IndexMode::SYMLINK,
-            )
+            let data = into_bstr(target).into_owned();
+            let id = repo
+                .write_blob(data.as_slice())
+                .map_err(|e| map_git_err(e, "git write symlink blob"))?
+                .detach();
+            (id, IndexMode::SYMLINK)
         } else if metadata.is_file() {
             #[cfg(unix)]
             let executable = {
@@ -91,16 +94,19 @@ fn stage_file(repo: &Repository, worktree_path: &str) -> AppResult<()> {
             } else {
                 IndexMode::FILE
             };
-            (std::fs::read(&abs)?, mode)
+            // Repository::write_blob_stream() 在 gix 0.85 中仍先聚合到内存；
+            // 直接写公开 ODB handle 才会流式压缩并落到 loose object。
+            let mut file = std::fs::File::open(&abs)?;
+            let id = repo
+                .objects
+                .write_stream(gix::objs::Kind::Blob, metadata.len(), &mut file)
+                .map_err(|e| map_git_err(e, "git stream worktree blob"))?;
+            (id, mode)
         } else {
             return Err(AppError::validation(format!(
                 "unsupported file type: {worktree_path}"
             )));
         };
-        let blob_id = repo
-            .write_blob(data)
-            .map_err(|e| map_git_err(e, "git write_blob"))?
-            .detach();
         let stat = Stat::default();
         if let Some(e) = index.entry_mut_by_path_and_stage(bstr_path, Stage::Unconflicted) {
             e.id = blob_id;

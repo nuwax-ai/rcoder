@@ -21,36 +21,36 @@ const PLATFORM_ENV_SCRIPT_PATH: &str = "hooks/platform-env.sh";
 // ── vendored opencode 插件 (编译进二进制) ────────────────────────────────────────
 
 /// opencode-hooks-plugin/dist 下所有 .js (对齐 nuwax assets/opencode-hooks-plugin/dist)。
-const OPENCODE_HOOKS_PLUGIN_FILES: &[(&str, &[u8])] = &[
+const OPENCODE_HOOKS_PLUGIN_FILES: &[(&str, &str)] = &[
     (
         "config.js",
-        include_bytes!("../../../assets/opencode-hooks-plugin/dist/config.js"),
+        include_str!("../../../assets/opencode-hooks-plugin/dist/config.js"),
     ),
     (
         "events.js",
-        include_bytes!("../../../assets/opencode-hooks-plugin/dist/events.js"),
+        include_str!("../../../assets/opencode-hooks-plugin/dist/events.js"),
     ),
     (
         "executor.js",
-        include_bytes!("../../../assets/opencode-hooks-plugin/dist/executor.js"),
+        include_str!("../../../assets/opencode-hooks-plugin/dist/executor.js"),
     ),
     (
         "index.js",
-        include_bytes!("../../../assets/opencode-hooks-plugin/dist/index.js"),
+        include_str!("../../../assets/opencode-hooks-plugin/dist/index.js"),
     ),
     (
         "matcher.js",
-        include_bytes!("../../../assets/opencode-hooks-plugin/dist/matcher.js"),
+        include_str!("../../../assets/opencode-hooks-plugin/dist/matcher.js"),
     ),
     (
         "types.js",
-        include_bytes!("../../../assets/opencode-hooks-plugin/dist/types.js"),
+        include_str!("../../../assets/opencode-hooks-plugin/dist/types.js"),
     ),
 ];
 
 /// opencode-platform-env-plugin 入口 (对齐 nuwax assets/opencode-platform-env-plugin)。
-const OPENCODE_PLATFORM_ENV_PLUGIN_JS: &[u8] =
-    include_bytes!("../../../assets/opencode-platform-env-plugin/platform-env-plugin.js");
+const OPENCODE_PLATFORM_ENV_PLUGIN_JS: &str =
+    include_str!("../../../assets/opencode-platform-env-plugin/platform-env-plugin.js");
 
 // ── 安装 ─────────────────────────────────────────────────────────────────────────
 
@@ -61,7 +61,7 @@ pub(super) async fn install_opencode_hooks_plugin(opencode_plugins_dir: &Path) -
     let target_plugin_root = opencode_plugins_dir.join(OPENCODE_PLUGIN_DIR).join("dist");
     fs::create_dir_all(&target_plugin_root).await?;
     for (name, content) in OPENCODE_HOOKS_PLUGIN_FILES {
-        fs::write(target_plugin_root.join(name), content).await?;
+        write_file_atomic(&target_plugin_root.join(name), content, None).await?;
     }
     let entry_file = opencode_plugins_dir.join(OPENCODE_PLUGIN_ENTRY);
     let entry_content =
@@ -80,7 +80,7 @@ pub(super) async fn install_opencode_platform_env_plugin(
 ) -> AppResult<bool> {
     fs::create_dir_all(opencode_plugins_dir).await?;
     let target = opencode_plugins_dir.join(OPENCODE_PLATFORM_ENV_PLUGIN_ENTRY);
-    fs::write(&target, OPENCODE_PLATFORM_ENV_PLUGIN_JS).await?;
+    write_file_atomic(&target, OPENCODE_PLATFORM_ENV_PLUGIN_JS, None).await?;
     tracing::info!(
         entry = OPENCODE_PLATFORM_ENV_PLUGIN_ENTRY,
         "Installed opencode-platform-env-plugin into .opencode/plugins"

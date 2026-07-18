@@ -1,4 +1,4 @@
-//! 静态文件服务路由 (对齐 nuwax `server.js` 顶层 `/api/page/static` + `/api/computer/static`)。
+//! 静态文件 HTTP handlers (对齐 nuwax `server.js` 顶层 `/api/page/static` + `/api/computer/static`)。
 //!
 //! 复刻要点 (nuwax 用 `res.sendFile`/`send` 库):
 //! - 根目录: page = `PROJECT_SOURCE_DIR/{projectId}`; computer = `COMPUTER_WORKSPACE_DIR/{userId}/{cId}`
@@ -15,12 +15,9 @@ use std::path::{Path, PathBuf};
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::options;
 use serde::Deserialize;
 use tower::util::ServiceExt;
 use tower_http::services::ServeFile;
-use utoipa_axum::router::OpenApiRouter;
-use utoipa_axum::routes;
 
 use crate::AppState;
 use crate::extract::{AppPath as AxumPath, AppQuery as Query};
@@ -44,23 +41,9 @@ const COMPUTER_CORS: CorsConfig = CorsConfig {
 
 const ALLOW_METHODS: &str = "HEAD,GET,POST,PUT,DELETE,OPTIONS";
 
-/// 挂 `/api/page` 路由 (static 子路由)。
-pub fn page_router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
-        .routes(routes!(serve_page))
-        .route("/static/{project_id}/{*rest}", options(serve_page))
-}
-
-/// computer static 路由 (挂到现有 `/api/computer` router 下, 相对 `/static/...`)。
-pub fn computer_static_route() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
-        .routes(routes!(serve_computer))
-        .route("/static/{user_id}/{c_id}/{*rest}", options(serve_computer))
-}
-
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct CustomTargetQuery {
+pub(crate) struct CustomTargetQuery {
     #[serde(default)]
     custom_target_dir: Option<String>,
 }
@@ -81,7 +64,7 @@ struct CustomTargetQuery {
     ),
     tag = "Static"
 )]
-async fn serve_page(
+pub(crate) async fn serve_page(
     State(state): State<AppState>,
     AxumPath((project_id, rest)): AxumPath<(String, String)>,
     req: Request,
@@ -89,12 +72,15 @@ async fn serve_page(
     if project_id.trim().is_empty() {
         return cors_404(&req, &PAGE_CORS);
     }
-    let root = state.resolver.resolve_project(&ProjectContext {
+    let root = match state.resolver.resolve_project(&ProjectContext {
         project_id: project_id.to_string(),
         tenant_id: None,
         space_id: None,
         isolation_type: None,
-    });
+    }) {
+        Ok(root) => root,
+        Err(error) => return error.into_response(),
+    };
     serve_from_root(&root, &rest, &PAGE_CORS, req).await
 }
 
@@ -116,7 +102,7 @@ async fn serve_page(
     ),
     tag = "Static"
 )]
-async fn serve_computer(
+pub(crate) async fn serve_computer(
     State(state): State<AppState>,
     AxumPath((user_id, c_id, rest)): AxumPath<(String, String, String)>,
     Query(q): Query<CustomTargetQuery>,
@@ -126,6 +112,13 @@ async fn serve_computer(
         return cors_404(&req, &COMPUTER_CORS);
     }
     // customTargetDir 非空 → 完全覆盖根 (对齐 nuwax, 不拼 user/cId)
+    let default_root = match state.resolver.resolve_computer(&ComputerContext {
+        user_id: user_id.to_string(),
+        cid: c_id.to_string(),
+    }) {
+        Ok(root) => root,
+        Err(error) => return error.into_response(),
+    };
     let root = match q
         .custom_target_dir
         .as_deref()
@@ -133,10 +126,7 @@ async fn serve_computer(
         .filter(|s| !s.is_empty())
     {
         Some(ct) => PathBuf::from(ct),
-        None => state.resolver.resolve_computer(&ComputerContext {
-            user_id: user_id.to_string(),
-            cid: c_id.to_string(),
-        }),
+        None => default_root,
     };
     serve_from_root(&root, &rest, &COMPUTER_CORS, req).await
 }

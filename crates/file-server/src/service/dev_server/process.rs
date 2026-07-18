@@ -317,11 +317,10 @@ pub async fn find_pids_by_project_id(project_id: &str) -> Vec<u32> {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    let precise_needle = format!("/{project_id}");
     let mut pids: Vec<u32> = Vec::new();
     // 精确匹配
     for line in text.lines() {
-        if line.contains(&precise_needle)
+        if contains_project_path_segment(line, project_id)
             && let Some(pid) = parse_pid_from_line(line)
         {
             pids.push(pid);
@@ -330,6 +329,17 @@ pub async fn find_pids_by_project_id(project_id: &str) -> Vec<u32> {
     pids.sort_unstable();
     pids.dedup();
     pids
+}
+
+/// 匹配命令行中的完整项目路径段，避免项目 `abc` 误命中 `abc2`。
+fn contains_project_path_segment(command_line: &str, project_id: &str) -> bool {
+    let needle = format!("/{project_id}");
+    command_line.match_indices(&needle).any(|(offset, _)| {
+        command_line[offset + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next == '/' || next.is_whitespace() || matches!(next, '\'' | '"'))
+    })
 }
 
 /// 从 `ps` 输出行提取首列 pid。
@@ -378,12 +388,28 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::system_pid;
+    use super::{contains_project_path_segment, system_pid};
 
     #[test]
     fn system_pid_rejects_values_outside_positive_pid_t_range() {
         assert!(system_pid(0).is_none());
         assert!(system_pid(u32::MAX).is_none());
         assert_eq!(system_pid(1).map(nix::unistd::Pid::as_raw), Some(1));
+    }
+
+    #[test]
+    fn project_process_match_requires_a_path_segment_boundary() {
+        assert!(contains_project_path_segment(
+            "123 node /workspace/abc/node_modules/vite/bin/vite.js",
+            "abc"
+        ));
+        assert!(contains_project_path_segment(
+            "123 sh -c 'cd /workspace/abc'",
+            "abc"
+        ));
+        assert!(!contains_project_path_segment(
+            "123 node /workspace/abc2/node_modules/vite/bin/vite.js",
+            "abc"
+        ));
     }
 }

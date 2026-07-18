@@ -4,51 +4,28 @@
 //! encodeURIComponent: 保留 [A-Za-z0-9-_.!~*'()], 其余按 UTF-8 字节百分号编码
 //! (多字节字符逐字节, 与 JS 一致)。
 
-/// JS decodeURIComponent 等价。
-pub fn decode_uri_component(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && let (Some(h), Some(l)) = (hex_digit(b[i + 1]), hex_digit(b[i + 2]))
-        {
-            out.push(h * 16 + l);
-            i += 3;
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
-}
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+/// `encodeURIComponent` 不编码的非字母数字 ASCII 字符。
+const URI_COMPONENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'!')
+    .remove(b'~')
+    .remove(b'*')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')');
+
+/// 解码 URI component；非法输入按 nuwax 兼容策略保留或 lossy 替换，而不是抛异常。
+pub fn decode_uri_component(s: &str) -> String {
+    percent_decode_str(s).decode_utf8_lossy().into_owned()
 }
 
 /// JS encodeURIComponent 等价。
 pub fn encode_uri_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        if b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
-            )
-        {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
+    utf8_percent_encode(s, URI_COMPONENT_ENCODE_SET).to_string()
 }
 
 #[cfg(test)]
@@ -61,6 +38,8 @@ mod tests {
         assert_eq!(decode_uri_component("hello%20world"), "hello world");
         assert_eq!(decode_uri_component("plain"), "plain");
         assert_eq!(decode_uri_component("bad%ZZ"), "bad%ZZ"); // 非法保留
+        assert_eq!(decode_uri_component("bad%FF"), "bad�"); // 非法 UTF-8 lossy
+        assert_eq!(decode_uri_component("a+b"), "a+b"); // URI component 不把 + 当空格
     }
 
     #[test]
@@ -71,6 +50,10 @@ mod tests {
         assert_eq!(encode_uri_component("a b/c"), "a%20b%2Fc");
         // 中文逐字节 (中 = E4 B8 AD)
         assert_eq!(encode_uri_component("中"), "%E4%B8%AD");
+        assert_eq!(
+            encode_uri_component(";/?:@&=+$,#%"),
+            "%3B%2F%3F%3A%40%26%3D%2B%24%2C%23%25"
+        );
         // 互逆
         assert_eq!(
             decode_uri_component(&encode_uri_component("a b/中文")),

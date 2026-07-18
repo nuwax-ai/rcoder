@@ -1,6 +1,6 @@
 //! Git 读操作 (status/log/branches/tags/file-content)。
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 use super::{map_git_err, shorten_ref};
 
@@ -165,6 +165,7 @@ pub fn file_content_at_ref(
     repo: &Repository,
     ref_spec: &str,
     file_path: &str,
+    max_bytes: u64,
 ) -> AppResult<Option<String>> {
     let oid = repo
         .rev_parse_single(ref_spec)
@@ -178,6 +179,15 @@ pub fn file_content_at_ref(
         .map_err(|e| map_git_err(e, "git lookup_entry_by_path"))?
     {
         Some(entry) => {
+            let size = repo
+                .find_header(entry.id())
+                .map_err(|e| map_git_err(e, "git find file-content header"))?
+                .size();
+            if size > max_bytes {
+                return Err(AppError::validation(format!(
+                    "git file content exceeds limit (max {max_bytes} bytes)"
+                )));
+            }
             let blob = repo
                 .find_blob(entry.id())
                 .map_err(|e| map_git_err(e, "git find_blob"))?;

@@ -15,11 +15,16 @@ RCoder 的 file-server(node `nuwax-file-server`)已用 Rust 重写(`crates/file-
 - `nuwax-file-server`(npm 全局,node 版)—— **保留作回滚**
 
 > Rust 版兼容 `FILE_SERVER_PORT`，也兼容 nuwax 原生 `PORT`；请求体上限同时支持字节数
-> `REQUEST_BODY_MAX_BYTES` 和 nuwax 字符串格式 `REQUEST_BODY_LIMIT=2000mb`。其余业务 env 使用:
+> `REQUEST_BODY_MAX_BYTES` 和 nuwax 字符串格式 `REQUEST_BODY_LIMIT=1gb`，默认且硬上限为 1 GiB。其余业务 env 使用:
 > `PROJECT_SOURCE_DIR` / `COMPUTER_WORKSPACE_DIR` /
-> `UPLOAD_PROJECT_DIR` / `DIST_TARGET_DIR` / `LOG_BASE_DIR` / `COMPUTER_LOG_DIR` / `TEMPLATE_CACHE_DIR` /
-> `NODE_MODULES_LOCAL_DIR` / `INIT_PROJECT_DIR` / `DEPLOYMENT_MODE` / `FAST_RESTART_ENABLED` / `GIT_*`。
+> `UPLOAD_PROJECT_DIR` / `DIST_TARGET_DIR` / `LOG_BASE_DIR` / `COMPUTER_LOG_DIR` /
+> `INIT_PROJECT_DIR` / `DEPLOYMENT_MODE` / `FAST_RESTART_ENABLED` / `GIT_*`。
 > build-agent-docker configmap 无需改 env。
+
+> 所有 multipart 文件上传统一由 `UPLOAD_MAX_FILE_SIZE_BYTES` 控制，默认且硬上限为
+> `1073741824` 字节（1 GiB）；旧的 `UPLOAD_SINGLE_FILE_SIZE_BYTES` 已废弃。
+
+> 可设置 `FILE_SERVER_CONFIG=/path/file-server.yaml` 使用 YAML/TOML/JSON 配置文件；环境变量继续作为覆盖层。服务日志按天写入 `FILE_SERVER_LOG_DIR`（默认 `/app/logs/file-server`），保留最近 7 个每日日志文件，日志级别可由 `RUST_LOG` 覆盖。
 
 ## 2. 启动切换(在 build-agent-docker 仓)
 

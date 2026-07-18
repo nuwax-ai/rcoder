@@ -11,6 +11,31 @@
 use crate::error::AppError;
 
 use regex::Regex;
+use std::sync::LazyLock;
+
+static PORT_IN_USE_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_regex(r"(?i)port (\d+) is (?:in use|already in use)|EADDRINUSE.*?(\d+)")
+});
+static NODE_MISSING_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_regex(
+        r"(?i)(?:npx|node): (?:command )?not found|no such file or directory.*npx|enoent.*spawn|cannot run node",
+    )
+});
+static MISSING_MODULE_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_regex(
+        r#"(?i)(?:Cannot find module|Failed to resolve (?:import )?|Module not found)\s*['"]?([A-Za-z0-9_@/.\-]+)"#,
+    )
+});
+static CONFIG_ERROR_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_regex(
+        r"(?im)(Failed to load config[^\n]*|vite\.config[^\n]*SyntaxError[^\n]*|SyntaxError[^\n]*vite\.config[^\n]*|[Ee]rror in config[^\n]*)",
+    )
+});
+static TRANSFORM_ERROR_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_regex(
+        r"(?im)(Pre-transform error[^\n]*|Internal server error[^\n]*|[Ee]rror during transform[^\n]*)",
+    )
+});
 
 /// stderr 环形缓冲 (启动期间保留末尾若干行供分类)。
 pub type StderrRing = std::sync::Mutex<std::collections::VecDeque<String>>;
@@ -86,44 +111,39 @@ impl ViteStartupError {
 }
 
 fn capture_port(s: &str) -> Option<u16> {
-    let re = Regex::new(r"(?i)port (\d+) is (?:in use|already in use)|EADDRINUSE.*?(\d+)").ok()?;
-    let caps = re.captures(s)?;
+    let caps = PORT_IN_USE_RE.as_ref()?.captures(s)?;
     caps.get(1)
         .or_else(|| caps.get(2))
         .and_then(|m| m.as_str().parse().ok())
 }
 
 fn is_node_missing(s: &str) -> bool {
-    let re = Regex::new(
-        r"(?i)(?:npx|node): (?:command )?not found|no such file or directory.*npx|enoent.*spawn|cannot run node",
-    );
-    match re {
-        Ok(re) => re.is_match(s),
-        Err(_) => false,
-    }
+    NODE_MISSING_RE
+        .as_ref()
+        .is_some_and(|regex| regex.is_match(s))
 }
 
 fn capture_module(s: &str) -> Option<String> {
-    let re = Regex::new(
-        r#"(?i)(?:Cannot find module|Failed to resolve (?:import )?|Module not found)\s*['"]?([A-Za-z0-9_@/.\-]+)"#,
-    )
-    .ok()?;
-    let caps = re.captures(s)?;
+    let caps = MISSING_MODULE_RE.as_ref()?.captures(s)?;
     caps.get(1).map(|m| m.as_str().to_string())
 }
 
 fn capture_config(s: &str) -> Option<String> {
-    let re =
-        Regex::new(r"(?im)(Failed to load config[^\n]*|vite\.config[^\n]*SyntaxError[^\n]*|SyntaxError[^\n]*vite\.config[^\n]*|[Ee]rror in config[^\n]*)")
-            .ok()?;
-    let m = re.captures(s)?.get(1)?;
+    let m = CONFIG_ERROR_RE.as_ref()?.captures(s)?.get(1)?;
     Some(m.as_str().trim().to_string())
 }
 
 fn capture_transform(s: &str) -> Option<String> {
-    let re = Regex::new(r"(?im)(Pre-transform error[^\n]*|Internal server error[^\n]*|[Ee]rror during transform[^\n]*)").ok()?;
-    let m = re.captures(s)?.get(1)?;
+    let m = TRANSFORM_ERROR_RE.as_ref()?.captures(s)?.get(1)?;
     Some(m.as_str().trim().to_string())
+}
+
+fn compile_regex(pattern: &'static str) -> Option<Regex> {
+    Regex::new(pattern)
+        .map_err(|error| {
+            tracing::error!(%error, %pattern, "invalid built-in Vite error regex");
+        })
+        .ok()
 }
 
 /// 取末尾 N 行 (用于 Unknown 兜底展示)。

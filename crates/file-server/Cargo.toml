@@ -38,10 +38,13 @@ tokio = { workspace = true, features = ["full"] }
 # 日志
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 
 # 序列化 (preserve_order: package.json round-trip 保序, 对齐 nuwax JSON.stringify)
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
 
 # 校验 (声明式 #[derive(Validate)] + #[garde(...)], 与 shared_types/rcoder 一致)
 garde = { workspace = true, features = ["derive"] }
@@ -60,11 +63,19 @@ mime_guess = { workspace = true }
 # Base64 编码 (图片内联)
 base64 = { workspace = true }
 
+# URI component 百分号编解码（精确对齐 JavaScript encodeURIComponent 字符集）
+percent-encoding = { workspace = true }
+
+# 文件系统无关的词法路径规范化（消除手写 Component 归约）
+path-clean = { workspace = true }
+
 # Zip 解压/打包 (模板/upload/export/skills)
 zip = { workspace = true }
 
 # HTTP client (push-skills url fetch)
 reqwest = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
 
 # Git (gix, 纯 Rust)
 gix = { workspace = true }
@@ -75,5 +86,13 @@ nix = { workspace = true }
 # 正则 (构建错误解析)
 regex = { workspace = true }
 
+# package.json 中 npm 版本范围解析（Vue 主版本检测）
+node-semver = { workspace = true }
+
 # 组合解析器 (hook shell 环境变量语法等小型文法)
 winnow = { workspace = true }
+# POSIX shell 字面量转义（HTTP Hook wrapper 参数）
+shlex = { workspace = true }
+
+# 安全临时文件/目录（Hook 配置原子替换与 staging 生命周期由 RAII 管理）
+tempfile = { workspace = true }

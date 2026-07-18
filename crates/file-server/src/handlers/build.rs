@@ -1,4 +1,4 @@
-//! `/api/build` 路由 (对齐 nuwax buildRoutes; dev server 经 DevServerManager)。
+//! `/api/build` HTTP handlers (对齐 nuwax buildRoutes; dev server 经 DevServerManager)。
 //!
 //! 本文件含 dev server 生命周期 + 端口池 + 日志读取 7 路由。
 //! `build` / `parse-build-error` / computer 相关路由见后续 task。
@@ -8,17 +8,16 @@ use std::path::PathBuf;
 use axum::extract::State;
 use serde::Deserialize;
 use serde_json::Value;
-use utoipa_axum::router::OpenApiRouter;
-use utoipa_axum::routes;
 
+use super::build_support::{copy_dir_all, normalize_build_base};
 use crate::AppState;
-use crate::error::AppError;
+use crate::error::{AppError, AppResult};
 use crate::extract::{AppJson as Json, AppQuery as Query};
 use crate::service::pnpm::{self, InstallOptions, LogFiles};
 use crate::workspace::ProjectContext;
 
 // ── 类型化响应 (取代 serde_json::json! 字面量; camelCase 由 serde 统一保证) ──────
-mod response {
+pub(super) mod response {
     use serde::Serialize;
 
     use crate::service::dev_server::log::LogLine;
@@ -138,25 +137,10 @@ mod response {
     }
 }
 
-pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
-        .routes(routes!(start_dev))
-        .routes(routes!(stop_dev))
-        .routes(routes!(restart_dev))
-        .routes(routes!(list_dev))
-        .routes(routes!(keep_alive))
-        .routes(routes!(port_pool_status))
-        .routes(routes!(get_dev_log))
-        .routes(routes!(build_project))
-        .routes(routes!(parse_build_error))
-        .routes(routes!(get_log_cache_stats))
-        .routes(routes!(clear_all_log_cache))
-}
-
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
-struct BuildQuery {
+pub(crate) struct BuildQuery {
     project_id: String,
     #[serde(default)]
     pid: Option<String>,
@@ -174,7 +158,7 @@ struct BuildQuery {
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
-struct KeepAliveQuery {
+pub(crate) struct KeepAliveQuery {
     project_id: String,
     #[serde(default)]
     pid: Option<u32>,
@@ -192,7 +176,7 @@ struct KeepAliveQuery {
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
-struct DevLogQuery {
+pub(crate) struct DevLogQuery {
     project_id: String,
     #[serde(default = "default_start_index")]
     start_index: usize,
@@ -206,7 +190,7 @@ fn default_log_type() -> String {
     "temp".to_string()
 }
 
-fn project_path(state: &AppState, q: &BuildQuery) -> PathBuf {
+fn project_path(state: &AppState, q: &BuildQuery) -> AppResult<PathBuf> {
     state.resolver.resolve_project(&ProjectContext {
         project_id: q.project_id.clone(),
         tenant_id: q.tenant_id.clone(),
@@ -215,7 +199,7 @@ fn project_path(state: &AppState, q: &BuildQuery) -> PathBuf {
     })
 }
 
-fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> PathBuf {
+fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> AppResult<PathBuf> {
     state.resolver.resolve_project(&ProjectContext {
         project_id: q.project_id.clone(),
         tenant_id: q.tenant_id.clone(),
@@ -232,11 +216,11 @@ fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> PathBuf {
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
-async fn start_dev(
+pub(crate) async fn start_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<response::DevStarted>, AppError> {
-    let path = project_path(&state, &q);
+    let path = project_path(&state, &q)?;
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
@@ -259,7 +243,7 @@ async fn start_dev(
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
-async fn stop_dev(
+pub(crate) async fn stop_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<response::DevStopped>, AppError> {
@@ -295,11 +279,11 @@ async fn stop_dev(
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
-async fn restart_dev(
+pub(crate) async fn restart_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<response::DevStarted>, AppError> {
-    let path = project_path(&state, &q);
+    let path = project_path(&state, &q)?;
     let base = q.base_path.as_deref();
     let started = state
         .dev_server
@@ -321,7 +305,9 @@ async fn restart_dev(
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
-async fn list_dev(State(state): State<AppState>) -> Result<Json<response::DevList>, AppError> {
+pub(crate) async fn list_dev(
+    State(state): State<AppState>,
+) -> Result<Json<response::DevList>, AppError> {
     let list = state.dev_server.list_dev()?;
     Ok(Json(response::DevList {
         success: true,
@@ -337,7 +323,7 @@ async fn list_dev(State(state): State<AppState>) -> Result<Json<response::DevLis
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
-async fn keep_alive(
+pub(crate) async fn keep_alive(
     State(state): State<AppState>,
     Query(q): Query<KeepAliveQuery>,
 ) -> Result<Json<response::KeepAlive>, AppError> {
@@ -351,7 +337,7 @@ async fn keep_alive(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::validation("basePath is required"))?;
-    let path = project_path_keep(&state, &q);
+    let path = project_path_keep(&state, &q)?;
     let result = state
         .dev_server
         .keep_alive(&q.project_id, pid, q.port, Some(base_str), &path)
@@ -382,7 +368,7 @@ async fn keep_alive(
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
-async fn port_pool_status(
+pub(crate) async fn port_pool_status(
     State(state): State<AppState>,
 ) -> Result<Json<response::PortPool>, AppError> {
     let status = state.dev_server.port_pool_status()?;
@@ -403,7 +389,7 @@ async fn port_pool_status(
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
-async fn get_dev_log(
+pub(crate) async fn get_dev_log(
     State(state): State<AppState>,
     Query(q): Query<DevLogQuery>,
 ) -> Result<Json<response::DevLog>, AppError> {
@@ -461,11 +447,11 @@ async fn get_dev_log(
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
-async fn build_project(
+pub(crate) async fn build_project(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<response::BuildDone>, AppError> {
-    let path = project_path(&state, &q);
+    let path = project_path(&state, &q)?;
     if !path.exists() {
         return Err(AppError::resource("project does not exist"));
     }
@@ -523,9 +509,13 @@ async fn build_project(
     .await;
     if let Err(build_error) = build_result {
         // 失败: 读 build 日志用 build_error 解析友好消息 (对齐 nuwax BuildErrorParser)
-        let log_content = tokio::fs::read_to_string(&temp_log)
-            .await
-            .unwrap_or_else(|_| build_error.to_string());
+        let log_content = crate::service::fs_util::read_to_string_bounded(
+            &temp_log,
+            state.config.log_read_max_bytes,
+            "build log",
+        )
+        .await
+        .unwrap_or_else(|_| build_error.to_string());
         let friendly = crate::service::build_error::parse(&log_content);
         return Err(AppError::system(friendly));
     }
@@ -558,73 +548,6 @@ async fn build_project(
     }))
 }
 
-/// build basePath 规范化 (对齐 nuwax: 补首尾 `/`; vite --base 需尾斜杠)。
-fn normalize_build_base(b: Option<&str>) -> String {
-    let b = b.map(str::trim).unwrap_or("/").to_string();
-    if b.is_empty() {
-        return "/".to_string();
-    }
-    let mut s = if b.starts_with('/') {
-        b
-    } else {
-        format!("/{b}")
-    };
-    if !s.ends_with('/') {
-        s.push('/');
-    }
-    s
-}
-
-/// 递归拷贝目录 (替代 `rm -rf && cp -R`); 目标存在则先清空, 保留 symlink。
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> Result<(), AppError> {
-    use std::fs;
-    if dst.exists() {
-        fs::remove_dir_all(dst)
-            .map_err(|e| AppError::system(format!("remove old dist {}: {e}", dst.display())))?;
-    }
-    fs::create_dir_all(dst)
-        .map_err(|e| AppError::system(format!("create dist {}: {e}", dst.display())))?;
-    for entry in fs::read_dir(src)
-        .map_err(|e| AppError::system(format!("read dist {}: {e}", src.display())))?
-    {
-        let entry = entry.map_err(|e| AppError::system(format!("read dir entry: {e}")))?;
-        let ft = entry
-            .file_type()
-            .map_err(|e| AppError::system(format!("file type: {e}")))?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if ft.is_dir() {
-            copy_dir_all(&from, &to)?;
-        } else {
-            fs::copy(&from, &to)
-                .map_err(|e| AppError::system(format!("copy {}: {e}", from.display())))?;
-        }
-    }
-    Ok(())
-}
-
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-struct ParseErrorBody {
-    /// 必填校验 (对齐 nuwax buildRoutes projectId 校验; handler 不读, 仅供 serde 强制存在)
-    #[allow(dead_code)]
-    project_id: String,
-    error_message: String,
-}
-
-/// `POST /api/build/parse-build-error` (对齐 nuwax BuildErrorParser)。
-#[utoipa::path(post, path = "/parse-build-error", request_body = ParseErrorBody, responses(crate::openapi::JsonApiResponses), tag = "Build")]
-async fn parse_build_error(
-    State(_state): State<AppState>,
-    Json(body): Json<ParseErrorBody>,
-) -> Result<Json<response::Simple>, AppError> {
-    let msg = crate::service::build_error::parse(&body.error_message);
-    Ok(Json(response::Simple {
-        success: true,
-        message: msg,
-    }))
-}
-
 // ── 日志缓存接口 (对齐 nuwax logCacheManager; Rust 无缓存层, 返回固定 stats) ────
 
 /// `GET /api/build/get-log-cache-stats` (对齐 nuwax logCacheManager.getStats)。
@@ -634,7 +557,7 @@ async fn parse_build_error(
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
-async fn get_log_cache_stats(
+pub(crate) async fn get_log_cache_stats(
     State(state): State<AppState>,
 ) -> Result<Json<response::LogCacheStats>, AppError> {
     let stats = state.log_cache.stats()?;
@@ -664,7 +587,7 @@ async fn get_log_cache_stats(
     responses(crate::openapi::JsonApiResponses),
     tag = "Build"
 )]
-async fn clear_all_log_cache(
+pub(crate) async fn clear_all_log_cache(
     State(state): State<AppState>,
 ) -> Result<Json<response::Simple>, AppError> {
     state.log_cache.clear()?;

@@ -8,11 +8,10 @@ use tokio::fs;
 use crate::error::AppResult;
 
 use super::DYNAMIC_ADD_LOCK;
-use super::helpers::{find_dir, move_dir, temp_sibling};
+use super::helpers::{find_dir, move_dir};
 
 pub struct CreateWorkspaceResult {
     pub message: String,
-    pub workspace_root: String,
     pub updated_skills: Vec<String>,
 }
 
@@ -27,9 +26,10 @@ pub struct CreateWorkspaceResult {
 /// 8. syncAgents
 pub async fn create_workspace(
     workspace: &Path,
-    skill_zip: Option<Vec<u8>>,
+    skill_zip: Option<&Path>,
     skill_urls: Vec<String>,
     hook_config: Option<crate::service::agent_hooks::HookConfigInput>,
+    downloader: Option<&crate::service::skill_download::SkillDownloader>,
 ) -> AppResult<CreateWorkspaceResult> {
     let (skills_dir, agents_dir) = ensure_primary_agent_dirs(workspace).await?;
 
@@ -37,20 +37,23 @@ pub async fn create_workspace(
     let preserved = preserve_locked_skills(&skills_dir, workspace).await?;
 
     // rm + 重建 skills/agents
-    let _ = fs::remove_dir_all(&skills_dir).await;
-    let _ = fs::remove_dir_all(&agents_dir).await;
+    remove_dir_all_if_exists(&skills_dir).await?;
+    remove_dir_all_if_exists(&agents_dir).await?;
     fs::create_dir_all(&skills_dir).await?;
     fs::create_dir_all(&agents_dir).await?;
 
     // 还原保留 skills
     restore_locked_skills(&preserved, &skills_dir).await?;
 
-    // 写入 agent hook 配置 (best-effort: 内部吞错不破坏 workspace 创建, 对齐 nuwax try/catch)
-    let _ = crate::service::agent_hooks::write_agent_hook_configs(
+    // workspace 创建保持 nuwax 的 best-effort 语义，但明确记录 Hook 配置错误。
+    if let Err(error) = crate::service::agent_hooks::write_agent_hook_configs(
         workspace,
         hook_config.unwrap_or_default(),
     )
-    .await;
+    .await
+    {
+        tracing::error!(%error, "agent hook configuration failed; continuing workspace creation");
+    }
 
     let mut updated_skills: Vec<String> = Vec::new();
     let mut updated_dirs: Vec<&str> = Vec::new();
@@ -62,21 +65,19 @@ pub async fn create_workspace(
         crate::service::skills::sync_agents(workspace).await?;
         return Ok(CreateWorkspaceResult {
             message: "Workspace created (no uploaded file, no skills and agents)".to_string(),
-            workspace_root: workspace.to_string_lossy().to_string(),
             updated_skills,
         });
     }
 
-    if let Some(data) = skill_zip {
+    if let Some(source) = skill_zip {
         // 解压到临时目录 (zip 内找 skills/ + agents/)
-        let extract_root = temp_sibling(workspace, "skill_extract");
+        let parent = workspace.parent().unwrap_or(workspace).to_path_buf();
+        let extract_guard =
+            crate::service::temp_file::tempdir_in(parent, ".skill-extract-").await?;
+        let extract_root = extract_guard.path().join("content");
         fs::create_dir_all(&extract_root).await?;
-        let tmp_zip = extract_root.join("src.zip");
-        let extract_res: AppResult<()> = async {
-            fs::write(&tmp_zip, &data).await?;
-            crate::service::zip::extract_to(tmp_zip.clone(), extract_root.clone()).await
-        }
-        .await;
+        let extract_res =
+            crate::service::zip::extract_to(source.to_path_buf(), extract_root.clone()).await;
         match extract_res {
             Ok(()) => {
                 // skills/: 逐子目录移动覆盖
@@ -107,16 +108,16 @@ pub async fn create_workspace(
                 }
             }
             Err(e) => {
-                let _ = fs::remove_dir_all(&extract_root).await;
                 return Err(e);
             }
         }
-        let _ = fs::remove_dir_all(&extract_root).await;
     }
 
     // skillUrls: 逐个下载解压, 集成 skill 目录 (对齐 nuwax createWorkspace skillUrls 循环)
     for url in &skill_urls {
-        match process_skill_url(url, &skills_dir, workspace).await {
+        let downloader = downloader
+            .ok_or_else(|| crate::error::AppError::system("skill downloader is not configured"))?;
+        match process_skill_url(url, &skills_dir, workspace, downloader).await {
             Ok(names) => {
                 if !names.is_empty() {
                     if !updated_dirs.contains(&"skills") {
@@ -145,7 +146,6 @@ pub async fn create_workspace(
 
     Ok(CreateWorkspaceResult {
         message,
-        workspace_root: workspace.to_string_lossy().to_string(),
         updated_skills,
     })
 }
@@ -156,20 +156,18 @@ async fn process_skill_url(
     url: &str,
     skills_dir: &Path,
     workspace: &Path,
+    downloader: &crate::service::skill_download::SkillDownloader,
 ) -> AppResult<Vec<String>> {
-    let data = crate::service::skills::fetch_url(url).await?;
-    let extract_root = temp_sibling(workspace, "skill_url_extract");
+    let downloaded = downloader.download(url).await?;
+    let parent = workspace.parent().unwrap_or(workspace).to_path_buf();
+    let extract_guard =
+        crate::service::temp_file::tempdir_in(parent, ".skill-url-extract-").await?;
+    let extract_root = extract_guard.path().join("content");
     fs::create_dir_all(&extract_root).await?;
-    let tmp_zip = extract_root.join("src.zip");
-    let extract_res: AppResult<()> = async {
-        fs::write(&tmp_zip, &data).await?;
-        crate::service::zip::extract_to(tmp_zip.clone(), extract_root.clone()).await
-    }
-    .await;
-    if let Err(e) = extract_res {
-        let _ = fs::remove_dir_all(&extract_root).await;
-        return Err(e);
-    }
+    let extract_res =
+        crate::service::zip::extract_to(downloaded.path().to_path_buf(), extract_root.clone())
+            .await;
+    extract_res?;
     // 候选 skill 目录: 优先 skills/ 子目录, 否则顶层非隐藏目录 (对齐 nuwax)
     let skills_sub = extract_root.join("skills");
     let base = if skills_sub.is_dir() {
@@ -197,7 +195,6 @@ async fn process_skill_url(
         move_dir(&src, &dst).await?;
         updated.push(name);
     }
-    let _ = fs::remove_dir_all(&extract_root).await;
     Ok(updated)
 }
 
@@ -212,15 +209,23 @@ async fn ensure_primary_agent_dirs(workspace: &Path) -> AppResult<(PathBuf, Path
     Ok((skills_dir, agents_dir))
 }
 
+async fn remove_dir_all_if_exists(path: &Path) -> AppResult<()> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// 把含 `.dynamic_add.lock` 的 skill 子目录移到临时区保留 (对齐 nuwax hasDynamicAddLock)。
 /// 返回 (临时目录, 保留的 skill 名列表)。
 async fn preserve_locked_skills(
     skills_dir: &Path,
     workspace: &Path,
-) -> AppResult<(PathBuf, Vec<String>)> {
+) -> AppResult<(Option<tempfile::TempDir>, Vec<String>)> {
     let preserved: Vec<String> = Vec::new();
-    if !fs::try_exists(skills_dir).await.unwrap_or(false) {
-        return Ok((PathBuf::new(), preserved));
+    if !fs::try_exists(skills_dir).await? {
+        return Ok((None, preserved));
     }
     let mut to_preserve: Vec<String> = Vec::new();
     let mut rd = fs::read_dir(skills_dir).await?;
@@ -231,35 +236,38 @@ async fn preserve_locked_skills(
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let lock = skills_dir.join(&name).join(DYNAMIC_ADD_LOCK);
-        if fs::try_exists(&lock).await.unwrap_or(false) {
+        if fs::try_exists(&lock).await? {
             to_preserve.push(name);
         }
     }
     if to_preserve.is_empty() {
-        return Ok((PathBuf::new(), Vec::new()));
+        return Ok((None, Vec::new()));
     }
-    let temp = temp_sibling(workspace, "preserved_skills");
-    fs::create_dir_all(&temp).await?;
+    let parent = workspace.parent().unwrap_or(workspace).to_path_buf();
+    let guard = crate::service::temp_file::tempdir_in(parent, ".preserved-skills-").await?;
+    let temp = guard.path();
     for name in &to_preserve {
         move_dir(&skills_dir.join(name), &temp.join(name)).await?;
     }
-    Ok((temp, to_preserve))
+    Ok((Some(guard), to_preserve))
 }
 
 /// 还原保留的 skill 子目录。
 async fn restore_locked_skills(
-    preserved: &(PathBuf, Vec<String>),
+    preserved: &(Option<tempfile::TempDir>, Vec<String>),
     skills_dir: &Path,
 ) -> AppResult<()> {
-    let (temp, names) = preserved;
-    if temp.as_os_str().is_empty() || names.is_empty() {
+    let (guard, names) = preserved;
+    let Some(temp) = guard.as_ref().map(tempfile::TempDir::path) else {
+        return Ok(());
+    };
+    if names.is_empty() {
         return Ok(());
     }
     fs::create_dir_all(skills_dir).await?;
     for name in names {
         move_dir(&temp.join(name), &skills_dir.join(name)).await?;
     }
-    let _ = fs::remove_dir_all(temp).await;
     Ok(())
 }
 
@@ -272,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn create_workspace_writes_agents_skills() {
         let tmp = std::env::temp_dir().join(format!("fs_cw_{}", now_nanos()));
-        let res = create_workspace(&tmp, None, Vec::new(), None)
+        let res = create_workspace(&tmp, None, Vec::new(), None, None)
             .await
             .unwrap();
         assert!(tmp.join(".agents").join("skills").is_dir());

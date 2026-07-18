@@ -63,7 +63,8 @@ pub async fn restore_from_zip(
 }
 
 /// 清空目录内容, 但保留名字命中 exclude_dirs (目录) / exclude_files (文件) 的顶层条目
-/// (对齐 nuwax restoreProjectFromZip 的 "keep excluded" 清理)。个别删除失败忽略。
+/// (对齐 nuwax restoreProjectFromZip 的 "keep excluded" 清理)。
+/// 删除失败必须中止恢复，避免旧文件残留后继续覆盖成混合版本。
 async fn clear_dir_keep_excluded(
     dir: &Path,
     exclude_dirs: &[String],
@@ -80,11 +81,17 @@ async fn clear_dir_keep_excluded(
             continue;
         }
         let path = entry.path();
-        let _ = if ft.is_dir() {
+        if ft.is_dir() {
             fs::remove_dir_all(&path).await
         } else {
             fs::remove_file(&path).await
-        };
+        }
+        .map_err(|error| {
+            AppError::system(format!(
+                "clear project entry before restore {}: {error}",
+                path.display()
+            ))
+        })?;
     }
     Ok(())
 }
@@ -107,7 +114,7 @@ pub async fn backup_current_version(
     if project_id.is_empty() {
         return Err(AppError::validation("Project ID cannot be empty"));
     }
-    let project_path = resolver.resolve_project(ctx);
+    let project_path = resolver.resolve_project(ctx)?;
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
@@ -146,7 +153,7 @@ pub async fn rollback_version(
             "rollbackTo must be less than codeVersion",
         ));
     }
-    let project_path = resolver.resolve_project(ctx);
+    let project_path = resolver.resolve_project(ctx)?;
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
@@ -172,13 +179,18 @@ pub async fn rollback_version(
     {
         if crate::service::fs_util::path_exists(&cur_zip).await? {
             tracing::warn!(error = %e, "rollback restore failed, restoring current version backup");
-            let _ = restore_from_zip(
+            if let Err(restore_error) = restore_from_zip(
                 &project_path,
                 &cur_zip,
                 &config.traverse_exclude_dirs,
                 &config.backup_traverse_exclude_files,
             )
-            .await;
+            .await
+            {
+                return Err(AppError::system(format!(
+                    "rollback to v{to} failed: {e}; restoring current version v{cur} also failed: {restore_error}"
+                )));
+            }
         }
         return Err(e);
     }
@@ -204,31 +216,59 @@ pub async fn get_content_by_version(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     let version = parse_version(code_version)?;
-    let project_path = resolver.resolve_project(ctx);
+    let project_path = resolver.resolve_project(ctx)?;
     let zip = version_zip_path(config, project_id, version);
     if !crate::service::fs_util::path_exists(&zip).await? {
         return Err(AppError::resource(format!(
             "Version v{version} zip not found"
         )));
     }
-    // 临时解压目录: project 父目录下 _his/{projectId}
-    let his_dir = match project_path.parent() {
-        Some(p) => p.join("_his").join(project_id),
+    // 每次请求使用独立临时目录，避免并发读取同一版本时互相清理。
+    let history_root = match project_path.parent() {
+        Some(parent) => parent.join("_his"),
         None => return Err(AppError::system("invalid project path")),
     };
-    let _ = fs::remove_dir_all(&his_dir).await;
-    crate::service::zip::extract_to(zip, his_dir.clone()).await?;
+    fs::create_dir_all(&history_root).await?;
+    let history_temp = create_history_temp_dir(history_root).await?;
+    let his_dir = history_temp.path().to_path_buf();
 
-    // 遍历 (无论成败都清理临时目录)
-    let mut files_result = crate::service::tree::list_files(&his_dir, config, proxy_path).await;
-    let _ = fs::remove_dir_all(&his_dir).await;
+    // 解压与遍历结束后显式异步清理；TempDir 同时作为异常路径的 RAII 兜底。
+    let mut files_result: AppResult<Vec<crate::service::tree::FileEntry>> = async {
+        crate::service::zip::extract_to(zip, his_dir.clone()).await?;
+        crate::service::tree::list_files(&his_dir, config, proxy_path).await
+    }
+    .await;
+    let cleanup_result = fs::remove_dir_all(&his_dir).await;
     // command != "cpage_config" 时过滤 cpage_config.json (对齐 nuwax getContentUtils)
     if let Ok(files) = files_result.as_mut()
         && command != Some("cpage_config")
     {
         files.retain(|f| f.name != "cpage_config.json");
     }
-    files_result
+    match (files_result, cleanup_result) {
+        (Ok(files), Ok(())) => Ok(files),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(AppError::system(format!(
+            "remove history temporary directory {}: {error}",
+            his_dir.display()
+        ))),
+    }
+}
+
+async fn create_history_temp_dir(parent: PathBuf) -> AppResult<tempfile::TempDir> {
+    tokio::task::spawn_blocking(move || {
+        tempfile::Builder::new()
+            .prefix("file-server-version-")
+            .tempdir_in(&parent)
+            .map_err(|error| {
+                AppError::system(format!(
+                    "create history temporary directory in {}: {error}",
+                    parent.display()
+                ))
+            })
+    })
+    .await
+    .map_err(|error| AppError::system(format!("history tempdir task failed: {error}")))?
 }
 
 #[cfg(test)]

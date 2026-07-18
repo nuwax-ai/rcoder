@@ -1,6 +1,4 @@
-//! computer 打包下载路由: zip-workspace / download-all-files + zip 响应辅助。
-
-use std::path::PathBuf;
+//! computer 打包下载 handlers: zip-workspace / download-all-files + zip 响应辅助。
 
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode};
@@ -10,36 +8,40 @@ use serde::Deserialize;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::service::temp_file::{TemporaryFile, TemporaryFileWriter};
 use crate::service::zip;
 
 use super::{UserCidQuery, resolve_computer_target, ws_path};
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ZipBody {
+pub(crate) struct ZipBody {
     user_id: String,
     c_id: String,
     #[serde(default)]
     exclude_dirs: Option<Vec<String>>,
 }
 
-/// 临时 zip 路径 (基于 user/cid + 纳秒, 避免并发冲突)。
-fn computer_tmp_zip(user_id: &str, cid: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("computer-{user_id}-{cid}-{nanos}.zip"))
+async fn computer_tmp_zip(state: &AppState) -> Result<TemporaryFile, AppError> {
+    TemporaryFileWriter::create(
+        &state.config.upload_project_dir.join("temp"),
+        "computer-download-",
+        u64::MAX,
+    )
+    .await?
+    .finish()
+    .await
 }
 
 /// zip 下载响应头: Content-Type + UTF-8 Content-Disposition (对齐 nuwax `filename` + `filename*`)。
-fn zip_response(filename: &str, bytes: Vec<u8>) -> Response {
+async fn zip_response(filename: &str, archive: TemporaryFile) -> Result<Response, AppError> {
     let disposition = format!(
         "attachment; filename=\"{}\"; filename*=UTF-8''{}",
         filename,
         utf8_percent_encode(filename)
     );
-    (
+    let body = archive.into_body().await?;
+    Ok((
         StatusCode::OK,
         [
             (
@@ -52,9 +54,9 @@ fn zip_response(filename: &str, bytes: Vec<u8>) -> Response {
                     .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
             ),
         ],
-        bytes,
+        body,
     )
-        .into_response()
+        .into_response())
 }
 
 /// 文件名 RFC 5987 百分号编码 (仅 [A-Za-z0-9-._~] 不编码)。
@@ -84,15 +86,15 @@ fn utf8_percent_encode(s: &str) -> String {
     ),
     tag = "Computer"
 )]
-pub(super) async fn zip_workspace(
+pub(crate) async fn zip_workspace(
     State(state): State<AppState>,
     Json(body): Json<ZipBody>,
 ) -> Result<Response, AppError> {
-    let src = ws_path(&state, &body.user_id, &body.c_id);
+    let src = ws_path(&state, &body.user_id, &body.c_id)?;
     if !src.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
-    let tmp = computer_tmp_zip(&body.user_id, &body.c_id);
+    let tmp = computer_tmp_zip(&state).await?;
     // mandatory(ZIP_WORKSPACE_EXCLUDE) ∪ extra(调用方 excludeDirs); 同时填 dirs 与 files,
     // 等价 nuwax archive.directory 的 "任一路径段命中集合则跳过" (对目录与文件同集合)。
     let merged: Vec<String> = state
@@ -110,11 +112,9 @@ pub(super) async fn zip_workspace(
         skip_hardlinks: false,
         path_prefix: None,
     };
-    zip::pack_with_opts(src, tmp.clone(), opts).await?;
-    let bytes = tokio::fs::read(&tmp).await?;
-    let _ = tokio::fs::remove_file(&tmp).await;
+    zip::pack_with_opts(src, tmp.path().to_path_buf(), opts).await?;
     let filename = format!("{}_{}.zip", body.user_id, body.c_id);
-    Ok(zip_response(&filename, bytes))
+    zip_response(&filename, tmp).await
 }
 
 /// `GET /api/computer/download-all-files` (对齐 nuwax downloadAllFiles):
@@ -129,21 +129,19 @@ pub(super) async fn zip_workspace(
     ),
     tag = "Computer"
 )]
-pub(super) async fn download_all_files(
+pub(crate) async fn download_all_files(
     State(state): State<AppState>,
     Query(q): Query<UserCidQuery>,
 ) -> Result<Response, AppError> {
-    let src = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref());
+    let src = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())?;
     let prefix = format!("{}_{}/", q.user_id, q.c_id);
     let filename = format!("{}_{}.zip", q.user_id, q.c_id);
-    let tmp = computer_tmp_zip(&q.user_id, &q.c_id);
+    let tmp = computer_tmp_zip(&state).await?;
 
     // 工作区不存在 → 空 zip 兜底 (仅含顶层目录条目, 对齐 nuwax)
     if !src.exists() {
-        zip::write_empty_zip(tmp.clone(), prefix.clone()).await?;
-        let bytes = tokio::fs::read(&tmp).await?;
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Ok(zip_response(&filename, bytes));
+        zip::write_empty_zip(tmp.path().to_path_buf(), prefix.clone()).await?;
+        return zip_response(&filename, tmp).await;
     }
 
     // 过滤对齐 nuwax downloadAllFiles: excludeDirs=TRAVERSE_EXCLUDE_DIRS,
@@ -173,10 +171,8 @@ pub(super) async fn download_all_files(
         )));
     }
 
-    zip::pack_download(src, tmp.clone(), opts).await?;
-    let bytes = tokio::fs::read(&tmp).await?;
-    let _ = tokio::fs::remove_file(&tmp).await;
-    Ok(zip_response(&filename, bytes))
+    zip::pack_download(src, tmp.path().to_path_buf(), opts).await?;
+    zip_response(&filename, tmp).await
 }
 
 #[cfg(test)]

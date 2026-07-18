@@ -1,11 +1,11 @@
-//! project 增删改/上传路由: delete / create / copy / upload-single / upload-batch /
+//! project 增删改/上传 handlers: delete / create / copy / upload-single / upload-batch /
 //! upload-attachment / upload-project / push-skills。
 
 use axum::extract::State;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{bytes_field, ctx_from, text_field, validate_zip_ext};
+use super::{ctx_from, file_field, text_field, validate_zip_ext};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
@@ -86,7 +86,7 @@ pub struct PushProjectSkillsForm {
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct DeleteParams {
+pub(crate) struct DeleteParams {
     pub project_id: String,
     #[serde(default)]
     pub pid: Option<String>,
@@ -103,7 +103,7 @@ pub(super) struct DeleteParams {
     responses(crate::openapi::JsonApiResponses),
     tag = "Project"
 )]
-pub(super) async fn delete_project(
+pub(crate) async fn delete_project(
     State(state): State<AppState>,
     Query(params): Query<DeleteParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -149,7 +149,9 @@ pub(super) async fn delete_project(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct CreateProjectBody {
+pub(crate) struct CreateProjectBody {
+    #[serde(default)]
+    #[schema(required = true)]
     pub project_id: String,
     pub template_type: Option<String>,
     pub tenant_id: Option<String>,
@@ -159,13 +161,16 @@ pub(super) struct CreateProjectBody {
 
 /// `POST /api/project/create-project`
 #[utoipa::path(post, path = "/create-project", request_body = CreateProjectBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
-pub(super) async fn create_project(
+pub(crate) async fn create_project(
     State(state): State<AppState>,
     Json(body): Json<CreateProjectBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project_id = body.project_id.trim().to_string();
     if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
+        return Err(AppError::validation_with(
+            "Project ID cannot be empty",
+            json!({ "field": "projectId" }),
+        ));
     }
     let template_type = body.template_type.as_deref().unwrap_or("react").to_string();
     let ctx = ctx_from(
@@ -188,7 +193,7 @@ pub(super) async fn create_project(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct CopyProjectBody {
+pub(crate) struct CopyProjectBody {
     pub source_project_id: String,
     pub target_project_id: String,
     #[serde(default)]
@@ -213,7 +218,7 @@ pub(super) struct CopyProjectBody {
 
 /// `POST /api/project/copy-project` (源/目标各自隔离上下文, 缺省回退公共字段)
 #[utoipa::path(post, path = "/copy-project", request_body = CopyProjectBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
-pub(super) async fn copy_project(
+pub(crate) async fn copy_project(
     State(state): State<AppState>,
     Json(body): Json<CopyProjectBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -257,14 +262,14 @@ pub(super) async fn copy_project(
 
 /// `POST /api/project/upload-single-file`
 #[utoipa::path(post, path = "/upload-single-file", request_body(content = UploadSingleFileForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Code")]
-pub(super) async fn upload_single_file(
+pub(crate) async fn upload_single_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut project_id = None;
     let mut code_version = None;
     let mut file_path = None;
-    let mut data: Option<Vec<u8>> = None;
+    let mut data = None;
     let mut tenant = None;
     let mut space = None;
     let mut iso = None;
@@ -279,7 +284,14 @@ pub(super) async fn upload_single_file(
             "codeVersion" => code_version = Some(text_field(field).await?),
             "filePath" => file_path = Some(text_field(field).await?),
             "file" => {
-                data = Some(bytes_field(field, state.config.upload_single_file_size_bytes).await?)
+                data = Some(
+                    file_field(
+                        field,
+                        state.config.upload_max_file_size_bytes,
+                        &state.config.upload_project_dir.join("temp"),
+                    )
+                    .await?,
+                )
             }
             "tenantId" => tenant = Some(text_field(field).await?),
             "spaceId" => space = Some(text_field(field).await?),
@@ -299,7 +311,7 @@ pub(super) async fn upload_single_file(
         &state.config,
         &ctx,
         &file_path,
-        data,
+        data.path(),
         &code_version,
     )
     .await?;
@@ -315,14 +327,14 @@ pub(super) async fn upload_single_file(
 
 /// `POST /api/project/upload-batch-files`
 #[utoipa::path(post, path = "/upload-batch-files", request_body(content = UploadBatchFilesForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Code")]
-pub(super) async fn upload_batch_files(
+pub(crate) async fn upload_batch_files(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut project_id = None;
     let mut code_version = None;
     let mut file_paths: Vec<String> = Vec::new();
-    let mut files_vec: Vec<Vec<u8>> = Vec::new();
+    let mut files_vec = Vec::new();
     let mut tenant = None;
     let mut space = None;
     let mut iso = None;
@@ -336,8 +348,14 @@ pub(super) async fn upload_batch_files(
             "projectId" => project_id = Some(text_field(field).await?),
             "codeVersion" => code_version = Some(text_field(field).await?),
             "filePaths" => file_paths.push(text_field(field).await?),
-            "files" => files_vec
-                .push(bytes_field(field, state.config.upload_single_file_size_bytes).await?),
+            "files" => files_vec.push(
+                file_field(
+                    field,
+                    state.config.upload_max_file_size_bytes,
+                    &state.config.upload_project_dir.join("temp"),
+                )
+                .await?,
+            ),
             "tenantId" => tenant = Some(text_field(field).await?),
             "spaceId" => space = Some(text_field(field).await?),
             "isolationType" => iso = Some(text_field(field).await?),
@@ -350,7 +368,10 @@ pub(super) async fn upload_batch_files(
     if file_paths.len() != files_vec.len() {
         return Err(AppError::validation("filePaths and files count mismatch"));
     }
-    let pairs: Vec<(String, Vec<u8>)> = file_paths.into_iter().zip(files_vec).collect();
+    let pairs: Vec<(String, std::path::PathBuf)> = file_paths
+        .into_iter()
+        .zip(files_vec.iter().map(|file| file.path().to_path_buf()))
+        .collect();
     let ctx = ctx_from(project_id.trim(), tenant, space, iso);
     let written = upload_service::upload_batch_files(
         &*state.resolver,
@@ -375,13 +396,13 @@ pub(super) async fn upload_batch_files(
 
 /// `POST /api/project/upload-attachment-file`
 #[utoipa::path(post, path = "/upload-attachment-file", request_body(content = UploadAttachmentForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Project")]
-pub(super) async fn upload_attachment_file(
+pub(crate) async fn upload_attachment_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut project_id = None;
     let mut file_name = None;
-    let mut data: Option<Vec<u8>> = None;
+    let mut data = None;
     let mut original_name = None;
     let mut tenant = None;
     let mut space = None;
@@ -397,7 +418,14 @@ pub(super) async fn upload_attachment_file(
             "fileName" => file_name = Some(text_field(field).await?),
             "file" => {
                 original_name = field.file_name().map(|s| s.to_string());
-                data = Some(bytes_field(field, state.config.upload_single_file_size_bytes).await?);
+                data = Some(
+                    file_field(
+                        field,
+                        state.config.upload_max_file_size_bytes,
+                        &state.config.upload_project_dir.join("temp"),
+                    )
+                    .await?,
+                );
             }
             "tenantId" => tenant = Some(text_field(field).await?),
             "spaceId" => space = Some(text_field(field).await?),
@@ -408,12 +436,6 @@ pub(super) async fn upload_attachment_file(
     let project_id = project_id.ok_or_else(|| AppError::validation("projectId is required"))?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     let original = original_name.unwrap_or_else(|| "attachment".to_string());
-    if data.len() as u64 > state.config.upload_single_file_size_bytes {
-        return Err(AppError::validation(format!(
-            "attachment exceeds maximum size of {} bytes",
-            state.config.upload_single_file_size_bytes
-        )));
-    }
     let effective_name = file_name.as_deref().unwrap_or(&original);
     let extension = std::path::Path::new(effective_name)
         .extension()
@@ -436,7 +458,7 @@ pub(super) async fn upload_attachment_file(
         &ctx,
         file_name.as_deref(),
         &original,
-        data,
+        data.path(),
     )
     .await?;
     Ok(Json(json!({
@@ -450,13 +472,13 @@ pub(super) async fn upload_attachment_file(
 
 /// `POST /api/project/upload-project` (上传 zip 覆盖项目)
 #[utoipa::path(post, path = "/upload-project", request_body(content = UploadProjectForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Project")]
-pub(super) async fn upload_project(
+pub(crate) async fn upload_project(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut project_id = None;
     let mut code_version = None;
-    let mut data: Option<Vec<u8>> = None;
+    let mut data = None;
     let mut file_name = None;
     let mut pid = None;
     let mut tenant = None;
@@ -473,7 +495,14 @@ pub(super) async fn upload_project(
             "codeVersion" => code_version = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                data = Some(bytes_field(field, state.config.upload_max_file_size_bytes).await?);
+                data = Some(
+                    file_field(
+                        field,
+                        state.config.upload_max_file_size_bytes,
+                        &state.config.upload_project_dir.join("temp"),
+                    )
+                    .await?,
+                );
             }
             "pid" => pid = text_field(field).await.ok(),
             "tenantId" => tenant = Some(text_field(field).await?),
@@ -488,21 +517,20 @@ pub(super) async fn upload_project(
     let data = data.ok_or_else(|| AppError::validation("Please upload a zip file"))?;
     // 扩展名 (仅 zip) + 大小上限校验 (对齐 nuwax multer fileFilter/limits)
     validate_zip_ext(file_name.as_deref())?;
-    if data.len() as u64 > state.config.upload_max_file_size_bytes {
-        return Err(AppError::validation(format!(
-            "File size exceeds limit (max {} bytes)",
-            state.config.upload_max_file_size_bytes
-        )));
-    }
     // 停旧版 dev server (对齐 nuwax: pid 可用时 stopDevServer, 失败不阻塞)
     if let Some(p) = pid.as_deref().and_then(|s| s.trim().parse::<u32>().ok()) {
         tracing::debug!(project_id = %project_id, pid = p, "upload-project: stop old dev server");
         let _ = state.dev_server.stop_dev(project_id.trim()).await;
     }
     let ctx = ctx_from(project_id.trim(), tenant, space, iso);
-    let result =
-        project_service::upload_project(&*state.resolver, &state.config, &ctx, &code_version, data)
-            .await?;
+    let result = project_service::upload_project(
+        &*state.resolver,
+        &state.config,
+        &ctx,
+        &code_version,
+        data.path(),
+    )
+    .await?;
     Ok(Json(json!({
         "success": true,
         "message": format!("Project {} uploaded successfully", result.project_id),
@@ -515,12 +543,12 @@ pub(super) async fn upload_project(
 
 /// `POST /api/project/push-skills-to-workspace`
 #[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = PushProjectSkillsForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Project")]
-pub(super) async fn push_skills_to_workspace(
+pub(crate) async fn push_skills_to_workspace(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut project_id = None;
-    let mut zip_data: Option<Vec<u8>> = None;
+    let mut zip_data = None;
     let mut skill_urls: Vec<String> = Vec::new();
     let mut tenant = None;
     let mut space = None;
@@ -534,7 +562,14 @@ pub(super) async fn push_skills_to_workspace(
         match name.as_str() {
             "projectId" => project_id = Some(text_field(field).await?),
             "file" => {
-                zip_data = Some(bytes_field(field, state.config.upload_max_file_size_bytes).await?)
+                zip_data = Some(
+                    file_field(
+                        field,
+                        state.config.upload_max_file_size_bytes,
+                        &state.config.upload_project_dir.join("temp"),
+                    )
+                    .await?,
+                )
             }
             "skillUrls" => {
                 let t = text_field(field).await?;
@@ -552,8 +587,18 @@ pub(super) async fn push_skills_to_workspace(
         }
     }
     let project_id = project_id.ok_or_else(|| AppError::validation("projectId is required"))?;
+    state
+        .skill_downloader
+        .validate_url_count(skill_urls.len())?;
     let ctx = ctx_from(project_id.trim(), tenant, space, iso);
-    let result = skills_service::push_skills(&*state.resolver, &ctx, zip_data, skill_urls).await?;
+    let result = skills_service::push_skills(
+        &*state.resolver,
+        &ctx,
+        zip_data.as_ref().map(|file| file.path()),
+        skill_urls,
+        &state.skill_downloader,
+    )
+    .await?;
     Ok(Json(json!({
         "success": true,
         "message": "Skills pushed to workspace",

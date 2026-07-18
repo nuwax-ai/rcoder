@@ -1,4 +1,4 @@
-//! project 内容读取路由: get-project-content / get-project-content-by-version。
+//! project 内容读取 handlers: get-project-content / get-project-content-by-version。
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -16,7 +16,7 @@ use crate::workspace::ProjectContext;
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct GetContentParams {
+pub(crate) struct GetContentParams {
     pub project_id: String,
     pub command: Option<String>,
     pub proxy_path: Option<String>,
@@ -33,7 +33,7 @@ pub(super) struct GetContentParams {
     responses(crate::openapi::JsonApiResponses),
     tag = "Project"
 )]
-pub(super) async fn get_project_content(
+pub(crate) async fn get_project_content(
     State(state): State<AppState>,
     Query(params): Query<GetContentParams>,
 ) -> Response {
@@ -47,7 +47,10 @@ pub(super) async fn get_project_content(
         space_id: params.space_id.clone(),
         isolation_type: params.isolation_type.clone(),
     };
-    let project_path = state.resolver.resolve_project(&ctx);
+    let project_path = match state.resolver.resolve_project(&ctx) {
+        Ok(path) => path,
+        Err(error) => return error.into_response(),
+    };
 
     match crate::service::fs_util::path_exists(&project_path).await {
         Ok(true) => {}
@@ -81,7 +84,7 @@ pub(super) async fn get_project_content(
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct GetByVersionParams {
+pub(crate) struct GetByVersionParams {
     pub project_id: String,
     pub code_version: String,
     pub proxy_path: Option<String>,
@@ -103,7 +106,7 @@ pub(super) struct GetByVersionParams {
     responses(crate::openapi::JsonApiResponses),
     tag = "Project"
 )]
-pub(super) async fn get_project_content_by_version(
+pub(crate) async fn get_project_content_by_version(
     State(state): State<AppState>,
     Query(params): Query<GetByVersionParams>,
 ) -> Response {

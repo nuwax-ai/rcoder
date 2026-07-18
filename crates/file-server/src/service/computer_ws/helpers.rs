@@ -1,4 +1,4 @@
-//! computer_ws 共享 helper: 目录移动 / 临时目录命名 / find_dir / now_nanos /
+//! computer_ws 共享 helper: 目录移动 / find_dir / 测试夹具命名 /
 //! remove_top_level_dir (单顶层目录上提)。
 
 use std::path::{Path, PathBuf};
@@ -34,19 +34,15 @@ pub async fn remove_top_level_dir(dir: &Path, extra_excludes: &[&str]) -> AppRes
         return Ok(());
     }
     // 唯一顶层目录内容上提: rename 到临时名, 再逐项 rename 回 dir
-    let staging = dir.join(format!(".toplift_{}", now_nanos()));
+    let parent = dir.parent().unwrap_or(dir).to_path_buf();
+    let staging_guard = crate::service::temp_file::tempdir_in(parent, ".toplift-").await?;
+    let staging = staging_guard.path().join("content");
     move_dir(&only, &staging).await?;
     let mut rd = fs::read_dir(&staging).await?;
     while let Some(child) = rd.next_entry().await? {
         let name = child.file_name();
         move_dir(&child.path(), &dir.join(&name)).await?;
     }
-    fs::remove_dir_all(&staging).await.map_err(|error| {
-        AppError::system(format!(
-            "remove top-level staging directory {}: {error}",
-            staging.display()
-        ))
-    })?;
     Ok(())
 }
 
@@ -80,12 +76,6 @@ pub(super) async fn move_dir(src: &Path, dst: &Path) -> AppResult<()> {
     Ok(())
 }
 
-/// 在 base 的父(或自身)目录下建临时目录名 (尽量同设备, 便于 rename)。
-pub(super) fn temp_sibling(base: &Path, prefix: &str) -> PathBuf {
-    let parent = base.parent().unwrap_or_else(|| Path::new("/tmp"));
-    parent.join(format!(".{prefix}_{}", now_nanos()))
-}
-
 /// 在 root 下查找 `name` 目录: 优先 root/name, 再查一层子目录 name/ (对齐 nuwax findDir)。
 pub(super) fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
     let direct = root.join(name);
@@ -104,6 +94,7 @@ pub(super) fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// 当前时间纳秒 (仅用于生成唯一临时名; 避免直接 `new Date`)。
+#[cfg(test)]
 pub(super) fn now_nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

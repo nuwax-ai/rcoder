@@ -12,4 +12,4 @@ mod types;
 pub use all_files::{AllResult, all_files_update, apply_all_files};
 pub use codec::{decode_uri_component, encode_uri_component};
 pub use specified::{ModifyStrategy, SpecifiedResult, apply_file_ops, specified_files_update};
-pub use types::{FileEntry, FileOp};
+pub use types::{FileEntry, FileOp, FileOperation};

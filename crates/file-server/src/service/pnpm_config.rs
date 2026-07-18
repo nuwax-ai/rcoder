@@ -66,7 +66,7 @@ pub(crate) async fn create_pnpm_npmrc(project_dir: &Path) -> AppResult<()> {
                 .filter(|s| !s.is_empty())
         });
     // 已存在且最优 → 跳过 (对齐 nuwax: method=copy 且 store-dir 匹配)
-    if let Ok(existing) = fs::read_to_string(&npmrc_path).await
+    if let Some(existing) = read_optional_text(&npmrc_path).await?
         && npmrc_optimal(&existing, store_dir.as_deref())
     {
         return Ok(());
@@ -134,9 +134,8 @@ async fn sanitize_pnpm_built_dependencies_config(project_dir: &Path) -> AppResul
 /// 非法 JSON / 无 pnpm 对象 → no-op。
 async fn sanitize_package_json_built_deps(project_dir: &Path) -> AppResult<()> {
     let pkg_path = project_dir.join("package.json");
-    let raw = match fs::read_to_string(&pkg_path).await {
-        Ok(s) => s,
-        Err(_) => return Ok(()),
+    let Some(raw) = read_optional_text(&pkg_path).await? else {
+        return Ok(());
     };
     let Ok(mut pkg) = serde_json::from_str::<Value>(&raw) else {
         tracing::warn!(path = %pkg_path.display(), "skip sanitize package.json: invalid JSON");
@@ -170,13 +169,13 @@ async fn sanitize_package_json_built_deps(project_dir: &Path) -> AppResult<()> {
     Ok(())
 }
 
-/// 从 pnpm-workspace.yaml 行级移除互斥键及其块值 (对齐 nuwax sanitizePnpmWorkspaceBuiltDepsConfig)。
-/// 匹配 `^key:\s*(.*)$`; 值为空 / `|` / `>` 时连同其后更深缩进行一并删除。
+/// 从 pnpm-workspace.yaml 行级移除顶层互斥键及其块值。
+/// 匹配顶层 `key:\s*(.*)`；值为空 / `|` / `>` 时连同其后更深缩进行一并删除。
+/// pnpm 的这些配置只允许位于文档顶层，限制缩进可避免误删嵌套对象中的同名业务键。
 async fn sanitize_pnpm_workspace_built_deps(project_dir: &Path) -> AppResult<()> {
     let yaml_path = project_dir.join("pnpm-workspace.yaml");
-    let content = match fs::read_to_string(&yaml_path).await {
-        Ok(s) => s,
-        Err(_) => return Ok(()),
+    let Some(content) = read_optional_text(&yaml_path).await? else {
+        return Ok(());
     };
     let mut result: Vec<&str> = Vec::new();
     let mut skip_until_indent: Option<usize> = None;
@@ -184,7 +183,9 @@ async fn sanitize_pnpm_workspace_built_deps(project_dir: &Path) -> AppResult<()>
     for line in content.split('\n') {
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
-        if let Some(key) = match_built_deps_key(trimmed) {
+        if indent == 0
+            && let Some(key) = match_built_deps_key(trimmed)
+        {
             removed.push(key);
             let inline = trimmed[key.len() + 1..].trim();
             if inline.is_empty() || inline == "|" || inline == ">" {
@@ -229,9 +230,8 @@ fn match_built_deps_key(trimmed_line: &str) -> Option<&'static str> {
 /// 从 .npmrc 移除 kebab-case built-deps 行 (对齐 nuwax sanitizeNpmrcBuiltDepsConfig)。
 /// 返回过滤后内容; 文件不存在 → no-op。
 async fn sanitize_npmrc_built_deps(npmrc_path: &Path) -> AppResult<String> {
-    let content = match fs::read_to_string(npmrc_path).await {
-        Ok(s) => s,
-        Err(_) => return Ok(String::new()),
+    let Some(content) = read_optional_text(npmrc_path).await? else {
+        return Ok(String::new());
     };
     let filtered: String = content
         .split('\n')
@@ -301,6 +301,18 @@ fn is_built_deps_npmrc_line(line: &str) -> bool {
                 .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
         })
     })
+}
+
+/// 读取可选配置文件：不存在是正常分支，其他 I/O 错误交给上层记录或处理。
+async fn read_optional_text(path: &Path) -> AppResult<Option<String>> {
+    match fs::read_to_string(path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::system(format!(
+            "read config file {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 // ── 辅助: 文件系统类型 / CST 时间 (仅 .npmrc 注释, 非功能性) ────────────────────
@@ -398,5 +410,28 @@ mod tests {
             "dangerously-allow-all-builds"
         ));
         assert!(!contains_config_key("registry=https://x\n", "production"));
+    }
+
+    #[tokio::test]
+    async fn workspace_sanitize_only_removes_top_level_keys() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let path = dir.path().join("pnpm-workspace.yaml");
+        fs::write(
+            &path,
+            "packages:\n  - apps/*\nmetadata:\n  onlyBuiltDependencies:\n    - keep-me\nonlyBuiltDependencies:\n  - esbuild\nignoredBuiltDependencies: [sharp]\n",
+        )
+        .await
+        .expect("write test workspace file");
+
+        sanitize_pnpm_workspace_built_deps(dir.path())
+            .await
+            .expect("sanitize workspace file");
+
+        let output = fs::read_to_string(path)
+            .await
+            .expect("read sanitized workspace file");
+        assert!(output.contains("  onlyBuiltDependencies:\n    - keep-me"));
+        assert!(!output.contains("\nonlyBuiltDependencies:"));
+        assert!(!output.contains("ignoredBuiltDependencies:"));
     }
 }

@@ -1,4 +1,4 @@
-//! git 读路由: branches / tags / log / file-content / status。
+//! git 读 handlers: branches / tags / log / file-content / status。
 
 use axum::extract::State;
 use serde::Deserialize;
@@ -18,7 +18,7 @@ use crate::service::git;
     responses(crate::openapi::JsonApiResponses),
     tag = "Git"
 )]
-pub(super) async fn branches(
+pub(crate) async fn branches(
     State(state): State<AppState>,
     Query(q): Query<GitQuery>,
 ) -> Result<Json<Value>, AppError> {
@@ -57,7 +57,7 @@ pub(super) async fn branches(
     responses(crate::openapi::JsonApiResponses),
     tag = "Git"
 )]
-pub(super) async fn tags(
+pub(crate) async fn tags(
     State(state): State<AppState>,
     Query(q): Query<GitQuery>,
 ) -> Result<Json<Value>, AppError> {
@@ -80,7 +80,7 @@ pub(super) async fn tags(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct GitLogQuery {
+pub(crate) struct GitLogQuery {
     #[serde(flatten)]
     pub base: GitQuery,
     pub max_count: Option<usize>,
@@ -106,7 +106,7 @@ pub(super) struct GitLogQuery {
     responses(crate::openapi::JsonApiResponses),
     tag = "Git"
 )]
-pub(super) async fn log_history(
+pub(crate) async fn log_history(
     State(state): State<AppState>,
     Query(q): Query<GitLogQuery>,
 ) -> Result<Json<Value>, AppError> {
@@ -139,7 +139,7 @@ pub(super) async fn log_history(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct FileContentBody {
+pub(crate) struct FileContentBody {
     #[serde(flatten)]
     pub base: GitWriteBody,
     /// nuwax 字段名 `ref` (Rust 关键字, 用 ref_ + serde rename)
@@ -151,7 +151,7 @@ pub(super) struct FileContentBody {
 /// `POST /api/git/file-content` (对齐 nuwax fileContent; 从 **body** 取 {ref, filePath})。
 /// ref ∈ {worktree, staged, ""} → 直接读 workdir 文件 (不查 git); 否则读 ref 处 blob。
 #[utoipa::path(post, path = "/file-content", request_body = FileContentBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
-pub(super) async fn file_content(
+pub(crate) async fn file_content(
     State(state): State<AppState>,
     Json(body): Json<FileContentBody>,
 ) -> Result<Json<Value>, AppError> {
@@ -161,18 +161,27 @@ pub(super) async fn file_content(
     let read_worktree = matches!(ref_spec.as_str(), "worktree" | "staged" | "");
     let ref_c = ref_spec.clone();
     let fp_c = file_path.clone();
+    let max_bytes = state.config.git_file_content_max_bytes;
     let content = tokio::task::spawn_blocking(move || -> Result<String, AppError> {
         if !path.exists() {
             return Err(AppError::resource("workspace does not exist"));
         }
         if read_worktree {
             let full = crate::path_safety::ensure_within(&path, &fp_c)?;
+            let metadata = std::fs::metadata(&full).map_err(|error| {
+                AppError::system(format!("read metadata {}: {error}", full.display()))
+            })?;
+            if metadata.len() > max_bytes {
+                return Err(AppError::validation(format!(
+                    "git file content exceeds limit (max {max_bytes} bytes)"
+                )));
+            }
             return std::fs::read_to_string(&full)
                 .map_err(|error| AppError::system(format!("read {}: {error}", full.display())));
         }
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;
-        match git::file_content_at_ref(&repo, &ref_c, &fp_c)? {
+        match git::file_content_at_ref(&repo, &ref_c, &fp_c, max_bytes)? {
             Some(c) => Ok(c),
             None => Ok(String::new()),
         }
@@ -196,7 +205,7 @@ pub(super) async fn file_content(
     responses(crate::openapi::JsonApiResponses),
     tag = "Git"
 )]
-pub(super) async fn status(
+pub(crate) async fn status(
     State(state): State<AppState>,
     Query(q): Query<GitQuery>,
 ) -> Result<Json<Value>, AppError> {

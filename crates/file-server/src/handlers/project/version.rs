@@ -1,4 +1,4 @@
-//! project 版本管理路由: backup-current-version / rollback-version / export-project。
+//! project 版本管理 handlers: backup-current-version / rollback-version / export-project。
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -15,7 +15,7 @@ use crate::service::{project as project_service, version as version_service};
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct BackupVersionBody {
+pub(crate) struct BackupVersionBody {
     pub project_id: String,
     pub code_version: String,
     #[serde(default)]
@@ -28,7 +28,7 @@ pub(super) struct BackupVersionBody {
 
 /// `POST /api/project/backup-current-version`
 #[utoipa::path(post, path = "/backup-current-version", request_body = BackupVersionBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
-pub(super) async fn backup_current_version(
+pub(crate) async fn backup_current_version(
     State(state): State<AppState>,
     Json(body): Json<BackupVersionBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -66,7 +66,7 @@ pub(super) async fn backup_current_version(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct RollbackBody {
+pub(crate) struct RollbackBody {
     pub project_id: String,
     pub code_version: String,
     pub rollback_to: String,
@@ -80,7 +80,7 @@ pub(super) struct RollbackBody {
 
 /// `POST /api/project/rollback-version`
 #[utoipa::path(post, path = "/rollback-version", request_body = RollbackBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
-pub(super) async fn rollback_version(
+pub(crate) async fn rollback_version(
     State(state): State<AppState>,
     Json(body): Json<RollbackBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -117,7 +117,7 @@ pub(super) async fn rollback_version(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ExportBody {
+pub(crate) struct ExportBody {
     pub project_id: String,
     pub code_version: String,
     #[serde(default)]
@@ -144,7 +144,7 @@ pub(super) struct ExportBody {
     ),
     tag = "Project"
 )]
-pub(super) async fn export_project(
+pub(crate) async fn export_project(
     State(state): State<AppState>,
     Json(body): Json<ExportBody>,
 ) -> Result<Response, AppError> {
@@ -167,7 +167,8 @@ pub(super) async fn export_project(
         body.config.as_ref(),
     )
     .await?;
-    let bytes = tokio::fs::read(&zip_path).await?;
+    let archive_size = tokio::fs::metadata(&zip_path).await?.len();
+    let archive_body = crate::service::temp_file::file_body(&zip_path).await?;
     let filename = zip_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -184,8 +185,14 @@ pub(super) async fn export_project(
                 axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
                     .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
             ),
+            (
+                axum::http::header::CONTENT_LENGTH,
+                axum::http::HeaderValue::from_str(&archive_size.to_string()).map_err(|error| {
+                    AppError::system(format!("build export content length header: {error}"))
+                })?,
+            ),
         ],
-        bytes,
+        archive_body,
     )
         .into_response())
 }

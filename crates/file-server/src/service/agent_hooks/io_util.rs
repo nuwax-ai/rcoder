@@ -2,6 +2,7 @@
 //!
 //! 供 agent_hooks 各子模块复用: staging 写 codex 脚本 / settings.json / hook 脚本等。
 
+use std::io::Write;
 use std::path::Path;
 
 use serde_json::Value;
@@ -9,15 +10,9 @@ use tokio::fs;
 
 use crate::error::{AppError, AppResult};
 
-/// 当前时间纳秒 (用于生成唯一临时名 / staging 目录名)。
-pub(super) fn now_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
-/// 原子写文本文件: 先写 `.<name>.<pid>.<nanos>.tmp` 再 rename (对齐 nuwax writeFileAtomic)。
+/// 原子写文本文件：在目标目录创建不可预测的临时文件，再原子替换目标。
+///
+/// `tempfile` 负责排他创建与异常路径清理；阻塞文件操作放入 blocking 线程池。
 pub(super) async fn write_file_atomic(
     target: &Path,
     content: &str,
@@ -25,21 +20,24 @@ pub(super) async fn write_file_atomic(
 ) -> AppResult<()> {
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir).await?;
-    let basename = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
-    let tmp = dir.join(format!(
-        ".{basename}.{}.{}.tmp",
-        std::process::id(),
-        now_nanos()
-    ));
-    fs::write(&tmp, content).await?;
-    if let Some(m) = mode {
-        set_mode(&tmp, m).await?;
-    }
-    fs::rename(&tmp, target).await?;
-    Ok(())
+    let dir = dir.to_path_buf();
+    let target = target.to_path_buf();
+    let content = content.as_bytes().to_vec();
+    tokio::task::spawn_blocking(move || -> AppResult<()> {
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".hook-config-")
+            .tempfile_in(&dir)?;
+        temporary.write_all(&content)?;
+        temporary.flush()?;
+        if let Some(mode) = mode {
+            set_mode(temporary.as_file(), mode)?;
+        }
+        temporary.as_file().sync_all()?;
+        temporary.persist(&target).map_err(|error| error.error)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| AppError::system(format!("join atomic file writer: {error}")))?
 }
 
 /// 原子写 JSON 文件 (对齐 nuwax writeJsonFileAtomic: pretty + 末尾换行)。
@@ -50,14 +48,29 @@ pub(super) async fn write_json_file_atomic(target: &Path, data: &Value) -> AppRe
     write_file_atomic(target, &s, None).await
 }
 
+/// 删除文件、目录或符号链接；不存在视为成功，其他 I/O 错误立即返回。
+pub(super) async fn remove_path_if_exists(path: &Path) -> AppResult<()> {
+    let metadata = match fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() {
+        fs::remove_dir_all(path).await?;
+    } else {
+        fs::remove_file(path).await?;
+    }
+    Ok(())
+}
+
 /// 设置文件权限 (unix only; 0o755 等)。
 #[cfg(unix)]
-async fn set_mode(path: &Path, mode: u32) -> AppResult<()> {
+fn set_mode(file: &std::fs::File, mode: u32) -> AppResult<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 #[cfg(not(unix))]
-async fn set_mode(_path: &Path, _mode: u32) -> AppResult<()> {
+fn set_mode(_file: &std::fs::File, _mode: u32) -> AppResult<()> {
     Ok(())
 }

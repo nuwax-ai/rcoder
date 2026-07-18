@@ -12,6 +12,7 @@ pub mod error_classify;
 pub mod log;
 pub mod port_pool;
 pub mod process;
+mod support;
 
 pub use error_classify::{STDERR_RING_CAP, StderrRing, ViteStartupError};
 pub use log::{ReadDevLogResult, read_dev_log};
@@ -26,6 +27,7 @@ use std::time::Duration;
 use crate::Config;
 use crate::error::{AppError, AppResult};
 use crate::service::pnpm::{self, InstallOptions, LogFiles};
+use support::{early_exit_err, ldrtemp, lock, read_dev_script};
 
 /// 运行中的 dev server 记录 (内存状态)。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -414,7 +416,7 @@ impl DevServerManager {
         log_type: &str,
     ) -> AppResult<ReadDevLogResult> {
         let dir = log::log_dir(&self.config, project_id);
-        read_dev_log(&dir, start_index, log_type).await
+        read_dev_log(&dir, start_index, log_type, self.config.log_read_max_bytes).await
     }
 
     async fn write_npmrc(&self, project_path: &Path) -> AppResult<()> {
@@ -491,36 +493,6 @@ impl Drop for AllocGuard<'_> {
             self.pool.release(&self.project_id);
         }
     }
-}
-
-fn ldrtemp(ldir: &Path, now: i64) -> PathBuf {
-    ldir.join(log::temp_log_name(now))
-}
-
-/// 进程早退时: 收集 stderr ring → 分类成结构化 [`ViteStartupError`] → 转 [`AppError`]。
-fn early_exit_err(pid: u32, port: u16, ring: &Arc<StderrRing>) -> AppError {
-    let lines = error_classify::ring_collect(ring);
-    ViteStartupError::classify(&lines).into_app_error(pid, port)
-}
-
-/// 读 package.json 的 scripts.dev (对齐 nuwax startDevUtils)。
-fn read_dev_script(project_path: &Path) -> AppResult<String> {
-    let pkg_path = project_path.join("package.json");
-    let content = std::fs::read_to_string(&pkg_path)
-        .map_err(|e| AppError::business(format!("read package.json failed: {e}")))?;
-    let pkg: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| AppError::business(format!("parse package.json failed: {e}")))?;
-    let dev = pkg
-        .get("scripts")
-        .and_then(|s| s.get("dev"))
-        .and_then(|d| d.as_str())
-        .ok_or_else(|| AppError::business("package.json has no scripts.dev"))?;
-    Ok(dev.to_string())
-}
-
-fn lock<T>(m: &Mutex<T>) -> AppResult<std::sync::MutexGuard<'_, T>> {
-    m.lock()
-        .map_err(|e| AppError::system(format!("mutex poisoned: {e}")))
 }
 
 #[cfg(test)]

@@ -55,6 +55,8 @@ pub struct DiffParams {
     pub from: Option<String>,
     pub to: Option<String>,
     pub paths: Vec<String>,
+    pub max_file_size_bytes: u64,
+    pub max_total_bytes: u64,
 }
 
 /// 单文件统计。
@@ -80,8 +82,12 @@ pub struct DiffResult {
 pub fn compute_diff(repo: &Repository, params: &DiffParams) -> AppResult<DiffResult> {
     let mut changes = match params.source {
         DiffSource::Commit => collect_commit_changes(repo, params)?,
-        DiffSource::Worktree => collect_worktree_changes(repo)?,
-        DiffSource::Staged => collect_staged_changes(repo)?,
+        DiffSource::Worktree => {
+            collect_worktree_changes(repo, params.max_file_size_bytes, params.max_total_bytes)?
+        }
+        DiffSource::Staged => {
+            collect_staged_changes(repo, params.max_file_size_bytes, params.max_total_bytes)?
+        }
     };
     // isomorphic-git 的 listFiles/statusMatrix 以路径稳定排序；gix tree diff
     // 的事件顺序不作相同保证。在公共入口统一排序以保持 API 可比较。
@@ -161,6 +167,7 @@ fn collect_commit_changes(repo: &Repository, params: &DiffParams) -> AppResult<V
         .diff_tree_to_tree(Some(&old_tree), &new_tree, None)
         .map_err(|e| map_git_err(e, "git diff_tree_to_tree"))?;
     let mut out = Vec::new();
+    let mut total_bytes = 0_u64;
     for change in changes {
         let (path, old_id, new_id) = match change {
             Change::Addition {
@@ -206,18 +213,24 @@ fn collect_commit_changes(repo: &Repository, params: &DiffParams) -> AppResult<V
             } => (location, Some(source_id), Some(id)),
         };
         let path = path.to_string();
-        let old = read_blob(repo, old_id)?;
-        let new = read_blob(repo, new_id)?;
-        out.push(FileChange {
+        let old = read_blob(repo, old_id, params.max_file_size_bytes)?;
+        let new = read_blob(repo, new_id, params.max_file_size_bytes)?;
+        let change = FileChange {
             path,
             old: Side { bytes: old },
             new: Side { bytes: new },
-        });
+        };
+        account_change(&change, &mut total_bytes, params.max_total_bytes)?;
+        out.push(change);
     }
     Ok(out)
 }
 
-fn collect_worktree_changes(repo: &Repository) -> AppResult<Vec<FileChange>> {
+fn collect_worktree_changes(
+    repo: &Repository,
+    max_bytes: u64,
+    max_total_bytes: u64,
+) -> AppResult<Vec<FileChange>> {
     let st = get_status(repo)?;
     let workdir = repo
         .workdir()
@@ -225,6 +238,7 @@ fn collect_worktree_changes(repo: &Repository) -> AppResult<Vec<FileChange>> {
     let head_tree = head_tree(repo)?;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
+    let mut total_bytes = 0_u64;
     // 工作区 diff = HEAD ↔ 工作区: 覆盖 staged + modified + created + deleted
     for f in st
         .staged
@@ -236,35 +250,64 @@ fn collect_worktree_changes(repo: &Repository) -> AppResult<Vec<FileChange>> {
         if !seen.insert(f.clone()) {
             continue;
         }
-        let old = read_head_blob(repo, &head_tree, f)?;
-        let new = read_worktree_file(workdir, f);
-        out.push(FileChange {
+        let old = read_head_blob(repo, &head_tree, f, max_bytes)?;
+        let new = read_worktree_file(workdir, f, max_bytes)?;
+        let change = FileChange {
             path: f.clone(),
             old: Side { bytes: old },
             new: Side { bytes: new },
-        });
+        };
+        account_change(&change, &mut total_bytes, max_total_bytes)?;
+        out.push(change);
     }
     Ok(out)
 }
 
-fn collect_staged_changes(repo: &Repository) -> AppResult<Vec<FileChange>> {
+fn collect_staged_changes(
+    repo: &Repository,
+    max_bytes: u64,
+    max_total_bytes: u64,
+) -> AppResult<Vec<FileChange>> {
     let st = get_status(repo)?;
     let head_tree = head_tree(repo)?;
     let index = repo
         .open_index()
         .map_err(|e| map_git_err(e, "git open_index"))?;
     let mut out = Vec::new();
+    let mut total_bytes = 0_u64;
     // 暂存区 diff = HEAD ↔ index: 仅 staged 桶 (index 相对 HEAD 的变更)
     for f in &st.staged {
-        let old = read_head_blob(repo, &head_tree, f)?;
-        let new = read_index_blob(repo, &index, f);
-        out.push(FileChange {
+        let old = read_head_blob(repo, &head_tree, f, max_bytes)?;
+        let new = read_index_blob(repo, &index, f, max_bytes)?;
+        let change = FileChange {
             path: f.clone(),
             old: Side { bytes: old },
             new: Side { bytes: new },
-        });
+        };
+        account_change(&change, &mut total_bytes, max_total_bytes)?;
+        out.push(change);
     }
     Ok(out)
+}
+
+fn account_change(change: &FileChange, total: &mut u64, max_total_bytes: u64) -> AppResult<()> {
+    let change_bytes = change
+        .old
+        .bytes
+        .as_ref()
+        .map_or(0, Vec::len)
+        .checked_add(change.new.bytes.as_ref().map_or(0, Vec::len))
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| AppError::validation("git diff size overflow"))?;
+    *total = total
+        .checked_add(change_bytes)
+        .ok_or_else(|| AppError::validation("git diff total size overflow"))?;
+    if *total > max_total_bytes {
+        return Err(AppError::validation(format!(
+            "git diff total content exceeds limit (max {max_total_bytes} bytes)"
+        )));
+    }
+    Ok(())
 }
 
 // ── 渲染 ────────────────────────────────────────────────────────────────────────
@@ -425,9 +468,14 @@ fn assemble_header(
 
 // ── 读取 helper ─────────────────────────────────────────────────────────────────
 
-fn read_blob(repo: &Repository, id: Option<ObjectId>) -> AppResult<Option<Vec<u8>>> {
+fn read_blob(
+    repo: &Repository,
+    id: Option<ObjectId>,
+    max_bytes: u64,
+) -> AppResult<Option<Vec<u8>>> {
     match id {
         Some(id) => {
+            ensure_blob_size(repo, id, max_bytes)?;
             let blob = repo
                 .find_blob(id)
                 .map_err(|e| map_git_err(e, "git find_blob"))?;
@@ -445,12 +493,18 @@ fn head_tree(repo: &Repository) -> AppResult<Tree<'_>> {
         .map_err(|e| map_git_err(e, "git find_tree (head)"))
 }
 
-fn read_head_blob(repo: &Repository, tree: &Tree<'_>, path: &str) -> AppResult<Option<Vec<u8>>> {
+fn read_head_blob(
+    repo: &Repository,
+    tree: &Tree<'_>,
+    path: &str,
+    max_bytes: u64,
+) -> AppResult<Option<Vec<u8>>> {
     let entry = tree
         .lookup_entry_by_path(path)
         .map_err(|e| map_git_err(e, "git lookup_entry_by_path"))?;
     match entry {
         Some(e) => {
+            ensure_blob_size(repo, e.id().detach(), max_bytes)?;
             let blob = repo
                 .find_blob(e.id())
                 .map_err(|e| map_git_err(e, "git find_blob (head)"))?;
@@ -460,15 +514,51 @@ fn read_head_blob(repo: &Repository, tree: &Tree<'_>, path: &str) -> AppResult<O
     }
 }
 
-fn read_index_blob(repo: &Repository, index: &IndexFile, path: &str) -> Option<Vec<u8>> {
+fn read_index_blob(
+    repo: &Repository,
+    index: &IndexFile,
+    path: &str,
+    max_bytes: u64,
+) -> AppResult<Option<Vec<u8>>> {
     let bstr_path = into_bstr(PathBuf::from(path));
-    let entry = index.entry_by_path_and_stage(bstr_path.as_ref(), IndexStage::Unconflicted)?;
-    let blob = repo.find_blob(entry.id).ok()?;
-    Some(blob.data.to_vec())
+    let Some(entry) = index.entry_by_path_and_stage(bstr_path.as_ref(), IndexStage::Unconflicted)
+    else {
+        return Ok(None);
+    };
+    ensure_blob_size(repo, entry.id, max_bytes)?;
+    let blob = repo
+        .find_blob(entry.id)
+        .map_err(|error| map_git_err(error, "git find index blob"))?;
+    Ok(Some(blob.data.to_vec()))
 }
 
-fn read_worktree_file(workdir: &Path, path: &str) -> Option<Vec<u8>> {
-    std::fs::read(workdir.join(path)).ok()
+fn read_worktree_file(workdir: &Path, path: &str, max_bytes: u64) -> AppResult<Option<Vec<u8>>> {
+    let path = workdir.join(path);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() > max_bytes {
+        return Err(AppError::validation(format!(
+            "git diff file {} exceeds limit (max {max_bytes} bytes)",
+            path.display()
+        )));
+    }
+    Ok(Some(std::fs::read(path)?))
+}
+
+fn ensure_blob_size(repo: &Repository, id: ObjectId, max_bytes: u64) -> AppResult<()> {
+    let size = repo
+        .find_header(id)
+        .map_err(|error| map_git_err(error, "git find blob header"))?
+        .size();
+    if size > max_bytes {
+        return Err(AppError::validation(format!(
+            "git diff blob exceeds limit (max {max_bytes} bytes)"
+        )));
+    }
+    Ok(())
 }
 
 // ── 工具 ─────────────────────────────────────────────────────────────────────────
@@ -540,6 +630,8 @@ mod tests {
                 from: Some(old),
                 to: Some(new.clone()),
                 paths: Vec::new(),
+                max_file_size_bytes: 16 * 1024 * 1024,
+                max_total_bytes: 64 * 1024 * 1024,
             },
         )
         .expect("explicit commit diff");
@@ -561,11 +653,28 @@ mod tests {
                 from: Some(new),
                 to: None,
                 paths: Vec::new(),
+                max_file_size_bytes: 16 * 1024 * 1024,
+                max_total_bytes: 64 * 1024 * 1024,
             },
         )
         .expect("from-only commit diff");
         assert_eq!(from_only.insertions, result.insertions);
         assert_eq!(from_only.deletions, result.deletions);
+
+        std::fs::write(root.join("src/app.txt"), "content beyond tiny limit\n")
+            .expect("write oversized diff fixture");
+        let oversized = compute_diff(
+            &repo,
+            &DiffParams {
+                source: DiffSource::Worktree,
+                from: None,
+                to: None,
+                paths: Vec::new(),
+                max_file_size_bytes: 1,
+                max_total_bytes: 2,
+            },
+        );
+        assert!(oversized.is_err());
 
         drop(repo);
         let _ = std::fs::remove_dir_all(root);

@@ -1,4 +1,4 @@
-//! project 文件增量/全量更新路由: specified-files-update / all-files-update。
+//! project 文件增量/全量更新 handlers: specified-files-update / all-files-update。
 
 use axum::extract::State;
 use serde::Deserialize;
@@ -12,7 +12,7 @@ use crate::service::code as code_service;
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct SpecifiedBody {
+pub(crate) struct SpecifiedBody {
     pub project_id: String,
     pub code_version: String,
     pub files: Vec<code_service::FileOp>,
@@ -26,7 +26,7 @@ pub(super) struct SpecifiedBody {
 
 /// `POST /api/project/specified-files-update` (create/delete/rename/modify 增量)
 #[utoipa::path(post, path = "/specified-files-update", request_body = SpecifiedBody, responses(crate::openapi::JsonApiResponses), tag = "Code")]
-pub(super) async fn specified_files_update(
+pub(crate) async fn specified_files_update(
     State(state): State<AppState>,
     Json(mut body): Json<SpecifiedBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -66,7 +66,7 @@ pub(super) async fn specified_files_update(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct AllFilesBody {
+pub(crate) struct AllFilesBody {
     pub project_id: String,
     pub code_version: String,
     pub files: Vec<code_service::FileEntry>,
@@ -86,7 +86,7 @@ pub(super) struct AllFilesBody {
 
 /// `POST /api/project/all-files-update` (全量覆盖 + 清理缺失)
 #[utoipa::path(post, path = "/all-files-update", request_body = AllFilesBody, responses(crate::openapi::JsonApiResponses), tag = "Code")]
-pub(super) async fn all_files_update(
+pub(crate) async fn all_files_update(
     State(state): State<AppState>,
     Json(mut body): Json<AllFilesBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {

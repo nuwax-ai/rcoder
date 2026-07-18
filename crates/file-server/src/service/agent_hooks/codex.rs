@@ -5,7 +5,6 @@
 //! curl wrapper 脚本后转 command handler。
 
 use serde_json::{Map, Value};
-use std::collections::HashSet;
 use std::path::Path;
 use tokio::fs;
 use winnow::combinator::{alt, repeat};
@@ -33,7 +32,7 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
 // ── shell / 脚本路径辅助 (对齐 nuwax) ───────────────────────────────────────────
 
 /// 解析 timeout 秒数 (对齐 nuwax parseTimeoutSeconds): 非有限正数 → 默认值。
-fn parse_timeout_seconds(value: &Value, default_sec: u32) -> u32 {
+fn parse_timeout_seconds(value: &Value, default_sec: f64) -> f64 {
     let n = match value {
         Value::Number(num) => num.as_f64(),
         Value::String(s) => s.parse::<f64>().ok(),
@@ -42,10 +41,7 @@ fn parse_timeout_seconds(value: &Value, default_sec: u32) -> u32 {
         _ => None,
     };
     match n {
-        Some(x) if x.is_finite() && x > 0.0 => {
-            let seconds = std::time::Duration::from_secs_f64(x.min(86_400.0)).as_secs();
-            u32::try_from(seconds).unwrap_or(default_sec)
-        }
+        Some(seconds) if seconds.is_finite() && seconds > 0.0 => seconds,
         _ => default_sec,
     }
 }
@@ -56,20 +52,51 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 /// 将 header 值中的 `$ENV_VAR` 转为 bash 运行时展开形式 `${ENV_VAR}` (对齐 nuwax toBashEnvExpandable)。
-fn to_bash_env_expandable(value: &str) -> AppResult<String> {
-    repeat(
+fn parse_bash_env_parts(value: &str) -> AppResult<Vec<BashEnvPart>> {
+    let parts: Vec<BashEnvPart> = repeat(
         0..,
         alt((
             bash_env_reference,
-            any.map(|character: char| character.to_string()),
+            any.map(|character: char| BashEnvPart::Literal(character.to_string())),
         )),
     )
     .parse(value)
-    .map_err(|error| AppError::system(format!("parse hook header environment variables: {error}")))
+    .map_err(|error| {
+        AppError::system(format!("parse hook header environment variables: {error}"))
+    })?;
+
+    let mut merged = Vec::with_capacity(parts.len());
+    for part in parts {
+        match (merged.last_mut(), part) {
+            (Some(BashEnvPart::Literal(current)), BashEnvPart::Literal(next)) => {
+                current.push_str(&next);
+            }
+            (_, part) => merged.push(part),
+        }
+    }
+    Ok(merged)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BashEnvPart {
+    Literal(String),
+    Variable(String),
+}
+
+/// 保留与 nuwax 一致的文本转换语义，供测试与协议对照使用。
+#[cfg(test)]
+fn to_bash_env_expandable(value: &str) -> AppResult<String> {
+    Ok(parse_bash_env_parts(value)?
+        .into_iter()
+        .map(|part| match part {
+            BashEnvPart::Literal(literal) => literal,
+            BashEnvPart::Variable(variable) => format!("${{{variable}}}"),
+        })
+        .collect())
 }
 
 /// `$[A-Za-z_][A-Za-z0-9_]*`，与 nuwax 的正则捕获范围一致。
-fn bash_env_reference(input: &mut &str) -> ModalResult<String> {
+fn bash_env_reference(input: &mut &str) -> ModalResult<BashEnvPart> {
     '$'.parse_next(input)?;
     let first = one_of(|character: char| character.is_ascii_alphabetic() || character == '_')
         .parse_next(input)?;
@@ -77,7 +104,28 @@ fn bash_env_reference(input: &mut &str) -> ModalResult<String> {
         character.is_ascii_alphanumeric() || character == '_'
     })
     .parse_next(input)?;
-    Ok(format!("${{{first}{remainder}}}"))
+    Ok(BashEnvPart::Variable(format!("{first}{remainder}")))
+}
+
+/// 将 header 组装成一个安全的 shell word，仅允许 `$ENV_VAR` 发生运行时展开。
+fn quote_header(key: &str, value: &str) -> AppResult<String> {
+    let mut parts = vec![BashEnvPart::Literal(format!("{key}: "))];
+    parts.extend(parse_bash_env_parts(value)?);
+    let mut quoted = String::new();
+    for part in parts {
+        match part {
+            BashEnvPart::Literal(literal) => {
+                let escaped = shlex::try_quote(&literal).map_err(|error| {
+                    AppError::validation(format!("invalid control byte in hook header: {error}"))
+                })?;
+                quoted.push_str(&escaped);
+            }
+            BashEnvPart::Variable(variable) => {
+                quoted.push_str(&format!("\"${{{variable}}}\""));
+            }
+        }
+    }
+    Ok(quoted)
 }
 
 /// 判断 command 是否为需基于 git 根目录解析的脚本路径 (对齐 nuwax isLikelyScriptPath)。
@@ -199,9 +247,7 @@ fn build_curl_header_args(headers: Option<&Value>) -> AppResult<Vec<String>> {
             Value::Bool(b) => b.to_string(),
             other => other.to_string(),
         };
-        let header_key = escape_for_double_quote(&key);
-        let header_value = escape_for_double_quote(&to_bash_env_expandable(&val_str)?);
-        args.push(format!("-H \"{header_key}: {header_value}\""));
+        args.push(format!("-H {}", quote_header(&key, &val_str)?));
     }
     Ok(args)
 }
@@ -209,7 +255,7 @@ fn build_curl_header_args(headers: Option<&Value>) -> AppResult<Vec<String>> {
 /// 构建 http hook 的 curl wrapper 脚本内容 (对齐 nuwax buildHttpWrapperScript)。
 fn build_http_wrapper_script(
     url: &str,
-    timeout_sec: u32,
+    timeout_sec: f64,
     headers: Option<&Value>,
 ) -> AppResult<String> {
     let header_args = build_curl_header_args(headers)?.join(" ");
@@ -232,12 +278,11 @@ pub(super) async fn transform_hooks_for_codex(
     hooks_map: &Map<String, Value>,
     codex_hooks_dir: &Path,
 ) -> AppResult<Option<Map<String, Value>>> {
-    let allowed: HashSet<&str> = CODEX_HOOK_EVENTS.iter().copied().collect();
     let mut codex_hooks: Map<String, Value> = Map::new();
     let mut wrapper_index = 0u32;
 
     for (event_name, matcher_groups) in hooks_map {
-        if !allowed.contains(event_name.as_str()) {
+        if !CODEX_HOOK_EVENTS.contains(&event_name.as_str()) {
             tracing::warn!(event = %event_name, "Skipping unsupported Codex hook event");
             continue;
         }
@@ -287,8 +332,8 @@ pub(super) async fn transform_hooks_for_codex(
                     {
                         let timeout = handler_obj
                             .get("timeout")
-                            .map(|v| parse_timeout_seconds(v, 30))
-                            .unwrap_or(30);
+                            .map(|v| parse_timeout_seconds(v, 30.0))
+                            .unwrap_or(30.0);
                         let script_name = format!("http-hook-{wrapper_index}.sh");
                         wrapper_index += 1;
                         let script_path = codex_hooks_dir.join(&script_name);
@@ -304,10 +349,13 @@ pub(super) async fn transform_hooks_for_codex(
                             "command".to_string(),
                             Value::String(build_codex_hook_command(&script_name)),
                         );
-                        new_handler.insert(
-                            "timeout".to_string(),
-                            Value::Number(serde_json::Number::from(timeout)),
-                        );
+                        let timeout_number =
+                            serde_json::Number::from_f64(timeout).ok_or_else(|| {
+                                AppError::system(
+                                    "finite hook timeout could not be represented as JSON",
+                                )
+                            })?;
+                        new_handler.insert("timeout".to_string(), Value::Number(timeout_number));
                         if let Some(sm) = handler_obj.get("statusMessage").filter(|v| !v.is_null())
                         {
                             new_handler.insert("statusMessage".to_string(), sm.clone());
@@ -356,12 +404,13 @@ mod tests {
 
     #[test]
     fn timeout_parsing_defaults_on_invalid() {
-        assert_eq!(parse_timeout_seconds(&Value::Null, 30), 30);
-        assert_eq!(parse_timeout_seconds(&json!("abc"), 30), 30);
-        assert_eq!(parse_timeout_seconds(&json!(0), 30), 30);
-        assert_eq!(parse_timeout_seconds(&json!(-5), 30), 30);
-        assert_eq!(parse_timeout_seconds(&json!(10), 30), 10);
-        assert_eq!(parse_timeout_seconds(&json!("15"), 30), 15);
+        assert_eq!(parse_timeout_seconds(&Value::Null, 30.0), 30.0);
+        assert_eq!(parse_timeout_seconds(&json!("abc"), 30.0), 30.0);
+        assert_eq!(parse_timeout_seconds(&json!(0), 30.0), 30.0);
+        assert_eq!(parse_timeout_seconds(&json!(-5), 30.0), 30.0);
+        assert_eq!(parse_timeout_seconds(&json!(10), 30.0), 10.0);
+        assert_eq!(parse_timeout_seconds(&json!("15"), 30.0), 15.0);
+        assert_eq!(parse_timeout_seconds(&json!(0.5), 30.0), 0.5);
     }
 
     #[test]
@@ -446,9 +495,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn header_quoting_expands_only_environment_references() {
+        let value = "pre-$TOKEN-$(printf injected)-`printf tick`";
+        let header = quote_header("X-Token", value).expect("quote header");
+        assert!(header.contains("\"${TOKEN}\""));
+
+        let script = format!("set -- {header}; printf %s \"$1\"");
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .env("TOKEN", "secret")
+            .output()
+            .expect("execute shell fixture");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("utf8 shell output"),
+            "X-Token: pre-secret-$(printf injected)-`printf tick`"
+        );
+    }
+
+    #[test]
     fn build_http_wrapper_script_shape() {
         let script =
-            build_http_wrapper_script("https://x.com/h", 30, None).expect("wrapper script");
+            build_http_wrapper_script("https://x.com/h", 30.0, None).expect("wrapper script");
         assert!(script.starts_with("#!/usr/bin/env bash\nset -euo pipefail"));
         assert!(script.contains("curl -fsS -X POST"));
         assert!(script.contains("--max-time 30"));

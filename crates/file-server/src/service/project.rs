@@ -35,8 +35,8 @@ pub async fn delete_project(
     if project_id.is_empty() {
         return Err(AppError::validation("Project ID cannot be empty"));
     }
-    // TODO(Task 1.4): 若请求带 pid, 先停旧 dev server
-    let project_path = resolver.resolve_project(ctx);
+    // HTTP handler 已在请求带 pid 时先停止旧 dev server；service 只负责目录事务。
+    let project_path = resolver.resolve_project(ctx)?;
     let targets = [
         config.upload_project_dir.join(project_id),
         project_path,
@@ -67,7 +67,7 @@ pub struct CreateResult {
 }
 
 /// 从模板创建项目 (对齐 nuwax createProject): 解压/复制模板 → .npmrc。
-/// `copyNodeModulesFromCache` / `git init` 留待 Task 1.3/1.4。
+/// 依赖统一由启动流程中的 `pnpm install --prefer-offline` 恢复，不复制 node_modules 缓存。
 pub async fn create_project(
     resolver: &dyn WorkspaceResolver,
     config: &Config,
@@ -89,7 +89,7 @@ pub async fn create_project(
         // react
         _ => config.init_project_name_react.as_str(),
     };
-    let project_path = resolver.resolve_project(ctx);
+    let project_path = resolver.resolve_project(ctx)?;
     if try_exists(&project_path).await? {
         return Err(AppError::business("Project directory already exists"));
     }
@@ -119,7 +119,6 @@ pub async fn create_project(
         return Err(e);
     }
 
-    // TODO(Task 1.4): copyNodeModulesFromCache (模板缓存加速)
     if let Err(error) = crate::service::fs_util::write_npmrc(&project_path).await {
         let _ = fs::remove_dir_all(&project_path).await;
         return Err(error);
@@ -163,8 +162,8 @@ pub async fn copy_project(
             "sourceProjectId and targetProjectId cannot be empty",
         ));
     }
-    let source_path = resolver.resolve_project(source_ctx);
-    let target_path = resolver.resolve_project(target_ctx);
+    let source_path = resolver.resolve_project(source_ctx)?;
+    let target_path = resolver.resolve_project(target_ctx)?;
     if !try_exists(&source_path).await? {
         return Err(AppError::business("Source project does not exist"));
     }
@@ -250,7 +249,7 @@ pub async fn upload_project(
     config: &Config,
     ctx: &ProjectContext,
     code_version: &str,
-    zip_data: Vec<u8>,
+    zip_path: &Path,
 ) -> AppResult<UploadProjectResult> {
     let project_id = ctx.project_id.trim();
     if project_id.is_empty() {
@@ -260,25 +259,28 @@ pub async fn upload_project(
         return Err(AppError::validation("Code version cannot be empty"));
     }
     let version = crate::service::version::parse_version(code_version)?;
-    let project_path = resolver.resolve_project(ctx);
+    let project_path = resolver.resolve_project(ctx)?;
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
     let parent = project_path
         .parent()
         .ok_or_else(|| AppError::system("project path has no parent"))?;
     fs::create_dir_all(parent).await?;
-    let staging = parent.join(format!(".upload-{project_id}-{nanos}.staging"));
-    let rollback = parent.join(format!(".upload-{project_id}-{nanos}.rollback"));
+    let staging_guard = crate::service::temp_file::tempdir_in(
+        parent.to_path_buf(),
+        &format!(".upload-{project_id}-staging-"),
+    )
+    .await?;
+    let rollback_guard = crate::service::temp_file::tempdir_in(
+        parent.to_path_buf(),
+        &format!(".upload-{project_id}-rollback-"),
+    )
+    .await?;
+    let staging = staging_guard.path().join("project");
+    let rollback = rollback_guard.path().join("project");
     fs::create_dir_all(&staging).await?;
 
     // 1. 先完整解压、整理到 staging；失败不触碰现有项目。
-    let tmp = std::env::temp_dir().join(format!("upload-{project_id}-{version}-{nanos}.zip"));
-    fs::write(&tmp, &zip_data).await?;
-    let extract_r = crate::service::zip::extract_to(tmp.clone(), staging.clone()).await;
-    let _ = fs::remove_file(&tmp).await;
+    let extract_r = crate::service::zip::extract_to(zip_path.to_path_buf(), staging.clone()).await;
     if let Err(e) = extract_r {
         let _ = fs::remove_dir_all(&staging).await;
         return Err(e);
@@ -383,7 +385,7 @@ pub async fn export_project(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     let version = crate::service::version::parse_version(code_version)?;
-    let project_path = resolver.resolve_project(ctx);
+    let project_path = resolver.resolve_project(ctx)?;
     if !try_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }

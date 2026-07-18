@@ -138,6 +138,7 @@ process-wrap = { version = "9.0", features = ["tokio1", "process-group", "job-ob
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
 url = { version = "2.5", features = ["serde"] }
+percent-encoding = "2.3"
 
 # TLS/Crypto
 rustls = { version = "0.23", features = ["ring"] }
@@ -188,12 +189,14 @@ pathdiff = "0.2"
 postage = "0.5"
 regex = "1.12"
 semver = "1.0"
+# npm/node 版本范围语义（与 package.json 依赖版本一致；不同于 Cargo semver）
+node-semver = "2.2"
 shellexpand = "3.1"
 winnow = "1.0.3"
 shlex = "2.0"
 smallvec = "1.15"
 
-toml = "1.1.2+spec-1.1.0"
+toml = "1.1.2"
 which = "8.0"
 
 

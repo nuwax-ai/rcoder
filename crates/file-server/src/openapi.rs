@@ -194,6 +194,20 @@ mod tests {
         assert!(!names.contains(&"base"));
     }
 
+    #[test]
+    fn file_operation_is_documented_as_enum() {
+        let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
+        let schemas = &value["components"]["schemas"];
+        assert_eq!(
+            schemas["FileOp"]["properties"]["operation"]["$ref"],
+            "#/components/schemas/FileOperation"
+        );
+        assert_eq!(
+            schemas["FileOperation"]["enum"],
+            serde_json::json!(["create", "delete", "rename", "modify"])
+        );
+    }
+
     fn schema_has_named_fields(
         schema: &Value,
         components: &serde_json::Map<String, Value>,
