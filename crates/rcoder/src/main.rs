@@ -13,6 +13,7 @@ mod server;
 mod service;
 mod shutdown;
 mod utils;
+mod workspace_migrate;
 
 use std::sync::Arc;
 

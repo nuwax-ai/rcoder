@@ -315,6 +315,19 @@ impl ComputerContainerManager {
             container_info.container_ip
         );
 
+        // 阶段3 lazy mv: 共享 PVC (rcoder-computer-workspace/{user_id}) → per-user subvolume
+        // (经挂根 rename, 瞬间无重复; dst=per-user PVC 根, 吸收 user_id)
+        crate::workspace_migrate::lazy_migrate(
+            runtime,
+            "RCODER_COMPUTER_WORKSPACE_PVC_NAME",
+            &[],
+            &options.user_id,
+            &ServiceType::ComputerAgentRunner,
+            &options.user_id,
+            true,
+        )
+        .await;
+
         Ok(container_info)
     }
 

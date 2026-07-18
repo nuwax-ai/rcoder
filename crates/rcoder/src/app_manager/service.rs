@@ -198,6 +198,19 @@ impl AppService {
             app_id, container_info.container_name
         );
 
+        // 阶段3 lazy mv: 共享 PVC (rcoder-workspace/workspace/apps/{app_id}) → per-app subvolume
+        // (经挂根 rename, 瞬间无重复)
+        crate::workspace_migrate::lazy_migrate(
+            &self.runtime,
+            "RCODER_WORKSPACE_PVC_NAME",
+            &["workspace", "apps"],
+            &app_id,
+            &ServiceType::UserApp,
+            &app_id,
+            false,
+        )
+        .await;
+
         // 4. Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/{port} → container_ip）
         let http_ports = http_port_numbers(&request.ports);
         self.register_pingora_backends(&app_id, &http_ports, &container_info.container_ip)

@@ -88,6 +88,17 @@ pub(crate) trait K8sPvcOps {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String>;
 
+    /// 解析任意 PVC 名的 CephFS subvolume 路径 (阶段3 lazy mv 用)
+    ///
+    /// 与 `resolve_subvolume_path` 同, 但直接接受 PVC 名 (共享 PVC 如 rcoder-workspace,
+    /// 非 `workspace_pvc_name` 生成)。cache key = pvc_name。供 rcoder 经挂根做 lazy mv 时
+    /// 定位共享 PVC 的 subvolume 根。
+    #[allow(dead_code)]
+    async fn resolve_subvolume_path_by_pvcname(
+        &self,
+        pvc_name: &str,
+    ) -> ContainerRuntimeResult<String>;
+
     /// 扩容 workspace PVC (CephFS subvolume 配额调整)
     ///
     /// patch PVC `spec.resources.requests.storage` → ceph-csi external-resizer 自动
@@ -315,18 +326,25 @@ impl K8sPvcOps for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
-        // cache hit (subvolumePath 对 PVC 不可变 → 永不失效)
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        self.resolve_subvolume_path_by_pvcname(&pvc_name).await
+    }
+
+    async fn resolve_subvolume_path_by_pvcname(
+        &self,
+        pvc_name: &str,
+    ) -> ContainerRuntimeResult<String> {
+        // cache hit (subvolumePath 对 PVC 不可变 → 永不失效; key=pvc_name 覆盖共享+per-agent)
         if let Some(cached) = self
             .subvolume_path_cache
             .read()
             .await
-            .get(identifier)
+            .get(pvc_name)
             .cloned()
         {
             return Ok(cached);
         }
-        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-        let pvc = self.pvcs().get(&pvc_name).await.map_err(|e| {
+        let pvc = self.pvcs().get(pvc_name).await.map_err(|e| {
             ContainerRuntimeError::K8sError(format!("Failed to get PVC '{}': {}", pvc_name, e))
         })?;
         let pv_name = pvc
@@ -343,7 +361,7 @@ impl K8sPvcOps for KubernetesRuntime {
         let pv = self.pvs().get(&pv_name).await.map_err(|e| {
             ContainerRuntimeError::K8sError(format!("Failed to get PV '{}': {}", pv_name, e))
         })?;
-        // csi.volumeAttributes["subvolumePath"] (字段名待 Task 2.5 实测确认;
+        // csi.volumeAttributes["subvolumePath"] (字段名待部署实测确认;
         // 兜底 rootPath, 部分 ceph-csi 版本用此 key)
         let vol_attrs = pv
             .spec
@@ -362,10 +380,10 @@ impl K8sPvcOps for KubernetesRuntime {
         self.subvolume_path_cache
             .write()
             .await
-            .insert(identifier.to_string(), subvolume_path.clone());
+            .insert(pvc_name.to_string(), subvolume_path.clone());
         debug!(
-            "[K8S] resolved subvolumePath for {}: {} (PVC {} -> PV {})",
-            identifier, subvolume_path, pvc_name, pv_name
+            "[K8S] resolved subvolumePath for PVC {}: {} (PV {})",
+            pvc_name, subvolume_path, pv_name
         );
         Ok(subvolume_path)
     }

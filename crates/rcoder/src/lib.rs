@@ -13,6 +13,7 @@ mod service;
 pub mod storage;
 mod utils;
 pub mod vnc;
+mod workspace_migrate;
 
 // 重新导出主要的类型和函数
 pub use storage::ProjectAdapter;

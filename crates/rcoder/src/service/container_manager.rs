@@ -186,6 +186,22 @@ async fn create_container_for_request(
         container_identifier, container_info.container_id, container_info.container_ip
     );
 
+    // 阶段3 lazy mv: 共享 PVC (rcoder-workspace/workspace/{project_id}) → per-agent subvolume
+    // (经挂根 rename, 瞬间无重复)。仅非共享容器 (pod_id=None, project-level); 共享容器
+    // (pod_id, 多 project 复用一个 PVC) 跳过 (per-pod_id PVC 布局与共享 /workspace/{project} 不一致)。
+    if options.pod_id.is_none() {
+        crate::workspace_migrate::lazy_migrate(
+            options.runtime,
+            "RCODER_WORKSPACE_PVC_NAME",
+            &["workspace"],
+            options.project_id,
+            options.service_type,
+            options.project_id,
+            false,
+        )
+        .await;
+    }
+
     Ok(container_info)
 }
 

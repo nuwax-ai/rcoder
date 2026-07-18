@@ -1539,6 +1539,18 @@ impl ContainerRuntime for KubernetesRuntime {
         Ok(Some(format!("{cephfs_root}/{sub}")))
     }
 
+    async fn resolve_workspace_path_by_pvcname(
+        &self,
+        pvc_name: &str,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        // 阶段3 lazy mv: 与 resolve_workspace_path 同, 但用任意 PVC 名 (共享 PVC 如 rcoder-workspace)
+        let cephfs_root =
+            std::env::var("RCODER_CEPHFS_ROOT").unwrap_or_else(|_| "/app/cephfs-root".to_string());
+        let subvolume_path = self.resolve_subvolume_path_by_pvcname(pvc_name).await?;
+        let sub = subvolume_path.trim_start_matches('/');
+        Ok(Some(format!("{cephfs_root}/{sub}")))
+    }
+
     // ===== Deployment 生命周期（UserApp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====
     async fn create_deployment(
         &self,

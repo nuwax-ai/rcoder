@@ -550,6 +550,18 @@ pub trait ContainerRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// 解析任意 PVC 名(per-agent 或共享)的 CephFS subvolume 聚合路径 (阶段3 lazy mv 用)。
+    ///
+    /// 与 `resolve_workspace_path` 同, 但直接接受 PVC 名 (共享 PVC 如 rcoder-workspace,
+    /// 非按 identifier 生成)。供 rcoder 经挂根做 lazy mv 时定位共享 PVC 的数据根。
+    /// Docker 模式默认 None。
+    async fn resolve_workspace_path_by_pvcname(
+        &self,
+        _pvc_name: &str,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        Ok(None)
+    }
+
     // ====================================================================
     // Deployment 生命周期（UserApp 专用，agent 路径不调用）
     //
