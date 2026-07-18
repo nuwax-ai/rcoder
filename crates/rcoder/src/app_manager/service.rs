@@ -439,8 +439,9 @@ impl AppService {
         //    默认保留：应用可重建，数据不可再生（v2 §5.3 数据安全）。
         if purge {
             let app_dir = self.get_container_app_dir(app_id).await;
+            // K8s per-agent: app_dir = per-app PVC 根, 清空内容不删根 (同 delete_app_storage)
             if app_dir.exists()
-                && let Err(e) = fs::remove_dir_all(&app_dir).await
+                && let Err(e) = Self::purge_dir_contents(&app_dir).await
             {
                 warn!("[APP] purge 清理应用目录失败 {:?}: {}", app_dir, e);
             }
@@ -497,12 +498,30 @@ impl AppService {
             }
         }
         let app_dir = self.get_container_app_dir(app_id).await;
+        // K8s per-agent: app_dir = per-app PVC 根 (ceph-csi subvol 根), 清空内容不删根
+        // (删 subvol 根破坏 PV subvolumePath → pod 重启挂载异常)
         if app_dir.exists()
-            && let Err(e) = fs::remove_dir_all(&app_dir).await
+            && let Err(e) = Self::purge_dir_contents(&app_dir).await
         {
             return Err(map_io_error("failed to clear storage", e, false));
         }
         info!("[APP] 已清空应用存储: {}", app_id);
+        Ok(())
+    }
+
+    /// 清空目录内容 (逐子项 remove), 保留目录本身。
+    /// purge per-agent PVC 根 (ceph-csi subvol 根) 必须用此 —— `remove_dir_all` 删 subvol 根
+    /// 会破坏 PV `csi.volumeAttributes.subvolumePath` (PVC 仍在但 subvol 路径不存在 → pod 重启挂载异常)。
+    async fn purge_dir_contents(dir: &std::path::Path) -> std::io::Result<()> {
+        let mut rd = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            let p = entry.path();
+            if p.is_dir() {
+                tokio::fs::remove_dir_all(&p).await?;
+            } else {
+                tokio::fs::remove_file(&p).await?;
+            }
+        }
         Ok(())
     }
 

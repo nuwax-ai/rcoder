@@ -185,6 +185,7 @@ pub struct Config {
     pub git_default_author_email: String,
     pub git_diff_max_file_size_bytes: u64,
     pub git_diff_max_total_bytes: u64,
+    pub git_diff_max_output_bytes: u64,
     pub git_file_content_max_bytes: u64,
 
     // —— 模板 ——
@@ -268,6 +269,7 @@ impl Default for Config {
             git_default_author_email: "git@nuwax.com".to_string(),
             git_diff_max_file_size_bytes: 16 * 1024 * 1024,
             git_diff_max_total_bytes: 64 * 1024 * 1024,
+            git_diff_max_output_bytes: 64 * 1024 * 1024,
             git_file_content_max_bytes: 64 * 1024 * 1024,
             init_project_name_react: "react-vite-template".to_string(),
             init_project_name_vue3: "vue3-vite-template".to_string(),
@@ -416,6 +418,7 @@ impl Config {
         string!(git_default_author_email, "GIT_DEFAULT_AUTHOR_EMAIL");
         parse!(git_diff_max_file_size_bytes, "GIT_DIFF_MAX_FILE_SIZE_BYTES");
         parse!(git_diff_max_total_bytes, "GIT_DIFF_MAX_TOTAL_BYTES");
+        parse!(git_diff_max_output_bytes, "GIT_DIFF_MAX_OUTPUT_BYTES");
         parse!(git_file_content_max_bytes, "GIT_FILE_CONTENT_MAX_BYTES");
         string!(init_project_name_react, "INIT_PROJECT_NAME_REACT");
         string!(init_project_name_vue3, "INIT_PROJECT_NAME_VUE3");
@@ -515,6 +518,7 @@ impl Config {
                 16 * 1024 * 1024,
             )?,
             git_diff_max_total_bytes: env_parse("GIT_DIFF_MAX_TOTAL_BYTES", 64 * 1024 * 1024)?,
+            git_diff_max_output_bytes: env_parse("GIT_DIFF_MAX_OUTPUT_BYTES", 64 * 1024 * 1024)?,
             git_file_content_max_bytes: env_parse("GIT_FILE_CONTENT_MAX_BYTES", 64 * 1024 * 1024)?,
             init_project_name_react: env_str("INIT_PROJECT_NAME_REACT", "react-vite-template")?,
             init_project_name_vue3: env_str("INIT_PROJECT_NAME_VUE3", "vue3-vite-template")?,
@@ -590,6 +594,7 @@ impl Config {
                 self.git_diff_max_file_size_bytes,
             ),
             ("GIT_DIFF_MAX_TOTAL_BYTES", self.git_diff_max_total_bytes),
+            ("GIT_DIFF_MAX_OUTPUT_BYTES", self.git_diff_max_output_bytes),
             (
                 "GIT_FILE_CONTENT_MAX_BYTES",
                 self.git_file_content_max_bytes,

@@ -13,6 +13,7 @@ upload_max_file_size_bytes: 1073741824
 git_enabled: true
 git_diff_max_file_size_bytes: 16777216
 git_diff_max_total_bytes: 67108864
+git_diff_max_output_bytes: 67108864
 git_file_content_max_bytes: 67108864
 service_log_dir: /app/logs/file-server
 service_log_retention_days: 7

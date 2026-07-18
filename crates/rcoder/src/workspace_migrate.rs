@@ -149,7 +149,7 @@ async fn migrate_children(src: &std::path::Path, dst: &std::path::Path, identifi
     let mut skipped = 0u32;
     while let Ok(Some(entry)) = rd.next_entry().await {
         let dst_item = dst.join(entry.file_name());
-        if dst_item.exists() {
+        if tokio::fs::try_exists(&dst_item).await.unwrap_or(false) {
             skipped += 1; // 已存在 (agent 新装 acp-agent / 已迁), skip
             continue;
         }

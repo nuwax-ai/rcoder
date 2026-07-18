@@ -46,7 +46,7 @@ function normalize(value) {
 }
 
 async function request(implementation, spec) {
-  const body = typeof spec.body === "function" ? spec.body() : spec.body;
+  const body = typeof spec.body === "function" ? spec.body(implementation) : spec.body;
   const response = await fetch(`http://127.0.0.1:${ports[implementation]}${spec.path}`, {
     method: spec.method || "GET",
     headers: spec.headers,
@@ -75,6 +75,17 @@ async function pair(name, spec, project = normalize) {
   const equal = JSON.stringify(tsComparable) === JSON.stringify(rustComparable);
   report.cases.push({ name, equal, ts, rust, tsComparable, rustComparable });
   console.log(`${equal ? "PASS" : "DIFF"} ${name}`);
+  return { ts, rust };
+}
+
+function normalizeGitDiff(result) {
+  const comparable = normalize(result);
+  if (typeof comparable.payload?.diff === "string") {
+    comparable.payload.diff = comparable.payload.diff
+      .replace(/(@@ -\d+),1 /g, "$1 ")
+      .replace(/(\d+),1 @@/g, "$1 @@");
+  }
+  return comparable;
 }
 
 const json = (value) => ({
@@ -190,6 +201,56 @@ await pair("git branch create", { path: "/api/git/branch-create", ...json({ ...g
 await pair("git branches", { path: `/api/git/branches?${new URLSearchParams(gitBase)}` });
 await pair("git tag create", { path: "/api/git/tag-create", ...json({ ...gitBase, tagName: "parity-v1", message: "parity tag" }) });
 await pair("git tags", { path: `/api/git/tags?${new URLSearchParams(gitBase)}` });
+
+await pair("git update worktree for diff", {
+  path: "/api/computer/files-update",
+  ...json({
+    userId: "parity-user",
+    cId: "parity-computer",
+    files: [{ operation: "modify", name: "README.md", contents: encodeURIComponent("# parity changed\n") }],
+  }),
+});
+await pair(
+  "git diff worktree",
+  { path: "/api/git/diff", ...json({ ...gitBase, paths: ["README.md"] }) },
+  normalizeGitDiff,
+);
+await pair("git add diff fixture", {
+  path: "/api/git/add",
+  ...json({ ...gitBase, files: ["README.md"] }),
+});
+await pair(
+  "git diff staged",
+  { path: "/api/git/diff", ...json({ ...gitBase, source: "staged", paths: ["README.md"] }) },
+  normalizeGitDiff,
+);
+const secondCommit = await pair("git commit diff fixture", {
+  path: "/api/git/commit",
+  ...json({
+    ...gitBase,
+    message: "parity diff commit",
+    files: ["README.md"],
+    authorName: "Parity",
+    authorEmail: "parity@example.com",
+  }),
+});
+if (secondCommit?.ts?.payload?.commit && secondCommit?.rust?.payload?.commit) {
+  await pair(
+    "git diff commit",
+    {
+      path: "/api/git/diff",
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: (implementation) => JSON.stringify({
+        ...gitBase,
+        source: "commit",
+        from: secondCommit[implementation].payload.commit,
+        paths: ["README.md"],
+      }),
+    },
+    normalizeGitDiff,
+  );
+}
 
 const excluded = new Set([".git", "node_modules", ".tmp", "logs", "cache"]);
 async function snapshot(root, relative = "") {

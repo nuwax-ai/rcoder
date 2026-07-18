@@ -215,7 +215,7 @@ pub(crate) async fn diff(
     Json(body): Json<DiffBody>,
 ) -> Result<Json<Value>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
-    let source = git::DiffSource::parse(&body.source)?;
+    let source = body.source.parse::<git::DiffSource>()?;
     let params = git::DiffParams {
         source,
         from: body.from.clone(),
@@ -223,6 +223,7 @@ pub(crate) async fn diff(
         paths: body.paths.clone().unwrap_or_default(),
         max_file_size_bytes: state.config.git_diff_max_file_size_bytes,
         max_total_bytes: state.config.git_diff_max_total_bytes,
+        max_output_bytes: state.config.git_diff_max_output_bytes,
     };
     let result = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         if !path.exists() {
@@ -237,7 +238,7 @@ pub(crate) async fn diff(
     Ok(Json(json!({
         "success": true,
         "logId": log_id,
-        "source": body.source,
+        "source": source.to_string(),
         "diff": result.diff,
         "summary": {
             "files": result.files,
