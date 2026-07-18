@@ -2,7 +2,9 @@
 
 pub mod config;
 pub mod error;
+pub mod extract;
 pub mod handler;
+pub mod openapi;
 pub mod path_safety;
 pub mod response;
 pub mod routes;
@@ -14,7 +16,9 @@ pub use workspace::{ComputerContext, LocalWorkspaceResolver, ProjectContext, Wor
 use std::sync::Arc;
 
 pub use crate::config::Config;
+pub use crate::service::build_manager::BuildManager;
 pub use crate::service::dev_server::DevServerManager;
+pub use crate::service::log_cache::LogCacheManager;
 
 /// axum 共享状态: 持有工作区解析器 + 全局配置 + dev server 进程管理器。
 #[derive(Clone)]
@@ -22,4 +26,7 @@ pub struct AppState {
     pub resolver: Arc<dyn WorkspaceResolver>,
     pub config: Arc<Config>,
     pub dev_server: Arc<DevServerManager>,
+    pub build_manager: Arc<BuildManager>,
+    pub log_cache: Arc<LogCacheManager>,
+    pub started_at: std::time::Instant,
 }

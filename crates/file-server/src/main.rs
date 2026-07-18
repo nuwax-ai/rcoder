@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::HeaderValue;
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
-use axum::{Router, routing::get};
 use file_server::error::{AppError, REQUEST_ID, generate_request_id};
-use file_server::{AppState, Config, DevServerManager, LocalWorkspaceResolver, handler};
+use file_server::{
+    AppState, BuildManager, Config, DevServerManager, LocalWorkspaceResolver, LogCacheManager,
+};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -27,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let port = std::env::var(ENV_PORT)
+        .or_else(|_| std::env::var("PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PORT);
@@ -35,20 +37,23 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         resolver: Arc::new(LocalWorkspaceResolver::from_env()),
         dev_server: Arc::new(DevServerManager::new(config.clone())),
+        build_manager: Arc::new(BuildManager::new(config.max_build_concurrency)),
+        log_cache: Arc::new(LogCacheManager::new(&config)),
         config,
+        started_at: std::time::Instant::now(),
     };
     // clone Arc 给 graceful shutdown 闭包 (state 会被 with_state 消费)
     let dev_server = state.dev_server.clone();
+    let request_body_limit =
+        usize::try_from(state.config.request_body_max_bytes).unwrap_or(usize::MAX);
 
-    let app = Router::<AppState>::new()
-        .route("/health", get(handler::health))
-        .nest("/api/project", file_server::routes::project_api_router())
-        .nest("/api/git", file_server::routes::git_router())
-        .nest("/api/build", file_server::routes::build_router())
-        .nest("/api/computer", file_server::routes::computer_router())
-        .nest("/api/page", file_server::routes::page_router())
+    let (api_router, openapi) = file_server::routes::api_router().split_for_parts();
+    let app = api_router
+        .merge(file_server::openapi::swagger_ui(openapi))
         // 未匹配路由 → JSON ResourceError (对齐 nuwax notFoundHandler)
         .fallback(not_found)
+        // Axum 默认 2MB，会在 handler 前拒绝项目 JSON/ZIP；改为可配置并对齐旧服务。
+        .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(from_fn(request_id_layer))
         .layer(TraceLayer::new_for_http())
         .with_state(state);

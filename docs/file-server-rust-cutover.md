@@ -14,7 +14,9 @@ RCoder 的 file-server(node `nuwax-file-server`)已用 Rust 重写(`crates/file-
 - `/app/bin/file-server` —— **Rust 版**(新)
 - `nuwax-file-server`(npm 全局,node 版)—— **保留作回滚**
 
-> Rust 版 env 全部对齐 nuwax 名:`FILE_SERVER_PORT` / `PROJECT_SOURCE_DIR` / `COMPUTER_WORKSPACE_DIR` /
+> Rust 版兼容 `FILE_SERVER_PORT`，也兼容 nuwax 原生 `PORT`；请求体上限同时支持字节数
+> `REQUEST_BODY_MAX_BYTES` 和 nuwax 字符串格式 `REQUEST_BODY_LIMIT=2000mb`。其余业务 env 使用:
+> `PROJECT_SOURCE_DIR` / `COMPUTER_WORKSPACE_DIR` /
 > `UPLOAD_PROJECT_DIR` / `DIST_TARGET_DIR` / `LOG_BASE_DIR` / `COMPUTER_LOG_DIR` / `TEMPLATE_CACHE_DIR` /
 > `NODE_MODULES_LOCAL_DIR` / `INIT_PROJECT_DIR` / `DEPLOYMENT_MODE` / `FAST_RESTART_ENABLED` / `GIT_*`。
 > build-agent-docker configmap 无需改 env。
@@ -36,7 +38,7 @@ fi
 nohup "$FILE_SERVER_CMD" > /app/logs/file-server.out 2>&1 &
 ```
 
-> Rust 版 `/health` 契约与 nuwax 一致:`GET /health` → 200 `{status:"ok",service:"file-server"}`,
+> Rust 版 `/health` 契约与 nuwax 一致:`GET /health` → 200 且 `status:"ok"`,
 > start-services.sh 的探活逻辑无需改。
 
 ## 3. 回滚
@@ -57,8 +59,44 @@ Rust 版启动后(经 pingora `/proxy/{port}` 反代,与 node 版同链路):
 - [ ] **computer**:`/api/computer/*`(file-list/files-update/upload/execute-command/install/create/delete/get-logs/push-skills/build-agent-package)
 - [ ] 对比 node 版无功能退化
 
+### 4.1 本地双服务差异探针
+
+使用彼此隔离的工作区启动两个服务。TS 启动时会清理 `INIT_PROJECT_DIR` 下已解压目录，
+因此先复制 ZIP 到临时模板目录，禁止直接把 TS 指向本仓源模板目录：
+
+```bash
+# 一次性准备隔离模板
+mkdir -p /tmp/file-server-diff/templates
+cp /Users/soddy/Documents/git-workspace/rcoder/tmp/template/*.zip \
+  /tmp/file-server-diff/templates/
+
+# terminal 1: TS
+cd /Users/soddy/Documents/git-workspace/nuwax-file-server
+PORT=60000 \
+PROJECT_SOURCE_DIR=/tmp/file-server-diff/ts/projects \
+COMPUTER_WORKSPACE_DIR=/tmp/file-server-diff/ts/computers \
+INIT_PROJECT_DIR=/tmp/file-server-diff/templates \
+node src/server.js
+
+# terminal 2: Rust
+cd /Users/soddy/Documents/git-workspace/rcoder
+FILE_SERVER_PORT=60001 \
+PROJECT_SOURCE_DIR=/tmp/file-server-diff/rust/projects \
+COMPUTER_WORKSPACE_DIR=/tmp/file-server-diff/rust/computers \
+INIT_PROJECT_DIR=/tmp/file-server-diff/templates \
+cargo run -p file-server
+
+# terminal 3: 只读/失败路径契约差异测试
+node scripts/file-server-differential.mjs
+```
+
+脚本会比较健康检查、404、JSON rejection、业务校验、缺失 Git 工作区和构建错误解析；
+任何业务字段差异都会以非零退出码结束，可直接接入 CI。涉及创建项目、上传 ZIP、Vite/HMR、
+Git branch/tag/reset 的有状态场景仍按上面的冒烟清单执行，并确保两个服务使用不同工作区。
+
 ## 5. Rust 版相对 node 版的差异(已知)
 
-- **不跑** `@xagi/dev-inject` + `vite-plugin-design-mode`(监控面板 + 设计模式插件;已确认不需要)
+- `@xagi/dev-inject` + `vite-plugin-design-mode` 已在 Rust dev 启动流程中执行。
 - **不跑** pnpm store 定时清理(nuwax 的 `pnpmPruneScheduler`,独立功能,可在 rcoder 侧另行加 cron)
-- 错误分类、进程组 kill、早退检测、日志原子写等比 node 版更强
+- TS 的进程级 CLI `start/stop/restart/status` 不迁移；K8s 由容器生命周期管理 file-server 本身。
+- Rust 增强了错误分类、进程组 kill、上传原子切换、路径/Zip Slip 校验和 Git `spawn_blocking` 隔离。

@@ -3,13 +3,13 @@
 
 use std::path::Path;
 
-use axum::Json;
-use axum::extract::{Multipart, Query, State};
+use axum::extract::State;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::error::AppError;
+use crate::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
 use crate::path_safety;
 use crate::service::{code as code_service, tree};
 
@@ -17,17 +17,65 @@ use super::{
     UserCidQuery, bytes_field, resolve_computer_target, text_field, validate_zip_ext, ws_path,
 };
 
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DeleteWorkspaceBody {
+    user_id: String,
+    c_id: String,
+}
+
+#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadFileForm {
+    pub user_id: String,
+    pub c_id: String,
+    pub file_path: String,
+    pub custom_target_dir: Option<String>,
+    #[schema(format = Binary)]
+    pub file: String,
+}
+
+#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadFilesForm {
+    pub user_id: String,
+    pub c_id: String,
+    pub custom_target_dir: Option<String>,
+    pub file_paths: Vec<String>,
+    pub files: Vec<crate::openapi::BinaryFile>,
+}
+
+#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProjectForm {
+    pub user_id: String,
+    pub c_id: String,
+    pub custom_target_dir: Option<String>,
+    #[schema(format = Binary)]
+    pub file: String,
+}
+
 // ── get-file-list ───────────────────────────────────────────────────────────────
 
 /// `GET /api/computer/get-file-list` (对齐 nuwax getFileList):
 /// 轻量元信息遍历 (不读内容) + customTargetDir 覆盖; 目录不存在返回空数组。
+#[utoipa::path(
+    get,
+    path = "/get-file-list",
+    params(UserCidQuery),
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Computer"
+)]
 pub(super) async fn get_file_list(
     State(state): State<AppState>,
     Query(q): Query<UserCidQuery>,
 ) -> Result<Json<Value>, AppError> {
     let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref());
     // 对齐 nuwax: 目录不存在 → 返回空数组 (非报错)
-    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&path).await? {
         return Ok(Json(json!({ "success": true, "files": [] })));
     }
     let mut files = tree::list_files_meta(&path, &state.config, q.proxy_path.as_deref()).await?;
@@ -54,19 +102,12 @@ pub(super) async fn get_file_list(
 // ── delete-workspace ────────────────────────────────────────────────────────────
 
 /// `POST /api/computer/delete-workspace` (对齐 nuwax deleteWorkspace; 目录不存在也返回 deleted)。
+#[utoipa::path(post, path = "/delete-workspace", request_body = DeleteWorkspaceBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(super) async fn delete_workspace(
     State(state): State<AppState>,
-    Json(body): Json<serde_json::Map<String, Value>>,
+    Json(body): Json<DeleteWorkspaceBody>,
 ) -> Result<Json<Value>, AppError> {
-    let user_id = body
-        .get("userId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::validation("userId is required"))?;
-    let cid = body
-        .get("cId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::validation("cId is required"))?;
-    let path = ws_path(&state, user_id, cid);
+    let path = ws_path(&state, &body.user_id, &body.c_id);
     // 不存在视为已删除 (对齐 nuwax, 只 warn)
     if path.exists() {
         tokio::fs::remove_dir_all(&path)
@@ -78,7 +119,7 @@ pub(super) async fn delete_workspace(
 
 // ── files-update ────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct FilesUpdateBody {
     user_id: String,
@@ -89,6 +130,7 @@ pub(super) struct FilesUpdateBody {
 }
 
 /// `POST /api/computer/files-update` (对齐 nuwax computer updateFiles; 增量 create/delete/rename/modify)。
+#[utoipa::path(post, path = "/files-update", request_body = FilesUpdateBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(super) async fn files_update(
     State(state): State<AppState>,
     Json(mut body): Json<FilesUpdateBody>,
@@ -131,6 +173,7 @@ pub(super) async fn files_update(
 
 /// `POST /api/computer/upload-file` (对齐 nuwax computer uploadFile; multipart)。
 /// 返回 {success, message, fileSize} (不返回 filePath/originalname)。
+#[utoipa::path(post, path = "/upload-file", request_body(content = UploadFileForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(super) async fn upload_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -150,7 +193,9 @@ pub(super) async fn upload_file(
             "cId" => cid = Some(text_field(field).await?),
             "filePath" => file_path = Some(text_field(field).await?),
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
-            "file" => data = Some(bytes_field(field).await?),
+            "file" => {
+                data = Some(bytes_field(field, state.config.upload_single_file_size_bytes).await?)
+            }
             _ => {}
         }
     }
@@ -174,6 +219,7 @@ pub(super) async fn upload_file(
 
 /// `POST /api/computer/upload-files` (对齐 nuwax computer uploadFiles; 多文件 multipart)。
 /// 返回 {success, message, totalCount, successCount, failCount, results:[{success,filePath,originalname?,message?,fileSize?,error?}]}。
+#[utoipa::path(post, path = "/upload-files", request_body(content = UploadFilesForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(super) async fn upload_files(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -195,7 +241,10 @@ pub(super) async fn upload_files(
             "filePaths" => file_paths.push(text_field(field).await?),
             "files" => {
                 let original = field.file_name().map(|s| s.to_string());
-                files_vec.push((original, bytes_field(field).await?));
+                files_vec.push((
+                    original,
+                    bytes_field(field, state.config.upload_single_file_size_bytes).await?,
+                ));
             }
             _ => {}
         }
@@ -210,15 +259,6 @@ pub(super) async fn upload_files(
     let mut success_count = 0usize;
     let mut results: Vec<Value> = Vec::new();
     for (fp, (original, data)) in file_paths.iter().zip(files_vec) {
-        // 空文件对象
-        if data.is_empty() {
-            results.push(json!({
-                "success": false,
-                "filePath": fp,
-                "error": "Empty file object",
-            }));
-            continue;
-        }
         let target = match path_safety::ensure_within(&ws, fp) {
             Ok(t) => t,
             Err(_) => {
@@ -276,6 +316,7 @@ async fn write_file_create_parent(target: &Path, data: Vec<u8>) -> Result<(), st
 
 /// `POST /api/computer/import-project` (对齐 nuwax computer importProject):
 /// 上传 zip → 解压 + removeTopLevelDir + 白名单保留合并到工作区。
+#[utoipa::path(post, path = "/import-project", request_body(content = ImportProjectForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(super) async fn import_project(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -296,7 +337,7 @@ pub(super) async fn import_project(
             "customTargetDir" => custom_target_dir = Some(text_field(field).await?),
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                data = Some(bytes_field(field).await?);
+                data = Some(bytes_field(field, state.config.upload_max_file_size_bytes).await?);
             }
             _ => {}
         }

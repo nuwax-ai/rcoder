@@ -35,7 +35,7 @@ pub async fn all_files_update(
     }
     version::parse_version(code_version)?;
     let project_path = resolver.resolve_project(ctx);
-    if !fs::try_exists(&project_path).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
     version::backup_project(config, project_id, &project_path, code_version).await?;
@@ -56,7 +56,7 @@ pub async fn apply_all_files(base: &Path, config: &Config, files: &[FileEntry]) 
         };
         // (A) 目录
         if file.is_dir == Some(true) {
-            if !fs::try_exists(&target).await.unwrap_or(false) {
+            if !crate::service::fs_util::path_exists(&target).await? {
                 fs::create_dir_all(&target).await?;
             }
             continue;
@@ -64,7 +64,7 @@ pub async fn apply_all_files(base: &Path, config: &Config, files: &[FileEntry]) 
         // (B) rename
         if let Some(from) = file.rename_from.as_deref()
             && let Some(old) = safe_within_or_skip(base, from)
-            && fs::try_exists(&old).await.unwrap_or(false)
+            && crate::service::fs_util::path_exists(&old).await?
         {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).await?;
@@ -82,7 +82,7 @@ pub async fn apply_all_files(base: &Path, config: &Config, files: &[FileEntry]) 
             .unwrap_or(false);
         // (C) 二进制
         if is_binary {
-            if fs::try_exists(&target).await.unwrap_or(false) {
+            if crate::service::fs_util::path_exists(&target).await? {
                 continue;
             }
             if has_contents {
@@ -128,8 +128,8 @@ pub async fn apply_all_files(base: &Path, config: &Config, files: &[FileEntry]) 
     for file in files {
         if file.is_dir == Some(true) {
             let dir_path = base.join(normalize_relative(&file.name));
-            if !fs::try_exists(&dir_path).await.unwrap_or(false) {
-                let _ = fs::create_dir_all(&dir_path).await;
+            if !crate::service::fs_util::path_exists(&dir_path).await? {
+                fs::create_dir_all(&dir_path).await?;
             }
         }
     }

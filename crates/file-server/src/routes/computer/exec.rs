@@ -4,20 +4,21 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::error::{AppError, AppResult};
+use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::service::pnpm::{self, InstallOptions};
 use crate::service::pnpm_config;
 
 use super::{resolve_computer_target, ws_path};
 
 // ── execute-command ─────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ExecCommandBody {
     user_id: String,
@@ -28,6 +29,7 @@ pub(super) struct ExecCommandBody {
 /// `POST /api/computer/execute-command` (对齐 nuwax executeCommand; shell 执行 + 超时 + 捕获输出)。
 /// command 是 agent 提供的 shell 命令串, 故经 shell -c (与 nuwax child_process.exec 一致)。
 /// shell 优先用 `BASH_PATH` (未配置则 sh); stdout/stderr 截断到 50MB (对齐 nuwax maxBuffer)。
+#[utoipa::path(post, path = "/execute-command", request_body = ExecCommandBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(super) async fn execute_command(
     State(state): State<AppState>,
     Json(body): Json<ExecCommandBody>,
@@ -54,9 +56,12 @@ pub(super) async fn execute_command(
     // 输出捕获 (maxBuffer 50MB 对齐 nuwax)
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
     let child = cmd
         .spawn()
         .map_err(|e| AppError::system(format!("execute-command spawn failed: {e}")))?;
+    let child_pid = child.id();
     let out =
         tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
     match out {
@@ -65,7 +70,8 @@ pub(super) async fn execute_command(
             let stderr = cap_50mb(String::from_utf8_lossy(&o.stderr));
             let code = o.status.code().unwrap_or(-1);
             Ok(Json(json!({
-                "success": code == 0,
+                // TS 外层响应始终 success=true，命令结果由 exitCode 表示。
+                "success": true,
                 "stdout": stdout,
                 "stderr": stderr,
                 "exitCode": code,
@@ -74,12 +80,17 @@ pub(super) async fn execute_command(
         Ok(Err(e)) => Err(AppError::system(format!(
             "execute-command wait failed: {e}"
         ))),
-        Err(_) => Ok(Json(json!({
-            "success": false,
-            "stdout": "",
-            "stderr": format!("command timed out after {timeout_secs}s"),
-            "exitCode": -1,
-        }))),
+        Err(_) => {
+            if let Some(pid) = child_pid {
+                crate::service::dev_server::process::kill_process_group_force(pid);
+            }
+            Ok(Json(json!({
+                "success": true,
+                "stdout": "",
+                "stderr": format!("command timed out after {timeout_secs}s"),
+                "exitCode": -1,
+            })))
+        }
     }
 }
 
@@ -100,7 +111,8 @@ fn cap_50mb(cow: std::borrow::Cow<'_, str>) -> String {
 
 // ── get-logs ────────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct GetLogsQuery {
     user_id: String,
@@ -114,6 +126,13 @@ fn default_tail_lines() -> usize {
 
 /// `GET /api/computer/get-logs` (对齐 nuwax getLatestLogs; 读 .logs/ 下 mtime 最新的文件末尾 N 行)。
 /// 空场景区分 message, logFileName=null; 成功 message="Get log successfully"; 过滤空行。
+#[utoipa::path(
+    get,
+    path = "/get-logs",
+    params(GetLogsQuery),
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Computer"
+)]
 pub(super) async fn get_logs(
     State(state): State<AppState>,
     Query(q): Query<GetLogsQuery>,
@@ -188,7 +207,7 @@ async fn latest_log_file(dir: &Path) -> AppResult<Option<PathBuf>> {
 
 // ── install-project ─────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct InstallBody {
     user_id: String,
@@ -198,6 +217,7 @@ pub(super) struct InstallBody {
 
 /// `POST /api/computer/install-project` (对齐 nuwax installProjectDependencies)。
 /// typescript → 递归找 package.json 目录 pnpm install; python → 找 requirements/pyproject pip install。
+#[utoipa::path(post, path = "/install-project", request_body = InstallBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(super) async fn install_project(
     State(state): State<AppState>,
     Json(body): Json<InstallBody>,
@@ -215,17 +235,7 @@ pub(super) async fn install_project(
                 Some(d) => Some(d),
                 None => find_first(&ws, "package.json").await,
             };
-            (
-                "pnpm",
-                vec![
-                    "install",
-                    "--prefer-offline",
-                    "--config.production=false",
-                    "--config.confirmModulesPurge=false",
-                    "--config.dangerouslyAllowAllBuilds=true",
-                ],
-                dir,
-            )
+            ("pnpm", Vec::new(), dir)
         }
         "python" | "py" => {
             // 优先 pyproject.toml (pip install -e .), 否则 requirements.txt
@@ -256,18 +266,32 @@ pub(super) async fn install_project(
     if program == "pnpm" {
         pnpm_config::ensure_pnpm_install_config(&project_dir).await;
     }
-    let (_stdout, stderr, code) = run_capture(program, &args, &project_dir, timeout).await?;
-    // 失败 → SystemError 500 (对齐 nuwax installProjectDependencies:
-    // throw SystemError(`Project dependencies install failed: ${stderr||stdout}`))
-    if code != 0 {
-        let detail = if stderr.trim().is_empty() {
-            _stdout
-        } else {
-            stderr
+    if program == "pnpm" {
+        let options = InstallOptions {
+            prefer_offline: true,
+            extra_args: vec![
+                "--config.production=false".to_string(),
+                "--config.confirmModulesPurge=false".to_string(),
+                "--config.dangerouslyAllowAllBuilds=true".to_string(),
+            ],
         };
-        return Err(AppError::system(format!(
-            "Project dependencies install failed: {detail}"
-        )));
+        pnpm::install(&project_dir, &options, None, timeout)
+            .await
+            .map_err(|error| {
+                AppError::system(format!("Project dependencies install failed: {error}"))
+            })?;
+    } else {
+        let (stdout, stderr, code) = run_capture(program, &args, &project_dir, timeout).await?;
+        if code != 0 {
+            let detail = if stderr.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            };
+            return Err(AppError::system(format!(
+                "Project dependencies install failed: {detail}"
+            )));
+        }
     }
     Ok(Json(json!({
         "success": true,
@@ -279,7 +303,7 @@ pub(super) async fn install_project(
 
 // ── build-agent-package ─────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BuildAgentBody {
     user_id: String,
@@ -292,6 +316,7 @@ pub(super) struct BuildAgentBody {
 /// 递归找含 scripts/package-platforms.mjs 的目录 → pnpm install →
 /// `node scripts/package-platforms.mjs agent-{id} {ver} {dir}/dist-packages --print-artifacts`
 /// → 解析 stdout 中产物 (path 转 workspace 相对, platform 从文件名提取)。响应无 stdout。
+#[utoipa::path(post, path = "/build-agent-package", request_body = BuildAgentBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(super) async fn build_agent_package(
     State(state): State<AppState>,
     Json(body): Json<BuildAgentBody>,
@@ -310,12 +335,9 @@ pub(super) async fn build_agent_package(
     // pnpm install 前准备 .npmrc (best-effort, 对齐 nuwax runPnpmInstall → ensurePnpmInstallConfig)
     pnpm_config::ensure_pnpm_install_config(&pkg_dir).await;
     // pnpm install (含 devDependencies; esbuild/typescript 在 devDependencies 中)
-    let (_, _, code) = run_capture("pnpm", &["install"], &pkg_dir, timeout).await?;
-    if code != 0 {
-        return Err(AppError::system(format!(
-            "pnpm install failed (exit {code})"
-        )));
-    }
+    pnpm::install(&pkg_dir, &InstallOptions::default(), None, timeout)
+        .await
+        .map_err(|error| AppError::system(format!("pnpm install failed: {error}")))?;
     // 打包
     let dist_packages = pkg_dir.join("dist-packages");
     let agent_name = format!("agent-{}", body.agent_id);
@@ -344,26 +366,28 @@ pub(super) async fn build_agent_package(
 
 // ── cleanup-build-artifacts ─────────────────────────────────────────────────────
 
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CleanupBuildArtifactsBody {
+    user_id: String,
+    c_id: String,
+    #[serde(default)]
+    custom_target_dir: Option<String>,
+}
+
 /// `POST /api/computer/cleanup-build-artifacts` (对齐 nuwax cleanupBuildArtifacts; 删 dist-packages)。
 /// 返回 {success, cleaned} (字段 cleaned, 非 removed; 无 message)。
 /// 递归找 scripts/package-platforms.mjs 所在 projectDir, 删其 dist-packages (对齐 nuwax)。
+#[utoipa::path(post, path = "/cleanup-build-artifacts", request_body = CleanupBuildArtifactsBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(super) async fn cleanup_build_artifacts(
     State(state): State<AppState>,
-    Json(body): Json<serde_json::Map<String, Value>>,
+    Json(body): Json<CleanupBuildArtifactsBody>,
 ) -> Result<Json<Value>, AppError> {
-    let user_id = body
-        .get("userId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::validation("userId is required"))?;
-    let cid = body
-        .get("cId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::validation("cId is required"))?;
     let ws = resolve_computer_target(
         &state,
-        user_id,
-        cid,
-        body.get("customTargetDir").and_then(|v| v.as_str()),
+        &body.user_id,
+        &body.c_id,
+        body.custom_target_dir.as_deref(),
     );
     if !ws.exists() {
         return Ok(Json(json!({ "success": true, "cleaned": false })));
@@ -477,9 +501,12 @@ async fn run_capture(
     cmd.env("NODE_ENV", "development");
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
     let child = cmd
         .spawn()
         .map_err(|e| AppError::system(format!("spawn {program} failed: {e}")))?;
+    let child_pid = child.id();
     let out =
         tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
     match out {
@@ -489,11 +516,16 @@ async fn run_capture(
             o.status.code().unwrap_or(-1),
         )),
         Ok(Err(e)) => Err(AppError::system(format!("{program} wait failed: {e}"))),
-        Err(_) => Ok((
-            String::new(),
-            format!("timed out after {timeout_secs}s"),
-            -1,
-        )),
+        Err(_) => {
+            if let Some(pid) = child_pid {
+                crate::service::dev_server::process::kill_process_group_force(pid);
+            }
+            Ok((
+                String::new(),
+                format!("timed out after {timeout_secs}s"),
+                -1,
+            ))
+        }
     }
 }
 

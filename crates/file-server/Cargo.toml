@@ -28,6 +28,9 @@ shared_types = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
 
 # 异步运行时
 tokio = { workspace = true, features = ["full"] }
@@ -71,3 +74,6 @@ nix = { workspace = true }
 
 # 正则 (构建错误解析)
 regex = { workspace = true }
+
+# 组合解析器 (hook shell 环境变量语法等小型文法)
+winnow = { workspace = true }

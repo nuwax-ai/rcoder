@@ -17,6 +17,11 @@ pub use write::*;
 
 use std::path::{Path, PathBuf};
 
+use gix::index::write::Options as IndexWriteOptions;
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::{FullName, Target};
+use gix::{Repository, init, open};
+
 use crate::error::{AppError, AppResult};
 use crate::workspace::{ComputerContext, ProjectContext, WorkspaceResolver};
 
@@ -25,6 +30,7 @@ pub const DEFAULT_GITIGNORE_ENTRIES: &[&str] = &[
     "node_modules/",
     ".pnpm-store/",
     "dist/",
+    "dist-packages/",
     "build/",
     ".idea/",
     ".vscode/",
@@ -85,6 +91,9 @@ pub fn resolve_target(
                 ));
             }
             let path = resolver.resolve_computer(ctx);
+            if !path.exists() {
+                return Err(AppError::resource("Computer workspace does not exist"));
+            }
             Ok(GitTarget::TaskAgent {
                 user_id: ctx.user_id.clone(),
                 cid: ctx.cid.clone(),
@@ -98,6 +107,9 @@ pub fn resolve_target(
                 return Err(AppError::validation("pageApp mode requires projectId"));
             }
             let path = resolver.resolve_project(ctx);
+            if !path.exists() {
+                return Err(AppError::resource("Project does not exist"));
+            }
             Ok(GitTarget::PageApp {
                 project_id: ctx.project_id.clone(),
                 path,
@@ -144,7 +156,16 @@ pub fn ensure_gitignore(path: &Path) -> AppResult<()> {
         return Ok(());
     }
     let gitignore = path.join(".gitignore");
-    let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    let current = match std::fs::read_to_string(&gitignore) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(AppError::system(format!(
+                "read .gitignore {}: {error}",
+                gitignore.display()
+            )));
+        }
+    };
     let existing: Vec<String> = current.lines().map(|l| l.trim().to_string()).collect();
     let entries = gitignore_entries();
     let mut to_append: Vec<&str> = Vec::new();
@@ -167,12 +188,13 @@ pub fn ensure_gitignore(path: &Path) -> AppResult<()> {
 }
 
 /// 打开或初始化仓库 (对齐 nuwax ensureGitRepo 的 open/init 部分; initial commit 见 write::commit_indexed)。
-pub fn ensure_repo(path: &Path) -> AppResult<gix::Repository> {
+pub fn ensure_repo(path: &Path) -> AppResult<Repository> {
     if is_git_repo(path) {
-        gix::open(path).map_err(|e| AppError::system(format!("git open failed: {e}")))
+        open(path).map_err(|e| AppError::system(format!("git open failed: {e}")))
     } else {
-        let repo =
-            gix::init(path).map_err(|e| AppError::system(format!("git init failed: {e}")))?;
+        let repo = init(path).map_err(|e| AppError::system(format!("git init failed: {e}")))?;
+        // nuwax 显式 defaultBranch=main；覆盖宿主机/镜像中的 init.defaultBranch 配置。
+        set_unborn_head_to_main(&repo)?;
         // 新 repo 无 .git/index 文件, 从空 tree 创建空 index (否则首次 stage 的 open_index 失败)
         let empty_id = repo
             .head_tree_id_or_empty()
@@ -182,10 +204,33 @@ pub fn ensure_repo(path: &Path) -> AppResult<gix::Repository> {
             .index_from_tree(&empty_id)
             .map_err(|e| AppError::system(format!("git index_from_tree: {e}")))?;
         idx.remove_tree();
-        idx.write(gix::index::write::Options::default())
+        idx.write(IndexWriteOptions::default())
             .map_err(|e| AppError::system(format!("git index write: {e}")))?;
         Ok(repo)
     }
+}
+
+fn set_unborn_head_to_main(repo: &Repository) -> AppResult<()> {
+    let edit = RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "init: set default branch to main".into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(
+                FullName::try_from("refs/heads/main")
+                    .map_err(|e| AppError::system(format!("invalid main ref: {e}")))?,
+            ),
+        },
+        name: FullName::try_from("HEAD")
+            .map_err(|e| AppError::system(format!("invalid HEAD ref: {e}")))?,
+        deref: false,
+    };
+    repo.edit_references(std::iter::once(edit))
+        .map_err(|e| map_git_err(e, "git set initial HEAD to main"))?;
+    Ok(())
 }
 
 /// gix 错误 → AppError::system。
@@ -201,4 +246,33 @@ pub(crate) fn shorten_ref(full: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::LocalWorkspaceResolver;
+
+    #[test]
+    fn resolve_target_rejects_missing_workspace_without_creating_it() {
+        let root =
+            std::env::temp_dir().join(format!("file-server-git-resolve-{}", std::process::id()));
+        let project_root = root.join("projects");
+        let computer_root = root.join("computers");
+        let resolver = LocalWorkspaceResolver::new(project_root.clone(), computer_root);
+        let context = ProjectContext {
+            project_id: "missing".to_string(),
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
+        };
+
+        let error = match resolve_target(&resolver, "pageApp", Some(&context), None) {
+            Ok(_) => panic!("missing workspace must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, AppError::Resource(_)));
+        assert!(!project_root.join("missing").exists());
+    }
 }

@@ -108,7 +108,7 @@ pub async fn backup_current_version(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     let project_path = resolver.resolve_project(ctx);
-    if !fs::try_exists(&project_path).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
     let zip = backup_project(config, project_id, &project_path, code_version)
@@ -147,18 +147,18 @@ pub async fn rollback_version(
         ));
     }
     let project_path = resolver.resolve_project(ctx);
-    if !fs::try_exists(&project_path).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
     let target_zip = version_zip_path(config, project_id, to);
-    if !fs::try_exists(&target_zip).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&target_zip).await? {
         return Err(AppError::resource(format!(
             "Rollback version v{to} zip not found"
         )));
     }
     // 当前版本若未备份, 先备份 (避免覆盖已有备份)
     let cur_zip = version_zip_path(config, project_id, cur);
-    if !fs::try_exists(&cur_zip).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&cur_zip).await? {
         backup_project(config, project_id, &project_path, code_version).await?;
     }
     // 从目标版本恢复; 失败则尝试从刚才备份的当前版本恢复 (对齐 nuwax rollbackVersion catch)
@@ -170,7 +170,7 @@ pub async fn rollback_version(
     )
     .await
     {
-        if fs::try_exists(&cur_zip).await.unwrap_or(false) {
+        if crate::service::fs_util::path_exists(&cur_zip).await? {
             tracing::warn!(error = %e, "rollback restore failed, restoring current version backup");
             let _ = restore_from_zip(
                 &project_path,
@@ -206,7 +206,7 @@ pub async fn get_content_by_version(
     let version = parse_version(code_version)?;
     let project_path = resolver.resolve_project(ctx);
     let zip = version_zip_path(config, project_id, version);
-    if !fs::try_exists(&zip).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&zip).await? {
         return Err(AppError::resource(format!(
             "Version v{version} zip not found"
         )));

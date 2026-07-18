@@ -1,7 +1,7 @@
 //! code 文件操作的请求结构 (对齐 nuwax codeService 入参)。
 
 /// 增量文件操作项 (specified-files-update / computer files-update)。
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FileOp {
     pub operation: String,
@@ -15,7 +15,7 @@ pub struct FileOp {
 }
 
 /// 全量文件项 (all-files-update)。
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
     pub name: String,

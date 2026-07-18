@@ -4,8 +4,14 @@ use crate::error::AppResult;
 
 use super::{map_git_err, shorten_ref};
 
+use gix::diff::index::ChangeRef as IndexChange;
+use gix::progress::Discard;
+use gix::status::index_worktree::Item as WorktreeItem;
+use gix::status::{Item as StatusItem, UntrackedFiles};
+use gix::{Commit, Repository};
+
 /// 列本地分支 + 当前分支名 (对齐 nuwax listBranches + currentBranch)。
-pub fn list_branches(repo: &gix::Repository) -> AppResult<(Vec<String>, Option<String>)> {
+pub fn list_branches(repo: &Repository) -> AppResult<(Vec<String>, Option<String>)> {
     let current = repo
         .head_name()
         .ok()
@@ -29,7 +35,7 @@ pub fn list_branches(repo: &gix::Repository) -> AppResult<(Vec<String>, Option<S
 }
 
 /// 列标签 (对齐 nuwax listTags)。
-pub fn list_tags(repo: &gix::Repository) -> AppResult<Vec<String>> {
+pub fn list_tags(repo: &Repository) -> AppResult<Vec<String>> {
     let mut tags = Vec::new();
     let refs = repo
         .references()
@@ -57,10 +63,11 @@ pub struct CommitInfo {
 /// 提交历史 (对齐 nuwax logHistory; first-parent)。
 /// `branch` 非空 → 从该 ref 起 walk (对齐 nuwax git.log({ ref: branch })); 默认 HEAD。
 pub fn log_history(
-    repo: &gix::Repository,
+    repo: &Repository,
     max_count: usize,
     skip: usize,
     branch: Option<&str>,
+    file_path: Option<&str>,
 ) -> AppResult<Vec<CommitInfo>> {
     let start_id = match branch {
         Some(b) if !b.trim().is_empty() => repo
@@ -81,6 +88,14 @@ pub fn log_history(
     let mut seen = 0usize;
     for info in walk {
         let info = info.map_err(|e| map_git_err(e, "git walk item"))?;
+        let commit = info
+            .object()
+            .map_err(|e| map_git_err(e, "git commit object"))?;
+        if let Some(path) = file_path.filter(|p| !p.trim().is_empty())
+            && !commit_changes_path(repo, &commit, path)?
+        {
+            continue;
+        }
         if seen < skip {
             seen += 1;
             continue;
@@ -88,13 +103,15 @@ pub fn log_history(
         if commits.len() >= max_count {
             break;
         }
-        let commit = info
-            .object()
-            .map_err(|e| map_git_err(e, "git commit object"))?;
-        let message = commit
+        let mut message = commit
             .message_raw()
             .map_err(|e| map_git_err(e, "git message"))?
             .to_string();
+        // isomorphic-git 的 `readCommit()` 会把提交消息作为完整消息段返回，
+        // 其序列化的 commit message 末尾带换行。API 保留该可见格式。
+        if !message.ends_with('\n') {
+            message.push('\n');
+        }
         let author = commit.author().map_err(|e| map_git_err(e, "git author"))?;
         let secs = commit
             .time()
@@ -111,6 +128,31 @@ pub fn log_history(
     Ok(commits)
 }
 
+fn commit_changes_path(repo: &Repository, commit: &Commit<'_>, path: &str) -> AppResult<bool> {
+    let tree = commit
+        .tree()
+        .map_err(|e| map_git_err(e, "git commit tree"))?;
+    let current = tree
+        .lookup_entry_by_path(path)
+        .map_err(|e| map_git_err(e, "git lookup path in commit"))?
+        .map(|entry| (entry.id().detach(), entry.mode()));
+    let parent = match commit.parent_ids().next() {
+        Some(parent_id) => {
+            let parent_tree = repo
+                .find_commit(parent_id)
+                .map_err(|e| map_git_err(e, "git find parent"))?
+                .tree()
+                .map_err(|e| map_git_err(e, "git parent tree"))?;
+            parent_tree
+                .lookup_entry_by_path(path)
+                .map_err(|e| map_git_err(e, "git lookup path in parent"))?
+                .map(|entry| (entry.id().detach(), entry.mode()))
+        }
+        None => None,
+    };
+    Ok(current != parent)
+}
+
 fn iso_from_secs(secs: i64) -> String {
     // 对齐 nuwax `new Date(ts*1000).toISOString()` → "YYYY-MM-DDTHH:mm:ss.sssZ" (毫秒 + UTC Z)
     chrono::DateTime::from_timestamp(secs, 0)
@@ -120,7 +162,7 @@ fn iso_from_secs(secs: i64) -> String {
 
 /// 读 ref 处的文件内容 (对齐 nuwax fileContent)。
 pub fn file_content_at_ref(
-    repo: &gix::Repository,
+    repo: &Repository,
     ref_spec: &str,
     file_path: &str,
 ) -> AppResult<Option<String>> {
@@ -157,7 +199,7 @@ pub struct StatusResult {
 
 /// 工作区状态 (对齐 nuwax status; gix status platform 折叠到 5-bucket)。
 /// IndexWorktree Modification 暂统一归 modified (worktree delete 细分需 gix_status EntryStatus)。
-pub fn get_status(repo: &gix::Repository) -> AppResult<StatusResult> {
+pub fn get_status(repo: &Repository) -> AppResult<StatusResult> {
     let current = repo
         .head_name()
         .ok()
@@ -172,9 +214,9 @@ pub fn get_status(repo: &gix::Repository) -> AppResult<StatusResult> {
         untracked: vec![],
     };
     let mut iter = repo
-        .status(gix::progress::Discard)
+        .status(Discard)
         .map_err(|e| map_git_err(e, "git status"))?
-        .untracked_files(gix::status::UntrackedFiles::Files)
+        .untracked_files(UntrackedFiles::Files)
         .into_iter(None)
         .map_err(|e| map_git_err(e, "git status into_iter"))?;
     while let Some(item) = iter
@@ -183,20 +225,12 @@ pub fn get_status(repo: &gix::Repository) -> AppResult<StatusResult> {
         .map_err(|e| map_git_err(e, "git status item"))?
     {
         match item {
-            gix::status::Item::TreeIndex(change) => {
+            StatusItem::TreeIndex(change) => {
                 let (loc, is_add, is_del) = match &change {
-                    gix::diff::index::ChangeRef::Addition { location, .. } => {
-                        (location, true, false)
-                    }
-                    gix::diff::index::ChangeRef::Deletion { location, .. } => {
-                        (location, false, true)
-                    }
-                    gix::diff::index::ChangeRef::Modification { location, .. } => {
-                        (location, false, false)
-                    }
-                    gix::diff::index::ChangeRef::Rewrite { location, .. } => {
-                        (location, false, false)
-                    }
+                    IndexChange::Addition { location, .. } => (location, true, false),
+                    IndexChange::Deletion { location, .. } => (location, false, true),
+                    IndexChange::Modification { location, .. } => (location, false, false),
+                    IndexChange::Rewrite { location, .. } => (location, false, false),
                 };
                 let s = loc.to_string();
                 r.staged.push(s.clone());
@@ -206,8 +240,8 @@ pub fn get_status(repo: &gix::Repository) -> AppResult<StatusResult> {
                     r.deleted.push(s);
                 }
             }
-            gix::status::Item::IndexWorktree(change) => match change {
-                gix::status::index_worktree::Item::Modification { rela_path, .. } => {
+            StatusItem::IndexWorktree(change) => match change {
+                WorktreeItem::Modification { rela_path, .. } => {
                     // workdir 文件不存在 → workdir 删除归 deleted, 否则 modified
                     // (对齐 nuwax W===0&&S!==0 → deleted 桶)
                     let s = rela_path.to_string();
@@ -221,7 +255,7 @@ pub fn get_status(repo: &gix::Repository) -> AppResult<StatusResult> {
                         r.modified.push(s);
                     }
                 }
-                gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
+                WorktreeItem::DirectoryContents { entry, .. } => {
                     r.untracked.push(entry.rela_path.to_string());
                 }
                 _ => {}

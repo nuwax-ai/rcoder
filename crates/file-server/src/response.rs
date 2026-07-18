@@ -1,8 +1,9 @@
 //! 统一响应助手 (多数 success 响应是 `{success:true, ...payload}`)。
 
-use axum::Json;
 use serde::Serialize;
 use serde_json::{Value, json};
+
+use crate::extract::AppJson as Json;
 
 /// 把任意可序列化 payload 包成 `{success:true, ...payload}` (字段平铺)。
 pub fn success<T: Serialize>(payload: T) -> Json<Value> {

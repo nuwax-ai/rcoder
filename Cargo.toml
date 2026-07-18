@@ -215,6 +215,7 @@ tar = "0.4"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 utoipa = { version = "5.4", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-axum = "0.2"
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 
 

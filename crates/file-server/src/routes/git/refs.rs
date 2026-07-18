@@ -1,7 +1,6 @@
 //! git 引用 (branch/tag) CRUD 路由: branch-create / branch-delete / branch-switch /
 //! tag-create / tag-delete。
 
-use axum::Json;
 use axum::extract::State;
 use garde::Validate;
 use serde::Deserialize;
@@ -10,9 +9,10 @@ use serde_json::{Value, json};
 use super::{GitWriteBody, resolve_body};
 use crate::AppState;
 use crate::error::AppError;
+use crate::extract::AppJson as Json;
 use crate::service::git;
 
-#[derive(Deserialize, Validate)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BranchCreateBody {
     #[serde(flatten)]
@@ -25,7 +25,7 @@ pub(super) struct BranchCreateBody {
     pub start_point: Option<String>,
 }
 
-#[derive(Deserialize, Validate)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BranchNameBody {
     #[serde(flatten)]
@@ -39,7 +39,7 @@ pub(super) struct BranchNameBody {
     pub force: Option<bool>,
 }
 
-#[derive(Deserialize, Validate)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TagCreateBody {
     #[serde(flatten)]
@@ -52,7 +52,7 @@ pub(super) struct TagCreateBody {
     pub message: Option<String>,
 }
 
-#[derive(Deserialize, Validate)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TagNameBody {
     #[serde(flatten)]
@@ -63,6 +63,7 @@ pub(super) struct TagNameBody {
 }
 
 /// `POST /api/git/branch-create`
+#[utoipa::path(post, path = "/branch-create", request_body = BranchCreateBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn branch_create(
     State(state): State<AppState>,
     Json(body): Json<BranchCreateBody>,
@@ -88,6 +89,7 @@ pub(super) async fn branch_create(
 }
 
 /// `POST /api/git/branch-delete`
+#[utoipa::path(post, path = "/branch-delete", request_body = BranchNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn branch_delete(
     State(state): State<AppState>,
     Json(body): Json<BranchNameBody>,
@@ -114,6 +116,7 @@ pub(super) async fn branch_delete(
 }
 
 /// `POST /api/git/tag-create`
+#[utoipa::path(post, path = "/tag-create", request_body = TagCreateBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn tag_create(
     State(state): State<AppState>,
     Json(body): Json<TagCreateBody>,
@@ -140,6 +143,7 @@ pub(super) async fn tag_create(
 }
 
 /// `POST /api/git/tag-delete`
+#[utoipa::path(post, path = "/tag-delete", request_body = TagNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn tag_delete(
     State(state): State<AppState>,
     Json(body): Json<TagNameBody>,
@@ -162,6 +166,7 @@ pub(super) async fn tag_delete(
 }
 
 /// `POST /api/git/branch-switch` (对齐 nuwax switchBranch; 切到已存在分支)。
+#[utoipa::path(post, path = "/branch-switch", request_body = BranchNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn branch_switch(
     State(state): State<AppState>,
     Json(body): Json<BranchNameBody>,

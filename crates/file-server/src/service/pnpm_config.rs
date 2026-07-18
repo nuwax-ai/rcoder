@@ -13,11 +13,8 @@
 //! .npmrc 与 sanitize 是优化 (避免 JuiceFS/FUSE hardlink 失败 + 避免 never/only
 //! built 互斥冲突), 故整个步骤对调用方为**尽力而为** (失败仅 warn, 不阻断 install)。
 
-use std::path::Path;
-use std::sync::LazyLock;
-
-use regex::Regex;
 use serde_json::Value;
+use std::path::Path;
 use tokio::fs;
 
 use crate::error::{AppError, AppResult};
@@ -29,13 +26,12 @@ const BUILT_DEPS_PACKAGE_JSON_KEYS: [&str; 3] = [
     "ignoredBuiltDependencies",
 ];
 
-/// `.npmrc` 中同名配置的 kebab-case 行前缀正则 (对齐 nuwax sanitizeNpmrcBuiltDepsConfig)。
-static NPMRC_BUILT_DEPS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^\s*(never-built-dependencies|only-built-dependencies|ignored-built-dependencies)\b",
-    )
-    .expect("valid static regex")
-});
+/// `.npmrc` 中同名配置的 kebab-case 键。
+const BUILT_DEPS_NPMRC_KEYS: [&str; 3] = [
+    "never-built-dependencies",
+    "only-built-dependencies",
+    "ignored-built-dependencies",
+];
 
 // ── ensure 入口 ─────────────────────────────────────────────────────────────────
 
@@ -59,7 +55,7 @@ pub async fn ensure_pnpm_install_config(project_dir: &Path) {
 
 /// 写 `.npmrc` 模板 (对齐 nuwax createPnpmNpmrc): 已最优 (package-import-method=copy
 /// 且 store-dir 匹配) 则跳过, 否则整体覆盖为模板内容。
-async fn create_pnpm_npmrc(project_dir: &Path) -> AppResult<()> {
+pub(crate) async fn create_pnpm_npmrc(project_dir: &Path) -> AppResult<()> {
     let npmrc_path = project_dir.join(".npmrc");
     let store_dir = std::env::var("npm_config_store_dir")
         .ok()
@@ -110,10 +106,17 @@ fn npmrc_optimal(existing: &str, want_store_dir: Option<&str>) -> bool {
 
 /// 从 .npmrc 文本取某配置键的值 (首个非注释匹配, 对齐 nuwax `^\s*key\s*=\s*(\S+)` + `m` 多行)。
 fn first_config_value(npmrc: &str, key: &str) -> Option<String> {
-    let re = Regex::new(&format!(r"(?m)^\s*{key}\s*=\s*(\S+)"))
-        .ok()?
-        .captures(npmrc)?;
-    re.get(1).map(|m| m.as_str().to_string())
+    npmrc.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            return None;
+        }
+        let (candidate, value) = trimmed.split_once('=')?;
+        if candidate.trim() != key {
+            return None;
+        }
+        value.split_whitespace().next().map(ToOwned::to_owned)
+    })
 }
 
 // ── sanitize: 互斥 built-deps 配置清理 ──────────────────────────────────────────
@@ -139,10 +142,9 @@ async fn sanitize_package_json_built_deps(project_dir: &Path) -> AppResult<()> {
         tracing::warn!(path = %pkg_path.display(), "skip sanitize package.json: invalid JSON");
         return Ok(());
     };
-    let Some(pnpm) = pkg.get_mut("pnpm").filter(|v| v.is_object()) else {
+    let Some(Value::Object(obj)) = pkg.get_mut("pnpm") else {
         return Ok(());
     };
-    let obj = pnpm.as_object_mut().expect("checked is_object above");
     let removed: Vec<&str> = BUILT_DEPS_PACKAGE_JSON_KEYS
         .iter()
         .filter(|k| obj.contains_key(**k))
@@ -233,7 +235,7 @@ async fn sanitize_npmrc_built_deps(npmrc_path: &Path) -> AppResult<String> {
     };
     let filtered: String = content
         .split('\n')
-        .filter(|line| !NPMRC_BUILT_DEPS_RE.is_match(line))
+        .filter(|line| !is_built_deps_npmrc_line(line))
         .collect::<Vec<_>>()
         .join("\n");
     if filtered != content {
@@ -278,8 +280,27 @@ async fn append_install_lines(project_dir: &Path) -> AppResult<()> {
 
 /// .npmrc 是否已含某配置键 (对齐 nuwax `/key\s*=/` 测试; 仅看是否存在赋值行)。
 fn contains_config_key(npmrc: &str, key: &str) -> bool {
-    let re = Regex::new(&format!(r"{key}\s*=")).expect("valid regex");
-    re.is_match(npmrc)
+    npmrc.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            return false;
+        }
+        trimmed
+            .split_once('=')
+            .is_some_and(|(candidate, _)| candidate.trim() == key)
+    })
+}
+
+fn is_built_deps_npmrc_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    BUILT_DEPS_NPMRC_KEYS.iter().any(|key| {
+        trimmed.strip_prefix(key).is_some_and(|suffix| {
+            suffix
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+        })
+    })
 }
 
 // ── 辅助: 文件系统类型 / CST 时间 (仅 .npmrc 注释, 非功能性) ────────────────────
@@ -300,10 +321,7 @@ fn detect_filesystem_type() -> &'static str {
 
 /// 当前东八区时间字符串 `YYYY-MM-DD HH:MM:SS` (对齐 nuwax getCSTDateTimeString)。
 fn cst_datetime_string() -> String {
-    use chrono::{FixedOffset, Utc};
-    let cst = FixedOffset::east_opt(8 * 3600).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
-    Utc::now()
-        .with_timezone(&cst)
+    (chrono::Utc::now() + chrono::Duration::hours(8))
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
 }
@@ -366,7 +384,7 @@ mod tests {
         let input = "registry=https://x\nonly-built-dependencies=[\"esbuild\"]\nfoo=bar\n";
         let out = input
             .split('\n')
-            .filter(|l| !NPMRC_BUILT_DEPS_RE.is_match(l))
+            .filter(|line| !is_built_deps_npmrc_line(line))
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!out.contains("only-built-dependencies"));

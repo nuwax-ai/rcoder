@@ -6,8 +6,8 @@
 
 use std::path::Path;
 
-use axum::Router;
-use axum::routing::{get, post};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::AppState;
 use crate::error::AppError;
@@ -18,39 +18,23 @@ mod content;
 mod crud;
 mod version;
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/get-project-content", get(content::get_project_content))
-        // nuwax delete-project 用 GET (反直觉, 但保持兼容)
-        .route("/delete-project", get(crud::delete_project))
-        .route("/create-project", post(crud::create_project))
-        .route("/copy-project", post(crud::copy_project))
-        .route("/upload-single-file", post(crud::upload_single_file))
-        .route("/upload-batch-files", post(crud::upload_batch_files))
-        .route(
-            "/upload-attachment-file",
-            post(crud::upload_attachment_file),
-        )
-        .route(
-            "/specified-files-update",
-            post(code::specified_files_update),
-        )
-        .route("/all-files-update", post(code::all_files_update))
-        .route("/upload-project", post(crud::upload_project))
-        .route(
-            "/backup-current-version",
-            post(version::backup_current_version),
-        )
-        .route("/rollback-version", post(version::rollback_version))
-        .route(
-            "/get-project-content-by-version",
-            get(content::get_project_content_by_version),
-        )
-        .route("/export-project", post(version::export_project))
-        .route(
-            "/push-skills-to-workspace",
-            post(crud::push_skills_to_workspace),
-        )
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(content::get_project_content))
+        .routes(routes!(crud::delete_project))
+        .routes(routes!(crud::create_project))
+        .routes(routes!(crud::copy_project))
+        .routes(routes!(crud::upload_single_file))
+        .routes(routes!(crud::upload_batch_files))
+        .routes(routes!(crud::upload_attachment_file))
+        .routes(routes!(code::specified_files_update))
+        .routes(routes!(code::all_files_update))
+        .routes(routes!(crud::upload_project))
+        .routes(routes!(version::backup_current_version))
+        .routes(routes!(version::rollback_version))
+        .routes(routes!(content::get_project_content_by_version))
+        .routes(routes!(version::export_project))
+        .routes(routes!(crud::push_skills_to_workspace))
 }
 
 // ── 跨组共享 helper (子模块经 super:: 访问) ──────────────────────────────────────
@@ -76,12 +60,29 @@ async fn text_field(field: axum::extract::multipart::Field<'_>) -> Result<String
         .map_err(|e| AppError::validation(format!("read multipart field: {e}")))
 }
 
-async fn bytes_field(field: axum::extract::multipart::Field<'_>) -> Result<Vec<u8>, AppError> {
-    field
-        .bytes()
+async fn bytes_field(
+    mut field: axum::extract::multipart::Field<'_>,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
+    let mut data = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
         .await
-        .map(|b| b.to_vec())
-        .map_err(|e| AppError::validation(format!("read multipart file: {e}")))
+        .map_err(|e| AppError::validation(format!("read multipart file: {e}")))?
+    {
+        let next_len = (data.len() as u64)
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| AppError::validation("multipart file size overflow"))?;
+        if next_len > max_bytes {
+            return Err(AppError::validation(format!(
+                "File size exceeds limit (max {max_bytes} bytes)"
+            )));
+        }
+        data.try_reserve(chunk.len())
+            .map_err(|e| AppError::system(format!("reserve multipart buffer: {e}")))?;
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
 }
 
 /// `.zip` 扩展名校验 (对齐 nuwax multer fileFilter: 仅允许 zip)。

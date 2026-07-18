@@ -22,6 +22,40 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn parse_byte_size(value: &str) -> Option<u64> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let (number, multiplier) = [
+        ("gb", 1024_u64.pow(3)),
+        ("mb", 1024_u64.pow(2)),
+        ("kb", 1024_u64),
+        ("b", 1_u64),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| {
+        normalized
+            .strip_suffix(suffix)
+            .map(|number| (number.trim(), multiplier))
+    })
+    .unwrap_or((normalized.as_str(), 1));
+    number
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| value.checked_mul(multiplier))
+}
+
+fn request_body_max_bytes(default: u64) -> u64 {
+    std::env::var("REQUEST_BODY_MAX_BYTES")
+        .ok()
+        .and_then(|value| parse_byte_size(&value))
+        .or_else(|| {
+            // 兼容 nuwax body-parser 的字符串配置，例如 `2000mb`。
+            std::env::var("REQUEST_BODY_LIMIT")
+                .ok()
+                .and_then(|value| parse_byte_size(&value))
+        })
+        .unwrap_or(default)
+}
+
 fn env_port(key: &str, default: u16) -> u16 {
     std::env::var(key)
         .ok()
@@ -43,7 +77,8 @@ fn default_attachment_extensions() -> Vec<String> {
     [
         ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".md", ".png", ".jpg",
         ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico", ".avif", ".zip", ".rar", ".7z", ".tar",
-        ".gz", ".mp4", ".mov", ".avi", ".mp3", ".wav",
+        ".gz", ".csv", ".json", ".xml", ".mp4", ".mov", ".avi", ".wmv", ".flv", ".mp3", ".wav",
+        ".ogg", ".m4a",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -64,6 +99,14 @@ pub struct Config {
     pub upload_max_file_size_bytes: u64,
     pub upload_single_file_size_bytes: u64,
     pub download_max_file_size_bytes: u64,
+    /// Axum 请求体上限；默认对齐 nuwax express.json 2000mb。
+    pub request_body_max_bytes: u64,
+
+    // —— 日志缓存 (对齐 nuwax logCacheManager) ——
+    pub log_cache_enabled: bool,
+    pub log_cache_duration_ms: u64,
+    pub log_cache_max_entries: usize,
+    pub log_cache_max_file_size_bytes: u64,
 
     // —— 扩展名白名单 ——
     pub upload_allowed_extensions: Vec<String>,
@@ -124,6 +167,11 @@ impl Config {
             upload_max_file_size_bytes: env_u64("UPLOAD_MAX_FILE_SIZE_BYTES", 1_048_576_000),
             upload_single_file_size_bytes: env_u64("UPLOAD_SINGLE_FILE_SIZE_BYTES", 1_048_576_000),
             download_max_file_size_bytes: env_u64("DOWNLOAD_MAX_FILE_SIZE_BYTES", 104_857_600),
+            request_body_max_bytes: request_body_max_bytes(2_097_152_000),
+            log_cache_enabled: env_bool("LOG_CACHE_ENABLED", true),
+            log_cache_duration_ms: env_u64("LOG_CACHE_DURATION", 180_000),
+            log_cache_max_entries: env_u64("LOG_CACHE_MAX_ENTRIES", 100) as usize,
+            log_cache_max_file_size_bytes: env_u64("LOG_CACHE_MAX_FILE_SIZE", 2_097_152),
             upload_allowed_extensions: env_list("UPLOAD_ALLOWED_EXTENSIONS", ".zip"),
             attachment_allowed_extensions: default_attachment_extensions(),
             traverse_exclude_dirs: env_list(
@@ -148,7 +196,7 @@ impl Config {
             ),
             git_enabled: env_bool("GIT_ENABLED", false),
             git_default_author_name: env_str("GIT_DEFAULT_AUTHOR_NAME", "Nuwax File Server"),
-            git_default_author_email: env_str("GIT_DEFAULT_AUTHOR_EMAIL", "git@nuwax.local"),
+            git_default_author_email: env_str("GIT_DEFAULT_AUTHOR_EMAIL", "git@nuwax.com"),
             init_project_name_react: env_str("INIT_PROJECT_NAME_REACT", "react-vite-template"),
             init_project_name_vue3: env_str("INIT_PROJECT_NAME_VUE3", "vue3-vite-template"),
             deployment_mode: env_str("DEPLOYMENT_MODE", "docker-compose"),
@@ -180,5 +228,18 @@ impl Config {
     pub fn ext_allowed(&self, list: &[String], ext: &str) -> bool {
         let lower = ext.to_lowercase();
         list.iter().any(|e| e.to_lowercase() == lower)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_byte_size;
+
+    #[test]
+    fn parses_legacy_request_body_limit_units() {
+        assert_eq!(parse_byte_size("2000mb"), Some(2_097_152_000));
+        assert_eq!(parse_byte_size("2 GB"), Some(2_147_483_648));
+        assert_eq!(parse_byte_size("1024"), Some(1024));
+        assert_eq!(parse_byte_size("invalid"), None);
     }
 }

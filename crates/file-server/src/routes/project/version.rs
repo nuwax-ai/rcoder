@@ -1,6 +1,5 @@
 //! project 版本管理路由: backup-current-version / rollback-version / export-project。
 
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -10,10 +9,11 @@ use serde_json::json;
 use super::ctx_from;
 use crate::AppState;
 use crate::error::AppError;
+use crate::extract::AppJson as Json;
 use crate::response;
 use crate::service::{project as project_service, version as version_service};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct BackupVersionBody {
     pub project_id: String,
@@ -27,6 +27,7 @@ pub(super) struct BackupVersionBody {
 }
 
 /// `POST /api/project/backup-current-version`
+#[utoipa::path(post, path = "/backup-current-version", request_body = BackupVersionBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(super) async fn backup_current_version(
     State(state): State<AppState>,
     Json(body): Json<BackupVersionBody>,
@@ -63,7 +64,7 @@ pub(super) async fn backup_current_version(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct RollbackBody {
     pub project_id: String,
@@ -78,6 +79,7 @@ pub(super) struct RollbackBody {
 }
 
 /// `POST /api/project/rollback-version`
+#[utoipa::path(post, path = "/rollback-version", request_body = RollbackBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
 pub(super) async fn rollback_version(
     State(state): State<AppState>,
     Json(body): Json<RollbackBody>,
@@ -113,7 +115,7 @@ pub(super) async fn rollback_version(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ExportBody {
     pub project_id: String,
@@ -121,6 +123,7 @@ pub(super) struct ExportBody {
     #[serde(default)]
     pub export_type: Option<String>,
     #[serde(default)]
+    #[schema(value_type = Object)]
     pub config: Option<serde_json::Value>,
     #[serde(default)]
     pub tenant_id: Option<String>,
@@ -131,6 +134,16 @@ pub(super) struct ExportBody {
 }
 
 /// `POST /api/project/export-project` (返回 application/zip 文件流)
+#[utoipa::path(
+    post,
+    path = "/export-project",
+    request_body = ExportBody,
+    responses(
+        (status = 200, description = "Project ZIP archive", body = crate::openapi::BinaryFile, content_type = "application/zip"),
+        crate::openapi::ErrorApiResponses
+    ),
+    tag = "Project"
+)]
 pub(super) async fn export_project(
     State(state): State<AppState>,
     Json(body): Json<ExportBody>,

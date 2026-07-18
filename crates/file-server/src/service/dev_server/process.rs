@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use chrono::Local;
 use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+use nix::unistd::{Pid, getpgid};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 use crate::error::{AppError, AppResult};
@@ -158,7 +158,7 @@ pub fn spawn_dev(
     Ok((child, stdout, stderr))
 }
 
-/// 运行一次性命令 (install/build/preprocess), arg 数组 + stdout/stderr 管道到日志, 阻塞等待。
+/// 运行一次性非 pnpm-install 命令 (build/preprocess), arg 数组 + stdout/stderr 管道到日志, 阻塞等待。
 /// 用 current_dir 替代 `cd ... &&`, arg 数组替代 shell 拼接; 错误为类型化 io::Error/退出码。
 pub async fn run_command_to_log(
     program: &str,
@@ -171,7 +171,7 @@ pub async fn run_command_to_log(
     let mut cmd = Command::new(program);
     cmd.args(args);
     cmd.current_dir(cwd);
-    // install 继承当前 env (pnpm store 等), 仅删 CI/NPM_CONFIG_PRODUCTION
+    // 一次性 Node 命令继承 PATH/HOME，仅删会改变依赖/脚本行为的环境变量。
     if let Ok(p) = std::env::var("PATH") {
         cmd.env("PATH", p);
     }
@@ -184,6 +184,8 @@ pub async fn run_command_to_log(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd
         .spawn()
         .map_err(|e| AppError::system(format!("spawn command failed: {e}")))?;
@@ -209,8 +211,12 @@ pub async fn run_command_to_log(
         ))),
         Ok(Err(e)) => Err(AppError::system(format!("command wait failed: {e}"))),
         Err(_) => {
-            // 超时: 尽力杀子进程
-            let _ = child.start_kill();
+            // 超时: 杀整个进程组，避免 pnpm/vite 子进程遗留。
+            if let Some(pid) = child.id() {
+                kill_process_group_force(pid);
+            } else {
+                let _ = child.start_kill();
+            }
             Err(AppError::system(format!(
                 "command timed out after {timeout_secs}s"
             )))
@@ -250,6 +256,13 @@ pub fn kill_process_group_force(pid: u32) -> bool {
     }
 }
 
+/// 读取进程组 ID，用于 stop 去重：同一 Vite/pnpm 进程树只需 kill 一次。
+pub fn process_group_id(pid: u32) -> Option<u32> {
+    getpgid(Some(Pid::from_raw(pid as i32)))
+        .ok()
+        .map(|pgid| pgid.as_raw() as u32)
+}
+
 /// 进程是否仍在运行 (kill pid 0 探活; 对齐 nuwax isProcessRunning)。
 pub fn is_process_running(pid: u32) -> bool {
     // kill(pid, None) == 信号 0, 不实际杀, 仅探测
@@ -271,7 +284,9 @@ pub async fn wait_for_stop(pid: u32, interval_ms: u64, max_attempts: u32) {
 }
 
 /// 系统级扫描某 project_id 的所有相关 pid (对齐 nuwax findPidsByProjectId)。
-/// `ps -Ao pid,command -ww` → 精确匹配 `/{projectId}` 子串; 空则宽松匹配 `{projectId}`。
+/// `ps -Ao pid,command -ww` → 只匹配 `/{projectId}` 路径片段。
+/// 不使用 nuwax 的宽松回退：本地调用时 curl/shell 命令行也含有
+/// `projectId=...`，宽松匹配会把请求发起进程误当成 Vite 并终止。
 /// ps 不存在/失败返回空 (调用方仍可用内存 Map 的 pid 兜底)。
 pub async fn find_pids_by_project_id(project_id: &str) -> Vec<u32> {
     let out = Command::new("ps")
@@ -292,16 +307,6 @@ pub async fn find_pids_by_project_id(project_id: &str) -> Vec<u32> {
             && let Some(pid) = parse_pid_from_line(line)
         {
             pids.push(pid);
-        }
-    }
-    // 精确为空 → 宽松兜底
-    if pids.is_empty() {
-        for line in text.lines() {
-            if line.contains(project_id)
-                && let Some(pid) = parse_pid_from_line(line)
-            {
-                pids.push(pid);
-            }
         }
     }
     pids.sort_unstable();

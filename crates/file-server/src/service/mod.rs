@@ -2,11 +2,14 @@
 
 pub mod agent_hooks;
 pub mod build_error;
+pub mod build_manager;
 pub mod code;
 pub mod computer_ws;
 pub mod dev_server;
 pub mod fs_util;
 pub mod git;
+pub mod log_cache;
+pub mod pnpm;
 pub mod pnpm_config;
 pub mod project;
 pub mod skills;

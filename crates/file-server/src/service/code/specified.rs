@@ -46,7 +46,23 @@ pub async fn specified_files_update(
         return Err(AppError::validation("codeVersion cannot be empty"));
     }
     version::parse_version(code_version)?; // 校验为数字
-    // 结构校验
+    validate_file_ops(files)?;
+
+    let project_path = resolver.resolve_project(ctx);
+    if !crate::service::fs_util::path_exists(&project_path).await? {
+        return Err(AppError::resource("Project does not exist"));
+    }
+    version::backup_project(config, project_id, &project_path, code_version).await?;
+
+    apply_file_ops(&project_path, files, ModifyStrategy::Diff).await?;
+    Ok(SpecifiedResult {
+        project_id: project_id.to_string(),
+        files_count: files.len(),
+    })
+}
+
+/// 在产生任何文件副作用之前校验增量操作结构。
+pub fn validate_file_ops(files: &[FileOp]) -> AppResult<()> {
     for (i, op) in files.iter().enumerate() {
         if op.operation.trim().is_empty() {
             return Err(AppError::validation_with(
@@ -84,18 +100,7 @@ pub async fn specified_files_update(
             )));
         }
     }
-
-    let project_path = resolver.resolve_project(ctx);
-    if !fs::try_exists(&project_path).await.unwrap_or(false) {
-        return Err(AppError::resource("Project does not exist"));
-    }
-    version::backup_project(config, project_id, &project_path, code_version).await?;
-
-    apply_file_ops(&project_path, files, ModifyStrategy::Diff).await?;
-    Ok(SpecifiedResult {
-        project_id: project_id.to_string(),
-        files_count: files.len(),
-    })
+    Ok(())
 }
 
 /// 文件操作核心 (path 制, 无版本备份): create/delete/rename/modify, 路径防穿越。
@@ -105,6 +110,7 @@ pub async fn apply_file_ops(
     files: &[FileOp],
     strategy: ModifyStrategy,
 ) -> AppResult<()> {
+    validate_file_ops(files)?;
     for op in files {
         let op_l = op.operation.to_lowercase();
         let Some(target) = safe_within_or_skip(base, &op.name) else {
@@ -114,7 +120,7 @@ pub async fn apply_file_ops(
         match op_l.as_str() {
             "create" => {
                 if op.is_dir == Some(true) {
-                    if !fs::try_exists(&target).await.unwrap_or(false) {
+                    if !crate::service::fs_util::path_exists(&target).await? {
                         fs::create_dir_all(&target).await?;
                     }
                 } else if let Some(parent) = target.parent() {
@@ -125,7 +131,7 @@ pub async fn apply_file_ops(
                 }
             }
             "delete" => {
-                if fs::try_exists(&target).await.unwrap_or(false) {
+                if crate::service::fs_util::path_exists(&target).await? {
                     let is_dir = fs::metadata(&target)
                         .await
                         .map(|m| m.is_dir())
@@ -145,7 +151,7 @@ pub async fn apply_file_ops(
                     tracing::warn!(path = %from, "unsafe rename source, skipping");
                     continue;
                 };
-                if fs::try_exists(&old).await.unwrap_or(false) {
+                if crate::service::fs_util::path_exists(&old).await? {
                     if let Some(parent) = target.parent() {
                         fs::create_dir_all(parent).await?;
                     }
@@ -153,14 +159,19 @@ pub async fn apply_file_ops(
                 }
             }
             "modify" => {
-                if !fs::try_exists(&target).await.unwrap_or(false) {
+                if !crate::service::fs_util::path_exists(&target).await? {
                     continue;
                 }
                 let new = op.contents.as_deref().unwrap_or("");
                 match strategy {
                     ModifyStrategy::ByteCompare => {
                         // computer updateFiles: 字节相等跳写, 不等直写 (避免 \r\n 归一改内容)
-                        let existing = fs::read(&target).await.unwrap_or_default();
+                        let existing = fs::read(&target).await.map_err(|error| {
+                            AppError::system(format!(
+                                "read {} before update: {error}",
+                                target.display()
+                            ))
+                        })?;
                         if existing == new.as_bytes() {
                             continue;
                         }
@@ -168,7 +179,12 @@ pub async fn apply_file_ops(
                     }
                     ModifyStrategy::Diff => {
                         // project specifiedFilesUpdate: 行级 diff 合并, 换行符继承 existing
-                        let existing = fs::read_to_string(&target).await.unwrap_or_default();
+                        let existing = fs::read_to_string(&target).await.map_err(|error| {
+                            AppError::system(format!(
+                                "read {} before update: {error}",
+                                target.display()
+                            ))
+                        })?;
                         let (final_content, changes) = diff_content_by_lines(&existing, new);
                         if changes == 0 {
                             continue; // 内容未变跳写, 避免 HMR

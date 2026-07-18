@@ -1,7 +1,6 @@
 //! project 内容读取路由: get-project-content / get-project-content-by-version。
 
-use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -9,11 +8,13 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::error::AppError;
+use crate::extract::{AppJson as Json, AppQuery as Query};
 use crate::response;
 use crate::service::{tree, version as version_service};
 use crate::workspace::ProjectContext;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct GetContentParams {
     pub project_id: String,
@@ -25,6 +26,13 @@ pub(super) struct GetContentParams {
 }
 
 /// `GET /api/project/get-project-content`
+#[utoipa::path(
+    get,
+    path = "/get-project-content",
+    params(GetContentParams),
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Project"
+)]
 pub(super) async fn get_project_content(
     State(state): State<AppState>,
     Query(params): Query<GetContentParams>,
@@ -41,8 +49,10 @@ pub(super) async fn get_project_content(
     };
     let project_path = state.resolver.resolve_project(&ctx);
 
-    if !tokio::fs::try_exists(&project_path).await.unwrap_or(false) {
-        return AppError::validation("Project does not exist").into_response();
+    match crate::service::fs_util::path_exists(&project_path).await {
+        Ok(true) => {}
+        Ok(false) => return AppError::validation("Project does not exist").into_response(),
+        Err(error) => return error.into_response(),
     }
 
     match tree::get_project_content(
@@ -68,7 +78,8 @@ pub(super) async fn get_project_content(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct GetByVersionParams {
     pub project_id: String,
@@ -85,6 +96,13 @@ pub(super) struct GetByVersionParams {
 }
 
 /// `GET /api/project/get-project-content-by-version`
+#[utoipa::path(
+    get,
+    path = "/get-project-content-by-version",
+    params(GetByVersionParams),
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Project"
+)]
 pub(super) async fn get_project_content_by_version(
     State(state): State<AppState>,
     Query(params): Query<GetByVersionParams>,

@@ -7,6 +7,13 @@
 
 use std::path::Path;
 
+use gix::Repository;
+use gix::hash::{ObjectId, oid};
+use gix::index::{entry::Stage, write::Options as IndexWriteOptions};
+use gix::path::from_bstr;
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::{FullName, Target};
+
 use crate::error::{AppError, AppResult};
 
 use super::{commit_indexed, ensure_gitignore, get_status, map_git_err, stage_path};
@@ -77,7 +84,7 @@ pub struct ResetOutcome {
 /// - 移动当前分支 ref → target
 /// - mixed/hard: 重建 index 为 target tree
 /// - hard: 额外重写 worktree (写 target 文件 + 删除 target 之外文件) + 补 .gitignore
-pub fn reset(repo: &gix::Repository, target: &str, mode: ResetMode) -> AppResult<ResetOutcome> {
+pub fn reset(repo: &Repository, target: &str, mode: ResetMode) -> AppResult<ResetOutcome> {
     let target_id = repo
         .rev_parse_single(target)
         .map_err(|e| map_git_err(e, "git rev_parse target"))?
@@ -118,12 +125,12 @@ pub fn reset(repo: &gix::Repository, target: &str, mode: ResetMode) -> AppResult
 }
 
 /// 把 index 重置为 tree (mixed reset 用; 不动 worktree)。
-fn reset_index_to_tree(repo: &gix::Repository, tree_id: &gix::hash::oid) -> AppResult<()> {
+fn reset_index_to_tree(repo: &Repository, tree_id: &oid) -> AppResult<()> {
     let mut idx = repo
         .index_from_tree(tree_id)
         .map_err(|e| map_git_err(e, "git index_from_tree"))?;
     idx.remove_tree();
-    idx.write(gix::index::write::Options::default())
+    idx.write(IndexWriteOptions::default())
         .map_err(|e| map_git_err(e, "git index write"))?;
     Ok(())
 }
@@ -133,7 +140,7 @@ fn reset_index_to_tree(repo: &gix::Repository, tree_id: &gix::hash::oid) -> AppR
 /// `checkout` (对齐 nuwax checkout): 把 target 的整棵 tree 恢复到 workdir + index,
 /// **不删除** target 之外的文件, **不动** HEAD, 变更留 staged。
 /// (对齐 nuwax: 不是切分支, 不是恢复单文件; 类似 `git checkout <commit> -- .` 的覆盖语义)
-pub fn checkout_tree(repo: &gix::Repository, target: &str) -> AppResult<()> {
+pub fn checkout_tree(repo: &Repository, target: &str) -> AppResult<()> {
     let target_id = repo
         .rev_parse_single(target)
         .map_err(|e| map_git_err(e, "git rev_parse target"))?
@@ -148,10 +155,49 @@ pub fn checkout_tree(repo: &gix::Repository, target: &str) -> AppResult<()> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
-    // old_tree = None → 不删除多余文件 (对齐 nuwax checkout 行为)
-    apply_tree_to_worktree(repo, workdir, &target_tree_id, None)?;
+    overlay_tree_on_worktree_and_index(repo, workdir, &target_tree_id)?;
     ensure_gitignore(workdir)?;
     stage_path(repo, ".gitignore")?;
+    Ok(())
+}
+
+/// 将 target tree 覆盖到 worktree 和现有 index，不删除 target 之外的 index entry。
+/// 这与 nuwax 的 listFiles + writeFile + git.add 行为一致。
+fn overlay_tree_on_worktree_and_index(
+    repo: &Repository,
+    workdir: &Path,
+    tree_id: &oid,
+) -> AppResult<()> {
+    let target_index = repo
+        .index_from_tree(tree_id)
+        .map_err(|e| map_git_err(e, "git index_from_tree (checkout overlay)"))?;
+    let target_backing = target_index.path_backing();
+    let mut current_index = repo
+        .open_index()
+        .map_err(|e| map_git_err(e, "git open_index (checkout overlay)"))?;
+
+    for entry in target_index.entries() {
+        if entry.stage() != Stage::Unconflicted {
+            continue;
+        }
+        let path = entry.path_in(target_backing);
+        let blob = repo
+            .find_blob(entry.id)
+            .map_err(|e| map_git_err(e, "git find_blob (checkout overlay)"))?;
+        let dest = workdir.join(from_bstr(path));
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, &blob.data)?;
+
+        current_index.remove_entries(|_, candidate, _| candidate == path);
+        current_index.dangerously_push_entry(entry.stat, entry.id, entry.flags, entry.mode, path);
+    }
+    current_index.sort_entries();
+    current_index.remove_tree();
+    current_index
+        .write(IndexWriteOptions::default())
+        .map_err(|e| map_git_err(e, "git index write (checkout overlay)"))?;
     Ok(())
 }
 
@@ -167,7 +213,7 @@ pub struct RevertOutcome {
 /// `revert` (对齐 nuwax revert): 把 tree 重置到 target **但用新 commit 保留历史**。
 /// (注意: 不是 `git revert <commit>` 反转单提交; 是"让文件树等于 target 再提交一次")
 pub fn revert_to_commit(
-    repo: &gix::Repository,
+    repo: &Repository,
     target: &str,
     message: Option<&str>,
     author_name: &str,
@@ -231,7 +277,7 @@ pub fn revert_to_commit(
 /// - clean-tree 检查
 /// - HEAD symbolic ref → refs/heads/<name>
 /// - index + worktree 重置为分支 tree (删除多余文件)
-pub fn switch_branch(repo: &gix::Repository, name: &str) -> AppResult<()> {
+pub fn switch_branch(repo: &Repository, name: &str) -> AppResult<()> {
     clean_tree_check(repo)?;
     let branch_full = format!("refs/heads/{name}");
     let branch_ref = repo
@@ -262,11 +308,7 @@ pub fn switch_branch(repo: &gix::Repository, name: &str) -> AppResult<()> {
 
 /// 移动当前分支 ref → target_id (对齐 nuwax writeRef force=true)。
 /// HEAD 须是 symbolic (在某分支上); detached → BusinessError。
-fn move_branch_ref(
-    repo: &gix::Repository,
-    target_id: gix::hash::ObjectId,
-    log_msg: &str,
-) -> AppResult<()> {
+fn move_branch_ref(repo: &Repository, target_id: ObjectId, log_msg: &str) -> AppResult<()> {
     let branch_full = repo
         .head_name()
         .ok()
@@ -281,14 +323,12 @@ fn move_branch_ref(
 }
 
 /// 把 HEAD 改为 symbolic → branch_full (切分支用)。
-fn set_head_symbolic(repo: &gix::Repository, branch_full: &str) -> AppResult<()> {
-    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefLog};
-    use gix::refs::{FullName, Target};
+fn set_head_symbolic(repo: &Repository, branch_full: &str) -> AppResult<()> {
     let target_ref = FullName::try_from(branch_full)
         .map_err(|e| AppError::system(format!("invalid branch ref name: {e}")))?;
     let head_name = FullName::try_from("HEAD")
         .map_err(|e| AppError::system(format!("invalid HEAD name: {e}")))?;
-    let edit = gix::refs::transaction::RefEdit {
+    let edit = RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
@@ -311,10 +351,10 @@ fn set_head_symbolic(repo: &gix::Repository, branch_full: &str) -> AppResult<()>
 /// - 落 index = tree_id (index_from_tree + write)
 /// - 若 `old_tree_id` 给定: 删除 old_tree 有但 tree_id 没有的 worktree 文件 (reset-hard/revert/switch 用)
 fn apply_tree_to_worktree(
-    repo: &gix::Repository,
+    repo: &Repository,
     workdir: &Path,
-    tree_id: &gix::hash::oid,
-    old_tree_id: Option<&gix::hash::oid>,
+    tree_id: &oid,
+    old_tree_id: Option<&oid>,
 ) -> AppResult<()> {
     let mut new_index = repo
         .index_from_tree(tree_id)
@@ -326,7 +366,7 @@ fn apply_tree_to_worktree(
         let blob = repo
             .find_blob(entry.id)
             .map_err(|e| map_git_err(e, "git find_blob (checkout)"))?;
-        let dest = workdir.join(gix::path::from_bstr(path));
+        let dest = workdir.join(from_bstr(path));
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -341,17 +381,17 @@ fn apply_tree_to_worktree(
         for entry in old_index.entries() {
             let path = entry.path_in(old_backing);
             if new_index
-                .entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted)
+                .entry_by_path_and_stage(path, Stage::Unconflicted)
                 .is_none()
             {
-                let _ = std::fs::remove_file(workdir.join(gix::path::from_bstr(path)));
+                let _ = std::fs::remove_file(workdir.join(from_bstr(path)));
             }
         }
     }
     // 落 index = target tree
     new_index.remove_tree();
     new_index
-        .write(gix::index::write::Options::default())
+        .write(IndexWriteOptions::default())
         .map_err(|e| map_git_err(e, "git index write (checkout)"))?;
     Ok(())
 }
@@ -359,7 +399,7 @@ fn apply_tree_to_worktree(
 /// clean-tree 检查: 有 staged/modified/deleted 跟踪变更 → BusinessError (revert/switch/branch-create 前置)。
 /// 对齐 nuwax `beforeMatrix.some(([f,H,W,S]) => H===0&&S===0 ? false : W!==1||S!==1)` ——
 /// workdir 删除的跟踪文件 (H=1,W=0) 也算未提交变更, 须阻止; 仅未跟踪文件 (H=0,S=0) 不阻止。
-pub(crate) fn clean_tree_check(repo: &gix::Repository) -> AppResult<()> {
+pub(crate) fn clean_tree_check(repo: &Repository) -> AppResult<()> {
     let st = get_status(repo)?;
     if !st.staged.is_empty() || !st.modified.is_empty() || !st.deleted.is_empty() {
         return Err(AppError::business(

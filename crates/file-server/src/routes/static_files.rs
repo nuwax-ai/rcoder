@@ -12,16 +12,18 @@
 
 use std::path::{Path, PathBuf};
 
-use axum::Router;
-use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::options;
 use serde::Deserialize;
 use tower::util::ServiceExt;
 use tower_http::services::ServeFile;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::AppState;
+use crate::extract::{AppPath as AxumPath, AppQuery as Query};
 use crate::workspace::{ComputerContext, ProjectContext};
 
 /// CORS 头配置 (两套路由不同)。
@@ -43,19 +45,17 @@ const COMPUTER_CORS: CorsConfig = CorsConfig {
 const ALLOW_METHODS: &str = "HEAD,GET,POST,PUT,DELETE,OPTIONS";
 
 /// 挂 `/api/page` 路由 (static 子路由)。
-pub fn page_router() -> Router<AppState> {
-    Router::new().route(
-        "/static/{project_id}/{*rest}",
-        get(serve_page).options(serve_page),
-    )
+pub fn page_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(serve_page))
+        .route("/static/{project_id}/{*rest}", options(serve_page))
 }
 
 /// computer static 路由 (挂到现有 `/api/computer` router 下, 相对 `/static/...`)。
-pub fn computer_static_route() -> Router<AppState> {
-    Router::new().route(
-        "/static/{user_id}/{c_id}/{*rest}",
-        get(serve_computer).options(serve_computer),
-    )
+pub fn computer_static_route() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(serve_computer))
+        .route("/static/{user_id}/{c_id}/{*rest}", options(serve_computer))
 }
 
 #[derive(Deserialize, Default)]
@@ -68,6 +68,19 @@ struct CustomTargetQuery {
 // ── page static ────────────────────────────────────────────────────────────────
 
 /// `GET|OPTIONS /api/page/static/{projectId}/{*rest}`
+#[utoipa::path(
+    get,
+    path = "/static/{project_id}/{*rest}",
+    params(
+        ("project_id" = String, Path, description = "Project identifier"),
+        ("rest" = String, Path, description = "Project-relative file path")
+    ),
+    responses(
+        (status = 200, description = "Static file", body = crate::openapi::BinaryFile, content_type = "application/octet-stream"),
+        (status = 404, description = "File not found")
+    ),
+    tag = "Static"
+)]
 async fn serve_page(
     State(state): State<AppState>,
     AxumPath((project_id, rest)): AxumPath<(String, String)>,
@@ -88,6 +101,21 @@ async fn serve_page(
 // ── computer static ────────────────────────────────────────────────────────────
 
 /// `GET|OPTIONS /api/computer/static/{userId}/{cId}/{*rest}?customTargetDir=`
+#[utoipa::path(
+    get,
+    path = "/static/{user_id}/{c_id}/{*rest}",
+    params(
+        ("user_id" = String, Path, description = "User identifier"),
+        ("c_id" = String, Path, description = "Computer workspace identifier"),
+        ("rest" = String, Path, description = "Workspace-relative file path"),
+        ("customTargetDir" = Option<String>, Query, description = "Override workspace root")
+    ),
+    responses(
+        (status = 200, description = "Static file", body = crate::openapi::BinaryFile, content_type = "application/octet-stream"),
+        (status = 404, description = "File not found")
+    ),
+    tag = "Static"
+)]
 async fn serve_computer(
     State(state): State<AppState>,
     AxumPath((user_id, c_id, rest)): AxumPath<(String, String, String)>,

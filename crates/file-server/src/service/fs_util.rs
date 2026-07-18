@@ -6,6 +6,11 @@ use tokio::fs;
 
 use crate::error::AppResult;
 
+/// 检查路径是否存在；与 `Path::exists` 不同，权限/底层 I/O 错误不会伪装成“不存在”。
+pub async fn path_exists(path: &Path) -> AppResult<bool> {
+    fs::try_exists(path).await.map_err(Into::into)
+}
+
 /// 递归复制目录, 跳过 `exclude_dirs` 中的目录名与 `exclude_files` 中的文件名
 /// (对齐 nuwax `copyDirectoryFiltered`)。
 pub async fn copy_dir_filtered(
@@ -46,17 +51,5 @@ pub async fn copy_dir_filtered(
 /// 固定 `package-import-method=copy` (JuiceFS/FUSE 上 hardlink 会失败) +
 /// `auto-install-peers=true` + npmmirror registry + 可选 `store-dir` (环境变量设置时)。
 pub async fn write_npmrc(project_path: &Path) -> AppResult<()> {
-    let store_dir_line = match (
-        std::env::var("npm_config_store_dir").ok(),
-        std::env::var("PNPM_STORE_DIR").ok(),
-    ) {
-        (Some(s), _) if !s.trim().is_empty() => format!("store-dir={}\n", s.trim()),
-        (_, Some(s)) if !s.trim().is_empty() => format!("store-dir={}\n", s.trim()),
-        _ => String::new(),
-    };
-    let content = format!(
-        "# pnpm 优化配置\n# 自动生成\npackage-import-method=copy\nauto-install-peers=true\nregistry=https://registry.npmmirror.com/\n{store_dir_line}"
-    );
-    fs::write(project_path.join(".npmrc"), content).await?;
-    Ok(())
+    super::pnpm_config::create_pnpm_npmrc(project_path).await
 }

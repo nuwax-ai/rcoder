@@ -4,15 +4,15 @@
 //! command handler 经 `normalizeCodexCommand` 规范, http handler 生成 `http-hook-N.sh`
 //! curl wrapper 脚本后转 command handler。
 
+use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::LazyLock;
-
-use regex::Regex;
-use serde_json::{Map, Value};
 use tokio::fs;
+use winnow::combinator::{alt, repeat};
+use winnow::prelude::*;
+use winnow::token::{any, one_of, take_while};
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 use super::io_util::write_file_atomic;
 
@@ -53,52 +53,82 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 /// 将 header 值中的 `$ENV_VAR` 转为 bash 运行时展开形式 `${ENV_VAR}` (对齐 nuwax toBashEnvExpandable)。
-fn to_bash_env_expandable(value: &str) -> String {
-    static RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)").expect("env var regex"));
-    RE.replace_all(value, |caps: &regex::Captures| format!("${{{}}}", &caps[1]))
-        .to_string()
+fn to_bash_env_expandable(value: &str) -> AppResult<String> {
+    repeat(
+        0..,
+        alt((
+            bash_env_reference,
+            any.map(|character: char| character.to_string()),
+        )),
+    )
+    .parse(value)
+    .map_err(|error| AppError::system(format!("parse hook header environment variables: {error}")))
+}
+
+/// `$[A-Za-z_][A-Za-z0-9_]*`，与 nuwax 的正则捕获范围一致。
+fn bash_env_reference(input: &mut &str) -> ModalResult<String> {
+    '$'.parse_next(input)?;
+    let first = one_of(|character: char| character.is_ascii_alphabetic() || character == '_')
+        .parse_next(input)?;
+    let remainder: &str = take_while(0.., |character: char| {
+        character.is_ascii_alphanumeric() || character == '_'
+    })
+    .parse_next(input)?;
+    Ok(format!("${{{first}{remainder}}}"))
 }
 
 /// 判断 command 是否为需基于 git 根目录解析的脚本路径 (对齐 nuwax isLikelyScriptPath)。
 fn is_likely_script_path(command: &str) -> bool {
-    static GIT_ROOT: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"git rev-parse --show-toplevel").expect("git root regex"));
-    static SHELL_META: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"[|;&`<>$()]").expect("shell meta regex"));
-    static CMD_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)^(bash|sh|zsh|dash|python3?|node|npm|npx|curl|wget|echo|env|cd|export|test|\[)\s+")
-            .expect("cmd prefix regex")
-    });
-    static SCRIPT_EXT: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\.(sh|bash|py|js|mjs|cjs|ts|pl|rb)$").expect("script ext regex")
-    });
-    static BARE_SH: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?i)^[\w.-]+\.sh$").expect("bare sh regex"));
-
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return false;
     }
-    if GIT_ROOT.is_match(trimmed) {
+    if trimmed.contains("git rev-parse --show-toplevel") {
         return false;
     }
-    if SHELL_META.is_match(trimmed) {
+    if trimmed.chars().any(|ch| "|;&`<>$()".contains(ch)) {
         return false;
     }
-    if CMD_PREFIX.is_match(trimmed) {
+    let command_name = trimmed.split_whitespace().next().unwrap_or_default();
+    if [
+        "bash", "sh", "zsh", "dash", "python", "python2", "python3", "node", "npm", "npx", "curl",
+        "wget", "echo", "env", "cd", "export", "test", "[",
+    ]
+    .iter()
+    .any(|known| command_name.eq_ignore_ascii_case(known))
+        && trimmed[command_name.len()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
         return false;
     }
     if trimmed.starts_with('/') {
         return true;
     }
-    if trimmed.contains('/') || SCRIPT_EXT.is_match(trimmed) {
+    if trimmed.contains('/') || has_script_extension(trimmed) {
         return true;
     }
-    if BARE_SH.is_match(trimmed) {
+    if is_bare_shell_script(trimmed) {
         return true;
     }
     false
+}
+
+fn has_script_extension(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        ".sh", ".bash", ".py", ".js", ".mjs", ".cjs", ".ts", ".pl", ".rb",
+    ]
+    .iter()
+    .any(|extension| lower.ends_with(extension))
+}
+
+fn is_bare_shell_script(value: &str) -> bool {
+    value.to_ascii_lowercase().ends_with(".sh")
+        && value
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '.' | '-'))
 }
 
 /// 字符串反斜杠/双引号转义 (对齐 nuwax 多处 `.replace(/\\/g, "\\\\").replace(/"/g, '\\"')`)。
@@ -124,9 +154,7 @@ fn normalize_codex_command(command: &str) -> String {
     {
         return build_codex_hook_command(script_name);
     }
-    static BARE_SH: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?i)^[\w.-]+\.sh$").expect("bare sh regex 2"));
-    if BARE_SH.is_match(relative) {
+    if is_bare_shell_script(relative) {
         return build_codex_hook_command(relative);
     }
     format!(
@@ -143,13 +171,13 @@ fn build_codex_hook_command(script_name: &str) -> String {
 }
 
 /// 构建 curl header 参数数组 (对齐 nuwax buildCurlHeaderArgs)。
-fn build_curl_header_args(headers: Option<&Value>) -> Vec<String> {
+fn build_curl_header_args(headers: Option<&Value>) -> AppResult<Vec<String>> {
     let mut args = Vec::new();
     let entries: Vec<(String, Value)> = match headers {
         Some(Value::Object(m)) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         _ => {
             args.push("-H \"Content-Type: application/json\"".to_string());
-            return args;
+            return Ok(args);
         }
     };
     let has_content_type = entries
@@ -169,19 +197,23 @@ fn build_curl_header_args(headers: Option<&Value>) -> Vec<String> {
             other => other.to_string(),
         };
         let header_key = escape_for_double_quote(&key);
-        let header_value = escape_for_double_quote(&to_bash_env_expandable(&val_str));
+        let header_value = escape_for_double_quote(&to_bash_env_expandable(&val_str)?);
         args.push(format!("-H \"{header_key}: {header_value}\""));
     }
-    args
+    Ok(args)
 }
 
 /// 构建 http hook 的 curl wrapper 脚本内容 (对齐 nuwax buildHttpWrapperScript)。
-fn build_http_wrapper_script(url: &str, timeout_sec: u32, headers: Option<&Value>) -> String {
-    let header_args = build_curl_header_args(headers).join(" ");
-    format!(
+fn build_http_wrapper_script(
+    url: &str,
+    timeout_sec: u32,
+    headers: Option<&Value>,
+) -> AppResult<String> {
+    let header_args = build_curl_header_args(headers)?.join(" ");
+    Ok(format!(
         "#!/usr/bin/env bash\nset -euo pipefail\ncurl -fsS -X POST {header_args} --data-binary @- --max-time {timeout_sec} {}\n",
         shell_single_quote(url)
-    )
+    ))
 }
 
 // ── transformHooksForCodex ──────────────────────────────────────────────────────
@@ -259,7 +291,7 @@ pub(super) async fn transform_hooks_for_codex(
                         let script_path = codex_hooks_dir.join(&script_name);
                         let headers = handler_obj.get("headers").filter(|v| v.is_object());
                         fs::create_dir_all(codex_hooks_dir).await?;
-                        let script = build_http_wrapper_script(url.trim(), timeout, headers);
+                        let script = build_http_wrapper_script(url.trim(), timeout, headers)?;
                         write_file_atomic(&script_path, &script, Some(0o755)).await?;
 
                         let mut new_handler = Map::new();
@@ -337,9 +369,27 @@ mod tests {
 
     #[test]
     fn bash_env_expand_rewrites() {
-        assert_eq!(to_bash_env_expandable("Bearer $TOKEN"), "Bearer ${TOKEN}");
-        assert_eq!(to_bash_env_expandable("$A/$B1"), "${A}/${B1}");
-        assert_eq!(to_bash_env_expandable("no vars"), "no vars");
+        assert_eq!(
+            to_bash_env_expandable("Bearer $TOKEN").expect("parse header"),
+            "Bearer ${TOKEN}"
+        );
+        assert_eq!(
+            to_bash_env_expandable("$A/$B1").expect("parse header"),
+            "${A}/${B1}"
+        );
+        assert_eq!(
+            to_bash_env_expandable("no vars").expect("parse header"),
+            "no vars"
+        );
+    }
+
+    #[test]
+    fn bash_env_expand_preserves_non_matching_shell_forms() {
+        assert_eq!(
+            to_bash_env_expandable("${READY} $9 $ 中文$变量 $$TOKEN")
+                .expect("parse boundary cases"),
+            "${READY} $9 $ 中文$变量 $${TOKEN}"
+        );
     }
 
     #[test]
@@ -380,11 +430,11 @@ mod tests {
 
     #[test]
     fn build_curl_header_args_default_content_type() {
-        let args = build_curl_header_args(None);
+        let args = build_curl_header_args(None).expect("default header args");
         assert_eq!(args, vec!["-H \"Content-Type: application/json\""]);
         // 有 Content-Type → 不再补默认
         let h = json!({"Content-Type": "text/plain", "X-Api-Key": "k$SECRET"});
-        let args = build_curl_header_args(Some(&h));
+        let args = build_curl_header_args(Some(&h)).expect("custom header args");
         assert!(args.iter().any(|a| a.contains("text/plain")));
         assert!(args.iter().any(|a| a.contains("X-Api-Key")));
         // $SECRET → ${SECRET}
@@ -394,7 +444,8 @@ mod tests {
 
     #[test]
     fn build_http_wrapper_script_shape() {
-        let script = build_http_wrapper_script("https://x.com/h", 30, None);
+        let script =
+            build_http_wrapper_script("https://x.com/h", 30, None).expect("wrapper script");
         assert!(script.starts_with("#!/usr/bin/env bash\nset -euo pipefail"));
         assert!(script.contains("curl -fsS -X POST"));
         assert!(script.contains("--max-time 30"));

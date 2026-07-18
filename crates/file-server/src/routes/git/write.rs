@@ -1,6 +1,5 @@
 //! git 写路由: init / add / commit / unstage / discard / diff / reset / checkout / revert。
 
-use axum::Json;
 use axum::extract::State;
 use garde::Validate;
 use serde::Deserialize;
@@ -9,9 +8,10 @@ use serde_json::{Value, json};
 use super::{GitWriteBody, resolve_body};
 use crate::AppState;
 use crate::error::AppError;
+use crate::extract::AppJson as Json;
 use crate::service::git;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct FilesBody {
     #[serde(flatten)]
@@ -20,7 +20,7 @@ pub(super) struct FilesBody {
     pub files: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Validate)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CommitBody {
     #[serde(flatten)]
@@ -40,14 +40,13 @@ pub(super) struct CommitBody {
 }
 
 /// `POST /api/git/init`
+#[utoipa::path(post, path = "/init", request_body = GitWriteBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn init(
     State(state): State<AppState>,
     Json(body): Json<GitWriteBody>,
 ) -> Result<Json<Value>, AppError> {
     let (path, log_id) = resolve_body(&state, &body)?;
-    let an = state.config.git_default_author_name.clone();
-    let ae = state.config.git_default_author_email.clone();
-    let already = tokio::task::spawn_blocking(move || git::init_repo(&path, &an, &ae))
+    let already = tokio::task::spawn_blocking(move || git::init_repo_only(&path))
         .await
         .map_err(|e| AppError::system(format!("git join: {e}")))??;
     Ok(Json(json!({
@@ -59,6 +58,7 @@ pub(super) async fn init(
 }
 
 /// `POST /api/git/add`
+#[utoipa::path(post, path = "/add", request_body = FilesBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn add(
     State(state): State<AppState>,
     Json(body): Json<FilesBody>,
@@ -83,6 +83,7 @@ pub(super) async fn add(
 }
 
 /// `POST /api/git/commit`
+#[utoipa::path(post, path = "/commit", request_body = CommitBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn commit(
     State(state): State<AppState>,
     Json(body): Json<CommitBody>,
@@ -131,6 +132,7 @@ pub(super) async fn commit(
 }
 
 /// `POST /api/git/unstage`
+#[utoipa::path(post, path = "/unstage", request_body = FilesBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn unstage(
     State(state): State<AppState>,
     Json(body): Json<FilesBody>,
@@ -163,6 +165,7 @@ pub(super) async fn unstage(
 }
 
 /// `POST /api/git/discard`
+#[utoipa::path(post, path = "/discard", request_body = FilesBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn discard(
     State(state): State<AppState>,
     Json(body): Json<FilesBody>,
@@ -190,7 +193,7 @@ pub(super) async fn discard(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DiffBody {
     #[serde(flatten)]
@@ -206,6 +209,7 @@ pub(super) struct DiffBody {
 }
 
 /// `POST /api/git/diff` (对齐 nuwax diff; source: worktree|staged|commit, 默认 worktree)。
+#[utoipa::path(post, path = "/diff", request_body = DiffBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn diff(
     State(state): State<AppState>,
     Json(body): Json<DiffBody>,
@@ -241,7 +245,7 @@ pub(super) async fn diff(
     })))
 }
 
-#[derive(Deserialize, Validate)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TargetBody {
     #[serde(flatten)]
@@ -251,7 +255,7 @@ pub(super) struct TargetBody {
     pub target: String,
 }
 
-#[derive(Deserialize, Validate)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ResetBody {
     #[serde(flatten)]
@@ -264,7 +268,7 @@ pub(super) struct ResetBody {
     pub mode: String,
 }
 
-#[derive(Deserialize, Validate)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct RevertBody {
     #[serde(flatten)]
@@ -284,6 +288,7 @@ pub(super) struct RevertBody {
 }
 
 /// `POST /api/git/reset` (对齐 nuwax reset; mode: soft|mixed|hard, 默认 mixed)。
+#[utoipa::path(post, path = "/reset", request_body = ResetBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn reset(
     State(state): State<AppState>,
     Json(body): Json<ResetBody>,
@@ -314,6 +319,7 @@ pub(super) async fn reset(
 }
 
 /// `POST /api/git/checkout` (对齐 nuwax checkout; 恢复 target 整棵 tree, 不删多余文件, 不动 HEAD)。
+#[utoipa::path(post, path = "/checkout", request_body = TargetBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn checkout(
     State(state): State<AppState>,
     Json(body): Json<TargetBody>,
@@ -340,6 +346,7 @@ pub(super) async fn checkout(
 }
 
 /// `POST /api/git/revert` (对齐 nuwax revert; 把 tree 重置到 target 但用新 commit 保留历史)。
+#[utoipa::path(post, path = "/revert", request_body = RevertBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
 pub(super) async fn revert(
     State(state): State<AppState>,
     Json(body): Json<RevertBody>,

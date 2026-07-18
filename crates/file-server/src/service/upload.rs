@@ -32,7 +32,7 @@ pub async fn upload_single_file(
         return Err(AppError::validation("filePath cannot be empty"));
     }
     let project_path = resolver.resolve_project(ctx);
-    if !fs::try_exists(&project_path).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
     version::backup_project(config, project_id, &project_path, code_version).await?;
@@ -69,7 +69,7 @@ pub async fn upload_batch_files(
         return Err(AppError::validation("files cannot be empty"));
     }
     let project_path = resolver.resolve_project(ctx);
-    if !fs::try_exists(&project_path).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
     let backup = version::backup_project(config, project_id, &project_path, code_version).await?;
@@ -131,15 +131,21 @@ pub async fn upload_attachment_file(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     let project_path = resolver.resolve_project(ctx);
-    if !fs::try_exists(&project_path).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
     let attachments_dir = project_path.join(".attachments");
     fs::create_dir_all(&attachments_dir).await?;
-    let base = preferred_name
+    let requested = preferred_name
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| original_name.to_string());
+    let base = Path::new(&requested)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| AppError::validation("invalid attachment file name"))?
+        .to_string();
     let final_name = unique_name(&attachments_dir, &base);
     let target = attachments_dir.join(&final_name);
     fs::write(&target, data).await?;

@@ -7,29 +7,69 @@
 //! 响应字段对齐 nuwax: timestamp/uptime/version/platform/runtimeVersion/pid/memory/env。
 
 use axum::Json;
-use serde_json::{Value, json};
+use axum::extract::State;
+use axum::response::Html;
+use serde::Serialize;
+use utoipa::ToSchema;
 
-/// 进程启动时间 (首次调用 health 时记; 用于 uptime 计算)。
-static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+use crate::AppState;
+
+/// `GET /`，兼容 nuwax 根路径探测。
+#[utoipa::path(
+    get,
+    path = "/",
+    responses((status = 200, description = "Service greeting", body = String, content_type = "text/html")),
+    tag = "System"
+)]
+pub async fn root() -> Html<&'static str> {
+    Html("Hello")
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthResponse {
+    pub status: String,
+    pub timestamp: i64,
+    pub uptime: u64,
+    pub version: String,
+    pub platform: String,
+    pub node_version: String,
+    pub pid: u32,
+    pub memory: MemoryUsage,
+    pub env: String,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryUsage {
+    pub rss: f64,
+    pub heap_used: f64,
+    pub heap_total: f64,
+    pub external: f64,
+}
 
 /// `GET /health`
-pub async fn health() -> Json<Value> {
-    let start = START.get_or_init(std::time::Instant::now);
-    let uptime = start.elapsed().as_secs();
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses((status = 200, description = "Service health", body = HealthResponse)),
+    tag = "System"
+)]
+pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let uptime = state.started_at.elapsed().as_secs();
     let memory = memory_usage();
-    Json(json!({
-        "status": "ok",
-        "service": "file-server",
-        "timestamp": now_ms(),
-        "uptime": uptime,
-        "version": env!("CARGO_PKG_VERSION"),
-        "platform": std::env::consts::OS,
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        timestamp: now_ms(),
+        uptime,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        platform: std::env::consts::OS.to_string(),
         // Rust 无 node 运行时, 用 rust edition 标识 (对齐 nuwax nodeVersion 字段位)
-        "nodeVersion": "rust-2024",
-        "pid": std::process::id(),
-        "memory": memory,
-        "env": std::env::var("NODE_ENV").unwrap_or_else(|_| "unknown".to_string()),
-    }))
+        node_version: "rust-2024".to_string(),
+        pid: std::process::id(),
+        memory,
+        env: std::env::var("NODE_ENV").unwrap_or_else(|_| "unknown".to_string()),
+    })
 }
 
 /// 当前 epoch 毫秒 (对齐 nuwax Date.now())。
@@ -39,14 +79,14 @@ fn now_ms() -> i64 {
 
 /// 内存占用 (MB, 对齐 nuwax process.memoryUsage 形状; Rust 无 GC 堆, heapUsed/Total/external 填 0,
 /// rss 取 /proc/self/status 的 VmRSS, 不可用时为 0)。
-fn memory_usage() -> Value {
+fn memory_usage() -> MemoryUsage {
     let round2 = |mb: f64| (mb * 100.0).round() / 100.0;
-    json!({
-        "rss": round2(rss_mb()),
-        "heapUsed": 0.0,
-        "heapTotal": 0.0,
-        "external": 0.0,
-    })
+    MemoryUsage {
+        rss: round2(rss_mb()),
+        heap_used: 0.0,
+        heap_total: 0.0,
+        external: 0.0,
+    }
 }
 
 /// 读 /proc/self/status 的 VmRSS (KB → MB); 非 Linux 或读取失败 → 0。

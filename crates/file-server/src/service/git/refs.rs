@@ -4,13 +4,18 @@ use crate::error::AppResult;
 
 use super::map_git_err;
 
+use gix::Repository;
+use gix::actor::Signature;
+use gix::bstr::BString;
+use gix::date::{Time, parse::TimeBuf};
+use gix::object::Kind as ObjectKind;
 use gix::refs::transaction::PreviousValue;
 
 /// 创建分支 (对齐 nuwax createBranch; start_point 默认 HEAD)。
 /// `switch=true` 时创建后立即 checkout (对齐 nuwax `git.branch({ checkout: true })`):
 /// 先 clean_tree_check (避免创建后切换失败的半成品), 再建 ref, 再 switch。
 pub fn create_branch(
-    repo: &gix::Repository,
+    repo: &Repository,
     name: &str,
     start_point: Option<&str>,
     switch: bool,
@@ -40,7 +45,7 @@ pub fn create_branch(
 
 /// 删除分支 (对齐 nuwax deleteBranch)。
 /// `force` 仅为字段契约对齐 nuwax (gix reference.delete 不校验合并状态, 始终删除)。
-pub fn delete_branch(repo: &gix::Repository, name: &str, _force: bool) -> AppResult<()> {
+pub fn delete_branch(repo: &Repository, name: &str, _force: bool) -> AppResult<()> {
     let full = format!("refs/heads/{name}");
     let r = repo
         .find_reference(&full)
@@ -52,7 +57,7 @@ pub fn delete_branch(repo: &gix::Repository, name: &str, _force: bool) -> AppRes
 /// 创建标签 (对齐 nuwax createTag; message 非空 → annotated, 否则 lightweight)。
 /// annotated tag 的 tagger 用传入的 author (对齐 nuwax getDefaultAuthor), 不再硬编码。
 pub fn create_tag(
-    repo: &gix::Repository,
+    repo: &Repository,
     name: &str,
     message: Option<&str>,
     author_name: &str,
@@ -63,16 +68,16 @@ pub fn create_tag(
         .map_err(|e| map_git_err(e, "git head_id"))?
         .detach();
     if let Some(msg) = message {
-        let tagger = gix::actor::Signature {
-            name: gix::bstr::BString::from(author_name),
-            email: gix::bstr::BString::from(author_email),
-            time: gix::date::Time::now_local_or_utc(),
+        let tagger = Signature {
+            name: BString::from(author_name),
+            email: BString::from(author_email),
+            time: Time::now_local_or_utc(),
         };
-        let mut buf = gix::date::parse::TimeBuf::default();
+        let mut buf = TimeBuf::default();
         repo.tag(
             name,
             head_id,
-            gix::object::Kind::Commit,
+            ObjectKind::Commit,
             Some(tagger.to_ref(&mut buf)),
             msg,
             PreviousValue::MustNotExist,
@@ -86,7 +91,7 @@ pub fn create_tag(
 }
 
 /// 删除标签 (对齐 nuwax deleteTag)。
-pub fn delete_tag(repo: &gix::Repository, name: &str) -> AppResult<()> {
+pub fn delete_tag(repo: &Repository, name: &str) -> AppResult<()> {
     let full = format!("refs/tags/{name}");
     let r = repo
         .find_reference(&full)
@@ -96,7 +101,7 @@ pub fn delete_tag(repo: &gix::Repository, name: &str) -> AppResult<()> {
 }
 
 /// 校验不能删除当前分支 (对齐 nuwax deleteBranch 检查)。
-pub fn is_current_branch(repo: &gix::Repository, name: &str) -> AppResult<bool> {
+pub fn is_current_branch(repo: &Repository, name: &str) -> AppResult<bool> {
     let current = repo
         .head_name()
         .ok()

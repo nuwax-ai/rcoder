@@ -13,7 +13,7 @@
 //! (它统一补 `\n`), 与 nuwax/git CLI 存在细微差异; 仅影响显示, 不影响 diff 正确性。
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
 
@@ -22,6 +22,11 @@ use super::{get_status, map_git_err};
 use gix::diff::blob::sources;
 use gix::diff::blob::unified_diff::{ConsumeBinaryHunk, ContextSize};
 use gix::diff::blob::{Algorithm, Diff, InternedInput, UnifiedDiff};
+use gix::diff::tree_with_rewrites::Change;
+use gix::hash::ObjectId;
+use gix::index::{File as IndexFile, entry::Stage as IndexStage};
+use gix::path::into_bstr;
+use gix::{Repository, Tree};
 
 /// diff 数据来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,12 +77,15 @@ pub struct DiffResult {
 }
 
 /// 计算工作区 diff (对齐 nuwax diff)。
-pub fn compute_diff(repo: &gix::Repository, params: &DiffParams) -> AppResult<DiffResult> {
-    let changes = match params.source {
+pub fn compute_diff(repo: &Repository, params: &DiffParams) -> AppResult<DiffResult> {
+    let mut changes = match params.source {
         DiffSource::Commit => collect_commit_changes(repo, params)?,
         DiffSource::Worktree => collect_worktree_changes(repo)?,
         DiffSource::Staged => collect_staged_changes(repo)?,
     };
+    // isomorphic-git 的 listFiles/statusMatrix 以路径稳定排序；gix tree diff
+    // 的事件顺序不作相同保证。在公共入口统一排序以保持 API 可比较。
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
     render_changes(repo, changes, &params.paths)
 }
 
@@ -95,10 +103,7 @@ struct FileChange {
     new: Side,
 }
 
-fn collect_commit_changes(
-    repo: &gix::Repository,
-    params: &DiffParams,
-) -> AppResult<Vec<FileChange>> {
+fn collect_commit_changes(repo: &Repository, params: &DiffParams) -> AppResult<Vec<FileChange>> {
     let from = params
         .from
         .as_deref()
@@ -106,31 +111,34 @@ fn collect_commit_changes(
     let from_id = repo
         .rev_parse_single(from)
         .map_err(|e| map_git_err(e, "git rev_parse from"))?;
-    let from_tree = repo
+    let requested_tree = repo
         .find_commit(from_id)
         .map_err(|e| map_git_err(e, "git find_commit from"))?
         .tree()
         .map_err(|e| map_git_err(e, "git from tree"))?
         .id()
         .detach();
-    // to 缺省取 from 的首个 parent; 无 parent (初始提交) → 空 tree (全部视为新增)
-    let to_tree = match &params.to {
+    // 同时给 from/to: old=from, new=to。
+    // 只给 from: old=from 的首个 parent (无 parent 则空树), new=from。
+    let (old_tree_id, new_tree_id) = match &params.to {
         Some(to) => {
             let to_id = repo
                 .rev_parse_single(to.as_str())
                 .map_err(|e| map_git_err(e, "git rev_parse to"))?;
-            repo.find_commit(to_id)
+            let to_tree = repo
+                .find_commit(to_id)
                 .map_err(|e| map_git_err(e, "git find_commit to"))?
                 .tree()
                 .map_err(|e| map_git_err(e, "git to tree"))?
                 .id()
-                .detach()
+                .detach();
+            (requested_tree, to_tree)
         }
         None => {
             let commit = repo
                 .find_commit(from_id)
                 .map_err(|e| map_git_err(e, "git find_commit from (parent)"))?;
-            match commit.parent_ids().next() {
+            let parent_tree = match commit.parent_ids().next() {
                 Some(parent_id) => repo
                     .find_commit(parent_id)
                     .map_err(|e| map_git_err(e, "git find_commit parent"))?
@@ -138,19 +146,16 @@ fn collect_commit_changes(
                     .map_err(|e| map_git_err(e, "git parent tree"))?
                     .id()
                     .detach(),
-                None => repo
-                    .head_tree_id_or_empty()
-                    .map_err(|e| map_git_err(e, "git empty tree"))?
-                    .detach(),
-            }
+                None => repo.empty_tree().id().detach(),
+            };
+            (parent_tree, requested_tree)
         }
     };
-    // old = to_tree (基准), new = from_tree (目标) — 对齐 nuwax: diff to..from
     let old_tree = repo
-        .find_tree(to_tree)
+        .find_tree(old_tree_id)
         .map_err(|e| map_git_err(e, "git find_tree old"))?;
     let new_tree = repo
-        .find_tree(from_tree)
+        .find_tree(new_tree_id)
         .map_err(|e| map_git_err(e, "git find_tree new"))?;
     let changes = repo
         .diff_tree_to_tree(Some(&old_tree), &new_tree, None)
@@ -158,22 +163,47 @@ fn collect_commit_changes(
     let mut out = Vec::new();
     for change in changes {
         let (path, old_id, new_id) = match change {
-            gix::diff::tree_with_rewrites::Change::Addition { location, id, .. } => {
-                (location, None, Some(id))
-            }
-            gix::diff::tree_with_rewrites::Change::Deletion { location, id, .. } => {
-                (location, Some(id), None)
-            }
-            gix::diff::tree_with_rewrites::Change::Modification {
+            Change::Addition {
                 location,
-                previous_id,
+                entry_mode,
                 id,
                 ..
-            } => (location, Some(previous_id), Some(id)),
-            // rewrite 归为 modification (old=source, new=dest); source_id 取值需额外字段, 这里保守跳过
-            gix::diff::tree_with_rewrites::Change::Rewrite { location, id, .. } => {
+            } => {
+                if entry_mode.is_tree() {
+                    continue;
+                }
                 (location, None, Some(id))
             }
+            Change::Deletion {
+                location,
+                entry_mode,
+                id,
+                ..
+            } => {
+                if entry_mode.is_tree() {
+                    continue;
+                }
+                (location, Some(id), None)
+            }
+            Change::Modification {
+                location,
+                previous_entry_mode,
+                previous_id,
+                entry_mode,
+                id,
+                ..
+            } => {
+                if previous_entry_mode.is_tree() || entry_mode.is_tree() {
+                    continue;
+                }
+                (location, Some(previous_id), Some(id))
+            }
+            Change::Rewrite {
+                location,
+                source_id,
+                id,
+                ..
+            } => (location, Some(source_id), Some(id)),
         };
         let path = path.to_string();
         let old = read_blob(repo, old_id)?;
@@ -187,7 +217,7 @@ fn collect_commit_changes(
     Ok(out)
 }
 
-fn collect_worktree_changes(repo: &gix::Repository) -> AppResult<Vec<FileChange>> {
+fn collect_worktree_changes(repo: &Repository) -> AppResult<Vec<FileChange>> {
     let st = get_status(repo)?;
     let workdir = repo
         .workdir()
@@ -217,7 +247,7 @@ fn collect_worktree_changes(repo: &gix::Repository) -> AppResult<Vec<FileChange>
     Ok(out)
 }
 
-fn collect_staged_changes(repo: &gix::Repository) -> AppResult<Vec<FileChange>> {
+fn collect_staged_changes(repo: &Repository) -> AppResult<Vec<FileChange>> {
     let st = get_status(repo)?;
     let head_tree = head_tree(repo)?;
     let index = repo
@@ -241,7 +271,7 @@ fn collect_staged_changes(repo: &gix::Repository) -> AppResult<Vec<FileChange>> 
 
 /// 渲染所有变更 → 完整 unified diff 文本 + summary。
 fn render_changes(
-    repo: &gix::Repository,
+    repo: &Repository,
     changes: Vec<FileChange>,
     path_filter: &[String],
 ) -> AppResult<DiffResult> {
@@ -395,10 +425,7 @@ fn assemble_header(
 
 // ── 读取 helper ─────────────────────────────────────────────────────────────────
 
-fn read_blob(
-    repo: &gix::Repository,
-    id: Option<gix::hash::ObjectId>,
-) -> AppResult<Option<Vec<u8>>> {
+fn read_blob(repo: &Repository, id: Option<ObjectId>) -> AppResult<Option<Vec<u8>>> {
     match id {
         Some(id) => {
             let blob = repo
@@ -410,7 +437,7 @@ fn read_blob(
     }
 }
 
-fn head_tree(repo: &gix::Repository) -> AppResult<gix::Tree<'_>> {
+fn head_tree(repo: &Repository) -> AppResult<Tree<'_>> {
     let head_id = repo
         .head_tree_id_or_empty()
         .map_err(|e| map_git_err(e, "git head_tree_id_or_empty"))?;
@@ -418,11 +445,7 @@ fn head_tree(repo: &gix::Repository) -> AppResult<gix::Tree<'_>> {
         .map_err(|e| map_git_err(e, "git find_tree (head)"))
 }
 
-fn read_head_blob(
-    repo: &gix::Repository,
-    tree: &gix::Tree<'_>,
-    path: &str,
-) -> AppResult<Option<Vec<u8>>> {
+fn read_head_blob(repo: &Repository, tree: &Tree<'_>, path: &str) -> AppResult<Option<Vec<u8>>> {
     let entry = tree
         .lookup_entry_by_path(path)
         .map_err(|e| map_git_err(e, "git lookup_entry_by_path"))?;
@@ -437,14 +460,9 @@ fn read_head_blob(
     }
 }
 
-fn read_index_blob(
-    repo: &gix::Repository,
-    index: &gix::index::File,
-    path: &str,
-) -> Option<Vec<u8>> {
-    let bstr_path = gix::path::into_bstr(std::path::PathBuf::from(path));
-    let entry = index
-        .entry_by_path_and_stage(bstr_path.as_ref(), gix::index::entry::Stage::Unconflicted)?;
+fn read_index_blob(repo: &Repository, index: &IndexFile, path: &str) -> Option<Vec<u8>> {
+    let bstr_path = into_bstr(PathBuf::from(path));
+    let entry = index.entry_by_path_and_stage(bstr_path.as_ref(), IndexStage::Unconflicted)?;
     let blob = repo.find_blob(entry.id).ok()?;
     Some(blob.data.to_vec())
 }
@@ -478,10 +496,78 @@ fn count_changes(hunks: &str) -> (usize, usize) {
 
 /// blob 7 字符短 hash (对齐 nuwax gitBlobHash[..7])。
 /// write_blob 对已存在内容去重, 不会重复存储。
-fn short_hash(repo: &gix::Repository, bytes: &[u8]) -> AppResult<String> {
+fn short_hash(repo: &Repository, bytes: &[u8]) -> AppResult<String> {
     let id = repo
         .write_blob(bytes)
         .map_err(|e| map_git_err(e, "git write_blob (hash)"))?;
     let hex = id.to_hex().to_string();
     Ok(hex.chars().take(7).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::git::{commit_indexed, init_repo, stage_path};
+    use gix::open;
+
+    #[test]
+    fn commit_diff_handles_nested_tree_and_preserves_from_to_direction() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "file-server-diff-test-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("create fixture");
+        init_repo(&root, "Test", "test@example.com").expect("init repo");
+        let repo = open(&root).expect("open repo");
+
+        std::fs::write(root.join("src/app.txt"), "old\n").expect("write old");
+        stage_path(&repo, "src/app.txt").expect("stage old");
+        let old = commit_indexed(&repo, "old", "Test", "test@example.com").expect("commit old");
+
+        std::fs::write(root.join("src/app.txt"), "new\n").expect("write new");
+        std::fs::write(root.join("src/added.txt"), "added\n").expect("write added");
+        stage_path(&repo, "src").expect("stage nested tree");
+        let new = commit_indexed(&repo, "new", "Test", "test@example.com").expect("commit new");
+
+        let result = compute_diff(
+            &repo,
+            &DiffParams {
+                source: DiffSource::Commit,
+                from: Some(old),
+                to: Some(new.clone()),
+                paths: Vec::new(),
+            },
+        )
+        .expect("explicit commit diff");
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .map(|file| file.file.as_str())
+                .collect::<Vec<_>>(),
+            ["src/added.txt", "src/app.txt"]
+        );
+        assert!(result.diff.contains("-old"));
+        assert!(result.diff.contains("+new"));
+
+        let from_only = compute_diff(
+            &repo,
+            &DiffParams {
+                source: DiffSource::Commit,
+                from: Some(new),
+                to: None,
+                paths: Vec::new(),
+            },
+        )
+        .expect("from-only commit diff");
+        assert_eq!(from_only.insertions, result.insertions);
+        assert_eq!(from_only.deletions, result.deletions);
+
+        drop(repo);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

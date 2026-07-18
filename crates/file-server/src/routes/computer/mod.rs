@@ -9,9 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
-use axum::Router;
-use axum::routing::{get, post};
 use serde::Deserialize;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::AppState;
 use crate::error::AppError;
@@ -22,38 +22,26 @@ mod exec;
 mod files;
 mod workspace;
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/get-file-list", get(files::get_file_list))
-        .route("/delete-workspace", post(files::delete_workspace))
-        .route("/get-logs", get(exec::get_logs))
-        .route("/execute-command", post(exec::execute_command))
-        .route("/install-project", post(exec::install_project))
-        .route("/zip-workspace", post(archive::zip_workspace))
-        .route("/download-all-files", get(archive::download_all_files))
-        .route("/files-update", post(files::files_update))
-        .route("/upload-file", post(files::upload_file))
-        .route("/upload-files", post(files::upload_files))
-        .route("/import-project", post(files::import_project))
-        .route(
-            "/cleanup-build-artifacts",
-            post(exec::cleanup_build_artifacts),
-        )
-        .route("/create-workspace", post(workspace::create_workspace))
-        .route("/create-workspace-v2", post(workspace::create_workspace_v2))
-        .route(
-            "/push-skills-to-workspace",
-            post(workspace::push_skills_to_workspace),
-        )
-        .route(
-            "/push-skills-to-workspace-v2",
-            post(workspace::push_skills_to_workspace),
-        )
-        .route(
-            "/init-project-template",
-            post(workspace::init_project_template),
-        )
-        .route("/build-agent-package", post(exec::build_agent_package))
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(files::get_file_list))
+        .routes(routes!(files::delete_workspace))
+        .routes(routes!(exec::get_logs))
+        .routes(routes!(exec::execute_command))
+        .routes(routes!(exec::install_project))
+        .routes(routes!(archive::zip_workspace))
+        .routes(routes!(archive::download_all_files))
+        .routes(routes!(files::files_update))
+        .routes(routes!(files::upload_file))
+        .routes(routes!(files::upload_files))
+        .routes(routes!(files::import_project))
+        .routes(routes!(exec::cleanup_build_artifacts))
+        .routes(routes!(workspace::create_workspace))
+        .routes(routes!(workspace::create_workspace_v2))
+        .routes(routes!(workspace::push_skills_to_workspace))
+        .routes(routes!(workspace::push_skills_to_workspace_v2))
+        .routes(routes!(workspace::init_project_template))
+        .routes(routes!(exec::build_agent_package))
 }
 
 // ── 跨组共享 helper (子模块经 super:: 访问) ──────────────────────────────────────
@@ -65,12 +53,29 @@ async fn text_field(field: axum::extract::multipart::Field<'_>) -> Result<String
         .map_err(|e| AppError::validation(format!("read multipart field: {e}")))
 }
 
-async fn bytes_field(field: axum::extract::multipart::Field<'_>) -> Result<Vec<u8>, AppError> {
-    field
-        .bytes()
+async fn bytes_field(
+    mut field: axum::extract::multipart::Field<'_>,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
+    let mut data = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
         .await
-        .map(|b| b.to_vec())
-        .map_err(|e| AppError::validation(format!("read multipart file: {e}")))
+        .map_err(|e| AppError::validation(format!("read multipart file: {e}")))?
+    {
+        let next_len = (data.len() as u64)
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| AppError::validation("multipart file size overflow"))?;
+        if next_len > max_bytes {
+            return Err(AppError::validation(format!(
+                "File size exceeds limit (max {max_bytes} bytes)"
+            )));
+        }
+        data.try_reserve(chunk.len())
+            .map_err(|e| AppError::system(format!("reserve multipart buffer: {e}")))?;
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
 }
 
 /// `.zip` 扩展名校验 (对齐 nuwax: 仅允许 zip)。
@@ -110,7 +115,8 @@ fn resolve_computer_target(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct UserCidQuery {
     pub user_id: String,

@@ -11,6 +11,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::error::{AppError, AppResult};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogFileSnapshot {
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub(crate) modified: std::time::SystemTime,
+}
+
 /// 解析 dev 日志目录 (对齐 nuwax getLogDir)。
 pub fn log_dir(cfg: &crate::Config, project_id: &str) -> PathBuf {
     if let Some(rest) = project_id.strip_prefix("computer:") {
@@ -47,7 +54,12 @@ pub fn timestamp_prefix() -> String {
 /// 避免 stdout/stderr 两个管道 task 并发写同一日志文件时行间交错粘连。
 pub async fn append_line(path: &Path, line: &str) -> AppResult<()> {
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            AppError::system(format!(
+                "create dev log directory {}: {error}",
+                parent.display()
+            ))
+        })?;
     }
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -141,7 +153,8 @@ pub async fn read_dev_log(
     let content = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| AppError::system(format!("read dev log: {e}")))?;
-    let all: Vec<&str> = content.lines().collect();
+    // JS `String.split("\n")` 会保留末尾空行；保持 totalLines/行号完全一致。
+    let all: Vec<&str> = content.split('\n').collect();
     let total = all.len();
     let start = start_index.saturating_sub(1).min(total);
     let logs = all[start..]
@@ -160,12 +173,58 @@ pub async fn read_dev_log(
     })
 }
 
+pub async fn snapshot_dev_log(dir: &Path, log_type: &str) -> AppResult<Option<LogFileSnapshot>> {
+    let file_name = if log_type == "main" {
+        main_log_name()
+    } else {
+        latest_temp_log(dir).await.unwrap_or_else(main_log_name)
+    };
+    let path = dir.join(&file_name);
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::system(format!(
+                "inspect dev log {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let modified = metadata.modified().map_err(|error| {
+        AppError::system(format!("read dev log mtime {}: {error}", path.display()))
+    })?;
+    Ok(Some(LogFileSnapshot {
+        file_name,
+        size_bytes: metadata.len(),
+        modified,
+    }))
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReadDevLogResult {
     pub logs: Vec<LogLine>,
     pub total_lines: usize,
     pub start_index: usize,
     pub log_file_name: String,
+}
+
+pub fn slice_log_result(full: &ReadDevLogResult, start_index: usize) -> ReadDevLogResult {
+    let total = full.logs.len();
+    let start = start_index.saturating_sub(1).min(total);
+    let logs = full.logs[start..]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| LogLine {
+            line: start + offset + 1,
+            content: line.content.clone(),
+        })
+        .collect();
+    ReadDevLogResult {
+        logs,
+        total_lines: total,
+        start_index: start + 1,
+        log_file_name: full.log_file_name.clone(),
+    }
 }
 
 /// 目录下最新的 `dev-temp-*.log` (按文件名内时间戳降序)。

@@ -5,14 +5,16 @@
 
 use std::path::PathBuf;
 
-use axum::extract::{Query, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::extract::State;
 use serde::Deserialize;
 use serde_json::Value;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::AppState;
 use crate::error::AppError;
+use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::service::pnpm::{self, InstallOptions, LogFiles};
 use crate::workspace::ProjectContext;
 
 // ── 类型化响应 (取代 serde_json::json! 字面量; camelCase 由 serde 统一保证) ──────
@@ -132,29 +134,32 @@ mod response {
         #[serde(rename = "NODE_ENV")]
         pub node_env: String,
         #[serde(rename = "LOG_CACHE_ENABLED")]
-        pub log_cache_enabled: String,
+        pub log_cache_enabled: bool,
     }
 }
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/start-dev", get(start_dev))
-        .route("/stop-dev", get(stop_dev))
-        .route("/restart-dev", get(restart_dev))
-        .route("/list-dev", get(list_dev))
-        .route("/keep-alive", get(keep_alive))
-        .route("/port-pool-status", get(port_pool_status))
-        .route("/get-dev-log", get(get_dev_log))
-        .route("/build", get(build_project))
-        .route("/parse-build-error", axum::routing::post(parse_build_error))
-        .route("/get-log-cache-stats", get(get_log_cache_stats))
-        .route("/clear-all-log-cache", get(clear_all_log_cache))
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(start_dev))
+        .routes(routes!(stop_dev))
+        .routes(routes!(restart_dev))
+        .routes(routes!(list_dev))
+        .routes(routes!(keep_alive))
+        .routes(routes!(port_pool_status))
+        .routes(routes!(get_dev_log))
+        .routes(routes!(build_project))
+        .routes(routes!(parse_build_error))
+        .routes(routes!(get_log_cache_stats))
+        .routes(routes!(clear_all_log_cache))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 struct BuildQuery {
     project_id: String,
+    #[serde(default)]
+    pid: Option<String>,
     #[serde(default)]
     base_path: Option<String>,
     // 多租户隔离参数 (透传给 ProjectContext)
@@ -166,7 +171,8 @@ struct BuildQuery {
     isolation_type: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 struct KeepAliveQuery {
     project_id: String,
@@ -183,7 +189,8 @@ struct KeepAliveQuery {
     isolation_type: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 struct DevLogQuery {
     project_id: String,
@@ -218,6 +225,13 @@ fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> PathBuf {
 }
 
 /// `GET /api/build/start-dev` (对齐 nuwax start-dev)。
+#[utoipa::path(
+    get,
+    path = "/start-dev",
+    params(BuildQuery),
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Build"
+)]
 async fn start_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
@@ -238,11 +252,23 @@ async fn start_dev(
 }
 
 /// `GET /api/build/stop-dev` (对齐 nuwax stop-dev)。
+#[utoipa::path(
+    get,
+    path = "/stop-dev",
+    params(BuildQuery),
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Build"
+)]
 async fn stop_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<response::DevStopped>, AppError> {
+    q.pid
+        .as_deref()
+        .filter(|pid| !pid.trim().is_empty())
+        .ok_or_else(|| AppError::validation("Process ID cannot be empty"))?;
     let stopped = state.dev_server.stop_dev(&q.project_id).await?;
+    state.log_cache.delete(&q.project_id)?;
     // message 对齐 nuwax stopDevUtils: 全杀 "Stopped" / 部分杀 "Partially stopped..." / 无候选 "No running process found"
     let all_killed = stopped.killed_pids.iter().all(|k| k.killed);
     let message = if stopped.killed_pids.is_empty() {
@@ -262,6 +288,13 @@ async fn stop_dev(
 }
 
 /// `GET /api/build/restart-dev` (对齐 nuwax restart-dev)。
+#[utoipa::path(
+    get,
+    path = "/restart-dev",
+    params(BuildQuery),
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Build"
+)]
 async fn restart_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
@@ -282,6 +315,12 @@ async fn restart_dev(
 }
 
 /// `GET /api/build/list-dev` (对齐 nuwax list-dev)。
+#[utoipa::path(
+    get,
+    path = "/list-dev",
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Build"
+)]
 async fn list_dev(State(state): State<AppState>) -> Result<Json<response::DevList>, AppError> {
     let list = state.dev_server.list_dev()?;
     Ok(Json(response::DevList {
@@ -291,6 +330,13 @@ async fn list_dev(State(state): State<AppState>) -> Result<Json<response::DevLis
 }
 
 /// `GET /api/build/keep-alive` (对齐 nuwax keep-alive)。
+#[utoipa::path(
+    get,
+    path = "/keep-alive",
+    params(KeepAliveQuery),
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Build"
+)]
 async fn keep_alive(
     State(state): State<AppState>,
     Query(q): Query<KeepAliveQuery>,
@@ -330,6 +376,12 @@ async fn keep_alive(
 }
 
 /// `GET /api/build/port-pool-status` (对齐 nuwax port-pool-status)。
+#[utoipa::path(
+    get,
+    path = "/port-pool-status",
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Build"
+)]
 async fn port_pool_status(
     State(state): State<AppState>,
 ) -> Result<Json<response::PortPool>, AppError> {
@@ -344,28 +396,71 @@ async fn port_pool_status(
 }
 
 /// `GET /api/build/get-dev-log` (对齐 nuwax get-dev-log)。
+#[utoipa::path(
+    get,
+    path = "/get-dev-log",
+    params(DevLogQuery),
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Build"
+)]
 async fn get_dev_log(
     State(state): State<AppState>,
     Query(q): Query<DevLogQuery>,
 ) -> Result<Json<response::DevLog>, AppError> {
-    let result = state
-        .dev_server
-        .read_dev_log(&q.project_id, q.start_index, &q.log_type)
-        .await?;
+    let log_dir = crate::service::dev_server::log::log_dir(&state.config, &q.project_id);
+    let snapshot = crate::service::dev_server::log::snapshot_dev_log(&log_dir, &q.log_type).await?;
+    let mut cache_hit = false;
+    let mut file_too_large = false;
+    let result = if let Some(snapshot) = snapshot {
+        if let Some(cached) = state
+            .log_cache
+            .get(&q.project_id, &snapshot, q.start_index)?
+        {
+            cache_hit = true;
+            cached
+        } else {
+            let full = state
+                .dev_server
+                .read_dev_log(&q.project_id, 1, &q.log_type)
+                .await?;
+            file_too_large = state.config.log_cache_enabled
+                && snapshot.size_bytes > state.config.log_cache_max_file_size_bytes;
+            state.log_cache.insert(&q.project_id, snapshot, &full)?;
+            crate::service::dev_server::log::slice_log_result(&full, q.start_index)
+        }
+    } else {
+        state
+            .dev_server
+            .read_dev_log(&q.project_id, q.start_index, &q.log_type)
+            .await?
+    };
+    let message = if cache_hit {
+        "Get log successfully (cache)"
+    } else if file_too_large {
+        "Get log successfully (file too large, not cached)"
+    } else {
+        "Get log successfully"
+    };
     Ok(Json(response::DevLog {
         success: true,
-        message: "Get log successfully".to_string(),
+        message: message.to_string(),
         logs: result.logs,
         total_lines: result.total_lines,
         start_index: result.start_index,
         log_file_name: result.log_file_name,
-        // Rust 无缓存层, 固定 false (对齐 nuwax getDevLog 字段)
-        cache_hit: false,
-        file_too_large: false,
+        cache_hit,
+        file_too_large,
     }))
 }
 
 /// `GET /api/build/build` (对齐 nuwax buildProject): install + build + 拷贝 dist。
+#[utoipa::path(
+    get,
+    path = "/build",
+    params(BuildQuery),
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Build"
+)]
 async fn build_project(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
@@ -398,28 +493,15 @@ async fn build_project(
     let base = normalize_build_base(q.base_path.as_deref());
 
     // 并发控制: 全局信号量 + 项目级互斥 (对齐 nuwax buildingProjects + MAX_BUILD_CONCURRENCY)
-    let (sem, building) = build_concurrency(state.config.max_build_concurrency);
-    // 全局并发上限: 立即拒绝 (对齐 nuwax "Concurrency is full, please try again later";
-    // 非排队等待 — 排队会挂起到请求超时, nuwax 是立即 BusinessError)
-    let _permit = sem
-        .try_acquire()
-        .map_err(|_| AppError::business("Concurrency is full, please try again later"))?;
-    // 项目级互斥: 同一项目正在 build 则拒绝 (poison 恢复: 另一请求 panic 毒化锁时取回数据)
-    {
-        let mut b = building.lock().unwrap_or_else(|e| e.into_inner());
-        if b.contains(&q.project_id) {
-            return Err(AppError::business("This project is being built"));
-        }
-        b.insert(q.project_id.clone());
-    }
+    // 立即拒绝超容量/同项目重复 build；guard 在所有退出路径自动释放。
+    let _build_guard = state.build_manager.try_start(&q.project_id)?;
 
     // install (对齐 nuwax: 失败则整体 build 失败, 透传 "Dependency installation failed")
-    crate::service::dev_server::process::run_command_to_log(
-        "pnpm",
-        &["install", "--prefer-offline"],
+    let install_logs = LogFiles::new(&main_log, &temp_log);
+    pnpm::install(
         &path,
-        &main_log,
-        &temp_log,
+        &InstallOptions::prefer_offline(),
+        Some(&install_logs),
         timeout,
     )
     .await
@@ -439,16 +521,11 @@ async fn build_project(
         timeout,
     )
     .await;
-    // 释放项目级锁 (drop _permit + 显式 remove)
-    building
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&q.project_id);
-    if build_result.is_err() {
+    if let Err(build_error) = build_result {
         // 失败: 读 build 日志用 build_error 解析友好消息 (对齐 nuwax BuildErrorParser)
         let log_content = tokio::fs::read_to_string(&temp_log)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|_| build_error.to_string());
         let friendly = crate::service::build_error::parse(&log_content);
         return Err(AppError::system(friendly));
     }
@@ -462,7 +539,12 @@ async fn build_project(
         .join("dist");
     let src = path.join("dist");
     if !src.exists() {
-        return Err(AppError::business("build produced no dist directory"));
+        tracing::warn!(project_id = %q.project_id, path = %src.display(), "build produced no dist directory");
+        return Ok(Json(response::BuildDone {
+            success: true,
+            message: "Build completed".to_string(),
+            project_id: q.project_id.clone(),
+        }));
     }
     let src2 = src.clone();
     let dst2 = dst.clone();
@@ -493,23 +575,6 @@ fn normalize_build_base(b: Option<&str>) -> String {
     s
 }
 
-/// 全局 build 并发: 信号量(全局上限) + 正在构建项目集合(项目级互斥)。
-/// 进程级单例 (OnceLock), 对齐 nuwax 模块级 buildingProjects/currentBuilds。
-fn build_concurrency(
-    max: usize,
-) -> (
-    &'static tokio::sync::Semaphore,
-    &'static std::sync::Mutex<std::collections::HashSet<String>>,
-) {
-    use std::sync::OnceLock;
-    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-    static BUILDING: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        OnceLock::new();
-    let sem = SEM.get_or_init(|| tokio::sync::Semaphore::new(max.max(1)));
-    let building = BUILDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    (sem, building)
-}
-
 /// 递归拷贝目录 (替代 `rm -rf && cp -R`); 目标存在则先清空, 保留 symlink。
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> Result<(), AppError> {
     use std::fs;
@@ -538,7 +603,7 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> Result<(), AppE
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct ParseErrorBody {
     /// 必填校验 (对齐 nuwax buildRoutes projectId 校验; handler 不读, 仅供 serde 强制存在)
@@ -548,6 +613,7 @@ struct ParseErrorBody {
 }
 
 /// `POST /api/build/parse-build-error` (对齐 nuwax BuildErrorParser)。
+#[utoipa::path(post, path = "/parse-build-error", request_body = ParseErrorBody, responses(crate::openapi::JsonApiResponses), tag = "Build")]
 async fn parse_build_error(
     State(_state): State<AppState>,
     Json(body): Json<ParseErrorBody>,
@@ -561,29 +627,49 @@ async fn parse_build_error(
 
 // ── 日志缓存接口 (对齐 nuwax logCacheManager; Rust 无缓存层, 返回固定 stats) ────
 
-/// `GET /api/build/get-log-cache-stats` (对齐 nuwax; Rust 无缓存层 → 返回 disabled 形态)。
-async fn get_log_cache_stats(State(_state): State<AppState>) -> Json<response::LogCacheStats> {
-    Json(response::LogCacheStats {
+/// `GET /api/build/get-log-cache-stats` (对齐 nuwax logCacheManager.getStats)。
+#[utoipa::path(
+    get,
+    path = "/get-log-cache-stats",
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Build"
+)]
+async fn get_log_cache_stats(
+    State(state): State<AppState>,
+) -> Result<Json<response::LogCacheStats>, AppError> {
+    let stats = state.log_cache.stats()?;
+    Ok(Json(response::LogCacheStats {
         success: true,
         message: "Get log cache statistics successfully".to_string(),
         stats: response::LogCacheStatsData {
-            enabled: false,
-            cache_size: 0,
-            max_cache_entries: 100,
-            cache_duration: 300000,
-            max_file_size_mb: "0.00".to_string(),
-            total_cache_size_mb: "0.00".to_string(),
+            enabled: stats.enabled,
+            cache_size: stats.cache_size,
+            max_cache_entries: stats.max_cache_entries,
+            cache_duration: stats.cache_duration,
+            max_file_size_mb: format!("{:.2}", stats.max_file_size_bytes as f64 / 1_048_576.0),
+            total_cache_size_mb: format!(
+                "{:.2}",
+                stats.total_cache_size_bytes as f64 / 1_048_576.0
+            ),
             node_env: std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string()),
-            log_cache_enabled: std::env::var("LOG_CACHE_ENABLED")
-                .unwrap_or_else(|_| "false".to_string()),
+            log_cache_enabled: stats.enabled,
         },
-    })
+    }))
 }
 
-/// `GET /api/build/clear-all-log-cache` (对齐 nuwax; Rust 无缓存层 → no-op)。
-async fn clear_all_log_cache(State(_state): State<AppState>) -> Json<response::Simple> {
-    Json(response::Simple {
+/// `GET /api/build/clear-all-log-cache` (对齐 nuwax logCacheManager.clear)。
+#[utoipa::path(
+    get,
+    path = "/clear-all-log-cache",
+    responses(crate::openapi::JsonApiResponses),
+    tag = "Build"
+)]
+async fn clear_all_log_cache(
+    State(state): State<AppState>,
+) -> Result<Json<response::Simple>, AppError> {
+    state.log_cache.clear()?;
+    Ok(Json(response::Simple {
         success: true,
         message: "All log caches have been cleared".to_string(),
-    })
+    }))
 }

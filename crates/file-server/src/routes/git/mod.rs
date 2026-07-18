@@ -7,9 +7,9 @@
 
 use std::path::PathBuf;
 
-use axum::Router;
-use axum::routing::{get, post};
 use serde::Deserialize;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::AppState;
 use crate::error::AppError;
@@ -20,33 +20,34 @@ mod read;
 mod refs;
 mod write;
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/branches", get(read::branches))
-        .route("/tags", get(read::tags))
-        .route("/log", get(read::log_history))
-        .route("/file-content", post(read::file_content))
-        .route("/status", get(read::status))
-        .route("/init", post(write::init))
-        .route("/add", post(write::add))
-        .route("/commit", post(write::commit))
-        .route("/unstage", post(write::unstage))
-        .route("/discard", post(write::discard))
-        .route("/diff", post(write::diff))
-        .route("/reset", post(write::reset))
-        .route("/checkout", post(write::checkout))
-        .route("/revert", post(write::revert))
-        .route("/branch-create", post(refs::branch_create))
-        .route("/branch-delete", post(refs::branch_delete))
-        .route("/branch-switch", post(refs::branch_switch))
-        .route("/tag-create", post(refs::tag_create))
-        .route("/tag-delete", post(refs::tag_delete))
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(read::branches))
+        .routes(routes!(read::tags))
+        .routes(routes!(read::log_history))
+        .routes(routes!(read::file_content))
+        .routes(routes!(read::status))
+        .routes(routes!(write::init))
+        .routes(routes!(write::add))
+        .routes(routes!(write::commit))
+        .routes(routes!(write::unstage))
+        .routes(routes!(write::discard))
+        .routes(routes!(write::diff))
+        .routes(routes!(write::reset))
+        .routes(routes!(write::checkout))
+        .routes(routes!(write::revert))
+        .routes(routes!(refs::branch_create))
+        .routes(routes!(refs::branch_delete))
+        .routes(routes!(refs::branch_switch))
+        .routes(routes!(refs::tag_create))
+        .routes(routes!(refs::tag_delete))
 }
 
 // ── 共享 base 结构 + 路径解析 (子模块经 super:: 访问) ─────────────────────────────
 
 /// GET 路由公共查询 (workspaceType + project/computer 标识 + 多租户)。
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams, utoipa::ToSchema)]
+#[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct GitQuery {
     pub workspace_type: Option<String>,
@@ -89,7 +90,7 @@ pub(super) fn resolve(q: &GitQuery, state: &AppState) -> Result<(PathBuf, String
 }
 
 /// POST 路由公共 body (写操作基类, 被 FilesBody / CommitBody 等经 serde flatten 复用)。
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct GitWriteBody {
     pub workspace_type: String,

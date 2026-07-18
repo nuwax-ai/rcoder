@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use crate::Config;
 use crate::error::{AppError, AppResult};
+use crate::service::pnpm::{self, InstallOptions, LogFiles};
 
 /// 运行中的 dev server 记录 (内存状态)。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -161,6 +162,8 @@ impl DevServerManager {
         let main_log = ldir.join(log::main_log_name());
         let temp_log = ldrtemp(&ldir, now);
 
+        self.write_npmrc(project_path).await?;
+
         // 命令: override env (运维控制, 非用户输入 → sh -c 安全) 优先;
         // 否则从 package.json 读 dev script → arg 数组 (用户输入经此路径, 避免注入)
         let ovr = std::env::var("DEV_SERVER_OVERRIDE_CMD")
@@ -193,22 +196,20 @@ impl DevServerManager {
             }
             None => {
                 let dev_script = read_dev_script(project_path)?;
-                self.write_npmrc(project_path).await?;
-                // 对齐 nuwax K8s 快路径 (restartDevUtils shouldUseFastRestart):
-                // 永不 removeNodeModules (那是 nuwax 非 K8s 全路径才做的); node_modules 存在则
-                // 直接复用 (更快, 省去增量 pnpm install), 仅缺失时才 install。
-                // → 重启 dev server 不删前端 vite 项目缓存, 与 K8s 分支一致。
-                if !project_path.join("node_modules").exists() {
-                    let _ = process::run_command_to_log(
-                        "pnpm",
-                        &["install", "--prefer-offline"],
-                        project_path,
-                        &main_log,
-                        &temp_log,
-                        self.config.dev_command_timeout_secs,
-                    )
-                    .await;
-                }
+                // preCmd 会改写 package.json/vite.config 并增加设计模式依赖，
+                // 即使 node_modules 已存在也必须执行增量 install。对齐 nuwax
+                // startDev_NonBlocking，安装失败必须阻止启动，不能带着缺包配置启动 Vite。
+                let install_logs = LogFiles::new(&main_log, &temp_log);
+                pnpm::install(
+                    project_path,
+                    &InstallOptions::prefer_offline(),
+                    Some(&install_logs),
+                    self.config.dev_command_timeout_secs,
+                )
+                .await
+                .map_err(|error| {
+                    AppError::system(format!("Dependency installation failed: {error}"))
+                })?;
                 let dev_args = process::build_dev_args(&dev_script, port, base_path)?;
                 process::spawn_dev(
                     dev_args.program,
@@ -307,8 +308,19 @@ impl DevServerManager {
         candidates.sort_unstable();
         candidates.dedup();
 
+        let candidates: Vec<(u32, Option<u32>)> = candidates
+            .into_iter()
+            .map(|pid| (pid, process::process_group_id(pid)))
+            .collect();
+        let mut stopped_groups = HashSet::new();
         let mut killed: Vec<KilledPid> = Vec::new();
-        for pid in candidates {
+        for (pid, pgid) in candidates {
+            // 第一个成员已通过 kill(-pgid) 停止整组，其余成员不应
+            // 因无法再次发送信号而被误报为 false。
+            if pgid.is_some_and(|group| stopped_groups.contains(&group)) {
+                killed.push(KilledPid { pid, killed: true });
+                continue;
+            }
             let ok = kill_process_group(pid);
             process::wait_for_stop(
                 pid,
@@ -319,14 +331,19 @@ impl DevServerManager {
             let mut k = ok;
             if is_process_running(pid) {
                 tracing::warn!("dev server (pid {pid}) 未在 SIGTERM 宽限期退出, 升级 SIGKILL");
-                process::kill_process_group_force(pid);
+                let force_sent = process::kill_process_group_force(pid);
                 process::wait_for_stop(
                     pid,
                     self.config.dev_stop_check_interval_ms,
                     self.config.dev_stop_max_attempts,
                 )
                 .await;
-                k = !is_process_running(pid);
+                // zombie 进程在父进程回收前 `kill(pid, 0)` 仍会返回存在，
+                // 但 SIGKILL 已成功送达时业务上应视为 killed，对齐 nuwax killProcess。
+                k = k || force_sent || !is_process_running(pid);
+            }
+            if k && let Some(group) = pgid {
+                stopped_groups.insert(group);
             }
             killed.push(KilledPid { pid, killed: k });
         }
@@ -401,12 +418,7 @@ impl DevServerManager {
     }
 
     async fn write_npmrc(&self, project_path: &Path) -> AppResult<()> {
-        let npmrc = project_path.join(".npmrc");
-        // JuiceFS 上 hardlink 会失败, 强制 copy
-        tokio::fs::write(npmrc, "package-import-method=copy\n")
-            .await
-            .map_err(|e| AppError::system(format!("write .npmrc: {e}")))?;
-        Ok(())
+        crate::service::pnpm_config::create_pnpm_npmrc(project_path).await
     }
 
     /// 全量优雅停止 (供 main.rs graceful shutdown 调用):

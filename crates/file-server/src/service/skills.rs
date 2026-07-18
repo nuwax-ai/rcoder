@@ -26,7 +26,7 @@ pub async fn push_skills(
         return Err(AppError::validation("Project ID cannot be empty"));
     }
     let project_path = resolver.resolve_project(ctx);
-    if !fs::try_exists(&project_path).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
     let updated = push_skills_at(&project_path, zip_data, skill_urls).await?;
@@ -143,14 +143,14 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
         // skills (先 rm 再 copy, 全量覆盖)
         let _ = fs::remove_dir_all(&t_skills).await;
         fs::create_dir_all(&t_skills).await?;
-        if fs::try_exists(&primary_skills).await.unwrap_or(false) {
+        if crate::service::fs_util::path_exists(&primary_skills).await? {
             crate::service::fs_util::copy_dir_filtered(&primary_skills, &t_skills, &[], &[])
                 .await?;
         }
         // agents
         let _ = fs::remove_dir_all(&t_agents).await;
         fs::create_dir_all(&t_agents).await?;
-        if fs::try_exists(&primary_agents).await.unwrap_or(false) {
+        if crate::service::fs_util::path_exists(&primary_agents).await? {
             crate::service::fs_util::copy_dir_filtered(&primary_agents, &t_agents, &[], &[])
                 .await?;
         }
