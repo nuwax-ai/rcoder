@@ -12,7 +12,45 @@ use std::sync::Arc;
 
 use container_runtime_api::ContainerRuntime;
 use shared_types::ServiceType;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// resolve per-agent dst 聚合路径, 等 PVC Bound (重试)。
+///
+/// UserApp `create_deployment` 不等 Pod Ready, PVC 刚 ensure 可能未 Bound
+/// (WaitForFirstConsumer 需 Pod 调度)。重试几秒等 ceph-csi provision 完成。
+/// Web/Computer `create_container` 等 Pod Ready, 首次即 Bound, 不实际重试。
+async fn resolve_dst_with_retry(
+    runtime: &Arc<dyn ContainerRuntime>,
+    identifier: &str,
+    service_type: &ServiceType,
+) -> Option<String> {
+    const MAX_RETRIES: u32 = 6;
+    for attempt in 0..MAX_RETRIES {
+        match runtime.resolve_workspace_path(identifier, service_type).await {
+            Ok(Some(base)) => return Some(base),
+            Ok(None) => return None, // Docker 模式 (runtime 不提供聚合视角)
+            Err(e) => {
+                if attempt + 1 < MAX_RETRIES {
+                    debug!(
+                        "[MIGRATE] dst resolve {} pending (PVC 可能未 Bound), 重试 {}/{}: {}",
+                        identifier,
+                        attempt + 1,
+                        MAX_RETRIES,
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                } else {
+                    warn!(
+                        "[MIGRATE] dst resolve {} 重试 {} 次后仍失败 (PVC 未 Bound?), 跳过迁移: {}",
+                        identifier, MAX_RETRIES, e
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
 
 /// 经挂根把共享 PVC 子目录数据 mv 到 per-agent subvolume (首次懒迁移, 瞬间无重复)。
 ///
@@ -40,10 +78,12 @@ pub async fn lazy_migrate(
     else {
         return;
     };
-    // per-agent dst base: {cephfs_root}/{per-agent-subvol}
-    let dst_base = match runtime.resolve_workspace_path(identifier, service_type).await {
-        Ok(Some(base)) => PathBuf::from(base),
-        _ => return, // runtime 不提供聚合视角 (Docker), 跳过
+    // per-agent dst base: {cephfs_root}/{per-agent-subvol}; 等 PVC Bound
+    // (UserApp create_deployment 不等 Pod Ready, PVC 可能刚 ensure 未 Bound → 重试;
+    //  Web/Computer create_container 等 Pod Ready, 首次即 Bound, 不实际重试)
+    let dst_base = match resolve_dst_with_retry(runtime, identifier, service_type).await {
+        Some(base) => PathBuf::from(base),
+        None => return, // Docker 模式或 PVC 长时间未 Bound, 跳过
     };
     let dst = if dst_at_root {
         dst_base // computer: PVC 根 (per-user 吸收 user_id)
