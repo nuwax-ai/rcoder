@@ -65,12 +65,12 @@ pub fn is_kubernetes_runtime() -> bool {
 
 /// per-agent PVC 模式开关 (阶段2 per-agent subvolume PVC)。
 ///
-/// env `RCODER_PER_AGENT_PVC_ENABLED`（默认 true）。
-/// 设 false → 回滚到共享 PVC 行为（file-server fallback Local + create_container 共享 PVC）。
+/// env `RCODER_PER_AGENT_PVC_ENABLED`（默认 false → 继续用共享 PVC 子目录）。
+/// 设 true → 启用 per-agent PVC + lazy mv + 配额（代码保留, 暂不上线）。
 pub fn per_agent_pvc_enabled() -> bool {
-    !matches!(
+    matches!(
         std::env::var("RCODER_PER_AGENT_PVC_ENABLED").ok().as_deref(),
-        Some("false") | Some("0")
+        Some("true") | Some("1")
     )
 }
 
