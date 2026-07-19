@@ -130,6 +130,3 @@ moka = { workspace = true }
 # Kubernetes (optional)
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
-
-[build-dependencies]
-time = { workspace = true }

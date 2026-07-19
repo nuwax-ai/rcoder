@@ -117,7 +117,6 @@ uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
-time = { version = "0.3", features = ["formatting"] }
 
 # File system watching
 notify = "8.2"

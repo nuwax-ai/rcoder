@@ -1,6 +1,8 @@
 //! build.rs — 编译时注入版本信息 (git commit hash + branch + build time)
-#![allow(deprecated)]
+//!
+//! 不依赖外部 crate, 纯标准库实现。
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     let git_hash = Command::new("git")
@@ -27,10 +29,10 @@ fn main() {
         .map(|s| if s.trim().is_empty() { "" } else { "+dirty" }.to_string())
         .unwrap_or_default();
 
-    let fmt = time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second] UTC")
-        .unwrap_or_else(|_| time::format_description::parse("[unix_timestamp]").unwrap());
-    let build_time = time::OffsetDateTime::now_utc()
-        .format(&fmt)
+    // build time: Unix timestamp (纯标准库, 不依赖 time/chrono crate)
+    let build_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
     println!("cargo:rustc-env=RCODER_BUILD_GIT_HASH={git_hash}{git_dirty}");

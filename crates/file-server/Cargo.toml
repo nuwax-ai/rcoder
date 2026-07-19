@@ -99,6 +99,3 @@ shlex = { workspace = true }
 
 # 安全临时文件/目录（Hook 配置原子替换与 staging 生命周期由 RAII 管理）
 tempfile = { workspace = true }
-
-[build-dependencies]
-time = { workspace = true }
