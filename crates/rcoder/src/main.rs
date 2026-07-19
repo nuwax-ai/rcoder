@@ -27,7 +27,20 @@ use docker_manager::runtime_selection::RuntimeType;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 版本标识 (先 eprintln 保证 console 一定输出; bootstrap 后再 info! 写文件日志)
+    let version_line = format!(
+        "🚀 rcoder v{} — BUILD: {} @ {} (branch: {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("RCODER_BUILD_GIT_HASH"),
+        env!("RCODER_BUILD_TIME"),
+        env!("RCODER_BUILD_GIT_BRANCH")
+    );
+    eprintln!("{version_line}");
+
     let bootstrap_result = bootstrap::bootstrap().await?;
+
+    // bootstrap 完成 (tracing 已初始化) → 再写一次到文件日志
+    info!("{version_line}");
 
     let runtime_type = RuntimeType::from_env();
     let is_kubernetes = shared_types::is_kubernetes_runtime();

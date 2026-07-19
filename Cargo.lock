@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "agent_abstraction"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agent-client-protocol",
  "agent_config",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "agent_config"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "agent_provisioning"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "dashmap",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "agent_runner"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agent-client-protocol",
  "agent_abstraction",
@@ -1172,7 +1172,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "container-runtime-api"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "docker_manager"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1749,7 +1749,7 @@ dependencies = [
 
 [[package]]
 name = "download_utils"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "flate2",
  "futures-util",
@@ -1953,7 +1953,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "file-server"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1979,6 +1979,7 @@ dependencies = [
  "shlex",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "toml 1.1.3+spec-1.1.0",
  "tower",
@@ -6168,7 +6169,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agent_provisioning",
  "anyhow",
@@ -6218,6 +6219,7 @@ dependencies = [
  "shared_types",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-fs",
  "tokio-stream",
@@ -6262,7 +6264,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-gateway"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6284,7 +6286,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-proxy"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6312,7 +6314,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-telemetry"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -7155,7 +7157,7 @@ dependencies = [
 
 [[package]]
 name = "shared_types"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -7200,7 +7202,7 @@ dependencies = [
 
 [[package]]
 name = "shared_types_grpc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "prost",
  "prost-types",
@@ -7213,7 +7215,7 @@ dependencies = [
 
 [[package]]
 name = "shared_types_i18n"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rust-i18n",
 ]

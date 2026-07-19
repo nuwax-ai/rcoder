@@ -8,6 +8,14 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load().context("load file-server configuration")?;
     // 必须持有到 main 结束，确保 non-blocking 文件日志完整刷盘。
     let _log_guard = file_server::logging::init(&config)?;
+    // 版本标识 (编译时注入, 日志确认镜像代码版本)
+    tracing::info!("═══════════════════════════════════════════");
+    tracing::info!("🚀 file-server v{} starting — BUILD: {} @ {} (branch: {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("RCODER_BUILD_GIT_HASH"),
+        env!("RCODER_BUILD_TIME"),
+        env!("RCODER_BUILD_GIT_BRANCH"));
+    tracing::info!("═══════════════════════════════════════════");
     let address = format!("{}:{}", config.listen_host, config.port);
     let server = FileServer::builder(config).build()?;
     let listener = tokio::net::TcpListener::bind(&address)
