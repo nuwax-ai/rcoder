@@ -80,18 +80,20 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
         const MAX_RETRIES: u32 = 30;
         let mut base: Option<PathBuf> = None;
         for attempt in 0..MAX_RETRIES {
-            match self.resolve(identifier, service_type).await {
-                Ok(Some(b)) => {
+            // 直接调 runtime.resolve_workspace_path (不经 self.resolve 吞 Err)
+            // self.resolve 把 Err → Ok(None) → 重试循环误判 Docker 模式直接 break
+            match self.runtime.resolve_workspace_path(identifier, service_type).await {
+                Ok(Some(path)) => {
                     if attempt > 0 {
                         info!(
                             "[ensure_and_resolve] {} PVC Bound after {} retries",
                             identifier, attempt
                         );
                     }
-                    base = Some(b);
+                    base = Some(PathBuf::from(path));
                     break;
                 }
-                Ok(None) => break, // Docker 模式 (runtime 无聚合视角) → fallback
+                Ok(None) => break, // 真 Docker 模式 (runtime 无聚合视角)
                 Err(e) => {
                     if attempt + 1 < MAX_RETRIES {
                         tracing::debug!(

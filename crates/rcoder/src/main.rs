@@ -1,4 +1,5 @@
 mod background_tasks;
+mod batch_migrate;
 mod bootstrap;
 mod cleanup_task;
 mod config;
@@ -115,6 +116,9 @@ async fn main() -> anyhow::Result<()> {
     let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get container runtime: {}", e))?;
+
+    // 阶段2 批量迁移: 启动后台 task 将共享 PVC 老数据一次性迁到 per-agent PVC (env 开关, 默认 false)
+    batch_migrate::spawn_if_enabled(runtime.clone());
 
     // 阶段2 方案C: rcoder 同进程嵌入 file-server (env 开关 RCODER_EMBED_FILE_SERVER, 灰度)。
     // 启用时 rcoder 进程内 spawn file-server (端口 60000), 经 SubvolumeWorkspaceResolver

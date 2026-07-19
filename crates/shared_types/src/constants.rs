@@ -63,6 +63,17 @@ pub fn is_kubernetes_runtime() -> bool {
     cfg!(feature = "kubernetes")
 }
 
+/// per-agent PVC 模式开关 (阶段2 per-agent subvolume PVC)。
+///
+/// env `RCODER_PER_AGENT_PVC_ENABLED`（默认 true）。
+/// 设 false → 回滚到共享 PVC 行为（file-server fallback Local + create_container 共享 PVC）。
+pub fn per_agent_pvc_enabled() -> bool {
+    !matches!(
+        std::env::var("RCODER_PER_AGENT_PVC_ENABLED").ok().as_deref(),
+        Some("false") | Some("0")
+    )
+}
+
 /// 构建 K8s Service FQDN
 ///
 /// # 参数

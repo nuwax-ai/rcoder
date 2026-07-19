@@ -76,6 +76,10 @@ pub async fn lazy_migrate(
     leaf: &str,
     dst_at_root: bool,
 ) {
+    // 回滚开关 false → 跳过迁移 (共享 PVC 模式)
+    if !shared_types::per_agent_pvc_enabled() {
+        return;
+    }
     // 共享 PVC 名 (env); 未设 → Docker 模式或未启用挂根聚合, 跳过
     let Some(shared_pvc) = std::env::var(shared_pvc_env)
         .ok()
@@ -106,43 +110,54 @@ pub async fn lazy_migrate(
     };
 
     if dst_at_root {
-        // Computer: 逐子项 rename (src/{user_id}/* → dst/{subvol}/* = per-user PVC 根)
+        // Computer: 逐子项迁移 (src/{user_id}/* → dst/{subvol}/* = per-user PVC 根)
         migrate_children(&src, &dst_base, identifier).await;
         return;
     }
 
-    // Web/UserApp: 单 leaf rename (src → dst={subvol}/{leaf})
+    // Web/UserApp: 单 leaf 迁移 (src → dst={subvol}/{leaf})
     let dst = dst_base.join(leaf);
-    // 幂等: dst({leaf})非空 → 已迁移, 跳过
-    if let Ok(mut rd) = tokio::fs::read_dir(&dst).await
-        && rd.next_entry().await.ok().flatten().is_some()
-    {
+    // 幂等: dst/.migrated 存在 → 已迁移, 跳过 (防 copy 中途失败后半 copy 误判)
+    let marker = dst.join(".migrated");
+    if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
         return;
     }
-    // mv (经挂根同 mount rename, 瞬间 MDS 元数据, 无重复; 共享子目录自动空)
+    // 迁移: 先试 rename (同 subvolume 快), EXDEV → fallback copy+remove (跨 subvolume)
     match tokio::fs::rename(&src, &dst).await {
-        Ok(()) => info!(
-            "[MIGRATE] lazy mv {} -> {} ({} {})",
-            src.display(),
-            dst.display(),
-            service_type,
-            identifier
-        ),
+        Ok(()) => {
+            let _ = tokio::fs::write(&marker, b"1").await;
+            info!("[MIGRATE] rename {} -> {} ({} {})", src.display(), dst.display(), service_type, identifier);
+        }
+        Err(e) if e.raw_os_error() == Some(18) => {
+            // EXDEV: 跨 CephFS subvolume → copy + remove (shell mv 行为)
+            match copy_dir_recursive(&src, &dst).await {
+                Ok(()) => {
+                    let _ = tokio::fs::write(&marker, b"1").await;
+                    let _ = tokio::fs::remove_dir_all(&src).await;
+                    info!("[MIGRATE] copy+remove {} -> {} ({} {})", src.display(), dst.display(), service_type, identifier);
+                }
+                Err(e) => warn!(
+                    "[MIGRATE] copy failed {} -> {}: {} (agent 将启动; 数据仍在共享, 下次 ensure 重试)",
+                    src.display(), dst.display(), e
+                ),
+            }
+        }
         Err(e) => warn!(
-            "[MIGRATE] lazy mv failed {} -> {}: {} (agent 将启动; 数据仍在共享, 下次 ensure 重试)",
-            src.display(),
-            dst.display(),
-            e
+            "[MIGRATE] rename failed {} -> {}: {} (agent 将启动; 数据仍在共享, 下次 ensure 重试)",
+            src.display(), dst.display(), e
         ),
     }
 }
 
-/// Computer 逐子项迁移: 遍历 src (`{shared}/{user_id}`) 子项, 逐个 rename 到 dst (per-user PVC 根),
-/// **skip 已存在** (agent 启动装的 `acp-agent` 等 / 已迁子项)。
-///
-/// 避免 rename 整个 `{user_id}` 目录到非空 PVC 根 (ENOTEMPTY)。项目 `{cid}` 不存在 → 成功;
-/// agent 装的 `acp-agent` 已存在 → skip (per-user PVC 用 agent 新装的)。幂等: 已迁/已存在 skip。
+/// Computer 逐子项迁移: 遍历 src (`{shared}/{user_id}`) 子项, 逐个迁移到 dst (per-user PVC 根)。
+/// rename EXDEV 时 fallback copy+remove (跨 CephFS subvolume)。
+/// skip 已存在 (agent 启动装的 `acp-agent` 等)。幂等: dst/.migrated 存在 → 全量 skip。
 async fn migrate_children(src: &std::path::Path, dst: &std::path::Path, identifier: &str) {
+    // 幂等: dst/.migrated → 已迁移
+    let marker = dst.join(".migrated");
+    if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+        return;
+    }
     let mut rd = match tokio::fs::read_dir(src).await {
         Ok(rd) => rd,
         Err(_) => return, // src 不存在 → 新 user (无旧数据), 跳过
@@ -150,30 +165,70 @@ async fn migrate_children(src: &std::path::Path, dst: &std::path::Path, identifi
     let mut migrated = 0u32;
     let mut skipped = 0u32;
     while let Ok(Some(entry)) = rd.next_entry().await {
+        let src_item = entry.path();
         let dst_item = dst.join(entry.file_name());
         if tokio::fs::try_exists(&dst_item).await.unwrap_or(false) {
-            skipped += 1; // 已存在 (agent 新装 acp-agent / 已迁), skip
+            skipped += 1;
             continue;
         }
-        match tokio::fs::rename(entry.path(), &dst_item).await {
+        // rename, EXDEV → copy + remove
+        match tokio::fs::rename(&src_item, &dst_item).await {
             Ok(()) => migrated += 1,
+            Err(e) if e.raw_os_error() == Some(18) => {
+                match copy_dir_recursive(&src_item, &dst_item).await {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_dir_all(&src_item).await;
+                        migrated += 1;
+                    }
+                    Err(e) => warn!(
+                        "[MIGRATE] copy {} -> {} failed: {} (skip, 继续其他子项)",
+                        src_item.display(), dst_item.display(), e
+                    ),
+                }
+            }
             Err(e) => warn!(
-                "[MIGRATE] 逐子项 rename {} -> {} failed: {} (skip, 继续其他子项)",
-                entry.path().display(),
-                dst_item.display(),
-                e
+                "[MIGRATE] rename {} -> {} failed: {} (skip, 继续其他子项)",
+                src_item.display(), dst_item.display(), e
             ),
         }
     }
     if migrated > 0 || skipped > 0 {
+        let _ = tokio::fs::write(&marker, b"1").await;
         info!(
-            "[MIGRATE] {} 逐子项迁移 (迁 {}, skip 已存在 {}): {} -> {}",
-            identifier,
-            migrated,
-            skipped,
-            src.display(),
-            dst.display()
+            "[MIGRATE] {} 逐子项迁移 (迁 {}, skip {}): {} -> {}",
+            identifier, migrated, skipped, src.display(), dst.display()
         );
     }
+}
+
+/// 递归 copy 目录树 (纯 tokio::fs, 无外部依赖)。
+/// 用于 rename EXDEV 时 fallback (跨 CephFS subvolume) + 批量迁移。
+async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(dst).await?;
+    let mut rd = tokio::fs::read_dir(src).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let src_item = entry.path();
+        let dst_item = dst.join(entry.file_name());
+        let ft = entry.file_type().await?;
+        if ft.is_dir() {
+            Box::pin(copy_dir_recursive(&src_item, &dst_item)).await?;
+        } else if ft.is_file() {
+            tokio::fs::copy(&src_item, &dst_item).await?;
+        } else if ft.is_symlink() {
+            let target = tokio::fs::read_link(&src_item).await?;
+            #[cfg(unix)]
+            tokio::fs::symlink(&target, &dst_item).await?;
+        }
+    }
+    Ok(())
+}
+
+/// pub wrapper for batch_migrate (bin 模块调用, lib 编译看不到 → allow dead_code)
+#[allow(dead_code)]
+pub(crate) async fn copy_dir_recursive_pub(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<()> {
+    copy_dir_recursive(src, dst).await
 }
 

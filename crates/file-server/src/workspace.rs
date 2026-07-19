@@ -194,6 +194,10 @@ impl SubvolumeWorkspaceResolver {
 impl WorkspaceResolver for SubvolumeWorkspaceResolver {
     async fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf> {
         let project_id = validated_identifier(&ctx.project_id, "projectId")?;
+        // 回滚开关 false → 直接 fallback Local (共享 PVC, 生产行为)
+        if !shared_types::per_agent_pvc_enabled() {
+            return self.fallback.resolve_project(ctx).await;
+        }
         // 主动 ensure per-agent PVC + 迁移 (不被动 fallback; 失败才降级 Local)
         match self
             .path_resolver
@@ -215,6 +219,10 @@ impl WorkspaceResolver for SubvolumeWorkspaceResolver {
     async fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf> {
         let user_id = validated_identifier(&ctx.user_id, "userId")?;
         let cid = validated_identifier(&ctx.cid, "cId")?;
+        // 回滚开关 false → 直接 fallback Local
+        if !shared_types::per_agent_pvc_enabled() {
+            return self.fallback.resolve_computer(ctx).await;
+        }
         match self
             .path_resolver
             .ensure_and_resolve(user_id, &ServiceType::ComputerAgentRunner)

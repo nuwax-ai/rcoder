@@ -612,10 +612,9 @@ impl ContainerRuntime for KubernetesRuntime {
         let pod_name = self.pod_name(identifier, &service_type)?;
 
         // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
-        // 仅隔离容器 (pod_id=None, project/user 级) 走 per-agent PVC。共享容器 (pod_id=Some,
-        // 多 project 复用一个 pod 省资源) 保持共享 PVC (非 per-agent 隔离目标, 选项A):
-        // Pod 挂共享 PVC + subPath, file-server Local 读共享 /{tenant}/{space}/{project}, lazy mv skip。
-        if pod_id.is_none() {
+        // 仅隔离容器 (pod_id=None, project/user 级) 且 per_agent_pvc_enabled=true 走 per-agent PVC。
+        // 共享容器 (pod_id=Some) 或回滚开关 false → 共享 PVC (选项A 行为)。
+        if pod_id.is_none() && shared_types::per_agent_pvc_enabled() {
             self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
                 .await?;
         }
@@ -649,26 +648,30 @@ impl ContainerRuntime for KubernetesRuntime {
             .and_then(Self::build_resource_requirements);
 
         // workspace PVC:
-        // - 隔离容器 (pod_id=None): per-agent PVC (阶段2, subPath=None, subvolume 天然边界)
-        // - 共享容器 (pod_id=Some): 保持共享 PVC + subPath (选项A — 共享容器非 per-agent 隔离目标;
-        //   Pod 挂共享 subPath, file-server Local 读共享 /{tenant}/{space}/{project}, lazy mv skip)
-        let (workspace_pvc, workspace_sub_path): (String, Option<String>) = match (&pod_id, &service_type) {
-            (Some(_), ServiceType::WebAgentRunner) => (
-                std::env::var("RCODER_WORKSPACE_PVC_NAME")
-                    .unwrap_or_else(|_| format!("{}-rcoder-workspace", self.namespace)),
-                Some(
-                    std::env::var("RCODER_WORKSPACE_SUBPATH")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "workspace".to_string()),
+        // - per-agent (pod_id=None + per_agent_pvc_enabled=true): per-agent PVC (subPath=None)
+        // - 共享 (pod_id=Some 或 per_agent_pvc_enabled=false): 共享 PVC + subPath (选项A / 回滚)
+        let per_agent = pod_id.is_none() && shared_types::per_agent_pvc_enabled();
+        let (workspace_pvc, workspace_sub_path): (String, Option<String>) = if per_agent {
+            (self.workspace_pvc_name(identifier, &service_type)?, None)
+        } else {
+            match &service_type {
+                ServiceType::WebAgentRunner => (
+                    std::env::var("RCODER_WORKSPACE_PVC_NAME")
+                        .unwrap_or_else(|_| format!("{}-rcoder-workspace", self.namespace)),
+                    Some(
+                        std::env::var("RCODER_WORKSPACE_SUBPATH")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "workspace".to_string()),
+                    ),
                 ),
-            ),
-            (Some(_), ServiceType::ComputerAgentRunner) => (
-                std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME")
-                    .unwrap_or_else(|_| format!("{}-rcoder-computer-workspace", self.namespace)),
-                Some(user_id_val.clone()),
-            ),
-            _ => (self.workspace_pvc_name(identifier, &service_type)?, None),
+                ServiceType::ComputerAgentRunner => (
+                    std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME")
+                        .unwrap_or_else(|_| format!("{}-rcoder-computer-workspace", self.namespace)),
+                    Some(user_id_val.clone()),
+                ),
+                _ => (self.workspace_pvc_name(identifier, &service_type)?, None),
+            }
         };
 
         // (阶段2: xattr 目录配额已退役 —— 改用 per-agent subvolume PVC + CSI 服务端配额。
