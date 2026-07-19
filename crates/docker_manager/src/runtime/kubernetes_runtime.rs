@@ -1577,9 +1577,11 @@ impl ContainerRuntime for KubernetesRuntime {
         &self,
         identifier: &str,
         service_type: &ServiceType,
+        storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         // 复用 K8sPvcOps::ensure_workspace_pvc (幂等: active→复用 / not_found→创建)
-        self.ensure_workspace_pvc(identifier, service_type, None).await
+        self.ensure_workspace_pvc(identifier, service_type, storage_size)
+            .await
     }
 
     // ===== Deployment 生命周期（UserApp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====

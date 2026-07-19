@@ -571,6 +571,7 @@ pub trait ContainerRuntime: Send + Sync {
         &self,
         _identifier: &str,
         _service_type: &ServiceType,
+        _storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         Ok(()) // default no-op (Docker / 未实现)
     }

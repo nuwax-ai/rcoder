@@ -130,7 +130,7 @@ async fn migrate_shared_pvc(
         let identifier = &name;
 
         // ensure per-agent PVC (SC Immediate 立即 Bound)
-        if let Err(e) = runtime.ensure_workspace(identifier, &service_type).await {
+        if let Err(e) = runtime.ensure_workspace(identifier, &service_type, None).await {
             warn!("[BATCH_MIGRATE] ensure_workspace {} failed: {}, skip", identifier, e);
             *failed += 1;
             continue;

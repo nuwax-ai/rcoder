@@ -71,7 +71,7 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
         }
         // 2. PVC 不存在 → ensure + resolve (重试等 Bound) + 迁移
         self.runtime
-            .ensure_workspace(identifier, service_type)
+            .ensure_workspace(identifier, service_type, None)
             .await
             .map_err(|e| AppError::system(format!("ensure_workspace: {e}")))?;
         // ensure 后 PVC 刚创建, ceph-csi provision 异步 (volumeName/subvolumePath 填充延迟)
