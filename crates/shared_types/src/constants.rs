@@ -60,10 +60,8 @@ pub fn per_agent_pvc_enabled() -> bool {
     FeatureFlags::get().per_agent_pvc
 }
 
-/// UserApp per-app PVC 开关 (便捷访问)。
-pub fn userapp_per_app_pvc_enabled() -> bool {
-    FeatureFlags::get().userapp_per_app_pvc
-}
+// UserApp K8s 永远 per-app (代码不读开关, 无分裂);
+// FeatureFlags.userapp_per_app_pvc 字段保留供启动日志 + chart cephfs-root 派生标记。
 
 // === 端口配置 ===
 

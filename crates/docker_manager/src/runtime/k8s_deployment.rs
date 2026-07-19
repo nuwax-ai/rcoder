@@ -335,23 +335,13 @@ impl KubernetesRuntime {
             ..Default::default()
         }]);
 
-        // app workspace 卷:
-        // - per-app (userapp_per_app_pvc=true): per-app CephFS subvolume PVC (subPath=None,
-        //   subvolume 天然边界), 由 create_app_resources ensure。rcoder 经挂根聚合访问。
-        // - 共享 (userapp_per_app_pvc=false): rcoder-workspace 共享 PVC + subPath workspace/apps/{app_id}
-        //   (与 rcoder Pod 共享同一 PVC 物理路径, rcoder 侧 /app/project_workspace/apps/{app_id})。
-        let (app_claim_name, app_sub_path): (String, Option<String>) =
-            if shared_types::userapp_per_app_pvc_enabled() {
-                (self.app_workspace_pvc_name(app_id)?, None)
-            } else {
-                let shared_pvc = std::env::var("RCODER_WORKSPACE_PVC_NAME")
-                    .unwrap_or_else(|_| format!("{}-rcoder-workspace", self.namespace));
-                (shared_pvc, Some(format!("workspace/apps/{app_id}")))
-            };
+        // UserApp (K8s 永远 per-app): per-app CephFS subvolume PVC (subPath=None, subvolume 天然边界),
+        // 由 create_app_resources ensure。rcoder 经挂根聚合 ({cephfs_root}/{subvolumePath}) 访问。
+        // UserApp 代码路径独立于主线 (Web/Computer 走 create_container 共享 PVC)。
         let volumes = Some(vec![Volume {
             name: "app-workspace".to_string(),
             persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                claim_name: app_claim_name,
+                claim_name: self.app_workspace_pvc_name(app_id)?,
                 read_only: Some(false),
             }),
             ..Default::default()
@@ -359,7 +349,7 @@ impl KubernetesRuntime {
         let volume_mounts = Some(vec![VolumeMount {
             name: "app-workspace".to_string(),
             mount_path: "/app".to_string(),
-            sub_path: app_sub_path,
+            sub_path: None,
             read_only: Some(false),
             ..Default::default()
         }]);
@@ -668,13 +658,12 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
         let tenant_id = params.tenant_id.as_deref();
         let space_id = params.space_id.as_deref();
-        // 0. workspace PVC: 仅 UserApp per-app 模式 (FeatureFlags.userapp_per_app_pvc) 才 ensure
-        //    per-app CephFS subvolume (配额由 requests.storage 经 CSI 服务端设, 绕开 client setfattr;
-        //    PVC 永不删除, 重建时 ensure "active" 分支复用)。共享模式复用 rcoder-workspace, 无需独立 PVC。
-        if shared_types::userapp_per_app_pvc_enabled() {
-            self.ensure_workspace_pvc(app_id, &ServiceType::UserApp, params.storage_size.as_deref())
-                .await?;
-        }
+        // 0. workspace PVC: UserApp (K8s 永远 per-app) ensure per-app CephFS subvolume
+        //    (配额由 requests.storage 经 CSI 服务端设, 绕开 client setfattr; PVC 永不删除,
+        //    重建时 ensure "active" 分支复用)。create_app 流程已在 app_manager ensure_app_workspace_ready
+        //    预 ensure + 等 subvolumePath 就绪, 这里命中 "active" 复用分支。
+        self.ensure_workspace_pvc(app_id, &ServiceType::UserApp, params.storage_size.as_deref())
+            .await?;
         // 1. ConfigMap（env）
         if let Some(env) = &params.env
             && !env.is_empty()
