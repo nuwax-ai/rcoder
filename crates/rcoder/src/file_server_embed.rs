@@ -69,14 +69,47 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
             run_lazy_migrate(&self.runtime, identifier, service_type).await;
             return Ok(Some(base));
         }
-        // 2. PVC 不存在 → ensure + resolve + 迁移
+        // 2. PVC 不存在 → ensure + resolve (重试等 Bound) + 迁移
         self.runtime
             .ensure_workspace(identifier, service_type)
             .await
             .map_err(|e| AppError::system(format!("ensure_workspace: {e}")))?;
-        let base = match self.resolve(identifier, service_type).await? {
-            Some(b) => b,
-            None => return Ok(None), // ensure 后仍 None (异常), 让上层 fallback
+        // ensure 后 PVC 刚创建, ceph-csi provision 异步 (volumeName/subvolumePath 填充延迟)
+        // 必须重试 resolve 等 Bound, 否则首次 None → fallback Local, 后续 Some → per-agent
+        // → create-project 写 Local, git 读 per-agent, 路径不一致
+        const MAX_RETRIES: u32 = 30;
+        let mut base: Option<PathBuf> = None;
+        for attempt in 0..MAX_RETRIES {
+            match self.resolve(identifier, service_type).await {
+                Ok(Some(b)) => {
+                    if attempt > 0 {
+                        info!(
+                            "[ensure_and_resolve] {} PVC Bound after {} retries",
+                            identifier, attempt
+                        );
+                    }
+                    base = Some(b);
+                    break;
+                }
+                Ok(None) => break, // Docker 模式 (runtime 无聚合视角) → fallback
+                Err(e) => {
+                    if attempt + 1 < MAX_RETRIES {
+                        tracing::debug!(
+                            "[ensure_and_resolve] {} PVC pending (attempt {}/{}): {}",
+                            identifier, attempt + 1, MAX_RETRIES, e
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    } else {
+                        warn!(
+                            "[ensure_and_resolve] {} PVC resolve timeout after {} retries: {}, fallback Local",
+                            identifier, MAX_RETRIES, e
+                        );
+                    }
+                }
+            }
+        }
+        let Some(base) = base else {
+            return Ok(None);
         };
         run_lazy_migrate(&self.runtime, identifier, service_type).await;
         Ok(Some(base))
