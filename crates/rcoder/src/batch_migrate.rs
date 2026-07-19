@@ -18,15 +18,13 @@ use tracing::{info, warn};
 
 /// 启动批量迁移后台 task (不阻塞 rcoder 主流程)。
 ///
-/// 仅当 env `RCODER_BATCH_MIGRATE_ON_STARTUP=true` 时执行。
+/// 仅当 `FeatureFlags.batch_migrate_on_startup=true` 且 `per_agent_pvc=true` 时执行。
 pub fn spawn_if_enabled(runtime: Arc<dyn ContainerRuntime>) {
-    if !matches!(
-        std::env::var("RCODER_BATCH_MIGRATE_ON_STARTUP").ok().as_deref(),
-        Some("true") | Some("1")
-    ) {
+    let flags = shared_types::FeatureFlags::get();
+    if !flags.batch_migrate_on_startup {
         return;
     }
-    if !shared_types::per_agent_pvc_enabled() {
+    if !flags.per_agent_pvc {
         info!("[BATCH_MIGRATE] per_agent_pvc disabled, skip batch migration");
         return;
     }

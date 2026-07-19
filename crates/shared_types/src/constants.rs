@@ -2,6 +2,69 @@
 //!
 //! 集中管理所有服务端口、超时等配置常量
 
+use std::sync::OnceLock;
+
+// === Feature 开关 (启动读一次, 进程级不可变) ===
+
+/// 所有 feature 开关集合 (启动时从 env 读一次, 进程级不可变)。
+///
+/// 收紧在入口读 env ([`FeatureFlags::init`]), 避免散落多处 `std::env::var`;
+/// 调用点经 [`FeatureFlags::get`] 或便捷函数 (`per_agent_pvc_enabled` 等) 读单例。
+#[derive(Debug, Clone, Copy)]
+pub struct FeatureFlags {
+    /// 主线 Web/Computer per-agent PVC (per-agent subvolume + 配额 + lazy mv + batch migrate)
+    pub per_agent_pvc: bool,
+    /// UserApp per-app PVC (新功能, 独立于主线; 依赖 cephfs-root 派生挂载 + SC Immediate)
+    pub userapp_per_app_pvc: bool,
+    /// rcoder 嵌入 Rust file-server (替代 nuwax-file-server 独立进程)
+    pub embed_file_server: bool,
+    /// 启动后台批量迁移 (共享 PVC 老数据 → per-agent, 一次性)
+    pub batch_migrate_on_startup: bool,
+}
+
+impl FeatureFlags {
+    fn from_env() -> Self {
+        Self {
+            per_agent_pvc: env_flag("RCODER_PER_AGENT_PVC_ENABLED"),
+            userapp_per_app_pvc: env_flag("RCODER_USERAPP_PER_APP_PVC_ENABLED"),
+            embed_file_server: env_flag("RCODER_EMBED_FILE_SERVER"),
+            batch_migrate_on_startup: env_flag("RCODER_BATCH_MIGRATE_ON_STARTUP"),
+        }
+    }
+
+    /// 启动时调一次: 读 env 初始化 + eprintln 打印状态 (console, tracing 未就绪也可见)。
+    /// 重复调用安全 (幂等, 日志会重复打印 — main 只调一次)。
+    pub fn init() {
+        let f = FEATURE_FLAGS.get_or_init(Self::from_env);
+        eprintln!(
+            "🔧 [FEATURE_FLAGS] per_agent_pvc={} userapp_per_app_pvc={} embed_file_server={} batch_migrate_on_startup={}",
+            f.per_agent_pvc, f.userapp_per_app_pvc, f.embed_file_server, f.batch_migrate_on_startup
+        );
+    }
+
+    /// 取单例; 未 [`init`] 时 lazy 读 env (测试 / 忘记 init 兜底, 保证永远可用)。
+    pub fn get() -> &'static FeatureFlags {
+        FEATURE_FLAGS.get_or_init(Self::from_env)
+    }
+}
+
+static FEATURE_FLAGS: OnceLock<FeatureFlags> = OnceLock::new();
+
+/// 读 bool env (`true`/`1` → true, 其余含未设 → false)。
+fn env_flag(key: &str) -> bool {
+    matches!(std::env::var(key).ok().as_deref(), Some("true") | Some("1"))
+}
+
+/// 主线 per-agent PVC 开关 (便捷访问, 内部读 [`FeatureFlags`] 单例)。
+pub fn per_agent_pvc_enabled() -> bool {
+    FeatureFlags::get().per_agent_pvc
+}
+
+/// UserApp per-app PVC 开关 (便捷访问)。
+pub fn userapp_per_app_pvc_enabled() -> bool {
+    FeatureFlags::get().userapp_per_app_pvc
+}
+
 // === 端口配置 ===
 
 /// gRPC 服务默认端口
@@ -61,17 +124,6 @@ pub fn get_k8s_cluster_domain() -> String {
 /// 返回 `true` 表示当前是 K8s 运行时，`false` 表示 Docker 运行时
 pub fn is_kubernetes_runtime() -> bool {
     cfg!(feature = "kubernetes")
-}
-
-/// per-agent PVC 模式开关 (阶段2 per-agent subvolume PVC)。
-///
-/// env `RCODER_PER_AGENT_PVC_ENABLED`（默认 false → 继续用共享 PVC 子目录）。
-/// 设 true → 启用 per-agent PVC + lazy mv + 配额（代码保留, 暂不上线）。
-pub fn per_agent_pvc_enabled() -> bool {
-    matches!(
-        std::env::var("RCODER_PER_AGENT_PVC_ENABLED").ok().as_deref(),
-        Some("true") | Some("1")
-    )
 }
 
 /// 构建 K8s Service FQDN

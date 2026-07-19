@@ -28,6 +28,9 @@ use docker_manager::runtime_selection::RuntimeType;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Feature 开关: 启动读一次 env + eprintln 打印状态 (console, tracing 未就绪也可见)
+    shared_types::FeatureFlags::init();
+
     // 版本标识 (先 eprintln 保证 console 一定输出; bootstrap 后再 info! 写文件日志)
     let version_line = format!(
         "🚀 rcoder v{} — BUILD: {} @ {} (branch: {})",
@@ -42,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
 
     // bootstrap 完成 (tracing 已初始化) → 再写一次到文件日志
     info!("{version_line}");
+    info!(target: "feature_flags", "{:?}", shared_types::FeatureFlags::get());
 
     let runtime_type = RuntimeType::from_env();
     let is_kubernetes = shared_types::is_kubernetes_runtime();
@@ -120,15 +124,11 @@ async fn main() -> anyhow::Result<()> {
     // 阶段2 批量迁移: 启动后台 task 将共享 PVC 老数据一次性迁到 per-agent PVC (env 开关, 默认 false)
     batch_migrate::spawn_if_enabled(runtime.clone());
 
-    // 阶段2 方案C: rcoder 同进程嵌入 file-server (env 开关 RCODER_EMBED_FILE_SERVER, 灰度)。
+    // 阶段2 方案C: rcoder 同进程嵌入 file-server (FeatureFlags.embed_file_server, 灰度)。
     // 启用时 rcoder 进程内 spawn file-server (端口 60000), 经 SubvolumeWorkspaceResolver
     // 复用本进程 ContainerRuntime 解析 per-agent subvolume 聚合路径 (file-server 不加 kube 依赖)。
     // 配套: start-services.sh 须检查本 env, 嵌入时不再单独启 file-server 二进制 (避免端口冲突)。
-    let embed_file_server = matches!(
-        std::env::var("RCODER_EMBED_FILE_SERVER").ok().as_deref(),
-        Some("true") | Some("1")
-    );
-    if embed_file_server {
+    if shared_types::FeatureFlags::get().embed_file_server {
         file_server_embed::spawn_embedded_file_server(Arc::clone(&runtime)).await;
     }
 
