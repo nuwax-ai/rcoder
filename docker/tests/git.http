@@ -1,0 +1,50 @@
+### git init
+POST {{base_url}}/api/git/init
+Content-Type: application/json
+
+{"workspaceType": "pageApp", "projectId": "{{test_project}}"}
+
+### git add (全部)
+POST {{base_url}}/api/git/add
+Content-Type: application/json
+
+{"workspaceType": "pageApp", "projectId": "{{test_project}}"}
+
+### git add (指定文件)
+POST {{base_url}}/api/git/add
+Content-Type: application/json
+
+{"workspaceType": "pageApp", "projectId": "{{test_project}}", "files": ["package.json", "src/main.ts"]}
+
+### git commit
+POST {{base_url}}/api/git/commit
+Content-Type: application/json
+
+{"workspaceType": "pageApp", "projectId": "{{test_project}}", "message": "test commit"}
+
+### git status
+GET {{base_url}}/api/git/status?workspaceType=pageApp&projectId={{test_project}}
+
+### git log
+GET {{base_url}}/api/git/log?workspaceType=pageApp&projectId={{test_project}}
+
+### git branches
+GET {{base_url}}/api/git/branches?workspaceType=pageApp&projectId={{test_project}}
+
+### git diff (worktree)
+POST {{base_url}}/api/git/diff
+Content-Type: application/json
+
+{"workspaceType": "pageApp", "projectId": "{{test_project}}", "source": "worktree"}
+
+### git discard (撤销修改)
+POST {{base_url}}/api/git/discard
+Content-Type: application/json
+
+{"workspaceType": "pageApp", "projectId": "{{test_project}}", "files": []}
+
+### git unstage (全部)
+POST {{base_url}}/api/git/unstage
+Content-Type: application/json
+
+{"workspaceType": "pageApp", "projectId": "{{test_project}}"}

@@ -1,0 +1,31 @@
+### 创建项目 (vue3 模板)
+POST {{base_url}}/api/project/create-project
+Content-Type: application/json
+
+{"projectId": "{{test_project}}", "templateType": "vue3"}
+
+### 创建项目 (react 模板)
+POST {{base_url}}/api/project/create-project
+Content-Type: application/json
+
+{"projectId": "test-react-001", "templateType": "react"}
+
+### 获取项目文件树
+GET {{base_url}}/api/project/get-project-content?projectId={{test_project}}
+
+### 获取项目文件内容 (单个文件)
+GET {{base_url}}/api/project/get-project-content?projectId={{test_project}}&path=package.json
+
+### 删除项目
+GET {{base_url}}/api/project/delete-project?projectId={{test_project}}
+
+### 上传单个文件 (multipart)
+POST {{base_url}}/api/project/upload-attachment-file?projectId={{test_project}}&filePath=uploaded.txt
+Content-Type: multipart/form-data; boundary=----boundary
+
+------boundary
+Content-Disposition: form-data; name="file"; filename="test.txt"
+Content-Type: text/plain
+
+hello world
+------boundary--
