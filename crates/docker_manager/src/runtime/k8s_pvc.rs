@@ -218,7 +218,10 @@ impl K8sPvcOps for KubernetesRuntime {
                 self.subvolume_path_cache.write().await.remove(&pvc_name);
             }
             _ => {
-                // "not_found" — PVC doesn't exist, will create below
+                // "not_found" — PVC 不存在, 将创建。清可能陈旧的 subvolPath cache
+                // (运维 kubectl delete pvc 后重建场景: 新 PVC 新 ceph subvol UUID,
+                // 旧 cache 导致 resolve 返回旧 subvol → 数据面分裂)
+                self.subvolume_path_cache.write().await.remove(&pvc_name);
             }
         }
         // If not found or terminated, create it (falls through to creation logic below)

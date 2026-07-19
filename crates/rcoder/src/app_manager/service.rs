@@ -198,18 +198,10 @@ impl AppService {
             app_id, container_info.container_name
         );
 
-        // 阶段3 lazy mv: 共享 PVC (rcoder-workspace/workspace/apps/{app_id}) → per-app subvolume
-        // (经挂根 rename, 瞬间无重复)
-        crate::workspace_migrate::lazy_migrate(
-            &self.runtime,
-            "RCODER_WORKSPACE_PVC_NAME",
-            &["workspace", "apps"],
-            &app_id,
-            &ServiceType::UserApp,
-            &app_id,
-            true, // dst=per-app PVC 根 (app pod 挂 PVC 根到 /app, rcoder 写 PVC 根)
-        )
-        .await;
+        // 注: UserApp 是新开发逻辑 (application-management-service-v2-design.md), /app 路径
+        // 不涉及历史数据迁移 → 不调 lazy_migrate (新应用无旧数据; 避免 create_app_dirs 先建
+        // src 导致 lazy_migrate 不早退 + resolve_dst_with_retry 阻塞 HTTP 60s)。
+        // Web/Computer 有历史数据 → 保留 lazy_migrate。
 
         // 4. Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/{port} → container_ip）
         let http_ports = http_port_numbers(&request.ports);

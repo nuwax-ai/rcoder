@@ -1521,8 +1521,10 @@ impl ContainerRuntime for KubernetesRuntime {
             "[K8S CLEANUP] PVC cleanup skipped — PVCs are cleaned up via K8s cascading deletion when pods are removed"
         );
 
-        // 清理缓存
+        // 清理缓存 (含 subvolume_path_cache — 跨重启 PVC 可能被运维删除重建,
+        // 陈旧 cache 导致 resolve 命中旧 subvolPath → rcoder 读老 subvol 而 pod 挂新 PVC → 数据面分裂)
         self.pod_cache.write().await.clear();
+        self.subvolume_path_cache.write().await.clear();
 
         info!(
             "[K8S CLEANUP] cleanup_all completed in {:.1}s",
