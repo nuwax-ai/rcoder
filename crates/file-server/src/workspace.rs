@@ -153,6 +153,19 @@ pub trait WorkspacePathResolver: Send + Sync {
         identifier: &str,
         service_type: &ServiceType,
     ) -> AppResult<Option<PathBuf>>;
+
+    /// 主动 ensure per-agent PVC + resolve + 检查迁移老数据。
+    ///
+    /// default: 调 resolve (不 ensure, Docker 模式 / 兼容)。
+    /// rcoder ContainerRuntimePathResolver 重写: ensure PVC + resolve + lazy_migrate。
+    /// 供 SubvolumeWorkspaceResolver 调用 (替代被动 fallback)。
+    async fn ensure_and_resolve(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> AppResult<Option<PathBuf>> {
+        self.resolve(identifier, service_type).await
+    }
 }
 
 /// 阶段 2 实现: 经 rcoder 注入的 [`WorkspacePathResolver`] 拿 per-agent PVC 的 subvolume
@@ -181,16 +194,16 @@ impl SubvolumeWorkspaceResolver {
 impl WorkspaceResolver for SubvolumeWorkspaceResolver {
     async fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf> {
         let project_id = validated_identifier(&ctx.project_id, "projectId")?;
+        // 主动 ensure per-agent PVC + 迁移 (不被动 fallback; 失败才降级 Local)
         match self
             .path_resolver
-            .resolve(project_id, &ServiceType::WebAgentRunner)
+            .ensure_and_resolve(project_id, &ServiceType::WebAgentRunner)
             .await?
         {
-            // {cephfs-root}/{subvolumePath}/{projectId} (tenant/space 被 per-project PVC 吸收)
             Some(subvolume_base) => Ok(subvolume_base.join(project_id)),
             None => {
                 warn!(
-                    "SubvolumeWorkspaceResolver: runtime returned None for project {}, \
+                    "SubvolumeWorkspaceResolver: ensure_and_resolve returned None for project {}, \
                      falling back to LocalWorkspaceResolver",
                     project_id
                 );
@@ -204,7 +217,7 @@ impl WorkspaceResolver for SubvolumeWorkspaceResolver {
         let cid = validated_identifier(&ctx.cid, "cId")?;
         match self
             .path_resolver
-            .resolve(user_id, &ServiceType::ComputerAgentRunner)
+            .ensure_and_resolve(user_id, &ServiceType::ComputerAgentRunner)
             .await?
         {
             // {cephfs-root}/{subvolumePath}/{cid} (user_id 被 per-user PVC 吸收)

@@ -42,7 +42,6 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
         service_type: &ServiceType,
     ) -> AppResult<Option<PathBuf>> {
         // resolve_workspace_path 失败 → None (降级 Local), 不传播 Err
-        // (避免 K8s API 抖动导致 file-server 全瘫; SubvolumeResolver 的 None 分支走 Local 兜底)
         Ok(self
             .runtime
             .resolve_workspace_path(identifier, service_type)
@@ -56,6 +55,49 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
                 None
             }))
     }
+
+    async fn ensure_and_resolve(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> AppResult<Option<PathBuf>> {
+        use file_server::error::AppError;
+
+        // 1. 先 resolve (cache 快): PVC 已存在?
+        if let Some(base) = self.resolve(identifier, service_type).await? {
+            // PVC 存在 → 检查迁移 (幂等: dst 非空跳过; 共享有数据才迁)
+            run_lazy_migrate(&self.runtime, identifier, service_type).await;
+            return Ok(Some(base));
+        }
+        // 2. PVC 不存在 → ensure + resolve + 迁移
+        self.runtime
+            .ensure_workspace(identifier, service_type)
+            .await
+            .map_err(|e| AppError::system(format!("ensure_workspace: {e}")))?;
+        let base = match self.resolve(identifier, service_type).await? {
+            Some(b) => b,
+            None => return Ok(None), // ensure 后仍 None (异常), 让上层 fallback
+        };
+        run_lazy_migrate(&self.runtime, identifier, service_type).await;
+        Ok(Some(base))
+    }
+}
+
+/// 按 service_type 算 lazy_migrate 参数并执行 (async)。
+async fn run_lazy_migrate(
+    runtime: &Arc<dyn ContainerRuntime>,
+    identifier: &str,
+    service_type: &ServiceType,
+) {
+    let (pvc_env, subpath, dst_at_root) = match service_type {
+        ServiceType::WebAgentRunner => ("RCODER_WORKSPACE_PVC_NAME", vec!["workspace"], false),
+        ServiceType::ComputerAgentRunner => ("RCODER_COMPUTER_WORKSPACE_PVC_NAME", vec![], true),
+        _ => return, // UserApp 不经 file-server (app_manager 直管)
+    };
+    crate::workspace_migrate::lazy_migrate(
+        runtime, pvc_env, &subpath, identifier, service_type, identifier, dst_at_root,
+    )
+    .await;
 }
 
 /// 启动嵌入式 file-server (rcoder 同进程, 方案C)。

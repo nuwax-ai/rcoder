@@ -315,10 +315,8 @@ impl ComputerContainerManager {
             container_info.container_ip
         );
 
-        // 阶段3 lazy mv: 共享 PVC (rcoder-computer-workspace/{user_id}) → per-user subvolume
-        // (经挂根 rename, 瞬间无重复; dst=per-user PVC 根, 吸收 user_id)。
-        // 仅隔离容器 (pod_id=None, per-user); 共享容器 (pod_id=Some, 共享 PVC) 跳过
-        // (per-user PVC 不存在 → resolve 重试 12s 浪费 + K8s 404, 对齐 container_manager.rs gate)
+        // lazy mv (双重保险): 覆盖"先调 rcoder (/computer/pod/ensure) 不经 file-server"场景。
+        // file-server ensure_and_resolve 也会做 (幂等), 两者不冲突。仅 pod_id=None (隔离)。
         if options.pod_id.is_none() {
             crate::workspace_migrate::lazy_migrate(
                 runtime,

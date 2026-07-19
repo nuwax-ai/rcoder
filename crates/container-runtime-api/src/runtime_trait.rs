@@ -562,6 +562,19 @@ pub trait ContainerRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// 确保 per-agent workspace PVC 存在 (幂等: 已存在则复用, 不存在则创建)。
+    ///
+    /// K8s: 调 `ensure_workspace_pvc`; Docker: no-op。
+    /// 供 file-server (经 `WorkspacePathResolver::ensure_and_resolve`) 在 resolve 时
+    /// 主动确保 PVC 存在 (file-server 先于 rcoder create_container 被调)。
+    async fn ensure_workspace(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(()) // default no-op (Docker / 未实现)
+    }
+
     // ====================================================================
     // Deployment 生命周期（UserApp 专用，agent 路径不调用）
     //
