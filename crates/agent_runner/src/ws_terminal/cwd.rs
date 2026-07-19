@@ -154,8 +154,8 @@ mod tests {
         let result = resolve_project_cwd("computer-agent-runner", "1553211", "t", "s");
         // 在容器环境中应该返回 Some("/home/user/1553211")，在非容器环境中返回 None
         // 这里只测试逻辑正确性，不测试实际路径
-        if result.is_some() {
-            assert_eq!(result.unwrap().to_str().unwrap(), "/home/user/1553211");
+        if let Some(cwd) = result.as_ref() {
+            assert_eq!(cwd.to_str().unwrap(), "/home/user/1553211");
         }
     }
 
