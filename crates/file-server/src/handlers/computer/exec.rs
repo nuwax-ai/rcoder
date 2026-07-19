@@ -21,7 +21,9 @@ use super::{resolve_computer_target, ws_path};
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecCommandBody {
+    #[serde(deserialize_with = "super::deserialize_id_string")]
     user_id: String,
+    #[serde(deserialize_with = "super::deserialize_id_string")]
     c_id: String,
     command: String,
 }
@@ -167,7 +169,9 @@ async fn latest_log_file(dir: &Path) -> AppResult<Option<PathBuf>> {
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InstallBody {
+    #[serde(deserialize_with = "super::deserialize_id_string")]
     user_id: String,
+    #[serde(deserialize_with = "super::deserialize_id_string")]
     c_id: String,
     programming_language: String,
 }
@@ -263,7 +267,9 @@ pub(crate) async fn install_project(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BuildAgentBody {
+    #[serde(deserialize_with = "super::deserialize_id_string")]
     user_id: String,
+    #[serde(deserialize_with = "super::deserialize_id_string")]
     c_id: String,
     agent_id: String,
     version: String,
@@ -326,7 +332,9 @@ pub(crate) async fn build_agent_package(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CleanupBuildArtifactsBody {
+    #[serde(deserialize_with = "super::deserialize_id_string")]
     user_id: String,
+    #[serde(deserialize_with = "super::deserialize_id_string")]
     c_id: String,
     #[serde(default)]
     custom_target_dir: Option<String>,
