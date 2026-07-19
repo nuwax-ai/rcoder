@@ -24,7 +24,11 @@ export PATH="/usr/local/cargo/bin:${PATH}"
 cd /app
 
 PORT="${RCODER_PORT:-8290}"
-FEATURES="${RCODER_FEATURES:-ebpf-debug,pyroscope,otel,debug,kubernetes}"
+# FEATURES: 默认只用 kubernetes (存储/PVC/lazy mv 逻辑测试够了)。
+# 需全功能调试(eBPF/pyroscope/otel)时:RCODER_FEATURES=ebpf-debug,pyroscope,otel,debug,kubernetes dev-rcoder.sh restart
+FEATURES="${RCODER_FEATURES:-kubernetes}"
+# line-tables-only: 最小 debuginfo (行号), 避免大 debug binary (666MB→269MB) 导致 OrbStack link 卡死
+export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}"
 BIN="/app/target/debug/rcoder"
 PID_FILE="/tmp/rcoder.pid"
 OUT_FILE="/tmp/rcoder.out"
