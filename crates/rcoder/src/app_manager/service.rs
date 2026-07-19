@@ -180,17 +180,11 @@ impl AppService {
             }
         }
 
-        // 0.6 K8s: ensure UserApp per-app PVC + 等 subvolumePath 就绪 (create_app_dirs resolve 依赖,
-        //    避免 PVC 未 ensure 时 fallback 共享 → 数据分裂)。Docker 模式 no-op。
-        self.ensure_app_workspace_ready(&app_id).await?;
-
-        // 1. 创建应用工作空间目录（code/data/logs）
-        self.create_app_dirs(&app_id).await?;
-
-        // 2. 构建容器创建参数（UserApp）
+        // 1. 构建容器创建参数（UserApp）
         let params = self.build_container_params(&app_id, &request).await?;
 
-        // 3. 创建 Deployment / 容器（K8s 含 ConfigMap/Secret/Service/HTTPRoute/NodePort）
+        // 2. 创建 Deployment / 容器（K8s 含 ConfigMap/Secret/Service/HTTPRoute/NodePort +
+        //    ensure per-app PVC 带 requests.storage 用户配额）。PVC 在此 ensure, 配额正确。
         let container_info = self.runtime.create_deployment(params).await.map_err(|e| {
             map_runtime_error(
                 &format!("[APP] create_deployment failed app_id={app_id}"),
@@ -202,9 +196,14 @@ impl AppService {
             app_id, container_info.container_name
         );
 
+        // 3. 创建应用工作空间目录（code/data/logs）—— 在 create_deployment (ensure PVC 带配额) 之后:
+        //    resolve per-app PVC 根 (resolve_app_dir_with_retry 重试等 ceph-csi provision subvolumePath),
+        //    建目录在 PVC 根 → app pod 挂同 PVC 看到目录 (无数据分裂)。
+        //    Docker 模式 get_container_app_dir Ok(None) → 共享 Local (运行时适配)。
+        self.create_app_dirs(&app_id).await?;
+
         // 注: UserApp 是新开发逻辑 (application-management-service-v2-design.md), /app 路径
-        // 不涉及历史数据迁移 → 不调 lazy_migrate (新应用无旧数据; 避免 create_app_dirs 先建
-        // src 导致 lazy_migrate 不早退 + resolve_dst_with_retry 阻塞 HTTP 60s)。
+        // 不涉及历史数据迁移 → 不调 lazy_migrate (新应用无旧数据)。
         // Web/Computer 有历史数据 → 保留 lazy_migrate。
 
         // 4. Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/{port} → container_ip）
@@ -1502,51 +1501,36 @@ impl AppService {
         }
     }
 
-    /// 确保 UserApp per-app 工作空间就绪 (K8s): ensure PVC + 重试 resolve 等 ceph-csi provision
-    /// subvolumePath (SC Immediate 后秒级, 慢可达 10s+)。
+    /// resolve UserApp 应用目录, 带重试等 ceph-csi provision subvolumePath (K8s)。
     ///
-    /// 解决 `create_app_dirs` 在 `create_deployment` (内含 ensure PVC) 之前调用的顺序问题:
-    /// 在 create_app 开头预 ensure + 等 subvolumePath 就绪, 保证后续 `get_container_app_dir`
-    /// resolve 成功, 建 code/data/logs 在 per-app PVC 根 (与 app pod 挂载同 PVC, 无分裂)。
-    /// Docker 模式无 per-app PVC → no-op (create_app_dirs 走共享 Local)。
-    async fn ensure_app_workspace_ready(&self, app_id: &str) -> AppResult<()> {
-        if !shared_types::is_kubernetes_runtime() {
-            return Ok(()); // Docker 无 per-app PVC, create_app_dirs 用共享 Local
-        }
-        self.runtime
-            .ensure_workspace(app_id, &ServiceType::UserApp)
-            .await
-            .map_err(|e| {
-                AppOperationError::Backend(format!("ensure UserApp PVC (app_id={app_id}): {e}"))
-            })?;
-        // 重试 resolve 等 ceph-csi provision subvolumePath 填充 (PVC Bound 后 PV subvolumePath 仍有延迟)
+    /// create_deployment 内 create_app_resources 已 ensure per-app PVC 带 requests.storage 用户配额
+    /// (SC Immediate 后立即 Bound), 但 PV csi.volumeAttributes.subvolumePath 填充有延迟 (ceph-csi
+    /// provision 秒级, 慢可达 10s+)。本函数在 create_app_dirs (create_deployment 之后) 重试 resolve
+    /// 等 subvolumePath 就绪, 保证建 code/data/logs 在 per-app PVC 根 (app pod 挂同 PVC, 无分裂)。
+    /// Docker 模式 get_container_app_dir 返回 Ok(共享 Local), 立即返回不重试。
+    async fn resolve_app_dir_with_retry(&self, app_id: &str) -> AppResult<PathBuf> {
         const MAX_RETRIES: u32 = 15;
-        for attempt in 0..MAX_RETRIES {
-            match self
-                .runtime
-                .resolve_workspace_path(app_id, &ServiceType::UserApp)
-                .await
-            {
-                Ok(Some(_)) => return Ok(()), // subvolumePath 就绪
-                Ok(None) => return Ok(()),    // 容错 (K8s 已 ensure, 不该 None)
-                Err(e) if attempt + 1 < MAX_RETRIES => {
-                    tracing::debug!(
-                        "[APP] UserApp PVC subvolumePath pending ({}/{}, app_id={}): {}",
-                        attempt + 1,
-                        MAX_RETRIES,
-                        app_id,
-                        e
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
+        let mut attempt: u32 = 0;
+        loop {
+            match self.get_container_app_dir(app_id).await {
+                Ok(path) => return Ok(path),
                 Err(e) => {
-                    return Err(AppOperationError::Backend(format!(
-                        "UserApp PVC subvolumePath 未就绪 (app_id={app_id}, 重试 {MAX_RETRIES} 次): {e}"
-                    )))
+                    attempt += 1;
+                    if attempt < MAX_RETRIES {
+                        tracing::debug!(
+                            "[APP] UserApp PVC resolve pending ({}/{}, app_id={}): {}",
+                            attempt,
+                            MAX_RETRIES,
+                            app_id,
+                            e
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    } else {
+                        return Err(e);
+                    }
                 }
             }
         }
-        Ok(())
     }
 
     /// 获取应用目录的宿主机路径（Docker bind mount 源）
@@ -1569,9 +1553,10 @@ impl AppService {
         }
     }
 
-    /// 创建应用工作空间子目录
+    /// 创建应用工作空间子目录（code/data/logs）。在 create_deployment (ensure PVC 带配额) 之后调用,
+    /// 经 resolve_app_dir_with_retry 等 subvolumePath 就绪后建目录在 per-app PVC 根 (无分裂)。
     async fn create_app_dirs(&self, app_id: &str) -> AppResult<()> {
-        let app_dir = self.get_container_app_dir(app_id).await?;
+        let app_dir = self.resolve_app_dir_with_retry(app_id).await?;
         fs::create_dir_all(app_dir.join("code"))
             .await
             .map_err(|e| map_io_error("failed to create code dir", e, false))?;
