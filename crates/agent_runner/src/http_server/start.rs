@@ -111,9 +111,10 @@ impl HttpServerHandle {
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     // 创建 Agent Session Service
+///     // 创建 Agent Session Service（第二参为 ACP session 创建超时秒数，取自 GrpcTimeoutConfig）
 ///     let agent_session_service = Arc::new(AgentSessionService::new(
 ///         agent_abstraction::launcher::direct_model_runtime_env_resolver(),
+///         100,
 ///     ));
 ///
 ///     // 配置 HTTP Server

@@ -564,6 +564,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let spawn_project_id = project_id.clone();
         let spawn_command_line = full_command_line.clone();
         let diagnostics_listener_for_task = self.diagnostics_listener.clone();
+        // 🔥 提前取出 session 创建超时：start_config 随即被 move 进 spawn task，之后不可读。
+        // 值来自 AgentStartConfig（由 GrpcTimeoutConfig.acp_session_create_timeout_secs 注入），默认 60s。
+        let session_create_timeout_secs = start_config.acp_session_create_timeout_secs.unwrap_or(60);
         let connection_task_handle = tokio::spawn(async move {
             info!(
                 "[SACP] Spawned ACP connection task, project_id={}",
@@ -646,13 +649,13 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             }
         });
 
-        // 等待会话 ID（60 秒超时），同时监听连接失败
+        // 等待会话 ID（超时取自 start_config / GrpcTimeoutConfig，默认 60s），同时监听连接失败
         info!(
-            "[SACP] Waiting for session_id from ACP agent, project_id={}, timeout=60s",
-            project_id
+            "[SACP] Waiting for session_id from ACP agent, project_id={}, timeout={}s",
+            project_id, session_create_timeout_secs
         );
         let session_id = match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(session_create_timeout_secs),
             async {
                 tokio::select! {
                     result = session_id_rx => {
@@ -687,21 +690,30 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     .map(|s| format!("; stderr: {}", s))
                     .unwrap_or_default();
                 error!(
-                    "[SACP] Agent initialization timeout (60s), project_id={}, command=[{}], child_pid={}, stderr={}",
-                    project_id, full_command_line, child_pid, stderr_info
+                    "[SACP] Agent initialization timeout ({}s), project_id={}, command=[{}], child_pid={}, stderr={}",
+                    session_create_timeout_secs, project_id, full_command_line, child_pid, stderr_info
                 );
                 // 超时后取消 spawned 任务，避免子进程泄漏
                 connection_task_handle.abort();
                 // kill 子进程（使用进程组 kill 清理所有孙进程）
                 #[cfg(unix)]
                 {
-                    use nix::sys::signal::{Signal, killpg};
+                    use nix::errno::Errno;
+                    use nix::sys::signal::{Signal, kill};
                     use nix::unistd::Pid;
                     if child_pid > 0 {
-                        let pgid = Pid::from_raw(-(child_pid as i32));
-                        match killpg(pgid, Signal::SIGKILL) {
+                        // kill(2) 的负数 pid 表示「整个进程组」；子进程以 ProcessGroup::leader() 启动，pgid == child_pid，
+                        // 故 -child_pid 能杀掉 claude-code-acp-ts 及其所有 MCP 孙进程。
+                        // ⚠️ 绝不能用 libc killpg 并预先取负：killpg 期望正数 pgrp（内部自取负），负数会直接 EINVAL。
+                        // 与 lifecycle.rs 的正常关闭路径保持一致。
+                        let target = Pid::from_raw(-(child_pid as i32));
+                        match kill(target, Signal::SIGKILL) {
                             Ok(_) => warn!(
                                 "[SACP] Killed process group (SIGKILL) for child_pid={}, project_id={}",
+                                child_pid, project_id
+                            ),
+                            Err(Errno::ESRCH) => debug!(
+                                "[SACP] Process group already exited: child_pid={}, project_id={}",
                                 child_pid, project_id
                             ),
                             Err(e) => error!(
@@ -712,8 +724,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     }
                 }
                 return Err(anyhow::anyhow!(
-                    "{}: agent initialization timeout (60s){}",
+                    "{}: agent initialization timeout ({}s){}",
                     error_codes::get_i18n_message_default("error.agent_init_timeout"),
+                    session_create_timeout_secs,
                     stderr_info
                 ));
             }

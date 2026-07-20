@@ -28,12 +28,21 @@ use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 #[derive(Clone)]
 pub struct AcpAgentWorker<N: SessionNotifier, R: SessionRegistry> {
     session_manager: Arc<AcpSessionManager<N, R>>,
+    /// ACP session 创建超时（秒），源自 GrpcTimeoutConfig，注入 AgentStartConfig。
+    /// 这是 launcher 等待子进程返回 session_id 的「外层超时」真正生效的值。
+    acp_session_create_timeout_secs: u64,
 }
 
 impl<N: SessionNotifier + 'static, R: SessionRegistry> AcpAgentWorker<N, R> {
     /// 创建新的 ACP Agent Worker
-    pub fn new(session_manager: Arc<AcpSessionManager<N, R>>) -> Self {
-        Self { session_manager }
+    pub fn new(
+        session_manager: Arc<AcpSessionManager<N, R>>,
+        acp_session_create_timeout_secs: u64,
+    ) -> Self {
+        Self {
+            session_manager,
+            acp_session_create_timeout_secs,
+        }
     }
 }
 
@@ -133,7 +142,8 @@ where
             .with_system_prompt(system_prompt)
             .with_mcp_servers(mcp_servers)
             .with_user_id(request.prompt_message.user_id.clone())
-            .with_is_devcomputer(request.prompt_message.is_devcomputer);
+            .with_is_devcomputer(request.prompt_message.is_devcomputer)
+            .with_acp_session_create_timeout(self.acp_session_create_timeout_secs);
 
         // 🆕 如果用户指定了 agent_server 配置，添加到 start_config
         // 注意：这里直接使用用户传入的配置，由 launcher 层负责与默认配置合并

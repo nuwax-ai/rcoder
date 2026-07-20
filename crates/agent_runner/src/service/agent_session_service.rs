@@ -64,7 +64,10 @@ pub struct AgentSessionService {
 }
 
 impl AgentSessionService {
-    pub fn new(model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>) -> Self {
+    pub fn new(
+        model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+        acp_session_create_timeout_secs: u64,
+    ) -> Self {
         let session_manager = Arc::new(AcpSessionManager::<
             StateAwareNotifier<AgentSessionRegistry>,
             AgentSessionRegistry,
@@ -77,7 +80,7 @@ impl AgentSessionService {
         ));
 
         Self {
-            worker: AcpAgentWorker::new(session_manager),
+            worker: AcpAgentWorker::new(session_manager, acp_session_create_timeout_secs),
         }
     }
 

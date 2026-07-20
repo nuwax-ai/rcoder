@@ -179,7 +179,17 @@ async fn main() -> anyhow::Result<()> {
 
     let model_env_resolver: Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> =
         create_model_env_resolver(&config);
-    let agent_session_service = Arc::new(AgentSessionService::new(model_env_resolver));
+    // ACP session 创建超时：取自 GrpcTimeoutConfig（已 validate ∈ [10,300]，默认 100），
+    // 经 AgentSessionService → AcpAgentWorker → AgentStartConfig 注入到 launcher 外层超时。
+    let acp_session_create_timeout_secs = config
+        .grpc_timeouts
+        .as_ref()
+        .map(|t| t.acp_session_create_timeout_secs)
+        .unwrap_or(100);
+    let agent_session_service = Arc::new(AgentSessionService::new(
+        model_env_resolver,
+        acp_session_create_timeout_secs,
+    ));
     info!("[MAIN] AgentSessionService created");
 
     // 🆕 P0-1: 创建 Agent 管理注册表(从磁盘加载,失败则用空注册表 + 警告)
