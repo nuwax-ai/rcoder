@@ -1,0 +1,17 @@
+# Node.js/TypeScript 应用运行时
+ARG BASE_IMAGE=app-runtime-base:latest
+FROM ${BASE_IMAGE}
+
+ENV NODE_VERSION=24
+
+# 安装 Node.js
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g pm2 typescript ts-node \
+    && rm -rf /var/lib/apt/lists/*
+
+# 暴露端口
+EXPOSE 8080 7681
+
+# 启动命令
+CMD ["/usr/local/bin/start-ttyd.sh"]

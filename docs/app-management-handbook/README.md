@@ -28,6 +28,7 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
 | [04-设计考虑](./04-设计考虑.md) | 想了解 why 时读 | 每个关键决策的动机（异步/全量替换/保留数据/状态机/对账/路径契约/WS/CephFS） |
 | [05-典型场景](./05-典型场景.md) | 上手时读 | 8 个端到端剧本（部署/更新/启停/删除找回/清孤儿/对账/日志/部署物），含可复制 curl |
 | [06-快速开始-发布与访问](./06-快速开始-发布与访问.md) | **给同事看** | 应用发布（build→upload→create→轮询→update）+ 服务访问（access→Pingora→访问），含流程图 + FAQ |
+| [07-前端项目部署](./07-前端项目部署.md) | 部署前端时读 | React/Vue + Vite 模板部署实测（vite `--host`、install、dev/preview 模式）+ Pingora 访问 + HMR，含可复制 curl + FAQ |
 
 > **建议顺序**：01 → 02（快速浏览）→ 05（跑一遍场景）→ 遇到错误查 03 → 想懂 why 查 04。
 
@@ -39,7 +40,6 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
 
 | 项 | 设计文档 | 当前实现现状 | 影响 / 应对 |
 |---|---|---|---|
-| **app_id 生成** | "生成或接受 Java 传入" | **只由 RCoder 自动生成**（`Uuid::v4` 前 8 位），`CreateAppRequest` 无 app_id 字段 | "用旧 app_id 重建挂回旧数据"走不通；误删找回需运维迁移目录（见 [05 场景 4](./05-典型场景.md#场景-4删除保留数据与误删找回)） |
 | **镜像拉取/资源不足错误码** | `ERR_IMAGE_PULL_FAILED`(502)、`ERR_RESOURCE_EXHAUSTED`(503) | **未落地**，两者都归 `ERR_BACKEND_ERROR`(500) | 收不到 502/503；区分镜像问题要看 `GET /apps/{id}` 的 `conditions[].reason`（见 [03 §3.2](./03-错误处理与重试.md)） |
 | **logs follow** | `follow=true` 流式 | **未实现**（runtime 返回快照） | 实时流用 `GET /apps/{id}/logs/stream`（WebSocket）；`since` 参数也暂未透传 |
 | **stats CPU/内存** | 返回资源使用 | **返回默认空值** | K8s 需装 metrics-server 才有真实数据，当前仅 `restart_count` 可靠 |

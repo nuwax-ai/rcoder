@@ -218,7 +218,7 @@ RCoder:
   2. 创建 ConfigMap/Secret/PVC（如有）
   3. SSA-apply Deployment（replicas=期望, labels, envFrom, probes, ports）
   4. 创建 ClusterIP Service（{app_id}-svc，始终建）
-     + 注册 Pingora backend（/proxy/{port} → {app_id}-svc，默认模式）
+     + 注册 Pingora backend（/proxy/apps/{app_id}/{port} → {app_id}-svc，默认模式）
      [仅 gateway 模式建 HTTPRoute；TCP 初期不建 NodePort，见 §8]
   5. 立即返回 201 + AppInfo{status: Starting}
      —— 不等待 Pod Ready
@@ -438,7 +438,7 @@ pub trait ContainerRuntime: Send + Sync {
 | env（非敏感） | `ConfigMap` `{app_id}-config` | 同上 |
 | secrets（敏感） | `Secret` `{app_id}-secret` | 同上 |
 | 内部服务发现 + Pingora 后端 | `Service` (ClusterIP) `{app_id}-svc`（**两种暴露模式都建**：Pingora 转发目标 / 集群内互调） | 同上 |
-| HTTP 端口对外（默认 Pingora） | **不建额外资源**——RCoder 内置 Pingora 转发到 `{app_id}-svc:{port}`，access 返回 path `/proxy/{port}`（Java 拼 RCoder 入口） | — |
+| HTTP 端口对外（默认 Pingora） | **不建额外资源**——RCoder 内置 Pingora 转发到 `{app_id}-svc:{port}`，access 返回 path `/proxy/apps/{app_id}/{port}`（Java 拼 RCoder 入口） | — |
 | HTTP 端口对外（可选 gateway） | `HTTPRoute` `{app_id}-route`（path `/apps/{app_id}`，挂 `nuwax-gateway`），**仅 `http_expose=gateway` 时建** | 同上 |
 | TCP 端口对外 | **初期不对外**（不建 NodePort）；仅 ClusterIP 供集群内访问 | — |
 | 持久存储 | `PVC`（复用 workspace PVC 的 `apps/{app_id}` subPath，见 §10） | — |
@@ -452,7 +452,7 @@ pub trait ContainerRuntime: Send + Sync {
 | 副本（Docker 无副本概念） | 单容器，replicas>0 = 存在，=0 = stop 不删 |
 | 镜像 + command + env + resources | 容器 create 参数 |
 | 内部服务发现 | 容器名（同 Docker network 内 DNS） |
-| HTTP 端口对外 | pingora 代理路由 `/proxy/{port}/{path}`（既有机制） |
+| HTTP 端口对外 | pingora 代理路由 `/proxy/apps/{app_id}/{port}/{path}`（既有机制） |
 | TCP 端口对外 | **初期不对外**（不做 host port 映射）；仅 Docker 网络内可达 |
 | 持久存储 | bind-mount `app-workspace/{app_id}/` |
 
@@ -476,15 +476,15 @@ devspace 本地 K8s 测试也用 `KubernetesRuntime`。
 
 | 模式 | 触发条件 | K8s 资源 | `access.external.http` |
 |---|---|---|---|
-| **Pingora（默认）** | `http_expose=pingora` | ClusterIP Service（Pingora 转发到 `{app_id}-svc:{port}`） | `/proxy/{port}`（**path，Java 拼 RCoder 入口**） |
+| **Pingora（默认）** | `http_expose=pingora` | ClusterIP Service（Pingora 转发到 `{app_id}-svc:{port}`） | `/proxy/apps/{app_id}/{port}`（**path，Java 拼 RCoder 入口**） |
 | **Gateway（可选）** | `http_expose=gateway` | ClusterIP Service + HTTPRoute（path `/apps/{app_id}`，挂 `nuwax-gateway`） | `/apps/{app_id}`（path，**Java 拼 gateway 域名**） |
 
-Docker 后端两种模式都走 Pingora（`/proxy/{port}` → container_ip），无 gateway 概念。两种模式、两后端都建 ClusterIP Service `{app_id}-svc`：Pingora 模式它是转发目标，Gateway 模式它是 HTTPRoute 的 backendRef，集群内互调也都用它。
+Docker 后端两种模式都走 Pingora（`/proxy/apps/{app_id}/{port}` → container_ip），无 gateway 概念。两种模式、两后端都建 ClusterIP Service `{app_id}-svc`：Pingora 模式它是转发目标，Gateway 模式它是 HTTPRoute 的 backendRef，集群内互调也都用它。
 
 ### 8.2 为什么默认 Pingora（统一两后端）
 
 - **消除 K8s(gateway) / Docker(Pingora) 分裂**：此前 K8s 走外部 gateway、Docker 走 Pingora，两后端 access 形态不一致、Java 要分别处理。统一后两后端都"返 path + Java 拼 host"，完全对称。
-- **RCoder 作唯一 HTTP 入口**：便于未来统一鉴权 / 限流 / 观测；access 只返 path（`/proxy/{port}`），host 由 Java 持有（它本就知道 RCoder 入口，否则没法访问）。
+- **RCoder 作唯一 HTTP 入口**：便于未来统一鉴权 / 限流 / 观测；access 只返 path（`/proxy/apps/{app_id}/{port}`），host 由 Java 持有（它本就知道 RCoder 入口，否则没法访问）。
 - **gateway 留作可选**：当需要 7 层路径路由（一个 gateway 域名承载多 app，靠 `/apps/{id}` 区分）或对接既有 Envoy/Cilium Gateway 体系时，切 `http_expose=gateway`。
 
 代价（可接受）：RCoder 成 HTTP 流量单点（它挂则所有 app 不可达）；RCoder 自身需对外暴露 Pingora 监听端口（见 §8.3）。
@@ -495,7 +495,7 @@ Pingora 监听 `proxy_config.listen_port`（RCoder Pod 内，默认 8088）。�
 - **K8s**：RCoder Service 用 NodePort / LoadBalancer 暴露 Pingora 端口，或前置 Ingress。
 - **Docker**：Pingora 直接监听宿主机端口。
 
-`access.external.http` **只返 path（`/proxy/{port}`），不含 host**——Java 既然通过 RCoder 访问应用，必然已持有 RCoder 入口（ip:port/域名），RCoder 不必替它拼（避免依赖 `RCODER_EXTERNAL_HOST` 配置、避免多环境域名耦合）。
+`access.external.http` **只返 path（`/proxy/apps/{app_id}/{port}`），不含 host**——Java 既然通过 RCoder 访问应用，必然已持有 RCoder 入口（ip:port/域名），RCoder 不必替它拼（避免依赖 `RCODER_EXTERNAL_HOST` 配置、避免多环境域名耦合）。
 
 ### 8.4 TCP 端口（初期不对外）
 

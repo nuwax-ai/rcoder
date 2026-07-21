@@ -1,0 +1,15 @@
+# Rust 应用运行时
+ARG BASE_IMAGE=app-runtime-base:latest
+FROM ${BASE_IMAGE}
+
+ENV RUST_VERSION=1.96
+
+# 安装 Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_VERSION}
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 暴露端口
+EXPOSE 8080 7681
+
+# 启动命令
+CMD ["/usr/local/bin/start-ttyd.sh"]
