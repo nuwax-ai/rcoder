@@ -145,6 +145,19 @@ docker_config:
           cpu_limit: 2.0
           swap_limit: 8589934592 # 8GB
 
+        # 可选：Docker 模式子容器安全参数（仅 Docker 部署生效；老内核 EPERM 时启用，运维自负其责）
+        # 未配置（保持注释）时走代码默认：privileged=false + cap_drop=[NET_RAW,NET_ADMIN]。
+        # 一旦配置则整体覆盖默认；字段语义与 docker-compose.yml 的 security_opt 一致，可直接照搬。
+        # security:
+        #   security_opt:
+        #     - "seccomp=unconfined"      # 关闭 seccomp（老内核兼容）
+        #     - "apparmor=unconfined"     # 关闭 apparmor
+        #   cap_add:
+        #     - "SYS_PTRACE"              # chrome sandbox 常需要
+        #   # privileged: true            # 极端情况才开，会移除几乎所有内核限制
+        #   # pids_limit: 200             # 进程数上限（0/-1 表示无限制）
+        #   # init: true                  # 容器内运行 init 进程（转发信号 + 回收僵尸）
+
         work_dir: "/app"
         network_mode: "bridge"
 

@@ -178,6 +178,9 @@ impl<'a> AgentContainerStarter<'a> {
         // （Docker 只用 memory/cpu/swap，storage 字段随 struct 携带但 build_host_config 不读）
         builder = builder.resource_limits(final_resource_limits);
 
+        // 透传服务级安全配置（仅 Docker 模式生效；None 时 build_host_config 走代码默认）
+        builder = builder.security(service_config.security.clone());
+
         // 添加环境变量
         // 处理其他环境变量中的模板（先处理，因为后续需要使用 project_id/user_id 的值）
         for (key, value) in &service_config.environment {

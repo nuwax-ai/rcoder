@@ -51,6 +51,9 @@ pub struct DockerContainerConfig {
     /// 隔离类型（可选），控制容器共享粒度：tenant/space/project
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation_type: Option<String>,
+    /// 容器安全配置（可选，仅 Docker 模式生效），透传到 bollard HostConfig
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<shared_types::ServiceSecurityConfig>,
 }
 
 /// 挂载点配置
@@ -111,6 +114,7 @@ impl DockerContainerConfig {
             tenant_id: None,
             space_id: None,
             isolation_type: None,
+            security: None,
         }
     }
 }

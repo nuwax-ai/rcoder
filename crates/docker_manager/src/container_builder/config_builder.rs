@@ -3,7 +3,7 @@
 //! 使用 Builder 模式构建 DockerContainerConfig
 
 use crate::{DockerContainerConfig, DockerResult, MountPoint};
-use shared_types::ServiceResourceLimits;
+use shared_types::{ServiceResourceLimits, ServiceSecurityConfig};
 use std::collections::HashMap;
 use tracing::debug;
 
@@ -47,6 +47,8 @@ pub struct ContainerConfigBuilder {
     tenant_id: Option<String>,
     space_id: Option<String>,
     isolation_type: Option<String>,
+    // 容器安全配置（可选，仅 Docker 模式生效）
+    security: Option<ServiceSecurityConfig>,
 }
 
 impl ContainerConfigBuilder {
@@ -76,6 +78,7 @@ impl ContainerConfigBuilder {
             tenant_id: None,
             space_id: None,
             isolation_type: None,
+            security: None,
         }
     }
 
@@ -210,6 +213,12 @@ impl ContainerConfigBuilder {
         self
     }
 
+    /// 设置容器安全配置（可选，仅 Docker 模式生效）；传 None 表示走代码默认
+    pub fn security(mut self, security: Option<ServiceSecurityConfig>) -> Self {
+        self.security = security;
+        self
+    }
+
     /// 构建 DockerContainerConfig
     ///
     /// # Returns
@@ -254,6 +263,7 @@ impl ContainerConfigBuilder {
             tenant_id: self.tenant_id,
             space_id: self.space_id,
             isolation_type: self.isolation_type,
+            security: self.security,
         };
 
         debug!(

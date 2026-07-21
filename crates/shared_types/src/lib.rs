@@ -160,7 +160,7 @@ pub use multi_image_config::{
     ProjectImageOverrides, create_default_multi_image_config, create_legacy_multi_image_config,
 };
 pub use service_config::{
-    ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits,
+    ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits, ServiceSecurityConfig,
     default_agent_runner_service_config, default_rcoder_service_config,
 };
 pub use service_type::{

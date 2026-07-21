@@ -322,6 +322,7 @@ mod tests {
                 network_mode: "bridge".to_string(),
                 container_path_template: "/app/project_workspace/{project_id}".to_string(),
                 workspace_resolution_path: None,
+                security: None,
             },
         );
 
@@ -345,6 +346,7 @@ mod tests {
                 container_path_template: "/app/computer-project-workspace/{user_id}/{project_id}"
                     .to_string(),
                 workspace_resolution_path: None,
+                security: None,
             },
         );
 

@@ -82,6 +82,10 @@ pub struct ServiceImageConfig {
     ///   - ComputerAgentRunner: "/app/computer-project-workspace/{user_id}/{project_id}" → "/app/computer-project-workspace"
     #[serde(default)]
     pub workspace_resolution_path: Option<String>,
+    /// 容器安全配置（可选）。仅 Docker 部署模式透传到 bollard HostConfig；
+    /// 未配置（None）时走代码默认（privileged=false + cap_drop=[NET_RAW,NET_ADMIN]）。
+    #[serde(default)]
+    pub security: Option<ServiceSecurityConfig>,
 }
 
 /// 服务挂载点配置
@@ -138,6 +142,36 @@ pub struct ServiceResourceLimits {
     /// 与 storage_size 是两个独立配额，不会合并；格式同 storage_size；未指定时回退到 storage_size 的值。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ephemeral_storage_limit: Option<String>,
+}
+
+/// 服务容器的安全配置（可选）。仅 Docker 部署模式透传到 bollard HostConfig。
+///
+/// 字段语义与 Docker `HostConfig` / docker-compose.yml 一致，运维可直接照搬 compose 写法。
+/// 合并语义（在 docker_manager 的 `build_host_config` 中应用）：
+/// - `ServiceImageConfig.security = None`（未配置 security 块）→ 完全走代码默认逻辑
+///   （`privileged=false` + `cap_drop=[NET_RAW,NET_ADMIN]`，受 `ebpf-debug` feature 影响）。
+/// - `security = Some`（配置了 security 块）→ 该配置覆盖一切（含 `ebpf-debug`）；
+///   块内每个字段 `Some(x)` 用 x，字段未写（`None`）回退到该字段的内置默认。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ServiceSecurityConfig {
+    /// 是否以特权模式运行（默认 false）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub privileged: Option<bool>,
+    /// 要添加的内核 capabilities，如 ["SYS_PTRACE"]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cap_add: Option<Vec<String>>,
+    /// 要移除的内核 capabilities；显式配置则整体覆盖默认 ["NET_RAW","NET_ADMIN"]（写 `[]` 表示不 drop 任何 cap）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cap_drop: Option<Vec<String>>,
+    /// Docker security_opt，如 ["seccomp=unconfined","apparmor=unconfined"]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_opt: Option<Vec<String>>,
+    /// 进程数限制；`0` 或 `-1` 表示无限制
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<i64>,
+    /// 是否在容器内运行 init 进程（转发信号 + 回收僵尸进程）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub init: Option<bool>,
 }
 
 impl ServiceResourceLimits {
@@ -567,6 +601,7 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
         network_mode: "bridge".to_string(),
         container_path_template: default_container_path_template(),
         workspace_resolution_path: None,
+        security: None,
     }
 }
 
@@ -623,12 +658,58 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
         network_mode: "bridge".to_string(),
         container_path_template: default_computer_agent_runner_container_path_template(),
         workspace_resolution_path: None,
+        security: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ServiceSecurityConfig 反序列化：未配置字段应为 None
+    #[test]
+    fn test_security_config_deserialize() {
+        let json = r#"{"privileged":true,"cap_add":["SYS_PTRACE"],"security_opt":["seccomp=unconfined"],"pids_limit":200}"#;
+        let sec: ServiceSecurityConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(sec.privileged, Some(true));
+        assert_eq!(sec.cap_add, Some(vec!["SYS_PTRACE".to_string()]));
+        assert_eq!(
+            sec.security_opt,
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+        assert_eq!(sec.pids_limit, Some(200));
+        assert_eq!(sec.cap_drop, None);
+        assert_eq!(sec.init, None);
+    }
+
+    /// 默认服务配置（代码内构造）security 必须为 None —— 不改变现有默认行为
+    #[test]
+    fn test_default_service_config_security_is_none() {
+        assert!(default_agent_runner_service_config().security.is_none());
+        assert!(default_rcoder_service_config().security.is_none());
+    }
+
+    /// ServiceImageConfig 带 security 的 round-trip：验证 security 字段 serde 贯通
+    #[test]
+    fn test_service_image_config_security_roundtrip() {
+        let mut cfg = default_agent_runner_service_config();
+        cfg.security = Some(ServiceSecurityConfig {
+            privileged: Some(false),
+            cap_add: Some(vec!["SYS_PTRACE".to_string()]),
+            cap_drop: None,
+            security_opt: Some(vec!["seccomp=unconfined".to_string()]),
+            pids_limit: None,
+            init: None,
+        });
+        let json = serde_json::to_string(&cfg).unwrap();
+        let cfg2: ServiceImageConfig = serde_json::from_str(&json).unwrap();
+        let sec = cfg2.security.expect("security preserved after roundtrip");
+        assert_eq!(sec.cap_add, Some(vec!["SYS_PTRACE".to_string()]));
+        assert_eq!(
+            sec.security_opt,
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+    }
 
     /// serde alias 兼容：旧字段名（memory_limit/cpu_limit/swap_limit）经 alias 反序列化到
     /// 新字段（memory/cpu/swap）。保证 config.yml 旧键名 + 旧 HTTP 请求不破坏。
@@ -725,6 +806,7 @@ mod tests {
             network_mode: "bridge".to_string(),
             container_path_template: "/app/project_workspace/{project_id}".to_string(),
             workspace_resolution_path: None,
+            security: None,
         };
 
         for mount in &config_with_mounts.mounts {
