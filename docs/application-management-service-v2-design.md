@@ -205,6 +205,15 @@ v1 → v2 真实变更（均与 HTTP 方法无关）：
 | `POST` | `/apps/{id}/storage/delete` | 清空该 app 持久存储（**仅当 app 已 delete 时允许**，否则 409） |
 | `POST` | `/apps/storage/query` | 分页查询持久存储（body: **page/page_size 必填** + filters；**强制分页、无全量模式**） |
 
+#### 数据库管理（v2 新增，仅 app-runtime 镜像带 PG 的 app，见 handbook 08）
+
+> app-runtime 镜像单容器自带 PostgreSQL（PG/pgweb/ttyd 同容器）。日常 DB 操作（建表/查改数据/建用户/改密码）用户在 pgweb 自助（pgweb 连 `POSTGRES_USER` 超级用户，SQL 全能）。这组 rcoder 接口只覆盖 pgweb **做不到**或**需要 API 化**的场景。无 PG 的 app 调用返回 `400 ERR_OPERATION_NOT_SUPPORTED`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/apps/{id}/db/reset-password` | 重置 PG 密码（body: `{ "new_password": "..." }`）。rcoder exec 容器内 psql（本地 trust 认证，**不依赖当前密码**）→ `ALTER USER`。**解决「忘记密码进不去 pgweb」的循环依赖**（pgweb 做不到，必须 rcoder 提供） |
+| `POST` | `/apps/{id}/db/create-database` | 新建 PG 库（body: `{ "database": "newdb", "owner": "app"(可选，默认 POSTGRES_USER) }`）。rcoder exec 容器内 psql `CREATE DATABASE`。API 化建库（pgweb 也能手动建，此接口供 Java/CI 自动化） |
+
 ---
 
 ## 5. 关键交互细节
@@ -310,6 +319,53 @@ POST /apps/storage/query
 > **备选**（仅当将来业务确需在 RCoder 接口里直接拿 per-app 大小时再考虑）：CephFS 的 MDS 内置维护每目录递归大小，可读虚拟 xattr `ceph.dir.rbytes`（一次 `getfattr`，O(1)、不遍历），仅在 `GET /apps/{id}/storage` 实现，且需确认挂载已开启 xattr 支持 + RCoder 引入 `getfattr`/libcephfs 能力；**列表接口无论如何都不算 size**。当前 v2 不做。
 
 `is_orphan` 字段始终返回（无论是否过滤），让业务一眼识别孤儿。这条查询路径与 `GET /apps/runtime`（列运行中应用）互补，合起来覆盖"应用 vs 数据"两侧对账。
+
+### 5.5 数据库管理（v2 新增，仅 app-runtime 带 PG 的 app）
+
+app-runtime 镜像单容器自带 PG（见 handbook 08）。**日常 DB 操作用户在 pgweb 自助**（pgweb 连 `POSTGRES_USER` 超级用户，SQL 全能：建表/查改/建用户/改密码）。rcoder 只提供 pgweb **做不到**的「密码重置」+ 可选的「API 化建库」。
+
+**适用性**：仅 app-runtime 镜像（带 PG）的 app。无 PG 的 app → `400 ERR_OPERATION_NOT_SUPPORTED`。判断依据：容器内 PG 进程在 / PGDATA 就绪。
+
+#### 5.5.1 重置密码 `POST /apps/{id}/db/reset-password`
+
+**场景**：用户忘记 PG 密码 → pgweb 登不进（要当前密码）→ 改不了（**循环依赖**）。rcoder 破环。
+
+```
+请求: { "new_password": "newSecret123" }
+rcoder:
+  1. exec 进 app 容器（docker exec / kubectl exec）
+  2. 容器内 psql（unix socket 本地 trust 认证，不需当前密码）
+  3. ALTER USER "{POSTGRES_USER}" WITH PASSWORD '{new_password}';
+  4. （可选）同步更新 app env POSTGRES_PASSWORD，供应用/pgweb 重连
+返回: HttpResult<String>（"密码已重置"）
+```
+
+**为什么不依赖当前密码**：start-app.sh initdb 设 `--auth-local=trust`，PG 本地 unix socket 免密；rcoder exec 容器内以 postgres 系统用户 peer 认证直连，绕过密码。
+
+**约束**：app 必须 Running（PG 进程在）；`new_password` 非空校验；接口需鉴权（避免越权改别人 app 密码）。
+
+#### 5.5.2 新建数据库 `POST /apps/{id}/db/create-database`
+
+**场景**：API 化建库（Java/CI 自动创建业务库，不手动 pgweb）。pgweb 也能手动建，此接口供自动化。
+
+```
+请求: { "database": "orders_db", "owner": "app"(可选，默认 POSTGRES_USER) }
+rcoder:
+  1. exec 进 app 容器
+  2. CREATE DATABASE "{database}" OWNER "{owner}";
+  3. 已存在 → 409 ERR_APP_ALREADY_EXISTS（或幂等返回成功，待定）
+返回: HttpResult<String>（"数据库已创建"）
+```
+
+**约束**：app 必须 Running；`database` 名校验（PG 标识符规则）；`owner` 必须是已存在 PG 用户（否则 400）。
+
+#### 5.5.3 实现前提：rcoder 容器 exec 能力
+
+两个接口都依赖 rcoder **exec 进 app 容器跑 psql**：
+- Docker：docker exec（bollard）→ `psql -c "ALTER USER ..."`
+- K8s：kubectl exec（kube-rs）→ 同理
+
+**前置**：ContainerRuntime trait 要有 `exec(app_id, command)` 方法（rcoder 当前可能没有，需新增）。exec 复用价值高（未来诊断、文件操作、ttyd 命令执行都可走 exec）。
 
 ---
 

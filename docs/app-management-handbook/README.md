@@ -29,6 +29,7 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
 | [05-典型场景](./05-典型场景.md) | 上手时读 | 8 个端到端剧本（部署/更新/启停/删除找回/清孤儿/对账/日志/部署物），含可复制 curl |
 | [06-快速开始-发布与访问](./06-快速开始-发布与访问.md) | **给同事看** | 应用发布（build→upload→create→轮询→update）+ 服务访问（access→Pingora→访问），含流程图 + FAQ |
 | [07-前端项目部署](./07-前端项目部署.md) | 部署前端时读 | React/Vue + Vite 模板部署实测（vite `--host`、install、dev/preview 模式）+ Pingora 访问 + HMR，含可复制 curl + FAQ |
+| [08-带数据库的应用部署](./08-带数据库的应用部署.md) | 需要数据库时读 | 单容器自带 PostgreSQL+pgweb+ttyd（app-runtime 镜像）+ Pingora 访问 pgweb/ttyd + PG 持久化，含实测 curl + FAQ |
 
 > **建议顺序**：01 → 02（快速浏览）→ 05（跑一遍场景）→ 遇到错误查 03 → 想懂 why 查 04。
 
