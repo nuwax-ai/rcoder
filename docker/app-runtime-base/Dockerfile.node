@@ -10,8 +10,5 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && npm install -g pm2 typescript ts-node \
     && rm -rf /var/lib/apt/lists/*
 
-# 暴露端口
-EXPOSE 8080 7681
-
-# 启动命令
-CMD ["/usr/local/bin/start-ttyd.sh"]
+# 启动入口继承 base:ENTRYPOINT=start-app.sh(PG+pgweb+ttyd+用户 command)
+# UserApp command 覆盖 base CMD,作为 args 传给 start-app.sh

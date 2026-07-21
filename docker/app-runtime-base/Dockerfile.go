@@ -13,8 +13,5 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 ENV GOPATH="/root/go"
 ENV PATH="${GOPATH}/bin:${PATH}"
 
-# 暴露端口
-EXPOSE 8080 7681
-
-# 启动命令
-CMD ["/usr/local/bin/start-ttyd.sh"]
+# 启动入口继承 base:ENTRYPOINT=start-app.sh(PG+pgweb+ttyd+用户 command)
+# UserApp command 覆盖 base CMD,作为 args 传给 start-app.sh

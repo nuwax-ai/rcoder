@@ -20,8 +20,5 @@ RUN curl -fsSL https://arthas.aliyun.com/arthas-boot.jar -o /usr/local/bin/artha
     && echo 'java -jar /usr/local/bin/arthas-boot.jar "$@"' >> /usr/local/bin/arthas \
     && chmod +x /usr/local/bin/arthas
 
-# 暴露端口
-EXPOSE 8080 7681
-
-# 启动命令
-CMD ["/usr/local/bin/start-ttyd.sh"]
+# 启动入口继承 base:ENTRYPOINT=start-app.sh(PG+pgweb+ttyd+用户 command)
+# UserApp command 覆盖 base CMD,作为 args 传给 start-app.sh

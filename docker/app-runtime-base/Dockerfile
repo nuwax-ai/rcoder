@@ -65,17 +65,49 @@ RUN ARCH=$(dpkg --print-architecture) && \
 COPY start-ttyd.sh /usr/local/bin/start-ttyd.sh
 RUN chmod +x /usr/local/bin/start-ttyd.sh
 
+# 安装 PostgreSQL 16
+RUN install -d /usr/share/postgresql-keyring && \
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        | gpg --dearmor -o /usr/share/postgresql-keyring/pgdg.gpg && \
+    chmod 644 /usr/share/postgresql-keyring/pgdg.gpg && \
+    echo "deb [signed-by=/usr/share/postgresql-keyring/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && apt-get install -y postgresql-16 && rm -rf /var/lib/apt/lists/*
+
+# 安装 pgweb(Go 单二进制,PostgreSQL Web UI)
+ARG PGWEB_VERSION=0.17.0
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "${ARCH}" in \
+        amd64) PGWEB_ARCH=amd64;; \
+        arm64) PGWEB_ARCH=arm64;; \
+        *) echo "Unsupported arch: ${ARCH}" && exit 1;; \
+    esac && \
+    curl -fsSL -o /tmp/pgweb.zip \
+        "https://github.com/sosedoff/pgweb/releases/download/v${PGWEB_VERSION}/pgweb_linux_${PGWEB_ARCH}.zip" && \
+    cd /tmp && unzip -o pgweb.zip && \
+    mv "pgweb_linux_${PGWEB_ARCH}" /usr/local/bin/pgweb && \
+    chmod +x /usr/local/bin/pgweb && \
+    rm -f /tmp/pgweb.zip
+
+# 复制 supervisor 配置 + ENTRYPOINT 启动脚本
+COPY app-runtime.supervisor.conf /etc/supervisor/conf.d/app-runtime.conf
+COPY start-app.sh /usr/local/bin/start-app.sh
+RUN chmod +x /usr/local/bin/start-app.sh
+
 # 创建应用目录结构
 RUN mkdir -p /app/{code,data,config,logs}
 
-# 暴露端口
-# 8080 - 应用端口
-# 7681 - ttyd Web 终端
-EXPOSE 8080 7681
+# PG / pgweb 默认配置(可被 UserApp env 覆盖)
+# POSTGRES_PASSWORD 不设默认(敏感),由 UserApp env 提供;start-app.sh 兜底 "app"
+ENV PGDATA=/app/data/pg \
+    POSTGRES_USER=app \
+    POSTGRES_DB=app \
+    PGWEB_PORT=8081
 
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+# 暴露端口:8080 应用 / 7681 ttyd / 8081 pgweb / 5432 PostgreSQL(仅容器内)
+EXPOSE 8080 7681 8081 5432
 
-# 启动命令
-CMD ["/usr/local/bin/start-ttyd.sh"]
+# ENTRYPOINT:start-app.sh 起 PG+pgweb+ttyd(supervisor)+ 用户 command
+# CMD 被 UserApp 的 command 覆盖(作为 args 传给 start-app.sh)
+ENTRYPOINT ["/usr/local/bin/start-app.sh"]
+CMD ["sleep", "infinity"]
