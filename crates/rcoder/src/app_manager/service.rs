@@ -151,7 +151,9 @@ impl AppService {
             }
         }
 
-        // 0.5 校验端口：HTTP 端口 ≤ 1（access 只报单个 path；gateway 模式 HTTPRoute 也仅支持单 HTTP 端口）
+        // 0.5 校验端口：HTTP 端口数上限放开（app-runtime 镜像单容器带 pgweb 8081 + ttyd 7681 + 用户应用端口）
+        // Pingora path 路由 /proxy/apps/{app_id}/{port}/ 按 (app_id, port) 区分，天然支持多 HTTP 端口
+        // gateway 模式（HTTPRoute）仍只支持单 HTTP，在 k8s_deployment 侧单独拦截（这里不拦，让 Pingora 模式可用）
         let http_port_count = request
             .ports
             .as_ref()
@@ -161,9 +163,10 @@ impl AppService {
                     .count()
             })
             .unwrap_or(0);
-        if http_port_count > 1 {
+        const MAX_HTTP_PORTS: usize = 8;
+        if http_port_count > MAX_HTTP_PORTS {
             return Err(AppOperationError::Validation(format!(
-                "at most 1 HTTP port allowed (got {http_port_count}); multi HTTP port support pending"
+                "at most {MAX_HTTP_PORTS} HTTP ports allowed (got {http_port_count})"
             )));
         }
         // 0.5b 端口号唯一：避免 K8s annotation 解码歧义（同 port 不同 type 会被 HashMap 折叠）
@@ -505,6 +508,123 @@ impl AppService {
             return Err(map_io_error("failed to clear storage", e, false));
         }
         info!("[APP] 已清空应用存储: {}", app_id);
+        Ok(())
+    }
+
+    /// 重置 app 容器内 PG 密码(rcoder exec 容器内 psql ALTER USER,本地 trust 认证绕过当前密码)。
+    /// 解决"用户忘记密码进不去 pgweb"的死锁(pgweb 要当前密码,rcoder 用容器内 trust 免密)。
+    pub async fn reset_db_password(
+        &self,
+        app_id: &str,
+        req: ResetDbPasswordRequest,
+    ) -> AppResult<()> {
+        validate_app_id(app_id)?;
+        // exec psql 需活容器(app Running);Stopped/Starting 等给友好错误而非 exec 失败
+        let status = self.fetch_runtime_status_or_err(app_id).await?;
+        if status.phase != "Running" {
+            return Err(AppOperationError::InvalidState(format!(
+                "app {app_id} not running (phase={}), exec psql 需活容器",
+                status.phase
+            )));
+        }
+        if req.new_password.is_empty() {
+            return Err(AppOperationError::Validation(
+                "new_password must not be empty".to_string(),
+            ));
+        }
+        // 容器内 sh 展开 $POSTGRES_USER(镜像 ENV,create 时用户 env 覆盖);rcoder 无状态不知值。
+        // psql -U $POSTGRES_USER 本地 trust 认证(start-app.sh initdb --auth-local=trust)免密。
+        // SQL 字符串里 ' 转义为 ''(防注入)。ON_ERROR_STOP=1:出错 exit≠0。
+        let safe_pw = req.new_password.replace('\'', "''");
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                r#"psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "ALTER USER \"$POSTGRES_USER\" WITH PASSWORD '{safe_pw}'""#,
+            ),
+        ];
+        let r = self
+            .runtime
+            .exec(app_id, cmd)
+            .await
+            .map_err(|e| {
+                map_runtime_error(
+                    &format!("[APP] reset_db_password failed app_id={app_id}"),
+                    e,
+                )
+            })?;
+        if r.exit_code != 0 {
+            return Err(AppOperationError::Backend(format!(
+                "reset password failed (exit {}): {}",
+                r.exit_code,
+                r.stderr.trim()
+            )));
+        }
+        info!("[APP] PG 密码已重置: {}", app_id);
+        Ok(())
+    }
+
+    /// 新建 PG 库(rcoder exec 容器内 psql CREATE DATABASE)。API 化建库(Java/CI 自动化)。
+    pub async fn create_database(
+        &self,
+        app_id: &str,
+        req: CreateDatabaseRequest,
+    ) -> AppResult<()> {
+        validate_app_id(app_id)?;
+        let status = self.fetch_runtime_status_or_err(app_id).await?;
+        if status.phase != "Running" {
+            return Err(AppOperationError::InvalidState(format!(
+                "app {app_id} not running (phase={}), exec psql 需活容器",
+                status.phase
+            )));
+        }
+        validate_pg_identifier(&req.database)?;
+        if let Some(owner) = &req.owner {
+            validate_pg_identifier(owner)?;
+        }
+        // CREATE DATABASE "{db}"[ OWNER "{owner}"] —— 双引号 PG 标识符," 转义为 ""
+        let safe_db = req.database.replace('"', "\"\"");
+        let owner_clause = req
+            .owner
+            .as_ref()
+            .map(|o| format!(" OWNER \"{}\"", o.replace('"', "\"\"")))
+            .unwrap_or_default();
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                r#"psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE "{safe_db}"{owner_clause}'"#,
+            ),
+        ];
+        let r = self
+            .runtime
+            .exec(app_id, cmd)
+            .await
+            .map_err(|e| {
+                map_runtime_error(
+                    &format!("[APP] create_database failed app_id={app_id}"),
+                    e,
+                )
+            })?;
+        if r.exit_code != 0 {
+            // 库已存在(duplicate_database)→ AlreadyExists;其他 → Backend
+            let msg = format!("{} {}", r.stdout, r.stderr).to_lowercase();
+            if msg.contains("already exists") || msg.contains("duplicate") {
+                return Err(AppOperationError::AlreadyExists(format!(
+                    "database {} already exists",
+                    req.database
+                )));
+            }
+            return Err(AppOperationError::Backend(format!(
+                "create database failed (exit {}): {}",
+                r.exit_code,
+                r.stderr.trim()
+            )));
+        }
+        info!(
+            "[APP] PG 库已创建: {} (app_id={})",
+            req.database, app_id
+        );
         Ok(())
     }
 
@@ -1710,6 +1830,35 @@ fn validate_app_id(app_id: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// 校验 PG 标识符（数据库名 / 用户名）：首字符字母或下划线，其余字母/数字/下划线，≤63 字符。
+/// 防 SQL 注入（标识符进双引号，但严格白名单更稳）。
+fn validate_pg_identifier(name: &str) -> AppResult<()> {
+    if name.is_empty() || name.len() > 63 {
+        return Err(AppOperationError::Validation(
+            "PG identifier must be 1..=63 chars".to_string(),
+        ));
+    }
+    match name.chars().next() {
+        Some(first) if !(first.is_ascii_alphabetic() || first == '_') => {
+            return Err(AppOperationError::Validation(
+                "PG identifier must start with letter or '_'".to_string(),
+            ));
+        }
+        None => {
+            return Err(AppOperationError::Validation(
+                "PG identifier empty".to_string(),
+            ))
+        }
+        _ => {}
+    }
+    if !name.chars().skip(1).all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(AppOperationError::Validation(
+            "PG identifier: only [a-zA-Z0-9_] allowed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// 从 PortConfig 列表提取 HTTP 端口号（供 Pingora backend 注册，create/update 共用）
 fn http_port_numbers(ports: &Option<Vec<PortConfig>>) -> Vec<u16> {
     ports
@@ -1878,6 +2027,22 @@ impl super::AppServiceTrait for AppService {
 
     async fn delete_app_storage(&self, app_id: &str) -> AppResult<()> {
         self.delete_app_storage(app_id).await
+    }
+
+    async fn reset_db_password(
+        &self,
+        app_id: &str,
+        request: ResetDbPasswordRequest,
+    ) -> AppResult<()> {
+        self.reset_db_password(app_id, request).await
+    }
+
+    async fn create_database(
+        &self,
+        app_id: &str,
+        request: CreateDatabaseRequest,
+    ) -> AppResult<()> {
+        self.create_database(app_id, request).await
     }
 
     async fn query_storage(

@@ -42,10 +42,24 @@ pub enum ContainerRuntimeError {
 
     #[error("Docker error: {0}")]
     DockerError(String),
+
+    #[error("Container exec failed: {0}")]
+    ContainerExecError(String),
 }
 
 /// Result type for container operations
 pub type ContainerRuntimeResult<T> = Result<T, ContainerRuntimeError>;
+
+/// exec 命令执行结果(UserApp 容器内跑命令的输出)
+#[derive(Debug, Clone)]
+pub struct ExecResult {
+    /// 标准输出
+    pub stdout: String,
+    /// 标准错误
+    pub stderr: String,
+    /// 退出码(0 = 成功;-1 表示无法获取)
+    pub exit_code: i64,
+}
 
 /// Container runtime status
 #[derive(Debug, Clone, PartialEq)]
@@ -683,6 +697,19 @@ pub trait ContainerRuntime: Send + Sync {
         let _ = (app_id, tail);
         Err(ContainerRuntimeError::ConfigurationError(
             "stream_app_logs not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// 在 UserApp 容器内执行命令（exec）。
+    ///
+    /// 用于数据库管理等场景（reset-password / create-database：在 app 容器内跑 psql，
+    /// 利用本地 trust 认证绕过当前密码）。默认不支持（返回 ConfigurationError），
+    /// DockerRuntime 用 bollard exec、KubernetesRuntime 用 kube-rs exec 实现。
+    /// `command` 是完整命令（如 `["sh","-c","psql -c ..."]`），容器内 sh 可展开镜像 ENV。
+    async fn exec(&self, app_id: &str, command: Vec<String>) -> ContainerRuntimeResult<ExecResult> {
+        let _ = (app_id, command);
+        Err(ContainerRuntimeError::ConfigurationError(
+            "exec not supported by this runtime".to_string(),
         ))
     }
 

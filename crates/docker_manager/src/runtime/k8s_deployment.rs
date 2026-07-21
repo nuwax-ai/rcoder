@@ -358,8 +358,13 @@ impl KubernetesRuntime {
             name: APP_CONTAINER_NAME.to_string(),
             image: Some(image),
             image_pull_policy: Some("IfNotPresent".to_string()),
-            command: params.command.clone(),
-            args: params.args.clone(),
+            // K8s:command 不设 → 用镜像 ENTRYPOINT(app-runtime 镜像 = start-app.sh,
+            // 负责起 PG/pgweb/ttyd 后 exec 用户 command)。
+            // args = 用户 command(等同 docker CMD 语义:有 ENTRYPOINT 时作其参数,
+            // 无 ENTRYPOINT 时(如 node:20-alpine)docker 自动作命令运行)。
+            // 这样 app-runtime 镜像的 ENTRYPOINT 生效跑内置服务,普通镜像用户 command 直接运行。
+            command: None,
+            args: params.command.clone(),
             env,
             env_from,
             ports: if ports.is_empty() { None } else { Some(ports) },
@@ -1081,6 +1086,108 @@ impl KubernetesRuntime {
                 }
             })
             .collect())
+    }
+
+    /// 在 app Pod 内执行命令(kubectl exec 等价):Pod 定位(label)→ Api::exec → AttachedProcess。
+    /// 用于数据库管理(reset-password / create-database 跑 psql)。
+    /// stdout/stderr 借 &mut self 顺序读(各自独立 DuplexStream,顺序不丢);exit code 从 Status 取。
+    pub async fn app_exec(
+        &self,
+        app_id: &str,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        use kube::api::AttachParams;
+        use tokio::io::AsyncReadExt;
+
+        // 解析 exec 退出码:Status.reason == "NonZeroExitCode" 且 details.causes[] 有
+        // reason == "ExitCode"(message 是退出码字符串)。无 NonZeroExitCode → 0。
+        // 不用 status.code(那是 HTTP 状态码,非命令退出码)。
+        fn parse_exit(status: k8s_openapi::apimachinery::pkg::apis::meta::v1::Status) -> i64 {
+            // Status.reason == "NonZeroExitCode" 且 details.causes[] 有 reason == "ExitCode"
+            // (其 message 是退出码字符串)。无 NonZeroExitCode → 0。
+            if status.reason.as_deref() == Some("NonZeroExitCode") {
+                if let Some(details) = &status.details {
+                    if let Some(causes) = &details.causes {
+                        for cause in causes {
+                            if cause.reason.as_deref() == Some("ExitCode") {
+                                if let Some(msg) = &cause.message {
+                                    if let Ok(code) = msg.parse::<i64>() {
+                                        return code;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            0
+        }
+
+        // 1. Pod 定位(复用 app_logs 的 label selector)
+        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
+        let pods = self
+            .pods_api()
+            .list(&lp)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("list pods for exec: {e}")))?;
+        let Some(pod_name) = pods
+            .items
+            .into_iter()
+            .next()
+            .and_then(|p| p.metadata.name.clone())
+        else {
+            // exec 是写操作,需活 Pod;无 Pod(app stopped)→ ContainerNotFound
+            return Err(ContainerRuntimeError::ContainerNotFound(format!(
+                "no running pod for app {app_id}"
+            )));
+        };
+
+        // 2. exec(指定 app 容器,stdout+stderr,非 tty;调大 buffer 防 psql 输出反压)
+        let ap = AttachParams::default()
+            .container(APP_CONTAINER_NAME)
+            .stdout(true)
+            .stderr(true)
+            .stdin(false)
+            .tty(false)
+            .max_stdout_buf_size(1024 * 1024)
+            .max_stderr_buf_size(1024 * 1024);
+        let mut attached = self
+            .pods_api()
+            .exec(&pod_name, command, &ap)
+            .await
+            .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("exec: {e}")))?;
+
+        // 3. take_status 先移出(免后续 stdout/stderr 借用 &mut self 冲突)
+        let mut status_fut = attached.take_status();
+
+        // 4. 顺序读 stdout → stderr(借 &mut self,不能并发;各自独立 DuplexStream,顺序不丢)
+        let mut stdout = String::new();
+        if let Some(mut r) = attached.stdout() {
+            let _ = r.read_to_string(&mut stdout).await;
+        }
+        let mut stderr = String::new();
+        if let Some(mut r) = attached.stderr() {
+            let _ = r.read_to_string(&mut stderr).await;
+        }
+        // readers 出作用域 drop(join 前 drop,防 DuplexStream 满死锁)
+
+        // 5. exit code
+        let exit_code = if let Some(fut) = status_fut.as_mut() {
+            fut.await.map(parse_exit).unwrap_or(0)
+        } else {
+            0
+        };
+
+        // 6. join 收尾(reader 已 drop)
+        if let Err(e) = attached.join().await {
+            tracing::debug!("[K8S-APP] exec join: {e}");
+        }
+
+        Ok(container_runtime_api::ExecResult {
+            stdout,
+            stderr,
+            exit_code,
+        })
     }
 
     /// 启动日志流（follow）：返回 mpsc::Receiver。内部 spawn 任务读 K8s `log_stream(follow)`，

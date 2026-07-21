@@ -154,7 +154,7 @@ rust-embed = "8.0"
 zstd = "0.13"
 
 # Kubernetes
-kube = { version = "4.0", features = ["runtime", "client", "kube-runtime", "config"] }
+kube = { version = "4.0", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 
 

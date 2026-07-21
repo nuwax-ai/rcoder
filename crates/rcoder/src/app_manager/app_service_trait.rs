@@ -52,6 +52,20 @@ pub trait AppServiceTrait: Send + Sync {
     /// 清空应用持久存储（仅当 app 已 delete 时允许，否则 INVALID_STATE）
     async fn delete_app_storage(&self, app_id: &str) -> AppResult<()>;
 
+    /// 重置 app 容器内 PG 密码（exec psql ALTER USER，本地 trust 认证绕过当前密码）
+    async fn reset_db_password(
+        &self,
+        app_id: &str,
+        request: ResetDbPasswordRequest,
+    ) -> AppResult<()>;
+
+    /// 新建 PG 库（exec psql CREATE DATABASE）
+    async fn create_database(
+        &self,
+        app_id: &str,
+        request: CreateDatabaseRequest,
+    ) -> AppResult<()>;
+
     /// 分页查询持久存储（强制分页，无全量模式）
     async fn query_storage(
         &self,

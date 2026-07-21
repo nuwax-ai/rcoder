@@ -654,6 +654,88 @@ impl ContainerRuntime for DockerRuntime {
         Ok(out)
     }
 
+    /// 在 app 容器内执行命令(docker exec):create_exec → start_exec(读 LogOutput)→ inspect_exec(exit code)。
+    /// 用于数据库管理(reset-password / create-database 跑 psql)等场景。
+    async fn exec(
+        &self,
+        app_id: &str,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        use bollard::container::LogOutput;
+        use bollard::exec::{CreateExecOptions, StartExecResults};
+        use futures_util::StreamExt;
+
+        let name = app_deployment_name(app_id);
+        let client = self.inner.get_docker_client();
+
+        // 1. create exec(容器不存在 → ContainerNotFound,与 get_deployment_status 404 处理一致)
+        let exec = client
+            .create_exec(
+                &name,
+                CreateExecOptions {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(command),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| match e {
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                } => ContainerRuntimeError::ContainerNotFound(name.clone()),
+                _ => ContainerRuntimeError::ContainerExecError(format!("create_exec: {e}")),
+            })?;
+
+        // 2. start exec + 读输出流(LogOutput 分桶 stdout/stderr,同 get_app_logs)
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        match client
+            .start_exec(&exec.id, None)
+            .await
+            .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("start_exec: {e}")))?
+        {
+            StartExecResults::Attached { mut output, .. } => {
+                while let Some(item) = output.next().await {
+                    match item {
+                        Ok(LogOutput::StdOut { message })
+                        | Ok(LogOutput::Console { message }) => {
+                            stdout.push_str(&String::from_utf8_lossy(&message));
+                        }
+                        Ok(LogOutput::StdErr { message }) => {
+                            stderr.push_str(&String::from_utf8_lossy(&message));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(ContainerRuntimeError::ContainerExecError(format!(
+                                "stream: {e}"
+                            )))
+                        }
+                    }
+                }
+            }
+            StartExecResults::Detached => {
+                return Err(ContainerRuntimeError::ContainerExecError(
+                    "unexpected Detached".into(),
+                ));
+            }
+        }
+
+        // 3. exit code(stream 结束后 inspect 单独取)
+        let inspect = client
+            .inspect_exec(&exec.id)
+            .await
+            .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("inspect_exec: {e}")))?;
+        let exit_code = inspect.exit_code.unwrap_or(-1);
+
+        Ok(container_runtime_api::ExecResult {
+            stdout,
+            stderr,
+            exit_code,
+        })
+    }
+
     async fn stream_app_logs(
         &self,
         app_id: &str,

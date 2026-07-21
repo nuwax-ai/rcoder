@@ -1719,6 +1719,14 @@ impl ContainerRuntime for KubernetesRuntime {
         self.app_events(app_id).await
     }
 
+    async fn exec(
+        &self,
+        app_id: &str,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        self.app_exec(app_id, command).await
+    }
+
     async fn validate_app_prerequisites(&self) -> ContainerRuntimeResult<()> {
         // RBAC 探测：list deployments（limit 1）。403 = ClusterRole 缺 apps/deployments 权限。
         // 明确报错指向部署侧 RBAC，避免创建 app 时静默 403。
