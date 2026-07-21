@@ -8,15 +8,19 @@ use std::collections::HashMap;
 
 /// 容器路径模板的默认值
 fn default_container_path_template() -> String {
-    format!("{}{{project_id}}", crate::paths::WORKSPACE_ROOT)
+    std::path::PathBuf::from(crate::paths::WORKSPACE_ROOT)
+        .join("{project_id}")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Computer Agent Runner 容器路径模板的默认值
 fn default_computer_agent_runner_container_path_template() -> String {
-    format!(
-        "{}{{user_id}}/{{project_id}}",
-        crate::paths::COMPUTER_WORKSPACE_ROOT
-    )
+    std::path::PathBuf::from(crate::paths::COMPUTER_WORKSPACE_ROOT)
+        .join("{user_id}")
+        .join("{project_id}")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// 容器工作目录的默认值
