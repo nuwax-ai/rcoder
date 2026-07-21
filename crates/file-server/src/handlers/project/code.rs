@@ -13,12 +13,13 @@ use crate::service::code as code_service;
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SpecifiedBody {
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub project_id: String,
     pub code_version: String,
     pub files: Vec<code_service::FileOp>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub tenant_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub space_id: Option<String>,
     #[serde(default)]
     pub isolation_type: Option<String>,
@@ -67,12 +68,13 @@ pub(crate) async fn specified_files_update(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AllFilesBody {
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub project_id: String,
     pub code_version: String,
     pub files: Vec<code_service::FileEntry>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub tenant_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub space_id: Option<String>,
     #[serde(default)]
     pub isolation_type: Option<String>,

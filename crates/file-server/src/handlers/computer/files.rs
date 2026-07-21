@@ -20,9 +20,9 @@ use super::{
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DeleteWorkspaceBody {
-    #[serde(deserialize_with = "super::deserialize_id_string")]
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     user_id: String,
-    #[serde(deserialize_with = "super::deserialize_id_string")]
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     c_id: String,
 }
 
@@ -125,9 +125,9 @@ pub(crate) async fn delete_workspace(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FilesUpdateBody {
-    #[serde(deserialize_with = "super::deserialize_id_string")]
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     user_id: String,
-    #[serde(deserialize_with = "super::deserialize_id_string")]
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     c_id: String,
     files: Vec<code_service::FileOp>,
     #[serde(default)]

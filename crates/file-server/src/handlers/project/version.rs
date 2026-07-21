@@ -16,11 +16,12 @@ use crate::service::{project as project_service, version as version_service};
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BackupVersionBody {
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub project_id: String,
     pub code_version: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub tenant_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub space_id: Option<String>,
     #[serde(default)]
     pub isolation_type: Option<String>,
@@ -67,12 +68,13 @@ pub(crate) async fn backup_current_version(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RollbackBody {
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub project_id: String,
     pub code_version: String,
     pub rollback_to: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub tenant_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub space_id: Option<String>,
     #[serde(default)]
     pub isolation_type: Option<String>,
@@ -118,6 +120,7 @@ pub(crate) async fn rollback_version(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExportBody {
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub project_id: String,
     pub code_version: String,
     #[serde(default)]
@@ -125,9 +128,9 @@ pub(crate) struct ExportBody {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub config: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub tenant_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub space_id: Option<String>,
     #[serde(default)]
     pub isolation_type: Option<String>,

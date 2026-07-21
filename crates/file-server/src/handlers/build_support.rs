@@ -60,6 +60,7 @@ pub(super) fn copy_dir_all(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ParseErrorBody {
     #[allow(dead_code)]
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     project_id: String,
     error_message: String,
 }

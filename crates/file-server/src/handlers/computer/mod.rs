@@ -16,20 +16,8 @@ use serde::Deserialize;
 
 use super::multipart::{file_field, text_field, validate_zip_ext};
 
-/// 兼容整数 + 字符串 deserializer (Java 后端可能传 userId: 6 或 "6")。
-/// 用法: #[serde(deserialize_with = "super::deserialize_id_string")]
-pub(crate) fn deserialize_id_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-    let v = serde_json::Value::deserialize(deserializer)?;
-    match v {
-        serde_json::Value::String(s) => Ok(s),
-        serde_json::Value::Number(n) => Ok(n.to_string()),
-        _ => Err(Error::custom("expected string or number")),
-    }
-}
+// ID 字段反序列化 helper (deserialize_id_string / deserialize_optional_id_string) 已提升至
+// `crate::extract`, 供 computer / project 等所有 handler 共用。
 
 pub(crate) mod archive;
 pub(crate) mod exec;

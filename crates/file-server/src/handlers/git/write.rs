@@ -392,3 +392,48 @@ pub(crate) async fn revert(
         }))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 关键回归: git 写接口 (add/commit/discard/...) 经 `#[serde(flatten)]` 复用 GitWriteBody。
+    /// serde flatten 会把字段收集到 Map 再二次反序列化, 是 deserialize_with 失效的已知坑区。
+    /// 此测试验证 flatten 下整数 ID (Java bigint, 如 projectId:17) 仍被正确转 String。
+    #[test]
+    fn flatten_git_write_body_accepts_integer_ids() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Input {
+            #[serde(flatten)]
+            base: GitWriteBody,
+            message: String,
+        }
+
+        // 整数 ID 经 flatten 传递
+        let body: Input = serde_json::from_str(
+            r#"{"workspaceType":"project","projectId":17,"userId":5,"tenantId":9,"message":"m"}"#,
+        )
+        .expect("flatten + integer ids must deserialize");
+        assert_eq!(body.base.workspace_type, "project");
+        assert_eq!(body.base.project_id.as_deref(), Some("17"));
+        assert_eq!(body.base.user_id.as_deref(), Some("5"));
+        assert_eq!(body.base.tenant_id.as_deref(), Some("9"));
+        assert_eq!(body.message, "m");
+
+        // 字符串 ID 不回归 (原有行为)
+        let body: Input = serde_json::from_str(
+            r#"{"workspaceType":"computer","userId":"u","cId":"c","message":"m"}"#,
+        )
+        .expect("string ids must still deserialize");
+        assert_eq!(body.base.workspace_type, "computer");
+        assert_eq!(body.base.user_id.as_deref(), Some("u"));
+        assert_eq!(body.base.c_id.as_deref(), Some("c"));
+
+        // ID 缺失 (flatten 下 default 仍生效 → None)
+        let body: Input =
+            serde_json::from_str(r#"{"workspaceType":"project","message":"m"}"#).unwrap();
+        assert!(body.base.project_id.is_none());
+        assert!(body.base.tenant_id.is_none());
+    }
+}

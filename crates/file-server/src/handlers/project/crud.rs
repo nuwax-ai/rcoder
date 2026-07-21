@@ -150,11 +150,13 @@ pub(crate) async fn delete_project(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreateProjectBody {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_id_string")]
     #[schema(required = true)]
     pub project_id: String,
     pub template_type: Option<String>,
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub tenant_id: Option<String>,
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub space_id: Option<String>,
     pub isolation_type: Option<String>,
 }
@@ -194,23 +196,25 @@ pub(crate) async fn create_project(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CopyProjectBody {
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub source_project_id: String,
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub target_project_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub tenant_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub space_id: Option<String>,
     #[serde(default)]
     pub isolation_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub source_tenant_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub source_space_id: Option<String>,
     #[serde(default)]
     pub source_isolation_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub target_tenant_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
     pub target_space_id: Option<String>,
     #[serde(default)]
     pub target_isolation_type: Option<String>,
