@@ -123,7 +123,7 @@ fn first_config_value(npmrc: &str, key: &str) -> Option<String> {
 
 /// 清理 package.json + pnpm-workspace.yaml + .npmrc 中与 build-script 互斥的配置
 /// (对齐 nuwax sanitizePnpmBuiltDependenciesConfig)。
-async fn sanitize_pnpm_built_dependencies_config(project_dir: &Path) -> AppResult<()> {
+pub(crate) async fn sanitize_pnpm_built_dependencies_config(project_dir: &Path) -> AppResult<()> {
     sanitize_package_json_built_deps(project_dir).await?;
     sanitize_pnpm_workspace_built_deps(project_dir).await?;
     sanitize_npmrc_built_deps(&project_dir.join(".npmrc")).await?;

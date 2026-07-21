@@ -26,6 +26,15 @@ pub(super) async fn install(
     if options.prefer_offline {
         args.push("--prefer-offline".to_string());
     }
+    // file-server 非 TTY (stdin null) spawn pnpm: node_modules 与 lockfile 不一致时, pnpm 要
+    // 交互确认 purge modules 目录, 无 TTY 则 abort (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY)
+    // → install 永久失败、vite 起不来。confirmModulesPurge=false 跳过确认 (对齐 pnpm 源码
+    // deps-installer/.../validateModules.ts:152 + PnpmError hint 推荐; CLI 用 camelCase,
+    // .npmrc 才用 kebab confirm-modules-purge)。兜底所有 install 路径 (dev_server/exec/build)。
+    // 另一解法是 CI=true (源码 index.ts: confirmModulesPurge && !ci), 但 file-server
+    // env_remove(CI), 且 CI 模式会影响 reporter, 故走精确配置。
+    // 不用 --config.dangerously-allow-all-builds: pnpm 10.x 下它与内置 neverBuiltDependencies 冲突。
+    args.push("--config.confirmModulesPurge=false".to_string());
     args.extend(options.extra_args.iter().cloned());
 
     let mut command = Command::new("pnpm");

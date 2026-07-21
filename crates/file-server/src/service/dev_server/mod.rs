@@ -420,7 +420,13 @@ impl DevServerManager {
     }
 
     async fn write_npmrc(&self, project_path: &Path) -> AppResult<()> {
-        crate::service::pnpm_config::create_pnpm_npmrc(project_path).await
+        // create .npmrc 模板 + sanitize built-deps 冲突 (对齐 exec.rs 的清理逻辑)。
+        // 不调 ensure_pnpm_install_config: 其 append 会加 dangerously-allow-all-builds=true,
+        // 在 pnpm 10.x 下与内置 neverBuiltDependencies 冲突 (ERR_PNPM_CONFIG_CONFLICT_BUILT_DEPENDENCIES),
+        // 而 vite dev 的依赖 (esbuild) 走可选依赖机制、不需 build 脚本。NO_TTY 由 pnpm cli 的
+        // --config.confirmModulesPurge=false 兜底 (见 pnpm/cli.rs)。
+        crate::service::pnpm_config::create_pnpm_npmrc(project_path).await?;
+        crate::service::pnpm_config::sanitize_pnpm_built_dependencies_config(project_path).await
     }
 
     /// 全量优雅停止 (供 main.rs graceful shutdown 调用):
