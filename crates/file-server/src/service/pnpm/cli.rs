@@ -66,13 +66,13 @@ pub(super) async fn install(
 
     let stdout_task = tokio::spawn(async move {
         match stdout {
-            Some(stream) => read_stream(stream, stdout_logs.as_ref(), false).await,
+            Some(stream) => read_stream(stream, stdout_logs.as_ref()).await,
             None => StreamResult::default(),
         }
     });
     let stderr_task = tokio::spawn(async move {
         match stderr {
-            Some(stream) => read_stream(stream, stderr_logs.as_ref(), true).await,
+            Some(stream) => read_stream(stream, stderr_logs.as_ref()).await,
             None => StreamResult::default(),
         }
     });
@@ -171,7 +171,14 @@ struct StreamResult {
     error: Option<String>,
 }
 
-async fn read_stream<R>(stream: R, logs: Option<&LogFiles>, parse_protocol: bool) -> StreamResult
+/// 逐行读取 pnpm 的 stdout/stderr, 解析 NDJSON 协议事件并按需落盘。
+///
+/// pnpm `--reporter=ndjson` 的输出分流: **正常事件** (scope/manifest/progress/link/
+/// hoist/stats/summary, 多为 debug 级) 走 **stdout**, 仅 `ERR_PNPM_*` 走 **stderr**。
+/// 故两流都必须经 observe_event 解析: 高频 debug 事件被 Suppressed 不落盘, 有用事件
+/// Rendered, 真错误计入 summary.error_codes/diagnostics 供失败分类。若只解析其中一流,
+/// 另一流的原始 JSON 会全部落盘 → 海量 debug 噪音 (实测单次 install 可产生 4000+ 行)。
+async fn read_stream<R>(stream: R, logs: Option<&LogFiles>) -> StreamResult
 where
     R: AsyncRead + Unpin,
 {
@@ -188,11 +195,7 @@ where
             }
         };
         push_bounded(&mut result.tail, &line);
-        let observed = if parse_protocol {
-            observe_event(&line, &mut result.summary)
-        } else {
-            ObservedLine::Unstructured
-        };
+        let observed = observe_event(&line, &mut result.summary);
         if write_logs && let Some(logs) = logs {
             let write_result = match observed {
                 ObservedLine::Rendered(rendered) => write_log_line(logs, &rendered).await,
