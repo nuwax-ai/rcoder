@@ -93,7 +93,9 @@ pub(crate) async fn get_logs(
     State(state): State<AppState>,
     Query(q): Query<GetLogsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let log_dir = resolve_computer_target(&state, &q.user_id, &q.c_id, None).await?.join(".logs");
+    let log_dir = resolve_computer_target(&state, &q.user_id, &q.c_id, None)
+        .await?
+        .join(".logs");
     let empty_resp = |msg: &str| {
         Json(json!({
             "success": true,

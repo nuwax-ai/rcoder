@@ -109,8 +109,8 @@ pub fn deserialize_id_string<'de, D>(deserializer: D) -> Result<String, D::Error
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
     use serde::Deserialize;
+    use serde::de::Error;
     match serde_json::Value::deserialize(deserializer)? {
         serde_json::Value::String(s) => Ok(s),
         serde_json::Value::Number(n) => Ok(n.to_string()),
@@ -119,14 +119,12 @@ where
 }
 
 /// `Option<String>` 版本, 用于可选 ID 字段 (tenant_id / space_id 等, 缺省为 None)。
-pub fn deserialize_optional_id_string<'de, D>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error>
+pub fn deserialize_optional_id_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
     use serde::Deserialize;
+    use serde::de::Error;
     match Option::<serde_json::Value>::deserialize(deserializer)? {
         None => Ok(None),
         Some(serde_json::Value::String(s)) => Ok(Some(s)),

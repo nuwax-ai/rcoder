@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
 use shared_types::ServiceType;
+use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
 use tracing::warn;
 
 use crate::error::{AppError, AppResult};

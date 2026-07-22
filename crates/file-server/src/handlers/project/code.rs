@@ -17,9 +17,15 @@ pub(crate) struct SpecifiedBody {
     pub project_id: String,
     pub code_version: String,
     pub files: Vec<code_service::FileOp>,
-    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
     pub tenant_id: Option<String>,
-    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
     pub space_id: Option<String>,
     #[serde(default)]
     pub isolation_type: Option<String>,
@@ -72,9 +78,15 @@ pub(crate) struct AllFilesBody {
     pub project_id: String,
     pub code_version: String,
     pub files: Vec<code_service::FileEntry>,
-    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
     pub tenant_id: Option<String>,
-    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
     pub space_id: Option<String>,
     #[serde(default)]
     pub isolation_type: Option<String>,

@@ -69,15 +69,30 @@ pub(super) async fn resolve(q: &GitQuery, state: &AppState) -> Result<(PathBuf, 
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GitWriteBody {
     pub workspace_type: String,
-    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
     pub project_id: Option<String>,
-    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
     pub user_id: Option<String>,
-    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
     pub c_id: Option<String>,
-    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
     pub tenant_id: Option<String>,
-    #[serde(default, deserialize_with = "crate::extract::deserialize_optional_id_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
     pub space_id: Option<String>,
     #[serde(default)]
     pub isolation_type: Option<String>,

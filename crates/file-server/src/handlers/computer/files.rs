@@ -75,8 +75,8 @@ pub(crate) async fn get_file_list(
     State(state): State<AppState>,
     Query(q): Query<UserCidQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let path =
-        resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref()).await?;
+    let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
+        .await?;
     // 对齐 nuwax: 目录不存在 → 返回空数组 (非报错)
     if !crate::service::fs_util::path_exists(&path).await? {
         return Ok(Json(json!({ "success": true, "files": [] })));
@@ -370,7 +370,8 @@ pub(crate) async fn import_project(
     let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     validate_zip_ext(file_name.as_deref())?;
-    let target_dir = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref()).await?;
+    let target_dir =
+        resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref()).await?;
     tokio::fs::create_dir_all(&target_dir).await?;
     let res = crate::service::computer_ws::import_project(&target_dir, data.path()).await?;
     Ok(Json(json!({

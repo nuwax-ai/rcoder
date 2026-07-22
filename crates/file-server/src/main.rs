@@ -10,11 +10,13 @@ async fn main() -> anyhow::Result<()> {
     let _log_guard = file_server::logging::init(&config)?;
     // 版本标识 (编译时注入, 日志确认镜像代码版本)
     tracing::info!("═══════════════════════════════════════════");
-    tracing::info!("🚀 file-server v{} starting — BUILD: {} @ {} (branch: {})",
+    tracing::info!(
+        "🚀 file-server v{} starting — BUILD: {} @ {} (branch: {})",
         env!("CARGO_PKG_VERSION"),
         env!("RCODER_BUILD_GIT_HASH"),
         env!("RCODER_BUILD_TIME"),
-        env!("RCODER_BUILD_GIT_BRANCH"));
+        env!("RCODER_BUILD_GIT_BRANCH")
+    );
     tracing::info!("═══════════════════════════════════════════");
     let address = format!("{}:{}", config.listen_host, config.port);
     let server = FileServer::builder(config).build()?;
