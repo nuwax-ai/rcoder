@@ -74,7 +74,7 @@ pub async fn create_app(
     State(state): State<Arc<AppManagerState>>,
     Json(request): Json<CreateAppRequest>,
 ) -> Result<Json<HttpResult<AppInfo>>, AppError> {
-    info!("[APP] 创建应用: {}", request.name);
+    info!("[APP] creating app: {}", request.name);
     let app_info = state.app_service.create_app(request).await?;
     Ok(Json(HttpResult::success(app_info)))
 }
@@ -94,7 +94,7 @@ pub async fn query_apps(
     State(state): State<Arc<AppManagerState>>,
     Json(request): Json<QueryAppsRequest>,
 ) -> Result<Json<HttpResult<PaginatedResponse<AppRuntimeInfo>>>, AppError> {
-    info!("[APP] 查询应用列表");
+    info!("[APP] querying apps");
     let response = state.app_service.query_apps(request).await?;
     Ok(Json(HttpResult::success(response)))
 }
@@ -114,7 +114,7 @@ pub async fn query_apps(
 pub async fn list_app_runtimes(
     State(state): State<Arc<AppManagerState>>,
 ) -> Result<Json<HttpResult<Vec<AppRuntimeInfo>>>, AppError> {
-    info!("[APP] 对账查询：列出所有应用运行时状态");
+    info!("[APP] reconcile: listing all app runtimes");
     let runtimes = state.app_service.list_app_runtimes().await?;
     Ok(Json(HttpResult::success(runtimes)))
 }
@@ -137,7 +137,7 @@ pub async fn get_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    info!("[APP] 获取应用运行时详情: {}", app_id);
+    info!("[APP] getting app runtime: {}", app_id);
     let runtime = state.app_service.get_app(&app_id).await?;
     Ok(Json(HttpResult::success(runtime)))
 }
@@ -165,7 +165,7 @@ pub async fn update_app(
     Path(app_id): Path<String>,
     Json(request): Json<UpdateAppRequest>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    info!("[APP] 更新应用配置: {}", app_id);
+    info!("[APP] updating app: {}", app_id);
     let runtime = state.app_service.update_app(&app_id, request).await?;
     Ok(Json(HttpResult::success(runtime)))
 }
@@ -193,7 +193,7 @@ pub async fn delete_app(
     let (purge, expected_rv) = body
         .map(|Json(r)| (r.purge.unwrap_or(false), r.expected_resource_version))
         .unwrap_or((false, None));
-    info!("[APP] 删除应用: {} (purge={})", app_id, purge);
+    info!("[APP] deleting app: {} (purge={})", app_id, purge);
     state
         .app_service
         .delete_app(&app_id, purge, expected_rv.as_deref())
@@ -223,7 +223,7 @@ pub async fn start_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    info!("[APP] 启动应用: {}", app_id);
+    info!("[APP] starting app: {}", app_id);
     let runtime = state.app_service.start_app(&app_id).await?;
     Ok(Json(HttpResult::success(runtime)))
 }
@@ -246,7 +246,7 @@ pub async fn stop_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    info!("[APP] 停止应用: {}", app_id);
+    info!("[APP] stopping app: {}", app_id);
     let runtime = state.app_service.stop_app(&app_id).await?;
     Ok(Json(HttpResult::success(runtime)))
 }
@@ -269,7 +269,7 @@ pub async fn restart_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    info!("[APP] 重启应用: {}", app_id);
+    info!("[APP] restarting app: {}", app_id);
     let runtime = state.app_service.restart_app(&app_id).await?;
     Ok(Json(HttpResult::success(runtime)))
 }
@@ -299,7 +299,7 @@ pub async fn get_app_logs(
     Path(app_id): Path<String>,
     Query(params): Query<LogParams>,
 ) -> Result<Json<HttpResult<Vec<LogEntry>>>, AppError> {
-    info!("[APP] 获取应用日志: {}", app_id);
+    info!("[APP] getting app logs: {}", app_id);
     let logs = state.app_service.get_app_logs(&app_id, params).await?;
     Ok(Json(HttpResult::success(logs)))
 }
@@ -322,7 +322,7 @@ pub async fn get_app_health(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<HealthInfo>>, AppError> {
-    info!("[APP] 获取应用健康状态: {}", app_id);
+    info!("[APP] getting app health: {}", app_id);
     let runtime = state.app_service.get_app(&app_id).await?;
     Ok(Json(HttpResult::success(health_from_runtime(&runtime))))
 }
@@ -345,7 +345,7 @@ pub async fn get_app_stats(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<ResourceStats>>, AppError> {
-    info!("[APP] 获取应用资源使用: {}", app_id);
+    info!("[APP] getting app stats: {}", app_id);
     let stats = state.app_service.get_app_stats(&app_id).await?;
     Ok(Json(HttpResult::success(stats)))
 }
@@ -368,7 +368,7 @@ pub async fn get_app_events(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<Vec<container_runtime_api::AppEventInfo>>>, AppError> {
-    info!("[APP] 获取应用事件: {}", app_id);
+    info!("[APP] getting app events: {}", app_id);
     let events = state.app_service.get_app_events(&app_id).await?;
     Ok(Json(HttpResult::success(events)))
 }
@@ -405,7 +405,7 @@ pub async fn get_app_file_logs(
 ) -> Result<Json<HttpResult<Vec<LogEntry>>>, AppError> {
     let tail = params.tail.unwrap_or(100);
     info!(
-        "[APP] 读取文件日志: {} path={} tail={}",
+        "[APP] reading file logs: {} path={} tail={}",
         app_id, params.path, tail
     );
     let logs = state
@@ -439,7 +439,7 @@ pub async fn upload_file(
     Path(app_id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Json<HttpResult<UploadResult>>, AppError> {
-    info!("[APP] 上传文件: {}", app_id);
+    info!("[APP] uploading file: {}", app_id);
 
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
@@ -517,7 +517,7 @@ pub async fn list_files(
     Path(app_id): Path<String>,
     Query(q): Query<ListFilesQuery>,
 ) -> Result<Json<HttpResult<Vec<FileInfo>>>, AppError> {
-    info!("[APP] 列出文件: {} (subpath={:?})", app_id, q.path);
+    info!("[APP] listing files: {} (subpath={:?})", app_id, q.path);
     let files = state
         .app_service
         .list_files(&app_id, q.path.as_deref())
@@ -551,7 +551,7 @@ pub async fn delete_file(
     Path(app_id): Path<String>,
     Json(request): Json<DeleteFileRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    info!("[APP] 删除文件: {}/{}", app_id, request.path);
+    info!("[APP] deleting file: {}/{}", app_id, request.path);
     state
         .app_service
         .delete_file(&app_id, &request.path)
@@ -579,7 +579,7 @@ pub async fn get_app_storage(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<StorageInfo>>, AppError> {
-    info!("[APP] 查询应用存储: {}", app_id);
+    info!("[APP] getting app storage: {}", app_id);
     let info = state.app_service.get_app_storage(&app_id).await?;
     Ok(Json(HttpResult::success(info)))
 }
@@ -601,7 +601,7 @@ pub async fn delete_app_storage(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    info!("[APP] 清空应用存储: {}", app_id);
+    info!("[APP] clearing app storage: {}", app_id);
     state.app_service.delete_app_storage(&app_id).await?;
     Ok(Json(HttpResult::success("存储已清空".to_string())))
 }
@@ -625,7 +625,7 @@ pub async fn reset_db_password(
     Path(app_id): Path<String>,
     Json(request): Json<ResetDbPasswordRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    info!("[APP] 重置 PG 密码: {}", app_id);
+    info!("[APP] resetting PG password: {}", app_id);
     state
         .app_service
         .reset_db_password(&app_id, request)
@@ -653,7 +653,7 @@ pub async fn create_database(
     Path(app_id): Path<String>,
     Json(request): Json<CreateDatabaseRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    info!("[APP] 新建 PG 库: {}", app_id);
+    info!("[APP] creating database: {}", app_id);
     state
         .app_service
         .create_database(&app_id, request)
@@ -678,7 +678,7 @@ pub async fn query_storage(
     Json(request): Json<QueryStorageRequest>,
 ) -> Result<Json<HttpResult<PaginatedResponse<StorageInfo>>>, AppError> {
     info!(
-        "[APP] 查询存储列表: page={} page_size={}",
+        "[APP] querying storage list: page={} page_size={}",
         request.page, request.page_size
     );
     let resp = state.app_service.query_storage(request).await?;
@@ -718,7 +718,7 @@ pub async fn stream_app_logs(
     Query(params): Query<LogStreamQuery>,
 ) -> Result<Response, AppError> {
     let tail = params.tail.unwrap_or(0);
-    info!("[APP] 日志 WS 流: {} (tail={})", app_id, tail);
+    info!("[APP] log WS stream: {} (tail={})", app_id, tail);
     let mut rx = state.app_service.stream_app_logs(&app_id, tail).await?;
     Ok(ws.on_upgrade(move |mut socket: WebSocket| async move {
         while let Some(entry) = rx.recv().await {

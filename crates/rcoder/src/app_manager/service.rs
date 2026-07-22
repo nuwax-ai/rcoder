@@ -10,7 +10,6 @@
 //! `/proxy/{port}` → 后端 host：Docker container_ip / K8s ClusterIP FQDN）或 Gateway
 //! （可选，K8s 建 HTTPRoute `/apps/{id}`）。TCP 初期不对外。Docker 模式建容器入主网络。
 
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,31 +23,28 @@ use uuid::Uuid;
 
 use container_runtime_api::{
     AppHealthCheck, AppPortSpec, AppResourceRequirements, ContainerCreateParams, ContainerRuntime,
-    ContainerRuntimeError, DeploymentStatus, ExposeType as RtExposeType,
-    HealthCheckType as RtHealthCheckType, HttpExpose,
-};
-use download_utils::{
-    ArchiveError, detect_file_type, extract_tar_gz, extract_zip, normalize_extracted_dir,
+    DeploymentStatus, ExposeType as RtExposeType, HttpExpose,
 };
 use rcoder_proxy::PingoraProxyService;
 use shared_types::ServiceType;
 
 use super::config::{AppAccessMode, AppManagerConfig};
 use super::models::*;
+use super::utils::*;
 
 /// 应用管理服务（Docker / K8s 统一）
 pub struct AppService {
-    config: AppManagerConfig,
-    runtime: Arc<dyn ContainerRuntime>,
+    pub(crate) config: AppManagerConfig,
+    pub(crate) runtime: Arc<dyn ContainerRuntime>,
     /// Pingora 代理（Docker 模式用于注册 HTTP backend；K8s 模式通常为 None）
-    pingora: Option<Arc<PingoraProxyService>>,
+    pub(crate) pingora: Option<Arc<PingoraProxyService>>,
     /// 路径解析器缓存（单例；Docker 模式将 rcoder 容器内路径解析为宿主机路径）
-    path_resolver: Cache<String, Arc<HostPathResolver>>,
+    pub(crate) path_resolver: Cache<String, Arc<HostPathResolver>>,
     /// Docker 模式 Pingora backend 端口登记（app_id → 注册的 HTTP 端口列表）
     ///
     /// 这是**操作副作用的临时缓存**（非业务元数据）：delete 时需要知道曾注册过哪些端口
     /// 才能清理 Pingora backend。rcoder 重启后丢失可接受（Docker 模式定位为开发环境）。
-    pingora_ports: DashMap<String, Vec<u16>>,
+    pub(crate) pingora_ports: DashMap<String, Vec<u16>>,
 }
 
 impl AppService {
@@ -64,11 +60,11 @@ impl AppService {
         // 初始化路径解析器（失败不致命，Docker 模式回退到容器内路径）
         match HostPathResolver::new().await {
             Ok(resolver) => {
-                info!("[APP] 路径解析器初始化成功");
+                info!("[APP] path resolver initialized");
                 path_resolver.insert("default".to_string(), Arc::new(resolver));
             }
             Err(e) => {
-                warn!("[APP] 路径解析器初始化失败，将使用容器内路径: {}", e);
+                warn!("[APP] path resolver init failed, using container path: {}", e);
             }
         }
 
@@ -76,8 +72,8 @@ impl AppService {
         // RBAC 缺失，而非运行时创建 app 才 403）。Docker 模式 trait 默认 Ok，跳过。
         if config.access_mode == AppAccessMode::Kubernetes {
             match runtime.validate_app_prerequisites().await {
-                Ok(_) => info!("[APP] K8s 前置校验通过（RBAC/apps/deployments 可访问）"),
-                Err(e) => warn!("[APP] K8s 启动前置校验失败，app 管理可能无法工作: {}", e),
+                Ok(_) => info!("[APP] K8s prerequisites validated (RBAC/apps/deployments accessible)"),
+                Err(e) => warn!("[APP] K8s prerequisites validation failed, app management may not work: {}", e),
             }
         }
 
@@ -86,7 +82,7 @@ impl AppService {
         if config.access_mode == AppAccessMode::Docker && config.http_expose == HttpExpose::Gateway
         {
             warn!(
-                "[APP] 无效组合 access_mode=docker + http_expose=gateway：Docker 无 HTTPRoute，gateway 模式不可用，HTTP 将不可访问；请设 RCODER_APP_HTTP_EXPOSE=pingora"
+                "[APP] invalid combo access_mode=docker + http_expose=gateway: Docker has no HTTPRoute, gateway mode unavailable, HTTP will be inaccessible; set RCODER_APP_HTTP_EXPOSE=pingora"
             );
         }
 
@@ -105,7 +101,7 @@ impl AppService {
             && let Err(e) = svc.rebuild_pingora_backends().await
         {
             warn!(
-                "[APP] Pingora backends 重建失败（重启后 HTTP 暂不可达，待下次 create/update 恢复）: {}",
+                "[APP] pingora backends rebuild failed (HTTP temporarily unreachable after restart, recovered on next create/update): {}",
                 e
             );
         }
@@ -130,7 +126,7 @@ impl AppService {
             None => format!("app-{}", &Uuid::new_v4().to_string()[..8]),
         };
         info!(
-            "[APP] 创建应用: {} ({}, mode={:?})",
+            "[APP] creating app: {} ({}, mode={:?})",
             request.name, app_id, self.config.access_mode
         );
 
@@ -205,7 +201,7 @@ impl AppService {
             )
         })?;
         info!(
-            "[APP] 应用资源创建成功: {} (container={})",
+            "[APP] app resources created: {} (container={})",
             app_id, container_info.container_name
         );
 
@@ -320,7 +316,7 @@ impl AppService {
             }
             if filters.name.is_some() || filters.created_at.is_some() {
                 warn!(
-                    "[APP] query_apps 的 name/created_at 过滤需要业务元数据，rcoder 无状态已忽略"
+                    "[APP] query_apps name/created_at filters require business metadata, rcoder is stateless, ignored"
                 );
             }
         }
@@ -399,7 +395,7 @@ impl AppService {
         let http_ports = http_port_numbers(&request.ports);
         self.register_pingora_backends(app_id, &http_ports, &info.container_ip)
             .await;
-        info!("[APP] 应用已更新: {}", app_id);
+        info!("[APP] app updated: {}", app_id);
         self.get_app(app_id).await
     }
 
@@ -423,7 +419,7 @@ impl AppService {
                 )));
             }
         }
-        info!("[APP] 删除应用: {} (purge={})", app_id, purge);
+        info!("[APP] deleting app: {} (purge={})", app_id, purge);
 
         // 1. Docker 模式：清理 Pingora backend
         self.unregister_pingora_backends(app_id).await;
@@ -445,69 +441,16 @@ impl AppService {
             if app_dir.exists()
                 && let Err(e) = Self::purge_dir_contents(&app_dir).await
             {
-                warn!("[APP] purge 清理应用目录失败 {:?}: {}", app_dir, e);
+                warn!("[APP] purge dir contents failed {:?}: {}", app_dir, e);
             }
-            info!("[APP] 已清空应用持久存储: {}", app_id);
+            info!("[APP] persistent storage cleared: {}", app_id);
         } else {
             info!(
-                "[APP] 保留应用持久存储（如需清空传 purge=true）: {}",
+                "[APP] retained persistent storage (pass purge=true to clear): {}",
                 app_id
             );
         }
 
-        Ok(())
-    }
-
-    // ===== 持久存储管理（v2 §5.4）=====
-    // 删应用默认保留数据；这组接口让 Java 显式管理残留存储。
-    // StorageInfo 不含 size_bytes——CephFS 上不能用 du（详见设计文档 §5.4）。
-
-    /// 查询单个应用的持久存储状态（O(1) stat，不递归）。
-    pub async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo> {
-        validate_app_id(app_id)?;
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        let metadata = tokio::fs::metadata(&app_dir).await.ok();
-        let exists = metadata.is_some();
-        let modified_at = metadata
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
-        let is_orphan = self.is_storage_orphan(app_id).await;
-        Ok(StorageInfo {
-            app_id: app_id.to_string(),
-            exists,
-            path: app_dir.to_string_lossy().to_string(),
-            modified_at,
-            is_orphan,
-        })
-    }
-
-    /// 清空应用的持久存储。安全约束：仅当 app 计算资源已不存在时允许（否则 INVALID_STATE）。
-    pub async fn delete_app_storage(&self, app_id: &str) -> AppResult<()> {
-        validate_app_id(app_id)?;
-        match self.runtime.get_deployment_status(app_id).await {
-            Ok(Some(_)) => {
-                return Err(AppOperationError::InvalidState(format!(
-                    "app {app_id} still exists, delete it before clearing storage (to avoid corrupting in-use data)"
-                )));
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("[APP] 查询应用状态失败 app_id={}: {}", app_id, e);
-                return Err(AppOperationError::Backend(format!(
-                    "failed to query app status: {e}"
-                )));
-            }
-        }
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        // K8s per-agent: app_dir = per-app PVC 根 (ceph-csi subvol 根), 清空内容不删根
-        // (删 subvol 根破坏 PV subvolumePath → pod 重启挂载异常)
-        if app_dir.exists()
-            && let Err(e) = Self::purge_dir_contents(&app_dir).await
-        {
-            return Err(map_io_error("failed to clear storage", e, false));
-        }
-        info!("[APP] 已清空应用存储: {}", app_id);
         Ok(())
     }
 
@@ -560,7 +503,7 @@ impl AppService {
                 r.stderr.trim()
             )));
         }
-        info!("[APP] PG 密码已重置: {}", app_id);
+        info!("[APP] PG password reset: {}", app_id);
         Ok(())
     }
 
@@ -622,147 +565,10 @@ impl AppService {
             )));
         }
         info!(
-            "[APP] PG 库已创建: {} (app_id={})",
+            "[APP] database created: {} (app_id={})",
             req.database, app_id
         );
         Ok(())
-    }
-
-    /// 清空目录内容 (逐子项 remove), 保留目录本身。
-    /// purge per-agent PVC 根 (ceph-csi subvol 根) 必须用此 —— `remove_dir_all` 删 subvol 根
-    /// 会破坏 PV `csi.volumeAttributes.subvolumePath` (PVC 仍在但 subvol 路径不存在 → pod 重启挂载异常)。
-    async fn purge_dir_contents(dir: &std::path::Path) -> std::io::Result<()> {
-        let mut rd = tokio::fs::read_dir(dir).await?;
-        while let Some(entry) = rd.next_entry().await? {
-            let p = entry.path();
-            if p.is_dir() {
-                tokio::fs::remove_dir_all(&p).await?;
-            } else {
-                tokio::fs::remove_file(&p).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// 分页查询持久存储（强制分页，无全量模式）。
-    /// 过滤：orphan_only、app_ids 生效；tenant_id/space_id 在无状态下不支持（rcoder 不持
-    /// app→租户映射），提供则 warn 忽略。
-    pub async fn query_storage(
-        &self,
-        request: QueryStorageRequest,
-    ) -> AppResult<PaginatedResponse<StorageInfo>> {
-        if request.page == 0 {
-            return Err(AppOperationError::Validation(
-                "page starts from 1".to_string(),
-            ));
-        }
-        if request.page_size == 0 || request.page_size > 100 {
-            return Err(AppOperationError::Validation(
-                "page_size must be in 1..=100".to_string(),
-            ));
-        }
-        let filters = request.filters.unwrap_or_default();
-        if filters.tenant_id.is_some() || filters.space_id.is_some() {
-            warn!(
-                "[APP] query_storage 的 tenant_id/space_id 过滤在无状态下不支持（rcoder 不持 app→租户映射），已忽略"
-            );
-        }
-        // 现有 app 集合（供 is_orphan），一次 list 调用
-        let existing: std::collections::HashSet<String> = self
-            .runtime
-            .list_deployments()
-            .await
-            .map_err(|e| map_runtime_error("[APP] list_deployments failed", e))?
-            .into_iter()
-            .map(|s| s.app_id)
-            .collect();
-        // 阶段2 per-app PVC: app 数据在各自 per-app PVC (rcoder 经挂根聚合访问), workspace_root
-        // 不再含 app 目录 → app 列表来自 list_deployments (existing, Deployment by label),
-        // 不 read_dir(workspace_root)。orphan 检测 (read_dir 找不在 Deployment 的目录) 在
-        // per-agent 模式失效 (数据跨 PVC); existing 内全为非 orphan。
-        let mut entries: Vec<String> = existing.iter().cloned().collect();
-        entries.sort();
-        let app_ids_filter = filters.app_ids.as_deref();
-        let filtered: Vec<String> = entries
-            .into_iter()
-            .filter(|app_id| {
-                if let Some(ids) = app_ids_filter
-                    && !ids.iter().any(|x| x == app_id)
-                {
-                    return false;
-                }
-                if filters.orphan_only.unwrap_or(false) && existing.contains(app_id) {
-                    return false;
-                }
-                true
-            })
-            .collect();
-        let total = filtered.len() as u64;
-        let page = request.page as usize;
-        let page_size = request.page_size as usize;
-        let start = page.saturating_sub(1) * page_size;
-        let paged: Vec<String> = filtered.into_iter().skip(start).take(page_size).collect();
-
-        let mut items = Vec::with_capacity(paged.len());
-        for app_id in paged {
-            let is_orphan = !existing.contains(&app_id);
-            // resolve 失败 (K8s per-app PVC 未就绪) 不中断整个列表: warn + 标记 not exist
-            let (exists, path, modified_at) = match self.get_container_app_dir(&app_id).await {
-                Ok(app_dir) => {
-                    let metadata = tokio::fs::metadata(&app_dir).await.ok();
-                    let modified_at = metadata
-                        .as_ref()
-                        .and_then(|m| m.modified().ok())
-                        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
-                    (metadata.is_some(), app_dir.to_string_lossy().to_string(), modified_at)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[APP] list storage resolve {} failed, mark not exist: {}",
-                        app_id,
-                        e
-                    );
-                    (false, String::new(), None)
-                }
-            };
-            items.push(StorageInfo {
-                app_id,
-                exists,
-                path,
-                modified_at,
-                is_orphan,
-            });
-        }
-        let total_pages = if total == 0 {
-            1
-        } else {
-            total.div_ceil(page_size as u64) as u32
-        };
-        Ok(PaginatedResponse {
-            items,
-            pagination: Pagination {
-                page: request.page,
-                page_size: request.page_size,
-                total,
-                total_pages,
-            },
-        })
-    }
-
-    /// 存储是否为孤儿（无对应运行应用）。Ok(None)=orphan；Ok(Some)/Err=非 orphan（保守）。
-    async fn is_storage_orphan(&self, app_id: &str) -> bool {
-        match self.runtime.get_deployment_status(app_id).await {
-            Ok(None) => true,
-            Ok(Some(_)) => false,
-            Err(e) => {
-                // 瞬时 API 错误保守视为"非 orphan"（避免误删在用数据），但落日志可见
-                warn!(
-                    "[APP] is_storage_orphan 查询状态失败 app_id={}: {}",
-                    app_id, e
-                );
-                false
-            }
-        }
     }
 
     /// 启动应用（scale replicas = 1）
@@ -776,7 +582,7 @@ impl AppService {
             .map_err(|e| {
                 map_runtime_error(&format!("[APP] scale_deployment failed app_id={app_id}"), e)
             })?;
-        info!("[APP] 应用已启动 (scale=1): {}", app_id);
+        info!("[APP] app started (scale=1): {}", app_id);
         self.get_app(app_id).await
     }
 
@@ -791,7 +597,7 @@ impl AppService {
             .map_err(|e| {
                 map_runtime_error(&format!("[APP] scale_deployment failed app_id={app_id}"), e)
             })?;
-        info!("[APP] 应用已停止 (scale=0): {}", app_id);
+        info!("[APP] app stopped (scale=0): {}", app_id);
         self.get_app(app_id).await
     }
 
@@ -806,7 +612,7 @@ impl AppService {
                 e,
             )
         })?;
-        info!("[APP] 应用已重启 (rollout): {}", app_id);
+        info!("[APP] app restarted (rollout): {}", app_id);
         self.get_app(app_id).await
     }
 
@@ -922,255 +728,6 @@ impl AppService {
                 message: line.to_string(),
             })
             .collect())
-    }
-
-    /// 上传文件 / 压缩包。
-    ///
-    /// 自动判断（魔数）：zip/tar.gz 压缩包 → 解压到 `target` 目录；其它 → 单文件存 `target`。
-    /// 单文件：`target`=文件路径（如 `code/app.jar`）；压缩包：`target`=解压目录（如 `code/`）。
-    /// 安全：复用 download_utils 的 zip slip + 1GiB 大小防护，叠加 app 根 canonicalize 校验。
-    #[instrument(skip(self, file_data))]
-    pub async fn upload_file(
-        &self,
-        app_id: &str,
-        file_data: Vec<u8>,
-        target: &str,
-        flatten: bool,
-    ) -> AppResult<UploadResult> {
-        validate_app_id(app_id)?;
-        validate_upload_target(target)?; // create_dir_all 前拦截 ../ 与绝对路径（避免副作用泄漏）
-        if file_data.is_empty() {
-            return Err(AppOperationError::Validation(
-                "file data is empty".to_string(),
-            ));
-        }
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        fs::create_dir_all(&app_dir)
-            .await
-            .map_err(|e| map_io_error("failed to create app dir", e, false))?;
-        let canonical_app_dir = app_dir
-            .canonicalize()
-            .map_err(|e| map_io_error("failed to resolve app dir", e, false))?;
-
-        // 魔数判断压缩包类型（不靠文件名后缀，app.jar.zip 也能识别为 zip）
-        let file_type = detect_file_type(&file_data);
-        match file_type {
-            "zip" | "tar.gz" => {
-                self.extract_archive(
-                    app_id,
-                    file_data,
-                    file_type,
-                    target,
-                    flatten,
-                    &canonical_app_dir,
-                )
-                .await
-            }
-            _ => {
-                // 单文件分支（target=文件路径，app 根相对）
-                let file_path = app_dir.join(target);
-                // 防穿越：canonicalize 父目录后校验仍在 app 目录内（与 delete_file 对称）
-                if let Some(parent) = file_path.parent() {
-                    fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| map_io_error("failed to create parent dir", e, false))?;
-                    let canonical_parent = parent
-                        .canonicalize()
-                        .map_err(|e| map_io_error("failed to resolve parent dir", e, false))?;
-                    if !canonical_parent.starts_with(&canonical_app_dir) {
-                        return Err(AppOperationError::Validation(
-                            "path is outside app dir".to_string(),
-                        ));
-                    }
-                }
-                fs::write(&file_path, &file_data)
-                    .await
-                    .map_err(|e| map_io_error("failed to write file", e, true))?;
-                Ok(UploadResult {
-                    file_path: target.to_string(),
-                    file_size: file_data.len() as u64,
-                    uploaded_at: Utc::now().to_rfc3339(),
-                    extracted_count: None,
-                })
-            }
-        }
-    }
-
-    /// 解压压缩包（zip/tar.gz）到 target 目录（app 根相对）。
-    async fn extract_archive(
-        &self,
-        app_id: &str,
-        file_data: Vec<u8>,
-        file_type: &str,
-        target: &str,
-        flatten: bool,
-        canonical_app_dir: &std::path::Path,
-    ) -> AppResult<UploadResult> {
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        let dest = app_dir.join(target.trim_end_matches('/'));
-        fs::create_dir_all(&dest)
-            .await
-            .map_err(|e| map_io_error("failed to create extraction dir", e, false))?;
-        let canonical_dest = dest
-            .canonicalize()
-            .map_err(|e| map_io_error("failed to resolve extraction dir", e, false))?;
-        if !canonical_dest.starts_with(canonical_app_dir) {
-            return Err(AppOperationError::Validation(
-                "extraction dir is outside app dir".to_string(),
-            ));
-        }
-
-        let file_size = file_data.len() as u64;
-        let file_type = file_type.to_string(); // 由 upload_file 传入（避免重复 detect）
-        let dest_clone = canonical_dest.clone();
-        // spawn_blocking：写临时文件 + 解压（同步 IO，不阻塞 tokio；TempPath 闭包结束自动删）
-        let count =
-            tokio::task::spawn_blocking(move || -> std::result::Result<usize, ArchiveError> {
-                let mut tmp = tempfile::NamedTempFile::new()?;
-                tmp.write_all(&file_data)?;
-                let tmp_path = tmp.into_temp_path();
-                match file_type.as_str() {
-                    "tar.gz" => extract_tar_gz(&tmp_path, &dest_clone),
-                    "zip" => extract_zip(&tmp_path, &dest_clone),
-                    _ => Err(ArchiveError::InvalidArchive(format!(
-                        "unsupported: {file_type}"
-                    ))),
-                }
-            })
-            .await
-            .map_err(|e| AppOperationError::Backend(format!("extraction task failed: {e}")))?
-            .map_err(map_archive_error)?;
-
-        if flatten {
-            normalize_extracted_dir(&canonical_dest).map_err(map_archive_error)?;
-        }
-        info!(
-            "[APP] 压缩包已解压: {} -> {} ({} 文件, flatten={})",
-            app_id, target, count, flatten
-        );
-        Ok(UploadResult {
-            file_path: target.to_string(),
-            file_size,
-            uploaded_at: Utc::now().to_rfc3339(),
-            extracted_count: Some(count),
-        })
-    }
-
-    /// 列出文件（app 根目录，或其子目录如 "code"/"data"/"logs"）。
-    ///
-    /// `subpath` 为 None/空 → 列 app 根；否则列 `app_dir/{subpath}`。返回的 `path` 字段是
-    /// **app-root-relative**（如 "code/app.jar"），可直接作为 upload 的 target / delete 的 path，
-    /// 与这两个接口的约定一致。防穿越：子目录 canonicalize 后必须仍在 app 目录内。
-    #[instrument(skip(self))]
-    pub async fn list_files(
-        &self,
-        app_id: &str,
-        subpath: Option<&str>,
-    ) -> AppResult<Vec<FileInfo>> {
-        validate_app_id(app_id)?;
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        if !app_dir.exists() {
-            return Ok(vec![]);
-        }
-        let canonical_app_dir = app_dir
-            .canonicalize()
-            .map_err(|e| map_io_error("failed to resolve app dir", e, false))?;
-        // subpath 归一化：去尾部 '/'，空 → 列 app 根
-        let sub = subpath
-            .map(|p| p.trim_end_matches('/'))
-            .filter(|p| !p.is_empty());
-        let target_dir = match sub {
-            Some(p) => {
-                let full = app_dir.join(p);
-                if !full.exists() {
-                    return Ok(vec![]);
-                }
-                let canonical_full = full
-                    .canonicalize()
-                    .map_err(|e| map_io_error("failed to resolve sub dir", e, false))?;
-                if !canonical_full.starts_with(&canonical_app_dir) {
-                    return Err(AppOperationError::Validation(
-                        "path is outside app dir".to_string(),
-                    ));
-                }
-                canonical_full
-            }
-            None => canonical_app_dir,
-        };
-        // 返回 app-root-relative 路径（sub 存在时前缀 "sub/"）
-        let rel_prefix = sub.map(|p| format!("{p}/")).unwrap_or_default();
-        let mut files = Vec::new();
-        let mut entries = fs::read_dir(&target_dir)
-            .await
-            .map_err(|e| map_io_error("failed to read dir", e, false))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| map_io_error("failed to traverse dir", e, false))?
-        {
-            let metadata = entry
-                .metadata()
-                .await
-                .map_err(|e| map_io_error("failed to read file metadata", e, false))?;
-            files.push(FileInfo {
-                path: format!("{rel_prefix}{}", entry.file_name().to_string_lossy()),
-                size: metadata.len(),
-                is_dir: metadata.is_dir(),
-                modified_at: metadata
-                    .modified()
-                    .map(|t| {
-                        let datetime: chrono::DateTime<Utc> = t.into();
-                        datetime.to_rfc3339()
-                    })
-                    .unwrap_or_default(),
-            });
-        }
-        Ok(files)
-    }
-
-    /// 删除文件
-    #[instrument(skip(self))]
-    pub async fn delete_file(&self, app_id: &str, file_path: &str) -> AppResult<()> {
-        validate_app_id(app_id)?;
-        // file_path 相对 app 根目录（与 upload_file 的 target 同约定：可指向 code/ data/ logs/）
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        if !app_dir.exists() {
-            return Err(AppOperationError::NotFound(format!(
-                "app dir does not exist: {app_id}"
-            )));
-        }
-        let full_path = app_dir.join(file_path);
-        // 先 exists 守卫，避免 canonicalize 对不存在路径抛 OS 错误（导致 500 而非 404）
-        if !full_path.exists() {
-            return Err(AppOperationError::FileNotFound(format!(
-                "file does not exist: {file_path}"
-            )));
-        }
-
-        // 安全检查：canonicalize 后确保路径仍在 app 目录内（防 ../ 穿越到外部）
-        let canonical_path = full_path
-            .canonicalize()
-            .map_err(|e| map_io_error("failed to resolve file path", e, false))?;
-        let canonical_app_dir = app_dir
-            .canonicalize()
-            .map_err(|e| map_io_error("failed to resolve app dir", e, false))?;
-        if !canonical_path.starts_with(&canonical_app_dir) {
-            return Err(AppOperationError::Validation(
-                "path is outside app dir".to_string(),
-            ));
-        }
-
-        if canonical_path.is_dir() {
-            fs::remove_dir_all(&canonical_path)
-                .await
-                .map_err(|e| map_io_error("failed to remove dir", e, false))?;
-        } else {
-            fs::remove_file(&canonical_path)
-                .await
-                .map_err(|e| map_io_error("failed to remove file", e, true))?;
-        }
-        info!("[APP] 文件已删除: {}", file_path);
-        Ok(())
     }
 
     // ========================================================================
@@ -1360,7 +917,7 @@ impl AppService {
         match self.runtime.get_deployment_status(app_id).await {
             Ok(s) => s,
             Err(e) => {
-                warn!("[APP] 查询运行时状态失败 app_id={}: {}", app_id, e);
+                warn!("[APP] query runtime status failed app_id={}: {}", app_id, e);
                 None
             }
         }
@@ -1379,7 +936,7 @@ impl AppService {
                 "app does not exist: {app_id}"
             ))),
             Err(e) => {
-                warn!("[APP] 查询应用状态失败 app_id={}: {}", app_id, e);
+                warn!("[APP] query app status failed app_id={}: {}", app_id, e);
                 Err(AppOperationError::Backend(format!(
                     "failed to query app status: {e}"
                 )))
@@ -1515,7 +1072,7 @@ impl AppService {
             AppAccessMode::Docker => {
                 if container_ip.is_empty() {
                     warn!(
-                        "[APP] Docker 模式 container_ip 为空，跳过 Pingora backend 注册: {}",
+                        "[APP] Docker mode container_ip empty, skip pingora backend registration: {}",
                         app_id
                     );
                     return vec![];
@@ -1540,7 +1097,7 @@ impl AppService {
             self.pingora_ports
                 .insert(app_id.to_string(), http_ports.to_vec());
             info!(
-                "[APP] Pingora backend 已注册: {} ports={:?} -> {}",
+                "[APP] pingora backend registered: {} ports={:?} -> {}",
                 app_id, http_ports, backend_host
             );
         }
@@ -1559,7 +1116,7 @@ impl AppService {
             for port in &ports {
                 pingora.remove_app_backend(app_id, *port);
             }
-            info!("[APP] Pingora backend 已清理: {} ports={:?}", app_id, ports);
+            info!("[APP] pingora backend unregistered: {} ports={:?}", app_id, ports);
         }
     }
 
@@ -1568,7 +1125,7 @@ impl AppService {
     async fn rebuild_pingora_backends(&self) -> AppResult<()> {
         // pingora 未配置（proxy_config 未配）→ 无 backend 可注册；显式说明，避免"0 个 app"被误读为"集群无应用"
         if self.pingora.is_none() {
-            info!("[APP] Pingora 未启用（proxy_config 未配），跳过 backends 重建");
+            info!("[APP] pingora disabled (no proxy_config), skip backends rebuild");
             return Ok(());
         }
         let statuses = self
@@ -1596,7 +1153,7 @@ impl AppService {
             }
         }
         info!(
-            "[APP] Pingora backends 重建完成: {count} 个 app（集群共 {} 个托管 app）",
+            "[APP] pingora backends rebuilt: {count} apps ({} managed apps total in cluster)",
             statuses.len()
         );
         Ok(())
@@ -1611,7 +1168,7 @@ impl AppService {
     ///   运行时适配, 非 per-app 失败)。
     /// - K8s per-app resolve 失败 (Err): **Fail Fast** 返回 Backend 错误, 不 fallback 共享
     ///   (避免 per-app PVC + 共享 PVC 数据面分裂, 见 code-review M1/M2)。
-    async fn get_container_app_dir(&self, app_id: &str) -> AppResult<PathBuf> {
+    pub(super) async fn get_container_app_dir(&self, app_id: &str) -> AppResult<PathBuf> {
         match self
             .runtime
             .resolve_workspace_path(app_id, &ServiceType::UserApp)
@@ -1713,272 +1270,6 @@ impl AppService {
             .await
             .map_err(|e| map_io_error("failed to create logs dir", e, false))?;
         Ok(())
-    }
-}
-
-// ============================================================================
-// 自由函数辅助
-// ============================================================================
-
-/// ContainerRuntimeError → AppOperationError 精确映射。
-///
-/// `ctx` = 动作前缀（如 "[APP] create_deployment 失败 app_id=app-xxx"），拼入 message。
-/// thiserror variant 无 source，`{e}` 即 variant Display（含原始 daemon message）。
-fn map_runtime_error(ctx: &str, e: ContainerRuntimeError) -> AppOperationError {
-    match e {
-        // 容器/deployment 不存在 = app 不存在（404）
-        ContainerRuntimeError::ContainerNotFound(_) => {
-            AppOperationError::NotFound(format!("{ctx}: {e}"))
-        }
-        // 其余 8 类（Connection/Creation/Start/Stop/Configuration/Timeout/K8s/Docker）
-        // 都是后端运行时/基础设施问题，客户端不可恢复，归 Backend(500)。
-        // ConfigurationError 在 runtime 是内部前置条件（params 缺字段），非用户输入，
-        // 归 Backend 最保守，避免误判 400。
-        _ => AppOperationError::Backend(format!("{ctx}: {e}")),
-    }
-}
-
-/// io::Error → AppOperationError 精确映射。
-///
-/// `is_file_op=true`（read_to_string/write/remove_file）：NotFound → FileNotFound(404)
-/// `is_file_op=false`（create_dir_all/metadata/canonicalize/read_dir/remove_dir_all）：→ Backend
-/// （目录层 NotFound 通常已被上游 app_dir.exists() 守卫拦截，漏到这属异常，归 Backend）
-fn map_io_error(ctx: &str, e: std::io::Error, is_file_op: bool) -> AppOperationError {
-    match e.kind() {
-        std::io::ErrorKind::NotFound if is_file_op => {
-            AppOperationError::FileNotFound(format!("{ctx}: {e}"))
-        }
-        _ => AppOperationError::Backend(format!("{ctx}: {e}")),
-    }
-}
-
-/// `ArchiveError`（download_utils 解压错误）→ `AppOperationError`。
-/// 非法路径 / 解压超限 / 无效压缩包 → `Validation`（400，客户端错误）；
-/// IO → `Backend`（500）。
-fn map_archive_error(e: ArchiveError) -> AppOperationError {
-    match e {
-        ArchiveError::PathTraversal(msg) => {
-            AppOperationError::Validation(format!("archive contains illegal path: {msg}"))
-        }
-        ArchiveError::ArchiveBomb { size, max } => AppOperationError::Validation(format!(
-            "archive extraction exceeded size limit: {size} > {max}"
-        )),
-        ArchiveError::InvalidArchive(msg) => {
-            AppOperationError::Validation(format!("invalid archive: {msg}"))
-        }
-        ArchiveError::Io(e) => map_io_error("archive IO error", e, true),
-    }
-}
-
-/// 校验 upload target（app 根相对路径）。
-///
-/// 拒绝空 / 绝对路径 / 含 `..` 组件——在 `create_dir_all` **之前**拦截，避免 path traversal
-/// 副作用（target 含 `../` 时 create_dir_all 会先在工作空间外创建目录，虽后续 `starts_with`
-/// 拒绝，但目录已落盘）。
-fn validate_upload_target(target: &str) -> AppResult<()> {
-    if target.trim_end_matches('/').is_empty() {
-        return Err(AppOperationError::Validation(
-            "target must not be empty".to_string(),
-        ));
-    }
-    if target.starts_with('/') {
-        return Err(AppOperationError::Validation(
-            "target must be relative (app-root-relative)".to_string(),
-        ));
-    }
-    if std::path::Path::new(target)
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(AppOperationError::Validation(
-            "target must not contain '..'".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// 校验 app_id 格式（create_app 生成 `app-` + 8 个十六进制字符）
-///
-/// app_id 直接来自 HTTP 路径参数，会流入文件系统路径拼接（delete/upload/logs/list）。
-/// 此校验是路径穿越的纵深防御（Fail Fast）：拒绝 `..`、绝对路径、非法格式，
-/// 避免恶意 app_id 触达工作空间目录之外。
-fn validate_app_id(app_id: &str) -> AppResult<()> {
-    // 必须 app- 前缀（统一，和自动生成一致）
-    let rest = app_id.strip_prefix("app-").ok_or_else(|| {
-        AppOperationError::Validation("invalid app_id: must start with 'app-'".to_string())
-    })?;
-    if rest.is_empty() {
-        return Err(AppOperationError::Validation(
-            "invalid app_id: empty after 'app-'".to_string(),
-        ));
-    }
-    // DNS-1123 label 合规（[a-z0-9]([-a-z0-9]*[a-z0-9])?，≤63；支持 app-order-svc 等业务名）
-    if rest.len() > 63
-        || !rest
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        return Err(AppOperationError::Validation(format!(
-            "invalid app_id: must be DNS-1123 label (lowercase alphanumeric or '-', got '{rest}')"
-        )));
-    }
-    if rest.starts_with('-') || rest.ends_with('-') {
-        return Err(AppOperationError::Validation(
-            "invalid app_id: must not start/end with '-'".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// 校验 PG 标识符（数据库名 / 用户名）：首字符字母或下划线，其余字母/数字/下划线，≤63 字符。
-/// 防 SQL 注入（标识符进双引号，但严格白名单更稳）。
-fn validate_pg_identifier(name: &str) -> AppResult<()> {
-    if name.is_empty() || name.len() > 63 {
-        return Err(AppOperationError::Validation(
-            "PG identifier must be 1..=63 chars".to_string(),
-        ));
-    }
-    match name.chars().next() {
-        Some(first) if !(first.is_ascii_alphabetic() || first == '_') => {
-            return Err(AppOperationError::Validation(
-                "PG identifier must start with letter or '_'".to_string(),
-            ));
-        }
-        None => {
-            return Err(AppOperationError::Validation(
-                "PG identifier empty".to_string(),
-            ))
-        }
-        _ => {}
-    }
-    if !name.chars().skip(1).all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(AppOperationError::Validation(
-            "PG identifier: only [a-zA-Z0-9_] allowed".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// 从 PortConfig 列表提取 HTTP 端口号（供 Pingora backend 注册，create/update 共用）
-fn http_port_numbers(ports: &Option<Vec<PortConfig>>) -> Vec<u16> {
-    ports
-        .as_ref()
-        .map(|ps| {
-            ps.iter()
-                .filter(|p| p.expose_type == ExposeType::Http)
-                .map(|p| p.port)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// 运行时 phase → 应用状态枚举
-fn phase_to_status(phase: &str) -> AppStatus {
-    match phase {
-        "Running" => AppStatus::Running,
-        "Stopped" | "ScaledDown" => AppStatus::Stopped,
-        "Starting" | "Pending" | "Creating" => AppStatus::Starting,
-        "Error" | "Failed" => AppStatus::Error,
-        _ => AppStatus::Created,
-    }
-}
-
-/// 从 message 中提取简短机器码原因（CrashLoopBackOff / ImagePullBackOff 等）
-fn extract_reason(msg: &str) -> Option<&str> {
-    const KNOWN: &[&str] = &[
-        "CrashLoopBackOff",
-        "ImagePullBackOff",
-        "ErrImagePull",
-        "CreateContainerConfigError",
-        "CreateContainerError",
-        "InvalidImageName",
-        "RunContainerError",
-        "StartError",
-        "OOMKilled",
-    ];
-    KNOWN.iter().find(|k| msg.contains(*k)).copied()
-}
-
-/// 由 DeploymentStatus 派生 conditions（见设计文档 §6.3 派生表）
-///
-/// 与 headline 的 `AppStatus` 同源、不矛盾：`status` 给 Java 做状态机判断，
-/// `conditions[]` 给人/前端做细粒度诊断。`last_transition_time` 在无状态下不持久
-/// 追踪（rcoder 不持有上一时刻状态），统一为 `None`。
-fn derive_conditions(status: &DeploymentStatus) -> Vec<Condition> {
-    let app_status = phase_to_status(&status.phase);
-    let mk = |t: &str, s: &str, reason: Option<&str>, msg: Option<String>| Condition {
-        r#type: t.to_string(),
-        status: s.to_string(),
-        reason: reason.map(str::to_string),
-        message: msg,
-        last_transition_time: None,
-    };
-    match app_status {
-        AppStatus::Error => {
-            let reason = status
-                .message
-                .as_deref()
-                .and_then(extract_reason)
-                .unwrap_or("Error");
-            vec![
-                mk("Error", "True", Some(reason), status.message.clone()),
-                mk("Ready", "False", Some("Error"), None),
-            ]
-        }
-        AppStatus::Running => vec![
-            mk("Ready", "True", None, None),
-            mk("Available", "True", None, None),
-        ],
-        AppStatus::Stopped => vec![
-            mk("Ready", "False", Some("ScaledDown"), None),
-            mk("Available", "False", Some("ScaledDown"), None),
-        ],
-        AppStatus::Starting => vec![
-            mk("Progressing", "True", Some("Starting"), None),
-            mk("Ready", "False", Some("Starting"), None),
-        ],
-        AppStatus::Stopping => vec![mk("Progressing", "True", Some("Stopping"), None)],
-        AppStatus::Deleting => vec![mk("Progressing", "True", Some("Deleting"), None)],
-        AppStatus::Created => vec![mk("Ready", "False", Some("Created"), None)],
-    }
-}
-
-/// 由 DeploymentStatus 派生健康信息
-fn health_from_status(status: &DeploymentStatus) -> HealthInfo {
-    HealthInfo {
-        status: status.phase.clone(),
-        instance: Some(InstanceInfo {
-            name: format!(
-                "{}-{}",
-                ServiceType::UserApp.container_prefix(),
-                status.app_id
-            ),
-            phase: status.phase.clone(),
-            ready: status.ready_replicas > 0,
-            restart_count: status.restart_count,
-            node: status.node.clone().unwrap_or_default(),
-            ip: status.pod_ip.clone().unwrap_or_default(),
-            started_at: status.started_at.clone(),
-        }),
-        probes: None,
-    }
-}
-
-/// models::ExposeType → container_runtime_api::ExposeType
-fn map_expose_type(e: &ExposeType) -> RtExposeType {
-    match e {
-        ExposeType::Http => RtExposeType::Http,
-        ExposeType::Tcp => RtExposeType::Tcp,
-    }
-}
-
-/// models::HealthCheckType → container_runtime_api::HealthCheckType
-fn map_health_check_type(t: &HealthCheckType) -> RtHealthCheckType {
-    match t {
-        HealthCheckType::Http => RtHealthCheckType::Http,
-        HealthCheckType::Tcp => RtHealthCheckType::Tcp,
-        HealthCheckType::Exec => RtHealthCheckType::Exec,
-        HealthCheckType::None => RtHealthCheckType::None,
     }
 }
 

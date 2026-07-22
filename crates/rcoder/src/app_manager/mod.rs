@@ -5,10 +5,13 @@
 
 pub mod app_service_trait;
 pub mod config;
+pub mod files;
 pub mod handlers;
 pub mod models;
 pub mod routes;
 pub mod service;
+pub mod storage;
+pub mod utils;
 
 // 重新导出常用类型
 pub use app_service_trait::AppServiceTrait;

@@ -14,7 +14,7 @@ fn http_expose_from_env() -> HttpExpose {
         Some("pingora") | None => HttpExpose::Pingora,
         Some(other) => {
             warn!(
-                "未识别的 RCODER_APP_HTTP_EXPOSE={other:?}，回退 pingora（合法值: pingora|gateway）"
+                "unrecognized RCODER_APP_HTTP_EXPOSE={other:?}, falling back to pingora (valid: pingora|gateway)"
             );
             HttpExpose::Pingora
         }
