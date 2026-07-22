@@ -43,8 +43,8 @@ impl super::service::AppService {
             .map_err(|e| map_io_error("failed to resolve app dir", e, false))?;
 
         // 魔数判断压缩包类型（不靠文件名后缀，app.jar.zip 也能识别为 zip）
-        let file_type = detect_file_type(&file_data);
-        match file_type {
+        let file_type = detect_file_type(&file_data).to_string();
+        match file_type.as_str() {
             "zip" | "tar.gz" => {
                 self.extract_archive(
                     app_id,
@@ -64,14 +64,7 @@ impl super::service::AppService {
                     fs::create_dir_all(parent)
                         .await
                         .map_err(|e| map_io_error("failed to create parent dir", e, false))?;
-                    let canonical_parent = parent
-                        .canonicalize()
-                        .map_err(|e| map_io_error("failed to resolve parent dir", e, false))?;
-                    if !canonical_parent.starts_with(&canonical_app_dir) {
-                        return Err(AppOperationError::Validation(
-                            "path is outside app dir".to_string(),
-                        ));
-                    }
+                    ensure_within_app_dir(parent, &canonical_app_dir)?;
                 }
                 fs::write(&file_path, &file_data)
                     .await
@@ -91,7 +84,7 @@ impl super::service::AppService {
         &self,
         app_id: &str,
         file_data: Vec<u8>,
-        file_type: &str,
+        file_type: String,
         target: &str,
         flatten: bool,
         canonical_app_dir: &std::path::Path,
@@ -101,17 +94,9 @@ impl super::service::AppService {
         fs::create_dir_all(&dest)
             .await
             .map_err(|e| map_io_error("failed to create extraction dir", e, false))?;
-        let canonical_dest = dest
-            .canonicalize()
-            .map_err(|e| map_io_error("failed to resolve extraction dir", e, false))?;
-        if !canonical_dest.starts_with(canonical_app_dir) {
-            return Err(AppOperationError::Validation(
-                "extraction dir is outside app dir".to_string(),
-            ));
-        }
+        let canonical_dest = ensure_within_app_dir(&dest, canonical_app_dir)?;
 
         let file_size = file_data.len() as u64;
-        let file_type = file_type.to_string(); // 由 upload_file 传入（避免重复 detect）
         let dest_clone = canonical_dest.clone();
         // spawn_blocking：写临时文件 + 解压（同步 IO，不阻塞 tokio；TempPath 闭包结束自动删）
         let count =
@@ -175,15 +160,7 @@ impl super::service::AppService {
                 if !full.exists() {
                     return Ok(vec![]);
                 }
-                let canonical_full = full
-                    .canonicalize()
-                    .map_err(|e| map_io_error("failed to resolve sub dir", e, false))?;
-                if !canonical_full.starts_with(&canonical_app_dir) {
-                    return Err(AppOperationError::Validation(
-                        "path is outside app dir".to_string(),
-                    ));
-                }
-                canonical_full
+                ensure_within_app_dir(&full, &canonical_app_dir)?
             }
             None => canonical_app_dir,
         };
@@ -236,19 +213,11 @@ impl super::service::AppService {
                 "file does not exist: {file_path}"
             )));
         }
-
         // 安全检查：canonicalize 后确保路径仍在 app 目录内（防 ../ 穿越到外部）
-        let canonical_path = full_path
-            .canonicalize()
-            .map_err(|e| map_io_error("failed to resolve file path", e, false))?;
         let canonical_app_dir = app_dir
             .canonicalize()
             .map_err(|e| map_io_error("failed to resolve app dir", e, false))?;
-        if !canonical_path.starts_with(&canonical_app_dir) {
-            return Err(AppOperationError::Validation(
-                "path is outside app dir".to_string(),
-            ));
-        }
+        let canonical_path = ensure_within_app_dir(&full_path, &canonical_app_dir)?;
 
         if canonical_path.is_dir() {
             fs::remove_dir_all(&canonical_path)

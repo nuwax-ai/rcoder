@@ -1,0 +1,50 @@
+[package]
+name = "app_manager"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+# Kubernetes 后端模式：启用后 AppAccessMode 默认值 = Kubernetes（仍可被 env 覆盖）
+# 由 rcoder 的 kubernetes feature 转发开启，保持双后端编译期同源。
+kubernetes = []
+
+[dependencies]
+# Internal crates
+container-runtime-api = { workspace = true }
+docker_manager = { workspace = true }
+rcoder-proxy = { workspace = true }
+shared_types = { workspace = true }
+download_utils = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+
+# HTTP server
+axum = { workspace = true }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Concurrency
+dashmap = { workspace = true }
+
+# Cache
+moka = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# OpenAPI
+utoipa = { workspace = true }
+
+# Temp files
+tempfile = { workspace = true }

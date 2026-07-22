@@ -70,7 +70,7 @@ fn validate_resource_limits(limits: &ServiceResourceLimits) -> Result<(), String
 
     // 验证 storage_size 格式（K8s 资源格式）
     if let Some(ref storage_size) = limits.storage_size {
-        validate_k8s_storage_size(storage_size)?;
+        container_runtime_api::validate_k8s_storage_size(storage_size)?;
     }
 
     Ok(())
@@ -277,32 +277,7 @@ fn container_identifier_for_service(
         .to_string()
 }
 
-/// 验证 K8s 存储大小格式与范围
-///
-/// 格式：任意合法 K8s Quantity（`10Gi`、`100Mi`、`1Ti`、`1e12`、纯数字字节等），
-/// 由 `container_runtime_api::parse_memory_quantity`（winnow）解析，支持完整 K8s Quantity 规范。
-/// 范围：1Gi ≤ value ≤ 100Ti（与 PVC 配额约束一致）。
-///
-/// # 参数
-/// * `storage_size` - 存储大小字符串（K8s Quantity）
-///
-/// # 返回
-/// Ok(()) 验证通过，Err(String) 返回错误信息
-pub(crate) fn validate_k8s_storage_size(storage_size: &str) -> Result<(), String> {
-    let bytes = container_runtime_api::parse_memory_quantity(storage_size).ok_or_else(|| {
-        format!(
-            "invalid storage_size '{storage_size}': expected K8s quantity (e.g., 10Gi, 100Mi, 1Ti)"
-        )
-    })?;
-    let gi = bytes as f64 / 1024f64.powi(3);
-    if gi < 1.0 {
-        return Err("storage_size must be at least 1Gi".to_string());
-    }
-    if gi > 100.0 * 1024.0 {
-        return Err("storage_size cannot exceed 100Ti".to_string());
-    }
-    Ok(())
-}
+// validate_k8s_storage_size 已下沉到 container-runtime-api（共享，避免双份维护）
 
 /// 将 Unix 毫秒时间戳转换为东八区（UTC+8）时间字符串
 ///

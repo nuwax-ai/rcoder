@@ -21,7 +21,6 @@ use serde::Serialize;
 use shared_types::ProjectAndContainerInfo;
 
 use crate::{
-    app_manager,
     config::{ApiKeyAuthConfig, AppConfig},
     handler,
     storage::ProjectAdapter,
@@ -95,7 +94,7 @@ pub struct AppState {
     /// Agent 下载管理器（统一缓存）
     pub agent_download_manager: Arc<AgentDownloadManager>,
     /// 应用管理服务
-    pub app_service: Arc<dyn crate::app_manager::AppServiceTrait>,
+    pub app_service: Arc<dyn app_manager::AppServiceTrait>,
     /// K8s 集群域名（用于构建 K8s Service FQDN）
     pub cluster_domain: String,
 }
@@ -128,8 +127,8 @@ impl AppState {
             })?);
 
         // 初始化应用管理服务（Docker / K8s 统一构造，运行时由 access_mode 决定行为）
-        let app_service: Arc<dyn crate::app_manager::AppServiceTrait> = Arc::new(
-            crate::app_manager::service::AppService::new(
+        let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
+            app_manager::service::AppService::new(
                 config.app_manager.clone(),
                 runtime.clone(),
                 pingora.clone(),

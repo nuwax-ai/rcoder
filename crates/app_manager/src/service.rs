@@ -7,9 +7,10 @@
 //!
 //! K8s 模式 `create_deployment` 创建 ConfigMap/Secret/ClusterIP Service/Deployment；
 //! HTTP 入口按 `http_expose`：Pingora（默认，两后端统一，本服务注册 Pingora backend
-//! `/proxy/{port}` → 后端 host：Docker container_ip / K8s ClusterIP FQDN）或 Gateway
+//! `/proxy/apps/{app_id}/{port}` → 后端 host：Docker container_ip / K8s ClusterIP FQDN）或 Gateway
 //! （可选，K8s 建 HTTPRoute `/apps/{id}`）。TCP 初期不对外。Docker 模式建容器入主网络。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -133,12 +134,12 @@ impl AppService {
         // 0. 校验资源限制格式（K8s Quantity: storage / ephemeral_storage）→ ERR_VALIDATION
         if let Some(ref resources) = request.resources {
             if let Some(ref s) = resources.storage {
-                crate::handler::pod_handler::validate_k8s_storage_size(s).map_err(|e| {
+                validate_k8s_storage_size(s).map_err(|e| {
                     AppOperationError::Validation(format!("invalid storage '{}': {}", s, e))
                 })?;
             }
             if let Some(ref es) = resources.ephemeral_storage {
-                crate::handler::pod_handler::validate_k8s_storage_size(es).map_err(|e| {
+                validate_k8s_storage_size(es).map_err(|e| {
                     AppOperationError::Validation(format!(
                         "invalid ephemeral_storage '{}': {}",
                         es, e
@@ -209,12 +210,12 @@ impl AppService {
         // 不涉及历史数据迁移 → 不调 lazy_migrate (新应用无旧数据)。
         // Web/Computer 有历史数据 → 保留 lazy_migrate。
 
-        // 4. Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/{port} → container_ip）
+        // 5. Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/apps/{app_id}/{port} → container_ip）
         let http_ports = http_port_numbers(&request.ports);
         self.register_pingora_backends(&app_id, &http_ports, &container_info.container_ip)
             .await;
 
-        // 5. 实时查询运行时状态（K8s 用于拿真实 node_port；Docker 模式不还原端口语义）
+        // 6. 实时查询运行时状态（K8s 用于拿真实 node_port；Docker 模式不还原端口语义）
         let runtime_status = self.fetch_runtime_status(&app_id).await;
 
         // 端口状态：以请求端口为准（expose_type 语义完整），合并运行时返回的 external_port
@@ -247,7 +248,7 @@ impl AppService {
             }
         }
 
-        // 6. 构建访问信息 + 健康信息
+        // 7. 构建访问信息 + 健康信息
         let access = self.build_access_info(&app_id, &ports);
         let health = runtime_status
             .as_ref()
@@ -357,6 +358,7 @@ impl AppService {
     /// 获取应用运行时详情（实时查集群；精确区分 404 与 500）
     #[instrument(skip(self))]
     pub async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        validate_app_id(app_id)?;
         let status = self.fetch_runtime_status_or_err(app_id).await?;
         Ok(self.build_runtime_info(status))
     }
@@ -461,15 +463,7 @@ impl AppService {
         app_id: &str,
         req: ResetDbPasswordRequest,
     ) -> AppResult<()> {
-        validate_app_id(app_id)?;
-        // exec psql 需活容器(app Running);Stopped/Starting 等给友好错误而非 exec 失败
-        let status = self.fetch_runtime_status_or_err(app_id).await?;
-        if status.phase != "Running" {
-            return Err(AppOperationError::InvalidState(format!(
-                "app {app_id} not running (phase={}), exec psql 需活容器",
-                status.phase
-            )));
-        }
+        self.ensure_app_running(app_id).await?;
         if req.new_password.is_empty() {
             return Err(AppOperationError::Validation(
                 "new_password must not be empty".to_string(),
@@ -486,23 +480,12 @@ impl AppService {
                 r#"psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "ALTER USER \"$POSTGRES_USER\" WITH PASSWORD '{safe_pw}'""#,
             ),
         ];
-        let r = self
-            .runtime
-            .exec(app_id, cmd)
-            .await
-            .map_err(|e| {
-                map_runtime_error(
-                    &format!("[APP] reset_db_password failed app_id={app_id}"),
-                    e,
-                )
-            })?;
-        if r.exit_code != 0 {
-            return Err(AppOperationError::Backend(format!(
-                "reset password failed (exit {}): {}",
-                r.exit_code,
-                r.stderr.trim()
-            )));
-        }
+        self.exec_psql(
+            app_id,
+            cmd,
+            &format!("[APP] reset_db_password failed app_id={app_id}"),
+        )
+        .await?;
         info!("[APP] PG password reset: {}", app_id);
         Ok(())
     }
@@ -513,14 +496,7 @@ impl AppService {
         app_id: &str,
         req: CreateDatabaseRequest,
     ) -> AppResult<()> {
-        validate_app_id(app_id)?;
-        let status = self.fetch_runtime_status_or_err(app_id).await?;
-        if status.phase != "Running" {
-            return Err(AppOperationError::InvalidState(format!(
-                "app {app_id} not running (phase={}), exec psql 需活容器",
-                status.phase
-            )));
-        }
+        self.ensure_app_running(app_id).await?;
         validate_pg_identifier(&req.database)?;
         if let Some(owner) = &req.owner {
             validate_pg_identifier(owner)?;
@@ -539,16 +515,14 @@ impl AppService {
                 r#"psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE "{safe_db}"{owner_clause}'"#,
             ),
         ];
+        // 不复用 exec_psql:create_database 的 exit≠0 需区分"库已存在"(AlreadyExists)
+        // 与其他错误(Backend),而 exec_psql 一律返 Backend。
+        let ctx = format!("[APP] create_database failed app_id={app_id}");
         let r = self
             .runtime
             .exec(app_id, cmd)
             .await
-            .map_err(|e| {
-                map_runtime_error(
-                    &format!("[APP] create_database failed app_id={app_id}"),
-                    e,
-                )
-            })?;
+            .map_err(|e| map_runtime_error(&ctx, e))?;
         if r.exit_code != 0 {
             // 库已存在(duplicate_database)→ AlreadyExists;其他 → Backend
             let msg = format!("{} {}", r.stdout, r.stderr).to_lowercase();
@@ -559,7 +533,7 @@ impl AppService {
                 )));
             }
             return Err(AppOperationError::Backend(format!(
-                "create database failed (exit {}): {}",
+                "{ctx}: exit {}: {}",
                 r.exit_code,
                 r.stderr.trim()
             )));
@@ -623,6 +597,7 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn get_app_logs(&self, app_id: &str, params: LogParams) -> AppResult<Vec<LogEntry>> {
         validate_app_id(app_id)?;
+        self.ensure_app_exists(app_id).await?;
         let tail = params.tail.unwrap_or(1000);
         let timestamps = params.timestamps.unwrap_or(true);
         let entries = self
@@ -662,6 +637,7 @@ impl AppService {
     /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
     #[instrument(skip(self))]
     pub async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats> {
+        validate_app_id(app_id)?;
         let status = self.fetch_runtime_status_or_err(app_id).await?;
         Ok(ResourceStats {
             restart_count: status.restart_count,
@@ -676,6 +652,7 @@ impl AppService {
         app_id: &str,
     ) -> AppResult<Vec<container_runtime_api::AppEventInfo>> {
         validate_app_id(app_id)?;
+        self.ensure_app_exists(app_id).await?;
         self.runtime.get_app_events(app_id).await.map_err(|e| {
             map_runtime_error(&format!("[APP] get_app_events failed app_id={app_id}"), e)
         })
@@ -696,21 +673,17 @@ impl AppService {
         let app_dir = self.get_container_app_dir(app_id).await?;
         let target = app_dir.join(file_path);
 
-        // path traversal 防护（与 upload/delete_file 一致）
-        let canonical_target = match target.canonicalize() {
-            Ok(c) => c,
-            Err(_) => {
-                return Err(AppOperationError::FileNotFound(format!(
-                    "log file does not exist: {file_path}"
-                )));
-            }
-        };
-        let canonical_root = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
-        if !canonical_target.starts_with(&canonical_root) {
-            return Err(AppOperationError::Validation(format!(
-                "path traversal rejected: {file_path}"
+        // exists 守卫：日志文件不存在返 FileNotFound（常见，非 500）；canonicalize 失败也归此类
+        if !target.exists() {
+            return Err(AppOperationError::FileNotFound(format!(
+                "log file does not exist: {file_path}"
             )));
         }
+        // path traversal 防护（与 upload/delete_file 一致，复用 utils::ensure_within_app_dir）
+        let canonical_root = app_dir
+            .canonicalize()
+            .unwrap_or_else(|_| app_dir.clone());
+        let canonical_target = ensure_within_app_dir(&target, &canonical_root)?;
 
         // 读文件，取最后 tail 行
         let content = tokio::fs::read_to_string(&canonical_target)
@@ -734,15 +707,76 @@ impl AppService {
     // 辅助方法
     // ========================================================================
 
-    /// 构建 ContainerCreateParams（UserApp）
+    /// 构建 ContainerCreateParams（UserApp，create 路径）
     async fn build_container_params(
         &self,
         app_id: &str,
         request: &CreateAppRequest,
     ) -> AppResult<ContainerCreateParams> {
+        self.build_params_inner(
+            app_id,
+            request.image.clone(),
+            &request.command,
+            &request.env,
+            &request.secrets,
+            &request.ports,
+            &request.health_check,
+            &request.resources,
+            &request.tenant_id,
+            &request.space_id,
+        )
+        .await
+    }
+
+    /// UpdateAppRequest → ContainerCreateParams（全量替换语义，image 必填）。
+    /// image 缺失 → ERR_VALIDATION（rcoder 无状态，无法保留旧 image，调用方必须发完整新状态）。
+    async fn build_container_params_from_update(
+        &self,
+        app_id: &str,
+        request: &UpdateAppRequest,
+    ) -> AppResult<ContainerCreateParams> {
+        let image = request.image.clone().ok_or_else(|| {
+            AppOperationError::Validation(
+                "update requires image (rcoder is stateless, cannot retain previous image)"
+                    .to_string(),
+            )
+        })?;
+        self.build_params_inner(
+            app_id,
+            image,
+            &request.command,
+            &request.env,
+            &request.secrets,
+            &request.ports,
+            &request.health_check,
+            &request.resources,
+            &request.tenant_id,
+            &request.space_id,
+        )
+        .await
+    }
+
+    /// build_container_params / build_container_params_from_update 的公共逻辑。
+    ///
+    /// 参数全用引用（`&Option<...>`），内部按需 `.clone()` 取值；`image` 为 owned `String`
+    /// （create 直接传 `request.image.clone()`；update 先 ok_or 校验再传入）。
+    /// 统一 create/update 两路逻辑：此前重复 ~180 行（90% 相同），分歧仅在 image 校验。
+    #[allow(clippy::too_many_arguments)]
+    async fn build_params_inner(
+        &self,
+        app_id: &str,
+        image: String,
+        command: &Option<Vec<String>>,
+        env: &Option<HashMap<String, String>>,
+        secrets: &Option<HashMap<String, String>>,
+        ports: &Option<Vec<PortConfig>>,
+        health_check: &Option<HealthCheckConfig>,
+        resources: &Option<ResourceLimits>,
+        tenant_id: &Option<String>,
+        space_id: &Option<String>,
+    ) -> AppResult<ContainerCreateParams> {
         // 端口：models::PortConfig → container_runtime_api::AppPortSpec
-        let ports: Vec<AppPortSpec> = request
-            .ports
+        let app_ports: Vec<AppPortSpec> = ports
             .as_ref()
             .map(|ps| {
                 ps.iter()
@@ -758,7 +792,7 @@ impl AppService {
 
         // Exec 健康检查当前未支持（AppHealthCheck 无 command 字段），Fail Fast 拒绝，
         // 避免静默丢弃用户配置（K8s build_probe 对 Exec 返回 None → 容器被视为永远健康）
-        if let Some(hc) = &request.health_check
+        if let Some(hc) = health_check
             && matches!(hc.check_type, HealthCheckType::Exec)
         {
             return Err(AppOperationError::Validation(
@@ -768,7 +802,7 @@ impl AppService {
         }
 
         // 健康检查：models::HealthCheckConfig → AppHealthCheck
-        let health_check = request.health_check.as_ref().map(|hc| AppHealthCheck {
+        let app_health_check = health_check.as_ref().map(|hc| AppHealthCheck {
             check_type: map_health_check_type(&hc.check_type),
             path: hc.path.clone(),
             port: hc.port,
@@ -777,7 +811,7 @@ impl AppService {
         });
 
         // 资源：models::ResourceLimits → AppResourceRequirements
-        let app_resources = request.resources.as_ref().map(|r| AppResourceRequirements {
+        let app_resources = resources.as_ref().map(|r| AppResourceRequirements {
             cpu: r.cpu.clone(),
             memory: r.memory.clone(),
             storage: r.storage.clone(),
@@ -785,24 +819,28 @@ impl AppService {
         });
 
         // 宿主机工作空间路径（Docker 模式 bind mount 源；K8s 模式 runtime 用 subPath，忽略此值）
-        let host_workspace_path = self.get_host_app_dir(app_id).await.to_string_lossy().to_string();
+        let host_workspace_path = self
+            .get_host_app_dir(app_id)
+            .await
+            .to_string_lossy()
+            .to_string();
 
         let mut builder = ContainerCreateParams::builder()
             .project_id(app_id.to_string())
             .service_type(ServiceType::UserApp)
             .host_workspace_path(host_workspace_path)
-            .image_override(request.image.clone())
-            .env(request.env.clone().unwrap_or_default())
-            .secrets(request.secrets.clone().unwrap_or_default())
-            .ports(ports);
+            .image_override(image)
+            .env(env.clone().unwrap_or_default())
+            .secrets(secrets.clone().unwrap_or_default())
+            .ports(app_ports);
 
         // command 仅在非空时设置（空 vec 会覆盖镜像 CMD）
-        if let Some(cmd) = request.command.clone()
+        if let Some(cmd) = command.clone()
             && !cmd.is_empty()
         {
             builder = builder.command(cmd);
         }
-        if let Some(hc) = health_check {
+        if let Some(hc) = app_health_check {
             builder = builder.health_check(hc);
         }
         if let Some(ar) = app_resources {
@@ -814,101 +852,14 @@ impl AppService {
             builder = builder.app_resources(ar);
         }
         // tenant/space：进 ContainerCreateParams → build_app_labels 打 rcoder.io/tenant、
-        // rcoder.io/space label（供对账/过滤）。此前 create 路径漏设，导致 create 出来的
-        // 资源缺这两个 label（只有 update 路径 build_container_params_from_update 设了）。
-        if let Some(t) = request.tenant_id.clone() {
+        // rcoder.io/space label（供对账/过滤）。
+        if let Some(t) = tenant_id.clone() {
             builder = builder.tenant_id(t);
         }
-        if let Some(s) = request.space_id.clone() {
+        if let Some(s) = space_id.clone() {
             builder = builder.space_id(s);
         }
 
-        Ok(builder.build())
-    }
-
-    /// UpdateAppRequest → ContainerCreateParams（全量替换语义，image 必填）。
-    /// 与 build_container_params 平行；image 缺失 → ERR_VALIDATION
-    /// （rcoder 无状态，无法保留旧 image，调用方必须发完整新状态）。
-    async fn build_container_params_from_update(
-        &self,
-        app_id: &str,
-        request: &UpdateAppRequest,
-    ) -> AppResult<ContainerCreateParams> {
-        let image = request.image.clone().ok_or_else(|| {
-            AppOperationError::Validation(
-                "update requires image (rcoder is stateless, cannot retain previous image)"
-                    .to_string(),
-            )
-        })?;
-
-        let ports: Vec<AppPortSpec> = request
-            .ports
-            .as_ref()
-            .map(|ps| {
-                ps.iter()
-                    .map(|p| AppPortSpec {
-                        name: p.name.clone(),
-                        port: p.port,
-                        expose_type: map_expose_type(&p.expose_type),
-                        strip_prefix: p.strip_prefix,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if let Some(hc) = &request.health_check
-            && matches!(hc.check_type, HealthCheckType::Exec)
-        {
-            return Err(AppOperationError::Validation(
-                "Exec health check is not supported (AppHealthCheck lacks command field); use Http/Tcp instead"
-                    .to_string(),
-            ));
-        }
-        let health_check = request.health_check.as_ref().map(|hc| AppHealthCheck {
-            check_type: map_health_check_type(&hc.check_type),
-            path: hc.path.clone(),
-            port: hc.port,
-            initial_delay_seconds: None,
-            period_seconds: None,
-        });
-        let app_resources = request.resources.as_ref().map(|r| AppResourceRequirements {
-            cpu: r.cpu.clone(),
-            memory: r.memory.clone(),
-            storage: r.storage.clone(),
-            ephemeral_storage: r.ephemeral_storage.clone(),
-        });
-        let host_workspace_path = self.get_host_app_dir(app_id).await.to_string_lossy().to_string();
-
-        let mut builder = ContainerCreateParams::builder()
-            .project_id(app_id.to_string())
-            .service_type(ServiceType::UserApp)
-            .host_workspace_path(host_workspace_path)
-            .image_override(image)
-            .env(request.env.clone().unwrap_or_default())
-            .secrets(request.secrets.clone().unwrap_or_default())
-            .ports(ports);
-        if let Some(t) = request.tenant_id.clone() {
-            builder = builder.tenant_id(t);
-        }
-        if let Some(s) = request.space_id.clone() {
-            builder = builder.space_id(s);
-        }
-        if let Some(cmd) = request.command.clone()
-            && !cmd.is_empty()
-        {
-            builder = builder.command(cmd);
-        }
-        if let Some(hc) = health_check {
-            builder = builder.health_check(hc);
-        }
-        if let Some(ar) = app_resources {
-            // 阶段2: storage 落 per-app PVC requests.storage (CSI 服务端 subvolume 配额);
-            // ephemeral_storage 仍限 overlay 可写层。
-            if let Some(ss) = ar.storage.clone() {
-                builder = builder.storage_size(ss);
-            }
-            builder = builder.app_resources(ar);
-        }
         Ok(builder.build())
     }
 
@@ -951,6 +902,44 @@ impl AppService {
         self.fetch_runtime_status_or_err(app_id).await.map(|_| ())
     }
 
+    /// 校验 app 处于 Running 阶段（exec psql 的前置条件）。
+    ///
+    /// Stopped/Starting 等给 InvalidState 友好错误而非让 exec 失败（exec 在 Stopped 时
+    /// 报容器不存在的 Backend 错误，对用户不友好）。reset_db_password / create_database 共用。
+    async fn ensure_app_running(&self, app_id: &str) -> AppResult<()> {
+        validate_app_id(app_id)?;
+        let status = self.fetch_runtime_status_or_err(app_id).await?;
+        if status.phase != "Running" {
+            return Err(AppOperationError::InvalidState(format!(
+                "app {app_id} not running (phase={}), exec psql requires a live container",
+                status.phase
+            )));
+        }
+        Ok(())
+    }
+
+    /// exec 容器内 psql 命令，exit_code != 0 → Backend 错误（含 stderr 摘要）。
+    ///
+    /// reset_db_password 共用。create_database 因需区分"库已存在"(AlreadyExists) 不复用此函数。
+    async fn exec_psql(
+        &self,
+        app_id: &str,
+        command: Vec<String>,
+        ctx: &str,
+    ) -> AppResult<()> {
+        let r = self.runtime.exec(app_id, command).await.map_err(|e| {
+            map_runtime_error(ctx, e)
+        })?;
+        if r.exit_code != 0 {
+            return Err(AppOperationError::Backend(format!(
+                "{ctx}: exit {}: {}",
+                r.exit_code,
+                r.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
     /// DeploymentStatus → AppRuntimeInfo（含访问地址构建 + conditions 派生）
     fn build_runtime_info(&self, status: DeploymentStatus) -> AppRuntimeInfo {
         let conditions = derive_conditions(&status);
@@ -960,7 +949,7 @@ impl AppService {
         // Gateway 模式：K8s status.ports 已含 HTTP（HTTPRoute backendRef），无需补。
         // ⚠️ 重启风险（pingora_ports 内存态丢失，已知限制）：
         //   - Docker：HTTP 端口补不出 → access.external.http = null（Java 可感知降级）
-        //   - K8s Pingora：status.ports（containerPort）仍含 HTTP → access 返有效 /proxy/{port}，
+        //   - K8s Pingora：status.ports（containerPort）仍含 HTTP → access 返有效 /proxy/apps/{app_id}/{port}，
         //     但 Pingora backend 未重注册 → 访问 404（静默坏路径）。根治：启动从 containerPorts 重建 backends（TODO）
         let ports = if self.config.http_expose == HttpExpose::Pingora {
             let mut merged = status.ports.clone();
@@ -1008,7 +997,7 @@ impl AppService {
         let http_port = ports.iter().find(|p| p.expose_type == RtExposeType::Http);
 
         // 一律只返 path，host 由 Java 拼（Java 必然已知 RCoder / gateway 入口，否则访问不了）：
-        // - Pingora 模式（默认，两后端统一）：/proxy/{port}
+        // - Pingora 模式（默认，两后端统一）：/proxy/apps/{app_id}/{port}
         // - Gateway 模式（K8s 可选）：/apps/{app_id}
         // TCP 初期不对外（external.tcp 空）；internal 始终给 ClusterIP FQDN / 容器名。
         let http_url = match self.config.http_expose {

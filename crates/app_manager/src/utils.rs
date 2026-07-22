@@ -59,6 +59,27 @@ pub(super) fn map_archive_error(e: ArchiveError) -> AppOperationError {
     }
 }
 
+/// canonicalize `target` 并校验仍在 `canonical_app_dir` 内（path traversal 防护）。
+///
+/// 4 处文件操作（upload/extract/list/delete）+ service.rs `get_app_file_logs` 共用。
+/// 调用前需保证 `target` 已存在（否则 canonicalize 抛 OS 错误 → Backend）；
+/// 需要 NotFound 语义的调用方（如日志文件读取）应先 `target.exists()` 守卫。
+/// `canonical_app_dir` 应由调用方预先 canonicalize（通常在创建目录后立即取）。
+pub(super) fn ensure_within_app_dir(
+    target: &std::path::Path,
+    canonical_app_dir: &std::path::Path,
+) -> AppResult<std::path::PathBuf> {
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| map_io_error("failed to resolve path", e, false))?;
+    if !canonical.starts_with(canonical_app_dir) {
+        return Err(AppOperationError::Validation(
+            "path is outside app dir".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
 /// 校验 upload target（app 根相对路径）。
 ///
 /// 拒绝空 / 绝对路径 / 含 `..` 组件——在 `create_dir_all` **之前**拦截，避免 path traversal
@@ -127,18 +148,13 @@ pub(super) fn validate_pg_identifier(name: &str) -> AppResult<()> {
             "PG identifier must be 1..=63 chars".to_string(),
         ));
     }
-    match name.chars().next() {
-        Some(first) if !(first.is_ascii_alphabetic() || first == '_') => {
-            return Err(AppOperationError::Validation(
-                "PG identifier must start with letter or '_'".to_string(),
-            ));
-        }
-        None => {
-            return Err(AppOperationError::Validation(
-                "PG identifier empty".to_string(),
-            ))
-        }
-        _ => {}
+    // 首字符：必须字母或下划线（is_empty 已由上方长度校验拦截，无需再处理 None）
+    if let Some(first) = name.chars().next()
+        && !(first.is_ascii_alphabetic() || first == '_')
+    {
+        return Err(AppOperationError::Validation(
+            "PG identifier must start with letter or '_'".to_string(),
+        ));
     }
     if !name.chars().skip(1).all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(AppOperationError::Validation(
@@ -268,5 +284,248 @@ pub(super) fn map_health_check_type(t: &HealthCheckType) -> RtHealthCheckType {
         HealthCheckType::Tcp => RtHealthCheckType::Tcp,
         HealthCheckType::Exec => RtHealthCheckType::Exec,
         HealthCheckType::None => RtHealthCheckType::None,
+    }
+}
+
+/// 校验 K8s 存储大小（K8s Quantity）：1Gi ≤ size ≤ 100Ti
+///
+/// 独立校验函数（不依赖 rcoder），create/update 时 storage/ephemeral_storage 校验共用。
+/// 与 `rcoder::handler::pod_handler::validate_k8s_storage_size` 语义一致（同源）。
+// validate_k8s_storage_size 下沉到 container-runtime-api（共享，避免双份维护）
+pub(super) use container_runtime_api::validate_k8s_storage_size;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use container_runtime_api::{
+        ExposeType as RtExposeType, HealthCheckType as RtHealthCheckType,
+    };
+
+    // ---------------- validate_app_id ----------------
+
+    #[test]
+    fn validate_app_id_ok() {
+        assert!(validate_app_id("app-order-svc").is_ok());
+        assert!(validate_app_id("app-1a2b3c4d").is_ok());
+        assert!(validate_app_id("app-a").is_ok()); // 最短合法
+    }
+
+    #[test]
+    fn validate_app_id_err_no_prefix() {
+        // 无 app- 前缀
+        assert!(validate_app_id("order-svc").is_err());
+    }
+
+    #[test]
+    fn validate_app_id_err_empty_after_prefix() {
+        // prefix 后为空
+        assert!(validate_app_id("app-").is_err());
+    }
+
+    #[test]
+    fn validate_app_id_err_uppercase() {
+        // 大写非法（DNS-1123 label）
+        assert!(validate_app_id("app-UPPER").is_err());
+    }
+
+    #[test]
+    fn validate_app_id_err_path_traversal() {
+        // 含 ../ 等穿越字符
+        assert!(validate_app_id("app-../../../etc").is_err());
+    }
+
+    #[test]
+    fn validate_app_id_err_too_long() {
+        // rest > 63 字符
+        let too_long = format!("app-{}", "a".repeat(64));
+        assert!(validate_app_id(&too_long).is_err());
+    }
+
+    #[test]
+    fn validate_app_id_err_trailing_dash() {
+        // 尾部 '-' 非法
+        assert!(validate_app_id("app-trailing-").is_err());
+    }
+
+    // ---------------- validate_pg_identifier ----------------
+
+    #[test]
+    fn validate_pg_identifier_ok() {
+        assert!(validate_pg_identifier("mydb").is_ok());
+        assert!(validate_pg_identifier("_underscore").is_ok());
+        assert!(validate_pg_identifier("MixedCase123").is_ok());
+    }
+
+    #[test]
+    fn validate_pg_identifier_err_empty() {
+        assert!(validate_pg_identifier("").is_err());
+    }
+
+    #[test]
+    fn validate_pg_identifier_err_starts_with_digit() {
+        assert!(validate_pg_identifier("1num").is_err());
+    }
+
+    #[test]
+    fn validate_pg_identifier_err_dash() {
+        assert!(validate_pg_identifier("has-dash").is_err());
+    }
+
+    #[test]
+    fn validate_pg_identifier_err_space() {
+        assert!(validate_pg_identifier("has space").is_err());
+    }
+
+    #[test]
+    fn validate_pg_identifier_err_injection() {
+        assert!(validate_pg_identifier("a;b").is_err());
+    }
+
+    // ---------------- validate_upload_target ----------------
+
+    #[test]
+    fn validate_upload_target_ok() {
+        assert!(validate_upload_target("code/app.jar").is_ok());
+        assert!(validate_upload_target("data/db/file").is_ok());
+    }
+
+    #[test]
+    fn validate_upload_target_err_traversal() {
+        assert!(validate_upload_target("../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_upload_target_err_absolute() {
+        assert!(validate_upload_target("/absolute").is_err());
+    }
+
+    #[test]
+    fn validate_upload_target_err_empty() {
+        assert!(validate_upload_target("").is_err());
+    }
+
+    // ---------------- phase_to_status ----------------
+
+    #[test]
+    fn phase_to_status_running() {
+        assert_eq!(phase_to_status("Running"), AppStatus::Running);
+    }
+
+    #[test]
+    fn phase_to_status_stopped() {
+        assert_eq!(phase_to_status("Stopped"), AppStatus::Stopped);
+        assert_eq!(phase_to_status("ScaledDown"), AppStatus::Stopped);
+    }
+
+    #[test]
+    fn phase_to_status_starting() {
+        assert_eq!(phase_to_status("Starting"), AppStatus::Starting);
+        assert_eq!(phase_to_status("Pending"), AppStatus::Starting);
+    }
+
+    #[test]
+    fn phase_to_status_error() {
+        assert_eq!(phase_to_status("Error"), AppStatus::Error);
+        assert_eq!(phase_to_status("Failed"), AppStatus::Error);
+    }
+
+    #[test]
+    fn phase_to_status_unknown_falls_back_to_created() {
+        assert_eq!(phase_to_status("unknown"), AppStatus::Created);
+    }
+
+    // ---------------- extract_reason ----------------
+
+    #[test]
+    fn extract_reason_finds_known_code() {
+        assert_eq!(
+            extract_reason("Back-off restarting... CrashLoopBackOff"),
+            Some("CrashLoopBackOff")
+        );
+        assert_eq!(
+            extract_reason("ImagePullBackOff: pull failed"),
+            Some("ImagePullBackOff")
+        );
+        assert_eq!(extract_reason("ErrImagePull"), Some("ErrImagePull"));
+        assert_eq!(extract_reason("OOMKilled"), Some("OOMKilled"));
+    }
+
+    #[test]
+    fn extract_reason_returns_none_for_normal_log() {
+        assert_eq!(extract_reason("normal log message"), None);
+    }
+
+    // ---------------- http_port_numbers ----------------
+
+    #[test]
+    fn http_port_numbers_filters_http_only() {
+        // 2 HTTP + 1 TCP → 只返回 HTTP 端口
+        let ports = Some(vec![
+            PortConfig {
+                name: "web".into(),
+                port: 8080,
+                expose_type: ExposeType::Http,
+                strip_prefix: None,
+            },
+            PortConfig {
+                name: "db".into(),
+                port: 5432,
+                expose_type: ExposeType::Tcp,
+                strip_prefix: None,
+            },
+        ]);
+        assert_eq!(http_port_numbers(&ports), vec![8080]);
+    }
+
+    #[test]
+    fn http_port_numbers_none_returns_empty() {
+        let result: Vec<u16> = http_port_numbers(&None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn http_port_numbers_tcp_only_returns_empty() {
+        let tcp_only = Some(vec![PortConfig {
+            name: "db".into(),
+            port: 5432,
+            expose_type: ExposeType::Tcp,
+            strip_prefix: None,
+        }]);
+        let result: Vec<u16> = http_port_numbers(&tcp_only);
+        assert!(result.is_empty());
+    }
+
+    // ---------------- map_expose_type / map_health_check_type ----------------
+
+    #[test]
+    fn map_expose_type_maps_variants() {
+        assert!(matches!(
+            map_expose_type(&ExposeType::Http),
+            RtExposeType::Http
+        ));
+        assert!(matches!(
+            map_expose_type(&ExposeType::Tcp),
+            RtExposeType::Tcp
+        ));
+    }
+
+    #[test]
+    fn map_health_check_type_maps_variants() {
+        assert!(matches!(
+            map_health_check_type(&HealthCheckType::Http),
+            RtHealthCheckType::Http
+        ));
+        assert!(matches!(
+            map_health_check_type(&HealthCheckType::Tcp),
+            RtHealthCheckType::Tcp
+        ));
+        assert!(matches!(
+            map_health_check_type(&HealthCheckType::Exec),
+            RtHealthCheckType::Exec
+        ));
+        assert!(matches!(
+            map_health_check_type(&HealthCheckType::None),
+            RtHealthCheckType::None
+        ));
     }
 }

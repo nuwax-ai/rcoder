@@ -765,6 +765,27 @@ pub fn parse_memory_quantity(quantity: &str) -> Option<u64> {
     Some(bytes.round() as u64)
 }
 
+/// 校验 K8s 存储大小（Quantity 格式 + 范围限制）。
+///
+/// 共享校验（app_manager service / rcoder pod_handler 都用），避免逻辑重复。
+/// - 格式：合法 K8s Quantity（调 [`parse_memory_quantity`]）
+/// - 范围：1Gi ≤ size ≤ 100Ti
+pub fn validate_k8s_storage_size(storage_size: &str) -> Result<(), String> {
+    let bytes = parse_memory_quantity(storage_size).ok_or_else(|| {
+        format!(
+            "invalid storage_size '{storage_size}': expected K8s quantity (e.g., 10Gi, 100Mi, 1Ti)"
+        )
+    })?;
+    let gi = bytes as f64 / 1024f64.powi(3);
+    if gi < 1.0 {
+        return Err("storage_size must be at least 1Gi".to_string());
+    }
+    if gi > 100.0 * 1024.0 {
+        return Err("storage_size cannot exceed 100Ti".to_string());
+    }
+    Ok(())
+}
+
 /// 拆分带时间戳的容器日志行。
 ///
 /// `timestamps=true` 时 K8s `logs` 与 `docker logs` 行格式均为 `<RFC3339> <message>`
@@ -839,5 +860,22 @@ mod quantity_tests {
         assert_eq!(parse_memory_quantity(""), None);
         assert_eq!(parse_memory_quantity("   "), None);
         assert_eq!(parse_memory_quantity("abc"), None);
+    }
+
+    #[test]
+    fn test_validate_k8s_storage_size_valid() {
+        assert!(validate_k8s_storage_size("10Gi").is_ok());
+        assert!(validate_k8s_storage_size("1Gi").is_ok()); // 边界（最小）
+        assert!(validate_k8s_storage_size("100Ti").is_ok()); // 边界（最大）
+        assert!(validate_k8s_storage_size("500Gi").is_ok());
+    }
+
+    #[test]
+    fn test_validate_k8s_storage_size_invalid() {
+        assert!(validate_k8s_storage_size("512Mi").is_err()); // < 1Gi
+        assert!(validate_k8s_storage_size("0").is_err()); // 太小
+        assert!(validate_k8s_storage_size("abc").is_err()); // 非法格式
+        assert!(validate_k8s_storage_size("").is_err()); // 空
+        assert!(validate_k8s_storage_size("1Pi").is_err()); // > 100Ti（1Pi = 1024Ti）
     }
 }

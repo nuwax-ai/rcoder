@@ -272,7 +272,7 @@ pub struct AppInfo {
 /// 应用运行时信息（rcoder 实时从集群查询）
 ///
 /// 只含运行时字段（phase/副本/Pod IP/端口状态/访问地址），**不含业务元数据**。
-/// 由 [`crate::app_manager::AppService`] 调用 `ContainerRuntime::get_deployment_status` /
+/// 由 [`crate::service::AppService`] 调用 `ContainerRuntime::get_deployment_status` /
 /// `list_deployments` 实时组装，rcoder 重启后仍可查询（真正无状态）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppRuntimeInfo {

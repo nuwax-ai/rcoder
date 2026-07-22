@@ -14,6 +14,7 @@ default-members = [
     "crates/rcoder-gateway",
     "crates/download_utils",
     "crates/agent_provisioning",
+    "crates/app_manager",
 ]
 
 

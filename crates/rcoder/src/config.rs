@@ -67,7 +67,7 @@ pub struct AppConfig {
     pub api_key_auth: ApiKeyAuthConfig,
     /// 应用管理配置
     #[serde(default)]
-    pub app_manager: crate::app_manager::AppManagerConfig,
+    pub app_manager: app_manager::AppManagerConfig,
 }
 
 fn default_agent_id() -> String {
@@ -279,7 +279,7 @@ impl Default for AppConfig {
                 enabled: false,
                 api_key: generate_random_api_key(),
             },
-            app_manager: crate::app_manager::AppManagerConfig::default(),
+            app_manager: app_manager::AppManagerConfig::default(),
         }
     }
 }
