@@ -264,8 +264,9 @@ v1 这里 Fail-Fast。v2 用 SSA 真正实现：
 orphan 扫描（兜底，仅扫 K8s 计算资源）：
   5. list 所有带 instance={app_id}, managed-by=rcoder-app-manager 的【计算资源】
      任何残留 → 删除（防止前面步骤部分失败留孤儿）
-     注：持久存储（共享 PVC 上的 apps/{app_id} subPath 目录）不是 K8s 资源，
-         不在 label 扫描范围内，故不会被误删——这正是"默认保留"的实现保障。
+     注：per-app PVC 虽是 K8s 资源（带 instance label），但 cleanup_labeled_orphans
+         明确【不扫 PVC】（只扫 Deployment/Service/ConfigMap/Secret/HTTPRoute），
+         故 PVC 不会被误删——这正是"默认保留持久存储"的实现保障。
 ```
 
 **默认保留持久存储的理由**：应用可重建，数据不可再生。误删应用若连带抹掉 `data/`（数据库、用户上传、文件日志）是灾难性的。因此 `POST /apps/{id}/delete` 只删"计算面"（Deployment/Service/路由/配置），**保留"数据面"**（code/data/logs 目录）。
@@ -289,7 +290,7 @@ Docker 后端：删容器 + 删网络 + 摘 pingora 路由 / host port；**保�
 **安全约束**：`POST /apps/{id}/storage/delete` **仅当该 app 的计算资源不存在（即已 delete）时才允许**；若 app 仍存在（Running/Stopped 等），返回 `409 INVALID_STATE`，避免清空在用数据导致损坏。强制工作流：`delete app →（数据保留）→ 确认无误后再 storage/delete`。
 
 **实现**：
-- **K8s**：删除共享 PVC（`project-workspace-pvc`）上的 `apps/{app_id}` subPath 目录（**不删 PVC 本身**——PVC 是多 app 共享的）。
+- **K8s**：每 app 一个独立 **per-app PVC**（CephFS subvolume，`subPath=None`，整 PVC 根挂 `/app`）。`storage/delete` **清空 PVC 根内容（code/data/logs）但保留 subvolume 根目录**——删根会破坏 PV `csi.volumeAttributes.subvolumePath` → pod 重启挂载异常。PVC **永不删除**（数据安全硬约束，配额靠 `resize` 回收不靠删 PVC）。
 - **Docker**：删除 `app-workspace/{app_id}/` 目录。
 
 **重建复用**：若 Java 用同一 `app_id` 重新 `POST /apps`，由于存储目录还在，新应用会自动挂回旧数据（适合"误删应用、找回数据"场景）。若需要干净起点，先 `storage/delete` 再 create。
@@ -312,9 +313,9 @@ POST /apps/storage/query
   StorageInfo = { app_id, exists, path, modified_at, is_orphan }   // 全部 O(1) 单次 stat，不遍历
 ```
 
-**存储大小策略（绝不能用 `du`）**：app 存储落在 Rook/Ceph 裸盘上的共享 CephFS PVC（per-app subPath）。RCoder 虽把它挂载为普通路径，但在 CephFS 上**每次 `stat`/`du` 都是一次到 MDS 的网络往返**，遍历目录树代价极高且会压垮 MDS——**RCoder 绝不用 `du`/递归 stat 去算 size**。
+**存储大小策略（绝不能用 `du`）**：app 存储落在 per-app CephFS subvolume PVC 上（每 app 独立 subvolume，整 PVC 根挂 `/app`）。RCoder 虽经挂根聚合（`{cephfs_root}/{subvolumePath}`，见 §10.3.1）把它当普通路径访问，但在 CephFS 上**每次 `stat`/`du` 都是一次到 MDS 的网络往返**，遍历目录树代价极高且会压垮 MDS——**RCoder 绝不用 `du`/递归 stat 去算 size**。
 
-因此 `StorageInfo` **不含 `size_bytes`**。per-app 存储用量是"存储观测性"关切，不属于应用生命周期，交给 Ceph 原生体系：`ceph-mgr` + Prometheus `ceph_exporter` + Grafana 观测，配合 CephFS **每目录配额** `ceph.quota.max_bytes`（`setfattr -n ceph.quota.max_bytes -v <bytes> <dir>`）做限额。这样 RCoder 既不算 size 也不背存储计费的锅。
+因此 `StorageInfo` **不含 `size_bytes`**。per-app 存储用量是"存储观测性"关切，不属于应用生命周期，交给 Ceph 原生体系：`ceph-mgr` + Prometheus `ceph_exporter` + Grafana 观测。**配额**走 per-app PVC 的 `requests.storage`：创建时 ceph-csi 服务端据此执行 `subvolume create --size` 设 **subvolume 级配额**；扩容 patch `requests.storage` → external-resizer 自动 `subvolume resize`（只扩不缩）。**不用 client 端 `setfattr`**（csi 挂载默认无写 xattr caps，且 subvolume 级配额比目录配额更精准、与 PVC 生命周期一致）。默认 `50Gi`（`CreateAppRequest.storage_size` 未指定时，见 `DEFAULT_PVC_STORAGE_SIZE`）。
 
 > **备选**（仅当将来业务确需在 RCoder 接口里直接拿 per-app 大小时再考虑）：CephFS 的 MDS 内置维护每目录递归大小，可读虚拟 xattr `ceph.dir.rbytes`（一次 `getfattr`，O(1)、不遍历），仅在 `GET /apps/{id}/storage` 实现，且需确认挂载已开启 xattr 支持 + RCoder 引入 `getfattr`/libcephfs 能力；**列表接口无论如何都不算 size**。当前 v2 不做。
 
@@ -497,7 +498,7 @@ pub trait ContainerRuntime: Send + Sync {
 | HTTP 端口对外（默认 Pingora） | **不建额外资源**——RCoder 内置 Pingora 转发到 `{app_id}-svc:{port}`，access 返回 path `/proxy/apps/{app_id}/{port}`（Java 拼 RCoder 入口） | — |
 | HTTP 端口对外（可选 gateway） | `HTTPRoute` `{app_id}-route`（path `/apps/{app_id}`，挂 `nuwax-gateway`），**仅 `http_expose=gateway` 时建** | 同上 |
 | TCP 端口对外 | **初期不对外**（不建 NodePort）；仅 ClusterIP 供集群内访问 | — |
-| 持久存储 | `PVC`（复用 workspace PVC 的 `apps/{app_id}` subPath，见 §10） | — |
+| 持久存储 | **per-app `PVC`**（CephFS subvolume，`subPath=None`，整 PVC 根挂 `/app`；每 app 独立 PVC + subvolume 级配额，见 §10.3.1） | `instance={app_id}, managed-by=rcoder-app-manager` |
 
 **所有 K8s 写操作走 SSA**（operator-rs `apply_patch` 模式）：`field_manager="rcoder-app-manager/{resource-kind}"`，`force=true`。这让 create-or-update 自然合一，update 实现零成本。
 
@@ -638,7 +639,7 @@ RCoder 进程重启后：
 ### 10.1 目录约定（app 根相对）
 
 ```
-{app 根}/                      # K8s: PVC 的 apps/{app_id} subPath 挂到 /app；Docker: app-workspace/{app_id}/
+{app 根}/                      # K8s: per-app CephFS subvolume PVC 根 (整 PVC 挂到 /app, subPath=None)；Docker: app-workspace/{app_id}/
 ├── code/                      # 应用代码（启动前上传，运行时只读）
 ├── data/                      # 应用数据（读写）
 └── logs/                      # 应用日志（容器 stdout 之外的文件日志，读写）
@@ -654,8 +655,28 @@ RCoder 进程重启后：
 
 | 后端 | app 根（RCoder 视角） | app 根（容器视角） |
 |---|---|---|
-| K8s | `/app/project_workspace/apps/{app_id}`（复用 rcoder workspace PVC subPath） | `/app` |
+| K8s | `{RCODER_CEPHFS_ROOT}/{subvolumePath}`（rcoder 经挂根聚合访问 per-app PVC 根，**不 join app_id**；subvolumePath 由 PVC→PV `csi.volumeAttributes` 解析，见 §10.3.1） | `/app`（整 per-app PVC 根，subPath=None） |
 | Docker | `{RCODER_WORKSPACE_ROOT}/{app_id}` | `/app`（bind-mount） |
+
+### 10.3.1 per-app PVC 与挂根聚合（K8s 实现要点）
+
+UserApp 持久存储用 **per-app CephFS subvolume PVC**（每 app 独立 PVC + subvolume 级配额，`subPath=None`，整 PVC 根挂 `/app`）。rcoder 自身**不挂 per-app PVC**，而是挂一个 **CephFS 根静态 PV**（ceph-csi `rootPath=/`，挂到 `$RCODER_CEPHFS_ROOT`，默认 `/app/cephfs-root`），经聚合路径访问任意 app 的数据——这样 rcoder 不依赖某个具体 PVC 也能 tree/upload/storage：
+
+```
+rcoder 访问 app 数据:  {RCODER_CEPHFS_ROOT}/{subvolumePath}/<app 内相对路径>
+                            ▲                       ▲
+              cephfs-root 静态 PV 挂载点       per-app PVC → PV 的
+                                            csi.volumeAttributes.subvolumePath
+                              （形如 /volumes/csi/<uuid>/<subuuid>，CephFS fs 根绝对路径）
+```
+
+- **subvolumePath 解析**：读 per-app PVC 的 `spec.volumeName`（PV 名）→ PV 的 `csi.volumeAttributes["subvolumePath"]`（兜底 `rootPath`，ceph-csi 版本差异）。对 PVC 不可变 → 结果缓存（key=pvc_name，永不失效；PVC 重建即新 subvol UUID，创建时 invalidate 旧缓存）。
+- **功能开关**：`rcoder.userAppPerAppPvc.enabled`（helm values）→ env `RCODER_USERAPP_PER_APP_PVC_ENABLED`。`true` 时 helm 派生 cephfs-root 静态 PV/PVC + mount + 注入 `RCODER_CEPHFS_ROOT`（`or perAgentPvc` 关系，主线 per-agent PVC 共用同一挂根基础设施）。
+- **PVC 命名**：`{container_prefix}-{sanitized_id}-workspace`（`ServiceType::UserApp` 前缀，下划线转连字符，DNS-1123 合规）。
+- **SC / 默认 size**：`storage_class` ← env `RCODER_K8S_STORAGE_CLASS`（部署注入，dev/test/prod = `cephfs`）；`access_mode` ← `RCODER_K8S_PVC_ACCESS_MODE`（默认 `ReadWriteMany`）。size = `CreateAppRequest.storage_size`，未指定时 `DEFAULT_PVC_STORAGE_SIZE = 50Gi`。
+- **配额**：见 §5.4（PVC `requests.storage` → ceph-csi subvolume 级配额，非 `setfattr`）。
+
+> ⚠️ **部署前提（上线必测）**：① cephfs-root 静态 PV 的 `clusterID`/`fsName`/`rootPath`/`nodeStageSecretRef` 须匹配集群（写死在 helm template，不匹配 → rcoder pod 卡 ContainerCreating）；② per-app PVC 的 PV `csi.volumeAttributes` 实际返回的 key（`subvolumePath` vs `rootPath`，代码已做兜底，仍需实测确认）。
 
 ### 10.4 upload 压缩包自动解压（v2 新增）
 
@@ -770,7 +791,7 @@ operator-rs 没做好的"retryable vs terminal"分类，v2 用 `is_retryable_cod
 | `models.rs::UpdateAppRequest` | 加 `ports` / `health_check` 字段（§6.1） |
 | `models.rs`（新增） | `DeleteAppRequest { purge: Option<bool> }`、`QueryStorageRequest { page: u32, page_size: u32 /* 必填, ≤100 */, filters }` + `StorageFilters { orphan_only, app_ids, tenant_id, space_id }`、`StorageInfo { app_id, exists, path, modified_at, is_orphan }`（**不含 size_bytes**——CephFS 上不能用 du，见 §5.4） |
 | `runtime_trait.rs` | 加 `patch_deployment` / `delete_app_resources` / `get_app_storage` / `delete_app_storage` / `list_orphan_storage`（§7.1） |
-| K8s 后端写操作 | 全面改用 SSA `apply_patch`（替换现在的 `create` + `patch` 分支）；delete 不再删 PVC subPath 目录 |
+| K8s 后端写操作 | 全面改用 SSA `apply_patch`（替换现在的 `create` + `patch` 分支）；delete 不删 per-app PVC（数据安全硬约束），仅清计算资源 |
 
 开发阶段、未对外提供接口，故可直接改契约，无需版本共存。
 
