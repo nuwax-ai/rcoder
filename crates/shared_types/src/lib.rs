@@ -90,6 +90,9 @@ pub use shared_types_i18n::{
 pub mod validation;
 pub use validation::{garde_err_to_app_error, validate_identifier};
 
+pub mod quantity;
+pub use quantity::{parse_memory_quantity, validate_k8s_storage_size};
+
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
 pub use shared_types_grpc::grpc;
 
