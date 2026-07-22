@@ -1836,54 +1836,58 @@ function start_ime_services() {
 }
 
 # ============================================================================
-# 🖥️ ttyd Web 终端服务（PTY → WebSocket，给前端 xterm.js 用）
-# 不依赖 X11，可与 noVNC 并存：noVNC 看桌面，ttyd 敲命令
-# 降权到 user (uid 1000) 防止 -W 模式下浏览器直接以 root 跑命令
+# 🐘 PostgreSQL + pgweb（开发环境本地数据库 + Web UI）
+# 用户在 agent-runner 容器开发时用本地 PG 测试；开发完打包发布到 UserApp。
+# PG 数据落 /home/user/.pgdata（持久化，容器重启保留）；pgweb Web UI 操作数据库。
 # ============================================================================
-function start_ttyd_services() {
-    log "Starting ttyd web terminal service..."
+function init_pg() {
+    log "Initializing PostgreSQL (首次 initdb，supervisor 启动前一次性)..."
 
-    # 检查开关（默认开，与 audio_server/ime_server 风格一致）
-    if [ "${ENABLE_TTYD:-true}" != "true" ]; then
-        log_warn "  ttyd is disabled (set ENABLE_TTYD=true to enable)"
-        return 0
+    export PGDATA="${PGDATA:-/home/user/.pgdata}"
+    export POSTGRES_USER="${POSTGRES_USER:-dev}"
+    export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-dev}"
+    export POSTGRES_DB="${POSTGRES_DB:-dev}"
+    export PGWEB_PORT="${PGWEB_PORT:-8081}"
+
+    mkdir -p "$PGDATA" /app/logs
+    chown -R postgres:postgres "$(dirname "$PGDATA")" 2>/dev/null || true
+
+    # 初始化 PG（首次，PGDATA 为空）—— supervisor 启动前一次性 initdb，
+    # 避免 supervisor 反复尝试 initdb（postgres 进程归 supervisor 管，autorestart）
+    if [ ! -s "$PGDATA/PG_VERSION" ]; then
+        log "  Initializing PostgreSQL at $PGDATA ..."
+        local PWFILE
+        PWFILE=$(mktemp)
+        printf '%s\n' "$POSTGRES_PASSWORD" > "$PWFILE"
+        chown postgres:postgres "$PWFILE"; chmod 600 "$PWFILE"
+        if ! su postgres -c "/usr/lib/postgresql/16/bin/initdb -D \"$PGDATA\" --username=\"$POSTGRES_USER\" --pwfile=\"$PWFILE\" --auth-host=scram-sha-256 --auth-local=trust"; then
+            log_warn "  PG initdb failed"
+            rm -f "$PWFILE"
+            return 1
+        fi
+        rm -f "$PWFILE"
+        # 临时启动建业务库
+        su postgres -c "/usr/lib/postgresql/16/bin/pg_ctl -D \"$PGDATA\" -o '-c listen_addresses= -c unix_socket_directories=/tmp' -w start"
+        su postgres -c "/usr/lib/postgresql/16/bin/createdb -h /tmp -U \"$POSTGRES_USER\" \"$POSTGRES_DB\"" 2>/dev/null || true
+        su postgres -c "/usr/lib/postgresql/16/bin/pg_ctl -D \"$PGDATA\" -m fast -w stop"
+        log_success "  PostgreSQL initialized (user=$POSTGRES_USER db=$POSTGRES_DB)"
     fi
+    chown -R postgres:postgres "$(dirname "$PGDATA")" 2>/dev/null || true
 
-    # 检查二进制（由 Dockerfile.base 注入）
-    if [ ! -x /usr/local/bin/ttyd ]; then
-        log_warn "  ttyd binary not found at /usr/local/bin/ttyd, skipping"
-        return 1
-    fi
-
-    # 检查启动脚本（由 Dockerfile 注入）
-    if [ ! -x /usr/local/bin/start-ttyd.sh ]; then
-        log_warn "  start-ttyd.sh not found, skipping"
-        return 1
-    fi
-
-    # 创建日志目录
-    local TTYD_LOG_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}/ttyd"
-    mkdir -p "$TTYD_LOG_DIR"
-    chmod 755 "$TTYD_LOG_DIR"
-    log_success "  ttyd log directory: $TTYD_LOG_DIR"
-
-    # 启动（与 ime/audio 同风格：nohup + 后台 + 写日志）
-    nohup /usr/local/bin/start-ttyd.sh > "$TTYD_LOG_DIR/ttyd.log" 2>&1 &
-
-    # 等待端口就绪（5 秒内）
-    local TTYD_PORT="${TTYD_PORT:-7681}"
-    if wait_for_port localhost "$TTYD_PORT" 5; then
-        log_success "  ttyd started"
-        log_success "  ttyd URL:        http://localhost:${TTYD_PORT}/"
-        log_success "  ttyd WebSocket:  ws://localhost:${TTYD_PORT}/ws"
-    else
-        log_warn "  ttyd port ${TTYD_PORT} not ready, check log: $TTYD_LOG_DIR/ttyd.log"
-        tail -20 "$TTYD_LOG_DIR/ttyd.log" 2>/dev/null || true
-        return 1
-    fi
-
+    # 连接信息（供用户参考；postgres/pgweb 进程由 supervisor 管）
+    cat > /home/user/pg-connection.txt <<EOF
+PostgreSQL 开发数据库:
+  容器内: host=localhost port=5432 user=$POSTGRES_USER password=$POSTGRES_PASSWORD database=$POSTGRES_DB sslmode=disable
+pgweb: http://localhost:$PGWEB_PORT  (Add Connection 填上述信息)
+EOF
+    log_success "PostgreSQL initdb done（进程由 supervisor 管：postgresql/pgweb/ttyd）"
     return 0
 }
+
+# ============================================================================
+# 🖥️ ttyd Web 终端 —— 由 supervisor 管（conf.d/ttyd.conf，autorestart 自动拉起）
+# 不再在此 nohup 启动（阶段1 迁 supervisor；进程崩溃 supervisor 自动重启）
+# ============================================================================
 
 # 设置VNC自动启动标志
 export VNC_AUTO_START=true
@@ -1891,6 +1895,13 @@ export VNC_AUTO_START=true
 # ========== 关键：在启动 X11 之前初始化用户主目录 ==========
 # 从骨架目录恢复配置（解决挂载空目录导致的花屏和图标消失）
 initialize_user_home
+
+# ========== supervisor 管 ttyd/PG/pgweb（不依赖 X11，初始化后启动）==========
+# 阶段1：ttyd/PG/pgweb 迁 supervisor（autorestart 崩溃自动拉起）
+# VNC/XFCE/MCP/audio/IME 仍由下方 start-up.sh 管（保留自定义）
+init_pg                                          # PG 首次 initdb（一次性，supervisor 启动前）
+supervisord -c /etc/supervisor/supervisord.conf  # daemon，autostart postgres/pgweb/ttyd
+log "supervisord started (manages: postgresql, pgweb, ttyd — autorestart on crash)"
 
 # ========== MCP Proxy 服务在 X11 就绪后启动 ==========
 # 注意：chrome-devtools-mcp 需要 X11 来启动 Chromium 浏览器
@@ -1961,11 +1972,8 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
     ) &
     ime_pid=$!
 
-    # 4.5 ttyd Web 终端（不依赖 X11，独立启动）
-    (
-        start_ttyd_services
-    ) &
-    ttyd_pid=$!
+    # 4.5 ttyd + PostgreSQL + pgweb —— 由 supervisor 管（autorestart），不在此启动
+    # （见上方 supervisord 启动；阶段1 迁 supervisor）
 
     # 5. 应用 XFCE 壁纸（后台）
     (
@@ -1975,7 +1983,7 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
 
     # 等待所有并行服务启动完成
     log "Waiting for all services to start..."
-    wait $vnc_pid $mcp_pid $audio_pid $ime_pid $ttyd_pid $wallpaper_pid 2>/dev/null || true
+    wait $vnc_pid $mcp_pid $audio_pid $ime_pid $wallpaper_pid 2>/dev/null || true
     log_success "All X11-dependent services started!"
 
     # 🆕 启动 VNC 就绪标记轮询任务（后台）

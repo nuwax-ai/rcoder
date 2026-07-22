@@ -30,17 +30,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# 安全校验：只允许 /app/ 下的子目录
+# 设定初始工作目录：--cwd 指定则 cd 到该目录，否则 cd /app（非访问控制，bash 后可 cd 任意）
 if [ -n "$TARGET_DIR" ] && [ -d "$TARGET_DIR" ]; then
-    REAL_DIR=$(realpath "$TARGET_DIR" 2>/dev/null)
-    case "$REAL_DIR" in
-        /app|/app/*)
-            cd "$REAL_DIR" 2>/dev/null || cd /app 2>/dev/null || true
-            ;;
-        *)
-            cd /app 2>/dev/null || true
-            ;;
-    esac
+    cd "$TARGET_DIR" 2>/dev/null || cd /app 2>/dev/null || true
 else
     cd /app 2>/dev/null || true
 fi

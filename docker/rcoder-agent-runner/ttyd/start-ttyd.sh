@@ -12,6 +12,12 @@
 
 set -e
 
+# ENABLE_TTYD 开关（迁 supervisor 后保留：false → exit 0，supervisor 认为正常退出不 restart）
+if [ "${ENABLE_TTYD:-true}" != "true" ]; then
+    echo "ttyd disabled (ENABLE_TTYD != true), exit 0"
+    exit 0
+fi
+
 PORT="${TTYD_PORT:-7681}"
 # 主镜像是 user (uid 1000)，不是 demo；保持和项目其他服务一致
 USER_NAME="${TTYD_USER:-user}"
@@ -22,14 +28,11 @@ INDEX_PATH="${TTYD_INDEX:-/usr/local/share/ttyd/index.html}"
 CREDENTIAL="${TTYD_CREDENTIAL:-}"
 
 # ttyd -u/-g 接受数字 ID，不接受用户名；自动转换
-# 如果指定的用户不存在，自动回退到 root 用户
-USER_ID="$(id -u "${USER_NAME}" 2>/dev/null || true)"
-GROUP_ID="$(id -g "${USER_NAME}" 2>/dev/null || true)"
+USER_ID="$(id -u "${USER_NAME}" 2>/dev/null)"
+GROUP_ID="$(id -g "${USER_NAME}" 2>/dev/null)"
 if [ -z "${USER_ID}" ] || [ -z "${GROUP_ID}" ]; then
-    echo "⚠️  用户 ${USER_NAME} 不存在，使用 root 用户"
-    USER_NAME="root"
-    USER_ID=0
-    GROUP_ID=0
+    echo "❌ 用户 ${USER_NAME} 不存在"
+    exit 1
 fi
 
 AUTH_OPT=""
@@ -72,18 +75,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# 安全校验：只允许 /home/USER_NAME_PLACEHOLDER/ 下的子目录
+# 设定初始工作目录：--cwd 指定则 cd 到该目录，否则 cd $HOME（非访问控制，bash 后可 cd 任意）
 if [ -n "$TARGET_DIR" ] && [ -d "$TARGET_DIR" ]; then
-    REAL_DIR=$(realpath "$TARGET_DIR" 2>/dev/null)
-    HOME_PREFIX="/home/USER_NAME_PLACEHOLDER"
-    case "$REAL_DIR" in
-        "$HOME_PREFIX"|"$HOME_PREFIX"/*)
-            cd "$REAL_DIR" 2>/dev/null || cd "${HOME}" 2>/dev/null || true
-            ;;
-        *)
-            cd "${HOME}" 2>/dev/null || true
-            ;;
-    esac
+    cd "$TARGET_DIR" 2>/dev/null || cd "${HOME}" 2>/dev/null || true
 else
     cd "${HOME}" 2>/dev/null || true
 fi

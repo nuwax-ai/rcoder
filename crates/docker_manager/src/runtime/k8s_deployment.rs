@@ -1105,18 +1105,16 @@ impl KubernetesRuntime {
         fn parse_exit(status: k8s_openapi::apimachinery::pkg::apis::meta::v1::Status) -> i64 {
             // Status.reason == "NonZeroExitCode" 且 details.causes[] 有 reason == "ExitCode"
             // (其 message 是退出码字符串)。无 NonZeroExitCode → 0。
-            if status.reason.as_deref() == Some("NonZeroExitCode") {
-                if let Some(details) = &status.details {
-                    if let Some(causes) = &details.causes {
-                        for cause in causes {
-                            if cause.reason.as_deref() == Some("ExitCode") {
-                                if let Some(msg) = &cause.message {
-                                    if let Ok(code) = msg.parse::<i64>() {
-                                        return code;
-                                    }
-                                }
-                            }
-                        }
+            if status.reason.as_deref() == Some("NonZeroExitCode")
+                && let Some(details) = &status.details
+                && let Some(causes) = &details.causes
+            {
+                for cause in causes {
+                    if cause.reason.as_deref() == Some("ExitCode")
+                        && let Some(msg) = &cause.message
+                        && let Ok(code) = msg.parse::<i64>()
+                    {
+                        return code;
                     }
                 }
             }

@@ -192,6 +192,10 @@ RUN chmod +x /usr/local/bin/ime_server.py
 # ============================================================================
 # 复制 ttyd 启动脚本和自定义前端页面
 COPY ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
+
+# 复制 supervisor 配置（管 ttyd/PG/pgweb，autorestart 自动拉起；见 start-up.sh 的 supervisord 启动）
+COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+COPY supervisor/conf.d/ /etc/supervisor/conf.d/
 COPY ttyd/ttyd-index.html /usr/local/share/ttyd/index.html
 RUN chmod +x /usr/local/bin/start-ttyd.sh
 

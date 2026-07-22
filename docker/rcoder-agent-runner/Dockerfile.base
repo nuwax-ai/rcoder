@@ -407,11 +407,8 @@ RUN chmod 755 /usr/local/bin/chromium-for-mcp
 #     chmod +x /usr/local/bin/start-port-forward.sh && \
 #     echo "[Desktop Entry]\nType=Application\nName=PortForward\nExec=/usr/local/bin/start-port-forward.sh\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true" > /home/user/.config/autostart/port-forward.desktop
 
-# 添加自动启动supervisord的桌面启动项 (使用系统级配置)
-RUN echo '#!/bin/bash\n# 启动supervisord服务\nsudo /usr/bin/supervisord -c /etc/supervisor/supervisord.conf &' > /usr/local/bin/start-supervisord.sh && \
-    chmod +x /usr/local/bin/start-supervisord.sh && \
-    echo "[Desktop Entry]\nType=Application\nName=Supervisord\nExec=/usr/local/bin/start-supervisord.sh\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true" > /etc/xdg/autostart/supervisord.desktop && \
-    chmod 644 /etc/xdg/autostart/supervisord.desktop
+# （已移除）无效的 xdg autostart supervisord.desktop
+# supervisord 现由 start-up.sh 直接启动（管 ttyd/PG/pgweb，见 supervisor/ 配置）
 
 # Install VS Code - 使用 apt 仓库方式（比直接下载 deb 更可靠）
 RUN echo "📦 Adding Microsoft VS Code repository..." && \
@@ -922,6 +919,56 @@ RUN _ARCH="${TARGETARCH}"; \
 # 静态资源目录（demo 用的 index.html 由 Dockerfile 注入）
 RUN mkdir -p /usr/local/share/ttyd
 
+# ============================================================================
+# 🐘 PostgreSQL 16 + pgweb（开发环境本地数据库 + Web UI）
+# 用户在 agent-runner 容器开发时用本地 PG 测试 + pgweb 操作；
+# 开发完打包发布到 UserApp（app-runtime 镜像自带 PG/pgweb）。
+# ============================================================================
+# PostgreSQL 16（PGDG repo for bookworm）
+RUN install -d /etc/apt/keyrings && \
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /etc/apt/keyrings/postgresql.asc && \
+    echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && \
+    apt-get install -y postgresql-16 && \
+    rm -rf /var/lib/apt/lists/*
+
+# pgweb（Go 单二进制，PostgreSQL Web UI；多架构 + GitHub 镜像支持，同 ttyd 模式）
+ARG USE_GITHUB_MIRROR
+ARG TARGETARCH
+ARG PGWEB_VERSION=0.17.0
+ARG CACHEBUST_PGWEB=1
+
+RUN _ARCH="${TARGETARCH}"; \
+    if [ -z "${_ARCH}" ]; then _ARCH=$(dpkg --print-architecture); fi && \
+    echo "🔧 pgweb cache bust: ${CACHEBUST_PGWEB}" && \
+    case "${_ARCH}" in \
+        "amd64") PGWEB_ARCH=amd64;; \
+        "arm64") PGWEB_ARCH=arm64;; \
+        *) echo "❌ Unsupported arch: ${_ARCH}" && exit 1;; \
+    esac && \
+    if [ "$USE_GITHUB_MIRROR" = "true" ]; then \
+        GH_HOST="https://gh-proxy.org/"; GH_PATH="https://github.com/"; \
+    else \
+        GH_HOST=""; GH_PATH="https://github.com/"; \
+    fi && \
+    DOWNLOAD_URL="${GH_HOST}${GH_PATH}sosedoff/pgweb/releases/download/v${PGWEB_VERSION}/pgweb_linux_${PGWEB_ARCH}.zip" && \
+    echo "📦 Downloading pgweb ${PGWEB_VERSION} for ${_ARCH}..." && \
+    curl -fsSL -o /tmp/pgweb.zip "${DOWNLOAD_URL}" && \
+    cd /tmp && unzip -o pgweb.zip && \
+    mv "pgweb_linux_${PGWEB_ARCH}" /usr/local/bin/pgweb && \
+    chmod +x /usr/local/bin/pgweb && \
+    rm -f /tmp/pgweb.zip && \
+    pgweb --version
+
+# PG 开发数据库默认配置（可被运行时 env 覆盖；PGDATA 落 /home/user 持久化）
+ENV PGDATA=/home/user/.pgdata \
+    POSTGRES_USER=dev \
+    POSTGRES_PASSWORD=dev \
+    POSTGRES_DB=dev \
+    PGWEB_PORT=8081
+
 # ttyd 默认端口
 ENV TTYD_PORT=7681
 
@@ -931,6 +978,9 @@ ENV TTYD_PORT=7681
 # 此处不设置 ENTRYPOINT，由最终镜像设置
 # 暴露 agent_runner 端口（供最终镜像使用）
 EXPOSE 8086
+
+# ttyd（Web 终端）+ PostgreSQL + pgweb（开发本地数据库 + Web UI）端口
+EXPOSE 7681 5432 8081
 
 # 设置 agent_runner 默认端口环境变量
 ENV AGENT_RUNNER_PORT=8086
