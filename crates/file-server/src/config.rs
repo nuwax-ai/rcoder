@@ -250,7 +250,7 @@ impl Default for Config {
             upload_allowed_extensions: vec![".zip".to_string()],
             attachment_allowed_extensions: default_attachment_extensions(),
             traverse_exclude_dirs: split_default(
-                "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.logs",
+                "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.grok,.pi,.logs",
             ),
             backup_traverse_exclude_files: split_default(
                 "pnpm-lock.yaml,yarn.lock,package-lock.json",
@@ -262,7 +262,7 @@ impl Default for Config {
                 ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif",
             ),
             zip_workspace_exclude: split_default(
-                ".git,.tmp,.claude,.agents,.codex,.opencode,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json",
+                ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json",
             ),
             git_enabled: false,
             git_default_author_name: "Nuwax File Server".to_string(),
@@ -492,7 +492,7 @@ impl Config {
             attachment_allowed_extensions: default_attachment_extensions(),
             traverse_exclude_dirs: env_list(
                 "TRAVERSE_EXCLUDE_DIRS",
-                "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.logs",
+                "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.grok,.pi,.logs",
             )?,
             backup_traverse_exclude_files: env_list(
                 "BACKUP_TRAVERSE_EXCLUDE_FILES",
@@ -508,7 +508,7 @@ impl Config {
             )?,
             zip_workspace_exclude: env_list(
                 "ZIP_WORKSPACE_EXCLUDE",
-                ".git,.tmp,.claude,.agents,.codex,.opencode,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json",
+                ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json",
             )?,
             git_enabled: env_bool("GIT_ENABLED", false)?,
             git_default_author_name: env_str("GIT_DEFAULT_AUTHOR_NAME", "Nuwax File Server")?,

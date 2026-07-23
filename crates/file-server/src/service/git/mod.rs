@@ -40,6 +40,8 @@ pub const DEFAULT_GITIGNORE_ENTRIES: &[&str] = &[
     ".claude/",
     ".opencode/",
     ".codex/",
+    ".grok/",
+    ".pi/",
     ".tmp/",
     ".logs/",
     "pnpm-lock.yaml",

@@ -77,20 +77,26 @@ pub(super) async fn move_dir(src: &Path, dst: &Path) -> AppResult<()> {
 }
 
 /// 在 root 下查找 `name` 目录: 优先 root/name, 再查一层子目录 name/ (对齐 nuwax findDir)。
-pub(super) fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
+/// async: 原 sync `std::fs` 在 async create_workspace 里直接调会阻塞 worker 线程
+/// (tokio 反模式 — async 中同步阻塞 IO), 改用 tokio::fs 非阻塞。
+pub(super) async fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
     let direct = root.join(name);
-    if direct.is_dir() {
+    if is_dir(&direct).await {
         return Some(direct);
     }
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let sub = entry.path().join(name);
-            if sub.is_dir() {
-                return Some(sub);
-            }
+    let mut entries = fs::read_dir(root).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let sub = entry.path().join(name);
+        if is_dir(&sub).await {
+            return Some(sub);
         }
     }
     None
+}
+
+/// 跟随符号链接判定目录 (等价 `std::path::Path::is_dir` 的 async 版, 用 fs::metadata 跟随 symlink)。
+async fn is_dir(path: &Path) -> bool {
+    fs::metadata(path).await.map(|m| m.is_dir()).unwrap_or(false)
 }
 
 /// 当前时间纳秒 (仅用于生成唯一临时名; 避免直接 `new Date`)。

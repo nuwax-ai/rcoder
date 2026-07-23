@@ -20,6 +20,8 @@ pub(super) const IMPORT_PRESERVED: &[&str] = &[
     ".claude",
     ".codex",
     ".opencode",
+    ".grok",
+    ".pi",
     ".tmp",
     ".logs",
 ];
@@ -33,14 +35,16 @@ mod tests {
 
     #[test]
     fn preserved_entries_match_nuwax() {
-        // 7 项白名单 (对齐 nuwax IMPORT_PROJECT_PRESERVED_ENTRIES)
-        assert_eq!(IMPORT_PRESERVED.len(), 7);
+        // 9 项白名单 (对齐 nuwax IMPORT_PROJECT_PRESERVED_ENTRIES + grok/pi)
+        assert_eq!(IMPORT_PRESERVED.len(), 9);
         for e in [
             ".git",
             ".agents",
             ".claude",
             ".codex",
             ".opencode",
+            ".grok",
+            ".pi",
             ".tmp",
             ".logs",
         ] {

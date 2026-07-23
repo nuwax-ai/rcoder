@@ -92,7 +92,7 @@ pub async fn create_workspace(
         match extract_res {
             Ok(()) => {
                 // skills/: 逐子目录移动覆盖
-                if let Some(src_skills) = find_dir(&extract_root, "skills") {
+                if let Some(src_skills) = find_dir(&extract_root, "skills").await {
                     if let Ok(mut rd) = fs::read_dir(&src_skills).await {
                         while let Ok(Some(entry)) = rd.next_entry().await {
                             let ft = match entry.file_type().await {
@@ -112,7 +112,7 @@ pub async fn create_workspace(
                     updated_dirs.push("skills");
                 }
                 // agents/: 整目录替换
-                if let Some(src_agents) = find_dir(&extract_root, "agents") {
+                if let Some(src_agents) = find_dir(&extract_root, "agents").await {
                     let _ = fs::remove_dir_all(&agents_dir).await;
                     move_dir(&src_agents, &agents_dir).await?;
                     updated_dirs.push("agents");
@@ -149,7 +149,7 @@ pub async fn create_workspace(
         }
     }
 
-    // syncAgents: .agents → .claude/.opencode/.codex
+    // syncAgents: .agents → .claude/.opencode/.codex/.grok/.pi
     crate::service::skills::sync_agents(workspace).await?;
 
     let mut message = if updated_dirs.is_empty() {
@@ -321,6 +321,8 @@ mod tests {
         assert!(tmp.join(".claude").join("skills").is_dir());
         assert!(tmp.join(".opencode").join("skills").is_dir());
         assert!(tmp.join(".codex").join("skills").is_dir());
+        assert!(tmp.join(".grok").join("skills").is_dir());
+        assert!(tmp.join(".pi").join("skills").is_dir());
         let _ = fs::remove_dir_all(&tmp).await;
     }
 }

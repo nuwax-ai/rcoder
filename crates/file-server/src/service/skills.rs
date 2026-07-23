@@ -14,7 +14,7 @@ pub struct PushResult {
     pub updated_skills: Vec<String>,
 }
 
-/// 推送 skills 到项目 `.claude/skills`, 再 syncAgents 到 `.agents/.opencode/.codex`。
+/// 推送 skills 到权威源 `.agents/skills`, 再 sync_agents fan-out 到五家 ACP 目录。
 /// 来源: 上传 zip (file) 和/或 skillUrls (HTTP fetch zip)。
 pub async fn push_skills(
     resolver: &dyn WorkspaceResolver,
@@ -111,12 +111,21 @@ async fn find_skills_dir(root: &Path) -> AppResult<Option<PathBuf>> {
     Ok(None)
 }
 
-/// 以 `.agents` 为权威源, 全量 fan-out skills/agents 到 `.claude/.opencode/.codex`
+/// sync_agents fan-out 目标目录: 权威源 .agents/{skills,agents} → 各家 ACP agent 约定目录。
+/// 加新 agent 在此追加目录名即可 (注意: .agents 是权威源本身, 不在此列)。
+/// 源码实证: claude(.claude) / opencode(.opencode) / codex(.codex) / grok(.grok) / pi(.pi)。
+const SYNC_TARGET_DIRS: &[&str] = &[".claude", ".opencode", ".codex", ".grok", ".pi"];
+
+/// 以 `.agents` 为权威源, 全量 fan-out skills/agents 到五家 ACP agent 约定目录
 /// (对齐 nuwax AgentWorkspaceUtils syncAgents; PRIMARY_AGENT_TYPE="agents")。
 pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     let primary_skills = project_path.join(".agents").join("skills");
     let primary_agents = project_path.join(".agents").join("agents");
-    for agent_root in [".claude", ".opencode", ".codex"] {
+    // 权威源存在性循环外判定一次, 5 家 fan-out 共享;
+    // 原实现每家都 path_exists → 5 家 × {skills,agents} = 10 次冗余 stat (CephFS 上不便宜)。
+    let has_skills = crate::service::fs_util::path_exists(&primary_skills).await?;
+    let has_agents = crate::service::fs_util::path_exists(&primary_agents).await?;
+    for agent_root in SYNC_TARGET_DIRS {
         let t_root = project_path.join(agent_root);
         fs::create_dir_all(&t_root).await?;
         let t_skills = t_root.join("skills");
@@ -124,14 +133,14 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
         // skills (先 rm 再 copy, 全量覆盖)
         let _ = fs::remove_dir_all(&t_skills).await;
         fs::create_dir_all(&t_skills).await?;
-        if crate::service::fs_util::path_exists(&primary_skills).await? {
+        if has_skills {
             crate::service::fs_util::copy_dir_filtered(&primary_skills, &t_skills, &[], &[])
                 .await?;
         }
         // agents
         let _ = fs::remove_dir_all(&t_agents).await;
         fs::create_dir_all(&t_agents).await?;
-        if crate::service::fs_util::path_exists(&primary_agents).await? {
+        if has_agents {
             crate::service::fs_util::copy_dir_filtered(&primary_agents, &t_agents, &[], &[])
                 .await?;
         }
