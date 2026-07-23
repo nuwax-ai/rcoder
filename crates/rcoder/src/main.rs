@@ -13,6 +13,7 @@ mod router;
 mod server;
 mod service;
 mod shutdown;
+mod skill_sync_reconciler;
 mod utils;
 mod workspace_migrate;
 
@@ -123,6 +124,10 @@ async fn main() -> anyhow::Result<()> {
 
     // 阶段2 批量迁移: 启动后台 task 将共享 PVC 老数据一次性迁到 per-agent PVC (env 开关, 默认 false)
     batch_migrate::spawn_if_enabled(runtime.clone());
+
+    // 启动 skill sync reconciler: 后台补齐旧 workspace 缺的 fan-out 目录 (grok/pi/...),
+    // 版本 marker 驱动, 已同步的 O(1) 跳过。env RCODER_SKILL_SYNC_RECONCILE_ON_STARTUP 默认 true。
+    skill_sync_reconciler::spawn_skill_sync_reconciler();
 
     // 阶段2 方案C: rcoder 同进程嵌入 file-server (FeatureFlags.embed_file_server, 灰度)。
     // 启用时 rcoder 进程内 spawn file-server (端口 60000), 经 SubvolumeWorkspaceResolver

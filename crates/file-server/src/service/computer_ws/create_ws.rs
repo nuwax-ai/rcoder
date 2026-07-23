@@ -323,6 +323,8 @@ mod tests {
         assert!(tmp.join(".codex").join("skills").is_dir());
         assert!(tmp.join(".grok").join("skills").is_dir());
         assert!(tmp.join(".pi").join("skills").is_dir());
+        // sync_agents 写版本 marker (启动 reconciler 据此 O(1) 判断是否需补 sync)
+        assert!(tmp.join(".agents").join(".sync_version").is_file());
         let _ = fs::remove_dir_all(&tmp).await;
     }
 }

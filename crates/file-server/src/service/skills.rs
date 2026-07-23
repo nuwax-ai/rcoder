@@ -116,6 +116,12 @@ async fn find_skills_dir(root: &Path) -> AppResult<Option<PathBuf>> {
 /// 源码实证: claude(.claude) / opencode(.opencode) / codex(.codex) / grok(.grok) / pi(.pi)。
 const SYNC_TARGET_DIRS: &[&str] = &[".claude", ".opencode", ".codex", ".grok", ".pi"];
 
+/// fan-out 版本标识 (SYNC_TARGET_DIRS 派生): sync_agents 写入 `.agents/.sync_version`,
+/// 启动 reconciler 据此 O(1) 判断是否需补 sync。加新 agent 改 SYNC_TARGET_DIRS 即自动变版本。
+pub fn sync_target_version() -> String {
+    SYNC_TARGET_DIRS.join(",")
+}
+
 /// 以 `.agents` 为权威源, 全量 fan-out skills/agents 到五家 ACP agent 约定目录
 /// (对齐 nuwax AgentWorkspaceUtils syncAgents; PRIMARY_AGENT_TYPE="agents")。
 pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
@@ -145,6 +151,13 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
                 .await?;
         }
     }
+    // 版本 marker: 启动 reconciler 据此 O(1) 判断是否需补 sync
+    // (写失败不阻断 sync 结果; 最坏 reconciler 下次多 sync 一次, 幂等兜底)
+    let _ = fs::write(
+        project_path.join(".agents").join(".sync_version"),
+        sync_target_version(),
+    )
+    .await;
     Ok(())
 }
 
@@ -184,5 +197,15 @@ mod tests {
 
         let found = find_skills_dir(&root).await.expect("scan skills directory");
         assert_eq!(found, Some(expected));
+    }
+
+    #[test]
+    fn sync_target_version_reflects_target_dirs() {
+        // 版本标识 = SYNC_TARGET_DIRS join; 加新 agent 即变版本 (reconciler 据此判断是否需补 sync)
+        let v = sync_target_version();
+        assert_eq!(v.split(',').count(), SYNC_TARGET_DIRS.len());
+        for d in SYNC_TARGET_DIRS {
+            assert!(v.contains(*d), "version missing {d}");
+        }
     }
 }

@@ -26,6 +26,7 @@ pub use crate::service::build_manager::BuildManager;
 pub use crate::service::dev_server::DevServerManager;
 pub use crate::service::log_cache::LogCacheManager;
 pub use crate::service::skill_download::SkillDownloader;
+pub use crate::service::skills::{sync_agents, sync_target_version};
 
 /// axum 共享状态: 持有工作区解析器 + 全局配置 + dev server 进程管理器。
 #[derive(Clone)]
