@@ -9,7 +9,7 @@ mod create_ws;
 mod helpers;
 mod import_ws;
 
-pub use create_ws::{CreateWorkspaceResult, create_workspace};
+pub use create_ws::{CreateWorkspaceResult, SkillFailure, create_workspace};
 pub use helpers::remove_top_level_dir;
 pub use import_ws::{ImportResult, import_project};
 

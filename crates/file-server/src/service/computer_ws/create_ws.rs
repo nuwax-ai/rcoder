@@ -10,9 +10,19 @@ use crate::error::AppResult;
 use super::DYNAMIC_ADD_LOCK;
 use super::helpers::{find_dir, move_dir};
 
+/// 单个 skill URL 推送失败 (best-effort 语义下收集, 透传给调用方)。
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct SkillFailure {
+    pub url: String,
+    pub error: String,
+}
+
 pub struct CreateWorkspaceResult {
     pub message: String,
     pub updated_skills: Vec<String>,
+    /// best-effort: 推送失败的 skill URL 明细 (空 = 全部成功)。透传给调用方,
+    /// 避免 skill 缺失被静默吞掉 (SSRF/HTTPS 校验拒绝、下载/解压失败等)。
+    pub failed_skills: Vec<SkillFailure>,
 }
 
 /// create-workspace 核心 (对齐 nuwax createWorkspace):
@@ -66,6 +76,7 @@ pub async fn create_workspace(
         return Ok(CreateWorkspaceResult {
             message: "Workspace created (no uploaded file, no skills and agents)".to_string(),
             updated_skills,
+            failed_skills: Vec::new(),
         });
     }
 
@@ -113,7 +124,9 @@ pub async fn create_workspace(
         }
     }
 
-    // skillUrls: 逐个下载解压, 集成 skill 目录 (对齐 nuwax createWorkspace skillUrls 循环)
+    // skillUrls: 逐个下载解压, 集成 skill 目录 (对齐 nuwax createWorkspace skillUrls 循环)。
+    // best-effort: 单个失败不中断其余, 但收集明细透传给调用方 (避免 skill 缺失被静默吞掉)。
+    let mut failed_skills: Vec<SkillFailure> = Vec::new();
     for url in &skill_urls {
         let downloader = downloader
             .ok_or_else(|| crate::error::AppError::system("skill downloader is not configured"))?;
@@ -128,6 +141,10 @@ pub async fn create_workspace(
             }
             Err(e) => {
                 tracing::warn!(url = %url, error = %e, "skill url processing failed");
+                failed_skills.push(SkillFailure {
+                    url: url.to_string(),
+                    error: e.to_string(),
+                });
             }
         }
     }
@@ -135,7 +152,7 @@ pub async fn create_workspace(
     // syncAgents: .agents → .claude/.opencode/.codex
     crate::service::skills::sync_agents(workspace).await?;
 
-    let message = if updated_dirs.is_empty() {
+    let mut message = if updated_dirs.is_empty() {
         "Workspace created successfully (skills and agents directories not found)".to_string()
     } else {
         format!(
@@ -143,10 +160,23 @@ pub async fn create_workspace(
             updated_dirs.join(" and ")
         )
     };
+    // 全部 skill URL 失败: 升级日志 + message 标注 (仍 best-effort 不 fail fast, 保留 nuwax
+    // 语义; 但让调用方/日志一眼看到 skill 全军覆没, 不再静默吞掉)。
+    if !skill_urls.is_empty() && failed_skills.len() == skill_urls.len() {
+        tracing::error!(
+            count = failed_skills.len(),
+            "all skill URLs failed to process; workspace created but no skills applied"
+        );
+        message.push_str(&format!(
+            "; WARNING: all {} skill URL(s) failed (see failedSkills)",
+            failed_skills.len()
+        ));
+    }
 
     Ok(CreateWorkspaceResult {
         message,
         updated_skills,
+        failed_skills,
     })
 }
 

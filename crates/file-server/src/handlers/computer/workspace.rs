@@ -13,26 +13,38 @@ use crate::service::{skills as skills_service, zip};
 
 use super::{file_field, text_field, validate_zip_ext, ws_path};
 
-/// 对齐 nuwax createWorkspace 响应：workspaceRoot 是 COMPUTER_WORKSPACE_DIR，
-/// 无 skill 变更时不输出 updatedSkills。
+/// create-workspace 响应 (对齐 nuwax createWorkspace 响应字段)。
+/// workspaceRoot = COMPUTER_WORKSPACE_DIR; updatedSkills/failedSkills 空时不输出。
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateWorkspaceResponse {
+    pub success: bool,
+    pub message: String,
+    pub workspace_root: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub updated_skills: Vec<String>,
+    /// best-effort 透传: 推送失败的 skill URL 明细 (空则不输出)。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_skills: Vec<crate::service::computer_ws::SkillFailure>,
+}
+
 fn create_workspace_response(
     workspace: &Path,
     result: crate::service::computer_ws::CreateWorkspaceResult,
-) -> Json<Value> {
+) -> Json<CreateWorkspaceResponse> {
     let workspace_root = workspace
         .parent()
         .and_then(Path::parent)
         .unwrap_or(workspace)
-        .to_string_lossy();
-    let mut response = json!({
-        "success": true,
-        "message": result.message,
-        "workspaceRoot": workspace_root,
-    });
-    if !result.updated_skills.is_empty() {
-        response["updatedSkills"] = json!(result.updated_skills);
-    }
-    Json(response)
+        .to_string_lossy()
+        .to_string();
+    Json(CreateWorkspaceResponse {
+        success: true,
+        message: result.message,
+        workspace_root,
+        updated_skills: result.updated_skills,
+        failed_skills: result.failed_skills,
+    })
 }
 
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
@@ -89,7 +101,7 @@ pub struct InitProjectTemplateForm {
 pub(crate) async fn create_workspace(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<CreateWorkspaceResponse>, AppError> {
     let mut user_id = None;
     let mut cid = None;
     let mut skill_zip = None;
@@ -142,7 +154,7 @@ pub(crate) async fn create_workspace(
 pub(crate) async fn create_workspace_v2(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<CreateWorkspaceResponse>, AppError> {
     let mut user_id = None;
     let mut cid = None;
     let mut skill_zip = None;
