@@ -29,6 +29,10 @@ use crate::error::{AppError, AppResult};
 use crate::service::pnpm::{self, InstallOptions, LogFiles};
 use support::{early_exit_err, ldrtemp, lock, read_dev_script};
 
+/// dev server 就绪轮询间隔 (ms)。vite 冷启动通常 300-500ms 即 ready, 原 1s 粒度会让
+/// 已 ready 的 server 白等近 1s。首次 sleep 与失败重试间隔同此值 (实测 vite ready in ~357ms)。
+const DEV_ALIVE_POLL_INTERVAL_MS: u64 = 300;
+
 /// 运行中的 dev server 记录 (内存状态)。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -272,20 +276,31 @@ impl DevServerManager {
         base_path: Option<&str>,
         stderr_ring: &Arc<StderrRing>,
     ) -> AppResult<()> {
-        tokio::time::sleep(Duration::from_secs(1)).await;
         let max = self.config.dev_alive_max_wait_ms;
         let timeout = self.config.dev_alive_check_timeout_ms;
-        let mut elapsed = 1000u64;
-        while elapsed < max {
+        let interval = Duration::from_millis(DEV_ALIVE_POLL_INTERVAL_MS);
+        // 用墙钟 deadline 计时 (而非固定步进累加): 探活本身可能耗时 (未 ready 时等到
+        // timeout), 固定步进累加会让 max 超时判断严重偏松 (实际墙钟远大于累加值)。
+        let deadline = std::time::Instant::now() + Duration::from_millis(max);
+        loop {
             // 进程已退出 (端口冲突 / 配置错 / 依赖缺失) → 读 stderr 分类成可操作错误
             if !is_process_running(pid) {
                 return Err(early_exit_err(pid, port, stderr_ring));
             }
-            if is_project_alive(port, base_path, timeout).await {
+            // deadline 检查放探活前: 兜底 max=0 边界 + sleep 后已超 deadline 不再多探活。
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            // 探活超时夹到剩余 deadline (min): 防单次探活越过 deadline, 让 max 成硬上限
+            // (默认 max=30s >> timeout=1.5s 不触发, 仅防御 max<timeout 的错误配置)。
+            // 首轮即探活 (不固定盲等 sleep): spawn 返回时 vite 端口未 listen, reqwest
+            // connection refused 快速失败, 等价探测式等待; vite 提前 ready 能立刻发现。
+            let this_timeout = timeout.min((deadline - now).as_millis() as u64);
+            if is_project_alive(port, base_path, this_timeout).await {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            elapsed += 1000;
+            tokio::time::sleep(interval).await;
         }
         // 超时: 进程仍存活但未响应 HTTP → 按 nuwax 宽松返回成功; 若已死则分类报错
         if !is_process_running(pid) {
@@ -581,5 +596,36 @@ mod tests {
             );
         }
         drop(mgr); // 不 panic 即通过
+    }
+
+    #[tokio::test]
+    async fn poll_alive_returns_promptly_when_server_ready() {
+        use tokio::io::AsyncWriteExt;
+        // mock vite: 监听任意端口, 对所有请求回 HTTP 200
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        let mgr = DevServerManager::new(Arc::new(Config::from_env().expect("test config")));
+        // pid 用当前进程 → is_process_running 恒 true, 焦点在探活速度
+        let pid = std::process::id();
+        let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let start = std::time::Instant::now();
+        let res = mgr.poll_alive(pid, port, None, &ring).await;
+        let elapsed = start.elapsed();
+        assert!(res.is_ok(), "ready 时 poll_alive 应成功");
+        // 核心断言: 首次 sleep 300ms + 探活, 应 < 1s (原固定 sleep 1s + 探活 > 1s)
+        assert!(
+            elapsed.as_millis() < 1000,
+            "poll_alive 耗时 {elapsed:?}, 期望 < 1s (300ms 间隔)"
+        );
     }
 }

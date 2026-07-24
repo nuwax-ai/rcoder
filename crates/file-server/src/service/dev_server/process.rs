@@ -376,8 +376,17 @@ pub async fn is_project_alive(port: u16, base_path: Option<&str>, timeout_ms: u6
         .send()
         .await
     {
-        Ok(resp) => resp.status().is_success(),
-        Err(_) => false,
+        Ok(resp) => {
+            let ok = resp.status().is_success();
+            if !ok {
+                tracing::debug!(port, status = %resp.status(), "alive probe non-2xx");
+            }
+            ok
+        }
+        Err(error) => {
+            tracing::debug!(port, %error, "alive probe failed");
+            false
+        }
     }
 }
 
