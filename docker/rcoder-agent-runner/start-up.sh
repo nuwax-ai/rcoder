@@ -1839,40 +1839,25 @@ function start_ime_services() {
 # 🐘 PostgreSQL + pgweb（开发环境本地数据库 + Web UI）
 # 用户在 agent-runner 容器开发时用本地 PG 测试；开发完打包发布到 UserApp。
 # PG 数据落 /home/user/.pgdata（持久化，容器重启保留）；pgweb Web UI 操作数据库。
+#
+# ⚠️ 启动模型: 此处只做"非阻塞"准备（备 PGDATA 归属 + 写连接信息）；首次 initdb
+# 与 postgres 进程均由 supervisor 托管的 pg-supervisor-entry.sh 异步拉起。
+# agent_runner 不依赖 PG（PG 仅供用户开发用），故 PG initdb 再慢也不阻塞 :8086
+# health —— 旧版在此同步 initdb, CephFS 上 >60s, 导致 agent_runner 被 liveness 杀。
 # ============================================================================
-function init_pg() {
-    log "Initializing PostgreSQL (首次 initdb，supervisor 启动前一次性)..."
-
+function prepare_pg() {
     export PGDATA="${PGDATA:-/home/user/.pgdata}"
     export POSTGRES_USER="${POSTGRES_USER:-dev}"
     export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-dev}"
     export POSTGRES_DB="${POSTGRES_DB:-dev}"
     export PGWEB_PORT="${PGWEB_PORT:-8081}"
 
-    mkdir -p "$PGDATA" /app/logs
-    chown -R postgres:postgres "$(dirname "$PGDATA")" 2>/dev/null || true
-
-    # 初始化 PG（首次，PGDATA 为空）—— supervisor 启动前一次性 initdb，
-    # 避免 supervisor 反复尝试 initdb（postgres 进程归 supervisor 管，autorestart）
-    if [ ! -s "$PGDATA/PG_VERSION" ]; then
-        log "  Initializing PostgreSQL at $PGDATA ..."
-        local PWFILE
-        PWFILE=$(mktemp)
-        printf '%s\n' "$POSTGRES_PASSWORD" > "$PWFILE"
-        chown postgres:postgres "$PWFILE"; chmod 600 "$PWFILE"
-        if ! su postgres -c "/usr/lib/postgresql/16/bin/initdb -D \"$PGDATA\" --username=\"$POSTGRES_USER\" --pwfile=\"$PWFILE\" --auth-host=scram-sha-256 --auth-local=trust"; then
-            log_warn "  PG initdb failed"
-            rm -f "$PWFILE"
-            return 1
-        fi
-        rm -f "$PWFILE"
-        # 临时启动建业务库
-        su postgres -c "/usr/lib/postgresql/16/bin/pg_ctl -D \"$PGDATA\" -o '-c listen_addresses= -c unix_socket_directories=/tmp' -w start"
-        su postgres -c "/usr/lib/postgresql/16/bin/createdb -h /tmp -U \"$POSTGRES_USER\" \"$POSTGRES_DB\"" 2>/dev/null || true
-        su postgres -c "/usr/lib/postgresql/16/bin/pg_ctl -D \"$PGDATA\" -m fast -w stop"
-        log_success "  PostgreSQL initialized (user=$POSTGRES_USER db=$POSTGRES_DB)"
-    fi
-    chown -R postgres:postgres "$(dirname "$PGDATA")" 2>/dev/null || true
+    mkdir -p /app/logs
+    # 仅备好 PGDATA 目录归属（瞬时: 无 fsync、无递归 chown）。
+    # 只 chown .pgdata 本身，不碰 /home/user —— 旧版 `chown -R $(dirname $PGDATA)`
+    # 会递归 chown 整个用户主目录（= /home/user），既慢（CephFS 递归）又会把用户
+    # 项目文件属主错改成 postgres。
+    install -d -o postgres -g postgres "$PGDATA"
 
     # 连接信息（供用户参考；postgres/pgweb 进程由 supervisor 管）
     cat > /home/user/pg-connection.txt <<EOF
@@ -1880,8 +1865,7 @@ PostgreSQL 开发数据库:
   容器内: host=localhost port=5432 user=$POSTGRES_USER password=$POSTGRES_PASSWORD database=$POSTGRES_DB sslmode=disable
 pgweb: http://localhost:$PGWEB_PORT  (Add Connection 填上述信息)
 EOF
-    log_success "PostgreSQL initdb done（进程由 supervisor 管：postgresql/pgweb/ttyd）"
-    return 0
+    log "PG prepared (PGDATA=$PGDATA); initdb/postgres 由 supervisor 异步拉起"
 }
 
 # ============================================================================
@@ -1899,7 +1883,7 @@ initialize_user_home
 # ========== supervisor 管 ttyd/PG/pgweb（不依赖 X11，初始化后启动）==========
 # 阶段1：ttyd/PG/pgweb 迁 supervisor（autorestart 崩溃自动拉起）
 # VNC/XFCE/MCP/audio/IME 仍由下方 start-up.sh 管（保留自定义）
-init_pg                                          # PG 首次 initdb（一次性，supervisor 启动前）
+prepare_pg                                       # PG 非阻塞准备（initdb 已异步进 supervisor）
 supervisord -c /etc/supervisor/supervisord.conf  # daemon，autostart postgres/pgweb/ttyd
 log "supervisord started (manages: postgresql, pgweb, ttyd — autorestart on crash)"
 
