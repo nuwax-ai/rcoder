@@ -979,7 +979,11 @@ impl ContainerRuntime for KubernetesRuntime {
                     containers_vec.extend(sidecars.iter().map(Self::translate_k8s_sidecar));
                     containers_vec
                 },
-                restart_policy: Some("Never".to_string()),
+                // Always(非 Never): agent 容器 OOM/崩溃时由 kubelet 原地重启自愈。
+                // Never 下 agent 一死(sidecar 还活着 → pod 仍 Running)rcoder 既不重启也不重建 → 用户中断。
+                // rcoder 的 stop/restart/destroy 均走 pods().delete() 整 pod 删, 不依赖 Never;
+                // /computer/agent/stop 是 gRPC 取消会话(进程继续), 故 Always 只补崩盘自愈、不冲突。
+                restart_policy: Some("Always".to_string()),
                 service_account_name: Some(self.config.service_account_name.clone()),
                 ..Default::default()
             }),
