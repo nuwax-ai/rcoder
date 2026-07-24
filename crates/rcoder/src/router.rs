@@ -358,6 +358,15 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             "/computer/ime/{user_id}/{project_id}/{*path}",
             get(handler::computer_ime_proxy),
         )
+        // 🆕 Computer Agent-runner 容器 PG 管理（重置密码 / 建库; rcoder exec 容器内 psql）
+        .route(
+            "/computer/db/{user_id}/reset-password",
+            post(handler::computer_db_reset_password),
+        )
+        .route(
+            "/computer/db/{user_id}/create-database",
+            post(handler::computer_db_create_database),
+        )
         .with_state(state.clone());
 
     // Pingora 代理 API 路由（用于文档和状态查询）
@@ -560,6 +569,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::computer_desktop_proxy,
         handler::computer_audio_proxy,
         handler::computer_ime_proxy,
+        handler::computer_db_reset_password,
+        handler::computer_db_create_database,
         handler::computer_ttyd_proxy,
         handler::pod_count,
         handler::pod_list,

@@ -501,6 +501,14 @@ impl AppService {
         if let Some(owner) = &req.owner {
             validate_pg_identifier(owner)?;
         }
+        // 先查是否已存在(check-then-act): PG 不支持 CREATE DATABASE IF NOT EXISTS、也不能进事务/DO 块。
+        // 故先 SELECT pg_database 判定, 避免 CREATE 失败后靠 stderr 文本(随 PG 版本/locale 变)判"已存在"。
+        if self.database_exists(app_id, &req.database).await? {
+            return Err(AppOperationError::AlreadyExists(format!(
+                "database {} already exists",
+                req.database
+            )));
+        }
         // CREATE DATABASE "{db}"[ OWNER "{owner}"] —— 双引号 PG 标识符," 转义为 ""
         let safe_db = req.database.replace('"', "\"\"");
         let owner_clause = req
@@ -515,8 +523,6 @@ impl AppService {
                 r#"psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE "{safe_db}"{owner_clause}'"#,
             ),
         ];
-        // 不复用 exec_psql:create_database 的 exit≠0 需区分"库已存在"(AlreadyExists)
-        // 与其他错误(Backend),而 exec_psql 一律返 Backend。
         let ctx = format!("[APP] create_database failed app_id={app_id}");
         let r = self
             .runtime
@@ -524,9 +530,8 @@ impl AppService {
             .await
             .map_err(|e| map_runtime_error(&ctx, e))?;
         if r.exit_code != 0 {
-            // 库已存在(duplicate_database)→ AlreadyExists;其他 → Backend
-            let msg = format!("{} {}", r.stdout, r.stderr).to_lowercase();
-            if msg.contains("already exists") || msg.contains("duplicate") {
+            // 罕见竞态: SELECT 时不存在、CREATE 时被并发创建 → 再查一次精确判定, 仍不靠 stderr 文本。
+            if self.database_exists(app_id, &req.database).await? {
                 return Err(AppOperationError::AlreadyExists(format!(
                     "database {} already exists",
                     req.database
@@ -938,6 +943,34 @@ impl AppService {
             )));
         }
         Ok(())
+    }
+
+    /// 查询 app 容器 PG 里某库是否已存在（psql `-tAc SELECT pg_database`）。
+    /// `-tAc` 取无表头纯输出: 命中输出 `1`、未命中输出空 → 比 CREATE 失败后解析 stderr 稳定。
+    /// `db` 已过 `validate_pg_identifier` 白名单(`[a-zA-Z0-9_]`), 安全内联到字符串字面量。
+    /// create_database 用此做 check-then-act(替代旧版靠 stderr 文本判"已存在")。
+    async fn database_exists(&self, app_id: &str, db: &str) -> AppResult<bool> {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                r#"psql -U "$POSTGRES_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='{db}'""#,
+            ),
+        ];
+        let ctx = format!("[APP] check database exists failed app_id={app_id}");
+        let r = self
+            .runtime
+            .exec(app_id, cmd)
+            .await
+            .map_err(|e| map_runtime_error(&ctx, e))?;
+        if r.exit_code != 0 {
+            return Err(AppOperationError::Backend(format!(
+                "{ctx}: exit {}: {}",
+                r.exit_code,
+                r.stderr.trim()
+            )));
+        }
+        Ok(r.stdout.trim() == "1")
     }
 
     /// DeploymentStatus → AppRuntimeInfo（含访问地址构建 + conditions 派生）
