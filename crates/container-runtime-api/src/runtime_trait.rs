@@ -150,6 +150,20 @@ pub trait ContainerRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// 列出某 service_type 下所有 workspace（per-app PVC / 工作空间目录）对应的 identifier。
+    ///
+    /// 供 storage/query 枚举"有持久数据"的 app——含**已 delete 但 PVC/目录保留的孤儿**。
+    /// 这是 orphan 检测的数据源：`list_deployments` 只能拿到运行中的 app，看不到已删的残留，
+    /// 故 storage/query 需用它才能发现孤儿存储（v2 §5.4 / §9.2 的数据侧对账）。
+    /// K8s 实现：枚举带 `service_type=<st>` label 的 PVC，从 PVC 名反解 identifier；
+    /// Docker 默认空（dev 模式，孤儿检测非关键）。
+    async fn list_workspace_identifiers(
+        &self,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        Ok(vec![])
+    }
+
     /// 确保 per-agent workspace PVC 存在 (幂等: 已存在则复用, 不存在则创建)。
     ///
     /// K8s: 调 `ensure_workspace_pvc`; Docker: no-op。

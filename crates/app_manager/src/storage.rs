@@ -2,6 +2,8 @@
 
 use tracing::{info, warn};
 
+use shared_types::ServiceType;
+
 use super::models::*;
 use super::utils::*;
 
@@ -107,11 +109,21 @@ impl super::service::AppService {
             .into_iter()
             .map(|s| s.app_id)
             .collect();
-        // 阶段2 per-app PVC: app 数据在各自 per-app PVC (rcoder 经挂根聚合访问), workspace_root
-        // 不再含 app 目录 → app 列表来自 list_deployments (existing, Deployment by label),
-        // 不 read_dir(workspace_root)。orphan 检测 (read_dir 找不在 Deployment 的目录) 在
-        // per-agent 模式失效 (数据跨 PVC); existing 内全为非 orphan。
-        let mut entries: Vec<String> = existing.iter().cloned().collect();
+        // 候选 = 所有"有持久数据"的 app：枚举 UserApp 的 per-app PVC（含**已 delete 但
+        // PVC 保留的孤儿**）——这才是 orphan 检测的数据源。再并入运行中的 app（existing，
+        // 兜底；正常 running app 都有 PVC，已含）。list_deployments 只能拿运行中的，看不到
+        // 孤儿 PVC，故旧实现（候选仅来自 existing）会让 storage/query 永远查不到孤儿。
+        let mut entries: std::collections::HashSet<String> = self
+            .runtime
+            .list_workspace_identifiers(&ServiceType::UserApp)
+            .await
+            .map_err(|e| map_runtime_error("[APP] list_workspace_identifiers failed", e))?
+            .into_iter()
+            .collect();
+        for id in existing.iter() {
+            entries.insert(id.clone());
+        }
+        let mut entries: Vec<String> = entries.into_iter().collect();
         entries.sort();
         let app_ids_filter = filters.app_ids.as_deref();
         let filtered: Vec<String> = entries

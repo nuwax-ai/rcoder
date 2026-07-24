@@ -1585,6 +1585,46 @@ impl ContainerRuntime for KubernetesRuntime {
         Ok(Some(format!("{cephfs_root}/{sub}")))
     }
 
+    /// 枚举某 service_type 的所有 per-app PVC，从 PVC 名反解 identifier（app_id）。
+    ///
+    /// 用于 storage/query 发现"有持久数据"的 app（含已 delete 但 PVC 保留的孤儿）——
+    /// `list_deployments` 只能拿运行中的，PVC 才是持久数据的真源。
+    /// PVC 名格式见 `workspace_pvc_name`：`{sanitize(container_prefix)}-{identifier(_→-)}-workspace`，
+    /// identifier 经 app_id 校验已是 DNS-1123（无下划线），故反解结果即原 identifier。
+    async fn list_workspace_identifiers(
+        &self,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        let selector = format!("service_type={}", service_type);
+        let list = self
+            .pvcs()
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!(
+                    "list_workspace_identifiers: list PVC failed (service_type={}): {}",
+                    service_type, e
+                ))
+            })?;
+        // 前缀/后缀与 workspace_pvc_name 保持一致，反解中间段为 identifier
+        let prefix = format!(
+            "{}-",
+            Self::sanitize_k8s_name_part(&self.service_container_prefix(service_type)?)
+        );
+        let suffix = "-workspace";
+        let mut ids = Vec::with_capacity(list.items.len());
+        for pvc in list.items {
+            if let Some(name) = pvc.metadata.name.as_deref()
+                && let Some(mid) = name
+                    .strip_prefix(prefix.as_str())
+                    .and_then(|s| s.strip_suffix(suffix))
+            {
+                ids.push(mid.to_string());
+            }
+        }
+        Ok(ids)
+    }
+
     async fn ensure_workspace(
         &self,
         identifier: &str,
