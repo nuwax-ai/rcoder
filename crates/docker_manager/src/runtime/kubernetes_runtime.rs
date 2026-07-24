@@ -936,6 +936,25 @@ impl ContainerRuntime for KubernetesRuntime {
                             success_threshold: Some(1),
                             ..Default::default()
                         }),
+                        // startup_probe: 重型 agent-runner (computer 桌面/X11/VNC) 启动较慢,
+                        // 用 startupProbe 给最长 ~4min 启动宽限; 其运行期间 liveness/readiness
+                        // 自动暂停, 通过后才接管 → 慢启动不被 liveness 误杀; 通过后 readiness(period=1)
+                        // ~1s 内 Ready, 稳态仍由 liveness 严格保护。
+                        // (曾因 "startupProbe + readiness period=3 handoff 延迟" 去掉; 现 readiness
+                        //  已是 period=1, handoff ≤1s 可忽略, 故重新引入 —— 三者兼得。)
+                        startup_probe: Some(Probe {
+                            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                                path: Some("/health".to_string()),
+                                port: IntOrString::Int(8086),
+                                ..Default::default()
+                            }),
+                            initial_delay_seconds: Some(5),
+                            period_seconds: Some(10),
+                            timeout_seconds: Some(3),
+                            failure_threshold: Some(24),
+                            success_threshold: Some(1),
+                            ..Default::default()
+                        }),
                         // preStop lifecycle hook: 在 kubelet 发送 SIGTERM 之前执行，
                         // 确保 JuiceFS FUSE 卷上的写入 buffer flush 到磁盘，
                         // 减少 FUSE unmount 卡住的概率
