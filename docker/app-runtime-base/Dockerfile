@@ -94,6 +94,10 @@ COPY app-runtime.supervisor.conf /etc/supervisor/conf.d/app-runtime.conf
 COPY start-app.sh /usr/local/bin/start-app.sh
 RUN chmod +x /usr/local/bin/start-app.sh
 
+# PG 首次 initdb wrapper(异步, 由 supervisor [program:postgresql] 托管)
+COPY pg-supervisor-entry.sh /usr/local/bin/pg-supervisor-entry.sh
+RUN chmod +x /usr/local/bin/pg-supervisor-entry.sh
+
 # 创建应用目录结构
 RUN mkdir -p /app/{code,data,config,logs}
 

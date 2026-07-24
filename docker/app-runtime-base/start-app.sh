@@ -12,27 +12,19 @@ export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-app}"
 export POSTGRES_DB="${POSTGRES_DB:-app}"
 export PGWEB_PORT="${PGWEB_PORT:-8081}"
 
-mkdir -p /app/data "$PGDATA" /app/logs /app/config /app/code
+mkdir -p /app/data /app/logs /app/config /app/code
+# PGDATA 属主备好(非递归, 瞬时)。PGDATA 落 /app/data(PVC), 首次 initdb 慢。
+# postgres 需 traverse /app/data → 单层 chown(非 -R, 避免递归扫 PVC 慢)。
+chown postgres:postgres /app/data 2>/dev/null || true
+install -d -o postgres -g postgres "$PGDATA"
 
 # ============================================================================
-# 1. 初始化 PostgreSQL(首次,PGDATA 为空)
+# 1. PostgreSQL 首次 initdb 已异步化 —— 由 supervisor 托管的
+#    /usr/local/bin/pg-supervisor-entry.sh 在 [program:postgresql] 里幂等执行
+#    (PG_VERSION 缺失才 initdb)。不再在此同步阻塞 exec supervisord, 避免
+#    UserApp 首启慢被 liveness 杀(restartPolicy=Always → CrashLoopBackOff)。
+#    PGDATA 在 /app/data(PVC), 重启不丢数据。
 # ============================================================================
-if [ ! -s "$PGDATA/PG_VERSION" ]; then
-    echo "📦 Initializing PostgreSQL at $PGDATA ..."
-    chown -R postgres:postgres /app/data
-    PWFILE=$(mktemp)
-    printf '%s\n' "$POSTGRES_PASSWORD" > "$PWFILE"
-    chown postgres:postgres "$PWFILE"
-    chmod 600 "$PWFILE"
-    su postgres -c "/usr/lib/postgresql/16/bin/initdb -D \"$PGDATA\" --username=\"$POSTGRES_USER\" --pwfile=\"$PWFILE\" --auth-host=scram-sha-256 --auth-local=trust"
-    rm -f "$PWFILE"
-    # 临时启动(仅 unix socket)建业务库
-    su postgres -c "/usr/lib/postgresql/16/bin/pg_ctl -D \"$PGDATA\" -o '-c listen_addresses= -c unix_socket_directories=/tmp' -w start"
-    su postgres -c "/usr/lib/postgresql/16/bin/createdb -h /tmp -U \"$POSTGRES_USER\" \"$POSTGRES_DB\"" 2>/dev/null || true
-    su postgres -c "/usr/lib/postgresql/16/bin/pg_ctl -D \"$PGDATA\" -m fast -w stop"
-    echo "✅ PostgreSQL initialized (user=$POSTGRES_USER db=$POSTGRES_DB)"
-fi
-chown -R postgres:postgres /app/data 2>/dev/null || true
 
 # 连接信息供用户参考(pgweb UI 手填 / 应用连接)
 cat > /app/config/pg-connection.txt <<EOF

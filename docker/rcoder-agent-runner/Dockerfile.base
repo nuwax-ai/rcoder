@@ -86,7 +86,9 @@ RUN apt-get update && \
     wget software-properties-common \
     # Suna dependencies:
     poppler-utils wkhtmltopdf antiword unrtf catdoc gawk file jq csvkit xmlstarlet zip unzip tmux vim tree rsync \
-    gvfs libglib2.0-bin && \
+    gvfs libglib2.0-bin \
+    # pm-utils: 提供 pm-is-supported, 消除 xfce4-session 启动告警(容器无电源管理, 仅满足探测)
+    pm-utils && \
     # Configure X11 wrapper to allow any user:
     sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config && \
     # Set the default terminal
@@ -505,6 +507,8 @@ RUN mkdir -p /home/user/Desktop /usr/share/applications && \
     cp /usr/share/applications/user-terminal.desktop /home/user/Desktop/terminal.desktop && \
     cp /usr/share/applications/user-vscode.desktop /home/user/Desktop/vscode.desktop && \
     cp /usr/share/applications/chromium-browser.desktop /home/user/Desktop/chromium.desktop && \
+    printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=pgweb\nComment=PostgreSQL Web UI\nExec=/usr/bin/chromium-browser-launcher http://localhost:8081\nIcon=applications-development\nTerminal=false\nCategories=Development;Database;" > /usr/share/applications/pgweb.desktop && \
+    cp /usr/share/applications/pgweb.desktop /home/user/Desktop/pgweb.desktop && \
     chmod 755 /home/user/Desktop/*.desktop && \
     chown -R user:user /home/user/Desktop
 

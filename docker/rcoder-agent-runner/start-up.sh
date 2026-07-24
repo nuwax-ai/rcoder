@@ -350,6 +350,14 @@ function initialize_user_home() {
             fi
         fi
 
+        # ========== 清除残留的 sudo-supervisord autostart ==========
+        # 老镜像 Dockerfile.old 曾写入 $USER_HOME/.config/autostart/supervisord.desktop
+        # (Exec=sudo supervisord); 当前镜像不再生成, 但 /home/user 是持久化 PVC, 旧文件残留。
+        # XFCE 启动会 autostart 它 → sudo 净化环境 → 那把 supervisord 解析 pgweb.conf
+        # %(ENV_PGWEB_PORT)s 失败(error.log 噪音) + 第二把 supervisord 隐患(socket 冲突)。
+        # 必须在 start_display_and_desktop(XFCE 起来)前删掉。定向清理, 不动其它 autostart。
+        rm -f "$USER_HOME/.config/autostart/supervisord.desktop" /usr/local/bin/start-supervisord.sh 2>/dev/null || true
+
         # ========== .local 目录 - 强制覆盖 ==========
         if [ -d "$SKEL_DIR/.local" ]; then
             cp -a "$SKEL_DIR/.local/." "$USER_HOME/.local/" 2>/dev/null || true

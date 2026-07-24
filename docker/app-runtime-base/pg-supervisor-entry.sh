@@ -1,24 +1,19 @@
 #!/bin/sh
 # =============================================================================
 # supervisor `program:postgresql` 入口（由 supervisor 以 user=postgres 运行）。
-#
-# 为什么存在: PG 首次 initdb 必须异步于 agent_runner。旧版 init_db 在 start-up.sh
-# 里同步阻塞, 而 PGDATA 落 CephFS → initdb >60s → agent_runner 的 :8086/health
-# 在 liveness 窗口内起不来 → 容器被杀 (exit 137) → restartPolicy=Never 永久 Error。
-# agent_runner 不依赖 PG (PG 是给用户开发用的本地库), 故把 initdb 挪到这里、由
-# supervisor 托管, initdb 再慢也只推迟 PG 可用, 不影响 :8086 health。
-#
-# 幂等: PG_VERSION 缺失才 initdb; supervisor autorestart 重试安全。
-# 末尾 exec postgres 前台 → supervisor 直接追踪 postgres PID (与旧 postgres.conf
-# 直接跑 postgres 的行为一致, 无需 gosu/su-exec)。
+# UserApp(app-runtime)版: PG 首次 initdb 异步化 —— 不再在 start-app.sh 同步阻塞,
+# 避免 UserApp 首启慢被 liveness 杀(restartPolicy=Always → CrashLoopBackOff)。
+# PGDATA=/app/data/pg(PVC), 重启不丢; PG_VERSION 存在则跳过 initdb。
+# 幂等 + 末尾 exec postgres 前台(supervisor 直追 PID, 无需 gosu/su)。
+# 对齐 agent-runner 的 pg-supervisor-entry.sh, 仅默认值不同(PGDATA/user/db)。
 # =============================================================================
 set -u
 
 PG_BIN=/usr/lib/postgresql/16/bin
-: "${PGDATA:=/home/user/.pgdata}"
-: "${POSTGRES_USER:=dev}"
-: "${POSTGRES_PASSWORD:=dev}"
-: "${POSTGRES_DB:=dev}"
+: "${PGDATA:=/app/data/pg}"
+: "${POSTGRES_USER:=app}"
+: "${POSTGRES_PASSWORD:=app}"
+: "${POSTGRES_DB:=app}"
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
     echo "[pg] first-time initdb at $PGDATA"
@@ -50,7 +45,7 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
 fi
 
 # 前台运行 postgres, 供 supervisor 直接托管 (PID 即 postgres 本体)
-# chmod 700: postgres 要求 PGDATA u=rwx(0700)或 u=rwx,g=rx(0750); start-up.sh 的 install -d 默认建 755
-# → postgres FATAL "data directory has invalid permissions" → pgweb 登录连不上 PG. 幂等兜底 (supervisor 每次重启都校正, 也防 fsGroup/PVC 改权限).
+# chmod 700: postgres 要求 PGDATA u=rwx(0700)或 u=rwx,g=rx(0750); start-app.sh 的 install -d 默认建 755
+# → postgres FATAL "data directory has invalid permissions" → pgweb 登录连不上 PG. 幂等兜底 (防 fsGroup/PVC 改权限).
 chmod 700 "$PGDATA" 2>/dev/null || true
 exec "$PG_BIN/postgres" -D "$PGDATA"
