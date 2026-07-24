@@ -936,26 +936,14 @@ impl ContainerRuntime for KubernetesRuntime {
                             success_threshold: Some(1),
                             ..Default::default()
                         }),
-                        // startup_probe: 重型 agent-runner (computer 桌面/X11/VNC) 启动较慢,
-                        // 用 startupProbe 给最长 ~2min 启动宽限; 其运行期间 liveness/readiness
-                        // 自动暂停, 通过后才接管 → 慢启动不被 liveness 误杀; 通过后 readiness(period=1)
-                        // ~1s 内 Ready, 稳态仍由 liveness 严格保护。
-                        // (曾因 "startupProbe + readiness period=3 handoff 延迟" 去掉; 现 readiness
-                        //  已是 period=1, handoff ≤1s 可忽略, 故重新引入 —— 三者兼得。)
-                        // failure_threshold=12 × period=10s = ~2min: 兼顾首启慢与"真崩别等太久才暴露"。
-                        startup_probe: Some(Probe {
-                            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                                path: Some("/health".to_string()),
-                                port: IntOrString::Int(8086),
-                                ..Default::default()
-                            }),
-                            initial_delay_seconds: Some(5),
-                            period_seconds: Some(10),
-                            timeout_seconds: Some(3),
-                            failure_threshold: Some(12),
-                            success_threshold: Some(1),
-                            ..Default::default()
-                        }),
+                        // 注: 此处不配 startup_probe。
+                        // 历史: 曾配 startup_probe(initialDelay=5/period=10/failure=12, ~2min 宽限) 防
+                        // initdb 慢启动被 liveness 误杀; 但 bebba86 已把 PG initdb 异步化(supervisor 托管),
+                        // /health 2s 内 ready, 慢启动根因消除。保留 startup_probe 反成拖累: initialDelay=5 +
+                        // period=10 粒度让 Ready 卡在 ~11s(应用早 ready 却要等首探 pod+5s)。去掉后
+                        // readiness(period=1) 直接接管, ~3s 内 Ready; 启动期保护由 liveness 兜底
+                        // (initialDelay=30 + failure=3×period=10 = 50s 宽限, 远大于 2s ready, 不会被误杀)。
+                        // 若日后 agent-runner 首启又变慢(>50s), 再考虑重新引入激进配置的 startup_probe。
                         // preStop lifecycle hook: 在 kubelet 发送 SIGTERM 之前执行，
                         // 确保 JuiceFS FUSE 卷上的写入 buffer flush 到磁盘，
                         // 减少 FUSE unmount 卡住的概率
