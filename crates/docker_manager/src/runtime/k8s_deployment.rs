@@ -1,14 +1,14 @@
-//! K8s Deployment 生命周期管理（UserApp 专用）
+//! UserApp K8s 资源 **共享 helper**(命名/label/API accessor/const)。
+//! 从原 k8s_deployment.rs(1415行)拆分后,本文件仅保留跨 create/lifecycle/query 共用的:
+//! - 模块级 const:`APP_MANAGED_BY`/`APP_LABEL_PREFIX`/`RCODER_LABEL_PREFIX`/`APP_CONTAINER_NAME`
+//! - 命名:`app_deployment_name`/`app_config_name`/.../`app_workspace_pvc_name`
+//! - label 构建:`build_app_labels`
+//! - API accessor:`pods_api`/`deployments_api`/`services_api`/`configmaps_api`/`secrets_api`
+//! - SSA 参数:`ssa_patch_params`
 //!
-//! 与 agent 的裸 Pod 模式（k8s_pod.rs）区分：UserApp 走 Deployment，
-//! 支持 scale（start/stop）与 rollout restart。
-//!
-//! 资源 label `app.kubernetes.io/managed-by=rcoder-app-manager`，与 agent 的
-//! `rcoder-runtime` 物理隔离——cleanup_task 基于 `projects` 内存表扫描，UserApp
-//! 不进该表；label 差异作为第二道防线（供对账接口 list，及防御未来按 label 的扫描）。
-//!
-//! 存储复用 rcoder-workspace RWX PVC + subPath `workspace/apps/{app_id}`（rcoder Pod 与 app
-//! Pod 共享，app_manager 文件管理直接读写）。
+//! 实际生命周期方法见 `k8s_app_create`(创建)/`k8s_app_lifecycle`(stop/restart/cleanup)/
+//! `k8s_app_query`(状态查询)/`k8s_app_helpers`(编解码/probe)。
+//! UserApp 存储走 per-app CephFS subvolume PVC(`ensure_workspace_pvc(app_id, UserApp, ...)`)。
 
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::ContainerRuntimeResult;
