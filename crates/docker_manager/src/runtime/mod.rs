@@ -23,6 +23,10 @@ pub(crate) mod k8s_translate;
 pub(crate) mod k8s_app_observation;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_agent_pod;
+#[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_agent_create;
+#[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_agent_query;
 
 pub use docker_runtime::DockerRuntime;
 #[cfg(feature = "kubernetes")]
