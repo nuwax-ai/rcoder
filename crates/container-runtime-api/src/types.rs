@@ -214,6 +214,23 @@ pub struct DeploymentStatus {
     pub resource_version: Option<String>,
 }
 
+/// app 容器当前 `command`/`env` 快照（`update` 部分更新回退用）。
+///
+/// rcoder 无状态、不存业务元数据（name/image/command/env 由调用方持久化）。
+/// `update` 请求若漏 `command`/`env`，从 live 容器读当前值回退——与 `ports` 从运行时状态
+/// 回退一致，避免部分更新静默清空（`command` 丢 → 镜像无 ENTRYPOINT 时 CrashLoop；
+/// `env` 丢 → K8s `cleanup_orphan_port_resources` 删 ConfigMap → 容器丢环境变量）。
+///
+/// 注：env 仅回退**字面值**（K8s ConfigMap.data / Docker Config.env）；
+/// `valueFrom`（secret/configmap 引用）无字面值，读不回，需调用方 update 时重发 `secrets`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerSpecSnapshot {
+    /// 启动命令（K8s UserApp 存于 `container.args`，Docker 存于 `Config.cmd`）
+    pub command: Option<Vec<String>>,
+    /// 字面值环境变量
+    pub env: Option<HashMap<String, String>>,
+}
+
 /// 应用资源用量（运行时层；K8s 来自 metrics.k8s.io PodMetrics，Docker 可来自 bollard stats）。
 /// 仅含运行时可观测的用量 + 限额；百分比由 app_manager 层算（usage/limit）。
 /// network（rx/tx）metrics.k8s.io 不提供，故不在此（app_manager 层留 0）。

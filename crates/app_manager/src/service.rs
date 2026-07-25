@@ -792,11 +792,34 @@ impl AppService {
                     .to_string(),
             )
         })?;
+        // 问题④修复（方案C）：`command`/`env` 为 None 时从 live 容器读当前值回退（与 `ports`
+        // 从运行时状态回退一致），避免部分更新静默清空：
+        //   - `command` 丢 → 镜像无 ENTRYPOINT 时 CrashLoop（container.args 为空）；
+        //   - `env` 丢 → K8s `cleanup_orphan_port_resources` 删 ConfigMap → 容器丢环境变量。
+        // 仅在确实缺省时才读（省一次 K8s GET）；读失败降级为旧行为（清空）+ warn，不阻塞 update。
+        // 注：`secrets`/`resources`/`health_check`/`tenant_id`/`space_id` 同为部分更新时静默清空，
+        // 但 severity 较低（不直接 CrashLoop），暂不在此次修复范围（可同法扩展）。
+        let (command, env) = if request.command.is_none() || request.env.is_none() {
+            match self.runtime.get_app_container_spec(app_id).await {
+                Ok(spec) => (
+                    request.command.clone().or(spec.command),
+                    request.env.clone().or(spec.env),
+                ),
+                Err(e) => {
+                    warn!(
+                        "[APP] get_app_container_spec failed app_id={app_id} (command/env may be cleared on partial update): {e}"
+                    );
+                    (request.command.clone(), request.env.clone())
+                }
+            }
+        } else {
+            (request.command.clone(), request.env.clone())
+        };
         self.build_params_inner(
             app_id,
             image,
-            &request.command,
-            &request.env,
+            &command,
+            &env,
             &request.secrets,
             &request.ports,
             &request.health_check,

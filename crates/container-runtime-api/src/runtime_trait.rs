@@ -6,8 +6,8 @@ use shared_types::{ContainerBasicInfo, ServiceType};
 use super::container_params::ContainerCreateParams;
 use super::types::{
     AppEventInfo, ContainerLogEntry, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, DeploymentStatus, ExecResult, RemovedContainerInfo, ResourceUsage,
-    RuntimeContainerInfo,
+    ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus, ExecResult,
+    RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo,
 };
 
 // mpsc 仍在 lib.rs re-export（`container_runtime_api::mpsc::Receiver` 被 docker_manager /
@@ -245,6 +245,20 @@ pub trait ContainerRuntime: Send + Sync {
         Err(ContainerRuntimeError::ConfigurationError(
             "get_deployment_status not supported by this runtime".to_string(),
         ))
+    }
+
+    /// 读 app 当前容器的 `command`/`env` 快照（`update` 部分更新回退用，见
+    /// [`ContainerSpecSnapshot`]）。
+    ///
+    /// 默认返回空快照（不支持时回退为空 = 保持旧行为）；K8s/Docker 重写读 live 容器。
+    /// 仅在 `request.command`/`env` 为 None 时由 `app_manager::build_container_params_from_update`
+    /// 用作回退，避免部分更新静默清空 → CrashLoop / 丢环境变量。
+    async fn get_app_container_spec(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<ContainerSpecSnapshot> {
+        let _ = app_id;
+        Ok(ContainerSpecSnapshot::default())
     }
 
     /// 列出当前 runtime 托管的所有 UserApp Deployment（供对账接口）

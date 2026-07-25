@@ -6,7 +6,8 @@
 use async_trait::async_trait;
 use container_runtime_api::{
     AppPortStatus, ContainerCreateParams, ContainerLogEntry, ContainerRuntime,
-    ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus, DeploymentStatus,
+    ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot,
+    DeploymentStatus,
     ExposeType, RemovedContainerInfo, RuntimeContainerInfo,
 };
 use moka::future::Cache;
@@ -538,6 +539,41 @@ impl ContainerRuntime for DockerRuntime {
             ports,
             resource_version: None,
         }))
+    }
+
+    /// 读 app 当前容器的 `command`/`env` 快照（update 部分更新回退用，见 trait 注释）。
+    /// Docker：command = `Config.cmd`，env = `Config.env`（`K=V` 数组）。容器不存在 → 空快照。
+    async fn get_app_container_spec(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<ContainerSpecSnapshot> {
+        let name = app_deployment_name(app_id);
+        let client = self.inner.get_docker_client();
+        let inspect = match client.inspect_container(&name, None).await {
+            Ok(i) => i,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(ContainerSpecSnapshot::default()),
+            Err(e) => {
+                return Err(ContainerRuntimeError::ConnectionError(format!(
+                    "inspect for container spec: {e}"
+                )))
+            }
+        };
+        let cfg = inspect.config.as_ref();
+        let command = cfg.and_then(|c| c.cmd.clone());
+        let env = cfg
+            .and_then(|c| c.env.clone())
+            .map(|envs| {
+                envs.into_iter()
+                    .filter_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        Some((k.to_string(), v.to_string()))
+                    })
+                    .collect::<std::collections::HashMap<String, String>>()
+            })
+            .filter(|m| !m.is_empty());
+        Ok(ContainerSpecSnapshot { command, env })
     }
 
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {

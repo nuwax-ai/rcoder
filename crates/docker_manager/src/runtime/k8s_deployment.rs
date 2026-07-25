@@ -13,7 +13,7 @@
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
     AppPortSpec, AppPortStatus, ContainerCreateParams, ContainerRuntimeError,
-    ContainerRuntimeResult, DeploymentStatus, ExposeType, HttpExpose,
+    ContainerRuntimeResult, ContainerSpecSnapshot, DeploymentStatus, ExposeType, HttpExpose,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
@@ -1009,6 +1009,51 @@ impl KubernetesRuntime {
             }
         };
         Ok(Some(self.deployment_to_status(app_id, &deploy).await))
+    }
+
+    /// 读 app 当前容器的 `command`/`env` 快照（update 部分更新回退用）。
+    ///
+    /// - **command**：UserApp 存于 `container.args`（用镜像 ENTRYPOINT + 用户命令作 args），
+    ///   兼顾 `container.command`（其他路径内联）→ `command.or(args)`。
+    /// - **env**：UserApp env 走 ConfigMap（envFrom 引用 `{app}-config`），读 `.data` 还原字面值。
+    ///
+    /// 任一资源 404 → 对应字段 None（互不影响）。读失败上抛（update 调用方降级 warn）。
+    pub async fn get_app_container_spec(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<ContainerSpecSnapshot> {
+        // command：Deployment 主容器的 args（UserApp）/ command（其他）
+        let command = match self
+            .deployments_api()
+            .get(&self.app_deployment_name(app_id))
+            .await
+        {
+            Ok(deploy) => deploy
+                .spec
+                .and_then(|s| s.template.spec)
+                .and_then(|ps| ps.containers.into_iter().next())
+                .and_then(|c| c.command.or(c.args)),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => None,
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "get deployment for container spec: {e}"
+                )))
+            }
+        };
+        // env：ConfigMap `{app}-config`.data（apply_app_configmap 写入 = params.env 原样）
+        let env = match self.configmaps_api().get(&self.app_config_name(app_id)).await {
+            Ok(cm) => cm
+                .data
+                .filter(|m| !m.is_empty())
+                .map(|m| m.into_iter().collect()),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => None,
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "get configmap for container spec: {e}"
+                )))
+            }
+        };
+        Ok(ContainerSpecSnapshot { command, env })
     }
 
     /// 列出所有 rcoder-app-manager 托管的 app 状态（对账用）
