@@ -109,6 +109,19 @@ impl AppService {
     /// 创建应用
     #[instrument(skip(self, request))]
     pub async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
+        let app_id = self.validate_create_request(&request).await?;
+        info!(
+            "[APP] creating app: {} ({}, mode={:?})",
+            request.name, app_id, self.config.access_mode
+        );
+        self.provision_app_workspace(&app_id, &request).await?;
+        self.create_app_runtime(&app_id, &request).await?;
+        Ok(self.assemble_app_info(app_id, request).await)
+    }
+
+    /// 校验创建请求并解析 app_id（app_id 规范 + 唯一性 + 资源格式 + 端口）。
+    /// 任一校验失败 Fail Fast 返回 ERR_VALIDATION / ERR_APP_ALREADY_EXISTS。
+    async fn validate_create_request(&self, request: &CreateAppRequest) -> AppResult<String> {
         // app_id：外部指定（app- + DNS-1123，校验 + 唯一性）or 自动生成
         let app_id = match &request.app_id {
             Some(id) => {
@@ -123,12 +136,8 @@ impl AppService {
             }
             None => format!("app-{}", &Uuid::new_v4().to_string()[..8]),
         };
-        info!(
-            "[APP] creating app: {} ({}, mode={:?})",
-            request.name, app_id, self.config.access_mode
-        );
 
-        // 0. 校验资源限制格式（K8s Quantity: storage / ephemeral_storage）→ ERR_VALIDATION
+        // 资源限制格式（K8s Quantity: storage / ephemeral_storage）→ ERR_VALIDATION
         if let Some(ref resources) = request.resources {
             if let Some(ref s) = resources.storage {
                 validate_k8s_storage_size(s).map_err(|e| {
@@ -145,17 +154,13 @@ impl AppService {
             }
         }
 
-        // 0.5 校验端口：HTTP 端口数上限放开（app-runtime 镜像单容器带 pgweb 8081 + ttyd 7681 + 用户应用端口）
+        // 端口校验：HTTP 端口数上限放开（app-runtime 镜像单容器带 pgweb 8081 + ttyd 7681 + 用户应用端口）
         // Pingora path 路由 /proxy/apps/{app_id}/{port}/ 按 (app_id, port) 区分，天然支持多 HTTP 端口
         // gateway 模式（HTTPRoute）仍只支持单 HTTP，在 k8s_deployment 侧单独拦截（这里不拦，让 Pingora 模式可用）
         let http_port_count = request
             .ports
             .as_ref()
-            .map(|ps| {
-                ps.iter()
-                    .filter(|p| p.expose_type == ExposeType::Http)
-                    .count()
-            })
+            .map(|ps| ps.iter().filter(|p| p.expose_type == ExposeType::Http).count())
             .unwrap_or(0);
         const MAX_HTTP_PORTS: usize = 8;
         if http_port_count > MAX_HTTP_PORTS {
@@ -163,7 +168,7 @@ impl AppService {
                 "at most {MAX_HTTP_PORTS} HTTP ports allowed (got {http_port_count})"
             )));
         }
-        // 0.5b 端口号唯一：避免 K8s annotation 解码歧义（同 port 不同 type 会被 HashMap 折叠）
+        // 端口号唯一：避免 K8s annotation 解码歧义（同 port 不同 type 会被 HashMap 折叠）
         // 及 Pingora backend key(port) 冲突。Fail Fast 在源头拒绝。
         if let Some(ports) = &request.ports {
             let mut seen = std::collections::HashSet::new();
@@ -176,48 +181,63 @@ impl AppService {
                 }
             }
         }
+        Ok(app_id)
+    }
 
-        // 1. K8s: ensure per-app PVC 带用户配额 requests.storage + 等 subvolumePath 就绪。Docker no-op。
-        //    必须在 create_app_dirs (建目录) + create_deployment (Docker bind mount 需源目录存在) 之前:
-        //    首次 ensure 带配额, 避免 create_deployment 内 ensure 命中 active 复用丢配额。
+    /// provision：ensure per-app PVC（带用户配额 requests.storage + 等 subvolumePath）+ 建工作空间目录。
+    ///
+    /// 顺序硬约束：K8s ensure PVC 必须在 create_app_dirs + create_deployment 之前——首次 ensure
+    /// 带配额，否则 create_deployment 内 ensure 命中 active 复用会丢配额。Docker 模式 no-op。
+    async fn provision_app_workspace(
+        &self,
+        app_id: &str,
+        request: &CreateAppRequest,
+    ) -> AppResult<()> {
         let storage_size = request.resources.as_ref().and_then(|r| r.storage.as_deref());
-        self.ensure_app_workspace_ready(&app_id, storage_size).await?;
+        self.ensure_app_workspace_ready(app_id, storage_size).await?;
+        // 创建工作空间目录（code/data/logs）—— Docker: 共享 Local (create_deployment bind mount 源,
+        // 必须先存在); K8s: per-app PVC 根 (ensure_app_workspace_ready 已 ensure + 等 subvolumePath)。
+        self.create_app_dirs(app_id).await?;
+        Ok(())
+    }
 
-        // 2. 创建应用工作空间目录（code/data/logs）—— Docker: 共享 Local (create_deployment bind mount 源,
-        //    必须先存在); K8s: per-app PVC 根 (ensure_app_workspace_ready 已 ensure + 等 subvolumePath)。
-        self.create_app_dirs(&app_id).await?;
-
-        // 3. 构建容器创建参数（UserApp）
-        let params = self.build_container_params(&app_id, &request).await?;
-
-        // 4. 创建 Deployment / 容器（K8s 含 ConfigMap/Secret/Service/HTTPRoute/NodePort;
-        //    PVC active 复用 / Docker bind mount 共享目录已存在）。
+    /// 创建运行时资源：build params → create_deployment → 注册 Pingora backend。
+    ///
+    /// 注: UserApp 是新开发逻辑 (application-management-service-v2-design.md), /app 路径
+    /// 不涉及历史数据迁移 → 不调 lazy_migrate (新应用无旧数据)。Web/Computer 有历史数据才调。
+    async fn create_app_runtime(
+        &self,
+        app_id: &str,
+        request: &CreateAppRequest,
+    ) -> AppResult<()> {
+        let params = self.build_container_params(app_id, request).await?;
         let container_info = self.runtime.create_deployment(params).await.map_err(|e| {
-            map_runtime_error(
-                &format!("[APP] create_deployment failed app_id={app_id}"),
-                e,
-            )
+            map_runtime_error(&format!("[APP] create_deployment failed app_id={app_id}"), e)
         })?;
         info!(
             "[APP] app resources created: {} (container={})",
             app_id, container_info.container_name
         );
-
-        // 注: UserApp 是新开发逻辑 (application-management-service-v2-design.md), /app 路径
-        // 不涉及历史数据迁移 → 不调 lazy_migrate (新应用无旧数据)。
-        // Web/Computer 有历史数据 → 保留 lazy_migrate。
-
-        // 5. Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/apps/{app_id}/{port} → container_ip）
+        // Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/apps/{app_id}/{port} → container_ip）
         let http_ports = http_port_numbers(&request.ports);
-        self.register_pingora_backends(&app_id, &http_ports, &container_info.container_ip)
+        self.register_pingora_backends(app_id, &http_ports, &container_info.container_ip)
             .await;
+        Ok(())
+    }
 
-        // 6. 实时查询运行时状态（K8s 用于拿真实 node_port；Docker 模式不还原端口语义）
+    /// 装配 AppInfo：实时查运行时状态，合并端口 external_port（K8s node_port），构建 access/health/status。
+    ///
+    /// status 用运行时 phase 映射（不再硬编码 Running）——刚创建的 Pod 通常还是 Starting，甚至镜像
+    /// 拉取失败已 Error；返回真实状态避免"status=Running 但 health=Starting/Error"自相矛盾。
+    async fn assemble_app_info(
+        &self,
+        app_id: String,
+        request: CreateAppRequest,
+    ) -> AppInfo {
         let runtime_status = self.fetch_runtime_status(&app_id).await;
 
-        // 端口状态：以请求端口为准（expose_type 语义完整），合并运行时返回的 external_port
-        // （K8s node_port）。Docker 模式 get_deployment_status 不还原端口语义，Tcp 的 host_port
-        // 留空（已知限制：Docker Tcp 对外端口需通过 docker inspect port_bindings 另查）。
+        // 端口状态：以请求端口为准（expose_type 语义完整），合并运行时返回的 external_port（K8s node_port）。
+        // Docker 模式 get_deployment_status 不还原端口语义，Tcp 的 host_port 留空（已知限制）。
         let mut ports: Vec<AppPortStatus> = request
             .ports
             .as_ref()
@@ -245,7 +265,6 @@ impl AppService {
             }
         }
 
-        // 7. 构建访问信息 + 健康信息
         let access = self.build_access_info(&app_id, &ports);
         let health = runtime_status
             .as_ref()
@@ -255,31 +274,27 @@ impl AppService {
                 instance: None,
                 probes: None,
             });
-
-        // status：用刚查到的运行时 phase 映射（不再硬编码 Running）——刚创建的 Pod 通常
-        // 还是 Starting，甚至镜像拉取失败已 Error；返回真实状态避免"status=Running 但
-        // health=Starting/Error"自相矛盾。message 带 phase=Error 的失败原因。
         let (status, message) = match &runtime_status {
             Some(s) => (phase_to_status(&s.phase), s.message.clone()),
             None => (AppStatus::Starting, None),
         };
 
         let now = Utc::now().to_rfc3339();
-        Ok(AppInfo {
-            app_id: app_id.clone(),
-            name: request.name.clone(),
+        AppInfo {
+            app_id,
+            name: request.name,
             status,
             message,
-            image: request.image.clone(),
-            command: request.command.clone().unwrap_or_default(),
+            image: request.image,
+            command: request.command.unwrap_or_default(),
             replicas: 1,
             access,
             health,
-            resources: request.resources.clone(),
-            env: request.env.clone().unwrap_or_default(),
+            resources: request.resources,
+            env: request.env.unwrap_or_default(),
             created_at: now.clone(),
             updated_at: now,
-        })
+        }
     }
 
 
