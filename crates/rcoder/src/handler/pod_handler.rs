@@ -1820,38 +1820,29 @@ pub async fn pod_restart(
                     " [POD_RESTART] Agent 原地重启完成（fast，volume 未 unstage）: container_identifier={}",
                     container_identifier
                 );
-                // 取最新 container_info（status 刷新为 Running）构建响应
-                match ComputerContainerManager::get_container_info_with_type(
-                    &container_identifier,
-                    state.runtime(),
-                    &service_type,
-                )
-                .await
-                {
-                    Ok(Some(info)) => {
-                        let response = RestartPodResponse {
-                            was_existing: true,
-                            restarted: true,
-                            container_info: PodContainerInfo {
-                                container_id: info.container_id.clone(),
-                                status: info.status.clone(),
-                            },
-                            message: "Container restarted in-place (fast), can access virtual desktop via VNC (Agent service not started)".to_string(),
-                        };
-                        info!(
-                            " [POD_RESTART] Completed (in-place): container_id={}",
-                            info.container_id
-                        );
-                        return Ok(HttpResult::success(response));
-                    }
-                    other => {
-                        warn!(
-                            " [POD_RESTART] in-place 重启成功但取 info 失败({:?})，回落 destroy+recreate: container_identifier={}",
-                            other, container_identifier
-                        );
-                        // 落入下方 destroy+recreate 兜底
-                    }
-                }
+                // 原地重启不换 pod（同 UID）→ 复用 existing_container 的 container_id；
+                // status=Running（in-place 的 poll 已确认 ready）。不再 re-fetch —— 避免 fetch 失败
+                // 时回落 destroy 把刚原地重启好的 pod 毁掉重建（违背原地重启初衷）。
+                let response = RestartPodResponse {
+                    was_existing: true,
+                    restarted: true,
+                    container_info: existing_container
+                        .as_ref()
+                        .map(|c| PodContainerInfo {
+                            container_id: c.container_id.clone(),
+                            status: "Running".to_string(),
+                        })
+                        .unwrap_or_else(|| PodContainerInfo {
+                            container_id: container_identifier.clone(),
+                            status: "Running".to_string(),
+                        }),
+                    message: "Container restarted in-place (fast), can access virtual desktop via VNC (Agent service not started)".to_string(),
+                };
+                info!(
+                    " [POD_RESTART] Completed (in-place): container_id={}",
+                    response.container_info.container_id
+                );
+                return Ok(HttpResult::success(response));
             }
             Err(e) => {
                 warn!(

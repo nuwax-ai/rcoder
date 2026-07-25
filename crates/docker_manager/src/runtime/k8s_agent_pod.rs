@@ -10,7 +10,7 @@
 use container_runtime_api::{
     ContainerRuntimeError, ContainerRuntimeResult, RemovedContainerInfo, RuntimeContainerInfo,
 };
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::api::{Api, DeleteParams, ListParams};
 use shared_types::ServiceType;
 use tracing::{debug, info, warn};
@@ -89,20 +89,20 @@ impl KubernetesRuntime {
         use tokio::io::AsyncReadExt;
 
         const AGENT_CONTAINER: &str = "agent";
+        const RESTART_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let pod_name = self.agent_pod_name(identifier, service_type)?;
 
-        // 1. 基线 restartCount（agent 容器；缺失视作 0）
-        let baseline = self
+        // 1. 基线 restartCount（agent 容器；缺失视作 0）。pod 取失败 → Err（fail-fast）。
+        let pod = self
             .pods()
             .get(&pod_name)
             .await
             .map_err(|e| {
                 ContainerRuntimeError::K8sError(format!("get pod for restart baseline: {e}"))
-            })?
-            .status
-            .and_then(|s| s.container_statuses)
-            .and_then(|cs| cs.into_iter().find(|c| c.name == AGENT_CONTAINER))
-            .map(|c| c.restart_count)
+            })?;
+        let baseline = container_status(&pod, AGENT_CONTAINER)
+            .map(|(rc, _)| rc)
             .unwrap_or(0);
 
         // 2. exec kill -TERM 1（agent 容器 PID 1 = agent_runner → SIGTERM → 优雅退出 → kubelet 原地重启）
@@ -138,24 +138,21 @@ impl KubernetesRuntime {
             debug!("[K8S] restart exec join (kill -TERM 1): {e} (non-fatal, SIGTERM 已发)");
         }
 
-        // 3. 轮询原地重启完成：restartCount 自增（kubelet 原地重启）+ ready。30s 超时 → Err（回落）。
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // 3. 轮询原地重启完成：restartCount 自增（kubelet 原地重启）+ ready。超时 → Err（回落）。
+        let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
         loop {
             if std::time::Instant::now() > deadline {
                 return Err(ContainerRuntimeError::K8sError(format!(
-                    "in-place restart timeout: agent restartCount did not increment within 30s (pod={pod_name})"
+                    "in-place restart timeout: agent restartCount did not increment within {RESTART_TIMEOUT:?} (pod={pod_name})"
                 )));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(RESTART_POLL_INTERVAL).await;
             let restarted = self
                 .pods()
                 .get(&pod_name)
                 .await
                 .ok()
-                .and_then(|p| p.status)
-                .and_then(|s| s.container_statuses)
-                .and_then(|cs| cs.into_iter().find(|c| c.name == AGENT_CONTAINER))
-                .map(|c| (c.restart_count, c.ready));
+                .and_then(|p| container_status(&p, AGENT_CONTAINER));
             if let Some((rc, ready)) = restarted
                 && rc > baseline
                 && ready
@@ -333,4 +330,12 @@ impl KubernetesRuntime {
         );
         Ok(())
     }
+}
+
+/// 取 pod 内指定容器的 (restartCount, ready)。找不到容器/无状态 → None。
+/// `restart_agent_container_inplace` 的 baseline 与 poll 共用（避免重复 pod→status→find 展开）。
+fn container_status(pod: &Pod, container_name: &str) -> Option<(i32, bool)> {
+    let cs = pod.status.as_ref()?.container_statuses.as_ref()?;
+    let c = cs.iter().find(|c| c.name == container_name)?;
+    Some((c.restart_count, c.ready))
 }
