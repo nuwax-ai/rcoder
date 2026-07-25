@@ -10,8 +10,8 @@ use chrono::Utc;
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
     ContainerCreateParams, ContainerLogEntry, ContainerRuntime, ContainerRuntimeError,
-    ContainerRuntimeResult, ContainerRuntimeStatus, DeploymentStatus, HttpExpose,
-    RemovedContainerInfo, RuntimeContainerInfo,
+    ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus,
+    HttpExpose, RemovedContainerInfo, RuntimeContainerInfo,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
@@ -764,6 +764,16 @@ impl ContainerRuntime for KubernetesRuntime {
 
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
         self.list_app_status().await
+    }
+
+    async fn get_app_container_spec(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<ContainerSpecSnapshot> {
+        // 委派到 k8s_deployment 的 inherent 实现（UserApp trait 方法统一走「委派→inherent」模式，
+        // 与 get_deployment_status→get_app_status 一致）。不委派则会命中 trait 默认实现（空快照）→
+        // update 回退失效 → command/env 仍被清空。
+        self.read_app_container_spec(app_id).await
     }
 
     async fn get_app_logs(

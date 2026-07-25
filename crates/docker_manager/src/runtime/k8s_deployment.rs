@@ -1018,7 +1018,8 @@ impl KubernetesRuntime {
     /// - **env**：UserApp env 走 ConfigMap（envFrom 引用 `{app}-config`），读 `.data` 还原字面值。
     ///
     /// 任一资源 404 → 对应字段 None（互不影响）。读失败上抛（update 调用方降级 warn）。
-    pub async fn get_app_container_spec(
+    /// 注：trait 方法 `ContainerRuntime::get_app_container_spec` 委派到这里（见 kubernetes_runtime.rs）。
+    pub async fn read_app_container_spec(
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<ContainerSpecSnapshot> {
