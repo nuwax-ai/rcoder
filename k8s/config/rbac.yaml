@@ -18,7 +18,7 @@ rules:
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets"]
+    resources: ["deployments", "replicasets", "statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["namespaces"]

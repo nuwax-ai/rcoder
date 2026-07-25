@@ -16,6 +16,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::api_key_manager::ApiKeyManager;
 use crate::config::AppConfig;
+use crate::handler::ready_check;
+use crate::handler::__path_ready_check;
 use crate::service::AgentSessionService;
 use crate::service::local_agent_service::LocalAgentHttpService;
 
@@ -182,7 +184,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     // 通用路由
     let api_routes = Router::new()
-        .route("/health", get(health_check))
+        .route("/health", get(health_check))            // liveness: 纯进程活, 恒 200
+        .route("/ready", get(ready_check)) // readiness: gRPC 就绪才 200, 否则 503
         .with_state(state.clone());
 
     // P0-1: Agent 管理路由(仅在 agent_mgmt_http_state 被设置时启用)
@@ -203,32 +206,22 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // 🔥 50MB body 限制
 }
 
-/// 健康检查端点
-///
-/// 检查服务的健康状态，同时检查 HTTP 和 gRPC 服务是否就绪
+/// liveness 检查端点（/health）：纯"进程活"立即 200，不检查 gRPC。
+/// 供 K8s livenessProbe —— 进程活着就别重启; gRPC 是否就绪由 /ready (readinessProbe) 管。
+/// 极快（~1ms, 无 TCP 探测）, cpu 饱和也扛得住 liveness timeout, 避免启动期误杀。
 #[utoipa::path(
     get,
     path = "/health",
     responses(
-        (status = 200, description = "服务健康状态", body = shared_types::HttpResult<shared_types::HealthCheckResponse>)
+        (status = 200, description = "进程存活（liveness）", body = shared_types::HttpResult<shared_types::HealthCheckResponse>)
     ),
     tag = "system"
 )]
 pub async fn health_check() -> Json<shared_types::HttpResult<shared_types::HealthCheckResponse>> {
-    use crate::handler::health_handler::{build_health_response, check_grpc_port_simple};
-
-    // HTTP 服务：本端点正常响应即表示就绪
-    let http_ready = true;
-
-    // 检查 gRPC 端口是否就绪
-    let grpc_ready = check_grpc_port_simple().await;
-
-    // 使用统一的健康检查响应构建函数
-    Json(build_health_response(
-        "agent-runner",
-        http_ready,
-        grpc_ready,
-    ))
+    use crate::handler::health_handler::build_health_response;
+    // liveness 只关心进程存活: 本端点能响应即证明 agent_runner 进程活着 → 200。
+    // gRPC 就绪状态交由 /ready (readinessProbe) 负责, 这里不检查, 避免启动期 liveness 误杀。
+    Json(build_health_response("agent-runner", true, true))
 }
 
 /// P0-1: 构建 agent_mgmt 子路由(导出供集成测试使用)
@@ -289,6 +282,7 @@ fn create_swagger_ui() -> SwaggerUi {
             handle_pod_count,
             // 健康检查
             health_check,
+            ready_check,
             // Agent Management 端点
             list_agents,
             get_agent,

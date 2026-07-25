@@ -102,6 +102,14 @@ async fn main() -> anyhow::Result<()> {
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let _telemetry = Arc::new(telemetry);
 
+    // 打印 tokio runtime worker 数, 排查"cpu limit 是否导致 worker=1 阻塞"。
+    // tokio multi_thread 默认 worker = 物理核数 (num_cpus), 不受 cgroup CFS quota 影响;
+    // 仅 cpuset 静态绑核才受限 → cpu limit=1 不会让 worker=1。
+    info!(
+        "tokio runtime workers: {}",
+        tokio::runtime::Handle::current().metrics().num_workers()
+    );
+
     // 🆕 Pyroscope Profiler 初始化（可选：需要 pyroscope feature）
     #[cfg(feature = "pyroscope")]
     let _pyroscope_guard: Option<profiler::ProfilerGuard> = {

@@ -391,14 +391,13 @@ impl KubernetesRuntime {
                         success_threshold: Some(1),
                         ..Default::default()
                     }),
-                    // readiness_probe: initialDelay/period 用 1s, agent_runner /health 一返回 200 即 Ready。
-                    // 原 initialDelay=3+period=3 会把首次成功探测拖到 ~3-6s (create 阶段慢)。
-                    // 实测 startupProbe + readiness period=3 有 handoff 延迟 (startup 通过后还要等 readiness 的 3s 边界),
-                    // 不如直接 readiness period=1: 每 1s 探一次, /health=200 后 ~1s 内 Ready。
-                    // 稳态每秒一次 /health GET 开销可忽略; failure_threshold=20 容忍启动期 503, 不被误杀。
+                    // readiness_probe: 探 /ready (检查 gRPC 50051 就绪), 与 liveness 的 /health 分离。
+                    // gRPC 没起 → /ready 返 503 → pod NotReady → Service 摘流量; gRPC 起了 → 200 → 放流量。
+                    // initialDelay/period 用 1s: 每 1s 探一次, /ready=200 后 ~1s 内 Ready。
+                    // failure_threshold=20 容忍启动期 503 (gRPC 还没起), 不被误判 NotReady 太久。
                     readiness_probe: Some(Probe {
                         http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                            path: Some("/health".to_string()),
+                            path: Some("/ready".to_string()),
                             port: IntOrString::Int(8086),
                             ..Default::default()
                         }),
