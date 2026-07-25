@@ -6,7 +6,7 @@ use shared_types::{ContainerBasicInfo, ServiceType};
 use super::container_params::ContainerCreateParams;
 use super::types::{
     AppEventInfo, ContainerLogEntry, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, DeploymentStatus, ExecResult, RemovedContainerInfo,
+    ContainerRuntimeStatus, DeploymentStatus, ExecResult, RemovedContainerInfo, ResourceUsage,
     RuntimeContainerInfo,
 };
 
@@ -306,6 +306,18 @@ pub trait ContainerRuntime: Send + Sync {
     async fn get_app_events(&self, app_id: &str) -> ContainerRuntimeResult<Vec<AppEventInfo>> {
         let _ = app_id;
         Ok(vec![])
+    }
+
+    /// 查询 app 实时资源用量（CPU/内存用量 + 限额）。
+    /// K8s 实现：metrics.k8s.io PodMetrics（用量）+ pod spec resources.limits（限额）。
+    /// network（rx/tx）metrics.k8s.io 不提供，故不含。默认返回空（后端未实现/无 metrics-server），
+    /// app_manager 层据此 + restart_count 组装对外 ResourceStats（用量 0 即降级为 0，不 500）。
+    async fn get_app_resource_usage(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<ResourceUsage> {
+        let _ = app_id;
+        Ok(ResourceUsage::default())
     }
 
     /// 校验 app 管理前置条件（启动时 Fail Fast，防静默失败）

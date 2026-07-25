@@ -15,6 +15,12 @@ pub(crate) mod k8s_pod;
 pub(crate) mod k8s_pvc;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_service;
+#[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_statefulset;
+#[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_translate;
+#[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_app_observation;
 
 pub use docker_runtime::DockerRuntime;
 #[cfg(feature = "kubernetes")]

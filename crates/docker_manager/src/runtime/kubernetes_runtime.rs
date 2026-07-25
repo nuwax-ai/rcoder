@@ -15,9 +15,9 @@ use container_runtime_api::{
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
-    ConfigMapVolumeSource, Container as K8sContainer, ContainerPort, EmptyDirVolumeSource, EnvVar,
-    LocalObjectReference, PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimVolumeSource,
-    Pod, PodSecurityContext, PodSpec, Probe, ResourceRequirements, Service, Volume, VolumeMount,
+    Container as K8sContainer, ContainerPort, EnvVar, LocalObjectReference, PersistentVolume,
+    PersistentVolumeClaim, PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec,
+    Probe, ResourceRequirements, Service, Volume, VolumeMount,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -26,13 +26,13 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
 use kube::Config;
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, ObjectMeta};
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
 #[cfg(feature = "kubernetes")]
 use shared_types::{
-    ContainerBasicInfo, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec, K8sVolumeType,
-    ServiceResourceLimits, ServiceType,
+    ContainerBasicInfo, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec, ServiceResourceLimits,
+    ServiceType,
 };
 #[cfg(feature = "kubernetes")]
 use std::sync::Arc;
@@ -337,7 +337,9 @@ impl KubernetesRuntime {
     }
 
     /// Build resource requirements for K8s container from ServiceResourceLimits
-    fn build_resource_requirements(limits: &ServiceResourceLimits) -> Option<ResourceRequirements> {
+    pub(crate) fn build_resource_requirements(
+        limits: &ServiceResourceLimits,
+    ) -> Option<ResourceRequirements> {
         let mut requests: std::collections::BTreeMap<String, Quantity> =
             std::collections::BTreeMap::new();
         let mut lims: std::collections::BTreeMap<String, Quantity> =
@@ -393,115 +395,6 @@ impl KubernetesRuntime {
         })
     }
 
-    // ---- kubernetes_config → kube 对象翻译函数(完全分家:卷/挂载/sidecar 由配置驱动) ----
-
-    /// 翻译 kubernetes_config 卷规格 → kube `Volume`
-    ///
-    /// - 卷名 "workspace" 被拒(builder 硬编码占用)+告警
-    /// - HostPath 被策略禁用 → 跳过+告警
-    /// - Pvc/ConfigMap 缺 claim_name/config_map_name → 跳过+告警
-    /// - 返回 None 表示该卷被丢弃(调用方 flat_map 跳过)
-    fn translate_k8s_volume(spec: &K8sVolumeSpec) -> Option<Volume> {
-        // 卷名冲突保护:workspace 由 builder 硬编码管理
-        if spec.name == "workspace" {
-            warn!("[K8S] config volume name 'workspace' is reserved (builder-managed), skipping");
-            return None;
-        }
-        match spec.volume_type {
-            K8sVolumeType::EmptyDir => {
-                let mut ed = EmptyDirVolumeSource::default();
-                if let Some(sl) = &spec.size_limit {
-                    ed.size_limit = Some(Quantity(sl.clone()));
-                }
-                Some(Volume {
-                    name: spec.name.clone(),
-                    empty_dir: Some(ed),
-                    ..Default::default()
-                })
-            }
-            K8sVolumeType::Pvc => {
-                let Some(claim_name) = spec.claim_name.clone() else {
-                    warn!(
-                        "[K8S] pvc volume '{}' missing claim_name, skipping",
-                        spec.name
-                    );
-                    return None;
-                };
-                Some(Volume {
-                    name: spec.name.clone(),
-                    persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                        claim_name,
-                        read_only: Some(spec.read_only),
-                    }),
-                    ..Default::default()
-                })
-            }
-            K8sVolumeType::ConfigMap => {
-                let Some(cm_name) = spec.config_map_name.clone() else {
-                    warn!(
-                        "[K8S] configMap volume '{}' missing config_map_name, skipping",
-                        spec.name
-                    );
-                    return None;
-                };
-                Some(Volume {
-                    name: spec.name.clone(),
-                    config_map: Some(ConfigMapVolumeSource {
-                        name: cm_name,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })
-            }
-            K8sVolumeType::HostPath => {
-                // 策略禁用:hostPath 绑宿主机路径,动态 agent pod 多节点漂移不安全。
-                warn!(
-                    "[K8S] hostPath volume '{}' is forbidden by policy, skipping",
-                    spec.name
-                );
-                None
-            }
-        }
-    }
-
-    /// 翻译 kubernetes_config 卷挂载规格 → kube `VolumeMount`
-    fn translate_k8s_volume_mount(spec: &K8sVolumeMountSpec) -> VolumeMount {
-        VolumeMount {
-            name: spec.name.clone(),
-            mount_path: spec.mount_path.clone(),
-            sub_path: spec.sub_path.clone(),
-            read_only: Some(spec.read_only),
-            ..Default::default()
-        }
-    }
-
-    /// 翻译 kubernetes_config sidecar 规格 → kube `Container`(与主 agent 同 Pod)
-    fn translate_k8s_sidecar(spec: &K8sSidecarSpec) -> K8sContainer {
-        K8sContainer {
-            name: spec.name.clone(),
-            image: Some(spec.image.clone()),
-            // 用户硬性要求:imagePullPolicy 必须 IfNotPresent(动态 pod 频繁创建,节点已缓存)
-            image_pull_policy: Some(
-                spec.image_pull_policy
-                    .clone()
-                    .unwrap_or_else(|| "IfNotPresent".to_string()),
-            ),
-            command: if spec.command.is_empty() {
-                None
-            } else {
-                Some(spec.command.clone())
-            },
-            volume_mounts: Some(
-                spec.volume_mounts
-                    .iter()
-                    .map(Self::translate_k8s_volume_mount)
-                    .collect(),
-            ),
-            resources: Self::build_resource_requirements(&spec.resources),
-            ..Default::default()
-        }
-    }
-
     /// 获取 K8s 模式 agent 容器的访问地址(Service FQDN)。
     /// Docker 模式不经过此函数(走 docker_runtime,用容器 IP)。
     fn get_container_access_address(&self, identifier: &str) -> String {
@@ -529,8 +422,8 @@ impl KubernetesRuntime {
         project_id: &str,
         pod_info: &RuntimeContainerInfo,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
-        // service_url = {container_name}-svc:container_name 是 Pod 实际名(已含类型前缀),
-        // 不需要 service_type(容器信息本就不含此字段)。
+        // service_url = {sts_name}-svc：container_name 已在 get_container_info 源头剥成 sts_name
+        // （agent-runner STS pod 名 {sts_name}-0 的寻址基名），直接拼 Service FQDN。
         let access_address = self.get_container_access_address(&pod_info.container_name);
 
         Ok(ContainerBasicInfo {
@@ -978,64 +871,16 @@ impl ContainerRuntime for KubernetesRuntime {
             status: None,
         };
 
-        let pp = PostParams::default();
-        match self.pods().create(&pp, &pod).await {
-            Ok(_) => {
-                info!("[K8S] Pod {} created successfully", pod_name);
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 409 => {
-                // 同名 Pod 已存在。校验其 service_type：历史 identifier bug 可能造出
-                // 错类型 pod 撞了本请求的 identifier（如旧 chat 用 user_id 命名的 web pod
-                // 撞了 computer 的 user_id identifier，pod 名都是 rcoder-k8s-{user_id}）。
-                // 不匹配则删旧重建，避免 computer 请求复用到无 VNC 的 web pod。
-                let existing_st: Option<ServiceType> = match self.pods().get(&pod_name).await {
-                    Ok(p) => p
-                        .metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|l| l.get("rcoder.io/service-type"))
-                        .and_then(|v| v.parse::<ServiceType>().ok()),
-                    Err(_) => None,
-                };
-                if existing_st.as_ref() == Some(&service_type) {
-                    warn!(
-                        "[K8S] Pod {} already exists (409), service_type={:?} matches, reusing",
-                        pod_name, service_type
-                    );
-                } else {
-                    warn!(
-                        "[K8S] Pod {} exists (409) but service_type mismatch (existing={:?}, requested={:?}); deleting stale pod and recreating",
-                        pod_name, existing_st, service_type
-                    );
-                    // stop_container_by_identifier 删 pod+svc+backend（PVC 保留，新 pod 复用数据）
-                    if let Err(e) = self
-                        .stop_container_by_identifier(identifier, &service_type)
-                        .await
-                    {
-                        warn!(
-                            "[K8S] Failed to stop mismatched pod {}: {} (will retry create anyway)",
-                            pod_name, e
-                        );
-                    }
-                    self.pods().create(&pp, &pod).await.map_err(|e| {
-                        ContainerRuntimeError::ContainerCreationError(format!(
-                            "Failed to recreate pod after service_type mismatch: {}",
-                            e
-                        ))
-                    })?;
-                    info!(
-                        "[K8S] Pod {} recreated with correct service_type={:?}",
-                        pod_name, service_type
-                    );
-                }
-            }
-            Err(e) => {
-                return Err(ContainerRuntimeError::ContainerCreationError(format!(
-                    "Failed to create pod: {}",
-                    e
-                )));
-            }
-        }
+        // agent-runner 走 StatefulSet（K8s 原生 pod 级自愈）：把上面构造的 pod spec
+        // wrap 进 STS（而非裸 Pod）。STS replicas=1 时 pod 被 evict/删除 → 控制器自动重建
+        // 同名 pod（挂回同 PVC，数据不丢）；容器级 OOM 仍由 restartPolicy=Always 原地重启。
+        // service_type 重名/不匹配由 ensure_agent_statefulset 内部删旧重建处理。
+        // UserApp 不走此路径（用 create_deployment）。
+        let pod_spec = pod.spec.unwrap_or_default();
+        self.ensure_agent_headless_service(identifier, &service_type)
+            .await?;
+        self.ensure_agent_statefulset(identifier, &service_type, pod_spec, 1)
+            .await?;
 
         // Wait for pod to be ready
         self.wait_for_pod_ready(identifier, &service_type).await?;
@@ -1100,7 +945,11 @@ impl ContainerRuntime for KubernetesRuntime {
 
                 let pod_info = RuntimeContainerInfo {
                     container_id: uid,
-                    container_name: name,
+                    // agent-runner 走 STS：pod 名 = {sts_name}-0，但 container_name 用作寻址基名
+                    // （Service FQDN/grpc_addr/backend_addr 都从它派生 `{name}-svc`），故剥 -0 还原
+                    // sts_name，否则所有 gRPC/VNC 地址会指向不存在的 {...}-0-svc。bare-pod 残留无
+                    // -0 后缀，strip 安全（identity）。实际 pod 名由 agent_pod_name() 按需取。
+                    container_name: Self::sts_name_from_pod_name(&name).to_string(),
                     container_ip: pod_ip,
                     status,
                     created_at,
@@ -1256,72 +1105,40 @@ impl ContainerRuntime for KubernetesRuntime {
         let total_start = std::time::Instant::now();
         let pod_name = self.pod_name(identifier, service_type)?;
 
+        // STS 实际 pod 名（等待终止用）；pod_name 即 sts_name。
+        let agent_pod = self.agent_pod_name(identifier, service_type)?;
+
         info!(
-            "[K8S] Stopping pod {} (identifier={}, service_type={})",
+            "[K8S] Destroying agent StatefulSet {} (identifier={}, service_type={})",
             pod_name, identifier, service_type
         );
 
-        // ── Step 0: 删除 K8s Service（移除 DNS 条目，在 Pod 终止前完成，确保流量不再进入即将销毁的 Pod）──
+        // Step 0: 删除 ClusterIP Service（先摘流量 / 移除 DNS，再销毁 pod）
         if let Err(e) = self.delete_agent_service(identifier, service_type).await {
-            warn!(
-                "[K8S] Failed to delete Service for {}: {} (continuing)",
-                identifier, e
-            );
+            warn!("[K8S] Failed to delete ClusterIP Service for {}: {} (continuing)", identifier, e);
         }
 
-        // ── Step 1: 发送 Pod 删除请求（graceful，grace period = 15s）──
-        //
-        // 使用 Foreground propagation 确保 Pod 的子资源先于 Pod 被删除。
-        // 注意：pods().delete() 是立即返回的异步 API 调用，
-        // Pod 在此时仅被标记为 Terminating，尚未真正终止。
-        let step_start = std::time::Instant::now();
-        let dp = DeleteParams {
-            propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
-            grace_period_seconds: Some(15),
-            ..Default::default()
-        };
-
-        match self.pods().delete(&pod_name, &dp).await {
-            Ok(_either) => {
-                // _either: Left(Pod) = 立即删除 / Right(name) = 等待终止
-                info!(
-                    "[K8S] Pod {} delete requested (graceful, 15s), took {:.1}s",
-                    pod_name,
-                    step_start.elapsed().as_secs_f64()
-                );
-                self.pod_cache.write().await.remove(identifier);
-
-                // ── Step 2: 等待 Pod 完全终止（404）或超时后 force-delete ──
-                let step_start = std::time::Instant::now();
-                if let Err(e) = self.wait_for_pod_terminated(&pod_name).await {
-                    // Pod 终止失败不阻止 PVC 清理：即使 Pod 仍在运行，
-                    // PVC 清理有自己的超时和容错机制
-                    warn!(
-                        "[K8S] wait_for_pod_terminated failed for {}: {} (continuing to PVC cleanup)",
-                        pod_name, e
-                    );
-                }
-                info!(
-                    "[K8S] Step 2 (wait pod terminated) took {:.1}s",
-                    step_start.elapsed().as_secs_f64()
-                );
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                info!("[K8S] Pod {} not found, skip delete", pod_name);
-            }
-            Err(e) => {
-                warn!("[K8S] Failed to request delete pod {}: {}", pod_name, e);
-            }
+        // Step 1: 删除 StatefulSet（Foreground cascade → pod 随之终止）。回收 = 彻底销毁 STS
+        // （非 scale 0；scale 0 会留 STS 永不清理）。PVC 保留（数据复用，下次 ensure 重建挂回）。
+        if let Err(e) = self.delete_agent_statefulset(identifier, service_type).await {
+            warn!("[K8S] Failed to delete StatefulSet {}: {} (continuing)", pod_name, e);
         }
 
-        // ── Step 3: PVC 保留策略 ──
-        //
-        // 不在 stop_container 时删除 PVC，原因：
-        // 1. pod_handler 检测到 Pending pod 会调用 stop + recreate，PVC 需要保留给新 pod 复用
-        // 2. 用户显式停止 workspace 时，PVC 应保留以便下次启动时数据不丢失
-        // 3. 孤立 PVC 的清理由启动时的 cleanup_all 负责（通过 label selector delete_collection）
+        // Step 2: 等 pod {sts}-0 完全终止（Foreground cascade 异步；等其 404 再继续，
+        // 避免与立即重建的新 pod 抢 RWO PVC）。
+        if let Err(e) = self.wait_for_pod_terminated(&agent_pod).await {
+            warn!("[K8S] wait_for_pod_terminated for {} failed: {} (continuing)", agent_pod, e);
+        }
+
+        // Step 3: 删除 headless Service（与 STS/ClusterIP 一并彻底回收）
+        if let Err(e) = self.delete_agent_headless_service(identifier, service_type).await {
+            warn!("[K8S] Failed to delete headless Service for {}: {} (continuing)", identifier, e);
+        }
+
+        self.pod_cache.write().await.remove(identifier);
+
         info!(
-            "[K8S] Pod {} stopped (PVC preserved for reuse), total time: {:.1}s",
+            "[K8S] agent {} destroyed (STS + ClusterIP/headless svc deleted; PVC preserved for reuse), total time: {:.1}s",
             pod_name,
             total_start.elapsed().as_secs_f64()
         );
@@ -1375,7 +1192,11 @@ impl ContainerRuntime for KubernetesRuntime {
 
             let pod_info = RuntimeContainerInfo {
                 container_id: metadata.uid.clone().unwrap_or_default(),
-                container_name: metadata.name.clone().unwrap_or_default(),
+                // 同 get 路径：剥 STS ordinal -0，container_name 作寻址基名（见上方注释）。
+                container_name: Self::sts_name_from_pod_name(
+                    &metadata.name.clone().unwrap_or_default(),
+                )
+                .to_string(),
                 container_ip: pod
                     .status
                     .as_ref()
@@ -1416,31 +1237,31 @@ impl ContainerRuntime for KubernetesRuntime {
         let checked_count = cache_snapshot.len() as u32;
 
         for (identifier, container_info) in cache_snapshot {
-            // 使用缓存中的 container_name (完整 pod name) 进行 API 查询
-            match self.pods().get(&container_info.container_name).await {
+            // container_name 已是 sts_name（get_container_info 源头剥过 -0）。判"真没了"看 STS
+            // 是否存在，不看 pod 404（STS replicas>0 时 pod 被 evict/重建会瞬时空缺，误判清缓存
+            // 会中断重建）。
+            let sts_name = &container_info.container_name;
+            match self.statefulsets().get(sts_name).await {
                 Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                    // Pod 不存在，从缓存中移除，并收集信息用于清理关联资源
+                    // STS 已删 → 真没了；从缓存移除 + 收集（消费方 container_sync 只用 container_ip 清 gRPC 池）
                     self.pod_cache.write().await.remove(&identifier);
                     removed.push(RemovedContainerInfo {
                         container_name: container_info.container_name.clone(),
                         container_ip: container_info.container_ip.clone(),
                         identifier: identifier.clone(),
-                        service_type: ServiceType::WebAgentRunner, // K8s 模式目前只有 RCoder
+                        // FIXME: RuntimeContainerInfo 不带 service_type；消费方未用，暂占位。
+                        service_type: ServiceType::WebAgentRunner,
                     });
                     info!(
-                        "[K8S_SYNC] Removed stale pod from cache: {} (identifier={})",
-                        container_info.container_name, identifier
+                        "[K8S_SYNC] StatefulSet gone, removed from cache: {} (identifier={})",
+                        sts_name, identifier
                     );
                 }
                 Ok(_) => {
-                    // Pod 存在，无需处理
+                    // STS 存在（replicas>0 pod 运行/重建中；replicas=0 已停）→ 不动缓存
                 }
                 Err(e) => {
-                    // 其他错误，只记录日志
-                    warn!(
-                        "[K8S_SYNC] Failed to check pod {}: {}",
-                        container_info.container_name, e
-                    );
+                    warn!("[K8S_SYNC] Failed to check StatefulSet {}: {}", sts_name, e);
                 }
             }
         }
@@ -1497,6 +1318,19 @@ impl ContainerRuntime for KubernetesRuntime {
             ..Default::default()
         };
 
+        // 先删 StatefulSet（cascade 删其 pod，且阻止 STS 控制器重建 pod）。
+        // agent-runner 现走 STS，若直接删 pod 而 STS 仍在，控制器会立即重建 pod → 永远删不掉。
+        match self.statefulsets().delete_collection(&dp, &lp).await {
+            Ok(_) => info!("[K8S CLEANUP] StatefulSet delete_collection requested"),
+            Err(e) => {
+                tracing::warn!(
+                    "[K8S CLEANUP] StatefulSet delete_collection failed: {} (continuing)",
+                    e
+                );
+            }
+        }
+
+        // 再删 Pod（兜底：清理历史遗留的游离裸 pod，或 STS cascade 未覆盖的残留）
         match self.pods().delete_collection(&dp, &lp).await {
             Ok(_) => info!("[K8S CLEANUP] Pod delete_collection requested"),
             Err(e) => {
@@ -1771,6 +1605,13 @@ impl ContainerRuntime for KubernetesRuntime {
         self.app_events(app_id).await
     }
 
+    async fn get_app_resource_usage(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<container_runtime_api::ResourceUsage> {
+        self.app_resource_usage(app_id).await
+    }
+
     async fn exec(
         &self,
         app_id: &str,
@@ -1800,246 +1641,5 @@ impl ContainerRuntime for KubernetesRuntime {
                 Ok(())
             }
         }
-    }
-}
-
-/// 纯函数单元测试:translate_k8s_volume / translate_k8s_volume_mount / translate_k8s_sidecar。
-///
-/// 这些函数编码了 K8s 动态 pod 的**安全策略**,必须测:
-/// - HostPath 禁用(返回 None 跳过)
-/// - 卷名 "workspace" 冲突拒绝(builder 硬编码占用)
-/// - Pvc/ConfigMap 缺必要字段跳过
-/// - sidecar image_pull_policy 默认 IfNotPresent(用户硬性要求)
-///
-/// 注:select_image / create_container 装配是 &self 方法,依赖 K8s client,此处不覆盖
-/// (整个 runtime/ 目录的集成测试是后续议题)。
-#[cfg(all(test, feature = "kubernetes"))]
-mod tests {
-    use super::*;
-
-    // ---- translate_k8s_volume ----
-
-    #[test]
-    fn test_translate_volume_emptydir_default() {
-        let spec = K8sVolumeSpec {
-            name: "container-logs".into(),
-            volume_type: K8sVolumeType::EmptyDir,
-            ..Default::default()
-        };
-        let v = KubernetesRuntime::translate_k8s_volume(&spec).expect("emptyDir should translate");
-        assert_eq!(v.name, "container-logs");
-        let ed = v.empty_dir.expect("empty_dir should be set");
-        assert!(ed.size_limit.is_none(), "no size_limit configured");
-        // 其它卷源都不该出现
-        assert!(v.persistent_volume_claim.is_none());
-        assert!(v.config_map.is_none());
-    }
-
-    #[test]
-    fn test_translate_volume_emptydir_with_size_limit() {
-        let spec = K8sVolumeSpec {
-            name: "scratch".into(),
-            volume_type: K8sVolumeType::EmptyDir,
-            size_limit: Some("1Gi".into()),
-            ..Default::default()
-        };
-        let v = KubernetesRuntime::translate_k8s_volume(&spec).expect("emptyDir should translate");
-        let ed = v.empty_dir.expect("empty_dir set");
-        assert_eq!(ed.size_limit.as_ref().expect("size_limit set").0, "1Gi");
-    }
-
-    #[test]
-    fn test_translate_volume_pvc_ok() {
-        let spec = K8sVolumeSpec {
-            name: "data".into(),
-            volume_type: K8sVolumeType::Pvc,
-            claim_name: Some("my-pvc".into()),
-            read_only: true,
-            ..Default::default()
-        };
-        let v = KubernetesRuntime::translate_k8s_volume(&spec).expect("pvc should translate");
-        let pvc = v
-            .persistent_volume_claim
-            .expect("persistent_volume_claim set");
-        assert_eq!(pvc.claim_name, "my-pvc");
-        assert_eq!(pvc.read_only, Some(true));
-        assert!(v.empty_dir.is_none());
-    }
-
-    #[test]
-    fn test_translate_volume_pvc_missing_claim_name_skipped() {
-        let spec = K8sVolumeSpec {
-            name: "data".into(),
-            volume_type: K8sVolumeType::Pvc,
-            // 无 claim_name
-            ..Default::default()
-        };
-        assert!(
-            KubernetesRuntime::translate_k8s_volume(&spec).is_none(),
-            "pvc without claim_name must be skipped"
-        );
-    }
-
-    #[test]
-    fn test_translate_volume_configmap_ok() {
-        let spec = K8sVolumeSpec {
-            name: "cfg".into(),
-            volume_type: K8sVolumeType::ConfigMap,
-            config_map_name: Some("my-cm".into()),
-            ..Default::default()
-        };
-        let v = KubernetesRuntime::translate_k8s_volume(&spec).expect("configMap should translate");
-        let cm = v.config_map.expect("config_map set");
-        assert_eq!(cm.name, "my-cm");
-    }
-
-    #[test]
-    fn test_translate_volume_configmap_missing_name_skipped() {
-        let spec = K8sVolumeSpec {
-            name: "cfg".into(),
-            volume_type: K8sVolumeType::ConfigMap,
-            ..Default::default()
-        };
-        assert!(
-            KubernetesRuntime::translate_k8s_volume(&spec).is_none(),
-            "configMap without config_map_name must be skipped"
-        );
-    }
-
-    #[test]
-    fn test_translate_volume_hostpath_forbidden() {
-        // HostPath 被策略禁用 → 必须跳过(None),即使配了也要被拒绝
-        let spec = K8sVolumeSpec {
-            name: "forbidden".into(),
-            volume_type: K8sVolumeType::HostPath,
-            ..Default::default()
-        };
-        assert!(
-            KubernetesRuntime::translate_k8s_volume(&spec).is_none(),
-            "hostPath must be forbidden (policy)"
-        );
-    }
-
-    #[test]
-    fn test_translate_volume_workspace_name_reserved() {
-        // "workspace" 卷名被 builder 硬编码占用 → 任何类型的同名卷都该被拒
-        for vt in [
-            K8sVolumeType::EmptyDir,
-            K8sVolumeType::Pvc,
-            K8sVolumeType::ConfigMap,
-        ] {
-            let spec = K8sVolumeSpec {
-                name: "workspace".into(),
-                volume_type: vt,
-                claim_name: Some("x".into()),
-                config_map_name: Some("y".into()),
-                ..Default::default()
-            };
-            assert!(
-                KubernetesRuntime::translate_k8s_volume(&spec).is_none(),
-                "volume name 'workspace' is reserved, must be rejected for {:?}",
-                vt
-            );
-        }
-    }
-
-    // ---- translate_k8s_volume_mount ----
-
-    #[test]
-    fn test_translate_volume_mount_basic() {
-        let spec = K8sVolumeMountSpec {
-            name: "container-logs".into(),
-            mount_path: "/app/container-logs".into(),
-            ..Default::default()
-        };
-        let m = KubernetesRuntime::translate_k8s_volume_mount(&spec);
-        assert_eq!(m.name, "container-logs");
-        assert_eq!(m.mount_path, "/app/container-logs");
-        assert_eq!(m.sub_path, None);
-        assert_eq!(m.read_only, Some(false), "default read_only=false");
-    }
-
-    #[test]
-    fn test_translate_volume_mount_with_subpath_readonly() {
-        let spec = K8sVolumeMountSpec {
-            name: "data".into(),
-            mount_path: "/data".into(),
-            sub_path: Some("user-123".into()),
-            read_only: true,
-        };
-        let m = KubernetesRuntime::translate_k8s_volume_mount(&spec);
-        assert_eq!(m.sub_path.as_deref(), Some("user-123"));
-        assert_eq!(m.read_only, Some(true));
-    }
-
-    // ---- translate_k8s_sidecar ----
-
-    #[test]
-    fn test_translate_sidecar_defaults_and_image_pull_policy() {
-        let spec = K8sSidecarSpec {
-            name: "log-collector".into(),
-            image: "registry/alpine:3.22.4".into(),
-            command: vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()],
-            volume_mounts: vec![K8sVolumeMountSpec {
-                name: "container-logs".into(),
-                mount_path: "/app/container-logs".into(),
-                read_only: true,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let c = KubernetesRuntime::translate_k8s_sidecar(&spec);
-        assert_eq!(c.name, "log-collector");
-        assert_eq!(c.image.as_deref(), Some("registry/alpine:3.22.4"));
-        // 用户硬性要求:image_pull_policy 缺省必须 IfNotPresent
-        assert_eq!(
-            c.image_pull_policy.as_deref(),
-            Some("IfNotPresent"),
-            "image_pull_policy must default to IfNotPresent"
-        );
-        // command 非空 → Some
-        assert_eq!(
-            c.command.as_deref(),
-            Some(
-                &[
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "sleep 1".to_string()
-                ][..]
-            )
-        );
-        // volume_mounts 翻译
-        let mounts = c.volume_mounts.expect("volume_mounts set");
-        assert_eq!(mounts.len(), 1);
-        assert_eq!(mounts[0].name, "container-logs");
-        assert_eq!(mounts[0].read_only, Some(true));
-        // resources 全 None → build_resource_requirements 返回 None
-        assert!(c.resources.is_none());
-    }
-
-    #[test]
-    fn test_translate_sidecar_empty_command_becomes_none() {
-        let spec = K8sSidecarSpec {
-            name: "s".into(),
-            image: "img".into(),
-            ..Default::default()
-        };
-        let c = KubernetesRuntime::translate_k8s_sidecar(&spec);
-        assert!(
-            c.command.is_none(),
-            "empty command should yield None (use image ENTRYPOINT/CMD)"
-        );
-    }
-
-    #[test]
-    fn test_translate_sidecar_explicit_image_pull_policy_honored() {
-        let spec = K8sSidecarSpec {
-            name: "s".into(),
-            image: "img".into(),
-            image_pull_policy: Some("Always".into()),
-            ..Default::default()
-        };
-        let c = KubernetesRuntime::translate_k8s_sidecar(&spec);
-        assert_eq!(c.image_pull_policy.as_deref(), Some("Always"));
     }
 }

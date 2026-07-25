@@ -652,14 +652,47 @@ impl AppService {
             })
     }
 
-    /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
+    /// 获取资源使用情况。
+    ///
+    /// CPU/内存用量 + 限额来自运行时（K8s = metrics.k8s.io PodMetrics + pod limits；Docker 默认 0），
+    /// 百分比 = usage/limit×100（limit=0 → 0）。restart_count 来自 Deployment 状态。
+    /// network（rx/tx）metrics.k8s.io 不提供，留 0。运行时用量查询失败降级为 0（不 500）。
     #[instrument(skip(self))]
     pub async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats> {
         validate_app_id(app_id)?;
         let status = self.fetch_runtime_status_or_err(app_id).await?;
+        let usage = match self.runtime.get_app_resource_usage(app_id).await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(
+                    "[APP] get_app_resource_usage failed app_id={app_id}: {e} (stats 降级 0)"
+                );
+                Default::default()
+            }
+        };
+        let cpu_percent = if usage.cpu_limit_cores > 0.0 {
+            (usage.cpu_usage_cores / usage.cpu_limit_cores * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let mem_percent = if usage.mem_limit_bytes > 0 {
+            usage.mem_usage_bytes as f64 / usage.mem_limit_bytes as f64 * 100.0
+        } else {
+            0.0
+        };
         Ok(ResourceStats {
             restart_count: status.restart_count,
-            ..Default::default()
+            cpu: CpuStats {
+                usage_cores: usage.cpu_usage_cores,
+                limit_cores: usage.cpu_limit_cores,
+                usage_percent: cpu_percent,
+            },
+            memory: MemoryStats {
+                usage_bytes: usage.mem_usage_bytes,
+                limit_bytes: usage.mem_limit_bytes,
+                usage_percent: mem_percent,
+            },
+            network: NetworkStats::default(),
         })
     }
 

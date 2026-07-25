@@ -162,7 +162,8 @@ impl K8sPodOps for KubernetesRuntime {
         // Pod wait timeout: configurable from config, default 120s
         let timeout = std::time::Duration::from_secs(self.config.pod_ttl_seconds.unwrap_or(120));
         let start = std::time::Instant::now();
-        let pod_name = self.pod_name(identifier, service_type)?;
+        // agent-runner 走 StatefulSet，pod 稳定名为 {sts_name}-0（非裸 pod 的 {sts_name}）。
+        let pod_name = self.agent_pod_name(identifier, service_type)?;
 
         while start.elapsed() < timeout {
             match self.pods().get(&pod_name).await {

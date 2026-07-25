@@ -34,6 +34,32 @@ pub fn parse_memory_quantity(quantity: &str) -> Option<u64> {
     Some(bytes.round() as u64)
 }
 
+/// 解析 K8s CPU Quantity（核数，f64）。
+///
+/// K8s CPU Quantity 仅用 DecimalSI 后缀（无 BinarySI）：
+/// - `n` 纳核(1e-9)、`u` 微核(1e-6)、`m` 毫核(1e-3) —— metrics-server 常返回 `123456n`，
+///   limits 常为 `500m`
+/// - `k`/`M`/`G`/`T`/`P`/`E`（1000 进制）
+/// - 无后缀 = 核（如 `"2"`、`"0.5"`）
+/// - 科学计数法（`1e3`）由 `float` 直接解析
+///
+/// 非法（BinarySI 后缀如 `Mi`、负数、未识别后缀、非有限）返回 `None`。
+pub fn parse_cpu_quantity(quantity: &str) -> Option<f64> {
+    let trimmed = quantity.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut input = trimmed;
+    let value: f64 = float::<_, f64, ()>.parse_next(&mut input).ok()?;
+    let suffix: &str = rest::<_, ()>.parse_next(&mut input).ok()?;
+    let multiplier = cpu_suffix_to_multiplier(suffix)?;
+    let cores = value * multiplier;
+    if !cores.is_finite() || cores < 0.0 {
+        return None;
+    }
+    Some(cores)
+}
+
 /// 校验 K8s 存储大小（Quantity 格式 + 范围限制）。
 ///
 /// 共享校验（app_manager service / rcoder pod_handler 都用），避免逻辑重复。
@@ -87,6 +113,24 @@ fn suffix_to_multiplier(suffix: &str) -> Option<f64> {
     })
 }
 
+/// K8s CPU Quantity 后缀 → 乘数（仅 DecimalSI；CPU 无 BinarySI）。
+/// metrics-server 用量常为 `n`(纳核),limits 常为 `m`(毫核)或无后缀(核)。
+fn cpu_suffix_to_multiplier(suffix: &str) -> Option<f64> {
+    Some(match suffix {
+        "" => 1.0,
+        "n" => 1e-9,
+        "u" => 1e-6,
+        "m" => 1e-3,
+        "k" => 1e3,
+        "M" => 1e6,
+        "G" => 1e9,
+        "T" => 1e12,
+        "P" => 1e15,
+        "E" => 1e18,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +166,31 @@ mod tests {
         assert_eq!(parse_memory_quantity(""), None);
         assert_eq!(parse_memory_quantity("   "), None);
         assert_eq!(parse_memory_quantity("abc"), None);
+    }
+
+    #[test]
+    fn parses_cpu_quantity() {
+        // 毫核（limits 常见）
+        assert_eq!(parse_cpu_quantity("500m"), Some(0.5));
+        assert_eq!(parse_cpu_quantity("1000m"), Some(1.0));
+        // 纳核（metrics-server 用量常见）
+        assert!((parse_cpu_quantity("500000000n").unwrap() - 0.5).abs() < 1e-9);
+        // 微核
+        assert!((parse_cpu_quantity("500000u").unwrap() - 0.5).abs() < 1e-6);
+        // 无后缀 = 核
+        assert_eq!(parse_cpu_quantity("2"), Some(2.0));
+        assert_eq!(parse_cpu_quantity("0.5"), Some(0.5));
+        // 科学计数法
+        assert_eq!(parse_cpu_quantity("1e3"), Some(1000.0));
+    }
+
+    #[test]
+    fn rejects_invalid_cpu_quantity() {
+        assert_eq!(parse_cpu_quantity("500Mi"), None); // CPU 无 BinarySI
+        assert_eq!(parse_cpu_quantity("-1"), None); // 负数
+        assert_eq!(parse_cpu_quantity("1Xi"), None); // 未识别后缀
+        assert_eq!(parse_cpu_quantity(""), None);
+        assert_eq!(parse_cpu_quantity("abc"), None);
     }
 
     #[test]

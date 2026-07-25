@@ -214,6 +214,21 @@ pub struct DeploymentStatus {
     pub resource_version: Option<String>,
 }
 
+/// 应用资源用量（运行时层；K8s 来自 metrics.k8s.io PodMetrics，Docker 可来自 bollard stats）。
+/// 仅含运行时可观测的用量 + 限额；百分比由 app_manager 层算（usage/limit）。
+/// network（rx/tx）metrics.k8s.io 不提供，故不在此（app_manager 层留 0）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceUsage {
+    /// CPU 已用核数（各容器求和）
+    pub cpu_usage_cores: f64,
+    /// 内存已用字节（各容器求和）
+    pub mem_usage_bytes: u64,
+    /// CPU 限额核数（pod resources.limits.cpu 求和；无 limit 则 0 → 百分比为 0）
+    pub cpu_limit_cores: f64,
+    /// 内存限额字节（pod resources.limits.memory 求和；无 limit 则 0）
+    pub mem_limit_bytes: u64,
+}
+
 /// 容器日志条目（运行时层；app_manager 层另映射为带 ToSchema 的 LogEntry 暴露给 API）
 #[derive(Debug, Clone)]
 pub struct ContainerLogEntry {
