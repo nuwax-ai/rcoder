@@ -14,6 +14,22 @@ use super::models::*;
 use super::utils::*;
 use super::service::AppService;
 
+/// build_params_inner 的入参聚合（消除 too_many_arguments，create/update 两路统一填充）。
+///
+/// 各字段语义对齐 `CreateAppRequest` / `UpdateAppRequest` 的可选字段；owned（调用方填充，
+/// inner 内部按需 move 进 ContainerCreateParams builder，无需重复 clone）。
+struct AppParamsInput {
+    image: String,
+    command: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    secrets: Option<HashMap<String, String>>,
+    ports: Option<Vec<PortConfig>>,
+    health_check: Option<HealthCheckConfig>,
+    resources: Option<ResourceLimits>,
+    tenant_id: Option<String>,
+    space_id: Option<String>,
+}
+
 impl AppService {
 
 
@@ -25,15 +41,17 @@ impl AppService {
     ) -> AppResult<ContainerCreateParams> {
         self.build_params_inner(
             app_id,
-            request.image.clone(),
-            &request.command,
-            &request.env,
-            &request.secrets,
-            &request.ports,
-            &request.health_check,
-            &request.resources,
-            &request.tenant_id,
-            &request.space_id,
+            AppParamsInput {
+                image: request.image.clone(),
+                command: request.command.clone(),
+                env: request.env.clone(),
+                secrets: request.secrets.clone(),
+                ports: request.ports.clone(),
+                health_check: request.health_check.clone(),
+                resources: request.resources.clone(),
+                tenant_id: request.tenant_id.clone(),
+                space_id: request.space_id.clone(),
+            },
         )
         .await
     }
@@ -77,15 +95,17 @@ impl AppService {
         };
         self.build_params_inner(
             app_id,
-            image,
-            &command,
-            &env,
-            &request.secrets,
-            &request.ports,
-            &request.health_check,
-            &request.resources,
-            &request.tenant_id,
-            &request.space_id,
+            AppParamsInput {
+                image,
+                command,
+                env,
+                secrets: request.secrets.clone(),
+                ports: request.ports.clone(),
+                health_check: request.health_check.clone(),
+                resources: request.resources.clone(),
+                tenant_id: request.tenant_id.clone(),
+                space_id: request.space_id.clone(),
+            },
         )
         .await
     }
@@ -93,26 +113,28 @@ impl AppService {
 
     /// build_container_params / build_container_params_from_update 的公共逻辑。
     ///
-    /// 参数全用引用（`&Option<...>`），内部按需 `.clone()` 取值；`image` 为 owned `String`
-    /// （create 直接传 `request.image.clone()`；update 先 ok_or 校验再传入）。
-    /// 统一 create/update 两路逻辑：此前重复 ~180 行（90% 相同），分歧仅在 image 校验。
-    #[allow(clippy::too_many_arguments)]
+    /// 入参聚合为 `AppParamsInput`（owned），内部按需 move 进 ContainerCreateParams builder；
+    /// 统一 create/update 两路逻辑：此前重复 ~180 行（90% 相同），分歧仅在 image 校验 +
+    /// 问题④的 command/env 回退（均已在各自入口处理完毕，此处纯装配）。
     async fn build_params_inner(
         &self,
         app_id: &str,
-        image: String,
-        command: &Option<Vec<String>>,
-        env: &Option<HashMap<String, String>>,
-        secrets: &Option<HashMap<String, String>>,
-        ports: &Option<Vec<PortConfig>>,
-        health_check: &Option<HealthCheckConfig>,
-        resources: &Option<ResourceLimits>,
-        tenant_id: &Option<String>,
-        space_id: &Option<String>,
+        input: AppParamsInput,
     ) -> AppResult<ContainerCreateParams> {
+        let AppParamsInput {
+            image,
+            command,
+            env,
+            secrets,
+            ports,
+            health_check,
+            resources,
+            tenant_id,
+            space_id,
+        } = input;
+
         // 端口：models::PortConfig → container_runtime_api::AppPortSpec
         let app_ports: Vec<AppPortSpec> = ports
-            .as_ref()
             .map(|ps| {
                 ps.iter()
                     .map(|p| AppPortSpec {
@@ -127,7 +149,7 @@ impl AppService {
 
         // Exec 健康检查当前未支持（AppHealthCheck 无 command 字段），Fail Fast 拒绝，
         // 避免静默丢弃用户配置（K8s build_probe 对 Exec 返回 None → 容器被视为永远健康）
-        if let Some(hc) = health_check
+        if let Some(hc) = &health_check
             && matches!(hc.check_type, HealthCheckType::Exec)
         {
             return Err(AppOperationError::Validation(
@@ -165,12 +187,12 @@ impl AppService {
             .service_type(ServiceType::UserApp)
             .host_workspace_path(host_workspace_path)
             .image_override(image)
-            .env(env.clone().unwrap_or_default())
-            .secrets(secrets.clone().unwrap_or_default())
+            .env(env.unwrap_or_default())
+            .secrets(secrets.unwrap_or_default())
             .ports(app_ports);
 
         // command 仅在非空时设置（空 vec 会覆盖镜像 CMD）
-        if let Some(cmd) = command.clone()
+        if let Some(cmd) = command
             && !cmd.is_empty()
         {
             builder = builder.command(cmd);
@@ -188,10 +210,10 @@ impl AppService {
         }
         // tenant/space：进 ContainerCreateParams → build_app_labels 打 rcoder.io/tenant、
         // rcoder.io/space label（供对账/过滤）。
-        if let Some(t) = tenant_id.clone() {
+        if let Some(t) = tenant_id {
             builder = builder.tenant_id(t);
         }
-        if let Some(s) = space_id.clone() {
+        if let Some(s) = space_id {
             builder = builder.space_id(s);
         }
 
