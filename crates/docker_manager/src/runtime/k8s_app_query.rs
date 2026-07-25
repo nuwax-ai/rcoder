@@ -356,3 +356,197 @@ fn container_error_message(cs: &k8s_openapi::api::core::v1::ContainerStatus) -> 
     }
     None
 }
+
+#[cfg(all(test, feature = "kubernetes"))]
+mod tests {
+    use super::*;
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
+    };
+
+    // ---- derive_phase：四态 + 边界优先级 ----
+
+    #[test]
+    fn phase_zero_replicas_is_stopped_regardless_of_error() {
+        // replicas=0 最先判断：已缩容，即便容器报 error 也归 Stopped
+        assert_eq!(derive_phase(0, 0, &None), "Stopped");
+        assert_eq!(derive_phase(0, 0, &Some("CrashLoop".into())), "Stopped");
+    }
+
+    #[test]
+    fn phase_error_preferred_over_ready() {
+        // CrashLoop 期间偶发 ready_replicas>0，error 必须优先 → Error（防误报 Running）
+        assert_eq!(derive_phase(1, 1, &Some("err".into())), "Error");
+        assert_eq!(derive_phase(2, 2, &Some("err".into())), "Error");
+    }
+
+    #[test]
+    fn phase_running_when_ready_meets_replicas() {
+        assert_eq!(derive_phase(1, 1, &None), "Running");
+        assert_eq!(derive_phase(3, 3, &None), "Running");
+    }
+
+    #[test]
+    fn phase_starting_when_ready_below_replicas() {
+        assert_eq!(derive_phase(1, 0, &None), "Starting");
+        assert_eq!(derive_phase(3, 1, &None), "Starting");
+    }
+
+    #[test]
+    fn phase_running_requires_ready_positive() {
+        // ready_replicas > 0 是 Running 硬条件：replicas>0 但 ready=0 → Starting
+        assert_eq!(derive_phase(2, 0, &None), "Starting");
+    }
+
+    // ---- container_error_message：启动失败原因提取 ----
+
+    fn cs_waiting(reason: &str, message: Option<&str>) -> ContainerStatus {
+        ContainerStatus {
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some(reason.to_string()),
+                    message: message.map(|m| m.to_string()),
+                }),
+                ..Default::default()
+            }),
+            last_state: None,
+            ..Default::default()
+        }
+    }
+
+    fn cs_terminated(exit: i32, reason: Option<&str>) -> ContainerStatus {
+        ContainerStatus {
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: exit,
+                    reason: reason.map(|r| r.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            last_state: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn error_message_crashloop_with_detail() {
+        let cs = cs_waiting("CrashLoopBackOff", Some("back-off 5s"));
+        assert_eq!(
+            container_error_message(&cs).as_deref(),
+            Some("CrashLoopBackOff: back-off 5s")
+        );
+    }
+
+    #[test]
+    fn error_message_image_pull_no_detail() {
+        let cs = cs_waiting("ImagePullBackOff", None);
+        assert_eq!(container_error_message(&cs).as_deref(), Some("ImagePullBackOff"));
+    }
+
+    #[test]
+    fn error_message_includes_last_terminated_exit_code() {
+        // CrashLoop 时当前 state=waiting，真实退出码在 last_state.terminated，应附带
+        let mut cs = cs_waiting("CrashLoopBackOff", None);
+        cs.last_state = Some(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: 137,
+                reason: Some("OOMKilled".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            container_error_message(&cs).as_deref(),
+            Some("CrashLoopBackOff (last exit=137, reason=OOMKilled)")
+        );
+    }
+
+    #[test]
+    fn error_message_container_creating_is_none() {
+        // ContainerCreating 是正常拉起中间态，不在 BAD_WAITING → None（不误判 Error）
+        let cs = cs_waiting("ContainerCreating", None);
+        assert!(container_error_message(&cs).is_none());
+    }
+
+    #[test]
+    fn error_message_nonzero_exit() {
+        let cs = cs_terminated(137, Some("OOMKilled"));
+        assert_eq!(
+            container_error_message(&cs).as_deref(),
+            Some("terminated: exit code=137, reason=OOMKilled")
+        );
+    }
+
+    #[test]
+    fn error_message_zero_exit_is_none() {
+        let cs = cs_terminated(0, None);
+        assert!(container_error_message(&cs).is_none());
+    }
+
+    #[test]
+    fn error_message_empty_state_is_none() {
+        let cs = ContainerStatus {
+            state: None,
+            ..Default::default()
+        };
+        assert!(container_error_message(&cs).is_none());
+    }
+
+    // ---- derive_port_statuses：annotation 优先 + NodePort 回退 ----
+
+    fn deploy_from_json(json: &str) -> Deployment {
+        serde_json::from_str(json).expect("解析测试 Deployment 失败")
+    }
+
+    #[test]
+    fn port_status_annotation_tcp_with_nodeport() {
+        // annotation 标 5432=tcp + NodePort 有该 name → Tcp + external_port
+        let deploy = deploy_from_json(
+            r#"{"metadata":{"annotations":{"rcoder.io/port-expose":"80:http,5432:tcp"}},
+               "spec":{"template":{"spec":{"containers":[{"name":"app","ports":[
+                   {"name":"http","containerPort":80},
+                   {"name":"pg","containerPort":5432}
+               ]}]}}}}"#,
+        );
+        let mut nodeports = std::collections::HashMap::new();
+        nodeports.insert("pg".to_string(), 30001u16);
+        let ports = derive_port_statuses(&deploy, &nodeports);
+        assert_eq!(ports.len(), 2);
+        let pg = ports.iter().find(|p| p.port == 5432).unwrap();
+        assert_eq!(pg.expose_type, ExposeType::Tcp);
+        assert_eq!(pg.external_port, Some(30001));
+        let http = ports.iter().find(|p| p.port == 80).unwrap();
+        assert_eq!(http.expose_type, ExposeType::Http);
+        assert_eq!(http.external_port, None);
+    }
+
+    #[test]
+    fn port_status_no_annotation_falls_back_to_nodeport() {
+        // 旧 app 无 annotation：端口在 NodePort Service 里 = Tcp，否则 Http
+        let deploy = deploy_from_json(
+            r#"{"metadata":{},"spec":{"template":{"spec":{"containers":[{"name":"app","ports":[
+                {"name":"http","containerPort":80},
+                {"name":"pg","containerPort":5432}
+            ]}]}}}}"#,
+        );
+        let mut nodeports = std::collections::HashMap::new();
+        nodeports.insert("pg".to_string(), 30002u16);
+        let ports = derive_port_statuses(&deploy, &nodeports);
+        let pg = ports.iter().find(|p| p.port == 5432).unwrap();
+        assert_eq!(pg.expose_type, ExposeType::Tcp); // nodeport 里有 → Tcp
+        assert_eq!(pg.external_port, Some(30002));
+        let http = ports.iter().find(|p| p.port == 80).unwrap();
+        assert_eq!(http.expose_type, ExposeType::Http); // nodeport 里无 → Http
+    }
+
+    #[test]
+    fn port_status_no_container_ports_empty() {
+        let deploy = deploy_from_json(
+            r#"{"metadata":{"annotations":{"rcoder.io/port-expose":"80:http"}},
+               "spec":{"template":{"spec":{"containers":[{"name":"app"}]}}}}"#,
+        );
+        let ports = derive_port_statuses(&deploy, &std::collections::HashMap::new());
+        assert!(ports.is_empty());
+    }
+}
