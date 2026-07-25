@@ -116,125 +116,27 @@ impl KubernetesRuntime {
     }
 
 
-    /// Deployment 对象 → DeploymentStatus（含关联 Pod 的实时信息）
+    /// Deployment 对象 → DeploymentStatus（含关联 Pod 的实时信息）。
+    ///
+    /// 编排 4 个单一职责子步骤：
+    /// - `fetch_app_pod_info`：拉关联 Pod（pod_ip/node/restart/started_at/error）—— IO
+    /// - `derive_phase`：replicas+ready+error → phase —— 纯函数
+    /// - `collect_tcp_nodeports`：查 NodePort Service 的 TCP node_port —— IO
+    /// - `derive_port_statuses`：container ports + annotation + nodeports → 端口状态 —— 纯函数
     async fn deployment_to_status(&self, app_id: &str, deploy: &Deployment) -> DeploymentStatus {
-        let spec = deploy.spec.as_ref();
-        let status = deploy.status.as_ref();
-        let replicas = spec.and_then(|s| s.replicas).unwrap_or(0);
-        let ready_replicas = status.and_then(|s| s.ready_replicas).unwrap_or(0);
-
-        // 关联 Pod 信息（取一个；app 当前为单副本）。先于 phase 计算：需要用容器状态
-        // （CrashLoopBackOff / ImagePullBackOff / 非 0 退出）判定启动失败 → phase=Error。
-        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
-        let (pod_ip, node, restart_count, started_at, error_message) =
-            match self.pods_api().list(&lp).await {
-                Ok(pods) => pods
-                    .items
-                    .into_iter()
-                    .next()
-                    .and_then(|p| {
-                        let st = p.status?;
-                        // 按容器名取 "app" 容器状态（防御 sidecar 注入后 pop() 取错容器）
-                        let cs = st
-                            .container_statuses
-                            .and_then(|v| v.into_iter().find(|c| c.name == APP_CONTAINER_NAME))?;
-                        // started_at：从 container state.running 提取实际启动时间
-                        let started_at = cs
-                            .state
-                            .as_ref()
-                            .and_then(|s| s.running.as_ref())
-                            .and_then(|r| r.started_at.as_ref())
-                            .map(|t| t.0.to_string());
-                        // 启动失败原因（CrashLoop / 镜像拉取失败 / 异常退出）；正常拉起的中间态
-                        // （ContainerCreating）不在此列，不会被误判为 Error。
-                        let error_message = container_error_message(&cs);
-                        Some((
-                            st.pod_ip.unwrap_or_default(),
-                            p.spec.and_then(|s| s.node_name).unwrap_or_default(),
-                            cs.restart_count as u32,
-                            started_at,
-                            error_message,
-                        ))
-                    })
-                    .unwrap_or_default(),
-                Err(_) => (String::new(), String::new(), 0, None, None),
-            };
-
-        // phase：replicas=0 → Stopped；容器启动失败 → Error（优先于 ready 判定，避免
-        // CrashLoop 期间偶发 ready_replicas>0 被误报 Running）；就绪副本达标 → Running；否则 Starting。
-        let phase = if replicas == 0 {
-            "Stopped".to_string()
-        } else if error_message.is_some() {
-            "Error".to_string()
-        } else if ready_replicas >= replicas && ready_replicas > 0 {
-            "Running".to_string()
-        } else {
-            "Starting".to_string()
-        };
-
-        // TCP 端口的 node_port：查 NodePort Service，按 port name 关联（TCP 对外时用）
-        let tcp_nodeports: std::collections::HashMap<String, u16> = self
-            .services_api()
-            .get(&self.app_nodeport_name(app_id))
-            .await
-            .ok()
-            .and_then(|svc| svc.spec)
-            .and_then(|s| s.ports)
-            .map(|ports| {
-                ports
-                    .into_iter()
-                    .filter_map(|p| {
-                        let name = p.name.unwrap_or_default();
-                        let np = p.node_port.map(|n| n as u16)?;
-                        Some((name, np))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // port → expose_type：优先从 Deployment annotation rcoder.io/port-expose 还原
-        // （create 时写入，TCP 不对外也能准确区分）；缺失（旧 app）回退 NodePort 推导。
-        let port_expose: std::collections::HashMap<u16, ExposeType> = deploy
-            .metadata
-            .annotations
+        let replicas = deploy.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
+        let ready_replicas = deploy
+            .status
             .as_ref()
-            .and_then(|a| a.get(PORT_EXPOSE_ANNOTATION))
-            .map(|s| parse_port_expose(s))
-            .unwrap_or_default();
+            .and_then(|s| s.ready_replicas)
+            .unwrap_or(0);
 
-        // 端口状态：从 Deployment spec 的 container ports 推导；
-        // expose_type 优先用 annotation（准确），回退 NodePort 推导（旧 app 兼容）。
-        let ports = spec
-            .and_then(|s| s.template.spec.as_ref())
-            .and_then(|s| s.containers.first())
-            .and_then(|c| c.ports.as_ref())
-            .map(|ps| {
-                ps.iter()
-                    .map(|p| {
-                        let name = p.name.clone().unwrap_or_default();
-                        let port = p.container_port as u16;
-                        let (expose_type, external_port) = match port_expose.get(&port) {
-                            Some(ExposeType::Tcp) => {
-                                (ExposeType::Tcp, tcp_nodeports.get(&name).copied())
-                            }
-                            Some(ExposeType::Http) => (ExposeType::Http, None),
-                            // 回退：无 annotation（旧 app）—— 在 NodePort Service 里 = Tcp，否则 Http
-                            None => tcp_nodeports
-                                .get(&name)
-                                .map_or((ExposeType::Http, None), |np| {
-                                    (ExposeType::Tcp, Some(*np))
-                                }),
-                        };
-                        AppPortStatus {
-                            name,
-                            port,
-                            expose_type,
-                            external_port,
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // 关联 Pod 信息先取：phase 判定需要容器状态（CrashLoop/ImagePull/异常退出 → Error）。
+        let (pod_ip, node, restart_count, started_at, error_message) =
+            self.fetch_app_pod_info(app_id).await;
+        let phase = derive_phase(replicas, ready_replicas, &error_message);
+        let tcp_nodeports = self.collect_tcp_nodeports(app_id).await;
+        let ports = derive_port_statuses(deploy, &tcp_nodeports);
 
         DeploymentStatus {
             app_id: app_id.to_string(),
@@ -254,6 +156,140 @@ impl KubernetesRuntime {
             resource_version: deploy.metadata.resource_version.clone(),
         }
     }
+
+    /// 拉取 app 关联 Pod 的实时信息（取一个；app 当前为单副本）。
+    /// 返回 (pod_ip, node, restart_count, started_at, error_message)；无 Pod 或 list 失败返默认空值。
+    async fn fetch_app_pod_info(
+        &self,
+        app_id: &str,
+    ) -> (String, String, u32, Option<String>, Option<String>) {
+        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
+        match self.pods_api().list(&lp).await {
+            Ok(pods) => pods
+                .items
+                .into_iter()
+                .next()
+                .and_then(|p| {
+                    let st = p.status?;
+                    // 按容器名取 "app" 容器状态（防御 sidecar 注入后 pop() 取错容器）
+                    let cs = st
+                        .container_statuses
+                        .and_then(|v| v.into_iter().find(|c| c.name == APP_CONTAINER_NAME))?;
+                    // started_at：从 container state.running 提取实际启动时间
+                    let started_at = cs
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.running.as_ref())
+                        .and_then(|r| r.started_at.as_ref())
+                        .map(|t| t.0.to_string());
+                    // 启动失败原因（CrashLoop / 镜像拉取失败 / 异常退出）；正常拉起的中间态
+                    // （ContainerCreating）不在此列，不会被误判为 Error。
+                    let error_message = container_error_message(&cs);
+                    Some((
+                        st.pod_ip.unwrap_or_default(),
+                        p.spec.and_then(|s| s.node_name).unwrap_or_default(),
+                        cs.restart_count as u32,
+                        started_at,
+                        error_message,
+                    ))
+                })
+                .unwrap_or_default(),
+            Err(_) => (String::new(), String::new(), 0, None, None),
+        }
+    }
+
+    /// TCP 端口的 node_port：查 NodePort Service，按 port name 关联（TCP 对外时用）。
+    /// Service 不存在（无 TCP 端口）返空 map。
+    async fn collect_tcp_nodeports(
+        &self,
+        app_id: &str,
+    ) -> std::collections::HashMap<String, u16> {
+        self.services_api()
+            .get(&self.app_nodeport_name(app_id))
+            .await
+            .ok()
+            .and_then(|svc| svc.spec)
+            .and_then(|s| s.ports)
+            .map(|ports| {
+                ports
+                    .into_iter()
+                    .filter_map(|p| {
+                        let name = p.name.unwrap_or_default();
+                        let np = p.node_port.map(|n| n as u16)?;
+                        Some((name, np))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+
+/// phase 推导（纯函数）。
+///
+/// replicas=0 → Stopped；容器启动失败 → Error（优先于 ready 判定，避免 CrashLoop 期间
+/// 偶发 ready_replicas>0 被误报 Running）；就绪副本达标 → Running；否则 Starting。
+fn derive_phase(replicas: i32, ready_replicas: i32, error_message: &Option<String>) -> String {
+    if replicas == 0 {
+        "Stopped".to_string()
+    } else if error_message.is_some() {
+        "Error".to_string()
+    } else if ready_replicas >= replicas && ready_replicas > 0 {
+        "Running".to_string()
+    } else {
+        "Starting".to_string()
+    }
+}
+
+/// 端口状态推导（纯函数）：从 Deployment spec container ports + annotation port-expose +
+/// TCP nodeports 推导每端口 expose_type/external_port。
+///
+/// expose_type 优先用 annotation（create 时写入，TCP 不对外也能准确区分）；
+/// 缺失（旧 app）回退 NodePort 推导：在 NodePort Service 里 = Tcp，否则 Http。
+fn derive_port_statuses(
+    deploy: &Deployment,
+    tcp_nodeports: &std::collections::HashMap<String, u16>,
+) -> Vec<AppPortStatus> {
+    let port_expose: std::collections::HashMap<u16, ExposeType> = deploy
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(PORT_EXPOSE_ANNOTATION))
+        .map(|s| parse_port_expose(s))
+        .unwrap_or_default();
+    deploy
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|s| s.containers.first())
+        .and_then(|c| c.ports.as_ref())
+        .map(|ps| {
+            ps.iter()
+                .map(|p| {
+                    let name = p.name.clone().unwrap_or_default();
+                    let port = p.container_port as u16;
+                    let (expose_type, external_port) = match port_expose.get(&port) {
+                        Some(ExposeType::Tcp) => {
+                            (ExposeType::Tcp, tcp_nodeports.get(&name).copied())
+                        }
+                        Some(ExposeType::Http) => (ExposeType::Http, None),
+                        // 回退：无 annotation（旧 app）—— 在 NodePort Service 里 = Tcp，否则 Http
+                        None => tcp_nodeports
+                            .get(&name)
+                            .map_or((ExposeType::Http, None), |np| {
+                                (ExposeType::Tcp, Some(*np))
+                            }),
+                    };
+                    AppPortStatus {
+                        name,
+                        port,
+                        expose_type,
+                        external_port,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 
