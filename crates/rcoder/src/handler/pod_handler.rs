@@ -268,13 +268,19 @@ fn container_identifier_for_service(
     user_id: &str,
     project_id: &str,
     pod_id: Option<&str>,
-) -> String {
-    // 复用 ServiceType::container_identifier（单一事实源）。user_id/project_id 由调用方
-    // 保证非空（pod_ensure 已校验），故此处不会返回 Err。
+) -> Result<String, AppError> {
+    // 复用 ServiceType::container_identifier（单一事实源）。调用方（pod_ensure/keepalive/
+    // restart）已校验 user_id/project_id 非空，正常不会 Err。若仍缺字段 → 上游校验逻辑有
+    // bug，Fail Fast 返回 500 暴露（不再用 expect panic，符合禁生产 panic 约束）。
     service_type
         .container_identifier(pod_id, Some(user_id), Some(project_id))
-        .expect("user_id/project_id guaranteed non-empty by caller validation")
-        .to_string()
+        .map(|id| id.to_string())
+        .map_err(|e| {
+            AppError::internal_server_error(&format!(
+                "container_identifier for {service_type:?} failed: {e} \
+                 (user_id/project_id should have been validated upstream)"
+            ))
+        })
 }
 
 // validate_k8s_storage_size 已下沉到 container-runtime-api（共享，避免双份维护）
@@ -981,7 +987,7 @@ pub async fn pod_ensure(
         &request.user_id,
         &request.project_id,
         request.pod_id.as_deref(),
-    );
+    )?;
 
     info!(
         " [POD_ENSURE] Ensuring container exists: user_id={}, project_id={}, service_type={}, container_identifier={}",
@@ -1579,7 +1585,7 @@ pub async fn pod_keepalive(
         pod_id.clone()
     } else {
         // 根据 service_type 确定容器标识符
-        container_identifier_for_service(&service_type, &request.user_id, &request.project_id, None)
+        container_identifier_for_service(&service_type, &request.user_id, &request.project_id, None)?
     };
 
     info!(
@@ -1789,7 +1795,7 @@ pub async fn pod_restart(
         &request.user_id,
         &request.project_id,
         request.pod_id.as_deref(),
-    );
+    )?;
 
     info!(
         " [POD_RESTART] Restarting container: user_id={}, project_id={}, service_type={}, container_identifier={}",
