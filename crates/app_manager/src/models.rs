@@ -1,15 +1,13 @@
 //! 应用管理服务数据模型
 
 use std::collections::HashMap;
-use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use shared_types::error_codes::{
-    ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_CONFLICT, ERR_FILE_NOT_FOUND,
-    ERR_INVALID_STATE, ERR_OPERATION_NOT_SUPPORTED, ERR_VALIDATION,
-};
+// 错误类型抽到 error.rs（SRP：错误与数据模型分离），此处 re-export 保持
+// `super::models::*` 调用方零改动（12 个内部文件均经此 glob 引用 AppOperationError）。
+pub use crate::error::{AppOperationError, AppResult};
 
 /// 应用端口运行时状态（来自 container-runtime-api，含实际分配的对外端口）
 pub use container_runtime_api::AppPortStatus;
@@ -585,73 +583,3 @@ pub struct CreateDatabaseRequest {
     pub owner: Option<String>,
 }
 
-// ============================================================================
-// 错误（v2 §12）—— service 层抛出强类型错误，handler 用 From 直接转 AppError
-// ============================================================================
-
-/// app 操作级错误（携带业务错误码，供 handler 精确映射 HTTP）。
-///
-/// 每个错误场景一个 variant，`code()`/`message()` 用 match 实现，编译器强制穷举
-/// （新增 variant 时所有 match 编译报错，OCP）。message 含完整因果链，由 service
-/// 层在构造时拼入。handler 通过 `impl From<AppOperationError> for AppError` 直接转换，
-/// 无需 downcast / 字符串匹配。
-#[derive(Debug)]
-pub enum AppOperationError {
-    /// 应用不存在（404 ERR_APP_NOT_FOUND）
-    NotFound(String),
-    /// 应用已存在（409 ERR_APP_ALREADY_EXISTS）
-    AlreadyExists(String),
-    /// 操作状态非法，如未 delete 就清空存储（409 ERR_INVALID_STATE）
-    InvalidState(String),
-    /// 操作不支持（400 ERR_OPERATION_NOT_SUPPORTED）
-    NotSupported(String),
-    /// 文件/目录不存在（404 ERR_FILE_NOT_FOUND）
-    FileNotFound(String),
-    /// 请求参数校验失败（400 ERR_VALIDATION）
-    Validation(String),
-    /// 后端运行时错误（500 ERR_BACKEND_ERROR，兜底）
-    Backend(String),
-    /// 乐观锁冲突（409 ERR_CONFLICT）—— expected_resource_version 不匹配
-    Conflict(String),
-}
-
-impl AppOperationError {
-    /// 业务错误码（ERR_* 常量）
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::NotFound(_) => ERR_APP_NOT_FOUND,
-            Self::AlreadyExists(_) => ERR_APP_ALREADY_EXISTS,
-            Self::InvalidState(_) => ERR_INVALID_STATE,
-            Self::NotSupported(_) => ERR_OPERATION_NOT_SUPPORTED,
-            Self::FileNotFound(_) => ERR_FILE_NOT_FOUND,
-            Self::Validation(_) => ERR_VALIDATION,
-            Self::Backend(_) => ERR_BACKEND_ERROR,
-            Self::Conflict(_) => ERR_CONFLICT,
-        }
-    }
-
-    /// 人读错误信息（含完整因果链，由 service 构造时拼入）
-    pub fn message(&self) -> &str {
-        match self {
-            Self::NotFound(m)
-            | Self::AlreadyExists(m)
-            | Self::InvalidState(m)
-            | Self::NotSupported(m)
-            | Self::FileNotFound(m)
-            | Self::Validation(m)
-            | Self::Backend(m)
-            | Self::Conflict(m) => m,
-        }
-    }
-}
-
-impl fmt::Display for AppOperationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {}", self.code(), self.message())
-    }
-}
-
-impl std::error::Error for AppOperationError {}
-
-/// app_manager 服务统一返回类型（减少签名噪音）
-pub type AppResult<T> = std::result::Result<T, AppOperationError>;

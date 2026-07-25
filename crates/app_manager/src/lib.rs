@@ -13,6 +13,7 @@ pub mod app_pingora;
 pub mod app_status;
 pub mod app_workspace;
 pub mod config;
+pub mod error;
 pub mod files;
 pub mod handlers;
 pub mod models;
