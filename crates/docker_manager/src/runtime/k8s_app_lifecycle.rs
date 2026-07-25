@@ -9,6 +9,10 @@ use container_runtime_api::{
     ContainerRuntimeResult, ExposeType,
 };
 #[cfg(feature = "kubernetes")]
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+#[cfg(feature = "kubernetes")]
+use k8s_openapi::Metadata;
+#[cfg(feature = "kubernetes")]
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 #[cfg(feature = "kubernetes")]
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
@@ -125,59 +129,64 @@ impl KubernetesRuntime {
         let lp = ListParams::default().labels(&selector);
         let dp = DeleteParams::default();
 
-        // Deployment
-        if let Ok(list) = self.deployments_api().list(&lp).await {
-            for it in list.items {
-                if let Some(name) = it.metadata.name.as_ref() {
-                    let _ = self.deployments_api().delete(name, &dp).await;
-                }
-            }
-        } else {
-            warn!("[K8S-APP] orphan 扫描 list deployments 失败 (ignored): {app_id}");
-        }
+        // 类型化资源（Deployment/Service/ConfigMap/Secret）—— 共用泛型扫删
+        self.list_and_delete_orphans(&self.deployments_api(), &lp, &dp, "deployments", app_id)
+            .await;
         // Service（含 ClusterIP + NodePort，按 label 一并清）
-        if let Ok(list) = self.services_api().list(&lp).await {
-            for it in list.items {
-                if let Some(name) = it.metadata.name.as_ref() {
-                    let _ = self.services_api().delete(name, &dp).await;
-                }
-            }
-        } else {
-            warn!("[K8S-APP] orphan 扫描 list services 失败 (ignored): {app_id}");
-        }
-        // ConfigMap
-        if let Ok(list) = self.configmaps_api().list(&lp).await {
-            for it in list.items {
-                if let Some(name) = it.metadata.name.as_ref() {
-                    let _ = self.configmaps_api().delete(name, &dp).await;
-                }
-            }
-        } else {
-            warn!("[K8S-APP] orphan 扫描 list configmaps 失败 (ignored): {app_id}");
-        }
-        // Secret
-        if let Ok(list) = self.secrets_api().list(&lp).await {
-            for it in list.items {
-                if let Some(name) = it.metadata.name.as_ref() {
-                    let _ = self.secrets_api().delete(name, &dp).await;
-                }
-            }
-        } else {
-            warn!("[K8S-APP] orphan 扫描 list secrets 失败 (ignored): {app_id}");
-        }
-        // HTTPRoute（动态资源）
+        self.list_and_delete_orphans(&self.services_api(), &lp, &dp, "services", app_id)
+            .await;
+        self.list_and_delete_orphans(&self.configmaps_api(), &lp, &dp, "configmaps", app_id)
+            .await;
+        self.list_and_delete_orphans(&self.secrets_api(), &lp, &dp, "secrets", app_id)
+            .await;
+        // HTTPRoute（动态 CRD，无 typed Api：DynamicObject 未实现 k8s_openapi::Metadata，
+        // 无法走泛型，单独构造 DynamicObject Api 后内联扫删）
         let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
         let api_resource = ApiResource::from_gvk(&gvk);
         let routes: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
-        if let Ok(list) = routes.list(&lp).await {
-            for it in list.items {
-                if let Some(name) = it.metadata.name.as_ref() {
-                    let _ = routes.delete(name, &dp).await;
+        match routes.list(&lp).await {
+            Ok(list) => {
+                for it in list.items {
+                    if let Some(name) = it.metadata.name.as_ref() {
+                        let _ = routes.delete(name, &dp).await;
+                    }
                 }
             }
-        } else {
-            warn!("[K8S-APP] orphan 扫描 list httproutes 失败 (ignored): {app_id}");
+            Err(_) => warn!("[K8S-APP] orphan 扫描 list httproutes 失败 (ignored): {app_id}"),
+        }
+    }
+
+    /// 通用 orphan 扫删：按 label selector list 某类资源，逐个 best-effort 删除（错误忽略）。
+    /// list 失败仅 warn 不阻塞；delete 失败静默忽略（best-effort 兜底语义）。
+    ///
+    /// 泛型 `K` 覆盖类型化资源（Deployment/Service/ConfigMap/Secret）；HTTPRoute 等动态
+    /// CRD（DynamicObject）因未实现 `k8s_openapi::Metadata`，仍内联于 `cleanup_labeled_orphans`。
+    async fn list_and_delete_orphans<K>(
+        &self,
+        api: &Api<K>,
+        lp: &ListParams,
+        dp: &DeleteParams,
+        kind: &str,
+        app_id: &str,
+    ) where
+        K: kube::Resource
+            + Clone
+            + std::fmt::Debug
+            + serde::de::DeserializeOwned
+            + Metadata<Ty = ObjectMeta>,
+    {
+        match api.list(lp).await {
+            Ok(list) => {
+                for it in list.items {
+                    if let Some(name) = it.metadata().name.as_deref() {
+                        let _ = api.delete(name, dp).await;
+                    }
+                }
+            }
+            Err(_) => {
+                warn!("[K8S-APP] orphan 扫描 list {kind} 失败 (ignored): {app_id}");
+            }
         }
     }
 
