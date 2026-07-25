@@ -13,11 +13,9 @@ use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapEnvSource, Container as K8sContainer, ContainerPort, EnvFromSource, EnvVar,
-    PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec, ResourceRequirements,
+    PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec,
     SecretEnvSource, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
-#[cfg(feature = "kubernetes")]
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 #[cfg(feature = "kubernetes")]
@@ -27,8 +25,6 @@ use kube::api::{Api, Patch};
 #[cfg(feature = "kubernetes")]
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 #[cfg(feature = "kubernetes")]
-use std::collections::BTreeMap;
-#[cfg(feature = "kubernetes")]
 use tracing::info;
 
 #[cfg(feature = "kubernetes")]
@@ -37,7 +33,10 @@ use shared_types::ServiceType;
 #[cfg(feature = "kubernetes")]
 use super::k8s_pvc::K8sPvcOps;
 use super::kubernetes_runtime::KubernetesRuntime;
-use super::k8s_app_helpers::{build_probe, config_hash_annotations, encode_port_expose_annotations};
+use super::k8s_app_helpers::{
+    build_app_resource_requirements, build_probe, config_hash_annotations,
+    encode_port_expose_annotations,
+};
 use super::k8s_deployment::APP_CONTAINER_NAME;
 
 
@@ -143,50 +142,12 @@ impl KubernetesRuntime {
             })
             .unwrap_or_default();
 
-        // 资源
-        // ⚙️ requests/limits 解耦:requests 设超小固定值(仅作 scheduler 调度保障量),
-        //    limits 保留配置上限。原实现只设 limits → K8s 自动补 requests=limits(大值)
-        //    → scheduler 严格按大 requests 预订 → 节点迅速占满 → Pod Pending。
-        //    requests 小 → 支持大量 Pod 超卖调度;limits 大 → 单 Pod 突发不受限(swap+limits 兜底)。
-        //    值与 agent-runner (kubernetes_runtime.rs build_resource_requirements) 保持一致。
-        let resources = params.app_resources.as_ref().and_then(|req| {
-            let mut limits = BTreeMap::new();
-            let mut requests = BTreeMap::new();
-            if let Some(cpu) = &req.cpu {
-                limits.insert("cpu".to_string(), Quantity(cpu.clone()));
-                // cpu 可压缩:requests 设极小 5m,突发靠 limits(最多 throttle)。
-                requests.insert("cpu".to_string(), Quantity("5m".to_string()));
-            }
-            if let Some(mem) = &req.memory {
-                limits.insert("memory".to_string(), Quantity(mem.clone()));
-                // memory requests 设极小 64Mi(pod 开 swap,内存吃紧可换出不易 OOM)。
-                requests.insert("memory".to_string(), Quantity("64Mi".to_string()));
-            }
-            // ephemeral-storage：限制 overlay 可写层。优先 ephemeral_storage，回退 storage。
-            // 修复此前 storage 字段被完全忽略的问题：UserApp 复用共享 PVC subPath 无独立配额,
-            // storage 现用于限制 overlay 可写层（与 ephemeral_storage 同义）。
-            let es = req
-                .ephemeral_storage
-                .clone()
-                .or_else(|| req.storage.clone());
-            if let Some(es_val) = es {
-                limits.insert("ephemeral-storage".to_string(), Quantity(es_val));
-                // overlay 实际写入少(数据在共享 PVC subPath),requests 给 512Mi 调度保障。
-                requests.insert(
-                    "ephemeral-storage".to_string(),
-                    Quantity("512Mi".to_string()),
-                );
-            }
-            if limits.is_empty() {
-                None
-            } else {
-                Some(ResourceRequirements {
-                    requests: Some(requests),
-                    limits: Some(limits),
-                    ..Default::default()
-                })
-            }
-        });
+        // 资源：requests/limits 解耦策略下沉到 build_app_resource_requirements（与 agent 侧
+        // build_resource_requirements 共享 build_decoupled_resources，值一致）。
+        let resources = params
+            .app_resources
+            .as_ref()
+            .and_then(build_app_resource_requirements);
 
         // 健康检查 probe
         let (liveness, readiness) = params.health_check.as_ref().map_or((None, None), |hc| {
