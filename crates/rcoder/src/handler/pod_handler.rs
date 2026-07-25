@@ -1805,6 +1805,64 @@ pub async fn pod_restart(
     .await?;
     let was_existing = existing_container.is_some();
 
+    // 🆕 优先原地重启（exec SIGTERM PID 1 → kubelet restartPolicy 原地重启容器，卷不 unstage → ~秒级）。
+    // 仅容器已存在时尝试；K8s agent-runner 支持。失败（runtime 不支持 / 超时 / agent 卡死）自动
+    // 回落下方 destroy+recreate（慢但可靠）。原地重启 pod 名/IP/svc 不变 → VNC backend / 存储
+    // 记录 / grpc 池均复用，无需重注或清理。
+    if was_existing {
+        let runtime = state.runtime().clone();
+        match runtime
+            .restart_container_inplace(&container_identifier, &service_type)
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    " [POD_RESTART] Agent 原地重启完成（fast，volume 未 unstage）: container_identifier={}",
+                    container_identifier
+                );
+                // 取最新 container_info（status 刷新为 Running）构建响应
+                match ComputerContainerManager::get_container_info_with_type(
+                    &container_identifier,
+                    state.runtime(),
+                    &service_type,
+                )
+                .await
+                {
+                    Ok(Some(info)) => {
+                        let response = RestartPodResponse {
+                            was_existing: true,
+                            restarted: true,
+                            container_info: PodContainerInfo {
+                                container_id: info.container_id.clone(),
+                                status: info.status.clone(),
+                            },
+                            message: "Container restarted in-place (fast), can access virtual desktop via VNC (Agent service not started)".to_string(),
+                        };
+                        info!(
+                            " [POD_RESTART] Completed (in-place): container_id={}",
+                            info.container_id
+                        );
+                        return Ok(HttpResult::success(response));
+                    }
+                    other => {
+                        warn!(
+                            " [POD_RESTART] in-place 重启成功但取 info 失败({:?})，回落 destroy+recreate: container_identifier={}",
+                            other, container_identifier
+                        );
+                        // 落入下方 destroy+recreate 兜底
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    " [POD_RESTART] 原地重启失败，回落 destroy+recreate: container_identifier={}, err={:?}",
+                    container_identifier, e
+                );
+                // 落入下方 destroy+recreate 兜底
+            }
+        }
+    }
+
     // 3. 如果容器存在，先销毁
     if let Some(container_info) = existing_container {
         info!(

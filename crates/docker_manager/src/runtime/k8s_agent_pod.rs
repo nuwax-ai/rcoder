@@ -24,7 +24,7 @@ use kube::api::{Api, DeleteParams, ListParams};
 use shared_types::{
     ContainerBasicInfo, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec, ServiceType,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::k8s_pod::K8sPodOps;
 use super::k8s_pvc::K8sPvcOps;
@@ -879,5 +879,103 @@ impl KubernetesRuntime {
             total_start.elapsed().as_secs_f64()
         );
         Ok(())
+    }
+
+    /// 原地重启 agent 容器：exec 进 agent 容器 `kill -TERM 1` → agent_runner SIGTERM handler
+    /// 优雅退出 → kubelet `restartPolicy=Always` **原地重启容器**（卷不 unstage，避免 CephFS
+    /// `NodeStageVolume` re-stage ~60s）。对比 destroy+recreate（删 STS+等 pod 404+重建，慢）。
+    ///
+    /// 轮询 agent 容器 `restartCount` 自增确认 kubelet 已原地重启；30s 超时 → Err（调用方
+    /// `pod_restart` 回落 destroy+recreate，处理 agent 卡死/PID 1 不接 SIGTERM 等异常）。
+    /// agent 容器名固定 "agent"；PID 1 = agent_runner（实测 ComputerAgentRunner
+    /// `/usr/local/bin/agent_runner -p 8086`），SIGTERM 直达其 shutdown handler。
+    pub(crate) async fn restart_agent_container_inplace(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        use kube::api::AttachParams;
+        use tokio::io::AsyncReadExt;
+
+        const AGENT_CONTAINER: &str = "agent";
+        let pod_name = self.agent_pod_name(identifier, service_type)?;
+
+        // 1. 基线 restartCount（agent 容器；缺失视作 0）
+        let baseline = self
+            .pods()
+            .get(&pod_name)
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("get pod for restart baseline: {e}"))
+            })?
+            .status
+            .and_then(|s| s.container_statuses)
+            .and_then(|cs| cs.into_iter().find(|c| c.name == AGENT_CONTAINER))
+            .map(|c| c.restart_count)
+            .unwrap_or(0);
+
+        // 2. exec kill -TERM 1（agent 容器 PID 1 = agent_runner → SIGTERM → 优雅退出 → kubelet 原地重启）
+        let ap = AttachParams::default()
+            .container(AGENT_CONTAINER)
+            .stdout(true)
+            .stderr(true)
+            .stdin(false)
+            .tty(false);
+        let mut attached = self
+            .pods()
+            .exec(
+                &pod_name,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "kill -TERM 1".to_string(),
+                ],
+                &ap,
+            )
+            .await
+            .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("exec kill: {e}")))?;
+        // drain stdout/stderr（kill 通常无输出；读空释放 buffer，避免 join 死锁；reader 出作用域 drop 后再 join）
+        if let Some(mut r) = attached.stdout() {
+            let mut buf = String::new();
+            let _ = r.read_to_string(&mut buf).await;
+        }
+        if let Some(mut r) = attached.stderr() {
+            let mut buf = String::new();
+            let _ = r.read_to_string(&mut buf).await;
+        }
+        if let Err(e) = attached.join().await {
+            debug!("[K8S] restart exec join (kill -TERM 1): {e} (non-fatal, SIGTERM 已发)");
+        }
+
+        // 3. 轮询原地重启完成：restartCount 自增（kubelet 原地重启）+ ready。30s 超时 → Err（回落）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if std::time::Instant::now() > deadline {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "in-place restart timeout: agent restartCount did not increment within 30s (pod={pod_name})"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let restarted = self
+                .pods()
+                .get(&pod_name)
+                .await
+                .ok()
+                .and_then(|p| p.status)
+                .and_then(|s| s.container_statuses)
+                .and_then(|cs| cs.into_iter().find(|c| c.name == AGENT_CONTAINER))
+                .map(|c| (c.restart_count, c.ready));
+            if let Some((rc, ready)) = restarted
+                && rc > baseline
+                && ready
+            {
+                info!(
+                    "[K8S] agent restarted in-place: {} (restartCount {}→{}, ready, volume 未 unstage)",
+                    pod_name, baseline, rc
+                );
+                return Ok(());
+            }
+            // restartCount 未自增 / ready 未就绪 / pod get 短暂失败（重启中）→ 继续轮询
+        }
     }
 }

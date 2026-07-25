@@ -228,6 +228,23 @@ pub trait ContainerRuntime: Send + Sync {
         ))
     }
 
+    /// 原地重启 agent 容器（exec SIGTERM PID 1 → kubelet restartPolicy 重启容器，卷不 unstage → 快）。
+    ///
+    /// 用于 agent-runner pod 重启，避免 delete+recreate 触发 CephFS `NodeStageVolume` re-stage（~60s）。
+    /// K8s：exec 进 agent 容器 `kill -TERM 1` → agent_runner SIGTERM handler 优雅退出 → kubelet
+    /// `restartPolicy=Always` 原地重启容器（PID 1 = agent_runner，已实测确认）。
+    /// 默认 NotImplemented；调用方（pod_restart）失败应回落 destroy+recreate。
+    async fn restart_container_inplace(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        let _ = (identifier, service_type);
+        Err(ContainerRuntimeError::ConfigurationError(
+            "restart_container_inplace not supported by this runtime".to_string(),
+        ))
+    }
+
     /// 删除 Deployment 及其关联资源（Service/HTTPRoute/ConfigMap/Secret 等）
     async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         let _ = app_id;

@@ -751,6 +751,17 @@ impl ContainerRuntime for KubernetesRuntime {
         self.restart_app(app_id).await
     }
 
+    async fn restart_container_inplace(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        // 委派到 k8s_agent_pod 的 inherent 实现（沿用 get_deployment_status→get_app_status 的
+        // 「委派→inherent」模式）。不委派则命中 trait 默认（NotImplemented）→ pod_restart 回落慢路径。
+        self.restart_agent_container_inplace(identifier, service_type)
+            .await
+    }
+
     async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         self.delete_app_resources(app_id).await
     }
