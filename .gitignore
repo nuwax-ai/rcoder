@@ -34,3 +34,4 @@ docker/app-workspace/*
 # Ignore DevSpace cache and log folder
 .devspace/
 target.garbage/
+.workbuddy/
