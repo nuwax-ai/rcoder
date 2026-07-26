@@ -1,0 +1,139 @@
+//! 应用管理请求模型
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use super::commons::{AppStatus, HealthCheckConfig, PortConfig, ResourceLimits};
+
+/// 创建应用请求
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateAppRequest {
+    /// 应用 ID（可选，外部指定；格式 `app-` + DNS-1123，如 `app-order-svc`；None=自动生成）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    /// 应用名称
+    pub name: String,
+    /// 容器镜像（**完整地址**，含 registry + 命名空间，如 `nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/app-runtime-java`）。
+    /// 由调用方提前准备好并 push 到 registry；RCoder 不构建镜像。初期不限定镜像列表。
+    /// 命名空间区分环境：`nuwax-k8s-test`（测试）/ `nuwax-k8s-prod`（线上）。
+    pub image: String,
+    /// 启动命令
+    pub command: Option<Vec<String>>,
+    /// 环境变量（存储到 ConfigMap）
+    pub env: Option<HashMap<String, String>>,
+    /// 敏感信息（存储到 Secret）
+    pub secrets: Option<HashMap<String, String>>,
+    /// 资源限制
+    pub resources: Option<ResourceLimits>,
+    /// 端口配置
+    pub ports: Option<Vec<PortConfig>>,
+    /// 健康检查配置
+    pub health_check: Option<HealthCheckConfig>,
+    /// 租户 ID（多租户场景）
+    pub tenant_id: Option<String>,
+    /// 空间 ID（多租户场景）
+    pub space_id: Option<String>,
+}
+
+/// 查询应用请求
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueryAppsRequest {
+    /// 页码
+    pub page: Option<u32>,
+    /// 每页数量
+    pub page_size: Option<u32>,
+    /// 过滤条件
+    pub filters: Option<AppFilters>,
+    /// 排序字段
+    pub sort_by: Option<String>,
+    /// 排序方式
+    pub sort_order: Option<SortOrder>,
+}
+
+/// 应用过滤条件
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AppFilters {
+    /// 按状态过滤
+    pub status: Option<Vec<AppStatus>>,
+    /// 按名称模糊搜索
+    pub name: Option<String>,
+    /// 按应用 ID 过滤
+    pub app_ids: Option<Vec<String>>,
+    /// 创建时间范围
+    pub created_at: Option<DateRange>,
+}
+
+/// 时间范围
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DateRange {
+    /// 起始时间（RFC3339）
+    pub start: String,
+    /// 结束时间（RFC3339）
+    pub end: String,
+}
+
+/// 排序方式
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+/// 更新应用请求
+///
+/// **rcoder 无状态**：不持有旧 desired state，无法做"部分字段保留"。因此本请求语义为
+/// **全量替换**——调用方（Java，desired state 的 source of truth）需发送完整新状态。
+/// `image` 必填（无法保留旧 image）；`ports`/`health_check` 为整段替换。
+/// `tenant_id`/`space_id` 携带以保持资源 label（rcoder 不主动修改租户归属）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateAppRequest {
+    /// 应用名称（仅元数据，不影响 K8s 资源命名；rcoder 忽略）
+    pub name: Option<String>,
+    /// 容器镜像（**必填**，rcoder 无状态无法保留旧 image；缺失 → ERR_VALIDATION）
+    pub image: Option<String>,
+    /// 启动命令
+    pub command: Option<Vec<String>>,
+    /// 环境变量
+    pub env: Option<HashMap<String, String>>,
+    /// 敏感信息
+    pub secrets: Option<HashMap<String, String>>,
+    /// 资源限制
+    pub resources: Option<ResourceLimits>,
+    /// 端口配置（整段替换）
+    pub ports: Option<Vec<PortConfig>>,
+    /// 健康检查配置
+    pub health_check: Option<HealthCheckConfig>,
+    /// 租户 ID（携带以保持 label）
+    pub tenant_id: Option<String>,
+    /// 空间 ID（携带以保持 label）
+    pub space_id: Option<String>,
+    /// 乐观锁：传入 `GET /apps/{id}` 返回的 `resource_version`；不匹配 → 409 ERR_CONFLICT。
+    /// 不传 = 不校验（向后兼容）。Docker 模式 resource_version=None，忽略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_resource_version: Option<String>,
+}
+
+/// 日志查询参数
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LogParams {
+    /// 返回最后 N 行
+    pub tail: Option<u32>,
+    /// 是否显示时间戳
+    pub timestamps: Option<bool>,
+    /// 起始时间（暂未透传到 runtime；实时流走 `GET /apps/{id}/logs/stream` WebSocket）
+    pub since: Option<String>,
+}
+
+/// 删除应用请求
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct DeleteAppRequest {
+    /// 是否同时清空持久存储（默认 `false`：只删计算面，保留数据面）
+    #[serde(default)]
+    pub purge: Option<bool>,
+    /// 乐观锁：传入 `GET /apps/{id}` 返回的 `resource_version`；不匹配 → 409 ERR_CONFLICT。
+    /// 不传 = 不校验（向后兼容）。Docker 模式忽略。
+    #[serde(default)]
+    pub expected_resource_version: Option<String>,
+}
