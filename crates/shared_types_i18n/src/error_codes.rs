@@ -185,7 +185,7 @@ pub const ERR_APP_NOT_FOUND: &str = "ERR_APP_NOT_FOUND";
 /// 应用已存在（创建时 Deployment 已存在）。终态 → 409
 pub const ERR_APP_ALREADY_EXISTS: &str = "ERR_APP_ALREADY_EXISTS";
 
-/// 状态不允许操作（如 Deleting 中又 start；对运行中应用执行 storage/delete）。终态 → 409
+/// 状态不允许操作（如 Deleting 中又 start；对运行中应用执行 storage/clear 或 storage/destroy）。终态 → 409
 pub const ERR_INVALID_STATE: &str = "ERR_INVALID_STATE";
 
 /// 操作不被支持（如 K8s 后端尝试改不可变字段 name）。终态 → 400

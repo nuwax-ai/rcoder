@@ -197,12 +197,13 @@ v1 → v2 真实变更（均与 HTTP 方法无关）：
 
 #### 持久存储管理（v2 新增，见 §5.4）
 
-> 删应用默认保留数据（§5.3），用这组接口显式查询/清空残留存储。
+> 删应用默认保留数据（§5.3），用这组接口显式管理残留存储。`clear` 清内容（留 PVC，可恢复）；`destroy` 高危销毁 PVC（释放配额，不可逆）。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/apps/{id}/storage` | 查询存储状态：`{app_id, exists, path, modified_at, is_orphan}` |
-| `POST` | `/apps/{id}/storage/delete` | 清空该 app 持久存储（**仅当 app 已 delete 时允许**，否则 409） |
+| `POST` | `/apps/{id}/storage/clear` | 清空内容（留 PVC，可恢复；**仅当 app 已 delete 时允许**，否则 409） |
+| `POST` | `/apps/{id}/storage/destroy` | **销毁 PVC + subvolume（高危·不可逆·释放配额；需 body `confirm=app_id`，仅 app 已 delete 后允许）** |
 | `POST` | `/apps/storage/query` | 分页查询持久存储（body: **page/page_size 必填** + filters；**强制分页、无全量模式**） |
 
 #### 数据库管理（v2 新增，仅 app-runtime 镜像带 PG 的 app，见 handbook 08）
@@ -271,7 +272,7 @@ orphan 扫描（兜底，仅扫 K8s 计算资源）：
 
 **默认保留持久存储的理由**：应用可重建，数据不可再生。误删应用若连带抹掉 `data/`（数据库、用户上传、文件日志）是灾难性的。因此 `POST /apps/{id}/delete` 只删"计算面"（Deployment/Service/路由/配置），**保留"数据面"**（code/data/logs 目录）。
 
-**可选一键全删**：`POST /apps/{id}/delete` 接受 body `{"purge": true}` → 在上述流程末尾追加存储清理（等价于先 delete 再调 §5.4 的 `storage/delete`）。默认 `purge=false`。
+**可选一键全清**：`POST /apps/{id}/delete` 接受 body `{"purge": true}` → 在上述流程末尾追加内容清理（等价于先 delete 再调 §5.4 的 `storage/clear`，清内容但**留 PVC**）。默认 `purge=false`。若要**彻底销毁 PVC + 释放配额**（不可逆），delete 后再调 `storage/destroy`（见 §5.4）。
 
 **orphan 扫描是关键**：即使前面有序删除中途失败，最后一步 label 扫描保证不留**计算资源**孤儿。这是 operator-rs `delete_orphaned_resources` 的核心价值。
 
@@ -284,16 +285,24 @@ Docker 后端：删容器 + 删网络 + 摘 pingora 路由 / host port；**保�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/apps/{id}/storage` | 查询持久存储状态：`{app_id, exists, path, modified_at, is_orphan}` |
-| `POST` | `/apps/{id}/storage/delete` | 清空该 app 的持久存储（code/data/logs 全删） |
+| `POST` | `/apps/{id}/storage/clear` | 清空内容（code/data/logs，**留 PVC**，可恢复） |
+| `POST` | `/apps/{id}/storage/destroy` | **销毁 PVC + subvolume（高危·不可逆·释放配额）**，需 body `confirm=app_id` |
 | `POST` | `/apps/storage/query` | 分页查询持久存储（body: `QueryStorageRequest`，**page/page_size 必填** + filters；**强制分页、无全量模式**） |
 
-**安全约束**：`POST /apps/{id}/storage/delete` **仅当该 app 的计算资源不存在（即已 delete）时才允许**；若 app 仍存在（Running/Stopped 等），返回 `409 INVALID_STATE`，避免清空在用数据导致损坏。强制工作流：`delete app →（数据保留）→ 确认无误后再 storage/delete`。
+**两档销毁语义**（clear vs destroy）：
+- `clear`：清空 PVC 根内容（code/data/logs），**保留 PVC 对象 + subvolume 根**。可恢复（同 app_id 重建挂回空 PVC），但**不释放配额**（resize 只扩不缩）。用于"下线但留找回余地"。
+- `destroy`：**删 PVC 对象 + subvolume**（ceph-csi 回收 subvolume → 配额释放）。不可逆。用于"彻底销毁 / 合规销毁 / 释放配额"。destroy 是 clear 的超集，不必先 clear。
+
+**安全约束**：`clear` 和 `destroy` 均**仅当该 app 的计算资源不存在（即已 delete）时才允许**；若 app 仍存在（Running/Stopped 等），返回 `409 INVALID_STATE`，避免损坏在用数据。`destroy` 额外要求 body `confirm == app_id`（防误调/防脚本批量误删），否则 `400 ERR_VALIDATION`。强制工作流：`delete app →（数据保留）→ 确认无误后再 clear（留 PVC）或 destroy（销毁 PVC）`。
 
 **实现**：
-- **K8s**：每 app 一个独立 **per-app PVC**（CephFS subvolume，`subPath=None`，整 PVC 根挂 `/app`）。`storage/delete` **清空 PVC 根内容（code/data/logs）但保留 subvolume 根目录**——删根会破坏 PV `csi.volumeAttributes.subvolumePath` → pod 重启挂载异常。PVC **永不删除**（数据安全硬约束，配额靠 `resize` 回收不靠删 PVC）。
-- **Docker**：删除 `app-workspace/{app_id}/` 目录。
+- **K8s**：每 app 一个独立 **per-app PVC**（CephFS subvolume，`subPath=None`，整 PVC 根挂 `/app`）。
+  - `clear`：清空 PVC 根内容（code/data/logs）但**保留 subvolume 根目录**——删根会破坏 PV `csi.volumeAttributes.subvolumePath` → pod 重启挂载异常。
+  - `destroy`：`pvcs().delete` 删 PVC → ceph-csi 回收 subvolume（配额释放）；删前等 `pvc-protection` finalizer 移除；删后 invalidate `subvolume_path_cache`。**仅删 per-app PVC**（`rcoder-app-{id}-workspace`），PVC 名白名单硬校验，绝不碰共享 PVC。**幂等**：PVC 已不存在也返回成功（允许 Java 重试/对账）。
+  - **配额策略**：扩容走 `resize`（patch `requests.storage` → external-resizer `subvolume resize`，只扩不缩）；**配额回收只能 `destroy`**（resize 缩不了）。
+- **Docker**：`clear` 和 `destroy` 都删除 `app-workspace/{app_id}/` 目录（Docker 无 PVC 概念，两者等价）。
 
-**重建复用**：若 Java 用同一 `app_id` 重新 `POST /apps`，由于存储目录还在，新应用会自动挂回旧数据（适合"误删应用、找回数据"场景）。若需要干净起点，先 `storage/delete` 再 create。
+**重建复用**：若 Java 用同一 `app_id` 重新 `POST /apps`，由于存储目录还在，新应用会自动挂回旧数据（适合"误删应用、找回数据"场景）。若需要干净起点，先 `storage/clear` 再 create（或 `storage/destroy` 彻底销毁 PVC 后重建，得到全新 subvolume）。
 
 **存储查询（强制分页，无全量模式）**：扫存储后端（遍历 PVC/工作空间目录树）代价高，`page`/`page_size` 为**必填**，`page_size` 上限 100，**不存在"返回全部"的模式**。建议业务用 `filters`（`app_ids`/`tenant_id`/`space_id`）收窄范围，避免大范围扫描。
 
@@ -743,7 +752,7 @@ rcoder 访问 app 数据:  {RCODER_CEPHFS_ROOT}/{subvolumePath}/<app 内相对�
 | `ERR_APP_NOT_FOUND` | 404 | 应用不存在（Deployment 404） |
 | `ERR_FILE_NOT_FOUND` | 404 | 文件管理目标不存在 |
 | `ERR_APP_ALREADY_EXISTS` | 409 | 创建时 Deployment 已存在 |
-| `ERR_INVALID_STATE` | 409 | 状态不允许操作（如 Deleting 中又 start；对运行中应用 storage/delete） |
+| `ERR_INVALID_STATE` | 409 | 状态不允许操作（如 Deleting 中又 start；对运行中应用 storage/clear 或 storage/destroy） |
 | `ERR_BACKEND_ERROR` | 500 | K8s/Docker API 调用失败（透传 source） |
 | `ERR_IMAGE_PULL_FAILED` | 502 | 镜像拉取失败（ImagePullBackOff） |
 | `ERR_RESOURCE_EXHAUSTED` | 503 | 集群资源不足（调度失败） |
@@ -786,12 +795,12 @@ operator-rs 没做好的"retryable vs terminal"分类，v2 用 `is_retryable_cod
 | `handlers.rs` | 端点路径保持 v1（GET+POST、写操作动词进路径，§4.1）；日志拆 `logs`+`logs/stream`；`map_app_error` 扩展错误码分类（§12） |
 | `service.rs::update_app` | 从 Fail-Fast 改为 SSA apply（§5.2） |
 | `service.rs::delete_app` | 加 orphan 扫描；**默认保留持久存储**，支持 `purge=true` 一键全删（§5.3） |
-| `handlers.rs` / `service.rs`（新增） | 新增存储管理端点：`GET /apps/{id}/storage`、`POST /apps/{id}/storage/delete`、`POST /apps/storage/query`（§5.4） |
+| `handlers.rs` / `service.rs`（新增） | 新增存储管理端点：`GET /apps/{id}/storage`、`POST /apps/{id}/storage/clear`（原 storage/delete 改名，清内容留 PVC）、`POST /apps/{id}/storage/destroy`（销毁 PVC，高危）、`POST /apps/storage/query`（§5.4） |
 | `models.rs::AppRuntimeInfo` | 加 `conditions` 字段（§6.2） |
 | `models.rs::UpdateAppRequest` | 加 `ports` / `health_check` 字段（§6.1） |
 | `models.rs`（新增） | `DeleteAppRequest { purge: Option<bool> }`、`QueryStorageRequest { page: u32, page_size: u32 /* 必填, ≤100 */, filters }` + `StorageFilters { orphan_only, app_ids, tenant_id, space_id }`、`StorageInfo { app_id, exists, path, modified_at, is_orphan }`（**不含 size_bytes**——CephFS 上不能用 du，见 §5.4） |
-| `runtime_trait.rs` | 加 `patch_deployment` / `delete_app_resources` / `get_app_storage` / `delete_app_storage` / `list_orphan_storage`（§7.1） |
-| K8s 后端写操作 | 全面改用 SSA `apply_patch`（替换现在的 `create` + `patch` 分支）；delete 不删 per-app PVC（数据安全硬约束），仅清计算资源 |
+| `runtime_trait.rs` | 加 `patch_deployment` / `delete_app_resources` / `get_app_storage` / `clear_app_storage`（原 delete_app_storage）/ `destroy_app_pvc`（销毁 PVC）/ `list_orphan_storage`（§7.1） |
+| K8s 后端写操作 | 全面改用 SSA `apply_patch`（替换现在的 `create` + `patch` 分支）；delete **默认不删 per-app PVC**（数据保留，仅清计算资源）；PVC 销毁走独立 `storage/destroy` 接口（§5.4，默认保留 + 显式销毁两档） |
 
 开发阶段、未对外提供接口，故可直接改契约，无需版本共存。
 

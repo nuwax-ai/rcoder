@@ -151,28 +151,29 @@ make update-image-tag
 - **内部网络通信**: 容器间通过 Docker 内部网络直接通信，无需端口映射
 - **路径自动解析**: 自动检测容器内路径到宿主机路径的映射
 
-### K8s Pod/PVC 生命周期管理
+### K8s Pod/PVC 生命周期管理（agent-runner，STS-based）
 
-K8s 模式下，Pod 和 PVC 的停止流程需要严格顺序，否则会导致 Terminating 卡死：
+K8s 模式下 agent-runner（ComputerAgentRunner / WebAgentRunner）的停止流程基于 **StatefulSet**（裸 Pod→STS 改造后，commit d98c923），**PVC 全程保留不删**（数据复用，下次 ensure 重建挂回）：
 
 ```
-stop_container_by_identifier()
-  ├─ Step 1: pods().delete()       // 发送删除请求（graceful, 60s grace period）
-  ├─ Step 2: wait_for_pod_terminated()  // 轮询等待 Pod 消失（404），超时 90s 后 force-delete
-  ├─ Step 3: wait_for_pvc_removable()   // 等待 pvc-protection finalizer 移除（30s）
-  └─ Step 4: delete_workspace_pvc()     // 安全删除 PVC
+stop_container_by_identifier_inner()  // k8s_agent_pod.rs
+  ├─ Step 0: delete_agent_service()         // 删 ClusterIP Service（先摘流量 / DNS）
+  ├─ Step 1: delete_agent_statefulset()      // Foreground cascade 删 STS → pod 随之终止（非 scale 0）
+  ├─ Step 2: wait_for_pod_terminated()       // 等 pod {sts}-0 完全终止（404），避免与重建 pod 抢 RWO PVC
+  └─ Step 3: delete_agent_headless_service() // 删 headless Service（彻底回收）
+  —— PVC 保留（日志 "PVC preserved for reuse"），不删——
 ```
 
-**历史问题**: 早期版本在 `pods().delete()` 后立即调用 `delete_workspace_pvc()`，此时 Pod 还在运行、JuiceFS FUSE 卷仍被挂载，导致 PVC 的 `pvc-protection` finalizer 无法移除 → Pod 和 PVC 双双卡死在 Terminating。
+**PVC 保留策略（数据安全硬约束）**：`K8sPvcOps` trait（k8s_pvc.rs）**不提供 PVC 删除方法**——只有 `ensure_workspace_pvc` / `resolve_subvolume_path` / `resize_workspace_pvc`，无 `delete_workspace_pvc` / `wait_for_pvc_removable`（这两个是早期 JuiceFS + 裸 Pod 时代的，STS + CephFS + per-agent PVC 改造后已移除）。配额扩容走 `resize`；**UserApp 侧 PVC 销毁走独立 REST 接口** `POST /apps/{id}/storage/destroy`（见 `docs/application-management-service-v2-design.md` §5.4），agent 侧无对应接口。
 
 **关键文件**：
-- `crates/docker_manager/src/runtime/kubernetes_runtime.rs` - 核心：`stop_container_by_identifier()`
+- `crates/docker_manager/src/runtime/k8s_agent_pod.rs` - 核心：`stop_container_by_identifier_inner`（STS 销毁流程）+ `restart_agent_container_inplace`（原地重启）
 - `crates/docker_manager/src/runtime/k8s_pod.rs` - Pod 生命周期：`K8sPodOps` trait（wait_for_pod_ready, wait_for_pod_terminated）
-- `crates/docker_manager/src/runtime/k8s_pvc.rs` - PVC 生命周期：`K8sPvcOps` trait（ensure_workspace_pvc, wait_for_pvc_removable, delete_workspace_pvc）
+- `crates/docker_manager/src/runtime/k8s_pvc.rs` - PVC 生命周期：`K8sPvcOps` trait（ensure_workspace_pvc, resolve_subvolume_path, resize_workspace_pvc —— **无删除方法**）
 - `crates/agent_runner/src/shutdown.rs` - 进程优雅关闭：`terminate_children()`（SIGTERM → 3s → SIGKILL）
 
 **Pod 停止时的三道防线**：
-1. **preStop lifecycle hook**: `sync && sleep 2`，在 SIGTERM 前 flush FUSE 写入 buffer
+1. **preStop lifecycle hook**: `sync && sleep 2`，在 SIGTERM 前 flush 写入 buffer
 2. **agent_runner shutdown handler**: 构建进程树，递归收集所有后代 + 孤儿进程（ppid=1），叶子优先 SIGTERM → 等待 3s → SIGKILL
 3. **wait_for_pod_terminated**: 等待 Pod 从 API Server 消失（404），超时后 `gracePeriodSeconds=0` 强制删除
 
