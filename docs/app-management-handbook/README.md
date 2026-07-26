@@ -53,7 +53,7 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
 
 ---
 
-## 接口总览（21 个）
+## 接口总览（24 个）
 
 ```
 生命周期   POST   /api/v1/apps                       创建（异步）
@@ -78,9 +78,13 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
            GET    /api/v1/apps/{app_id}/files        列出文件
            POST   /api/v1/apps/{app_id}/files/delete 删除文件
 
-持久存储   GET    /api/v1/apps/{app_id}/storage      查询存储状态
-           POST   /api/v1/apps/{app_id}/storage/delete  清空存储（仅已 delete 的 app）
-           POST   /api/v1/apps/storage/query         分页查询存储（强制分页）
+持久存储   GET    /api/v1/apps/{app_id}/storage          查询存储状态
+           POST   /api/v1/apps/{app_id}/storage/clear    清空内容（留 PVC，仅已 delete 的 app）
+           POST   /api/v1/apps/{app_id}/storage/destroy  销毁 PVC（高危·不可逆·释放配额）
+           POST   /api/v1/apps/storage/query             分页查询存储（强制分页）
+
+数据库     POST   /api/v1/apps/{app_id}/db/reset-password   重置 PG 密码（仅 app-runtime 镜像）
+           POST   /api/v1/apps/{app_id}/db/create-database  新建 PG 库
 ```
 
 所有响应统一包 `HttpResult<T> = { success, data, code, message, tid }`。逐个字段含义见 [02-接口手册](./02-接口手册.md)。
