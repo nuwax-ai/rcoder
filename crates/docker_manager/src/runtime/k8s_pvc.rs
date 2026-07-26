@@ -42,9 +42,11 @@ use super::kubernetes_runtime::KubernetesRuntime;
 /// - subvolume 路径解析 (`resolve_subvolume_path`, 阶段2 rcoder 挂根聚合)
 /// - PVC 配额扩容 (`resize_workspace_pvc`, 阶段2 配额调整)
 ///
-/// 注: 不提供 PVC 删除方法 (数据安全硬约束: PVC 永不删除, 见
-/// `stop_container_by_identifier` / `cleanup_all` 的保留策略)。配额靠 resize,
-/// 不靠删 PVC 回收。
+/// - PVC 销毁 (`destroy_workspace_pvc`, 仅 UserApp 经 REST `storage/destroy` 显式调用)
+///
+/// PVC 销毁策略: 默认保留 (clear 清内容留 PVC, 可恢复); 仅 `destroy_workspace_pvc`
+/// 显式删 PVC + subvolume (释放配额, 不可逆)。agent PVC 仍永不删。
+/// 见 `docs/application-management-service-v2-design.md` §5.4。
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 pub(crate) trait K8sPvcOps {
@@ -111,6 +113,19 @@ pub(crate) trait K8sPvcOps {
         identifier: &str,
         service_type: &ServiceType,
         new_size: &str,
+    ) -> ContainerRuntimeResult<()>;
+
+    /// 销毁 workspace PVC + CephFS subvolume (释放配额, 不可逆)。
+    ///
+    /// 仅 UserApp 经 REST `POST /apps/{id}/storage/destroy` 显式调用 (agent PVC 永不删)。
+    /// 调用方须保证 app 已 delete (PVC 无 Pod 引用 → pvc-protection finalizer 正常移除,
+    /// 不会卡 Terminating)。幂等: PVC 不存在返回 Ok。
+    /// 白名单: pvc_name 由 `workspace_pvc_name` 生成, 只删 `{prefix}-{id}-workspace`,
+    /// 碰不到共享 PVC (rcoder-workspace / rcoder-computer-workspace)。
+    async fn destroy_workspace_pvc(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()>;
 }
 
@@ -421,6 +436,117 @@ impl K8sPvcOps for KubernetesRuntime {
             "[K8S] PVC {} resize requested -> {} (ceph-csi auto subvolume resize)",
             pvc_name, new_size
         );
+        Ok(())
+    }
+
+    async fn destroy_workspace_pvc(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+
+        // 幂等: PVC 不存在直接返回成功 (Java 重试 / 对账安全)
+        match self.pvcs().get(&pvc_name).await {
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                info!(
+                    "[K8S] PVC {} not found, destroy is no-op (idempotent)",
+                    pvc_name
+                );
+                self.subvolume_path_cache.write().await.remove(&pvc_name);
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "Failed to get PVC '{}' before destroy: {}",
+                    pvc_name, e
+                )))
+            }
+            Ok(_) => {}
+        }
+
+        // 发删除请求 (默认 grace period; 调用方保证 app 已 delete → 无 Pod 引用 →
+        // pvc-protection finalizer 正常移除)
+        match self
+            .pvcs()
+            .delete(&pvc_name, &kube::api::DeleteParams::default())
+            .await
+        {
+            Ok(_) => info!("[K8S] PVC {} delete requested", pvc_name),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                // 并发已删, 幂等
+                self.subvolume_path_cache.write().await.remove(&pvc_name);
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "Failed to delete PVC '{}': {}",
+                    pvc_name, e
+                )))
+            }
+        }
+
+        // 等 PVC 完全消失 (复用 ensure_workspace_pvc 的轮询模式: 60s 超时 → 强删 grace=0)。
+        // app 已 delete 前提下, pvc-protection finalizer 会正常移除, 通常秒级完成。
+        // ⚠️ 与 ensure_workspace_pvc 的关键差异: 非 404 错误 (transport/auth/RBAC 瞬时故障)
+        //    不假定"已删"——destroy 不可逆, 误报成功会让用户基于"PVC 已销毁"做错决策
+        //    (如缩减 cephfs 容量规划、对账孤儿); 继续轮询直到 404 或超时强删。
+        let wait_start = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(60);
+        loop {
+            // 超时 → 强删 + 确认 (Ok/Err 任一累计到超时都走此分支, 抽顶部避免重复)
+            if wait_start.elapsed() > max_wait {
+                warn!(
+                    "[K8S] PVC {} stuck in Terminating for {:.1}s, force deleting",
+                    pvc_name,
+                    wait_start.elapsed().as_secs_f64()
+                );
+                let dp = kube::api::DeleteParams {
+                    grace_period_seconds: Some(0),
+                    ..Default::default()
+                };
+                let _ = self.pvcs().delete(&pvc_name, &dp).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // 强删后再确认; 仍卡 → 不自动剥 finalizer (危险, 绕过 pvc-protection),
+                // 报错让人/运维介入
+                match self.pvcs().get(&pvc_name).await {
+                    Err(kube::Error::Api(ae)) if ae.code == 404 => break,
+                    _ => {
+                        self.subvolume_path_cache.write().await.remove(&pvc_name);
+                        return Err(ContainerRuntimeError::K8sError(format!(
+                            "PVC '{}' stuck in Terminating after force delete (pvc-protection finalizer?) — manual intervention required",
+                            pvc_name
+                        )));
+                    }
+                }
+            }
+            match self.pvcs().get(&pvc_name).await {
+                Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                    info!(
+                        "[K8S] PVC {} fully deleted after {:.1}s",
+                        pvc_name,
+                        wait_start.elapsed().as_secs_f64()
+                    );
+                    break;
+                }
+                Ok(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    // 非 404 错误 (transport/auth/RBAC 瞬时故障): 不假定已删, 继续轮询
+                    warn!(
+                        "[K8S] PVC {} get failed during wait, keep polling: {}",
+                        pvc_name, e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+
+        // invalidate subvolPath cache (destroy 打破 resolve_subvolume_path 的 "PVC 不可变" 假设;
+        // 不清则重建同 app_id 时 resolve 命中脏值 → 读老 subvol → 数据面分裂)
+        self.subvolume_path_cache.write().await.remove(&pvc_name);
+        info!("[K8S] workspace PVC destroyed: {}", pvc_name);
         Ok(())
     }
 }

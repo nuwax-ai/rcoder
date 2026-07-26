@@ -515,9 +515,9 @@ impl KubernetesRuntime {
         let tenant_id = params.tenant_id.as_deref();
         let space_id = params.space_id.as_deref();
         // 0. workspace PVC: UserApp (K8s 永远 per-app) ensure per-app CephFS subvolume
-        //    (配额由 requests.storage 经 CSI 服务端设, 绕开 client setfattr; PVC 永不删除,
-        //    重建时 ensure "active" 分支复用)。create_app 流程已在 app_manager ensure_app_workspace_ready
-        //    预 ensure + 等 subvolumePath 就绪, 这里命中 "active" 复用分支。
+        //    (配额由 requests.storage 经 CSI 服务端设, 绕开 client setfattr; PVC 默认保留,
+        //    重建时 ensure "active" 分支复用; 销毁走 destroy_app_pvc)。create_app 流程已在
+        //    app_manager ensure_app_workspace_ready 预 ensure + 等 subvolumePath 就绪, 这里命中 "active" 复用分支。
         self.ensure_workspace_pvc(app_id, &ServiceType::UserApp, params.storage_size.as_deref())
             .await?;
         // 1. ConfigMap（env）

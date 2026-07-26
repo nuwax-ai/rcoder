@@ -727,6 +727,13 @@ impl ContainerRuntime for KubernetesRuntime {
         self.delete_app_resources(app_id).await
     }
 
+    async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        // 委派 K8sPvcOps::destroy_workspace_pvc (service_type=UserApp; 仅 UserApp 走此路径,
+        // agent PVC 永不删)。trait 方法默认 no-op, Docker 不覆盖。
+        self.destroy_workspace_pvc(app_id, &ServiceType::UserApp)
+            .await
+    }
+
     async fn get_deployment_status(
         &self,
         app_id: &str,

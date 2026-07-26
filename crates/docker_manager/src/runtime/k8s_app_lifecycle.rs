@@ -58,8 +58,9 @@ impl KubernetesRuntime {
     }
 
 
-    /// 删除 UserApp 的全部 K8s 资源（Deployment/Service/NodePort/HTTPRoute/ConfigMap/Secret）
-    /// 不删 PVC（app 复用 rcoder-workspace 共享 PVC，由 app_manager 在子目录层清理）。
+    /// 删除 UserApp 的全部 K8s 计算资源（Deployment/Service/NodePort/HTTPRoute/ConfigMap/Secret）。
+    /// **不删 per-app PVC**（数据安全：默认保留，可恢复；销毁走独立 `storage/destroy` 接口
+    /// → `destroy_app_pvc`，见 docs/application-management-service-v2-design.md §5.4）。
     ///
     /// 任一资源删除返回非 404 错误（如 API Server 不可达、权限拒绝）立即透传，调用方
     /// （app_manager）据此决定是否继续清理工作空间目录，避免"集群资源还在但数据已删"
@@ -120,7 +121,8 @@ impl KubernetesRuntime {
     /// list 所有带 `instance={app_id}, managed-by=rcoder-app-manager` 的计算资源并删除残留。
     ///
     /// 供 delete_app_resources 末尾调用，保证不留孤儿（哪怕前面按名删除部分失败）。
-    /// **不扫 PVC**（共享 PVC 不带 app 标签，且不可删）。best-effort：错误仅 warn。
+    /// **不扫 PVC**（per-app PVC 用 `managed-by=rcoder-runtime` label、不带 instance，故 label
+    /// 扫不到；且 PVC 默认保留，销毁走显式 `destroy_app_pvc`，不靠 orphan 扫）。best-effort：错误仅 warn。
     async fn cleanup_labeled_orphans(&self, app_id: &str) {
         let selector = format!(
             "{}/instance={app_id},{}/managed-by={APP_MANAGED_BY}",

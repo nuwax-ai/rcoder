@@ -178,6 +178,15 @@ pub trait ContainerRuntime: Send + Sync {
         Ok(()) // default no-op (Docker / 未实现)
     }
 
+    /// 销毁 per-app PVC(UserApp 专用;Docker 默认 no-op)。
+    ///
+    /// K8s: 删 PVC 对象 → ceph-csi 回收 subvolume(释放配额)。调用方须保证 app 已 delete
+    /// (PVC 无 Pod 引用 → pvc-protection finalizer 正常移除,不会卡)。幂等:PVC 不存在返 Ok。
+    /// 见 `docs/application-management-service-v2-design.md` §5.4 destroy。
+    async fn destroy_app_pvc(&self, _app_id: &str) -> ContainerRuntimeResult<()> {
+        Ok(()) // default no-op (Docker / 未实现)
+    }
+
     // ====================================================================
     // Deployment 生命周期（UserApp 专用，agent 路径不调用）
     //
