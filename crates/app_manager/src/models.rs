@@ -523,6 +523,13 @@ pub struct DeleteAppRequest {
     pub expected_resource_version: Option<String>,
 }
 
+/// 销毁 PVC 请求（高危·不可逆；强制 `confirm == app_id` 二次确认）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DestroyStorageRequest {
+    /// 必须等于 path 的 `app_id`（防误调 / 防脚本批量误删 / 防重放）
+    pub confirm: String,
+}
+
 /// 存储查询请求（**强制分页，无全量模式**——扫存储后端代价高）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueryStorageRequest {

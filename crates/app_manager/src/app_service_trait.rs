@@ -49,8 +49,11 @@ pub trait AppServiceTrait: Send + Sync {
     /// 查询单个应用持久存储状态（v2 §5.4，O(1) stat，不含 size_bytes）
     async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo>;
 
-    /// 清空应用持久存储（仅当 app 已 delete 时允许，否则 INVALID_STATE）
-    async fn delete_app_storage(&self, app_id: &str) -> AppResult<()>;
+    /// 清空应用持久存储内容（留 PVC，可恢复；仅当 app 已 delete 时允许，否则 INVALID_STATE）
+    async fn clear_app_storage(&self, app_id: &str) -> AppResult<()>;
+
+    /// 销毁应用持久存储 PVC（高危·不可逆·释放配额；需 confirm==app_id，仅 app 已 delete 后允许）
+    async fn destroy_app_storage(&self, app_id: &str, confirm: &str) -> AppResult<()>;
 
     /// 重置 app 容器内 PG 密码（exec psql ALTER USER，本地 trust 认证绕过当前密码）
     async fn reset_db_password(

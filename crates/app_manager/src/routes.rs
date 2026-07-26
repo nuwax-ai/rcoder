@@ -57,8 +57,12 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             get(handlers::get_app_storage),
         )
         .route(
-            "/api/v1/apps/{app_id}/storage/delete",
-            post(handlers::delete_app_storage),
+            "/api/v1/apps/{app_id}/storage/clear",
+            post(handlers::clear_app_storage),
+        )
+        .route(
+            "/api/v1/apps/{app_id}/storage/destroy",
+            post(handlers::destroy_app_storage),
         )
         .route("/api/v1/apps/storage/query", post(handlers::query_storage))
         // 数据库管理（app-runtime 镜像单容器自带 PG；rcoder exec psql 操作）

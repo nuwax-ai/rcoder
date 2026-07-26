@@ -584,10 +584,10 @@ pub async fn get_app_storage(
     Ok(Json(HttpResult::success(info)))
 }
 
-/// 清空应用持久存储（仅当 app 已 delete 时允许，否则 409 INVALID_STATE）
+/// 清空应用持久存储内容（留 PVC，可恢复；仅当 app 已 delete 时允许，否则 409 INVALID_STATE）
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/storage/delete",
+    path = "/api/v1/apps/{app_id}/storage/clear",
     params(("app_id" = String, Path, description = "应用 ID")),
     responses(
         (status = 200, description = "清空成功", body = HttpResult<String>),
@@ -597,13 +597,41 @@ pub async fn get_app_storage(
     tag = "应用管理"
 )]
 #[instrument(skip(state))]
-pub async fn delete_app_storage(
+pub async fn clear_app_storage(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
     info!("[APP] clearing app storage: {}", app_id);
-    state.app_service.delete_app_storage(&app_id).await?;
+    state.app_service.clear_app_storage(&app_id).await?;
     Ok(Json(HttpResult::success("存储已清空".to_string())))
+}
+
+/// 销毁应用持久存储 PVC（高危·不可逆·释放配额；需 body `confirm=app_id`，仅 app 已 delete 后允许）
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/storage/destroy",
+    params(("app_id" = String, Path, description = "应用 ID")),
+    request_body = DestroyStorageRequest,
+    responses(
+        (status = 200, description = "PVC 已销毁", body = HttpResult<String>),
+        (status = 400, description = "confirm 缺失/不匹配 app_id", body = HttpResult<String>),
+        (status = 409, description = "应用仍存在，需先 delete", body = HttpResult<String>),
+        (status = 500, description = "PVC 卡 Terminating，需运维介入（pvc-protection finalizer 未移除）", body = HttpResult<String>)
+    ),
+    tag = "应用管理"
+)]
+#[instrument(skip(state, req))]
+pub async fn destroy_app_storage(
+    State(state): State<Arc<AppManagerState>>,
+    Path(app_id): Path<String>,
+    Json(req): Json<DestroyStorageRequest>,
+) -> Result<Json<HttpResult<String>>, AppError> {
+    info!("[APP] destroying app PVC: {}", app_id);
+    state
+        .app_service
+        .destroy_app_storage(&app_id, &req.confirm)
+        .await?;
+    Ok(Json(HttpResult::success("PVC 已销毁，配额已释放".to_string())))
 }
 
 /// 重置 app 容器内 PG 密码（exec 容器内 psql ALTER USER，本地 trust 认证绕过当前密码）

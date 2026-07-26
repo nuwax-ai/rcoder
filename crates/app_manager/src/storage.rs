@@ -32,23 +32,27 @@ impl super::service::AppService {
         })
     }
 
-    /// 清空应用的持久存储。安全约束：仅当 app 计算资源已不存在时允许（否则 INVALID_STATE）。
-    pub async fn delete_app_storage(&self, app_id: &str) -> AppResult<()> {
-        validate_app_id(app_id)?;
+    /// 校验 app 计算资源已不存在（clear/destroy 共用前置：必须先 delete app，否则 INVALID_STATE）。
+    /// `op` 用于错误描述（如 "clearing storage" / "destroying PVC"）。
+    async fn ensure_app_deleted(&self, app_id: &str, op: &str) -> AppResult<()> {
         match self.runtime.get_deployment_status(app_id).await {
-            Ok(Some(_)) => {
-                return Err(AppOperationError::InvalidState(format!(
-                    "app {app_id} still exists, delete it before clearing storage (to avoid corrupting in-use data)"
-                )));
-            }
-            Ok(None) => {}
+            Ok(Some(_)) => Err(AppOperationError::InvalidState(format!(
+                "app {app_id} still exists, delete it before {op}"
+            ))),
+            Ok(None) => Ok(()),
             Err(e) => {
                 warn!("[APP] query app status failed app_id={}: {}", app_id, e);
-                return Err(AppOperationError::Backend(format!(
+                Err(AppOperationError::Backend(format!(
                     "failed to query app status: {e}"
-                )));
+                )))
             }
         }
+    }
+
+    /// 清空应用持久存储内容（留 PVC，可恢复）。安全约束：仅当 app 计算资源已不存在时允许（否则 INVALID_STATE）。
+    pub async fn clear_app_storage(&self, app_id: &str) -> AppResult<()> {
+        validate_app_id(app_id)?;
+        self.ensure_app_deleted(app_id, "clearing storage").await?;
         let app_dir = self.get_container_app_dir(app_id).await?;
         // K8s per-agent: app_dir = per-app PVC 根 (ceph-csi subvol 根), 清空内容不删根
         // (删 subvol 根破坏 PV subvolumePath → pod 重启挂载异常)
@@ -58,6 +62,28 @@ impl super::service::AppService {
             return Err(map_io_error("failed to clear storage", e, false));
         }
         info!("[APP] app storage cleared: {}", app_id);
+        Ok(())
+    }
+
+    /// 销毁应用持久存储 PVC（高危·不可逆·释放配额）。
+    ///
+    /// 安全约束：① 仅当 app 计算资源已不存在（已 delete）时允许（否则 INVALID_STATE）；
+    /// ② body `confirm` 必须等于 app_id（否则 VALIDATION，防误调/防脚本批量误删）。
+    /// K8s：删 PVC 对象 → ceph-csi 回收 subvolume（配额释放）。Docker：无 PVC，trait 默认 no-op。
+    /// 幂等：PVC 已不存在也返回成功。
+    pub async fn destroy_app_storage(&self, app_id: &str, confirm: &str) -> AppResult<()> {
+        validate_app_id(app_id)?;
+        if confirm != app_id {
+            return Err(AppOperationError::Validation(format!(
+                "confirm must equal app_id for destroy (high-risk op): got confirm='{confirm}'"
+            )));
+        }
+        self.ensure_app_deleted(app_id, "destroying PVC").await?;
+        self.runtime
+            .destroy_app_pvc(app_id)
+            .await
+            .map_err(|e| map_runtime_error("destroy_app_pvc failed", e))?;
+        info!("[APP] app PVC destroyed: {}", app_id);
         Ok(())
     }
 

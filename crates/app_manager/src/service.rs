@@ -469,7 +469,7 @@ impl AppService {
         //    默认保留：应用可重建，数据不可再生（v2 §5.3 数据安全）。
         if purge {
             let app_dir = self.get_container_app_dir(app_id).await?;
-            // K8s per-agent: app_dir = per-app PVC 根, 清空内容不删根 (同 delete_app_storage)
+            // K8s per-agent: app_dir = per-app PVC 根, 清空内容不删根 (同 clear_app_storage)
             if app_dir.exists()
                 && let Err(e) = Self::purge_dir_contents(&app_dir).await
             {
@@ -531,8 +531,12 @@ impl super::AppServiceTrait for AppService {
         self.get_app_storage(app_id).await
     }
 
-    async fn delete_app_storage(&self, app_id: &str) -> AppResult<()> {
-        self.delete_app_storage(app_id).await
+    async fn clear_app_storage(&self, app_id: &str) -> AppResult<()> {
+        self.clear_app_storage(app_id).await
+    }
+
+    async fn destroy_app_storage(&self, app_id: &str, confirm: &str) -> AppResult<()> {
+        self.destroy_app_storage(app_id, confirm).await
     }
 
     async fn reset_db_password(
