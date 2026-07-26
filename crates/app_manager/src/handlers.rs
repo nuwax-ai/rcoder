@@ -22,26 +22,8 @@ pub struct AppManagerState {
     pub app_service: Arc<dyn super::AppServiceTrait>,
 }
 
-/// 由运行时信息派生健康信息（AppRuntimeInfo → HealthInfo）
-fn health_from_runtime(info: &AppRuntimeInfo) -> HealthInfo {
-    HealthInfo {
-        status: info.phase.clone(),
-        instance: Some(InstanceInfo {
-            name: format!(
-                "{}-{}",
-                shared_types::ServiceType::UserApp.container_prefix(),
-                info.app_id
-            ),
-            phase: info.phase.clone(),
-            ready: info.ready_replicas > 0,
-            restart_count: info.restart_count,
-            node: info.node.clone().unwrap_or_default(),
-            ip: info.pod_ip.clone().unwrap_or_default(),
-            started_at: info.started_at.clone(),
-        }),
-        probes: None,
-    }
-}
+// health 信息已合并到 AppRuntimeInfo.health（由 build_runtime_info 经 health_from_status 统一派生）；
+// get_app_health 直接取 runtime.health，无需 handler 重复派生（消除 m1 重复）。
 
 /// app 操作错误 → HTTP 响应错误（v2 §12）。
 ///
@@ -324,7 +306,7 @@ pub async fn get_app_health(
 ) -> Result<Json<HttpResult<HealthInfo>>, AppError> {
     info!("[APP] getting app health: {}", app_id);
     let runtime = state.app_service.get_app(&app_id).await?;
-    Ok(Json(HttpResult::success(health_from_runtime(&runtime))))
+    Ok(Json(HttpResult::success(runtime.health)))
 }
 
 /// 获取应用资源使用（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）

@@ -20,7 +20,7 @@ use k8s_openapi::api::core::v1::{
 #[cfg(feature = "kubernetes")]
 use kube::Config;
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, ListParams};
+use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams};
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
 #[cfg(feature = "kubernetes")]
@@ -161,6 +161,13 @@ impl KubernetesRuntime {
     /// Get the PVC API
     pub(crate) fn pvcs(&self) -> Api<PersistentVolumeClaim> {
         Api::namespaced(self.client.clone(), &self.namespace)
+    }
+
+    /// Get the HTTPRoute API（gateway.networking.k8s.io/v1 动态资源；apply / delete by name / label 扫 / 条件删共用）
+    pub(crate) fn httproute_api(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
+        let ar = ApiResource::from_gvk(&gvk);
+        Api::namespaced_with(self.client.clone(), &self.namespace, &ar)
     }
 
     /// Get the PV API (cluster-scoped)

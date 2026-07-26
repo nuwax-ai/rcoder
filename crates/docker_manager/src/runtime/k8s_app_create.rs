@@ -21,9 +21,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, Patch};
-#[cfg(feature = "kubernetes")]
-use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
+use kube::api::Patch;
 #[cfg(feature = "kubernetes")]
 use tracing::info;
 
@@ -337,10 +335,7 @@ impl KubernetesRuntime {
         // 默认 true（与 Docker Pingora 模式一致：后端收到 clean path）。
         // 显式传 false 才保留 /apps/{id} 前缀。
         let strip_prefix = http_port.strip_prefix.unwrap_or(true);
-        let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
-        let api_resource = ApiResource::from_gvk(&gvk);
-        let routes: Api<DynamicObject> =
-            Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
+        let routes = self.httproute_api();
 
         // strip_prefix=true → URLRewrite ReplacePrefixMatch：`/apps/{id}/api` → `/api`
         let filters = if strip_prefix {

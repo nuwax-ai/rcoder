@@ -300,6 +300,8 @@ pub struct AppRuntimeInfo {
     /// update/delete 时作为 `expected_resource_version` 传入校验。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_version: Option<String>,
+    /// 健康信息（由 build_runtime_info 经 health_from_status 统一派生；消除 handler 重复派生）
+    pub health: HealthInfo,
 }
 
 /// 访问信息

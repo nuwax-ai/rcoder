@@ -15,8 +15,6 @@ use k8s_openapi::Metadata;
 #[cfg(feature = "kubernetes")]
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 #[cfg(feature = "kubernetes")]
-use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
-#[cfg(feature = "kubernetes")]
 use tracing::{info, warn};
 
 
@@ -98,10 +96,7 @@ impl KubernetesRuntime {
         )
         .await?;
         // HTTPRoute（动态资源）
-        let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
-        let api_resource = ApiResource::from_gvk(&gvk);
-        let routes: Api<DynamicObject> =
-            Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
+        let routes = self.httproute_api();
         self.ignore_404(routes.delete(&self.app_http_route_name(app_id), &dp).await)
             .await?;
         // orphan 扫描兜底：删除所有带本 app label 的残留计算资源（防前面按名删除中途
@@ -143,10 +138,7 @@ impl KubernetesRuntime {
             .await;
         // HTTPRoute（动态 CRD，无 typed Api：DynamicObject 未实现 k8s_openapi::Metadata，
         // 无法走泛型，单独构造 DynamicObject Api 后内联扫删）
-        let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
-        let api_resource = ApiResource::from_gvk(&gvk);
-        let routes: Api<DynamicObject> =
-            Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
+        let routes = self.httproute_api();
         match routes.list(&lp).await {
             Ok(list) => {
                 for it in list.items {
@@ -215,10 +207,7 @@ impl KubernetesRuntime {
         let has_secrets = params.secrets.as_ref().is_some_and(|s| !s.is_empty());
         let dp = DeleteParams::default();
         if !has_http {
-            let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
-            let api_resource = ApiResource::from_gvk(&gvk);
-            let routes: Api<DynamicObject> =
-                Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
+            let routes = self.httproute_api();
             self.ignore_404(routes.delete(&self.app_http_route_name(app_id), &dp).await)
                 .await?;
         }

@@ -63,6 +63,7 @@ impl AppService {
     /// DeploymentStatus → AppRuntimeInfo（含访问地址构建 + conditions 派生）
     pub(crate) fn build_runtime_info(&self, status: DeploymentStatus) -> AppRuntimeInfo {
         let conditions = derive_conditions(&status);
+        let health = health_from_status(&status);
 
         // Pingora 模式（不论 Docker/K8s）：runtime status 只含 TCP（HTTP 端口无 binding），
         // 从 pingora_ports 补全 HTTP 端口，保证 get 路径的 ports/access 与 create 一致。
@@ -108,6 +109,7 @@ impl AppService {
             started_at: status.started_at,
             ports,
             conditions,
+            health,
             resource_version: status.resource_version,
         }
     }
