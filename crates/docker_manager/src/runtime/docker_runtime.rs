@@ -499,6 +499,33 @@ impl ContainerRuntime for DockerRuntime {
         Ok(())
     }
 
+    async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        // Docker 无 PVC 概念；destroy = 删除 app workspace 目录（对应 K8s 删 PVC + subvolume）。
+        // 路径同 service 层 get_container_app_dir 的 Docker 分支：RCODER_WORKSPACE_ROOT/{app_id}
+        // （默认 /app/project_workspace/apps，与 AppManagerConfig::get_workspace_root 同源）。
+        // 幂等：目录不存在返回 Ok（对应 K8s PVC 404→Ok）。app_id 经 service 层 validate_app_id
+        // 校验（DNS-1123，无 .. / 路径穿越），join 安全。
+        let ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
+            .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
+        let app_dir = std::path::Path::new(&ws_root).join(app_id);
+        if app_dir.exists() {
+            tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
+                ContainerRuntimeError::DockerError(format!(
+                    "destroy_app_pvc: remove {}: {}",
+                    app_dir.display(),
+                    e
+                ))
+            })?;
+            tracing::info!("[Docker] app workspace destroyed: {}", app_dir.display());
+        } else {
+            tracing::info!(
+                "[Docker] app workspace not found, destroy no-op (idempotent): {}",
+                app_dir.display()
+            );
+        }
+        Ok(())
+    }
+
     async fn get_deployment_status(
         &self,
         app_id: &str,

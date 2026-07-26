@@ -276,7 +276,7 @@ orphan 扫描（兜底，仅扫 K8s 计算资源）：
 
 **orphan 扫描是关键**：即使前面有序删除中途失败，最后一步 label 扫描保证不留**计算资源**孤儿。这是 operator-rs `delete_orphaned_resources` 的核心价值。
 
-Docker 后端：删容器 + 删网络 + 摘 pingora 路由 / host port；**保留** `app-workspace/{app_id}/` 目录（同理，`purge=true` 才删）。
+Docker 后端：删容器 + 删网络 + 摘 pingora 路由 / host port；**保留** `app-workspace/{app_id}/` 目录（`purge=true` 清内容留目录；彻底删目录走 `storage/destroy`）。
 
 ### 5.4 持久存储管理（v2 新增）
 
@@ -300,7 +300,7 @@ Docker 后端：删容器 + 删网络 + 摘 pingora 路由 / host port；**保�
   - `clear`：清空 PVC 根内容（code/data/logs）但**保留 subvolume 根目录**——删根会破坏 PV `csi.volumeAttributes.subvolumePath` → pod 重启挂载异常。
   - `destroy`：`pvcs().delete` 删 PVC → ceph-csi 回收 subvolume（配额释放）；删前等 `pvc-protection` finalizer 移除；删后 invalidate `subvolume_path_cache`。**仅删 per-app PVC**（`rcoder-app-{id}-workspace`），PVC 名白名单硬校验，绝不碰共享 PVC。**幂等**：PVC 已不存在也返回成功（允许 Java 重试/对账）。
   - **配额策略**：扩容走 `resize`（patch `requests.storage` → external-resizer `subvolume resize`，只扩不缩）；**配额回收只能 `destroy`**（resize 缩不了）。
-- **Docker**：`clear` 和 `destroy` 都删除 `app-workspace/{app_id}/` 目录（Docker 无 PVC 概念，两者等价）。
+- **Docker**：`clear` 清空 `app-workspace/{app_id}/` 内容（留目录，可恢复）；`destroy` 删除整个目录（`remove_dir_all`，不可逆）。Docker 无 PVC，两者均作用于宿主机 bind-mount 目录。
 
 **重建复用**：若 Java 用同一 `app_id` 重新 `POST /apps`，由于存储目录还在，新应用会自动挂回旧数据（适合"误删应用、找回数据"场景）。若需要干净起点，先 `storage/clear` 再 create（或 `storage/destroy` 彻底销毁 PVC 后重建，得到全新 subvolume）。
 
