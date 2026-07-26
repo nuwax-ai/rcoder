@@ -9,7 +9,7 @@ use std::fmt;
 
 use shared_types::error_codes::{
     ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_CONFLICT, ERR_FILE_NOT_FOUND,
-    ERR_INVALID_STATE, ERR_OPERATION_NOT_SUPPORTED, ERR_VALIDATION,
+    ERR_INVALID_STATE, ERR_VALIDATION,
 };
 
 /// app 操作级错误（携带业务错误码，供 handler 精确映射 HTTP）。
@@ -26,8 +26,6 @@ pub enum AppOperationError {
     AlreadyExists(String),
     /// 操作状态非法，如未 delete 就清空存储（409 ERR_INVALID_STATE）
     InvalidState(String),
-    /// 操作不支持（400 ERR_OPERATION_NOT_SUPPORTED）
-    NotSupported(String),
     /// 文件/目录不存在（404 ERR_FILE_NOT_FOUND）
     FileNotFound(String),
     /// 请求参数校验失败（400 ERR_VALIDATION）
@@ -45,7 +43,6 @@ impl AppOperationError {
             Self::NotFound(_) => ERR_APP_NOT_FOUND,
             Self::AlreadyExists(_) => ERR_APP_ALREADY_EXISTS,
             Self::InvalidState(_) => ERR_INVALID_STATE,
-            Self::NotSupported(_) => ERR_OPERATION_NOT_SUPPORTED,
             Self::FileNotFound(_) => ERR_FILE_NOT_FOUND,
             Self::Validation(_) => ERR_VALIDATION,
             Self::Backend(_) => ERR_BACKEND_ERROR,
@@ -59,7 +56,6 @@ impl AppOperationError {
             Self::NotFound(m)
             | Self::AlreadyExists(m)
             | Self::InvalidState(m)
-            | Self::NotSupported(m)
             | Self::FileNotFound(m)
             | Self::Validation(m)
             | Self::Backend(m)

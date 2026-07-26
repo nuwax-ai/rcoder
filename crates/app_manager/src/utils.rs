@@ -242,8 +242,6 @@ pub(super) fn derive_conditions(status: &DeploymentStatus) -> Vec<Condition> {
             mk("Progressing", "True", Some("Starting"), None),
             mk("Ready", "False", Some("Starting"), None),
         ],
-        AppStatus::Stopping => vec![mk("Progressing", "True", Some("Stopping"), None)],
-        AppStatus::Deleting => vec![mk("Progressing", "True", Some("Deleting"), None)],
         AppStatus::Created => vec![mk("Ready", "False", Some("Created"), None)],
     }
 }

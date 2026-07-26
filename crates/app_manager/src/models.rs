@@ -188,11 +188,9 @@ pub struct UpdateAppRequest {
 pub struct LogParams {
     /// 返回最后 N 行
     pub tail: Option<u32>,
-    /// 是否持续输出
-    pub follow: Option<bool>,
     /// 是否显示时间戳
     pub timestamps: Option<bool>,
-    /// 起始时间
+    /// 起始时间（暂未透传到 runtime；实时流走 `GET /apps/{id}/logs/stream` WebSocket）
     pub since: Option<String>,
 }
 
@@ -206,10 +204,8 @@ pub enum AppStatus {
     Created,
     Starting,
     Running,
-    Stopping,
     Stopped,
     Error,
-    Deleting,
 }
 
 /// 条件（K8s conditions 风格，read 时由 DeploymentStatus 派生，用于诊断）

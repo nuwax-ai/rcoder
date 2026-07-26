@@ -20,12 +20,13 @@ impl AppService {
         app_id: &str,
         req: ResetDbPasswordRequest,
     ) -> AppResult<()> {
-        self.ensure_app_running(app_id).await?;
+        validate_app_id(app_id)?;
         if req.new_password.is_empty() {
             return Err(AppOperationError::Validation(
                 "new_password must not be empty".to_string(),
             ));
         }
+        self.ensure_app_running(app_id).await?;
         // 容器内 sh 展开 $POSTGRES_USER(镜像 ENV,create 时用户 env 覆盖);rcoder 无状态不知值。
         // psql -U $POSTGRES_USER 本地 trust 认证(start-app.sh initdb --auth-local=trust)免密。
         // SQL 字符串里 ' 转义为 ''(防注入)。ON_ERROR_STOP=1:出错 exit≠0。
@@ -54,11 +55,12 @@ impl AppService {
         app_id: &str,
         req: CreateDatabaseRequest,
     ) -> AppResult<()> {
-        self.ensure_app_running(app_id).await?;
+        validate_app_id(app_id)?;
         validate_pg_identifier(&req.database)?;
         if let Some(owner) = &req.owner {
             validate_pg_identifier(owner)?;
         }
+        self.ensure_app_running(app_id).await?;
         // 先查是否已存在(check-then-act): PG 不支持 CREATE DATABASE IF NOT EXISTS、也不能进事务/DO 块。
         // 故先 SELECT pg_database 判定, 避免 CREATE 失败后靠 stderr 文本(随 PG 版本/locale 变)判"已存在"。
         if self.database_exists(app_id, &req.database).await? {
@@ -166,7 +168,8 @@ impl AppService {
     /// Stopped/Starting 等给 InvalidState 友好错误而非让 exec 失败（exec 在 Stopped 时
     /// 报容器不存在的 Backend 错误，对用户不友好）。reset_db_password / create_database 共用。
     async fn ensure_app_running(&self, app_id: &str) -> AppResult<()> {
-        validate_app_id(app_id)?;
+        // validate_app_id 由调用方（reset_db_password/create_database）先做（Fail Fast：参数校验
+        // 在 K8s API 调用前，非法 app_id 不浪费 RTT）。此方法仅做 phase 检查（单一职责）。
         let status = self.fetch_runtime_status_or_err(app_id).await?;
         if status.phase != "Running" {
             return Err(AppOperationError::InvalidState(format!(

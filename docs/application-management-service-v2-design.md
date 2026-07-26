@@ -443,10 +443,10 @@ pub struct Condition {
 
 ### 6.3 `AppStatus` 枚举（headline，Java 友好）
 
-保留 v1 枚举不变（Java 已依赖语义）：
+v2 简化为 6 状态（删 v1 的 `Stopping`/`Deleting`——当前 delete 同步完成不产生这俩，`phase_to_status` 也无映射；未来改异步删除可再启用）：
 
 ```rust
-pub enum AppStatus { Created, Starting, Running, Stopping, Stopped, Error, Deleting }
+pub enum AppStatus { Created, Starting, Running, Stopped, Error }
 ```
 
 派生规则（read 时，对应 Epinio `fetch()` 的派生逻辑）：
@@ -748,14 +748,16 @@ rcoder 访问 app 数据:  {RCODER_CEPHFS_ROOT}/{subvolumePath}/<app 内相对�
 | code | HTTP | 场景 |
 |---|---|---|
 | `ERR_VALIDATION` | 400 | 参数缺失/非法（如 path traversal、port 重复、资源 Quantity 非法） |
-| `ERR_OPERATION_NOT_SUPPORTED` | 400 | K8s 后端尝试改不可变字段（如 name） |
+| `ERR_OPERATION_NOT_SUPPORTED` | 400 | **未实现**（update 改 name 直接忽略不报错）；保留错误码供未来不可变字段校验 |
 | `ERR_APP_NOT_FOUND` | 404 | 应用不存在（Deployment 404） |
 | `ERR_FILE_NOT_FOUND` | 404 | 文件管理目标不存在 |
 | `ERR_APP_ALREADY_EXISTS` | 409 | 创建时 Deployment 已存在 |
 | `ERR_INVALID_STATE` | 409 | 状态不允许操作（如 Deleting 中又 start；对运行中应用 storage/clear 或 storage/destroy） |
 | `ERR_BACKEND_ERROR` | 500 | K8s/Docker API 调用失败（透传 source） |
-| `ERR_IMAGE_PULL_FAILED` | 502 | 镜像拉取失败（ImagePullBackOff） |
-| `ERR_RESOURCE_EXHAUSTED` | 503 | 集群资源不足（调度失败） |
+| `ERR_IMAGE_PULL_FAILED` | 502 | 镜像拉取失败（ImagePullBackOff）—— **异步模型下不作为同步错误码**¹ |
+| `ERR_RESOURCE_EXHAUSTED` | 503 | 集群资源不足（调度失败）—— **同上**¹ |
+
+> ¹ **异步模型说明（C1）**：create 异步返 `Starting`（不等 ready），镜像拉取失败/资源不足是**异步**发生——调用方经 `GET /apps/{id}` 轮询发现 `status=Error` + `message`（含 `ImagePullBackOff` 等 reason，由 `extract_reason` 识别），**不作为 create 同步错误码返回**。当前实现塌缩为 `ERR_BACKEND_ERROR`（500，retryable）；`ERR_IMAGE_PULL_FAILED`/`ERR_RESOURCE_EXHAUSTED` 的 variant + 精确映射暂未实现，列此供未来（读路径不 raise，需另设计暴露方式）。
 
 > 常量定义在 `shared_types_i18n::error_codes`，HTTP 映射在 `shared_types::AppError::status_from_code`，retryable 在 `is_retryable_code`。
 
@@ -764,7 +766,7 @@ rcoder 访问 app 数据:  {RCODER_CEPHFS_ROOT}/{subvolumePath}/<app 内相对�
 operator-rs 没做好的"retryable vs terminal"分类，v2 用 `is_retryable_code(code)` 明确：
 
 - **可重试**（Java 可指数退避重发）：`ERR_BACKEND_ERROR`(瞬时 5xx/timeout) / `ERR_RESOURCE_EXHAUSTED` / `ERR_IMAGE_PULL_FAILED`(临时 registry 故障)
-- **终态**（重发无用，需修改请求）：`ERR_VALIDATION` / `ERR_OPERATION_NOT_SUPPORTED` / `ERR_APP_NOT_FOUND` / `ERR_APP_ALREADY_EXISTS` / `ERR_INVALID_STATE` / `ERR_FILE_NOT_FOUND`
+- **终态**（重发无用，需修改请求）：`ERR_VALIDATION` / `ERR_APP_NOT_FOUND` / `ERR_APP_ALREADY_EXISTS` / `ERR_INVALID_STATE` / `ERR_FILE_NOT_FOUND`
 
 `retryable` 是错误码的固有属性，**不在响应体重复**（HttpResult 不改）；Java 按 `code` 调 `is_retryable_code` 或本地查表决策。
 
