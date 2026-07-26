@@ -1,4 +1,13 @@
 //! ContainerRuntime trait 定义
+//!
+//! 阶段3 ISP 拆分: 原 `ContainerRuntime` 32 方法拆为 3 个聚焦子 trait + 1 个聚合 super-trait:
+//! - [`AgentContainerRuntime`] (Group A, 13): agent 容器生命周期 (create/stop/find/list/health).
+//! - [`WorkspaceRuntime`]    (Group B, 5):  workspace/file-server PVC 解析 (resolve/ensure/destroy).
+//! - [`UserAppDeploymentRuntime`] (Group C, 14): UserApp Deployment CRUD (create/patch/scale/logs/exec).
+//! - [`ContainerRuntime`]:    聚合 super-trait = A + B + C; 旧调用点零改 (`Arc<dyn ContainerRuntime>`).
+//! - [`UserAppRuntime`]:      B + C 视图; 供 app_manager 收紧 (不需 agent 能力).
+//!
+//! 默认实现逐字照搬原 trait; K8s/Docker 各自的 override 也保留原 method body.
 
 use async_trait::async_trait;
 use shared_types::{ContainerBasicInfo, ServiceType};
@@ -14,12 +23,18 @@ use super::types::{
 // app_manager 多处使用，trait 方法 stream_app_logs 用到）
 pub use tokio::sync::mpsc;
 
-/// Abstraction trait for container runtimes (Docker, Kubernetes, etc.)
+// ============================================================================
+// Group A — AgentContainerRuntime (13 方法)
+// agent 容器生命周期: create / find / stop / list / health / sync / inplace-restart.
+// 三个 *_by_identifier 方法保留行为默认实现 (委派 find / get_container_info / stop_container).
+// ============================================================================
+
+/// Agent 容器生命周期运行时 (Group A)。
 ///
-/// This trait follows the Interface Segregation Principle - it provides
-/// a lean interface with only the methods that callers actually need.
+/// 用于 rcoder 主服务对 agent pod/container (WebAgentRunner / ComputerAgentRunner) 的管理。
+/// 不含 UserApp Deployment 或 workspace PVC 解析能力。
 #[async_trait]
-pub trait ContainerRuntime: Send + Sync {
+pub trait AgentContainerRuntime: Send + Sync {
     /// Create and start a container
     async fn create_container(
         &self,
@@ -124,6 +139,38 @@ pub trait ContainerRuntime: Send + Sync {
     /// Health check - verify runtime is accessible
     async fn health_check(&self) -> ContainerRuntimeResult<()>;
 
+    /// 原地重启 agent 容器（exec SIGTERM PID 1 → kubelet restartPolicy 重启容器，卷不 unstage → 快）。
+    ///
+    /// 用于 agent-runner pod 重启，避免 delete+recreate 触发 CephFS `NodeStageVolume` re-stage（~60s）。
+    /// K8s：exec 进 agent 容器 `kill -TERM 1` → agent_runner SIGTERM handler 优雅退出 → kubelet
+    /// `restartPolicy=Always` 原地重启容器（PID 1 = agent_runner，已实测确认）。
+    /// 默认 NotImplemented；调用方（pod_restart）失败应回落 destroy+recreate。
+    async fn restart_container_inplace(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        let _ = (identifier, service_type);
+        Err(ContainerRuntimeError::ConfigurationError(
+            "restart_container_inplace not supported by this runtime".to_string(),
+        ))
+    }
+}
+
+// ============================================================================
+// Group B — WorkspaceRuntime (5 方法)
+// workspace / file-server PVC 解析与生命周期:
+//   resolve_workspace_path / resolve_workspace_path_by_pvcname / list_workspace_identifiers /
+//   ensure_workspace / destroy_app_pvc.
+// 默认实现: resolve_*=Ok(None), list=Ok(vec![]), ensure/destroy=Ok(()) (Docker / 未实现).
+// ============================================================================
+
+/// Workspace (per-agent / per-app PVC) 解析与生命周期运行时 (Group B)。
+///
+/// 用于 file-server 经 rcoder 挂根聚合访问 agent 数据 (不启动 agent pod 也能服务),
+/// 以及 app_manager 维护 per-app PVC (含孤儿检测 / destroy).
+#[async_trait]
+pub trait WorkspaceRuntime: Send + Sync {
     /// 解析 agent workspace 在 rcoder 主进程可访问的路径 (阶段2 挂根聚合)。
     ///
     /// K8s 模式: 返回 per-agent PVC 的 CephFS subvolume 聚合路径
@@ -186,15 +233,20 @@ pub trait ContainerRuntime: Send + Sync {
     async fn destroy_app_pvc(&self, _app_id: &str) -> ContainerRuntimeResult<()> {
         Ok(()) // default no-op (Docker / 未实现)
     }
+}
 
-    // ====================================================================
-    // Deployment 生命周期（UserApp 专用，agent 路径不调用）
-    //
-    // K8s 由 KubernetesRuntime 实现真实 Deployment 操作；
-    // Docker 由 DockerRuntime 做等价语义映射（容器 create/stop/start）。
-    // 默认实现返回 ConfigurationError，强制具体 runtime 按需实现。
-    // ====================================================================
+// ============================================================================
+// Group C — UserAppDeploymentRuntime (14 方法)
+// UserApp Deployment CRUD: create/patch/scale/restart/delete + status/logs/events/exec.
+// 默认实现: 核心操作返 ConfigurationError; 容器快照/events/resource/prerequisites Ok(default).
+// ============================================================================
 
+/// UserApp Deployment 运行时 (Group C)。
+///
+/// K8s 由 `KubernetesRuntime` 实现真实 Deployment 操作；
+/// Docker 由 `DockerRuntime` 做等价语义映射（容器 create/stop/start）。
+#[async_trait]
+pub trait UserAppDeploymentRuntime: Send + Sync {
     /// 创建并启动一个 Deployment（K8s）或等价容器（Docker）
     async fn create_deployment(
         &self,
@@ -234,23 +286,6 @@ pub trait ContainerRuntime: Send + Sync {
         let _ = app_id;
         Err(ContainerRuntimeError::ConfigurationError(
             "restart_deployment not supported by this runtime".to_string(),
-        ))
-    }
-
-    /// 原地重启 agent 容器（exec SIGTERM PID 1 → kubelet restartPolicy 重启容器，卷不 unstage → 快）。
-    ///
-    /// 用于 agent-runner pod 重启，避免 delete+recreate 触发 CephFS `NodeStageVolume` re-stage（~60s）。
-    /// K8s：exec 进 agent 容器 `kill -TERM 1` → agent_runner SIGTERM handler 优雅退出 → kubelet
-    /// `restartPolicy=Always` 原地重启容器（PID 1 = agent_runner，已实测确认）。
-    /// 默认 NotImplemented；调用方（pod_restart）失败应回落 destroy+recreate。
-    async fn restart_container_inplace(
-        &self,
-        identifier: &str,
-        service_type: &ServiceType,
-    ) -> ContainerRuntimeResult<()> {
-        let _ = (identifier, service_type);
-        Err(ContainerRuntimeError::ConfigurationError(
-            "restart_container_inplace not supported by this runtime".to_string(),
         ))
     }
 
@@ -368,4 +403,44 @@ pub trait ContainerRuntime: Send + Sync {
     async fn validate_app_prerequisites(&self) -> ContainerRuntimeResult<()> {
         Ok(())
     }
+}
+
+// ============================================================================
+// 聚合 super-trait — ContainerRuntime (A + B + C) / UserAppRuntime (B + C 视图)
+// ============================================================================
+
+/// UserApp 视图: 同时具备 workspace (B) + UserApp Deployment (C) 能力, **不含 agent (A)**.
+///
+/// 供 app_manager 类型收紧 (file_server_embed 同理用 [`WorkspaceRuntime`] 单独收紧):
+/// 任何调用点声明 `Arc<dyn UserAppRuntime>` 即可在编译期阻止使用 agent 方法 (Group A),
+/// 暴露 ISP 违规 (设计上 app_manager 不该依赖 agent 能力).
+///
+/// **必须**作为 [`ContainerRuntime`] 的声明式 super-trait (而非仅 blanket impl) 才能让
+/// trait 对象经 trait upcasting (Rust 1.86+) 从 `dyn ContainerRuntime` 收缩到 `dyn UserAppRuntime` ——
+/// blanket impl 只对具体类型生效, 不改变 trait 对象的 super-trait 链.
+pub trait UserAppRuntime: WorkspaceRuntime + UserAppDeploymentRuntime {}
+impl<T> UserAppRuntime for T where T: WorkspaceRuntime + UserAppDeploymentRuntime {}
+
+/// 聚合 super-trait: 同时具备 agent / workspace / UserApp 三类能力。
+///
+/// 旧调用点 (`Arc<dyn ContainerRuntime>`) 零改 —— 任何 impl A+B+C 的具体类型
+/// (KubernetesRuntime / DockerRuntime) 自动 impl ContainerRuntime:
+///   - A/B/C 由具体 impl 块提供;
+///   - UserAppRuntime 由上方 blanket impl 自动提供 (B+C 已满足);
+///   - ContainerRuntime 由下方 blanket impl 自动提供 (A+B+C+UserAppRuntime 已满足).
+///
+/// trait 对象经 trait upcasting (Rust 1.86+) 可收缩到任一子 trait:
+///   `Arc<dyn ContainerRuntime>` → `Arc<dyn AgentContainerRuntime>` / `Arc<dyn WorkspaceRuntime>`
+///   / `Arc<dyn UserAppDeploymentRuntime>` / `Arc<dyn UserAppRuntime>` 均可直接 upcast.
+pub trait ContainerRuntime: AgentContainerRuntime
+    + WorkspaceRuntime
+    + UserAppDeploymentRuntime
+    + UserAppRuntime {}
+
+// Blanket impl: 任何 A+B+C+UserAppRuntime 类型自动 impl ContainerRuntime.
+// Rust 不凭 super-trait bounds 自动 impl (即使 trait 体为空), 需显式声明 blanket impl.
+// 含 `?Sized` 以覆盖 `dyn ContainerRuntime` 自身 (理论上可被嵌套 upcast).
+impl<T> ContainerRuntime for T where
+    T: AgentContainerRuntime + WorkspaceRuntime + UserAppDeploymentRuntime + UserAppRuntime + ?Sized
+{
 }

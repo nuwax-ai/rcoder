@@ -19,9 +19,7 @@ use moka::sync::Cache;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use container_runtime_api::{
-    ContainerRuntime, ExposeType as RtExposeType, HttpExpose,
-};
+use container_runtime_api::{ExposeType as RtExposeType, HttpExpose, UserAppRuntime};
 use rcoder_proxy::PingoraProxyService;
 
 use super::config::{AppAccessMode, AppManagerConfig};
@@ -31,7 +29,9 @@ use super::utils::*;
 /// 应用管理服务（Docker / K8s 统一）
 pub struct AppService {
     pub(crate) config: AppManagerConfig,
-    pub(crate) runtime: Arc<dyn ContainerRuntime>,
+    /// ISP 收紧 (阶段3): app_manager 只需 workspace (B) + UserApp Deployment (C) 能力,
+    /// 不依赖 agent 容器生命周期 (A) —— 类型声明即编译期约束 (调用 agent 方法会编译错).
+    pub(crate) runtime: Arc<dyn UserAppRuntime>,
     /// Pingora 代理（Docker 模式用于注册 HTTP backend；K8s 模式通常为 None）
     pub(crate) pingora: Option<Arc<PingoraProxyService>>,
     /// 路径解析器缓存（单例；Docker 模式将 rcoder 容器内路径解析为宿主机路径）
@@ -48,7 +48,7 @@ impl AppService {
     /// 创建新的应用管理服务
     pub async fn new(
         config: AppManagerConfig,
-        runtime: Arc<dyn ContainerRuntime>,
+        runtime: Arc<dyn UserAppRuntime>,
         pingora: Option<Arc<PingoraProxyService>>,
     ) -> AppResult<Self> {
         let path_resolver: Cache<String, Arc<HostPathResolver>> =

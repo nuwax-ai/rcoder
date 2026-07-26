@@ -5,10 +5,10 @@
 
 use async_trait::async_trait;
 use container_runtime_api::{
-    AppPortStatus, ContainerCreateParams, ContainerLogEntry, ContainerRuntime,
+    AgentContainerRuntime, AppPortStatus, ContainerCreateParams, ContainerLogEntry,
     ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot,
-    DeploymentStatus,
-    ExposeType, RemovedContainerInfo, RuntimeContainerInfo,
+    DeploymentStatus, ExposeType, RemovedContainerInfo, RuntimeContainerInfo,
+    UserAppDeploymentRuntime, WorkspaceRuntime,
 };
 use moka::future::Cache;
 use shared_types::{ContainerBasicInfo, ServiceType};
@@ -39,7 +39,7 @@ impl DockerRuntime {
 }
 
 #[async_trait]
-impl ContainerRuntime for DockerRuntime {
+impl AgentContainerRuntime for DockerRuntime {
     async fn create_container(
         &self,
         params: ContainerCreateParams,
@@ -236,7 +236,44 @@ impl ContainerRuntime for DockerRuntime {
         })?;
         Ok(())
     }
+}
 
+/// Docker 不实现 WorkspaceRuntime 的 `resolve_*` / `list_workspace_identifiers` / `ensure_workspace`
+/// (file-server 经 trait upcast 拿到 DockerRuntime 时这些方法命中 trait 默认 Ok(None)/Ok(vec![])/Ok(()),
+/// 走 LocalWorkspaceResolver 降级 —— 符合 Docker 模式设计)。
+/// **仅 `destroy_app_pvc` 重写** (Docker 模式 destroy = 删 app workspace 目录, 对应 K8s 删 PVC+subvolume).
+#[async_trait]
+impl WorkspaceRuntime for DockerRuntime {
+    async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        // Docker 无 PVC 概念；destroy = 删除 app workspace 目录（对应 K8s 删 PVC + subvolume）。
+        // 路径同 service 层 get_container_app_dir 的 Docker 分支：RCODER_WORKSPACE_ROOT/{app_id}
+        // （默认 /app/project_workspace/apps，与 AppManagerConfig::get_workspace_root 同源）。
+        // 幂等：目录不存在返回 Ok（对应 K8s PVC 404→Ok）。app_id 经 service 层 validate_app_id
+        // 校验（DNS-1123，无 .. / 路径穿越），join 安全。
+        let ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
+            .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
+        let app_dir = std::path::Path::new(&ws_root).join(app_id);
+        if app_dir.exists() {
+            tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
+                ContainerRuntimeError::DockerError(format!(
+                    "destroy_app_pvc: remove {}: {}",
+                    app_dir.display(),
+                    e
+                ))
+            })?;
+            tracing::info!("[Docker] app workspace destroyed: {}", app_dir.display());
+        } else {
+            tracing::info!(
+                "[Docker] app workspace not found, destroy no-op (idempotent): {}",
+                app_dir.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl UserAppDeploymentRuntime for DockerRuntime {
     // ===== Deployment 生命周期（UserApp 专用，Docker 语义映射）=====
     // Docker 无 Deployment 概念，用容器 create/stop/start 做等价映射。
     // app 容器加入主网络（与 rcoder 同网络），HTTP 端口由 app_manager 通过
@@ -496,33 +533,6 @@ impl ContainerRuntime for DockerRuntime {
                 }),
             )
             .await;
-        Ok(())
-    }
-
-    async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
-        // Docker 无 PVC 概念；destroy = 删除 app workspace 目录（对应 K8s 删 PVC + subvolume）。
-        // 路径同 service 层 get_container_app_dir 的 Docker 分支：RCODER_WORKSPACE_ROOT/{app_id}
-        // （默认 /app/project_workspace/apps，与 AppManagerConfig::get_workspace_root 同源）。
-        // 幂等：目录不存在返回 Ok（对应 K8s PVC 404→Ok）。app_id 经 service 层 validate_app_id
-        // 校验（DNS-1123，无 .. / 路径穿越），join 安全。
-        let ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
-            .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
-        let app_dir = std::path::Path::new(&ws_root).join(app_id);
-        if app_dir.exists() {
-            tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
-                ContainerRuntimeError::DockerError(format!(
-                    "destroy_app_pvc: remove {}: {}",
-                    app_dir.display(),
-                    e
-                ))
-            })?;
-            tracing::info!("[Docker] app workspace destroyed: {}", app_dir.display());
-        } else {
-            tracing::info!(
-                "[Docker] app workspace not found, destroy no-op (idempotent): {}",
-                app_dir.display()
-            );
-        }
         Ok(())
     }
 

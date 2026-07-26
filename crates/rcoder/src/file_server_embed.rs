@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use container_runtime_api::ContainerRuntime;
+use container_runtime_api::WorkspaceRuntime;
 use file_server::error::AppResult;
 use file_server::{
     Config, FileServer, SubvolumeWorkspaceResolver, WorkspacePathResolver, WorkspaceResolver,
@@ -20,16 +20,19 @@ use file_server::{
 use shared_types::ServiceType;
 use tracing::{info, warn};
 
-/// 包 `Arc<dyn ContainerRuntime>` 实现 file-server 的 [`WorkspacePathResolver`] 窄 trait。
+/// 包 `Arc<dyn WorkspaceRuntime>` 实现 file-server 的 [`WorkspacePathResolver`] 窄 trait。
+///
+/// ISP 收紧 (阶段3): file-server 仅需 workspace 能力 (resolve/ensure), 不依赖 agent 容器
+/// 生命周期或 UserApp Deployment —— 类型声明即编译期约束。
 ///
 /// `resolve_workspace_path` 失败 (K8s API 抖动 / PVC 未 Bound / Docker 模式) → 返回 `None`
 /// → [`SubvolumeWorkspaceResolver`] 降级到 LocalWorkspaceResolver (fail-open, 不阻断服务)。
 pub(crate) struct ContainerRuntimePathResolver {
-    runtime: Arc<dyn ContainerRuntime>,
+    runtime: Arc<dyn WorkspaceRuntime>,
 }
 
 impl ContainerRuntimePathResolver {
-    pub(crate) fn new(runtime: Arc<dyn ContainerRuntime>) -> Self {
+    pub(crate) fn new(runtime: Arc<dyn WorkspaceRuntime>) -> Self {
         Self { runtime }
     }
 }
@@ -120,7 +123,7 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
 
 /// 按 service_type 算 lazy_migrate 参数并执行 (async)。
 async fn run_lazy_migrate(
-    runtime: &Arc<dyn ContainerRuntime>,
+    runtime: &Arc<dyn WorkspaceRuntime>,
     identifier: &str,
     service_type: &ServiceType,
 ) {
@@ -129,8 +132,15 @@ async fn run_lazy_migrate(
         ServiceType::ComputerAgentRunner => ("RCODER_COMPUTER_WORKSPACE_PVC_NAME", vec![], true),
         _ => return, // UserApp 不经 file-server (app_manager 直管)
     };
+    // lazy_migrate 取 Arc by-value (trait upcast 需按值), clone 廉价 (原子计数).
     crate::workspace_migrate::lazy_migrate(
-        runtime, pvc_env, &subpath, identifier, service_type, identifier, dst_at_root,
+        Arc::clone(runtime),
+        pvc_env,
+        &subpath,
+        identifier,
+        service_type,
+        identifier,
+        dst_at_root,
     )
     .await;
 }
@@ -140,7 +150,7 @@ async fn run_lazy_migrate(
 /// 构造 [`SubvolumeWorkspaceResolver`] (包 ContainerRuntime) + [`Config::load`] +
 /// `tokio::spawn` serve (端口 60000)。任何阶段失败只 warn, 不阻断 rcoder 启动
 /// (file-server 降级, rcoder 主服务不受影响)。
-pub(crate) async fn spawn_embedded_file_server(runtime: Arc<dyn ContainerRuntime>) {
+pub(crate) async fn spawn_embedded_file_server(runtime: Arc<dyn WorkspaceRuntime>) {
     let path_resolver = Arc::new(ContainerRuntimePathResolver::new(runtime));
     let fs_resolver: Arc<dyn WorkspaceResolver> =
         Arc::new(SubvolumeWorkspaceResolver::new(path_resolver));

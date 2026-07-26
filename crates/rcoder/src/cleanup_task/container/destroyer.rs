@@ -148,8 +148,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use container_runtime_api::{
-        ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
-        RuntimeContainerInfo,
+        AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult,
+        RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
     };
     use rcoder_proxy::PingoraProxyService;
     use rcoder_proxy::config::ProxyConfig;
@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl ContainerRuntime for RecordingRuntime {
+    impl AgentContainerRuntime for RecordingRuntime {
         async fn create_container(
             &self,
             _params: ContainerCreateParams,
@@ -290,6 +290,12 @@ mod tests {
             Ok(())
         }
     }
+
+    // 空 impl 块继承默认实现 → RecordingRuntime impl B+C → 自动 impl ContainerRuntime (super-trait bounds)
+    #[async_trait]
+    impl WorkspaceRuntime for RecordingRuntime {}
+    #[async_trait]
+    impl UserAppDeploymentRuntime for RecordingRuntime {}
 
     #[tokio::test]
     async fn destroyer_routes_stop_through_runtime_trait_and_cleans_vnc() {

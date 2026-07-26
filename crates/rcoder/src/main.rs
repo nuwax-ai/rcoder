@@ -134,7 +134,9 @@ async fn main() -> anyhow::Result<()> {
     // 复用本进程 ContainerRuntime 解析 per-agent subvolume 聚合路径 (file-server 不加 kube 依赖)。
     // 配套: start-services.sh 须检查本 env, 嵌入时不再单独启 file-server 二进制 (避免端口冲突)。
     if shared_types::FeatureFlags::get().embed_file_server {
-        file_server_embed::spawn_embedded_file_server(Arc::clone(&runtime)).await;
+        // spawn_embedded_file_server 取 Arc<dyn WorkspaceRuntime>; trait upcast 需两步.
+        let ws_runtime: Arc<dyn container_runtime_api::WorkspaceRuntime> = runtime.clone();
+        file_server_embed::spawn_embedded_file_server(ws_runtime).await;
     }
 
     let state = Arc::new(

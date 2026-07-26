@@ -153,7 +153,8 @@ impl VncBackendResolver for CachedDockerResolver {
 mod tests {
     use super::*;
     use container_runtime_api::{
-        ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, RuntimeContainerInfo,
+        AgentContainerRuntime, ContainerCreateParams, ContainerRuntime, ContainerRuntimeError,
+        ContainerRuntimeResult, RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
     };
     use shared_types::ContainerBasicInfo;
 
@@ -161,7 +162,7 @@ mod tests {
     struct StubRuntime;
 
     #[async_trait]
-    impl ContainerRuntime for StubRuntime {
+    impl AgentContainerRuntime for StubRuntime {
         async fn create_container(
             &self,
             _params: ContainerCreateParams,
@@ -197,6 +198,12 @@ mod tests {
             Ok(())
         }
     }
+
+    // 空 impl 块继承默认实现 → StubRuntime impl B+C → 自动 impl ContainerRuntime (super-trait bounds)
+    #[async_trait]
+    impl WorkspaceRuntime for StubRuntime {}
+    #[async_trait]
+    impl UserAppDeploymentRuntime for StubRuntime {}
 
     fn stub_runtime() -> Arc<dyn ContainerRuntime> {
         Arc::new(StubRuntime)

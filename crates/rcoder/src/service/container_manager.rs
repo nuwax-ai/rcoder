@@ -190,8 +190,12 @@ async fn create_container_for_request(
     // file-server ensure_and_resolve 也会做 (幂等: dst 非空跳过), 两者不冲突。
     // 仅非共享容器 (pod_id=None, project-level); 共享容器保持共享 PVC。
     if options.pod_id.is_none() {
+        // lazy_migrate 取 Arc<dyn WorkspaceRuntime> by-value; trait upcast 需两步:
+        // ① clone 得 Arc<dyn ContainerRuntime> (原类型); ② 显式类型归属触发 unsized coercion.
+        let cloned: Arc<dyn container_runtime_api::ContainerRuntime> = Arc::clone(options.runtime);
+        let ws_runtime: Arc<dyn container_runtime_api::WorkspaceRuntime> = cloned;
         crate::workspace_migrate::lazy_migrate(
-            options.runtime,
+            ws_runtime,
             "RCODER_WORKSPACE_PVC_NAME",
             &["workspace"],
             options.project_id,

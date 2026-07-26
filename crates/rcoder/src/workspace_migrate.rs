@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use container_runtime_api::ContainerRuntime;
+use container_runtime_api::WorkspaceRuntime;
 use shared_types::ServiceType;
 use tracing::{debug, info, warn};
 
@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 /// (WaitForFirstConsumer 需 Pod 调度)。重试等 ceph-csi provision 完成 (典型秒级,
 /// 慢调度可达 30s+)。Web/Computer `create_container` 等 Pod Ready, 首次即 Bound, 不实际重试。
 async fn resolve_dst_with_retry(
-    runtime: &Arc<dyn ContainerRuntime>,
+    runtime: &Arc<dyn WorkspaceRuntime>,
     identifier: &str,
     service_type: &ServiceType,
 ) -> Option<String> {
@@ -67,8 +67,15 @@ async fn resolve_dst_with_retry(
 /// per-user PVC 根, skip 已存在)。原因: Computer agent 启动会装 `acp-agent` 到 PVC 根 (`/home/user`),
 /// rename 整个 `{user_id} → PVC 根` 会 ENOTEMPTY; 逐子项迁项目 `{cid}` (不存在 → 成功), agent 装的
 /// acp-agent 已存在自动 skip。Web/UserApp 不受影响 (单 leaf rename, dst 不存在, 不碰 agent 写)。
+///
+/// # 类型 (ISP 阶段3)
+/// 取 `Arc<dyn WorkspaceRuntime>` (按值): lazy_migrate 只用 workspace 方法 (resolve),
+/// 不需 agent/UserApp 能力。调用方传 `Arc<dyn ContainerRuntime>` 时, Rust trait upcasting
+/// (1.86+) 自动把 `Arc<dyn ContainerRuntime>` → `Arc<dyn WorkspaceRuntime>` (super-trait coercion).
+/// 按值而非 `&Arc` 是为绕过 `&Arc<dyn Sub>` → `&Arc<dyn Super>` 不自动 coercible 的限制
+/// (借用背后的临时值生命周期有歧义). Arc::clone 是原子计数, 廉价.
 pub async fn lazy_migrate(
-    runtime: &Arc<dyn ContainerRuntime>,
+    runtime: Arc<dyn WorkspaceRuntime>,
     shared_pvc_env: &str,
     shared_subpath: &[&str],
     identifier: &str,
@@ -104,7 +111,7 @@ pub async fn lazy_migrate(
         return;
     }
     // per-agent dst base: {cephfs_root}/{per-agent-subvol}; 等 PVC Bound (仅旧数据迁移才需)
-    let dst_base = match resolve_dst_with_retry(runtime, identifier, service_type).await {
+    let dst_base = match resolve_dst_with_retry(&runtime, identifier, service_type).await {
         Some(base) => PathBuf::from(base),
         None => return, // Docker 模式或 PVC 长时间未 Bound, 跳过 (数据仍在共享)
     };
@@ -231,4 +238,3 @@ pub(crate) async fn copy_dir_recursive_pub(
 ) -> std::io::Result<()> {
     copy_dir_recursive(src, dst).await
 }
-

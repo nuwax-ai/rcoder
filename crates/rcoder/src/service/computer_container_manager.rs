@@ -318,8 +318,12 @@ impl ComputerContainerManager {
         // lazy mv (双重保险): 覆盖"先调 rcoder (/computer/pod/ensure) 不经 file-server"场景。
         // file-server ensure_and_resolve 也会做 (幂等), 两者不冲突。仅 pod_id=None (隔离)。
         if options.pod_id.is_none() {
+            // lazy_migrate 取 Arc<dyn WorkspaceRuntime> by-value; trait upcast 需两步:
+            // ① clone 得 Arc<dyn ContainerRuntime> (原类型); ② 显式类型归属触发 unsized coercion.
+            let cloned: Arc<dyn container_runtime_api::ContainerRuntime> = Arc::clone(runtime);
+            let ws_runtime: Arc<dyn container_runtime_api::WorkspaceRuntime> = cloned;
             crate::workspace_migrate::lazy_migrate(
-                runtime,
+                ws_runtime,
                 "RCODER_COMPUTER_WORKSPACE_PVC_NAME",
                 &[],
                 &options.user_id,

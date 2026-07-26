@@ -9,9 +9,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
-    ContainerCreateParams, ContainerLogEntry, ContainerRuntime, ContainerRuntimeError,
+    AgentContainerRuntime, ContainerCreateParams, ContainerLogEntry, ContainerRuntimeError,
     ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus,
-    HttpExpose, RemovedContainerInfo, RuntimeContainerInfo,
+    HttpExpose, RemovedContainerInfo, RuntimeContainerInfo, UserAppDeploymentRuntime,
+    WorkspaceRuntime,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
@@ -428,7 +429,7 @@ fn read_app_expose_env() -> (Option<String>, Option<String>, HttpExpose) {
 
 #[cfg(feature = "kubernetes")]
 #[async_trait]
-impl ContainerRuntime for KubernetesRuntime {
+impl AgentContainerRuntime for KubernetesRuntime {
     async fn create_container(
         &self,
         params: ContainerCreateParams,
@@ -544,6 +545,21 @@ impl ContainerRuntime for KubernetesRuntime {
         Ok(())
     }
 
+    async fn restart_container_inplace(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        // 委派到 k8s_agent_pod 的 inherent 实现（沿用 get_deployment_status→get_app_status 的
+        // 「委派→inherent」模式）。不委派则命中 trait 默认（NotImplemented）→ pod_restart 回落慢路径。
+        self.restart_agent_container_inplace(identifier, service_type)
+            .await
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+#[async_trait]
+impl WorkspaceRuntime for KubernetesRuntime {
     async fn resolve_workspace_path(
         &self,
         identifier: &str,
@@ -623,6 +639,17 @@ impl ContainerRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        // 委派 K8sPvcOps::destroy_workspace_pvc (service_type=UserApp; 仅 UserApp 走此路径,
+        // agent PVC 永不删)。trait 方法默认 no-op, Docker 不覆盖。
+        self.destroy_workspace_pvc(app_id, &ServiceType::UserApp)
+            .await
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+#[async_trait]
+impl UserAppDeploymentRuntime for KubernetesRuntime {
     // ===== Deployment 生命周期（UserApp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====
     async fn create_deployment(
         &self,
@@ -719,26 +746,8 @@ impl ContainerRuntime for KubernetesRuntime {
         self.restart_app(app_id).await
     }
 
-    async fn restart_container_inplace(
-        &self,
-        identifier: &str,
-        service_type: &ServiceType,
-    ) -> ContainerRuntimeResult<()> {
-        // 委派到 k8s_agent_pod 的 inherent 实现（沿用 get_deployment_status→get_app_status 的
-        // 「委派→inherent」模式）。不委派则命中 trait 默认（NotImplemented）→ pod_restart 回落慢路径。
-        self.restart_agent_container_inplace(identifier, service_type)
-            .await
-    }
-
     async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         self.delete_app_resources(app_id).await
-    }
-
-    async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
-        // 委派 K8sPvcOps::destroy_workspace_pvc (service_type=UserApp; 仅 UserApp 走此路径,
-        // agent PVC 永不删)。trait 方法默认 no-op, Docker 不覆盖。
-        self.destroy_workspace_pvc(app_id, &ServiceType::UserApp)
-            .await
     }
 
     async fn get_deployment_status(
