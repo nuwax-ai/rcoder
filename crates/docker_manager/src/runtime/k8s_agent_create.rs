@@ -426,6 +426,14 @@ impl KubernetesRuntime {
                         }),
                         ..Default::default()
                     }),
+                    // 启用 TTY + stdin: 让 k9s / kubectl exec -it 能进交互式 shell 排查。
+                    // agent_runner 是服务进程(PID 1 监听 8086/50051, 不读 stdin), tty 不影响其运行;
+                    // 与 Docker 模式(container_creator.rs tty:true)对齐。
+                    // 副作用: PTY 下 agent 容器 stdout/stderr 合并成一条流(loki stream 标记失效),
+                    // 但 agent_runner 同时写文件日志(/app/logs, 经 log-collector sidecar 进 loki, 完整),
+                    // 故日志排查不受影响。
+                    tty: Some(true),
+                    stdin: Some(true),
                     ..Default::default()
                 }];
                 // sidecar(只来自 kubernetes_config.services[].sidecars)。
