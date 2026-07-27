@@ -34,6 +34,10 @@ impl super::service::AppService {
                 "file data is empty".to_string(),
             ));
         }
+        // 所有参数校验通过后，确保 workspace 就绪（K8s: 建 per-app PVC；Docker: no-op）。
+        // 放参数校验后：避免非法参数（../、空文件）导致副作用（建孤儿 PVC）。
+        // 支持"先 upload 准备文件 → 再 create 启动"工作流（upload 不依赖 create 已执行）。
+        self.ensure_app_workspace_ready(app_id, None).await?;
         let app_dir = self.get_container_app_dir(app_id).await?;
         fs::create_dir_all(&app_dir)
             .await
