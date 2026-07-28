@@ -287,7 +287,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             start_config.mcp_servers.clone()
         } else if !default_agent_config.context_servers.is_empty() {
             info!("[SACP] using config file MCP servers");
-            convert_context_servers_sacp(&default_agent_config.context_servers)
+            convert_context_servers_sacp(&default_agent_config.context_servers)?
         } else {
             info!("[SACP] no config MCP servers");
             Vec::new()
@@ -566,7 +566,8 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let diagnostics_listener_for_task = self.diagnostics_listener.clone();
         // 🔥 提前取出 session 创建超时：start_config 随即被 move 进 spawn task，之后不可读。
         // 值来自 AgentStartConfig（由 GrpcTimeoutConfig.acp_session_create_timeout_secs 注入），默认 60s。
-        let session_create_timeout_secs = start_config.acp_session_create_timeout_secs.unwrap_or(60);
+        let session_create_timeout_secs =
+            start_config.acp_session_create_timeout_secs.unwrap_or(60);
         let connection_task_handle = tokio::spawn(async move {
             info!(
                 "[SACP] Spawned ACP connection task, project_id={}",

@@ -82,6 +82,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "dirs",
+ "mcp-proxy-args",
  "moka",
  "nix 0.31.3",
  "notify",
@@ -4443,6 +4444,18 @@ name = "maybe-uninit"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60302e4db3a61da70c0cb7991976248362f30319e88850c487b9b95bbf059e00"
+
+[[package]]
+name = "mcp-proxy-args"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccd64659d26b2b5f0b53d2b8ab4ebd9a2981d6afef8f6e5bb93f9ab472541d20"
+dependencies = [
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "md5"

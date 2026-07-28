@@ -134,7 +134,7 @@ where
         );
 
         // 将 context_servers 转换为 ACP 协议的 McpServer 格式
-        let mcp_servers = convert_context_servers(&context_servers);
+        let mcp_servers = convert_context_servers(&context_servers)?;
         debug!("MCP servers: {}", mcp_servers.len());
 
         // 构建 AgentStartConfig 并传递 MCP 服务器、service_type

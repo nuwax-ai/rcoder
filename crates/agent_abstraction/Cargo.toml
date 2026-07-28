@@ -63,6 +63,7 @@ which = { workspace = true }
 
 # MCP 协议 - rmcp 官方库: https://github.com/modelcontextprotocol/rust-sdk
 rmcp = { workspace = true }
+mcp-proxy-args = { workspace = true }
 
 # 序列化
 serde = { workspace = true }
