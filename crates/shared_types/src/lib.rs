@@ -198,10 +198,10 @@ pub use rcoder_agent_types::*;
 pub mod agent_mgmt_types;
 pub mod http_handlers;
 
-// UserApp workspace 两级 manifest 类型（极轻量独立 crate，file-server build + app-cli runtime 共用）
+// UserApp workspace manifest 类型（极轻量独立 crate，file-server build + app-cli runtime 共用）
 pub use workspace_manifest::{
-    BuildSection, ProjectManifest, ProjectMeta, ProjectRef, RunSection, WorkspaceManifest,
-    WorkspaceMeta,
+    BuildSection, DiscoverError, DiscoveredProject, ProjectManifest, ProjectMeta, ProxySection,
+    RunSection, WorkspaceManifest, WorkspaceMeta, discover_projects,
 };
 pub use agent_mgmt_types::{
     AGENT_CACHE_DIR, AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus,

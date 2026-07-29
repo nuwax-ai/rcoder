@@ -17,7 +17,7 @@ mod manifest;
 
 // 重导出 manifest 类型：保持 userapp 模块公开面。
 pub use manifest::{
-    BuildSection, ProjectManifest, ProjectMeta, ProjectRef, RunSection, WorkspaceManifest,
+    BuildSection, ProjectManifest, ProjectMeta, ProxySection, RunSection, WorkspaceManifest,
     WorkspaceMeta,
 };
 
@@ -29,7 +29,7 @@ use crate::service::build_manager::BuildManager;
 use crate::workspace::{ProjectContext, WorkspaceResolver};
 
 use assemble::assemble_workspace_package;
-use manifest::{read_project_manifest, read_workspace_manifest};
+use manifest::read_workspace_manifest;
 
 /// 整体包产物文件名（放在 workspace 根，供 `GET /api/userapp/static` 下载）。
 pub const WORKSPACE_PACKAGE_ZIP: &str = "workspace-package.zip";
@@ -73,45 +73,51 @@ pub async fn build_workspace_package(
         )));
     }
 
-    // 2. workspace manifest
+    // 2. workspace manifest（只读 [workspace].name，不再有 [[projects]]）
     let manifest = read_workspace_manifest(&ws).await?;
-    if manifest.projects.is_empty() {
+
+    // 3. 自动发现子项目（扫描含 project.manifest.toml 的一级子目录）
+    let discovered = manifest::discover_projects(&ws).map_err(|e| {
+        AppError::system(format!("discover projects in {}: {e}", ws.display()))
+    })?;
+    if discovered.is_empty() {
         return Err(AppError::business(format!(
-            "workspace.manifest.toml declares no [[projects]] (workspace=\"{}\")",
+            "no sub-projects found (no project.manifest.toml in any subdirectory of workspace=\"{}\")",
             manifest.workspace.name
         )));
     }
 
-    // 3. 各子项目 build（log_dir = workspace/logs；build_generic 内建 create_dir_all）
+    // 4. 各子项目 build（log_dir = workspace/logs；build_generic 内建 create_dir_all）
     let log_dir = ws.join("logs");
-    let mut built: Vec<BuiltProject> = Vec::with_capacity(manifest.projects.len());
-    for proj in &manifest.projects {
+    let mut built: Vec<BuiltProject> = Vec::with_capacity(discovered.len());
+    for proj in &discovered {
         // path 安全校验 + 拼接（防 `../` 穿越 workspace）
-        let proj_dir = crate::path_safety::ensure_within(&ws, &proj.path).map_err(|_| {
+        let proj_dir = crate::path_safety::ensure_within(&ws, &proj.dir).map_err(|_| {
             AppError::validation(format!(
                 "project path escapes workspace: {} (=\"{}\")",
-                proj.path, proj.name
+                proj.dir,
+                proj.name()
             ))
         })?;
         if !proj_dir.is_dir() {
             return Err(AppError::resource(format!(
                 "project dir not found: {} (path={})",
-                proj.name, proj.path
+                proj.name(),
+                proj.dir
             )));
         }
-        let proj_manifest = read_project_manifest(&proj_dir).await?;
         let artifact = build_generic(
             build_manager,
             app_id,
-            &proj_manifest.build.cmd,
+            &proj.manifest.build.cmd,
             &proj_dir,
-            &proj_manifest.build.artifact,
+            &proj.manifest.build.artifact,
             &log_dir,
             timeout_secs,
         )
         .await?;
         built.push(BuiltProject {
-            path: proj.path.clone(),
+            path: proj.dir.clone(),
             artifact,
         });
     }

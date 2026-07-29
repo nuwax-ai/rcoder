@@ -4199,6 +4199,7 @@ name = "workspace-manifest"
 version = "0.1.3"
 dependencies = [
  "serde",
+ "toml 0.8.23",
 ]
 
 [[package]]

@@ -9153,6 +9153,7 @@ name = "workspace-manifest"
 version = "0.1.3"
 dependencies = [
  "serde",
+ "tempfile",
  "toml 0.8.23",
 ]
 

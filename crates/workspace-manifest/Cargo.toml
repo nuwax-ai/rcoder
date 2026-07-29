@@ -7,6 +7,7 @@ description = "UserApp workspace 两级 manifest 类型（file-server build + ap
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [dev-dependencies]
-toml = "0.8"
+tempfile = "3"

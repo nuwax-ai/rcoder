@@ -8,6 +8,7 @@ ARG DOCKER_MIRROR
 # === app-cli builder（从 vendored rcoder 源编译 app-cli 编排器；app-cli 独立于 rcoder workspace）===
 FROM ${DOCKER_MIRROR}rust:1.97 AS app-cli-builder
 WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake libclang-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY code/rcoder/ .
 RUN cd crates/app-cli && cargo build --release
 
@@ -24,8 +25,7 @@ ENV TTYD_VERSION=1.7.7
 WORKDIR /app
 
 
-# 使用 LinuxMirrors 一键配置阿里云镜像源（Debian bookworm，rust:1.97 已预装 curl）
-# 参考: https://github.com/SuperManito/LinuxMirrors
+# 使用 LinuxMirrors 一键配置阿里云镜像源（rust:1.97 基于 Debian trixie，已预装 curl）
 RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --source mirrors.aliyun.com \
     --protocol https \
@@ -88,12 +88,12 @@ RUN ARCH=$(dpkg --print-architecture) && \
 COPY start-ttyd.sh /usr/local/bin/start-ttyd.sh
 RUN chmod +x /usr/local/bin/start-ttyd.sh
 
-# 安装 PostgreSQL 16（Debian bookworm 仓库代号为 bookworm-pgdg）
+# 安装 PostgreSQL 16（rust:1.97 基于 Debian trixie，PG apt 仓库用 trixie-pgdg）
 RUN install -d /usr/share/postgresql-keyring && \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         | gpg --dearmor -o /usr/share/postgresql-keyring/pgdg.gpg && \
     chmod 644 /usr/share/postgresql-keyring/pgdg.gpg && \
-    echo "deb [signed-by=/usr/share/postgresql-keyring/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+    echo "deb [signed-by=/usr/share/postgresql-keyring/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list && \
     apt-get update && apt-get install -y postgresql-16 && rm -rf /var/lib/apt/lists/*
 

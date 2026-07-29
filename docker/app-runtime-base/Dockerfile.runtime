@@ -33,15 +33,15 @@ RUN apt-get update && apt-get install -y \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && pip3 install --no-cache-dir --break-system-packages pip setuptools wheel virtualenv uv
 
-# ── Java (OpenJDK 17 + Maven + Gradle + Arthas) ──────────────────────────────
-RUN apt-get update && apt-get install -y openjdk-17-jdk maven gradle \
+# ── Java (OpenJDK 25 LTS + Maven + Gradle + Arthas) ─────────────────────────
+RUN apt-get update && apt-get install -y openjdk-25-jdk maven gradle \
     && rm -rf /var/lib/apt/lists/* \
     && ARCH=$(dpkg --print-architecture) \
-    && ln -s /usr/lib/jvm/java-17-openjdk-${ARCH} /usr/lib/jvm/java-17-openjdk-current \
+    && ln -s /usr/lib/jvm/java-25-openjdk-${ARCH} /usr/lib/jvm/java-25-openjdk-current \
     && curl -fsSL https://arthas.aliyun.com/arthas-boot.jar -o /usr/local/bin/arthas-boot.jar \
     && printf '#!/bin/bash\njava -jar /usr/local/bin/arthas-boot.jar "$@"\n' > /usr/local/bin/arthas \
     && chmod +x /usr/local/bin/arthas
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-current
+ENV JAVA_HOME=/usr/lib/jvm/java-25-openjdk-current
 
 # ── Go ────────────────────────────────────────────────────────────────────────
 ENV GO_VERSION=1.26.4

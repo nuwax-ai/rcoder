@@ -12,19 +12,14 @@ use tokio::process::{Child, Command};
 use tracing::{error, info, warn};
 
 use crate::config::CliArgs;
-use crate::manifest;
-use crate::pingap_config;
+use crate::manifest::{self, ServiceSpec};
+use crate::pingap_config::{self, ProxyEntry};
 
 /// 编排主入口。
 pub async fn run(args: &CliArgs) -> Result<()> {
-    // 1. 读 manifest + 组装服务清单
-    let ws_manifest = manifest::load_workspace(&args.workspace)
-        .context("load workspace.manifest.toml")?;
-    let specs = manifest::build_specs(&args.workspace, &ws_manifest)
-        .context("build service specs")?;
-    if specs.is_empty() {
-        anyhow::bail!("no [[projects]] in workspace.manifest.toml");
-    }
+    // 1. 自动发现子项目 + 组装服务清单
+    let specs = manifest::build_specs(&args.workspace)
+        .context("discover + build service specs")?;
 
     // 2. wait PG（PG 由 supervisor [program:postgresql] 托管，秒级就绪；失败不阻断）
     wait_for_pg().await;
@@ -34,27 +29,37 @@ pub async fn run(args: &CliArgs) -> Result<()> {
     for spec in &specs {
         // migrate（如有）
         if let Some(migrate_cmd) = spec.run.migrate.as_ref().filter(|c| !c.is_empty()) {
-            info!("🛠️  migrate {}", spec.project.name);
-            if let Err(e) = run_transient(migrate_cmd, &args.workspace.join(&spec.project.path)).await {
-                warn!("⚠️  migrate {} failed: {e} — continuing", spec.project.name);
+            info!("🛠️  migrate {}", spec.name);
+            if let Err(e) = run_transient(migrate_cmd, &args.workspace.join(&spec.dir)).await {
+                warn!("⚠️  migrate {} failed: {e} — continuing", spec.name);
             }
         }
         // start
         if spec.run.command.is_empty() {
-            warn!("⚠️  {} 无 [run].command，跳过", spec.project.name);
+            warn!("⚠️  {} 无 [run].command，跳过", spec.name);
             continue;
         }
         match start_service(spec, &args.workspace, &args.log_dir) {
-            Ok(child) => children.push((spec.project.name.clone(), child)),
+            Ok(child) => children.push((spec.name.clone(), child)),
             Err(e) => {
-                error!("❌ start {} failed: {e}", spec.project.name);
+                error!("❌ start {} failed: {e}", spec.name);
                 return Err(e);
             }
         }
     }
 
     // 4. 生成 pingap 配置 + spawn pingap
-    if let Err(e) = start_pingap(&args.workspace, &ws_manifest.projects, &args.pingap_bin, &mut children).await {
+    let proxy_entries: Vec<ProxyEntry> = specs
+        .iter()
+        .filter_map(|s| {
+            s.proxy.as_ref().map(|p| ProxyEntry {
+                name: s.name.clone(),
+                port: s.port,
+                proxy: p.clone(),
+            })
+        })
+        .collect();
+    if let Err(e) = start_pingap(&args.workspace, &proxy_entries, &args.pingap_bin, &mut children).await {
         warn!("⚠️  pingap 启动失败: {e} — 继续仅子项目");
     }
 
@@ -97,20 +102,20 @@ async fn wait_for_pg() {
 
 // ── 子项目启动 ─────────────────────────────────────────────────────────────────
 
-/// 启动一个子项目（[run].command + PORT/HOSTNAME env + stdout/stderr → log_dir/<name>.{out,err}.log）。
+/// 启动一个子项目（[run].command + PORT/HOSTNAME env + stdout/stderr → log_dir/<dir>.{out,err}.log）。
 fn start_service(
-    spec: &manifest::ServiceSpec,
+    spec: &ServiceSpec,
     ws_root: &Path,
     log_dir: &Path,
 ) -> Result<Child> {
-    let cwd = ws_root.join(&spec.project.path);
-    let out_path = log_dir.join(format!("{}.out.log", spec.project.name));
-    let err_path = log_dir.join(format!("{}.err.log", spec.project.name));
+    let cwd = ws_root.join(&spec.dir);
+    let out_path = log_dir.join(format!("{}.out.log", spec.dir));
+    let err_path = log_dir.join(format!("{}.err.log", spec.dir));
 
     let stdout = std::fs::File::create(&out_path)
-        .with_context(|| format!("create {}: {}", out_path.display(), spec.project.name))?;
+        .with_context(|| format!("create {}: {}", out_path.display(), spec.name))?;
     let stderr = std::fs::File::create(&err_path)
-        .with_context(|| format!("create {}: {}", err_path.display(), spec.project.name))?;
+        .with_context(|| format!("create {}: {}", err_path.display(), spec.name))?;
 
     let mut cmd = Command::new(&spec.run.command[0]);
     cmd.args(&spec.run.command[1..])
@@ -121,8 +126,8 @@ fn start_service(
         .stderr(Stdio::from(stderr));
 
     let child = cmd.spawn()
-        .with_context(|| format!("spawn {}: {}", spec.project.name, spec.run.command.join(" ")))?;
-    info!("🚀 start {} on :{} (pid={})", spec.project.name, spec.port,
+        .with_context(|| format!("spawn {}: {}", spec.name, spec.run.command.join(" ")))?;
+    info!("🚀 start {} on :{} (pid={})", spec.name, spec.port,
         child.id().unwrap_or(0));
     Ok(child)
 }
@@ -147,14 +152,14 @@ async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
 /// 生成 pingap 配置（build_pingap_config）→ 写到 ws_root/pingap/pingap.toml → spawn pingap。
 async fn start_pingap(
     ws_root: &Path,
-    projects: &[workspace_manifest::ProjectRef],
+    proxy_entries: &[ProxyEntry],
     pingap_bin: &Path,
     children: &mut Vec<(String, Child)>,
 ) -> Result<()> {
-    let conf = match pingap_config::build_pingap_config(projects) {
+    let conf = match pingap_config::build_pingap_config(proxy_entries) {
         Some(c) => c,
         None => {
-            info!("no proxy_path declared → skip pingap");
+            info!("no [proxy] declared → skip pingap");
             return Ok(());
         }
     };
