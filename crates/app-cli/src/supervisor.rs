@@ -164,11 +164,23 @@ async fn start_pingap(
     tokio::fs::write(&conf_path, &conf).await?;
     info!("📝 pingap config → {}", conf_path.display());
 
-    let child = Command::new(pingap_bin)
-        .arg("-c").arg(&conf_path)
-        .arg("--autoreload")
-        .spawn()
-        .context("spawn pingap")?;
+    // spawn pingap（manifest 权威：每次启动从 manifest 重新生成；admin UI 改动临时，重启覆盖）
+    let mut cmd = Command::new(pingap_bin);
+    cmd.arg("-c").arg(&conf_path).arg("--autoreload");
+    // admin UI（从环境变量读 user/pass/addr；默认开 /pingap 路径，共用 :9080 端口）
+    if let (Ok(user), Ok(pass)) = (
+        std::env::var("PINGAP_ADMIN_USER"),
+        std::env::var("PINGAP_ADMIN_PASSWORD"),
+    ) {
+        let addr = std::env::var("PINGAP_ADMIN_ADDR")
+            .unwrap_or_else(|_| format!("0.0.0.0:{}/pingap", pingap_config::PINGAP_PORT));
+        let admin = format!("{user}:{pass}@{addr}");
+        cmd.arg(format!("--admin={admin}"));
+        info!("📡 pingap admin UI → http://{addr}");
+    } else {
+        info!("ℹ️  PINGAP_ADMIN_USER/PASSWORD 未设 → admin UI 关闭（设置环境变量开启）");
+    }
+    let child = cmd.spawn().context("spawn pingap")?;
     info!("🚀 start pingap on :{} (pid={})", pingap_config::PINGAP_PORT, child.id().unwrap_or(0));
     children.push(("pingap".into(), child));
     Ok(())
