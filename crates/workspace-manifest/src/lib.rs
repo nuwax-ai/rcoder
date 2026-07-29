@@ -36,6 +36,9 @@ pub struct ProjectManifest {
     /// 反代配置（可选）。没有 [proxy] = 不经 pingap（仅内部服务）。
     #[serde(default)]
     pub proxy: Option<ProxySection>,
+    /// 项目级环境变量（可选）。app-cli 启动子项目时注入（合并 workspace env，项目覆盖 workspace）。
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,7 +94,7 @@ pub struct ProxySection {
 pub struct DiscoveredProject {
     /// 目录名（= workspace 相对路径，用于 build cwd + assemble 前缀 + 端口排序）。
     pub dir: String,
-    /// 项目 manifest（[project]+[build]+[run]+[proxy]）。
+    /// 项目 manifest（[project]+[build]+[run]+[proxy]+[env]）。
     pub manifest: ProjectManifest,
 }
 

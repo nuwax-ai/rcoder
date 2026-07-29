@@ -123,6 +123,7 @@ fn start_service(
         .current_dir(&cwd)
         .env("HOSTNAME", "0.0.0.0")
         .env("PORT", spec.port.to_string())
+        .envs(&spec.env) // 项目级 env（覆盖 workspace 级同名变量）
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
 

@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use workspace_manifest::{discover_projects, DiscoveredProject, ProxySection, RunSection};
 
@@ -22,6 +24,8 @@ pub struct ServiceSpec {
     pub proxy: Option<ProxySection>,
     /// 健康检查路径（缺省 /health）。
     pub health: String,
+    /// 项目级环境变量（app-cli 启动子项目时注入，覆盖 workspace 级同名变量）。
+    pub env: HashMap<String, String>,
 }
 
 /// 自动发现 workspace 下所有子项目 → 组装服务清单（按目录名字母序，端口 4000+i）。
@@ -52,5 +56,6 @@ fn discovered_to_spec(d: DiscoveredProject, port: u16) -> ServiceSpec {
         run: d.manifest.run,
         proxy: d.manifest.proxy,
         health,
+        env: d.manifest.env,
     }
 }
