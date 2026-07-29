@@ -56,6 +56,7 @@ pub async fn run(args: &CliArgs) -> Result<()> {
                 name: s.name.clone(),
                 port: s.port,
                 proxy: p.clone(),
+                health: s.health.clone(),
             })
         })
         .collect();

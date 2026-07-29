@@ -60,6 +60,12 @@ pub struct RunSection {
     pub command: Vec<String>,
     #[serde(default)]
     pub migrate: Option<Vec<String>>,
+    /// 健康检查路径（缺省 `/health`）。pingap upstream health_check 用它探活，不健康不路由。
+    #[serde(default)]
+    pub health: Option<String>,
+    /// 就绪检查路径（可选，如 `/ready`）。区分「存活」(health) vs 「就绪」(ready)。
+    #[serde(default)]
+    pub ready: Option<String>,
 }
 
 /// project.manifest.toml 的 `[proxy]`（pingap 反代配置，从 workspace.manifest 下沉到此）。

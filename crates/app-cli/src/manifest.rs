@@ -20,6 +20,8 @@ pub struct ServiceSpec {
     pub run: RunSection,
     /// 反代配置（None = 不经 pingap）。
     pub proxy: Option<ProxySection>,
+    /// 健康检查路径（缺省 /health）。
+    pub health: String,
 }
 
 /// 自动发现 workspace 下所有子项目 → 组装服务清单（按目录名字母序，端口 4000+i）。
@@ -37,11 +39,18 @@ pub fn build_specs(ws_root: &Path) -> Result<Vec<ServiceSpec>> {
 }
 
 fn discovered_to_spec(d: DiscoveredProject, port: u16) -> ServiceSpec {
+    let health = d
+        .manifest
+        .run
+        .health
+        .clone()
+        .unwrap_or_else(|| "/health".into());
     ServiceSpec {
         name: d.name().to_string(),
         dir: d.dir,
         port,
         run: d.manifest.run,
         proxy: d.manifest.proxy,
+        health,
     }
 }

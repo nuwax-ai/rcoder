@@ -13,6 +13,8 @@ pub struct ProxyEntry {
     pub name: String,
     pub port: u16,
     pub proxy: ProxySection,
+    /// 健康检查路径（pingap upstream health_check 用它探活）。
+    pub health: String,
 }
 
 /// 从 service specs 中提取有 [proxy] 的项目 → 生成 pingap 配置。
@@ -49,6 +51,7 @@ pub fn build_pingap_config(entries: &[ProxyEntry]) -> Option<String> {
             name.clone(),
             UpstreamConf {
                 addrs: vec![format!("127.0.0.1:{}", e.port)],
+                health_check: Some(format!("http://{name}{}", e.health)),
                 ..Default::default()
             },
         );
@@ -88,6 +91,7 @@ mod tests {
                 cache: None,
                 rate_limit: None,
             },
+            health: "/health".into(),
         }
     }
 
