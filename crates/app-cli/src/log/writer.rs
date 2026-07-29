@@ -44,6 +44,8 @@ pub async fn pipe_to_rotating_file<R>(
     while let Ok(Some(line)) = lines.next_line().await {
         writer.write_line(&line).await;
     }
+    // 管道结束（子进程退出）→ 刷盘，保证最后几行落盘（drop 不保证）
+    writer.flush().await;
 }
 
 struct RotatingWriter {
@@ -84,6 +86,15 @@ impl RotatingWriter {
         let data = format!("{line}\n");
         if file.write_all(data.as_bytes()).await.is_ok() {
             self.size += data.len() as u64;
+        }
+    }
+
+    /// 刷盘：tokio::fs::File 的写入经 spawn_blocking，需显式 `flush` + `sync_all`
+    /// 才能保证数据持久化（drop 不保证末尾写入落盘 → 会丢最后几行）。
+    async fn flush(&mut self) {
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.flush().await;
+            let _ = f.sync_all().await;
         }
     }
 
@@ -151,6 +162,7 @@ mod tests {
         for i in 0..5 {
             writer.write_line(&format!("line-{i}: some content here")).await;
         }
+        writer.flush().await;
         drop(writer);
 
         assert!(path.is_file(), "current .log exists");
@@ -172,6 +184,7 @@ mod tests {
 
         let mut writer = RotatingWriter::new(&path, 1_000_000, 3).await.unwrap();
         writer.write_line("new line").await;
+        writer.flush().await;
         drop(writer);
 
         let content = std::fs::read_to_string(&path).unwrap();

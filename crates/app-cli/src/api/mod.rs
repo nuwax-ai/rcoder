@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::{Json, Router};
 use axum::routing::{get, post};
@@ -74,22 +74,47 @@ fn default_lines() -> usize {
     1000
 }
 
+/// 子项目目录名安全校验：仅允许 `[A-Za-z0-9._-]`，禁止空 / `.` / `..` / 路径分隔符。
+/// `dir` 来自 URL，无校验拼路径会 `../` 穿越 `log_dir` 读到容器内任意文件。
+fn is_safe_dir(dir: &str) -> bool {
+    !dir.is_empty()
+        && dir != "."
+        && dir != ".."
+        && !dir.contains('/')
+        && !dir.contains('\\')
+        && dir
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// 解析日志文件路径（带穿越校验）：`<log_dir>/<dir>.<out|err>.log`。
+fn resolve_log_path(
+    log_dir: &std::path::Path,
+    dir: &str,
+    err: bool,
+) -> Result<PathBuf, (StatusCode, String)> {
+    if !is_safe_dir(dir) {
+        return Err((StatusCode::BAD_REQUEST, format!("invalid log dir: {dir}")));
+    }
+    let suffix = if err { ".err.log" } else { ".out.log" };
+    Ok(log_dir.join(format!("{dir}{suffix}")))
+}
+
 async fn get_logs(
     State(state): State<AppState>,
     Path(dir): Path<String>,
     Query(q): Query<LogQuery>,
-) -> Json<Value> {
-    let suffix = if q.err.unwrap_or(false) { ".err.log" } else { ".out.log" };
-    let path = state.log_dir.join(format!("{dir}{suffix}"));
-    match crate::log::reader::read_last_n_lines(&path, q.lines) {
-        Ok((lines, total_bytes)) => Json(json!({
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let path = resolve_log_path(&state.log_dir, &dir, q.err.unwrap_or(false))?;
+    Ok(match crate::log::reader::read_last_n_lines(&path, q.lines) {
+        Ok((lines, total_bytes, has_more)) => Json(json!({
             "dir": dir,
             "totalBytes": total_bytes,
             "lines": lines,
-            "truncated": total_bytes > 0 && (lines.len() as u64) < total_bytes / 50, // 粗略判断
+            "truncated": has_more,
         })),
         Err(e) => Json(json!({ "error": e.to_string() })),
-    }
+    })
 }
 
 // ── /logs/<dir>/stream（SSE 实时流 + Last-Event-ID 补漏）────────────────────
@@ -99,9 +124,8 @@ async fn stream_logs(
     Path(dir): Path<String>,
     Query(q): Query<LogQuery>,
     headers: HeaderMap,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let suffix = if q.err.unwrap_or(false) { ".err.log" } else { ".out.log" };
-    let path = state.log_dir.join(format!("{dir}{suffix}"));
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)> {
+    let path = resolve_log_path(&state.log_dir, &dir, q.err.unwrap_or(false))?;
 
     // 读 Last-Event-ID（浏览器断线重连自动发）
     let start_offset = headers
@@ -119,19 +143,65 @@ async fn stream_logs(
         let mut offset = start_offset;
         loop {
             let current_size = crate::log::reader::file_size(&path);
-            if offset < current_size {
-                if let Ok((lines, total)) = crate::log::reader::read_from_offset(&path, offset) {
-                    for (line, byte_pos) in lines {
-                        yield Ok(Event::default()
-                            .id(byte_pos.to_string())
-                            .data(line));
-                    }
-                    offset = total;
+            // 日志轮转/截断检测：writer rotate 后新文件从 0 开始增长，
+            // 此时 offset（旧文件的字节位置）> current_size。若不重置，
+            // `offset < current_size` 恒为 false → SSE 永久断流、丢日志。
+            if current_size < offset {
+                tracing::info!(
+                    "log rotated/truncated for {dir}: offset {offset} > size {current_size}, resetting to 0"
+                );
+                offset = 0;
+            }
+            if let Ok((lines, total)) = crate::log::reader::read_from_offset(&path, offset) {
+                for (line, byte_pos) in lines {
+                    yield Ok(Event::default()
+                        .id(byte_pos.to_string())
+                        .data(line));
                 }
+                offset = total;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     };
 
-    Sse::new(stream)
+    Ok(Sse::new(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_dir_allows_normal_names() {
+        assert!(is_safe_dir("frontend"));
+        assert!(is_safe_dir("backend-go"));
+        assert!(is_safe_dir("api_v2"));
+        assert!(is_safe_dir("service.api"));
+    }
+
+    #[test]
+    fn safe_dir_rejects_traversal() {
+        // 空与裸点
+        assert!(!is_safe_dir(""));
+        assert!(!is_safe_dir("."));
+        assert!(!is_safe_dir(".."));
+        // 路径分隔符（含 URL 解码后的 /）
+        assert!(!is_safe_dir("../"));
+        assert!(!is_safe_dir("../etc"));
+        assert!(!is_safe_dir("foo/../bar"));
+        assert!(!is_safe_dir("a/b"));
+        assert!(!is_safe_dir("a\\b"));
+        // 非 ASCII 与特殊符号
+        assert!(!is_safe_dir("项目"));
+        assert!(!is_safe_dir("a;b"));
+        assert!(!is_safe_dir("a b"));
+    }
+
+    #[test]
+    fn resolve_log_path_blocks_traversal() {
+        let tmp = std::env::temp_dir();
+        assert!(resolve_log_path(&tmp, "..", false).is_err());
+        assert!(resolve_log_path(&tmp, "../../etc/passwd", false).is_err());
+        assert!(resolve_log_path(&tmp, "ok", true).is_ok());
+    }
 }

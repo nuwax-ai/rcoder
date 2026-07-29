@@ -79,11 +79,13 @@ pub fn list_log_files(log_dir: &Path) -> Vec<ProjectLogs> {
 /// 从大文件末尾读取最后 N 行。O(N) 复杂度（不读整个文件）。
 ///
 /// 算法（GNU tail 同理）：seek 到文件尾，按 8KB 块 backwards 读，数换行符。
-pub fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<(Vec<String>, u64)> {
+/// 返回 `(lines, total_bytes, has_more)`：`has_more` 表示文件还有更早的行未读到，
+/// 前端据此判断 `truncated`（请求 N 行但文件实际更多）。
+pub fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<(Vec<String>, u64, bool)> {
     let mut file = std::fs::File::open(path)?;
     let total = file.metadata()?.len();
     if total == 0 {
-        return Ok((vec![], 0));
+        return Ok((vec![], 0, false));
     }
 
     const CHUNK: u64 = 8192;
@@ -101,12 +103,16 @@ pub fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<(Vec<String>,
         buf.extend_from_slice(&chunk);
     }
 
+    // has_more：退出循环时 pos>0（文件还有更早内容未读）或 nl_count>n（已读范围内行数已超 N），
+    // 都意味着 take(n) 必然丢弃了部分行 → 截断。
+    let has_more = pos > 0 || nl_count > n;
+
     // 反转 → 按换行分割 → 取最后 N 行 → 再反转回正序
     buf.reverse();
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<String> = text.lines().rev().take(n).map(|s| s.to_string()).collect();
     lines.reverse();
-    Ok((lines, total))
+    Ok((lines, total, has_more))
 }
 
 /// 从 `start_offset` 读文件到尾（返回行 + 每行的字节偏移）。
