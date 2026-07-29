@@ -103,7 +103,7 @@ async fn wait_for_pg() {
 
 // ── 子项目启动 ─────────────────────────────────────────────────────────────────
 
-/// 启动一个子项目（[run].command + PORT/HOSTNAME env + stdout/stderr → log_dir/<dir>.{out,err}.log）。
+/// 启动一个子项目（[run].command + PORT/HOSTNAME env + stdout/stderr → 轮转日志）。
 fn start_service(
     spec: &ServiceSpec,
     ws_root: &Path,
@@ -113,22 +113,28 @@ fn start_service(
     let out_path = log_dir.join(format!("{}.out.log", spec.dir));
     let err_path = log_dir.join(format!("{}.err.log", spec.dir));
 
-    let stdout = std::fs::File::create(&out_path)
-        .with_context(|| format!("create {}: {}", out_path.display(), spec.name))?;
-    let stderr = std::fs::File::create(&err_path)
-        .with_context(|| format!("create {}: {}", err_path.display(), spec.name))?;
-
     let mut cmd = Command::new(&spec.run.command[0]);
     cmd.args(&spec.run.command[1..])
         .current_dir(&cwd)
         .env("HOSTNAME", "0.0.0.0")
         .env("PORT", spec.port.to_string())
         .envs(&spec.env) // 项目级 env（覆盖 workspace 级同名变量）
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    let child = cmd.spawn()
+    let mut child = cmd.spawn()
         .with_context(|| format!("spawn {}: {}", spec.name, spec.run.command.join(" ")))?;
+
+    // pipe → 带轮转的日志文件（append 模式，不 truncate；超 10MB rotate，保留 3 份）
+    if let Some(stdout) = child.stdout.take() {
+        let p = out_path.clone();
+        tokio::spawn(crate::log_writer::pipe_to_rotating_file(stdout, p, None, None));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let p = err_path.clone();
+        tokio::spawn(crate::log_writer::pipe_to_rotating_file(stderr, p, None, None));
+    }
+
     info!("🚀 start {} on :{} (pid={})", spec.name, spec.port,
         child.id().unwrap_or(0));
     Ok(child)
