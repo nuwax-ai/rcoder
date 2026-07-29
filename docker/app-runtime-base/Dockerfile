@@ -8,10 +8,7 @@ ARG DOCKER_MIRROR
 # === app-cli builder（从 vendored rcoder 源编译 app-cli 编排器；app-cli 独立于 rcoder workspace）===
 FROM ${DOCKER_MIRROR}rust:1.97 AS app-cli-builder
 WORKDIR /build
-COPY code/rcoder/crates/app-cli/Cargo.toml crates/app-cli/Cargo.toml
-COPY code/rcoder/crates/app-cli/src crates/app-cli/src
-COPY code/rcoder/crates/workspace-manifest/Cargo.toml crates/workspace-manifest/Cargo.toml
-COPY code/rcoder/crates/workspace-manifest/src crates/workspace-manifest/src
+COPY code/rcoder/ .
 RUN cd crates/app-cli && cargo build --release
 
 # === 主 stage（app-runtime-base 基础设施层）===

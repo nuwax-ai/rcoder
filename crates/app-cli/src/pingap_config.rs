@@ -7,14 +7,15 @@ use pingap_config::{LocationConf, PingapConfig, ServerConf, UpstreamConf};
 use workspace_manifest::ProjectRef;
 
 /// pingap 监听端口（= `[deploy].ports` 的 app HTTP 端口，rcoder pingora 透出）。
-pub const PINGAP_PORT: u16 = 3000;
+/// 不用 3000（前端框架默认端口）；9080 无冲突。
+pub const PINGAP_PORT: u16 = 9080;
 /// 子项目内部端口基（4000+i，i = `[[projects]]` 顺序下标）。
 pub const INTERNAL_PORT_BASE: u16 = 4000;
 
 /// 按 workspace manifest 的 `[[projects]].proxy_path` 生成 pingap 配置（pingap.toml 文本）。
 ///
 /// 仅当 ≥1 子项目声明 `proxy_path` 时返回 `Some`。约定：
-/// - pingap 监听 :3000；各子项目 upstream = `127.0.0.1:<4000+i>`。
+/// - pingap 监听 :9080；各子项目 upstream = `127.0.0.1:<4000+i>`。
 /// - `proxy_path == "/"` 兜底（location 不写 path）；其余前缀匹配；`proxy_strip_prefix` 去前缀。
 /// - 每个 location 默认带 `pingap:requestId` + `pingap:compressionUpstream`（零配置内置插件）。
 pub fn build_pingap_config(projects: &[ProjectRef]) -> Option<String> {
@@ -107,7 +108,7 @@ mod tests {
             proj("backend", Some("/api/"), Some(true)),
         ];
         let toml_text = build_pingap_config(&projects).expect("proxied → Some");
-        assert!(toml_text.contains("addr = \"0.0.0.0:3000\""), "{toml_text}");
+        assert!(toml_text.contains("addr = \"0.0.0.0:9080\""), "{toml_text}");
         assert!(toml_text.contains("[upstreams.frontend]"), "{toml_text}");
         assert!(toml_text.contains("addrs = [\"127.0.0.1:4000\"]"), "{toml_text}");
         assert!(toml_text.contains("[locations.frontendLocation]"), "{toml_text}");

@@ -169,7 +169,7 @@ async fn start_pingap(
         .arg("--autoreload")
         .spawn()
         .context("spawn pingap")?;
-    info!("🚀 start pingap on :3000 (pid={})", child.id().unwrap_or(0));
+    info!("🚀 start pingap on :{} (pid={})", pingap_config::PINGAP_PORT, child.id().unwrap_or(0));
     children.push(("pingap".into(), child));
     Ok(())
 }
