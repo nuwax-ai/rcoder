@@ -87,10 +87,10 @@ pub async fn build_workspace_package(
         )));
     }
 
-    // 4. 各子项目 build（log_dir = workspace/logs；build_generic 内建 create_dir_all）
-    let log_dir = ws.join("logs");
+    // 4. 各子项目 build（log_dir = workspace/logs/<dir>；分项目日志方便排查哪个构建失败）
     let mut built: Vec<BuiltProject> = Vec::with_capacity(discovered.len());
     for proj in &discovered {
+        let log_dir = ws.join("logs").join(&proj.dir);
         // path 安全校验 + 拼接（防 `../` 穿越 workspace）
         let proj_dir = crate::path_safety::ensure_within(&ws, &proj.dir).map_err(|_| {
             AppError::validation(format!(

@@ -55,13 +55,41 @@ pub fn build_pingap_config(entries: &[ProxyEntry]) -> Option<String> {
                 ..Default::default()
             },
         );
+
+        // 构建 location plugins 列表：requestId → cache(可选) → limit(可选) → compression
+        let mut plugins: Vec<String> = vec!["pingap:requestId".into()];
+
+        // cache 插件（proxy.cache = true）
+        if e.proxy.cache.unwrap_or(false) {
+            let plugin_name = format!("{name}Cache");
+            let mut conf = pingap_config::PluginConf::new();
+            conf.insert("category".into(), "cache".into());
+            conf.insert("directory".into(), "memory://workspace?max_size=100mb".into());
+            conf.insert("namespace".into(), name.clone().into());
+            conf.insert("max_ttl".into(), "10m".into());
+            cfg.plugins.insert(plugin_name.clone(), conf);
+            plugins.push(plugin_name);
+        }
+
+        // rate_limit 插件（proxy.rate_limit = N）
+        if let Some(max) = e.proxy.rate_limit {
+            let plugin_name = format!("{name}RateLimit");
+            let mut conf = pingap_config::PluginConf::new();
+            conf.insert("category".into(), "limit".into());
+            conf.insert("type".into(), "rate".into());
+            conf.insert("tag".into(), "ip".into());
+            conf.insert("max".into(), (max as i64).into());
+            conf.insert("interval".into(), "60s".into());
+            cfg.plugins.insert(plugin_name.clone(), conf);
+            plugins.push(plugin_name);
+        }
+
+        plugins.push("pingap:compressionUpstream".into());
+
         let is_catchall = e.proxy.path == "/";
         let mut loc = LocationConf {
             upstream: Some(name.clone()),
-            plugins: Some(vec![
-                "pingap:requestId".into(),
-                "pingap:compressionUpstream".into(),
-            ]),
+            plugins: Some(plugins),
             enable_reverse_proxy_headers: Some(true),
             ..Default::default()
         };
