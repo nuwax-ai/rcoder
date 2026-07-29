@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 
 use crate::config::CliArgs;
 use crate::manifest::{self, ServiceSpec};
-use crate::pingap_config::{self, ProxyEntry};
+use crate::proxy::pingap::{build_pingap_config, ProxyEntry, PINGAP_PORT};
 
 /// 编排主入口。
 pub async fn run(args: &CliArgs) -> Result<()> {
@@ -128,11 +128,11 @@ fn start_service(
     // pipe → 带轮转的日志文件（append 模式，不 truncate；超 10MB rotate，保留 3 份）
     if let Some(stdout) = child.stdout.take() {
         let p = out_path.clone();
-        tokio::spawn(crate::log_writer::pipe_to_rotating_file(stdout, p, None, None));
+        tokio::spawn(crate::log::writer::pipe_to_rotating_file(stdout, p, None, None));
     }
     if let Some(stderr) = child.stderr.take() {
         let p = err_path.clone();
-        tokio::spawn(crate::log_writer::pipe_to_rotating_file(stderr, p, None, None));
+        tokio::spawn(crate::log::writer::pipe_to_rotating_file(stderr, p, None, None));
     }
 
     info!("🚀 start {} on :{} (pid={})", spec.name, spec.port,
@@ -164,7 +164,7 @@ async fn start_pingap(
     pingap_bin: &Path,
     children: &mut Vec<(String, Child)>,
 ) -> Result<()> {
-    let conf = match pingap_config::build_pingap_config(proxy_entries) {
+    let conf = match build_pingap_config(proxy_entries) {
         Some(c) => c,
         None => {
             info!("no [proxy] declared → skip pingap");
@@ -186,7 +186,7 @@ async fn start_pingap(
         std::env::var("PINGAP_ADMIN_PASSWORD"),
     ) {
         let addr = std::env::var("PINGAP_ADMIN_ADDR")
-            .unwrap_or_else(|_| format!("0.0.0.0:{}/pingap", pingap_config::PINGAP_PORT));
+            .unwrap_or_else(|_| format!("0.0.0.0:{}/pingap", PINGAP_PORT));
         let admin = format!("{user}:{pass}@{addr}");
         cmd.arg(format!("--admin={admin}"));
         info!("📡 pingap admin UI → http://{addr}");
@@ -194,7 +194,7 @@ async fn start_pingap(
         info!("ℹ️  PINGAP_ADMIN_USER/PASSWORD 未设 → admin UI 关闭（设置环境变量开启）");
     }
     let child = cmd.spawn().context("spawn pingap")?;
-    info!("🚀 start pingap on :{} (pid={})", pingap_config::PINGAP_PORT, child.id().unwrap_or(0));
+    info!("🚀 start pingap on :{} (pid={})", PINGAP_PORT, child.id().unwrap_or(0));
     children.push(("pingap".into(), child));
     Ok(())
 }

@@ -56,7 +56,7 @@ async fn reload() -> Json<Value> {
 // ── /logs（列举）──────────────────────────────────────────────────────────────
 
 async fn list_logs(State(state): State<AppState>) -> Json<Value> {
-    let logs = crate::log_reader::list_log_files(&state.log_dir);
+    let logs = crate::log::reader::list_log_files(&state.log_dir);
     Json(serde_json::to_value(&logs).unwrap_or(json!([])))
 }
 
@@ -81,7 +81,7 @@ async fn get_logs(
 ) -> Json<Value> {
     let suffix = if q.err.unwrap_or(false) { ".err.log" } else { ".out.log" };
     let path = state.log_dir.join(format!("{dir}{suffix}"));
-    match crate::log_reader::read_last_n_lines(&path, q.lines) {
+    match crate::log::reader::read_last_n_lines(&path, q.lines) {
         Ok((lines, total_bytes)) => Json(json!({
             "dir": dir,
             "totalBytes": total_bytes,
@@ -110,7 +110,7 @@ async fn stream_logs(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or_else(|| {
             // 没有 Last-Event-ID = 首次连接 → 从文件尾开始（只推新行）
-            crate::log_reader::file_size(&path)
+            crate::log::reader::file_size(&path)
         });
 
     tracing::info!("SSE stream {dir} from offset {start_offset}");
@@ -118,9 +118,9 @@ async fn stream_logs(
     let stream = async_stream::stream! {
         let mut offset = start_offset;
         loop {
-            let current_size = crate::log_reader::file_size(&path);
+            let current_size = crate::log::reader::file_size(&path);
             if offset < current_size {
-                if let Ok((lines, total)) = crate::log_reader::read_from_offset(&path, offset) {
+                if let Ok((lines, total)) = crate::log::reader::read_from_offset(&path, offset) {
                     for (line, byte_pos) in lines {
                         yield Ok(Event::default()
                             .id(byte_pos.to_string())

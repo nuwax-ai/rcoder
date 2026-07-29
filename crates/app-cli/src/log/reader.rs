@@ -5,7 +5,7 @@
 //! - `tail_from`：从 offset 读到文件尾 → 继续 tail 新行（SSE stream 用）
 
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 日志文件信息（列举用）。
 #[derive(serde::Serialize)]

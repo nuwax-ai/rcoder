@@ -1,16 +1,21 @@
 //! `app-cli`：UserApp 容器运行时编排器。
 //!
-//! 装在 app-runtime 镜像 `/usr/local/bin/app-cli`，替代 workspace `start.sh`：
-//! 读 workspace.manifest.toml + 各子项目 project.manifest.toml 的 `[run].command`，
-//! 语言无关地编排所有子项目（按子项目分日志）+ 管理 pingap（类型安全配置 + spawn/托管），
-//! 并暴露 HTTP 管理 API。编排逻辑版本化进镜像二进制，升级 = 升镜像，不动已部署用户的包。
+//! 装在 app-runtime 镜像，替代 workspace `start.sh`：自动发现子项目 → 编排（启服务 + pingap）
+//! → 日志（轮转 + API + SSE）→ 管理 API。
+//!
+//! 分层：
+//! - [`config`]：CLI 参数
+//! - [`manifest`]：自动发现子项目 → ServiceSpec
+//! - [`supervisor`]：编排核心（wait PG → migrate → start → pingap → supervise）
+//! - [`api`]：管理 HTTP 端点（/health /reload /logs /logs/stream SSE）
+//! - [`log`]：日志系统（轮转写入 + 历史读取 + 实时流）
+//! - [`proxy`]：pingap 配置生成
 
 pub mod api;
 pub mod config;
-pub mod log_reader;
-pub mod log_writer;
+pub mod log;
 pub mod manifest;
-pub mod pingap_config;
+pub mod proxy;
 pub mod supervisor;
 
 pub use config::CliArgs;
