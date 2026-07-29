@@ -112,10 +112,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
     chmod +x /usr/local/bin/pgweb && \
     rm -f /tmp/pgweb.zip
 
-# 安装 pingap (pingora 反向代理，UserApp workspace 经它统一 :3000 入口；与 ttyd/pgweb 同层)
-# 多阶段从官方镜像拉二进制（官方 Dockerfile 已置于 /usr/local/bin/pingap）。
-ARG PINGAP_VERSION=0.13.7
-COPY --from=vicanso/pingap:${PINGAP_VERSION} /usr/local/bin/pingap /usr/local/bin/pingap
+# 安装 pingap (pingora 反向代理，全特性版；官方安装脚本自动识别 amd64/arm64)
+RUN curl -sSL https://raw.githubusercontent.com/vicanso/pingap/main/install.sh | PINGAP_FULL=1 sh
 
 # 安装 app-cli（UserApp 容器编排器，替代 start.sh；由 app-cli-builder stage 编译）
 COPY --from=app-cli-builder /build/crates/app-cli/target/release/app-cli /usr/local/bin/app-cli
