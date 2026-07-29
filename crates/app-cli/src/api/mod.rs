@@ -1,207 +1,231 @@
-//! 管理 API（/health、/reload、/logs、/logs/<dir>/stream）。
+//! app-cli internal management API.
 
+use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event, Sse};
-use axum::{Json, Router};
+use anyhow::{Context, Result};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
-use futures::stream::Stream;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use axum::{Json, Router};
+use futures::Stream;
+use serde_json::{Value, json};
+use utoipa::OpenApi;
 
-/// 启动管理 API（阻塞，由 main.rs 在 tokio::spawn 里跑）。
-pub async fn serve(addr: &str, log_dir: PathBuf) {
-    let state = AppState { log_dir };
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/reload", post(reload))
-        .route("/logs", get(list_logs))
-        .route("/logs/{dir}", get(get_logs))
-        .route("/logs/{dir}/stream", get(stream_logs))
-        .with_state(state);
+use crate::log::model::{LogQueryRequest, LogQueryResponse, LogSourceInfo};
+use crate::log::service::LogService;
+use crate::runtime_status::RuntimeStatusService;
 
-    match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => {
-            tracing::info!("📡 管理 API 监听 http://{addr}");
-            if let Err(e) = axum::serve(listener, app).await {
-                tracing::error!("管理 API 异常: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("⚠️  管理 API 绑定 {addr} 失败: {e}"),
-    }
-}
+mod proxy;
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        query_sources,
+        query_logs,
+        stream_logs,
+        proxy::validate,
+        proxy::reload,
+        proxy::status,
+        proxy::effective_config,
+        proxy::upstreams
+    ),
+    components(schemas(
+        LogQueryRequest,
+        crate::log::model::LogSelector,
+        LogQueryResponse,
+        LogSourceInfo,
+        crate::log::model::LogRecord,
+        crate::log::model::SourceError
+    )),
+    tags(
+        (name = "Runtime Logs", description = "Multi-service declared file logs"),
+        (name = "Runtime Proxy", description = "Pingap validation and runtime status")
+    )
+)]
+struct ApiDoc;
 
 #[derive(Clone)]
-struct AppState {
+pub(super) struct AppState {
+    logs: LogService,
+    workspace: PathBuf,
+    pingap_bin: PathBuf,
+    release: workspace_manifest::ReleaseLock,
+    runtime_status: RuntimeStatusService,
+}
+
+pub async fn serve(
+    addr: &str,
+    workspace: PathBuf,
     log_dir: PathBuf,
+    pingap_bin: PathBuf,
+    runtime_status: RuntimeStatusService,
+) -> Result<()> {
+    let release = crate::manifest::read_release_lock(&workspace)?;
+    let state = AppState {
+        logs: LogService::new(release.clone(), log_dir),
+        workspace,
+        pingap_bin,
+        release,
+        runtime_status,
+    };
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/openapi.json", get(openapi))
+        .route("/v1/logs/sources/query", post(query_sources))
+        .route("/v1/logs/query", post(query_logs))
+        .route("/v1/logs/stream", post(stream_logs))
+        .route("/v1/proxy/validate", post(proxy::validate))
+        .route("/v1/proxy/reload", post(proxy::reload))
+        .route("/v1/proxy/status", get(proxy::status))
+        .route("/v1/proxy/effective-config", get(proxy::effective_config))
+        .route("/v1/proxy/upstreams", get(proxy::upstreams))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind app-cli API {addr}"))?;
+    tracing::info!("app-cli management API listening on http://{addr}");
+    axum::serve(listener, app)
+        .await
+        .context("serve app-cli management API")
 }
 
-// ── /health ───────────────────────────────────────────────────────────────────────
-
-async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "service": "app-cli" }))
+async fn openapi() -> Json<utoipa::openapi::OpenApi> {
+    Json(ApiDoc::openapi())
 }
 
-// ── /reload ───────────────────────────────────────────────────────────────────────
-
-async fn reload() -> Json<Value> {
-    // TODO: 读 workspace manifest → 重生成 pingap config → 写 pingap.toml
-    //       → pingap --autoreload 检测文件变化热生效
-    Json(json!({ "status": "todo", "message": "dynamic reload not yet implemented" }))
-}
-
-// ── /logs（列举）──────────────────────────────────────────────────────────────
-
-async fn list_logs(State(state): State<AppState>) -> Json<Value> {
-    let logs = crate::log::reader::list_log_files(&state.log_dir);
-    Json(serde_json::to_value(&logs).unwrap_or(json!([])))
-}
-
-// ── /logs/<dir>（读历史 tail N 行）────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct LogQuery {
-    #[serde(default = "default_lines")]
-    lines: usize,
-    #[serde(default)]
-    err: Option<bool>,
-}
-
-fn default_lines() -> usize {
-    1000
-}
-
-/// 子项目目录名安全校验：仅允许 `[A-Za-z0-9._-]`，禁止空 / `.` / `..` / 路径分隔符。
-/// `dir` 来自 URL，无校验拼路径会 `../` 穿越 `log_dir` 读到容器内任意文件。
-fn is_safe_dir(dir: &str) -> bool {
-    !dir.is_empty()
-        && dir != "."
-        && dir != ".."
-        && !dir.contains('/')
-        && !dir.contains('\\')
-        && dir
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
-/// 解析日志文件路径（带穿越校验）：`<log_dir>/<dir>.<out|err>.log`。
-fn resolve_log_path(
-    log_dir: &std::path::Path,
-    dir: &str,
-    err: bool,
-) -> Result<PathBuf, (StatusCode, String)> {
-    if !is_safe_dir(dir) {
-        return Err((StatusCode::BAD_REQUEST, format!("invalid log dir: {dir}")));
+async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    if state.runtime_status.is_ready() {
+        (
+            StatusCode::OK,
+            Json(json!({ "status": "ready", "service": "app-cli" })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "not_ready", "service": "app-cli" })),
+        )
     }
-    let suffix = if err { ".err.log" } else { ".out.log" };
-    Ok(log_dir.join(format!("{dir}{suffix}")))
 }
 
-async fn get_logs(
+#[utoipa::path(
+    post,
+    path = "/v1/logs/sources/query",
+    request_body = LogQueryRequest,
+    responses(
+        (status = 200, body = Vec<LogSourceInfo>),
+        (status = 400, description = "Invalid selector or query")
+    ),
+    tag = "Runtime Logs"
+)]
+async fn query_sources(
     State(state): State<AppState>,
-    Path(dir): Path<String>,
-    Query(q): Query<LogQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let path = resolve_log_path(&state.log_dir, &dir, q.err.unwrap_or(false))?;
-    Ok(match crate::log::reader::read_last_n_lines(&path, q.lines) {
-        Ok((lines, total_bytes, has_more)) => Json(json!({
-            "dir": dir,
-            "totalBytes": total_bytes,
-            "lines": lines,
-            "truncated": has_more,
-        })),
-        Err(e) => Json(json!({ "error": e.to_string() })),
-    })
+    Json(request): Json<LogQueryRequest>,
+) -> Result<Json<Vec<LogSourceInfo>>, (StatusCode, Json<Value>)> {
+    state.logs.sources(&request).map(Json).map_err(bad_request)
 }
 
-// ── /logs/<dir>/stream（SSE 实时流 + Last-Event-ID 补漏）────────────────────
+#[utoipa::path(
+    post,
+    path = "/v1/logs/query",
+    request_body = LogQueryRequest,
+    responses(
+        (status = 200, body = LogQueryResponse),
+        (status = 400, description = "Invalid selector or query")
+    ),
+    tag = "Runtime Logs"
+)]
+async fn query_logs(
+    State(state): State<AppState>,
+    Json(request): Json<LogQueryRequest>,
+) -> Result<Json<LogQueryResponse>, (StatusCode, Json<Value>)> {
+    state.logs.query(&request).map(Json).map_err(bad_request)
+}
 
+#[utoipa::path(
+    post,
+    path = "/v1/logs/stream",
+    request_body = LogQueryRequest,
+    responses(
+        (status = 200, description = "SSE events: log, source_error, source_recovered, cursor_reset, checkpoint, heartbeat"),
+        (status = 400, description = "Invalid selector or query")
+    ),
+    tag = "Runtime Logs"
+)]
 async fn stream_logs(
     State(state): State<AppState>,
-    Path(dir): Path<String>,
-    Query(q): Query<LogQuery>,
-    headers: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)> {
-    let path = resolve_log_path(&state.log_dir, &dir, q.err.unwrap_or(false))?;
-
-    // 读 Last-Event-ID（浏览器断线重连自动发）
-    let start_offset = headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            // 没有 Last-Event-ID = 首次连接 → 从文件尾开始（只推新行）
-            crate::log::reader::file_size(&path)
-        });
-
-    tracing::info!("SSE stream {dir} from offset {start_offset}");
-
+    Json(mut request): Json<LogQueryRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
+    state.logs.sources(&request).map_err(bad_request)?;
     let stream = async_stream::stream! {
-        let mut offset = start_offset;
+        let mut first = true;
+        let mut last_checkpoint: Option<String> = None;
+        let mut failed_sources: BTreeSet<(String, String)> = BTreeSet::new();
         loop {
-            let current_size = crate::log::reader::file_size(&path);
-            // 日志轮转/截断检测：writer rotate 后新文件从 0 开始增长，
-            // 此时 offset（旧文件的字节位置）> current_size。若不重置，
-            // `offset < current_size` 恒为 false → SSE 永久断流、丢日志。
-            if current_size < offset {
-                tracing::info!(
-                    "log rotated/truncated for {dir}: offset {offset} > size {current_size}, resetting to 0"
-                );
-                offset = 0;
+            if !first {
+                request.tail = None;
             }
-            if let Ok((lines, total)) = crate::log::reader::read_from_offset(&path, offset) {
-                for (line, byte_pos) in lines {
-                    yield Ok(Event::default()
-                        .id(byte_pos.to_string())
-                        .data(line));
+            match state.logs.query(&request) {
+                Ok(response) => {
+                    for record in response.logs {
+                        if let Ok(data) = serde_json::to_string(&record) {
+                            yield Ok(Event::default().event("log").data(data));
+                        }
+                    }
+                    let mut current_failures = BTreeSet::new();
+                    for error in response.source_errors {
+                        let key = (error.service_id.clone(), error.source_id.clone());
+                        current_failures.insert(key.clone());
+                        if !failed_sources.contains(&key)
+                            && let Ok(data) = serde_json::to_string(&error)
+                        {
+                            yield Ok(Event::default().event("source_error").data(data));
+                        }
+                    }
+                    for (service_id, source_id) in failed_sources.difference(&current_failures) {
+                        yield Ok(Event::default().event("source_recovered").data(
+                            json!({
+                                "serviceId": service_id,
+                                "sourceId": source_id,
+                            })
+                            .to_string(),
+                        ));
+                    }
+                    failed_sources = current_failures;
+                    request.cursor = Some(response.cursor.clone());
+                    if last_checkpoint.as_deref() != Some(response.cursor.as_str()) {
+                        last_checkpoint = Some(response.cursor.clone());
+                        yield Ok(Event::default().event("checkpoint").data(response.cursor));
+                    }
                 }
-                offset = total;
+                Err(error) => {
+                    yield Ok(Event::default()
+                        .event("cursor_reset")
+                        .data(json!({"message": error.to_string()}).to_string()));
+                    request.cursor = None;
+                    last_checkpoint = None;
+                }
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            first = false;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     };
-
-    Ok(Sse::new(stream))
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .event(Event::default().event("heartbeat").data("{}")),
+    ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn safe_dir_allows_normal_names() {
-        assert!(is_safe_dir("frontend"));
-        assert!(is_safe_dir("backend-go"));
-        assert!(is_safe_dir("api_v2"));
-        assert!(is_safe_dir("service.api"));
-    }
-
-    #[test]
-    fn safe_dir_rejects_traversal() {
-        // 空与裸点
-        assert!(!is_safe_dir(""));
-        assert!(!is_safe_dir("."));
-        assert!(!is_safe_dir(".."));
-        // 路径分隔符（含 URL 解码后的 /）
-        assert!(!is_safe_dir("../"));
-        assert!(!is_safe_dir("../etc"));
-        assert!(!is_safe_dir("foo/../bar"));
-        assert!(!is_safe_dir("a/b"));
-        assert!(!is_safe_dir("a\\b"));
-        // 非 ASCII 与特殊符号
-        assert!(!is_safe_dir("项目"));
-        assert!(!is_safe_dir("a;b"));
-        assert!(!is_safe_dir("a b"));
-    }
-
-    #[test]
-    fn resolve_log_path_blocks_traversal() {
-        let tmp = std::env::temp_dir();
-        assert!(resolve_log_path(&tmp, "..", false).is_err());
-        assert!(resolve_log_path(&tmp, "../../etc/passwd", false).is_err());
-        assert!(resolve_log_path(&tmp, "ok", true).is_ok());
-    }
+fn bad_request(error: anyhow::Error) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "code": "INVALID_LOG_QUERY",
+            "message": error.to_string(),
+        })),
+    )
 }

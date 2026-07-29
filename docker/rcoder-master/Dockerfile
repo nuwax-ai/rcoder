@@ -67,7 +67,8 @@ COPY . .
 # 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
 ARG CARGO_FLAGS=""
 RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
-    cargo build --release --bin rcoder --bin agent_runner --bin file-server ${CARGO_FLAGS}
+    cargo build --release --bin rcoder --bin agent_runner ${CARGO_FLAGS} && \
+    cargo build --release -p file-server --bin file-server
 
 # ============================================================================
 # 第二阶段：运行阶段（基于基础镜像）

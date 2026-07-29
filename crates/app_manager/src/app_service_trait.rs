@@ -84,6 +84,26 @@ pub trait AppServiceTrait: Send + Sync {
     /// 重启应用（rollout restart）
     async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
 
+    async fn prepare_release(
+        &self,
+        app_id: &str,
+        request: PrepareReleaseRequest,
+    ) -> AppResult<ReleaseInfo>;
+
+    async fn activate_release(&self, app_id: &str, release_id: &str) -> AppResult<ReleaseInfo>;
+
+    async fn confirm_release(
+        &self,
+        app_id: &str,
+        release_id: &str,
+        healthy: bool,
+        message: Option<String>,
+    ) -> AppResult<ReleaseInfo>;
+
+    async fn list_releases(&self, app_id: &str) -> AppResult<ReleaseListResponse>;
+
+    async fn delete_release(&self, app_id: &str, release_id: &str) -> AppResult<()>;
+
     /// 获取应用日志（读取共享工作空间的 logs/app.log）
     async fn get_app_logs(&self, app_id: &str, params: LogParams) -> AppResult<Vec<LogEntry>>;
 

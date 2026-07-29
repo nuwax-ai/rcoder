@@ -35,6 +35,14 @@ futures = "0.3"
 async-stream = "0.3"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
+utoipa = { version = "5", features = ["axum_extras"] }
+globset = "0.4"
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.13", default-features = false }
+semver = "1"
 
 # unix 下发 SIGTERM 做 graceful shutdown（仅 unix 启用，不污染 windows 构建）
 [target.'cfg(unix)'.dependencies]

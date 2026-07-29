@@ -88,6 +88,9 @@ nix = { workspace = true }
 
 # 正则 (构建错误解析)
 regex = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
 
 # package.json 中 npm 版本范围解析（Vue 主版本检测）
 node-semver = { workspace = true }

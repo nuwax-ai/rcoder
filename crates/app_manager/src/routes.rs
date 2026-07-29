@@ -25,15 +25,38 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
         .route("/api/v1/apps/{app_id}/start", post(handlers::start_app))
         .route("/api/v1/apps/{app_id}/stop", post(handlers::stop_app))
         .route("/api/v1/apps/{app_id}/restart", post(handlers::restart_app))
-        // 查询接口
-        .route("/api/v1/apps/{app_id}/logs", get(handlers::get_app_logs))
         .route(
-            "/api/v1/apps/{app_id}/logs/file",
-            get(handlers::get_app_file_logs),
+            "/api/v1/apps/{app_id}/releases/prepare",
+            post(handlers::prepare_release),
+        )
+        .route(
+            "/api/v1/apps/{app_id}/releases/{release_id}/activate",
+            post(handlers::activate_release),
+        )
+        .route(
+            "/api/v1/apps/{app_id}/releases/{release_id}/confirm",
+            post(handlers::confirm_release),
+        )
+        .route(
+            "/api/v1/apps/{app_id}/releases",
+            get(handlers::list_releases),
+        )
+        .route(
+            "/api/v1/apps/{app_id}/releases/{release_id}/delete",
+            post(handlers::delete_release),
+        )
+        // 查询接口
+        .route(
+            "/api/v1/apps/{app_id}/logs/sources/query",
+            post(handlers::query_app_log_sources),
+        )
+        .route(
+            "/api/v1/apps/{app_id}/logs/query",
+            post(handlers::query_app_logs),
         )
         .route(
             "/api/v1/apps/{app_id}/logs/stream",
-            get(handlers::stream_app_logs),
+            post(handlers::stream_app_logs_v1),
         )
         .route(
             "/api/v1/apps/{app_id}/health",

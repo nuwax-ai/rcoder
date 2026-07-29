@@ -8,7 +8,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::AppState;
-use crate::handlers::{build, build_support, computer, git, health, project, static_files, userapp};
+use crate::handlers::{
+    build, build_support, computer, git, health, project, static_files, userapp,
+};
 
 /// 业务路由与 OpenAPI 文档的唯一聚合入口。
 pub fn api_router() -> OpenApiRouter<AppState> {
@@ -125,9 +127,34 @@ fn page_router() -> OpenApiRouter<AppState> {
 fn userapp_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(userapp::build_workspace))
+        .routes(routes!(userapp::detect_project))
+        .routes(routes!(userapp::confirm_project))
         .routes(routes!(static_files::serve_userapp))
         .route(
             "/static/{app_id}/{*rest}",
             options(static_files::serve_userapp),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn userapp_routes_are_registered_in_openapi() {
+        let document = api_router().into_openapi();
+        assert!(document.paths.paths.contains_key("/api/userapp/build"));
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/userapp/projects/detect")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/userapp/projects/confirm")
+        );
+    }
 }

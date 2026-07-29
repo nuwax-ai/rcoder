@@ -1,4 +1,4 @@
-//! 整体包 `workspace-package.zip` 组装。
+//! 版本化整体包 `workspace-package-<release_id>.zip` 组装。
 //!
 //! 各子项目 zip **直接 raw copy**（加 `{path}/` 前缀，不二次压缩）+ workspace 根入口文件
 //! （`start.sh`/`scripts/`，小文件正常压缩）+ pingap 配置 + `.service-ports`。
@@ -11,20 +11,25 @@ use std::path::Path;
 
 use crate::error::{AppError, AppResult};
 
-use super::{BuiltProject, WORKSPACE_PACKAGE_ZIP};
+use super::BuiltProject;
+use super::manifest::ReleaseLock;
 
 /// ZipWriter 绑定磁盘文件（组装整体包用）。别名避免在多个 helper 签名里重复长类型。
 type ZipWriterFile = ::zip::ZipWriter<std::fs::File>;
 
-/// 组装整体包 → 写 `{workspace}/workspace-package.zip`。失败时清理半成品（避免 GET static 服务到损坏包）。
+/// 组装整体包。失败时清理半成品，避免静态下载服务返回损坏包。
 pub(super) async fn assemble_workspace_package(
     ws: &Path,
     built: &[BuiltProject],
+    release_lock: &ReleaseLock,
+    file_name: &str,
 ) -> AppResult<std::path::PathBuf> {
-    let out = ws.join(WORKSPACE_PACKAGE_ZIP);
+    let out = ws.join(file_name);
     let out_for_task = out.clone();
     let ws_for_task = ws.to_path_buf();
     let built_for_task = built.to_vec();
+    let lock_toml = toml::to_string_pretty(release_lock)
+        .map_err(|e| AppError::system(format!("serialize release.lock.toml: {e}")))?;
 
     tokio::task::spawn_blocking(move || -> AppResult<()> {
         // 失败时清理半成品 zip，避免后续 GET static 服务到一个损坏包（404 优于坏包）
@@ -33,7 +38,7 @@ pub(super) async fn assemble_workspace_package(
                 std::fs::create_dir_all(parent)?;
             }
             let out_file = std::fs::File::create(&out_for_task)
-                .map_err(|e| AppError::file(format!("create workspace-package.zip: {e}")))?;
+                .map_err(|e| AppError::file(format!("create workspace package: {e}")))?;
             let mut zw = ZipWriterFile::new(out_file);
 
             // 1. 各子项目 zip：raw copy（保留原始压缩字节，不二次压缩），加 {path}/ 前缀
@@ -46,9 +51,17 @@ pub(super) async fn assemble_workspace_package(
 
             // 3. workspace.manifest.toml + 各 project.manifest.toml（app-cli 运行时读，编排子项目 + pingap）
             add_file_if_exists(&mut zw, &ws_for_task, "workspace.manifest.toml")?;
+            zw.start_file("release.lock.toml", deflate_opts())
+                .map_err(|e| AppError::file(format!("start_file release.lock.toml: {e}")))?;
+            use std::io::Write;
+            zw.write_all(lock_toml.as_bytes())?;
             for proj in &built_for_task {
                 let rel = format!("{}/project.manifest.toml", proj.path);
                 add_file_if_exists(&mut zw, &ws_for_task, &rel)?;
+            }
+            let pingap = ws_for_task.join("pingap");
+            if pingap.is_dir() {
+                add_dir_entries(&mut zw, &pingap, "pingap")?;
             }
 
             zw.finish()
@@ -158,6 +171,26 @@ fn add_file_if_exists(zw: &mut ZipWriterFile, ws_root: &Path, rel_path: &str) ->
 mod tests {
     use super::*;
     use crate::service::zip; // 本地 zip::extract_to（解整体包做断言；非 test 代码用 ::zip 外部 crate raw copy）
+    use shared_types::{LockedPingap, PingapMode};
+
+    const TEST_PACKAGE: &str = "workspace-package-test-release.zip";
+
+    fn test_lock() -> ReleaseLock {
+        ReleaseLock {
+            schema_version: 1,
+            release_id: "test-release".into(),
+            workspace_name: "test".into(),
+            pingap: LockedPingap {
+                mode: PingapMode::Managed,
+                config: None,
+                version: "test".into(),
+                commit: "test".into(),
+            },
+            minimum_app_cli_version: "0.1.3".into(),
+            runtime_image_digest: "sha256:test".into(),
+            services: Vec::new(),
+        }
+    }
 
     /// 用 zip crate 造一个「zip 根直接是文件」的产物包（模拟子项目 build 产物）。
     fn make_flat_zip(zip_path: &Path, entries: &[(&str, &str)]) -> std::io::Result<()> {
@@ -187,7 +220,7 @@ mod tests {
         // workspace.manifest.toml（app-cli 运行时读，应进包）
         std::fs::write(
             ws_path.join("workspace.manifest.toml"),
-            "[workspace]\nname=\"x\"\n[[projects]]\nname=\"frontend\"\npath=\"userapp-frontend\"\n",
+            "schema_version=1\n[workspace]\nname=\"x\"\n[pingap]\nmode=\"managed\"\n",
         )
         .unwrap();
 
@@ -227,13 +260,10 @@ mod tests {
             },
         ];
 
-        let out = assemble_workspace_package(&ws_path, &built)
+        let out = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE)
             .await
             .expect("assemble workspace package");
-        assert_eq!(
-            out.file_name().unwrap().to_str().unwrap(),
-            WORKSPACE_PACKAGE_ZIP
-        );
+        assert_eq!(out.file_name().unwrap().to_str().unwrap(), TEST_PACKAGE);
 
         // 解开整体包校验预定义结构
         let extract_dst = tempfile::tempdir().expect("extract tempdir");
@@ -262,6 +292,7 @@ mod tests {
         assert!(root.join("scripts/lib/helpers.sh").is_file());
         // manifest 进包（app-cli 运行时读）
         assert!(root.join("workspace.manifest.toml").is_file());
+        assert!(root.join("release.lock.toml").is_file());
         assert!(
             root.join("userapp-frontend/project.manifest.toml")
                 .is_file()
@@ -282,7 +313,7 @@ mod tests {
             artifact: fe_zip,
         }];
 
-        let out = assemble_workspace_package(&ws_path, &built)
+        let out = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE)
             .await
             .expect("assemble without entry files");
         let extract_dst = tempfile::tempdir().expect("extract tempdir");
@@ -311,14 +342,14 @@ mod tests {
             artifact: bad_zip,
         }];
 
-        let result = assemble_workspace_package(&ws_path, &built).await;
+        let result = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE).await;
         assert!(result.is_err(), "assemble should fail on corrupt artifact");
 
-        // 失败后半成品 workspace-package.zip 必须被清理（否则后续 GET static 会服务到损坏包）
-        let out = ws_path.join(WORKSPACE_PACKAGE_ZIP);
+        // 失败后半成品版本包必须被清理。
+        let out = ws_path.join(TEST_PACKAGE);
         assert!(
             !out.exists(),
-            "partial workspace-package.zip should be cleaned up on failure"
+            "partial workspace package should be cleaned up on failure"
         );
     }
 }

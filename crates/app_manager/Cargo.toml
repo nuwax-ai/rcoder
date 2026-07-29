@@ -16,6 +16,7 @@ docker_manager = { workspace = true }
 rcoder-proxy = { workspace = true }
 shared_types = { workspace = true }
 download_utils = { workspace = true }
+workspace-manifest = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }
@@ -23,10 +24,13 @@ tokio = { workspace = true, features = ["fs"] }
 
 # HTTP server
 axum = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+toml = { workspace = true }
 
 # Date/time
 chrono = { workspace = true }
@@ -49,3 +53,7 @@ utoipa = { workspace = true }
 # Temp files
 tempfile = { workspace = true }
 tokio-util = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zip = { workspace = true }
+fs2 = "0.4"

@@ -18,6 +18,10 @@ services:
       # 阶段2: rcoder 嵌入 Rust file-server (端口 60000, 替代 nuwax-file-server 独立进程)
       # Docker 模式无 Ceph, 嵌入后用 LocalWorkspaceResolver (共享 Docker volume)
       - RCODER_EMBED_FILE_SERVER=true
+      # UserApp release.lock 构建元数据；测试正式镜像时建议由 shell 覆盖 digest。
+      - RCODER_PINGAP_VERSION=${RCODER_PINGAP_VERSION:-0.13.7}
+      - RCODER_PINGAP_COMMIT=${RCODER_PINGAP_COMMIT:-056161144ef0fcceb034ca0e5a1973abd48d2d10}
+      - RCODER_RUNTIME_IMAGE_DIGEST=${RCODER_RUNTIME_IMAGE_DIGEST:-sha256:local-development}
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}
       # 主容器禁用 ttyd（ttyd 在动态创建的容器中运行）

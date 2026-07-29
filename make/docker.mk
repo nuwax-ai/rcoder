@@ -12,9 +12,12 @@ PUSH_IMAGE ?= false
 # 串行构建镜像，避免资源竞争
 docker-build:
 	@echo "🔨 开始构建主镜像..."
-	@$(MAKE) docker-build-master & \
-	$(MAKE) docker-build-agent-runner & \
-	wait
+	@task_build_status=0; \
+	$(MAKE) docker-build-master & master_pid=$$!; \
+	$(MAKE) docker-build-agent-runner & agent_pid=$$!; \
+	wait $$master_pid || task_build_status=$$?; \
+	wait $$agent_pid || task_build_status=$$?; \
+	exit $$task_build_status
 	@echo ""
 	@echo "✅ 所有 Docker 镜像构建完成！"
 	@echo "  ✓ dev-master-rcoder:latest"

@@ -14,26 +14,32 @@ use tracing::{error, info, warn};
 
 use crate::config::CliArgs;
 use crate::manifest::{self, ServiceSpec};
-use crate::proxy::pingap::{build_pingap_config, ProxyEntry, PINGAP_PORT};
+use crate::proxy::compiler::compile_and_validate;
+use crate::proxy::pingap::PINGAP_PORT;
+use crate::runtime_status::RuntimeStatusService;
 
 /// 编排主入口。
-pub async fn run(args: &CliArgs) -> Result<()> {
+pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result<()> {
+    runtime_status.set_ready(false);
     // 1. 自动发现子项目 + 组装服务清单
-    let specs = manifest::build_specs(&args.workspace)
-        .context("discover + build service specs")?;
+    let release = manifest::read_release_lock(&args.workspace).context("load release lock")?;
+    validate_runtime_compatibility(&release)?;
+    let specs = release.services.clone();
 
     // 2. wait PG（PG 由 supervisor [program:postgresql] 托管，秒级就绪；失败不阻断）
-    wait_for_pg().await;
+    wait_for_pg().await?;
 
     // 3. 各子项目：migrate → start
     let mut children: Vec<(String, Child)> = Vec::new();
     for spec in &specs {
         // migrate（如有）—— 失败不阻断其他项目（多项目隔离），但 error! 暴露 +
         // stdout/stderr 已落 app-cli 日志（run_transient 内打印），便于排障（Fail Fast）。
-        if let Some(migrate_cmd) = spec.run.migrate.as_ref().filter(|c| !c.is_empty()) {
+        if !spec.run.migrate.is_empty() {
             info!("🛠️  migrate {}", spec.name);
-            if let Err(e) = run_transient(migrate_cmd, &args.workspace.join(&spec.dir)).await {
-                error!("❌ migrate {} failed: {e} — continuing（其他项目仍启动）", spec.name);
+            if let Err(e) = run_transient(&spec.run.migrate, &args.workspace.join(&spec.dir)).await
+            {
+                error!("❌ migrate {} failed: {e}", spec.name);
+                return Err(e);
             }
         }
         // start
@@ -50,36 +56,62 @@ pub async fn run(args: &CliArgs) -> Result<()> {
         }
     }
 
-    // 4. 生成 pingap 配置 + spawn pingap
-    let proxy_entries: Vec<ProxyEntry> = specs
-        .iter()
-        .filter_map(|s| {
-            s.proxy.as_ref().map(|p| ProxyEntry {
-                name: s.name.clone(),
-                port: s.port,
-                proxy: p.clone(),
-                health: s.health.clone(),
-            })
-        })
-        .collect();
-    if let Err(e) = start_pingap(&args.workspace, &proxy_entries, &args.pingap_bin, &mut children).await {
-        warn!("⚠️  pingap 启动失败: {e} — 继续仅子项目");
-    }
+    // 4. 编译、完整验证并启动 Pingap；代理失败时 workspace 不得进入 ready。
+    start_pingap(&args.workspace, &args.pingap_bin, &release, &mut children).await?;
+
+    wait_for_services_ready(&specs).await?;
+    runtime_status.set_ready(true);
 
     if children.is_empty() {
         anyhow::bail!("no service started");
     }
 
     // 5. supervise（阻塞直到任一退出或信号）
-    info!("✅ all services started, supervising {} process(es)", children.len());
-    supervise(children).await;
+    info!(
+        "✅ all services started, supervising {} process(es)",
+        children.len()
+    );
+    let shutdown_timeout = specs
+        .iter()
+        .map(|service| service.run.shutdown_timeout_seconds)
+        .max()
+        .unwrap_or(30);
+    supervise(children, shutdown_timeout).await;
+    runtime_status.set_ready(false);
+    Ok(())
+}
+
+fn validate_runtime_compatibility(release: &workspace_manifest::ReleaseLock) -> Result<()> {
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .context("parse current app-cli version")?;
+    let minimum = semver::Version::parse(&release.minimum_app_cli_version)
+        .context("parse minimum app-cli version from release lock")?;
+    if current < minimum {
+        anyhow::bail!("release requires app-cli >= {minimum}, current version is {current}");
+    }
+    for (name, locked) in [
+        ("RCODER_PINGAP_VERSION", release.pingap.version.as_str()),
+        ("RCODER_PINGAP_COMMIT", release.pingap.commit.as_str()),
+        (
+            "RCODER_RUNTIME_IMAGE_DIGEST",
+            release.runtime_image_digest.as_str(),
+        ),
+    ] {
+        let runtime = std::env::var(name)
+            .with_context(|| format!("required runtime identity is missing: {name}"))?;
+        if runtime != locked {
+            anyhow::bail!(
+                "runtime identity mismatch for {name}: release={locked}, runtime={runtime}"
+            );
+        }
+    }
     Ok(())
 }
 
 // ── PG 等待 ──────────────────────────────────────────────────────────────────
 
 /// pg_isready 轮询（最多 30 次 × 2s = 60s），失败不阻断（PG 可能晚于 app-cli 启）。
-async fn wait_for_pg() {
+async fn wait_for_pg() -> Result<()> {
     let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".into());
     let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
     let user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "app".into());
@@ -87,58 +119,110 @@ async fn wait_for_pg() {
 
     for i in 1..=30u8 {
         let result = Command::new("pg_isready")
-            .arg("-h").arg(&host)
-            .arg("-p").arg(&port)
-            .arg("-U").arg(&user)
+            .arg("-h")
+            .arg(&host)
+            .arg("-p")
+            .arg(&port)
+            .arg("-U")
+            .arg(&user)
             .env("PGPASSWORD", &pwd)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status().await;
+            .status()
+            .await;
         if matches!(result, Ok(s) if s.success()) {
             info!("✅ PG ready (after {i} attempt(s))");
-            return;
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    warn!("⚠️  PG not ready after 30 attempts — continuing anyway");
+    anyhow::bail!("PostgreSQL not ready after 60 seconds");
+}
+
+async fn wait_for_services_ready(specs: &[ServiceSpec]) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .context("build readiness HTTP client")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let mut pending = Vec::new();
+        for spec in specs
+            .iter()
+            .filter(|service| service.enabled && service.proxy.is_some())
+        {
+            let url = format!(
+                "http://127.0.0.1:{}{}",
+                spec.port, spec.health.readiness_path
+            );
+            let ready = client
+                .get(&url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success());
+            if !ready {
+                pending.push(spec.service_id.clone());
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "service readiness timed out after 120 seconds: {}",
+                pending.join(", ")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 // ── 子项目启动 ─────────────────────────────────────────────────────────────────
 
 /// 启动一个子项目（[run].command + PORT/HOSTNAME env + stdout/stderr → 轮转日志）。
-fn start_service(
-    spec: &ServiceSpec,
-    ws_root: &Path,
-    log_dir: &Path,
-) -> Result<Child> {
+fn start_service(spec: &ServiceSpec, ws_root: &Path, log_dir: &Path) -> Result<Child> {
     let cwd = ws_root.join(&spec.dir);
-    let out_path = log_dir.join(format!("{}.out.log", spec.dir));
-    let err_path = log_dir.join(format!("{}.err.log", spec.dir));
+    let service_log_dir = log_dir.join(&spec.service_id);
+    std::fs::create_dir_all(&service_log_dir)
+        .with_context(|| format!("create service log dir {}", service_log_dir.display()))?;
+    let out_path = service_log_dir.join("runtime.out.log");
+    let err_path = service_log_dir.join("runtime.err.log");
 
-    let mut cmd = Command::new(&spec.run.command[0]);
+    let mut cmd = process_group_command(&spec.run.command[0]);
     cmd.args(&spec.run.command[1..])
         .current_dir(&cwd)
         .env("HOSTNAME", "0.0.0.0")
         .env("PORT", spec.port.to_string())
+        .env("APP_LOG_DIR", &service_log_dir)
+        .env("APP_SERVICE_ID", &spec.service_id)
         .envs(&spec.env) // 项目级 env（覆盖 workspace 级同名变量）
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("spawn {}: {}", spec.name, spec.run.command.join(" ")))?;
 
     // pipe → 带轮转的日志文件（append 模式，不 truncate；超 10MB rotate，保留 3 份）
     if let Some(stdout) = child.stdout.take() {
         let p = out_path.clone();
-        tokio::spawn(crate::log::writer::pipe_to_rotating_file(stdout, p, None, None));
+        tokio::spawn(crate::log::writer::pipe_to_rotating_file(
+            stdout, p, None, None,
+        ));
     }
     if let Some(stderr) = child.stderr.take() {
         let p = err_path.clone();
-        tokio::spawn(crate::log::writer::pipe_to_rotating_file(stderr, p, None, None));
+        tokio::spawn(crate::log::writer::pipe_to_rotating_file(
+            stderr, p, None, None,
+        ));
     }
 
-    info!("🚀 start {} on :{} (pid={})", spec.name, spec.port,
-        child.id().unwrap_or(0));
+    info!(
+        "🚀 start {} on :{} (pid={})",
+        spec.name,
+        spec.port,
+        child.id().unwrap_or(0)
+    );
     Ok(child)
 }
 
@@ -191,44 +275,28 @@ async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
 
 // ── pingap 启动 ─────────────────────────────────────────────────────────────────
 
-/// 生成 pingap 配置（build_pingap_config）→ 写到 ws_root/pingap/pingap.toml → spawn pingap。
+/// 编译用户权威配置到只读运行目录，`pingap -t` 成功后再启动。
 async fn start_pingap(
     ws_root: &Path,
-    proxy_entries: &[ProxyEntry],
     pingap_bin: &Path,
+    release: &workspace_manifest::ReleaseLock,
     children: &mut Vec<(String, Child)>,
 ) -> Result<()> {
-    let conf = match build_pingap_config(proxy_entries) {
-        Some(c) => c,
-        None => {
-            info!("no [proxy] declared → skip pingap");
-            return Ok(());
-        }
-    };
-    let conf_dir = ws_root.join("pingap");
-    tokio::fs::create_dir_all(&conf_dir).await?;
-    let conf_path = conf_dir.join("pingap.toml");
-    tokio::fs::write(&conf_path, &conf).await?;
-    info!("📝 pingap config → {}", conf_path.display());
+    let runtime_root = std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/run/app-cli/pingap".into());
+    let conf_path = compile_and_validate(ws_root, &runtime_root, pingap_bin, release).await?;
+    info!("📝 effective pingap config → {}", conf_path.display());
 
-    // spawn pingap（manifest 权威：每次启动从 manifest 重新生成；admin UI 改动临时，重启覆盖）
-    let mut cmd = Command::new(pingap_bin);
+    let mut cmd = process_group_command(pingap_bin);
     cmd.arg("-c").arg(&conf_path).arg("--autoreload");
-    // admin UI（从环境变量读 user/pass/addr；默认开 /pingap 路径，共用 :9080 端口）
-    if let (Ok(user), Ok(pass)) = (
-        std::env::var("PINGAP_ADMIN_USER"),
-        std::env::var("PINGAP_ADMIN_PASSWORD"),
-    ) {
-        let addr = std::env::var("PINGAP_ADMIN_ADDR")
-            .unwrap_or_else(|_| format!("0.0.0.0:{}/pingap", PINGAP_PORT));
-        let admin = format!("{user}:{pass}@{addr}");
-        cmd.arg(format!("--admin={admin}"));
-        info!("📡 pingap admin UI → http://{addr}");
-    } else {
-        info!("ℹ️  PINGAP_ADMIN_USER/PASSWORD 未设 → admin UI 关闭（设置环境变量开启）");
-    }
+    // Admin deliberately stays disabled: workspace TOML is the sole authority.
     let child = cmd.spawn().context("spawn pingap")?;
-    info!("🚀 start pingap on :{} (pid={})", PINGAP_PORT, child.id().unwrap_or(0));
+    info!(
+        "🚀 start pingap on :{} (pid={})",
+        PINGAP_PORT,
+        child.id().unwrap_or(0)
+    );
     children.push(("pingap".into(), child));
     Ok(())
 }
@@ -237,10 +305,8 @@ async fn start_pingap(
 
 /// 优雅停机宽限期（秒）：先 SIGTERM，超时后 SIGKILL。
 /// 对齐 agent_runner shutdown 惯例，避免 DB/写文件类子进程丢未刷盘数据。
-const SHUTDOWN_GRACE_SECS: u64 = 5;
-
 /// 阻塞直到收到 SIGINT/SIGTERM 或任一子进程退出 → 优雅停止所有子进程 → return。
-async fn supervise(mut children: Vec<(String, Child)>) {
+async fn supervise(mut children: Vec<(String, Child)>, shutdown_timeout_seconds: u64) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("📡 received SIGINT, shutting down");
@@ -254,11 +320,11 @@ async fn supervise(mut children: Vec<(String, Child)>) {
             }
         }
     }
-    shutdown_all(children).await;
+    shutdown_all(children, shutdown_timeout_seconds).await;
 }
 
 /// 优雅停止所有子进程：SIGTERM → 等 `SHUTDOWN_GRACE_SECS` → SIGKILL 残留。
-async fn shutdown_all(mut children: Vec<(String, Child)>) {
+async fn shutdown_all(mut children: Vec<(String, Child)>, shutdown_timeout_seconds: u64) {
     // 1. SIGTERM 所有子进程
     for (_, child) in children.iter_mut() {
         send_term(child);
@@ -266,12 +332,12 @@ async fn shutdown_all(mut children: Vec<(String, Child)>) {
     info!(
         "🛑 SIGTERM sent to {} process(es); grace {}s",
         children.len(),
-        SHUTDOWN_GRACE_SECS
+        shutdown_timeout_seconds
     );
 
     // 2. grace 窗口内轮询收尸
     let mut done = vec![false; children.len()];
-    let deadline = std::time::Instant::now() + Duration::from_secs(SHUTDOWN_GRACE_SECS);
+    let deadline = std::time::Instant::now() + Duration::from_secs(shutdown_timeout_seconds);
     while std::time::Instant::now() < deadline {
         for (i, (_, child)) in children.iter_mut().enumerate() {
             if !done[i] && matches!(child.try_wait(), Ok(Some(_))) {
@@ -288,7 +354,7 @@ async fn shutdown_all(mut children: Vec<(String, Child)>) {
     // 3. 超时 SIGKILL 残留
     for (i, (name, child)) in children.iter_mut().enumerate() {
         if !done[i] {
-            let _ = child.start_kill();
+            send_kill(child);
             warn!("💀 force-killed {name} (SIGKILL after grace)");
         }
     }
@@ -297,15 +363,29 @@ async fn shutdown_all(mut children: Vec<(String, Child)>) {
 /// 向子进程发 SIGTERM（unix）；其他平台无 SIGTERM，退化为 SIGKILL。
 #[cfg(unix)]
 fn send_term(child: &mut Child) {
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     if let Some(pid) = child.id() {
-        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
     }
 }
 
 #[cfg(not(unix))]
 fn send_term(child: &mut Child) {
+    let _ = child.start_kill();
+}
+
+#[cfg(unix)]
+fn send_kill(child: &mut Child) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    if let Some(pid) = child.id() {
+        let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn send_kill(child: &mut Child) {
     let _ = child.start_kill();
 }
 
@@ -327,7 +407,7 @@ async fn poll_any_exit(children: &mut [(String, Child)]) -> Option<String> {
 /// 由 [`tokio::signal::ctrl_c`] / `poll_any_exit` 兜底触发关闭。
 #[cfg(unix)]
 async fn wait_sigterm() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sig = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(e) => {
@@ -341,4 +421,16 @@ async fn wait_sigterm() {
 #[cfg(not(unix))]
 async fn wait_sigterm() {
     std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+fn process_group_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new("setsid");
+    command.arg("--").arg(program);
+    command
+}
+
+#[cfg(not(unix))]
+fn process_group_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    Command::new(program)
 }

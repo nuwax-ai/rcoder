@@ -625,7 +625,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::query_storage,
         app_manager::handlers::reset_db_password,
         app_manager::handlers::create_database,
-        app_manager::handlers::stream_app_logs,
+        app_manager::handlers::stream_app_logs_v1,
         app_manager::handlers::get_app_file_logs,
     ),
     components(

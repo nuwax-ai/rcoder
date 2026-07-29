@@ -5,16 +5,19 @@ use std::path::Path;
 use crate::error::{AppError, AppResult};
 
 pub use shared_types::{
-    BuildSection, DiscoveredProject, DiscoverError, ProjectManifest, ProjectMeta, ProxySection,
-    RunSection, WorkspaceManifest, WorkspaceMeta, discover_projects,
+    BuildSection, ProjectManifest, ProjectMeta, ProxySection, RunSection, WorkspaceManifest,
+    WorkspaceMeta,
+};
+pub(super) use shared_types::{
+    ReleaseLock, ReleaseMetadata, build_release_lock, discover_projects, parse_workspace,
 };
 
-/// 读 `workspace.manifest.toml`（只读 [workspace].name，[[projects]] 已废弃）。
+/// 读取并严格校验 Manifest v1 `workspace.manifest.toml`。
 pub(super) async fn read_workspace_manifest(ws: &Path) -> AppResult<WorkspaceManifest> {
     let path = ws.join("workspace.manifest.toml");
     let content = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| AppError::resource(format!("read workspace.manifest.toml: {e}")))?;
-    toml::from_str(&content)
+    parse_workspace(&content)
         .map_err(|e| AppError::business(format!("parse workspace.manifest.toml: {e}")))
 }

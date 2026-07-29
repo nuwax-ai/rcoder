@@ -13,18 +13,20 @@
 pub mod db;
 pub mod files;
 pub mod lifecycle;
-pub mod logs_stream;
+pub mod logs;
 pub mod ops;
 pub mod query;
+pub mod releases;
 pub mod state;
 pub mod storage;
 
 pub use db::*;
 pub use files::*;
 pub use lifecycle::*;
-pub use logs_stream::*;
+pub use logs::*;
 pub use ops::*;
 pub use query::*;
+pub use releases::*;
 pub use state::AppManagerState;
 pub use storage::*;
 

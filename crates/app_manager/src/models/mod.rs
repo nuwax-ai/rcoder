@@ -9,12 +9,16 @@
 
 pub mod commons;
 pub mod db;
+pub mod logs;
+pub mod release;
 pub mod request;
 pub mod response;
 pub mod storage;
 
 pub use commons::*;
 pub use db::*;
+pub use logs::*;
+pub use release::*;
 pub use request::*;
 pub use response::*;
 pub use storage::*;

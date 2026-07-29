@@ -4,4 +4,6 @@
 //! - [`reader`]：list_log_files + read_last_n_lines + read_from_offset
 
 pub mod reader;
+pub mod model;
+pub mod service;
 pub mod writer;

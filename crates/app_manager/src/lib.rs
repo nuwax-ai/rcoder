@@ -5,11 +5,11 @@
 //! Docker / K8s 双后端统一走 ContainerRuntime 抽象。
 //! rcoder 无状态：业务元数据由调用方持久化。
 
-pub mod app_service_trait;
 pub mod app_db;
 pub mod app_ops;
 pub mod app_params;
 pub mod app_pingora;
+pub mod app_service_trait;
 pub mod app_status;
 pub mod app_workspace;
 pub mod config;
@@ -17,7 +17,9 @@ pub mod error;
 pub mod files;
 pub mod handlers;
 pub mod models;
+pub mod releases;
 pub mod routes;
+mod runtime_identity;
 pub mod service;
 pub mod storage;
 pub mod utils;

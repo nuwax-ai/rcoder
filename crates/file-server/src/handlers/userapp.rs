@@ -6,17 +6,17 @@
 //!
 //! 详见 `docs/userapp-development-design.md` §5。
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::error::AppError;
+use crate::extract::AppJson;
 use crate::extract::deserialize_id_string;
 use crate::extract::deserialize_optional_id_string;
-use crate::extract::AppJson;
-use crate::service::userapp::{self, WORKSPACE_PACKAGE_ZIP};
-use crate::AppState;
+use crate::service::userapp;
 
 /// `POST /api/userapp/build` 请求体。
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -26,6 +26,18 @@ pub(crate) struct BuildUserAppBody {
     #[serde(deserialize_with = "deserialize_id_string")]
     pub app_id: String,
     /// 多租户三级目录（可选，留空走单级；对齐 resolve_project）。
+    #[serde(default, deserialize_with = "deserialize_optional_id_string")]
+    pub tenant_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_id_string")]
+    pub space_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImportProjectBody {
+    #[serde(deserialize_with = "deserialize_id_string")]
+    pub app_id: String,
+    pub project_dir: String,
     #[serde(default, deserialize_with = "deserialize_optional_id_string")]
     pub tenant_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_id_string")]
@@ -51,7 +63,7 @@ pub(crate) async fn build_workspace(
     State(state): State<AppState>,
     AppJson(body): AppJson<BuildUserAppBody>,
 ) -> Result<Json<Value>, AppError> {
-    let pkg = userapp::build_workspace_package(
+    let artifact = userapp::build_workspace_package(
         state.resolver.as_ref(),
         state.build_manager.as_ref(),
         &body.app_id,
@@ -63,15 +75,67 @@ pub(crate) async fn build_workspace(
 
     tracing::info!(
         app_id = %body.app_id,
-        package = %pkg.display(),
+        package = %artifact.path.display(),
         "userapp workspace package built"
     );
 
     Ok(Json(json!({
         "success": true,
+        "releaseId": artifact.release_id,
+        "schemaVersion": 1,
         "artifact": {
-            "path": WORKSPACE_PACKAGE_ZIP,
-            "fileName": WORKSPACE_PACKAGE_ZIP,
+            "path": artifact.file_name,
+            "fileName": artifact.file_name,
+            "sha256": artifact.sha256,
+            "sizeBytes": artifact.size_bytes,
         }
     })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/detect",
+    request_body = ImportProjectBody,
+    responses(crate::openapi::JsonApiResponses),
+    tag = "UserApp"
+)]
+pub(crate) async fn detect_project(
+    State(state): State<AppState>,
+    AppJson(body): AppJson<ImportProjectBody>,
+) -> Result<Json<Value>, AppError> {
+    let workspace = state
+        .resolver
+        .resolve_project(&crate::workspace::ProjectContext {
+            project_id: body.app_id,
+            tenant_id: body.tenant_id,
+            space_id: body.space_id,
+            isolation_type: None,
+        })
+        .await?;
+    let result = userapp::import::detect_project(&workspace, &body.project_dir).await?;
+    Ok(Json(json!({"success": true, "detection": result})))
+}
+
+#[utoipa::path(
+    post,
+    path = "/projects/confirm",
+    request_body = ImportProjectBody,
+    responses(crate::openapi::JsonApiResponses),
+    tag = "UserApp"
+)]
+pub(crate) async fn confirm_project(
+    State(state): State<AppState>,
+    AppJson(body): AppJson<ImportProjectBody>,
+) -> Result<Json<Value>, AppError> {
+    let workspace = state
+        .resolver
+        .resolve_project(&crate::workspace::ProjectContext {
+            project_id: body.app_id,
+            tenant_id: body.tenant_id,
+            space_id: body.space_id,
+            isolation_type: None,
+        })
+        .await?;
+    let path = userapp::import::confirm_project(&workspace, &body.project_dir).await?;
+    Ok(Json(json!({"success": true, "path": path})))
 }

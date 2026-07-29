@@ -7,6 +7,7 @@ use app_cli::CliArgs;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
+    let runtime_status = app_cli::runtime_status::RuntimeStatusService::default();
 
     // init tracing：stderr + 文件（daily 轮转 + non-blocking，_guard 保活到 main 退出）
     let _guard = init_tracing(&args.log_dir);
@@ -22,12 +23,25 @@ async fn main() -> anyhow::Result<()> {
     // 管理 API（后台并发跑；supervisor 退出时 abort）
     let api_addr = args.admin_addr.clone();
     let api_log_dir = args.log_dir.clone();
+    let api_workspace = args.workspace.clone();
+    let api_pingap_bin = args.pingap_bin.clone();
+    let api_runtime_status = runtime_status.clone();
     let api_handle = tokio::spawn(async move {
-        app_cli::api::serve(&api_addr, api_log_dir).await;
+        if let Err(error) = app_cli::api::serve(
+            &api_addr,
+            api_workspace,
+            api_log_dir,
+            api_pingap_bin,
+            api_runtime_status,
+        )
+        .await
+        {
+            tracing::error!("app-cli API failed: {error:#}");
+        }
     });
 
     // supervisor（前台阻塞，退出 → main 退出 → supervisor [program:app] 重启）
-    match app_cli::supervisor::run(&args).await {
+    match app_cli::supervisor::run(&args, runtime_status).await {
         Ok(()) => tracing::info!("app-cli supervisor exited normally"),
         Err(e) => tracing::error!("app-cli supervisor error: {e:#}"),
     }

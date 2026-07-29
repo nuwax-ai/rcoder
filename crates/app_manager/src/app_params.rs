@@ -11,6 +11,7 @@ use container_runtime_api::{
 use shared_types::ServiceType;
 
 use super::models::*;
+use super::runtime_identity::inject_release_identity;
 use super::utils::*;
 use super::service::AppService;
 
@@ -133,6 +134,9 @@ impl AppService {
             space_id,
         } = input;
 
+        let app_dir = self.get_container_app_dir(app_id).await?;
+        let env = inject_release_identity(&app_dir, env.unwrap_or_default()).await?;
+
         // 端口：models::PortConfig → container_runtime_api::AppPortSpec
         let app_ports: Vec<AppPortSpec> = ports
             .map(|ps| {
@@ -187,7 +191,7 @@ impl AppService {
             .service_type(ServiceType::UserApp)
             .host_workspace_path(host_workspace_path)
             .image_override(image)
-            .env(env.unwrap_or_default())
+            .env(env)
             .secrets(secrets.unwrap_or_default())
             .ports(app_ports);
 

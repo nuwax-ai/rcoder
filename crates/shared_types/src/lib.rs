@@ -199,10 +199,6 @@ pub mod agent_mgmt_types;
 pub mod http_handlers;
 
 // UserApp workspace manifest 类型（极轻量独立 crate，file-server build + app-cli runtime 共用）
-pub use workspace_manifest::{
-    BuildSection, DiscoverError, DiscoveredProject, ProjectManifest, ProjectMeta, ProxySection,
-    RunSection, WorkspaceManifest, WorkspaceMeta, discover_projects,
-};
 pub use agent_mgmt_types::{
     AGENT_CACHE_DIR, AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus,
     CheckAgentRequest, CheckAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR, GetAgentRequest,
@@ -210,4 +206,11 @@ pub use agent_mgmt_types::{
     InstallFromUrlRequest, InstallType, ListAgentsRequest, ListAgentsResponse, MAX_BINARY_SIZE,
     MAX_EXTRACTED_SIZE, PlatformEntry, RoutingParams, StaticCheckResult, SystemInfo,
     UPLOAD_CHUNK_SIZE, URL_DOWNLOAD_TIMEOUT_SECS, UninstallAgentRequest, UninstallAgentResponse,
+};
+pub use workspace_manifest::{
+    BuildSection, DiscoverError, DiscoveredProject, HealthSection, LockedPingap, LockedService,
+    LogFormat, LogSource, LogsSection, ManifestError, PingapMode, PingapSection, ProjectKind,
+    ProjectManifest, ProjectMeta, ProjectType, ProxySection, ReleaseLock, ReleaseMetadata,
+    RunSection, WorkspaceManifest, WorkspaceMeta, build_release_lock, discover_projects,
+    parse_project, parse_workspace, validate_project, validate_topology, validate_workspace,
 };

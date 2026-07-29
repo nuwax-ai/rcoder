@@ -23,9 +23,9 @@ pub struct ProxyEntry {
 /// - pingap 监听 :9080；各子项目 upstream = `127.0.0.1:<port>`。
 /// - `proxy.path == "/"` 兜底（location 不写 path）；其余前缀匹配；`strip_prefix` 去前缀。
 /// - 每个 location 默认带 `pingap:requestId` + `pingap:compressionUpstream`（零配置内置插件）。
-pub fn build_pingap_config(entries: &[ProxyEntry]) -> Option<String> {
+pub fn build_pingap_config(entries: &[ProxyEntry]) -> anyhow::Result<Option<String>> {
     if entries.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut cfg = PingapConfig::default();
@@ -56,34 +56,9 @@ pub fn build_pingap_config(entries: &[ProxyEntry]) -> Option<String> {
             },
         );
 
-        // 构建 location plugins 列表：requestId → cache(可选) → limit(可选) → compression
+        // 平台内置插件 + manifest 显式引用的插件。
         let mut plugins: Vec<String> = vec!["pingap:requestId".into()];
-
-        // cache 插件（proxy.cache = true）
-        if e.proxy.cache.unwrap_or(false) {
-            let plugin_name = format!("{name}Cache");
-            let mut conf = pingap_config::PluginConf::new();
-            conf.insert("category".into(), "cache".into());
-            conf.insert("directory".into(), "memory://workspace?max_size=100mb".into());
-            conf.insert("namespace".into(), name.clone().into());
-            conf.insert("max_ttl".into(), "10m".into());
-            cfg.plugins.insert(plugin_name.clone(), conf);
-            plugins.push(plugin_name);
-        }
-
-        // rate_limit 插件（proxy.rate_limit = N）
-        if let Some(max) = e.proxy.rate_limit {
-            let plugin_name = format!("{name}RateLimit");
-            let mut conf = pingap_config::PluginConf::new();
-            conf.insert("category".into(), "limit".into());
-            conf.insert("type".into(), "rate".into());
-            conf.insert("tag".into(), "ip".into());
-            conf.insert("max".into(), (max as i64).into());
-            conf.insert("interval".into(), "60s".into());
-            cfg.plugins.insert(plugin_name.clone(), conf);
-            plugins.push(plugin_name);
-        }
-
+        plugins.extend(e.proxy.plugins.clone());
         plugins.push("pingap:compressionUpstream".into());
 
         let is_catchall = e.proxy.path == "/";
@@ -95,29 +70,29 @@ pub fn build_pingap_config(entries: &[ProxyEntry]) -> Option<String> {
         };
         if !is_catchall {
             loc.path = Some(e.proxy.path.clone());
-            if e.proxy.strip_prefix.unwrap_or(false) {
+            if e.proxy.strip_prefix {
                 loc.rewrite = Some(format!("^{}(.*) /$1", e.proxy.path));
             }
         }
         cfg.locations.insert(format!("{name}Location"), loc);
     }
 
-    toml::to_string(&cfg).ok()
+    Ok(Some(toml::to_string(&cfg)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn entry(name: &str, port: u16, path: &str, strip: Option<bool>) -> ProxyEntry {
+    fn entry(name: &str, port: u16, path: &str, strip: bool) -> ProxyEntry {
         ProxyEntry {
             name: name.into(),
             port,
             proxy: ProxySection {
                 path: path.into(),
                 strip_prefix: strip,
-                cache: None,
-                rate_limit: None,
+                plugins: Vec::new(),
+                upstream_includes: Vec::new(),
             },
             health: "/health".into(),
         }
@@ -125,16 +100,18 @@ mod tests {
 
     #[test]
     fn empty_entries_returns_none() {
-        assert!(build_pingap_config(&[]).is_none());
+        assert!(build_pingap_config(&[]).expect("serialize").is_none());
     }
 
     #[test]
     fn routes_root_and_api_with_builtin_plugins() {
         let entries = vec![
-            entry("frontend", 4000, "/", None),
-            entry("backend", 4001, "/api/", Some(true)),
+            entry("frontend", 4000, "/", false),
+            entry("backend", 4001, "/api/", true),
         ];
-        let toml_text = build_pingap_config(&entries).expect("→ Some");
+        let toml_text = build_pingap_config(&entries)
+            .expect("serialize")
+            .expect("non-empty config");
         assert!(toml_text.contains("addr = \"0.0.0.0:9080\""), "{toml_text}");
         assert!(toml_text.contains("[upstreams.frontend]"), "{toml_text}");
         assert!(toml_text.contains("addrs = [\"127.0.0.1:4000\"]"), "{toml_text}");

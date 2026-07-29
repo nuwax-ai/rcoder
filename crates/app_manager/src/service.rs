@@ -574,6 +574,37 @@ impl super::AppServiceTrait for AppService {
         self.restart_app(app_id).await
     }
 
+    async fn prepare_release(
+        &self,
+        app_id: &str,
+        request: PrepareReleaseRequest,
+    ) -> AppResult<ReleaseInfo> {
+        self.prepare_release(app_id, request).await
+    }
+
+    async fn activate_release(&self, app_id: &str, release_id: &str) -> AppResult<ReleaseInfo> {
+        self.activate_release(app_id, release_id).await
+    }
+
+    async fn confirm_release(
+        &self,
+        app_id: &str,
+        release_id: &str,
+        healthy: bool,
+        message: Option<String>,
+    ) -> AppResult<ReleaseInfo> {
+        self.confirm_release(app_id, release_id, healthy, message)
+            .await
+    }
+
+    async fn list_releases(&self, app_id: &str) -> AppResult<ReleaseListResponse> {
+        self.list_releases(app_id).await
+    }
+
+    async fn delete_release(&self, app_id: &str, release_id: &str) -> AppResult<()> {
+        self.delete_release(app_id, release_id).await
+    }
+
     async fn get_app_logs(&self, app_id: &str, params: LogParams) -> AppResult<Vec<LogEntry>> {
         self.get_app_logs(app_id, params).await
     }
