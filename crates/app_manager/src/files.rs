@@ -7,8 +7,10 @@ use tokio::fs;
 use tracing::{info, instrument};
 
 use download_utils::{
-    ArchiveError, detect_file_type, extract_tar_gz, extract_zip, normalize_extracted_dir,
+    ArchiveError, DownloadConfig, DownloadError, Downloader, detect_file_type, extract_tar_gz,
+    extract_zip, normalize_extracted_dir,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::models::*;
 use super::utils::*;
@@ -81,6 +83,36 @@ impl super::service::AppService {
                 })
             }
         }
+    }
+
+    /// 从 URL 下载 → 复用 upload_file（魔数识别 + 解压 + zip slip + canonicalize 全复用）。
+    /// SSRF：Downloader（download_utils）经 config.app_url_allow_private_networks 控制。
+    #[instrument(skip(self))]
+    pub async fn upload_from_url(
+        &self,
+        app_id: &str,
+        url: &str,
+        target: &str,
+        flatten: bool,
+    ) -> AppResult<UploadResult> {
+        validate_app_id(app_id)?;
+        validate_upload_target(target)?;
+        let downloader = Downloader::new(DownloadConfig::default());
+        let cancel = CancellationToken::new();
+        // 下载到临时文件（NamedTempFile 闭包结束自动删）
+        let tmp = tokio::task::spawn_blocking(tempfile::NamedTempFile::new)
+            .await
+            .map_err(|e| AppOperationError::Backend(format!("tempfile task failed: {e}")))?
+            .map_err(|e| map_io_error("failed to create tempfile", e, false))?;
+        downloader
+            .download_to_file(url, tmp.path(), None, &cancel)
+            .await
+            .map_err(map_download_error)?;
+        let file_data = tokio::fs::read(tmp.path())
+            .await
+            .map_err(|e| map_io_error("failed to read downloaded file", e, false))?;
+        // 复用 upload_file：魔数识别 + 解压 + 安全全复用
+        self.upload_file(app_id, file_data, target, flatten).await
     }
 
     /// 解压压缩包（zip/tar.gz）到 target 目录（app 根相对）。
@@ -234,5 +266,13 @@ impl super::service::AppService {
         }
         info!("[APP] file deleted: {}", file_path);
         Ok(())
+    }
+}
+
+/// download_utils::DownloadError → AppOperationError（InvalidUrl/SSRF → Validation 400；其余 → Backend 500）
+fn map_download_error(e: DownloadError) -> AppOperationError {
+    match e {
+        DownloadError::InvalidUrl(msg) => AppOperationError::Validation(msg),
+        other => AppOperationError::Backend(format!("download failed: {other}")),
     }
 }

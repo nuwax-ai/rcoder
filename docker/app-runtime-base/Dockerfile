@@ -1,8 +1,10 @@
-# 应用运行时基础镜像
-# 包含常用排查工具、ttyd、基础服务支持
+# 应用运行时基础镜像（app-runtime-base）
+# 基础设施层：Rust 工具链（来自 rust:1.97）+ 排查工具 + ttyd + PostgreSQL + pgweb + supervisor。
+# rust:1.97 基于 Debian bookworm（buildpack-deps），Rust/cargo 白赚，不再单独 rustup 装。
+# 语言运行时见 Dockerfile.runtime（FROM 本镜像 + Node/Python/Java/Go）。
 
 ARG DOCKER_MIRROR
-FROM ${DOCKER_MIRROR}ubuntu:24.04
+FROM ${DOCKER_MIRROR}rust:1.97
 
 # 设置环境变量
 ENV DEBIAN_FRONTEND=noninteractive
@@ -12,14 +14,26 @@ ENV TTYD_VERSION=1.7.7
 # 设置工作目录
 WORKDIR /app
 
-# 安装基础依赖和常用排查工具
+
+# 使用 LinuxMirrors 一键配置阿里云镜像源（Debian bookworm，rust:1.97 已预装 curl）
+# 参考: https://github.com/SuperManito/LinuxMirrors
+RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
+    --source mirrors.aliyun.com \
+    --protocol https \
+    --use-intranet-source false \
+    --install-epel false \
+    --backup false \
+    --upgrade-software false \
+    --clean-cache true \
+    --ignore-backup-tips
+
+# 安装基础依赖和常用排查工具（去掉 software-properties-common —— 不再用 deadsnakes PPA/add-apt-repository）
 RUN apt-get update && apt-get install -y \
     curl \
     wget \
     gnupg2 \
     lsb-release \
     ca-certificates \
-    software-properties-common \
     supervisor \
     # 网络排查工具
     dnsutils \
@@ -65,12 +79,12 @@ RUN ARCH=$(dpkg --print-architecture) && \
 COPY start-ttyd.sh /usr/local/bin/start-ttyd.sh
 RUN chmod +x /usr/local/bin/start-ttyd.sh
 
-# 安装 PostgreSQL 16
+# 安装 PostgreSQL 16（Debian bookworm 仓库代号为 bookworm-pgdg）
 RUN install -d /usr/share/postgresql-keyring && \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         | gpg --dearmor -o /usr/share/postgresql-keyring/pgdg.gpg && \
     chmod 644 /usr/share/postgresql-keyring/pgdg.gpg && \
-    echo "deb [signed-by=/usr/share/postgresql-keyring/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+    echo "deb [signed-by=/usr/share/postgresql-keyring/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list && \
     apt-get update && apt-get install -y postgresql-16 && rm -rf /var/lib/apt/lists/*
 
@@ -97,6 +111,9 @@ RUN chmod +x /usr/local/bin/start-app.sh
 # PG 首次 initdb wrapper(异步, 由 supervisor [program:postgresql] 托管)
 COPY pg-supervisor-entry.sh /usr/local/bin/pg-supervisor-entry.sh
 RUN chmod +x /usr/local/bin/pg-supervisor-entry.sh
+
+# npm 默认国内镜像源（加速：① Dockerfile.runtime 的 npm install -g；② UserApp 运行时 npm install）
+COPY .npmrc /root/.npmrc
 
 # 创建应用目录结构
 RUN mkdir -p /app/{code,data,config,logs}

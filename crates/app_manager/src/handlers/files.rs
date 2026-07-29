@@ -86,6 +86,45 @@ pub async fn upload_file(
     Ok(Json(HttpResult::success(result)))
 }
 
+/// 从 URL 下载文件请求
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UploadFromUrlRequest {
+    /// 下载 URL（http/https；SSRF 防护：默认拒私网/保留地址）
+    pub url: String,
+    /// 目标路径（app 根相对；单文件=文件路径，压缩包=解压目录如 "code/"；默认 "code/"）
+    pub target: Option<String>,
+    /// 压缩包是否剥单层 wrapper 目录（默认 false）
+    pub flatten: Option<bool>,
+}
+
+/// 从 URL 下载文件/压缩包并上传
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/upload-from-url",
+    params(("app_id" = String, Path, description = "应用 ID")),
+    request_body = UploadFromUrlRequest,
+    responses(
+        (status = 200, description = "下载并上传成功", body = HttpResult<UploadResult>),
+        (status = 400, description = "URL 非法 / SSRF 拒绝", body = HttpResult<String>)
+    ),
+    tag = "应用管理"
+)]
+#[instrument(skip(state))]
+pub async fn upload_from_url(
+    State(state): State<Arc<AppManagerState>>,
+    Path(app_id): Path<String>,
+    Json(req): Json<UploadFromUrlRequest>,
+) -> Result<Json<HttpResult<UploadResult>>, AppError> {
+    info!("[APP] upload from url: {} (url={})", app_id, req.url);
+    let target = req.target.unwrap_or_else(|| "code/".to_string());
+    let flatten = req.flatten.unwrap_or(false);
+    let result = state
+        .app_service
+        .upload_from_url(&app_id, &req.url, &target, flatten)
+        .await?;
+    Ok(Json(HttpResult::success(result)))
+}
+
 /// 列出文件查询参数
 #[derive(Debug, Deserialize, Default, ToSchema)]
 pub struct ListFilesQuery {

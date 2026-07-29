@@ -88,6 +88,49 @@ pub(crate) async fn serve_page(
     serve_from_root(&root, &rest, &PAGE_CORS, req).await
 }
 
+// ── userapp static ─────────────────────────────────────────────────────────────
+
+/// `GET|OPTIONS /api/userapp/static/{appId}/{*rest}`（取整体包 workspace-package.zip）。
+///
+/// `app_id` = workspace app_id = file-server project_id（复用 resolve_project）。
+/// 用 COMPUTER_CORS（暴露 Range/Content-Range，支持大产物断点续传）。
+#[utoipa::path(
+    get,
+    path = "/static/{app_id}/{*rest}",
+    params(
+        ("app_id" = String, Path, description = "UserApp identifier (= workspace app_id = project_id)"),
+        ("rest" = String, Path, description = "Workspace-relative file path (e.g. workspace-package.zip)")
+    ),
+    responses(
+        (status = 200, description = "Static file", body = crate::openapi::BinaryFile, content_type = "application/octet-stream"),
+        (status = 404, description = "File not found")
+    ),
+    tag = "UserApp"
+)]
+pub(crate) async fn serve_userapp(
+    State(state): State<AppState>,
+    AxumPath((app_id, rest)): AxumPath<(String, String)>,
+    req: Request,
+) -> Response {
+    if app_id.trim().is_empty() {
+        return cors_404(&req, &COMPUTER_CORS);
+    }
+    let root = match state
+        .resolver
+        .resolve_project(&ProjectContext {
+            project_id: app_id.to_string(),
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
+        })
+        .await
+    {
+        Ok(root) => root,
+        Err(error) => return error.into_response(),
+    };
+    serve_from_root(&root, &rest, &COMPUTER_CORS, req).await
+}
+
 // ── computer static ────────────────────────────────────────────────────────────
 
 /// `GET|OPTIONS /api/computer/static/{userId}/{cId}/{*rest}?customTargetDir=`

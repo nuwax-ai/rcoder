@@ -368,6 +368,7 @@ dependencies = [
  "shared_types",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "utoipa",
  "uuid",

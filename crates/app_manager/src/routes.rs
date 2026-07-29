@@ -46,6 +46,10 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
         )
         // 文件管理
         .route("/api/v1/apps/{app_id}/upload", post(handlers::upload_file))
+        .route(
+            "/api/v1/apps/{app_id}/upload-from-url",
+            post(handlers::upload_from_url),
+        )
         .route("/api/v1/apps/{app_id}/files", get(handlers::list_files))
         .route(
             "/api/v1/apps/{app_id}/files/delete",

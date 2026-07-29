@@ -8,7 +8,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::AppState;
-use crate::handlers::{build, build_support, computer, git, health, project, static_files};
+use crate::handlers::{build, build_support, computer, git, health, project, static_files, userapp};
 
 /// 业务路由与 OpenAPI 文档的唯一聚合入口。
 pub fn api_router() -> OpenApiRouter<AppState> {
@@ -20,6 +20,7 @@ pub fn api_router() -> OpenApiRouter<AppState> {
         .nest("/api/build", build_router())
         .nest("/api/computer", computer_router())
         .nest("/api/page", page_router())
+        .nest("/api/userapp", userapp_router())
 }
 
 /// `/api/project` + code 路由。
@@ -117,5 +118,16 @@ fn page_router() -> OpenApiRouter<AppState> {
         .route(
             "/static/{project_id}/{*rest}",
             options(static_files::serve_page),
+        )
+}
+
+/// `/api/userapp` 路由（workspace 多项目打包 + 取整体包）。
+fn userapp_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(userapp::build_workspace))
+        .routes(routes!(static_files::serve_userapp))
+        .route(
+            "/static/{app_id}/{*rest}",
+            options(static_files::serve_userapp),
         )
 }

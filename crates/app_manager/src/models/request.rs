@@ -15,7 +15,7 @@ pub struct CreateAppRequest {
     pub app_id: Option<String>,
     /// 应用名称
     pub name: String,
-    /// 容器镜像（**完整地址**，含 registry + 命名空间，如 `nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/app-runtime-java`）。
+    /// 容器镜像（**完整地址**，含 registry + 命名空间，如 `nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/app-runtime`）。
     /// 由调用方提前准备好并 push 到 registry；RCoder 不构建镜像。初期不限定镜像列表。
     /// 命名空间区分环境：`nuwax-k8s-test`（测试）/ `nuwax-k8s-prod`（线上）。
     pub image: String,

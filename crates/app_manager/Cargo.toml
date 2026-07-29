@@ -48,3 +48,4 @@ utoipa = { workspace = true }
 
 # Temp files
 tempfile = { workspace = true }
+tokio-util = { workspace = true }

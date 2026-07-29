@@ -173,9 +173,9 @@ base 改动 → 所有运行时镜像(node/java/python/go/rust)**继承,都带 P
 
 ## 8. 待确认 / 决策点
 
-### 8.1 PG 加在 base vs 专门镜像 ⭐
-- **方案 A(改 base)**:所有运行时都带 PG + pgweb(镜像 +~300MB)。你倾向这个 —— 确认接受?加 `ENABLE_POSTGRES` 开关?
-- **方案 B(专门镜像)**:`app-runtime-node-pg` 等,按需。
+### 8.1 PG 加在 base vs 专门镜像 ⭐ ✅ 已决策
+- **方案 A(改 base)**:✅ 已落地 —— 统一运行时镜像 `app-runtime`（rust:1.97/Debian 底）内置 PG + pgweb，所有应用都带（不再按语言拆镜像）。
+- ~~**方案 B(专门镜像)**:`app-runtime-node-pg` 等,按需。~~ 已弃用（多语言合并为单一 `app-runtime`）。
 
 ### 8.2 pgweb 端口注册方式
 - A(自动,推荐):rcoder 自动注册 8081

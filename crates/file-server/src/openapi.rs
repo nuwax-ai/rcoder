@@ -87,7 +87,8 @@ pub enum ErrorApiResponses {
         (name = "Build", description = "Build and Vite dev-server lifecycle"),
         (name = "Git", description = "Git repository operations"),
         (name = "Computer", description = "Computer workspace operations"),
-        (name = "Static", description = "Project and workspace static files")
+        (name = "Static", description = "Project and workspace static files"),
+        (name = "UserApp", description = "UserApp workspace build and static")
     )
 )]
 struct ApiMetadata;
@@ -127,7 +128,7 @@ mod tests {
     #[test]
     fn document_contains_every_registered_operation() {
         let document = generated_document();
-        assert_eq!(document.paths.paths.len(), 67);
+        assert_eq!(document.paths.paths.len(), 69);
         assert!(document.paths.paths.contains_key("/"));
         assert!(document.paths.paths.contains_key("/api/build/start-dev"));
         assert!(document.paths.paths.contains_key("/api/git/commit"));
@@ -142,6 +143,13 @@ mod tests {
                 .paths
                 .paths
                 .contains_key("/api/page/static/{project_id}/{rest}")
+        );
+        assert!(document.paths.paths.contains_key("/api/userapp/build"));
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/userapp/static/{app_id}/{rest}")
         );
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }

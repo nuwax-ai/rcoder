@@ -120,6 +120,15 @@ pub trait AppServiceTrait: Send + Sync {
         flatten: bool,
     ) -> AppResult<UploadResult>;
 
+    /// 从 URL 下载文件/压缩包并上传（复用 upload_file 解压/安全；SSRF 由 download_utils 防护）
+    async fn upload_from_url(
+        &self,
+        app_id: &str,
+        url: &str,
+        target: &str,
+        flatten: bool,
+    ) -> AppResult<UploadResult>;
+
     /// 列出文件（app 根或其子目录 code/data/logs；subpath=None 列 app 根）
     async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> AppResult<Vec<FileInfo>>;
 

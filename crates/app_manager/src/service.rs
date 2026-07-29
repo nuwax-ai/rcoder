@@ -617,6 +617,16 @@ impl super::AppServiceTrait for AppService {
         self.upload_file(app_id, file_data, target, flatten).await
     }
 
+    async fn upload_from_url(
+        &self,
+        app_id: &str,
+        url: &str,
+        target: &str,
+        flatten: bool,
+    ) -> AppResult<UploadResult> {
+        self.upload_from_url(app_id, url, target, flatten).await
+    }
+
     async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> AppResult<Vec<FileInfo>> {
         self.list_files(app_id, subpath).await
     }
