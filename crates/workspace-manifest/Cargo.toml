@@ -1,0 +1,12 @@
+[package]
+name = "workspace-manifest"
+version = "0.1.3"
+edition = "2024"
+license = "Apache-2.0"
+description = "UserApp workspace 两级 manifest 类型（file-server build + app-cli runtime 共用，极轻量）"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+toml = "0.8"

@@ -197,6 +197,12 @@ pub use rcoder_agent_types::*;
 // 通用 HTTP Handlers（基于 trait）
 pub mod agent_mgmt_types;
 pub mod http_handlers;
+
+// UserApp workspace 两级 manifest 类型（极轻量独立 crate，file-server build + app-cli runtime 共用）
+pub use workspace_manifest::{
+    BuildSection, ProjectManifest, ProjectMeta, ProjectRef, RunSection, WorkspaceManifest,
+    WorkspaceMeta,
+};
 pub use agent_mgmt_types::{
     AGENT_CACHE_DIR, AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus,
     CheckAgentRequest, CheckAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR, GetAgentRequest,

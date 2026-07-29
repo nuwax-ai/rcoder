@@ -1,0 +1,35 @@
+[package]
+name = "app-cli"
+version = "0.1.3"
+edition = "2024"
+license = "Apache-2.0"
+description = "UserApp 容器运行时编排器（替代 start.sh，管 pingap + 子项目编排 + 管理 API）"
+# app-cli 独立于 rcoder workspace（exclude）—— 避免 pingap-config 的 bollard/regex 传递依赖
+# 与 rcoder workspace 的锁冲突。app-cli 有自己的 Cargo.lock。
+
+[lib]
+name = "app_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "app-cli"
+path = "src/main.rs"
+
+[dependencies]
+# 极轻量 manifest 类型（path 到同仓库的独立小 crate）
+workspace-manifest = { path = "../workspace-manifest" }
+# pingap 官方配置类型（pin HEAD：crates.io 0.13.x 有发布 bug；HEAD 修了 bollard 0.21 兼容）
+# bollard/regex 隔离在 app-cli 自己的 Cargo.lock，不和 rcoder 冲突
+pingap-config = { git = "https://github.com/vicanso/pingap", rev = "056161144ef0fcceb034ca0e5a1973abd48d2d10" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

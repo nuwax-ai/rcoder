@@ -4,6 +4,18 @@
 # 语言运行时见 Dockerfile.runtime（FROM 本镜像 + Node/Python/Java/Go）。
 
 ARG DOCKER_MIRROR
+
+# === app-cli builder（从 vendored rcoder 源编译 app-cli 编排器；app-cli 独立于 rcoder workspace）===
+FROM ${DOCKER_MIRROR}rust:1.97 AS app-cli-builder
+WORKDIR /build
+COPY code/rcoder/crates/app-cli/Cargo.toml crates/app-cli/Cargo.toml
+COPY code/rcoder/crates/app-cli/src crates/app-cli/src
+COPY code/rcoder/crates/workspace-manifest/Cargo.toml crates/workspace-manifest/Cargo.toml
+COPY code/rcoder/crates/workspace-manifest/src crates/workspace-manifest/src
+RUN cd crates/app-cli && cargo build --release
+
+# === 主 stage（app-runtime-base 基础设施层）===
+ARG DOCKER_MIRROR
 FROM ${DOCKER_MIRROR}rust:1.97
 
 # 设置环境变量
@@ -102,6 +114,14 @@ RUN ARCH=$(dpkg --print-architecture) && \
     mv "pgweb_linux_${PGWEB_ARCH}" /usr/local/bin/pgweb && \
     chmod +x /usr/local/bin/pgweb && \
     rm -f /tmp/pgweb.zip
+
+# 安装 pingap (pingora 反向代理，UserApp workspace 经它统一 :3000 入口；与 ttyd/pgweb 同层)
+# 多阶段从官方镜像拉二进制（官方 Dockerfile 已置于 /usr/local/bin/pingap）。
+ARG PINGAP_VERSION=0.13.7
+COPY --from=vicanso/pingap:${PINGAP_VERSION} /usr/local/bin/pingap /usr/local/bin/pingap
+
+# 安装 app-cli（UserApp 容器编排器，替代 start.sh；由 app-cli-builder stage 编译）
+COPY --from=app-cli-builder /build/crates/app-cli/target/release/app-cli /usr/local/bin/app-cli
 
 # 复制 supervisor 配置 + ENTRYPOINT 启动脚本
 COPY app-runtime.supervisor.conf /etc/supervisor/conf.d/app-runtime.conf

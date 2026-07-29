@@ -114,22 +114,25 @@ userapp-workspace-template/                ← workspace 根（= app_id workspac
 [workspace]
 name = "my-userapp"
 
-# 子项目列表（打包时遍历）
+# 子项目列表（打包时遍历；file-server 按顺序分配内部端口 4000+i）
 [[projects]]
 name = "frontend"
 path = "userapp-frontend"           # workspace 相对路径
+proxy_path = "/"                    # pingap 兜底 catch-all（/ → 前端）
 [[projects]]
 name = "backend"
 path = "userapp-backend"
+proxy_path = "/api/"                # /api/* → 后端
+proxy_strip_prefix = true           # 转发去 /api/ 前缀（后端收到 /users 而非 /api/users）
 
 # 部署配置（Java create_app 用，对应 CreateAppRequest）
 [deploy]
-image = "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/app-runtime:latest"   # 统一多语言镜像（rust:1.97/Debian + Node/Python/Java/Go/Rust）
+image = "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/app-runtime:latest"   # 统一多语言镜像（rust:1.97/Debian + Node/Python/Java/Go/Rust + pingap）
 command = ["bash", "/app/code/start.sh"]   # bash：start.sh 用 wait -n（dash 不支持）
+# app=3000 = pingap 统一入口（/ → 前端、/api/ → 后端）；pgweb=8081 内置。子项目 4000+i 内部不声明。
 ports = [
-  { name = "frontend", port = 3000, expose_type = "Http" },
-  { name = "backend",  port = 8080, expose_type = "Http" },
-  { name = "pgweb",    port = 8081, expose_type = "Http" },
+  { name = "app",   port = 3000, expose_type = "Http" },
+  { name = "pgweb", port = 8081, expose_type = "Http" },
 ]
 env = { NODE_ENV = "production", POSTGRES_USER = "app", POSTGRES_PASSWORD = "app", POSTGRES_DB = "app" }
 resources = { cpu = "1", memory = "1Gi" }
@@ -255,6 +258,34 @@ wait
 **用 bash 而非 sh**：`wait -n` 是 bash 扩展（dash 不支持）；command 必须是 `["bash",...]`，shebang `#!/bin/bash`。app-runtime-base 是 Ubuntu 24.04，bash 必有。
 
 **粗粒度重启（初期）**：一个服务崩 → 整组（前端+后端）重启。后续可拆多 `[program]` 独立重启（需 start-app.sh 支持多 program，或 workspace 自写 supervisor conf，见 §10）。
+
+### 6.4 pingap 统一入口（一个 URL 访问前后端）
+
+容器内跑 **pingap**（pingora 反代，与 rcoder pingora-proxy 同引擎）作统一 HTTP 入口，监听 **:3000**
+（= `[deploy].ports` 的 app 端口，rcoder 透出）。按路径分发：`/` → 前端兜底、`/api/` → 后端。
+用户访问 `/proxy/apps/{id}/3000/` 一个地址即可用整个应用。
+
+**配置全自动（file-server build 时生成）**：file-server 读 `[[projects]].proxy_path`，生成
+`pingap/pingap.toml`（servers/upstreams/locations）+ `.service-ports`（子项目端口清单）打进
+`workspace-package.zip`。start.sh 读 `.service-ports` 启动子项目（:4000+i）+ 起 pingap（:3000）。
+**用户零手写反代配置**。
+
+**端口约定**：pingap :3000（对外）；子项目 :4000+i（内部，i = `[[projects]]` 顺序下标，pingap 经
+`127.0.0.1` 拨号，不进 `[deploy].ports`）。
+
+**proxy_path 语义**：`"/"` = 兜底（pingap location 不写 path，`PathSelector::Any` 权重 0 最低）；
+`"/api/"` = 前缀匹配；省略 = 不经 pingap（仅内部）。`proxy_strip_prefix = true` → `rewrite "^<path>(.*) /$1"`。
+
+**分层**：app-runtime 容器内 pingap（应用层统一入口）→ rcoder pingora-proxy（平台层对外）。同引擎、
+互补，**rcoder 侧零改动**（pingap 监听 :3000 = `[deploy].ports` app 端口，pingora 直接透出）。
+
+**镜像**：pingap 二进制装在 `app-runtime-base`（base 层，`COPY --from=vicanso/pingap:<ver>`），语言无关。
+
+**禁用**：所有子项目去掉 `proxy_path` → 不生成 pingap 配置 → start.sh 不起 pingap，子项目直连
+（向后兼容单项目）。
+
+> 路由用社区标准（`/` → 前端 + `/api/` → 后端，NGINX+SPA/API 通用），应用在根路径。`/static/` 方案
+> 否决（与「静态资源」语义冲突）。
 
 ---
 

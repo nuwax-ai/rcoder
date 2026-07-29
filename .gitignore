@@ -35,3 +35,4 @@ docker/app-workspace/*
 .devspace/
 target.garbage/
 .workbuddy/
+crates/*/target/

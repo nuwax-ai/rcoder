@@ -12,6 +12,7 @@ kubernetes = []
 [dependencies]
 
 serde.workspace = true
+workspace-manifest = { workspace = true }
 serde_json.workspace = true
 semver = { workspace = true }
 winnow = { workspace = true }
@@ -87,3 +88,4 @@ shared_types_grpc = { workspace = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }
+toml = { workspace = true }

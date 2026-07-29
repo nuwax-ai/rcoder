@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["tmp/*", "crates/ai-agents", "crates/codex-acp-agent"]
+exclude = ["tmp/*", "crates/app-cli"]
 resolver = "2"
 
 default-members = [
@@ -196,6 +196,7 @@ semver = "1.0"
 node-semver = "2.2"
 shellexpand = "3.1"
 winnow = "1.0.3"
+workspace-manifest = { path = "crates/workspace-manifest" }
 shlex = "2.0"
 smallvec = "1.15"
 
