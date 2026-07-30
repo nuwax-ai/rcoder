@@ -11,11 +11,14 @@ pub mod utils;
 
 // 新增模块
 pub mod agent_container_starter;
+pub mod api_cache;
 pub mod container_builder;
 pub mod container_creator;
 pub mod container_query;
 pub mod health;
+pub mod image_management;
 pub mod network;
+pub mod network_management;
 pub mod runtime_selection;
 
 // Runtime abstraction (Docker/K8s selection)
@@ -26,6 +29,9 @@ pub use container_state_actor::*;
 pub use manager::*;
 pub use types::*;
 pub use utils::*;
+
+// DockerApiCache 从 manager 拆出后单独导出，保持 `docker_manager::DockerApiCache` 路径不变
+pub use api_cache::DockerApiCache;
 
 // 公共导出新模块
 pub use container_builder::{ContainerConfigBuilder, MountProcessor};
