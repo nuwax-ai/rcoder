@@ -387,10 +387,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     /// K8s 实现：metrics.k8s.io PodMetrics（用量）+ pod spec resources.limits（限额）。
     /// network（rx/tx）metrics.k8s.io 不提供，故不含。默认返回空（后端未实现/无 metrics-server），
     /// app_manager 层据此 + restart_count 组装对外 ResourceStats（用量 0 即降级为 0，不 500）。
-    async fn get_app_resource_usage(
-        &self,
-        app_id: &str,
-    ) -> ContainerRuntimeResult<ResourceUsage> {
+    async fn get_app_resource_usage(&self, app_id: &str) -> ContainerRuntimeResult<ResourceUsage> {
         let _ = app_id;
         Ok(ResourceUsage::default())
     }
@@ -432,15 +429,19 @@ impl<T> UserAppRuntime for T where T: WorkspaceRuntime + UserAppDeploymentRuntim
 /// trait 对象经 trait upcasting (Rust 1.86+) 可收缩到任一子 trait:
 ///   `Arc<dyn ContainerRuntime>` → `Arc<dyn AgentContainerRuntime>` / `Arc<dyn WorkspaceRuntime>`
 ///   / `Arc<dyn UserAppDeploymentRuntime>` / `Arc<dyn UserAppRuntime>` 均可直接 upcast.
-pub trait ContainerRuntime: AgentContainerRuntime
-    + WorkspaceRuntime
-    + UserAppDeploymentRuntime
-    + UserAppRuntime {}
+pub trait ContainerRuntime:
+    AgentContainerRuntime + WorkspaceRuntime + UserAppDeploymentRuntime + UserAppRuntime
+{
+}
 
 // Blanket impl: 任何 A+B+C+UserAppRuntime 类型自动 impl ContainerRuntime.
 // Rust 不凭 super-trait bounds 自动 impl (即使 trait 体为空), 需显式声明 blanket impl.
 // 含 `?Sized` 以覆盖 `dyn ContainerRuntime` 自身 (理论上可被嵌套 upcast).
 impl<T> ContainerRuntime for T where
-    T: AgentContainerRuntime + WorkspaceRuntime + UserAppDeploymentRuntime + UserAppRuntime + ?Sized
+    T: AgentContainerRuntime
+        + WorkspaceRuntime
+        + UserAppDeploymentRuntime
+        + UserAppRuntime
+        + ?Sized
 {
 }

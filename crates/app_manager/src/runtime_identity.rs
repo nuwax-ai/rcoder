@@ -24,12 +24,14 @@ pub(crate) async fn inject_release_identity(
     }
 
     let lock_path = app_dir.join("code").join("release.lock.toml");
-    let content = tokio::fs::read_to_string(&lock_path).await.map_err(|error| {
-        AppOperationError::InvalidState(format!(
-            "active release lock is required before creating the app container ({}): {error}",
-            lock_path.display()
-        ))
-    })?;
+    let content = tokio::fs::read_to_string(&lock_path)
+        .await
+        .map_err(|error| {
+            AppOperationError::InvalidState(format!(
+                "active release lock is required before creating the app container ({}): {error}",
+                lock_path.display()
+            ))
+        })?;
     let lock: workspace_manifest::ReleaseLock = toml::from_str(&content).map_err(|error| {
         AppOperationError::Validation(format!(
             "invalid active release lock {}: {error}",
@@ -40,10 +42,7 @@ pub(crate) async fn inject_release_identity(
     let values = [
         ("RCODER_PINGAP_VERSION", lock.pingap.version),
         ("RCODER_PINGAP_COMMIT", lock.pingap.commit),
-        (
-            "RCODER_RUNTIME_IMAGE_DIGEST",
-            lock.runtime_image_digest,
-        ),
+        ("RCODER_RUNTIME_IMAGE_DIGEST", lock.runtime_image_digest),
     ];
     for (key, value) in values {
         if value.trim().is_empty() {

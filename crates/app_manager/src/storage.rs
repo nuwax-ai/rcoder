@@ -183,13 +183,16 @@ impl super::service::AppService {
                         .as_ref()
                         .and_then(|m| m.modified().ok())
                         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
-                    (metadata.is_some(), app_dir.to_string_lossy().to_string(), modified_at)
+                    (
+                        metadata.is_some(),
+                        app_dir.to_string_lossy().to_string(),
+                        modified_at,
+                    )
                 }
                 Err(e) => {
                     warn!(
                         "[APP] list storage resolve {} failed, mark not exist: {}",
-                        app_id,
-                        e
+                        app_id, e
                     );
                     (false, String::new(), None)
                 }

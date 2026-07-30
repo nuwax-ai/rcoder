@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use container_runtime_api::{
     AgentContainerRuntime, ContainerCreateParams, ContainerRuntime, ContainerRuntimeError,
-    ContainerRuntimeResult, UserAppDeploymentRuntime, WorkspaceRuntime, RuntimeContainerInfo,
+    ContainerRuntimeResult, RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
 };
 use futures_util::stream::StreamExt;
 use shared_types::ContainerBasicInfo;

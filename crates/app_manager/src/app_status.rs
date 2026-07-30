@@ -2,22 +2,17 @@
 //!
 //! fetch_runtime_status* / ensure_app_exists / build_runtime_info / build_access_info。
 
-
 use tracing::warn;
 
-use container_runtime_api::{
-        DeploymentStatus, ExposeType as RtExposeType, HttpExpose,
-};
+use container_runtime_api::{DeploymentStatus, ExposeType as RtExposeType, HttpExpose};
 use shared_types::ServiceType;
 
 use super::config::AppAccessMode;
 use super::models::*;
-use super::utils::*;
 use super::service::AppService;
+use super::utils::*;
 
 impl AppService {
-
-
     /// 实时查询单个应用运行时状态（None 表示不存在）
     pub(crate) async fn fetch_runtime_status(&self, app_id: &str) -> Option<DeploymentStatus> {
         match self.runtime.get_deployment_status(app_id).await {
@@ -29,14 +24,16 @@ impl AppService {
         }
     }
 
-
     /// 实时查状态，精确区分两种"查不到"：Ok(None)=集群中真不存在 → "应用不存在"(→404)；
     /// Err=API Server 不可达/RBAC 拒绝 → "查询应用状态失败"(→500)。
     ///
     /// 供需要精确错误分类的读路径（get_app/get_app_stats/ensure_app_exists）使用，
     /// 替代会塌缩错误的 `fetch_runtime_status`（后者仅供 create_app 这类 None 可接受的场景）。
     /// 若误用 fetch_runtime_status，瞬时 API 错误会被当成"应用不存在"→404，触发 Java 误重建。
-    pub(crate) async fn fetch_runtime_status_or_err(&self, app_id: &str) -> AppResult<DeploymentStatus> {
+    pub(crate) async fn fetch_runtime_status_or_err(
+        &self,
+        app_id: &str,
+    ) -> AppResult<DeploymentStatus> {
         match self.runtime.get_deployment_status(app_id).await {
             Ok(Some(s)) => Ok(s),
             Ok(None) => Err(AppOperationError::NotFound(format!(
@@ -51,14 +48,12 @@ impl AppService {
         }
     }
 
-
     /// 确认 app 存在（集群中有 Deployment/容器），不存在返回"应用不存在"错误。
     /// 调用方（start/stop/restart）据此返回 404，方便 Java 区分并触发 create 重建，
     /// 而非收到 generic 500 误以为系统故障。
     pub(crate) async fn ensure_app_exists(&self, app_id: &str) -> AppResult<()> {
         self.fetch_runtime_status_or_err(app_id).await.map(|_| ())
     }
-
 
     /// DeploymentStatus → AppRuntimeInfo（含访问地址构建 + conditions 派生）
     pub(crate) fn build_runtime_info(&self, status: DeploymentStatus) -> AppRuntimeInfo {
@@ -113,7 +108,6 @@ impl AppService {
             resource_version: status.resource_version,
         }
     }
-
 
     /// 构建访问信息（按 `http_expose` 决定 HTTP path；一律只返 path，host 由 Java 拼）
     pub(crate) fn build_access_info(&self, app_id: &str, ports: &[AppPortStatus]) -> AccessInfo {

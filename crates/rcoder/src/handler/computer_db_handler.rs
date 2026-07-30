@@ -17,8 +17,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
 use axum::Json;
+use axum::extract::{Path, State};
 use shared_types::{AppError, HttpResult, ServiceType};
 use tracing::{info, instrument};
 
@@ -233,7 +233,11 @@ fn validate_pg_identifier(name: &str) -> Result<(), AppError> {
             "PG identifier must start with letter or '_'",
         ));
     }
-    if !name.chars().skip(1).all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !name
+        .chars()
+        .skip(1)
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return Err(AppError::validation_error(
             "PG identifier: only [a-zA-Z0-9_] allowed",
         ));

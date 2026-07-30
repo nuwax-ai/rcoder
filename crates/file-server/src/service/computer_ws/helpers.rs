@@ -96,7 +96,10 @@ pub(super) async fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
 
 /// 跟随符号链接判定目录 (等价 `std::path::Path::is_dir` 的 async 版, 用 fs::metadata 跟随 symlink)。
 async fn is_dir(path: &Path) -> bool {
-    fs::metadata(path).await.map(|m| m.is_dir()).unwrap_or(false)
+    fs::metadata(path)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
 }
 
 /// 当前时间纳秒 (仅用于生成唯一临时名; 避免直接 `new Date`)。

@@ -44,7 +44,6 @@ pub struct AppService {
 }
 
 impl AppService {
-
     /// 创建新的应用管理服务
     pub async fn new(
         config: AppManagerConfig,
@@ -61,7 +60,10 @@ impl AppService {
                 path_resolver.insert("default".to_string(), Arc::new(resolver));
             }
             Err(e) => {
-                warn!("[APP] path resolver init failed, using container path: {}", e);
+                warn!(
+                    "[APP] path resolver init failed, using container path: {}",
+                    e
+                );
             }
         }
 
@@ -69,8 +71,13 @@ impl AppService {
         // RBAC 缺失，而非运行时创建 app 才 403）。Docker 模式 trait 默认 Ok，跳过。
         if config.access_mode == AppAccessMode::Kubernetes {
             match runtime.validate_app_prerequisites().await {
-                Ok(_) => info!("[APP] K8s prerequisites validated (RBAC/apps/deployments accessible)"),
-                Err(e) => warn!("[APP] K8s prerequisites validation failed, app management may not work: {}", e),
+                Ok(_) => {
+                    info!("[APP] K8s prerequisites validated (RBAC/apps/deployments accessible)")
+                }
+                Err(e) => warn!(
+                    "[APP] K8s prerequisites validation failed, app management may not work: {}",
+                    e
+                ),
             }
         }
 
@@ -104,7 +111,6 @@ impl AppService {
         }
         Ok(svc)
     }
-
 
     /// 创建应用
     #[instrument(skip(self, request))]
@@ -160,7 +166,11 @@ impl AppService {
         let http_port_count = request
             .ports
             .as_ref()
-            .map(|ps| ps.iter().filter(|p| p.expose_type == ExposeType::Http).count())
+            .map(|ps| {
+                ps.iter()
+                    .filter(|p| p.expose_type == ExposeType::Http)
+                    .count()
+            })
             .unwrap_or(0);
         const MAX_HTTP_PORTS: usize = 8;
         if http_port_count > MAX_HTTP_PORTS {
@@ -193,8 +203,12 @@ impl AppService {
         app_id: &str,
         request: &CreateAppRequest,
     ) -> AppResult<()> {
-        let storage_size = request.resources.as_ref().and_then(|r| r.storage.as_deref());
-        self.ensure_app_workspace_ready(app_id, storage_size).await?;
+        let storage_size = request
+            .resources
+            .as_ref()
+            .and_then(|r| r.storage.as_deref());
+        self.ensure_app_workspace_ready(app_id, storage_size)
+            .await?;
         // 创建工作空间目录（code/data/logs）—— Docker: 共享 Local (create_deployment bind mount 源,
         // 必须先存在); K8s: per-app PVC 根 (ensure_app_workspace_ready 已 ensure + 等 subvolumePath)。
         self.create_app_dirs(app_id).await?;
@@ -205,14 +219,13 @@ impl AppService {
     ///
     /// 注: UserApp 是新开发逻辑 (application-management-service-v2-design.md), /app 路径
     /// 不涉及历史数据迁移 → 不调 lazy_migrate (新应用无旧数据)。Web/Computer 有历史数据才调。
-    async fn create_app_runtime(
-        &self,
-        app_id: &str,
-        request: &CreateAppRequest,
-    ) -> AppResult<()> {
+    async fn create_app_runtime(&self, app_id: &str, request: &CreateAppRequest) -> AppResult<()> {
         let params = self.build_container_params(app_id, request).await?;
         let container_info = self.runtime.create_deployment(params).await.map_err(|e| {
-            map_runtime_error(&format!("[APP] create_deployment failed app_id={app_id}"), e)
+            map_runtime_error(
+                &format!("[APP] create_deployment failed app_id={app_id}"),
+                e,
+            )
         })?;
         info!(
             "[APP] app resources created: {} (container={})",
@@ -229,11 +242,7 @@ impl AppService {
     ///
     /// status 用运行时 phase 映射（不再硬编码 Running）——刚创建的 Pod 通常还是 Starting，甚至镜像
     /// 拉取失败已 Error；返回真实状态避免"status=Running 但 health=Starting/Error"自相矛盾。
-    async fn assemble_app_info(
-        &self,
-        app_id: String,
-        request: CreateAppRequest,
-    ) -> AppInfo {
+    async fn assemble_app_info(&self, app_id: String, request: CreateAppRequest) -> AppInfo {
         let runtime_status = self.fetch_runtime_status(&app_id).await;
 
         // 端口状态：以请求端口为准（expose_type 语义完整），合并运行时返回的 external_port（K8s node_port）。
@@ -297,7 +306,6 @@ impl AppService {
         }
     }
 
-
     /// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
     #[instrument(skip(self))]
     pub async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
@@ -311,7 +319,6 @@ impl AppService {
             .map(|s| self.build_runtime_info(s))
             .collect())
     }
-
 
     /// 查询应用列表（实时查集群 + 过滤/分页）
     #[instrument(skip(self, request))]
@@ -369,7 +376,6 @@ impl AppService {
         })
     }
 
-
     /// 获取应用运行时详情（实时查集群；精确区分 404 与 500）
     #[instrument(skip(self))]
     pub async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
@@ -377,7 +383,6 @@ impl AppService {
         let status = self.fetch_runtime_status_or_err(app_id).await?;
         Ok(self.build_runtime_info(status))
     }
-
 
     /// 更新应用配置
     /// 更新应用（v2 §5.2，全量替换 desired state）。
@@ -403,7 +408,9 @@ impl AppService {
                 "resource version mismatch: expected={expected}, actual={actual}"
             )));
         }
-        let params = self.build_container_params_from_update(app_id, &request).await?;
+        let params = self
+            .build_container_params_from_update(app_id, &request)
+            .await?;
         // 先注销旧 Pingora backend（K8s/Docker 都执行：Docker 旧 container_ip 失效；
         // K8s 下方按本次 http_ports 重新注册到 Service FQDN，注销-重注成对保证一致）。
         self.unregister_pingora_backends(app_id).await;
@@ -429,7 +436,6 @@ impl AppService {
         info!("[APP] app updated: {}", app_id);
         self.get_app(app_id).await
     }
-
 
     /// 删除应用（v2 §5.3：默认保留持久存储，purge=true 才清空数据面）。
     #[instrument(skip(self))]
@@ -486,7 +492,6 @@ impl AppService {
         Ok(())
     }
 }
-
 
 #[async_trait::async_trait]
 impl super::AppServiceTrait for AppService {
@@ -547,11 +552,7 @@ impl super::AppServiceTrait for AppService {
         self.reset_db_password(app_id, request).await
     }
 
-    async fn create_database(
-        &self,
-        app_id: &str,
-        request: CreateDatabaseRequest,
-    ) -> AppResult<()> {
+    async fn create_database(&self, app_id: &str, request: CreateDatabaseRequest) -> AppResult<()> {
         self.create_database(app_id, request).await
     }
 

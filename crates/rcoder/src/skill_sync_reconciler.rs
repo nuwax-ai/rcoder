@@ -80,12 +80,7 @@ async fn scan_and_reconcile(dir: &Path, depth: u32, current: &str, stats: &mut S
         return;
     };
     while let Ok(Some(entry)) = rd.next_entry().await {
-        if entry
-            .file_type()
-            .await
-            .map(|t| t.is_dir())
-            .unwrap_or(false)
-        {
+        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
             // async 递归需 Box::pin
             Box::pin(scan_and_reconcile(&entry.path(), depth + 1, current, stats)).await;
         }
@@ -169,7 +164,9 @@ mod tests {
     async fn reconcile_skips_uptodate_workspace() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
-        tokio::fs::create_dir_all(ws.join(".agents/skills")).await.unwrap();
+        tokio::fs::create_dir_all(ws.join(".agents/skills"))
+            .await
+            .unwrap();
         let current = file_server::sync_target_version();
         // 预置当前版本 marker → 应 skip (不动文件)
         tokio::fs::write(ws.join(".agents/.sync_version"), &current)

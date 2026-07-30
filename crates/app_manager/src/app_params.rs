@@ -7,13 +7,14 @@ use std::collections::HashMap;
 use tracing::warn;
 
 use container_runtime_api::{
-    AppHealthCheck, AppPortSpec, AppResourceRequirements, ContainerCreateParams, };
+    AppHealthCheck, AppPortSpec, AppResourceRequirements, ContainerCreateParams,
+};
 use shared_types::ServiceType;
 
 use super::models::*;
 use super::runtime_identity::inject_release_identity;
-use super::utils::*;
 use super::service::AppService;
+use super::utils::*;
 
 /// build_params_inner 的入参聚合（消除 too_many_arguments，create/update 两路统一填充）。
 ///
@@ -32,8 +33,6 @@ struct AppParamsInput {
 }
 
 impl AppService {
-
-
     /// 构建 ContainerCreateParams（UserApp，create 路径）
     pub(crate) async fn build_container_params(
         &self,
@@ -56,7 +55,6 @@ impl AppService {
         )
         .await
     }
-
 
     /// UpdateAppRequest → ContainerCreateParams（全量替换语义，image 必填）。
     /// image 缺失 → ERR_VALIDATION（rcoder 无状态，无法保留旧 image，调用方必须发完整新状态）。
@@ -110,7 +108,6 @@ impl AppService {
         )
         .await
     }
-
 
     /// build_container_params / build_container_params_from_update 的公共逻辑。
     ///

@@ -26,7 +26,10 @@ async fn resolve_dst_with_retry(
 ) -> Option<String> {
     const MAX_RETRIES: u32 = 30;
     for attempt in 0..MAX_RETRIES {
-        match runtime.resolve_workspace_path(identifier, service_type).await {
+        match runtime
+            .resolve_workspace_path(identifier, service_type)
+            .await
+        {
             Ok(Some(base)) => return Some(base),
             Ok(None) => return None, // Docker 模式 (runtime 不提供聚合视角)
             Err(e) => {
@@ -88,10 +91,7 @@ pub async fn lazy_migrate(
         return;
     }
     // 共享 PVC 名 (env); 未设 → Docker 模式或未启用挂根聚合, 跳过
-    let Some(shared_pvc) = std::env::var(shared_pvc_env)
-        .ok()
-        .filter(|s| !s.is_empty())
-    else {
+    let Some(shared_pvc) = std::env::var(shared_pvc_env).ok().filter(|s| !s.is_empty()) else {
         return;
     };
     // 共享 src base: {cephfs_root}/{shared-subvol} (共享 PVC 早已 Bound, resolve 快 + cache 命中)
@@ -133,7 +133,13 @@ pub async fn lazy_migrate(
     match tokio::fs::rename(&src, &dst).await {
         Ok(()) => {
             let _ = tokio::fs::write(&marker, b"1").await;
-            info!("[MIGRATE] rename {} -> {} ({} {})", src.display(), dst.display(), service_type, identifier);
+            info!(
+                "[MIGRATE] rename {} -> {} ({} {})",
+                src.display(),
+                dst.display(),
+                service_type,
+                identifier
+            );
         }
         Err(e) if e.raw_os_error() == Some(18) => {
             // EXDEV: 跨 CephFS subvolume → copy + remove (shell mv 行为)
@@ -141,17 +147,27 @@ pub async fn lazy_migrate(
                 Ok(()) => {
                     let _ = tokio::fs::write(&marker, b"1").await;
                     let _ = tokio::fs::remove_dir_all(&src).await;
-                    info!("[MIGRATE] copy+remove {} -> {} ({} {})", src.display(), dst.display(), service_type, identifier);
+                    info!(
+                        "[MIGRATE] copy+remove {} -> {} ({} {})",
+                        src.display(),
+                        dst.display(),
+                        service_type,
+                        identifier
+                    );
                 }
                 Err(e) => warn!(
                     "[MIGRATE] copy failed {} -> {}: {} (agent 将启动; 数据仍在共享, 下次 ensure 重试)",
-                    src.display(), dst.display(), e
+                    src.display(),
+                    dst.display(),
+                    e
                 ),
             }
         }
         Err(e) => warn!(
             "[MIGRATE] rename failed {} -> {}: {} (agent 将启动; 数据仍在共享, 下次 ensure 重试)",
-            src.display(), dst.display(), e
+            src.display(),
+            dst.display(),
+            e
         ),
     }
 }
@@ -189,13 +205,17 @@ async fn migrate_children(src: &std::path::Path, dst: &std::path::Path, identifi
                     }
                     Err(e) => warn!(
                         "[MIGRATE] copy {} -> {} failed: {} (skip, 继续其他子项)",
-                        src_item.display(), dst_item.display(), e
+                        src_item.display(),
+                        dst_item.display(),
+                        e
                     ),
                 }
             }
             Err(e) => warn!(
                 "[MIGRATE] rename {} -> {} failed: {} (skip, 继续其他子项)",
-                src_item.display(), dst_item.display(), e
+                src_item.display(),
+                dst_item.display(),
+                e
             ),
         }
     }
@@ -203,7 +223,11 @@ async fn migrate_children(src: &std::path::Path, dst: &std::path::Path, identifi
         let _ = tokio::fs::write(&marker, b"1").await;
         info!(
             "[MIGRATE] {} 逐子项迁移 (迁 {}, skip {}): {} -> {}",
-            identifier, migrated, skipped, src.display(), dst.display()
+            identifier,
+            migrated,
+            skipped,
+            src.display(),
+            dst.display()
         );
     }
 }

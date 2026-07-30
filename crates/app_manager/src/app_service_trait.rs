@@ -63,11 +63,7 @@ pub trait AppServiceTrait: Send + Sync {
     ) -> AppResult<()>;
 
     /// 新建 PG 库（exec psql CREATE DATABASE）
-    async fn create_database(
-        &self,
-        app_id: &str,
-        request: CreateDatabaseRequest,
-    ) -> AppResult<()>;
+    async fn create_database(&self, app_id: &str, request: CreateDatabaseRequest) -> AppResult<()>;
 
     /// 分页查询持久存储（强制分页，无全量模式）
     async fn query_storage(

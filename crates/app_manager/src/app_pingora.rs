@@ -2,7 +2,6 @@
 //!
 //! register / unregister / rebuild_pingora_backends（Docker 模式为主）。
 
-
 use tracing::{info, warn};
 
 use container_runtime_api::{ExposeType as RtExposeType, HttpExpose};
@@ -10,12 +9,10 @@ use shared_types::ServiceType;
 
 use super::config::AppAccessMode;
 use super::models::*;
-use super::utils::*;
 use super::service::AppService;
+use super::utils::*;
 
 impl AppService {
-
-
     /// 为 HTTP 端口注册 Pingora backend（Pingora 模式，Docker/K8s 统一）。
     /// backend host 按后端：Docker=container_ip，K8s=ClusterIP Service FQDN（Pod 内 kube-dns 解析）。
     /// Gateway 模式不注册（HTTP 走 HTTPRoute）。
@@ -69,7 +66,6 @@ impl AppService {
         http_ports.to_vec()
     }
 
-
     /// 清理 app 曾注册的 Pingora backend（Pingora 模式）。Gateway 模式未注册过，直接返回。
     pub(crate) async fn unregister_pingora_backends(&self, app_id: &str) {
         if self.config.http_expose == HttpExpose::Gateway {
@@ -82,10 +78,12 @@ impl AppService {
             for port in &ports {
                 pingora.remove_app_backend(app_id, *port);
             }
-            info!("[APP] pingora backend unregistered: {} ports={:?}", app_id, ports);
+            info!(
+                "[APP] pingora backend unregistered: {} ports={:?}",
+                app_id, ports
+            );
         }
     }
-
 
     /// 启动时重建 Pingora backends（K8s Pingora 模式，修复重启后 pingora_ports 内存态丢失）。
     /// 从集群列出所有托管 app，按 expose_type（Deployment annotation 还原）重新注册 HTTP 端口的 backend。

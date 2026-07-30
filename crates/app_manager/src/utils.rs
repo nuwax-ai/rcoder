@@ -156,7 +156,11 @@ pub(super) fn validate_pg_identifier(name: &str) -> AppResult<()> {
             "PG identifier must start with letter or '_'".to_string(),
         ));
     }
-    if !name.chars().skip(1).all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !name
+        .chars()
+        .skip(1)
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return Err(AppOperationError::Validation(
             "PG identifier: only [a-zA-Z0-9_] allowed".to_string(),
         ));
@@ -295,9 +299,7 @@ pub(super) use container_runtime_api::validate_k8s_storage_size;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use container_runtime_api::{
-        ExposeType as RtExposeType, HealthCheckType as RtHealthCheckType,
-    };
+    use container_runtime_api::{ExposeType as RtExposeType, HealthCheckType as RtHealthCheckType};
 
     // ---------------- validate_app_id ----------------
 

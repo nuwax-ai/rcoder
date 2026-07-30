@@ -92,7 +92,10 @@ async fn migrate_shared_pvc(
     let shared_base = match runtime.resolve_workspace_path_by_pvcname(&shared_pvc).await {
         Ok(Some(p)) => PathBuf::from(p),
         _ => {
-            warn!("[BATCH_MIGRATE] cannot resolve shared PVC {}: skip", pvc_env);
+            warn!(
+                "[BATCH_MIGRATE] cannot resolve shared PVC {}: skip",
+                pvc_env
+            );
             return 0;
         }
     };
@@ -130,14 +133,23 @@ async fn migrate_shared_pvc(
         let identifier = &name;
 
         // ensure per-agent PVC (SC Immediate 立即 Bound)
-        if let Err(e) = runtime.ensure_workspace(identifier, &service_type, None).await {
-            warn!("[BATCH_MIGRATE] ensure_workspace {} failed: {}, skip", identifier, e);
+        if let Err(e) = runtime
+            .ensure_workspace(identifier, &service_type, None)
+            .await
+        {
+            warn!(
+                "[BATCH_MIGRATE] ensure_workspace {} failed: {}, skip",
+                identifier, e
+            );
             *failed += 1;
             continue;
         }
 
         // resolve per-agent subvolumePath
-        let per_agent_base = match runtime.resolve_workspace_path(identifier, &service_type).await {
+        let per_agent_base = match runtime
+            .resolve_workspace_path(identifier, &service_type)
+            .await
+        {
             Ok(Some(p)) => PathBuf::from(p),
             _ => {
                 warn!(
@@ -181,8 +193,10 @@ async fn migrate_shared_pvc(
                 migrated += 1;
                 info!(
                     "[BATCH_MIGRATE] {} {} copied {} -> {}",
-                    service_type, identifier,
-                    src_item.display(), dst_item.display()
+                    service_type,
+                    identifier,
+                    src_item.display(),
+                    dst_item.display()
                 );
             }
             Err(e) => {

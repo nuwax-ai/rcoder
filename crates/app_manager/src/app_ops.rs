@@ -2,17 +2,13 @@
 //!
 //! start/stop/restart + logs/stats/events/file_logs 观测委托（转调 ContainerRuntime）。
 
-
 use tracing::{info, instrument, warn};
 
-
 use super::models::*;
-use super::utils::*;
 use super::service::AppService;
+use super::utils::*;
 
 impl AppService {
-
-
     /// 启动应用（scale replicas = 1）
     #[instrument(skip(self))]
     pub async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
@@ -27,7 +23,6 @@ impl AppService {
         info!("[APP] app started (scale=1): {}", app_id);
         self.get_app(app_id).await
     }
-
 
     /// 停止应用（scale replicas = 0）
     #[instrument(skip(self))]
@@ -44,7 +39,6 @@ impl AppService {
         self.get_app(app_id).await
     }
 
-
     /// 重启应用（rollout restart）
     #[instrument(skip(self))]
     pub async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
@@ -59,7 +53,6 @@ impl AppService {
         info!("[APP] app restarted (rollout): {}", app_id);
         self.get_app(app_id).await
     }
-
 
     /// 获取应用日志（实时拉容器 stdout/stderr：K8s Pod logs / docker logs）。
     ///
@@ -88,7 +81,6 @@ impl AppService {
             .collect())
     }
 
-
     /// 启动日志流（follow），返回 mpsc::Receiver 供 WS handler 桥接（v2 §11）。
     /// receiver drop 即取消：客户端断开 → handler 退出 → receiver 析构 → runtime 任务终止。
     pub async fn stream_app_logs(
@@ -106,7 +98,6 @@ impl AppService {
             })
     }
 
-
     /// 获取资源使用情况。
     ///
     /// CPU/内存用量 + 限额来自运行时（K8s = metrics.k8s.io PodMetrics + pod limits；Docker 默认 0），
@@ -119,9 +110,7 @@ impl AppService {
         let usage = match self.runtime.get_app_resource_usage(app_id).await {
             Ok(u) => u,
             Err(e) => {
-                warn!(
-                    "[APP] get_app_resource_usage failed app_id={app_id}: {e} (stats 降级 0)"
-                );
+                warn!("[APP] get_app_resource_usage failed app_id={app_id}: {e} (stats 降级 0)");
                 Default::default()
             }
         };
@@ -151,7 +140,6 @@ impl AppService {
         })
     }
 
-
     /// 获取应用事件（K8s Events API：调度/拉取/启动/崩溃）
     #[instrument(skip(self))]
     pub async fn get_app_events(
@@ -164,7 +152,6 @@ impl AppService {
             map_runtime_error(&format!("[APP] get_app_events failed app_id={app_id}"), e)
         })
     }
-
 
     /// 读取应用文件日志（从 workspace PVC 的 logs/ 目录直接读，不依赖 K8s Pod log API）。
     ///
@@ -188,9 +175,7 @@ impl AppService {
             )));
         }
         // path traversal 防护（与 upload/delete_file 一致，复用 utils::ensure_within_app_dir）
-        let canonical_root = app_dir
-            .canonicalize()
-            .unwrap_or_else(|_| app_dir.clone());
+        let canonical_root = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
         let canonical_target = ensure_within_app_dir(&target, &canonical_root)?;
 
         // 读文件，取最后 tail 行

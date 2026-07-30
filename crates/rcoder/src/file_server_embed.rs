@@ -85,7 +85,11 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
         for attempt in 0..MAX_RETRIES {
             // 直接调 runtime.resolve_workspace_path (不经 self.resolve 吞 Err)
             // self.resolve 把 Err → Ok(None) → 重试循环误判 Docker 模式直接 break
-            match self.runtime.resolve_workspace_path(identifier, service_type).await {
+            match self
+                .runtime
+                .resolve_workspace_path(identifier, service_type)
+                .await
+            {
                 Ok(Some(path)) => {
                     if attempt > 0 {
                         info!(
@@ -101,7 +105,10 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
                     if attempt + 1 < MAX_RETRIES {
                         tracing::debug!(
                             "[ensure_and_resolve] {} PVC pending (attempt {}/{}): {}",
-                            identifier, attempt + 1, MAX_RETRIES, e
+                            identifier,
+                            attempt + 1,
+                            MAX_RETRIES,
+                            e
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     } else {
@@ -163,14 +170,16 @@ pub(crate) async fn spawn_embedded_file_server(runtime: Arc<dyn WorkspaceRuntime
         }
     };
     let address = format!("{}:{}", fs_config.listen_host, fs_config.port);
-    let fs_server =
-        match FileServer::builder(fs_config).with_workspace_resolver(fs_resolver).build() {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("build embedded file-server failed, not started: {e:#}");
-                return;
-            }
-        };
+    let fs_server = match FileServer::builder(fs_config)
+        .with_workspace_resolver(fs_resolver)
+        .build()
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("build embedded file-server failed, not started: {e:#}");
+            return;
+        }
+    };
     info!("file-server (embedded) starting on {}", address);
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind(&address).await {

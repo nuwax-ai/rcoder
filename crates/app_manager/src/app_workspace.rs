@@ -9,12 +9,10 @@ use tokio::fs;
 use shared_types::ServiceType;
 
 use super::models::*;
-use super::utils::*;
 use super::service::AppService;
+use super::utils::*;
 
 impl AppService {
-
-
     /// ensure UserApp per-app 工作空间就绪 (K8s): ensure PVC 带 requests.storage 用户配额 + 重试
     /// resolve 等 ceph-csi provision subvolumePath (SC Immediate 后秒级, 慢可达 10s+)。
     ///
@@ -68,7 +66,6 @@ impl AppService {
         }
     }
 
-
     /// 获取应用目录的宿主机路径（Docker bind mount 源）
     ///
     /// Docker 模式：rcoder 通常也运行在容器内，需经 HostPathResolver 将容器内路径
@@ -89,7 +86,6 @@ impl AppService {
         }
     }
 
-
     /// 创建应用工作空间子目录（code/data/logs）。在 ensure_app_workspace_ready (K8s ensure PVC +
     /// 等 subvolumePath) 之后、create_deployment (Docker bind mount 需源目录存在) 之前调用。
     /// Docker: 共享 Local; K8s: per-app PVC 根 (ensure_app_workspace_ready 已确保 resolve 成功)。
@@ -106,7 +102,6 @@ impl AppService {
             .map_err(|e| map_io_error("failed to create logs dir", e, false))?;
         Ok(())
     }
-
 
     /// 获取应用目录（rcoder 视角）。
     ///

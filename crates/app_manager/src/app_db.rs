@@ -2,17 +2,13 @@
 //!
 //! reset-password / create-database（exec psql）+ exec_psql / database_exists / ensure_app_running。
 
-
 use tracing::info;
 
-
 use super::models::*;
-use super::utils::*;
 use super::service::AppService;
+use super::utils::*;
 
 impl AppService {
-
-
     /// 重置 app 容器内 PG 密码(rcoder exec 容器内 psql ALTER USER,本地 trust 认证绕过当前密码)。
     /// 解决"用户忘记密码进不去 pgweb"的死锁(pgweb 要当前密码,rcoder 用容器内 trust 免密)。
     pub async fn reset_db_password(
@@ -48,13 +44,8 @@ impl AppService {
         Ok(())
     }
 
-
     /// 新建 PG 库(rcoder exec 容器内 psql CREATE DATABASE)。API 化建库(Java/CI 自动化)。
-    pub async fn create_database(
-        &self,
-        app_id: &str,
-        req: CreateDatabaseRequest,
-    ) -> AppResult<()> {
+    pub async fn create_database(&self, app_id: &str, req: CreateDatabaseRequest) -> AppResult<()> {
         validate_app_id(app_id)?;
         validate_pg_identifier(&req.database)?;
         if let Some(owner) = &req.owner {
@@ -110,19 +101,15 @@ impl AppService {
         Ok(())
     }
 
-
     /// exec 容器内 psql 命令，exit_code != 0 → Backend 错误（含 stderr 摘要）。
     ///
     /// reset_db_password 共用。create_database 因需区分"库已存在"(AlreadyExists) 不复用此函数。
-    async fn exec_psql(
-        &self,
-        app_id: &str,
-        command: Vec<String>,
-        ctx: &str,
-    ) -> AppResult<()> {
-        let r = self.runtime.exec(app_id, command).await.map_err(|e| {
-            map_runtime_error(ctx, e)
-        })?;
+    async fn exec_psql(&self, app_id: &str, command: Vec<String>, ctx: &str) -> AppResult<()> {
+        let r = self
+            .runtime
+            .exec(app_id, command)
+            .await
+            .map_err(|e| map_runtime_error(ctx, e))?;
         if r.exit_code != 0 {
             return Err(AppOperationError::Backend(format!(
                 "{ctx}: exit {}: {}",
@@ -132,7 +119,6 @@ impl AppService {
         }
         Ok(())
     }
-
 
     /// 查询 app 容器 PG 里某库是否已存在（psql `-tAc SELECT pg_database`）。
     /// `-tAc` 取无表头纯输出: 命中输出 `1`、未命中输出空 → 比 CREATE 失败后解析 stderr 稳定。
@@ -161,7 +147,6 @@ impl AppService {
         }
         Ok(r.stdout.trim() == "1")
     }
-
 
     /// 校验 app 处于 Running 阶段（exec psql 的前置条件）。
     ///

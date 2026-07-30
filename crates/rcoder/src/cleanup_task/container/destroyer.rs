@@ -148,8 +148,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use container_runtime_api::{
-        AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult,
-        RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
+        AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeError,
+        ContainerRuntimeResult, RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
     };
     use rcoder_proxy::PingoraProxyService;
     use rcoder_proxy::config::ProxyConfig;
