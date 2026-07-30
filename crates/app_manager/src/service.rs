@@ -471,17 +471,12 @@ impl AppService {
             )
         })?;
 
-        // 3. 仅 purge=true 时清空持久存储（code/data/logs 目录）。
-        //    默认保留：应用可重建，数据不可再生（v2 §5.3 数据安全）。
+        // 3. purge=true 必须销毁持久存储（K8s: PVC + Ceph subvolume；Docker:
+        //    workspace 目录），与 API 的“全部删除”语义一致。仅清空目录却保留 PVC
+        //    会继续占用配额，并让成功响应与实际状态不一致。
         if purge {
-            let app_dir = self.get_container_app_dir(app_id).await?;
-            // K8s per-agent: app_dir = per-app PVC 根, 清空内容不删根 (同 clear_app_storage)
-            if app_dir.exists()
-                && let Err(e) = Self::purge_dir_contents(&app_dir).await
-            {
-                warn!("[APP] purge dir contents failed {:?}: {}", app_dir, e);
-            }
-            info!("[APP] persistent storage cleared: {}", app_id);
+            self.destroy_app_storage(app_id, app_id).await?;
+            info!("[APP] persistent storage destroyed: {}", app_id);
         } else {
             info!(
                 "[APP] retained persistent storage (pass purge=true to clear): {}",

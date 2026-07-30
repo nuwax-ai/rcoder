@@ -13,6 +13,7 @@ pub struct ReleaseMetadata<'a> {
     pub pingap_version: &'a str,
     pub pingap_commit: &'a str,
     pub minimum_app_cli_version: &'a str,
+    /// Manifest v1 compatibility field containing a versioned runtime image reference.
     pub runtime_image_digest: &'a str,
 }
 

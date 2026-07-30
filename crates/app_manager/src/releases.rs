@@ -603,6 +603,57 @@ mod tests {
         assert!(!root.path().join("packages/old.zip").exists());
     }
 
+    #[tokio::test]
+    async fn retention_fifteen_prunes_the_oldest_non_active_release() {
+        let root = tempfile::tempdir().expect("release tempdir");
+        tokio::fs::create_dir_all(root.path().join("packages"))
+            .await
+            .expect("packages");
+        let mut releases = Vec::new();
+        for sequence in 0..16 {
+            let id = format!("release-{sequence:02}");
+            let status = if sequence == 0 {
+                ReleaseStatus::Active
+            } else {
+                ReleaseStatus::Prepared
+            };
+            releases.push(release(
+                &id,
+                status,
+                &format!("2026-01-{day:02}", day = sequence + 1),
+            ));
+            tokio::fs::write(root.path().join("packages").join(format!("{id}.zip")), &id)
+                .await
+                .expect("package");
+        }
+        let mut index = ReleaseIndex {
+            active_release_id: Some("release-00".into()),
+            pending_release_id: None,
+            previous_release_id: None,
+            retention: 15,
+            releases,
+        };
+
+        cleanup_retention(root.path(), &mut index)
+            .await
+            .expect("cleanup");
+
+        assert_eq!(index.releases.len(), 15);
+        assert!(
+            index
+                .releases
+                .iter()
+                .any(|release| release.release_id == "release-00")
+        );
+        assert!(
+            !index
+                .releases
+                .iter()
+                .any(|release| release.release_id == "release-01")
+        );
+        assert!(!root.path().join("packages/release-01.zip").exists());
+    }
+
     #[test]
     fn validates_release_identity_and_digest() {
         assert!(validate_release_id("01j-release").is_ok());

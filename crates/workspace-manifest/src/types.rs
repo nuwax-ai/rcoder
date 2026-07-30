@@ -194,6 +194,8 @@ pub struct ReleaseLock {
     pub workspace_name: String,
     pub pingap: LockedPingap,
     pub minimum_app_cli_version: String,
+    /// Manifest v1 compatibility name. The value is the platform-versioned
+    /// app-runtime image reference; it is not required to be an OCI digest.
     pub runtime_image_digest: String,
     pub services: Vec<LockedService>,
 }

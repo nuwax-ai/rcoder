@@ -28,5 +28,6 @@ app-cli 加载配置、解析逻辑地址、检查冲突、调用 `PingapConfig:
 - 公网 listener 只能是 `0.0.0.0:9080`；额外 listener 只能 loopback。
 - Admin 始终关闭，运行时修改不作为权威配置。
 - 每类对象默认最多 256 个，总配置最多 2 MiB。
-- binary 和 `pingap-config` 必须锁到相同 commit；release lock 记录版本、commit 和镜像 digest。
+- binary 和 `pingap-config` 必须锁到相同 commit；release lock 记录版本、commit 和平台
+  版本化 app-runtime 镜像引用。
 - TOML 明文会进入源码和保留的 Release 包，app-cli 不应主动打印完整配置。

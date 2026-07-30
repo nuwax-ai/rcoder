@@ -124,7 +124,8 @@ UserApp 发布包只包含 workspace 代码、Manifest 和 release lock，不包
 
 - `workspace.manifest.toml` 不保存镜像、CPU/内存、Secret、PVC 大小或版本保留数；
 - Java 创建计算资源时使用平台当前允许的 app-runtime 镜像；
-- release lock 记录精确 `runtime_image_digest`；
+- release lock 的 Manifest v1 兼容字段 `runtime_image_digest` 记录与 Chart 版本绑定的完整
+  app-runtime 镜像引用；不解析 registry manifest digest；
 - app-cli 启动时复核实际运行时身份与 release lock；
 - 用户代码发布不通过 `POST /apps/{id}/update` 更换业务镜像。
 
@@ -176,7 +177,7 @@ file-server 构建成功后生成 `release.lock.toml`，至少锁定：
 - run/migrate/health/proxy/logs/env；
 - Pingap mode、精确版本和 commit；
 - 最低 app-cli 版本；
-- app-runtime 镜像 digest。
+- 平台版本化 app-runtime 镜像引用。
 
 app-cli 运行时只读 release lock，不重新扫描源 Manifest，也不重新推导端口和依赖顺序。
 
@@ -344,7 +345,7 @@ app-cli 当前启动流程：
 
 1. 读取并严格解析 `/app/code/release.lock.toml`；
 2. 校验最低 app-cli 版本；
-3. 校验 Pingap 版本/commit 和 runtime image digest；
+3. 校验 Pingap 版本/commit 和版本化 runtime image reference；
 4. 等待 PostgreSQL ready；
 5. 按 release lock 的拓扑顺序执行每个 service 的 migrate；
 6. 启动 enabled service；

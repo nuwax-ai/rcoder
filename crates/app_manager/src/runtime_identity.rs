@@ -65,7 +65,7 @@ schema_version = 1
 release_id = "release-1"
 workspace_name = "smoke"
 minimum_app_cli_version = "0.1.0"
-runtime_image_digest = "sha256:runtime"
+runtime_image_digest = "registry.example/app-runtime:0.1.140"
 
 [pingap]
 mode = "managed"
@@ -114,7 +114,7 @@ upstream_includes = []
             .expect("inject identity");
         assert_eq!(
             env.get("RCODER_RUNTIME_IMAGE_DIGEST").map(String::as_str),
-            Some("sha256:runtime")
+            Some("registry.example/app-runtime:0.1.140")
         );
         assert_eq!(
             env.get("RCODER_PINGAP_COMMIT").map(String::as_str),

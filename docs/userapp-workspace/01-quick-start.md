@@ -25,6 +25,9 @@ Content-Type: application/json
 
 file-server 构建前必须配置 `RCODER_PINGAP_VERSION`、`RCODER_PINGAP_COMMIT` 和
 `RCODER_RUNTIME_IMAGE_DIGEST`。缺失时 Fail Fast，禁止生成身份为 `latest/unknown` 的锁文件。
+为兼容 Manifest v1，第三个变量沿用旧名称，但值是与平台 Chart 版本绑定的完整镜像引用
+（例如 `registry/nuwax-k8s-test/app-runtime:0.1.140`），不要求解析 registry manifest
+或填写 `sha256` digest。
 发布激活后，app_manager 会从 `release.lock.toml` 将这三项作为保留环境变量注入
 UserApp 容器；应用请求和项目 manifest 都不能覆盖它们。
 应用容器启动时会用同名环境变量复核 release lock，任何不一致都会保持 not-ready。

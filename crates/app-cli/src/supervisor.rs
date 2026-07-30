@@ -47,7 +47,12 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
             warn!("⚠️  {} 无 [run].command，跳过", spec.name);
             continue;
         }
-        match start_service(spec, &args.workspace, &args.log_dir) {
+        match start_service(
+            spec,
+            &args.workspace,
+            &args.log_dir,
+            &release.release_id,
+        ) {
             Ok(child) => children.push((spec.name.clone(), child)),
             Err(e) => {
                 error!("❌ start {} failed: {e}", spec.name);
@@ -180,7 +185,12 @@ async fn wait_for_services_ready(specs: &[ServiceSpec]) -> Result<()> {
 // ── 子项目启动 ─────────────────────────────────────────────────────────────────
 
 /// 启动一个子项目（[run].command + PORT/HOSTNAME env + stdout/stderr → 轮转日志）。
-fn start_service(spec: &ServiceSpec, ws_root: &Path, log_dir: &Path) -> Result<Child> {
+fn start_service(
+    spec: &ServiceSpec,
+    ws_root: &Path,
+    log_dir: &Path,
+    release_id: &str,
+) -> Result<Child> {
     let cwd = ws_root.join(&spec.dir);
     let service_log_dir = log_dir.join(&spec.service_id);
     std::fs::create_dir_all(&service_log_dir)
@@ -191,11 +201,14 @@ fn start_service(spec: &ServiceSpec, ws_root: &Path, log_dir: &Path) -> Result<C
     let mut cmd = process_group_command(&spec.run.command[0]);
     cmd.args(&spec.run.command[1..])
         .current_dir(&cwd)
+        .envs(&spec.env)
+        // Runtime-owned variables are applied last so even a hand-crafted
+        // release lock cannot override service identity, paths, or ports.
         .env("HOSTNAME", "0.0.0.0")
         .env("PORT", spec.port.to_string())
         .env("APP_LOG_DIR", &service_log_dir)
         .env("APP_SERVICE_ID", &spec.service_id)
-        .envs(&spec.env) // 项目级 env（覆盖 workspace 级同名变量）
+        .env("APP_RELEASE_ID", release_id)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
