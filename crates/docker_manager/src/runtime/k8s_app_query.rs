@@ -5,23 +5,21 @@
 
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
-    AppPortStatus, ContainerRuntimeError,
-    ContainerRuntimeResult, ContainerSpecSnapshot, DeploymentStatus, ExposeType,
+    AppPortStatus, ContainerRuntimeError, ContainerRuntimeResult, ContainerSpecSnapshot,
+    DeploymentStatus, ExposeType,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::apps::v1::Deployment;
 #[cfg(feature = "kubernetes")]
 use kube::api::ListParams;
 
-
+use super::k8s_app_helpers::{PORT_EXPOSE_ANNOTATION, parse_port_expose};
+use super::k8s_deployment::{
+    APP_CONTAINER_NAME, APP_LABEL_PREFIX, APP_MANAGED_BY, RCODER_LABEL_PREFIX,
+};
 use super::kubernetes_runtime::KubernetesRuntime;
-use super::k8s_app_helpers::{parse_port_expose, PORT_EXPOSE_ANNOTATION};
-use super::k8s_deployment::{APP_CONTAINER_NAME, APP_LABEL_PREFIX, APP_MANAGED_BY, RCODER_LABEL_PREFIX};
-
 
 impl KubernetesRuntime {
-
-
     /// 查询单个 app 的运行时状态（实时查 Deployment + Pod）
     pub async fn get_app_status(
         &self,
@@ -39,7 +37,6 @@ impl KubernetesRuntime {
         };
         Ok(Some(self.deployment_to_status(app_id, &deploy).await))
     }
-
 
     /// 读 app 当前容器的 `command`/`env` 快照（update 部分更新回退用）。
     ///
@@ -68,11 +65,15 @@ impl KubernetesRuntime {
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "get deployment for container spec: {e}"
-                )))
+                )));
             }
         };
         // env：ConfigMap `{app}-config`.data（apply_app_configmap 写入 = params.env 原样）
-        let env = match self.configmaps_api().get(&self.app_config_name(app_id)).await {
+        let env = match self
+            .configmaps_api()
+            .get(&self.app_config_name(app_id))
+            .await
+        {
             Ok(cm) => cm
                 .data
                 .filter(|m| !m.is_empty())
@@ -81,12 +82,11 @@ impl KubernetesRuntime {
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "get configmap for container spec: {e}"
-                )))
+                )));
             }
         };
         Ok(ContainerSpecSnapshot { command, env })
     }
-
 
     /// 列出所有 rcoder-app-manager 托管的 app 状态（对账用）
     pub async fn list_app_status(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
@@ -114,7 +114,6 @@ impl KubernetesRuntime {
         }
         Ok(out)
     }
-
 
     /// Deployment 对象 → DeploymentStatus（含关联 Pod 的实时信息）。
     ///
@@ -200,10 +199,7 @@ impl KubernetesRuntime {
 
     /// TCP 端口的 node_port：查 NodePort Service，按 port name 关联（TCP 对外时用）。
     /// Service 不存在（无 TCP 端口）返空 map。
-    async fn collect_tcp_nodeports(
-        &self,
-        app_id: &str,
-    ) -> std::collections::HashMap<String, u16> {
+    async fn collect_tcp_nodeports(&self, app_id: &str) -> std::collections::HashMap<String, u16> {
         self.services_api()
             .get(&self.app_nodeport_name(app_id))
             .await
@@ -223,7 +219,6 @@ impl KubernetesRuntime {
             .unwrap_or_default()
     }
 }
-
 
 /// phase 推导（纯函数）。
 ///
@@ -276,9 +271,7 @@ fn derive_port_statuses(
                         // 回退：无 annotation（旧 app）—— 在 NodePort Service 里 = Tcp，否则 Http
                         None => tcp_nodeports
                             .get(&name)
-                            .map_or((ExposeType::Http, None), |np| {
-                                (ExposeType::Tcp, Some(*np))
-                            }),
+                            .map_or((ExposeType::Http, None), |np| (ExposeType::Tcp, Some(*np))),
                     };
                     AppPortStatus {
                         name,
@@ -291,7 +284,6 @@ fn derive_port_statuses(
         })
         .unwrap_or_default()
 }
-
 
 /// 从容器状态提取"启动失败"原因（供 phase=Error 的 message）。
 ///
@@ -441,7 +433,10 @@ mod tests {
     #[test]
     fn error_message_image_pull_no_detail() {
         let cs = cs_waiting("ImagePullBackOff", None);
-        assert_eq!(container_error_message(&cs).as_deref(), Some("ImagePullBackOff"));
+        assert_eq!(
+            container_error_message(&cs).as_deref(),
+            Some("ImagePullBackOff")
+        );
     }
 
     #[test]

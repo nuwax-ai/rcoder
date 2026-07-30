@@ -8,8 +8,8 @@ use kube::api::{Api, ListParams};
 use kube::core::{ApiResource, DynamicObject};
 use tracing::{debug, warn};
 
-use super::k8s_deployment::{APP_CONTAINER_NAME, RCODER_LABEL_PREFIX};
 use super::KubernetesRuntime;
+use super::k8s_deployment::{APP_CONTAINER_NAME, RCODER_LABEL_PREFIX};
 
 impl KubernetesRuntime {
     /// 拉取 app Pod 的 stdout/stderr 日志（最近 `tail` 行）。

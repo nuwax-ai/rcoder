@@ -594,7 +594,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             Err(e) => {
                 return Err(ContainerRuntimeError::ConnectionError(format!(
                     "inspect for container spec: {e}"
-                )))
+                )));
             }
         };
         let cfg = inspect.config.as_ref();
@@ -755,8 +755,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             .await
             .map_err(|e| match e {
                 bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404,
-                    ..
+                    status_code: 404, ..
                 } => ContainerRuntimeError::ContainerNotFound(name.clone()),
                 _ => ContainerRuntimeError::ContainerExecError(format!("create_exec: {e}")),
             })?;
@@ -772,8 +771,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             StartExecResults::Attached { mut output, .. } => {
                 while let Some(item) = output.next().await {
                     match item {
-                        Ok(LogOutput::StdOut { message })
-                        | Ok(LogOutput::Console { message }) => {
+                        Ok(LogOutput::StdOut { message }) | Ok(LogOutput::Console { message }) => {
                             stdout.push_str(&String::from_utf8_lossy(&message));
                         }
                         Ok(LogOutput::StdErr { message }) => {
@@ -783,7 +781,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                         Err(e) => {
                             return Err(ContainerRuntimeError::ContainerExecError(format!(
                                 "stream: {e}"
-                            )))
+                            )));
                         }
                     }
                 }

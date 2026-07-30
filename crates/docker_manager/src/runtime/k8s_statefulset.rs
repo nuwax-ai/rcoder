@@ -17,8 +17,8 @@ use tracing::{debug, info, warn};
 use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
 use shared_types::ServiceType;
 
-use crate::runtime::k8s_service::build_standard_labels;
 use crate::runtime::k8s_pod::K8sPodOps;
+use crate::runtime::k8s_service::build_standard_labels;
 
 use super::KubernetesRuntime;
 
@@ -37,7 +37,10 @@ impl KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
-        Ok(format!("{}-headless", self.pod_name(identifier, service_type)?))
+        Ok(format!(
+            "{}-headless",
+            self.pod_name(identifier, service_type)?
+        ))
     }
 
     /// STS 实际 Pod 名（StatefulSet 稳定命名：`{sts_name}-0`）。
@@ -183,21 +186,26 @@ impl KubernetesRuntime {
                         "[K8S-STS] {} exists but service_type mismatch (existing={:?}, requested={:?}); recreating",
                         sts_name, existing_st, service_type
                     );
-                    self.delete_agent_statefulset(identifier, service_type).await?;
+                    self.delete_agent_statefulset(identifier, service_type)
+                        .await?;
                     let sts =
                         self.build_agent_statefulset(identifier, service_type, pod_spec, replicas)?;
                     sts_api
                         .create(&PostParams::default(), &sts)
                         .await
-                        .map_err(|e| ContainerRuntimeError::K8sError(format!("recreate sts: {e}")))?;
+                        .map_err(|e| {
+                            ContainerRuntimeError::K8sError(format!("recreate sts: {e}"))
+                        })?;
                     info!("[K8S-STS] recreated {} (type={:?})", sts_name, service_type);
                 } else {
                     // 类型匹配：scale 到期望 replicas（幂等）
-                    self.scale_agent_statefulset(identifier, service_type, replicas).await?;
+                    self.scale_agent_statefulset(identifier, service_type, replicas)
+                        .await?;
                 }
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                let sts = self.build_agent_statefulset(identifier, service_type, pod_spec, replicas)?;
+                let sts =
+                    self.build_agent_statefulset(identifier, service_type, pod_spec, replicas)?;
                 sts_api
                     .create(&PostParams::default(), &sts)
                     .await
@@ -211,7 +219,7 @@ impl KubernetesRuntime {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "get sts {}: {}",
                     sts_name, e
-                )))
+                )));
             }
         }
         Ok(())
@@ -236,10 +244,7 @@ impl KubernetesRuntime {
             )
             .await
             .map_err(|e| ContainerRuntimeError::K8sError(format!("scale sts {sts_name}: {e}")))?;
-        debug!(
-            "[K8S-STS] scaled {} to replicas={}",
-            sts_name, replicas
-        );
+        debug!("[K8S-STS] scaled {} to replicas={}", sts_name, replicas);
         Ok(())
     }
 

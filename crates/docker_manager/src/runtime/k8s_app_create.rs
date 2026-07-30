@@ -13,8 +13,8 @@ use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapEnvSource, Container as K8sContainer, ContainerPort, EnvFromSource, EnvVar,
-    PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec,
-    SecretEnvSource, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec, SecretEnvSource, Service,
+    ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -28,19 +28,16 @@ use tracing::info;
 #[cfg(feature = "kubernetes")]
 use shared_types::ServiceType;
 
-#[cfg(feature = "kubernetes")]
-use super::k8s_pvc::K8sPvcOps;
-use super::kubernetes_runtime::KubernetesRuntime;
 use super::k8s_app_helpers::{
     build_app_resource_requirements, build_probe, config_hash_annotations,
     encode_port_expose_annotations,
 };
 use super::k8s_deployment::APP_CONTAINER_NAME;
-
+#[cfg(feature = "kubernetes")]
+use super::k8s_pvc::K8sPvcOps;
+use super::kubernetes_runtime::KubernetesRuntime;
 
 impl KubernetesRuntime {
-
-
     /// apply ConfigMap（存 env，非敏感）—— SSA create-or-update
     async fn apply_app_configmap(
         &self,
@@ -71,7 +68,6 @@ impl KubernetesRuntime {
             .map_err(|e| ContainerRuntimeError::K8sError(format!("apply configmap: {e}")))?;
         Ok(())
     }
-
 
     /// apply Secret（存 secrets，敏感）—— SSA create-or-update
     async fn apply_app_secret(
@@ -105,7 +101,6 @@ impl KubernetesRuntime {
             .map_err(|e| ContainerRuntimeError::K8sError(format!("apply secret: {e}")))?;
         Ok(())
     }
-
 
     /// 构建 Deployment 资源
     fn build_app_deployment(
@@ -260,7 +255,6 @@ impl KubernetesRuntime {
         Ok(deployment)
     }
 
-
     /// apply ClusterIP Service（暴露 app 端口）—— SSA create-or-update
     async fn apply_app_service(
         &self,
@@ -315,7 +309,6 @@ impl KubernetesRuntime {
             .map_err(|e| ContainerRuntimeError::K8sError(format!("apply app service: {e}")))?;
         Ok(())
     }
-
 
     /// apply HTTPRoute（HTTP 端口 → Gateway）—— SSA create-or-update，path prefix `/apps/{app_id}`
     ///
@@ -391,7 +384,6 @@ impl KubernetesRuntime {
             .map_err(|e| ContainerRuntimeError::K8sError(format!("apply httproute: {e}")))?;
         Ok(())
     }
-
 
     /// apply NodePort Service（TCP 端口对外暴露）—— SSA create-or-update，
     /// 返回实际分配的 node_port 列表（server 分配，apply 后从返回对象读取）。
@@ -474,7 +466,6 @@ impl KubernetesRuntime {
         Ok(result)
     }
 
-
     /// apply Deployment（SSA create-or-update）。抽出供 create_app_resources 与
     /// patch_deployment（Phase 3）复用。
     async fn apply_app_deployment(
@@ -496,7 +487,6 @@ impl KubernetesRuntime {
         Ok(())
     }
 
-
     /// 创建 UserApp 的全部 K8s 资源（SSA apply，幂等 create-or-update）：
     /// ConfigMap/Secret/Service/Deployment/HTTPRoute/NodePort。
     pub async fn create_app_resources(
@@ -513,8 +503,12 @@ impl KubernetesRuntime {
         //    (配额由 requests.storage 经 CSI 服务端设, 绕开 client setfattr; PVC 默认保留,
         //    重建时 ensure "active" 分支复用; 销毁走 destroy_app_pvc)。create_app 流程已在
         //    app_manager ensure_app_workspace_ready 预 ensure + 等 subvolumePath 就绪, 这里命中 "active" 复用分支。
-        self.ensure_workspace_pvc(app_id, &ServiceType::UserApp, params.storage_size.as_deref())
-            .await?;
+        self.ensure_workspace_pvc(
+            app_id,
+            &ServiceType::UserApp,
+            params.storage_size.as_deref(),
+        )
+        .await?;
         // 1. ConfigMap（env）
         if let Some(env) = &params.env
             && !env.is_empty()

@@ -460,7 +460,7 @@ impl K8sPvcOps for KubernetesRuntime {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "Failed to get PVC '{}' before destroy: {}",
                     pvc_name, e
-                )))
+                )));
             }
             Ok(_) => {}
         }
@@ -482,7 +482,7 @@ impl K8sPvcOps for KubernetesRuntime {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "Failed to delete PVC '{}': {}",
                     pvc_name, e
-                )))
+                )));
             }
         }
 

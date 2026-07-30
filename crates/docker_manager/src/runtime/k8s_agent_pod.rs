@@ -20,8 +20,6 @@ use super::k8s_service::K8sServiceOps;
 use super::kubernetes_runtime::{KubernetesRuntime, RUNTIME_MANAGED_LABEL};
 
 impl KubernetesRuntime {
-
-
     pub(crate) async fn stop_container_by_identifier_inner(
         &self,
         identifier: &str,
@@ -40,24 +38,42 @@ impl KubernetesRuntime {
 
         // Step 0: 删除 ClusterIP Service（先摘流量 / 移除 DNS，再销毁 pod）
         if let Err(e) = self.delete_agent_service(identifier, service_type).await {
-            warn!("[K8S] Failed to delete ClusterIP Service for {}: {} (continuing)", identifier, e);
+            warn!(
+                "[K8S] Failed to delete ClusterIP Service for {}: {} (continuing)",
+                identifier, e
+            );
         }
 
         // Step 1: 删除 StatefulSet（Foreground cascade → pod 随之终止）。回收 = 彻底销毁 STS
         // （非 scale 0；scale 0 会留 STS 永不清理）。PVC 保留（数据复用，下次 ensure 重建挂回）。
-        if let Err(e) = self.delete_agent_statefulset(identifier, service_type).await {
-            warn!("[K8S] Failed to delete StatefulSet {}: {} (continuing)", pod_name, e);
+        if let Err(e) = self
+            .delete_agent_statefulset(identifier, service_type)
+            .await
+        {
+            warn!(
+                "[K8S] Failed to delete StatefulSet {}: {} (continuing)",
+                pod_name, e
+            );
         }
 
         // Step 2: 等 pod {sts}-0 完全终止（Foreground cascade 异步；等其 404 再继续，
         // 避免与立即重建的新 pod 抢 RWO PVC）。
         if let Err(e) = self.wait_for_pod_terminated(&agent_pod).await {
-            warn!("[K8S] wait_for_pod_terminated for {} failed: {} (continuing)", agent_pod, e);
+            warn!(
+                "[K8S] wait_for_pod_terminated for {} failed: {} (continuing)",
+                agent_pod, e
+            );
         }
 
         // Step 3: 删除 headless Service（与 STS/ClusterIP 一并彻底回收）
-        if let Err(e) = self.delete_agent_headless_service(identifier, service_type).await {
-            warn!("[K8S] Failed to delete headless Service for {}: {} (continuing)", identifier, e);
+        if let Err(e) = self
+            .delete_agent_headless_service(identifier, service_type)
+            .await
+        {
+            warn!(
+                "[K8S] Failed to delete headless Service for {}: {} (continuing)",
+                identifier, e
+            );
         }
 
         self.pod_cache.write().await.remove(identifier);
@@ -70,7 +86,6 @@ impl KubernetesRuntime {
 
         Ok(())
     }
-
 
     /// 原地重启 agent 容器：exec 进 agent 容器 `kill -TERM 1` → agent_runner SIGTERM handler
     /// 优雅退出 → kubelet `restartPolicy=Always` **原地重启容器**（卷不 unstage，避免 CephFS
@@ -94,13 +109,9 @@ impl KubernetesRuntime {
         let pod_name = self.agent_pod_name(identifier, service_type)?;
 
         // 1. 基线 restartCount（agent 容器；缺失视作 0）。pod 取失败 → Err（fail-fast）。
-        let pod = self
-            .pods()
-            .get(&pod_name)
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::K8sError(format!("get pod for restart baseline: {e}"))
-            })?;
+        let pod = self.pods().get(&pod_name).await.map_err(|e| {
+            ContainerRuntimeError::K8sError(format!("get pod for restart baseline: {e}"))
+        })?;
         let baseline = container_status(&pod, AGENT_CONTAINER)
             .map(|(rc, _)| rc)
             .unwrap_or(0);
@@ -167,7 +178,6 @@ impl KubernetesRuntime {
         }
     }
 
-
     pub(crate) async fn sync_states_inner(
         &self,
     ) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
@@ -216,7 +226,6 @@ impl KubernetesRuntime {
 
         Ok((checked_count, removed))
     }
-
 
     pub(crate) async fn cleanup_all_inner(&self) -> ContainerRuntimeResult<()> {
         let total_start = std::time::Instant::now();

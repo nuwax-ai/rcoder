@@ -137,7 +137,10 @@ mod tests {
         };
         let v = KubernetesRuntime::translate_k8s_volume(&spec).expect("emptyDir should translate");
         let ed = v.empty_dir.expect("empty_dir set");
-        assert!(ed.size_limit.is_none(), "default emptyDir has no size_limit");
+        assert!(
+            ed.size_limit.is_none(),
+            "default emptyDir has no size_limit"
+        );
     }
 
     #[test]

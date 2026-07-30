@@ -15,7 +15,6 @@ use std::collections::BTreeMap;
 
 pub(crate) const PORT_EXPOSE_ANNOTATION: &str = "rcoder.io/port-expose";
 
-
 /// ports → annotation（`rcoder.io/port-expose: "80:http,5432:tcp"`）；无端口返 None。
 #[cfg(feature = "kubernetes")]
 pub(crate) fn encode_port_expose_annotations(
@@ -191,7 +190,10 @@ pub(crate) fn build_decoupled_resources(
 pub(crate) fn build_app_resource_requirements(
     req: &AppResourceRequirements,
 ) -> Option<ResourceRequirements> {
-    let ephemeral = req.ephemeral_storage.clone().or_else(|| req.storage.clone());
+    let ephemeral = req
+        .ephemeral_storage
+        .clone()
+        .or_else(|| req.storage.clone());
     build_decoupled_resources(req.cpu.clone(), req.memory.clone(), ephemeral)
 }
 
@@ -241,12 +243,9 @@ mod tests {
 
     #[test]
     fn decoupled_resources_all_three_decoupled_values() {
-        let rr = build_decoupled_resources(
-            Some("1".into()),
-            Some("512Mi".into()),
-            Some("1Gi".into()),
-        )
-        .unwrap();
+        let rr =
+            build_decoupled_resources(Some("1".into()), Some("512Mi".into()), Some("1Gi".into()))
+                .unwrap();
         let limits = rr.limits.unwrap();
         let requests = rr.requests.unwrap();
         assert_eq!(limits["cpu"].0.clone(), "1");
@@ -266,10 +265,7 @@ mod tests {
             ..Default::default()
         };
         let rr = build_app_resource_requirements(&req).unwrap();
-        assert_eq!(
-            rr.limits.unwrap()["ephemeral-storage"].0.clone(),
-            "5Gi"
-        );
+        assert_eq!(rr.limits.unwrap()["ephemeral-storage"].0.clone(), "5Gi");
     }
 
     #[test]
@@ -280,10 +276,7 @@ mod tests {
             ..Default::default()
         };
         let rr = build_app_resource_requirements(&req).unwrap();
-        assert_eq!(
-            rr.limits.unwrap()["ephemeral-storage"].0.clone(),
-            "1Gi"
-        );
+        assert_eq!(rr.limits.unwrap()["ephemeral-storage"].0.clone(), "1Gi");
     }
 
     #[test]
@@ -420,10 +413,7 @@ mod tests {
         let probe = build_probe(&hc).unwrap();
         let hg = probe.http_get.expect("http_get 必须设置");
         assert_eq!(hg.path, Some("/".to_string()));
-        assert!(
-            matches!(hg.port, IntOrString::Int(80)),
-            "port 缺省应为 80"
-        );
+        assert!(matches!(hg.port, IntOrString::Int(80)), "port 缺省应为 80");
     }
 
     #[test]

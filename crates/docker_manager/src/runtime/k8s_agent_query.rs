@@ -20,8 +20,6 @@ use super::k8s_service::K8sServiceOps;
 use super::kubernetes_runtime::{KubernetesRuntime, RUNTIME_MANAGED_LABEL};
 
 impl KubernetesRuntime {
-
-
     pub(crate) async fn get_container_info_inner(
         &self,
         identifier: &str,
@@ -98,7 +96,6 @@ impl KubernetesRuntime {
         Ok(None)
     }
 
-
     pub(crate) async fn get_container_info_by_identifier_inner(
         &self,
         identifier: &str,
@@ -120,7 +117,6 @@ impl KubernetesRuntime {
         }
         Ok(info)
     }
-
 
     pub(crate) async fn find_container_inner(
         &self,
@@ -186,7 +182,6 @@ impl KubernetesRuntime {
 
         Ok(None)
     }
-
 
     pub(crate) async fn list_containers_inner(
         &self,

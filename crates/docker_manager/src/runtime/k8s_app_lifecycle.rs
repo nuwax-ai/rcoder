@@ -5,26 +5,21 @@
 
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
-    ContainerCreateParams, ContainerRuntimeError,
-    ContainerRuntimeResult, ExposeType,
+    ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ExposeType,
 };
 #[cfg(feature = "kubernetes")]
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-#[cfg(feature = "kubernetes")]
 use k8s_openapi::Metadata;
+#[cfg(feature = "kubernetes")]
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 #[cfg(feature = "kubernetes")]
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 #[cfg(feature = "kubernetes")]
 use tracing::{info, warn};
 
-
-use super::kubernetes_runtime::KubernetesRuntime;
 use super::k8s_deployment::{APP_LABEL_PREFIX, APP_MANAGED_BY, RCODER_LABEL_PREFIX};
-
+use super::kubernetes_runtime::KubernetesRuntime;
 
 impl KubernetesRuntime {
-
-
     /// scale Deployment replicas
     pub async fn scale_app(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
         let name = self.app_deployment_name(app_id);
@@ -36,7 +31,6 @@ impl KubernetesRuntime {
         info!("[K8S-APP] Deployment {name} scaled to {replicas}");
         Ok(())
     }
-
 
     /// 触发滚动重启（rollout annotation）
     pub async fn restart_app(&self, app_id: &str) -> ContainerRuntimeResult<()> {
@@ -54,7 +48,6 @@ impl KubernetesRuntime {
         info!("[K8S-APP] Deployment {name} restarted");
         Ok(())
     }
-
 
     /// 删除 UserApp 的全部 K8s 计算资源（Deployment/Service/NodePort/HTTPRoute/ConfigMap/Secret）。
     /// **不删 per-app PVC**（数据安全：默认保留，可恢复；销毁走独立 `storage/destroy` 接口
@@ -110,7 +103,6 @@ impl KubernetesRuntime {
         info!("[K8S-APP] K8s resources deleted for app: {app_id}");
         Ok(())
     }
-
 
     /// label 扫描兜底（operator-rs delete_orphaned_resources 思路）：
     /// list 所有带 `instance={app_id}, managed-by=rcoder-app-manager` 的计算资源并删除残留。
@@ -184,7 +176,6 @@ impl KubernetesRuntime {
         }
     }
 
-
     /// 清理 update 后不再需要的端口/配置资源（orphan）。
     ///
     /// SSA re-apply 只创建当前 desired 的资源；若 HTTP/TCP 端口被移除、或 env/secrets 被清空，
@@ -238,7 +229,6 @@ impl KubernetesRuntime {
         Ok(())
     }
 
-
     /// 等 app Pod 容器全部退出（按 rcoder.io/app-id label 轮询 Pod phase），best-effort：
     /// 容器退出（phase != Running）或 Pod 消失即返回；超时/API 错误仅 warn 不阻塞删除
     /// （app 复用共享 PVC 子目录，残留写入影响可控）。
@@ -277,7 +267,6 @@ impl KubernetesRuntime {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     }
-
 
     /// 仅容忍 404（视为已删除/幂等），其余 K8s 错误透传
     async fn ignore_404<T>(&self, r: Result<T, kube::Error>) -> ContainerRuntimeResult<()> {

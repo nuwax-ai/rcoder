@@ -24,7 +24,6 @@ use super::k8s_service::K8sServiceOps;
 use super::kubernetes_runtime::KubernetesRuntime;
 
 impl KubernetesRuntime {
-
     /// 创建 agent-runner 容器（走 StatefulSet，K8s 原生 pod 级自愈）。
     ///
     /// 编排顺序：identifier 解析 → per-agent PVC ensure（副作用）→ cache-hit 早返回 →
@@ -98,7 +97,6 @@ impl KubernetesRuntime {
             })
     }
 
-
     /// 纯构造 agent-runner 的 PodSpec（image 选择、PVC 名、volumes/mounts 翻译、env 合并、
     /// command、probe、resources、sidecar）。
     ///
@@ -140,8 +138,9 @@ impl KubernetesRuntime {
                     ),
                 ),
                 ServiceType::ComputerAgentRunner => (
-                    std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME")
-                        .unwrap_or_else(|_| format!("{}-rcoder-computer-workspace", self.namespace)),
+                    std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME").unwrap_or_else(|_| {
+                        format!("{}-rcoder-computer-workspace", self.namespace)
+                    }),
                     Some(user_id_val.clone()),
                 ),
                 _ => (self.workspace_pvc_name(identifier, service_type)?, None),

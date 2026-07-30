@@ -449,7 +449,8 @@ impl AgentContainerRuntime for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        self.get_container_info_by_identifier_inner(identifier, service_type).await
+        self.get_container_info_by_identifier_inner(identifier, service_type)
+            .await
     }
 
     async fn find_container(
@@ -501,7 +502,8 @@ impl AgentContainerRuntime for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
-        self.stop_container_by_identifier_inner(identifier, service_type).await
+        self.stop_container_by_identifier_inner(identifier, service_type)
+            .await
     }
 
     async fn is_container_running(&self, project_id: &str) -> ContainerRuntimeResult<bool> {
@@ -570,7 +572,9 @@ impl WorkspaceRuntime for KubernetesRuntime {
         // file-server 经此聚合路径访问 agent 数据 (tree/git/skills), 不启动 agent pod。
         let cephfs_root =
             std::env::var("RCODER_CEPHFS_ROOT").unwrap_or_else(|_| "/app/cephfs-root".to_string());
-        let subvolume_path = self.resolve_subvolume_path(identifier, service_type).await?;
+        let subvolume_path = self
+            .resolve_subvolume_path(identifier, service_type)
+            .await?;
         // subvolumePath 以 / 开头 (fs 绝对路径); trim 防御性处理确保单斜杠拼接
         let sub = subvolume_path.trim_start_matches('/');
         Ok(Some(format!("{cephfs_root}/{sub}")))

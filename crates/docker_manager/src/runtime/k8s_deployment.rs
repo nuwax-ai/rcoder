@@ -15,9 +15,7 @@ use container_runtime_api::ContainerRuntimeResult;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::apps::v1::Deployment;
 #[cfg(feature = "kubernetes")]
-use k8s_openapi::api::core::v1::{
-    ConfigMap, Service,
-};
+use k8s_openapi::api::core::v1::{ConfigMap, Service};
 #[cfg(feature = "kubernetes")]
 use kube::api::{Api, PatchParams};
 #[cfg(feature = "kubernetes")]
@@ -44,7 +42,6 @@ pub(crate) const APP_CONTAINER_NAME: &str = "app";
 /// trait 的 Deployment 方法转调，rcoder 通过 trait 调用）。
 #[cfg(feature = "kubernetes")]
 impl KubernetesRuntime {
-
     /// app_id → Deployment 名（其余 app 资源名基于此）
     ///
     /// 前缀取自 `ServiceType::UserApp::container_prefix()`（单一来源），与 Docker 侧
@@ -53,39 +50,32 @@ impl KubernetesRuntime {
         format!("{}-{app_id}", ServiceType::UserApp.container_prefix())
     }
 
-
     pub(crate) fn app_config_name(&self, app_id: &str) -> String {
         format!("{}-config", self.app_deployment_name(app_id))
     }
 
-
     pub(crate) fn app_secret_name(&self, app_id: &str) -> String {
         format!("{}-secret", self.app_deployment_name(app_id))
     }
-
 
     /// app ClusterIP Service 名（供 HTTPRoute backendRef / 集群内访问）
     pub fn app_service_name(&self, app_id: &str) -> String {
         format!("{}-svc", self.app_deployment_name(app_id))
     }
 
-
     pub(crate) fn app_http_route_name(&self, app_id: &str) -> String {
         format!("{}-route", self.app_deployment_name(app_id))
     }
 
-
     pub(crate) fn app_nodeport_name(&self, app_id: &str) -> String {
         format!("{}-nodeport", self.app_deployment_name(app_id))
     }
-
 
     /// app workspace PVC 名（阶段2 per-app PVC, 复用 K8sPvcOps::workspace_pvc_name 单一事实源,
     /// 与 agent 路径 create_container + resolve_subvolume_path 同名, 根除漂移）
     pub(crate) fn app_workspace_pvc_name(&self, app_id: &str) -> ContainerRuntimeResult<String> {
         self.workspace_pvc_name(app_id, &ServiceType::UserApp)
     }
-
 
     /// 构建 app 专用 label（与 agent 物理隔离）。
     ///
@@ -123,7 +113,6 @@ impl KubernetesRuntime {
         labels
     }
 
-
     /// Server-Side Apply 参数：`field_manager=rcoder-app-manager` 标识字段 owner，
     /// `force=true` 允许从其他 manager 接管字段（controller 应总是 force，见 operator-rs）。
     /// 让 create-or-update 自然合一：不存在则创建，存在则按字段级三方合并收敛。
@@ -135,26 +124,21 @@ impl KubernetesRuntime {
         }
     }
 
-
     pub(crate) fn pods_api(&self) -> Api<k8s_openapi::api::core::v1::Pod> {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
-
 
     pub(crate) fn deployments_api(&self) -> Api<Deployment> {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
-
     pub(crate) fn services_api(&self) -> Api<Service> {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
-
     pub(crate) fn configmaps_api(&self) -> Api<ConfigMap> {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
-
 
     pub(crate) fn secrets_api(&self) -> Api<k8s_openapi::api::core::v1::Secret> {
         Api::namespaced(self.client.clone(), &self.namespace)

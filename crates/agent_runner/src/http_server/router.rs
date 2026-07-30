@@ -16,8 +16,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::api_key_manager::ApiKeyManager;
 use crate::config::AppConfig;
-use crate::handler::ready_check;
 use crate::handler::__path_ready_check;
+use crate::handler::ready_check;
 use crate::service::AgentSessionService;
 use crate::service::local_agent_service::LocalAgentHttpService;
 
@@ -184,7 +184,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     // 通用路由
     let api_routes = Router::new()
-        .route("/health", get(health_check))            // liveness: 纯进程活, 恒 200
+        .route("/health", get(health_check)) // liveness: 纯进程活, 恒 200
         .route("/ready", get(ready_check)) // readiness: gRPC 就绪才 200, 否则 503
         .with_state(state.clone());
 
