@@ -221,7 +221,7 @@ impl BuildTask {
         }
     }
 
-    async fn is_terminal(&self) -> bool {
+    pub async fn is_terminal(&self) -> bool {
         matches!(
             self.inner.lock().await.status,
             BuildTaskStatus::Completed | BuildTaskStatus::Failed | BuildTaskStatus::Cancelled

@@ -22,6 +22,7 @@ pub use manifest::{
 };
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::{AppError, AppResult};
 use crate::service::build_generic::build_generic;
@@ -30,6 +31,8 @@ use crate::workspace::{ProjectContext, WorkspaceResolver};
 
 use assemble::assemble_workspace_package;
 use manifest::{ReleaseMetadata, build_release_lock, read_workspace_manifest};
+
+use tasks::{BuildProgressEvent, BuildTask, BuildTaskId, BuildTaskKind, BuildTaskStore};
 
 /// 整体包产物文件名（放在 workspace 根，供 `GET /api/userapp/static` 下载）。
 pub const WORKSPACE_PACKAGE_PREFIX: &str = "workspace-package-";
@@ -65,6 +68,7 @@ pub async fn build_workspace_package(
     tenant_id: Option<&str>,
     space_id: Option<&str>,
     timeout_secs: u64,
+    progress: Option<&BuildTask>,
 ) -> AppResult<WorkspaceBuildArtifact> {
     // 1. workspace 根（app_id 复用 project_id）
     let ws = resolver
@@ -102,6 +106,17 @@ pub async fn build_workspace_package(
         .collect();
     let mut built: Vec<BuiltProject> = Vec::with_capacity(enabled.len());
     for proj in enabled {
+        // 软取消：服务间检查（硬 cancel 靠外部 kill 进程组，见 cancel handler）
+        if let Some(p) = progress {
+            if p.is_cancelled() {
+                p.emit(BuildProgressEvent::Cancelled).await;
+                return Err(AppError::business("build cancelled by user"));
+            }
+            p.emit(BuildProgressEvent::Building {
+                service: proj.name().to_string(),
+            })
+            .await;
+        }
         let log_dir = ws.join("logs").join(&proj.dir);
         // path 安全校验 + 拼接（防 `../` 穿越 workspace）
         let proj_dir = crate::path_safety::ensure_within(&ws, &proj.dir).map_err(|_| {
@@ -112,13 +127,16 @@ pub async fn build_workspace_package(
             ))
         })?;
         if !proj_dir.is_dir() {
-            return Err(AppError::resource(format!(
-                "project dir not found: {} (path={})",
-                proj.name(),
-                proj.dir
-            )));
+            let msg = format!("project dir not found: {} (path={})", proj.name(), proj.dir);
+            if let Some(p) = progress {
+                p.emit(BuildProgressEvent::Failed {
+                    error: msg.clone(),
+                })
+                .await;
+            }
+            return Err(AppError::resource(msg));
         }
-        let artifact = build_generic(
+        let artifact = match build_generic(
             build_manager,
             app_id,
             &proj.manifest.build.command,
@@ -127,7 +145,31 @@ pub async fn build_workspace_package(
             &log_dir,
             timeout_secs,
         )
-        .await?;
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                let svc = proj.name().to_string();
+                if let Some(p) = progress {
+                    p.emit(BuildProgressEvent::BuildFail {
+                        service: svc.clone(),
+                        error: e.to_string(),
+                    })
+                    .await;
+                    p.emit(BuildProgressEvent::Failed {
+                        error: format!("build {svc} failed: {e}"),
+                    })
+                    .await;
+                }
+                return Err(e);
+            }
+        };
+        if let Some(p) = progress {
+            p.emit(BuildProgressEvent::BuildOk {
+                service: proj.name().to_string(),
+            })
+            .await;
+        }
         built.push(BuiltProject {
             path: proj.dir.clone(),
             artifact,
@@ -153,6 +195,12 @@ pub async fn build_workspace_package(
     let file_name = format!("{WORKSPACE_PACKAGE_PREFIX}{release_id}.zip");
     let path = assemble_workspace_package(&ws, &built, &lock, &file_name).await?;
     let (sha256, size_bytes) = hash_file(&path).await?;
+    if let Some(p) = progress {
+        p.emit(BuildProgressEvent::Completed {
+            release_id: release_id.clone(),
+        })
+        .await;
+    }
     Ok(WorkspaceBuildArtifact {
         release_id,
         path,
@@ -160,6 +208,45 @@ pub async fn build_workspace_package(
         sha256,
         size_bytes,
     })
+}
+
+/// 异步发起 build 任务（不阻塞，立即返 taskId）。进度事件经 task 流出（SSE/轮询）。
+///
+/// 同 app_id 排队由 `BuildManager` per-project 互斥保证（`try_start` 在 build_generic 内）。
+/// 非循环路径的 Err（如 release lock env 缺失）由这里兜底 emit Failed。
+pub async fn start_build_task(
+    store: &BuildTaskStore,
+    resolver: Arc<dyn WorkspaceResolver>,
+    build_manager: Arc<BuildManager>,
+    app_id: String,
+    timeout_secs: u64,
+) -> BuildTaskId {
+    let task = store.create(app_id.clone(), BuildTaskKind::Build).await;
+    let task_spawn = task.clone();
+    tokio::spawn(async move {
+        let result = build_workspace_package(
+            resolver.as_ref(),
+            build_manager.as_ref(),
+            &app_id,
+            None,
+            None,
+            timeout_secs,
+            Some(&task_spawn),
+        )
+        .await;
+        // build_workspace_package 内部已 emit Completed/Failed/Cancelled；
+        // 兜底：非终态的 Err（循环外失败，如 release lock env 缺）补 Failed。
+        if let Err(e) = result
+            && !task_spawn.is_terminal().await
+        {
+            task_spawn
+                .emit(BuildProgressEvent::Failed {
+                    error: e.to_string(),
+                })
+                .await;
+        }
+    });
+    task.id.clone()
 }
 
 fn required_release_metadata(name: &str) -> AppResult<String> {

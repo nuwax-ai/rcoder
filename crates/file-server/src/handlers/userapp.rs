@@ -70,6 +70,7 @@ pub(crate) async fn build_workspace(
         body.tenant_id.as_deref(),
         body.space_id.as_deref(),
         state.config.dev_command_timeout_secs,
+        None,
     )
     .await?;
 
