@@ -8,12 +8,13 @@
 //! cancel 通过 `cancel()` 置位 + 外部 kill 进程组(`kill_process_group`)。
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use chrono::Utc;
 use serde::Serialize;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 /// 历史事件 ring 容量(断线重连 seq replay)。
@@ -64,35 +65,19 @@ pub struct BuildTaskSnapshot {
 #[serde(rename_all = "camelCase", tag = "event")]
 pub enum BuildProgressEvent {
     /// 进入新阶段(publish: GitCommit/Prepare/Activate/CreateApp/WaitReady/Confirm)
-    Stage {
-        stage: String,
-    },
+    Stage { stage: String },
     /// 开始编译某服务
-    Building {
-        service: String,
-    },
+    Building { service: String },
     /// 某服务编译成功
-    BuildOk {
-        service: String,
-    },
+    BuildOk { service: String },
     /// 某服务编译失败
-    BuildFail {
-        service: String,
-        error: String,
-    },
+    BuildFail { service: String, error: String },
     /// 一行日志(实时 tail,可选)
-    Log {
-        service: String,
-        line: String,
-    },
+    Log { service: String, line: String },
     /// 任务完成(build:产出 release_id;publish:发布 Active)
-    Completed {
-        release_id: String,
-    },
+    Completed { release_id: String },
     /// 任务失败
-    Failed {
-        error: String,
-    },
+    Failed { error: String },
     /// 任务被取消
     Cancelled,
 }
@@ -105,6 +90,8 @@ struct TaskInner {
     current_service: Option<String>,
     release_id: Option<String>,
     error: Option<String>,
+    /// workspace 根 (build/publish 工作区): logs/SSE 查询路径解析用。预 resolve 后存入。
+    workspace_root: Option<PathBuf>,
     created_at: i64,
     updated_at: i64,
 }
@@ -117,7 +104,9 @@ pub struct BuildTask {
     history: Mutex<VecDeque<(u64, BuildProgressEvent)>>,
     seq: AtomicU64,
     cancelled: AtomicBool,
-    pid: Mutex<Option<u32>>,
+    /// 当前 build 子进程 pid (cancel 时 kill_process_group 用)。
+    /// AtomicU32 (0 = 未设置) 而非 Mutex: build_generic 的 on_pid 回调是同步的, 需同步写。
+    pid: AtomicU32,
 }
 
 impl BuildTask {
@@ -134,6 +123,7 @@ impl BuildTask {
                 current_service: None,
                 release_id: None,
                 error: None,
+                workspace_root: None,
                 created_at: now,
                 updated_at: now,
             }),
@@ -141,7 +131,7 @@ impl BuildTask {
             history: Mutex::new(VecDeque::with_capacity(RING_CAP)),
             seq: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
-            pid: Mutex::new(None),
+            pid: AtomicU32::new(0),
         })
     }
 
@@ -166,6 +156,16 @@ impl BuildTask {
     /// 当前状态(轻量,无完整快照)。
     pub async fn status(&self) -> BuildTaskStatus {
         self.inner.lock().await.status
+    }
+
+    /// 记录 workspace 根 (start_build_task 预 resolve 后存入),供 logs/SSE 解析日志目录。
+    pub async fn set_workspace_root(&self, root: PathBuf) {
+        self.inner.lock().await.workspace_root = Some(root);
+    }
+
+    /// workspace 根; 任务 resolve 前为 None (logs handler 据此判断日志目录是否就绪)。
+    pub async fn workspace_root(&self) -> Option<PathBuf> {
+        self.inner.lock().await.workspace_root.clone()
     }
 
     /// 发进度事件:apply 状态副作用 → seq++ → ring → broadcast。
@@ -248,13 +248,17 @@ impl BuildTask {
         (replay, self.tx.subscribe())
     }
 
-    pub async fn set_pid(&self, pid: u32) {
-        *self.pid.lock().await = Some(pid);
+    /// 记录当前 build 子进程 pid (build_generic spawn 后经 on_pid 回调同步写入)。
+    pub fn set_pid(&self, pid: u32) {
+        self.pid.store(pid, Ordering::Relaxed);
     }
 
-    /// 当前 build child 进程 pid(cancel 时 kill_process_group 用)。
-    pub async fn pid(&self) -> Option<u32> {
-        *self.pid.lock().await
+    /// 当前 build child 进程 pid (cancel 时 kill_process_group 用); 0 = 未设置。
+    pub fn pid(&self) -> Option<u32> {
+        match self.pid.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -273,6 +277,12 @@ pub struct BuildTaskStore {
     map: Mutex<HashMap<BuildTaskId, Arc<BuildTask>>>,
 }
 
+impl Default for BuildTaskStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BuildTaskStore {
     pub fn new() -> Self {
         Self {
@@ -282,10 +292,7 @@ impl BuildTaskStore {
 
     pub async fn create(&self, app_id: String, kind: BuildTaskKind) -> Arc<BuildTask> {
         let task = BuildTask::new(app_id, kind);
-        self.map
-            .lock()
-            .await
-            .insert(task.id.clone(), task.clone());
+        self.map.lock().await.insert(task.id.clone(), task.clone());
         task
     }
 

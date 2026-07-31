@@ -60,10 +60,21 @@ impl ProfilerConfig {
 
 /// Profiler Guard
 ///
-/// 当 dropped 时自动停止 profiler
+/// 当 dropped 时自动停止 profiler，确保后台线程和网络连接被释放
 pub struct ProfilerGuard {
     _agent:
         Option<pyroscope::pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
+}
+
+impl Drop for ProfilerGuard {
+    fn drop(&mut self) {
+        if let Some(agent) = self._agent.take() {
+            match agent.stop() {
+                Ok(_) => debug!("[Profiler] Pyroscope agent stopped successfully."),
+                Err(e) => warn!("[Profiler] Failed to stop Pyroscope agent: {}", e),
+            }
+        }
+    }
 }
 
 /// 初始化并启动 Pyroscope Profiler

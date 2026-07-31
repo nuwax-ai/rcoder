@@ -481,10 +481,7 @@ impl Config {
             skill_download_max_redirects: env_parse("SKILL_DOWNLOAD_MAX_REDIRECTS", 3)?,
             skill_url_max_count: env_parse("SKILL_URL_MAX_COUNT", 20)?,
             skill_url_allow_http: env_bool("SKILL_URL_ALLOW_HTTP", true)?,
-            skill_url_allow_private_networks: env_bool(
-                "SKILL_URL_ALLOW_PRIVATE_NETWORKS",
-                true,
-            )?,
+            skill_url_allow_private_networks: env_bool("SKILL_URL_ALLOW_PRIVATE_NETWORKS", true)?,
             skill_url_allowed_hosts: env_list("SKILL_URL_ALLOWED_HOSTS", "")?,
             download_max_file_size_bytes: env_parse("DOWNLOAD_MAX_FILE_SIZE_BYTES", 104_857_600)?,
             request_body_max_bytes: request_body_max_bytes(MAX_UPLOAD_FILE_SIZE_BYTES)?,

@@ -9,6 +9,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+use tracing::error;
+
 /// Maximum extracted size (1GB)
 const MAX_EXTRACTED_SIZE: u64 = 1024 * 1024 * 1024;
 
@@ -273,11 +275,11 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> Result<bool, ArchiveError> {
             let src = agent_dir.join(name);
             let dst = tmp_rename.join(name);
             if let Err(re) = std::fs::rename(&src, &dst) {
-                eprintln!("Rollback failed to move back {}: {}", src.display(), re);
+                error!("Rollback failed to move back {}: {}", src.display(), re);
             }
         }
         if let Err(re) = std::fs::rename(&tmp_rename, &wrapper) {
-            eprintln!(
+            error!(
                 "Rollback failed to restore wrapper dir {}: {}",
                 wrapper.display(),
                 re
@@ -398,12 +400,24 @@ fn sanitize_entry_path(path: &Path) -> Result<PathBuf, ArchiveError> {
 }
 
 fn ensure_within(dest_path: &Path, base: &Path) -> Result<(), ArchiveError> {
-    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    // Fail-closed: canonicalize 失败时拒绝而非回退到未验证路径。
+    // 防御符号链接攻击: canonicalize 解析符号链接后验证真实路径。
+    let base_canon = base.canonicalize().map_err(|e| {
+        ArchiveError::PathTraversal(format!(
+            "cannot canonicalize base dir {}: {}",
+            base.display(),
+            e
+        ))
+    })?;
 
     let parent = dest_path.parent().unwrap_or(dest_path);
-    let canon_parent = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
+    let canon_parent = parent.canonicalize().map_err(|e| {
+        ArchiveError::PathTraversal(format!(
+            "cannot canonicalize parent dir {}: {}",
+            parent.display(),
+            e
+        ))
+    })?;
 
     if !canon_parent.starts_with(&base_canon) {
         return Err(ArchiveError::PathTraversal(format!(

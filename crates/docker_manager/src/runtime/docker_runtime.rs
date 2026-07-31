@@ -130,19 +130,7 @@ impl AgentContainerRuntime for DockerRuntime {
             container_id: r.container_id,
             container_name: r.container_name,
             container_ip: r.container_ip,
-            status: match r.status {
-                crate::types::ContainerStatus::Running => ContainerRuntimeStatus::Running,
-                crate::types::ContainerStatus::Stopped => ContainerRuntimeStatus::Failed,
-                crate::types::ContainerStatus::Creating => ContainerRuntimeStatus::Pending,
-                crate::types::ContainerStatus::Restarting => ContainerRuntimeStatus::Pending,
-                crate::types::ContainerStatus::Paused => {
-                    ContainerRuntimeStatus::Unknown("paused".to_string())
-                }
-                crate::types::ContainerStatus::Dead => ContainerRuntimeStatus::Failed,
-                crate::types::ContainerStatus::Removing => ContainerRuntimeStatus::Failed,
-                crate::types::ContainerStatus::Exited => ContainerRuntimeStatus::Failed,
-                crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s),
-            },
+            status: map_container_status(&r.status),
             created_at: r.created_at,
             env_vars: None, // 不填充环境变量（用于快速查找）
         }))
@@ -463,7 +451,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         let name = app_deployment_name(&app_id);
         let client = self.inner.get_docker_client();
         // 旧容器 best-effort 强删（image/env/command 变了必须重建；不存在则忽略错误）
-        let _ = client
+        if let Err(e) = client
             .remove_container(
                 &name,
                 Some(RemoveContainerOptions {
@@ -471,7 +459,13 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                     ..Default::default()
                 }),
             )
-            .await;
+            .await
+        {
+            tracing::debug!(
+                "[DOCKER] Best-effort remove old container {} failed (may not exist): {}",
+                name, e
+            );
+        }
         // 用新 params 重建（复用 create_deployment 全套逻辑：mount/env/labels/ports/start）
         self.create_deployment(params).await
     }
@@ -504,7 +498,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         use bollard::query_parameters::{StartContainerOptions, StopContainerOptions};
         let name = app_deployment_name(app_id);
         let client = self.inner.get_docker_client();
-        let _ = client
+        // best-effort: 容器可能已停止，忽略 stop 失败
+        if let Err(e) = client
             .stop_container(
                 &name,
                 Some(StopContainerOptions {
@@ -512,7 +507,13 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                     signal: Some(String::new()),
                 }),
             )
-            .await;
+            .await
+        {
+            tracing::debug!(
+                "[DOCKER] Best-effort stop container {} before restart failed: {}",
+                name, e
+            );
+        }
         client
             .start_container(&name, None::<StartContainerOptions>)
             .await
@@ -524,7 +525,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         use bollard::query_parameters::RemoveContainerOptions;
         let name = app_deployment_name(app_id);
         let client = self.inner.get_docker_client();
-        let _ = client
+        // best-effort: 容器可能不存在，忽略删除失败
+        if let Err(e) = client
             .remove_container(
                 &name,
                 Some(RemoveContainerOptions {
@@ -532,7 +534,13 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                     ..Default::default()
                 }),
             )
-            .await;
+            .await
+        {
+            tracing::debug!(
+                "[DOCKER] Best-effort delete container {} failed (may not exist): {}",
+                name, e
+            );
+        }
         Ok(())
     }
 
@@ -902,19 +910,7 @@ impl DockerRuntime {
                 container_id: c.container_id,
                 container_name: c.container_name,
                 container_ip,
-                status: match c.status {
-                    crate::types::ContainerStatus::Running => ContainerRuntimeStatus::Running,
-                    crate::types::ContainerStatus::Stopped => ContainerRuntimeStatus::Failed,
-                    crate::types::ContainerStatus::Creating => ContainerRuntimeStatus::Pending,
-                    crate::types::ContainerStatus::Restarting => ContainerRuntimeStatus::Pending,
-                    crate::types::ContainerStatus::Paused => {
-                        ContainerRuntimeStatus::Unknown("paused".to_string())
-                    }
-                    crate::types::ContainerStatus::Dead => ContainerRuntimeStatus::Failed,
-                    crate::types::ContainerStatus::Removing => ContainerRuntimeStatus::Failed,
-                    crate::types::ContainerStatus::Exited => ContainerRuntimeStatus::Failed,
-                    crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s),
-                },
+                status: map_container_status(&c.status),
                 created_at: c.created_at,
                 env_vars: Some(env_vars),
             });
@@ -928,6 +924,23 @@ impl DockerRuntime {
 /// 前缀取自 `ServiceType::UserApp::container_prefix()`，避免散落硬编码；改前缀只需改一处。
 fn app_deployment_name(app_id: &str) -> String {
     format!("{}-{app_id}", ServiceType::UserApp.container_prefix())
+}
+
+/// 将内部 `ContainerStatus` 映射为运行时 `ContainerRuntimeStatus`
+fn map_container_status(status: &crate::types::ContainerStatus) -> ContainerRuntimeStatus {
+    match status {
+        crate::types::ContainerStatus::Running => ContainerRuntimeStatus::Running,
+        crate::types::ContainerStatus::Stopped => ContainerRuntimeStatus::Failed,
+        crate::types::ContainerStatus::Creating => ContainerRuntimeStatus::Pending,
+        crate::types::ContainerStatus::Restarting => ContainerRuntimeStatus::Pending,
+        crate::types::ContainerStatus::Paused => {
+            ContainerRuntimeStatus::Unknown("paused".to_string())
+        }
+        crate::types::ContainerStatus::Dead => ContainerRuntimeStatus::Failed,
+        crate::types::ContainerStatus::Removing => ContainerRuntimeStatus::Failed,
+        crate::types::ContainerStatus::Exited => ContainerRuntimeStatus::Failed,
+        crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s.clone()),
+    }
 }
 
 /// 从容器 inspect 结果提取 IP：优先取 `preferred_network` 网卡，回退任意网卡。

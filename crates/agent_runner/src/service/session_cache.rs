@@ -194,7 +194,11 @@ impl SessionData {
         if let Some(handle) = guard.as_ref() {
             if handle.is_finished() {
                 // take() 消耗 handle 来 await 获取结果
-                let handle = guard.take().unwrap();
+                // 安全：持有 Mutex 锁期间 as_ref() 与 take() 之间无竞争
+                let handle = match guard.take() {
+                    Some(h) => h,
+                    None => return false, // 锁内另一分支已消费
+                };
                 match handle.await {
                     Err(e) if e.is_panic() => {
                         warn!("[SessionData] SessionWorker panicked: {:?}", e);

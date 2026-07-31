@@ -410,15 +410,24 @@ fn sanitize_entry_path(path: &Path) -> AgentMgmtResult<PathBuf> {
 }
 
 fn ensure_within(dest_path: &Path, base: &Path) -> AgentMgmtResult<()> {
-    // 在 macOS / Linux 上 canonicalize 会解析符号链接,且需要文件存在。
-    // 这里 dest_path 的父目录可能尚未创建(dest_dir 一定存在),
-    // 所以我们用 cleaned() 进行路径规范化,然后对 dest_path 的父目录做 canonicalize。
-    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    // Fail-closed: canonicalize 失败时拒绝而非回退到未验证路径。
+    // 防御符号链接攻击: canonicalize 解析符号链接后验证真实路径。
+    let base_canon = base.canonicalize().map_err(|e| {
+        AgentMgmtError::PathTraversal(format!(
+            "cannot canonicalize base dir {}: {}",
+            base.display(),
+            e
+        ))
+    })?;
 
     let parent = dest_path.parent().unwrap_or(dest_path);
-    let canon_parent = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
+    let canon_parent = parent.canonicalize().map_err(|e| {
+        AgentMgmtError::PathTraversal(format!(
+            "cannot canonicalize parent dir {}: {}",
+            parent.display(),
+            e
+        ))
+    })?;
 
     if !canon_parent.starts_with(&base_canon) {
         return Err(AgentMgmtError::PathTraversal(format!(

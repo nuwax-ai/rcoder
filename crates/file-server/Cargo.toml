@@ -103,3 +103,6 @@ shlex = { workspace = true }
 
 # 安全临时文件/目录（Hook 配置原子替换与 staging 生命周期由 RAII 管理）
 tempfile = { workspace = true }
+
+# 异步流构造 (UserApp build 进度 SSE: async_stream::stream!)
+async-stream = { workspace = true }

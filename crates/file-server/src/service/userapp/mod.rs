@@ -13,6 +13,7 @@
 mod assemble;
 pub mod import;
 mod manifest;
+pub mod publish;
 pub mod tasks;
 
 // 重导出 manifest 类型：保持 userapp 模块公开面。
@@ -25,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::{AppError, AppResult};
-use crate::service::build_generic::build_generic;
+use crate::service::build_generic::{GenericBuildRequest, build_generic};
 use crate::service::build_manager::BuildManager;
 use crate::workspace::{ProjectContext, WorkspaceResolver};
 
@@ -106,10 +107,10 @@ pub async fn build_workspace_package(
         .collect();
     let mut built: Vec<BuiltProject> = Vec::with_capacity(enabled.len());
     for proj in enabled {
-        // 软取消：服务间检查（硬 cancel 靠外部 kill 进程组，见 cancel handler）
+        // 软取消：服务间检查（硬 cancel 靠外部 kill 进程组，见 cancel handler）。
+        // 不在此 emit 终态（Cancelled 由 cancel handler / 顶层 task 统一 emit）。
         if let Some(p) = progress {
             if p.is_cancelled() {
-                p.emit(BuildProgressEvent::Cancelled).await;
                 return Err(AppError::business("build cancelled by user"));
             }
             p.emit(BuildProgressEvent::Building {
@@ -127,37 +128,40 @@ pub async fn build_workspace_package(
             ))
         })?;
         if !proj_dir.is_dir() {
-            let msg = format!("project dir not found: {} (path={})", proj.name(), proj.dir);
-            if let Some(p) = progress {
-                p.emit(BuildProgressEvent::Failed {
-                    error: msg.clone(),
-                })
-                .await;
-            }
-            return Err(AppError::resource(msg));
+            return Err(AppError::resource(format!(
+                "project dir not found: {} (path={})",
+                proj.name(),
+                proj.dir
+            )));
         }
+        // on_pid 回调: spawn build 子进程后回写 pid 到 task, 供 cancel kill 进程组。
+        let pid_cb = progress.map(|p| move |pid: u32| p.set_pid(pid));
+        let pid_ref: Option<&(dyn Fn(u32) + Send + Sync)> =
+            pid_cb.as_ref().map(|c| c as &(dyn Fn(u32) + Send + Sync));
         let artifact = match build_generic(
             build_manager,
             app_id,
-            &proj.manifest.build.command,
-            &proj_dir,
-            &proj.manifest.build.artifact,
-            &log_dir,
-            timeout_secs,
+            &GenericBuildRequest {
+                argv: &proj.manifest.build.command,
+                cwd: &proj_dir,
+                artifact_rel: &proj.manifest.build.artifact,
+                log_dir: &log_dir,
+                timeout_secs,
+                on_pid: pid_ref,
+            },
         )
         .await
         {
             Ok(a) => a,
             Err(e) => {
-                let svc = proj.name().to_string();
-                if let Some(p) = progress {
+                // cancel(kill 进程组)导致的失败不 emit（终态 Cancelled 由 cancel handler 置）；
+                // 否则 emit 服务级 BuildFail（任务级 Failed 由顶层 start_*_task 统一 emit）。
+                if let Some(p) = progress
+                    && !p.is_cancelled()
+                {
                     p.emit(BuildProgressEvent::BuildFail {
-                        service: svc.clone(),
+                        service: proj.name().to_string(),
                         error: e.to_string(),
-                    })
-                    .await;
-                    p.emit(BuildProgressEvent::Failed {
-                        error: format!("build {svc} failed: {e}"),
                     })
                     .await;
                 }
@@ -195,12 +199,6 @@ pub async fn build_workspace_package(
     let file_name = format!("{WORKSPACE_PACKAGE_PREFIX}{release_id}.zip");
     let path = assemble_workspace_package(&ws, &built, &lock, &file_name).await?;
     let (sha256, size_bytes) = hash_file(&path).await?;
-    if let Some(p) = progress {
-        p.emit(BuildProgressEvent::Completed {
-            release_id: release_id.clone(),
-        })
-        .await;
-    }
     Ok(WorkspaceBuildArtifact {
         release_id,
         path,
@@ -219,31 +217,62 @@ pub async fn start_build_task(
     resolver: Arc<dyn WorkspaceResolver>,
     build_manager: Arc<BuildManager>,
     app_id: String,
+    tenant_id: Option<String>,
+    space_id: Option<String>,
     timeout_secs: u64,
 ) -> BuildTaskId {
     let task = store.create(app_id.clone(), BuildTaskKind::Build).await;
+    // 预 resolve workspace 根并存入 task,供 logs/SSE handler 解析日志目录
+    // ({workspace}/logs/{service}/)。resolve 失败则 emit Failed 终态,不 spawn。
+    match resolver
+        .resolve_project(&ProjectContext {
+            project_id: app_id.clone(),
+            tenant_id: tenant_id.clone(),
+            space_id: space_id.clone(),
+            isolation_type: None,
+        })
+        .await
+    {
+        Ok(ws) => task.set_workspace_root(ws).await,
+        Err(e) => {
+            task.emit(BuildProgressEvent::Failed {
+                error: format!("resolve workspace: {e}"),
+            })
+            .await;
+            return task.id.clone();
+        }
+    }
     let task_spawn = task.clone();
     tokio::spawn(async move {
         let result = build_workspace_package(
             resolver.as_ref(),
             build_manager.as_ref(),
             &app_id,
-            None,
-            None,
+            tenant_id.as_deref(),
+            space_id.as_deref(),
             timeout_secs,
             Some(&task_spawn),
         )
         .await;
-        // build_workspace_package 内部已 emit Completed/Failed/Cancelled；
-        // 兜底：非终态的 Err（循环外失败，如 release lock env 缺）补 Failed。
-        if let Err(e) = result
-            && !task_spawn.is_terminal().await
-        {
-            task_spawn
-                .emit(BuildProgressEvent::Failed {
-                    error: e.to_string(),
-                })
-                .await;
+        // 终态统一由此 emit：build_workspace_package 只发非终态进度（Building/BuildOk/BuildFail）。
+        // Ok → Completed；Err 且非 cancel → Failed（cancel 的 Cancelled 已由 cancel handler emit）。
+        match result {
+            Ok(artifact) => {
+                task_spawn
+                    .emit(BuildProgressEvent::Completed {
+                        release_id: artifact.release_id.clone(),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                if !task_spawn.is_cancelled() && !task_spawn.is_terminal().await {
+                    task_spawn
+                        .emit(BuildProgressEvent::Failed {
+                            error: e.to_string(),
+                        })
+                        .await;
+                }
+            }
         }
     });
     task.id.clone()

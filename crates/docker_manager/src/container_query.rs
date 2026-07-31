@@ -1073,9 +1073,9 @@ impl DockerManager {
         // 创建过滤器
         let filter = crate::ContainerFilter::name_pattern(pattern);
 
-        // 过滤容器，排除当前容器自己
+        let total_count = containers.len();
+        // 过滤容器，排除当前容器自己（直接用 into_iter 消费，避免 clone）
         let matched_containers: Vec<bollard::models::ContainerSummary> = containers
-            .clone()
             .into_iter()
             .filter(|container| {
                 // 排除当前容器自己
@@ -1094,7 +1094,7 @@ impl DockerManager {
 
         info!(
             "Container lookup completed: total={}, matched={} (self excluded), pattern={}",
-            containers.len(),
+            total_count,
             matched_containers.len(),
             pattern
         );

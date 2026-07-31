@@ -208,7 +208,7 @@ impl DockerManager {
                 DockerError::BollardError(e)
             })?;
 
-        info!("containerdestroysucceeded: {}", container_id);
+        info!("container destroy succeeded: {}", container_id);
 
         // 从映射中移除所有匹配 container_id 的条目
         // 注意：同一容器可能存储在多个 key 下（如 project_id 和 pod_id），
@@ -228,7 +228,7 @@ impl DockerManager {
 
     /// 停止并删除容器
     pub async fn stop_container(&self, project_id: &str) -> DockerResult<()> {
-        info!("stoppedcontainer, projectID: {}", project_id);
+        info!("stopped container, project_id: {}", project_id);
 
         let container_info = if let Some(info) = self.containers.get(project_id).await {
             info
@@ -791,7 +791,7 @@ impl DockerManager {
                         .await
                     {
                         warn!(
-                            "gracefulstoppedfailed, forcestopped: {} - {}",
+                            "graceful stop failed, force stopped: {} - {}",
                             container_id, e
                         );
                         // 强制停止

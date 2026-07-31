@@ -172,6 +172,78 @@ jobs:
               -i "$AK" -k "$SK" -e "$ENDPOINT" --acl public-read -f
           done
 
+      # 生成 manifest（每平台 sha256 + size + url），作为消费者（Electron prepare 脚本等）
+      # 的单一事实源：按 plat-arch key 选资产 + 校验完整性 + 发现版本。
+      - name: Generate manifest (sha256 + per-target metadata)
+        env:
+          VER: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+          COMMIT: ${{ github.sha }}
+          BUCKET: ${{ env.OSS_BUCKET }}
+          ENDPOINT: ${{ env.OSS_ENDPOINT }}
+          PREFIX: ${{ env.OSS_PREFIX }}
+        run: |
+          set -euo pipefail
+          cd dist
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          BASE_URL="https://${BUCKET}.${ENDPOINT}/${PREFIX}/v${VER}"
+          VERPREFIX="file-server-${VER}-"
+          targets='{}'
+          for f in *.tar.gz *.zip; do
+            [ -e "$f" ] || continue
+            rest=${f#${VERPREFIX}}
+            triple=${rest%.tar.gz}
+            triple=${triple%.zip}
+            case "$triple" in
+              aarch64-apple-darwin)      key=darwin-arm64 ;;
+              x86_64-apple-darwin)       key=darwin-x64 ;;
+              x86_64-unknown-linux-gnu)  key=linux-x64 ;;
+              x86_64-unknown-linux-musl) key=linux-x64-musl ;;
+              aarch64-unknown-linux-gnu) key=linux-arm64 ;;
+              x86_64-pc-windows-msvc)    key=win32-x64 ;;
+              *) echo "WARN: skip unknown triple: $triple"; continue ;;
+            esac
+            sha=$(sha256sum "$f" | cut -d' ' -f1)
+            size=$(stat -c%s "$f")
+            targets=$(jq --arg k "$key" --arg t "$triple" --arg a "$f" \
+                           --arg s "$sha" --argjson sz "$size" --arg u "${BASE_URL}/${f}" \
+                           '. + {($k): {rustTarget:$t, archive:$a, sha256:$s, size:$sz, url:$u}}' <<<"$targets")
+          done
+          jq -n --arg name file-server --arg ver "$VER" --arg commit "$COMMIT" \
+                --arg date "$DATE" --argjson pre "$PRERELEASE" --argjson targets "$targets" \
+                '{name:$name, version:$ver, commit:$commit, publishedAt:$date, prerelease:$pre, targets:$targets}' \
+                > "manifest-${VER}.json"
+          echo "Generated manifest-${VER}.json:"
+          cat "manifest-${VER}.json"
+
+      - name: Upload manifest to Aliyun OSS
+        env:
+          AK: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          SK: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          BUCKET: ${{ env.OSS_BUCKET }}
+          ENDPOINT: ${{ env.OSS_ENDPOINT }}
+          PREFIX: ${{ env.OSS_PREFIX }}
+          VER: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          cd dist
+          ossutil cp "manifest-${VER}.json" "oss://${BUCKET}/${PREFIX}/manifest/${VER}.json" \
+            -i "$AK" -k "$SK" -e "$ENDPOINT" --acl public-read -f
+          if [ "$PRERELEASE" = "true" ]; then
+            ossutil cp "manifest-${VER}.json" "oss://${BUCKET}/${PREFIX}/manifest/beta.json" \
+              -i "$AK" -k "$SK" -e "$ENDPOINT" --acl public-read -f
+          else
+            ossutil cp "manifest-${VER}.json" "oss://${BUCKET}/${PREFIX}/manifest/latest.json" \
+              -i "$AK" -k "$SK" -e "$ENDPOINT" --acl public-read -f
+          fi
+
+      - name: Attach manifest as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest
+          path: dist/manifest-${{ needs.meta.outputs.version }}.json
+
   publish-npm:
     needs: [meta, upload-oss]
     runs-on: ubuntu-latest
@@ -218,3 +290,4 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/manifest-*.json

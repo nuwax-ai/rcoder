@@ -229,7 +229,7 @@ pub async fn computer_agent_stop(
                         let err_msg = response
                             .message
                             .unwrap_or_else(|| "Unknown error".to_string());
-                        error!("[COMPUTER_STOP] Agent stoppedfailed: {}", err_msg);
+                        error!("[COMPUTER_STOP] Agent stop failed: {}", err_msg);
                         return Ok(HttpResult::error_with_locale(
                             shared_types::error_codes::ERR_STOP_FAILED,
                             locale,

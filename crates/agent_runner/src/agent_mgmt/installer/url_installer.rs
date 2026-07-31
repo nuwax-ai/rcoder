@@ -85,6 +85,34 @@ pub async fn install_from_url(
             "URL must start with http:// or https://: {url}"
         )));
     }
+
+    // SSRF 防护：阻止访问内部/私有网络地址
+    if let Ok(parsed) = url.parse::<reqwest::Url>()
+        && let Some(host) = parsed.host_str()
+    {
+        // 阻止常见内部地址
+        let blocked = host == "localhost"
+            || host == "127.0.0.1"
+            || host.starts_with("169.254.")
+            || host.starts_with("10.")
+            || host.starts_with("192.168.")
+            || host.starts_with("172.16.")
+            || host.starts_with("172.17.")
+            || host.starts_with("172.18.")
+            || host.starts_with("172.19.")
+            || host.starts_with("172.2")
+            || host.starts_with("172.30.")
+            || host.starts_with("172.31.")
+            || host == "[::1]"
+            || host.starts_with("[fc")
+            || host.starts_with("[fd")
+            || host == "0.0.0.0";
+        if blocked {
+            return Err(AgentMgmtError::InvalidChunk(format!(
+                "SSRF protection: access to internal address '{host}' is blocked"
+            )));
+        }
+    }
     if command.is_empty() {
         return Err(AgentMgmtError::InvalidChunk("empty command".into()));
     }
@@ -218,14 +246,11 @@ async fn do_install_with_version_check(
     use crate::agent_mgmt::registry::normalize_platform_key;
 
     // 1. 版本检查：检查特定版本是否已安装（精确匹配）
-    if params
+    // 使用单次 lookup 避免 contains + get 之间的 TOCTOU 竞争
+    if let Some(manifest) = params
         .registry
-        .contains_version(params.agent_id, params.version)
+        .get_version(params.agent_id, params.version)
     {
-        let manifest = params
-            .registry
-            .get_version(params.agent_id, params.version)
-            .unwrap();
         let mut resp = make_skip_response(&manifest);
         resp.previous_version = params.version.to_string();
         return Ok(resp);

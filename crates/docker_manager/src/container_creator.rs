@@ -23,6 +23,8 @@ use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
 use super::manager::DockerManager;
+use shared_types::HTTP_DEFAULT_PORT;
+
 use super::{
     ContainerStatus, DockerContainerConfig, DockerContainerInfo, DockerError, DockerResult,
 };
@@ -191,7 +193,7 @@ impl<'a> ContainerCreator<'a> {
             assigned_port: 0,
             health_status: None,
             service_health: None,
-            internal_port: 8080,
+            internal_port: HTTP_DEFAULT_PORT,
             network_name: container_network_name.clone(),
         };
 

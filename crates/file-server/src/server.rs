@@ -13,8 +13,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::error::{AppError, REQUEST_ID, generate_request_id};
 use crate::{
-    AppState, BuildManager, Config, DevServerManager, LocalWorkspaceResolver, LogCacheManager,
-    SkillDownloader, WorkspaceResolver,
+    AppState, BuildManager, BuildTaskStore, Config, DevServerManager, LocalWorkspaceResolver,
+    LogCacheManager, SkillDownloader, WorkspaceResolver,
 };
 
 pub struct FileServerBuilder {
@@ -56,6 +56,7 @@ impl FileServerBuilder {
             build_manager: Arc::new(BuildManager::new(config.max_build_concurrency)),
             log_cache: Arc::new(LogCacheManager::new(&config)),
             skill_downloader,
+            build_tasks: Arc::new(BuildTaskStore::new()),
             config,
             started_at: std::time::Instant::now(),
         };

@@ -13,6 +13,8 @@ use anyhow::Result;
 use chrono::Utc;
 use dashmap::DashMap;
 use shared_types::{AgentMode, ModelProviderConfig, ToolApprovalRule};
+use tokio::select;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::model::{AgentStatus, ChatPromptResponse, ProjectAndAgentInfo};
@@ -189,10 +191,13 @@ impl AgentSessionService {
                     project_id, response_session_id
                 );
 
+                // 使用进程级 shutdown token，确保关闭时 watcher 任务能退出
+                let shutdown_token = CancellationToken::new();
                 spawn_lifecycle_watcher(
                     project_id.clone(),
                     response_session_id.clone(),
                     handles.lifecycle_handle.clone(),
+                    shutdown_token,
                 );
             }
         } else {
@@ -220,14 +225,23 @@ fn spawn_lifecycle_watcher(
     project_id: String,
     session_id: String,
     lifecycle_handle: Option<Arc<dyn shared_types::AgentLifecycle>>,
+    shutdown_token: CancellationToken,
 ) {
     tokio::spawn(async move {
+        // 等待 Agent 生命周期结束 **或** 进程 shutdown 信号
         if let Some(lifecycle) = lifecycle_handle {
             info!(
                 "🔄 [SACP] 新会话：等待 Agent 生命周期 - project_id={}, session_id={}",
                 project_id, session_id
             );
-            lifecycle.cancellation_token().cancelled().await;
+            select! {
+                _ = lifecycle.cancellation_token().cancelled() => {
+                    info!("[SACP] Agent lifecycle ended naturally: project_id={}, session_id={}", project_id, session_id);
+                }
+                _ = shutdown_token.cancelled() => {
+                    info!("[SACP] Shutdown signal received, cleaning up watcher: project_id={}, session_id={}", project_id, session_id);
+                }
+            }
         } else {
             warn!(
                 "⚠️ [SACP] 新会话缺少 lifecycle_handle - project_id={}",

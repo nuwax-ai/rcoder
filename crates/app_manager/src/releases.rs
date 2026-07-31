@@ -9,7 +9,7 @@ use download_utils::{DownloadConfig, DownloadError, Downloader, extract_zip};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::models::{
     AppOperationError, AppResult, PrepareReleaseRequest, ReleaseIndex, ReleaseInfo,
@@ -84,7 +84,13 @@ impl AppService {
         }
         .await;
         if let Err(error) = result {
-            let _ = tokio::fs::remove_file(&incoming).await;
+            if let Err(cleanup_err) = tokio::fs::remove_file(&incoming).await {
+                warn!(
+                    "[app_manager] Failed to cleanup incoming file {} after prepare failure: {}",
+                    incoming.display(),
+                    cleanup_err
+                );
+            }
             return Err(error);
         }
         let release = ReleaseInfo {
@@ -169,22 +175,37 @@ impl AppService {
                 .map_err(|error| map_io_error("move active code to rollback", error, true))?;
         }
         if let Err(error) = tokio::fs::rename(&staging, &code).await {
-            if rollback.exists() {
-                let _ = tokio::fs::rename(&rollback, &code).await;
+            if rollback.exists()
+                && let Err(rollback_err) = tokio::fs::rename(&rollback, &code).await
+            {
+                error!(
+                    "[app_manager] CRITICAL: rollback rename failed for {}: {}. Code directory may be in inconsistent state.",
+                    app_id, rollback_err
+                );
             }
             return Err(map_io_error("activate staged release", error, true));
         }
         if app_exists && let Err(error) = self.start_app(app_id).await {
-            remove_dir_if_exists(&code).await?;
+            warn!("[app_manager] Failed to restart app {} after activation: {}, attempting rollback", app_id, error);
+            if let Err(cleanup_err) = remove_dir_if_exists(&code).await {
+                warn!("[app_manager] Failed to cleanup code dir {} during rollback: {}", code.display(), cleanup_err);
+            }
             if rollback.exists() {
                 tokio::fs::rename(&rollback, &code)
                     .await
                     .map_err(|restore| map_io_error("restore previous release", restore, true))?;
-                let _ = self.start_app(app_id).await;
+                if let Err(restart_err) = self.start_app(app_id).await {
+                    error!(
+                        "[app_manager] CRITICAL: rollback restart failed for {}: {}. App may be down.",
+                        app_id, restart_err
+                    );
+                }
             }
             index.releases[release_position].status = ReleaseStatus::Failed;
             index.releases[release_position].failure_message = Some(error.to_string());
-            let _ = tokio::fs::remove_file(&package).await;
+            if let Err(e) = tokio::fs::remove_file(&package).await {
+                debug!("[app_manager] Failed to cleanup package {}: {}", package.display(), e);
+            }
             write_index(&releases_dir, &index).await?;
             return Err(error);
         }
@@ -222,11 +243,25 @@ impl AppService {
                 AppOperationError::NotFound(format!("release not found: {release_id}"))
             })?;
         if !healthy {
+            warn!(
+                "[app_manager] Release {} for app {} unhealthy, initiating rollback",
+                release_id, app_id
+            );
             let code = app_dir.join("code");
             let rollback = releases_dir.join(".rollback").join("code");
             if rollback.exists() {
-                let _ = self.stop_app(app_id).await;
-                remove_dir_if_exists(&code).await?;
+                if let Err(stop_err) = self.stop_app(app_id).await {
+                    warn!(
+                        "[app_manager] Failed to stop app {} during rollback: {}",
+                        app_id, stop_err
+                    );
+                }
+                if let Err(cleanup_err) = remove_dir_if_exists(&code).await {
+                    warn!(
+                        "[app_manager] Failed to cleanup code dir during rollback: {}",
+                        cleanup_err
+                    );
+                }
                 tokio::fs::rename(&rollback, &code).await.map_err(|error| {
                     map_io_error(
                         "restore previous release after readiness failure",
@@ -234,7 +269,12 @@ impl AppService {
                         true,
                     )
                 })?;
-                self.start_app(app_id).await?;
+                if let Err(restart_err) = self.start_app(app_id).await {
+                    error!(
+                        "[app_manager] CRITICAL: rollback restart failed for {}: {}",
+                        app_id, restart_err
+                    );
+                }
             }
             index.releases[position].status = ReleaseStatus::Failed;
             index.releases[position].failure_message =
@@ -243,7 +283,12 @@ impl AppService {
             let package = releases_dir
                 .join("packages")
                 .join(format!("{release_id}.zip"));
-            let _ = tokio::fs::remove_file(package).await;
+            if let Err(e) = tokio::fs::remove_file(package).await {
+                debug!(
+                    "[app_manager] Failed to cleanup package for failed release {}: {}",
+                    release_id, e
+                );
+            }
             write_index(&releases_dir, &index).await?;
             return Err(AppOperationError::InvalidState(format!(
                 "release readiness failed: {release_id}"

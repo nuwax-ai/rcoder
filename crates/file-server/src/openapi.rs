@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn document_contains_every_registered_operation() {
         let document = generated_document();
-        assert_eq!(document.paths.paths.len(), 71);
+        assert_eq!(document.paths.paths.len(), 76);
         assert!(document.paths.paths.contains_key("/"));
         assert!(document.paths.paths.contains_key("/api/build/start-dev"));
         assert!(document.paths.paths.contains_key("/api/git/commit"));
@@ -163,6 +163,31 @@ mod tests {
                 .paths
                 .contains_key("/api/userapp/static/{app_id}/{rest}")
         );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/userapp/tasks/{task_id}")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/userapp/tasks/{task_id}/logs")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/userapp/tasks/{task_id}/logs/stream")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/userapp/tasks/{task_id}/cancel")
+        );
+        assert!(document.paths.paths.contains_key("/api/userapp/publish"));
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 
@@ -184,9 +209,10 @@ mod tests {
             let Some(operation) = path_item.get("post") else {
                 continue;
             };
-            let content = operation["requestBody"]["content"]
-                .as_object()
-                .unwrap_or_else(|| panic!("POST {path} must declare a request body"));
+            // 无请求体的 POST（cancel/stop 等动作接口）跳过；声明了 body 的必须类型化。
+            let Some(content) = operation["requestBody"]["content"].as_object() else {
+                continue;
+            };
             let schema = content
                 .values()
                 .next()

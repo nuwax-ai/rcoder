@@ -511,6 +511,7 @@ pub(crate) async fn build_project(
         &main_log,
         &temp_log,
         timeout,
+        None,
     )
     .await;
     if let Err(build_error) = build_result {

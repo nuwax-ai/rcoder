@@ -162,6 +162,8 @@ pub fn spawn_dev(
 
 /// 运行一次性非 pnpm-install 命令 (build/preprocess), arg 数组 + stdout/stderr 管道到日志, 阻塞等待。
 /// 用 current_dir 替代 `cd ... &&`, arg 数组替代 shell 拼接; 错误为类型化 io::Error/退出码。
+///
+/// `on_pid`: spawn 后回调 child pid (供外部 cancel 时 kill 进程组); 传 None 则不回调。
 pub async fn run_command_to_log(
     program: &str,
     args: &[&str],
@@ -169,6 +171,7 @@ pub async fn run_command_to_log(
     main_log: &Path,
     temp_log: &Path,
     timeout_secs: u64,
+    on_pid: Option<&(dyn Fn(u32) + Send + Sync)>,
 ) -> AppResult<()> {
     let mut cmd = Command::new(program);
     cmd.args(args);
@@ -191,6 +194,12 @@ pub async fn run_command_to_log(
     let mut child = cmd
         .spawn()
         .map_err(|e| AppError::system(format!("spawn command failed: {e}")))?;
+    // 回调 pid 供外部 cancel (kill_process_group); child drop 前 pid 恒有效。
+    if let Some(cb) = on_pid
+        && let Some(pid) = child.id()
+    {
+        cb(pid);
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let main = main_log.to_path_buf();
@@ -317,9 +326,7 @@ fn kill_tree_windows(pid: u32, force: bool) -> bool {
     if force {
         cmd.arg("/F");
     }
-    cmd.output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
 }
 /// Windows 无进程组；返回 pid 本身用于 stop 去重（同 pid 只 kill 一次）。
 #[cfg(windows)]
