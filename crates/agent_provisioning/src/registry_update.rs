@@ -73,7 +73,9 @@ fn update_registry_sync(
     // 读取现有 registry（Vec<AgentManifest> 格式）
     let mut manifests: Vec<AgentManifest> = if registry_path.exists() {
         let data = std::fs::read_to_string(&registry_path)?;
-        serde_json::from_str(&data).unwrap_or_default()
+        // 解析失败必须上抛而非清空：unwrap_or_default() 会把损坏的 registry.json 当成空 Vec，
+        // 随后只写回当前单条记录，擦除所有历史 agent 注册记录（数据丢失）。
+        serde_json::from_str(&data)?
     } else {
         Vec::new()
     };

@@ -46,14 +46,19 @@ impl KubernetesRuntime {
 
         // Step 1: 删除 StatefulSet（Foreground cascade → pod 随之终止）。回收 = 彻底销毁 STS
         // （非 scale 0；scale 0 会留 STS 永不清理）。PVC 保留（数据复用，下次 ensure 重建挂回）。
+        //
+        // STS 删除失败必须上抛：delete_agent_statefulset 已把 404→Ok，返回 Err 必为真失败。
+        // 若仍清 pod_cache 并返回 Ok，会出现 "STS 还在（控制器会重建 pod）但 rcoder 缓存已空"
+        // 的分裂 → 孤儿 STS + 下次 ensure 同名冲突/误建副本。Service 删除（Step 0/3）可 best-effort。
         if let Err(e) = self
             .delete_agent_statefulset(identifier, service_type)
             .await
         {
-            warn!(
-                "[K8S] Failed to delete StatefulSet {}: {} (continuing)",
+            error!(
+                "[K8S] Failed to delete StatefulSet {}: {}; aborting destroy (pod_cache retained)",
                 pod_name, e
             );
+            return Err(e);
         }
 
         // Step 2: 等 pod {sts}-0 完全终止（Foreground cascade 异步；等其 404 再继续，

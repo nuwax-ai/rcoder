@@ -665,7 +665,12 @@ pub async fn pod_status(
             }
             Err(e) => {
                 error!("[POD_STATUS] Query failed: {}", e);
-                // 继续返回 not_found 而不是错误
+                // 与第一路（user_id 查询）保持一致：runtime 错误返回 500，而非伪装成 not_found，
+                // 否则客户端会误判"容器已销毁"并触发 ensure 重建风暴。
+                return Err(AppError::internal_server_error(&format!(
+                    "Failed to query container status: {}",
+                    e
+                )));
             }
         }
     }

@@ -13,7 +13,6 @@
 mod assemble;
 pub mod import;
 mod manifest;
-pub mod publish;
 pub mod tasks;
 
 // 重导出 manifest 类型：保持 userapp 模块公开面。
@@ -291,10 +290,30 @@ fn required_release_metadata(name: &str) -> AppResult<String> {
 
 async fn hash_file(path: &std::path::Path) -> AppResult<(String, u64)> {
     use sha2::{Digest, Sha256};
-    let bytes = tokio::fs::read(path)
+    use tokio::io::AsyncReadExt;
+
+    // 流式读取：整个 workspace 发布包（多项目 Next.js standalone，可达数百 MB~GB）
+    // 不能一次性 read 进内存算 hash（高并发发布会 OOM）。用固定 64KB buffer 循环 update。
+    let mut file = tokio::fs::File::open(path)
         .await
-        .map_err(|e| AppError::file(format!("read built workspace package: {e}")))?;
-    let size = u64::try_from(bytes.len())
-        .map_err(|e| AppError::system(format!("package size conversion: {e}")))?;
-    Ok((hex::encode(Sha256::digest(&bytes)), size))
+        .map_err(|e| AppError::file(format!("open built workspace package: {e}")))?;
+    let size = file
+        .metadata()
+        .await
+        .map_err(|e| AppError::file(format!("stat built workspace package: {e}")))?
+        .len();
+
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| AppError::file(format!("read built workspace package: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok((hex::encode(hasher.finalize()), size))
 }
