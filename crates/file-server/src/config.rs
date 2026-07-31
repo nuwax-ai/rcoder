@@ -237,8 +237,10 @@ impl Default for Config {
             skill_download_timeout_secs: 60,
             skill_download_max_redirects: 3,
             skill_url_max_count: 20,
-            skill_url_allow_http: false,
-            skill_url_allow_private_networks: false,
+            skill_url_allow_http: true,
+            // 私有化部署默认放行私网/保留地址: skill 通常托管在内网 (10.x/192.168.x/容器域名)。
+            // 公网/SaaS 部署可用 SKILL_URL_ALLOW_PRIVATE_NETWORKS=false 重新锁紧。
+            skill_url_allow_private_networks: true,
             skill_url_allowed_hosts: Vec::new(),
             download_max_file_size_bytes: 104_857_600,
             request_body_max_bytes: MAX_UPLOAD_FILE_SIZE_BYTES,
@@ -478,8 +480,11 @@ impl Config {
             skill_download_timeout_secs: env_parse("SKILL_DOWNLOAD_TIMEOUT_SECS", 60)?,
             skill_download_max_redirects: env_parse("SKILL_DOWNLOAD_MAX_REDIRECTS", 3)?,
             skill_url_max_count: env_parse("SKILL_URL_MAX_COUNT", 20)?,
-            skill_url_allow_http: env_bool("SKILL_URL_ALLOW_HTTP", false)?,
-            skill_url_allow_private_networks: env_bool("SKILL_URL_ALLOW_PRIVATE_NETWORKS", false)?,
+            skill_url_allow_http: env_bool("SKILL_URL_ALLOW_HTTP", true)?,
+            skill_url_allow_private_networks: env_bool(
+                "SKILL_URL_ALLOW_PRIVATE_NETWORKS",
+                true,
+            )?,
             skill_url_allowed_hosts: env_list("SKILL_URL_ALLOWED_HOSTS", "")?,
             download_max_file_size_bytes: env_parse("DOWNLOAD_MAX_FILE_SIZE_BYTES", 104_857_600)?,
             request_body_max_bytes: request_body_max_bytes(MAX_UPLOAD_FILE_SIZE_BYTES)?,

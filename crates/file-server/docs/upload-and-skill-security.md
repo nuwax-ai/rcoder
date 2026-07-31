@@ -14,9 +14,9 @@ ZIP 解压同时限制为最多 100,000 个条目、单个解压文件最多 1 G
 
 ## skill URL 默认策略
 
-- 默认只允许 HTTPS。
+- 默认允许明文 HTTP 与私网/保留地址：本产品以私有化部署为主，skill 通常托管在内网（`10.x`/`192.168.x`/集群内域名）且多为 HTTP。公网或互联网暴露的部署应设置 `SKILL_URL_ALLOW_HTTP=false` 与 `SKILL_URL_ALLOW_PRIVATE_NETWORKS=false` 重新锁紧。
 - 禁止 URL 用户名和密码。
-- DNS 在 reqwest 实际连接阶段通过安全 resolver 解析，拒绝任一私网、回环、链路本地、组播或保留地址，避免预检查与连接二次解析造成 DNS rebinding。
+- DNS 在 reqwest 实际连接阶段通过安全 resolver 解析（防 DNS rebinding）；当关闭私网放行（`SKILL_URL_ALLOW_PRIVATE_NETWORKS=false`）时，resolver 还会拒绝任一私网、回环、链路本地、组播或保留地址。
 - 禁用 reqwest 自动重定向；每一跳重新执行 URL、域名和 DNS 策略检查。
 - 使用进程级共享 `reqwest::Client`，配置连接超时和请求总超时。
 - 同时检查 `Content-Length` 和实际流式接收字节数。
@@ -31,8 +31,8 @@ ZIP 解压同时限制为最多 100,000 个条目、单个解压文件最多 1 G
 | `SKILL_DOWNLOAD_TIMEOUT_SECS` | `60` | 单次请求总超时 |
 | `SKILL_DOWNLOAD_MAX_REDIRECTS` | `3` | 最大重定向跳数 |
 | `SKILL_URL_MAX_COUNT` | `20` | 单次接口最大 URL 数量 |
-| `SKILL_URL_ALLOW_HTTP` | `false` | 是否允许明文 HTTP |
-| `SKILL_URL_ALLOW_PRIVATE_NETWORKS` | `false` | 是否允许私网/保留地址；生产环境不建议开启 |
+| `SKILL_URL_ALLOW_HTTP` | `true` | 是否允许明文 HTTP；公网部署建议设为 `false` |
+| `SKILL_URL_ALLOW_PRIVATE_NETWORKS` | `true` | 是否允许私网/保留地址；公网/互联网暴露部署建议设为 `false` |
 | `SKILL_URL_ALLOWED_HOSTS` | 空 | 可选域名白名单，逗号分隔；允许该域名及其子域名 |
 
 K8s 部署时应给 `UPLOAD_PROJECT_DIR/temp` 所在卷设置足够的 ephemeral-storage request/limit，并监控临时盘使用量。内存上限不再决定大文件上传能力，但磁盘配额仍应与上传上限及并发量匹配。
