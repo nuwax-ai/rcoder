@@ -229,7 +229,7 @@ pub async fn startup_cleanup(config: &AppConfig) {
     }
 }
 
-pub fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(String, String)> {
+pub async fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(String, String)> {
     let docker_config = config
         .docker_config
         .as_ref()
@@ -237,25 +237,19 @@ pub fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(String, Str
     let multi_config = docker_config.get_multi_image_config();
     let selector = docker_manager::image_selector::ImageSelector::new(multi_config);
 
-    let (container_prefix_rcoder, container_prefix_computer) = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            let rcoder_prefix = selector
-                .get_service_config(&shared_types::ServiceType::WebAgentRunner)
-                .await
-                .expect("Failed to get RCoder service config")
-                .container_prefix()
-                .to_string();
-            let computer_prefix = selector
-                .get_service_config(&shared_types::ServiceType::ComputerAgentRunner)
-                .await
-                .expect("Failed to get ComputerAgentRunner service config")
-                .container_prefix()
-                .to_string();
-            (rcoder_prefix, computer_prefix)
-        })
-    });
+    let rcoder_cfg = selector
+        .get_service_config(&shared_types::ServiceType::WebAgentRunner)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get RCoder service config: {e}"))?;
+    let computer_cfg = selector
+        .get_service_config(&shared_types::ServiceType::ComputerAgentRunner)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get ComputerAgentRunner service config: {e}"))?;
 
-    Ok((container_prefix_rcoder, container_prefix_computer))
+    Ok((
+        rcoder_cfg.container_prefix().to_string(),
+        computer_cfg.container_prefix().to_string(),
+    ))
 }
 
 fn show_docker_configuration_help(socket_path: &str) {

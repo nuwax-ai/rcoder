@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (container_prefix_rcoder, container_prefix_computer) =
-        docker_init::get_container_prefixes(&bootstrap_result.config)?;
+        docker_init::get_container_prefixes(&bootstrap_result.config).await?;
 
     // 获取容器运行时（在 init_docker_manager 之后可用）
     let runtime = docker_manager::runtime::RuntimeManager::get()

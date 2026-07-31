@@ -48,6 +48,7 @@ pub use api_key_validator::{ApiKeyAuthConfig, ApiKeyAuthError, ApiKeyValidator};
 // 新增多镜像配置相关模块
 pub mod multi_image_config;
 pub mod permission_types;
+pub mod pg_utils;
 pub mod service_config;
 pub mod service_type;
 // K8s 运行时专用配置(与 docker_config 分家)

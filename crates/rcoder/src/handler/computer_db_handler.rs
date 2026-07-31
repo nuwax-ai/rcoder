@@ -10,15 +10,12 @@
 //! 而 agent-runner 容器自带本地 PG（POSTGRES_USER 烤进 ENV、psql 在 PATH、initdb
 //! --auth-local=trust 本地免密），rcoder 经 `ContainerRuntime::exec` 在容器内跑 psql 即可，
 //! agent_runner 二进制零改动。
-//!
-//! 请求体复用 app_manager::models（同构, 避免 utoipa schema 名冲突）；标识符校验本地复制
-//! （app_manager::utils::validate_pg_identifier 返 app_manager 错误类型, 跨 crate 复用会
-//! 纠缠错误转换, 故此处自包含、返回 rcoder 的 AppError）。
 
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State};
+use shared_types::pg_utils::{pg_escape_literal, pg_quote_ident, validate_pg_identifier};
 use shared_types::{AppError, HttpResult, ServiceType};
 use tracing::{info, instrument};
 
@@ -55,8 +52,10 @@ pub async fn computer_db_reset_password(
     let container_name = resolve_computer_container(&state, &user_id).await?;
 
     // 镜像 app_manager::service::reset_db_password:
-    // 容器内 sh 展开 $POSTGRES_USER(镜像 ENV); psql 本地 trust 免密; SQL ' 转义为 ''; ON_ERROR_STOP=1。
-    let safe_pw = req.new_password.replace('\'', "''");
+    // 容器内 sh 展开 $POSTGRES_USER(镜像 ENV); psql 本地 trust 免密;
+    // safe_pw 经 pg_escape_literal (SQL 标准 ' → '' 转义) 防注入到 SQL 字符串字面量;
+    // 密码本身不做标识符白名单校验(允许任意字符含特殊符号)。
+    let safe_pw = pg_escape_literal(&req.new_password);
     let cmd = vec![
         "sh".to_string(),
         "-c".to_string(),
@@ -105,9 +104,11 @@ pub async fn computer_db_create_database(
     Path(user_id): Path<String>,
     Json(req): Json<CreateDatabaseRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    validate_pg_identifier(&req.database)?;
+    validate_pg_identifier(&req.database)
+        .map_err(|e| AppError::validation_error(&e))?;
     if let Some(owner) = &req.owner {
-        validate_pg_identifier(owner)?;
+        validate_pg_identifier(owner)
+            .map_err(|e| AppError::validation_error(&e))?;
     }
     let container_name = resolve_computer_container(&state, &user_id).await?;
 
@@ -121,18 +122,19 @@ pub async fn computer_db_create_database(
         )));
     }
 
-    // CREATE DATABASE "{db}"[ OWNER "{owner}"] —— 双引号 PG 标识符, " 转义为 ""。
-    let safe_db = req.database.replace('"', "\"\"");
+    // CREATE DATABASE :owner 经 pg_quote_ident 转义 (双引号引用,内部 " → "")。
+    // req.database / owner 已在入口 validate_pg_identifier 校验,此处为纵深防御。
+    let safe_db = pg_quote_ident(&req.database);
     let owner_clause = req
         .owner
         .as_ref()
-        .map(|o| format!(" OWNER \"{}\"", o.replace('"', "\"\"")))
+        .map(|o| format!(" OWNER {}", pg_quote_ident(o)))
         .unwrap_or_default();
     let cmd = vec![
         "sh".to_string(),
         "-c".to_string(),
         format!(
-            r#"psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE "{safe_db}"{owner_clause}'"#,
+            r#"psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE {safe_db}{owner_clause}'"#,
         ),
     ];
     let ctx = format!("[COMPUTER_DB] create-database failed user_id={user_id}");
@@ -186,17 +188,18 @@ async fn resolve_computer_container(state: &AppState, user_id: &str) -> Result<S
 
 /// 查询 PG 里某库是否已存在（容器内 psql `-tAc SELECT pg_database`）。
 /// `-tAc` 取无表头纯输出：命中输出 `1`、未命中输出空 → 比 CREATE 失败后解析 stderr 稳定。
-/// `db` 已过 `validate_pg_identifier` 白名单（`[a-zA-Z0-9_]`），安全内联到字符串字面量。
+/// `db` 在入口处已 `validate_pg_identifier` 白名单校验,此处 pg_escape_literal 作纵深防御。
 async fn database_exists(
     state: &AppState,
     container_name: &str,
     db: &str,
 ) -> Result<bool, AppError> {
+    let safe_db = pg_escape_literal(db);
     let cmd = vec![
         "sh".to_string(),
         "-c".to_string(),
         format!(
-            r#"psql -U "$POSTGRES_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='{db}'""#,
+            r#"psql -U "$POSTGRES_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='{safe_db}'""#,
         ),
     ];
     let r = state
@@ -216,31 +219,4 @@ async fn database_exists(
         )));
     }
     Ok(r.stdout.trim() == "1")
-}
-
-/// 校验 PG 标识符（数据库名 / 用户名）：首字符字母或下划线，其余字母/数字/下划线，≤63 字符。
-/// 镜像 app_manager::utils::validate_pg_identifier（此处自包含, 返回 rcoder 的 AppError）。
-fn validate_pg_identifier(name: &str) -> Result<(), AppError> {
-    if name.is_empty() || name.len() > 63 {
-        return Err(AppError::validation_error(
-            "PG identifier must be 1..=63 chars",
-        ));
-    }
-    if let Some(first) = name.chars().next()
-        && !(first.is_ascii_alphabetic() || first == '_')
-    {
-        return Err(AppError::validation_error(
-            "PG identifier must start with letter or '_'",
-        ));
-    }
-    if !name
-        .chars()
-        .skip(1)
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Err(AppError::validation_error(
-            "PG identifier: only [a-zA-Z0-9_] allowed",
-        ));
-    }
-    Ok(())
 }
