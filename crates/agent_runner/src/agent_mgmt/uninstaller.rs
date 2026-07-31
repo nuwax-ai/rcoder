@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use shared_types::InstallType;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
 use crate::agent_mgmt::installer::AgentManifest;
@@ -118,8 +118,13 @@ pub async fn uninstall_version(
             .path_manager()
             .agent_dir(agent_id)
             .map_err(AgentMgmtError::InvalidManifest)?;
-        // best-effort: remove_dir 只能删空目录
-        let _ = tokio::fs::remove_dir(&agent_dir).await;
+        // best-effort: remove_dir 只能删空目录，非空时失败属正常，记 debug 即可
+        if let Err(e) = tokio::fs::remove_dir(&agent_dir).await {
+            debug!(
+                "[agent_mgmt] best-effort remove_dir {} failed: {e}",
+                agent_dir.display()
+            );
+        }
     }
 
     info!(

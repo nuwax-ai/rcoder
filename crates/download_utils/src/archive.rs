@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use tracing::error;
+use tracing::{error, warn};
 
 /// Maximum extracted size (1GB)
 const MAX_EXTRACTED_SIZE: u64 = 1024 * 1024 * 1024;
@@ -334,8 +334,22 @@ pub fn find_entrypoint_from_metadata(agent_dir: &Path) -> Option<(String, Vec<St
 
 /// Read `bin.start` from a JSON file.
 fn read_bin_start_from_json(path: &Path) -> Option<(String, Vec<String>)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    // 区分"文件不存在"（正常，试下一个候选）与"存在但读取/解析失败"（配置 bug，须可见）。
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!("failed to read package json {}: {e}", path.display());
+            return None;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("failed to parse package json {}: {e}", path.display());
+            return None;
+        }
+    };
 
     let bin_start = value.get("bin")?.get("start")?.as_str()?;
 

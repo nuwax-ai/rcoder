@@ -22,7 +22,7 @@ use futures_util::Stream;
 use sha2::{Digest, Sha256};
 use shared_types::InstallType;
 use shared_types_grpc::{InstallAgentRequest, InstallAgentResponse};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::archive_installer;
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
@@ -300,8 +300,13 @@ pub async fn install_from_bytes(
     };
 
     // 只删除特定版本目录，不影响其他版本
-    if version_dir.exists() {
-        tokio::fs::remove_dir_all(&version_dir).await.ok();
+    if version_dir.exists()
+        && let Err(e) = tokio::fs::remove_dir_all(&version_dir).await
+    {
+        warn!(
+            "[agent_mgmt] failed to remove existing version_dir {}: {e}",
+            version_dir.display()
+        );
     }
     tokio::fs::create_dir_all(&version_dir).await?;
 
@@ -406,7 +411,12 @@ pub async fn install_from_file(
     // 只删除特定版本目录，不影响其他版本
     if version_dir.exists() {
         debug!("[agent_mgmt] install_from_file: removing existing version_dir");
-        tokio::fs::remove_dir_all(&version_dir).await.ok();
+        if let Err(e) = tokio::fs::remove_dir_all(&version_dir).await {
+            warn!(
+                "[agent_mgmt] failed to remove existing version_dir {}: {e}",
+                version_dir.display()
+            );
+        }
         info!(
             "[agent_mgmt] install_from_file: remove_dir_all took {:?}",
             t1.elapsed()
