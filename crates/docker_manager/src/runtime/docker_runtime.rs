@@ -422,6 +422,13 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             ip
         };
 
+        if ip.is_empty() {
+            tracing::warn!(
+                "[APP-DOCKER] container {} started but IP not ready after polling; \
+                 Pingora/gRPC 注册前应确认可达，否则会掩盖启动故障",
+                created.id
+            );
+        }
         Ok(ContainerBasicInfo {
             container_id: created.id.clone(),
             container_name,

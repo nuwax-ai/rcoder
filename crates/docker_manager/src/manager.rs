@@ -200,13 +200,28 @@ impl DockerManager {
             link: false,
         });
 
-        self.docker
-            .remove_container(container_id, remove_options)
-            .await
-            .map_err(|e| {
+        match tokio::time::timeout(
+            timeout,
+            self.docker.remove_container(container_id, remove_options),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
                 warn!("Failed to remove container {}: {}", container_id, e);
-                DockerError::BollardError(e)
-            })?;
+                return Err(DockerError::BollardError(e));
+            }
+            Err(_) => {
+                // 与上方 inspect 一致的超时保护：daemon 挂起/OOM/网络阻塞时避免永久阻塞
+                warn!(
+                    "Timed out removing container {} after {}s",
+                    container_id, timeout_seconds
+                );
+                return Err(DockerError::Timeout(format!(
+                    "remove container {container_id} ({timeout_seconds}s)"
+                )));
+            }
+        }
 
         info!("container destroy succeeded: {}", container_id);
 

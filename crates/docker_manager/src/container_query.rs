@@ -1128,18 +1128,30 @@ impl DockerManager {
             ..Default::default()
         };
 
+        // idle 超时：daemon 卡顿/网络挂起时 log_stream.next() 既不产出也不报错，
+        // 会永久阻塞调用方。每条 chunk 间最多等 30s，超时则返回已累积的部分日志。
+        const LOG_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
         let mut log_stream = self
             .docker
             .logs(&container_info.container_id, Some(log_options));
         let mut logs = String::new();
 
-        while let Some(result) = log_stream.next().await {
-            match result {
-                Ok(output) => {
+        loop {
+            match tokio::time::timeout(LOG_STREAM_IDLE_TIMEOUT, log_stream.next()).await {
+                Ok(Some(Ok(output))) => {
                     logs.push_str(&String::from_utf8_lossy(&output.into_bytes()));
                 }
-                Err(e) => {
+                Ok(Some(Err(e))) => {
                     warn!("get container logs failed: {}", e);
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    warn!(
+                        "get container logs idle for {:?}, returning partial logs",
+                        LOG_STREAM_IDLE_TIMEOUT
+                    );
+                    break;
                 }
             }
         }

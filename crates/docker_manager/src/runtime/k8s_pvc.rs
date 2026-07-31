@@ -214,16 +214,35 @@ impl K8sPvcOps for KubernetesRuntime {
                                     grace_period_seconds: Some(0),
                                     ..Default::default()
                                 };
-                                let _ = self.pvcs().delete(&pvc_name, &dp).await;
+                                if let Err(e) = self.pvcs().delete(&pvc_name, &dp).await {
+                                    warn!(
+                                        "[K8S] force delete PVC {} failed: {}",
+                                        pvc_name, e
+                                    );
+                                }
                                 // Wait a bit more for the API to reflect the deletion
                                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                                 break;
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
-                        Err(_) => {
-                            // On error, assume PVC is gone
-                            break;
+                        Err(e) => {
+                            // 非 404 错误（transport/auth/RBAC 瞬时故障）：不假定 PVC 已删，
+                            // 继续轮询（对齐 destroy_workspace_pvc），避免误判已删后重建撞 409。
+                            // 同样受 max_wait 约束，超时则跳出由上层重建兜底。
+                            if wait_start.elapsed() > max_wait {
+                                warn!(
+                                    "[K8S] PVC {} get kept failing (non-404) for {:.1}s; stop waiting",
+                                    pvc_name,
+                                    wait_start.elapsed().as_secs_f64()
+                                );
+                                break;
+                            }
+                            warn!(
+                                "[K8S] PVC {} get failed during Terminating wait, keep polling: {}",
+                                pvc_name, e
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
                     }
                 }

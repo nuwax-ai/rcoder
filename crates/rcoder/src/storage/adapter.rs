@@ -701,7 +701,7 @@ impl ProjectAdapter {
             let info = entry.info();
             self.container_id_to_key.remove(&info.container_id);
             // identifier 用裸 logical_id（清理链路按 logical id）
-            let _ = self.cleanup_tx.send(CleanupRequest {
+            if let Err(e) = self.cleanup_tx.send(CleanupRequest {
                 identifier: entry.logical_id().to_string(),
                 container_name: info.container_name,
                 service_type: entry.service_type(),
@@ -709,7 +709,13 @@ impl ProjectAdapter {
                 namespace: self.namespace.clone(),
                 cluster_domain: self.cluster_domain.clone(),
                 project_ids,
-            });
+            }) {
+                tracing::error!(
+                    "[STORAGE] cleanup channel send failed (ResourceReaper down?), container leak risk: identifier={}, {}",
+                    entry.logical_id(),
+                    e
+                );
+            }
         }
 
         (container_existed, count)
@@ -930,7 +936,7 @@ impl ProjectAdapter {
             );
             // identifier 用裸 logical_id（清理链路按 logical id：stop_container_by_identifier/
             // remove_vnc_backend/remove_project_backend/remove_container_cache），而非 DashMap 键
-            let _ = self.cleanup_tx.send(CleanupRequest {
+            if let Err(e) = self.cleanup_tx.send(CleanupRequest {
                 identifier: entry.logical_id().to_string(),
                 container_name: info.container_name,
                 service_type: entry.service_type(),
@@ -938,7 +944,13 @@ impl ProjectAdapter {
                 namespace: self.namespace.clone(),
                 cluster_domain: self.cluster_domain.clone(),
                 project_ids: vec![],
-            });
+            }) {
+                tracing::error!(
+                    "[STORAGE] cleanup channel send failed (ResourceReaper down?), container leak risk: identifier={}, {}",
+                    entry.logical_id(),
+                    e
+                );
+            }
         }
     }
 }
