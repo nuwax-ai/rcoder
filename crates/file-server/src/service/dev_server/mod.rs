@@ -29,9 +29,11 @@ use crate::error::{AppError, AppResult};
 use crate::service::pnpm::{self, InstallOptions, LogFiles};
 use support::{early_exit_err, ldrtemp, lock, read_dev_script};
 
-/// dev server 就绪轮询间隔 (ms)。vite 冷启动通常 300-500ms 即 ready, 原 1s 粒度会让
-/// 已 ready 的 server 白等近 1s。首次 sleep 与失败重试间隔同此值 (实测 vite ready in ~357ms)。
-const DEV_ALIVE_POLL_INTERVAL_MS: u64 = 300;
+/// 探活回调：(port, base_path, timeout_ms) → boxed future<bool>。
+/// 抽成类型别名既绕开 clippy::type_complexity，也方便测试注入 stub（绕开 reqwest 延迟）。
+type AliveProbe<'a> = &'a (dyn for<'s> Fn(u16, Option<&'s str>, u64)
+    -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + 's>>
+    + Sync);
 
 /// 运行中的 dev server 记录 (内存状态)。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -250,7 +252,14 @@ impl DevServerManager {
 
         // 就绪轮询 (在登记到 map 之前): 进程早退 → 读 stderr ring 分类成结构化错误;
         // 端口经 AllocGuard 自动释放。避免把"启动失败已死的 vite"当成成功。
-        self.poll_alive(pid, port, base_path, &stderr_ring).await?;
+        self.poll_alive(
+            pid,
+            port,
+            base_path,
+            &stderr_ring,
+            &|port, base, timeout_ms| Box::pin(is_project_alive(port, base, timeout_ms)),
+        )
+        .await?;
 
         lock(&self.processes)?.insert(
             project_id.to_string(),
@@ -276,10 +285,11 @@ impl DevServerManager {
         port: u16,
         base_path: Option<&str>,
         stderr_ring: &Arc<StderrRing>,
+        probe: AliveProbe<'_>,
     ) -> AppResult<()> {
         let max = self.config.dev_alive_max_wait_ms;
         let timeout = self.config.dev_alive_check_timeout_ms;
-        let interval = Duration::from_millis(DEV_ALIVE_POLL_INTERVAL_MS);
+        let interval = Duration::from_millis(self.config.dev_alive_poll_interval_ms);
         // 用墙钟 deadline 计时 (而非固定步进累加): 探活本身可能耗时 (未 ready 时等到
         // timeout), 固定步进累加会让 max 超时判断严重偏松 (实际墙钟远大于累加值)。
         let deadline = std::time::Instant::now() + Duration::from_millis(max);
@@ -298,7 +308,7 @@ impl DevServerManager {
             // 首轮即探活 (不固定盲等 sleep): spawn 返回时 vite 端口未 listen, reqwest
             // connection refused 快速失败, 等价探测式等待; vite 提前 ready 能立刻发现。
             let this_timeout = timeout.min((deadline - now).as_millis() as u64);
-            if is_project_alive(port, base_path, this_timeout).await {
+            if probe(port, base_path, this_timeout).await {
                 return Ok(());
             }
             tokio::time::sleep(interval).await;
@@ -601,32 +611,31 @@ mod tests {
 
     #[tokio::test]
     async fn poll_alive_returns_promptly_when_server_ready() {
-        use tokio::io::AsyncWriteExt;
-        // mock vite: 监听任意端口, 对所有请求回 HTTP 200
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    continue;
-                };
-                let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .await;
-            }
-        });
-        let mgr = DevServerManager::new(Arc::new(Config::from_env().expect("test config")));
-        // pid 用当前进程 → is_process_running 恒 true, 焦点在探活速度
+        // 探活用即时返回 true 的 stub：绕开 reqwest Client 构建 / 系统 CA 加载的固有延迟
+        // （macOS keychain 首加载数百 ms，会让真实探活的计时断言 flaky）。焦点纯粹在 poll_alive
+        // 的循环逻辑——server ready 时首轮探活即返回，而非固定盲等 sleep。
+        let mut config = Config::from_env().expect("test config");
+        config.dev_alive_poll_interval_ms = 10;
+        let mgr = DevServerManager::new(Arc::new(config));
+        // pid 用当前进程 → is_process_running 恒 true
         let pid = std::process::id();
         let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let start = std::time::Instant::now();
-        let res = mgr.poll_alive(pid, port, None, &ring).await;
+        let res = mgr
+            .poll_alive(
+                pid,
+                0,
+                None,
+                &ring,
+                &|_port, _base, _timeout| Box::pin(async { true }),
+            )
+            .await;
         let elapsed = start.elapsed();
         assert!(res.is_ok(), "ready 时 poll_alive 应成功");
-        // 核心断言: 首次 sleep 300ms + 探活, 应 < 1s (原固定 sleep 1s + 探活 > 1s)
+        // 即时探活 + 10ms 间隔，首轮即返回，应远 < 200ms（原固定 1s sleep > 1s）。
         assert!(
-            elapsed.as_millis() < 1000,
-            "poll_alive 耗时 {elapsed:?}, 期望 < 1s (300ms 间隔)"
+            elapsed.as_millis() < 200,
+            "poll_alive 耗时 {elapsed:?}, 期望 < 200ms (即时探活 stub, 首轮即返回)"
         );
     }
 }

@@ -207,6 +207,9 @@ pub struct Config {
     pub dev_alive_check_timeout_ms: u64,
     /// 存活轮询上限 ms (对齐 nuwax 30000; 超时仍返回成功)。
     pub dev_alive_max_wait_ms: u64,
+    /// 存活轮询间隔 ms (默认 300：vite 冷启动 ~300-500ms 即 ready，原 1s 粒度会白等；
+    /// 测试可设极小值如 10 以消除调度噪声、使就绪探测定时断言确定化)。
+    pub dev_alive_poll_interval_ms: u64,
     /// stop 后等进程退出轮询间隔 ms (对齐 nuwax 100)。
     pub dev_stop_check_interval_ms: u64,
     /// stop 后最大轮询次数 (对齐 nuwax 50, 合计 5s)。
@@ -285,6 +288,7 @@ impl Default for Config {
             dev_port_reserved_end: 9000,
             dev_alive_check_timeout_ms: 1500,
             dev_alive_max_wait_ms: 30_000,
+            dev_alive_poll_interval_ms: 300,
             dev_stop_check_interval_ms: 100,
             dev_stop_max_attempts: 50,
             dev_command_timeout_secs: 600,
@@ -434,6 +438,7 @@ impl Config {
         parse!(dev_port_reserved_end, "DEV_PORT_RESERVED_END");
         parse!(dev_alive_check_timeout_ms, "DEV_ALIVE_CHECK_TIMEOUT_MS");
         parse!(dev_alive_max_wait_ms, "DEV_ALIVE_MAX_WAIT_MS");
+        parse!(dev_alive_poll_interval_ms, "DEV_ALIVE_POLL_INTERVAL_MS");
         parse!(dev_stop_check_interval_ms, "DEV_STOP_CHECK_INTERVAL_MS");
         parse!(dev_stop_max_attempts, "DEV_STOP_MAX_ATTEMPTS");
         parse!(dev_command_timeout_secs, "DEV_COMMAND_TIMEOUT_SECS");
@@ -537,6 +542,7 @@ impl Config {
             dev_port_reserved_end: env_parse("DEV_PORT_RESERVED_END", 9000)?,
             dev_alive_check_timeout_ms: env_parse("DEV_ALIVE_CHECK_TIMEOUT_MS", 1500)?,
             dev_alive_max_wait_ms: env_parse("DEV_ALIVE_MAX_WAIT_MS", 30000)?,
+            dev_alive_poll_interval_ms: env_parse("DEV_ALIVE_POLL_INTERVAL_MS", 300)?,
             dev_stop_check_interval_ms: env_parse("DEV_STOP_CHECK_INTERVAL_MS", 100)?,
             dev_stop_max_attempts: env_parse("DEV_STOP_MAX_ATTEMPTS", 50)?,
             dev_command_timeout_secs: env_parse("DEV_COMMAND_TIMEOUT_SECS", 600)?,
@@ -630,6 +636,10 @@ impl Config {
                 self.dev_alive_check_timeout_ms,
             ),
             ("DEV_ALIVE_MAX_WAIT_MS", self.dev_alive_max_wait_ms),
+            (
+                "DEV_ALIVE_POLL_INTERVAL_MS",
+                self.dev_alive_poll_interval_ms,
+            ),
             (
                 "DEV_STOP_CHECK_INTERVAL_MS",
                 self.dev_stop_check_interval_ms,
