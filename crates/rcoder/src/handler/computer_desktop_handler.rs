@@ -176,38 +176,32 @@ pub async fn computer_desktop_vnc(
     // 1. 验证参数（校验失败返回 Err(AppError)，由 status_from_code 映射为 400/404，
     //    与 utoipa 声明对齐；不再用 Ok(HttpResult::error) 返回 HTTP 200）
     // 字符集校验：user_id/project_id 会被拼进 Pingora 代理 URL（见下方 format!），
-    // 除空外还要拒绝 `/`、`..`、空格等可能拼出非预期路径的字符（纵深防御）。
-    if user_id.trim().is_empty()
-        || !user_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        error!("[DESKTOP_VNC] invalid user_id");
+    // 复用 shared_types::validate_identifier（字母/数字/下划线/连字符，含长度≤64），
+    // 拒绝 `/`、`..`、空格等可能拼出非预期路径的字符（纵深防御）。
+    if user_id.trim().is_empty() {
+        error!("[DESKTOP_VNC] user_id is required");
         return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            if user_id.trim().is_empty() {
-                shared_types::get_i18n_message("error.user_id_required", locale)
-            } else {
-                "user_id contains invalid characters (allowed: alphanumeric, '_', '-')".to_string()
-            },
+            shared_types::get_i18n_message("error.user_id_required", locale),
         ));
+    } else {
+        shared_types::validate_identifier(&user_id, "user_id").map_err(|e| {
+            error!("[DESKTOP_VNC] invalid user_id: {e}");
+            AppError::with_message(shared_types::error_codes::ERR_VALIDATION, e)
+        })?;
     }
 
-    if project_id.trim().is_empty()
-        || !project_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        error!("[DESKTOP_VNC] invalid project_id");
+    if project_id.trim().is_empty() {
+        error!("[DESKTOP_VNC] project_id is required");
         return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            if project_id.trim().is_empty() {
-                shared_types::get_i18n_message("error.project_id_required", locale)
-            } else {
-                "project_id contains invalid characters (allowed: alphanumeric, '_', '-')"
-                    .to_string()
-            },
+            shared_types::get_i18n_message("error.project_id_required", locale),
         ));
+    } else {
+        shared_types::validate_identifier(&project_id, "project_id").map_err(|e| {
+            error!("[DESKTOP_VNC] invalid project_id: {e}");
+            AppError::with_message(shared_types::error_codes::ERR_VALIDATION, e)
+        })?;
     }
 
     info!(
