@@ -13,6 +13,7 @@
 mod assemble;
 pub mod import;
 mod manifest;
+pub mod tasks;
 
 // 重导出 manifest 类型：保持 userapp 模块公开面。
 pub use manifest::{
