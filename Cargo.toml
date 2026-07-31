@@ -69,6 +69,8 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace", "set-header", "fs"] }
 hyper = { version = "1.8", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+# gRPC。tonic 0.14 全系 TLS 特性均基于 rustls：tls-native-roots = rustls + 系统根证书(rustls-native-certs)，
+# 并非 native-tls。保留以信任私有部署的系统/私有 CA（与 reqwest 的 rustls-platform-verifier 一致）。
 tonic = { version = "0.14.6", features = ["tls-native-roots"] }
 tonic-prost = "0.14"
 prost = "0.14"
@@ -177,7 +179,17 @@ tree-sitter-rust = "0.24"                                          # 使用 crat
 sha2 = "0.11"
 hex = "0.4"
 walkdir = "2.5"
-reqwest = { version = "0.13", features = ["json", "stream"] }
+# HTTP client。reqwest 0.13 的 default-tls 本就是 rustls(aws-lc-rs + rustls-platform-verifier 读 OS 根证书)，
+# 并无 openssl/native-tls。这里 default-features=false + 显式 rustls 固化“全 workspace 用 rustls”，
+# 防止未来 reqwest 改默认后悄悄回退；charset/http2/system-proxy 补回原默认特性。
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls",
+    "charset",
+    "http2",
+    "system-proxy",
+] }
 
 # 项目依赖 - 保留核心功能
 aho-corasick = "1.1"
