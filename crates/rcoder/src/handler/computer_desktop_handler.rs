@@ -138,6 +138,11 @@ pub struct DesktopErrorResponse {
             })
         ),
         (
+            status = 400,
+            description = "参数错误（user_id/project_id 为空）",
+            body = HttpResult<String>
+        ),
+        (
             status = 401,
             description = "API Key 鉴权失败",
             body = HttpResult<String>
@@ -168,22 +173,21 @@ pub async fn computer_desktop_vnc(
     let user_id = params.user_id.clone();
     let project_id = params.project_id.clone();
 
-    // 1. 验证参数
+    // 1. 验证参数（校验失败返回 Err(AppError)，由 status_from_code 映射为 400/404，
+    //    与 utoipa 声明对齐；不再用 Ok(HttpResult::error) 返回 HTTP 200）
     if user_id.trim().is_empty() {
         error!("[DESKTOP_VNC] user_id is required");
-        return Ok(HttpResult::error_with_message(
+        return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            locale,
-            &shared_types::get_i18n_message("error.user_id_required", locale),
+            shared_types::get_i18n_message("error.user_id_required", locale),
         ));
     }
 
     if project_id.trim().is_empty() {
         error!("[DESKTOP_VNC] project_id is required");
-        return Ok(HttpResult::error_with_message(
+        return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            locale,
-            &shared_types::get_i18n_message("error.project_id_required", locale),
+            shared_types::get_i18n_message("error.project_id_required", locale),
         ));
     }
 
@@ -200,10 +204,9 @@ pub async fn computer_desktop_vnc(
         Some(info) => info,
         None => {
             warn!("[DESKTOP_VNC] Container not found: user_id={}", user_id);
-            return Ok(HttpResult::error_with_message(
+            return Err(AppError::with_message(
                 shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
-                locale,
-                &shared_types::get_i18n_message("error.container_not_found", locale),
+                shared_types::get_i18n_message("error.container_not_found", locale),
             ));
         }
     };
@@ -288,6 +291,11 @@ pub struct VncProxyPathParams {
         ("path" = Option<String>, Path, description = "剩余路径，如 vnc.html, websockify 等")
     ),
     responses(
+        (
+            status = 501,
+            description = "未实现：本端点由 Pingora 代理，直接调用 rcoder 返回此占位响应",
+            body = DesktopErrorResponse
+        ),
         (
             status = 200,
             description = "成功访问 VNC 资源",
@@ -428,6 +436,11 @@ pub struct AudioProxyPathParams {
     ),
     responses(
         (
+            status = 501,
+            description = "未实现：本端点由 Pingora 代理，直接调用 rcoder 返回此占位响应",
+            body = DesktopErrorResponse
+        ),
+        (
             status = 200,
             description = "成功访问音频播放器页面",
             body = String,
@@ -566,6 +579,11 @@ pub struct ImeProxyPathParams {
         ("path" = Option<String>, Path, description = "剩余路径")
     ),
     responses(
+        (
+            status = 501,
+            description = "未实现：本端点由 Pingora 代理，直接调用 rcoder 返回此占位响应",
+            body = DesktopErrorResponse
+        ),
         (
             status = 101,
             description = "WebSocket 升级响应（IME 连接）",
@@ -741,6 +759,11 @@ pub struct TtydProxyPathParams {
         ("path" = Option<String>, Path, description = "剩余路径（ws 表示 WebSocket 端点）")
     ),
     responses(
+        (
+            status = 501,
+            description = "未实现：本端点由 Pingora 代理，直接调用 rcoder 返回此占位响应",
+            body = DesktopErrorResponse
+        ),
         (
             status = 200,
             description = "ttyd Web UI 页面（HTTP）",

@@ -279,17 +279,15 @@ pub async fn pod_keepalive(
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[POD_KEEPALIVE] user_id is required");
-        return Ok(HttpResult::error_with_message(
+        return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            locale,
             "user_id is required and cannot be empty",
         ));
     }
     if request.project_id.trim().is_empty() {
         error!("[POD_KEEPALIVE] project_id is required");
-        return Ok(HttpResult::error_with_message(
+        return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            locale,
             "project_id is required and cannot be empty",
         ));
     }
@@ -299,10 +297,9 @@ pub async fn pod_keepalive(
         Ok(st) => st,
         Err(e) => {
             error!("[POD_KEEPALIVE] invalid service_type: {}", e);
-            return Ok(HttpResult::error_with_message(
+            return Err(AppError::with_message(
                 shared_types::error_codes::ERR_VALIDATION,
-                locale,
-                &e,
+                e.to_string(),
             ));
         }
     };
@@ -316,9 +313,8 @@ pub async fn pod_keepalive(
             error!(
                 "[POD_KEEPALIVE] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
             );
-            return Ok(HttpResult::error_with_message(
+            return Err(AppError::with_message(
                 shared_types::error_codes::ERR_VALIDATION,
-                locale,
                 "isolation_type, tenant_id, space_id are all required when pod_id is provided",
             ));
         }
@@ -510,9 +506,8 @@ pub async fn pod_status(
     // 1. 验证参数：至少需要 pod_id、user_id 或 project_id 之一
     if params.pod_id.is_none() && params.user_id.is_none() && params.project_id.is_none() {
         error!("[POD_STATUS] pod_id, user_id and project_id are all empty");
-        return Ok(HttpResult::error_with_message(
+        return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            locale,
             "at least one of pod_id, user_id or project_id is required",
         ));
     }
@@ -522,10 +517,9 @@ pub async fn pod_status(
         Ok(st) => st,
         Err(e) => {
             error!("[POD_STATUS] invalid service_type: {}", e);
-            return Ok(HttpResult::error_with_message(
+            return Err(AppError::with_message(
                 shared_types::error_codes::ERR_VALIDATION,
-                locale,
-                &e,
+                e.to_string(),
             ));
         }
     };
@@ -539,9 +533,8 @@ pub async fn pod_status(
             error!(
                 "[POD_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
             );
-            return Ok(HttpResult::error_with_message(
+            return Err(AppError::with_message(
                 shared_types::error_codes::ERR_VALIDATION,
-                locale,
                 "isolation_type, tenant_id, space_id are all required when pod_id is provided",
             ));
         }
@@ -733,10 +726,9 @@ pub async fn pod_vnc_status(
         Ok(st) => st,
         Err(e) => {
             error!("[POD_VNC_STATUS] invalid service_type: {}", e);
-            return Ok(HttpResult::error_with_message(
+            return Err(AppError::with_message(
                 shared_types::error_codes::ERR_VALIDATION,
-                locale,
-                &e,
+                e.to_string(),
             ));
         }
     };
@@ -750,18 +742,16 @@ pub async fn pod_vnc_status(
         error!(
             "[POD_VNC_STATUS] Validation failed: isolation_type, tenant_id, space_id are required when pod_id is provided"
         );
-        return Ok(HttpResult::error_with_message(
+        return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            locale,
             "isolation_type, tenant_id, space_id are all required when pod_id is provided",
         ));
     }
 
     if pod_id.is_none() && user_id.is_none() && project_id.is_none() {
         warn!("[POD_VNC_STATUS] pod_id, user_id and project_id are all empty");
-        return Ok(HttpResult::error_with_message(
+        return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
-            locale,
             "at least one of pod_id, user_id or project_id is required",
         ));
     }
