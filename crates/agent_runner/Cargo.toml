@@ -49,6 +49,7 @@ agent_config = { workspace = true }
 agent_abstraction = { workspace = true }
 agent_provisioning = { workspace = true }
 download_utils = { workspace = true }
+file-server = { workspace = true }
 rcoder-proxy = { workspace = true, optional = true }
 rcoder-telemetry = { workspace = true }
 

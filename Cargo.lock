@@ -157,6 +157,7 @@ dependencies = [
  "dashmap",
  "derive_builder",
  "download_utils",
+ "file-server",
  "flate2",
  "futures 0.3.32",
  "futures-util",

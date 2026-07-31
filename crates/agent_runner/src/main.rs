@@ -37,6 +37,7 @@ mod utils;
 mod http_server;
 
 // ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
+mod file_server_embed;
 mod ws_terminal;
 
 pub use model::*;
@@ -101,6 +102,9 @@ async fn main() -> anyhow::Result<()> {
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let _telemetry = Arc::new(telemetry);
+
+    // 初始化 FeatureFlags（进程级单例：读 RCODER_EMBED_FILE_SERVER 等环境开关）
+    shared_types::FeatureFlags::init();
 
     // 打印 tokio runtime worker 数, 排查"cpu limit 是否导致 worker=1 阻塞"。
     // tokio multi_thread 默认 worker = 物理核数 (num_cpus), 不受 cgroup CFS quota 影响;
@@ -303,6 +307,12 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             ws_terminal::start_ws_terminal().await;
         });
+
+        // 🔥 1.6. 可选：启动嵌入式 file-server (RCODER_EMBED_FILE_SERVER=true)
+        //         让 workspace build 在 agent-runner 全量工具链下执行 (UserApp)
+        if shared_types::FeatureFlags::get().embed_file_server {
+            file_server_embed::spawn_embedded_file_server().await;
+        }
 
         // 🔥 2. 创建 HttpServerConfig（包含所有配置）
         let http_config = HttpServerConfig {
