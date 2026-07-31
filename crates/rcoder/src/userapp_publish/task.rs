@@ -5,8 +5,8 @@
 //! agent-runner 的 build 进度经 [`client`] 透传给前端(rcoder SSE),叠加 rcoder 发布阶段(Stage)。
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::Utc;
 use serde::Serialize;
@@ -44,21 +44,13 @@ pub enum PublishTaskStatus {
 #[serde(rename_all = "camelCase", tag = "event")]
 pub enum PublishEvent {
     /// 进入新发布阶段(publish: EnsureApp/Prepare/Activate/WaitReady/Confirm)。
-    Stage {
-        stage: String,
-    },
+    Stage { stage: String },
     /// 透传 agent-runner build 进度(Building/BuildOk/BuildFail,data=原始 JSON)。
-    BuildProgress {
-        data: Value,
-    },
+    BuildProgress { data: Value },
     /// 任务完成(build 产 release_id;publish 发布 Active)。
-    Completed {
-        release_id: String,
-    },
+    Completed { release_id: String },
     /// 任务失败。
-    Failed {
-        error: String,
-    },
+    Failed { error: String },
     /// 任务被取消。
     Cancelled,
 }
@@ -147,9 +139,7 @@ impl PublishTask {
     pub async fn is_terminal(&self) -> bool {
         matches!(
             self.inner.lock().await.status,
-            PublishTaskStatus::Completed
-                | PublishTaskStatus::Failed
-                | PublishTaskStatus::Cancelled
+            PublishTaskStatus::Completed | PublishTaskStatus::Failed | PublishTaskStatus::Cancelled
         )
     }
 
@@ -199,10 +189,7 @@ impl PublishTask {
     pub async fn subscribe(
         &self,
         from_seq: u64,
-    ) -> (
-        Vec<(u64, PublishEvent)>,
-        broadcast::Receiver<PublishEvent>,
-    ) {
+    ) -> (Vec<(u64, PublishEvent)>, broadcast::Receiver<PublishEvent>) {
         let replay = self
             .history
             .lock()
@@ -243,10 +230,7 @@ impl PublishTaskStore {
         kind: PublishTaskKind,
     ) -> Arc<PublishTask> {
         let task = PublishTask::new(app_id, project_id, kind);
-        self.map
-            .lock()
-            .await
-            .insert(task.id.clone(), task.clone());
+        self.map.lock().await.insert(task.id.clone(), task.clone());
         task
     }
 

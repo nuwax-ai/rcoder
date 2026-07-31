@@ -215,10 +215,7 @@ impl K8sPvcOps for KubernetesRuntime {
                                     ..Default::default()
                                 };
                                 if let Err(e) = self.pvcs().delete(&pvc_name, &dp).await {
-                                    warn!(
-                                        "[K8S] force delete PVC {} failed: {}",
-                                        pvc_name, e
-                                    );
+                                    warn!("[K8S] force delete PVC {} failed: {}", pvc_name, e);
                                 }
                                 // Wait a bit more for the API to reflect the deletion
                                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;

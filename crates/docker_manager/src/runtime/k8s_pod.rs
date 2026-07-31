@@ -321,7 +321,8 @@ impl K8sPodOps for KubernetesRuntime {
                 // force-delete 成功后仍需等待 Pod 真正消失（404）
                 // 因为 force-delete 只是发起请求，kubelet 还需要时间清理
                 let cleanup_start = std::time::Instant::now();
-                let cleanup_timeout = std::time::Duration::from_secs(FORCE_DELETE_CLEANUP_TIMEOUT_SECS);
+                let cleanup_timeout =
+                    std::time::Duration::from_secs(FORCE_DELETE_CLEANUP_TIMEOUT_SECS);
                 while cleanup_start.elapsed() < cleanup_timeout {
                     match self.pods().get(pod_name).await {
                         Ok(_) => {

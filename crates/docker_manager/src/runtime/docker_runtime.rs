@@ -470,7 +470,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         {
             tracing::debug!(
                 "[DOCKER] Best-effort remove old container {} failed (may not exist): {}",
-                name, e
+                name,
+                e
             );
         }
         // 用新 params 重建（复用 create_deployment 全套逻辑：mount/env/labels/ports/start）
@@ -518,7 +519,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         {
             tracing::debug!(
                 "[DOCKER] Best-effort stop container {} before restart failed: {}",
-                name, e
+                name,
+                e
             );
         }
         client
@@ -545,7 +547,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         {
             tracing::debug!(
                 "[DOCKER] Best-effort delete container {} failed (may not exist): {}",
-                name, e
+                name,
+                e
             );
         }
         Ok(())

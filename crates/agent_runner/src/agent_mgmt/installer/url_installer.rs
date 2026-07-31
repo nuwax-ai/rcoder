@@ -247,10 +247,7 @@ async fn do_install_with_version_check(
 
     // 1. 版本检查：检查特定版本是否已安装（精确匹配）
     // 使用单次 lookup 避免 contains + get 之间的 TOCTOU 竞争
-    if let Some(manifest) = params
-        .registry
-        .get_version(params.agent_id, params.version)
-    {
+    if let Some(manifest) = params.registry.get_version(params.agent_id, params.version) {
         let mut resp = make_skip_response(&manifest);
         resp.previous_version = params.version.to_string();
         return Ok(resp);

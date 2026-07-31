@@ -300,7 +300,10 @@ impl AgentDownloadManager {
 
         // 确保父目录存在（target 经 join 构造、实际总有 parent；ok_or_else 满足禁 unwrap 规则）
         let target_parent = target.parent().ok_or_else(|| {
-            AgentDownloadError::InvalidManifest(format!("target path has no parent: {}", target.display()))
+            AgentDownloadError::InvalidManifest(format!(
+                "target path has no parent: {}",
+                target.display()
+            ))
         })?;
         tokio::fs::create_dir_all(target_parent).await?;
 

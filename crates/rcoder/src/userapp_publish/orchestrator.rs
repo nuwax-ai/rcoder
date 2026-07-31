@@ -10,9 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 use app_manager::models::commons::{AppStatus, ExposeType, HealthCheckType};
-use app_manager::models::{
-    CreateAppRequest, HealthCheckConfig, PortConfig, PrepareReleaseRequest,
-};
+use app_manager::models::{CreateAppRequest, HealthCheckConfig, PortConfig, PrepareReleaseRequest};
 use shared_types::build_backend_addr;
 
 use crate::router::AppState;
@@ -39,7 +37,12 @@ enum BuildOutcome {
 }
 
 /// 独立 build 入口(spawn 调):触发 agent-runner build + 透传进度,终态 emit。
-pub async fn run_build(task: Arc<PublishTask>, state: Arc<AppState>, project_id: String, app_id: String) {
+pub async fn run_build(
+    task: Arc<PublishTask>,
+    state: Arc<AppState>,
+    project_id: String,
+    app_id: String,
+) {
     let result = run_build_inner(&task, &state, &project_id, &app_id).await;
     if let Err(e) = result
         && !task.is_terminal().await
@@ -273,13 +276,15 @@ async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Resu
             _ => {}
         }
     }
-    Err(anyhow!("agent-runner build stream ended without terminal event"))
+    Err(anyhow!(
+        "agent-runner build stream ended without terminal event"
+    ))
 }
 
 /// 确保 app 计算单元存在:不存在则 create_app(幂等;image/ports 首次设定后恒定)。
 async fn ensure_app(state: &AppState, rcoder_app_id: &str, name: &str, image: &str) -> Result<()> {
     match state.app_service.get_app(rcoder_app_id).await {
-        Ok(_) => return Ok(()), // 已存在
+        Ok(_) => return Ok(()),          // 已存在
         Err(e) if is_not_found(&e) => {} // 不存在 → create
         Err(e) => return Err(anyhow!("get_app: {e}")),
     }

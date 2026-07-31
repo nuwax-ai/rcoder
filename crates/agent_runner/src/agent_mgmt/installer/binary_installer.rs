@@ -313,9 +313,11 @@ pub async fn install_from_bytes(
     let staging_ext = match file_type.as_str() {
         "tar.gz" => "tar.gz",
         "zip" => "zip",
-        other => return Err(AgentMgmtError::InstallFailed(format!(
-            "unsupported file_type: {other}"
-        ))),
+        other => {
+            return Err(AgentMgmtError::InstallFailed(format!(
+                "unsupported file_type: {other}"
+            )));
+        }
     };
     let staging = version_dir.join(format!("staging.{staging_ext}"));
     tokio::fs::write(&staging, &bytes).await?;
@@ -429,9 +431,11 @@ pub async fn install_from_file(
     let staging_ext = match file_type.as_str() {
         "tar.gz" => "tar.gz",
         "zip" => "zip",
-        other => return Err(AgentMgmtError::InstallFailed(format!(
-            "unsupported file_type: {other}"
-        ))),
+        other => {
+            return Err(AgentMgmtError::InstallFailed(format!(
+                "unsupported file_type: {other}"
+            )));
+        }
     };
     let staging = version_dir.join(format!("staging.{staging_ext}"));
     // rename（同文件系统零拷贝）或 copy（跨文件系统降级）
@@ -526,7 +530,7 @@ async fn _install_from_staging(
             _ => {
                 return Err(AgentMgmtError::InstallFailed(
                     "unsupported file_type".to_string(),
-                ))
+                ));
             }
         };
         debug!(

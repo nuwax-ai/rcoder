@@ -186,9 +186,16 @@ impl AppService {
             return Err(map_io_error("activate staged release", error, true));
         }
         if app_exists && let Err(error) = self.start_app(app_id).await {
-            warn!("[app_manager] Failed to restart app {} after activation: {}, attempting rollback", app_id, error);
+            warn!(
+                "[app_manager] Failed to restart app {} after activation: {}, attempting rollback",
+                app_id, error
+            );
             if let Err(cleanup_err) = remove_dir_if_exists(&code).await {
-                warn!("[app_manager] Failed to cleanup code dir {} during rollback: {}", code.display(), cleanup_err);
+                warn!(
+                    "[app_manager] Failed to cleanup code dir {} during rollback: {}",
+                    code.display(),
+                    cleanup_err
+                );
             }
             if rollback.exists() {
                 tokio::fs::rename(&rollback, &code)
@@ -204,7 +211,11 @@ impl AppService {
             index.releases[release_position].status = ReleaseStatus::Failed;
             index.releases[release_position].failure_message = Some(error.to_string());
             if let Err(e) = tokio::fs::remove_file(&package).await {
-                debug!("[app_manager] Failed to cleanup package {}: {}", package.display(), e);
+                debug!(
+                    "[app_manager] Failed to cleanup package {}: {}",
+                    package.display(),
+                    e
+                );
             }
             write_index(&releases_dir, &index).await?;
             return Err(error);

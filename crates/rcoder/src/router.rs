@@ -463,8 +463,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .with_state(app_manager_state);
 
     // UserApp 自动化构建发布(rcoder 侧编排):publish/build + task 查询/SSE/cancel
-    let userapp_publish_routes = crate::userapp_publish::handler::routes()
-        .with_state(state.clone());
+    let userapp_publish_routes =
+        crate::userapp_publish::handler::routes().with_state(state.clone());
 
     let mut router = Router::new()
         .merge(health_routes)

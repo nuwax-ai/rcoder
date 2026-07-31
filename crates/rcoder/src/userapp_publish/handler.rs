@@ -19,8 +19,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR;
 
-use crate::router::AppState;
 use crate::AppError;
+use crate::router::AppState;
 
 use super::orchestrator;
 use super::task::{PublishEvent, PublishTaskKind};
@@ -66,11 +66,17 @@ pub async fn publish(
     Json(body): Json<PublishBody>,
 ) -> Result<Json<Value>, AppError> {
     if body.project_id.trim().is_empty() {
-        return Err(err("projectId is required (agent-runner hosting the UserApp workspace)"));
+        return Err(err(
+            "projectId is required (agent-runner hosting the UserApp workspace)",
+        ));
     }
     let task = state
         .publish_tasks
-        .create(app_id.clone(), body.project_id.clone(), PublishTaskKind::Publish)
+        .create(
+            app_id.clone(),
+            body.project_id.clone(),
+            PublishTaskKind::Publish,
+        )
         .await;
     let task_id = task.id.clone();
     let project_id = body.project_id.clone();
@@ -91,11 +97,17 @@ pub async fn build(
     Json(body): Json<PublishBody>,
 ) -> Result<Json<Value>, AppError> {
     if body.project_id.trim().is_empty() {
-        return Err(err("projectId is required (agent-runner hosting the UserApp workspace)"));
+        return Err(err(
+            "projectId is required (agent-runner hosting the UserApp workspace)",
+        ));
     }
     let task = state
         .publish_tasks
-        .create(app_id.clone(), body.project_id.clone(), PublishTaskKind::Build)
+        .create(
+            app_id.clone(),
+            body.project_id.clone(),
+            PublishTaskKind::Build,
+        )
         .await;
     let task_id = task.id.clone();
     let project_id = body.project_id.clone();

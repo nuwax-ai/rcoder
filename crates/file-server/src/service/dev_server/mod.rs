@@ -31,9 +31,14 @@ use support::{early_exit_err, ldrtemp, lock, read_dev_script};
 
 /// 探活回调：(port, base_path, timeout_ms) → boxed future<bool>。
 /// 抽成类型别名既绕开 clippy::type_complexity，也方便测试注入 stub（绕开 reqwest 延迟）。
-type AliveProbe<'a> = &'a (dyn for<'s> Fn(u16, Option<&'s str>, u64)
-    -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + 's>>
-    + Sync);
+type AliveProbe<'a> = &'a (
+        dyn for<'s> Fn(
+    u16,
+    Option<&'s str>,
+    u64,
+) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + 's>>
+            + Sync
+    );
 
 /// 运行中的 dev server 记录 (内存状态)。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -622,13 +627,9 @@ mod tests {
         let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let start = std::time::Instant::now();
         let res = mgr
-            .poll_alive(
-                pid,
-                0,
-                None,
-                &ring,
-                &|_port, _base, _timeout| Box::pin(async { true }),
-            )
+            .poll_alive(pid, 0, None, &ring, &|_port, _base, _timeout| {
+                Box::pin(async { true })
+            })
             .await;
         let elapsed = start.elapsed();
         assert!(res.is_ok(), "ready 时 poll_alive 应成功");

@@ -302,14 +302,8 @@ mod tests {
 
     #[test]
     fn compare_ordering() {
-        assert_eq!(
-            compare_versions("1.0.0", "1.0.0").unwrap(),
-            Ordering::Equal
-        );
-        assert_eq!(
-            compare_versions("1.0.0", "1.0.1").unwrap(),
-            Ordering::Less
-        );
+        assert_eq!(compare_versions("1.0.0", "1.0.0").unwrap(), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.0", "1.0.1").unwrap(), Ordering::Less);
         assert_eq!(
             compare_versions("1.0.1", "1.0.0").unwrap(),
             Ordering::Greater
