@@ -1,7 +1,7 @@
 [package]
 name = "file-server"
 # 独立版本号：支持 file-server 单独打 tag (file-server-v*) 经 CI 发 npm/OSS，与 rcoder 主版本解耦。
-version = "0.0.1-beta.1"
+version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
