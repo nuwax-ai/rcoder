@@ -25,6 +25,7 @@ use super::kubernetes_runtime::KubernetesRuntime;
 
 // Pod 生命周期超时常量
 #[cfg(feature = "kubernetes")]
+#[allow(dead_code)] // wait_for_pod_ready 当前用 config.pod_ttl_seconds 兜底；保留作 ready 超时语义占位
 const POD_READY_TIMEOUT_SECS: u64 = 300;
 #[cfg(feature = "kubernetes")]
 const POD_TERMINATION_TIMEOUT_SECS: u64 = 30;

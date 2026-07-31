@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
 use pyroscope::pyroscope::PyroscopeAgentBuilder;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Profiler 配置
 #[derive(Debug, Clone)]
