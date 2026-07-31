@@ -13,7 +13,7 @@ use container_runtime_api::{
 use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::api::{Api, DeleteParams, ListParams};
 use shared_types::ServiceType;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::k8s_pod::K8sPodOps;
 use super::k8s_service::K8sServiceOps;
