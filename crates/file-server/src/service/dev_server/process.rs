@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::Local;
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
+#[cfg(unix)]
 use nix::unistd::{Pid, getpgid};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
@@ -237,8 +239,10 @@ where
     }
 }
 
+// ── unix: 进程组信号 (kill -pgid) ──────────────────────────────────────────
 /// 杀进程组 (对齐 nuwax killProcess): 优先 kill(-pid) SIGTERM, 降级 kill(pid)。
 /// 返回是否成功送出信号。
+#[cfg(unix)]
 pub fn kill_process_group(pid: u32) -> bool {
     let Some(process_pid) = system_pid(pid) else {
         return false;
@@ -251,6 +255,7 @@ pub fn kill_process_group(pid: u32) -> bool {
 }
 
 /// 强杀进程组 (SIGKILL 升级): SIGTERM 宽限期后进程仍存活时调用, 优先 kill(-pid) SIGKILL, 降级 kill(pid)。
+#[cfg(unix)]
 pub fn kill_process_group_force(pid: u32) -> bool {
     let Some(process_pid) = system_pid(pid) else {
         return false;
@@ -263,6 +268,7 @@ pub fn kill_process_group_force(pid: u32) -> bool {
 }
 
 /// 读取进程组 ID，用于 stop 去重：同一 Vite/pnpm 进程树只需 kill 一次。
+#[cfg(unix)]
 pub fn process_group_id(pid: u32) -> Option<u32> {
     getpgid(Some(system_pid(pid)?))
         .ok()
@@ -270,6 +276,7 @@ pub fn process_group_id(pid: u32) -> Option<u32> {
 }
 
 /// 进程是否仍在运行 (kill pid 0 探活; 对齐 nuwax isProcessRunning)。
+#[cfg(unix)]
 pub fn is_process_running(pid: u32) -> bool {
     let Some(process_pid) = system_pid(pid) else {
         return false;
@@ -284,11 +291,50 @@ pub fn is_process_running(pid: u32) -> bool {
 
 /// 将 Tokio 返回的无符号 PID 安全转换为 Unix `pid_t`。
 /// PID 0 代表当前进程组，不允许作为外部子进程 PID 使用。
+#[cfg(unix)]
 fn system_pid(pid: u32) -> Option<Pid> {
     i32::try_from(pid)
         .ok()
         .filter(|pid| *pid > 0)
         .map(Pid::from_raw)
+}
+
+// ── windows: 无进程组概念，用 taskkill /T 递归杀进程树 ──────────────────────
+// SIGTERM 在 Windows 无直接对应；force=false 走 taskkill /T（尽量优雅），
+// force=true 加 /F 强杀整树。
+#[cfg(windows)]
+pub fn kill_process_group(pid: u32) -> bool {
+    kill_tree_windows(pid, false)
+}
+#[cfg(windows)]
+pub fn kill_process_group_force(pid: u32) -> bool {
+    kill_tree_windows(pid, true)
+}
+#[cfg(windows)]
+fn kill_tree_windows(pid: u32, force: bool) -> bool {
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.arg("/PID").arg(pid.to_string()).arg("/T");
+    if force {
+        cmd.arg("/F");
+    }
+    cmd.output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+/// Windows 无进程组；返回 pid 本身用于 stop 去重（同 pid 只 kill 一次）。
+#[cfg(windows)]
+pub fn process_group_id(pid: u32) -> Option<u32> {
+    Some(pid)
+}
+/// tasklist 探活：CSV 输出首列含 "{pid}", 即在运行。
+#[cfg(windows)]
+pub fn is_process_running(pid: u32) -> bool {
+    let needle = format!("\"{pid}\",");
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle.as_str()))
+        .unwrap_or(false)
 }
 
 /// 轮询等待进程退出 (对齐 nuwax waitForProcessStop)。
@@ -397,8 +443,11 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_project_path_segment, system_pid};
+    use super::contains_project_path_segment;
+    #[cfg(unix)]
+    use super::system_pid;
 
+    #[cfg(unix)]
     #[test]
     fn system_pid_rejects_values_outside_positive_pid_t_range() {
         assert!(system_pid(0).is_none());

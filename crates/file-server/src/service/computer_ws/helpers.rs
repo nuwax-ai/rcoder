@@ -46,11 +46,17 @@ pub async fn remove_top_level_dir(dir: &Path, extra_excludes: &[&str]) -> AppRes
     Ok(())
 }
 
+/// 跨设备 rename 的 errno：unix EXDEV(18)，Windows ERROR_NOT_SAME_DEVICE(17)。
+#[cfg(unix)]
+const CROSS_DEVICE_ERRNO: i32 = nix::libc::EXDEV;
+#[cfg(not(unix))]
+const CROSS_DEVICE_ERRNO: i32 = 17;
+
 /// 移动目录 (rename; 跨设备 fallback copy + rm, 对齐 nuwax moveDirectory EXDEV 降级)。
 pub(super) async fn move_dir(src: &Path, dst: &Path) -> AppResult<()> {
     match fs::rename(src, dst).await {
         Ok(()) => return Ok(()),
-        Err(error) if error.raw_os_error() == Some(nix::libc::EXDEV) => {}
+        Err(error) if error.raw_os_error() == Some(CROSS_DEVICE_ERRNO) => {}
         Err(error) => {
             return Err(AppError::system(format!(
                 "move {} to {}: {error}",
