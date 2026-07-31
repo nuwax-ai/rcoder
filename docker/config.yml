@@ -188,6 +188,36 @@ docker_config:
             mount_type: "bind"
             resolve_from: "/app/assets"
 
+      # UserAppBuilder 服务配置(路B:UserApp 构建 agent-runner)
+      # 复用 dev-rcoder-agent-runner 镜像(容器隔离但镜像共享),独立 per-app PVC。
+      # 容器名 rcoder-app-builder-{app_id},PVC 复用运行时 rcoder-app-{app_id}-workspace。
+      user-app-builder:
+        service_type: "user-app-builder"
+        image: "dev-rcoder-agent-runner:latest"
+        arm64_image: "dev-rcoder-agent-runner:latest"
+        amd64_image: "dev-rcoder-agent-runner:latest"
+        default_image: "dev-rcoder-agent-runner:latest"
+        image_tag_prefix: "rcoder-app-builder"
+        enabled: true
+        workspace_resolution_path: "/app/userapp-workspace"
+        environment:
+          RUST_LOG: "debug"
+          PROJECT_WORKSPACE_BASE: "/app/userapp-workspace"
+          # UserAppBuilder 跑内嵌 file-server(build 入口 :60000)
+          RCODER_EMBED_FILE_SERVER: "true"
+          PROJECT_SOURCE_DIR: "/app/userapp-workspace"
+        command:
+          - "/usr/local/bin/agent_runner"
+          - "--port"
+          - "8086"
+        resource_limits:
+          memory_limit: 2147483648 # 2GB
+          cpu_limit: 2.0
+          swap_limit: 4294963648 # 4GB
+        work_dir: "/app"
+        network_mode: "bridge"
+        mounts: []
+
     # 镜像选择策略
     selection_strategy: "ServiceOnly"
 

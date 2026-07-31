@@ -191,6 +191,9 @@ docker_config:
         environment:
           RUST_LOG: "debug"
           PROJECT_WORKSPACE_BASE: "/app/userapp-workspace"
+          # UserAppBuilder 跑内嵌 file-server(build 入口 :60000)
+          RCODER_EMBED_FILE_SERVER: "true"
+          PROJECT_SOURCE_DIR: "/app/userapp-workspace"
         command:
           - "/usr/local/bin/agent_runner"
           - "--port"
