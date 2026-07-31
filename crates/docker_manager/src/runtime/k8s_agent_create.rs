@@ -276,12 +276,32 @@ impl KubernetesRuntime {
                                 .unwrap_or_else(|| vec!["/app/bin/agent_runner".to_string()]);
                             Some(cmd)
                         }
-                        // ComputerAgentRunner / UserApp / UserAppBuilder 用镜像自带 ENTRYPOINT/CMD
+                        // ComputerAgentRunner / UserApp 用镜像自带 ENTRYPOINT/CMD
                         // (UserApp 实际走 create_deployment,不经此路径;
-                        //  UserAppBuilder 复用 dev-rcoder-agent-runner 镜像,走其 start-up.sh 启动 agent_runner + 内嵌 file-server)
-                        ServiceType::ComputerAgentRunner
-                        | ServiceType::UserApp
-                        | ServiceType::UserAppBuilder => None,
+                        //  ComputerAgentRunner 走 start-up.sh 启 ttyd/VNC + agent_runner)
+                        ServiceType::ComputerAgentRunner | ServiceType::UserApp => None,
+                        // UserAppBuilder 是 lean build agent(无桌面):显式跑 agent_runner
+                        // (读 kubernetes_config.user-app-builder.command),不经 start-up.sh/ttyd/VNC。
+                        // agent_runner 读 RCODER_EMBED_FILE_SERVER=true 内嵌 file-server(build 入口 :60000)。
+                        // 裸跑 fallback 用 agent-runner 镜像路径 /usr/local/bin/agent_runner(非 rcoder 主镜像的 /app/bin)。
+                        ServiceType::UserAppBuilder => {
+                            let cmd = k8s_service
+                                .and_then(|sc| {
+                                    if sc.command.is_empty() {
+                                        None
+                                    } else {
+                                        Some(sc.command.clone())
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    vec![
+                                        "/usr/local/bin/agent_runner".to_string(),
+                                        "--port".to_string(),
+                                        "8086".to_string(),
+                                    ]
+                                });
+                            Some(cmd)
+                        }
                     },
                     env: {
                         let mut env_vars = vec![

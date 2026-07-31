@@ -251,6 +251,22 @@ impl KubernetesRuntime {
                     return env_image;
                 }
             }
+            // UserAppBuilder 复用 agent-runner 镜像(含 file-server embed + build 工具链),与
+            // ComputerAgentRunner 同源。只读 RCODER_DOCKER_IMAGE_COMPUTER(= agent-runner 镜像),
+            // 绝不能读 RCODER_DOCKER_IMAGE(= rcoder 主镜像)——后者默认 CMD 是 node REPL,不是 agent_runner,
+            // 会导致 builder pod 落入 node 交互式 shell 而非跑 agent_runner + 内嵌 file-server。
+            ServiceType::UserAppBuilder => {
+                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER")
+                    && !env_image.is_empty()
+                {
+                    info!(
+                        "[K8S] UserAppBuilder using agent-runner image from RCODER_DOCKER_IMAGE_COMPUTER env: {}",
+                        env_image
+                    );
+                    return env_image;
+                }
+                // COMPUTER env 未设 → 落到 step 2 读 kubernetes_config.user-app-builder.image
+            }
             _ => {
                 if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE")
                     && !env_image.is_empty()
