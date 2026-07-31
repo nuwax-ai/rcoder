@@ -148,6 +148,10 @@ impl PlatformKey {
     }
 
     /// 从当前运行环境构造
+    ///
+    /// `std::env::consts::OS/ARCH` 是编译期常量，对受支持的 6 个平台组合
+    /// (linux/darwin/windows × x86_64/aarch64) `new()` 恒成功；此处 `.expect`
+    /// 保留是因为它对受支持目标在运行时不可能失败，且无合理的兜底平台可回退。
     pub fn current() -> Self {
         Self::new(std::env::consts::OS, std::env::consts::ARCH)
             .expect("current platform should always be valid")

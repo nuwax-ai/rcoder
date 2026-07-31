@@ -203,12 +203,15 @@ impl ServiceResourceLimits {
 
     /// 验证资源限制的合理性
     pub fn validate(&self) -> Result<(), String> {
-        // 内存限制：512MB ~ 64GB
+        // 内存限制（bytes）。阈值用十进制 MB/GB（与 Docker/K8s quantity 习惯一致，
+        // 非 MiB/GiB；512×10⁶ 而非 512×2²⁰）：512MB ~ 64GB
+        const MIN_MEMORY_BYTES: f64 = 512_000_000.0;
+        const MAX_MEMORY_BYTES: f64 = 64_000_000_000.0;
         if let Some(memory) = self.memory {
-            if memory < 512_000_000.0 {
+            if memory < MIN_MEMORY_BYTES {
                 return Err("memory_limit must be at least 512MB".to_string());
             }
-            if memory > 64_000_000_000.0 {
+            if memory > MAX_MEMORY_BYTES {
                 return Err("memory_limit cannot exceed 64GB".to_string());
             }
         }

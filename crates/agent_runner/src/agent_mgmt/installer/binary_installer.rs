@@ -313,7 +313,9 @@ pub async fn install_from_bytes(
     let staging_ext = match file_type.as_str() {
         "tar.gz" => "tar.gz",
         "zip" => "zip",
-        other => unreachable!("file_type already validated, got: {other}"),
+        other => return Err(AgentMgmtError::InstallFailed(format!(
+            "unsupported file_type: {other}"
+        ))),
     };
     let staging = version_dir.join(format!("staging.{staging_ext}"));
     tokio::fs::write(&staging, &bytes).await?;
@@ -427,7 +429,9 @@ pub async fn install_from_file(
     let staging_ext = match file_type.as_str() {
         "tar.gz" => "tar.gz",
         "zip" => "zip",
-        other => unreachable!("file_type already validated, got: {other}"),
+        other => return Err(AgentMgmtError::InstallFailed(format!(
+            "unsupported file_type: {other}"
+        ))),
     };
     let staging = version_dir.join(format!("staging.{staging_ext}"));
     // rename（同文件系统零拷贝）或 copy（跨文件系统降级）
@@ -519,7 +523,11 @@ async fn _install_from_staging(
         let count = match file_type_clone.as_str() {
             "tar.gz" => archive_installer::extract_tar_gz(&staging_clone, &agent_dir_clone)?,
             "zip" => archive_installer::extract_zip(&staging_clone, &agent_dir_clone)?,
-            _ => unreachable!(),
+            _ => {
+                return Err(AgentMgmtError::InstallFailed(
+                    "unsupported file_type".to_string(),
+                ))
+            }
         };
         debug!(
             "[agent_mgmt] extraction done: {} files, took {:?}",
@@ -619,7 +627,7 @@ async fn _install_from_staging(
         status: shared_types_grpc::AgentInstallStatus::Available as i32,
         binary_path: binary_path_str,
         file_type,
-        file_count: Some(file_count as i32),
+        file_count: Some(file_count.try_into().unwrap_or(i32::MAX)),
         file_size: file_size as i64,
         version: param_version.map(String::from),
         source_url: param_source.map(String::from),

@@ -268,17 +268,11 @@ pub(super) fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
     let datetime =
         DateTime::from_timestamp_millis(timestamp_millis as i64).unwrap_or(DateTime::UNIX_EPOCH);
 
-    // 创建东八区时区偏移 (UTC+8)
-    // 注意: east_opt 在参数有效时总是返回 Some，这里使用 unwrap_or 仅作为安全保障
-    let utc8_offset = FixedOffset::east_opt(8 * 3600).unwrap_or_else(|| {
-        tracing::warn!("created UTC+8 timezone failed, fallback to UTC+0");
-        // east_opt(0) 始终返回 Some(0)，因为 0 是有效参数
-        // 使用 unwrap_or_else 避免嵌套 unwrap，仅作为防御性编程
-        FixedOffset::east_opt(0).unwrap_or_else(|| {
-            // 这个分支永远不会执行，因为 east_opt(0) 不会失败
-            unreachable!("FixedOffset::east_opt(0) is guaranteed to return Some")
-        })
-    });
+    // 创建东八区时区偏移 (UTC+8)。chrono 弃用了不返回 Option 的 east()、改推 east_opt()，
+    // 但 8*3600=28800 在 ±86400 内恒有效，east_opt 必返回 Some；这里用 east() 避免
+    // unwrap_or_else(unreachable!)/expect 的 panic 路径，对该 let 放行 deprecation。
+    #[allow(deprecated)]
+    let utc8_offset = FixedOffset::east(8 * 3600);
 
     // 转换为东八区时间并格式化
     datetime

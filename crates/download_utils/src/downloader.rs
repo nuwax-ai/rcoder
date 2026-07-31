@@ -107,7 +107,7 @@ impl Downloader {
                         );
                         last_err = Some(err);
                         let backoff = Duration::from_secs(
-                            self.config.retry_backoff_base_secs * 2u64.pow(attempt as u32 - 1),
+                            self.config.retry_backoff_base_secs * 2u64.pow((attempt as u32 - 1).min(30)),
                         );
                         tokio::time::sleep(backoff).await;
                         continue;
@@ -124,7 +124,7 @@ impl Downloader {
                         warn!("[download] attempt {} failed: {}, retrying...", attempt, e);
                         last_err = Some(e);
                         let backoff = Duration::from_secs(
-                            self.config.retry_backoff_base_secs * 2u64.pow(attempt as u32 - 1),
+                            self.config.retry_backoff_base_secs * 2u64.pow((attempt as u32 - 1).min(30)),
                         );
                         tokio::time::sleep(backoff).await;
                         continue;
@@ -156,7 +156,7 @@ impl Downloader {
                     );
                     last_err = Some(err);
                     let backoff = Duration::from_secs(
-                        self.config.retry_backoff_base_secs * 2u64.pow(attempt as u32 - 1),
+                        self.config.retry_backoff_base_secs * 2u64.pow((attempt as u32 - 1).min(30)),
                     );
                     tokio::time::sleep(backoff).await;
                     continue;
@@ -193,7 +193,7 @@ impl Downloader {
                         warn!("[download] attempt {} failed: {}, retrying...", attempt, e);
                         last_err = Some(e);
                         let backoff = Duration::from_secs(
-                            self.config.retry_backoff_base_secs * 2u64.pow(attempt as u32 - 1),
+                            self.config.retry_backoff_base_secs * 2u64.pow((attempt as u32 - 1).min(30)),
                         );
                         tokio::time::sleep(backoff).await;
                         continue;

@@ -298,8 +298,11 @@ impl AgentDownloadManager {
             tokio::fs::remove_dir_all(&target).await?;
         }
 
-        // 确保父目录存在
-        tokio::fs::create_dir_all(target.parent().unwrap()).await?;
+        // 确保父目录存在（target 经 join 构造、实际总有 parent；ok_or_else 满足禁 unwrap 规则）
+        let target_parent = target.parent().ok_or_else(|| {
+            AgentDownloadError::InvalidManifest(format!("target path has no parent: {}", target.display()))
+        })?;
+        tokio::fs::create_dir_all(target_parent).await?;
 
         // 查找缓存中的归档文件
         let archive_file = self.find_archive_file(&source).await?;

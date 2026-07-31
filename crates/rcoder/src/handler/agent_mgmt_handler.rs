@@ -572,7 +572,7 @@ pub async fn install_agent(
                         file.write_all(&chunk)
                             .map_err(|e| std::io::Error::other(format!("write: {e}")))?;
                     }
-                    file.flush().ok();
+                    file.flush()?;
                     drop(file);
                     // 读回 bytes,然后 tmp_path drop 时自动清理临时文件
                     let bytes = std::fs::read(&tmp_path)?;

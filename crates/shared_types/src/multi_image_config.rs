@@ -400,6 +400,9 @@ impl ProjectImageOverrides {
     }
 
     /// 生成配置哈希键（用于缓存）
+    ///
+    /// 注意：使用 `DefaultHasher`，其输出**不保证跨 Rust 版本稳定**，故仅限
+    /// 进程内缓存 key 使用，不可作为持久化 key 或跨进程比对依据。
     pub fn hash_key(&self) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
