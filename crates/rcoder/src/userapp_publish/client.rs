@@ -96,7 +96,9 @@ pub fn subscribe_build_progress(addr: &str, task_id: &str) -> mpsc::Receiver<Val
     let (tx, rx) = mpsc::channel(SSE_CHANNEL_CAP);
     let url = format!("{addr}/api/userapp/tasks/{task_id}/logs/stream");
     tokio::spawn(async move {
-        let client = match http_client() {
+        // SSE 长连接:不能用 http_client() 的 30s 总超时(build 可能数分钟到 1800s);
+        // 用无超时 client,靠终态事件 / 连接断 / 接收端 drop 结束。
+        let client = match reqwest::Client::builder().build() {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "build sse client build failed");
