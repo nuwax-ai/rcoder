@@ -8,6 +8,7 @@ pub mod grpc;
 pub mod handler;
 pub mod middleware;
 pub mod router;
+pub mod userapp_publish;
 mod service;
 pub mod storage;
 mod utils;

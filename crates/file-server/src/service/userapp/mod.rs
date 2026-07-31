@@ -260,6 +260,9 @@ pub async fn start_build_task(
                 task_spawn
                     .emit(BuildProgressEvent::Completed {
                         release_id: artifact.release_id.clone(),
+                        sha256: artifact.sha256.clone(),
+                        size_bytes: artifact.size_bytes,
+                        file_name: artifact.file_name.clone(),
                     })
                     .await;
             }

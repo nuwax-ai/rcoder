@@ -116,44 +116,6 @@ pub(crate) async fn build_workspace(
     })))
 }
 
-/// `POST /api/userapp/publish` —— 异步发起发布全流程（git snapshot commit → build →
-/// prepare → activate → 轮询就绪 → confirm Active）。复用 [`BuildUserAppBody`]（app_id + 租户）。
-///
-/// 编排在后台 spawn 执行；rcoder app_manager 地址/镜像/file-server base 由环境变量配置
-/// （缺失 publish task 即 Failed）。进度与 build 共用 task 通道（Stage 事件区分阶段）。
-#[utoipa::path(
-    post,
-    path = "/publish",
-    request_body = BuildUserAppBody,
-    responses(crate::openapi::JsonApiResponses),
-    tag = "UserApp"
-)]
-pub(crate) async fn publish_workspace(
-    State(state): State<AppState>,
-    AppJson(body): AppJson<BuildUserAppBody>,
-) -> Result<Json<Value>, AppError> {
-    let task_id = userapp::publish::start_publish_task(
-        &state.build_tasks,
-        userapp::publish::PublishContext {
-            resolver: state.resolver.clone(),
-            build_manager: state.build_manager.clone(),
-            config: state.config.clone(),
-            app_id: body.app_id.clone(),
-            tenant_id: body.tenant_id.clone(),
-            space_id: body.space_id.clone(),
-            timeout_secs: state.config.dev_command_timeout_secs,
-        },
-    )
-    .await;
-
-    tracing::info!(app_id = %body.app_id, %task_id, "userapp publish task started");
-
-    Ok(Json(json!({
-        "success": true,
-        "taskId": task_id,
-        "status": "pending",
-    })))
-}
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}",

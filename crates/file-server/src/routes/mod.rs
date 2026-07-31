@@ -127,7 +127,6 @@ fn page_router() -> OpenApiRouter<AppState> {
 fn userapp_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(userapp::build_workspace))
-        .routes(routes!(userapp::publish_workspace))
         .routes(routes!(userapp::get_task))
         .routes(routes!(userapp::get_task_logs))
         .routes(routes!(userapp::stream_task_logs))

@@ -97,6 +97,8 @@ pub struct AppState {
     pub app_service: Arc<dyn app_manager::AppServiceTrait>,
     /// K8s 集群域名（用于构建 K8s Service FQDN）
     pub cluster_domain: String,
+    /// UserApp 自动化构建发布任务表(rcoder 侧编排:正向调 agent-runner build + 同进程 app_manager 发布)。
+    pub publish_tasks: Arc<crate::userapp_publish::PublishTaskStore>,
 }
 
 impl AppState {
@@ -153,6 +155,7 @@ impl AppState {
             agent_download_manager,
             app_service,
             cluster_domain,
+            publish_tasks: Arc::new(crate::userapp_publish::PublishTaskStore::new()),
         })
     }
 
@@ -459,6 +462,10 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GiB（upload 压缩包，覆盖全局 50MB）
         .with_state(app_manager_state);
 
+    // UserApp 自动化构建发布(rcoder 侧编排):publish/build + task 查询/SSE/cancel
+    let userapp_publish_routes = crate::userapp_publish::handler::routes()
+        .with_state(state.clone());
+
     let mut router = Router::new()
         .merge(health_routes)
         .merge(api_routes)
@@ -466,7 +473,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .merge(devcomputer_routes)
         .merge(proxy_api_routes)
         .merge(agent_mgmt_routes)
-        .merge(app_manager_routes);
+        .merge(app_manager_routes)
+        .merge(userapp_publish_routes);
 
     // 仅在启用 debug feature 时添加调试路由
     #[cfg(feature = "debug")]

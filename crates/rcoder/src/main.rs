@@ -16,6 +16,7 @@ mod shutdown;
 mod skill_sync_reconciler;
 mod utils;
 mod workspace_migrate;
+mod userapp_publish;
 
 use std::sync::Arc;
 

@@ -24,12 +24,11 @@ const BROADCAST_CAP: usize = 256;
 
 pub type BuildTaskId = String;
 
-/// 任务类型:仅编译 / 全流程发布。
+/// 任务类型:仅编译(发布编排已移 rcoder 侧,agent-runner 只负责 build)。
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildTaskKind {
     Build,
-    Publish,
 }
 
 /// 任务状态(镜像 app_manager ReleaseStatus 语义)。
@@ -54,6 +53,9 @@ pub struct BuildTaskSnapshot {
     pub stage: Option<String>,
     pub current_service: Option<String>,
     pub release_id: Option<String>,
+    pub sha256: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub file_name: Option<String>,
     pub error: Option<String>,
     pub seq: u64,
     pub created_at: i64,
@@ -74,8 +76,13 @@ pub enum BuildProgressEvent {
     BuildFail { service: String, error: String },
     /// 一行日志(实时 tail,可选)
     Log { service: String, line: String },
-    /// 任务完成(build:产出 release_id;publish:发布 Active)
-    Completed { release_id: String },
+    /// 任务完成(build 产 release_id + 包摘要;rcoder publish 经快照读取做 prepare)。
+    Completed {
+        release_id: String,
+        sha256: String,
+        size_bytes: u64,
+        file_name: String,
+    },
     /// 任务失败
     Failed { error: String },
     /// 任务被取消
@@ -89,6 +96,10 @@ struct TaskInner {
     stage: Option<String>,
     current_service: Option<String>,
     release_id: Option<String>,
+    /// build 产物包摘要(完成时填;rcoder publish 经 GET /tasks/{id} 读取做 prepare)。
+    sha256: Option<String>,
+    size_bytes: Option<u64>,
+    file_name: Option<String>,
     error: Option<String>,
     /// workspace 根 (build/publish 工作区): logs/SSE 查询路径解析用。预 resolve 后存入。
     workspace_root: Option<PathBuf>,
@@ -122,6 +133,9 @@ impl BuildTask {
                 stage: None,
                 current_service: None,
                 release_id: None,
+                sha256: None,
+                size_bytes: None,
+                file_name: None,
                 error: None,
                 workspace_root: None,
                 created_at: now,
@@ -146,6 +160,9 @@ impl BuildTask {
             stage: inner.stage.clone(),
             current_service: inner.current_service.clone(),
             release_id: inner.release_id.clone(),
+            sha256: inner.sha256.clone(),
+            size_bytes: inner.size_bytes,
+            file_name: inner.file_name.clone(),
             error: inner.error.clone(),
             seq: self.seq.load(Ordering::Relaxed),
             created_at: inner.created_at,
@@ -207,8 +224,16 @@ impl BuildTask {
                 inner.error = Some(error.clone());
             }
             BuildProgressEvent::Log { .. } => {}
-            BuildProgressEvent::Completed { release_id } => {
+            BuildProgressEvent::Completed {
+                release_id,
+                sha256,
+                size_bytes,
+                file_name,
+            } => {
                 inner.release_id = Some(release_id.clone());
+                inner.sha256 = Some(sha256.clone());
+                inner.size_bytes = Some(*size_bytes);
+                inner.file_name = Some(file_name.clone());
                 inner.status = BuildTaskStatus::Completed;
             }
             BuildProgressEvent::Failed { error } => {

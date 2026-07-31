@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn document_contains_every_registered_operation() {
         let document = generated_document();
-        assert_eq!(document.paths.paths.len(), 76);
+        assert_eq!(document.paths.paths.len(), 75);
         assert!(document.paths.paths.contains_key("/"));
         assert!(document.paths.paths.contains_key("/api/build/start-dev"));
         assert!(document.paths.paths.contains_key("/api/git/commit"));
@@ -187,7 +187,6 @@ mod tests {
                 .paths
                 .contains_key("/api/userapp/tasks/{task_id}/cancel")
         );
-        assert!(document.paths.paths.contains_key("/api/userapp/publish"));
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 
