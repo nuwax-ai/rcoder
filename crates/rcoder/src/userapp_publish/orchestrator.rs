@@ -252,7 +252,10 @@ async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Resu
             .to_string();
         // 终态字段先取出(emit 会 move data)。
         let release_id = if event == "completed" {
-            data.get("releaseId")
+            // agent-runner BuildProgressEvent enum 级 serde rename_all 只作用于 variant 名,
+            // struct-variant field 未 rename(仍 snake_case),故 release_id 用 snake 取。
+            // (BuildTaskSnapshot 是 struct,camelCase 正常;sha/size/file 走 snapshot 不受影响。)
+            data.get("release_id")
                 .and_then(|r| r.as_str())
                 .unwrap_or_default()
                 .to_string()
