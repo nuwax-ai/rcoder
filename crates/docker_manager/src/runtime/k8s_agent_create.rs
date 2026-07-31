@@ -354,6 +354,39 @@ impl KubernetesRuntime {
                                 ..Default::default()
                             });
                         }
+                        // 透传 UserApp build 必需 env 给 agent-runner（build 在 agent-runner 执行）:
+                        // release lock 三元组（rcoder 自身 env 已有，来自 helm runtime identity 注入）。
+                        // 缺这些 agent-runner 无法生成 release.lock.toml。
+                        for var in [
+                            "RCODER_PINGAP_VERSION",
+                            "RCODER_PINGAP_COMMIT",
+                            "RCODER_RUNTIME_IMAGE_DIGEST",
+                        ] {
+                            if merged_env.contains_key(var) {
+                                continue;
+                            }
+                            if let Ok(val) = std::env::var(var)
+                                && !val.is_empty()
+                            {
+                                env_vars.push(EnvVar {
+                                    name: var.to_string(),
+                                    value: Some(val),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        // build timeout: rcoder env 透传，缺省 1800s（全量多语言 workspace build）
+                        if !merged_env.contains_key("DEV_COMMAND_TIMEOUT_SECS") {
+                            let timeout = std::env::var("DEV_COMMAND_TIMEOUT_SECS")
+                                .ok()
+                                .filter(|v| !v.is_empty())
+                                .unwrap_or_else(|| "1800".to_string());
+                            env_vars.push(EnvVar {
+                                name: "DEV_COMMAND_TIMEOUT_SECS".to_string(),
+                                value: Some(timeout),
+                                ..Default::default()
+                            });
+                        }
                         Some(env_vars)
                     },
                     ports: Some(vec![
@@ -366,6 +399,12 @@ impl KubernetesRuntime {
                         ContainerPort {
                             container_port: 8086,
                             name: Some("http".to_string()),
+                            ..Default::default()
+                        },
+                        // file-server port (embedded, UserApp workspace build / package download)
+                        ContainerPort {
+                            container_port: 60_000,
+                            name: Some("file-server".to_string()),
                             ..Default::default()
                         },
                     ]),

@@ -38,6 +38,9 @@ const AGENT_NOVNC_PORT: u32 = NOVNC_PORT as u32;
 /// Agent Runner WS 终端中间层端口（agent_runner tokio-tungstenite 监听；Pingora TtydProxy 路由到此）
 const AGENT_WS_TERMINAL_PORT: u32 = WS_TERMINAL_PORT as u32;
 
+/// Agent Runner 内嵌 file-server 端口（UserApp workspace build / package 下载，prepare 走它）
+const AGENT_FILE_SERVER_PORT: u32 = 60_000;
+
 /// K8s 标准标签前缀
 const LABEL_PREFIX: &str = "app.kubernetes.io";
 
@@ -241,6 +244,17 @@ impl K8sServiceOps for KubernetesRuntime {
                         target_port: Some(
                             k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
                                 AGENT_WS_TERMINAL_PORT as i32,
+                            ),
+                        ),
+                        protocol: Some("TCP".to_string()),
+                        ..Default::default()
+                    },
+                    ServicePort {
+                        name: Some("file-server".to_string()),
+                        port: AGENT_FILE_SERVER_PORT as i32,
+                        target_port: Some(
+                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                                AGENT_FILE_SERVER_PORT as i32,
                             ),
                         ),
                         protocol: Some("TCP".to_string()),
