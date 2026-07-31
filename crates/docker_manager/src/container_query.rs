@@ -668,6 +668,10 @@ impl DockerManager {
                     }
                     // UserApp 端口不固定，此处仅兜底；实际端口由 app_manager 管理
                     Some(shared_types::ServiceType::UserApp) => shared_types::GRPC_DEFAULT_PORT,
+                    // UserAppBuilder 是 agent-runner(复用 dev-rcoder-agent-runner 镜像),有 gRPC
+                    Some(shared_types::ServiceType::UserAppBuilder) => {
+                        shared_types::GRPC_DEFAULT_PORT
+                    }
                     None => shared_types::GRPC_DEFAULT_PORT,
                 };
 

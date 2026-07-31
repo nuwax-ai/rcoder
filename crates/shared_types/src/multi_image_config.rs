@@ -22,8 +22,9 @@ fn is_compatible_service_key(service_key: &str, service_type: &ServiceType) -> b
             // ComputerAgentRunner 没有旧名称
             false
         }
-        ServiceType::UserApp => {
-            // UserApp 镜像由调用方提供，不走多镜像配置选择，无旧名称兼容
+        ServiceType::UserApp | ServiceType::UserAppBuilder => {
+            // UserApp / UserAppBuilder 镜像由调用方/image_selector 提供,
+            // 不走多镜像配置选择,无旧名称兼容
             false
         }
     }
@@ -199,8 +200,8 @@ impl MultiImageConfig {
                 // ComputerAgentRunner 没有旧名称
                 None
             }
-            ServiceType::UserApp => {
-                // UserApp 镜像由调用方提供，不走多镜像配置选择
+            ServiceType::UserApp | ServiceType::UserAppBuilder => {
+                // UserApp / UserAppBuilder 镜像由调用方/image_selector 提供,不走多镜像配置选择
                 None
             }
         }

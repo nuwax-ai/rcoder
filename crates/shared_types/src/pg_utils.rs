@@ -23,14 +23,10 @@ pub fn validate_pg_identifier(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     let first = chars.next().unwrap(); // safe: is_empty 已排除
     if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(
-            "PG identifier must start with letter or '_'".to_string(),
-        );
+        return Err("PG identifier must start with letter or '_'".to_string());
     }
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(
-            "PG identifier: only [a-zA-Z0-9_] allowed after the first char".to_string(),
-        );
+        return Err("PG identifier: only [a-zA-Z0-9_] allowed after the first char".to_string());
     }
     Ok(())
 }

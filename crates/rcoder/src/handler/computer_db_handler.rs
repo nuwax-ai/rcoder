@@ -104,11 +104,9 @@ pub async fn computer_db_create_database(
     Path(user_id): Path<String>,
     Json(req): Json<CreateDatabaseRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    validate_pg_identifier(&req.database)
-        .map_err(|e| AppError::validation_error(&e))?;
+    validate_pg_identifier(&req.database).map_err(|e| AppError::validation_error(&e))?;
     if let Some(owner) = &req.owner {
-        validate_pg_identifier(owner)
-            .map_err(|e| AppError::validation_error(&e))?;
+        validate_pg_identifier(owner).map_err(|e| AppError::validation_error(&e))?;
     }
     let container_name = resolve_computer_container(&state, &user_id).await?;
 

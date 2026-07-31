@@ -15,9 +15,12 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use container_runtime_api::ContainerCreateParams;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR;
+use shared_types::{ProjectAndContainerInfo, ServiceType};
+use tracing::info;
 
 use crate::AppError;
 use crate::router::AppState;
@@ -29,6 +32,7 @@ use super::task::{PublishEvent, PublishTaskKind};
 pub fn routes() -> axum::Router<Arc<AppState>> {
     use axum::routing::{get, post};
     axum::Router::new()
+        .route("/api/v1/apps/{app_id}/ensure-builder", post(ensure_builder))
         .route("/api/v1/apps/{app_id}/publish", post(publish))
         .route("/api/v1/apps/{app_id}/build", post(build))
         .route("/api/v1/apps/publish/tasks/{task_id}", get(get_task))
@@ -120,6 +124,70 @@ pub async fn build(
         "status": "pending",
     })))
 }
+
+/// `POST /api/v1/apps/{app_id}/ensure-builder` —— 确保 UserAppBuilder pod 存在(幂等)。
+///
+/// 按 app_id 创建/复用 UserAppBuilder agent-runner pod(走 STS + per-app PVC
+/// `rcoder-app-{app_id}-workspace`,复用 `dev-rcoder-agent-runner` 镜像),并注册到
+/// `state.projects` 供 publish 流程的 `resolve_agent_addr` 据 app_id 定位。
+///
+/// 直接调 `runtime.create_container`(UserAppBuilder → `create_agent_container`),
+/// **不走 ComputerContainerManager**(避免 ComputerAgentRunner 专属的 lazy_migrate)。
+pub async fn ensure_builder(
+    State(state): State<Arc<AppState>>,
+    Path(app_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    if app_id.trim().is_empty() {
+        return Err(err("appId is required"));
+    }
+    // UserAppBuilder identifier = project_id(app_id 兼任);host_workspace_path K8s 模式不用。
+    let params = ContainerCreateParams::builder()
+        .project_id(app_id.clone())
+        .user_id(app_id.clone())
+        .host_workspace_path("")
+        .service_type(ServiceType::UserAppBuilder)
+        .storage_size(DEFAULT_BUILDER_STORAGE_SIZE)
+        .build();
+
+    let container_info = state
+        .runtime()
+        .create_container(params)
+        .await
+        .map_err(|e| err(format!("ensure UserAppBuilder failed: {e}")))?;
+
+    // 注册到 state.projects(publish 的 resolve_agent_addr 据 app_id 查 container_name/ip)。
+    let project_info = if let Some(existing) = state.get_project(&app_id) {
+        let mut info = (*existing).clone();
+        info.set_container(Some(container_info.clone()));
+        info
+    } else {
+        let mut info = ProjectAndContainerInfo::new(app_id.clone());
+        info.set_service_type(Some(ServiceType::UserAppBuilder));
+        info.set_container(Some(container_info.clone()));
+        info
+    };
+    state
+        .insert_project(app_id.clone(), Arc::new(project_info))
+        .map_err(|e| {
+            tracing::error!(error = %e, "[USERAPP_PUBLISH] register builder to projects failed");
+            err(format!("register builder failed: {e}"))
+        })?;
+
+    info!(
+        "[USERAPP_PUBLISH] UserAppBuilder ensured: app_id={}, container={}, ip={}",
+        app_id, container_info.container_name, container_info.container_ip
+    );
+
+    Ok(Json(json!({
+        "success": true,
+        "appId": app_id,
+        "containerName": container_info.container_name,
+        "containerIp": container_info.container_ip,
+    })))
+}
+
+/// UserAppBuilder per-app PVC 默认大小(后续可提到 config.yml 的 user-app-builder.service 段)。
+const DEFAULT_BUILDER_STORAGE_SIZE: &str = "10Gi";
 
 /// `GET /api/v1/apps/publish/tasks/{task_id}` —— 任务状态快照。
 pub async fn get_task(

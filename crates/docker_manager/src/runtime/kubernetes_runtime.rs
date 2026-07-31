@@ -325,7 +325,8 @@ impl KubernetesRuntime {
             // UserApp 实际走 create_deployment（image_override），不走 create_container/select_image
             // 此处兜底与 WebAgentRunner 共用，仅为 match 穷尽
             ServiceType::WebAgentRunner | ServiceType::UserApp => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
-            ServiceType::ComputerAgentRunner => {
+            // UserAppBuilder 复用 dev-rcoder-agent-runner 镜像(与 ComputerAgentRunner 同镜像)
+            ServiceType::ComputerAgentRunner | ServiceType::UserAppBuilder => {
                 "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest".to_string()
             }
         }

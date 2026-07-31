@@ -216,6 +216,8 @@ impl K8sServiceConfig {
             ServiceType::WebAgentRunner => crate::paths::WORKSPACE_ROOT.to_string(),
             ServiceType::ComputerAgentRunner => crate::paths::COMPUTER_WORKSPACE_ROOT.to_string(),
             ServiceType::UserApp => "/app/app-workspace".to_string(),
+            // UserAppBuilder: per-app PVC 挂载点
+            ServiceType::UserAppBuilder => "/app/userapp-workspace".to_string(),
         }
     }
 
@@ -310,7 +312,7 @@ impl KubernetesConfig {
         match service_type {
             ServiceType::WebAgentRunner => self.services.get("rcoder"),
             ServiceType::ComputerAgentRunner => None,
-            ServiceType::UserApp => None,
+            ServiceType::UserApp | ServiceType::UserAppBuilder => None,
         }
     }
 

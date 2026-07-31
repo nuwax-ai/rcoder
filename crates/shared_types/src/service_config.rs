@@ -464,6 +464,8 @@ impl ServiceImageConfig {
                 }
                 // UserApp 复用 rcoder-workspace PVC 的 apps subPath（部署侧挂到 /app/app-workspace）
                 ServiceType::UserApp => "/app/app-workspace".to_string(),
+                // UserAppBuilder: per-app PVC(`rcoder-app-{app_id}-workspace`)挂载点
+                ServiceType::UserAppBuilder => "/app/userapp-workspace".to_string(),
             })
     }
 

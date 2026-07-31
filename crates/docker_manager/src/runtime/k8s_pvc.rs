@@ -137,8 +137,15 @@ impl K8sPvcOps for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
+        // UserAppBuilder 复用 UserApp 的 per-app PVC(rcoder-app-{id}-workspace),
+        // 使 build 产物与运行时 Deployment 共享同 PVC 数据(路B)。container_prefix 独立
+        // (rcoder-app-builder,容器名隔离)但 PVC 名复用 UserApp,故 ensure/pod/resolve 全一致。
+        let pvc_service_type = match service_type {
+            ServiceType::UserAppBuilder => &ServiceType::UserApp,
+            other => other,
+        };
         let prefix = KubernetesRuntime::sanitize_k8s_name_part(
-            &self.service_container_prefix(service_type)?,
+            &self.service_container_prefix(pvc_service_type)?,
         );
         let sanitized = identifier.replace('_', "-");
         Ok(format!("{}-{}-workspace", prefix, sanitized))

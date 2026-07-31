@@ -316,9 +316,12 @@ impl<'a> AgentContainerStarter<'a> {
                                 std::path::PathBuf::from(&workspace_container),
                             )
                         }
-                        // RCoder/UserApp: 一个 project_id/app_id 对应一个容器
+                        // RCoder/UserApp/UserAppBuilder: 一个 project_id/app_id 对应一个容器
                         // 挂载: 宿主机 /project_workspace/{project_id} → 容器 /project_workspace/{project_id}
-                        ServiceType::WebAgentRunner | ServiceType::UserApp => {
+                        // (UserAppBuilder 在 K8s 走 per-app PVC 特判;Docker 模式复用此挂载)
+                        ServiceType::WebAgentRunner
+                        | ServiceType::UserApp
+                        | ServiceType::UserAppBuilder => {
                             let pid = project_id.as_deref().unwrap_or("default");
                             (
                                 pid.to_string(),

@@ -54,8 +54,8 @@ pub async fn pod_count(
         {
             Some(ServiceType::WebAgentRunner) => rcoder_count += 1,
             Some(ServiceType::ComputerAgentRunner) => computer_count += 1,
-            // UserApp 容器不计入 agent 统计
-            Some(ServiceType::UserApp) => {}
+            // UserApp/UserAppBuilder 容器不计入 agent 统计
+            Some(ServiceType::UserApp) | Some(ServiceType::UserAppBuilder) => {}
             None => {}
         }
     }

@@ -355,8 +355,11 @@ impl ContainerStatusChecker {
                     false
                 }
             }
-            shared_types::ServiceType::WebAgentRunner => {
-                // RCoder 模式：使用 project_id 查找容器
+            // UserAppBuilder 是 agent-runner(复用 dev-rcoder-agent-runner,有 gRPC),
+            // 复用 WebAgentRunner 的 project_id 查找路径
+            shared_types::ServiceType::WebAgentRunner
+            | shared_types::ServiceType::UserAppBuilder => {
+                // RCoder / UserAppBuilder 模式：使用 project_id(app_id)查找容器
                 match runtime
                     .find_container(container_info.project_id(), &service_type)
                     .await

@@ -77,8 +77,9 @@ impl AgentContainerRuntime for DockerRuntime {
                 .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string())),
             // 使用 find_container 实时查询 Docker API 获取 IP，
             // 避免 get_user_container_info → get_agent_info → get_container_info 只查缓存
-            // 导致服务重启后缓存丢失返回 None
-            ServiceType::ComputerAgentRunner => {
+            // 导致服务重启后缓存丢失返回 None。
+            // UserAppBuilder 复用 agent-runner 镜像(有 gRPC),同样走实时查询。
+            ServiceType::ComputerAgentRunner | ServiceType::UserAppBuilder => {
                 let result = self.find_container(identifier, service_type).await?;
                 Ok(result.map(|pod| ContainerBasicInfo {
                     container_id: pod.container_id,
@@ -149,12 +150,13 @@ impl AgentContainerRuntime for DockerRuntime {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
         match service_type {
-            // UserApp 的 identifier=app_id，复用 WebAgentRunner 的 stop_container 路径
-            ServiceType::WebAgentRunner | ServiceType::UserApp => self
-                .inner
-                .stop_container(identifier)
-                .await
-                .map_err(|e| ContainerRuntimeError::ContainerStopError(e.to_string())),
+            // UserApp/UserAppBuilder 的 identifier=app_id/project_id，复用 WebAgentRunner 的 stop_container 路径
+            ServiceType::WebAgentRunner | ServiceType::UserApp | ServiceType::UserAppBuilder => {
+                self.inner
+                    .stop_container(identifier)
+                    .await
+                    .map_err(|e| ContainerRuntimeError::ContainerStopError(e.to_string()))
+            }
             ServiceType::ComputerAgentRunner => {
                 if let Some(container) = self
                     .inner

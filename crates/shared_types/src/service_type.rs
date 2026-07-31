@@ -30,6 +30,9 @@ pub enum ServiceType {
     /// 容器标识为 app_id；镜像/命令/端口由调用方提供，不走 select_image。
     /// K8s 模式下对应 Deployment（而非 agent 的裸 Pod）。
     UserApp,
+    /// UserApp 构建/开发 agent-runner（路B：独立 per-app PVC + 复用 dev-rcoder-agent-runner 镜像）。
+    /// 容器标识为 app_id（project_id 兼任）；走 create_container（STS）；与 ComputerAgentRunner 容器隔离。
+    UserAppBuilder,
 }
 
 // 自定义 Serialize 实现，输出中划线格式
@@ -59,6 +62,7 @@ impl std::fmt::Display for ServiceType {
             ServiceType::WebAgentRunner => write!(f, "web-agent-runner"),
             ServiceType::ComputerAgentRunner => write!(f, "computer-agent-runner"),
             ServiceType::UserApp => write!(f, "user-app"),
+            ServiceType::UserAppBuilder => write!(f, "user-app-builder"),
         }
     }
 }
@@ -78,10 +82,12 @@ impl std::str::FromStr for ServiceType {
             "web-agent-runner" => Ok(ServiceType::WebAgentRunner),
             "computer-agent-runner" => Ok(ServiceType::ComputerAgentRunner),
             "user-app" => Ok(ServiceType::UserApp),
+            "user-app-builder" => Ok(ServiceType::UserAppBuilder),
             // 大驼峰格式（兼容旧配置）
             "WebAgentRunner" => Ok(ServiceType::WebAgentRunner),
             "ComputerAgentRunner" => Ok(ServiceType::ComputerAgentRunner),
             "UserApp" => Ok(ServiceType::UserApp),
+            "UserAppBuilder" => Ok(ServiceType::UserAppBuilder),
             // 旧枚举名（向后兼容）
             "RCoder" | "rcoder" => Ok(ServiceType::WebAgentRunner),
             "application" | "app" => Ok(ServiceType::UserApp),
@@ -117,6 +123,9 @@ impl ServiceType {
             ServiceType::UserApp => {
                 "User application managed by app_manager (long-running service owned by the user, not an agent)"
             }
+            ServiceType::UserAppBuilder => {
+                "UserApp build/dev agent-runner (per-app PVC, reuses dev-rcoder-agent-runner image)"
+            }
         }
     }
 
@@ -131,6 +140,7 @@ impl ServiceType {
             ServiceType::WebAgentRunner => "web-agent-runner",
             ServiceType::ComputerAgentRunner => "computer-agent-runner",
             ServiceType::UserApp => "rcoder-app",
+            ServiceType::UserAppBuilder => "rcoder-app-builder",
         }
     }
 
@@ -169,7 +179,7 @@ impl ServiceType {
         }
         match self {
             ServiceType::ComputerAgentRunner => user_id.ok_or(MissingIdentifier::UserId),
-            ServiceType::WebAgentRunner | ServiceType::UserApp => {
+            ServiceType::WebAgentRunner | ServiceType::UserApp | ServiceType::UserAppBuilder => {
                 project_id.ok_or(MissingIdentifier::ProjectId)
             }
         }
@@ -182,7 +192,7 @@ pub enum ServiceTypeError {
     #[error("service type cannot be empty")]
     EmptyServiceType,
     #[error(
-        "unsupported service type '{0}', please use 'web-agent-runner'/'WebAgentRunner'/'RCoder', 'computer-agent-runner'/'ComputerAgentRunner', or 'user-app'/'UserApp'/'application'"
+        "unsupported service type '{0}', please use 'web-agent-runner'/'WebAgentRunner'/'RCoder', 'computer-agent-runner'/'ComputerAgentRunner', 'user-app'/'UserApp'/'application', or 'user-app-builder'/'UserAppBuilder'"
     )]
     InvalidServiceType(String),
     #[error("service type '{0}' is disabled")]
@@ -195,6 +205,7 @@ pub fn get_supported_service_types() -> Vec<String> {
         "web-agent-runner".to_string(),
         "computer-agent-runner".to_string(),
         "user-app".to_string(),
+        "user-app-builder".to_string(),
     ]
 }
 
@@ -237,6 +248,7 @@ mod tests {
             ServiceType::WebAgentRunner,
             ServiceType::ComputerAgentRunner,
             ServiceType::UserApp,
+            ServiceType::UserAppBuilder,
         ] {
             assert_eq!(
                 st.container_identifier(Some("shared-pod"), Some("u1"), Some("p1")),
@@ -264,6 +276,20 @@ mod tests {
         assert_eq!(
             ServiceType::UserApp.container_identifier(None, None, Some("app-9")),
             Ok("app-9")
+        );
+    }
+
+    #[test]
+    fn userapp_builder_uses_project_id() {
+        // UserAppBuilder identifier = project_id(app_id 兼任)
+        assert_eq!(
+            ServiceType::UserAppBuilder.container_identifier(None, None, Some("app-9")),
+            Ok("app-9")
+        );
+        // user_id 给了也不用
+        assert_eq!(
+            ServiceType::UserAppBuilder.container_identifier(None, Some("u1"), None),
+            Err(MissingIdentifier::ProjectId)
         );
     }
 
@@ -432,6 +458,16 @@ mod tests {
             ServiceType::UserApp
         );
 
+        // UserAppBuilder 多格式
+        assert_eq!(
+            "user-app-builder".parse::<ServiceType>().unwrap(),
+            ServiceType::UserAppBuilder
+        );
+        assert_eq!(
+            "UserAppBuilder".parse::<ServiceType>().unwrap(),
+            ServiceType::UserAppBuilder
+        );
+
         // 未知类型应该返回错误
         assert!("unknown".parse::<ServiceType>().is_err());
 
@@ -454,10 +490,11 @@ mod tests {
     #[test]
     fn test_get_supported_service_types() {
         let types = get_supported_service_types();
-        assert_eq!(types.len(), 3);
+        assert_eq!(types.len(), 4);
         assert!(types.contains(&"web-agent-runner".to_string()));
         assert!(types.contains(&"computer-agent-runner".to_string()));
         assert!(types.contains(&"user-app".to_string()));
+        assert!(types.contains(&"user-app-builder".to_string()));
     }
 
     #[test]

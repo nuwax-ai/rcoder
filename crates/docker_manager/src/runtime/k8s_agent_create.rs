@@ -51,7 +51,11 @@ impl KubernetesRuntime {
         // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
         // 仅隔离容器 (pod_id=None, project/user 级) 且 per_agent_pvc_enabled=true 走 per-agent PVC。
         // 共享容器 (pod_id=Some) 或回滚开关 false → 共享 PVC (选项A 行为)。
-        if pod_id.is_none() && shared_types::per_agent_pvc_enabled() {
+        // UserAppBuilder 天然 per-app PVC(不受灰度开关限制),总是 ensure。
+        if pod_id.is_none()
+            && (shared_types::per_agent_pvc_enabled()
+                || matches!(service_type, ServiceType::UserAppBuilder))
+        {
             self.ensure_workspace_pvc(identifier, &service_type, params.storage_size.as_deref())
                 .await?;
         }
@@ -169,6 +173,8 @@ impl KubernetesRuntime {
             .or_else(|| docker_service.map(|sc| sc.workspace_container_path()))
             .unwrap_or_else(|| match service_type {
                 ServiceType::ComputerAgentRunner => "/home/user".to_string(),
+                // UserAppBuilder: per-app PVC 挂载点(file-server PROJECT_SOURCE_DIR 与之一致)
+                ServiceType::UserAppBuilder => "/app/userapp-workspace".to_string(),
                 _ => "/app/project_workspace".to_string(),
             });
 
@@ -270,9 +276,12 @@ impl KubernetesRuntime {
                                 .unwrap_or_else(|| vec!["/app/bin/agent_runner".to_string()]);
                             Some(cmd)
                         }
-                        // ComputerAgentRunner / UserApp 用镜像自带 ENTRYPOINT/CMD
-                        // （UserApp 实际走 create_deployment，不经此路径）
-                        ServiceType::ComputerAgentRunner | ServiceType::UserApp => None,
+                        // ComputerAgentRunner / UserApp / UserAppBuilder 用镜像自带 ENTRYPOINT/CMD
+                        // (UserApp 实际走 create_deployment,不经此路径;
+                        //  UserAppBuilder 复用 dev-rcoder-agent-runner 镜像,走其 start-up.sh 启动 agent_runner + 内嵌 file-server)
+                        ServiceType::ComputerAgentRunner
+                        | ServiceType::UserApp
+                        | ServiceType::UserAppBuilder => None,
                     },
                     env: {
                         let mut env_vars = vec![
