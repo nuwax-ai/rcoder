@@ -75,13 +75,12 @@ pub async fn handle_api_proxy_request(
 
     // 3. 从 ApiKeyManager 查询 API 密钥配置
     let api_config = api_key_manager.get(service_name).ok_or_else(|| {
+        // 只记录数量不暴露 service 名列表，避免配置结构泄漏到日志
+        let count = api_key_manager.iter().count();
         warn!(
-            "[API_PROXY] Cannot find API key config for service '{}'",
-            service_name
+            "[API_PROXY] Cannot find API key config for service '{}' (configured: {} services)",
+            service_name, count
         );
-        // 打印所有可用的 key 用于调试
-        let available_keys: Vec<_> = api_key_manager.iter().map(|r| r.key().clone()).collect();
-        warn!("[API_PROXY] available keys: {:?}", available_keys);
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(format!(
             "Cannot find API key config for service {}, please ensure it is properly configured",
             service_name
