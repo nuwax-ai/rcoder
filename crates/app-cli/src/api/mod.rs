@@ -73,7 +73,12 @@ pub async fn serve(
         runtime_status,
     };
     let app = Router::new()
+        // liveness 探针:app-cli 进程能响应即活(永远 200,不依赖任何后端)。
+        // 后端 app 有 bug 起不来时,liveness 不杀容器,用户可 kubectl exec 进去排查。
         .route("/health", get(health))
+        // readiness 探针:默认 app-cli 初始化完成(与后端无关);配了 [health].bridge_service
+        // 才桥接到那个后端的 readiness_path 深检查(fail→503 摘流,但 liveness 仍 200)。
+        .route("/ready", get(ready))
         .route("/openapi.json", get(openapi))
         .route("/v1/logs/sources/query", post(query_sources))
         .route("/v1/logs/query", post(query_logs))
@@ -97,7 +102,16 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     Json(ApiDoc::openapi())
 }
 
-async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+/// `/health` — liveness 探针:app-cli 进程活就 200(能响应即活)。不强依赖后端 app。
+async fn health() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "alive", "service": "app-cli" })),
+    )
+}
+
+/// `/ready` — readiness 探针:默认 app-cli 初始化完成;配了 bridge_service 时反映桥接后端就绪。
+async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     if state.runtime_status.is_ready() {
         (
             StatusCode::OK,

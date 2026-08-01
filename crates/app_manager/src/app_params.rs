@@ -163,6 +163,7 @@ impl AppService {
         let app_health_check = health_check.as_ref().map(|hc| AppHealthCheck {
             check_type: map_health_check_type(&hc.check_type),
             path: hc.path.clone(),
+            liveness_path: hc.liveness_path.clone(),
             port: hc.port,
             initial_delay_seconds: None,
             period_seconds: None,

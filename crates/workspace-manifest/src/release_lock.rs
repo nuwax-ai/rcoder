@@ -55,6 +55,17 @@ pub fn build_release_lock(
             })
         })
         .collect::<Result<Vec<_>, ManifestError>>()?;
+    // 校验 workspace 级 [health].bridge_service(若声明)指向真实存在的 service_id(Fail Fast)。
+    let bridge_service = workspace.health.bridge_service.clone();
+    if let Some(ref bridge_id) = bridge_service
+        && !services
+            .iter()
+            .any(|service| &service.service_id == bridge_id)
+    {
+        return Err(ManifestError::Validation(format!(
+            "[health].bridge_service references unknown service_id '{bridge_id}'"
+        )));
+    }
     Ok(ReleaseLock {
         schema_version: SCHEMA_VERSION,
         release_id: metadata.release_id.to_owned(),
@@ -68,6 +79,7 @@ pub fn build_release_lock(
         minimum_app_cli_version: metadata.minimum_app_cli_version.to_owned(),
         runtime_image_digest: metadata.runtime_image_digest.to_owned(),
         services,
+        bridge_service,
     })
 }
 

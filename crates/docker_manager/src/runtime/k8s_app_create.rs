@@ -142,10 +142,10 @@ impl KubernetesRuntime {
             .as_ref()
             .and_then(build_app_resource_requirements);
 
-        // 健康检查 probe
+        // 健康检查 probe:liveness 用 liveness_path(缺省回退 path),readiness 用 path。
+        // 拆成两个语义不同的探针:liveness(进程活,不被后端 bug 杀)+ readiness(能服务,可摘流)。
         let (liveness, readiness) = params.health_check.as_ref().map_or((None, None), |hc| {
-            let probe = build_probe(hc);
-            (probe.clone(), probe)
+            (build_probe(hc, true), build_probe(hc, false))
         });
 
         // 环境变量（ConfigMap + Secret 通过 envFrom 引用）

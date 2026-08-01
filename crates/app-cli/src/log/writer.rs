@@ -30,7 +30,10 @@ pub async fn pipe_to_rotating_file<R>(
     let mut writer = match RotatingWriter::new(&base_path, max_size, max_backups).await {
         Ok(w) => w,
         Err(e) => {
-            warn!("rotating writer init failed for {}: {e}, logs will be lost", base_path.display());
+            warn!(
+                "rotating writer init failed for {}: {e}, logs will be lost",
+                base_path.display()
+            );
             // 读掉 pipe 内容（防止子进程 SIGPIPE），但不落盘
             let mut buf = vec![0u8; 4096];
             let mut reader = pipe;
@@ -160,7 +163,9 @@ mod tests {
 
         let mut writer = RotatingWriter::new(&path, 100, 3).await.unwrap();
         for i in 0..5 {
-            writer.write_line(&format!("line-{i}: some content here")).await;
+            writer
+                .write_line(&format!("line-{i}: some content here"))
+                .await;
         }
         writer.flush().await;
         drop(writer);
@@ -168,7 +173,10 @@ mod tests {
         assert!(path.is_file(), "current .log exists");
         assert!(rotate_path(&path, 1).is_file(), ".1.log exists (rotated)");
         let current = std::fs::read_to_string(&path).unwrap();
-        assert!(current.contains("line-4"), "current has last line: {current}");
+        assert!(
+            current.contains("line-4"),
+            "current has last line: {current}"
+        );
         let backup1 = std::fs::read_to_string(rotate_path(&path, 1)).unwrap();
         assert!(
             backup1.contains("line-0") || backup1.contains("line-1"),
@@ -188,7 +196,10 @@ mod tests {
         drop(writer);
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.starts_with("existing"), "append preserves: {content}");
+        assert!(
+            content.starts_with("existing"),
+            "append preserves: {content}"
+        );
         assert!(content.contains("new line"), "append adds: {content}");
     }
 

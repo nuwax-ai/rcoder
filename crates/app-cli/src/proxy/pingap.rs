@@ -114,11 +114,23 @@ mod tests {
             .expect("non-empty config");
         assert!(toml_text.contains("addr = \"0.0.0.0:9080\""), "{toml_text}");
         assert!(toml_text.contains("[upstreams.frontend]"), "{toml_text}");
-        assert!(toml_text.contains("addrs = [\"127.0.0.1:4000\"]"), "{toml_text}");
-        assert!(toml_text.contains("[locations.frontendLocation]"), "{toml_text}");
-        assert!(toml_text.contains("addrs = [\"127.0.0.1:4001\"]"), "{toml_text}");
+        assert!(
+            toml_text.contains("addrs = [\"127.0.0.1:4000\"]"),
+            "{toml_text}"
+        );
+        assert!(
+            toml_text.contains("[locations.frontendLocation]"),
+            "{toml_text}"
+        );
+        assert!(
+            toml_text.contains("addrs = [\"127.0.0.1:4001\"]"),
+            "{toml_text}"
+        );
         assert!(toml_text.contains("path = \"/api/\""), "{toml_text}");
-        assert!(toml_text.contains("rewrite = \"^/api/(.*) /$1\""), "{toml_text}");
+        assert!(
+            toml_text.contains("rewrite = \"^/api/(.*) /$1\""),
+            "{toml_text}"
+        );
         assert!(toml_text.contains("\"pingap:requestId\""), "{toml_text}");
         assert!(
             toml_text.contains("\"pingap:compressionUpstream\""),

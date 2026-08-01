@@ -20,10 +20,13 @@ use super::task::{PublishEvent, PublishTask};
 
 /// agent-runner 内嵌 file-server 端口(与 k8s_service.rs AGENT_FILE_SERVER_PORT 一致)。
 const FILE_SERVER_PORT: u16 = 60_000;
-/// app-runtime(pingap/app-cli)容器监听端口。
+/// app-runtime 容器公网端口(pingap 监听,对外 Service + PortConfig 用)。
 const APP_HTTP_PORT: u16 = 9080;
-/// app-runtime(pingap)统一 ready 端点(与业务服务无关,恒有效)。
-const APP_READY_PATH: &str = "/api/rust/ready";
+/// app-cli 管理 API 端口(K8s 探针打这里:app-cli 自身提供 /health+/ready,不强依赖后端 app)。
+const APP_CLI_ADMIN_PORT: u16 = 3010;
+/// app-cli 提供的探针路径(liveness=进程活,readiness=初始化完成/可选桥接后端)。
+const APP_LIVENESS_PATH: &str = "/health";
+const APP_READINESS_PATH: &str = "/ready";
 /// 就绪轮询间隔。
 const READY_POLL_INTERVAL_SECS: u64 = 3;
 /// 就绪轮询总超时(activate 后 app 启动 + 健康检查窗口)。
@@ -309,10 +312,14 @@ async fn ensure_app(state: &AppState, rcoder_app_id: &str, name: &str, image: &s
             expose_type: ExposeType::Http,
             strip_prefix: None,
         }]),
+        // 探针打 app-cli 的 3010 管理 API(非 pingap 9080):app-cli 自身提供 /health(liveness,
+        // 进程活,后端有 bug 也不杀容器)+ /ready(readiness,默认 app-cli 就绪/可选桥接后端)。
+        // 不再硬编码 /api/rust/ready(旧 bug:与实际后端语言无关,且强依赖后端实现该路径)。
         health_check: Some(HealthCheckConfig {
             check_type: HealthCheckType::Http,
-            path: Some(APP_READY_PATH.to_string()),
-            port: Some(APP_HTTP_PORT),
+            path: Some(APP_READINESS_PATH.to_string()),
+            liveness_path: Some(APP_LIVENESS_PATH.to_string()),
+            port: Some(APP_CLI_ADMIN_PORT),
         }),
         tenant_id: None,
         space_id: None,

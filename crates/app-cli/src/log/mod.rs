@@ -3,7 +3,7 @@
 //! - [`writer`]：RotatingWriter（append + 大小轮转）+ pipe_to_rotating_file
 //! - [`reader`]：list_log_files + read_last_n_lines + read_from_offset
 
-pub mod reader;
 pub mod model;
+pub mod reader;
 pub mod service;
 pub mod writer;

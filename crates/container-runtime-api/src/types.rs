@@ -158,7 +158,12 @@ pub enum HealthCheckType {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppHealthCheck {
     pub check_type: HealthCheckType,
+    /// readiness 探针路径(Http 类型时)。
     pub path: Option<String>,
+    /// liveness 探针路径(Http 类型时);None = 复用 `path`(向后兼容,两探针同路径)。
+    /// 设了不同值时,K8s liveness 用本字段、readiness 用 `path`,从而可拆成两个语义不同的探针。
+    #[serde(default)]
+    pub liveness_path: Option<String>,
     pub port: Option<u16>,
     pub initial_delay_seconds: Option<u32>,
     pub period_seconds: Option<u32>,

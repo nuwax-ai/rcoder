@@ -47,12 +47,7 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
             warn!("⚠️  {} 无 [run].command，跳过", spec.name);
             continue;
         }
-        match start_service(
-            spec,
-            &args.workspace,
-            &args.log_dir,
-            &release.release_id,
-        ) {
+        match start_service(spec, &args.workspace, &args.log_dir, &release.release_id) {
             Ok(child) => children.push((spec.name.clone(), child)),
             Err(e) => {
                 error!("❌ start {} failed: {e}", spec.name);
@@ -64,8 +59,36 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
     // 4. 编译、完整验证并启动 Pingap；代理失败时 workspace 不得进入 ready。
     start_pingap(&args.workspace, &args.pingap_bin, &release, &mut children).await?;
 
-    wait_for_services_ready(&specs).await?;
-    runtime_status.set_ready(true);
+    // 5. readiness —— 默认不强依赖后端 app(用户核心诉求:后端有 bug 起不来时容器仍 ready、可排查)。
+    //   - 无 [health].bridge_service:app-cli 自给自足,初始化完成即 ready。
+    //   - 有 bridge_service:只等那一个后端的 readiness_path;超时 → 保持 NotReady(摘流)
+    //     但不 bail/崩溃(liveness /health 仍 200,容器活着,用户可 exec 进去排查)。
+    let ready = match &release.bridge_service {
+        None => true,
+        Some(bridge_id) => match specs.iter().find(|s| &s.service_id == bridge_id) {
+            None => {
+                warn!(
+                    "⚠️  [health].bridge_service '{bridge_id}' not in release services; \
+                     defaulting to ready"
+                );
+                true
+            }
+            Some(spec) => match wait_for_service_ready(spec).await {
+                Ok(()) => {
+                    info!("✅ bridge service '{bridge_id}' ready");
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        "⏳ bridge service '{bridge_id}' not ready: {e}; \
+                         staying NotReady (traffic withheld, liveness unaffected)"
+                    );
+                    false
+                }
+            },
+        },
+    };
+    runtime_status.set_ready(ready);
 
     if children.is_empty() {
         anyhow::bail!("no service started");
@@ -144,38 +167,34 @@ async fn wait_for_pg() -> Result<()> {
     anyhow::bail!("PostgreSQL not ready after 60 seconds");
 }
 
-async fn wait_for_services_ready(specs: &[ServiceSpec]) -> Result<()> {
+/// 轮询单个桥接后端的 readiness_path 直至就绪(120s 超时)。
+///
+/// 仅在 workspace.manifest `[health].bridge_service` 显式配置时调用(只等那一个后端)。
+/// 默认(不配 bridge)不调本函数 —— app-cli 自给 /ready,不强依赖任何后端。
+async fn wait_for_service_ready(spec: &ServiceSpec) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
         .context("build readiness HTTP client")?;
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        spec.port, spec.health.readiness_path
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
-        let mut pending = Vec::new();
-        for spec in specs
-            .iter()
-            .filter(|service| service.enabled && service.proxy.is_some())
-        {
-            let url = format!(
-                "http://127.0.0.1:{}{}",
-                spec.port, spec.health.readiness_path
-            );
-            let ready = client
-                .get(&url)
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success());
-            if !ready {
-                pending.push(spec.service_id.clone());
-            }
-        }
-        if pending.is_empty() {
+        let ready = client
+            .get(&url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        if ready {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "service readiness timed out after 120 seconds: {}",
-                pending.join(", ")
+                "service '{}' readiness timed out after 120 seconds (path {})",
+                spec.service_id,
+                spec.health.readiness_path
             );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

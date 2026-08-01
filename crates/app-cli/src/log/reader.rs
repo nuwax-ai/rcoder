@@ -31,7 +31,8 @@ pub fn list_log_files(log_dir: &Path) -> Vec<ProjectLogs> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         // 文件名格式：<dir>.out.log / <dir>.err.log / <dir>.out.1.log 等
-        let (dir, kind) = if let Some(dir) = name.strip_suffix(".out.log")
+        let (dir, kind) = if let Some(dir) = name
+            .strip_suffix(".out.log")
             .or_else(|| name.strip_suffix(".err.log"))
             .or_else(|| {
                 // 轮转文件：<dir>.out.1.log → strip → <dir>.out
@@ -117,7 +118,10 @@ pub fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<(Vec<String>,
 
 /// 从 `start_offset` 读文件到尾（返回行 + 每行的字节偏移）。
 /// 用于 SSE stream 的「补漏」阶段：断线期间漏掉的日志，从 last-event-id 开始读到文件尾。
-pub fn read_from_offset(path: &Path, start_offset: u64) -> std::io::Result<(Vec<(String, u64)>, u64)> {
+pub fn read_from_offset(
+    path: &Path,
+    start_offset: u64,
+) -> std::io::Result<(Vec<(String, u64)>, u64)> {
     let mut file = std::fs::File::open(path)?;
     let total = file.metadata()?.len();
     if start_offset >= total {

@@ -95,8 +95,14 @@ pub(crate) fn config_hash_annotations(
 }
 
 /// 健康检查配置 → K8s Probe
+///
+/// `is_liveness`:true 构建 liveness 探针(用 `liveness_path`,缺省回退 `path`);
+/// false 构建 readiness 探针(用 `path`)。从而支持 liveness/readiness 不同路径的语义拆分。
 #[cfg(feature = "kubernetes")]
-pub(crate) fn build_probe(hc: &container_runtime_api::AppHealthCheck) -> Option<Probe> {
+pub(crate) fn build_probe(
+    hc: &container_runtime_api::AppHealthCheck,
+    is_liveness: bool,
+) -> Option<Probe> {
     use container_runtime_api::HealthCheckType;
     let init = hc.initial_delay_seconds.map(|s| s as i32);
     let period = hc.period_seconds.map(|s| s as i32);
@@ -104,9 +110,17 @@ pub(crate) fn build_probe(hc: &container_runtime_api::AppHealthCheck) -> Option<
         HealthCheckType::None | HealthCheckType::Exec => None,
         HealthCheckType::Http => {
             let port = hc.port.unwrap_or(80);
+            let path = if is_liveness {
+                hc.liveness_path
+                    .clone()
+                    .or_else(|| hc.path.clone())
+                    .unwrap_or_else(|| "/".to_string())
+            } else {
+                hc.path.clone().unwrap_or_else(|| "/".to_string())
+            };
             Some(Probe {
                 http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                    path: Some(hc.path.clone().unwrap_or_else(|| "/".to_string())),
+                    path: Some(path),
                     port: IntOrString::Int(port as i32),
                     ..Default::default()
                 }),
@@ -389,16 +403,17 @@ mod tests {
         let none_hc = AppHealthCheck {
             check_type: HealthCheckType::None,
             path: None,
+            liveness_path: None,
             port: None,
             initial_delay_seconds: None,
             period_seconds: None,
         };
-        assert!(build_probe(&none_hc).is_none());
+        assert!(build_probe(&none_hc, false).is_none());
         let exec_hc = AppHealthCheck {
             check_type: HealthCheckType::Exec,
             ..none_hc
         };
-        assert!(build_probe(&exec_hc).is_none());
+        assert!(build_probe(&exec_hc, true).is_none());
     }
 
     #[test]
@@ -406,14 +421,36 @@ mod tests {
         let hc = AppHealthCheck {
             check_type: HealthCheckType::Http,
             path: None,
+            liveness_path: None,
             port: None,
             initial_delay_seconds: None,
             period_seconds: None,
         };
-        let probe = build_probe(&hc).unwrap();
+        let probe = build_probe(&hc, false).unwrap();
         let hg = probe.http_get.expect("http_get 必须设置");
         assert_eq!(hg.path, Some("/".to_string()));
         assert!(matches!(hg.port, IntOrString::Int(80)), "port 缺省应为 80");
+    }
+
+    #[test]
+    fn build_probe_liveness_uses_liveness_path() {
+        // liveness_path 设了 → liveness 用它;readiness 仍用 path。
+        let hc = AppHealthCheck {
+            check_type: HealthCheckType::Http,
+            path: Some("/ready".to_string()),
+            liveness_path: Some("/health".to_string()),
+            port: Some(3010),
+            initial_delay_seconds: None,
+            period_seconds: None,
+        };
+        let live = build_probe(&hc, true).unwrap().http_get.unwrap();
+        let ready = build_probe(&hc, false).unwrap().http_get.unwrap();
+        assert_eq!(
+            live.path,
+            Some("/health".to_string()),
+            "liveness 用 liveness_path"
+        );
+        assert_eq!(ready.path, Some("/ready".to_string()), "readiness 用 path");
     }
 
     #[test]
@@ -421,11 +458,12 @@ mod tests {
         let hc = AppHealthCheck {
             check_type: HealthCheckType::Tcp,
             path: None,
+            liveness_path: None,
             port: Some(9090),
             initial_delay_seconds: None,
             period_seconds: None,
         };
-        let probe = build_probe(&hc).unwrap();
+        let probe = build_probe(&hc, false).unwrap();
         assert!(probe.tcp_socket.is_some());
         assert!(probe.http_get.is_none());
     }

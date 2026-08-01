@@ -6,7 +6,11 @@ use clap::Parser;
 
 /// UserApp 容器运行时编排器。
 #[derive(Parser, Debug)]
-#[command(name = "app-cli", version, about = "UserApp 容器运行时编排器（替代 start.sh）")]
+#[command(
+    name = "app-cli",
+    version,
+    about = "UserApp 容器运行时编排器（替代 start.sh）"
+)]
 pub struct CliArgs {
     /// workspace 根（含 workspace.manifest.toml + 各子项目；解压后的 /app/code）。
     #[arg(long, default_value = "/app/code", env = "APP_CLI_WORKSPACE")]
@@ -21,6 +25,10 @@ pub struct CliArgs {
     pub admin_addr: String,
 
     /// pingap 二进制路径。
-    #[arg(long, default_value = "/usr/local/bin/pingap", env = "APP_CLI_PINGAP_BIN")]
+    #[arg(
+        long,
+        default_value = "/usr/local/bin/pingap",
+        env = "APP_CLI_PINGAP_BIN"
+    )]
     pub pingap_bin: PathBuf,
 }

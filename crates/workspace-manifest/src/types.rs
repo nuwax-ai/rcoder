@@ -9,6 +9,21 @@ pub struct WorkspaceManifest {
     pub workspace: WorkspaceMeta,
     #[serde(default)]
     pub pingap: PingapSection,
+    /// workspace 级健康策略(默认空 = app-cli 自给自足,不强依赖任何后端)。
+    #[serde(default)]
+    pub health: WorkspaceHealthSection,
+}
+
+/// workspace 级健康配置。
+///
+/// `bridge_service`:显式指定用哪个 service 的 `[health].readiness_path` 代表整个 workspace
+/// 的就绪状态。**不写(默认)** = app-cli 自身提供 `/ready`(后端 bug 不卡容器,用户可排查);
+/// 写了 = app-cli 把 `/ready` 桥接到该后端,深检查(后端不 ready 摘流,但 liveness 仍 200 不杀容器)。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceHealthSection {
+    #[serde(default)]
+    pub bridge_service: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -198,6 +213,9 @@ pub struct ReleaseLock {
     /// app-runtime image reference; it is not required to be an OCI digest.
     pub runtime_image_digest: String,
     pub services: Vec<LockedService>,
+    /// workspace 级健康桥接策略(从 WorkspaceManifest 透传;None = app-cli 自给 /ready)。
+    #[serde(default)]
+    pub bridge_service: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

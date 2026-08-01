@@ -47,8 +47,12 @@ pub enum ExposeType {
 pub struct HealthCheckConfig {
     /// 检查类型
     pub check_type: HealthCheckType,
-    /// HTTP 检查路径
+    /// readiness 探针路径(Http 类型时)。
     pub path: Option<String>,
+    /// liveness 探针路径(Http 类型时);None = 复用 `path`。
+    /// 设了不同值 → K8s liveness 用本字段、readiness 用 `path`(两探针语义拆分)。
+    #[serde(default)]
+    pub liveness_path: Option<String>,
     /// 检查端口
     pub port: Option<u16>,
 }
