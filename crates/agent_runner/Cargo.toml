@@ -60,6 +60,9 @@ async-trait = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
 
+# PID 1 init: 容器内做 PID 1 的孤儿回收 + 信号转发(经 re-exec 等价 tini,进程外 waitpid 不与 tokio 冲突)
+pid1 = "0.1.6"
+
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }
 tower = { workspace = true }

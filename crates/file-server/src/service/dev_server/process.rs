@@ -128,10 +128,6 @@ pub fn spawn_override_shell(
     let mut child = cmd
         .spawn()
         .map_err(|e| AppError::system(format!("spawn override dev server failed: {e}")))?;
-    // 登记 tokio 拥有的 PID: reaper 回收孤儿时跳过它,避免抢 tokio 的子进程 → ECHILD
-    if let Some(pid) = child.id() {
-        shared_types::reaper_coord::register_tokio_pid(pid);
-    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     Ok((child, stdout, stderr))
@@ -159,10 +155,6 @@ pub fn spawn_dev(
     let mut child = cmd
         .spawn()
         .map_err(|e| AppError::system(format!("spawn dev server failed: {e}")))?;
-    // 登记 tokio 拥有的 PID: reaper 回收孤儿时跳过它,避免抢 tokio 的子进程 → ECHILD
-    if let Some(pid) = child.id() {
-        shared_types::reaper_coord::register_tokio_pid(pid);
-    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     Ok((child, stdout, stderr))
@@ -202,12 +194,6 @@ pub async fn run_command_to_log(
     let mut child = cmd
         .spawn()
         .map_err(|e| AppError::system(format!("spawn command failed: {e}")))?;
-    // 登记 tokio 拥有的 PID: reaper 回收孤儿时跳过它,避免抢 build 子进程 → ECHILD。
-    // spawn() 返回时子进程刚 exec 完是活的,这里登记无 race(它要之后才死,那时已登记)。
-    let _spawned_pid = child.id();
-    if let Some(pid) = _spawned_pid {
-        shared_types::reaper_coord::register_tokio_pid(pid);
-    }
     // 回调 pid 供外部 cancel (kill_process_group); child drop 前 pid 恒有效。
     if let Some(cb) = on_pid
         && let Some(pid) = child.id()

@@ -16,7 +16,6 @@ mod config;
 mod grpc;
 mod handler;
 mod model;
-mod process_reaper;
 mod proxy_agent;
 
 // 🔥 Pyroscope Profiler 模块（可选：需要 pyroscope feature）
@@ -82,8 +81,21 @@ fn create_model_env_resolver(
 
 // 路由创建函数已移动到 handler 模块
 
+fn main() -> anyhow::Result<()> {
+    // 容器内若为 PID 1(被 start-up.sh exec / 直跑),re-exec 自己为子进程 + 本进程做 PID 1 监督
+    // (回收孤儿 + 转发 SIGTERM/SIGINT)。等价 tini,但纯 Rust 库、无需镜像装 tini 或命令前置。
+    // 关键:监督进程的 waitpid(-1) 与 app 的 tokio::process 在 **不同进程**(app 是 PID 2 子进程),
+    // 不再像旧 in-process process_reaper 那样抢 tokio 的子进程 → ECHILD 彻底消失。
+    // 非 PID 1(本地直接跑)launch() 直接返回,行为不变。
+    pid1::Pid1Settings::new()
+        .enable_log(true)
+        .timeout(Duration::from_secs(15))
+        .launch()?;
+    agent_runner_main()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn agent_runner_main() -> anyhow::Result<()> {
     // 🔥 设置自定义 Panic Hook，确保 panic 信息被记录
     set_panic_hook();
 
@@ -155,21 +167,9 @@ async fn main() -> anyhow::Result<()> {
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args);
 
-    // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）。
-    // 默认开启。UserAppBuilder 等精简 agent(无 chromium/VNC 孤儿, 只跑 tokio::process
-    // build 子进程)可经 RCODER_PROCESS_REAPER_ENABLED=false 关闭 —— 彻底杜绝 reaper 与
-    // tokio 抢子进程的 ECHILD race(reaper 逻辑已修得不再抢 tokio 的, 关闭是额外保险 + 省 /proc 扫描)。
-    let reaper_enabled = std::env::var("RCODER_PROCESS_REAPER_ENABLED")
-        .map(|v| !matches!(v.as_str(), "false" | "0" | "no" | "off" | ""))
-        .unwrap_or(true);
-    let _reaper_handle: Option<tokio::task::JoinHandle<()>> = if reaper_enabled {
-        let h = process_reaper::start_process_reaper();
-        info!("[MAIN] Process reaper started (PID 1 mode)");
-        Some(h)
-    } else {
-        info!("[MAIN] Process reaper DISABLED (RCODER_PROCESS_REAPER_ENABLED=false)");
-        None
-    };
+    // 注:容器以 tini 做 PID 1(见镜像 ENTRYPOINT / chart command 前置 tini),由 tini 负责回收
+    // 孤儿进程 + 转发信号。agent_runner 不再自带 in-process reaper(旧 process_reaper 模块已删:
+    // 它的 waitpid(-1) 会抢 tokio::process 的子进程导致 build child.wait() ECHILD)。
 
     // 🆕 从配置中获取 Agent 清理配置，或使用默认值
     let agent_cleanup_config = config.agent_cleanup.clone().unwrap_or_default();

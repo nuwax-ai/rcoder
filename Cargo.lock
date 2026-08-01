@@ -170,6 +170,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "path-clean",
+ "pid1",
  "piper",
  "pyroscope",
  "rcoder-proxy",
@@ -5328,6 +5329,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
 dependencies = [
  "siphasher",
+]
+
+[[package]]
+name = "pid1"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51c83a25a484a726b9f20ca9098d12ff32e429b5a37193a63b9308f141b25360"
+dependencies = [
+ "nix 0.31.3",
+ "signal-hook 0.4.4",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
