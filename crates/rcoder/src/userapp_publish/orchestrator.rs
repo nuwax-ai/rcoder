@@ -145,15 +145,8 @@ async fn run_publish_inner(
     let image = std::env::var("RCODER_RUNTIME_IMAGE_DIGEST")
         .context("RCODER_RUNTIME_IMAGE_DIGEST env not set (app-runtime image for create_app)")?;
 
-    // 2. ensure_app(不存在则 create:image=app-runtime,端口 9080,health ready 端点)。
-    fail_if_cancelled(task)?;
-    task.emit(PublishEvent::Stage {
-        stage: "EnsureApp".to_string(),
-    })
-    .await;
-    ensure_app(state, &rcoder_app_id, app_id, &image).await?;
-
-    // 3. prepare(包 url 指向 agent-runner file-server,app_manager 据此下载校验)。
+    // 2. prepare(包 url 指向 agent-runner file-server,app_manager 据此下载校验)。
+    //    prepare 自带 ensure_app_workspace_ready + ensure_release_dirs,无需先 create_app。
     fail_if_cancelled(task)?;
     task.emit(PublishEvent::Stage {
         stage: "Prepare".to_string(),
@@ -175,7 +168,7 @@ async fn run_publish_inner(
         .await
         .map_err(|e| anyhow!("prepare_release: {e}"))?;
 
-    // 4. activate(切 code 目录 + 重启 app-runtime 容器)。
+    // 3. activate(切 code 目录 + 重启 app-runtime 容器;新 app 无容器则只解压 code)。
     fail_if_cancelled(task)?;
     task.emit(PublishEvent::Stage {
         stage: "Activate".to_string(),
@@ -186,6 +179,17 @@ async fn run_publish_inner(
         .activate_release(&rcoder_app_id, &release_id)
         .await
         .map_err(|e| anyhow!("activate_release: {e}"))?;
+
+    // 4. ensure_app:create app 运行时容器(image=app-runtime,端口 9080,health ready 端点)。
+    //    顺序硬约束:必须在 activate 之后 —— create_app_runtime 读 code/release.lock.toml
+    //    注入 build identity,而 release.lock.toml 是 activate 从 release 包解压到 code/ 的。
+    //    幂等:已存在的 app(重发)get_app 命中 → no-op;activate 的 stop/swap/restart 照常。
+    fail_if_cancelled(task)?;
+    task.emit(PublishEvent::Stage {
+        stage: "EnsureApp".to_string(),
+    })
+    .await;
+    ensure_app(state, &rcoder_app_id, app_id, &image).await?;
 
     // 5. 轮询就绪:status=Running 且 health 非 Unhealthy。
     fail_if_cancelled(task)?;

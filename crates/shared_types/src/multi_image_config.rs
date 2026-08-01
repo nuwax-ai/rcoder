@@ -837,8 +837,8 @@ mod tests {
         let multi_config: MultiImageConfig = serde_yaml::from_value(multi_image_config.clone())
             .unwrap_or_else(|e| panic!("Failed to parse multi_image_config: {}", e));
 
-        // 验证服务数量
-        assert_eq!(multi_config.services.len(), 2);
+        // 验证服务数量(web-agent-runner + computer-agent-runner + user-app-builder)
+        assert_eq!(multi_config.services.len(), 3);
 
         // 验证 web-agent-runner 配置
         let web_config = multi_config
@@ -858,6 +858,14 @@ mod tests {
             computer_config.service_type,
             ServiceType::ComputerAgentRunner
         );
+
+        // 验证 user-app-builder 配置(路 B)
+        let builder_config = multi_config
+            .get_service_config(&ServiceType::UserAppBuilder)
+            .expect("user-app-builder config not found");
+        assert!(builder_config.image.is_some());
+        assert!(builder_config.enabled);
+        assert_eq!(builder_config.service_type, ServiceType::UserAppBuilder);
 
         // 验证配置有效
         assert!(multi_config.validate().is_ok());
