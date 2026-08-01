@@ -29,6 +29,10 @@ pub(super) async fn capture_command(
         .spawn()
         .map_err(|error| AppError::system(format!("spawn {label} failed: {error}")))?;
     let child_pid = child.id();
+    // 登记 tokio 拥有的 PID: reaper 回收孤儿时跳过它,避免抢该子进程 → ECHILD
+    if let Some(pid) = child_pid {
+        shared_types::reaper_coord::register_tokio_pid(pid);
+    }
     let stdout = child
         .stdout
         .take()

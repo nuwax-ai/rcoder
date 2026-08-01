@@ -155,9 +155,21 @@ async fn main() -> anyhow::Result<()> {
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args);
 
-    // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）
-    let _reaper_handle = process_reaper::start_process_reaper();
-    info!("[MAIN] Process reaper started (PID 1 mode)");
+    // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）。
+    // 默认开启。UserAppBuilder 等精简 agent(无 chromium/VNC 孤儿, 只跑 tokio::process
+    // build 子进程)可经 RCODER_PROCESS_REAPER_ENABLED=false 关闭 —— 彻底杜绝 reaper 与
+    // tokio 抢子进程的 ECHILD race(reaper 逻辑已修得不再抢 tokio 的, 关闭是额外保险 + 省 /proc 扫描)。
+    let reaper_enabled = std::env::var("RCODER_PROCESS_REAPER_ENABLED")
+        .map(|v| !matches!(v.as_str(), "false" | "0" | "no" | "off" | ""))
+        .unwrap_or(true);
+    let _reaper_handle: Option<tokio::task::JoinHandle<()>> = if reaper_enabled {
+        let h = process_reaper::start_process_reaper();
+        info!("[MAIN] Process reaper started (PID 1 mode)");
+        Some(h)
+    } else {
+        info!("[MAIN] Process reaper DISABLED (RCODER_PROCESS_REAPER_ENABLED=false)");
+        None
+    };
 
     // 🆕 从配置中获取 Agent 清理配置，或使用默认值
     let agent_cleanup_config = config.agent_cleanup.clone().unwrap_or_default();

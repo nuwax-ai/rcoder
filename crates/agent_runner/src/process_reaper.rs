@@ -179,103 +179,55 @@ impl ReaperState {
         zombies
     }
 
-    /// 🔧 主动清理所有僵尸进程
+    /// 🔧 主动回收真·孤儿僵尸进程。
     ///
-    /// 使用 waitpid 循环回收所有可能的僵尸进程，不仅仅是追踪的子进程
-    /// 这是 PID 1 的责任：回收所有孤儿进程
+    /// PID 1 的责任: 回收被 reparent 到 PID 1 的孤儿僵尸(如 chromium/VNC 的孙进程)。
     ///
-    /// ⚠️ 跳过已在 active_children 中注册的 PID，避免抢占 reap_all() 的退出状态
+    /// **不再用 `waitpid(-1)`** —— 它无法区分孤儿与 `tokio::process` 正在 `child.wait()` 的
+    /// 直系子进程, 会抢走 tokio 的子进程导致 `child.wait()` 拿到 ECHILD ("No child processes")。
+    /// `tokio::process` 与同一进程内的 `waitpid(-1)` 是已知冲突反模式。
+    ///
+    /// 改用 /proc 扫描定位僵尸, 只回收 **PPID==1(归 PID 1)且非 tokio 拥有** 的, 按具体 PID
+    /// `waitpid(pid)` 回收。tokio 拥有的 PID(已登记在 [`reaper_coord`] 注册表)留给 tokio 自己回收。
     fn reap_all_zombies_blocking(&mut self) {
         #[cfg(unix)]
         {
             use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
             use nix::unistd::Pid;
-            use std::collections::HashSet;
 
-            let mut reaped_this_round = 0;
+            // 1. 一次 /proc 扫描: 拿僵尸列表 + 当前全部存活 PID(用于清理注册表死 PID)。
+            let (zombies, live_pids) = scan_proc_zombies_and_live();
 
-            // 收集已注册的活跃子进程 PID，避免抢占其退出状态
-            let registered_pids: HashSet<u32> = self.active_children.keys().copied().collect();
+            // 2. 清理 reaper_coord 注册表中已不在 /proc 的 PID —— 进程已退出且被 tokio 回收。
+            //    避免 PID 复用: 否则一个已退出的 tokio 子进程 PID 被复用成新孤儿时,
+            //    reaper 会误判为 tokio 拥有而漏回收。
+            shared_types::reaper_coord::prune_dead_pids(&live_pids);
 
-            // 循环调用 waitpid，直到没有更多僵尸进程
-            loop {
-                match waitpid(
-                    Pid::from_raw(-1), // -1 表示等待任意子进程
-                    Some(WaitPidFlag::WNOHANG),
-                ) {
-                    Ok(WaitStatus::Exited(pid, exit_code)) => {
-                        // 跳过已注册的子进程，交由 reap_all() 处理
-                        if registered_pids.contains(&(pid.as_raw() as u32)) {
-                            debug!(
-                                "[ProcessReaper] Skipping registered child PID={} (exit_code={}), \
-                                 will be reaped by reap_all()",
-                                pid, exit_code
-                            );
-                            continue;
-                        }
+            // 3. 回收真·孤儿: PPID==1 且非 tokio 拥有的僵尸。按具体 PID 回收, 绝不 waitpid(-1)。
+            let mut reaped_this_round = 0u64;
+            for z in &zombies {
+                if z.ppid != 1 {
+                    continue; // 非 PID 1 的子进程, 其父进程负责回收
+                }
+                if shared_types::reaper_coord::is_tokio_owned(z.pid) {
+                    continue; // tokio 拥有, 留给 tokio::process child.wait()
+                }
+                match waitpid(Pid::from_raw(z.pid as i32), Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) => {
                         reaped_this_round += 1;
                         debug!(
-                            "[ProcessReaper] Reaped zombie proactively: PID={}, exit_code={}",
-                            pid, exit_code
+                            "[ProcessReaper] Reaped orphan zombie: PID={}, cmd={}",
+                            z.pid, z.comm
                         );
                     }
-                    Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                        // 跳过已注册的子进程，交由 reap_all() 处理
-                        if registered_pids.contains(&(pid.as_raw() as u32)) {
-                            debug!(
-                                "[ProcessReaper] Skipping registered child PID={} (signal={:?}), \
-                                 will be reaped by reap_all()",
-                                pid, signal
-                            );
-                            continue;
-                        }
-                        reaped_this_round += 1;
-                        debug!(
-                            "[ProcessReaper] Reaped zombie proactively: PID={}, signal={:?}",
-                            pid, signal
-                        );
-                    }
-                    Ok(WaitStatus::StillAlive) => {
-                        // WNOHANG: 没有更多的僵尸进程
-                        break;
-                    }
-                    Ok(WaitStatus::Stopped(pid, signal)) => {
-                        // 进程被停止（不是退出），不计入回收
-                        debug!(
-                            "[ProcessReaper] Process stopped: PID={}, signal={:?}",
-                            pid, signal
-                        );
-                        // 继续循环，可能还有其他僵尸进程
-                        continue;
-                    }
-                    Ok(WaitStatus::Continued(pid)) => {
-                        // 进程被恢复（SIGCONT），不计入回收
-                        debug!("[ProcessReaper] Process resumed: PID={}", pid);
-                        // 继续循环，可能还有其他僵尸进程
-                        continue;
-                    }
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    Ok(WaitStatus::PtraceEvent(pid, signal, event)) => {
-                        // ptrace 事件，不计入回收
-                        debug!(
-                            "[ProcessReaper] ptrace event: PID={}, signal={:?}, event={}",
-                            pid, signal, event
-                        );
-                        continue;
-                    }
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    Ok(WaitStatus::PtraceSyscall(pid)) => {
-                        // ptrace 系统调用，不计入回收
-                        debug!("[ProcessReaper] ptrace syscall: PID={}", pid);
-                        continue;
+                    Ok(WaitStatus::StillAlive) | Ok(_) => {
+                        // 还没真正退出 / 停止·恢复等非退出事件, 下轮再说
                     }
                     Err(nix::errno::Errno::ECHILD) => {
-                        // 没有子进程
-                        break;
+                        // 已被回收(如 tokio 刚收), 跳过
                     }
                     Err(e) => {
-                        warn!("[ProcessReaper] waitpid error: {}", e);
-                        break;
+                        warn!("[ProcessReaper] waitpid({}) error: {}", z.pid, e);
                     }
                 }
             }
@@ -283,7 +235,7 @@ impl ReaperState {
             if reaped_this_round > 0 {
                 self.reaped_count += reaped_this_round;
                 info!(
-                    "[ProcessReaper] Reaped {} zombies proactively (total: {})",
+                    "[ProcessReaper] Reaped {} orphan zombies (total: {})",
                     reaped_this_round, self.reaped_count
                 );
             }
@@ -328,6 +280,51 @@ fn parse_stat_file(pid: u32, content: &str) -> Option<ZombieProcessInfo> {
         comm,
         state,
     })
+}
+
+/// 一次 /proc 扫描, 同时返回: (僵尸进程列表, 当前全部存活 PID 集合)。
+///
+/// 僵尸列表供 `reap_all_zombies_blocking` 按 PID 回收; 存活 PID 集合供
+/// `reaper_coord::prune_dead_pids` 清理注册表中已退出的 tokio 子进程 PID。
+/// 合并成一次 /proc 遍历, 避免重复扫描。
+fn scan_proc_zombies_and_live() -> (Vec<ZombieProcessInfo>, std::collections::HashSet<u32>) {
+    let mut zombies = Vec::new();
+    let mut live = std::collections::HashSet::new();
+
+    #[cfg(unix)]
+    {
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(pid) = name.to_string_lossy().parse::<u32>().ok() else {
+                    continue;
+                };
+                live.insert(pid);
+                if let Ok(content) = fs::read_to_string(entry.path().join("stat"))
+                    && let Some(info) = parse_stat_file(pid, &content)
+                    && info.state == 'Z'
+                {
+                    zombies.push(info);
+                }
+            }
+        }
+    }
+
+    if !zombies.is_empty() {
+        warn!(
+            "[ProcessReaper] Detected {} zombie processes (total detected: {})",
+            zombies.len(),
+            zombies.len()
+        );
+        for z in &zombies {
+            warn!(
+                "[ProcessReaper] Zombie process: PID={}, PPID={}, CMD={}",
+                z.pid, z.ppid, z.comm
+            );
+        }
+    }
+
+    (zombies, live)
 }
 
 /// 启动进程回收器任务
@@ -413,29 +410,24 @@ async fn run_reaper_with_detection(
 
     loop {
         tokio::select! {
-            // 等待 SIGCHLD 信号
+            // SIGCHLD: 只 reap_all(已注册子进程, cheap try_wait)。
+            // 不在此处 reap_all_zombies_blocking —— 它会扫 /proc, 而 build 期间 SIGCHLD 极多
+            // (每个编译进程退出都发一个), 逐信号扫 /proc 会拖慢 build。孤儿回收交给定时分支。
             _ = sigchld.recv() => {
                 if state.config.verbose {
                     debug!("[ProcessReaper] Received SIGCHLD");
                 }
                 state.reap_all();
-                state.reap_all_zombies_blocking();
             }
-            // 定期轮询（每 5 秒）
+            // 定期轮询（每 5 秒）—— 只 reap 已注册子进程
             _ = poll_interval.tick() => {
                 state.reap_all();
             }
-            // 🔍 定期主动检测和清理僵尸进程
+            // 🔍 定期主动回收孤儿僵尸(reap_all_zombies_blocking 内部一次 /proc 扫描:
+            // 找 PPID==1 僵尸 + 跳过 tokio 拥有 + 按具体 PID 回收 + 清理注册表死 PID)。
             _ = zombie_detect_interval.tick() => {
                 debug!("[ProcessReaper] Running scheduled zombie detection...");
-
-                // 先检测有哪些僵尸进程
-                let zombies = state.detect_zombie_processes();
-
-                // 然后主动清理所有僵尸进程
-                if !zombies.is_empty() {
-                    state.reap_all_zombies_blocking();
-                }
+                state.reap_all_zombies_blocking();
             }
         }
     }
@@ -450,17 +442,17 @@ async fn run_reaper_without_detection(
 ) {
     loop {
         tokio::select! {
-            // 等待 SIGCHLD 信号
+            // SIGCHLD: 只 reap_all(cheap, 不扫 /proc —— 见 with_detection 注释)
             _ = sigchld.recv() => {
                 if state.config.verbose {
                     debug!("[ProcessReaper] Received SIGCHLD");
                 }
                 state.reap_all();
-                state.reap_all_zombies_blocking();
             }
-            // 定期轮询（每 5 秒）
+            // 定期轮询（每 5 秒）—— 此模式无独立 zombie_detect 定时, 故在此处顺带回收孤儿
             _ = poll_interval.tick() => {
                 state.reap_all();
+                state.reap_all_zombies_blocking();
             }
         }
     }
@@ -493,13 +485,9 @@ async fn run_reaper_polling_with_detection(mut state: ReaperState, detect_interv
         tokio::select! {
             _ = interval.tick() => {
                 state.reap_all();
-                state.reap_all_zombies_blocking();
             }
             _ = zombie_detect_interval.tick() => {
-                let zombies = state.detect_zombie_processes();
-                if !zombies.is_empty() {
-                    state.reap_all_zombies_blocking();
-                }
+                state.reap_all_zombies_blocking();
             }
         }
     }

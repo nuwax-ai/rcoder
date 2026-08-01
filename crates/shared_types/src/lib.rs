@@ -62,6 +62,8 @@ pub use permission_types::{
 pub mod constants;
 // 工作区路径常量 (单一事实源, 所有 crate 共用: rcoder/docker_manager/agent_runner)
 pub mod paths;
+// PID 1 reaper 与 tokio::process 协调注册表 (避免 waitpid(-1) 抢 tokio 子进程 → ECHILD)
+pub mod reaper_coord;
 pub use constants::*;
 
 // 错误码定义模块 — 重导出自 shared_types_i18n（过渡期兼容）

@@ -59,6 +59,10 @@ pub(super) async fn install(
         .spawn()
         .map_err(|source| InstallError::Spawn { source })?;
     let child_pid = child.id();
+    // 登记 tokio 拥有的 PID: reaper 回收孤儿时跳过它,避免抢 pnpm 子进程 → ECHILD
+    if let Some(pid) = child_pid {
+        shared_types::reaper_coord::register_tokio_pid(pid);
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_logs = logs.cloned();
