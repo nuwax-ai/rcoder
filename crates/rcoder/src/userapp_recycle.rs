@@ -20,7 +20,7 @@ use crate::router::AppState;
 /// 扫描器运行期配置(秒 → Duration,由 background_tasks 从 AppConfig 装配)
 pub(crate) struct UserAppRecycleRuntimeConfig {
     /// 闲置阈值(秒;per-app 注解可覆盖)
-    pub idle_timeout_secs: u64,
+    pub idle_timeout: Duration,
     /// 扫描间隔
     pub scan_interval: Duration,
     /// 新建 app 最小保护期(龄期小于此值不回收)
@@ -39,8 +39,8 @@ impl UserAppRecycleScanner {
 
     pub async fn run(self) {
         info!(
-            "[USERAPP_RECYCLE] scanner started (interval={:?}, idle_timeout={}s, protection={:?})",
-            self.config.scan_interval, self.config.idle_timeout_secs, self.config.protection
+            "[USERAPP_RECYCLE] scanner started (interval={:?}, idle_timeout={:?}, protection={:?})",
+            self.config.scan_interval, self.config.idle_timeout, self.config.protection
         );
         let mut interval = tokio::time::interval(self.config.scan_interval);
         interval.tick().await; // 消耗首次立即 tick(给启动 grace;Running app 已被 rebuild_stopped_apps 种 last_accessed=now)
@@ -78,7 +78,7 @@ impl UserAppRecycleScanner {
                     is_waking: self.state.activity.is_waking(&app.app_id),
                     age,
                     idle,
-                    per_app_idle_secs: app.idle_timeout_seconds,
+                    per_app_idle: app.idle_timeout_seconds.map(Duration::from_secs),
                 },
                 &self.config,
             );
@@ -130,8 +130,8 @@ struct RecycleEvalInput {
     age: Option<Duration>,
     /// `Some(最近访问至今)`；`None`=从未被 HTTP 访问 → grace 跳过
     idle: Option<Duration>,
-    /// per-app 注解覆盖；`None`=用全局 `cfg.idle_timeout_secs`
-    per_app_idle_secs: Option<u64>,
+    /// per-app 注解覆盖；`None`=用全局 `cfg.idle_timeout`
+    per_app_idle: Option<Duration>,
 }
 
 /// 纯函数：给定 app 状态 + 配置，判定是否应回收。提取自 `do_scan` 便于单测覆盖所有跳过分支。
@@ -157,7 +157,7 @@ fn decide_recycle(input: &RecycleEvalInput, cfg: &UserAppRecycleRuntimeConfig) -
         Some(d) => d,
         None => return RecycleDecision::Skip("never accessed (grace)"),
     };
-    let threshold = Duration::from_secs(input.per_app_idle_secs.unwrap_or(cfg.idle_timeout_secs));
+    let threshold = input.per_app_idle.unwrap_or(cfg.idle_timeout);
     if idle < threshold {
         return RecycleDecision::Skip("below idle threshold");
     }
@@ -179,7 +179,7 @@ mod tests {
 
     fn cfg() -> UserAppRecycleRuntimeConfig {
         UserAppRecycleRuntimeConfig {
-            idle_timeout_secs: 432_000, // 5d
+            idle_timeout: Duration::from_secs(432_000), // 5d
             scan_interval: Duration::from_secs(3600),
             protection: Duration::from_secs(300),
         }
@@ -296,7 +296,7 @@ mod tests {
                 replicas: 1,
                 age: Some(Duration::from_secs(1000)),
                 idle: Some(Duration::from_secs(100)),
-                per_app_idle_secs: Some(60),
+                per_app_idle: Some(Duration::from_secs(60)),
                 ..Default::default()
             },
             &cfg(),

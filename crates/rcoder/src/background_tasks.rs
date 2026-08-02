@@ -83,7 +83,7 @@ pub async fn start_all_background_tasks(
     // 闲置超阈值 → scale0 回收;付费 app 注解 recycle-enabled=false opt-out;流量唤醒由 pingora 负责。
     let userapp_recycle_handle = if config.userapp_recycle.enabled {
         let recycle_cfg = userapp_recycle::UserAppRecycleRuntimeConfig {
-            idle_timeout_secs: config.userapp_recycle.idle_timeout_seconds,
+            idle_timeout: Duration::from_secs(config.userapp_recycle.idle_timeout_seconds),
             scan_interval: Duration::from_secs(config.userapp_recycle.scan_interval_seconds),
             protection: Duration::from_secs(config.userapp_recycle.protection_seconds),
         };

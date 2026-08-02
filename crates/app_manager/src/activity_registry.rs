@@ -10,12 +10,12 @@
 //! runtime 构建后(RuntimeManager::get)经 [`AppActivityRegistry::set_runtime`] 注入(OnceLock 延迟)。
 //! wake 只在 `is_stopped` 真时触发,而 `stopped` 表要到 `AppService::new` 才填充——此时 OnceLock 早已 set。
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use ::tokio::sync::watch;
-use ::tokio::time::sleep;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
+use tokio::sync::watch;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, warn};
 
 use container_runtime_api::UserAppRuntime;
@@ -25,6 +25,10 @@ use shared_types::{AppAccessTracker, AppWakeControl, WakeOutcome};
 const TOUCH_THROTTLE: Duration = Duration::from_secs(5);
 /// wake 轮询 `get_deployment_status` 的间隔
 const WAKE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// follower 等待 leader 的额外宽限(leader 的 WakeGuard drop 必先广播,follower 不应先超时)
+const WAKE_FOLLOWER_GRACE: Duration = Duration::from_secs(10);
+/// leader 异常退出(panic)时广播给 follower 的失败原因
+const WAKE_LEADER_ABORTED: &str = "wake leader aborted";
 
 /// 进行中的唤醒句柄(leader 持有 `tx`,follower `subscribe` 后等结果)
 struct WakeHandle {
@@ -36,11 +40,11 @@ struct WakeHandle {
 ///    避免 follower 干等 dead-man 超时);
 /// 2. 从 `waking` 移除条目(防泄漏)。
 struct WakeGuard {
-    map: std::sync::Arc<DashMap<String, std::sync::Arc<WakeHandle>>>,
+    map: Arc<DashMap<String, Arc<WakeHandle>>>,
     key: String,
-    handle: std::sync::Arc<WakeHandle>,
+    handle: Arc<WakeHandle>,
     /// leader 完成后写入 outcome;panic 时仍为 None → drop 发 `Failed`。
-    result: std::sync::Arc<std::sync::Mutex<Option<WakeOutcome>>>,
+    result: Arc<Mutex<Option<WakeOutcome>>>,
 }
 
 impl Drop for WakeGuard {
@@ -51,7 +55,7 @@ impl Drop for WakeGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-            .unwrap_or_else(|| WakeOutcome::Failed("wake leader aborted".into()));
+            .unwrap_or_else(|| WakeOutcome::Failed(WAKE_LEADER_ABORTED.into()));
         let _ = self.handle.tx.send(Some(outcome));
         self.map.remove(&self.key);
     }
@@ -62,11 +66,11 @@ pub struct AppActivityRegistry {
     /// app_id → 最近一次真实 HTTP 访问时刻(节流更新)
     last_accessed: DashMap<String, Instant>,
     /// app_id → 已 stopped(scale0)标记;stop/start/wake/重启重建 共同维护
-    stopped: DashMap<String, ()>,
+    stopped: DashSet<String>,
     /// app_id → 进行中的唤醒句目(并发合流)
-    waking: std::sync::Arc<DashMap<String, std::sync::Arc<WakeHandle>>>,
+    waking: Arc<DashMap<String, Arc<WakeHandle>>>,
     /// runtime 延迟注入(wake 需要 scale + 查 status;启动早期拿不到,故 OnceLock)
-    runtime: OnceLock<std::sync::Arc<dyn UserAppRuntime>>,
+    runtime: OnceLock<Arc<dyn UserAppRuntime>>,
     /// 唤醒 hold-and-wait 上限
     wake_timeout: Duration,
     /// touch 节流(可配,便于测试)
@@ -83,8 +87,8 @@ impl AppActivityRegistry {
     fn new_with(wake_timeout: Duration, throttle: Duration) -> Self {
         Self {
             last_accessed: DashMap::new(),
-            stopped: DashMap::new(),
-            waking: std::sync::Arc::new(DashMap::new()),
+            stopped: DashSet::new(),
+            waking: Arc::new(DashMap::new()),
             runtime: OnceLock::new(),
             wake_timeout,
             throttle,
@@ -92,7 +96,7 @@ impl AppActivityRegistry {
     }
 
     /// 注入 runtime(幂等;重复 set 告警不覆盖)。main.rs 在 runtime 构建后调用。
-    pub fn set_runtime(&self, rt: std::sync::Arc<dyn UserAppRuntime>) {
+    pub fn set_runtime(&self, rt: Arc<dyn UserAppRuntime>) {
         if self.runtime.set(rt).is_err() {
             warn!("[ACTIVITY] set_runtime called twice; keeping existing runtime");
         }
@@ -100,7 +104,7 @@ impl AppActivityRegistry {
 
     /// 标记 app 为 stopped(scale0)。AppService::stop_app / 回收扫描器调用。
     pub fn mark_stopped(&self, app_id: &str) {
-        self.stopped.insert(app_id.to_string(), ());
+        self.stopped.insert(app_id.to_string());
     }
 
     /// 是否有进行中的唤醒(回收扫描器据此跳过,避免与 in-flight wake 竞态)
@@ -129,7 +133,7 @@ impl AppActivityRegistry {
     /// leader 实际执行唤醒:scale→1 + 轮询直到 Running/Error/超时
     async fn wake_leader(&self, app_id: &str) -> WakeOutcome {
         // double-check:进入 leader 前可能已被别处拉起
-        if !self.stopped.contains_key(app_id) {
+        if !self.stopped.contains(app_id) {
             return WakeOutcome::AlreadyRunning;
         }
         let rt = match self.runtime.get() {
@@ -191,7 +195,7 @@ impl AppAccessTracker for AppActivityRegistry {
 #[async_trait::async_trait]
 impl AppWakeControl for AppActivityRegistry {
     fn is_stopped(&self, app_id: &str) -> bool {
-        self.stopped.contains_key(app_id)
+        self.stopped.contains(app_id)
     }
 
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
@@ -205,9 +209,9 @@ impl AppWakeControl for AppActivityRegistry {
                 // LEADER:建 channel、插入句柄;result cell + WakeGuard 保证退出时
                 // (含 panic)必广播一次 outcome 并移除条目。
                 let (tx, _rx) = watch::channel(None::<WakeOutcome>);
-                let h = std::sync::Arc::new(WakeHandle { tx });
+                let h = Arc::new(WakeHandle { tx });
                 e.insert(h.clone()); // VacantEntry::insert 消耗 e,语句结束即释放 entry shard 锁
-                let result = std::sync::Arc::new(std::sync::Mutex::new(None::<WakeOutcome>));
+                let result = Arc::new(Mutex::new(None::<WakeOutcome>));
                 let outcome = {
                     let _guard = WakeGuard {
                         map: self.waking.clone(),
@@ -237,14 +241,12 @@ impl AppWakeControl for AppActivityRegistry {
         }
         // 等 leader 广播(WakeGuard drop 必 send 一次)。changed() Err = leader 的所有 tx 句柄全 drop
         // (理论不会发生:guard + follower 各持一份 Arc<WakeHandle>);dead-man 开关兜底极端情况。
-        match ::tokio::time::timeout(self.wake_timeout + Duration::from_secs(10), rx.changed())
-            .await
-        {
+        match timeout(self.wake_timeout + WAKE_FOLLOWER_GRACE, rx.changed()).await {
             Ok(Ok(())) => rx
                 .borrow()
                 .clone()
                 .unwrap_or(WakeOutcome::Failed("no outcome".into())),
-            Ok(Err(_)) => WakeOutcome::Failed("wake leader aborted".into()),
+            Ok(Err(_)) => WakeOutcome::Failed(WAKE_LEADER_ABORTED.into()),
             Err(_) => WakeOutcome::Failed("wake join timeout".into()),
         }
     }
@@ -253,8 +255,8 @@ impl AppWakeControl for AppActivityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::Mutex as StdMutex;
+    use Arc;
+    use Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use container_runtime_api::{
@@ -433,10 +435,9 @@ mod tests {
     /// 让已 subscribe 的 follower 立即收到(而非干等 dead-man 超时)。
     #[tokio::test]
     async fn guard_broadcasts_failed_on_drop_when_leader_did_not_finish() {
-        let map: std::sync::Arc<DashMap<String, std::sync::Arc<WakeHandle>>> =
-            std::sync::Arc::new(DashMap::new());
+        let map: Arc<DashMap<String, Arc<WakeHandle>>> = Arc::new(DashMap::new());
         let (tx, _) = watch::channel(None::<WakeOutcome>);
-        let handle = std::sync::Arc::new(WakeHandle { tx });
+        let handle = Arc::new(WakeHandle { tx });
         map.insert("app-g".to_string(), handle.clone());
 
         // follower 先 subscribe(模拟并发请求 join 到 leader)
@@ -447,8 +448,7 @@ mod tests {
         );
 
         // leader 中途 panic:result 仍为 None,guard drop
-        let result: std::sync::Arc<std::sync::Mutex<Option<WakeOutcome>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result: Arc<Mutex<Option<WakeOutcome>>> = Arc::new(Mutex::new(None));
         {
             let _guard = WakeGuard {
                 map: map.clone(),
