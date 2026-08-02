@@ -103,10 +103,6 @@ pub async fn set_recycle_policy(
     Path(app_id): Path<String>,
     Json(request): Json<RecyclePolicyRequest>,
 ) -> Result<axum::Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    info!(
-        "[APP] set recycle policy: {} (enabled={:?}, idle_timeout={:?})",
-        app_id, request.recycle_enabled, request.idle_timeout_seconds
-    );
     let runtime = state
         .app_service
         .set_recycle_policy(&app_id, request)

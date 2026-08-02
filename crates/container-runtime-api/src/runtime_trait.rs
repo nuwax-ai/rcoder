@@ -290,8 +290,8 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     }
 
     /// 修改闲置回收策略（只 patch Deployment `metadata.annotations`，不碰 pod template → 不触发 rollout）。
-    /// 字段 `None` = 不改该键；至少一个 `Some` 由上层校验。默认 no-op（Docker 等无注解 runtime 继承；
-    /// recycle 特性 K8s-focused）。生效于下个扫描 tick（注解 live，扫描器 `list_deployments` 读回）。
+    /// 字段 `None` = 不改该键；至少一个 `Some` 由上层校验。K8s/Docker 均已 override；
+    /// 未实现的 runtime 返回 Err（Fail Fast，避免策略被静默丢弃）。生效于下个扫描 tick。
     async fn patch_recycle_policy(
         &self,
         app_id: &str,
@@ -299,7 +299,9 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         idle_timeout_seconds: Option<u64>,
     ) -> ContainerRuntimeResult<()> {
         let _ = (app_id, recycle_enabled, idle_timeout_seconds);
-        Ok(())
+        Err(ContainerRuntimeError::ConfigurationError(
+            "patch_recycle_policy not supported by this runtime".to_string(),
+        ))
     }
 
     /// 删除 Deployment 及其关联资源（Service/HTTPRoute/ConfigMap/Secret 等）

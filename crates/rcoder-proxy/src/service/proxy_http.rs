@@ -16,6 +16,9 @@ use crate::router::RouteType;
 
 use super::{PortProxy, TrackingCtx, handlers, utils};
 
+/// 唤醒超时/失败时 503 响应的 Retry-After(秒)。客户端据此延后重试(app 仍在后台启动)。
+const WAKE_503_RETRY_AFTER_SECS: &str = "15";
+
 #[async_trait]
 impl ProxyHttp for PortProxy {
     type CTX = TrackingCtx;
@@ -64,7 +67,7 @@ impl ProxyHttp for PortProxy {
                     shared_types::WakeOutcome::Timeout | shared_types::WakeOutcome::Failed(_) => {
                         // hold-and-wait 超时/失败：app 仍在后台启动，返 503 + Retry-After
                         let mut resp = ResponseHeader::build(503, None)?;
-                        resp.insert_header("Retry-After", "15")?;
+                        resp.insert_header("Retry-After", WAKE_503_RETRY_AFTER_SECS)?;
                         session.write_response_header(Box::new(resp), true).await?;
                         return Ok(true); // 已直接响应，跳过 upstream
                     }

@@ -72,12 +72,14 @@ impl UserAppRecycleScanner {
                 .last_accessed_at(&app.app_id)
                 .map(|t| now.saturating_duration_since(t));
             let decision = decide_recycle(
-                app.replicas,
-                app.recycle_enabled,
-                self.state.activity.is_waking(&app.app_id),
-                age,
-                idle,
-                app.idle_timeout_seconds,
+                &RecycleEvalInput {
+                    replicas: app.replicas,
+                    recycle_enabled: app.recycle_enabled,
+                    is_waking: self.state.activity.is_waking(&app.app_id),
+                    age,
+                    idle,
+                    per_app_idle_secs: app.idle_timeout_seconds,
+                },
                 &self.config,
             );
             let app_id = &app.app_id;
@@ -99,9 +101,6 @@ impl UserAppRecycleScanner {
                 }
             }
         }
-        if recycled > 0 {
-            info!("[USERAPP_RECYCLE] tick recycled {} app(s)", recycled);
-        }
         Ok(recycled)
     }
 }
@@ -120,42 +119,45 @@ enum RecycleDecision {
     Skip(&'static str),
 }
 
-/// 纯函数:给定 app 状态 + 配置,判定是否应回收。提取自 `do_scan` 便于单测覆盖所有跳过分支。
-///
-/// 判定顺序(短路):非 Running → 付费 opt-out → 唤醒中 → protection 龄期 → 从未访问 grace → 闲置阈值。
-///
-/// - `age`:`Some(创建至今)`,`None`=未知(无法判 protection → 放行后续检查)。
-/// - `idle`:`Some(最近访问至今)`,`None`=从未被 HTTP 访问 → grace 跳过。
-/// - `per_app_idle_secs`:per-app 注解覆盖;`None`=用全局 `cfg.idle_timeout_secs`。
-fn decide_recycle(
+/// 单 app 的回收判定输入（扫描器从 `AppRuntimeInfo` + activity registry 装配）。
+#[derive(Default)]
+struct RecycleEvalInput {
     replicas: i32,
+    /// absent / Some(true) = 可回收；Some(false) = 付费永不回收
     recycle_enabled: Option<bool>,
     is_waking: bool,
+    /// `Some(创建至今)`；`None`=未知（无法判 protection → 放行后续检查）
     age: Option<Duration>,
+    /// `Some(最近访问至今)`；`None`=从未被 HTTP 访问 → grace 跳过
     idle: Option<Duration>,
+    /// per-app 注解覆盖；`None`=用全局 `cfg.idle_timeout_secs`
     per_app_idle_secs: Option<u64>,
-    cfg: &UserAppRecycleRuntimeConfig,
-) -> RecycleDecision {
-    if replicas <= 0 {
+}
+
+/// 纯函数：给定 app 状态 + 配置，判定是否应回收。提取自 `do_scan` 便于单测覆盖所有跳过分支。
+///
+/// 判定顺序(短路):非 Running → 付费 opt-out → 唤醒中 → protection 龄期 → 从未访问 grace → 闲置阈值。
+fn decide_recycle(input: &RecycleEvalInput, cfg: &UserAppRecycleRuntimeConfig) -> RecycleDecision {
+    if input.replicas <= 0 {
         return RecycleDecision::Skip("not running");
     }
     // absent / Some(true) = 可回收(免费默认);Some(false) = 付费永不回收
-    if recycle_enabled == Some(false) {
+    if input.recycle_enabled == Some(false) {
         return RecycleDecision::Skip("opt-out (paid)");
     }
-    if is_waking {
+    if input.is_waking {
         return RecycleDecision::Skip("wake in flight");
     }
-    if let Some(age) = age
+    if let Some(age) = input.age
         && age < cfg.protection
     {
         return RecycleDecision::Skip("within protection");
     }
-    let idle = match idle {
+    let idle = match input.idle {
         Some(d) => d,
         None => return RecycleDecision::Skip("never accessed (grace)"),
     };
-    let threshold = Duration::from_secs(per_app_idle_secs.unwrap_or(cfg.idle_timeout_secs));
+    let threshold = Duration::from_secs(input.per_app_idle_secs.unwrap_or(cfg.idle_timeout_secs));
     if idle < threshold {
         return RecycleDecision::Skip("below idle threshold");
     }
@@ -183,18 +185,18 @@ mod tests {
         }
     }
 
-    // ---- decide_recycle: 全部分支 ----
+    // ---- decide_recycle: 全部分支(named-field 输入,..Default 聚焦被测字段) ----
 
     #[test]
     fn decide_recycles_idle_running_app() {
         // Running + 可回收 + 龄期足够 + idle 超全局阈值 → Recycle
         let d = decide_recycle(
-            1,
-            None,
-            false,
-            Some(Duration::from_secs(1000)),
-            Some(Duration::from_secs(500_000)),
-            None,
+            &RecycleEvalInput {
+                replicas: 1,
+                age: Some(Duration::from_secs(1000)),
+                idle: Some(Duration::from_secs(500_000)),
+                ..Default::default()
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Recycle);
@@ -203,12 +205,10 @@ mod tests {
     #[test]
     fn decide_skips_not_running() {
         let d = decide_recycle(
-            0,
-            None,
-            false,
-            None,
-            Some(Duration::from_secs(500_000)),
-            None,
+            &RecycleEvalInput {
+                replicas: 0,
+                ..Default::default()
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Skip("not running"));
@@ -217,12 +217,13 @@ mod tests {
     #[test]
     fn decide_skips_paid_opt_out() {
         let d = decide_recycle(
-            1,
-            Some(false),
-            false,
-            Some(Duration::from_secs(1000)),
-            Some(Duration::from_secs(500_000)),
-            None,
+            &RecycleEvalInput {
+                replicas: 1,
+                recycle_enabled: Some(false),
+                age: Some(Duration::from_secs(1000)),
+                idle: Some(Duration::from_secs(500_000)),
+                ..Default::default()
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Skip("opt-out (paid)"));
@@ -231,12 +232,13 @@ mod tests {
     #[test]
     fn decide_skips_wake_in_flight() {
         let d = decide_recycle(
-            1,
-            None,
-            true,
-            Some(Duration::from_secs(1000)),
-            Some(Duration::from_secs(500_000)),
-            None,
+            &RecycleEvalInput {
+                replicas: 1,
+                is_waking: true,
+                age: Some(Duration::from_secs(1000)),
+                idle: Some(Duration::from_secs(500_000)),
+                ..Default::default()
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Skip("wake in flight"));
@@ -246,12 +248,12 @@ mod tests {
     fn decide_skips_within_protection() {
         // age=10s < protection=300s
         let d = decide_recycle(
-            1,
-            None,
-            false,
-            Some(Duration::from_secs(10)),
-            Some(Duration::from_secs(500_000)),
-            None,
+            &RecycleEvalInput {
+                replicas: 1,
+                age: Some(Duration::from_secs(10)),
+                idle: Some(Duration::from_secs(500_000)),
+                ..Default::default()
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Skip("within protection"));
@@ -261,12 +263,11 @@ mod tests {
     fn decide_skips_never_accessed() {
         // idle=None → grace(刚建还没流量)
         let d = decide_recycle(
-            1,
-            None,
-            false,
-            Some(Duration::from_secs(1000)),
-            None,
-            None,
+            &RecycleEvalInput {
+                replicas: 1,
+                age: Some(Duration::from_secs(1000)),
+                ..Default::default() // idle 默认 None
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Skip("never accessed (grace)"));
@@ -276,12 +277,12 @@ mod tests {
     fn decide_skips_below_threshold() {
         // idle=100s < 全局阈值 432000s
         let d = decide_recycle(
-            1,
-            None,
-            false,
-            Some(Duration::from_secs(1000)),
-            Some(Duration::from_secs(100)),
-            None,
+            &RecycleEvalInput {
+                replicas: 1,
+                age: Some(Duration::from_secs(1000)),
+                idle: Some(Duration::from_secs(100)),
+                ..Default::default()
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Skip("below idle threshold"));
@@ -291,12 +292,13 @@ mod tests {
     fn decide_per_app_threshold_overrides_global() {
         // per-app 阈值=60s;idle=100s > 60 → Recycle(即便全局 432000 本会跳过)
         let d = decide_recycle(
-            1,
-            None,
-            false,
-            Some(Duration::from_secs(1000)),
-            Some(Duration::from_secs(100)),
-            Some(60),
+            &RecycleEvalInput {
+                replicas: 1,
+                age: Some(Duration::from_secs(1000)),
+                idle: Some(Duration::from_secs(100)),
+                per_app_idle_secs: Some(60),
+                ..Default::default()
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Recycle);
@@ -306,12 +308,12 @@ mod tests {
     fn decide_absent_recycle_enabled_treated_as_recyclable() {
         // recycle_enabled=None(旧 app 无注解)= 免费默认可回收
         let d = decide_recycle(
-            1,
-            None,
-            false,
-            Some(Duration::from_secs(1000)),
-            Some(Duration::from_secs(500_000)),
-            None,
+            &RecycleEvalInput {
+                replicas: 1,
+                age: Some(Duration::from_secs(1000)),
+                idle: Some(Duration::from_secs(500_000)),
+                ..Default::default()
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Recycle);
@@ -320,12 +322,13 @@ mod tests {
     #[test]
     fn decide_explicit_recyclable_true_recycles() {
         let d = decide_recycle(
-            1,
-            Some(true),
-            false,
-            Some(Duration::from_secs(1000)),
-            Some(Duration::from_secs(500_000)),
-            None,
+            &RecycleEvalInput {
+                replicas: 1,
+                recycle_enabled: Some(true),
+                age: Some(Duration::from_secs(1000)),
+                idle: Some(Duration::from_secs(500_000)),
+                ..Default::default()
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Recycle);
@@ -335,12 +338,11 @@ mod tests {
     fn decide_unknown_age_does_not_block_recycle() {
         // age=None(无法判 protection)→ 不因 protection 跳过,继续后续检查;idle 超阈值 → Recycle
         let d = decide_recycle(
-            1,
-            None,
-            false,
-            None,
-            Some(Duration::from_secs(500_000)),
-            None,
+            &RecycleEvalInput {
+                replicas: 1,
+                idle: Some(Duration::from_secs(500_000)),
+                ..Default::default() // age 默认 None
+            },
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Recycle);

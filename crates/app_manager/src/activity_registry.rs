@@ -6,8 +6,8 @@
 //! - [`AppWakeControl`](shared_types::AppWakeControl):stopped app 收到请求时 hold-and-wait 拉起,
 //!   并发请求经 `tokio::sync::watch` 合流为一次 scale-up。
 //!
-//! 构造顺序:rcoder 启动早期(main.rs ~:80)独立构造为 `Arc`,注入 Pingora(访问/唤醒);
-//! runtime 在 main.rs:122 构建后经 [`AppActivityRegistry::set_runtime`] 注入(OnceLock 延迟)。
+//! 构造顺序:rcoder 启动早期(init_proxy 之前)独立构造为 `Arc`,注入 Pingora(访问/唤醒);
+//! runtime 构建后(RuntimeManager::get)经 [`AppActivityRegistry::set_runtime`] 注入(OnceLock 延迟)。
 //! wake 只在 `is_stopped` 真时触发,而 `stopped` 表要到 `AppService::new` 才填充——此时 OnceLock 早已 set。
 
 use std::sync::OnceLock;
@@ -322,10 +322,6 @@ mod tests {
         }
     }
 
-    fn registry_stopped(reg: &AppActivityRegistry, app_id: &str) {
-        reg.mark_stopped(app_id);
-    }
-
     #[tokio::test]
     async fn touch_throttle_collapses_writes_within_window() {
         let reg = AppActivityRegistry::new_with(Duration::from_secs(1), Duration::from_millis(100));
@@ -353,7 +349,7 @@ mod tests {
         let rt = Arc::new(MockRuntime::new(true)); // scale 后转 Running
         let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
         reg.set_runtime(rt.clone());
-        registry_stopped(&reg, "app-x");
+        reg.mark_stopped("app-x");
 
         // 5 并发唤醒:无论时序如何都只 scale 一次——
         // leader 拉起后 mark_running 清 stopped,后到者走 leader 路径时 is_stopped=false → AlreadyRunning(不再 scale);
@@ -390,7 +386,7 @@ mod tests {
         let reg =
             AppActivityRegistry::new_with(Duration::from_millis(300), Duration::from_millis(50));
         reg.set_runtime(rt.clone());
-        registry_stopped(&reg, "app-t");
+        reg.mark_stopped("app-t");
 
         let outcome = reg.ensure_running("app-t").await;
         assert_eq!(outcome, WakeOutcome::Timeout);
@@ -408,7 +404,7 @@ mod tests {
             Duration::from_millis(50),
         ));
         reg.set_runtime(rt.clone());
-        registry_stopped(&reg, "app-p");
+        reg.mark_stopped("app-p");
 
         // 第一次唤醒(leader panic)
         let jh = tokio::spawn({

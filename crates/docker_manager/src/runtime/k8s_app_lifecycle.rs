@@ -47,7 +47,7 @@ impl KubernetesRuntime {
         if let Some(b) = recycle_enabled {
             ann.insert(
                 RECYCLE_ENABLED_ANNOTATION.to_string(),
-                serde_json::Value::from(if b { "true" } else { "false" }),
+                serde_json::Value::from(b.to_string()),
             );
         }
         if let Some(s) = idle_timeout_seconds {

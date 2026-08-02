@@ -106,10 +106,7 @@ pub(crate) fn encode_recycle_annotations(
 ) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     let enabled = params.recycle_enabled.unwrap_or(true);
-    m.insert(
-        RECYCLE_ENABLED_ANNOTATION.to_string(),
-        if enabled { "true" } else { "false" }.to_string(),
-    );
+    m.insert(RECYCLE_ENABLED_ANNOTATION.to_string(), enabled.to_string());
     if let Some(secs) = params.idle_timeout_seconds {
         m.insert(IDLE_TIMEOUT_ANNOTATION.to_string(), secs.to_string());
     }

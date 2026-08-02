@@ -279,6 +279,30 @@ fn default_userapp_protection_seconds() -> u64 {
     300 // 5 分钟
 }
 
+/// 从环境变量读取 bool 覆盖 target;解析失败 warn 不阻塞(Fail Fast 仅记日志,沿用默认)。
+fn env_override_bool(key: &str, target: &mut bool) {
+    if let Ok(val) = std::env::var(key)
+        && let Ok(v) = val.parse::<bool>()
+    {
+        *target = v;
+        info!(" {key}: {v}");
+    } else if let Ok(val) = std::env::var(key) {
+        warn!(" parse {key} failed: {val}");
+    }
+}
+
+/// 从环境变量读取 u64 覆盖 target。
+fn env_override_u64(key: &str, target: &mut u64) {
+    if let Ok(val) = std::env::var(key)
+        && let Ok(v) = val.parse::<u64>()
+    {
+        *target = v;
+        info!(" {key}: {v}");
+    } else if let Ok(val) = std::env::var(key) {
+        warn!(" parse {key} failed: {val}");
+    }
+}
+
 impl Default for UserAppRecycleConfig {
     fn default() -> Self {
         Self {
@@ -689,54 +713,26 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     }
 
     // 应用 UserApp 自动回收配置的环境变量覆盖
-    if let Ok(val) = std::env::var("RCODER_USERAPP_RECYCLE_ENABLED") {
-        match val.parse::<bool>() {
-            Ok(v) => {
-                config.userapp_recycle.enabled = v;
-                info!(" RCODER_USERAPP_RECYCLE_ENABLED: {}", v);
-            }
-            Err(_) => warn!(" parse RCODER_USERAPP_RECYCLE_ENABLED failed: {}", val),
-        }
-    }
-    if let Ok(val) = std::env::var("RCODER_USERAPP_IDLE_TIMEOUT_SECONDS") {
-        match val.parse::<u64>() {
-            Ok(v) => {
-                config.userapp_recycle.idle_timeout_seconds = v;
-                info!(" RCODER_USERAPP_IDLE_TIMEOUT_SECONDS: {}", v);
-            }
-            Err(_) => warn!(" parse RCODER_USERAPP_IDLE_TIMEOUT_SECONDS failed: {}", val),
-        }
-    }
-    if let Ok(val) = std::env::var("RCODER_USERAPP_SCAN_INTERVAL_SECONDS") {
-        match val.parse::<u64>() {
-            Ok(v) => {
-                config.userapp_recycle.scan_interval_seconds = v;
-                info!(" RCODER_USERAPP_SCAN_INTERVAL_SECONDS: {}", v);
-            }
-            Err(_) => warn!(
-                " parse RCODER_USERAPP_SCAN_INTERVAL_SECONDS failed: {}",
-                val
-            ),
-        }
-    }
-    if let Ok(val) = std::env::var("RCODER_USERAPP_WAKE_TIMEOUT_SECONDS") {
-        match val.parse::<u64>() {
-            Ok(v) => {
-                config.userapp_recycle.wake_timeout_seconds = v;
-                info!(" RCODER_USERAPP_WAKE_TIMEOUT_SECONDS: {}", v);
-            }
-            Err(_) => warn!(" parse RCODER_USERAPP_WAKE_TIMEOUT_SECONDS failed: {}", val),
-        }
-    }
-    if let Ok(val) = std::env::var("RCODER_USERAPP_PROTECTION_SECONDS") {
-        match val.parse::<u64>() {
-            Ok(v) => {
-                config.userapp_recycle.protection_seconds = v;
-                info!(" RCODER_USERAPP_PROTECTION_SECONDS: {}", v);
-            }
-            Err(_) => warn!(" parse RCODER_USERAPP_PROTECTION_SECONDS failed: {}", val),
-        }
-    }
+    env_override_bool(
+        "RCODER_USERAPP_RECYCLE_ENABLED",
+        &mut config.userapp_recycle.enabled,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_IDLE_TIMEOUT_SECONDS",
+        &mut config.userapp_recycle.idle_timeout_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_SCAN_INTERVAL_SECONDS",
+        &mut config.userapp_recycle.scan_interval_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_WAKE_TIMEOUT_SECONDS",
+        &mut config.userapp_recycle.wake_timeout_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_PROTECTION_SECONDS",
+        &mut config.userapp_recycle.protection_seconds,
+    );
 
     // 验证 API Key 配置
     if config.api_key_auth.enabled && config.api_key_auth.api_key.trim().is_empty() {

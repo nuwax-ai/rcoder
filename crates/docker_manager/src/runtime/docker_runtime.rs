@@ -21,14 +21,31 @@ use tracing::info;
 
 use crate::DockerManager;
 
+/// Docker 内存态回收策略（Docker 无 K8s 注解；字段 None = 未设/沿用默认）。
+#[derive(Clone, Copy, Default)]
+struct RecyclePolicy {
+    recycle_enabled: Option<bool>,
+    idle_timeout_seconds: Option<u64>,
+}
+
+impl RecyclePolicy {
+    /// merge：参数为 None 则保留旧值（self），Some 则覆盖。返回新策略。
+    fn merge(self, recycle_enabled: Option<bool>, idle_timeout_seconds: Option<u64>) -> Self {
+        Self {
+            recycle_enabled: recycle_enabled.or(self.recycle_enabled),
+            idle_timeout_seconds: idle_timeout_seconds.or(self.idle_timeout_seconds),
+        }
+    }
+}
+
 /// Docker runtime implementation wrapping DockerManager
 pub struct DockerRuntime {
     inner: Arc<DockerManager>,
     /// TTL cache for list_containers result (15 seconds)
     list_cache: Cache<(), Vec<RuntimeContainerInfo>>,
     /// UserApp 闲置回收策略（Docker 无 K8s 注解，改用内存态；dev 模式可接受重启丢失，
-    /// 与 pingora_ports 同架构）。app_id → (recycle_enabled, idle_timeout_seconds)，merge 语义。
-    recycle_policy: DashMap<String, (Option<bool>, Option<u64>)>,
+    /// 与 pingora_ports 同架构）。app_id → RecyclePolicy，merge 语义。
+    recycle_policy: DashMap<String, RecyclePolicy>,
 }
 
 impl DockerRuntime {
@@ -44,12 +61,12 @@ impl DockerRuntime {
         }
     }
 
-    /// 读 app 的回收策略（内存态）。未设置 → (None, None) = 默认可回收。
-    fn recycle_policy_of(&self, app_id: &str) -> (Option<bool>, Option<u64>) {
+    /// 读 app 的回收策略（内存态）。未设置 → 默认（recyclable）。
+    fn recycle_policy_of(&self, app_id: &str) -> RecyclePolicy {
         self.recycle_policy
             .get(app_id)
             .map(|e| *e.value())
-            .unwrap_or((None, None))
+            .unwrap_or_default()
     }
 }
 
@@ -526,16 +543,14 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         recycle_enabled: Option<bool>,
         idle_timeout_seconds: Option<u64>,
     ) -> ContainerRuntimeResult<()> {
-        match self.recycle_policy.entry(app_id.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                let (re, it) = *e.get();
-                // merge:新值 None 则保留旧值
-                e.insert((recycle_enabled.or(re), idle_timeout_seconds.or(it)));
-            }
-            dashmap::mapref::entry::Entry::Vacant(e) => {
-                e.insert((recycle_enabled, idle_timeout_seconds));
-            }
-        }
+        // merge 语义统一:Occupied 合并旧值,Vacant 以 default(全 None) 为基底 merge。
+        // and_modify/or_insert_with 把两分支的 merge 语义收敛为一处表达。
+        self.recycle_policy
+            .entry(app_id.to_string())
+            .and_modify(|p| *p = p.merge(recycle_enabled, idle_timeout_seconds))
+            .or_insert_with(|| {
+                RecyclePolicy::default().merge(recycle_enabled, idle_timeout_seconds)
+            });
         info!(
             "[DOCKER-APP] recycle policy patched: {app_id} (enabled={:?}, idle_timeout={:?})",
             recycle_enabled, idle_timeout_seconds
@@ -624,7 +639,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         let ip = extract_container_ip(&inspect, None);
         // 提前借用 inspect 提取 ports（避免下方 inspect.state 消费后借用冲突）
         let ports = extract_container_ports(&inspect);
-        let (recycle_enabled, idle_timeout_seconds) = self.recycle_policy_of(app_id);
+        let rp = self.recycle_policy_of(app_id);
         Ok(Some(DeploymentStatus {
             app_id: app_id.to_string(),
             replicas: if running { 1 } else { 0 },
@@ -637,8 +652,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             started_at: inspect.state.as_ref().and_then(|s| s.started_at.clone()),
             ports,
             resource_version: None,
-            recycle_enabled,
-            idle_timeout_seconds,
+            recycle_enabled: rp.recycle_enabled,
+            idle_timeout_seconds: rp.idle_timeout_seconds,
             ..Default::default()
         }))
     }
@@ -722,7 +737,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                         .collect()
                 })
                 .unwrap_or_default();
-            let (recycle_enabled, idle_timeout_seconds) = self.recycle_policy_of(&app_id);
+            let rp = self.recycle_policy_of(&app_id);
             out.push(DeploymentStatus {
                 app_id,
                 replicas: if running { 1 } else { 0 },
@@ -735,8 +750,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 started_at: None,
                 ports,
                 resource_version: None,
-                recycle_enabled,
-                idle_timeout_seconds,
+                recycle_enabled: rp.recycle_enabled,
+                idle_timeout_seconds: rp.idle_timeout_seconds,
                 ..Default::default()
             });
         }
