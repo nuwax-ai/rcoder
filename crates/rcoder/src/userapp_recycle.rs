@@ -116,7 +116,30 @@ fn age_of(created_at: &str) -> Option<Duration> {
 #[derive(Debug, PartialEq, Eq)]
 enum RecycleDecision {
     Recycle,
-    Skip(&'static str),
+    Skip(SkipReason),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SkipReason {
+    NotRunning,
+    OptOut,
+    WakeInFlight,
+    WithinProtection,
+    NeverAccessed,
+    BelowThreshold,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRunning => write!(f, "not running"),
+            Self::OptOut => write!(f, "opt-out (paid)"),
+            Self::WakeInFlight => write!(f, "wake in flight"),
+            Self::WithinProtection => write!(f, "within protection"),
+            Self::NeverAccessed => write!(f, "never accessed (grace)"),
+            Self::BelowThreshold => write!(f, "below idle threshold"),
+        }
+    }
 }
 
 /// 单 app 的回收判定输入（扫描器从 `AppRuntimeInfo` + activity registry 装配）。
@@ -139,27 +162,27 @@ struct RecycleEvalInput {
 /// 判定顺序(短路):非 Running → 付费 opt-out → 唤醒中 → protection 龄期 → 从未访问 grace → 闲置阈值。
 fn decide_recycle(input: &RecycleEvalInput, cfg: &UserAppRecycleRuntimeConfig) -> RecycleDecision {
     if input.replicas <= 0 {
-        return RecycleDecision::Skip("not running");
+        return RecycleDecision::Skip(SkipReason::NotRunning);
     }
     // absent / Some(true) = 可回收(免费默认);Some(false) = 付费永不回收
     if input.recycle_enabled == Some(false) {
-        return RecycleDecision::Skip("opt-out (paid)");
+        return RecycleDecision::Skip(SkipReason::OptOut);
     }
     if input.is_waking {
-        return RecycleDecision::Skip("wake in flight");
+        return RecycleDecision::Skip(SkipReason::WakeInFlight);
     }
     if let Some(age) = input.age
         && age < cfg.protection
     {
-        return RecycleDecision::Skip("within protection");
+        return RecycleDecision::Skip(SkipReason::WithinProtection);
     }
     let idle = match input.idle {
         Some(d) => d,
-        None => return RecycleDecision::Skip("never accessed (grace)"),
+        None => return RecycleDecision::Skip(SkipReason::NeverAccessed),
     };
     let threshold = input.per_app_idle.unwrap_or(cfg.idle_timeout);
     if idle < threshold {
-        return RecycleDecision::Skip("below idle threshold");
+        return RecycleDecision::Skip(SkipReason::BelowThreshold);
     }
     RecycleDecision::Recycle
 }
@@ -211,7 +234,7 @@ mod tests {
             },
             &cfg(),
         );
-        assert_eq!(d, RecycleDecision::Skip("not running"));
+        assert_eq!(d, RecycleDecision::Skip(SkipReason::NotRunning));
     }
 
     #[test]
@@ -226,7 +249,7 @@ mod tests {
             },
             &cfg(),
         );
-        assert_eq!(d, RecycleDecision::Skip("opt-out (paid)"));
+        assert_eq!(d, RecycleDecision::Skip(SkipReason::OptOut));
     }
 
     #[test]
@@ -241,7 +264,7 @@ mod tests {
             },
             &cfg(),
         );
-        assert_eq!(d, RecycleDecision::Skip("wake in flight"));
+        assert_eq!(d, RecycleDecision::Skip(SkipReason::WakeInFlight));
     }
 
     #[test]
@@ -256,7 +279,7 @@ mod tests {
             },
             &cfg(),
         );
-        assert_eq!(d, RecycleDecision::Skip("within protection"));
+        assert_eq!(d, RecycleDecision::Skip(SkipReason::WithinProtection));
     }
 
     #[test]
@@ -270,7 +293,7 @@ mod tests {
             },
             &cfg(),
         );
-        assert_eq!(d, RecycleDecision::Skip("never accessed (grace)"));
+        assert_eq!(d, RecycleDecision::Skip(SkipReason::NeverAccessed));
     }
 
     #[test]
@@ -285,7 +308,7 @@ mod tests {
             },
             &cfg(),
         );
-        assert_eq!(d, RecycleDecision::Skip("below idle threshold"));
+        assert_eq!(d, RecycleDecision::Skip(SkipReason::BelowThreshold));
     }
 
     #[test]
