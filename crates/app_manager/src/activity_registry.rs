@@ -172,6 +172,38 @@ impl AppActivityRegistry {
             sleep(WAKE_POLL_INTERVAL).await;
         }
     }
+
+    /// Leader 路径:result cell + WakeGuard 保证退出时(含 panic)必广播 outcome 并移除 waking 条目。
+    async fn become_leader(&self, app_id: &str, handle: Arc<WakeHandle>) -> WakeOutcome {
+        let result = Arc::new(Mutex::new(None::<WakeOutcome>));
+        let _guard = WakeGuard {
+            map: self.waking.clone(),
+            key: app_id.to_string(),
+            handle: handle.clone(),
+            result: result.clone(),
+        };
+        let r = self.wake_leader(app_id).await;
+        // 写入 result;_guard 在函数返回/panic unwind 时 drop → 广播给 follower + 移除 waking 条目
+        *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.clone());
+        r
+    }
+
+    /// Follower 路径:subscribe + 等 leader 广播(WakeGuard drop 必 send 一次)。
+    async fn join_as_follower(&self, handle: Arc<WakeHandle>) -> WakeOutcome {
+        let mut rx = handle.tx.subscribe();
+        // leader 可能已 finished(borrow 拿到 Some)
+        if let Some(outcome) = rx.borrow().clone() {
+            return outcome;
+        }
+        match timeout(self.wake_timeout + WAKE_FOLLOWER_GRACE, rx.changed()).await {
+            Ok(Ok(())) => rx
+                .borrow()
+                .clone()
+                .unwrap_or(WakeOutcome::Failed("no outcome".into())),
+            Ok(Err(_)) => WakeOutcome::Failed(WAKE_LEADER_ABORTED.into()),
+            Err(_) => WakeOutcome::Failed("wake join timeout".into()),
+        }
+    }
 }
 
 impl AppAccessTracker for AppActivityRegistry {
@@ -200,54 +232,18 @@ impl AppWakeControl for AppActivityRegistry {
 
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
         // Single-flight:DashMap::entry 原子 insert-or-join 选主
-        let handle = match self.waking.entry(app_id.to_string()) {
+        match self.waking.entry(app_id.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(e) => {
-                // FOLLOWER:克隆句柄,释放 entry guard 后等结果
-                e.get().clone()
+                // FOLLOWER:克隆句柄 → delegate
+                self.join_as_follower(e.get().clone()).await
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
-                // LEADER:建 channel、插入句柄;result cell + WakeGuard 保证退出时
-                // (含 panic)必广播一次 outcome 并移除条目。
+                // LEADER:建 channel、插入句柄(释放 shard lock)→ delegate
                 let (tx, _rx) = watch::channel(None::<WakeOutcome>);
-                let h = Arc::new(WakeHandle { tx });
-                e.insert(h.clone()); // VacantEntry::insert 消耗 e,语句结束即释放 entry shard 锁
-                let result = Arc::new(Mutex::new(None::<WakeOutcome>));
-                let outcome = {
-                    let _guard = WakeGuard {
-                        map: self.waking.clone(),
-                        key: app_id.to_string(),
-                        handle: h.clone(),
-                        result: result.clone(),
-                    };
-                    let r = self.wake_leader(app_id).await;
-                    // 正常完成:写入 result,guard drop 时取出 Some(r) 广播给 follower。
-                    // unwrap_or_else(into_inner):锁毒化(理论不会发生)也不 panic,与 WakeGuard::drop 一致。
-                    *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.clone());
-                    r
-                    // _guard 在此 drop:
-                    //   - 正常:取 result(=Some),send 给 follower,移除条目
-                    //   - panic(wake_leader 中途 unwound):result 仍 None → 发 Failed("aborted"),
-                    //     follower 立即收到(不再干等 dead-man 超时),移除条目
-                };
-                return outcome;
+                let handle = Arc::new(WakeHandle { tx });
+                e.insert(handle.clone());
+                self.become_leader(app_id, handle).await
             }
-        };
-
-        // —— FOLLOWER 路径 ——
-        let mut rx = handle.tx.subscribe();
-        // leader 可能已 finished(borrow 拿到 Some)
-        if let Some(outcome) = rx.borrow().clone() {
-            return outcome;
-        }
-        // 等 leader 广播(WakeGuard drop 必 send 一次)。changed() Err = leader 的所有 tx 句柄全 drop
-        // (理论不会发生:guard + follower 各持一份 Arc<WakeHandle>);dead-man 开关兜底极端情况。
-        match timeout(self.wake_timeout + WAKE_FOLLOWER_GRACE, rx.changed()).await {
-            Ok(Ok(())) => rx
-                .borrow()
-                .clone()
-                .unwrap_or(WakeOutcome::Failed("no outcome".into())),
-            Ok(Err(_)) => WakeOutcome::Failed(WAKE_LEADER_ABORTED.into()),
-            Err(_) => WakeOutcome::Failed("wake join timeout".into()),
         }
     }
 }
