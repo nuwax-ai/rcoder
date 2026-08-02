@@ -20,6 +20,7 @@ impl AppService {
             .map_err(|e| {
                 map_runtime_error(&format!("[APP] scale_deployment failed app_id={app_id}"), e)
             })?;
+        self.activity.mark_running(app_id);
         info!("[APP] app started (scale=1): {}", app_id);
         self.get_app(app_id).await
     }
@@ -35,6 +36,7 @@ impl AppService {
             .map_err(|e| {
                 map_runtime_error(&format!("[APP] scale_deployment failed app_id={app_id}"), e)
             })?;
+        self.activity.mark_stopped(app_id);
         info!("[APP] app stopped (scale=0): {}", app_id);
         self.get_app(app_id).await
     }

@@ -50,6 +50,10 @@ pub struct ContainerCreateParams {
     pub health_check: Option<AppHealthCheck>,
     /// 应用资源需求（字符串格式；与 resource_limits 二选一，UserApp 专用）
     pub app_resources: Option<AppResourceRequirements>,
+    /// 是否参与闲置自动回收（UserApp 用；None/Some(true)=可回收=免费用户默认，Some(false)=永不回收=付费/常驻）
+    pub recycle_enabled: Option<bool>,
+    /// 闲置回收阈值秒数（UserApp 用；None=用全局默认，Some=per-app 覆盖）
+    pub idle_timeout_seconds: Option<u64>,
 }
 
 impl ContainerCreateParams {
@@ -79,6 +83,8 @@ pub struct ContainerCreateParamsBuilder {
     ports: Option<Vec<AppPortSpec>>,
     health_check: Option<AppHealthCheck>,
     app_resources: Option<AppResourceRequirements>,
+    recycle_enabled: Option<bool>,
+    idle_timeout_seconds: Option<u64>,
 }
 
 impl ContainerCreateParamsBuilder {
@@ -172,6 +178,16 @@ impl ContainerCreateParamsBuilder {
         self
     }
 
+    pub fn recycle_enabled(mut self, recycle_enabled: bool) -> Self {
+        self.recycle_enabled = Some(recycle_enabled);
+        self
+    }
+
+    pub fn idle_timeout_seconds(mut self, idle_timeout_seconds: u64) -> Self {
+        self.idle_timeout_seconds = Some(idle_timeout_seconds);
+        self
+    }
+
     pub fn build(self) -> ContainerCreateParams {
         ContainerCreateParams {
             project_id: self.project_id,
@@ -192,6 +208,8 @@ impl ContainerCreateParamsBuilder {
             ports: self.ports,
             health_check: self.health_check,
             app_resources: self.app_resources,
+            recycle_enabled: self.recycle_enabled,
+            idle_timeout_seconds: self.idle_timeout_seconds,
         }
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! fetch_runtime_status* / ensure_app_exists / build_runtime_info / build_access_info。
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use container_runtime_api::{DeploymentStatus, ExposeType as RtExposeType, HttpExpose};
 use shared_types::ServiceType;
@@ -106,7 +106,35 @@ impl AppService {
             conditions,
             health,
             resource_version: status.resource_version,
+            recycle_enabled: status.recycle_enabled,
+            idle_timeout_seconds: status.idle_timeout_seconds,
+            created_at: status.created_at,
         }
+    }
+
+    /// 重建活动状态内存态(rcoder 重启后调用):`list_deployments` →
+    /// replicas==0 的 `mark_stopped`(支持流量唤醒识别 stopped app);replicas>0 的 `seed_accessed`(种
+    /// last_accessed=now,给 Running app 完整 grace 周期,避免重启后立刻被回收)。失败向上传播。
+    pub(crate) async fn rebuild_stopped_apps(&self) -> AppResult<()> {
+        let deploys = self.runtime.list_deployments().await.map_err(|e| {
+            map_runtime_error("[APP] list_deployments failed (rebuild_stopped_apps)", e)
+        })?;
+        let mut stopped = 0u32;
+        let mut running = 0u32;
+        for s in deploys {
+            if s.replicas == 0 {
+                self.activity.mark_stopped(&s.app_id);
+                stopped += 1;
+            } else {
+                self.activity.seed_accessed(&s.app_id);
+                running += 1;
+            }
+        }
+        info!(
+            "[APP] activity rebuild: {} stopped, {} running apps seeded",
+            stopped, running
+        );
+        Ok(())
     }
 
     /// 构建访问信息（按 `http_expose` 决定 HTTP path；一律只返 path，host 由 Java 拼）

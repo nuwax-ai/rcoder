@@ -595,6 +595,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             started_at: inspect.state.as_ref().and_then(|s| s.started_at.clone()),
             ports,
             resource_version: None,
+            ..Default::default()
         }))
     }
 
@@ -689,6 +690,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 started_at: None,
                 ports,
                 resource_version: None,
+                ..Default::default()
             });
         }
         Ok(out)

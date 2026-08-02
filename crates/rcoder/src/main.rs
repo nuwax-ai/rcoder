@@ -15,6 +15,7 @@ mod service;
 mod shutdown;
 mod skill_sync_reconciler;
 mod userapp_publish;
+mod userapp_recycle;
 mod utils;
 mod workspace_migrate;
 
@@ -84,10 +85,24 @@ async fn main() -> anyhow::Result<()> {
     let projects_for_lookup = Arc::clone(&projects);
     let container_lookup: Arc<dyn shared_types::ContainerLookup> = projects_for_lookup;
 
+    // UserApp 活动状态注册表（闲置回收 + 流量唤醒的共享状态）。
+    // 独立 Arc 在 Pingora 之前构造（注入代理层）；runtime 延迟到下方 RuntimeManager::get 后
+    // 经 set_runtime 填充（OnceLock）——wake 只在 is_stopped 真时触发，而 stopped 表要到
+    // AppService::new 才填充，此时 OnceLock 早已 set。
+    let wake_timeout = std::time::Duration::from_secs(
+        bootstrap_result.config.userapp_recycle.wake_timeout_seconds,
+    );
+    let activity_registry: Arc<app_manager::AppActivityRegistry> =
+        Arc::new(app_manager::AppActivityRegistry::new(wake_timeout));
+    let access_tracker: Arc<dyn shared_types::AppAccessTracker> = activity_registry.clone();
+    let wake_control: Arc<dyn shared_types::AppWakeControl> = activity_registry.clone();
+
     let proxy_result = proxy_init::init_proxy(
         &bootstrap_result.config,
         Arc::clone(&bootstrap_result.api_key_config),
         container_lookup,
+        access_tracker,
+        wake_control,
     )
     .await;
     proxy_init::log_proxy_info(&bootstrap_result.config);
@@ -123,6 +138,10 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get container runtime: {}", e))?;
 
+    // 注入 runtime 到活动注册表（wake 需要 scale + 查 status；启动早期 OnceLock 为空，此处填充）。
+    // trait upcasting: Arc<dyn ContainerRuntime> → Arc<dyn UserAppRuntime>（supertrait，Rust 1.86+）
+    activity_registry.set_runtime(runtime.clone());
+
     // 阶段2 批量迁移: 启动后台 task 将共享 PVC 老数据一次性迁到 per-agent PVC (env 开关, 默认 false)
     batch_migrate::spawn_if_enabled(runtime.clone());
 
@@ -150,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
             runtime,
             projects,
             cleanup_rx,
+            activity_registry.clone(),
         )
         .await?,
     );

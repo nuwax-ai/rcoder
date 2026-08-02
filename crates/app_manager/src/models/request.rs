@@ -35,6 +35,14 @@ pub struct CreateAppRequest {
     pub tenant_id: Option<String>,
     /// 空间 ID（多租户场景）
     pub space_id: Option<String>,
+    /// 是否参与闲置自动回收（None/Some(true)=可回收=免费用户默认；Some(false)=永不回收=付费/常驻）。
+    /// rcoder 持久化为 Deployment 注解 `rcoder.io/recycle-enabled`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recycle_enabled: Option<bool>,
+    /// 闲置回收阈值秒数（per-app 覆盖全局 `userapp_recycle.idle_timeout_seconds`）。
+    /// rcoder 持久化为注解 `rcoder.io/idle-timeout-seconds`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_seconds: Option<u64>,
 }
 
 /// 查询应用请求
@@ -109,6 +117,12 @@ pub struct UpdateAppRequest {
     pub tenant_id: Option<String>,
     /// 空间 ID（携带以保持 label）
     pub space_id: Option<String>,
+    /// 是否参与闲置自动回收（None=沿用既有/默认；Some 覆盖）。部分更新时由 rcoder 回填旧值（SSA 保留）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recycle_enabled: Option<bool>,
+    /// 闲置回收阈值秒数（部分更新时由 rcoder 回填旧值）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_seconds: Option<u64>,
     /// 乐观锁：传入 `GET /apps/{id}` 返回的 `resource_version`；不匹配 → 409 ERR_CONFLICT。
     /// 不传 = 不校验（向后兼容）。Docker 模式 resource_version=None，忽略。
     #[serde(skip_serializing_if = "Option::is_none")]

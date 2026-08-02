@@ -103,6 +103,15 @@ pub struct AppRuntimeInfo {
     pub resource_version: Option<String>,
     /// 健康信息（由 build_runtime_info 经 health_from_status 统一派生；消除 handler 重复派生）
     pub health: HealthInfo,
+    /// 是否参与闲置自动回收（None=旧 app/未知；Some(false)=付费永不回收）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recycle_enabled: Option<bool>,
+    /// 闲置回收阈值秒数（per-app 覆盖；None=用全局配置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_seconds: Option<u64>,
+    /// Deployment 创建时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// 健康信息

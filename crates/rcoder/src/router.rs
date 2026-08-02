@@ -95,6 +95,8 @@ pub struct AppState {
     pub agent_download_manager: Arc<AgentDownloadManager>,
     /// 应用管理服务
     pub app_service: Arc<dyn app_manager::AppServiceTrait>,
+    /// UserApp 活动状态注册表（闲置回收/流量唤醒共享状态；扫描器读 last_accessed/waking）
+    pub activity: Arc<app_manager::AppActivityRegistry>,
     /// K8s 集群域名（用于构建 K8s Service FQDN）
     pub cluster_domain: String,
     /// UserApp 自动化构建发布任务表(rcoder 侧编排:正向调 agent-runner build + 同进程 app_manager 发布)。
@@ -112,6 +114,7 @@ impl AppState {
         runtime: Arc<dyn ContainerRuntime>,
         projects: Arc<ProjectAdapter>,
         cleanup_rx: tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>,
+        activity: Arc<app_manager::AppActivityRegistry>,
     ) -> anyhow::Result<Self> {
         // ProjectAdapter 由调用方（main.rs）提前创建并注入，
         // 以便同一 Arc 实例可同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层。
@@ -133,6 +136,7 @@ impl AppState {
             app_manager::service::AppService::new(
                 config.app_manager.clone(),
                 runtime.clone(),
+                activity.clone(),
                 pingora.clone(),
             )
             .await
@@ -154,6 +158,7 @@ impl AppState {
             cleanup_rx: Arc::new(std::sync::Mutex::new(Some(cleanup_rx))),
             agent_download_manager,
             app_service,
+            activity,
             cluster_domain,
             publish_tasks: Arc::new(crate::userapp_publish::PublishTaskStore::new()),
         })

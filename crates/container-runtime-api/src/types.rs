@@ -191,7 +191,7 @@ pub struct AppPortStatus {
 }
 
 /// Deployment 运行时状态（供 app_manager 实时查询，rcoder 无状态化读路径的数据载体）
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct DeploymentStatus {
     /// 应用 ID（app_id）
     pub app_id: String,
@@ -217,6 +217,13 @@ pub struct DeploymentStatus {
     /// K8s Deployment.resourceVersion（乐观锁用，update/delete 校验 expected_resource_version）。
     /// Docker 无此概念，填 None（开发环境不校验乐观锁）。
     pub resource_version: Option<String>,
+    /// 是否参与闲置自动回收（None=注解缺失/旧 app=按免费默认可回收；Some(false)=付费永不回收）。
+    /// 由 `rcoder.io/recycle-enabled` 注解读回。
+    pub recycle_enabled: Option<bool>,
+    /// 闲置回收阈值秒数（per-app 覆盖；None=用全局配置）。由 `rcoder.io/idle-timeout-seconds` 注解读回。
+    pub idle_timeout_seconds: Option<u64>,
+    /// Deployment 创建时间（RFC3339，来自 metadata.creationTimestamp；回收扫描器做 protection 龄期判断）。
+    pub created_at: Option<String>,
 }
 
 /// app 容器当前 `command`/`env` 快照（`update` 部分更新回退用）。

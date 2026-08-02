@@ -13,7 +13,9 @@ use k8s_openapi::api::apps::v1::Deployment;
 #[cfg(feature = "kubernetes")]
 use kube::api::ListParams;
 
-use super::k8s_app_helpers::{PORT_EXPOSE_ANNOTATION, parse_port_expose};
+use super::k8s_app_helpers::{
+    IDLE_TIMEOUT_ANNOTATION, PORT_EXPOSE_ANNOTATION, RECYCLE_ENABLED_ANNOTATION, parse_port_expose,
+};
 use super::k8s_deployment::{
     APP_CONTAINER_NAME, APP_LABEL_PREFIX, APP_MANAGED_BY, RCODER_LABEL_PREFIX,
 };
@@ -137,6 +139,21 @@ impl KubernetesRuntime {
         let tcp_nodeports = self.collect_tcp_nodeports(app_id).await;
         let ports = derive_port_statuses(deploy, &tcp_nodeports);
 
+        // recycle 配置从 Deployment metadata.annotations 读回（absent=旧 app=默认可回收）；
+        // created_at 来自 creationTimestamp，供回收扫描器做 protection 龄期判断。
+        let ann = deploy.metadata.annotations.as_ref();
+        let recycle_enabled = ann
+            .and_then(|a| a.get(RECYCLE_ENABLED_ANNOTATION))
+            .map(|s| !s.eq_ignore_ascii_case("false"));
+        let idle_timeout_seconds = ann
+            .and_then(|a| a.get(IDLE_TIMEOUT_ANNOTATION))
+            .and_then(|s| s.parse::<u64>().ok());
+        let created_at = deploy
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|t| t.0.to_string());
+
         DeploymentStatus {
             app_id: app_id.to_string(),
             replicas,
@@ -153,6 +170,9 @@ impl KubernetesRuntime {
             started_at,
             ports,
             resource_version: deploy.metadata.resource_version.clone(),
+            recycle_enabled,
+            idle_timeout_seconds,
+            created_at,
         }
     }
 

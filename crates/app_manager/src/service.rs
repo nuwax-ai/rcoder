@@ -22,6 +22,8 @@ use uuid::Uuid;
 use container_runtime_api::{ExposeType as RtExposeType, HttpExpose, UserAppRuntime};
 use rcoder_proxy::PingoraProxyService;
 
+use crate::AppActivityRegistry;
+
 use super::config::{AppAccessMode, AppManagerConfig};
 use super::models::*;
 use super::utils::*;
@@ -32,6 +34,8 @@ pub struct AppService {
     /// ISP 收紧 (阶段3): app_manager 只需 workspace (B) + UserApp Deployment (C) 能力,
     /// 不依赖 agent 容器生命周期 (A) —— 类型声明即编译期约束 (调用 agent 方法会编译错).
     pub(crate) runtime: Arc<dyn UserAppRuntime>,
+    /// UserApp 活动状态注册表(闲置回收/流量唤醒的共享状态:last_accessed/stopped/waking)
+    pub(crate) activity: Arc<AppActivityRegistry>,
     /// Pingora 代理（Docker 模式用于注册 HTTP backend；K8s 模式通常为 None）
     pub(crate) pingora: Option<Arc<PingoraProxyService>>,
     /// 路径解析器缓存（单例；Docker 模式将 rcoder 容器内路径解析为宿主机路径）
@@ -48,6 +52,7 @@ impl AppService {
     pub async fn new(
         config: AppManagerConfig,
         runtime: Arc<dyn UserAppRuntime>,
+        activity: Arc<AppActivityRegistry>,
         pingora: Option<Arc<PingoraProxyService>>,
     ) -> AppResult<Self> {
         let path_resolver: Cache<String, Arc<HostPathResolver>> =
@@ -93,6 +98,7 @@ impl AppService {
         let svc = Self {
             config,
             runtime,
+            activity,
             pingora,
             path_resolver,
             pingora_ports: DashMap::new(),
@@ -108,6 +114,13 @@ impl AppService {
                 "[APP] pingora backends rebuild failed (HTTP temporarily unreachable after restart, recovered on next create/update): {}",
                 e
             );
+        }
+        // 重建活动状态内存态(rcoder 重启后 last_accessed/stopped 丢失):
+        //  - replicas==0 → mark_stopped(支持流量唤醒识别)
+        //  - replicas>0  → seed_accessed=now(给 Running app 完整 grace 周期,避免重启后立刻被回收)
+        // 失败不阻塞启动(下次操作/扫描器自愈)。
+        if let Err(e) = svc.rebuild_stopped_apps().await {
+            warn!("[APP] rebuild_stopped_apps failed: {}", e);
         }
         Ok(svc)
     }
@@ -409,7 +422,7 @@ impl AppService {
             )));
         }
         let params = self
-            .build_container_params_from_update(app_id, &request)
+            .build_container_params_from_update(app_id, &request, &current)
             .await?;
         // 先注销旧 Pingora backend（K8s/Docker 都执行：Docker 旧 container_ip 失效；
         // K8s 下方按本次 http_ports 重新注册到 Service FQDN，注销-重注成对保证一致）。

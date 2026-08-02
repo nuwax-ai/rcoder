@@ -62,6 +62,9 @@ pub struct AppConfig {
     /// 容器清理配置
     #[serde(default)]
     pub cleanup_config: CleanupConfigSettings,
+    /// UserApp 闲置自动回收 + 流量唤醒配置
+    #[serde(default)]
+    pub userapp_recycle: UserAppRecycleConfig,
     /// API Key 鉴权配置
     #[serde(default)]
     pub api_key_auth: ApiKeyAuthConfig,
@@ -233,6 +236,61 @@ impl Default for CleanupConfigSettings {
     }
 }
 
+/// UserApp 闲置自动回收 + 流量唤醒配置（配置文件格式，秒为单位）
+///
+/// 默认 `enabled=true`：免费用户 app 闲置超阈值自动 scale0 回收；付费 app 经
+/// `CreateAppRequest.recycle_enabled=false`（注解 `rcoder.io/recycle-enabled=false`）opt-out 永不回收。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserAppRecycleConfig {
+    /// 是否启用自动回收 + 流量唤醒（默认 true；部署侧可 env/helm 关闭）
+    #[serde(default = "default_userapp_recycle_enabled")]
+    pub enabled: bool,
+    /// 闲置超时阈值（秒），默认 432000（5 天）
+    #[serde(default = "default_userapp_idle_timeout_seconds")]
+    pub idle_timeout_seconds: u64,
+    /// 回收扫描间隔（秒），默认 3600（1 小时）
+    #[serde(default = "default_userapp_scan_interval_seconds")]
+    pub scan_interval_seconds: u64,
+    /// 流量唤醒 hold-and-wait 上限（秒），默认 60；超时返回 503+Retry-After
+    #[serde(default = "default_userapp_wake_timeout_seconds")]
+    pub wake_timeout_seconds: u64,
+    /// 新建 app 最小保护期（秒），默认 300；龄期小于此值不回收
+    #[serde(default = "default_userapp_protection_seconds")]
+    pub protection_seconds: u64,
+}
+
+fn default_userapp_recycle_enabled() -> bool {
+    true // 默认免费用户自动回收
+}
+
+fn default_userapp_idle_timeout_seconds() -> u64 {
+    432000 // 5 天
+}
+
+fn default_userapp_scan_interval_seconds() -> u64 {
+    3600 // 1 小时
+}
+
+fn default_userapp_wake_timeout_seconds() -> u64 {
+    60
+}
+
+fn default_userapp_protection_seconds() -> u64 {
+    300 // 5 分钟
+}
+
+impl Default for UserAppRecycleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_userapp_recycle_enabled(),
+            idle_timeout_seconds: default_userapp_idle_timeout_seconds(),
+            scan_interval_seconds: default_userapp_scan_interval_seconds(),
+            wake_timeout_seconds: default_userapp_wake_timeout_seconds(),
+            protection_seconds: default_userapp_protection_seconds(),
+        }
+    }
+}
+
 /// Docker 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -275,6 +333,7 @@ impl Default for AppConfig {
             docker_config: Some(DockerConfig::default()),
             kubernetes_config: None,
             cleanup_config: CleanupConfigSettings::default(),
+            userapp_recycle: UserAppRecycleConfig::default(),
             api_key_auth: ApiKeyAuthConfig {
                 enabled: false,
                 api_key: generate_random_api_key(),
@@ -627,6 +686,56 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     if let Ok(val) = std::env::var("RCODER_API_KEY") {
         config.api_key_auth.api_key = val.clone();
         info!(" RCODER_API_KEY configured");
+    }
+
+    // 应用 UserApp 自动回收配置的环境变量覆盖
+    if let Ok(val) = std::env::var("RCODER_USERAPP_RECYCLE_ENABLED") {
+        match val.parse::<bool>() {
+            Ok(v) => {
+                config.userapp_recycle.enabled = v;
+                info!(" RCODER_USERAPP_RECYCLE_ENABLED: {}", v);
+            }
+            Err(_) => warn!(" parse RCODER_USERAPP_RECYCLE_ENABLED failed: {}", val),
+        }
+    }
+    if let Ok(val) = std::env::var("RCODER_USERAPP_IDLE_TIMEOUT_SECONDS") {
+        match val.parse::<u64>() {
+            Ok(v) => {
+                config.userapp_recycle.idle_timeout_seconds = v;
+                info!(" RCODER_USERAPP_IDLE_TIMEOUT_SECONDS: {}", v);
+            }
+            Err(_) => warn!(" parse RCODER_USERAPP_IDLE_TIMEOUT_SECONDS failed: {}", val),
+        }
+    }
+    if let Ok(val) = std::env::var("RCODER_USERAPP_SCAN_INTERVAL_SECONDS") {
+        match val.parse::<u64>() {
+            Ok(v) => {
+                config.userapp_recycle.scan_interval_seconds = v;
+                info!(" RCODER_USERAPP_SCAN_INTERVAL_SECONDS: {}", v);
+            }
+            Err(_) => warn!(
+                " parse RCODER_USERAPP_SCAN_INTERVAL_SECONDS failed: {}",
+                val
+            ),
+        }
+    }
+    if let Ok(val) = std::env::var("RCODER_USERAPP_WAKE_TIMEOUT_SECONDS") {
+        match val.parse::<u64>() {
+            Ok(v) => {
+                config.userapp_recycle.wake_timeout_seconds = v;
+                info!(" RCODER_USERAPP_WAKE_TIMEOUT_SECONDS: {}", v);
+            }
+            Err(_) => warn!(" parse RCODER_USERAPP_WAKE_TIMEOUT_SECONDS failed: {}", val),
+        }
+    }
+    if let Ok(val) = std::env::var("RCODER_USERAPP_PROTECTION_SECONDS") {
+        match val.parse::<u64>() {
+            Ok(v) => {
+                config.userapp_recycle.protection_seconds = v;
+                info!(" RCODER_USERAPP_PROTECTION_SECONDS: {}", v);
+            }
+            Err(_) => warn!(" parse RCODER_USERAPP_PROTECTION_SECONDS failed: {}", val),
+        }
     }
 
     // 验证 API Key 配置

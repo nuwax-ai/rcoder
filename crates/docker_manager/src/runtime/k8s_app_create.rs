@@ -29,8 +29,7 @@ use tracing::info;
 use shared_types::ServiceType;
 
 use super::k8s_app_helpers::{
-    build_app_resource_requirements, build_probe, config_hash_annotations,
-    encode_port_expose_annotations,
+    build_app_resource_requirements, build_probe, config_hash_annotations, merge_app_annotations,
 };
 use super::k8s_deployment::APP_CONTAINER_NAME;
 #[cfg(feature = "kubernetes")]
@@ -226,9 +225,9 @@ impl KubernetesRuntime {
                 name: Some(self.app_deployment_name(app_id)),
                 namespace: Some(self.namespace.clone()),
                 labels: Some(full_labels.clone()),
-                // 记录每个端口的 expose_type（"port:type,..."），供读路径/重启重建还原——
-                // 不依赖 NodePort，TCP 不对外时也能准确区分 Http/Tcp
-                annotations: encode_port_expose_annotations(params),
+                // Deployment metadata.annotations：port-expose + recycle 配置（SSA 单一事实源，
+                // 供读路径/重启重建还原 expose_type 与回收策略）。
+                annotations: merge_app_annotations(params),
                 ..Default::default()
             },
             spec: Some(DeploymentSpec {

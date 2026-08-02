@@ -189,6 +189,7 @@ mod tests {
             minimum_app_cli_version: "0.1.3".into(),
             runtime_image_digest: "sha256:test".into(),
             services: Vec::new(),
+            bridge_service: None,
         }
     }
 

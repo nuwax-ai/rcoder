@@ -13,6 +13,10 @@ pub use storage_types::{IdleContainerInfo, StorageStats};
 pub mod container_lookup;
 pub use container_lookup::{ContainerLookup, ProjectScope};
 
+// UserApp 活动追踪 + 流量唤醒接口模块（闲置自动回收 / wake-on-traffic）
+pub mod app_activity;
+pub use app_activity::{AppAccessTracker, AppWakeControl, WakeOutcome};
+
 // 容器条目模块（refcount + 活跃时间跟踪）
 pub mod container_entry;
 pub use container_entry::ContainerEntry;

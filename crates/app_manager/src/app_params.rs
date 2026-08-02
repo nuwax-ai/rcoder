@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use tracing::warn;
 
 use container_runtime_api::{
-    AppHealthCheck, AppPortSpec, AppResourceRequirements, ContainerCreateParams,
+    AppHealthCheck, AppPortSpec, AppResourceRequirements, ContainerCreateParams, DeploymentStatus,
 };
 use shared_types::ServiceType;
 
@@ -30,6 +30,8 @@ struct AppParamsInput {
     resources: Option<ResourceLimits>,
     tenant_id: Option<String>,
     space_id: Option<String>,
+    recycle_enabled: Option<bool>,
+    idle_timeout_seconds: Option<u64>,
 }
 
 impl AppService {
@@ -51,6 +53,8 @@ impl AppService {
                 resources: request.resources.clone(),
                 tenant_id: request.tenant_id.clone(),
                 space_id: request.space_id.clone(),
+                recycle_enabled: request.recycle_enabled,
+                idle_timeout_seconds: request.idle_timeout_seconds,
             },
         )
         .await
@@ -58,10 +62,13 @@ impl AppService {
 
     /// UpdateAppRequest → ContainerCreateParams（全量替换语义，image 必填）。
     /// image 缺失 → ERR_VALIDATION（rcoder 无状态，无法保留旧 image，调用方必须发完整新状态）。
+    /// `current` 为 update 前的 DeploymentStatus（乐观锁用同一份），其 recycle 字段用于部分更新回填
+    /// ——SSA re-apply 会擦除未携带的注解,故 `request.x.or(current.x)` 保留旧值(镜像 command/env 回退同因)。
     pub(crate) async fn build_container_params_from_update(
         &self,
         app_id: &str,
         request: &UpdateAppRequest,
+        current: &DeploymentStatus,
     ) -> AppResult<ContainerCreateParams> {
         let image = request.image.clone().ok_or_else(|| {
             AppOperationError::Validation(
@@ -104,6 +111,10 @@ impl AppService {
                 resources: request.resources.clone(),
                 tenant_id: request.tenant_id.clone(),
                 space_id: request.space_id.clone(),
+                recycle_enabled: request.recycle_enabled.or(current.recycle_enabled),
+                idle_timeout_seconds: request
+                    .idle_timeout_seconds
+                    .or(current.idle_timeout_seconds),
             },
         )
         .await
@@ -129,6 +140,8 @@ impl AppService {
             resources,
             tenant_id,
             space_id,
+            recycle_enabled,
+            idle_timeout_seconds,
         } = input;
 
         let app_dir = self.get_container_app_dir(app_id).await?;
@@ -217,6 +230,13 @@ impl AppService {
         }
         if let Some(s) = space_id {
             builder = builder.space_id(s);
+        }
+        // recycle 配置 → ContainerCreateParams → Deployment 注解(rcoder.io/recycle-enabled / idle-timeout-seconds)
+        if let Some(re) = recycle_enabled {
+            builder = builder.recycle_enabled(re);
+        }
+        if let Some(it) = idle_timeout_seconds {
+            builder = builder.idle_timeout_seconds(it);
         }
 
         Ok(builder.build())

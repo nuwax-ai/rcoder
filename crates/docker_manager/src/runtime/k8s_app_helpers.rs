@@ -14,6 +14,10 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use std::collections::BTreeMap;
 
 pub(crate) const PORT_EXPOSE_ANNOTATION: &str = "rcoder.io/port-expose";
+/// 闲置回收开关注解（absent/"true"=可回收=免费默认；"false"=永不回收=付费/常驻）
+pub(crate) const RECYCLE_ENABLED_ANNOTATION: &str = "rcoder.io/recycle-enabled";
+/// 闲置回收阈值秒数注解（per-app 覆盖全局）
+pub(crate) const IDLE_TIMEOUT_ANNOTATION: &str = "rcoder.io/idle-timeout-seconds";
 
 /// ports → annotation（`rcoder.io/port-expose: "80:http,5432:tcp"`）；无端口返 None。
 #[cfg(feature = "kubernetes")]
@@ -92,6 +96,35 @@ pub(crate) fn config_hash_annotations(
         format!("{:016x}", h.finish()),
     );
     ann
+}
+
+/// recycle 配置 → annotation：恒出 `rcoder.io/recycle-enabled`（None/true→"true"，false→"false"），
+/// `idle_timeout_seconds` 仅 Some 时写入。供 [`merge_app_annotations`] 合并到 Deployment metadata。
+#[cfg(feature = "kubernetes")]
+pub(crate) fn encode_recycle_annotations(
+    params: &container_runtime_api::ContainerCreateParams,
+) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    let enabled = params.recycle_enabled.unwrap_or(true);
+    m.insert(
+        RECYCLE_ENABLED_ANNOTATION.to_string(),
+        if enabled { "true" } else { "false" }.to_string(),
+    );
+    if let Some(secs) = params.idle_timeout_seconds {
+        m.insert(IDLE_TIMEOUT_ANNOTATION.to_string(), secs.to_string());
+    }
+    m
+}
+
+/// 合并 port-expose + recycle 注解为 Deployment metadata.annotations（SSA 单一事实源）。
+/// encode_recycle_annotations 恒非空 → 结果恒 Some。
+#[cfg(feature = "kubernetes")]
+pub(crate) fn merge_app_annotations(
+    params: &container_runtime_api::ContainerCreateParams,
+) -> Option<BTreeMap<String, String>> {
+    let mut ann = encode_port_expose_annotations(params).unwrap_or_default();
+    ann.extend(encode_recycle_annotations(params));
+    if ann.is_empty() { None } else { Some(ann) }
 }
 
 /// 健康检查配置 → K8s Probe
@@ -466,5 +499,38 @@ mod tests {
         let probe = build_probe(&hc, false).unwrap();
         assert!(probe.tcp_socket.is_some());
         assert!(probe.http_get.is_none());
+    }
+
+    #[test]
+    fn encode_recycle_annotations_roundtrip() {
+        use container_runtime_api::ContainerCreateParams;
+
+        // 付费 app:recycle=false + 自定义 idle 阈值
+        let paid = ContainerCreateParams::builder()
+            .recycle_enabled(false)
+            .idle_timeout_seconds(86400)
+            .build();
+        let ann = encode_recycle_annotations(&paid);
+        assert_eq!(
+            ann.get(RECYCLE_ENABLED_ANNOTATION).map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            ann.get(IDLE_TIMEOUT_ANNOTATION).map(String::as_str),
+            Some("86400")
+        );
+
+        // 免费默认:recycle=None → "true";无 idle 注解
+        let free = ContainerCreateParams::builder().build();
+        let ann2 = encode_recycle_annotations(&free);
+        assert_eq!(
+            ann2.get(RECYCLE_ENABLED_ANNOTATION).map(String::as_str),
+            Some("true")
+        );
+        assert!(ann2.get(IDLE_TIMEOUT_ANNOTATION).is_none());
+
+        // merge 恒出 recycle-enabled(即使无端口 → port-expose 为 None,merge 仍非空)
+        let merged = merge_app_annotations(&free).expect("merge non-empty (recycle-enabled)");
+        assert!(merged.contains_key(RECYCLE_ENABLED_ANNOTATION));
     }
 }
