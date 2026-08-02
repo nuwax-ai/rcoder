@@ -216,8 +216,9 @@ impl AppWakeControl for AppActivityRegistry {
                         result: result.clone(),
                     };
                     let r = self.wake_leader(app_id).await;
-                    // 正常完成:写入 result,guard drop 时取出 Some(r) 广播给 follower
-                    *result.lock().unwrap() = Some(r.clone());
+                    // 正常完成:写入 result,guard drop 时取出 Some(r) 广播给 follower。
+                    // unwrap_or_else(into_inner):锁毒化(理论不会发生)也不 panic,与 WakeGuard::drop 一致。
+                    *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.clone());
                     r
                     // _guard 在此 drop:
                     //   - 正常:取 result(=Some),send 给 follower,移除条目

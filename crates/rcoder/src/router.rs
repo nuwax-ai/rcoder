@@ -624,6 +624,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::start_app,
         app_manager::handlers::stop_app,
         app_manager::handlers::restart_app,
+        app_manager::handlers::set_recycle_policy,
         app_manager::handlers::get_app_logs,
         app_manager::handlers::get_app_health,
         app_manager::handlers::get_app_stats,

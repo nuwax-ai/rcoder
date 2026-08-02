@@ -80,6 +80,13 @@ pub trait AppServiceTrait: Send + Sync {
     /// 重启应用（rollout restart）
     async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
 
+    /// 设置闲置回收策略（动态、免重启：只 patch Deployment 注解）。供免费↔付费 tier 变更调用。
+    async fn set_recycle_policy(
+        &self,
+        app_id: &str,
+        request: RecyclePolicyRequest,
+    ) -> AppResult<AppRuntimeInfo>;
+
     async fn prepare_release(
         &self,
         app_id: &str,

@@ -16,6 +16,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
+use tracing::info;
+
 use crate::DockerManager;
 
 /// Docker runtime implementation wrapping DockerManager
@@ -23,6 +26,9 @@ pub struct DockerRuntime {
     inner: Arc<DockerManager>,
     /// TTL cache for list_containers result (15 seconds)
     list_cache: Cache<(), Vec<RuntimeContainerInfo>>,
+    /// UserApp 闲置回收策略（Docker 无 K8s 注解，改用内存态；dev 模式可接受重启丢失，
+    /// 与 pingora_ports 同架构）。app_id → (recycle_enabled, idle_timeout_seconds)，merge 语义。
+    recycle_policy: DashMap<String, (Option<bool>, Option<u64>)>,
 }
 
 impl DockerRuntime {
@@ -34,7 +40,16 @@ impl DockerRuntime {
                 .max_capacity(1)
                 .time_to_live(Duration::from_secs(15))
                 .build(),
+            recycle_policy: DashMap::new(),
         }
+    }
+
+    /// 读 app 的回收策略（内存态）。未设置 → (None, None) = 默认可回收。
+    fn recycle_policy_of(&self, app_id: &str) -> (Option<bool>, Option<u64>) {
+        self.recycle_policy
+            .get(app_id)
+            .map(|e| *e.value())
+            .unwrap_or((None, None))
     }
 }
 
@@ -504,6 +519,30 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         Ok(())
     }
 
+    /// Docker 无 K8s 注解,改用内存态存储回收策略(merge 语义:None=不改该字段)。
+    async fn patch_recycle_policy(
+        &self,
+        app_id: &str,
+        recycle_enabled: Option<bool>,
+        idle_timeout_seconds: Option<u64>,
+    ) -> ContainerRuntimeResult<()> {
+        match self.recycle_policy.entry(app_id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                let (re, it) = *e.get();
+                // merge:新值 None 则保留旧值
+                e.insert((recycle_enabled.or(re), idle_timeout_seconds.or(it)));
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                e.insert((recycle_enabled, idle_timeout_seconds));
+            }
+        }
+        info!(
+            "[DOCKER-APP] recycle policy patched: {app_id} (enabled={:?}, idle_timeout={:?})",
+            recycle_enabled, idle_timeout_seconds
+        );
+        Ok(())
+    }
+
     async fn restart_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         use bollard::query_parameters::{StartContainerOptions, StopContainerOptions};
         let name = app_deployment_name(app_id);
@@ -553,6 +592,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 e
             );
         }
+        // 清理内存态回收策略（K8s 靠注解随 Deployment 自动消失；Docker 需显式清，防孤儿堆积）
+        let _ = self.recycle_policy.remove(app_id);
         Ok(())
     }
 
@@ -583,6 +624,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         let ip = extract_container_ip(&inspect, None);
         // 提前借用 inspect 提取 ports（避免下方 inspect.state 消费后借用冲突）
         let ports = extract_container_ports(&inspect);
+        let (recycle_enabled, idle_timeout_seconds) = self.recycle_policy_of(app_id);
         Ok(Some(DeploymentStatus {
             app_id: app_id.to_string(),
             replicas: if running { 1 } else { 0 },
@@ -595,6 +637,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             started_at: inspect.state.as_ref().and_then(|s| s.started_at.clone()),
             ports,
             resource_version: None,
+            recycle_enabled,
+            idle_timeout_seconds,
             ..Default::default()
         }))
     }
@@ -678,6 +722,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                         .collect()
                 })
                 .unwrap_or_default();
+            let (recycle_enabled, idle_timeout_seconds) = self.recycle_policy_of(&app_id);
             out.push(DeploymentStatus {
                 app_id,
                 replicas: if running { 1 } else { 0 },
@@ -690,6 +735,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 started_at: None,
                 ports,
                 resource_version: None,
+                recycle_enabled,
+                idle_timeout_seconds,
                 ..Default::default()
             });
         }

@@ -763,6 +763,16 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         self.scale_app(app_id, replicas).await
     }
 
+    async fn patch_recycle_policy(
+        &self,
+        app_id: &str,
+        recycle_enabled: Option<bool>,
+        idle_timeout_seconds: Option<u64>,
+    ) -> ContainerRuntimeResult<()> {
+        self.patch_app_recycle_policy(app_id, recycle_enabled, idle_timeout_seconds)
+            .await
+    }
+
     async fn restart_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         self.restart_app(app_id).await
     }

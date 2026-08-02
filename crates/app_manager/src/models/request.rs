@@ -129,6 +129,20 @@ pub struct UpdateAppRequest {
     pub expected_resource_version: Option<String>,
 }
 
+/// 设置闲置回收策略（动态、免重启：只 patch Deployment 注解，不碰 pod template → 不触发 rollout）。
+///
+/// 供计费侧免费↔付费 tier 变更调用：`recycle_enabled=false`（付费→不回收）/`true`（降级免费→恢复回收）。
+/// 比 `UpdateAppRequest` 轻——无需 image、不走全量 SSA。至少需传一个字段（皆 None → ERR_VALIDATION）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecyclePolicyRequest {
+    /// 是否参与闲置回收。None=不改；Some(true)=可回收（免费默认）；Some(false)=永不回收（付费/常驻）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recycle_enabled: Option<bool>,
+    /// 闲置回收阈值秒数（per-app 覆盖全局）。None=不改/沿用。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_seconds: Option<u64>,
+}
+
 /// 日志查询参数
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LogParams {

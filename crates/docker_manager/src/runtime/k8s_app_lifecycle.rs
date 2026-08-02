@@ -16,6 +16,8 @@ use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 #[cfg(feature = "kubernetes")]
 use tracing::{info, warn};
 
+#[cfg(feature = "kubernetes")]
+use super::k8s_app_helpers::{IDLE_TIMEOUT_ANNOTATION, RECYCLE_ENABLED_ANNOTATION};
 use super::k8s_deployment::{APP_LABEL_PREFIX, APP_MANAGED_BY, RCODER_LABEL_PREFIX};
 use super::kubernetes_runtime::KubernetesRuntime;
 
@@ -29,6 +31,43 @@ impl KubernetesRuntime {
             .await
             .map_err(|e| ContainerRuntimeError::K8sError(format!("scale deployment: {e}")))?;
         info!("[K8S-APP] Deployment {name} scaled to {replicas}");
+        Ok(())
+    }
+
+    /// patch Deployment 的闲置回收策略注解(strategic merge:只改指定注解键,不碰 pod template → 不触发 rollout)。
+    /// 字段 None=不改该键;两者皆 None 由上层 service 校验拒绝(此处防御性早返 Ok)。
+    pub async fn patch_app_recycle_policy(
+        &self,
+        app_id: &str,
+        recycle_enabled: Option<bool>,
+        idle_timeout_seconds: Option<u64>,
+    ) -> ContainerRuntimeResult<()> {
+        let name = self.app_deployment_name(app_id);
+        let mut ann = serde_json::Map::new();
+        if let Some(b) = recycle_enabled {
+            ann.insert(
+                RECYCLE_ENABLED_ANNOTATION.to_string(),
+                serde_json::Value::from(if b { "true" } else { "false" }),
+            );
+        }
+        if let Some(s) = idle_timeout_seconds {
+            ann.insert(
+                IDLE_TIMEOUT_ANNOTATION.to_string(),
+                serde_json::Value::from(s.to_string()),
+            );
+        }
+        if ann.is_empty() {
+            return Ok(()); // 防御:两字段皆 None(service 层已校验)
+        }
+        let patch = serde_json::json!({ "metadata": { "annotations": ann } });
+        self.deployments_api()
+            .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("patch recycle policy: {e}")))?;
+        info!(
+            "[K8S-APP] Deployment {name} recycle policy patched (enabled={:?}, idle_timeout={:?})",
+            recycle_enabled, idle_timeout_seconds
+        );
         Ok(())
     }
 

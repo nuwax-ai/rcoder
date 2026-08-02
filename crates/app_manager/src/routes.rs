@@ -26,6 +26,10 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
         .route("/api/v1/apps/{app_id}/stop", post(handlers::stop_app))
         .route("/api/v1/apps/{app_id}/restart", post(handlers::restart_app))
         .route(
+            "/api/v1/apps/{app_id}/recycle-policy",
+            post(handlers::set_recycle_policy),
+        )
+        .route(
             "/api/v1/apps/{app_id}/releases/prepare",
             post(handlers::prepare_release),
         )

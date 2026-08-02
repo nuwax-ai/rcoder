@@ -583,6 +583,14 @@ impl super::AppServiceTrait for AppService {
         self.restart_app(app_id).await
     }
 
+    async fn set_recycle_policy(
+        &self,
+        app_id: &str,
+        request: RecyclePolicyRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        self.set_recycle_policy(app_id, request).await
+    }
+
     async fn prepare_release(
         &self,
         app_id: &str,

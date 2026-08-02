@@ -56,6 +56,37 @@ impl AppService {
         self.get_app(app_id).await
     }
 
+    /// 设置闲置回收策略（动态、免重启：strategic-merge Deployment 注解，不碰 pod template）。
+    /// 供计费侧免费↔付费 tier 变更调用。Fail Fast：两字段皆 None → ERR_VALIDATION。
+    pub async fn set_recycle_policy(
+        &self,
+        app_id: &str,
+        request: RecyclePolicyRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        validate_app_id(app_id)?;
+        // Fail Fast:先校验请求形状,再查 app 是否存在(空请求不浪费 K8s GET)
+        validate_recycle_policy_fields(request.recycle_enabled, request.idle_timeout_seconds)?;
+        self.ensure_app_exists(app_id).await?;
+        self.runtime
+            .patch_recycle_policy(
+                app_id,
+                request.recycle_enabled,
+                request.idle_timeout_seconds,
+            )
+            .await
+            .map_err(|e| {
+                map_runtime_error(
+                    &format!("[APP] patch_recycle_policy failed app_id={app_id}"),
+                    e,
+                )
+            })?;
+        info!(
+            "[APP] recycle policy updated: {} (enabled={:?}, idle_timeout={:?})",
+            app_id, request.recycle_enabled, request.idle_timeout_seconds
+        );
+        self.get_app(app_id).await
+    }
+
     /// 获取应用日志（实时拉容器 stdout/stderr：K8s Pod logs / docker logs）。
     ///
     /// `follow` 流式当前未实现（runtime 返回 tail 快照），`since` 暂未透传；
@@ -196,5 +227,35 @@ impl AppService {
                 message: line.to_string(),
             })
             .collect())
+    }
+}
+
+/// 校验 recycle-policy 请求至少带一个字段(纯函数,便于单测)。
+fn validate_recycle_policy_fields(
+    recycle_enabled: Option<bool>,
+    idle_timeout_seconds: Option<u64>,
+) -> AppResult<()> {
+    if recycle_enabled.is_none() && idle_timeout_seconds.is_none() {
+        return Err(AppOperationError::Validation(
+            "recycle-policy requires at least one of recycle_enabled / idle_timeout_seconds"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recycle_policy_requires_at_least_one_field() {
+        // 两字段皆 None → Fail Fast
+        assert!(validate_recycle_policy_fields(None, None).is_err());
+        // 任一 Some → Ok
+        assert!(validate_recycle_policy_fields(Some(true), None).is_ok());
+        assert!(validate_recycle_policy_fields(Some(false), None).is_ok());
+        assert!(validate_recycle_policy_fields(None, Some(60)).is_ok());
+        assert!(validate_recycle_policy_fields(Some(true), Some(60)).is_ok());
     }
 }
