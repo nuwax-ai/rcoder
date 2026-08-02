@@ -87,6 +87,8 @@ async fn run_build_inner(
     })
     .await;
     let build_task_id = client::trigger_build(&addr, app_id).await?;
+    task.set_remote_build(addr.clone(), build_task_id.clone())
+        .await;
     match wait_build(&addr, &build_task_id, task).await? {
         BuildOutcome::Completed { release_id } => {
             task.emit(PublishEvent::Completed { release_id }).await;
@@ -116,6 +118,8 @@ async fn run_publish_inner(
     })
     .await;
     let build_task_id = client::trigger_build(&addr, app_id).await?;
+    task.set_remote_build(addr.clone(), build_task_id.clone())
+        .await;
     let release_id = match wait_build(&addr, &build_task_id, task).await? {
         BuildOutcome::Completed { release_id } => release_id,
         BuildOutcome::Failed(err) => {
@@ -183,41 +187,64 @@ async fn run_publish_inner(
         .await
         .map_err(|e| anyhow!("activate_release: {e}"))?;
 
-    // 4. ensure_app:create app 运行时容器(image=app-runtime,端口 9080,health ready 端点)。
-    //    顺序硬约束:必须在 activate 之后 —— create_app_runtime 读 code/release.lock.toml
-    //    注入 build identity,而 release.lock.toml 是 activate 从 release 包解压到 code/ 的。
-    //    幂等:已存在的 app(重发)get_app 命中 → no-op;activate 的 stop/swap/restart 照常。
-    fail_if_cancelled(task)?;
-    task.emit(PublishEvent::Stage {
-        stage: "EnsureApp".to_string(),
-    })
-    .await;
-    ensure_app(state, &rcoder_app_id, app_id, &image).await?;
+    // activate 之后的所有退出路径都必须收敛到 confirm。否则 readiness/取消失败
+    // 会永久留下 pending_release_id，阻塞后续发布。
+    let post_activate = async {
+        // 4. ensure_app:create app 运行时容器(image=app-runtime,端口 9080,health ready 端点)。
+        fail_if_cancelled(task)?;
+        task.emit(PublishEvent::Stage {
+            stage: "EnsureApp".to_string(),
+        })
+        .await;
+        ensure_app(state, &rcoder_app_id, app_id, &image).await?;
 
-    // 5. 轮询就绪:status=Running 且 health 非 Unhealthy。
-    fail_if_cancelled(task)?;
-    task.emit(PublishEvent::Stage {
-        stage: "WaitReady".to_string(),
-    })
-    .await;
-    wait_app_ready(state, &rcoder_app_id, task).await?;
+        // 5. 轮询就绪:status=Running 且 health 非 Unhealthy。
+        fail_if_cancelled(task)?;
+        task.emit(PublishEvent::Stage {
+            stage: "WaitReady".to_string(),
+        })
+        .await;
+        wait_app_ready(state, &rcoder_app_id, task).await?;
 
-    // 6. confirm healthy → Active(不健康 rcoder 自动回滚,此处返错)。
-    fail_if_cancelled(task)?;
-    task.emit(PublishEvent::Stage {
-        stage: "Confirm".to_string(),
-    })
+        // 6. confirm healthy → Active。
+        fail_if_cancelled(task)?;
+        task.emit(PublishEvent::Stage {
+            stage: "Confirm".to_string(),
+        })
+        .await;
+        state
+            .app_service
+            .confirm_release(
+                &rcoder_app_id,
+                &release_id,
+                true,
+                Some("publish auto-confirm".to_string()),
+            )
+            .await
+            .map_err(|e| anyhow!("confirm_release: {e}"))
+    }
     .await;
-    state
-        .app_service
-        .confirm_release(
-            &rcoder_app_id,
-            &release_id,
-            true,
-            Some("publish auto-confirm".to_string()),
-        )
-        .await
-        .map_err(|e| anyhow!("confirm_release: {e}"))?;
+
+    if let Err(error) = post_activate {
+        let message = error.to_string();
+        state
+            .app_service
+            .confirm_release(
+                &rcoder_app_id,
+                &release_id,
+                false,
+                Some(message.clone()),
+            )
+            .await
+            .map_err(|rollback_error| {
+                anyhow!(
+                    "publish failed after activation: {message}; rollback also failed: {rollback_error}"
+                )
+            })?;
+        return Err(anyhow!(
+            "publish failed after activation and was rolled back: {message}"
+        ));
+    }
 
     task.emit(PublishEvent::Completed {
         release_id: release_id.clone(),
@@ -246,12 +273,27 @@ fn resolve_agent_addr(state: &AppState, project_id: &str) -> Result<String> {
 /// 消费 agent-runner build SSE:透传进度到 task,终态返 BuildOutcome。
 /// 期间检查 task.is_cancelled → cancel_build + Cancelled。
 async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Result<BuildOutcome> {
+    if task.is_cancelled() {
+        client::cancel_build(addr, build_task_id)
+            .await
+            .context("cancel agent-runner build before subscribing progress")?;
+        return Ok(BuildOutcome::Cancelled);
+    }
     let mut rx = client::subscribe_build_progress(addr, build_task_id);
-    while let Some(data) = rx.recv().await {
-        if task.is_cancelled() {
-            let _ = client::cancel_build(addr, build_task_id).await;
-            return Ok(BuildOutcome::Cancelled);
-        }
+    loop {
+        let data = tokio::select! {
+            biased;
+            _ = task.cancellation_notified() => {
+                client::cancel_build(addr, build_task_id)
+                    .await
+                    .context("cancel agent-runner build")?;
+                return Ok(BuildOutcome::Cancelled);
+            }
+            data = rx.recv() => match data {
+                Some(data) => data,
+                None => break,
+            },
+        };
         let event = data
             .get("event")
             .and_then(|e| e.as_str())
@@ -374,8 +416,7 @@ fn fail_if_cancelled(task: &PublishTask) -> Result<()> {
 
 /// app_manager 错误是否 "app 不存在"(get_app 判存性用)。
 fn is_not_found(e: &app_manager::error::AppOperationError) -> bool {
-    let msg = e.to_string().to_ascii_lowercase();
-    msg.contains("does not exist") || msg.contains("not found")
+    matches!(e, app_manager::error::AppOperationError::NotFound(_))
 }
 
 /// file-server project_id → rcoder app_id(强制 `app-` 前缀,已带则原样)。

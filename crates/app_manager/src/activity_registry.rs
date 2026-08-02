@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, warn};
 
@@ -47,6 +47,25 @@ struct WakeGuard {
     result: Arc<Mutex<Option<WakeOutcome>>>,
 }
 
+/// 闲置回收过渡守卫。守卫存活期内，新流量会等待 scale-to-zero 完成后再唤醒，
+/// 避免扫描器在活跃请求中途停掉应用。
+pub struct RecycleTransition {
+    map: Arc<DashMap<String, Arc<Notify>>>,
+    key: String,
+    signal: Arc<Notify>,
+}
+
+impl Drop for RecycleTransition {
+    fn drop(&mut self) {
+        if let dashmap::mapref::entry::Entry::Occupied(entry) = self.map.entry(self.key.clone())
+            && Arc::ptr_eq(entry.get(), &self.signal)
+        {
+            entry.remove();
+        }
+        self.signal.notify_waiters();
+    }
+}
+
 impl Drop for WakeGuard {
     fn drop(&mut self) {
         // unwrap_or_else(into_inner):即使 result 锁被毒化(leader 持锁时 panic,极罕见)也能取值,不二次 panic
@@ -69,6 +88,8 @@ pub struct AppActivityRegistry {
     stopped: DashSet<String>,
     /// app_id → 进行中的唤醒句目(并发合流)
     waking: Arc<DashMap<String, Arc<WakeHandle>>>,
+    /// app_id → 正在执行的闲置回收过渡。
+    recycling: Arc<DashMap<String, Arc<Notify>>>,
     /// runtime 延迟注入(wake 需要 scale + 查 status;启动早期拿不到,故 OnceLock)
     runtime: OnceLock<Arc<dyn UserAppRuntime>>,
     /// 唤醒 hold-and-wait 上限
@@ -89,6 +110,7 @@ impl AppActivityRegistry {
             last_accessed: DashMap::new(),
             stopped: DashSet::new(),
             waking: Arc::new(DashMap::new()),
+            recycling: Arc::new(DashMap::new()),
             runtime: OnceLock::new(),
             wake_timeout,
             throttle,
@@ -110,6 +132,50 @@ impl AppActivityRegistry {
     /// 是否有进行中的唤醒(回收扫描器据此跳过,避免与 in-flight wake 竞态)
     pub fn is_waking(&self, app_id: &str) -> bool {
         self.waking.contains_key(app_id)
+    }
+
+    /// 仅当最近访问时间仍等于扫描器观测值时，原子登记回收过渡。
+    pub fn try_begin_recycle(
+        &self,
+        app_id: &str,
+        observed_access: Instant,
+    ) -> Option<RecycleTransition> {
+        let signal = Arc::new(Notify::new());
+        match self.recycling.entry(app_id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => return None,
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(signal.clone());
+            }
+        }
+        let transition = RecycleTransition {
+            map: self.recycling.clone(),
+            key: app_id.to_string(),
+            signal,
+        };
+        if self.last_accessed_at(app_id) != Some(observed_access) {
+            return None;
+        }
+        Some(transition)
+    }
+
+    async fn wait_for_recycle_transition(&self, app_id: &str) {
+        loop {
+            let Some(signal_ref) = self.recycling.get(app_id) else {
+                return;
+            };
+            let signal = signal_ref.value().clone();
+            drop(signal_ref);
+            let notified = signal.notified();
+            let still_current = self
+                .recycling
+                .get(app_id)
+                .map(|current| Arc::ptr_eq(current.value(), &signal))
+                .unwrap_or(false);
+            if !still_current {
+                continue;
+            }
+            notified.await;
+        }
     }
 
     /// 给 Running app 种入 last_accessed=now(rebuild_stopped_apps / 外部 start 用)
@@ -227,10 +293,15 @@ impl AppAccessTracker for AppActivityRegistry {
 #[async_trait::async_trait]
 impl AppWakeControl for AppActivityRegistry {
     fn is_stopped(&self, app_id: &str) -> bool {
-        self.stopped.contains(app_id)
+        self.stopped.contains(app_id) || self.recycling.contains_key(app_id)
     }
 
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
+        // 回收过渡期的请求必须等 scale0 完成，再由唤醒 single-flight scale1。
+        self.wait_for_recycle_transition(app_id).await;
+        if !self.stopped.contains(app_id) {
+            return WakeOutcome::AlreadyRunning;
+        }
         // Single-flight:DashMap::entry 原子 insert-or-join 选主
         match self.waking.entry(app_id.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(e) => {
@@ -390,6 +461,51 @@ mod tests {
         assert_eq!(outcome, WakeOutcome::Timeout);
         // 超时后保持 stopped(下次请求重新唤醒)
         assert!(reg.is_stopped("app-t"));
+    }
+
+    #[tokio::test]
+    async fn recycle_transition_waits_for_stop_then_wakes_once() {
+        let runtime = Arc::new(MockRuntime::new(true));
+        let registry = Arc::new(AppActivityRegistry::new_with(
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        ));
+        registry.set_runtime(runtime.clone());
+        registry.seed_accessed("app-r");
+        let observed = registry
+            .last_accessed_at("app-r")
+            .expect("seeded access timestamp");
+        let transition = registry
+            .try_begin_recycle("app-r", observed)
+            .expect("unchanged app may enter recycle transition");
+
+        let wake = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.ensure_running("app-r").await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+
+        registry.mark_stopped("app-r");
+        drop(transition);
+        let outcome = wake.await.expect("wake task");
+        assert_eq!(outcome, WakeOutcome::Ready);
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn recycle_transition_rejects_stale_access_observation() {
+        let registry =
+            AppActivityRegistry::new_with(Duration::from_secs(2), Duration::from_millis(0));
+        registry.seed_accessed("app-r");
+        let observed = registry
+            .last_accessed_at("app-r")
+            .expect("seeded access timestamp");
+        sleep(Duration::from_millis(1)).await;
+        registry.touch("app-r");
+
+        assert!(registry.try_begin_recycle("app-r", observed).is_none());
+        assert!(!registry.is_stopped("app-r"));
     }
 
     #[tokio::test]

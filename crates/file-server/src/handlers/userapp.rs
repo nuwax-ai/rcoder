@@ -162,7 +162,13 @@ pub(crate) async fn get_task_logs(
         .await
         .ok_or_else(|| AppError::resource("build task workspace not resolved yet"))?;
     let dir = match q.service.as_deref() {
-        Some(s) if !s.is_empty() => ws_root.join("logs").join(s),
+        Some(service) if !service.is_empty() => {
+            shared_types::validate_service_id(service).map_err(|error| {
+                AppError::validation(format!("invalid log service selector: {error}"))
+            })?;
+            crate::path_safety::ensure_within(&ws_root.join("logs"), service)
+                .map_err(|_| AppError::validation("log service selector escapes workspace logs"))?
+        }
         _ => ws_root.join("logs"),
     };
     let result = read_dev_log(&dir, q.start_index, "main", state.config.log_read_max_bytes).await?;
@@ -200,19 +206,29 @@ pub(crate) async fn stream_task_logs(
 
     let progress = stream! {
         // 回放历史事件（seq >= from_seq）
-        for (_seq, ev) in replay {
+        for (seq, ev) in replay {
             let terminal = is_terminal_event(&ev);
-            yield Ok::<_, Infallible>(event_from_progress(&ev));
+            yield Ok::<_, Infallible>(event_from_progress(seq, &ev));
             if terminal {
                 return;
             }
         }
         // 实时跟随 broadcast
-        while let Ok(ev) = rx.recv().await {
-            let terminal = is_terminal_event(&ev);
-            yield Ok::<_, Infallible>(event_from_progress(&ev));
-            if terminal {
-                break;
+        loop {
+            match rx.recv().await {
+                Ok((seq, ev)) => {
+                    let terminal = is_terminal_event(&ev);
+                    yield Ok::<_, Infallible>(event_from_progress(seq, &ev));
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    let data = serde_json::json!({"event":"stream_lagged","skipped":skipped});
+                    yield Ok::<_, Infallible>(Event::default().event("stream_lagged").data(data.to_string()));
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     };
@@ -333,7 +349,7 @@ pub(crate) async fn confirm_project(
 // ── SSE helper ──────────────────────────────────────────────────────────────────
 
 /// `BuildProgressEvent` → SSE `Event`（event 名 = 事件类型，data = JSON 全量）。
-fn event_from_progress(ev: &BuildProgressEvent) -> Event {
+fn event_from_progress(seq: u64, ev: &BuildProgressEvent) -> Event {
     let name = match ev {
         BuildProgressEvent::Stage { .. } => "stage",
         BuildProgressEvent::Building { .. } => "building",
@@ -345,7 +361,7 @@ fn event_from_progress(ev: &BuildProgressEvent) -> Event {
         BuildProgressEvent::Cancelled => "cancelled",
     };
     let data = serde_json::to_string(ev).unwrap_or_else(|_| "{}".to_string());
-    Event::default().event(name).data(data)
+    Event::default().id(seq.to_string()).event(name).data(data)
 }
 
 /// 是否终态事件（SSE 收到后关闭流）。

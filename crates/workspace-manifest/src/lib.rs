@@ -13,7 +13,8 @@ pub use error::{DiscoverError, ManifestError};
 pub use release_lock::{ReleaseMetadata, build_release_lock};
 pub use types::*;
 pub use validation::{
-    parse_project, parse_workspace, validate_project, validate_topology, validate_workspace,
+    parse_project, parse_workspace, validate_project, validate_service_id, validate_topology,
+    validate_workspace,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;

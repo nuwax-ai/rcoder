@@ -6,22 +6,26 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 
 /// 历史事件 ring 容量(断线重连 seq replay)。
 const RING_CAP: usize = 1000;
 /// broadcast 通道容量(实时 SSE fan-out)。
 const BROADCAST_CAP: usize = 256;
+/// 终态任务在内存中保留 24h，便于前端重连查询。
+const TERMINAL_TASK_TTL_SECS: i64 = 24 * 60 * 60;
+/// 防止异常调用方无限创建任务。达上限时优先淘汰最旧终态任务。
+const MAX_RETAINED_TASKS: usize = 1_000;
 
 pub type PublishTaskId = String;
 
 /// 任务类型:仅触发 agent-runner build / 全流程发布。
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PublishTaskKind {
     Build,
@@ -29,7 +33,7 @@ pub enum PublishTaskKind {
 }
 
 /// 任务状态。
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PublishTaskStatus {
     Pending,
@@ -40,7 +44,7 @@ pub enum PublishTaskStatus {
 }
 
 /// 进度事件(给前端 SSE)。agent-runner build 进度原样透传(`BuildProgress.data`)。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", tag = "event")]
 pub enum PublishEvent {
     /// 进入新发布阶段(publish: EnsureApp/Prepare/Activate/WaitReady/Confirm)。
@@ -56,7 +60,7 @@ pub enum PublishEvent {
 }
 
 /// 任务快照(GET /tasks/{id} 返回)。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishTaskSnapshot {
     pub id: PublishTaskId,
@@ -88,10 +92,22 @@ struct TaskInner {
 pub struct PublishTask {
     pub id: PublishTaskId,
     inner: Mutex<TaskInner>,
-    tx: broadcast::Sender<PublishEvent>,
+    tx: broadcast::Sender<(u64, PublishEvent)>,
     history: Mutex<VecDeque<(u64, PublishEvent)>>,
+    /// 串行化状态转移、seq、history 与 broadcast，避免终态被并发覆盖。
+    event_lock: Mutex<()>,
     seq: AtomicU64,
     cancelled: AtomicBool,
+    cancel_notify: Notify,
+    terminal_at: AtomicI64,
+    created_at: i64,
+    remote_build: Mutex<Option<RemoteBuildTask>>,
+}
+
+#[derive(Clone)]
+pub struct RemoteBuildTask {
+    pub addr: String,
+    pub task_id: String,
 }
 
 impl PublishTask {
@@ -113,8 +129,13 @@ impl PublishTask {
             }),
             tx,
             history: Mutex::new(VecDeque::with_capacity(RING_CAP)),
+            event_lock: Mutex::new(()),
             seq: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
+            terminal_at: AtomicI64::new(0),
+            created_at: now,
+            remote_build: Mutex::new(None),
         })
     }
 
@@ -145,10 +166,13 @@ impl PublishTask {
 
     /// 发进度事件:apply 状态副作用 → seq++ → ring → broadcast。终态后丢弃后续事件。
     pub async fn emit(&self, event: PublishEvent) {
-        if self.is_terminal().await {
+        let _event_guard = self.event_lock.lock().await;
+        let mut inner = self.inner.lock().await;
+        if is_terminal_status(inner.status) {
             return;
         }
-        self.apply_event(&event).await;
+        apply_event(&mut inner, &event);
+        let terminal = is_terminal_status(inner.status);
         let s = self.seq.fetch_add(1, Ordering::Relaxed);
         {
             let mut h = self.history.lock().await;
@@ -157,39 +181,25 @@ impl PublishTask {
             }
             h.push_back((s, event.clone()));
         }
-        let _ = self.tx.send(event);
-    }
-
-    async fn apply_event(&self, event: &PublishEvent) {
-        let mut inner = self.inner.lock().await;
-        inner.updated_at = Utc::now().timestamp();
-        match event {
-            PublishEvent::Stage { stage } => {
-                inner.stage = Some(stage.clone());
-                inner.status = PublishTaskStatus::Running;
-            }
-            PublishEvent::BuildProgress { .. } => {
-                inner.status = PublishTaskStatus::Running;
-            }
-            PublishEvent::Completed { release_id } => {
-                inner.release_id = Some(release_id.clone());
-                inner.status = PublishTaskStatus::Completed;
-            }
-            PublishEvent::Failed { error } => {
-                inner.error = Some(error.clone());
-                inner.status = PublishTaskStatus::Failed;
-            }
-            PublishEvent::Cancelled => {
-                inner.status = PublishTaskStatus::Cancelled;
-            }
+        let _ = self.tx.send((s, event));
+        if terminal {
+            self.terminal_at
+                .store(Utc::now().timestamp(), Ordering::Release);
         }
+        drop(inner);
     }
 
     /// 订阅:回放 ring 里 seq >= from_seq 的历史 + 实时 broadcast receiver。
     pub async fn subscribe(
         &self,
         from_seq: u64,
-    ) -> (Vec<(u64, PublishEvent)>, broadcast::Receiver<PublishEvent>) {
+    ) -> (
+        Vec<(u64, PublishEvent)>,
+        broadcast::Receiver<(u64, PublishEvent)>,
+    ) {
+        let _event_guard = self.event_lock.lock().await;
+        // 必须先创建 receiver，再取 replay。event_lock 保证两者之间无 emit。
+        let receiver = self.tx.subscribe();
         let replay = self
             .history
             .lock()
@@ -198,7 +208,7 @@ impl PublishTask {
             .filter(|(s, _)| *s >= from_seq)
             .cloned()
             .collect();
-        (replay, self.tx.subscribe())
+        (replay, receiver)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -208,6 +218,52 @@ impl PublishTask {
     /// 标记取消(外部再调 agent-runner cancel_build + 顶层 emit Cancelled)。
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
+        self.cancel_notify.notify_waiters();
+    }
+
+    pub async fn cancellation_notified(&self) {
+        loop {
+            let notified = self.cancel_notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn set_remote_build(&self, addr: String, task_id: String) {
+        *self.remote_build.lock().await = Some(RemoteBuildTask { addr, task_id });
+    }
+
+    pub async fn remote_build(&self) -> Option<RemoteBuildTask> {
+        self.remote_build.lock().await.clone()
+    }
+}
+
+fn is_terminal_status(status: PublishTaskStatus) -> bool {
+    matches!(
+        status,
+        PublishTaskStatus::Completed | PublishTaskStatus::Failed | PublishTaskStatus::Cancelled
+    )
+}
+
+fn apply_event(inner: &mut TaskInner, event: &PublishEvent) {
+    inner.updated_at = Utc::now().timestamp();
+    match event {
+        PublishEvent::Stage { stage } => {
+            inner.stage = Some(stage.clone());
+            inner.status = PublishTaskStatus::Running;
+        }
+        PublishEvent::BuildProgress { .. } => inner.status = PublishTaskStatus::Running,
+        PublishEvent::Completed { release_id } => {
+            inner.release_id = Some(release_id.clone());
+            inner.status = PublishTaskStatus::Completed;
+        }
+        PublishEvent::Failed { error } => {
+            inner.error = Some(error.clone());
+            inner.status = PublishTaskStatus::Failed;
+        }
+        PublishEvent::Cancelled => inner.status = PublishTaskStatus::Cancelled,
     }
 }
 
@@ -230,7 +286,22 @@ impl PublishTaskStore {
         kind: PublishTaskKind,
     ) -> Arc<PublishTask> {
         let task = PublishTask::new(app_id, project_id, kind);
-        self.map.lock().await.insert(task.id.clone(), task.clone());
+        let now = Utc::now().timestamp();
+        let mut map = self.map.lock().await;
+        map.retain(|_, existing| {
+            let terminal_at = existing.terminal_at.load(Ordering::Acquire);
+            terminal_at == 0 || now.saturating_sub(terminal_at) < TERMINAL_TASK_TTL_SECS
+        });
+        if map.len() >= MAX_RETAINED_TASKS
+            && let Some(oldest_terminal_id) = map
+                .values()
+                .filter(|existing| existing.terminal_at.load(Ordering::Acquire) > 0)
+                .min_by_key(|existing| existing.created_at)
+                .map(|existing| existing.id.clone())
+        {
+            map.remove(&oldest_terminal_id);
+        }
+        map.insert(task.id.clone(), task.clone());
         task
     }
 
@@ -242,5 +313,58 @@ impl PublishTaskStore {
 impl Default for PublishTaskStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn subscription_has_no_gap_between_replay_and_live_events() {
+        let task = PublishTask::new("app-a".into(), "app-a".into(), PublishTaskKind::Publish);
+        let (replay, mut receiver) = task.subscribe(0).await;
+        assert!(replay.is_empty());
+
+        task.emit(PublishEvent::Stage {
+            stage: "Build".into(),
+        })
+        .await;
+        let (seq, event) = receiver.recv().await.expect("live event");
+        assert_eq!(seq, 0);
+        assert!(matches!(event, PublishEvent::Stage { .. }));
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_events_commit_exactly_once() {
+        let task = PublishTask::new("app-a".into(), "app-a".into(), PublishTaskKind::Publish);
+        let completed = task.emit(PublishEvent::Completed {
+            release_id: "release-1".into(),
+        });
+        let failed = task.emit(PublishEvent::Failed {
+            error: "late failure".into(),
+        });
+        tokio::join!(completed, failed);
+
+        let snapshot = task.snapshot().await;
+        assert_eq!(snapshot.seq, 1);
+        assert!(matches!(
+            snapshot.status,
+            PublishTaskStatus::Completed | PublishTaskStatus::Failed
+        ));
+        let (replay, _) = task.subscribe(0).await;
+        assert_eq!(replay.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_notification_is_not_lost_when_cancelled_first() {
+        let task = PublishTask::new("app-a".into(), "app-a".into(), PublishTaskKind::Build);
+        task.cancel();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            task.cancellation_notified(),
+        )
+        .await
+        .expect("pre-existing cancellation must be observed");
     }
 }

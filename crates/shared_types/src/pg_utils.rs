@@ -21,7 +21,9 @@ pub fn validate_pg_identifier(name: &str) -> Result<(), String> {
         ));
     }
     let mut chars = name.chars();
-    let first = chars.next().unwrap(); // safe: is_empty 已排除
+    let Some(first) = chars.next() else {
+        return Err("PG identifier must not be empty".to_string());
+    };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return Err("PG identifier must start with letter or '_'".to_string());
     }

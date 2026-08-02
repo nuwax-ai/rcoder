@@ -10,7 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use chrono::Utc;
 use serde::Serialize;
@@ -21,6 +21,8 @@ use uuid::Uuid;
 const RING_CAP: usize = 1000;
 /// broadcast 通道容量(实时 SSE fan-out)。
 const BROADCAST_CAP: usize = 256;
+const TERMINAL_TASK_TTL_SECS: i64 = 24 * 60 * 60;
+const MAX_RETAINED_TASKS: usize = 1_000;
 
 pub type BuildTaskId = String;
 
@@ -111,10 +113,13 @@ struct TaskInner {
 pub struct BuildTask {
     pub id: BuildTaskId,
     inner: Mutex<TaskInner>,
-    tx: broadcast::Sender<BuildProgressEvent>,
+    tx: broadcast::Sender<(u64, BuildProgressEvent)>,
     history: Mutex<VecDeque<(u64, BuildProgressEvent)>>,
+    event_lock: Mutex<()>,
     seq: AtomicU64,
     cancelled: AtomicBool,
+    terminal_at: AtomicI64,
+    created_at: i64,
     /// 当前 build 子进程 pid (cancel 时 kill_process_group 用)。
     /// AtomicU32 (0 = 未设置) 而非 Mutex: build_generic 的 on_pid 回调是同步的, 需同步写。
     pid: AtomicU32,
@@ -143,8 +148,11 @@ impl BuildTask {
             }),
             tx,
             history: Mutex::new(VecDeque::with_capacity(RING_CAP)),
+            event_lock: Mutex::new(()),
             seq: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
+            terminal_at: AtomicI64::new(0),
+            created_at: now,
             pid: AtomicU32::new(0),
         })
     }
@@ -188,10 +196,13 @@ impl BuildTask {
     /// 发进度事件:apply 状态副作用 → seq++ → ring → broadcast。
     /// 已 Completed/Failed/Cancelled 的任务丢弃后续事件(终态)。
     pub async fn emit(&self, event: BuildProgressEvent) {
-        if self.is_terminal().await {
+        let _event_guard = self.event_lock.lock().await;
+        let mut inner = self.inner.lock().await;
+        if is_terminal_status(inner.status) {
             return;
         }
-        self.apply_event(&event).await;
+        apply_event(&mut inner, &event);
+        let terminal = is_terminal_status(inner.status);
         let s = self.seq.fetch_add(1, Ordering::Relaxed);
         {
             let mut h = self.history.lock().await;
@@ -201,49 +212,12 @@ impl BuildTask {
             h.push_back((s, event.clone()));
         }
         // 无订阅者时 send 报错,属正常,忽略。
-        let _ = self.tx.send(event);
-    }
-
-    async fn apply_event(&self, event: &BuildProgressEvent) {
-        let mut inner = self.inner.lock().await;
-        inner.updated_at = Utc::now().timestamp();
-        match event {
-            BuildProgressEvent::Stage { stage } => {
-                inner.stage = Some(stage.clone());
-                inner.status = BuildTaskStatus::Running;
-            }
-            BuildProgressEvent::Building { service } => {
-                inner.current_service = Some(service.clone());
-                inner.status = BuildTaskStatus::Running;
-            }
-            BuildProgressEvent::BuildOk { .. } => {
-                inner.current_service = None;
-            }
-            BuildProgressEvent::BuildFail { service, error } => {
-                inner.current_service = Some(service.clone());
-                inner.error = Some(error.clone());
-            }
-            BuildProgressEvent::Log { .. } => {}
-            BuildProgressEvent::Completed {
-                release_id,
-                sha256,
-                size_bytes,
-                file_name,
-            } => {
-                inner.release_id = Some(release_id.clone());
-                inner.sha256 = Some(sha256.clone());
-                inner.size_bytes = Some(*size_bytes);
-                inner.file_name = Some(file_name.clone());
-                inner.status = BuildTaskStatus::Completed;
-            }
-            BuildProgressEvent::Failed { error } => {
-                inner.error = Some(error.clone());
-                inner.status = BuildTaskStatus::Failed;
-            }
-            BuildProgressEvent::Cancelled => {
-                inner.status = BuildTaskStatus::Cancelled;
-            }
+        let _ = self.tx.send((s, event));
+        if terminal {
+            self.terminal_at
+                .store(Utc::now().timestamp(), Ordering::Release);
         }
+        drop(inner);
     }
 
     pub async fn is_terminal(&self) -> bool {
@@ -260,8 +234,10 @@ impl BuildTask {
         from_seq: u64,
     ) -> (
         Vec<(u64, BuildProgressEvent)>,
-        broadcast::Receiver<BuildProgressEvent>,
+        broadcast::Receiver<(u64, BuildProgressEvent)>,
     ) {
+        let _event_guard = self.event_lock.lock().await;
+        let receiver = self.tx.subscribe();
         let replay = self
             .history
             .lock()
@@ -270,7 +246,7 @@ impl BuildTask {
             .filter(|(s, _)| *s >= from_seq)
             .cloned()
             .collect();
-        (replay, self.tx.subscribe())
+        (replay, receiver)
     }
 
     /// 记录当前 build 子进程 pid (build_generic spawn 后经 on_pid 回调同步写入)。
@@ -296,6 +272,50 @@ impl BuildTask {
     }
 }
 
+fn is_terminal_status(status: BuildTaskStatus) -> bool {
+    matches!(
+        status,
+        BuildTaskStatus::Completed | BuildTaskStatus::Failed | BuildTaskStatus::Cancelled
+    )
+}
+
+fn apply_event(inner: &mut TaskInner, event: &BuildProgressEvent) {
+    inner.updated_at = Utc::now().timestamp();
+    match event {
+        BuildProgressEvent::Stage { stage } => {
+            inner.stage = Some(stage.clone());
+            inner.status = BuildTaskStatus::Running;
+        }
+        BuildProgressEvent::Building { service } => {
+            inner.current_service = Some(service.clone());
+            inner.status = BuildTaskStatus::Running;
+        }
+        BuildProgressEvent::BuildOk { .. } => inner.current_service = None,
+        BuildProgressEvent::BuildFail { service, error } => {
+            inner.current_service = Some(service.clone());
+            inner.error = Some(error.clone());
+        }
+        BuildProgressEvent::Log { .. } => {}
+        BuildProgressEvent::Completed {
+            release_id,
+            sha256,
+            size_bytes,
+            file_name,
+        } => {
+            inner.release_id = Some(release_id.clone());
+            inner.sha256 = Some(sha256.clone());
+            inner.size_bytes = Some(*size_bytes);
+            inner.file_name = Some(file_name.clone());
+            inner.status = BuildTaskStatus::Completed;
+        }
+        BuildProgressEvent::Failed { error } => {
+            inner.error = Some(error.clone());
+            inner.status = BuildTaskStatus::Failed;
+        }
+        BuildProgressEvent::Cancelled => inner.status = BuildTaskStatus::Cancelled,
+    }
+}
+
 /// 全局任务表(Mutex<HashMap>,内存;build 短期不需持久化,发布产物由 app_manager release index 持久)。
 /// 用 tokio::sync::Mutex(无 poison,符合禁止 unwrap/expect);并发度低(任务数有限)。
 pub struct BuildTaskStore {
@@ -317,11 +337,70 @@ impl BuildTaskStore {
 
     pub async fn create(&self, app_id: String, kind: BuildTaskKind) -> Arc<BuildTask> {
         let task = BuildTask::new(app_id, kind);
-        self.map.lock().await.insert(task.id.clone(), task.clone());
+        let now = Utc::now().timestamp();
+        let mut map = self.map.lock().await;
+        map.retain(|_, existing| {
+            let terminal_at = existing.terminal_at.load(Ordering::Acquire);
+            terminal_at == 0 || now.saturating_sub(terminal_at) < TERMINAL_TASK_TTL_SECS
+        });
+        if map.len() >= MAX_RETAINED_TASKS
+            && let Some(oldest_terminal_id) = map
+                .values()
+                .filter(|existing| existing.terminal_at.load(Ordering::Acquire) > 0)
+                .min_by_key(|existing| existing.created_at)
+                .map(|existing| existing.id.clone())
+        {
+            map.remove(&oldest_terminal_id);
+        }
+        map.insert(task.id.clone(), task.clone());
         task
     }
 
     pub async fn get(&self, id: &str) -> Option<Arc<BuildTask>> {
         self.map.lock().await.get(id).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn subscription_has_no_gap_between_replay_and_live_events() {
+        let task = BuildTask::new("app-a".into(), BuildTaskKind::Build);
+        let (replay, mut receiver) = task.subscribe(0).await;
+        assert!(replay.is_empty());
+
+        task.emit(BuildProgressEvent::Stage {
+            stage: "Build".into(),
+        })
+        .await;
+        let (seq, event) = receiver.recv().await.expect("live event");
+        assert_eq!(seq, 0);
+        assert!(matches!(event, BuildProgressEvent::Stage { .. }));
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_events_commit_exactly_once() {
+        let task = BuildTask::new("app-a".into(), BuildTaskKind::Build);
+        let completed = task.emit(BuildProgressEvent::Completed {
+            release_id: "release-1".into(),
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+            file_name: "release-1.zip".into(),
+        });
+        let failed = task.emit(BuildProgressEvent::Failed {
+            error: "late failure".into(),
+        });
+        tokio::join!(completed, failed);
+
+        let snapshot = task.snapshot().await;
+        assert_eq!(snapshot.seq, 1);
+        assert!(matches!(
+            snapshot.status,
+            BuildTaskStatus::Completed | BuildTaskStatus::Failed
+        ));
+        let (replay, _) = task.subscribe(0).await;
+        assert_eq!(replay.len(), 1);
     }
 }

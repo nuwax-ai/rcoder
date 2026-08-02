@@ -524,7 +524,7 @@ mod tests {
             ann2.get(RECYCLE_ENABLED_ANNOTATION).map(String::as_str),
             Some("true")
         );
-        assert!(ann2.get(IDLE_TIMEOUT_ANNOTATION).is_none());
+        assert!(!ann2.contains_key(IDLE_TIMEOUT_ANNOTATION));
 
         // merge 恒出 recycle-enabled(即使无端口 → port-expose 为 None,merge 仍非空)
         let merged = merge_app_annotations(&free).expect("merge non-empty (recycle-enabled)");

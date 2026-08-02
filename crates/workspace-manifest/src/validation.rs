@@ -42,12 +42,7 @@ pub fn validate_workspace(manifest: &WorkspaceManifest) -> Result<(), ManifestEr
 pub fn validate_project(manifest: &ProjectManifest) -> Result<(), ManifestError> {
     require_v1(manifest.schema_version)?;
     let project = &manifest.project;
-    if !is_dns1123_label(&project.service_id) {
-        return Err(ManifestError::Validation(format!(
-            "project.service_id must be a DNS-1123 label: {}",
-            project.service_id
-        )));
-    }
+    validate_service_id(&project.service_id)?;
     if project.name.trim().is_empty() {
         return Err(ManifestError::Validation(
             "project.name must not be empty".into(),
@@ -88,6 +83,17 @@ pub fn validate_project(manifest: &ProjectManifest) -> Result<(), ManifestError>
         }
     }
     Ok(())
+}
+
+/// 校验跨模块使用的稳定服务标识（manifest、日志 selector、代理 upstream 同一规则）。
+pub fn validate_service_id(value: &str) -> Result<(), ManifestError> {
+    if is_dns1123_label(value) {
+        Ok(())
+    } else {
+        Err(ManifestError::Validation(format!(
+            "project.service_id must be a DNS-1123 label: {value}"
+        )))
+    }
 }
 
 pub fn validate_topology(projects: &[DiscoveredProject]) -> Result<Vec<String>, ManifestError> {

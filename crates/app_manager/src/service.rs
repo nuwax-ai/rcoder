@@ -72,27 +72,24 @@ impl AppService {
             }
         }
 
-        // K8s 模式：启动校验前置条件（RBAC 等）。失败 log warn 不阻塞（Fail Fast 暴露部署侧
-        // RBAC 缺失，而非运行时创建 app 才 403）。Docker 模式 trait 默认 Ok，跳过。
+        // K8s 模式：启动时校验前置条件（RBAC 等）。失败直接返回，
+        // 避免 rcoder 显示健康、直到首次创建 app 才暴露 403。
         if config.access_mode == AppAccessMode::Kubernetes {
-            match runtime.validate_app_prerequisites().await {
-                Ok(_) => {
-                    info!("[APP] K8s prerequisites validated (RBAC/apps/deployments accessible)")
-                }
-                Err(e) => warn!(
-                    "[APP] K8s prerequisites validation failed, app management may not work: {}",
-                    e
-                ),
-            }
+            runtime
+                .validate_app_prerequisites()
+                .await
+                .map_err(|error| {
+                    map_runtime_error("[APP] K8s prerequisites validation failed", error)
+                })?;
+            info!("[APP] K8s prerequisites validated (RBAC/apps/deployments accessible)");
         }
 
-        // 无效组合告警（Fail Fast）：Docker 无 HTTPRoute/gateway 概念，gateway 模式不可用。
-        // 不阻塞启动（便于临时切回 pingora），但 HTTP 将不可访问。
+        // 无效组合必须 Fail Fast：Docker 无 HTTPRoute/gateway 概念。
         if config.access_mode == AppAccessMode::Docker && config.http_expose == HttpExpose::Gateway
         {
-            warn!(
-                "[APP] invalid combo access_mode=docker + http_expose=gateway: Docker has no HTTPRoute, gateway mode unavailable, HTTP will be inaccessible; set RCODER_APP_HTTP_EXPOSE=pingora"
-            );
+            return Err(AppOperationError::Validation(
+                "invalid app configuration: access_mode=docker requires http_expose=pingora".into(),
+            ));
         }
 
         let svc = Self {
@@ -105,23 +102,17 @@ impl AppService {
         };
         // K8s Pingora 模式：启动时从集群重建 Pingora backends——修复 pingora_ports 内存态
         // 丢失导致的重启 silent 404（list_deployments 的 expose_type 已由 Deployment annotation
-        // 准确还原）。失败不阻塞启动（warn，待下次 create/update 恢复）。
+        // 准确还原）。重建失败时不能对外声称就绪。
         if svc.config.access_mode == AppAccessMode::Kubernetes
             && svc.config.http_expose == HttpExpose::Pingora
-            && let Err(e) = svc.rebuild_pingora_backends().await
         {
-            warn!(
-                "[APP] pingora backends rebuild failed (HTTP temporarily unreachable after restart, recovered on next create/update): {}",
-                e
-            );
+            svc.rebuild_pingora_backends().await?;
         }
         // 重建活动状态内存态(rcoder 重启后 last_accessed/stopped 丢失):
         //  - replicas==0 → mark_stopped(支持流量唤醒识别)
         //  - replicas>0  → seed_accessed=now(给 Running app 完整 grace 周期,避免重启后立刻被回收)
-        // 失败不阻塞启动(下次操作/扫描器自愈)。
-        if let Err(e) = svc.rebuild_stopped_apps().await {
-            warn!("[APP] rebuild_stopped_apps failed: {}", e);
-        }
+        // 失败时 stopped app 无法被流量唤醒，必须阻止就绪。
+        svc.rebuild_stopped_apps().await?;
         Ok(svc)
     }
 
@@ -146,10 +137,19 @@ impl AppService {
             Some(id) => {
                 validate_app_id(id)?;
                 // 唯一性：已存在 → ERR_APP_ALREADY_EXISTS（防止 SSA force=true 静默覆盖）
-                if let Ok(Some(_)) = self.runtime.get_deployment_status(id).await {
-                    return Err(AppOperationError::AlreadyExists(format!(
-                        "app already exists: {id}"
-                    )));
+                match self.runtime.get_deployment_status(id).await {
+                    Ok(Some(_)) => {
+                        return Err(AppOperationError::AlreadyExists(format!(
+                            "app already exists: {id}"
+                        )));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Err(map_runtime_error(
+                            &format!("[APP] check app existence failed app_id={id}"),
+                            error,
+                        ));
+                    }
                 }
                 id.clone()
             }

@@ -217,5 +217,6 @@ pub use workspace_manifest::{
     LogFormat, LogSource, LogsSection, ManifestError, PingapMode, PingapSection, ProjectKind,
     ProjectManifest, ProjectMeta, ProjectType, ProxySection, ReleaseLock, ReleaseMetadata,
     RunSection, WorkspaceManifest, WorkspaceMeta, build_release_lock, discover_projects,
-    parse_project, parse_workspace, validate_project, validate_topology, validate_workspace,
+    parse_project, parse_workspace, validate_project, validate_service_id, validate_topology,
+    validate_workspace,
 };

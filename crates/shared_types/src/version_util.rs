@@ -149,12 +149,25 @@ impl PlatformKey {
 
     /// 从当前运行环境构造
     ///
-    /// `std::env::consts::OS/ARCH` 是编译期常量，对受支持的 6 个平台组合
-    /// (linux/darwin/windows × x86_64/aarch64) `new()` 恒成功；此处 `.expect`
-    /// 保留是因为它对受支持目标在运行时不可能失败，且无合理的兜底平台可回退。
+    /// 使用编译期 `cfg` 构造；不支持的目标在编译阶段 Fail Fast，而不是运行时 panic。
     pub fn current() -> Self {
-        Self::new(std::env::consts::OS, std::env::consts::ARCH)
-            .expect("current platform should always be valid")
+        #[cfg(target_os = "linux")]
+        let os = Os::Linux;
+        #[cfg(target_os = "macos")]
+        let os = Os::Darwin;
+        #[cfg(target_os = "windows")]
+        let os = Os::Windows;
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        compile_error!("unsupported target OS; expected linux, macos, or windows");
+
+        #[cfg(target_arch = "x86_64")]
+        let arch = Arch::X86_64;
+        #[cfg(target_arch = "aarch64")]
+        let arch = Arch::Arm64;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        compile_error!("unsupported target architecture; expected x86_64 or aarch64");
+
+        Self { os, arch }
     }
 
     /// 作为 HashMap key 使用的字符串（归一化形式）

@@ -41,13 +41,11 @@ pub enum IdentifierSource {
 }
 
 /// 构建完整路由表
-pub fn build_route_table() -> Router<RouteType> {
+pub fn build_route_table() -> Result<Router<RouteType>, matchit::InsertError> {
     let mut router = Router::new();
 
     // ── 网关自身 ──
-    router
-        .insert("/gateway/health", RouteType::GatewayHealth)
-        .expect("route insert failed");
+    router.insert("/gateway/health", RouteType::GatewayHealth)?;
 
     // ── Computer Agent 数据面路由 ──
     let computer_body = |field: &'static str, read_only: bool| {
@@ -59,37 +57,25 @@ pub fn build_route_table() -> Router<RouteType> {
         })
     };
 
-    router
-        .insert("/computer/chat", computer_body("user_id", false))
-        .unwrap();
-    router
-        .insert("/computer/agent/stop", computer_body("user_id", false))
-        .unwrap();
-    router
-        .insert(
-            "/computer/agent/session/cancel",
-            computer_body("user_id", false),
-        )
-        .unwrap();
-    router
-        .insert("/computer/agent/status", computer_body("user_id", true)) // 只读
-        .unwrap();
-    router
-        .insert("/computer/notify-resolved", computer_body("user_id", false))
-        .unwrap();
+    router.insert("/computer/chat", computer_body("user_id", false))?;
+    router.insert("/computer/agent/stop", computer_body("user_id", false))?;
+    router.insert(
+        "/computer/agent/session/cancel",
+        computer_body("user_id", false),
+    )?;
+    router.insert("/computer/agent/status", computer_body("user_id", true))?; // 只读
+    router.insert("/computer/notify-resolved", computer_body("user_id", false))?;
 
     // SSE progress：session_id 解析（只读，不触发 pod 创建）
-    router
-        .insert(
-            "/computer/progress/{session_id}",
-            RouteType::DataPlane(DataPlaneRoute {
-                identifier_field: "session_id",
-                source: IdentifierSource::Session,
-                service_type: ServiceType::ComputerAgentRunner,
-                read_only: true,
-            }),
-        )
-        .unwrap();
+    router.insert(
+        "/computer/progress/{session_id}",
+        RouteType::DataPlane(DataPlaneRoute {
+            identifier_field: "session_id",
+            source: IdentifierSource::Session,
+            service_type: ServiceType::ComputerAgentRunner,
+            read_only: true,
+        }),
+    )?;
 
     // ── RCoder Agent 数据面路由 ──
     let rcoder_body = |field: &'static str, read_only: bool| {
@@ -101,54 +87,42 @@ pub fn build_route_table() -> Router<RouteType> {
         })
     };
 
-    router
-        .insert("/chat", rcoder_body("project_id", false))
-        .unwrap();
-    router
-        .insert("/agent/session/cancel", rcoder_body("project_id", false))
-        .unwrap();
-    router
-        .insert("/agent/stop", rcoder_body("project_id", false))
-        .unwrap();
+    router.insert("/chat", rcoder_body("project_id", false))?;
+    router.insert("/agent/session/cancel", rcoder_body("project_id", false))?;
+    router.insert("/agent/stop", rcoder_body("project_id", false))?;
 
     // Agent status：path 参数提取（只读）
-    router
-        .insert(
-            "/agent/status/{project_id}",
-            RouteType::DataPlane(DataPlaneRoute {
-                identifier_field: "project_id",
-                source: IdentifierSource::Path("project_id".to_string()),
-                service_type: ServiceType::WebAgentRunner,
-                read_only: true,
-            }),
-        )
-        .unwrap();
+    router.insert(
+        "/agent/status/{project_id}",
+        RouteType::DataPlane(DataPlaneRoute {
+            identifier_field: "project_id",
+            source: IdentifierSource::Path("project_id".to_string()),
+            service_type: ServiceType::WebAgentRunner,
+            read_only: true,
+        }),
+    )?;
 
     // RCoder SSE progress：session_id 解析（只读）
-    router
-        .insert(
-            "/agent/progress/{session_id}",
-            RouteType::DataPlane(DataPlaneRoute {
-                identifier_field: "session_id",
-                source: IdentifierSource::Session,
-                service_type: ServiceType::WebAgentRunner,
-                read_only: true,
-            }),
-        )
-        .unwrap();
+    router.insert(
+        "/agent/progress/{session_id}",
+        RouteType::DataPlane(DataPlaneRoute {
+            identifier_field: "session_id",
+            source: IdentifierSource::Session,
+            service_type: ServiceType::WebAgentRunner,
+            read_only: true,
+        }),
+    )?;
 
     // ── Agent Management 数据面路由 ──
-    router
-        .insert(
-            "/agent-mgmt/agents/{action}",
-            RouteType::DataPlane(DataPlaneRoute {
-                identifier_field: "project_id",
-                source: IdentifierSource::Body,
-                service_type: ServiceType::WebAgentRunner,
-                read_only: false,
-            }),
-        )
-        .unwrap();
+    router.insert(
+        "/agent-mgmt/agents/{action}",
+        RouteType::DataPlane(DataPlaneRoute {
+            identifier_field: "project_id",
+            source: IdentifierSource::Body,
+            service_type: ServiceType::WebAgentRunner,
+            read_only: false,
+        }),
+    )?;
 
     // ── 控制面路由（不注册，由默认匹配处理）──
     // POST /computer/pod/ensure → ControlPlane (default)
@@ -157,7 +131,7 @@ pub fn build_route_table() -> Router<RouteType> {
     // GET  /computer/pod/count → ControlPlane (default)
     // GET  /health → ControlPlane (default)
 
-    router
+    Ok(router)
 }
 
 #[cfg(test)]
@@ -166,14 +140,14 @@ mod tests {
 
     #[test]
     fn test_health_route() {
-        let router = build_route_table();
+        let router = build_route_table().expect("valid route table");
         let result = router.at("/gateway/health").unwrap();
         assert!(matches!(result.value, RouteType::GatewayHealth));
     }
 
     #[test]
     fn test_computer_chat_route() {
-        let router = build_route_table();
+        let router = build_route_table().expect("valid route table");
         let result = router.at("/computer/chat").unwrap();
         match &result.value {
             RouteType::DataPlane(route) => {
@@ -186,7 +160,7 @@ mod tests {
 
     #[test]
     fn test_computer_progress_session() {
-        let router = build_route_table();
+        let router = build_route_table().expect("valid route table");
         let result = router.at("/computer/progress/sess-abc123").unwrap();
         match &result.value {
             RouteType::DataPlane(route) => {
@@ -199,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_agent_status_path() {
-        let router = build_route_table();
+        let router = build_route_table().expect("valid route table");
         let result = router.at("/agent/status/proj-456").unwrap();
         match &result.value {
             RouteType::DataPlane(route) => {
@@ -212,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_control_plane_defaults() {
-        let router = build_route_table();
+        let router = build_route_table().expect("valid route table");
         assert!(router.at("/computer/pod/ensure").is_err());
         assert!(router.at("/health").is_err());
         assert!(router.at("/computer/pod/count").is_err());
@@ -220,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_rcoder_chat_route() {
-        let router = build_route_table();
+        let router = build_route_table().expect("valid route table");
         let result = router.at("/chat").unwrap();
         match &result.value {
             RouteType::DataPlane(route) => {

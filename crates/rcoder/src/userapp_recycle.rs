@@ -66,11 +66,8 @@ impl UserAppRecycleScanner {
 
         for app in apps {
             let age = app.created_at.as_deref().and_then(age_of);
-            let idle = self
-                .state
-                .activity
-                .last_accessed_at(&app.app_id)
-                .map(|t| now.saturating_duration_since(t));
+            let last_accessed = self.state.activity.last_accessed_at(&app.app_id);
+            let idle = last_accessed.map(|t| now.saturating_duration_since(t));
             let decision = decide_recycle(
                 &RecycleEvalInput {
                     replicas: app.replicas,
@@ -85,6 +82,19 @@ impl UserAppRecycleScanner {
             let app_id = &app.app_id;
             match decision {
                 RecycleDecision::Recycle => {
+                    let Some(observed_access) = last_accessed else {
+                        continue;
+                    };
+                    // 原子登记回收过渡并复核访问 epoch。新请求若已 touch，本次回收失效；
+                    // 若在登记后到达，请求会等 scale0 完成后再唤醒。
+                    let Some(_transition) = self
+                        .state
+                        .activity
+                        .try_begin_recycle(app_id, observed_access)
+                    else {
+                        debug!("[USERAPP_RECYCLE] skip {app_id}: access changed before recycle");
+                        continue;
+                    };
                     // 命中:回收(scale0,stop_app 内部 mark_stopped)。每 app 错误隔离。
                     if let Err(e) = self.state.app_service.stop_app(app_id).await {
                         warn!("[USERAPP_RECYCLE] stop_app failed app_id={app_id}: {e}");

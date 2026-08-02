@@ -39,7 +39,7 @@ impl GatewayService {
             .map_err(|e| anyhow::anyhow!("Failed to create Pingora server: {}", e))?;
         server.bootstrap();
 
-        let proxy = GatewayProxy::new(self.config.clone());
+        let proxy = GatewayProxy::new(self.config.clone())?;
         let mut http_service = http_proxy_service(&server.configuration, proxy);
 
         http_service.add_tcp(&format!("0.0.0.0:{}", self.config.gateway_port));

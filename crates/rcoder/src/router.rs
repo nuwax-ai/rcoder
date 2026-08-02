@@ -625,6 +625,13 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::stop_app,
         app_manager::handlers::restart_app,
         app_manager::handlers::set_recycle_policy,
+        app_manager::handlers::prepare_release,
+        app_manager::handlers::activate_release,
+        app_manager::handlers::confirm_release,
+        app_manager::handlers::list_releases,
+        app_manager::handlers::delete_release,
+        app_manager::handlers::query_app_log_sources,
+        app_manager::handlers::query_app_logs,
         app_manager::handlers::get_app_logs,
         app_manager::handlers::get_app_health,
         app_manager::handlers::get_app_stats,
@@ -641,6 +648,13 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::create_database,
         app_manager::handlers::stream_app_logs_v1,
         app_manager::handlers::get_app_file_logs,
+        app_manager::handlers::upload_from_url,
+        crate::userapp_publish::handler::ensure_builder,
+        crate::userapp_publish::handler::publish,
+        crate::userapp_publish::handler::build,
+        crate::userapp_publish::handler::get_task,
+        crate::userapp_publish::handler::stream_task,
+        crate::userapp_publish::handler::cancel_task,
     ),
     components(
         schemas(
@@ -766,6 +780,10 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             app_manager::models::CreateDatabaseRequest,
             container_runtime_api::AppPortStatus,
             container_runtime_api::AppEventInfo,
+            crate::userapp_publish::handler::PublishBody,
+            crate::userapp_publish::task::PublishTaskKind,
+            crate::userapp_publish::task::PublishTaskStatus,
+            crate::userapp_publish::task::PublishTaskSnapshot,
         )
     ),
     tags(
@@ -848,4 +866,25 @@ pub fn create_swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/api/docs")
         .url("/api/docs/openapi.json", ApiDoc::openapi())
         .config(utoipa_swagger_ui::Config::new(["/api/docs/openapi.json"]))
+}
+
+#[cfg(test)]
+mod openapi_tests {
+    use super::*;
+
+    #[test]
+    fn userapp_release_log_and_publish_paths_are_documented() {
+        let document = ApiDoc::openapi();
+        let paths = document.paths.paths;
+        for path in [
+            "/api/v1/apps/{app_id}/releases/prepare",
+            "/api/v1/apps/{app_id}/logs/query",
+            "/api/v1/apps/{app_id}/logs/stream",
+            "/api/v1/apps/{app_id}/publish",
+            "/api/v1/apps/{app_id}/build",
+            "/api/v1/apps/publish/tasks/{task_id}/stream",
+        ] {
+            assert!(paths.contains_key(path), "OpenAPI path missing: {path}");
+        }
+    }
 }

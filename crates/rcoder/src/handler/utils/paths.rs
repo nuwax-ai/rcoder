@@ -5,19 +5,11 @@
 //! 防止路径穿越和注入攻击。
 
 use std::path::PathBuf;
-use std::sync::LazyLock;
-
-use regex::Regex;
 
 // 路径常量已下沉到 shared_types::paths (单一事实源, 所有 crate 共用)。
 // 这里 re-export 保持本模块 API (paths::WORKSPACE_ROOT / paths::COMPUTER_WORKSPACE_ROOT) 不破坏。
 // 文档与目录结构见 crates/shared_types/src/paths.rs。
 pub use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
-
-/// 标识符验证正则：仅允许字母、数字、下划线、连字符
-/// 长度 1-64 字符
-static IDENTIFIER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").expect("identifier regex is valid"));
 
 /// 路径标识符验证错误
 #[derive(Debug, thiserror::Error)]
@@ -45,7 +37,11 @@ pub fn validate_identifier(value: &str, field_name: &str) -> Result<(), PathVali
             field: field_name.to_string(),
         });
     }
-    if !IDENTIFIER_RE.is_match(value) {
+    if value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
         return Err(PathValidationError::Invalid {
             field: field_name.to_string(),
             value: value.to_string(),

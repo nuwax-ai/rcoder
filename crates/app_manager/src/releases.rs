@@ -144,30 +144,24 @@ impl AppService {
             )));
         }
         let staging = releases_dir.join(".staging").join(release_id);
-        remove_dir_if_exists(&staging).await?;
-        tokio::fs::create_dir_all(&staging)
-            .await
-            .map_err(|error| map_io_error("create release staging directory", error, false))?;
-        let package_clone = package.clone();
-        let staging_clone = staging.clone();
-        tokio::task::spawn_blocking(move || extract_zip(&package_clone, &staging_clone))
-            .await
-            .map_err(|error| AppOperationError::Backend(format!("release extract task: {error}")))?
-            .map_err(map_archive_error)?;
-        validate_staging(&staging, release_id).await?;
+        stage_release_package(&package, &staging, release_id).await?;
 
         let code = app_dir.join("code");
         let rollback = releases_dir.join(".rollback").join("code");
         remove_dir_if_exists(&rollback).await?;
-        let app_exists = self
-            .runtime
-            .get_deployment_status(app_id)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        if app_exists {
-            self.stop_app(app_id).await?;
+        let app_exists = match self.runtime.get_deployment_status(app_id).await {
+            Ok(status) => status.is_some(),
+            Err(error) => {
+                remove_dir_if_exists(&staging).await?;
+                return Err(crate::utils::map_runtime_error(
+                    &format!("[APP] check app existence before activation failed app_id={app_id}"),
+                    error,
+                ));
+            }
+        };
+        if app_exists && let Err(error) = self.stop_app(app_id).await {
+            remove_dir_if_exists(&staging).await?;
+            return Err(error);
         }
         if code.exists() {
             tokio::fs::rename(&code, &rollback)
@@ -260,19 +254,18 @@ impl AppService {
             );
             let code = app_dir.join("code");
             let rollback = releases_dir.join(".rollback").join("code");
+            // 不论是升级还是首次发布，都必须先停止失败运行时，再操作 code。
+            match self.stop_app(app_id).await {
+                Ok(_) | Err(AppOperationError::NotFound(_)) => {}
+                Err(error) => {
+                    return Err(AppOperationError::Backend(format!(
+                        "failed to stop app before release rollback: {error}"
+                    )));
+                }
+            }
+            remove_dir_if_exists(&code).await?;
+            let mut restart_error = None;
             if rollback.exists() {
-                if let Err(stop_err) = self.stop_app(app_id).await {
-                    warn!(
-                        "[app_manager] Failed to stop app {} during rollback: {}",
-                        app_id, stop_err
-                    );
-                }
-                if let Err(cleanup_err) = remove_dir_if_exists(&code).await {
-                    warn!(
-                        "[app_manager] Failed to cleanup code dir during rollback: {}",
-                        cleanup_err
-                    );
-                }
                 tokio::fs::rename(&rollback, &code).await.map_err(|error| {
                     map_io_error(
                         "restore previous release after readiness failure",
@@ -281,10 +274,7 @@ impl AppService {
                     )
                 })?;
                 if let Err(restart_err) = self.start_app(app_id).await {
-                    error!(
-                        "[app_manager] CRITICAL: rollback restart failed for {}: {}",
-                        app_id, restart_err
-                    );
+                    restart_error = Some(restart_err);
                 }
             }
             index.releases[position].status = ReleaseStatus::Failed;
@@ -301,9 +291,12 @@ impl AppService {
                 );
             }
             write_index(&releases_dir, &index).await?;
-            return Err(AppOperationError::InvalidState(format!(
-                "release readiness failed: {release_id}"
-            )));
+            if let Some(restart_error) = restart_error {
+                return Err(AppOperationError::Backend(format!(
+                    "rollback restored previous code but restart failed for {app_id}: {restart_error}"
+                )));
+            }
+            return Ok(index.releases[position].clone());
         }
         for release in &mut index.releases {
             if release.status == ReleaseStatus::Active {
@@ -375,6 +368,36 @@ async fn ensure_release_dirs(root: &Path) -> AppResult<()> {
             .map_err(|error| map_io_error("create releases directory", error, false))?;
     }
     Ok(())
+}
+
+/// 解压并校验 release staging。任一步失败都立即清理，避免损坏包持续占用 PVC。
+async fn stage_release_package(package: &Path, staging: &Path, release_id: &str) -> AppResult<()> {
+    remove_dir_if_exists(staging).await?;
+    tokio::fs::create_dir_all(staging)
+        .await
+        .map_err(|error| map_io_error("create release staging directory", error, false))?;
+
+    let package = package.to_path_buf();
+    let staging_owned = staging.to_path_buf();
+    let result = async {
+        tokio::task::spawn_blocking(move || extract_zip(&package, &staging_owned))
+            .await
+            .map_err(|error| AppOperationError::Backend(format!("release extract task: {error}")))?
+            .map_err(map_archive_error)?;
+        validate_staging(staging, release_id).await
+    }
+    .await;
+
+    if result.is_err()
+        && let Err(cleanup_error) = remove_dir_if_exists(staging).await
+    {
+        warn!(
+            staging = %staging.display(),
+            error = %cleanup_error,
+            "failed to cleanup invalid release staging directory"
+        );
+    }
+    result
 }
 
 async fn acquire_lock(path: PathBuf) -> AppResult<std::fs::File> {
@@ -716,5 +739,20 @@ mod tests {
         assert!(validate_release_id("../release").is_err());
         assert!(validate_sha256(&"a".repeat(64)).is_ok());
         assert!(validate_sha256("abc").is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_staging_is_removed_immediately() {
+        let root = tempfile::tempdir().expect("release tempdir");
+        let package = root.path().join("broken.zip");
+        let staging = root.path().join("staging");
+        tokio::fs::write(&package, b"not a zip archive")
+            .await
+            .expect("write broken package");
+
+        let result = stage_release_package(&package, &staging, "release-1").await;
+
+        assert!(result.is_err());
+        assert!(!staging.exists(), "invalid staging must not remain on PVC");
     }
 }

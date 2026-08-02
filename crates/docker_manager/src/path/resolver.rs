@@ -90,7 +90,7 @@ impl HostPathResolver {
 
         // 选择默认工作空间（用于相对路径解析）
         // 优先选择 project_workspace 相关的挂载点
-        let default_workspace = all_mounts
+        let (container_workspace, host_workspace) = all_mounts
             .iter()
             .find(|(container_path, _)| {
                 let path_str = container_path.to_string_lossy();
@@ -98,10 +98,12 @@ impl HostPathResolver {
                     || path_str.contains("project_workspace")
             })
             .or_else(|| all_mounts.first())
-            // all_mounts 不为空（前面已检查），所以这里一定有值
-            .expect("all_mounts is not empty, checked above");
-
-        let (container_workspace, host_workspace) = default_workspace.clone();
+            .cloned()
+            .ok_or_else(|| {
+                DockerError::ConfigurationError(
+                    "No usable workspace mount point was detected".to_string(),
+                )
+            })?;
 
         info!(
             "[HostPathResolver] Default workspace: {} (host) -> {} (container)",
