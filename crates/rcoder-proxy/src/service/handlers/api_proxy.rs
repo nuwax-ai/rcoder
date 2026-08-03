@@ -46,18 +46,15 @@ pub async fn handle_api_proxy_request(
     // 记录服务名到 ctx（用于错误响应体日志）
     ctx.api_service_name = Some(service_name.to_string());
 
-    debug!(
-        "API proxy request: service_name={}, api_path={}",
-        service_name, api_path
-    );
+    debug!("API proxy request: service_name={}", service_name);
 
     // [DEBUG] 打印原始请求的所有 headers
     {
         let method = upstream_request.method.as_str();
-        let uri = original_uri.to_string();
         debug!(
-            "[API_PROXY_DEBUG] ====== Original request ======\n  Method: {}\n  URI: {}",
-            method, uri
+            "[API_PROXY_DEBUG] ====== Original request ======\n  Method: {}\n  Path: {}",
+            method,
+            original_uri.path()
         );
         for (name, value) in upstream_request.headers.iter() {
             let val_str = value.to_str().unwrap_or("<binary>");
@@ -90,11 +87,12 @@ pub async fn handle_api_proxy_request(
     let config = api_config.value();
     let base_url = config.base_url.trim_end_matches('/');
 
-    // [DEBUG] 打印完整的 ModelProviderConfig（脱敏）
+    // 仅记录 origin，避免 base_url 的用户信息、租户路径或 query 参数进入日志。
+    let base_url_origin = utils::url_origin_for_log(base_url);
     debug!(
         "[API_PROXY_DEBUG] ====== DashMap config (service={}) ======\n  base_url: {}\n  api_protocol: {:?}\n  requires_openai_auth: {}\n  api_key: {}",
         service_name,
-        base_url, // 不脱敏，debug 模式下需要完整 URL 排查
+        base_url_origin,
         config.api_protocol,
         config.requires_openai_auth,
         utils::mask_header_value(&config.api_key),
@@ -149,11 +147,10 @@ pub async fn handle_api_proxy_request(
         new_uri_str
     };
 
-    // [DEBUG] 打印完整的上游 URL（不脱敏）
-    debug!("[API_PROXY_DEBUG] proxy URL: {}", new_uri_str);
+    debug!("[API_PROXY_DEBUG] proxy origin: {}", base_url_origin);
 
     let new_uri = new_uri_str.parse::<http::Uri>().map_err(|e| {
-        error!("URI rewrite failed: {} - {}", new_uri_str, e);
+        error!("API proxy URI rewrite failed: {}", e);
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
 
@@ -174,11 +171,9 @@ pub async fn handle_api_proxy_request(
     upstream_request.insert_header("X-API-Proxy", "pingora-proxy")?;
     upstream_request.insert_header("X-Service-Name", service_name)?;
 
-    // 对 URL 进行脱敏处理后输出日志
-    let masked_url = utils::mask_url(base_url);
     info!(
-        "[API_PROXY] {} request rewritten to: {}",
-        service_name, masked_url
+        "[API_PROXY] {} request rewritten to origin: {}",
+        service_name, base_url_origin
     );
 
     // [DEBUG] 打印最终发送到上游的所有 headers

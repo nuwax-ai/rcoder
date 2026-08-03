@@ -55,6 +55,17 @@ pub fn mask_header_value(value: &str) -> String {
     format!("{}***{}", prefix, suffix)
 }
 
+/// 返回适合日志记录的 URL origin，不包含用户信息、路径、query 或 fragment。
+///
+/// 配置解析失败时不回显原始输入，防止格式错误的 URL 将敏感内容带入日志。
+pub fn url_origin_for_log(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .filter(|parsed| matches!(parsed.scheme(), "http" | "https"))
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or_else(|| "<invalid-url>".to_string())
+}
+
 /// 对 URL 进行脱敏处理，隐藏域名中间部分
 ///
 /// # 示例
@@ -137,6 +148,21 @@ mod tests {
         assert_eq!(mask_header_value("1234567890"), "***");
         assert_eq!(mask_header_value("12345678901"), "1234***8901");
         assert_eq!(mask_header_value("abcdefghijklmnop"), "abcd***mnop");
+    }
+
+    #[test]
+    fn url_origin_for_log_omits_sensitive_url_components() {
+        assert_eq!(
+            url_origin_for_log(
+                "https://user:secret@api.example.com:8443/tenant-a/v1?token=secret#x"
+            ),
+            "https://api.example.com:8443"
+        );
+        assert_eq!(
+            url_origin_for_log("not a url?token=secret"),
+            "<invalid-url>"
+        );
+        assert_eq!(url_origin_for_log("file:///tmp/secret"), "<invalid-url>");
     }
 
     #[test]

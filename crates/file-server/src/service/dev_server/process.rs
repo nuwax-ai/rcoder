@@ -125,9 +125,12 @@ pub fn spawn_override_shell(
     cmd.stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AppError::system(format!("spawn override dev server failed: {e}")))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::system(format!(
+            "spawn override dev server failed (cwd={}): {e}",
+            cwd.display()
+        ))
+    })?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     Ok((child, stdout, stderr))
@@ -152,9 +155,12 @@ pub fn spawn_dev(
     // 新进程组 (unix): child.pid == pgid, 后续 kill(-pid) 杀整组 (含 vite 子进程)
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AppError::system(format!("spawn dev server failed: {e}")))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::system(format!(
+            "spawn dev server failed (program={program}, cwd={}): {e}",
+            cwd.display()
+        ))
+    })?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     Ok((child, stdout, stderr))
@@ -191,9 +197,12 @@ pub async fn run_command_to_log(
     cmd.stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AppError::system(format!("spawn command failed: {e}")))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::system(format!(
+            "spawn command failed (program={program}, cwd={}): {e}",
+            cwd.display()
+        ))
+    })?;
     // 回调 pid 供外部 cancel (kill_process_group); child drop 前 pid 恒有效。
     if let Some(cb) = on_pid
         && let Some(pid) = child.id()

@@ -1,7 +1,7 @@
 //! PostgreSQL 标识符与字面量的校验 / 转义工具
 //!
 //! PG 标识符规则 (SQL 标准 + PG 扩展):
-//! - 长度 1..=63 (超长自动截断到 63, 但显式报错更安全)
+//! - 长度 1..=63 字节 (与 PostgreSQL `NAMEDATALEN - 1` 一致；超长时显式报错)
 //! - 首字符: 字母 (a-zA-Z) 或下划线 `_`
 //! - 后续字符: 字母 / 数字 / 下划线
 //! - 大小写保留 (加双引号时不折叠为小写)
@@ -12,11 +12,12 @@ use std::result::Result;
 
 /// PG 标识符校验 — 白名单, 拒绝即报错
 ///
-/// 规则: `[a-zA-Z_][a-zA-Z0-9_]*`, 长度 1..=63
+/// 规则: `[a-zA-Z_][a-zA-Z0-9_]*`, 长度 1..=63 字节。
+/// `str::len()` 返回字节数；当前白名单只允许 ASCII，因此也等于字符数。
 pub fn validate_pg_identifier(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 63 {
         return Err(format!(
-            "PG identifier must be 1..=63 chars, got {len}",
+            "PG identifier must be 1..=63 bytes, got {len}",
             len = name.len()
         ));
     }
