@@ -60,15 +60,19 @@ pub async fn create_grpc_sse_stream(
             session_id, client_last_seq
         );
 
-        // 2. 增量补齐：从 ring 读取 seq > client_last_seq 的历史（断线重连补缺，不重复已收）
+        // 2. 先订阅 broadcast(接实时),再 replay ring(补历史)——顺序不能反!
+        //    若 replay 先 subscribe 后,中间 dispatch 的事件不在 replay 也不在 receiver = 丢事件。
+        //    subscribe 先 replay 后:gap 里的事件在两边都有 → dedup(seq<=client_last_seq)去重。
+        let mut bc_rx = shared.subscribe();
+
+        // 3. 增量补齐：从 ring 读取 seq > client_last_seq 的历史（断线重连补缺，不重复已收）
         for ev in shared.replay_since(client_last_seq) {
             if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
                 return; // 客户端断开，或历史已含终端事件
             }
         }
 
-        // 3. 订阅 broadcast 接实时事件
-        let mut bc_rx = shared.subscribe();
+        // 4. 接实时事件(dedup 跳过 replay 已发的)
         loop {
             tokio::select! {
                 // HTTP 客户端断开（SSE Receiver 全 drop）→ 退出（_guard drop 时 release_client）
