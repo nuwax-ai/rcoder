@@ -52,8 +52,9 @@ pub struct KubernetesRuntime {
     pub(crate) config: KubernetesRuntimeConfig,
     /// Cache for pod information (using RwLock to avoid DashMap deadlocks)
     pub(crate) pod_cache: Arc<RwLock<std::collections::HashMap<String, RuntimeContainerInfo>>>,
-    /// identifier -> CephFS subvolumePath 缓存 (resolve_subvolume_path 用)。
-    /// subvolumePath 对 PVC 不可变 → 缓存只冷启动填充, 永不失效。
+    /// CephFS subvolumePath 缓存(key=pvc_name,resolve_subvolume_path_by_pvcname 用)。
+    /// subvolumePath 对 PVC 不可变 → 命中即安全;cache miss 时查 K8s(PVC→PV→csi.subvolumePath)懒填充。
+    /// 失效时机:PVC destroy(destroy_workspace_pvc 等 remove)+ cleanup_all clear。
     /// 阶段2: rcoder 挂根聚合访问 agent subvolume (/app/cephfs-root/{subvolumePath}/...)。
     pub(crate) subvolume_path_cache: Arc<RwLock<std::collections::HashMap<String, String>>>,
 }

@@ -379,7 +379,8 @@ impl K8sPvcOps for KubernetesRuntime {
         &self,
         pvc_name: &str,
     ) -> ContainerRuntimeResult<String> {
-        // cache hit (subvolumePath 对 PVC 不可变 → 永不失效; key=pvc_name 覆盖共享+per-agent)
+        // cache hit (subvolumePath 对 PVC 不可变,命中即安全;失效靠 PVC destroy 时的 remove。
+        // key=pvc_name 覆盖共享+per-agent)
         if let Some(cached) = self
             .subvolume_path_cache
             .read()
