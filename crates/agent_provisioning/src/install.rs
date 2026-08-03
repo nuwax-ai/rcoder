@@ -54,7 +54,7 @@ pub async fn install_agent(
     })?;
 
     // 2. 缓存检查（仅用于日志区分）
-    let from_cache = download_manager.is_cached(agent_id, version);
+    let from_cache = download_manager.is_cached_async(agent_id, version).await;
 
     // 3. 下载到缓存
     let download_result = download_manager

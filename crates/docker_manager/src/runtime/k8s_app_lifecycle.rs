@@ -17,7 +17,9 @@ use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use tracing::{info, warn};
 
 #[cfg(feature = "kubernetes")]
-use super::k8s_app_helpers::{IDLE_TIMEOUT_ANNOTATION, RECYCLE_ENABLED_ANNOTATION};
+use super::k8s_app_helpers::{
+    IDLE_TIMEOUT_ANNOTATION, RECYCLE_ENABLED_ANNOTATION, WAKE_ON_TRAFFIC_ANNOTATION,
+};
 use super::k8s_deployment::{APP_LABEL_PREFIX, APP_MANAGED_BY, RCODER_LABEL_PREFIX};
 use super::kubernetes_runtime::KubernetesRuntime;
 
@@ -68,6 +70,24 @@ impl KubernetesRuntime {
             "[K8S-APP] Deployment {name} recycle policy patched (enabled={:?}, idle_timeout={:?})",
             recycle_enabled, idle_timeout_seconds
         );
+        Ok(())
+    }
+
+    pub async fn patch_app_wake_on_traffic(
+        &self,
+        app_id: &str,
+        enabled: bool,
+    ) -> ContainerRuntimeResult<()> {
+        let name = self.app_deployment_name(app_id);
+        let annotations =
+            std::collections::BTreeMap::from([(WAKE_ON_TRAFFIC_ANNOTATION, enabled.to_string())]);
+        let patch = serde_json::json!({ "metadata": { "annotations": annotations } });
+        self.deployments_api()
+            .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("patch wake-on-traffic: {error}"))
+            })?;
         Ok(())
     }
 

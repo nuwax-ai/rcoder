@@ -77,6 +77,9 @@ pub trait AppServiceTrait: Send + Sync {
     /// 停止应用（scale replicas = 0）
     async fn stop_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
 
+    /// 闲置回收专用 scale0：持久化允许流量唤醒的停止原因。
+    async fn recycle_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
+
     /// 重启应用（rollout restart）
     async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
 
@@ -107,16 +110,6 @@ pub trait AppServiceTrait: Send + Sync {
 
     async fn delete_release(&self, app_id: &str, release_id: &str) -> AppResult<()>;
 
-    /// 获取应用日志（读取共享工作空间的 logs/app.log）
-    async fn get_app_logs(&self, app_id: &str, params: LogParams) -> AppResult<Vec<LogEntry>>;
-
-    /// 启动日志流（follow），返回 mpsc::Receiver 供 WS handler 桥接（v2 §11）
-    async fn stream_app_logs(
-        &self,
-        app_id: &str,
-        tail: u32,
-    ) -> AppResult<container_runtime_api::mpsc::Receiver<container_runtime_api::ContainerLogEntry>>;
-
     /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
     async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats>;
 
@@ -125,14 +118,6 @@ pub trait AppServiceTrait: Send + Sync {
         &self,
         app_id: &str,
     ) -> AppResult<Vec<container_runtime_api::AppEventInfo>>;
-
-    /// 读取应用文件日志（从 workspace PVC 读，适用不写 stdout 的应用）
-    async fn get_app_file_logs(
-        &self,
-        app_id: &str,
-        file_path: &str,
-        tail: u32,
-    ) -> AppResult<Vec<LogEntry>>;
 
     /// 上传文件 / 压缩包（魔数判断：zip/tar.gz → 解压到 target 目录；单文件存 target；flatten 剥 wrapper）
     async fn upload_file(
@@ -143,7 +128,7 @@ pub trait AppServiceTrait: Send + Sync {
         flatten: bool,
     ) -> AppResult<UploadResult>;
 
-    /// 从 URL 下载文件/压缩包并上传（复用 upload_file 解压/安全；SSRF 由 download_utils 防护）
+    /// 从 HTTP(S) URL 下载文件/压缩包并上传；允许内网地址，复用 upload_file 解压和路径安全校验。
     async fn upload_from_url(
         &self,
         app_id: &str,

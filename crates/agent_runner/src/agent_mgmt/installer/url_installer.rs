@@ -80,39 +80,16 @@ pub async fn install_from_url(
     crate::agent_mgmt::path_manager::validate_agent_id(agent_id)
         .map_err(AgentMgmtError::InvalidManifest)?;
 
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    let parsed_url = reqwest::Url::parse(url)
+        .map_err(|error| AgentMgmtError::InvalidChunk(format!("invalid URL '{url}': {error}")))?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
         return Err(AgentMgmtError::InvalidChunk(format!(
-            "URL must start with http:// or https://: {url}"
+            "URL must use http or https: {url}"
         )));
     }
 
-    // SSRF 防护：阻止访问内部/私有网络地址
-    if let Ok(parsed) = url.parse::<reqwest::Url>()
-        && let Some(host) = parsed.host_str()
-    {
-        // 阻止常见内部地址
-        let blocked = host == "localhost"
-            || host == "127.0.0.1"
-            || host.starts_with("169.254.")
-            || host.starts_with("10.")
-            || host.starts_with("192.168.")
-            || host.starts_with("172.16.")
-            || host.starts_with("172.17.")
-            || host.starts_with("172.18.")
-            || host.starts_with("172.19.")
-            || host.starts_with("172.2")
-            || host.starts_with("172.30.")
-            || host.starts_with("172.31.")
-            || host == "[::1]"
-            || host.starts_with("[fc")
-            || host.starts_with("[fd")
-            || host == "0.0.0.0";
-        if blocked {
-            return Err(AgentMgmtError::InvalidChunk(format!(
-                "SSRF protection: access to internal address '{host}' is blocked"
-            )));
-        }
-    }
+    // 私有化部署需要从内网 IP、集群域名和 localhost 镜像源下载；不限制 host 的公网属性。
+    // 仍只接受 HTTP(S)，拒绝 file/gopher 等本地文件或非 HTTP 协议。
     if command.is_empty() {
         return Err(AgentMgmtError::InvalidChunk("empty command".into()));
     }
@@ -534,6 +511,11 @@ mod tests {
         StatusCode::NOT_FOUND
     }
 
+    async fn handler_slow() -> impl IntoResponse {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        StatusCode::OK
+    }
+
     /// 解析 Range: bytes=start-end
     fn parse_range(range_str: &str, total_size: u64) -> Option<(u64, u64)> {
         let range_str = range_str.strip_prefix("bytes=")?;
@@ -640,6 +622,31 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
+    async fn test_download_cancellation_is_prompt_and_cleans_partial_file() {
+        let app = Router::new().route("/slow", get(handler_slow));
+        let addr = start_server(app).await;
+        let url = format!("http://{addr}/slow");
+        let dest = std::env::temp_dir().join("test-download-cancel.bin");
+        std::fs::write(&dest, b"partial").expect("partial download");
+        let cancel = CancellationToken::new();
+        let cancel_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_task.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            download_to_file(&url, &dest, 1024, None, &cancel),
+        )
+        .await
+        .expect("cancellation must not wait for HTTP timeout");
+
+        assert!(matches!(result, Err(AgentMgmtError::InstallCancelled)));
+        assert!(!dest.exists(), "cancelled partial download must be removed");
     }
 
     /// 测试断点续传（本地服务器，支持 Range）

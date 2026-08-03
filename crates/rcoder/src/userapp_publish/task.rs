@@ -174,6 +174,8 @@ impl PublishTask {
         apply_event(&mut inner, &event);
         let terminal = is_terminal_status(inner.status);
         let s = self.seq.fetch_add(1, Ordering::Relaxed);
+        // event_lock 已保证事件顺序，状态更新完成后无需在等待 history 锁时继续持有 inner。
+        drop(inner);
         {
             let mut h = self.history.lock().await;
             if h.len() >= RING_CAP {
@@ -186,7 +188,6 @@ impl PublishTask {
             self.terminal_at
                 .store(Utc::now().timestamp(), Ordering::Release);
         }
-        drop(inner);
     }
 
     /// 订阅:回放 ring 里 seq >= from_seq 的历史 + 实时 broadcast receiver。

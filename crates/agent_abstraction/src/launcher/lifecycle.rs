@@ -154,7 +154,7 @@ impl AgentLifecycleGuard {
         child_process: Box<dyn ChildWrapper>,
         stderr_task: JoinHandle<()>,
         cancel_token: CancellationToken,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_claude_full(ClaudeProcessParams {
             project_id,
             session_id,
@@ -177,10 +177,10 @@ impl AgentLifecycleGuard {
     ///
     /// 支持所有可选功能：密钥管理器、异常退出标志、诊断监听器等。
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// 如果子进程 PID 无效（为 0 或 None），此函数会 panic，因为这意味着进程启动失败。
-    pub fn new_claude_full(params: ClaudeProcessParams) -> Self {
+    /// 子进程 PID 不存在或为 0 时返回初始化错误。
+    pub fn new_claude_full(params: ClaudeProcessParams) -> Result<Self> {
         let ClaudeProcessParams {
             project_id,
             session_id,
@@ -197,24 +197,9 @@ impl AgentLifecycleGuard {
             process_args,
             working_dir,
         } = params;
-        // 🔥 关键：PID 有效性检查
-        // ChildWrapper 的 id() 返回 Option<u32>，当进程已终止或无效时返回 None
-        // 如果 PID 无效，这是一个严重的初始化错误，应该 panic
-        let pid = child_process.id().unwrap_or_else(|| {
-            panic!(
-                "[LifecycleGuard] 子进程 PID 无效（None），进程可能已终止: project_id={}",
-                project_id
-            )
-        });
-
-        // 🔥 额外检查：PID 不应该为 0
-        // 虽然 id() 返回 Some(0) 理论上可能，但实际上 PID 0 是内核保留的
-        if pid == 0 {
-            panic!(
-                "[LifecycleGuard] 子进程 PID 为 0，这是无效的 PID: project_id={}",
-                project_id
-            );
-        }
+        let pid = child_process.id().filter(|pid| *pid != 0).ok_or_else(|| {
+            anyhow::anyhow!("lifecycle child process has no valid PID: project_id={project_id}")
+        })?;
 
         // 🔥 进程组 ID 等于组长进程的 PID
         // process-wrap 的 ProcessGroup 使用 setpgid(0, 0) 创建新进程组，使进程成为组长
@@ -383,7 +368,7 @@ impl AgentLifecycleGuard {
             project_id, pgid, session_id_str
         );
 
-        Self { inner }
+        Ok(Self { inner })
     }
 
     /// 优雅停止agent

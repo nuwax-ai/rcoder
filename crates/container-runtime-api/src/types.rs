@@ -222,6 +222,8 @@ pub struct DeploymentStatus {
     pub recycle_enabled: Option<bool>,
     /// 闲置回收阈值秒数（per-app 覆盖；None=用全局配置）。由 `rcoder.io/idle-timeout-seconds` 注解读回。
     pub idle_timeout_seconds: Option<u64>,
+    /// replicas=0 时是否允许 HTTP 流量自动唤醒；K8s 由 Deployment 注解持久化。
+    pub wake_on_traffic: Option<bool>,
     /// Deployment 创建时间（RFC3339，来自 metadata.creationTimestamp；回收扫描器做 protection 龄期判断）。
     pub created_at: Option<String>,
 }

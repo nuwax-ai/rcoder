@@ -1,8 +1,10 @@
 //! UserApp 生命周期 + 观测操作（从 service.rs 拆出，extension-impl）。
 //!
-//! start/stop/restart + logs/stats/events/file_logs 观测委托（转调 ContainerRuntime）。
+//! start/stop/restart/recycle + stats/events 观测委托（转调 ContainerRuntime）。
 
 use tracing::{info, instrument, warn};
+
+use container_runtime_api::DeploymentStatus;
 
 use super::models::*;
 use super::service::AppService;
@@ -13,13 +15,33 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
-        self.ensure_app_exists(app_id).await?;
+        let previous = self.fetch_runtime_status_or_err(app_id).await?;
+        let previous_wake_on_traffic = previous
+            .wake_on_traffic
+            .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
         self.runtime
-            .scale_deployment(app_id, 1)
+            .patch_wake_on_traffic(app_id, true)
             .await
-            .map_err(|e| {
-                map_runtime_error(&format!("[APP] scale_deployment failed app_id={app_id}"), e)
+            .map_err(|error| {
+                map_runtime_error(
+                    &format!("[APP] enable wake-on-traffic failed app_id={app_id}"),
+                    error,
+                )
             })?;
+        if let Err(error) = self.runtime.scale_deployment(app_id, 1).await {
+            if let Err(restore_error) = self
+                .runtime
+                .patch_wake_on_traffic(app_id, previous_wake_on_traffic)
+                .await
+            {
+                warn!(app_id, %restore_error, "failed to restore wake block after scale1 failure");
+            }
+            self.restore_activity_state(app_id, &previous, previous_wake_on_traffic);
+            return Err(map_runtime_error(
+                &format!("[APP] scale_deployment failed app_id={app_id}"),
+                error,
+            ));
+        }
         self.activity.mark_running(app_id);
         info!("[APP] app started (scale=1): {}", app_id);
         self.get_app(app_id).await
@@ -28,17 +50,72 @@ impl AppService {
     /// 停止应用（scale replicas = 0）
     #[instrument(skip(self))]
     pub async fn stop_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        self.scale_to_zero(app_id, false).await
+    }
+
+    /// 闲置回收使用：scale0 后允许后续流量自动唤醒。
+    #[instrument(skip(self))]
+    pub async fn recycle_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        self.scale_to_zero(app_id, true).await
+    }
+
+    async fn scale_to_zero(
+        &self,
+        app_id: &str,
+        wake_on_traffic: bool,
+    ) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
-        self.ensure_app_exists(app_id).await?;
-        self.runtime
-            .scale_deployment(app_id, 0)
+        let previous = self.fetch_runtime_status_or_err(app_id).await?;
+        let previous_wake_on_traffic = previous
+            .wake_on_traffic
+            .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
+        // 先阻断内存态唤醒，再持久化停止原因，避免 scale0 与请求触发 scale1 竞态。
+        self.activity.mark_wake_blocked(app_id);
+        if let Err(error) = self
+            .runtime
+            .patch_wake_on_traffic(app_id, wake_on_traffic)
             .await
-            .map_err(|e| {
-                map_runtime_error(&format!("[APP] scale_deployment failed app_id={app_id}"), e)
-            })?;
-        self.activity.mark_stopped(app_id);
+        {
+            self.restore_activity_state(app_id, &previous, previous_wake_on_traffic);
+            return Err(map_runtime_error(
+                &format!("[APP] patch wake-on-traffic failed app_id={app_id}"),
+                error,
+            ));
+        }
+        if let Err(error) = self.runtime.scale_deployment(app_id, 0).await {
+            self.restore_activity_state(app_id, &previous, previous_wake_on_traffic);
+            if let Err(restore_error) = self
+                .runtime
+                .patch_wake_on_traffic(app_id, previous_wake_on_traffic)
+                .await
+            {
+                warn!(app_id, %restore_error, "failed to restore wake-on-traffic after scale0 failure");
+            }
+            return Err(map_runtime_error(
+                &format!("[APP] scale_deployment failed app_id={app_id}"),
+                error,
+            ));
+        }
+        if wake_on_traffic {
+            self.activity.mark_recycled(app_id);
+        }
         info!("[APP] app stopped (scale=0): {}", app_id);
         self.get_app(app_id).await
+    }
+
+    pub(super) fn restore_activity_state(
+        &self,
+        app_id: &str,
+        previous: &DeploymentStatus,
+        previous_wake_on_traffic: bool,
+    ) {
+        if previous.replicas > 0 {
+            self.activity.mark_running(app_id);
+        } else if !previous_wake_on_traffic {
+            self.activity.mark_wake_blocked(app_id);
+        } else {
+            self.activity.mark_recycled(app_id);
+        }
     }
 
     /// 重启应用（rollout restart）
@@ -86,50 +163,6 @@ impl AppService {
             app_id, request.recycle_enabled, request.idle_timeout_seconds
         );
         self.get_app(app_id).await
-    }
-
-    /// 获取应用日志（实时拉容器 stdout/stderr：K8s Pod logs / docker logs）。
-    ///
-    /// `follow` 流式当前未实现（runtime 返回 tail 快照），`since` 暂未透传；
-    /// SSE/WebSocket 实时流留待后续增强。
-    #[instrument(skip(self))]
-    pub async fn get_app_logs(&self, app_id: &str, params: LogParams) -> AppResult<Vec<LogEntry>> {
-        validate_app_id(app_id)?;
-        self.ensure_app_exists(app_id).await?;
-        let tail = params.tail.unwrap_or(1000);
-        let timestamps = params.timestamps.unwrap_or(true);
-        let entries = self
-            .runtime
-            .get_app_logs(app_id, tail, timestamps)
-            .await
-            .map_err(|e| {
-                map_runtime_error(&format!("[APP] get_app_logs failed app_id={app_id}"), e)
-            })?;
-        Ok(entries
-            .into_iter()
-            .map(|e| LogEntry {
-                timestamp: e.timestamp.unwrap_or_default(),
-                stream: e.stream,
-                message: e.message,
-            })
-            .collect())
-    }
-
-    /// 启动日志流（follow），返回 mpsc::Receiver 供 WS handler 桥接（v2 §11）。
-    /// receiver drop 即取消：客户端断开 → handler 退出 → receiver 析构 → runtime 任务终止。
-    pub async fn stream_app_logs(
-        &self,
-        app_id: &str,
-        tail: u32,
-    ) -> AppResult<container_runtime_api::mpsc::Receiver<container_runtime_api::ContainerLogEntry>>
-    {
-        validate_app_id(app_id)?;
-        self.runtime
-            .stream_app_logs(app_id, tail)
-            .await
-            .map_err(|e| {
-                map_runtime_error(&format!("[APP] stream_app_logs failed app_id={app_id}"), e)
-            })
     }
 
     /// 获取资源使用情况。
@@ -185,49 +218,6 @@ impl AppService {
         self.runtime.get_app_events(app_id).await.map_err(|e| {
             map_runtime_error(&format!("[APP] get_app_events failed app_id={app_id}"), e)
         })
-    }
-
-    /// 读取应用文件日志（从 workspace PVC 的 logs/ 目录直接读，不依赖 K8s Pod log API）。
-    ///
-    /// 适用：不写 stdout 而写文件的应用（Java Spring Boot → logs/application.log 等）。
-    /// 路径相对 app 根（如 "logs/app.log"），有 path traversal 防护。
-    #[instrument(skip(self))]
-    pub async fn get_app_file_logs(
-        &self,
-        app_id: &str,
-        file_path: &str,
-        tail: u32,
-    ) -> AppResult<Vec<LogEntry>> {
-        validate_app_id(app_id)?;
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        let target = app_dir.join(file_path);
-
-        // exists 守卫：日志文件不存在返 FileNotFound（常见，非 500）；canonicalize 失败也归此类
-        if !target.exists() {
-            return Err(AppOperationError::FileNotFound(format!(
-                "log file does not exist: {file_path}"
-            )));
-        }
-        // path traversal 防护（与 upload/delete_file 一致，复用 utils::ensure_within_app_dir）
-        let canonical_root = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
-        let canonical_target = ensure_within_app_dir(&target, &canonical_root)?;
-
-        // 读文件，取最后 tail 行
-        let content = tokio::fs::read_to_string(&canonical_target)
-            .await
-            .map_err(|e| {
-                map_io_error(&format!("failed to read log file '{file_path}'"), e, true)
-            })?;
-        let lines: Vec<&str> = content.lines().collect();
-        let start = lines.len().saturating_sub(tail as usize);
-        Ok(lines[start..]
-            .iter()
-            .map(|line| LogEntry {
-                timestamp: String::new(),
-                stream: "file".to_string(),
-                message: line.to_string(),
-            })
-            .collect())
     }
 }
 

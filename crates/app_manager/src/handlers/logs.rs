@@ -58,7 +58,8 @@ pub async fn stream_app_logs_v1(
     Json(request): Json<AppLogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
     let base = runtime_api_base(&state, &app_id).await?;
-    let response = reqwest::Client::new()
+    let response = state
+        .http_client
         .post(format!("{base}/v1/logs/stream"))
         .json(&request)
         .send()
@@ -67,10 +68,13 @@ pub async fn stream_app_logs_v1(
     if !response.status().is_success() {
         let status = response.status();
         let message = response.text().await.unwrap_or_default();
-        return Err(backend(format!(
-            "app-cli log stream rejected request ({status}): {message}"
-        ))
-        .into());
+        if status.is_client_error() {
+            return Err(AppOperationError::Validation(format!(
+                "app-cli rejected log stream ({status}): {message}"
+            ))
+            .into());
+        }
+        return Err(backend(format!("app-cli log stream failed ({status}): {message}")).into());
     }
     let stream = response.bytes_stream().map_err(std::io::Error::other);
     Response::builder()
@@ -88,7 +92,8 @@ async fn forward_json(
     request: AppLogQueryRequest,
 ) -> Result<Json<Value>, AppError> {
     let base = runtime_api_base(state, app_id).await?;
-    let response = reqwest::Client::new()
+    let response = state
+        .http_client
         .post(format!("{base}{path}"))
         .json(&request)
         .send()
@@ -99,11 +104,14 @@ async fn forward_json(
         .json()
         .await
         .map_err(|error| backend(format!("parse app-cli logs response: {error}")))?;
-    if !status.is_success() {
+    if status.is_client_error() {
         return Err(AppOperationError::Validation(format!(
             "app-cli rejected log query ({status}): {value}"
         ))
         .into());
+    }
+    if !status.is_success() {
+        return Err(backend(format!("app-cli log query failed ({status}): {value}")).into());
     }
     Ok(Json(value))
 }

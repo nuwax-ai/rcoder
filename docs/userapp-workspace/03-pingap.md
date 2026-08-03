@@ -25,7 +25,8 @@ app-cli 根据 release lock 转成 `127.0.0.1:<locked_port>`。引用不存在�
 app-cli 加载配置、解析逻辑地址、检查冲突、调用 `PingapConfig::validate()`，再执行
 `pingap -t`。通过后写入 `/run/app-cli/pingap/<release_id>/pingap.toml`，权限 `0600`。
 
-- 公网 listener 只能是 `0.0.0.0:9080`；额外 listener 只能 loopback。
+- 统一 listener 只能是 `0.0.0.0:9080`，接受公网或内网来源；额外 listener 只能 loopback。
+- 不要求公网域名或 HTTPS；内网 IP、内网域名和 HTTP 都是受支持的部署方式。
 - Admin 始终关闭，运行时修改不作为权威配置。
 - 每类对象默认最多 256 个，总配置最多 2 MiB。
 - binary 和 `pingap-config` 必须锁到相同 commit；release lock 记录版本、commit 和平台

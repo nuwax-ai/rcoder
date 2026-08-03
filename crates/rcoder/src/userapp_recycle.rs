@@ -95,9 +95,9 @@ impl UserAppRecycleScanner {
                         debug!("[USERAPP_RECYCLE] skip {app_id}: access changed before recycle");
                         continue;
                     };
-                    // 命中:回收(scale0,stop_app 内部 mark_stopped)。每 app 错误隔离。
-                    if let Err(e) = self.state.app_service.stop_app(app_id).await {
-                        warn!("[USERAPP_RECYCLE] stop_app failed app_id={app_id}: {e}");
+                    // 命中：以“允许流量唤醒”的语义回收到 scale0。每 app 错误隔离。
+                    if let Err(e) = self.state.app_service.recycle_app(app_id).await {
+                        warn!("[USERAPP_RECYCLE] recycle_app failed app_id={app_id}: {e}");
                     } else {
                         info!(
                             "[USERAPP_RECYCLE] recycled idle app: {app_id} (idle={:?})",

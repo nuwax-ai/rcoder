@@ -108,6 +108,7 @@ impl AppService {
             resource_version: status.resource_version,
             recycle_enabled: status.recycle_enabled,
             idle_timeout_seconds: status.idle_timeout_seconds,
+            wake_on_traffic: status.wake_on_traffic,
             created_at: status.created_at,
         }
     }
@@ -123,7 +124,11 @@ impl AppService {
         let mut running = 0u32;
         for s in deploys {
             if s.replicas == 0 {
-                self.activity.mark_stopped(&s.app_id);
+                if s.wake_on_traffic == Some(false) {
+                    self.activity.mark_wake_blocked(&s.app_id);
+                } else {
+                    self.activity.mark_stopped(&s.app_id);
+                }
                 stopped += 1;
             } else {
                 self.activity.seed_accessed(&s.app_id);

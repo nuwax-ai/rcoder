@@ -311,3 +311,31 @@ async fn set_private_permissions(path: &Path) -> Result<()> {
 async fn set_private_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::validate_upstream_destination;
+
+    #[test]
+    fn private_and_loopback_upstreams_are_allowed() {
+        for address in [
+            "10.0.0.8:8080",
+            "192.168.32.229:8080",
+            "172.20.1.8:8080",
+            "127.0.0.1:8080",
+            "service.namespace.svc.cluster.local:8080",
+        ] {
+            assert!(
+                validate_upstream_destination("internal", address).is_ok(),
+                "internal upstream should be allowed: {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_metadata_and_link_local_upstreams_remain_blocked() {
+        for address in ["169.254.169.254:80", "metadata.google.internal:80"] {
+            assert!(validate_upstream_destination("metadata", address).is_err());
+        }
+    }
+}

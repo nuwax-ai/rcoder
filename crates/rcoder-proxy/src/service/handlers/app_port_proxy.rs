@@ -86,7 +86,7 @@ pub async fn handle_app_port_proxy_upstream(
 
     ctx.target_port = Some(target_port);
     metrics.record_request();
-    metrics.record_request_port(target_port).await;
+    metrics.record_request_port(target_port);
     metrics.inc_active();
 
     // 按 (app_id, port) 查 backend；未注册 → 502（无兜底，Fail Fast）

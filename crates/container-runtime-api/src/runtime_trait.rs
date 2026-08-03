@@ -304,6 +304,16 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// 持久化 scale-to-zero 的流量唤醒语义。默认 runtime 没有持久注解能力，允许 no-op。
+    async fn patch_wake_on_traffic(
+        &self,
+        app_id: &str,
+        enabled: bool,
+    ) -> ContainerRuntimeResult<()> {
+        let _ = (app_id, enabled);
+        Ok(())
+    }
+
     /// 删除 Deployment 及其关联资源（Service/HTTPRoute/ConfigMap/Secret 等）
     async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         let _ = app_id;

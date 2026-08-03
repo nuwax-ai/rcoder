@@ -33,13 +33,13 @@ UserApp 全量业务接口已验证通过。长期运行的 UserApp 占用 K8s �
 - `cleanup_task`（[cleaner.rs:206](../../crates/rcoder/src/cleanup_task/cleaner.rs)）**故意跳过 UserApp**——UserApp 不进 `state.projects` 表，扫描器看不到。
 - **无任何 per-app HTTP 访问记录**：pingora 只有 per-port 聚合计数器（[types.rs:45](../../crates/rcoder-proxy/src/service/types.rs)），多 app 共用端口无法归属；`/proxy/stats` 仅端口维度。
 - 现有 `last_activity`（[container_entry.rs:31](../../crates/shared_types/src/container_entry.rs)）只服务 agent-runner。
-- 现有 `stop_app` = `scale_deployment(app_id,0)`（[app_ops.rs:29](../../crates/app_manager/src/app_ops.rs)）——**恰好就是 scale-to-zero 语义**，回收直接复用，PVC 零风险。
+- 停止分成两种业务语义：`recycle_app` 用于空闲回收，允许后续流量唤醒；`stop_app` 用于用户手动停止，必须持续保持停止，不能被访问意外拉起。二者都只 scale-to-zero，不删除 PVC。
 
 ### 1.2 功能需求
 
 - **R1 自动回收**：闲置超过阈值的 Running UserApp → scale replicas 0。仅回收 `managed-by=rcoder-app-manager` 的 Deployment；跳过 `protection_seconds` 内新建的 app。
-- **R2 配置开关**：全局 `enabled`(默认 false，opt-in) + `idle_timeout_seconds`(默认 432000=5天) + `scan_interval_seconds`(默认 3600) + `wake_timeout_seconds`(默认 60) + `protection_seconds`(默认 300)。
-- **R3 流量唤醒**：stopped UserApp 收到 `/proxy/apps/{id}/...` 请求 → 自动 scale 1 → 轮询 Ready（上限 `wake_timeout`）→ Ready 则正常代理；超时返回 503+`Retry-After: 15`，后台继续拉起。
+- **R2 配置开关**：全局 `enabled`(默认 true，可由部署侧关闭) + `idle_timeout_seconds`(默认 432000=5天) + `scan_interval_seconds`(默认 3600) + `wake_timeout_seconds`(默认 60) + `protection_seconds`(默认 300)。
+- **R3 流量唤醒**：仅由空闲回收产生的 stopped UserApp 收到 `/proxy/apps/{id}/...` 请求时，自动 scale 1 → 轮询 Ready（上限 `wake_timeout`）→ Ready 后正常代理；超时返回 503+`Retry-After: 15`。用户手动停止和发布切换期间禁止流量唤醒。
 - **R4 per-app 回收策略（付费/免费分层）**：默认所有 UserApp **可回收**（= 免费用户语义）。允许对**单独 app** 设为不回收——通过 `CreateAppRequest`/`UpdateAppRequest` 的 `recycle_enabled: Option<bool>` 字段（rcoder 持久化为 Deployment 注解 `rcoder.io/recycle-enabled`），`false` = **永不回收**（付费 / 需常驻的 app）。另支持 `idle_timeout_seconds: Option<u64>` 字段（注解 `rcoder.io/idle-timeout-seconds`）覆盖全局阈值。**rcoder 不感知"付费/免费"业务概念**，只看布尔；tier→bool 映射由 Java 调用方决定（付费 → `recycle_enabled=false`）。
 
 ### 1.3 非目标
@@ -57,9 +57,11 @@ UserApp 全量业务接口已验证通过。长期运行的 UserApp 占用 K8s �
 |---|---|---|---|
 | Running + 频繁访问 | 不回收（last_accessed 新） | 不触发 | 正常代理 200 |
 | Running + 闲置 > 阈值 | 回收 → scale0，记 stopped_apps | — | — |
-| Stopped + 来请求 | —（已 stopped） | scale1 → Ready → 代理 | hold-and-wait 后 200（≤60s） |
-| Stopped + 来请求 + 60s 未 Ready | — | 超时 | 503 + Retry-After（后台继续起） |
-| Stopped + 并发多请求 | — | 合流成一次 wake | 共享同一次唤醒结果 |
+| 空闲回收后 + 来请求 | —（已 stopped） | scale1 → Ready → 代理 | hold-and-wait 后 200（≤60s） |
+| 空闲回收后 + 60s 未 Ready | — | 超时 | 503 + Retry-After（后台继续起） |
+| 空闲回收后 + 并发多请求 | — | 合流成一次 wake | 共享同一次唤醒结果 |
+| 用户手动停止 + 来请求 | — | 禁止唤醒 | 503，保持 replicas=0 |
+| 发布切换期间 + 来请求 | — | 禁止唤醒 | 503，避免旧/新版本并发启动 |
 | 默认（无注解 = 免费用户） | 按阈值回收 | 唤醒 | 正常 |
 | 注解 recycle-enabled=false（付费） | 跳过，永不回收 | — | 常驻 Running |
 | Gateway 模式 | 不适用（无访问信号） | 不适用 | 已知限制 |
@@ -82,11 +84,11 @@ UserApp 全量业务接口已验证通过。长期运行的 UserApp 占用 K8s �
                   │   upstream_peer ──► app_backends[(app_id,port)] → Service FQDN → Pod      │
                   │                                                                       │
                   │  ② UserAppRecycleScanner (interval 3600s)                               │
-                  │     list_deployments → 比 last_accessed > 阈值 → stop_app(scale0)        │
-                  │     → 记 stopped_apps                                                  │
+                  │     list_deployments → 比 last_accessed > 阈值 → recycle_app(scale0)     │
+                  │     → 标记为可流量唤醒                                                  │
                   │                                                                       │
                   │  AppActivityRegistry (in-memory DashMap):                               │
-                  │     last_accessed[app_id] / stopped_apps[app_id] / waking[app_id]        │
+                  │     last_accessed / stopped / wake_blocked / waking                      │
                   └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -101,8 +103,10 @@ UserApp 全量业务接口已验证通过。长期运行的 UserApp 占用 K8s �
 pub struct AppActivityRegistry {
     /// app_id → 最近一次真实 HTTP 访问时间（节流更新，5s 粒度）
     last_accessed: DashMap<String, Instant>,
-    /// app_id → 已停止（scale0）记录 { stopped_at }；stop/start/wake/重启重建 共同维护
-    stopped: DashMap<String, StoppedEntry>,
+    /// app_id → 已停止（scale0）记录；空闲回收和手动停止都维护
+    stopped: DashSet<String>,
+    /// app_id → 禁止由流量唤醒；手动停止和发布切换时设置
+    wake_blocked: DashSet<String>,
     /// app_id → 进行中的唤醒句柄（并发合流用）；leader 负责 scale+wait，follower join
     waking: DashMap<String, Arc<WakeHandle>>,
 }
@@ -128,7 +132,7 @@ pub struct AppActivityRegistry {
    - 读注解 `rcoder.io/recycle-enabled`：**absent 或 `"true"` → 可回收（免费用户默认）**；`"false"` → 跳过（付费 / 常驻 app，永不回收）；
    - 阈值 = 注解 `rcoder.io/idle-timeout-seconds` ?? 全局 `idle_timeout_seconds`；
    - `now - last_accessed[app_id] > 阈值` 且 龄期 > `protection_seconds` → 回收。
-4. 回收动作 = 调 `AppService::stop_app(app_id)`（scale0）→ `registry.mark_stopped(app_id)`。
+4. 回收动作 = 调 `AppService::recycle_app(app_id)`（scale0）→ `registry.mark_recycled(app_id)`；该状态明确允许流量唤醒。
 5. 每 tick 错误隔离（单个 app 失败不影响其他），warn 记录。
 
 **关键**：扫描器只回收 Running 闲置 app；已 stopped 的不再处理。`last_accessed` 在 wake 时已 touch，避免"唤醒中被误回收"竞态。
@@ -144,7 +148,7 @@ request_filter(session):
     access_tracker.touch(app_id)                     // ①
     if !wake_control.is_stopped(app_id):
         return Ok(false)                             // 正在运行，正常代理
-    // ② stopped → 唤醒（hold-and-wait）
+    // ② stopped 且允许 wake → 唤醒（hold-and-wait）
     match wake_control.ensure_running(app_id).await {
         Ready | AlreadyRunning => { registry.mark_running(app_id); return Ok(false) }
         Timeout => { respond_503(Retry-After: 15); return Ok(true) }   // 已直接响应
@@ -222,11 +226,12 @@ pub struct UserAppRecycleConfig {
 
 ### 2.8 状态一致性与重启重建
 
-`stopped_apps` 的维护点（四处）：
-- `stop_app`（API/扫描器）→ `mark_stopped`
+停止状态的维护点：
+- `recycle_app`（扫描器）→ `mark_recycled`，允许 wake-on-traffic
+- `stop_app`（手动 API、发布切换）→ `mark_wake_blocked`，禁止 wake-on-traffic
 - `start_app`（API）→ `mark_running`
 - wake 成功 → `mark_running`
-- **rcoder 重启**：`AppService::new`（[service.rs:103](../../crates/app_manager/src/service.rs)，与 `rebuild_pingora_backends` 并列）调 `rebuild_stopped_apps()`：`list_deployments` 中 `spec.replicas==0` 的 → 填入 stopped_apps。
+- **rcoder 重启**：`AppService::new` 调 `rebuild_stopped_apps()`；`spec.replicas==0` 且注解 `rcoder.io/wake-on-traffic=false` 的恢复为 wake-blocked，其余 scale0 应用恢复为可唤醒。注解缺失按可唤醒处理，兼容已部署的旧资源。
 
 `last_accessed` 重启策略（v1）：Running app 的 `last_accessed` 初始化为 `now`（重启给一个完整 grace 周期，最坏多宽限一个阈值，可接受）；Stopped app 无需 last_accessed。
 
@@ -236,7 +241,8 @@ pub struct UserAppRecycleConfig {
 |---|---|
 | 扫描器回收 vs wake 同时发生 | wake 已先 `touch`（更新 last_accessed），扫描器读到新时间 → 不回收。额外：扫描器跳过 `waking` 中的 app |
 | 并发请求触发多次 scale-up | `waking` 句柄合流，仅 leader 执行 scale，follower join |
-| stop 与 start API 并发 | 现有 `scale_deployment` 是 merge patch，幂等；registry 用 entry API 更新 stopped 状态 |
+| stop 与 start API 并发 | 先持久化 `rcoder.io/wake-on-traffic` 再 scale；registry 使用 entry API 更新，失败时恢复原状态 |
+| 发布切换 vs 外部流量 | 停止旧 workspace 前写入 wake-blocked，阻止代理流量在切换窗口重新拉起 |
 | rcoder 重启丢失 waking 态 | 重启后 stopped_apps 重建自 K8s，waking 清空；下次请求重新发起 wake（幂等） |
 
 ### 2.10 错误处理（Fail Fast）
@@ -253,7 +259,7 @@ pub struct UserAppRecycleConfig {
 | 1 | `shared_types/src/lib.rs`（新 trait 文件） | 加 `AppAccessTracker` / `AppWakeControl` / `WakeOutcome` |
 | 2 | `app_manager/src/activity_registry.rs`（新） | `AppActivityRegistry`（last_accessed/stopped/waking + mark/touch/ensure_running） |
 | 3 | `app_manager/src/service.rs:30` | `AppService` 加 `activity: AppActivityRegistry`；`new()`(:48) 加 `rebuild_stopped_apps()` |
-| 4 | `app_manager/src/app_ops.rs:14,29` | `start_app`/`stop_app` 调 `activity.mark_running`/`mark_stopped` |
+| 4 | `app_manager/src/app_ops.rs` | `start_app`/`stop_app`/`recycle_app` 分别维护 running、wake-blocked、wakeable 状态 |
 | 4a | `app_manager/src/models.rs` + `k8s_app_create.rs` | `CreateAppRequest`/`UpdateAppRequest` 加 `recycle_enabled`/`idle_timeout_seconds` 字段；create/update stamp 为 `rcoder.io/*` 注解（absent = 可回收） |
 | 5 | `app_manager/src/service.rs` | impl `AppAccessTracker` + `AppWakeControl`（透传 activity） |
 | 6 | `rcoder-proxy/src/service/mod.rs:60,79` | `PingoraProxyService` + `PortProxy` 加 `access_tracker`/`wake_control` 字段；`PingoraProxyService::new` 注入 |
@@ -272,7 +278,7 @@ pub struct UserAppRecycleConfig {
 
 - **T1**：`shared_types` 加三个 trait/enum（AppAccessTracker / AppWakeControl / WakeOutcome）。完成标准：编译过，clippy 零 warning。
 - **T2**：`app_manager` 新建 `activity_registry.rs`（DashMap 三表 + touch 节流 + mark_stopped/running + ensure_running 状态机 + rebuild_stopped_apps）。完成标准：单元测试覆盖 touch 节流、wake 合流、超时。
-- **T3**：`AppService` 持有 activity + impl 两 trait + `start_app`/`stop_app` 接 mark_* + `new()` 重建 stopped_apps + `CreateAppRequest`/`UpdateAppRequest` 加 `recycle_enabled`/`idle_timeout_seconds` 字段并 stamp `rcoder.io/*` 注解。完成标准：编译，现有 app_manager 测试不退化。
+- **T3**：`AppService` 持有 activity + impl 两 trait + `start_app`/`stop_app`/`recycle_app` 维护不同停止语义 + `new()` 从副本数和注解重建状态 + `CreateAppRequest`/`UpdateAppRequest` 加 `recycle_enabled`/`idle_timeout_seconds` 字段并 stamp `rcoder.io/*` 注解。完成标准：编译，现有 app_manager 测试不退化。
 - **T4**：`UserAppRecycleConfig` + env override + 挂 AppConfig + 启动装配（pingora 注入 tracker/wake_control，None 时短路）。
 - **T5**：pingora `request_filter` 注入字段 + 唤醒逻辑（路径解析/touch/stopped 检查/wake hold-and-wait/503）。完成标准：stopped app 来请求能唤醒并代理。
 - **T6**：`cleanup_task/userapp/scanner.rs` + `background_tasks` 注册。完成标准：闲置 app 被 scale0 且记 stopped_apps。
@@ -289,11 +295,12 @@ pub struct UserAppRecycleConfig {
 1. **静态**：`cargo fmt --check` + `cargo clippy --default-features --features kubernetes`（零 warning）+ `cargo test`（全绿，含新增 activity_registry 单测）。
 2. **229 E2E**（Pingora 模式，NodePort 30435）：
    - **回收**：`enabled=true`，`idle_timeout_seconds=120`（测试用短阈值），发布一个 app → 停止访问 > 2min → 扫描器 scale0 → `kubectl get deploy` replicas=0，PVC/Service 仍在 → `stopped_apps` 含该 id。
-   - **唤醒**：scale0 后 `curl http://192.168.32.229:30435/proxy/apps/{id}/9080/...` → hold-and-wait ≤60s → 200，Deployment replicas 回 1。
+   - **唤醒**：空闲回收 scale0 后 `curl http://192.168.32.229:30435/proxy/apps/{id}/9080/...` → hold-and-wait ≤60s → 200，Deployment replicas 回 1。
+   - **手动停止隔离**：调用 stop API 后访问代理路径 → 返回 503，Deployment 持续 replicas=0；显式 start 后恢复。
    - **超时**：人为让 app 启动失败（坏 command）→ wake 60s 超时 → 客户端收 503+Retry-After。
    - **并发合流**：stopped app 并发 5 请求 → 仅 1 次 scale-up（日志/事件验证）。
    - **注解覆盖**：app 注解 `recoder.io/recycle-enabled=false` → 闲置不被回收。
-   - **重启重建**：scale0 一个 app → 重启 rcoder → `stopped_apps` 从 K8s 重建 → 该 app 来请求仍能唤醒。
+   - **重启重建**：分别准备空闲回收和手动停止的 scale0 app → 重启 rcoder → 前者仍能被访问唤醒，后者仍保持停止。
    - **Gateway 模式**（如可选）：确认已知限制（不回收、不唤醒），不 crash。
 
 ---
@@ -303,5 +310,5 @@ pub struct UserAppRecycleConfig {
 - **Gateway 模式不支持**（HTTPRoute 绕过 rcoder）。当前 229 部署为 Pingora 模式，不受影响；切 Gateway 需 v2 加 Envoy 钩子。
 - **冷启延迟感知**：hold-and-wait 期间客户端像"卡住"。缓解：60s 上限 + 超时 503+Retry-After；前端可加 loading 态。web 应用首屏冷启 10–40s 可接受。
 - **重启 grace 膨胀**：v1 重启给 Running app 重置闲置时钟，最坏多宽限一个阈值。注解持久化（v2）可消除。
-- **out-of-band scale**：用户手动 `kubectl scale 0` 不在 stopped_apps → pingora 直连死 backend → 502。缓解（可选 v1.1）：upstream 连接失败且未在 stopped_apps 时 fallback 触发 wake。
+- **out-of-band scale**：用户手动 `kubectl scale 0` 没有同步业务意图；rcoder 重启前可能仍直连失效 backend，重启后会按注解重建。运维应使用 stop/recycle API，避免绕过状态机。
 - **rcoder 单实例假设**：in-memory registry 不支持多副本；当前 `replicaCount:1`，满足。多副本需上 DB/注解（v2）。

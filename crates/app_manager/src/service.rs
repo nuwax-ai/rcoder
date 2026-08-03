@@ -45,6 +45,9 @@ pub struct AppService {
     /// 这是**操作副作用的临时缓存**（非业务元数据）：delete 时需要知道曾注册过哪些端口
     /// 才能清理 Pingora backend。rcoder 重启后丢失可接受（Docker 模式定位为开发环境）。
     pub(crate) pingora_ports: DashMap<String, Vec<u16>>,
+    /// 同一 rcoder 进程内按 app 串行化 release 操作。PVC 文件锁继续负责跨进程互斥；
+    /// 先等异步锁可避免同 app 的并发请求长期占用 Tokio blocking 线程等待 flock。
+    pub(crate) release_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl AppService {
@@ -99,6 +102,7 @@ impl AppService {
             pingora,
             path_resolver,
             pingora_ports: DashMap::new(),
+            release_locks: DashMap::new(),
         };
         // K8s Pingora 模式：启动时从集群重建 Pingora backends——修复 pingora_ports 内存态
         // 丢失导致的重启 silent 404（list_deployments 的 expose_type 已由 Deployment annotation
@@ -126,6 +130,8 @@ impl AppService {
         );
         self.provision_app_workspace(&app_id, &request).await?;
         self.create_app_runtime(&app_id, &request).await?;
+        // 同 ID 删除后重建时，必须清除旧的 stopped/wake-blocked 内存态。
+        self.activity.mark_running(&app_id);
         Ok(self.assemble_app_info(app_id, request).await)
     }
 
@@ -459,17 +465,22 @@ impl AppService {
         expected_resource_version: Option<&str>,
     ) -> AppResult<()> {
         validate_app_id(app_id)?;
+        let previous = self.fetch_runtime_status_or_err(app_id).await?;
+        let previous_wake_on_traffic = previous
+            .wake_on_traffic
+            .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
         // 乐观锁（同 update_app）：expected 不匹配 → 409 Conflict
-        if let Some(expected) = expected_resource_version {
-            let current = self.fetch_runtime_status_or_err(app_id).await?;
-            if let Some(actual) = &current.resource_version
-                && expected != actual
-            {
-                return Err(AppOperationError::Conflict(format!(
-                    "resource version mismatch: expected={expected}, actual={actual}"
-                )));
-            }
+        if let Some(expected) = expected_resource_version
+            && let Some(actual) = &previous.resource_version
+            && expected != actual
+        {
+            return Err(AppOperationError::Conflict(format!(
+                "resource version mismatch: expected={expected}, actual={actual}"
+            )));
         }
+        // delete/purge 必须与 prepare/activate/confirm/delete-release 串行，避免删除 PVC
+        // 时另一个任务仍在写版本包或切换 code。
+        let release_lock = self.acquire_process_release_lock(app_id).await;
         info!("[APP] deleting app: {} (purge={})", app_id, purge);
 
         // 1. Docker 模式：清理 Pingora backend
@@ -477,12 +488,28 @@ impl AppService {
 
         // 2. 删除计算资源（K8s: Deployment/Service/HTTPRoute/NodePort/ConfigMap/Secret
         //    + label orphan 扫描兜底；Docker: 容器）。持久存储默认保留。
-        self.runtime.delete_deployment(app_id).await.map_err(|e| {
-            map_runtime_error(
-                &format!("[APP] delete_deployment failed app_id={app_id}"),
-                e,
+        // 先阻止并发流量唤醒；删除失败时恢复原活动状态。
+        self.activity.mark_wake_blocked(app_id);
+        if let Err(error) = self.runtime.delete_deployment(app_id).await {
+            self.restore_activity_state(app_id, &previous, previous_wake_on_traffic);
+            let http_ports = previous
+                .ports
+                .iter()
+                .filter(|port| port.expose_type == RtExposeType::Http)
+                .map(|port| port.port)
+                .collect::<Vec<_>>();
+            self.register_pingora_backends(
+                app_id,
+                &http_ports,
+                previous.pod_ip.as_deref().unwrap_or_default(),
             )
-        })?;
+            .await;
+            return Err(map_runtime_error(
+                &format!("[APP] delete_deployment failed app_id={app_id}"),
+                error,
+            ));
+        }
+        self.activity.forget_app(app_id);
 
         // 3. purge=true 必须销毁持久存储（K8s: PVC + Ceph subvolume；Docker:
         //    workspace 目录），与 API 的“全部删除”语义一致。仅清空目录却保留 PVC
@@ -497,6 +524,8 @@ impl AppService {
             );
         }
 
+        drop(release_lock);
+        self.remove_unused_process_release_lock(app_id);
         Ok(())
     }
 }
@@ -579,6 +608,10 @@ impl super::AppServiceTrait for AppService {
         self.stop_app(app_id).await
     }
 
+    async fn recycle_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        self.recycle_app(app_id).await
+    }
+
     async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         self.restart_app(app_id).await
     }
@@ -622,19 +655,6 @@ impl super::AppServiceTrait for AppService {
         self.delete_release(app_id, release_id).await
     }
 
-    async fn get_app_logs(&self, app_id: &str, params: LogParams) -> AppResult<Vec<LogEntry>> {
-        self.get_app_logs(app_id, params).await
-    }
-
-    async fn stream_app_logs(
-        &self,
-        app_id: &str,
-        tail: u32,
-    ) -> AppResult<container_runtime_api::mpsc::Receiver<container_runtime_api::ContainerLogEntry>>
-    {
-        self.stream_app_logs(app_id, tail).await
-    }
-
     async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats> {
         self.get_app_stats(app_id).await
     }
@@ -644,15 +664,6 @@ impl super::AppServiceTrait for AppService {
         app_id: &str,
     ) -> AppResult<Vec<container_runtime_api::AppEventInfo>> {
         self.get_app_events(app_id).await
-    }
-
-    async fn get_app_file_logs(
-        &self,
-        app_id: &str,
-        file_path: &str,
-        tail: u32,
-    ) -> AppResult<Vec<LogEntry>> {
-        self.get_app_file_logs(app_id, file_path, tail).await
     }
 
     async fn upload_file(

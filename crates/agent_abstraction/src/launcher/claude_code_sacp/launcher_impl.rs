@@ -785,8 +785,8 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // stderr 任务已在子进程启动后立即创建（stderr_task_handle），无需重复创建
 
         // 创建生命周期守卫（带异常退出标志 + 诊断监听器）
-        let lifecycle_guard =
-            AgentLifecycleGuard::new_claude_full(crate::launcher::lifecycle::ClaudeProcessParams {
+        let lifecycle_guard = AgentLifecycleGuard::new_claude_full(
+            crate::launcher::lifecycle::ClaudeProcessParams {
                 project_id: project_id.clone(),
                 session_id: session_id.clone(),
                 child_process: child,
@@ -801,7 +801,8 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 process_command: command_path,
                 process_args: command_args,
                 working_dir: project_path,
-            });
+            },
+        )?;
 
         Ok(SacpLauncherConnectionInfo {
             session_id,

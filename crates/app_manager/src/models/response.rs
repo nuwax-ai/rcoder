@@ -109,6 +109,9 @@ pub struct AppRuntimeInfo {
     /// 闲置回收阈值秒数（per-app 覆盖；None=用全局配置）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_timeout_seconds: Option<u64>,
+    /// scale0 时是否允许流量自动唤醒。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_on_traffic: Option<bool>,
     /// Deployment 创建时间（RFC3339）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
@@ -160,17 +163,6 @@ pub struct ProbeStatus {
     pub status: String,
     /// 最近检查时间（RFC3339）
     pub last_checked: Option<String>,
-}
-
-/// 日志条目
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct LogEntry {
-    /// 时间戳（RFC3339；文件日志无时间戳则为空）
-    pub timestamp: String,
-    /// 日志流：stdout / stderr / file
-    pub stream: String,
-    /// 日志内容
-    pub message: String,
 }
 
 /// 资源使用

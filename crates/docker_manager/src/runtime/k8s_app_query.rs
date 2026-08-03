@@ -14,7 +14,8 @@ use k8s_openapi::api::apps::v1::Deployment;
 use kube::api::ListParams;
 
 use super::k8s_app_helpers::{
-    IDLE_TIMEOUT_ANNOTATION, PORT_EXPOSE_ANNOTATION, RECYCLE_ENABLED_ANNOTATION, parse_port_expose,
+    IDLE_TIMEOUT_ANNOTATION, PORT_EXPOSE_ANNOTATION, RECYCLE_ENABLED_ANNOTATION,
+    WAKE_ON_TRAFFIC_ANNOTATION, parse_port_expose,
 };
 use super::k8s_deployment::{
     APP_CONTAINER_NAME, APP_LABEL_PREFIX, APP_MANAGED_BY, RCODER_LABEL_PREFIX,
@@ -148,6 +149,9 @@ impl KubernetesRuntime {
         let idle_timeout_seconds = ann
             .and_then(|a| a.get(IDLE_TIMEOUT_ANNOTATION))
             .and_then(|s| s.parse::<u64>().ok());
+        let wake_on_traffic = ann
+            .and_then(|a| a.get(WAKE_ON_TRAFFIC_ANNOTATION))
+            .and_then(|value| value.parse::<bool>().ok());
         let created_at = deploy
             .metadata
             .creation_timestamp
@@ -172,6 +176,7 @@ impl KubernetesRuntime {
             resource_version: deploy.metadata.resource_version.clone(),
             recycle_enabled,
             idle_timeout_seconds,
+            wake_on_traffic,
             created_at,
         }
     }

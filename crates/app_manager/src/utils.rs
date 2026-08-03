@@ -61,7 +61,7 @@ pub(super) fn map_archive_error(e: ArchiveError) -> AppOperationError {
 
 /// canonicalize `target` 并校验仍在 `canonical_app_dir` 内（path traversal 防护）。
 ///
-/// 4 处文件操作（upload/extract/list/delete）+ service.rs `get_app_file_logs` 共用。
+/// 文件操作（upload/extract/list/delete）共用。
 /// 调用前需保证 `target` 已存在（否则 canonicalize 抛 OS 错误 → Backend）；
 /// 需要 NotFound 语义的调用方（如日志文件读取）应先 `target.exists()` 守卫。
 /// `canonical_app_dir` 应由调用方预先 canonicalize（通常在创建目录后立即取）。

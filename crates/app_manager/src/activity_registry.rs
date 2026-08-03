@@ -10,7 +10,7 @@
 //! runtime 构建后(RuntimeManager::get)经 [`AppActivityRegistry::set_runtime`] 注入(OnceLock 延迟)。
 //! wake 只在 `is_stopped` 真时触发,而 `stopped` 表要到 `AppService::new` 才填充——此时 OnceLock 早已 set。
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
@@ -43,8 +43,8 @@ struct WakeGuard {
     map: Arc<DashMap<String, Arc<WakeHandle>>>,
     key: String,
     handle: Arc<WakeHandle>,
-    /// leader 完成后写入 outcome;panic 时仍为 None → drop 发 `Failed`。
-    result: Arc<Mutex<Option<WakeOutcome>>>,
+    /// leader 完成后写入 outcome；panic 时仍为 None → drop 发 `Failed`。
+    outcome: Option<WakeOutcome>,
 }
 
 /// 闲置回收过渡守卫。守卫存活期内，新流量会等待 scale-to-zero 完成后再唤醒，
@@ -68,15 +68,16 @@ impl Drop for RecycleTransition {
 
 impl Drop for WakeGuard {
     fn drop(&mut self) {
-        // unwrap_or_else(into_inner):即使 result 锁被毒化(leader 持锁时 panic,极罕见)也能取值,不二次 panic
         let outcome = self
-            .result
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .outcome
             .take()
             .unwrap_or_else(|| WakeOutcome::Failed(WAKE_LEADER_ABORTED.into()));
         let _ = self.handle.tx.send(Some(outcome));
-        self.map.remove(&self.key);
+        if let dashmap::mapref::entry::Entry::Occupied(entry) = self.map.entry(self.key.clone())
+            && Arc::ptr_eq(entry.get(), &self.handle)
+        {
+            entry.remove();
+        }
     }
 }
 
@@ -86,6 +87,8 @@ pub struct AppActivityRegistry {
     last_accessed: DashMap<String, Instant>,
     /// app_id → 已 stopped(scale0)标记;stop/start/wake/重启重建 共同维护
     stopped: DashSet<String>,
+    /// app_id → 用户主动停止或发布切换中的应用；流量不得自动唤醒。
+    wake_blocked: DashSet<String>,
     /// app_id → 进行中的唤醒句目(并发合流)
     waking: Arc<DashMap<String, Arc<WakeHandle>>>,
     /// app_id → 正在执行的闲置回收过渡。
@@ -109,6 +112,7 @@ impl AppActivityRegistry {
         Self {
             last_accessed: DashMap::new(),
             stopped: DashSet::new(),
+            wake_blocked: DashSet::new(),
             waking: Arc::new(DashMap::new()),
             recycling: Arc::new(DashMap::new()),
             runtime: OnceLock::new(),
@@ -126,12 +130,50 @@ impl AppActivityRegistry {
 
     /// 标记 app 为 stopped(scale0)。AppService::stop_app / 回收扫描器调用。
     pub fn mark_stopped(&self, app_id: &str) {
+        self.wake_blocked.remove(app_id);
+        self.stopped.insert(app_id.to_string());
+    }
+
+    /// 主动停止/发布切换：记录 scale0，但禁止流量自动拉起。
+    pub fn mark_wake_blocked(&self, app_id: &str) {
+        self.stopped.remove(app_id);
+        self.wake_blocked.insert(app_id.to_string());
+    }
+
+    /// 闲置回收完成后把停止状态转换为可由流量唤醒。
+    pub fn mark_recycled(&self, app_id: &str) {
+        self.wake_blocked.remove(app_id);
         self.stopped.insert(app_id.to_string());
     }
 
     /// 是否有进行中的唤醒(回收扫描器据此跳过,避免与 in-flight wake 竞态)
     pub fn is_waking(&self, app_id: &str) -> bool {
         self.waking.contains_key(app_id)
+    }
+
+    pub fn is_wake_blocked(&self, app_id: &str) -> bool {
+        self.wake_blocked.contains(app_id)
+    }
+
+    /// 应用删除后清理所有内存态。正在等待的唤醒/回收请求会立即收到终止信号；
+    /// RAII 守卫使用指针比对移除条目，不会误删同 ID 重建后的新状态。
+    pub fn forget_app(&self, app_id: &str) {
+        self.last_accessed.remove(app_id);
+        self.stopped.remove(app_id);
+        self.wake_blocked.remove(app_id);
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            self.waking.entry(app_id.to_string())
+        {
+            let handle = entry.remove();
+            let _ = handle
+                .tx
+                .send(Some(WakeOutcome::Failed("app was deleted".into())));
+        }
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            self.recycling.entry(app_id.to_string())
+        {
+            entry.remove().notify_waiters();
+        }
     }
 
     /// 仅当最近访问时间仍等于扫描器观测值时，原子登记回收过渡。
@@ -166,6 +208,10 @@ impl AppActivityRegistry {
             let signal = signal_ref.value().clone();
             drop(signal_ref);
             let notified = signal.notified();
+            tokio::pin!(notified);
+            // 先把 waiter 注册进 Notify，再复查 map。否则 transition 恰好在
+            // `still_current` 与 `.await` 之间 drop 时，notify_waiters 可能丢失。
+            notified.as_mut().enable();
             let still_current = self
                 .recycling
                 .get(app_id)
@@ -174,7 +220,7 @@ impl AppActivityRegistry {
             if !still_current {
                 continue;
             }
-            notified.await;
+            notified.as_mut().await;
         }
     }
 
@@ -192,13 +238,39 @@ impl AppActivityRegistry {
     /// 标记 app 为 Running(唤醒成功 / start_app / 外部 start 后调用,清 stopped 态 + 刷新访问时间)。
     pub fn mark_running(&self, app_id: &str) {
         self.stopped.remove(app_id);
+        self.wake_blocked.remove(app_id);
         self.last_accessed
             .insert(app_id.to_string(), Instant::now());
+    }
+
+    /// 仅供流量唤醒成功路径使用。唤醒不能清除并发到达的手动停止标记，
+    /// 否则在途的 scale1 可能覆盖 stop_app 的 scale0。
+    fn try_mark_woken(&self, app_id: &str) -> bool {
+        if self.wake_blocked.contains(app_id) {
+            return false;
+        }
+        self.stopped.remove(app_id);
+        self.last_accessed
+            .insert(app_id.to_string(), Instant::now());
+        !self.wake_blocked.contains(app_id)
+    }
+
+    async fn keep_intentionally_stopped(
+        runtime: &Arc<dyn UserAppRuntime>,
+        app_id: &str,
+    ) -> WakeOutcome {
+        if let Err(error) = runtime.scale_deployment(app_id, 0).await {
+            warn!(app_id, %error, "failed to restore scale0 after wake raced with stop");
+        }
+        WakeOutcome::Failed("app is intentionally stopped".into())
     }
 
     /// leader 实际执行唤醒:scale→1 + 轮询直到 Running/Error/超时
     async fn wake_leader(&self, app_id: &str) -> WakeOutcome {
         // double-check:进入 leader 前可能已被别处拉起
+        if self.wake_blocked.contains(app_id) {
+            return WakeOutcome::Failed("app is intentionally stopped".into());
+        }
         if !self.stopped.contains(app_id) {
             return WakeOutcome::AlreadyRunning;
         }
@@ -212,13 +284,21 @@ impl AppActivityRegistry {
         if let Err(e) = rt.scale_deployment(app_id, 1).await {
             return WakeOutcome::Failed(format!("scale_deployment: {e}"));
         }
+        if self.wake_blocked.contains(app_id) {
+            return Self::keep_intentionally_stopped(&rt, app_id).await;
+        }
         // 轮询 get_deployment_status 直到 Running / Error / 超时
         let deadline = Instant::now() + self.wake_timeout;
         loop {
+            if self.wake_blocked.contains(app_id) {
+                return Self::keep_intentionally_stopped(&rt, app_id).await;
+            }
             match rt.get_deployment_status(app_id).await {
                 Ok(Some(s)) if s.phase == "Running" => {
-                    // 唤醒成功:清 stopped + 种 last_accessed(避免扫描器立刻又回收)
-                    self.mark_running(app_id);
+                    // 唤醒成功不能覆盖并发手动 stop；若竞争失败，补偿 scale0。
+                    if !self.try_mark_woken(app_id) {
+                        return Self::keep_intentionally_stopped(&rt, app_id).await;
+                    }
                     debug!("[ACTIVITY] app {} woken (Ready)", app_id);
                     return WakeOutcome::Ready;
                 }
@@ -241,16 +321,15 @@ impl AppActivityRegistry {
 
     /// Leader 路径:result cell + WakeGuard 保证退出时(含 panic)必广播 outcome 并移除 waking 条目。
     async fn become_leader(&self, app_id: &str, handle: Arc<WakeHandle>) -> WakeOutcome {
-        let result = Arc::new(Mutex::new(None::<WakeOutcome>));
-        let _guard = WakeGuard {
+        let mut guard = WakeGuard {
             map: self.waking.clone(),
             key: app_id.to_string(),
             handle: handle.clone(),
-            result: result.clone(),
+            outcome: None,
         };
         let r = self.wake_leader(app_id).await;
-        // 写入 result;_guard 在函数返回/panic unwind 时 drop → 广播给 follower + 移除 waking 条目
-        *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.clone());
+        // 写入 outcome；guard 在函数返回/panic unwind 时 drop → 广播给 follower + 移除 waking 条目。
+        guard.outcome = Some(r.clone());
         r
     }
 
@@ -293,37 +372,47 @@ impl AppAccessTracker for AppActivityRegistry {
 #[async_trait::async_trait]
 impl AppWakeControl for AppActivityRegistry {
     fn is_stopped(&self, app_id: &str) -> bool {
-        self.stopped.contains(app_id) || self.recycling.contains_key(app_id)
+        self.stopped.contains(app_id)
+            || self.wake_blocked.contains(app_id)
+            || self.recycling.contains_key(app_id)
     }
 
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
         // 回收过渡期的请求必须等 scale0 完成，再由唤醒 single-flight scale1。
         self.wait_for_recycle_transition(app_id).await;
+        if self.wake_blocked.contains(app_id) {
+            return WakeOutcome::Failed("app is intentionally stopped".into());
+        }
         if !self.stopped.contains(app_id) {
             return WakeOutcome::AlreadyRunning;
         }
-        // Single-flight:DashMap::entry 原子 insert-or-join 选主
-        match self.waking.entry(app_id.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(e) => {
-                // FOLLOWER:克隆句柄 → delegate
-                self.join_as_follower(e.get().clone()).await
-            }
+        // 只在同步作用域内持有 DashMap entry guard，禁止 shard 锁跨越 await。
+        let role = match self.waking.entry(app_id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(e) => WakeRole::Follower(e.get().clone()),
             dashmap::mapref::entry::Entry::Vacant(e) => {
-                // LEADER:建 channel、插入句柄(释放 shard lock)→ delegate
                 let (tx, _rx) = watch::channel(None::<WakeOutcome>);
                 let handle = Arc::new(WakeHandle { tx });
                 e.insert(handle.clone());
-                self.become_leader(app_id, handle).await
+                WakeRole::Leader(handle)
             }
+        };
+        match role {
+            WakeRole::Follower(handle) => self.join_as_follower(handle).await,
+            WakeRole::Leader(handle) => self.become_leader(app_id, handle).await,
         }
     }
+}
+
+enum WakeRole {
+    Leader(Arc<WakeHandle>),
+    Follower(Arc<WakeHandle>),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use Arc;
-    use Mutex as StdMutex;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use container_runtime_api::{
@@ -464,6 +553,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn intentional_stop_is_not_woken_by_traffic() {
+        let reg =
+            AppActivityRegistry::new_with(Duration::from_millis(50), Duration::from_millis(1));
+        let runtime = Arc::new(MockRuntime::new(true));
+        let scale_calls = runtime.scale_calls.clone();
+        reg.set_runtime(runtime);
+        reg.mark_wake_blocked("app-manual");
+
+        let outcome = reg.ensure_running("app-manual").await;
+
+        assert!(matches!(outcome, WakeOutcome::Failed(_)));
+        assert_eq!(scale_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn recycle_transition_waits_for_stop_then_wakes_once() {
         let runtime = Arc::new(MockRuntime::new(true));
         let registry = Arc::new(AppActivityRegistry::new_with(
@@ -560,13 +664,12 @@ mod tests {
         );
 
         // leader 中途 panic:result 仍为 None,guard drop
-        let result: Arc<Mutex<Option<WakeOutcome>>> = Arc::new(Mutex::new(None));
         {
             let _guard = WakeGuard {
                 map: map.clone(),
                 key: "app-g".to_string(),
                 handle: handle.clone(),
-                result,
+                outcome: None,
             };
             // _guard 在此 drop(模拟 leader task 终止):result=None → 广播 Failed + 移除条目
         }
@@ -584,5 +687,29 @@ mod tests {
             !map.contains_key("app-g"),
             "entry must be removed on guard drop"
         );
+    }
+
+    #[test]
+    fn wake_completion_cannot_clear_concurrent_manual_stop() {
+        let registry = AppActivityRegistry::new(Duration::from_secs(2));
+        registry.mark_stopped("app-stop-race");
+        registry.mark_wake_blocked("app-stop-race");
+
+        assert!(!registry.try_mark_woken("app-stop-race"));
+        assert!(registry.is_wake_blocked("app-stop-race"));
+        assert!(registry.is_stopped("app-stop-race"));
+    }
+
+    #[test]
+    fn forget_app_clears_deleted_app_state() {
+        let registry = AppActivityRegistry::new(Duration::from_secs(2));
+        registry.seed_accessed("app-deleted");
+        registry.mark_wake_blocked("app-deleted");
+
+        registry.forget_app("app-deleted");
+
+        assert!(!registry.is_stopped("app-deleted"));
+        assert!(!registry.is_wake_blocked("app-deleted"));
+        assert_eq!(registry.last_accessed_at("app-deleted"), None);
     }
 }

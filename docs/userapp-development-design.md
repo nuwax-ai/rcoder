@@ -32,7 +32,7 @@ flowchart LR
 - file-server：严格解析 Manifest v1，构建服务产物，生成 `release.lock.toml` 和版本包。
 - app_manager：下载、校验、保存、激活、确认、回滚和清理版本。
 - app-cli：只读 release lock，启动服务、编译 Pingap、读取应用文件日志并提供内部 API。
-- Pingap：唯一公网应用入口 `0.0.0.0:9080`；workspace TOML 是唯一配置权威。
+- Pingap：统一应用入口 `0.0.0.0:9080`，允许公网或内网访问，不强制 HTTPS/公网域名；workspace TOML 是唯一配置权威。
 
 ## 当前发布语义
 

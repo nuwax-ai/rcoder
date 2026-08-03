@@ -82,7 +82,7 @@ flowchart LR
 - **file-server**：解析 Manifest v1、执行构建、生成 release lock 和完整版本包。
 - **app_manager**：管理计算资源、应用 PVC、版本包、激活、确认、回滚和清理。
 - **app-cli**：只读取 release lock，编排当前 release 的服务、健康检查、Pingap 和日志。
-- **Pingap**：UserApp 容器唯一公网应用入口，固定监听 `0.0.0.0:9080`。
+- **Pingap**：UserApp 容器统一应用入口，固定监听 `0.0.0.0:9080`，同时支持公网和内网访问。
 - **PostgreSQL/pgweb**：由 app-runtime 提供；数据库数据位于应用持久卷。
 
 Java 仍是业务 desired state 的权威。workspace TOML 是 workspace 拓扑、服务和 Pingap
@@ -311,6 +311,9 @@ activate 可以指定任意已保留 release，因此激活旧 release 就是回
 - 健康：`confirm { healthy: true }`，release 变为 `Active`；
 - 不健康或超时：`confirm { healthy: false, message }`，恢复旧 code，标记失败。
 
+相同结果的 confirm 可安全重试：已经 Active 的 release 再次确认健康、已经 Failed 的
+release 再次确认不健康，均返回当前 release，不重复执行切换或回滚。
+
 注意：当前 `ActivateReleaseRequest.readinessTimeoutSeconds` 已存在于模型，但 handler 尚未使用；
 120 秒 readiness 由 app-cli 和外部发布编排共同完成。后续应把超时所有权统一到一个组件，
 避免 Java、app_manager 和 app-cli 各自维护不同计时器。
@@ -375,7 +378,9 @@ app-cli 当前启动流程：
 
 ### 6.3 管理端口
 
-app-cli 管理 API 默认监听 `0.0.0.0:3010`，只供平台内部访问。不能通过应用公网路由暴露。
+app-cli 管理 API 默认监听 `0.0.0.0:3010`，不内置鉴权，不限制来源 IP、内网域名、
+公网域名或 HTTP 访问。平台生成的 managed Pingap 配置默认不为该端口创建应用路由；
+是否经外层网络或自定义代理暴露由私有化部署方决定。
 
 ```text
 GET  /health
@@ -438,9 +443,9 @@ app-cli：
 
 护栏：
 
-- 必须存在且只能存在平台公网入口 `0.0.0.0:9080`；
+- 必须存在且只能存在平台统一入口 `0.0.0.0:9080`，不限制客户端来源 IP；
 - 其它 listener 只能监听 loopback；
-- `9080` 禁止 TLS/ACME，由平台边缘终止 TLS；
+- `9080` 使用 HTTP，不强制用户具备 HTTPS 或公网域名；需要 TLS 时由外层平台终止；
 - Admin 关闭；
 - 配置最多 2 MiB；
 - 每类 server/location/upstream/plugin/certificate/storage 最多 256；
@@ -538,9 +543,9 @@ stream 返回 `Content-Type: text/event-stream`。浏览器使用 `fetch + Reada
 cursor 是 opaque 值，包含 boot ID 和各 source 的文件身份/offset。客户端断线后，把最近
 checkpoint 放入下一次 POST body，不使用 `Last-Event-ID`。
 
-app-cli 重启后 boot ID 改变，旧 cursor 必须失效。当前实现会在解码时内部重置 cursor，
-但不保证为这种 boot ID 变化发出显式 `cursor_reset`；该事件语义仍需补齐，客户端现阶段
-还应把重复日志视为可接受并按 service/source/file/offset 去重。
+app-cli 重启后 boot ID 改变，旧 cursor 必须失效。快照响应返回 `cursorReset=true`，SSE
+显式发送 `cursor_reset`，随后从新的 cursor 继续。客户端仍应按
+service/source/file/offset 对断线窗口内的日志做幂等去重。
 
 限制：
 
@@ -648,17 +653,17 @@ UserApp 长期运行占用 K8s 算力，但很多 app（demo、低频内部工�
                    upstream_peer → app_backends[(app_id,port)] → Service → Pod
 
 回收扫描器(后台 interval 1h):
-  list_deployments → decide_recycle → stop_app(scale0)
+  list_deployments → decide_recycle → recycle_app(scale0, wakeable)
 
 AppActivityRegistry (in-memory, rcoder 单实例):
-  last_accessed[app_id] / stopped[app_id] / waking[app_id]
+  last_accessed / stopped / wake_blocked / waking / recycling
 ```
 
 三个组件共享 `AppActivityRegistry`（内存态）：
 - **访问追踪**：Pingora `request_filter` 对 `/proxy/apps/{id}/...` 路由调 `touch(app_id)`，
   5s 节流写入 `last_accessed`。
 - **回收扫描器**：后台 `tokio::time::interval` 循环，枚举 Running app，比对 `last_accessed`
-  与阈值，命中 → `stop_app(scale0)` + `mark_stopped`。判定逻辑抽纯函数 `decide_recycle`
+  与阈值，命中 → `recycle_app(scale0)` + `mark_recycled`。判定逻辑抽纯函数 `decide_recycle`
   便于单测覆盖全部分支。
 - **流量唤醒**：Pingora `request_filter` 检测 `is_stopped(app_id)` → `ensure_running`
   （scale→1 + 轮询 Ready），并发请求经 `tokio::sync::watch` 合流为一次 scale-up。
@@ -681,6 +686,7 @@ per-app 覆盖（Deployment 注解，由 `CreateAppRequest`/`UpdateAppRequest`/`
 |---|---|
 | `rcoder.io/recycle-enabled` | `true`/absent = 可回收（免费默认）；`false` = 永不回收（付费） |
 | `rcoder.io/idle-timeout-seconds` | per-app 覆盖全局闲置阈值 |
+| `rcoder.io/wake-on-traffic` | `true`=闲置回收，可由流量唤醒；`false`=用户主动停止/发布切换，不得自动唤醒 |
 
 #### 动态回收策略端点
 
@@ -717,10 +723,12 @@ POST /api/v1/apps/{app_id}/recycle-policy
 
 - 回收 = scale-to-zero，**不删 PVC**（数据零风险；销毁存储仍只走 `storage/destroy`）。
 - stopped app 改 recycle 策略 → **不会自动拉起**；只影响"要不要回收"，不影响"要不要常驻"。
-- wake-on-traffic 与 recycle 策略**独立**：stopped app 来流量总唤醒（无论免费/付费）。
+- wake-on-traffic 与 recycle 策略**独立**：因闲置回收而停止的 app 来流量总唤醒；用户主动
+  stop 或发布切换产生的 scale0 不允许流量唤醒。
 - rcoder 单实例：in-memory `AppActivityRegistry` 一致；多副本需上 DB/注解（v2）。
-- rcoder 重启：`rebuild_stopped_apps` 从 K8s（`replicas==0` → stopped）重建内存态；
-  Running app 种 `last_accessed=now`（给完整 grace 周期）。
+- rcoder 重启：`rebuild_stopped_apps` 从 K8s 重建内存态；`replicas==0` 时结合
+  `rcoder.io/wake-on-traffic` 恢复为可唤醒或手动停止，Running app 种
+  `last_accessed=now`（给完整 grace 周期）。
 - **Gateway 模式不支持**：HTTPRoute 绕过 rcoder，pingora 无法记录访问 / 触发唤醒。
 
 ---
@@ -770,7 +778,8 @@ migrate 在 service 启动前执行。任意 migration 失败会使整组启动�
 - Secret 不进入 workspace Manifest；
 - workspace TOML 中的明文会进入源码和最近保留的 release 包；
 - app-cli 不主动打印完整 Pingap TOML；
-- app-cli 管理端口、PG 和 pgweb 不通过用户自定义 Pingap 公网暴露；
+- app-cli 管理端口、PG 和 pgweb 不通过用户自定义 Pingap 应用路由暴露；
+- 发布包、上传文件和 Agent 下载 URL 允许 HTTP、内网 IP、localhost、集群域名及公网域名；
 - release URL、摘要、大小和 ID全部校验；
 - 日志查询不能读取未在 release lock 声明的路径；
 - storage destroy 必须二次确认；
@@ -779,10 +788,9 @@ migrate 在 service 启动前执行。任意 migration 失败会使整组启动�
 
 仍需加强：
 
-- app-cli 内部 API 的显式鉴权/网络策略；
 - effective-config 的权限和脱敏审计；
 - release 包最大大小、解压后总大小和文件数上限统一；
-- custom Pingap 对公网/内网目标的更完整 SSRF 校验；
+- custom Pingap 保留云元数据/link-local 精确地址保护，但不限制普通内网 IP、HTTP 或内网域名；
 - release 包签名或平台侧可信来源校验。
 
 ---

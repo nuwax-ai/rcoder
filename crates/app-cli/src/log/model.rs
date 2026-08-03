@@ -72,6 +72,7 @@ pub struct LogQueryResponse {
     pub logs: Vec<LogRecord>,
     pub source_errors: Vec<SourceError>,
     pub cursor: String,
+    pub cursor_reset: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -82,7 +83,11 @@ pub struct CursorState {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SourceCursor {
+    pub files: BTreeMap<String, FileCursor>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FileCursor {
     pub file: String,
-    pub file_identity: String,
     pub offset: u64,
 }

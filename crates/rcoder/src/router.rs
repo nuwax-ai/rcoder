@@ -462,6 +462,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     // 应用管理路由
     let app_manager_state = Arc::new(app_manager::handlers::AppManagerState {
         app_service: state.app_service.clone(),
+        http_client: reqwest::Client::new(),
     });
     let app_manager_routes = app_manager::routes::app_manager_routes()
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GiB（upload 压缩包，覆盖全局 50MB）
@@ -632,7 +633,6 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::delete_release,
         app_manager::handlers::query_app_log_sources,
         app_manager::handlers::query_app_logs,
-        app_manager::handlers::get_app_logs,
         app_manager::handlers::get_app_health,
         app_manager::handlers::get_app_stats,
         app_manager::handlers::get_app_events,
@@ -647,7 +647,6 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::reset_db_password,
         app_manager::handlers::create_database,
         app_manager::handlers::stream_app_logs_v1,
-        app_manager::handlers::get_app_file_logs,
         app_manager::handlers::upload_from_url,
         crate::userapp_publish::handler::ensure_builder,
         crate::userapp_publish::handler::publish,
@@ -764,8 +763,6 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             app_manager::models::AppStatus,
             app_manager::models::QueryAppsRequest,
             app_manager::models::UpdateAppRequest,
-            app_manager::models::LogParams,
-            app_manager::models::LogEntry,
             app_manager::models::ResourceStats,
             app_manager::models::HealthInfo,
             app_manager::models::PaginatedResponse<app_manager::models::AppRuntimeInfo>,

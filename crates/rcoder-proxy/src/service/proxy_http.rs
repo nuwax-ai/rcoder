@@ -416,8 +416,7 @@ impl ProxyHttp for PortProxy {
         // 如果有目标端口，记录端口指标
         if let Some(port) = ctx.target_port {
             self.metrics
-                .record_response_port(port, &status_text, duration)
-                .await;
+                .record_response_port(port, &status_text, duration);
         }
 
         // 减少活跃连接数

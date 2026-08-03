@@ -62,11 +62,15 @@ pub async fn proxy_status(
 
     // 收集后端列表
     let backends_arc = svc.backends();
-    let backends_map = backends_arc.read().await;
-    let backend_count = backends_map.len();
+    let backend_snapshot = backends_arc
+        .load()
+        .iter()
+        .map(|(port, host)| (*port, host.clone()))
+        .collect::<Vec<_>>();
+    let backend_count = backend_snapshot.len();
     // 收集后端列表（从缓存快照）
     let health_map = svc.health_snapshot().await;
-    let backends = backends_map
+    let backends = backend_snapshot
         .iter()
         .map(|(port, host)| {
             if let Some(health) = health_map.get(port) {

@@ -773,6 +773,14 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn patch_wake_on_traffic(
+        &self,
+        app_id: &str,
+        enabled: bool,
+    ) -> ContainerRuntimeResult<()> {
+        self.patch_app_wake_on_traffic(app_id, enabled).await
+    }
+
     async fn restart_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         self.restart_app(app_id).await
     }

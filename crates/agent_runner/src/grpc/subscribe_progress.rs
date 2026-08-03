@@ -135,7 +135,7 @@ pub async fn subscribe_progress(
                         );
                         if tx.send(Ok(event)).await.is_err() {
                             debug!("[gRPC] Client disconnected during replay");
-                            session_data.close_current_connection().await;
+                            session_data.close_current_connection();
                             return;
                         }
                     }
@@ -153,7 +153,7 @@ pub async fn subscribe_progress(
                         "[gRPC] SubscribeProgress stream ended, cleaning up SSE sender: session_id={}, reason={}",
                         session_id_clone, reason
                     );
-                    session_data.close_current_connection().await;
+                    session_data.close_current_connection();
                 }
                 Err(e) => {
                     warn!("[gRPC] Failed to create session connection: {}", e);

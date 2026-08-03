@@ -86,7 +86,7 @@ impl super::service::AppService {
     }
 
     /// 从 URL 下载 → 复用 upload_file（魔数识别 + 解压 + zip slip + canonicalize 全复用）。
-    /// SSRF：Downloader（download_utils）经 config.app_url_allow_private_networks 控制。
+    /// 私有化部署默认允许 HTTP、内网 IP、localhost 和集群内域名；仅限制为 HTTP(S) 协议。
     #[instrument(skip(self))]
     pub async fn upload_from_url(
         &self,
@@ -269,7 +269,7 @@ impl super::service::AppService {
     }
 }
 
-/// download_utils::DownloadError → AppOperationError（InvalidUrl/SSRF → Validation 400；其余 → Backend 500）
+/// download_utils::DownloadError → AppOperationError（非法/非 HTTP(S) URL → 400；其余 → 500）
 fn map_download_error(e: DownloadError) -> AppOperationError {
     match e {
         DownloadError::InvalidUrl(msg) => AppOperationError::Validation(msg),

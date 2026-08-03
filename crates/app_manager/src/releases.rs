@@ -3,11 +3,13 @@
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 use download_utils::{DownloadConfig, DownloadError, Downloader, extract_zip};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -37,6 +39,7 @@ impl AppService {
         let app_dir = self.get_container_app_dir(app_id).await?;
         let releases_dir = app_dir.join("releases");
         ensure_release_dirs(&releases_dir).await?;
+        let _process_lock = self.acquire_process_release_lock(app_id).await;
         let _lock = acquire_lock(releases_dir.join(".operation.lock")).await?;
         let mut index = read_index(&releases_dir, retention).await?;
         if let Some(existing) = index
@@ -104,7 +107,16 @@ impl AppService {
         };
         index.retention = retention;
         index.releases.push(release.clone());
-        write_index(&releases_dir, &index).await?;
+        if let Err(error) = write_index(&releases_dir, &index).await {
+            if let Err(cleanup_error) = tokio::fs::remove_file(&package).await {
+                warn!(
+                    path = %package.display(),
+                    %cleanup_error,
+                    "failed to remove orphaned release package after index commit failure"
+                );
+            }
+            return Err(error);
+        }
         info!(app_id, release_id = %release.release_id, "release prepared");
         Ok(release)
     }
@@ -115,6 +127,7 @@ impl AppService {
         validate_release_id(release_id)?;
         let app_dir = self.get_container_app_dir(app_id).await?;
         let releases_dir = app_dir.join("releases");
+        let _process_lock = self.acquire_process_release_lock(app_id).await;
         let _lock = acquire_lock(releases_dir.join(".operation.lock")).await?;
         let mut index = read_index(&releases_dir, release_retention(None)?).await?;
         let release_position = index
@@ -124,10 +137,37 @@ impl AppService {
             .ok_or_else(|| {
                 AppOperationError::NotFound(format!("release not found: {release_id}"))
             })?;
-        if index.active_release_id.as_deref() == Some(release_id)
-            || index.pending_release_id.as_deref() == Some(release_id)
-        {
+        if index.active_release_id.as_deref() == Some(release_id) {
             return Ok(index.releases[release_position].clone());
+        }
+        if index.pending_release_id.as_deref() == Some(release_id) {
+            let code = app_dir.join("code");
+            let rollback = releases_dir.join(".rollback").join("code");
+            if code_release_id(&code).await?.as_deref() == Some(release_id) {
+                let app_exists = self
+                    .runtime
+                    .get_deployment_status(app_id)
+                    .await
+                    .map_err(|error| {
+                        crate::utils::map_runtime_error(
+                            &format!("[APP] recover pending activation failed app_id={app_id}"),
+                            error,
+                        )
+                    })?
+                    .is_some();
+                if app_exists {
+                    self.start_app(app_id).await?;
+                }
+                return Ok(index.releases[release_position].clone());
+            }
+            if !code.exists() && rollback.exists() {
+                tokio::fs::rename(&rollback, &code)
+                    .await
+                    .map_err(|error| map_io_error("recover interrupted activation", error, true))?;
+            }
+            index.pending_release_id = None;
+            index.releases[release_position].status = ReleaseStatus::Prepared;
+            write_index(&releases_dir, &index).await?;
         }
         if let Some(pending) = &index.pending_release_id {
             return Err(AppOperationError::InvalidState(format!(
@@ -159,23 +199,49 @@ impl AppService {
                 ));
             }
         };
+        index.previous_release_id = index.active_release_id.clone();
+        index.pending_release_id = Some(release_id.to_owned());
+        index.releases[release_position].status = ReleaseStatus::PendingStart;
+        index.releases[release_position].activated_at = Some(Utc::now().to_rfc3339());
+        write_index(&releases_dir, &index).await?;
         if app_exists && let Err(error) = self.stop_app(app_id).await {
             remove_dir_if_exists(&staging).await?;
+            index.pending_release_id = None;
+            index.releases[release_position].status = ReleaseStatus::Prepared;
+            write_index(&releases_dir, &index).await?;
             return Err(error);
         }
-        if code.exists() {
-            tokio::fs::rename(&code, &rollback)
-                .await
-                .map_err(|error| map_io_error("move active code to rollback", error, true))?;
+        if code.exists()
+            && let Err(error) = tokio::fs::rename(&code, &rollback).await
+        {
+            index.pending_release_id = None;
+            index.releases[release_position].status = ReleaseStatus::Prepared;
+            write_index(&releases_dir, &index).await?;
+            if app_exists && let Err(restart_error) = self.start_app(app_id).await {
+                error!(app_id, %restart_error, "failed to restart app after code move failure");
+            }
+            return Err(map_io_error("move active code to rollback", error, true));
         }
         if let Err(error) = tokio::fs::rename(&staging, &code).await {
+            let mut restore_failed = false;
             if rollback.exists()
-                && let Err(rollback_err) = tokio::fs::rename(&rollback, &code).await
+                && let Err(rollback_error) = tokio::fs::rename(&rollback, &code).await
             {
-                error!(
-                    "[app_manager] CRITICAL: rollback rename failed for {}: {}. Code directory may be in inconsistent state.",
-                    app_id, rollback_err
-                );
+                restore_failed = true;
+                error!(app_id, %rollback_error, "rollback rename failed after activation error");
+            }
+            index.pending_release_id = None;
+            index.releases[release_position].status = if restore_failed {
+                ReleaseStatus::Failed
+            } else {
+                ReleaseStatus::Prepared
+            };
+            write_index(&releases_dir, &index).await?;
+            if app_exists
+                && !restore_failed
+                && let Err(restart_error) = self.start_app(app_id).await
+            {
+                error!(app_id, %restart_error, "failed to restart restored app after activation error");
             }
             return Err(map_io_error("activate staged release", error, true));
         }
@@ -204,6 +270,8 @@ impl AppService {
             }
             index.releases[release_position].status = ReleaseStatus::Failed;
             index.releases[release_position].failure_message = Some(error.to_string());
+            index.pending_release_id = None;
+            write_index(&releases_dir, &index).await?;
             if let Err(e) = tokio::fs::remove_file(&package).await {
                 debug!(
                     "[app_manager] Failed to cleanup package {}: {}",
@@ -211,15 +279,9 @@ impl AppService {
                     e
                 );
             }
-            write_index(&releases_dir, &index).await?;
             return Err(error);
         }
-        index.previous_release_id = index.active_release_id.clone();
-        index.pending_release_id = Some(release_id.to_owned());
-        index.releases[release_position].status = ReleaseStatus::PendingStart;
-        index.releases[release_position].activated_at = Some(Utc::now().to_rfc3339());
         let release = index.releases[release_position].clone();
-        write_index(&releases_dir, &index).await?;
         Ok(release)
     }
 
@@ -231,15 +293,12 @@ impl AppService {
         message: Option<String>,
     ) -> AppResult<ReleaseInfo> {
         validate_app_id(app_id)?;
+        validate_release_id(release_id)?;
         let app_dir = self.get_container_app_dir(app_id).await?;
         let releases_dir = app_dir.join("releases");
+        let _process_lock = self.acquire_process_release_lock(app_id).await;
         let _lock = acquire_lock(releases_dir.join(".operation.lock")).await?;
         let mut index = read_index(&releases_dir, release_retention(None)?).await?;
-        if index.pending_release_id.as_deref() != Some(release_id) {
-            return Err(AppOperationError::InvalidState(format!(
-                "release is not pending confirmation: {release_id}"
-            )));
-        }
         let position = index
             .releases
             .iter()
@@ -247,6 +306,19 @@ impl AppService {
             .ok_or_else(|| {
                 AppOperationError::NotFound(format!("release not found: {release_id}"))
             })?;
+        if index.pending_release_id.as_deref() != Some(release_id) {
+            let release = &index.releases[position];
+            if (healthy
+                && index.active_release_id.as_deref() == Some(release_id)
+                && release.status == ReleaseStatus::Active)
+                || (!healthy && release.status == ReleaseStatus::Failed)
+            {
+                return Ok(release.clone());
+            }
+            return Err(AppOperationError::InvalidState(format!(
+                "release is not pending confirmation: {release_id}"
+            )));
+        }
         if !healthy {
             warn!(
                 "[app_manager] Release {} for app {} unhealthy, initiating rollback",
@@ -281,6 +353,7 @@ impl AppService {
             index.releases[position].failure_message =
                 message.or_else(|| Some("readiness confirmation failed".into()));
             index.pending_release_id = None;
+            write_index(&releases_dir, &index).await?;
             let package = releases_dir
                 .join("packages")
                 .join(format!("{release_id}.zip"));
@@ -290,7 +363,6 @@ impl AppService {
                     release_id, e
                 );
             }
-            write_index(&releases_dir, &index).await?;
             if let Some(restart_error) = restart_error {
                 return Err(AppOperationError::Backend(format!(
                     "rollback restored previous code but restart failed for {app_id}: {restart_error}"
@@ -308,9 +380,17 @@ impl AppService {
         index.active_release_id = Some(release_id.to_owned());
         index.pending_release_id = None;
         let release = index.releases[position].clone();
-        cleanup_retention(&releases_dir, &mut index).await?;
-        remove_dir_if_exists(&releases_dir.join(".rollback").join("code")).await?;
+        // 先持久化 Active 权威状态。后续保留清理均可重试，不能让清理失败破坏发布确认。
         write_index(&releases_dir, &index).await?;
+        let removals = plan_retention(&mut index);
+        if !removals.is_empty() {
+            write_index(&releases_dir, &index).await?;
+            remove_release_packages(&releases_dir, &removals).await;
+        }
+        if let Err(error) = remove_dir_if_exists(&releases_dir.join(".rollback").join("code")).await
+        {
+            warn!(app_id, release_id, %error, "failed to remove rollback directory after confirm");
+        }
         Ok(release)
     }
 
@@ -331,6 +411,7 @@ impl AppService {
         validate_release_id(release_id)?;
         let app_dir = self.get_container_app_dir(app_id).await?;
         let releases_dir = app_dir.join("releases");
+        let _process_lock = self.acquire_process_release_lock(app_id).await;
         let _lock = acquire_lock(releases_dir.join(".operation.lock")).await?;
         let mut index = read_index(&releases_dir, release_retention(None)?).await?;
         if index.active_release_id.as_deref() == Some(release_id)
@@ -349,15 +430,34 @@ impl AppService {
                 "release not found: {release_id}"
             )));
         }
-        let package = releases_dir
-            .join("packages")
-            .join(format!("{release_id}.zip"));
-        if let Err(error) = tokio::fs::remove_file(&package).await
-            && error.kind() != std::io::ErrorKind::NotFound
+        // 先从权威索引移除，再 best-effort 删除包；删除失败只留下可回收孤儿文件。
+        write_index(&releases_dir, &index).await?;
+        remove_release_packages(&releases_dir, &[release_id.to_owned()]).await;
+        Ok(())
+    }
+
+    pub(super) async fn acquire_process_release_lock(
+        &self,
+        app_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = match self.release_locks.entry(app_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                entry.insert(lock.clone());
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    pub(super) fn remove_unused_process_release_lock(&self, app_id: &str) {
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            self.release_locks.entry(app_id.to_owned())
+            && Arc::strong_count(entry.get()) == 1
         {
-            return Err(map_io_error("delete release package", error, true));
+            entry.remove();
         }
-        write_index(&releases_dir, &index).await
     }
 }
 
@@ -434,12 +534,32 @@ async fn write_index(root: &Path, index: &ReleaseIndex) -> AppResult<()> {
     let bytes = serde_json::to_vec_pretty(index)
         .map_err(|error| AppOperationError::Backend(format!("serialize release index: {error}")))?;
     let temp = root.join("index.json.tmp");
-    tokio::fs::write(&temp, bytes)
+    let mut file = tokio::fs::File::create(&temp)
         .await
         .map_err(|error| map_io_error("write release index", error, true))?;
+    file.write_all(&bytes)
+        .await
+        .map_err(|error| map_io_error("write release index", error, true))?;
+    file.sync_all()
+        .await
+        .map_err(|error| map_io_error("sync release index", error, true))?;
+    drop(file);
     tokio::fs::rename(&temp, root.join("index.json"))
         .await
-        .map_err(|error| map_io_error("commit release index", error, true))
+        .map_err(|error| map_io_error("commit release index", error, true))?;
+    let root = root.to_path_buf();
+    match tokio::task::spawn_blocking(move || std::fs::File::open(root)?.sync_all()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            // rename 已提交，目录 fsync 在部分 PVC/NFS 上不受支持。此时不能
+            // 返回失败，否则调用方可能把 index 已引用的 package 当成孤儿删除。
+            warn!(%error, "release index committed but directory sync is unsupported or failed");
+        }
+        Err(error) => {
+            warn!(%error, "release index committed but directory sync task failed");
+        }
+    }
+    Ok(())
 }
 
 async fn verify_package(
@@ -525,7 +645,23 @@ async fn validate_staging(path: &Path, release_id: &str) -> AppResult<()> {
     Ok(())
 }
 
-async fn cleanup_retention(root: &Path, index: &mut ReleaseIndex) -> AppResult<()> {
+async fn code_release_id(code: &Path) -> AppResult<Option<String>> {
+    let path = code.join("release.lock.toml");
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(map_io_error("read active release lock", error, false)),
+    };
+    let value: toml::Value = toml::from_str(&content).map_err(|error| {
+        AppOperationError::Backend(format!("parse active release lock: {error}"))
+    })?;
+    Ok(value
+        .get("release_id")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned))
+}
+
+fn plan_retention(index: &mut ReleaseIndex) -> Vec<String> {
     let active = index.active_release_id.as_deref();
     let mut ordered: Vec<_> = index
         .releases
@@ -550,18 +686,21 @@ async fn cleanup_retention(root: &Path, index: &mut ReleaseIndex) -> AppResult<(
         .filter(|release| !keep.contains(&release.release_id))
         .map(|release| release.release_id.clone())
         .collect();
-    for release_id in &remove {
+    index
+        .releases
+        .retain(|release| !remove.contains(&release.release_id));
+    remove
+}
+
+async fn remove_release_packages(root: &Path, release_ids: &[String]) {
+    for release_id in release_ids {
         let path = root.join("packages").join(format!("{release_id}.zip"));
         if let Err(error) = tokio::fs::remove_file(path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            return Err(map_io_error("clean retained release", error, true));
+            warn!(release_id, %error, "failed to remove unreferenced release package");
         }
     }
-    index
-        .releases
-        .retain(|release| !remove.contains(&release.release_id));
-    Ok(())
 }
 
 async fn remove_dir_if_exists(path: &Path) -> AppResult<()> {
@@ -670,9 +809,8 @@ mod tests {
                 .await
                 .expect("package");
         }
-        cleanup_retention(root.path(), &mut index)
-            .await
-            .expect("cleanup");
+        let removals = plan_retention(&mut index);
+        remove_release_packages(root.path(), &removals).await;
         let ids: std::collections::BTreeSet<_> = index
             .releases
             .iter()
@@ -713,9 +851,8 @@ mod tests {
             releases,
         };
 
-        cleanup_retention(root.path(), &mut index)
-            .await
-            .expect("cleanup");
+        let removals = plan_retention(&mut index);
+        remove_release_packages(root.path(), &removals).await;
 
         assert_eq!(index.releases.len(), 15);
         assert!(

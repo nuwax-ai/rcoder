@@ -617,7 +617,7 @@ pub async fn handle_chat_core(
 
                 // view() 在闭包返回后立即释放锁，无 Ref 暴露
                 if let Some(sd) = SESSION_CACHE.view(&old_session_id, |_, d| d.clone()) {
-                    sd.close_current_connection().await;
+                    sd.close_current_connection();
                 }
                 SESSION_CACHE.remove(&old_session_id);
             }

@@ -1,16 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, Read, Seek};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use chrono::DateTime;
+use chrono::{DateTime, FixedOffset, Utc};
 use globset::Glob;
 use workspace_manifest::{LockedService, LogFormat, LogSource, ReleaseLock};
 
 use super::model::{
-    CursorState, LogQueryRequest, LogQueryResponse, LogRecord, LogSourceInfo, MAX_CURSOR_BYTES,
-    MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE, SourceCursor, SourceError,
+    CursorState, FileCursor, LogQueryRequest, LogQueryResponse, LogRecord, LogSourceInfo,
+    MAX_CURSOR_BYTES, MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE,
+    SourceCursor, SourceError,
 };
 
 const MAX_FILES_PER_SOURCE: usize = 128;
@@ -29,6 +32,13 @@ struct SelectedSource {
     source: LogSource,
 }
 
+struct MatchedLogFile {
+    path: PathBuf,
+    identity: String,
+    len: u64,
+    modified: std::time::SystemTime,
+}
+
 impl LogService {
     pub fn new(release: ReleaseLock, log_root: PathBuf) -> Self {
         Self {
@@ -38,7 +48,14 @@ impl LogService {
         }
     }
 
-    pub fn sources(&self, request: &LogQueryRequest) -> Result<Vec<LogSourceInfo>> {
+    pub async fn sources(&self, request: LogQueryRequest) -> Result<Vec<LogSourceInfo>> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.sources_blocking(&request))
+            .await
+            .context("join log source query")?
+    }
+
+    fn sources_blocking(&self, request: &LogQueryRequest) -> Result<Vec<LogSourceInfo>> {
         self.select(request)?
             .into_iter()
             .map(|selected| {
@@ -53,8 +70,9 @@ impl LogService {
                     .into(),
                     matched_files: files
                         .iter()
-                        .filter_map(|path| {
-                            path.file_name()
+                        .filter_map(|file| {
+                            file.path
+                                .file_name()
                                 .map(|name| name.to_string_lossy().to_string())
                         })
                         .collect(),
@@ -63,14 +81,37 @@ impl LogService {
             .collect()
     }
 
-    pub fn query(&self, request: &LogQueryRequest) -> Result<LogQueryResponse> {
+    pub async fn query(&self, request: LogQueryRequest) -> Result<LogQueryResponse> {
+        self.query_with_cancel(request, Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    pub async fn query_with_cancel(
+        &self,
+        request: LogQueryRequest,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<LogQueryResponse> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.query_blocking(&request, &cancelled))
+            .await
+            .context("join log query")?
+    }
+
+    fn query_blocking(
+        &self,
+        request: &LogQueryRequest,
+        cancelled: &AtomicBool,
+    ) -> Result<LogQueryResponse> {
         self.validate_request(request)?;
         let selected = self.select(request)?;
-        let mut cursor = self.decode_cursor(request.cursor.as_deref())?;
+        let (mut cursor, cursor_reset) = self.decode_cursor(request.cursor.as_deref())?;
         let mut logs = Vec::new();
         let mut source_errors = Vec::new();
         for source in selected {
-            match self.read_source(&source, request, &mut cursor) {
+            if cancelled.load(Ordering::Relaxed) {
+                anyhow::bail!("log query cancelled");
+            }
+            match self.read_source(&source, request, &mut cursor, cancelled) {
                 Ok(mut records) => logs.append(&mut records),
                 Err(error) => source_errors.push(SourceError {
                     service_id: source.service_id,
@@ -81,8 +122,7 @@ impl LogService {
             }
         }
         logs.sort_by(|left, right| {
-            left.timestamp
-                .cmp(&right.timestamp)
+            compare_timestamps(left.timestamp.as_deref(), right.timestamp.as_deref())
                 .then_with(|| left.service_id.cmp(&right.service_id))
                 .then_with(|| left.source_id.cmp(&right.source_id))
                 .then_with(|| left.file.cmp(&right.file))
@@ -92,6 +132,7 @@ impl LogService {
             logs,
             source_errors,
             cursor: self.encode_cursor(&cursor)?,
+            cursor_reset,
         })
     }
 
@@ -185,21 +226,42 @@ impl LogService {
                 }
             }
         }
+        let selected_service_count = selected
+            .iter()
+            .map(|source| source.service_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        if selected_service_count > MAX_SERVICES {
+            anyhow::bail!("selected services exceeds maximum of {MAX_SERVICES}");
+        }
         if selected.len() > MAX_SOURCES {
             anyhow::bail!("selected sources exceeds maximum of {MAX_SOURCES}");
         }
         Ok(selected)
     }
 
-    fn match_files(&self, selected: &SelectedSource) -> Result<Vec<PathBuf>> {
+    fn match_files(&self, selected: &SelectedSource) -> Result<Vec<MatchedLogFile>> {
         let directory = self.log_root.join(&selected.service_id);
         let matcher = Glob::new(&selected.source.glob)
             .with_context(|| format!("invalid source glob {}", selected.source.glob))?
             .compile_matcher();
         let mut files = Vec::new();
+        let directory_metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect log directory {}", directory.display()));
+            }
+        };
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            anyhow::bail!(
+                "service log directory must be a real directory: {}",
+                directory.display()
+            );
+        }
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(files),
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("read log directory {}", directory.display()));
@@ -213,7 +275,15 @@ impl LogService {
             }
             let name = entry.file_name();
             if matcher.is_match(Path::new(&name)) {
-                files.push(entry.path());
+                let path = entry.path();
+                let metadata = entry.metadata()?;
+                let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                files.push(MatchedLogFile {
+                    identity: file_identity(&path, &metadata),
+                    path,
+                    len: metadata.len(),
+                    modified,
+                });
                 if files.len() > MAX_FILES_PER_SOURCE {
                     anyhow::bail!(
                         "source {}/{} matches more than {MAX_FILES_PER_SOURCE} files",
@@ -223,7 +293,11 @@ impl LogService {
                 }
             }
         }
-        files.sort();
+        files.sort_by(|left, right| {
+            left.modified
+                .cmp(&right.modified)
+                .then_with(|| left.path.cmp(&right.path))
+        });
         Ok(files)
     }
 
@@ -232,72 +306,109 @@ impl LogService {
         selected: &SelectedSource,
         request: &LogQueryRequest,
         cursor: &mut CursorState,
+        cancelled: &AtomicBool,
     ) -> Result<Vec<LogRecord>> {
         let files = self.match_files(selected)?;
         if files.is_empty() {
             anyhow::bail!("no files match declared glob {}", selected.source.glob);
         }
         let key = format!("{}/{}", selected.service_id, selected.source.id);
-        let prior = cursor.sources.get(&key).cloned();
+        let prior = cursor.sources.get(&key).cloned().unwrap_or(SourceCursor {
+            files: BTreeMap::new(),
+        });
+        let mut next = prior.clone();
+        let mut seen_identities = BTreeSet::new();
         let mut records = Vec::new();
-        for path in files {
+        let mut exhausted_all_files = true;
+        let initial_tail = request
+            .cursor
+            .is_none()
+            .then(|| request.tail.unwrap_or(100));
+        let mut remaining = initial_tail.is_none().then_some(MAX_TAIL_PER_SOURCE);
+        for matched in files {
+            let path = &matched.path;
             let file_name = path
                 .file_name()
                 .ok_or_else(|| anyhow::anyhow!("log file has no name"))?
                 .to_string_lossy()
                 .to_string();
-            let identity = file_identity(&path)?;
-            if prior.as_ref().is_some_and(|state| file_name < state.file) {
+            let identity = matched.identity;
+            seen_identities.insert(identity.clone());
+            let start = prior.files.get(&identity).map_or(0, |state| state.offset);
+            if request.cursor.is_some() && start == matched.len {
+                next.files.insert(
+                    identity,
+                    FileCursor {
+                        file: file_name,
+                        offset: start,
+                    },
+                );
                 continue;
             }
-            let start = prior
-                .as_ref()
-                .filter(|state| state.file == file_name && state.file_identity == identity)
-                .map_or(0, |state| state.offset);
-            let (mut file_records, end) =
-                read_file(&path, start, selected, request).with_context(|| {
-                    format!(
-                        "read source {}/{} file {}",
-                        selected.service_id, selected.source.id, file_name
-                    )
-                })?;
-            records.append(&mut file_records);
-            cursor.sources.insert(
-                key.clone(),
-                SourceCursor {
+            let outcome = read_file(
+                path,
+                start,
+                selected,
+                request,
+                initial_tail,
+                remaining,
+                cancelled,
+            )
+            .with_context(|| {
+                format!(
+                    "read source {}/{} file {}",
+                    selected.service_id, selected.source.id, file_name
+                )
+            })?;
+            next.files.insert(
+                identity,
+                FileCursor {
                     file: file_name,
-                    file_identity: identity,
-                    offset: end,
+                    offset: outcome.offset,
                 },
             );
-        }
-        if request.cursor.is_none() {
-            let tail = request.tail.unwrap_or(100);
-            if records.len() > tail {
-                records.drain(..records.len() - tail);
+            if let Some(limit) = initial_tail {
+                records.extend(outcome.records);
+                if records.len() > limit {
+                    records.drain(..records.len() - limit);
+                }
+            } else {
+                let count = outcome.records.len();
+                records.extend(outcome.records);
+                remaining = remaining.map(|value| value.saturating_sub(count));
+                if !outcome.complete || remaining == Some(0) {
+                    exhausted_all_files = false;
+                    break;
+                }
             }
         }
+        if exhausted_all_files {
+            next.files
+                .retain(|identity, _| seen_identities.contains(identity));
+        }
+        cursor.sources.insert(key, next);
         Ok(records)
     }
 
-    fn decode_cursor(&self, encoded: Option<&str>) -> Result<CursorState> {
+    fn decode_cursor(&self, encoded: Option<&str>) -> Result<(CursorState, bool)> {
         let Some(encoded) = encoded else {
-            return Ok(CursorState {
-                boot_id: self.boot_id.clone(),
-                sources: BTreeMap::new(),
-            });
+            return Ok((self.empty_cursor(), false));
         };
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded)
             .context("decode cursor")?;
-        let mut cursor: CursorState = serde_json::from_slice(&bytes).context("parse cursor")?;
+        let cursor: CursorState = serde_json::from_slice(&bytes).context("parse cursor")?;
         if cursor.boot_id != self.boot_id {
-            cursor = CursorState {
-                boot_id: self.boot_id.clone(),
-                sources: BTreeMap::new(),
-            };
+            return Ok((self.empty_cursor(), true));
         }
-        Ok(cursor)
+        Ok((cursor, false))
+    }
+
+    fn empty_cursor(&self) -> CursorState {
+        CursorState {
+            boot_id: self.boot_id.clone(),
+            sources: BTreeMap::new(),
+        }
     }
 
     fn encode_cursor(&self, cursor: &CursorState) -> Result<String> {
@@ -309,20 +420,45 @@ impl LogService {
     }
 }
 
+struct ReadOutcome {
+    records: Vec<LogRecord>,
+    offset: u64,
+    complete: bool,
+}
+
 fn read_file(
     path: &Path,
     start: u64,
     selected: &SelectedSource,
     request: &LogQueryRequest,
-) -> Result<(Vec<LogRecord>, u64)> {
+    tail_limit: Option<usize>,
+    record_limit: Option<usize>,
+    cancelled: &AtomicBool,
+) -> Result<ReadOutcome> {
     let mut file = std::fs::File::open(path)?;
     let length = file.metadata()?.len();
     let safe_start = if start > length { 0 } else { start };
     file.seek(std::io::SeekFrom::Start(safe_start))?;
     let mut reader = std::io::BufReader::new(file);
     let mut offset = safe_start;
-    let mut records = Vec::new();
+    let mut records = VecDeque::new();
+    let multiline_start = if selected.source.format == LogFormat::Text {
+        selected
+            .source
+            .multiline_start_pattern
+            .as_deref()
+            .map(regex::Regex::new)
+            .transpose()
+            .context("compile multiline_start_pattern")?
+    } else {
+        None
+    };
+    let mut pending_multiline: Option<LogRecord> = None;
+    let mut complete = true;
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            anyhow::bail!("log query cancelled");
+        }
         let mut line = Vec::new();
         let read = reader
             .by_ref()
@@ -340,10 +476,7 @@ fn read_file(
             .trim_end_matches(['\r', '\n'])
             .to_string();
         let (timestamp, level, rendered) = parse_line(&message, &selected.source.format);
-        if !matches_filters(request, timestamp.as_deref(), level.as_deref(), &rendered) {
-            continue;
-        }
-        records.push(LogRecord {
+        let record = LogRecord {
             service_id: selected.service_id.clone(),
             source_id: selected.source.id.clone(),
             file: path
@@ -354,28 +487,62 @@ fn read_file(
             timestamp,
             level,
             message: rendered,
-        });
-    }
-    if selected.source.format == LogFormat::Text
-        && let Some(pattern) = &selected.source.multiline_start_pattern
-    {
-        records = merge_multiline(records, pattern)?;
-    }
-    Ok((records, offset))
-}
-
-fn merge_multiline(records: Vec<LogRecord>, pattern: &str) -> Result<Vec<LogRecord>> {
-    let start = regex::Regex::new(pattern).context("compile multiline_start_pattern")?;
-    let mut merged: Vec<LogRecord> = Vec::new();
-    for record in records {
-        if start.is_match(&record.message) || merged.is_empty() {
-            merged.push(record);
-        } else if let Some(previous) = merged.last_mut() {
-            previous.message.push('\n');
-            previous.message.push_str(&record.message);
+        };
+        if let Some(start) = &multiline_start {
+            if start.is_match(&record.message) || pending_multiline.is_none() {
+                if let Some(previous) = pending_multiline.take()
+                    && push_record(&mut records, previous, request, tail_limit, record_limit)
+                {
+                    // 当前行已读出但属于下一条逻辑记录；cursor 回到该行开头，
+                    // 下一页重新读取，避免达到分页上限时丢日志。
+                    offset = current_offset;
+                    complete = false;
+                    break;
+                }
+                pending_multiline = Some(record);
+            } else if let Some(previous) = pending_multiline.as_mut() {
+                previous.message.push('\n');
+                previous.message.push_str(&record.message);
+            }
+        } else if push_record(&mut records, record, request, tail_limit, record_limit) {
+            complete = false;
+            break;
         }
     }
-    Ok(merged)
+    if complete && let Some(record) = pending_multiline {
+        let _ = push_record(&mut records, record, request, tail_limit, record_limit);
+    }
+    Ok(ReadOutcome {
+        records: records.into(),
+        offset,
+        complete,
+    })
+}
+
+fn push_record(
+    records: &mut VecDeque<LogRecord>,
+    record: LogRecord,
+    request: &LogQueryRequest,
+    tail_limit: Option<usize>,
+    record_limit: Option<usize>,
+) -> bool {
+    if !matches_filters(
+        request,
+        record.timestamp.as_deref(),
+        record.level.as_deref(),
+        &record.message,
+    ) {
+        return false;
+    }
+    records.push_back(record);
+    if let Some(limit) = tail_limit {
+        if records.len() > limit {
+            records.pop_front();
+        }
+        false
+    } else {
+        records.len() >= record_limit.unwrap_or(MAX_TAIL_PER_SOURCE)
+    }
 }
 
 fn parse_line(line: &str, format: &LogFormat) -> (Option<String>, Option<String>, String) {
@@ -423,68 +590,259 @@ fn matches_filters(
     {
         return false;
     }
-    if let (Some(since), Some(timestamp)) = (request.since.as_deref(), timestamp)
-        && timestamp < since
-    {
-        return false;
-    }
-    if let (Some(until), Some(timestamp)) = (request.until.as_deref(), timestamp)
-        && timestamp > until
-    {
-        return false;
+    if request.since.is_some() || request.until.is_some() {
+        let Some(timestamp) = timestamp.and_then(parse_timestamp) else {
+            return false;
+        };
+        if let Some(since) = request.since.as_deref().and_then(parse_timestamp)
+            && timestamp < since
+        {
+            return false;
+        }
+        if let Some(until) = request.until.as_deref().and_then(parse_timestamp)
+            && timestamp > until
+        {
+            return false;
+        }
     }
     true
 }
 
+fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::<FixedOffset>::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn compare_timestamps(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
+    match (
+        left.and_then(parse_timestamp),
+        right.and_then(parse_timestamp),
+    ) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.cmp(&right),
+    }
+}
+
 #[cfg(unix)]
-fn file_identity(path: &Path) -> Result<String> {
+fn file_identity(_path: &Path, metadata: &std::fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata(path)?;
-    Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+    format!("{}:{}", metadata.dev(), metadata.ino())
 }
 
 #[cfg(not(unix))]
-fn file_identity(path: &Path) -> Result<String> {
-    let metadata = std::fs::metadata(path)?;
-    let modified = metadata
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("file modified time before epoch")?;
-    Ok(format!("{}:{}", metadata.len(), modified.as_nanos()))
+fn file_identity(path: &Path, _metadata: &std::fs::Metadata) -> String {
+    // Rust 标准库在所有非 Unix 平台上没有统一稳定的 file-id API。日志目录和
+    // 文件名已经过边界校验，以路径作为稳定 identity 可避免每次 append 都重置 cursor。
+    path.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn record(offset: u64, message: &str) -> LogRecord {
-        LogRecord {
-            service_id: "api".into(),
-            source_id: "application".into(),
-            file: "application.log".into(),
-            offset,
-            timestamp: None,
-            level: None,
-            message: message.into(),
-        }
+    fn release_lock() -> ReleaseLock {
+        toml::from_str(
+            r#"
+schema_version = 1
+release_id = "release-1"
+workspace_name = "test"
+minimum_app_cli_version = "0.1.0"
+runtime_image_digest = "runtime:test"
+
+[pingap]
+mode = "managed"
+version = "test"
+commit = "test"
+
+[[services]]
+service_id = "api"
+name = "API"
+dir = "api"
+type = "go"
+kind = "web"
+enabled = true
+port = 18080
+
+[services.run]
+command = ["./api"]
+
+[services.health]
+
+[services.env]
+
+[[services.logs]]
+id = "application"
+glob = "application*.log"
+format = "jsonl"
+"#,
+        )
+        .expect("valid release lock")
     }
 
     #[test]
     fn multiline_text_combines_stack_trace_lines() {
-        let records = vec![
-            record(0, "2026-07-29 ERROR failed"),
-            record(24, "  at example::main"),
-            record(45, "2026-07-29 INFO recovered"),
-        ];
-        let merged =
-            merge_multiline(records, r"^\d{4}-\d{2}-\d{2}").expect("valid multiline pattern");
-        assert_eq!(merged.len(), 2);
-        assert!(merged[0].message.contains("at example::main"));
-        assert_eq!(merged[1].offset, 45);
+        let root = tempfile::tempdir().expect("log root");
+        let path = root.path().join("application.log");
+        std::fs::write(
+            &path,
+            "2026-07-29 ERROR failed\n  at example::main\n2026-07-29 INFO recovered\n",
+        )
+        .expect("write multiline log");
+        let selected = SelectedSource {
+            service_id: "api".into(),
+            source: LogSource {
+                id: "application".into(),
+                glob: "application*.log".into(),
+                format: LogFormat::Text,
+                multiline_start_pattern: Some(r"^\d{4}-\d{2}-\d{2}".into()),
+            },
+        };
+        let outcome = read_file(
+            &path,
+            0,
+            &selected,
+            &LogQueryRequest::default(),
+            Some(2),
+            None,
+            &AtomicBool::new(false),
+        )
+        .expect("read multiline log");
+        assert_eq!(outcome.records.len(), 2);
+        assert!(outcome.records[0].message.contains("at example::main"));
+        assert_eq!(outcome.records[1].message, "2026-07-29 INFO recovered");
+
+        let tail = read_file(
+            &path,
+            0,
+            &selected,
+            &LogQueryRequest::default(),
+            Some(1),
+            None,
+            &AtomicBool::new(false),
+        )
+        .expect("tail multiline log");
+        assert_eq!(tail.records.len(), 1);
+        assert_eq!(tail.records[0].message, "2026-07-29 INFO recovered");
     }
 
     #[test]
     fn invalid_multiline_pattern_fails_fast() {
-        assert!(merge_multiline(vec![record(0, "line")], "[").is_err());
+        let root = tempfile::tempdir().expect("log root");
+        let path = root.path().join("application.log");
+        std::fs::write(&path, "line\n").expect("write log");
+        let selected = SelectedSource {
+            service_id: "api".into(),
+            source: LogSource {
+                id: "application".into(),
+                glob: "application*.log".into(),
+                format: LogFormat::Text,
+                multiline_start_pattern: Some("[".into()),
+            },
+        };
+        assert!(
+            read_file(
+                &path,
+                0,
+                &selected,
+                &LogQueryRequest::default(),
+                Some(100),
+                None,
+                &AtomicBool::new(false),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_error_does_not_commit_partial_cursor_progress() {
+        let root = tempfile::tempdir().expect("log root");
+        let directory = root.path().join("api");
+        std::fs::create_dir_all(&directory).expect("service log directory");
+        let first = directory.join("application-1.log");
+        let second = directory.join("application-2.log");
+        std::fs::write(&first, "").expect("first log");
+        std::fs::write(&second, "").expect("second log");
+        let service = LogService::new(release_lock(), root.path().to_path_buf());
+
+        let initial = service
+            .query(LogQueryRequest::default())
+            .await
+            .expect("initial cursor");
+        std::fs::write(
+            &first,
+            "{\"timestamp\":\"2026-08-03T00:00:00Z\",\"message\":\"first\"}\n",
+        )
+        .expect("append first");
+        std::fs::write(&second, vec![b'x'; MAX_LINE_BYTES + 1]).expect("oversized second");
+        let request = LogQueryRequest {
+            cursor: Some(initial.cursor.clone()),
+            ..Default::default()
+        };
+        let failed = service
+            .query(request.clone())
+            .await
+            .expect("source error response");
+        assert!(failed.logs.is_empty());
+        assert_eq!(failed.source_errors.len(), 1);
+        assert_eq!(failed.cursor, initial.cursor);
+
+        std::fs::write(
+            &second,
+            "{\"timestamp\":\"2026-08-03T00:00:01Z\",\"message\":\"second\"}\n",
+        )
+        .expect("repair second");
+        let recovered = service.query(request).await.expect("recovered source");
+        assert_eq!(recovered.logs.len(), 2);
+        assert_eq!(recovered.logs[0].message, "first");
+        assert_eq!(recovered.logs[1].message, "second");
+    }
+
+    #[tokio::test]
+    async fn cursor_from_previous_boot_is_reported_as_reset() {
+        let root = tempfile::tempdir().expect("log root");
+        std::fs::create_dir_all(root.path().join("api")).expect("service log directory");
+        std::fs::write(root.path().join("api/application.log"), "").expect("log file");
+        let first = LogService::new(release_lock(), root.path().to_path_buf());
+        let cursor = first
+            .query(LogQueryRequest::default())
+            .await
+            .expect("first query")
+            .cursor;
+        let second = LogService::new(release_lock(), root.path().to_path_buf());
+        let response = second
+            .query(LogQueryRequest {
+                cursor: Some(cursor),
+                ..Default::default()
+            })
+            .await
+            .expect("second query");
+        assert!(response.cursor_reset);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn service_log_directory_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("log root");
+        let outside = tempfile::tempdir().expect("outside directory");
+        std::fs::write(outside.path().join("application.log"), "secret\n").expect("outside log");
+        symlink(outside.path(), root.path().join("api")).expect("service directory symlink");
+        let service = LogService::new(release_lock(), root.path().to_path_buf());
+
+        let response = service
+            .query(LogQueryRequest::default())
+            .await
+            .expect("query isolates source errors");
+        assert!(response.logs.is_empty());
+        assert_eq!(response.source_errors.len(), 1);
+        assert!(
+            response.source_errors[0]
+                .message
+                .contains("must be a real directory")
+        );
     }
 }

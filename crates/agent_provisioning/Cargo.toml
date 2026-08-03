@@ -18,6 +18,7 @@ tokio-util = { workspace = true }
 
 # 并发集合
 dashmap = { workspace = true }
+fs2 = "0.4"
 
 # 序列化
 serde = { workspace = true, features = ["derive"] }

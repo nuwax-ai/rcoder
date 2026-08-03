@@ -89,7 +89,7 @@ pub async fn upload_file(
 /// 从 URL 下载文件请求
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UploadFromUrlRequest {
-    /// 下载 URL（http/https；SSRF 防护：默认拒私网/保留地址）
+    /// 下载 URL（HTTP/HTTPS；允许内网 IP、localhost、集群域名和普通公网域名）
     pub url: String,
     /// 目标路径（app 根相对；单文件=文件路径，压缩包=解压目录如 "code/"；默认 "code/"）
     pub target: Option<String>,
@@ -105,7 +105,7 @@ pub struct UploadFromUrlRequest {
     request_body = UploadFromUrlRequest,
     responses(
         (status = 200, description = "下载并上传成功", body = HttpResult<UploadResult>),
-        (status = 400, description = "URL 非法 / SSRF 拒绝", body = HttpResult<String>)
+        (status = 400, description = "URL 非法或不是 HTTP(S)", body = HttpResult<String>)
     ),
     tag = "应用管理"
 )]

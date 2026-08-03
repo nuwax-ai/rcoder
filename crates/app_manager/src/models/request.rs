@@ -143,17 +143,6 @@ pub struct RecyclePolicyRequest {
     pub idle_timeout_seconds: Option<u64>,
 }
 
-/// 日志查询参数
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct LogParams {
-    /// 返回最后 N 行
-    pub tail: Option<u32>,
-    /// 是否显示时间戳
-    pub timestamps: Option<bool>,
-    /// 起始时间（暂未透传到 runtime；实时流走 `GET /apps/{id}/logs/stream` WebSocket）
-    pub since: Option<String>,
-}
-
 /// 删除应用请求
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct DeleteAppRequest {

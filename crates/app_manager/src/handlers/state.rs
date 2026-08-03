@@ -8,4 +8,5 @@ use crate::AppServiceTrait;
 #[derive(Clone)]
 pub struct AppManagerState {
     pub app_service: Arc<dyn AppServiceTrait>,
+    pub http_client: reqwest::Client,
 }

@@ -3,6 +3,8 @@
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -139,7 +141,12 @@ async fn query_sources(
     State(state): State<AppState>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Json<Vec<LogSourceInfo>>, (StatusCode, Json<Value>)> {
-    state.logs.sources(&request).map(Json).map_err(bad_request)
+    state
+        .logs
+        .sources(request)
+        .await
+        .map(Json)
+        .map_err(bad_request)
 }
 
 #[utoipa::path(
@@ -156,7 +163,14 @@ async fn query_logs(
     State(state): State<AppState>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Json<LogQueryResponse>, (StatusCode, Json<Value>)> {
-    state.logs.query(&request).map(Json).map_err(bad_request)
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+    state
+        .logs
+        .query_with_cancel(request, cancelled)
+        .await
+        .map(Json)
+        .map_err(bad_request)
 }
 
 #[utoipa::path(
@@ -173,8 +187,14 @@ async fn stream_logs(
     State(state): State<AppState>,
     Json(mut request): Json<LogQueryRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
-    state.logs.sources(&request).map_err(bad_request)?;
+    state
+        .logs
+        .sources(request.clone())
+        .await
+        .map_err(bad_request)?;
     let stream = async_stream::stream! {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
         let mut first = true;
         let mut last_checkpoint: Option<String> = None;
         let mut failed_sources: BTreeSet<(String, String)> = BTreeSet::new();
@@ -182,8 +202,13 @@ async fn stream_logs(
             if !first {
                 request.tail = None;
             }
-            match state.logs.query(&request) {
+            match state.logs.query_with_cancel(request.clone(), cancelled.clone()).await {
                 Ok(response) => {
+                    if response.cursor_reset {
+                        yield Ok(Event::default()
+                            .event("cursor_reset")
+                            .data(json!({"message": "cursor belongs to a previous app-cli boot"}).to_string()));
+                    }
                     for record in response.logs {
                         if let Ok(data) = serde_json::to_string(&record) {
                             yield Ok(Event::default().event("log").data(data));
@@ -232,6 +257,14 @@ async fn stream_logs(
             .interval(Duration::from_secs(15))
             .event(Event::default().event("heartbeat").data("{}")),
     ))
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 fn bad_request(error: anyhow::Error) -> (StatusCode, Json<Value>) {

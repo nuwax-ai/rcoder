@@ -9,8 +9,8 @@
 //! - HTTP 客户端按各自的消费游标从 ring 增量补齐，并跳过 broadcast 中 `seq <= 已收最大值`
 //!   的重叠消息（补齐与订阅之间的窗口去重）。
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -44,7 +44,7 @@ type SharedEvent = Arc<ProgressEvent>;
 pub struct SessionStreamRegistry {
     streams: DashMap<String, Arc<SharedStream>>,
     /// per-session 创建锁：序列化 `get_or_create` 的慢速路径，避免并发创建多个 SharedStream。
-    /// 必要性：agent_runner 的 `current_sender` 是单连接模型（`create_new_connection` cancel 旧 token），
+    /// 必要性：agent_runner 的 `current_connection` 是单连接模型（`create_new_connection` cancel 旧 token），
     /// 若并发创建 N 个 SharedStream，它们各自建立的 agent_runner SubscribeProgress 流会互相 cancel 抖动，
     /// 导致 registry 持有的流被反复 cancel、客户端收不到稳定事件。
     create_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
@@ -125,6 +125,17 @@ impl SessionStreamRegistry {
         self.streams.len()
     }
 
+    fn remove_unused_create_lock(&self, session_id: &str) {
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            self.create_locks.entry(session_id.to_string())
+            && Arc::strong_count(entry.get()) == 1
+        {
+            // entry guard prevents a concurrent get_or_create from cloning this Arc between the
+            // strong-count check and removal. Any current/waiting creator contributes another Arc.
+            entry.remove();
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.streams.is_empty()
     }
@@ -139,7 +150,7 @@ impl Default for SessionStreamRegistry {
 /// 一个 session 的共享流：一条 agent_runner `SubscribeProgress` 后台 task + `broadcast` fan-out + 历史 ring。
 pub struct SharedStream {
     session_id: String,
-    grpc_addr: Mutex<String>,
+    grpc_addr: String,
     broadcast_tx: broadcast::Sender<SharedEvent>,
     ring: Mutex<HeapRb<(u64, SharedEvent)>>,
     ref_count: AtomicUsize,
@@ -147,7 +158,7 @@ pub struct SharedStream {
     last_activity_secs: AtomicI64,
     activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
     cancel_token: CancellationToken,
-    task_handle: Mutex<Option<JoinHandle<()>>>,
+    task_handle: OnceLock<JoinHandle<()>>,
 }
 
 impl SharedStream {
@@ -161,7 +172,7 @@ impl SharedStream {
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let shared = Arc::new(Self {
             session_id: session_id.clone(),
-            grpc_addr: Mutex::new(grpc_addr.clone()),
+            grpc_addr: grpc_addr.clone(),
             broadcast_tx,
             ring: Mutex::new(HeapRb::<(u64, SharedEvent)>::new(RING_CAPACITY)),
             ref_count: AtomicUsize::new(0),
@@ -169,7 +180,7 @@ impl SharedStream {
             last_activity_secs: AtomicI64::new(0),
             activity_updater: Arc::clone(&activity_updater),
             cancel_token: CancellationToken::new(),
-            task_handle: Mutex::new(None),
+            task_handle: OnceLock::new(),
         });
 
         let handle = spawn_backend_task(
@@ -179,12 +190,15 @@ impl SharedStream {
             locale,
             activity_updater,
         );
-        *shared.task_handle.lock() = Some(handle);
+        if let Err(handle) = shared.task_handle.set(handle) {
+            handle.abort();
+            warn!(session_id = %shared.session_id, "backend task handle was initialized twice");
+        }
         shared
     }
 
     fn matches_addr(&self, grpc_addr: &str) -> bool {
-        self.grpc_addr.lock().as_str() == grpc_addr
+        self.grpc_addr == grpc_addr
     }
 
     /// 后台 task 仍存活（未 cancel 且 JoinHandle 未结束）
@@ -192,7 +206,7 @@ impl SharedStream {
         if self.cancel_token.is_cancelled() {
             return false;
         }
-        match self.task_handle.lock().as_ref() {
+        match self.task_handle.get() {
             Some(h) => !h.is_finished(),
             None => false,
         }
@@ -312,8 +326,9 @@ impl Drop for ClientGuard {
                     .remove_if(&session_id, |_, v| Arc::ptr_eq(v, &shared))
                 {
                     removed.shutdown();
-                    // 一并清理 create_locks 条目，避免 per-session Mutex 随历史 session 无限累积（内存泄漏）。
-                    registry.create_locks.remove(&session_id);
+                    // 仅在没有创建者持有/等待这把锁时移除，避免同一 session 短暂出现两把锁，
+                    // 破坏 get_or_create 的 single-flight 保证。
+                    registry.remove_unused_create_lock(&session_id);
                     info!(
                         "[SessionStream] idle cleanup after {}s: session_id={}",
                         IDLE_CLEANUP_SECS, session_id
@@ -608,6 +623,23 @@ mod tests {
     fn registry_default_is_empty() {
         let r = SessionStreamRegistry::default();
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn create_lock_is_removed_only_without_active_holders() {
+        let registry = SessionStreamRegistry::default();
+        let held = registry
+            .create_locks
+            .entry("session-a".to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+
+        registry.remove_unused_create_lock("session-a");
+        assert!(registry.create_locks.contains_key("session-a"));
+
+        drop(held);
+        registry.remove_unused_create_lock("session-a");
+        assert!(!registry.create_locks.contains_key("session-a"));
     }
 
     fn arc_event(seq: u64, sub: &str) -> Arc<ProgressEvent> {

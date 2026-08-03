@@ -126,6 +126,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "download_utils",
+ "fs2",
  "serde",
  "serde_json",
  "shared_types",

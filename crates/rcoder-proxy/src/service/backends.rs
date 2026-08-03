@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use pingora_load_balancing::{LoadBalancer, health_check, selection::RoundRobin};
 use shared_types::ModelProviderConfig;
@@ -22,8 +23,7 @@ use super::{HealthInfo, HealthState, PingoraProxyService};
 impl PingoraProxyService {
     /// 获取后端数量
     pub async fn backend_count(&self) -> usize {
-        let backends = self.backends.read().await;
-        backends.len()
+        self.backends.load().len()
     }
 
     /// 从请求中提取目标端口（兼容接口）
@@ -61,7 +61,7 @@ impl PingoraProxyService {
 
     /// 获取目标后端地址
     pub async fn get_target_backend(&self, port: u16) -> crate::ProxyResult<String> {
-        let backends = self.backends.read().await;
+        let backends = self.backends.load();
         backends.get(&port).cloned().ok_or_else(|| {
             crate::ProxyError::Backend(format!("backend service not found for port {}", port))
         })
@@ -69,15 +69,23 @@ impl PingoraProxyService {
 
     /// 添加后端服务
     pub async fn add_backend(&self, port: u16, host: String) {
-        let mut backends = self.backends.write().await;
-        backends.insert(port, host.clone());
+        self.backends.rcu(|backends| {
+            let mut updated = HashMap::clone(backends);
+            updated.insert(port, host.clone());
+            updated
+        });
         info!(" proxy route: {} -> {}", port, host);
     }
 
     /// 移除后端服务
     pub async fn remove_backend(&self, port: u16) {
-        let mut backends = self.backends.write().await;
-        if backends.remove(&port).is_some() {
+        let existed = self.backends.load().contains_key(&port);
+        if existed {
+            self.backends.rcu(|backends| {
+                let mut updated = HashMap::clone(backends);
+                updated.remove(&port);
+                updated
+            });
             info!("removed route: {}", port);
         }
     }
@@ -104,14 +112,12 @@ impl PingoraProxyService {
 
     /// 列出所有后端服务
     pub async fn list_backends(&self) -> HashMap<u16, String> {
-        let backends = self.backends.read().await;
-        backends.clone()
+        HashMap::clone(&self.backends.load())
     }
 
     /// 检查后端服务是否存在
     pub async fn has_backend(&self, port: u16) -> bool {
-        let backends = self.backends.read().await;
-        backends.contains_key(&port)
+        self.backends.load().contains_key(&port)
     }
 
     /// 创建负载均衡器
@@ -135,7 +141,7 @@ impl PingoraProxyService {
     }
 
     /// 获取后端映射的 Arc 引用
-    pub fn backends(&self) -> Arc<tokio::sync::RwLock<HashMap<u16, String>>> {
+    pub fn backends(&self) -> Arc<ArcSwap<HashMap<u16, String>>> {
         self.backends.clone()
     }
 
@@ -161,14 +167,11 @@ impl PingoraProxyService {
     /// - 批量更新 health_map（只获取一次锁）
     pub async fn update_health_once(&self, timeout_ms: u64) {
         // 1. 快速克隆 backends 并释放锁（避免持有锁期间 await）
-        let backends_snapshot = {
-            let backends = self.backends.read().await;
-            backends.clone()
-        }; // 锁在此处释放
+        let backends_snapshot = self.backends.load_full();
 
         // 2. 不持有任何锁进行网络 I/O
         let mut results = HashMap::new();
-        for (port, host) in &backends_snapshot {
+        for (port, host) in backends_snapshot.iter() {
             let addr = format!("{}:{}", host, port);
             let state =
                 match timeout(Duration::from_millis(timeout_ms), TcpStream::connect(&addr)).await {
@@ -186,16 +189,12 @@ impl PingoraProxyService {
         }
 
         // 3. 批量更新 health_map（只获取一次写锁）
-        let mut health_map = self.health_map.write().await;
-        for (port, info) in results {
-            health_map.insert(port, info);
-        }
+        self.health_map.store(Arc::new(results));
     }
 
     /// 获取所有后端的健康状态快照
     pub async fn get_health_snapshot(&self) -> HashMap<u16, HealthInfo> {
-        let health_map = self.health_map.read().await;
-        health_map.clone()
+        HashMap::clone(&self.health_map.load())
     }
 
     /// 启动健康检查循环

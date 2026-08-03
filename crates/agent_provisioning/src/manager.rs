@@ -120,8 +120,25 @@ impl AgentDownloadManager {
     /// 检查缓存是否存在
     pub fn is_cached(&self, agent_id: &str, version: &str) -> bool {
         self.version_dir(agent_id, version)
-            .map(|p| p.exists())
-            .unwrap_or(false)
+            .ok()
+            .and_then(|path| std::fs::read_dir(path).ok())
+            .is_some_and(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            })
+    }
+
+    /// 异步检查缓存，供请求处理路径使用，避免网络文件系统上的目录读取阻塞 Tokio worker。
+    pub async fn is_cached_async(&self, agent_id: &str, version: &str) -> bool {
+        let Ok(version_dir) = self.version_dir(agent_id, version) else {
+            return false;
+        };
+        self.get_cached_file_size_async(&version_dir)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// 获取版本缓存目录路径（版本归一化）
@@ -169,51 +186,85 @@ impl AgentDownloadManager {
         validate_download_identifier(agent_id, "agent_id")?;
         validate_download_identifier(version, "version")?;
 
-        // 获取锁（同一版本只有一个下载任务）
+        let key = Self::lock_key(agent_id, version)?;
         let lock = self.get_download_lock(agent_id, version)?;
-        let _guard = lock.lock().await;
+        let result = {
+            let _guard = lock.lock().await;
+            self.download_to_cache_locked(agent_id, version, url).await
+        };
+        self.remove_unused_download_lock(&key, &lock);
+        result
+    }
 
-        // 双重检查：可能其他请求已经下载完成
-        if self.is_cached(agent_id, version) {
+    async fn download_to_cache_locked(
+        &self,
+        agent_id: &str,
+        version: &str,
+        url: &str,
+    ) -> Result<DownloadResult, AgentDownloadError> {
+        let version_dir = self.version_dir(agent_id, version)?;
+        // 双重检查：可能其他请求已经下载完成。异步扫描避免网络盘较慢时阻塞 runtime。
+        if let Some(file_size) = self.get_cached_file_size_async(&version_dir).await? {
             info!(
                 agent_id = %agent_id,
                 version = %version,
                 "Agent already cached, skipping download"
             );
-            let version_dir = self.version_dir(agent_id, version)?;
-            // 获取已缓存文件的大小
-            let file_size = self.get_cached_file_size(&version_dir).unwrap_or(0);
             return Ok(DownloadResult {
                 cache_path: version_dir,
                 file_size,
             });
         }
 
-        // 确保缓存目录存在
-        tokio::fs::create_dir_all(&self.cache_dir).await?;
-
-        // 执行下载到临时文件
-        let version_dir = self.version_dir(agent_id, version)?;
-        let temp_file = self
-            .cache_dir
-            .join(format!(".download-{}-{}", agent_id, version));
+        let parent = version_dir.parent().ok_or_else(|| {
+            AgentDownloadError::InvalidManifest(format!(
+                "cache version path has no parent: {}",
+                version_dir.display()
+            ))
+        })?;
+        tokio::fs::create_dir_all(parent).await?;
+        let normalized_version = version_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| {
+                AgentDownloadError::InvalidManifest(format!(
+                    "cache version path has no valid filename: {}",
+                    version_dir.display()
+                ))
+            })?;
+        let staging = parent.join(format!(".{normalized_version}.download"));
+        if let Err(error) = tokio::fs::remove_dir_all(&staging).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.into());
+        }
+        tokio::fs::create_dir(&staging).await?;
+        let temp_file = staging.join("payload.part");
 
         // 下载文件到临时文件（使用 download_utils）
         let cancel_token = CancellationToken::new();
-        let file_size = self
+        let download_result = self
             .downloader
             .download_to_file(url, &temp_file, None, &cancel_token)
-            .await
-            .map_err(AgentDownloadError::Download)?;
-
-        // 创建版本目录并移动文件
-        tokio::fs::create_dir_all(&version_dir).await?;
-        // 从 URL 获取真实文件名（优先从 Content-Disposition，其次从 URL 路径）
+            .await;
+        let file_size = match download_result {
+            Ok(size) => size,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                return Err(AgentDownloadError::Download(error));
+            }
+        };
         let raw_filename = download_utils::get_filename_from_url(url)
             .await
             .unwrap_or_else(|_| "package.tar.gz".to_string());
-        let dest_path = version_dir.join(&raw_filename);
-        tokio::fs::rename(&temp_file, &dest_path).await?;
+        tokio::fs::rename(&temp_file, staging.join(raw_filename)).await?;
+        if let Err(error) = tokio::fs::remove_dir_all(&version_dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            return Err(error.into());
+        }
+        tokio::fs::rename(&staging, &version_dir).await?;
 
         info!(
             agent_id = %agent_id,
@@ -229,16 +280,31 @@ impl AgentDownloadManager {
         })
     }
 
-    /// 获取缓存目录中第一个文件的大小
-    fn get_cached_file_size(&self, version_dir: &Path) -> Option<u64> {
-        let entries = std::fs::read_dir(version_dir).ok()?;
-        for entry in entries {
-            let entry = entry.ok()?;
-            if entry.file_type().ok()?.is_file() {
-                return entry.metadata().ok().map(|m| m.len());
+    fn remove_unused_download_lock(&self, key: &str, lock: &Arc<Mutex<()>>) {
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            self.download_locks.entry(key.into())
+            && Arc::ptr_eq(entry.get(), lock)
+            && Arc::strong_count(entry.get()) == 2
+        {
+            entry.remove();
+        }
+    }
+
+    async fn get_cached_file_size_async(
+        &self,
+        version_dir: &Path,
+    ) -> Result<Option<u64>, AgentDownloadError> {
+        let mut entries = match tokio::fs::read_dir(version_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                return Ok(Some(entry.metadata().await?.len()));
             }
         }
-        None
+        Ok(None)
     }
 
     /// 判断目录是否存在且非空
@@ -274,7 +340,7 @@ impl AgentDownloadManager {
         );
 
         // 检查源目录
-        if !source.exists() {
+        if !tokio::fs::try_exists(&source).await? {
             return Err(AgentDownloadError::NotFound(format!(
                 "{}@{} not in cache",
                 agent_id, version
@@ -283,7 +349,8 @@ impl AgentDownloadManager {
 
         // 目标已存在且非空 → 已安装，跳过复制
         // （避免重复解压；更重要的是避免删除"正被 agent 进程读取"的 bundle，引发并发竞态）
-        if target.exists() && Self::is_non_empty_dir(&target).await {
+        let target_exists = tokio::fs::try_exists(&target).await?;
+        if target_exists && Self::is_non_empty_dir(&target).await {
             info!(
                 agent_id = %agent_id,
                 version = %version,
@@ -294,7 +361,7 @@ impl AgentDownloadManager {
         }
 
         // 目标存在但为空 / 不完整 → 删除后重新解压（确保干净复制）
-        if target.exists() {
+        if target_exists {
             tokio::fs::remove_dir_all(&target).await?;
         }
 
@@ -393,7 +460,7 @@ impl AgentDownloadManager {
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if !path.is_file() {
+            if !entry.file_type().await?.is_file() {
                 continue;
             }
 
@@ -485,8 +552,19 @@ mod tests {
         // 创建缓存目录
         let version_dir = manager.version_dir("codex-acp", "1.0.0").unwrap();
         std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("agent.tar.gz"), b"archive").unwrap();
 
         assert!(manager.is_cached("codex-acp", "1.0.0"));
+    }
+
+    #[test]
+    fn test_empty_cache_directory_is_not_complete() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let manager = AgentDownloadManager::new(tmp_dir.path()).unwrap();
+        let version_dir = manager.version_dir("codex-acp", "1.0.0").unwrap();
+        std::fs::create_dir_all(version_dir).unwrap();
+
+        assert!(!manager.is_cached("codex-acp", "1.0.0"));
     }
 
     #[test]

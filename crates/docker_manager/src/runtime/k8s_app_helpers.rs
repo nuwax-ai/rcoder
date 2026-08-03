@@ -18,6 +18,7 @@ pub(crate) const PORT_EXPOSE_ANNOTATION: &str = "rcoder.io/port-expose";
 pub(crate) const RECYCLE_ENABLED_ANNOTATION: &str = "rcoder.io/recycle-enabled";
 /// 闲置回收阈值秒数注解（per-app 覆盖全局）
 pub(crate) const IDLE_TIMEOUT_ANNOTATION: &str = "rcoder.io/idle-timeout-seconds";
+pub(crate) const WAKE_ON_TRAFFIC_ANNOTATION: &str = "rcoder.io/wake-on-traffic";
 
 /// ports → annotation（`rcoder.io/port-expose: "80:http,5432:tcp"`）；无端口返 None。
 #[cfg(feature = "kubernetes")]

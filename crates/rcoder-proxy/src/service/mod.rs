@@ -25,7 +25,6 @@ use dashmap::DashMap;
 use matchit::Router;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 // 导入 shared_types 以使用 ModelProviderConfig
 use shared_types::ModelProviderConfig;
@@ -40,13 +39,13 @@ pub use utils::*;
 /// 基于 Pingora 的端口反向代理服务
 pub struct PingoraProxyService {
     config: ProxyConfig,
-    backends: Arc<RwLock<HashMap<u16, String>>>,
+    backends: Arc<ArcSwap<HashMap<u16, String>>>,
     /// 负载均衡算法选择
     pub use_round_robin: bool,
     /// 指标
     pub metrics: Arc<ProxyMetrics>,
     /// 后端健康状态缓存
-    pub health_map: Arc<RwLock<HashMap<u16, HealthInfo>>>,
+    pub health_map: Arc<ArcSwap<HashMap<u16, HealthInfo>>>,
     /// VNC 后端映射: user_id/pod_id -> container_ip
     /// 用于 /computer/vnc/{user_id}/{project_id} 路由
     pub vnc_backends: Arc<DashMap<String, String>>,
@@ -74,7 +73,7 @@ pub type PortProxyService = PingoraProxyService;
 
 /// Pingora 代理实现
 pub struct PortProxy {
-    backends: Arc<RwLock<HashMap<u16, String>>>,
+    backends: Arc<ArcSwap<HashMap<u16, String>>>,
     #[allow(dead_code)]
     default_backend_port: u16,
     backend_host: String,
@@ -111,10 +110,10 @@ impl PingoraProxyService {
 
         Self {
             config,
-            backends: Arc::new(RwLock::new(backends)),
+            backends: Arc::new(ArcSwap::from_pointee(backends)),
             use_round_robin: true, // 默认使用轮询算法
             metrics: Arc::new(ProxyMetrics::default()),
-            health_map: Arc::new(RwLock::new(HashMap::new())),
+            health_map: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             vnc_backends: Arc::new(DashMap::new()),
             project_backends: Arc::new(DashMap::new()),
             app_backends: Arc::new(DashMap::new()),
@@ -273,5 +272,31 @@ mod tests {
         let service = PingoraProxyService::new(config);
 
         assert_eq!(service.backend_count().await, 1); // 默认后端
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_backend_updates_do_not_lose_routes() {
+        let service = PingoraProxyService::new(ProxyConfig::default());
+        let mut tasks = Vec::new();
+        for index in 0..32_u16 {
+            let service = service.clone();
+            tasks.push(tokio::spawn(async move {
+                service
+                    .add_backend(10_000 + index, format!("backend-{index}"))
+                    .await;
+            }));
+        }
+        for task in tasks {
+            task.await.expect("backend update task");
+        }
+
+        let snapshot = service.list_backends().await;
+        assert_eq!(snapshot.len(), 33, "default backend plus all RCU updates");
+        for index in 0..32_u16 {
+            assert_eq!(
+                snapshot.get(&(10_000 + index)),
+                Some(&format!("backend-{index}"))
+            );
+        }
     }
 }

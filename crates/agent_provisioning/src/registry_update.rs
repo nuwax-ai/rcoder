@@ -3,8 +3,10 @@
 //! 更新安装目录下的 registry.json 文件。
 //! 使用与 agent_runner 兼容的 JSON 格式。
 
+use std::fs::OpenOptions;
 use std::path::Path;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -37,10 +39,8 @@ pub struct AgentManifest {
 ///
 /// # 并发安全
 ///
-/// 使用原子写入（tmp + rename）保证文件完整性。
-/// 在单实例部署场景下是安全的。
-/// 多实例并发写入时，后写入的会覆盖先写入的（可能丢失更新），
-/// 但不会导致文件损坏。如需多实例完全安全，应引入文件锁。
+/// 使用文件锁串行化 read-modify-write，再通过 tmp + rename 原子替换。
+/// 同一共享目录被多个进程更新时也不会丢失已经写入的条目。
 pub async fn update_registry(
     acp_agent_dir: &Path,
     agent_id: &str,
@@ -68,6 +68,15 @@ fn update_registry_sync(
     command: &str,
     args: &[String],
 ) -> Result<(), AgentDownloadError> {
+    let lock_path = acp_agent_dir.join(".registry.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    FileExt::lock_exclusive(&lock_file)?;
+
     let registry_path = acp_agent_dir.join("registry.json");
 
     // 读取现有 registry（Vec<AgentManifest> 格式）
@@ -167,6 +176,25 @@ mod tests {
         assert_eq!(manifests.len(), 1);
         assert_eq!(manifests[0].agent_id, "test-agent");
         assert_eq!(manifests[0].version, Some("1.0.0".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_updates_do_not_lose_entries() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let directory = tmp_dir.path().to_path_buf();
+            tasks.push(tokio::spawn(async move {
+                update_registry(&directory, &format!("agent-{index}"), "1.0.0", "agent", &[]).await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        let data = std::fs::read_to_string(tmp_dir.path().join("registry.json")).unwrap();
+        let manifests: Vec<AgentManifest> = serde_json::from_str(&data).unwrap();
+        assert_eq!(manifests.len(), 16);
     }
 
     #[tokio::test]

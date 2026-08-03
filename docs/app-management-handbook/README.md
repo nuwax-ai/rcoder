@@ -65,9 +65,9 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
            POST   /api/v1/apps/{app_id}/stop         停止（scale=0）
            POST   /api/v1/apps/{app_id}/restart      重启（rollout）
 
-查询       GET    /api/v1/apps/{app_id}/logs         日志快照
-           GET    /api/v1/apps/{app_id}/logs/file    文件日志
-           GET    /api/v1/apps/{app_id}/logs/stream  日志 WebSocket 流
+日志       POST   /api/v1/apps/{app_id}/logs/sources/query  查询声明的日志源
+           POST   /api/v1/apps/{app_id}/logs/query          多服务文件日志快照
+           POST   /api/v1/apps/{app_id}/logs/stream         SSE 实时流
            GET    /api/v1/apps/{app_id}/health       健康状态
            GET    /api/v1/apps/{app_id}/stats        资源使用（best-effort）
            GET    /api/v1/apps/{app_id}/events       应用事件

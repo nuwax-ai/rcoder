@@ -155,7 +155,7 @@ pub async fn handle_audio_upstream(
 
     // 记录指标
     metrics.record_request();
-    metrics.record_request_port(target_port).await;
+    metrics.record_request_port(target_port);
     metrics.inc_active();
 
     // 保存音频目标 IP 到上下文（用于响应过滤）

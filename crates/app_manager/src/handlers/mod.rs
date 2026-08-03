@@ -4,11 +4,10 @@
 //! - [`state`]：处理器共享状态 [`AppManagerState`]
 //! - [`lifecycle`]：create / query / get / update / delete
 //! - [`ops`]：start / stop / restart
-//! - [`query`]：logs / health / stats / events / file-logs
+//! - [`query`]：health / stats / events
 //! - [`files`]：upload / list / delete
 //! - [`storage`]：get / clear / destroy / query（v2 §5.4）
 //! - [`db`]：reset-password / create-database
-//! - [`logs_stream`]：日志 WebSocket 流（v2 §11）
 
 pub mod db;
 pub mod files;
