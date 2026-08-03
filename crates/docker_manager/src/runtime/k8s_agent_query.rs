@@ -25,11 +25,13 @@ impl KubernetesRuntime {
         identifier: &str,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         // Try cache first
-        if let Some(cached) = self.pod_cache.read().await.get(identifier)
+        // .cloned() 让 cached 成为 owned,读守卫在条件求值结束即释放 —— 否则守卫跨下面
+        // build_container_basic_info().await 持续占读锁,卡住写者(stop/cleanup)。
+        if let Some(cached) = self.pod_cache.read().await.get(identifier).cloned()
             && cached.status == ContainerRuntimeStatus::Running
         {
             return Ok(Some(
-                self.build_container_basic_info(identifier, cached).await?,
+                self.build_container_basic_info(identifier, &cached).await?,
             ));
         }
 

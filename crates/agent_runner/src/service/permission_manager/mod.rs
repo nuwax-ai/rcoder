@@ -101,103 +101,114 @@ impl PermissionManager {
             session_id, tool_call_id, input.cancelled, input.option_id
         );
 
-        let Some(pending) = self.pending.lock().remove(&key) else {
-            warn!(
-                "[Permission] Permission request not found: session_id={}, tool_call_id={}",
-                session_id, tool_call_id
-            );
-            return ResolvePermissionResponseDto {
-                success: false,
-                session_id,
-                tool_call_id,
-                outcome_json: None,
-                rule_saved: false,
-                error_code: Some(shared_types::error_codes::ERR_PERMISSION_NOT_FOUND.to_string()),
-                message: Some("permission request not found or already resolved".to_string()),
+        // 持 pending 锁一次性完成 remove + 全部同步校验 + 失败原地放回;成功则取出
+        // (pending, response) 释放锁后再 consume。消除原来 remove 与 4 处 re-insert 之间的
+        // 窗口里并发 store_pending 被覆盖、孤儿 Responder 的丢更新。
+        let (pending, response) = {
+            let mut guard = self.pending.lock();
+            let Some(pending) = guard.remove(&key) else {
+                warn!(
+                    "[Permission] Permission request not found: session_id={}, tool_call_id={}",
+                    session_id, tool_call_id
+                );
+                return ResolvePermissionResponseDto {
+                    success: false,
+                    session_id,
+                    tool_call_id,
+                    outcome_json: None,
+                    rule_saved: false,
+                    error_code: Some(
+                        shared_types::error_codes::ERR_PERMISSION_NOT_FOUND.to_string(),
+                    ),
+                    message: Some("permission request not found or already resolved".to_string()),
+                };
             };
-        };
 
-        if let Some(project_id) = input.project_id.as_deref().filter(|s| !s.trim().is_empty())
-            && project_id != pending.context.project_id
-        {
-            self.pending.lock().insert(key, pending);
-            return ResolvePermissionResponseDto {
-                success: false,
-                session_id,
-                tool_call_id,
-                outcome_json: None,
-                rule_saved: false,
-                error_code: Some(
-                    shared_types::error_codes::ERR_PERMISSION_RESOLVE_FAILED.to_string(),
-                ),
-                message: Some("project_id does not match pending permission".to_string()),
-            };
-        }
+            if let Some(project_id) = input.project_id.as_deref().filter(|s| !s.trim().is_empty())
+                && project_id != pending.context.project_id
+            {
+                guard.insert(key, pending);
+                return ResolvePermissionResponseDto {
+                    success: false,
+                    session_id,
+                    tool_call_id,
+                    outcome_json: None,
+                    rule_saved: false,
+                    error_code: Some(
+                        shared_types::error_codes::ERR_PERMISSION_RESOLVE_FAILED.to_string(),
+                    ),
+                    message: Some("project_id does not match pending permission".to_string()),
+                };
+            }
 
-        if let Some(user_id) = input.user_id.as_deref().filter(|s| !s.trim().is_empty())
-            && pending.context.user_id.as_deref() != Some(user_id)
-        {
-            self.pending.lock().insert(key, pending);
-            return ResolvePermissionResponseDto {
-                success: false,
-                session_id,
-                tool_call_id,
-                outcome_json: None,
-                rule_saved: false,
-                error_code: Some(
-                    shared_types::error_codes::ERR_PERMISSION_RESOLVE_FAILED.to_string(),
-                ),
-                message: Some("user_id does not match pending permission".to_string()),
-            };
-        }
+            if let Some(user_id) = input.user_id.as_deref().filter(|s| !s.trim().is_empty())
+                && pending.context.user_id.as_deref() != Some(user_id)
+            {
+                guard.insert(key, pending);
+                return ResolvePermissionResponseDto {
+                    success: false,
+                    session_id,
+                    tool_call_id,
+                    outcome_json: None,
+                    rule_saved: false,
+                    error_code: Some(
+                        shared_types::error_codes::ERR_PERMISSION_RESOLVE_FAILED.to_string(),
+                    ),
+                    message: Some("user_id does not match pending permission".to_string()),
+                };
+            }
 
-        let response = if input.cancelled {
-            cancelled_response()
-        } else {
-            match input.option_id.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(option_id) => {
-                    let option_id = option_id.trim().to_string();
-                    if !pending
-                        .request
-                        .options
-                        .iter()
-                        .any(|option| option.option_id.to_string() == option_id)
-                    {
-                        self.pending.lock().insert(key, pending);
+            let response = if input.cancelled {
+                cancelled_response()
+            } else {
+                match input.option_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                    Some(option_id) => {
+                        let option_id = option_id.trim().to_string();
+                        if !pending
+                            .request
+                            .options
+                            .iter()
+                            .any(|option| option.option_id.to_string() == option_id)
+                        {
+                            guard.insert(key, pending);
+                            return ResolvePermissionResponseDto {
+                                success: false,
+                                session_id,
+                                tool_call_id,
+                                outcome_json: None,
+                                rule_saved: false,
+                                error_code: Some(
+                                    shared_types::error_codes::ERR_PERMISSION_RESOLVE_FAILED
+                                        .to_string(),
+                                ),
+                                message: Some(
+                                    "option_id is not available for this permission request"
+                                        .to_string(),
+                                ),
+                            };
+                        }
+
+                        RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                            SelectedPermissionOutcome::new(option_id),
+                        ))
+                    }
+                    None => {
+                        guard.insert(key, pending);
                         return ResolvePermissionResponseDto {
                             success: false,
                             session_id,
                             tool_call_id,
                             outcome_json: None,
                             rule_saved: false,
-                            error_code: Some(
-                                shared_types::error_codes::ERR_PERMISSION_RESOLVE_FAILED
-                                    .to_string(),
-                            ),
+                            error_code: Some(shared_types::error_codes::ERR_VALIDATION.to_string()),
                             message: Some(
-                                "option_id is not available for this permission request"
-                                    .to_string(),
+                                "option_id is required when cancelled is false".to_string(),
                             ),
                         };
                     }
-
-                    RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
-                        SelectedPermissionOutcome::new(option_id),
-                    ))
                 }
-                None => {
-                    self.pending.lock().insert(key, pending);
-                    return ResolvePermissionResponseDto {
-                        success: false,
-                        session_id,
-                        tool_call_id,
-                        outcome_json: None,
-                        rule_saved: false,
-                        error_code: Some(shared_types::error_codes::ERR_VALIDATION.to_string()),
-                        message: Some("option_id is required when cancelled is false".to_string()),
-                    };
-                }
-            }
+            };
+            (pending, response)
         };
 
         let selected_kind = match &response.outcome {

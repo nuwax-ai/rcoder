@@ -61,7 +61,10 @@ impl KubernetesRuntime {
         }
 
         // Check if pod already exists and is running
-        if let Some(cached) = self.pod_cache.read().await.get(identifier)
+        // .cloned() 让 cached 成为 owned,读守卫在条件求值结束即释放 —— 否则守卫会跨下面
+        // get_container_info_by_identifier_inner().await,而后者会再次进入同一把 RwLock;
+        // tokio RwLock 写优先,并发 ensure+stop 时会自死锁。
+        if let Some(cached) = self.pod_cache.read().await.get(identifier).cloned()
             && cached.status == ContainerRuntimeStatus::Running
         {
             info!("[K8S] Pod {} already exists and is running", pod_name);

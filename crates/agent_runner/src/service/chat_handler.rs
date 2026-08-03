@@ -314,22 +314,35 @@ pub async fn handle_chat_core(
 
     // ========== 步骤1: 查询现有 Agent 状态 ==========
     // 优先通过 session_id 查找，回退到 project_id 查找
-    let agent_info_ref = if let Some(ref sid) = session_id {
+    // 用 view 闭包访问 agent_info:闭包返回即释放读锁,无 Ref 暴露 —— 结构上杜绝守卫跨
+    // 下面 install_agent / get_agent_version 的 await(闭包是同步 FnOnce,无法在里面 await)。
+    let agent_busy = if let Some(ref sid) = session_id {
         info!(
             "[ChatHandler] Looking up Agent by session_id: session_id={}",
             sid
         );
-        AGENT_REGISTRY.get_agent_info_by_session(sid)
+        AGENT_REGISTRY.view_agent_info_by_session(sid, |info| {
+            (
+                info.status,
+                info.cancel_tx.clone(),
+                info.session_id.to_string(),
+            )
+        })
     } else {
         None
     };
-
-    let agent_info_ref = agent_info_ref.or_else(|| {
+    let agent_busy = agent_busy.or_else(|| {
         info!(
             "[ChatHandler] Looking up Agent by project_id: project_id={}",
             project_id
         );
-        AGENT_REGISTRY.get_agent_info(&project_id)
+        AGENT_REGISTRY.view_agent_info(&project_id, |info| {
+            (
+                info.status,
+                info.cancel_tx.clone(),
+                info.session_id.to_string(),
+            )
+        })
     });
 
     // ========== 步骤1.5: 检查 agent 二进制是否存在 + 版本检测 ==========
@@ -466,22 +479,19 @@ pub async fn handle_chat_core(
 
     // ========== 步骤2: 检查 Agent Busy 状态，如果忙则取消当前任务 ==========
     use crate::model::AgentStatus;
-    if let Some(agent_info) = agent_info_ref
-        && (agent_info.status == AgentStatus::Active || agent_info.status == AgentStatus::Pending)
+    if let Some((status, cancel_tx, agent_session_id)) = agent_busy
+        && (status == AgentStatus::Active || status == AgentStatus::Pending)
     {
         info!(
             "[ChatHandler] Agent Busy, cancelling current task: project_id={}, status={:?}, session_id={:?}",
-            project_id, agent_info.status, session_id
+            project_id, status, session_id
         );
 
-        // 获取 cancel_tx 和 session_id，并释放 DashMap 读锁（防死锁）
-        let cancel_tx = agent_info.cancel_tx.clone();
-        // 优先使用请求中的 session_id，如果为空则从 agent_info 中获取
+        // cancel_tx 已 owned(上面 clone 出来);actual_session_id 优先用请求里的,空则用 agent 的
         let actual_session_id = session_id
             .clone()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| agent_info.session_id.to_string());
-        drop(agent_info);
+            .unwrap_or(agent_session_id);
 
         // 取消当前任务
         if let Err(cancel_error) =

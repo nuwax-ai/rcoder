@@ -285,8 +285,9 @@ fn is_terminal_status(status: PublishTaskStatus) -> bool {
 }
 
 /// 临界逻辑(自由函数,吃 `&mut TaskState`、无 `&self`):终态检查 → #11 截断 → apply → seq → ring。
-/// 返回 `(seq, event, terminal)` 供调用方在【释放锁后】做 broadcast + terminal_at;任务已终态返回 None。
-/// 没有 `&self` → 类型上无法再去取 state 锁 → 根除"持锁时调 emit"的重入死锁。
+/// 返回 `(seq, event, terminal)`:event 供调用方在【持 state 锁期间】做 broadcast(必须在锁内,
+/// 与 subscribe 的"创建 receiver + 读 replay"串行,防同一事件既进 replay 又进 broadcast);
+/// 任务已终态返回 None。没有 `&self` → 类型上无法再去取 state 锁 → 根除"持锁时调 emit"的重入死锁。
 fn publish_mut(
     state: &mut TaskState,
     mut event: PublishEvent,
