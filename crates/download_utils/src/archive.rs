@@ -13,6 +13,14 @@ use tracing::{error, warn};
 
 /// Maximum extracted size (1GB)
 const MAX_EXTRACTED_SIZE: u64 = 1024 * 1024 * 1024;
+/// 最大 entry 数(文件/目录/符号链接总数;防零字节文件耗尽 inode/CPU)。
+const MAX_ENTRY_COUNT: usize = 100_000;
+/// 单个文件最大解压字节(防超大单文件单独突破总量限制前的资源占用)。
+const MAX_PER_FILE_SIZE: u64 = 512 * 1024 * 1024;
+/// 单个 entry 最大路径字节数(防超长路径)。
+const MAX_PATH_LEN: usize = 4096;
+/// 解压后文件权限掩码:剥离 setuid/setgid/sticky 等危险位。
+const SAFE_MODE_MASK: u32 = 0o1777;
 
 /// Archive extraction error
 #[derive(Debug)]
@@ -23,6 +31,12 @@ pub enum ArchiveError {
     PathTraversal(String),
     /// Archive bomb detected (too large)
     ArchiveBomb { size: u64, max: u64 },
+    /// Entry 数量超限(防 inode/CPU 耗尽)
+    TooManyEntries { count: usize, max: usize },
+    /// 单文件超限
+    EntryTooLarge { size: u64, max: u64 },
+    /// Entry 路径过长
+    PathTooLong { len: usize, max: usize },
     /// Invalid archive format
     InvalidArchive(String),
 }
@@ -38,6 +52,18 @@ impl std::fmt::Display for ArchiveError {
                     "Archive bomb: {} bytes exceeds limit of {} bytes",
                     size, max
                 )
+            }
+            ArchiveError::TooManyEntries { count, max } => {
+                write!(f, "Too many entries: {count} exceeds limit of {max}")
+            }
+            ArchiveError::EntryTooLarge { size, max } => {
+                write!(
+                    f,
+                    "Entry too large: {size} bytes exceeds limit of {max} bytes"
+                )
+            }
+            ArchiveError::PathTooLong { len, max } => {
+                write!(f, "Entry path too long: {len} bytes exceeds limit of {max}")
             }
             ArchiveError::InvalidArchive(msg) => write!(f, "Invalid archive: {}", msg),
         }
@@ -62,13 +88,27 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
 
     let mut total_uncompressed: u64 = 0;
     let mut file_count: usize = 0;
+    let mut entry_count: usize = 0;
     let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
+        entry_count += 1;
+        if entry_count > MAX_ENTRY_COUNT {
+            return Err(ArchiveError::TooManyEntries {
+                count: entry_count,
+                max: MAX_ENTRY_COUNT,
+            });
+        }
         let entry_path = entry.path()?.into_owned();
 
         let sanitized = sanitize_entry_path(&entry_path)?;
+        if sanitized.as_os_str().len() > MAX_PATH_LEN {
+            return Err(ArchiveError::PathTooLong {
+                len: sanitized.as_os_str().len(),
+                max: MAX_PATH_LEN,
+            });
+        }
         let dest_path = dest_dir.join(&sanitized);
 
         // Path safety check
@@ -82,6 +122,12 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
 
         let entry_type = entry.header().entry_type();
         let entry_size = entry.header().size()?;
+        if entry_size > MAX_PER_FILE_SIZE {
+            return Err(ArchiveError::EntryTooLarge {
+                size: entry_size,
+                max: MAX_PER_FILE_SIZE,
+            });
+        }
 
         total_uncompressed = total_uncompressed.saturating_add(entry_size);
         if total_uncompressed > MAX_EXTRACTED_SIZE {
@@ -112,7 +158,11 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = entry.header().mode()?;
-                std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(mode))?;
+                // 屏蔽 setuid/setgid/sticky 等危险位(#18)。
+                std::fs::set_permissions(
+                    &dest_path,
+                    std::fs::Permissions::from_mode(mode & SAFE_MODE_MASK),
+                )?;
             }
         } else if entry_type.is_symlink() {
             // Skip symlinks for safety
@@ -138,16 +188,30 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, Archiv
 
     let mut total_uncompressed: u64 = 0;
     let mut file_count: usize = 0;
+    let mut entry_count: usize = 0;
     let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| ArchiveError::InvalidArchive(format!("read zip entry {i}: {e}")))?;
+        entry_count += 1;
+        if entry_count > MAX_ENTRY_COUNT {
+            return Err(ArchiveError::TooManyEntries {
+                count: entry_count,
+                max: MAX_ENTRY_COUNT,
+            });
+        }
         let entry_name = entry.name().to_string();
         let entry_path = PathBuf::from(&entry_name);
 
         let sanitized = sanitize_entry_path(&entry_path)?;
+        if sanitized.as_os_str().len() > MAX_PATH_LEN {
+            return Err(ArchiveError::PathTooLong {
+                len: sanitized.as_os_str().len(),
+                max: MAX_PATH_LEN,
+            });
+        }
         let dest_path = dest_dir.join(&sanitized);
 
         if let Some(parent) = dest_path.parent()
@@ -159,6 +223,12 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, Archiv
         }
 
         let entry_size = entry.size();
+        if entry_size > MAX_PER_FILE_SIZE {
+            return Err(ArchiveError::EntryTooLarge {
+                size: entry_size,
+                max: MAX_PER_FILE_SIZE,
+            });
+        }
         total_uncompressed = total_uncompressed.saturating_add(entry_size);
         if total_uncompressed > MAX_EXTRACTED_SIZE {
             return Err(ArchiveError::ArchiveBomb {
@@ -180,7 +250,11 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, Archiv
             #[cfg(unix)]
             if let Some(mode) = entry.unix_mode() {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(mode))?;
+                // 屏蔽 setuid/setgid/sticky 等危险位(#18)。
+                std::fs::set_permissions(
+                    &dest_path,
+                    std::fs::Permissions::from_mode(mode & SAFE_MODE_MASK),
+                )?;
             }
         }
     }
@@ -503,6 +577,46 @@ mod tests {
         assert!(hello.exists());
         let content = std::fs::read_to_string(&hello).unwrap();
         assert!(content.contains("echo hi"));
+    }
+
+    #[test]
+    fn extract_tar_strips_setuid_setgid_sticky_bits() {
+        let tmp = tempdir().unwrap();
+        let archive = tmp.path().join("setuid.tar.gz");
+        let extract_to = tmp.path().join("out");
+        std::fs::create_dir_all(&extract_to).unwrap();
+
+        {
+            let tar_file = File::create(&archive).unwrap();
+            let enc = flate2::write::GzEncoder::new(tar_file, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            let data = b"#!/bin/sh\necho hi\n";
+            header.set_size(data.len() as u64);
+            // setuid(0o4000) + rwxr-xr-x —— 解压后必须剥离 setuid 位(#18)。
+            header.set_mode(0o4755);
+            header.set_cksum();
+            tar.append_data(&mut header, "hello", &data[..]).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+
+        let count = extract_tar_gz(&archive, &extract_to).unwrap();
+        assert_eq!(count, 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(extract_to.join("hello"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o7000,
+                0,
+                "setuid/setgid/sticky bits must be stripped"
+            );
+            assert_eq!(mode & 0o777, 0o755, "regular rwx bits must be preserved");
+        }
     }
 
     #[test]

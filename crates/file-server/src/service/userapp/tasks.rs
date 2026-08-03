@@ -254,6 +254,11 @@ impl BuildTask {
         self.pid.store(pid, Ordering::Relaxed);
     }
 
+    /// 清除记录的 build pid。子进程退出(或超时被 kill)后调用,缩短 stale-pid 窗口(#2 防御性加固)。
+    pub fn clear_pid(&self) {
+        self.pid.store(0, Ordering::Relaxed);
+    }
+
     /// 当前 build child 进程 pid (cancel 时 kill_process_group 用); 0 = 未设置。
     pub fn pid(&self) -> Option<u32> {
         match self.pid.load(Ordering::Relaxed) {
@@ -320,6 +325,14 @@ fn apply_event(inner: &mut TaskInner, event: &BuildProgressEvent) {
 /// 用 tokio::sync::Mutex(无 poison,符合禁止 unwrap/expect);并发度低(任务数有限)。
 pub struct BuildTaskStore {
     map: Mutex<HashMap<BuildTaskId, Arc<BuildTask>>>,
+    max_retained_tasks: usize,
+}
+
+/// `BuildTaskStore::create` 容量耗尽错误(硬上限:全活跃任务达上限且无终态任务可淘汰)。
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BuildTaskStoreError {
+    #[error("build task capacity exhausted (limit={limit}); wait for an active build to finish")]
+    CapacityExceeded { limit: usize },
 }
 
 impl Default for BuildTaskStore {
@@ -332,10 +345,23 @@ impl BuildTaskStore {
     pub fn new() -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
+            max_retained_tasks: MAX_RETAINED_TASKS,
         }
     }
 
-    pub async fn create(&self, app_id: String, kind: BuildTaskKind) -> Arc<BuildTask> {
+    #[cfg(test)]
+    fn with_max_retained_tasks(max_retained_tasks: usize) -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            max_retained_tasks,
+        }
+    }
+
+    pub async fn create(
+        &self,
+        app_id: String,
+        kind: BuildTaskKind,
+    ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
         let task = BuildTask::new(app_id, kind);
         let now = Utc::now().timestamp();
         let mut map = self.map.lock().await;
@@ -343,17 +369,22 @@ impl BuildTaskStore {
             let terminal_at = existing.terminal_at.load(Ordering::Acquire);
             terminal_at == 0 || now.saturating_sub(terminal_at) < TERMINAL_TASK_TTL_SECS
         });
-        if map.len() >= MAX_RETAINED_TASKS
-            && let Some(oldest_terminal_id) = map
+        // 硬上限:全活跃任务达上限时,优先淘汰最旧终态任务;无终态可淘汰则拒绝(不再越过上限插入,#12)。
+        while map.len() >= self.max_retained_tasks {
+            let Some(oldest_terminal_id) = map
                 .values()
                 .filter(|existing| existing.terminal_at.load(Ordering::Acquire) > 0)
                 .min_by_key(|existing| existing.created_at)
                 .map(|existing| existing.id.clone())
-        {
+            else {
+                return Err(BuildTaskStoreError::CapacityExceeded {
+                    limit: self.max_retained_tasks,
+                });
+            };
             map.remove(&oldest_terminal_id);
         }
         map.insert(task.id.clone(), task.clone());
-        task
+        Ok(task)
     }
 
     pub async fn get(&self, id: &str) -> Option<Arc<BuildTask>> {
@@ -402,5 +433,50 @@ mod tests {
         ));
         let (replay, _) = task.subscribe(0).await;
         assert_eq!(replay.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_rejects_new_task_when_all_capacity_is_active() {
+        let store = BuildTaskStore::with_max_retained_tasks(2);
+        for app_id in ["app-a", "app-b"] {
+            store
+                .create(app_id.into(), BuildTaskKind::Build)
+                .await
+                .expect("active task within capacity");
+        }
+
+        let result = store.create("app-c".into(), BuildTaskKind::Build).await;
+        let error = match result {
+            Ok(_) => panic!("active tasks must never be silently evicted"),
+            Err(error) => error,
+        };
+        assert_eq!(error, BuildTaskStoreError::CapacityExceeded { limit: 2 });
+        assert_eq!(store.map.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn store_evicts_terminal_task_before_rejecting_new_task() {
+        let store = BuildTaskStore::with_max_retained_tasks(1);
+        let completed = store
+            .create("app-a".into(), BuildTaskKind::Build)
+            .await
+            .expect("first task");
+        completed
+            .emit(BuildProgressEvent::Completed {
+                release_id: "release-a".into(),
+                sha256: "a".repeat(64),
+                size_bytes: 1,
+                file_name: "release-a.zip".into(),
+            })
+            .await;
+
+        let replacement = store
+            .create("app-b".into(), BuildTaskKind::Build)
+            .await
+            .expect("terminal task should be evicted");
+        let map = store.map.lock().await;
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&replacement.id));
+        assert!(!map.contains_key(&completed.id));
     }
 }

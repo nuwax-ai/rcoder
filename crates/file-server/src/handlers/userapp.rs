@@ -105,7 +105,7 @@ pub(crate) async fn build_workspace(
         body.space_id.clone(),
         state.config.dev_command_timeout_secs,
     )
-    .await;
+    .await?;
 
     tracing::info!(app_id = %body.app_id, %task_id, "userapp build task started");
 

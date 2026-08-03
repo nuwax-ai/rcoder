@@ -15,6 +15,7 @@ use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
 use nix::unistd::{Pid, getpgid};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::task::JoinHandle;
 
 use crate::error::{AppError, AppResult};
 
@@ -213,33 +214,62 @@ pub async fn run_command_to_log(
     let stderr = child.stderr.take();
     let main = main_log.to_path_buf();
     let temp = temp_log.to_path_buf();
-    if let Some(out) = stdout {
-        let m = main.clone();
-        let t = temp.clone();
-        tokio::spawn(async move { pipe_stream(out, m, t).await });
-    }
-    if let Some(err) = stderr {
-        let m = main.clone();
-        let t = temp.clone();
-        tokio::spawn(async move { pipe_stream(err, m, t).await });
-    }
+    // 收集日志管道 JoinHandle:child.wait() 后 drain 尾部日志,避免主流程在日志未写完时返回(#17)。
+    let stdout_handle = stdout.map(|out| {
+        let main = main.clone();
+        let temp = temp.clone();
+        tokio::spawn(async move { pipe_stream(out, main, temp).await })
+    });
+    let stderr_handle = stderr.map(|err| {
+        let main = main.clone();
+        let temp = temp.clone();
+        tokio::spawn(async move { pipe_stream(err, main, temp).await })
+    });
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
-    match result {
+    let outcome = match result {
         Ok(Ok(status)) if status.success() => Ok(()),
         Ok(Ok(status)) => Err(AppError::system(format!(
             "command exited non-zero: {status}"
         ))),
         Ok(Err(e)) => Err(AppError::system(format!("command wait failed: {e}"))),
         Err(_) => {
-            // 超时: 杀整个进程组，避免 pnpm/vite 子进程遗留。
+            // 超时: 杀整个进程组,避免 pnpm/vite 子进程遗留。
             if let Some(pid) = child.id() {
-                kill_process_group_force(pid);
+                if !kill_process_group_force(pid) {
+                    tracing::warn!(
+                        "kill_process_group_force reported failure for pid={pid}; \
+                         falling back to orphan reaper"
+                    );
+                }
             } else {
                 let _ = child.start_kill();
             }
+            // 超时分支补一次 wait() reap 子进程(#1):不依赖 tokio orphan reaper 时序,
+            // 短超时(5s)放弃,避免 kill 失败时永久阻塞。
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
             Err(AppError::system(format!(
                 "command timed out after {timeout_secs}s"
             )))
+        }
+    };
+
+    // 等日志管道 drain(超时放弃,不阻塞返回;尾部日志可能截断但会告警)。
+    drain_log_pipes(stdout_handle, stderr_handle).await;
+
+    outcome
+}
+
+/// 等待 stdout/stderr 日志管道 task 结束,确保 child 退出后尾部日志写完(#17)。
+/// 每个 handle 给 2s drain 窗口;超时/panic 仅告警,不影响构建结果。
+async fn drain_log_pipes(stdout: Option<JoinHandle<()>>, stderr: Option<JoinHandle<()>>) {
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+    for handle in stdout.into_iter().chain(stderr) {
+        match tokio::time::timeout(DRAIN_TIMEOUT, handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "log pipe task ended with error"),
+            Err(_) => tracing::warn!(
+                "log pipe drain timed out after {DRAIN_TIMEOUT:?}; tail logs may be incomplete"
+            ),
         }
     }
 }
@@ -323,8 +353,13 @@ where
             continue;
         }
         let prefixed = format!("[{}] {}", Local::now().format("%Y/%m/%d %H:%M:%S"), line);
-        let _ = super::log::append_line(&main, &prefixed).await;
-        let _ = super::log::append_line(&temp, &prefixed).await;
+        // 日志写失败告警(#17):磁盘满/权限错误时可见,不再静默吞掉。
+        if let Err(e) = super::log::append_line(&main, &prefixed).await {
+            tracing::warn!(error = %e, "append_line (main log) failed");
+        }
+        if let Err(e) = super::log::append_line(&temp, &prefixed).await {
+            tracing::warn!(error = %e, "append_line (temp log) failed");
+        }
     }
 }
 

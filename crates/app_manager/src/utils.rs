@@ -55,6 +55,15 @@ pub(super) fn map_archive_error(e: ArchiveError) -> AppOperationError {
         ArchiveError::InvalidArchive(msg) => {
             AppOperationError::Validation(format!("invalid archive: {msg}"))
         }
+        ArchiveError::TooManyEntries { count, max } => {
+            AppOperationError::Validation(format!("archive has too many entries: {count} > {max}"))
+        }
+        ArchiveError::EntryTooLarge { size, max } => {
+            AppOperationError::Validation(format!("archive entry too large: {size} > {max}"))
+        }
+        ArchiveError::PathTooLong { len, max } => {
+            AppOperationError::Validation(format!("archive entry path too long: {len} > {max}"))
+        }
         ArchiveError::Io(e) => map_io_error("archive IO error", e, true),
     }
 }

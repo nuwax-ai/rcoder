@@ -123,21 +123,7 @@ pub async fn run_build(
     app_id: String,
 ) {
     let result = run_build_inner(&task, &state, &project_id, &app_id).await;
-    if let Err(error) = result
-        && !task.is_terminal().await
-    {
-        tracing::error!(
-            task_id = %task.id,
-            app_id = %app_id,
-            project_id = %project_id,
-            error = %error,
-            "UserApp build orchestration failed"
-        );
-        task.emit(PublishEvent::Failed {
-            error: error.to_string(),
-        })
-        .await;
-    }
+    finalize_terminal(&task, &app_id, &project_id, result, "build").await;
 }
 
 /// 全流程发布入口(spawn 调):build → ensure_app → prepare → activate → 轮询 → confirm。
@@ -148,15 +134,36 @@ pub async fn run_publish(
     app_id: String,
 ) {
     let result = run_publish_inner(&task, &state, &project_id, &app_id).await;
-    if let Err(error) = result
-        && !task.is_terminal().await
-    {
+    finalize_terminal(&task, &app_id, &project_id, result, "publish").await;
+}
+
+/// 顶层终态收敛:inner 返回 Err 时(尚未自 emit 终态),按是否取消区分 emit Cancelled/Failed。
+/// 取消路径不再被旧的 `!is_terminal` 守卫吞掉(#6):取消+回滚成功 → Cancelled,失败/超时 → Failed。
+async fn finalize_terminal(
+    task: &PublishTask,
+    app_id: &str,
+    project_id: &str,
+    result: Result<()>,
+    label: &str,
+) {
+    let Err(error) = result else {
+        return; // inner 已自 emit 终态(Cancelled/Failed/Completed)或正常完成
+    };
+    if task.is_cancelled() && !task.is_terminal().await {
+        tracing::info!(
+            task_id = %task.id,
+            app_id = %app_id,
+            project_id = %project_id,
+            "UserApp {label} cancelled by user"
+        );
+        task.emit(PublishEvent::Cancelled).await;
+    } else if !task.is_terminal().await {
         tracing::error!(
             task_id = %task.id,
             app_id = %app_id,
             project_id = %project_id,
             error = %error,
-            "UserApp publish orchestration failed"
+            "UserApp {label} orchestration failed"
         );
         task.emit(PublishEvent::Failed {
             error: error.to_string(),
@@ -317,23 +324,39 @@ async fn run_publish_inner(
 
     if let Err(error) = post_activate {
         let message = error.to_string();
-        state
+        let cancelled = task.is_cancelled();
+        match state
             .app_service
-            .confirm_release(
-                &rcoder_app_id,
-                &release_id,
-                false,
-                Some(message.clone()),
-            )
+            .confirm_release(&rcoder_app_id, &release_id, false, Some(message.clone()))
             .await
-            .map_err(|rollback_error| {
-                anyhow!(
+        {
+            Ok(_) => {
+                // 回滚成功:取消 → 终态 Cancelled(在此 emit,顶层见 Ok 跳过);
+                // 非取消失败 → 交顶层 finalize_terminal emit Failed("已回滚")。
+                if cancelled {
+                    task.emit(PublishEvent::Cancelled).await;
+                    return Ok(());
+                }
+                return Err(anyhow!(
+                    "publish failed after activation and was rolled back: {message}"
+                ));
+            }
+            Err(rollback_error) => {
+                // 回滚失败是真实故障:必须以 Failed 暴露,绝不能被顶层 !is_terminal 吞掉(#6)。
+                let combined = format!(
                     "publish failed after activation: {message}; rollback also failed: {rollback_error}"
-                )
-            })?;
-        return Err(anyhow!(
-            "publish failed after activation and was rolled back: {message}"
-        ));
+                );
+                tracing::error!(
+                    task_id = %task.id,
+                    app_id = %app_id,
+                    project_id = %project_id,
+                    error = %combined,
+                    "UserApp publish rollback failed"
+                );
+                task.emit(PublishEvent::Failed { error: combined }).await;
+                return Ok(()); // 已自 emit 终态,顶层见 Ok 跳过
+            }
+        }
     }
 
     task.emit(PublishEvent::Completed {
@@ -370,6 +393,8 @@ async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Resu
         return Ok(BuildOutcome::Cancelled);
     }
     let mut rx = client::subscribe_build_progress(addr, build_task_id);
+    // 未知事件按 event 名去重警告一次,避免未来高频未知事件刷日志(P3)。
+    let mut warned_unknown = std::collections::HashSet::<String>::new();
     loop {
         let data = tokio::select! {
             biased;
@@ -407,12 +432,14 @@ async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Resu
             | AgentBuildEventKind::BuildFail
             | AgentBuildEventKind::Log => None,
             AgentBuildEventKind::Unknown(event_name) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    remote_build_task_id = %build_task_id,
-                    event = %event_name,
-                    "received unknown agent-runner build event"
-                );
+                if warned_unknown.insert(event_name.clone()) {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        remote_build_task_id = %build_task_id,
+                        event = %event_name,
+                        "received unknown agent-runner build event (warned once per event name)"
+                    );
+                }
                 None
             }
         };
@@ -439,7 +466,18 @@ async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Resu
 /// 确保 app 计算单元存在:不存在则 create_app(幂等;image/ports 首次设定后恒定)。
 async fn ensure_app(state: &AppState, rcoder_app_id: &str, name: &str, image: &str) -> Result<()> {
     match state.app_service.get_app(rcoder_app_id).await {
-        Ok(_) => return Ok(()),          // 已存在
+        Ok(_) => {
+            // app 已存在:image/ports/probes 首次设定后恒定,不自动 reconcile(#14)。
+            // 注:app_service trait 只暴露运行时信息(AppRuntimeInfo,无 image 字段),无法在此
+            // 直接比对存储镜像;改为记录期望 image,平台升级 app-runtime 后运维可据日志发现滞后。
+            tracing::info!(
+                app_id = %rcoder_app_id,
+                desired_image = %image,
+                "[USERAPP_PUBLISH] app already exists; image/ports/probes are constant after first \
+                 create and will NOT be reconciled to the desired image"
+            );
+            return Ok(()); // 已存在
+        }
         Err(e) if is_not_found(&e) => {} // 不存在 → create
         Err(e) => return Err(anyhow!("get_app: {e}")),
     }

@@ -29,7 +29,7 @@ use crate::router::AppState;
 
 use super::client;
 use super::orchestrator;
-use super::task::{PublishEvent, PublishTaskKind};
+use super::task::{CancelAttempt, PublishEvent, PublishTaskKind};
 
 /// 路由聚合(注册到 rcoder 主 router,与 app_manager 路由同 `/api/v1/apps` 前缀)。
 pub fn routes() -> axum::Router<Arc<AppState>> {
@@ -99,7 +99,10 @@ fn validate_publish_identifiers(app_id: &str, project_id: &str) -> Result<(), Ap
     request_body = PublishBody,
     responses(
         (status = 200, description = "Publish task created"),
-        (status = 429, description = "Publish task capacity exhausted")
+        (status = 400, description = "Invalid app_id / project_id"),
+        (status = 404, description = "Agent-runner not found for project"),
+        (status = 429, description = "Publish task capacity exhausted"),
+        (status = 500, description = "Internal server error")
     ),
     tag = "UserApp 发布"
 )]
@@ -138,7 +141,10 @@ pub async fn publish(
     request_body = PublishBody,
     responses(
         (status = 200, description = "Build task created"),
-        (status = 429, description = "Publish task capacity exhausted")
+        (status = 400, description = "Invalid app_id / project_id"),
+        (status = 404, description = "Agent-runner not found for project"),
+        (status = 429, description = "Publish task capacity exhausted"),
+        (status = 500, description = "Internal server error")
     ),
     tag = "UserApp 发布"
 )]
@@ -244,7 +250,11 @@ const DEFAULT_BUILDER_STORAGE_SIZE: &str = "10Gi";
     get,
     path = "/api/v1/apps/publish/tasks/{task_id}",
     params(("task_id" = String, Path)),
-    responses((status = 200, description = "Publish task snapshot")),
+    responses(
+        (status = 200, description = "Publish task snapshot"),
+        (status = 404, description = "Publish task not found"),
+        (status = 500, description = "Internal server error")
+    ),
     tag = "UserApp 发布"
 )]
 pub async fn get_task(
@@ -259,7 +269,10 @@ pub async fn get_task(
     let snapshot = task.snapshot().await;
     Ok(Json(json!({
         "success": true,
-        "task": serde_json::to_value(&snapshot).unwrap_or(Value::Null),
+        "task": serde_json::to_value(&snapshot).unwrap_or_else(|e| {
+            tracing::error!(task_id = %task_id, error = %e, "serialize publish task snapshot failed");
+            Value::Null
+        }),
     })))
 }
 
@@ -322,7 +335,10 @@ pub async fn stream_task(
     post,
     path = "/api/v1/apps/publish/tasks/{task_id}/cancel",
     params(("task_id" = String, Path)),
-    responses((status = 200, description = "Publish task cancelled")),
+    responses(
+        (status = 200, description = "Publish task cancellation accepted (or already terminal)"),
+        (status = 404, description = "Publish task not found")
+    ),
     tag = "UserApp 发布"
 )]
 pub async fn cancel_task(
@@ -334,30 +350,38 @@ pub async fn cancel_task(
         .get(&task_id)
         .await
         .ok_or_else(|| not_found(format!("publish task not found: {task_id}")))?;
-    if task.is_terminal().await {
-        return Ok(Json(json!({
+    // request_cancel 在 event_lock 内原子 check 终态 + 转 Cancelling,消除"check 与 emit 之间
+    // 被 Completed 抢入却仍回 cancelled"的撒谎窗口(#5)。终态 Cancelled/Failed 由 orchestrator
+    // 完成远端取消/回滚后 emit —— handler 不再抢先置终态(原行为会让回滚失败被顶层 !is_terminal
+    // 守卫吞掉,#6)。
+    match task.request_cancel().await {
+        CancelAttempt::AlreadyTerminal(status) => Ok(Json(json!({
             "success": true,
             "taskId": task_id,
             "alreadyTerminal": true,
-        })));
+            "status": status,
+        }))),
+        CancelAttempt::Accepted => {
+            // 尽力通知 agent-runner 取消 build;失败仅 warn(orchestrator 仍会收敛终态)。
+            if let Some(remote) = task.remote_build().await
+                && let Err(error) = client::cancel_build(&remote.addr, &remote.task_id).await
+            {
+                tracing::warn!(
+                    %task_id,
+                    remote_task_id = %remote.task_id,
+                    error = %error,
+                    "publish task cancellation requested but remote build cancel failed"
+                );
+            }
+            // 返回【实际】状态(此时为 cancelling),不再硬编码 "cancelled"。
+            let status = task.status().await;
+            Ok(Json(json!({
+                "success": true,
+                "taskId": task_id,
+                "status": status,
+            })))
+        }
     }
-    task.cancel();
-    task.emit(PublishEvent::Cancelled).await;
-    if let Some(remote) = task.remote_build().await
-        && let Err(error) = client::cancel_build(&remote.addr, &remote.task_id).await
-    {
-        tracing::warn!(
-            %task_id,
-            remote_task_id = %remote.task_id,
-            error = %error,
-            "publish task marked cancelled but remote build cancellation failed"
-        );
-    }
-    Ok(Json(json!({
-        "success": true,
-        "taskId": task_id,
-        "status": "cancelled",
-    })))
 }
 
 /// PublishEvent → SSE Event(event 名 = 事件类型,data = JSON 全量)。
@@ -365,11 +389,15 @@ fn event_from(seq: u64, ev: &PublishEvent) -> Event {
     let name = match ev {
         PublishEvent::Stage { .. } => "stage",
         PublishEvent::BuildProgress { .. } => "build_progress",
+        PublishEvent::Cancelling => "cancelling",
         PublishEvent::Completed { .. } => "completed",
         PublishEvent::Failed { .. } => "failed",
         PublishEvent::Cancelled => "cancelled",
     };
-    let data = serde_json::to_string(ev).unwrap_or_else(|_| "{}".to_string());
+    let data = serde_json::to_string(ev).unwrap_or_else(|e| {
+        tracing::error!(seq, error = %e, "serialize publish SSE event failed");
+        "{}".to_string()
+    });
     Event::default().id(seq.to_string()).event(name).data(data)
 }
 

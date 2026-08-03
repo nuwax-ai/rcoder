@@ -15,6 +15,9 @@ use tokio::sync::{Mutex, Notify, broadcast};
 
 /// 历史事件 ring 容量(断线重连 seq replay)。
 const RING_CAP: usize = 1000;
+/// 单个 build 进度事件(`BuildProgress.data`)序列化字节上限:超大对象会撑大 ring
+/// (1000 事件 × N MB)。超限在入 ring/broadcast 前替换为截断标记(#11)。
+const MAX_EVENT_BYTES: usize = 64 * 1024;
 /// broadcast 通道容量(实时 SSE fan-out)。
 const BROADCAST_CAP: usize = 256;
 /// 终态任务在内存中保留 24h，便于前端重连查询。
@@ -44,6 +47,8 @@ pub enum PublishTaskKind {
 pub enum PublishTaskStatus {
     Pending,
     Running,
+    /// 取消已请求、远端取消/回滚进行中(非终态)。终态由 orchestrator 收敛为 Cancelled/Failed。
+    Cancelling,
     Completed,
     Failed,
     Cancelled,
@@ -57,12 +62,23 @@ pub enum PublishEvent {
     Stage { stage: String },
     /// 透传 agent-runner build 进度(Building/BuildOk/BuildFail,data=原始 JSON)。
     BuildProgress { data: Value },
+    /// 取消已请求(非终态):任务进入 Cancelling,通知前端"取消中"。终态 Cancelled/Failed 由 orchestrator emit。
+    Cancelling,
     /// 任务完成(build 产 release_id;publish 发布 Active)。
     Completed { release_id: String },
     /// 任务失败。
     Failed { error: String },
     /// 任务被取消。
     Cancelled,
+}
+
+/// `request_cancel` 的结果(原子取消请求)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelAttempt {
+    /// 已接受:任务转入 Cancelling(非终态),orchestrator 将做远端取消/回滚后 emit 终态。
+    Accepted,
+    /// 任务已终态,不可取消。携带实际终态供调用方如实回传(避免 #5 撒谎窗口)。
+    AlreadyTerminal(PublishTaskStatus),
 }
 
 /// 任务快照(GET /tasks/{id} 返回)。
@@ -173,9 +189,32 @@ impl PublishTask {
     /// 发进度事件:apply 状态副作用 → seq++ → ring → broadcast。终态后丢弃后续事件。
     pub async fn emit(&self, event: PublishEvent) {
         let _event_guard = self.event_lock.lock().await;
+        self.emit_locked(event).await;
+    }
+
+    /// 假设调用方已持有 `event_lock`(供 `request_cancel` 在同一临界区内做原子 check+转移+emit)。
+    async fn emit_locked(&self, mut event: PublishEvent) {
         let mut inner = self.inner.lock().await;
         if is_terminal_status(inner.status) {
             return;
+        }
+        // 单事件字节上限:超大的 build 进度对象会撑大 ring(1000 事件 × N MB)。超限替换为截断标记(#11)。
+        if let PublishEvent::BuildProgress { data } = &mut event
+            && let Ok(bytes) = serde_json::to_vec(data)
+            && bytes.len() > MAX_EVENT_BYTES
+        {
+            let orig_len = bytes.len();
+            tracing::warn!(
+                task_id = %self.id,
+                orig_len,
+                max_bytes = MAX_EVENT_BYTES,
+                "build progress event exceeds byte cap, truncating before ring/broadcast"
+            );
+            *data = serde_json::json!({
+                "truncated": true,
+                "origLen": orig_len,
+                "maxBytes": MAX_EVENT_BYTES,
+            });
         }
         apply_event(&mut inner, &event);
         let terminal = is_terminal_status(inner.status);
@@ -194,6 +233,31 @@ impl PublishTask {
             self.terminal_at
                 .store(Utc::now().timestamp(), Ordering::Release);
         }
+    }
+
+    /// 当前状态(轻量,无完整快照)。
+    pub async fn status(&self) -> PublishTaskStatus {
+        self.inner.lock().await.status
+    }
+
+    /// 原子取消请求(在 `event_lock` 内:check 终态 → 置 flag+notify → emit Cancelling)。
+    /// 把"检查终态 + 状态转移"收成一次临界区,消除 cancel handler 在 check 与 emit 之间被
+    /// Completed 抢入导致的撒谎窗口(#5)。返回 Accepted 表示已进入非终态 Cancelling,终态
+    /// Cancelled/Failed 由 orchestrator 完成远端取消/回滚后收敛;返回 AlreadyTerminal 时任务
+    /// 已终态,携带实际状态供调用方如实回传。
+    pub async fn request_cancel(&self) -> CancelAttempt {
+        let _event_guard = self.event_lock.lock().await;
+        {
+            let inner = self.inner.lock().await;
+            if is_terminal_status(inner.status) {
+                return CancelAttempt::AlreadyTerminal(inner.status);
+            }
+        }
+        // 唤醒 orchestrator 的 cancellation_notified 等待者(置 flag + notify)。
+        self.cancel();
+        // 通知 SSE 客户端"取消中"(非终态事件;持有 event_lock,不会被并发终态覆盖)。
+        self.emit_locked(PublishEvent::Cancelling).await;
+        CancelAttempt::Accepted
     }
 
     /// 订阅:回放 ring 里 seq >= from_seq 的历史 + 实时 broadcast receiver。
@@ -262,6 +326,7 @@ fn apply_event(inner: &mut TaskInner, event: &PublishEvent) {
             inner.status = PublishTaskStatus::Running;
         }
         PublishEvent::BuildProgress { .. } => inner.status = PublishTaskStatus::Running,
+        PublishEvent::Cancelling => inner.status = PublishTaskStatus::Cancelling,
         PublishEvent::Completed { release_id } => {
             inner.release_id = Some(release_id.clone());
             inner.status = PublishTaskStatus::Completed;
@@ -387,6 +452,75 @@ mod tests {
         )
         .await
         .expect("pre-existing cancellation must be observed");
+    }
+
+    #[tokio::test]
+    async fn request_cancel_transitions_running_to_cancelling() {
+        let task = PublishTask::new("app-a".into(), "app-a".into(), PublishTaskKind::Publish);
+        task.emit(PublishEvent::Stage {
+            stage: "Build".into(),
+        })
+        .await;
+        assert_eq!(task.status().await, PublishTaskStatus::Running);
+
+        let attempt = task.request_cancel().await;
+        assert_eq!(attempt, CancelAttempt::Accepted);
+        assert_eq!(task.status().await, PublishTaskStatus::Cancelling);
+        assert!(!task.is_terminal().await, "Cancelling must be non-terminal");
+        assert!(task.is_cancelled(), "cancelled flag must be set");
+        // Cancelling 事件入历史(SSE 客户端可见"取消中")。
+        let (replay, _) = task.subscribe(0).await;
+        assert!(
+            replay
+                .iter()
+                .any(|(_, ev)| matches!(ev, PublishEvent::Cancelling))
+        );
+    }
+
+    #[tokio::test]
+    async fn request_cancel_returns_already_terminal_for_terminal_task() {
+        let task = PublishTask::new("app-a".into(), "app-a".into(), PublishTaskKind::Publish);
+        task.emit(PublishEvent::Completed {
+            release_id: "r1".into(),
+        })
+        .await;
+
+        let attempt = task.request_cancel().await;
+        assert_eq!(
+            attempt,
+            CancelAttempt::AlreadyTerminal(PublishTaskStatus::Completed)
+        );
+        assert_eq!(task.status().await, PublishTaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn oversized_build_progress_event_is_truncated() {
+        let task = PublishTask::new("app-a".into(), "app-a".into(), PublishTaskKind::Publish);
+        let huge = serde_json::json!({ "blob": "x".repeat(MAX_EVENT_BYTES + 4096) });
+        task.emit(PublishEvent::BuildProgress { data: huge }).await;
+
+        let (replay, _) = task.subscribe(0).await;
+        let (_, ev) = replay
+            .iter()
+            .find(|(_, e)| matches!(e, PublishEvent::BuildProgress { .. }))
+            .expect("build progress event stored in ring");
+        match ev {
+            PublishEvent::BuildProgress { data } => {
+                assert_eq!(
+                    data.get("truncated").and_then(|v| v.as_bool()),
+                    Some(true),
+                    "oversized event must be replaced with truncation marker"
+                );
+                assert!(
+                    data.get("origLen")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_default()
+                        > MAX_EVENT_BYTES as u64,
+                    "origLen must reflect the original oversized length"
+                );
+            }
+            other => panic!("expected BuildProgress, got {other:?}"),
+        }
     }
 
     #[tokio::test]

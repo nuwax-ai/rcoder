@@ -6,14 +6,14 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
-use crate::service::build_manager::BuildManager;
+use crate::service::build_manager::BuildGuard;
 use crate::service::dev_server::log::{main_log_name, temp_log_name};
 use crate::service::dev_server::process::{now_ms, run_command_to_log};
 
 /// 通用 build 请求参数（命令 + 产物 + 日志 + 超时 + pid 回调）。
 ///
-/// 把 `build_generic` 的执行参数打包为参数对象（SOLID：相关参数聚合），
-/// 避免函数签名过长。`build_manager` + `project_id`（并发控制语义）独立，单独传入。
+/// 把 `build_generic` 的执行参数打包为参数对象（SOLID：相关参数聚合），避免函数签名过长。
+/// 并发控制(项目互斥 + 全局 permit)由调用方持 [`BuildGuard`] 保证,不在此聚合。
 pub struct GenericBuildRequest<'a> {
     /// build 命令 argv（不经过 shell；需 shell 语法时显式写成 `["sh", "-c", "..."]`）。
     pub argv: &'a [String],
@@ -29,18 +29,23 @@ pub struct GenericBuildRequest<'a> {
     pub on_pid: Option<&'a (dyn Fn(u32) + Send + Sync)>,
 }
 
-/// 通用 build：在 workspace 内直接执行 `argv`，产 `artifact_rel`。
+/// 通用 build：在给定工作目录执行 `argv`，产 `artifact_rel`。
 ///
-/// 复用 `run_command_to_log`（日志管道 + 超时 + 进程组 kill）+ `BuildManager`（全局并发 +
-/// 项目级互斥）。给 [`crate::service::userapp`] workspace 打包调用（project.manifest [build] → artifact）。
+/// 复用 `run_command_to_log`（日志管道 + 超时 + 进程组 kill）。**并发控制（项目互斥 + 全局
+/// permit）由调用方持 `BuildGuard` 保证** —— 本函数只负责跑命令 + 校验产物,不再自取锁,
+/// 保持为通用原语:既可作 workspace 打包的子项目构建(workspace 最外层持【一个】guard 跨
+/// 整个构建周期,避免子项目间隙释放锁导致同 app_id 构建穿插、首个构建中途 409 失败,#13),
+/// 也可作任意单项目构建(调用方自己 `try_start` 取一个 guard 传入)。
+///
+/// `guard` 以引用传入:仅用于在类型层面证明调用方已持有并发 guard(其借用在本次调用期间
+/// 有效,阻止 guard 被提前释放),函数体内不直接使用。
 ///
 /// # 工具链盲区
 /// agent-runner 镜像当前缺 **Go** 和 **Gradle**（`Dockerfile.base` 未装）。这两类项目
 /// 需先在镜像补装，或在 `cmd` 里自行 `curl` 拉取 —— 否则 build 会失败。
 pub async fn build_generic(
-    build_manager: &BuildManager,
-    project_id: &str,
     req: &GenericBuildRequest<'_>,
+    _guard: &BuildGuard<'_>,
 ) -> AppResult<PathBuf> {
     let (program, args) = req
         .argv
@@ -52,9 +57,6 @@ pub async fn build_generic(
     let now = now_ms();
     let main_log = req.log_dir.join(main_log_name());
     let temp_log = req.log_dir.join(temp_log_name(now));
-
-    // 并发控制：全局信号量 + 项目级互斥（与 build_project 同机制）
-    let _guard = build_manager.try_start(project_id)?;
 
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_command_to_log(

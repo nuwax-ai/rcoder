@@ -360,7 +360,6 @@ fn spawn_backend_task(
     tokio::spawn(async move {
         let session_id = shared.session_id.clone();
         let cancel = shared.cancel_token.clone();
-        let mut last_error = String::new();
         let _ = activity_updater; // activity 已通过 dispatch_event 内部节流调用
 
         for attempt in 1..=MAX_RETRIES {
@@ -372,12 +371,18 @@ fn spawn_backend_task(
                 Ok(c) => c,
                 Err(e) => {
                     warn!(
-                        "[SessionStream] get_client failed (attempt {}/{}): {}, retrying...",
+                        "[SessionStream] get_client failed (attempt {}/{}): {}",
                         attempt, MAX_RETRIES, e
                     );
                     pool.remove(&grpc_addr).await;
-                    last_error = format!("get_client: {e}");
-                    continue;
+                    if attempt < MAX_RETRIES {
+                        continue;
+                    }
+                    // 重试耗尽:必须发终态错误事件,否则 SharedStream 持 sender 不 Closed,
+                    // 已连上的 HTTP SSE 客户端会永久 hang 在 recv()。错误文案用【当前】失败(#16a)。
+                    let err_ev = make_connection_error_event(&format!("get_client: {e}"));
+                    let _ = shared.broadcast_tx.send(Arc::new(err_ev));
+                    return;
                 }
             };
 
@@ -465,7 +470,6 @@ fn spawn_backend_task(
                                     shared.last_seq.store(0, Ordering::Release);
                                     if attempt < MAX_RETRIES {
                                         pool.remove(&grpc_addr).await;
-                                        last_error = format!("stream err: {}", e);
                                         break; // 内层 loop 退出，外层重试
                                     }
                                     let err_ev = make_stream_error_event(e.code(), e.message());
@@ -483,10 +487,10 @@ fn spawn_backend_task(
                     );
                     if attempt < MAX_RETRIES {
                         pool.remove(&grpc_addr).await;
-                        last_error = format!("subscribe: {e}");
                         continue;
                     }
-                    let err_ev = make_connection_error_event(&last_error);
+                    // 终态事件报告【当前】阶段错误,不用累积的过期错误(#16a)。
+                    let err_ev = make_connection_error_event(&format!("subscribe: {e}"));
                     let _ = shared.broadcast_tx.send(Arc::new(err_ev));
                     return;
                 }
@@ -535,13 +539,17 @@ fn make_prompt_end_event() -> ProgressEvent {
 /// agent_runner 流传输中出错（seq=0 合成消息）
 fn make_stream_error_event(code: Code, _message: &str) -> ProgressEvent {
     let error_code = map_tonic_code(code);
+    // 用 serde_json 构造,避免 format! 拼接产生非法 JSON(error_code 虽为静态串,
+    // 统一走安全路径以便未来扩展)。
+    let payload = serde_json::json!({
+        "code": error_code,
+        "message": "Agent execution error, please retry.",
+    })
+    .to_string();
     ProgressEvent {
         message_type: "SessionPromptEnd".to_string(),
         sub_type: "error".to_string(),
-        payload: format!(
-            r#"{{"code":"{}","message":"Agent execution error, please retry."}}"#,
-            error_code
-        ),
+        payload,
         request_id: None,
         seq: 0,
         timestamp: now_millis(),
@@ -550,13 +558,17 @@ fn make_stream_error_event(code: Code, _message: &str) -> ProgressEvent {
 
 /// gRPC 连接彻底失败（重试耗尽；seq=0 合成消息）
 fn make_connection_error_event(message: &str) -> ProgressEvent {
+    // 必须用 serde_json:message 来自 tonic Status/transport 错误,含引号/换行/反斜杠时,
+    // format! 拼 JSON 会产生非法 JSON。serde_json 正确转义。
+    let payload = serde_json::json!({
+        "code": "GRPC_CONNECTION_FAILED",
+        "message": message,
+    })
+    .to_string();
     ProgressEvent {
         message_type: "SessionPromptEnd".to_string(),
         sub_type: "error".to_string(),
-        payload: format!(
-            r#"{{"code":"GRPC_CONNECTION_FAILED","message":"{}"}}"#,
-            message
-        ),
+        payload,
         request_id: None,
         seq: 0,
         timestamp: now_millis(),
@@ -738,5 +750,31 @@ mod tests {
             "all guards dropped → ref_count back to 0"
         );
         // 最后一个 guard drop 会 spawn 30s 延迟清理；测试结束 runtime drop 会 cancel 它。
+    }
+
+    #[test]
+    fn connection_error_payload_is_valid_json_with_special_chars() {
+        // message 含引号/换行/制表符/反斜杠:format! 拼 JSON 会断,serde_json 必须正确转义。
+        let msg = "connect \"refused\"\nsecond line\ttab\\backslash";
+        let ev = make_connection_error_event(msg);
+        let payload: serde_json::Value =
+            serde_json::from_str(&ev.payload).expect("payload must be valid JSON");
+        assert_eq!(payload["code"], "GRPC_CONNECTION_FAILED");
+        assert_eq!(
+            payload["message"], msg,
+            "message must round-trip special chars"
+        );
+        assert_eq!(ev.message_type, "SessionPromptEnd");
+        assert_eq!(ev.sub_type, "error");
+        assert_eq!(ev.seq, 0, "synthetic terminal event uses seq=0");
+    }
+
+    #[test]
+    fn stream_error_payload_is_valid_json() {
+        let ev = make_stream_error_event(Code::Unavailable, "irrelevant");
+        let payload: serde_json::Value =
+            serde_json::from_str(&ev.payload).expect("payload must be valid JSON");
+        assert_eq!(payload["code"], "GRPC_SERVICE_UNAVAILABLE");
+        assert_eq!(payload["message"], "Agent execution error, please retry.");
     }
 }

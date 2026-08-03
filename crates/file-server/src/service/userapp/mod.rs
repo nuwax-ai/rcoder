@@ -104,6 +104,12 @@ pub async fn build_workspace_package(
         .iter()
         .filter(|project| project.manifest.project.enabled)
         .collect();
+
+    // 整个 workspace 构建周期持有 app_id 的 BuildGuard(项目互斥 + 1 个全局 permit):
+    // 避免子项目构建间隙释放锁导致同 app_id 构建穿插、首个构建中途 409 失败(#13)。
+    // guard 以引用传给每个子项目 build_generic,跨整个 for 循环不释放。
+    let _ws_guard = build_manager.try_start(app_id)?;
+
     let mut built: Vec<BuiltProject> = Vec::with_capacity(enabled.len());
     for proj in enabled {
         // 软取消：服务间检查（硬 cancel 靠外部 kill 进程组，见 cancel handler）。
@@ -137,9 +143,7 @@ pub async fn build_workspace_package(
         let pid_cb = progress.map(|p| move |pid: u32| p.set_pid(pid));
         let pid_ref: Option<&(dyn Fn(u32) + Send + Sync)> =
             pid_cb.as_ref().map(|c| c as &(dyn Fn(u32) + Send + Sync));
-        let artifact = match build_generic(
-            build_manager,
-            app_id,
+        let build_result = build_generic(
             &GenericBuildRequest {
                 argv: &proj.manifest.build.command,
                 cwd: &proj_dir,
@@ -148,9 +152,14 @@ pub async fn build_workspace_package(
                 timeout_secs,
                 on_pid: pid_ref,
             },
+            &_ws_guard,
         )
-        .await
-        {
+        .await;
+        // 子进程已退出(或超时被 kill),pid 即将失效,清零缩短 stale-pid 窗口(#2)。
+        if let Some(p) = progress {
+            p.clear_pid();
+        }
+        let artifact = match build_result {
             Ok(a) => a,
             Err(e) => {
                 // cancel(kill 进程组)导致的失败不 emit（终态 Cancelled 由 cancel handler 置）；
@@ -209,7 +218,9 @@ pub async fn build_workspace_package(
 
 /// 异步发起 build 任务（不阻塞，立即返 taskId）。进度事件经 task 流出（SSE/轮询）。
 ///
-/// 同 app_id 排队由 `BuildManager` per-project 互斥保证（`try_start` 在 build_generic 内）。
+/// 同 app_id 互斥由 `build_workspace_package` 最外层 `try_start(app_id)` 持有的
+/// `BuildGuard` 保证(覆盖整个构建周期,跨所有子项目)。重复构建立即返回 409 fail-fast
+/// (非排队);该 guard 同时占用 1 个全局并发 permit,以引用传给每个子项目 build_generic。
 /// 非循环路径的 Err（如 release lock env 缺失）由这里兜底 emit Failed。
 pub async fn start_build_task(
     store: &BuildTaskStore,
@@ -219,8 +230,12 @@ pub async fn start_build_task(
     tenant_id: Option<String>,
     space_id: Option<String>,
     timeout_secs: u64,
-) -> BuildTaskId {
-    let task = store.create(app_id.clone(), BuildTaskKind::Build).await;
+) -> Result<BuildTaskId, AppError> {
+    // 容量耗尽(全活跃任务达上限)→ 立即拒绝,不再越过上限插入(#12)。
+    let task = store
+        .create(app_id.clone(), BuildTaskKind::Build)
+        .await
+        .map_err(|e| AppError::business(e.to_string()))?;
     // 预 resolve workspace 根并存入 task,供 logs/SSE handler 解析日志目录
     // ({workspace}/logs/{service}/)。resolve 失败则 emit Failed 终态,不 spawn。
     match resolver
@@ -238,7 +253,7 @@ pub async fn start_build_task(
                 error: format!("resolve workspace: {e}"),
             })
             .await;
-            return task.id.clone();
+            return Ok(task.id.clone());
         }
     }
     let task_spawn = task.clone();
@@ -277,7 +292,7 @@ pub async fn start_build_task(
             }
         }
     });
-    task.id.clone()
+    Ok(task.id.clone())
 }
 
 fn required_release_metadata(name: &str) -> AppResult<String> {
