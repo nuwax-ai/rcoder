@@ -569,6 +569,7 @@ POST /api/v1/apps/{app_id}/delete
 POST /api/v1/apps/{app_id}/start
 POST /api/v1/apps/{app_id}/stop
 POST /api/v1/apps/{app_id}/restart
+POST /api/v1/apps/{app_id}/recycle-policy
 ```
 
 RCoder 不持久化 name/image/env 等业务元数据。后续 GET 返回 observed
@@ -581,6 +582,7 @@ K8s update 使用 `resourceVersion` 乐观锁和 SSA；Docker 模式当前为 la
 - create 负责创建 app-runtime 计算资源；
 - start/stop/restart 操作整个 workspace 容器；
 - update 只用于平台运行时镜像、资源或基础设施配置变更；
+- recycle-policy 动态修改闲置回收策略（免费↔付费 tier 变更），见 [§9.5](#95-闲置自动回收与流量唤醒)；
 - 用户代码升级和回滚必须使用 release API。
 
 ### 9.2 查询与诊断
@@ -621,6 +623,105 @@ POST /api/v1/apps/{app_id}/db/create-database
 
 接口通过容器 exec 调用本地 psql，只适用于带 PostgreSQL 的 app-runtime。普通数据操作由
 pgweb 或业务迁移完成。
+
+### 9.5 闲置自动回收与流量唤醒
+
+#### 业务场景
+
+UserApp 长期运行占用 K8s 算力，但很多 app（demo、低频内部工具、预览站）长时间无人访问。
+平台需要：
+
+1. **自动回收**：闲置超过阈值的 app → scale replicas → 0（回收算力，**不删任何资源**：
+   Deployment/Service/NodePort/PVC/pingora 路由全保留）。
+2. **流量唤醒**：stopped app 收到 HTTP 请求 → 自动 scale → 1，等 Ready 后代理。
+3. **免费/付费分层**：默认所有 app 可回收（免费）；付费 app 可经注解 opt-out 永不回收。
+
+#### 架构
+
+```
+客户端 ──HTTP──► Pingora (NodePort)
+                   request_filter:
+                     ① touch(app_id)           [更新 last_accessed,5s 节流]
+                     ② if stopped → ensure_running
+                          hold-and-wait ≤60s → Ready → 代理
+                          超时 → 503 + Retry-After:15
+                   upstream_peer → app_backends[(app_id,port)] → Service → Pod
+
+回收扫描器(后台 interval 1h):
+  list_deployments → decide_recycle → stop_app(scale0)
+
+AppActivityRegistry (in-memory, rcoder 单实例):
+  last_accessed[app_id] / stopped[app_id] / waking[app_id]
+```
+
+三个组件共享 `AppActivityRegistry`（内存态）：
+- **访问追踪**：Pingora `request_filter` 对 `/proxy/apps/{id}/...` 路由调 `touch(app_id)`，
+  5s 节流写入 `last_accessed`。
+- **回收扫描器**：后台 `tokio::time::interval` 循环，枚举 Running app，比对 `last_accessed`
+  与阈值，命中 → `stop_app(scale0)` + `mark_stopped`。判定逻辑抽纯函数 `decide_recycle`
+  便于单测覆盖全部分支。
+- **流量唤醒**：Pingora `request_filter` 检测 `is_stopped(app_id)` → `ensure_running`
+  （scale→1 + 轮询 Ready），并发请求经 `tokio::sync::watch` 合流为一次 scale-up。
+
+#### 配置
+
+全局配置（`UserAppRecycleConfig`，env / config.yml / helm values）：
+
+| 参数 | 默认值 | env | 说明 |
+|---|---|---|---|
+| `enabled` | `true` | `RCODER_USERAPP_RECYCLE_ENABLED` | 总开关（免费用户默认回收） |
+| `idle_timeout_seconds` | `432000`(5天) | `RCODER_USERAPP_IDLE_TIMEOUT_SECONDS` | 闲置超此值触发回收 |
+| `scan_interval_seconds` | `3600`(1h) | `RCODER_USERAPP_SCAN_INTERVAL_SECONDS` | 扫描间隔 |
+| `wake_timeout_seconds` | `60` | `RCODER_USERAPP_WAKE_TIMEOUT_SECONDS` | 唤醒 hold-and-wait 上限 |
+| `protection_seconds` | `300`(5min) | `RCODER_USERAPP_PROTECTION_SECONDS` | 新建 app 最小保护期 |
+
+per-app 覆盖（Deployment 注解，由 `CreateAppRequest`/`UpdateAppRequest`/`recycle-policy` 设置）：
+
+| 注解 | 含义 |
+|---|---|
+| `rcoder.io/recycle-enabled` | `true`/absent = 可回收（免费默认）；`false` = 永不回收（付费） |
+| `rcoder.io/idle-timeout-seconds` | per-app 覆盖全局闲置阈值 |
+
+#### 动态回收策略端点
+
+```text
+POST /api/v1/apps/{app_id}/recycle-policy
+```
+
+```json
+{
+  "recycle_enabled": false,
+  "idle_timeout_seconds": 86400
+}
+```
+
+- 两字段皆 `Option`，`None` = 不改该键；至少一个 `Some`（皆 None → 400 `ERR_VALIDATION`）。
+- K8s：strategic-merge `metadata.annotations`（**不碰 pod template → 不触发 rollout**），下个
+  扫描 tick 生效。
+- Docker：内存态 `DashMap` 存储（dev 模式，重启丢失，与 `pingora_ports` 同架构）。
+- 供计费侧免费↔付费 tier 变更使用（比 `update` 轻：不需 image、不走全量 SSA）。
+
+#### 行为矩阵
+
+| 场景 | 回收 | 唤醒 | 客户端 |
+|---|---|---|---|
+| Running + 频繁访问 | 不回收 | 不触发 | 正常 200 |
+| Running + 闲置 > 阈值 | scale→0 | — | — |
+| Stopped + 来请求 | — | scale→1 → Ready → 代理 | hold-and-wait 后 200（≤60s） |
+| Stopped + 来请求 + 60s 未 Ready | — | 超时 | 503 + Retry-After:15（app 后台继续起） |
+| Stopped + 并发多请求 | — | 合流一次 scale-up | 共享唤醒结果 |
+| 注解 recycle-enabled=false | 跳过 | — | 常驻 Running |
+| Gateway 模式 | 不适用（无访问信号） | 不适用 | 已知限制 |
+
+#### 语义边界
+
+- 回收 = scale-to-zero，**不删 PVC**（数据零风险；销毁存储仍只走 `storage/destroy`）。
+- stopped app 改 recycle 策略 → **不会自动拉起**；只影响"要不要回收"，不影响"要不要常驻"。
+- wake-on-traffic 与 recycle 策略**独立**：stopped app 来流量总唤醒（无论免费/付费）。
+- rcoder 单实例：in-memory `AppActivityRegistry` 一致；多副本需上 DB/注解（v2）。
+- rcoder 重启：`rebuild_stopped_apps` 从 K8s（`replicas==0` → stopped）重建内存态；
+  Running app 种 `last_accessed=now`（给完整 grace 周期）。
+- **Gateway 模式不支持**：HTTPRoute 绕过 rcoder，pingora 无法记录访问 / 触发唤醒。
 
 ---
 
@@ -702,7 +803,10 @@ migrate 在 service 启动前执行。任意 migration 失败会使整组启动�
 - 多 service/source 文件日志快照和 POST SSE；
 - cursor、source_error/recovered、checkpoint 和 heartbeat；
 - 外部 app_manager 日志接口转发到 app-cli；
-- per-app PVC、存储 clear/destroy 及数据库管理接口。
+- per-app PVC、存储 clear/destroy 及数据库管理接口；
+- 闲置自动回收 + 流量唤醒（scale-to-zero + wake-on-traffic + `POST /apps/{id}/recycle-policy`）；
+- per-app 回收策略注解（`rcoder.io/recycle-enabled` / `idle-timeout-seconds`）+ Docker 内存态支持；
+- AppActivityRegistry 内存态（last_accessed/stopped/waking）+ `tokio::sync::watch` 并发去重 + `ensure_running` 拆分分发。
 
 ### 12.2 尚需补齐或验证
 
@@ -774,6 +878,13 @@ migrate 在 service 启动前执行。任意 migration 失败会使整组启动�
 - 不经过 workspace 的任意项目直接发布；
 - CRD/controller 持续对账。
 
+闲置回收的已知限制：
+
+- **Gateway 模式不支持**：HTTPRoute → Envoy 绕过 rcoder，pingora 无法记录访问 / 触发唤醒；
+  当前 Pingora 模式（默认）全支持。切 Gateway 需 Envoy 级钩子（v2）。
+- **rcoder 单实例**：in-memory `AppActivityRegistry` 不支持多副本；多副本需上 DB/注解（v2）。
+- **Docker 模式**：回收策略用内存态，rcoder 重启丢失（dev 模式可接受）。
+
 后续演进顺序：
 
 1. 完成真实容器与 K8s E2E；
@@ -788,6 +899,7 @@ migrate 在 service 启动前执行。任意 migration 失败会使整组启动�
 ## 15. 相关文档
 
 - [`userapp-development-design.md`](./userapp-development-design.md)
+- [`userapp-auto-recycle-design.md`](./userapp-auto-recycle-design.md)
 - [`userapp-workspace/01-quick-start.md`](./userapp-workspace/01-quick-start.md)
 - [`userapp-workspace/02-manifest-reference.md`](./userapp-workspace/02-manifest-reference.md)
 - [`userapp-workspace/03-pingap.md`](./userapp-workspace/03-pingap.md)
