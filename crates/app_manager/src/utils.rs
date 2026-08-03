@@ -49,20 +49,8 @@ pub(super) fn map_archive_error(e: ArchiveError) -> AppOperationError {
         ArchiveError::PathTraversal(msg) => {
             AppOperationError::Validation(format!("archive contains illegal path: {msg}"))
         }
-        ArchiveError::ArchiveBomb { size, max } => AppOperationError::Validation(format!(
-            "archive extraction exceeded size limit: {size} > {max}"
-        )),
         ArchiveError::InvalidArchive(msg) => {
             AppOperationError::Validation(format!("invalid archive: {msg}"))
-        }
-        ArchiveError::TooManyEntries { count, max } => {
-            AppOperationError::Validation(format!("archive has too many entries: {count} > {max}"))
-        }
-        ArchiveError::EntryTooLarge { size, max } => {
-            AppOperationError::Validation(format!("archive entry too large: {size} > {max}"))
-        }
-        ArchiveError::PathTooLong { len, max } => {
-            AppOperationError::Validation(format!("archive entry path too long: {len} > {max}"))
         }
         ArchiveError::Io(e) => map_io_error("archive IO error", e, true),
     }

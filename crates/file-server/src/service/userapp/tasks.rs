@@ -1,8 +1,8 @@
-//! UserApp 异步编译/发布任务:BuildTaskStore(DashMap)+ 状态机 + 进度事件。
+//! UserApp 异步编译/发布任务:BuildTaskStore(Mutex<HashMap>)+ 状态机 + 进度事件。
 //!
 //! 设计参考 app_manager `ReleaseStatus`(Prepared/PendingStart/Active/Failed)状态机;
 //! 进度事件用 `broadcast`(实时 SSE 推送)+ `VecDeque` ring(seq replay,断线重连)。
-//! 无新重依赖:broadcast(tokio)、DashMap、VecDeque(std)。
+//! 无新重依赖:broadcast(tokio)、VecDeque(std)。
 //!
 //! 任务生命周期:Pending(创建)→ Running(spawn 执行)→ Completed/Failed/Cancelled。
 //! cancel 通过 `cancel()` 置位 + 外部 kill 进程组(`kill_process_group`)。
@@ -10,7 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 use chrono::Utc;
 use serde::Serialize;
@@ -91,7 +91,8 @@ pub enum BuildProgressEvent {
     Cancelled,
 }
 
-struct TaskInner {
+/// 任务可变状态:全部收在【一把】`state` 锁后(status/seq/history 同步变更,保证一致性)。
+struct TaskState {
     app_id: String,
     kind: BuildTaskKind,
     status: BuildTaskStatus,
@@ -105,18 +106,21 @@ struct TaskInner {
     error: Option<String>,
     /// workspace 根 (build/publish 工作区): logs/SSE 查询路径解析用。预 resolve 后存入。
     workspace_root: Option<PathBuf>,
-    created_at: i64,
+    seq: u64,
+    history: VecDeque<(u64, BuildProgressEvent)>,
     updated_at: i64,
 }
 
 /// 单个异步任务:状态 + 进度事件流 + cancel + build 进程 pid。
+///
+/// 并发模型:所有可变状态在【一把】`state` 锁后;`emit`/`subscribe` 各取一次锁、互不嵌套调用
+/// (共享临界逻辑在自由函数 [`publish_mut`],它吃 `&mut TaskState`、无 `&self`,类型上无法再去
+/// 取 state 锁),从结构上根除锁序/重入死锁。`cancelled`/`terminal_at`/`created_at`/`pid`
+/// 保持在锁外:供 cancel/store/同步 on_pid 回调无锁读写。
 pub struct BuildTask {
     pub id: BuildTaskId,
-    inner: Mutex<TaskInner>,
+    state: Mutex<TaskState>,
     tx: broadcast::Sender<(u64, BuildProgressEvent)>,
-    history: Mutex<VecDeque<(u64, BuildProgressEvent)>>,
-    event_lock: Mutex<()>,
-    seq: AtomicU64,
     cancelled: AtomicBool,
     terminal_at: AtomicI64,
     created_at: i64,
@@ -131,7 +135,7 @@ impl BuildTask {
         let now = Utc::now().timestamp();
         Arc::new(Self {
             id: Uuid::now_v7().simple().to_string(),
-            inner: Mutex::new(TaskInner {
+            state: Mutex::new(TaskState {
                 app_id,
                 kind,
                 status: BuildTaskStatus::Pending,
@@ -143,13 +147,11 @@ impl BuildTask {
                 file_name: None,
                 error: None,
                 workspace_root: None,
-                created_at: now,
+                seq: 0,
+                history: VecDeque::with_capacity(RING_CAP),
                 updated_at: now,
             }),
             tx,
-            history: Mutex::new(VecDeque::with_capacity(RING_CAP)),
-            event_lock: Mutex::new(()),
-            seq: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
             terminal_at: AtomicI64::new(0),
             created_at: now,
@@ -159,75 +161,70 @@ impl BuildTask {
 
     /// 当前快照(查询用)。
     pub async fn snapshot(&self) -> BuildTaskSnapshot {
-        let inner = self.inner.lock().await;
+        let s = self.state.lock().await;
         BuildTaskSnapshot {
             id: self.id.clone(),
-            app_id: inner.app_id.clone(),
-            kind: inner.kind,
-            status: inner.status,
-            stage: inner.stage.clone(),
-            current_service: inner.current_service.clone(),
-            release_id: inner.release_id.clone(),
-            sha256: inner.sha256.clone(),
-            size_bytes: inner.size_bytes,
-            file_name: inner.file_name.clone(),
-            error: inner.error.clone(),
-            seq: self.seq.load(Ordering::Relaxed),
-            created_at: inner.created_at,
-            updated_at: inner.updated_at,
+            app_id: s.app_id.clone(),
+            kind: s.kind,
+            status: s.status,
+            stage: s.stage.clone(),
+            current_service: s.current_service.clone(),
+            release_id: s.release_id.clone(),
+            sha256: s.sha256.clone(),
+            size_bytes: s.size_bytes,
+            file_name: s.file_name.clone(),
+            error: s.error.clone(),
+            seq: s.seq,
+            created_at: self.created_at,
+            updated_at: s.updated_at,
         }
     }
 
     /// 当前状态(轻量,无完整快照)。
     pub async fn status(&self) -> BuildTaskStatus {
-        self.inner.lock().await.status
+        self.state.lock().await.status
     }
 
     /// 记录 workspace 根 (start_build_task 预 resolve 后存入),供 logs/SSE 解析日志目录。
     pub async fn set_workspace_root(&self, root: PathBuf) {
-        self.inner.lock().await.workspace_root = Some(root);
+        self.state.lock().await.workspace_root = Some(root);
     }
 
     /// workspace 根; 任务 resolve 前为 None (logs handler 据此判断日志目录是否就绪)。
     pub async fn workspace_root(&self) -> Option<PathBuf> {
-        self.inner.lock().await.workspace_root.clone()
+        self.state.lock().await.workspace_root.clone()
     }
 
-    /// 发进度事件:apply 状态副作用 → seq++ → ring → broadcast。
+    /// 发进度事件:取一次 state 锁 → [`publish_mut`] → 释放 → broadcast。
+    /// 已 Completed/Failed/Cancelled 的任务丢弃后续事件(终态)。
+    /// 发进度事件:取一次 state 锁 → [`publish_mut`] → broadcast → 释放。
     /// 已 Completed/Failed/Cancelled 的任务丢弃后续事件(终态)。
     pub async fn emit(&self, event: BuildProgressEvent) {
-        let _event_guard = self.event_lock.lock().await;
-        let mut inner = self.inner.lock().await;
-        if is_terminal_status(inner.status) {
-            return;
-        }
-        apply_event(&mut inner, &event);
-        let terminal = is_terminal_status(inner.status);
-        let s = self.seq.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut h = self.history.lock().await;
-            if h.len() >= RING_CAP {
-                h.pop_front();
-            }
-            h.push_back((s, event.clone()));
-        }
-        // 无订阅者时 send 报错,属正常,忽略。
-        let _ = self.tx.send((s, event));
+        let terminal = {
+            let mut s = self.state.lock().await;
+            let Some((seq, event, terminal)) = publish_mut(&mut s, event) else {
+                return;
+            };
+            // broadcast 必须在持 state 锁内:与 subscribe 的"创建 receiver + 读 replay"互斥串行,
+            // 否则同一事件可能既进 replay 又被 receiver 收到 → 重复(broadcast::send 非阻塞,持锁安全)。
+            let _ = self.tx.send((seq, event));
+            terminal
+        };
         if terminal {
             self.terminal_at
                 .store(Utc::now().timestamp(), Ordering::Release);
         }
-        drop(inner);
     }
 
     pub async fn is_terminal(&self) -> bool {
         matches!(
-            self.inner.lock().await.status,
+            self.state.lock().await.status,
             BuildTaskStatus::Completed | BuildTaskStatus::Failed | BuildTaskStatus::Cancelled
         )
     }
 
     /// 订阅:回放 ring 里 seq >= from_seq 的历史 + 实时 broadcast receiver。
+    /// 一把 state 锁兜住"创建 receiver + 取 replay",保证两者之间无 emit 缝隙。
     /// 供 SSE 断线重连(带 from_seq)+ 首次订阅(from_seq=0)。
     pub async fn subscribe(
         &self,
@@ -236,14 +233,12 @@ impl BuildTask {
         Vec<(u64, BuildProgressEvent)>,
         broadcast::Receiver<(u64, BuildProgressEvent)>,
     ) {
-        let _event_guard = self.event_lock.lock().await;
+        let s = self.state.lock().await;
         let receiver = self.tx.subscribe();
-        let replay = self
+        let replay = s
             .history
-            .lock()
-            .await
             .iter()
-            .filter(|(s, _)| *s >= from_seq)
+            .filter(|(seq, _)| *seq >= from_seq)
             .cloned()
             .collect();
         (replay, receiver)
@@ -284,21 +279,43 @@ fn is_terminal_status(status: BuildTaskStatus) -> bool {
     )
 }
 
-fn apply_event(inner: &mut TaskInner, event: &BuildProgressEvent) {
-    inner.updated_at = Utc::now().timestamp();
+/// 临界逻辑(自由函数,吃 `&mut TaskState`、无 `&self`):终态检查 → apply → seq → ring。
+/// 返回 `(seq, event, terminal)`:event 供调用方在【持 state 锁时】做 broadcast(必须持锁,
+/// 与 subscribe 串行,防同一事件既进 replay 又进 broadcast);任务已终态返回 None。
+/// 没有 `&self` → 类型上无法再去取 state 锁 → 根除"持锁时调 emit"的重入死锁(与 rcoder PublishTask 同构)。
+fn publish_mut(
+    state: &mut TaskState,
+    event: BuildProgressEvent,
+) -> Option<(u64, BuildProgressEvent, bool)> {
+    if is_terminal_status(state.status) {
+        return None;
+    }
+    apply_event(state, &event);
+    let terminal = is_terminal_status(state.status);
+    let seq = state.seq;
+    state.seq += 1;
+    if state.history.len() >= RING_CAP {
+        state.history.pop_front();
+    }
+    state.history.push_back((seq, event.clone()));
+    Some((seq, event, terminal))
+}
+
+fn apply_event(state: &mut TaskState, event: &BuildProgressEvent) {
+    state.updated_at = Utc::now().timestamp();
     match event {
         BuildProgressEvent::Stage { stage } => {
-            inner.stage = Some(stage.clone());
-            inner.status = BuildTaskStatus::Running;
+            state.stage = Some(stage.clone());
+            state.status = BuildTaskStatus::Running;
         }
         BuildProgressEvent::Building { service } => {
-            inner.current_service = Some(service.clone());
-            inner.status = BuildTaskStatus::Running;
+            state.current_service = Some(service.clone());
+            state.status = BuildTaskStatus::Running;
         }
-        BuildProgressEvent::BuildOk { .. } => inner.current_service = None,
+        BuildProgressEvent::BuildOk { .. } => state.current_service = None,
         BuildProgressEvent::BuildFail { service, error } => {
-            inner.current_service = Some(service.clone());
-            inner.error = Some(error.clone());
+            state.current_service = Some(service.clone());
+            state.error = Some(error.clone());
         }
         BuildProgressEvent::Log { .. } => {}
         BuildProgressEvent::Completed {
@@ -307,17 +324,17 @@ fn apply_event(inner: &mut TaskInner, event: &BuildProgressEvent) {
             size_bytes,
             file_name,
         } => {
-            inner.release_id = Some(release_id.clone());
-            inner.sha256 = Some(sha256.clone());
-            inner.size_bytes = Some(*size_bytes);
-            inner.file_name = Some(file_name.clone());
-            inner.status = BuildTaskStatus::Completed;
+            state.release_id = Some(release_id.clone());
+            state.sha256 = Some(sha256.clone());
+            state.size_bytes = Some(*size_bytes);
+            state.file_name = Some(file_name.clone());
+            state.status = BuildTaskStatus::Completed;
         }
         BuildProgressEvent::Failed { error } => {
-            inner.error = Some(error.clone());
-            inner.status = BuildTaskStatus::Failed;
+            state.error = Some(error.clone());
+            state.status = BuildTaskStatus::Failed;
         }
-        BuildProgressEvent::Cancelled => inner.status = BuildTaskStatus::Cancelled,
+        BuildProgressEvent::Cancelled => state.status = BuildTaskStatus::Cancelled,
     }
 }
 

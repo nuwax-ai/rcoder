@@ -2,25 +2,17 @@
 //!
 //! Provides safe extraction for tar.gz and zip archives with:
 //! - Path traversal protection
-//! - Zip bomb protection (size limits)
 //! - Directory normalization (strip single wrapper directory)
+//!
+//! 资源限制(总解压字节/entry 数/单文件大小)有意不加:解压发生在用户隔离的容器内,由容器/PVC
+//! 配额作主边界;用户自己的内容用爆了,重启容器即可恢复。仅保留 path-traversal 安全边界
+//! (防 entry 越出 dest_dir 写到别处)。
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use tracing::{error, warn};
-
-/// Maximum extracted size (1GB)
-const MAX_EXTRACTED_SIZE: u64 = 1024 * 1024 * 1024;
-/// 最大 entry 数(文件/目录/符号链接总数;防零字节文件耗尽 inode/CPU)。
-const MAX_ENTRY_COUNT: usize = 100_000;
-/// 单个文件最大解压字节(防超大单文件单独突破总量限制前的资源占用)。
-const MAX_PER_FILE_SIZE: u64 = 512 * 1024 * 1024;
-/// 单个 entry 最大路径字节数(防超长路径)。
-const MAX_PATH_LEN: usize = 4096;
-/// 解压后文件权限掩码:剥离 setuid/setgid/sticky 等危险位。
-const SAFE_MODE_MASK: u32 = 0o1777;
 
 /// Archive extraction error
 #[derive(Debug)]
@@ -29,14 +21,6 @@ pub enum ArchiveError {
     Io(std::io::Error),
     /// Path traversal attempt detected
     PathTraversal(String),
-    /// Archive bomb detected (too large)
-    ArchiveBomb { size: u64, max: u64 },
-    /// Entry 数量超限(防 inode/CPU 耗尽)
-    TooManyEntries { count: usize, max: usize },
-    /// 单文件超限
-    EntryTooLarge { size: u64, max: u64 },
-    /// Entry 路径过长
-    PathTooLong { len: usize, max: usize },
     /// Invalid archive format
     InvalidArchive(String),
 }
@@ -46,25 +30,6 @@ impl std::fmt::Display for ArchiveError {
         match self {
             ArchiveError::Io(e) => write!(f, "IO error: {}", e),
             ArchiveError::PathTraversal(msg) => write!(f, "Path traversal: {}", msg),
-            ArchiveError::ArchiveBomb { size, max } => {
-                write!(
-                    f,
-                    "Archive bomb: {} bytes exceeds limit of {} bytes",
-                    size, max
-                )
-            }
-            ArchiveError::TooManyEntries { count, max } => {
-                write!(f, "Too many entries: {count} exceeds limit of {max}")
-            }
-            ArchiveError::EntryTooLarge { size, max } => {
-                write!(
-                    f,
-                    "Entry too large: {size} bytes exceeds limit of {max} bytes"
-                )
-            }
-            ArchiveError::PathTooLong { len, max } => {
-                write!(f, "Entry path too long: {len} bytes exceeds limit of {max}")
-            }
             ArchiveError::InvalidArchive(msg) => write!(f, "Invalid archive: {}", msg),
         }
     }
@@ -86,29 +51,14 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
 
-    let mut total_uncompressed: u64 = 0;
     let mut file_count: usize = 0;
-    let mut entry_count: usize = 0;
     let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        entry_count += 1;
-        if entry_count > MAX_ENTRY_COUNT {
-            return Err(ArchiveError::TooManyEntries {
-                count: entry_count,
-                max: MAX_ENTRY_COUNT,
-            });
-        }
         let entry_path = entry.path()?.into_owned();
 
         let sanitized = sanitize_entry_path(&entry_path)?;
-        if sanitized.as_os_str().len() > MAX_PATH_LEN {
-            return Err(ArchiveError::PathTooLong {
-                len: sanitized.as_os_str().len(),
-                max: MAX_PATH_LEN,
-            });
-        }
         let dest_path = dest_dir.join(&sanitized);
 
         // Path safety check
@@ -121,21 +71,6 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
         }
 
         let entry_type = entry.header().entry_type();
-        let entry_size = entry.header().size()?;
-        if entry_size > MAX_PER_FILE_SIZE {
-            return Err(ArchiveError::EntryTooLarge {
-                size: entry_size,
-                max: MAX_PER_FILE_SIZE,
-            });
-        }
-
-        total_uncompressed = total_uncompressed.saturating_add(entry_size);
-        if total_uncompressed > MAX_EXTRACTED_SIZE {
-            return Err(ArchiveError::ArchiveBomb {
-                size: total_uncompressed,
-                max: MAX_EXTRACTED_SIZE,
-            });
-        }
 
         if entry_type.is_dir() {
             if !created_dirs.contains(&dest_path) {
@@ -154,15 +89,12 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
                 out.write_all(&buf[..n])?;
             }
 
+            // 保留归档内文件权限位(如可执行位),不做剥离 —— 容器隔离下由用户自己负责。
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = entry.header().mode()?;
-                // 屏蔽 setuid/setgid/sticky 等危险位(#18)。
-                std::fs::set_permissions(
-                    &dest_path,
-                    std::fs::Permissions::from_mode(mode & SAFE_MODE_MASK),
-                )?;
+                std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(mode))?;
             }
         } else if entry_type.is_symlink() {
             // Skip symlinks for safety
@@ -186,32 +118,17 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, Archiv
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| ArchiveError::InvalidArchive(format!("open zip: {e}")))?;
 
-    let mut total_uncompressed: u64 = 0;
     let mut file_count: usize = 0;
-    let mut entry_count: usize = 0;
     let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| ArchiveError::InvalidArchive(format!("read zip entry {i}: {e}")))?;
-        entry_count += 1;
-        if entry_count > MAX_ENTRY_COUNT {
-            return Err(ArchiveError::TooManyEntries {
-                count: entry_count,
-                max: MAX_ENTRY_COUNT,
-            });
-        }
         let entry_name = entry.name().to_string();
         let entry_path = PathBuf::from(&entry_name);
 
         let sanitized = sanitize_entry_path(&entry_path)?;
-        if sanitized.as_os_str().len() > MAX_PATH_LEN {
-            return Err(ArchiveError::PathTooLong {
-                len: sanitized.as_os_str().len(),
-                max: MAX_PATH_LEN,
-            });
-        }
         let dest_path = dest_dir.join(&sanitized);
 
         if let Some(parent) = dest_path.parent()
@@ -220,21 +137,6 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, Archiv
             std::fs::create_dir_all(parent)?;
             ensure_within(&dest_path, dest_dir)?;
             created_dirs.insert(parent.to_path_buf());
-        }
-
-        let entry_size = entry.size();
-        if entry_size > MAX_PER_FILE_SIZE {
-            return Err(ArchiveError::EntryTooLarge {
-                size: entry_size,
-                max: MAX_PER_FILE_SIZE,
-            });
-        }
-        total_uncompressed = total_uncompressed.saturating_add(entry_size);
-        if total_uncompressed > MAX_EXTRACTED_SIZE {
-            return Err(ArchiveError::ArchiveBomb {
-                size: total_uncompressed,
-                max: MAX_EXTRACTED_SIZE,
-            });
         }
 
         if entry.is_dir() {
@@ -247,14 +149,11 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, Archiv
             let mut out = File::create(&dest_path)?;
             std::io::copy(&mut entry, &mut out)?;
 
+            // 保留归档内文件权限位(如可执行位),不做剥离 —— 容器隔离下由用户自己负责。
             #[cfg(unix)]
             if let Some(mode) = entry.unix_mode() {
                 use std::os::unix::fs::PermissionsExt;
-                // 屏蔽 setuid/setgid/sticky 等危险位(#18)。
-                std::fs::set_permissions(
-                    &dest_path,
-                    std::fs::Permissions::from_mode(mode & SAFE_MODE_MASK),
-                )?;
+                std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(mode))?;
             }
         }
     }
@@ -580,9 +479,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_tar_strips_setuid_setgid_sticky_bits() {
+    fn extract_tar_preserves_file_permissions() {
+        // 资源/权限限制已移除(容器隔离):归档内的权限位原样保留(含可执行位),不做剥离。
         let tmp = tempdir().unwrap();
-        let archive = tmp.path().join("setuid.tar.gz");
+        let archive = tmp.path().join("perms.tar.gz");
         let extract_to = tmp.path().join("out");
         std::fs::create_dir_all(&extract_to).unwrap();
 
@@ -593,15 +493,13 @@ mod tests {
             let mut header = tar::Header::new_gnu();
             let data = b"#!/bin/sh\necho hi\n";
             header.set_size(data.len() as u64);
-            // setuid(0o4000) + rwxr-xr-x —— 解压后必须剥离 setuid 位(#18)。
-            header.set_mode(0o4755);
+            header.set_mode(0o755);
             header.set_cksum();
             tar.append_data(&mut header, "hello", &data[..]).unwrap();
             tar.into_inner().unwrap().finish().unwrap();
         }
 
-        let count = extract_tar_gz(&archive, &extract_to).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(extract_tar_gz(&archive, &extract_to).unwrap(), 1);
 
         #[cfg(unix)]
         {
@@ -610,12 +508,7 @@ mod tests {
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(
-                mode & 0o7000,
-                0,
-                "setuid/setgid/sticky bits must be stripped"
-            );
-            assert_eq!(mode & 0o777, 0o755, "regular rwx bits must be preserved");
+            assert_eq!(mode & 0o111, 0o111, "executable bits must be preserved");
         }
     }
 

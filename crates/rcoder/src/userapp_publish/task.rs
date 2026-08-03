@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use chrono::Utc;
 use serde::Serialize;
@@ -98,7 +98,8 @@ pub struct PublishTaskSnapshot {
     pub updated_at: i64,
 }
 
-struct TaskInner {
+/// 任务可变状态:全部收在【一把】`state` 锁后(status/seq/history 同步变更,保证一致性)。
+struct TaskState {
     app_id: String,
     project_id: String,
     kind: PublishTaskKind,
@@ -106,19 +107,21 @@ struct TaskInner {
     stage: Option<String>,
     release_id: Option<String>,
     error: Option<String>,
-    created_at: i64,
+    seq: u64,
+    history: VecDeque<(u64, PublishEvent)>,
     updated_at: i64,
 }
 
 /// 单个异步任务:状态 + 进度事件流 + cancel。
+///
+/// 并发模型:所有可变状态在【一把】`state` 锁后;`emit`/`request_cancel`/`subscribe` 各取一次锁、
+/// 互不嵌套调用(共享临界逻辑在自由函数 [`publish_mut`],它吃 `&mut TaskState`、无 `&self`,
+/// 类型上无法再去取 state 锁),从结构上根除锁序/重入死锁。`cancelled`/`terminal_at`/`created_at`
+/// 保持在锁外:供 orchestrator/store 无锁读。
 pub struct PublishTask {
     pub id: PublishTaskId,
-    inner: Mutex<TaskInner>,
+    state: Mutex<TaskState>,
     tx: broadcast::Sender<(u64, PublishEvent)>,
-    history: Mutex<VecDeque<(u64, PublishEvent)>>,
-    /// 串行化状态转移、seq、history 与 broadcast，避免终态被并发覆盖。
-    event_lock: Mutex<()>,
-    seq: AtomicU64,
     cancelled: AtomicBool,
     cancel_notify: Notify,
     terminal_at: AtomicI64,
@@ -138,7 +141,7 @@ impl PublishTask {
         let now = Utc::now().timestamp();
         Arc::new(Self {
             id: uuid::Uuid::now_v7().simple().to_string(),
-            inner: Mutex::new(TaskInner {
+            state: Mutex::new(TaskState {
                 app_id,
                 project_id,
                 kind,
@@ -146,13 +149,11 @@ impl PublishTask {
                 stage: None,
                 release_id: None,
                 error: None,
-                created_at: now,
+                seq: 0,
+                history: VecDeque::with_capacity(RING_CAP),
                 updated_at: now,
             }),
             tx,
-            history: Mutex::new(VecDeque::with_capacity(RING_CAP)),
-            event_lock: Mutex::new(()),
-            seq: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
             cancel_notify: Notify::new(),
             terminal_at: AtomicI64::new(0),
@@ -163,104 +164,72 @@ impl PublishTask {
 
     /// 当前快照(查询用)。
     pub async fn snapshot(&self) -> PublishTaskSnapshot {
-        let inner = self.inner.lock().await;
+        let s = self.state.lock().await;
         PublishTaskSnapshot {
             id: self.id.clone(),
-            app_id: inner.app_id.clone(),
-            project_id: inner.project_id.clone(),
-            kind: inner.kind,
-            status: inner.status,
-            stage: inner.stage.clone(),
-            release_id: inner.release_id.clone(),
-            error: inner.error.clone(),
-            seq: self.seq.load(Ordering::Relaxed),
-            created_at: inner.created_at,
-            updated_at: inner.updated_at,
+            app_id: s.app_id.clone(),
+            project_id: s.project_id.clone(),
+            kind: s.kind,
+            status: s.status,
+            stage: s.stage.clone(),
+            release_id: s.release_id.clone(),
+            error: s.error.clone(),
+            seq: s.seq,
+            created_at: self.created_at,
+            updated_at: s.updated_at,
         }
     }
 
     pub async fn is_terminal(&self) -> bool {
-        matches!(
-            self.inner.lock().await.status,
-            PublishTaskStatus::Completed | PublishTaskStatus::Failed | PublishTaskStatus::Cancelled
-        )
+        is_terminal_status(self.state.lock().await.status)
     }
 
-    /// 发进度事件:apply 状态副作用 → seq++ → ring → broadcast。终态后丢弃后续事件。
+    /// 当前状态(轻量,无完整快照)。
+    pub async fn status(&self) -> PublishTaskStatus {
+        self.state.lock().await.status
+    }
+
+    /// 发进度事件:取一次 state 锁 → [`publish_mut`] → broadcast → 释放。终态后丢弃后续事件。
     pub async fn emit(&self, event: PublishEvent) {
-        let _event_guard = self.event_lock.lock().await;
-        self.emit_locked(event).await;
-    }
-
-    /// 假设调用方已持有 `event_lock`(供 `request_cancel` 在同一临界区内做原子 check+转移+emit)。
-    async fn emit_locked(&self, mut event: PublishEvent) {
-        let mut inner = self.inner.lock().await;
-        if is_terminal_status(inner.status) {
-            return;
-        }
-        // 单事件字节上限:超大的 build 进度对象会撑大 ring(1000 事件 × N MB)。超限替换为截断标记(#11)。
-        if let PublishEvent::BuildProgress { data } = &mut event
-            && let Ok(bytes) = serde_json::to_vec(data)
-            && bytes.len() > MAX_EVENT_BYTES
-        {
-            let orig_len = bytes.len();
-            tracing::warn!(
-                task_id = %self.id,
-                orig_len,
-                max_bytes = MAX_EVENT_BYTES,
-                "build progress event exceeds byte cap, truncating before ring/broadcast"
-            );
-            *data = serde_json::json!({
-                "truncated": true,
-                "origLen": orig_len,
-                "maxBytes": MAX_EVENT_BYTES,
-            });
-        }
-        apply_event(&mut inner, &event);
-        let terminal = is_terminal_status(inner.status);
-        let s = self.seq.fetch_add(1, Ordering::Relaxed);
-        // event_lock 已保证事件顺序，状态更新完成后无需在等待 history 锁时继续持有 inner。
-        drop(inner);
-        {
-            let mut h = self.history.lock().await;
-            if h.len() >= RING_CAP {
-                h.pop_front();
-            }
-            h.push_back((s, event.clone()));
-        }
-        let _ = self.tx.send((s, event));
+        let terminal = {
+            let mut s = self.state.lock().await;
+            let Some((seq, event, terminal)) = publish_mut(&mut s, event) else {
+                return;
+            };
+            // broadcast 必须在持 state 锁内:与 subscribe 的"创建 receiver + 读 replay"互斥串行,
+            // 否则同一事件可能既进 replay 又被 receiver 收到 → 重复(broadcast::send 非阻塞,持锁安全)。
+            let _ = self.tx.send((seq, event));
+            terminal
+        };
         if terminal {
             self.terminal_at
                 .store(Utc::now().timestamp(), Ordering::Release);
         }
     }
 
-    /// 当前状态(轻量,无完整快照)。
-    pub async fn status(&self) -> PublishTaskStatus {
-        self.inner.lock().await.status
-    }
-
-    /// 原子取消请求(在 `event_lock` 内:check 终态 → 置 flag+notify → emit Cancelling)。
-    /// 把"检查终态 + 状态转移"收成一次临界区,消除 cancel handler 在 check 与 emit 之间被
-    /// Completed 抢入导致的撒谎窗口(#5)。返回 Accepted 表示已进入非终态 Cancelling,终态
-    /// Cancelled/Failed 由 orchestrator 完成远端取消/回滚后收敛;返回 AlreadyTerminal 时任务
-    /// 已终态,携带实际状态供调用方如实回传。
+    /// 原子取消请求:取一次 state 锁 → check 终态 → [`publish_mut`](Cancelling) → 释放 → 置 flag+notify。
+    /// 与 `emit` 是【平级兄弟】(都只调 `publish_mut`,互不调用),不再有"持锁时调 emit"的重入死锁。
+    /// 返回 Accepted 表示已进入非终态 Cancelling,终态 Cancelled/Failed 由 orchestrator 完成远端
+    /// 取消/回滚后收敛;返回 AlreadyTerminal 时任务已终态,携带实际状态供调用方如实回传(#5)。
     pub async fn request_cancel(&self) -> CancelAttempt {
-        let _event_guard = self.event_lock.lock().await;
-        {
-            let inner = self.inner.lock().await;
-            if is_terminal_status(inner.status) {
-                return CancelAttempt::AlreadyTerminal(inner.status);
-            }
+        let mut s = self.state.lock().await;
+        if is_terminal_status(s.status) {
+            return CancelAttempt::AlreadyTerminal(s.status);
         }
+        // check + 转移 + 广播在同一把锁内原子完成(同 emit,防 replay/broadcast 重复;
+        // 也不会被并发终态在 check 与转移之间抢入)。
+        let Some((seq, event, _)) = publish_mut(&mut s, PublishEvent::Cancelling) else {
+            unreachable!("status was checked non-terminal above");
+        };
+        let _ = self.tx.send((seq, event));
+        drop(s);
         // 唤醒 orchestrator 的 cancellation_notified 等待者(置 flag + notify)。
         self.cancel();
-        // 通知 SSE 客户端"取消中"(非终态事件;持有 event_lock,不会被并发终态覆盖)。
-        self.emit_locked(PublishEvent::Cancelling).await;
         CancelAttempt::Accepted
     }
 
     /// 订阅:回放 ring 里 seq >= from_seq 的历史 + 实时 broadcast receiver。
+    /// 一把 state 锁兜住"创建 receiver + 取 replay",保证两者之间无 emit 缝隙。
     pub async fn subscribe(
         &self,
         from_seq: u64,
@@ -268,15 +237,12 @@ impl PublishTask {
         Vec<(u64, PublishEvent)>,
         broadcast::Receiver<(u64, PublishEvent)>,
     ) {
-        let _event_guard = self.event_lock.lock().await;
-        // 必须先创建 receiver，再取 replay。event_lock 保证两者之间无 emit。
+        let s = self.state.lock().await;
         let receiver = self.tx.subscribe();
-        let replay = self
+        let replay = s
             .history
-            .lock()
-            .await
             .iter()
-            .filter(|(s, _)| *s >= from_seq)
+            .filter(|(seq, _)| *seq >= from_seq)
             .cloned()
             .collect();
         (replay, receiver)
@@ -286,7 +252,7 @@ impl PublishTask {
         self.cancelled.load(Ordering::Relaxed)
     }
 
-    /// 标记取消(外部再调 agent-runner cancel_build + 顶层 emit Cancelled)。
+    /// 标记取消(供 orchestrator 的 cancellation_notified 感知;终态 emit 由顶层统一做)。
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
         self.cancel_notify.notify_waiters();
@@ -318,24 +284,62 @@ fn is_terminal_status(status: PublishTaskStatus) -> bool {
     )
 }
 
-fn apply_event(inner: &mut TaskInner, event: &PublishEvent) {
-    inner.updated_at = Utc::now().timestamp();
+/// 临界逻辑(自由函数,吃 `&mut TaskState`、无 `&self`):终态检查 → #11 截断 → apply → seq → ring。
+/// 返回 `(seq, event, terminal)` 供调用方在【释放锁后】做 broadcast + terminal_at;任务已终态返回 None。
+/// 没有 `&self` → 类型上无法再去取 state 锁 → 根除"持锁时调 emit"的重入死锁。
+fn publish_mut(
+    state: &mut TaskState,
+    mut event: PublishEvent,
+) -> Option<(u64, PublishEvent, bool)> {
+    if is_terminal_status(state.status) {
+        return None;
+    }
+    // 单事件字节上限:超大的 build 进度对象会撑大 ring(1000 事件 × N MB)。超限替换为截断标记(#11)。
+    if let PublishEvent::BuildProgress { data } = &mut event
+        && let Ok(bytes) = serde_json::to_vec(data)
+        && bytes.len() > MAX_EVENT_BYTES
+    {
+        let orig_len = bytes.len();
+        tracing::warn!(
+            orig_len,
+            max_bytes = MAX_EVENT_BYTES,
+            "build progress event exceeds byte cap, truncating before ring/broadcast"
+        );
+        *data = serde_json::json!({
+            "truncated": true,
+            "origLen": orig_len,
+            "maxBytes": MAX_EVENT_BYTES,
+        });
+    }
+    apply_event(state, &event);
+    let terminal = is_terminal_status(state.status);
+    let seq = state.seq;
+    state.seq += 1;
+    if state.history.len() >= RING_CAP {
+        state.history.pop_front();
+    }
+    state.history.push_back((seq, event.clone()));
+    Some((seq, event, terminal))
+}
+
+fn apply_event(state: &mut TaskState, event: &PublishEvent) {
+    state.updated_at = Utc::now().timestamp();
     match event {
         PublishEvent::Stage { stage } => {
-            inner.stage = Some(stage.clone());
-            inner.status = PublishTaskStatus::Running;
+            state.stage = Some(stage.clone());
+            state.status = PublishTaskStatus::Running;
         }
-        PublishEvent::BuildProgress { .. } => inner.status = PublishTaskStatus::Running,
-        PublishEvent::Cancelling => inner.status = PublishTaskStatus::Cancelling,
+        PublishEvent::BuildProgress { .. } => state.status = PublishTaskStatus::Running,
+        PublishEvent::Cancelling => state.status = PublishTaskStatus::Cancelling,
         PublishEvent::Completed { release_id } => {
-            inner.release_id = Some(release_id.clone());
-            inner.status = PublishTaskStatus::Completed;
+            state.release_id = Some(release_id.clone());
+            state.status = PublishTaskStatus::Completed;
         }
         PublishEvent::Failed { error } => {
-            inner.error = Some(error.clone());
-            inner.status = PublishTaskStatus::Failed;
+            state.error = Some(error.clone());
+            state.status = PublishTaskStatus::Failed;
         }
-        PublishEvent::Cancelled => inner.status = PublishTaskStatus::Cancelled,
+        PublishEvent::Cancelled => state.status = PublishTaskStatus::Cancelled,
     }
 }
 
@@ -520,6 +524,89 @@ mod tests {
                 );
             }
             other => panic!("expected BuildProgress, got {other:?}"),
+        }
+    }
+
+    /// 并发 emit + request_cancel 不应死锁/卡住(回归守护:state 单锁 + publish_mut 无重入)。
+    #[tokio::test]
+    async fn concurrent_emit_and_request_cancel_do_not_deadlock() {
+        let task = Arc::new(PublishTask::new(
+            "app-a".into(),
+            "app-a".into(),
+            PublishTaskKind::Publish,
+        ));
+        let t = Arc::clone(&task);
+        let emitter = tokio::spawn(async move {
+            for i in 0..200_u32 {
+                t.emit(PublishEvent::BuildProgress {
+                    data: serde_json::json!({ "i": i }),
+                })
+                .await;
+            }
+        });
+        let t = Arc::clone(&task);
+        let canceller = tokio::spawn(async move { t.request_cancel().await });
+        // 若死锁,timeout 触发失败。
+        let (_, cancel_result) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            (emitter.await, canceller.await)
+        })
+        .await
+        .expect("emit + request_cancel must not deadlock");
+        let _ = cancel_result.expect("canceller task panicked");
+        // 收敛:任务最终进入某个终态或 Cancelling,且不卡。
+        let _ = task.status().await;
+    }
+
+    /// 并发回归守护:多 emit + 多 subscribe 并发,任一订阅者不应在 replay 与 broadcast 中
+    /// 收到同一 seq 两次。这条不变量依赖"broadcast 必须在持 state 锁内、与 subscribe 串行"——
+    /// 若 tx.send 被移到锁外,会在 [ring push, send] 窗口内让某订阅者既从 replay 又从 broadcast
+    /// 拿到同一事件(重复)。测试在多线程下反复触发该窗口,有 bug 必然失败。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn subscribers_never_receive_duplicate_seq_under_concurrency() {
+        let task = Arc::new(PublishTask::new(
+            "app-a".into(),
+            "app-a".into(),
+            PublishTaskKind::Publish,
+        ));
+        let mut handles = Vec::new();
+
+        // 生产者:持续 emit 进度事件。
+        let producer = Arc::clone(&task);
+        handles.push(tokio::spawn(async move {
+            for i in 0..300_u64 {
+                producer
+                    .emit(PublishEvent::BuildProgress {
+                        data: serde_json::json!({ "i": i }),
+                    })
+                    .await;
+            }
+        }));
+
+        // 4 个订阅者:各自 replay + 消费广播,断言无 seq 在 replay∪broadcast 中重复。
+        for _ in 0..4 {
+            let t = Arc::clone(&task);
+            handles.push(tokio::spawn(async move {
+                let (replay, mut rx) = t.subscribe(0).await;
+                let mut seen = std::collections::HashSet::new();
+                for (seq, _) in replay {
+                    assert!(seen.insert(seq), "duplicate seq {seq} from replay");
+                }
+                loop {
+                    match tokio::time::timeout(std::time::Duration::from_millis(30), rx.recv())
+                        .await
+                    {
+                        Ok(Ok((seq, _))) => {
+                            assert!(seen.insert(seq), "duplicate seq {seq} from broadcast")
+                        }
+                        Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                        _ => break, // Closed 或超时(生产者停 + 静默)
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
         }
     }
 
