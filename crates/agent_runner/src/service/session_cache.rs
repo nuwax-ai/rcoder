@@ -77,9 +77,17 @@ pub struct SessionData {
     current_connection: CurrentConnection,
     // 🔒 Critical fix: 存储 worker JoinHandle，用于检测 panic
     worker_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// session 的 stream epoch(每次 new 生成新值)。rcoder 据此判断 seq epoch 是否变化:
+    /// 进程重启 / SessionWorker panic 重建都会 new → 新 epoch → rcoder 重置 last_seq + 清 ring(#15)。
+    epoch: String,
 }
 
 impl SessionData {
+    /// 该 session 的 stream epoch(进程重启/worker panic 重建会换新)。供 rcoder 判断 seq epoch。
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
     pub async fn new(max_size: usize) -> Arc<Self> {
         let start_time = std::time::Instant::now();
         debug!(
@@ -99,6 +107,7 @@ impl SessionData {
             command_tx,
             current_connection: Arc::new(ArcSwapOption::empty()),
             worker_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            epoch: uuid::Uuid::now_v7().simple().to_string(),
         });
         debug!(
             "[SessionData::new] Arc creation took: {:?}",

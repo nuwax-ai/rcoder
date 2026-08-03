@@ -37,6 +37,7 @@ pub async fn get_status(
             return Ok(Response::new(GetStatusResponse {
                 status: "not_found".to_string(),
                 is_found: false,
+                stream_epoch: None,
             }));
         };
 
@@ -71,9 +72,17 @@ pub async fn get_status(
             status_str, is_found, project_id
         );
 
+        // session 的 stream epoch(供 rcoder 判断 seq epoch 是否变化,#15)。
+        let stream_epoch = if !req.session_id.is_empty() {
+            crate::service::SESSION_CACHE.view(&req.session_id, |_, d| d.epoch().to_string())
+        } else {
+            None
+        };
+
         Ok(Response::new(GetStatusResponse {
             status: status_str.to_string(),
             is_found,
+            stream_epoch,
         }))
     })
     .await

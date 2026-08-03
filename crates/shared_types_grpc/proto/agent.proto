@@ -196,6 +196,10 @@ message GetStatusRequest {
 message GetStatusResponse {
   string status = 1; // "idle", "busy", "error"
   bool is_found = 2; // Agent 是否存在于 Registry
+  // session 的 stream epoch(per-SessionData 生成,重启 + worker panic 重建都会换新)。
+  // rcoder 据此判断 seq epoch:同 epoch → 增量订阅保留 last_seq;epoch 变化 → 重置 last_seq
+  // + 清 ring + cursor-reset,避免新 epoch 的低 seq 事件被客户端去重静默丢弃(#15)。
+  optional string stream_epoch = 3;
 }
 
 // === Stop Agent ===

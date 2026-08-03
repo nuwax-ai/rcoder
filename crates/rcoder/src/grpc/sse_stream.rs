@@ -130,6 +130,10 @@ async fn forward_to_client(
     client_last_seq: &mut u64,
 ) -> bool {
     let is_terminal = ev.message_type == "SessionPromptEnd";
+    // cursor-reset(#15):epoch 变化 → 重置客户端去重游标,让新 epoch 的低 seq 事件不被去重丢弃。
+    if ev.message_type == "StreamReset" {
+        *client_last_seq = 0;
+    }
     let sse_event = progress_event_to_sse(ev, session_id);
     if tx.send(Ok(sse_event)).await.is_err() {
         return false; // HTTP 客户端断开

@@ -162,6 +162,9 @@ pub struct SharedStream {
     ring: Mutex<HeapRb<(u64, SharedEvent)>>,
     ref_count: AtomicUsize,
     last_seq: AtomicU64,
+    /// agent_runner 该 session 的 stream epoch(GetStatus 返回)。同 epoch → 保留 last_seq 增量订阅;
+    /// epoch 变化(agent 重启/worker panic 重建)→ 重置 last_seq + 清 ring + cursor-reset(#15)。
+    epoch: Mutex<Option<String>>,
     last_activity_secs: AtomicI64,
     activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
     cancel_token: CancellationToken,
@@ -184,6 +187,7 @@ impl SharedStream {
             ring: Mutex::new(HeapRb::<(u64, SharedEvent)>::new(RING_CAPACITY)),
             ref_count: AtomicUsize::new(0),
             last_seq: AtomicU64::new(0),
+            epoch: Mutex::new(None),
             last_activity_secs: AtomicI64::new(0),
             activity_updater: Arc::clone(&activity_updater),
             cancel_token: CancellationToken::new(),
@@ -276,6 +280,12 @@ impl SharedStream {
         }
         // broadcast：无 receiver 时 send 返回 Err，忽略（客户端全断时事件只留 ring）
         let _ = self.broadcast_tx.send(ev);
+    }
+
+    /// 清空历史 ring(epoch 变化时调用,丢弃旧 epoch 的事件,避免新 epoch 重放旧事件)。
+    fn clear_ring(&self) {
+        let mut ring = self.ring.lock();
+        *ring = HeapRb::<(u64, SharedEvent)>::new(RING_CAPACITY);
     }
 
     fn shutdown(&self) {
@@ -410,6 +420,35 @@ fn spawn_backend_task(
                         let _ = shared.broadcast_tx.send(Arc::new(ev));
                         return;
                     }
+                    // epoch 比较(#15):同 epoch → 保留 last_seq(增量订阅);
+                    // epoch 变化(agent 重启/worker panic 重建)→ 重置 last_seq + 清 ring + cursor-reset
+                    if let Some(ref new_epoch) = inner.stream_epoch {
+                        let changed = {
+                            let mut guard = shared.epoch.lock();
+                            match &*guard {
+                                None => {
+                                    *guard = Some(new_epoch.clone());
+                                    false
+                                }
+                                Some(old) if old == new_epoch => false,
+                                Some(_) => {
+                                    *guard = Some(new_epoch.clone());
+                                    true
+                                }
+                            }
+                        };
+                        if changed {
+                            warn!(
+                                "[SessionStream] epoch changed → reset last_seq + clear ring + cursor-reset: session_id={}",
+                                session_id
+                            );
+                            shared.last_seq.store(0, Ordering::Release);
+                            shared.clear_ring();
+                            let _ = shared
+                                .broadcast_tx
+                                .send(Arc::new(make_cursor_reset_event()));
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -466,8 +505,12 @@ fn spawn_backend_task(
                                         "[SessionStream] stream error: session_id={}, code={}, msg={}",
                                         session_id, e.code(), e.message()
                                     );
-                                    // agent_runner 可能重启（seq 归零），重置 last_seq 触发重建时全量 replay
-                                    shared.last_seq.store(0, Ordering::Release);
+                                    // 有 epoch 时:不在此重置 last_seq(下次 GetStatus epoch 比较决定,#15)。
+                                    // 无 epoch(旧 agent_runner 不发 stream_epoch)→ 保留旧行为:重置 last_seq=0
+                                    // 兜底重启(全量 replay 有重复但不丢数据;新 agent_runner 有 epoch 时由比较决定)。
+                                    if shared.epoch.lock().is_none() {
+                                        shared.last_seq.store(0, Ordering::Release);
+                                    }
                                     if attempt < MAX_RETRIES {
                                         pool.remove(&grpc_addr).await;
                                         break; // 内层 loop 退出，外层重试
@@ -569,6 +612,23 @@ fn make_connection_error_event(message: &str) -> ProgressEvent {
         message_type: "SessionPromptEnd".to_string(),
         sub_type: "error".to_string(),
         payload,
+        request_id: None,
+        seq: 0,
+        timestamp: now_millis(),
+    }
+}
+
+/// epoch 变化时的 cursor-reset 哨兵(seq=0):告知客户端重置去重游标(client_last_seq=0),
+/// 让新 epoch 的低 seq 事件不被静默丢弃(#15)。非终态(message_type≠SessionPromptEnd,不关流)。
+fn make_cursor_reset_event() -> ProgressEvent {
+    ProgressEvent {
+        message_type: "StreamReset".to_string(),
+        sub_type: "epoch_changed".to_string(),
+        payload: serde_json::json!({
+            "reason": "EpochChanged",
+            "description": "Agent stream epoch changed; reset your dedup cursor"
+        })
+        .to_string(),
         request_id: None,
         seq: 0,
         timestamp: now_millis(),
