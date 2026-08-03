@@ -312,7 +312,9 @@ fn resolve_agent_addr(state: &AppState, project_id: &str) -> Result<String> {
 }
 
 /// 消费 agent-runner build SSE:透传进度到 task,终态返 BuildOutcome。
+/// 消费 agent-runner build SSE:透传进度到 task,终态返 BuildOutcome。
 /// 期间检查 task.is_cancelled → cancel_build + Cancelled。
+/// 流错误或断流(无终态)→ 查 task 快照收敛终态(不再吞成 "stream ended without terminal event")。
 async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Result<BuildOutcome> {
     if task.is_cancelled() {
         client::cancel_build(addr, build_task_id)
@@ -322,7 +324,7 @@ async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Resu
     }
     let mut rx = client::subscribe_build_progress(addr, build_task_id);
     loop {
-        let data = tokio::select! {
+        let item = tokio::select! {
             biased;
             _ = task.cancellation_notified() => {
                 client::cancel_build(addr, build_task_id)
@@ -330,41 +332,84 @@ async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Resu
                     .context("cancel agent-runner build")?;
                 return Ok(BuildOutcome::Cancelled);
             }
-            data = rx.recv() => match data {
-                Some(data) => data,
-                None => break,
+            item = rx.recv() => match item {
+                Some(item) => item,
+                None => return recover_outcome_from_snapshot(addr, build_task_id).await,
             },
         };
-        // 终态判定直接 match 类型化事件(不再字符串键解析;类型保证 release_id 存在)。
-        let terminal_outcome: Option<BuildOutcome> = match &data {
-            BuildProgressEvent::Completed { release_id, .. } => Some(BuildOutcome::Completed {
-                release_id: release_id.clone(),
-            }),
-            BuildProgressEvent::Failed { error } => Some(BuildOutcome::Failed(error.clone())),
-            BuildProgressEvent::Cancelled => Some(BuildOutcome::Cancelled),
-            BuildProgressEvent::Stage { .. }
-            | BuildProgressEvent::Building { .. }
-            | BuildProgressEvent::BuildOk { .. }
-            | BuildProgressEvent::BuildFail { .. }
-            | BuildProgressEvent::Log { .. } => None,
-        };
-        if let Some(BuildOutcome::Failed(error)) = &terminal_outcome {
-            tracing::warn!(
-                task_id = %task.id,
-                remote_build_task_id = %build_task_id,
-                error = %error,
-                "agent-runner build reported failure"
-            );
-        }
-        // 透传(含终态事件,前端可见 build 完整进度)。
-        task.emit(PublishEvent::BuildProgress { data }).await;
-        if let Some(outcome) = terminal_outcome {
-            return Ok(outcome);
+        match item {
+            Ok(data) => {
+                // 终态判定直接 match 类型化事件(类型保证 release_id 存在)。
+                let terminal_outcome: Option<BuildOutcome> = match &data {
+                    BuildProgressEvent::Completed { release_id, .. } => {
+                        Some(BuildOutcome::Completed {
+                            release_id: release_id.clone(),
+                        })
+                    }
+                    BuildProgressEvent::Failed { error } => {
+                        Some(BuildOutcome::Failed(error.clone()))
+                    }
+                    BuildProgressEvent::Cancelled => Some(BuildOutcome::Cancelled),
+                    BuildProgressEvent::Stage { .. }
+                    | BuildProgressEvent::Building { .. }
+                    | BuildProgressEvent::BuildOk { .. }
+                    | BuildProgressEvent::BuildFail { .. }
+                    | BuildProgressEvent::Log { .. } => None,
+                };
+                if let Some(BuildOutcome::Failed(error)) = &terminal_outcome {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        remote_build_task_id = %build_task_id,
+                        error = %error,
+                        "agent-runner build reported failure"
+                    );
+                }
+                task.emit(PublishEvent::BuildProgress { data }).await;
+                if let Some(outcome) = terminal_outcome {
+                    return Ok(outcome);
+                }
+            }
+            Err(e) => {
+                // 流级错误(connect/非2xx/读取/缓冲):log + snapshot 恢复(不再 log-then-close 让 orchestrator 瞎)。
+                tracing::warn!(
+                    task_id = %task.id,
+                    remote_build_task_id = %build_task_id,
+                    error = %e,
+                    "agent-runner build stream error, attempting snapshot recovery"
+                );
+                return recover_outcome_from_snapshot(addr, build_task_id).await;
+            }
         }
     }
-    Err(anyhow!(
-        "agent-runner build stream ended without terminal event"
-    ))
+}
+
+/// 断流后查 agent-runner task 快照收敛终态。已终态(completed/failed/cancelled)按快照映射;
+/// 仍非终态或快照不可达 → Err(真因透传,不再吞成 "stream ended without terminal event")。
+async fn recover_outcome_from_snapshot(addr: &str, build_task_id: &str) -> Result<BuildOutcome> {
+    let snap = client::get_build_snapshot(addr, build_task_id)
+        .await
+        .context("snapshot recovery after build stream ended")?;
+    let status = snap.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    match status {
+        "completed" => {
+            let release_id = snap
+                .get("releaseId")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("snapshot completed but missing releaseId"))?;
+            Ok(BuildOutcome::Completed { release_id })
+        }
+        "failed" => Ok(BuildOutcome::Failed(
+            snap.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("build failed")
+                .to_owned(),
+        )),
+        "cancelled" => Ok(BuildOutcome::Cancelled),
+        other => Err(anyhow!(
+            "build stream ended and task still non-terminal (status={other})"
+        )),
+    }
 }
 
 /// 确保 app 计算单元存在:不存在则 create_app(幂等;image/ports 首次设定后恒定)。
