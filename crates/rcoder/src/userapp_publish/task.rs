@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use chrono::Utc;
 use serde::Serialize;
-use serde_json::Value;
+use shared_types::BuildProgressEvent;
 use tokio::sync::{Mutex, Notify, broadcast};
 
 /// 历史事件 ring 容量(断线重连 seq replay)。
@@ -60,8 +60,8 @@ pub enum PublishTaskStatus {
 pub enum PublishEvent {
     /// 进入新发布阶段(publish: EnsureApp/Prepare/Activate/WaitReady/Confirm)。
     Stage { stage: String },
-    /// 透传 agent-runner build 进度(Building/BuildOk/BuildFail,data=原始 JSON)。
-    BuildProgress { data: Value },
+    /// 透传 agent-runner build 进度(Building/BuildOk/BuildFail,data=类型化事件)。
+    BuildProgress { data: BuildProgressEvent },
     /// 取消已请求(非终态):任务进入 Cancelling,通知前端"取消中"。终态 Cancelled/Failed 由 orchestrator emit。
     Cancelling,
     /// 任务完成(build 产 release_id;publish 发布 Active)。
@@ -288,34 +288,29 @@ fn is_terminal_status(status: PublishTaskStatus) -> bool {
 /// 返回 `(seq, event, terminal)`:event 供调用方在【持 state 锁期间】做 broadcast(必须在锁内,
 /// 与 subscribe 的"创建 receiver + 读 replay"串行,防同一事件既进 replay 又进 broadcast);
 /// 任务已终态返回 None。没有 `&self` → 类型上无法再去取 state 锁 → 根除"持锁时调 emit"的重入死锁。
-fn publish_mut(
-    state: &mut TaskState,
-    mut event: PublishEvent,
-) -> Option<(u64, PublishEvent, bool)> {
+fn publish_mut(state: &mut TaskState, event: PublishEvent) -> Option<(u64, PublishEvent, bool)> {
     if is_terminal_status(state.status) {
         return None;
-    }
-    // 单事件字节上限:超大的 build 进度对象会撑大 ring(1000 事件 × N MB)。超限替换为截断标记(#11)。
-    if let PublishEvent::BuildProgress { data } = &mut event
-        && let Ok(bytes) = serde_json::to_vec(data)
-        && bytes.len() > MAX_EVENT_BYTES
-    {
-        let orig_len = bytes.len();
-        tracing::warn!(
-            orig_len,
-            max_bytes = MAX_EVENT_BYTES,
-            "build progress event exceeds byte cap, truncating before ring/broadcast"
-        );
-        *data = serde_json::json!({
-            "truncated": true,
-            "origLen": orig_len,
-            "maxBytes": MAX_EVENT_BYTES,
-        });
     }
     apply_event(state, &event);
     let terminal = is_terminal_status(state.status);
     let seq = state.seq;
     state.seq += 1;
+    // 单事件字节上限:超大的 build 进度(如巨长 error)会撑大 ring(1000 事件 × N MB)。
+    // 超限不入 ring(仍 broadcast 给实时客户端)—— 不影响终态(PublishEvent::Completed/Failed
+    // 是 orchestrator 单独 emit 的另一事件,不受此限,故迟重连者仍能收到终态)(#11)。
+    if let PublishEvent::BuildProgress { .. } = &event
+        && let Ok(bytes) = serde_json::to_vec(&event)
+        && bytes.len() > MAX_EVENT_BYTES
+    {
+        tracing::warn!(
+            seq,
+            orig_len = bytes.len(),
+            max_bytes = MAX_EVENT_BYTES,
+            "build progress event exceeds byte cap, skipped from ring (still broadcast)"
+        );
+        return Some((seq, event, terminal));
+    }
     if state.history.len() >= RING_CAP {
         state.history.pop_front();
     }
@@ -499,33 +494,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_build_progress_event_is_truncated() {
+    async fn oversized_build_progress_event_skipped_from_ring() {
         let task = PublishTask::new("app-a".into(), "app-a".into(), PublishTaskKind::Publish);
-        let huge = serde_json::json!({ "blob": "x".repeat(MAX_EVENT_BYTES + 4096) });
+        // 超长 error 字段 → 序列化超 MAX_EVENT_BYTES
+        let huge = BuildProgressEvent::Failed {
+            error: "x".repeat(MAX_EVENT_BYTES + 4096),
+        };
         task.emit(PublishEvent::BuildProgress { data: huge }).await;
 
         let (replay, _) = task.subscribe(0).await;
-        let (_, ev) = replay
-            .iter()
-            .find(|(_, e)| matches!(e, PublishEvent::BuildProgress { .. }))
-            .expect("build progress event stored in ring");
-        match ev {
-            PublishEvent::BuildProgress { data } => {
-                assert_eq!(
-                    data.get("truncated").and_then(|v| v.as_bool()),
-                    Some(true),
-                    "oversized event must be replaced with truncation marker"
-                );
-                assert!(
-                    data.get("origLen")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or_default()
-                        > MAX_EVENT_BYTES as u64,
-                    "origLen must reflect the original oversized length"
-                );
-            }
-            other => panic!("expected BuildProgress, got {other:?}"),
-        }
+        // 超限事件不入 ring(仍 broadcast,但 replay 不含)—— ring 内存有界(#11)。
+        assert!(
+            replay
+                .iter()
+                .all(|(_, ev)| !matches!(ev, PublishEvent::BuildProgress { .. })),
+            "oversized build progress event must be skipped from ring"
+        );
     }
 
     /// 并发 emit + request_cancel 不应死锁/卡住(回归守护:state 单锁 + publish_mut 无重入)。
@@ -540,7 +524,9 @@ mod tests {
         let emitter = tokio::spawn(async move {
             for i in 0..200_u32 {
                 t.emit(PublishEvent::BuildProgress {
-                    data: serde_json::json!({ "i": i }),
+                    data: BuildProgressEvent::Building {
+                        service: i.to_string(),
+                    },
                 })
                 .await;
             }
@@ -577,7 +563,9 @@ mod tests {
             for i in 0..300_u64 {
                 producer
                     .emit(PublishEvent::BuildProgress {
-                        data: serde_json::json!({ "i": i }),
+                        data: BuildProgressEvent::Building {
+                            service: i.to_string(),
+                        },
                     })
                     .await;
             }

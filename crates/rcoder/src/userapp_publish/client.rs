@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use shared_types::BuildProgressEvent;
 use tokio::sync::mpsc;
 
 const REQUEST_TIMEOUT_SECS: u64 = 120;
@@ -87,10 +88,10 @@ pub async fn get_build_snapshot(addr: &str, task_id: &str) -> Result<Value> {
     extract_task_snapshot(&body)
 }
 
-/// 订阅 agent-runner build 进度 SSE → `mpsc::Receiver<data JSON>`(透传给前端)。
+/// 订阅 agent-runner build 进度 SSE → `mpsc::Receiver<BuildProgressEvent>`(透传给前端)。
 ///
 /// 后台 spawn 消费;终态事件(completed/failed/cancelled)后或接收端退出时关闭 channel。
-pub fn subscribe_build_progress(addr: &str, task_id: &str) -> mpsc::Receiver<Value> {
+pub fn subscribe_build_progress(addr: &str, task_id: &str) -> mpsc::Receiver<BuildProgressEvent> {
     let (tx, rx) = mpsc::channel(SSE_CHANNEL_CAP);
     let url = format!("{addr}/api/userapp/tasks/{task_id}/logs/stream");
     tokio::spawn(async move {
@@ -154,8 +155,8 @@ pub fn package_url(addr: &str, app_id: &str, file_name: &str) -> String {
     format!("{addr}/api/userapp/static/{app_id}/{file_name}")
 }
 
-/// 从 SSE 帧提取 `data:` 行 JSON。
-fn parse_sse_data(frame: &[u8]) -> Option<Value> {
+/// 从 SSE 帧提取 `data:` 行,反序列化为类型化 `BuildProgressEvent`。
+fn parse_sse_data(frame: &[u8]) -> Option<BuildProgressEvent> {
     let text = std::str::from_utf8(frame).ok()?;
     let data_line = text
         .lines()
@@ -163,11 +164,13 @@ fn parse_sse_data(frame: &[u8]) -> Option<Value> {
     serde_json::from_str(data_line).ok()
 }
 
-/// data JSON 是否终态事件(file-server BuildProgressEvent: completed/failed/cancelled)。
-fn is_terminal_event(data: &Value) -> bool {
+/// 是否终态事件(completed/failed/cancelled)。
+fn is_terminal_event(data: &BuildProgressEvent) -> bool {
     matches!(
-        data.get("event").and_then(|e| e.as_str()),
-        Some("completed") | Some("failed") | Some("cancelled")
+        data,
+        BuildProgressEvent::Completed { .. }
+            | BuildProgressEvent::Failed { .. }
+            | BuildProgressEvent::Cancelled
     )
 }
 

@@ -17,6 +17,9 @@ use serde::Serialize;
 use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
+// 进度事件类型复用 shared_types(file-server 发送 ↔ rcoder 接收,统一 wire)。
+pub use shared_types::build_event::BuildProgressEvent;
+
 /// 历史事件 ring 容量(断线重连 seq replay)。
 const RING_CAP: usize = 1000;
 /// broadcast 通道容量(实时 SSE fan-out)。
@@ -62,33 +65,6 @@ pub struct BuildTaskSnapshot {
     pub seq: u64,
     pub created_at: i64,
     pub updated_at: i64,
-}
-
-/// 进度事件(SSE 推送 + ring 持久)。每个事件自增 seq。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "event")]
-pub enum BuildProgressEvent {
-    /// 进入新阶段(publish: GitCommit/Prepare/Activate/CreateApp/WaitReady/Confirm)
-    Stage { stage: String },
-    /// 开始编译某服务
-    Building { service: String },
-    /// 某服务编译成功
-    BuildOk { service: String },
-    /// 某服务编译失败
-    BuildFail { service: String, error: String },
-    /// 一行日志(实时 tail,可选)
-    Log { service: String, line: String },
-    /// 任务完成(build 产 release_id + 包摘要;rcoder publish 经快照读取做 prepare)。
-    Completed {
-        release_id: String,
-        sha256: String,
-        size_bytes: u64,
-        file_name: String,
-    },
-    /// 任务失败
-    Failed { error: String },
-    /// 任务被取消
-    Cancelled,
 }
 
 /// 任务可变状态:全部收在【一把】`state` 锁后(status/seq/history 同步变更,保证一致性)。

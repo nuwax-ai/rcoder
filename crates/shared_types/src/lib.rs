@@ -1,6 +1,10 @@
 mod container;
 mod model;
 
+// UserApp build 进度事件 —— file-server(发送)与 rcoder(接收)共享的类型化 DTO
+pub mod build_event;
+pub use build_event::BuildProgressEvent;
+
 // 清理请求模块
 pub mod cleanup_request;
 pub use cleanup_request::CleanupRequest;

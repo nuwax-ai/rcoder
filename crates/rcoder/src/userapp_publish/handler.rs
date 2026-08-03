@@ -17,7 +17,6 @@ use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use container_runtime_api::ContainerCreateParams;
 use serde::Deserialize;
-use serde_json::{Value, json};
 use shared_types::error_codes::{
     ERR_INTERNAL_SERVER_ERROR, ERR_NOT_FOUND, ERR_TOO_MANY_REQUESTS, ERR_VALIDATION,
 };
@@ -29,7 +28,9 @@ use crate::router::AppState;
 
 use super::client;
 use super::orchestrator;
-use super::task::{CancelAttempt, PublishEvent, PublishTaskKind};
+use super::task::{
+    CancelAttempt, PublishEvent, PublishTaskKind, PublishTaskSnapshot, PublishTaskStatus,
+};
 
 /// 路由聚合(注册到 rcoder 主 router,与 app_manager 路由同 `/api/v1/apps` 前缀)。
 pub fn routes() -> axum::Router<Arc<AppState>> {
@@ -60,6 +61,46 @@ pub struct PublishBody {
 pub struct StreamQuery {
     #[serde(default)]
     pub from_seq: u64,
+}
+
+// ---- 类型化响应(Direction 2:保留 wire shape,仅消除 Json<Value>)----
+
+/// publish / build 立即返回(task 已创建,后台 spawn)。
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishTaskResponse {
+    pub success: bool,
+    pub task_id: String,
+    pub status: String,
+}
+
+/// ensure-builder 返回。
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnsureBuilderResponse {
+    pub success: bool,
+    pub app_id: String,
+    pub container_name: String,
+    pub container_ip: String,
+}
+
+/// get_task 返回(任务快照)。
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTaskResponse {
+    pub success: bool,
+    pub task: PublishTaskSnapshot,
+}
+
+/// cancel_task 返回(Accepted 时 already_terminal=None;AlreadyTerminal 时 Some(true))。
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelTaskResponse {
+    pub success: bool,
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub already_terminal: Option<bool>,
+    pub status: PublishTaskStatus,
 }
 
 fn err(msg: impl Into<String>) -> AppError {
@@ -98,7 +139,7 @@ fn validate_publish_identifiers(app_id: &str, project_id: &str) -> Result<(), Ap
     params(("app_id" = String, Path)),
     request_body = PublishBody,
     responses(
-        (status = 200, description = "Publish task created"),
+        (status = 200, body = PublishTaskResponse, description = "Publish task created"),
         (status = 400, description = "Invalid app_id / project_id"),
         (status = 404, description = "Agent-runner not found for project"),
         (status = 429, description = "Publish task capacity exhausted"),
@@ -110,7 +151,7 @@ pub async fn publish(
     State(state): State<Arc<AppState>>,
     Path(app_id): Path<String>,
     Json(body): Json<PublishBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<PublishTaskResponse>, AppError> {
     validate_publish_identifiers(&app_id, &body.project_id)?;
     let task = state
         .publish_tasks
@@ -126,11 +167,11 @@ pub async fn publish(
     tokio::spawn(async move {
         orchestrator::run_publish(task, state, project_id, app_id).await;
     });
-    Ok(Json(json!({
-        "success": true,
-        "taskId": task_id,
-        "status": "pending",
-    })))
+    Ok(Json(PublishTaskResponse {
+        success: true,
+        task_id,
+        status: "pending".into(),
+    }))
 }
 
 /// `POST /api/v1/apps/{app_id}/build` —— 仅触发 agent-runner build(透传进度,不发布)。
@@ -140,7 +181,7 @@ pub async fn publish(
     params(("app_id" = String, Path)),
     request_body = PublishBody,
     responses(
-        (status = 200, description = "Build task created"),
+        (status = 200, body = PublishTaskResponse, description = "Build task created"),
         (status = 400, description = "Invalid app_id / project_id"),
         (status = 404, description = "Agent-runner not found for project"),
         (status = 429, description = "Publish task capacity exhausted"),
@@ -152,7 +193,7 @@ pub async fn build(
     State(state): State<Arc<AppState>>,
     Path(app_id): Path<String>,
     Json(body): Json<PublishBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<PublishTaskResponse>, AppError> {
     validate_publish_identifiers(&app_id, &body.project_id)?;
     let task = state
         .publish_tasks
@@ -168,11 +209,11 @@ pub async fn build(
     tokio::spawn(async move {
         orchestrator::run_build(task, state, project_id, app_id).await;
     });
-    Ok(Json(json!({
-        "success": true,
-        "taskId": task_id,
-        "status": "pending",
-    })))
+    Ok(Json(PublishTaskResponse {
+        success: true,
+        task_id,
+        status: "pending".into(),
+    }))
 }
 
 /// `POST /api/v1/apps/{app_id}/ensure-builder` —— 确保 UserAppBuilder pod 存在(幂等)。
@@ -187,13 +228,13 @@ pub async fn build(
     post,
     path = "/api/v1/apps/{app_id}/ensure-builder",
     params(("app_id" = String, Path)),
-    responses((status = 200, description = "UserAppBuilder ensured")),
+    responses((status = 200, body = EnsureBuilderResponse, description = "UserAppBuilder ensured")),
     tag = "UserApp 发布"
 )]
 pub async fn ensure_builder(
     State(state): State<Arc<AppState>>,
     Path(app_id): Path<String>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<EnsureBuilderResponse>, AppError> {
     crate::handler::utils::validate_identifier(&app_id, "app_id")
         .map_err(|error| validation(error.to_string()))?;
     // UserAppBuilder identifier = project_id(app_id 兼任);host_workspace_path K8s 模式不用。
@@ -234,12 +275,12 @@ pub async fn ensure_builder(
         app_id, container_info.container_name, container_info.container_ip
     );
 
-    Ok(Json(json!({
-        "success": true,
-        "appId": app_id,
-        "containerName": container_info.container_name,
-        "containerIp": container_info.container_ip,
-    })))
+    Ok(Json(EnsureBuilderResponse {
+        success: true,
+        app_id,
+        container_name: container_info.container_name,
+        container_ip: container_info.container_ip,
+    }))
 }
 
 /// UserAppBuilder per-app PVC 默认大小(后续可提到 config.yml 的 user-app-builder.service 段)。
@@ -251,7 +292,7 @@ const DEFAULT_BUILDER_STORAGE_SIZE: &str = "10Gi";
     path = "/api/v1/apps/publish/tasks/{task_id}",
     params(("task_id" = String, Path)),
     responses(
-        (status = 200, description = "Publish task snapshot"),
+        (status = 200, body = GetTaskResponse, description = "Publish task snapshot"),
         (status = 404, description = "Publish task not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -260,20 +301,17 @@ const DEFAULT_BUILDER_STORAGE_SIZE: &str = "10Gi";
 pub async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GetTaskResponse>, AppError> {
     let task = state
         .publish_tasks
         .get(&task_id)
         .await
         .ok_or_else(|| not_found(format!("publish task not found: {task_id}")))?;
     let snapshot = task.snapshot().await;
-    Ok(Json(json!({
-        "success": true,
-        "task": serde_json::to_value(&snapshot).unwrap_or_else(|e| {
-            tracing::error!(task_id = %task_id, error = %e, "serialize publish task snapshot failed");
-            Value::Null
-        }),
-    })))
+    Ok(Json(GetTaskResponse {
+        success: true,
+        task: snapshot,
+    }))
 }
 
 /// `GET /api/v1/apps/publish/tasks/{task_id}/stream` —— 进度 SSE(回放 + 实时,终态后关流)。
@@ -336,7 +374,7 @@ pub async fn stream_task(
     path = "/api/v1/apps/publish/tasks/{task_id}/cancel",
     params(("task_id" = String, Path)),
     responses(
-        (status = 200, description = "Publish task cancellation accepted (or already terminal)"),
+        (status = 200, body = CancelTaskResponse, description = "Publish task cancellation accepted (or already terminal)"),
         (status = 404, description = "Publish task not found")
     ),
     tag = "UserApp 发布"
@@ -344,7 +382,7 @@ pub async fn stream_task(
 pub async fn cancel_task(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<CancelTaskResponse>, AppError> {
     let task = state
         .publish_tasks
         .get(&task_id)
@@ -355,12 +393,12 @@ pub async fn cancel_task(
     // 完成远端取消/回滚后 emit —— handler 不再抢先置终态(原行为会让回滚失败被顶层 !is_terminal
     // 守卫吞掉,#6)。
     match task.request_cancel().await {
-        CancelAttempt::AlreadyTerminal(status) => Ok(Json(json!({
-            "success": true,
-            "taskId": task_id,
-            "alreadyTerminal": true,
-            "status": status,
-        }))),
+        CancelAttempt::AlreadyTerminal(status) => Ok(Json(CancelTaskResponse {
+            success: true,
+            task_id,
+            already_terminal: Some(true),
+            status,
+        })),
         CancelAttempt::Accepted => {
             // 尽力通知 agent-runner 取消 build;失败仅 warn(orchestrator 仍会收敛终态)。
             if let Some(remote) = task.remote_build().await
@@ -375,11 +413,12 @@ pub async fn cancel_task(
             }
             // 返回【实际】状态(此时为 cancelling),不再硬编码 "cancelled"。
             let status = task.status().await;
-            Ok(Json(json!({
-                "success": true,
-                "taskId": task_id,
-                "status": status,
-            })))
+            Ok(Json(CancelTaskResponse {
+                success: true,
+                task_id,
+                already_terminal: None,
+                status,
+            }))
         }
     }
 }
