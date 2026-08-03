@@ -18,7 +18,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use container_runtime_api::ContainerCreateParams;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use shared_types::error_codes::{ERR_INTERNAL_SERVER_ERROR, ERR_NOT_FOUND, ERR_VALIDATION};
+use shared_types::error_codes::{
+    ERR_INTERNAL_SERVER_ERROR, ERR_NOT_FOUND, ERR_TOO_MANY_REQUESTS, ERR_VALIDATION,
+};
 use shared_types::{ProjectAndContainerInfo, ServiceType};
 use tracing::info;
 
@@ -72,6 +74,10 @@ fn not_found(msg: impl Into<String>) -> AppError {
     AppError::with_message(ERR_NOT_FOUND, msg.into())
 }
 
+fn too_many_requests(msg: impl Into<String>) -> AppError {
+    AppError::with_message(ERR_TOO_MANY_REQUESTS, msg.into())
+}
+
 fn validate_publish_identifiers(app_id: &str, project_id: &str) -> Result<(), AppError> {
     crate::handler::utils::validate_identifier(app_id, "app_id")
         .map_err(|error| validation(error.to_string()))?;
@@ -91,7 +97,10 @@ fn validate_publish_identifiers(app_id: &str, project_id: &str) -> Result<(), Ap
     path = "/api/v1/apps/{app_id}/publish",
     params(("app_id" = String, Path)),
     request_body = PublishBody,
-    responses((status = 200, description = "Publish task created")),
+    responses(
+        (status = 200, description = "Publish task created"),
+        (status = 429, description = "Publish task capacity exhausted")
+    ),
     tag = "UserApp 发布"
 )]
 pub async fn publish(
@@ -107,7 +116,8 @@ pub async fn publish(
             body.project_id.clone(),
             PublishTaskKind::Publish,
         )
-        .await;
+        .await
+        .map_err(|error| too_many_requests(error.to_string()))?;
     let task_id = task.id.clone();
     let project_id = body.project_id.clone();
     tokio::spawn(async move {
@@ -126,7 +136,10 @@ pub async fn publish(
     path = "/api/v1/apps/{app_id}/build",
     params(("app_id" = String, Path)),
     request_body = PublishBody,
-    responses((status = 200, description = "Build task created")),
+    responses(
+        (status = 200, description = "Build task created"),
+        (status = 429, description = "Publish task capacity exhausted")
+    ),
     tag = "UserApp 发布"
 )]
 pub async fn build(
@@ -142,7 +155,8 @@ pub async fn build(
             body.project_id.clone(),
             PublishTaskKind::Build,
         )
-        .await;
+        .await
+        .map_err(|error| too_many_requests(error.to_string()))?;
     let task_id = task.id.clone();
     let project_id = body.project_id.clone();
     tokio::spawn(async move {

@@ -58,6 +58,18 @@ impl SessionStreamRegistry {
         }
     }
 
+    /// 仅当 registry 中仍是指定实例时移除并关闭，避免快慢路径行为不一致。
+    fn remove_and_shutdown(&self, session_id: &str, expected: &Arc<SharedStream>) -> bool {
+        let Some((_, removed)) = self
+            .streams
+            .remove_if(session_id, |_, current| Arc::ptr_eq(current, expected))
+        else {
+            return false;
+        };
+        removed.shutdown();
+        true
+    }
+
     /// 获取或创建 session 的共享流。
     ///
     /// 并发安全：参照 `session_cache::push_session_update` 的快速路径(`view`) + 慢速路径(`entry` 外 await)，
@@ -79,13 +91,7 @@ impl SessionStreamRegistry {
             }
             // grpc_addr 变化（容器重建）或 task 已死 → 移除并 shutdown 旧 task（cancel 后台
             // gRPC task，避免它继续重试已失效的旧 grpc_addr 而短暂泄漏资源）。
-            if self
-                .streams
-                .remove_if(session_id, |_, v| Arc::ptr_eq(v, &existing))
-                .is_some()
-            {
-                existing.shutdown();
-            }
+            self.remove_and_shutdown(session_id, &existing);
         }
 
         // 慢速路径：per-session 创建锁序列化，避免并发创建多个 SharedStream
@@ -102,8 +108,9 @@ impl SessionStreamRegistry {
             if existing.matches_addr(grpc_addr) && existing.is_alive() {
                 return existing;
             }
-            self.streams
-                .remove_if(session_id, |_, v| Arc::ptr_eq(v, &existing));
+            // 这里可能移除另一个创建者刚插入但 grpc_addr 不匹配的活跃流，必须同步 cancel
+            // 它的后台 task；只 remove 会让 task 持有 Arc 并继续运行到自然断流。
+            self.remove_and_shutdown(session_id, &existing);
         }
 
         // 锁内创建（含 spawn 后台 task 的 await）；此时无并发创建者，安全。
@@ -640,6 +647,27 @@ mod tests {
         drop(held);
         registry.remove_unused_create_lock("session-a");
         assert!(!registry.create_locks.contains_key("session-a"));
+    }
+
+    #[tokio::test]
+    async fn removing_matching_stream_cancels_its_backend_task() {
+        let registry = SessionStreamRegistry::default();
+        let shared = SharedStream::new(
+            "session-a".into(),
+            "127.0.0.1:1".into(),
+            Arc::new(GrpcChannelPool::new()),
+            "en",
+            Arc::new(|_| {}),
+        )
+        .await;
+        registry
+            .streams
+            .insert("session-a".into(), Arc::clone(&shared));
+
+        assert!(!shared.cancel_token.is_cancelled());
+        assert!(registry.remove_and_shutdown("session-a", &shared));
+        assert!(shared.cancel_token.is_cancelled());
+        assert!(!registry.streams.contains_key("session-a"));
     }
 
     fn arc_event(seq: u64, sub: &str) -> Arc<ProgressEvent> {

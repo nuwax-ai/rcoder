@@ -4,6 +4,8 @@
 //! - `run_build`:仅触发 agent-runner build + 透传进度(独立 build 接口)。
 //! - `run_publish`:全流程 build → ensure_app → prepare → activate → 轮询就绪 → confirm。
 
+use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +41,80 @@ enum BuildOutcome {
     Cancelled,
 }
 
+/// agent-runner `BuildProgressEvent` 的 wire-level `event` 值。
+///
+/// `Unknown` 保留未来新增的非终态事件，rcoder 仍可原样透传给前端；缺失或空事件名则属于协议错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentBuildEventKind {
+    Stage,
+    Building,
+    BuildOk,
+    BuildFail,
+    Log,
+    Completed,
+    Failed,
+    Cancelled,
+    Unknown(String),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("agent-runner build event name must not be empty")]
+struct ParseAgentBuildEventError;
+
+impl FromStr for AgentBuildEventKind {
+    type Err = ParseAgentBuildEventError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if value.trim().is_empty() {
+            return Err(ParseAgentBuildEventError);
+        }
+        Ok(match value {
+            "stage" => Self::Stage,
+            "building" => Self::Building,
+            "buildOk" => Self::BuildOk,
+            "buildFail" => Self::BuildFail,
+            "log" => Self::Log,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            unknown => Self::Unknown(unknown.to_owned()),
+        })
+    }
+}
+
+impl fmt::Display for AgentBuildEventKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Stage => "stage",
+            Self::Building => "building",
+            Self::BuildOk => "buildOk",
+            Self::BuildFail => "buildFail",
+            Self::Log => "log",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Unknown(value) => value,
+        };
+        formatter.write_str(value)
+    }
+}
+
+fn completed_release_id(data: &serde_json::Value) -> Result<String> {
+    data.get("release_id")
+        .and_then(|release_id| release_id.as_str())
+        .filter(|release_id| !release_id.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("agent-runner completed build event missing non-empty release_id"))
+}
+
+fn failed_build_error(data: &serde_json::Value) -> Result<String> {
+    data.get("error")
+        .and_then(|error| error.as_str())
+        .filter(|error| !error.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("agent-runner failed build event missing non-empty string 'error'"))
+}
+
 /// 独立 build 入口(spawn 调):触发 agent-runner build + 透传进度,终态 emit。
 pub async fn run_build(
     task: Arc<PublishTask>,
@@ -47,11 +123,18 @@ pub async fn run_build(
     app_id: String,
 ) {
     let result = run_build_inner(&task, &state, &project_id, &app_id).await;
-    if let Err(e) = result
+    if let Err(error) = result
         && !task.is_terminal().await
     {
+        tracing::error!(
+            task_id = %task.id,
+            app_id = %app_id,
+            project_id = %project_id,
+            error = %error,
+            "UserApp build orchestration failed"
+        );
         task.emit(PublishEvent::Failed {
-            error: e.to_string(),
+            error: error.to_string(),
         })
         .await;
     }
@@ -65,11 +148,18 @@ pub async fn run_publish(
     app_id: String,
 ) {
     let result = run_publish_inner(&task, &state, &project_id, &app_id).await;
-    if let Err(e) = result
+    if let Err(error) = result
         && !task.is_terminal().await
     {
+        tracing::error!(
+            task_id = %task.id,
+            app_id = %app_id,
+            project_id = %project_id,
+            error = %error,
+            "UserApp publish orchestration failed"
+        );
         task.emit(PublishEvent::Failed {
-            error: e.to_string(),
+            error: error.to_string(),
         })
         .await;
     }
@@ -297,35 +387,48 @@ async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Resu
         let event = data
             .get("event")
             .and_then(|e| e.as_str())
-            .unwrap_or_default()
-            .to_string();
-        // 终态字段先取出(emit 会 move data)。
-        let release_id = if event == "completed" {
-            // agent-runner BuildProgressEvent enum 级 serde rename_all 只作用于 variant 名,
-            // struct-variant field 未 rename(仍 snake_case),故 release_id 用 snake 取。
-            // (BuildTaskSnapshot 是 struct,camelCase 正常;sha/size/file 走 snapshot 不受影响。)
-            data.get("release_id")
-                .and_then(|r| r.as_str())
-                .unwrap_or_default()
-                .to_string()
-        } else {
-            String::new()
+            .ok_or_else(|| anyhow!("agent-runner build event missing string field 'event'"))?
+            .parse::<AgentBuildEventKind>()
+            .context("parse agent-runner build event kind")?;
+
+        // 在 data move 给前端事件前构造终态结果。Completed 的 struct-variant 字段仍为 snake_case。
+        let terminal_outcome: Option<Result<BuildOutcome>> = match &event {
+            AgentBuildEventKind::Completed => Some(
+                completed_release_id(&data)
+                    .map(|release_id| BuildOutcome::Completed { release_id }),
+            ),
+            AgentBuildEventKind::Failed => {
+                Some(failed_build_error(&data).map(BuildOutcome::Failed))
+            }
+            AgentBuildEventKind::Cancelled => Some(Ok(BuildOutcome::Cancelled)),
+            AgentBuildEventKind::Stage
+            | AgentBuildEventKind::Building
+            | AgentBuildEventKind::BuildOk
+            | AgentBuildEventKind::BuildFail
+            | AgentBuildEventKind::Log => None,
+            AgentBuildEventKind::Unknown(event_name) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    remote_build_task_id = %build_task_id,
+                    event = %event_name,
+                    "received unknown agent-runner build event"
+                );
+                None
+            }
         };
-        let error = if event == "failed" {
-            data.get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("build failed")
-                .to_string()
-        } else {
-            String::new()
-        };
+
         // 透传(含终态事件,前端可见 build 完整进度)。
         task.emit(PublishEvent::BuildProgress { data }).await;
-        match event.as_str() {
-            "completed" => return Ok(BuildOutcome::Completed { release_id }),
-            "failed" => return Ok(BuildOutcome::Failed(error)),
-            "cancelled" => return Ok(BuildOutcome::Cancelled),
-            _ => {}
+        if let Some(outcome) = terminal_outcome {
+            if let Ok(BuildOutcome::Failed(error)) = &outcome {
+                tracing::warn!(
+                    task_id = %task.id,
+                    remote_build_task_id = %build_task_id,
+                    error = %error,
+                    "agent-runner build reported failure"
+                );
+            }
+            return outcome;
         }
     }
     Err(anyhow!(
@@ -430,7 +533,68 @@ fn rcoder_app_id(app_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::rcoder_app_id;
+    use serde_json::json;
+
+    use super::{AgentBuildEventKind, completed_release_id, failed_build_error, rcoder_app_id};
+
+    #[test]
+    fn agent_build_event_kind_round_trips_known_and_unknown_values() {
+        for value in [
+            "stage",
+            "building",
+            "buildOk",
+            "buildFail",
+            "log",
+            "completed",
+            "failed",
+            "cancelled",
+            "futureEvent",
+        ] {
+            let event = value
+                .parse::<AgentBuildEventKind>()
+                .expect("non-empty event name");
+            assert_eq!(event.to_string(), value);
+        }
+        assert!("".parse::<AgentBuildEventKind>().is_err());
+        assert!("  ".parse::<AgentBuildEventKind>().is_err());
+    }
+
+    #[test]
+    fn completed_event_requires_non_empty_release_id() {
+        assert_eq!(
+            completed_release_id(&json!({"release_id": "release-a"})).expect("valid release id"),
+            "release-a"
+        );
+        for invalid in [
+            json!({}),
+            json!({"release_id": null}),
+            json!({"release_id": "  "}),
+        ] {
+            let error = completed_release_id(&invalid).expect_err("release id is required");
+            assert!(error.to_string().contains("missing non-empty release_id"));
+        }
+    }
+
+    #[test]
+    fn failed_event_requires_non_empty_error_message() {
+        assert_eq!(
+            failed_build_error(&json!({"error": "compile failed"})).expect("valid build error"),
+            "compile failed"
+        );
+        for invalid in [
+            json!({}),
+            json!({"error": null}),
+            json!({"error": 42}),
+            json!({"error": "  "}),
+        ] {
+            let error = failed_build_error(&invalid).expect_err("error string is required");
+            assert!(
+                error
+                    .to_string()
+                    .contains("missing non-empty string 'error'")
+            );
+        }
+    }
 
     #[test]
     fn rcoder_app_id_prepends_prefix_when_missing() {

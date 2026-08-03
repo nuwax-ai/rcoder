@@ -6,6 +6,7 @@
 //! agent-runner 接口(file-server task 10):`POST /api/userapp/build`、`GET /tasks/{id}`、
 //! `GET /tasks/{id}/logs/stream`(SSE)、`POST /tasks/{id}/cancel`、`GET /static/{app_id}/{file}`。
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -13,15 +14,12 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-const REQUEST_TIMEOUT_SECS: u64 = 30;
+const REQUEST_TIMEOUT_SECS: u64 = 120;
 const SSE_CHANNEL_CAP: usize = 128;
 
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .build()
-        .context("build http client for agent-runner")
-}
+/// reqwest::Client 内部持有连接池；进程内统一复用，普通请求通过 RequestBuilder 设置总超时，
+/// SSE 长连接不设置总超时。
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
 /// file-server 统一错误体:`{success:false, error:{message}}` → 提取 message。
 fn extract_fs_error(body: &Value, status: reqwest::StatusCode, where_: &str) -> anyhow::Error {
@@ -36,10 +34,10 @@ fn extract_fs_error(body: &Value, status: reqwest::StatusCode, where_: &str) -> 
 
 /// 触发 agent-runner workspace build,返 taskId。
 pub async fn trigger_build(addr: &str, app_id: &str) -> Result<String> {
-    let client = http_client()?;
     let url = format!("{addr}/api/userapp/build");
-    let resp = client
+    let resp = HTTP_CLIENT
         .post(&url)
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .json(&json!({ "appId": app_id }))
         .send()
         .await
@@ -57,10 +55,10 @@ pub async fn trigger_build(addr: &str, app_id: &str) -> Result<String> {
 
 /// 取消 agent-runner build 任务(软取消 + kill 进程组,见 file-server cancel handler)。
 pub async fn cancel_build(addr: &str, task_id: &str) -> Result<()> {
-    let client = http_client()?;
     let url = format!("{addr}/api/userapp/tasks/{task_id}/cancel");
-    let resp = client
+    let resp = HTTP_CLIENT
         .post(&url)
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .send()
         .await
         .with_context(|| format!("agent-runner cancel request: {url}"))?;
@@ -74,10 +72,10 @@ pub async fn cancel_build(addr: &str, task_id: &str) -> Result<()> {
 
 /// 取 build 任务快照(`{task:{status,releaseId,...}}`)。
 pub async fn get_build_snapshot(addr: &str, task_id: &str) -> Result<Value> {
-    let client = http_client()?;
     let url = format!("{addr}/api/userapp/tasks/{task_id}");
-    let resp = client
+    let resp = HTTP_CLIENT
         .get(&url)
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .send()
         .await
         .with_context(|| format!("agent-runner get task: {url}"))?;
@@ -86,7 +84,7 @@ pub async fn get_build_snapshot(addr: &str, task_id: &str) -> Result<Value> {
     if !status.is_success() || body.get("success").and_then(|s| s.as_bool()) == Some(false) {
         return Err(extract_fs_error(&body, status, "get task"));
     }
-    Ok(body.get("task").cloned().unwrap_or(body))
+    extract_task_snapshot(&body)
 }
 
 /// 订阅 agent-runner build 进度 SSE → `mpsc::Receiver<data JSON>`(透传给前端)。
@@ -96,16 +94,8 @@ pub fn subscribe_build_progress(addr: &str, task_id: &str) -> mpsc::Receiver<Val
     let (tx, rx) = mpsc::channel(SSE_CHANNEL_CAP);
     let url = format!("{addr}/api/userapp/tasks/{task_id}/logs/stream");
     tokio::spawn(async move {
-        // SSE 长连接:不能用 http_client() 的 30s 总超时(build 可能数分钟到 1800s);
-        // 用无超时 client,靠终态事件 / 连接断 / 接收端 drop 结束。
-        let client = match reqwest::Client::builder().build() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "build sse client build failed");
-                return;
-            }
-        };
-        let resp = match client
+        // SSE 长连接不设置总超时(build 可能数分钟到 1800s)，但复用同一个连接池。
+        let resp = match HTTP_CLIENT
             .get(&url)
             .header("Accept", "text/event-stream")
             .header("Cache-Control", "no-cache")
@@ -152,6 +142,13 @@ pub fn subscribe_build_progress(addr: &str, task_id: &str) -> mpsc::Receiver<Val
     rx
 }
 
+fn extract_task_snapshot(body: &Value) -> Result<Value> {
+    body.get("task")
+        .filter(|task| task.is_object())
+        .cloned()
+        .ok_or_else(|| anyhow!("agent-runner get task response missing object field 'task'"))
+}
+
 /// 整体包下载 URL(rcoder prepare_release 的 url 字段;rcoder app_manager 据此从 agent-runner 拉包)。
 pub fn package_url(addr: &str, app_id: &str, file_name: &str) -> String {
     format!("{addr}/api/userapp/static/{app_id}/{file_name}")
@@ -172,4 +169,28 @@ fn is_terminal_event(data: &Value) -> bool {
         data.get("event").and_then(|e| e.as_str()),
         Some("completed") | Some("failed") | Some("cancelled")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_snapshot_requires_task_object() {
+        let task = extract_task_snapshot(&json!({
+            "success": true,
+            "task": {"sha256": "abc"}
+        }))
+        .expect("valid task snapshot");
+        assert_eq!(task["sha256"], "abc");
+
+        for invalid in [
+            json!({"success": true}),
+            json!({"success": true, "task": null}),
+            json!({"success": true, "task": "invalid"}),
+        ] {
+            let error = extract_task_snapshot(&invalid).expect_err("task object is required");
+            assert!(error.to_string().contains("missing object field 'task'"));
+        }
+    }
 }

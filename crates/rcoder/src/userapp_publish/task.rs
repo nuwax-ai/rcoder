@@ -22,6 +22,12 @@ const TERMINAL_TASK_TTL_SECS: i64 = 24 * 60 * 60;
 /// 防止异常调用方无限创建任务。达上限时优先淘汰最旧终态任务。
 const MAX_RETAINED_TASKS: usize = 1_000;
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PublishTaskStoreError {
+    #[error("publish task capacity exhausted (limit={limit}); wait for an active task to finish")]
+    CapacityExceeded { limit: usize },
+}
+
 pub type PublishTaskId = String;
 
 /// 任务类型:仅触发 agent-runner build / 全流程发布。
@@ -271,12 +277,22 @@ fn apply_event(inner: &mut TaskInner, event: &PublishEvent) {
 /// 全局任务表(内存;短期。发布产物由 app_manager release index 持久)。
 pub struct PublishTaskStore {
     map: Mutex<HashMap<PublishTaskId, Arc<PublishTask>>>,
+    max_retained_tasks: usize,
 }
 
 impl PublishTaskStore {
     pub fn new() -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
+            max_retained_tasks: MAX_RETAINED_TASKS,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_max_retained_tasks(max_retained_tasks: usize) -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            max_retained_tasks,
         }
     }
 
@@ -285,25 +301,29 @@ impl PublishTaskStore {
         app_id: String,
         project_id: String,
         kind: PublishTaskKind,
-    ) -> Arc<PublishTask> {
-        let task = PublishTask::new(app_id, project_id, kind);
+    ) -> Result<Arc<PublishTask>, PublishTaskStoreError> {
         let now = Utc::now().timestamp();
         let mut map = self.map.lock().await;
         map.retain(|_, existing| {
             let terminal_at = existing.terminal_at.load(Ordering::Acquire);
             terminal_at == 0 || now.saturating_sub(terminal_at) < TERMINAL_TASK_TTL_SECS
         });
-        if map.len() >= MAX_RETAINED_TASKS
-            && let Some(oldest_terminal_id) = map
+        while map.len() >= self.max_retained_tasks {
+            let Some(oldest_terminal_id) = map
                 .values()
                 .filter(|existing| existing.terminal_at.load(Ordering::Acquire) > 0)
                 .min_by_key(|existing| existing.created_at)
                 .map(|existing| existing.id.clone())
-        {
+            else {
+                return Err(PublishTaskStoreError::CapacityExceeded {
+                    limit: self.max_retained_tasks,
+                });
+            };
             map.remove(&oldest_terminal_id);
         }
+        let task = PublishTask::new(app_id, project_id, kind);
         map.insert(task.id.clone(), task.clone());
-        task
+        Ok(task)
     }
 
     pub async fn get(&self, id: &str) -> Option<Arc<PublishTask>> {
@@ -367,5 +387,49 @@ mod tests {
         )
         .await
         .expect("pre-existing cancellation must be observed");
+    }
+
+    #[tokio::test]
+    async fn store_rejects_new_task_when_all_capacity_is_active() {
+        let store = PublishTaskStore::with_max_retained_tasks(2);
+        for app_id in ["app-a", "app-b"] {
+            store
+                .create(app_id.into(), app_id.into(), PublishTaskKind::Build)
+                .await
+                .expect("active task within capacity");
+        }
+
+        let result = store
+            .create("app-c".into(), "app-c".into(), PublishTaskKind::Build)
+            .await;
+        let error = match result {
+            Ok(_) => panic!("active tasks must never be silently evicted"),
+            Err(error) => error,
+        };
+        assert_eq!(error, PublishTaskStoreError::CapacityExceeded { limit: 2 });
+        assert_eq!(store.map.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn store_evicts_terminal_task_before_rejecting_new_task() {
+        let store = PublishTaskStore::with_max_retained_tasks(1);
+        let completed = store
+            .create("app-a".into(), "app-a".into(), PublishTaskKind::Build)
+            .await
+            .expect("first task");
+        completed
+            .emit(PublishEvent::Completed {
+                release_id: "release-a".into(),
+            })
+            .await;
+
+        let replacement = store
+            .create("app-b".into(), "app-b".into(), PublishTaskKind::Build)
+            .await
+            .expect("terminal task should be evicted");
+        let map = store.map.lock().await;
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&replacement.id));
+        assert!(!map.contains_key(&completed.id));
     }
 }
