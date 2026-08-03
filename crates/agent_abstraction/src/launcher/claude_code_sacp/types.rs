@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use super::super::lifecycle::AgentLifecycleGuard;
 use crate::acp::CancelNotificationRequestWrapper;
 
-/// 使用最新协议版本
-pub(crate) const VERSION: ProtocolVersion = ProtocolVersion::LATEST;
+/// 使用 v1 稳定协议版本（与所有 ACP v1 agent 兼容）
+pub(crate) const VERSION: ProtocolVersion = ProtocolVersion::V1;
 
 /// 环境变量键名常量
 pub(crate) const ENV_ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";

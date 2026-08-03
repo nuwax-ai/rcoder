@@ -130,16 +130,16 @@ make update-image-tag
 - `crates/agent_runner/src/grpc/agent_service_impl.rs` - gRPC 服务实现
 
 ### ACP 协议集成
-- 使用 `agent-client-protocol = "0.6"` 和 `agent_client_protocol = "0.4"` 实现多版本兼容
-- AgentSideConnection 和 ClientSideConnection **未实现 Send trait**
-- **必须**在 LocalSet 和 spawn_local 中使用这些连接
-- 参考示例目录: `/Volumes/soddy/git_workspace/rcoder/tmp/agent-client-protocol/rust/examples`
+- 使用 `agent-client-protocol = "2"`（官方 SDK），schema 走 `agent_client_protocol::schema::v1`，v1 是稳定 wire 协议
+- SDK 全程 `Send`：连接任务用标准 `tokio::spawn` 驱动，**无需 LocalSet / spawn_local**
+- 连接模型：`Client.builder().name(...).on_receive_dispatch(...).on_receive_request(...).connect_with(transport, |cx| async {...})`，核心实现见 `crates/agent_abstraction/src/launcher/claude_code_sacp/connection.rs`
+- 与所有 ACP v1 agent（Claude Code / nuwaxcode / codex 等）wire 兼容：握手发送 `protocolVersion: 1`
 
 ### 并发模型和状态管理
 - 使用 **DashMap** 替代 `Arc<RwLock<HashMap>>` 以获得更好的性能
 - 使用写时复制 (CoW) 模式进行状态更新
-- 主应用使用 `#[tokio::main(flavor = "current_thread")]`
-- ACP 操作必须在 `LocalSet` 中执行以支持 `spawn_local`
+- 主应用使用 `#[tokio::main]`（多线程）
+- ACP SDK 完全 Send-safe，连接任务用标准 `tokio::spawn` 驱动，无需 LocalSet
 
 ### Docker 容器动态创建
 - **多级隔离架构**: 支持三种隔离级别
@@ -249,7 +249,7 @@ struct HttpResult<T> {
 ### 禁止事项
 1. **禁止使用模拟响应逻辑** - 所有 AI 调用必须真实执行
 2. **禁止编写 unsafe 代码** - 项目要求内存安全
-3. **AgentSideConnection 必须在 LocalSet 中使用** - 由于未实现 Send trait
+3. **ACP schema 类型变更需谨慎** - `shared_types` 直接嵌套 `schema::v1` 类型（StopReason/SessionUpdate/SessionId），升级 SDK 后务必全量编译 + 测试
 4. ** Always Response in 中文** - 所有响应必须使用中文
 
 ### Docker 容器管理
@@ -437,17 +437,31 @@ kubectl get pod -n rcoder-dev dev-rcoder-agent-runner-test-u \
 
 ### ACP 协议集成模式
 ```rust
-// 正确的 LocalSet 使用模式
-let local_set = LocalSet::new();
-local_set.run_until(async move {
-    let (client_conn, handle_io) = ClientSideConnection::new(
-        client, outgoing, incoming, |fut| {
-            tokio::task::spawn_local(fut);
-        }
-    );
-    tokio::task::spawn_local(handle_io);
-    // ... 处理逻辑
-}).await;
+// ACP 连接：Builder + connect_with，标准 tokio::spawn 驱动（无需 LocalSet）
+tokio::spawn(async move {
+    Client.builder()
+        .name("rcoder-agent-runner-sacp")
+        .on_receive_dispatch(
+            async move |dispatch: Dispatch, _cx: ConnectionTo<Agent>| {
+                // 匹配 Dispatch::Notification(message) 等，处理 SessionNotification
+                Ok(Handled::Yes)
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .on_receive_request(
+            move |req: RequestPermissionRequest, responder: Responder<_>, _cx| async move {
+                responder.respond(RequestPermissionResponse::new(...))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(transport, move |cx: ConnectionTo<Agent>| async move {
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+            cx.send_request(NewSessionRequest::new(cwd)).block_task().await?; // 建会话
+            cx.send_request(PromptRequest::new(...)).block_task().await?; // 发 prompt
+            Ok(())
+        })
+        .await
+});
 ```
 
 ### DashMap 高效使用模式
