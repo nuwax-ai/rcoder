@@ -18,9 +18,10 @@ path = "src/main.rs"
 [dependencies]
 # 极轻量 manifest 类型（path 到同仓库的独立小 crate）
 workspace-manifest = { path = "../workspace-manifest" }
-# pingap 官方配置类型（pin HEAD：crates.io 0.13.x 有发布 bug；HEAD 修了 bollard 0.21 兼容）
+# pingap 官方配置类型（pin 到 v0.13.8 tag commit：crates.io 0.13.x 有发布 bug，用 git rev；
+# 与 app-runtime-base 镜像里的 pingap 二进制版本保持一致，避免 config schema 漂移）
 # bollard/regex 隔离在 app-cli 自己的 Cargo.lock，不和 rcoder 冲突
-pingap-config = { git = "https://github.com/vicanso/pingap", rev = "056161144ef0fcceb034ca0e5a1973abd48d2d10" }
+pingap-config = { git = "https://github.com/vicanso/pingap", rev = "07d1cce1b658418bb46c2dec1a49c43fd2f48268" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

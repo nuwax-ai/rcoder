@@ -19,8 +19,8 @@ services:
       # Docker 模式无 Ceph, 嵌入后用 LocalWorkspaceResolver (共享 Docker volume)
       - RCODER_EMBED_FILE_SERVER=true
       # UserApp release.lock 构建元数据；测试正式镜像时建议由 shell 覆盖 digest。
-      - RCODER_PINGAP_VERSION=${RCODER_PINGAP_VERSION:-0.13.7}
-      - RCODER_PINGAP_COMMIT=${RCODER_PINGAP_COMMIT:-056161144ef0fcceb034ca0e5a1973abd48d2d10}
+      - RCODER_PINGAP_VERSION=${RCODER_PINGAP_VERSION:-0.13.8}
+      - RCODER_PINGAP_COMMIT=${RCODER_PINGAP_COMMIT:-07d1cce1b658418bb46c2dec1a49c43fd2f48268}
       - RCODER_RUNTIME_IMAGE_DIGEST=${RCODER_RUNTIME_IMAGE_DIGEST:-sha256:local-development}
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}

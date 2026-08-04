@@ -2387,8 +2387,8 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pingap-config"
-version = "0.13.7"
-source = "git+https://github.com/vicanso/pingap?rev=056161144ef0fcceb034ca0e5a1973abd48d2d10#056161144ef0fcceb034ca0e5a1973abd48d2d10"
+version = "0.13.8"
+source = "git+https://github.com/vicanso/pingap?rev=07d1cce1b658418bb46c2dec1a49c43fd2f48268#07d1cce1b658418bb46c2dec1a49c43fd2f48268"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2422,8 +2422,8 @@ dependencies = [
 
 [[package]]
 name = "pingap-core"
-version = "0.13.7"
-source = "git+https://github.com/vicanso/pingap?rev=056161144ef0fcceb034ca0e5a1973abd48d2d10#056161144ef0fcceb034ca0e5a1973abd48d2d10"
+version = "0.13.8"
+source = "git+https://github.com/vicanso/pingap?rev=07d1cce1b658418bb46c2dec1a49c43fd2f48268#07d1cce1b658418bb46c2dec1a49c43fd2f48268"
 dependencies = [
  "TinyUFO",
  "ahash",
@@ -2446,8 +2446,8 @@ dependencies = [
 
 [[package]]
 name = "pingap-discovery"
-version = "0.13.7"
-source = "git+https://github.com/vicanso/pingap?rev=056161144ef0fcceb034ca0e5a1973abd48d2d10#056161144ef0fcceb034ca0e5a1973abd48d2d10"
+version = "0.13.8"
+source = "git+https://github.com/vicanso/pingap?rev=07d1cce1b658418bb46c2dec1a49c43fd2f48268#07d1cce1b658418bb46c2dec1a49c43fd2f48268"
 dependencies = [
  "async-trait",
  "bollard",
@@ -2463,8 +2463,8 @@ dependencies = [
 
 [[package]]
 name = "pingap-util"
-version = "0.13.7"
-source = "git+https://github.com/vicanso/pingap?rev=056161144ef0fcceb034ca0e5a1973abd48d2d10#056161144ef0fcceb034ca0e5a1973abd48d2d10"
+version = "0.13.8"
+source = "git+https://github.com/vicanso/pingap?rev=07d1cce1b658418bb46c2dec1a49c43fd2f48268#07d1cce1b658418bb46c2dec1a49c43fd2f48268"
 dependencies = [
  "aes-gcm-siv",
  "ahash",

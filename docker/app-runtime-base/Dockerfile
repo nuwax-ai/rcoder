@@ -112,8 +112,14 @@ RUN ARCH=$(dpkg --print-architecture) && \
     chmod +x /usr/local/bin/pgweb && \
     rm -f /tmp/pgweb.zip
 
-# 安装 pingap (pingora 反向代理，全特性版；官方安装脚本自动识别 amd64/arm64)
-RUN curl -sSL https://raw.githubusercontent.com/vicanso/pingap/main/install.sh | PINGAP_FULL=1 sh
+# 安装 pingap (pingora 反向代理，全特性版；官方 install.sh 自动识别 amd64/arm64)
+# 锁定版本：install.sh 默认拉 latest 会随上游漂移、构建不可复现，
+# 用 sed 把 get_latest_release 替换为固定 tag（arch/libc/full 处理仍走脚本原逻辑）。
+# 升级 pingap：改下面 ARG + 同步 crates/app-cli/Cargo.toml 的 pingap-config rev + docker-compose 元数据。
+ARG PINGAP_VERSION=v0.13.8
+RUN curl -sSL https://raw.githubusercontent.com/vicanso/pingap/main/install.sh \
+    | sed "s|version=\"\$(get_latest_release)\"|version=\"${PINGAP_VERSION}\"|" \
+    | PINGAP_FULL=1 sh
 
 # 安装 app-cli（UserApp 容器编排器，替代 start.sh；由 app-cli-builder stage 编译）
 COPY --from=app-cli-builder /build/crates/app-cli/target/release/app-cli /usr/local/bin/app-cli
