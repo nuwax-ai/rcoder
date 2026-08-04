@@ -778,9 +778,9 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             container_runtime_api::AppPortStatus,
             container_runtime_api::AppEventInfo,
             crate::userapp_publish::handler::PublishBody,
-            crate::userapp_publish::task::PublishTaskKind,
-            crate::userapp_publish::task::PublishTaskStatus,
-            crate::userapp_publish::task::PublishTaskSnapshot,
+            crate::userapp_publish::PublishTaskKind,
+            crate::userapp_publish::PublishTaskStatus,
+            crate::userapp_publish::PublishTaskSnapshot,
         )
     ),
     tags(

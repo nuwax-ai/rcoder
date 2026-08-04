@@ -6,11 +6,21 @@
 //!
 //! 接口(对前端/Java):一键 `publish` + 独立 `build`,均带 agent-runner `project_id`(一个
 //! agent-runner 可含多个 UserApp workspace)。
+//!
+//! 模块划分:`types`(对外契约)← `task`(单任务状态机)← `store`(任务表);
+//! `client`(底层 HTTP)← `agent_runner`(build SSE 消费) + `app_lifecycle`(app_manager 生命周期),
+//! `orchestrator`(流程编排入口)组合上述两者。对外契约统一从本模块父路径取。
 
+pub mod agent_runner;
+pub mod app_lifecycle;
 pub mod client;
 pub mod handler;
 pub mod orchestrator;
+pub mod store;
 pub mod task;
+pub mod types;
 
-// PublishTaskStore 注入 AppState(router.rs 用);其余类型经 `super::task::*` 在本模块内消费。
-pub use task::PublishTaskStore;
+// 对外契约统一从父路径取;消费者不再 reach into `::task::` 拿类型。
+// (`PublishTask`/`RemoteBuildTask` 只在本模块内经 `super::task::` 直接引用,无需父级再导出。)
+pub use store::PublishTaskStore;
+pub use types::*;

@@ -1,47 +1,23 @@
-//! 发布/构建编排:rcoder 正向调 agent-runner build(HTTP :60000 + 订阅进度 SSE)
-//! → 同进程调 app_manager(prepare/activate/create_app/confirm)。
+//! 发布/构建编排(对外入口):`run_build` / `run_publish`,顶层终态/取消收敛在此。
 //!
+//! 与 agent-runner 的 build SSE 消费见 `super::agent_runner`;与 app_manager 的生命周期
+//! (ensure_app/wait_app_ready)见 `super::app_lifecycle`;底层 HTTP 在 `super::client`。
 //! - `run_build`:仅触发 agent-runner build + 透传进度(独立 build 接口)。
 //! - `run_publish`:全流程 build → ensure_app → prepare → activate → 轮询就绪 → confirm。
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use app_manager::models::commons::{AppStatus, ExposeType, HealthCheckType};
-use app_manager::models::{CreateAppRequest, HealthCheckConfig, PortConfig, PrepareReleaseRequest};
-use shared_types::BuildProgressEvent;
-use shared_types::build_backend_addr;
+use app_manager::models::PrepareReleaseRequest;
 
 use crate::router::AppState;
 
+use super::agent_runner::{BuildOutcome, resolve_agent_addr, wait_build};
+use super::app_lifecycle::{ensure_app, rcoder_app_id, wait_app_ready};
 use super::client;
-use super::task::{PublishEvent, PublishTask};
-
-/// agent-runner 内嵌 file-server 端口(与 k8s_service.rs AGENT_FILE_SERVER_PORT 一致)。
-const FILE_SERVER_PORT: u16 = 60_000;
-/// app-runtime 容器公网端口(pingap 监听,对外 Service + PortConfig 用)。
-const APP_HTTP_PORT: u16 = 9080;
-/// app-cli 管理 API 端口(K8s 探针打这里:app-cli 自身提供 /health+/ready,不强依赖后端 app)。
-const APP_CLI_ADMIN_PORT: u16 = 3010;
-/// app-cli 提供的探针路径(liveness=进程活,readiness=初始化完成/可选桥接后端)。
-const APP_LIVENESS_PATH: &str = "/health";
-const APP_READINESS_PATH: &str = "/ready";
-/// 就绪轮询间隔。
-const READY_POLL_INTERVAL_SECS: u64 = 3;
-/// 就绪轮询总超时(activate 后 app 启动 + 健康检查窗口)。
-const APP_READY_TIMEOUT_SECS: u64 = 600;
-
-/// build 等待结果(消费 agent-runner build SSE 终态事件得出)。
-enum BuildOutcome {
-    Completed { release_id: String },
-    Failed(String),
-    Cancelled,
-}
-
-// agent-runner 的 build 进度事件类型 = `shared_types::BuildProgressEvent`(file-server 发送 ↔
-// rcoder 接收共享)。终态判定直接 match 类型化变体,不再字符串键解析(消除漂移)。
+use super::task::PublishTask;
+use super::types::PublishEvent;
 
 /// 独立 build 入口(spawn 调):触发 agent-runner build + 透传进度,终态 emit。
 pub async fn run_build(
@@ -294,241 +270,9 @@ async fn run_publish_inner(
     Ok(())
 }
 
-/// 解析 agent-runner project_id → file-server addr(`http://{host}:60000`)。
-/// 复用 `build_backend_addr`(K8s 自动走 `{container_name}-svc.{ns}.svc.{domain}`,Docker 走 container_ip)。
-fn resolve_agent_addr(state: &AppState, project_id: &str) -> Result<String> {
-    let info = state
-        .projects
-        .get(project_id)
-        .and_then(|p| p.container_info())
-        .ok_or_else(|| anyhow!("agent-runner not found for project_id={project_id}"))?;
-    let host = build_backend_addr(
-        &info.container_name,
-        &info.container_ip,
-        &state.config.app_manager.namespace,
-        &state.cluster_domain,
-    );
-    Ok(format!("http://{host}:{FILE_SERVER_PORT}"))
-}
-
-/// 消费 agent-runner build SSE:透传进度到 task,终态返 BuildOutcome。
-/// 消费 agent-runner build SSE:透传进度到 task,终态返 BuildOutcome。
-/// 期间检查 task.is_cancelled → cancel_build + Cancelled。
-/// 流错误或断流(无终态)→ 查 task 快照收敛终态(不再吞成 "stream ended without terminal event")。
-async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Result<BuildOutcome> {
-    if task.is_cancelled() {
-        client::cancel_build(addr, build_task_id)
-            .await
-            .context("cancel agent-runner build before subscribing progress")?;
-        return Ok(BuildOutcome::Cancelled);
-    }
-    let mut rx = client::subscribe_build_progress(addr, build_task_id);
-    loop {
-        let item = tokio::select! {
-            biased;
-            _ = task.cancellation_notified() => {
-                client::cancel_build(addr, build_task_id)
-                    .await
-                    .context("cancel agent-runner build")?;
-                return Ok(BuildOutcome::Cancelled);
-            }
-            item = rx.recv() => match item {
-                Some(item) => item,
-                None => return recover_outcome_from_snapshot(addr, build_task_id).await,
-            },
-        };
-        match item {
-            Ok(data) => {
-                // 终态判定直接 match 类型化事件(类型保证 release_id 存在)。
-                let terminal_outcome: Option<BuildOutcome> = match &data {
-                    BuildProgressEvent::Completed { release_id, .. } => {
-                        Some(BuildOutcome::Completed {
-                            release_id: release_id.clone(),
-                        })
-                    }
-                    BuildProgressEvent::Failed { error } => {
-                        Some(BuildOutcome::Failed(error.clone()))
-                    }
-                    BuildProgressEvent::Cancelled => Some(BuildOutcome::Cancelled),
-                    BuildProgressEvent::Stage { .. }
-                    | BuildProgressEvent::Building { .. }
-                    | BuildProgressEvent::BuildOk { .. }
-                    | BuildProgressEvent::BuildFail { .. }
-                    | BuildProgressEvent::Log { .. } => None,
-                };
-                if let Some(BuildOutcome::Failed(error)) = &terminal_outcome {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        remote_build_task_id = %build_task_id,
-                        error = %error,
-                        "agent-runner build reported failure"
-                    );
-                }
-                task.emit(PublishEvent::BuildProgress { data }).await;
-                if let Some(outcome) = terminal_outcome {
-                    return Ok(outcome);
-                }
-            }
-            Err(e) => {
-                // 流级错误(connect/非2xx/读取/缓冲):log + snapshot 恢复(不再 log-then-close 让 orchestrator 瞎)。
-                tracing::warn!(
-                    task_id = %task.id,
-                    remote_build_task_id = %build_task_id,
-                    error = %e,
-                    "agent-runner build stream error, attempting snapshot recovery"
-                );
-                return recover_outcome_from_snapshot(addr, build_task_id).await;
-            }
-        }
-    }
-}
-
-/// 断流后查 agent-runner task 快照收敛终态。已终态(completed/failed/cancelled)按快照映射;
-/// 仍非终态或快照不可达 → Err(真因透传,不再吞成 "stream ended without terminal event")。
-async fn recover_outcome_from_snapshot(addr: &str, build_task_id: &str) -> Result<BuildOutcome> {
-    let snap = client::get_build_snapshot(addr, build_task_id)
-        .await
-        .context("snapshot recovery after build stream ended")?;
-    let status = snap.get("status").and_then(|s| s.as_str()).unwrap_or("");
-    match status {
-        "completed" => {
-            let release_id = snap
-                .get("releaseId")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-                .ok_or_else(|| anyhow!("snapshot completed but missing releaseId"))?;
-            Ok(BuildOutcome::Completed { release_id })
-        }
-        "failed" => Ok(BuildOutcome::Failed(
-            snap.get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("build failed")
-                .to_owned(),
-        )),
-        "cancelled" => Ok(BuildOutcome::Cancelled),
-        other => Err(anyhow!(
-            "build stream ended and task still non-terminal (status={other})"
-        )),
-    }
-}
-
-/// 确保 app 计算单元存在:不存在则 create_app(幂等;image/ports 首次设定后恒定)。
-async fn ensure_app(state: &AppState, rcoder_app_id: &str, name: &str, image: &str) -> Result<()> {
-    match state.app_service.get_app(rcoder_app_id).await {
-        Ok(_) => {
-            // app 已存在:image/ports/probes 首次设定后恒定,不自动 reconcile(#14)。
-            // 注:app_service trait 只暴露运行时信息(AppRuntimeInfo,无 image 字段),无法在此
-            // 直接比对存储镜像;改为记录期望 image,平台升级 app-runtime 后运维可据日志发现滞后。
-            tracing::info!(
-                app_id = %rcoder_app_id,
-                desired_image = %image,
-                "[USERAPP_PUBLISH] app already exists; image/ports/probes are constant after first \
-                 create and will NOT be reconciled to the desired image"
-            );
-            return Ok(()); // 已存在
-        }
-        Err(e) if is_not_found(&e) => {} // 不存在 → create
-        Err(e) => return Err(anyhow!("get_app: {e}")),
-    }
-    let req = CreateAppRequest {
-        app_id: Some(rcoder_app_id.to_string()),
-        name: name.to_string(),
-        image: image.to_string(),
-        command: None,
-        env: None,
-        secrets: None,
-        resources: None,
-        ports: Some(vec![PortConfig {
-            name: "http".to_string(),
-            port: APP_HTTP_PORT,
-            expose_type: ExposeType::Http,
-            strip_prefix: None,
-        }]),
-        // 探针打 app-cli 的 3010 管理 API(非 pingap 9080):app-cli 自身提供 /health(liveness,
-        // 进程活,后端有 bug 也不杀容器)+ /ready(readiness,默认 app-cli 就绪/可选桥接后端)。
-        // 不再硬编码 /api/rust/ready(旧 bug:与实际后端语言无关,且强依赖后端实现该路径)。
-        health_check: Some(HealthCheckConfig {
-            check_type: HealthCheckType::Http,
-            path: Some(APP_READINESS_PATH.to_string()),
-            liveness_path: Some(APP_LIVENESS_PATH.to_string()),
-            port: Some(APP_CLI_ADMIN_PORT),
-        }),
-        tenant_id: None,
-        space_id: None,
-        // 发布编排创建的 UserApp 默认参与闲置回收（= 免费用户语义）；如需付费常驻由调用方另行 update。
-        recycle_enabled: None,
-        idle_timeout_seconds: None,
-    };
-    state
-        .app_service
-        .create_app(req)
-        .await
-        .map_err(|e| anyhow!("create_app: {e}"))?;
-    Ok(())
-}
-
-/// 轮询 app 到 status=Running 且 health 非 Unhealthy;超时或进入 Error 则失败。
-async fn wait_app_ready(state: &AppState, rcoder_app_id: &str, task: &PublishTask) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(APP_READY_TIMEOUT_SECS);
-    loop {
-        if task.is_cancelled() {
-            return Err(anyhow!("publish cancelled by user"));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(anyhow!(
-                "app readiness poll timed out after {APP_READY_TIMEOUT_SECS}s"
-            ));
-        }
-        let info = state
-            .app_service
-            .get_app(rcoder_app_id)
-            .await
-            .map_err(|e| anyhow!("get_app poll: {e}"))?;
-        if info.status == AppStatus::Error {
-            return Err(anyhow!(
-                "app entered Error state (health={})",
-                info.health.status
-            ));
-        }
-        if info.status == AppStatus::Running && info.health.status != "Unhealthy" {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(READY_POLL_INTERVAL_SECS)).await;
-    }
-}
-
 fn fail_if_cancelled(task: &PublishTask) -> Result<()> {
     if task.is_cancelled() {
         return Err(anyhow!("publish cancelled by user"));
     }
     Ok(())
-}
-
-/// app_manager 错误是否 "app 不存在"(get_app 判存性用)。
-fn is_not_found(e: &app_manager::error::AppOperationError) -> bool {
-    matches!(e, app_manager::error::AppOperationError::NotFound(_))
-}
-
-/// file-server project_id → rcoder app_id(强制 `app-` 前缀,已带则原样)。
-fn rcoder_app_id(app_id: &str) -> String {
-    if app_id.starts_with("app-") {
-        app_id.to_string()
-    } else {
-        format!("app-{app_id}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::rcoder_app_id;
-
-    #[test]
-    fn rcoder_app_id_prepends_prefix_when_missing() {
-        assert_eq!(rcoder_app_id("userapp-e2e"), "app-userapp-e2e");
-    }
-
-    #[test]
-    fn rcoder_app_id_is_idempotent_when_prefixed() {
-        assert_eq!(rcoder_app_id("app-userapp-e2e"), "app-userapp-e2e");
-    }
 }

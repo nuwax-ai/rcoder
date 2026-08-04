@@ -1,17 +1,23 @@
-//! rcoder 侧 publish/build 异步任务:`PublishTaskStore` + `PublishTask` + 进度事件。
+//! 单个 publish/build 异步任务:状态机 + 进度事件流 + 取消。
 //!
-//! 结构参考:file-server `BuildTaskStore`(`crates/file-server/src/service/userapp/tasks.rs`)
-//! 与 rcoder `SessionStreamRegistry`(`grpc/session_stream_registry.rs`,broadcast+ring+seq)。
-//! agent-runner 的 build 进度经 [`client`] 透传给前端(rcoder SSE),叠加 rcoder 发布阶段(Stage)。
+//! 所有可变状态收在【一把】`state` 锁后;`emit`/`request_cancel`/`subscribe` 各取一次锁、互不嵌套
+//! (共享临界逻辑在自由函数 `publish_mut`)。结构参考 file-server `BuildTaskStore`
+//! (`crates/file-server/src/service/userapp/tasks.rs`)与 rcoder `SessionStreamRegistry`
+//! (`grpc/session_stream_registry.rs`,broadcast+ring+seq)。对外契约类型(事件/状态/快照)见
+//! `super::types`,全局任务表见 `super::store`。agent-runner 的 build 进度经 `super::client`
+//! 透传给前端(rcoder SSE),叠加发布阶段(Stage)。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use chrono::Utc;
-use serde::Serialize;
-use shared_types::BuildProgressEvent;
 use tokio::sync::{Mutex, Notify, broadcast};
+
+use super::types::{
+    CancelAttempt, PublishEvent, PublishTaskId, PublishTaskKind, PublishTaskSnapshot,
+    PublishTaskStatus,
+};
 
 /// 历史事件 ring 容量(断线重连 seq replay)。
 const RING_CAP: usize = 1000;
@@ -20,83 +26,6 @@ const RING_CAP: usize = 1000;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 /// broadcast 通道容量(实时 SSE fan-out)。
 const BROADCAST_CAP: usize = 256;
-/// 终态任务在内存中保留 24h，便于前端重连查询。
-const TERMINAL_TASK_TTL_SECS: i64 = 24 * 60 * 60;
-/// 防止异常调用方无限创建任务。达上限时优先淘汰最旧终态任务。
-const MAX_RETAINED_TASKS: usize = 1_000;
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum PublishTaskStoreError {
-    #[error("publish task capacity exhausted (limit={limit}); wait for an active task to finish")]
-    CapacityExceeded { limit: usize },
-}
-
-pub type PublishTaskId = String;
-
-/// 任务类型:仅触发 agent-runner build / 全流程发布。
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum PublishTaskKind {
-    Build,
-    Publish,
-}
-
-/// 任务状态。
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum PublishTaskStatus {
-    Pending,
-    Running,
-    /// 取消已请求、远端取消/回滚进行中(非终态)。终态由 orchestrator 收敛为 Cancelled/Failed。
-    Cancelling,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-/// 进度事件(给前端 SSE)。agent-runner build 进度原样透传(`BuildProgress.data`)。
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase", tag = "event")]
-pub enum PublishEvent {
-    /// 进入新发布阶段(publish: EnsureApp/Prepare/Activate/WaitReady/Confirm)。
-    Stage { stage: String },
-    /// 透传 agent-runner build 进度(Building/BuildOk/BuildFail,data=类型化事件)。
-    BuildProgress { data: BuildProgressEvent },
-    /// 取消已请求(非终态):任务进入 Cancelling,通知前端"取消中"。终态 Cancelled/Failed 由 orchestrator emit。
-    Cancelling,
-    /// 任务完成(build 产 release_id;publish 发布 Active)。
-    Completed { release_id: String },
-    /// 任务失败。
-    Failed { error: String },
-    /// 任务被取消。
-    Cancelled,
-}
-
-/// `request_cancel` 的结果(原子取消请求)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CancelAttempt {
-    /// 已接受:任务转入 Cancelling(非终态),orchestrator 将做远端取消/回滚后 emit 终态。
-    Accepted,
-    /// 任务已终态,不可取消。携带实际终态供调用方如实回传(避免 #5 撒谎窗口)。
-    AlreadyTerminal(PublishTaskStatus),
-}
-
-/// 任务快照(GET /tasks/{id} 返回)。
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PublishTaskSnapshot {
-    pub id: PublishTaskId,
-    pub app_id: String,
-    pub project_id: String,
-    pub kind: PublishTaskKind,
-    pub status: PublishTaskStatus,
-    pub stage: Option<String>,
-    pub release_id: Option<String>,
-    pub error: Option<String>,
-    pub seq: u64,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
 
 /// 任务可变状态:全部收在【一把】`state` 锁后(status/seq/history 同步变更,保证一致性)。
 struct TaskState {
@@ -112,10 +41,16 @@ struct TaskState {
     updated_at: i64,
 }
 
+#[derive(Clone)]
+pub struct RemoteBuildTask {
+    pub addr: String,
+    pub task_id: String,
+}
+
 /// 单个异步任务:状态 + 进度事件流 + cancel。
 ///
 /// 并发模型:所有可变状态在【一把】`state` 锁后;`emit`/`request_cancel`/`subscribe` 各取一次锁、
-/// 互不嵌套调用(共享临界逻辑在自由函数 [`publish_mut`],它吃 `&mut TaskState`、无 `&self`,
+/// 互不嵌套调用(共享临界逻辑在自由函数 `publish_mut`,它吃 `&mut TaskState`、无 `&self`,
 /// 类型上无法再去取 state 锁),从结构上根除锁序/重入死锁。`cancelled`/`terminal_at`/`created_at`
 /// 保持在锁外:供 orchestrator/store 无锁读。
 pub struct PublishTask {
@@ -129,14 +64,8 @@ pub struct PublishTask {
     remote_build: Mutex<Option<RemoteBuildTask>>,
 }
 
-#[derive(Clone)]
-pub struct RemoteBuildTask {
-    pub addr: String,
-    pub task_id: String,
-}
-
 impl PublishTask {
-    fn new(app_id: String, project_id: String, kind: PublishTaskKind) -> Arc<Self> {
+    pub(super) fn new(app_id: String, project_id: String, kind: PublishTaskKind) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAP);
         let now = Utc::now().timestamp();
         Arc::new(Self {
@@ -189,7 +118,7 @@ impl PublishTask {
         self.state.lock().await.status
     }
 
-    /// 发进度事件:取一次 state 锁 → [`publish_mut`] → broadcast → 释放。终态后丢弃后续事件。
+    /// 发进度事件:取一次 state 锁 → `publish_mut` → broadcast → 释放。终态后丢弃后续事件。
     pub async fn emit(&self, event: PublishEvent) {
         let terminal = {
             let mut s = self.state.lock().await;
@@ -207,7 +136,7 @@ impl PublishTask {
         }
     }
 
-    /// 原子取消请求:取一次 state 锁 → check 终态 → [`publish_mut`](Cancelling) → 释放 → 置 flag+notify。
+    /// 原子取消请求:取一次 state 锁 → check 终态 → `publish_mut`(置 Cancelling) → 释放 → 置 flag+notify。
     /// 与 `emit` 是【平级兄弟】(都只调 `publish_mut`,互不调用),不再有"持锁时调 emit"的重入死锁。
     /// 返回 Accepted 表示已进入非终态 Cancelling,终态 Cancelled/Failed 由 orchestrator 完成远端
     /// 取消/回滚后收敛;返回 AlreadyTerminal 时任务已终态,携带实际状态供调用方如实回传(#5)。
@@ -266,6 +195,16 @@ impl PublishTask {
             }
             notified.await;
         }
+    }
+
+    /// 终态时间戳(0=未终态)。Acquire 载入供 store 的 TTL/淘汰决策无锁读。
+    pub(super) fn terminal_at(&self) -> i64 {
+        self.terminal_at.load(Ordering::Acquire)
+    }
+
+    /// 创建时间。供 store 淘汰"最旧终态任务"。
+    pub(super) fn created_at(&self) -> i64 {
+        self.created_at
     }
 
     pub async fn set_remote_build(&self, addr: String, task_id: String) {
@@ -339,72 +278,10 @@ fn apply_event(state: &mut TaskState, event: &PublishEvent) {
     }
 }
 
-/// 全局任务表(内存;短期。发布产物由 app_manager release index 持久)。
-pub struct PublishTaskStore {
-    map: Mutex<HashMap<PublishTaskId, Arc<PublishTask>>>,
-    max_retained_tasks: usize,
-}
-
-impl PublishTaskStore {
-    pub fn new() -> Self {
-        Self {
-            map: Mutex::new(HashMap::new()),
-            max_retained_tasks: MAX_RETAINED_TASKS,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_max_retained_tasks(max_retained_tasks: usize) -> Self {
-        Self {
-            map: Mutex::new(HashMap::new()),
-            max_retained_tasks,
-        }
-    }
-
-    pub async fn create(
-        &self,
-        app_id: String,
-        project_id: String,
-        kind: PublishTaskKind,
-    ) -> Result<Arc<PublishTask>, PublishTaskStoreError> {
-        let now = Utc::now().timestamp();
-        let mut map = self.map.lock().await;
-        map.retain(|_, existing| {
-            let terminal_at = existing.terminal_at.load(Ordering::Acquire);
-            terminal_at == 0 || now.saturating_sub(terminal_at) < TERMINAL_TASK_TTL_SECS
-        });
-        while map.len() >= self.max_retained_tasks {
-            let Some(oldest_terminal_id) = map
-                .values()
-                .filter(|existing| existing.terminal_at.load(Ordering::Acquire) > 0)
-                .min_by_key(|existing| existing.created_at)
-                .map(|existing| existing.id.clone())
-            else {
-                return Err(PublishTaskStoreError::CapacityExceeded {
-                    limit: self.max_retained_tasks,
-                });
-            };
-            map.remove(&oldest_terminal_id);
-        }
-        let task = PublishTask::new(app_id, project_id, kind);
-        map.insert(task.id.clone(), task.clone());
-        Ok(task)
-    }
-
-    pub async fn get(&self, id: &str) -> Option<Arc<PublishTask>> {
-        self.map.lock().await.get(id).cloned()
-    }
-}
-
-impl Default for PublishTaskStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared_types::BuildProgressEvent;
 
     #[tokio::test]
     async fn subscription_has_no_gap_between_replay_and_live_events() {
@@ -597,49 +474,5 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-    }
-
-    #[tokio::test]
-    async fn store_rejects_new_task_when_all_capacity_is_active() {
-        let store = PublishTaskStore::with_max_retained_tasks(2);
-        for app_id in ["app-a", "app-b"] {
-            store
-                .create(app_id.into(), app_id.into(), PublishTaskKind::Build)
-                .await
-                .expect("active task within capacity");
-        }
-
-        let result = store
-            .create("app-c".into(), "app-c".into(), PublishTaskKind::Build)
-            .await;
-        let error = match result {
-            Ok(_) => panic!("active tasks must never be silently evicted"),
-            Err(error) => error,
-        };
-        assert_eq!(error, PublishTaskStoreError::CapacityExceeded { limit: 2 });
-        assert_eq!(store.map.lock().await.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn store_evicts_terminal_task_before_rejecting_new_task() {
-        let store = PublishTaskStore::with_max_retained_tasks(1);
-        let completed = store
-            .create("app-a".into(), "app-a".into(), PublishTaskKind::Build)
-            .await
-            .expect("first task");
-        completed
-            .emit(PublishEvent::Completed {
-                release_id: "release-a".into(),
-            })
-            .await;
-
-        let replacement = store
-            .create("app-b".into(), "app-b".into(), PublishTaskKind::Build)
-            .await
-            .expect("terminal task should be evicted");
-        let map = store.map.lock().await;
-        assert_eq!(map.len(), 1);
-        assert!(map.contains_key(&replacement.id));
-        assert!(!map.contains_key(&completed.id));
     }
 }
