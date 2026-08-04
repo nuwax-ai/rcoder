@@ -11,6 +11,7 @@ use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -80,6 +81,9 @@ pub struct SessionData {
     /// session 的 stream epoch(每次 new 生成新值)。rcoder 据此判断 seq epoch 是否变化:
     /// 进程重启 / SessionWorker panic 重建都会 new → 新 epoch → rcoder 重置 last_seq + 清 ring(#15)。
     epoch: String,
+    /// worker 已结束（panic/正常退出/cancel）标记。置位后并发调用据不再向已死 channel 推消息，
+    /// 直接走重建路径（修复 has_worker_panicked 的 take→replace 竞态丢消息）。
+    poisoned: AtomicBool,
 }
 
 impl SessionData {
@@ -108,6 +112,7 @@ impl SessionData {
             current_connection: Arc::new(ArcSwapOption::empty()),
             worker_handle: Arc::new(tokio::sync::Mutex::new(None)),
             epoch: uuid::Uuid::now_v7().simple().to_string(),
+            poisoned: AtomicBool::new(false),
         });
         debug!(
             "[SessionData::new] Arc creation took: {:?}",
@@ -207,11 +212,14 @@ impl SessionData {
         let mut guard = self.worker_handle.lock().await;
         if let Some(handle) = guard.as_ref() {
             if handle.is_finished() {
+                // worker 已结束（panic/正常退出/cancel），channel 随之关闭。先标记 poisoned，
+                // 使并发调用（handle 已被 take 走、看到 None）据此重建，不再向已死 channel 推消息。
+                self.poisoned.store(true, Ordering::Release);
                 // take() 消耗 handle 来 await 获取结果
                 // 安全：持有 Mutex 锁期间 as_ref() 与 take() 之间无竞争
                 let handle = match guard.take() {
                     Some(h) => h,
-                    None => return false, // 锁内另一分支已消费
+                    None => return self.poisoned.load(Ordering::Acquire),
                 };
                 // JoinHandle 已从共享状态移出；等待它之前释放锁，避免健康检查等调用
                 // 在任务退出清理较慢时被无谓串行化。
@@ -235,7 +243,8 @@ impl SessionData {
                 false
             }
         } else {
-            false
+            // handle 已被并发调用 take 走（worker 已结束）：据 poisoned 判断是否需重建
+            self.poisoned.load(Ordering::Acquire)
         }
     }
 

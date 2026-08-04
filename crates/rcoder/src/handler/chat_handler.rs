@@ -525,6 +525,8 @@ pub async fn handle_chat(
                             "⚠️ [CHAT] Agent status probe failed (attempt {}/{}): {}",
                             attempt, MAX_PROBE_ATTEMPTS, e
                         );
+                        // 探活失败驱逐坏 channel，避免后续重试复用同一失效连接（对齐 forward 重试 remove）
+                        state.grpc_pool.remove(&grpc_addr).await;
                         false
                     }
                 },
@@ -533,6 +535,8 @@ pub async fn handle_chat(
                         "⚠️ [CHAT] Agent status probe get_client failed (attempt {}/{}): {}",
                         attempt, MAX_PROBE_ATTEMPTS, e
                     );
+                    // 取不到/坏 channel 也驱逐，下次重试由连接池重建
+                    state.grpc_pool.remove(&grpc_addr).await;
                     false
                 }
             };
