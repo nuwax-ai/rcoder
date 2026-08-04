@@ -343,6 +343,9 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
     };
     let mut buckets = DiscardBuckets::default();
     for f in &to_discard {
+        // 安全：用户可控的 files 必须在任何 fs 操作前做路径校验，拒绝 `..` / 绝对路径穿越。
+        // stage_path 内部的 ensure_within 发生在 write/remove 之后（太晚），故在此先行拦截。
+        let abs = crate::path_safety::ensure_within(workdir, f)?;
         match tree
             .lookup_entry_by_path(f)
             .map_err(|e| map_git_err(e, "git lookup_entry_by_path"))?
@@ -352,17 +355,16 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
                 let blob = repo
                     .find_blob(entry.id())
                     .map_err(|e| map_git_err(e, "git find_blob"))?;
-                let dest = workdir.join(f);
-                if let Some(p) = dest.parent() {
+                if let Some(p) = abs.parent() {
                     let _ = std::fs::create_dir_all(p);
                 }
-                std::fs::write(&dest, &blob.data)?;
+                std::fs::write(&abs, &blob.data)?;
                 stage_path(repo, f)?;
                 buckets.tracked_files.push(f.clone());
             }
             None => {
                 // untracked / staged-new: 删 worktree + 同步 index (移除 staged-new entry)
-                let _ = std::fs::remove_file(workdir.join(f));
+                let _ = std::fs::remove_file(&abs);
                 stage_path(repo, f)?;
                 if staged_set.contains(f) {
                     buckets.new_files.push(f.clone());
@@ -430,6 +432,37 @@ mod tests {
                 .is_none(),
             "deleted index entry must not be copied back from HEAD"
         );
+    }
+
+    #[test]
+    fn discard_restores_tracked_file_from_head() {
+        let test = TestRepo::new();
+        commit_file(&test, "tracked.txt", "head", "add tracked");
+        std::fs::write(test.0.join("tracked.txt"), "modified").expect("modify fixture");
+        let repo = test.open();
+        let buckets = discard_files(&repo, &["tracked.txt".to_string()]).expect("discard tracked");
+        assert_eq!(buckets.tracked_files, vec!["tracked.txt".to_string()]);
+        // worktree 恢复到 HEAD 内容
+        assert_eq!(
+            std::fs::read_to_string(test.0.join("tracked.txt")).unwrap(),
+            "head"
+        );
+    }
+
+    #[test]
+    fn discard_rejects_path_traversal() {
+        let test = TestRepo::new();
+        commit_file(&test, "tracked.txt", "head", "add tracked");
+        let repo = test.open();
+        // 穿越路径必须在任何 fs 操作前被 ensure_within 拦截
+        let outside = test.0.parent().unwrap().join("evil-outside.txt");
+        let _ = std::fs::remove_file(&outside);
+        let result = discard_files(&repo, &["../evil-outside.txt".to_string()]);
+        assert!(
+            result.is_err(),
+            "path traversal must be rejected before any fs op"
+        );
+        assert!(!outside.exists(), "no fs side effect outside workdir");
     }
 
     #[test]

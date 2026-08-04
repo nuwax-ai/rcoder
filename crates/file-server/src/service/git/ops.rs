@@ -15,6 +15,7 @@ use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
 use crate::error::{AppError, AppResult};
+use crate::path_safety::ensure_within_path;
 
 use super::{commit_indexed, ensure_gitignore, get_status, map_git_err, stage_path};
 
@@ -184,7 +185,7 @@ fn overlay_tree_on_worktree_and_index(
         let blob = repo
             .find_blob(entry.id)
             .map_err(|e| map_git_err(e, "git find_blob (checkout overlay)"))?;
-        let dest = workdir.join(from_bstr(path));
+        let dest = ensure_within_path(workdir, from_bstr(path))?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -366,7 +367,7 @@ fn apply_tree_to_worktree(
         let blob = repo
             .find_blob(entry.id)
             .map_err(|e| map_git_err(e, "git find_blob (checkout)"))?;
-        let dest = workdir.join(from_bstr(path));
+        let dest = ensure_within_path(workdir, from_bstr(path))?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -384,7 +385,10 @@ fn apply_tree_to_worktree(
                 .entry_by_path_and_stage(path, Stage::Unconflicted)
                 .is_none()
             {
-                let _ = std::fs::remove_file(workdir.join(from_bstr(path)));
+                // 防御：恶意 old-tree entry 含 `..` 时跳过删除（绝不删工作区外文件）
+                if let Ok(abs) = ensure_within_path(workdir, from_bstr(path)) {
+                    let _ = std::fs::remove_file(&abs);
+                }
             }
         }
     }

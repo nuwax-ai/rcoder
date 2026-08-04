@@ -27,6 +27,20 @@ pub fn ensure_within(base: &Path, relative: &str) -> AppResult<PathBuf> {
     }
 }
 
+/// Path 级校验（用于 git tree entry 等可能非 UTF-8 的路径）：`target` 解析后必须落在
+/// `base` 下，越界返回 `Err`。语义同 [`ensure_within`]，区别是接受 `Path` 而非 `&str`。
+pub fn ensure_within_path(base: &Path, target: impl AsRef<Path>) -> AppResult<PathBuf> {
+    let target = base.join(target).clean();
+    let normalized_base = base.clean();
+    if target.starts_with(&normalized_base) {
+        Ok(target)
+    } else {
+        Err(AppError::validation(
+            "File path is not safe, cannot exceed project directory",
+        ))
+    }
+}
+
 /// 业务文件路径校验 (跳过风格): 越界返回 `None`, 由调用方决定跳过。
 /// 对齐 nuwax `specifiedFilesUpdate` / `uploadBatchFiles`。
 pub fn safe_within_or_skip(base: &Path, relative: &str) -> Option<PathBuf> {
@@ -81,6 +95,18 @@ mod tests {
         // 绝对路径: PathBuf::join 替换 base → 落在 base 外 → 拦截
         assert!(ensure_within(&base, "/etc/passwd").is_err());
         assert!(ensure_within(&base, "/app/other").is_err());
+    }
+
+    #[test]
+    fn ensure_within_path_accepts_and_rejects() {
+        let base = PathBuf::from("/app/p");
+        assert_eq!(
+            ensure_within_path(&base, "a/b.txt").unwrap(),
+            PathBuf::from("/app/p/a/b.txt")
+        );
+        // `..` 越界 / 绝对路径均拒绝
+        assert!(ensure_within_path(&base, "../secret").is_err());
+        assert!(ensure_within_path(&base, "/etc/passwd").is_err());
     }
 
     #[test]
