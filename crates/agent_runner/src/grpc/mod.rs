@@ -14,6 +14,9 @@ mod subscribe_progress;
 pub(crate) mod utils;
 pub(crate) mod vnc_probe;
 
+// HTTP 停止路径复用 gRPC 的清理逻辑（含 graceful_stop），故 crate 内重导出
+pub(crate) use cleanup::remove_agent_and_cleanup;
+
 use std::sync::Arc;
 
 use shared_types::grpc::{

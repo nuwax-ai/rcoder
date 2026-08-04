@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::CancelNotificationRequestWrapper;
+use crate::grpc::remove_agent_and_cleanup;
 use crate::http_server::router::AppState;
 use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER, SESSION_CACHE};
 use shared_types::{
@@ -136,18 +137,11 @@ pub async fn handle_computer_stop(
             }
         }
 
-        // 从 AGENT_REGISTRY 移除
-        let removed = AGENT_REGISTRY.remove_by_project(project_id).is_some();
-        if removed {
-            info!("[HTTP] Agent stopped: project_id={}", project_id);
-            (true, get_error_message(SUCCESS, locale))
-        } else {
-            info!("[HTTP] Agent already cleaned up: project_id={}", project_id);
-            (
-                true,
-                get_i18n_message("success.agent_already_stopped", locale),
-            )
-        }
+        // 从 AGENT_REGISTRY 移除并优雅停止子进程（对齐 gRPC 路径：
+        // remove_agent_and_cleanup 内部 remove_by_project + 后台 graceful_stop SIGTERM+wait）
+        remove_agent_and_cleanup(project_id);
+        info!("[HTTP] Agent stopped: project_id={}", project_id);
+        (true, get_error_message(SUCCESS, locale))
     } else {
         info!(
             "[HTTP] Agent not found, returning success idempotently: project_id={}",

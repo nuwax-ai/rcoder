@@ -801,6 +801,10 @@ pub async fn handle_chat_core(
         Ok(Err(e)) => {
             // PendingGuard 自动清理（在 drop 时）
             error!("[ChatHandler] Agent session processing failed: {}", e);
+            // 回滚 step7 写入的 API key 配置，避免失败累积泄漏（DashMap::remove 幂等）
+            if let Some((_, uuid)) = context.project_uuid_map.remove(&project_id) {
+                context.shared_api_key_manager.remove(&uuid);
+            }
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
@@ -818,6 +822,10 @@ pub async fn handle_chat_core(
                 "[ChatHandler] ⏰ Chat request timeout (300s): project_id={}",
                 project_id
             );
+            // 回滚 step7 写入的 API key 配置，避免失败累积泄漏（DashMap::remove 幂等）
+            if let Some((_, uuid)) = context.project_uuid_map.remove(&project_id) {
+                context.shared_api_key_manager.remove(&uuid);
+            }
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
