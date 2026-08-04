@@ -589,7 +589,7 @@ impl ProjectAdapter {
 
     /// 保存容器信息（更新或创建）
     ///
-    /// 通过 view() 获取 Arc<ContainerEntry>，利用内部可变性（RwLock）更新。
+    /// 通过 view() 获取 `Arc<ContainerEntry>`，利用内部可变性（RwLock）更新。
     /// DashMap 读锁在 view() 闭包返回后立即释放，update() 仅持有 RwLock。
     /// 不存在时使用 entry() API 原子插入，避免 TOCTOU 竞态。
     ///

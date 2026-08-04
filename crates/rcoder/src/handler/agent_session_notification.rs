@@ -1114,7 +1114,7 @@ async fn create_sse_proxy_stream(
 
                                 // 按双换行符分割 SSE 事件
                                 while let Some(event_end) =
-                                    buffer.windows(2).position(|w| w == [b'\n', b'\n'])
+                                    buffer.windows(2).position(|w| w == *b"\n\n")
                                 {
                                     let event_data = buffer[..event_end].to_vec();
                                     buffer = buffer[event_end + 2..].to_vec();

@@ -526,7 +526,7 @@ mod tests {
         let mut config = MultiImageConfig::default();
 
         // 为测试设置镜像配置
-        for (_, service_config) in config.services.iter_mut() {
+        for service_config in config.services.values_mut() {
             service_config.arm64_image = Some("test-image:arm64".to_string());
             service_config.amd64_image = Some("test-image:amd64".to_string());
         }
