@@ -69,7 +69,7 @@ pub async fn load_sacp_agent_config_with_resolver(
 
         if let Some(provider) = model_provider {
             let resolved = model_env_resolver.resolve(provider, service_uuid)?;
-            for (_key, value) in resolved_env.iter_mut() {
+            for value in resolved_env.values_mut() {
                 render_model_template(value, &resolved);
             }
         }

@@ -159,7 +159,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             // 🔧 关键修复：替换自定义环境变量中的模板变量
             // 用户可能传入 {MODEL_PROVIDER_API_KEY} 等模板，需要替换为实际值
             if let Some(ref resolved) = resolved_model_env {
-                for (_key, value) in env.iter_mut() {
+                for value in env.values_mut() {
                     render_model_template(value, resolved);
                 }
                 let bound_model_env_keys = apply_model_env_bindings(
@@ -367,7 +367,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 替换 UUID 占位符
         if let Some(ref uuid) = service_uuid {
             info!("[SACP] Replacing {{SERVICE_UUID}} with: {}", uuid);
-            for (_key, value) in merged_envs.iter_mut() {
+            for value in merged_envs.values_mut() {
                 *value = value.replace("{SERVICE_UUID}", uuid);
             }
         } else {
