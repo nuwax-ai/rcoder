@@ -117,6 +117,10 @@ fn validate_runtime_compatibility(release: &workspace_manifest::ReleaseLock) -> 
     if current < minimum {
         anyhow::bail!("release requires app-cli >= {minimum}, current version is {current}");
     }
+    // 运行时身份(pingap 版本/commit、镜像 digest)仅记录日志,不做硬校验:
+    // pingap 向前兼容(新版接受旧配置),且 app-runtime 镜像与 pingap 会随升级变动,
+    // 硬性相等比对会阻塞容器启动 → 无法平滑升级。此处打印 release.lock 与运行时实际值
+    // 供日志追溯;mismatch / 缺失仅 warn,不阻断启动。
     for (name, locked) in [
         ("RCODER_PINGAP_VERSION", release.pingap.version.as_str()),
         ("RCODER_PINGAP_COMMIT", release.pingap.commit.as_str()),
@@ -125,12 +129,17 @@ fn validate_runtime_compatibility(release: &workspace_manifest::ReleaseLock) -> 
             release.runtime_image_digest.as_str(),
         ),
     ] {
-        let runtime = std::env::var(name)
-            .with_context(|| format!("required runtime identity is missing: {name}"))?;
-        if runtime != locked {
-            anyhow::bail!(
-                "runtime identity mismatch for {name}: release={locked}, runtime={runtime}"
-            );
+        match std::env::var(name) {
+            Ok(runtime) => {
+                if runtime == locked {
+                    info!("{name}: release={locked} runtime={runtime} (matched)");
+                } else {
+                    warn!("{name} mismatch (non-fatal, will not block startup): release={locked}, runtime={runtime}");
+                }
+            }
+            Err(_) => warn!(
+                "{name} not set in runtime (non-fatal): release={locked}"
+            ),
         }
     }
     Ok(())
