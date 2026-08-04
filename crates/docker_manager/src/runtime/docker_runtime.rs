@@ -416,17 +416,36 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 );
                 ContainerRuntimeError::ContainerCreationError(e.to_string())
             })?;
-        client
+        if let Err(e) = client
             .start_container(&created.id, None::<StartContainerOptions>)
             .await
-            .map_err(|e| {
-                tracing::error!(
-                    "[APP-DOCKER] start_container 失败 name={}, id={}: {e:?}",
-                    container_name,
-                    created.id
+        {
+            tracing::error!(
+                "[APP-DOCKER] start_container 失败 name={}, id={}: {e:?}",
+                container_name,
+                created.id
+            );
+            // best-effort 强删已 created 的孤儿容器，避免残留导致下次同名创建冲突
+            // （对齐 delete_deployment 的 force-remove 范式）
+            use bollard::query_parameters::RemoveContainerOptions;
+            if let Err(rm_e) = client
+                .remove_container(
+                    &created.id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                tracing::debug!(
+                    "[APP-DOCKER] best-effort remove orphan container {} failed: {}",
+                    created.id,
+                    rm_e
                 );
-                ContainerRuntimeError::ContainerStartError(e.to_string())
-            })?;
+            }
+            return Err(ContainerRuntimeError::ContainerStartError(e.to_string()));
+        }
 
         // 短轮询等待 container_ip 就绪（容器刚 start，IP 可能尚未分配）。
         // 优先取主网络网卡的 IP，回退任意网卡；最多重试 6 次 × 200ms。

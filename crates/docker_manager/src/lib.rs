@@ -64,6 +64,9 @@ pub enum DockerError {
     #[error("image pull failed: {0}")]
     ImagePullError(String),
 
+    #[error("image inspect failed: {0}")]
+    ImageInspectError(String),
+
     #[error("configuration error: {0}")]
     ConfigurationError(String),
 

@@ -22,45 +22,59 @@ impl DockerManager {
                 );
                 Ok(())
             }
-            Err(_) => {
-                info!(
-                    "Image {} not found, pulling... (inspect {:?})",
-                    image,
-                    inspect_started.elapsed()
-                );
+            Err(e) => match &e {
+                // 404 = 镜像不存在，走拉取
+                bollard::errors::Error::DockerResponseServerError { status_code, .. }
+                    if *status_code == 404 =>
+                {
+                    info!(
+                        "Image {} not found, pulling... (inspect {:?})",
+                        image,
+                        inspect_started.elapsed()
+                    );
 
-                let pull_started = std::time::Instant::now();
-                let pull_options = CreateImageOptions {
-                    from_image: Some(image.to_string()),
-                    ..Default::default()
-                };
+                    let pull_started = std::time::Instant::now();
+                    let pull_options = CreateImageOptions {
+                        from_image: Some(image.to_string()),
+                        ..Default::default()
+                    };
 
-                let mut pull_stream = self.docker.create_image(Some(pull_options), None, None);
+                    let mut pull_stream = self.docker.create_image(Some(pull_options), None, None);
 
-                while let Some(result) = pull_stream.next().await {
-                    match result {
-                        Ok(progress) => {
-                            if let Some(status) = progress.status {
-                                debug!("Image pull progress: {}", status);
+                    while let Some(result) = pull_stream.next().await {
+                        match result {
+                            Ok(progress) => {
+                                if let Some(status) = progress.status {
+                                    debug!("Image pull progress: {}", status);
+                                }
+                            }
+                            Err(e) => {
+                                return Err(DockerError::ImagePullError(format!(
+                                    "Failed to pull image after {:?}: {}",
+                                    pull_started.elapsed(),
+                                    e
+                                )));
                             }
                         }
-                        Err(e) => {
-                            return Err(DockerError::ImagePullError(format!(
-                                "Failed to pull image after {:?}: {}",
-                                pull_started.elapsed(),
-                                e
-                            )));
-                        }
                     }
-                }
 
-                info!(
-                    "Image {} pull completed in {:?}",
-                    image,
-                    pull_started.elapsed()
-                );
-                Ok(())
-            }
+                    info!(
+                        "Image {} pull completed in {:?}",
+                        image,
+                        pull_started.elapsed()
+                    );
+                    Ok(())
+                }
+                // 非 404（401/403/500/超时等）：daemon/鉴权/网络故障，透传而非误判为"镜像不存在"
+                _ => {
+                    tracing::warn!(
+                        "inspect_image failed for {} (not 404), propagating: {:?}",
+                        image,
+                        e
+                    );
+                    Err(DockerError::ImageInspectError(e.to_string()))
+                }
+            },
         }
     }
 
