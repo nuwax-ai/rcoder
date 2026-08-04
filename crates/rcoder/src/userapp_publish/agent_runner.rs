@@ -44,7 +44,11 @@ pub(super) fn resolve_agent_addr(state: &AppState, project_id: &str) -> Result<S
 /// 消费 agent-runner build SSE:透传进度到 task,终态返 BuildOutcome。
 /// 期间检查 task.is_cancelled → cancel_build + Cancelled。
 /// 流错误或断流(无终态)→ 查 task 快照收敛终态(不再吞成 "stream ended without terminal event")。
-pub(super) async fn wait_build(addr: &str, build_task_id: &str, task: &PublishTask) -> Result<BuildOutcome> {
+pub(super) async fn wait_build(
+    addr: &str,
+    build_task_id: &str,
+    task: &PublishTask,
+) -> Result<BuildOutcome> {
     if task.is_cancelled() {
         client::cancel_build(addr, build_task_id)
             .await

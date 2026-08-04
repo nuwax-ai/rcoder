@@ -28,9 +28,7 @@ use crate::router::AppState;
 
 use super::client;
 use super::orchestrator;
-use super::{
-    CancelAttempt, PublishEvent, PublishTaskKind, PublishTaskSnapshot, PublishTaskStatus,
-};
+use super::{CancelAttempt, PublishEvent, PublishTaskKind, PublishTaskSnapshot, PublishTaskStatus};
 
 /// 路由聚合(注册到 rcoder 主 router,与 app_manager 路由同 `/api/v1/apps` 前缀)。
 pub fn routes() -> axum::Router<Arc<AppState>> {

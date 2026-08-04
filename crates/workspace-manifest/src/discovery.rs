@@ -1,8 +1,6 @@
 use std::path::Path;
 
-use crate::{
-    DiscoverError, DiscoveredProject, ProjectManifest, parse_project, validate_topology,
-};
+use crate::{DiscoverError, DiscoveredProject, ProjectManifest, parse_project, validate_topology};
 
 /// 扫描 workspace 根的一级子目录，发现并解析所有 `project.manifest.toml`。
 ///

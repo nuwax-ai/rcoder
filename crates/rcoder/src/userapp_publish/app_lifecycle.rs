@@ -26,7 +26,12 @@ const READY_POLL_INTERVAL_SECS: u64 = 3;
 const APP_READY_TIMEOUT_SECS: u64 = 600;
 
 /// 确保 app 计算单元存在:不存在则 create_app(幂等;image/ports 首次设定后恒定)。
-pub(super) async fn ensure_app(state: &AppState, rcoder_app_id: &str, name: &str, image: &str) -> Result<()> {
+pub(super) async fn ensure_app(
+    state: &AppState,
+    rcoder_app_id: &str,
+    name: &str,
+    image: &str,
+) -> Result<()> {
     match state.app_service.get_app(rcoder_app_id).await {
         Ok(_) => {
             // app 已存在:image/ports/probes 首次设定后恒定,不自动 reconcile(#14)。
@@ -81,7 +86,11 @@ pub(super) async fn ensure_app(state: &AppState, rcoder_app_id: &str, name: &str
 }
 
 /// 轮询 app 到 status=Running 且 health 非 Unhealthy;超时或进入 Error 则失败。
-pub(super) async fn wait_app_ready(state: &AppState, rcoder_app_id: &str, task: &PublishTask) -> Result<()> {
+pub(super) async fn wait_app_ready(
+    state: &AppState,
+    rcoder_app_id: &str,
+    task: &PublishTask,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(APP_READY_TIMEOUT_SECS);
     loop {
         if task.is_cancelled() {

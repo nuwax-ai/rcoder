@@ -57,11 +57,7 @@ pub enum LoadError {
     Invariant(String),
     /// 破坏性变更无法仅从老 lock 推导，必须用源 manifest 重锁（Stage 2 路径）。
     /// app-cli 据此上报，平台侧触发 `relock_from_package`。
-    RequiresRebuild {
-        from: u32,
-        to: u32,
-        reason: String,
-    },
+    RequiresRebuild { from: u32, to: u32, reason: String },
 }
 
 impl std::fmt::Display for LoadError {
@@ -69,7 +65,10 @@ impl std::fmt::Display for LoadError {
         match self {
             Self::Parse(message) => write!(f, "parse release lock: {message}"),
             Self::NewerThanKnown { got, known } => {
-                write!(f, "release lock schema_version {got} is newer than known {known}")
+                write!(
+                    f,
+                    "release lock schema_version {got} is newer than known {known}"
+                )
             }
             Self::UnknownVersion(version) => {
                 write!(f, "unknown release lock schema_version {version}")
