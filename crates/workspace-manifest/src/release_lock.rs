@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    DiscoveredProject, INTERNAL_PORT_MAX, INTERNAL_PORT_MIN, LockedPingap, LockedService,
-    ManifestError, ReleaseLock, SCHEMA_VERSION, WorkspaceManifest, validate_topology,
-    validate_workspace,
+    DiscoveredProject, INTERNAL_PORT_MAX, INTERNAL_PORT_MIN, LoadError, LockedPingap,
+    LockedService, ManifestError, ReleaseLock, SCHEMA_VERSION, WorkspaceManifest,
+    validate_topology, validate_workspace,
 };
 
 const RESERVED_RUNTIME_PORTS: [u16; 2] = [5432, 7681];
@@ -117,6 +117,59 @@ fn allocate_ports(projects: &[DiscoveredProject]) -> Result<BTreeMap<String, u16
         result.insert(project.service_id().to_owned(), candidate);
     }
     Ok(result)
+}
+
+/// 仅用于探测 `schema_version` 的最小结构。不带 `deny_unknown_fields`，故可从任意
+/// 版本的 lock 内容里取出版本号，再据此分发到对应版本的反序列化/迁移路径。
+#[derive(serde::Deserialize)]
+struct VersionPeek {
+    schema_version: u32,
+}
+
+/// 版本感知地加载 `release.lock.toml`。
+///
+/// 这是 release lock 的**唯一读取入口**（app-cli 运行时 + app_manager 注入运行时身份都用它）。
+/// 按 `schema_version` 分发：
+/// - 等于 [`SCHEMA_VERSION`]：反序列化成当前 [`ReleaseLock`] 并校验运行时不变量。
+/// - 大于当前：[`LoadError::NewerThanKnown`]（正常被 `minimum_app_cli_version` 门禁提前拦截）。
+/// - 已注册的历史版本：走迁移链上移到当前（Stage 1 落地时在此加分支）。
+/// - 其它：[`LoadError::UnknownVersion`]。
+///
+/// 当前只有 v1。未来引入 v2 时（破坏性变更）：
+/// 1. 把当前 `ReleaseLock` 形状冻结成 `release_lock::legacy::v1::LegacyV1Lock`（各 struct 照贴
+///    `deny_unknown_fields`，保 fail-fast）；
+/// 2. `ReleaseLock` 升为 v2 当前型，`SCHEMA_VERSION = 2`；
+/// 3. 加 `migrate_v1_v2(LegacyV1Lock) -> Result<ReleaseLock, LoadError>`；
+/// 4. 在下方 `match` 加 `1 => { let l1 = LegacyV1Lock::parse(content)?; migrate_v1_v2(l1) }`；
+/// 5. golden 测试加 v1→v2 快照（`tests/fixtures/lock_v1.toml` 永久保留）。
+///
+/// 详见 crate 顶部"配置演进策略"。
+pub fn load_release_lock(content: &str) -> Result<ReleaseLock, LoadError> {
+    let peek: VersionPeek =
+        toml::from_str(content).map_err(|error| LoadError::Parse(error.to_string()))?;
+    match peek.schema_version {
+        v if v == SCHEMA_VERSION => parse_current(content),
+        v if v > SCHEMA_VERSION => Err(LoadError::NewerThanKnown {
+            got: v,
+            known: SCHEMA_VERSION,
+        }),
+        // 历史版本分支在此扩展（Stage 1）：v => parse LegacyV{v} → 迁移链 → 当前型。
+        // C 类"不可推导"的迁移步骤返回 LoadError::RequiresRebuild，由平台侧重锁（Stage 2）。
+        v => Err(LoadError::UnknownVersion(v)),
+    }
+}
+
+/// 反序列化成当前版本 [`ReleaseLock`] 并校验运行时不变量。
+///
+/// 保留 `#[serde(deny_unknown_fields)]` 的 fail-fast：当前版本的 lock 出现未知字段即报错
+/// （v1 当前型一旦见未知字段，必是真正的非法/外来内容）。
+fn parse_current(content: &str) -> Result<ReleaseLock, LoadError> {
+    let lock: ReleaseLock =
+        toml::from_str(content).map_err(|error| LoadError::Parse(error.to_string()))?;
+    if lock.services.is_empty() {
+        return Err(LoadError::Invariant("release lock has no services".into()));
+    }
+    Ok(lock)
 }
 
 #[cfg(test)]

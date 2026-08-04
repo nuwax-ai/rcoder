@@ -32,7 +32,9 @@ pub(crate) async fn inject_release_identity(
                 lock_path.display()
             ))
         })?;
-    let lock: workspace_manifest::ReleaseLock = toml::from_str(&content).map_err(|error| {
+    // 经 workspace_manifest::load_release_lock 读取：版本感知 + 迁移 dispatch（与 app-cli
+    // 同一入口），顺带补上此前 app_manager 裸 toml::from_str 完全不校验 schema_version 的缺口。
+    let lock = workspace_manifest::load_release_lock(&content).map_err(|error| {
         AppOperationError::Validation(format!(
             "invalid active release lock {}: {error}",
             lock_path.display()

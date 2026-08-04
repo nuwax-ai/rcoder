@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use workspace_manifest::{LockedService, ReleaseLock, SCHEMA_VERSION};
+use workspace_manifest::{LockedService, ReleaseLock, load_release_lock};
 
 pub type ServiceSpec = LockedService;
 
@@ -14,19 +14,10 @@ pub fn read_release_lock(workspace: &Path) -> Result<ReleaseLock> {
     let path = workspace.join("release.lock.toml");
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("read release lock {}", path.display()))?;
-    let lock: ReleaseLock = toml::from_str(&content)
-        .with_context(|| format!("parse release lock {}", path.display()))?;
-    if lock.schema_version != SCHEMA_VERSION {
-        anyhow::bail!(
-            "unsupported release lock schema {}; expected {}",
-            lock.schema_version,
-            SCHEMA_VERSION
-        );
-    }
-    if lock.services.is_empty() {
-        anyhow::bail!("release lock has no enabled services");
-    }
-    Ok(lock)
+    // 版本感知加载与迁移 dispatch 收敛到 workspace_manifest::load_release_lock（单一权威）；
+    // app-cli 与 app_manager 两条读路径都经它，LoadError 经 anyhow 上下文化后返回。
+    load_release_lock(&content)
+        .with_context(|| format!("load release lock {}", path.display()))
 }
 
 pub fn build_specs(workspace: &Path) -> Result<Vec<ServiceSpec>> {
