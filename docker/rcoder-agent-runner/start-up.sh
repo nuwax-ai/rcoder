@@ -1512,7 +1512,7 @@ function restart_mcp_proxy() {
         LANG=C.UTF-8 \
         LC_ALL=C.UTF-8 \
         LC_CTYPE=C.UTF-8 \
-        PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
+        PATH="/usr/local/bin:/usr/local/cargo/bin:$PATH" \
         setsid bash -c "
             exec mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file '$MCP_CONFIG_FILE' --log-dir /app/container-logs -v \
             > '$MCP_LOG_DIR/mcp-proxy.log' 2>&1
@@ -1748,7 +1748,7 @@ function start_mcp_proxy_services() {
         LANG=C.UTF-8 \
         LC_ALL=C.UTF-8 \
         LC_CTYPE=C.UTF-8 \
-        PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
+        PATH="/usr/local/bin:/usr/local/cargo/bin:$PATH" \
         setsid bash -c "
             exec mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file '$MCP_CONFIG_FILE' --log-dir /app/container-logs -v \
             > '$MCP_LOG_DIR/mcp-proxy.log' 2>&1
@@ -2294,7 +2294,7 @@ export INPUT_METHOD=fcitx; \
 export LANG=C.UTF-8; \
 export LC_ALL=C.UTF-8; \
 export BROWSER=/usr/bin/chromium-browser-launcher; \
-export PATH=/usr/local/bin:/opt/cargo/bin:\$PATH"
+export PATH=/usr/local/bin:/usr/local/cargo/bin:\$PATH"
 
 # 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）
 # 否则执行默认的 agent_runner

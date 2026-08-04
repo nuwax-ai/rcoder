@@ -11,6 +11,7 @@
 	k8s-run run-in-container \
 	docker-build docker-build-base docker-build-master docker-build-master-base \
 	docker-build-agent-runner docker-build-agent-base docker-build-agent-production docker-push-agent-base \
+	docker-build-app-runtime-base docker-build-app-runtime \
 	docker-pre-download-libreoffice docker-clean-libreoffice-downloads \
 	update-image-tag \
 	test test-unit test-integration test-all test-blocking \
@@ -78,6 +79,8 @@ help:
 	@echo "  make docker-build-agent-base     - 仅构建 rcoder-agent-base 基础镜像"
 	@echo "  make docker-push-agent-base      - 单独推送基础镜像到阿里云（带重试，推送失败可单独重试）"
 	@echo "  make docker-build-agent-production - 构建生产镜像（无 eBPF 工具，镜像更小）"
+	@echo "  make docker-build-app-runtime        - 构建 UserApp 运行时镜像（多语言, dev- 前缀, 本地测试）"
+	@echo "  make docker-build-app-runtime-base    - 仅构建 app-runtime-base 基础镜像（基础设施+Rust app-cli）"
 	@echo "  make docker-pre-download-libreoffice - 预下载 LibreOffice（避免每次构建重新下载）"
 	@echo "  make docker-clean-libreoffice-downloads - 清理已下载的 LibreOffice 文件"
 	@echo "  make dev-build                    - 本地编译 + 构建 Docker 镜像（一键完成）"

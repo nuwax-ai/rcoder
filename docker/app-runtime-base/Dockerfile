@@ -1,20 +1,20 @@
 # 应用运行时基础镜像（app-runtime-base）
-# 基础设施层：Rust 工具链（来自 rust:1.97）+ 排查工具 + ttyd + PostgreSQL + pgweb + supervisor。
-# rust:1.97 基于 Debian bookworm（buildpack-deps），Rust/cargo 白赚，不再单独 rustup 装。
+# 基础设施层：Rust 工具链（来自 rust:trixie）+ 排查工具 + ttyd + PostgreSQL + pgweb + supervisor。
+# rust:trixie 基于 Debian trixie（buildpack-deps），Rust/cargo 白赚，不再单独 rustup 装；Rust 版本随 tag 自动跟进最新 stable。
 # 语言运行时见 Dockerfile.runtime（FROM 本镜像 + Node/Python/Java/Go）。
 
 ARG DOCKER_MIRROR
 
 # === app-cli builder（从 vendored rcoder 源编译 app-cli 编排器；app-cli 独立于 rcoder workspace）===
-FROM ${DOCKER_MIRROR}rust:1.97 AS app-cli-builder
+FROM ${DOCKER_MIRROR}rust:trixie AS app-cli-builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake libclang-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
-COPY code/rcoder/ .
+COPY . .
 RUN cd crates/app-cli && cargo build --release
 
 # === 主 stage（app-runtime-base 基础设施层）===
 ARG DOCKER_MIRROR
-FROM ${DOCKER_MIRROR}rust:1.97
+FROM ${DOCKER_MIRROR}rust:trixie
 
 # 设置环境变量
 ENV DEBIAN_FRONTEND=noninteractive
@@ -25,7 +25,7 @@ ENV TTYD_VERSION=1.7.7
 WORKDIR /app
 
 
-# 使用 LinuxMirrors 一键配置阿里云镜像源（rust:1.97 基于 Debian trixie，已预装 curl）
+# 使用 LinuxMirrors 一键配置阿里云镜像源（rust:trixie 基于 Debian trixie，已预装 curl）
 RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --source mirrors.aliyun.com \
     --protocol https \
@@ -85,10 +85,10 @@ RUN ARCH=$(dpkg --print-architecture) && \
     mkdir -p /usr/local/share/ttyd
 
 # 复制 ttyd 启动脚本
-COPY start-ttyd.sh /usr/local/bin/start-ttyd.sh
+COPY docker/app-runtime-base/start-ttyd.sh /usr/local/bin/start-ttyd.sh
 RUN chmod +x /usr/local/bin/start-ttyd.sh
 
-# 安装 PostgreSQL 16（rust:1.97 基于 Debian trixie，PG apt 仓库用 trixie-pgdg）
+# 安装 PostgreSQL 16（rust:trixie 基于 Debian trixie，PG apt 仓库用 trixie-pgdg）
 RUN install -d /usr/share/postgresql-keyring && \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         | gpg --dearmor -o /usr/share/postgresql-keyring/pgdg.gpg && \
@@ -125,16 +125,16 @@ RUN curl -sSL https://raw.githubusercontent.com/vicanso/pingap/main/install.sh \
 COPY --from=app-cli-builder /build/crates/app-cli/target/release/app-cli /usr/local/bin/app-cli
 
 # 复制 supervisor 配置 + ENTRYPOINT 启动脚本
-COPY app-runtime.supervisor.conf /etc/supervisor/conf.d/app-runtime.conf
-COPY start-app.sh /usr/local/bin/start-app.sh
+COPY docker/app-runtime-base/app-runtime.supervisor.conf /etc/supervisor/conf.d/app-runtime.conf
+COPY docker/app-runtime-base/start-app.sh /usr/local/bin/start-app.sh
 RUN chmod +x /usr/local/bin/start-app.sh
 
 # PG 首次 initdb wrapper(异步, 由 supervisor [program:postgresql] 托管)
-COPY pg-supervisor-entry.sh /usr/local/bin/pg-supervisor-entry.sh
+COPY docker/app-runtime-base/pg-supervisor-entry.sh /usr/local/bin/pg-supervisor-entry.sh
 RUN chmod +x /usr/local/bin/pg-supervisor-entry.sh
 
 # npm 默认国内镜像源（加速：① Dockerfile.runtime 的 npm install -g；② UserApp 运行时 npm install）
-COPY .npmrc /root/.npmrc
+COPY docker/app-runtime-base/.npmrc /root/.npmrc
 
 # 创建应用目录结构
 RUN mkdir -p /app/{code,data,config,logs}

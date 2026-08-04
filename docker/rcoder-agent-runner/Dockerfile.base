@@ -9,12 +9,12 @@
 ARG DOCKER_MIRROR
 # GitHub 镜像加速配置（默认启用）
 ARG USE_GITHUB_MIRROR=true
-# 基础镜像: buildpack-deps:bookworm-curl
-# - 基于 debian:12 (bookworm), 与 debian:12 100% 兼容
-# - 预装 curl + wget + ca-certificates + gnupg, 无需先 apt 安装
-# - Docker 官方维护, 与 debian:12 共享底层 layer, 拉取几乎零增量
-# - 避免"先用海外 apt 源装 curl 再配置镜像"的鸡生蛋死循环
-FROM ${DOCKER_MIRROR}buildpack-deps:bookworm-curl
+# 基础镜像: rust:bookworm (= buildpack-deps:bookworm 完整版 + Rust 工具链)
+# - 基于 debian:12 (bookworm), GLIBC 2.36, 与 debian:12 100% 兼容
+# - 预装 Rust 工具链 (cargo/rustc, 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo), 免 rustup 安装
+# - 预装 build-essential 构成 + libssl-dev/pkg-config + curl/wget/git 等 (buildpack-deps 完整版)
+# - 镜像内可直接编译 Rust 项目 (UserApp runtime build 需要 cargo)
+FROM ${DOCKER_MIRROR}rust:bookworm
 
 # GitHub 镜像加速环境变量（必须在 FROM 之后设置）
 ENV GITHUB_MIRROR_URL=https://gh-proxy.org/https://github.com/
@@ -35,7 +35,7 @@ ENV \
 
 # 使用 LinuxMirrors 一键配置阿里云镜像源
 # 参考: https://github.com/SuperManito/LinuxMirrors
-# buildpack-deps:bookworm-curl 已预装 curl，可直接执行脚本配置镜像源
+# rust:bookworm (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
 RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --source mirrors.aliyun.com \
     --protocol https \
@@ -762,32 +762,11 @@ RUN npm install -g @zed-industries/claude-code-acp@latest && \
 #     echo "✅ Playwright Chromium installed"
 
 # 安装 OpenSSL 开发包和构建依赖（mcp-stdio-proxy 需要）
-RUN apt-get update && apt-get install -y \
-    libssl-dev \
-    pkg-config \
-    build-essential && \
-    rm -rf /var/lib/apt/lists/*
-
-# 安装 Rust toolchain（需要 root）
-# 注意：mcp-stdio-proxy 的安装已移至 Dockerfile，以便频繁更新时无需重建基础镜像
-ENV RUSTUP_HOME=/opt/rustup \
-    CARGO_HOME=/opt/cargo \
-    PATH="/opt/cargo/bin:$PATH"
-
-# 使用国内镜像源加速下载
-#ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static/
-#ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup/
-# 安装 Rust 并验证
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-    echo 'export PATH="/root/.cargo/bin:$PATH"' >> /root/.bashrc && \
-    export PATH="/root/.cargo/bin:$PATH" && \
-    which cargo && cargo --version
-
-# 设置 PATH 环境变量（确保后续命令能找到 cargo）
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# 复制 cargo 镜像配置文件（使用国内镜像加速）
-COPY .cargo/config.toml /root/.cargo/config.toml
+# Rust 工具链已由 rust:bookworm 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
+# libssl-dev / pkg-config / build-essential 构成 已由 rust:bookworm (buildpack-deps) 预装, 不再单独 apt 装
+# (原此处 apt 装 libssl-dev/pkg-config/build-essential + rustup 安装, 均已冗余, 删除)。
+# cargo 镜像配置 (rsproxy-sparse) COPY 到 /usr/local/cargo/config.toml; runtime UserApp build 走加速源。
+COPY .cargo/config.toml /usr/local/cargo/config.toml
 
 # 安装 uv 到全局路径（需要 root）
 # 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
@@ -804,14 +783,13 @@ RUN pip3 install --break-system-packages --no-cache-dir -i https://mirrors.aliyu
     echo 'export UV_CACHE_DIR=/home/user/.cache/uv' >> /etc/profile.d/uv-env.sh && \
     chmod +x /etc/profile.d/uv-env.sh
 
-# 添加 cargo bin 和 uv 到 PATH
 # 添加所有工具安装路径到 PATH:
 # - /root/.local/bin: root 用户使用 uv tool install 时的可执行文件位置
 # - /home/user/.local/bin: user 用户使用 uv tool install 时的可执行文件位置
-# - /opt/cargo/bin: Rust cargo 安装的工具
 # - /usr/local/bin: 系统级工具（bun, uv, pnpm 等）
+# 注: Rust cargo 在 /usr/local/cargo/bin, 由 rust:bookworm 的 ${PATH} 继承, 不在此显式列出
 ENV PNPM_HOME="/home/user/.local/share/pnpm" \
-    PATH="/root/.local/bin:/home/user/.local/bin:/opt/cargo/bin:/usr/local/bin:${PATH}"
+    PATH="/root/.local/bin:/home/user/.local/bin:/usr/local/bin:${PATH}"
 
 # ============================================================================
 # 🔊 pcmflux 音频流服务安装

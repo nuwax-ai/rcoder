@@ -6,14 +6,14 @@
 # 平时不需要重新构建，只有在修改系统依赖时才需要重新构建
 # ============================================================================
 
-FROM node:22
+FROM rust:bookworm
 
 # 设置环境变量
 ENV TZ=Asia/Shanghai
 
 # 使用 LinuxMirrors 一键配置阿里云镜像源
 # 参考: https://github.com/SuperManito/LinuxMirrors
-# node:22 基础镜像已预装 curl，可直接执行脚本配置镜像源
+# rust:bookworm (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
 RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --source mirrors.aliyun.com \
     --protocol https \
@@ -25,12 +25,8 @@ RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --ignore-backup-tips
 
 # 安装必要的运行时依赖（apt 包管理器）
+# ca-certificates / curl / wget / gnupg / unzip 已由 rust:bookworm (buildpack-deps) 预装, 不重装
 RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    curl \
-    wget \
-    gnupg \
-    unzip \
     zip \
     tzdata \
     lsof \
@@ -46,6 +42,22 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone
+
+# ============================================================================
+# 安装 Node.js 22.x + npm (rust:bookworm 不带 Node, 手动装; NodeSource 套路, 与 agent-runner 统一)
+# npm install -g yarn: node:22 原捆绑 yarn, NodeSource 的 Node 不带, 单独装回 (yarn config 需要)
+# ============================================================================
+RUN apt-get update && \
+    apt-get install -y gnupg ca-certificates && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && \
+    npm --version && \
+    npm install -g yarn --registry=https://registry.npmmirror.com && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Rust cargo 国内镜像配置 (rsproxy-sparse); rust:bookworm CARGO_HOME=/usr/local/cargo, dev 容器 cargo run/build 走加速源
+COPY .cargo/config.toml /usr/local/cargo/config.toml
 
 # 复制 npmrc 配置镜像（使用国内镜像加速）
 COPY .npmrc /root/.npmrc
@@ -100,7 +112,7 @@ RUN echo '[install]' > /root/.bunfig.toml && \
     # 运行时 bunx @upstash/context7-mcp 会命中 ~/.bun/install/global 全局缓存，无需再下载
     echo '"@upstash" = "https://registry.npmmirror.com"' >> /root/.bunfig.toml
 
-# 安装 python3-pip（node:22 基础镜像默认不带 Python，用 pip 装 uv 需要先安装）
+# 安装 python3-pip（rust:bookworm 基础镜像默认不带 Python，用 pip 装 uv 需要先安装）
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
@@ -131,7 +143,7 @@ RUN mkdir -p /root/.claude && \
 
 # 添加所有工具安装路径到 PATH
 ENV PNPM_HOME="/home/user/.local/share/pnpm" \
-    PATH="/app/bin:/root/.local/bin:/home/user/.local/bin:/home/user/.local/share/pnpm:/opt/cargo/bin:/usr/local/bin:${PATH}"
+    PATH="/app/bin:/root/.local/bin:/home/user/.local/bin:/home/user/.local/share/pnpm:/usr/local/bin:${PATH}"
 
 
 # 清理默认nginx配置以避免冲突

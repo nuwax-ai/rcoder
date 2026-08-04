@@ -11,6 +11,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REGISTRY="${DOCKER_REGISTRY:-}"
 TAG="${DOCKER_TAG:-latest}"
 
@@ -37,14 +38,14 @@ push_if_registry() {
 # 构建基础设施层镜像
 build_base() {
     log_info "Building base image: app-runtime-base:${TAG}"
-    docker build -t "app-runtime-base:${TAG}" -f Dockerfile .
+    docker build -t "app-runtime-base:${TAG}" -f "${SCRIPT_DIR}/Dockerfile" "${REPO_ROOT}"
     push_if_registry "app-runtime-base:${TAG}"
 }
 
 # 构建统一多语言运行时镜像
 build_runtime() {
     log_info "Building unified runtime: app-runtime:${TAG}"
-    docker build -t "app-runtime:${TAG}" -f Dockerfile.runtime .
+    docker build -t "app-runtime:${TAG}" -f "${SCRIPT_DIR}/Dockerfile.runtime" "${REPO_ROOT}"
     push_if_registry "app-runtime:${TAG}"
 }
 

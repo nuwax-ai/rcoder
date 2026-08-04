@@ -2,7 +2,7 @@
 # 最终镜像 Dockerfile - master-rcoder
 # ============================================================================
 # 此 Dockerfile 使用多阶段构建：
-# 1. 第一阶段：在 node:22 中构建 Rust 项目
+# 1. 第一阶段：在 rust:bookworm 中构建 Rust 项目
 # 2. 第二阶段：基于 master-rcoder-base 基础镜像运行
 # ============================================================================
 
@@ -12,7 +12,7 @@ ARG BASE_IMAGE=dev-master-rcoder-base:latest
 # ============================================================================
 # 第一阶段：构建 Rust 项目
 # ============================================================================
-FROM node:22 AS rust-builder
+FROM rust:bookworm AS rust-builder
 
 # 设置环境变量避免交互式提示
 ENV DEBIAN_FRONTEND=noninteractive
@@ -36,30 +36,22 @@ RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --clean-cache true \
     --ignore-backup-tips
 
-# 安装构建依赖（包括cmake和protoc）
+# 安装 Rust 构建所需的额外系统依赖
+# rust:bookworm (= buildpack-deps:bookworm 完整版) 已预装 build-essential / libssl-dev / git / curl 等,
+# 这里补镜像里没有的: cmake + protobuf (rcoder/agent_runner/file-server gRPC 依赖); pkg-config 保留兜底
 RUN apt-get update && apt-get install -y \
-    build-essential \
     cmake \
     pkg-config \
     protobuf-compiler \
     libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 使用国内镜像加速 rustup。实测 rsproxy.cn（字节跳动）≈26 MB/s，远快于 USTC 此刻 ≈0.1 MB/s。
-# rsproxy 同时提供 rustup dist 与 cargo registry。
-ENV RUSTUP_DIST_SERVER=https://rsproxy.cn
-ENV RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
-
-# 安装 Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-    . /root/.cargo/env && cargo --version
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# builder 阶段 cargo 镜像（仅作用于 builder，不污染宿主 .cargo/config.toml）
-# 加速依赖下载；仓库根 .cargo/config.toml 当前为空（直连 crates.io 很慢）
-RUN mkdir -p /root/.cargo && \
+# Rust 工具链已由 rust:bookworm 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
+# builder 阶段 cargo 镜像 (rsproxy-sparse) 写到 /usr/local/cargo/config.toml 生效
+# (仓库根 .cargo/config.toml 为空, 故用 printf 内联生成, 不污染宿主)
+RUN mkdir -p /usr/local/cargo && \
     printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' \
-    > /root/.cargo/config.toml
+    > /usr/local/cargo/config.toml
 
 # 复制整个项目源代码（通过 .dockerignore 排除不需要的文件）
 COPY . .
@@ -97,18 +89,9 @@ RUN apt-get update && apt-get install -y \
 # 复制 .npmrc 文件
 COPY docker/rcoder-master/.npmrc /root/.npmrc
 
-# 安装 Rust（运行阶段也需 cargo：dev 容器内 cargo run/build）
-# 用 rsproxy.cn（实测 ≈26 MB/s，远快于 USTC ≈0.1 MB/s）
-ENV RUSTUP_DIST_SERVER=https://rsproxy.cn
-ENV RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-    echo 'export PATH="/root/.cargo/bin:$PATH"' >> /root/.bashrc && \
-    export PATH="/root/.cargo/bin:$PATH" && \
-    which cargo && cargo --version
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# 复制 cargo 镜像配置文件（使用国内镜像加速）
-COPY .cargo/config.toml /root/.cargo/config.toml
+# Rust 工具链 + cargo rsproxy 配置 已由 base (rust:bookworm) 提供:
+# cargo 在 /usr/local/cargo/bin, config 在 /usr/local/cargo/config.toml (base COPY)。
+# dev 容器 cargo run/build 直接可用, 不再单独 rustup 安装。
 
 # npm 工具安装（CACHEBUST 刻意 bust 拿最新版；CACHEBUST 不变则缓存）
 ARG CACHEBUST=1
