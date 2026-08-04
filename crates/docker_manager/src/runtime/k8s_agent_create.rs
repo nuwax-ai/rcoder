@@ -435,7 +435,7 @@ impl KubernetesRuntime {
                         },
                         // file-server port (embedded, UserApp workspace build / package download)
                         ContainerPort {
-                            container_port: 60_000,
+                            container_port: shared_types::AGENT_FILE_SERVER_PORT as i32,
                             name: Some("file-server".to_string()),
                             ..Default::default()
                         },

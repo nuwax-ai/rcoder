@@ -14,7 +14,8 @@ use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
 use shared_types::{
-    GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT, ServiceType, WS_TERMINAL_PORT,
+    AGENT_FILE_SERVER_PORT, GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT, ServiceType,
+    WS_TERMINAL_PORT,
 };
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
@@ -37,9 +38,6 @@ const AGENT_NOVNC_PORT: u32 = NOVNC_PORT as u32;
 
 /// Agent Runner WS 终端中间层端口（agent_runner tokio-tungstenite 监听；Pingora TtydProxy 路由到此）
 const AGENT_WS_TERMINAL_PORT: u32 = WS_TERMINAL_PORT as u32;
-
-/// Agent Runner 内嵌 file-server 端口（UserApp workspace build / package 下载，prepare 走它）
-const AGENT_FILE_SERVER_PORT: u32 = 60_000;
 
 /// K8s 标准标签前缀
 const LABEL_PREFIX: &str = "app.kubernetes.io";

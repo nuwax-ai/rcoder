@@ -102,6 +102,16 @@ pub const TTYD_PORT: u16 = 7681;
 /// 仅 agent_runner 内部连接，不对外暴露（K8s Service 暴露此 17681 而非 ttyd 7681）。
 pub const WS_TERMINAL_PORT: u16 = 17681;
 
+/// agent-runner 内嵌 file-server 端口
+///
+/// agent-runner 内嵌的 file-server 监听端口（UserApp workspace build / package 下载；
+/// rcoder 的 prepare 与 agent-runner build 都走它）。四方共用此单一来源,避免各处硬编码
+/// `60_000` 漂移:
+/// - file-server 自身默认监听端口（可被 `FILE_SERVER_PORT`/`PORT` env 覆盖）
+/// - docker_manager 在 K8s Service/containerPort 上暴露该端口
+/// - rcoder `userapp_publish` 连接该端口
+pub const AGENT_FILE_SERVER_PORT: u16 = 60_000;
+
 // === K8s 配置 ===
 
 /// K8s 集群域名环境变量名

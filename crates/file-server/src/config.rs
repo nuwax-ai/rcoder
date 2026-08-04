@@ -8,6 +8,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
+use shared_types::AGENT_FILE_SERVER_PORT;
 
 /// 所有客户端上传文件共享的硬上限：1 GiB。
 pub const MAX_UPLOAD_FILE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -224,7 +225,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_host: "0.0.0.0".to_string(),
-            port: 60_000,
+            port: AGENT_FILE_SERVER_PORT,
             project_source_dir: PathBuf::from(WORKSPACE_ROOT),
             computer_workspace_dir: PathBuf::from(COMPUTER_WORKSPACE_ROOT),
             service_log_dir: PathBuf::from("/app/logs/file-server"),
@@ -455,7 +456,7 @@ impl Config {
                 Ok(value) => value
                     .parse()
                     .map_err(|error| anyhow!("invalid FILE_SERVER_PORT/PORT: {error}"))?,
-                Err(std::env::VarError::NotPresent) => 60_000,
+                Err(std::env::VarError::NotPresent) => AGENT_FILE_SERVER_PORT,
                 Err(error) => return Err(anyhow!(error)).context("read FILE_SERVER_PORT/PORT"),
             },
             project_source_dir: PathBuf::from(env_str("PROJECT_SOURCE_DIR", WORKSPACE_ROOT)?),
