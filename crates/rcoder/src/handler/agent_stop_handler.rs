@@ -71,6 +71,8 @@ async fn destroy_container_for_project(
 
         // 从存储中移除项目（如果 project_id 不是 "unknown"）
         if container_info.project_id != "unknown" {
+            // 先关闭该 project 的 SSE 共享流（remove_project 会清空 sessions 集合，之后无法枚举）
+            state.shutdown_sse_streams_for_project(&container_info.project_id);
             state.remove_project(&container_info.project_id);
         }
 

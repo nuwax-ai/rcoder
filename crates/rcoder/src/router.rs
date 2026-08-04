@@ -212,6 +212,26 @@ impl AppState {
         self.projects.remove(project_id)
     }
 
+    /// 关闭某 project 关联的所有 SSE 共享流（容器销毁/项目删除前调用）。
+    ///
+    /// 必须在 [`remove_project`] 之前调用——remove_project 会清空 project 的 sessions 集合，
+    /// 之后无法再据此枚举。销毁语义：让后台 gRPC task 尽快退出，避免对已失效地址重试。
+    pub fn shutdown_sse_streams_for_project(&self, project_id: &str) {
+        let sids: Vec<String> = self
+            .get_project(project_id)
+            .map(|info| info.sessions().into_iter().collect())
+            .unwrap_or_default();
+        for sid in sids {
+            if self.session_stream_registry.shutdown_session(&sid) {
+                tracing::info!(
+                    "[STATE] shutdown SSE stream on project removal: project_id={}, session_id={}",
+                    project_id,
+                    sid
+                );
+            }
+        }
+    }
+
     /// 检查项目是否存在（替代 project_and_agent_map.contains_key）
     #[inline]
     pub fn contains_project(&self, project_id: &str) -> bool {

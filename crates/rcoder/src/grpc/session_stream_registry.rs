@@ -70,6 +70,19 @@ impl SessionStreamRegistry {
         true
     }
 
+    /// 强制关闭某 session 的共享流（容器销毁/项目删除时调用）。
+    /// 与 [`remove_and_shutdown`] 的 ptr_eq 精确清理不同，这是销毁语义：无条件移除该 session 的流，
+    /// 让后台 gRPC task 尽快退出，避免对已失效地址重试到 MAX_RETRIES。
+    pub fn shutdown_session(&self, session_id: &str) -> bool {
+        if let Some((_, removed)) = self.streams.remove(session_id) {
+            removed.shutdown();
+            self.remove_unused_create_lock(session_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// 获取或创建 session 的共享流。
     ///
     /// 并发安全：参照 `session_cache::push_session_update` 的快速路径(`view`) + 慢速路径(`entry` 外 await)，
@@ -249,7 +262,9 @@ impl SharedStream {
     pub fn replay_since(&self, from_seq: u64) -> Vec<SharedEvent> {
         let ring = self.ring.lock();
         ring.iter()
-            .filter(|(s, _)| *s > from_seq)
+            // seq=0 是 cursor-reset 哨兵：无条件返回，让断线重连客户端也能收到它并由
+            // forward_to_client 重置去重游标（修复 epoch 变更后重连丢事件）。
+            .filter(|(s, _)| *s == 0 || *s > from_seq)
             .map(|(_, ev)| Arc::clone(ev))
             .collect()
     }
@@ -286,6 +301,17 @@ impl SharedStream {
     fn clear_ring(&self) {
         let mut ring = self.ring.lock();
         *ring = HeapRb::<(u64, SharedEvent)>::new(RING_CAPACITY);
+    }
+
+    /// 把 cursor-reset 哨兵(seq=0)写入 ring。
+    /// dispatch_event 跳过 seq=0 故单独推送；目的是让断线重连客户端经 replay_since 取到哨兵，
+    /// 进而由 forward_to_client 重置去重游标（broadcast 只投递订阅后的消息，重连客户端收不到）。
+    fn push_reset_to_ring(&self, ev: SharedEvent) {
+        let mut ring = self.ring.lock();
+        if ring.is_full() {
+            ring.try_pop();
+        }
+        let _ = ring.try_push((0, ev));
     }
 
     fn shutdown(&self) {
@@ -444,9 +470,11 @@ fn spawn_backend_task(
                             );
                             shared.last_seq.store(0, Ordering::Release);
                             shared.clear_ring();
-                            let _ = shared
-                                .broadcast_tx
-                                .send(Arc::new(make_cursor_reset_event()));
+                            // cursor-reset 哨兵同时进 ring + broadcast：ring 让断线重连客户端
+                            // 经 replay_since 收到它（broadcast 只投递订阅后的消息，重连客户端收不到）。
+                            let reset_ev = Arc::new(make_cursor_reset_event());
+                            shared.push_reset_to_ring(Arc::clone(&reset_ev));
+                            let _ = shared.broadcast_tx.send(reset_ev);
                         }
                     }
                 }

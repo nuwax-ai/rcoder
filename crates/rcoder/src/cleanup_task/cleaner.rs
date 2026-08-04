@@ -256,6 +256,14 @@ impl AgentCleaner {
                 .container_info()
                 .map(|c| c.container_id.clone())
                 .unwrap_or_default();
+            // 先关闭该容器所有 project 的 SSE 共享流（delete_container_with_projects 会移除 project 记录）
+            for p in self
+                .state
+                .projects
+                .get_projects_by_container_id(&container_id)
+            {
+                self.state.shutdown_sse_streams_for_project(p.project_id());
+            }
             let (deleted, project_count) = self
                 .state
                 .projects
@@ -266,6 +274,8 @@ impl AgentCleaner {
             );
         } else {
             // 容器未销毁（仅超时等原因）：只删除当前项目记录
+            // 先关闭该 project 的 SSE 共享流（remove_project 会清空 sessions 集合）
+            self.state.shutdown_sse_streams_for_project(project_id);
             self.state.remove_project(project_id);
             info!(
                 "[cleaner] Removed project record only (container not destroyed): project_id={}",
