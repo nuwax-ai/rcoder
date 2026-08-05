@@ -274,6 +274,13 @@ impl WorkspaceRuntime for DockerRuntime {
         // 校验（DNS-1123，无 .. / 路径穿越），join 安全。
         let ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
             .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
+        // 防御：service 层 validate_app_id 已保证 DNS-1123，但 runtime 层独立校验，
+        // 拒绝路径分隔符，防止新增未校验调用路径导致任意目录删除。
+        if app_id.is_empty() || app_id.contains('/') || app_id.contains('\\') {
+            return Err(ContainerRuntimeError::DockerError(format!(
+                "destroy_app_pvc: invalid app_id {app_id:?}"
+            )));
+        }
         let app_dir = std::path::Path::new(&ws_root).join(app_id);
         if app_dir.exists() {
             tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {

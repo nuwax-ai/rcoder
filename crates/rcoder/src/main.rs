@@ -174,9 +174,12 @@ async fn main() -> anyhow::Result<()> {
         .await?,
     );
 
-    let _bg_handles =
-        background_tasks::start_all_background_tasks(&bootstrap_result.config, state.clone())
-            .await?;
+    let _bg_handles = background_tasks::start_all_background_tasks(
+        &bootstrap_result.config,
+        state.clone(),
+        shutdown_tx.clone(),
+    )
+    .await?;
 
     let runtime_for_shutdown = state.runtime().clone();
     let app = router::create_router(state, Some(bootstrap_result.telemetry));

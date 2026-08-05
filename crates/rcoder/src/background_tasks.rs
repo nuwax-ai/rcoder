@@ -25,6 +25,7 @@ pub struct BackgroundTaskHandles {
 pub async fn start_all_background_tasks(
     config: &AppConfig,
     state: Arc<AppState>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> anyhow::Result<BackgroundTaskHandles> {
     let cleanup_config = cleanup_task::CleanupConfig {
         idle_timeout: Duration::from_secs(config.cleanup_config.idle_timeout_seconds),
@@ -52,7 +53,14 @@ pub async fn start_all_background_tasks(
     let cleanup_handle = if config.cleanup_config.enabled {
         let cleanup_config_clone = cleanup_config.clone();
         let state_for_cleanup = state.clone();
-        Some(cleanup_task::start_cleanup_task(cleanup_config_clone, state_for_cleanup).await?)
+        Some(
+            cleanup_task::start_cleanup_task(
+                cleanup_config_clone,
+                state_for_cleanup,
+                shutdown_tx.clone(),
+            )
+            .await?,
+        )
     } else {
         info!("Container cleanup task already started (cleanup_config.enabled=false)");
         None
@@ -66,7 +74,7 @@ pub async fn start_all_background_tasks(
         health_reset_interval: Duration::from_secs(30 * 60),
     };
     let status_checker_handle =
-        start_container_status_checker(status_checker_config, state.clone());
+        start_container_status_checker(status_checker_config, state.clone(), shutdown_tx.clone());
     info!("Container status checker already started (interval: 30s, will skip Docker on failure)");
 
     let container_sync_config = ContainerSyncConfig {
@@ -76,6 +84,7 @@ pub async fn start_all_background_tasks(
         container_sync_config,
         state.grpc_pool.clone(),
         state.runtime().clone(),
+        shutdown_tx.clone(),
     );
     info!("Container status sync already started (interval: 60s, detect container)");
 
@@ -93,7 +102,14 @@ pub async fn start_all_background_tasks(
             config.userapp_recycle.scan_interval_seconds,
             config.userapp_recycle.protection_seconds,
         );
-        Some(userapp_recycle::start_userapp_recycle_task(recycle_cfg, state.clone()).await?)
+        Some(
+            userapp_recycle::start_userapp_recycle_task(
+                recycle_cfg,
+                state.clone(),
+                shutdown_tx.clone(),
+            )
+            .await?,
+        )
     } else {
         info!("[USERAPP_RECYCLE] disabled (userapp_recycle.enabled=false)");
         None

@@ -286,8 +286,8 @@ impl AgentCleaner {
         Ok(container_destroyed)
     }
 
-    /// 运行清理任务（定时）
-    pub async fn run(&mut self) {
+    /// 运行清理任务（定时）。收到 shutdown 信号后优雅退出。
+    pub async fn run(&mut self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
         info!("[cleaner] cleanup task already started");
 
         let mut interval = interval(self.config.cleanup_interval);
@@ -295,22 +295,28 @@ impl AgentCleaner {
         const MEMORY_LOG_INTERVAL: u32 = 12; // 每 12 次清理（大约 1 小时）输出一次内存日志
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    match self.cleanup_once().await {
+                        Ok(_) => debug!("[cleaner] Cleanup completed"),
+                        Err(e) => warn!("[cleaner] Cleanup failed: {}", e),
+                    }
 
-            match self.cleanup_once().await {
-                Ok(_) => debug!("[cleaner] Cleanup completed"),
-                Err(e) => warn!("[cleaner] Cleanup failed: {}", e),
-            }
-
-            // 定期输出存储统计信息
-            memory_log_counter += 1;
-            if memory_log_counter >= MEMORY_LOG_INTERVAL {
-                memory_log_counter = 0;
-                let stats = self.state.projects.get_stats();
-                debug!(
-                    "[cleaner] Storage Stats: projects={}, containers={}, sessions={}",
-                    stats.total_projects, stats.total_containers, stats.active_sessions
-                );
+                    // 定期输出存储统计信息
+                    memory_log_counter += 1;
+                    if memory_log_counter >= MEMORY_LOG_INTERVAL {
+                        memory_log_counter = 0;
+                        let stats = self.state.projects.get_stats();
+                        debug!(
+                            "[cleaner] Storage Stats: projects={}, containers={}, sessions={}",
+                            stats.total_projects, stats.total_containers, stats.active_sessions
+                        );
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("[cleaner] shutdown");
+                    break;
+                }
             }
         }
     }

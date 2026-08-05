@@ -42,46 +42,54 @@ pub fn start_container_sync_task(
     config: ContainerSyncConfig,
     grpc_pool: Arc<GrpcChannelPool>,
     runtime: Arc<dyn ContainerRuntime>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     info!(
         "🔄 [CONTAINER_SYNC] Starting container state sync task: interval={}s",
         config.sync_interval.as_secs()
     );
 
+    let mut shutdown_rx = shutdown_tx.subscribe();
     tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(config.sync_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            interval.tick().await;
-
-            // 同步缓存状态 - 清理失效的容器记录
-            debug!("[CONTAINER_SYNC] Syncing container states...");
-            match runtime.sync_states().await {
-                Ok((checked, removed)) => {
-                    if !removed.is_empty() {
-                        info!(
-                            "[CONTAINER_SYNC] Sync completed: checked={}, removed_stale={}",
-                            checked,
-                            removed.len()
-                        );
-
-                        // 清理关联资源
-                        for container in removed {
-                            // 清理 gRPC 连接池
-                            if !container.container_ip.is_empty() {
-                                let grpc_addr = format!(
-                                    "{}:{}",
-                                    container.container_ip,
-                                    shared_types::GRPC_DEFAULT_PORT
+            tokio::select! {
+                _ = interval.tick() => {
+                    // 同步缓存状态 - 清理失效的容器记录
+                    debug!("[CONTAINER_SYNC] Syncing container states...");
+                    match runtime.sync_states().await {
+                        Ok((checked, removed)) => {
+                            if !removed.is_empty() {
+                                info!(
+                                    "[CONTAINER_SYNC] Sync completed: checked={}, removed_stale={}",
+                                    checked,
+                                    removed.len()
                                 );
-                                grpc_pool.remove(&grpc_addr).await;
+
+                                // 清理关联资源
+                                for container in removed {
+                                    // 清理 gRPC 连接池
+                                    if !container.container_ip.is_empty() {
+                                        let grpc_addr = format!(
+                                            "{}:{}",
+                                            container.container_ip,
+                                            shared_types::GRPC_DEFAULT_PORT
+                                        );
+                                        grpc_pool.remove(&grpc_addr).await;
+                                    }
+                                }
                             }
+                        }
+                        Err(e) => {
+                            warn!("[CONTAINER_SYNC] sync failed: {}", e);
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("[CONTAINER_SYNC] sync failed: {}", e);
+                _ = shutdown_rx.recv() => {
+                    info!("[CONTAINER_SYNC] shutdown");
+                    break;
                 }
             }
         }

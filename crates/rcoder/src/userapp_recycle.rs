@@ -37,7 +37,7 @@ impl UserAppRecycleScanner {
         Self { config, state }
     }
 
-    pub async fn run(self) {
+    pub async fn run(self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
         info!(
             "[USERAPP_RECYCLE] scanner started (interval={:?}, idle_timeout={:?}, protection={:?})",
             self.config.scan_interval, self.config.idle_timeout, self.config.protection
@@ -45,10 +45,17 @@ impl UserAppRecycleScanner {
         let mut interval = tokio::time::interval(self.config.scan_interval);
         interval.tick().await; // 消耗首次立即 tick(给启动 grace;Running app 已被 rebuild_stopped_apps 种 last_accessed=now)
         loop {
-            interval.tick().await;
-            match self.do_scan().await {
-                Ok(n) => debug!("[USERAPP_RECYCLE] scan done: {} recycled this tick", n),
-                Err(e) => warn!("[USERAPP_RECYCLE] scan failed: {}", e),
+            tokio::select! {
+                _ = interval.tick() => {
+                    match self.do_scan().await {
+                        Ok(n) => debug!("[USERAPP_RECYCLE] scan done: {} recycled this tick", n),
+                        Err(e) => warn!("[USERAPP_RECYCLE] scan failed: {}", e),
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("[USERAPP_RECYCLE] shutdown");
+                    break;
+                }
             }
         }
     }
@@ -201,9 +208,11 @@ fn decide_recycle(input: &RecycleEvalInput, cfg: &UserAppRecycleRuntimeConfig) -
 pub(crate) async fn start_userapp_recycle_task(
     config: UserAppRecycleRuntimeConfig,
     state: Arc<AppState>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let scanner = UserAppRecycleScanner::new(config, state);
-    Ok(tokio::task::spawn(scanner.run()))
+    let shutdown_rx = shutdown_tx.subscribe();
+    Ok(tokio::task::spawn(scanner.run(shutdown_rx)))
 }
 
 #[cfg(test)]

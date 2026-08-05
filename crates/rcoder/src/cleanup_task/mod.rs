@@ -28,6 +28,7 @@ pub use config::CleanupStats;
 pub async fn start_cleanup_task(
     config: CleanupConfig,
     state: Arc<crate::router::AppState>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let docker_manager = match docker_manager::global::get_global_docker_manager().await {
         Ok(dm) => Some(dm),
@@ -95,7 +96,8 @@ pub async fn start_cleanup_task(
     // Docker / K8s 都从这里复用同一套清理逻辑。
     let mut cleaner = AgentCleaner::new(config, state, pingora_service);
 
+    let shutdown_rx = shutdown_tx.subscribe();
     Ok(tokio::task::spawn(async move {
-        cleaner.run().await;
+        cleaner.run(shutdown_rx).await;
     }))
 }

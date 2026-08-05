@@ -559,6 +559,7 @@ impl ContainerStatusChecker {
 pub fn start_container_status_checker(
     config: ContainerStatusCheckerConfig,
     state: Arc<AppState>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     info!(
         " [STATUS_CHECKER] Starting container status checker: interval={}s, failure_threshold={}, skip_duration={}s",
@@ -569,6 +570,7 @@ pub fn start_container_status_checker(
 
     let checker = Arc::new(ContainerStatusChecker::new(config.clone(), state));
 
+    let mut shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
         let mut interval = time::interval(config.check_interval);
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -577,18 +579,24 @@ pub fn start_container_status_checker(
         let cleanup_interval = 10; // 每 10 次检查清理一次健康状态
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    // 执行容器状态检查
+                    if let Err(e) = checker.check_all_containers().await {
+                        warn!(" [STATUS_CHECKER] Container status check failed: {}", e);
+                    }
 
-            // 执行容器状态检查
-            if let Err(e) = checker.check_all_containers().await {
-                warn!(" [STATUS_CHECKER] Container status check failed: {}", e);
-            }
-
-            // 定期清理过期的健康状态
-            cleanup_counter += 1;
-            if cleanup_counter >= cleanup_interval {
-                checker.cleanup_stale_health_states();
-                cleanup_counter = 0;
+                    // 定期清理过期的健康状态
+                    cleanup_counter += 1;
+                    if cleanup_counter >= cleanup_interval {
+                        checker.cleanup_stale_health_states();
+                        cleanup_counter = 0;
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!(" [STATUS_CHECKER] shutdown");
+                    break;
+                }
             }
         }
     })
