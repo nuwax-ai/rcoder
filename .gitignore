@@ -36,3 +36,4 @@ docker/app-workspace/*
 target.garbage/
 .workbuddy/
 crates/*/target/
+.qoder/
