@@ -57,6 +57,7 @@ pub async fn install_from_npm(
     let output = tokio::time::timeout(
         Duration::from_secs(NPM_INSTALL_TIMEOUT_SECS),
         Command::new("npm")
+            .kill_on_drop(true)
             .arg("install")
             .arg("-g")
             .arg(package)
@@ -83,15 +84,19 @@ pub async fn install_from_npm(
         )));
     }
 
-    // 2. 解析全局 node_modules 路径（加超时，避免 npm 卡住永久占用安装锁）
+    // 2. 解析全局 node_modules 路径（加超时 + kill_on_drop，避免 npm 卡住时子进程变孤儿占安装锁）
     let npm_root_output = tokio::time::timeout(
         Duration::from_secs(NPM_ROOT_TIMEOUT_SECS),
-        Command::new("npm").arg("root").arg("-g").output(),
+        Command::new("npm")
+            .kill_on_drop(true)
+            .arg("root")
+            .arg("-g")
+            .output(),
     )
     .await
     .map_err(|_| {
-        AgentMgmtError::InstallFailed(format!(
-            "npm root -g timed out after {NPM_ROOT_TIMEOUT_SECS}s"
+        AgentMgmtError::CommandTimeout(format!(
+            "npm root -g (timed out after {NPM_ROOT_TIMEOUT_SECS}s)"
         ))
     })?
     .map_err(AgentMgmtError::Io)?;
