@@ -17,7 +17,9 @@ use tracing::warn;
 
 use super::k8s_pod::K8sPodOps;
 use super::k8s_service::K8sServiceOps;
-use super::kubernetes_runtime::{KubernetesRuntime, RUNTIME_MANAGED_LABEL};
+use super::kubernetes_runtime::{
+    CachedPod, KubernetesRuntime, POD_CACHE_TTL, RUNTIME_MANAGED_LABEL,
+};
 
 impl KubernetesRuntime {
     pub(crate) async fn get_container_info_inner(
@@ -27,11 +29,13 @@ impl KubernetesRuntime {
         // Try cache first
         // .cloned() 让 cached 成为 owned,读守卫在条件求值结束即释放 —— 否则守卫跨下面
         // build_container_basic_info().await 持续占读锁,卡住写者(stop/cleanup)。
-        if let Some(cached) = self.pod_cache.read().await.get(identifier).cloned()
-            && cached.status == ContainerRuntimeStatus::Running
+        if let Some(entry) = self.pod_cache.read().await.get(identifier).cloned()
+            && entry.cached_at.elapsed() < POD_CACHE_TTL
+            && entry.info.status == ContainerRuntimeStatus::Running
         {
             return Ok(Some(
-                self.build_container_basic_info(identifier, &cached).await?,
+                self.build_container_basic_info(identifier, &entry.info)
+                    .await?,
             ));
         }
 
@@ -82,10 +86,13 @@ impl KubernetesRuntime {
 
                 // Update cache if running
                 if pod_info.status == ContainerRuntimeStatus::Running {
-                    self.pod_cache
-                        .write()
-                        .await
-                        .insert(identifier.to_string(), pod_info.clone());
+                    self.pod_cache.write().await.insert(
+                        identifier.to_string(),
+                        CachedPod {
+                            info: pod_info.clone(),
+                            cached_at: std::time::Instant::now(),
+                        },
+                    );
                 }
 
                 return Ok(Some(
@@ -125,15 +132,21 @@ impl KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
-        // Check cache first
-        if let Some(cached) = self.pod_cache.read().await.get(identifier) {
-            return Ok(Some(cached.clone()));
+        // Check cache first（TTL 未过期才命中，避免外部删除后返旧）
+        if let Some(entry) = self.pod_cache.read().await.get(identifier)
+            && entry.cached_at.elapsed() < POD_CACHE_TTL
+        {
+            return Ok(Some(entry.info.clone()));
         }
 
         // 1) Query by concrete pod name
         let pod_name = self.pod_name(identifier, service_type)?;
         match self.pods().get(&pod_name).await {
-            Ok(pod) => return Ok(Some(Self::runtime_info_from_pod(&pod))),
+            Ok(pod) => {
+                let info = Self::runtime_info_from_pod(&pod);
+                self.maybe_cache_running_pod(identifier, &info).await;
+                return Ok(Some(info));
+            }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {}
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
@@ -157,7 +170,9 @@ impl KubernetesRuntime {
             })?;
 
         if let Some(pod) = pods.items.into_iter().next() {
-            return Ok(Some(Self::runtime_info_from_pod(&pod)));
+            let info = Self::runtime_info_from_pod(&pod);
+            self.maybe_cache_running_pod(identifier, &info).await;
+            return Ok(Some(info));
         }
 
         // 3) 兼容旧标签查询（平滑迁移）
@@ -178,11 +193,28 @@ impl KubernetesRuntime {
                 })?;
 
             if let Some(pod) = pods.items.into_iter().next() {
-                return Ok(Some(Self::runtime_info_from_pod(&pod)));
+                let info = Self::runtime_info_from_pod(&pod);
+                self.maybe_cache_running_pod(identifier, &info).await;
+                return Ok(Some(info));
             }
         }
 
         Ok(None)
+    }
+
+    /// find_container_inner 查询成功且 Running 时回填缓存。
+    /// 避免 TTL 过期后每次 find_container 都打 K8s API（status checker 等
+    /// 高频调用方）；与 get_container_info_inner 的写入语义一致（仅缓存 Running）。
+    async fn maybe_cache_running_pod(&self, identifier: &str, info: &RuntimeContainerInfo) {
+        if info.status == ContainerRuntimeStatus::Running {
+            self.pod_cache.write().await.insert(
+                identifier.to_string(),
+                CachedPod {
+                    info: info.clone(),
+                    cached_at: std::time::Instant::now(),
+                },
+            );
+        }
     }
 
     pub(crate) async fn list_containers_inner(

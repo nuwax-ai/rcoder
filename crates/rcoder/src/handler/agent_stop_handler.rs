@@ -7,7 +7,7 @@ use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{error, info, instrument};
 
-use super::utils::{I18nJsonOrQuery, get_locale_from_headers};
+use super::utils::{I18nJsonOrQuery, get_locale_from_headers, is_known_identifier};
 use crate::{AppError, HttpResult, router::AppState};
 use shared_types::{AgentStopRequest, AgentStopResponse};
 
@@ -69,8 +69,8 @@ async fn destroy_container_for_project(
             state.grpc_pool.remove(&old_grpc_addr).await;
         }
 
-        // 从存储中移除项目（如果 project_id 不是 "unknown"）
-        if container_info.project_id != "unknown" {
+        // 从存储中移除项目（如果 project_id 是已知标识，非 "unknown" 哨兵）
+        if is_known_identifier(&container_info.project_id) {
             // 先关闭该 project 的 SSE 共享流（remove_project 会清空 sessions 集合，之后无法枚举）
             state.shutdown_sse_streams_for_project(&container_info.project_id);
             state.remove_project(&container_info.project_id);

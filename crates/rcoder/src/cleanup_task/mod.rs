@@ -78,6 +78,7 @@ pub async fn start_cleanup_task(
             state.grpc_pool.clone(),
             state.pingora_service.clone(),
             docker_manager.clone(),
+            state.projects.cleanup_tx(),
         );
         tokio::spawn(reaper.run());
         tracing::info!(

@@ -63,6 +63,13 @@ pub enum ContainerStateCommand {
         container_id: String,
         reply: oneshot::Sender<Option<DockerContainerInfo>>,
     },
+    /// 移除所有 container_id 匹配的条目（单次遍历，返回被移除项）。
+    /// 用于 cleanup_all_containers 等场景，替代逐个 list() 的 O(n²)；仍按
+    /// container_id 精确匹配，保留"防误删重启新容器"语义。
+    RemoveAllByContainerId {
+        container_id: String,
+        reply: oneshot::Sender<Vec<DockerContainerInfo>>,
+    },
 }
 
 /// 容器状态 Actor
@@ -174,6 +181,25 @@ impl ContainerStateActor {
 
                 if reply.send(result).is_err() {
                     warn!("[ACTOR] RemoveIfContainerId reply channel closed");
+                }
+            }
+            ContainerStateCommand::RemoveAllByContainerId {
+                container_id,
+                reply,
+            } => {
+                // 单次遍历收集匹配 key，再逐个 remove（O(n)，一次 actor 往返）
+                let matching_keys: Vec<String> = self
+                    .containers
+                    .iter()
+                    .filter(|(_, info)| info.container_id == container_id)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                let removed: Vec<DockerContainerInfo> = matching_keys
+                    .into_iter()
+                    .filter_map(|k| self.containers.remove(&k))
+                    .collect();
+                if reply.send(removed).is_err() {
+                    warn!("[ACTOR] RemoveAllByContainerId reply channel closed");
                 }
             }
         }
@@ -372,6 +398,27 @@ impl ContainerStateHandle {
         rx.await.unwrap_or_else(|_| {
             error!("[HANDLE] RemoveIfContainerId reply failed - actor task died");
             None
+        })
+    }
+
+    /// 移除所有 container_id 匹配的条目（单次 actor 往返，替代多次 list() 的 O(n²)）。
+    pub async fn remove_all_by_container_id(&self, container_id: &str) -> Vec<DockerContainerInfo> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(ContainerStateCommand::RemoveAllByContainerId {
+                container_id: container_id.to_string(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            error!("[HANDLE] Failed to send RemoveAllByContainerId command - actor stopped");
+            return vec![];
+        }
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] RemoveAllByContainerId reply failed - actor task died");
+            vec![]
         })
     }
 }

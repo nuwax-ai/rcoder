@@ -24,4 +24,4 @@ pub use paths::{
 
 // 内部使用：路径验证（通过路径函数自动调用，无需外部直接使用）
 #[allow(unused_imports)]
-pub use paths::{PathValidationError, validate_identifier};
+pub use paths::{PathValidationError, is_known_identifier, validate_identifier};

@@ -95,6 +95,11 @@ impl ProjectAdapter {
         (adapter, rx)
     }
 
+    /// 返回 cleanup channel sender 的 clone，供 ResourceReaper 在 stop 失败时 re-enqueue 重试。
+    pub fn cleanup_tx(&self) -> tokio::sync::mpsc::UnboundedSender<CleanupRequest> {
+        self.cleanup_tx.clone()
+    }
+
     // ========== Project CRUD ==========
 
     /// 获取项目信息（view: 闭包结束读锁立即释放）
@@ -709,6 +714,7 @@ impl ProjectAdapter {
                 namespace: self.namespace.clone(),
                 cluster_domain: self.cluster_domain.clone(),
                 project_ids,
+                retry_count: 0,
             }) {
                 tracing::error!(
                     "[STORAGE] cleanup channel send failed (ResourceReaper down?), container leak risk: identifier={}, {}",
@@ -944,6 +950,7 @@ impl ProjectAdapter {
                 namespace: self.namespace.clone(),
                 cluster_domain: self.cluster_domain.clone(),
                 project_ids: vec![],
+                retry_count: 0,
             }) {
                 tracing::error!(
                     "[STORAGE] cleanup channel send failed (ResourceReaper down?), container leak risk: identifier={}, {}",

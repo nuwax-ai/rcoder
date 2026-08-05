@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -15,11 +16,12 @@ pub struct InstallState {
     lock: Mutex<()>,
     /// 当前正在安装的版本（None = 未在安装）
     installing_version: parking_lot::Mutex<Option<String>>,
-    /// 取消令牌（force=true 时取消正在进行的下载）
+    /// 取消令牌（force=true 时取消正在进行的下载）。
     ///
-    /// 使用 Mutex 包装，因为 CancellationToken 不支持 reset，
-    /// force-cancel 后需要替换为新的 token。
-    cancel: parking_lot::Mutex<CancellationToken>,
+    /// CancellationToken 不支持 reset，force-cancel 后需替换为新 token；用 `ArcSwap`
+    /// 无锁替换/加载，避免 `Mutex::try_lock` 在竞争时静默跳过导致 force-cancel 失效
+    /// （旧 bug：replace 失败后旧 token 残留，后续 cancel 命中已取消的旧 token 对新安装无效）。
+    cancel: ArcSwap<CancellationToken>,
 }
 
 impl InstallState {
@@ -54,28 +56,24 @@ impl InstallState {
         self.installing_version.try_lock().and_then(|g| g.clone())
     }
 
-    /// 取消当前正在进行的安装
+    /// 取消当前正在进行的安装。
     ///
-    /// 使用 try_lock 避免阻塞 tokio worker 线程。
-    /// 如果锁被短暂持有（赋值操作），try_lock 几乎总是成功；
-    /// 极端竞争下会跳过本次取消（调用方可重试）。
+    /// `ArcSwap::load` 是无锁原子读，必成功（不阻塞 tokio worker、不再有 try_lock 竞争跳过）。
     pub fn cancel(&self) {
-        if let Some(guard) = self.cancel.try_lock() {
-            guard.cancel();
-        }
+        self.cancel.load().cancel();
     }
 
-    /// 替换取消令牌（安装开始时调用，确保新安装使用未取消的 token）
+    /// 替换取消令牌（安装开始时调用，确保新安装使用未取消的 token）。
+    ///
+    /// `ArcSwap::store` 无锁原子写，必成功。
     pub fn replace_cancel_token(&self, new_token: CancellationToken) {
-        if let Some(mut guard) = self.cancel.try_lock() {
-            *guard = new_token;
-        }
+        self.cancel.store(Arc::new(new_token));
     }
 
     /// 获取当前取消令牌的快照（仅供测试）
     #[cfg(test)]
     fn cancel_token_snapshot(&self) -> CancellationToken {
-        self.cancel.lock().clone()
+        (**self.cancel.load()).clone()
     }
 }
 
@@ -119,7 +117,7 @@ impl InstallLockManager {
                     Arc::new(InstallState {
                         lock: Mutex::new(()),
                         installing_version: parking_lot::Mutex::new(None),
-                        cancel: parking_lot::Mutex::new(CancellationToken::new()),
+                        cancel: ArcSwap::new(Arc::new(CancellationToken::new())),
                     })
                 })
                 .clone(),
@@ -214,5 +212,21 @@ mod tests {
         let token_before = s2.cancel_token_snapshot();
         s1.cancel();
         assert!(!token_before.is_cancelled());
+    }
+
+    #[test]
+    fn replace_then_cancel_hits_new_token() {
+        // 回归 #24：replace_cancel_token 必须真正替换，cancel 命中新 token 而非旧 token。
+        // 旧实现用 try_lock，replace 失败后旧 token 残留，cancel 命中已取消旧 token 对新安装无效。
+        let mgr = InstallLockManager::new();
+        let state = mgr.get_or_create("agent-x", "1.0.0").unwrap();
+
+        let old_token = state.cancel_token_snapshot();
+        let new_token = CancellationToken::new();
+        state.replace_cancel_token(new_token.clone());
+        state.cancel();
+
+        assert!(new_token.is_cancelled(), "new token must be cancelled");
+        assert!(!old_token.is_cancelled(), "old token must remain untouched");
     }
 }

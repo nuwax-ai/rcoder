@@ -225,13 +225,15 @@ impl DockerManager {
 
         info!("container destroy succeeded: {}", container_id);
 
-        // 从映射中移除所有匹配 container_id 的条目
-        // 注意：同一容器可能存储在多个 key 下（如 project_id 和 pod_id），
-        // 必须遍历所有条目，不能 break，否则会遗留孤儿缓存
-        for info in self.containers.list().await {
-            if info.container_id == container_id {
-                self.containers.remove(&info.project_id).await;
-                self.api_cache.invalidate(container_id).await;
+        // 单次 actor 往返移除所有匹配 container_id 的条目（替代 list()+逐个 remove 的 O(n²)）。
+        // 同一容器可能存于多个 key（project_id/pod_id），一次清空避免孤儿缓存。
+        let removed = self
+            .containers
+            .remove_all_by_container_id(container_id)
+            .await;
+        if !removed.is_empty() {
+            self.api_cache.invalidate(container_id).await;
+            for info in &removed {
                 self.api_cache
                     .invalidate(info.container_name.as_str())
                     .await;
@@ -951,23 +953,18 @@ impl DockerManager {
     async fn cleanup_internal_mappings(&self, removed_containers: &[ContainerSummary]) {
         for container in removed_containers {
             if let Some(container_id) = &container.id {
-                // 从内存映射中查找并移除
-                // 从内存映射中查找并安全移除
-                for info in self.containers.list().await {
-                    if info.container_id == *container_id {
-                        // 使用安全移除，只有 container_id 匹配时才移除 (防止误删重启后的新容器)
-                        if self
-                            .containers
-                            .remove_if_container_id(&info.project_id, container_id)
-                            .await
-                            .is_some()
-                        {
-                            info!(
-                                "Removed from internal mapping: project_id={}, container_id={}",
-                                info.project_id, container_id
-                            );
-                        }
-                    }
+                // 单次 actor 往返按 container_id 移除所有匹配条目（替代 list()+逐个
+                // remove_if_container_id 的 O(n²)）；仍按 container_id 精确匹配，保留
+                // "防误删重启新容器"语义（重启的新容器 container_id 不同，不被匹配）。
+                let removed = self
+                    .containers
+                    .remove_all_by_container_id(container_id)
+                    .await;
+                for info in &removed {
+                    info!(
+                        "Removed from internal mapping: project_id={}, container_id={}",
+                        info.project_id, container_id
+                    );
                 }
             }
         }

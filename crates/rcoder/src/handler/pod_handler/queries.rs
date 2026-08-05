@@ -1,5 +1,6 @@
 use super::helpers::*;
 use super::*;
+use crate::handler::utils::is_known_identifier;
 
 /// 获取当前容器数量
 ///
@@ -169,9 +170,7 @@ pub async fn pod_list(
             })
             .or_else(|| {
                 // 如果存储中没有，使用Docker容器中的project_id
-                if !docker_container.container_name.is_empty()
-                    && docker_container.container_name != "unknown"
-                {
+                if is_known_identifier(&docker_container.container_name) {
                     Some(docker_container.container_name.clone())
                 } else {
                     None

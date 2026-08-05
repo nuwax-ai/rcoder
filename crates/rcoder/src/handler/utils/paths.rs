@@ -20,6 +20,15 @@ pub enum PathValidationError {
     Invalid { field: String, value: String },
 }
 
+/// 判断标识符是否"已知"（非空且非 "unknown" 哨兵）。
+///
+/// 容器查询/销毁路径用 "unknown" 作为"标识未知"的哨兵；用此 helper 统一判断，避免散落的
+/// 字面量。合法标识符不会是 "unknown"（validate_identifier 不允许也不生成该值），故对真实
+/// project_id / container_name 安全。
+pub fn is_known_identifier(s: &str) -> bool {
+    !s.is_empty() && s != "unknown"
+}
+
 /// 验证路径标识符（user_id, project_id, tenant_id, space_id 等）
 ///
 /// # 规则

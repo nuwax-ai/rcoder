@@ -21,7 +21,7 @@ use tracing::info;
 use super::k8s_pod::K8sPodOps;
 use super::k8s_pvc::K8sPvcOps;
 use super::k8s_service::K8sServiceOps;
-use super::kubernetes_runtime::KubernetesRuntime;
+use super::kubernetes_runtime::{KubernetesRuntime, POD_CACHE_TTL};
 
 impl KubernetesRuntime {
     /// 创建 agent-runner 容器（走 StatefulSet，K8s 原生 pod 级自愈）。
@@ -64,8 +64,9 @@ impl KubernetesRuntime {
         // .cloned() 让 cached 成为 owned,读守卫在条件求值结束即释放 —— 否则守卫会跨下面
         // get_container_info_by_identifier_inner().await,而后者会再次进入同一把 RwLock;
         // tokio RwLock 写优先,并发 ensure+stop 时会自死锁。
-        if let Some(cached) = self.pod_cache.read().await.get(identifier).cloned()
-            && cached.status == ContainerRuntimeStatus::Running
+        if let Some(entry) = self.pod_cache.read().await.get(identifier).cloned()
+            && entry.cached_at.elapsed() < POD_CACHE_TTL
+            && entry.info.status == ContainerRuntimeStatus::Running
         {
             info!("[K8S] Pod {} already exists and is running", pod_name);
             return self

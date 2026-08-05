@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use shared_types::ServiceType;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use container_runtime_api::ContainerRuntime;
 
@@ -41,6 +41,8 @@ pub struct CleanupRequest {
     pub cluster_domain: String,
     /// 关联的 project_id 列表（日志用）
     pub project_ids: Vec<String>,
+    /// re-enqueue 重试次数（0=首次，上限 MAX_STOP_RETRIES；reaper stop 失败时自增并重新入队）
+    pub retry_count: u32,
 }
 
 /// 单个清理操作超时时间（防止慢清理阻塞队列）
@@ -55,6 +57,8 @@ pub struct ResourceReaper {
     docker_manager: Option<Arc<docker_manager::DockerManager>>,
     /// 是否是 K8s 运行时
     is_kubernetes: bool,
+    /// cleanup channel sender：stop 失败时 re-enqueue（有限次重试）
+    cleanup_tx: tokio::sync::mpsc::UnboundedSender<CleanupRequest>,
 }
 
 impl ResourceReaper {
@@ -64,6 +68,7 @@ impl ResourceReaper {
         grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
         pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
         docker_manager: Option<Arc<docker_manager::DockerManager>>,
+        cleanup_tx: tokio::sync::mpsc::UnboundedSender<CleanupRequest>,
     ) -> Self {
         // 判断是否是 K8s 运行时（通过 features flag）
         let is_kubernetes = shared_types::is_kubernetes_runtime();
@@ -75,6 +80,7 @@ impl ResourceReaper {
             pingora,
             docker_manager,
             is_kubernetes,
+            cleanup_tx,
         }
     }
 
@@ -118,11 +124,31 @@ impl ResourceReaper {
         {
             Ok(()) => info!("[REAPER] destroyed container: {}", req.container_name),
             Err(e) => {
-                warn!(
-                    "[REAPER] failed to stop container {}: {}",
-                    req.container_name, e
+                const MAX_STOP_RETRIES: u32 = 3;
+                if req.retry_count < MAX_STOP_RETRIES {
+                    let retry_count = req.retry_count + 1;
+                    warn!(
+                        "[REAPER] stop failed (attempt {}/{}), re-enqueue after 10s: id={}, err={}",
+                        retry_count, MAX_STOP_RETRIES, req.identifier, e
+                    );
+                    let tx = self.cleanup_tx.clone();
+                    let mut next = req.clone();
+                    next.retry_count = retry_count;
+                    // spawn 延迟发送，不阻塞串行 reaper 主循环
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        if let Err(send_e) = tx.send(next) {
+                            warn!("[REAPER] re-enqueue send failed: {}", send_e);
+                        }
+                    });
+                    // re-enqueue：跳过后续 steps 2-5，等 stop 成功那次再完整清
+                    return;
+                }
+                // 重试耗尽：容器孤儿（rcoder 已无跟踪记录），但仍 best-effort 清理非容器资源（steps 2-5）
+                error!(
+                    "[REAPER] stop failed after {} retries, ORPHANED container: id={}, name={}, err={}",
+                    MAX_STOP_RETRIES, req.identifier, req.container_name, e
                 );
-                // 继续清理其他资源，不因 stop 失败而中断
             }
         }
 
@@ -182,6 +208,7 @@ mod tests {
             namespace: "test-namespace".to_string(),
             cluster_domain: "test.cluster.local".to_string(),
             project_ids: vec!["proj-1".to_string()],
+            retry_count: 0,
         };
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("user-123"));

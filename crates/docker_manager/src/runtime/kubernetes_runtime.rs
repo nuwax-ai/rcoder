@@ -44,6 +44,19 @@ use crate::types::DockerManagerConfig;
 // 此处与 PVC/Backend CRD 的 label 写入一并对齐到全键。
 pub(crate) const RUNTIME_MANAGED_LABEL: &str = "app.kubernetes.io/managed-by=rcoder-runtime";
 
+/// pod_cache 条目的新鲜度包装：记录写入时刻，TTL 过期则视为 miss 走 K8s API，
+/// 修复外部 `kubectl delete pod` / STS 重建窗口期内仍返回旧 Running 的问题。
+#[cfg(feature = "kubernetes")]
+#[derive(Clone)]
+pub(crate) struct CachedPod {
+    pub(crate) info: RuntimeContainerInfo,
+    pub(crate) cached_at: std::time::Instant,
+}
+
+/// pod_cache TTL：超过则视为 miss。30s 平衡缓存收益与外部删除后的可见性窗口。
+#[cfg(feature = "kubernetes")]
+pub(crate) const POD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Kubernetes runtime implementation using kube-rs
 #[cfg(feature = "kubernetes")]
 pub struct KubernetesRuntime {
@@ -51,7 +64,7 @@ pub struct KubernetesRuntime {
     pub(crate) namespace: String,
     pub(crate) config: KubernetesRuntimeConfig,
     /// Cache for pod information (using RwLock to avoid DashMap deadlocks)
-    pub(crate) pod_cache: Arc<RwLock<std::collections::HashMap<String, RuntimeContainerInfo>>>,
+    pub(crate) pod_cache: Arc<RwLock<std::collections::HashMap<String, CachedPod>>>,
     /// CephFS subvolumePath 缓存(key=pvc_name,resolve_subvolume_path_by_pvcname 用)。
     /// subvolumePath 对 PVC 不可变 → 命中即安全;cache miss 时查 K8s(PVC→PV→csi.subvolumePath)懒填充。
     /// 失效时机:PVC destroy(destroy_workspace_pvc 等 remove)+ cleanup_all clear。

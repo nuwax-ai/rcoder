@@ -649,7 +649,7 @@ async fn forward_request_to_container_service(
 
     // 🎯 使用 gRPC 替代 HTTP
     // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
-    let grpc_addr = shared_types::build_grpc_addr(
+    let mut grpc_addr = shared_types::build_grpc_addr(
         &container_info.container_name,
         &container_info.container_ip,
         ctx.namespace,
@@ -723,18 +723,47 @@ async fn forward_request_to_container_service(
                 let should_retry = grpc_err.should_retry();
 
                 if should_retry && attempt < max_retries {
-                    // 可重试错误：清理连接池并重新获取 IP 后重试
-                    info!(
-                        "🔄 [FORWARD] Detected retryable error, retrying with K8s Service FQDN..."
-                    );
+                    // 可重试错误：清理连接池后重试
+                    info!("🔄 [FORWARD] Detected retryable error, retrying...");
                     ctx.grpc_pool.remove(&grpc_addr).await;
 
-                    // K8s Service FQDN 是稳定的，不需要重新解析
-                    // 直接使用原来的 FQDN 进行重试
-                    debug!(
-                        "🔄 [FORWARD] Retrying with same K8s Service FQDN: {}",
-                        grpc_addr
-                    );
+                    // K8s Service FQDN 稳定无需重解析；Docker 模式容器重启后 IP 可能变化，
+                    // 按 name 实时重新解析（find_container → find_container_realtime，
+                    // 不要用 get_container_info_by_identifier：它走缓存的旧 container_id 会 404）。
+                    if !shared_types::is_kubernetes_runtime() {
+                        match ctx
+                            .runtime
+                            .find_container(&project_id, &shared_types::ServiceType::WebAgentRunner)
+                            .await
+                        {
+                            Ok(Some(info)) if !info.container_ip.is_empty() => {
+                                let new_addr = shared_types::build_grpc_addr(
+                                    &info.container_name,
+                                    &info.container_ip,
+                                    ctx.namespace,
+                                    ctx.cluster_domain,
+                                );
+                                if new_addr != grpc_addr {
+                                    info!(
+                                        "🔄 [FORWARD] Container IP changed on retry: {} -> {}",
+                                        grpc_addr, new_addr
+                                    );
+                                    grpc_addr = new_addr;
+                                }
+                            }
+                            other => {
+                                warn!(
+                                    "🔄 [FORWARD] Re-resolve on retry returned {:?}, retrying with original addr: {}",
+                                    other, grpc_addr
+                                );
+                            }
+                        }
+                    } else {
+                        debug!(
+                            "🔄 [FORWARD] Retrying with same K8s Service FQDN: {}",
+                            grpc_addr
+                        );
+                    }
 
                     last_error = Some(anyhow::Error::from(grpc_err));
                     continue;
