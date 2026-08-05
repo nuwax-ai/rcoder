@@ -192,12 +192,17 @@ fn get_active_tasks_count() -> i32 {
     // （http-server 关闭时 start_ws_terminal 不被启动，无连接被 accept，计数自然为 0。）
     let terminal_count = crate::ws_terminal::active_terminal_count() as i32;
 
+    // VNC 桌面连接同样算「容器在用」：VNC 数据流不经过 agent_runner（Pingora 直连容器 6080），
+    // 故读 /proc/net/tcp 数 noVNC 端口上的 ESTABLISHED 连接。用户开着虚拟桌面阅读、
+    // 但两次对话间 agent 处于 Idle 时，靠这个计数让容器被判活跃、不被闲置回收。
+    let vnc_count = crate::vnc_activity::active_vnc_client_count() as i32;
+
     debug!(
-        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}",
-        agent_count, terminal_count
+        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}, vnc={}",
+        agent_count, terminal_count, vnc_count
     );
 
-    agent_count + terminal_count
+    agent_count + terminal_count + vnc_count
 }
 
 fn get_uptime_seconds() -> i64 {

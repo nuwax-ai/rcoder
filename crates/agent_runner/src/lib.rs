@@ -22,6 +22,10 @@ pub mod http_server;
 // ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
 pub mod ws_terminal;
 
+// VNC 桌面连接活跃度计数（读 /proc/net/tcp 数 noVNC 端口 ESTABLISHED 连接，
+// 供 get_active_tasks_count 折入 active_tasks，使「桌面开着」的容器不被闲置回收）
+pub mod vnc_activity;
+
 // 测试辅助模块 (仅在 testing feature 启用时编译)
 #[cfg(feature = "testing")]
 pub mod testing;

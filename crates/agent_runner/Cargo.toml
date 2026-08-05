@@ -146,6 +146,11 @@ pyroscope = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
 
+# /proc 解析（agent_runner 统计容器内 noVNC 端口 ESTABLISHED 连接，判 VNC 桌面是否在用）
+# 仅 Linux target 引入；macOS 开发 cargo check/test 不拉此依赖，保持 Mac 编译干净。
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = { workspace = true }
+
 [dev-dependencies]
 # 集成测试用:解析响应 body
 http-body-util = { workspace = true }

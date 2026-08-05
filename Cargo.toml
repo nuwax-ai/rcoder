@@ -169,6 +169,9 @@ derive_builder = "0.20"
 # Zed 核心功能依赖
 libc = "0.2"
 nix = { version = "0.31.3", features = ["fs", "process", "term", "signal"] }
+# /proc 解析（agent_runner 统计容器内 noVNC 端口 ESTABLISHED 连接，判 VNC 桌面是否在用）。
+# 仅在 Linux target 的 agent_runner 里引入（target-gated），Mac 开发编译不拉它。
+procfs = "0.18"
 unindent = "0.2"                                                   # 使用 crates.io 版本
 open = "5.0"                                                       # 使用 crates.io 版本
 git2 = "0.21"

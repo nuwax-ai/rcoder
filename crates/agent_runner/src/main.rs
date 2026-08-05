@@ -38,6 +38,9 @@ mod http_server;
 // ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
 mod file_server_embed;
 mod ws_terminal;
+// VNC 桌面连接活跃度计数（读 /proc/net/tcp 数 noVNC 端口 ESTABLISHED 连接，
+// 供 get_active_tasks_count 折入 active_tasks，使「桌面开着」的容器不被闲置回收）
+mod vnc_activity;
 
 pub use model::*;
 
