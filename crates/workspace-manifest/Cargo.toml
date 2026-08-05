@@ -5,6 +5,9 @@ edition = "2024"
 license = "Apache-2.0"
 description = "UserApp workspace 两级 manifest 类型（file-server build + app-cli runtime 共用，极轻量）"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

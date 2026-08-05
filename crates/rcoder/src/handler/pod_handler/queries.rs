@@ -399,7 +399,7 @@ pub async fn pod_keepalive(
             let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
             project_info.set_user_id(Some(request.user_id.clone()));
             project_info.set_pod_id(request.pod_id.clone());
-            project_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+            project_info.set_service_type(Some(ServiceType::ComputerAgentRunner));
             project_info.set_scope(
                 request.tenant_id.clone(),
                 request.space_id.clone(),
@@ -625,7 +625,7 @@ pub async fn pod_status(
         && let Some(ref project_id) = params.project_id
     {
         match runtime
-            .find_container(project_id, &shared_types::ServiceType::WebAgentRunner)
+            .find_container(project_id, &ServiceType::WebAgentRunner)
             .await
         {
             Ok(Some(result)) => {

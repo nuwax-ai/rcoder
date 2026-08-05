@@ -26,7 +26,7 @@ pub struct DockerManager {
     /// 容器状态句柄（Actor 模式，无锁并发安全）
     pub(crate) containers: ContainerStateHandle,
     /// 主网络名称（动态检测或使用默认值）
-    pub(crate) main_network_name: std::sync::Arc<tokio::sync::RwLock<String>>,
+    pub(crate) main_network_name: Arc<tokio::sync::RwLock<String>>,
     /// Docker API 缓存
     pub(crate) api_cache: Arc<DockerApiCache>,
 }
@@ -76,7 +76,7 @@ impl DockerManager {
             docker,
             config,
             containers,
-            main_network_name: std::sync::Arc::new(tokio::sync::RwLock::new(main_network_name)),
+            main_network_name: Arc::new(tokio::sync::RwLock::new(main_network_name)),
             api_cache,
         };
 
@@ -795,7 +795,8 @@ impl DockerManager {
             .as_ref()
             .and_then(|s| s.status.as_ref())
         {
-            Some(status) if status.to_string() == "running" => {
+            // 统一走 ContainerStatus 枚举比较（大小写不敏感），不直接比字符串
+            Some(status) if ContainerStatus::from(status.to_string()).is_running() => {
                 if !options.force_remove_running {
                     info!("Container {} is running, skip (force=false)", container_id);
                     return Ok(());

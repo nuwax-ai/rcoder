@@ -161,7 +161,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
     // 异步初始化内置 agent 版本缓存（不阻塞主流程）
     tokio::spawn(async {
-        crate::agent_mgmt::checker::init_builtin_agent_versions().await;
+        agent_mgmt::checker::init_builtin_agent_versions().await;
     });
 
     // 解析命令行参数
@@ -193,7 +193,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
     // 🔒 创建共享的 API 密钥 DashMap
     let shared_api_key_manager =
-        Arc::new(dashmap::DashMap::<String, shared_types::ModelProviderConfig>::new());
+        Arc::new(DashMap::<String, shared_types::ModelProviderConfig>::new());
     info!("[MAIN] Shared API key DashMap created");
 
     #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
@@ -222,26 +222,24 @@ async fn agent_runner_main() -> anyhow::Result<()> {
     // 🆕 P0-1: 创建 Agent 管理注册表(从磁盘加载,失败则用空注册表 + 警告)
     // 注:用二进制自己的 `crate::agent_mgmt` 模块(与 router::AppState 同编译单元),
     //     lib 和 binary 是两个独立 crate,类型不能混用。
-    let agent_mgmt_path_manager = crate::agent_mgmt::PathManager::new();
-    let agent_mgmt_registry =
-        match crate::agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone()) {
-            Ok(r) => {
-                info!(
-                    "[MAIN] Agent management registry loaded: total={}, builtin={}",
-                    r.total(),
-                    r.builtin_count()
-                );
-                std::sync::Arc::new(r)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[MAIN] Failed to load agent management registry, starting empty: {e}"
-                );
-                std::sync::Arc::new(crate::agent_mgmt::AgentRegistry::empty(
-                    agent_mgmt_path_manager.clone(),
-                ))
-            }
-        };
+    let agent_mgmt_path_manager = agent_mgmt::PathManager::new();
+    let agent_mgmt_registry = match agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone())
+    {
+        Ok(r) => {
+            info!(
+                "[MAIN] Agent management registry loaded: total={}, builtin={}",
+                r.total(),
+                r.builtin_count()
+            );
+            Arc::new(r)
+        }
+        Err(e) => {
+            tracing::warn!("[MAIN] Failed to load agent management registry, starting empty: {e}");
+            Arc::new(agent_mgmt::AgentRegistry::empty(
+                agent_mgmt_path_manager.clone(),
+            ))
+        }
+    };
 
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
@@ -279,7 +277,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
             .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
             // P0-1: Agent 管理 gRPC 服务
-            let agent_mgmt_service = crate::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+            let agent_mgmt_service = agent_mgmt::grpc::AgentMgmtServiceImpl::new(
                 agent_mgmt_registry.clone(),
                 agent_mgmt_path_manager.clone(),
             );

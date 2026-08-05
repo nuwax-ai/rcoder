@@ -60,7 +60,7 @@ impl AgentRegistry {
                 if manifest.install_type == InstallType::Builtin {
                     return true;
                 }
-                let binary_path = std::path::PathBuf::from(&manifest.binary_path);
+                let binary_path = PathBuf::from(&manifest.binary_path);
                 if !binary_path.exists() {
                     warn!(
                         "[agent_mgmt] Healing orphaned registry entry: agent_id={}, version={:?}, binary_path={} (directory missing)",
@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn compare_versions_basic() {
         use std::cmp::Ordering;
-        let cv = shared_types::version_util::compare_versions;
+        let cv = version_util::compare_versions;
         assert_eq!(cv("1.0.0", "1.0.0").unwrap(), Ordering::Equal);
         assert_eq!(cv("1.0.0", "1.0.1").unwrap(), Ordering::Less);
         assert_eq!(cv("1.0.1", "1.0.0").unwrap(), Ordering::Greater);
@@ -628,19 +628,19 @@ mod tests {
     #[test]
     fn compare_versions_with_v_prefix() {
         use std::cmp::Ordering;
-        let cv = shared_types::version_util::compare_versions;
+        let cv = version_util::compare_versions;
         assert_eq!(cv("v1.0.0", "1.0.0").unwrap(), Ordering::Equal);
         assert_eq!(cv("V2.0.0", "1.9.9").unwrap(), Ordering::Greater);
     }
 
     #[test]
     fn compare_versions_returns_err_on_invalid() {
-        assert!(shared_types::version_util::compare_versions("invalid", "0.0.0").is_err());
+        assert!(version_util::compare_versions("invalid", "0.0.0").is_err());
     }
 
     #[test]
     fn version_key_normalizes() {
-        let nk = shared_types::version_util::normalize_version;
+        let nk = version_util::normalize_version;
         // v 前缀归一化
         assert_eq!(nk("v1.0.0").unwrap(), "1.0.0");
         assert_eq!(nk("V2.0.0").unwrap(), "2.0.0");

@@ -168,8 +168,9 @@ pub use k8s_config::{
     K8sVolumeType, KubernetesConfig,
 };
 pub use multi_image_config::{
-    GlobalImageDefaults, ImageCacheConfig, ImageSelectionStrategy, MultiImageConfig,
-    ProjectImageOverrides, create_default_multi_image_config, create_legacy_multi_image_config,
+    GlobalImageDefaults, IMAGE_CACHE_DEFAULT_MAX_ENTRIES, IMAGE_CACHE_DEFAULT_TTL_SECS,
+    ImageCacheConfig, ImageSelectionStrategy, MultiImageConfig, ProjectImageOverrides,
+    create_default_multi_image_config, create_legacy_multi_image_config,
 };
 pub use service_config::{
     ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits, ServiceSecurityConfig,

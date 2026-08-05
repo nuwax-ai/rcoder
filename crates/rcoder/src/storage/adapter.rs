@@ -47,8 +47,8 @@ pub struct ProjectAdapter {
     session_index: DashMap<String, (String, String)>,
     /// project_id → container_key（反向索引）
     project_to_container: DashMap<String, String>,
-    /// RAII 清理通道（unbounded，send 是同步的）
-    cleanup_tx: tokio::sync::mpsc::UnboundedSender<CleanupRequest>,
+    /// RAII 清理通道（bounded，try_send 非阻塞，满时丢弃并告警）
+    cleanup_tx: tokio::sync::mpsc::Sender<CleanupRequest>,
     /// K8s namespace（用于构建 K8s Service FQDN）
     namespace: String,
     /// K8s 集群域名
@@ -77,8 +77,9 @@ impl ProjectAdapter {
     pub fn new(
         namespace: String,
         cluster_domain: String,
-    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<CleanupRequest>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    ) -> (Self, tokio::sync::mpsc::Receiver<CleanupRequest>) {
+        let (tx, rx) =
+            tokio::sync::mpsc::channel(crate::storage::resource_reaper::CLEANUP_CHANNEL_CAPACITY);
         let adapter = Self {
             projects: DashMap::new(),
             namespace,
@@ -93,11 +94,6 @@ impl ProjectAdapter {
         };
         info!("[STORAGE] ProjectAdapter initialized (DashMap, RAII enabled)");
         (adapter, rx)
-    }
-
-    /// 返回 cleanup channel sender 的 clone，供 ResourceReaper 在 stop 失败时 re-enqueue 重试。
-    pub fn cleanup_tx(&self) -> tokio::sync::mpsc::UnboundedSender<CleanupRequest> {
-        self.cleanup_tx.clone()
     }
 
     // ========== Project CRUD ==========
@@ -706,7 +702,7 @@ impl ProjectAdapter {
             let info = entry.info();
             self.container_id_to_key.remove(&info.container_id);
             // identifier 用裸 logical_id（清理链路按 logical id）
-            if let Err(e) = self.cleanup_tx.send(CleanupRequest {
+            if let Err(e) = self.cleanup_tx.try_send(CleanupRequest {
                 identifier: entry.logical_id().to_string(),
                 container_name: info.container_name,
                 service_type: entry.service_type(),
@@ -717,7 +713,7 @@ impl ProjectAdapter {
                 retry_count: 0,
             }) {
                 tracing::error!(
-                    "[STORAGE] cleanup channel send failed (ResourceReaper down?), container leak risk: identifier={}, {}",
+                    "[STORAGE] cleanup channel try_send failed (full or ResourceReaper down?), container leak risk: identifier={}, {}",
                     entry.logical_id(),
                     e
                 );
@@ -942,7 +938,7 @@ impl ProjectAdapter {
             );
             // identifier 用裸 logical_id（清理链路按 logical id：stop_container_by_identifier/
             // remove_vnc_backend/remove_project_backend/remove_container_cache），而非 DashMap 键
-            if let Err(e) = self.cleanup_tx.send(CleanupRequest {
+            if let Err(e) = self.cleanup_tx.try_send(CleanupRequest {
                 identifier: entry.logical_id().to_string(),
                 container_name: info.container_name,
                 service_type: entry.service_type(),
@@ -953,7 +949,7 @@ impl ProjectAdapter {
                 retry_count: 0,
             }) {
                 tracing::error!(
-                    "[STORAGE] cleanup channel send failed (ResourceReaper down?), container leak risk: identifier={}, {}",
+                    "[STORAGE] cleanup channel try_send failed (full or ResourceReaper down?), container leak risk: identifier={}, {}",
                     entry.logical_id(),
                     e
                 );
@@ -1009,7 +1005,7 @@ impl ProjectAdapter {
     ///   解析;Pod 重建后 Service selector 选到新 Pod,DNS 自动指向新 IP,客户端重连即
     ///   恢复,无需 rcoder 重注册/重查(与 `register_vnc_backend` 的 vnc_backends 对齐)。
     /// - Docker:容器 IP(直连)。
-    fn resolve_backend_addr(&self, info: &shared_types::ContainerBasicInfo) -> String {
+    fn resolve_backend_addr(&self, info: &ContainerBasicInfo) -> String {
         if shared_types::is_kubernetes_runtime() {
             shared_types::build_k8s_service_fqdn(
                 &info.container_name,
@@ -1031,11 +1027,7 @@ impl shared_types::ContainerLookup for ProjectAdapter {
     /// 此处全量扫描（`find_projects_by_user_id`，已按 `service_type` 过滤）取任一
     /// 匹配 project，再经 `container_info_by_project` 走 `containers[name]` 权威源取 IP——
     /// 同 user 的 Computer 项目共享同一容器，任取一个即可。O(N)，N 为该 user 的 project 数。
-    fn find_by_user_id(
-        &self,
-        user_id: &str,
-        service_type: &shared_types::ServiceType,
-    ) -> Option<String> {
+    fn find_by_user_id(&self, user_id: &str, service_type: &ServiceType) -> Option<String> {
         // 委托 get_container_by_user_id（同一查找逻辑：扫描 + containers[name] 权威源），
         // 仅取 container_ip。同 user 的 Computer 项目共享同一容器，任取一个即可。
         self.get_container_by_user_id(user_id, service_type)
@@ -1048,11 +1040,7 @@ impl shared_types::ContainerLookup for ProjectAdapter {
     /// 然后从 containers 中获取 container_ip。
     ///
     /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None。
-    fn find_by_project_id(
-        &self,
-        project_id: &str,
-        service_type: &shared_types::ServiceType,
-    ) -> Option<String> {
+    fn find_by_project_id(&self, project_id: &str, service_type: &ServiceType) -> Option<String> {
         // clone 出 container_key 后立即释放 project_to_container 读锁
         let container_key = self.project_to_container.get(project_id)?.value().clone();
         let entry = self.containers.get(&container_key)?;
@@ -1077,11 +1065,7 @@ impl shared_types::ContainerLookup for ProjectAdapter {
     ///
     /// 命中容器的 service_type 必须与 `service_type` 一致，否则返回 None，
     /// 避免同一 pod_id 下跨 ServiceType 容器互相串用。
-    fn find_by_pod_id(
-        &self,
-        pod_id: &str,
-        service_type: &shared_types::ServiceType,
-    ) -> Option<String> {
+    fn find_by_pod_id(&self, pod_id: &str, service_type: &ServiceType) -> Option<String> {
         // 索引链查找：每步 clone 出 key 后立即释放读锁，避免跨 map 同时持锁
         let project_id = self.pod_id_to_project_id.get(pod_id)?.value().clone();
         let container_key = self.project_to_container.get(&project_id)?.value().clone();
@@ -1107,7 +1091,7 @@ impl shared_types::ContainerLookup for ProjectAdapter {
     fn find_project_scope(
         &self,
         project_id: &str,
-        service_type: &shared_types::ServiceType,
+        service_type: &ServiceType,
     ) -> Option<shared_types::ProjectScope> {
         let info = self.projects.get(project_id)?;
         // 校验 service_type，防止跨 ServiceType 串用

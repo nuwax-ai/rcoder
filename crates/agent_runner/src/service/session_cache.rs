@@ -61,6 +61,46 @@ pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock
 /// 与 ring buffer 大小一致，提供足够的缓冲同时防止 OOM
 const COMMAND_CHANNEL_BUFFER_SIZE: usize = 1000;
 
+/// worker 轻量命令应答超时（秒）: message_count / clear 等。
+///
+/// worker 被长任务占住时, 健康检查 / stop 等调用方应超时返回默认值
+/// 而不是无限挂死, 避免拖死整个请求链路 (Fail Fast)。
+const WORKER_REPLY_TIMEOUT_SECS: u64 = 5;
+
+/// replay 类命令应答超时（秒）。
+///
+/// replay_since 用于 SSE/gRPC 重连补发历史消息; 它超时静默返回空会丢失
+/// 重连区间消息, 违背 ring buffer 的设计初衷, 故给更长预算 (worker 被
+/// 积压 Push 占住时宁可多等, 也不能静默丢消息)。
+const WORKER_REPLAY_TIMEOUT_SECS: u64 = 30;
+
+/// 带超时等待 worker 应答; 超时/worker 退出时返回默认值并告警。
+async fn await_worker_reply<T: Default>(
+    command: &str,
+    timeout_secs: u64,
+    rx: oneshot::Receiver<T>,
+) -> T {
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            // RecvError: worker 侧 sender 已 drop (worker 退出/panic), 无更多细节
+            warn!(
+                %error,
+                "Worker reply channel closed for {command}; worker has exited"
+            );
+            T::default()
+        }
+        Err(error) => {
+            // Elapsed: 超时标记, 携带命令名 + 实际超时值便于定位慢点
+            warn!(
+                %error,
+                "Worker reply timed out after {timeout_secs}s for {command}; returning default"
+            );
+            T::default()
+        }
+    }
+}
+
 /// Session数据包装 - 极简版本，专注消息传输
 type SessionMessageSender = mpsc::Sender<(u64, UnifiedSessionMessage)>;
 
@@ -155,7 +195,7 @@ impl SessionData {
             warn!("Failed to send message_count command; worker has exited");
             return 0;
         }
-        rx.await.unwrap_or(0)
+        await_worker_reply("message_count", WORKER_REPLY_TIMEOUT_SECS, rx).await
     }
 
     /// 增量回放 ring buffer：只返回 seq > from_seq 的消息（非破坏性读取，buffer 内容不变）。
@@ -174,7 +214,7 @@ impl SessionData {
             warn!("Failed to send replay command; worker has exited");
             return vec![];
         }
-        rx.await.unwrap_or_default()
+        await_worker_reply("replay_since", WORKER_REPLAY_TIMEOUT_SECS, rx).await
     }
 
     /// 清空 ring buffer 中所有消息
@@ -191,7 +231,7 @@ impl SessionData {
             warn!("Failed to send clear command; worker has exited");
             return 0;
         }
-        rx.await.unwrap_or(0)
+        await_worker_reply("clear_message_buffer", WORKER_REPLY_TIMEOUT_SECS, rx).await
     }
 
     /// 检查 worker 是否仍然存活
@@ -909,7 +949,7 @@ mod tests {
         let real_sid = "ses_real_active";
         let stale_sid = "753cf1fd-stale-not-registered";
 
-        let registry = &crate::service::AGENT_REGISTRY;
+        let registry = &AGENT_REGISTRY;
         registry.remove_by_project(project); // 幂等清理残留
         registry.register(project, real_sid, make_agent_info(project, real_sid));
 

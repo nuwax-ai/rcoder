@@ -106,7 +106,7 @@ pub mod default_images {
 /// 注意：此函数使用硬编码的默认值，建议使用 `get_docker_image_from_config()`
 /// 从配置中读取镜像地址
 pub fn default_docker_image() -> String {
-    let platform = crate::utils::DockerUtils::auto_detect_platform();
+    let platform = DockerUtils::auto_detect_platform();
     match platform.as_str() {
         "linux/arm64" => default_images::ARM64.to_string(),
         "linux/amd64" => default_images::AMD64.to_string(),
@@ -142,7 +142,7 @@ pub fn get_docker_image_from_config(
     amd64_image: Option<String>,
     default_image: Option<String>,
 ) -> String {
-    let platform = crate::utils::DockerUtils::auto_detect_platform();
+    let platform = DockerUtils::auto_detect_platform();
 
     // 优先使用通用镜像
     if let Some(img) = image {
@@ -163,7 +163,7 @@ pub fn get_docker_image_from_config(
 
 /// 默认的平台（使用自动检测）
 pub fn default_platform() -> String {
-    crate::utils::DockerUtils::auto_detect_platform()
+    DockerUtils::auto_detect_platform()
 }
 
 /// 默认的工作目录
@@ -182,8 +182,7 @@ pub const RCODER_NETWORK_BASE_NAME: &str = "agent-network";
 /// 全局 Docker 管理器实例
 pub mod global {
     use super::*;
-    #[cfg(feature = "kubernetes")]
-    use crate::runtime_selection::RuntimeType;
+    use crate::{runtime, runtime_selection::RuntimeType};
     use std::sync::Arc;
     use tokio::sync::OnceCell;
     use tracing::{debug, info};
@@ -209,18 +208,21 @@ pub mod global {
 
     /// 使用自定义配置初始化全局 DockerManager
     ///
-    /// 注意：此函数保持向后兼容。对于 K8s 支持，请使用 init_global_runtime()
-    #[cfg(feature = "kubernetes")]
+    /// Docker / K8s 统一实现：先初始化 RuntimeManager，仅 Docker 运行时
+    /// 才创建全局 DockerManager（K8s 模式走 RuntimeManager 抽象，无需 DockerManager）。
+    /// 对于 K8s 支持，请使用 init_global_runtime()
     pub async fn init_global_docker_manager_with_config(
         config: DockerManagerConfig,
     ) -> DockerResult<()> {
+        // Initialize RuntimeManager so RUNTIME_INSTANCE is set
+        // This allows RuntimeManager::get() to work in docker compose mode
         let runtime_type = RuntimeType::from_env();
-        crate::runtime::RuntimeManager::init(config.clone())
+        runtime::RuntimeManager::init(config.clone())
             .await
             .map_err(|e| DockerError::ConfigurationError(e.to_string()))?;
         info!("Runtime initialized with config");
 
-        if runtime_type == RuntimeType::Docker {
+        if !runtime_type.is_kubernetes() {
             let manager = Arc::new(DockerManager::new(config).await?);
             GLOBAL_DOCKER_MANAGER.set(manager).map_err(|_| {
                 DockerError::IoError(std::io::Error::new(
@@ -234,29 +236,6 @@ pub mod global {
         Ok(())
     }
 
-    /// 使用自定义配置初始化全局 DockerManager（无 K8s 支持）
-    #[cfg(not(feature = "kubernetes"))]
-    pub async fn init_global_docker_manager_with_config(
-        config: DockerManagerConfig,
-    ) -> DockerResult<()> {
-        // Initialize RuntimeManager so RUNTIME_INSTANCE is set
-        // This allows RuntimeManager::get() to work in docker compose mode
-        crate::runtime::RuntimeManager::init(config.clone())
-            .await
-            .map_err(|e| DockerError::ConfigurationError(e.to_string()))?;
-        info!("Runtime initialized with config");
-
-        let manager = Arc::new(DockerManager::new(config).await?);
-        GLOBAL_DOCKER_MANAGER.set(manager).map_err(|_| {
-            DockerError::IoError(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "global DockerManager already initialized",
-            ))
-        })?;
-        info!("DockerManager initialized with config");
-        Ok(())
-    }
-
     /// 初始化全局运行时（RuntimeManager）
     ///
     /// 根据 CONTAINER_RUNTIME 环境变量选择 Docker 或 Kubernetes 运行时
@@ -264,7 +243,7 @@ pub mod global {
     pub async fn init_global_runtime(
         config: DockerManagerConfig,
     ) -> container_runtime_api::ContainerRuntimeResult<()> {
-        crate::runtime::RuntimeManager::init(config).await
+        runtime::RuntimeManager::init(config).await
     }
 
     /// 获取全局运行时实例（Arc<dyn ContainerRuntime>）
@@ -274,7 +253,7 @@ pub mod global {
     pub async fn get_global_runtime() -> container_runtime_api::ContainerRuntimeResult<
         Arc<dyn container_runtime_api::ContainerRuntime>,
     > {
-        crate::runtime::RuntimeManager::get().await
+        runtime::RuntimeManager::get().await
     }
 
     /// 获取全局 DockerManager 实例

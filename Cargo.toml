@@ -22,8 +22,18 @@ default-members = [
 rustdoc.unescaped_backticks = "warn"
 rustdoc.redundant_explicit_links = "warn"
 rust.unused_lifetimes = "warn"
-rust.unused_qualifications = "warn"
+# 防回归: 多余路径限定 (如 `crate::foo::Bar` 而 `Bar` 已在作用域内) 降低可读性。
+# 存量已清零, 升级 deny 拦截新增; prost 生成代码在 shared_types_grpc 内局部 allow。
+rust.unused_qualifications = "deny"
 rust.variant_size_differences = "warn"
+# 防回归: `let _ = x;` 静默丢弃带 Drop 语义的值 (如 guard/receiver) 会埋隐患。
+# 存量较多暂用 warn 防新增; 存量清零后可升级为 deny。
+rust.let_underscore_drop = "warn"
+
+[workspace.lints.clippy]
+# 防回归: sync Mutex 跨 await 持有会阻塞 executor 线程并引入死锁风险。
+# 当前无存量违规, deny 直接拦截新增; CI 配合 `-D warnings` 兑现。
+await_holding_lock = "deny"
 
 [workspace.package]
 version = "0.1.3"
@@ -50,7 +60,7 @@ clap = { version = "4.6", features = ["derive", "env"] }
 
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { version = "0.7", features = ["compat", "time"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
 async-trait = "0.1"
@@ -287,6 +297,7 @@ docker_manager = { path = "crates/docker_manager" }
 rcoder-proxy = { path = "crates/rcoder-proxy" }
 container-runtime-api = { path = "crates/container-runtime-api" }
 download_utils = { path = "crates/download_utils" }
+process_utils = { path = "crates/process_utils" }
 file-server = { path = "crates/file-server" }
 
 # Pyroscope Continuous Profiling

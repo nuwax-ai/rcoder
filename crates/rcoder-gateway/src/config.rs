@@ -4,6 +4,12 @@
 
 use std::time::Duration;
 
+/// 网关监听端口默认值（GATEWAY_PORT 未设置时）
+const DEFAULT_GATEWAY_PORT: u16 = 8090;
+
+/// Cluster cache TTL 默认值（秒，CACHE_TTL_SECONDS 未设置时）
+const DEFAULT_CACHE_TTL_SECONDS: u64 = 600;
+
 /// rcoder-gateway 配置
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
@@ -25,7 +31,7 @@ impl GatewayConfig {
         let gateway_port = std::env::var("GATEWAY_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8090);
+            .unwrap_or(DEFAULT_GATEWAY_PORT);
         let control_plane_url = std::env::var("RCODER_CONTROL_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8087".to_string());
         let envoy_gateway_url = std::env::var("ENVOY_GATEWAY_URL")
@@ -35,7 +41,7 @@ impl GatewayConfig {
         let cache_ttl_seconds = std::env::var("CACHE_TTL_SECONDS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(600);
+            .unwrap_or(DEFAULT_CACHE_TTL_SECONDS);
 
         Self {
             gateway_port,

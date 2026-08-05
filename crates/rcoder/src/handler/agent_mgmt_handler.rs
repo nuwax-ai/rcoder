@@ -344,9 +344,9 @@ fn read_registry_from_file(
         .map(|m| shared_types::AgentInfo {
             agent_id: m.agent_id,
             install_type: match m.install_type.as_str() {
-                "npm" => shared_types::InstallType::Npm,
-                "url" => shared_types::InstallType::Url,
-                _ => shared_types::InstallType::Binary,
+                "npm" => InstallType::Npm,
+                "url" => InstallType::Url,
+                _ => InstallType::Binary,
             },
             status: shared_types::AgentInstallStatus::Available,
             version: m.version,
@@ -666,7 +666,7 @@ pub async fn install_agent(
 
     // 3. 构造 forward 参数
     let params = InstallAgentParams {
-        agent: shared_types::AgentIdentity {
+        agent: AgentIdentity {
             agent_id: meta.agent.agent_id.clone(),
             command: meta.agent.command.clone(),
             args: meta.agent.args.clone(),

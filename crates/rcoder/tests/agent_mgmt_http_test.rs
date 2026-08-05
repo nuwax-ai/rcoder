@@ -227,28 +227,27 @@ fn build_multipart_body(file_bytes: &[u8], metadata_json: &str) -> (String, Vec<
 /// 1MB 的 multipart 请求应能到达 handler(不触发 body limit)
 #[tokio::test]
 async fn install_route_accepts_1mb_multipart_body() {
-    async fn echo_handler(
-        mut m: axum::extract::Multipart,
-    ) -> Result<String, (axum::http::StatusCode, String)> {
+    async fn echo_handler(mut m: axum::extract::Multipart) -> Result<String, (StatusCode, String)> {
         let mut got_file = 0usize;
         let mut got_meta = String::new();
         while let Some(f) = m
             .next_field()
             .await
-            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("mp: {e}")))?
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("mp: {e}")))?
         {
             match f.name().unwrap_or("") {
                 "file" => {
-                    let b = f.bytes().await.map_err(|e| {
-                        (axum::http::StatusCode::BAD_REQUEST, format!("bytes: {e}"))
-                    })?;
+                    let b = f
+                        .bytes()
+                        .await
+                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bytes: {e}")))?;
                     got_file = b.len();
                 }
                 "metadata" => {
                     got_meta = f
                         .text()
                         .await
-                        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("text: {e}")))?;
+                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("text: {e}")))?;
                 }
                 _ => {
                     let _ = f.bytes().await;
@@ -279,20 +278,18 @@ async fn install_route_accepts_1mb_multipart_body() {
 /// 10MB 的 multipart 请求在 50MB 全局限制下应能通过(用于确认 DefaultBodyLimit 已挂)
 #[tokio::test]
 async fn install_route_accepts_10mb_multipart_body() {
-    async fn echo_handler(
-        mut m: axum::extract::Multipart,
-    ) -> Result<String, (axum::http::StatusCode, String)> {
+    async fn echo_handler(mut m: axum::extract::Multipart) -> Result<String, (StatusCode, String)> {
         let mut got_file = 0usize;
         while let Some(f) = m
             .next_field()
             .await
-            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("mp: {e}")))?
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("mp: {e}")))?
         {
             if f.name().unwrap_or("") == "file" {
                 let b = f
                     .bytes()
                     .await
-                    .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("bytes: {e}")))?;
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("bytes: {e}")))?;
                 got_file = b.len();
             }
         }

@@ -108,7 +108,7 @@ impl super::service::AppService {
             .download_to_file(url, tmp.path(), None, &cancel)
             .await
             .map_err(map_download_error)?;
-        let file_data = tokio::fs::read(tmp.path())
+        let file_data = fs::read(tmp.path())
             .await
             .map_err(|e| map_io_error("failed to read downloaded file", e, false))?;
         // 复用 upload_file：魔数识别 + 解压 + 安全全复用
@@ -135,22 +135,21 @@ impl super::service::AppService {
         let file_size = file_data.len() as u64;
         let dest_clone = canonical_dest.clone();
         // spawn_blocking：写临时文件 + 解压（同步 IO，不阻塞 tokio；TempPath 闭包结束自动删）
-        let count =
-            tokio::task::spawn_blocking(move || -> std::result::Result<usize, ArchiveError> {
-                let mut tmp = tempfile::NamedTempFile::new()?;
-                tmp.write_all(&file_data)?;
-                let tmp_path = tmp.into_temp_path();
-                match file_type.as_str() {
-                    "tar.gz" => extract_tar_gz(&tmp_path, &dest_clone),
-                    "zip" => extract_zip(&tmp_path, &dest_clone),
-                    _ => Err(ArchiveError::InvalidArchive(format!(
-                        "unsupported: {file_type}"
-                    ))),
-                }
-            })
-            .await
-            .map_err(|e| AppOperationError::Backend(format!("extraction task failed: {e}")))?
-            .map_err(map_archive_error)?;
+        let count = tokio::task::spawn_blocking(move || -> Result<usize, ArchiveError> {
+            let mut tmp = tempfile::NamedTempFile::new()?;
+            tmp.write_all(&file_data)?;
+            let tmp_path = tmp.into_temp_path();
+            match file_type.as_str() {
+                "tar.gz" => extract_tar_gz(&tmp_path, &dest_clone),
+                "zip" => extract_zip(&tmp_path, &dest_clone),
+                _ => Err(ArchiveError::InvalidArchive(format!(
+                    "unsupported: {file_type}"
+                ))),
+            }
+        })
+        .await
+        .map_err(|e| AppOperationError::Backend(format!("extraction task failed: {e}")))?
+        .map_err(map_archive_error)?;
 
         if flatten {
             normalize_extracted_dir(&canonical_dest).map_err(map_archive_error)?;

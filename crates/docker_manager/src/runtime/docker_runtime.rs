@@ -208,7 +208,8 @@ impl AgentContainerRuntime for DockerRuntime {
 
     async fn is_container_running(&self, project_id: &str) -> ContainerRuntimeResult<bool> {
         if let Some(info) = self.get_container_info(project_id).await? {
-            Ok(info.status == "running")
+            // 统一走 ContainerStatus 枚举比较（大小写不敏感），不直接比字符串
+            Ok(crate::types::ContainerStatus::from(info.status).is_running())
         } else {
             Ok(false)
         }
@@ -476,7 +477,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                     }
                 }
                 if attempt < 5 {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
             ip
@@ -713,7 +714,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                         let (k, v) = kv.split_once('=')?;
                         Some((k.to_string(), v.to_string()))
                     })
-                    .collect::<std::collections::HashMap<String, String>>()
+                    .collect::<HashMap<String, String>>()
             })
             .filter(|m| !m.is_empty());
         Ok(ContainerSpecSnapshot { command, env })
@@ -999,7 +1000,7 @@ impl DockerRuntime {
                 .unwrap_or_default();
 
             // 构建环境变量映射（包含 project_id 和 service_type）
-            let mut env_vars = std::collections::HashMap::new();
+            let mut env_vars = HashMap::new();
             env_vars.insert("PROJECT_ID".to_string(), c.project_id.clone());
             if let Some(ref user_id) = c.user_id {
                 env_vars.insert("USER_ID".to_string(), user_id.clone());

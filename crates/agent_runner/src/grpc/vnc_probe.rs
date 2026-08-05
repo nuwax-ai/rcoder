@@ -384,7 +384,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             if let Ok((_sock, _)) = listener.accept().await {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
 
@@ -393,11 +393,11 @@ mod tests {
         assert!(!result);
         let elapsed = start.elapsed();
         assert!(
-            elapsed >= std::time::Duration::from_millis(450),
+            elapsed >= Duration::from_millis(450),
             "should wait ~timeout, got {elapsed:?}"
         );
         assert!(
-            elapsed < std::time::Duration::from_millis(1500),
+            elapsed < Duration::from_millis(1500),
             "should not hang, got {elapsed:?}"
         );
     }

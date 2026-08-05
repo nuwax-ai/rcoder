@@ -376,7 +376,10 @@ impl<'a> AgentContainerStarter<'a> {
         }
 
         // 🎯 处理配置文件中的挂载点 (service_config.mounts)
-        let container_name = format!("{}-{}", container_prefix, container_id);
+        // 容器名统一走 DockerUtils::generate_container_name（含合法性校验，与创建路径一致）
+        let container_name =
+            crate::utils::DockerUtils::generate_container_name(&container_prefix, &container_id)
+                .map_err(DockerError::ConfigurationError)?;
         let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
         let log_dir_name = format!("{}-{}", container_name, timestamp);
 

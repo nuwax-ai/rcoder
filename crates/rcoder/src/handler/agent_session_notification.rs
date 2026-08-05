@@ -2,10 +2,8 @@
 //!
 //! 使用 Axum SSE 代理处理 SSE 消息，实现高效的 SSE 转发
 
-#![allow(dead_code)]
-
 use super::utils::{I18nPath, container_identity_from_name};
-use crate::{AppError, HttpResult};
+use crate::HttpResult;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -14,17 +12,17 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use futures_util::{StreamExt, stream::Stream};
-use reqwest::Client;
+use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
-use shared_types::ProjectAndContainerInfo;
 use std::{convert::Infallible, sync::Arc, time::Duration};
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 /// 会话通知路径参数
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
+// pod_id/tenant_id/space_id/isolation_type 是 API 契约预留参数（前端可传，
+// 当前服务端未消费），不可删除，故显式压制 dead_code 警告
+#[allow(dead_code)]
 pub struct SessionNotificationParams {
     /// 会话ID，用于标识特定的会话连接
     #[param(example = "session456")]
@@ -748,8 +746,15 @@ async fn build_sse_stream_from_container_name(
 #[utoipa::path(
     get,
     path = "/agent/progress/{session_id}",
+    // inline 声明 (与项目其他 handler 一致): 避免引用类型时 utoipa 宏展开
+    // 生成限定路径触发 unused_qualifications
     params(
-        SessionNotificationParams
+        ("session_id" = String, Path, description = "会话ID，用于标识特定的会话连接"),
+        ("pod_id" = Option<String>, Query, description = "Pod ID，用于共享容器模式下的容器定位（可选）"),
+        ("tenant_id" = Option<String>, Query, description = "租户ID（可选）"),
+        ("space_id" = Option<String>, Query, description = "空间ID（可选）"),
+        ("isolation_type" = Option<String>, Query, description = "隔离类型（可选），如 project, tenant, space"),
+        ("last_seq" = Option<u64>, Query, description = "客户端消费游标：重连时带上最后收到的 seq 做增量补齐（可选）")
     ),
     responses(
         (
@@ -954,8 +959,15 @@ pub async fn agent_session_notification(
 #[utoipa::path(
     get,
     path = "/computer/agent/progress/{session_id}",
+    // inline 声明 (与项目其他 handler 一致): 避免引用类型时 utoipa 宏展开
+    // 生成限定路径触发 unused_qualifications
     params(
-        SessionNotificationParams
+        ("session_id" = String, Path, description = "会话ID，用于标识特定的会话连接"),
+        ("pod_id" = Option<String>, Query, description = "Pod ID，用于共享容器模式下的容器定位（可选）"),
+        ("tenant_id" = Option<String>, Query, description = "租户ID（可选）"),
+        ("space_id" = Option<String>, Query, description = "空间ID（可选）"),
+        ("isolation_type" = Option<String>, Query, description = "隔离类型（可选），如 project, tenant, space"),
+        ("last_seq" = Option<u64>, Query, description = "客户端消费游标：重连时带上最后收到的 seq 做增量补齐（可选）")
     ),
     responses(
         (
@@ -1077,159 +1089,6 @@ pub async fn computer_agent_progress_notification(
     build_sse_stream_from_container_name(params).await
 }
 
-/// 创建 SSE 代理流
-async fn create_sse_proxy_stream(
-    sse_url: String,
-    session_id: String,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
-
-    // 在后台任务中处理 SSE 连接
-    tokio::spawn(async move {
-        let client = Client::new();
-
-        info!(
-            " [SSE_PROXY] 开始连接容器SSE: url={}, session_id={}",
-            sse_url, session_id
-        );
-
-        match client
-            .get(&sse_url)
-            .header("Accept", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    info!(" [SSE_PROXY] 成功连接到容器SSE: session_id={}", session_id);
-
-                    let mut stream = response.bytes_stream();
-                    let mut buffer = Vec::new();
-
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                buffer.extend_from_slice(&chunk);
-
-                                // 按双换行符分割 SSE 事件
-                                while let Some(event_end) =
-                                    buffer.windows(2).position(|w| w == *b"\n\n")
-                                {
-                                    let event_data = buffer[..event_end].to_vec();
-                                    buffer = buffer[event_end + 2..].to_vec();
-
-                                    if !event_data.is_empty() {
-                                        debug!(
-                                            " [SSE_PROXY] 透传SSE事件: session_id={}, event_len={}",
-                                            session_id,
-                                            event_data.len()
-                                        );
-
-                                        // 直接透传原始 SSE 数据
-                                        if let Ok(event_text) = String::from_utf8(event_data)
-                                            && let Some(event) =
-                                                create_passthrough_event(&event_text)
-                                            && tx.send(Ok(event)).await.is_err()
-                                        {
-                                            warn!(
-                                                " [SSE_PROXY] 客户端已断开连接: session_id={}",
-                                                session_id
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    " [SSE_PROXY] 读取SSE流失败: session_id={}, error={}",
-                                    session_id, e
-                                );
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    error!(
-                        " [SSE_PROXY] 容器SSE连接失败: session_id={}, status={}",
-                        session_id,
-                        response.status()
-                    );
-
-                    // 发送错误事件
-                    let error_event = Event::default().event("error").data(format!(
-                        "container connection failed: {}",
-                        response.status()
-                    ));
-                    if let Err(send_err) = tx.send(Ok(error_event)).await {
-                        warn!(
-                            " [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
-                            session_id, send_err
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                error!(
-                    " [SSE_PROXY] 无法连接到容器SSE: session_id={}, error={}",
-                    session_id, e
-                );
-
-                // 发送连接错误事件
-                let error_event = Event::default()
-                    .event("error")
-                    .data(format!("connection error: {}", e));
-                if let Err(send_err) = tx.send(Ok(error_event)).await {
-                    warn!(
-                        " [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
-                        session_id, send_err
-                    );
-                }
-            }
-        }
-
-        info!(
-            "[SSE_PROXY] SSE proxy connection: session_id={}",
-            session_id
-        );
-    });
-
-    ReceiverStream::new(rx)
-}
-
-/// 创建透传 SSE 事件
-///
-/// 正确解析SSE消息的各个部分，避免重复的data:前缀
-fn create_passthrough_event(event_text: &str) -> Option<Event> {
-    let mut event_type = None;
-    let mut data_lines = Vec::new();
-
-    // 解析SSE消息的各个部分
-    for line in event_text.lines() {
-        if let Some(value) = line.strip_prefix("event:") {
-            event_type = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            data_lines.push(value.trim());
-        }
-    }
-
-    // 只有当有数据内容时才创建事件
-    if !data_lines.is_empty() {
-        let data_content = data_lines.join("\n");
-        let mut event = Event::default().data(data_content);
-
-        // 如果有事件类型，则设置事件类型
-        if let Some(event_type) = event_type {
-            event = event.event(event_type);
-        }
-
-        Some(event)
-    } else {
-        None
-    }
-}
-
 /// 创建错误响应
 fn create_error_response(status: StatusCode, code: &str, message: &str) -> Response {
     let locale = shared_types::current_request_locale();
@@ -1261,36 +1120,5 @@ fn map_error_code_for_locale(code: &str) -> &str {
         "INVALID_DATA" => error_codes::ERR_INVALID_PARAMS,
         error_codes::ERR_INTERNAL_SERVER_ERROR => error_codes::ERR_INTERNAL_SERVER_ERROR,
         _ => error_codes::ERR_UNKNOWN,
-    }
-}
-
-/// 获取容器的 SSE 端点 URL
-async fn get_container_sse_url(
-    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
-    project_id: &str,
-    _agent_info: &ProjectAndContainerInfo,
-    session_id: &str,
-) -> Result<String, AppError> {
-    info!(
-        " [CONTAINER] 获取容器SSE端点: project_id={}, session_id={}",
-        project_id, session_id
-    );
-
-    if let Some(info) = runtime
-        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::WebAgentRunner)
-        .await
-        .map_err(|e| {
-            error!("[CONTAINER] Failed to get container info: {}", e);
-            AppError::internal_server_error(&format!("Failed to get container info: {}", e))
-        })?
-    {
-        // 构建 SSE 端点 URL
-        // info.service_url 格式为 http://ip:8086
-        let sse_url = format!("{}/agent/progress/{}", info.service_url, session_id);
-
-        info!("[CONTAINER] get container SSE: {}", sse_url);
-        Ok(sse_url)
-    } else {
-        Err(AppError::internal_server_error("Container info not found"))
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "process_utils"
+version = "0.1.3"
+edition = "2024"
+license = "Apache-2.0"
+description = "Unix 进程信号工具: 带 PID 1 防御的进程组 kill (file-server / agent_abstraction / app-cli 共用)"
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }

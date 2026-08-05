@@ -36,7 +36,7 @@ pub async fn create_grpc_sse_stream(
     registry: Arc<crate::grpc::SessionStreamRegistry>,
     grpc_addr: String,
     session_id: String,
-    pool: std::sync::Arc<crate::grpc::GrpcChannelPool>,
+    pool: Arc<crate::grpc::GrpcChannelPool>,
     locale: &'static str,
     activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
     last_seq: u64,

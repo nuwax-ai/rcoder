@@ -32,6 +32,7 @@
 pub mod archive;
 pub mod downloader;
 pub mod error;
+pub mod memory;
 
 pub use archive::{
     ArchiveError, detect_file_type, detect_file_type_from_path, extract_tar_gz, extract_zip,
@@ -39,6 +40,10 @@ pub use archive::{
 };
 pub use downloader::{DownloadConfig, Downloader};
 pub use error::DownloadError;
+pub use memory::{
+    CONNECT_TIMEOUT_SECS, DEFAULT_MAX_BYTES, TIMEOUT_SECS, download_bytes_limited,
+    download_text_limited, shared_client,
+};
 
 fn validate_download_filename(filename: &str) -> Result<String, DownloadError> {
     let path = std::path::Path::new(filename);

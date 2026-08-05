@@ -5,6 +5,7 @@ pub mod agent_mgmt_handler;
 mod agent_session_notification;
 mod agent_status_handler;
 mod agent_stop_handler;
+pub(crate) mod chat_forward;
 mod chat_handler;
 mod computer_agent_status_handler;
 mod computer_agent_stop_handler;

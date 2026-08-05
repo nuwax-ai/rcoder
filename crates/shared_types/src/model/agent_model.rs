@@ -468,9 +468,7 @@ impl Drop for AgentLifecycleGuard {
 /// 定义了Agent生命周期管理的基本接口
 pub trait AgentLifecycle: Send + Sync + 'static {
     /// 优雅停止Agent
-    fn graceful_stop(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn graceful_stop(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// 发送取消信号（非阻塞）
     fn cancel(&self);
@@ -511,9 +509,7 @@ impl std::ops::Deref for AgentStopHandle {
 
 // 为AgentLifecycleGuard实现AgentLifecycle trait
 impl AgentLifecycle for AgentLifecycleGuard {
-    fn graceful_stop(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn graceful_stop(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move { self.graceful_stop().await })
     }
 

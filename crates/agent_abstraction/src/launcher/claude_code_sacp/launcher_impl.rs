@@ -702,11 +702,12 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                     use nix::errno::Errno;
                     use nix::sys::signal::{Signal, kill};
                     use nix::unistd::Pid;
-                    if child_pid > 0 {
+                    if child_pid > 1 {
                         // kill(2) 的负数 pid 表示「整个进程组」；子进程以 ProcessGroup::leader() 启动，pgid == child_pid，
                         // 故 -child_pid 能杀掉 claude-code-acp-ts 及其所有 MCP 孙进程。
                         // ⚠️ 绝不能用 libc killpg 并预先取负：killpg 期望正数 pgrp（内部自取负），负数会直接 EINVAL。
                         // 与 lifecycle.rs 的正常关闭路径保持一致。
+                        // ⚠️ child_pid==1 时 kill(-1) 语义是「所有进程组」且 PID 1 信号被内核忽略，必须跳过。
                         let target = Pid::from_raw(-(child_pid as i32));
                         match kill(target, Signal::SIGKILL) {
                             Ok(_) => warn!(
@@ -722,6 +723,11 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                                 child_pid, e, project_id
                             ),
                         }
+                    } else if child_pid == 1 {
+                        warn!(
+                            "[SACP] child_pid==1（容器 PID 1），跳过进程组 kill，依赖 init 收割: project_id={}",
+                            project_id
+                        );
                     }
                 }
                 return Err(anyhow::anyhow!(

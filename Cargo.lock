@@ -1790,6 +1790,8 @@ dependencies = [
 name = "download_utils"
 version = "0.1.3"
 dependencies = [
+ "axum",
+ "bytes 1.12.0",
  "flate2",
  "futures-util",
  "hex",
@@ -2011,6 +2013,7 @@ dependencies = [
  "node-semver",
  "path-clean",
  "percent-encoding",
+ "process_utils",
  "regex",
  "reqwest",
  "serde",
@@ -5793,6 +5796,14 @@ dependencies = [
  "tokio",
  "tracing",
  "windows",
+]
+
+[[package]]
+name = "process_utils"
+version = "0.1.3"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
 ]
 
 [[package]]

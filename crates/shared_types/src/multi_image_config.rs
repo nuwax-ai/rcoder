@@ -71,6 +71,12 @@ pub enum ImageSelectionStrategy {
     ServiceOnly,
 }
 
+/// 镜像缓存默认过期时间（秒，1 小时）——各 crate 的 ttl 默认值单一来源
+pub const IMAGE_CACHE_DEFAULT_TTL_SECS: u64 = 3600;
+
+/// 镜像缓存默认最大条目数
+pub const IMAGE_CACHE_DEFAULT_MAX_ENTRIES: usize = 50;
+
 /// 镜像缓存配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageCacheConfig {
@@ -80,6 +86,16 @@ pub struct ImageCacheConfig {
     pub ttl_seconds: u64,
     /// 最大缓存条目数
     pub max_entries: usize,
+}
+
+impl Default for ImageCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl_seconds: IMAGE_CACHE_DEFAULT_TTL_SECS,
+            max_entries: IMAGE_CACHE_DEFAULT_MAX_ENTRIES,
+        }
+    }
 }
 
 /// 项目级镜像覆盖配置
@@ -334,11 +350,7 @@ impl Default for MultiImageConfig {
             },
             services,
             selection_strategy: ImageSelectionStrategy::ServiceOnly,
-            cache_config: ImageCacheConfig {
-                enabled: true,
-                ttl_seconds: 3600, // 1小时
-                max_entries: 50,   // 适合双服务的缓存大小
-            },
+            cache_config: ImageCacheConfig::default(), // 适合双服务的默认缓存参数
         }
     }
 }
@@ -490,11 +502,7 @@ pub fn create_legacy_multi_image_config(
         global_defaults,
         services,
         selection_strategy: ImageSelectionStrategy::ServiceOnly,
-        cache_config: ImageCacheConfig {
-            enabled: true,
-            ttl_seconds: 3600,
-            max_entries: 50,
-        },
+        cache_config: ImageCacheConfig::default(),
     }
 }
 

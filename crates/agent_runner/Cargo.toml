@@ -40,6 +40,9 @@ otel = []  # 启用 OpenTelemetry 追踪功能
 # Pyroscope 连续性能分析
 pyroscope = ["dep:pyroscope"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # Internal crates
 shared_types = { workspace = true }

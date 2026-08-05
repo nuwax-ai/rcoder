@@ -762,7 +762,7 @@ pub async fn handle_chat_core(
 
     // ========== 步骤9: 等待响应（5 分钟超时）==========
     match tokio::time::timeout(
-        std::time::Duration::from_secs(300),
+        Duration::from_secs(300),
         context.agent_session_service.process_request(agent_request),
     )
     .await

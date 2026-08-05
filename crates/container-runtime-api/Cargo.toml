@@ -7,6 +7,9 @@ license.workspace = true
 description.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 shared_types = { workspace = true }
 async-trait = { workspace = true }

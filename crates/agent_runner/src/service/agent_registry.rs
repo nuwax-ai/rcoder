@@ -390,7 +390,7 @@ impl AgentSessionRegistry {
         use tokio::sync::mpsc;
 
         match self.agent_info_map.entry(project_id.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            Entry::Occupied(mut entry) => {
                 // 已存在：仅当 Idle 时更新为 Pending
                 let info = entry.get_mut();
                 if info.status == AgentStatus::Idle {
@@ -402,7 +402,7 @@ impl AgentSessionRegistry {
                     );
                 }
             }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
+            Entry::Vacant(entry) => {
                 // 不存在：创建占位记录（使用有界通道，容量由常量定义）
                 let (prompt_tx, _) = mpsc::channel(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY);
                 let (cancel_tx, _) = mpsc::channel(shared_types::AGENT_CANCEL_CHANNEL_CAPACITY);

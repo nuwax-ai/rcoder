@@ -73,4 +73,4 @@ impl fmt::Display for AppOperationError {
 impl std::error::Error for AppOperationError {}
 
 /// app service 操作返回类型
-pub type AppResult<T> = std::result::Result<T, AppOperationError>;
+pub type AppResult<T> = Result<T, AppOperationError>;

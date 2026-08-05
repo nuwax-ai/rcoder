@@ -205,7 +205,7 @@ pub async fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
 fn init_tracing_subscriber(
     service_name: &str,
     tracer_provider: Option<&SdkTracerProvider>,
-    file_log_config: Option<&config::FileLogConfig>,
+    file_log_config: Option<&FileLogConfig>,
 ) -> Result<()> {
     use opentelemetry::trace::TracerProvider;
 

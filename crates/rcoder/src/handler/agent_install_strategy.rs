@@ -219,7 +219,7 @@ pub async fn ensure_agent_installed(
         )
     })?;
 
-    let routing = shared_types::RoutingParams {
+    let routing = RoutingParams {
         project_id: Some(project_id.to_string()),
         ..Default::default()
     };

@@ -5,6 +5,9 @@ use tracing::warn;
 
 use container_runtime_api::HttpExpose;
 
+/// Gateway NodePort 默认值（未配置时使用）
+const DEFAULT_GATEWAY_NODE_PORT: u16 = 30080;
+
 /// 从 env `RCODER_APP_HTTP_EXPOSE` 读取 HTTP 暴露策略（pingora|gateway，默认 pingora）。
 /// 无效值 warn 后回退 Pingora（Fail Fast：显眼告警，避免静默走错模式）。
 /// **必须与 `docker_manager::kubernetes_runtime` 同源读取**，保证 service 层与 K8s 后端一致。
@@ -156,6 +159,6 @@ impl AppManagerConfig {
 
     /// 获取 Gateway NodePort
     pub fn get_gateway_node_port(&self) -> u16 {
-        self.gateway_node_port.unwrap_or(30080)
+        self.gateway_node_port.unwrap_or(DEFAULT_GATEWAY_NODE_PORT)
     }
 }

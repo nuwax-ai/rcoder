@@ -386,11 +386,7 @@ mod tests {
             },
             services,
             selection_strategy: ImageSelectionStrategy::ServiceOnly,
-            cache_config: ImageCacheConfig {
-                enabled: true,
-                ttl_seconds: 3600,
-                max_entries: 50,
-            },
+            cache_config: ImageCacheConfig::default(),
         }
     }
 

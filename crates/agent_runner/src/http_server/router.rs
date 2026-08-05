@@ -52,7 +52,7 @@ impl AppState {
     /// P0-1: 设置 agent management 状态(在 main.rs 中注册)
     pub fn with_agent_mgmt(
         mut self,
-        registry: std::sync::Arc<crate::agent_mgmt::AgentRegistry>,
+        registry: Arc<crate::agent_mgmt::AgentRegistry>,
         path_manager: crate::agent_mgmt::PathManager,
     ) -> Self {
         self.agent_mgmt_http_state = Some(

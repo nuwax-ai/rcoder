@@ -404,10 +404,11 @@ async fn shutdown_all(mut children: Vec<(String, Child)>, shutdown_timeout_secon
 /// 向子进程发 SIGTERM（unix）；其他平台无 SIGTERM，退化为 SIGKILL。
 #[cfg(unix)]
 fn send_term(child: &mut Child) {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-    if let Some(pid) = child.id() {
-        let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
+    if let Some(pid) = child.id()
+        && !process_utils::kill_process_group(pid, process_utils::KillSignal::SIGTERM)
+    {
+        // 信号未送达通常意味进程已退出; 仅 debug 留痕 (PID1 防御见 process_utils)
+        tracing::debug!(pid, "send_term: signal not delivered");
     }
 }
 
@@ -418,10 +419,10 @@ fn send_term(child: &mut Child) {
 
 #[cfg(unix)]
 fn send_kill(child: &mut Child) {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-    if let Some(pid) = child.id() {
-        let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+    if let Some(pid) = child.id()
+        && !process_utils::kill_process_group(pid, process_utils::KillSignal::SIGKILL)
+    {
+        tracing::debug!(pid, "send_kill: signal not delivered");
     }
 }
 

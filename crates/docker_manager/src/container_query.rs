@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions, LogsOptions};
+use bollard::query_parameters::{InspectContainerOptions, LogsOptions};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use shared_types::ContainerBasicInfo;
@@ -60,126 +60,6 @@ impl DockerManager {
     // Realtime Docker API queries
     // ========================================================================
 
-    /// 通过多种方式查找容器：project_id 或容器名称
-    ///
-    /// # ⚠️ 已废弃
-    ///
-    /// 此方法返回的容器信息可能包含过期的 `container_id`。
-    ///
-    /// **推荐使用**：
-    /// - [`find_container_realtime`](Self::find_container_realtime) - 实时查询 Docker API，获取最新的容器信息和 ID
-    ///
-    /// **问题**：
-    /// - 返回的 `container_id` 可能是缓存中的旧值
-    /// - 容器重启后 ID 会变化，导致使用旧 ID 操作失败（404 错误）
-    ///
-    /// **迁移指南**：
-    /// ```text
-    /// // ❌ 旧方式（可能使用过期的 container_id）
-    /// if let Some(info) = docker_manager.find_container_by_identifier("container_name").await {
-    ///     docker_manager.stop_container_by_id(&info.container_id).await?;
-    /// }
-    ///
-    /// // ✅ 新方式（获取最新的 container_id）
-    /// if let Ok(Some((container_id, _, _, _))) =
-    ///     docker_manager.find_container_realtime("container_name").await
-    /// {
-    ///     docker_manager.stop_container_by_id(&container_id).await?;
-    /// }
-    /// ```
-    #[deprecated(
-        since = "0.1.0",
-        note = "返回的 container_id 可能过期。请使用 find_container_realtime() 获取最新的容器信息"
-    )]
-    pub async fn find_container_by_identifier(
-        &self,
-        identifier: &str,
-    ) -> Option<DockerContainerInfo> {
-        // 1. 首先尝试通过 project_id 查找
-        if let Some(info) = self.containers.get(identifier).await {
-            return Some(info);
-        }
-
-        // 2. 如果没找到，尝试通过容器名称查找
-        for info in self.containers.list().await {
-            if info.container_name == identifier {
-                return Some(info);
-            }
-        }
-
-        // 3. 如果还没找到，尝试通过 Docker API 直接查找容器（适用于容器存在但映射缺失的情况）
-        let options = Some(ListContainersOptions {
-            all: true,
-            ..Default::default()
-        });
-
-        if let Ok(containers) = self.docker.list_containers(options).await {
-            for container in containers {
-                if let Some(names) = container.names {
-                    for name in names {
-                        // Docker 容器名称通常以 '/' 开头，需要去掉
-                        let clean_name = name.trim_start_matches('/');
-                        if clean_name == identifier {
-                            let container_id = container.id.clone().unwrap_or_default();
-                            info!(
-                                "Found container via Docker API: {} (ID: {})",
-                                identifier, container_id
-                            );
-
-                            // 🛡️ 从容器信息中获取真实的创建时间
-                            // 使用统一的时间戳解析函数
-                            let created_at = if let Some(created_timestamp) = container.created {
-                                // list_containers API 返回的是 Unix 秒时间戳
-                                Self::parse_unix_timestamp(
-                                    created_timestamp,
-                                    &format!("container {}", clean_name),
-                                )
-                                .unwrap_or_else(|e| {
-                                    warn!(
-                                        "parse container created failed: {}, retry with current time",
-                                        e
-                                    );
-                                    Utc::now()
-                                })
-                            } else {
-                                warn!(
-                                    "Container missing creation time info, using current time as fallback: container_id={}",
-                                    container_id
-                                );
-                                Utc::now()
-                            };
-
-                            // 创建一个临时的容器信息，用于销毁
-                            return Some(DockerContainerInfo {
-                                container_id,
-                                container_name: clean_name.to_string(),
-                                project_id: "unknown".to_string(), // 我们无法直接知道 project_id
-                                user_id: None,
-                                service_type: None,
-                                image: container.image.unwrap_or_default(),
-                                status: ContainerStatus::Unknown(
-                                    "found_via_docker_api".to_string(),
-                                ),
-                                created_at,
-                                started_at: None,
-                                host_path: String::new(),
-                                container_path: String::new(),
-                                port_bindings: std::collections::HashMap::new(),
-                                assigned_port: 0,
-                                health_status: None,
-                                service_health: None,
-                                internal_port: 0,
-                                network_name: "unknown".to_string(), // 临时容器信息，网络名称未知
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
     /// 检查指定ID的容器是否正在运行
     pub async fn is_container_running(&self, container_id: &str) -> DockerResult<bool> {
         match self
@@ -210,8 +90,7 @@ impl DockerManager {
 
     /// 实时查询容器状态（使用缓存 + 超时保护）
     ///
-    /// 与 `find_container_by_identifier` 不同，此方法跳过内存缓存，
-    /// 直接查询 Docker API 获取最新的容器状态。
+    /// 此方法直接查询 Docker API 获取最新的容器状态（返回的 container_id 保证新鲜）。
     ///
     /// 🔧 优化：使用 Moka 缓存减少 Docker API 调用，使用超时保护防止阻塞
     /// 📝 缓存策略：同时缓存 container_id 和 container_name，支持 404 响应缓存
@@ -495,6 +374,7 @@ impl DockerManager {
     ///
     /// # 注意
     /// Docker 的 list_containers API 返回的是 Unix **秒**时间戳，不是毫秒
+    #[cfg(test)]
     pub(crate) fn parse_unix_timestamp(
         timestamp_secs: i64,
         context: &str,
@@ -816,7 +696,10 @@ impl DockerManager {
                 service_type.container_prefix().to_string()
             }
         };
-        let expected_container_name = format!("{}-{}", prefix, project_id);
+        // 容器名统一走 DockerUtils::generate_container_name（含合法性校验，与创建路径一致）
+        let expected_container_name =
+            crate::utils::DockerUtils::generate_container_name(&prefix, project_id)
+                .map_err(DockerError::ConfigurationError)?;
 
         // 直接返回 find_container_realtime 的结果
         self.find_container_realtime(&expected_container_name).await
@@ -1007,7 +890,10 @@ impl DockerManager {
                 service_type.container_prefix().to_string()
             }
         };
-        let expected_container_name = format!("{}-{}", prefix, user_id);
+        // 容器名统一走 DockerUtils::generate_container_name（含合法性校验，与创建路径一致）
+        let expected_container_name =
+            crate::utils::DockerUtils::generate_container_name(&prefix, user_id)
+                .map_err(DockerError::ConfigurationError)?;
 
         // 直接返回 find_container_realtime 的结果
         self.find_container_realtime(&expected_container_name).await
@@ -1134,7 +1020,7 @@ impl DockerManager {
 
         // idle 超时：daemon 卡顿/网络挂起时 log_stream.next() 既不产出也不报错，
         // 会永久阻塞调用方。每条 chunk 间最多等 30s，超时则返回已累积的部分日志。
-        const LOG_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const LOG_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
         let mut log_stream = self
             .docker
@@ -1188,10 +1074,7 @@ mod tests {
 
         // 直接调用 Docker API 获取容器信息
         match docker
-            .inspect_container(
-                container_name,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
+            .inspect_container(container_name, None::<InspectContainerOptions>)
             .await
         {
             Ok(details) => {
@@ -1381,13 +1264,13 @@ mod tests {
         println!("✅ container already started");
 
         // 等待容器完全启动
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // 3. 使用 list_containers API 获取 Unix 时间戳
         println!("\n📋 testing list_containers API (Unix timestamp):");
         println!("─────────────────────────────────────────");
 
-        let mut filters = std::collections::HashMap::new();
+        let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![container_name.clone()]);
 
         let list_options = ListContainersOptionsBuilder::default()

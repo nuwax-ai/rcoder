@@ -16,6 +16,9 @@ dist = true
 name = "rcoder-cli"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 # Internal crates
 agent_abstraction = { workspace = true }

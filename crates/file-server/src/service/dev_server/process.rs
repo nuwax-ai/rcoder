@@ -365,17 +365,14 @@ where
 
 // ── unix: 进程组信号 (kill -pgid) ──────────────────────────────────────────
 /// 杀进程组 (对齐 nuwax killProcess): 优先 kill(-pid) SIGTERM, 降级 kill(pid)。
+/// PID 1 防御统一封装在 [`process_utils`]。
 /// 返回是否成功送出信号。
 #[cfg(unix)]
 pub fn kill_process_group(pid: u32) -> bool {
     let Some(process_pid) = system_pid(pid) else {
         return false;
     };
-    let pgid = Pid::from_raw(-process_pid.as_raw());
-    match kill(pgid, Signal::SIGTERM) {
-        Ok(()) => true,
-        Err(_) => kill(process_pid, Signal::SIGTERM).is_ok(),
-    }
+    process_utils::kill_process_group_with_fallback(process_pid.as_raw() as u32, Signal::SIGTERM)
 }
 
 /// 强杀进程组 (SIGKILL 升级): SIGTERM 宽限期后进程仍存活时调用, 优先 kill(-pid) SIGKILL, 降级 kill(pid)。
@@ -384,11 +381,7 @@ pub fn kill_process_group_force(pid: u32) -> bool {
     let Some(process_pid) = system_pid(pid) else {
         return false;
     };
-    let pgid = Pid::from_raw(-process_pid.as_raw());
-    match kill(pgid, Signal::SIGKILL) {
-        Ok(()) => true,
-        Err(_) => kill(process_pid, Signal::SIGKILL).is_ok(),
-    }
+    process_utils::kill_process_group_with_fallback(process_pid.as_raw() as u32, Signal::SIGKILL)
 }
 
 /// 读取进程组 ID，用于 stop 去重：同一 Vite/pnpm 进程树只需 kill 一次。

@@ -472,8 +472,18 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        // 等待服务器就绪
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // 轮询等待服务器就绪（避免固定 sleep 在高负载 CI 上不可靠）
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "test server did not become ready within 2s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         addr
     }
 
@@ -570,8 +580,8 @@ mod tests {
         let addr = start_server(app).await;
         let url = format!("http://{}/file", addr);
 
-        let dest = std::env::temp_dir().join("test-download-basic.bin");
-        let _ = std::fs::remove_file(&dest);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
 
         let max_bytes = test_data().len() as u64 * 2; // 足够大
         let result =
@@ -584,12 +594,9 @@ mod tests {
                 assert_eq!(file_content, test_data());
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&dest);
                 panic!("download failed: {}", e);
             }
         }
-
-        let _ = std::fs::remove_file(&dest);
     }
 
     /// 测试 max_bytes 限制（下载过程中超限）
@@ -599,8 +606,8 @@ mod tests {
         let addr = start_server(app).await;
         let url = format!("http://{}/file", addr);
 
-        let dest = std::env::temp_dir().join("test-download-maxbytes.bin");
-        let _ = std::fs::remove_file(&dest);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
 
         // max_bytes 小于文件大小（100KB），下载过程中触发 BinaryTooLarge
         let max_bytes = 30 * 1024u64; // 30KB
@@ -615,12 +622,9 @@ mod tests {
                 assert!(size > max_bytes, "size should exceed max_bytes");
             }
             other => {
-                let _ = std::fs::remove_file(&dest);
                 panic!("expected BinaryTooLarge, got: {:?}", other);
             }
         }
-
-        let _ = std::fs::remove_file(&dest);
     }
 
     /// 测试 404 错误不重试（本地服务器）
@@ -630,8 +634,8 @@ mod tests {
         let addr = start_server(app).await;
         let url = format!("http://{}/notfound", addr);
 
-        let dest = std::env::temp_dir().join("test-download-404.bin");
-        let _ = std::fs::remove_file(&dest);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
 
         let result = download_to_file(&url, &dest, 1024, None, &CancellationToken::new()).await;
 
@@ -644,12 +648,9 @@ mod tests {
                 );
             }
             other => {
-                let _ = std::fs::remove_file(&dest);
                 panic!("expected InstallFailed with HTTP 404, got: {:?}", other);
             }
         }
-
-        let _ = std::fs::remove_file(&dest);
     }
 
     #[tokio::test]
@@ -657,7 +658,8 @@ mod tests {
         let app = Router::new().route("/slow", get(handler_slow));
         let addr = start_server(app).await;
         let url = format!("http://{addr}/slow");
-        let dest = std::env::temp_dir().join("test-download-cancel.bin");
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
         std::fs::write(&dest, b"partial").expect("partial download");
         let cancel = CancellationToken::new();
         let cancel_task = cancel.clone();
@@ -688,8 +690,8 @@ mod tests {
         let addr = start_server(app).await;
         let url = format!("http://{}/file", addr);
 
-        let dest = std::env::temp_dir().join("test-download-resume.bin");
-        let _ = std::fs::remove_file(&dest);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
 
         // Step 1: 手动下载前 30KB（模拟中断）
         let partial_size = 30 * 1024usize;
@@ -737,12 +739,9 @@ mod tests {
                 );
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&dest);
                 panic!("resume download failed: {}", e);
             }
         }
-
-        let _ = std::fs::remove_file(&dest);
     }
 
     /// 测试不支持 Range 的服务器（模拟 MinIO）
@@ -755,8 +754,8 @@ mod tests {
         let addr = start_server(app).await;
         let url = format!("http://{}/file", addr);
 
-        let dest = std::env::temp_dir().join("test-download-noresume.bin");
-        let _ = std::fs::remove_file(&dest);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
 
         // 先写入部分数据模拟中断
         let partial = vec![0xABu8; 30 * 1024];
@@ -781,11 +780,8 @@ mod tests {
                 );
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&dest);
                 panic!("unexpected error: {}", e);
             }
         }
-
-        let _ = std::fs::remove_file(&dest);
     }
 }

@@ -625,7 +625,7 @@ async fn query_container_status(
 
     // 发送请求（带超时）
     let response =
-        tokio::time::timeout(config.query_timeout, client.get_container_status(request)).await??;
+        time::timeout(config.query_timeout, client.get_container_status(request)).await??;
 
     let status_response = response.into_inner();
 

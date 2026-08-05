@@ -373,7 +373,9 @@ impl AgentLifecycleGuard {
 
     /// 优雅停止agent
     ///
-    /// 带超时机制（5秒），超时后强制 kill 进程组
+    /// 带升级机制：SIGTERM → 等 500ms → SIGKILL（见 kill_process_group）。
+    /// 注：容器内子进程若为 PID 1 则信号被内核忽略，此时跳过进程组信号、
+    /// 仅发 cancel 信号并依赖 init 收割（见 kill_process_group 的 pgid==1 防御）。
     ///
     /// ## 进程组终止
     ///
@@ -456,6 +458,20 @@ impl AgentLifecycleGuard {
             if pgid == 0 {
                 warn!(
                     "[LifecycleGuard] 进程组 ID 为 0，跳过进程组终止（可能是初始化失败）: project_id={}",
+                    self.inner.project_id
+                );
+                return Ok(());
+            }
+
+            // 🔥 PID 1 防御：子进程以 ProcessGroup::leader() 启动，pgid == child_pid。
+            // 在 docker exec 等场景子进程可能拿到 pid 1，此时：
+            // - kill(-1, SIG) 语义是「所有进程组」，绝不能发；
+            // - 内核默认忽略 PID 1 的未注册信号（含 SIGTERM/SIGKILL）。
+            // 依赖容器内 init（如 tini）兼作孤儿进程收割者（见本模块顶部说明）。
+            if pgid == 1 {
+                warn!(
+                    "[LifecycleGuard] pgid==1（子进程为容器 PID 1），跳过进程组信号终止，\
+                     仅依赖 cancel 信号与 init 收割: project_id={}",
                     self.inner.project_id
                 );
                 return Ok(());
@@ -633,9 +649,7 @@ impl Drop for AgentLifecycleGuard {
 
 // 为AgentLifecycleGuard实现AgentLifecycle trait
 impl AgentLifecycle for AgentLifecycleGuard {
-    fn graceful_stop(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn graceful_stop(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move { AgentLifecycleGuard::graceful_stop(self).await })
     }
 

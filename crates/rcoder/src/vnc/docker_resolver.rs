@@ -89,8 +89,9 @@ impl CachedDockerResolver {
                 VncResolveError::ContainerNotFound(user_id.to_string())
             })?;
 
-        // 检查容器状态
-        let is_running = container_info.status.to_lowercase() == "running";
+        // 检查容器状态（统一走 ContainerStatus 枚举比较，不直接比字符串）
+        let is_running =
+            docker_manager::ContainerStatus::from(container_info.status.clone()).is_running();
         if !is_running {
             warn!(
                 "⚠️ [VNC_RESOLVER] Container not running: user_id={}, status={}",
@@ -212,12 +213,12 @@ mod tests {
     #[test]
     fn test_resolver_creation() {
         let resolver = CachedDockerResolver::new(stub_runtime());
-        assert!(std::mem::size_of_val(&resolver) > 0);
+        assert!(size_of_val(&resolver) > 0);
     }
 
     #[test]
     fn test_custom_ttl() {
         let resolver = CachedDockerResolver::with_ttl(Duration::from_secs(10), stub_runtime());
-        assert!(std::mem::size_of_val(&resolver) > 0);
+        assert!(size_of_val(&resolver) > 0);
     }
 }

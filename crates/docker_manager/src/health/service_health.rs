@@ -4,7 +4,7 @@
 //! 这是对 Docker 容器状态检查的补充，用于确认容器内服务是否真正可用。
 
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use moka::sync::Cache as MokaCache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -16,11 +16,16 @@ use tracing::{debug, warn};
 /// 默认 HTTP 健康检查端口
 pub const DEFAULT_HTTP_HEALTH_PORT: u16 = 8086;
 
-/// 默认 gRPC 服务端口
-pub const DEFAULT_GRPC_PORT: u16 = 50051;
+// gRPC 端口统一使用 shared_types::GRPC_DEFAULT_PORT（消除与 shared_types/constants.rs 的双定义）
 
 /// 服务健康检查超时时间（秒）
 const HEALTH_CHECK_TIMEOUT_SECS: u64 = 3;
+
+/// gRPC channel 缓存空闲过期 (分钟): 容器销毁/重建后旧 channel 自动淘汰。
+const CHANNEL_CACHE_TTL_MINS: u64 = 10;
+
+/// gRPC channel 缓存容量上限: 防容器频繁创建销毁时无界增长。
+const CHANNEL_CACHE_MAX_CAPACITY: u64 = 1024;
 
 /// 服务健康状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,9 +75,10 @@ pub struct ServiceHealthChecker {
     http_port: u16,
     grpc_port: u16,
     timeout_secs: u64,
-    /// gRPC channel 缓存，避免每次健康检查都创建新连接
-    /// Key: IP 地址，Value: 复用的 Channel
-    channel_cache: Arc<DashMap<String, Channel>>,
+    /// gRPC channel 缓存，避免每次健康检查都创建新连接。
+    /// Key: IP 地址，Value: 复用的 Channel。
+    /// 用 moka 替代无界 DashMap: 空闲 TTL + 容量上限, 容器频繁创建销毁不会泄漏。
+    channel_cache: Arc<MokaCache<String, Channel>>,
 }
 
 impl ServiceHealthChecker {
@@ -84,9 +90,14 @@ impl ServiceHealthChecker {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             http_port: DEFAULT_HTTP_HEALTH_PORT,
-            grpc_port: DEFAULT_GRPC_PORT,
+            grpc_port: shared_types::GRPC_DEFAULT_PORT,
             timeout_secs: HEALTH_CHECK_TIMEOUT_SECS,
-            channel_cache: Arc::new(DashMap::new()),
+            channel_cache: Arc::new(
+                MokaCache::builder()
+                    .time_to_idle(Duration::from_secs(CHANNEL_CACHE_TTL_MINS * 60))
+                    .max_capacity(CHANNEL_CACHE_MAX_CAPACITY)
+                    .build(),
+            ),
         }
     }
 
@@ -103,7 +114,7 @@ impl ServiceHealthChecker {
     async fn get_or_create_channel(&self, addr: &str) -> Result<Channel, String> {
         // 尝试从缓存获取
         if let Some(channel) = self.channel_cache.get(addr) {
-            return Ok(channel.clone());
+            return Ok(channel);
         }
 
         // 创建新 channel

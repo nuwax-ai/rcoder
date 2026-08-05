@@ -10,7 +10,7 @@ RCoder 是一个基于 ACP (Agent Client Protocol) 的 AI 驱动开发平台，�
 
 ### 工作空间结构
 - **Workspace**: 使用 Cargo workspace 管理多个 crate
-- **主要 crate**: `rcoder` (主应用), `agent_runner` (代理运行时), `shared_types` (共享类型), `docker_manager` (容器管理), `pingora-proxy` (反向代理)
+- **主要 crate**: `rcoder` (主应用), `agent_runner` (代理运行时), `docker_manager` (容器管理), `rcoder-proxy` (反向代理), `shared_types` (共享类型), `shared_types_grpc` (gRPC proto 定义), `agent_abstraction` (ACP 代理连接), `app_manager` (UserApp 管理), `container-runtime-api` (容器运行时抽象), `file-server` (独立文件服务), `rcoder-telemetry` (可观测性)
 
 ### 容器化架构设计
 项目采用动态容器化架构，每个项目对应一个独立的 Docker 容器：
@@ -39,7 +39,7 @@ RCoder (转换为 SSE)
 - `CancelSession`: 取消正在执行的会话
 - `GetStatus`: 查询 Agent 状态
 
-**Proto 定义位置**: `crates/shared_types/proto/agent.proto`
+**Proto 定义位置**: `crates/shared_types_grpc/proto/agent.proto`
 
 ### 核心组件
 - **DockerManager**: 全局容器管理器，负责容器生命周期
@@ -116,7 +116,7 @@ make update-image-tag
 ## 重要技术细节
 
 ### gRPC 通信架构
-- 使用 **Tonic 0.14.2** 实现 gRPC 服务端和客户端
+- 使用 **Tonic 0.14** 实现 gRPC 服务端和客户端
 - Proto 文件使用 **Protobuf oneof** 实现类型安全的事件系统，完全消除 JSON 序列化
 - **GrpcChannelPool** 基于 DashMap 提供高效的连接复用
 - **Server Streaming** 用于实时推送进度事件（替代轮询）
@@ -124,10 +124,10 @@ make update-image-tag
 - gRPC 默认端口：`50051`（定义在 `shared_types::GRPC_DEFAULT_PORT`）
 
 **关键文件**：
-- `crates/shared_types/proto/agent.proto` - Proto 定义
+- `crates/shared_types_grpc/proto/agent.proto` - Proto 定义
 - `crates/rcoder/src/grpc/channel_pool.rs` - 连接池
 - `crates/rcoder/src/grpc/chat_client.rs` - gRPC 客户端
-- `crates/agent_runner/src/grpc/agent_service_impl.rs` - gRPC 服务实现
+- `crates/agent_runner/src/grpc/mod.rs` - gRPC 服务实现（`AgentServiceImpl` 定义，方法实现拆分至 `chat.rs`/`subscribe_progress.rs`/`cancel.rs`/`status.rs`/`permission.rs` 等子文件）
 
 ### ACP 协议集成
 - 使用 `agent-client-protocol = "2"`（官方 SDK），schema 走 `agent_client_protocol::schema::v1`，v1 是稳定 wire 协议
@@ -210,39 +210,9 @@ COMPOSE_PROJECT_NAME=rcoder                 # Docker Compose 项目名
 ```
 
 ### 开发环境要求
-- Rust 1.75+ (2024 Edition)
+- Rust 1.85+ (2024 Edition, edition 2024 最低要求 1.85)
 - Docker 和 Docker Compose
 - Claude Code CLI (可选)
-
-## API 接口
-
-### 核心端点
-- `POST /chat`: 发送聊天消息到 AI 代理 (支持 `pod_id`, `tenant_id`, `space_id`, `isolation_type` 多租户参数)
-- `POST /computer/chat`: Computer Agent 聊天接口 (支持多租户参数)
-- `GET /agent/progress/{session_id}`: SSE 进度流，接收实时通知
-- `POST /agent/session/cancel`: 取消正在执行的任务
-- `POST /agent/stop`: 停止 Agent
-- `GET /agent/status/{project_id}`: 查询 Agent 状态
-- `POST /pod/ensure`: 确保容器存在，支持多租户参数
-- `POST /pod/restart`: 重启容器，支持多租户参数
-- `GET /health`: 健康检查
-
-### Pingora 反向代理
-- `GET /proxy/{port}/{path}`: 端口路由到指定后端服务
-- `GET /proxy/status`: 查看代理服务状态
-- `GET /proxy/stats`: 查看代理统计信息
-
-### 响应格式
-所有 API 响应都使用统一的 HttpResult 格式：
-```rust
-struct HttpResult<T> {
-    success: bool,
-    data: Option<T>,
-    code: String,        // 业务错误码
-    message: String,     // 错误描述
-    tid: Option<String>, // 追踪ID
-}
-```
 
 ## 特殊注意事项
 

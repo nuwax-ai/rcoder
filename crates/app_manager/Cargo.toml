@@ -9,6 +9,9 @@ default = []
 # 由 rcoder 的 kubernetes feature 转发开启，保持双后端编译期同源。
 kubernetes = []
 
+[lints]
+workspace = true
+
 [dependencies]
 # Internal crates
 container-runtime-api = { workspace = true }

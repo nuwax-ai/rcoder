@@ -170,6 +170,9 @@ pub(crate) async fn serve_computer(
         Ok(root) => root,
         Err(error) => return error.into_response(),
     };
+    // customTargetDir 非空 → 完全覆盖根 (对齐 nuwax, 不拼 user/cId);
+    // 注: 不做根目录白名单限制 —— 容器内内网部署, 且用户客户端复用本模块逻辑,
+    // 每个用户电脑上的路径各不相同, 限制根路径会误伤正常业务。
     let root = match q
         .custom_target_dir
         .as_deref()
@@ -243,6 +246,8 @@ fn add_cors_headers(mut resp: Response, origin: Option<&str>, cors: &CorsConfig)
         HeaderName::from_static("access-control-expose-headers"),
         HeaderValue::from_str(cors.expose_headers).unwrap_or_else(|_| HeaderValue::from_static("")),
     );
+    // 注: CORS 凭据策略不在本层拦截 —— 前置有网关/代理系统,
+    // 需要收紧时由前置系统统一处理, file-server 保持原行为 (有 Origin 即下发凭据头)。
     if origin.is_some() {
         let _ = headers.insert(
             HeaderName::from_static("access-control-allow-credentials"),
@@ -310,5 +315,38 @@ mod tests {
         // dotfiles allow: .env / .git/config 不被隐藏拦截 (ensure_within 只防穿越)
         assert!(crate::path_safety::ensure_within(root, ".env").is_ok());
         assert!(crate::path_safety::ensure_within(root, ".git/config").is_ok());
+    }
+
+    #[test]
+    fn cors_headers_echo_origin_with_credentials() {
+        // 有 Origin: 回显 + 凭据头 (CORS 拦截由前置网关负责, 本层不做)
+        let resp = add_cors_headers(
+            StatusCode::OK.into_response(),
+            Some("http://client.example.com"),
+            &PAGE_CORS,
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "http://client.example.com"
+        );
+        assert_eq!(
+            resp.headers().get("access-control-allow-credentials"),
+            Some(&HeaderValue::from_static("true"))
+        );
+        // 无 Origin: `*` 且无凭据头
+        let resp = add_cors_headers(StatusCode::OK.into_response(), None, &PAGE_CORS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+        assert!(
+            resp.headers()
+                .get("access-control-allow-credentials")
+                .is_none()
+        );
     }
 }

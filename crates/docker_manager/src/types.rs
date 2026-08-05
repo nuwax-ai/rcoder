@@ -176,8 +176,8 @@ impl ContainerQueryResult {
             container_name: tuple.1,
             status: tuple.2,
             is_running: tuple.3,
-            container_ip: String::new(),    // 默认为空，需要后续更新
-            created_at: chrono::Utc::now(), // 兼容旧代码，使用当前时间
+            container_ip: String::new(), // 默认为空，需要后续更新
+            created_at: Utc::now(),      // 兼容旧代码，使用当前时间
         }
     }
 
@@ -269,11 +269,11 @@ impl DockerContainerInfo {
             service_type: None,
             image,
             status: ContainerStatus::Running,
-            created_at: chrono::Utc::now(),
-            started_at: Some(chrono::Utc::now()),
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
             host_path: String::new(),
             container_path: String::new(),
-            port_bindings: std::collections::HashMap::new(),
+            port_bindings: HashMap::new(),
             assigned_port: 0,
             health_status: None,
             service_health: None,
@@ -355,6 +355,13 @@ impl From<String> for ContainerStatus {
             "dead" => ContainerStatus::Dead,
             _ => ContainerStatus::Unknown(status),
         }
+    }
+}
+
+impl ContainerStatus {
+    /// 是否处于运行中（替代各处的 `status == "running"` 字符串比较）
+    pub fn is_running(&self) -> bool {
+        matches!(self, ContainerStatus::Running)
     }
 }
 

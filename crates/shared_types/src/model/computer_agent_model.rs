@@ -521,7 +521,7 @@ mod tests {
         let old_activity = project.last_activity;
 
         // 等待一小段时间确保时间戳变化
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
 
         project.update_session("session_456".to_string());
         assert_eq!(project.session_id, Some("session_456".to_string()));

@@ -13,6 +13,9 @@ default = []
 # Windows 不支持 Pingora，禁用此 feature 时直接使用真实的 API Key 和 Base URL
 proxy = []
 
+[lints]
+workspace = true
+
 [dependencies]
 # 依赖其他 crate
 agent_config = { workspace = true }

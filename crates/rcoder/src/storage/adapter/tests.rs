@@ -501,7 +501,7 @@ fn join_with_timeout<T>(handle: thread::JoinHandle<T>, timeout_secs: u64) -> Opt
 }
 
 fn drain_cleanup_requests(
-    rx: &std::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<CleanupRequest>>,
+    rx: &std::sync::Mutex<tokio::sync::mpsc::Receiver<CleanupRequest>>,
 ) -> Vec<CleanupRequest> {
     let mut guard = rx.lock().unwrap();
     let mut requests = vec![];

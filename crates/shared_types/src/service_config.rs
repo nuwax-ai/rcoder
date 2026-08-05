@@ -504,10 +504,7 @@ impl ServiceImageConfig {
     /// - 变量: `{"project_id": "123"}`
     /// - 输出: `/app/project_workspace/123`
     ///
-    pub fn resolve_container_path(
-        &self,
-        variables: &std::collections::HashMap<String, String>,
-    ) -> String {
+    pub fn resolve_container_path(&self, variables: &HashMap<String, String>) -> String {
         let mut resolved = self.container_path_template.clone();
         for (key, value) in variables {
             resolved = resolved.replace(&format!("{{{}}}", key), value);

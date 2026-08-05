@@ -60,9 +60,7 @@ fn get_common_user_bins() -> Vec<&'static str> {
 /// 2. 当前系统 PATH — 保留所有现有路径（关键改进！）
 /// 3. 常用用户目录 — cargo, npm, uv, homebrew 等
 /// 4. 系统基础目录 — `/bin`, `/usr/bin` 等（仅在 PATH 为空时）
-pub(crate) fn ensure_subprocess_path_env(
-    merged_envs: &mut std::collections::HashMap<String, String>,
-) {
+pub(crate) fn ensure_subprocess_path_env(merged_envs: &mut HashMap<String, String>) {
     if !merged_envs.contains_key("PATH") {
         let path = build_mcp_server_path_env();
         if !path.is_empty() {
@@ -143,7 +141,7 @@ pub(crate) fn build_mcp_server_path_env() -> String {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         for bin in get_common_user_bins() {
             let expanded = bin.replace("$HOME", &home);
-            let path = std::path::Path::new(&expanded);
+            let path = Path::new(&expanded);
             if path.is_dir() && !paths.contains(&expanded) {
                 paths.push(expanded);
             }
@@ -157,7 +155,7 @@ pub(crate) fn build_mcp_server_path_env() -> String {
         #[cfg(not(windows))]
         for sys_dir in &["/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin"] {
             let s = sys_dir.to_string();
-            if std::path::Path::new(sys_dir).is_dir() {
+            if Path::new(sys_dir).is_dir() {
                 paths.push(s);
             }
         }

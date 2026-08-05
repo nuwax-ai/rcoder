@@ -38,6 +38,11 @@ async fn ws_path(state: &AppState, user_id: &str, cid: &str) -> Result<PathBuf, 
 }
 
 /// computer 目标路径: `customTargetDir` trim 后非空则用之, 否则回退默认工作区 (对齐 nuwax)。
+///
+/// 注: `customTargetDir` 完全信任调用方, **不做根目录白名单限制**:
+/// 产品运行于容器内、内网私有化部署, 且用户客户端复用本 file-server 模块逻辑,
+/// 每个用户电脑上的路径各不相同, 限制根路径会误伤正常业务;
+/// 其内部相对路径仍由 [`crate::path_safety::ensure_within`] 防逃逸。
 async fn resolve_computer_target(
     state: &AppState,
     user_id: &str,
@@ -45,12 +50,10 @@ async fn resolve_computer_target(
     custom_target_dir: Option<&str>,
 ) -> Result<PathBuf, AppError> {
     let default_path = ws_path(state, user_id, cid).await?;
-    Ok(
-        match custom_target_dir.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(ct) => PathBuf::from(ct),
-            None => default_path,
-        },
-    )
+    match custom_target_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(ct) => Ok(PathBuf::from(ct)),
+        None => Ok(default_path),
+    }
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]

@@ -185,7 +185,7 @@ mod tests {
         crate::agent_mgmt::path_manager::PathManager::new_with_root(dir)
     }
 
-    fn sample(id: &str, install_type: InstallType, install_dir: &std::path::Path) -> AgentManifest {
+    fn sample(id: &str, install_type: InstallType, install_dir: &Path) -> AgentManifest {
         let binary_path = install_dir.join("bin").join(id);
         let mut m = AgentManifest::new(
             id.into(),
@@ -204,7 +204,7 @@ mod tests {
         id: &str,
         version: &str,
         install_type: InstallType,
-        install_dir: &std::path::Path,
+        install_dir: &Path,
     ) -> AgentManifest {
         let binary_path = install_dir.join(id).join(version).join(id);
         let mut m = AgentManifest::new(

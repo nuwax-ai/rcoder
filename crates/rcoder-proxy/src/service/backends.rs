@@ -201,7 +201,7 @@ impl PingoraProxyService {
     pub fn start_health_check_loop(&self, interval_secs: u64, timeout_ms: u64) {
         let svc = self.clone();
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(interval_secs);
+            let interval = Duration::from_secs(interval_secs);
             loop {
                 svc.update_health_once(timeout_ms).await;
                 tokio::time::sleep(interval).await;

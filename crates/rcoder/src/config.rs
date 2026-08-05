@@ -455,7 +455,8 @@ impl DockerConfig {
             selection_strategy: shared_types::ImageSelectionStrategy::ServiceOnly,
             cache_config: shared_types::ImageCacheConfig {
                 enabled: true,
-                ttl_seconds: 3600,
+                ttl_seconds: shared_types::IMAGE_CACHE_DEFAULT_TTL_SECS,
+                // rcoder 主进程面向多 project，缓存容量高于 crate 默认值
                 max_entries: 100,
             },
         }
@@ -860,7 +861,7 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
 
     // 创建配置文件目录（如果不存在）
     if let Some(parent) = std::path::Path::new(CONFIG_FILE).parent() {
-        std::fs::create_dir_all(parent)
+        fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
     }
 

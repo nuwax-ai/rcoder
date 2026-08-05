@@ -112,8 +112,7 @@ impl AgentCleaner {
                         .and_then(|i| i.container_info().map(|c| c.container_name.clone()))
                 })
                 .collect();
-            self.pending_destroy
-                .retain(|k| idle_containers.contains(k));
+            self.pending_destroy.retain(|k| idle_containers.contains(k));
         }
 
         // 3. 清理每个 agent

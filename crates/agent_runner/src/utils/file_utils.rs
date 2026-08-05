@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -234,8 +234,17 @@ impl FileUtils {
         description: Option<String>,
     ) -> Result<Attachment> {
         // 获取 URL 头信息以确定文件类型和大小
-        let client = reqwest::Client::new();
-        let response = client.head(url).send().await?;
+        // (共享 client 带连接/整体超时; 非 2xx 状态直接报错, 错误信息带 URL + HTTP 状态码)
+        let client = download_utils::shared_client()?;
+        let response = client
+            .head(url)
+            .send()
+            .await
+            .with_context(|| format!("probe attachment URL: {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("probe attachment URL failed: HEAD {url} returned HTTP {status}");
+        }
 
         // 检查文件大小
         if let Some(content_length) = response.headers().get(reqwest::header::CONTENT_LENGTH) {

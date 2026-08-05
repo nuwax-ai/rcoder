@@ -169,8 +169,7 @@ async fn connect_ttyd_with_retry(
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     service_type: &str,
     project_id: &str,
-) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, String>
-{
+) -> Result<WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, String> {
     let max_attempts = TTYD_CONNECT_RETRIES + 1; // initial + retries
     let mut last_err = String::from("no connection attempts made");
 
@@ -222,7 +221,7 @@ async fn connect_ttyd_with_retry(
 async fn is_tcp_port_open(port: u16) -> bool {
     tokio::time::timeout(
         Duration::from_millis(300),
-        tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)),
+        TcpStream::connect(format!("127.0.0.1:{}", port)),
     )
     .await
     .is_ok_and(|r| r.is_ok())
@@ -388,9 +387,7 @@ mod tests {
                 let (s, _) = listener.accept().await.unwrap();
                 tokio_tungstenite::accept_async(s).await.unwrap()
             });
-            let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
-                .await
-                .unwrap();
+            let (client, _) = connect_async(format!("ws://{addr}")).await.unwrap();
             (client, server.await.unwrap())
         }
 

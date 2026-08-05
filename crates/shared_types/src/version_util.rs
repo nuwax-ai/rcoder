@@ -212,7 +212,7 @@ impl std::error::Error for PlatformParseError {}
 ///
 /// 输入格式: "linux-x86_64", "darwin-arm64", "windows-amd64" 等
 /// 归一化: amd64 → x86_64, aarch64 → arm64, 大小写不敏感
-fn platform_key_parser(input: &mut &str) -> winnow::ModalResult<PlatformKey> {
+fn platform_key_parser(input: &mut &str) -> ModalResult<PlatformKey> {
     // 1. 解析 os 部分（纯字母，大小写不敏感）
     let os_raw: &str = alpha1.parse_next(input)?;
     let os_lower = os_raw.to_ascii_lowercase();

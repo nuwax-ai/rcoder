@@ -66,7 +66,7 @@ pub(super) async fn ensure_project_workspace_exists(
 /// * `container_info` - 容器信息
 /// * `request` - 聊天请求
 pub(super) fn ensure_project_mapping_in_state(
-    state: &Arc<crate::router::AppState>,
+    state: &Arc<AppState>,
     user_id: &str,
     project_id: &str,
     container_info: &ContainerBasicInfo,

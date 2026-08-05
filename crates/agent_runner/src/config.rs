@@ -320,6 +320,9 @@ impl Default for GrpcTimeoutConfig {
 /// 配置文件路径
 const CONFIG_FILE: &str = "config.yml";
 
+/// 代理监听端口默认值（CLI 未指定 --proxy-port 时）
+const DEFAULT_PROXY_LISTEN_PORT: u16 = 8080;
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -621,7 +624,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     // 5. 处理代理配置。必须在最终 HTTP port 确定后再推导 default_backend_port。
     if cli_args.enable_proxy {
         let proxy_config = ProxyConfig {
-            listen_port: cli_args.proxy_port.unwrap_or(8080),
+            listen_port: cli_args.proxy_port.unwrap_or(DEFAULT_PROXY_LISTEN_PORT),
             default_backend_port: cli_args.default_backend_port.unwrap_or(config.port),
             backend_host: "127.0.0.1".to_string(),
             port_param: "port".to_string(),

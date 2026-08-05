@@ -208,10 +208,9 @@ pub const ERR_RESOURCE_EXHAUSTED: &str = "ERR_RESOURCE_EXHAUSTED";
 /// 注意：`retryable` 是错误码的固有属性，不在响应体重复（HttpResult 不变）。
 /// 详见 docs/application-management-service-v2-design.md §12.3。
 pub fn is_retryable_code(code: &str) -> bool {
-    use crate::error_codes as ec;
     matches!(
         code,
-        ec::ERR_BACKEND_ERROR | ec::ERR_IMAGE_PULL_FAILED | ec::ERR_RESOURCE_EXHAUSTED
+        ERR_BACKEND_ERROR | ERR_IMAGE_PULL_FAILED | ERR_RESOURCE_EXHAUSTED
     )
 }
 

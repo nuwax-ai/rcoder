@@ -188,7 +188,7 @@ pub async fn subscribe_progress(
 /// 独立函数避免了 `tokio::select!` 宏展开导致的 definite-assignment 盲区。
 async fn run_stream_loop(
     session_id: &str,
-    mut message_rx: tokio::sync::mpsc::Receiver<(u64, shared_types::UnifiedSessionMessage)>,
+    mut message_rx: mpsc::Receiver<(u64, shared_types::UnifiedSessionMessage)>,
     cancellation_token: tokio_util::sync::CancellationToken,
     tx: &mpsc::Sender<Result<ProgressEvent, Status>>,
     locale: &'static str,

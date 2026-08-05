@@ -32,6 +32,9 @@ kubernetes = ["docker_manager/kubernetes", "shared_types/kubernetes", "app_manag
 [dev-dependencies]
 filetime = { workspace = true }
 
+[lints]
+workspace = true
+
 [dependencies]
 # Internal crates
 shared_types = { workspace = true }

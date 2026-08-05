@@ -76,7 +76,7 @@ pub struct AppState {
     pub api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
     /// 🆕 容器创建中标记: user_id -> 创建开始时间
     /// 用于防止并发 pod_ensure 请求互相干扰（无锁方案）
-    pub pod_creating: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    pub pod_creating: Arc<DashMap<String, std::time::Instant>>,
     /// 🚀 容器创建完成通知通道（替代轮询等待）
     /// 当容器创建完成时，发送 user_id 通知等待方
     pub pod_created_tx: Arc<broadcast::Sender<String>>,
@@ -86,11 +86,8 @@ pub struct AppState {
     /// 容器运行时（通过 DI 注入，替代全局 RuntimeManager::get()）
     pub runtime: Arc<dyn ContainerRuntime>,
     /// RAII 资源回收器接收端（在 start_cleanup_task 中取出并启动 ResourceReaper）
-    pub cleanup_rx: Arc<
-        std::sync::Mutex<
-            Option<tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>>,
-        >,
-    >,
+    pub cleanup_rx:
+        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>>>>,
     /// Agent 下载管理器（统一缓存）
     pub agent_download_manager: Arc<AgentDownloadManager>,
     /// 应用管理服务
@@ -113,7 +110,7 @@ impl AppState {
         container_prefix_computer: String,
         runtime: Arc<dyn ContainerRuntime>,
         projects: Arc<ProjectAdapter>,
-        cleanup_rx: tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>,
+        cleanup_rx: tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>,
         activity: Arc<app_manager::AppActivityRegistry>,
     ) -> anyhow::Result<Self> {
         // ProjectAdapter 由调用方（main.rs）提前创建并注入，
@@ -482,7 +479,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     // 应用管理路由
     let app_manager_state = Arc::new(app_manager::handlers::AppManagerState {
         app_service: state.app_service.clone(),
-        http_client: reqwest::Client::new(),
+        // 共享客户端 (连接超时 + 连接池复用; SSE 流不能设总超时, 见 http_client 模块)
+        http_client: crate::http_client::shared_client().clone(),
     });
     let app_manager_routes = app_manager::routes::app_manager_routes()
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GiB（upload 压缩包，覆盖全局 50MB）

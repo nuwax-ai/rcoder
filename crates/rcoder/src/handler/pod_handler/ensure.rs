@@ -470,7 +470,7 @@ pub async fn pod_ensure(
                         // 设置创建标记
                         state
                             .pod_creating
-                            .insert(container_identifier.clone(), std::time::Instant::now());
+                            .insert(container_identifier.clone(), Instant::now());
 
                         let options = ContainerCreateOptions {
                             user_id: request.user_id.clone(),

@@ -158,7 +158,16 @@ impl AppService {
         // internal domain：K8s = ClusterIP Service FQDN；Docker = 容器名（= 资源名）
         let (domain, short_domain) = match self.config.access_mode {
             AppAccessMode::Docker => {
-                let name = format!("{}-{}", ServiceType::UserApp.container_prefix(), app_id);
+                // 容器名统一走 DockerUtils::generate_container_name（与创建路径一致）；
+                // app_id 已在 API 层校验，理论上不会走到降级分支
+                let name = docker_manager::utils::DockerUtils::generate_container_name(
+                    ServiceType::UserApp.container_prefix(),
+                    app_id,
+                )
+                .unwrap_or_else(|e| {
+                    tracing::warn!("[APP] invalid app_id for container name, fallback: {}", e);
+                    format!("{}-{}", ServiceType::UserApp.container_prefix(), app_id)
+                });
                 (name.clone(), name)
             }
             AppAccessMode::Kubernetes => {

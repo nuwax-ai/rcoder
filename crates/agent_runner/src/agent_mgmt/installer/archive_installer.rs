@@ -40,12 +40,24 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<u
         let sanitized = sanitize_entry_path(&entry_path)?;
         let dest_path = dest_dir.join(&sanitized);
 
-        // 路径安全检查：只对首次出现的目录做 canonicalize
+        // 路径安全检查：只对首次出现的目录做 canonicalize。
+        // canonicalize 要求目录已存在, 故先建目录再校验; 校验失败时
+        // 尽力回收刚建的空目录, 不在磁盘留下残留。
         if let Some(parent) = dest_path.parent()
             && !created_dirs.contains(parent)
         {
             std::fs::create_dir_all(parent)?;
-            ensure_within(&dest_path, dest_dir)?;
+            if let Err(e) = ensure_within(&dest_path, dest_dir) {
+                // 仅删空目录 (非空说明已有内容, 不能删); 失败无害, 记 debug 日志留痕
+                if let Err(error) = std::fs::remove_dir(parent) {
+                    debug!(
+                        path = %parent.display(),
+                        %error,
+                        "cleanup of directory created for path validation failed"
+                    );
+                }
+                return Err(e);
+            }
             created_dirs.insert(parent.to_path_buf());
         }
 
@@ -130,11 +142,22 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<usiz
         let sanitized = sanitize_entry_path(&entry_path)?;
         let dest_path = dest_dir.join(&sanitized);
 
+        // 同上: 先建目录再 canonicalize 校验; 校验失败时尽力回收空目录。
         if let Some(parent) = dest_path.parent()
             && !created_dirs.contains(parent)
         {
             std::fs::create_dir_all(parent)?;
-            ensure_within(&dest_path, dest_dir)?;
+            if let Err(e) = ensure_within(&dest_path, dest_dir) {
+                // 同 tar.gz 分支: 仅删空目录, 失败无害, 记 debug 日志留痕
+                if let Err(error) = std::fs::remove_dir(parent) {
+                    debug!(
+                        path = %parent.display(),
+                        %error,
+                        "cleanup of directory created for path validation failed"
+                    );
+                }
+                return Err(e);
+            }
             created_dirs.insert(parent.to_path_buf());
         }
 
@@ -284,8 +307,14 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> AgentMgmtResult<bool> {
         )));
     }
 
-    // Cleanup the now-empty wrapper directory
-    let _ = std::fs::remove_dir(&tmp_rename);
+    // Cleanup the now-empty wrapper directory; 失败无害 (目录非空或已删), 记 debug 日志留痕
+    if let Err(error) = std::fs::remove_dir(&tmp_rename) {
+        debug!(
+            path = %tmp_rename.display(),
+            %error,
+            "cleanup of empty wrapper directory failed"
+        );
+    }
 
     debug!(
         "[agent_mgmt] Stripped top-level wrapper directory: {}",
@@ -528,7 +557,7 @@ mod tests {
             File::create(&archive).unwrap(),
             flate2::Compression::fast(),
         );
-        std::io::Write::write_all(&mut gz, &raw_tar).unwrap();
+        Write::write_all(&mut gz, &raw_tar).unwrap();
         gz.finish().unwrap();
 
         let err = extract_tar_gz(&archive, &extract_to).unwrap_err();

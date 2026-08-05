@@ -6,6 +6,7 @@ pub mod cleanup_task;
 pub mod config;
 pub mod grpc;
 pub mod handler;
+pub mod http_client;
 pub mod middleware;
 pub mod router;
 mod service;
