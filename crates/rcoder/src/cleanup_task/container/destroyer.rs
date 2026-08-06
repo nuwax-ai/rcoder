@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::cleanup_task::strategies::DestroyReason;
+use crate::grpc::ShutdownSseFn;
 
 /// 容器销毁器
 pub struct ContainerDestroyer {
@@ -27,6 +28,9 @@ pub struct ContainerDestroyer {
     pub cluster_domain: String,
     /// 是否是 K8s 运行时
     pub is_kubernetes: bool,
+    /// 可选的 SSE 共享流关闭回调（参数为 grpc_addr）。
+    /// 容器销毁后按地址关闭前端 SSE 进度流；未注入时保持旧行为（向后兼容）。
+    shutdown_sse: Option<ShutdownSseFn>,
 }
 
 impl ContainerDestroyer {
@@ -45,7 +49,17 @@ impl ContainerDestroyer {
             namespace,
             cluster_domain,
             is_kubernetes,
+            shutdown_sse: None,
         }
+    }
+
+    /// 注入 SSE 共享流关闭回调（builder 风格，保持 `new` 签名向后兼容）。
+    ///
+    /// 回调参数为 grpc_addr；销毁流程在 `grpc_pool.remove` 同处调用，
+    /// 确保容器死亡后前端 SSE 进度流被主动关闭（幂等，重复调用安全）。
+    pub fn with_shutdown_sse(mut self, shutdown_sse: ShutdownSseFn) -> Self {
+        self.shutdown_sse = Some(shutdown_sse);
+        self
     }
 
     /// 销毁容器并清理相关资源（带原因）
@@ -113,6 +127,11 @@ impl ContainerDestroyer {
             &self.cluster_domain,
         );
         self.grpc_pool.remove(&grpc_addr).await;
+
+        // 关闭指向该地址的 SSE 共享流（与 grpc_pool.remove 同源同处；幂等）。
+        if let Some(ref shutdown_sse) = self.shutdown_sse {
+            shutdown_sse(&grpc_addr);
+        }
 
         if let Some(ref pingora_service) = self.pingora_service {
             if *service_type == ServiceType::ComputerAgentRunner {

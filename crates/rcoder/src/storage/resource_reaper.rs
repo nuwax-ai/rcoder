@@ -25,9 +25,11 @@ use std::time::Duration;
 use shared_types::ServiceType;
 use tokio_stream::StreamExt;
 use tokio_util::time::DelayQueue;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use container_runtime_api::ContainerRuntime;
+
+use crate::grpc::ShutdownSseFn;
 
 /// RAII 清理请求（当容器引用计数归零时发送）
 #[derive(Debug, Clone)]
@@ -73,6 +75,8 @@ pub struct ResourceReaper {
     docker_manager: Option<Arc<docker_manager::DockerManager>>,
     /// 是否是 K8s 运行时
     is_kubernetes: bool,
+    /// SSE 共享流关闭回调（参数为 grpc_addr）：容器销毁后按地址关闭前端进度流
+    shutdown_sse: ShutdownSseFn,
     /// stop 失败的重试延迟队列（reaper 内部持有，10s 后重新参与调度）
     retry_queue: DelayQueue<CleanupRequest>,
 }
@@ -84,6 +88,7 @@ impl ResourceReaper {
         grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
         pingora: Option<Arc<rcoder_proxy::PingoraProxyService>>,
         docker_manager: Option<Arc<docker_manager::DockerManager>>,
+        shutdown_sse: ShutdownSseFn,
     ) -> Self {
         // 判断是否是 K8s 运行时（通过 features flag）
         let is_kubernetes = shared_types::is_kubernetes_runtime();
@@ -95,6 +100,7 @@ impl ResourceReaper {
             pingora,
             docker_manager,
             is_kubernetes,
+            shutdown_sse,
             retry_queue: DelayQueue::new(),
         }
     }
@@ -186,9 +192,13 @@ impl ResourceReaper {
 
         // 2. 清理 gRPC 连接
         // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）；
-        // Docker 模式下 container_ip 为空时无法定位连接，跳过清理（K8s 用 FQDN，不受影响）
+        // Docker 模式下 container_ip 为空时无法构造 grpc_addr，跳过 gRPC/SSE 清理
+        // （K8s 用 FQDN，不受影响；无法反查容器→addr 映射，只能告警提示可能残留）
         if !self.is_kubernetes && req.container_ip.is_empty() {
-            debug!("[REAPER] Container IP is empty, skipping gRPC cleanup");
+            warn!(
+                "[REAPER] Container IP is empty, skipping gRPC/SSE cleanup (no grpc_addr available, SSE streams for {} may linger)",
+                req.container_name
+            );
             return;
         }
         let grpc_addr = shared_types::build_grpc_addr(
@@ -198,6 +208,9 @@ impl ResourceReaper {
             &req.cluster_domain,
         );
         self.grpc_pool.remove(&grpc_addr).await;
+
+        // 2.1 关闭指向该地址的 SSE 共享流（与 grpc_pool.remove 同源同处；幂等）。
+        (self.shutdown_sse)(&grpc_addr);
 
         // 3. 清理 DockerManager 缓存（Docker 模式）
         if let Some(ref dm) = self.docker_manager {

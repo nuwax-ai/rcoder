@@ -48,6 +48,14 @@ impl AgentCleaner {
         // 判断是否是 K8s 运行时（通过 features flag）
         let is_kubernetes = shared_types::is_kubernetes_runtime();
 
+        // SSE 关闭回调：destroyer 物理销毁后按 grpc_addr 关闭前端进度流。
+        // 与下方 cleanup_once 中既有的 shutdown_sse_streams_for_project 调用冗余但幂等
+        // （前者按地址、后者按 project sessions 枚举），双保险覆盖记录已清空场景。
+        let shutdown_sse: crate::grpc::ShutdownSseFn = {
+            let state = state.clone();
+            Arc::new(move |addr: &str| state.shutdown_sse_streams_by_addr(addr))
+        };
+
         // 创建日志清理器（使用配置）
         let log_cleaner = super::logs::LogCleaner::new(
             config.log_dir.clone(),
@@ -67,7 +75,8 @@ impl AgentCleaner {
                 namespace,
                 state.cluster_domain.clone(),
                 is_kubernetes,
-            ),
+            )
+            .with_shutdown_sse(shutdown_sse),
             agent_scanner: {
                 use crate::cleanup_task::agent::AgentScanner;
                 AgentScanner::new(state.clone(), config_clone)

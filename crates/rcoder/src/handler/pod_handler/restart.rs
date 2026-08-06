@@ -148,6 +148,20 @@ pub async fn pod_restart(
             container_info.container_id
         );
 
+        // 先关闭指向旧容器的 SSE 共享流：必须在 delete_container_with_projects 之前，
+        // 因为它会清空 project/session 记录，之后无法再按 session 枚举（按 addr 关闭幂等）。
+        // 地址必须走 build_grpc_addr（K8s 用 Service FQDN，与 registry 中存储的地址同源）；
+        // K8s 不依赖 container_ip，Docker 下 ip 为空才跳过。
+        if shared_types::is_kubernetes_runtime() || !container_info.container_ip.is_empty() {
+            let sse_grpc_addr = shared_types::build_grpc_addr(
+                &container_info.container_name,
+                &container_info.container_ip,
+                &state.config.app_manager.namespace,
+                &state.cluster_domain,
+            );
+            state.shutdown_sse_streams_by_addr(&sse_grpc_addr);
+        }
+
         // 从存储中彻底移除旧容器及其所有关联记录
         // 使用 container_id 删除,确保清理该容器关联的所有 project_id
         let (container_deleted, deleted_projects) = state
@@ -178,11 +192,13 @@ pub async fn pod_restart(
         }
 
         // 🆕 清理旧容器的 gRPC 连接（避免复用已失效的 TCP 连接）
-        if !container_info.container_ip.is_empty() {
-            let old_grpc_addr = format!(
-                "{}:{}",
-                container_info.container_ip,
-                shared_types::GRPC_DEFAULT_PORT
+        // 地址与连接建立时同源：K8s 用 Service FQDN，Docker 用容器 IP
+        if shared_types::is_kubernetes_runtime() || !container_info.container_ip.is_empty() {
+            let old_grpc_addr = shared_types::build_grpc_addr(
+                &container_info.container_name,
+                &container_info.container_ip,
+                &state.config.app_manager.namespace,
+                &state.cluster_domain,
             );
             state.grpc_pool.remove(&old_grpc_addr).await;
         }

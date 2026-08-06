@@ -229,6 +229,24 @@ impl AppState {
         }
     }
 
+    /// 按 grpc_addr 关闭关联的所有 SSE 共享流。
+    ///
+    /// 适用于记录可能已被清空的销毁路径（reaper/restart/ensure/destroyer）：这些路径中
+    /// project/session 记录可能在关闭前已被移除，无法再走 [`shutdown_sse_streams_for_project`]，
+    /// 但它们都能构造出 grpc_addr（与 `grpc_pool.remove` 同源）。幂等：重复调用安全。
+    pub fn shutdown_sse_streams_by_addr(&self, grpc_addr: &str) {
+        let closed = self
+            .session_stream_registry
+            .shutdown_streams_by_addr(grpc_addr);
+        if closed > 0 {
+            tracing::info!(
+                "[STATE] shutdown SSE streams on container destruction: grpc_addr={}, closed={}",
+                grpc_addr,
+                closed
+            );
+        }
+    }
+
     /// 检查项目是否存在（替代 project_and_agent_map.contains_key）
     #[inline]
     pub fn contains_project(&self, project_id: &str) -> bool {

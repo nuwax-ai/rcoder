@@ -72,12 +72,19 @@ pub async fn start_cleanup_task(
             }
         };
 
+        // SSE 关闭回调：reaper 销毁容器后按 grpc_addr 关闭前端进度流（幂等）
+        let shutdown_sse: crate::grpc::ShutdownSseFn = {
+            let state = state.clone();
+            Arc::new(move |addr: &str| state.shutdown_sse_streams_by_addr(addr))
+        };
+
         let reaper = crate::storage::ResourceReaper::new(
             reaper_rx,
             state.runtime().clone(),
             state.grpc_pool.clone(),
             state.pingora_service.clone(),
             docker_manager.clone(),
+            shutdown_sse,
         );
         tokio::spawn(reaper.run());
         tracing::info!(

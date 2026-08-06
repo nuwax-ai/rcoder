@@ -40,6 +40,10 @@ const MAX_RETRIES: u32 = 2;
 
 type SharedEvent = Arc<ProgressEvent>;
 
+/// SSE 共享流关闭回调类型（参数为 grpc_addr）。
+/// 容器销毁路径（reaper/restart/ensure/destroyer）按地址关闭前端进度流。
+pub type ShutdownSseFn = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Session → 共享流注册表（rcoder 进程级单例，挂在 `AppState`）。
 pub struct SessionStreamRegistry {
     streams: DashMap<String, Arc<SharedStream>>,
@@ -138,6 +142,40 @@ impl SessionStreamRegistry {
         self.streams
             .insert(session_id.to_string(), new_stream.clone());
         new_stream
+    }
+
+    /// 按 grpc_addr 批量关闭共享流（容器销毁路径：reaper/restart/ensure/destroyer 调用）。
+    ///
+    /// 与 [`shutdown_session`] 的按 session_id 关闭不同，此方法用于"project/session 记录可能
+    /// 已被清空、只剩 grpc_addr 可用"的销毁路径。销毁语义：无条件移除匹配地址的流，先发终态
+    /// SessionPromptEnd 事件再 cancel 后台 task。幂等：重复调用返回 0。
+    pub fn shutdown_streams_by_addr(&self, grpc_addr: &str) -> usize {
+        // 两阶段：先迭代收集 (session_id, Arc)，再逐个 remove_if(ptr_eq) + shutdown。
+        // 避免在 DashMap 迭代持 shard 锁期间执行 shutdown 的 broadcast send。
+        let matches: Vec<(String, Arc<SharedStream>)> = self
+            .streams
+            .iter()
+            .filter(|entry| entry.value().matches_addr(grpc_addr))
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        let total = matches.len();
+        let mut closed = 0usize;
+        for (session_id, shared) in matches {
+            // ptr_eq 确保只移除迭代时看到的同一实例（并发 get_or_create 可能已替换为新流）
+            if let Some((_, removed)) = self
+                .streams
+                .remove_if(&session_id, |_, current| Arc::ptr_eq(current, &shared))
+            {
+                removed.shutdown();
+                self.remove_unused_create_lock(&session_id);
+                closed += 1;
+            }
+        }
+        info!(
+            "[SessionStream] shutdown_streams_by_addr: grpc_addr={}, matched={}, closed={}",
+            grpc_addr, total, closed
+        );
+        closed
     }
 
     /// 当前活跃共享流数量（测试 / 观测用）
@@ -838,6 +876,66 @@ mod tests {
             "all guards dropped → ref_count back to 0"
         );
         // 最后一个 guard drop 会 spawn 30s 延迟清理；测试结束 runtime drop 会 cancel 它。
+    }
+
+    #[tokio::test]
+    async fn shutdown_streams_by_addr_closes_only_matching_streams() {
+        let registry = SessionStreamRegistry::default();
+        let matched_a = SharedStream::new(
+            "session-a".into(),
+            "10.0.0.1:50051".into(),
+            Arc::new(GrpcChannelPool::new()),
+            "en",
+            Arc::new(|_| {}),
+        )
+        .await;
+        let matched_b = SharedStream::new(
+            "session-b".into(),
+            "10.0.0.1:50051".into(),
+            Arc::new(GrpcChannelPool::new()),
+            "en",
+            Arc::new(|_| {}),
+        )
+        .await;
+        let unmatched = SharedStream::new(
+            "session-c".into(),
+            "10.0.0.2:50051".into(),
+            Arc::new(GrpcChannelPool::new()),
+            "en",
+            Arc::new(|_| {}),
+        )
+        .await;
+        registry
+            .streams
+            .insert("session-a".into(), Arc::clone(&matched_a));
+        registry
+            .streams
+            .insert("session-b".into(), Arc::clone(&matched_b));
+        registry
+            .streams
+            .insert("session-c".into(), Arc::clone(&unmatched));
+
+        // 只关闭匹配地址的流
+        let closed = registry.shutdown_streams_by_addr("10.0.0.1:50051");
+        assert_eq!(closed, 2, "两条匹配地址的流都应被关闭");
+        assert!(matched_a.cancel_token.is_cancelled());
+        assert!(matched_b.cancel_token.is_cancelled());
+        assert!(!registry.streams.contains_key("session-a"));
+        assert!(!registry.streams.contains_key("session-b"));
+
+        // 不匹配的流保留且未 cancel
+        assert!(!unmatched.cancel_token.is_cancelled());
+        assert!(registry.streams.contains_key("session-c"));
+        assert_eq!(registry.len(), 1);
+
+        // 幂等：重复关闭同一地址返回 0
+        assert_eq!(registry.shutdown_streams_by_addr("10.0.0.1:50051"), 0);
+    }
+
+    #[test]
+    fn shutdown_streams_by_addr_returns_zero_for_unknown_addr() {
+        let registry = SessionStreamRegistry::default();
+        assert_eq!(registry.shutdown_streams_by_addr("1.2.3.4:50051"), 0);
     }
 
     #[test]
