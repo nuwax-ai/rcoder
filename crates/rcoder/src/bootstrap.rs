@@ -38,20 +38,21 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
         match file_server::Config::load() {
             Ok(fs_config) => match file_server::logging::build_file_layer(&fs_config) {
                 Ok((layer, guard)) => {
-                    info!(
+                    // tracing 尚未 init（下方才 init），用 eprintln 保证可见（与 main.rs 一致）
+                    eprintln!(
                         "[BOOTSTRAP] file-server independent log layer injected: dir={}",
                         fs_config.service_log_dir.display()
                     );
                     telemetry_config = telemetry_config.with_extra_layer(layer, guard);
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    eprintln!(
                         "[BOOTSTRAP] failed to build file-server log layer (falling back to rcoder.log): {e}"
                     );
                 }
             },
             Err(e) => {
-                tracing::warn!(
+                eprintln!(
                     "[BOOTSTRAP] failed to load file-server config (file-server logs will mix into rcoder.log): {e}"
                 );
             }

@@ -61,7 +61,10 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::Rotation;
-use tracing_subscriber::{EnvFilter, Layer, fmt, filter::filter_fn, layer::SubscriberExt, registry::Registry, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter, Layer, filter::filter_fn, fmt, layer::SubscriberExt, registry::Registry,
+    util::SubscriberInitExt,
+};
 
 /// 类型擦除的 tracing layer（用于跨 crate 注入额外日志层）。
 pub type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
@@ -177,6 +180,7 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
     };
 
     // 🆕 初始化 tracing subscriber（包括控制台、文件、OpenTelemetry、额外 layer）
+    let has_extra_layer = config.extra_layer.is_some(); // take 前记，供下方启动日志使用
     let extra_layer = config.extra_layer.take();
     init_tracing_subscriber(
         &config.service_name,
@@ -194,7 +198,7 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
         tracer_provider.is_some(),
         prometheus_handle.is_some(),
         config.file_log.is_some(),
-        config.extra_layer.is_some()
+        has_extra_layer
     );
 
     Ok(TelemetryGuard {
@@ -238,9 +242,9 @@ fn init_tracing_subscriber(
         .with_thread_ids(false)
         .with_file(false)
         .with_line_number(false)
-        .with_filter(filter_fn(
-            |meta: &tracing::Metadata<'_>| !meta.target().starts_with("file_server"),
-        ));
+        .with_filter(filter_fn(|meta: &tracing::Metadata<'_>| {
+            !meta.target().starts_with("file_server")
+        }));
 
     // 创建文件日志层（deny file_server → file-server 日志不进 rcoder.log）
     let file_layer = if let Some(file_config) = file_log_config {
@@ -256,9 +260,8 @@ fn init_tracing_subscriber(
             .max_log_files(file_config.max_log_files)
             .build(&file_config.directory)?;
 
-        let deny_fs = filter_fn(
-            |meta: &tracing::Metadata<'_>| !meta.target().starts_with("file_server"),
-        );
+        let deny_fs =
+            filter_fn(|meta: &tracing::Metadata<'_>| !meta.target().starts_with("file_server"));
 
         if file_config.json_format {
             // JSON 格式文件日志
