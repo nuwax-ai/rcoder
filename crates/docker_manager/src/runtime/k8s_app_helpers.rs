@@ -74,9 +74,7 @@ pub(crate) fn expose_type_str(e: &ExposeType) -> &'static str {
 /// annotation 变 → spec 变 → 自动 rollout。DefaultHasher 跨进程确定（固定 key），故同
 /// 内容多次 apply 的 hash 稳定，不会引发误 rollout。
 #[cfg(feature = "kubernetes")]
-pub(crate) fn config_hash_annotations(
-    params: &container_runtime_api::ContainerCreateParams,
-) -> BTreeMap<String, String> {
+pub(crate) fn config_hash_annotations(params: &ContainerCreateParams) -> BTreeMap<String, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -103,7 +101,7 @@ pub(crate) fn config_hash_annotations(
 /// `idle_timeout_seconds` 仅 Some 时写入。供 [`merge_app_annotations`] 合并到 Deployment metadata。
 #[cfg(feature = "kubernetes")]
 pub(crate) fn encode_recycle_annotations(
-    params: &container_runtime_api::ContainerCreateParams,
+    params: &ContainerCreateParams,
 ) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     let enabled = params.recycle_enabled.unwrap_or(true);
@@ -118,7 +116,7 @@ pub(crate) fn encode_recycle_annotations(
 /// encode_recycle_annotations 恒非空 → 结果恒 Some。
 #[cfg(feature = "kubernetes")]
 pub(crate) fn merge_app_annotations(
-    params: &container_runtime_api::ContainerCreateParams,
+    params: &ContainerCreateParams,
 ) -> Option<BTreeMap<String, String>> {
     let mut ann = encode_port_expose_annotations(params).unwrap_or_default();
     ann.extend(encode_recycle_annotations(params));
