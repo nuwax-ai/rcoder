@@ -13,12 +13,14 @@ mod computer_chat_handler;
 mod computer_db_handler;
 mod computer_desktop_handler;
 mod devcomputer_handler;
+mod docs;
 mod health_handler;
 mod internal_handler;
 mod permission_handler;
 pub mod pod_handler;
 pub mod proxy_api;
 pub mod proxy_handler_api;
+mod sse_builder;
 pub mod utils;
 
 // 调试处理器（仅在启用 debug feature 时可用）
@@ -37,6 +39,7 @@ pub use computer_chat_handler::*;
 pub use computer_db_handler::*;
 pub use computer_desktop_handler::*;
 pub use devcomputer_handler::*;
+pub use docs::*;
 pub use health_handler::*;
 pub use internal_handler::*;
 pub use permission_handler::*;

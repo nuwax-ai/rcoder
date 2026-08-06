@@ -17,6 +17,7 @@ pub mod container_creator;
 pub mod container_query;
 pub mod health;
 pub mod image_management;
+pub mod manager_cleanup;
 pub mod network;
 pub mod network_management;
 pub mod runtime_selection;

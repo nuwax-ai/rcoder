@@ -1,18 +1,17 @@
 use super::{
-    CleanupOptions, CleanupResult, ContainerRemovalFailure, ContainerStatus, DockerContainerConfig,
-    DockerContainerInfo, DockerError, DockerManagerConfig, DockerResult,
+    ContainerStatus, DockerContainerConfig, DockerContainerInfo, DockerError, DockerManagerConfig,
+    DockerResult,
 };
 use crate::container_state_actor::{ContainerStateActor, ContainerStateHandle};
-use anyhow::Result;
 use bollard::query_parameters::{
-    InspectContainerOptions, RemoveContainerOptions, RestartContainerOptions, StopContainerOptions,
+    InspectContainerOptions, RemoveContainerOptions, RestartContainerOptions,
 };
-use bollard::{API_DEFAULT_VERSION, Docker, models::ContainerSummary};
+use bollard::{API_DEFAULT_VERSION, Docker};
 use container_runtime_api::RemovedContainerInfo;
 use shared_types::{ContainerBasicInfo, ServiceType};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::api_cache::DockerApiCache;
@@ -362,103 +361,7 @@ impl DockerManager {
                 .map(|project_id| {
                     let health_checker = health_checker.clone();
                     let main_network_name = main_network_name.clone();
-                    async move {
-                        let project_id = project_id.clone();
-                        let container_info_before_update = self.containers.get(&project_id).await;
-
-                        match self.update_container_status(&project_id).await {
-                            Ok(None) => {
-                                // 容器不存在，需要从缓存中移除
-                                if let Some(info) = container_info_before_update {
-                                    // 获取容器 IP（用于清理 gRPC 连接池）
-                                    let container_ip = match self
-                                        .get_container_network_info(&info.container_id)
-                                        .await
-                                    {
-                                        Ok(ips) => ips.values().next().cloned().unwrap_or_default(),
-                                        Err(e) => {
-                                            warn!(
-                                                "[SYNC] Failed to get container IP for cleanup: container_id={}, error={}",
-                                                info.container_id, e
-                                            );
-                                            String::new()
-                                        }
-                                    };
-
-                                    Some((project_id.clone(), Some(RemovedContainerInfo {
-                                        container_name: info.container_name,
-                                        container_ip,
-                                        identifier: project_id,
-                                        service_type: info.service_type.unwrap_or(ServiceType::WebAgentRunner),
-                                    }), false))
-                                } else {
-                                    Some((project_id, None, false))
-                                }
-                            }
-                            Ok(Some(status)) => {
-                                // 🆕 对运行中的容器执行服务健康检查
-                                if matches!(status, ContainerStatus::Running) {
-                                    let container_info = self.containers.get(&project_id).await;
-                                    let Some(container_info) = container_info else {
-                                        return Some((project_id, None, false));
-                                    };
-
-                                    // 获取容器 IP
-                                    if let Ok(network_ips) = self
-                                        .get_container_network_info(&container_info.container_id)
-                                        .await
-                                    {
-                                        let container_ip = network_ips
-                                            .get(&main_network_name)
-                                            .or_else(|| network_ips.values().next());
-
-                                        if let Some(ip) = container_ip {
-                                            let previous_failures = container_info
-                                                .service_health
-                                                .as_ref()
-                                                .map(|h| h.consecutive_failures)
-                                                .unwrap_or(0);
-
-                                            let health_status =
-                                                health_checker.check_service(ip, previous_failures).await;
-
-                                            let mut updated_info = container_info.clone();
-                                            updated_info.service_health = Some(health_status.clone());
-                                            self.containers
-                                                .insert(project_id.clone(), updated_info)
-                                                .await;
-
-                                            if health_status.is_fully_healthy() {
-                                                debug!(
-                                                    "[SYNC] Service healthy: container_id={}, service_type={:?}",
-                                                    project_id, container_info.service_type
-                                                );
-                                            } else {
-                                                warn!(
-                                                    "[SYNC] Service unhealthy: container_id={}, service_type={:?}, http={}, grpc={}, failures={}",
-                                                    project_id,
-                                                    container_info.service_type,
-                                                    health_status.http_healthy,
-                                                    health_status.grpc_healthy,
-                                                    health_status.consecutive_failures
-                                                );
-                                            }
-
-                                            return Some((project_id, None, true));
-                                        }
-                                    }
-                                }
-                                Some((project_id, None, false))
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "[SYNC] Check container status failed: project_id={}, error={}",
-                                    project_id, e
-                                );
-                                None
-                            }
-                        }
-                    }
+                    self.sync_single_container_state(project_id, health_checker, main_network_name)
                 })
                 .collect();
 
@@ -489,31 +392,159 @@ impl DockerManager {
 
         // 清理被移除容器的 API 缓存（避免残留数据导致后续查询返回旧 IP）
         if !removed.is_empty() {
-            let identifiers: Vec<String> = removed.iter().map(|r| r.identifier.clone()).collect();
-            self.api_cache.invalidate_all(&identifiers).await;
-            debug!(
-                "[SYNC] Invalidated API cache for {} removed containers",
-                identifiers.len()
-            );
+            self.invalidate_cache_for_removed_containers(&removed).await;
         }
 
         Ok((total, removed))
     }
 
-    /// 清理所有容器
-    pub async fn cleanup_all_containers(&self) -> DockerResult<()> {
-        info!("Starting cleanup of all containers");
+    /// 同步单个容器的状态（`sync_all_container_states` 的内部步骤）
+    ///
+    /// 返回 (project_id, 被移除容器的信息, 是否执行了健康检查)；
+    /// 检查状态失败时返回 None。
+    async fn sync_single_container_state(
+        &self,
+        project_id: &str,
+        health_checker: Arc<crate::health::ServiceHealthChecker>,
+        main_network_name: String,
+    ) -> Option<(String, Option<RemovedContainerInfo>, bool)> {
+        let project_id = project_id.to_string();
+        let container_info_before_update = self.containers.get(&project_id).await;
 
-        let project_ids: Vec<String> = self.containers.keys().await;
-
-        for project_id in project_ids {
-            if let Err(e) = self.stop_container(&project_id).await {
-                error!("cleanup project {} container failed: {}", project_id, e);
+        match self.update_container_status(&project_id).await {
+            Ok(None) => {
+                // 容器不存在，需要从缓存中移除
+                if let Some(info) = container_info_before_update {
+                    let removed_info = self.build_removed_container_info(&project_id, &info).await;
+                    Some((project_id, Some(removed_info), false))
+                } else {
+                    Some((project_id, None, false))
+                }
+            }
+            Ok(Some(status)) => {
+                // 🆕 对运行中的容器执行服务健康检查
+                if matches!(status, ContainerStatus::Running)
+                    && self
+                        .health_check_running_container(
+                            &project_id,
+                            &health_checker,
+                            &main_network_name,
+                        )
+                        .await
+                {
+                    return Some((project_id, None, true));
+                }
+                Some((project_id, None, false))
+            }
+            Err(e) => {
+                warn!(
+                    "[SYNC] Check container status failed: project_id={}, error={}",
+                    project_id, e
+                );
+                None
             }
         }
+    }
 
-        info!("Container cleanup completed");
-        Ok(())
+    /// 收集被外部移除容器的信息（含获取容器 IP，用于清理 gRPC 连接池）
+    async fn build_removed_container_info(
+        &self,
+        project_id: &str,
+        info: &DockerContainerInfo,
+    ) -> RemovedContainerInfo {
+        let container_ip = match self.get_container_network_info(&info.container_id).await {
+            Ok(ips) => ips.values().next().cloned().unwrap_or_default(),
+            Err(e) => {
+                warn!(
+                    "[SYNC] Failed to get container IP for cleanup: container_id={}, error={}",
+                    info.container_id, e
+                );
+                String::new()
+            }
+        };
+
+        RemovedContainerInfo {
+            container_name: info.container_name.clone(),
+            container_ip,
+            identifier: project_id.to_string(),
+            service_type: info
+                .service_type
+                .clone()
+                .unwrap_or(ServiceType::WebAgentRunner),
+        }
+    }
+
+    /// 对运行中的容器执行服务健康检查并写回缓存
+    ///
+    /// 返回是否实际执行了健康检查（获取到 IP 并完成检查）
+    async fn health_check_running_container(
+        &self,
+        project_id: &str,
+        health_checker: &crate::health::ServiceHealthChecker,
+        main_network_name: &str,
+    ) -> bool {
+        let container_info = self.containers.get(project_id).await;
+        let Some(container_info) = container_info else {
+            return false;
+        };
+
+        // 获取容器 IP
+        let Ok(network_ips) = self
+            .get_container_network_info(&container_info.container_id)
+            .await
+        else {
+            return false;
+        };
+
+        let container_ip = network_ips
+            .get(main_network_name)
+            .or_else(|| network_ips.values().next());
+
+        let Some(ip) = container_ip else {
+            return false;
+        };
+
+        let previous_failures = container_info
+            .service_health
+            .as_ref()
+            .map(|h| h.consecutive_failures)
+            .unwrap_or(0);
+
+        let health_status = health_checker.check_service(ip, previous_failures).await;
+
+        let mut updated_info = container_info.clone();
+        updated_info.service_health = Some(health_status.clone());
+        self.containers
+            .insert(project_id.to_string(), updated_info)
+            .await;
+
+        if health_status.is_fully_healthy() {
+            debug!(
+                "[SYNC] Service healthy: container_id={}, service_type={:?}",
+                project_id, container_info.service_type
+            );
+        } else {
+            warn!(
+                "[SYNC] Service unhealthy: container_id={}, service_type={:?}, http={}, grpc={}, failures={}",
+                project_id,
+                container_info.service_type,
+                health_status.http_healthy,
+                health_status.grpc_healthy,
+                health_status.consecutive_failures
+            );
+        }
+
+        true
+    }
+
+    /// 清理被移除容器的 API 缓存
+    async fn invalidate_cache_for_removed_containers(&self, removed: &[RemovedContainerInfo]) {
+        let identifiers: Vec<String> = removed.iter().map(|r| r.identifier.clone()).collect();
+        self.api_cache.invalidate_all(&identifiers).await;
+        debug!(
+            "[SYNC] Invalidated API cache for {} removed containers",
+            identifiers.len()
+        );
     }
 
     /// 重启容器
@@ -717,257 +748,6 @@ impl DockerManager {
                 "unable to get container status info: {}",
                 container_id
             )))
-        }
-    }
-
-    /// 批量停止并删除指定的容器
-    ///
-    /// # Arguments
-    /// * `container_ids` - 要删除的容器ID列表
-    /// * `options` - 清理选项
-    ///
-    /// # Returns
-    /// 返回清理操作结果统计
-    pub async fn stop_and_remove_containers_by_ids(
-        &self,
-        container_ids: Vec<String>,
-        options: CleanupOptions,
-    ) -> DockerResult<CleanupResult> {
-        info!("Starting cleanup container: count={}", container_ids.len());
-
-        let start_time = Instant::now();
-        let mut result = CleanupResult {
-            total_found: container_ids.len(),
-            ..Default::default()
-        };
-
-        for container_id in &container_ids {
-            match self
-                .stop_and_remove_single_container(container_id, &options)
-                .await
-            {
-                Ok(_) => {
-                    result.successfully_removed += 1;
-                    result.removed_container_ids.push(container_id.clone());
-                    info!("Container cleanup succeeded: {}", container_id);
-                }
-                Err(e) => {
-                    result.failed_removals += 1;
-                    result
-                        .failed_removals_details
-                        .push(ContainerRemovalFailure {
-                            container_id: container_id.clone(),
-                            container_name: container_id.clone(), // 我们可能不知道名称，使用ID
-                            error_message: e.to_string(),
-                        });
-                    error!("Container cleanup failed: {} - {}", container_id, e);
-                }
-            }
-        }
-
-        result.duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
-
-        info!(
-            "Batch container cleanup completed: total={}, success={}, failed={}, duration={}ms",
-            result.total_found,
-            result.successfully_removed,
-            result.failed_removals,
-            result.duration_ms
-        );
-
-        Ok(result)
-    }
-
-    /// 停止并删除单个容器
-    async fn stop_and_remove_single_container(
-        &self,
-        container_id: &str,
-        options: &CleanupOptions,
-    ) -> DockerResult<()> {
-        info!("Cleaning up container: {}", container_id);
-
-        // 第一步：获取容器信息
-        let container_info = self.inspect_container_for_cleanup(container_id).await?;
-
-        // 第二步：检查容器状态并决定是否需要停止
-        match container_info
-            .state
-            .as_ref()
-            .and_then(|s| s.status.as_ref())
-        {
-            // 统一走 ContainerStatus 枚举比较（大小写不敏感），不直接比字符串
-            Some(status) if ContainerStatus::from(status.to_string()).is_running() => {
-                if !options.force_remove_running {
-                    info!("Container {} is running, skip (force=false)", container_id);
-                    return Ok(());
-                }
-
-                if options.wait_for_graceful_stop {
-                    info!("Gracefully stopped container: {}", container_id);
-                    if let Err(e) = self
-                        .graceful_stop_container(container_id, options.stop_timeout_seconds)
-                        .await
-                    {
-                        warn!(
-                            "graceful stop failed, force stopped: {} - {}",
-                            container_id, e
-                        );
-                        // 强制停止
-                        self.force_stop_container(container_id).await?;
-                    }
-                } else {
-                    // 直接强制停止
-                    self.force_stop_container(container_id).await?;
-                }
-            }
-            Some(_) => {
-                info!("Container {} is not running", container_id);
-            }
-            None => {
-                warn!("Unable to get container {} status", container_id);
-            }
-        }
-
-        // 第三步：删除容器
-        self.remove_single_container(container_id, options.remove_associated_volumes)
-            .await?;
-
-        info!("containercleanupcompleted: {}", container_id);
-        Ok(())
-    }
-
-    /// 获取容器信息用于清理
-    async fn inspect_container_for_cleanup(
-        &self,
-        container_id: &str,
-    ) -> Result<bollard::models::ContainerInspectResponse, DockerError> {
-        let options = Some(InspectContainerOptions { size: false });
-
-        self.docker
-            .inspect_container(container_id, options)
-            .await
-            .map_err(|e| {
-                DockerError::ConnectionError(format!("failed to get container info: {}", e))
-            })
-    }
-
-    /// 优雅停止容器
-    async fn graceful_stop_container(
-        &self,
-        container_id: &str,
-        timeout_seconds: u64,
-    ) -> DockerResult<()> {
-        let stop_options = Some(StopContainerOptions {
-            t: Some(timeout_seconds as i32),
-            signal: None::<String>,
-        });
-
-        self.docker
-            .stop_container(container_id, stop_options)
-            .await
-            .map_err(|e| {
-                DockerError::ContainerStopError(format!(
-                    "failed to gracefully stop container: {}",
-                    e
-                ))
-            })
-    }
-
-    /// 强制停止容器
-    async fn force_stop_container(&self, container_id: &str) -> DockerResult<()> {
-        let stop_options = Some(StopContainerOptions {
-            t: None::<i32>,
-            signal: None::<String>,
-        });
-
-        self.docker
-            .stop_container(container_id, stop_options)
-            .await
-            .map_err(|e| {
-                DockerError::ContainerStopError(format!("failed to force stop container: {}", e))
-            })
-    }
-
-    /// 删除单个容器
-    async fn remove_single_container(
-        &self,
-        container_id: &str,
-        remove_volumes: bool,
-    ) -> DockerResult<()> {
-        let remove_options = Some(RemoveContainerOptions {
-            force: true,
-            v: remove_volumes,
-            ..Default::default()
-        });
-
-        self.docker
-            .remove_container(container_id, remove_options)
-            .await
-            .map_err(|e| {
-                DockerError::ContainerRemoveError(format!("failed to delete container: {}", e))
-            })
-    }
-
-    /// 使用模式匹配清理容器（主要接口）
-    ///
-    /// # Arguments
-    /// * `pattern` - 容器名称模式（如 "rcoder-agent-*"）
-    /// * `options` - 清理选项
-    ///
-    /// # Returns
-    /// 返回清理结果统计
-    pub async fn cleanup_containers_with_pattern(
-        &self,
-        pattern: &str,
-        options: CleanupOptions,
-    ) -> DockerResult<CleanupResult> {
-        info!("Starting cleanup container: pattern={:?}", pattern);
-
-        // 第一步：查找匹配的容器
-        let matched_containers = self.list_containers_with_pattern(pattern).await?;
-
-        // 第二步：提取容器ID
-        let container_ids: Vec<String> = matched_containers
-            .iter()
-            .filter_map(|container| container.id.as_ref())
-            .cloned()
-            .collect();
-
-        info!(
-            "Found {} matching containers: pattern={}",
-            container_ids.len(),
-            pattern
-        );
-
-        // 第三步：批量清理
-        let result = self
-            .stop_and_remove_containers_by_ids(container_ids, options)
-            .await;
-
-        // 第四步：从内部映射中移除已清理的容器
-        self.cleanup_internal_mappings(&matched_containers).await;
-
-        result
-    }
-
-    /// 从内部映射中清理已删除的容器
-    async fn cleanup_internal_mappings(&self, removed_containers: &[ContainerSummary]) {
-        for container in removed_containers {
-            if let Some(container_id) = &container.id {
-                // 单次 actor 往返按 container_id 移除所有匹配条目（替代 list()+逐个
-                // remove_if_container_id 的 O(n²)）；仍按 container_id 精确匹配，保留
-                // "防误删重启新容器"语义（重启的新容器 container_id 不同，不被匹配）。
-                let removed = self
-                    .containers
-                    .remove_all_by_container_id(container_id)
-                    .await;
-                for info in &removed {
-                    info!(
-                        "Removed from internal mapping: project_id={}, container_id={}",
-                        info.project_id, container_id
-                    );
-                }
-            }
         }
     }
 }

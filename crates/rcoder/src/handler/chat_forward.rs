@@ -26,6 +26,25 @@ use shared_types::ChatResponse;
 /// chat gRPC 转发最大尝试次数
 const MAX_RETRIES: u32 = 2;
 
+/// chat 处理流程的阶段退出点（纯控制流，不含业务逻辑）
+///
+/// chat / computer-chat 两条链路在拆分为多阶段函数后，阶段失败分为两类：
+/// - [`ChatFlowExit::Response`]：业务校验/容器错误，按原语义以 `Ok(HttpResult::error...)`
+///   形式返回客户端（HTTP 200 + 错误体）；
+/// - [`ChatFlowExit::Fatal`]：基础设施错误，按原语义以 `Err(AppError)` 向上传播。
+pub enum ChatFlowExit {
+    /// 以业务错误响应提前结束（保持原 `Ok(HttpResult::...)` 语义）
+    Response(HttpResult<ChatResponse>),
+    /// 以 AppError 提前结束（保持原 `Err(AppError)` 语义）
+    Fatal(crate::AppError),
+}
+
+impl From<crate::AppError> for ChatFlowExit {
+    fn from(e: crate::AppError) -> Self {
+        ChatFlowExit::Fatal(e)
+    }
+}
+
 /// 重试前重新解析容器地址的上下文（Docker 模式 IP 漂移场景）
 pub struct ReResolveCtx<'a> {
     /// 容器运行时（按 name 实时解析）

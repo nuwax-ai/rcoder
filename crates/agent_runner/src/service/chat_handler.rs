@@ -7,21 +7,29 @@
 //! - **RAII 状态管理**: 使用 PendingGuard 自动管理 Pending 状态
 //! - **DashMap Entry API**: 避免读写锁竞态条件
 //! - **Fail Fast**: 尽早暴露问题，便于定位修复
+//!
+//! ## 结构
+//!
+//! `handle_chat_core` 仅负责编排，具体流程拆为三段内部函数：
+//! 1. `prepare_session` —— 会话准备（Agent 状态查询/版本检测/Busy 取消/PendingGuard/session 清理/Auto-Reload）
+//! 2. `dispatch_task` —— 任务下发（目录创建/ChatPrompt 构建/API Key 管理/AgentRequest 创建）
+//! 3. `finalize_response` —— 结果组装（等待响应/状态提交或回滚）
+//!
+//! 取消逻辑见同目录 `cancel.rs`。
 
 #![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{CancelNotification, SessionId};
 use dashmap::DashMap;
 use shared_types::{
-    Attachment, CancelNotificationRequestWrapper, CancelResult, ChatAgentConfig, ChatPromptBuilder,
-    ModelProviderConfig, ServiceType, error_codes,
+    Attachment, ChatAgentConfig, ChatPromptBuilder, ModelProviderConfig, ServiceType, error_codes,
 };
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use super::cancel::cancel_current_task;
 use crate::service::{
     AGENT_REGISTRY, AgentRequest, AgentSessionService, PendingGuard, SESSION_CACHE,
 };
@@ -143,150 +151,26 @@ pub struct ChatHandlerContext {
     pub project_uuid_map: Arc<DashMap<String, String>>,
 }
 
-/// 取消当前正在执行的 Agent 任务
+/// 会话准备阶段的产出
 ///
-/// 发送取消通知并等待取消完成，超时时间为 10 秒
-///
-/// # Arguments
-/// * `cancel_tx` - 取消通知发送通道
-/// * `session_id` - 当前会话 ID
-/// * `project_id` - 项目 ID
-///
-/// # Returns
-/// * `Ok(())` - 取消成功，Agent 状态已恢复为 Idle
-/// * `Err(ChatHandlerOutput)` - 取消失败，包含错误响应
-async fn cancel_current_task(
-    cancel_tx: &tokio::sync::mpsc::Sender<CancelNotificationRequestWrapper>,
-    session_id: &str,
-    project_id: &str,
-) -> Result<(), ChatHandlerOutput> {
-    info!(
-        "[ChatHandler] Cancelling current task: project_id={}, session_id={}",
-        project_id, session_id
-    );
-
-    // 1. 检查 cancel_tx 是否有效
-    if cancel_tx.is_closed() {
-        error!(
-            "[ChatHandler] Cancel channel closed: project_id={}, session_id={}",
-            project_id, session_id
-        );
-        return Err(ChatHandlerOutput::error(
-            project_id.to_string(),
-            session_id.to_string(),
-            error_codes::get_i18n_message_default("error.cancel_channel_closed"),
-            error_codes::ERR_SERVICE_UNAVAILABLE.to_string(),
-        ));
-    }
-
-    // 2. 创建 oneshot channel 等待取消结果
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<CancelResult>();
-    let cancel_notification = CancelNotification::new(SessionId::new(Arc::from(session_id)));
-    let cancel_request = CancelNotificationRequestWrapper {
-        cancel_notification,
-        result_tx,
-    };
-
-    // 3. 发送取消通知
-    if let Err(e) = cancel_tx.send(cancel_request).await {
-        error!(
-            "[ChatHandler] Failed to send cancel notification: project_id={}, error={}",
-            project_id, e
-        );
-        return Err(ChatHandlerOutput::error(
-            project_id.to_string(),
-            session_id.to_string(),
-            format!(
-                "{}: {}",
-                error_codes::get_i18n_message_default("error.cancel_failed"),
-                e
-            ),
-            error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-        ));
-    }
-
-    // 4. 等待取消结果（超时 10 秒）
-    match tokio::time::timeout(Duration::from_secs(10), result_rx).await {
-        Ok(Ok(cancel_result)) => {
-            if cancel_result.is_success() {
-                info!(
-                    "[ChatHandler] Cancel notification sent successfully, proceeding with new request: project_id={}, session_id={}",
-                    project_id, session_id
-                );
-
-                // 🎯 关键设计：cancel 后立即返回，不等待 session 移除
-                //
-                // 上下文连续性保证：
-                // - 不等待 session 移除 → session 保持在 Registry 中
-                // - get_or_create_session → is_channel_closed()=false → 复用同一 session
-                // - 新 prompt 发送到同一 session 的 prompt_tx → 同一 Agent 子进程处理
-                // - Agent 子进程保持存活 → 内存中的对话上下文连续
-                //
-                // 时序：
-                // 1. CancelResult::Success → cancel 通知已发送给 Agent
-                // 2. SACP inner loop 收到 cancel → is_cancelled=true → 等待 Agent 响应或超时
-                // 3. inner loop 退出 → outer loop 继续等待 prompt_rx
-                // 4. 新请求的 prompt 到达 → session_cancelled 重置 → 处理新 prompt
-                // 5. 同一 Agent 子进程处理新 prompt → 上下文连续
-                //
-                // 最坏情况延迟：inner cancel timeout (10s) — Agent 不响应 cancel 时
-                Ok(())
-            } else {
-                let error_msg = cancel_result.error_message().unwrap_or("Unknown error");
-                error!(
-                    "[ChatHandler] Cancel failed: project_id={}, error={}",
-                    project_id, error_msg
-                );
-                Err(ChatHandlerOutput::error(
-                    project_id.to_string(),
-                    session_id.to_string(),
-                    format!(
-                        "{}: {}",
-                        error_codes::get_i18n_message_default("error.cancel_failed"),
-                        error_msg
-                    ),
-                    error_codes::ERR_AGENT_ERROR.to_string(),
-                ))
-            }
-        }
-        Ok(Err(_)) => {
-            error!(
-                "[ChatHandler] Cancel result channel dropped: project_id={}",
-                project_id
-            );
-            Err(ChatHandlerOutput::error(
-                project_id.to_string(),
-                session_id.to_string(),
-                error_codes::get_i18n_message_default("error.cancel_channel_dropped"),
-                error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-            ))
-        }
-        Err(_) => {
-            error!(
-                "[ChatHandler] Cancel timeout (10s): project_id={}",
-                project_id
-            );
-            Err(ChatHandlerOutput::error(
-                project_id.to_string(),
-                session_id.to_string(),
-                error_codes::get_i18n_message_default("error.cancel_timeout"),
-                error_codes::ERR_CANCEL_FAILED.to_string(),
-            ))
-        }
-    }
+/// 由 `prepare_session` 返回，传递给后续的任务下发与结果组装阶段
+struct SessionPreparation {
+    /// RAII 状态守卫（成功提交前保持 Pending，失败时自动清理）
+    pending_guard: PendingGuard<'static>,
+    /// agent 版本号（检测失败时为 None）
+    agent_version: Option<String>,
+    /// 是否触发了 agent 二进制热重载
+    was_reloaded: bool,
+    /// auto_reload 重启前的旧 session_id（用于 resume 恢复上下文）
+    resume_session_id: Option<String>,
 }
 
 /// 执行 Chat 请求的核心逻辑
 ///
-/// 封装了 chat 请求的完整处理流程：
-/// 1. Agent Busy 检查
-/// 2. PendingGuard RAII 状态管理
-/// 3. Session 清理逻辑
-/// 4. 目录创建
-/// 5. ChatPrompt 构建
-/// 6. API Key 管理
-/// 7. AgentRequest 创建和发送
-/// 8. 等待响应
+/// 封装了 chat 请求的完整处理流程（编排三段内部函数）：
+/// 1. `prepare_session`: Agent 状态查询、版本检测、Busy 取消、PendingGuard、session 清理、Auto-Reload
+/// 2. `dispatch_task`: 目录创建、ChatPrompt 构建、API Key 管理、AgentRequest 创建
+/// 3. `finalize_response`: 等待响应、状态提交或回滚
 ///
 /// # Arguments
 ///
@@ -312,11 +196,58 @@ pub async fn handle_chat_core(
         input.model_config.is_some()
     );
 
+    // ========== 阶段1: 会话准备（ensure session/registry） ==========
+    let preparation = match prepare_session(&input, &project_id, &session_id).await {
+        Ok(preparation) => preparation,
+        Err(output) => return output,
+    };
+
+    // ========== 阶段2: 任务下发 ==========
+    let agent_request = match dispatch_task(
+        input,
+        context,
+        &project_id,
+        &session_id,
+        &request_id,
+        &preparation,
+    )
+    .await
+    {
+        Ok(agent_request) => agent_request,
+        Err(output) => return output,
+    };
+
+    // ========== 阶段3: 结果组装 ==========
+    finalize_response(
+        context,
+        agent_request,
+        preparation,
+        project_id,
+        session_id,
+        request_id,
+    )
+    .await
+}
+
+/// 阶段1: 会话准备
+///
+/// 对应原流程步骤 1 ~ 4.5：
+/// - 步骤 1: 查询现有 Agent 状态（session_id 优先，回退 project_id）
+/// - 步骤 1.5: 检查 agent 二进制是否存在 + 版本检测（缺失时兜底自装）
+/// - 步骤 2: Agent Busy 时取消当前任务
+/// - 步骤 3: 创建 PendingGuard（RAII）
+/// - 步骤 4: 清理无效 session / 复用时清空 ring buffer
+/// - 步骤 4.5: Auto-Reload 检测（强制重启 ACP agent 进程）
+async fn prepare_session(
+    input: &ChatHandlerInput,
+    project_id: &str,
+    session_id: &Option<String>,
+) -> Result<SessionPreparation, ChatHandlerOutput> {
     // ========== 步骤1: 查询现有 Agent 状态 ==========
     // 优先通过 session_id 查找，回退到 project_id 查找
     // 用 view 闭包访问 agent_info:闭包返回即释放读锁,无 Ref 暴露 —— 结构上杜绝守卫跨
     // 下面 install_agent / get_agent_version 的 await(闭包是同步 FnOnce,无法在里面 await)。
-    let agent_busy = if let Some(ref sid) = session_id {
+    let agent_busy = if let Some(sid) = session_id {
         info!(
             "[ChatHandler] Looking up Agent by session_id: session_id={}",
             sid
@@ -336,7 +267,7 @@ pub async fn handle_chat_core(
             "[ChatHandler] Looking up Agent by project_id: project_id={}",
             project_id
         );
-        AGENT_REGISTRY.view_agent_info(&project_id, |info| {
+        AGENT_REGISTRY.view_agent_info(project_id, |info| {
             (
                 info.status,
                 info.cancel_tx.clone(),
@@ -352,12 +283,12 @@ pub async fn handle_chat_core(
             if let Some(ref command) = server.command {
                 if let Err(e) = checker::check_agent_exists(command) {
                     error!("[ChatHandler] Agent not found: {}", e);
-                    return ChatHandlerOutput::error(
-                        project_id,
-                        session_id.unwrap_or_default(),
+                    return Err(ChatHandlerOutput::error(
+                        project_id.to_string(),
+                        session_id.clone().unwrap_or_default(),
                         e,
                         error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
-                    );
+                    ));
                 }
 
                 // 兜底自装：bundle 缺失时（正常情况 rcoder 已装好，走不到这里）主动安装；
@@ -395,12 +326,12 @@ pub async fn handle_chat_core(
                                     "[ChatHandler] fallback self-install: cache dir init failed: {}",
                                     e
                                 );
-                                return ChatHandlerOutput::error(
-                                    project_id,
-                                    session_id.unwrap_or_default(),
+                                return Err(ChatHandlerOutput::error(
+                                    project_id.to_string(),
+                                    session_id.clone().unwrap_or_default(),
                                     format!("agent cache dir unavailable: {}", e),
                                     error_codes::ERR_AGENT_MGMT_INSTALL_FAILED.to_string(),
-                                );
+                                ));
                             }
                         };
                         let args = server.args.clone().unwrap_or_default();
@@ -421,12 +352,12 @@ pub async fn handle_chat_core(
                                  version={}, error={:?}",
                                 agent_id, version, e
                             );
-                            return ChatHandlerOutput::error(
-                                project_id,
-                                session_id.unwrap_or_default(),
+                            return Err(ChatHandlerOutput::error(
+                                project_id.to_string(),
+                                session_id.clone().unwrap_or_default(),
                                 format!("agent bundle missing and self-install failed: {}", e),
                                 error_codes::ERR_AGENT_MGMT_INSTALL_FAILED.to_string(),
-                            );
+                            ));
                         }
                         warn!(
                             "[ChatHandler] fallback self-install OK: agent_id={}, version={}",
@@ -441,15 +372,15 @@ pub async fn handle_chat_core(
                             version,
                             install_root.display()
                         );
-                        return ChatHandlerOutput::error(
-                            project_id,
-                            session_id.unwrap_or_default(),
+                        return Err(ChatHandlerOutput::error(
+                            project_id.to_string(),
+                            session_id.clone().unwrap_or_default(),
                             format!(
                                 "agent bundle missing and no install info: agent_id={}, version={}",
                                 agent_id, version
                             ),
                             error_codes::ERR_AGENT_MGMT_INSTALL_FAILED.to_string(),
-                        );
+                        ));
                     }
                 }
 
@@ -464,12 +395,12 @@ pub async fn handle_chat_core(
         // 默认 agent
         if let Err(e) = checker::check_agent_exists(shared_types::DEFAULT_AGENT_ID) {
             error!("[ChatHandler] Default agent not found: {}", e);
-            return ChatHandlerOutput::error(
-                project_id,
-                session_id.unwrap_or_default(),
+            return Err(ChatHandlerOutput::error(
+                project_id.to_string(),
+                session_id.clone().unwrap_or_default(),
                 e,
                 error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
-            );
+            ));
         }
         checker::get_agent_version(shared_types::DEFAULT_AGENT_ID).await
     };
@@ -495,14 +426,14 @@ pub async fn handle_chat_core(
 
         // 取消当前任务
         if let Err(cancel_error) =
-            cancel_current_task(&cancel_tx, &actual_session_id, &project_id).await
+            cancel_current_task(&cancel_tx, &actual_session_id, project_id).await
         {
             // 取消失败，返回错误
             error!(
                 "[ChatHandler] Failed to cancel current task: project_id={}, error={:?}",
                 project_id, cancel_error
             );
-            return cancel_error;
+            return Err(cancel_error);
         }
 
         info!(
@@ -513,7 +444,7 @@ pub async fn handle_chat_core(
 
     // ========== 步骤3: 创建 PendingGuard（RAII）==========
     // 自动在作用域结束时清理，避免状态泄漏
-    let pending_guard = PendingGuard::new(&AGENT_REGISTRY, &project_id);
+    let pending_guard = PendingGuard::new(&AGENT_REGISTRY, project_id);
     info!(
         "[ChatHandler] Created PendingGuard: project_id={}",
         project_id
@@ -521,7 +452,7 @@ pub async fn handle_chat_core(
 
     // ========== 步骤4: 清理无效 session ==========
     // 只在 session 不存在时才清理无效的 session_id
-    if let Some(ref sid) = session_id {
+    if let Some(sid) = session_id {
         let session_exists = AGENT_REGISTRY.contains_session(sid);
         info!(
             "[ChatHandler] Step 4: session_id={}, session_exists_in_registry={}",
@@ -578,7 +509,7 @@ pub async fn handle_chat_core(
         && let Some(_command) = agent_server.command.as_deref()
     {
         // Re-lookup from registry (original binding may have been consumed in Step 2)
-        let agent_info_for_reload = AGENT_REGISTRY.get_agent_info(&project_id);
+        let agent_info_for_reload = AGENT_REGISTRY.get_agent_info(project_id);
 
         if let Some(agent_info) = agent_info_for_reload {
             // Extract needed data, then IMMEDIATELY drop Ref before .await
@@ -608,7 +539,7 @@ pub async fn handle_chat_core(
             }
 
             // 2. Remove from AGENT_REGISTRY
-            AGENT_REGISTRY.remove_by_project(&project_id);
+            AGENT_REGISTRY.remove_by_project(project_id);
 
             // 3. Notify SSE stream + clean SESSION_CACHE
             if !old_session_id.is_empty() {
@@ -622,8 +553,7 @@ pub async fn handle_chat_core(
                     error_message: Some("Auto-reload: restarting agent".into()),
                     request_id: None,
                 });
-                let _ =
-                    push_session_update_with_project(&project_id, &old_session_id, notify).await;
+                let _ = push_session_update_with_project(project_id, &old_session_id, notify).await;
 
                 // view() 在闭包返回后立即释放锁，无 Ref 暴露
                 if let Some(sd) = SESSION_CACHE.view(&old_session_id, |_, d| d.clone()) {
@@ -641,6 +571,29 @@ pub async fn handle_chat_core(
         }
     }
 
+    Ok(SessionPreparation {
+        pending_guard,
+        agent_version,
+        was_reloaded,
+        resume_session_id: old_session_id_for_resume,
+    })
+}
+
+/// 阶段2: 任务下发
+///
+/// 对应原流程步骤 5 ~ 8：
+/// - 步骤 5: 获取项目工作目录并确保存在
+/// - 步骤 6: 构建 ChatPrompt 和 PromptMessage
+/// - 步骤 7: 管理 API 密钥配置
+/// - 步骤 8: 创建 AgentRequest
+async fn dispatch_task(
+    input: ChatHandlerInput,
+    context: &ChatHandlerContext,
+    project_id: &str,
+    session_id: &Option<String>,
+    request_id: &str,
+    preparation: &SessionPreparation,
+) -> Result<AgentRequest, ChatHandlerOutput> {
     // ========== 步骤5: 获取项目工作目录 ==========
     let project_dir = input.project_dir.clone();
     info!(
@@ -653,29 +606,29 @@ pub async fn handle_chat_core(
         && let Err(e) = tokio::fs::create_dir_all(&project_dir).await
     {
         error!("[ChatHandler] Failed to create project directory: {}", e);
-        return ChatHandlerOutput::error(
-            project_id,
-            session_id.unwrap_or_default(),
+        return Err(ChatHandlerOutput::error(
+            project_id.to_string(),
+            session_id.clone().unwrap_or_default(),
             format!(
                 "{}: {}",
                 error_codes::get_i18n_message_default("error.create_project_dir_failed"),
                 e
             ),
             error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-        );
+        ));
     }
 
     // ========== 步骤6: 构建 ChatPrompt 和 PromptMessage ==========
 
     // 如果是 auto_reload 重启，使用旧 session_id 作为 resume_session_id
-    let session_id_for_prompt = if was_reloaded {
-        old_session_id_for_resume.clone()
+    let session_id_for_prompt = if preparation.was_reloaded {
+        preparation.resume_session_id.clone()
     } else {
         session_id.clone()
     };
 
     let chat_prompt = match ChatPromptBuilder::default()
-        .project_id(project_id.clone())
+        .project_id(project_id.to_string())
         .project_path(project_dir)
         .session_id(session_id_for_prompt)
         .prompt(input.prompt)
@@ -683,7 +636,7 @@ pub async fn handle_chat_core(
         .data_source_attachments(input.data_source_attachments)
         .service_type(input.service_type)
         .user_id(input.user_id)
-        .request_id(request_id.clone())
+        .request_id(request_id.to_string())
         .model_provider(input.model_config.clone())
         .system_prompt_override(input.system_prompt_override)
         .user_prompt_template_override(input.user_prompt_template_override)
@@ -694,16 +647,16 @@ pub async fn handle_chat_core(
         Ok(prompt) => prompt,
         Err(e) => {
             error!("[ChatHandler] Failed to build ChatPrompt: {}", e);
-            return ChatHandlerOutput::error(
-                project_id,
-                session_id.unwrap_or_default(),
+            return Err(ChatHandlerOutput::error(
+                project_id.to_string(),
+                session_id.clone().unwrap_or_default(),
                 format!(
                     "{}: {}",
                     error_codes::get_i18n_message_default("error.build_chat_prompt_failed"),
                     e
                 ),
                 error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-            );
+            ));
         }
     };
 
@@ -742,7 +695,7 @@ pub async fn handle_chat_core(
         // 存储 project_id -> UUID 映射（用于后续清理时查找）
         context
             .project_uuid_map
-            .insert(project_id.clone(), service_uuid_ref.to_string());
+            .insert(project_id.to_string(), service_uuid_ref.to_string());
 
         info!(
             "[ChatHandler] Stored API config: service_uuid={}, provider_name={}, base_url={}",
@@ -756,10 +709,29 @@ pub async fn handle_chat_core(
 
     // ========== 步骤8: 直接调用 Agent 会话服务 ==========
     // 创建请求并设置 UUID 和密钥管理器
-    let agent_request = AgentRequest::new(prompt_message, model_provider)
+    Ok(AgentRequest::new(prompt_message, model_provider)
         .with_service_uuid(service_uuid)
-        .with_key_manager(Some(context.shared_api_key_manager.clone()));
+        .with_key_manager(Some(context.shared_api_key_manager.clone())))
+}
 
+/// 阶段3: 结果组装
+///
+/// 对应原流程步骤 9：等待响应（5 分钟超时），成功时提交 PendingGuard，
+/// 失败/超时时回滚 API key 配置（PendingGuard 自动清理）
+async fn finalize_response(
+    context: &ChatHandlerContext,
+    agent_request: AgentRequest,
+    preparation: SessionPreparation,
+    project_id: String,
+    session_id: Option<String>,
+    request_id: String,
+) -> ChatHandlerOutput {
+    let SessionPreparation {
+        pending_guard,
+        agent_version,
+        was_reloaded,
+        ..
+    } = preparation;
     // ========== 步骤9: 等待响应（5 分钟超时）==========
     match tokio::time::timeout(
         Duration::from_secs(300),
