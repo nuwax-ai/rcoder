@@ -153,10 +153,20 @@ async fn apply_validated_file_ops(
                         .await
                         .map(|m| m.is_dir())
                         .unwrap_or(false);
-                    if is_dir {
-                        fs::remove_dir_all(&target).await?;
+                    let remove_res = if is_dir {
+                        fs::remove_dir_all(&target).await
                     } else {
-                        fs::remove_file(&target).await?;
+                        fs::remove_file(&target).await
+                    };
+                    // NotFound = 文件在 path_exists 后、remove 前被删（TOCTOU）= 删除目标已达成，
+                    // 良性跳过；其他错误（权限/IO/磁盘等）是真实失败 → 传播给调用方（Fail Fast），不吞。
+                    if let Err(e) = remove_res
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        return Err(AppError::system(format!(
+                            "delete {}: {e}",
+                            target.display()
+                        )));
                     }
                 }
             }
