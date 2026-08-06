@@ -331,9 +331,11 @@ impl SharedStream {
                 &self.last_activity_secs,
             );
         }
-        // broadcast：无 receiver 时 send 返回 Err（客户端全断时事件只留 ring）；记 debug 便于诊断
+        // broadcast：无 receiver 时 send 返回 Err（客户端全断时事件只留 ring）。
+        // 高频路径 (每个流式 chunk 都经过), 且"无订阅者"是正常态 (客户端全断后
+        // 流要等 idle 清理窗口才移除), 用 debug 避免日志刷屏。
         if let Err(send_err) = self.broadcast_tx.send(ev) {
-            warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
+            debug!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
         }
     }
 
