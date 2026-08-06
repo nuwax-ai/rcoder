@@ -68,13 +68,15 @@ pub async fn download_bytes_limited(url: &str, max_bytes: u64) -> Result<Bytes, 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| DownloadError::Http(format!("read body from {url}: {e}")))?;
-        buf.extend_from_slice(&chunk);
-        if buf.len() as u64 > max_bytes {
+        // 先判超限再写入：避免单个 chunk 让 buf 越过 cap 一个 chunk 才触发（更紧 + 不分配超限内存）
+        let projected = buf.len() as u64 + chunk.len() as u64;
+        if projected > max_bytes {
             return Err(DownloadError::BinaryTooLarge {
-                size: buf.len() as u64,
+                size: projected,
                 max: max_bytes,
             });
         }
+        buf.extend_from_slice(&chunk);
     }
     Ok(buf.into())
 }
