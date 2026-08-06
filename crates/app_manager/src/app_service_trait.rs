@@ -106,6 +106,16 @@ pub trait AppServiceTrait: Send + Sync {
         message: Option<String>,
     ) -> AppResult<ReleaseInfo>;
 
+    /// 中止 pending 发布（index-only compare-and-clear）。
+    /// confirm(false) 自身失败导致 pending 卡死时的运维自救手段：仅当 pending 恰指该 release
+    /// 时置 Failed + 清 pending，不做任何文件/运行时操作。
+    async fn abort_release(
+        &self,
+        app_id: &str,
+        release_id: &str,
+        message: Option<String>,
+    ) -> AppResult<ReleaseInfo>;
+
     async fn list_releases(&self, app_id: &str) -> AppResult<ReleaseListResponse>;
 
     async fn delete_release(&self, app_id: &str, release_id: &str) -> AppResult<()>;

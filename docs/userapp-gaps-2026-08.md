@@ -8,6 +8,9 @@
 >
 > **优先级**:🔴 高(正确性/数据) · 🟠 中(UX/健壮性) · 🔵 低(TODO) · 🟢 文档同步
 >
+> **修复状态(2026-08)**:R1-R4、U1-U3、T1、P1 已全部实施完成并通过单测/clippy 验证;T1 采用
+> Pingap admin loopback 只读确认方案(admin 仅用于 reload 生效确认,不经 admin 修改配置)。
+>
 > **重要前置结论(不是问题,别误改)**:
 > - **per-app 子域名访问由独立的前端/网关项目实现**(host→app 映射后转发 rcoder),rcoder 后端是
 >   Pingora 路径代理 `/proxy/apps/{app_id}/{port}/`(无 hostnames)——这是设计分工,不是缺口。
@@ -16,7 +19,7 @@
 
 ---
 
-## 🔴 R1 — 首次发布失败:code 被删空 + 空壳 Deployment 残留
+## 🔴 R1 — 首次发布失败:code 被删空 + 空壳 Deployment 残留(✅ 已修复)
 
 ### 问题
 发布编排的失败补偿(post_activate 收敛到 `confirm_release(healthy=false)`)对**升级**场景完善
@@ -74,7 +77,7 @@ index 标 Failed 且无 pending。下次发布能正常成功。
 
 ---
 
-## 🔴 R2 — create_app 部分失败无回滚
+## 🔴 R2 — create_app 部分失败无回滚(✅ 已修复)
 
 ### 问题
 `create_app` 内部多步(建 PVC/目录 → create_deployment + 注册 pingora),任一步失败直接 return Err,
@@ -107,7 +110,7 @@ create_app 任一步失败后,不残留半成品资源;下次同名 create 能�
 
 ---
 
-## 🔴 R3 — confirm(healthy=false) 自身失败 → pending 卡死
+## 🔴 R3 — confirm(healthy=false) 自身失败 → pending 卡死(✅ 已修复)
 
 ### 问题
 post_activate 的失败收敛依赖 `confirm_release(healthy=false)` 成功清掉 pending_release_id。若
@@ -143,7 +146,7 @@ confirm(false) 失败后,pending 被强制清掉,下次发布能正常 activate�
 
 ---
 
-## 🟠 R4 — disabled 服务:supervisor 与 Pingap 生成缺防御性 `.filter(enabled)`
+## 🟠 R4 — disabled 服务:supervisor 与 Pingap 生成缺防御性 `.filter(enabled)`(✅ 已修复)
 
 ### 问题
 `enabled=false` 的服务在 build/release_lock 阶段已被排除(不进 release.lock),所以当前**无功能
@@ -200,7 +203,7 @@ bug**。但运行时消费者(app-cli supervisor 的 migrate/start、managed Pin
 
 ---
 
-## 🟠 U1 — runtime 日志源(stdout/stderr)不自动注册
+## 🟠 U1 — runtime 日志源(stdout/stderr)不自动注册(✅ 已修复)
 
 ### 问题
 app-cli 把每个服务的 stdout/stderr 捕获落盘成 `runtime.out.log`/`runtime.err.log`,但**不**在日志
@@ -240,7 +243,7 @@ manifest 不声明任何 `[[logs.sources]]` 的服务,其 stdout/stderr 也能�
 
 ---
 
-## 🟠 U2 — 同 app 并发 publish 无早拒绝
+## 🟠 U2 — 同 app 并发 publish 无早拒绝(✅ 已修复)
 
 ### 问题
 `PublishTaskStore::create` 只查全局容量(默认 1000),不查"该 app 是否已有进行中的 publish 任务"。
@@ -273,7 +276,7 @@ Pending/Running/Cancelling 的 publish 任务,返回 `Conflict`;handler 返回 *
 
 ---
 
-## 🟠 U3 — `POSTGRES_*`/`PG*` 未进保留环境变量清单(footgun)
+## 🟠 U3 — `POSTGRES_*`/`PG*` 未进保留环境变量清单(footgun)(✅ 已修复)
 
 ### 问题
 容器继承的 `POSTGRES_USER`/`POSTGRES_DB`/`POSTGRES_PASSWORD`/`PGHOST`/`PGPORT` 没在 manifest 的
@@ -312,7 +315,7 @@ Pending/Running/Cancelling 的 publish 任务,返回 `Conflict`;handler 返回 *
 
 ---
 
-## 🔵 T1 — Pingap reload 无生效确认(设计 §12.2.6,TODO)
+## 🔵 T1 — Pingap reload 无生效确认(设计 §12.2.6,TODO)(✅ 已修复)
 
 ### 问题
 `POST /v1/proxy/reload`(及 app-cli 的 Pingap 配置编译)只做 `pingap -t` 语法校验 + 原子落盘,就
@@ -346,7 +349,7 @@ reload 返回成功时,Pingap 实际加载的配置与写入一致;加载失败�
 
 ---
 
-## 🟢 P1 — cursor_reset 事件已实现(设计 §12.2.10 标 TODO,实际已落地)
+## 🟢 P1 — cursor_reset 事件已实现(设计 §12.2.10 标 TODO,实际已落地)(✅ 已修复)
 
 ### 问题(文档/代码不同步)
 设计文档 `application-management-service-v2-design.md` §12.2.10(item 10)把"app-cli 重启后 boot ID

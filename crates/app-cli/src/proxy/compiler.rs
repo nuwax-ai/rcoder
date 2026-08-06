@@ -11,12 +11,18 @@ use super::pingap::{PINGAP_PORT, ProxyEntry, build_pingap_config};
 const MAX_CONFIG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OBJECTS_PER_CATEGORY: usize = 256;
 
+/// 编译产物：生效配置路径 + 期望 config_hash（供 admin 只读确认重载生效）。
+pub struct CompileOutcome {
+    pub config_path: PathBuf,
+    pub expected_hash: String,
+}
+
 pub async fn compile_and_validate(
     workspace: &Path,
     runtime_root: &Path,
     pingap_bin: &Path,
     release: &ReleaseLock,
-) -> Result<PathBuf> {
+) -> Result<CompileOutcome> {
     let mut config = match release.pingap.mode {
         PingapMode::Managed => managed_config(release)?,
         PingapMode::Extend => compile_extend(workspace, release).await?,
@@ -25,6 +31,11 @@ pub async fn compile_and_validate(
     resolve_service_addresses(&mut config, release)?;
     validate_guardrails(&config)?;
     config.validate().context("PingapConfig::validate")?;
+    // 期望 hash：与 pingap 加载同一 TOML 后 get_current_config().hash() 同算法
+    //（descriptions 拼接 CRC32），供 reload 只读确认比对。
+    let expected_hash = config
+        .hash()
+        .context("compute effective Pingap config hash")?;
     let content = toml::to_string_pretty(&config).context("serialize effective Pingap config")?;
     if content.len() > MAX_CONFIG_BYTES {
         anyhow::bail!("effective Pingap config exceeds {MAX_CONFIG_BYTES} bytes");
@@ -53,16 +64,32 @@ pub async fn compile_and_validate(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    // rename 前备份当前生效 TOML 为 pingap.toml.prev（保留上一份供 reload 失败回切）。
+    if tokio::fs::try_exists(&target)
+        .await
+        .with_context(|| format!("stat Pingap config {}", target.display()))?
+    {
+        let backup = target_dir.join("pingap.toml.prev");
+        tokio::fs::copy(&target, &backup)
+            .await
+            .with_context(|| format!("backup Pingap config {}", backup.display()))?;
+    }
     tokio::fs::rename(&temporary, &target)
         .await
         .with_context(|| format!("commit Pingap config {}", target.display()))?;
-    Ok(target)
+    Ok(CompileOutcome {
+        config_path: target,
+        expected_hash,
+    })
 }
 
 fn managed_config(release: &ReleaseLock) -> Result<PingapConfig> {
     let entries: Vec<_> = release
         .services
         .iter()
+        // 防御过滤：release.lock 正常不含 disabled 服务，此为防御手工篡改/未来锁语义变化
+        // （对齐 resolve_service_addresses 的 enabled 过滤先例）。
+        .filter(|service| service.enabled)
         .filter_map(|service| {
             service.proxy.as_ref().map(|proxy| ProxyEntry {
                 name: service.service_id.clone(),
@@ -93,7 +120,9 @@ async fn compile_extend(workspace: &Path, release: &ReleaseLock) -> Result<Pinga
     merge_unique(&mut managed.storages, extension.storages, "storage")?;
     let known_plugins: BTreeSet<_> = managed.plugins.keys().map(String::as_str).collect();
     let known_storages: BTreeSet<_> = managed.storages.keys().map(String::as_str).collect();
-    for service in &release.services {
+    // 防御过滤：release.lock 正常不含 disabled 服务，此为防御手工篡改/未来锁语义变化；
+    // disabled 服务的 plugin/storage 引用不参与校验（其拓扑也不会进入 managed 配置）。
+    for service in release.services.iter().filter(|service| service.enabled) {
         if let Some(proxy) = &service.proxy {
             for plugin in &proxy.plugins {
                 if !plugin.starts_with("pingap:") && !known_plugins.contains(plugin.as_str()) {
@@ -314,7 +343,96 @@ async fn set_private_permissions(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_upstream_destination;
+    use super::{managed_config, validate_upstream_destination};
+    use workspace_manifest::ReleaseLock;
+
+    fn release_lock_with_disabled_proxy() -> ReleaseLock {
+        toml::from_str(
+            r#"
+schema_version = 1
+release_id = "release-1"
+workspace_name = "test"
+minimum_app_cli_version = "0.1.0"
+runtime_image_digest = "runtime:test"
+
+[pingap]
+mode = "managed"
+version = "test"
+commit = "test"
+
+[[services]]
+service_id = "api"
+name = "API"
+dir = "api"
+type = "go"
+kind = "web"
+enabled = true
+port = 18080
+
+[services.run]
+command = ["./api"]
+
+[services.health]
+
+[services.env]
+
+[services.proxy]
+path = "/api/"
+
+[[services.logs]]
+id = "application"
+glob = "application*.log"
+format = "text"
+
+[[services]]
+service_id = "worker"
+name = "Worker"
+dir = "worker"
+type = "go"
+kind = "web"
+enabled = false
+port = 18081
+
+[services.run]
+command = ["./worker"]
+
+[services.health]
+
+[services.env]
+
+[services.proxy]
+path = "/"
+
+[[services.logs]]
+id = "application"
+glob = "application*.log"
+format = "text"
+"#,
+        )
+        .expect("valid release lock")
+    }
+
+    #[test]
+    fn disabled_services_are_excluded_from_managed_config() {
+        let config =
+            managed_config(&release_lock_with_disabled_proxy()).expect("managed config compiles");
+        assert!(config.upstreams.contains_key("api"));
+        assert!(
+            !config.upstreams.contains_key("worker"),
+            "disabled service must not produce a Pingap upstream"
+        );
+        assert!(!config.locations.contains_key("workerLocation"));
+    }
+
+    #[test]
+    fn disabled_only_proxy_services_yield_no_managed_config() {
+        let mut release = release_lock_with_disabled_proxy();
+        release
+            .services
+            .retain(|service| service.service_id == "worker");
+        // 唯一的 proxied 服务被禁用 → 无拓扑可编译，报错而非生成空配置。
+        assert!(managed_config(&release).is_err());
+    }
 
     #[test]
     fn private_and_loopback_upstreams_are_allowed() {

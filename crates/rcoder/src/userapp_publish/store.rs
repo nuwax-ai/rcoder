@@ -51,6 +51,19 @@ impl PublishTaskStore {
             let terminal_at = existing.terminal_at();
             terminal_at == 0 || now.saturating_sub(terminal_at) < TERMINAL_TASK_TTL_SECS
         });
+        // U2 并发早拒绝:同 app 已有活跃任务(未终态)则 409,避免白跑 build 直到
+        // activate 撞 pending 守卫才失败。检查与插入在同一把 map 锁内,并发 create 原子串行。
+        // app_id 为任务锁外不可变字段、terminal_at 为原子读,扫描无需取任务 state 锁;
+        // n≤MAX_RETAINED_TASKS,线性扫描即可,不引入二级索引。
+        if let Some(busy) = map
+            .values()
+            .find(|t| t.app_id() == app_id && t.terminal_at() == 0)
+        {
+            return Err(PublishTaskStoreError::AppBusy {
+                app_id,
+                task_id: busy.id.clone(),
+            });
+        }
         while map.len() >= self.max_retained_tasks {
             let Some(oldest_terminal_id) = map
                 .values()
@@ -127,5 +140,65 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert!(map.contains_key(&replacement.id));
         assert!(!map.contains_key(&completed.id));
+    }
+
+    /// U2:同 app 第二个活跃任务被拒(AppBusy 携带既有活跃任务 id)。
+    #[tokio::test]
+    async fn store_rejects_second_active_task_for_same_app() {
+        let store = PublishTaskStore::new();
+        let first = store
+            .create("app-a".into(), "app-a".into(), PublishTaskKind::Publish)
+            .await
+            .expect("first task");
+
+        let result = store
+            .create("app-a".into(), "app-a".into(), PublishTaskKind::Publish)
+            .await;
+        assert_eq!(
+            result.err(),
+            Some(PublishTaskStoreError::AppBusy {
+                app_id: "app-a".into(),
+                task_id: first.id.clone(),
+            }),
+            "second active task for the same app must be rejected with AppBusy"
+        );
+        assert_eq!(store.map.lock().await.len(), 1);
+    }
+
+    /// U2:前一任务进入终态后,同 app 允许再建新任务。
+    #[tokio::test]
+    async fn store_allows_new_task_after_previous_task_reaches_terminal() {
+        let store = PublishTaskStore::new();
+        let first = store
+            .create("app-a".into(), "app-a".into(), PublishTaskKind::Publish)
+            .await
+            .expect("first task");
+        first
+            .emit(PublishEvent::Failed {
+                error: "build failed".into(),
+            })
+            .await;
+
+        let second = store
+            .create("app-a".into(), "app-a".into(), PublishTaskKind::Publish)
+            .await
+            .expect("terminal previous task must not block new task");
+        assert_ne!(second.id, first.id);
+    }
+
+    /// U2:跨 app 不受 per-app 拒绝影响。
+    #[tokio::test]
+    async fn store_allows_concurrent_active_tasks_for_different_apps() {
+        let store = PublishTaskStore::new();
+        store
+            .create("app-a".into(), "app-a".into(), PublishTaskKind::Publish)
+            .await
+            .expect("task for app-a");
+        let other = store
+            .create("app-b".into(), "app-b".into(), PublishTaskKind::Build)
+            .await
+            .expect("task for a different app must not be rejected");
+        assert_eq!(other.app_id(), "app-b");
+        assert_eq!(store.map.lock().await.len(), 2);
     }
 }

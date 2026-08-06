@@ -279,10 +279,27 @@ fn is_dns1123_label(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
+/// 校验 [env] 不得覆盖运行时保留键。
+///
+/// POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB 保留原因：PG initdb 使用容器 env 的
+/// POSTGRES_PASSWORD 设置密码（docker/app-runtime-base/pg-supervisor-entry.sh），
+/// 用户在 [env] 覆盖会导致服务与 PG 实际密码静默错开、连不上库。
+///
+/// PGHOST/PGPORT 明确不保留：用户代码连外部 PostgreSQL 是合法场景（只影响其服务
+/// 进程自身连接），且 app-cli supervisor 的 wait_for_pg 读的是 app-cli 自身进程 env，
+/// workspace [env] 只注入服务子进程，互不影响。
 fn is_reserved_env(key: &str) -> bool {
     matches!(
         key,
-        "PORT" | "HOST" | "HOSTNAME" | "APP_LOG_DIR" | "APP_SERVICE_ID" | "APP_RELEASE_ID"
+        "PORT"
+            | "HOST"
+            | "HOSTNAME"
+            | "APP_LOG_DIR"
+            | "APP_SERVICE_ID"
+            | "APP_RELEASE_ID"
+            | "POSTGRES_USER"
+            | "POSTGRES_PASSWORD"
+            | "POSTGRES_DB"
     ) || key.starts_with("RCODER_")
 }
 
@@ -353,6 +370,29 @@ mod tests {
             },
         ];
         assert!(validate_topology(&cycle).is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_postgres_env_keys() {
+        for key in ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"] {
+            let mut manifest = project("web", &[]);
+            manifest.env.insert(key.into(), "value".into());
+            match validate_project(&manifest) {
+                Err(ManifestError::Validation(message)) => assert!(
+                    message.contains("reserved by the runtime"),
+                    "{key}: {message}"
+                ),
+                other => panic!("expected reserved env error for {key}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn allows_pghost_and_pgport_env_keys() {
+        let mut manifest = project("web", &[]);
+        manifest.env.insert("PGHOST".into(), "localhost".into());
+        manifest.env.insert("PGPORT".into(), "5432".into());
+        validate_project(&manifest).expect("PGHOST/PGPORT are not reserved");
     }
 
     #[test]

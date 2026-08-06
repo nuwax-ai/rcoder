@@ -29,7 +29,6 @@ const BROADCAST_CAP: usize = 256;
 
 /// 任务可变状态:全部收在【一把】`state` 锁后(status/seq/history 同步变更,保证一致性)。
 struct TaskState {
-    app_id: String,
     project_id: String,
     kind: PublishTaskKind,
     status: PublishTaskStatus,
@@ -55,6 +54,8 @@ pub struct RemoteBuildTask {
 /// 保持在锁外:供 orchestrator/store 无锁读。
 pub struct PublishTask {
     pub id: PublishTaskId,
+    /// 所属 app(不可变,锁外):供 store 在 map 锁内无锁扫描 per-app 活跃任务(U2 早拒绝)。
+    app_id: String,
     state: Mutex<TaskState>,
     tx: broadcast::Sender<(u64, PublishEvent)>,
     cancelled: AtomicBool,
@@ -70,8 +71,8 @@ impl PublishTask {
         let now = Utc::now().timestamp();
         Arc::new(Self {
             id: uuid::Uuid::now_v7().simple().to_string(),
+            app_id,
             state: Mutex::new(TaskState {
-                app_id,
                 project_id,
                 kind,
                 status: PublishTaskStatus::Pending,
@@ -96,7 +97,7 @@ impl PublishTask {
         let s = self.state.lock().await;
         PublishTaskSnapshot {
             id: self.id.clone(),
-            app_id: s.app_id.clone(),
+            app_id: self.app_id.clone(),
             project_id: s.project_id.clone(),
             kind: s.kind,
             status: s.status,
@@ -195,6 +196,11 @@ impl PublishTask {
             }
             notified.await;
         }
+    }
+
+    /// 所属 app(不可变)。供 store create 时同锁扫描 per-app 活跃任务(U2 并发早拒绝)。
+    pub fn app_id(&self) -> &str {
+        &self.app_id
     }
 
     /// 终态时间戳(0=未终态)。Acquire 载入供 store 的 TTL/淘汰决策无锁读。

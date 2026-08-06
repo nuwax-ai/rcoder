@@ -5,8 +5,8 @@ use axum::extract::{Path, State};
 use shared_types::AppError;
 
 use crate::models::{
-    ActivateReleaseRequest, ConfirmReleaseRequest, PrepareReleaseRequest, ReleaseInfo,
-    ReleaseListResponse,
+    AbortReleaseRequest, ActivateReleaseRequest, ConfirmReleaseRequest, PrepareReleaseRequest,
+    ReleaseInfo, ReleaseListResponse,
 };
 
 use super::AppManagerState;
@@ -67,6 +67,27 @@ pub async fn confirm_release(
         state
             .app_service
             .confirm_release(&app_id, &release_id, request.healthy, request.message)
+            .await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/releases/{release_id}/abort",
+    params(("app_id" = String, Path), ("release_id" = String, Path)),
+    request_body = AbortReleaseRequest,
+    responses((status = 200, body = ReleaseInfo)),
+    tag = "应用发布"
+)]
+pub async fn abort_release(
+    State(state): State<Arc<AppManagerState>>,
+    Path((app_id, release_id)): Path<(String, String)>,
+    Json(request): Json<AbortReleaseRequest>,
+) -> Result<Json<ReleaseInfo>, AppError> {
+    Ok(Json(
+        state
+            .app_service
+            .abort_release(&app_id, &release_id, request.message)
             .await?,
     ))
 }

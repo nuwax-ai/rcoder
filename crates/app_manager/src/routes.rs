@@ -42,6 +42,10 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             post(handlers::confirm_release),
         )
         .route(
+            "/api/v1/apps/{app_id}/releases/{release_id}/abort",
+            post(handlers::abort_release),
+        )
+        .route(
             "/api/v1/apps/{app_id}/releases",
             get(handlers::list_releases),
         )

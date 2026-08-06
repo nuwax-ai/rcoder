@@ -250,6 +250,21 @@ async fn run_publish_inner(
                 let combined = format!(
                     "publish failed after activation: {message}; rollback also failed: {rollback_error}"
                 );
+                // confirm(false) 自身失败时的兜底清 pending:abort_release 是 index-only CAS,
+                // 不做文件/运行时操作,即便 confirm 失败也能成功,防止 pending_release_id
+                // 永久残留导致 activate 守卫卡死后续所有发布。best-effort:失败仅记日志。
+                if let Err(abort_error) = state
+                    .app_service
+                    .abort_release(&rcoder_app_id, &release_id, Some(combined.clone()))
+                    .await
+                {
+                    tracing::error!(
+                        task_id = %task.id,
+                        app_id = %app_id,
+                        error = %abort_error,
+                        "best-effort abort_release failed; pending_release_id may remain stuck"
+                    );
+                }
                 tracing::error!(
                     task_id = %task.id,
                     app_id = %app_id,

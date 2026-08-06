@@ -16,8 +16,7 @@ pub fn read_release_lock(workspace: &Path) -> Result<ReleaseLock> {
         .with_context(|| format!("read release lock {}", path.display()))?;
     // 版本感知加载与迁移 dispatch 收敛到 workspace_manifest::load_release_lock（单一权威）；
     // app-cli 与 app_manager 两条读路径都经它，LoadError 经 anyhow 上下文化后返回。
-    load_release_lock(&content)
-        .with_context(|| format!("load release lock {}", path.display()))
+    load_release_lock(&content).with_context(|| format!("load release lock {}", path.display()))
 }
 
 pub fn build_specs(workspace: &Path) -> Result<Vec<ServiceSpec>> {

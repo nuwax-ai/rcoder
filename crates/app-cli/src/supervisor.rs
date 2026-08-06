@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::config::CliArgs;
 use crate::manifest::{self, ServiceSpec};
+use crate::proxy::admin_probe;
 use crate::proxy::compiler::compile_and_validate;
 use crate::proxy::pingap::PINGAP_PORT;
 use crate::runtime_status::RuntimeStatusService;
@@ -24,7 +25,14 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
     // 1. 自动发现子项目 + 组装服务清单
     let release = manifest::read_release_lock(&args.workspace).context("load release lock")?;
     validate_runtime_compatibility(&release)?;
-    let specs = release.services.clone();
+    // 防御过滤：release.lock 正常不含 disabled 服务，此为防御手工篡改/未来锁语义变化；
+    // 一处过滤覆盖后续 migrate/start/readiness/shutdown 全循环（对齐 log/service.rs 先例）。
+    let specs: Vec<ServiceSpec> = release
+        .services
+        .iter()
+        .filter(|service| service.enabled)
+        .cloned()
+        .collect();
 
     // 2. wait PG（PG 由 supervisor [program:postgresql] 托管，秒级就绪；失败不阻断）
     wait_for_pg().await?;
@@ -63,6 +71,8 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
     //   - 无 [health].bridge_service:app-cli 自给自足,初始化完成即 ready。
     //   - 有 bridge_service:只等那一个后端的 readiness_path;超时 → 保持 NotReady(摘流)
     //     但不 bail/崩溃(liveness /health 仍 200,容器活着,用户可 exec 进去排查)。
+    // 防御过滤:bridge 查找仅在已过滤的 specs(enabled 服务)中进行,disabled 服务
+    // 即便被手工写入 bridge_service 也不会被等待(走 warn 默认 ready 分支)。
     let ready = match &release.bridge_service {
         None => true,
         Some(bridge_id) => match specs.iter().find(|s| &s.service_id == bridge_id) {
@@ -134,12 +144,12 @@ fn validate_runtime_compatibility(release: &workspace_manifest::ReleaseLock) -> 
                 if runtime == locked {
                     info!("{name}: release={locked} runtime={runtime} (matched)");
                 } else {
-                    warn!("{name} mismatch (non-fatal, will not block startup): release={locked}, runtime={runtime}");
+                    warn!(
+                        "{name} mismatch (non-fatal, will not block startup): release={locked}, runtime={runtime}"
+                    );
                 }
             }
-            Err(_) => warn!(
-                "{name} not set in runtime (non-fatal): release={locked}"
-            ),
+            Err(_) => warn!("{name} not set in runtime (non-fatal): release={locked}"),
         }
     }
     Ok(())
@@ -316,7 +326,8 @@ async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
 
 // ── pingap 启动 ─────────────────────────────────────────────────────────────────
 
-/// 编译用户权威配置到只读运行目录，`pingap -t` 成功后再启动。
+/// 编译用户权威配置到只读运行目录，`pingap -t` 成功后再启动，
+/// 并经 loopback admin 只读通道确认初始配置实际生效。
 async fn start_pingap(
     ws_root: &Path,
     pingap_bin: &Path,
@@ -326,12 +337,28 @@ async fn start_pingap(
     let runtime_root = std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| "/run/app-cli/pingap".into());
-    let conf_path = compile_and_validate(ws_root, &runtime_root, pingap_bin, release).await?;
-    info!("📝 effective pingap config → {}", conf_path.display());
+    let outcome = compile_and_validate(ws_root, &runtime_root, pingap_bin, release).await?;
+    info!(
+        "📝 effective pingap config → {}",
+        outcome.config_path.display()
+    );
+
+    // admin 仅启用为 loopback 只读确认通道；TOML 仍是唯一配置权威；永不通过 admin 写配置。
+    // 凭证每次启动随机生成，经 env 注入（不进命令行，避免 ps 泄露；不落盘不进日志）。
+    let admin_addr = format!("127.0.0.1:{}", admin_probe::admin_port());
+    let endpoint = admin_probe::register_admin_endpoint(
+        admin_addr,
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
 
     let mut cmd = process_group_command(pingap_bin);
-    cmd.arg("-c").arg(&conf_path).arg("--autoreload");
-    // Admin deliberately stays disabled: workspace TOML is the sole authority.
+    cmd.arg("-c")
+        .arg(&outcome.config_path)
+        .arg("--autoreload")
+        .env("admin_addr", &endpoint.addr)
+        .env("admin_user", &endpoint.user)
+        .env("admin_password", &endpoint.password);
     let child = cmd.spawn().context("spawn pingap")?;
     info!(
         "🚀 start pingap on :{} (pid={})",
@@ -339,6 +366,21 @@ async fn start_pingap(
         child.id().unwrap_or(0)
     );
     children.push(("pingap".into(), child));
+
+    // 初始确认：pingap 必须真正加载当前配置（config_hash 匹配），否则视为启动失败，
+    // 返回 Err 触发 supervisor 整组重启语义；失败前优雅停止已启动的子进程避免残留。
+    if let Err(error) = admin_probe::wait_for_config_hash(
+        endpoint,
+        &outcome.expected_hash,
+        admin_probe::CONFIRM_BUDGET,
+    )
+    .await
+    {
+        error!("❌ pingap initial config confirmation failed: {error:#}");
+        shutdown_all(std::mem::take(children), 5).await;
+        return Err(error).context("confirm initial Pingap config via loopback admin probe");
+    }
+    info!("✅ pingap initial config confirmed (config_hash matched)");
     Ok(())
 }
 

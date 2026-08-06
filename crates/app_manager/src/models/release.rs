@@ -26,6 +26,13 @@ pub struct ConfirmReleaseRequest {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AbortReleaseRequest {
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub enum ReleaseStatus {

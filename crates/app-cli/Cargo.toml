@@ -46,6 +46,8 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.13", default-features = false }
 semver = "1"
+# Pingap admin 鉴权头：sha256("{user}:{pass}:{ts}")（pingap plugin/admin.rs 算法，非 Basic Auth）
+sha2 = "0.10"
 
 # unix 信号已通过 process_utils 封装（仅 unix 启用，不污染 windows 构建）
 

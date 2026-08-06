@@ -19,6 +19,22 @@ use super::model::{
 const MAX_FILES_PER_SOURCE: usize = 128;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// runtime 日志源为平台注入：supervisor 会为每个服务落盘 runtime.out.log /
+/// runtime.err.log（轮转命名 runtime.out.N.log），即使 manifest 未声明也应可查。
+/// 纯内存变换，不写回 release.lock；用户已声明同 id source 时以用户声明为准，不覆盖。
+fn inject_runtime_log_sources(release: &mut ReleaseLock) {
+    for service in &mut release.services {
+        if !service.logs.iter().any(|source| source.id == "runtime") {
+            service.logs.push(LogSource {
+                id: "runtime".into(),
+                glob: "runtime.*.log".into(),
+                format: LogFormat::Text,
+                multiline_start_pattern: None,
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LogService {
     release: ReleaseLock,
@@ -40,7 +56,8 @@ struct MatchedLogFile {
 }
 
 impl LogService {
-    pub fn new(release: ReleaseLock, log_root: PathBuf) -> Self {
+    pub fn new(mut release: ReleaseLock, log_root: PathBuf) -> Self {
+        inject_runtime_log_sources(&mut release);
         Self {
             release,
             log_root,
@@ -765,6 +782,8 @@ format = "jsonl"
         let second = directory.join("application-2.log");
         std::fs::write(&first, "").expect("first log");
         std::fs::write(&second, "").expect("second log");
+        // 平台注入的 runtime 源也需有匹配文件，避免其 source error 干扰断言。
+        std::fs::write(directory.join("runtime.out.log"), "").expect("runtime log");
         let service = LogService::new(release_lock(), root.path().to_path_buf());
 
         let initial = service
@@ -822,6 +841,57 @@ format = "jsonl"
         assert!(response.cursor_reset);
     }
 
+    #[tokio::test]
+    async fn runtime_log_source_is_injected_when_service_declares_no_logs() {
+        let mut release = release_lock();
+        release.services[0].logs.clear();
+        let service = LogService::new(release, PathBuf::from("/nonexistent-log-root"));
+        let sources = service
+            .sources(LogQueryRequest::default())
+            .await
+            .expect("sources query");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].service_id, "api");
+        assert_eq!(sources[0].source_id, "runtime");
+        assert_eq!(sources[0].format, "text");
+    }
+
+    #[tokio::test]
+    async fn existing_runtime_source_is_neither_duplicated_nor_overridden() {
+        let mut release = release_lock();
+        release.services[0].logs = vec![LogSource {
+            id: "runtime".into(),
+            glob: "custom-runtime*.log".into(),
+            format: LogFormat::Jsonl,
+            multiline_start_pattern: None,
+        }];
+        let service = LogService::new(release, PathBuf::from("/nonexistent-log-root"));
+        let sources = service
+            .sources(LogQueryRequest::default())
+            .await
+            .expect("sources query");
+        assert_eq!(sources.len(), 1);
+        // 用户已声明同 id source：不重复注入，且保留用户声明（jsonl 而非平台合成 text）。
+        assert_eq!(sources[0].format, "jsonl");
+    }
+
+    #[tokio::test]
+    async fn injected_runtime_source_coexists_with_user_declared_sources() {
+        // release_lock() 已声明 application 源；runtime 源应共存不覆盖。
+        let service = LogService::new(release_lock(), PathBuf::from("/nonexistent-log-root"));
+        let sources = service
+            .sources(LogQueryRequest::default())
+            .await
+            .expect("sources query");
+        assert_eq!(sources.len(), 2);
+        let ids: Vec<&str> = sources
+            .iter()
+            .map(|source| source.source_id.as_str())
+            .collect();
+        assert!(ids.contains(&"application"), "{ids:?}");
+        assert!(ids.contains(&"runtime"), "{ids:?}");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn service_log_directory_symlink_is_rejected() {
@@ -838,11 +908,13 @@ format = "jsonl"
             .await
             .expect("query isolates source errors");
         assert!(response.logs.is_empty());
-        assert_eq!(response.source_errors.len(), 1);
+        // application 与平台注入的 runtime 两个源都命中 symlink 目录 → 各报一条 source error。
+        assert_eq!(response.source_errors.len(), 2);
         assert!(
-            response.source_errors[0]
-                .message
-                .contains("must be a real directory")
+            response
+                .source_errors
+                .iter()
+                .all(|error| error.message.contains("must be a real directory"))
         );
     }
 }

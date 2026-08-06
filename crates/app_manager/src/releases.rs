@@ -1,28 +1,23 @@
 //! Workspace release package persistence and atomic code switching.
 
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use download_utils::{DownloadConfig, DownloadError, Downloader, extract_zip};
-use fs2::FileExt;
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use download_utils::{DownloadConfig, Downloader};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::models::{
-    AppOperationError, AppResult, PrepareReleaseRequest, ReleaseIndex, ReleaseInfo,
-    ReleaseListResponse, ReleaseStatus,
+    AppOperationError, AppResult, PrepareReleaseRequest, ReleaseInfo, ReleaseListResponse,
+    ReleaseStatus,
+};
+use crate::release_store::{
+    acquire_lock, code_release_id, ensure_release_dirs, map_download_error, plan_retention,
+    read_index, release_retention, remove_dir_if_exists, remove_release_packages,
+    stage_release_package, validate_release_id, validate_sha256, verify_package, write_index,
 };
 use crate::service::AppService;
-use crate::utils::{map_archive_error, map_io_error, validate_app_id};
-
-const RETENTION_MIN: u16 = 2;
-const RETENTION_FALLBACK: u16 = 15;
-const RETENTION_MAX_FALLBACK: u16 = 100;
+use crate::utils::{map_io_error, validate_app_id};
 
 impl AppService {
     #[instrument(skip(self, request))]
@@ -348,6 +343,24 @@ impl AppService {
                 if let Err(restart_err) = self.start_app(app_id).await {
                     restart_error = Some(restart_err);
                 }
+            } else {
+                // 首次发布失败（无旧版本可回滚）：code 已被上方清空，必须清理残留运行时资源，
+                // 否则留下 Deployment 空壳 + 空 code 的坏状态。
+                // 注意：此处**不可调 delete_app** —— 它会再次 acquire_process_release_lock
+                // （tokio Mutex 不可重入），在 confirm 持锁分支内调用会死锁；
+                // 故内联 delete_app 内核中的免锁清理序列（见 service.rs delete_app）。
+                // 整个清理 best-effort：任何一步失败仅记日志，绝不 return Err，
+                // 否则会阻断下方 `pending_release_id = None` + write_index，重蹈 pending 卡死。
+                // PVC 保留（purge=false 语义）：K8s SSA apply 幂等，同名重建仍可成功。
+                self.unregister_pingora_backends(app_id).await;
+                if let Err(error) = self.runtime.delete_deployment(app_id).await {
+                    // Deployment 可能从未建成（NotFound 属正常）；其他错误仅记 warn 不阻断
+                    warn!(
+                        "[app_manager] Failed to cleanup deployment for failed first release {} (NotFound tolerated): {}",
+                        app_id, error
+                    );
+                }
+                self.activity.forget_app(app_id);
             }
             index.releases[position].status = ReleaseStatus::Failed;
             index.releases[position].failure_message =
@@ -436,6 +449,54 @@ impl AppService {
         Ok(())
     }
 
+    /// 中止 pending 发布（index-only compare-and-clear，运维自救 API）。
+    ///
+    /// 针对 `confirm_release(healthy=false)` 自身失败导致 `pending_release_id` 永久残留、
+    /// activate 守卫挡住后续所有发布、且 delete_release 拒删 pending 的死局。
+    /// 仅当 index 的 pending 恰好指向 `release_id` 时（CAS 语义）：置 Failed + 清 pending。
+    /// **仅改 index，不做任何文件/运行时操作**——这是 confirm 自身失败后仍能成功的最小操作。
+    pub async fn abort_release(
+        &self,
+        app_id: &str,
+        release_id: &str,
+        message: Option<String>,
+    ) -> AppResult<ReleaseInfo> {
+        validate_app_id(app_id)?;
+        validate_release_id(release_id)?;
+        let app_dir = self.get_container_app_dir(app_id).await?;
+        let releases_dir = app_dir.join("releases");
+        let _process_lock = self.acquire_process_release_lock(app_id).await;
+        let _lock = acquire_lock(releases_dir.join(".operation.lock")).await?;
+        let mut index = read_index(&releases_dir, release_retention(None)?).await?;
+        let position = index
+            .releases
+            .iter()
+            .position(|release| release.release_id == release_id)
+            .ok_or_else(|| {
+                AppOperationError::NotFound(format!("release not found: {release_id}"))
+            })?;
+        if index.pending_release_id.as_deref() != Some(release_id) {
+            // 幂等：目标 release 已 Failed 且非 pending → 视为已中止（对齐 confirm_release 先例）。
+            let release = &index.releases[position];
+            if release.status == ReleaseStatus::Failed {
+                return Ok(release.clone());
+            }
+            return Err(AppOperationError::InvalidState(format!(
+                "release is not pending confirmation: {release_id}"
+            )));
+        }
+        index.releases[position].status = ReleaseStatus::Failed;
+        index.releases[position].failure_message =
+            message.or_else(|| Some("release aborted".into()));
+        index.pending_release_id = None;
+        write_index(&releases_dir, &index).await?;
+        warn!(
+            app_id,
+            release_id, "release aborted: pending_release_id cleared"
+        );
+        Ok(index.releases[position].clone())
+    }
+
     pub(super) async fn acquire_process_release_lock(
         &self,
         app_id: &str,
@@ -461,319 +522,13 @@ impl AppService {
     }
 }
 
-async fn ensure_release_dirs(root: &Path) -> AppResult<()> {
-    for directory in ["packages", ".incoming", ".staging", ".rollback"] {
-        tokio::fs::create_dir_all(root.join(directory))
-            .await
-            .map_err(|error| map_io_error("create releases directory", error, false))?;
-    }
-    Ok(())
-}
-
-/// 解压并校验 release staging。任一步失败都立即清理，避免损坏包持续占用 PVC。
-async fn stage_release_package(package: &Path, staging: &Path, release_id: &str) -> AppResult<()> {
-    remove_dir_if_exists(staging).await?;
-    tokio::fs::create_dir_all(staging)
-        .await
-        .map_err(|error| map_io_error("create release staging directory", error, false))?;
-
-    let package = package.to_path_buf();
-    let staging_owned = staging.to_path_buf();
-    let result = async {
-        tokio::task::spawn_blocking(move || extract_zip(&package, &staging_owned))
-            .await
-            .map_err(|error| AppOperationError::Backend(format!("release extract task: {error}")))?
-            .map_err(map_archive_error)?;
-        validate_staging(staging, release_id).await
-    }
-    .await;
-
-    if result.is_err()
-        && let Err(cleanup_error) = remove_dir_if_exists(staging).await
-    {
-        warn!(
-            staging = %staging.display(),
-            error = %cleanup_error,
-            "failed to cleanup invalid release staging directory"
-        );
-    }
-    result
-}
-
-async fn acquire_lock(path: PathBuf) -> AppResult<std::fs::File> {
-    tokio::task::spawn_blocking(move || {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| map_io_error("open release operation lock", error, false))?;
-        file.lock_exclusive()
-            .map_err(|error| map_io_error("lock release operation", error, false))?;
-        Ok(file)
-    })
-    .await
-    .map_err(|error| AppOperationError::Backend(format!("release lock task: {error}")))?
-}
-
-async fn read_index(root: &Path, retention: u16) -> AppResult<ReleaseIndex> {
-    let path = root.join("index.json");
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| AppOperationError::Backend(format!("parse release index: {error}"))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ReleaseIndex {
-            retention,
-            ..ReleaseIndex::default()
-        }),
-        Err(error) => Err(map_io_error("read release index", error, false)),
-    }
-}
-
-async fn write_index(root: &Path, index: &ReleaseIndex) -> AppResult<()> {
-    let bytes = serde_json::to_vec_pretty(index)
-        .map_err(|error| AppOperationError::Backend(format!("serialize release index: {error}")))?;
-    let temp = root.join("index.json.tmp");
-    let mut file = tokio::fs::File::create(&temp)
-        .await
-        .map_err(|error| map_io_error("write release index", error, true))?;
-    file.write_all(&bytes)
-        .await
-        .map_err(|error| map_io_error("write release index", error, true))?;
-    file.sync_all()
-        .await
-        .map_err(|error| map_io_error("sync release index", error, true))?;
-    drop(file);
-    tokio::fs::rename(&temp, root.join("index.json"))
-        .await
-        .map_err(|error| map_io_error("commit release index", error, true))?;
-    let root = root.to_path_buf();
-    match tokio::task::spawn_blocking(move || std::fs::File::open(root)?.sync_all()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            // rename 已提交，目录 fsync 在部分 PVC/NFS 上不受支持。此时不能
-            // 返回失败，否则调用方可能把 index 已引用的 package 当成孤儿删除。
-            warn!(%error, "release index committed but directory sync is unsupported or failed");
-        }
-        Err(error) => {
-            warn!(%error, "release index committed but directory sync task failed");
-        }
-    }
-    Ok(())
-}
-
-async fn verify_package(
-    path: &Path,
-    release_id: &str,
-    expected_sha256: &str,
-    expected_size: u64,
-) -> AppResult<()> {
-    let path = path.to_path_buf();
-    let release_id = release_id.to_owned();
-    let expected_sha256 = expected_sha256.to_ascii_lowercase();
-    tokio::task::spawn_blocking(move || {
-        let metadata = std::fs::metadata(&path)
-            .map_err(|error| map_io_error("stat release package", error, false))?;
-        if metadata.len() != expected_size {
-            return Err(AppOperationError::Validation(format!(
-                "release size mismatch: expected {expected_size}, got {}",
-                metadata.len()
-            )));
-        }
-        let mut file = std::fs::File::open(&path)
-            .map_err(|error| map_io_error("open release package", error, false))?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|error| map_io_error("hash release package", error, false))?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        let actual = hex::encode(hasher.finalize());
-        if actual != expected_sha256 {
-            return Err(AppOperationError::Validation(format!(
-                "release sha256 mismatch: expected {expected_sha256}, got {actual}"
-            )));
-        }
-        let file = std::fs::File::open(&path)
-            .map_err(|error| map_io_error("open release zip", error, false))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|error| {
-            AppOperationError::Validation(format!("invalid release zip: {error}"))
-        })?;
-        let mut lock = archive.by_name("release.lock.toml").map_err(|error| {
-            AppOperationError::Validation(format!("release lock missing: {error}"))
-        })?;
-        let mut content = String::new();
-        lock.read_to_string(&mut content)
-            .map_err(|error| map_io_error("read release lock", error, false))?;
-        let value: toml::Value = toml::from_str(&content).map_err(|error| {
-            AppOperationError::Validation(format!("invalid release lock: {error}"))
-        })?;
-        if value.get("release_id").and_then(toml::Value::as_str) != Some(release_id.as_str()) {
-            return Err(AppOperationError::Validation(
-                "release lock ID does not match requested release ID".into(),
-            ));
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|error| AppOperationError::Backend(format!("verify release task: {error}")))?
-}
-
-async fn validate_staging(path: &Path, release_id: &str) -> AppResult<()> {
-    if !path.join("workspace.manifest.toml").is_file() || !path.join("release.lock.toml").is_file()
-    {
-        return Err(AppOperationError::Validation(
-            "release must contain workspace.manifest.toml and release.lock.toml".into(),
-        ));
-    }
-    let content = tokio::fs::read_to_string(path.join("release.lock.toml"))
-        .await
-        .map_err(|error| map_io_error("read staged release lock", error, false))?;
-    let value: toml::Value = toml::from_str(&content).map_err(|error| {
-        AppOperationError::Validation(format!("parse staged release lock: {error}"))
-    })?;
-    if value.get("release_id").and_then(toml::Value::as_str) != Some(release_id) {
-        return Err(AppOperationError::Validation(
-            "staged release lock ID mismatch".into(),
-        ));
-    }
-    Ok(())
-}
-
-async fn code_release_id(code: &Path) -> AppResult<Option<String>> {
-    let path = code.join("release.lock.toml");
-    let content = match tokio::fs::read_to_string(&path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(map_io_error("read active release lock", error, false)),
-    };
-    let value: toml::Value = toml::from_str(&content).map_err(|error| {
-        AppOperationError::Backend(format!("parse active release lock: {error}"))
-    })?;
-    Ok(value
-        .get("release_id")
-        .and_then(toml::Value::as_str)
-        .map(str::to_owned))
-}
-
-fn plan_retention(index: &mut ReleaseIndex) -> Vec<String> {
-    let active = index.active_release_id.as_deref();
-    let mut ordered: Vec<_> = index
-        .releases
-        .iter()
-        .filter(|release| {
-            release.status != ReleaseStatus::Failed && active != Some(release.release_id.as_str())
-        })
-        .map(|release| (release.created_at.clone(), release.release_id.clone()))
-        .collect();
-    ordered.sort_by(|left, right| right.0.cmp(&left.0));
-    let mut keep: std::collections::BTreeSet<String> = ordered
-        .into_iter()
-        .take(usize::from(index.retention.saturating_sub(1)))
-        .map(|(_, id)| id)
-        .collect();
-    if let Some(active) = active {
-        keep.insert(active.to_owned());
-    }
-    let remove: Vec<String> = index
-        .releases
-        .iter()
-        .filter(|release| !keep.contains(&release.release_id))
-        .map(|release| release.release_id.clone())
-        .collect();
-    index
-        .releases
-        .retain(|release| !remove.contains(&release.release_id));
-    remove
-}
-
-async fn remove_release_packages(root: &Path, release_ids: &[String]) {
-    for release_id in release_ids {
-        let path = root.join("packages").join(format!("{release_id}.zip"));
-        if let Err(error) = tokio::fs::remove_file(path).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(release_id, %error, "failed to remove unreferenced release package");
-        }
-    }
-}
-
-async fn remove_dir_if_exists(path: &Path) -> AppResult<()> {
-    if let Err(error) = tokio::fs::remove_dir_all(path).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(map_io_error("remove release directory", error, true));
-    }
-    Ok(())
-}
-
-fn release_retention(requested: Option<u16>) -> AppResult<u16> {
-    let default = env_u16("RCODER_APP_RELEASE_RETENTION_DEFAULT", RETENTION_FALLBACK)?;
-    let maximum = env_u16("RCODER_APP_RELEASE_RETENTION_MAX", RETENTION_MAX_FALLBACK)?;
-    if !(RETENTION_MIN..=RETENTION_MAX_FALLBACK).contains(&maximum) {
-        return Err(AppOperationError::Validation(format!(
-            "RCODER_APP_RELEASE_RETENTION_MAX must be {RETENTION_MIN}..={RETENTION_MAX_FALLBACK}"
-        )));
-    }
-    let value = requested.unwrap_or(default);
-    if value < RETENTION_MIN || value > maximum {
-        return Err(AppOperationError::Validation(format!(
-            "release retention must be {RETENTION_MIN}..={maximum}, got {value}"
-        )));
-    }
-    Ok(value)
-}
-
-fn env_u16(name: &str, fallback: u16) -> AppResult<u16> {
-    match std::env::var(name) {
-        Ok(value) => value.parse().map_err(|error| {
-            AppOperationError::Validation(format!("invalid {name}={value}: {error}"))
-        }),
-        Err(std::env::VarError::NotPresent) => Ok(fallback),
-        Err(error) => Err(AppOperationError::Validation(format!(
-            "read {name}: {error}"
-        ))),
-    }
-}
-
-fn validate_release_id(release_id: &str) -> AppResult<()> {
-    if release_id.is_empty()
-        || release_id.len() > 64
-        || !release_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
-        return Err(AppOperationError::Validation(
-            "release_id must be 1-64 ASCII alphanumeric/hyphen characters".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_sha256(value: &str) -> AppResult<()> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(AppOperationError::Validation(
-            "sha256 must contain exactly 64 hexadecimal characters".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn map_download_error(error: DownloadError) -> AppOperationError {
-    match error {
-        DownloadError::InvalidUrl(message) => AppOperationError::Validation(message),
-        other => AppOperationError::Backend(format!("download release failed: {other}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
+    use crate::models::ReleaseIndex;
+    use crate::test_support::{MockRuntime, test_service};
 
     fn release(id: &str, status: ReleaseStatus, created_at: &str) -> ReleaseInfo {
         ReleaseInfo {
@@ -787,109 +542,219 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn retention_keeps_active_plus_recent_other_versions() {
-        let root = tempfile::tempdir().expect("release tempdir");
-        tokio::fs::create_dir_all(root.path().join("packages"))
+    /// 铺设“首次发布 pending 中”现场：index 含 pending release，无 .rollback/code（首次发布）。
+    async fn seed_pending_first_release(root: &Path, app_id: &str) -> PathBuf {
+        let app_dir = root.join(app_id);
+        let releases_dir = app_dir.join("releases");
+        ensure_release_dirs(&releases_dir)
             .await
-            .expect("packages");
+            .expect("ensure release dirs");
         let mut index = ReleaseIndex {
-            active_release_id: Some("active".into()),
-            pending_release_id: None,
-            previous_release_id: None,
-            retention: 2,
-            releases: vec![
-                release("active", ReleaseStatus::Active, "2026-01-01"),
-                release("recent", ReleaseStatus::Prepared, "2026-01-03"),
-                release("old", ReleaseStatus::Prepared, "2026-01-02"),
-            ],
-        };
-        for id in ["active", "recent", "old"] {
-            tokio::fs::write(root.path().join("packages").join(format!("{id}.zip")), id)
-                .await
-                .expect("package");
-        }
-        let removals = plan_retention(&mut index);
-        remove_release_packages(root.path(), &removals).await;
-        let ids: std::collections::BTreeSet<_> = index
-            .releases
-            .iter()
-            .map(|item| item.release_id.as_str())
-            .collect();
-        assert_eq!(ids, std::collections::BTreeSet::from(["active", "recent"]));
-        assert!(!root.path().join("packages/old.zip").exists());
-    }
-
-    #[tokio::test]
-    async fn retention_fifteen_prunes_the_oldest_non_active_release() {
-        let root = tempfile::tempdir().expect("release tempdir");
-        tokio::fs::create_dir_all(root.path().join("packages"))
-            .await
-            .expect("packages");
-        let mut releases = Vec::new();
-        for sequence in 0..16 {
-            let id = format!("release-{sequence:02}");
-            let status = if sequence == 0 {
-                ReleaseStatus::Active
-            } else {
-                ReleaseStatus::Prepared
-            };
-            releases.push(release(
-                &id,
-                status,
-                &format!("2026-01-{day:02}", day = sequence + 1),
-            ));
-            tokio::fs::write(root.path().join("packages").join(format!("{id}.zip")), &id)
-                .await
-                .expect("package");
-        }
-        let mut index = ReleaseIndex {
-            active_release_id: Some("release-00".into()),
-            pending_release_id: None,
-            previous_release_id: None,
             retention: 15,
-            releases,
+            pending_release_id: Some("release-1".into()),
+            ..ReleaseIndex::default()
         };
-
-        let removals = plan_retention(&mut index);
-        remove_release_packages(root.path(), &removals).await;
-
-        assert_eq!(index.releases.len(), 15);
-        assert!(
-            index
-                .releases
-                .iter()
-                .any(|release| release.release_id == "release-00")
-        );
-        assert!(
-            !index
-                .releases
-                .iter()
-                .any(|release| release.release_id == "release-01")
-        );
-        assert!(!root.path().join("packages/release-01.zip").exists());
-    }
-
-    #[test]
-    fn validates_release_identity_and_digest() {
-        assert!(validate_release_id("01j-release").is_ok());
-        assert!(validate_release_id("../release").is_err());
-        assert!(validate_sha256(&"a".repeat(64)).is_ok());
-        assert!(validate_sha256("abc").is_err());
-    }
-
-    #[tokio::test]
-    async fn invalid_staging_is_removed_immediately() {
-        let root = tempfile::tempdir().expect("release tempdir");
-        let package = root.path().join("broken.zip");
-        let staging = root.path().join("staging");
-        tokio::fs::write(&package, b"not a zip archive")
+        index.releases.push(release(
+            "release-1",
+            ReleaseStatus::PendingStart,
+            "2026-08-01",
+        ));
+        write_index(&releases_dir, &index)
             .await
-            .expect("write broken package");
+            .expect("write pending index");
+        assert!(
+            !releases_dir.join(".rollback").join("code").exists(),
+            "first release must have no rollback source"
+        );
+        releases_dir
+    }
 
-        let result = stage_release_package(&package, &staging, "release-1").await;
+    /// R1：首次发布 confirm(false) 且无 rollback——必须 best-effort 清理 Deployment，
+    /// 且 pending_release_id 被清、write_index 成功。
+    #[tokio::test]
+    async fn confirm_unhealthy_first_release_cleans_up_without_rollback() {
+        let root = tempfile::tempdir().expect("release tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let service = test_service(root.path(), runtime.clone());
+        let app_id = "app-r1";
+        let releases_dir = seed_pending_first_release(root.path(), app_id).await;
 
-        assert!(result.is_err());
-        assert!(!staging.exists(), "invalid staging must not remain on PVC");
+        let release = service
+            .confirm_release(app_id, "release-1", false, Some("readiness failed".into()))
+            .await
+            .expect("confirm must succeed");
+
+        assert_eq!(release.status, ReleaseStatus::Failed);
+        assert_eq!(
+            runtime
+                .delete_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "delete_deployment must be called for failed first release"
+        );
+        let index = read_index(&releases_dir, 15)
+            .await
+            .expect("write_index must have succeeded");
+        assert!(
+            index.pending_release_id.is_none(),
+            "pending_release_id must be cleared"
+        );
+        assert!(
+            !root.path().join(app_id).join("code").exists(),
+            "failed first release must not leave code dir"
+        );
+    }
+
+    /// R1：清理失败（delete_deployment 报错）绝不能阻断 pending 清理与 write_index。
+    #[tokio::test]
+    async fn confirm_unhealthy_first_release_cleanup_failure_does_not_block_commit() {
+        let root = tempfile::tempdir().expect("release tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        runtime
+            .delete_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let service = test_service(root.path(), runtime.clone());
+        let app_id = "app-r1-fail";
+        let releases_dir = seed_pending_first_release(root.path(), app_id).await;
+
+        let release = service
+            .confirm_release(app_id, "release-1", false, None)
+            .await
+            .expect("cleanup failure must not break confirm");
+
+        assert_eq!(release.status, ReleaseStatus::Failed);
+        assert_eq!(
+            runtime
+                .delete_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let index = read_index(&releases_dir, 15)
+            .await
+            .expect("write_index must have succeeded despite cleanup failure");
+        assert!(
+            index.pending_release_id.is_none(),
+            "pending must be cleared even when cleanup fails (no pending deadlock)"
+        );
+    }
+
+    /// R3：CAS 匹配——pending 恰为目标 release → abort 成功、状态 Failed、pending 清空。
+    #[tokio::test]
+    async fn abort_release_clears_matching_pending() {
+        let root = tempfile::tempdir().expect("release tempdir");
+        let service = test_service(root.path(), Arc::new(MockRuntime::default()));
+        let app_id = "app-r3-abort";
+        let releases_dir = seed_pending_first_release(root.path(), app_id).await;
+
+        let release = service
+            .abort_release(app_id, "release-1", Some("confirm failed hard".into()))
+            .await
+            .expect("abort must succeed when pending matches");
+
+        assert_eq!(release.status, ReleaseStatus::Failed);
+        assert_eq!(
+            release.failure_message.as_deref(),
+            Some("confirm failed hard")
+        );
+        let index = read_index(&releases_dir, 15).await.expect("read index");
+        assert!(
+            index.pending_release_id.is_none(),
+            "pending_release_id must be cleared by abort"
+        );
+    }
+
+    /// R3：CAS 不匹配——pending 指向别的 release → InvalidState。
+    #[tokio::test]
+    async fn abort_release_rejects_non_matching_release() {
+        let root = tempfile::tempdir().expect("release tempdir");
+        let service = test_service(root.path(), Arc::new(MockRuntime::default()));
+        let app_id = "app-r3-mismatch";
+        let app_dir = root.path().join(app_id);
+        let releases_dir = app_dir.join("releases");
+        ensure_release_dirs(&releases_dir)
+            .await
+            .expect("ensure release dirs");
+        let mut index = ReleaseIndex {
+            retention: 15,
+            pending_release_id: Some("release-1".into()),
+            ..ReleaseIndex::default()
+        };
+        index.releases.push(release(
+            "release-1",
+            ReleaseStatus::PendingStart,
+            "2026-08-01",
+        ));
+        index
+            .releases
+            .push(release("release-2", ReleaseStatus::Prepared, "2026-08-02"));
+        write_index(&releases_dir, &index)
+            .await
+            .expect("write index");
+
+        let error = service
+            .abort_release(app_id, "release-2", None)
+            .await
+            .expect_err("abort must fail when pending points elsewhere");
+
+        assert!(
+            matches!(error, AppOperationError::InvalidState(_)),
+            "expected InvalidState, got {error:?}"
+        );
+        let index = read_index(&releases_dir, 15).await.expect("read index");
+        assert_eq!(index.pending_release_id.as_deref(), Some("release-1"));
+    }
+
+    /// R3：幂等——目标 release 已 Failed 且非 pending → 返回 Ok。
+    #[tokio::test]
+    async fn abort_release_is_idempotent_for_already_failed_release() {
+        let root = tempfile::tempdir().expect("release tempdir");
+        let service = test_service(root.path(), Arc::new(MockRuntime::default()));
+        let app_id = "app-r3-idempotent";
+        let app_dir = root.path().join(app_id);
+        let releases_dir = app_dir.join("releases");
+        ensure_release_dirs(&releases_dir)
+            .await
+            .expect("ensure release dirs");
+        let mut index = ReleaseIndex {
+            retention: 15,
+            ..ReleaseIndex::default()
+        };
+        index.releases.push(ReleaseInfo {
+            failure_message: Some("earlier failure".into()),
+            ..release("release-1", ReleaseStatus::Failed, "2026-08-01")
+        });
+        write_index(&releases_dir, &index)
+            .await
+            .expect("write index");
+
+        let release = service
+            .abort_release(app_id, "release-1", None)
+            .await
+            .expect("abort must be idempotent for already-failed release");
+
+        assert_eq!(release.status, ReleaseStatus::Failed);
+        assert_eq!(release.failure_message.as_deref(), Some("earlier failure"));
+    }
+
+    /// R3：release 不存在 → NotFound。
+    #[tokio::test]
+    async fn abort_release_returns_not_found_for_missing_release() {
+        let root = tempfile::tempdir().expect("release tempdir");
+        let service = test_service(root.path(), Arc::new(MockRuntime::default()));
+        let app_id = "app-r3-missing";
+        let app_dir = root.path().join(app_id);
+        ensure_release_dirs(&app_dir.join("releases"))
+            .await
+            .expect("ensure release dirs");
+
+        let error = service
+            .abort_release(app_id, "no-such-release", None)
+            .await
+            .expect_err("abort must fail for missing release");
+
+        assert!(
+            matches!(error, AppOperationError::NotFound(_)),
+            "expected NotFound, got {error:?}"
+        );
     }
 }

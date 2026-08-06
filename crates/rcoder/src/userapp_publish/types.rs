@@ -11,6 +11,11 @@ use shared_types::BuildProgressEvent;
 pub enum PublishTaskStoreError {
     #[error("publish task capacity exhausted (limit={limit}); wait for an active task to finish")]
     CapacityExceeded { limit: usize },
+    /// 同一 app 已有活跃 publish/build 任务(U2 并发早拒绝)。携带活跃任务 id 便于排障。
+    #[error(
+        "app {app_id} already has an active publish/build task (task_id={task_id}); wait for it to finish or cancel it"
+    )]
+    AppBusy { app_id: String, task_id: String },
 }
 
 pub type PublishTaskId = String;

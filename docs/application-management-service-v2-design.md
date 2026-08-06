@@ -826,14 +826,18 @@ migrate 在 service 启动前执行。任意 migration 失败会使整组启动�
 4. **首次发布事务**：明确 `prepare → activate → create_app → readiness → confirm` 的失败补偿，
    并由 Java 保存可恢复状态。
 5. **UserApp 专用 create 契约**：避免普通用户控制 app-runtime image/command/系统端口。
-6. **Pingap reload 确认**：增加实际 config hash/进程状态确认和失败回切，而不只返回文件已更新。
+6. **Pingap reload 确认**（已完成）：app-cli 启动 pingap 时经 env 注入 loopback admin（随机凭证，
+   仅作只读确认通道，TOML 仍是唯一配置权威）；compile 时本地计算期望 config_hash
+   （pingap-config 同算法 CRC32）；reload/启动后经 `GET /api/basic` 轮询比对 config_hash
+   确认生效，超时/不匹配自动回切 `pingap.toml.prev` 并 best-effort 二次确认。
+   实现位置：app-cli `proxy/admin_probe.rs`、`proxy/compiler.rs`、`supervisor.rs`、`api/proxy.rs`。
 7. **ProcessSupervisor 拆分**：当前 supervisor 仍较集中，后续按
    ProcessSupervisor/HealthManager/ProxyController/LogService/RuntimeStatusService 分离。
 8. **日志轮转一致性**：语言模板补齐 JSONL、100 MiB、按天和 14 天保留；明确
    `runtime.*.log` 是否自动注册为默认 source。
 9. **disabled service 语义**：supervisor 启动/migrate 和 managed Pingap 生成必须统一跳过
    `enabled=false`；当前部分路径仍会处理 disabled service。
-10. **cursor reset 事件**：boot ID 变化时应显式发送 `cursor_reset`，不能只在内部静默重置。
+10. **cursor reset 事件**（已完成）：boot ID 变化时已显式发送 `cursor_reset` 事件。实现位置：app-cli `log/service.rs` boot_id 每次启动重新生成、`decode_cursor` 检测旧 boot_id 返回 `cursor_reset`、`api/mod.rs` SSE 显式 yield `cursor_reset` 事件（含 query 出错兜底）。
 11. **日志取消传播**：确认外部客户端取消后 reqwest 和 app-cli SSE tail 任务立即结束。
 12. **导入准确性**：补齐各语言检测矩阵和误判保护。
 13. **运行时升级预检**：新 app-runtime/Pingap 上线前批量验证 active extend/custom 配置。

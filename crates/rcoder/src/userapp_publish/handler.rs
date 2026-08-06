@@ -28,6 +28,7 @@ use crate::router::AppState;
 
 use super::client;
 use super::orchestrator;
+use super::types::PublishTaskStoreError;
 use super::{CancelAttempt, PublishEvent, PublishTaskKind, PublishTaskSnapshot, PublishTaskStatus};
 
 /// 路由聚合(注册到 rcoder 主 router,与 app_manager 路由同 `/api/v1/apps` 前缀)。
@@ -117,6 +118,19 @@ fn too_many_requests(msg: impl Into<String>) -> AppError {
     AppError::with_message(ERR_TOO_MANY_REQUESTS, msg.into())
 }
 
+fn conflict(msg: impl Into<String>) -> AppError {
+    AppError::with_message(shared_types::error_codes::ERR_CONFLICT, msg.into())
+}
+
+/// publish/build 建任务失败映射:AppBusy(同 app 已有活跃任务)→ 409(U2 早拒绝);
+/// CapacityExceeded(全局容量)→ 保持 429。
+fn create_task_error(error: PublishTaskStoreError) -> AppError {
+    match error {
+        PublishTaskStoreError::AppBusy { .. } => conflict(error.to_string()),
+        PublishTaskStoreError::CapacityExceeded { .. } => too_many_requests(error.to_string()),
+    }
+}
+
 fn validate_publish_identifiers(app_id: &str, project_id: &str) -> Result<(), AppError> {
     crate::handler::utils::validate_identifier(app_id, "app_id")
         .map_err(|error| validation(error.to_string()))?;
@@ -140,6 +154,7 @@ fn validate_publish_identifiers(app_id: &str, project_id: &str) -> Result<(), Ap
         (status = 200, body = PublishTaskResponse, description = "Publish task created"),
         (status = 400, description = "Invalid app_id / project_id"),
         (status = 404, description = "Agent-runner not found for project"),
+        (status = 409, description = "App already has an active publish/build task"),
         (status = 429, description = "Publish task capacity exhausted"),
         (status = 500, description = "Internal server error")
     ),
@@ -159,7 +174,7 @@ pub async fn publish(
             PublishTaskKind::Publish,
         )
         .await
-        .map_err(|error| too_many_requests(error.to_string()))?;
+        .map_err(create_task_error)?;
     let task_id = task.id.clone();
     let project_id = body.project_id.clone();
     tokio::spawn(async move {
@@ -182,6 +197,7 @@ pub async fn publish(
         (status = 200, body = PublishTaskResponse, description = "Build task created"),
         (status = 400, description = "Invalid app_id / project_id"),
         (status = 404, description = "Agent-runner not found for project"),
+        (status = 409, description = "App already has an active publish/build task"),
         (status = 429, description = "Publish task capacity exhausted"),
         (status = 500, description = "Internal server error")
     ),
@@ -201,7 +217,7 @@ pub async fn build(
             PublishTaskKind::Build,
         )
         .await
-        .map_err(|error| too_many_requests(error.to_string()))?;
+        .map_err(create_task_error)?;
     let task_id = task.id.clone();
     let project_id = body.project_id.clone();
     tokio::spawn(async move {

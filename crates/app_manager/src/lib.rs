@@ -6,6 +6,7 @@
 //! rcoder 无状态：业务元数据由调用方持久化。
 
 pub mod activity_registry;
+pub mod app_create;
 pub mod app_db;
 pub mod app_ops;
 pub mod app_params;
@@ -18,11 +19,14 @@ pub mod error;
 pub mod files;
 pub mod handlers;
 pub mod models;
+pub mod release_store;
 pub mod releases;
 pub mod routes;
 mod runtime_identity;
 pub mod service;
 pub mod storage;
+#[cfg(test)]
+mod test_support;
 pub mod utils;
 
 pub use activity_registry::AppActivityRegistry;
