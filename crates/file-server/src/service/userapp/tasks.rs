@@ -183,7 +183,10 @@ impl BuildTask {
             };
             // broadcast 必须在持 state 锁内:与 subscribe 的"创建 receiver + 读 replay"互斥串行,
             // 否则同一事件可能既进 replay 又被 receiver 收到 → 重复(broadcast::send 非阻塞,持锁安全)。
-            let _ = self.tx.send((seq, event));
+            // 进度事件无订阅者时 send 失败属预期(接收方可能已退出)；记 debug 便于诊断
+            if let Err(send_err) = self.tx.send((seq, event)) {
+                tracing::warn!("progress event send failed (consumer gone): {send_err}");
+            }
             terminal
         };
         if terminal {

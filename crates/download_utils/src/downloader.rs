@@ -202,7 +202,12 @@ impl Downloader {
                     downloaded.saturating_add(content_length)
                 };
                 if expected_total > self.config.max_bytes {
-                    let _ = tokio::fs::remove_file(dest_path).await;
+                    if let Err(e) = tokio::fs::remove_file(dest_path).await {
+                        warn!(
+                            "[download] failed to remove temp file {}: {e}",
+                            dest_path.display()
+                        );
+                    }
                     return Err(DownloadError::BinaryTooLarge {
                         size: expected_total,
                         max: self.config.max_bytes,
@@ -277,7 +282,9 @@ impl Downloader {
             };
             if actual != expected {
                 // Delete file on checksum mismatch
-                let _ = tokio::fs::remove_file(dest_path).await;
+                if let Err(e) = tokio::fs::remove_file(dest_path).await {
+                    warn!("[download] failed to remove temp file on checksum mismatch: {e}");
+                }
                 return Err(DownloadError::ChecksumMismatch {
                     expected: expected.to_string(),
                     actual,
@@ -319,7 +326,9 @@ impl Downloader {
                 _ = cancel_token.cancelled() => {
                     info!("[download] download cancelled");
                     drop(file);
-                    let _ = tokio::fs::remove_file(dest_path).await;
+                    if let Err(e) = tokio::fs::remove_file(dest_path).await {
+                        warn!("[download] failed to remove temp file on cancel: {e}");
+                    }
                     return Err(DownloadError::Cancelled);
                 }
                 chunk = stream.next() => {
@@ -328,7 +337,9 @@ impl Downloader {
                             total += bytes.len() as u64;
                             if total > self.config.max_bytes {
                                 drop(file);
-                                let _ = tokio::fs::remove_file(dest_path).await;
+                                if let Err(e) = tokio::fs::remove_file(dest_path).await {
+                                    warn!("[download] failed to remove temp file on size limit: {e}");
+                                }
                                 return Err(DownloadError::BinaryTooLarge {
                                     size: total,
                                     max: self.config.max_bytes,

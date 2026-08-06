@@ -1225,10 +1225,12 @@ mod tests {
             .from_image("alpine:latest")
             .build();
 
-        let _ = docker
-            .create_image(Some(create_image_options), None, None)
-            .try_collect::<Vec<_>>()
-            .await;
+        drop(
+            docker
+                .create_image(Some(create_image_options), None, None)
+                .try_collect::<Vec<_>>()
+                .await,
+        );
 
         // 1. 创建测试容器（使用 alpine 镜像）
         let config = ContainerCreateBody {

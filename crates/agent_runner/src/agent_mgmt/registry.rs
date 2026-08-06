@@ -286,7 +286,13 @@ impl AgentRegistry {
         std::fs::write(&tmp, json.as_bytes())?;
         if std::fs::rename(&tmp, &path).is_err() {
             std::fs::copy(&tmp, &path)?;
-            let _ = std::fs::remove_file(&tmp);
+            if let Err(e) = std::fs::remove_file(&tmp) {
+                warn!(
+                    "[agent_mgmt] failed to remove registry tmp file after copy fallback: path={}, error={}",
+                    tmp.display(),
+                    e
+                );
+            }
         }
         info!(
             "[agent_mgmt] Registry persisted: path={}, count={}",
@@ -362,7 +368,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("agent-mgmt-test-{}-{}", std::process::id(), n));
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(std::fs::remove_dir_all(&dir));
         PathManager::new_with_root(dir)
     }
 

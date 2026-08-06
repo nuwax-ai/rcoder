@@ -230,29 +230,29 @@ fn origin_value(req: &Request) -> Option<String> {
 fn add_cors_headers(mut resp: Response, origin: Option<&str>, cors: &CorsConfig) -> Response {
     let allow_origin = origin.unwrap_or("*");
     let headers = resp.headers_mut();
-    let _ = headers.insert(
+    drop(headers.insert(
         axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_str(allow_origin).unwrap_or(HeaderValue::from_static("*")),
-    );
-    let _ = headers.insert(
+    ));
+    drop(headers.insert(
         HeaderName::from_static("access-control-allow-methods"),
         HeaderValue::from_static(ALLOW_METHODS),
-    );
-    let _ = headers.insert(
+    ));
+    drop(headers.insert(
         HeaderName::from_static("access-control-allow-headers"),
         HeaderValue::from_str(cors.allow_headers).unwrap_or_else(|_| HeaderValue::from_static("")),
-    );
-    let _ = headers.insert(
+    ));
+    drop(headers.insert(
         HeaderName::from_static("access-control-expose-headers"),
         HeaderValue::from_str(cors.expose_headers).unwrap_or_else(|_| HeaderValue::from_static("")),
-    );
+    ));
     // 注: CORS 凭据策略不在本层拦截 —— 前置有网关/代理系统,
     // 需要收紧时由前置系统统一处理, file-server 保持原行为 (有 Origin 即下发凭据头)。
     if origin.is_some() {
-        let _ = headers.insert(
+        drop(headers.insert(
             HeaderName::from_static("access-control-allow-credentials"),
             HeaderValue::from_static("true"),
-        );
+        ));
         let _ = headers.append(axum::http::header::VARY, HeaderValue::from_static("Origin"));
     }
     resp

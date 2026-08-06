@@ -222,9 +222,11 @@ async fn create_container_with_marker(
     // 清除标记（无论成功还是失败）
     state.pod_creating.remove(user_id);
 
-    // 🚀 发送容器创建完成通知（唤醒等待方）
-    if result.is_ok() {
-        let _ = state.pod_created_tx.send(user_id.to_string());
+    // 🚀 发送容器创建完成通知（唤醒等待方）；无等待者时记 warn（pod 创建重，可能白创建）
+    if result.is_ok()
+        && let Err(send_err) = state.pod_created_tx.send(user_id.to_string())
+    {
+        warn!("pod_created notify failed (no waiter subscribed): {send_err}");
     }
 
     match result {

@@ -78,7 +78,7 @@ async fn test_actor_workflow() {
 
     // Clean up (Actor will stop when handle is dropped, but we can just let test finish)
     drop(handle);
-    let _ = actor_handle.await;
+    drop(actor_handle.await);
 }
 
 #[tokio::test]

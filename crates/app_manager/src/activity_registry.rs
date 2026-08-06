@@ -72,7 +72,9 @@ impl Drop for WakeGuard {
             .outcome
             .take()
             .unwrap_or_else(|| WakeOutcome::Failed(WAKE_LEADER_ABORTED.into()));
-        let _ = self.handle.tx.send(Some(outcome));
+        if let Err(e) = self.handle.tx.send(Some(outcome)) {
+            warn!("activity outcome send failed (no follower): {e}");
+        }
         if let dashmap::mapref::entry::Entry::Occupied(entry) = self.map.entry(self.key.clone())
             && Arc::ptr_eq(entry.get(), &self.handle)
         {
@@ -165,9 +167,12 @@ impl AppActivityRegistry {
             self.waking.entry(app_id.to_string())
         {
             let handle = entry.remove();
-            let _ = handle
+            if let Err(e) = handle
                 .tx
-                .send(Some(WakeOutcome::Failed("app was deleted".into())));
+                .send(Some(WakeOutcome::Failed("app was deleted".into())))
+            {
+                warn!("activity outcome send failed (no follower): {e}");
+            }
         }
         if let dashmap::mapref::entry::Entry::Occupied(entry) =
             self.recycling.entry(app_id.to_string())
@@ -629,7 +634,7 @@ mod tests {
             let r = reg.clone();
             async move { r.ensure_running("app-p").await }
         });
-        let _ = jh.await; // task panic → JoinError,吞掉
+        drop(jh.await); // task panic → JoinError,吞掉
 
         // 守卫应已移除 waking 条目(未泄漏)
         assert!(

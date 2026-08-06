@@ -109,18 +109,24 @@ pub async fn create_project(
         )
         .await
     } else {
-        let _ = fs::remove_dir_all(&project_path).await;
+        if let Err(e) = fs::remove_dir_all(&project_path).await {
+            tracing::warn!(error = %e, "cleanup project_path on missing template failed (skipping)");
+        }
         return Err(AppError::system(format!(
             "Template not found: {template_name}"
         )));
     };
     if let Err(e) = deploy {
-        let _ = fs::remove_dir_all(&project_path).await;
+        if let Err(cleanup_err) = fs::remove_dir_all(&project_path).await {
+            tracing::warn!(error = %cleanup_err, "cleanup project_path on deploy failure failed (skipping)");
+        }
         return Err(e);
     }
 
     if let Err(error) = crate::service::fs_util::write_npmrc(&project_path).await {
-        let _ = fs::remove_dir_all(&project_path).await;
+        if let Err(cleanup_err) = fs::remove_dir_all(&project_path).await {
+            tracing::warn!(error = %cleanup_err, "cleanup project_path on npmrc failure failed (skipping)");
+        }
         return Err(error);
     }
     // GIT_ENABLED → git init + commit("init project: {id}") (对齐 nuwax createProject)
@@ -181,11 +187,15 @@ pub async fn copy_project(
     )
     .await
     {
-        let _ = fs::remove_dir_all(&target_path).await;
+        if let Err(cleanup_err) = fs::remove_dir_all(&target_path).await {
+            tracing::warn!(error = %cleanup_err, "cleanup target_path on copy failure failed (skipping)");
+        }
         return Err(e);
     }
     if let Err(error) = crate::service::fs_util::write_npmrc(&target_path).await {
-        let _ = fs::remove_dir_all(&target_path).await;
+        if let Err(cleanup_err) = fs::remove_dir_all(&target_path).await {
+            tracing::warn!(error = %cleanup_err, "cleanup target_path on npmrc failure failed (skipping)");
+        }
         return Err(error);
     }
     // GIT_ENABLED → git init + commit("copy project: {src} -> {tgt}") (对齐 nuwax copyProject)
@@ -282,18 +292,24 @@ pub async fn upload_project(
     // 1. 先完整解压、整理到 staging；失败不触碰现有项目。
     let extract_r = crate::service::zip::extract_to(zip_path.to_path_buf(), staging.clone()).await;
     if let Err(e) = extract_r {
-        let _ = fs::remove_dir_all(&staging).await;
+        if let Err(cleanup_err) = fs::remove_dir_all(&staging).await {
+            tracing::warn!(error = %cleanup_err, "cleanup staging on extract failure failed (skipping)");
+        }
         return Err(e);
     }
     if let Err(error) =
         crate::service::computer_ws::remove_top_level_dir(&staging, &["__MACOSX"]).await
     {
-        let _ = fs::remove_dir_all(&staging).await;
+        if let Err(cleanup_err) = fs::remove_dir_all(&staging).await {
+            tracing::warn!(error = %cleanup_err, "cleanup staging on tidy failure failed (skipping)");
+        }
         return Err(error);
     }
     remove_node_modules(&staging).await;
     if let Err(error) = crate::service::fs_util::write_npmrc(&staging).await {
-        let _ = fs::remove_dir_all(&staging).await;
+        if let Err(cleanup_err) = fs::remove_dir_all(&staging).await {
+            tracing::warn!(error = %cleanup_err, "cleanup staging on npmrc failure failed (skipping)");
+        }
         return Err(error);
     }
 
@@ -320,14 +336,16 @@ pub async fn upload_project(
         fs::rename(&project_path, &rollback).await?;
     }
     if let Err(e) = fs::rename(&staging, &project_path).await {
-        if had_old {
-            let _ = fs::rename(&rollback, &project_path).await;
+        if had_old && let Err(cleanup_err) = fs::rename(&rollback, &project_path).await {
+            tracing::warn!(error = %cleanup_err, "rollback rename to restore old project failed (skipping)");
         }
-        let _ = fs::remove_dir_all(&staging).await;
+        if let Err(cleanup_err) = fs::remove_dir_all(&staging).await {
+            tracing::warn!(error = %cleanup_err, "cleanup staging on rename failure failed (skipping)");
+        }
         return Err(e.into());
     }
-    if had_old {
-        let _ = fs::remove_dir_all(&rollback).await;
+    if had_old && let Err(cleanup_err) = fs::remove_dir_all(&rollback).await {
+        tracing::warn!(error = %cleanup_err, "cleanup rollback backup after upload failed (skipping)");
     }
 
     // 4. GIT_ENABLED → init + commit
@@ -420,8 +438,10 @@ pub async fn export_project(
         config.backup_traverse_exclude_files.clone(),
     )
     .await;
-    if let Some(p) = &config_written {
-        let _ = fs::remove_file(p).await;
+    if let Some(p) = &config_written
+        && let Err(cleanup_err) = fs::remove_file(p).await
+    {
+        tracing::warn!(error = %cleanup_err, "cleanup temp config file after export failed (skipping)");
     }
     repack_result?;
     if !try_exists(&zip_path).await? {

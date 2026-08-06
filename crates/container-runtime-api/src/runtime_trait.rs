@@ -250,9 +250,8 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     /// 创建并启动一个 Deployment（K8s）或等价容器（Docker）
     async fn create_deployment(
         &self,
-        params: ContainerCreateParams,
+        _params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
-        let _ = params;
         Err(ContainerRuntimeError::ConfigurationError(
             "create_deployment not supported by this runtime".to_string(),
         ))
@@ -265,9 +264,8 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     /// 返回新的 ContainerBasicInfo（Docker 含新 container_ip，供 service 层重注 pingora）。
     async fn patch_deployment(
         &self,
-        params: ContainerCreateParams,
+        _params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
-        let _ = params;
         Err(ContainerRuntimeError::ConfigurationError(
             "patch_deployment not supported by this runtime".to_string(),
         ))
@@ -394,8 +392,11 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     /// 利用本地 trust 认证绕过当前密码）。默认不支持（返回 ConfigurationError），
     /// DockerRuntime 用 bollard exec、KubernetesRuntime 用 kube-rs exec 实现。
     /// `command` 是完整命令（如 `["sh","-c","psql -c ..."]`），容器内 sh 可展开镜像 ENV。
-    async fn exec(&self, app_id: &str, command: Vec<String>) -> ContainerRuntimeResult<ExecResult> {
-        let _ = (app_id, command);
+    async fn exec(
+        &self,
+        _app_id: &str,
+        _command: Vec<String>,
+    ) -> ContainerRuntimeResult<ExecResult> {
         Err(ContainerRuntimeError::ConfigurationError(
             "exec not supported by this runtime".to_string(),
         ))

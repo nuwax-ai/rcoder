@@ -100,7 +100,7 @@ async fn check_vnc_rfb_ready_inner(port: u16) -> std::io::Result<bool> {
     let mut name = vec![0u8; name_len as usize];
     s.read_exact(&mut name).await?;
 
-    let _ = s.shutdown().await;
+    drop(s.shutdown().await);
     Ok(true)
 }
 
@@ -276,17 +276,17 @@ mod tests {
     async fn spawn_fake_3_3(listener: TcpListener) {
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let _ = sock.write_all(b"RFB 003.003\n").await;
+                drop(sock.write_all(b"RFB 003.003\n").await);
                 let mut cv = [0u8; 12];
                 if sock.read_exact(&mut cv).await.is_err() {
                     continue;
                 }
-                let _ = sock.write_all(&[0, 0, 0, SECURITY_NONE]).await; // 3.3 安全=None
+                drop(sock.write_all(&[0, 0, 0, SECURITY_NONE]).await); // 3.3 安全=None
                 let mut ci = [0u8; 1];
                 if sock.read_exact(&mut ci).await.is_err() {
                     continue;
                 }
-                let _ = sock.write_all(&[0u8; 24]).await; // ServerInit (name_length=0)
+                drop(sock.write_all(&[0u8; 24]).await); // ServerInit (name_length=0)
             }
         });
     }
@@ -296,22 +296,22 @@ mod tests {
     async fn spawn_fake_3_8(listener: TcpListener) {
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let _ = sock.write_all(b"RFB 003.008\n").await;
+                drop(sock.write_all(b"RFB 003.008\n").await);
                 let mut cv = [0u8; 12];
                 if sock.read_exact(&mut cv).await.is_err() {
                     continue;
                 }
-                let _ = sock.write_all(&[1, SECURITY_NONE]).await; // count=1, 类型=[None]
+                drop(sock.write_all(&[1, SECURITY_NONE]).await); // count=1, 类型=[None]
                 let mut chosen = [0u8; 1];
                 if sock.read_exact(&mut chosen).await.is_err() {
                     continue;
                 }
-                let _ = sock.write_all(&[0, 0, 0, 0]).await; // SecurityResult=ok
+                drop(sock.write_all(&[0, 0, 0, 0]).await); // SecurityResult=ok
                 let mut ci = [0u8; 1];
                 if sock.read_exact(&mut ci).await.is_err() {
                     continue;
                 }
-                let _ = sock.write_all(&[0u8; 24]).await; // ServerInit
+                drop(sock.write_all(&[0u8; 24]).await); // ServerInit
             }
         });
     }
@@ -339,15 +339,15 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let _ = sock.write_all(b"RFB 003.003\n").await;
+                drop(sock.write_all(b"RFB 003.003\n").await);
                 let mut cv = [0u8; 12];
                 if sock.read_exact(&mut cv).await.is_err() {
                     continue;
                 }
-                let _ = sock.write_all(&[0, 0, 0, 0]).await; // security=0 失败
+                drop(sock.write_all(&[0, 0, 0, 0]).await); // security=0 失败
                 let reason = b"Too many security failures";
-                let _ = sock.write_all(&(reason.len() as u32).to_be_bytes()).await;
-                let _ = sock.write_all(reason).await;
+                drop(sock.write_all(&(reason.len() as u32).to_be_bytes()).await);
+                drop(sock.write_all(reason).await);
             }
         });
         assert!(!check_vnc_rfb_ready(port, 2000).await);
@@ -359,7 +359,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\n").await; // 非 RFB
+                drop(sock.write_all(b"HTTP/1.1 200 OK\r\n").await); // 非 RFB
             }
         });
         assert!(!check_vnc_rfb_ready(port, 2000).await);

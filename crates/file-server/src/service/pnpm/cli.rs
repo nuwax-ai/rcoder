@@ -81,14 +81,22 @@ pub(super) async fn install(
         Ok(Ok(status)) => status,
         Ok(Err(source)) => {
             terminate_and_reap(&mut child, child_pid).await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            if let Err(e) = stdout_task.await {
+                tracing::warn!(error = %e, "stdout reader task join failed during wait-error path (skipping)");
+            }
+            if let Err(e) = stderr_task.await {
+                tracing::warn!(error = %e, "stderr reader task join failed during wait-error path (skipping)");
+            }
             return Err(InstallError::Wait { source });
         }
         Err(_) => {
             terminate_and_reap(&mut child, child_pid).await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            if let Err(e) = stdout_task.await {
+                tracing::warn!(error = %e, "stdout reader task join failed during timeout path (skipping)");
+            }
+            if let Err(e) = stderr_task.await {
+                tracing::warn!(error = %e, "stderr reader task join failed during timeout path (skipping)");
+            }
             return Err(InstallError::TimedOut { timeout_secs });
         }
     };
@@ -158,10 +166,14 @@ async fn terminate_and_reap(child: &mut tokio::process::Child, pid: Option<u32>)
     if let Some(pid) = pid {
         process::kill_process_group_force(pid);
     } else {
-        let _ = child.start_kill();
+        if let Err(e) = child.start_kill() {
+            tracing::warn!(error = %e, "start_kill failed (child may already be dead)");
+        }
     }
     // 回收子进程，让 stdout/stderr reader 收到 EOF，避免留下 zombie 和后台 task。
-    let _ = child.wait().await;
+    if let Err(e) = child.wait().await {
+        tracing::warn!(error = %e, "wait to reap child failed (skipping)");
+    }
 }
 
 #[derive(Default)]

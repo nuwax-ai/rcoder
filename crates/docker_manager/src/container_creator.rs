@@ -171,7 +171,9 @@ impl<'a> ContainerCreator<'a> {
                 "[CREATE] Container {} started but health check failed: {}. Rolling back...",
                 container_id, e
             );
-            let _ = self.manager.stop_container_by_id(&container_id).await;
+            if let Err(stop_e) = self.manager.stop_container_by_id(&container_id).await {
+                warn!("[CREATE] rollback stop failed (orphan may leak): {container_id}: {stop_e}");
+            }
             return Err(e);
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;

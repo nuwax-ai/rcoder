@@ -156,12 +156,18 @@ impl Callback for HandshakeCallback {
                 .unwrap_or_default()
                 .to_string()
         };
-        let _ = self.metadata.set(HandshakeMetadata {
-            project_id: header(PROJECT_ID_HEADER),
-            service_type: header(SERVICE_TYPE_HEADER),
-            tenant_id: header(TENANT_ID_HEADER),
-            space_id: header(SPACE_ID_HEADER),
-        });
+        if self
+            .metadata
+            .set(HandshakeMetadata {
+                project_id: header(PROJECT_ID_HEADER),
+                service_type: header(SERVICE_TYPE_HEADER),
+                tenant_id: header(TENANT_ID_HEADER),
+                space_id: header(SPACE_ID_HEADER),
+            })
+            .is_err()
+        {
+            warn!("metadata set failed (already initialized)");
+        }
 
         // 2. 协商子协议：客户端请求含 `tty` 时回选 `tty`，否则不动（保持默认行为）
         let wants_tty = req

@@ -496,9 +496,11 @@ async fn check_agent_forwards_request() {
     let ctx = make_ctx(addr);
     let project = make_project(addr);
 
-    let _ = check_agent(&ctx, &project, "codex-acp", None)
-        .await
-        .expect("check ok");
+    drop(
+        check_agent(&ctx, &project, "codex-acp", None)
+            .await
+            .expect("check ok"),
+    );
     let snap = mock.snapshot();
     assert_eq!(snap.check_calls, 1);
 }

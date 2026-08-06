@@ -51,8 +51,12 @@ pub async fn import_project(target_dir: &Path, zip_path: &Path) -> AppResult<Imp
     let merge_res = merge_extracted(&extract_root, target_dir).await;
     if let Err(merge_err) = merge_res {
         // 回滚: 清空刚合并的非白名单条目 + 从备份恢复
-        let _ = clear_except_preserved(target_dir).await;
-        let _ = restore_from_backup(&backup_dir, target_dir).await;
+        if let Err(e) = clear_except_preserved(target_dir).await {
+            tracing::warn!(error = %e, "rollback clear_except_preserved failed (skipping)");
+        }
+        if let Err(e) = restore_from_backup(&backup_dir, target_dir).await {
+            tracing::warn!(error = %e, "rollback restore_from_backup failed (skipping)");
+        }
         return Err(merge_err);
     }
 
@@ -172,14 +176,14 @@ mod tests {
         crate::service::zip::pack_dir(zip_root.clone(), zip_path.clone(), Vec::new(), Vec::new())
             .await
             .unwrap();
-        let _ = import_project(&tmp, &zip_path).await.unwrap();
+        drop(import_project(&tmp, &zip_path).await.unwrap());
         // .git 保留, old.txt 被移除, new.txt 出现
         assert!(tmp.join(".git").join("HEAD").exists());
         assert!(!tmp.join("old.txt").exists());
         assert!(tmp.join("new.txt").exists());
         assert!(!tmp.join("src.zip").exists());
-        let _ = fs::remove_dir_all(&tmp).await;
-        let _ = fs::remove_dir_all(&zip_root).await;
-        let _ = fs::remove_file(&zip_path).await;
+        drop(fs::remove_dir_all(&tmp).await);
+        drop(fs::remove_dir_all(&zip_root).await);
+        drop(fs::remove_file(&zip_path).await);
     }
 }

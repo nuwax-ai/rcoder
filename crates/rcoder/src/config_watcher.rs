@@ -75,8 +75,10 @@ impl ConfigWatcher {
         let (tx, mut rx) = mpsc::channel(100);
 
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                let _ = tx.blocking_send(event);
+            if let Ok(event) = res
+                && let Err(e) = tx.blocking_send(event)
+            {
+                warn!("config watcher event send failed (consumer gone): {e}");
             }
         })?;
 

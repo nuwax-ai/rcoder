@@ -189,7 +189,13 @@ async fn migrate_shared_pvc(
         // copy (不删源, 安全)
         match crate::workspace_migrate::copy_dir_recursive_pub(&src_item, &dst_item).await {
             Ok(()) => {
-                let _ = tokio::fs::write(&marker, b"1").await;
+                if let Err(e) = tokio::fs::write(&marker, b"1").await {
+                    warn!(
+                        "[BATCH_MIGRATE] copy 后写 marker {} 失败: {}",
+                        marker.display(),
+                        e
+                    );
+                }
                 migrated += 1;
                 info!(
                     "[BATCH_MIGRATE] {} {} copied {} -> {}",

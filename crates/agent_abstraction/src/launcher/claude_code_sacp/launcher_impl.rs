@@ -263,8 +263,13 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 }
 
                 // 🔥 立即通知外层连接失败，避免等待 60 秒超时
-                if let Some(tx) = connection_failed_tx.take() {
-                    let _ = tx.send(format!("{}", e));
+                if let Some(tx) = connection_failed_tx.take()
+                    && let Err(send_err) = tx.send(format!("{}", e))
+                {
+                    warn!(
+                        "[SACP] connection_failed_tx send failed (receiver dropped), error was: {}",
+                        send_err
+                    );
                 }
 
                 // 🔥 关键修复：连接失败时发送错误通知到 SSE 流

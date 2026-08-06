@@ -331,8 +331,10 @@ impl SharedStream {
                 &self.last_activity_secs,
             );
         }
-        // broadcast：无 receiver 时 send 返回 Err，忽略（客户端全断时事件只留 ring）
-        let _ = self.broadcast_tx.send(ev);
+        // broadcast：无 receiver 时 send 返回 Err（客户端全断时事件只留 ring）；记 debug 便于诊断
+        if let Err(send_err) = self.broadcast_tx.send(ev) {
+            warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
+        }
     }
 
     /// 清空历史 ring(epoch 变化时调用,丢弃旧 epoch 的事件,避免新 epoch 重放旧事件)。
@@ -349,7 +351,7 @@ impl SharedStream {
         if ring.is_full() {
             ring.try_pop();
         }
-        let _ = ring.try_push((0, ev));
+        drop(ring.try_push((0, ev)));
     }
 
     fn shutdown(&self) {
@@ -366,7 +368,9 @@ impl SharedStream {
             seq: 0,
             timestamp: now_millis(),
         });
-        let _ = self.broadcast_tx.send(end_ev);
+        if let Err(send_err) = self.broadcast_tx.send(end_ev) {
+            warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
+        }
         self.cancel_token.cancel();
         // 不 await task：避免 get_or_create（HTTP 请求路径）阻塞——后台 task 在 get_client/get_status/
         // subscribe_progress 等连接阶段不响应 cancel，若 await 会卡住 HTTP 请求。task 会在 stream 循环
@@ -434,7 +438,7 @@ fn spawn_backend_task(
     tokio::spawn(async move {
         let session_id = shared.session_id.clone();
         let cancel = shared.cancel_token.clone();
-        let _ = activity_updater; // activity 已通过 dispatch_event 内部节流调用
+        drop(activity_updater); // activity 已通过 dispatch_event 内部节流调用
 
         for attempt in 1..=MAX_RETRIES {
             if cancel.is_cancelled() {
@@ -455,7 +459,9 @@ fn spawn_backend_task(
                     // 重试耗尽:必须发终态错误事件,否则 SharedStream 持 sender 不 Closed,
                     // 已连上的 HTTP SSE 客户端会永久 hang 在 recv()。错误文案用【当前】失败(#16a)。
                     let err_ev = make_connection_error_event(&format!("get_client: {e}"));
-                    let _ = shared.broadcast_tx.send(Arc::new(err_ev));
+                    if let Err(send_err) = shared.broadcast_tx.send(Arc::new(err_ev)) {
+                        warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
+                    }
                     return;
                 }
             };
@@ -481,7 +487,11 @@ fn spawn_backend_task(
                             session_id
                         );
                         let ev = make_prompt_end_event();
-                        let _ = shared.broadcast_tx.send(Arc::new(ev));
+                        if let Err(send_err) = shared.broadcast_tx.send(Arc::new(ev)) {
+                            warn!(
+                                "[SessionStream] broadcast send failed (no subscriber): {send_err}"
+                            );
+                        }
                         return;
                     }
                     // epoch 比较(#15):同 epoch → 保留 last_seq(增量订阅);
@@ -512,7 +522,11 @@ fn spawn_backend_task(
                             // 经 replay_since 收到它（broadcast 只投递订阅后的消息，重连客户端收不到）。
                             let reset_ev = Arc::new(make_cursor_reset_event());
                             shared.push_reset_to_ring(Arc::clone(&reset_ev));
-                            let _ = shared.broadcast_tx.send(reset_ev);
+                            if let Err(send_err) = shared.broadcast_tx.send(reset_ev) {
+                                warn!(
+                                    "[SessionStream] broadcast send failed (no subscriber): {send_err}"
+                                );
+                            }
                         }
                     }
                 }
@@ -561,9 +575,14 @@ fn spawn_backend_task(
                                     );
                                     // 兜底：若 agent_runner 未推 SessionPromptEnd 就关流，客户端转发 task 会 hang
                                     // （broadcast 不会 Closed，因 SharedStream 持有 sender）。补一个 terminal 事件唤醒退出。
-                                    let _ = shared
+                                    if let Err(send_err) = shared
                                         .broadcast_tx
-                                        .send(Arc::new(make_prompt_end_event()));
+                                        .send(Arc::new(make_prompt_end_event()))
+                                    {
+                                        warn!(
+                                            "[SessionStream] broadcast send failed (no subscriber): {send_err}"
+                                        );
+                                    }
                                     return;
                                 }
                                 Err(e) => {
@@ -582,7 +601,13 @@ fn spawn_backend_task(
                                         break; // 内层 loop 退出，外层重试
                                     }
                                     let err_ev = make_stream_error_event(e.code(), e.message());
-                                    let _ = shared.broadcast_tx.send(Arc::new(err_ev));
+                                    if let Err(send_err) =
+                                        shared.broadcast_tx.send(Arc::new(err_ev))
+                                    {
+                                        warn!(
+                                            "[SessionStream] broadcast send failed (no subscriber): {send_err}"
+                                        );
+                                    }
                                     return;
                                 }
                             }
@@ -600,7 +625,9 @@ fn spawn_backend_task(
                     }
                     // 终态事件报告【当前】阶段错误,不用累积的过期错误(#16a)。
                     let err_ev = make_connection_error_event(&format!("subscribe: {e}"));
-                    let _ = shared.broadcast_tx.send(Arc::new(err_ev));
+                    if let Err(send_err) = shared.broadcast_tx.send(Arc::new(err_ev)) {
+                        warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
+                    }
                     return;
                 }
             }
@@ -729,7 +756,7 @@ mod tests {
                 seq,
                 timestamp: seq as i64,
             });
-            let _ = ring.try_push((seq, ev));
+            drop(ring.try_push((seq, ev)));
         }
         let ring = Mutex::new(ring);
         let got: Vec<u64> = ring
@@ -745,7 +772,7 @@ mod tests {
     fn replay_since_is_non_destructive() {
         let mut ring: HeapRb<(u64, SharedEvent)> = HeapRb::new(10);
         for seq in 1..=3 {
-            let _ = ring.try_push((
+            drop(ring.try_push((
                 seq,
                 Arc::new(ProgressEvent {
                     message_type: "X".into(),
@@ -755,7 +782,7 @@ mod tests {
                     seq,
                     timestamp: 0,
                 }),
-            ));
+            )));
         }
         let ring = Mutex::new(ring);
         let first: Vec<u64> = ring.lock().iter().map(|(s, _)| *s).collect();

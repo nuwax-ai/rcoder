@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn collect_does_not_panic() {
-        let _ = collect_mirror_env_vars();
+        drop(collect_mirror_env_vars());
     }
 
     #[test]

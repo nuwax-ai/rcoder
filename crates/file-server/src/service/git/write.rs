@@ -217,7 +217,9 @@ pub fn init_repo(path: &Path, author_name: &str, author_email: &str) -> AppResul
     super::ensure_gitignore(path)?;
     if !already {
         stage_path(&repo, ".gitignore")?;
-        let _ = commit_indexed(&repo, "Initial commit", author_name, author_email);
+        if let Err(e) = commit_indexed(&repo, "Initial commit", author_name, author_email) {
+            tracing::warn!(error = %e, "initial commit failed (best-effort, skipping)");
+        }
     }
     Ok(already)
 }
@@ -244,7 +246,9 @@ pub fn init_and_commit(
     // stage 全部变更 (addAll: modified + untracked + deleted)
     stage_files(&repo, &[])?;
     // 提交 (无变更也会产生提交, 与 nuwax 一致; commit 失败 best-effort 不阻断业务)
-    let _ = commit_indexed(&repo, message, author_name, author_email);
+    if let Err(e) = commit_indexed(&repo, message, author_name, author_email) {
+        tracing::warn!(error = %e, "commit failed (best-effort, skipping)");
+    }
     Ok(())
 }
 
@@ -356,7 +360,7 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
                     .find_blob(entry.id())
                     .map_err(|e| map_git_err(e, "git find_blob"))?;
                 if let Some(p) = abs.parent() {
-                    let _ = std::fs::create_dir_all(p);
+                    std::fs::create_dir_all(p)?;
                 }
                 std::fs::write(&abs, &blob.data)?;
                 stage_path(repo, f)?;
@@ -364,7 +368,9 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
             }
             None => {
                 // untracked / staged-new: 删 worktree + 同步 index (移除 staged-new entry)
-                let _ = std::fs::remove_file(&abs);
+                if let Err(e) = std::fs::remove_file(&abs) {
+                    tracing::warn!(error = %e, "remove untracked worktree file failed (skipping)");
+                }
                 stage_path(repo, f)?;
                 if staged_set.contains(f) {
                     buckets.new_files.push(f.clone());
@@ -406,7 +412,7 @@ mod tests {
 
     impl Drop for TestRepo {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            drop(std::fs::remove_dir_all(&self.0));
         }
     }
 
@@ -456,7 +462,7 @@ mod tests {
         let repo = test.open();
         // 穿越路径必须在任何 fs 操作前被 ensure_within 拦截
         let outside = test.0.parent().unwrap().join("evil-outside.txt");
-        let _ = std::fs::remove_file(&outside);
+        drop(std::fs::remove_file(&outside));
         let result = discard_files(&repo, &["../evil-outside.txt".to_string()]);
         assert!(
             result.is_err(),

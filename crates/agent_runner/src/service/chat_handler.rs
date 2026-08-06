@@ -553,7 +553,14 @@ async fn prepare_session(
                     error_message: Some("Auto-reload: restarting agent".into()),
                     request_id: None,
                 });
-                let _ = push_session_update_with_project(project_id, &old_session_id, notify).await;
+                if let Err(e) =
+                    push_session_update_with_project(project_id, &old_session_id, notify).await
+                {
+                    warn!(
+                        "[ChatHandler] failed to push auto-reload SessionPromptEnd notification: project_id={}, session_id={}, error={}",
+                        project_id, old_session_id, e
+                    );
+                }
 
                 // view() 在闭包返回后立即释放锁，无 Ref 暴露
                 if let Some(sd) = SESSION_CACHE.view(&old_session_id, |_, d| d.clone()) {

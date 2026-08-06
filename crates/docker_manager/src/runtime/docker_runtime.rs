@@ -635,7 +635,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             );
         }
         // 清理内存态回收策略（K8s 靠注解随 Deployment 自动消失；Docker 需显式清，防孤儿堆积）
-        let _ = self.recycle_policy.remove(app_id);
+        drop(self.recycle_policy.remove(app_id));
         Ok(())
     }
 

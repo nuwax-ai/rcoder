@@ -193,8 +193,12 @@ impl KubernetesRuntime {
         match routes.list(&lp).await {
             Ok(list) => {
                 for it in list.items {
-                    if let Some(name) = it.metadata.name.as_ref() {
-                        let _ = routes.delete(name, &dp).await;
+                    if let Some(name) = it.metadata.name.as_ref()
+                        && let Err(e) = routes.delete(name, &dp).await
+                    {
+                        warn!(
+                            "[K8S-APP] orphan 删 httproute '{name}' 失败 (ignored): {app_id}: {e}"
+                        );
                     }
                 }
             }
@@ -224,8 +228,10 @@ impl KubernetesRuntime {
         match api.list(lp).await {
             Ok(list) => {
                 for it in list.items {
-                    if let Some(name) = it.metadata().name.as_deref() {
-                        let _ = api.delete(name, dp).await;
+                    if let Some(name) = it.metadata().name.as_deref()
+                        && let Err(e) = api.delete(name, dp).await
+                    {
+                        warn!("[K8S-APP] orphan 删 {kind} '{name}' 失败 (ignored): {app_id}: {e}");
                     }
                 }
             }

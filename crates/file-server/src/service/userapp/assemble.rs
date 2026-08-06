@@ -68,8 +68,10 @@ pub(super) async fn assemble_workspace_package(
                 .map_err(|e| AppError::file(format!("zip finish: {e}")))?;
             Ok(())
         })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&out_for_task);
+        if result.is_err()
+            && let Err(e) = std::fs::remove_file(&out_for_task)
+        {
+            tracing::warn!(error = %e, "cleanup failed assemble output file failed (skipping)");
         }
         result
     })

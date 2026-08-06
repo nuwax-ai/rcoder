@@ -399,7 +399,13 @@ async fn resolve_container_target(
             .await?;
 
     // 第二步：获取或创建 ProjectAndContainerInfo - 使用 存储
-    let _ = ensure_project_record(state, request, project_id, &container_info, service_type)?;
+    drop(ensure_project_record(
+        state,
+        request,
+        project_id,
+        &container_info,
+        service_type,
+    )?);
 
     // 请求到达时立即更新活动时间（不等待请求执行结果）
     // 这样可以防止在 gRPC 请求期间被 cleanup_task 误清理

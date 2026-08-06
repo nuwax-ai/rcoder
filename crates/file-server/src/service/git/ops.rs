@@ -386,8 +386,10 @@ fn apply_tree_to_worktree(
                 .is_none()
             {
                 // 防御：恶意 old-tree entry 含 `..` 时跳过删除（绝不删工作区外文件）
-                if let Ok(abs) = ensure_within_path(workdir, from_bstr(path)) {
-                    let _ = std::fs::remove_file(&abs);
+                if let Ok(abs) = ensure_within_path(workdir, from_bstr(path))
+                    && let Err(e) = std::fs::remove_file(&abs)
+                {
+                    tracing::warn!(error = %e, "remove stale worktree file during checkout apply failed (skipping)");
                 }
             }
         }

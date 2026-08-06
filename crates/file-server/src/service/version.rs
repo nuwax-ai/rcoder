@@ -305,7 +305,7 @@ mod tests {
         assert!(!dir.join("src").exists());
         assert!(!dir.join("README.md").exists());
 
-        let _ = fs::remove_dir_all(&dir).await;
+        drop(fs::remove_dir_all(&dir).await);
     }
 
     #[test]

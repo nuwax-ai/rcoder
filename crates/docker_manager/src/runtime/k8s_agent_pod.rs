@@ -144,11 +144,15 @@ impl KubernetesRuntime {
         // drain stdout/stderr（kill 通常无输出；读空释放 buffer，避免 join 死锁；reader 出作用域 drop 后再 join）
         if let Some(mut r) = attached.stdout() {
             let mut buf = String::new();
-            let _ = r.read_to_string(&mut buf).await;
+            if let Err(e) = r.read_to_string(&mut buf).await {
+                warn!("[K8S] restart exec drain stdout (kill -TERM 1): {e} (non-fatal)");
+            }
         }
         if let Some(mut r) = attached.stderr() {
             let mut buf = String::new();
-            let _ = r.read_to_string(&mut buf).await;
+            if let Err(e) = r.read_to_string(&mut buf).await {
+                warn!("[K8S] restart exec drain stderr (kill -TERM 1): {e} (non-fatal)");
+            }
         }
         if let Err(e) = attached.join().await {
             debug!("[K8S] restart exec join (kill -TERM 1): {e} (non-fatal, SIGTERM 已发)");

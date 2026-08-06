@@ -91,8 +91,12 @@ where
         while let Ok(Some(line)) = lines.next_line().await {
             let prefixed = format!("{}{}", timestamp_prefix(), line);
             // 主+临时都写; 单流失败不阻塞另一流
-            let _ = append_line(&main_path, &prefixed).await;
-            let _ = append_line(&temp_path, &prefixed).await;
+            if let Err(e) = append_line(&main_path, &prefixed).await {
+                tracing::warn!(error = %e, "append_line (main log) failed");
+            }
+            if let Err(e) = append_line(&temp_path, &prefixed).await {
+                tracing::warn!(error = %e, "append_line (temp log) failed");
+            }
         }
     })
 }
@@ -115,8 +119,12 @@ where
             super::error_classify::ring_push(&ring, &line);
             // 带时间戳写日志
             let prefixed = format!("{}{}", timestamp_prefix(), line);
-            let _ = append_line(&main_path, &prefixed).await;
-            let _ = append_line(&temp_path, &prefixed).await;
+            if let Err(e) = append_line(&main_path, &prefixed).await {
+                tracing::warn!(error = %e, "append_line (main log) failed");
+            }
+            if let Err(e) = append_line(&temp_path, &prefixed).await {
+                tracing::warn!(error = %e, "append_line (temp log) failed");
+            }
         }
     })
 }
@@ -270,8 +278,11 @@ pub async fn cleanup_temp_logs(dir: &Path) {
     };
     while let Ok(Some(e)) = entries.next_entry().await {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with("dev-temp-") && name.ends_with(".log") {
-            let _ = tokio::fs::remove_file(e.path()).await;
+        if name.starts_with("dev-temp-")
+            && name.ends_with(".log")
+            && let Err(e) = tokio::fs::remove_file(e.path()).await
+        {
+            tracing::warn!(error = %e, "remove temp log file failed (skipping)");
         }
     }
 }

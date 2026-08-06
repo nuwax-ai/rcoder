@@ -154,9 +154,9 @@ async fn apply_validated_file_ops(
                         .map(|m| m.is_dir())
                         .unwrap_or(false);
                     if is_dir {
-                        let _ = fs::remove_dir_all(&target).await;
+                        fs::remove_dir_all(&target).await?;
                     } else {
-                        let _ = fs::remove_file(&target).await;
+                        fs::remove_file(&target).await?;
                     }
                 }
             }

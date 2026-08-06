@@ -8,7 +8,7 @@ use std::path::Path;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::error::AgentDownloadError;
 
@@ -141,7 +141,12 @@ fn update_registry_sync(
     std::fs::write(&tmp_path, json.as_bytes())?;
     if std::fs::rename(&tmp_path, &registry_path).is_err() {
         std::fs::copy(&tmp_path, &registry_path)?;
-        let _ = std::fs::remove_file(&tmp_path);
+        if let Err(e) = std::fs::remove_file(&tmp_path) {
+            warn!(
+                "[registry] failed to clean up temp file {}: {e}",
+                tmp_path.display()
+            );
+        }
     }
 
     info!(

@@ -161,16 +161,24 @@ pub fn subscribe_build_progress(
         {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                let _ = tx
+                if let Err(e) = tx
                     .send(Err(BuildStreamError::Non2xx {
                         status: r.status().as_u16(),
                         url: url.clone(),
                     }))
-                    .await;
+                    .await
+                {
+                    tracing::warn!("build stream error event send failed (orchestrator gone): {e}");
+                }
                 return;
             }
             Err(e) => {
-                let _ = tx.send(Err(BuildStreamError::Connect(e.to_string()))).await;
+                if let Err(send_err) = tx.send(Err(BuildStreamError::Connect(e.to_string()))).await
+                {
+                    tracing::warn!(
+                        "build stream error event send failed (orchestrator gone): {send_err}"
+                    );
+                }
                 return;
             }
         };
@@ -183,7 +191,14 @@ pub fn subscribe_build_progress(
                 chunk = stream.next() => match chunk {
                     None => return, // 流正常结束(无终态 → orchestrator 走 snapshot 恢复)
                     Some(Err(e)) => {
-                        let _ = tx.send(Err(BuildStreamError::Read(e.to_string()))).await;
+                        if let Err(send_err) = tx
+                            .send(Err(BuildStreamError::Read(e.to_string())))
+                            .await
+                        {
+                            tracing::warn!(
+                                "build stream error event send failed (orchestrator gone): {send_err}"
+                            );
+                        }
                         return;
                     }
                     Some(Ok(chunk)) => {
@@ -217,12 +232,17 @@ pub fn subscribe_build_progress(
                             }
                         }
                         if buffer.len() > MAX_SSE_BUFFER {
-                            let _ = tx
+                            if let Err(e) = tx
                                 .send(Err(BuildStreamError::BufferOverrun {
                                     size: buffer.len(),
                                     max: MAX_SSE_BUFFER,
                                 }))
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(
+                                    "build stream error event send failed (orchestrator gone): {e}"
+                                );
+                            }
                             return;
                         }
                     }

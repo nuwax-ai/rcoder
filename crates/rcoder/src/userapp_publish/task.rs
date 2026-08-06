@@ -128,7 +128,9 @@ impl PublishTask {
             };
             // broadcast 必须在持 state 锁内:与 subscribe 的"创建 receiver + 读 replay"互斥串行,
             // 否则同一事件可能既进 replay 又被 receiver 收到 → 重复(broadcast::send 非阻塞,持锁安全)。
-            let _ = self.tx.send((seq, event));
+            if let Err(send_err) = self.tx.send((seq, event)) {
+                tracing::warn!("build progress event send failed (consumer gone): {send_err}");
+            }
             terminal
         };
         if terminal {
@@ -151,7 +153,9 @@ impl PublishTask {
         let Some((seq, event, _)) = publish_mut(&mut s, PublishEvent::Cancelling) else {
             unreachable!("status was checked non-terminal above");
         };
-        let _ = self.tx.send((seq, event));
+        if let Err(send_err) = self.tx.send((seq, event)) {
+            tracing::warn!("build progress event send failed (consumer gone): {send_err}");
+        }
         drop(s);
         // 唤醒 orchestrator 的 cancellation_notified 等待者(置 flag + notify)。
         self.cancel();

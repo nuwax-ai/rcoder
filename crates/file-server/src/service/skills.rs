@@ -137,14 +137,18 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
         let t_skills = t_root.join("skills");
         let t_agents = t_root.join("agents");
         // skills (先 rm 再 copy, 全量覆盖)
-        let _ = fs::remove_dir_all(&t_skills).await;
+        if let Err(e) = fs::remove_dir_all(&t_skills).await {
+            tracing::warn!(error = %e, "clear skills target dir before sync failed (skipping)");
+        }
         fs::create_dir_all(&t_skills).await?;
         if has_skills {
             crate::service::fs_util::copy_dir_filtered(&primary_skills, &t_skills, &[], &[])
                 .await?;
         }
         // agents
-        let _ = fs::remove_dir_all(&t_agents).await;
+        if let Err(e) = fs::remove_dir_all(&t_agents).await {
+            tracing::warn!(error = %e, "clear agents target dir before sync failed (skipping)");
+        }
         fs::create_dir_all(&t_agents).await?;
         if has_agents {
             crate::service::fs_util::copy_dir_filtered(&primary_agents, &t_agents, &[], &[])
@@ -153,11 +157,14 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     }
     // 版本 marker: 启动 reconciler 据此 O(1) 判断是否需补 sync
     // (写失败不阻断 sync 结果; 最坏 reconciler 下次多 sync 一次, 幂等兜底)
-    let _ = fs::write(
+    if let Err(e) = fs::write(
         project_path.join(".agents").join(".sync_version"),
         sync_target_version(),
     )
-    .await;
+    .await
+    {
+        tracing::warn!(error = %e, "write sync_version marker failed (best-effort, skipping)");
+    }
     Ok(())
 }
 

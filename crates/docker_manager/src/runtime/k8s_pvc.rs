@@ -529,7 +529,9 @@ impl K8sPvcOps for KubernetesRuntime {
                     grace_period_seconds: Some(0),
                     ..Default::default()
                 };
-                let _ = self.pvcs().delete(&pvc_name, &dp).await;
+                if let Err(e) = self.pvcs().delete(&pvc_name, &dp).await {
+                    warn!("[K8S] PVC {pvc_name} force-delete(grace=0) 请求失败: {e}");
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 // 强删后再确认; 仍卡 → 不自动剥 finalizer (危险, 绕过 pvc-protection),
                 // 报错让人/运维介入

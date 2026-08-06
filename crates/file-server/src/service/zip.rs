@@ -374,8 +374,8 @@ mod tests {
         );
 
         assert!(result.is_err());
-        let _ = fs::remove_file(source);
-        let _ = fs::remove_dir_all(destination);
+        drop(fs::remove_file(source));
+        drop(fs::remove_dir_all(destination));
     }
 
     /// download-all-files 口径: traverse_exclude_dirs + content excludes + dot-segment 过滤。
@@ -392,7 +392,7 @@ mod tests {
             skip_hardlinks: false,
             path_prefix: Some("u_c/".into()),
         };
-        let _ = pack_blocking(&src, &out, &opts);
+        drop(pack_blocking(&src, &out, &opts));
         let names = entry_names(&out);
         assert!(names.contains(&"u_c/src/index.js".to_string()), "{names:?}");
         assert!(
@@ -405,8 +405,8 @@ mod tests {
             !names.iter().any(|n| n.contains("package-lock.yaml")),
             "{names:?}"
         );
-        let _ = fs::remove_dir_all(&src);
-        let _ = fs::remove_file(&out);
+        drop(fs::remove_dir_all(&src));
+        drop(fs::remove_file(&out));
     }
 
     /// zip-workspace 口径: 合并集填 dirs+files, **无** dot-segment 过滤。
@@ -424,7 +424,7 @@ mod tests {
             skip_hardlinks: false,
             path_prefix: None,
         };
-        let _ = pack_blocking(&src, &out, &opts);
+        drop(pack_blocking(&src, &out, &opts));
         let names = entry_names(&out);
         assert!(names.contains(&"src/index.js".to_string()), "{names:?}");
         assert!(names.contains(&".gitignore".to_string()), "{names:?}");
@@ -433,7 +433,7 @@ mod tests {
             "{names:?}"
         );
         assert!(!names.iter().any(|n| n.contains("dist/")), "{names:?}");
-        let _ = fs::remove_dir_all(&src);
-        let _ = fs::remove_file(&out);
+        drop(fs::remove_dir_all(&src));
+        drop(fs::remove_file(&out));
     }
 }

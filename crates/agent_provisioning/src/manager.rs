@@ -11,7 +11,7 @@ use download_utils::archive::{self, ArchiveError};
 use download_utils::{DownloadConfig, Downloader};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::AgentDownloadError;
 
@@ -250,7 +250,12 @@ impl AgentDownloadManager {
         let file_size = match download_result {
             Ok(size) => size,
             Err(error) => {
-                let _ = tokio::fs::remove_dir_all(&staging).await;
+                if let Err(e) = tokio::fs::remove_dir_all(&staging).await {
+                    warn!(
+                        "[agent-provisioning] failed to clean up staging dir {}: {e}",
+                        staging.display()
+                    );
+                }
                 return Err(AgentDownloadError::Download(error));
             }
         };
@@ -261,7 +266,12 @@ impl AgentDownloadManager {
         if let Err(error) = tokio::fs::remove_dir_all(&version_dir).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            let _ = tokio::fs::remove_dir_all(&staging).await;
+            if let Err(e) = tokio::fs::remove_dir_all(&staging).await {
+                warn!(
+                    "[agent-provisioning] failed to clean up staging dir {}: {e}",
+                    staging.display()
+                );
+            }
             return Err(error.into());
         }
         tokio::fs::rename(&staging, &version_dir).await?;

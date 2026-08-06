@@ -84,7 +84,7 @@ fn commit_diff_handles_nested_tree_and_preserves_from_to_direction() {
     assert!(oversized.is_err());
 
     drop(repo);
-    let _ = std::fs::remove_dir_all(root);
+    drop(std::fs::remove_dir_all(root));
 }
 
 #[test]

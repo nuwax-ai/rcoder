@@ -261,7 +261,9 @@ where
                 Err(_) => break,
             }
         }
-        let _ = b_sink.close().await;
+        if let Err(e) = b_sink.close().await {
+            warn!("websocket sink close/send failed (peer gone): {e}");
+        }
     };
 
     // b(ttyd) → a(browser)，并周期注入 keepalive
@@ -311,7 +313,9 @@ where
                 }
             }
         }
-        let _ = a_sink.close().await;
+        if let Err(e) = a_sink.close().await {
+            warn!("websocket sink close/send failed (peer gone): {e}");
+        }
     };
 
     tokio::join!(ab, ba);
@@ -332,8 +336,12 @@ where
         reason: reason.into(),
     };
     // Send explicit Close frame with reason, then close the sink
-    let _ = sink.send(Message::Close(Some(frame))).await;
-    let _ = sink.close().await;
+    if let Err(e) = sink.send(Message::Close(Some(frame))).await {
+        warn!("websocket sink close/send failed (peer gone): {e}");
+    }
+    if let Err(e) = sink.close().await {
+        warn!("websocket sink close/send failed (peer gone): {e}");
+    }
     info!(
         "[WS_TERMINAL] connection closed with reason: {} (code={})",
         reason, code

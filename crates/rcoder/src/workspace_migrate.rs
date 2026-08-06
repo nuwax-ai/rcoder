@@ -132,7 +132,13 @@ pub async fn lazy_migrate(
     // 迁移: 先试 rename (同 subvolume 快), EXDEV → fallback copy+remove (跨 subvolume)
     match tokio::fs::rename(&src, &dst).await {
         Ok(()) => {
-            let _ = tokio::fs::write(&marker, b"1").await;
+            if let Err(e) = tokio::fs::write(&marker, b"1").await {
+                warn!(
+                    "[MIGRATE] rename 后写 marker {} 失败: {} (下次 ensure 会重判)",
+                    marker.display(),
+                    e
+                );
+            }
             info!(
                 "[MIGRATE] rename {} -> {} ({} {})",
                 src.display(),
@@ -145,8 +151,20 @@ pub async fn lazy_migrate(
             // EXDEV: 跨 CephFS subvolume → copy + remove (shell mv 行为)
             match copy_dir_recursive(&src, &dst).await {
                 Ok(()) => {
-                    let _ = tokio::fs::write(&marker, b"1").await;
-                    let _ = tokio::fs::remove_dir_all(&src).await;
+                    if let Err(e) = tokio::fs::write(&marker, b"1").await {
+                        warn!(
+                            "[MIGRATE] copy 后写 marker {} 失败: {} (下次 ensure 会重判)",
+                            marker.display(),
+                            e
+                        );
+                    }
+                    if let Err(e) = tokio::fs::remove_dir_all(&src).await {
+                        warn!(
+                            "[MIGRATE] copy 后删除源 {} 失败: {} (数据已复制, 源残留)",
+                            src.display(),
+                            e
+                        );
+                    }
                     info!(
                         "[MIGRATE] copy+remove {} -> {} ({} {})",
                         src.display(),
@@ -200,7 +218,13 @@ async fn migrate_children(src: &std::path::Path, dst: &std::path::Path, identifi
             Err(e) if e.raw_os_error() == Some(18) => {
                 match copy_dir_recursive(&src_item, &dst_item).await {
                     Ok(()) => {
-                        let _ = tokio::fs::remove_dir_all(&src_item).await;
+                        if let Err(e) = tokio::fs::remove_dir_all(&src_item).await {
+                            warn!(
+                                "[MIGRATE] 子项 copy 后删除源 {} 失败: {} (数据已复制, 源残留)",
+                                src_item.display(),
+                                e
+                            );
+                        }
                         migrated += 1;
                     }
                     Err(e) => warn!(
@@ -220,7 +244,13 @@ async fn migrate_children(src: &std::path::Path, dst: &std::path::Path, identifi
         }
     }
     if migrated > 0 || skipped > 0 {
-        let _ = tokio::fs::write(&marker, b"1").await;
+        if let Err(e) = tokio::fs::write(&marker, b"1").await {
+            warn!(
+                "[MIGRATE] 逐子项迁移后写 marker {} 失败: {} (下次 ensure 会重判)",
+                marker.display(),
+                e
+            );
+        }
         info!(
             "[MIGRATE] {} 逐子项迁移 (迁 {}, skip {}): {} -> {}",
             identifier,

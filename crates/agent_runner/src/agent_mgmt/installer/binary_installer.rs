@@ -443,7 +443,13 @@ pub async fn install_from_file(
     if tokio::fs::rename(download_path, &staging).await.is_err() {
         debug!("[agent_mgmt] install_from_file: rename failed, falling back to copy");
         tokio::fs::copy(download_path, &staging).await?;
-        let _ = tokio::fs::remove_file(download_path).await;
+        if let Err(e) = tokio::fs::remove_file(download_path).await {
+            warn!(
+                "[agent_mgmt] install_from_file: failed to remove source after copy fallback: path={}, error={}",
+                download_path.display(),
+                e
+            );
+        }
     }
     debug!(
         "[agent_mgmt] install_from_file: staging file ready, took {:?}",
@@ -538,7 +544,13 @@ async fn _install_from_staging(
             count,
             t_extract.elapsed()
         );
-        let _ = std::fs::remove_file(&staging_clone);
+        if let Err(e) = std::fs::remove_file(&staging_clone) {
+            warn!(
+                "[agent_mgmt] failed to remove staging archive after extraction: path={}, error={}",
+                staging_clone.display(),
+                e
+            );
+        }
 
         // 剥掉单个顶层目录包装（如 deepagents-dev-templates-0.2.9/）
         archive_installer::normalize_extracted_dir(&agent_dir_clone)?;

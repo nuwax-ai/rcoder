@@ -58,7 +58,9 @@ async fn shutdown_signal() {
             Ok(signal) => signal,
             Err(error) => {
                 tracing::error!(%error, "install SIGTERM handler failed; waiting for SIGINT");
-                let _ = tokio::signal::ctrl_c().await;
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(error = %e, "ctrl_c handler install also failed (skipping)");
+                }
                 return;
             }
         };

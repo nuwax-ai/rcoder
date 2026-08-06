@@ -408,8 +408,10 @@ pub async fn pod_ensure(
                 );
                 // 创建成功，清除标记
                 state.pod_creating.remove(&container_identifier);
-                // 🚀 发送容器创建完成通知（唤醒等待方）
-                let _ = state.pod_created_tx.send(container_identifier.clone());
+                // 🚀 发送容器创建完成通知（唤醒等待方）；无等待者时记 warn（pod 创建重，可能白创建）
+                if let Err(send_err) = state.pod_created_tx.send(container_identifier.clone()) {
+                    tracing::warn!("pod_created notify failed (no waiter subscribed): {send_err}");
+                }
                 (info, true)
             }
             None => {
@@ -507,9 +509,14 @@ pub async fn pod_ensure(
                         // 清除创建标记
                         state.pod_creating.remove(&container_identifier);
 
-                        // 🚀 发送容器创建完成通知（唤醒等待方）
-                        if result.is_ok() {
-                            let _ = state.pod_created_tx.send(container_identifier.clone());
+                        // 🚀 发送容器创建完成通知（唤醒等待方）；无等待者时记 warn（pod 创建重，可能白创建）
+                        if result.is_ok()
+                            && let Err(send_err) =
+                                state.pod_created_tx.send(container_identifier.clone())
+                        {
+                            tracing::warn!(
+                                "pod_created notify failed (no waiter subscribed): {send_err}"
+                            );
                         }
 
                         match result {

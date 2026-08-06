@@ -242,11 +242,17 @@ pub async fn run_command_to_log(
                     );
                 }
             } else {
-                let _ = child.start_kill();
+                if let Err(e) = child.start_kill() {
+                    tracing::warn!(error = %e, "start_kill failed (child may already be dead)");
+                }
             }
             // 超时分支补一次 wait() reap 子进程(#1):不依赖 tokio orphan reaper 时序,
             // 短超时(5s)放弃,避免 kill 失败时永久阻塞。
-            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "wait to reap child failed (skipping)"),
+                Err(_) => tracing::warn!("timed wait (5s) to reap child elapsed (skipping)"),
+            }
             Err(AppError::system(format!(
                 "command timed out after {timeout_secs}s"
             )))

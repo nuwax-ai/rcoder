@@ -88,14 +88,16 @@ pub async fn upload_batch_files(
                     Ok(size) => size,
                     Err(e) => {
                         tracing::warn!(path = %file_path, error = %e, "write failed, rolling back");
-                        if let Some(zip) = backup {
-                            let _ = version::restore_from_zip(
+                        if let Some(zip) = backup
+                            && let Err(restore_err) = version::restore_from_zip(
                                 &project_path,
                                 &zip,
                                 &config.traverse_exclude_dirs,
                                 &config.backup_traverse_exclude_files,
                             )
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(error = %restore_err, "rollback restore_from_zip after write failure failed (skipping)");
                         }
                         return Err(AppError::system(format!(
                             "batch upload failed at {file_path}: {e}"

@@ -133,7 +133,7 @@ mod tests {
         remove_top_level_dir(&tmp, &[]).await.unwrap();
         assert!(tmp.join("a.txt").exists());
         assert!(tmp.join("deep").is_dir());
-        let _ = fs::remove_dir_all(&tmp).await;
+        drop(fs::remove_dir_all(&tmp).await);
     }
 
     #[tokio::test]
@@ -144,7 +144,7 @@ mod tests {
         remove_top_level_dir(&tmp, &[]).await.unwrap();
         assert!(tmp.join("a").is_dir());
         assert!(tmp.join("b").is_dir());
-        let _ = fs::remove_dir_all(&tmp).await;
+        drop(fs::remove_dir_all(&tmp).await);
     }
 
     #[tokio::test]
@@ -161,6 +161,6 @@ mod tests {
         assert!(tmp.join("project").join("package.json").is_file());
         assert!(tmp.join("README.md").is_file());
         assert!(!tmp.join("package.json").exists());
-        let _ = fs::remove_dir_all(&tmp).await;
+        drop(fs::remove_dir_all(&tmp).await);
     }
 }

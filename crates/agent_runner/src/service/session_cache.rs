@@ -490,7 +490,7 @@ impl SessionWorker {
 
                     if should_buffer {
                         if producer.is_full() {
-                            let _ = consumer.try_pop();
+                            drop(consumer.try_pop());
                             buffered_len = buffered_len.saturating_sub(1);
                         }
                         if producer.try_push((seq, message.clone())).is_ok() {
@@ -521,9 +521,10 @@ impl SessionWorker {
                                         message.message_type, message.sub_type,
                                     );
                                     // 仅当它仍是当前连接时清除，避免旧 receiver 关闭误删刚建立的新连接。
-                                    let _ = self
-                                        .current_connection
-                                        .compare_and_swap(&*current_connection, None);
+                                    drop(
+                                        self.current_connection
+                                            .compare_and_swap(&*current_connection, None),
+                                    );
                                 }
                             }
                         }
@@ -564,7 +565,9 @@ impl SessionWorker {
                         snapshot.len(),
                         occupied
                     );
-                    let _ = ack.send(snapshot);
+                    if let Err(e) = ack.send(snapshot) {
+                        warn!("session_cache ack send failed (subscriber gone): {e:?}");
+                    }
                 }
             }
         }
@@ -739,7 +742,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             };
 
             // 更新 AGENT_REGISTRY 中的映射关系
-            let _ = AGENT_REGISTRY.update_session(project_id, session_id);
+            drop(AGENT_REGISTRY.update_session(project_id, session_id));
 
             // 清理旧 session_id 的动态权限状态（session_id 变更后旧 state 不再被引用，防泄漏）。
             PERMISSION_MANAGER.clear_session_state(&old_session_id);

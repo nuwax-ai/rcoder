@@ -539,7 +539,9 @@ impl PermissionManager {
                     "[Permission] SSE push failed, cancelling pending permission: session_id={}, tool_call_id={}",
                     key.0, key.1
                 );
-                let _ = pending.responder.respond(cancelled_response());
+                if let Err(e) = pending.responder.respond(cancelled_response()) {
+                    warn!("permission responder respond failed (caller timed out): {e:?}");
+                }
             }
         }
 

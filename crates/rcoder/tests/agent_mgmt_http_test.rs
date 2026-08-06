@@ -250,7 +250,7 @@ async fn install_route_accepts_1mb_multipart_body() {
                         .map_err(|e| (StatusCode::BAD_REQUEST, format!("text: {e}")))?;
                 }
                 _ => {
-                    let _ = f.bytes().await;
+                    drop(f.bytes().await);
                 }
             }
         }

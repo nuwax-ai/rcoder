@@ -136,7 +136,8 @@ impl ContainerDestroyer {
         if let Some(ref pingora_service) = self.pingora_service {
             if *service_type == ServiceType::ComputerAgentRunner {
                 // 清理 Pingora VNC 后端
-                let _: Option<String> = pingora_service.remove_vnc_backend(container_identifier);
+                let _unused: Option<String> =
+                    pingora_service.remove_vnc_backend(container_identifier);
             }
 
             // 清理 Pingora Project 后端（WebAgentRunner 容器）
@@ -144,7 +145,7 @@ impl ContainerDestroyer {
             if *service_type == ServiceType::WebAgentRunner
                 && let Some(pid) = project_id
             {
-                let _: Option<String> = pingora_service.remove_project_backend(pid);
+                let _unused: Option<String> = pingora_service.remove_project_backend(pid);
                 debug!(
                     " [destroyer] Cleaned up project_backends: project_id={}",
                     pid

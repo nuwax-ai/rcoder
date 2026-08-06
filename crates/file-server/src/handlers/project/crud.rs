@@ -118,7 +118,9 @@ pub(crate) async fn delete_project(
         .and_then(|s| s.trim().parse::<u32>().ok())
     {
         tracing::debug!(project_id = %project_id, pid = p, "delete-project: stop dev server");
-        let _ = state.dev_server.stop_dev(&project_id).await;
+        if let Err(e) = state.dev_server.stop_dev(&project_id).await {
+            tracing::warn!(error = %e, project_id = %project_id, "stop dev server on delete failed (skipping)");
+        }
     }
     let ctx = ProjectContext {
         project_id: project_id.clone(),
@@ -548,7 +550,9 @@ pub(crate) async fn upload_project(
     // 停旧版 dev server (对齐 nuwax: pid 可用时 stopDevServer, 失败不阻塞)
     if let Some(p) = pid.as_deref().and_then(|s| s.trim().parse::<u32>().ok()) {
         tracing::debug!(project_id = %project_id, pid = p, "upload-project: stop old dev server");
-        let _ = state.dev_server.stop_dev(project_id.trim()).await;
+        if let Err(e) = state.dev_server.stop_dev(project_id.trim()).await {
+            tracing::warn!(error = %e, project_id = %project_id, "stop old dev server on upload failed (skipping)");
+        }
     }
     let ctx = ctx_from(project_id.trim(), tenant, space, iso);
     let result = project_service::upload_project(

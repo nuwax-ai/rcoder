@@ -134,12 +134,16 @@ impl KubernetesRuntime {
 
         // 4. 顺序读 stdout → stderr(借 &mut self,不能并发;各自独立 DuplexStream,顺序不丢)
         let mut stdout = String::new();
-        if let Some(mut r) = attached.stdout() {
-            let _ = r.read_to_string(&mut stdout).await;
+        if let Some(mut r) = attached.stdout()
+            && let Err(e) = r.read_to_string(&mut stdout).await
+        {
+            warn!("[K8S-APP] exec drain stdout 失败 (输出可能不完整): {e}");
         }
         let mut stderr = String::new();
-        if let Some(mut r) = attached.stderr() {
-            let _ = r.read_to_string(&mut stderr).await;
+        if let Some(mut r) = attached.stderr()
+            && let Err(e) = r.read_to_string(&mut stderr).await
+        {
+            warn!("[K8S-APP] exec drain stderr 失败 (输出可能不完整): {e}");
         }
         // readers 出作用域 drop(join 前 drop,防 DuplexStream 满死锁)
 

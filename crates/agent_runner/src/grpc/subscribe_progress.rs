@@ -285,7 +285,9 @@ async fn run_stream_loop(
                         seq: 0,
                         timestamp: chrono::Utc::now().timestamp_millis(),
                     };
-                    let _ = tx.send(Ok(timeout_event)).await;
+                    if let Err(e) = tx.send(Ok(timeout_event)).await {
+                        warn!("subscribe_progress event send failed (subscriber gone): {e}");
+                    }
                     return ExitReason::IdleTimeout;
                 }
 

@@ -84,8 +84,13 @@ pub(super) async fn initialize_connection(
                 "[SACP] Init phase error: {}, project_id={}",
                 err_msg, project_id
             );
-            if let Some(tx) = connection_failed_tx.take() {
-                let _ = tx.send(err_msg.clone());
+            if let Some(tx) = connection_failed_tx.take()
+                && let Err(send_err) = tx.send(err_msg.clone())
+            {
+                warn!(
+                    "[SACP] connection_failed_tx send failed (receiver dropped), error was: {}",
+                    send_err
+                );
             }
             return Err(agent_client_protocol::Error::new(1003, err_msg));
         }
@@ -94,11 +99,16 @@ pub(super) async fn initialize_connection(
                 "[SACP] ⏰ InitializeRequest timeout ({}s), project_id={}",
                 INIT_TIMEOUT_SECS, project_id
             );
-            if let Some(tx) = connection_failed_tx.take() {
-                let _ = tx.send(format!(
+            if let Some(tx) = connection_failed_tx.take()
+                && let Err(send_err) = tx.send(format!(
                     "ACP InitializeRequest timeout ({}s), project_id={}",
                     INIT_TIMEOUT_SECS, project_id
-                ));
+                ))
+            {
+                warn!(
+                    "[SACP] connection_failed_tx send failed (receiver dropped), error was: {}",
+                    send_err
+                );
             }
             return Err(agent_client_protocol::Error::new(
                 1002,

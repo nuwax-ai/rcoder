@@ -197,8 +197,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pingora_shutdown_tx) = proxy_result.pingora_shutdown_tx {
         let _ = pingora_shutdown_tx.send(());
     }
-    if let Some(proxy_handle) = proxy_result.proxy_handle {
-        let _ = proxy_handle.await;
+    if let Some(proxy_handle) = proxy_result.proxy_handle
+        && let Err(e) = proxy_handle.await
+    {
+        warn!("proxy task join failed during shutdown: {}", e);
     }
 
     Ok(())

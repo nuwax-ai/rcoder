@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn generated_document_round_trips_as_openapi() {
         let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
-        let _: utoipa::openapi::OpenApi =
+        let _unused: utoipa::openapi::OpenApi =
             serde_json::from_value(value).expect("deserialize OpenAPI");
     }
 

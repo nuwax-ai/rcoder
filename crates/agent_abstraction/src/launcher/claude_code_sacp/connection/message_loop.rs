@@ -100,13 +100,18 @@ pub(super) async fn run_message_loop<N: SessionNotifier>(
                         if let Err(e) = cx.send_notification(cancel_notification) {
                             error!("[SACP] send cancel notification failed: {:?}", e);
                             // 通知调用方取消失败
-                            let _ = cancel_request.result_tx.send(shared_types::CancelResult::Failed(
+                            // cancel 结果回传：接收方放弃等待时 send 失败属良性
+                            if let Err(send_err) = cancel_request.result_tx.send(shared_types::CancelResult::Failed(
                                 format!("Failed to send cancel notification: {:?}", e)
-                            ));
+                            )) {
+                                warn!("[SACP] cancel result send failed (caller gave up): {send_err:?}");
+                            }
                         } else {
         info!("[SACP] cancel notification sent");
                             // 通知调用方取消成功
-                            let _ = cancel_request.result_tx.send(shared_types::CancelResult::Success);
+                            if let Err(e) = cancel_request.result_tx.send(shared_types::CancelResult::Success) {
+                                warn!("[SACP] cancel result send failed (caller gave up): {e:?}");
+                            }
                             // 注意：故意不退出 outer loop（保持 Agent 进程存活以接收后续 prompt）
                             // 参见下方 prompt 分支的设计注释
                         }
@@ -223,11 +228,12 @@ async fn process_prompt<N: SessionNotifier>(
             // 🔥 监听 cancel_token（Agent 进程退出时会触发）
             _ = cancel_token.cancelled() => {
                 // 🎯 如果有待发送的 cancel 结果，发送 CancelResult::Failed
-                if let Some(tx) = pending_cancel_tx.take() {
-                    let _ = tx.send(shared_types::CancelResult::Failed(
+                if let Some(tx) = pending_cancel_tx.take()
+                    && let Err(e) = tx.send(shared_types::CancelResult::Failed(
                         "Agent process exited".to_string()
-                    ));
-                }
+                    )) {
+                        warn!("[SACP] cancel result send failed (caller gave up): {e:?}");
+                    }
 
                 let is_abnormal = abnormal_exit_flag.load(Ordering::SeqCst);
                 if is_abnormal {
@@ -261,9 +267,10 @@ async fn process_prompt<N: SessionNotifier>(
                 warn!("[SACP] cancel message Prompt response timeout (15s), force exit");
 
                 // 🎯 如果有待发送的 cancel 结果，发送 CancelResult::Timeout
-                if let Some(tx) = pending_cancel_tx.take() {
-                    let _ = tx.send(shared_types::CancelResult::Timeout);
-                }
+                if let Some(tx) = pending_cancel_tx.take()
+                    && let Err(e) = tx.send(shared_types::CancelResult::Timeout) {
+                        warn!("[SACP] cancel result send failed (caller gave up): {e:?}");
+                    }
 
                 break Err(agent_client_protocol::Error::new(
                     1001,
@@ -275,7 +282,9 @@ async fn process_prompt<N: SessionNotifier>(
                 if is_cancelled {
                     // 🎯 已经在取消中，直接返回成功（通知已发送）
                     info!("[SACP] already sent cancel request, notification succeeded");
-                    let _ = cancel_request.result_tx.send(shared_types::CancelResult::Success);
+                    if let Err(e) = cancel_request.result_tx.send(shared_types::CancelResult::Success) {
+                        warn!("[SACP] cancel result send failed (caller gave up): {e:?}");
+                    }
                 } else {
                     let session_id_str = cancel_request.cancel_notification.session_id.0.to_string();
                     info!("[SACP] received Prompt cancel request: session_id={}", session_id_str);
@@ -285,9 +294,11 @@ async fn process_prompt<N: SessionNotifier>(
                     if let Err(e) = cx.send_notification(cancel_notification) {
                         error!("[SACP] send cancel notification failed: {:?}", e);
                         // 发送失败立即返回错误
-                        let _ = cancel_request.result_tx.send(shared_types::CancelResult::Failed(
+                        if let Err(send_err) = cancel_request.result_tx.send(shared_types::CancelResult::Failed(
                             format!("Failed to send cancel notification: {:?}", e)
-                        ));
+                        )) {
+                            warn!("[SACP] cancel result send failed (caller gave up): {send_err:?}");
+                        }
                     } else {
                         info!("[SACP] cancel notification sent, waiting for Agent to complete cancel");
                         // 🎯 保存 result_tx，等待 Prompt 响应完成后再发送
@@ -346,7 +357,9 @@ async fn process_prompt<N: SessionNotifier>(
             // 🎯 如果有待发送的 cancel 结果，发送 CancelResult::Success
             if let Some(tx) = pending_cancel_tx.take() {
                 info!("[SACP] Prompt completed after cancel, sending CancelResult::Success");
-                let _ = tx.send(shared_types::CancelResult::Success);
+                if let Err(e) = tx.send(shared_types::CancelResult::Success) {
+                    warn!("[SACP] cancel result send failed (caller gave up): {e:?}");
+                }
             }
             false
         }
@@ -379,7 +392,9 @@ async fn process_prompt<N: SessionNotifier>(
                 // 🎯 如果有待发送的 cancel 结果，发送 CancelResult::Success
                 if let Some(tx) = pending_cancel_tx.take() {
                     info!("[SACP] Cancel completed successfully, sending CancelResult::Success");
-                    let _ = tx.send(shared_types::CancelResult::Success);
+                    if let Err(send_err) = tx.send(shared_types::CancelResult::Success) {
+                        warn!("[SACP] cancel result send failed (caller gave up): {send_err:?}");
+                    }
                 }
             } else {
                 // 真正的错误：发送 PromptError
@@ -396,11 +411,13 @@ async fn process_prompt<N: SessionNotifier>(
                 }
 
                 // 🎯 如果有待发送的 cancel 结果，发送 CancelResult::Failed
-                if let Some(tx) = pending_cancel_tx.take() {
-                    let _ = tx.send(shared_types::CancelResult::Failed(format!(
+                if let Some(tx) = pending_cancel_tx.take()
+                    && let Err(send_err) = tx.send(shared_types::CancelResult::Failed(format!(
                         "Prompt request failed: {}",
                         error_msg
-                    )));
+                    )))
+                {
+                    warn!("[SACP] cancel result send failed (caller gave up): {send_err:?}");
                 }
             }
 

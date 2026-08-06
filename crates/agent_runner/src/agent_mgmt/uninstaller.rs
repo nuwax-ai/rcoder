@@ -181,7 +181,7 @@ mod tests {
             std::process::id(),
             n
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(std::fs::remove_dir_all(&dir));
         crate::agent_mgmt::path_manager::PathManager::new_with_root(dir)
     }
 

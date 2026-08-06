@@ -197,8 +197,10 @@ async fn prune_walk(
                 .strip_prefix(root)
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
-            if !keep_set.contains(&rel) {
-                let _ = fs::remove_file(&full).await; // 单文件失败忽略
+            if !keep_set.contains(&rel)
+                && let Err(e) = fs::remove_file(&full).await
+            {
+                tracing::warn!(error = %e, "prune single file failed (skipping)");
             }
         }
     }

@@ -222,7 +222,7 @@ fn test_clear_all_sessions_and_remove() {
     adapter.add_session_to_project(project_id, "s4");
     assert_eq!(adapter.session_index.len(), 2);
 
-    let _ = adapter.remove(project_id);
+    drop(adapter.remove(project_id));
     assert_eq!(
         adapter.session_index.len(),
         0,
@@ -554,8 +554,8 @@ fn test_concurrent_insert_remove_no_deadlock() {
                     &pid,
                     &format!("c-t{}-i{}", t, i),
                 ));
-                let _ = adapter.insert(pid.clone(), info);
-                let _ = adapter.remove(&pid);
+                drop(adapter.insert(pid.clone(), info));
+                drop(adapter.remove(&pid));
             }
         }));
     }
@@ -605,8 +605,8 @@ fn test_concurrent_same_project_insert_remove() {
                     project_id,
                     "shared-container",
                 ));
-                let _ = adapter.insert(project_id.to_string(), info);
-                let _ = adapter.remove(project_id);
+                drop(adapter.insert(project_id.to_string(), info));
+                drop(adapter.remove(project_id));
             }
         }));
     }
@@ -720,7 +720,7 @@ fn test_concurrent_session_update_and_remove() {
         handles.push(thread::spawn(move || {
             barrier.wait();
             thread::sleep(Duration::from_millis(5));
-            let _ = adapter.remove(pid);
+            drop(adapter.remove(pid));
         }));
     }
 
@@ -753,8 +753,8 @@ fn test_concurrent_insert_with_session_and_remove() {
             for i in 0..ITERS {
                 let info = Arc::new(create_test_info_with_container(pid, "battle-c"));
                 let sid = format!("sid-{}-{}", t, i);
-                let _ = adapter.insert_with_session(pid.to_string(), info, Some(&sid));
-                let _ = adapter.remove(pid);
+                drop(adapter.insert_with_session(pid.to_string(), info, Some(&sid)));
+                drop(adapter.remove(pid));
             }
         }));
     }
@@ -831,17 +831,17 @@ fn test_concurrent_stress_mixed_operations() {
                     &format!("sc-{}-{}", t, i),
                 ));
 
-                let _ = adapter.insert(pid.clone(), info);
-                let _ = adapter.get(&pid);
+                drop(adapter.insert(pid.clone(), info));
+                drop(adapter.get(&pid));
                 let _ = adapter.update_activity(&pid);
 
                 let sid = format!("sid-{}-{}", t, i);
                 adapter.add_session_to_project(&pid, &sid);
-                let _ = adapter.get_by_session_id(&sid);
-                let _ = adapter.get_container_name_by_session(&sid);
+                drop(adapter.get_by_session_id(&sid));
+                drop(adapter.get_container_name_by_session(&sid));
 
                 adapter.clear_session(&pid);
-                let _ = adapter.remove(&pid);
+                drop(adapter.remove(&pid));
             }
         }));
     }

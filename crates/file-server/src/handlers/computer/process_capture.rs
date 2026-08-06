@@ -48,8 +48,12 @@ pub(super) async fn capture_command(
             if let Some(pid) = child_pid {
                 crate::service::dev_server::process::kill_process_group_force(pid);
             }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            if let Err(e) = child.kill().await {
+                tracing::warn!(error = %e, "kill child on capture timeout failed (skipping)");
+            }
+            if let Err(e) = child.wait().await {
+                tracing::warn!(error = %e, "wait to reap child on capture timeout failed (skipping)");
+            }
             None
         }
     };

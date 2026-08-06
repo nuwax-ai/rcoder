@@ -104,7 +104,9 @@ pub async fn create_workspace(
                             }
                             let name = entry.file_name().to_string_lossy().to_string();
                             let dst = skills_dir.join(&name);
-                            let _ = fs::remove_dir_all(&dst).await;
+                            if let Err(e) = fs::remove_dir_all(&dst).await {
+                                tracing::warn!(error = %e, "clear existing skill dir before move failed (skipping)");
+                            }
                             move_dir(&entry.path(), &dst).await?;
                             updated_skills.push(name);
                         }
@@ -113,7 +115,9 @@ pub async fn create_workspace(
                 }
                 // agents/: 整目录替换
                 if let Some(src_agents) = find_dir(&extract_root, "agents").await {
-                    let _ = fs::remove_dir_all(&agents_dir).await;
+                    if let Err(e) = fs::remove_dir_all(&agents_dir).await {
+                        tracing::warn!(error = %e, "clear agents dir before move failed (skipping)");
+                    }
                     move_dir(&src_agents, &agents_dir).await?;
                     updated_dirs.push("agents");
                 }
@@ -221,7 +225,9 @@ async fn process_skill_url(
     let mut updated = Vec::new();
     for (name, src) in candidates {
         let dst = skills_dir.join(&name);
-        let _ = fs::remove_dir_all(&dst).await;
+        if let Err(e) = fs::remove_dir_all(&dst).await {
+            tracing::warn!(error = %e, "clear existing skill dir before move failed (skipping)");
+        }
         move_dir(&src, &dst).await?;
         updated.push(name);
     }
@@ -325,6 +331,6 @@ mod tests {
         assert!(tmp.join(".pi").join("skills").is_dir());
         // sync_agents 写版本 marker (启动 reconciler 据此 O(1) 判断是否需补 sync)
         assert!(tmp.join(".agents").join(".sync_version").is_file());
-        let _ = fs::remove_dir_all(&tmp).await;
+        drop(fs::remove_dir_all(&tmp).await);
     }
 }

@@ -47,7 +47,7 @@ fn temp_pm() -> PathManager {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir =
         std::env::temp_dir().join(format!("agent-mgmt-http-test-{}-{}", std::process::id(), n));
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(std::fs::remove_dir_all(&dir));
     PathManager::new_with_root(dir)
 }
 
@@ -64,7 +64,7 @@ mod tempfile_helpers {
     pub struct TempDir(pub std::path::PathBuf);
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            drop(std::fs::remove_dir_all(&self.0));
         }
     }
 }

@@ -157,18 +157,18 @@ mod tests {
     #[test]
     fn observes_stats_context_and_nested_error() {
         let mut summary = InstallSummary::default();
-        let _ = observe_event(
+        drop(observe_event(
             r#"{"name":"pnpm:context","level":"debug","storeDir":"/cache/store"}"#,
             &mut summary,
-        );
-        let _ = observe_event(
+        ));
+        drop(observe_event(
             r#"{"name":"pnpm:stats","level":"info","added":12,"removed":3}"#,
             &mut summary,
-        );
-        let _ = observe_event(
+        ));
+        drop(observe_event(
             r#"{"name":"pnpm","level":"error","err":{"code":"ERR_PNPM_FETCH_401","message":"Unauthorized"}}"#,
             &mut summary,
-        );
+        ));
 
         assert_eq!(summary.event_count, 3);
         assert_eq!(summary.store_dir.as_deref(), Some("/cache/store"));
