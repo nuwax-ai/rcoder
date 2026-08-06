@@ -91,7 +91,16 @@ impl FileServer {
             .fallback(not_found)
             .layer(DefaultBodyLimit::max(request_body_limit))
             .layer(from_fn(request_id_layer))
-            .layer(TraceLayer::new_for_http())
+            .layer(
+                TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        target: "file_server::http",
+                        "http_request",
+                        method = %req.method(),
+                        uri = %req.uri(),
+                    )
+                }),
+            )
             .with_state(self.state.clone()))
     }
 

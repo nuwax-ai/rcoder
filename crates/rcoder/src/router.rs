@@ -542,6 +542,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     router
         .merge(create_swagger_ui())
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB body 大小限制
+        .layer(tower_http::trace::TraceLayer::new_for_http()) // HTTP 请求日志（target: tower_http → rcoder.log）
         .layer(HttpMetricsLayer::new()) // HTTP 指标中间件
         // API Key 鉴权中间件（支持热更新）
         .layer(axum::middleware::from_fn(move |req, next| {

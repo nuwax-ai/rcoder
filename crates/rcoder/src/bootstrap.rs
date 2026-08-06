@@ -30,8 +30,34 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
     let file_log_config = FileLogConfig::new("logs", "rcoder")
         .with_max_files(config.cleanup_config.log_cleanup.log_retention_days as usize);
 
-    let telemetry_config =
+    let mut telemetry_config =
         TelemetryConfig::from_env("rcoder").with_file_log_config(file_log_config);
+
+    // 嵌入式 file-server：构建独立日志 layer + guard，注入到 rcoder 的 tracing subscriber
+    if shared_types::FeatureFlags::get().embed_file_server {
+        match file_server::Config::load() {
+            Ok(fs_config) => match file_server::logging::build_file_layer(&fs_config) {
+                Ok((layer, guard)) => {
+                    info!(
+                        "[BOOTSTRAP] file-server independent log layer injected: dir={}",
+                        fs_config.service_log_dir.display()
+                    );
+                    telemetry_config = telemetry_config.with_extra_layer(layer, guard);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[BOOTSTRAP] failed to build file-server log layer (falling back to rcoder.log): {e}"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "[BOOTSTRAP] failed to load file-server config (file-server logs will mix into rcoder.log): {e}"
+                );
+            }
+        }
+    }
+
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let telemetry = Arc::new(telemetry);
 
