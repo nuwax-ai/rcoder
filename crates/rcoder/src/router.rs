@@ -410,6 +410,10 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             "/computer/db/{user_id}/create-database",
             post(handler::computer_db_create_database),
         )
+        .route(
+            "/computer/cache/clean",
+            post(handler::computer_cache_clean),
+        )
         .with_state(state.clone());
 
     // Pingora 代理 API 路由（用于文档和状态查询）
@@ -629,6 +633,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::pod_keepalive,
         handler::pod_restart,
         handler::pod_status,
+        handler::computer_cache_clean,
         handler::pod_vnc_status,
         // Pingora 代理接口
         handler::proxy_status,
@@ -754,6 +759,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::KeepalivePodResponse,
             handler::RestartPodRequest,
             handler::RestartPodResponse,
+            handler::CacheCleanRequest,
+            handler::CacheCleanResponse,
             handler::PodStatusQuery,
             handler::PodStatusResponse,
             handler::VncStatusQuery,
