@@ -436,6 +436,23 @@ reload 返回成功时,Pingap 实际加载的配置与写入一致;加载失败�
 
 ---
 
+## 三轮复核新发现并已修复(本地 app-cli 端到端验证 managed/extend/custom 三模式)
+
+本地用 app-cli + pingap 0.13.8 二进制端到端验证 Pingap 三模式(managed/extend/custom)时新发现并已修复:
+
+| 项 | 问题 | 修复落点 |
+|---|---|---|
+| N4 | `compiler.rs:299 validate_plugin_paths` 对 plugin 里所有含 `path`/`file`/`directory` 且 `/` 开头的字段笼统当**文件系统路径**校验,误伤 mock/ping/stats/admin/cors/sub_filter/csrf 等 plugin 的 `path`(是 URL 请求路径或匹配正则,非文件路径)。实测 extend 模式配 `[plugins.go-mock] category="mock" path="/healthz"` → gen-lock 拒绝"path outside allowed runtime roots",导致 extend/custom 模式无法使用这些常见 plugin(managed 不受影响,其 plugin 多为 `pingap:` 内置)。 | `compiler.rs validate_plugin_paths` 按 category 区分:`path` 类字段仅 `directory`(文件根目录 `PathBuf`,需校验防穿越)校验,其余 category 的 path 视为 URL 跳过;`file`/`directory`/`cert` 等明确文件字段名始终校验。+ 3 单测(URL path 不误伤 / directory path 校验 / 文件字段始终校验)。本地端到端回归:gen-lock 不再误伤 + pingap 创建 mock plugin + 请求被 mock 拦截返回 mock 数据。 |
+
+**附:三模式本地验证结论**(均端到端通过,详见 memory `userapp-local-app-cli-verify`):
+- **managed**:平台按 `[proxy]` 自动生成拓扑,7 路由全通。
+- **extend**:managed 拓扑(7 upstreams)完整保留 + 用户 `[plugins]`/`[storages]` 合并;service `[proxy].plugins` 引用经校验;pingap 真正实例化用户 plugin(日志 `plugin will be created`);改拓扑被拒"extend mode only permits [plugins] and [storages]"。
+- **custom**:用户完整配置,upstream 用 `rcoder://<service_id>`(resolve 成 `127.0.0.1:<port>`,upstream name 可≠service_id);guardrail 强制 server `0.0.0.0:9080`(其他端口/loopback 外地址被拒)、禁 TLS、禁 metadata 地址、路径白名单。
+- 三模式 `config_hash` 确认 + reload `verified=true`(T1)均通过。
+- **pingap 语义注**:mock/ping/stats 等 plugin 的 `path` 字段在 strip_prefix location 下需匹配 **rewrite 后**的路径(如 `/api/go/mocktest` 经 `^/api/go/(.*) /$1` 改写后,plugin 实际见到 `/mocktest`)。
+
+---
+
 ## 附:核查中确认正确、无需改动的部分
 
 - **升级场景的 activate 内部失败补偿**(`releases.rs:207-283`)四条失败分支都有"清 pending + 还原 +

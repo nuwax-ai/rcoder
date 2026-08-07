@@ -302,11 +302,28 @@ fn validate_plugin_paths(name: &str, plugin: &impl serde::Serialize) -> Result<(
     let object = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("Pingap plugin {name} must be an object"))?;
+    // pingap 的 `path`/`token_path` 等字段语义随 plugin category 不同:
+    //   - mock/ping/stats/admin/cors/sub_filter/csrf 等:`path` 是 URL 请求路径或匹配正则
+    //     (mock.rs 注释明写 "The URL path to match against incoming requests"),不是文件
+    //     系统路径 —— 笼统当文件路径校验会误伤(实测 mock path="/healthz" 被拒,导致
+    //     extend/custom 无法用 mock/ping/stats 等常见 plugin)。
+    //   - directory:`path` 是文件系统根目录(directory.rs `path: PathBuf`),必须校验防穿越。
+    // 因此对 `path` 类字段,仅当 category 属于文件类时校验;`file`/`directory`/`cert` 等
+    // 字段名语义明确为文件,始终校验(如 cache.directory 缓存目录)。
+    const FILE_PATH_CATEGORIES: &[&str] = &["directory"];
+    let category = object
+        .get("category")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
     for (key, value) in object {
-        if let Some(path) = value.as_str()
-            && (key.contains("path") || key.contains("file") || key.contains("directory"))
-            && path.starts_with('/')
-        {
+        let Some(path) = value.as_str() else { continue };
+        if !path.starts_with('/') {
+            continue;
+        }
+        let is_file_field =
+            key.contains("file") || key.contains("directory") || key.contains("cert");
+        let is_path_field = key.contains("path");
+        if is_file_field || (is_path_field && FILE_PATH_CATEGORIES.contains(&category)) {
             validate_runtime_path(&format!("plugins.{name}.{key}"), path)?;
         }
     }
@@ -358,7 +375,7 @@ async fn set_private_permissions(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{managed_config, validate_upstream_destination};
+    use super::{managed_config, validate_plugin_paths, validate_upstream_destination};
     use workspace_manifest::ReleaseLock;
 
     fn release_lock_with_disabled_proxy() -> ReleaseLock {
@@ -470,5 +487,42 @@ format = "text"
         for address in ["169.254.169.254:80", "metadata.google.internal:80"] {
             assert!(validate_upstream_destination("metadata", address).is_err());
         }
+    }
+
+    #[test]
+    fn url_path_plugin_fields_are_not_treated_as_file_paths() {
+        // mock/ping/stats 的 path 是 URL 请求路径,pingap/csrf 的 token_path 同理,
+        // 不应被文件路径护栏误伤(回归:曾因笼统 key.contains("path") 拒绝 mock plugin)。
+        let mock = serde_json::json!({
+            "category": "mock",
+            "path": "/api/go/mocktest",
+            "data": "{}",
+            "status": 200,
+        });
+        assert!(validate_plugin_paths("go-mock", &mock).is_ok());
+        let ping = serde_json::json!({"category": "ping", "path": "/ping"});
+        assert!(validate_plugin_paths("ping", &ping).is_ok());
+        let stats = serde_json::json!({"category": "stats", "path": "/stats"});
+        assert!(validate_plugin_paths("stats", &stats).is_ok());
+        let csrf = serde_json::json!({"category": "csrf", "token_path": "/csrf_token"});
+        assert!(validate_plugin_paths("csrf", &csrf).is_ok());
+    }
+
+    #[test]
+    fn directory_plugin_path_is_validated_against_runtime_roots() {
+        // directory 的 path 是文件系统根目录(PathBuf),仅此 category 的 path 需校验防穿越。
+        let ok = serde_json::json!({"category": "directory", "path": "/app/data/static"});
+        assert!(validate_plugin_paths("dir-ok", &ok).is_ok());
+        let bad = serde_json::json!({"category": "directory", "path": "/etc/passwd"});
+        assert!(validate_plugin_paths("dir-bad", &bad).is_err());
+    }
+
+    #[test]
+    fn explicit_file_fields_are_always_validated_regardless_of_category() {
+        // file/directory/cert 等明确文件字段始终校验,不论 category。
+        let cache_ok = serde_json::json!({"category": "cache", "directory": "/app/data/cache"});
+        assert!(validate_plugin_paths("cache-ok", &cache_ok).is_ok());
+        let cache_bad = serde_json::json!({"category": "cache", "directory": "/etc"});
+        assert!(validate_plugin_paths("cache-bad", &cache_bad).is_err());
     }
 }
