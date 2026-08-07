@@ -65,7 +65,18 @@ pub fn build_pingap_config(entries: &[ProxyEntry]) -> anyhow::Result<Option<Stri
         let mut loc = LocationConf {
             upstream: Some(name.clone()),
             plugins: Some(plugins),
-            enable_reverse_proxy_headers: Some(true),
+            // 不用 enable_reverse_proxy_headers 默认集：它会设 `x-forwarded-host:$host`，
+            // 而 pingap 的 `$host` 刻意去端口（仿 nginx），非标准端口下与浏览器 origin
+            // （含端口）不一致，导致 Next.js/Nuxt 等 Server Actions 的 CSRF origin 校验失败。
+            // 改自定义 proxy_set_headers：保留 for/proto（后端取 client IP/scheme），
+            // 故意不设 x-forwarded-host —— 让后端读 host header（pingap/pingora 保留客户端
+            // 原始 host:port），与浏览器 origin 一致，Server Actions 校验通过。
+            enable_reverse_proxy_headers: Some(false),
+            proxy_set_headers: Some(vec![
+                "x-real-ip:$remote_addr".into(),
+                "x-forwarded-for:$proxy_add_x_forwarded_for".into(),
+                "x-forwarded-proto:$scheme".into(),
+            ]),
             ..Default::default()
         };
         if !is_catchall {
