@@ -26,6 +26,12 @@ use shared_types::ChatResponse;
 /// chat gRPC 转发最大尝试次数
 const MAX_RETRIES: u32 = 2;
 
+/// 智能等待 pod ready 的超时上限(容器冷启动 / OOM 重启恢复窗口)
+const AGENT_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// pod ready 后给 gRPC server 的缓冲(readiness probe 通过 ≠ gRPC 立即可连)
+const AGENT_READY_RETRY_BUFFER: Duration = Duration::from_secs(1);
+
 /// chat 处理流程的阶段退出点（纯控制流，不含业务逻辑）
 ///
 /// chat / computer-chat 两条链路在拆分为多阶段函数后，阶段失败分为两类：
@@ -59,6 +65,15 @@ pub struct ReResolveCtx<'a> {
     pub cluster_domain: &'a str,
 }
 
+/// 诊断上下文:gRPC 连接失败时定位真实根因(OOM/CrashLoop/缺失)+ 智能等待 pod ready。
+pub struct DiagnosticCtx<'a> {
+    /// 容器运行时(查 pod 状态)
+    pub runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
+    /// 容器标识(ComputerAgentRunner=user_id; WebAgentRunner=project_id)
+    pub identifier: String,
+    pub service_type: shared_types::ServiceType,
+}
+
 /// 转发行为差异选项
 pub struct ForwardChatOpts<'a> {
     /// 日志标签（区分链路，如 "FORWARD" / "COMPUTER_FORWARD"）
@@ -67,6 +82,8 @@ pub struct ForwardChatOpts<'a> {
     pub retry_delay: Option<Duration>,
     /// 重试前是否重新解析容器地址（Web Docker 场景）
     pub re_resolve: Option<ReResolveCtx<'a>>,
+    /// 连接失败时定位真实根因(OOM/CrashLoop/缺失)+ 智能等待 ready。None=不诊断(原行为)。
+    pub diagnostic: Option<DiagnosticCtx<'a>>,
 }
 
 /// 统一的 chat gRPC 转发（带重试）
@@ -124,6 +141,39 @@ pub async fn forward_chat(
                 let should_retry = grpc_err.should_retry();
 
                 if should_retry && attempt < MAX_RETRIES {
+                    // 🧠 智能等待:若诊断出容器启动中/OOM 重启,等 pod ready 再重试
+                    // (替代固定 sleep —— 旧策略对 30s+ 启动窗口无能为力)
+                    if let Some(dc) = &opts.diagnostic {
+                        let d = crate::handler::utils::diagnose(
+                            dc.runtime,
+                            &dc.identifier,
+                            dc.service_type.clone(),
+                        )
+                        .await;
+                        if d.is_starting_up() || d.is_oom() {
+                            info!(
+                                "🔄 [{}] 容器启动中/OOM 重启中,智能等待 pod ready (最多 60s)...",
+                                opts.log_tag
+                            );
+                            let ready = crate::handler::utils::wait_agent_ready(
+                                dc.runtime,
+                                &dc.identifier,
+                                dc.service_type.clone(),
+                                AGENT_READY_WAIT_TIMEOUT,
+                            )
+                            .await;
+                            if ready {
+                                grpc_pool.remove(&grpc_addr).await;
+                                last_error = Some(anyhow::Error::from(grpc_err));
+                                // readiness 通过 ≠ gRPC server 立即可连,给一小段缓冲再重试
+                                tokio::time::sleep(AGENT_READY_RETRY_BUFFER).await;
+                                info!("✅ [{}] pod 已 ready,重试", opts.log_tag);
+                                continue;
+                            }
+                            // 未 ready(超时/崩溃):落到下面固定 sleep 做兜底重试
+                        }
+                    }
+
                     // 可重试错误：（可选等待）+ 清理连接池后重试
                     if let Some(delay) = opts.retry_delay {
                         info!(
@@ -198,7 +248,7 @@ pub async fn forward_chat(
     }
 
     // 所有重试都失败
-    if let Some(e) = last_error {
+    if let Some(e) = &last_error {
         error!(
             "❌ [{}] gRPC request failed after all retries: {}",
             opts.log_tag, e
@@ -208,5 +258,25 @@ pub async fn forward_chat(
     // gRPC 通信失败，直接返回错误
     // 注：业务错误码（如 Agent busy）由 agent_runner 通过 grpc_response.error_code 返回，
     // 这里只处理真正的 gRPC 通信层错误
+
+    // 有诊断上下文:根据真实根因生成友好错误
+    // (有根因 → ERR_AGENT_CONTAINER_UNAVAILABLE + 根因; 无根因 → 保留 transport 原文)
+    if let Some(dc) = &opts.diagnostic {
+        let raw = last_error
+            .as_ref()
+            .map(|e| format!("{e}"))
+            .unwrap_or_default();
+        let (code, msg) = crate::handler::utils::build_connection_error(
+            dc.runtime,
+            &dc.identifier,
+            dc.service_type.clone(),
+            locale,
+            &raw,
+        )
+        .await;
+        return HttpResult::error(code.as_str(), msg.as_str());
+    }
+
+    // 无诊断上下文:保留原行为(通用 ERR_GRPC_ERROR)
     HttpResult::error_with_locale(shared_types::error_codes::ERR_GRPC_ERROR, locale)
 }

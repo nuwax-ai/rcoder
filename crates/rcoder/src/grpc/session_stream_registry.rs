@@ -460,7 +460,7 @@ fn spawn_backend_task(
                     }
                     // 重试耗尽:必须发终态错误事件,否则 SharedStream 持 sender 不 Closed,
                     // 已连上的 HTTP SSE 客户端会永久 hang 在 recv()。错误文案用【当前】失败(#16a)。
-                    let err_ev = make_connection_error_event(&format!("get_client: {e}"));
+                    let err_ev = make_connection_error_event(locale);
                     if let Err(send_err) = shared.broadcast_tx.send(Arc::new(err_ev)) {
                         warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
                     }
@@ -626,7 +626,7 @@ fn spawn_backend_task(
                         continue;
                     }
                     // 终态事件报告【当前】阶段错误,不用累积的过期错误(#16a)。
-                    let err_ev = make_connection_error_event(&format!("subscribe: {e}"));
+                    let err_ev = make_connection_error_event(locale);
                     if let Err(send_err) = shared.broadcast_tx.send(Arc::new(err_ev)) {
                         warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
                     }
@@ -695,11 +695,16 @@ fn make_stream_error_event(code: Code, _message: &str) -> ProgressEvent {
 }
 
 /// gRPC 连接彻底失败（重试耗尽；seq=0 合成消息）
-fn make_connection_error_event(message: &str) -> ProgressEvent {
-    // 必须用 serde_json:message 来自 tonic Status/transport 错误,含引号/换行/反斜杠时,
-    // format! 拼 JSON 会产生非法 JSON。serde_json 正确转义。
+///
+/// 不再把 transport 原文塞进 SSE 事件 —— 原文对用户无意义(transport error 多半不是根因),
+/// 且已在调用处 `warn!` 入日志供排查。这里给前端本地化友好提示 + `ERR_AGENT_CONTAINER_UNAVAILABLE`
+/// 错误码(前端可据码退避重试)。实时 OOM 诊断在 chat 路径(chat_forward)处理。
+fn make_connection_error_event(locale: &str) -> ProgressEvent {
+    let code = shared_types::error_codes::ERR_AGENT_CONTAINER_UNAVAILABLE;
+    let message = shared_types::error_codes::get_error_message(code, locale);
+    // serde_json 构造,避免 format! 拼 JSON 产生非法 JSON。
     let payload = serde_json::json!({
-        "code": "GRPC_CONNECTION_FAILED",
+        "code": code,
         "message": message,
     })
     .to_string();

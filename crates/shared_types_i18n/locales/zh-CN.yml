@@ -34,6 +34,11 @@ error.workspace_error: "工作目录错误"
 # gRPC 相关
 error.grpc_addr_error: "gRPC 地址解析失败"
 error.grpc_error: "gRPC 调用失败"
+error.agent_container_unavailable: "计算环境暂时不可用"
+error.agent_container_oom: "计算环境因内存不足被重启,正在自动恢复,请稍后重试(已重启 {} 次)"
+error.agent_container_crashloop: "计算环境启动异常,反复重启(退出码 {}),请联系管理员"
+error.agent_container_not_found: "计算环境未运行,请重新发起会话"
+error.agent_container_starting: "计算环境启动中,请稍后重试"
 
 # 服务状态
 error.service_unavailable: "服务暂时不可用"

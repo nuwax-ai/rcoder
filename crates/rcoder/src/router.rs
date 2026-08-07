@@ -410,10 +410,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             "/computer/db/{user_id}/create-database",
             post(handler::computer_db_create_database),
         )
-        .route(
-            "/computer/cache/clean",
-            post(handler::computer_cache_clean),
-        )
+        .route("/computer/cache/clean", post(handler::computer_cache_clean))
         .with_state(state.clone());
 
     // Pingora 代理 API 路由（用于文档和状态查询）

@@ -166,6 +166,10 @@ pub const ERR_PROJECT_NOT_FOUND: &str = "ERR_PROJECT_NOT_FOUND";
 /// Agent Runner 容器不可用(P0-4: gRPC 调用失败 / 容器离线)
 pub const ERR_AGENT_RUNNER_UNAVAILABLE: &str = "ERR_AGENT_RUNNER_UNAVAILABLE";
 
+/// Agent 计算环境不可用(诊断出真实根因:OOM 重启 / CrashLoopBackOff / 容器缺失等)。
+/// 可重试 —— 通常容器会自动恢复(STS restartPolicy)或可重新发起会话。
+pub const ERR_AGENT_CONTAINER_UNAVAILABLE: &str = "ERR_AGENT_CONTAINER_UNAVAILABLE";
+
 // ========== 应用管理服务错误码 ==========
 
 /// 资源不存在
@@ -210,7 +214,10 @@ pub const ERR_RESOURCE_EXHAUSTED: &str = "ERR_RESOURCE_EXHAUSTED";
 pub fn is_retryable_code(code: &str) -> bool {
     matches!(
         code,
-        ERR_BACKEND_ERROR | ERR_IMAGE_PULL_FAILED | ERR_RESOURCE_EXHAUSTED
+        ERR_BACKEND_ERROR
+            | ERR_IMAGE_PULL_FAILED
+            | ERR_RESOURCE_EXHAUSTED
+            | ERR_AGENT_CONTAINER_UNAVAILABLE
     )
 }
 
@@ -266,6 +273,7 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_AGENT_MGMT_INVALID_VERSION => "error.agent_mgmt_invalid_version",
         ERR_PROJECT_NOT_FOUND => "error.project_not_found",
         ERR_AGENT_RUNNER_UNAVAILABLE => "error.agent_runner_unavailable",
+        ERR_AGENT_CONTAINER_UNAVAILABLE => "error.agent_container_unavailable",
         ERR_NOT_FOUND => "error.not_found",
         ERR_CONFLICT => "error.conflict",
         ERR_APP_NOT_FOUND => "error.app_not_found",
@@ -369,6 +377,7 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_AGENT_MGMT_INVALID_CHUNK => "Invalid upload chunk",
         ERR_PROJECT_NOT_FOUND => "Project not found or stopped",
         ERR_AGENT_RUNNER_UNAVAILABLE => "Agent Runner container is unavailable",
+        ERR_AGENT_CONTAINER_UNAVAILABLE => "Agent compute environment is unavailable",
         ERR_APP_NOT_FOUND => "Application not found",
         ERR_APP_ALREADY_EXISTS => "Application already exists",
         ERR_INVALID_STATE => "Operation not allowed in current state",
@@ -437,6 +446,7 @@ mod tests {
             ERR_AGENT_MGMT_INVALID_CHUNK,
             ERR_PROJECT_NOT_FOUND,
             ERR_AGENT_RUNNER_UNAVAILABLE,
+            ERR_AGENT_CONTAINER_UNAVAILABLE,
         ];
 
         for code in codes {

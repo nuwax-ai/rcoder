@@ -55,6 +55,156 @@ pub struct ExecResult {
     pub exit_code: i64,
 }
 
+/// agent pod 容器诊断结果(用于 gRPC 连接失败时定位真实根因:OOM/CrashLoop/缺失等)。
+///
+/// `transport error` 往往只是"连不上"的表象,真实根因可能是容器被 OOMKilled、
+/// CrashLoopBackOff、或容器不存在。本结构承载诊断出的结构化根因,供错误生成层
+/// 据此决定错误信息(根因为主,transport 原文降级为日志/附注)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentPodDiagnostic {
+    /// pod/容器是否存在(不存在本身就是一种根因)
+    pub exists: bool,
+    /// 容器是否 ready(ready=false 可能是启动中或异常)
+    pub ready: bool,
+    /// 重启次数(频繁重启暗示崩溃)
+    pub restart_count: u32,
+    /// 上一次终止原因(如 "OOMKilled")
+    pub last_terminate_reason: Option<String>,
+    /// 上一次退出码(如 137 = SIGKILL/OOM)
+    pub last_exit_code: Option<i32>,
+    /// 当前 waiting 原因(如 "CrashLoopBackOff" / "ContainerCreating")
+    pub waiting_reason: Option<String>,
+    /// 可读详情(组合描述,供日志/排查)
+    pub detail: Option<String>,
+}
+
+impl AgentPodDiagnostic {
+    /// 是否存在明确根因(OOM 终止 / CrashLoop / 容器缺失)。
+    ///
+    /// 返回 true 时,`transport error` 多半只是表象,真实根因在此结构里,
+    /// 错误信息应以根因为主。`ContainerCreating` 是正常拉起中间态,不计为根因。
+    pub fn has_root_cause(&self) -> bool {
+        self.last_terminate_reason.is_some()
+            || matches!(self.waiting_reason.as_deref(), Some(r) if r != "ContainerCreating")
+            || !self.exists
+    }
+
+    /// 是否为 OOMKilled 根因
+    pub fn is_oom(&self) -> bool {
+        self.last_terminate_reason.as_deref() == Some("OOMKilled")
+    }
+
+    /// 是否正在启动/重启中(pod 存在但未 ready,且非 CrashLoopBackOff —— 值得等 ready)。
+    /// 默认诊断(未知)返回 false,避免误触发智能等待。
+    pub fn is_starting_up(&self) -> bool {
+        self.exists && !self.ready && self.waiting_reason.as_deref() != Some("CrashLoopBackOff")
+    }
+
+    /// 是否 CrashLoopBackOff(反复崩溃,不该傻等 ready)
+    pub fn is_crash_loop(&self) -> bool {
+        self.waiting_reason.as_deref() == Some("CrashLoopBackOff")
+    }
+}
+
+/// 默认诊断 = "未知/不支持"。
+///
+/// 关键:exists=true、ready=true,使 [`AgentPodDiagnostic::has_root_cause`] 与
+/// [`AgentPodDiagnostic::is_starting_up`] 均返回 false —— 调用方据此走"无根因保留原文"
+/// 分支,不会把不支持诊断的 runtime 误判为"容器缺失"或"启动中"。
+impl Default for AgentPodDiagnostic {
+    fn default() -> Self {
+        Self {
+            exists: true,
+            ready: true,
+            restart_count: 0,
+            last_terminate_reason: None,
+            last_exit_code: None,
+            waiting_reason: None,
+            detail: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod agent_pod_diagnostic_tests {
+    use super::AgentPodDiagnostic;
+
+    /// "存在且 ready、无任何根因" 的基准诊断
+    fn healthy() -> AgentPodDiagnostic {
+        AgentPodDiagnostic {
+            exists: true,
+            ready: true,
+            restart_count: 0,
+            last_terminate_reason: None,
+            last_exit_code: None,
+            waiting_reason: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn default_is_unknown_no_root_cause_not_starting() {
+        // 默认=未知:不应误判为根因或启动中(否则会误导错误生成 / 智能等待)
+        let d = AgentPodDiagnostic::default();
+        assert!(!d.has_root_cause());
+        assert!(!d.is_starting_up());
+        assert!(!d.is_oom());
+        assert!(!d.is_crash_loop());
+    }
+
+    #[test]
+    fn oomkilled_is_root_cause_and_oom() {
+        let mut d = healthy();
+        d.last_terminate_reason = Some("OOMKilled".to_string());
+        d.last_exit_code = Some(137);
+        d.restart_count = 2;
+        assert!(d.has_root_cause());
+        assert!(d.is_oom());
+    }
+
+    #[test]
+    fn crash_loop_is_root_cause_but_not_starting() {
+        let mut d = healthy();
+        d.ready = false;
+        d.waiting_reason = Some("CrashLoopBackOff".to_string());
+        assert!(d.has_root_cause());
+        assert!(d.is_crash_loop());
+        assert!(
+            !d.is_starting_up(),
+            "CrashLoop 不应算启动中(不值得等 ready)"
+        );
+    }
+
+    #[test]
+    fn not_exists_is_root_cause() {
+        let d = AgentPodDiagnostic {
+            exists: false,
+            ..healthy()
+        };
+        assert!(d.has_root_cause(), "容器缺失本身就是根因");
+    }
+
+    #[test]
+    fn starting_up_when_exists_not_ready_no_crashloop() {
+        let mut d = healthy();
+        d.ready = false;
+        // 存在、未 ready、非 CrashLoop → 启动中(智能等待应介入)
+        assert!(d.is_starting_up());
+        // 启动中(无 OOM/无 CrashLoop/容器在)不算 has_root_cause → 走"保留原文"或 starting 文案
+        assert!(!d.has_root_cause());
+    }
+
+    #[test]
+    fn container_creating_is_not_root_cause_but_is_starting() {
+        let mut d = healthy();
+        d.ready = false;
+        d.waiting_reason = Some("ContainerCreating".to_string());
+        // ContainerCreating 是正常拉起中间态,不计为根因
+        assert!(!d.has_root_cause());
+        assert!(d.is_starting_up());
+    }
+}
+
 /// Container runtime status
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContainerRuntimeStatus {

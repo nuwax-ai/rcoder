@@ -162,6 +162,7 @@ fn status_from_code(code: &str) -> axum::http::StatusCode {
         ec::ERR_IMAGE_PULL_FAILED => axum::http::StatusCode::BAD_GATEWAY,
         ec::ERR_SERVICE_UNAVAILABLE
         | ec::ERR_AGENT_RUNNER_UNAVAILABLE
+        | ec::ERR_AGENT_CONTAINER_UNAVAILABLE
         | ec::ERR_RESOURCE_EXHAUSTED => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         ec::ERR_BACKEND_ERROR => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,

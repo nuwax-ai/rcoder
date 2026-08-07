@@ -178,6 +178,7 @@ async fn run_computer_chat_flow(
         is_devcomputer,
         namespace: &state.config.app_manager.namespace,
         cluster_domain: &state.cluster_domain,
+        runtime: state.runtime(),
     };
     let result = forward::forward_computer_request_to_container(forward_params).await;
 

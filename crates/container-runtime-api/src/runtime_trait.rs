@@ -14,9 +14,9 @@ use shared_types::{ContainerBasicInfo, ServiceType};
 
 use super::container_params::ContainerCreateParams;
 use super::types::{
-    AppEventInfo, ContainerLogEntry, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus, ExecResult,
-    RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo,
+    AgentPodDiagnostic, AppEventInfo, ContainerLogEntry, ContainerRuntimeError,
+    ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus,
+    ExecResult, RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo,
 };
 
 // mpsc 仍在 lib.rs re-export（`container_runtime_api::mpsc::Receiver` 被 docker_manager /
@@ -154,6 +154,20 @@ pub trait AgentContainerRuntime: Send + Sync {
         Err(ContainerRuntimeError::ConfigurationError(
             "restart_container_inplace not supported by this runtime".to_string(),
         ))
+    }
+
+    /// 诊断 agent pod 容器状态(gRPC 连接失败时定位真实根因:OOM/CrashLoop/缺失等)。
+    ///
+    /// 返回 [`AgentPodDiagnostic`];真实根因(若有)在其字段里。默认实现返回"未知"
+    /// 诊断(不抛 Err —— 避免错误路径二次失败),调用方按"无根因"处理、保留 transport 原文。
+    /// K8s 实现覆盖为完整诊断;Docker 实现覆盖为基础诊断(inspect)。
+    async fn diagnose_agent_pod(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<AgentPodDiagnostic> {
+        let _ = (identifier, service_type);
+        Ok(AgentPodDiagnostic::default())
     }
 }
 

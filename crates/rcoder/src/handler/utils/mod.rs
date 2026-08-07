@@ -2,11 +2,14 @@
 //!
 //! 提供 handler 层共享的工具函数和常量。
 
+mod agent_diagnostic;
 mod agent_mgmt_forward;
 mod grpc_addr;
 mod i18n_extractors;
 mod locale;
 mod paths;
+
+pub use agent_diagnostic::{build_connection_error, diagnose, wait_agent_ready};
 
 #[allow(unused_imports)]
 pub use agent_mgmt_forward::{

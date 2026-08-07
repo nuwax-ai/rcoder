@@ -320,7 +320,9 @@ fn derive_port_statuses(
 ///
 /// CrashLoop 时当前 `state=waiting`，真实退出码在 `last_state.terminated`，一并附带，
 /// 便于定位"挂在哪一次退出、退出码多少"。
-fn container_error_message(cs: &k8s_openapi::api::core::v1::ContainerStatus) -> Option<String> {
+pub(crate) fn container_error_message(
+    cs: &k8s_openapi::api::core::v1::ContainerStatus,
+) -> Option<String> {
     let state = cs.state.as_ref()?;
     const BAD_WAITING: &[&str] = &[
         "CrashLoopBackOff",

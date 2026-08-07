@@ -588,6 +588,15 @@ impl AgentContainerRuntime for KubernetesRuntime {
         self.restart_agent_container_inplace(identifier, service_type)
             .await
     }
+
+    async fn diagnose_agent_pod(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentPodDiagnostic> {
+        self.diagnose_agent_pod_inner(identifier, service_type)
+            .await
+    }
 }
 
 #[cfg(feature = "kubernetes")]

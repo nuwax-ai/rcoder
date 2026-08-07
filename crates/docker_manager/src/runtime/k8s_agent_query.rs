@@ -8,7 +8,8 @@
 
 use chrono::Utc;
 use container_runtime_api::{
-    ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus, RuntimeContainerInfo,
+    AgentPodDiagnostic, ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus,
+    RuntimeContainerInfo,
 };
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::ListParams;
@@ -273,5 +274,68 @@ impl KubernetesRuntime {
         }
 
         Ok(result)
+    }
+
+    /// 诊断 agent pod 容器状态(gRPC 连接失败时定位真实根因)。
+    ///
+    /// 取 STS pod `{prefix}-{identifier}-0` 的 "agent" 容器 ContainerStatus,解析:
+    /// restart_count / ready / last_terminate_reason(OOMKilled)/ last_exit_code / waiting_reason
+    /// (CrashLoopBackOff)/ 可读 detail(复用 [`super::k8s_app_query::container_error_message`])。
+    /// pod 不存在(404)→ exists=false;其他 K8s API 错误 → 向上传播 Err(调用方兜底为"未知")。
+    pub(crate) async fn diagnose_agent_pod_inner(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<AgentPodDiagnostic> {
+        let pod_name = self.agent_pod_name(identifier, service_type)?;
+        let pod = match self.pods().get(&pod_name).await {
+            Ok(pod) => pod,
+            Err(kube::Error::Api(err)) if err.code == 404 => {
+                // pod 不存在:本身就是根因(默认诊断 exists=true,这里显式置 false)
+                return Ok(AgentPodDiagnostic {
+                    exists: false,
+                    ..Default::default()
+                });
+            }
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "diagnose_agent_pod: get pod {pod_name} failed: {e}"
+                )));
+            }
+        };
+
+        // agent-runner STS 主容器名(与 k8s_agent_create.rs 创建处、k8s_agent_pod.rs 的 AGENT_CONTAINER 保持一致)
+        const AGENT_CONTAINER: &str = "agent";
+        let Some(cs) = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.container_statuses.as_ref())
+            .and_then(|list| list.iter().find(|c| c.name == AGENT_CONTAINER))
+        else {
+            // pod 存在但 agent 容器状态尚未上报(刚创建 / ContainerCreating)
+            return Ok(AgentPodDiagnostic {
+                exists: true,
+                ready: false,
+                detail: Some("agent container status not available yet".to_string()),
+                ..Default::default()
+            });
+        };
+
+        let last_terminated = cs.last_state.as_ref().and_then(|ls| ls.terminated.as_ref());
+        let waiting_reason = cs
+            .state
+            .as_ref()
+            .and_then(|s| s.waiting.as_ref())
+            .and_then(|w| w.reason.clone());
+
+        Ok(AgentPodDiagnostic {
+            exists: true,
+            ready: cs.ready,
+            restart_count: u32::try_from(cs.restart_count).unwrap_or(0),
+            last_terminate_reason: last_terminated.and_then(|t| t.reason.clone()),
+            last_exit_code: last_terminated.map(|t| t.exit_code),
+            waiting_reason,
+            detail: super::k8s_app_query::container_error_message(cs),
+        })
     }
 }

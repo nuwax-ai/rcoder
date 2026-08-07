@@ -22,6 +22,8 @@ pub(super) struct ComputerForwardParams<'a> {
     pub(super) namespace: &'a str,
     /// K8s 集群域名
     pub(super) cluster_domain: &'a str,
+    /// 容器运行时(连接失败时诊断 pod 真实根因)
+    pub(super) runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
 }
 
 /// 与 RCoder 的 forward_request_to_container_service 类似，
@@ -107,6 +109,12 @@ pub(super) async fn forward_computer_request_to_container(
             retry_delay: Some(std::time::Duration::from_secs(3)),
             // K8s Service FQDN 稳定，Computer 链路不需要重新解析
             re_resolve: None,
+            // 连接失败时诊断 pod 根因(OOM/CrashLoop/缺失)+ 智能等待 ready
+            diagnostic: Some(crate::handler::chat_forward::DiagnosticCtx {
+                runtime: params.runtime,
+                identifier: params.request.user_id.clone(),
+                service_type: shared_types::ServiceType::ComputerAgentRunner,
+            }),
         },
     )
     .await

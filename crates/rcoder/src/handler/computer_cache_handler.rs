@@ -131,10 +131,7 @@ pub async fn computer_cache_clean(
     if let Some(ref st) = request.service_type
         && !st.trim().eq_ignore_ascii_case("computer-agent-runner")
     {
-        warn!(
-            "[CACHE_CLEAN] rejected: unsupported service_type={}",
-            st
-        );
+        warn!("[CACHE_CLEAN] rejected: unsupported service_type={}", st);
         return Ok(HttpResult::error_with_message(
             ERR_VALIDATION,
             locale,
@@ -146,10 +143,7 @@ pub async fn computer_cache_clean(
     let user_path = match user_dir(user_id) {
         Ok(p) => p,
         Err(e) => {
-            warn!(
-                "[CACHE_CLEAN] rejected: invalid user_id={}: {}",
-                user_id, e
-            );
+            warn!("[CACHE_CLEAN] rejected: invalid user_id={}: {}", user_id, e);
             return Ok(HttpResult::error_with_message(
                 ERR_VALIDATION,
                 locale,
@@ -199,11 +193,7 @@ async fn clean_cache_dir(cache_dir: &Path) -> std::io::Result<u64> {
         };
         match res {
             Ok(_) => deleted += 1,
-            Err(e) => warn!(
-                "[CACHE_CLEAN] failed to remove {}: {}",
-                path.display(),
-                e
-            ),
+            Err(e) => warn!("[CACHE_CLEAN] failed to remove {}: {}", path.display(), e),
         }
     }
     Ok(deleted)
@@ -223,7 +213,9 @@ mod tests {
         fs::write(cache.join("a.txt"), b"x").await.unwrap();
         fs::write(cache.join("b.json"), b"{}").await.unwrap();
         // 顶层目录（含嵌套内容）
-        fs::create_dir_all(cache.join("uv").join("store")).await.unwrap();
+        fs::create_dir_all(cache.join("uv").join("store"))
+            .await
+            .unwrap();
         fs::write(cache.join("uv").join("store").join("pkg"), b"y")
             .await
             .unwrap();
@@ -287,9 +279,7 @@ mod tests {
         // outside 目标内容完好（符号链接未被跟随）
         assert!(outside.join("keep").join("data").exists());
         assert_eq!(
-            fs::read(outside.join("keep").join("data"))
-                .await
-                .unwrap(),
+            fs::read(outside.join("keep").join("data")).await.unwrap(),
             b"precious"
         );
     }

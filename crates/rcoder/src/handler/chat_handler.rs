@@ -851,6 +851,11 @@ async fn forward_request_to_container_service(
                 namespace: ctx.namespace,
                 cluster_domain: ctx.cluster_domain,
             }),
+            diagnostic: Some(handler::chat_forward::DiagnosticCtx {
+                runtime: ctx.runtime,
+                identifier: project_id.clone(),
+                service_type: shared_types::ServiceType::WebAgentRunner,
+            }),
         },
     )
     .await;
