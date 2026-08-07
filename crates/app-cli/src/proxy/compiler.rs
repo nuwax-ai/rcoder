@@ -23,23 +23,7 @@ pub async fn compile_and_validate(
     pingap_bin: &Path,
     release: &ReleaseLock,
 ) -> Result<CompileOutcome> {
-    let mut config = match release.pingap.mode {
-        PingapMode::Managed => managed_config(release)?,
-        PingapMode::Extend => compile_extend(workspace, release).await?,
-        PingapMode::Custom => load_user_config(workspace, release).await?,
-    };
-    resolve_service_addresses(&mut config, release)?;
-    validate_guardrails(&config)?;
-    config.validate().context("PingapConfig::validate")?;
-    // 期望 hash：与 pingap 加载同一 TOML 后 get_current_config().hash() 同算法
-    //（descriptions 拼接 CRC32），供 reload 只读确认比对。
-    let expected_hash = config
-        .hash()
-        .context("compute effective Pingap config hash")?;
-    let content = toml::to_string_pretty(&config).context("serialize effective Pingap config")?;
-    if content.len() > MAX_CONFIG_BYTES {
-        anyhow::bail!("effective Pingap config exceeds {MAX_CONFIG_BYTES} bytes");
-    }
+    let (content, expected_hash) = compile_effective_config(workspace, release).await?;
 
     let target_dir = runtime_root.join(&release.release_id);
     tokio::fs::create_dir_all(&target_dir)
@@ -81,6 +65,37 @@ pub async fn compile_and_validate(
         config_path: target,
         expected_hash,
     })
+}
+
+/// 编译 release lock 为生效 Pingap 配置 TOML —— 纯编译，不触碰文件系统、不调用 pingap 二进制。
+///
+/// mode 分发(managed/extend/custom)→ `rcoder://` 地址解析 → 护栏 + 语义校验 → hash → 序列化。
+/// 供 `compile_and_validate`(运行时：再接 `pingap -t` + 原子落盘)与本地 `gen-lock` 预览共用，
+/// 让"反向代理规则是否正确"能在不依赖 pingap 二进制的前提下验证。
+///
+/// 返回 `(toml_content, expected_hash)`。
+pub async fn compile_effective_config(
+    workspace: &Path,
+    release: &ReleaseLock,
+) -> Result<(String, String)> {
+    let mut config = match release.pingap.mode {
+        PingapMode::Managed => managed_config(release)?,
+        PingapMode::Extend => compile_extend(workspace, release).await?,
+        PingapMode::Custom => load_user_config(workspace, release).await?,
+    };
+    resolve_service_addresses(&mut config, release)?;
+    validate_guardrails(&config)?;
+    config.validate().context("PingapConfig::validate")?;
+    // 期望 hash：与 pingap 加载同一 TOML 后 get_current_config().hash() 同算法
+    //（descriptions 拼接 CRC32），供 reload 只读确认比对。
+    let expected_hash = config
+        .hash()
+        .context("compute effective Pingap config hash")?;
+    let content = toml::to_string_pretty(&config).context("serialize effective Pingap config")?;
+    if content.len() > MAX_CONFIG_BYTES {
+        anyhow::bail!("effective Pingap config exceeds {MAX_CONFIG_BYTES} bytes");
+    }
+    Ok((content, expected_hash))
 }
 
 fn managed_config(release: &ReleaseLock) -> Result<PingapConfig> {

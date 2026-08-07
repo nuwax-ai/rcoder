@@ -15,6 +15,11 @@ impl AppService {
     #[instrument(skip(self, request))]
     pub async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
         let app_id = self.validate_create_request(&request).await?;
+        // 与 prepare/activate/confirm/delete-release/delete_app 串行: 防发布流水线
+        // EnsureApp 建 Deployment 与并发 DELETE 互踩 (删成功但 Deployment 复活/
+        // 半删半建脏状态)。create_app 的调用方 (HTTP handler / orchestrator
+        // ensure_app) 均不持本锁, 无重入风险 (tokio Mutex 不可重入)。
+        let _process_lock = self.acquire_process_release_lock(&app_id).await;
         info!(
             "[APP] creating app: {} ({}, mode={:?})",
             request.name, app_id, self.config.access_mode

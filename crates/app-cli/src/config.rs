@@ -31,4 +31,9 @@ pub struct CliArgs {
         env = "APP_CLI_PINGAP_BIN"
     )]
     pub pingap_bin: PathBuf,
+
+    /// 本地开发：只为 <WORKSPACE> 生成 release.lock.toml + 预览 Pingap 生效配置后退出
+    /// （不启动服务、不依赖 pingap 二进制 / PG）。供 manifest/路由设计秒级迭代验证。
+    #[arg(long, value_name = "WORKSPACE", env = "APP_CLI_GEN_LOCK")]
+    pub gen_lock: Option<PathBuf>,
 }

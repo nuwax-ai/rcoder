@@ -7,6 +7,13 @@ use app_cli::CliArgs;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
+
+    // 本地开发子模式：--gen-lock <workspace> 只生成 release.lock + 预览 Pingap 配置后退出。
+    if let Some(workspace) = args.gen_lock.clone() {
+        app_cli::devtool::gen_lock(&workspace).await?;
+        return Ok(());
+    }
+
     let runtime_status = app_cli::runtime_status::RuntimeStatusService::default();
 
     // init tracing：stderr + 文件（daily 轮转 + non-blocking，_guard 保活到 main 退出）

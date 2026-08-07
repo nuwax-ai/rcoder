@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod config;
+pub mod devtool;
 pub mod log;
 pub mod manifest;
 pub mod proxy;

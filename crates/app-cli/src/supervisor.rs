@@ -37,35 +37,41 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
     // 2. wait PG（PG 由 supervisor [program:postgresql] 托管，秒级就绪；失败不阻断）
     wait_for_pg().await?;
 
-    // 3. 各子项目：migrate → start
+    // 3. 各子项目 migrate → start；4. 编译验证并启动 Pingap。
+    // 任一阶段失败统一兜底：先 shutdown_all 优雅停掉已启动的子进程再返回 Err。
+    // tokio Child drop 默认不杀进程, 子进程又在独立进程组: 不清理会被 reparent 到
+    // PID1 继续持端口, 外层 supervisor 重启 app-cli 后新实例同名服务 bind 冲突
+    // → 永久 crash loop (只能重建容器恢复)。start_pingap 内部 config 确认失败
+    // 路径已自行清理, 此处对已 take 空的集合再调 shutdown_all 幂等无害。
     let mut children: Vec<(String, Child)> = Vec::new();
-    for spec in &specs {
-        // migrate（如有）—— 失败不阻断其他项目（多项目隔离），但 error! 暴露 +
-        // stdout/stderr 已落 app-cli 日志（run_transient 内打印），便于排障（Fail Fast）。
-        if !spec.run.migrate.is_empty() {
-            info!("🛠️  migrate {}", spec.name);
-            if let Err(e) = run_transient(&spec.run.migrate, &args.workspace.join(&spec.dir)).await
-            {
-                error!("❌ migrate {} failed: {e}", spec.name);
-                return Err(e);
+    let mut started_user_services = 0usize;
+    let startup = async {
+        for spec in &specs {
+            // migrate（如有）—— 失败 error 上报 + Fail Fast; stdout/stderr 已落 app-cli 日志。
+            if !spec.run.migrate.is_empty() {
+                info!("🛠️  migrate {}", spec.name);
+                run_transient(&spec.run.migrate, &args.workspace.join(&spec.dir))
+                    .await
+                    .with_context(|| format!("migrate {}", spec.name))?;
             }
-        }
-        // start
-        if spec.run.command.is_empty() {
-            warn!("⚠️  {} 无 [run].command，跳过", spec.name);
-            continue;
-        }
-        match start_service(spec, &args.workspace, &args.log_dir, &release.release_id) {
-            Ok(child) => children.push((spec.name.clone(), child)),
-            Err(e) => {
-                error!("❌ start {} failed: {e}", spec.name);
-                return Err(e);
+            // start
+            if spec.run.command.is_empty() {
+                warn!("⚠️  {} 无 [run].command，跳过", spec.name);
+                continue;
             }
+            let child = start_service(spec, &args.workspace, &args.log_dir, &release.release_id)
+                .with_context(|| format!("start {}", spec.name))?;
+            children.push((spec.name.clone(), child));
+            started_user_services += 1;
         }
+        // 编译、完整验证并启动 Pingap；代理失败时 workspace 不得进入 ready。
+        start_pingap(&args.workspace, &args.pingap_bin, &release, &mut children).await
+    };
+    if let Err(e) = startup.await {
+        error!("❌ startup failed, shutting down already-started children: {e:#}");
+        shutdown_all(std::mem::take(&mut children), 5).await;
+        return Err(e);
     }
-
-    // 4. 编译、完整验证并启动 Pingap；代理失败时 workspace 不得进入 ready。
-    start_pingap(&args.workspace, &args.pingap_bin, &release, &mut children).await?;
 
     // 5. readiness —— 默认不强依赖后端 app(用户核心诉求:后端有 bug 起不来时容器仍 ready、可排查)。
     //   - 无 [health].bridge_service:app-cli 自给自足,初始化完成即 ready。
@@ -100,7 +106,12 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
     };
     runtime_status.set_ready(ready);
 
-    if children.is_empty() {
+    // 守卫语义: 所有用户服务都因空 [run].command 被跳过时应 fail。不能用
+    // children.is_empty() 判断 —— start_pingap 已无条件 push pingap, 恒非空。
+    // 失败路径同样先清理 (此时 children 里至少有 pingap), 与 startup 失败兜底一致。
+    if started_user_services == 0 {
+        error!("❌ no service started, shutting down already-started children");
+        shutdown_all(std::mem::take(&mut children), 5).await;
         anyhow::bail!("no service started");
     }
 
@@ -159,6 +170,11 @@ fn validate_runtime_compatibility(release: &workspace_manifest::ReleaseLock) -> 
 
 /// pg_isready 轮询（最多 30 次 × 2s = 60s），失败不阻断（PG 可能晚于 app-cli 启）。
 async fn wait_for_pg() -> Result<()> {
+    // 本地开发逃生开关：前端服务不依赖 PG 时跳过 60s pg_isready 轮询（生产环境不设）。
+    if std::env::var_os("APP_CLI_SKIP_PG_WAIT").is_some() {
+        warn!("⏭  APP_CLI_SKIP_PG_WAIT set; skipping PostgreSQL readiness check (dev only)");
+        return Ok(());
+    }
     let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".into());
     let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
     let user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "app".into());
@@ -356,9 +372,12 @@ async fn start_pingap(
     cmd.arg("-c")
         .arg(&outcome.config_path)
         .arg("--autoreload")
-        .env("admin_addr", &endpoint.addr)
-        .env("admin_user", &endpoint.user)
-        .env("admin_password", &endpoint.password);
+        // pingap 的 env override 规则：`get_from_env(key)` 读 `PINGAP_{key}` 全大写
+        //（pingap src/main.rs parse_arguments 的闭包），故必须用 PINGAP_ADMIN_* 而非 admin_*。
+        // 凭证经 env 注入（不进命令行避免 ps 泄露、不落盘不进日志），admin 仅 loopback 只读。
+        .env("PINGAP_ADMIN_ADDR", &endpoint.addr)
+        .env("PINGAP_ADMIN_USER", &endpoint.user)
+        .env("PINGAP_ADMIN_PASSWORD", &endpoint.password);
     let child = cmd.spawn().context("spawn pingap")?;
     info!(
         "🚀 start pingap on :{} (pid={})",
@@ -369,7 +388,14 @@ async fn start_pingap(
 
     // 初始确认：pingap 必须真正加载当前配置（config_hash 匹配），否则视为启动失败，
     // 返回 Err 触发 supervisor 整组重启语义；失败前优雅停止已启动的子进程避免残留。
-    if let Err(error) = admin_probe::wait_for_config_hash(
+    //
+    // 本地开发逃生开关 APP_CLI_SKIP_PINGAP_CONFIRM：跳过 admin probe 确认（pingap 仍以
+    // --autoreload 启动；配置正确性已由 `pingap -t` 语法校验 + 实际 curl 验证兜底）。生产不设。
+    if std::env::var_os("APP_CLI_SKIP_PINGAP_CONFIRM").is_some() {
+        warn!(
+            "⏭  APP_CLI_SKIP_PINGAP_CONFIRM set; skipping initial pingap config confirmation (dev only)"
+        );
+    } else if let Err(error) = admin_probe::wait_for_config_hash(
         endpoint,
         &outcome.expected_hash,
         admin_probe::CONFIRM_BUDGET,
@@ -379,8 +405,9 @@ async fn start_pingap(
         error!("❌ pingap initial config confirmation failed: {error:#}");
         shutdown_all(std::mem::take(children), 5).await;
         return Err(error).context("confirm initial Pingap config via loopback admin probe");
+    } else {
+        info!("✅ pingap initial config confirmed (config_hash matched)");
     }
-    info!("✅ pingap initial config confirmed (config_hash matched)");
     Ok(())
 }
 
@@ -509,8 +536,11 @@ async fn wait_sigterm() {
 
 #[cfg(unix)]
 fn process_group_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    let mut command = Command::new("setsid");
-    command.arg("--").arg(program);
+    // 用标准库 process_group(0) 让子进程成为新进程组组长（fork 后 setpgid(0,0)）。
+    // kill_process_group(-pgid) 仍能整组发信号含子孙，与原 `setsid` 方案对信号语义等价，
+    // 但不依赖外部 setsid 二进制 —— Linux/macOS 标准库自带，真正跨平台（原方案 macOS 无 setsid）。
+    let mut command = Command::new(program);
+    command.process_group(0);
     command
 }
 

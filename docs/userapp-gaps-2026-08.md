@@ -10,6 +10,12 @@
 >
 > **修复状态(2026-08)**:R1-R4、U1-U3、T1、P1 已全部实施完成并通过单测/clippy 验证;T1 采用
 > Pingap admin loopback 只读确认方案(admin 仅用于 reload 生效确认,不经 admin 修改配置)。
+> **T1 补注(2026-08-07)**:admin_probe 曾因 env 名不匹配(pingap 读 `PINGAP_*` 全大写,app-cli 却
+> 设 `admin_*`)从未真正生效,本地 app-cli + pingap 二进制端到端实测发现并已补丁修复,详见 T1 条目。
+>
+> **行号基准说明**:下文"证据"段的文件行号以修复前快照(commit `856b923^`)为准。修复及后续重构
+> (create_app 链拆出 `app_create.rs`、release 存储函数拆出 `release_store.rs`)后行号已变化;
+> 各条目末尾附"修复落点"标注当前代码位置。
 >
 > **重要前置结论(不是问题,别误改)**:
 > - **per-app 子域名访问由独立的前端/网关项目实现**(host→app 映射后转发 rcoder),rcoder 后端是
@@ -75,6 +81,10 @@ K8s 资源)而不是只 `stop_app`,让应用回到"未部署"的干净态,而非
 首次发布失败后:`/app/code` 不残留空目录、`kubectl get deploy` 无该 app 的 Deployment、release
 index 标 Failed 且无 pending。下次发布能正常成功。
 
+> **修复落点(当前代码)**:`crates/app_manager/src/releases.rs` confirm_release unhealthy 分支的
+> `!rollback.exists()` 内联免锁清理(unregister_pingora_backends + delete_deployment + forget_app,
+> best-effort 不阻断 pending 落盘;不可直调 delete_app,避免 tokio Mutex 重入死锁)。
+
 ---
 
 ## 🔴 R2 — create_app 部分失败无回滚(✅ 已修复)
@@ -107,6 +117,10 @@ index 标 Failed 且无 pending。下次发布能正常成功。
 
 ### 验收
 create_app 任一步失败后,不残留半成品资源;下次同名 create 能干净成功。
+
+> **修复落点(当前代码)**:`crates/app_manager/src/app_create.rs` create_app 失败兜底 best-effort
+> delete_deployment(容忍 NotFound,清理失败仅 warn 不覆盖原始错误);pingora 注册在 deployment
+> 之后且幂等可重建,无需回滚。
 
 ---
 
@@ -143,6 +157,10 @@ orchestrator 检测到 confirm(false) 失败时,强制清 pending(直接写 inde
 
 ### 验收
 confirm(false) 失败后,pending 被强制清掉,下次发布能正常 activate。
+
+> **修复落点(当前代码)**:`crates/app_manager/src/releases.rs` abort_release(index-only CAS 清
+> pending)+ `crates/rcoder/src/userapp_publish/orchestrator.rs` confirm(false) 失败时兜底调
+> abort_release + 独立 abort HTTP API(app_manager handlers/releases.rs,已注册 OpenAPI)。
 
 ---
 
@@ -201,6 +219,10 @@ bug**。但运行时消费者(app-cli supervisor 的 migrate/start、managed Pin
 代码里 supervisor migrate/start 和 managed Pingap 生成对 `enabled=false` 显式跳过;即使 release.lock
 含 disabled 也不启动它、不为它生成路由。
 
+> **修复落点(当前代码)**:`crates/app-cli/src/supervisor.rs` specs 收集处 `.filter(enabled)`
+> (bridge 查找在已过滤集合内进行)+ `crates/app-cli/src/proxy/compiler.rs` managed_config /
+> compile_extend / resolve_service_addresses 三处 `.filter(enabled)`。
+
 ---
 
 ## 🟠 U1 — runtime 日志源(stdout/stderr)不自动注册(✅ 已修复)
@@ -241,6 +263,10 @@ release.lock)。
 manifest 不声明任何 `[[logs.sources]]` 的服务,其 stdout/stderr 也能在日志面板(选 `runtime` source)
 看到。
 
+> **修复落点(当前代码)**:`crates/app-cli/src/log/service.rs` inject_runtime_log_sources(在
+> LogService::new 唯一生产入口纯内存注入,不写回 release.lock;用户已声明同 id source 时以用户
+> 声明为准,不覆盖)。
+
 ---
 
 ## 🟠 U2 — 同 app 并发 publish 无早拒绝(✅ 已修复)
@@ -274,6 +300,10 @@ Pending/Running/Cancelling 的 publish 任务,返回 `Conflict`;handler 返回 *
 ### 验收
 同 app 已有进行中 publish 时,第二次 publish 立即 409,不进入 build。
 
+> **修复落点(当前代码)**:`crates/rcoder/src/userapp_publish/store.rs` create 内 per-app 活跃任务
+> 检查(检查与插入同把 map 锁内原子串行,AppBusy)+ `crates/rcoder/src/userapp_publish/handler.rs`
+> publish/build 两入口 AppBusy→409 映射(已注册 OpenAPI)。
+
 ---
 
 ## 🟠 U3 — `POSTGRES_*`/`PG*` 未进保留环境变量清单(footgun)(✅ 已修复)
@@ -306,12 +336,20 @@ Pending/Running/Cancelling 的 publish 任务,返回 `Conflict`;handler 返回 *
    实际密码能连。
 
 ### 建议修复
-`is_reserved_env` 把 `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`/`PGHOST`/`PGPORT` 加入保留
-(返回 true),让 `[env]` 出现这些 key 时构建直接失败、报清楚原因。同时在模板文档强调这些变量直接读、
-别覆盖(文档侧已加)。
+`is_reserved_env` 把 `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` 加入保留(返回 true),让
+`[env]` 出现这些 key 时构建直接失败、报清楚原因。同时在模板文档强调这些变量直接读、别覆盖
+(文档侧已加)。
+
+**实际落地偏差说明**:`PGHOST`/`PGPORT` 明确**不**保留——用户服务连外部 PostgreSQL 是合法场景
+(只影响其服务进程自身连接),且 app-cli supervisor 的 wait_for_pg 读的是 app-cli 自身进程 env,
+workspace `[env]` 只注入服务子进程,互不影响。理由详见实现处文档注释。
 
 ### 验收
-`[env]` 出现上述 key 时 manifest 校验失败,报"reserved by runtime"。
+`[env]` 出现 `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` 时 manifest 校验失败,报
+"reserved by runtime";`PGHOST`/`PGPORT` 允许出现(有测试断言)。
+
+> **修复落点(当前代码)**:`crates/workspace-manifest/src/validation.rs` is_reserved_env(含
+> POSTGRES_* 保留原因与 PGHOST/PGPORT 豁免理由的文档注释 + 正反向测试)。
 
 ---
 
@@ -347,6 +385,23 @@ reload 后增加生效确认:校验 Pingap 进程加载的 config hash(例如读
 ### 验收
 reload 返回成功时,Pingap 实际加载的配置与写入一致;加载失败时 reload 报错并回切。
 
+> **修复落点(当前代码)**:`crates/app-cli/src/proxy/admin_probe.rs`(loopback 只读 admin 注册 +
+> wait_for_config_hash)+ `crates/app-cli/src/api/proxy.rs` reload 先取旧 hash→落盘→对拍确认,
+> 超时/不匹配回切 pingap.toml.prev 并二次确认;admin 未就绪时显式报错不静默跳过。
+>
+> **⚠️ 2026-08-07 本地端到端实测发现 env 名 bug(已补丁修复)**:上述 admin_probe 方案虽代码写完 +
+> 单测过,但**从未真正端到端跑通** —— `supervisor.rs::start_pingap` 用 env `admin_addr`/
+> `admin_user`/`admin_password` 注入 pingap,而 pingap 的 `get_from_env`(`src/main.rs`
+> parse_arguments 闭包)读 env 时做 `format!("PINGAP_{key}").to_uppercase()`,实际读
+> `PINGAP_ADMIN_ADDR` 等全大写带前缀名。env 名不匹配 → pingap 收不到 admin 配置 → admin server
+> 从未在 loopback 启动 → admin_probe 25s 超时 → start_pingap 返 Err → supervisor 整组 SIGTERM 退出
+> (若已部署此版到生产,UserApp 容器会启动失败 / CrashLoop)。本地用 app-cli + pingap 0.13.8 二进制
+> 实测复现并定位。**补丁**:env key 改为 `PINGAP_ADMIN_ADDR`/`PINGAP_ADMIN_USER`/
+> `PINGAP_ADMIN_PASSWORD`(`supervisor.rs::start_pingap`)。验证:pingap admin 在 :3018 监听,
+> config_hash 启动后 ~1s 匹配确认,app-cli 稳定 supervise。**教训**:"代码写完 + 单测过" ≠ 真正
+> 生效;涉及外部进程 env 协议的改动必须端到端跑通(本地 app-cli + pingap 二进制验证范式见
+> `crates/app-cli/src/devtool.rs` `--gen-lock`)。
+
 ---
 
 ## 🟢 P1 — cursor_reset 事件已实现(设计 §12.2.10 标 TODO,实际已落地)(✅ 已修复)
@@ -366,6 +421,18 @@ reload 返回成功时,Pingap 实际加载的配置与写入一致;加载失败�
 
 ### 验收
 设计文档该条状态更新;代码行为不变。
+
+---
+
+## 二次复核新发现并已修复(不在原清单范围)
+
+上述 8 条核实修复后,对同链路做了新一轮独立排查,新发现 3 个问题并已修复:
+
+| 项 | 问题 | 修复落点 |
+|---|---|---|
+| N1 | app-cli supervisor:migrate/start/Pingap 启动失败时直接返回 Err,已启动的子进程无人清理(tokio Child drop 不杀进程、子进程独立进程组 → reparent 到 PID1 继续持端口,重启后 bind 冲突 → crash loop) | `supervisor.rs` startup 块统一兜底:任一阶段失败先 `shutdown_all` 再返回 Err |
+| N2 | "no service started" 守卫若用 `children.is_empty()` 判断会被 pingap(无条件 push)掩盖,且守卫失败路径不清理 | 改用 `started_user_services` 计数器(仅统计用户服务),失败路径同样先 `shutdown_all` |
+| N3 | `create_app` 未持 per-app release 锁,发布流水线 EnsureApp 建 Deployment 可与并发 DELETE 互踩(删成功但 Deployment 复活/半删半建) | `app_create.rs` create_app 入口 `acquire_process_release_lock`(调用方均不持锁,无 tokio Mutex 重入风险) |
 
 ---
 
