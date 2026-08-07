@@ -27,7 +27,7 @@ ebpf-debug = ["docker_manager/ebpf-debug"]
 
 # Kubernetes 支持：启用 Kubernetes 运行时模式
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
-kubernetes = ["docker_manager/kubernetes", "shared_types/kubernetes", "app_manager/kubernetes", "kube", "k8s-openapi"]
+kubernetes = ["docker_manager/kubernetes", "shared_types/kubernetes", "app_manager/kubernetes", "file-server/kubernetes", "kube", "k8s-openapi"]
 
 [dev-dependencies]
 filetime = { workspace = true }

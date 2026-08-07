@@ -13,6 +13,15 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# 空 marker：不引 kube 依赖，仅用于
+# (a) 编译期 cfg 门控未来 file-server 内的 K8s 独有代码 (`#[cfg(feature = "kubernetes")]`);
+# (b) 让 `DeploymentMode::default()` 随构建变体自动切换 (嵌入 rcoder k8s 构建 → Kubernetes,
+#     独立/Electron 构建 → DockerCompose)。
+# 真正的 K8s API 调用仍在 rcoder 的 WorkspacePathResolver impl 侧，file-server 保持 kube-free。
+# 由 rcoder 的 `kubernetes` feature 转发开启；file-server 独立构建不带本 feature。
+kubernetes = []
+
 [lib]
 name = "file_server"
 path = "src/lib.rs"

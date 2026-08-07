@@ -7,6 +7,7 @@ use shared_types::AGENT_FILE_SERVER_PORT;
 use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
 
 use super::Config;
+use super::DeploymentMode;
 use super::env::{
     MAX_UPLOAD_FILE_SIZE_BYTES, default_attachment_extensions, env_bool, env_list, env_parse,
     env_str, request_body_max_bytes, validate_request_body_limit, validate_upload_limit,
@@ -139,7 +140,7 @@ impl Config {
         parse!(git_file_content_max_bytes, "GIT_FILE_CONTENT_MAX_BYTES");
         string!(init_project_name_react, "INIT_PROJECT_NAME_REACT");
         string!(init_project_name_vue3, "INIT_PROJECT_NAME_VUE3");
-        string!(deployment_mode, "DEPLOYMENT_MODE");
+        parse!(deployment_mode, "DEPLOYMENT_MODE");
         boolean!(fast_restart_enabled, "FAST_RESTART_ENABLED");
         path!(computer_log_dir, "COMPUTER_LOG_DIR");
         string!(bash_path, "BASH_PATH");
@@ -240,7 +241,7 @@ impl Config {
             git_file_content_max_bytes: env_parse("GIT_FILE_CONTENT_MAX_BYTES", 64 * 1024 * 1024)?,
             init_project_name_react: env_str("INIT_PROJECT_NAME_REACT", "react-vite-template")?,
             init_project_name_vue3: env_str("INIT_PROJECT_NAME_VUE3", "vue3-vite-template")?,
-            deployment_mode: env_str("DEPLOYMENT_MODE", "docker-compose")?,
+            deployment_mode: env_parse("DEPLOYMENT_MODE", DeploymentMode::default())?,
             fast_restart_enabled: env_bool("FAST_RESTART_ENABLED", false)?,
             computer_log_dir: PathBuf::from(env_str(
                 "COMPUTER_LOG_DIR",

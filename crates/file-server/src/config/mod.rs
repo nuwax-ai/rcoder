@@ -19,6 +19,66 @@ use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
 pub use self::env::MAX_UPLOAD_FILE_SIZE_BYTES;
 use self::env::{default_attachment_extensions, split_default};
 
+/// 部署模式 (区分 K8s 容器部署 vs 宿主机/Electron 部署)。
+///
+/// file-server 自身保持 kube-free：K8s 重逻辑 (per-agent PVC / CephFS subvolume 解析) 全经
+/// `WorkspaceResolver` trait 由 rcoder 注入。本枚举只给 file-server 自身一个运行时区分手段
+/// (如启动日志、未来 K8s 独有的轻量行为分支)。
+///
+/// `Default` 随编译期 `kubernetes` Cargo feature 联动 (由 rcoder 转发开启)：
+/// 嵌入 rcoder (k8s 构建) → [`DeploymentMode::Kubernetes`]；独立/Electron 构建 →
+/// [`DeploymentMode::DockerCompose`]。运行时可用 `DEPLOYMENT_MODE` env 覆盖 (Fail Fast：未知值报错)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeploymentMode {
+    /// 宿主机 / Electron 客户端 (无容器编排、无 PV/PVC)。
+    #[serde(alias = "host")]
+    Standalone,
+    /// docker-compose 容器 (有容器、无 k8s) — TS 原版现状默认。
+    #[serde(alias = "docker_compose", alias = "compose")]
+    DockerCompose,
+    /// K8s + PVC (随 rcoder 集成)。
+    #[serde(alias = "k8s")]
+    Kubernetes,
+}
+
+impl Default for DeploymentMode {
+    fn default() -> Self {
+        // cfg! 编译期求值：与 rcoder 的 kubernetes feature 对齐 (本 marker 由 rcoder 转发开启)。
+        if cfg!(feature = "kubernetes") {
+            Self::Kubernetes
+        } else {
+            Self::DockerCompose
+        }
+    }
+}
+
+impl DeploymentMode {
+    pub fn is_kubernetes(&self) -> bool {
+        matches!(self, Self::Kubernetes)
+    }
+
+    pub fn is_standalone(&self) -> bool {
+        matches!(self, Self::Standalone)
+    }
+}
+
+impl std::str::FromStr for DeploymentMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "standalone" => Ok(Self::Standalone),
+            // 兼容 docker_compose / compose 写法
+            "docker-compose" | "docker_compose" | "compose" => Ok(Self::DockerCompose),
+            "kubernetes" | "k8s" => Ok(Self::Kubernetes),
+            other => Err(format!(
+                "unknown DEPLOYMENT_MODE '{other}'; expected one of: standalone, docker-compose, kubernetes"
+            )),
+        }
+    }
+}
+
 /// 全局配置 (启动时构造一次, 经 AppState 共享)。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -86,7 +146,8 @@ pub struct Config {
     pub init_project_name_vue3: String,
 
     // —— Dev server 进程管理 (对齐 nuwax processManager) ——
-    pub deployment_mode: String,
+    /// 部署模式 (区分 K8s vs 宿主机/Electron)；见 [`DeploymentMode`]。
+    pub deployment_mode: DeploymentMode,
     pub fast_restart_enabled: bool,
     pub computer_log_dir: PathBuf,
     pub bash_path: String,
@@ -171,7 +232,7 @@ impl Default for Config {
             git_file_content_max_bytes: 64 * 1024 * 1024,
             init_project_name_react: "react-vite-template".to_string(),
             init_project_name_vue3: "vue3-vite-template".to_string(),
-            deployment_mode: "docker-compose".to_string(),
+            deployment_mode: DeploymentMode::default(),
             fast_restart_enabled: false,
             computer_log_dir: PathBuf::from("/app/logs/computer_logs"),
             bash_path: String::new(),

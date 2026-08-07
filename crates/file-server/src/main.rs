@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         env!("RCODER_BUILD_GIT_BRANCH")
     );
     tracing::info!("═══════════════════════════════════════════");
+    tracing::info!(mode = ?config.deployment_mode, "deployment mode");
     let address = format!("{}:{}", config.listen_host, config.port);
     let server = FileServer::builder(config).build()?;
     let listener = tokio::net::TcpListener::bind(&address)

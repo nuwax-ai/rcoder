@@ -170,6 +170,7 @@ pub(crate) async fn spawn_embedded_file_server(runtime: Arc<dyn WorkspaceRuntime
         }
     };
     let address = format!("{}:{}", fs_config.listen_host, fs_config.port);
+    let deployment_mode = fs_config.deployment_mode;
     let fs_server = match FileServer::builder(fs_config)
         .with_workspace_resolver(fs_resolver)
         .build()
@@ -180,7 +181,10 @@ pub(crate) async fn spawn_embedded_file_server(runtime: Arc<dyn WorkspaceRuntime
             return;
         }
     };
-    info!("file-server (embedded) starting on {}", address);
+    info!(
+        "file-server (embedded) starting on {} (deployment mode: {:?})",
+        address, deployment_mode
+    );
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind(&address).await {
             Ok(listener) => {

@@ -98,6 +98,7 @@ fn computer_router() -> OpenApiRouter<AppState> {
         .routes(routes!(computer::files::files_update))
         .routes(routes!(computer::files::upload_file))
         .routes(routes!(computer::files::upload_files))
+        .routes(routes!(computer::files::generate_file))
         .routes(routes!(computer::files::import_project))
         .routes(routes!(computer::exec::cleanup_build_artifacts))
         .routes(routes!(computer::workspace::create_workspace))
