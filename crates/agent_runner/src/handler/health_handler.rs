@@ -10,10 +10,18 @@
 
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use axum::Json;
 use axum::http::StatusCode;
 use shared_types::HttpResult;
-use tracing::info;
+use tracing::{debug, info};
+
+/// 上次 readiness 探测报告的 gRPC 就绪状态 (用于翻转检测)。
+///
+/// K8s readinessProbe 每秒打一次 `/ready`, 若每次都 info 会刷屏 stdout/容器日志。
+/// 改为: 状态翻转(not_ready↔ready)时打 info(运维关心"何时就绪"), 稳态打 debug。
+static LAST_REPORTED_GRPC_READY: AtomicBool = AtomicBool::new(false);
 
 /// 健康检查端点
 ///
@@ -49,13 +57,26 @@ pub async fn ready_check() -> (
     // 任何构建都真正探测 50051；不绑 grpc-server feature, 避免"未启 feature 恒 true"的假就绪。
     let grpc_ready = check_grpc_port_simple().await;
 
-    // 输出详细的就绪检查日志
-    info!(
-        "🚦 [READY] Readiness check: http_ready={}, grpc_ready={}, status={}",
-        http_ready,
-        grpc_ready,
-        if grpc_ready { "ready" } else { "not_ready" }
-    );
+    // 就绪检查日志: 仅状态翻转时 info (避免 readinessProbe 每秒刷屏), 稳态 debug。
+    let last_ready = LAST_REPORTED_GRPC_READY.load(Ordering::Relaxed);
+    if grpc_ready != last_ready {
+        info!(
+            "🚦 [READY] Readiness transition: http_ready={}, grpc_ready={} ({} → {}), status={}",
+            http_ready,
+            grpc_ready,
+            last_ready,
+            grpc_ready,
+            if grpc_ready { "ready" } else { "not_ready" }
+        );
+        LAST_REPORTED_GRPC_READY.store(grpc_ready, Ordering::Relaxed);
+    } else {
+        debug!(
+            "🚦 [READY] Readiness check: http_ready={}, grpc_ready={}, status={}",
+            http_ready,
+            grpc_ready,
+            if grpc_ready { "ready" } else { "not_ready" }
+        );
+    }
 
     // 构建健康检查响应
     let health_response =
