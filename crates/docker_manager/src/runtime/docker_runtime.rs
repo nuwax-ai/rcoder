@@ -169,6 +169,63 @@ impl AgentContainerRuntime for DockerRuntime {
         }))
     }
 
+    /// Docker 基础诊断：find_container → docker inspect → 读 State(OOMKilled/exit_code/running)。
+    /// 用于 gRPC 连接失败时的根因识别（OOM / 容器不在），生成精准友好错误，而非裸 transport error。
+    /// inspect 失败(容器重建中等)→ 返回默认诊断(无根因)，调用方按"保留原文"处理，不误判。
+    async fn diagnose_agent_pod(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentPodDiagnostic> {
+        use bollard::query_parameters::InspectContainerOptions;
+
+        // 1. 按 identifier 找容器；找不到本身就是根因（exists=false）。
+        let Some(info) = self.find_container(identifier, service_type).await? else {
+            return Ok(container_runtime_api::AgentPodDiagnostic {
+                exists: false,
+                ..Default::default()
+            });
+        };
+
+        // 2. docker inspect 读 State。
+        let inspect = match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&info.container_id, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "[DIAGNOSE] docker inspect failed for {}: {}",
+                    info.container_id,
+                    e
+                );
+                // inspect 失败(容器可能在重建/重命名)→ 不确定，返回默认诊断，不误判。
+                return Ok(container_runtime_api::AgentPodDiagnostic::default());
+            }
+        };
+
+        // 3. State → AgentPodDiagnostic。OOMKilled 是 Docker 侧最关键的根因信号。
+        // state 借用(不 move inspect.state),以便同时读 inspect.restart_count(在顶层)。
+        let state = inspect.state.as_ref();
+        let oom_killed = state.and_then(|s| s.oom_killed).unwrap_or(false);
+        let exit_code = state.and_then(|s| s.exit_code);
+        let running = state.and_then(|s| s.running).unwrap_or(false);
+        let restart_count = inspect.restart_count.unwrap_or(0) as u32;
+        let status_str = state.and_then(|s| s.status.as_ref().map(|st| format!("{st:?}")));
+
+        Ok(container_runtime_api::AgentPodDiagnostic {
+            exists: true,
+            ready: running,
+            restart_count,
+            last_terminate_reason: oom_killed.then(|| "OOMKilled".to_string()),
+            last_exit_code: exit_code.map(|c| c as i32),
+            waiting_reason: None, // Docker 无 CrashLoopBackOff 概念
+            detail: status_str.filter(|s| !s.is_empty()),
+        })
+    }
+
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()> {
         self.inner
             .stop_container(project_id)
