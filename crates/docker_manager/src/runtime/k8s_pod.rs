@@ -130,7 +130,10 @@ impl K8sPodOps for KubernetesRuntime {
 
         RuntimeContainerInfo {
             container_id: metadata.uid.clone().unwrap_or_default(),
-            container_name: metadata.name.clone().unwrap_or_default(),
+            container_name: Self::sts_name_from_pod_name(
+                &metadata.name.clone().unwrap_or_default(),
+            )
+            .to_string(),
             container_ip: pod
                 .status
                 .as_ref()
