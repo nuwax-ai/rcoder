@@ -568,6 +568,8 @@ pub async fn agent_session_notification(
         namespace: state.config.app_manager.namespace.clone(),
         cluster_domain: state.cluster_domain.clone(),
         registry: state.session_stream_registry.clone(),
+        // Web Agent 诊断 identifier(project_id 维度)暂不接入,保留通用文案;后续按需补。
+        diag_ctx: None,
         last_seq,
     };
     build_sse_stream_from_container_name(params).await
@@ -689,6 +691,18 @@ pub async fn computer_agent_progress_notification(
         .and_then(|s| s.parse::<u64>().ok())
         .or(params.last_seq)
         .unwrap_or(0);
+    // Computer Agent: 诊断 identifier = user_id(SSE 断流重试耗尽时,据此做 OOM/crashloop
+    // 等精准诊断,替代通用文案)。拿不到 user_id → None → 回退通用文案。
+    let diag_ctx = state
+        .get_project(&project_id)
+        .and_then(|p| p.user_id().map(|u| u.to_string()))
+        .map(|identifier| {
+            Arc::new(crate::handler::utils::DiagCtx {
+                runtime: state.runtime().clone(),
+                identifier,
+                service_type: shared_types::ServiceType::ComputerAgentRunner,
+            })
+        });
     let params = SseStreamParams {
         container_name,
         container_ip,
@@ -701,6 +715,7 @@ pub async fn computer_agent_progress_notification(
         namespace: state.config.app_manager.namespace.clone(),
         cluster_domain: state.cluster_domain.clone(),
         registry: state.session_stream_registry.clone(),
+        diag_ctx,
         last_seq,
     };
     build_sse_stream_from_container_name(params).await

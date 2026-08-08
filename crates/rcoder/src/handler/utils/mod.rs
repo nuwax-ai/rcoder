@@ -9,7 +9,15 @@ mod i18n_extractors;
 mod locale;
 mod paths;
 
-pub use agent_diagnostic::{build_connection_error, diagnose, wait_agent_ready};
+// root_cause_message 仅被 lib 的 grpc::session_stream_registry 使用(bin 没有 grpc 模块),
+// bin 编译本 mod 时会判 unused —— 与本文件既有 #[allow(unused_imports)] 同一处理(lib/bin 双编译)。
+#[allow(unused_imports)]
+pub use agent_diagnostic::{
+    build_connection_error, diagnose, root_cause_message, wait_agent_ready,
+};
+// DiagCtx 定义在共享 crate container-runtime-api,这里 re-export 供 rcoder 内部统一引用
+// (规避 lib/bin 双实例类型分裂)。
+pub use container_runtime_api::DiagCtx;
 
 #[allow(unused_imports)]
 pub use agent_mgmt_forward::{

@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use super::GrpcChannelPool;
 use super::new_request_with_locale;
+use crate::handler::utils::{DiagCtx, diagnose, root_cause_message};
 
 /// broadcast 每个 receiver 的缓冲（高频 agent_message_chunk 时给慢消费者足够窗口）
 const BROADCAST_CAPACITY: usize = 256;
@@ -100,6 +101,7 @@ impl SessionStreamRegistry {
         pool: Arc<GrpcChannelPool>,
         locale: &'static str,
         activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
+        diag_ctx: Option<Arc<DiagCtx>>,
     ) -> Arc<SharedStream> {
         // 快速路径：存在 + grpc_addr 匹配 + 后台 task 存活 → 复用
         if let Some(existing) = self.streams.view(session_id, |_, v| v.clone()) {
@@ -137,6 +139,7 @@ impl SessionStreamRegistry {
             pool,
             locale,
             activity_updater,
+            diag_ctx,
         )
         .await;
         self.streams
@@ -220,6 +223,9 @@ pub struct SharedStream {
     activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
     cancel_token: CancellationToken,
     task_handle: OnceLock<JoinHandle<()>>,
+    /// 诊断上下文:后台 task 重试耗尽发终态错误事件时,据此做 OOM/crashloop 等精准诊断,
+    /// 替代通用文案。None(测试/无 runtime)→ 通用"Compute environment temporarily unavailable"。
+    diag_ctx: Option<Arc<DiagCtx>>,
 }
 
 impl SharedStream {
@@ -229,6 +235,7 @@ impl SharedStream {
         pool: Arc<GrpcChannelPool>,
         locale: &'static str,
         activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
+        diag_ctx: Option<Arc<DiagCtx>>,
     ) -> Arc<Self> {
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let shared = Arc::new(Self {
@@ -243,6 +250,7 @@ impl SharedStream {
             activity_updater: Arc::clone(&activity_updater),
             cancel_token: CancellationToken::new(),
             task_handle: OnceLock::new(),
+            diag_ctx: diag_ctx.clone(),
         });
 
         let handle = spawn_backend_task(
@@ -460,7 +468,7 @@ fn spawn_backend_task(
                     }
                     // 重试耗尽:必须发终态错误事件,否则 SharedStream 持 sender 不 Closed,
                     // 已连上的 HTTP SSE 客户端会永久 hang 在 recv()。错误文案用【当前】失败(#16a)。
-                    let err_ev = make_connection_error_event(locale);
+                    let err_ev = make_terminal_error_event(shared.diag_ctx.as_ref(), locale).await;
                     if let Err(send_err) = shared.broadcast_tx.send(Arc::new(err_ev)) {
                         warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
                     }
@@ -626,7 +634,7 @@ fn spawn_backend_task(
                         continue;
                     }
                     // 终态事件报告【当前】阶段错误,不用累积的过期错误(#16a)。
-                    let err_ev = make_connection_error_event(locale);
+                    let err_ev = make_terminal_error_event(shared.diag_ctx.as_ref(), locale).await;
                     if let Err(send_err) = shared.broadcast_tx.send(Arc::new(err_ev)) {
                         warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
                     }
@@ -694,14 +702,24 @@ fn make_stream_error_event(code: Code, _message: &str) -> ProgressEvent {
     }
 }
 
-/// gRPC 连接彻底失败（重试耗尽；seq=0 合成消息）
+/// gRPC 连接彻底失败(重试耗尽;seq=0 合成终态事件)。
 ///
 /// 不再把 transport 原文塞进 SSE 事件 —— 原文对用户无意义(transport error 多半不是根因),
-/// 且已在调用处 `warn!` 入日志供排查。这里给前端本地化友好提示 + `ERR_AGENT_CONTAINER_UNAVAILABLE`
-/// 错误码(前端可据码退避重试)。实时 OOM 诊断在 chat 路径(chat_forward)处理。
-fn make_connection_error_event(locale: &str) -> ProgressEvent {
+/// 且已在调用处 `warn!` 入日志供排查。有 [`DiagCtx`] 时做一次**实时诊断**(OOM/CrashLoop/
+/// 容器缺失/启动中),给精准根因文案(与 chat 路径共用 [`root_cause_message`],两路一致);
+/// 无 DiagCtx(测试 / 无 runtime)→ 通用"Compute environment temporarily unavailable"。
+/// 错误码统一 [`ERR_AGENT_CONTAINER_UNAVAILABLE`](前端可据码退避重试)。
+async fn make_terminal_error_event(diag: Option<&Arc<DiagCtx>>, locale: &str) -> ProgressEvent {
     let code = shared_types::error_codes::ERR_AGENT_CONTAINER_UNAVAILABLE;
-    let message = shared_types::error_codes::get_error_message(code, locale);
+    let message = match diag {
+        // 实时诊断根因 → 精准文案。诊断本身失败不阻断:diagnose() 内部已兜底默认诊断
+        // (→ root_cause_message 的通用分支),不会让错误路径二次失败。
+        Some(ctx) => {
+            let d = diagnose(&ctx.runtime, &ctx.identifier, ctx.service_type.clone()).await;
+            root_cause_message(&d, locale)
+        }
+        None => shared_types::error_codes::get_error_message(code, locale),
+    };
     // serde_json 构造,避免 format! 拼 JSON 产生非法 JSON。
     let payload = serde_json::json!({
         "code": code,
@@ -830,6 +848,7 @@ mod tests {
             Arc::new(GrpcChannelPool::new()),
             "en",
             Arc::new(|_| {}),
+            None,
         )
         .await;
         registry
@@ -863,6 +882,7 @@ mod tests {
             Arc::new(GrpcChannelPool::new()),
             "en",
             Arc::new(|_| {}),
+            None,
         )
         .await;
 
@@ -888,6 +908,7 @@ mod tests {
             Arc::new(GrpcChannelPool::new()),
             "en",
             Arc::new(|_| {}),
+            None,
         )
         .await;
 
@@ -921,6 +942,7 @@ mod tests {
             Arc::new(GrpcChannelPool::new()),
             "en",
             Arc::new(|_| {}),
+            None,
         )
         .await;
         let matched_b = SharedStream::new(
@@ -929,6 +951,7 @@ mod tests {
             Arc::new(GrpcChannelPool::new()),
             "en",
             Arc::new(|_| {}),
+            None,
         )
         .await;
         let unmatched = SharedStream::new(
@@ -937,6 +960,7 @@ mod tests {
             Arc::new(GrpcChannelPool::new()),
             "en",
             Arc::new(|_| {}),
+            None,
         )
         .await;
         registry
@@ -972,17 +996,19 @@ mod tests {
         assert_eq!(registry.shutdown_streams_by_addr("1.2.3.4:50051"), 0);
     }
 
-    #[test]
-    fn connection_error_payload_is_valid_json_with_special_chars() {
-        // message 含引号/换行/制表符/反斜杠:format! 拼 JSON 会断,serde_json 必须正确转义。
-        let msg = "connect \"refused\"\nsecond line\ttab\\backslash";
-        let ev = make_connection_error_event(msg);
+    #[tokio::test]
+    async fn terminal_error_event_payload_is_valid_json() {
+        // 无 DiagCtx → 通用文案;payload 必须是合法 JSON(serde_json 构造,非 format! 拼接)。
+        let ev = make_terminal_error_event(None, "en-US").await;
         let payload: serde_json::Value =
             serde_json::from_str(&ev.payload).expect("payload must be valid JSON");
-        assert_eq!(payload["code"], "GRPC_CONNECTION_FAILED");
         assert_eq!(
-            payload["message"], msg,
-            "message must round-trip special chars"
+            payload["code"],
+            shared_types::error_codes::ERR_AGENT_CONTAINER_UNAVAILABLE
+        );
+        assert!(
+            payload["message"].is_string(),
+            "message must be a JSON string"
         );
         assert_eq!(ev.message_type, "SessionPromptEnd");
         assert_eq!(ev.sub_type, "error");

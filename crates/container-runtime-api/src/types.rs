@@ -4,8 +4,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared_types::ServiceType;
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
 use utoipa::ToSchema;
+
+use crate::ContainerRuntime;
 
 /// Container runtime errors
 #[derive(Error, Debug)]
@@ -104,6 +107,21 @@ impl AgentPodDiagnostic {
     pub fn is_crash_loop(&self) -> bool {
         self.waiting_reason.as_deref() == Some("CrashLoopBackOff")
     }
+}
+
+/// 诊断上下文:把"诊断一次 agent 容器"所需的输入(runtime + identifier + service_type)打包,
+/// 供不持有 `AppState` 的层(如 rcoder SSE 共享流的后台 task)按需触发诊断。
+///
+/// 定义在共享 crate(`container-runtime-api`)而非 rcoder 内部,是为了规避 rcoder 同时作为
+/// lib + bin 编译时"同一类型出现两个 crate 实例"导致的类型分裂 —— 放这里 lib/bin 引用的是
+/// **同一个** `DiagCtx`。`Option<Arc<DiagCtx>>` 语义:Some 才诊断,O None 回退通用文案。
+pub struct DiagCtx {
+    /// 容器运行时抽象(Docker / K8s),来自 AppState.runtime()
+    pub runtime: Arc<dyn ContainerRuntime>,
+    /// 容器逻辑标识:ComputerAgentRunner=user_id,WebAgentRunner=project_id
+    pub identifier: String,
+    /// 服务类型(决定 agent_pod_name 如何拼装)
+    pub service_type: ServiceType,
 }
 
 /// 默认诊断 = "未知/不支持"。

@@ -32,6 +32,7 @@ use tracing::{info, warn};
 /// 不直接传 `Arc<AppState>` 是因为 rcoder 同时作为 lib 和 bin 编译，
 /// `crate::router::AppState` 在两边是不同的类型实例。改用闭包解耦：
 /// 调用方在 lib 内部捕获 state 引用，bin crate 不需要知道 AppState 类型。
+#[allow(clippy::too_many_arguments)] // SSE 流构建本质多参;diag_ctx 为新增诊断上下文
 pub async fn create_grpc_sse_stream(
     registry: Arc<crate::grpc::SessionStreamRegistry>,
     grpc_addr: String,
@@ -39,6 +40,7 @@ pub async fn create_grpc_sse_stream(
     pool: Arc<crate::grpc::GrpcChannelPool>,
     locale: &'static str,
     activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
+    diag_ctx: Option<Arc<crate::handler::utils::DiagCtx>>,
     last_seq: u64,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
@@ -49,7 +51,14 @@ pub async fn create_grpc_sse_stream(
     tokio::spawn(async move {
         // 1. 获取或创建 session 共享流（每 session 一条 agent_runner SubscribeProgress 流）
         let shared = registry
-            .get_or_create(&session_id, &grpc_addr, pool, locale, activity_updater)
+            .get_or_create(
+                &session_id,
+                &grpc_addr,
+                pool,
+                locale,
+                activity_updater,
+                diag_ctx,
+            )
             .await;
         // 注册本消费者（ref_count +1）；guard drop 时 release_client（最后一个离开延迟清理共享流）
         let _guard = shared.acquire_client(Arc::clone(&registry));

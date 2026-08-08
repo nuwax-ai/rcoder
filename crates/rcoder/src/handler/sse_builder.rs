@@ -38,6 +38,9 @@ pub(crate) struct SseStreamParams {
     pub(crate) cluster_domain: String,
     /// Session 共享流注册表（每 session 一条 agent_runner 流，多 SSE 客户端 fan-out 共享）
     pub(crate) registry: Arc<crate::grpc::SessionStreamRegistry>,
+    /// 诊断上下文：SSE 流断开重试耗尽时，据此做 OOM/CrashLoop 等精准诊断，替代通用文案。
+    /// None（无 runtime / 拿不到 identifier）→ 通用 "Compute environment temporarily unavailable"。
+    pub(crate) diag_ctx: Option<Arc<crate::handler::utils::DiagCtx>>,
     /// 客户端消费游标（从 Last-Event-ID header 或 ?last_seq= query 读取），
     /// 用于增量补齐；缺省 0 = 补齐该 session 全量历史（首次连接合理，重连应由前端带 last_seq）。
     pub(crate) last_seq: u64,
@@ -68,6 +71,7 @@ pub(crate) async fn build_sse_stream_from_container_name(
         params.grpc_pool.clone(),
         params.locale,
         params.activity_updater,
+        params.diag_ctx,
         params.last_seq,
     )
     .await;

@@ -41,6 +41,33 @@ pub async fn diagnose(
     }
 }
 
+/// 把诊断结果映射为面向用户的根因文案(OOM / CrashLoop / 容器缺失 / 启动中 / 通用)。
+///
+/// chat 路径([`build_connection_error`])与 SSE 路径(流断开终态事件)共用此函数,
+/// 保证两路对同一根因给出**一致**的文案 —— 避免"chat 报 OOM、SSE 报通用"的割裂。
+pub fn root_cause_message(d: &AgentPodDiagnostic, locale: &str) -> String {
+    if !d.exists {
+        get_i18n_message("error.agent_container_not_found", locale)
+    } else if d.is_oom() {
+        // OOMKilled:附重启次数
+        get_i18n_message("error.agent_container_oom", locale)
+            .replace("{}", &d.restart_count.to_string())
+    } else if d.is_crash_loop() {
+        // CrashLoopBackOff:附退出码
+        get_i18n_message("error.agent_container_crashloop", locale)
+            .replace("{}", &d.last_exit_code.unwrap_or(-1).to_string())
+    } else if d.is_starting_up() {
+        get_i18n_message("error.agent_container_starting", locale)
+    } else {
+        // 其他根因(有 last_terminate_reason 等):基础串 + 可读 detail
+        let base = get_i18n_message("error.agent_container_unavailable", locale);
+        match &d.detail {
+            Some(det) if !det.is_empty() => format!("{base} ({det})"),
+            _ => base,
+        }
+    }
+}
+
 /// gRPC 连接失败时,根据诊断结果生成 `(错误码, 错误消息)`。
 ///
 /// 调用方据此构造各自领域的错误响应(chat → `HttpResult::error`,SSE → 错误事件,
@@ -70,29 +97,12 @@ pub async fn build_connection_error(
         );
     }
 
-    // 有根因(或启动中):以根因为主,错误码 ERR_AGENT_CONTAINER_UNAVAILABLE
-    let msg = if !d.exists {
-        get_i18n_message("error.agent_container_not_found", locale)
-    } else if d.is_oom() {
-        // OOMKilled:附重启次数
-        get_i18n_message("error.agent_container_oom", locale)
-            .replace("{}", &d.restart_count.to_string())
-    } else if d.is_crash_loop() {
-        // CrashLoopBackOff:附退出码
-        get_i18n_message("error.agent_container_crashloop", locale)
-            .replace("{}", &d.last_exit_code.unwrap_or(-1).to_string())
-    } else if d.is_starting_up() {
-        get_i18n_message("error.agent_container_starting", locale)
-    } else {
-        // 其他根因(有 last_terminate_reason 等):基础串 + 可读 detail
-        let base = get_i18n_message("error.agent_container_unavailable", locale);
-        match &d.detail {
-            Some(det) if !det.is_empty() => format!("{base} ({det})"),
-            _ => base,
-        }
-    };
-
-    (ec::ERR_AGENT_CONTAINER_UNAVAILABLE.to_string(), msg)
+    // 有根因(或启动中):以根因为主,错误码 ERR_AGENT_CONTAINER_UNAVAILABLE。
+    // 文案映射与 SSE 路径共用 [`root_cause_message`],保证两路一致。
+    (
+        ec::ERR_AGENT_CONTAINER_UNAVAILABLE.to_string(),
+        root_cause_message(&d, locale),
+    )
 }
 
 /// 智能等待 agent pod ready(容器冷启动 / OOM 重启后,等它就绪再重试 gRPC)。
