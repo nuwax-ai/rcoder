@@ -201,7 +201,16 @@ impl ProjectAdapter {
         // 写入主存储和索引
         self.project_to_container
             .insert(project_id.clone(), key.clone());
-        self.projects.insert(project_id.clone(), info.clone());
+        let old_project = self.projects.insert(project_id.clone(), info.clone());
+
+        // 并发补偿：如果 project 已被另一线程先写入（Some 返回），本线程的容器
+        // inc_ref（或 create）是多余的（project 被覆盖不是新建）→ 撤销一次容器引用。
+        // 竞态窗口极小（inc 到这里只隔几行同步代码），keep-on-0 保证容器条目不被误删。
+        // 正确性：N 线程并发同 project → 1 个 None（赢家）+ N-1 个 Some（补偿 dec）
+        // → 净容器引用 = 1（create 初始值）= 实际 project 数。
+        if old_project.is_some() && container_changed {
+            self.dec_container_ref(&key);
+        }
 
         // 维护反向索引：container_id → 容器键
         if let Some(c) = info.container_info() {

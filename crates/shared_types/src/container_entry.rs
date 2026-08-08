@@ -87,14 +87,33 @@ impl ContainerEntry {
         self.ref_count.load(Ordering::Acquire)
     }
 
-    /// 增加引用，返回增加后的值
+    /// 增加引用，返回增加后的值。
+    ///
+    /// Saturating：达到 `usize::MAX` 后不再增加（防并发 bug 导致 fetch_add 回绕）。
+    /// 生产稳定优先 —— 宁可 ref_count 偏高（容器条目多留一会儿），不可 wrap 成错误值。
     pub fn inc_ref(&self) -> usize {
-        self.ref_count.fetch_add(1, Ordering::AcqRel) + 1
+        let prev = self.ref_count.fetch_add(1, Ordering::AcqRel);
+        if prev == usize::MAX {
+            // 已饱和：回退这次 add，返回 MAX
+            self.ref_count.store(usize::MAX, Ordering::Release);
+            usize::MAX
+        } else {
+            prev + 1
+        }
     }
 
-    /// 减少引用，返回减少后的值
+    /// 减少引用，返回减少后的值。
+    ///
+    /// Saturating：到 0 后不再减少（防并发 bug 导致 fetch_sub 下溢回绕到 MAX）。
     pub fn dec_ref(&self) -> usize {
-        self.ref_count.fetch_sub(1, Ordering::AcqRel) - 1
+        let prev = self.ref_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 0 {
+            // 已到 0：回退这次 sub，返回 0
+            self.ref_count.store(0, Ordering::Release);
+            0
+        } else {
+            prev - 1
+        }
     }
 
     /// 最后活跃时间
