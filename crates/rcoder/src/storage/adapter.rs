@@ -225,7 +225,8 @@ impl ProjectAdapter {
     /// 删除项目（RAII 核心）
     ///
     /// 自动清理 session 索引和容器引用计数。
-    /// 容器引用归零时触发异步物理销毁。
+    /// 容器引用归零时**保留容器条目**(刷新活跃时间,交 cleaner idle 回收),
+    /// 不再立即触发物理销毁 —— 避免短间隔 chat 反复重建容器导致 transport error。
     pub fn remove(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
         // 1. 先从主存储移除，获取 info 所有权（避免后续从 map 读取时被并发修改）
         let (_, info) = self.projects.remove(project_id)?;
