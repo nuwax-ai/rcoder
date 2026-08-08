@@ -323,16 +323,15 @@ impl ProjectAdapter {
         // dec_ref 在 entry 写锁范围内，与后续 remove_entry 原子
         let remaining = entry.get().dec_ref();
         if remaining == 0 {
-            // refcount=0（无 project 关联）: 清理 map 条目,但不发 cleanup_tx 物理销毁。
-            // 物理销毁由调用方负责: agent_stop 已 stop_container_by_identifier;
-            // cleaner idle 标记 Idle 保留容器(不删 project),long_idle 才销毁。
-            // 历史:refcount=0 立即 cleanup_tx 会绕过 cleaner idle 回收,导致容器在保护期内被误删。
-            let (_ck, entry) = entry.remove_entry();
-            let info = entry.info();
-            self.container_id_to_key.remove(&info.container_id);
+            // 不清 map 条目（保留）—— 清了会导致 ensure "container not found" 反复重建。
+            // 标记活跃时间,交 cleaner idle 回收统一清理。
+            // 注意:同一容器可能有两个 key（STS 名 + Pod 名,container_entry_key 在
+            // container_info None 时回退 logical_id），inc/dec 分布在两个 key 上导致
+            // refcount 不平衡。保留条目（不清）可避免 ensure 重建触发 transport error。
+            entry.get().update_activity();
             info!(
-                "[STORAGE] container refcount=0,清理 map 条目(不物理销毁): {}",
-                info.container_name
+                "[STORAGE] container refcount=0,保留条目(不清 map,交 cleaner 回收): {}",
+                entry.get().info().container_name
             );
         }
     }
