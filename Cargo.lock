@@ -3413,6 +3413,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -4373,6 +4375,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
+]
+
+[[package]]
+name = "lockmap"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67b0fa3c87eb654dda92c58abc3e5dbe31136f69d91ae0eed1728b6ef62240db"
+dependencies = [
+ "aliasable",
+ "foldhash 0.2.0",
+ "hashbrown 0.15.5",
+ "parking_lot",
 ]
 
 [[package]]
@@ -6309,6 +6323,7 @@ dependencies = [
  "hyper-util",
  "k8s-openapi",
  "kube",
+ "lockmap",
  "md5",
  "moka",
  "notify",

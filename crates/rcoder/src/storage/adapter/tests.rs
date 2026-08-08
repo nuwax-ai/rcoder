@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use super::*;
 use shared_types::ProjectExtendedFields;
 
@@ -511,7 +513,7 @@ fn join_with_timeout<T>(handle: thread::JoinHandle<T>, timeout_secs: u64) -> Opt
 }
 
 fn drain_cleanup_requests(
-    rx: &std::sync::Mutex<tokio::sync::mpsc::Receiver<CleanupRequest>>,
+    rx: &Mutex<tokio::sync::mpsc::Receiver<CleanupRequest>>,
 ) -> Vec<CleanupRequest> {
     let mut guard = rx.lock().unwrap();
     let mut requests = vec![];
@@ -546,7 +548,7 @@ fn test_concurrent_insert_remove_no_deadlock() {
     let (adapter, rx) =
         ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
     let adapter = Arc::new(adapter);
-    let rx = Arc::new(std::sync::Mutex::new(rx));
+    let rx = Arc::new(Mutex::new(rx));
 
     const THREADS: usize = 8;
     const ITERS: usize = 50;
@@ -595,10 +597,7 @@ fn test_concurrent_insert_remove_no_deadlock() {
     );
 }
 
-// 8 线程 × 50 并发同 project insert/remove：补偿事务 + saturating inc/dec 已防止 panic,
-// 但极端并发下 ref_count 仍可能短暂漂移（不影响正确性 —— saturating 保证不 wrap，cleaner 兜底回收）。
-// 暂时 #[ignore] 避免高频 CI 噪声；4 线程版本（下方）已解禁验证补偿事务有效。
-#[ignore]
+// 并发同 project_id insert/remove：per-project 锁序列化操作，ref_count 精确正确。
 #[test]
 fn test_concurrent_same_project_insert_remove() {
     let (adapter, _rx) =
@@ -641,7 +640,7 @@ fn test_concurrent_shared_container_remove() {
     let (adapter, rx) =
         ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
     let adapter = Arc::new(adapter);
-    let rx = Arc::new(std::sync::Mutex::new(rx));
+    let rx = Arc::new(Mutex::new(rx));
 
     let container = ContainerBasicInfo {
         container_id: "shared-id".to_string(),
@@ -876,7 +875,7 @@ fn test_concurrent_stress_mixed_operations() {
 fn test_raii_cleanup_request_content() {
     let (adapter, rx) =
         ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
-    let rx = Arc::new(std::sync::Mutex::new(rx));
+    let rx = Arc::new(Mutex::new(rx));
 
     let info = Arc::new(create_test_info_with_container("proj-verify", "c-verify"));
     adapter.insert("proj-verify".to_string(), info).unwrap();
@@ -894,7 +893,7 @@ fn test_raii_cleanup_request_content() {
 fn test_shared_container_ref_count_no_leak_under_reinsert() {
     let (adapter, rx) =
         ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
-    let rx = Arc::new(std::sync::Mutex::new(rx));
+    let rx = Arc::new(Mutex::new(rx));
 
     let container = ContainerBasicInfo {
         container_id: "leak-test-id".to_string(),

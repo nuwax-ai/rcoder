@@ -25,6 +25,7 @@ use tracing::{debug, info};
 
 use super::resource_reaper::CleanupRequest;
 use super::types::StorageStats;
+use lockmap::LockMap;
 use shared_types::ContainerEntry;
 
 /// 项目适配器
@@ -72,6 +73,10 @@ pub struct ProjectAdapter {
     pub(super) user_id_to_project_ids: DashMap<String, DashSet<String>>,
     /// pod_id → project_id（按 pod ID 快速查找）
     pub(super) pod_id_to_project_id: DashMap<String, String>,
+    /// per-project 串行锁：序列化同一 project_id 的 insert/remove，
+    /// 消除跨 DashMap（projects ↔ containers）的 TOCTOU 竞态。
+    /// Arc<LockMap> 保证 clone 后共享同一锁实例。
+    project_locks: Arc<LockMap<String, ()>>,
 }
 
 impl ProjectAdapter {
@@ -96,6 +101,7 @@ impl ProjectAdapter {
             container_id_to_key: DashMap::new(),
             user_id_to_project_ids: DashMap::new(),
             pod_id_to_project_id: DashMap::new(),
+            project_locks: Arc::new(LockMap::new()),
         };
         info!("[STORAGE] ProjectAdapter initialized (DashMap, RAII enabled)");
         (adapter, rx)
@@ -120,6 +126,10 @@ impl ProjectAdapter {
         project_id: String,
         info: Arc<ProjectAndContainerInfo>,
     ) -> anyhow::Result<()> {
+        // per-project 锁（lockmap）：序列化同一 project_id 的并发 insert/remove，
+        // 消除 projects ↔ containers 跨 DashMap 的 TOCTOU 竞态（ref_count 泄漏根因）。
+        // lockmap 的 entry_by_ref 阻塞获取 per-key 排他锁，guard drop 自动释放 + 自动清理。
+        let _project_guard = self.project_locks.entry_by_ref(&project_id);
         // DashMap 键：优先 container_name（跨重建稳定、含 service_type 前缀防跨类型碰撞），
         // 无容器信息时回退裸 logical_id（仅占位，不建容器条目）。
         let key = container_entry_key(&info);
@@ -201,16 +211,7 @@ impl ProjectAdapter {
         // 写入主存储和索引
         self.project_to_container
             .insert(project_id.clone(), key.clone());
-        let old_project = self.projects.insert(project_id.clone(), info.clone());
-
-        // 并发补偿：如果 project 已被另一线程先写入（Some 返回），本线程的容器
-        // inc_ref（或 create）是多余的（project 被覆盖不是新建）→ 撤销一次容器引用。
-        // 竞态窗口极小（inc 到这里只隔几行同步代码），keep-on-0 保证容器条目不被误删。
-        // 正确性：N 线程并发同 project → 1 个 None（赢家）+ N-1 个 Some（补偿 dec）
-        // → 净容器引用 = 1（create 初始值）= 实际 project 数。
-        if old_project.is_some() && container_changed {
-            self.dec_container_ref(&key);
-        }
+        self.projects.insert(project_id.clone(), info.clone());
 
         // 维护反向索引：container_id → 容器键
         if let Some(c) = info.container_info() {
@@ -237,6 +238,9 @@ impl ProjectAdapter {
     /// 容器引用归零时**保留容器条目**(刷新活跃时间,交 cleaner idle 回收),
     /// 不再立即触发物理销毁 —— 避免短间隔 chat 反复重建容器导致 transport error。
     pub fn remove(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        // per-project 锁（lockmap）：与 insert 共享，序列化同 project 并发操作。
+        let _project_guard = self.project_locks.entry_by_ref(project_id);
+
         // 1. 先从主存储移除，获取 info 所有权（避免后续从 map 读取时被并发修改）
         let (_, info) = self.projects.remove(project_id)?;
 
@@ -281,6 +285,7 @@ impl ProjectAdapter {
             project_id,
             info.session_count()
         );
+
         Some(info)
     }
 

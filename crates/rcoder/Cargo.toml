@@ -53,6 +53,7 @@ rcoder-telemetry = { workspace = true }
 clap = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
+lockmap = { workspace = true }
 tempfile = { workspace = true }
 
 # HTTP server

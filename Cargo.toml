@@ -161,6 +161,7 @@ rustls = { version = "0.23", features = ["ring"] }
 # Additional utilities
 indoc = "2.0"
 parking_lot = "0.12"
+lockmap = "0.2.3"
 convert_case = "0.11"
 # Persistent data structures for CoW-friendly multi-session tracking (C2/M3 fix)
 im = { version = "15.1", features = ["serde"] }
