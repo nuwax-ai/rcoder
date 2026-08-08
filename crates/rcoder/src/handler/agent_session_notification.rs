@@ -556,6 +556,23 @@ pub async fn agent_session_notification(
         .and_then(|s| s.parse::<u64>().ok())
         .or(params.last_seq)
         .unwrap_or(0);
+    // 构建 diag_ctx：根据 project 的 service_type 自动选诊断标识。
+    // ComputerAgentRunner → user_id,WebAgentRunner → project_id。
+    // 这样 Web 路径 SSE 断流时也能做 OOM/crashloop 精准诊断。
+    let diag_ctx = state.get_project(&project_id).and_then(|p| {
+        let st = p.service_type()?;
+        let id = match &st {
+            shared_types::ServiceType::ComputerAgentRunner => p.user_id().map(|u| u.to_string()),
+            _ => Some(project_id.clone()),
+        };
+        id.map(|identifier| {
+            Arc::new(crate::handler::utils::DiagCtx {
+                runtime: state.runtime().clone(),
+                identifier,
+                service_type: st.clone(),
+            })
+        })
+    });
     let params = SseStreamParams {
         container_name,
         container_ip,
@@ -568,8 +585,7 @@ pub async fn agent_session_notification(
         namespace: state.config.app_manager.namespace.clone(),
         cluster_domain: state.cluster_domain.clone(),
         registry: state.session_stream_registry.clone(),
-        // Web Agent 诊断 identifier(project_id 维度)暂不接入,保留通用文案;后续按需补。
-        diag_ctx: None,
+        diag_ctx,
         last_seq,
     };
     build_sse_stream_from_container_name(params).await
