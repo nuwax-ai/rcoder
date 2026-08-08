@@ -198,6 +198,10 @@ pub struct CleanupConfigSettings {
     /// 容器最小保护时间（秒），默认300秒（5分钟）
     #[serde(default = "default_container_protection_seconds")]
     pub container_protection_seconds: u64,
+    /// 长期闲置超时时间（秒），超过此值才真正销毁容器 + 删 project（默认 86400 = 24 小时）。
+    /// 短期闲置（idle_timeout ~ long_idle_timeout）只标记 Idle、保留容器复用。
+    #[serde(default = "default_long_idle_timeout_seconds")]
+    pub long_idle_timeout_seconds: u64,
     /// 日志清理配置
     #[serde(default)]
     pub log_cleanup: LogCleanupConfig,
@@ -223,6 +227,10 @@ fn default_container_protection_seconds() -> u64 {
     300 // 5分钟
 }
 
+fn default_long_idle_timeout_seconds() -> u64 {
+    3600 // 1小时 — 短期闲置保留复用，长期闲置才销毁
+}
+
 impl Default for CleanupConfigSettings {
     fn default() -> Self {
         Self {
@@ -231,6 +239,7 @@ impl Default for CleanupConfigSettings {
             cleanup_interval_seconds: default_cleanup_interval_seconds(),
             docker_stop_timeout_seconds: default_docker_stop_timeout_seconds(),
             container_protection_seconds: default_container_protection_seconds(),
+            long_idle_timeout_seconds: default_long_idle_timeout_seconds(),
             log_cleanup: LogCleanupConfig::default(),
         }
     }

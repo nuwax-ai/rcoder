@@ -166,8 +166,10 @@ impl ProjectAdapter {
                 // 键变了：把 temp Arc 共享到 containers[key]
                 let need_repoint = match self.containers.entry(key.clone()) {
                     Entry::Occupied(e) => {
-                        e.get().inc_ref(); // 另一 project 已有此容器，引用 +1
-                        Some(Arc::clone(e.get())) // 回指权威条目
+                        let ce = e.get();
+                        ce.inc_ref(); // 另一 project 已有此容器（含 refcount=0 的游离容器），引用 +1
+                        ce.update_activity(); // 复活:刷新 last_activity,避免刚回收池中的容器被立刻判 idle
+                        Some(Arc::clone(ce)) // 回指权威条目
                     }
                     Entry::Vacant(e) => {
                         e.insert(Arc::clone(&temp_entry)); // 共享 temp Arc

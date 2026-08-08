@@ -17,6 +17,8 @@ pub struct CleanupConfig {
     pub docker_stop_timeout: Duration,
     /// 容器最小保护时间（默认5分钟）
     pub container_protection_duration: Duration,
+    /// 长期闲置超时（默认24小时）—— 短期闲置标记 Idle 保留复用，超过此值才真正销毁
+    pub long_idle_timeout: Duration,
     /// Agent 活跃判断时间窗口（默认5分钟）
     pub active_window: Duration,
     /// 日志目录路径
@@ -32,6 +34,7 @@ impl Default for CleanupConfig {
             cleanup_interval: Duration::from_secs(5 * 60),
             docker_stop_timeout: Duration::from_secs(30),
             container_protection_duration: Duration::from_secs(5 * 60),
+            long_idle_timeout: Duration::from_secs(60 * 60), // 1小时
             active_window: Duration::from_secs(5 * 60),
             log_dir: "/app/logs/container".to_string(),
             log_retention_duration: Duration::from_secs(7 * 24 * 60 * 60),

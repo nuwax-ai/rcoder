@@ -34,6 +34,7 @@ pub async fn start_all_background_tasks(
         container_protection_duration: Duration::from_secs(
             config.cleanup_config.container_protection_seconds,
         ),
+        long_idle_timeout: Duration::from_secs(config.cleanup_config.long_idle_timeout_seconds),
         active_window: Duration::from_secs(5 * 60),
         log_dir: config.cleanup_config.log_cleanup.log_dir.clone(),
         log_retention_duration: Duration::from_secs(

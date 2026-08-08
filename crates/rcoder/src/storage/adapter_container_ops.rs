@@ -323,32 +323,17 @@ impl ProjectAdapter {
         // dec_ref 在 entry 写锁范围内，与后续 remove_entry 原子
         let remaining = entry.get().dec_ref();
         if remaining == 0 {
+            // refcount=0（无 project 关联）: 清理 map 条目,但不发 cleanup_tx 物理销毁。
+            // 物理销毁由调用方负责: agent_stop 已 stop_container_by_identifier;
+            // cleaner idle 标记 Idle 保留容器(不删 project),long_idle 才销毁。
+            // 历史:refcount=0 立即 cleanup_tx 会绕过 cleaner idle 回收,导致容器在保护期内被误删。
             let (_ck, entry) = entry.remove_entry();
             let info = entry.info();
-            // 清理反向索引
             self.container_id_to_key.remove(&info.container_id);
             info!(
-                "[STORAGE] RAII: container refcount=0, sending cleanup for {}",
+                "[STORAGE] container refcount=0,清理 map 条目(不物理销毁): {}",
                 info.container_name
             );
-            // identifier 用裸 logical_id（清理链路按 logical id：stop_container_by_identifier/
-            // remove_vnc_backend/remove_project_backend/remove_container_cache），而非 DashMap 键
-            if let Err(e) = self.cleanup_tx.try_send(CleanupRequest {
-                identifier: entry.logical_id().to_string(),
-                container_name: info.container_name,
-                service_type: entry.service_type(),
-                container_ip: info.container_ip,
-                namespace: self.namespace.clone(),
-                cluster_domain: self.cluster_domain.clone(),
-                project_ids: vec![],
-                retry_count: 0,
-            }) {
-                tracing::error!(
-                    "[STORAGE] cleanup channel try_send failed (full or ResourceReaper down?), container leak risk: identifier={}, {}",
-                    entry.logical_id(),
-                    e
-                );
-            }
         }
     }
 }

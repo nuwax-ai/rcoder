@@ -113,7 +113,7 @@ impl AgentCleaner {
         //    清掉其「已见过一次 idle」标记，下个闲置周期重新计数；本轮仍闲置的容器保留标记。
         //    这保证了「连续两轮 idle 才销毁」的连续性——中间任一轮恢复，计数清零重来。
         {
-            let idle_containers: std::collections::HashSet<String> = idle_agents
+            let idle_keys: std::collections::HashSet<String> = idle_agents
                 .iter()
                 .filter_map(|pid| {
                     self.state
@@ -121,7 +121,7 @@ impl AgentCleaner {
                         .and_then(|i| i.container_info().map(|c| c.container_name.clone()))
                 })
                 .collect();
-            self.pending_destroy.retain(|k| idle_containers.contains(k));
+            self.pending_destroy.retain(|k| idle_keys.contains(k));
         }
 
         // 3. 清理每个 agent
@@ -249,6 +249,21 @@ impl AgentCleaner {
         let destroy_reason = strategy
             .should_destroy_container(project_id, &context)
             .await?;
+
+        // 短期闲置（idle > idle_timeout 但 < long_idle_timeout）：标记 Idle、保留容器 + project 复用，
+        // 不销毁、不删 project。只有长期闲置（>= long_idle_timeout）才走下方二次确认 + 销毁链。
+        if destroy_reason.is_some() && idle_secs < self.config.long_idle_timeout.as_secs() as i64 {
+            self.state
+                .projects
+                .update_agent_status(project_id, 0, "idle");
+            info!(
+                " [cleaner] 📌 idle 标记(保留复用): project_id={}, idle_secs={}s < long_idle={}s",
+                project_id,
+                idle_secs,
+                self.config.long_idle_timeout.as_secs()
+            );
+            return Ok(false); // 不销毁容器、不删 project
+        }
 
         // 🔁 二次确认：策略判定该销毁时不立即销毁 —— 首次命中只记个标记，下一轮**连续**仍
         //    闲置才真正销毁。中间任一轮用户回归（last_activity 推进 / VNC 接入）会让容器不再
