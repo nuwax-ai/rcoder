@@ -76,6 +76,11 @@ async fn destroy_container_for_project(
         if is_known_identifier(&container_info.project_id) {
             // 先关闭该 project 的 SSE 共享流（remove_project 会清空 sessions 集合，之后无法枚举）
             state.shutdown_sse_streams_for_project(&container_info.project_id);
+            // 清理 Pingora 后端（dec_container_ref 不再发 cleanup_tx，需在此补清，
+            // 否则 agent_stop 后 Pingora 路由残留指向已删容器）
+            if let Some(ref pingora) = state.pingora_service {
+                let _unused = pingora.remove_project_backend(&container_info.project_id);
+            }
             state.remove_project(&container_info.project_id);
         }
 
