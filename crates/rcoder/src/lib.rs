@@ -2,18 +2,19 @@
 //!
 //! 提供 ACP 协议集成和 AI 代理管理功能
 
-pub mod agent_download;
-pub mod app_manager;
 pub mod cleanup_task;
 pub mod config;
 pub mod grpc;
 pub mod handler;
+pub mod http_client;
 pub mod middleware;
 pub mod router;
 mod service;
 pub mod storage;
+pub mod userapp_publish;
 mod utils;
 pub mod vnc;
+mod workspace_migrate;
 
 // 重新导出主要的类型和函数
 pub use storage::ProjectAdapter;

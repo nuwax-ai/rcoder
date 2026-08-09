@@ -331,7 +331,7 @@ mod tests {
     fn test_agent_id_with_override() {
         let config = create_test_default_config();
         let agent_config = ChatAgentConfig {
-            agent_server: Some(shared_types::ChatAgentServerConfig {
+            agent_server: Some(ChatAgentServerConfig {
                 agent_id: Some("custom-agent".to_string()),
                 ..Default::default()
             }),
@@ -362,7 +362,7 @@ mod tests {
         override_env.insert("NEW_VAR".to_string(), "new_value".to_string());
 
         let agent_config = ChatAgentConfig {
-            agent_server: Some(shared_types::ChatAgentServerConfig {
+            agent_server: Some(ChatAgentServerConfig {
                 env: Some(override_env),
                 ..Default::default()
             }),

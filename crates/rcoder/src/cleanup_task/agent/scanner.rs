@@ -189,10 +189,14 @@ impl AgentScanner {
                     );
                 }
                 Err(e) => {
+                    // gRPC 失败/超时 = agent 状态未知(典型:刚 OOM 由 restartPolicy 重启、
+                    // 进程未就绪;或瞬时网络抖动)。**不当 idle 清理**,本轮跳过,等下一轮重试。
+                    // 否则会误杀恢复中的 pod。
                     debug!(
-                        " [scanner] gRPC secondary confirmation failed, allowing cleanup: project_id={}, user_id={}, error={}",
+                        " [scanner] gRPC secondary confirmation FAILED (state unknown, skip cleanup this round): project_id={}, user_id={}, error={}",
                         project_id, user_id, e
                     );
+                    return false;
                 }
             }
         }

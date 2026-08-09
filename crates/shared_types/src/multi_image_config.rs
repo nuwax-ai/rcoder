@@ -22,6 +22,11 @@ fn is_compatible_service_key(service_key: &str, service_type: &ServiceType) -> b
             // ComputerAgentRunner 没有旧名称
             false
         }
+        ServiceType::UserApp | ServiceType::UserAppBuilder => {
+            // UserApp / UserAppBuilder 镜像由调用方/image_selector 提供,
+            // 不走多镜像配置选择,无旧名称兼容
+            false
+        }
     }
 }
 
@@ -66,6 +71,12 @@ pub enum ImageSelectionStrategy {
     ServiceOnly,
 }
 
+/// 镜像缓存默认过期时间（秒，1 小时）——各 crate 的 ttl 默认值单一来源
+pub const IMAGE_CACHE_DEFAULT_TTL_SECS: u64 = 3600;
+
+/// 镜像缓存默认最大条目数
+pub const IMAGE_CACHE_DEFAULT_MAX_ENTRIES: usize = 50;
+
 /// 镜像缓存配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageCacheConfig {
@@ -75,6 +86,16 @@ pub struct ImageCacheConfig {
     pub ttl_seconds: u64,
     /// 最大缓存条目数
     pub max_entries: usize,
+}
+
+impl Default for ImageCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl_seconds: IMAGE_CACHE_DEFAULT_TTL_SECS,
+            max_entries: IMAGE_CACHE_DEFAULT_MAX_ENTRIES,
+        }
+    }
 }
 
 /// 项目级镜像覆盖配置
@@ -193,6 +214,10 @@ impl MultiImageConfig {
             }
             ServiceType::ComputerAgentRunner => {
                 // ComputerAgentRunner 没有旧名称
+                None
+            }
+            ServiceType::UserApp | ServiceType::UserAppBuilder => {
+                // UserApp / UserAppBuilder 镜像由调用方/image_selector 提供,不走多镜像配置选择
                 None
             }
         }
@@ -325,11 +350,7 @@ impl Default for MultiImageConfig {
             },
             services,
             selection_strategy: ImageSelectionStrategy::ServiceOnly,
-            cache_config: ImageCacheConfig {
-                enabled: true,
-                ttl_seconds: 3600, // 1小时
-                max_entries: 50,   // 适合双服务的缓存大小
-            },
+            cache_config: ImageCacheConfig::default(), // 适合双服务的默认缓存参数
         }
     }
 }
@@ -392,6 +413,9 @@ impl ProjectImageOverrides {
     }
 
     /// 生成配置哈希键（用于缓存）
+    ///
+    /// 注意：使用 `DefaultHasher`，其输出**不保证跨 Rust 版本稳定**，故仅限
+    /// 进程内缓存 key 使用，不可作为持久化 key 或跨进程比对依据。
     pub fn hash_key(&self) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -478,11 +502,7 @@ pub fn create_legacy_multi_image_config(
         global_defaults,
         services,
         selection_strategy: ImageSelectionStrategy::ServiceOnly,
-        cache_config: ImageCacheConfig {
-            enabled: true,
-            ttl_seconds: 3600,
-            max_entries: 50,
-        },
+        cache_config: ImageCacheConfig::default(),
     }
 }
 
@@ -514,7 +534,7 @@ mod tests {
         let mut config = MultiImageConfig::default();
 
         // 为测试设置镜像配置
-        for (_, service_config) in config.services.iter_mut() {
+        for service_config in config.services.values_mut() {
             service_config.arm64_image = Some("test-image:arm64".to_string());
             service_config.amd64_image = Some("test-image:amd64".to_string());
         }
@@ -825,8 +845,8 @@ mod tests {
         let multi_config: MultiImageConfig = serde_yaml::from_value(multi_image_config.clone())
             .unwrap_or_else(|e| panic!("Failed to parse multi_image_config: {}", e));
 
-        // 验证服务数量
-        assert_eq!(multi_config.services.len(), 2);
+        // 验证服务数量(web-agent-runner + computer-agent-runner + user-app-builder)
+        assert_eq!(multi_config.services.len(), 3);
 
         // 验证 web-agent-runner 配置
         let web_config = multi_config
@@ -846,6 +866,14 @@ mod tests {
             computer_config.service_type,
             ServiceType::ComputerAgentRunner
         );
+
+        // 验证 user-app-builder 配置(路 B)
+        let builder_config = multi_config
+            .get_service_config(&ServiceType::UserAppBuilder)
+            .expect("user-app-builder config not found");
+        assert!(builder_config.image.is_some());
+        assert!(builder_config.enabled);
+        assert_eq!(builder_config.service_type, ServiceType::UserAppBuilder);
 
         // 验证配置有效
         assert!(multi_config.validate().is_ok());

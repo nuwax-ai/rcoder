@@ -22,7 +22,7 @@ use futures_util::Stream;
 use sha2::{Digest, Sha256};
 use shared_types::InstallType;
 use shared_types_grpc::{InstallAgentRequest, InstallAgentResponse};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::archive_installer;
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
@@ -300,15 +300,24 @@ pub async fn install_from_bytes(
     };
 
     // 只删除特定版本目录，不影响其他版本
-    if version_dir.exists() {
-        tokio::fs::remove_dir_all(&version_dir).await.ok();
+    if version_dir.exists()
+        && let Err(e) = tokio::fs::remove_dir_all(&version_dir).await
+    {
+        warn!(
+            "[agent_mgmt] failed to remove existing version_dir {}: {e}",
+            version_dir.display()
+        );
     }
     tokio::fs::create_dir_all(&version_dir).await?;
 
     let staging_ext = match file_type.as_str() {
         "tar.gz" => "tar.gz",
         "zip" => "zip",
-        other => unreachable!("file_type already validated, got: {other}"),
+        other => {
+            return Err(AgentMgmtError::InstallFailed(format!(
+                "unsupported file_type: {other}"
+            )));
+        }
     };
     let staging = version_dir.join(format!("staging.{staging_ext}"));
     tokio::fs::write(&staging, &bytes).await?;
@@ -406,7 +415,12 @@ pub async fn install_from_file(
     // 只删除特定版本目录，不影响其他版本
     if version_dir.exists() {
         debug!("[agent_mgmt] install_from_file: removing existing version_dir");
-        tokio::fs::remove_dir_all(&version_dir).await.ok();
+        if let Err(e) = tokio::fs::remove_dir_all(&version_dir).await {
+            warn!(
+                "[agent_mgmt] failed to remove existing version_dir {}: {e}",
+                version_dir.display()
+            );
+        }
         info!(
             "[agent_mgmt] install_from_file: remove_dir_all took {:?}",
             t1.elapsed()
@@ -417,7 +431,11 @@ pub async fn install_from_file(
     let staging_ext = match file_type.as_str() {
         "tar.gz" => "tar.gz",
         "zip" => "zip",
-        other => unreachable!("file_type already validated, got: {other}"),
+        other => {
+            return Err(AgentMgmtError::InstallFailed(format!(
+                "unsupported file_type: {other}"
+            )));
+        }
     };
     let staging = version_dir.join(format!("staging.{staging_ext}"));
     // rename（同文件系统零拷贝）或 copy（跨文件系统降级）
@@ -425,7 +443,13 @@ pub async fn install_from_file(
     if tokio::fs::rename(download_path, &staging).await.is_err() {
         debug!("[agent_mgmt] install_from_file: rename failed, falling back to copy");
         tokio::fs::copy(download_path, &staging).await?;
-        let _ = tokio::fs::remove_file(download_path).await;
+        if let Err(e) = tokio::fs::remove_file(download_path).await {
+            warn!(
+                "[agent_mgmt] install_from_file: failed to remove source after copy fallback: path={}, error={}",
+                download_path.display(),
+                e
+            );
+        }
     }
     debug!(
         "[agent_mgmt] install_from_file: staging file ready, took {:?}",
@@ -509,14 +533,24 @@ async fn _install_from_staging(
         let count = match file_type_clone.as_str() {
             "tar.gz" => archive_installer::extract_tar_gz(&staging_clone, &agent_dir_clone)?,
             "zip" => archive_installer::extract_zip(&staging_clone, &agent_dir_clone)?,
-            _ => unreachable!(),
+            _ => {
+                return Err(AgentMgmtError::InstallFailed(
+                    "unsupported file_type".to_string(),
+                ));
+            }
         };
         debug!(
             "[agent_mgmt] extraction done: {} files, took {:?}",
             count,
             t_extract.elapsed()
         );
-        let _ = std::fs::remove_file(&staging_clone);
+        if let Err(e) = std::fs::remove_file(&staging_clone) {
+            warn!(
+                "[agent_mgmt] failed to remove staging archive after extraction: path={}, error={}",
+                staging_clone.display(),
+                e
+            );
+        }
 
         // 剥掉单个顶层目录包装（如 deepagents-dev-templates-0.2.9/）
         archive_installer::normalize_extracted_dir(&agent_dir_clone)?;
@@ -609,7 +643,7 @@ async fn _install_from_staging(
         status: shared_types_grpc::AgentInstallStatus::Available as i32,
         binary_path: binary_path_str,
         file_type,
-        file_count: Some(file_count as i32),
+        file_count: Some(file_count.try_into().unwrap_or(i32::MAX)),
         file_size: file_size as i64,
         version: param_version.map(String::from),
         source_url: param_source.map(String::from),

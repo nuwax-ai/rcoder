@@ -60,6 +60,19 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
         let app_multi_config = docker_config.get_multi_image_config();
         default_config.multi_image_config = app_multi_config;
 
+        // K8s 运行时专用配置(docker 模式不读;K8s 模式从 config.yml 的 kubernetes_config 段取)
+        default_config.kubernetes_config = config.kubernetes_config.clone().unwrap_or_default();
+        if !default_config.kubernetes_config.services.is_empty() {
+            info!(
+                "[K8S] loaded kubernetes_config from config.yml: {} service(s), registry_prefix={:?}",
+                default_config.kubernetes_config.services.len(),
+                default_config
+                    .kubernetes_config
+                    .global_defaults
+                    .registry_prefix
+            );
+        }
+
         default_config.auto_cleanup = docker_config
             .auto_cleanup
             .unwrap_or(default_config.auto_cleanup);
@@ -107,7 +120,18 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
         default_config
     } else {
         info!(" no Docker config, using default config");
-        docker_manager::DockerManagerConfig::default()
+        // 即使无 docker_config,K8s 模式仍可能独立提供 kubernetes_config
+        let k8s_cfg = config.kubernetes_config.clone().unwrap_or_default();
+        if !k8s_cfg.services.is_empty() {
+            info!(
+                "[K8S] loaded kubernetes_config (no docker_config branch): {} service(s)",
+                k8s_cfg.services.len()
+            );
+        }
+        docker_manager::DockerManagerConfig {
+            kubernetes_config: k8s_cfg,
+            ..Default::default()
+        }
     }
 }
 
@@ -205,7 +229,7 @@ pub async fn startup_cleanup(config: &AppConfig) {
     }
 }
 
-pub fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(String, String)> {
+pub async fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(String, String)> {
     let docker_config = config
         .docker_config
         .as_ref()
@@ -213,25 +237,19 @@ pub fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(String, Str
     let multi_config = docker_config.get_multi_image_config();
     let selector = docker_manager::image_selector::ImageSelector::new(multi_config);
 
-    let (container_prefix_rcoder, container_prefix_computer) = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            let rcoder_prefix = selector
-                .get_service_config(&shared_types::ServiceType::WebAgentRunner)
-                .await
-                .expect("Failed to get RCoder service config")
-                .container_prefix()
-                .to_string();
-            let computer_prefix = selector
-                .get_service_config(&shared_types::ServiceType::ComputerAgentRunner)
-                .await
-                .expect("Failed to get ComputerAgentRunner service config")
-                .container_prefix()
-                .to_string();
-            (rcoder_prefix, computer_prefix)
-        })
-    });
+    let rcoder_cfg = selector
+        .get_service_config(&shared_types::ServiceType::WebAgentRunner)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get RCoder service config: {e}"))?;
+    let computer_cfg = selector
+        .get_service_config(&shared_types::ServiceType::ComputerAgentRunner)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get ComputerAgentRunner service config: {e}"))?;
 
-    Ok((container_prefix_rcoder, container_prefix_computer))
+    Ok((
+        rcoder_cfg.container_prefix().to_string(),
+        computer_cfg.container_prefix().to_string(),
+    ))
 }
 
 fn show_docker_configuration_help(socket_path: &str) {

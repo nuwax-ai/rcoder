@@ -1,0 +1,11 @@
+{
+  "name": "canvas-sync-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Canvas-based bidirectional browser sync POC (CDP screencast + Input relay)",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "puppeteer-core": "25.2.1",
+    "ws": "8.18.0"
+  }
+}

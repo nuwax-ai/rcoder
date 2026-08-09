@@ -6,6 +6,7 @@
 //! - RAII 清理（移除 project 时自动销毁无引用的容器）
 
 mod adapter;
+mod adapter_container_ops;
 mod resource_reaper;
 mod types;
 

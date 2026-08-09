@@ -135,7 +135,9 @@ impl App {
         let exit_code = self.run_inner().await;
 
         // 恢复终端
-        let _ = terminal::restore();
+        if let Err(e) = terminal::restore() {
+            eprintln!("恢复终端失败: {}", e);
+        }
 
         // Abort 任何残留的 submit task
         if let Some(handle) = self.submit_task.take() {
@@ -376,13 +378,25 @@ impl App {
                             Ok(Event::Key(key)) => {
                                 // 使用 try_send 避免在同步上下文中阻塞
                                 // channel 满时丢弃事件（保持轮询不退出）
-                                let _ = tx.try_send(AppEvent::Key(key));
+                                if let Err(e) = tx.try_send(AppEvent::Key(key)) {
+                                    tracing::warn!(
+                                        "ui event send failed (receiver gone / channel full): {e}"
+                                    );
+                                }
                             }
                             Ok(Event::Resize(_, _)) => {
-                                let _ = tx.try_send(AppEvent::Resize);
+                                if let Err(e) = tx.try_send(AppEvent::Resize) {
+                                    tracing::warn!(
+                                        "ui event send failed (receiver gone / channel full): {e}"
+                                    );
+                                }
                             }
                             Ok(Event::Paste(text)) => {
-                                let _ = tx.try_send(AppEvent::Paste(text));
+                                if let Err(e) = tx.try_send(AppEvent::Paste(text)) {
+                                    tracing::warn!(
+                                        "ui event send failed (receiver gone / channel full): {e}"
+                                    );
+                                }
                             }
                             Ok(_) => {} // 忽略其他事件（mouse 等）
                             Err(_) => break,
@@ -395,7 +409,9 @@ impl App {
             // Poller 退出（通常是终端错误）→ 发送 Exit 防止应用挂死
             // Exit 是关键事件，必须送达：使用 blocking_send 等待空间
             // 在 spawn_blocking 上下文中 blocking_send 会阻塞当前线程（不影响 tokio runtime）
-            let _ = tx.blocking_send(AppEvent::Exit);
+            if let Err(e) = tx.blocking_send(AppEvent::Exit) {
+                tracing::warn!("ui event send failed (receiver gone): {e}");
+            }
         });
     }
 
@@ -515,8 +531,9 @@ impl App {
             KeyCode::Esc => {
                 if let Some(overlay) = self.permission_overlay.take()
                     && let Some(tx) = overlay.response_tx
+                    && let Err(e) = tx.send(None)
                 {
-                    let _ = tx.send(None);
+                    tracing::warn!("oneshot send failed (receiver gone): {e:?}");
                 }
             }
 
@@ -527,8 +544,10 @@ impl App {
                         .options
                         .get(overlay.selected_index)
                         .map(|o| o.id.clone());
-                    if let Some(tx) = overlay.response_tx.take() {
-                        let _ = tx.send(option_id);
+                    if let Some(tx) = overlay.response_tx.take()
+                        && let Err(e) = tx.send(option_id)
+                    {
+                        tracing::warn!("oneshot send failed (receiver gone): {e:?}");
                     }
                 }
             }
@@ -541,8 +560,9 @@ impl App {
                         let option_id = overlay.options[idx - 1].id.clone();
                         if let Some(mut overlay) = self.permission_overlay.take()
                             && let Some(tx) = overlay.response_tx.take()
+                            && let Err(e) = tx.send(Some(option_id))
                         {
-                            let _ = tx.send(Some(option_id));
+                            tracing::warn!("oneshot send failed (receiver gone): {e:?}");
                         }
                     }
                 }
@@ -671,7 +691,9 @@ impl App {
         let tx = self.event_tx.clone();
 
         tokio::spawn(async move {
-            let _ = client.cancel().await;
+            if let Err(e) = client.cancel().await {
+                tracing::warn!("agent cancel request failed: {e}");
+            }
             // 无论 cancel 成功还是超时，都发送 ResetWaiting 作为兜底
             drop(tx.send(AppEvent::ResetWaiting(cancel_gen)));
         });

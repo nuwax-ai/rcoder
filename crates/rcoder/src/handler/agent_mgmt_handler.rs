@@ -331,7 +331,7 @@ fn read_registry_from_file(
         )
     })?;
 
-    let manifests: Vec<crate::agent_download::registry_update::AgentManifest> =
+    let manifests: Vec<agent_provisioning::AgentManifest> =
         serde_json::from_str(&data).map_err(|e| {
             AppError::with_message(
                 ec::ERR_INTERNAL_SERVER_ERROR,
@@ -344,9 +344,9 @@ fn read_registry_from_file(
         .map(|m| shared_types::AgentInfo {
             agent_id: m.agent_id,
             install_type: match m.install_type.as_str() {
-                "npm" => shared_types::InstallType::Npm,
-                "url" => shared_types::InstallType::Url,
-                _ => shared_types::InstallType::Binary,
+                "npm" => InstallType::Npm,
+                "url" => InstallType::Url,
+                _ => InstallType::Binary,
             },
             status: shared_types::AgentInstallStatus::Available,
             version: m.version,
@@ -572,7 +572,7 @@ pub async fn install_agent(
                         file.write_all(&chunk)
                             .map_err(|e| std::io::Error::other(format!("write: {e}")))?;
                     }
-                    file.flush().ok();
+                    file.flush()?;
                     drop(file);
                     // 读回 bytes,然后 tmp_path drop 时自动清理临时文件
                     let bytes = std::fs::read(&tmp_path)?;
@@ -666,7 +666,7 @@ pub async fn install_agent(
 
     // 3. 构造 forward 参数
     let params = InstallAgentParams {
-        agent: shared_types::AgentIdentity {
+        agent: AgentIdentity {
             agent_id: meta.agent.agent_id.clone(),
             command: meta.agent.command.clone(),
             args: meta.agent.args.clone(),
@@ -792,8 +792,8 @@ pub async fn install_from_url(
         .as_deref()
         .ok_or_else(|| AppError::with_message(ec::ERR_VALIDATION, "version is required"))?;
 
-    let (download_result, platform_key) = super::agent_install_strategy::do_install_from_url(
-        &state,
+    let (download_result, platform_key) = agent_provisioning::install_agent(
+        &state.agent_download_manager,
         &body.agent.agent_id,
         version,
         &body.agent.command,

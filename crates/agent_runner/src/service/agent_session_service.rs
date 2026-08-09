@@ -64,7 +64,10 @@ pub struct AgentSessionService {
 }
 
 impl AgentSessionService {
-    pub fn new(model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>) -> Self {
+    pub fn new(
+        model_env_resolver: Arc<dyn ModelRuntimeEnvResolver>,
+        acp_session_create_timeout_secs: u64,
+    ) -> Self {
         let session_manager = Arc::new(AcpSessionManager::<
             StateAwareNotifier<AgentSessionRegistry>,
             AgentSessionRegistry,
@@ -77,7 +80,7 @@ impl AgentSessionService {
         ));
 
         Self {
-            worker: AcpAgentWorker::new(session_manager),
+            worker: AcpAgentWorker::new(session_manager, acp_session_create_timeout_secs),
         }
     }
 
@@ -186,6 +189,8 @@ impl AgentSessionService {
                     project_id, response_session_id
                 );
 
+                // watcher 随进程退出被内核回收（agent_runner 收到 SIGTERM 直接 process::exit，
+                // 见 shutdown.rs；PID 1 SIGNAL_UNKILLABLE 故无进程级优雅 token 可接入）。
                 spawn_lifecycle_watcher(
                     project_id.clone(),
                     response_session_id.clone(),
@@ -219,12 +224,18 @@ fn spawn_lifecycle_watcher(
     lifecycle_handle: Option<Arc<dyn shared_types::AgentLifecycle>>,
 ) {
     tokio::spawn(async move {
+        // 等待 Agent 生命周期结束（进程级 shutdown 由 SIGTERM→process::exit 直接终止进程，
+        // watcher 随进程回收，故不再保留不可达的 shutdown 分支）。
         if let Some(lifecycle) = lifecycle_handle {
             info!(
                 "🔄 [SACP] 新会话：等待 Agent 生命周期 - project_id={}, session_id={}",
                 project_id, session_id
             );
             lifecycle.cancellation_token().cancelled().await;
+            info!(
+                "[SACP] Agent lifecycle ended naturally: project_id={}, session_id={}",
+                project_id, session_id
+            );
         } else {
             warn!(
                 "⚠️ [SACP] 新会话缺少 lifecycle_handle - project_id={}",

@@ -8,12 +8,19 @@ use std::collections::HashMap;
 
 /// 容器路径模板的默认值
 fn default_container_path_template() -> String {
-    "/app/project_workspace/{project_id}".to_string()
+    std::path::PathBuf::from(crate::paths::WORKSPACE_ROOT)
+        .join("{project_id}")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Computer Agent Runner 容器路径模板的默认值
 fn default_computer_agent_runner_container_path_template() -> String {
-    "/app/computer-project-workspace/{user_id}/{project_id}".to_string()
+    std::path::PathBuf::from(crate::paths::COMPUTER_WORKSPACE_ROOT)
+        .join("{user_id}")
+        .join("{project_id}")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// 容器工作目录的默认值
@@ -79,6 +86,10 @@ pub struct ServiceImageConfig {
     ///   - ComputerAgentRunner: "/app/computer-project-workspace/{user_id}/{project_id}" → "/app/computer-project-workspace"
     #[serde(default)]
     pub workspace_resolution_path: Option<String>,
+    /// 容器安全配置（可选）。仅 Docker 部署模式透传到 bollard HostConfig；
+    /// 未配置（None）时走代码默认（privileged=false + cap_drop=[NET_RAW,NET_ADMIN]）。
+    #[serde(default)]
+    pub security: Option<ServiceSecurityConfig>,
 }
 
 /// 服务挂载点配置
@@ -112,34 +123,101 @@ pub struct ServiceMountConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceResourceLimits {
     /// 内存限制（字节，支持浮点数输入）
-    pub memory_limit: Option<f64>,
-    /// CPU 限制（核心数）
-    pub cpu_limit: Option<f64>,
-    /// 交换空间限制（字节，支持浮点数输入）
-    pub swap_limit: Option<f64>,
+    ///
+    /// 注：字段名 `memory`（对齐 /computer/pod/ensure 基准）；serde alias `memory_limit`
+    /// 兼容旧 config.yml 键名与旧 HTTP 请求，反序列化两种写法都接受。
+    #[serde(alias = "memory_limit")]
+    pub memory: Option<f64>,
+    /// CPU 限制（核心数）。alias `cpu_limit` 兼容旧命名。
+    #[serde(alias = "cpu_limit")]
+    pub cpu: Option<f64>,
+    /// 交换空间限制（字节，支持浮点数输入）。alias `swap_limit` 兼容旧命名。
+    #[serde(alias = "swap_limit")]
+    pub swap: Option<f64>,
     /// PVC 存储空间大小（仅 K8s 模式生效，Docker 模式忽略）
     ///
     /// 格式：`<数字><单位>`，支持 Mi/Gi/Ti（二进制）和 M/G/T（十进制）
-    /// 范围：最小 1Gi，最大 100Ti，默认 50Gi
+    /// 范围：最小 1Gi，最大 100Ti，默认 10Gi
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_size: Option<String>,
+    /// 临时存储限制（overlay 可写层，仅 K8s 模式生效）
+    ///
+    /// 限制容器根文件系统可写层 + emptyDir 等临时存储的写入量（区别于 storage_size 管 PVC）。
+    /// 与 storage_size 是两个独立配额，不会合并；格式同 storage_size；未指定时回退到 storage_size 的值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_storage_limit: Option<String>,
+}
+
+/// 服务容器的安全配置（可选）。仅 Docker 部署模式透传到 bollard HostConfig。
+///
+/// 字段语义与 Docker `HostConfig` / docker-compose.yml 一致，运维可直接照搬 compose 写法。
+/// 合并语义（在 docker_manager 的 `build_host_config` 中应用）：
+/// - `ServiceImageConfig.security = None`（未配置 security 块）→ 完全走代码默认逻辑
+///   （`privileged=false` + `cap_drop=[NET_RAW,NET_ADMIN]`，受 `ebpf-debug` feature 影响）。
+/// - `security = Some`（配置了 security 块）→ 该配置覆盖一切（含 `ebpf-debug`）；
+///   块内每个字段 `Some(x)` 用 x，字段未写（`None`）回退到该字段的内置默认。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ServiceSecurityConfig {
+    /// 是否以特权模式运行（默认 false）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub privileged: Option<bool>,
+    /// 要添加的内核 capabilities，如 ["SYS_PTRACE"]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cap_add: Option<Vec<String>>,
+    /// 要移除的内核 capabilities；显式配置则整体覆盖默认 ["NET_RAW","NET_ADMIN"]（写 `[]` 表示不 drop 任何 cap）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cap_drop: Option<Vec<String>>,
+    /// Docker security_opt，如 ["seccomp=unconfined","apparmor=unconfined"]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_opt: Option<Vec<String>>,
+    /// 进程数限制；`0` 或 `-1` 表示无限制
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<i64>,
+    /// 是否在容器内运行 init 进程（转发信号 + 回收僵尸进程）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub init: Option<bool>,
 }
 
 impl ServiceResourceLimits {
+    /// 构造资源限制配置
+    ///
+    /// 所有参数均为 `Option`，未限制的资源传 `None`。
+    /// - K8s 模式下 `storage_size` 管 PVC，`ephemeral_storage_limit` 管 overlay 可写层（未指定时回退到 `storage_size`）
+    /// - Docker 模式忽略 `storage_size` / `ephemeral_storage_limit`
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        memory: Option<f64>,
+        cpu: Option<f64>,
+        swap: Option<f64>,
+        storage_size: Option<String>,
+        ephemeral_storage_limit: Option<String>,
+    ) -> Self {
+        Self {
+            memory,
+            cpu,
+            swap,
+            storage_size,
+            ephemeral_storage_limit,
+        }
+    }
+
     /// 验证资源限制的合理性
     pub fn validate(&self) -> Result<(), String> {
-        // 内存限制：512MB ~ 64GB
-        if let Some(memory) = self.memory_limit {
-            if memory < 512_000_000.0 {
+        // 内存限制（bytes）。阈值用十进制 MB/GB（与 Docker/K8s quantity 习惯一致，
+        // 非 MiB/GiB；512×10⁶ 而非 512×2²⁰）：512MB ~ 64GB
+        const MIN_MEMORY_BYTES: f64 = 512_000_000.0;
+        const MAX_MEMORY_BYTES: f64 = 64_000_000_000.0;
+        if let Some(memory) = self.memory {
+            if memory < MIN_MEMORY_BYTES {
                 return Err("memory_limit must be at least 512MB".to_string());
             }
-            if memory > 64_000_000_000.0 {
+            if memory > MAX_MEMORY_BYTES {
                 return Err("memory_limit cannot exceed 64GB".to_string());
             }
         }
 
         // CPU 限制：0.5 ~ 32 核
-        if let Some(cpu) = self.cpu_limit {
+        if let Some(cpu) = self.cpu {
             if cpu < 0.5 {
                 return Err("cpu_limit must be at least 0.5 cores".to_string());
             }
@@ -148,12 +226,10 @@ impl ServiceResourceLimits {
             }
         }
 
-        // Swap 应该 >= 内存
-        if let (Some(memory), Some(swap)) = (self.memory_limit, self.swap_limit)
-            && swap < memory
-        {
-            return Err("swap_limit should be >= memory_limit".to_string());
-        }
+        // 注:swap 与 memory 的关系校验已移除——改为在 resolve 阶段由
+        // [`ServiceResourceLimits::normalize_swap`] 自动规整(swap < memory 时
+        // 上调到 memory × 2),避免上游误传 swap<memory 直接阻塞业务。
+        // 详见该函数文档。
 
         Ok(())
     }
@@ -161,14 +237,42 @@ impl ServiceResourceLimits {
     /// 合并资源限制（override_limits 覆盖 self 中的字段）
     pub fn merge_with(&self, override_limits: &ServiceResourceLimits) -> Self {
         Self {
-            memory_limit: override_limits.memory_limit.or(self.memory_limit),
-            cpu_limit: override_limits.cpu_limit.or(self.cpu_limit),
-            swap_limit: override_limits.swap_limit.or(self.swap_limit),
+            memory: override_limits.memory.or(self.memory),
+            cpu: override_limits.cpu.or(self.cpu),
+            swap: override_limits.swap.or(self.swap),
             storage_size: override_limits
                 .storage_size
                 .clone()
                 .or_else(|| self.storage_size.clone()),
+            ephemeral_storage_limit: override_limits
+                .ephemeral_storage_limit
+                .clone()
+                .or_else(|| self.ephemeral_storage_limit.clone()),
         }
+    }
+
+    /// 规整 swap 上限:若 `swap < memory`,自动上调到 `memory × 2`。
+    ///
+    /// # 背景
+    /// cgroup `memory.memsw.limit`(Docker `--memory-swap`、K8s 同义)是
+    /// **memory + swap 的总和**,语义上必须 ≥ memory。上游(如 Backend)偶尔会误传
+    /// `swap < memory`(典型场景:把 swap 按核数 `perUserCpuCores × 1GiB` 估算,
+    /// 而 memory 按 `perUserMemoryGB × 1GiB` 估算,当核数 < 内存 GB 数时 swap 反而更小)。
+    /// 与其在 validate 阶段硬性拒绝阻塞业务,这里按 `memory × 2` 兜底——既满足
+    /// cgroup 约束,又留出 1×memory 的交换空间。
+    ///
+    /// 仅在 memory 与 swap 均 `Some` 且 `swap < memory` 时生效;其余情况原样返回。
+    ///
+    /// # 返回
+    /// `(规整后的 Self, 是否发生了修正)` —— 调用方据 `bool` 决定是否打 warn 日志。
+    pub fn normalize_swap(mut self) -> (Self, bool) {
+        if let (Some(memory), Some(swap)) = (self.memory, self.swap)
+            && swap < memory
+        {
+            self.swap = Some(memory * 2.0);
+            return (self, true);
+        }
+        (self, false)
     }
 }
 
@@ -354,8 +458,14 @@ impl ServiceImageConfig {
         self.workspace_resolution_path
             .clone()
             .unwrap_or_else(|| match self.service_type {
-                ServiceType::WebAgentRunner => "/app/project_workspace".to_string(),
-                ServiceType::ComputerAgentRunner => "/app/computer-project-workspace".to_string(),
+                ServiceType::WebAgentRunner => crate::paths::WORKSPACE_ROOT.to_string(),
+                ServiceType::ComputerAgentRunner => {
+                    crate::paths::COMPUTER_WORKSPACE_ROOT.to_string()
+                }
+                // UserApp 复用 rcoder-workspace PVC 的 apps subPath（部署侧挂到 /app/app-workspace）
+                ServiceType::UserApp => "/app/app-workspace".to_string(),
+                // UserAppBuilder: per-app PVC(`rcoder-app-{app_id}-workspace`)挂载点
+                ServiceType::UserAppBuilder => "/app/userapp-workspace".to_string(),
             })
     }
 
@@ -394,10 +504,7 @@ impl ServiceImageConfig {
     /// - 变量: `{"project_id": "123"}`
     /// - 输出: `/app/project_workspace/123`
     ///
-    pub fn resolve_container_path(
-        &self,
-        variables: &std::collections::HashMap<String, String>,
-    ) -> String {
+    pub fn resolve_container_path(&self, variables: &HashMap<String, String>) -> String {
         let mut resolved = self.container_path_template.clone();
         for (key, value) in variables {
             resolved = resolved.replace(&format!("{{{}}}", key), value);
@@ -475,12 +582,13 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
     ];
 
     // 默认资源限制
-    let resource_limits = ServiceResourceLimits {
-        memory_limit: Some(2_000_000_000.0), // 2GB
-        cpu_limit: Some(2.0),                // 2 核
-        swap_limit: Some(4_000_000_000.0),   // 4GB
-        storage_size: None,                  // K8s 模式下使用默认值 10Gi
-    };
+    let resource_limits = ServiceResourceLimits::new(
+        Some(2_000_000_000.0), // 2GB
+        Some(2.0),             // 2 核
+        Some(4_000_000_000.0), // 4GB
+        None, // storage_size: 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
+        None, // ephemeral_storage_limit: 回退到 storage_size
+    );
 
     ServiceImageConfig {
         service_type: ServiceType::WebAgentRunner,
@@ -499,6 +607,7 @@ pub fn default_rcoder_service_config() -> ServiceImageConfig {
         network_mode: "bridge".to_string(),
         container_path_template: default_container_path_template(),
         workspace_resolution_path: None,
+        security: None,
     }
 }
 
@@ -530,12 +639,13 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
     ];
 
     // 默认资源限制（ComputerAgentRunner 可能需要更多资源）
-    let resource_limits = ServiceResourceLimits {
-        memory_limit: Some(4_000_000_000.0), // 4GB
-        cpu_limit: Some(3.0),                // 3 核
-        swap_limit: Some(8_000_000_000.0),   // 8GB
-        storage_size: None,                  // K8s 模式下使用默认值 10Gi
-    };
+    let resource_limits = ServiceResourceLimits::new(
+        Some(4_000_000_000.0), // 4GB
+        Some(3.0),             // 3 核
+        Some(8_000_000_000.0), // 8GB
+        None, // storage_size: 由 k8s_pvc.rs DEFAULT_PVC_STORAGE_SIZE 兜底(当前 10Gi)
+        None, // ephemeral_storage_limit: 回退到 storage_size
+    );
 
     ServiceImageConfig {
         service_type: ServiceType::ComputerAgentRunner,
@@ -554,12 +664,89 @@ pub fn default_agent_runner_service_config() -> ServiceImageConfig {
         network_mode: "bridge".to_string(),
         container_path_template: default_computer_agent_runner_container_path_template(),
         workspace_resolution_path: None,
+        security: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ServiceSecurityConfig 反序列化：未配置字段应为 None
+    #[test]
+    fn test_security_config_deserialize() {
+        let json = r#"{"privileged":true,"cap_add":["SYS_PTRACE"],"security_opt":["seccomp=unconfined"],"pids_limit":200}"#;
+        let sec: ServiceSecurityConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(sec.privileged, Some(true));
+        assert_eq!(sec.cap_add, Some(vec!["SYS_PTRACE".to_string()]));
+        assert_eq!(
+            sec.security_opt,
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+        assert_eq!(sec.pids_limit, Some(200));
+        assert_eq!(sec.cap_drop, None);
+        assert_eq!(sec.init, None);
+    }
+
+    /// 默认服务配置（代码内构造）security 必须为 None —— 不改变现有默认行为
+    #[test]
+    fn test_default_service_config_security_is_none() {
+        assert!(default_agent_runner_service_config().security.is_none());
+        assert!(default_rcoder_service_config().security.is_none());
+    }
+
+    /// ServiceImageConfig 带 security 的 round-trip：验证 security 字段 serde 贯通
+    #[test]
+    fn test_service_image_config_security_roundtrip() {
+        let mut cfg = default_agent_runner_service_config();
+        cfg.security = Some(ServiceSecurityConfig {
+            privileged: Some(false),
+            cap_add: Some(vec!["SYS_PTRACE".to_string()]),
+            cap_drop: None,
+            security_opt: Some(vec!["seccomp=unconfined".to_string()]),
+            pids_limit: None,
+            init: None,
+        });
+        let json = serde_json::to_string(&cfg).unwrap();
+        let cfg2: ServiceImageConfig = serde_json::from_str(&json).unwrap();
+        let sec = cfg2.security.expect("security preserved after roundtrip");
+        assert_eq!(sec.cap_add, Some(vec!["SYS_PTRACE".to_string()]));
+        assert_eq!(
+            sec.security_opt,
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+    }
+
+    /// serde alias 兼容：旧字段名（memory_limit/cpu_limit/swap_limit）经 alias 反序列化到
+    /// 新字段（memory/cpu/swap）。保证 config.yml 旧键名 + 旧 HTTP 请求不破坏。
+    #[test]
+    fn test_resource_limits_serde_alias() {
+        // 旧字段名（config.yml 现状）经 alias 解析到新字段
+        let json_old = r#"{"memory_limit":1e9,"cpu_limit":2.0,"swap_limit":2e9}"#;
+        let limits_old: ServiceResourceLimits = serde_json::from_str(json_old).unwrap();
+        assert_eq!(limits_old.memory, Some(1e9));
+        assert_eq!(limits_old.cpu, Some(2.0));
+        assert_eq!(limits_old.swap, Some(2e9));
+
+        // 新字段名直接解析
+        let json_new = r#"{"memory":1e9,"cpu":2.0,"swap":2e9}"#;
+        let limits_new: ServiceResourceLimits = serde_json::from_str(json_new).unwrap();
+        assert_eq!(limits_new.memory, Some(1e9));
+        assert_eq!(limits_new.cpu, Some(2.0));
+        assert_eq!(limits_new.swap, Some(2e9));
+
+        // 序列化用新字段名（不带 _limit）
+        let s = serde_json::to_string(&limits_old).unwrap();
+        assert!(
+            s.contains("\"memory\""),
+            "serialized should use new field name: {s}"
+        );
+        assert!(
+            !s.contains("memory_limit"),
+            "serialized should not use alias: {s}"
+        );
+    }
+
     #[test]
     fn test_config_validation() {
         let mut config = default_rcoder_service_config();
@@ -620,16 +807,12 @@ mod tests {
             }],
             command: vec![],
             entrypoint: None,
-            resource_limits: ServiceResourceLimits {
-                memory_limit: None,
-                cpu_limit: None,
-                swap_limit: None,
-                storage_size: None,
-            },
+            resource_limits: ServiceResourceLimits::new(None, None, None, None, None),
             work_dir: "/app".to_string(),
             network_mode: "bridge".to_string(),
             container_path_template: "/app/project_workspace/{project_id}".to_string(),
             workspace_resolution_path: None,
+            security: None,
         };
 
         for mount in &config_with_mounts.mounts {
@@ -728,10 +911,11 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_valid() {
         let valid = ServiceResourceLimits {
-            memory_limit: Some(1_000_000_000.0), // 1GB
-            cpu_limit: Some(2.0),
-            swap_limit: Some(2_000_000_000.0), // 2GB
+            memory: Some(1_000_000_000.0), // 1GB
+            cpu: Some(2.0),
+            swap: Some(2_000_000_000.0), // 2GB
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(valid.validate().is_ok());
     }
@@ -739,10 +923,11 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_small() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(256_000_000.0), // 256MB - 太小
-            cpu_limit: None,
-            swap_limit: None,
+            memory: Some(256_000_000.0), // 256MB - 太小
+            cpu: None,
+            swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(invalid.validate().is_err());
         assert!(invalid.validate().unwrap_err().contains("at least 512MB"));
@@ -751,10 +936,11 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_memory_too_large() {
         let invalid = ServiceResourceLimits {
-            memory_limit: Some(100_000_000_000.0), // 100GB - 太大
-            cpu_limit: None,
-            swap_limit: None,
+            memory: Some(100_000_000_000.0), // 100GB - 太大
+            cpu: None,
+            swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -768,10 +954,11 @@ mod tests {
     #[test]
     fn test_resource_limits_validation_invalid_cpu_too_small() {
         let invalid = ServiceResourceLimits {
-            memory_limit: None,
-            cpu_limit: Some(0.1), // 太小
-            swap_limit: None,
+            memory: None,
+            cpu: Some(0.1), // 太小
+            swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
         assert!(invalid.validate().is_err());
         assert!(
@@ -783,66 +970,84 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_limits_validation_invalid_swap_less_than_memory() {
-        let invalid = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0), // 2GB
-            cpu_limit: None,
-            swap_limit: Some(1_000_000_000.0), // 1GB - swap < memory
+    fn test_resource_limits_normalize_swap_less_than_memory() {
+        // swap < memory 不再导致 validate 失败(已改为自动规整)
+        let rl = ServiceResourceLimits {
+            memory: Some(2_000_000_000.0), // 2GB
+            cpu: None,
+            swap: Some(1_000_000_000.0), // 1GB < memory
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
-        assert!(invalid.validate().is_err());
-        assert!(
-            invalid
-                .validate()
-                .unwrap_err()
-                .contains("should be >= memory_limit")
-        );
+        assert!(rl.validate().is_ok());
+
+        // normalize_swap:swap < memory → swap = memory × 2
+        let (fixed, changed) = rl.normalize_swap();
+        assert!(changed);
+        assert_eq!(fixed.swap, Some(4_000_000_000.0));
+        assert_eq!(fixed.memory, Some(2_000_000_000.0)); // memory 不变
+
+        // swap >= memory 时不修正
+        let ok = ServiceResourceLimits {
+            memory: Some(2_000_000_000.0),
+            cpu: None,
+            swap: Some(4_000_000_000.0),
+            storage_size: None,
+            ephemeral_storage_limit: None,
+        };
+        let (same, changed2) = ok.normalize_swap();
+        assert!(!changed2);
+        assert_eq!(same.swap, Some(4_000_000_000.0));
     }
 
     #[test]
     fn test_resource_limits_merge() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0), // 2GB
-            cpu_limit: Some(2.0),
-            swap_limit: Some(4_000_000_000.0), // 4GB
+            memory: Some(2_000_000_000.0), // 2GB
+            cpu: Some(2.0),
+            swap: Some(4_000_000_000.0), // 4GB
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
 
         let override_limits = ServiceResourceLimits {
-            memory_limit: Some(4_000_000_000.0), // 覆盖：4GB
-            cpu_limit: None,                     // 不覆盖
-            swap_limit: Some(8_000_000_000.0),   // 覆盖：8GB
+            memory: Some(4_000_000_000.0), // 覆盖：4GB
+            cpu: None,                     // 不覆盖
+            swap: Some(8_000_000_000.0),   // 覆盖：8GB
             storage_size: Some("20Gi".to_string()),
+            ephemeral_storage_limit: None,
         };
 
         let merged = default_limits.merge_with(&override_limits);
-        assert_eq!(merged.memory_limit, Some(4_000_000_000.0));
-        assert_eq!(merged.cpu_limit, Some(2.0)); // 保留默认
-        assert_eq!(merged.swap_limit, Some(8_000_000_000.0));
+        assert_eq!(merged.memory, Some(4_000_000_000.0));
+        assert_eq!(merged.cpu, Some(2.0)); // 保留默认
+        assert_eq!(merged.swap, Some(8_000_000_000.0));
         assert_eq!(merged.storage_size, Some("20Gi".to_string()));
     }
 
     #[test]
     fn test_resource_limits_merge_all_none() {
         let default_limits = ServiceResourceLimits {
-            memory_limit: Some(2_000_000_000.0), // 2GB
-            cpu_limit: Some(2.0),
-            swap_limit: Some(4_000_000_000.0), // 4GB
+            memory: Some(2_000_000_000.0), // 2GB
+            cpu: Some(2.0),
+            swap: Some(4_000_000_000.0), // 4GB
             storage_size: Some("10Gi".to_string()),
+            ephemeral_storage_limit: None,
         };
 
         let override_limits = ServiceResourceLimits {
-            memory_limit: None,
-            cpu_limit: None,
-            swap_limit: None,
+            memory: None,
+            cpu: None,
+            swap: None,
             storage_size: None,
+            ephemeral_storage_limit: None,
         };
 
         let merged = default_limits.merge_with(&override_limits);
         // 所有字段都应该保留默认值
-        assert_eq!(merged.memory_limit, Some(2_000_000_000.0));
-        assert_eq!(merged.cpu_limit, Some(2.0));
-        assert_eq!(merged.swap_limit, Some(4_000_000_000.0));
+        assert_eq!(merged.memory, Some(2_000_000_000.0));
+        assert_eq!(merged.cpu, Some(2.0));
+        assert_eq!(merged.swap, Some(4_000_000_000.0));
         assert_eq!(merged.storage_size, Some("10Gi".to_string()));
     }
 

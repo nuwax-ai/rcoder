@@ -25,6 +25,14 @@ pub enum ServiceType {
     /// 专注于代理运行和执行，提供轻量级的代理执行环境
     /// 容器标识为 user_id，用于桌面应用开发场景
     ComputerAgentRunner,
+    /// 用户应用（UserApp）
+    /// 由 app_manager 托管的用户业务应用（Java/Python/Go/前端等），区别于 agent。
+    /// 容器标识为 app_id；镜像/命令/端口由调用方提供，不走 select_image。
+    /// K8s 模式下对应 Deployment（而非 agent 的裸 Pod）。
+    UserApp,
+    /// UserApp 构建/开发 agent-runner（路B：独立 per-app PVC + 复用 dev-rcoder-agent-runner 镜像）。
+    /// 容器标识为 app_id（project_id 兼任）；走 create_container（STS）；与 ComputerAgentRunner 容器隔离。
+    UserAppBuilder,
 }
 
 // 自定义 Serialize 实现，输出中划线格式
@@ -53,6 +61,8 @@ impl std::fmt::Display for ServiceType {
         match self {
             ServiceType::WebAgentRunner => write!(f, "web-agent-runner"),
             ServiceType::ComputerAgentRunner => write!(f, "computer-agent-runner"),
+            ServiceType::UserApp => write!(f, "user-app"),
+            ServiceType::UserAppBuilder => write!(f, "user-app-builder"),
         }
     }
 }
@@ -71,14 +81,33 @@ impl std::str::FromStr for ServiceType {
             // 中划线格式（推荐）
             "web-agent-runner" => Ok(ServiceType::WebAgentRunner),
             "computer-agent-runner" => Ok(ServiceType::ComputerAgentRunner),
+            "user-app" => Ok(ServiceType::UserApp),
+            "user-app-builder" => Ok(ServiceType::UserAppBuilder),
             // 大驼峰格式（兼容旧配置）
             "WebAgentRunner" => Ok(ServiceType::WebAgentRunner),
             "ComputerAgentRunner" => Ok(ServiceType::ComputerAgentRunner),
+            "UserApp" => Ok(ServiceType::UserApp),
+            "UserAppBuilder" => Ok(ServiceType::UserAppBuilder),
             // 旧枚举名（向后兼容）
             "RCoder" | "rcoder" => Ok(ServiceType::WebAgentRunner),
+            "application" | "app" => Ok(ServiceType::UserApp),
             _ => Err(ServiceTypeError::InvalidServiceType(s.to_string())),
         }
     }
+}
+
+/// 计算容器标识符时缺少必需字段（由 [`ServiceType::container_identifier`] 返回）。
+///
+/// 各运行时（docker / k8s）调用方应将其 `map_err` 转成各自的错误类型
+/// （`DockerError::ConfigurationError` / `ContainerRuntimeError::ConfigurationError`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MissingIdentifier {
+    /// `ComputerAgentRunner` 需要 `user_id`
+    #[error("user_id is required for ComputerAgentRunner")]
+    UserId,
+    /// `WebAgentRunner` / `UserApp` 需要 `project_id`
+    #[error("project_id is required for WebAgentRunner/UserApp")]
+    ProjectId,
 }
 
 impl ServiceType {
@@ -90,6 +119,12 @@ impl ServiceType {
             }
             ServiceType::ComputerAgentRunner => {
                 "Computer Agent Runner service, focused on agent execution for desktop applications"
+            }
+            ServiceType::UserApp => {
+                "User application managed by app_manager (long-running service owned by the user, not an agent)"
+            }
+            ServiceType::UserAppBuilder => {
+                "UserApp build/dev agent-runner (per-app PVC, reuses dev-rcoder-agent-runner image)"
             }
         }
     }
@@ -104,6 +139,8 @@ impl ServiceType {
         match self {
             ServiceType::WebAgentRunner => "web-agent-runner",
             ServiceType::ComputerAgentRunner => "computer-agent-runner",
+            ServiceType::UserApp => "rcoder-app",
+            ServiceType::UserAppBuilder => "rcoder-app-builder",
         }
     }
 
@@ -117,6 +154,36 @@ impl ServiceType {
             false
         }
     }
+
+    /// 计算容器标识符（docker / k8s / handler 三处复用的**单一事实源**）。
+    ///
+    /// 优先级：
+    ///   - `pod_id` 存在（共享容器场景）→ 返回 `pod_id`
+    ///   - 否则按 service_type：
+    ///     - [`ComputerAgentRunner`](ServiceType::ComputerAgentRunner) → `user_id`
+    ///     - [`WebAgentRunner`](ServiceType::WebAgentRunner) | [`UserApp`](ServiceType::UserApp) → `project_id`
+    ///
+    /// 缺必需字段时返回 `Err(MissingIdentifier)`，由调用方转成各自的错误类型。
+    /// 返回借用（零分配）；调用方需要 owned 字符串自行 `.to_string()`。
+    ///
+    /// ⚠️ 不要在各运行时里重写这段优先级逻辑，否则会导致 ensure 与 chat 为同一项目
+    ///   造出不同名 pod + 不同 PVC（如 `rcoder-k8s-{user_id}` vs `rcoder-k8s-{project_id}`）。
+    pub fn container_identifier<'a>(
+        &self,
+        pod_id: Option<&'a str>,
+        user_id: Option<&'a str>,
+        project_id: Option<&'a str>,
+    ) -> Result<&'a str, MissingIdentifier> {
+        if let Some(pid) = pod_id {
+            return Ok(pid);
+        }
+        match self {
+            ServiceType::ComputerAgentRunner => user_id.ok_or(MissingIdentifier::UserId),
+            ServiceType::WebAgentRunner | ServiceType::UserApp | ServiceType::UserAppBuilder => {
+                project_id.ok_or(MissingIdentifier::ProjectId)
+            }
+        }
+    }
 }
 
 /// Service type validation error
@@ -125,7 +192,7 @@ pub enum ServiceTypeError {
     #[error("service type cannot be empty")]
     EmptyServiceType,
     #[error(
-        "unsupported service type '{0}', please use 'web-agent-runner'/'WebAgentRunner'/'RCoder' or 'computer-agent-runner'/'ComputerAgentRunner'"
+        "unsupported service type '{0}', please use 'web-agent-runner'/'WebAgentRunner'/'RCoder', 'computer-agent-runner'/'ComputerAgentRunner', 'user-app'/'UserApp'/'application', or 'user-app-builder'/'UserAppBuilder'"
     )]
     InvalidServiceType(String),
     #[error("service type '{0}' is disabled")]
@@ -137,6 +204,8 @@ pub fn get_supported_service_types() -> Vec<String> {
     vec![
         "web-agent-runner".to_string(),
         "computer-agent-runner".to_string(),
+        "user-app".to_string(),
+        "user-app-builder".to_string(),
     ]
 }
 
@@ -170,6 +239,88 @@ mod tests {
     use crate::MultiImageConfig;
     use std::collections::HashMap;
 
+    // ---- container_identifier 单一事实源测试 ----
+
+    #[test]
+    fn pod_id_takes_priority_over_others() {
+        // 共享容器场景：pod_id 存在时一律用它，无视 service_type
+        for st in [
+            ServiceType::WebAgentRunner,
+            ServiceType::ComputerAgentRunner,
+            ServiceType::UserApp,
+            ServiceType::UserAppBuilder,
+        ] {
+            assert_eq!(
+                st.container_identifier(Some("shared-pod"), Some("u1"), Some("p1")),
+                Ok("shared-pod")
+            );
+        }
+    }
+
+    #[test]
+    fn web_uses_project_id() {
+        let st = ServiceType::WebAgentRunner;
+        assert_eq!(
+            st.container_identifier(None, Some("u1"), Some("p1")),
+            Ok("p1")
+        );
+        // user_id 给了也不用
+        assert_eq!(
+            st.container_identifier(None, Some("u1"), None),
+            Err(MissingIdentifier::ProjectId)
+        );
+    }
+
+    #[test]
+    fn userapp_uses_project_id() {
+        assert_eq!(
+            ServiceType::UserApp.container_identifier(None, None, Some("app-9")),
+            Ok("app-9")
+        );
+    }
+
+    #[test]
+    fn userapp_builder_uses_project_id() {
+        // UserAppBuilder identifier = project_id(app_id 兼任)
+        assert_eq!(
+            ServiceType::UserAppBuilder.container_identifier(None, None, Some("app-9")),
+            Ok("app-9")
+        );
+        // user_id 给了也不用
+        assert_eq!(
+            ServiceType::UserAppBuilder.container_identifier(None, Some("u1"), None),
+            Err(MissingIdentifier::ProjectId)
+        );
+    }
+
+    #[test]
+    fn computer_uses_user_id() {
+        let st = ServiceType::ComputerAgentRunner;
+        assert_eq!(
+            st.container_identifier(None, Some("u7"), Some("p1")),
+            Ok("u7")
+        );
+        assert_eq!(
+            st.container_identifier(None, None, Some("p1")),
+            Err(MissingIdentifier::UserId)
+        );
+    }
+
+    #[test]
+    fn missing_identifier_display_is_stable() {
+        // 错误信息被各运行时 map_err 后透传，保持稳定便于排错
+        assert_eq!(
+            MissingIdentifier::UserId.to_string(),
+            "user_id is required for ComputerAgentRunner",
+        );
+        assert_eq!(
+            MissingIdentifier::ProjectId.to_string(),
+            "project_id is required for WebAgentRunner/UserApp",
+        );
+    }
+
+    // ---- 原 service_type 测试 ----
+
     fn create_test_config() -> MultiImageConfig {
         use crate::multi_image_config::{
             GlobalImageDefaults, ImageCacheConfig, ImageSelectionStrategy,
@@ -192,16 +343,12 @@ mod tests {
                 mounts: vec![],
                 command: vec![],
                 entrypoint: None,
-                resource_limits: ServiceResourceLimits {
-                    memory_limit: None,
-                    cpu_limit: None,
-                    swap_limit: None,
-                    storage_size: None,
-                },
+                resource_limits: ServiceResourceLimits::new(None, None, None, None, None),
                 work_dir: "/app".to_string(),
                 network_mode: "bridge".to_string(),
                 container_path_template: "/app/project_workspace/{project_id}".to_string(),
                 workspace_resolution_path: None,
+                security: None,
             },
         );
 
@@ -219,17 +366,13 @@ mod tests {
                 mounts: vec![],
                 command: vec![],
                 entrypoint: None,
-                resource_limits: ServiceResourceLimits {
-                    memory_limit: None,
-                    cpu_limit: None,
-                    swap_limit: None,
-                    storage_size: None,
-                },
+                resource_limits: ServiceResourceLimits::new(None, None, None, None, None),
                 work_dir: "/app".to_string(),
                 network_mode: "bridge".to_string(),
                 container_path_template: "/app/computer-project-workspace/{user_id}/{project_id}"
                     .to_string(),
                 workspace_resolution_path: None,
+                security: None,
             },
         );
 
@@ -243,11 +386,7 @@ mod tests {
             },
             services,
             selection_strategy: ImageSelectionStrategy::ServiceOnly,
-            cache_config: ImageCacheConfig {
-                enabled: true,
-                ttl_seconds: 3600,
-                max_entries: 50,
-            },
+            cache_config: ImageCacheConfig::default(),
         }
     }
 
@@ -258,6 +397,7 @@ mod tests {
             ServiceType::ComputerAgentRunner.to_string(),
             "computer-agent-runner"
         );
+        assert_eq!(ServiceType::UserApp.to_string(), "user-app");
 
         assert!(ServiceType::WebAgentRunner.description().contains("full"));
         assert!(
@@ -265,6 +405,7 @@ mod tests {
                 .description()
                 .contains("execution")
         );
+        assert!(ServiceType::UserApp.description().contains("app_manager"));
     }
 
     #[test]
@@ -299,6 +440,30 @@ mod tests {
             ServiceType::WebAgentRunner
         );
 
+        // UserApp 多格式
+        assert_eq!(
+            "user-app".parse::<ServiceType>().unwrap(),
+            ServiceType::UserApp
+        );
+        assert_eq!(
+            "UserApp".parse::<ServiceType>().unwrap(),
+            ServiceType::UserApp
+        );
+        assert_eq!(
+            "application".parse::<ServiceType>().unwrap(),
+            ServiceType::UserApp
+        );
+
+        // UserAppBuilder 多格式
+        assert_eq!(
+            "user-app-builder".parse::<ServiceType>().unwrap(),
+            ServiceType::UserAppBuilder
+        );
+        assert_eq!(
+            "UserAppBuilder".parse::<ServiceType>().unwrap(),
+            ServiceType::UserAppBuilder
+        );
+
         // 未知类型应该返回错误
         assert!("unknown".parse::<ServiceType>().is_err());
 
@@ -321,9 +486,11 @@ mod tests {
     #[test]
     fn test_get_supported_service_types() {
         let types = get_supported_service_types();
-        assert_eq!(types.len(), 2);
+        assert_eq!(types.len(), 4);
         assert!(types.contains(&"web-agent-runner".to_string()));
         assert!(types.contains(&"computer-agent-runner".to_string()));
+        assert!(types.contains(&"user-app".to_string()));
+        assert!(types.contains(&"user-app-builder".to_string()));
     }
 
     #[test]

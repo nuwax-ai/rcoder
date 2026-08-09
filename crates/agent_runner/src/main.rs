@@ -16,7 +16,6 @@ mod config;
 mod grpc;
 mod handler;
 mod model;
-mod process_reaper;
 mod proxy_agent;
 
 // 🔥 Pyroscope Profiler 模块（可选：需要 pyroscope feature）
@@ -37,7 +36,11 @@ mod utils;
 mod http_server;
 
 // ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
+mod file_server_embed;
 mod ws_terminal;
+// VNC 桌面连接活跃度计数（读 /proc/net/tcp 数 noVNC 端口 ESTABLISHED 连接，
+// 供 get_active_tasks_count 折入 active_tasks，使「桌面开着」的容器不被闲置回收）
+mod vnc_activity;
 
 pub use model::*;
 
@@ -81,13 +84,26 @@ fn create_model_env_resolver(
 
 // 路由创建函数已移动到 handler 模块
 
+fn main() -> anyhow::Result<()> {
+    // 容器内若为 PID 1(被 start-up.sh exec / 直跑),re-exec 自己为子进程 + 本进程做 PID 1 监督
+    // (回收孤儿 + 转发 SIGTERM/SIGINT)。等价 tini,但纯 Rust 库、无需镜像装 tini 或命令前置。
+    // 关键:监督进程的 waitpid(-1) 与 app 的 tokio::process 在 **不同进程**(app 是 PID 2 子进程),
+    // 不再像旧 in-process process_reaper 那样抢 tokio 的子进程 → ECHILD 彻底消失。
+    // 非 PID 1(本地直接跑)launch() 直接返回,行为不变。
+    pid1::Pid1Settings::new()
+        .enable_log(true)
+        .timeout(Duration::from_secs(15))
+        .launch()?;
+    agent_runner_main()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn agent_runner_main() -> anyhow::Result<()> {
     // 🔥 设置自定义 Panic Hook，确保 panic 信息被记录
     set_panic_hook();
 
     // 🔥 设置信号处理器，实现优雅关闭（Docker stop、Ctrl+C）
-    let _shutdown_handle = setup_shutdown_handler();
+    setup_shutdown_handler();
 
     // ✅ 初始化 Rustls CryptoProvider（必须在最前面，在任何可能使用 TLS 的代码之前）
     // 🔥 如果这里失败，会导致 panic，但 panic hook 会捕获并记录
@@ -101,6 +117,17 @@ async fn main() -> anyhow::Result<()> {
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let _telemetry = Arc::new(telemetry);
+
+    // 初始化 FeatureFlags（进程级单例：读 RCODER_EMBED_FILE_SERVER 等环境开关）
+    shared_types::FeatureFlags::init();
+
+    // 打印 tokio runtime worker 数, 排查"cpu limit 是否导致 worker=1 阻塞"。
+    // tokio multi_thread 默认 worker = 物理核数 (num_cpus), 不受 cgroup CFS quota 影响;
+    // 仅 cpuset 静态绑核才受限 → cpu limit=1 不会让 worker=1。
+    info!(
+        "tokio runtime workers: {}",
+        tokio::runtime::Handle::current().metrics().num_workers()
+    );
 
     // 🆕 Pyroscope Profiler 初始化（可选：需要 pyroscope feature）
     #[cfg(feature = "pyroscope")]
@@ -134,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 异步初始化内置 agent 版本缓存（不阻塞主流程）
     tokio::spawn(async {
-        crate::agent_mgmt::checker::init_builtin_agent_versions().await;
+        agent_mgmt::checker::init_builtin_agent_versions().await;
     });
 
     // 解析命令行参数
@@ -143,9 +170,9 @@ async fn main() -> anyhow::Result<()> {
     // 加载配置（包含命令行参数）
     let config = load_config_with_args(cli_args);
 
-    // 🔥 启动僵尸进程回收器（PID 1 必须回收孤儿进程）
-    let _reaper_handle = process_reaper::start_process_reaper();
-    info!("[MAIN] Process reaper started (PID 1 mode)");
+    // 注:容器以 tini 做 PID 1(见镜像 ENTRYPOINT / chart command 前置 tini),由 tini 负责回收
+    // 孤儿进程 + 转发信号。agent_runner 不再自带 in-process reaper(旧 process_reaper 模块已删:
+    // 它的 waitpid(-1) 会抢 tokio::process 的子进程导致 build child.wait() ECHILD)。
 
     // 🆕 从配置中获取 Agent 清理配置，或使用默认值
     let agent_cleanup_config = config.agent_cleanup.clone().unwrap_or_default();
@@ -166,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 🔒 创建共享的 API 密钥 DashMap
     let shared_api_key_manager =
-        Arc::new(dashmap::DashMap::<String, shared_types::ModelProviderConfig>::new());
+        Arc::new(DashMap::<String, shared_types::ModelProviderConfig>::new());
     info!("[MAIN] Shared API key DashMap created");
 
     #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
@@ -179,32 +206,40 @@ async fn main() -> anyhow::Result<()> {
 
     let model_env_resolver: Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> =
         create_model_env_resolver(&config);
-    let agent_session_service = Arc::new(AgentSessionService::new(model_env_resolver));
+    // ACP session 创建超时：取自 GrpcTimeoutConfig（已 validate ∈ [10,300]，默认 100），
+    // 经 AgentSessionService → AcpAgentWorker → AgentStartConfig 注入到 launcher 外层超时。
+    let acp_session_create_timeout_secs = config
+        .grpc_timeouts
+        .as_ref()
+        .map(|t| t.acp_session_create_timeout_secs)
+        .unwrap_or(100);
+    let agent_session_service = Arc::new(AgentSessionService::new(
+        model_env_resolver,
+        acp_session_create_timeout_secs,
+    ));
     info!("[MAIN] AgentSessionService created");
 
     // 🆕 P0-1: 创建 Agent 管理注册表(从磁盘加载,失败则用空注册表 + 警告)
     // 注:用二进制自己的 `crate::agent_mgmt` 模块(与 router::AppState 同编译单元),
     //     lib 和 binary 是两个独立 crate,类型不能混用。
-    let agent_mgmt_path_manager = crate::agent_mgmt::PathManager::new();
-    let agent_mgmt_registry =
-        match crate::agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone()) {
-            Ok(r) => {
-                info!(
-                    "[MAIN] Agent management registry loaded: total={}, builtin={}",
-                    r.total(),
-                    r.builtin_count()
-                );
-                std::sync::Arc::new(r)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[MAIN] Failed to load agent management registry, starting empty: {e}"
-                );
-                std::sync::Arc::new(crate::agent_mgmt::AgentRegistry::empty(
-                    agent_mgmt_path_manager.clone(),
-                ))
-            }
-        };
+    let agent_mgmt_path_manager = agent_mgmt::PathManager::new();
+    let agent_mgmt_registry = match agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone())
+    {
+        Ok(r) => {
+            info!(
+                "[MAIN] Agent management registry loaded: total={}, builtin={}",
+                r.total(),
+                r.builtin_count()
+            );
+            Arc::new(r)
+        }
+        Err(e) => {
+            tracing::warn!("[MAIN] Failed to load agent management registry, starting empty: {e}");
+            Arc::new(agent_mgmt::AgentRegistry::empty(
+                agent_mgmt_path_manager.clone(),
+            ))
+        }
+    };
 
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
@@ -242,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
             .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
             // P0-1: Agent 管理 gRPC 服务
-            let agent_mgmt_service = crate::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+            let agent_mgmt_service = agent_mgmt::grpc::AgentMgmtServiceImpl::new(
                 agent_mgmt_registry.clone(),
                 agent_mgmt_path_manager.clone(),
             );
@@ -285,6 +320,12 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             ws_terminal::start_ws_terminal().await;
         });
+
+        // 🔥 1.6. 可选：启动嵌入式 file-server (RCODER_EMBED_FILE_SERVER=true)
+        //         让 workspace build 在 agent-runner 全量工具链下执行 (UserApp)
+        if shared_types::FeatureFlags::get().embed_file_server {
+            file_server_embed::spawn_embedded_file_server().await;
+        }
 
         // 🔥 2. 创建 HttpServerConfig（包含所有配置）
         let http_config = HttpServerConfig {

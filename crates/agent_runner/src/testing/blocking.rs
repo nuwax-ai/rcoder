@@ -5,6 +5,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
 /// 阻塞配置
 #[derive(Debug, Clone)]
 pub struct BlockingConfig {
@@ -26,9 +28,13 @@ impl Default for BlockingConfig {
     }
 }
 
-/// 全局阻塞配置 (线程安全)
-pub static BLOCKING_CONFIG: std::sync::LazyLock<Arc<std::sync::RwLock<BlockingConfig>>> =
-    std::sync::LazyLock::new(|| Arc::new(std::sync::RwLock::new(BlockingConfig::default())));
+/// 全局阻塞配置。
+///
+/// 用 `ArcSwap` 而非 `RwLock`:read-mostly 配置快照正是 ArcSwap 的主场 —— 无锁读、
+/// 无中毒(RwLock 在测试注入时若 panic 会中毒,生产路径 `.read().unwrap()` 就会 panic 整个进程;
+/// 本模块被编进生产二进制,`maybe_block` 由 `AgentSessionService` 调用)。
+pub static BLOCKING_CONFIG: std::sync::LazyLock<ArcSwap<BlockingConfig>> =
+    std::sync::LazyLock::new(|| ArcSwap::from_pointee(BlockingConfig::default()));
 
 /// 注入阻塞 (用于测试)
 ///
@@ -47,8 +53,7 @@ pub static BLOCKING_CONFIG: std::sync::LazyLock<Arc<std::sync::RwLock<BlockingCo
 /// ```
 pub fn inject_blocking(config: BlockingConfig) {
     tracing::warn!("[TEST] Blocking config updated: {:?}", config);
-    let mut global = BLOCKING_CONFIG.write().unwrap();
-    *global = config;
+    BLOCKING_CONFIG.store(Arc::new(config));
 }
 
 /// 检查并执行阻塞 (在 AgentSessionService 请求路径中调用)
@@ -67,8 +72,9 @@ pub fn inject_blocking(config: BlockingConfig) {
 /// # }
 /// ```
 pub async fn maybe_block(blocking_type: &str) {
+    // load() 无锁读,返回 Guard(解引用到 BlockingConfig);读完即释放,不跨 await 持有。
     let (should_block, block_duration) = {
-        let config = BLOCKING_CONFIG.read().unwrap();
+        let config = BLOCKING_CONFIG.load();
         let should_block = match blocking_type {
             "new_session" => config.block_new_session,
             "prompt" => config.block_prompt,
@@ -113,7 +119,7 @@ mod tests {
             ..Default::default()
         });
 
-        let config = BLOCKING_CONFIG.read().unwrap();
+        let config = BLOCKING_CONFIG.load();
         assert!(config.block_prompt);
         assert_eq!(config.block_duration, Duration::from_secs(10));
 
@@ -121,7 +127,7 @@ mod tests {
         drop(config);
         reset_blocking();
 
-        let config = BLOCKING_CONFIG.read().unwrap();
+        let config = BLOCKING_CONFIG.load();
         assert!(!config.block_prompt);
         assert_eq!(config.block_duration, Duration::from_secs(30));
     }

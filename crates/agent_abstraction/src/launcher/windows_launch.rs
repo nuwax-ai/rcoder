@@ -75,8 +75,22 @@ fn npm_package_entry_from_dir(
     package_name: &str,
 ) -> Option<PathBuf> {
     let package_json = package_dir.join("package.json");
-    let content = std::fs::read_to_string(package_json).ok()?;
-    let package_json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    // 区分"文件不存在"（正常，回退其它解析）与"存在但读取/解析失败"（配置 bug，须可见）。
+    let content = match std::fs::read_to_string(&package_json) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!("failed to read {}: {e}", package_json.display());
+            return None;
+        }
+    };
+    let package_json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("failed to parse {}: {e}", package_json.display());
+            return None;
+        }
+    };
     let bin_field = package_json.get("bin")?;
 
     let rel_entry = if let Some(bin_str) = bin_field.as_str() {

@@ -13,7 +13,10 @@ use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 #[cfg(feature = "kubernetes")]
 use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 #[cfg(feature = "kubernetes")]
-use shared_types::{GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT, WS_TERMINAL_PORT, ServiceType};
+use shared_types::{
+    AGENT_FILE_SERVER_PORT, GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT, ServiceType,
+    WS_TERMINAL_PORT,
+};
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
 #[cfg(feature = "kubernetes")]
@@ -133,7 +136,7 @@ pub(crate) trait K8sServiceOps {
     /// - noVNC 6080：Web VNC 访问
     /// - ttyd 7681：Web 终端访问
     ///
-    /// selector 使用与 Pod 相同的 labels（`managed-by=rcoder-runtime` + identifier label）。
+    /// selector 使用与 Pod 相同的 labels（`app.kubernetes.io/managed-by=rcoder-runtime` + identifier label）。
     /// 创建前先检查是否已存在，已存在则跳过。
     async fn create_agent_service(
         &self,
@@ -239,6 +242,17 @@ impl K8sServiceOps for KubernetesRuntime {
                         target_port: Some(
                             k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
                                 AGENT_WS_TERMINAL_PORT as i32,
+                            ),
+                        ),
+                        protocol: Some("TCP".to_string()),
+                        ..Default::default()
+                    },
+                    ServicePort {
+                        name: Some("file-server".to_string()),
+                        port: AGENT_FILE_SERVER_PORT as i32,
+                        target_port: Some(
+                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                                AGENT_FILE_SERVER_PORT as i32,
                             ),
                         ),
                         protocol: Some("TCP".to_string()),

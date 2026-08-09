@@ -89,7 +89,11 @@ pub async fn chat(
         shared_types::ServiceType::ComputerAgentRunner => {
             std::path::PathBuf::from("/home/user").join(&work_dir_id)
         }
-        shared_types::ServiceType::WebAgentRunner => {
+        // UserApp 不由 agent_runner 托管；UserAppBuilder 复用 agent_runner 镜像但走 file-server build,不经 gRPC chat。
+        // 两者兜底走 WebAgentRunner 路径(运行时不应进入)
+        shared_types::ServiceType::WebAgentRunner
+        | shared_types::ServiceType::UserApp
+        | shared_types::ServiceType::UserAppBuilder => {
             let tenant_id = std::env::var("TENANT_ID").ok();
             let space_id = std::env::var("SPACE_ID").ok();
             match (tenant_id, space_id) {

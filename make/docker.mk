@@ -12,9 +12,12 @@ PUSH_IMAGE ?= false
 # 串行构建镜像，避免资源竞争
 docker-build:
 	@echo "🔨 开始构建主镜像..."
-	@$(MAKE) docker-build-master & \
-	$(MAKE) docker-build-agent-runner & \
-	wait
+	@task_build_status=0; \
+	$(MAKE) docker-build-master & master_pid=$$!; \
+	$(MAKE) docker-build-agent-runner & agent_pid=$$!; \
+	wait $$master_pid || task_build_status=$$?; \
+	wait $$agent_pid || task_build_status=$$?; \
+	exit $$task_build_status
 	@echo ""
 	@echo "✅ 所有 Docker 镜像构建完成！"
 	@echo "  ✓ dev-master-rcoder:latest"
@@ -164,3 +167,24 @@ docker-build-agent-production:
 	@echo "🐳 构建 rcoder-agent-runner 生产镜像（无 eBPF 工具）..."
 	@$(MAKE) docker-build-agent-runner CARGO_FEATURES=""
 	@echo "✅ 生产镜像构建完成（无 eBPF 工具，镜像更小）"
+
+# ============================================================================
+# app-runtime 镜像构建（本地开发/测试，dev 前缀，不推 registry）
+# ============================================================================
+# UserApp 容器运行时。app-runtime-base/Dockerfile 用仓库根作构建上下文 (COPY . . + COPY docker/app-runtime-base/...,
+# 同 rcoder-master 模式)，根 .dockerignore 已排除 target/.git/project_workspace 等，无需 rsync / code/rcoder 中转。
+# 产物: dev-app-runtime-base:latest（基础设施+Rust app-cli）+ dev-app-runtime:latest（多语言运行时）
+APP_RUNTIME_DIR := docker/app-runtime-base
+
+# 构建 dev-app-runtime-base（基础设施层: PG/pgweb/ttyd/supervisor + Rust app-cli）
+docker-build-app-runtime-base:
+	@echo "🐳 构建 dev-app-runtime-base:latest ..."
+	@docker build -t dev-app-runtime-base:latest -f $(APP_RUNTIME_DIR)/Dockerfile .
+	@echo "✅ dev-app-runtime-base:latest 构建完成"
+
+# 构建 dev-app-runtime（多语言运行时: base + Node/Python/Java/Go），UserApp 部署用此镜像
+docker-build-app-runtime: docker-build-app-runtime-base
+	@echo "🐳 构建 dev-app-runtime:latest（基于 dev-app-runtime-base）..."
+	@docker build --build-arg BASE_IMAGE=dev-app-runtime-base:latest \
+		-t dev-app-runtime:latest -f $(APP_RUNTIME_DIR)/Dockerfile.runtime .
+	@echo "✅ dev-app-runtime:latest 构建完成"

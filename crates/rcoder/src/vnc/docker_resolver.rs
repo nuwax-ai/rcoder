@@ -89,8 +89,9 @@ impl CachedDockerResolver {
                 VncResolveError::ContainerNotFound(user_id.to_string())
             })?;
 
-        // 检查容器状态
-        let is_running = container_info.status.to_lowercase() == "running";
+        // 检查容器状态（统一走 ContainerStatus 枚举比较，不直接比字符串）
+        let is_running =
+            docker_manager::ContainerStatus::from(container_info.status.clone()).is_running();
         if !is_running {
             warn!(
                 "⚠️ [VNC_RESOLVER] Container not running: user_id={}, status={}",
@@ -153,7 +154,8 @@ impl VncBackendResolver for CachedDockerResolver {
 mod tests {
     use super::*;
     use container_runtime_api::{
-        ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, RuntimeContainerInfo,
+        AgentContainerRuntime, ContainerCreateParams, ContainerRuntime, ContainerRuntimeError,
+        ContainerRuntimeResult, RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
     };
     use shared_types::ContainerBasicInfo;
 
@@ -161,7 +163,7 @@ mod tests {
     struct StubRuntime;
 
     #[async_trait]
-    impl ContainerRuntime for StubRuntime {
+    impl AgentContainerRuntime for StubRuntime {
         async fn create_container(
             &self,
             _params: ContainerCreateParams,
@@ -198,6 +200,12 @@ mod tests {
         }
     }
 
+    // 空 impl 块继承默认实现 → StubRuntime impl B+C → 自动 impl ContainerRuntime (super-trait bounds)
+    #[async_trait]
+    impl WorkspaceRuntime for StubRuntime {}
+    #[async_trait]
+    impl UserAppDeploymentRuntime for StubRuntime {}
+
     fn stub_runtime() -> Arc<dyn ContainerRuntime> {
         Arc::new(StubRuntime)
     }
@@ -205,12 +213,12 @@ mod tests {
     #[test]
     fn test_resolver_creation() {
         let resolver = CachedDockerResolver::new(stub_runtime());
-        assert!(std::mem::size_of_val(&resolver) > 0);
+        assert!(size_of_val(&resolver) > 0);
     }
 
     #[test]
     fn test_custom_ttl() {
         let resolver = CachedDockerResolver::with_ttl(Duration::from_secs(10), stub_runtime());
-        assert!(std::mem::size_of_val(&resolver) > 0);
+        assert!(size_of_val(&resolver) > 0);
     }
 }

@@ -79,7 +79,10 @@ impl HttpHealthChecker {
             {
                 Ok(Ok(response)) if response.status().is_success() => {
                     // HTTP 状态码成功，进一步检查响应体
-                    match response.json::<HttpResult<shared_types::HealthCheckResponse>>().await {
+                    match response
+                        .json::<HttpResult<shared_types::HealthCheckResponse>>()
+                        .await
+                    {
                         Ok(health_result) if health_result.code == "0000" => {
                             // 成功：code 为 "0000"
                             if let Some(health) = health_result.data {
@@ -184,7 +187,11 @@ impl HttpHealthChecker {
 
 /// 便捷函数: 等待服务就绪(使用默认配置)
 ///
-/// 检查 /health 端点，等待 agent-runner 的 HTTP 和 gRPC 服务都就绪。
+/// 检查 /ready 端点，等待 agent-runner 的 gRPC 服务就绪（readiness）。
+///
+/// 用 /ready（而非 /health）: /health 现为 liveness（纯进程活恒 200, 不查 gRPC）,
+/// /ready 才反映 gRPC 就绪（gRPC 没起返 503, 起了 200）。rcoder 创建 agent-runner 后
+/// 需等 gRPC 就绪才能转发请求, 故探 /ready。
 ///
 /// # Arguments
 /// * `base_url` - 服务基础URL
@@ -193,6 +200,6 @@ impl HttpHealthChecker {
 /// * `DockerResult<()>` - 成功或超时错误
 pub async fn wait_for_service_ready(base_url: &str) -> DockerResult<()> {
     HttpHealthChecker::default_checker()
-        .wait_for_ready(base_url, None)
+        .wait_for_ready(base_url, Some("ready"))
         .await
 }

@@ -11,7 +11,7 @@
 //! 参考实现：`tokio-tungstenite/examples/server.rs` 的 `TcpListener + accept_hdr_async`。
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::http::HeaderValue;
@@ -84,16 +84,10 @@ pub async fn start_ws_terminal() {
 
 /// 单条 TCP 连接：握手（取 project_id + 协商子协议）→ 交 proxy
 async fn handle_conn(stream: tokio::net::TcpStream, peer: SocketAddr) {
-    // 通过 Arc<Mutex<Option<_>>> 把握手 callback 读到的 project_id / service_type 传出 accept_hdr_async
-    let project_id_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let service_type_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let tenant_id_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let space_id_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // 握手 callback 只执行一次，使用 OnceLock 把不可变元数据传出，无需四把 Mutex。
+    let metadata_slot = Arc::new(OnceLock::new());
     let cb = HandshakeCallback {
-        project_id: project_id_slot.clone(),
-        service_type: service_type_slot.clone(),
-        tenant_id: tenant_id_slot.clone(),
-        space_id: space_id_slot.clone(),
+        metadata: Arc::clone(&metadata_slot),
     };
 
     let ws = match accept_hdr_async(stream, cb).await {
@@ -104,35 +98,23 @@ async fn handle_conn(stream: tokio::net::TcpStream, peer: SocketAddr) {
         }
     };
 
-    let project_id = project_id_slot
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_default();
-    let service_type = service_type_slot
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_default();
-    let tenant_id = tenant_id_slot
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_default();
-    let space_id = space_id_slot
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_default();
+    let metadata = metadata_slot.get().cloned().unwrap_or_default();
     info!(
         "[WS_TERMINAL] {} connected (service_type={}, project_id={}, tenant_id={}, space_id={})",
-        peer, service_type, project_id, tenant_id, space_id
+        peer, metadata.service_type, metadata.project_id, metadata.tenant_id, metadata.space_id
     );
 
     // 计入活跃终端连接：覆盖整个 handle_terminal（含其全部 return 路径），
     // 函数返回时 guard drop → 计数 -1。GetContainerStatus 据此判定容器在用、拦下空闲清理。
     let _conn_guard = super::TerminalConnGuard::new();
-    proxy::handle_terminal(ws, &service_type, &project_id, &tenant_id, &space_id).await;
+    proxy::handle_terminal(
+        ws,
+        &metadata.service_type,
+        &metadata.project_id,
+        &metadata.tenant_id,
+        &metadata.space_id,
+    )
+    .await;
 }
 
 /// 轮询等待本地端口可达（ttyd readiness 检查）
@@ -151,48 +133,40 @@ async fn wait_for_port(port: u16, per_try_ms: u64, retries: u32) -> bool {
     false
 }
 
+#[derive(Clone, Default)]
+struct HandshakeMetadata {
+    project_id: String,
+    service_type: String,
+    tenant_id: String,
+    space_id: String,
+}
+
 /// 握手回调：读 project_id + service_type header + 协商 `tty` 子协议
 struct HandshakeCallback {
-    project_id: Arc<Mutex<Option<String>>>,
-    service_type: Arc<Mutex<Option<String>>>,
-    tenant_id: Arc<Mutex<Option<String>>>,
-    space_id: Arc<Mutex<Option<String>>>,
+    metadata: Arc<OnceLock<HandshakeMetadata>>,
 }
 
 impl Callback for HandshakeCallback {
     fn on_request(self, req: &Request, mut resp: Response) -> Result<Response, ErrorResponse> {
         // 1. 读 project_id + service_type（Pingora 注入的 X-Ttyd-Project-Id / X-Ttyd-Service-Type）
-        if let Some(v) = req
-            .headers()
-            .get(PROJECT_ID_HEADER)
-            .and_then(|v| v.to_str().ok())
-            && let Ok(mut g) = self.project_id.lock()
+        let header = |name| {
+            req.headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        if self
+            .metadata
+            .set(HandshakeMetadata {
+                project_id: header(PROJECT_ID_HEADER),
+                service_type: header(SERVICE_TYPE_HEADER),
+                tenant_id: header(TENANT_ID_HEADER),
+                space_id: header(SPACE_ID_HEADER),
+            })
+            .is_err()
         {
-            *g = Some(v.to_string());
-        }
-        if let Some(v) = req
-            .headers()
-            .get(SERVICE_TYPE_HEADER)
-            .and_then(|v| v.to_str().ok())
-            && let Ok(mut g) = self.service_type.lock()
-        {
-            *g = Some(v.to_string());
-        }
-        if let Some(v) = req
-            .headers()
-            .get(TENANT_ID_HEADER)
-            .and_then(|v| v.to_str().ok())
-            && let Ok(mut g) = self.tenant_id.lock()
-        {
-            *g = Some(v.to_string());
-        }
-        if let Some(v) = req
-            .headers()
-            .get(SPACE_ID_HEADER)
-            .and_then(|v| v.to_str().ok())
-            && let Ok(mut g) = self.space_id.lock()
-        {
-            *g = Some(v.to_string());
+            warn!("metadata set failed (already initialized)");
         }
 
         // 2. 协商子协议：客户端请求含 `tty` 时回选 `tty`，否则不动（保持默认行为）

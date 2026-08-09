@@ -41,8 +41,12 @@ fn setup_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         // 先恢复终端，再打印 panic 信息
-        let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, DisableBracketedPaste);
+        if let Err(e) = disable_raw_mode() {
+            eprintln!("[tui] panic hook: disable raw mode failed: {e}");
+        }
+        if let Err(e) = execute!(stdout(), LeaveAlternateScreen, DisableBracketedPaste) {
+            eprintln!("[tui] panic hook: restore terminal output failed: {e}");
+        }
         default_hook(panic_info);
     }));
 }

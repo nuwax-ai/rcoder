@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
+use dashmap::DashSet;
 use shared_types::ServiceType;
 use std::sync::Arc;
 use tokio::time::interval;
@@ -23,22 +24,37 @@ pub struct AgentCleaner {
     container_destroyer: super::container::ContainerDestroyer,
     agent_scanner: super::agent::AgentScanner,
     log_cleaner: super::logs::LogCleaner,
+
+    /// 二次确认销毁：命中闲置回收规则的容器先入此集合（=「已见过一次 idle」），
+    /// 下一轮扫描仍闲置（第二次连续命中）才真正销毁。key = container_name。
+    /// 本轮不再闲置（用户回归）的条目由 `cleanup_once` 的 retain 清除，保证「连续」语义。
+    /// 详见 `cleanup_agent` 的二次确认闸门。延迟 ≈ 一个 cleanup_interval（连续两轮）。
+    pending_destroy: DashSet<String>,
 }
 
 impl AgentCleaner {
     pub fn new(
         config: super::config::CleanupConfig,
         state: Arc<crate::router::AppState>,
-        docker_manager: Arc<docker_manager::DockerManager>,
         pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     ) -> Self {
         let config_clone = config.clone();
         let state_clone = state.clone();
         let grpc_pool = state.grpc_pool.clone();
         let namespace = state.config.app_manager.namespace.clone();
+        // 运行时抽象 (Docker / K8s) —— destroyer 物理销毁走它, 使 AgentCleaner 跨模式复用
+        let runtime = state.runtime().clone();
 
         // 判断是否是 K8s 运行时（通过 features flag）
         let is_kubernetes = shared_types::is_kubernetes_runtime();
+
+        // SSE 关闭回调：destroyer 物理销毁后按 grpc_addr 关闭前端进度流。
+        // 与下方 cleanup_once 中既有的 shutdown_sse_streams_for_project 调用冗余但幂等
+        // （前者按地址、后者按 project sessions 枚举），双保险覆盖记录已清空场景。
+        let shutdown_sse: crate::grpc::ShutdownSseFn = {
+            let state = state.clone();
+            Arc::new(move |addr: &str| state.shutdown_sse_streams_by_addr(addr))
+        };
 
         // 创建日志清理器（使用配置）
         let log_cleaner = super::logs::LogCleaner::new(
@@ -53,18 +69,20 @@ impl AgentCleaner {
             rcoder_strategy: super::strategies::rcoder::RCoderStrategy,
             computer_runner_strategy: super::strategies::computer_runner::ComputerRunnerStrategy,
             container_destroyer: super::container::ContainerDestroyer::new(
-                docker_manager.clone(),
+                runtime,
                 grpc_pool,
                 pingora_service,
                 namespace,
                 state.cluster_domain.clone(),
                 is_kubernetes,
-            ),
+            )
+            .with_shutdown_sse(shutdown_sse),
             agent_scanner: {
                 use crate::cleanup_task::agent::AgentScanner;
                 AgentScanner::new(state.clone(), config_clone)
             },
             log_cleaner,
+            pending_destroy: DashSet::new(),
         }
     }
 
@@ -90,6 +108,21 @@ impl AgentCleaner {
         // 2. 扫描需要清理的 agent
         let idle_agents = self.agent_scanner.scan_idle_agents().await?;
         info!("[cleaner] Found {} idle agents to clean", idle_agents.len());
+
+        // 🔁 二次确认清扫：本轮不再闲置（用户回归 / VNC 接入刷新 last_activity）的容器，
+        //    清掉其「已见过一次 idle」标记，下个闲置周期重新计数；本轮仍闲置的容器保留标记。
+        //    这保证了「连续两轮 idle 才销毁」的连续性——中间任一轮恢复，计数清零重来。
+        {
+            let idle_keys: std::collections::HashSet<String> = idle_agents
+                .iter()
+                .filter_map(|pid| {
+                    self.state
+                        .get_project(pid)
+                        .and_then(|i| i.container_info().map(|c| c.container_name.clone()))
+                })
+                .collect();
+            self.pending_destroy.retain(|k| idle_keys.contains(k));
+        }
 
         // 3. 清理每个 agent
         // 记录已销毁的容器名称，避免共享容器被重复销毁（ComputerAgentRunner 场景）
@@ -202,6 +235,9 @@ impl AgentCleaner {
         let strategy: &dyn super::strategies::CleanupStrategy = match service_type {
             ServiceType::WebAgentRunner => &self.rcoder_strategy,
             ServiceType::ComputerAgentRunner => &self.computer_runner_strategy,
+            // UserApp 不注册到 projects 表,cleanup_task 不会处理;UserAppBuilder 复用 agent-runner,
+            // 闲置清理用 rcoder 策略(检查自身 idle + timeout)。兜底用 rcoder 策略。
+            ServiceType::UserApp | ServiceType::UserAppBuilder => &self.rcoder_strategy,
         };
 
         // 3. 检查是否需要销毁容器，并获取销毁原因
@@ -213,6 +249,53 @@ impl AgentCleaner {
         let destroy_reason = strategy
             .should_destroy_container(project_id, &context)
             .await?;
+
+        // 短期闲置（idle > idle_timeout 但 < long_idle_timeout）：标记 Idle、保留容器 + project 复用，
+        // 不销毁、不删 project。只有长期闲置（>= long_idle_timeout）才走下方二次确认 + 销毁链。
+        if destroy_reason.is_some() && idle_secs < self.config.long_idle_timeout.as_secs() as i64 {
+            self.state
+                .projects
+                .update_agent_status(project_id, 0, "idle");
+            info!(
+                " [cleaner] 📌 idle 标记(保留复用): project_id={}, idle_secs={}s < long_idle={}s",
+                project_id,
+                idle_secs,
+                self.config.long_idle_timeout.as_secs()
+            );
+            return Ok(false); // 不销毁容器、不删 project
+        }
+
+        // 🔁 二次确认：策略判定该销毁时不立即销毁 —— 首次命中只记个标记，下一轮**连续**仍
+        //    闲置才真正销毁。中间任一轮用户回归（last_activity 推进 / VNC 接入）会让容器不再
+        //    被 scanner 判为闲置 → cleanup_once 的 retain 清掉标记，计数清零，取消销毁，
+        //    规避"恰好撞车"误杀（01:07 那种：销毁瞬间用户回归、晚 1 秒）。
+        //
+        //    仅当确有容器可销毁（container_info 存在）时才二次确认 —— 它是为保护「活容器」
+        //    不被误杀；无容器的孤立 project 记录直接走下方清理（否则用 project_id 当 key 会被
+        //    cleanup_once 的 retain 每轮清掉、永不连击、孤立记录清不掉）。
+        if destroy_reason.is_some()
+            && let Some(grace_key) = agent_info
+                .container_info()
+                .map(|c| c.container_name.clone())
+        {
+            // insert 返回 true = 此前不在集合 = 本轮是第一次命中 → 先记下、放一马
+            // insert 返回 false = 已在集合 = 连续第二次命中 → 真正销毁
+            let first_hit = self.pending_destroy.insert(grace_key.clone());
+            if first_hit {
+                info!(
+                    " [cleaner] 🔁 idle first seen, will reconfirm next scan before destroy: project_id={}, container={}",
+                    project_id, grace_key
+                );
+                return Ok(false); // 容器还活着：不销毁、不删 project 记录
+            }
+            // 连续第二次命中：本轮 scanner 仍判闲置 + 上面 idle_secs 复核仍超时 → 继续销毁
+            info!(
+                " [cleaner] 🔁 idle confirmed (2nd consecutive scan), proceeding to destroy: project_id={}, container={}",
+                project_id, grace_key
+            );
+            self.pending_destroy.remove(&grace_key);
+            // 落入下方销毁逻辑
+        }
 
         // 4. 如果需要销毁容器
         let mut container_destroyed = false;
@@ -238,6 +321,7 @@ impl AgentCleaner {
                     &container_identifier,
                     &reason,
                     Some(project_id),
+                    &container_info.container_ip,
                 )
                 .await?;
 
@@ -251,6 +335,14 @@ impl AgentCleaner {
                 .container_info()
                 .map(|c| c.container_id.clone())
                 .unwrap_or_default();
+            // 先关闭该容器所有 project 的 SSE 共享流（delete_container_with_projects 会移除 project 记录）
+            for p in self
+                .state
+                .projects
+                .get_projects_by_container_id(&container_id)
+            {
+                self.state.shutdown_sse_streams_for_project(p.project_id());
+            }
             let (deleted, project_count) = self
                 .state
                 .projects
@@ -261,6 +353,8 @@ impl AgentCleaner {
             );
         } else {
             // 容器未销毁（仅超时等原因）：只删除当前项目记录
+            // 先关闭该 project 的 SSE 共享流（remove_project 会清空 sessions 集合）
+            self.state.shutdown_sse_streams_for_project(project_id);
             self.state.remove_project(project_id);
             info!(
                 "[cleaner] Removed project record only (container not destroyed): project_id={}",
@@ -271,8 +365,8 @@ impl AgentCleaner {
         Ok(container_destroyed)
     }
 
-    /// 运行清理任务（定时）
-    pub async fn run(&mut self) {
+    /// 运行清理任务（定时）。收到 shutdown 信号后优雅退出。
+    pub async fn run(&mut self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
         info!("[cleaner] cleanup task already started");
 
         let mut interval = interval(self.config.cleanup_interval);
@@ -280,22 +374,28 @@ impl AgentCleaner {
         const MEMORY_LOG_INTERVAL: u32 = 12; // 每 12 次清理（大约 1 小时）输出一次内存日志
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    match self.cleanup_once().await {
+                        Ok(_) => debug!("[cleaner] Cleanup completed"),
+                        Err(e) => warn!("[cleaner] Cleanup failed: {}", e),
+                    }
 
-            match self.cleanup_once().await {
-                Ok(_) => debug!("[cleaner] Cleanup completed"),
-                Err(e) => warn!("[cleaner] Cleanup failed: {}", e),
-            }
-
-            // 定期输出存储统计信息
-            memory_log_counter += 1;
-            if memory_log_counter >= MEMORY_LOG_INTERVAL {
-                memory_log_counter = 0;
-                let stats = self.state.projects.get_stats();
-                debug!(
-                    "[cleaner] Storage Stats: projects={}, containers={}, sessions={}",
-                    stats.total_projects, stats.total_containers, stats.active_sessions
-                );
+                    // 定期输出存储统计信息
+                    memory_log_counter += 1;
+                    if memory_log_counter >= MEMORY_LOG_INTERVAL {
+                        memory_log_counter = 0;
+                        let stats = self.state.projects.get_stats();
+                        debug!(
+                            "[cleaner] Storage Stats: projects={}, containers={}, sessions={}",
+                            stats.total_projects, stats.total_containers, stats.active_sessions
+                        );
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("[cleaner] shutdown");
+                    break;
+                }
             }
         }
     }

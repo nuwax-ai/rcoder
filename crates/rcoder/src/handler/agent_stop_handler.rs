@@ -7,7 +7,7 @@ use axum::http::HeaderMap;
 use std::sync::Arc;
 use tracing::{error, info, instrument};
 
-use super::utils::{I18nJsonOrQuery, get_locale_from_headers};
+use super::utils::{I18nJsonOrQuery, get_locale_from_headers, is_known_identifier};
 use crate::{AppError, HttpResult, router::AppState};
 use shared_types::{AgentStopRequest, AgentStopResponse};
 
@@ -60,17 +60,27 @@ async fn destroy_container_for_project(
         }
 
         // 清理旧容器的 gRPC 连接（避免复用已失效的 TCP 连接）
-        if !container_info.container_ip.is_empty() {
-            let old_grpc_addr = format!(
-                "{}:{}",
-                container_info.container_ip,
-                shared_types::GRPC_DEFAULT_PORT
+        // 地址与连接建立时同源：K8s 用 Service FQDN，Docker 用容器 IP
+        // （手拼 ip:port 在 K8s 下对不上 FQDN 键 → no-op 泄漏）
+        if shared_types::is_kubernetes_runtime() || !container_info.container_ip.is_empty() {
+            let old_grpc_addr = shared_types::build_grpc_addr(
+                &container_info.container_name,
+                &container_info.container_ip,
+                &state.config.app_manager.namespace,
+                &state.cluster_domain,
             );
             state.grpc_pool.remove(&old_grpc_addr).await;
         }
 
-        // 从存储中移除项目（如果 project_id 不是 "unknown"）
-        if container_info.project_id != "unknown" {
+        // 从存储中移除项目（如果 project_id 是已知标识，非 "unknown" 哨兵）
+        if is_known_identifier(&container_info.project_id) {
+            // 先关闭该 project 的 SSE 共享流（remove_project 会清空 sessions 集合，之后无法枚举）
+            state.shutdown_sse_streams_for_project(&container_info.project_id);
+            // 清理 Pingora 后端（dec_container_ref 不再发 cleanup_tx，需在此补清，
+            // 否则 agent_stop 后 Pingora 路由残留指向已删容器）
+            if let Some(ref pingora) = state.pingora_service {
+                let _unused = pingora.remove_project_backend(&container_info.project_id);
+            }
             state.remove_project(&container_info.project_id);
         }
 

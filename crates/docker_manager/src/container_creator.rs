@@ -23,6 +23,8 @@ use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
 use super::manager::DockerManager;
+use shared_types::HTTP_DEFAULT_PORT;
+
 use super::{
     ContainerStatus, DockerContainerConfig, DockerContainerInfo, DockerError, DockerResult,
 };
@@ -64,6 +66,7 @@ impl<'a> ContainerCreator<'a> {
         let command = config.command.clone();
         let entrypoint = config.entrypoint.clone();
         let resource_limits = config.resource_limits.clone();
+        let security = config.security.clone();
         let extra_mounts = config.extra_mounts.clone();
 
         // 1. 生成容器名称
@@ -111,6 +114,7 @@ impl<'a> ContainerCreator<'a> {
             port_bindings_map,
             auto_remove,
             resource_limits.as_ref(),
+            security.as_ref(),
         );
 
         // 9. 构建网络配置和容器体
@@ -167,7 +171,9 @@ impl<'a> ContainerCreator<'a> {
                 "[CREATE] Container {} started but health check failed: {}. Rolling back...",
                 container_id, e
             );
-            let _ = self.manager.stop_container_by_id(&container_id).await;
+            if let Err(stop_e) = self.manager.stop_container_by_id(&container_id).await {
+                warn!("[CREATE] rollback stop failed (orphan may leak): {container_id}: {stop_e}");
+            }
             return Err(e);
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -189,7 +195,7 @@ impl<'a> ContainerCreator<'a> {
             assigned_port: 0,
             health_status: None,
             service_health: None,
-            internal_port: 8080,
+            internal_port: HTTP_DEFAULT_PORT,
             network_name: container_network_name.clone(),
         };
 
@@ -457,45 +463,70 @@ fn build_host_config(
     mounts: Vec<Mount>,
     port_bindings: HashMap<String, Option<Vec<PortBinding>>>,
     auto_remove: bool,
-    resource_limits: Option<&crate::types::ResourceLimits>,
+    resource_limits: Option<&shared_types::ServiceResourceLimits>,
+    security: Option<&shared_types::ServiceSecurityConfig>,
 ) -> HostConfig {
     let mut config = HostConfig {
         mounts: Some(mounts),
         port_bindings: Some(port_bindings),
         auto_remove: Some(auto_remove),
-        #[cfg(feature = "ebpf-debug")]
-        privileged: Some(true),
-        #[cfg(not(feature = "ebpf-debug"))]
-        privileged: Some(false),
-        #[cfg(feature = "ebpf-debug")]
-        cap_add: Some(vec![
-            "SYS_ADMIN".to_string(),
-            "NET_ADMIN".to_string(),
-            "SYS_PTRACE".to_string(),
-        ]),
-        #[cfg(not(feature = "ebpf-debug"))]
-        cap_drop: Some(vec!["NET_RAW".to_string(), "NET_ADMIN".to_string()]),
         ..Default::default()
     };
 
+    // 应用安全配置：security 块（运维显式配置）优先级最高，覆盖 ebpf-debug feature 与内置默认。
+    // - None：走代码默认（ebpf-debug 时 privileged=true+cap_add=[SYS_ADMIN,NET_ADMIN,SYS_PTRACE]；
+    //   否则 privileged=false+cap_drop=[NET_RAW,NET_ADMIN]），与历史行为完全一致。
+    // - Some(sec)：字段级覆盖——sec 内 Some(x) 用 x，字段未写（None）回退该字段内置默认。运维自负其责。
+    match security {
+        None => {
+            #[cfg(feature = "ebpf-debug")]
+            {
+                config.privileged = Some(true);
+                config.cap_add = Some(vec![
+                    "SYS_ADMIN".to_string(),
+                    "NET_ADMIN".to_string(),
+                    "SYS_PTRACE".to_string(),
+                ]);
+            }
+            #[cfg(not(feature = "ebpf-debug"))]
+            {
+                config.privileged = Some(false);
+                config.cap_drop = Some(vec!["NET_RAW".to_string(), "NET_ADMIN".to_string()]);
+            }
+        }
+        Some(sec) => {
+            config.privileged = Some(sec.privileged.unwrap_or(false));
+            config.cap_add = sec.cap_add.clone();
+            // cap_drop 永远 Some：默认保留 [NET_RAW,NET_ADMIN]，仅运维显式配置（含空数组 []）时覆盖
+            config.cap_drop = Some(
+                sec.cap_drop
+                    .clone()
+                    .unwrap_or_else(|| vec!["NET_RAW".to_string(), "NET_ADMIN".to_string()]),
+            );
+            config.security_opt = sec.security_opt.clone();
+            config.pids_limit = sec.pids_limit;
+            config.init = sec.init;
+        }
+    }
+
     if let Some(limits) = resource_limits {
-        config.memory = limits.memory_limit.and_then(|v| {
+        config.memory = limits.memory.and_then(|v| {
             if v.is_finite() && v >= 0.0 && v <= i64::MAX as f64 {
                 Some(v as i64)
             } else {
-                warn!("[DOCKER_MGR] memory_limit {} out of range, skipping", v);
+                warn!("[DOCKER_MGR] memory {} out of range, skipping", v);
                 None
             }
         });
-        config.memory_swap = limits.swap_limit.and_then(|v| {
+        config.memory_swap = limits.swap.and_then(|v| {
             if v.is_finite() && v >= 0.0 && v <= i64::MAX as f64 {
                 Some(v as i64)
             } else {
-                warn!("[DOCKER_MGR] swap_limit {} out of range, skipping", v);
+                warn!("[DOCKER_MGR] swap {} out of range, skipping", v);
                 None
             }
         });
-        if let Some(cpu_limit) = limits.cpu_limit {
+        if let Some(cpu_limit) = limits.cpu {
             let nano_cpus = cpu_limit * 1e9;
             if nano_cpus.is_finite() && nano_cpus >= 0.0 && nano_cpus <= i64::MAX as f64 {
                 config.nano_cpus = Some(nano_cpus as i64);
@@ -509,4 +540,82 @@ fn build_host_config(
     }
 
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_types::ServiceSecurityConfig;
+    use std::collections::HashMap;
+
+    /// security = None（未配置 security 块）→ 走代码默认（非 ebpf-debug：
+    /// privileged=false + cap_drop=[NET_RAW,NET_ADMIN]，security_opt/cap_add 为 None）
+    #[cfg(not(feature = "ebpf-debug"))]
+    #[test]
+    fn test_security_none_uses_defaults() {
+        let hc = build_host_config(vec![], HashMap::new(), false, None, None);
+        assert_eq!(hc.privileged, Some(false));
+        assert_eq!(
+            hc.cap_drop,
+            Some(vec!["NET_RAW".to_string(), "NET_ADMIN".to_string()])
+        );
+        assert_eq!(hc.cap_add, None);
+        assert_eq!(hc.security_opt, None);
+    }
+
+    /// security = Some(仅 security_opt) → security_opt 透传；其余字段回退默认
+    /// （privileged=false、cap_drop=[NET_RAW,NET_ADMIN] 保留、cap_add=None）
+    #[test]
+    fn test_security_opt_passes_through() {
+        let sec = ServiceSecurityConfig {
+            security_opt: Some(vec!["seccomp=unconfined".to_string()]),
+            ..Default::default()
+        };
+        let hc = build_host_config(vec![], HashMap::new(), false, None, Some(&sec));
+        assert_eq!(
+            hc.security_opt,
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+        assert_eq!(hc.privileged, Some(false));
+        assert_eq!(
+            hc.cap_drop,
+            Some(vec!["NET_RAW".to_string(), "NET_ADMIN".to_string()])
+        );
+        assert_eq!(hc.cap_add, None);
+    }
+
+    /// security = Some(privileged=true, cap_drop=[]) → privileged=true；
+    /// cap_drop=[]（显式空数组）覆盖默认，表示不 drop 任何 cap
+    #[test]
+    fn test_security_privileged_and_empty_cap_drop_override() {
+        let sec = ServiceSecurityConfig {
+            privileged: Some(true),
+            cap_drop: Some(vec![]),
+            ..Default::default()
+        };
+        let hc = build_host_config(vec![], HashMap::new(), false, None, Some(&sec));
+        assert_eq!(hc.privileged, Some(true));
+        assert_eq!(hc.cap_drop, Some(vec![]));
+    }
+
+    /// security = Some(cap_add + pids_limit + init) → 这些字段透传；
+    /// 未配的 privileged/cap_drop 回退默认
+    #[test]
+    fn test_security_cap_add_pids_init_pass_through() {
+        let sec = ServiceSecurityConfig {
+            cap_add: Some(vec!["SYS_PTRACE".to_string()]),
+            pids_limit: Some(200),
+            init: Some(true),
+            ..Default::default()
+        };
+        let hc = build_host_config(vec![], HashMap::new(), false, None, Some(&sec));
+        assert_eq!(hc.cap_add, Some(vec!["SYS_PTRACE".to_string()]));
+        assert_eq!(hc.pids_limit, Some(200));
+        assert_eq!(hc.init, Some(true));
+        assert_eq!(hc.privileged, Some(false));
+        assert_eq!(
+            hc.cap_drop,
+            Some(vec!["NET_RAW".to_string(), "NET_ADMIN".to_string()])
+        );
+    }
 }

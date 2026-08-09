@@ -474,7 +474,7 @@ pub async fn agent_session_cancel(
     let project_id = request
         .project_id
         .as_ref()
-        .expect("validated: project_id is required and non-empty");
+        .ok_or_else(|| AppError::validation_error("project_id is required"))?;
 
     info!(
         "🚫 [CANCEL] Agent cancel request: project_id={}, session_id={:?}",
@@ -570,24 +570,17 @@ pub async fn computer_agent_session_cancel(
 ) -> Result<HttpResult<AgentCancelResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
 
-    // 验证 user_id 或 pod_id 至少有一个
-    let has_user_id = request
-        .user_id
-        .as_ref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let has_pod_id = request
-        .pod_id
-        .as_ref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    if !has_user_id && !has_pod_id {
-        error!("[COMPUTER_CANCEL] user_id or pod_id is required");
-        return Ok(HttpResult::error_with_locale(
-            shared_types::error_codes::ERR_VALIDATION,
-            locale,
-        ));
-    }
+    let identifier = match (&request.user_id, &request.pod_id) {
+        (Some(user_id), _) if !user_id.trim().is_empty() => CancelIdentifier::User(user_id.clone()),
+        (_, Some(pod_id)) if !pod_id.trim().is_empty() => CancelIdentifier::Pod(pod_id.clone()),
+        _ => {
+            error!("[COMPUTER_CANCEL] user_id or pod_id is required");
+            return Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+            ));
+        }
+    };
 
     // 验证 project_id 不为空
     if request.project_id.trim().is_empty() {
@@ -602,13 +595,6 @@ pub async fn computer_agent_session_cancel(
         "🚀 [COMPUTER_CANCEL] Starting to process cancel request: user_id={:?}, pod_id={:?}, project_id={}, session_id={:?}",
         request.user_id, request.pod_id, request.project_id, request.session_id
     );
-
-    // 使用 user_id 或 pod_id 来构建 CancelIdentifier
-    let identifier = if has_user_id {
-        CancelIdentifier::User(request.user_id.clone().unwrap())
-    } else {
-        CancelIdentifier::Pod(request.pod_id.clone().unwrap())
-    };
 
     handle_session_cancel_internal_v2(
         &state,

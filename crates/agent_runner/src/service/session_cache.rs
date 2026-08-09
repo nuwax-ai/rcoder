@@ -7,9 +7,11 @@
 use crate::service::PERMISSION_MANAGER;
 use crate::{SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
+use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -59,20 +61,77 @@ pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock
 /// 与 ring buffer 大小一致，提供足够的缓冲同时防止 OOM
 const COMMAND_CHANNEL_BUFFER_SIZE: usize = 1000;
 
+/// worker 轻量命令应答超时（秒）: message_count / clear 等。
+///
+/// worker 被长任务占住时, 健康检查 / stop 等调用方应超时返回默认值
+/// 而不是无限挂死, 避免拖死整个请求链路 (Fail Fast)。
+const WORKER_REPLY_TIMEOUT_SECS: u64 = 5;
+
+/// replay 类命令应答超时（秒）。
+///
+/// replay_since 用于 SSE/gRPC 重连补发历史消息; 它超时静默返回空会丢失
+/// 重连区间消息, 违背 ring buffer 的设计初衷, 故给更长预算 (worker 被
+/// 积压 Push 占住时宁可多等, 也不能静默丢消息)。
+const WORKER_REPLAY_TIMEOUT_SECS: u64 = 30;
+
+/// 带超时等待 worker 应答; 超时/worker 退出时返回默认值并告警。
+async fn await_worker_reply<T: Default>(
+    command: &str,
+    timeout_secs: u64,
+    rx: oneshot::Receiver<T>,
+) -> T {
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            // RecvError: worker 侧 sender 已 drop (worker 退出/panic), 无更多细节
+            warn!(
+                %error,
+                "Worker reply channel closed for {command}; worker has exited"
+            );
+            T::default()
+        }
+        Err(error) => {
+            // Elapsed: 超时标记, 携带命令名 + 实际超时值便于定位慢点
+            warn!(
+                %error,
+                "Worker reply timed out after {timeout_secs}s for {command}; returning default"
+            );
+            T::default()
+        }
+    }
+}
+
 /// Session数据包装 - 极简版本，专注消息传输
-/// 当前活跃 SSE 连接的发送端（每条消息带 session 级单调 seq，见 SessionWorker::run 的 Push 分支）。
-type CurrentSender = Arc<tokio::sync::Mutex<Option<mpsc::Sender<(u64, UnifiedSessionMessage)>>>>;
+type SessionMessageSender = mpsc::Sender<(u64, UnifiedSessionMessage)>;
+
+struct ConnectionState {
+    sender: SessionMessageSender,
+    cancel: CancellationToken,
+}
+
+/// 当前活跃 SSE 连接的不可变快照。消息热路径 lock-free 读取，重连/关闭原子替换整组状态。
+type CurrentConnection = Arc<ArcSwapOption<ConnectionState>>;
 
 pub struct SessionData {
     command_tx: mpsc::Sender<SessionCommand>,
     // 🎯 极简优化：直接存储当前连接，无需命令传递
-    current_sender: CurrentSender,
-    current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
+    current_connection: CurrentConnection,
     // 🔒 Critical fix: 存储 worker JoinHandle，用于检测 panic
     worker_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// session 的 stream epoch(每次 new 生成新值)。rcoder 据此判断 seq epoch 是否变化:
+    /// 进程重启 / SessionWorker panic 重建都会 new → 新 epoch → rcoder 重置 last_seq + 清 ring(#15)。
+    epoch: String,
+    /// worker 已结束（panic/正常退出/cancel）标记。置位后并发调用据不再向已死 channel 推消息，
+    /// 直接走重建路径（修复 has_worker_panicked 的 take→replace 竞态丢消息）。
+    poisoned: AtomicBool,
 }
 
 impl SessionData {
+    /// 该 session 的 stream epoch(进程重启/worker panic 重建会换新)。供 rcoder 判断 seq epoch。
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
     pub async fn new(max_size: usize) -> Arc<Self> {
         let start_time = std::time::Instant::now();
         debug!(
@@ -90,9 +149,10 @@ impl SessionData {
         let arc_start = std::time::Instant::now();
         let session = Arc::new(SessionData {
             command_tx,
-            current_sender: Arc::new(tokio::sync::Mutex::new(None)),
-            current_cancel: Arc::new(tokio::sync::Mutex::new(None)),
+            current_connection: Arc::new(ArcSwapOption::empty()),
             worker_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            epoch: uuid::Uuid::now_v7().simple().to_string(),
+            poisoned: AtomicBool::new(false),
         });
         debug!(
             "[SessionData::new] Arc creation took: {:?}",
@@ -103,8 +163,7 @@ impl SessionData {
         let handle = SessionWorker::spawn(
             max_size,
             command_rx,
-            session.current_sender.clone(),
-            session.current_cancel.clone(),
+            Arc::clone(&session.current_connection),
         );
 
         // 🔒 Critical fix: 使用 async lock 替代 blocking_lock，避免阻塞 executor
@@ -136,7 +195,7 @@ impl SessionData {
             warn!("Failed to send message_count command; worker has exited");
             return 0;
         }
-        rx.await.unwrap_or(0)
+        await_worker_reply("message_count", WORKER_REPLY_TIMEOUT_SECS, rx).await
     }
 
     /// 增量回放 ring buffer：只返回 seq > from_seq 的消息（非破坏性读取，buffer 内容不变）。
@@ -155,7 +214,7 @@ impl SessionData {
             warn!("Failed to send replay command; worker has exited");
             return vec![];
         }
-        rx.await.unwrap_or_default()
+        await_worker_reply("replay_since", WORKER_REPLAY_TIMEOUT_SECS, rx).await
     }
 
     /// 清空 ring buffer 中所有消息
@@ -172,7 +231,7 @@ impl SessionData {
             warn!("Failed to send clear command; worker has exited");
             return 0;
         }
-        rx.await.unwrap_or(0)
+        await_worker_reply("clear_message_buffer", WORKER_REPLY_TIMEOUT_SECS, rx).await
     }
 
     /// 检查 worker 是否仍然存活
@@ -193,8 +252,18 @@ impl SessionData {
         let mut guard = self.worker_handle.lock().await;
         if let Some(handle) = guard.as_ref() {
             if handle.is_finished() {
+                // worker 已结束（panic/正常退出/cancel），channel 随之关闭。先标记 poisoned，
+                // 使并发调用（handle 已被 take 走、看到 None）据此重建，不再向已死 channel 推消息。
+                self.poisoned.store(true, Ordering::Release);
                 // take() 消耗 handle 来 await 获取结果
-                let handle = guard.take().unwrap();
+                // 安全：持有 Mutex 锁期间 as_ref() 与 take() 之间无竞争
+                let handle = match guard.take() {
+                    Some(h) => h,
+                    None => return self.poisoned.load(Ordering::Acquire),
+                };
+                // JoinHandle 已从共享状态移出；等待它之前释放锁，避免健康检查等调用
+                // 在任务退出清理较慢时被无谓串行化。
+                drop(guard);
                 match handle.await {
                     Err(e) if e.is_panic() => {
                         warn!("[SessionData] SessionWorker panicked: {:?}", e);
@@ -214,7 +283,8 @@ impl SessionData {
                 false
             }
         } else {
-            false
+            // handle 已被并发调用 take 走（worker 已结束）：据 poisoned 判断是否需重建
+            self.poisoned.load(Ordering::Acquire)
         }
     }
 
@@ -248,32 +318,24 @@ impl SessionData {
         );
 
         let setup_start = std::time::Instant::now();
-        // 🛡️ 关键修复：使用 lock() 而非 try_lock()，确保连接一定被设置
-        // try_lock() 可能失败导致 current_sender 未设置，造成消息丢失
-        {
-            // 取消之前的连接
-            let mut current_cancel_guard = self.current_cancel.lock().await;
-            if let Some(token) = current_cancel_guard.take() {
-                token.cancel();
-            }
-            // 设置新的取消令牌
-            *current_cancel_guard = Some(cancellation_token.clone());
-
-            // 设置新的发送器
-            let mut current_sender_guard = self.current_sender.lock().await;
-            *current_sender_guard = Some(tx);
+        let previous = self.current_connection.swap(Some(Arc::new(ConnectionState {
+            sender: tx,
+            cancel: cancellation_token.clone(),
+        })));
+        if let Some(previous) = previous {
+            previous.cancel.cancel();
         }
         debug!(
             "[create_new_connection] Connection state setup took: {:?}",
             setup_start.elapsed()
         );
 
-        // 📼 回放 ring buffer 中的历史消息（在设置 current_sender 之后）
-        // 确保快照包含设置 current_sender 之前缓冲的所有消息
+        // 📼 回放 ring buffer 中的历史消息（在设置 current_connection 之后）
+        // 确保快照包含设置 current_connection 之前缓冲的所有消息
         // 时序保证：
-        // 1. 设置 current_sender 后，新消息会通过 channel 发送
-        // 2. replay_buffer() 获取的是设置 current_sender 之前缓冲的消息
-        // 3. 这些消息不会通过 current_sender 发送，所以需要回放
+        // 1. 设置 current_connection 后，新消息会通过 channel 发送
+        // 2. replay_buffer() 获取的是设置 current_connection 之前缓冲的消息
+        // 3. 这些消息不会通过 current_connection 发送，所以需要回放
         let replay_start = std::time::Instant::now();
         let replay_messages = self.replay_since(from_seq).await;
         if !replay_messages.is_empty() {
@@ -340,18 +402,11 @@ impl SessionData {
     /// 1. 触发 CancellationToken，让 SSE 流立即退出循环
     /// 2. 显式关闭 channel 发送端，让 rx.recv() 立即返回 None
     /// 3. 清空连接状态，防止新的消息被发送
-    pub async fn close_current_connection(&self) {
+    pub fn close_current_connection(&self) {
         // 🎯 主动触发取消令牌，关闭 SSE 连接
-        let mut current_cancel_guard = self.current_cancel.lock().await;
-        if let Some(token) = current_cancel_guard.take() {
+        if let Some(connection) = self.current_connection.swap(None) {
             info!("[SessionData] Triggering CancellationToken to close SSE connection");
-            token.cancel();
-        }
-        drop(current_cancel_guard);
-
-        // 🎯 显式关闭 channel 发送端，让接收端立即感知到连接关闭
-        let mut current_sender_guard = self.current_sender.lock().await;
-        if current_sender_guard.take().is_some() {
+            connection.cancel.cancel();
             info!(
                 "[SessionData] Explicitly closed channel sender; receiver disconnects immediately"
             );
@@ -365,16 +420,14 @@ struct SessionWorker {
     max_size: usize,
     command_rx: mpsc::Receiver<SessionCommand>,
     // 🎯 极简优化：直接共享连接状态，无需命令传递
-    current_sender: CurrentSender,
-    current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
+    current_connection: CurrentConnection,
 }
 
 impl SessionWorker {
     fn spawn(
         max_size: usize,
         command_rx: mpsc::Receiver<SessionCommand>,
-        current_sender: CurrentSender,
-        current_cancel: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
+        current_connection: CurrentConnection,
     ) -> tokio::task::JoinHandle<()> {
         let start_time = std::time::Instant::now();
         debug!(
@@ -385,8 +438,7 @@ impl SessionWorker {
         let worker = SessionWorker {
             max_size,
             command_rx,
-            current_sender,
-            current_cancel,
+            current_connection,
         };
 
         let spawn_start = std::time::Instant::now();
@@ -438,7 +490,7 @@ impl SessionWorker {
 
                     if should_buffer {
                         if producer.is_full() {
-                            let _ = consumer.try_pop();
+                            drop(consumer.try_pop());
                             buffered_len = buffered_len.saturating_sub(1);
                         }
                         if producer.try_push((seq, message.clone())).is_ok() {
@@ -448,12 +500,10 @@ impl SessionWorker {
                         }
                     }
 
-                    // 🛡️ 关键修复：使用 lock().await 确保消息一定被发送
-                    // try_lock() 可能失败导致消息丢失，造成 SSE 卡死
-                    let mut current_sender_guard = self.current_sender.lock().await;
-                    if let Some(sender) = current_sender_guard.as_mut() {
+                    let current_connection = self.current_connection.load();
+                    if let Some(connection) = current_connection.as_ref() {
                         use tokio::sync::mpsc::error::TrySendError;
-                        if let Err(send_err) = sender.try_send((seq, message.clone())) {
+                        if let Err(send_err) = connection.sender.try_send((seq, message.clone())) {
                             match send_err {
                                 TrySendError::Full(_) => {
                                     // buffer 满（客户端暂时慢）：不禁用 sender，等客户端消费后恢复
@@ -470,7 +520,11 @@ impl SessionWorker {
                                         "SSE sender receiver dropped, disabling sender: message_type={:?}, sub_type={}",
                                         message.message_type, message.sub_type,
                                     );
-                                    *current_sender_guard = None;
+                                    // 仅当它仍是当前连接时清除，避免旧 receiver 关闭误删刚建立的新连接。
+                                    drop(
+                                        self.current_connection
+                                            .compare_and_swap(&*current_connection, None),
+                                    );
                                 }
                             }
                         }
@@ -511,7 +565,9 @@ impl SessionWorker {
                         snapshot.len(),
                         occupied
                     );
-                    let _ = ack.send(snapshot);
+                    if let Err(e) = ack.send(snapshot) {
+                        warn!("session_cache ack send failed (subscriber gone): {e:?}");
+                    }
                 }
             }
         }
@@ -645,7 +701,25 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             0
         }
         Some(old_session_id) => {
-            // session_id 发生变化，需要清理旧 session 的数据
+            // 🛡️ 区分"合法正向迁移"与"过期 sessionId 反向顶替"。
+            // 传入 sid 若不是当前 project 的活跃 session（已被新 session 顶替后从
+            // session_to_project 移除 / 属于别的 project / 从未注册），说明是 agent
+            // 用过期 sessionId 推来的迟到通知（如技能加载后的 available_commands_update）。
+            // 此时只把消息 buffer 到该 sid，绝不反向改写 project 映射、不 cancel
+            // 当前正在工作的真实 SSE（否则前端会收到 sub=cancelled）。
+            let is_current_active = AGENT_REGISTRY
+                .get_project_by_session(session_id)
+                .map(|p| p == project_id)
+                .unwrap_or(false);
+            if !is_current_active {
+                info!(
+                    "Stale session_id ignored, skip migration (buffer-only): project_id={}, mapped={}, incoming={}",
+                    project_id, old_session_id, session_id
+                );
+                return 0;
+            }
+
+            // 合法正向迁移（传入 sid 是当前 project 的活跃 session）：保留原有清理逻辑
             info!(
                 "Detected project session change: project_id={}, old_session_id={}, new_session_id={}",
                 project_id, old_session_id, session_id
@@ -657,7 +731,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             let cleared_count = if let Some((_, old_session_data)) =
                 SESSION_CACHE.remove(&old_session_id)
             {
-                old_session_data.close_current_connection().await;
+                old_session_data.close_current_connection();
                 info!(
                     "[ensure_project_session] Closed old session SSE connection: old_session_id={}",
                     old_session_id
@@ -668,7 +742,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             };
 
             // 更新 AGENT_REGISTRY 中的映射关系
-            let _ = AGENT_REGISTRY.update_session(project_id, session_id);
+            drop(AGENT_REGISTRY.update_session(project_id, session_id));
 
             // 清理旧 session_id 的动态权限状态（session_id 变更后旧 state 不再被引用，防泄漏）。
             PERMISSION_MANAGER.clear_session_state(&old_session_id);
@@ -723,7 +797,12 @@ mod tests {
         sd.push_message(make_msg("b")); // seq 2
         sd.push_message(make_msg("c")); // seq 3
 
-        let got: Vec<u64> = sd.replay_since(1).await.into_iter().map(|(s, _)| s).collect();
+        let got: Vec<u64> = sd
+            .replay_since(1)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
         assert_eq!(got, vec![2, 3], "replay_since(1) must return only seq>1");
     }
 
@@ -736,7 +815,12 @@ mod tests {
         assert_eq!(cleared, 2);
         sd.push_message(make_msg("c")); // seq 必须为 3（不随 clear 重置）
 
-        let got: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
+        let got: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
         assert_eq!(got, vec![3], "seq must remain monotonic after clear");
     }
 
@@ -746,8 +830,18 @@ mod tests {
         sd.push_message(make_msg("a"));
         sd.push_message(make_msg("b"));
 
-        let first: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
-        let second: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
+        let first: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        let second: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
         assert_eq!(first, second);
         assert_eq!(first, vec![1, 2], "replay must not drain the buffer");
     }
@@ -770,8 +864,17 @@ mod tests {
         sd.push_message(make_heartbeat());
         sd.push_message(make_msg("b")); // seq 2（Heartbeat 不占 seq 号）
 
-        let got: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
-        assert_eq!(got, vec![1, 2], "Heartbeat must not be buffered; seq must skip it");
+        let got: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(
+            got,
+            vec![1, 2],
+            "Heartbeat must not be buffered; seq must skip it"
+        );
     }
 
     #[tokio::test]
@@ -783,7 +886,88 @@ mod tests {
         sd.push_message(make_msg("d")); // seq 4，挤掉 seq1
         sd.push_message(make_msg("e")); // seq 5，挤掉 seq2
 
-        let got: Vec<u64> = sd.replay_since(0).await.into_iter().map(|(s, _)| s).collect();
-        assert_eq!(got, vec![3, 4, 5], "ring overflow drops oldest, seq stays contiguous");
+        let got: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(
+            got,
+            vec![3, 4, 5],
+            "ring overflow drops oldest, seq stays contiguous"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_swap_cancels_previous_and_close_drops_sender() {
+        let session = SessionData::new(8).await;
+        let (_, mut first_rx, first_cancel) = session
+            .create_new_connection(8, 0)
+            .await
+            .expect("first connection");
+        let (_, mut second_rx, second_cancel) = session
+            .create_new_connection(8, 0)
+            .await
+            .expect("second connection");
+
+        assert!(first_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
+        assert!(
+            first_rx.recv().await.is_none(),
+            "old sender must be dropped"
+        );
+
+        session.close_current_connection();
+        assert!(second_cancel.is_cancelled());
+        assert!(
+            second_rx.recv().await.is_none(),
+            "closing must atomically drop current sender"
+        );
+    }
+
+    fn make_agent_info(project_id: &str, session_id: &str) -> shared_types::ProjectAndAgentInfo {
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        shared_types::ProjectAndAgentInfo {
+            project_id: project_id.to_string(),
+            session_id: agent_client_protocol::schema::v1::SessionId::new(Arc::from(session_id)),
+            prompt_tx: mpsc::channel(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY).0,
+            cancel_tx: mpsc::channel(shared_types::AGENT_CANCEL_CHANNEL_CAPACITY).0,
+            model_provider: None,
+            request_id: None,
+            status: shared_types::AgentStatus::Idle,
+            last_activity: Utc::now(),
+            created_at: Utc::now(),
+            stop_handle: None,
+            agent_binary_snapshot: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_project_session_ignores_stale_session_id() {
+        // C-slim 回归保护：agent 用过期/陌生 sessionId 推消息时，
+        // 不得反向改写 project 映射、不得 cancel 当前正在工作的真实 SSE。
+        let project = "cslim_stale_proj";
+        let real_sid = "ses_real_active";
+        let stale_sid = "753cf1fd-stale-not-registered";
+
+        let registry = &AGENT_REGISTRY;
+        registry.remove_by_project(project); // 幂等清理残留
+        registry.register(project, real_sid, make_agent_info(project, real_sid));
+
+        // stale_sid 从未注册 → get_project_by_session(stale_sid)=None → 只 buffer，返回 0
+        let cleared = ensure_project_session(project, stale_sid).await;
+        assert_eq!(
+            cleared, 0,
+            "stale sid must be ignored (buffer-only, no migration)"
+        );
+        assert_eq!(
+            registry.get_session_by_project(project).as_deref(),
+            Some(real_sid),
+            "active session mapping must NOT be overwritten by a stale sid"
+        );
+
+        registry.remove_by_project(project);
     }
 }

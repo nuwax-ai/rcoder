@@ -10,6 +10,9 @@
 
 /// gRPC 生成的类型（protobuf 消息和服务）
 pub mod grpc {
+    // prost-build 生成代码: 输出风格固定使用全限定路径 (::prost::alloc::string::String 等),
+    // 不属于手写代码质量问题, 抑制相应 lint。
+    #![allow(unused_qualifications)]
     include!("grpc/agent.rs");
 }
 

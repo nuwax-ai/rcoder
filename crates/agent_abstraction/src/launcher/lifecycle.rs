@@ -9,7 +9,7 @@
 //! 解决方案：
 //! 1. **后台回收任务**：立即启动后台任务 wait() 子进程
 //! 2. **进程组终止**：使用 nix::kill 发送信号到进程组
-//! 3. **三重保障**：PID 1 的 process_reaper 模块兜底
+//! 3. **三重保障**：tini(容器 PID 1)兜底回收孤儿进程
 //!
 //! ## 进程组说明
 //!
@@ -67,7 +67,7 @@ pub struct ClaudeProcessParams {
 ///
 /// 1. **后台回收任务**：构造时立即启动 tokio::spawn 等待子进程
 /// 2. **进程组终止**：Drop 时发送信号到进程组（使用 nix::kill）
-/// 3. **PID 1 兜底**：process_reaper 模块自动回收所有孤儿进程
+/// 3. **PID 1 兜底**：tini(容器 PID 1)自动回收所有孤儿进程
 ///
 /// ## 进程组信号
 ///
@@ -154,7 +154,7 @@ impl AgentLifecycleGuard {
         child_process: Box<dyn ChildWrapper>,
         stderr_task: JoinHandle<()>,
         cancel_token: CancellationToken,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_claude_full(ClaudeProcessParams {
             project_id,
             session_id,
@@ -177,10 +177,10 @@ impl AgentLifecycleGuard {
     ///
     /// 支持所有可选功能：密钥管理器、异常退出标志、诊断监听器等。
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// 如果子进程 PID 无效（为 0 或 None），此函数会 panic，因为这意味着进程启动失败。
-    pub fn new_claude_full(params: ClaudeProcessParams) -> Self {
+    /// 子进程 PID 不存在或为 0 时返回初始化错误。
+    pub fn new_claude_full(params: ClaudeProcessParams) -> Result<Self> {
         let ClaudeProcessParams {
             project_id,
             session_id,
@@ -197,24 +197,9 @@ impl AgentLifecycleGuard {
             process_args,
             working_dir,
         } = params;
-        // 🔥 关键：PID 有效性检查
-        // ChildWrapper 的 id() 返回 Option<u32>，当进程已终止或无效时返回 None
-        // 如果 PID 无效，这是一个严重的初始化错误，应该 panic
-        let pid = child_process.id().unwrap_or_else(|| {
-            panic!(
-                "[LifecycleGuard] 子进程 PID 无效（None），进程可能已终止: project_id={}",
-                project_id
-            )
-        });
-
-        // 🔥 额外检查：PID 不应该为 0
-        // 虽然 id() 返回 Some(0) 理论上可能，但实际上 PID 0 是内核保留的
-        if pid == 0 {
-            panic!(
-                "[LifecycleGuard] 子进程 PID 为 0，这是无效的 PID: project_id={}",
-                project_id
-            );
-        }
+        let pid = child_process.id().filter(|pid| *pid != 0).ok_or_else(|| {
+            anyhow::anyhow!("lifecycle child process has no valid PID: project_id={project_id}")
+        })?;
 
         // 🔥 进程组 ID 等于组长进程的 PID
         // process-wrap 的 ProcessGroup 使用 setpgid(0, 0) 创建新进程组，使进程成为组长
@@ -383,12 +368,14 @@ impl AgentLifecycleGuard {
             project_id, pgid, session_id_str
         );
 
-        Self { inner }
+        Ok(Self { inner })
     }
 
     /// 优雅停止agent
     ///
-    /// 带超时机制（5秒），超时后强制 kill 进程组
+    /// 带升级机制：SIGTERM → 等 500ms → SIGKILL（见 kill_process_group）。
+    /// 注：容器内子进程若为 PID 1 则信号被内核忽略，此时跳过进程组信号、
+    /// 仅发 cancel 信号并依赖 init 收割（见 kill_process_group 的 pgid==1 防御）。
     ///
     /// ## 进程组终止
     ///
@@ -471,6 +458,20 @@ impl AgentLifecycleGuard {
             if pgid == 0 {
                 warn!(
                     "[LifecycleGuard] 进程组 ID 为 0，跳过进程组终止（可能是初始化失败）: project_id={}",
+                    self.inner.project_id
+                );
+                return Ok(());
+            }
+
+            // 🔥 PID 1 防御：子进程以 ProcessGroup::leader() 启动，pgid == child_pid。
+            // 在 docker exec 等场景子进程可能拿到 pid 1，此时：
+            // - kill(-1, SIG) 语义是「所有进程组」，绝不能发；
+            // - 内核默认忽略 PID 1 的未注册信号（含 SIGTERM/SIGKILL）。
+            // 依赖容器内 init（如 tini）兼作孤儿进程收割者（见本模块顶部说明）。
+            if pgid == 1 {
+                warn!(
+                    "[LifecycleGuard] pgid==1（子进程为容器 PID 1），跳过进程组信号终止，\
+                     仅依赖 cancel 信号与 init 收割: project_id={}",
                     self.inner.project_id
                 );
                 return Ok(());
@@ -648,9 +649,7 @@ impl Drop for AgentLifecycleGuard {
 
 // 为AgentLifecycleGuard实现AgentLifecycle trait
 impl AgentLifecycle for AgentLifecycleGuard {
-    fn graceful_stop(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn graceful_stop(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move { AgentLifecycleGuard::graceful_stop(self).await })
     }
 

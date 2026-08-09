@@ -93,7 +93,9 @@ pub trait ContainerLookup: Send + Sync {
                     None
                 }
             }
-            ServiceType::WebAgentRunner => {
+            // UserApp / UserAppBuilder 的 identifier 是 app_id(兼任 project_id),
+            // 复用 project_id 查找路径(通常不注册到 agent lookup,命中预期为 None)
+            ServiceType::WebAgentRunner | ServiceType::UserApp | ServiceType::UserAppBuilder => {
                 if let Some(pid) = project_id {
                     let result = self.find_by_project_id(pid, service_type);
                     if result.is_some() {

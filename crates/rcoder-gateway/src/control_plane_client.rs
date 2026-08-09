@@ -91,8 +91,7 @@ impl ControlPlaneClient {
 
 /// 安全构建 backend_cluster 名
 ///
-/// 格式: `backend-{sanitized_identifier}`
-/// 与 docker_manager 的 K8sBackendCRDOps::backend_crd_name 保持一致
+/// 格式: `backend-{sanitized_identifier}`（rcoder-gateway 内部 cluster 命名约定）
 pub fn build_backend_cluster_name(identifier: &str) -> String {
     let sanitized = identifier
         .to_ascii_lowercase()

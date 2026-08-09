@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1280, initial-scale=1">
+<title>Canvas Sync 测试页</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 24px;
+         background: #f5f5f5; color: #222; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .lead { color: #666; font-size: 13px; margin-bottom: 20px; }
+  .card { background: #fff; border-radius: 8px; padding: 18px 20px; margin-bottom: 16px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .label { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 10px; }
+  button { font-size: 14px; padding: 9px 18px; background: #1976d2; color: #fff; border: 0;
+           border-radius: 4px; cursor: pointer; }
+  button:hover { background: #1565c0; }
+  #count { font-size: 32px; font-weight: 700; color: #1976d2; margin-left: 14px; vertical-align: middle; }
+  input { font-size: 14px; padding: 9px; width: 320px; border: 1px solid #ccc; border-radius: 4px; }
+  #echo { color: #555; margin-top: 8px; font-size: 13px; min-height: 18px; }
+  .scroll { height: 140px; overflow: auto; border: 1px solid #ddd; padding: 8px 12px;
+            background: #fafafa; border-radius: 4px; line-height: 1.8; }
+  .modal { position: fixed; top: 80px; right: 24px; width: 280px; background: #fff3cd;
+           border: 1px solid #ffe08a; border-radius: 8px; padding: 14px 16px;
+           box-shadow: 0 4px 14px rgba(0,0,0,.15); }
+  .modal .x { position: absolute; top: 6px; right: 10px; cursor: pointer; font-size: 18px;
+              color: #8a6d3b; background: none; border: 0; padding: 0; line-height: 1; }
+  .modal p { font-size: 13px; margin: 6px 0 0; color: #6a5300; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+  <h1>Canvas Sync POC — 测试页</h1>
+  <p class="lead">此页面由容器内的 headless Chrome 渲染,经 CDP screencast 推送到 viewer,反向输入也会回到这里。</p>
+
+  <div class="modal" id="modal">
+    <button class="x" onclick="document.getElementById('modal').classList.add('hidden')" title="关闭">✕</button>
+    <strong>👋 这是一个弹框</strong>
+    <p>点右上角 ✕ 关闭我(验证「关弹框」闭环)。</p>
+  </div>
+
+  <div class="card">
+    <div class="label">① 点击计数器 — 验证点击 + 画面同步</div>
+    <button onclick="inc()">点我 +1</button><span id="count">0</span>
+  </div>
+
+  <div class="card">
+    <div class="label">② 文字输入 — 验证键盘同步</div>
+    <input id="txt" placeholder="点这里获得焦点后打字..." autocomplete="off"
+           oninput="document.getElementById('echo').textContent = '你输入了: ' + this.value">
+    <div id="echo">你输入了: </div>
+  </div>
+
+  <div class="card">
+    <div class="label">③ 滚动区域 — 验证滚轮同步</div>
+    <div class="scroll" id="scroll">
+      <div>第 1 行 — 在画面上滚动鼠标滚轮</div>
+      <div>第 2 行 ...</div>
+      <div>第 3 行 ...</div>
+      <div>第 4 行 ...</div>
+      <div>第 5 行 ...</div>
+      <div>第 6 行 ...</div>
+      <div>第 7 行 ...</div>
+      <div>第 8 行 ...</div>
+      <div>第 9 行 ...</div>
+      <div>第 10 行 ...</div>
+      <div>第 11 行 ...</div>
+      <div>第 12 行 ...</div>
+      <div>第 13 行 ...</div>
+      <div>第 14 行 — 到底啦</div>
+    </div>
+  </div>
+
+  <script>
+    let n = 0;
+    function inc() {
+      n++;
+      document.getElementById('count').textContent = n;
+    }
+  </script>
+</body>
+</html>

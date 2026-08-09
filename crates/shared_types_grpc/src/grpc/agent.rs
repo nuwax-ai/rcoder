@@ -196,6 +196,12 @@ pub struct GetStatusResponse {
     /// Agent 是否存在于 Registry
     #[prost(bool, tag = "2")]
     pub is_found: bool,
+    /// session 的 stream epoch(per-SessionData 生成,重启 + worker panic 重建都会换新)。
+    /// rcoder 据此判断 seq epoch:同 epoch → 增量订阅保留 last_seq;epoch 变化 → 重置 last_seq
+    ///
+    /// * 清 ring + cursor-reset,避免新 epoch 的低 seq 事件被客户端去重静默丢弃(#15)。
+    #[prost(string, optional, tag = "3")]
+    pub stream_epoch: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopAgentRequest {

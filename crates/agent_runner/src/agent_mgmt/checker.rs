@@ -41,7 +41,9 @@ pub async fn init_builtin_agent_versions() {
     }
 
     // 一次性设置缓存
-    let _ = VERSION_CACHE.set(cache);
+    if let Err(e) = VERSION_CACHE.set(cache) {
+        tracing::warn!("VERSION_CACHE set failed (already initialized): {e:?}");
+    }
 }
 
 /// 获取 agent 版本（优先使用缓存）

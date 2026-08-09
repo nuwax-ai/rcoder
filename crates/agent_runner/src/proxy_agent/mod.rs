@@ -41,7 +41,7 @@ impl PingoraStartResult {
 #[cfg(feature = "proxy")]
 pub fn start_pingora(
     proxy_config: &ProxyConfig,
-    shared_api_key_manager: Arc<dashmap::DashMap<String, shared_types::ModelProviderConfig>>,
+    shared_api_key_manager: Arc<DashMap<String, shared_types::ModelProviderConfig>>,
 ) -> Result<PingoraStartResult> {
     info!(
         "Starting Pingora reverse proxy service, listening on port: {}",

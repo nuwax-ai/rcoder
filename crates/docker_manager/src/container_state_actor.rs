@@ -63,6 +63,13 @@ pub enum ContainerStateCommand {
         container_id: String,
         reply: oneshot::Sender<Option<DockerContainerInfo>>,
     },
+    /// 移除所有 container_id 匹配的条目（单次遍历，返回被移除项）。
+    /// 用于 cleanup_all_containers 等场景，替代逐个 list() 的 O(n²)；仍按
+    /// container_id 精确匹配，保留"防误删重启新容器"语义。
+    RemoveAllByContainerId {
+        container_id: String,
+        reply: oneshot::Sender<Vec<DockerContainerInfo>>,
+    },
 }
 
 /// 容器状态 Actor
@@ -176,6 +183,25 @@ impl ContainerStateActor {
                     warn!("[ACTOR] RemoveIfContainerId reply channel closed");
                 }
             }
+            ContainerStateCommand::RemoveAllByContainerId {
+                container_id,
+                reply,
+            } => {
+                // 单次遍历收集匹配 key，再逐个 remove（O(n)，一次 actor 往返）
+                let matching_keys: Vec<String> = self
+                    .containers
+                    .iter()
+                    .filter(|(_, info)| info.container_id == container_id)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                let removed: Vec<DockerContainerInfo> = matching_keys
+                    .into_iter()
+                    .filter_map(|k| self.containers.remove(&k))
+                    .collect();
+                if reply.send(removed).is_err() {
+                    warn!("[ACTOR] RemoveAllByContainerId reply channel closed");
+                }
+            }
         }
     }
 }
@@ -204,7 +230,10 @@ impl ContainerStateHandle {
             error!("[HANDLE] Failed to send Get command - actor stopped");
             return None;
         }
-        rx.await.unwrap_or(None)
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] Get reply failed - actor task died");
+            None
+        })
     }
 
     /// 插入/更新容器信息
@@ -234,7 +263,10 @@ impl ContainerStateHandle {
             error!("[HANDLE] Failed to send Remove command - actor stopped");
             return None;
         }
-        rx.await.unwrap_or(None)
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] Remove reply failed - actor task died");
+            None
+        })
     }
 
     /// 获取所有容器列表
@@ -249,7 +281,10 @@ impl ContainerStateHandle {
             error!("[HANDLE] Failed to send List command - actor stopped");
             return Vec::new();
         }
-        rx.await.unwrap_or_default()
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] List reply failed - actor task died");
+            Vec::new()
+        })
     }
 
     /// 获取所有 key 列表
@@ -264,7 +299,10 @@ impl ContainerStateHandle {
             error!("[HANDLE] Failed to send Keys command - actor stopped");
             return Vec::new();
         }
-        rx.await.unwrap_or_default()
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] Keys reply failed - actor task died");
+            Vec::new()
+        })
     }
 
     /// 获取容器数量
@@ -279,7 +317,10 @@ impl ContainerStateHandle {
             error!("[HANDLE] Failed to send Len command - actor stopped");
             return 0;
         }
-        rx.await.unwrap_or(0)
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] Len reply failed - actor task died");
+            0
+        })
     }
 
     /// 检查是否为空
@@ -302,7 +343,10 @@ impl ContainerStateHandle {
             error!("[HANDLE] Failed to send Contains command - actor stopped");
             return false;
         }
-        rx.await.unwrap_or(false)
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] Contains reply failed - actor task died");
+            false
+        })
     }
 
     /// 条件更新：如果 key 存在则更新
@@ -323,7 +367,10 @@ impl ContainerStateHandle {
             error!("[HANDLE] Failed to send UpdateWith command - actor stopped");
             return false;
         }
-        rx.await.unwrap_or(false)
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] UpdateWith reply failed - actor task died");
+            false
+        })
     }
 
     /// 条件移除：只有当 container_id 匹配时才移除
@@ -348,7 +395,31 @@ impl ContainerStateHandle {
             error!("[HANDLE] Failed to send RemoveIfContainerId command - actor stopped");
             return None;
         }
-        rx.await.unwrap_or(None)
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] RemoveIfContainerId reply failed - actor task died");
+            None
+        })
+    }
+
+    /// 移除所有 container_id 匹配的条目（单次 actor 往返，替代多次 list() 的 O(n²)）。
+    pub async fn remove_all_by_container_id(&self, container_id: &str) -> Vec<DockerContainerInfo> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(ContainerStateCommand::RemoveAllByContainerId {
+                container_id: container_id.to_string(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            error!("[HANDLE] Failed to send RemoveAllByContainerId command - actor stopped");
+            return vec![];
+        }
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] RemoveAllByContainerId reply failed - actor task died");
+            vec![]
+        })
     }
 }
 

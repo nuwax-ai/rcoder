@@ -9,22 +9,19 @@ use async_trait::async_trait;
 use chrono::Utc;
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{
-    ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, RemovedContainerInfo, RuntimeContainerInfo,
+    AgentContainerRuntime, ContainerCreateParams, ContainerLogEntry, ContainerRuntimeError,
+    ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus,
+    HttpExpose, RemovedContainerInfo, RuntimeContainerInfo, UserAppDeploymentRuntime,
+    WorkspaceRuntime,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
-    Container as K8sContainer, ContainerPort, EnvVar, LocalObjectReference, PersistentVolumeClaim,
-    Pod, PodSecurityContext, PodSpec, Probe, ResourceRequirements, Service, Volume, VolumeMount,
+    PersistentVolume, PersistentVolumeClaim, Pod, ResourceRequirements,
 };
-#[cfg(feature = "kubernetes")]
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-#[cfg(feature = "kubernetes")]
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
 use kube::Config;
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, DeleteParams, DynamicObject, ListParams, ObjectMeta, PostParams};
+use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams};
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
 #[cfg(feature = "kubernetes")]
@@ -34,19 +31,31 @@ use std::sync::Arc;
 #[cfg(feature = "kubernetes")]
 use tokio::sync::RwLock;
 #[cfg(feature = "kubernetes")]
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "kubernetes")]
-use super::{
-    k8s_backend_crd::K8sBackendCRDOps,
-    k8s_pod::K8sPodOps,
-    k8s_pvc::K8sPvcOps,
-    k8s_service::{K8sServiceOps, build_standard_labels},
-};
+use super::k8s_pvc::K8sPvcOps;
 #[cfg(feature = "kubernetes")]
 use crate::types::DockerManagerConfig;
 #[cfg(feature = "kubernetes")]
-const RUNTIME_MANAGED_LABEL: &str = "managed-by=rcoder-runtime";
+// 全键：Pod/Service 经 build_standard_labels 写入的是 app.kubernetes.io/managed-by
+// （K8s 惯例）。裸 key "managed-by" 只历史性地写在 PVC/Backend CRD 上，
+// 会导致 cleanup_all/list_containers 的 label selector 匹配不到 Pod/Service（空跑）。
+// 此处与 PVC/Backend CRD 的 label 写入一并对齐到全键。
+pub(crate) const RUNTIME_MANAGED_LABEL: &str = "app.kubernetes.io/managed-by=rcoder-runtime";
+
+/// pod_cache 条目的新鲜度包装：记录写入时刻，TTL 过期则视为 miss 走 K8s API，
+/// 修复外部 `kubectl delete pod` / STS 重建窗口期内仍返回旧 Running 的问题。
+#[cfg(feature = "kubernetes")]
+#[derive(Clone)]
+pub(crate) struct CachedPod {
+    pub(crate) info: RuntimeContainerInfo,
+    pub(crate) cached_at: std::time::Instant,
+}
+
+/// pod_cache TTL：超过则视为 miss。30s 平衡缓存收益与外部删除后的可见性窗口。
+#[cfg(feature = "kubernetes")]
+pub(crate) const POD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Kubernetes runtime implementation using kube-rs
 #[cfg(feature = "kubernetes")]
@@ -55,7 +64,12 @@ pub struct KubernetesRuntime {
     pub(crate) namespace: String,
     pub(crate) config: KubernetesRuntimeConfig,
     /// Cache for pod information (using RwLock to avoid DashMap deadlocks)
-    pub(crate) pod_cache: Arc<RwLock<std::collections::HashMap<String, RuntimeContainerInfo>>>,
+    pub(crate) pod_cache: Arc<RwLock<std::collections::HashMap<String, CachedPod>>>,
+    /// CephFS subvolumePath 缓存(key=pvc_name,resolve_subvolume_path_by_pvcname 用)。
+    /// subvolumePath 对 PVC 不可变 → 命中即安全;cache miss 时查 K8s(PVC→PV→csi.subvolumePath)懒填充。
+    /// 失效时机:PVC destroy(destroy_workspace_pvc 等 remove)+ cleanup_all clear。
+    /// 阶段2: rcoder 挂根聚合访问 agent subvolume (/app/cephfs-root/{subvolumePath}/...)。
+    pub(crate) subvolume_path_cache: Arc<RwLock<std::collections::HashMap<String, String>>>,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -82,6 +96,8 @@ pub struct KubernetesRuntimeConfig {
     pub access_mode: String,
     /// DockerManagerConfig for image selection (包含 multi_image_config)
     pub docker_manager_config: DockerManagerConfig,
+    /// K8s 运行时专用配置(自包含 image/env/command/卷/sidecar;K8s 构建器只读它)
+    pub kubernetes_config: shared_types::KubernetesConfig,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -122,22 +138,33 @@ impl KubernetesRuntime {
             nfs_server, nfs_path, storage_class, access_mode
         );
 
+        // 先取出 kubernetes_config(克隆),之后把 config 整体 move 进 docker_manager_config,
+        // 避免克隆整个 DockerManagerConfig(含 multi_image_config 的 HashMap)。
+        let kubernetes_config = config.kubernetes_config.clone();
+        // pod_ttl_seconds 是 Copy,move 前读取即可。
+        let pod_ttl_seconds = config.container_ttl_seconds;
+
         Ok(Self {
             client,
             namespace: namespace.clone(),
             config: KubernetesRuntimeConfig {
                 namespace: namespace.clone(),
                 cluster_domain,
-                pod_ttl_seconds: config.container_ttl_seconds,
+                pod_ttl_seconds,
                 image_pull_secret: std::env::var("RCODER_K8S_IMAGE_PULL_SECRET").ok(),
-                service_account_name: "rcoder-pods-sa".to_string(),
+                // agent-runner Pod 的 ServiceAccount 名（helm 注入 RCODER_AGENT_RUNNER_SA）。
+                // 兜底 rcoder-pods-sa 以兼容未注入该 env 的旧 chart，不破现有部署。
+                service_account_name: std::env::var("RCODER_AGENT_RUNNER_SA")
+                    .unwrap_or_else(|_| "rcoder-pods-sa".to_string()),
                 nfs_server,
                 nfs_path,
                 storage_class,
                 access_mode,
                 docker_manager_config: config,
+                kubernetes_config,
             },
             pod_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            subvolume_path_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
         })
     }
 
@@ -151,23 +178,46 @@ impl KubernetesRuntime {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
+    /// Get the HTTPRoute API（gateway.networking.k8s.io/v1 动态资源；apply / delete by name / label 扫 / 条件删共用）
+    pub(crate) fn httproute_api(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
+        let ar = ApiResource::from_gvk(&gvk);
+        Api::namespaced_with(self.client.clone(), &self.namespace, &ar)
+    }
+
+    /// Get the PV API (cluster-scoped)
+    ///
+    /// 阶段2: 读 PV `csi.volumeAttributes.subvolumePath` (rcoder 挂根聚合)。
+    pub(crate) fn pvs(&self) -> Api<PersistentVolume> {
+        Api::<PersistentVolume>::all(self.client.clone())
+    }
+
     pub(crate) fn service_container_prefix(
         &self,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
+        // 完全分家:pod/PVC 命名前缀优先读 kubernetes_config(自包含 image_tag_prefix),
+        // 回退 multi_image_config(过渡期),再回退 service_type.container_prefix() 默认。
+        // 避免命名漂移:k8s 配置改了前缀,pod 与 PVC 必须同步用新前缀。
+        if let Some(k8s_cfg) = self
+            .config
+            .kubernetes_config
+            .get_service_config(service_type)
+        {
+            return Ok(k8s_cfg.container_prefix().to_string());
+        }
         let service_key = service_type.to_string();
-        self.config
+        if let Some(config) = self
+            .config
             .docker_manager_config
             .multi_image_config
             .services
             .get(&service_key)
-            .map(|config| config.container_prefix().to_string())
-            .ok_or_else(|| {
-                ContainerRuntimeError::ConfigurationError(format!(
-                    "Service config not found for service_type={}",
-                    service_type
-                ))
-            })
+        {
+            return Ok(config.container_prefix().to_string());
+        }
+        // 最后兜底:service_type 默认前缀(避免命名查询因配置缺失而硬失败)
+        Ok(service_type.container_prefix().to_string())
     }
 
     pub(crate) fn sanitize_k8s_name_part(input: &str) -> String {
@@ -186,9 +236,13 @@ impl KubernetesRuntime {
             .to_string()
     }
 
-    /// Select image based on service type, using multi_image_config from ConfigMap
-    fn select_image(&self, service_type: &ServiceType) -> String {
-        // 优先使用环境变量（允许运行时覆盖）
+    /// Select image based on service type.
+    ///
+    /// 优先级:env(RCODER_DOCKER_IMAGE* / RCODER_DOCKER_IMAGE_COMPUTER)> `kubernetes_config`
+    /// (完全分家后的主数据源)> `multi_image_config`(docker_config,过渡期安全兜底,
+    /// 避免旧 chart 未带 kubernetes_config 时选不到镜像)> 硬编码默认值。
+    pub(crate) fn select_image(&self, service_type: &ServiceType) -> String {
+        // 1. 优先使用环境变量（允许运行时覆盖;deployment.yaml 注入）
         // 注意：ComputerAgentRunner 必须优先检查 RCODER_DOCKER_IMAGE_COMPUTER
         match service_type {
             ServiceType::ComputerAgentRunner => {
@@ -211,6 +265,22 @@ impl KubernetesRuntime {
                     return env_image;
                 }
             }
+            // UserAppBuilder 复用 agent-runner 镜像(含 file-server embed + build 工具链),与
+            // ComputerAgentRunner 同源。只读 RCODER_DOCKER_IMAGE_COMPUTER(= agent-runner 镜像),
+            // 绝不能读 RCODER_DOCKER_IMAGE(= rcoder 主镜像)——后者默认 CMD 是 node REPL,不是 agent_runner,
+            // 会导致 builder pod 落入 node 交互式 shell 而非跑 agent_runner + 内嵌 file-server。
+            ServiceType::UserAppBuilder => {
+                if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE_COMPUTER")
+                    && !env_image.is_empty()
+                {
+                    info!(
+                        "[K8S] UserAppBuilder using agent-runner image from RCODER_DOCKER_IMAGE_COMPUTER env: {}",
+                        env_image
+                    );
+                    return env_image;
+                }
+                // COMPUTER env 未设 → 落到 step 2 读 kubernetes_config.user-app-builder.image
+            }
             _ => {
                 if let Ok(env_image) = std::env::var("RCODER_DOCKER_IMAGE")
                     && !env_image.is_empty()
@@ -224,14 +294,38 @@ impl KubernetesRuntime {
             }
         }
 
-        // 使用 multi_image_config 配置
-        let multi_config = &self.config.docker_manager_config.multi_image_config;
-        let service_key = service_type.to_string();
+        // 2. 从 kubernetes_config(完全分家后的主数据源)按平台选镜像
+        if let Some(svc) = self
+            .config
+            .kubernetes_config
+            .get_service_config(service_type)
+        {
+            let arch = std::env::consts::ARCH;
+            let platform = if arch == "aarch64" || arch == "arm64" {
+                "linux/arm64"
+            } else {
+                "linux/amd64"
+            };
+            if let Some(image) = svc.get_image_for_platform(platform) {
+                info!("[K8S] Using image from kubernetes_config: {}", image);
+                return image;
+            }
+        }
 
-        if let Some(service_config) = multi_config.services.get(&service_key) {
+        // 3. 过渡期安全兜底:回退到 docker_config.multi_image_config
+        // (旧 chart / 旧 config.yml 未带 kubernetes_config 段时,避免选不到镜像)
+        warn!(
+            "[K8S] kubernetes_config has no image for {}, falling back to multi_image_config (legacy)",
+            service_type
+        );
+        let multi_config = &self.config.docker_manager_config.multi_image_config;
+        if let Some(service_config) = multi_config.get_service_config(service_type) {
             // 优先使用 image 字段
             if let Some(ref image) = service_config.image {
-                info!("[K8S] Using image from multi_image_config: {}", image);
+                info!(
+                    "[K8S] Using image from multi_image_config (fallback): {}",
+                    image
+                );
                 return image.clone();
             }
             // 使用架构特定镜像
@@ -242,81 +336,84 @@ impl KubernetesRuntime {
                 service_config.amd64_image.clone()
             };
             if let Some(img) = image {
-                info!("[K8S] Using architecture-specific image: {}", img);
+                info!(
+                    "[K8S] Using architecture-specific image (fallback): {}",
+                    img
+                );
                 return img.to_string();
             }
             // 使用默认镜像
             if let Some(ref img) = service_config.default_image {
-                info!("[K8S] Using default image: {}", img);
+                info!("[K8S] Using default image (fallback): {}", img);
                 return img.clone();
             }
         }
 
-        // 兜底：使用硬编码默认值（不应该到达这里，因为 multi_image_config 总是有默认值）
+        // 4. 硬编码兜底(env 与 config 都没给)
         warn!("[K8S] No image config found, using hardcoded fallback");
         match service_type {
-            ServiceType::WebAgentRunner => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
-            ServiceType::ComputerAgentRunner => {
+            // UserApp 实际走 create_deployment（image_override），不走 create_container/select_image
+            // 此处兜底与 WebAgentRunner 共用，仅为 match 穷尽
+            ServiceType::WebAgentRunner | ServiceType::UserApp => "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder:latest".to_string(),
+            // UserAppBuilder 复用 dev-rcoder-agent-runner 镜像(与 ComputerAgentRunner 同镜像)
+            ServiceType::ComputerAgentRunner | ServiceType::UserAppBuilder => {
                 "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev/rcoder-agent-runner:latest".to_string()
             }
         }
     }
 
-    /// Build resource requirements for K8s container from ServiceResourceLimits
-    fn build_resource_requirements(limits: &ServiceResourceLimits) -> Option<ResourceRequirements> {
-        let mut requests: std::collections::BTreeMap<String, Quantity> =
-            std::collections::BTreeMap::new();
-        let mut lims: std::collections::BTreeMap<String, Quantity> =
-            std::collections::BTreeMap::new();
-
-        if let Some(memory) = limits.memory_limit {
-            // memory_limit is in bytes, convert to Mi
-            let mem_mb = (memory / (1024.0 * 1024.0)) as i64;
-            // Quantity is a string wrapper, construct directly with formatted string
-            requests.insert("memory".to_string(), Quantity(format!("{}Mi", mem_mb)));
-            lims.insert("memory".to_string(), Quantity(format!("{}Mi", mem_mb)));
-        }
-        if let Some(cpu) = limits.cpu_limit {
-            // cpu_limit is core count, format as decimal string
-            requests.insert("cpu".to_string(), Quantity(format!("{}", cpu)));
-            lims.insert("cpu".to_string(), Quantity(format!("{}", cpu)));
-        }
-
-        if requests.is_empty() && lims.is_empty() {
-            return None;
-        }
-        Some(ResourceRequirements {
-            claims: None,
-            requests: Some(requests),
-            limits: Some(lims),
-        })
+    /// Build resource requirements for K8s container from ServiceResourceLimits。
+    ///
+    /// 委派给共享 `build_decoupled_resources`（与 UserApp 侧 `build_app_resource_requirements`
+    /// 共用 requests/limits 解耦策略，值一致）。仅在此做入参转换：ServiceResourceLimits 的
+    /// memory(bytes f64）/cpu（核数 f64）归一化为 K8s Quantity 字符串。
+    pub(crate) fn build_resource_requirements(
+        limits: &ServiceResourceLimits,
+    ) -> Option<ResourceRequirements> {
+        // memory 字节 → Mi；cpu 核数 → 十进制字符串（K8s Quantity 原生接受）
+        let cpu = limits.cpu.map(|c| format!("{}", c));
+        let memory = limits
+            .memory
+            .map(|bytes| format!("{}Mi", (bytes / (1024.0 * 1024.0)) as i64));
+        // ephemeral-storage：优先 ephemeral_storage_limit，回退 storage_size（与 PVC storage_size
+        // 是两个独立配额；未显式指定时回退，与 app 侧对称）
+        let ephemeral = limits
+            .ephemeral_storage_limit
+            .clone()
+            .or_else(|| limits.storage_size.clone());
+        super::k8s_app_helpers::build_decoupled_resources(cpu, memory, ephemeral)
     }
 
-    /// 根据运行环境获取容器访问地址
-    ///
-    /// - K8s 环境：使用 K8s Service FQDN
-    /// - Docker 环境：使用容器 IP
-    fn get_container_access_address(&self, identifier: &str, service_type: &ServiceType, _container_ip: &str) -> String {
-        // K8s 环境：使用 K8s Service FQDN
-        let svc_name = self.agent_service_name(identifier, service_type).unwrap_or_else(|_| {
-            format!("{}-{}", service_type, identifier)
-        });
-        format!("{}.{}.svc.{}", svc_name, self.namespace, self.config.cluster_domain)
+    /// 获取 K8s 模式 agent 容器的访问地址(Service FQDN)。
+    /// Docker 模式不经过此函数(走 docker_runtime,用容器 IP)。
+    fn get_container_access_address(&self, identifier: &str) -> String {
+        // identifier 是完整 Pod 名(pod_info.container_name = {prefix}-{业务id}),
+        // 真实 agent Service 名 = "{pod_name}-svc"(create_agent_service 创建)。
+        // 复用 shared_types::build_k8s_service_fqdn 统一 FQDN 格式(与 rcoder 侧 handler、
+        // 实际 K8s Service 名对齐)。不要过 agent_service_name/pod_name —— 那会再叠一层
+        // service_container_prefix,产生 {prefix}-{prefix}-{id}-svc 双前缀(生产 bug 根因:
+        // service_url 多出 rcoder-k8s- 前缀 → permission/cancel/stop transport error)。
+        let fqdn = shared_types::build_k8s_service_fqdn(
+            identifier,
+            &self.namespace,
+            &self.config.cluster_domain,
+        );
+        debug!(
+            "[K8S] agent access address: identifier={} -> {}",
+            identifier, fqdn
+        );
+        fqdn
     }
 
     /// Build container basic info from runtime container info
-    async fn build_container_basic_info(
+    pub(crate) async fn build_container_basic_info(
         &self,
         project_id: &str,
         pod_info: &RuntimeContainerInfo,
-        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
-        // 使用 K8s Service FQDN 而不是 Pod IP
-        let access_address = self.get_container_access_address(
-            &pod_info.container_name,
-            service_type,
-            &pod_info.container_ip,
-        );
+        // service_url = {sts_name}-svc：container_name 已在 get_container_info 源头剥成 sts_name
+        // （agent-runner STS pod 名 {sts_name}-0 的寻址基名），直接拼 Service FQDN。
+        let access_address = self.get_container_access_address(&pod_info.container_name);
 
         Ok(ContainerBasicInfo {
             container_id: pod_info.container_id.clone(),
@@ -336,373 +433,55 @@ impl KubernetesRuntime {
     }
 }
 
+/// 读取 app 暴露相关 env 配置（create/patch 共用，DRY）：
+/// gateway_name/gateway_namespace env 注入优先（兜底 nuwax-gateway/default），
+/// http_expose 从 RCODER_APP_HTTP_EXPOSE 读取（默认 pingora；无效值 warn 回退，Fail Fast）。
+/// 与 app_manager::config 同源，保证 service 层与 K8s 后端一致。
+#[cfg(feature = "kubernetes")]
+fn read_app_expose_env() -> (Option<String>, Option<String>, HttpExpose) {
+    let gateway_name = std::env::var("RCODER_K8S_GATEWAY_NAME")
+        .ok()
+        .or_else(|| Some("nuwax-gateway".to_string()));
+    let gateway_namespace = std::env::var("RCODER_K8S_GATEWAY_NAMESPACE")
+        .ok()
+        .or_else(|| Some("default".to_string()));
+    let http_expose = match std::env::var("RCODER_APP_HTTP_EXPOSE").ok().as_deref() {
+        Some("gateway") => HttpExpose::Gateway,
+        Some("pingora") | None => HttpExpose::Pingora,
+        Some(other) => {
+            tracing::warn!(
+                "未识别的 RCODER_APP_HTTP_EXPOSE={other:?}，回退 pingora（合法值: pingora|gateway）"
+            );
+            HttpExpose::Pingora
+        }
+    };
+    (gateway_name, gateway_namespace, http_expose)
+}
+
 #[cfg(feature = "kubernetes")]
 #[async_trait]
-impl ContainerRuntime for KubernetesRuntime {
+impl AgentContainerRuntime for KubernetesRuntime {
     async fn create_container(
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
-        let ContainerCreateParams {
-            project_id,
-            user_id,
-            host_workspace_path: _,
-            service_type,
-            resource_limits,
-            pod_id,
-            isolation_type,
-            tenant_id,
-            space_id,
-            storage_size,
-        } = params;
-
-        // 确定容器标识符：pod_id > user_id > project_id（与 Docker 模式一致）
-        let project_id_val = project_id.clone().unwrap_or_default();
-        let user_id_val = user_id.clone().unwrap_or_default();
-        let identifier = pod_id
-            .as_ref()
-            .or(user_id.as_ref())
-            .or(project_id.as_ref())
-            .ok_or_else(|| {
-                ContainerRuntimeError::ConfigurationError(
-                    "At least one of pod_id, user_id, or project_id must be provided".to_string(),
-                )
-            })?;
-
-        // Pod 名称：统一使用 pod_name() helper（含 RFC 1123 下划线清理）
-        let pod_name = self.pod_name(identifier, &service_type)?;
-
-        // Ensure workspace PVC exists first (NFS-backed, each project/user gets its own PVC)
-        // The PVC is backed by NFS Subdir External Provisioner which automatically
-        // creates NFS subdirectory per PVC for isolation and automatic cleanup
-        // Note: ensure_workspace_pvc waits for PVC Bound state before returning
-        self.ensure_workspace_pvc(identifier, &service_type, storage_size.as_deref())
-            .await?;
-
-        // Check if pod already exists and is running
-        if let Some(cached) = self.pod_cache.read().await.get(identifier)
-            && cached.status == ContainerRuntimeStatus::Running
-        {
-            info!("[K8S] Pod {} already exists and is running", pod_name);
-            return self
-                .get_container_info_by_identifier(identifier, &service_type)
-                .await?
-                .ok_or_else(|| ContainerRuntimeError::ContainerNotFound(identifier.to_string()));
-        }
-
-        let service_type_str = service_type.to_string();
-        let image = self.select_image(&service_type);
-
-        // Build labels using standard K8s labels
-        let labels = build_standard_labels(identifier, &service_type);
-
-        // Build Pod object using k8s-openapi types
-        // Note: Pod existence is already checked via cache above.
-        // The API-level check (for race conditions) is intentionally omitted here
-        // to avoid extra K8s API call overhead. If create() fails with 409 Conflict,
-        // the error will propagate and the caller should handle it.
-
-        // Build resource requirements if limits are provided
-        let resources = resource_limits
-            .as_ref()
-            .and_then(Self::build_resource_requirements);
-
-        // Build workspace volume using PVC (NFS-backed persistent storage)
-        // 每个项目/用户使用独立的 PVC，底层由 NFS Subdir External Provisioner
-        // 自动在 NFS Server 上创建子目录，实现存储隔离和自动回收
-        let pvc_name = self.workspace_pvc_name(identifier, &service_type)?;
-        let volumes = Some(vec![Volume {
-            name: "workspace".to_string(),
-            persistent_volume_claim: Some(
-                k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-                    claim_name: pvc_name.clone(),
-                    read_only: Some(false),
-                },
-            ),
-            ..Default::default()
-        }]);
-        let volume_mounts = Some(vec![VolumeMount {
-            name: "workspace".to_string(),
-            mount_path: "/app/project_workspace".to_string(),
-            read_only: Some(false),
-            ..Default::default()
-        }]);
-
-        // Build image pull secrets if configured
-        let image_pull_secrets = self.config.image_pull_secret.as_ref().map(|secret| {
-            vec![LocalObjectReference {
-                name: secret.clone(),
-            }]
-        });
-
-        let pod: Pod = Pod {
-            metadata: ObjectMeta {
-                name: Some(pod_name.clone()),
-                namespace: Some(self.namespace.clone()),
-                labels: Some(labels),
-                ..Default::default()
-            },
-            spec: Some(PodSpec {
-                volumes,
-                image_pull_secrets,
-                security_context: Some(PodSecurityContext {
-                    run_as_non_root: Some(false),
-                    ..Default::default()
-                }),
-                termination_grace_period_seconds: Some(60),
-                containers: vec![K8sContainer {
-                    name: "agent".to_string(),
-                    image: Some(image),
-                    // IfNotPresent: 动态 pod 频繁创建（每 chat/computer-chat 一个），
-                    // 节点已缓存就直接用，避免每次都去 registry 验 token/manifest。
-                    // image 更新由主 Deployment 触发拉取（用户做 rollout restart 时），
-                    // 主服务用新 image 启动后，动态 pod 跟着用同样的 image 引用。
-                    image_pull_policy: Some("IfNotPresent".to_string()),
-                    // 启动命令由 orchestration 层显式指定，避免依赖镜像默认行为：
-                    //   - RCoder 服务类型：运行 agent_runner binary（gRPC 50051 + HTTP 8086）。
-                    //     注意 rcoder-master 镜像本身没有 CMD/ENTRYPOINT，必须显式指定。
-                    //   - ComputerAgentRunner 服务类型：使用镜像自己的 ENTRYPOINT（start-up.sh）。
-                    command: match service_type {
-                        ServiceType::WebAgentRunner => {
-                            Some(vec!["/app/bin/agent_runner".to_string()])
-                        }
-                        ServiceType::ComputerAgentRunner => None,
-                    },
-                    env: {
-                        let mut env_vars = vec![
-                            EnvVar {
-                                name: "PROJECT_ID".to_string(),
-                                value: Some(project_id_val.to_string()),
-                                ..Default::default()
-                            },
-                            EnvVar {
-                                name: "USER_ID".to_string(),
-                                value: Some(user_id_val.to_string()),
-                                ..Default::default()
-                            },
-                            EnvVar {
-                                name: "SERVICE_TYPE".to_string(),
-                                value: Some(service_type_str.clone()),
-                                ..Default::default()
-                            },
-                        ];
-                        // 多租户环境变量（agent_runner 用于构建工作目录路径）
-                        if let Some(ref tid) = tenant_id {
-                            env_vars.push(EnvVar {
-                                name: "TENANT_ID".to_string(),
-                                value: Some(tid.clone()),
-                                ..Default::default()
-                            });
-                        }
-                        if let Some(ref sid) = space_id {
-                            env_vars.push(EnvVar {
-                                name: "SPACE_ID".to_string(),
-                                value: Some(sid.clone()),
-                                ..Default::default()
-                            });
-                        }
-                        if let Some(ref it) = isolation_type {
-                            env_vars.push(EnvVar {
-                                name: "ISOLATION_TYPE".to_string(),
-                                value: Some(it.clone()),
-                                ..Default::default()
-                            });
-                        }
-                        Some(env_vars)
-                    },
-                    ports: Some(vec![
-                        ContainerPort {
-                            container_port: shared_types::GRPC_DEFAULT_PORT as i32,
-                            name: Some("grpc".to_string()),
-                            ..Default::default()
-                        },
-                        // HTTP health check port for agent_runner
-                        ContainerPort {
-                            container_port: 8086,
-                            name: Some("http".to_string()),
-                            ..Default::default()
-                        },
-                    ]),
-                    resources,
-                    volume_mounts,
-                    liveness_probe: Some(Probe {
-                        http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                            path: Some("/health".to_string()),
-                            port: IntOrString::Int(8086),
-                            ..Default::default()
-                        }),
-                        initial_delay_seconds: Some(30),
-                        period_seconds: Some(10),
-                        timeout_seconds: Some(3),
-                        failure_threshold: Some(3),
-                        success_threshold: Some(1),
-                        ..Default::default()
-                    }),
-                    readiness_probe: Some(Probe {
-                        http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                            path: Some("/health".to_string()),
-                            port: IntOrString::Int(8086),
-                            ..Default::default()
-                        }),
-                        initial_delay_seconds: Some(3),
-                        period_seconds: Some(3),
-                        timeout_seconds: Some(3),
-                        failure_threshold: Some(20),
-                        success_threshold: Some(1),
-                        ..Default::default()
-                    }),
-                    // preStop lifecycle hook: 在 kubelet 发送 SIGTERM 之前执行，
-                    // 确保 JuiceFS FUSE 卷上的写入 buffer flush 到磁盘，
-                    // 减少 FUSE unmount 卡住的概率
-                    lifecycle: Some(k8s_openapi::api::core::v1::Lifecycle {
-                        pre_stop: Some(k8s_openapi::api::core::v1::LifecycleHandler {
-                            exec: Some(k8s_openapi::api::core::v1::ExecAction {
-                                command: Some(vec![
-                                    "sh".to_string(),
-                                    "-c".to_string(),
-                                    "sync && sleep 2".to_string(),
-                                ]),
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                restart_policy: Some("Never".to_string()),
-                service_account_name: Some(self.config.service_account_name.clone()),
-                ..Default::default()
-            }),
-            status: None,
-        };
-
-        let pp = PostParams::default();
-        match self.pods().create(&pp, &pod).await {
-            Ok(_) => {
-                info!("[K8S] Pod {} created successfully", pod_name);
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 409 => {
-                // Pod already exists (from a previous failed create_container attempt).
-                // Reuse the existing pod instead of failing.
-                warn!(
-                    "[K8S] Pod {} already exists (409), reusing existing pod",
-                    pod_name
-                );
-            }
-            Err(e) => {
-                return Err(ContainerRuntimeError::ContainerCreationError(
-                    format!("Failed to create pod: {}", e),
-                ));
-            }
-        }
-
-        // Wait for pod to be ready
-        self.wait_for_pod_ready(identifier, &service_type).await?;
-
-        // Create K8s Service for Envoy Gateway routing
-        self.create_agent_service(identifier, &service_type).await?;
-
-        // Create Backend CRD for Envoy Gateway discovery (non-fatal if Envoy Gateway is not installed)
-        if let Err(e) = self.create_backend_crd(identifier, &service_type).await {
-            warn!(
-                "[K8S] Failed to create Backend CRD for {} (Envoy Gateway may not be installed): {} (continuing)",
-                identifier, e
-            );
-        }
-
-        // Get pod info
-        self.get_container_info_by_identifier(identifier, &service_type)
-            .await?
-            .ok_or_else(|| {
-                ContainerRuntimeError::ContainerCreationError(
-                    "Pod created but info not found".to_string(),
-                )
-            })
+        self.create_agent_container(params).await
     }
 
     async fn get_container_info(
         &self,
         identifier: &str,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        // Try cache first
-        if let Some(cached) = self.pod_cache.read().await.get(identifier)
-            && cached.status == ContainerRuntimeStatus::Running
-        {
-            // get_container_info 只用于 WebAgentRunner
-            let service_type = shared_types::ServiceType::WebAgentRunner;
-            return Ok(Some(
-                self.build_container_basic_info(identifier, cached, &service_type).await?,
-            ));
-        }
-
-        // Query K8s API - 使用标准 K8s 标签查询（与 build_standard_labels 一致）
-        let search_queries = vec![
-            format!("app.kubernetes.io/instance={}", identifier),
-            format!("rcoder.io/identifier={}", identifier),
-        ];
-
-        for query in search_queries {
-            let lp = ListParams::default().labels(&query);
-            if let Ok(pods) = self.pods().list(&lp).await
-                && let Some(pod) = pods.items.into_iter().next()
-            {
-                let status = Self::extract_pod_status(&pod);
-                let metadata = &pod.metadata;
-                let uid = metadata.uid.clone().unwrap_or_default();
-                let name = metadata.name.clone().unwrap_or_default();
-                let pod_ip = pod
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.pod_ip.clone())
-                    .unwrap_or_default();
-                let created_at = metadata
-                    .creation_timestamp
-                    .as_ref()
-                    .map(|ts| {
-                        chrono::DateTime::from_timestamp(
-                            ts.0.as_second(),
-                            ts.0.subsec_nanosecond() as u32,
-                        )
-                        .unwrap_or_else(Utc::now)
-                    })
-                    .unwrap_or_else(Utc::now);
-
-                // get_container_info 只用于 WebAgentRunner
-                let service_type = shared_types::ServiceType::WebAgentRunner;
-
-                let pod_info = RuntimeContainerInfo {
-                    container_id: uid,
-                    container_name: name,
-                    container_ip: pod_ip,
-                    status,
-                    created_at,
-                    env_vars: None,
-                };
-
-                // Update cache if running
-                if pod_info.status == ContainerRuntimeStatus::Running {
-                    self.pod_cache
-                        .write()
-                        .await
-                        .insert(identifier.to_string(), pod_info.clone());
-                }
-
-                return Ok(Some(
-                    self.build_container_basic_info(identifier, &pod_info, &service_type)
-                        .await?,
-                ));
-            }
-        }
-
-        Ok(None)
+        self.get_container_info_inner(identifier).await
     }
 
     async fn get_container_info_by_identifier(
         &self,
         identifier: &str,
-        _service_type: &ServiceType,
+        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        self.get_container_info(identifier).await
+        self.get_container_info_by_identifier_inner(identifier, service_type)
+            .await
     }
 
     async fn find_container(
@@ -710,64 +489,7 @@ impl ContainerRuntime for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
-        // Check cache first
-        if let Some(cached) = self.pod_cache.read().await.get(identifier) {
-            return Ok(Some(cached.clone()));
-        }
-
-        // 1) Query by concrete pod name
-        let pod_name = self.pod_name(identifier, service_type)?;
-        match self.pods().get(&pod_name).await {
-            Ok(pod) => return Ok(Some(Self::runtime_info_from_pod(&pod))),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-            Err(e) => {
-                return Err(ContainerRuntimeError::K8sError(format!(
-                    "Failed to get pod by name '{}': {}",
-                    pod_name, e
-                )));
-            }
-        }
-
-        // 2) Query by labels (使用新的标准标签)
-        let selector = format!("app.kubernetes.io/instance={}", identifier);
-        let pods = self
-            .pods()
-            .list(&ListParams::default().labels(&selector).limit(1))
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::K8sError(format!(
-                    "Failed to list pods with selector '{}': {}",
-                    selector, e
-                ))
-            })?;
-
-        if let Some(pod) = pods.items.into_iter().next() {
-            return Ok(Some(Self::runtime_info_from_pod(&pod)));
-        }
-
-        // 3) 兼容旧标签查询（平滑迁移）
-        for old_selector in [
-            format!("pod_id={}", identifier),
-            format!("user_id={}", identifier),
-            format!("project_id={}", identifier),
-        ] {
-            let pods = self
-                .pods()
-                .list(&ListParams::default().labels(&old_selector).limit(1))
-                .await
-                .map_err(|e| {
-                    ContainerRuntimeError::K8sError(format!(
-                        "Failed to list pods with selector '{}': {}",
-                        old_selector, e
-                    ))
-                })?;
-
-            if let Some(pod) = pods.items.into_iter().next() {
-                return Ok(Some(Self::runtime_info_from_pod(&pod)));
-            }
-        }
-
-        Ok(None)
+        self.find_container_inner(identifier, service_type).await
     }
 
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()> {
@@ -811,90 +533,8 @@ impl ContainerRuntime for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
-        let total_start = std::time::Instant::now();
-        let pod_name = self.pod_name(identifier, service_type)?;
-
-        info!(
-            "[K8S] Stopping pod {} (identifier={}, service_type={})",
-            pod_name, identifier, service_type
-        );
-
-        // ── Step 0: 删除 Backend CRD + K8s Service（Envoy Gateway 清理）──
-        //
-        // 先删除 Backend CRD，让 Envoy 停止向该 Pod 路由新流量；
-        // 再删除 K8s Service，移除 DNS 条目。两者均在 Pod 终止前完成，
-        // 确保流量不再进入即将销毁的 Pod。
-        if let Err(e) = self.delete_backend_crd(identifier).await {
-            warn!(
-                "[K8S] Failed to delete Backend CRD for {}: {} (continuing)",
-                identifier, e
-            );
-        }
-        if let Err(e) = self.delete_agent_service(identifier, service_type).await {
-            warn!(
-                "[K8S] Failed to delete Service for {}: {} (continuing)",
-                identifier, e
-            );
-        }
-
-        // ── Step 1: 发送 Pod 删除请求（graceful，grace period = 60s）──
-        //
-        // 使用 Foreground propagation 确保 Pod 的子资源先于 Pod 被删除。
-        // 注意：pods().delete() 是立即返回的异步 API 调用，
-        // Pod 在此时仅被标记为 Terminating，尚未真正终止。
-        let step_start = std::time::Instant::now();
-        let dp = DeleteParams {
-            propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
-            grace_period_seconds: Some(60),
-            ..Default::default()
-        };
-
-        match self.pods().delete(&pod_name, &dp).await {
-            Ok(_either) => {
-                // _either: Left(Pod) = 立即删除 / Right(name) = 等待终止
-                info!(
-                    "[K8S] Pod {} delete requested (graceful, 60s), took {:.1}s",
-                    pod_name,
-                    step_start.elapsed().as_secs_f64()
-                );
-                self.pod_cache.write().await.remove(identifier);
-
-                // ── Step 2: 等待 Pod 完全终止（404）或超时后 force-delete ──
-                let step_start = std::time::Instant::now();
-                if let Err(e) = self.wait_for_pod_terminated(&pod_name).await {
-                    // Pod 终止失败不阻止 PVC 清理：即使 Pod 仍在运行，
-                    // PVC 清理有自己的超时和容错机制
-                    warn!(
-                        "[K8S] wait_for_pod_terminated failed for {}: {} (continuing to PVC cleanup)",
-                        pod_name, e
-                    );
-                }
-                info!(
-                    "[K8S] Step 2 (wait pod terminated) took {:.1}s",
-                    step_start.elapsed().as_secs_f64()
-                );
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                info!("[K8S] Pod {} not found, skip delete", pod_name);
-            }
-            Err(e) => {
-                warn!("[K8S] Failed to request delete pod {}: {}", pod_name, e);
-            }
-        }
-
-        // ── Step 3: PVC 保留策略 ──
-        //
-        // 不在 stop_container 时删除 PVC，原因：
-        // 1. pod_handler 检测到 Pending pod 会调用 stop + recreate，PVC 需要保留给新 pod 复用
-        // 2. 用户显式停止 workspace 时，PVC 应保留以便下次启动时数据不丢失
-        // 3. 孤立 PVC 的清理由启动时的 cleanup_all 负责（通过 label selector delete_collection）
-        info!(
-            "[K8S] Pod {} stopped (PVC preserved for reuse), total time: {:.1}s",
-            pod_name,
-            total_start.elapsed().as_secs_f64()
-        );
-
-        Ok(())
+        self.stop_container_by_identifier_inner(identifier, service_type)
+            .await
     }
 
     async fn is_container_running(&self, project_id: &str) -> ContainerRuntimeResult<bool> {
@@ -918,221 +558,15 @@ impl ContainerRuntime for KubernetesRuntime {
     }
 
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
-        let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
-        let pods =
-            self.pods().list(&lp).await.map_err(|e| {
-                ContainerRuntimeError::K8sError(format!("Failed to list pods: {}", e))
-            })?;
-
-        let mut result = Vec::new();
-        for p in pods.items {
-            let pod: Pod = p;
-            let status = Self::extract_pod_status(&pod);
-            let metadata = &pod.metadata;
-
-            // 从 Pod 的 labels 中提取环境变量信息
-            let mut env_vars = std::collections::HashMap::new();
-            if let Some(labels) = &metadata.labels {
-                if let Some(project_id) = labels.get("project_id") {
-                    env_vars.insert("PROJECT_ID".to_string(), project_id.clone());
-                }
-                if let Some(user_id) = labels.get("user_id") {
-                    env_vars.insert("USER_ID".to_string(), user_id.clone());
-                }
-            }
-
-            let pod_info = RuntimeContainerInfo {
-                container_id: metadata.uid.clone().unwrap_or_default(),
-                container_name: metadata.name.clone().unwrap_or_default(),
-                container_ip: pod
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.pod_ip.clone())
-                    .unwrap_or_default(),
-                status,
-                created_at: metadata
-                    .creation_timestamp
-                    .as_ref()
-                    .map(|ts| {
-                        chrono::DateTime::from_timestamp(
-                            ts.0.as_second(),
-                            ts.0.subsec_nanosecond() as u32,
-                        )
-                        .unwrap_or_else(Utc::now)
-                    })
-                    .unwrap_or_else(Utc::now),
-                env_vars: Some(env_vars),
-            };
-            result.push(pod_info);
-        }
-
-        Ok(result)
+        self.list_containers_inner().await
     }
 
     async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
-        let mut removed = Vec::new();
-
-        // 获取缓存快照 (identifier, RuntimeContainerInfo)
-        let cache_snapshot: Vec<(String, RuntimeContainerInfo)> = self
-            .pod_cache
-            .read()
-            .await
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        let checked_count = cache_snapshot.len() as u32;
-
-        for (identifier, container_info) in cache_snapshot {
-            // 使用缓存中的 container_name (完整 pod name) 进行 API 查询
-            match self.pods().get(&container_info.container_name).await {
-                Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                    // Pod 不存在，从缓存中移除，并收集信息用于清理关联资源
-                    self.pod_cache.write().await.remove(&identifier);
-                    removed.push(RemovedContainerInfo {
-                        container_name: container_info.container_name.clone(),
-                        container_ip: container_info.container_ip.clone(),
-                        identifier: identifier.clone(),
-                        service_type: ServiceType::WebAgentRunner, // K8s 模式目前只有 RCoder
-                    });
-                    info!(
-                        "[K8S_SYNC] Removed stale pod from cache: {} (identifier={})",
-                        container_info.container_name, identifier
-                    );
-                }
-                Ok(_) => {
-                    // Pod 存在，无需处理
-                }
-                Err(e) => {
-                    // 其他错误，只记录日志
-                    warn!(
-                        "[K8S_SYNC] Failed to check pod {}: {}",
-                        container_info.container_name, e
-                    );
-                }
-            }
-        }
-
-        Ok((checked_count, removed))
+        self.sync_states_inner().await
     }
 
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
-        let total_start = std::time::Instant::now();
-        info!(
-            "[K8S_CLEANUP] Starting cleanup_all — sequential Backend CRD → Service → Pod → PVC deletion"
-        );
-
-        let lp = ListParams::default().labels(RUNTIME_MANAGED_LABEL);
-
-        // ── Step 0: 批量删除 Backend CRD（停止 Envoy 路由）──
-        let backends: Api<DynamicObject> = Api::namespaced_with(
-            self.client.clone(),
-            &self.namespace,
-            &super::k8s_backend_crd::backend_api_resource(),
-        );
-        match backends
-            .delete_collection(&DeleteParams::default(), &lp)
-            .await
-        {
-            Ok(_) => info!("[K8S_CLEANUP] Backend CRD delete_collection requested"),
-            Err(e) => {
-                tracing::warn!(
-                    "[K8S_CLEANUP] Backend CRD delete_collection failed: {} (continuing)",
-                    e
-                );
-            }
-        }
-
-        // ── Step 0.5: 批量删除 K8s Service ──
-        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
-        match services
-            .delete_collection(&DeleteParams::default(), &lp)
-            .await
-        {
-            Ok(_) => info!("[K8S_CLEANUP] Service delete_collection requested"),
-            Err(e) => {
-                tracing::warn!(
-                    "[K8S_CLEANUP] Service delete_collection failed: {} (continuing)",
-                    e
-                );
-            }
-        }
-
-        // ── Step 1: 获取所有 managed Pod 名称（用于后续等待终止）──
-        let pods_to_wait: Vec<String> = self
-            .pods()
-            .list(&lp)
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::ConnectionError(format!(
-                    "Failed to list pods for cleanup: {}",
-                    e
-                ))
-            })?
-            .items
-            .iter()
-            .filter_map(|pod| pod.metadata.name.clone())
-            .collect();
-
-        info!(
-            "[K8S_CLEANUP] Found {} managed pods to clean",
-            pods_to_wait.len()
-        );
-
-        // ── Step 2: 批量删除 Pod（graceful, Foreground 传播）──
-        let dp = DeleteParams {
-            propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
-            grace_period_seconds: Some(30),
-            ..Default::default()
-        };
-
-        match self.pods().delete_collection(&dp, &lp).await {
-            Ok(_) => info!("[K8S CLEANUP] Pod delete_collection requested"),
-            Err(e) => {
-                tracing::warn!(
-                    "[K8S CLEANUP] Pod delete_collection failed: {} (continuing)",
-                    e
-                );
-            }
-        }
-
-        // ── Step 3: 等待所有 Pod 完全终止 ──
-        // 关键：必须在删除 PVC 之前完成，确保 FUSE 卷已卸载
-        let wait_futures: Vec<_> = pods_to_wait
-            .iter()
-            .map(|pod_name| self.wait_for_pod_terminated(pod_name))
-            .collect();
-
-        let wait_results = futures_util::future::join_all(wait_futures).await;
-        for (pod_name, result) in pods_to_wait.iter().zip(wait_results.iter()) {
-            if let Err(e) = result {
-                tracing::warn!(
-                    "[K8S CLEANUP] Pod {} termination wait failed: {}",
-                    pod_name,
-                    e
-                );
-            }
-        }
-
-        // ── Step 4: PVC 清理策略 ──
-        //
-        // 不在 cleanup_all 中主动删除 PVC，原因：
-        // 1. Pod 删除时 K8s PropagationPolicy::Foreground 会级联清理关联的 PVC
-        // 2. 主动删除正在被 pod 使用的 PVC 会导致 PVC 卡在 Terminating 状态（pvc-protection finalizer）
-        // 3. 多副本部署时，cleanup_all 会误删其他 rcoder 实例正在使用的 PVC
-        // 4. Terminating PVC 会导致后续 create_container 失败（409 重试循环）
-        info!(
-            "[K8S CLEANUP] PVC cleanup skipped — PVCs are cleaned up via K8s cascading deletion when pods are removed"
-        );
-
-        // 清理缓存
-        self.pod_cache.write().await.clear();
-
-        info!(
-            "[K8S CLEANUP] cleanup_all completed in {:.1}s",
-            total_start.elapsed().as_secs_f64()
-        );
-        Ok(())
+        self.cleanup_all_inner().await
     }
 
     async fn health_check(&self) -> ContainerRuntimeResult<()> {
@@ -1142,5 +576,322 @@ impl ContainerRuntime for KubernetesRuntime {
             ContainerRuntimeError::ConnectionError(format!("K8s health check failed: {}", e))
         })?;
         Ok(())
+    }
+
+    async fn restart_container_inplace(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        // 委派到 k8s_agent_pod 的 inherent 实现（沿用 get_deployment_status→get_app_status 的
+        // 「委派→inherent」模式）。不委派则命中 trait 默认（NotImplemented）→ pod_restart 回落慢路径。
+        self.restart_agent_container_inplace(identifier, service_type)
+            .await
+    }
+
+    async fn diagnose_agent_pod(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentPodDiagnostic> {
+        self.diagnose_agent_pod_inner(identifier, service_type)
+            .await
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+#[async_trait]
+impl WorkspaceRuntime for KubernetesRuntime {
+    async fn resolve_workspace_path(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        // 阶段2: rcoder 静态 PV 挂 CephFS 根 → {RCODER_CEPHFS_ROOT}/{subvolumePath}
+        // (subvolumePath 形如 /volumes/csi/<uuid>/<subuuid>, fs 根绝对路径)。
+        // file-server 经此聚合路径访问 agent 数据 (tree/git/skills), 不启动 agent pod。
+        let cephfs_root =
+            std::env::var("RCODER_CEPHFS_ROOT").unwrap_or_else(|_| "/app/cephfs-root".to_string());
+        let subvolume_path = self
+            .resolve_subvolume_path(identifier, service_type)
+            .await?;
+        // subvolumePath 以 / 开头 (fs 绝对路径); trim 防御性处理确保单斜杠拼接
+        let sub = subvolume_path.trim_start_matches('/');
+        Ok(Some(format!("{cephfs_root}/{sub}")))
+    }
+
+    async fn resolve_workspace_path_by_pvcname(
+        &self,
+        pvc_name: &str,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        // 阶段3 lazy mv: 与 resolve_workspace_path 同, 但用任意 PVC 名 (共享 PVC 如 rcoder-workspace)
+        let cephfs_root =
+            std::env::var("RCODER_CEPHFS_ROOT").unwrap_or_else(|_| "/app/cephfs-root".to_string());
+        let subvolume_path = self.resolve_subvolume_path_by_pvcname(pvc_name).await?;
+        let sub = subvolume_path.trim_start_matches('/');
+        Ok(Some(format!("{cephfs_root}/{sub}")))
+    }
+
+    /// 枚举某 service_type 的所有 per-app PVC，从 PVC 名反解 identifier（app_id）。
+    ///
+    /// 用于 storage/query 发现"有持久数据"的 app（含已 delete 但 PVC 保留的孤儿）——
+    /// `list_deployments` 只能拿运行中的，PVC 才是持久数据的真源。
+    /// PVC 名格式见 `workspace_pvc_name`：`{sanitize(container_prefix)}-{identifier(_→-)}-workspace`，
+    /// identifier 经 app_id 校验已是 DNS-1123（无下划线），故反解结果即原 identifier。
+    async fn list_workspace_identifiers(
+        &self,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        let selector = format!("service_type={}", service_type);
+        let list = self
+            .pvcs()
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!(
+                    "list_workspace_identifiers: list PVC failed (service_type={}): {}",
+                    service_type, e
+                ))
+            })?;
+        // 前缀/后缀与 workspace_pvc_name 保持一致，反解中间段为 identifier
+        let prefix = format!(
+            "{}-",
+            Self::sanitize_k8s_name_part(&self.service_container_prefix(service_type)?)
+        );
+        let suffix = "-workspace";
+        let mut ids = Vec::with_capacity(list.items.len());
+        for pvc in list.items {
+            if let Some(name) = pvc.metadata.name.as_deref()
+                && let Some(mid) = name
+                    .strip_prefix(prefix.as_str())
+                    .and_then(|s| s.strip_suffix(suffix))
+            {
+                ids.push(mid.to_string());
+            }
+        }
+        Ok(ids)
+    }
+
+    async fn ensure_workspace(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        storage_size: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
+        // 复用 K8sPvcOps::ensure_workspace_pvc (幂等: active→复用 / not_found→创建)
+        self.ensure_workspace_pvc(identifier, service_type, storage_size)
+            .await
+    }
+
+    async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        // 委派 K8sPvcOps::destroy_workspace_pvc (service_type=UserApp; 仅 UserApp 走此路径,
+        // agent PVC 永不删)。trait 方法默认 no-op, Docker 不覆盖。
+        self.destroy_workspace_pvc(app_id, &ServiceType::UserApp)
+            .await
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+#[async_trait]
+impl UserAppDeploymentRuntime for KubernetesRuntime {
+    // ===== Deployment 生命周期（UserApp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====
+    async fn create_deployment(
+        &self,
+        params: ContainerCreateParams,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        // app_id 占据 project_id 字段位
+        let app_id = params.project_id.clone().ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError(
+                "create_deployment requires project_id (app_id)".to_string(),
+            )
+        })?;
+        // Gateway 配置：env 注入优先，未注入则用默认（nuwax-gateway / default，匹配部署现状），
+        // 避免部署侧未配 env 时静默跳过 HTTPRoute 创建。
+        let (gateway_name, gateway_namespace, http_expose) = read_app_expose_env();
+        self.create_app_resources(
+            &app_id,
+            &params,
+            gateway_name.as_deref(),
+            gateway_namespace.as_deref(),
+            http_expose,
+        )
+        .await?;
+        Ok(ContainerBasicInfo {
+            container_id: self.app_deployment_name(&app_id),
+            container_name: self.app_deployment_name(&app_id),
+            container_ip: String::new(),
+            internal_port: 0,
+            external_port: 0,
+            project_id: app_id.clone(),
+            status: "Starting".to_string(),
+            created_at: Utc::now(),
+            // UserApp service_url: 传 app_deployment_name(不含 -svc),由 build_k8s_service_fqdn
+            // 追加单层 -svc。【不要】传 app_service_name(已含 -svc) → -svc-svc 双后缀。
+            service_url: format!(
+                "http://{}",
+                shared_types::build_k8s_service_fqdn(
+                    &self.app_deployment_name(&app_id),
+                    &self.namespace,
+                    &self.config.cluster_domain,
+                ),
+            ),
+        })
+    }
+
+    async fn patch_deployment(
+        &self,
+        params: ContainerCreateParams,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let app_id = params.project_id.clone().ok_or_else(|| {
+            ContainerRuntimeError::ConfigurationError(
+                "patch_deployment requires project_id (app_id)".to_string(),
+            )
+        })?;
+        let (gateway_name, gateway_namespace, http_expose) = read_app_expose_env();
+        // SSA re-apply 全部资源（幂等 create-or-update，收敛到新 desired state）
+        self.create_app_resources(
+            &app_id,
+            &params,
+            gateway_name.as_deref(),
+            gateway_namespace.as_deref(),
+            http_expose,
+        )
+        .await?;
+        // 清理 update 后不再需要的端口/配置资源（HTTPRoute/NodePort/ConfigMap/Secret orphan）
+        self.cleanup_orphan_port_resources(&app_id, &params).await?;
+        info!("[K8S-APP] Deployment patched for app: {app_id}");
+        Ok(ContainerBasicInfo {
+            container_id: self.app_deployment_name(&app_id),
+            container_name: self.app_deployment_name(&app_id),
+            container_ip: String::new(),
+            internal_port: 0,
+            external_port: 0,
+            project_id: app_id.clone(),
+            status: "Starting".to_string(),
+            created_at: Utc::now(),
+            // UserApp service_url: 传 app_deployment_name(不含 -svc),由 build_k8s_service_fqdn
+            // 追加单层 -svc。【不要】传 app_service_name(已含 -svc) → -svc-svc 双后缀。
+            service_url: format!(
+                "http://{}",
+                shared_types::build_k8s_service_fqdn(
+                    &self.app_deployment_name(&app_id),
+                    &self.namespace,
+                    &self.config.cluster_domain,
+                ),
+            ),
+        })
+    }
+
+    async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
+        self.scale_app(app_id, replicas).await
+    }
+
+    async fn patch_recycle_policy(
+        &self,
+        app_id: &str,
+        recycle_enabled: Option<bool>,
+        idle_timeout_seconds: Option<u64>,
+    ) -> ContainerRuntimeResult<()> {
+        self.patch_app_recycle_policy(app_id, recycle_enabled, idle_timeout_seconds)
+            .await
+    }
+
+    async fn patch_wake_on_traffic(
+        &self,
+        app_id: &str,
+        enabled: bool,
+    ) -> ContainerRuntimeResult<()> {
+        self.patch_app_wake_on_traffic(app_id, enabled).await
+    }
+
+    async fn restart_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        self.restart_app(app_id).await
+    }
+
+    async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
+        self.delete_app_resources(app_id).await
+    }
+
+    async fn get_deployment_status(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
+        self.get_app_status(app_id).await
+    }
+
+    async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
+        self.list_app_status().await
+    }
+
+    async fn get_app_container_spec(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<ContainerSpecSnapshot> {
+        // 委派到 k8s_deployment 的 inherent 实现（UserApp trait 方法统一走「委派→inherent」模式，
+        // 与 get_deployment_status→get_app_status 一致）。不委派则会命中 trait 默认实现（空快照）→
+        // update 回退失效 → command/env 仍被清空。
+        self.read_app_container_spec(app_id).await
+    }
+
+    async fn get_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+        timestamps: bool,
+    ) -> ContainerRuntimeResult<Vec<ContainerLogEntry>> {
+        self.app_logs(app_id, tail, timestamps).await
+    }
+
+    async fn stream_app_logs(
+        &self,
+        app_id: &str,
+        tail: u32,
+    ) -> ContainerRuntimeResult<container_runtime_api::mpsc::Receiver<ContainerLogEntry>> {
+        self.stream_app_logs_inner(app_id, tail).await
+    }
+
+    async fn get_app_events(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Vec<container_runtime_api::AppEventInfo>> {
+        self.app_events(app_id).await
+    }
+
+    async fn get_app_resource_usage(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<container_runtime_api::ResourceUsage> {
+        self.app_resource_usage(app_id).await
+    }
+
+    async fn exec(
+        &self,
+        app_id: &str,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        self.app_exec(app_id, command).await
+    }
+
+    async fn validate_app_prerequisites(&self) -> ContainerRuntimeResult<()> {
+        // RBAC 探测：list deployments（limit 1）。403 = ClusterRole 缺 apps/deployments 权限。
+        // 明确报错指向部署侧 RBAC，避免创建 app 时静默 403。
+        use k8s_openapi::api::apps::v1::Deployment;
+        use kube::api::{Api, ListParams};
+        let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), &self.namespace);
+        match deploy_api.list(&ListParams::default().limit(1)).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 403 => Err(ContainerRuntimeError::ConfigurationError(
+                "RBAC 403：rcoder ServiceAccount 缺 apps/deployments 权限，app 管理将无法创建 Deployment。\
+                 请在 ClusterRole 补 deployments/httproutes/configmaps/secrets 权限"
+                    .to_string(),
+            )),
+            Err(e) => {
+                tracing::warn!(
+                    "[K8S-APP] 前置校验 list deployments 失败（非 403，可能 API Server 暂时不可达，跳过）: {}",
+                    e
+                );
+                Ok(())
+            }
+        }
     }
 }

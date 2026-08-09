@@ -46,3 +46,20 @@ dev-restart: dev-build
 	@echo "🎉 完整重启完成！"
 	@echo "🎉 如需构建基础镜像,可以执行: make docker-build-base"
 	@echo "💡 代码更改已生效，因为重新构建了镜像！"
+
+# ============================================================================
+# 容器内热编译（改 Rust 源码后秒级生效，替代 dev-restart）
+# ============================================================================
+# 前提：docker-compose.yml 已挂载源码到 /app/src（首次需 make dev-restart 应用）。
+# 流程：容器内 cargo build --release --bin rcoder（增量）→ 替换 /app/bin/rcoder
+#       → docker restart 拉起新 binary。
+dev-hot:
+	@echo "🔥 容器内热编译 rcoder..."
+	@DEV_CID=$$(docker-compose -f docker/docker-compose.yml ps -q rcoder); \
+	if [ -z "$$DEV_CID" ]; then \
+		echo "❌ rcoder 容器未运行，请先 make dev-up"; exit 1; \
+	fi; \
+	docker exec $$DEV_CID bash /app/src/docker/dev-hot-build.sh && \
+	echo "🔄 重启 rcoder 进程（拉起新 binary）..." && \
+	docker restart $$DEV_CID >/dev/null && \
+	echo "✅ 热编译完成（日志: docker logs -f $$DEV_CID）"

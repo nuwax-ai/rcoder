@@ -66,7 +66,9 @@ impl HttpServerHandle {
         #[cfg(feature = "proxy")]
         {
             let mut pingora_guard = self.pingora_result.lock().await;
-            if let Some(mut pingora) = pingora_guard.take() {
+            let pingora = pingora_guard.take();
+            drop(pingora_guard);
+            if let Some(mut pingora) = pingora {
                 pingora.stop().await;
             }
         }
@@ -74,10 +76,17 @@ impl HttpServerHandle {
         // 3. 等待所有任务完成（带超时）
         // 使用 3 秒超时：清理任务会立即退出，axum 有 3 秒进行连接排空
         let timeout = Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut join_set = self.join_set.lock().await;
 
         loop {
-            match tokio::time::timeout(timeout, join_set.join_next()).await {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                warn!("Timed out waiting for tasks (3s total), aborting remaining tasks");
+                join_set.abort_all();
+                break;
+            }
+            match tokio::time::timeout(remaining, join_set.join_next()).await {
                 Ok(Some(Ok(()))) => {
                     info!("Task exited normally");
                 }
@@ -89,7 +98,7 @@ impl HttpServerHandle {
                     break;
                 }
                 Err(_) => {
-                    warn!("Timed out waiting for tasks (3s), aborting remaining tasks");
+                    warn!("Timed out waiting for tasks (3s total), aborting remaining tasks");
                     join_set.abort_all();
                     break;
                 }
@@ -111,9 +120,10 @@ impl HttpServerHandle {
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     // 创建 Agent Session Service
+///     // 创建 Agent Session Service（第二参为 ACP session 创建超时秒数，取自 GrpcTimeoutConfig）
 ///     let agent_session_service = Arc::new(AgentSessionService::new(
 ///         agent_abstraction::launcher::direct_model_runtime_env_resolver(),
+///         100,
 ///     ));
 ///
 ///     // 配置 HTTP Server

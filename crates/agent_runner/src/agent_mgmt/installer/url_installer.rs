@@ -9,7 +9,7 @@
 use shared_types::InstallType;
 use shared_types_grpc::InstallAgentResponse;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use download_utils::{DownloadConfig, Downloader};
 
@@ -67,6 +67,37 @@ struct DoInstallParams<'a> {
     platforms: &'a std::collections::HashMap<String, shared_types::PlatformEntry>,
 }
 
+/// 删除安装临时文件。
+///
+/// 安装成功时文件通常已被原子 rename，因此 `NotFound` 是正常结果；其他错误需要保留日志，
+/// 避免权限或磁盘故障导致 staging 文件长期堆积而无法察觉。
+async fn cleanup_staging_file(path: &std::path::Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to remove agent install staging file"
+            );
+        }
+    }
+}
+
+/// 解析并校验安装源 URL。仅限制协议，不限制 host，兼容内网 IP、集群域名和 localhost。
+fn parse_http_url(url: &str) -> AgentMgmtResult<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| AgentMgmtError::InvalidChunk(format!("invalid URL: {error}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AgentMgmtError::InvalidChunk(format!(
+            "URL must use http or https, got scheme {:?}",
+            parsed.scheme()
+        )));
+    }
+    Ok(parsed)
+}
+
 /// 从 URL 下载并安装(下载完成后,二进制/解压逻辑复用 `binary_installer`)
 pub async fn install_from_url(
     registry: &AgentRegistry,
@@ -80,11 +111,10 @@ pub async fn install_from_url(
     crate::agent_mgmt::path_manager::validate_agent_id(agent_id)
         .map_err(AgentMgmtError::InvalidManifest)?;
 
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(AgentMgmtError::InvalidChunk(format!(
-            "URL must start with http:// or https://: {url}"
-        )));
-    }
+    let parsed_url = parse_http_url(url)?;
+
+    // 私有化部署需要从内网 IP、集群域名和 localhost 镜像源下载；不限制 host 的公网属性。
+    // 仍只接受 HTTP(S)，拒绝 file/gopher 等本地文件或非 HTTP 协议。
     if command.is_empty() {
         return Err(AgentMgmtError::InvalidChunk("empty command".into()));
     }
@@ -92,8 +122,9 @@ pub async fn install_from_url(
         .map_err(AgentMgmtError::InvalidManifest)?;
 
     info!(
-        "[agent_mgmt] url install: agent_id={}, url={}",
-        agent_id, url
+        "[agent_mgmt] url install: agent_id={}, origin={}",
+        agent_id,
+        parsed_url.origin().ascii_serialization()
     );
 
     // 下载到临时文件(支持重试 + 断点续传)
@@ -111,9 +142,13 @@ pub async fn install_from_url(
     .await?;
 
     // 文件大小（download_to_file 已校验，传递给 install_from_file）
-    let file_size = std::fs::metadata(&staging_path)
-        .map(|m| m.len())
-        .map_err(AgentMgmtError::Io)?;
+    let file_size = match tokio::fs::metadata(&staging_path).await {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            cleanup_staging_file(&staging_path).await;
+            return Err(AgentMgmtError::Io(error));
+        }
+    };
 
     let response = binary_installer::install_from_file(
         registry,
@@ -132,7 +167,7 @@ pub async fn install_from_url(
     .await;
 
     // install_from_file 成功时已 rename 走了 staging，失败时需清理
-    let _ = std::fs::remove_file(&staging_path);
+    cleanup_staging_file(&staging_path).await;
 
     let mut response = response?;
     response.source_url = Some(url.to_string());
@@ -218,14 +253,8 @@ async fn do_install_with_version_check(
     use crate::agent_mgmt::registry::normalize_platform_key;
 
     // 1. 版本检查：检查特定版本是否已安装（精确匹配）
-    if params
-        .registry
-        .contains_version(params.agent_id, params.version)
-    {
-        let manifest = params
-            .registry
-            .get_version(params.agent_id, params.version)
-            .unwrap();
+    // 使用单次 lookup 避免 contains + get 之间的 TOCTOU 竞争
+    if let Some(manifest) = params.registry.get_version(params.agent_id, params.version) {
         let mut resp = make_skip_response(&manifest);
         resp.previous_version = params.version.to_string();
         return Ok(resp);
@@ -254,16 +283,13 @@ async fn do_install_with_version_check(
     })?;
 
     // 3. 验证 URL
-    if !entry.url.starts_with("http://") && !entry.url.starts_with("https://") {
-        return Err(AgentMgmtError::InvalidChunk(format!(
-            "URL must start with http:// or https://: {}",
-            entry.url
-        )));
-    }
+    let parsed_url = parse_http_url(&entry.url)?;
 
     info!(
-        "[agent_mgmt] platform install: agent_id={}, platform={}, url={}",
-        params.agent_id, platform_key, entry.url
+        "[agent_mgmt] platform install: agent_id={}, platform={}, origin={}",
+        params.agent_id,
+        platform_key,
+        parsed_url.origin().ascii_serialization()
     );
 
     // 4. 下载到临时文件(支持重试 + 断点续传)
@@ -282,9 +308,13 @@ async fn do_install_with_version_check(
     .await?;
 
     // 文件大小（download_to_file 已校验，传递给 install_from_file）
-    let file_size = std::fs::metadata(&staging_path)
-        .map(|m| m.len())
-        .map_err(AgentMgmtError::Io)?;
+    let file_size = match tokio::fs::metadata(&staging_path).await {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            cleanup_staging_file(&staging_path).await;
+            return Err(AgentMgmtError::Io(error));
+        }
+    };
 
     // 5. 安装(复用 binary_installer::install_from_file，避免全量读入内存)
     let t_install = std::time::Instant::now();
@@ -313,7 +343,7 @@ async fn do_install_with_version_check(
     );
 
     // install_from_file 成功时已 rename 走了 staging，失败时需清理
-    let _ = std::fs::remove_file(&staging_path);
+    cleanup_staging_file(&staging_path).await;
 
     let mut response = response?;
 
@@ -420,14 +450,11 @@ mod tests {
 
     #[test]
     fn rejects_non_http_scheme() {
-        assert!(!url_is_supported("file:///etc/passwd"));
-        assert!(!url_is_supported("gopher://evil/"));
-        assert!(url_is_supported("http://example.com/agent"));
-        assert!(url_is_supported("https://example.com/agent"));
-    }
-
-    fn url_is_supported(url: &str) -> bool {
-        url.starts_with("http://") || url.starts_with("https://")
+        assert!(parse_http_url("file:///etc/passwd").is_err());
+        assert!(parse_http_url("gopher://evil/").is_err());
+        assert!(parse_http_url("not a URL").is_err());
+        assert!(parse_http_url("http://127.0.0.1/agent").is_ok());
+        assert!(parse_http_url("https://service.cluster.local/agent").is_ok());
     }
 
     // ========== 本地 HTTP 测试服务器 ==========
@@ -445,8 +472,18 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        // 等待服务器就绪
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // 轮询等待服务器就绪（避免固定 sleep 在高负载 CI 上不可靠）
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "test server did not become ready within 2s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         addr
     }
 
@@ -512,6 +549,11 @@ mod tests {
         StatusCode::NOT_FOUND
     }
 
+    async fn handler_slow() -> impl IntoResponse {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        StatusCode::OK
+    }
+
     /// 解析 Range: bytes=start-end
     fn parse_range(range_str: &str, total_size: u64) -> Option<(u64, u64)> {
         let range_str = range_str.strip_prefix("bytes=")?;
@@ -538,8 +580,8 @@ mod tests {
         let addr = start_server(app).await;
         let url = format!("http://{}/file", addr);
 
-        let dest = std::env::temp_dir().join("test-download-basic.bin");
-        let _ = std::fs::remove_file(&dest);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
 
         let max_bytes = test_data().len() as u64 * 2; // 足够大
         let result =
@@ -552,12 +594,9 @@ mod tests {
                 assert_eq!(file_content, test_data());
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&dest);
                 panic!("download failed: {}", e);
             }
         }
-
-        let _ = std::fs::remove_file(&dest);
     }
 
     /// 测试 max_bytes 限制（下载过程中超限）
@@ -567,8 +606,8 @@ mod tests {
         let addr = start_server(app).await;
         let url = format!("http://{}/file", addr);
 
-        let dest = std::env::temp_dir().join("test-download-maxbytes.bin");
-        let _ = std::fs::remove_file(&dest);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
 
         // max_bytes 小于文件大小（100KB），下载过程中触发 BinaryTooLarge
         let max_bytes = 30 * 1024u64; // 30KB
@@ -583,12 +622,9 @@ mod tests {
                 assert!(size > max_bytes, "size should exceed max_bytes");
             }
             other => {
-                let _ = std::fs::remove_file(&dest);
                 panic!("expected BinaryTooLarge, got: {:?}", other);
             }
         }
-
-        let _ = std::fs::remove_file(&dest);
     }
 
     /// 测试 404 错误不重试（本地服务器）
@@ -598,8 +634,8 @@ mod tests {
         let addr = start_server(app).await;
         let url = format!("http://{}/notfound", addr);
 
-        let dest = std::env::temp_dir().join("test-download-404.bin");
-        let _ = std::fs::remove_file(&dest);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
 
         let result = download_to_file(&url, &dest, 1024, None, &CancellationToken::new()).await;
 
@@ -612,12 +648,35 @@ mod tests {
                 );
             }
             other => {
-                let _ = std::fs::remove_file(&dest);
                 panic!("expected InstallFailed with HTTP 404, got: {:?}", other);
             }
         }
+    }
 
-        let _ = std::fs::remove_file(&dest);
+    #[tokio::test]
+    async fn test_download_cancellation_is_prompt_and_cleans_partial_file() {
+        let app = Router::new().route("/slow", get(handler_slow));
+        let addr = start_server(app).await;
+        let url = format!("http://{addr}/slow");
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
+        std::fs::write(&dest, b"partial").expect("partial download");
+        let cancel = CancellationToken::new();
+        let cancel_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_task.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            download_to_file(&url, &dest, 1024, None, &cancel),
+        )
+        .await
+        .expect("cancellation must not wait for HTTP timeout");
+
+        assert!(matches!(result, Err(AgentMgmtError::InstallCancelled)));
+        assert!(!dest.exists(), "cancelled partial download must be removed");
     }
 
     /// 测试断点续传（本地服务器，支持 Range）
@@ -631,8 +690,8 @@ mod tests {
         let addr = start_server(app).await;
         let url = format!("http://{}/file", addr);
 
-        let dest = std::env::temp_dir().join("test-download-resume.bin");
-        let _ = std::fs::remove_file(&dest);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
 
         // Step 1: 手动下载前 30KB（模拟中断）
         let partial_size = 30 * 1024usize;
@@ -680,12 +739,9 @@ mod tests {
                 );
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&dest);
                 panic!("resume download failed: {}", e);
             }
         }
-
-        let _ = std::fs::remove_file(&dest);
     }
 
     /// 测试不支持 Range 的服务器（模拟 MinIO）
@@ -698,8 +754,8 @@ mod tests {
         let addr = start_server(app).await;
         let url = format!("http://{}/file", addr);
 
-        let dest = std::env::temp_dir().join("test-download-noresume.bin");
-        let _ = std::fs::remove_file(&dest);
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("file.bin");
 
         // 先写入部分数据模拟中断
         let partial = vec![0xABu8; 30 * 1024];
@@ -724,11 +780,8 @@ mod tests {
                 );
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&dest);
                 panic!("unexpected error: {}", e);
             }
         }
-
-        let _ = std::fs::remove_file(&dest);
     }
 }

@@ -34,6 +34,11 @@ error.workspace_error: "工作目錄錯誤"
 # gRPC 相關
 error.grpc_addr_error: "gRPC 位址解析失敗"
 error.grpc_error: "gRPC 呼叫失敗"
+error.agent_container_unavailable: "計算環境暫時不可用"
+error.agent_container_oom: "計算環境因記憶體不足被重啟,正在自動恢復,請稍後重試(已重啟 {} 次)"
+error.agent_container_crashloop: "計算環境啟動異常,反覆重啟(退出碼 {}),請聯繫管理員"
+error.agent_container_not_found: "計算環境未運行,請重新發起會話"
+error.agent_container_starting: "計算環境啟動中,請稍後重試"
 
 # 服務狀態
 error.service_unavailable: "服務暫時無法使用"

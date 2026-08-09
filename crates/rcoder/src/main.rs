@@ -1,9 +1,11 @@
 mod background_tasks;
+mod batch_migrate;
 mod bootstrap;
 mod cleanup_task;
 mod config;
 mod config_watcher;
 mod docker_init;
+mod file_server_embed;
 mod handler;
 mod middleware;
 mod proxy_init;
@@ -11,7 +13,11 @@ mod router;
 mod server;
 mod service;
 mod shutdown;
+mod skill_sync_reconciler;
+mod userapp_publish;
+mod userapp_recycle;
 mod utils;
+mod workspace_migrate;
 
 use std::sync::Arc;
 
@@ -25,7 +31,24 @@ use docker_manager::runtime_selection::RuntimeType;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Feature 开关: 启动读一次 env + eprintln 打印状态 (console, tracing 未就绪也可见)
+    shared_types::FeatureFlags::init();
+
+    // 版本标识 (先 eprintln 保证 console 一定输出; bootstrap 后再 info! 写文件日志)
+    let version_line = format!(
+        "🚀 rcoder v{} — BUILD: {} @ {} (branch: {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("RCODER_BUILD_GIT_HASH"),
+        env!("RCODER_BUILD_TIME"),
+        env!("RCODER_BUILD_GIT_BRANCH")
+    );
+    eprintln!("{version_line}");
+
     let bootstrap_result = bootstrap::bootstrap().await?;
+
+    // bootstrap 完成 (tracing 已初始化) → 再写一次到文件日志
+    info!("{version_line}");
+    info!(target: "feature_flags", "{:?}", shared_types::FeatureFlags::get());
 
     let runtime_type = RuntimeType::from_env();
     let is_kubernetes = shared_types::is_kubernetes_runtime();
@@ -62,10 +85,24 @@ async fn main() -> anyhow::Result<()> {
     let projects_for_lookup = Arc::clone(&projects);
     let container_lookup: Arc<dyn shared_types::ContainerLookup> = projects_for_lookup;
 
+    // UserApp 活动状态注册表（闲置回收 + 流量唤醒的共享状态）。
+    // 独立 Arc 在 Pingora 之前构造（注入代理层）；runtime 延迟到下方 RuntimeManager::get 后
+    // 经 set_runtime 填充（OnceLock）——wake 只在 is_stopped 真时触发，而 stopped 表要到
+    // AppService::new 才填充，此时 OnceLock 早已 set。
+    let wake_timeout = std::time::Duration::from_secs(
+        bootstrap_result.config.userapp_recycle.wake_timeout_seconds,
+    );
+    let activity_registry: Arc<app_manager::AppActivityRegistry> =
+        Arc::new(app_manager::AppActivityRegistry::new(wake_timeout));
+    let access_tracker: Arc<dyn shared_types::AppAccessTracker> = activity_registry.clone();
+    let wake_control: Arc<dyn shared_types::AppWakeControl> = activity_registry.clone();
+
     let proxy_result = proxy_init::init_proxy(
         &bootstrap_result.config,
         Arc::clone(&bootstrap_result.api_key_config),
         container_lookup,
+        access_tracker,
+        wake_control,
     )
     .await;
     proxy_init::log_proxy_info(&bootstrap_result.config);
@@ -94,12 +131,33 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (container_prefix_rcoder, container_prefix_computer) =
-        docker_init::get_container_prefixes(&bootstrap_result.config)?;
+        docker_init::get_container_prefixes(&bootstrap_result.config).await?;
 
     // 获取容器运行时（在 init_docker_manager 之后可用）
     let runtime = docker_manager::runtime::RuntimeManager::get()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get container runtime: {}", e))?;
+
+    // 注入 runtime 到活动注册表（wake 需要 scale + 查 status；启动早期 OnceLock 为空，此处填充）。
+    // trait upcasting: Arc<dyn ContainerRuntime> → Arc<dyn UserAppRuntime>（supertrait，Rust 1.86+）
+    activity_registry.set_runtime(runtime.clone());
+
+    // 阶段2 批量迁移: 启动后台 task 将共享 PVC 老数据一次性迁到 per-agent PVC (env 开关, 默认 false)
+    batch_migrate::spawn_if_enabled(runtime.clone());
+
+    // 启动 skill sync reconciler: 后台补齐旧 workspace 缺的 fan-out 目录 (grok/pi/...),
+    // 版本 marker 驱动, 已同步的 O(1) 跳过。env RCODER_SKILL_SYNC_RECONCILE_ON_STARTUP 默认 true。
+    skill_sync_reconciler::spawn_skill_sync_reconciler();
+
+    // 阶段2 方案C: rcoder 同进程嵌入 file-server (FeatureFlags.embed_file_server, 灰度)。
+    // 启用时 rcoder 进程内 spawn file-server (端口 60000), 经 SubvolumeWorkspaceResolver
+    // 复用本进程 ContainerRuntime 解析 per-agent subvolume 聚合路径 (file-server 不加 kube 依赖)。
+    // 配套: start-services.sh 须检查本 env, 嵌入时不再单独启 file-server 二进制 (避免端口冲突)。
+    if shared_types::FeatureFlags::get().embed_file_server {
+        // spawn_embedded_file_server 取 Arc<dyn WorkspaceRuntime>; trait upcast 需两步.
+        let ws_runtime: Arc<dyn container_runtime_api::WorkspaceRuntime> = runtime.clone();
+        file_server_embed::spawn_embedded_file_server(ws_runtime).await;
+    }
 
     let state = Arc::new(
         AppState::new(
@@ -111,13 +169,17 @@ async fn main() -> anyhow::Result<()> {
             runtime,
             projects,
             cleanup_rx,
+            activity_registry.clone(),
         )
         .await?,
     );
 
-    let _bg_handles =
-        background_tasks::start_all_background_tasks(&bootstrap_result.config, state.clone())
-            .await?;
+    let _bg_handles = background_tasks::start_all_background_tasks(
+        &bootstrap_result.config,
+        state.clone(),
+        shutdown_tx.clone(),
+    )
+    .await?;
 
     let runtime_for_shutdown = state.runtime().clone();
     let app = router::create_router(state, Some(bootstrap_result.telemetry));
@@ -135,8 +197,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pingora_shutdown_tx) = proxy_result.pingora_shutdown_tx {
         let _ = pingora_shutdown_tx.send(());
     }
-    if let Some(proxy_handle) = proxy_result.proxy_handle {
-        let _ = proxy_handle.await;
+    if let Some(proxy_handle) = proxy_result.proxy_handle
+        && let Err(e) = proxy_handle.await
+    {
+        warn!("proxy task join failed during shutdown: {}", e);
     }
 
     Ok(())

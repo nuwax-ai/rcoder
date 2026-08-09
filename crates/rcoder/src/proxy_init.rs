@@ -18,6 +18,8 @@ pub async fn init_proxy(
     config: &AppConfig,
     api_key_config: Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>,
     container_lookup: Arc<dyn shared_types::ContainerLookup>,
+    access_tracker: Arc<dyn shared_types::AppAccessTracker>,
+    wake_control: Arc<dyn shared_types::AppWakeControl>,
 ) -> ProxyInitResult {
     let Some(proxy_config) = &config.proxy_config else {
         info!("[Pingora] proxy_config not configured, skipping Pingora startup");
@@ -62,7 +64,9 @@ pub async fn init_proxy(
     info!("[Pingora] PingoraServerManager created successfully");
     let mut server_manager = PingoraServerManager::new(pingora_config)
         .with_api_key_config(Arc::clone(&api_key_config))
-        .with_container_lookup(container_lookup);
+        .with_container_lookup(container_lookup)
+        .with_access_tracker(access_tracker)
+        .with_wake_control(wake_control);
     let pingora_service = server_manager.service();
     info!("[Pingora] API Key config already loaded (no updates)");
 

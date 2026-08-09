@@ -34,6 +34,11 @@ error.workspace_error: "Workspace error"
 # gRPC
 error.grpc_addr_error: "gRPC address resolution failed"
 error.grpc_error: "gRPC call failed"
+error.agent_container_unavailable: "Compute environment temporarily unavailable"
+error.agent_container_oom: "Compute environment restarted due to out-of-memory, recovering automatically. Please retry later (restarted {} times)"
+error.agent_container_crashloop: "Compute environment is crash-looping (exit code {}). Please contact the administrator"
+error.agent_container_not_found: "Compute environment is not running. Please start a new session"
+error.agent_container_starting: "Compute environment is starting up, please retry shortly"
 
 # Service status
 error.service_unavailable: "Service temporarily unavailable"

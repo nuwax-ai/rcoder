@@ -166,6 +166,10 @@ pub const ERR_PROJECT_NOT_FOUND: &str = "ERR_PROJECT_NOT_FOUND";
 /// Agent Runner 容器不可用(P0-4: gRPC 调用失败 / 容器离线)
 pub const ERR_AGENT_RUNNER_UNAVAILABLE: &str = "ERR_AGENT_RUNNER_UNAVAILABLE";
 
+/// Agent 计算环境不可用(诊断出真实根因:OOM 重启 / CrashLoopBackOff / 容器缺失等)。
+/// 可重试 —— 通常容器会自动恢复(STS restartPolicy)或可重新发起会话。
+pub const ERR_AGENT_CONTAINER_UNAVAILABLE: &str = "ERR_AGENT_CONTAINER_UNAVAILABLE";
+
 // ========== 应用管理服务错误码 ==========
 
 /// 资源不存在
@@ -173,6 +177,49 @@ pub const ERR_NOT_FOUND: &str = "ERR_NOT_FOUND";
 
 /// 资源冲突（已存在）
 pub const ERR_CONFLICT: &str = "ERR_CONFLICT";
+
+// ========== 应用管理服务（app_manager v2）错误码 ==========
+//
+// retryable 语义见 `is_retryable_code`：可重试=Java 可指数退避重发；
+// 终态=重发无用，需修改请求。HTTP 状态见 shared_types::AppError::status_from_code。
+
+/// 应用不存在（Deployment/容器在集群中找不到）。终态 → 404
+pub const ERR_APP_NOT_FOUND: &str = "ERR_APP_NOT_FOUND";
+
+/// 应用已存在（创建时 Deployment 已存在）。终态 → 409
+pub const ERR_APP_ALREADY_EXISTS: &str = "ERR_APP_ALREADY_EXISTS";
+
+/// 状态不允许操作（如 Deleting 中又 start；对运行中应用执行 storage/clear 或 storage/destroy）。终态 → 409
+pub const ERR_INVALID_STATE: &str = "ERR_INVALID_STATE";
+
+/// 操作不被支持（如 K8s 后端尝试改不可变字段 name）。终态 → 400
+pub const ERR_OPERATION_NOT_SUPPORTED: &str = "ERR_OPERATION_NOT_SUPPORTED";
+
+/// 文件不存在（文件管理目标找不到）。终态 → 404
+pub const ERR_FILE_NOT_FOUND: &str = "ERR_FILE_NOT_FOUND";
+
+/// 后端 API 调用失败（K8s/Docker API 透传，瞬时故障）。可重试 → 500
+pub const ERR_BACKEND_ERROR: &str = "ERR_BACKEND_ERROR";
+
+/// 镜像拉取失败（ImagePullBackOff/ErrImagePull，常为临时 registry 故障）。可重试 → 502
+pub const ERR_IMAGE_PULL_FAILED: &str = "ERR_IMAGE_PULL_FAILED";
+
+/// 集群资源不足（调度失败）。可重试 → 503
+pub const ERR_RESOURCE_EXHAUSTED: &str = "ERR_RESOURCE_EXHAUSTED";
+
+/// 判断错误码是否可重试（Java 据此决定是否指数退避重发）。
+///
+/// 注意：`retryable` 是错误码的固有属性，不在响应体重复（HttpResult 不变）。
+/// 详见 docs/application-management-service-v2-design.md §12.3。
+pub fn is_retryable_code(code: &str) -> bool {
+    matches!(
+        code,
+        ERR_BACKEND_ERROR
+            | ERR_IMAGE_PULL_FAILED
+            | ERR_RESOURCE_EXHAUSTED
+            | ERR_AGENT_CONTAINER_UNAVAILABLE
+    )
+}
 
 /// 获取错误码对应的翻译 key
 fn get_error_i18n_key(code: &str) -> &'static str {
@@ -226,8 +273,17 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_AGENT_MGMT_INVALID_VERSION => "error.agent_mgmt_invalid_version",
         ERR_PROJECT_NOT_FOUND => "error.project_not_found",
         ERR_AGENT_RUNNER_UNAVAILABLE => "error.agent_runner_unavailable",
+        ERR_AGENT_CONTAINER_UNAVAILABLE => "error.agent_container_unavailable",
         ERR_NOT_FOUND => "error.not_found",
         ERR_CONFLICT => "error.conflict",
+        ERR_APP_NOT_FOUND => "error.app_not_found",
+        ERR_APP_ALREADY_EXISTS => "error.app_already_exists",
+        ERR_INVALID_STATE => "error.invalid_state",
+        ERR_OPERATION_NOT_SUPPORTED => "error.operation_not_supported",
+        ERR_FILE_NOT_FOUND => "error.file_not_found",
+        ERR_BACKEND_ERROR => "error.backend_error",
+        ERR_IMAGE_PULL_FAILED => "error.image_pull_failed",
+        ERR_RESOURCE_EXHAUSTED => "error.resource_exhausted",
         ERR_UNKNOWN => "error.unknown",
         _ => "error.undefined",
     }
@@ -321,6 +377,15 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_AGENT_MGMT_INVALID_CHUNK => "Invalid upload chunk",
         ERR_PROJECT_NOT_FOUND => "Project not found or stopped",
         ERR_AGENT_RUNNER_UNAVAILABLE => "Agent Runner container is unavailable",
+        ERR_AGENT_CONTAINER_UNAVAILABLE => "Agent compute environment is unavailable",
+        ERR_APP_NOT_FOUND => "Application not found",
+        ERR_APP_ALREADY_EXISTS => "Application already exists",
+        ERR_INVALID_STATE => "Operation not allowed in current state",
+        ERR_OPERATION_NOT_SUPPORTED => "Operation not supported",
+        ERR_FILE_NOT_FOUND => "File not found",
+        ERR_BACKEND_ERROR => "Backend API call failed",
+        ERR_IMAGE_PULL_FAILED => "Image pull failed",
+        ERR_RESOURCE_EXHAUSTED => "Cluster resources exhausted",
         ERR_UNKNOWN => "Unknown error",
         _ => "Undefined error code",
     }
@@ -381,6 +446,7 @@ mod tests {
             ERR_AGENT_MGMT_INVALID_CHUNK,
             ERR_PROJECT_NOT_FOUND,
             ERR_AGENT_RUNNER_UNAVAILABLE,
+            ERR_AGENT_CONTAINER_UNAVAILABLE,
         ];
 
         for code in codes {

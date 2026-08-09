@@ -44,9 +44,11 @@ impl SessionNotifier for TuiSessionNotifier {
         _request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 使用 try_send 提供背压保护，避免无限缓冲
-        let _ = self.tx.try_send(AppEvent::PromptStarted {
+        if let Err(e) = self.tx.try_send(AppEvent::PromptStarted {
             session_id: session_id.to_string(),
-        });
+        }) {
+            tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
+        }
         Ok(())
     }
 
@@ -58,10 +60,12 @@ impl SessionNotifier for TuiSessionNotifier {
         error_message: Option<String>,
         _request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _ = self.tx.try_send(AppEvent::PromptEnded {
+        if let Err(e) = self.tx.try_send(AppEvent::PromptEnded {
             session_id: session_id.to_string(),
             error: error_message,
-        });
+        }) {
+            tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
+        }
         self.signal_completion();
         Ok(())
     }
@@ -73,10 +77,12 @@ impl SessionNotifier for TuiSessionNotifier {
         error: agent_client_protocol::schema::v1::Error,
         _request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _ = self.tx.try_send(AppEvent::PromptEnded {
+        if let Err(e) = self.tx.try_send(AppEvent::PromptEnded {
             session_id: session_id.to_string(),
             error: Some(format!("{:?}", error)),
-        });
+        }) {
+            tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
+        }
         self.signal_completion();
         Ok(())
     }
@@ -90,20 +96,26 @@ impl SessionNotifier for TuiSessionNotifier {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match session_update {
             SessionUpdate::AgentMessageChunk(chunk) => {
-                if let ContentBlock::Text(text) = &chunk.content {
-                    let _ = self.tx.try_send(AppEvent::AgentText(text.text.clone()));
+                if let ContentBlock::Text(text) = &chunk.content
+                    && let Err(e) = self.tx.try_send(AppEvent::AgentText(text.text.clone()))
+                {
+                    tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
                 }
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
-                if let ContentBlock::Text(text) = &chunk.content {
-                    let _ = self.tx.try_send(AppEvent::AgentThought(text.text.clone()));
+                if let ContentBlock::Text(text) = &chunk.content
+                    && let Err(e) = self.tx.try_send(AppEvent::AgentThought(text.text.clone()))
+                {
+                    tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
                 }
             }
             SessionUpdate::ToolCall(tool_call) => {
-                let _ = self.tx.try_send(AppEvent::ToolCall {
+                if let Err(e) = self.tx.try_send(AppEvent::ToolCall {
                     title: tool_call.title.clone(),
                     status: format!("{:?}", tool_call.status),
-                });
+                }) {
+                    tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
+                }
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 if let Some(ref title) = update.fields.title {
@@ -113,10 +125,12 @@ impl SessionNotifier for TuiSessionNotifier {
                         .as_ref()
                         .map(|s| format!("{:?}", s))
                         .unwrap_or_else(|| "updating".to_string());
-                    let _ = self.tx.try_send(AppEvent::ToolCall {
+                    if let Err(e) = self.tx.try_send(AppEvent::ToolCall {
                         title: title.clone(),
                         status: status_str,
-                    });
+                    }) {
+                        tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
+                    }
                 }
             }
             _ => {}

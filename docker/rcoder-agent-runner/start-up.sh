@@ -69,6 +69,14 @@ fi
 
 
 # ============================================================================
+# 🎯 加载部署模式 extra (Docker Compose / K8s 差异函数, 如 fix_mount_permissions)
+# 提供 fix_mount_permissions: Docker 修权限 / K8s no-op (PVC 由 fsGroup 管理)
+# DEPLOY_MODE 由 rcoder 创建容器时注入 (kubernetes_runtime.rs / agent_container_starter.rs)
+# ============================================================================
+source /usr/local/bin/start-up-common.sh
+
+
+# ============================================================================
 # 🎯 动态时区设置（支持通过 TZ 环境变量自定义时区）
 # 默认时区为 Asia/Shanghai（在 Dockerfile 中配置）
 # 启动时如果检测到 TZ 环境变量，则更新系统时区
@@ -307,8 +315,8 @@ function initialize_user_home() {
         if [ -d "$SKEL_DIR/Desktop" ]; then
             # 先删除现有的 .desktop 文件（可能是损坏的软链接）
             rm -f "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
-            # 强制复制桌面图标
-            cp -a "$SKEL_DIR/Desktop/"*.desktop "$USER_HOME/Desktop/" 2>/dev/null || true
+            # 强制复制桌面图标 (-L 复制实体, 规避 rsync munge 死链 + xfdesktop untrusted)
+            cp -aL "$SKEL_DIR/Desktop/"*.desktop "$USER_HOME/Desktop/" 2>/dev/null || true
             # 设置可执行权限
             chmod +x "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
             log_success "  Desktop icons restored (forced overwrite)"
@@ -341,6 +349,14 @@ function initialize_user_home() {
                 log_success "  Chromium user data restored"
             fi
         fi
+
+        # ========== 清除残留的 sudo-supervisord autostart ==========
+        # 老镜像 Dockerfile.old 曾写入 $USER_HOME/.config/autostart/supervisord.desktop
+        # (Exec=sudo supervisord); 当前镜像不再生成, 但 /home/user 是持久化 PVC, 旧文件残留。
+        # XFCE 启动会 autostart 它 → sudo 净化环境 → 那把 supervisord 解析 pgweb.conf
+        # %(ENV_PGWEB_PORT)s 失败(error.log 噪音) + 第二把 supervisord 隐患(socket 冲突)。
+        # 必须在 start_display_and_desktop(XFCE 起来)前删掉。定向清理, 不动其它 autostart。
+        rm -f "$USER_HOME/.config/autostart/supervisord.desktop" /usr/local/bin/start-supervisord.sh 2>/dev/null || true
 
         # ========== .local 目录 - 强制覆盖 ==========
         if [ -d "$SKEL_DIR/.local" ]; then
@@ -382,6 +398,17 @@ function initialize_user_home() {
         log_success "User home directory initialized from skeleton"
     else
         log_success "User home directory already initialized"
+    fi
+
+    # ========== 无条件确保 .npmrc 存在（国内镜像源）==========
+    # /home/user 被宿主机挂载时 .npmrc 会丢失，且上方 need_restore 检测条件不含 .npmrc
+    # （只要 Desktop/.bashrc/.bunfig.toml/.claude/.config 存在就不会触发恢复）
+    # 因此每次启动都强制恢复，确保 user 用户使用国内 npm 源
+    # 注意：即使此文件丢失，/usr/etc/npmrc 系统级配置仍可兜底（见 Dockerfile.base）
+    if [ -f "$SKEL_DIR/.npmrc" ]; then
+        cp -a "$SKEL_DIR/.npmrc" "$USER_HOME/.npmrc"
+        chown user:user "$USER_HOME/.npmrc" 2>/dev/null || true
+        log_success "  .npmrc ensured (国内镜像源 registry=https://registry.npmmirror.com)"
     fi
 
     # ========== 额外保护：确保 XFCE Panel 配置始终有效 ==========
@@ -457,6 +484,39 @@ function initialize_user_home() {
         mkdir -p "$(dirname "$XFCE_DESKTOP_XML")"
         cp -f "$XFCE_DESKTOP_SYSTEM" "$XFCE_DESKTOP_XML"
         log_success "  xfce4-desktop.xml pre-configured from system (fixes wallpaper scaling)"
+    fi
+
+    # ========== 无条件补齐桌面系统图标 (每次启动确保预设图标存在) ==========
+    # 与下方 launcher 补齐同理, 属于"系统预设, 每次启动确保存在"。
+    # 语义: 只补缺失的, 不删除用户自定义图标, 不覆盖用户改过的同名图标:
+    #   - 用户删了图标 (链接不存在)              → 补
+    #   - 链接损坏 (目标无效, -e 跟踪失败)        → 补
+    #   - 用户保留或改过 (存在且有效)             → 不动
+    # 背景: /home/user 是持久化 PVC (rcoder-computer-workspace/{user_id}),
+    #       用户删图标会被 PVC 保留; 而上方 need_restore 只在"目录不存在"时触发,
+    #       删图标后 Desktop 目录还在 → 不触发 → 桌面图标必须靠这里无条件补齐才能恢复。
+    if [ -d "$SKEL_DIR/Desktop" ]; then
+        for skel_icon in "$SKEL_DIR/Desktop/"*.desktop; do
+            [ -e "$skel_icon" ] || continue            # glob 无匹配时跳过
+            local icon_name="$(basename "$skel_icon")"
+            local user_icon="$USER_HOME/Desktop/$icon_name"
+            if [ ! -e "$user_icon" ]; then              # 不存在或链接损坏 → 补
+                rm -f "$user_icon" 2>/dev/null || true      # 清 /rsyncd-munged/ 等历史断链 (cp -a 跟随断链 dst 会失败)
+                mkdir -p "$USER_HOME/Desktop"
+                cp -aL "$skel_icon" "$user_icon"           # -L 复制实体 (符号链接会被 munge 死链 + xfdesktop untrusted)
+                chmod +x "$user_icon" 2>/dev/null || true
+                chown user:user "$user_icon" 2>/dev/null || true
+                log_success "  Desktop icon ensured (was missing): $icon_name"
+            fi
+        done
+    fi
+
+    # 无条件确保桌面图标可执行 + 属主 (X 启动前; 补齐段只补缺失/断链,
+    # rsync 同步带过来的旧图标 (644) 会跳过补齐 → xfdesktop 读到 644 弹 mark executable。
+    # 这里无条件 chmod 兜底, 保证 xfdesktop 启动时桌面图标一定 755)
+    if [ -d "$USER_HOME/Desktop" ]; then
+        chmod 755 "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
+        chown user:user "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
     fi
 
     # 确保 Panel launcher 目录存在且内容完整（强制恢复）
@@ -585,49 +645,13 @@ EOF
     log_success "  Chromium set as default web browser (mimeapps.list)"
     log_success "  BROWSER env set to: $BROWSER"
 
-    # ========== 修复挂载目录的权限（优化版 - 避免递归遍历大量文件） ==========
-    # 优化说明：
-    # 1. 容器以 root 身份运行，通过 HOME=/home/user 设置环境变量
-    # 2. root 用户可以访问任何文件，不需要递归 chown
-    # 3. 只需要确保关键目录的基本权限即可
-    log "Fixing permissions for mounted directories (optimized)..."
-
-    # 确保必要目录存在
+    # 确保必要目录存在 (两类部署通用)
     mkdir -p "$USER_HOME/.cache" /app /tmp/mesa_shader_cache "${CONTAINER_LOGS_DIR:-/app/container-logs}"
 
-    # ========== 方案 1: 只修复顶层目录所有权（非递归，<0.1秒） ==========
-    log "Fixing ownership for top-level directories (non-recursive)..."
-    chown user:user "$USER_HOME" 2>/dev/null || true
-    chown user:user "$USER_HOME/.config" 2>/dev/null || true
-    chown user:user "$USER_HOME/.cache" 2>/dev/null || true
-    chown user:user "$USER_HOME/Desktop" 2>/dev/null || true
-
-    # ========== 方案 2: 只递归修复 XFCE 配置目录（文件少，~0.1秒） ==========
-    # XFCE 配置文件需要正确的所有者才能被 xfce4-session 正确加载
-    # 同时设置 other 读权限让 root 用户也能访问（一次性完成，避免重复遍历）
-    if [ -d "$USER_HOME/.config/xfce4" ]; then
-        find "$USER_HOME/.config/xfce4" \( -type f -o -type d \) \
-            -exec chown user:user {} + \
-            -exec chmod o+rX {} + 2>/dev/null || true
-        log_success "  XFCE config ownership and permissions fixed"
-    fi
-
-    # ========== 方案 3: 通过 chmod 让 root 用户也能访问（容器内以 root 运行） ==========
-    # 由于容器以 root 运行，只需要确保 other 有读权限即可
-    # 为了安全性和性能，只对必要的目录递归处理
-    log "Setting read permissions for root access..."
-
-    # Desktop 目录递归处理（文件少）
-    if [ -d "$USER_HOME/Desktop" ]; then
-        chmod -R o+rX "$USER_HOME/Desktop" 2>/dev/null || true
-    fi
-
-    # .cache 和 .local 可能包含大量文件，只修复顶层目录（非递归）
-    for dir in "$USER_HOME/.cache" "$USER_HOME/.local" "$USER_HOME/.config"; do
-        if [ -d "$dir" ]; then
-            chmod o+rX "$dir" 2>/dev/null || true
-        fi
-    done
+    # 修复挂载目录权限: 由 start-up-common.sh 按 DEPLOY_MODE 提供的 fix_mount_permissions 执行
+    #   - Docker Compose (bind mount): chown/chmod 修被宿主机改坏的 owner
+    #   - K8s (PVC subPath): no-op, 权限由 fsGroup 管理
+    fix_mount_permissions "$USER_HOME"
 
     # ========== 保护敏感目录（如果存在）==========
     # 确保 SSH 私钥等敏感文件权限严格
@@ -725,6 +749,44 @@ function start_vnc_services() {
 	return 0
 }
 
+# ========== 桌面图标信任化 (xfdesktop 双击实体 .desktop 仍可能弹 untrusted) ==========
+# 三层: 1) 实体 + 属主 user + 可执行  2) gio set metadata::trusted (GIO 通用, 需 D-Bus session)
+#        3) 兜底禁 Thunar launch-confirm (恢复被删的 ae73d82 逻辑)
+# 需在 X11 + D-Bus 起来后 (start_vnc_services 成功后) 调用。任何一层失败都不阻断启动。
+function trust_desktop_icons() {
+    local f
+    # 1) 实体 + 属主 user + 可执行 (xfdesktop 较宽容的信任条件)
+    for f in /home/user/Desktop/*.desktop; do
+        [ -f "$f" ] || continue
+        chown user:user "$f" 2>/dev/null || true
+        chmod 755 "$f" 2>/dev/null || true
+    done
+    # 2) gio set metadata::trusted + xfce-exe-checksum (XFCE 4.18 五件套: uid(user) + 755 + checksum + trusted)
+    if command -v gio >/dev/null 2>&1; then
+        local oh=$HOME od=$DISPLAY odb=${DBUS_SESSION_BUS_ADDRESS:-}
+        export HOME=/home/user DISPLAY=${DISPLAY:-:0}
+        [ -f /tmp/dbus-session-env ] && . /tmp/dbus-session-env     # 关键: gio set 要 DBUS 连 gvfsd, 否则 not supported
+        for f in /home/user/Desktop/*.desktop; do
+            [ -f "$f" ] || continue
+            local cksum=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+            [ -n "$cksum" ] && gio set "$f" metadata::xfce-exe-checksum "$cksum" 2>/dev/null || true
+            gio set "$f" metadata::trusted true 2>/dev/null || true
+        done
+        export HOME=$oh DISPLAY=$od
+        [ -n "$odb" ] && export DBUS_SESSION_BUS_ADDRESS=$odb || unset DBUS_SESSION_BUS_ADDRESS
+    fi
+    # 3) 兜底: 禁 Thunar 启动确认 (对 Thunar 内双击生效)
+    if command -v xfconf-query >/dev/null 2>&1; then
+        HOME=/home/user xfconf-query -c thunar -p /misc-executable-launch-confirm -s false 2>/dev/null || true
+    fi
+    # 4) xfdesktop restart (刷新 GDesktopAppInfo 缓存; gio set 后旧 xfdesktop 进程仍缓存 untrusted,
+    #    --reload 不刷 GDesktopAppInfo, 必须 kill+restart 新进程读 metadata::trusted + checksum)
+    killall xfdesktop 2>/dev/null || true
+    sleep 1
+    DISPLAY=${DISPLAY:-:0} HOME=/home/user nohup xfdesktop >/dev/null 2>&1 &
+    log_success "Desktop icons trusted"
+}
+
 function start_display_and_desktop() {
     log "Starting X11 display server and XFCE4 desktop..."
 
@@ -749,7 +811,7 @@ function start_display_and_desktop() {
     # 注意: CompressLevel/QualityLevel 是 VNC 客户端参数，不是 Xvnc 服务端参数
     #       真正的压缩配置在 noVNC 客户端侧 (rfb.js 的 compressionLevel/qualityLevel)
     log "Starting Xvnc :0 (background initialization)..."
-    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared >/tmp/xvnc.log 2>&1 &
+    HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache Xvnc :0 -geometry 1400x1050 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared >/tmp/xvnc.log 2>&1 &
 
 
 	# ========== 关键修复：清理 Chromium 进程和锁文件 ==========
@@ -774,10 +836,8 @@ function start_display_and_desktop() {
 	echo "export CHROMIUM_USER_DATA_DIR='${CHROMIUM_USER_DATA_DIR}'" >> /etc/environment
 	echo "export CHROMIUM_USER_DATA_DIR='${CHROMIUM_USER_DATA_DIR}'" >> /etc/profile.d/chromium-env.sh
 
-	# 4.1 agent-browser 使用独立 profile，避免与 MCP 的 Chromium 争抢锁
-	AGENT_BROWSER_PROFILE="${AGENT_BROWSER_PROFILE:-/home/user/.config/agent-browser/chromium}"
-	export AGENT_BROWSER_PROFILE
-	log_success "agent-browser configured with isolated profile: $AGENT_BROWSER_PROFILE"
+	# 4.1 agent-browser 默认配置来自 Dockerfile ENV
+	log_success "agent-browser configured for shared profile: $AGENT_BROWSER_PROFILE"
 
 	# 5. 清理 Chromium profile 锁文件（SingletonLock）
 	if [ -d "$CHROMIUM_USER_DATA_DIR" ]; then
@@ -795,17 +855,6 @@ function start_display_and_desktop() {
 		find "$CHROMIUM_USER_DATA_DIR" -name "lockfile" -type f -delete 2>/dev/null || true
 
 		log_success "Chromium lock files cleaned from: $CHROMIUM_USER_DATA_DIR"
-	fi
-
-	# 5.1 清理 agent-browser 独立 profile 锁文件（如果与 MCP profile 不同）
-	if [ "$AGENT_BROWSER_PROFILE" != "$CHROMIUM_USER_DATA_DIR" ]; then
-		mkdir -p "$AGENT_BROWSER_PROFILE"
-		rm -f "$AGENT_BROWSER_PROFILE/SingletonLock" || true
-		rm -f "$AGENT_BROWSER_PROFILE/SingletonSocket" || true
-		rm -f "$AGENT_BROWSER_PROFILE/SingletonCookie" || true
-		find "$AGENT_BROWSER_PROFILE" -name "*.lock" -type f -delete 2>/dev/null || true
-		find "$AGENT_BROWSER_PROFILE" -name "lockfile" -type f -delete 2>/dev/null || true
-		log_success "agent-browser lock files cleaned from: $AGENT_BROWSER_PROFILE"
 	fi
 
 	# 6. 清理 /tmp 中的 Chromium 临时文件
@@ -1017,7 +1066,7 @@ function apply_xfce_wallpaper() {
     # ========== 2. 等待 xfconf-query 可用 ==========
     local counter=0
     while ! DISPLAY=:0 HOME=/home/user xfconf-query -c xfce4-desktop -l >/dev/null 2>&1; do
-        sleep 1
+        sleep 0.3
         ((counter++))
         if ((counter > 30)); then
             log_warn " Timeout waiting for XFCE desktop xfconf, skipping wallpaper"
@@ -1106,7 +1155,7 @@ function apply_xfce_wallpaper() {
     local render_counter=0
     local render_detected=false
 
-    while ((render_counter < 60)); do  # 最长等待 30 秒
+    while ((render_counter < 16)); do  # 最长等待 8 秒
         # 检测根窗口是否已设置背景图 (xfdesktop 设置壁纸后会更新这个属性)
         if DISPLAY=:0 xprop -root _XROOTPMAP_ID 2>/dev/null | grep -q "pixmap id"; then
             render_detected=true
@@ -1247,7 +1296,7 @@ function restart_full_display_stack() {
     # 4. 重启 Xvnc
     log "Restarting Xvnc :0 ..."
     HOME=/home/user XAUTHORITY=/tmp/.Xauthority MESA_SHADER_CACHE_DIR=/tmp/mesa_shader_cache \
-        Xvnc :0 -geometry 1920x1080 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared \
+        Xvnc :0 -geometry 1400x1050 -depth 24 -SecurityTypes None -ac -rfbport 5900 -FrameRate 20 -AlwaysShared \
         >/tmp/xvnc.log 2>&1 &
 
     # 5. 等待 X11 display 就绪
@@ -1463,7 +1512,7 @@ function restart_mcp_proxy() {
         LANG=C.UTF-8 \
         LC_ALL=C.UTF-8 \
         LC_CTYPE=C.UTF-8 \
-        PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
+        PATH="/usr/local/bin:/usr/local/cargo/bin:$PATH" \
         setsid bash -c "
             exec mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file '$MCP_CONFIG_FILE' --log-dir /app/container-logs -v \
             > '$MCP_LOG_DIR/mcp-proxy.log' 2>&1
@@ -1699,7 +1748,7 @@ function start_mcp_proxy_services() {
         LANG=C.UTF-8 \
         LC_ALL=C.UTF-8 \
         LC_CTYPE=C.UTF-8 \
-        PATH="/usr/local/bin:/opt/cargo/bin:$PATH" \
+        PATH="/usr/local/bin:/usr/local/cargo/bin:$PATH" \
         setsid bash -c "
             exec mcp-proxy proxy --port 18099 --host 127.0.0.1 --config-file '$MCP_CONFIG_FILE' --log-dir /app/container-logs -v \
             > '$MCP_LOG_DIR/mcp-proxy.log' 2>&1
@@ -1795,54 +1844,42 @@ function start_ime_services() {
 }
 
 # ============================================================================
-# 🖥️ ttyd Web 终端服务（PTY → WebSocket，给前端 xterm.js 用）
-# 不依赖 X11，可与 noVNC 并存：noVNC 看桌面，ttyd 敲命令
-# 降权到 user (uid 1000) 防止 -W 模式下浏览器直接以 root 跑命令
+# 🐘 PostgreSQL + pgweb（开发环境本地数据库 + Web UI）
+# 用户在 agent-runner 容器开发时用本地 PG 测试；开发完打包发布到 UserApp。
+# PG 数据落 /home/user/.pgdata（持久化，容器重启保留）；pgweb Web UI 操作数据库。
+#
+# ⚠️ 启动模型: 此处只做"非阻塞"准备（备 PGDATA 归属 + 写连接信息）；首次 initdb
+# 与 postgres 进程均由 supervisor 托管的 pg-supervisor-entry.sh 异步拉起。
+# agent_runner 不依赖 PG（PG 仅供用户开发用），故 PG initdb 再慢也不阻塞 :8086
+# health —— 旧版在此同步 initdb, CephFS 上 >60s, 导致 agent_runner 被 liveness 杀。
 # ============================================================================
-function start_ttyd_services() {
-    log "Starting ttyd web terminal service..."
+function prepare_pg() {
+    export PGDATA="${PGDATA:-/home/user/.pgdata}"
+    export POSTGRES_USER="${POSTGRES_USER:-dev}"
+    export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-dev}"
+    export POSTGRES_DB="${POSTGRES_DB:-dev}"
+    export PGWEB_PORT="${PGWEB_PORT:-8081}"
 
-    # 检查开关（默认开，与 audio_server/ime_server 风格一致）
-    if [ "${ENABLE_TTYD:-true}" != "true" ]; then
-        log_warn "  ttyd is disabled (set ENABLE_TTYD=true to enable)"
-        return 0
-    fi
+    mkdir -p /app/logs
+    # 仅备好 PGDATA 目录归属（瞬时: 无 fsync、无递归 chown）。
+    # 只 chown .pgdata 本身，不碰 /home/user —— 旧版 `chown -R $(dirname $PGDATA)`
+    # 会递归 chown 整个用户主目录（= /home/user），既慢（CephFS 递归）又会把用户
+    # 项目文件属主错改成 postgres。
+    install -d -o postgres -g postgres "$PGDATA"
 
-    # 检查二进制（由 Dockerfile.base 注入）
-    if [ ! -x /usr/local/bin/ttyd ]; then
-        log_warn "  ttyd binary not found at /usr/local/bin/ttyd, skipping"
-        return 1
-    fi
-
-    # 检查启动脚本（由 Dockerfile 注入）
-    if [ ! -x /usr/local/bin/start-ttyd.sh ]; then
-        log_warn "  start-ttyd.sh not found, skipping"
-        return 1
-    fi
-
-    # 创建日志目录
-    local TTYD_LOG_DIR="${CONTAINER_LOGS_DIR:-/app/container-logs}/ttyd"
-    mkdir -p "$TTYD_LOG_DIR"
-    chmod 755 "$TTYD_LOG_DIR"
-    log_success "  ttyd log directory: $TTYD_LOG_DIR"
-
-    # 启动（与 ime/audio 同风格：nohup + 后台 + 写日志）
-    nohup /usr/local/bin/start-ttyd.sh > "$TTYD_LOG_DIR/ttyd.log" 2>&1 &
-
-    # 等待端口就绪（5 秒内）
-    local TTYD_PORT="${TTYD_PORT:-7681}"
-    if wait_for_port localhost "$TTYD_PORT" 5; then
-        log_success "  ttyd started"
-        log_success "  ttyd URL:        http://localhost:${TTYD_PORT}/"
-        log_success "  ttyd WebSocket:  ws://localhost:${TTYD_PORT}/ws"
-    else
-        log_warn "  ttyd port ${TTYD_PORT} not ready, check log: $TTYD_LOG_DIR/ttyd.log"
-        tail -20 "$TTYD_LOG_DIR/ttyd.log" 2>/dev/null || true
-        return 1
-    fi
-
-    return 0
+    # 连接信息（供用户参考；postgres/pgweb 进程由 supervisor 管）
+    cat > /home/user/pg-connection.txt <<EOF
+PostgreSQL 开发数据库:
+  容器内: host=localhost port=5432 user=$POSTGRES_USER password=$POSTGRES_PASSWORD database=$POSTGRES_DB sslmode=disable
+pgweb: http://localhost:$PGWEB_PORT  (Add Connection 填上述信息)
+EOF
+    log "PG prepared (PGDATA=$PGDATA); initdb/postgres 由 supervisor 异步拉起"
 }
+
+# ============================================================================
+# 🖥️ ttyd Web 终端 —— 由 supervisor 管（conf.d/ttyd.conf，autorestart 自动拉起）
+# 不再在此 nohup 启动（阶段1 迁 supervisor；进程崩溃 supervisor 自动重启）
+# ============================================================================
 
 # 设置VNC自动启动标志
 export VNC_AUTO_START=true
@@ -1850,6 +1887,13 @@ export VNC_AUTO_START=true
 # ========== 关键：在启动 X11 之前初始化用户主目录 ==========
 # 从骨架目录恢复配置（解决挂载空目录导致的花屏和图标消失）
 initialize_user_home
+
+# ========== supervisor 管 ttyd/PG/pgweb（不依赖 X11，初始化后启动）==========
+# 阶段1：ttyd/PG/pgweb 迁 supervisor（autorestart 崩溃自动拉起）
+# VNC/XFCE/MCP/audio/IME 仍由下方 start-up.sh 管（保留自定义）
+prepare_pg                                       # PG 非阻塞准备（initdb 已异步进 supervisor）
+supervisord -c /etc/supervisor/supervisord.conf  # daemon，autostart postgres/pgweb/ttyd
+log "supervisord started (manages: postgresql, pgweb, ttyd — autorestart on crash)"
 
 # ========== MCP Proxy 服务在 X11 就绪后启动 ==========
 # 注意：chrome-devtools-mcp 需要 X11 来启动 Chromium 浏览器
@@ -1893,6 +1937,8 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             log_success "VNC services started successfully!"
             log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
             log_success "Direct VNC port: 5900"
+            # 桌面图标信任化 (xfdesktop 起来后; 后台延迟调用, 不阻塞主流程)
+            ( sleep 3 && trust_desktop_icons ) &
         else
             log_error "VNC services failed to start, /tmp/novnc_port_ready will NOT be written"
         fi
@@ -1917,6 +1963,9 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
         start_ime_services
     ) &
     ime_pid=$!
+
+    # 4.5 ttyd + PostgreSQL + pgweb —— 由 supervisor 管（autorestart），不在此启动
+    # （见上方 supervisord 启动；阶段1 迁 supervisor）
 
     # 5. 应用 XFCE 壁纸（后台）
     (
@@ -2222,43 +2271,17 @@ source /etc/profile.d/ime-env.sh 2>/dev/null || true
 wait_for_file /tmp/dbus-session-env 5 || log_warn "D-Bus session file not ready"
 
 
-# ========== 等待 MCP Proxy 服务就绪 ==========
-# MCP Proxy 已在后台并行启动，这里只需等待端口就绪
-# 由于是并行启动，通常很快就会就绪
-log "Waiting for MCP Proxy service to be ready..."
-MCP_PROXY_PORT=18099
-MCP_PROXY_TIMEOUT=30  # 并行启动后，超时时间从 60s 降至 30s
-
-# 使用 wait_for_port 智能等待端口就绪
-if wait_for_port 127.0.0.1 $MCP_PROXY_PORT $MCP_PROXY_TIMEOUT; then
-    # 端口就绪后，使用 curl 发送 JSON-RPC 请求验证 MCP 服务是否真正可用
-    # 注意：mcp-proxy convert 是持续运行的进程会导致 5 秒超时，改用 curl 直接测试 HTTP 端点
-    MCP_TEST_RESULT=$(curl -s --max-time 3 -X POST "http://127.0.0.1:$MCP_PROXY_PORT" \
-        -H "Content-Type: application/json" \
-        -H "Accept: application/json, text/event-stream" \
-        -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 2>/dev/null)
-
-    if echo "$MCP_TEST_RESULT" | grep -q '"tools"'; then
-        log_success "MCP Proxy is fully ready on port $MCP_PROXY_PORT"
-    else
-        log_warn "MCP Proxy port is open but service not fully initialized, continuing anyway"
-        log_warn "Response: $MCP_TEST_RESULT"
-    fi
-else
-    log_warn "MCP Proxy not ready after ${MCP_PROXY_TIMEOUT}s, starting agent_runner anyway"
-    log_warn "Agent may need to retry MCP connections on first use"
-fi
+# ========== MCP Proxy：不在 readiness 关键路径，不阻塞 agent_runner 启动 ==========
+# MCP Proxy 仍在下方后台子 shell (X11 就绪后启动, ~line 1867) 里拉起，这里不再 wait_for_port。
+# 原因：agent_runner 的 /health 只查 HTTP+gRPC:50051，不依赖 MCP；而 wait_for_port 18099
+# 实际要等 "X11 就绪 + MCP 起来"，会把 exec agent_runner 拖后数秒 → restart create 阶段变慢。
+# MCP 未就绪时由 agent_runner 内部重试逻辑兜底（用户首次调 agent 通常已在重启数秒后，MCP 已就绪）。
 
 # 加载 D-Bus 会话环境
 if [ -f /tmp/dbus-session-env ]; then
     source /tmp/dbus-session-env
     log_success "Loaded D-Bus session: $DBUS_SESSION_BUS_ADDRESS"
 fi
-
-# ========== 启动 ttyd Web 终端服务 ==========
-# ttyd 不依赖 X11，可以独立启动
-log "Starting ttyd web terminal service..."
-start_ttyd_services
 
 # 构建环境变量导出命令
 ENV_EXPORTS="export HOME=/home/user; \
@@ -2271,7 +2294,7 @@ export INPUT_METHOD=fcitx; \
 export LANG=C.UTF-8; \
 export LC_ALL=C.UTF-8; \
 export BROWSER=/usr/bin/chromium-browser-launcher; \
-export PATH=/home/user/acp-agent:/usr/local/bin:/opt/cargo/bin:\$PATH"
+export PATH=/usr/local/bin:/usr/local/cargo/bin:\$PATH"
 
 # 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）
 # 否则执行默认的 agent_runner

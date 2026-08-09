@@ -7,9 +7,9 @@ use matchit::Params;
 use pingora_core::Result as PingoraResult;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::RequestHeader;
+use shared_types::NOVNC_PORT;
 use std::sync::Arc;
 use std::time::Duration;
-use shared_types::NOVNC_PORT;
 use tracing::{debug, error, info};
 
 use crate::service::types::{ProxyMetrics, TrackingCtx};
@@ -81,6 +81,7 @@ pub async fn handle_vnc_upstream(
     params: Params<'_, '_>,
     vnc_backends: &Arc<DashMap<String, String>>,
     metrics: &Arc<ProxyMetrics>,
+    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     // 从路径参数中提取 user_id
     let user_id = params.get("user_id").ok_or_else(|| {
@@ -95,9 +96,17 @@ pub async fn handle_vnc_upstream(
         user_id, project_id
     );
 
-    // 查找用户容器 IP
-    let container_ip = match vnc_backends.get(user_id) {
-        Some(ip_ref) => ip_ref.value().clone(),
+    // 查找容器 IP:优先 ContainerLookupService(动态查项目存储,容器存在即可达,
+    // 与 ttyd 一致、runtime 无关),回退 vnc_backends 显式注册
+    // (chat / pod_ensure / pod_restart / pod_vnc_status 注册,作为兜底数据源)。
+    let container_ip = if let Some(lookup) = container_lookup {
+        lookup.find_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+    } else {
+        vnc_backends.get(user_id).map(|r| r.value().clone())
+    };
+
+    let container_ip = match container_ip {
+        Some(ip) => ip,
         None => {
             info!("routing {} to VNC", user_id);
             return Err(

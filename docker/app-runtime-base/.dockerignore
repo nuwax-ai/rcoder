@@ -1,0 +1,6 @@
+# 排除 vendored rcoder 源码中的重目录（减小 Docker build context）
+code/rcoder/**/target
+code/rcoder/.git
+code/rcoder/**/node_modules
+code/rcoder/**/.next
+code/rcoder/**/*.zip

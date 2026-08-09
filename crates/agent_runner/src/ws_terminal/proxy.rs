@@ -74,7 +74,11 @@ pub async fn handle_terminal(
     match &cwd {
         Some(p) => info!(
             "[WS_TERMINAL] connecting ttyd: service_type={}, project_id={}, tenant_id={}, space_id={}, cwd={}",
-            service_type, project_id, tenant_id, space_id, p.display()
+            service_type,
+            project_id,
+            tenant_id,
+            space_id,
+            p.display()
         ),
         None => {
             let is_web = matches!(
@@ -165,8 +169,7 @@ async fn connect_ttyd_with_retry(
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     service_type: &str,
     project_id: &str,
-) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, String>
-{
+) -> Result<WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, String> {
     let max_attempts = TTYD_CONNECT_RETRIES + 1; // initial + retries
     let mut last_err = String::from("no connection attempts made");
 
@@ -218,7 +221,7 @@ async fn connect_ttyd_with_retry(
 async fn is_tcp_port_open(port: u16) -> bool {
     tokio::time::timeout(
         Duration::from_millis(300),
-        tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)),
+        TcpStream::connect(format!("127.0.0.1:{}", port)),
     )
     .await
     .is_ok_and(|r| r.is_ok())
@@ -258,7 +261,9 @@ where
                 Err(_) => break,
             }
         }
-        let _ = b_sink.close().await;
+        if let Err(e) = b_sink.close().await {
+            warn!("websocket sink close/send failed (peer gone): {e}");
+        }
     };
 
     // b(ttyd) → a(browser)，并周期注入 keepalive
@@ -308,7 +313,9 @@ where
                 }
             }
         }
-        let _ = a_sink.close().await;
+        if let Err(e) = a_sink.close().await {
+            warn!("websocket sink close/send failed (peer gone): {e}");
+        }
     };
 
     tokio::join!(ab, ba);
@@ -329,8 +336,12 @@ where
         reason: reason.into(),
     };
     // Send explicit Close frame with reason, then close the sink
-    let _ = sink.send(Message::Close(Some(frame))).await;
-    let _ = sink.close().await;
+    if let Err(e) = sink.send(Message::Close(Some(frame))).await {
+        warn!("websocket sink close/send failed (peer gone): {e}");
+    }
+    if let Err(e) = sink.close().await {
+        warn!("websocket sink close/send failed (peer gone): {e}");
+    }
     info!(
         "[WS_TERMINAL] connection closed with reason: {} (code={})",
         reason, code
@@ -384,8 +395,7 @@ mod tests {
                 let (s, _) = listener.accept().await.unwrap();
                 tokio_tungstenite::accept_async(s).await.unwrap()
             });
-            let (client, _) =
-                tokio_tungstenite::connect_async(format!("ws://{addr}")).await.unwrap();
+            let (client, _) = connect_async(format!("ws://{addr}")).await.unwrap();
             (client, server.await.unwrap())
         }
 

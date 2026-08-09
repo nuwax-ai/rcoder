@@ -105,7 +105,7 @@ pub async fn handle_ime_upstream(
         })?;
 
     metrics.record_request();
-    metrics.record_request_port(IME_PORT).await;
+    metrics.record_request_port(IME_PORT);
     metrics.inc_active();
 
     // 保存目标 IP 到上下文（用于响应过滤）

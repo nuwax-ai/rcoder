@@ -7,6 +7,9 @@ license.workspace = true
 description = "Shared telemetry module for rcoder services (Prometheus + OTLP)"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 # OpenTelemetry
 opentelemetry = { workspace = true }

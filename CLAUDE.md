@@ -10,7 +10,7 @@ RCoder 是一个基于 ACP (Agent Client Protocol) 的 AI 驱动开发平台，�
 
 ### 工作空间结构
 - **Workspace**: 使用 Cargo workspace 管理多个 crate
-- **主要 crate**: `rcoder` (主应用), `agent_runner` (代理运行时), `shared_types` (共享类型), `docker_manager` (容器管理), `pingora-proxy` (反向代理)
+- **主要 crate**: `rcoder` (主应用), `agent_runner` (代理运行时), `docker_manager` (容器管理), `rcoder-proxy` (反向代理), `shared_types` (共享类型), `shared_types_grpc` (gRPC proto 定义), `agent_abstraction` (ACP 代理连接), `app_manager` (UserApp 管理), `container-runtime-api` (容器运行时抽象), `file-server` (独立文件服务), `rcoder-telemetry` (可观测性)
 
 ### 容器化架构设计
 项目采用动态容器化架构，每个项目对应一个独立的 Docker 容器：
@@ -39,7 +39,7 @@ RCoder (转换为 SSE)
 - `CancelSession`: 取消正在执行的会话
 - `GetStatus`: 查询 Agent 状态
 
-**Proto 定义位置**: `crates/shared_types/proto/agent.proto`
+**Proto 定义位置**: `crates/shared_types_grpc/proto/agent.proto`
 
 ### 核心组件
 - **DockerManager**: 全局容器管理器，负责容器生命周期
@@ -71,15 +71,18 @@ make dev-up         # 启动开发容器
 
 ### 开发环境命令
 ```bash
-# 启动开发模式容器
-make dev-build      # 首次：构建 Docker 镜像
+# 首次部署（端口 8090）
+make dev-build      # 构建 Docker 镜像 dev-master-rcoder:latest
 make dev-up         # 启动容器
-make dev-restart    # 代码修改后重启容器
 
-# 查看容器日志
+# 日常开发：改 Rust 源码后秒级热编译（推荐！详见下文「本地 Docker Compose 测试」）
+make dev-hot
+
+# 全量重建（改 Dockerfile / Cargo.toml 依赖 / 非 Rust 改动时才用，10+ 分钟）
+make dev-restart
+
+# 日志 / 停止
 make dev-logs
-
-# 停止开发容器
 make dev-down
 ```
 
@@ -113,7 +116,7 @@ make update-image-tag
 ## 重要技术细节
 
 ### gRPC 通信架构
-- 使用 **Tonic 0.14.2** 实现 gRPC 服务端和客户端
+- 使用 **Tonic 0.14** 实现 gRPC 服务端和客户端
 - Proto 文件使用 **Protobuf oneof** 实现类型安全的事件系统，完全消除 JSON 序列化
 - **GrpcChannelPool** 基于 DashMap 提供高效的连接复用
 - **Server Streaming** 用于实时推送进度事件（替代轮询）
@@ -121,22 +124,22 @@ make update-image-tag
 - gRPC 默认端口：`50051`（定义在 `shared_types::GRPC_DEFAULT_PORT`）
 
 **关键文件**：
-- `crates/shared_types/proto/agent.proto` - Proto 定义
+- `crates/shared_types_grpc/proto/agent.proto` - Proto 定义
 - `crates/rcoder/src/grpc/channel_pool.rs` - 连接池
 - `crates/rcoder/src/grpc/chat_client.rs` - gRPC 客户端
-- `crates/agent_runner/src/grpc/agent_service_impl.rs` - gRPC 服务实现
+- `crates/agent_runner/src/grpc/mod.rs` - gRPC 服务实现（`AgentServiceImpl` 定义，方法实现拆分至 `chat.rs`/`subscribe_progress.rs`/`cancel.rs`/`status.rs`/`permission.rs` 等子文件）
 
 ### ACP 协议集成
-- 使用 `agent-client-protocol = "0.6"` 和 `agent_client_protocol = "0.4"` 实现多版本兼容
-- AgentSideConnection 和 ClientSideConnection **未实现 Send trait**
-- **必须**在 LocalSet 和 spawn_local 中使用这些连接
-- 参考示例目录: `/Volumes/soddy/git_workspace/rcoder/tmp/agent-client-protocol/rust/examples`
+- 使用 `agent-client-protocol = "2"`（官方 SDK），schema 走 `agent_client_protocol::schema::v1`，v1 是稳定 wire 协议
+- SDK 全程 `Send`：连接任务用标准 `tokio::spawn` 驱动，**无需 LocalSet / spawn_local**
+- 连接模型：`Client.builder().name(...).on_receive_dispatch(...).on_receive_request(...).connect_with(transport, |cx| async {...})`，核心实现见 `crates/agent_abstraction/src/launcher/claude_code_sacp/connection.rs`
+- 与所有 ACP v1 agent（Claude Code / nuwaxcode / codex 等）wire 兼容：握手发送 `protocolVersion: 1`
 
 ### 并发模型和状态管理
 - 使用 **DashMap** 替代 `Arc<RwLock<HashMap>>` 以获得更好的性能
 - 使用写时复制 (CoW) 模式进行状态更新
-- 主应用使用 `#[tokio::main(flavor = "current_thread")]`
-- ACP 操作必须在 `LocalSet` 中执行以支持 `spawn_local`
+- 主应用使用 `#[tokio::main]`（多线程）
+- ACP SDK 完全 Send-safe，连接任务用标准 `tokio::spawn` 驱动，无需 LocalSet
 
 ### Docker 容器动态创建
 - **多级隔离架构**: 支持三种隔离级别
@@ -148,28 +151,29 @@ make update-image-tag
 - **内部网络通信**: 容器间通过 Docker 内部网络直接通信，无需端口映射
 - **路径自动解析**: 自动检测容器内路径到宿主机路径的映射
 
-### K8s Pod/PVC 生命周期管理
+### K8s Pod/PVC 生命周期管理（agent-runner，STS-based）
 
-K8s 模式下，Pod 和 PVC 的停止流程需要严格顺序，否则会导致 Terminating 卡死：
+K8s 模式下 agent-runner（ComputerAgentRunner / WebAgentRunner）的停止流程基于 **StatefulSet**（裸 Pod→STS 改造后，commit d98c923），**PVC 全程保留不删**（数据复用，下次 ensure 重建挂回）：
 
 ```
-stop_container_by_identifier()
-  ├─ Step 1: pods().delete()       // 发送删除请求（graceful, 60s grace period）
-  ├─ Step 2: wait_for_pod_terminated()  // 轮询等待 Pod 消失（404），超时 90s 后 force-delete
-  ├─ Step 3: wait_for_pvc_removable()   // 等待 pvc-protection finalizer 移除（30s）
-  └─ Step 4: delete_workspace_pvc()     // 安全删除 PVC
+stop_container_by_identifier_inner()  // k8s_agent_pod.rs
+  ├─ Step 0: delete_agent_service()         // 删 ClusterIP Service（先摘流量 / DNS）
+  ├─ Step 1: delete_agent_statefulset()      // Foreground cascade 删 STS → pod 随之终止（非 scale 0）
+  ├─ Step 2: wait_for_pod_terminated()       // 等 pod {sts}-0 完全终止（404），避免与重建 pod 抢 RWO PVC
+  └─ Step 3: delete_agent_headless_service() // 删 headless Service（彻底回收）
+  —— PVC 保留（日志 "PVC preserved for reuse"），不删——
 ```
 
-**历史问题**: 早期版本在 `pods().delete()` 后立即调用 `delete_workspace_pvc()`，此时 Pod 还在运行、JuiceFS FUSE 卷仍被挂载，导致 PVC 的 `pvc-protection` finalizer 无法移除 → Pod 和 PVC 双双卡死在 Terminating。
+**PVC 保留策略（数据安全硬约束）**：agent 侧 PVC **永不删除**——`stop_container_by_identifier_inner`（k8s_agent_pod.rs）只删 ClusterIP/headless Service + STS + 等 pod 终止，全程不碰 PVC（数据复用，下次 ensure 重建挂回）。`K8sPvcOps` trait（k8s_pvc.rs）提供 `ensure_workspace_pvc` / `resolve_subvolume_path` / `resize_workspace_pvc` / `destroy_workspace_pvc` 等方法；其中 **`destroy_workspace_pvc` 是唯一的 PVC 删除入口，仅 UserApp 经独立 REST 接口 `POST /apps/{id}/storage/destroy` 显式调用**（见 `docs/application-management-service-v2-design.md` §5.4），agent 停止流程不调用。早期 JuiceFS + 裸 Pod 时代的 `delete_workspace_pvc` / `wait_for_pvc_removable` 已在 STS + CephFS + per-agent PVC 改造后移除，由 `destroy_workspace_pvc` 取代。
 
 **关键文件**：
-- `crates/docker_manager/src/runtime/kubernetes_runtime.rs` - 核心：`stop_container_by_identifier()`
+- `crates/docker_manager/src/runtime/k8s_agent_pod.rs` - 核心：`stop_container_by_identifier_inner`（STS 销毁流程）+ `restart_agent_container_inplace`（原地重启）
 - `crates/docker_manager/src/runtime/k8s_pod.rs` - Pod 生命周期：`K8sPodOps` trait（wait_for_pod_ready, wait_for_pod_terminated）
-- `crates/docker_manager/src/runtime/k8s_pvc.rs` - PVC 生命周期：`K8sPvcOps` trait（ensure_workspace_pvc, wait_for_pvc_removable, delete_workspace_pvc）
+- `crates/docker_manager/src/runtime/k8s_pvc.rs` - PVC 生命周期：`K8sPvcOps` trait（ensure_workspace_pvc, resolve_subvolume_path, resize_workspace_pvc, destroy_workspace_pvc）。`destroy_workspace_pvc` 仅 UserApp REST 调用，**agent 侧永不删 PVC**
 - `crates/agent_runner/src/shutdown.rs` - 进程优雅关闭：`terminate_children()`（SIGTERM → 3s → SIGKILL）
 
 **Pod 停止时的三道防线**：
-1. **preStop lifecycle hook**: `sync && sleep 2`，在 SIGTERM 前 flush FUSE 写入 buffer
+1. **preStop lifecycle hook**: `sync && sleep 2`，在 SIGTERM 前 flush 写入 buffer
 2. **agent_runner shutdown handler**: 构建进程树，递归收集所有后代 + 孤儿进程（ppid=1），叶子优先 SIGTERM → 等待 3s → SIGKILL
 3. **wait_for_pod_terminated**: 等待 Pod 从 API Server 消失（404），超时后 `gracePeriodSeconds=0` 强制删除
 
@@ -206,46 +210,16 @@ COMPOSE_PROJECT_NAME=rcoder                 # Docker Compose 项目名
 ```
 
 ### 开发环境要求
-- Rust 1.75+ (2024 Edition)
+- Rust 1.85+ (2024 Edition, edition 2024 最低要求 1.85)
 - Docker 和 Docker Compose
 - Claude Code CLI (可选)
-
-## API 接口
-
-### 核心端点
-- `POST /chat`: 发送聊天消息到 AI 代理 (支持 `pod_id`, `tenant_id`, `space_id`, `isolation_type` 多租户参数)
-- `POST /computer/chat`: Computer Agent 聊天接口 (支持多租户参数)
-- `GET /agent/progress/{session_id}`: SSE 进度流，接收实时通知
-- `POST /agent/session/cancel`: 取消正在执行的任务
-- `POST /agent/stop`: 停止 Agent
-- `GET /agent/status/{project_id}`: 查询 Agent 状态
-- `POST /pod/ensure`: 确保容器存在，支持多租户参数
-- `POST /pod/restart`: 重启容器，支持多租户参数
-- `GET /health`: 健康检查
-
-### Pingora 反向代理
-- `GET /proxy/{port}/{path}`: 端口路由到指定后端服务
-- `GET /proxy/status`: 查看代理服务状态
-- `GET /proxy/stats`: 查看代理统计信息
-
-### 响应格式
-所有 API 响应都使用统一的 HttpResult 格式：
-```rust
-struct HttpResult<T> {
-    success: bool,
-    data: Option<T>,
-    code: String,        // 业务错误码
-    message: String,     // 错误描述
-    tid: Option<String>, // 追踪ID
-}
-```
 
 ## 特殊注意事项
 
 ### 禁止事项
 1. **禁止使用模拟响应逻辑** - 所有 AI 调用必须真实执行
 2. **禁止编写 unsafe 代码** - 项目要求内存安全
-3. **AgentSideConnection 必须在 LocalSet 中使用** - 由于未实现 Send trait
+3. **ACP schema 类型变更需谨慎** - `shared_types` 直接嵌套 `schema::v1` 类型（StopReason/SessionUpdate/SessionId），升级 SDK 后务必全量编译 + 测试
 4. ** Always Response in 中文** - 所有响应必须使用中文
 
 ### Docker 容器管理
@@ -302,6 +276,55 @@ docker network inspect rcoder_agent-network
 # 测试容器间连通性
 docker exec <container1> ping <container2_ip>
 ```
+
+### 本地 Docker Compose 测试（端口 8090）
+
+用 `make dev-up` 启动 Docker Compose 模式（OrbStack 提供 docker），默认服务端口 `8090`，主容器 `rcoder-rcoder-1`，network `rcoder_default`。
+
+**首次部署**：
+```bash
+make dev-build      # 构建 Docker 镜像 dev-master-rcoder:latest
+make dev-up         # 启动容器
+```
+
+**日常开发（推荐：容器内热编译）**：
+
+`docker-compose.yml` 已挂载仓库源码到 `/app/src` + cargo/target 缓存 volume。改 Rust 源码后用 `make dev-hot` 秒级生效，**不用 `make dev-restart` 全量重建（10+ 分钟）**：
+```bash
+make dev-hot        # 容器内 cargo build --release --bin rcoder + mv 替换 binary + docker restart
+                    # 首次较慢（补 cmake/protoc + 全量编译），之后增量秒级（<2min）
+```
+脚本：`docker/dev-hot-build.sh`。改 Dockerfile / `Cargo.toml` 依赖 / 非 Rust 文件时仍需 `make dev-restart`。
+
+**日志查看**（rcoder 同时写文件 + stdout）：
+```bash
+make dev-logs       # docker logs（stdout）
+# 或查文件（按天滚动、JSON 格式，与 K8s 同款）
+docker exec rcoder-rcoder-1 grep -a "ERROR\|\[APP" /app/logs/rcoder.$(date +%Y-%m-%d) | tail -20
+```
+
+**端口 / 容器 / 网络**：
+- 主服务：`rcoder-rcoder-1`，端口 `8090`
+- Pingora 代理：宿主机 `8089` → 容器 `8088`（app HTTP 端口经 `/proxy/{port}` 暴露）
+- 网络：`rcoder_default`（动态 app 容器加入，pingora 通过 container_ip 访问）
+- app 工作空间：容器 `/app/app-workspace/{app_id}`，宿主机 `docker/app-workspace/`
+
+**app_manager（UserApp）Docker 模式要点**：
+- HTTP 端口：Pingora `/proxy/{port}` → container_ip:port；`access.http = http://127.0.0.1:8088/proxy/{port}`（宿主机访问把端口换成 8089）
+- TCP 端口：Docker 自动分配 host_port（`access.tcp.node_port`）
+- app 容器名：`rcoder-app-{app_id}`，label `managed-by=rcoder-app-manager`
+- ⚠️ rcoder 重启后 pingora 内存路由丢失（HTTP 端口需重建 app 才恢复，已知限制）
+
+**Docker Compose vs K8s（devspace）对照**：
+
+| 维度 | Docker Compose | K8s（devspace，详见下文） |
+|---|---|---|
+| 启动 | `make dev-up` | `devspace dev` |
+| 服务端口 | 8090 | 8290 |
+| HTTP 暴露 | Pingora `/proxy/{port}` | Envoy Gateway HTTPRoute `/apps/{id}` |
+| 热重载 | `make dev-hot`（秒级热编译） | devspace sync（rcoder 不自动重启，需 `kubectl delete pod`） |
+| app 计算单元 | 单容器 | Deployment + Pod |
+| 日志 | stdout + 文件 | 文件（`kubectl logs` 几乎空） |
 
 ### 本地 K8s 测试（devspace + OrbStack）
 
@@ -384,17 +407,31 @@ kubectl get pod -n rcoder-dev dev-rcoder-agent-runner-test-u \
 
 ### ACP 协议集成模式
 ```rust
-// 正确的 LocalSet 使用模式
-let local_set = LocalSet::new();
-local_set.run_until(async move {
-    let (client_conn, handle_io) = ClientSideConnection::new(
-        client, outgoing, incoming, |fut| {
-            tokio::task::spawn_local(fut);
-        }
-    );
-    tokio::task::spawn_local(handle_io);
-    // ... 处理逻辑
-}).await;
+// ACP 连接：Builder + connect_with，标准 tokio::spawn 驱动（无需 LocalSet）
+tokio::spawn(async move {
+    Client.builder()
+        .name("rcoder-agent-runner-sacp")
+        .on_receive_dispatch(
+            async move |dispatch: Dispatch, _cx: ConnectionTo<Agent>| {
+                // 匹配 Dispatch::Notification(message) 等，处理 SessionNotification
+                Ok(Handled::Yes)
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .on_receive_request(
+            move |req: RequestPermissionRequest, responder: Responder<_>, _cx| async move {
+                responder.respond(RequestPermissionResponse::new(...))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(transport, move |cx: ConnectionTo<Agent>| async move {
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+            cx.send_request(NewSessionRequest::new(cwd)).block_task().await?; // 建会话
+            cx.send_request(PromptRequest::new(...)).block_task().await?; // 发 prompt
+            Ok(())
+        })
+        .await
+});
 ```
 
 ### DashMap 高效使用模式

@@ -4,53 +4,12 @@
 //! 所有标识符（user_id, project_id, tenant_id, space_id）在使用前必须通过验证，
 //! 防止路径穿越和注入攻击。
 
-use std::sync::LazyLock;
+use std::path::PathBuf;
 
-use regex::Regex;
-
-/// 容器内 RCoder 项目工作空间的根目录
-///
-/// 容器内的目录结构（isolation_type=project）：
-/// ```text
-/// /app/project_workspace/
-/// └── {project_id}/
-///     └── (项目文件)
-/// ```
-///
-/// 容器内的目录结构（isolation_type=tenant/space）：
-/// ```text
-/// /app/project_workspace/
-/// └── {tenant_id}/
-///     └── {space_id}/
-///         └── {project_id}/
-///             └── (项目文件)
-/// ```
-pub const WORKSPACE_ROOT: &str = "/app/project_workspace";
-
-/// 容器内 Computer Use 项目工作空间的根目录
-///
-/// 容器内的目录结构（isolation_type=project）：
-/// ```text
-/// /app/computer-project-workspace/
-/// └── {user_id}/
-///     └── {project_id}/
-///         └── (项目文件)
-/// ```
-///
-/// 容器内的目录结构（isolation_type=tenant/space）：
-/// ```text
-/// /app/computer-project-workspace/
-/// └── {tenant_id}/
-///     └── {space_id}/
-///         └── {project_id}/
-///             └── (项目文件)
-/// ```
-pub const COMPUTER_WORKSPACE_ROOT: &str = "/app/computer-project-workspace";
-
-/// 标识符验证正则：仅允许字母、数字、下划线、连字符
-/// 长度 1-64 字符
-static IDENTIFIER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").expect("identifier regex is valid"));
+// 路径常量已下沉到 shared_types::paths (单一事实源, 所有 crate 共用)。
+// 这里 re-export 保持本模块 API (paths::WORKSPACE_ROOT / paths::COMPUTER_WORKSPACE_ROOT) 不破坏。
+// 文档与目录结构见 crates/shared_types/src/paths.rs。
+pub use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
 
 /// 路径标识符验证错误
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +18,15 @@ pub enum PathValidationError {
     Empty { field: String },
     #[error("{field} 包含非法字符: '{value}'，仅允许字母、数字、下划线和连字符，长度 1-64")]
     Invalid { field: String, value: String },
+}
+
+/// 判断标识符是否"已知"（非空且非 "unknown" 哨兵）。
+///
+/// 容器查询/销毁路径用 "unknown" 作为"标识未知"的哨兵；用此 helper 统一判断，避免散落的
+/// 字面量。合法标识符不会是 "unknown"（validate_identifier 不允许也不生成该值），故对真实
+/// project_id / container_name 安全。
+pub fn is_known_identifier(s: &str) -> bool {
+    !s.is_empty() && s != "unknown"
 }
 
 /// 验证路径标识符（user_id, project_id, tenant_id, space_id 等）
@@ -78,7 +46,11 @@ pub fn validate_identifier(value: &str, field_name: &str) -> Result<(), PathVali
             field: field_name.to_string(),
         });
     }
-    if !IDENTIFIER_RE.is_match(value) {
+    if value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
         return Err(PathValidationError::Invalid {
             field: field_name.to_string(),
             value: value.to_string(),
@@ -99,7 +71,10 @@ pub fn validate_identifier(value: &str, field_name: &str) -> Result<(), PathVali
 /// 当 `user_id` 包含非法字符时返回 `PathValidationError`
 pub fn user_dir(user_id: &str) -> Result<String, PathValidationError> {
     validate_identifier(user_id, "user_id")?;
-    Ok(format!("{}/{}", COMPUTER_WORKSPACE_ROOT, user_id))
+    Ok(PathBuf::from(COMPUTER_WORKSPACE_ROOT)
+        .join(user_id)
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// 构建项目目录路径（Computer Use 模式，project 隔离）
@@ -115,10 +90,11 @@ pub fn user_dir(user_id: &str) -> Result<String, PathValidationError> {
 pub fn project_dir(user_id: &str, project_id: &str) -> Result<String, PathValidationError> {
     validate_identifier(user_id, "user_id")?;
     validate_identifier(project_id, "project_id")?;
-    Ok(format!(
-        "{}/{}/{}",
-        COMPUTER_WORKSPACE_ROOT, user_id, project_id
-    ))
+    Ok(PathBuf::from(COMPUTER_WORKSPACE_ROOT)
+        .join(user_id)
+        .join(project_id)
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// 根据隔离类型构建 RCoder 工作空间路径
@@ -162,11 +138,19 @@ pub fn build_workspace_path(
             let sid = space_id.unwrap_or("default");
             validate_identifier(tid, "tenant_id")?;
             validate_identifier(sid, "space_id")?;
-            Ok(format!("{}/{}/{}/{}", WORKSPACE_ROOT, tid, sid, project_id))
+            Ok(PathBuf::from(WORKSPACE_ROOT)
+                .join(tid)
+                .join(sid)
+                .join(project_id)
+                .to_string_lossy()
+                .into_owned())
         }
         _ => {
             // project (默认): /app/project_workspace/{project_id}
-            Ok(format!("{}/{}", WORKSPACE_ROOT, project_id))
+            Ok(PathBuf::from(WORKSPACE_ROOT)
+                .join(project_id)
+                .to_string_lossy()
+                .into_owned())
         }
     }
 }
@@ -214,18 +198,21 @@ pub fn build_computer_workspace_path(
             let sid = space_id.unwrap_or("default");
             validate_identifier(tid, "tenant_id")?;
             validate_identifier(sid, "space_id")?;
-            Ok(format!(
-                "{}/{}/{}/{}",
-                COMPUTER_WORKSPACE_ROOT, tid, sid, project_id
-            ))
+            Ok(PathBuf::from(COMPUTER_WORKSPACE_ROOT)
+                .join(tid)
+                .join(sid)
+                .join(project_id)
+                .to_string_lossy()
+                .into_owned())
         }
         _ => {
             // project (默认): /app/computer-project-workspace/{user_id}/{project_id}
             validate_identifier(user_id, "user_id")?;
-            Ok(format!(
-                "{}/{}/{}",
-                COMPUTER_WORKSPACE_ROOT, user_id, project_id
-            ))
+            Ok(PathBuf::from(COMPUTER_WORKSPACE_ROOT)
+                .join(user_id)
+                .join(project_id)
+                .to_string_lossy()
+                .into_owned())
         }
     }
 }

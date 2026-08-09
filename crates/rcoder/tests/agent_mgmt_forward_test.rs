@@ -7,8 +7,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use container_runtime_api::{
-    ContainerCreateParams, ContainerRuntime, ContainerRuntimeError, ContainerRuntimeResult,
-    RuntimeContainerInfo,
+    AgentContainerRuntime, ContainerCreateParams, ContainerRuntime, ContainerRuntimeError,
+    ContainerRuntimeResult, RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
 };
 use futures_util::stream::StreamExt;
 use shared_types::ContainerBasicInfo;
@@ -45,7 +45,7 @@ use rcoder::handler::utils::{
 struct StubRuntime;
 
 #[async_trait]
-impl ContainerRuntime for StubRuntime {
+impl AgentContainerRuntime for StubRuntime {
     async fn create_container(
         &self,
         _params: ContainerCreateParams,
@@ -82,6 +82,12 @@ impl ContainerRuntime for StubRuntime {
         Ok(())
     }
 }
+
+// 空 impl 块继承默认实现 → StubRuntime impl B+C → 自动 impl ContainerRuntime (super-trait bounds)
+#[async_trait]
+impl WorkspaceRuntime for StubRuntime {}
+#[async_trait]
+impl UserAppDeploymentRuntime for StubRuntime {}
 
 #[allow(dead_code)]
 fn stub_runtime() -> Arc<dyn ContainerRuntime> {
@@ -490,9 +496,11 @@ async fn check_agent_forwards_request() {
     let ctx = make_ctx(addr);
     let project = make_project(addr);
 
-    let _ = check_agent(&ctx, &project, "codex-acp", None)
-        .await
-        .expect("check ok");
+    drop(
+        check_agent(&ctx, &project, "codex-acp", None)
+            .await
+            .expect("check ok"),
+    );
     let snap = mock.snapshot();
     assert_eq!(snap.check_calls, 1);
 }

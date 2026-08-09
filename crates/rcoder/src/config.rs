@@ -51,17 +51,26 @@ pub struct AppConfig {
     pub port: u16,
     /// 反向代理配置
     pub proxy_config: Option<ProxyConfig>,
-    /// Docker 配置
+    /// Docker 配置(docker 运行时读,K8s 不读)
     pub docker_config: Option<DockerConfig>,
+    /// K8s 运行时配置(K8s 运行时读,docker 不读;与 docker_config 完全分家)
+    ///
+    /// docker 部署下此键缺失 → None;AppConfig 无 deny_unknown_fields,
+    /// 故 docker 部署即使误带 kubernetes_config 键也不会报错(被忽略)。
+    #[serde(default)]
+    pub kubernetes_config: Option<shared_types::KubernetesConfig>,
     /// 容器清理配置
     #[serde(default)]
     pub cleanup_config: CleanupConfigSettings,
+    /// UserApp 闲置自动回收 + 流量唤醒配置
+    #[serde(default)]
+    pub userapp_recycle: UserAppRecycleConfig,
     /// API Key 鉴权配置
     #[serde(default)]
     pub api_key_auth: ApiKeyAuthConfig,
     /// 应用管理配置
     #[serde(default)]
-    pub app_manager: crate::app_manager::AppManagerConfig,
+    pub app_manager: app_manager::AppManagerConfig,
 }
 
 fn default_agent_id() -> String {
@@ -189,6 +198,10 @@ pub struct CleanupConfigSettings {
     /// 容器最小保护时间（秒），默认300秒（5分钟）
     #[serde(default = "default_container_protection_seconds")]
     pub container_protection_seconds: u64,
+    /// 长期闲置超时时间（秒），超过此值才真正销毁容器 + 删 project（默认 86400 = 24 小时）。
+    /// 短期闲置（idle_timeout ~ long_idle_timeout）只标记 Idle、保留容器复用。
+    #[serde(default = "default_long_idle_timeout_seconds")]
+    pub long_idle_timeout_seconds: u64,
     /// 日志清理配置
     #[serde(default)]
     pub log_cleanup: LogCleanupConfig,
@@ -214,6 +227,10 @@ fn default_container_protection_seconds() -> u64 {
     300 // 5分钟
 }
 
+fn default_long_idle_timeout_seconds() -> u64 {
+    3600 // 1小时 — 短期闲置保留复用，长期闲置才销毁
+}
+
 impl Default for CleanupConfigSettings {
     fn default() -> Self {
         Self {
@@ -222,7 +239,87 @@ impl Default for CleanupConfigSettings {
             cleanup_interval_seconds: default_cleanup_interval_seconds(),
             docker_stop_timeout_seconds: default_docker_stop_timeout_seconds(),
             container_protection_seconds: default_container_protection_seconds(),
+            long_idle_timeout_seconds: default_long_idle_timeout_seconds(),
             log_cleanup: LogCleanupConfig::default(),
+        }
+    }
+}
+
+/// UserApp 闲置自动回收 + 流量唤醒配置（配置文件格式，秒为单位）
+///
+/// 默认 `enabled=true`：免费用户 app 闲置超阈值自动 scale0 回收；付费 app 经
+/// `CreateAppRequest.recycle_enabled=false`（注解 `rcoder.io/recycle-enabled=false`）opt-out 永不回收。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserAppRecycleConfig {
+    /// 是否启用自动回收 + 流量唤醒（默认 true；部署侧可 env/helm 关闭）
+    #[serde(default = "default_userapp_recycle_enabled")]
+    pub enabled: bool,
+    /// 闲置超时阈值（秒），默认 432000（5 天）
+    #[serde(default = "default_userapp_idle_timeout_seconds")]
+    pub idle_timeout_seconds: u64,
+    /// 回收扫描间隔（秒），默认 3600（1 小时）
+    #[serde(default = "default_userapp_scan_interval_seconds")]
+    pub scan_interval_seconds: u64,
+    /// 流量唤醒 hold-and-wait 上限（秒），默认 60；超时返回 503+Retry-After
+    #[serde(default = "default_userapp_wake_timeout_seconds")]
+    pub wake_timeout_seconds: u64,
+    /// 新建 app 最小保护期（秒），默认 300；龄期小于此值不回收
+    #[serde(default = "default_userapp_protection_seconds")]
+    pub protection_seconds: u64,
+}
+
+fn default_userapp_recycle_enabled() -> bool {
+    true // 默认免费用户自动回收
+}
+
+fn default_userapp_idle_timeout_seconds() -> u64 {
+    432000 // 5 天
+}
+
+fn default_userapp_scan_interval_seconds() -> u64 {
+    3600 // 1 小时
+}
+
+fn default_userapp_wake_timeout_seconds() -> u64 {
+    60
+}
+
+fn default_userapp_protection_seconds() -> u64 {
+    300 // 5 分钟
+}
+
+/// 从环境变量读取 bool 覆盖 target;解析失败 warn 不阻塞(Fail Fast 仅记日志,沿用默认)。
+fn env_override_bool(key: &str, target: &mut bool) {
+    if let Ok(val) = std::env::var(key)
+        && let Ok(v) = val.parse::<bool>()
+    {
+        *target = v;
+        info!(" {key}: {v}");
+    } else if let Ok(val) = std::env::var(key) {
+        warn!(" parse {key} failed: {val}");
+    }
+}
+
+/// 从环境变量读取 u64 覆盖 target。
+fn env_override_u64(key: &str, target: &mut u64) {
+    if let Ok(val) = std::env::var(key)
+        && let Ok(v) = val.parse::<u64>()
+    {
+        *target = v;
+        info!(" {key}: {v}");
+    } else if let Ok(val) = std::env::var(key) {
+        warn!(" parse {key} failed: {val}");
+    }
+}
+
+impl Default for UserAppRecycleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_userapp_recycle_enabled(),
+            idle_timeout_seconds: default_userapp_idle_timeout_seconds(),
+            scan_interval_seconds: default_userapp_scan_interval_seconds(),
+            wake_timeout_seconds: default_userapp_wake_timeout_seconds(),
+            protection_seconds: default_userapp_protection_seconds(),
         }
     }
 }
@@ -267,12 +364,14 @@ impl Default for AppConfig {
             port: 8087,
             proxy_config: Some(ProxyConfig::default()),
             docker_config: Some(DockerConfig::default()),
+            kubernetes_config: None,
             cleanup_config: CleanupConfigSettings::default(),
+            userapp_recycle: UserAppRecycleConfig::default(),
             api_key_auth: ApiKeyAuthConfig {
                 enabled: false,
                 api_key: generate_random_api_key(),
             },
-            app_manager: crate::app_manager::AppManagerConfig::default(),
+            app_manager: app_manager::AppManagerConfig::default(),
         }
     }
 }
@@ -365,7 +464,8 @@ impl DockerConfig {
             selection_strategy: shared_types::ImageSelectionStrategy::ServiceOnly,
             cache_config: shared_types::ImageCacheConfig {
                 enabled: true,
-                ttl_seconds: 3600,
+                ttl_seconds: shared_types::IMAGE_CACHE_DEFAULT_TTL_SECS,
+                // rcoder 主进程面向多 project，缓存容量高于 crate 默认值
                 max_entries: 100,
             },
         }
@@ -622,6 +722,28 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         info!(" RCODER_API_KEY configured");
     }
 
+    // 应用 UserApp 自动回收配置的环境变量覆盖
+    env_override_bool(
+        "RCODER_USERAPP_RECYCLE_ENABLED",
+        &mut config.userapp_recycle.enabled,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_IDLE_TIMEOUT_SECONDS",
+        &mut config.userapp_recycle.idle_timeout_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_SCAN_INTERVAL_SECONDS",
+        &mut config.userapp_recycle.scan_interval_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_WAKE_TIMEOUT_SECONDS",
+        &mut config.userapp_recycle.wake_timeout_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_PROTECTION_SECONDS",
+        &mut config.userapp_recycle.protection_seconds,
+    );
+
     // 验证 API Key 配置
     if config.api_key_auth.enabled && config.api_key_auth.api_key.trim().is_empty() {
         return Err(anyhow::anyhow!(
@@ -748,7 +870,7 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
 
     // 创建配置文件目录（如果不存在）
     if let Some(parent) = std::path::Path::new(CONFIG_FILE).parent() {
-        std::fs::create_dir_all(parent)
+        fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
     }
 

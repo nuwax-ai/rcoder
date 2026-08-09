@@ -40,12 +40,24 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<u
         let sanitized = sanitize_entry_path(&entry_path)?;
         let dest_path = dest_dir.join(&sanitized);
 
-        // 路径安全检查：只对首次出现的目录做 canonicalize
+        // 路径安全检查：只对首次出现的目录做 canonicalize。
+        // canonicalize 要求目录已存在, 故先建目录再校验; 校验失败时
+        // 尽力回收刚建的空目录, 不在磁盘留下残留。
         if let Some(parent) = dest_path.parent()
             && !created_dirs.contains(parent)
         {
             std::fs::create_dir_all(parent)?;
-            ensure_within(&dest_path, dest_dir)?;
+            if let Err(e) = ensure_within(&dest_path, dest_dir) {
+                // 仅删空目录 (非空说明已有内容, 不能删); 失败无害, 记 debug 日志留痕
+                if let Err(error) = std::fs::remove_dir(parent) {
+                    debug!(
+                        path = %parent.display(),
+                        %error,
+                        "cleanup of directory created for path validation failed"
+                    );
+                }
+                return Err(e);
+            }
             created_dirs.insert(parent.to_path_buf());
         }
 
@@ -130,11 +142,22 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> AgentMgmtResult<usiz
         let sanitized = sanitize_entry_path(&entry_path)?;
         let dest_path = dest_dir.join(&sanitized);
 
+        // 同上: 先建目录再 canonicalize 校验; 校验失败时尽力回收空目录。
         if let Some(parent) = dest_path.parent()
             && !created_dirs.contains(parent)
         {
             std::fs::create_dir_all(parent)?;
-            ensure_within(&dest_path, dest_dir)?;
+            if let Err(e) = ensure_within(&dest_path, dest_dir) {
+                // 同 tar.gz 分支: 仅删空目录, 失败无害, 记 debug 日志留痕
+                if let Err(error) = std::fs::remove_dir(parent) {
+                    debug!(
+                        path = %parent.display(),
+                        %error,
+                        "cleanup of directory created for path validation failed"
+                    );
+                }
+                return Err(e);
+            }
             created_dirs.insert(parent.to_path_buf());
         }
 
@@ -284,8 +307,14 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> AgentMgmtResult<bool> {
         )));
     }
 
-    // Cleanup the now-empty wrapper directory
-    let _ = std::fs::remove_dir(&tmp_rename);
+    // Cleanup the now-empty wrapper directory; 失败无害 (目录非空或已删), 记 debug 日志留痕
+    if let Err(error) = std::fs::remove_dir(&tmp_rename) {
+        debug!(
+            path = %tmp_rename.display(),
+            %error,
+            "cleanup of empty wrapper directory failed"
+        );
+    }
 
     debug!(
         "[agent_mgmt] Stripped top-level wrapper directory: {}",
@@ -321,8 +350,22 @@ pub fn find_entrypoint_from_metadata(agent_dir: &Path) -> Option<(String, Vec<St
 /// - `"node dist/index.js"` → `("dist/index.js", [])`
 /// - `"node --max-old-space-size=4096 dist/index.js"` → `("dist/index.js", ["--max-old-space-size=4096"])`
 fn read_bin_start_from_json(path: &Path) -> Option<(String, Vec<String>)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    // 区分"文件不存在"（正常，试下一个候选）与"存在但读取/解析失败"（配置 bug，须可见）。
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!("failed to read package json {}: {e}", path.display());
+            return None;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("failed to parse package json {}: {e}", path.display());
+            return None;
+        }
+    };
 
     let bin_start = value.get("bin")?.get("start")?.as_str()?;
 
@@ -410,15 +453,24 @@ fn sanitize_entry_path(path: &Path) -> AgentMgmtResult<PathBuf> {
 }
 
 fn ensure_within(dest_path: &Path, base: &Path) -> AgentMgmtResult<()> {
-    // 在 macOS / Linux 上 canonicalize 会解析符号链接,且需要文件存在。
-    // 这里 dest_path 的父目录可能尚未创建(dest_dir 一定存在),
-    // 所以我们用 cleaned() 进行路径规范化,然后对 dest_path 的父目录做 canonicalize。
-    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    // Fail-closed: canonicalize 失败时拒绝而非回退到未验证路径。
+    // 防御符号链接攻击: canonicalize 解析符号链接后验证真实路径。
+    let base_canon = base.canonicalize().map_err(|e| {
+        AgentMgmtError::PathTraversal(format!(
+            "cannot canonicalize base dir {}: {}",
+            base.display(),
+            e
+        ))
+    })?;
 
     let parent = dest_path.parent().unwrap_or(dest_path);
-    let canon_parent = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
+    let canon_parent = parent.canonicalize().map_err(|e| {
+        AgentMgmtError::PathTraversal(format!(
+            "cannot canonicalize parent dir {}: {}",
+            parent.display(),
+            e
+        ))
+    })?;
 
     if !canon_parent.starts_with(&base_canon) {
         return Err(AgentMgmtError::PathTraversal(format!(
@@ -505,7 +557,7 @@ mod tests {
             File::create(&archive).unwrap(),
             flate2::Compression::fast(),
         );
-        std::io::Write::write_all(&mut gz, &raw_tar).unwrap();
+        Write::write_all(&mut gz, &raw_tar).unwrap();
         gz.finish().unwrap();
 
         let err = extract_tar_gz(&archive, &extract_to).unwrap_err();

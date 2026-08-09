@@ -38,10 +38,13 @@ pub async fn handle_computer_status(
 
     // 使用 garde 进行字段校验
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request
-        .project_id
-        .as_ref()
-        .expect("validated: project_id is required and non-empty");
+    // garde 已校验 required, 此处仍做防御性处理: 生产路径不 panic, 返回 400。
+    let Some(project_id) = request.project_id.as_ref() else {
+        return Err(shared_types::AppError::with_i18n_key(
+            ERR_VALIDATION,
+            &get_i18n_message("error.user_id_or_project_id_required", locale),
+        ));
+    };
 
     // 验证 user_id 或 project_id 至少有一个
     let user_id_empty = request.user_id.as_ref().is_none_or(|s| s.is_empty());

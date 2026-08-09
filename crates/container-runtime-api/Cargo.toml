@@ -7,8 +7,16 @@ license.workspace = true
 description.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 shared_types = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+utoipa = { workspace = true }
+winnow = { workspace = true }
+# stream_app_logs 返回 mpsc::Receiver（WS 日志流）；runtime 任务由各后端（持 full tokio）spawn
+tokio = { workspace = true, features = ["sync"] }

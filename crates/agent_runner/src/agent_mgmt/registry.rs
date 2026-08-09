@@ -10,6 +10,7 @@
 //! 每次 `insert`/`remove` 立即 `save_to_disk`,启动时 `load_from_disk` 恢复。
 //! 序列化格式保持 `Vec<AgentManifest>`，反序列化时按 (agent_id, version) 分组。
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -59,7 +60,7 @@ impl AgentRegistry {
                 if manifest.install_type == InstallType::Builtin {
                     return true;
                 }
-                let binary_path = std::path::PathBuf::from(&manifest.binary_path);
+                let binary_path = PathBuf::from(&manifest.binary_path);
                 if !binary_path.exists() {
                     warn!(
                         "[agent_mgmt] Healing orphaned registry entry: agent_id={}, version={:?}, binary_path={} (directory missing)",
@@ -117,6 +118,7 @@ impl AgentRegistry {
                             a.version.as_deref().unwrap_or("0.0.0"),
                             b.version.as_deref().unwrap_or("0.0.0"),
                         )
+                        .unwrap_or(Ordering::Equal)
                     })
                     .cloned()
             })
@@ -134,6 +136,7 @@ impl AgentRegistry {
                     a.version.as_deref().unwrap_or("0.0.0"),
                     b.version.as_deref().unwrap_or("0.0.0"),
                 )
+                .unwrap_or(Ordering::Equal)
             })
             .cloned()
     }
@@ -162,7 +165,8 @@ impl AgentRegistry {
         guard.get(agent_id).map(|v| !v.is_empty()).unwrap_or(false)
     }
 
-    /// 是否已安装指定版本
+    /// 是否已安装指定版本（测试用公共 API）
+    #[allow(dead_code)]
     pub fn contains_version(&self, agent_id: &str, version: &str) -> bool {
         let guard = self.inner.lock();
         let vkey = match version_util::normalize_version(version) {
@@ -267,6 +271,7 @@ impl AgentRegistry {
                         a.version.as_deref().unwrap_or("0.0.0"),
                         b.version.as_deref().unwrap_or("0.0.0"),
                     )
+                    .unwrap_or(Ordering::Equal)
                 })
             });
             v
@@ -281,7 +286,13 @@ impl AgentRegistry {
         std::fs::write(&tmp, json.as_bytes())?;
         if std::fs::rename(&tmp, &path).is_err() {
             std::fs::copy(&tmp, &path)?;
-            let _ = std::fs::remove_file(&tmp);
+            if let Err(e) = std::fs::remove_file(&tmp) {
+                warn!(
+                    "[agent_mgmt] failed to remove registry tmp file after copy fallback: path={}, error={}",
+                    tmp.display(),
+                    e
+                );
+            }
         }
         info!(
             "[agent_mgmt] Registry persisted: path={}, count={}",
@@ -357,7 +368,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("agent-mgmt-test-{}-{}", std::process::id(), n));
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(std::fs::remove_dir_all(&dir));
         PathManager::new_with_root(dir)
     }
 
@@ -612,31 +623,30 @@ mod tests {
     #[test]
     fn compare_versions_basic() {
         use std::cmp::Ordering;
-        let cv = shared_types::version_util::compare_versions;
-        assert_eq!(cv("1.0.0", "1.0.0"), Ordering::Equal);
-        assert_eq!(cv("1.0.0", "1.0.1"), Ordering::Less);
-        assert_eq!(cv("1.0.1", "1.0.0"), Ordering::Greater);
-        assert_eq!(cv("1.0.0", "2.0.0"), Ordering::Less);
-        assert_eq!(cv("1.2.3", "1.2.4"), Ordering::Less);
+        let cv = version_util::compare_versions;
+        assert_eq!(cv("1.0.0", "1.0.0").unwrap(), Ordering::Equal);
+        assert_eq!(cv("1.0.0", "1.0.1").unwrap(), Ordering::Less);
+        assert_eq!(cv("1.0.1", "1.0.0").unwrap(), Ordering::Greater);
+        assert_eq!(cv("1.0.0", "2.0.0").unwrap(), Ordering::Less);
+        assert_eq!(cv("1.2.3", "1.2.4").unwrap(), Ordering::Less);
     }
 
     #[test]
     fn compare_versions_with_v_prefix() {
         use std::cmp::Ordering;
-        let cv = shared_types::version_util::compare_versions;
-        assert_eq!(cv("v1.0.0", "1.0.0"), Ordering::Equal);
-        assert_eq!(cv("V2.0.0", "1.9.9"), Ordering::Greater);
+        let cv = version_util::compare_versions;
+        assert_eq!(cv("v1.0.0", "1.0.0").unwrap(), Ordering::Equal);
+        assert_eq!(cv("V2.0.0", "1.9.9").unwrap(), Ordering::Greater);
     }
 
     #[test]
-    #[should_panic(expected = "invalid semver version")]
-    fn compare_versions_panics_on_invalid() {
-        shared_types::version_util::compare_versions("invalid", "0.0.0");
+    fn compare_versions_returns_err_on_invalid() {
+        assert!(version_util::compare_versions("invalid", "0.0.0").is_err());
     }
 
     #[test]
     fn version_key_normalizes() {
-        let nk = shared_types::version_util::normalize_version;
+        let nk = version_util::normalize_version;
         // v 前缀归一化
         assert_eq!(nk("v1.0.0").unwrap(), "1.0.0");
         assert_eq!(nk("V2.0.0").unwrap(), "2.0.0");

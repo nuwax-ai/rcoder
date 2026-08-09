@@ -11,6 +11,9 @@ publish = false
 name = "rcoder_proxy"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 # Core dependencies
 tokio = { workspace = true }

@@ -23,6 +23,17 @@ use tracing::{debug, error, info, warn};
 #[cfg(feature = "kubernetes")]
 use super::kubernetes_runtime::KubernetesRuntime;
 
+// Pod 生命周期超时常量
+#[cfg(feature = "kubernetes")]
+#[allow(dead_code)] // wait_for_pod_ready 当前用 config.pod_ttl_seconds 兜底；保留作 ready 超时语义占位
+const POD_READY_TIMEOUT_SECS: u64 = 300;
+#[cfg(feature = "kubernetes")]
+const POD_TERMINATION_TIMEOUT_SECS: u64 = 30;
+#[cfg(feature = "kubernetes")]
+const FORCE_DELETE_CLEANUP_TIMEOUT_SECS: u64 = 15;
+#[cfg(feature = "kubernetes")]
+const POD_POLL_INTERVAL_SECS: u64 = 1;
+
 /// Pod 生命周期管理操作的 trait extension
 ///
 /// 为 `KubernetesRuntime` 添加 Pod 相关方法：
@@ -119,7 +130,10 @@ impl K8sPodOps for KubernetesRuntime {
 
         RuntimeContainerInfo {
             container_id: metadata.uid.clone().unwrap_or_default(),
-            container_name: metadata.name.clone().unwrap_or_default(),
+            container_name: Self::sts_name_from_pod_name(
+                &metadata.name.clone().unwrap_or_default(),
+            )
+            .to_string(),
             container_ip: pod
                 .status
                 .as_ref()
@@ -162,7 +176,8 @@ impl K8sPodOps for KubernetesRuntime {
         // Pod wait timeout: configurable from config, default 120s
         let timeout = std::time::Duration::from_secs(self.config.pod_ttl_seconds.unwrap_or(120));
         let start = std::time::Instant::now();
-        let pod_name = self.pod_name(identifier, service_type)?;
+        // agent-runner 走 StatefulSet，pod 稳定名为 {sts_name}-0（非裸 pod 的 {sts_name}）。
+        let pod_name = self.agent_pod_name(identifier, service_type)?;
 
         while start.elapsed() < timeout {
             match self.pods().get(&pod_name).await {
@@ -252,7 +267,7 @@ impl K8sPodOps for KubernetesRuntime {
                     )));
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(POD_POLL_INTERVAL_SECS)).await;
         }
 
         Err(ContainerRuntimeError::Timeout(
@@ -261,8 +276,10 @@ impl K8sPodOps for KubernetesRuntime {
     }
 
     async fn wait_for_pod_terminated(&self, pod_name: &str) -> ContainerRuntimeResult<()> {
-        let timeout = std::time::Duration::from_secs(75);
-        let poll_interval = std::time::Duration::from_secs(1);
+        let timeout = std::time::Duration::from_secs(POD_TERMINATION_TIMEOUT_SECS);
+        // 细化轮询: 容器秒退后 pod 对象仍要 ~2-3s 才从 API 消失(kubelet 清理)。
+        // 1s 轮询会多等最多 1s; 300ms 既及时察觉删除, 又不给 API server 压力(最多 ~100 次廉价 GET)。
+        let poll_interval = std::time::Duration::from_millis(300);
         let start = std::time::Instant::now();
 
         while start.elapsed() < timeout {
@@ -292,7 +309,7 @@ impl K8sPodOps for KubernetesRuntime {
 
         // 超时：force-delete（gracePeriodSeconds=0 立即杀死容器）
         warn!(
-            "[K8S] Pod {} did not terminate within 75s, issuing force-delete",
+            "[K8S] Pod {} did not terminate within 30s, issuing force-delete",
             pod_name
         );
         let force_dp = DeleteParams {
@@ -308,7 +325,8 @@ impl K8sPodOps for KubernetesRuntime {
                 // force-delete 成功后仍需等待 Pod 真正消失（404）
                 // 因为 force-delete 只是发起请求，kubelet 还需要时间清理
                 let cleanup_start = std::time::Instant::now();
-                let cleanup_timeout = std::time::Duration::from_secs(15);
+                let cleanup_timeout =
+                    std::time::Duration::from_secs(FORCE_DELETE_CLEANUP_TIMEOUT_SECS);
                 while cleanup_start.elapsed() < cleanup_timeout {
                     match self.pods().get(pod_name).await {
                         Ok(_) => {
@@ -335,13 +353,16 @@ impl K8sPodOps for KubernetesRuntime {
                     }
                     tokio::time::sleep(poll_interval).await;
                 }
-                // 即使等待后仍未消失，也不返回错误
-                // K8s 最终会回收 Pod，PVC 清理有独立容错
-                warn!(
-                    "[K8S] Pod {} still not 404 after force-delete + 15s wait, proceeding anyway",
+                // 超时后 Pod 仍未终止：返回错误而非静默继续
+                // 调用方需据此判断是否继续 PVC 操作（避免 RWO 数据竞争）
+                error!(
+                    "[K8S] Pod {} still not 404 after force-delete + 15s wait, returning error",
                     pod_name
                 );
-                Ok(())
+                Err(ContainerRuntimeError::Timeout(format!(
+                    "Pod {} still not terminated after force-delete + 15s cleanup wait",
+                    pod_name
+                )))
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 info!("[K8S] Pod {} already gone after timeout", pod_name);

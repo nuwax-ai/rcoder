@@ -53,37 +53,48 @@ impl TuiDiagnosticsListener {
 impl DiagnosticsListener for TuiDiagnosticsListener {
     fn on_process_started(&self, pid: u32, command: &str) {
         // 使用 try_send 提供背压保护，避免在同步回调中阻塞
-        let _ = self.tx.try_send(AppEvent::Diagnostics(format!(
+        if let Err(e) = self.tx.try_send(AppEvent::Diagnostics(format!(
             "Agent 进程已启动: pid={}, command={}",
             pid, command
-        )));
+        ))) {
+            tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
+        }
     }
 
     fn on_acp_initialized(&self, session_id: &str) {
-        let _ = self.tx.try_send(AppEvent::Diagnostics(format!(
+        if let Err(e) = self.tx.try_send(AppEvent::Diagnostics(format!(
             "ACP 初始化完成: session_id={}",
             session_id
-        )));
+        ))) {
+            tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
+        }
     }
 
     fn on_process_exited(&self, diagnostics: &ProcessDiagnostics) {
         if diagnostics.exit_code == Some(0) {
-            let _ = self
+            if let Err(e) = self
                 .tx
-                .try_send(AppEvent::Diagnostics("Agent 进程正常退出".to_string()));
+                .try_send(AppEvent::Diagnostics("Agent 进程正常退出".to_string()))
+            {
+                tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
+            }
         } else {
-            let _ = self.tx.try_send(AppEvent::Diagnostics(format!(
+            if let Err(e) = self.tx.try_send(AppEvent::Diagnostics(format!(
                 "Agent 进程异常退出: exit_code={:?}",
                 diagnostics.exit_code
-            )));
+            ))) {
+                tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
+            }
         }
     }
 
     fn on_process_error(&self, diagnostics: &ProcessDiagnostics) {
-        let _ = self.tx.try_send(AppEvent::Diagnostics(format!(
+        if let Err(e) = self.tx.try_send(AppEvent::Diagnostics(format!(
             "Agent 进程错误: {}",
             diagnostics.error_message.as_deref().unwrap_or("unknown")
-        )));
+        ))) {
+            tracing::warn!("ui event send failed (receiver gone / channel full): {e}");
+        }
     }
 }
 

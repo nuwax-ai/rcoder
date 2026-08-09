@@ -28,6 +28,7 @@ pub use config::CleanupStats;
 pub async fn start_cleanup_task(
     config: CleanupConfig,
     state: Arc<crate::router::AppState>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let docker_manager = match docker_manager::global::get_global_docker_manager().await {
         Ok(dm) => Some(dm),
@@ -71,12 +72,19 @@ pub async fn start_cleanup_task(
             }
         };
 
+        // SSE 关闭回调：reaper 销毁容器后按 grpc_addr 关闭前端进度流（幂等）
+        let shutdown_sse: crate::grpc::ShutdownSseFn = {
+            let state = state.clone();
+            Arc::new(move |addr: &str| state.shutdown_sse_streams_by_addr(addr))
+        };
+
         let reaper = crate::storage::ResourceReaper::new(
             reaper_rx,
             state.runtime().clone(),
             state.grpc_pool.clone(),
             state.pingora_service.clone(),
             docker_manager.clone(),
+            shutdown_sse,
         );
         tokio::spawn(reaper.run());
         tracing::info!(
@@ -85,81 +93,18 @@ pub async fn start_cleanup_task(
         );
     }
 
-    if docker_manager.is_none() {
-        let state_for_k8s = state.clone();
-        let runtime_for_k8s = state.runtime().clone();
-        return Ok(tokio::task::spawn(async move {
-            let mut interval = tokio::time::interval(config.cleanup_interval);
-            loop {
-                interval.tick().await;
-                let idle_threshold = match chrono::Duration::from_std(config.idle_timeout) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!("[CLEANUP_TASK] invalid idle_timeout config: {}", e);
-                        continue;
-                    }
-                };
-                let now = chrono::Utc::now();
-                let projects = state_for_k8s.projects.iter();
-
-                for (project_id, project_info) in projects {
-                    let idle = now.signed_duration_since(project_info.last_activity());
-                    if idle < idle_threshold {
-                        continue;
-                    }
-
-                    let service_type = project_info
-                        .service_type()
-                        .unwrap_or(shared_types::ServiceType::WebAgentRunner);
-                    let identifier = match service_type {
-                        shared_types::ServiceType::ComputerAgentRunner => project_info
-                            .user_id()
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| project_id.clone()),
-                        shared_types::ServiceType::WebAgentRunner => project_id.clone(),
-                    };
-
-                    if let Err(e) = runtime_for_k8s
-                        .stop_container_by_identifier(&identifier, &service_type)
-                        .await
-                    {
-                        tracing::warn!(
-                            "[CLEANUP_TASK] failed to stop runtime container: identifier={}, service_type={:?}, error={}",
-                            identifier,
-                            service_type,
-                            e
-                        );
-                        continue;
-                    }
-
-                    state_for_k8s.remove_project(&project_id);
-                    tracing::info!(
-                        "[CLEANUP_TASK] cleaned idle runtime container: project_id={}, identifier={}, service_type={:?}",
-                        project_id,
-                        identifier,
-                        service_type
-                    );
-                }
-            }
-        }));
-    }
-
+    // K8s 与 Docker 统一走下面的 AgentCleaner 公共清理逻辑 (引用计数 + 两分支), 不再有专门的
+    // K8s 裸循环 —— 旧 K8s 循环无引用计数, 会因单个 project idle 连坐销毁整个 user 容器
+    // (prod 实测 490 次)。AgentCleaner 内部 destroyer 经 ContainerRuntime trait 物理销毁,
+    // Docker / K8s 各自正确语义 (K8s 删 Pod+Service 并保留 PVC)。
     let pingora_service = state.pingora_service.clone();
 
-    // docker_manager 在此处一定为 Some（is_none 分支已 return）
-    let dm = match docker_manager {
-        Some(dm) => dm,
-        None => {
-            tracing::error!("[CLEANUP_TASK] docker_manager is None, cannot create AgentCleaner");
-            return Err(anyhow::anyhow!(
-                "docker_manager is None, cannot create AgentCleaner"
-            ));
-        }
-    };
+    // AgentCleaner 运行时无关 (destroyer 走 ContainerRuntime trait),
+    // Docker / K8s 都从这里复用同一套清理逻辑。
+    let mut cleaner = AgentCleaner::new(config, state, pingora_service);
 
-    let mut cleaner = AgentCleaner::new(config, state, dm, pingora_service);
-
+    let shutdown_rx = shutdown_tx.subscribe();
     Ok(tokio::task::spawn(async move {
-        cleaner.run().await;
+        cleaner.run(shutdown_rx).await;
     }))
 }

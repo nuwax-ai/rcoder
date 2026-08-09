@@ -21,12 +21,11 @@ use serde::Serialize;
 use shared_types::ProjectAndContainerInfo;
 
 use crate::{
-    agent_download::AgentDownloadManager,
-    app_manager,
     config::{ApiKeyAuthConfig, AppConfig},
     handler,
     storage::ProjectAdapter,
 };
+use agent_provisioning::AgentDownloadManager;
 use rcoder_telemetry::{HttpMetricsLayer, TelemetryGuard};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -77,7 +76,7 @@ pub struct AppState {
     pub api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
     /// 🆕 容器创建中标记: user_id -> 创建开始时间
     /// 用于防止并发 pod_ensure 请求互相干扰（无锁方案）
-    pub pod_creating: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    pub pod_creating: Arc<DashMap<String, std::time::Instant>>,
     /// 🚀 容器创建完成通知通道（替代轮询等待）
     /// 当容器创建完成时，发送 user_id 通知等待方
     pub pod_created_tx: Arc<broadcast::Sender<String>>,
@@ -87,17 +86,18 @@ pub struct AppState {
     /// 容器运行时（通过 DI 注入，替代全局 RuntimeManager::get()）
     pub runtime: Arc<dyn ContainerRuntime>,
     /// RAII 资源回收器接收端（在 start_cleanup_task 中取出并启动 ResourceReaper）
-    pub cleanup_rx: Arc<
-        std::sync::Mutex<
-            Option<tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>>,
-        >,
-    >,
+    pub cleanup_rx:
+        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>>>>,
     /// Agent 下载管理器（统一缓存）
     pub agent_download_manager: Arc<AgentDownloadManager>,
     /// 应用管理服务
-    pub app_service: Arc<dyn crate::app_manager::AppServiceTrait>,
+    pub app_service: Arc<dyn app_manager::AppServiceTrait>,
+    /// UserApp 活动状态注册表（闲置回收/流量唤醒共享状态；扫描器读 last_accessed/waking）
+    pub activity: Arc<app_manager::AppActivityRegistry>,
     /// K8s 集群域名（用于构建 K8s Service FQDN）
     pub cluster_domain: String,
+    /// UserApp 自动化构建发布任务表(rcoder 侧编排:正向调 agent-runner build + 同进程 app_manager 发布)。
+    pub publish_tasks: Arc<crate::userapp_publish::PublishTaskStore>,
 }
 
 impl AppState {
@@ -110,7 +110,8 @@ impl AppState {
         container_prefix_computer: String,
         runtime: Arc<dyn ContainerRuntime>,
         projects: Arc<ProjectAdapter>,
-        cleanup_rx: tokio::sync::mpsc::UnboundedReceiver<crate::storage::CleanupRequest>,
+        cleanup_rx: tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>,
+        activity: Arc<app_manager::AppActivityRegistry>,
     ) -> anyhow::Result<Self> {
         // ProjectAdapter 由调用方（main.rs）提前创建并注入，
         // 以便同一 Arc 实例可同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层。
@@ -127,28 +128,17 @@ impl AppState {
                 anyhow::anyhow!("failed to initialize agent download manager: {}", e)
             })?);
 
-        // 初始化应用管理服务（根据 features flag 选择）
-        let app_service: Arc<dyn crate::app_manager::AppServiceTrait> = {
-            #[cfg(feature = "kubernetes")]
-            {
-                Arc::new(
-                    crate::app_manager::k8s_service::K8sAppService::new(
-                        config.app_manager.clone(),
-                        runtime.clone(),
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to initialize K8s app service: {}", e))?,
-                )
-            }
-            #[cfg(not(feature = "kubernetes"))]
-            {
-                Arc::new(
-                    crate::app_manager::service::AppService::new(config.app_manager.clone())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
-                )
-            }
-        };
+        // 初始化应用管理服务（Docker / K8s 统一构造，运行时由 access_mode 决定行为）
+        let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
+            app_manager::service::AppService::new(
+                config.app_manager.clone(),
+                runtime.clone(),
+                activity.clone(),
+                pingora.clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
+        );
 
         Ok(Self {
             config,
@@ -165,7 +155,9 @@ impl AppState {
             cleanup_rx: Arc::new(std::sync::Mutex::new(Some(cleanup_rx))),
             agent_download_manager,
             app_service,
+            activity,
             cluster_domain,
+            publish_tasks: Arc::new(crate::userapp_publish::PublishTaskStore::new()),
         })
     }
 
@@ -215,6 +207,44 @@ impl AppState {
     #[inline]
     pub fn remove_project(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
         self.projects.remove(project_id)
+    }
+
+    /// 关闭某 project 关联的所有 SSE 共享流（容器销毁/项目删除前调用）。
+    ///
+    /// 必须在 [`remove_project`] 之前调用——remove_project 会清空 project 的 sessions 集合，
+    /// 之后无法再据此枚举。销毁语义：让后台 gRPC task 尽快退出，避免对已失效地址重试。
+    pub fn shutdown_sse_streams_for_project(&self, project_id: &str) {
+        let sids: Vec<String> = self
+            .get_project(project_id)
+            .map(|info| info.sessions().into_iter().collect())
+            .unwrap_or_default();
+        for sid in sids {
+            if self.session_stream_registry.shutdown_session(&sid) {
+                tracing::info!(
+                    "[STATE] shutdown SSE stream on project removal: project_id={}, session_id={}",
+                    project_id,
+                    sid
+                );
+            }
+        }
+    }
+
+    /// 按 grpc_addr 关闭关联的所有 SSE 共享流。
+    ///
+    /// 适用于记录可能已被清空的销毁路径（reaper/restart/ensure/destroyer）：这些路径中
+    /// project/session 记录可能在关闭前已被移除，无法再走 [`shutdown_sse_streams_for_project`]，
+    /// 但它们都能构造出 grpc_addr（与 `grpc_pool.remove` 同源）。幂等：重复调用安全。
+    pub fn shutdown_sse_streams_by_addr(&self, grpc_addr: &str) {
+        let closed = self
+            .session_stream_registry
+            .shutdown_streams_by_addr(grpc_addr);
+        if closed > 0 {
+            tracing::info!(
+                "[STATE] shutdown SSE streams on container destruction: grpc_addr={}, closed={}",
+                grpc_addr,
+                closed
+            );
+        }
     }
 
     /// 检查项目是否存在（替代 project_and_agent_map.contains_key）
@@ -371,6 +401,16 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             "/computer/ime/{user_id}/{project_id}/{*path}",
             get(handler::computer_ime_proxy),
         )
+        // 🆕 Computer Agent-runner 容器 PG 管理（重置密码 / 建库; rcoder exec 容器内 psql）
+        .route(
+            "/computer/db/{user_id}/reset-password",
+            post(handler::computer_db_reset_password),
+        )
+        .route(
+            "/computer/db/{user_id}/create-database",
+            post(handler::computer_db_create_database),
+        )
+        .route("/computer/cache/clean", post(handler::computer_cache_clean))
         .with_state(state.clone());
 
     // Pingora 代理 API 路由（用于文档和状态查询）
@@ -458,9 +498,16 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     // 应用管理路由
     let app_manager_state = Arc::new(app_manager::handlers::AppManagerState {
         app_service: state.app_service.clone(),
+        // 共享客户端 (连接超时 + 连接池复用; SSE 流不能设总超时, 见 http_client 模块)
+        http_client: crate::http_client::shared_client().clone(),
     });
-    let app_manager_routes =
-        app_manager::routes::app_manager_routes().with_state(app_manager_state);
+    let app_manager_routes = app_manager::routes::app_manager_routes()
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GiB（upload 压缩包，覆盖全局 50MB）
+        .with_state(app_manager_state);
+
+    // UserApp 自动化构建发布(rcoder 侧编排):publish/build + task 查询/SSE/cancel
+    let userapp_publish_routes =
+        crate::userapp_publish::handler::routes().with_state(state.clone());
 
     let mut router = Router::new()
         .merge(health_routes)
@@ -469,7 +516,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .merge(devcomputer_routes)
         .merge(proxy_api_routes)
         .merge(agent_mgmt_routes)
-        .merge(app_manager_routes);
+        .merge(app_manager_routes)
+        .merge(userapp_publish_routes);
 
     // 仅在启用 debug feature 时添加调试路由
     #[cfg(feature = "debug")]
@@ -495,6 +543,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     router
         .merge(create_swagger_ui())
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB body 大小限制
+        .layer(tower_http::trace::TraceLayer::new_for_http()) // HTTP 请求日志（target: tower_http → rcoder.log）
         .layer(HttpMetricsLayer::new()) // HTTP 指标中间件
         // API Key 鉴权中间件（支持热更新）
         .layer(axum::middleware::from_fn(move |req, next| {
@@ -572,6 +621,8 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::computer_desktop_proxy,
         handler::computer_audio_proxy,
         handler::computer_ime_proxy,
+        handler::computer_db_reset_password,
+        handler::computer_db_create_database,
         handler::computer_ttyd_proxy,
         handler::pod_count,
         handler::pod_list,
@@ -579,6 +630,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::pod_keepalive,
         handler::pod_restart,
         handler::pod_status,
+        handler::computer_cache_clean,
         handler::pod_vnc_status,
         // Pingora 代理接口
         handler::proxy_status,
@@ -586,6 +638,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         handler::proxy_config,
         handler::proxy_to_port,
         handler::proxy_to_port_with_path,
+        handler::proxy_to_app_with_path,
         handler::proxy_with_query_params,
         // P0-4: Agent Management 转发层
         handler::list_agents,
@@ -611,12 +664,36 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::start_app,
         app_manager::handlers::stop_app,
         app_manager::handlers::restart_app,
-        app_manager::handlers::get_app_logs,
+        app_manager::handlers::set_recycle_policy,
+        app_manager::handlers::prepare_release,
+        app_manager::handlers::activate_release,
+        app_manager::handlers::confirm_release,
+        app_manager::handlers::abort_release,
+        app_manager::handlers::list_releases,
+        app_manager::handlers::delete_release,
+        app_manager::handlers::query_app_log_sources,
+        app_manager::handlers::query_app_logs,
         app_manager::handlers::get_app_health,
         app_manager::handlers::get_app_stats,
         app_manager::handlers::get_app_events,
         app_manager::handlers::upload_file,
         app_manager::handlers::list_files,
+        app_manager::handlers::delete_file,
+        app_manager::handlers::list_app_runtimes,
+        app_manager::handlers::get_app_storage,
+        app_manager::handlers::clear_app_storage,
+        app_manager::handlers::destroy_app_storage,
+        app_manager::handlers::query_storage,
+        app_manager::handlers::reset_db_password,
+        app_manager::handlers::create_database,
+        app_manager::handlers::stream_app_logs_v1,
+        app_manager::handlers::upload_from_url,
+        crate::userapp_publish::handler::ensure_builder,
+        crate::userapp_publish::handler::publish,
+        crate::userapp_publish::handler::build,
+        crate::userapp_publish::handler::get_task,
+        crate::userapp_publish::handler::stream_task,
+        crate::userapp_publish::handler::cancel_task,
     ),
     components(
         schemas(
@@ -672,13 +749,15 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             handler::PodListResponse,
             handler::PodDetailInfo,
             handler::EnsurePodRequest,
-            handler::PodResourceLimits,
+            shared_types::ServiceResourceLimits,
             handler::EnsurePodResponse,
             handler::PodContainerInfo,
             handler::KeepalivePodRequest,
             handler::KeepalivePodResponse,
             handler::RestartPodRequest,
             handler::RestartPodResponse,
+            handler::CacheCleanRequest,
+            handler::CacheCleanResponse,
             handler::PodStatusQuery,
             handler::PodStatusResponse,
             handler::VncStatusQuery,
@@ -722,14 +801,28 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             // 应用管理相关结构体
             app_manager::models::CreateAppRequest,
             app_manager::models::AppInfo,
+            app_manager::models::AppRuntimeInfo,
             app_manager::models::AppStatus,
             app_manager::models::QueryAppsRequest,
             app_manager::models::UpdateAppRequest,
-            app_manager::models::LogParams,
-            app_manager::models::LogEntry,
             app_manager::models::ResourceStats,
             app_manager::models::HealthInfo,
-            app_manager::models::PaginatedResponse<app_manager::models::AppInfo>,
+            app_manager::models::PaginatedResponse<app_manager::models::AppRuntimeInfo>,
+            app_manager::models::PaginatedResponse<app_manager::models::StorageInfo>,
+            app_manager::models::Condition,
+            app_manager::models::DeleteAppRequest,
+            app_manager::models::DestroyStorageRequest,
+            app_manager::models::QueryStorageRequest,
+            app_manager::models::StorageFilters,
+            app_manager::models::StorageInfo,
+            app_manager::models::ResetDbPasswordRequest,
+            app_manager::models::CreateDatabaseRequest,
+            container_runtime_api::AppPortStatus,
+            container_runtime_api::AppEventInfo,
+            crate::userapp_publish::handler::PublishBody,
+            crate::userapp_publish::PublishTaskKind,
+            crate::userapp_publish::PublishTaskStatus,
+            crate::userapp_publish::PublishTaskSnapshot,
         )
     ),
     tags(
@@ -812,4 +905,25 @@ pub fn create_swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/api/docs")
         .url("/api/docs/openapi.json", ApiDoc::openapi())
         .config(utoipa_swagger_ui::Config::new(["/api/docs/openapi.json"]))
+}
+
+#[cfg(test)]
+mod openapi_tests {
+    use super::*;
+
+    #[test]
+    fn userapp_release_log_and_publish_paths_are_documented() {
+        let document = ApiDoc::openapi();
+        let paths = document.paths.paths;
+        for path in [
+            "/api/v1/apps/{app_id}/releases/prepare",
+            "/api/v1/apps/{app_id}/logs/query",
+            "/api/v1/apps/{app_id}/logs/stream",
+            "/api/v1/apps/{app_id}/publish",
+            "/api/v1/apps/{app_id}/build",
+            "/api/v1/apps/publish/tasks/{task_id}/stream",
+        ] {
+            assert!(paths.contains_key(path), "OpenAPI path missing: {path}");
+        }
+    }
 }

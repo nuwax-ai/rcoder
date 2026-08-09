@@ -2,7 +2,8 @@
 //!
 //! 使用 Builder 模式构建 DockerContainerConfig
 
-use crate::{DockerContainerConfig, DockerResult, MountPoint, ResourceLimits};
+use crate::{DockerContainerConfig, DockerResult, MountPoint};
+use shared_types::{ServiceResourceLimits, ServiceSecurityConfig};
 use std::collections::HashMap;
 use tracing::debug;
 
@@ -36,7 +37,7 @@ pub struct ContainerConfigBuilder {
     port_bindings: HashMap<String, String>,
     network_mode: Option<String>,
     auto_remove: bool,
-    resource_limits: Option<ResourceLimits>,
+    resource_limits: Option<ServiceResourceLimits>,
     extra_mounts: Vec<MountPoint>,
     command: Option<Vec<String>>,
     entrypoint: Option<Vec<String>>,
@@ -46,6 +47,8 @@ pub struct ContainerConfigBuilder {
     tenant_id: Option<String>,
     space_id: Option<String>,
     isolation_type: Option<String>,
+    // 容器安全配置（可选，仅 Docker 模式生效）
+    security: Option<ServiceSecurityConfig>,
 }
 
 impl ContainerConfigBuilder {
@@ -75,6 +78,7 @@ impl ContainerConfigBuilder {
             tenant_id: None,
             space_id: None,
             isolation_type: None,
+            security: None,
         }
     }
 
@@ -150,7 +154,7 @@ impl ContainerConfigBuilder {
     }
 
     /// 设置资源限制
-    pub fn resource_limits(mut self, limits: ResourceLimits) -> Self {
+    pub fn resource_limits(mut self, limits: ServiceResourceLimits) -> Self {
         self.resource_limits = Some(limits);
         self
     }
@@ -209,6 +213,12 @@ impl ContainerConfigBuilder {
         self
     }
 
+    /// 设置容器安全配置（可选，仅 Docker 模式生效）；传 None 表示走代码默认
+    pub fn security(mut self, security: Option<ServiceSecurityConfig>) -> Self {
+        self.security = security;
+        self
+    }
+
     /// 构建 DockerContainerConfig
     ///
     /// # Returns
@@ -253,6 +263,7 @@ impl ContainerConfigBuilder {
             tenant_id: self.tenant_id,
             space_id: self.space_id,
             isolation_type: self.isolation_type,
+            security: self.security,
         };
 
         debug!(
@@ -328,10 +339,12 @@ mod tests {
 
     #[test]
     fn test_builder_with_resource_limits() {
-        let limits = ResourceLimits {
-            memory_limit: Some((512 * 1024 * 1024) as f64), // 512MB
-            cpu_limit: Some(1.0),
-            swap_limit: None,
+        let limits = ServiceResourceLimits {
+            memory: Some((512 * 1024 * 1024) as f64), // 512MB
+            cpu: Some(1.0),
+            swap: None,
+            storage_size: None,
+            ephemeral_storage_limit: None,
         };
 
         let config = ContainerConfigBuilder::new("test-project")
@@ -341,10 +354,7 @@ mod tests {
 
         assert!(config.resource_limits.is_some());
         let resource_limits = config.resource_limits.unwrap();
-        assert_eq!(
-            resource_limits.memory_limit,
-            Some((512 * 1024 * 1024) as f64)
-        );
-        assert_eq!(resource_limits.cpu_limit, Some(1.0));
+        assert_eq!(resource_limits.memory, Some((512 * 1024 * 1024) as f64));
+        assert_eq!(resource_limits.cpu, Some(1.0));
     }
 }

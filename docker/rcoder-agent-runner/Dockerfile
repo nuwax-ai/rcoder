@@ -166,6 +166,11 @@ RUN chmod +x /usr/local/bin/agent_runner
 COPY ./start-up.sh /root/
 RUN chmod +x /root/start-up.sh
 
+# 复制部署模式差异脚本 (Docker Compose / K8s 通用引导 + 差异实现)
+# start-up.sh 按 DEPLOY_MODE source 这些脚本, 提供 fix_mount_permissions
+COPY ./start-up-common.sh ./start-up-docker-extra.sh ./start-up-k8s-extra.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/start-up-common.sh /usr/local/bin/start-up-docker-extra.sh /usr/local/bin/start-up-k8s-extra.sh
+
 # 复制中文输入法修复脚本（容器内运行 fix-ime 命令）
 COPY ./fix-chrome-ime-final.sh /usr/local/bin/fix-ime
 RUN chmod +x /usr/local/bin/fix-ime
@@ -187,6 +192,14 @@ RUN chmod +x /usr/local/bin/ime_server.py
 # ============================================================================
 # 复制 ttyd 启动脚本和自定义前端页面
 COPY ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
+
+# 复制 PostgreSQL supervisor 入口脚本（幂等 initdb + exec postgres，异步于 agent_runner）
+COPY pg-supervisor-entry.sh /usr/local/bin/pg-supervisor-entry.sh
+RUN chmod +x /usr/local/bin/pg-supervisor-entry.sh
+
+# 复制 supervisor 配置（管 ttyd/PG/pgweb，autorestart 自动拉起；见 start-up.sh 的 supervisord 启动）
+COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+COPY supervisor/conf.d/ /etc/supervisor/conf.d/
 COPY ttyd/ttyd-index.html /usr/local/share/ttyd/index.html
 RUN chmod +x /usr/local/bin/start-ttyd.sh
 

@@ -1,0 +1,151 @@
+//! 用 `pingap-config` crate 官方类型组装 pingap 配置 + `toml` 序列化。
+//!
+//! pingap-config 的 bollard/regex 依赖隔离在 app-cli 自己的 Cargo.lock（app-cli 独立于 rcoder workspace）。
+
+use pingap_config::{LocationConf, PingapConfig, ServerConf, UpstreamConf};
+use workspace_manifest::ProxySection;
+
+/// pingap 监听端口（不用 3000，前端框架默认端口；9080 无冲突）。
+pub const PINGAP_PORT: u16 = 9080;
+
+/// 一个需要代理的子项目（从 ServiceSpec 提取，pingap_config 不依赖 manifest 模块）。
+pub struct ProxyEntry {
+    pub name: String,
+    pub port: u16,
+    pub proxy: ProxySection,
+    /// 健康检查路径（pingap upstream health_check 用它探活）。
+    pub health: String,
+}
+
+/// 从 service specs 中提取有 [proxy] 的项目 → 生成 pingap 配置。
+///
+/// 仅当 ≥1 子项目有 [proxy] 时返回 `Some`。约定：
+/// - pingap 监听 :9080；各子项目 upstream = `127.0.0.1:<port>`。
+/// - `proxy.path == "/"` 兜底（location 不写 path）；其余前缀匹配；`strip_prefix` 去前缀。
+/// - 每个 location 默认带 `pingap:requestId` + `pingap:compressionUpstream`（零配置内置插件）。
+pub fn build_pingap_config(entries: &[ProxyEntry]) -> anyhow::Result<Option<String>> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let mut cfg = PingapConfig::default();
+
+    // [servers.app]
+    let location_names: Vec<String> = entries
+        .iter()
+        .map(|e| format!("{}Location", e.name))
+        .collect();
+    cfg.servers.insert(
+        "app".into(),
+        ServerConf {
+            addr: format!("0.0.0.0:{PINGAP_PORT}"),
+            locations: Some(location_names),
+            ..Default::default()
+        },
+    );
+
+    // 每个 proxied 项目：[upstreams.<name>] + [locations.<name>Location]
+    for e in entries {
+        let name = e.name.clone();
+        cfg.upstreams.insert(
+            name.clone(),
+            UpstreamConf {
+                addrs: vec![format!("127.0.0.1:{}", e.port)],
+                health_check: Some(format!("http://{name}{}", e.health)),
+                ..Default::default()
+            },
+        );
+
+        // 平台内置插件 + manifest 显式引用的插件。
+        let mut plugins: Vec<String> = vec!["pingap:requestId".into()];
+        plugins.extend(e.proxy.plugins.clone());
+        plugins.push("pingap:compressionUpstream".into());
+
+        let is_catchall = e.proxy.path == "/";
+        let mut loc = LocationConf {
+            upstream: Some(name.clone()),
+            plugins: Some(plugins),
+            // 不用 enable_reverse_proxy_headers 默认集：它会设 `x-forwarded-host:$host`，
+            // 而 pingap 的 `$host` 刻意去端口（仿 nginx），非标准端口下与浏览器 origin
+            // （含端口）不一致，导致 Next.js/Nuxt 等 Server Actions 的 CSRF origin 校验失败。
+            // 改自定义 proxy_set_headers：保留 for/proto（后端取 client IP/scheme），
+            // 故意不设 x-forwarded-host —— 让后端读 host header（pingap/pingora 保留客户端
+            // 原始 host:port），与浏览器 origin 一致，Server Actions 校验通过。
+            enable_reverse_proxy_headers: Some(false),
+            proxy_set_headers: Some(vec![
+                "x-real-ip:$remote_addr".into(),
+                "x-forwarded-for:$proxy_add_x_forwarded_for".into(),
+                "x-forwarded-proto:$scheme".into(),
+            ]),
+            ..Default::default()
+        };
+        if !is_catchall {
+            loc.path = Some(e.proxy.path.clone());
+            if e.proxy.strip_prefix {
+                loc.rewrite = Some(format!("^{}(.*) /$1", e.proxy.path));
+            }
+        }
+        cfg.locations.insert(format!("{name}Location"), loc);
+    }
+
+    Ok(Some(toml::to_string(&cfg)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, port: u16, path: &str, strip: bool) -> ProxyEntry {
+        ProxyEntry {
+            name: name.into(),
+            port,
+            proxy: ProxySection {
+                path: path.into(),
+                strip_prefix: strip,
+                plugins: Vec::new(),
+                upstream_includes: Vec::new(),
+            },
+            health: "/health".into(),
+        }
+    }
+
+    #[test]
+    fn empty_entries_returns_none() {
+        assert!(build_pingap_config(&[]).expect("serialize").is_none());
+    }
+
+    #[test]
+    fn routes_root_and_api_with_builtin_plugins() {
+        let entries = vec![
+            entry("frontend", 4000, "/", false),
+            entry("backend", 4001, "/api/", true),
+        ];
+        let toml_text = build_pingap_config(&entries)
+            .expect("serialize")
+            .expect("non-empty config");
+        assert!(toml_text.contains("addr = \"0.0.0.0:9080\""), "{toml_text}");
+        assert!(toml_text.contains("[upstreams.frontend]"), "{toml_text}");
+        assert!(
+            toml_text.contains("addrs = [\"127.0.0.1:4000\"]"),
+            "{toml_text}"
+        );
+        assert!(
+            toml_text.contains("[locations.frontendLocation]"),
+            "{toml_text}"
+        );
+        assert!(
+            toml_text.contains("addrs = [\"127.0.0.1:4001\"]"),
+            "{toml_text}"
+        );
+        assert!(toml_text.contains("path = \"/api/\""), "{toml_text}");
+        assert!(
+            toml_text.contains("rewrite = \"^/api/(.*) /$1\""),
+            "{toml_text}"
+        );
+        assert!(toml_text.contains("\"pingap:requestId\""), "{toml_text}");
+        assert!(
+            toml_text.contains("\"pingap:compressionUpstream\""),
+            "{toml_text}"
+        );
+    }
+}

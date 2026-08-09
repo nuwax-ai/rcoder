@@ -2,15 +2,17 @@
 //!
 //! Provides safe extraction for tar.gz and zip archives with:
 //! - Path traversal protection
-//! - Zip bomb protection (size limits)
 //! - Directory normalization (strip single wrapper directory)
+//!
+//! 资源限制(总解压字节/entry 数/单文件大小)有意不加:解压发生在用户隔离的容器内,由容器/PVC
+//! 配额作主边界;用户自己的内容用爆了,重启容器即可恢复。仅保留 path-traversal 安全边界
+//! (防 entry 越出 dest_dir 写到别处)。
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-/// Maximum extracted size (1GB)
-const MAX_EXTRACTED_SIZE: u64 = 1024 * 1024 * 1024;
+use tracing::{debug, error, warn};
 
 /// Archive extraction error
 #[derive(Debug)]
@@ -19,8 +21,6 @@ pub enum ArchiveError {
     Io(std::io::Error),
     /// Path traversal attempt detected
     PathTraversal(String),
-    /// Archive bomb detected (too large)
-    ArchiveBomb { size: u64, max: u64 },
     /// Invalid archive format
     InvalidArchive(String),
 }
@@ -30,13 +30,6 @@ impl std::fmt::Display for ArchiveError {
         match self {
             ArchiveError::Io(e) => write!(f, "IO error: {}", e),
             ArchiveError::PathTraversal(msg) => write!(f, "Path traversal: {}", msg),
-            ArchiveError::ArchiveBomb { size, max } => {
-                write!(
-                    f,
-                    "Archive bomb: {} bytes exceeds limit of {} bytes",
-                    size, max
-                )
-            }
             ArchiveError::InvalidArchive(msg) => write!(f, "Invalid archive: {}", msg),
         }
     }
@@ -58,7 +51,6 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
 
-    let mut total_uncompressed: u64 = 0;
     let mut file_count: usize = 0;
     let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
@@ -69,25 +61,28 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
         let sanitized = sanitize_entry_path(&entry_path)?;
         let dest_path = dest_dir.join(&sanitized);
 
-        // Path safety check
+        // Path safety check.
+        // canonicalize 要求目录已存在, 故先建目录再校验; 校验失败时
+        // 尽力回收刚建的空目录, 不在磁盘留下残留。
         if let Some(parent) = dest_path.parent()
             && !created_dirs.contains(parent)
         {
             std::fs::create_dir_all(parent)?;
-            ensure_within(&dest_path, dest_dir)?;
+            if let Err(e) = ensure_within(&dest_path, dest_dir) {
+                // 仅删空目录 (非空说明已有内容, 不能删); 失败无害, 记 debug 日志留痕
+                if let Err(error) = std::fs::remove_dir(parent) {
+                    debug!(
+                        path = %parent.display(),
+                        %error,
+                        "cleanup of directory created for path validation failed"
+                    );
+                }
+                return Err(e);
+            }
             created_dirs.insert(parent.to_path_buf());
         }
 
         let entry_type = entry.header().entry_type();
-        let entry_size = entry.header().size()?;
-
-        total_uncompressed = total_uncompressed.saturating_add(entry_size);
-        if total_uncompressed > MAX_EXTRACTED_SIZE {
-            return Err(ArchiveError::ArchiveBomb {
-                size: total_uncompressed,
-                max: MAX_EXTRACTED_SIZE,
-            });
-        }
 
         if entry_type.is_dir() {
             if !created_dirs.contains(&dest_path) {
@@ -106,6 +101,7 @@ pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<usize, Arc
                 out.write_all(&buf[..n])?;
             }
 
+            // 保留归档内文件权限位(如可执行位),不做剥离 —— 容器隔离下由用户自己负责。
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -134,7 +130,6 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, Archiv
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| ArchiveError::InvalidArchive(format!("open zip: {e}")))?;
 
-    let mut total_uncompressed: u64 = 0;
     let mut file_count: usize = 0;
     let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
@@ -148,21 +143,23 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, Archiv
         let sanitized = sanitize_entry_path(&entry_path)?;
         let dest_path = dest_dir.join(&sanitized);
 
+        // 同上: 先建目录再 canonicalize 校验; 校验失败时尽力回收空目录。
         if let Some(parent) = dest_path.parent()
             && !created_dirs.contains(parent)
         {
             std::fs::create_dir_all(parent)?;
-            ensure_within(&dest_path, dest_dir)?;
+            if let Err(e) = ensure_within(&dest_path, dest_dir) {
+                // 同 tar.gz 分支: 仅删空目录, 失败无害, 记 debug 日志留痕
+                if let Err(error) = std::fs::remove_dir(parent) {
+                    debug!(
+                        path = %parent.display(),
+                        %error,
+                        "cleanup of directory created for path validation failed"
+                    );
+                }
+                return Err(e);
+            }
             created_dirs.insert(parent.to_path_buf());
-        }
-
-        let entry_size = entry.size();
-        total_uncompressed = total_uncompressed.saturating_add(entry_size);
-        if total_uncompressed > MAX_EXTRACTED_SIZE {
-            return Err(ArchiveError::ArchiveBomb {
-                size: total_uncompressed,
-                max: MAX_EXTRACTED_SIZE,
-            });
         }
 
         if entry.is_dir() {
@@ -175,6 +172,7 @@ pub fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<usize, Archiv
             let mut out = File::create(&dest_path)?;
             std::io::copy(&mut entry, &mut out)?;
 
+            // 保留归档内文件权限位(如可执行位),不做剥离 —— 容器隔离下由用户自己负责。
             #[cfg(unix)]
             if let Some(mode) = entry.unix_mode() {
                 use std::os::unix::fs::PermissionsExt;
@@ -273,11 +271,11 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> Result<bool, ArchiveError> {
             let src = agent_dir.join(name);
             let dst = tmp_rename.join(name);
             if let Err(re) = std::fs::rename(&src, &dst) {
-                eprintln!("Rollback failed to move back {}: {}", src.display(), re);
+                error!("Rollback failed to move back {}: {}", src.display(), re);
             }
         }
         if let Err(re) = std::fs::rename(&tmp_rename, &wrapper) {
-            eprintln!(
+            error!(
                 "Rollback failed to restore wrapper dir {}: {}",
                 wrapper.display(),
                 re
@@ -286,8 +284,14 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> Result<bool, ArchiveError> {
         return Err(ArchiveError::Io(e));
     }
 
-    // Cleanup the now-empty wrapper directory
-    let _ = std::fs::remove_dir(&tmp_rename);
+    // Cleanup the now-empty wrapper directory; 失败无害 (目录非空或已删), 记 debug 日志留痕
+    if let Err(error) = std::fs::remove_dir(&tmp_rename) {
+        debug!(
+            path = %tmp_rename.display(),
+            %error,
+            "cleanup of empty wrapper directory failed"
+        );
+    }
 
     Ok(true)
 }
@@ -332,8 +336,22 @@ pub fn find_entrypoint_from_metadata(agent_dir: &Path) -> Option<(String, Vec<St
 
 /// Read `bin.start` from a JSON file.
 fn read_bin_start_from_json(path: &Path) -> Option<(String, Vec<String>)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    // 区分"文件不存在"（正常，试下一个候选）与"存在但读取/解析失败"（配置 bug，须可见）。
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!("failed to read package json {}: {e}", path.display());
+            return None;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("failed to parse package json {}: {e}", path.display());
+            return None;
+        }
+    };
 
     let bin_start = value.get("bin")?.get("start")?.as_str()?;
 
@@ -398,12 +416,24 @@ fn sanitize_entry_path(path: &Path) -> Result<PathBuf, ArchiveError> {
 }
 
 fn ensure_within(dest_path: &Path, base: &Path) -> Result<(), ArchiveError> {
-    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    // Fail-closed: canonicalize 失败时拒绝而非回退到未验证路径。
+    // 防御符号链接攻击: canonicalize 解析符号链接后验证真实路径。
+    let base_canon = base.canonicalize().map_err(|e| {
+        ArchiveError::PathTraversal(format!(
+            "cannot canonicalize base dir {}: {}",
+            base.display(),
+            e
+        ))
+    })?;
 
     let parent = dest_path.parent().unwrap_or(dest_path);
-    let canon_parent = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
+    let canon_parent = parent.canonicalize().map_err(|e| {
+        ArchiveError::PathTraversal(format!(
+            "cannot canonicalize parent dir {}: {}",
+            parent.display(),
+            e
+        ))
+    })?;
 
     if !canon_parent.starts_with(&base_canon) {
         return Err(ArchiveError::PathTraversal(format!(
@@ -478,6 +508,40 @@ mod tests {
     }
 
     #[test]
+    fn extract_tar_preserves_file_permissions() {
+        // 资源/权限限制已移除(容器隔离):归档内的权限位原样保留(含可执行位),不做剥离。
+        let tmp = tempdir().unwrap();
+        let archive = tmp.path().join("perms.tar.gz");
+        let extract_to = tmp.path().join("out");
+        std::fs::create_dir_all(&extract_to).unwrap();
+
+        {
+            let tar_file = File::create(&archive).unwrap();
+            let enc = flate2::write::GzEncoder::new(tar_file, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            let data = b"#!/bin/sh\necho hi\n";
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, "hello", &data[..]).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+
+        assert_eq!(extract_tar_gz(&archive, &extract_to).unwrap(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(extract_to.join("hello"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "executable bits must be preserved");
+        }
+    }
+
+    #[test]
     fn test_normalize_strips_wrapper() {
         let tmp = tempdir().unwrap();
         let agent_dir = tmp.path().join("agent");
@@ -529,47 +593,43 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_real_tar_gz() {
-        let archive_path = Path::new("/tmp/test-acp-install/cache/test.tar.gz");
-        if !archive_path.exists() {
-            println!("Skipping test: archive file not found");
-            return;
+    fn test_extract_generated_tar_gz() {
+        // 测试内动态构建 tar.gz（不再依赖 /tmp 外部文件，避免静默 skip）：
+        // 内容为带 wrapper 目录的结构 testpkg/{package.json, index.js}
+        let tmp = tempdir().unwrap();
+
+        // 1. 准备源目录
+        let wrapper_dir = tmp.path().join("testpkg");
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(wrapper_dir.join("package.json"), r#"{"name":"testpkg"}"#).unwrap();
+        std::fs::write(wrapper_dir.join("index.js"), "console.log('hi');").unwrap();
+
+        // 2. 打包为 tar.gz（wrapper 目录作为归档顶层条目）
+        let archive_path = tmp.path().join("test.tar.gz");
+        {
+            let file = File::create(&archive_path).unwrap();
+            let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut builder = tar::Builder::new(enc);
+            builder.append_dir_all("testpkg", &wrapper_dir).unwrap();
+            builder.finish().unwrap();
         }
 
-        let tmp_dir = tempdir().unwrap();
-        let extract_dir = tmp_dir.path().join("extracted");
-        std::fs::create_dir_all(&extract_dir).unwrap();
-
-        // 检测文件类型
-        let file_type = detect_file_type_from_path(archive_path).unwrap();
-        println!("File type detected: {}", file_type);
+        // 3. 检测文件类型
+        let file_type = detect_file_type_from_path(&archive_path).unwrap();
         assert_eq!(file_type, "tar.gz");
 
-        // 解压
-        let count = extract_tar_gz(archive_path, &extract_dir).unwrap();
-        println!("Extracted {} files", count);
+        // 4. 解压
+        let extract_dir = tmp.path().join("extracted");
+        std::fs::create_dir_all(&extract_dir).unwrap();
+        let count = extract_tar_gz(&archive_path, &extract_dir).unwrap();
         assert!(count > 0);
 
-        // 列出解压后的文件
-        println!("\nExtracted files:");
-        for entry in std::fs::read_dir(&extract_dir).unwrap() {
-            let entry = entry.unwrap();
-            println!("  {}", entry.file_name().to_string_lossy());
-        }
-
-        // 规范化目录（去掉 wrapper）
+        // 5. 规范化目录（去掉 wrapper）
         let stripped = normalize_extracted_dir(&extract_dir).unwrap();
-        println!("\nStripped wrapper: {}", stripped);
         assert!(stripped);
 
-        // 再次列出文件
-        println!("\nFiles after normalization:");
-        for entry in std::fs::read_dir(&extract_dir).unwrap() {
-            let entry = entry.unwrap();
-            println!("  {}", entry.file_name().to_string_lossy());
-        }
-
-        // 检查 package.json 存在
+        // 6. 检查内容直接位于解压根目录
         assert!(extract_dir.join("package.json").exists());
+        assert!(extract_dir.join("index.js").exists());
     }
 }

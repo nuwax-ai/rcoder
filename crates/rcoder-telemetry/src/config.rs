@@ -5,8 +5,11 @@
 use std::env;
 use std::path::PathBuf;
 
+use tracing_appender::non_blocking::WorkerGuard;
+
+use crate::BoxedLayer;
+
 /// 遥测系统统一配置
-#[derive(Debug, Clone)]
 pub struct TelemetryConfig {
     /// 服务名称（用于 trace 和 metrics 标识）
     pub service_name: String,
@@ -16,6 +19,10 @@ pub struct TelemetryConfig {
     pub prometheus: Option<PrometheusConfig>,
     /// 文件日志配置（可选）
     pub file_log: Option<FileLogConfig>,
+    /// 额外 tracing layer（嵌入式场景，如 file-server 独立日志）
+    pub extra_layer: Option<BoxedLayer>,
+    /// 额外 layer 关联的 WorkerGuard（必须存活到进程结束）
+    pub extra_layer_guard: Option<WorkerGuard>,
 }
 
 /// OTLP 导出器配置
@@ -52,6 +59,19 @@ pub struct FileLogConfig {
     pub json_format: bool,
 }
 
+impl std::fmt::Debug for TelemetryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryConfig")
+            .field("service_name", &self.service_name)
+            .field("otlp", &self.otlp)
+            .field("prometheus", &self.prometheus)
+            .field("file_log", &self.file_log)
+            .field("extra_layer", &self.extra_layer.is_some())
+            .field("extra_layer_guard", &self.extra_layer_guard.is_some())
+            .finish()
+    }
+}
+
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
@@ -59,6 +79,8 @@ impl Default for TelemetryConfig {
             otlp: None,
             prometheus: Some(PrometheusConfig::default()),
             file_log: None,
+            extra_layer: None,
+            extra_layer_guard: None,
         }
     }
 }
@@ -169,6 +191,8 @@ impl TelemetryConfig {
             otlp,
             prometheus,
             file_log: None,
+            extra_layer: None,
+            extra_layer_guard: None,
         }
     }
 
@@ -223,6 +247,16 @@ impl TelemetryConfig {
     /// 禁用文件日志
     pub fn without_file_log(mut self) -> Self {
         self.file_log = None;
+        self
+    }
+
+    /// 注入额外的 tracing layer 及其关联的 WorkerGuard（嵌入式场景，如 file-server 独立日志）。
+    ///
+    /// extra_layer 通过 per-layer filter 独立过滤，不受全局 EnvFilter 影响。
+    /// extra_layer_guard 必须存活到进程结束（由 [`crate::TelemetryGuard`] 持有）。
+    pub fn with_extra_layer(mut self, layer: BoxedLayer, guard: WorkerGuard) -> Self {
+        self.extra_layer = Some(layer);
+        self.extra_layer_guard = Some(guard);
         self
     }
 }

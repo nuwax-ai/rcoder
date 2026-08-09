@@ -42,6 +42,26 @@ spec:
               value: "local-path"
             - name: RCODER_K8S_PVC_ACCESS_MODE
               value: "ReadWriteOnce"
+            # app_manager（UserApp）共享存储：复用 project-workspace PVC（devspace 命名），
+            # app Pod 挂其 workspace/apps/{app_id} subPath → /app；rcoder 无 subPath 挂载
+            # （/app/project_workspace = PVC 根），故 workspace_root 多一层 workspace
+            - name: RCODER_WORKSPACE_PVC_NAME
+              value: "project-workspace-pvc"
+            - name: RCODER_WORKSPACE_ROOT
+              value: "/app/project_workspace/workspace/apps"
+            # computer-agent-runner 共享存储：所有 computer agent pod 挂此 PVC，
+            # 按 user_id subPath 隔离（挂载点 /home/user）。rcoder 默认名 {ns}-rcoder-computer-workspace，
+            # 这里用 env 覆盖成静态名 computer-workspace-pvc（与 web 对称，不硬编码 namespace）。
+            - name: RCODER_COMPUTER_WORKSPACE_PVC_NAME
+              value: "computer-workspace-pvc"
+            # UserApp HTTP 端口经 Gateway（HTTPRoute，标准 CR，controller 无关）。
+            # 本地 devspace 用 Envoy Gateway（OrbStack 原生），生产用 Cilium Gateway，
+            # 两者 gatewayClassName 不同但 Gateway 同名 nuwax-gateway/default。
+            # 未装 gateway 时 HTTPRoute 创建成功但 ResolvedRefs=False；不影响 TCP/存储验证。
+            - name: RCODER_K8S_GATEWAY_NAME
+              value: "nuwax-gateway"
+            - name: RCODER_K8S_GATEWAY_NAMESPACE
+              value: "default"
           volumeMounts:
             - name: cargo-target
               mountPath: /app/target
@@ -51,6 +71,12 @@ spec:
               mountPath: /app/project_workspace
             - name: logs
               mountPath: /app/logs
+            # rcoder 主配置(模拟 prod helm:ConfigMap subPath 挂载为单文件)
+            # 提供 config.yml(含 kubernetes_config 段),覆盖 devspace sync 的根 config.yml
+            - name: rcoder-config
+              mountPath: /app/config.yml
+              subPath: config.yml
+              readOnly: true
           resources:
             requests:
               memory: "2Gi"
@@ -70,3 +96,6 @@ spec:
             claimName: project-workspace-pvc
         - name: logs
           emptyDir: {}
+        - name: rcoder-config
+          configMap:
+            name: rcoder-config

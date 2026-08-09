@@ -12,6 +12,16 @@ services:
       - TZ=Asia/Shanghai
       - RCODER_PORT=${RCODER_PORT:-8090}
       - RUST_LOG=debug # 设置调试日志级别
+      # app_manager（UserApp）Docker 模式工作空间根（app-workspace 挂在 /app/app-workspace）；
+      # 不设则默认 /app/project_workspace/apps，与挂载点不符，文件管理/storage 会路径错
+      - RCODER_WORKSPACE_ROOT=/app/app-workspace
+      # 阶段2: rcoder 嵌入 Rust file-server (端口 60000, 替代 nuwax-file-server 独立进程)
+      # Docker 模式无 Ceph, 嵌入后用 LocalWorkspaceResolver (共享 Docker volume)
+      - RCODER_EMBED_FILE_SERVER=true
+      # UserApp release.lock 构建元数据；测试正式镜像时建议由 shell 覆盖 digest。
+      - RCODER_PINGAP_VERSION=${RCODER_PINGAP_VERSION:-0.13.8}
+      - RCODER_PINGAP_COMMIT=${RCODER_PINGAP_COMMIT:-07d1cce1b658418bb46c2dec1a49c43fd2f48268}
+      - RCODER_RUNTIME_IMAGE_DIGEST=${RCODER_RUNTIME_IMAGE_DIGEST:-sha256:local-development}
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}
       # 主容器禁用 ttyd（ttyd 在动态创建的容器中运行）
@@ -29,12 +39,22 @@ services:
       - ./logs/:/app/logs
       # 挂载启动脚本
       - ./start-rcoder.sh:/app/start-rcoder.sh
+      # 挂载项目模板 (create-project 用, react/vue3 vite 模板 zip)
+      - ./project_init:/app/project_init
       # 专门用于npm,pnpm,bun,uvx 缓存使用的目录
       - ./computer-cache:/root/.cache
       # 应用管理工作空间目录
       - ./app-workspace:/app/app-workspace
       # 🖼️ 挂载壁纸目录（供 agent_runner 子容器使用）
       # - ./wallpaper:/app/assets
+      # ============ 容器内热编译（本地开发测试用，见 make dev-hot）============
+      # 仓库源码 → /app/src（dev-master-rcoder 镜像只含 binary，热编译需源码）
+      - ..:/app/src:cached
+      # cargo 依赖缓存（跨容器持久化，避免每次 dev-restart 后重下）
+      - rcoder-cargo-registry:/root/.cargo/registry
+      - rcoder-cargo-git:/root/.cargo/git
+      # cargo target 缓存（独立 volume，避免 bind mount 拖慢 target 小文件 IO）
+      - rcoder-target:/app/src/target
     command: ["/bin/bash", "/app/start-rcoder.sh"]
     healthcheck:
       test:
@@ -100,3 +120,7 @@ volumes:
   pyroscope-data:
   prometheus-data:
   grafana-data:
+  # 容器内热编译缓存（本地开发测试用）
+  rcoder-cargo-registry:
+  rcoder-cargo-git:
+  rcoder-target:

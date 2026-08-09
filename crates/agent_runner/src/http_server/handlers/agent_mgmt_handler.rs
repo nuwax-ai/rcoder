@@ -35,7 +35,7 @@ fn resolve_manifest(
     registry: &AgentRegistry,
     agent_id: &str,
     version: Option<&str>,
-) -> Option<crate::agent_mgmt::installer::AgentManifest> {
+) -> Option<installer::AgentManifest> {
     match version {
         Some(v) if !v.is_empty() => registry.get_version(agent_id, v),
         _ => registry.get(agent_id),

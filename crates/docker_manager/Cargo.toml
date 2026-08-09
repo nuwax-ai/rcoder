@@ -7,6 +7,9 @@ license.workspace = true
 description.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 # Docker API
 bollard = { workspace = true }
@@ -58,6 +61,7 @@ k8s-openapi = { workspace = true, optional = true }
 [features]
 default = []
 # Kubernetes runtime support
+# 阶段2: xattr 目录配额已退役 (改 per-agent subvolume PVC + CSI 服务端配额), xattr crate 已移除
 kubernetes = ["kube", "k8s-openapi"]
 # 🔧 eBPF 调试模式：启用容器特权，允许使用 eBPF 诊断工具
 # 警告：仅在开发调试时使用，生产环境请勿启用

@@ -47,7 +47,11 @@ fn test_load_local_config_file() {
         .unwrap_or_else(|e| panic!("Failed to parse multi_image_config: {}", e));
 
     // 验证服务数量
-    assert_eq!(multi_config.services.len(), 2, "Expected 2 services");
+    assert_eq!(
+        multi_config.services.len(),
+        3,
+        "Expected 3 services (web/computer/user-app-builder)"
+    );
 
     // 验证 web-agent-runner 配置
     let web_config = multi_config

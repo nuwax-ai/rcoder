@@ -1,0 +1,29 @@
+### computer: 获取文件列表
+GET {{base_url}}/api/computer/get-file-list?userId={{test_user}}&cId={{test_cid}}
+
+### computer: 获取文件内容
+GET {{base_url}}/api/computer/get-project-content?userId={{test_user}}&cId={{test_cid}}
+
+### computer: 创建 workspace
+POST {{base_url}}/api/computer/create-workspace
+Content-Type: application/json
+
+{"userId": "{{test_user}}", "cId": "{{test_cid}}"}
+
+### computer: 删除 workspace
+POST {{base_url}}/api/computer/delete-workspace
+Content-Type: application/json
+
+{"userId": "{{test_user}}, "cId": "{{test_cid}}"}
+
+### computer: zip-workspace (下载)
+GET {{base_url}}/api/computer/zip-workspace?userId={{test_user}}&cId={{test_cid}}
+
+### computer: execute-command
+POST {{base_url}}/api/computer/execute-command
+Content-Type: application/json
+
+{"userId": "{{test_user}}", "cId": "{{test_cid}}", "command": "echo hello"}
+
+### computer: static 文件访问
+GET {{base_url}}/api/computer/static/{{test_user}}/{{test_cid}}/package.json

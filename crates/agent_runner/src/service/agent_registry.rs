@@ -390,7 +390,7 @@ impl AgentSessionRegistry {
         use tokio::sync::mpsc;
 
         match self.agent_info_map.entry(project_id.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+            Entry::Occupied(mut entry) => {
                 // 已存在：仅当 Idle 时更新为 Pending
                 let info = entry.get_mut();
                 if info.status == AgentStatus::Idle {
@@ -402,7 +402,7 @@ impl AgentSessionRegistry {
                     );
                 }
             }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
+            Entry::Vacant(entry) => {
                 // 不存在：创建占位记录（使用有界通道，容量由常量定义）
                 let (prompt_tx, _) = mpsc::channel(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY);
                 let (cancel_tx, _) = mpsc::channel(shared_types::AGENT_CANCEL_CHANNEL_CAPACITY);
@@ -545,6 +545,27 @@ impl AgentSessionRegistry {
 
         // 再通过 project_id 获取 agent_info
         self.agent_info_map.get(&project_id_str)
+    }
+
+    /// 通过 project_id 在闭包内访问 agent_info;闭包返回即释放读锁(无 Ref 暴露,
+    /// 防守卫跨 .await)。需要 owned 字段时用这个,不要用 [`get_agent_info`] 拿 Ref 跨 await。
+    pub fn view_agent_info<R>(
+        &self,
+        project_id: &str,
+        f: impl FnOnce(&ProjectAndAgentInfo) -> R,
+    ) -> Option<R> {
+        self.agent_info_map.view(project_id, |_, info| f(info))
+    }
+
+    /// 通过 session_id 在闭包内访问 agent_info(全程不暴露 Ref)。两 map 间仍有 ~100ns
+    /// 竞态(同 [`get_agent_info_by_session`]),可接受。
+    pub fn view_agent_info_by_session<R>(
+        &self,
+        session_id: &str,
+        f: impl FnOnce(&ProjectAndAgentInfo) -> R,
+    ) -> Option<R> {
+        let project_id_str = self.session_to_project.view(session_id, |_, v| v.clone())?;
+        self.agent_info_map.view(&project_id_str, |_, info| f(info))
     }
 
     /// 检查 project 是否存在

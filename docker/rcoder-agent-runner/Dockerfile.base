@@ -9,12 +9,12 @@
 ARG DOCKER_MIRROR
 # GitHub 镜像加速配置（默认启用）
 ARG USE_GITHUB_MIRROR=true
-# 基础镜像: buildpack-deps:bookworm-curl
-# - 基于 debian:12 (bookworm), 与 debian:12 100% 兼容
-# - 预装 curl + wget + ca-certificates + gnupg, 无需先 apt 安装
-# - Docker 官方维护, 与 debian:12 共享底层 layer, 拉取几乎零增量
-# - 避免"先用海外 apt 源装 curl 再配置镜像"的鸡生蛋死循环
-FROM ${DOCKER_MIRROR}buildpack-deps:bookworm-curl
+# 基础镜像: rust:bookworm (= buildpack-deps:bookworm 完整版 + Rust 工具链)
+# - 基于 debian:12 (bookworm), GLIBC 2.36, 与 debian:12 100% 兼容
+# - 预装 Rust 工具链 (cargo/rustc, 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo), 免 rustup 安装
+# - 预装 build-essential 构成 + libssl-dev/pkg-config + curl/wget/git 等 (buildpack-deps 完整版)
+# - 镜像内可直接编译 Rust 项目 (UserApp runtime build 需要 cargo)
+FROM ${DOCKER_MIRROR}rust:bookworm
 
 # GitHub 镜像加速环境变量（必须在 FROM 之后设置）
 ENV GITHUB_MIRROR_URL=https://gh-proxy.org/https://github.com/
@@ -35,7 +35,7 @@ ENV \
 
 # 使用 LinuxMirrors 一键配置阿里云镜像源
 # 参考: https://github.com/SuperManito/LinuxMirrors
-# buildpack-deps:bookworm-curl 已预装 curl，可直接执行脚本配置镜像源
+# rust:bookworm (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
 RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --source mirrors.aliyun.com \
     --protocol https \
@@ -85,7 +85,10 @@ RUN apt-get update && \
     xclip \
     wget software-properties-common \
     # Suna dependencies:
-    poppler-utils wkhtmltopdf antiword unrtf catdoc gawk file jq csvkit xmlstarlet zip unzip tmux vim tree rsync && \
+    poppler-utils wkhtmltopdf antiword unrtf catdoc gawk file jq csvkit xmlstarlet zip unzip tmux vim tree rsync \
+    gvfs libglib2.0-bin \
+    # pm-utils: 提供 pm-is-supported, 消除 xfce4-session 启动告警(容器无电源管理, 仅满足探测)
+    pm-utils && \
     # Configure X11 wrapper to allow any user:
     sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config && \
     # Set the default terminal
@@ -406,11 +409,8 @@ RUN chmod 755 /usr/local/bin/chromium-for-mcp
 #     chmod +x /usr/local/bin/start-port-forward.sh && \
 #     echo "[Desktop Entry]\nType=Application\nName=PortForward\nExec=/usr/local/bin/start-port-forward.sh\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true" > /home/user/.config/autostart/port-forward.desktop
 
-# 添加自动启动supervisord的桌面启动项 (使用系统级配置)
-RUN echo '#!/bin/bash\n# 启动supervisord服务\nsudo /usr/bin/supervisord -c /etc/supervisor/supervisord.conf &' > /usr/local/bin/start-supervisord.sh && \
-    chmod +x /usr/local/bin/start-supervisord.sh && \
-    echo "[Desktop Entry]\nType=Application\nName=Supervisord\nExec=/usr/local/bin/start-supervisord.sh\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true" > /etc/xdg/autostart/supervisord.desktop && \
-    chmod 644 /etc/xdg/autostart/supervisord.desktop
+# （已移除）无效的 xdg autostart supervisord.desktop
+# supervisord 现由 start-up.sh 直接启动（管 ttyd/PG/pgweb，见 supervisor/ 配置）
 
 # Install VS Code - 使用 apt 仓库方式（比直接下载 deb 更可靠）
 RUN echo "📦 Adding Microsoft VS Code repository..." && \
@@ -502,10 +502,14 @@ RUN mkdir -p /home/user/Desktop /usr/share/applications && \
     printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Terminal\nComment=Terminal Emulator\nExec=xfce4-terminal\nIcon=utilities-terminal\nTerminal=false\nCategories=System;TerminalEmulator;" > /usr/share/applications/user-terminal.desktop && \
     printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Visual Studio Code\nComment=Code Editor\nExec=/usr/bin/code --no-sandbox --user-data-dir=/home/user/.config/Code\nIcon=vscode\nTerminal=false\nCategories=Development;IDE;" > /usr/share/applications/user-vscode.desktop && \
     chmod 644 /usr/share/applications/user-terminal.desktop /usr/share/applications/user-vscode.desktop && \
-    # Create symbolic links from Desktop to system apps (安全软链接)
-    ln -sf /usr/share/applications/user-terminal.desktop /home/user/Desktop/terminal.desktop && \
-    ln -sf /usr/share/applications/user-vscode.desktop /home/user/Desktop/vscode.desktop && \
-    ln -sf /usr/share/applications/chromium-browser.desktop /home/user/Desktop/chromium.desktop && \
+    # 桌面图标用实体副本 (符号链接会被 rsync munge 成 /rsyncd-munged/ 死链 +
+    # xfdesktop/GIO 对符号链接判 untrusted; 实体文件两类问题一并规避)
+    cp /usr/share/applications/user-terminal.desktop /home/user/Desktop/terminal.desktop && \
+    cp /usr/share/applications/user-vscode.desktop /home/user/Desktop/vscode.desktop && \
+    cp /usr/share/applications/chromium-browser.desktop /home/user/Desktop/chromium.desktop && \
+    printf "[Desktop Entry]\nVersion=1.0\nType=Application\nName=pgweb\nComment=PostgreSQL Web UI\nExec=/usr/bin/chromium-browser-launcher http://localhost:8081\nIcon=applications-development\nTerminal=false\nCategories=Development;Database;" > /usr/share/applications/pgweb.desktop && \
+    cp /usr/share/applications/pgweb.desktop /home/user/Desktop/pgweb.desktop && \
+    chmod 755 /home/user/Desktop/*.desktop && \
     chown -R user:user /home/user/Desktop
 
 # ========== 创建骨架目录 /etc/skel-user-desktop ==========
@@ -758,32 +762,11 @@ RUN npm install -g @zed-industries/claude-code-acp@latest && \
 #     echo "✅ Playwright Chromium installed"
 
 # 安装 OpenSSL 开发包和构建依赖（mcp-stdio-proxy 需要）
-RUN apt-get update && apt-get install -y \
-    libssl-dev \
-    pkg-config \
-    build-essential && \
-    rm -rf /var/lib/apt/lists/*
-
-# 安装 Rust toolchain（需要 root）
-# 注意：mcp-stdio-proxy 的安装已移至 Dockerfile，以便频繁更新时无需重建基础镜像
-ENV RUSTUP_HOME=/opt/rustup \
-    CARGO_HOME=/opt/cargo \
-    PATH="/opt/cargo/bin:$PATH"
-
-# 使用国内镜像源加速下载
-#ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static/
-#ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup/
-# 安装 Rust 并验证
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-    echo 'export PATH="/root/.cargo/bin:$PATH"' >> /root/.bashrc && \
-    export PATH="/root/.cargo/bin:$PATH" && \
-    which cargo && cargo --version
-
-# 设置 PATH 环境变量（确保后续命令能找到 cargo）
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# 复制 cargo 镜像配置文件（使用国内镜像加速）
-COPY .cargo/config.toml /root/.cargo/config.toml
+# Rust 工具链已由 rust:bookworm 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
+# libssl-dev / pkg-config / build-essential 构成 已由 rust:bookworm (buildpack-deps) 预装, 不再单独 apt 装
+# (原此处 apt 装 libssl-dev/pkg-config/build-essential + rustup 安装, 均已冗余, 删除)。
+# cargo 镜像配置 (rsproxy-sparse) COPY 到 /usr/local/cargo/config.toml; runtime UserApp build 走加速源。
+COPY .cargo/config.toml /usr/local/cargo/config.toml
 
 # 安装 uv 到全局路径（需要 root）
 # 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
@@ -800,14 +783,13 @@ RUN pip3 install --break-system-packages --no-cache-dir -i https://mirrors.aliyu
     echo 'export UV_CACHE_DIR=/home/user/.cache/uv' >> /etc/profile.d/uv-env.sh && \
     chmod +x /etc/profile.d/uv-env.sh
 
-# 添加 cargo bin 和 uv 到 PATH
 # 添加所有工具安装路径到 PATH:
 # - /root/.local/bin: root 用户使用 uv tool install 时的可执行文件位置
 # - /home/user/.local/bin: user 用户使用 uv tool install 时的可执行文件位置
-# - /opt/cargo/bin: Rust cargo 安装的工具
 # - /usr/local/bin: 系统级工具（bun, uv, pnpm 等）
+# 注: Rust cargo 在 /usr/local/cargo/bin, 由 rust:bookworm 的 ${PATH} 继承, 不在此显式列出
 ENV PNPM_HOME="/home/user/.local/share/pnpm" \
-    PATH="/root/.local/bin:/home/user/.local/bin:/opt/cargo/bin:/usr/local/bin:${PATH}"
+    PATH="/root/.local/bin:/home/user/.local/bin:/usr/local/bin:${PATH}"
 
 # ============================================================================
 # 🔊 pcmflux 音频流服务安装
@@ -919,6 +901,56 @@ RUN _ARCH="${TARGETARCH}"; \
 # 静态资源目录（demo 用的 index.html 由 Dockerfile 注入）
 RUN mkdir -p /usr/local/share/ttyd
 
+# ============================================================================
+# 🐘 PostgreSQL 16 + pgweb（开发环境本地数据库 + Web UI）
+# 用户在 agent-runner 容器开发时用本地 PG 测试 + pgweb 操作；
+# 开发完打包发布到 UserApp（app-runtime 镜像自带 PG/pgweb）。
+# ============================================================================
+# PostgreSQL 16（PGDG repo for bookworm）
+RUN install -d /etc/apt/keyrings && \
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /etc/apt/keyrings/postgresql.asc && \
+    echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && \
+    apt-get install -y postgresql-16 && \
+    rm -rf /var/lib/apt/lists/*
+
+# pgweb（Go 单二进制，PostgreSQL Web UI；多架构 + GitHub 镜像支持，同 ttyd 模式）
+ARG USE_GITHUB_MIRROR
+ARG TARGETARCH
+ARG PGWEB_VERSION=0.17.0
+ARG CACHEBUST_PGWEB=1
+
+RUN _ARCH="${TARGETARCH}"; \
+    if [ -z "${_ARCH}" ]; then _ARCH=$(dpkg --print-architecture); fi && \
+    echo "🔧 pgweb cache bust: ${CACHEBUST_PGWEB}" && \
+    case "${_ARCH}" in \
+        "amd64") PGWEB_ARCH=amd64;; \
+        "arm64") PGWEB_ARCH=arm64;; \
+        *) echo "❌ Unsupported arch: ${_ARCH}" && exit 1;; \
+    esac && \
+    if [ "$USE_GITHUB_MIRROR" = "true" ]; then \
+        GH_HOST="https://gh-proxy.org/"; GH_PATH="https://github.com/"; \
+    else \
+        GH_HOST=""; GH_PATH="https://github.com/"; \
+    fi && \
+    DOWNLOAD_URL="${GH_HOST}${GH_PATH}sosedoff/pgweb/releases/download/v${PGWEB_VERSION}/pgweb_linux_${PGWEB_ARCH}.zip" && \
+    echo "📦 Downloading pgweb ${PGWEB_VERSION} for ${_ARCH}..." && \
+    curl -fsSL -o /tmp/pgweb.zip "${DOWNLOAD_URL}" && \
+    cd /tmp && unzip -o pgweb.zip && \
+    mv "pgweb_linux_${PGWEB_ARCH}" /usr/local/bin/pgweb && \
+    chmod +x /usr/local/bin/pgweb && \
+    rm -f /tmp/pgweb.zip && \
+    pgweb --version
+
+# PG 开发数据库默认配置（可被运行时 env 覆盖；PGDATA 落 /home/user 持久化）
+ENV PGDATA=/home/user/.pgdata \
+    POSTGRES_USER=dev \
+    POSTGRES_PASSWORD=dev \
+    POSTGRES_DB=dev \
+    PGWEB_PORT=8081
+
 # ttyd 默认端口
 ENV TTYD_PORT=7681
 
@@ -928,6 +960,9 @@ ENV TTYD_PORT=7681
 # 此处不设置 ENTRYPOINT，由最终镜像设置
 # 暴露 agent_runner 端口（供最终镜像使用）
 EXPOSE 8086
+
+# ttyd（Web 终端）+ PostgreSQL + pgweb（开发本地数据库 + Web UI）端口
+EXPOSE 7681 5432 8081
 
 # 设置 agent_runner 默认端口环境变量
 ENV AGENT_RUNNER_PORT=8086

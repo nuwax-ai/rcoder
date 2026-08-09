@@ -7,6 +7,9 @@ license.workspace = true
 description = "Agent configuration management for RCoder"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 # 复用 shared_types 中的类型
 shared_types = { workspace = true }

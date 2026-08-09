@@ -266,7 +266,7 @@ impl PingoraServerRunner {
     }
 
     /// 获取 Pingora 代理实例
-    pub fn create_pingora_proxy(&self) -> Result<crate::service::PortProxy, crate::ProxyError> {
+    pub fn create_pingora_proxy(&self) -> Result<crate::service::PortProxy, ProxyError> {
         self.service.create_pingora_proxy()
     }
 }

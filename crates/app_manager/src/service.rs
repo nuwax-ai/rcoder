@@ -1,0 +1,634 @@
+//! 应用管理服务层（统一 Docker / K8s 后端，无状态）
+//!
+//! rcoder 是无状态的应用 pod 引擎：
+//! - 写操作（create/start/stop/restart/delete）转调 [`ContainerRuntime`] 的 Deployment 能力；
+//! - 读操作（get/query/list）实时查集群，返回 [`AppRuntimeInfo`]；
+//! - 业务元数据（name/image/command/env 等）由调用方（Java）持久化，rcoder 不存。
+//!
+//! K8s 模式 `create_deployment` 创建 ConfigMap/Secret/ClusterIP Service/Deployment；
+//! HTTP 入口按 `http_expose`：Pingora（默认，两后端统一，本服务注册 Pingora backend
+//! `/proxy/apps/{app_id}/{port}` → 后端 host：Docker container_ip / K8s ClusterIP FQDN）或 Gateway
+//! （可选，K8s 建 HTTPRoute `/apps/{id}`）。TCP 初期不对外。Docker 模式建容器入主网络。
+
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use docker_manager::path::HostPathResolver;
+use moka::sync::Cache;
+use tracing::{info, instrument, warn};
+
+use container_runtime_api::{ExposeType as RtExposeType, HttpExpose, UserAppRuntime};
+use rcoder_proxy::PingoraProxyService;
+
+use crate::AppActivityRegistry;
+
+use super::config::{AppAccessMode, AppManagerConfig};
+use super::models::*;
+use super::utils::*;
+
+/// 应用管理服务（Docker / K8s 统一）
+pub struct AppService {
+    pub(crate) config: AppManagerConfig,
+    /// ISP 收紧 (阶段3): app_manager 只需 workspace (B) + UserApp Deployment (C) 能力,
+    /// 不依赖 agent 容器生命周期 (A) —— 类型声明即编译期约束 (调用 agent 方法会编译错).
+    pub(crate) runtime: Arc<dyn UserAppRuntime>,
+    /// UserApp 活动状态注册表(闲置回收/流量唤醒的共享状态:last_accessed/stopped/waking)
+    pub(crate) activity: Arc<AppActivityRegistry>,
+    /// Pingora 代理（Docker 模式用于注册 HTTP backend；K8s 模式通常为 None）
+    pub(crate) pingora: Option<Arc<PingoraProxyService>>,
+    /// 路径解析器缓存（单例；Docker 模式将 rcoder 容器内路径解析为宿主机路径）
+    pub(crate) path_resolver: Cache<String, Arc<HostPathResolver>>,
+    /// Docker 模式 Pingora backend 端口登记（app_id → 注册的 HTTP 端口列表）
+    ///
+    /// 这是**操作副作用的临时缓存**（非业务元数据）：delete 时需要知道曾注册过哪些端口
+    /// 才能清理 Pingora backend。rcoder 重启后丢失可接受（Docker 模式定位为开发环境）。
+    pub(crate) pingora_ports: DashMap<String, Vec<u16>>,
+    /// 同一 rcoder 进程内按 app 串行化 release 操作。PVC 文件锁继续负责跨进程互斥；
+    /// 先等异步锁可避免同 app 的并发请求长期占用 Tokio blocking 线程等待 flock。
+    pub(crate) release_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl AppService {
+    /// 创建新的应用管理服务
+    pub async fn new(
+        config: AppManagerConfig,
+        runtime: Arc<dyn UserAppRuntime>,
+        activity: Arc<AppActivityRegistry>,
+        pingora: Option<Arc<PingoraProxyService>>,
+    ) -> AppResult<Self> {
+        let path_resolver: Cache<String, Arc<HostPathResolver>> =
+            Cache::builder().max_capacity(1).build();
+
+        // 初始化路径解析器（失败不致命，Docker 模式回退到容器内路径）
+        match HostPathResolver::new().await {
+            Ok(resolver) => {
+                info!("[APP] path resolver initialized");
+                path_resolver.insert("default".to_string(), Arc::new(resolver));
+            }
+            Err(e) => {
+                warn!(
+                    "[APP] path resolver init failed, using container path: {}",
+                    e
+                );
+            }
+        }
+
+        // K8s 模式：启动时校验前置条件（RBAC 等）。失败直接返回，
+        // 避免 rcoder 显示健康、直到首次创建 app 才暴露 403。
+        if config.access_mode == AppAccessMode::Kubernetes {
+            runtime
+                .validate_app_prerequisites()
+                .await
+                .map_err(|error| {
+                    map_runtime_error("[APP] K8s prerequisites validation failed", error)
+                })?;
+            info!("[APP] K8s prerequisites validated (RBAC/apps/deployments accessible)");
+        }
+
+        // 无效组合必须 Fail Fast：Docker 无 HTTPRoute/gateway 概念。
+        if config.access_mode == AppAccessMode::Docker && config.http_expose == HttpExpose::Gateway
+        {
+            return Err(AppOperationError::Validation(
+                "invalid app configuration: access_mode=docker requires http_expose=pingora".into(),
+            ));
+        }
+
+        let svc = Self {
+            config,
+            runtime,
+            activity,
+            pingora,
+            path_resolver,
+            pingora_ports: DashMap::new(),
+            release_locks: DashMap::new(),
+        };
+        // K8s Pingora 模式：启动时从集群重建 Pingora backends——修复 pingora_ports 内存态
+        // 丢失导致的重启 silent 404（list_deployments 的 expose_type 已由 Deployment annotation
+        // 准确还原）。重建失败时不能对外声称就绪。
+        if svc.config.access_mode == AppAccessMode::Kubernetes
+            && svc.config.http_expose == HttpExpose::Pingora
+        {
+            svc.rebuild_pingora_backends().await?;
+        }
+        // 重建活动状态内存态(rcoder 重启后 last_accessed/stopped 丢失):
+        //  - replicas==0 → mark_stopped(支持流量唤醒识别)
+        //  - replicas>0  → seed_accessed=now(给 Running app 完整 grace 周期,避免重启后立刻被回收)
+        // 失败时 stopped app 无法被流量唤醒，必须阻止就绪。
+        svc.rebuild_stopped_apps().await?;
+        Ok(svc)
+    }
+
+    /// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
+    #[instrument(skip(self))]
+    pub async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
+        let statuses = self
+            .runtime
+            .list_deployments()
+            .await
+            .map_err(|e| map_runtime_error("[APP] list_deployments failed", e))?;
+        Ok(statuses
+            .into_iter()
+            .map(|s| self.build_runtime_info(s))
+            .collect())
+    }
+
+    /// 查询应用列表（实时查集群 + 过滤/分页）
+    #[instrument(skip(self, request))]
+    pub async fn query_apps(
+        &self,
+        request: QueryAppsRequest,
+    ) -> AppResult<PaginatedResponse<AppRuntimeInfo>> {
+        let mut items = self.list_app_runtimes().await?;
+
+        // 过滤（仅 status/app_ids 为运行时字段，可生效；name/created_at 需业务元数据，跳过）
+        if let Some(filters) = &request.filters {
+            if let Some(status) = &filters.status {
+                items.retain(|app| status.contains(&app.status));
+            }
+            if let Some(app_ids) = &filters.app_ids {
+                items.retain(|app| app_ids.contains(&app.app_id));
+            }
+            if filters.name.is_some() || filters.created_at.is_some() {
+                warn!(
+                    "[APP] query_apps name/created_at filters require business metadata, rcoder is stateless, ignored"
+                );
+            }
+        }
+
+        // 排序（仅 app_id 可用；默认升序，Desc 时降序）
+        if let Some(sort_by) = &request.sort_by
+            && (sort_by == "app_id" || sort_by == "name")
+        {
+            items.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+            if request.sort_order == Some(SortOrder::Desc) {
+                items.reverse();
+            }
+        }
+
+        // 分页
+        let total = items.len() as u64;
+        let page = request.page.unwrap_or(1).max(1);
+        let page_size = request.page_size.unwrap_or(20).min(100);
+        let start = ((page - 1) * page_size) as usize;
+        let end = (start + page_size as usize).min(items.len());
+        let paged_items = if start < items.len() {
+            items[start..end].to_vec()
+        } else {
+            vec![]
+        };
+
+        Ok(PaginatedResponse {
+            items: paged_items,
+            pagination: Pagination {
+                page,
+                page_size,
+                total,
+                total_pages: ((total as f64) / (page_size as f64)).ceil() as u32,
+            },
+        })
+    }
+
+    /// 获取应用运行时详情（实时查集群；精确区分 404 与 500）
+    #[instrument(skip(self))]
+    pub async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        validate_app_id(app_id)?;
+        let status = self.fetch_runtime_status_or_err(app_id).await?;
+        Ok(self.build_runtime_info(status))
+    }
+
+    /// 更新应用配置
+    /// 更新应用（v2 §5.2，全量替换 desired state）。
+    ///
+    /// rcoder 无状态：不持有旧 desired state，故本操作为**全量替换**——调用方需发送完整
+    /// 新状态（`image` 必填）。K8s 走 SSA re-apply（幂等）+ orphan 端口/配置清理；
+    /// Docker 重建容器（image/env/command 变化必须重建），工作空间目录保留。
+    #[instrument(skip(self, request))]
+    pub async fn update_app(
+        &self,
+        app_id: &str,
+        request: UpdateAppRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        validate_app_id(app_id)?;
+        let current = self.fetch_runtime_status_or_err(app_id).await?;
+        // 乐观锁：expected_resource_version 不匹配 → 409 Conflict
+        // （Docker resource_version=None → 跳过校验，开发环境 last-write-wins 可接受）
+        if let Some(expected) = &request.expected_resource_version
+            && let Some(actual) = &current.resource_version
+            && expected != actual
+        {
+            return Err(AppOperationError::Conflict(format!(
+                "resource version mismatch: expected={expected}, actual={actual}"
+            )));
+        }
+        let params = self
+            .build_container_params_from_update(app_id, &request, &current)
+            .await?;
+        // 先注销旧 Pingora backend（K8s/Docker 都执行：Docker 旧 container_ip 失效；
+        // K8s 下方按本次 http_ports 重新注册到 Service FQDN，注销-重注成对保证一致）。
+        self.unregister_pingora_backends(app_id).await;
+        let info = self.runtime.patch_deployment(params).await.map_err(|e| {
+            map_runtime_error(&format!("[APP] patch_deployment failed app_id={app_id}"), e)
+        })?;
+        // 重新注册 Pingora backend。http_ports 取本次请求 ports；若未带（K8s 下 update 常
+        // 只改 image/env 等部分字段），沿用当前 Deployment 的 HTTP 端口，保证与上面
+        // unregister 对称——否则部分更新会丢 Pingora 路由（app 经 /proxy/apps/{id}/{port} 变 502）。
+        // 注：register 在 K8s 模式并非 no-op，会把 backend 指到 Service FQDN（与 create 一致）。
+        let http_ports = if request.ports.is_some() {
+            http_port_numbers(&request.ports)
+        } else {
+            current
+                .ports
+                .iter()
+                .filter(|p| p.expose_type == RtExposeType::Http)
+                .map(|p| p.port)
+                .collect::<Vec<u16>>()
+        };
+        self.register_pingora_backends(app_id, &http_ports, &info.container_ip)
+            .await;
+        info!("[APP] app updated: {}", app_id);
+        self.get_app(app_id).await
+    }
+
+    /// 删除应用（v2 §5.3：默认保留持久存储，purge=true 才清空数据面）。
+    #[instrument(skip(self))]
+    pub async fn delete_app(
+        &self,
+        app_id: &str,
+        purge: bool,
+        expected_resource_version: Option<&str>,
+    ) -> AppResult<()> {
+        validate_app_id(app_id)?;
+        let previous = self.fetch_runtime_status_or_err(app_id).await?;
+        let previous_wake_on_traffic = previous
+            .wake_on_traffic
+            .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
+        // 乐观锁（同 update_app）：expected 不匹配 → 409 Conflict
+        if let Some(expected) = expected_resource_version
+            && let Some(actual) = &previous.resource_version
+            && expected != actual
+        {
+            return Err(AppOperationError::Conflict(format!(
+                "resource version mismatch: expected={expected}, actual={actual}"
+            )));
+        }
+        // delete/purge 必须与 prepare/activate/confirm/delete-release 串行，避免删除 PVC
+        // 时另一个任务仍在写版本包或切换 code。
+        let release_lock = self.acquire_process_release_lock(app_id).await;
+        info!("[APP] deleting app: {} (purge={})", app_id, purge);
+
+        // 1. Docker 模式：清理 Pingora backend
+        self.unregister_pingora_backends(app_id).await;
+
+        // 2. 删除计算资源（K8s: Deployment/Service/HTTPRoute/NodePort/ConfigMap/Secret
+        //    + label orphan 扫描兜底；Docker: 容器）。持久存储默认保留。
+        // 先阻止并发流量唤醒；删除失败时恢复原活动状态。
+        self.activity.mark_wake_blocked(app_id);
+        if let Err(error) = self.runtime.delete_deployment(app_id).await {
+            self.restore_activity_state(app_id, &previous, previous_wake_on_traffic);
+            let http_ports = previous
+                .ports
+                .iter()
+                .filter(|port| port.expose_type == RtExposeType::Http)
+                .map(|port| port.port)
+                .collect::<Vec<_>>();
+            self.register_pingora_backends(
+                app_id,
+                &http_ports,
+                previous.pod_ip.as_deref().unwrap_or_default(),
+            )
+            .await;
+            return Err(map_runtime_error(
+                &format!("[APP] delete_deployment failed app_id={app_id}"),
+                error,
+            ));
+        }
+        self.activity.forget_app(app_id);
+
+        // 3. purge=true 必须销毁持久存储（K8s: PVC + Ceph subvolume；Docker:
+        //    workspace 目录），与 API 的“全部删除”语义一致。仅清空目录却保留 PVC
+        //    会继续占用配额，并让成功响应与实际状态不一致。
+        if purge {
+            self.destroy_app_storage(app_id, app_id).await?;
+            info!("[APP] persistent storage destroyed: {}", app_id);
+        } else {
+            info!(
+                "[APP] retained persistent storage (pass purge=true to clear): {}",
+                app_id
+            );
+        }
+
+        drop(release_lock);
+        self.remove_unused_process_release_lock(app_id);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl super::AppServiceTrait for AppService {
+    async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
+        self.create_app(request).await
+    }
+
+    async fn query_apps(
+        &self,
+        request: QueryAppsRequest,
+    ) -> AppResult<PaginatedResponse<AppRuntimeInfo>> {
+        self.query_apps(request).await
+    }
+
+    async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
+        self.list_app_runtimes().await
+    }
+
+    async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        self.get_app(app_id).await
+    }
+
+    async fn update_app(
+        &self,
+        app_id: &str,
+        request: UpdateAppRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        self.update_app(app_id, request).await
+    }
+
+    async fn delete_app(
+        &self,
+        app_id: &str,
+        purge: bool,
+        expected_resource_version: Option<&str>,
+    ) -> AppResult<()> {
+        self.delete_app(app_id, purge, expected_resource_version)
+            .await
+    }
+
+    async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo> {
+        self.get_app_storage(app_id).await
+    }
+
+    async fn clear_app_storage(&self, app_id: &str) -> AppResult<()> {
+        self.clear_app_storage(app_id).await
+    }
+
+    async fn destroy_app_storage(&self, app_id: &str, confirm: &str) -> AppResult<()> {
+        self.destroy_app_storage(app_id, confirm).await
+    }
+
+    async fn reset_db_password(
+        &self,
+        app_id: &str,
+        request: ResetDbPasswordRequest,
+    ) -> AppResult<()> {
+        self.reset_db_password(app_id, request).await
+    }
+
+    async fn create_database(&self, app_id: &str, request: CreateDatabaseRequest) -> AppResult<()> {
+        self.create_database(app_id, request).await
+    }
+
+    async fn query_storage(
+        &self,
+        request: QueryStorageRequest,
+    ) -> AppResult<PaginatedResponse<StorageInfo>> {
+        self.query_storage(request).await
+    }
+
+    async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        self.start_app(app_id).await
+    }
+
+    async fn stop_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        self.stop_app(app_id).await
+    }
+
+    async fn recycle_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        self.recycle_app(app_id).await
+    }
+
+    async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        self.restart_app(app_id).await
+    }
+
+    async fn set_recycle_policy(
+        &self,
+        app_id: &str,
+        request: RecyclePolicyRequest,
+    ) -> AppResult<AppRuntimeInfo> {
+        self.set_recycle_policy(app_id, request).await
+    }
+
+    async fn prepare_release(
+        &self,
+        app_id: &str,
+        request: PrepareReleaseRequest,
+    ) -> AppResult<ReleaseInfo> {
+        self.prepare_release(app_id, request).await
+    }
+
+    async fn activate_release(&self, app_id: &str, release_id: &str) -> AppResult<ReleaseInfo> {
+        self.activate_release(app_id, release_id).await
+    }
+
+    async fn confirm_release(
+        &self,
+        app_id: &str,
+        release_id: &str,
+        healthy: bool,
+        message: Option<String>,
+    ) -> AppResult<ReleaseInfo> {
+        self.confirm_release(app_id, release_id, healthy, message)
+            .await
+    }
+
+    async fn abort_release(
+        &self,
+        app_id: &str,
+        release_id: &str,
+        message: Option<String>,
+    ) -> AppResult<ReleaseInfo> {
+        self.abort_release(app_id, release_id, message).await
+    }
+
+    async fn list_releases(&self, app_id: &str) -> AppResult<ReleaseListResponse> {
+        self.list_releases(app_id).await
+    }
+
+    async fn delete_release(&self, app_id: &str, release_id: &str) -> AppResult<()> {
+        self.delete_release(app_id, release_id).await
+    }
+
+    async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats> {
+        self.get_app_stats(app_id).await
+    }
+
+    async fn get_app_events(
+        &self,
+        app_id: &str,
+    ) -> AppResult<Vec<container_runtime_api::AppEventInfo>> {
+        self.get_app_events(app_id).await
+    }
+
+    async fn upload_file(
+        &self,
+        app_id: &str,
+        file_data: Vec<u8>,
+        target: &str,
+        flatten: bool,
+    ) -> AppResult<UploadResult> {
+        self.upload_file(app_id, file_data, target, flatten).await
+    }
+
+    async fn upload_from_url(
+        &self,
+        app_id: &str,
+        url: &str,
+        target: &str,
+        flatten: bool,
+    ) -> AppResult<UploadResult> {
+        self.upload_from_url(app_id, url, target, flatten).await
+    }
+
+    async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> AppResult<Vec<FileInfo>> {
+        self.list_files(app_id, subpath).await
+    }
+
+    async fn delete_file(&self, app_id: &str, file_path: &str) -> AppResult<()> {
+        self.delete_file(app_id, file_path).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    use crate::test_support::{MockRuntime, test_service};
+
+    /// 合法 schema_version=1 release lock（build_container_params 的 inject_release_identity 需要）
+    fn release_lock() -> &'static str {
+        r#"
+schema_version = 1
+release_id = "release-1"
+workspace_name = "smoke"
+minimum_app_cli_version = "0.1.0"
+runtime_image_digest = "registry.example/app-runtime:0.1.140"
+
+[pingap]
+mode = "managed"
+version = "0.13.7"
+commit = "abc123"
+
+[[services]]
+service_id = "backend"
+name = "Backend"
+dir = "backend"
+type = "go"
+kind = "web"
+enabled = true
+port = 4100
+logs = []
+
+[services.run]
+command = ["./server"]
+migrate = []
+depends_on = []
+shutdown_timeout_seconds = 30
+
+[services.health]
+
+[services.proxy]
+path = "/"
+strip_prefix = false
+plugins = []
+upstream_includes = []
+
+[services.env]
+"#
+    }
+
+    fn create_request(app_id: &str) -> CreateAppRequest {
+        CreateAppRequest {
+            app_id: Some(app_id.to_owned()),
+            name: "r2-app".into(),
+            image: "registry.example/app-runtime:test".into(),
+            command: None,
+            env: None,
+            secrets: None,
+            resources: None,
+            ports: None,
+            health_check: None,
+            tenant_id: None,
+            space_id: None,
+            recycle_enabled: None,
+            idle_timeout_seconds: None,
+        }
+    }
+
+    /// R2：create_app_runtime 失败——断言 delete_deployment 兜底被调用、原始错误原样返回（不被清理覆盖）。
+    #[tokio::test]
+    async fn create_app_runtime_failure_triggers_best_effort_cleanup() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        runtime.create_fails.store(true, Ordering::SeqCst);
+        let service = test_service(root.path(), runtime.clone());
+        // build_container_params 需 code/release.lock.toml，预铺现场
+        let app_dir = root.path().join("app-r2");
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+
+        let error = service
+            .create_app(create_request("app-r2"))
+            .await
+            .expect_err("create_app must fail");
+
+        // 原始错误原样返回（create_deployment 失败的映射，未被清理逻辑覆盖）
+        assert!(
+            error.to_string().contains("create_deployment failed"),
+            "original error must be preserved, got: {error}"
+        );
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.delete_calls.load(Ordering::SeqCst),
+            1,
+            "delete_deployment fallback must be called after create_app_runtime failure"
+        );
+    }
+
+    /// R2 对照：清理自身失败也不改变原始错误（只 warn）。
+    #[tokio::test]
+    async fn create_app_cleanup_failure_keeps_original_error() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        runtime.create_fails.store(true, Ordering::SeqCst);
+        runtime.delete_fails.store(true, Ordering::SeqCst);
+        let service = test_service(root.path(), runtime.clone());
+        let app_dir = root.path().join("app-r2b");
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+
+        let error = service
+            .create_app(create_request("app-r2b"))
+            .await
+            .expect_err("create_app must fail");
+
+        assert!(
+            error.to_string().contains("create_deployment failed"),
+            "original error must not be masked by cleanup failure, got: {error}"
+        );
+        assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
+    }
+}

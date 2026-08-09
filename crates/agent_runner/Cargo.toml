@@ -40,6 +40,9 @@ otel = []  # 启用 OpenTelemetry 追踪功能
 # Pyroscope 连续性能分析
 pyroscope = ["dep:pyroscope"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # Internal crates
 shared_types = { workspace = true }
@@ -47,7 +50,9 @@ shared_types_grpc = { workspace = true }
 shared_types_i18n = { workspace = true }
 agent_config = { workspace = true }
 agent_abstraction = { workspace = true }
+agent_provisioning = { workspace = true }
 download_utils = { workspace = true }
+file-server = { workspace = true }
 rcoder-proxy = { workspace = true, optional = true }
 rcoder-telemetry = { workspace = true }
 
@@ -57,6 +62,9 @@ agent-client-protocol = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
+
+# PID 1 init: 容器内做 PID 1 的孤儿回收 + 信号转发(经 re-exec 等价 tini,进程外 waitpid 不与 tokio 冲突)
+pid1 = "0.1.6"
 
 # HTTP server
 axum = { workspace = true, features = ["multipart"] }
@@ -140,6 +148,11 @@ pyroscope = { workspace = true, optional = true }
 # Unix 信号处理（用于僵尸进程回收，仅 Unix 平台）
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
+
+# /proc 解析（agent_runner 统计容器内 noVNC 端口 ESTABLISHED 连接，判 VNC 桌面是否在用）
+# 仅 Linux target 引入；macOS 开发 cargo check/test 不拉此依赖，保持 Mac 编译干净。
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = { workspace = true }
 
 [dev-dependencies]
 # 集成测试用:解析响应 body

@@ -20,9 +20,9 @@ use super::locale::locale_from_grpc_request;
 pub type SubscribeProgressStream =
     Pin<Box<dyn Stream<Item = Result<ProgressEvent, Status>> + Send>>;
 
-/// 空闲超时时间（5分钟）
+/// 空闲超时时间（30分钟）
 /// 如果在这个时间内没有收到任何真实消息（不包括心跳），则关闭流
-const IDLE_TIMEOUT_SECS: u64 = 300;
+const IDLE_TIMEOUT_SECS: u64 = 1800;
 
 /// 流退出原因，每个变体对应一个明确的退出路径
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +135,7 @@ pub async fn subscribe_progress(
                         );
                         if tx.send(Ok(event)).await.is_err() {
                             debug!("[gRPC] Client disconnected during replay");
-                            session_data.close_current_connection().await;
+                            session_data.close_current_connection();
                             return;
                         }
                     }
@@ -153,7 +153,7 @@ pub async fn subscribe_progress(
                         "[gRPC] SubscribeProgress stream ended, cleaning up SSE sender: session_id={}, reason={}",
                         session_id_clone, reason
                     );
-                    session_data.close_current_connection().await;
+                    session_data.close_current_connection();
                 }
                 Err(e) => {
                     warn!("[gRPC] Failed to create session connection: {}", e);
@@ -188,7 +188,7 @@ pub async fn subscribe_progress(
 /// 独立函数避免了 `tokio::select!` 宏展开导致的 definite-assignment 盲区。
 async fn run_stream_loop(
     session_id: &str,
-    mut message_rx: tokio::sync::mpsc::Receiver<(u64, shared_types::UnifiedSessionMessage)>,
+    mut message_rx: mpsc::Receiver<(u64, shared_types::UnifiedSessionMessage)>,
     cancellation_token: tokio_util::sync::CancellationToken,
     tx: &mpsc::Sender<Result<ProgressEvent, Status>>,
     locale: &'static str,
@@ -285,7 +285,9 @@ async fn run_stream_loop(
                         seq: 0,
                         timestamp: chrono::Utc::now().timestamp_millis(),
                     };
-                    let _ = tx.send(Ok(timeout_event)).await;
+                    if let Err(e) = tx.send(Ok(timeout_event)).await {
+                        warn!("subscribe_progress event send failed (subscriber gone): {e}");
+                    }
                     return ExitReason::IdleTimeout;
                 }
 

@@ -1,15 +1,17 @@
 //! HTTP downloader with retry, resume, and SHA-256 verification
 
-use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::error::DownloadError;
+
+static HTTP_CLIENT: tokio::sync::OnceCell<reqwest::Client> = tokio::sync::OnceCell::const_new();
 
 /// Download configuration
 #[derive(Debug, Clone)]
@@ -68,48 +70,76 @@ impl Downloader {
         expected_sha256: Option<&str>,
         cancel_token: &CancellationToken,
     ) -> Result<u64, DownloadError> {
-        // Validate URL scheme
-        if !url.starts_with("http://") && !url.starts_with("https://") {
+        let parsed_url = reqwest::Url::parse(url)
+            .map_err(|error| DownloadError::InvalidUrl(format!("{url}: {error}")))?;
+        if !matches!(parsed_url.scheme(), "http" | "https") {
             return Err(DownloadError::InvalidUrl(url.to_string()));
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.config.timeout_secs))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| DownloadError::Http(format!("http client: {}", e)))?;
+        let request_timeout = Duration::from_secs(self.config.timeout_secs.max(1));
+        let client = if let Some(client) = HTTP_CLIENT.get() {
+            // Client::clone() only clones an internal Arc and preserves the shared connection pool.
+            client.clone()
+        } else {
+            // reqwest requests are asynchronous, but Client::build() is synchronous and may inspect
+            // system proxy/TLS settings. Initialize it off the runtime worker and reuse its connection
+            // pool across all downloads. The detached initializer is allowed to finish after a caller
+            // cancels so the next download does not repeat the expensive setup.
+            let client_task = tokio::spawn(initialize_http_client());
+            tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    self.cleanup_cancelled_download(dest_path).await;
+                    return Err(DownloadError::Cancelled);
+                }
+                result = tokio::time::timeout(request_timeout, client_task) => {
+                    result
+                        .map_err(|_| DownloadError::Http("http client construction timed out".to_string()))?
+                        .map_err(|error| DownloadError::Http(format!("http client task failed: {error}")))?
+                        .map_err(|error| DownloadError::Http(format!("http client: {error}")))?
+                }
+            }
+        };
 
-        let mut last_err: Option<DownloadError> = None;
+        let max_attempts = self.config.max_retries.max(1);
+        for attempt in 1..=max_attempts {
+            if cancel_token.is_cancelled() {
+                self.cleanup_cancelled_download(dest_path).await;
+                return Err(DownloadError::Cancelled);
+            }
 
-        for attempt in 1..=self.config.max_retries {
             // Check existing bytes for resume
-            let mut downloaded = if dest_path.exists() {
-                std::fs::metadata(dest_path).map(|m| m.len()).unwrap_or(0)
-            } else {
-                0
+            let mut downloaded = match tokio::fs::metadata(dest_path).await {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(DownloadError::Io(error)),
             };
 
             // Build request with optional Range header
-            let mut req = client.get(url);
+            let mut req = client.get(parsed_url.clone()).timeout(request_timeout);
             if downloaded > 0 {
                 info!("[download] resume: url={}, from_byte={}", url, downloaded);
                 req = req.header("Range", format!("bytes={}-", downloaded));
             }
 
-            let response = match req.send().await {
+            let response = match tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    self.cleanup_cancelled_download(dest_path).await;
+                    return Err(DownloadError::Cancelled);
+                }
+                response = req.send() => response,
+            } {
                 Ok(r) => r,
                 Err(e) => {
                     let err = DownloadError::Http(format!("GET {}: {}", url, e));
-                    if err.is_retryable() && attempt < self.config.max_retries {
+                    if err.is_retryable() && attempt < max_attempts {
                         warn!(
                             "[download] attempt {} failed: {}, retrying...",
                             attempt, err
                         );
-                        last_err = Some(err);
-                        let backoff = Duration::from_secs(
-                            self.config.retry_backoff_base_secs * 2u64.pow(attempt as u32 - 1),
-                        );
-                        tokio::time::sleep(backoff).await;
+                        self.wait_before_retry(attempt, cancel_token, dest_path)
+                            .await?;
                         continue;
                     }
                     return Err(err);
@@ -117,16 +147,20 @@ impl Downloader {
             };
 
             // Follow redirects
-            let response = match self.follow_redirects(&client, response, 5).await {
+            let response = match self
+                .follow_redirects(&client, response, 5, request_timeout, cancel_token)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
-                    if e.is_retryable() && attempt < self.config.max_retries {
+                    if matches!(&e, DownloadError::Cancelled) {
+                        self.cleanup_cancelled_download(dest_path).await;
+                        return Err(e);
+                    }
+                    if e.is_retryable() && attempt < max_attempts {
                         warn!("[download] attempt {} failed: {}, retrying...", attempt, e);
-                        last_err = Some(e);
-                        let backoff = Duration::from_secs(
-                            self.config.retry_backoff_base_secs * 2u64.pow(attempt as u32 - 1),
-                        );
-                        tokio::time::sleep(backoff).await;
+                        self.wait_before_retry(attempt, cancel_token, dest_path)
+                            .await?;
                         continue;
                     }
                     return Err(e);
@@ -149,25 +183,44 @@ impl Downloader {
             // 5xx → retryable
             if status.is_server_error() {
                 let err = DownloadError::Http(format!("GET {}: HTTP {}", url, status));
-                if attempt < self.config.max_retries {
+                if attempt < max_attempts {
                     warn!(
                         "[download] attempt {} failed: {}, retrying...",
                         attempt, err
                     );
-                    last_err = Some(err);
-                    let backoff = Duration::from_secs(
-                        self.config.retry_backoff_base_secs * 2u64.pow(attempt as u32 - 1),
-                    );
-                    tokio::time::sleep(backoff).await;
+                    self.wait_before_retry(attempt, cancel_token, dest_path)
+                        .await?;
                     continue;
                 }
                 return Err(err);
             }
 
+            if let Some(content_length) = response.content_length() {
+                let expected_total = if status == reqwest::StatusCode::OK {
+                    content_length
+                } else {
+                    downloaded.saturating_add(content_length)
+                };
+                if expected_total > self.config.max_bytes {
+                    if let Err(e) = tokio::fs::remove_file(dest_path).await {
+                        warn!(
+                            "[download] failed to remove temp file {}: {e}",
+                            dest_path.display()
+                        );
+                    }
+                    return Err(DownloadError::BinaryTooLarge {
+                        size: expected_total,
+                        max: self.config.max_bytes,
+                    });
+                }
+            }
+
             // 200 with existing bytes → server doesn't support resume, restart
             let append = if status == reqwest::StatusCode::OK && downloaded > 0 {
                 info!("[download] server does not support resume, restarting");
-                std::fs::File::create(dest_path).map_err(DownloadError::Io)?;
+                tokio::fs::File::create(dest_path)
+                    .await
+                    .map_err(DownloadError::Io)?;
                 downloaded = 0;
                 false
             } else {
@@ -185,17 +238,13 @@ impl Downloader {
                         "[download] complete: url={}, bytes={}, attempt={}",
                         url, total_bytes, attempt
                     );
-                    last_err = None;
                     break;
                 }
                 Err(e) => {
-                    if e.is_retryable() && attempt < self.config.max_retries {
+                    if e.is_retryable() && attempt < max_attempts {
                         warn!("[download] attempt {} failed: {}, retrying...", attempt, e);
-                        last_err = Some(e);
-                        let backoff = Duration::from_secs(
-                            self.config.retry_backoff_base_secs * 2u64.pow(attempt as u32 - 1),
-                        );
-                        tokio::time::sleep(backoff).await;
+                        self.wait_before_retry(attempt, cancel_token, dest_path)
+                            .await?;
                         continue;
                     }
                     return Err(e);
@@ -204,7 +253,8 @@ impl Downloader {
         }
 
         // Final file size check
-        let file_size = std::fs::metadata(dest_path)
+        let file_size = tokio::fs::metadata(dest_path)
+            .await
             .map(|m| m.len())
             .map_err(DownloadError::Io)?;
 
@@ -217,19 +267,29 @@ impl Downloader {
 
         // SHA-256 verification
         if let Some(expected) = expected_sha256.filter(|s| !s.is_empty()) {
-            let actual = sha256_file(dest_path)?;
+            let hash_path = dest_path.to_path_buf();
+            let hash_task = tokio::task::spawn_blocking(move || sha256_file(&hash_path));
+            let actual = tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    self.cleanup_cancelled_download(dest_path).await;
+                    return Err(DownloadError::Cancelled);
+                }
+                result = hash_task => {
+                    result
+                        .map_err(|error| DownloadError::Http(format!("hash task failed: {error}")))??
+                }
+            };
             if actual != expected {
                 // Delete file on checksum mismatch
-                let _ = std::fs::remove_file(dest_path);
+                if let Err(e) = tokio::fs::remove_file(dest_path).await {
+                    warn!("[download] failed to remove temp file on checksum mismatch: {e}");
+                }
                 return Err(DownloadError::ChecksumMismatch {
                     expected: expected.to_string(),
                     actual,
                 });
             }
-        }
-
-        if let Some(err) = last_err {
-            return Err(err);
         }
 
         Ok(file_size)
@@ -245,13 +305,16 @@ impl Downloader {
         cancel_token: &CancellationToken,
     ) -> Result<u64, DownloadError> {
         let mut file = if append {
-            std::fs::OpenOptions::new()
+            tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(dest_path)
+                .await
                 .map_err(DownloadError::Io)?
         } else {
-            std::fs::File::create(dest_path).map_err(DownloadError::Io)?
+            tokio::fs::File::create(dest_path)
+                .await
+                .map_err(DownloadError::Io)?
         };
 
         let mut total = initial_offset;
@@ -259,18 +322,30 @@ impl Downloader {
 
         loop {
             tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    info!("[download] download cancelled");
+                    drop(file);
+                    if let Err(e) = tokio::fs::remove_file(dest_path).await {
+                        warn!("[download] failed to remove temp file on cancel: {e}");
+                    }
+                    return Err(DownloadError::Cancelled);
+                }
                 chunk = stream.next() => {
                     match chunk {
                         Some(Ok(bytes)) => {
                             total += bytes.len() as u64;
                             if total > self.config.max_bytes {
-                                let _ = std::fs::remove_file(dest_path);
+                                drop(file);
+                                if let Err(e) = tokio::fs::remove_file(dest_path).await {
+                                    warn!("[download] failed to remove temp file on size limit: {e}");
+                                }
                                 return Err(DownloadError::BinaryTooLarge {
                                     size: total,
                                     max: self.config.max_bytes,
                                 });
                             }
-                            file.write_all(&bytes).map_err(DownloadError::Io)?;
+                            file.write_all(&bytes).await.map_err(DownloadError::Io)?;
                         }
                         Some(Err(e)) => {
                             return Err(DownloadError::Http(format!("read body: {}", e)));
@@ -278,24 +353,21 @@ impl Downloader {
                         None => break, // Download complete
                     }
                 }
-                _ = cancel_token.cancelled() => {
-                    info!("[download] download cancelled");
-                    let _ = std::fs::remove_file(dest_path);
-                    return Err(DownloadError::Cancelled);
-                }
             }
         }
-        file.flush().map_err(DownloadError::Io)?;
+        file.flush().await.map_err(DownloadError::Io)?;
 
         Ok(total)
     }
 
-    /// Follow redirects manually, validating each target URL is http/https
+    /// Follow redirects manually, accepting absolute or relative HTTP(S) targets.
     async fn follow_redirects(
         &self,
         client: &reqwest::Client,
         mut response: reqwest::Response,
         max_redirects: usize,
+        request_timeout: Duration,
+        cancel_token: &CancellationToken,
     ) -> Result<reqwest::Response, DownloadError> {
         for _ in 0..max_redirects {
             if !response.status().is_redirection() {
@@ -306,22 +378,71 @@ impl Downloader {
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .ok_or(DownloadError::RedirectMissingLocation)?;
-            if !location.starts_with("http://") && !location.starts_with("https://") {
+            let next_url = response.url().join(location).map_err(|error| {
+                DownloadError::InvalidUrl(format!("invalid redirect URL {location}: {error}"))
+            })?;
+            if !matches!(next_url.scheme(), "http" | "https") {
                 return Err(DownloadError::InvalidUrl(format!(
                     "redirect to non-http scheme: {}",
-                    location
+                    next_url
                 )));
             }
-            response =
-                client.get(location).send().await.map_err(|e| {
-                    DownloadError::Http(format!("redirect GET {}: {}", location, e))
-                })?;
+            response = tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => return Err(DownloadError::Cancelled),
+                response = client.get(next_url.clone()).timeout(request_timeout).send() => {
+                    response.map_err(|e| DownloadError::Http(format!("redirect GET {next_url}: {e}")))?
+                }
+            };
         }
         if response.status().is_redirection() {
             return Err(DownloadError::TooManyRedirects(max_redirects));
         }
         Ok(response)
     }
+
+    async fn wait_before_retry(
+        &self,
+        attempt: usize,
+        cancel_token: &CancellationToken,
+        dest_path: &Path,
+    ) -> Result<(), DownloadError> {
+        let backoff = Duration::from_secs(
+            self.config.retry_backoff_base_secs * 2u64.pow((attempt as u32 - 1).min(30)),
+        );
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                self.cleanup_cancelled_download(dest_path).await;
+                Err(DownloadError::Cancelled)
+            }
+            () = tokio::time::sleep(backoff) => Ok(()),
+        }
+    }
+
+    async fn cleanup_cancelled_download(&self, dest_path: &Path) {
+        if let Err(error) = tokio::fs::remove_file(dest_path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %dest_path.display(), %error, "failed to remove cancelled download");
+        }
+    }
+}
+
+async fn initialize_http_client() -> Result<reqwest::Client, String> {
+    HTTP_CLIENT
+        .get_or_try_init(|| async {
+            tokio::task::spawn_blocking(|| {
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+            })
+            .await
+            .map_err(|error| format!("client builder task failed: {error}"))?
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .cloned()
 }
 
 /// Calculate SHA-256 hex digest of a file

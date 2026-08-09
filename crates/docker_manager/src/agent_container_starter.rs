@@ -42,7 +42,10 @@ impl<'a> AgentContainerStarter<'a> {
             isolation_type,
             tenant_id,
             space_id,
-            storage_size: _, // Docker 模式忽略 storage_size，仅 K8s 模式使用
+            // Docker 模式忽略 storage_size（仅 K8s 模式使用）；UserApp 专用字段
+            // （image_override/command/env/ports/...）由 DockerRuntime::create_deployment 处理，
+            // agent 路径一并忽略。
+            ..
         } = params;
 
         let start_phase = Instant::now();
@@ -76,32 +79,11 @@ impl<'a> AgentContainerStarter<'a> {
         // 3. 准备配置
         use crate::container_builder::ContainerConfigBuilder;
 
-        // 确定用于构建容器配置的主 ID
-        // 优先级：pod_id > user_id/project_id（根据 service_type）
-        let container_id: String = if let Some(ref pid) = pod_id {
-            // 共享容器场景：使用 pod_id
-            pid.clone()
-        } else {
-            // 非共享容器场景：根据 service_type 决定
-            match service_type {
-                ServiceType::ComputerAgentRunner => {
-                    // Computer Agent Runner 使用 user_id
-                    user_id.clone().ok_or_else(|| {
-                        DockerError::ConfigurationError(
-                            "user_id is required for ComputerAgentRunner".to_string(),
-                        )
-                    })?
-                }
-                ServiceType::WebAgentRunner => {
-                    // WebAgentRunner 使用 project_id
-                    project_id.clone().ok_or_else(|| {
-                        DockerError::ConfigurationError(
-                            "project_id is required for WebAgentRunner".to_string(),
-                        )
-                    })?
-                }
-            }
-        };
+        // 确定用于构建容器配置的主 ID（复用 ServiceType::container_identifier 单一事实源）
+        let container_id: String = service_type
+            .container_identifier(pod_id.as_deref(), user_id.as_deref(), project_id.as_deref())
+            .map_err(|e| DockerError::ConfigurationError(e.to_string()))?
+            .to_string();
 
         // 解析容器内工作目录路径
         let mut variables = std::collections::HashMap::new();
@@ -192,11 +174,12 @@ impl<'a> AgentContainerStarter<'a> {
             None => limits,
         };
 
-        builder = builder.resource_limits(crate::types::ResourceLimits {
-            memory_limit: final_resource_limits.memory_limit,
-            cpu_limit: final_resource_limits.cpu_limit,
-            swap_limit: final_resource_limits.swap_limit,
-        });
+        // final_resource_limits 已是 ServiceResourceLimits，直接传给 builder
+        // （Docker 只用 memory/cpu/swap，storage 字段随 struct 携带但 build_host_config 不读）
+        builder = builder.resource_limits(final_resource_limits);
+
+        // 透传服务级安全配置（仅 Docker 模式生效；None 时 build_host_config 走代码默认）
+        builder = builder.security(service_config.security.clone());
 
         // 添加环境变量
         // 处理其他环境变量中的模板（先处理，因为后续需要使用 project_id/user_id 的值）
@@ -228,6 +211,9 @@ impl<'a> AgentContainerStarter<'a> {
         if let Some(ref it) = isolation_type {
             builder = builder.env("ISOLATION_TYPE", it);
         }
+
+        // 部署模式标识: start-up.sh 据此 source extra (Docker Compose 下 /home/user 是 bind mount, 需修权限)
+        builder = builder.env("DEPLOY_MODE", "docker");
 
         // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配
 
@@ -330,9 +316,12 @@ impl<'a> AgentContainerStarter<'a> {
                                 std::path::PathBuf::from(&workspace_container),
                             )
                         }
-                        // RCoder: 一个 project_id 对应一个容器
+                        // RCoder/UserApp/UserAppBuilder: 一个 project_id/app_id 对应一个容器
                         // 挂载: 宿主机 /project_workspace/{project_id} → 容器 /project_workspace/{project_id}
-                        ServiceType::WebAgentRunner => {
+                        // (UserAppBuilder 在 K8s 走 per-app PVC 特判;Docker 模式复用此挂载)
+                        ServiceType::WebAgentRunner
+                        | ServiceType::UserApp
+                        | ServiceType::UserAppBuilder => {
                             let pid = project_id.as_deref().unwrap_or("default");
                             (
                                 pid.to_string(),
@@ -387,7 +376,10 @@ impl<'a> AgentContainerStarter<'a> {
         }
 
         // 🎯 处理配置文件中的挂载点 (service_config.mounts)
-        let container_name = format!("{}-{}", container_prefix, container_id);
+        // 容器名统一走 DockerUtils::generate_container_name（含合法性校验，与创建路径一致）
+        let container_name =
+            crate::utils::DockerUtils::generate_container_name(&container_prefix, &container_id)
+                .map_err(DockerError::ConfigurationError)?;
         let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
         let log_dir_name = format!("{}-{}", container_name, timestamp);
 

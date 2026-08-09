@@ -4,7 +4,7 @@
 //! 使用 `metrics` crate 作为 facade，`metrics-exporter-prometheus` 作为后端。
 
 use metrics::{
-    counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram, Unit,
+    Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;

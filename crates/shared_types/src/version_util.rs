@@ -61,14 +61,16 @@ pub fn parse_semver(version: &str) -> Option<Version> {
 
 /// 比较两个版本（semver 结构体比较）
 ///
-/// 两个版本都必须是合法的 semver 格式，否则 panic（Fail Fast）。
-/// 调用方应确保版本已经过校验。
-pub fn compare_versions(a: &str, b: &str) -> Ordering {
-    let a_ver = parse_semver(a)
-        .unwrap_or_else(|| panic!("compare_versions: invalid semver version: '{}'", a));
-    let b_ver = parse_semver(b)
-        .unwrap_or_else(|| panic!("compare_versions: invalid semver version: '{}'", b));
-    a_ver.cmp(&b_ver)
+/// 如果任一版本不是合法的 semver 格式，返回 `Err(VersionParseError)`。
+/// 调用方应处理错误，或使用 `unwrap_or(Ordering::Equal)` 做兜底。
+pub fn compare_versions(a: &str, b: &str) -> Result<Ordering, VersionParseError> {
+    let a_ver = parse_semver(a).ok_or_else(|| VersionParseError {
+        input: a.to_string(),
+    })?;
+    let b_ver = parse_semver(b).ok_or_else(|| VersionParseError {
+        input: b.to_string(),
+    })?;
+    Ok(a_ver.cmp(&b_ver))
 }
 
 // =============================================================================
@@ -146,9 +148,26 @@ impl PlatformKey {
     }
 
     /// 从当前运行环境构造
+    ///
+    /// 使用编译期 `cfg` 构造；不支持的目标在编译阶段 Fail Fast，而不是运行时 panic。
     pub fn current() -> Self {
-        Self::new(std::env::consts::OS, std::env::consts::ARCH)
-            .expect("current platform should always be valid")
+        #[cfg(target_os = "linux")]
+        let os = Os::Linux;
+        #[cfg(target_os = "macos")]
+        let os = Os::Darwin;
+        #[cfg(target_os = "windows")]
+        let os = Os::Windows;
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        compile_error!("unsupported target OS; expected linux, macos, or windows");
+
+        #[cfg(target_arch = "x86_64")]
+        let arch = Arch::X86_64;
+        #[cfg(target_arch = "aarch64")]
+        let arch = Arch::Arm64;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        compile_error!("unsupported target architecture; expected x86_64 or aarch64");
+
+        Self { os, arch }
     }
 
     /// 作为 HashMap key 使用的字符串（归一化形式）
@@ -193,7 +212,7 @@ impl std::error::Error for PlatformParseError {}
 ///
 /// 输入格式: "linux-x86_64", "darwin-arm64", "windows-amd64" 等
 /// 归一化: amd64 → x86_64, aarch64 → arm64, 大小写不敏感
-fn platform_key_parser(input: &mut &str) -> winnow::ModalResult<PlatformKey> {
+fn platform_key_parser(input: &mut &str) -> ModalResult<PlatformKey> {
     // 1. 解析 os 部分（纯字母，大小写不敏感）
     let os_raw: &str = alpha1.parse_next(input)?;
     let os_lower = os_raw.to_ascii_lowercase();
@@ -296,16 +315,23 @@ mod tests {
 
     #[test]
     fn compare_ordering() {
-        assert_eq!(compare_versions("1.0.0", "1.0.0"), Ordering::Equal);
-        assert_eq!(compare_versions("1.0.0", "1.0.1"), Ordering::Less);
-        assert_eq!(compare_versions("1.0.1", "1.0.0"), Ordering::Greater);
-        assert_eq!(compare_versions("v1.0.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.0", "1.0.0").unwrap(), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.0", "1.0.1").unwrap(), Ordering::Less);
+        assert_eq!(
+            compare_versions("1.0.1", "1.0.0").unwrap(),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("v1.0.0", "1.0.0").unwrap(),
+            Ordering::Equal
+        );
     }
 
     #[test]
-    #[should_panic(expected = "invalid semver version")]
-    fn compare_invalid_panics() {
-        compare_versions("invalid", "0.0.0");
+    fn compare_invalid_returns_err() {
+        assert!(compare_versions("invalid", "0.0.0").is_err());
+        assert!(compare_versions("1.0.0", "not-a-version").is_err());
+        assert!(compare_versions("", "").is_err());
     }
 
     // --- PlatformKey tests ---

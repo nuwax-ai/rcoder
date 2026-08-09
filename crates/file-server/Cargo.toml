@@ -1,0 +1,118 @@
+[package]
+name = "file-server"
+# 独立版本号：支持 file-server 单独打 tag (file-server-v*) 经 CI 发 npm/OSS，与 rcoder 主版本解耦。
+version = "0.1.1"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Rust file-server (tree/git/build/dev/upload/skills) — replaces nuwax-file-server, lives in rcoder pod"
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# 空 marker：不引 kube 依赖，仅用于
+# (a) 编译期 cfg 门控未来 file-server 内的 K8s 独有代码 (`#[cfg(feature = "kubernetes")]`);
+# (b) 让 `DeploymentMode::default()` 随构建变体自动切换 (嵌入 rcoder k8s 构建 → Kubernetes,
+#     独立/Electron 构建 → DockerCompose)。
+# 真正的 K8s API 调用仍在 rcoder 的 WorkspacePathResolver impl 侧，file-server 保持 kube-free。
+# 由 rcoder 的 `kubernetes` feature 转发开启；file-server 独立构建不带本 feature。
+kubernetes = []
+
+[lib]
+name = "file_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "file-server"
+path = "src/main.rs"
+
+[dependencies]
+# 共享类型 (WORKSPACE_ROOT / COMPUTER_WORKSPACE_ROOT 常量)
+shared_types = { workspace = true }
+process_utils = { workspace = true }
+
+# Web 框架
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+
+# 异步运行时
+tokio = { workspace = true, features = ["full"] }
+
+# 日志
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+
+# 序列化 (preserve_order: package.json round-trip 保序, 对齐 nuwax JSON.stringify)
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+
+# 校验 (声明式 #[derive(Validate)] + #[garde(...)], 与 shared_types/rcoder 一致)
+garde = { workspace = true, features = ["derive"] }
+
+# 错误处理
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# async trait (WorkspaceResolver trait async 化, 阶段2 SubvolumeWorkspaceResolver)
+async-trait = { workspace = true }
+
+# 时间 (错误响应 timestamp)
+chrono = { workspace = true }
+
+# 编码检测 / content-type 推断
+encoding_rs = { workspace = true }
+mime_guess = { workspace = true }
+
+# Base64 编码 (图片内联)
+base64 = { workspace = true }
+
+# URI component 百分号编解码（精确对齐 JavaScript encodeURIComponent 字符集）
+percent-encoding = { workspace = true }
+
+# 文件系统无关的词法路径规范化（消除手写 Component 归约）
+path-clean = { workspace = true }
+
+# Zip 解压/打包 (模板/upload/export/skills)
+zip = { workspace = true }
+
+# HTTP client (push-skills url fetch)
+reqwest = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+
+# Git (gix, 纯 Rust)
+gix = { workspace = true }
+
+# Unix 进程信号 (dev server 进程组 kill)
+nix = { workspace = true }
+
+# 正则 (构建错误解析)
+regex = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+
+# package.json 中 npm 版本范围解析（Vue 主版本检测）
+node-semver = { workspace = true }
+
+# 组合解析器 (hook shell 环境变量语法等小型文法)
+winnow = { workspace = true }
+# POSIX shell 字面量转义（HTTP Hook wrapper 参数）
+shlex = { workspace = true }
+
+# 安全临时文件/目录（Hook 配置原子替换与 staging 生命周期由 RAII 管理）
+tempfile = { workspace = true }
+
+# 异步流构造 (UserApp build 进度 SSE: async_stream::stream!)
+async-stream = { workspace = true }

@@ -186,6 +186,24 @@ async fn create_container_for_request(
         container_identifier, container_info.container_id, container_info.container_ip
     );
 
+    // lazy mv (双重保险): 覆盖"先调 rcoder (/pod/ensure / /pod/restart) 不经 file-server"场景。
+    // file-server ensure_and_resolve 也会做 (幂等: dst 非空跳过), 两者不冲突。
+    // 仅非共享容器 (pod_id=None, project-level); 共享容器保持共享 PVC。
+    if options.pod_id.is_none() {
+        // lazy_migrate 取 Arc<dyn WorkspaceRuntime> by-value; 用 method clone() 让 T 从 receiver 推导, 经 let 标注 upcast。
+        let ws_runtime: Arc<dyn container_runtime_api::WorkspaceRuntime> = options.runtime.clone();
+        crate::workspace_migrate::lazy_migrate(
+            ws_runtime,
+            "RCODER_WORKSPACE_PVC_NAME",
+            &["workspace"],
+            options.project_id,
+            options.service_type,
+            options.project_id,
+            false,
+        )
+        .await;
+    }
+
     Ok(container_info)
 }
 

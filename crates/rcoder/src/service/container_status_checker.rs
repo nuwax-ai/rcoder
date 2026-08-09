@@ -355,8 +355,11 @@ impl ContainerStatusChecker {
                     false
                 }
             }
-            shared_types::ServiceType::WebAgentRunner => {
-                // RCoder 模式：使用 project_id 查找容器
+            // UserAppBuilder 是 agent-runner(复用 dev-rcoder-agent-runner,有 gRPC),
+            // 复用 WebAgentRunner 的 project_id 查找路径
+            shared_types::ServiceType::WebAgentRunner
+            | shared_types::ServiceType::UserAppBuilder => {
+                // RCoder / UserAppBuilder 模式：使用 project_id(app_id)查找容器
                 match runtime
                     .find_container(container_info.project_id(), &service_type)
                     .await
@@ -369,6 +372,8 @@ impl ContainerStatusChecker {
                     }
                 }
             }
+            // UserApp 不参与 agent 健康检查（由 app_manager 独立管理），视为不存在
+            shared_types::ServiceType::UserApp => false,
         };
 
         if exists {
@@ -554,6 +559,7 @@ impl ContainerStatusChecker {
 pub fn start_container_status_checker(
     config: ContainerStatusCheckerConfig,
     state: Arc<AppState>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     info!(
         " [STATUS_CHECKER] Starting container status checker: interval={}s, failure_threshold={}, skip_duration={}s",
@@ -564,6 +570,7 @@ pub fn start_container_status_checker(
 
     let checker = Arc::new(ContainerStatusChecker::new(config.clone(), state));
 
+    let mut shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
         let mut interval = time::interval(config.check_interval);
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -572,18 +579,24 @@ pub fn start_container_status_checker(
         let cleanup_interval = 10; // 每 10 次检查清理一次健康状态
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    // 执行容器状态检查
+                    if let Err(e) = checker.check_all_containers().await {
+                        warn!(" [STATUS_CHECKER] Container status check failed: {}", e);
+                    }
 
-            // 执行容器状态检查
-            if let Err(e) = checker.check_all_containers().await {
-                warn!(" [STATUS_CHECKER] Container status check failed: {}", e);
-            }
-
-            // 定期清理过期的健康状态
-            cleanup_counter += 1;
-            if cleanup_counter >= cleanup_interval {
-                checker.cleanup_stale_health_states();
-                cleanup_counter = 0;
+                    // 定期清理过期的健康状态
+                    cleanup_counter += 1;
+                    if cleanup_counter >= cleanup_interval {
+                        checker.cleanup_stale_health_states();
+                        cleanup_counter = 0;
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!(" [STATUS_CHECKER] shutdown");
+                    break;
+                }
             }
         }
     })
@@ -612,7 +625,7 @@ async fn query_container_status(
 
     // 发送请求（带超时）
     let response =
-        tokio::time::timeout(config.query_timeout, client.get_container_status(request)).await??;
+        time::timeout(config.query_timeout, client.get_container_status(request)).await??;
 
     let status_response = response.into_inner();
 

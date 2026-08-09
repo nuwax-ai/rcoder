@@ -1,30 +1,35 @@
 //! Agent执行任务的SSE通知处理器
 //!
 //! 使用 Axum SSE 代理处理 SSE 消息，实现高效的 SSE 转发
+//!
+//! 模块组织：
+//! - utoipa 文档结构体（`ProgressEventDoc` / `SseErrorEvent`）见 [`super::docs`]
+//! - SSE 流构建（`SseStreamParams` / `build_sse_stream_from_container_name`）见 [`super::sse_builder`]
+//! - 本文件保留 2 个 handler 入口、会话校验与错误映射
 
-#![allow(dead_code)]
-
+use super::sse_builder::{SseStreamParams, build_sse_stream_from_container_name};
 use super::utils::{I18nPath, container_identity_from_name};
-use crate::{AppError, HttpResult};
+use crate::HttpResult;
 use axum::{
     extract::State,
     http::StatusCode,
     response::{
         Response,
-        sse::{Event, KeepAlive, Sse},
+        sse::{Event, Sse},
     },
 };
-use futures_util::{StreamExt, stream::Stream};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use futures_util::stream::Stream;
+use serde::Deserialize;
 use shared_types::ProjectAndContainerInfo;
-use std::{convert::Infallible, sync::Arc, time::Duration};
-use tokio_stream::wrappers::ReceiverStream;
+use std::{convert::Infallible, sync::Arc};
 use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 /// 会话通知路径参数
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
+// pod_id/tenant_id/space_id/isolation_type 是 API 契约预留参数（前端可传，
+// 当前服务端未消费），不可删除，故显式压制 dead_code 警告
+#[allow(dead_code)]
 pub struct SessionNotificationParams {
     /// 会话ID，用于标识特定的会话连接
     #[param(example = "session456")]
@@ -59,360 +64,6 @@ pub struct SessionNotificationParams {
     pub last_seq: Option<u64>,
 }
 
-/// SSE 进度事件（用于 OpenAPI 文档）
-///
-/// 这是通过 SSE 流推送的实际事件结构，遵循标准 SSE 格式。
-/// SSE 的 `data` 字段使用 `UnifiedSessionMessage` 结构体，包含完整的会话上下文信息：
-///
-/// ```text
-/// event: agent_message_chunk
-/// data: {"session_id":"session456","message_type":"AgentSessionUpdate","sub_type":"agent_message_chunk","data":{"content":{"type":"text","text":"Hello"},"index":0},"timestamp":"2024-12-16T10:30:00Z"}
-///
-/// event: tool_call
-/// data: {"session_id":"session456","message_type":"AgentSessionUpdate","sub_type":"tool_call","data":{"tool_name":"read_file","tool_input":{"path":"test.rs"},"status":"started"},"timestamp":"2024-12-16T10:30:01Z"}
-///
-/// event: end_turn
-/// data: {"session_id":"session456","message_type":"AgentSessionUpdate","sub_type":"end_turn","data":{"reason":"EndTurn","description":"正常结束"},"timestamp":"2024-12-16T10:30:05Z"}
-/// ```
-///
-/// ---
-///
-/// ## 📝 重要说明
-///
-/// | 项目 | 说明 |
-/// |------|------|
-/// | **结构体用途** | 用于 OpenAPI 文档展示，描述 gRPC `ProgressEvent` 的完整信息 |
-/// | **实际 SSE 格式** | 只有 `event` (= `sub_type`) 和 `data` (= `payload`) 两个字段 |
-/// | **payload 类型** | 文档中为 `Value`（便于展示），实际传输为 JSON 字符串 |
-/// | **元数据传输** | `message_type`, `request_id`, `timestamp` 在 gRPC 层传输，不直接出现在 SSE 流中 |
-/// | **前端接收** | 使用 `EventSource`，通过 `event.type` 和 `event.data` 获取数据 |
-///
-/// ---
-///
-/// ## 🔄 数据流转换链路
-///
-/// ```text
-/// [agent_runner]                    [rcoder]                      [前端]
-/// UnifiedSessionMessage  ──gRPC──>  ProgressEvent  ──SSE──>  EventSource
-///      │                                 │                        │
-///      ├─ session_id ────────────────────┼────────> URL 路径传递   │
-///      ├─ message_type ──────────────────┼────────> (gRPC 元数据)  │
-///      ├─ sub_type ──────────────────────┼────────> event 字段 ───┤
-///      ├─ data ──────────> payload ──────┼────────> data 字段 ────┤
-///      ├─ timestamp ─────────────────────┼────────> (gRPC 元数据)  │
-///      └─ request_id (在 data 中) ───────┴────────> (在 payload 中)│
-/// ```
-///
-/// ---
-///
-/// ## 📊 message_type 与 sub_type 对应关系
-///
-/// | message_type | sub_type | 说明 |
-/// |--------------|----------|------|
-/// | `SessionPromptStart` | `prompt_start` | 用户发起对话，Agent 开始处理 |
-/// | `SessionPromptEnd` | `end_turn` | Agent 正常完成任务 |
-/// | `SessionPromptEnd` | `max_tokens` | 达到最大 token 数限制 |
-/// | `SessionPromptEnd` | `max_turn_requests` | 达到最大请求数限制 |
-/// | `SessionPromptEnd` | `refusal` | Agent 拒绝继续执行 |
-/// | `SessionPromptEnd` | `cancelled` | 用户取消任务 |
-/// | `SessionPromptEnd` | `error` | 执行过程中发生错误 |
-/// | `AgentSessionUpdate` | `agent_message_chunk` | AI 响应文本片段 |
-/// | `AgentSessionUpdate` | `agent_thought_chunk` | AI 思考过程片段 |
-/// | `AgentSessionUpdate` | `user_message_chunk` | 用户消息片段 |
-/// | `AgentSessionUpdate` | `tool_call` | 工具调用开始 |
-/// | `AgentSessionUpdate` | `tool_call_update` | 工具调用状态更新 |
-/// | `AgentSessionUpdate` | `plan` | 执行计划更新 |
-/// | `AgentSessionUpdate` | `available_commands_update` | 可用命令列表更新 |
-/// | `AgentSessionUpdate` | `current_mode_update` | 当前模式更新 |
-/// | `Heartbeat` | `ping` | 心跳保活消息 |
-///
-/// ## 📦 完整 SSE 消息示例
-///
-/// ```json
-/// {
-///   "sessionId": "019b262c-e6d2-75d8-a374-2aa08bd93afd",
-///   "messageType": "agentSessionUpdate",
-///   "subType": "agent_message_chunk",
-///   "data": {
-///     "content": {"text": "你好，我来帮你...", "type": "text"},
-///     "request_id": "d633d7b0ba9d4505ae6d87a5b274c580"
-///   },
-///   "timestamp": "2025-12-16T08:00:39.766Z"
-/// }
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ProgressEventDoc {
-    /// 会话ID
-    ///
-    /// 与 URL 路径中的 `session_id` 参数一致，用于标识当前会话。
-    #[schema(example = "019b262c-e6d2-75d8-a374-2aa08bd93afd")]
-    pub session_id: String,
-
-    /// 消息主类型
-    ///
-    /// 用于区分消息的生命周期阶段，便于前端进行状态管理。
-    ///
-    /// ## 可能的值
-    ///
-    /// | 值 | 说明 | 对应 subType |
-    /// |----|------|--------------|
-    /// | `sessionPromptStart` | 会话开始，Agent 开始处理用户请求 | `prompt_start` |
-    /// | `sessionPromptEnd` | 会话结束，Agent 完成或终止处理 | `end_turn`, `max_tokens`, `cancelled`, `error` 等 |
-    /// | `agentSessionUpdate` | 执行过程中的实时更新 | `agent_message_chunk`, `tool_call`, `plan` 等 |
-    /// | `heartbeat` | 心跳消息，用于保持 SSE 连接 | `ping` |
-    ///
-    /// ## 前端状态机示例
-    ///
-    /// ```javascript
-    /// eventSource.addEventListener('agent_message_chunk', (event) => {
-    ///   const msg = JSON.parse(event.data);
-    ///   switch (msg.messageType) {
-    ///     case 'sessionPromptStart':
-    ///       setStatus('processing');
-    ///       break;
-    ///     case 'agentSessionUpdate':
-    ///       handleUpdate(msg.subType, msg.data);
-    ///       break;
-    ///     case 'sessionPromptEnd':
-    ///       setStatus('completed');
-    ///       break;
-    ///     case 'heartbeat':
-    ///       // 忽略或更新最后活跃时间
-    ///       break;
-    ///   }
-    /// });
-    /// ```
-    #[schema(example = "agentSessionUpdate")]
-    pub message_type: String,
-
-    /// 消息子类型（作为 SSE 的 event 字段）
-    ///
-    /// 这是 SSE 事件的核心标识，前端应根据此字段决定如何处理 `data`。
-    ///
-    /// ## 完整的 subType 列表
-    ///
-    /// ### 会话生命周期事件
-    /// | subType | messageType | 说明 |
-    /// |---------|-------------|------|
-    /// | `prompt_start` | sessionPromptStart | 会话开始 |
-    /// | `end_turn` | sessionPromptEnd | 正常结束 |
-    /// | `max_tokens` | sessionPromptEnd | token 限制 |
-    /// | `max_turn_requests` | sessionPromptEnd | 请求数限制 |
-    /// | `refusal` | sessionPromptEnd | Agent 拒绝 |
-    /// | `cancelled` | sessionPromptEnd | 用户取消 |
-    /// | `error` | sessionPromptEnd | 执行错误 |
-    ///
-    /// ### Agent 执行过程事件
-    /// | subType | 说明 | 典型用途 |
-    /// |---------|------|----------|
-    /// | `agent_message_chunk` | AI 响应文本片段 | 流式显示 AI 回复 |
-    /// | `agent_thought_chunk` | AI 思考过程片段 | 显示推理过程（可折叠） |
-    /// | `user_message_chunk` | 用户消息片段 | 回显用户输入 |
-    /// | `tool_call` | 工具调用开始 | 显示正在执行的操作 |
-    /// | `tool_call_update` | 工具调用状态更新 | 显示工具执行结果 |
-    /// | `plan` | 执行计划 | 显示任务分解步骤 |
-    /// | `available_commands_update` | 可用命令更新 | 更新交互按钮 |
-    /// | `current_mode_update` | 模式更新 | 显示当前工作模式 |
-    ///
-    /// ### 系统事件
-    /// | subType | 说明 |
-    /// |---------|------|
-    /// | `ping` | 心跳保活 |
-    ///
-    /// ## 前端监听示例
-    ///
-    /// ```javascript
-    /// const eventSource = new EventSource('/agent/progress/session_123');
-    ///
-    /// // 监听特定事件
-    /// eventSource.addEventListener('agent_message_chunk', handleChunk);
-    /// eventSource.addEventListener('tool_call', handleToolCall);
-    /// eventSource.addEventListener('end_turn', handleComplete);
-    /// ```
-    #[schema(example = "agent_message_chunk")]
-    pub sub_type: String,
-
-    /// ACP 消息的完整 JSON 载荷
-    ///
-    /// 这是一个 JSON 对象，包含完整的 ACP (Agent Client Protocol) 消息数据。
-    /// 具体结构取决于 `subType`，前端应根据 `subType` 解析此 JSON。
-    ///
-    /// ---
-    ///
-    /// ## 📋 各 subType 对应的 data 结构
-    ///
-    /// ### 1. `prompt_start` - 会话开始
-    /// ```json
-    /// {
-    ///   "request_id": "req_123"  // 可选
-    /// }
-    /// ```
-    ///
-    /// ### 2. `end_turn` / `max_tokens` / `cancelled` 等 - 会话结束
-    /// ```json
-    /// {
-    ///   "reason": "EndTurn",           // 停止原因枚举值
-    ///   "description": "正常结束",      // 人类可读的描述
-    ///   "error_message": "...",        // 可选，错误时才有
-    ///   "request_id": "req_123"        // 可选
-    /// }
-    /// ```
-    /// **reason 可能的值**: `EndTurn`, `MaxTokens`, `MaxTurnRequests`, `Refusal`, `Cancelled`
-    ///
-    /// ### 3. `error` - 执行错误
-    /// ```json
-    /// {
-    ///   "code": -1,                    // 错误代码
-    ///   "message": "执行失败: ...",     // 错误消息
-    ///   "request_id": "req_123"        // 可选
-    /// }
-    /// ```
-    ///
-    /// ### 4. `ping` - 心跳消息
-    /// ```json
-    /// {
-    ///   "type": "heartbeat",
-    ///   "message": "keep-alive",
-    ///   "timestamp": "2024-01-01T00:00:00Z"
-    /// }
-    /// ```
-    ///
-    /// ### 5. `agent_message_chunk` - AI 响应文本片段
-    /// ```json
-    /// {
-    ///   "content": {
-    ///     "type": "text",              // 内容类型
-    ///     "text": "你好，我来帮你..."   // 文本内容
-    ///   },
-    ///   "request_id": "req_123"        // 可选
-    /// }
-    /// ```
-    ///
-    /// ### 6. `agent_thought_chunk` - AI 思考过程片段
-    /// ```json
-    /// {
-    ///   "content": {
-    ///     "type": "thinking",
-    ///     "thinking": "正在分析用户的请求..."
-    ///   },
-    ///   "request_id": "req_123"        // 可选
-    /// }
-    /// ```
-    ///
-    /// ### 7. `tool_call` - 工具调用
-    /// ```json
-    /// {
-    ///   "tool_use_id": "tool_123",     // 工具调用 ID
-    ///   "tool_name": "read_file",      // 工具名称
-    ///   "tool_input": {                // 工具输入参数
-    ///     "path": "src/main.rs"
-    ///   },
-    ///   "request_id": "req_123"        // 可选
-    /// }
-    /// ```
-    ///
-    /// ### 8. `tool_call_update` - 工具调用状态更新
-    /// ```json
-    /// {
-    ///   "tool_use_id": "tool_123",     // 工具调用 ID
-    ///   "status": "running",           // 状态: running, success, error
-    ///   "output": "...",               // 可选，工具输出
-    ///   "error": "...",                // 可选，错误信息
-    ///   "request_id": "req_123"        // 可选
-    /// }
-    /// ```
-    ///
-    /// ### 9. `plan` - 执行计划
-    /// ```json
-    /// {
-    ///   "steps": [                     // 计划步骤列表
-    ///     {"description": "分析代码结构", "status": "completed"},
-    ///     {"description": "修改文件", "status": "in_progress"},
-    ///     {"description": "运行测试", "status": "pending"}
-    ///   ],
-    ///   "request_id": "req_123"        // 可选
-    /// }
-    /// ```
-    ///
-    /// ### 10. `available_commands_update` - 可用命令更新
-    /// ```json
-    /// {
-    ///   "available_commands": ["yes", "no", "explain"],
-    ///   "request_id": "req_123"        // 可选
-    /// }
-    /// ```
-    ///
-    /// ### 11. `current_mode_update` - 当前模式更新
-    /// ```json
-    /// {
-    ///   "current_mode_id": "code_review",
-    ///   "request_id": "req_123"        // 可选
-    /// }
-    /// ```
-    #[schema(
-        example = json!({
-            "content": {
-                "type": "text",
-                "text": "正在分析您的请求..."
-            },
-            "request_id": "req_123"
-        })
-    )]
-    pub data: serde_json::Value,
-
-    /// 事件时间戳（ISO 8601 格式）
-    ///
-    /// ## 格式
-    ///
-    /// - **类型**: ISO 8601 字符串
-    /// - **时区**: UTC（以 `Z` 结尾）
-    /// - **精度**: 毫秒
-    ///
-    /// ## 用途
-    ///
-    /// - **事件排序**: 确保事件按正确的时间顺序处理
-    /// - **延迟计算**: 前端可计算网络延迟
-    /// - **超时检测**: 检测是否有事件丢失或延迟过大
-    /// - **日志记录**: 记录精确的事件发生时间
-    ///
-    /// ## 前端使用示例
-    ///
-    /// ```javascript
-    /// eventSource.addEventListener('agent_message_chunk', (event) => {
-    ///   const msg = JSON.parse(event.data);
-    ///
-    ///   // 直接解析 ISO 8601 字符串
-    ///   const eventTime = new Date(msg.timestamp);
-    ///
-    ///   // 计算网络延迟
-    ///   const latency = Date.now() - eventTime.getTime();
-    ///   console.log(`事件延迟: ${latency}ms`);
-    ///
-    ///   // 格式化显示
-    ///   const timeStr = eventTime.toLocaleTimeString();
-    /// });
-    /// ```
-    ///
-    /// ## 注意事项
-    ///
-    /// - 时间戳在 `agent_runner` 端生成，反映事件的实际发生时间
-    /// - 由于网络传输，前端收到事件时可能有几十到几百毫秒的延迟
-    #[schema(example = "2025-12-16T08:00:39.766Z")]
-    pub timestamp: String,
-}
-
-/// SSE 错误事件（用于 OpenAPI 文档）
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SseErrorEvent {
-    /// 错误代码
-    #[schema(example = "GRPC_CONNECTION_ERROR")]
-    pub code: String,
-    /// 错误消息
-    #[schema(example = "无法连接到 Agent 服务")]
-    pub message: String,
-}
-
 /// 核心验证函数：验证会话并获取容器名称
 ///
 /// 这个函数被 SSE 通知处理器使用
@@ -429,27 +80,7 @@ async fn validate_and_get_session_context(
     // ========== 阶段 1: 获取项目信息（所有分支都需要） ==========
     // 🔧 优化：提前获取 project_info，避免后续重复查询
     // 同时获取 DockerManager（用于容器验证和降级查询）
-    let project_info = match state.get_by_session(session_id) {
-        Some(info) => {
-            debug!(
-                " [SSE_PROXY] Getting project info from memory: session_id={}, project_id={}",
-                session_id,
-                info.project_id()
-            );
-            info
-        }
-        None => {
-            error!(
-                " [SSE_PROXY] Project info for session not found: session_id={}",
-                session_id
-            );
-            return Err(create_error_response(
-                StatusCode::NOT_FOUND,
-                "SESSION_NOT_FOUND",
-                "Session does not exist or has expired. Please submit a new request.",
-            ));
-        }
-    };
+    let project_info = lookup_project_info_by_session(&state, session_id)?;
 
     let runtime = state.runtime().clone();
 
@@ -464,178 +95,13 @@ async fn validate_and_get_session_context(
             );
             name
         }
-        None => {
-            // 🔄 存储 中没有记录，触发降级查询
-            // 可能原因：
-            // 1. 新 session 尚未写入 存储（正常情况）
-            // 2. 测试环境脏数据
-            // 3. 容器重建后 存储 未更新
-            info!(
-                " [SSE_PROXY] session_id record not found in storage, executing fallback query: session_id={}, project_id={}",
-                session_id,
-                project_info.project_id()
-            );
-
-            // 根据 service_type 选择不同的查询策略
-
-            match project_info.service_type() {
-                Some(shared_types::ServiceType::ComputerAgentRunner) => {
-                    // ComputerAgentRunner 模式：通过 user_id 查询容器
-                    if let Some(user_id) = project_info.user_id() {
-                        match runtime
-                            .get_container_info_by_identifier(
-                                user_id,
-                                &shared_types::ServiceType::ComputerAgentRunner,
-                            )
-                            .await
-                        {
-                            Ok(Some(info)) => {
-                                info!(
-                                    " [SSE_PROXY] Fallback query succeeded: getting container via user_id in real-time: user_id={}, container_name={}",
-                                    user_id, info.container_name
-                                );
-                                info.container_name
-                            }
-                            Ok(None) => {
-                                error!(
-                                    "[SSE_PROXY] Fallback query failed: container not found: user_id={}",
-                                    user_id
-                                );
-                                return Err(create_error_response(
-                                    StatusCode::NOT_FOUND,
-                                    "CONTAINER_NOT_FOUND",
-                                    &format!("container not found: user_id={}", user_id),
-                                ));
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[SSE_PROXY] Fallback query failed: failed to query container: {}",
-                                    e
-                                );
-                                return Err(create_error_response(
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "CONTAINER_ERROR",
-                                    &format!("Failed to query container: {}", e),
-                                ));
-                            }
-                        }
-                    } else {
-                        error!(
-                            "[SSE_PROXY] Missing user_id in ComputerAgentRunner mode: session_id={}",
-                            session_id
-                        );
-                        return Err(create_error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "INVALID_DATA",
-                            "Project missing user identifier",
-                        ));
-                    }
-                }
-                _ => {
-                    // RCoder 模式：从 project_info 获取容器名称，或使用 project_id 作为容器名称
-                    //
-                    // ⚠️ 注意：project_info 从 存储 读取，可能包含部分过时数据
-                    // - container_name: 稳定不变（容器重建后仍有效）
-                    // - container_id, container_ip: 可能过时（容器重建后会变化）
-                    //
-                    // 阶段 3 会验证容器的真实存在性（通过内存信息或 Docker API）
-                    // 因此即使 project_info.container_info() 为 None，也可以继续执行
-                    match project_info.container_info() {
-                        Some(container) => {
-                            info!(
-                                " [SSE_PROXY] Fallback query succeeded: got container name from project_info: container_name={}",
-                                container.container_name
-                            );
-                            container.container_name.clone()
-                        }
-                        None => {
-                            // project_info 中没有容器信息，使用 project_id 作为容器名称
-                            // 这通常发生在容器刚创建但尚未写入 存储 的情况
-                            // 阶段 3 会通过 Docker API 验证容器是否存在
-                            warn!(
-                                " [SSE_PROXY] No container info in project_info, using project_id as container name: project_id={}",
-                                project_info.project_id()
-                            );
-                            project_info.project_id().to_string()
-                        }
-                    }
-                }
-            }
-        }
+        None => resolve_container_name_fallback(&project_info, &runtime, session_id).await?,
     };
 
     // ========== 阶段 3: 优先使用内存中的容器信息，避免不必要的 Docker API 调用 ==========
-
-    // 🎯 优化策略：
-    // 1. 首先检查内存中的 project_info.container_info() 是否已存在
-    // 2. 如果存在 → 使用内存中的 container_name（它是最新的），跳过 Docker API 调用
-    // 3. 如果不存在 → 调用 find_container_realtime 作为降级方案
-    // 4. 后续会通过 gRPC GetStatus 进行最终健康检查
-    if let Some(container) = project_info.container_info() {
-        info!(
-            " [SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
-            container.container_name, container.container_ip
-        );
-        // 🎯 关键修复：使用内存中的 container_name（它是最新的）
-        // storage 中的 container_name 可能对应旧容器（如 user container）
-        // 内存中的 container_name 对应当前活跃的容器（如 project container）
-        container_name = container.container_name.clone();
-    } else {
-        // 内存中没有容器信息，调用 Docker API 实时查询
-        warn!(
-            " [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
-            container_name
-        );
-        let computer_prefix = &state.container_prefix_computer;
-        let rcoder_prefix = &state.container_prefix_rcoder;
-        let query = if let Some((id, service_type)) =
-            container_identity_from_name(&container_name, rcoder_prefix, computer_prefix)
-        {
-            runtime.find_container(id, &service_type).await
-        } else {
-            runtime
-                .find_container(
-                    project_info.project_id(),
-                    &shared_types::ServiceType::WebAgentRunner,
-                )
-                .await
-        };
-        match query {
-            Ok(Some(result)) => {
-                if result.status == container_runtime_api::ContainerRuntimeStatus::Running {
-                    info!(
-                        " [SSE_PROXY] Runtime query successful, container is running: container_name={}",
-                        container_name
-                    );
-                } else {
-                    return Err(create_error_response(
-                        StatusCode::NOT_FOUND,
-                        "SESSION_EXPIRED",
-                        "Session has been cleaned up due to inactivity. Please submit a new request.",
-                    ));
-                }
-            }
-            Ok(None) => {
-                error!(
-                    " [SSE_PROXY] Container does not exist: container_name={}",
-                    container_name
-                );
-                return Err(create_error_response(
-                    StatusCode::NOT_FOUND,
-                    "SESSION_EXPIRED",
-                    "Container not found. Please submit a new request.",
-                ));
-            }
-            Err(e) => {
-                error!(" [SSE_PROXY] Runtime query failed: {}", e);
-                return Err(create_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
-                    "Error checking session status. Please retry later.",
-                ));
-            }
-        }
-    }
+    container_name =
+        verify_container_with_memory_preference(&state, &runtime, &project_info, container_name)
+            .await?;
 
     // ========== 阶段 4: 返回验证通过的上下文 ==========
 
@@ -657,87 +123,223 @@ async fn validate_and_get_session_context(
     Ok((project_id, container_name, container_ip))
 }
 
-/// 创建 SSE 响应流
-///
-/// SSE 流构建参数
-///
-/// 封装了构建 gRPC SSE 流所需的所有参数，
-/// 避免函数参数过多，同时支持不同场景的扩展。
-struct SseStreamParams {
-    /// 容器名称
-    container_name: String,
-    /// 容器 IP（Docker 环境使用）
-    container_ip: String,
-    /// 会话 ID
-    session_id: String,
-    /// 项目 ID
-    project_id: String,
-    /// gRPC 连接池
-    grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
-    /// 语言设置
-    locale: &'static str,
-    /// 服务类型（用于日志区分不同类型的 Agent）
-    service_type: shared_types::ServiceType,
-    /// 活动更新器
-    activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
-    /// K8s namespace
-    namespace: String,
-    /// K8s 集群域名
-    cluster_domain: String,
-    /// Session 共享流注册表（每 session 一条 agent_runner 流，多 SSE 客户端 fan-out 共享）
-    registry: Arc<crate::grpc::SessionStreamRegistry>,
-    /// 客户端消费游标（从 Last-Event-ID header 或 ?last_seq= query 读取），
-    /// 用于增量补齐；缺省 0 = 补齐该 session 全量历史（首次连接合理，重连应由前端带 last_seq）。
-    last_seq: u64,
+/// 阶段 1：按 session_id 查找项目信息
+#[allow(clippy::result_large_err)]
+fn lookup_project_info_by_session(
+    state: &Arc<crate::router::AppState>,
+    session_id: &str,
+) -> Result<Arc<ProjectAndContainerInfo>, Response> {
+    match state.get_by_session(session_id) {
+        Some(info) => {
+            debug!(
+                " [SSE_PROXY] Getting project info from memory: session_id={}, project_id={}",
+                session_id,
+                info.project_id()
+            );
+            Ok(info)
+        }
+        None => {
+            error!(
+                " [SSE_PROXY] Project info for session not found: session_id={}",
+                session_id
+            );
+            Err(create_error_response(
+                StatusCode::NOT_FOUND,
+                "SESSION_NOT_FOUND",
+                "Session does not exist or has expired. Please submit a new request.",
+            ))
+        }
+    }
 }
 
-/// 这个函数被 agent_session_notification 和 computer_agent_progress_notification 共同使用
-/// 通过 container_name 创建 gRPC SSE 流
-async fn build_sse_stream_from_container_name(
-    params: SseStreamParams,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
-    // 根据运行环境选择 gRPC 地址
-    // - K8s 环境：使用 K8s Service FQDN（利用服务发现和负载均衡）
-    // - Docker 环境：使用容器 IP（直接连接）
-    let grpc_addr = if shared_types::is_kubernetes_runtime() {
-        let svc_fqdn = super::utils::build_k8s_service_fqdn(
-            &params.container_name,
-            &params.namespace,
-            &params.cluster_domain,
-        );
-        debug!("📡 [SSE] Using K8s Service FQDN for gRPC: {}", svc_fqdn);
-        format!("{}:{}", svc_fqdn, shared_types::GRPC_DEFAULT_PORT)
-    } else {
-        let addr = format!(
-            "{}:{}",
-            params.container_ip,
-            shared_types::GRPC_DEFAULT_PORT
-        );
-        debug!("📡 [SSE] Using container IP for gRPC: {}", addr);
-        addr
-    };
+/// 阶段 2 降级：存储中没有 container_name 记录时的实时查询
+///
+/// 可能原因：
+/// 1. 新 session 尚未写入 存储（正常情况）
+/// 2. 测试环境脏数据
+/// 3. 容器重建后 存储 未更新
+async fn resolve_container_name_fallback(
+    project_info: &Arc<ProjectAndContainerInfo>,
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
+    session_id: &str,
+) -> Result<String, Response> {
     info!(
-        " [gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
-        params.service_type, grpc_addr, params.project_id
+        " [SSE_PROXY] session_id record not found in storage, executing fallback query: session_id={}, project_id={}",
+        session_id,
+        project_info.project_id()
     );
 
-    // 创建 gRPC SSE 流
-    let stream = crate::grpc::create_grpc_sse_stream(
-        params.registry.clone(),
-        grpc_addr,
-        params.session_id.clone(),
-        params.grpc_pool.clone(),
-        params.locale,
-        params.activity_updater,
-        params.last_seq,
-    )
-    .await;
+    // 根据 service_type 选择不同的查询策略
+    match project_info.service_type() {
+        Some(shared_types::ServiceType::ComputerAgentRunner) => {
+            // ComputerAgentRunner 模式：通过 user_id 查询容器
+            resolve_container_name_by_user_id(project_info, runtime, session_id).await
+        }
+        _ => {
+            // RCoder 模式：从 project_info 获取容器名称，或使用 project_id 作为容器名称
+            //
+            // ⚠️ 注意：project_info 从 存储 读取，可能包含部分过时数据
+            // - container_name: 稳定不变（容器重建后仍有效）
+            // - container_id, container_ip: 可能过时（容器重建后会变化）
+            //
+            // 阶段 3 会验证容器的真实存在性（通过内存信息或 Docker API）
+            // 因此即使 project_info.container_info() 为 None，也可以继续执行
+            match project_info.container_info() {
+                Some(container) => {
+                    info!(
+                        " [SSE_PROXY] Fallback query succeeded: got container name from project_info: container_name={}",
+                        container.container_name
+                    );
+                    Ok(container.container_name.clone())
+                }
+                None => {
+                    // project_info 中没有容器信息，使用 project_id 作为容器名称
+                    // 这通常发生在容器刚创建但尚未写入 存储 的情况
+                    // 阶段 3 会通过 Docker API 验证容器是否存在
+                    warn!(
+                        " [SSE_PROXY] No container info in project_info, using project_id as container name: project_id={}",
+                        project_info.project_id()
+                    );
+                    Ok(project_info.project_id().to_string())
+                }
+            }
+        }
+    }
+}
 
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+/// ComputerAgentRunner 模式降级：通过 user_id 实时查询容器
+async fn resolve_container_name_by_user_id(
+    project_info: &Arc<ProjectAndContainerInfo>,
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
+    session_id: &str,
+) -> Result<String, Response> {
+    let Some(user_id) = project_info.user_id() else {
+        error!(
+            "[SSE_PROXY] Missing user_id in ComputerAgentRunner mode: session_id={}",
+            session_id
+        );
+        return Err(create_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INVALID_DATA",
+            "Project missing user identifier",
+        ));
+    };
+
+    match runtime
+        .get_container_info_by_identifier(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+        .await
+    {
+        Ok(Some(info)) => {
+            info!(
+                " [SSE_PROXY] Fallback query succeeded: getting container via user_id in real-time: user_id={}, container_name={}",
+                user_id, info.container_name
+            );
+            Ok(info.container_name)
+        }
+        Ok(None) => {
+            error!(
+                "[SSE_PROXY] Fallback query failed: container not found: user_id={}",
+                user_id
+            );
+            Err(create_error_response(
+                StatusCode::NOT_FOUND,
+                "CONTAINER_NOT_FOUND",
+                &format!("container not found: user_id={}", user_id),
+            ))
+        }
+        Err(e) => {
+            error!(
+                "[SSE_PROXY] Fallback query failed: failed to query container: {}",
+                e
+            );
+            Err(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CONTAINER_ERROR",
+                &format!("Failed to query container: {}", e),
+            ))
+        }
+    }
+}
+
+/// 阶段 3：优先使用内存中的容器信息，避免不必要的 Docker API 调用
+///
+/// 🎯 优化策略：
+/// 1. 首先检查内存中的 project_info.container_info() 是否已存在
+/// 2. 如果存在 → 使用内存中的 container_name（它是最新的），跳过 Docker API 调用
+/// 3. 如果不存在 → 调用 runtime 实时查询 作为降级方案
+/// 4. 后续会通过 gRPC GetStatus 进行最终健康检查
+async fn verify_container_with_memory_preference(
+    state: &Arc<crate::router::AppState>,
+    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
+    project_info: &Arc<ProjectAndContainerInfo>,
+    container_name: String,
+) -> Result<String, Response> {
+    if let Some(container) = project_info.container_info() {
+        info!(
+            " [SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
+            container.container_name, container.container_ip
+        );
+        // 🎯 关键修复：使用内存中的 container_name（它是最新的）
+        // storage 中的 container_name 可能对应旧容器（如 user container）
+        // 内存中的 container_name 对应当前活跃的容器（如 project container）
+        return Ok(container.container_name.clone());
+    }
+
+    // 内存中没有容器信息，调用 Docker API 实时查询
+    warn!(
+        " [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
+        container_name
+    );
+    let computer_prefix = &state.container_prefix_computer;
+    let rcoder_prefix = &state.container_prefix_rcoder;
+    let query = if let Some((id, service_type)) =
+        container_identity_from_name(&container_name, rcoder_prefix, computer_prefix)
+    {
+        runtime.find_container(id, &service_type).await
+    } else {
+        runtime
+            .find_container(
+                project_info.project_id(),
+                &shared_types::ServiceType::WebAgentRunner,
+            )
+            .await
+    };
+    match query {
+        Ok(Some(result)) => {
+            if result.status == container_runtime_api::ContainerRuntimeStatus::Running {
+                info!(
+                    " [SSE_PROXY] Runtime query successful, container is running: container_name={}",
+                    container_name
+                );
+                Ok(container_name)
+            } else {
+                Err(create_error_response(
+                    StatusCode::NOT_FOUND,
+                    "SESSION_EXPIRED",
+                    "Session has been cleaned up due to inactivity. Please submit a new request.",
+                ))
+            }
+        }
+        Ok(None) => {
+            error!(
+                " [SSE_PROXY] Container does not exist: container_name={}",
+                container_name
+            );
+            Err(create_error_response(
+                StatusCode::NOT_FOUND,
+                "SESSION_EXPIRED",
+                "Container not found. Please submit a new request.",
+            ))
+        }
+        Err(e) => {
+            error!(" [SSE_PROXY] Runtime query failed: {}", e);
+            Err(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
+                "Error checking session status. Please retry later.",
+            ))
+        }
+    }
 }
 
 /// Agent 会话 SSE 通知处理器
@@ -761,8 +363,15 @@ async fn build_sse_stream_from_container_name(
 #[utoipa::path(
     get,
     path = "/agent/progress/{session_id}",
+    // inline 声明 (与项目其他 handler 一致): 避免引用类型时 utoipa 宏展开
+    // 生成限定路径触发 unused_qualifications
     params(
-        SessionNotificationParams
+        ("session_id" = String, Path, description = "会话ID，用于标识特定的会话连接"),
+        ("pod_id" = Option<String>, Query, description = "Pod ID，用于共享容器模式下的容器定位（可选）"),
+        ("tenant_id" = Option<String>, Query, description = "租户ID（可选）"),
+        ("space_id" = Option<String>, Query, description = "空间ID（可选）"),
+        ("isolation_type" = Option<String>, Query, description = "隔离类型（可选），如 project, tenant, space"),
+        ("last_seq" = Option<u64>, Query, description = "客户端消费游标：重连时带上最后收到的 seq 做增量补齐（可选）")
     ),
     responses(
         (
@@ -947,6 +556,23 @@ pub async fn agent_session_notification(
         .and_then(|s| s.parse::<u64>().ok())
         .or(params.last_seq)
         .unwrap_or(0);
+    // 构建 diag_ctx：根据 project 的 service_type 自动选诊断标识。
+    // ComputerAgentRunner → user_id,WebAgentRunner → project_id。
+    // 这样 Web 路径 SSE 断流时也能做 OOM/crashloop 精准诊断。
+    let diag_ctx = state.get_project(&project_id).and_then(|p| {
+        let st = p.service_type()?;
+        let id = match &st {
+            shared_types::ServiceType::ComputerAgentRunner => p.user_id().map(|u| u.to_string()),
+            _ => Some(project_id.clone()),
+        };
+        id.map(|identifier| {
+            Arc::new(crate::handler::utils::DiagCtx {
+                runtime: state.runtime().clone(),
+                identifier,
+                service_type: st.clone(),
+            })
+        })
+    });
     let params = SseStreamParams {
         container_name,
         container_ip,
@@ -959,6 +585,7 @@ pub async fn agent_session_notification(
         namespace: state.config.app_manager.namespace.clone(),
         cluster_domain: state.cluster_domain.clone(),
         registry: state.session_stream_registry.clone(),
+        diag_ctx,
         last_seq,
     };
     build_sse_stream_from_container_name(params).await
@@ -967,8 +594,15 @@ pub async fn agent_session_notification(
 #[utoipa::path(
     get,
     path = "/computer/agent/progress/{session_id}",
+    // inline 声明 (与项目其他 handler 一致): 避免引用类型时 utoipa 宏展开
+    // 生成限定路径触发 unused_qualifications
     params(
-        SessionNotificationParams
+        ("session_id" = String, Path, description = "会话ID，用于标识特定的会话连接"),
+        ("pod_id" = Option<String>, Query, description = "Pod ID，用于共享容器模式下的容器定位（可选）"),
+        ("tenant_id" = Option<String>, Query, description = "租户ID（可选）"),
+        ("space_id" = Option<String>, Query, description = "空间ID（可选）"),
+        ("isolation_type" = Option<String>, Query, description = "隔离类型（可选），如 project, tenant, space"),
+        ("last_seq" = Option<u64>, Query, description = "客户端消费游标：重连时带上最后收到的 seq 做增量补齐（可选）")
     ),
     responses(
         (
@@ -1073,6 +707,18 @@ pub async fn computer_agent_progress_notification(
         .and_then(|s| s.parse::<u64>().ok())
         .or(params.last_seq)
         .unwrap_or(0);
+    // Computer Agent: 诊断 identifier = user_id(SSE 断流重试耗尽时,据此做 OOM/crashloop
+    // 等精准诊断,替代通用文案)。拿不到 user_id → None → 回退通用文案。
+    let diag_ctx = state
+        .get_project(&project_id)
+        .and_then(|p| p.user_id().map(|u| u.to_string()))
+        .map(|identifier| {
+            Arc::new(crate::handler::utils::DiagCtx {
+                runtime: state.runtime().clone(),
+                identifier,
+                service_type: shared_types::ServiceType::ComputerAgentRunner,
+            })
+        });
     let params = SseStreamParams {
         container_name,
         container_ip,
@@ -1085,162 +731,10 @@ pub async fn computer_agent_progress_notification(
         namespace: state.config.app_manager.namespace.clone(),
         cluster_domain: state.cluster_domain.clone(),
         registry: state.session_stream_registry.clone(),
+        diag_ctx,
         last_seq,
     };
     build_sse_stream_from_container_name(params).await
-}
-
-/// 创建 SSE 代理流
-async fn create_sse_proxy_stream(
-    sse_url: String,
-    session_id: String,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
-
-    // 在后台任务中处理 SSE 连接
-    tokio::spawn(async move {
-        let client = Client::new();
-
-        info!(
-            " [SSE_PROXY] 开始连接容器SSE: url={}, session_id={}",
-            sse_url, session_id
-        );
-
-        match client
-            .get(&sse_url)
-            .header("Accept", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    info!(" [SSE_PROXY] 成功连接到容器SSE: session_id={}", session_id);
-
-                    let mut stream = response.bytes_stream();
-                    let mut buffer = Vec::new();
-
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                buffer.extend_from_slice(&chunk);
-
-                                // 按双换行符分割 SSE 事件
-                                while let Some(event_end) =
-                                    buffer.windows(2).position(|w| w == [b'\n', b'\n'])
-                                {
-                                    let event_data = buffer[..event_end].to_vec();
-                                    buffer = buffer[event_end + 2..].to_vec();
-
-                                    if !event_data.is_empty() {
-                                        debug!(
-                                            " [SSE_PROXY] 透传SSE事件: session_id={}, event_len={}",
-                                            session_id,
-                                            event_data.len()
-                                        );
-
-                                        // 直接透传原始 SSE 数据
-                                        if let Ok(event_text) = String::from_utf8(event_data)
-                                            && let Some(event) =
-                                                create_passthrough_event(&event_text)
-                                            && tx.send(Ok(event)).await.is_err()
-                                        {
-                                            warn!(
-                                                " [SSE_PROXY] 客户端已断开连接: session_id={}",
-                                                session_id
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    " [SSE_PROXY] 读取SSE流失败: session_id={}, error={}",
-                                    session_id, e
-                                );
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    error!(
-                        " [SSE_PROXY] 容器SSE连接失败: session_id={}, status={}",
-                        session_id,
-                        response.status()
-                    );
-
-                    // 发送错误事件
-                    let error_event = Event::default().event("error").data(format!(
-                        "container connection failed: {}",
-                        response.status()
-                    ));
-                    if let Err(send_err) = tx.send(Ok(error_event)).await {
-                        warn!(
-                            " [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
-                            session_id, send_err
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                error!(
-                    " [SSE_PROXY] 无法连接到容器SSE: session_id={}, error={}",
-                    session_id, e
-                );
-
-                // 发送连接错误事件
-                let error_event = Event::default()
-                    .event("error")
-                    .data(format!("connection error: {}", e));
-                if let Err(send_err) = tx.send(Ok(error_event)).await {
-                    warn!(
-                        " [SSE_PROXY] 发送错误事件失败: session_id={}, error={}",
-                        session_id, send_err
-                    );
-                }
-            }
-        }
-
-        info!(
-            "[SSE_PROXY] SSE proxy connection: session_id={}",
-            session_id
-        );
-    });
-
-    ReceiverStream::new(rx)
-}
-
-/// 创建透传 SSE 事件
-///
-/// 正确解析SSE消息的各个部分，避免重复的data:前缀
-fn create_passthrough_event(event_text: &str) -> Option<Event> {
-    let mut event_type = None;
-    let mut data_lines = Vec::new();
-
-    // 解析SSE消息的各个部分
-    for line in event_text.lines() {
-        if let Some(value) = line.strip_prefix("event:") {
-            event_type = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            data_lines.push(value.trim());
-        }
-    }
-
-    // 只有当有数据内容时才创建事件
-    if !data_lines.is_empty() {
-        let data_content = data_lines.join("\n");
-        let mut event = Event::default().data(data_content);
-
-        // 如果有事件类型，则设置事件类型
-        if let Some(event_type) = event_type {
-            event = event.event(event_type);
-        }
-
-        Some(event)
-    } else {
-        None
-    }
 }
 
 /// 创建错误响应
@@ -1274,36 +768,5 @@ fn map_error_code_for_locale(code: &str) -> &str {
         "INVALID_DATA" => error_codes::ERR_INVALID_PARAMS,
         error_codes::ERR_INTERNAL_SERVER_ERROR => error_codes::ERR_INTERNAL_SERVER_ERROR,
         _ => error_codes::ERR_UNKNOWN,
-    }
-}
-
-/// 获取容器的 SSE 端点 URL
-async fn get_container_sse_url(
-    runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
-    project_id: &str,
-    _agent_info: &ProjectAndContainerInfo,
-    session_id: &str,
-) -> Result<String, AppError> {
-    info!(
-        " [CONTAINER] 获取容器SSE端点: project_id={}, session_id={}",
-        project_id, session_id
-    );
-
-    if let Some(info) = runtime
-        .get_container_info_by_identifier(project_id, &shared_types::ServiceType::WebAgentRunner)
-        .await
-        .map_err(|e| {
-            error!("[CONTAINER] Failed to get container info: {}", e);
-            AppError::internal_server_error(&format!("Failed to get container info: {}", e))
-        })?
-    {
-        // 构建 SSE 端点 URL
-        // info.service_url 格式为 http://ip:8086
-        let sse_url = format!("{}/agent/progress/{}", info.service_url, session_id);
-
-        info!("[CONTAINER] get container SSE: {}", sse_url);
-        Ok(sse_url)
-    } else {
-        Err(AppError::internal_server_error("Container info not found"))
     }
 }

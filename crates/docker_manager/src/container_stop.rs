@@ -184,6 +184,10 @@ pub async fn startup_cleanup_containers(
                     }
                 }
             }
+        } else {
+            // task panic/cancel（JoinError）：补计 failed，避免 total ≠ success + failed
+            failed_removals += 1;
+            warn!("[STARTUP_CLEANUP] cleanup task join failed (panic/cancel), counted as failed");
         }
     }
 
@@ -402,6 +406,10 @@ pub async fn runtime_cleanup_containers(
                     });
                 }
             }
+        } else {
+            // task panic/cancel（JoinError）：补计 failed，避免 total ≠ success + failed
+            failed_removals += 1;
+            warn!("[RUNTIME_CLEANUP] cleanup task join failed (panic/cancel), counted as failed");
         }
     }
 

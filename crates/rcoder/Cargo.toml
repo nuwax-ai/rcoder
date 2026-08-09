@@ -27,10 +27,13 @@ ebpf-debug = ["docker_manager/ebpf-debug"]
 
 # Kubernetes 支持：启用 Kubernetes 运行时模式
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
-kubernetes = ["docker_manager/kubernetes", "shared_types/kubernetes", "kube", "k8s-openapi"]
+kubernetes = ["docker_manager/kubernetes", "shared_types/kubernetes", "app_manager/kubernetes", "file-server/kubernetes", "kube", "k8s-openapi"]
 
 [dev-dependencies]
 filetime = { workspace = true }
+
+[lints]
+workspace = true
 
 [dependencies]
 # Internal crates
@@ -38,6 +41,9 @@ shared_types = { workspace = true }
 rcoder-proxy = { workspace = true }
 container-runtime-api = { workspace = true }
 download_utils = { workspace = true }
+agent_provisioning = { workspace = true }
+file-server = { workspace = true }
+app_manager = { path = "../app_manager" }
 
 # 🚀 无锁配置热更新
 arc-swap = { workspace = true }
@@ -47,10 +53,11 @@ rcoder-telemetry = { workspace = true }
 clap = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
+lockmap = { workspace = true }
 tempfile = { workspace = true }
 
 # HTTP server
-axum = { workspace = true, features = ["multipart"] }
+axum = { workspace = true, features = ["multipart", "ws"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace", "set-header", "limit"] }
 hyper = { workspace = true }

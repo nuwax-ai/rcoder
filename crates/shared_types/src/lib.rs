@@ -1,6 +1,10 @@
 mod container;
 mod model;
 
+// UserApp build 进度事件 —— file-server(发送)与 rcoder(接收)共享的类型化 DTO
+pub mod build_event;
+pub use build_event::BuildProgressEvent;
+
 // 清理请求模块
 pub mod cleanup_request;
 pub use cleanup_request::CleanupRequest;
@@ -12,6 +16,10 @@ pub use storage_types::{IdleContainerInfo, StorageStats};
 // 容器查找接口模块
 pub mod container_lookup;
 pub use container_lookup::{ContainerLookup, ProjectScope};
+
+// UserApp 活动追踪 + 流量唤醒接口模块（闲置自动回收 / wake-on-traffic）
+pub mod app_activity;
+pub use app_activity::{AppAccessTracker, AppWakeControl, WakeOutcome};
 
 // 容器条目模块（refcount + 活跃时间跟踪）
 pub mod container_entry;
@@ -48,8 +56,11 @@ pub use api_key_validator::{ApiKeyAuthConfig, ApiKeyAuthError, ApiKeyValidator};
 // 新增多镜像配置相关模块
 pub mod multi_image_config;
 pub mod permission_types;
+pub mod pg_utils;
 pub mod service_config;
 pub mod service_type;
+// K8s 运行时专用配置(与 docker_config 分家)
+pub mod k8s_config;
 pub use permission_types::{
     PermissionResolveRequest, ResolvePermissionHttpRequest, ResolvePermissionRequestDto,
     ResolvePermissionResponseDto,
@@ -57,32 +68,40 @@ pub use permission_types::{
 
 // 常量定义模块
 pub mod constants;
+// 工作区路径常量 (单一事实源, 所有 crate 共用: rcoder/docker_manager/agent_runner)
+pub mod paths;
 pub use constants::*;
 
 // 错误码定义模块 — 重导出自 shared_types_i18n（过渡期兼容）
 pub use shared_types_i18n::{
-    ERR_AGENT_BUSY, ERR_AGENT_ERROR, ERR_AGENT_MGMT_ALREADY_INSTALLED, ERR_AGENT_MGMT_ARCHIVE_BOMB,
-    ERR_AGENT_MGMT_BINARY_TOO_LARGE, ERR_AGENT_MGMT_BUILTIN_PROTECTED, ERR_AGENT_MGMT_CHECK_FAILED,
+    ERR_AGENT_BUSY, ERR_AGENT_CONTAINER_UNAVAILABLE, ERR_AGENT_ERROR,
+    ERR_AGENT_MGMT_ALREADY_INSTALLED, ERR_AGENT_MGMT_ARCHIVE_BOMB, ERR_AGENT_MGMT_BINARY_TOO_LARGE,
+    ERR_AGENT_MGMT_BUILTIN_PROTECTED, ERR_AGENT_MGMT_CHECK_FAILED,
     ERR_AGENT_MGMT_CHECKSUM_MISMATCH, ERR_AGENT_MGMT_COMMAND_TIMEOUT, ERR_AGENT_MGMT_DISK_FULL,
     ERR_AGENT_MGMT_INSTALL_CANCELLED, ERR_AGENT_MGMT_INSTALL_FAILED, ERR_AGENT_MGMT_INVALID_CHUNK,
     ERR_AGENT_MGMT_INVALID_MANIFEST, ERR_AGENT_MGMT_INVALID_VERSION, ERR_AGENT_MGMT_NOT_FOUND,
     ERR_AGENT_MGMT_PATH_TRAVERSAL, ERR_AGENT_MGMT_PERMISSION_DENIED,
     ERR_AGENT_MGMT_PLATFORM_NOT_FOUND, ERR_AGENT_MGMT_STREAM_TRUNCATED,
     ERR_AGENT_MGMT_UNINSTALL_FAILED, ERR_AGENT_MGMT_UNKNOWN_AGENT, ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
-    ERR_AGENT_NOT_FOUND, ERR_AGENT_RUNNER_UNAVAILABLE, ERR_API_KEY_AUTH_FAILED, ERR_CANCEL_FAILED,
-    ERR_CONFLICT, ERR_CONTAINER_ERROR, ERR_CONTAINER_NOT_FOUND, ERR_GRPC_ADDR_ERROR,
-    ERR_GRPC_ERROR, ERR_HTTP_FALLBACK_FAILED, ERR_INTERNAL_SERVER_ERROR, ERR_INVALID_PARAMS,
-    ERR_INVALID_RESOURCE_LIMITS, ERR_NOT_FOUND, ERR_PERMISSION_EXPIRED, ERR_PERMISSION_NOT_FOUND,
+    ERR_AGENT_NOT_FOUND, ERR_AGENT_RUNNER_UNAVAILABLE, ERR_API_KEY_AUTH_FAILED,
+    ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_CANCEL_FAILED, ERR_CONFLICT,
+    ERR_CONTAINER_ERROR, ERR_CONTAINER_NOT_FOUND, ERR_FILE_NOT_FOUND, ERR_GRPC_ADDR_ERROR,
+    ERR_GRPC_ERROR, ERR_HTTP_FALLBACK_FAILED, ERR_IMAGE_PULL_FAILED, ERR_INTERNAL_SERVER_ERROR,
+    ERR_INVALID_PARAMS, ERR_INVALID_RESOURCE_LIMITS, ERR_INVALID_STATE, ERR_NOT_FOUND,
+    ERR_OPERATION_NOT_SUPPORTED, ERR_PERMISSION_EXPIRED, ERR_PERMISSION_NOT_FOUND,
     ERR_PERMISSION_RESOLVE_FAILED, ERR_PROJECT_NOT_FOUND, ERR_PROXY_DISABLED,
-    ERR_PROXY_SERVICE_UNAVAILABLE, ERR_RESUME_FAILED, ERR_RETRY_EXHAUSTED, ERR_SERVICE_UNAVAILABLE,
-    ERR_SESSION_NOT_FOUND, ERR_STOP_FAILED, ERR_TOO_MANY_REQUESTS, ERR_UNKNOWN, ERR_VALIDATION,
-    ERR_WORKSPACE_ERROR, SUCCESS, error_codes, get_error_description, get_error_message,
-    get_i18n_message, get_i18n_message_default,
+    ERR_PROXY_SERVICE_UNAVAILABLE, ERR_RESOURCE_EXHAUSTED, ERR_RESUME_FAILED, ERR_RETRY_EXHAUSTED,
+    ERR_SERVICE_UNAVAILABLE, ERR_SESSION_NOT_FOUND, ERR_STOP_FAILED, ERR_TOO_MANY_REQUESTS,
+    ERR_UNKNOWN, ERR_VALIDATION, ERR_WORKSPACE_ERROR, SUCCESS, error_codes, get_error_description,
+    get_error_message, get_i18n_message, get_i18n_message_default,
 };
 
 // Validation 模块
 pub mod validation;
 pub use validation::{garde_err_to_app_error, validate_identifier};
+
+pub mod quantity;
+pub use quantity::{parse_cpu_quantity, parse_memory_quantity, validate_k8s_storage_size};
 
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
 pub use shared_types_grpc::grpc;
@@ -145,16 +164,22 @@ pub use model::{
 };
 
 // 导出多镜像配置相关类型
+pub use k8s_config::{
+    K8sGlobalDefaults, K8sServiceConfig, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec,
+    K8sVolumeType, KubernetesConfig,
+};
 pub use multi_image_config::{
-    GlobalImageDefaults, ImageCacheConfig, ImageSelectionStrategy, MultiImageConfig,
-    ProjectImageOverrides, create_default_multi_image_config, create_legacy_multi_image_config,
+    GlobalImageDefaults, IMAGE_CACHE_DEFAULT_MAX_ENTRIES, IMAGE_CACHE_DEFAULT_TTL_SECS,
+    ImageCacheConfig, ImageSelectionStrategy, MultiImageConfig, ProjectImageOverrides,
+    create_default_multi_image_config, create_legacy_multi_image_config,
 };
 pub use service_config::{
-    ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits,
+    ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits, ServiceSecurityConfig,
     default_agent_runner_service_config, default_rcoder_service_config,
 };
 pub use service_type::{
-    ServiceType, ServiceTypeError, get_enabled_service_types, get_supported_service_types,
+    MissingIdentifier, ServiceType, ServiceTypeError, get_enabled_service_types,
+    get_supported_service_types,
 };
 
 // 隔离类型模块
@@ -183,6 +208,8 @@ pub use rcoder_agent_types::*;
 // 通用 HTTP Handlers（基于 trait）
 pub mod agent_mgmt_types;
 pub mod http_handlers;
+
+// UserApp workspace manifest 类型（极轻量独立 crate，file-server build + app-cli runtime 共用）
 pub use agent_mgmt_types::{
     AGENT_CACHE_DIR, AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus,
     CheckAgentRequest, CheckAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR, GetAgentRequest,
@@ -190,4 +217,12 @@ pub use agent_mgmt_types::{
     InstallFromUrlRequest, InstallType, ListAgentsRequest, ListAgentsResponse, MAX_BINARY_SIZE,
     MAX_EXTRACTED_SIZE, PlatformEntry, RoutingParams, StaticCheckResult, SystemInfo,
     UPLOAD_CHUNK_SIZE, URL_DOWNLOAD_TIMEOUT_SECS, UninstallAgentRequest, UninstallAgentResponse,
+};
+pub use workspace_manifest::{
+    BuildSection, DiscoverError, DiscoveredProject, HealthSection, LockedPingap, LockedService,
+    LogFormat, LogSource, LogsSection, ManifestError, PingapMode, PingapSection, ProjectKind,
+    ProjectManifest, ProjectMeta, ProjectType, ProxySection, ReleaseLock, ReleaseMetadata,
+    RunSection, WorkspaceManifest, WorkspaceMeta, build_release_lock, discover_projects,
+    parse_project, parse_workspace, validate_project, validate_service_id, validate_topology,
+    validate_workspace,
 };

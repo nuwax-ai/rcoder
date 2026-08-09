@@ -27,8 +27,8 @@ impl FromStr for ModelApiProtocol {
     }
 }
 
-impl std::fmt::Display for ModelApiProtocol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ModelApiProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ModelApiProtocol::Anthropic => f.write_str("Anthropic"),
             ModelApiProtocol::OpenAI => f.write_str("Openai"),

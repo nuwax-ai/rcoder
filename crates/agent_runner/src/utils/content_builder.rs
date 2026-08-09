@@ -19,7 +19,7 @@ impl ContentBuilder {
     /// 将单个附件转换为 ContentBlock
     pub async fn attachment_to_content_block(
         attachment: &Attachment,
-        project_path: &std::path::Path,
+        project_path: &Path,
     ) -> Result<Option<ContentBlock>> {
         match attachment {
             Attachment::Text(text_attachment) => {
@@ -41,7 +41,7 @@ impl ContentBuilder {
     /// 文件不存在或无法读取的附件会被静默忽略
     pub async fn attachments_to_content_blocks(
         attachments: &[Attachment],
-        project_path: &std::path::Path,
+        project_path: &Path,
     ) -> Result<Vec<ContentBlock>> {
         let mut content_blocks = Vec::new();
 
@@ -75,7 +75,7 @@ impl ContentBuilder {
     /// 如果文件不存在或是压缩文件，返回 Ok(None)
     async fn text_to_content_block(
         text_attachment: &crate::model::TextAttachment,
-        project_path: &std::path::Path,
+        project_path: &Path,
     ) -> Result<Option<ContentBlock>> {
         let text_content = match &text_attachment.source {
             AttachmentSource::FilePath { path } => {
@@ -124,9 +124,10 @@ impl ContentBuilder {
                 TextContent::new(text)
             }
             AttachmentSource::Url { url } => {
-                let client = reqwest::Client::new();
-                let response = client.get(url).send().await?;
-                let text = response.text().await?;
+                // 安全下载: 共享 client + 超时 + 状态校验 + 大小上限 (见 download_utils::memory)
+                let text =
+                    download_utils::download_text_limited(url, download_utils::DEFAULT_MAX_BYTES)
+                        .await?;
 
                 TextContent::new(text)
             }
@@ -139,7 +140,7 @@ impl ContentBuilder {
     /// 如果文件不存在，返回 Ok(None)
     async fn image_to_content_block(
         image_attachment: &crate::model::ImageAttachment,
-        project_path: &std::path::Path,
+        project_path: &Path,
     ) -> Result<Option<ContentBlock>> {
         let (data, uri) = match &image_attachment.source {
             AttachmentSource::FilePath { path } => {
@@ -169,9 +170,9 @@ impl ContentBuilder {
             }
             AttachmentSource::Base64 { data, .. } => (data.clone(), None),
             AttachmentSource::Url { url } => {
-                let client = reqwest::Client::new();
-                let response = client.get(url).send().await?;
-                let data = response.bytes().await?;
+                let data =
+                    download_utils::download_bytes_limited(url, download_utils::DEFAULT_MAX_BYTES)
+                        .await?;
                 let base64_data = general_purpose::STANDARD.encode(data);
                 (base64_data, Some(url.clone()))
             }
@@ -188,7 +189,7 @@ impl ContentBuilder {
     /// 如果文件不存在，返回 Ok(None)
     async fn audio_to_content_block(
         audio_attachment: &crate::model::AudioAttachment,
-        project_path: &std::path::Path,
+        project_path: &Path,
     ) -> Result<Option<ContentBlock>> {
         let data = match &audio_attachment.source {
             AttachmentSource::FilePath { path } => {
@@ -216,9 +217,9 @@ impl ContentBuilder {
             }
             AttachmentSource::Base64 { data, .. } => data.clone(),
             AttachmentSource::Url { url } => {
-                let client = reqwest::Client::new();
-                let response = client.get(url).send().await?;
-                let data = response.bytes().await?;
+                let data =
+                    download_utils::download_bytes_limited(url, download_utils::DEFAULT_MAX_BYTES)
+                        .await?;
                 general_purpose::STANDARD.encode(data)
             }
         };
@@ -233,7 +234,7 @@ impl ContentBuilder {
     /// 如果文件不存在，返回 Ok(None)
     async fn document_to_content_block(
         document_attachment: &crate::model::DocumentAttachment,
-        project_path: &std::path::Path,
+        project_path: &Path,
     ) -> Result<Option<ContentBlock>> {
         match &document_attachment.source {
             AttachmentSource::FilePath { path } => {
@@ -356,7 +357,7 @@ impl ContentBuilder {
 
     /// 从文件扩展名推断 MIME 类型
     pub fn infer_mime_type_from_extension(filename: &str) -> &'static str {
-        let path = std::path::Path::new(filename);
+        let path = Path::new(filename);
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("txt") => "text/plain",
             Some("md") => "text/markdown",

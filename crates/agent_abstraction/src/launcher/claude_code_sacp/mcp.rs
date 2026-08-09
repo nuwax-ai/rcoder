@@ -4,6 +4,8 @@ use std::sync::OnceLock;
 
 use agent_client_protocol::schema::v1::{McpServer, McpServerStdio};
 use agent_config::ContextServerConfig;
+use anyhow::{Context, Result};
+use mcp_proxy_args::{RewriteOptions, is_mcp_proxy_convert, rewrite_convert_import_args_to_files};
 use tracing::{debug, info};
 
 use super::env::build_mcp_server_path_env;
@@ -39,14 +41,14 @@ fn get_dbus_session_address() -> Option<String> {
 /// mcp-proxy 日志目录环境变量名
 pub(crate) const ENV_MCP_PROXY_LOG_DIR: &str = "MCP_PROXY_LOG_DIR";
 
-/// 检测命令是否为 mcp-proxy（简化版，只检测命令名）
+#[cfg(test)]
 pub(crate) fn is_mcp_proxy_command(command: &str) -> bool {
-    command == "mcp-proxy"
+    is_mcp_proxy_convert(command, &["convert".to_string()])
 }
 
-/// 检测参数中是否有 convert 子命令
+#[cfg(test)]
 pub(crate) fn has_convert_subcommand(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == "convert")
+    is_mcp_proxy_convert("mcp-proxy", args)
 }
 
 /// 检测当前日志级别是否为 debug
@@ -91,12 +93,14 @@ pub(crate) fn get_mcp_proxy_log_dir() -> Option<String> {
 
 /// 检查参数中是否已有 --log-dir 或 --log-file 参数
 pub(crate) fn has_log_dir_arg(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        arg == "--log-dir"
-            || arg.starts_with("--log-dir=")
-            || arg == "--log-file"
-            || arg.starts_with("--log-file=")
-    })
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| {
+            arg == "--log-dir"
+                || arg.starts_with("--log-dir=")
+                || arg == "--log-file"
+                || arg.starts_with("--log-file=")
+        })
 }
 
 /// 为 mcp-proxy convert 命令追加诊断参数
@@ -113,7 +117,7 @@ pub(crate) fn has_log_dir_arg(args: &[String]) -> bool {
 /// 2. 如果参数中已有 --log-dir 或 --log-file，不追加 --log-dir（避免覆盖用户配置）
 pub(crate) fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<String> {
     // 检查是否为 mcp-proxy convert 命令
-    if !is_mcp_proxy_command(command) || !has_convert_subcommand(&args) {
+    if !is_mcp_proxy_convert(command, &args) {
         return args;
     }
 
@@ -124,7 +128,10 @@ pub(crate) fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<St
     }
 
     // 检查是否已有 --diagnostic 参数
-    let has_diagnostic = args.iter().any(|arg| arg == "--diagnostic");
+    let has_diagnostic = args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--diagnostic");
     if has_diagnostic {
         debug!("[MCP] mcp-proxy already has --diagnostic params, skipping");
         return args;
@@ -133,7 +140,7 @@ pub(crate) fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<St
     let mut enhanced_args = args;
 
     // 追加 --diagnostic 参数
-    enhanced_args.push("--diagnostic".to_string());
+    insert_before_double_dash(&mut enhanced_args, "--diagnostic".to_string());
     info!("[MCP] added --diagnostic params to mcp-proxy");
 
     // 🔒 关键检查：如果用户已配置 --log-dir 或 --log-file，不覆盖
@@ -144,8 +151,14 @@ pub(crate) fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<St
 
     // 只有配置了 MCP_PROXY_LOG_DIR 环境变量时才追加 --log-dir 参数
     if let Some(log_dir) = get_mcp_proxy_log_dir() {
-        enhanced_args.push("--log-dir".to_string());
-        enhanced_args.push(log_dir.clone());
+        let insertion_index = enhanced_args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(enhanced_args.len());
+        enhanced_args.splice(
+            insertion_index..insertion_index,
+            ["--log-dir".to_string(), log_dir.clone()],
+        );
         info!(
             "[MCP] adding mcp-proxy convert --log-dir {} params",
             log_dir
@@ -155,25 +168,45 @@ pub(crate) fn enhance_mcp_proxy_args(command: &str, args: Vec<String>) -> Vec<St
     enhanced_args
 }
 
+fn insert_before_double_dash(args: &mut Vec<String>, value: String) {
+    let insertion_index = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    args.insert(insertion_index, value);
+}
+
 /// 将配置中的 Context 服务器转换为 SACP 协议的 McpServer
 pub fn convert_context_servers_sacp(
     configs: &HashMap<String, ContextServerConfig>,
-) -> Vec<McpServer> {
-    let dbus_address = get_dbus_session_address();
+) -> Result<Vec<McpServer>> {
+    let rewrite_options = RewriteOptions::new(std::env::temp_dir().join("mcp-proxy-import-cache"));
+    convert_context_servers_sacp_with_options(configs, &rewrite_options)
+}
 
+pub(crate) fn convert_context_servers_sacp_with_options(
+    configs: &HashMap<String, ContextServerConfig>,
+    rewrite_options: &RewriteOptions,
+) -> Result<Vec<McpServer>> {
+    let dbus_address = get_dbus_session_address();
     configs
         .iter()
         .filter(|(_, c)| c.enabled)
-        .filter_map(|(name, c)| {
-            let command = c.command.as_ref()?;
+        .map(|(name, c)| -> Result<McpServer> {
+            let command = c
+                .command
+                .as_ref()
+                .with_context(|| format!("enabled MCP server {name} is missing command"))?;
             let mut server = McpServerStdio::new(name, PathBuf::from(command));
 
-            // 处理参数，可能需要为 mcp-proxy convert 追加诊断参数
-            let final_args = if let Some(args) = &c.args {
-                enhance_mcp_proxy_args(command, args.clone())
-            } else {
-                Vec::new()
-            };
+            // 固定顺序：先将内联 fallback JSON 原子改写为文件，再增强诊断参数。
+            let original_args = c.args.clone().unwrap_or_default();
+            let rewritten =
+                rewrite_convert_import_args_to_files(command, &original_args, rewrite_options)
+                    .with_context(|| {
+                        format!("failed to rewrite MCP fallback arguments for {name}")
+                    })?;
+            let final_args = enhance_mcp_proxy_args(command, rewritten.args);
 
             if !final_args.is_empty() {
                 server = server.args(final_args);
@@ -264,7 +297,7 @@ pub fn convert_context_servers_sacp(
                 server = server.env(env_vars);
             }
 
-            Some(McpServer::Stdio(server))
+            Ok(McpServer::Stdio(server))
         })
         .collect()
 }

@@ -26,8 +26,8 @@ pub struct DockerContainerConfig {
     pub network_mode: String,
     /// 自动删除
     pub auto_remove: bool,
-    /// 资源限制
-    pub resource_limits: Option<ResourceLimits>,
+    /// 资源限制（复用 shared_types::ServiceResourceLimits，全仓库资源类型统一）
+    pub resource_limits: Option<shared_types::ServiceResourceLimits>,
     /// 额外的挂载点
     pub extra_mounts: Vec<MountPoint>,
     /// 启动命令
@@ -51,6 +51,9 @@ pub struct DockerContainerConfig {
     /// 隔离类型（可选），控制容器共享粒度：tenant/space/project
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation_type: Option<String>,
+    /// 容器安全配置（可选，仅 Docker 模式生效），透传到 bollard HostConfig
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<shared_types::ServiceSecurityConfig>,
 }
 
 /// 挂载点配置
@@ -62,17 +65,6 @@ pub struct MountPoint {
     pub container_path: String,
     /// 是否只读
     pub read_only: bool,
-}
-
-/// 资源限制配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceLimits {
-    /// 内存限制 (字节，支持浮点数)
-    pub memory_limit: Option<f64>,
-    /// CPU 限制
-    pub cpu_limit: Option<f64>,
-    /// 交换空间限制 (字节，支持浮点数)
-    pub swap_limit: Option<f64>,
 }
 
 impl DockerContainerConfig {
@@ -122,6 +114,7 @@ impl DockerContainerConfig {
             tenant_id: None,
             space_id: None,
             isolation_type: None,
+            security: None,
         }
     }
 }
@@ -183,8 +176,8 @@ impl ContainerQueryResult {
             container_name: tuple.1,
             status: tuple.2,
             is_running: tuple.3,
-            container_ip: String::new(),    // 默认为空，需要后续更新
-            created_at: chrono::Utc::now(), // 兼容旧代码，使用当前时间
+            container_ip: String::new(), // 默认为空，需要后续更新
+            created_at: Utc::now(),      // 兼容旧代码，使用当前时间
         }
     }
 
@@ -276,11 +269,11 @@ impl DockerContainerInfo {
             service_type: None,
             image,
             status: ContainerStatus::Running,
-            created_at: chrono::Utc::now(),
-            started_at: Some(chrono::Utc::now()),
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
             host_path: String::new(),
             container_path: String::new(),
-            port_bindings: std::collections::HashMap::new(),
+            port_bindings: HashMap::new(),
             assigned_port: 0,
             health_status: None,
             service_health: None,
@@ -365,6 +358,13 @@ impl From<String> for ContainerStatus {
     }
 }
 
+impl ContainerStatus {
+    /// 是否处于运行中（替代各处的 `status == "running"` 字符串比较）
+    pub fn is_running(&self) -> bool {
+        matches!(self, ContainerStatus::Running)
+    }
+}
+
 impl std::fmt::Display for ContainerStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -401,6 +401,13 @@ pub struct DockerManagerConfig {
 
     /// 多镜像配置（从 rcoder 配置传递，始终有值）
     pub multi_image_config: shared_types::MultiImageConfig,
+
+    /// K8s 运行时专用配置(从 rcoder 配置传递;docker 模式下为空默认值,不被读取)
+    ///
+    /// 与 `multi_image_config`(docker 用)分家:K8s 构建器只读本字段,
+    /// docker 运行时只读 `multi_image_config`。docker 部署下为 `KubernetesConfig::default()`(空)。
+    #[serde(default)]
+    pub kubernetes_config: shared_types::KubernetesConfig,
 
     /// 网络基础名称（不含 project name 前缀）
     /// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
@@ -491,6 +498,7 @@ impl Default for DockerManagerConfig {
             container_ttl_seconds: Some(3600), // 1小时
 
             multi_image_config: shared_types::create_default_multi_image_config(), // 默认多镜像配置
+            kubernetes_config: shared_types::KubernetesConfig::default(), // K8s 模式从 config.yml 填充;docker 模式空默认
             network_base_name: crate::RCODER_NETWORK_BASE_NAME.to_string(), // 默认网络基础名称
 
             api_timeout_seconds: default_api_timeout(), // 默认 10 秒

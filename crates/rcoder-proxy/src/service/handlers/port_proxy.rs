@@ -2,6 +2,7 @@
 //!
 //! 处理 `/proxy/{port}/{*path}` 路径的端口反向代理。
 
+use arc_swap::ArcSwap;
 use matchit::Params;
 use pingora_core::Result as PingoraResult;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -9,7 +10,6 @@ use pingora_http::RequestHeader;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tracing::{debug, error};
 
 use crate::service::types::{ProxyMetrics, TrackingCtx};
@@ -83,13 +83,13 @@ pub async fn handle_port_proxy_request(
 ///
 /// 功能:
 /// - 根据端口参数查找后端服务
-/// - 动态注册未见过的端口到后端映射
+/// - 显式配置的端口使用配置主机，其他端口直接使用默认主机
 /// - 创建到目标端口的 HTTP Peer
 /// - 配置长连接优化参数（支持 WebSocket、Vite HMR 等）
 pub async fn handle_port_proxy_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,
-    backends: &Arc<RwLock<HashMap<u16, String>>>,
+    backends: &Arc<ArcSwap<HashMap<u16, String>>>,
     backend_host: &str,
     metrics: &Arc<ProxyMetrics>,
 ) -> PingoraResult<Box<HttpPeer>> {
@@ -106,26 +106,16 @@ pub async fn handle_port_proxy_upstream(
 
     ctx.target_port = Some(target_port);
     metrics.record_request();
-    metrics.record_request_port(target_port).await;
+    metrics.record_request_port(target_port);
     metrics.inc_active();
 
-    // 如果端口不在后端映射中，动态添加
-    if !backends.read().await.contains_key(&target_port) {
-        backends
-            .write()
-            .await
-            .insert(target_port, backend_host.to_string());
-        debug!(" routing: {} -> {}", target_port, backend_host);
-    }
-
-    // 获取后端主机地址
-    let resolved_host = {
-        let backends_read = backends.read().await;
-        backends_read
-            .get(&target_port)
-            .cloned()
-            .unwrap_or_else(|| backend_host.to_string())
-    };
+    // 未显式配置的端口直接走默认主机，不把请求参数写回全局映射。这样热路径只有一次
+    // lock-free 快照读取，也避免大量不同端口请求触发 copy-on-write 放大。
+    let resolved_host = backends
+        .load()
+        .get(&target_port)
+        .cloned()
+        .unwrap_or_else(|| backend_host.to_string());
 
     debug!("route: {}:{}", resolved_host, target_port);
 

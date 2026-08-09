@@ -32,6 +32,7 @@
 pub mod archive;
 pub mod downloader;
 pub mod error;
+pub mod memory;
 
 pub use archive::{
     ArchiveError, detect_file_type, detect_file_type_from_path, extract_tar_gz, extract_zip,
@@ -39,6 +40,29 @@ pub use archive::{
 };
 pub use downloader::{DownloadConfig, Downloader};
 pub use error::DownloadError;
+pub use memory::{
+    CONNECT_TIMEOUT_SECS, DEFAULT_MAX_BYTES, TIMEOUT_SECS, download_bytes_limited,
+    download_text_limited, shared_client,
+};
+
+fn validate_download_filename(filename: &str) -> Result<String, DownloadError> {
+    let path = std::path::Path::new(filename);
+    let is_single_component = matches!(
+        path.components().next(),
+        Some(std::path::Component::Normal(_))
+    ) && path.components().count() == 1;
+    if filename.is_empty()
+        || !is_single_component
+        || filename.contains(['/', '\\'])
+        || filename.chars().any(char::is_control)
+        || path.file_name().and_then(std::ffi::OsStr::to_str) != Some(filename)
+    {
+        return Err(DownloadError::InvalidUrl(
+            "response contains an unsafe download filename".to_string(),
+        ));
+    }
+    Ok(filename.to_string())
+}
 
 /// 从 URL 获取文件名（优先从 Content-Disposition，其次从 URL 路径）
 ///
@@ -51,6 +75,13 @@ pub use error::DownloadError;
 /// # Returns
 /// 文件名字符串
 pub async fn get_filename_from_url(url: &str) -> Result<String, DownloadError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| DownloadError::InvalidUrl(format!("invalid download URL: {error}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(DownloadError::InvalidUrl(format!(
+            "download URL must use HTTP(S): {url}"
+        )));
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -58,7 +89,7 @@ pub async fn get_filename_from_url(url: &str) -> Result<String, DownloadError> {
 
     // 发送 HEAD 请求获取 Content-Disposition
     let response = client
-        .head(url)
+        .head(parsed.clone())
         .send()
         .await
         .map_err(|e| DownloadError::Http(format!("HEAD {}: {}", url, e)))?;
@@ -68,13 +99,16 @@ pub async fn get_filename_from_url(url: &str) -> Result<String, DownloadError> {
         && let Ok(cd_str) = cd.to_str()
         && let Some(filename) = parse_content_disposition(cd_str)
     {
-        return Ok(filename);
+        return validate_download_filename(&filename);
     }
 
-    // 2. 从 URL 路径提取（去掉查询参数）
-    let path = url.split('?').next().unwrap_or(url);
-    let filename = path.split('/').next_back().unwrap_or("package.tar.gz");
-    Ok(filename.to_string())
+    // 2. 从结构化 URL 路径提取，避免把 query/fragment 误当作文件名。
+    let filename = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("package.tar.gz");
+    validate_download_filename(filename)
 }
 
 /// 解析 Content-Disposition header 中的文件名
@@ -98,4 +132,34 @@ fn parse_content_disposition(cd: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod filename_tests {
+    use super::validate_download_filename;
+
+    #[test]
+    fn accepts_a_single_safe_filename() {
+        assert_eq!(
+            validate_download_filename("agent-linux-amd64.tar.gz").expect("safe filename"),
+            "agent-linux-amd64.tar.gz"
+        );
+    }
+
+    #[test]
+    fn rejects_paths_and_control_characters() {
+        for filename in [
+            "../agent.tar.gz",
+            "nested/agent.tar.gz",
+            "/tmp/agent.tar.gz",
+            "agent\\payload.zip",
+            "agent\n.zip",
+            "",
+        ] {
+            assert!(
+                validate_download_filename(filename).is_err(),
+                "{filename:?}"
+            );
+        }
+    }
 }

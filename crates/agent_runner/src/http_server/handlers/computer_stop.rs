@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::CancelNotificationRequestWrapper;
+use crate::grpc::remove_agent_and_cleanup;
 use crate::http_server::router::AppState;
 use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER, SESSION_CACHE};
 use shared_types::{
@@ -48,10 +49,13 @@ pub async fn handle_computer_stop(
     let locale = locale_from_headers(&headers);
 
     let I18nJsonOrQuery(request) = I18nJsonOrQuery(request).validate_into_app_error()?;
-    let project_id = request
-        .project_id
-        .as_ref()
-        .expect("validated: project_id is required and non-empty");
+    // garde 已校验 required, 此处仍做防御性处理: 生产路径不 panic, 返回 400。
+    let Some(project_id) = request.project_id.as_ref() else {
+        return Err(shared_types::AppError::with_i18n_key(
+            ERR_VALIDATION,
+            &get_i18n_message("error.user_id_or_project_id_required", locale),
+        ));
+    };
 
     let user_id_empty = request.user_id.as_ref().is_none_or(|s| s.is_empty());
     if user_id_empty && project_id.is_empty() {
@@ -136,18 +140,11 @@ pub async fn handle_computer_stop(
             }
         }
 
-        // 从 AGENT_REGISTRY 移除
-        let removed = AGENT_REGISTRY.remove_by_project(project_id).is_some();
-        if removed {
-            info!("[HTTP] Agent stopped: project_id={}", project_id);
-            (true, get_error_message(SUCCESS, locale))
-        } else {
-            info!("[HTTP] Agent already cleaned up: project_id={}", project_id);
-            (
-                true,
-                get_i18n_message("success.agent_already_stopped", locale),
-            )
-        }
+        // 从 AGENT_REGISTRY 移除并优雅停止子进程（对齐 gRPC 路径：
+        // remove_agent_and_cleanup 内部 remove_by_project + 后台 graceful_stop SIGTERM+wait）
+        remove_agent_and_cleanup(project_id);
+        info!("[HTTP] Agent stopped: project_id={}", project_id);
+        (true, get_error_message(SUCCESS, locale))
     } else {
         info!(
             "[HTTP] Agent not found, returning success idempotently: project_id={}",

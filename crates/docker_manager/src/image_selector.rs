@@ -40,7 +40,10 @@ impl ImageSelector {
     /// 支持两种 key 格式：
     /// 1. 新格式：`"web-agent-runner"`, `"computer-agent-runner"`
     /// 2. 老格式：`"rcoder"` (兼容 WebAgentRunner)
-    fn find_service_config(&self, service_type: &ServiceType) -> Option<&shared_types::ServiceImageConfig> {
+    fn find_service_config(
+        &self,
+        service_type: &ServiceType,
+    ) -> Option<&shared_types::ServiceImageConfig> {
         // 1. 先尝试新的服务名称
         let service_key = service_type.to_string();
         if let Some(config) = self.config.services.get(&service_key) {
@@ -55,6 +58,11 @@ impl ImageSelector {
             }
             ServiceType::ComputerAgentRunner => {
                 // ComputerAgentRunner 没有老名称
+                None
+            }
+            ServiceType::UserApp | ServiceType::UserAppBuilder => {
+                // UserApp / UserAppBuilder 镜像由调用方/chart 提供,不走多镜像选择。
+                // (UserAppBuilder 在 select_image 特判为 dev-rcoder-agent-runner,见路B)
                 None
             }
         }

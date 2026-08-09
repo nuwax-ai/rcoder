@@ -242,8 +242,7 @@ mod tests {
         }
 
         // 设置旧文件的修改时间为 15 天前
-        let old_time =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(15 * 24 * 60 * 60);
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(15 * 24 * 60 * 60);
         for (filename, _) in &test_files[..2] {
             let file_path = log_dir.join(filename);
             if let Err(e) = filetime::set_file_mtime(&file_path, old_time.into()) {

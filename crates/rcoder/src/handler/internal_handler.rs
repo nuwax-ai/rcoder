@@ -145,6 +145,12 @@ pub async fn internal_pod_ensure(
                 "RCoder container not found, route through control plane",
             )))
         }
+        // UserApp/UserAppBuilder 不走 internal agent pod ensure(各有独立入口:
+        // UserApp 走 app_manager;UserAppBuilder 走 ensure-builder)。进到此处视为 not_found
+        ServiceType::UserApp | ServiceType::UserAppBuilder => Ok(Json(HttpResult::error(
+            "not_found",
+            "UserApp/UserAppBuilder is not managed via internal pod ensure",
+        ))),
     }
 }
 

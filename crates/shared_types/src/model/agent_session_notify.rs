@@ -243,7 +243,7 @@ fn stop_reason_to_description(reason: &StopReason) -> &'static str {
 }
 
 /// 将 SessionUpdate 附属载荷序列化为 JSON（用于 SSE `data`）
-fn session_update_payload<T: serde::Serialize>(context: &'static str, v: &T) -> serde_json::Value {
+fn session_update_payload<T: Serialize>(context: &'static str, v: &T) -> serde_json::Value {
     serde_json::to_value(v).unwrap_or_else(|e| {
         warn!(
             context,

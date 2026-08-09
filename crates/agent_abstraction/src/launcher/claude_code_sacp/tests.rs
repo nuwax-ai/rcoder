@@ -1,8 +1,9 @@
 use super::config::{get_default_sacp_agent_config, get_default_sacp_agent_config_with_resolver};
 use super::env::{apply_model_env_bindings, apply_sensitive_model_env_fallback};
 use super::mcp::{
-    ENV_MCP_PROXY_LOG_DIR, convert_context_servers_sacp, enhance_mcp_proxy_args,
-    get_mcp_proxy_log_dir, has_convert_subcommand, has_log_dir_arg, is_mcp_proxy_command,
+    ENV_MCP_PROXY_LOG_DIR, convert_context_servers_sacp, convert_context_servers_sacp_with_options,
+    enhance_mcp_proxy_args, get_mcp_proxy_log_dir, has_convert_subcommand, has_log_dir_arg,
+    is_mcp_proxy_command,
 };
 use super::types::SacpAgentLaunchConfig;
 use crate::launcher::model_env;
@@ -303,7 +304,8 @@ fn test_proxy_model_env_resolver_requires_service_uuid() {
 #[test]
 fn test_convert_context_servers_empty() {
     let configs: HashMap<String, ContextServerConfig> = HashMap::new();
-    let servers = convert_context_servers_sacp(&configs);
+    let servers =
+        convert_context_servers_sacp(&configs).expect("context server conversion should succeed");
     assert!(servers.is_empty());
 }
 
@@ -321,7 +323,8 @@ fn test_convert_context_servers_disabled() {
         },
     );
 
-    let servers = convert_context_servers_sacp(&configs);
+    let servers =
+        convert_context_servers_sacp(&configs).expect("context server conversion should succeed");
     assert!(servers.is_empty()); // disabled 的服务器应该被过滤
 }
 
@@ -339,8 +342,10 @@ fn test_convert_context_servers_no_command() {
         },
     );
 
-    let servers = convert_context_servers_sacp(&configs);
-    assert!(servers.is_empty()); // 没有命令的服务器应该被过滤
+    let error = convert_context_servers_sacp(&configs)
+        .expect_err("enabled server without command must fail fast");
+    assert!(error.to_string().contains("no-command-server"));
+    assert!(error.to_string().contains("missing command"));
 }
 
 #[test]
@@ -365,7 +370,8 @@ fn test_convert_context_servers_stdio() {
         },
     );
 
-    let servers = convert_context_servers_sacp(&configs);
+    let servers =
+        convert_context_servers_sacp(&configs).expect("context server conversion should succeed");
     assert_eq!(servers.len(), 1);
 
     // 验证是 Stdio 类型
@@ -411,9 +417,89 @@ fn test_convert_context_servers_multiple() {
         },
     );
 
-    let servers = convert_context_servers_sacp(&configs);
+    let servers =
+        convert_context_servers_sacp(&configs).expect("context server conversion should succeed");
     // 应该只有 2 个 enabled 的服务器
     assert_eq!(servers.len(), 2);
+}
+
+#[test]
+fn test_convert_context_servers_rewrites_inline_fallback_to_tmp_files() {
+    let cache_directory = tempfile::tempdir().expect("create isolated fallback cache");
+    let rewrite_options = mcp_proxy_args::RewriteOptions::new(cache_directory.path());
+    let initialize = r#"{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"test","version":"1"}}"#;
+    let tools = r#"{"tools":[]}"#;
+    let mut configs = HashMap::new();
+    configs.insert(
+        "fallback-mcp".to_string(),
+        ContextServerConfig {
+            source: "local".to_string(),
+            enabled: true,
+            command: Some("/usr/local/bin/mcp-proxy".to_string()),
+            args: Some(vec![
+                "convert".to_string(),
+                "--protocol".to_string(),
+                "sse".to_string(),
+                "http://example.test/sse".to_string(),
+                "--import-initialize".to_string(),
+                initialize.to_string(),
+                format!("--import-tools={tools}"),
+            ]),
+            env: None,
+        },
+    );
+
+    let servers = convert_context_servers_sacp_with_options(&configs, &rewrite_options)
+        .expect("fallback rewrite should succeed");
+    match &servers[0] {
+        McpServer::Stdio(stdio) => {
+            assert!(
+                !stdio
+                    .args
+                    .iter()
+                    .any(|arg| arg == initialize || arg == tools)
+            );
+            assert!(
+                stdio
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--import-initialize-file")
+            );
+            assert!(stdio.args.iter().any(|arg| arg == "--import-tools-file"));
+            let cache_prefix = cache_directory.path().to_string_lossy();
+            assert!(
+                stdio.args.iter().any(|arg| {
+                    arg.starts_with(cache_prefix.as_ref()) && arg.ends_with(".json")
+                })
+            );
+        }
+        _ => panic!("Expected Stdio variant"),
+    }
+}
+
+#[test]
+fn test_convert_context_servers_propagates_invalid_fallback_json() {
+    let mut configs = HashMap::new();
+    configs.insert(
+        "bad-fallback".to_string(),
+        ContextServerConfig {
+            source: "local".to_string(),
+            enabled: true,
+            command: Some("mcp-proxy".to_string()),
+            args: Some(vec![
+                "convert".to_string(),
+                "--import-initialize".to_string(),
+                "{bad-json".to_string(),
+                "--import-tools".to_string(),
+                "{}".to_string(),
+            ]),
+            env: None,
+        },
+    );
+
+    let error = convert_context_servers_sacp(&configs)
+        .expect_err("invalid fallback must prevent session startup");
+    assert!(error.to_string().contains("failed to rewrite MCP fallback"));
 }
 
 #[test]
@@ -455,7 +541,7 @@ fn test_sacp_agent_launch_config_debug() {
 fn test_is_mcp_proxy_command_simple() {
     // 简化版只检测精确的命令名
     assert!(is_mcp_proxy_command("mcp-proxy"));
-    // 不再检测大小写变体和路径
+    // 大小写变体不匹配
     assert!(!is_mcp_proxy_command("MCP-PROXY"));
     assert!(!is_mcp_proxy_command("Mcp-Proxy"));
 }
@@ -466,9 +552,8 @@ fn test_is_mcp_proxy_command_not_mcp_proxy() {
     assert!(!is_mcp_proxy_command("bunx"));
     assert!(!is_mcp_proxy_command("/usr/bin/uvx"));
     assert!(!is_mcp_proxy_command("mcp-proxy-other"));
-    // 路径形式不再匹配（简化版）
-    assert!(!is_mcp_proxy_command("/usr/local/bin/mcp-proxy"));
-    assert!(!is_mcp_proxy_command("C:\\Users\\test\\mcp-proxy.exe"));
+    assert!(is_mcp_proxy_command("/usr/local/bin/mcp-proxy"));
+    assert!(is_mcp_proxy_command("C:\\Users\\test\\mcp-proxy.exe"));
 }
 
 #[test]
@@ -478,7 +563,7 @@ fn test_has_convert_subcommand() {
         "convert".to_string(),
         "http://example.com".to_string()
     ]));
-    assert!(has_convert_subcommand(&[
+    assert!(!has_convert_subcommand(&[
         "--config".to_string(),
         "config.json".to_string(),
         "convert".to_string()
@@ -580,6 +665,11 @@ fn test_has_log_dir_arg_no_log_args() {
     assert!(!has_log_dir_arg(&[]));
     assert!(!has_log_dir_arg(&["convert".to_string()]));
     assert!(!has_log_dir_arg(&["--diagnostic".to_string()]));
+    assert!(!has_log_dir_arg(&[
+        "convert".to_string(),
+        "--".to_string(),
+        "--log-dir=/downstream/value".to_string(),
+    ]));
     assert!(!has_log_dir_arg(&[
         "--config".to_string(),
         "config.json".to_string()

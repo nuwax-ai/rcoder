@@ -73,7 +73,7 @@ impl ProxyMetrics {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub async fn record_request_port(&self, port: u16) {
+    pub fn record_request_port(&self, port: u16) {
         let arc = self.get_or_create_port_metrics(port);
         arc.requests.fetch_add(1, Ordering::Relaxed);
     }
@@ -93,7 +93,7 @@ impl ProxyMetrics {
         }
     }
 
-    pub async fn record_response_port(
+    pub fn record_response_port(
         &self,
         port: u16,
         status_text: &str,
@@ -151,6 +151,9 @@ impl ProxyMetrics {
     ///
     /// 使用 DashMap entry API 实现，避免 TOCTOU 竞态条件
     fn get_or_create_port_metrics(&self, port: u16) -> Arc<PerPortMetrics> {
+        if let Some(metrics) = self.port_map.get(&port) {
+            return Arc::clone(metrics.value());
+        }
         self.port_map
             .entry(port)
             .or_insert_with(|| Arc::new(PerPortMetrics::new()))

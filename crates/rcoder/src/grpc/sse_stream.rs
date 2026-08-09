@@ -32,13 +32,15 @@ use tracing::{info, warn};
 /// 不直接传 `Arc<AppState>` 是因为 rcoder 同时作为 lib 和 bin 编译，
 /// `crate::router::AppState` 在两边是不同的类型实例。改用闭包解耦：
 /// 调用方在 lib 内部捕获 state 引用，bin crate 不需要知道 AppState 类型。
+#[allow(clippy::too_many_arguments)] // SSE 流构建本质多参;diag_ctx 为新增诊断上下文
 pub async fn create_grpc_sse_stream(
     registry: Arc<crate::grpc::SessionStreamRegistry>,
     grpc_addr: String,
     session_id: String,
-    pool: std::sync::Arc<crate::grpc::GrpcChannelPool>,
+    pool: Arc<crate::grpc::GrpcChannelPool>,
     locale: &'static str,
     activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
+    diag_ctx: Option<Arc<crate::handler::utils::DiagCtx>>,
     last_seq: u64,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
@@ -49,7 +51,14 @@ pub async fn create_grpc_sse_stream(
     tokio::spawn(async move {
         // 1. 获取或创建 session 共享流（每 session 一条 agent_runner SubscribeProgress 流）
         let shared = registry
-            .get_or_create(&session_id, &grpc_addr, pool, locale, activity_updater)
+            .get_or_create(
+                &session_id,
+                &grpc_addr,
+                pool,
+                locale,
+                activity_updater,
+                diag_ctx,
+            )
             .await;
         // 注册本消费者（ref_count +1）；guard drop 时 release_client（最后一个离开延迟清理共享流）
         let _guard = shared.acquire_client(Arc::clone(&registry));
@@ -60,15 +69,19 @@ pub async fn create_grpc_sse_stream(
             session_id, client_last_seq
         );
 
-        // 2. 增量补齐：从 ring 读取 seq > client_last_seq 的历史（断线重连补缺，不重复已收）
+        // 2. 先订阅 broadcast(接实时),再 replay ring(补历史)——顺序不能反!
+        //    若 replay 先 subscribe 后,中间 dispatch 的事件不在 replay 也不在 receiver = 丢事件。
+        //    subscribe 先 replay 后:gap 里的事件在两边都有 → dedup(seq<=client_last_seq)去重。
+        let mut bc_rx = shared.subscribe();
+
+        // 3. 增量补齐：从 ring 读取 seq > client_last_seq 的历史（断线重连补缺，不重复已收）
         for ev in shared.replay_since(client_last_seq) {
             if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
                 return; // 客户端断开，或历史已含终端事件
             }
         }
 
-        // 3. 订阅 broadcast 接实时事件
-        let mut bc_rx = shared.subscribe();
+        // 4. 接实时事件(dedup 跳过 replay 已发的)
         loop {
             tokio::select! {
                 // HTTP 客户端断开（SSE Receiver 全 drop）→ 退出（_guard drop 时 release_client）
@@ -130,6 +143,10 @@ async fn forward_to_client(
     client_last_seq: &mut u64,
 ) -> bool {
     let is_terminal = ev.message_type == "SessionPromptEnd";
+    // cursor-reset(#15):epoch 变化 → 重置客户端去重游标,让新 epoch 的低 seq 事件不被去重丢弃。
+    if ev.message_type == "StreamReset" {
+        *client_last_seq = 0;
+    }
     let sse_event = progress_event_to_sse(ev, session_id);
     if tx.send(Ok(sse_event)).await.is_err() {
         return false; // HTTP 客户端断开
@@ -295,7 +312,10 @@ mod tests {
         let ev = make_event("SessionPromptEnd", 0); // 终端 + seq=0 合成消息
 
         let cont = forward_to_client(&tx, &ev, "s1", &mut last_seq).await;
-        assert!(!cont, "SessionPromptEnd must stop the forward task (avoid hang)");
+        assert!(
+            !cont,
+            "SessionPromptEnd must stop the forward task (avoid hang)"
+        );
         assert_eq!(last_seq, 10, "seq=0 must not advance last_seq");
     }
 

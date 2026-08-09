@@ -59,8 +59,15 @@ use anyhow::Result;
 use metrics_exporter_prometheus::PrometheusHandle;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::info;
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::Rotation;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{
+    EnvFilter, Layer, filter::filter_fn, fmt, layer::SubscriberExt, registry::Registry,
+    util::SubscriberInitExt,
+};
+
+/// 类型擦除的 tracing layer（用于跨 crate 注入额外日志层）。
+pub type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
 
 /// 遥测系统 Guard
 ///
@@ -73,6 +80,8 @@ pub struct TelemetryGuard {
     prometheus_handle: Option<PrometheusHandle>,
     /// 服务名称
     service_name: String,
+    /// 额外 layer 关联的 WorkerGuard（如 file-server 独立日志的 non_blocking guard）
+    _extra_layer_guard: Option<WorkerGuard>,
 }
 
 impl TelemetryGuard {
@@ -150,7 +159,7 @@ impl Drop for TelemetryGuard {
 ///     Ok(())
 /// }
 /// ```
-pub async fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
+pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
     // 设置全局传播器（在初始化 subscriber 之前）
     set_global_propagator();
 
@@ -170,11 +179,14 @@ pub async fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
         None
     };
 
-    // 🆕 初始化 tracing subscriber（包括控制台、文件、OpenTelemetry）
+    // 🆕 初始化 tracing subscriber（包括控制台、文件、OpenTelemetry、额外 layer）
+    let has_extra_layer = config.extra_layer.is_some(); // take 前记，供下方启动日志使用
+    let extra_layer = config.extra_layer.take();
     init_tracing_subscriber(
         &config.service_name,
         tracer_provider.as_ref(),
         config.file_log.as_ref(),
+        extra_layer,
     )?;
 
     info!(
@@ -182,16 +194,18 @@ pub async fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
         config.service_name
     );
     info!(
-        "✅ [Telemetry] Telemetry system initialization completed: OTLP={}, Prometheus={}, FileLog={}, Console=true",
+        "✅ [Telemetry] Telemetry system initialization completed: OTLP={}, Prometheus={}, FileLog={}, ExtraLayer={}, Console=true",
         tracer_provider.is_some(),
         prometheus_handle.is_some(),
-        config.file_log.is_some()
+        config.file_log.is_some(),
+        has_extra_layer
     );
 
     Ok(TelemetryGuard {
         tracer_provider,
         prometheus_handle,
         service_name: config.service_name,
+        _extra_layer_guard: config.extra_layer_guard.take(),
     })
 }
 
@@ -199,13 +213,15 @@ pub async fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
 ///
 /// 配置以下层：
 /// - EnvFilter: 基于 RUST_LOG 环境变量的日志级别过滤
-/// - Console Layer: 控制台日志输出
-/// - File Layer: 可选的文件日志输出（JSON 格式，按天滚动）
+/// - Console Layer: 控制台日志输出（deny `file_server` target，独立写入 file-server.log）
+/// - File Layer: 可选的文件日志输出（JSON 格式，按天滚动，deny `file_server` target）
 /// - OpenTelemetry Layer: 如果提供了 TracerProvider，将 span 发送到 OTLP
+/// - Extra Layer: 可选的外部注入 layer（如 file-server 独立日志，per-layer filter 独立过滤）
 fn init_tracing_subscriber(
     service_name: &str,
     tracer_provider: Option<&SdkTracerProvider>,
-    file_log_config: Option<&config::FileLogConfig>,
+    file_log_config: Option<&FileLogConfig>,
+    extra_layer: Option<BoxedLayer>,
 ) -> Result<()> {
     use opentelemetry::trace::TracerProvider;
 
@@ -219,15 +235,18 @@ fn init_tracing_subscriber(
         .into()
     });
 
-    // 创建控制台日志层
+    // 创建控制台日志层（deny file_server → file-server 日志不进 rcoder console）
     let console_layer = fmt::layer()
         .with_target(true)
         .with_ansi(true)
         .with_thread_ids(false)
         .with_file(false)
-        .with_line_number(false);
+        .with_line_number(false)
+        .with_filter(filter_fn(|meta: &tracing::Metadata<'_>| {
+            !meta.target().starts_with("file_server")
+        }));
 
-    // 创建文件日志层（如果配置了）
+    // 创建文件日志层（deny file_server → file-server 日志不进 rcoder.log）
     let file_layer = if let Some(file_config) = file_log_config {
         // 创建日志目录
         if !file_config.directory.exists() {
@@ -241,6 +260,9 @@ fn init_tracing_subscriber(
             .max_log_files(file_config.max_log_files)
             .build(&file_config.directory)?;
 
+        let deny_fs =
+            filter_fn(|meta: &tracing::Metadata<'_>| !meta.target().starts_with("file_server"));
+
         if file_config.json_format {
             // JSON 格式文件日志
             Some(
@@ -251,6 +273,7 @@ fn init_tracing_subscriber(
                     .with_target(true)
                     .with_thread_ids(true)
                     .with_thread_names(true)
+                    .with_filter(deny_fs)
                     .boxed(),
             )
         } else {
@@ -260,6 +283,7 @@ fn init_tracing_subscriber(
                     .with_writer(file_appender)
                     .with_ansi(false)
                     .with_target(true)
+                    .with_filter(deny_fs)
                     .boxed(),
             )
         }
@@ -267,47 +291,22 @@ fn init_tracing_subscriber(
         None
     };
 
-    // 根据是否有 TracerProvider 和 FileLayer 决定如何初始化
-    match (tracer_provider, file_layer) {
-        (Some(provider), Some(file)) => {
-            // 有 OTLP + 文件日志
-            let tracer = provider.tracer(service_name.to_string());
-            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    // OTLP layer（可选）
+    let otel_layer = tracer_provider.map(|provider| {
+        let tracer = provider.tracer(service_name.to_string());
+        tracing_opentelemetry::layer().with_tracer(tracer)
+    });
 
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(console_layer)
-                .with(file)
-                .with(otel_layer)
-                .init();
-        }
-        (Some(provider), None) => {
-            // 只有 OTLP
-            let tracer = provider.tracer(service_name.to_string());
-            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(console_layer)
-                .with(otel_layer)
-                .init();
-        }
-        (None, Some(file)) => {
-            // 只有文件日志
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(console_layer)
-                .with(file)
-                .init();
-        }
-        (None, None) => {
-            // 仅控制台
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(console_layer)
-                .init();
-        }
-    }
+    // 构建完整 subscriber 链：
+    // extra_layer 先注入到 Registry 上（Box<dyn Layer<Registry>> 直接匹配 Registry），
+    // 然后 env_filter（全局过滤）、console/file（deny file_server）、otel
+    tracing_subscriber::registry()
+        .with(extra_layer)
+        .with(env_filter)
+        .with(console_layer)
+        .with(file_layer)
+        .with(otel_layer)
+        .init();
 
     Ok(())
 }
@@ -326,6 +325,7 @@ pub fn init_prometheus_only(service_name: impl Into<String>) -> Result<Telemetry
         tracer_provider: None,
         prometheus_handle: Some(prometheus_handle),
         service_name,
+        _extra_layer_guard: None,
     })
 }
 

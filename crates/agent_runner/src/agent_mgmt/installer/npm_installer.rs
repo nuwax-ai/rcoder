@@ -26,6 +26,9 @@ use crate::agent_mgmt::registry::AgentRegistry;
 /// npm install timeout(5 分钟)
 const NPM_INSTALL_TIMEOUT_SECS: u64 = 300;
 
+/// `npm root -g` 路径查询超时（正常 <1s；卡住会永久占用安装锁，故加宽裕上限）
+const NPM_ROOT_TIMEOUT_SECS: u64 = 30;
+
 /// 通过 npm 全局安装一个包,自动定位入口二进制并写入注册表
 pub async fn install_from_npm(
     registry: &AgentRegistry,
@@ -54,6 +57,7 @@ pub async fn install_from_npm(
     let output = tokio::time::timeout(
         Duration::from_secs(NPM_INSTALL_TIMEOUT_SECS),
         Command::new("npm")
+            .kill_on_drop(true)
             .arg("install")
             .arg("-g")
             .arg(package)
@@ -80,13 +84,22 @@ pub async fn install_from_npm(
         )));
     }
 
-    // 2. 解析全局 node_modules 路径
-    let npm_root_output = Command::new("npm")
-        .arg("root")
-        .arg("-g")
-        .output()
-        .await
-        .map_err(AgentMgmtError::Io)?;
+    // 2. 解析全局 node_modules 路径（加超时 + kill_on_drop，避免 npm 卡住时子进程变孤儿占安装锁）
+    let npm_root_output = tokio::time::timeout(
+        Duration::from_secs(NPM_ROOT_TIMEOUT_SECS),
+        Command::new("npm")
+            .kill_on_drop(true)
+            .arg("root")
+            .arg("-g")
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        AgentMgmtError::CommandTimeout(format!(
+            "npm root -g (timed out after {NPM_ROOT_TIMEOUT_SECS}s)"
+        ))
+    })?
+    .map_err(AgentMgmtError::Io)?;
     if !npm_root_output.status.success() {
         return Err(AgentMgmtError::InstallFailed(
             "npm root -g failed".to_string(),

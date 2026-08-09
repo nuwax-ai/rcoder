@@ -1,0 +1,47 @@
+# Golden v1 release lock —— 永久保留，用于回归"最老支持的版本仍能经 load_release_lock 正常加载"。
+# 形状对齐 backend-go 模板的真实 project.manifest.toml 经 build_release_lock 产出的 lock。
+# 引入新版本时新增 v{N} fixture，**不要删除本文件**。
+schema_version = 1
+release_id = "01923a5f8c217abc9def0123456789ab"
+workspace_name = "demo"
+minimum_app_cli_version = "0.1.3"
+runtime_image_digest = "registry.example/app-runtime:0.1.140"
+bridge_service = "backend-go"
+
+[pingap]
+mode = "managed"
+version = "0.13.8"
+commit = "abc123"
+
+[[services]]
+service_id = "backend-go"
+name = "Go Backend"
+dir = "backend-go"
+type = "go"
+kind = "web"
+enabled = true
+port = 4100
+
+[services.run]
+command = ["./server"]
+migrate = []
+depends_on = []
+shutdown_timeout_seconds = 30
+
+[services.health]
+startup_path = "/health"
+readiness_path = "/ready"
+liveness_path = "/health"
+
+[services.proxy]
+path = "/api/go/"
+strip_prefix = true
+plugins = []
+upstream_includes = []
+
+[[services.logs]]
+id = "application"
+glob = "backend-go*.log*"
+format = "jsonl"
+
+[services.env]

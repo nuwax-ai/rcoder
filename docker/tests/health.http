@@ -1,0 +1,5 @@
+### file-server 健康检查
+GET {{base_url}}/health
+
+### rcoder 健康检查 (端口 8090)
+GET http://127.0.0.1:8090/health

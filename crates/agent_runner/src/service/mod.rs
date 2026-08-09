@@ -1,5 +1,6 @@
 pub mod agent_registry;
 pub mod agent_session_service;
+mod cancel;
 pub mod chat_handler;
 #[cfg(feature = "http-server")]
 pub mod local_agent_service;

@@ -76,7 +76,7 @@ pub struct GatewayProxy {
 }
 
 impl GatewayProxy {
-    pub fn new(config: Arc<GatewayConfig>) -> Self {
+    pub fn new(config: Arc<GatewayConfig>) -> anyhow::Result<Self> {
         let control_client = ControlPlaneClient::new(config.control_plane_url.clone());
         let ttl = config.cache_ttl();
 
@@ -91,13 +91,14 @@ impl GatewayProxy {
             config.control_plane_url, config.namespace, cluster_domain
         );
 
-        Self {
-            route_table: build_route_table(),
+        Ok(Self {
+            route_table: build_route_table()
+                .map_err(|error| anyhow::anyhow!("build gateway route table: {error}"))?,
             config,
             cluster_cache,
             session_resolver,
             cluster_domain,
-        }
+        })
     }
 
     fn resolve_route(&self, path: &str) -> (RouteType, HashMap<String, String>) {

@@ -1,0 +1,29 @@
+### build: 端口池状态
+GET {{base_url}}/api/build/port-pool-status
+
+### build: 列出 dev server
+GET {{base_url}}/api/build/list-dev
+
+### build: 启动 dev server
+POST {{base_url}}/api/build/start-dev
+Content-Type: application/json
+
+{"projectId": "{{test_project}}"}
+
+### build: keep-alive
+POST {{base_url}}/api/build/keep-alive
+Content-Type: application/json
+
+{"projectId": "{{test_project}}", "pid": 0}
+
+### build: 停止 dev server
+POST {{base_url}}/api/build/stop-dev
+Content-Type: application/json
+
+{"projectId": "{{test_project}}", "pid": 0}
+
+### build: 解析构建错误
+POST {{base_url}}/api/build/parse-build-error
+Content-Type: application/json
+
+{"error": "Module not found: Can't resolve './missing'"}

@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use shared_types::InstallType;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent_mgmt::error::{AgentMgmtError, AgentMgmtResult};
 use crate::agent_mgmt::installer::AgentManifest;
@@ -118,8 +118,13 @@ pub async fn uninstall_version(
             .path_manager()
             .agent_dir(agent_id)
             .map_err(AgentMgmtError::InvalidManifest)?;
-        // best-effort: remove_dir 只能删空目录
-        let _ = tokio::fs::remove_dir(&agent_dir).await;
+        // best-effort: remove_dir 只能删空目录，非空时失败属正常，记 debug 即可
+        if let Err(e) = tokio::fs::remove_dir(&agent_dir).await {
+            debug!(
+                "[agent_mgmt] best-effort remove_dir {} failed: {e}",
+                agent_dir.display()
+            );
+        }
     }
 
     info!(
@@ -134,7 +139,23 @@ fn validate_binary_path(binary_path: &str, install_dir: &Path) -> AgentMgmtResul
     let binary_path = std::path::PathBuf::from(binary_path);
     let within_install = match (binary_path.canonicalize(), install_dir.canonicalize()) {
         (Ok(canon_bin), Ok(canon_inst)) => canon_bin.starts_with(&canon_inst),
-        _ => binary_path.starts_with(install_dir),
+        // canonicalize 失败（文件不存在/无权限）。对含 `..` 的路径 fail-closed：
+        // 含 `..` 的篡改路径无法 canonicalize 验证，直接拒绝防穿越（与
+        // archive_installer::ensure_within 一致）；不含 `..` 的（如已删除的合法
+        // binary）放行字符串 starts_with，避免破坏对遗留条目的清理。
+        _ => {
+            use std::path::Component;
+            if binary_path
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+            {
+                return Err(AgentMgmtError::InvalidManifest(format!(
+                    "binary_path '{}' contains '..' and cannot be canonicalized — refusing (possible traversal)",
+                    binary_path.display()
+                )));
+            }
+            binary_path.starts_with(install_dir)
+        }
     };
     if !within_install {
         return Err(AgentMgmtError::InvalidManifest(format!(
@@ -160,11 +181,11 @@ mod tests {
             std::process::id(),
             n
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(std::fs::remove_dir_all(&dir));
         crate::agent_mgmt::path_manager::PathManager::new_with_root(dir)
     }
 
-    fn sample(id: &str, install_type: InstallType, install_dir: &std::path::Path) -> AgentManifest {
+    fn sample(id: &str, install_type: InstallType, install_dir: &Path) -> AgentManifest {
         let binary_path = install_dir.join("bin").join(id);
         let mut m = AgentManifest::new(
             id.into(),
@@ -183,7 +204,7 @@ mod tests {
         id: &str,
         version: &str,
         install_type: InstallType,
-        install_dir: &std::path::Path,
+        install_dir: &Path,
     ) -> AgentManifest {
         let binary_path = install_dir.join(id).join(version).join(id);
         let mut m = AgentManifest::new(

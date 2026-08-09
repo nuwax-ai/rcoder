@@ -113,6 +113,11 @@ pub fn get_default_config_by_service_type(
     match service_type {
         shared_types::ServiceType::WebAgentRunner => &DEFAULT_CONFIG,
         shared_types::ServiceType::ComputerAgentRunner => &COMPUTER_AGENT_CONFIG,
+        // UserApp / UserAppBuilder 不是 agent，无 agent config；兜底返回 WebAgent 默认配置
+        // （运行时这些路径不应调用此函数）
+        shared_types::ServiceType::UserApp | shared_types::ServiceType::UserAppBuilder => {
+            &DEFAULT_CONFIG
+        }
     }
 }
 

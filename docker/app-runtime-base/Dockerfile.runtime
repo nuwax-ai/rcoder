@@ -1,0 +1,58 @@
+# ============================================================================
+# app-runtime: 统一多语言应用运行时（Rust + Node + Python + Java + Go）
+# ============================================================================
+# 合并原 Dockerfile.{node,python,java,go,rust} 为单镜像 —— 用户部署任意语言应用，
+# workspace 多语言项目（前端+后端不同语言）可同容器运行，不再按语言拆镜像。
+#
+# 基础设施 + Rust（rust:trixie）继承自 app-runtime-base（Dockerfile）。本层补 Node/Python/Java/Go。
+# ENTRYPOINT=start-app.sh（base 继承），UserApp command 覆盖 CMD 作 args 传入。
+#
+# ⚠️ Python 用 Debian bookworm 自带 3.11（原 deadsnakes PPA 仅 Ubuntu，Debian 不可用）。
+# ⚠️ 镜像体积：Rust(~1.5G,来自 base)+Go+JDK+Python+Node，约 4-5GB —— 全语言自由的代价。
+ARG BASE_IMAGE=app-runtime-base:latest
+FROM ${BASE_IMAGE}
+
+# ── Node.js / TypeScript（+ pnpm 锁大版本 10 + Deno）──────────────────────────
+ENV NODE_VERSION=24
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g pm2 typescript ts-node pnpm@10 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Deno（JS/TS 运行时，最新版；DENO_INSTALL=/usr/local → /usr/local/bin/deno，在默认 PATH）
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+
+# ── Python（Debian bookworm 自带 3.11）+ uv ───────────────────────────────────
+# uv（Astral 极速 Python 包管理器，最新版）经 pip 装到 /usr/local/bin，在默认 PATH。
+RUN apt-get update && apt-get install -y \
+       python3 \
+       python3-pip \
+       python3-venv \
+       python3-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && pip3 install --no-cache-dir --break-system-packages pip setuptools wheel virtualenv uv
+
+# ── Java (OpenJDK 25 LTS + Maven + Gradle + Arthas) ─────────────────────────
+RUN apt-get update && apt-get install -y openjdk-25-jdk maven gradle \
+    && rm -rf /var/lib/apt/lists/* \
+    && ARCH=$(dpkg --print-architecture) \
+    && ln -s /usr/lib/jvm/java-25-openjdk-${ARCH} /usr/lib/jvm/java-25-openjdk-current \
+    && curl -fsSL https://arthas.aliyun.com/arthas-boot.jar -o /usr/local/bin/arthas-boot.jar \
+    && printf '#!/bin/bash\njava -jar /usr/local/bin/arthas-boot.jar "$@"\n' > /usr/local/bin/arthas \
+    && chmod +x /usr/local/bin/arthas
+ENV JAVA_HOME=/usr/lib/jvm/java-25-openjdk-current
+
+# ── Go ────────────────────────────────────────────────────────────────────────
+ENV GO_VERSION=1.26.4
+RUN ARCH=$(dpkg --print-architecture) \
+    && wget -q https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz -O /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+ENV GOPATH=/root/go
+
+# Rust 已在 app-runtime-base（rust:trixie）层提供，cargo 在 PATH（base ENV 透传）。
+# 聚合 PATH：Go + Go bin（node 在 /usr/bin、python/java 在默认 PATH，无需追加）
+ENV PATH="/usr/local/go/bin:${GOPATH}/bin:${PATH}"
+
+# 入口继承 base：ENTRYPOINT=start-app.sh，CMD 被 UserApp command 覆盖

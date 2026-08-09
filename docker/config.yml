@@ -145,6 +145,19 @@ docker_config:
           cpu_limit: 2.0
           swap_limit: 8589934592 # 8GB
 
+        # 可选：Docker 模式子容器安全参数（仅 Docker 部署生效；老内核 EPERM 时启用，运维自负其责）
+        # 未配置（保持注释）时走代码默认：privileged=false + cap_drop=[NET_RAW,NET_ADMIN]。
+        # 一旦配置则整体覆盖默认；字段语义与 docker-compose.yml 的 security_opt 一致，可直接照搬。
+        # security:
+        #   security_opt:
+        #     - "seccomp=unconfined"      # 关闭 seccomp（老内核兼容）
+        #     - "apparmor=unconfined"     # 关闭 apparmor
+        #   cap_add:
+        #     - "SYS_PTRACE"              # chrome sandbox 常需要
+        #   # privileged: true            # 极端情况才开，会移除几乎所有内核限制
+        #   # pids_limit: 200             # 进程数上限（0/-1 表示无限制）
+        #   # init: true                  # 容器内运行 init 进程（转发信号 + 回收僵尸）
+
         work_dir: "/app"
         network_mode: "bridge"
 
@@ -174,6 +187,36 @@ docker_config:
             read_only: true
             mount_type: "bind"
             resolve_from: "/app/assets"
+
+      # UserAppBuilder 服务配置(路B:UserApp 构建 agent-runner)
+      # 复用 dev-rcoder-agent-runner 镜像(容器隔离但镜像共享),独立 per-app PVC。
+      # 容器名 rcoder-app-builder-{app_id},PVC 复用运行时 rcoder-app-{app_id}-workspace。
+      user-app-builder:
+        service_type: "user-app-builder"
+        image: "dev-rcoder-agent-runner:latest"
+        arm64_image: "dev-rcoder-agent-runner:latest"
+        amd64_image: "dev-rcoder-agent-runner:latest"
+        default_image: "dev-rcoder-agent-runner:latest"
+        image_tag_prefix: "rcoder-app-builder"
+        enabled: true
+        workspace_resolution_path: "/app/userapp-workspace"
+        environment:
+          RUST_LOG: "debug"
+          PROJECT_WORKSPACE_BASE: "/app/userapp-workspace"
+          # UserAppBuilder 跑内嵌 file-server(build 入口 :60000)
+          RCODER_EMBED_FILE_SERVER: "true"
+          PROJECT_SOURCE_DIR: "/app/userapp-workspace"
+        command:
+          - "/usr/local/bin/agent_runner"
+          - "--port"
+          - "8086"
+        resource_limits:
+          memory_limit: 2147483648 # 2GB
+          cpu_limit: 2.0
+          swap_limit: 4294963648 # 4GB
+        work_dir: "/app"
+        network_mode: "bridge"
+        mounts: []
 
     # 镜像选择策略
     selection_strategy: "ServiceOnly"

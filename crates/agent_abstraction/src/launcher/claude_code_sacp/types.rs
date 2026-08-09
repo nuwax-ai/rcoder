@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use super::super::lifecycle::AgentLifecycleGuard;
 use crate::acp::CancelNotificationRequestWrapper;
 
-/// 使用最新协议版本
-pub(crate) const VERSION: ProtocolVersion = ProtocolVersion::LATEST;
+/// 使用 v1 稳定协议版本（与所有 ACP v1 agent 兼容）
+pub(crate) const VERSION: ProtocolVersion = ProtocolVersion::V1;
 
 /// 环境变量键名常量
 pub(crate) const ENV_ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
@@ -18,6 +18,10 @@ pub(crate) const ENV_ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
 pub(crate) const ENV_ANTHROPIC_MODEL: &str = "ANTHROPIC_MODEL";
 pub(crate) const ENV_DISABLE_NONESSENTIAL: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
 pub(crate) const ENV_AGENT_SDK_SKIP_VERSION_CHECK: &str = "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK";
+/// 双保险：显式禁用错误上报（Sentry/Datadog），防止 claude 版本变化导致总开关覆盖不全
+pub(crate) const ENV_DISABLE_ERROR_REPORTING: &str = "DISABLE_ERROR_REPORTING";
+/// 双保险：显式禁用 GrowthBook 特性开关轮询（cdn.growthbook.io）
+pub(crate) const ENV_DISABLE_GROWTHBOOK: &str = "DISABLE_GROWTHBOOK";
 pub(crate) const ENV_RUST_LOG: &str = "RUST_LOG";
 pub(crate) const ENV_AGENT_WORKING_DIR: &str = "AGENT_WORKING_DIR";
 pub(crate) const ENV_AGENT_PROJECT_ID: &str = "AGENT_PROJECT_ID";

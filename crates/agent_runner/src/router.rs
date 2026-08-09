@@ -59,7 +59,7 @@ pub struct AppState {
 /// 创建 Axum 路由
 pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>>) -> Router {
     let api_routes = Router::new()
-        .route("/health", get(handler::health_check))
+        .route("/health", get(handler::ready_check))
         .with_state(state.clone());
 
     let mut router = Router::new().merge(api_routes).merge(create_swagger_ui());
@@ -106,7 +106,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        handler::health_check,
+        handler::ready_check,
     ),
     components(
         schemas(

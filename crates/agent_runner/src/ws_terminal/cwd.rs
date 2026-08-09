@@ -19,11 +19,12 @@
 
 use std::path::{Path, PathBuf};
 
+use shared_types::paths::WORKSPACE_ROOT;
+
 /// ComputerAgentRunner 容器内项目目录前缀（per-user 容器，不受隔离模式影响）
 const HOME_PREFIX: &str = "/home/user";
 
-/// WebAgentRunner 容器内工作区根（其下按隔离模式分单级/三级）
-const WEB_WORKSPACE_PREFIX: &str = "/app/project_workspace";
+// WebAgentRunner 工作区根用 shared_types::paths::WORKSPACE_ROOT (单一事实源, 不再本地定义)
 
 /// project_id 合法字符集：字母数字、`-`、`_`
 ///
@@ -64,8 +65,12 @@ pub fn resolve_project_cwd(
             // per-user 容器：项目目录恒为单级 /home/user/{project_id}
             resolve_in_candidates(project_id, &[HOME_PREFIX])
         }
-        Some(ServiceType::WebAgentRunner) => {
+        Some(ServiceType::WebAgentRunner)
+        | Some(ServiceType::UserApp)
+        | Some(ServiceType::UserAppBuilder) => {
             // 共享容器三级优先，单项目隔离单级兜底
+            // UserApp 不由 agent_runner 托管；UserAppBuilder 经 file-server build,终端 cwd 兜底此路径
+            // (此处仅兜底,运行时不应进入)
             let prefixes = build_web_prefixes(tenant, space);
             let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
             resolve_in_candidates(project_id, &refs)
@@ -91,9 +96,9 @@ fn build_web_prefixes(tenant: Option<&str>, space: Option<&str>) -> Vec<String> 
         .filter(|s| is_valid_project_id(s))
         .zip(space.filter(|s| is_valid_project_id(s)));
     if let Some((t, s)) = valid_pair {
-        out.push(format!("{WEB_WORKSPACE_PREFIX}/{t}/{s}"));
+        out.push(format!("{WORKSPACE_ROOT}/{t}/{s}"));
     }
-    out.push(WEB_WORKSPACE_PREFIX.to_string());
+    out.push(WORKSPACE_ROOT.to_string());
     out
 }
 
@@ -135,7 +140,10 @@ mod tests {
     #[test]
     fn rejects_invalid_chars() {
         // WebAgentRunner 需要 project_id，无效字符应返回 None
-        assert_eq!(resolve_project_cwd("web-agent-runner", "../etc", "", ""), None);
+        assert_eq!(
+            resolve_project_cwd("web-agent-runner", "../etc", "", ""),
+            None
+        );
         assert_eq!(resolve_project_cwd("web-agent-runner", "a/b", "", ""), None);
         assert_eq!(resolve_project_cwd("web-agent-runner", "a;b", "", ""), None);
         assert_eq!(resolve_project_cwd("web-agent-runner", "a b", "", ""), None);
@@ -149,8 +157,8 @@ mod tests {
         let result = resolve_project_cwd("computer-agent-runner", "1553211", "t", "s");
         // 在容器环境中应该返回 Some("/home/user/1553211")，在非容器环境中返回 None
         // 这里只测试逻辑正确性，不测试实际路径
-        if result.is_some() {
-            assert_eq!(result.unwrap().to_str().unwrap(), "/home/user/1553211");
+        if let Some(cwd) = result.as_ref() {
+            assert_eq!(cwd.to_str().unwrap(), "/home/user/1553211");
         }
     }
 

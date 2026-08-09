@@ -62,11 +62,15 @@ pub async fn proxy_status(
 
     // 收集后端列表
     let backends_arc = svc.backends();
-    let backends_map = backends_arc.read().await;
-    let backend_count = backends_map.len();
+    let backend_snapshot = backends_arc
+        .load()
+        .iter()
+        .map(|(port, host)| (*port, host.clone()))
+        .collect::<Vec<_>>();
+    let backend_count = backend_snapshot.len();
     // 收集后端列表（从缓存快照）
     let health_map = svc.health_snapshot().await;
-    let backends = backends_map
+    let backends = backend_snapshot
         .iter()
         .map(|(port, host)| {
             if let Some(health) = health_map.get(port) {
@@ -294,7 +298,7 @@ pub async fn proxy_config(
     get,
     path = "/proxy/{port}",
     tag = "proxy",
-    summary = "重定向到 Pingora 代理（无路径）",
+    summary = "Pingora 代理 - 访问部署的应用服务（无路径，重定向）",
     description = r#"
 重定向请求到 Pingora 代理服务，无额外路径。
 
@@ -383,9 +387,18 @@ pub async fn proxy_to_port(
     get,
     path = "/proxy/{port}/{*path}",
     tag = "proxy",
-    summary = "重定向到 Pingora 代理（含路径）",
+    summary = "Pingora 代理 - 访问部署的应用服务（含路径）",
     description = r#"
 重定向请求到 Pingora 代理服务，包含完整路径信息。
+
+## 访问部署的应用服务（重点）
+通过 `POST /api/v1/apps` 部署的应用（HTTP 端口），其访问入口 `access.external.http` 返回
+`/proxy/{port}`，即本接口。用法：`GET /proxy/{应用的 HTTP 端口}/{路径}` → 经 Pingora 代理到应用后端
+（K8s 转发到 `{app_id}-svc:{port}`，Docker 转发到 container_ip:{port}）。
+
+> 例：app HTTP 端口 8080，`GET /apps/{id}` 返回 `access.external.http = "/proxy/8080"`，
+> 访问该应用：`GET /proxy/8080/api/users` → Pingora 代理到应用 `:8080/api/users`。
+> host（RCoder 入口）由调用方持有，详见应用管理手册 §1.7。
 
 ## 工作原理
 此接口会返回 307 重定向，将请求转发到 Pingora 代理服务的实际端口和路径。
@@ -474,6 +487,76 @@ pub async fn proxy_to_port_with_path(
             )
         })?;
 
+    Ok(resp)
+}
+
+/// Pingora 代理 - 访问部署的应用服务（按 app_id+port 路由，含路径）
+#[utoipa::path(
+    get,
+    path = "/proxy/apps/{app_id}/{port}/{*path}",
+    tag = "应用管理",
+    summary = "Pingora 代理 - 访问部署的应用服务（按 app_id 路由，含路径）",
+    description = r#"
+访问 `POST /api/v1/apps` 部署的应用（HTTP 端口）。`access.external.http` 返回 `/proxy/apps/{app_id}/{port}`，即本接口。
+按 (app_id, port) 路由到应用后端（K8s→`{app_id}-svc:{port}`，Docker→container_ip:{port}），**多 app 同端口不冲突**。
+
+> 例：app HTTP 端口 8080，`GET /apps/{id}` 返回 `access.external.http = "/proxy/apps/{app_id}/8080"`，
+> 访问该应用：`GET /proxy/apps/{app_id}/8080/api/users` → Pingora 代理到应用 `:8080/api/users`。
+> host（Pingora 入口）由调用方持有，详见应用管理手册 §1.7。
+
+（此 axum 接口返回 307 重定向到 Pingora 端口；生产建议直接访问 Pingora 的 `/proxy/apps/{app_id}/{port}/{path}`）
+"#,
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("port" = u16, Path, description = "应用的 HTTP 端口"),
+        ("path" = String, Path, description = "应用内的路径")
+    ),
+    responses(
+        (status = 307, description = "重定向到 Pingora 代理服务", body = String),
+        (status = 503, description = "代理服务未启用", body = ProxyErrorResponse)
+    )
+)]
+pub async fn proxy_to_app_with_path(
+    State(state): State<Arc<AppState>>,
+    Path((app_id, port, path)): Path<(String, u16, String)>,
+) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
+    let Some(proxy_config) = state.config.proxy_config.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProxyErrorResponse {
+                error: "PROXY_DISABLED".to_string(),
+                message: "Pingora proxy service not enabled".to_string(),
+                target_port: port,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        ));
+    };
+    let listen_port = proxy_config.listen_port;
+    let target_path = if path.is_empty() || path == "/" {
+        "/".to_string()
+    } else {
+        format!("/{}", path)
+    };
+    // 重定向到 Pingora 的 app 专用代理路径（按 app_id+port 路由，多 app 同端口不冲突）
+    let location = format!(
+        "http://127.0.0.1:{}/proxy/apps/{}/{}{}",
+        listen_port, app_id, port, target_path
+    );
+    let resp = axum::http::Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(axum::http::header::LOCATION, location)
+        .body(axum::body::Body::empty())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProxyErrorResponse {
+                    error: "RESPONSE_BUILD_ERROR".to_string(),
+                    message: format!("failed to build response: {}", e),
+                    target_port: port,
+                    timestamp: Utc::now().to_rfc3339(),
+                }),
+            )
+        })?;
     Ok(resp)
 }
 
