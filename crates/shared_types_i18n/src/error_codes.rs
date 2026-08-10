@@ -170,6 +170,10 @@ pub const ERR_AGENT_RUNNER_UNAVAILABLE: &str = "ERR_AGENT_RUNNER_UNAVAILABLE";
 /// 可重试 —— 通常容器会自动恢复(STS restartPolicy)或可重新发起会话。
 pub const ERR_AGENT_CONTAINER_UNAVAILABLE: &str = "ERR_AGENT_CONTAINER_UNAVAILABLE";
 
+/// 模型服务不可用(预检探活发现:模型端点返回 5xx 或连接拒绝/DNS/TLS 失败)。
+/// 可重试 —— 模型恢复后用户重试即可。
+pub const ERR_MODEL_UNAVAILABLE: &str = "ERR_MODEL_UNAVAILABLE";
+
 // ========== 应用管理服务错误码 ==========
 
 /// 资源不存在
@@ -218,6 +222,7 @@ pub fn is_retryable_code(code: &str) -> bool {
             | ERR_IMAGE_PULL_FAILED
             | ERR_RESOURCE_EXHAUSTED
             | ERR_AGENT_CONTAINER_UNAVAILABLE
+            | ERR_MODEL_UNAVAILABLE
     )
 }
 
@@ -274,6 +279,7 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_PROJECT_NOT_FOUND => "error.project_not_found",
         ERR_AGENT_RUNNER_UNAVAILABLE => "error.agent_runner_unavailable",
         ERR_AGENT_CONTAINER_UNAVAILABLE => "error.agent_container_unavailable",
+        ERR_MODEL_UNAVAILABLE => "error.model_unavailable",
         ERR_NOT_FOUND => "error.not_found",
         ERR_CONFLICT => "error.conflict",
         ERR_APP_NOT_FOUND => "error.app_not_found",
@@ -378,6 +384,7 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_PROJECT_NOT_FOUND => "Project not found or stopped",
         ERR_AGENT_RUNNER_UNAVAILABLE => "Agent Runner container is unavailable",
         ERR_AGENT_CONTAINER_UNAVAILABLE => "Agent compute environment is unavailable",
+        ERR_MODEL_UNAVAILABLE => "Model service is unavailable",
         ERR_APP_NOT_FOUND => "Application not found",
         ERR_APP_ALREADY_EXISTS => "Application already exists",
         ERR_INVALID_STATE => "Operation not allowed in current state",
@@ -447,6 +454,7 @@ mod tests {
             ERR_PROJECT_NOT_FOUND,
             ERR_AGENT_RUNNER_UNAVAILABLE,
             ERR_AGENT_CONTAINER_UNAVAILABLE,
+            ERR_MODEL_UNAVAILABLE,
         ];
 
         for code in codes {

@@ -8,6 +8,10 @@
 # 用法: make dev-restart PUSH_IMAGE=true
 PUSH_IMAGE ?= false
 
+# Buildx 远程 builder（留空=本地 docker build；CI/远程构建时设为 nuwax-clusters 等）
+# 用法: make dev-restart BUILDX_BUILDER=nuwax-clusters
+BUILDX_BUILDER ?=
+
 # Docker 镜像构建（仅构建镜像，不编译）
 # 串行构建镜像，避免资源竞争
 docker-build:
@@ -148,13 +152,23 @@ docker-build-agent-runner:
 		echo "🔒 跳过 eBPF 工具安装（生产模式）"; \
 	fi; \
 	cd docker/rcoder-agent-runner && \
-		docker buildx build --platform linux/$(DOCKER_HOST_ARCH) --load \
-			--build-arg BASE_IMAGE=dev-rcoder-agent-base:latest \
-			--build-arg CACHEBUST=$$(date +%s) \
-			--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
-			--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
-			--build-arg INSTALL_ALLOY="$${INSTALL_EBPF}" \
-			-f Dockerfile -t dev-rcoder-agent-runner:latest .;)
+		if [ -n "$(BUILDX_BUILDER)" ]; then \
+			docker buildx build --builder $(BUILDX_BUILDER) --platform linux/$(DOCKER_HOST_ARCH) --load \
+				--build-arg BASE_IMAGE=dev-rcoder-agent-base:latest \
+				--build-arg CACHEBUST=$$(date +%s) \
+				--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
+				--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
+				--build-arg INSTALL_ALLOY="$${INSTALL_EBPF}" \
+				-f Dockerfile -t dev-rcoder-agent-runner:latest . ; \
+		else \
+			docker build \
+				--build-arg BASE_IMAGE=dev-rcoder-agent-base:latest \
+				--build-arg CACHEBUST=$$(date +%s) \
+				--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
+				--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
+				--build-arg INSTALL_ALLOY="$${INSTALL_EBPF}" \
+				-f Dockerfile -t dev-rcoder-agent-runner:latest . ; \
+		fi;)
 	@echo "✅ dev-computer-agent-runner 镜像构建完成！"
 	@if [ "$(CARGO_FEATURES)" != "" ]; then \
 		echo "🔧 eBPF 调试模式已启用，容器将以特权模式运行"; \

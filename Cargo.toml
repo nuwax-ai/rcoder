@@ -205,6 +205,10 @@ reqwest = { version = "0.13", default-features = false, features = [
     "system-proxy",
 ] }
 
+# Multi-AI provider client (Anthropic/OpenAI 协议抽象,用于 model_probe 探活)
+# 0.6.5 稳定版;默认 rustls-tls,依赖足迹与 workspace 基本重合
+genai = "0.6.5"
+
 # 项目依赖 - 保留核心功能
 aho-corasick = "1.1"
 base64 = "0.22"
@@ -300,6 +304,7 @@ container-runtime-api = { path = "crates/container-runtime-api" }
 download_utils = { path = "crates/download_utils" }
 process_utils = { path = "crates/process_utils" }
 file-server = { path = "crates/file-server" }
+model_probe = { path = "crates/model_probe" }
 
 # Pyroscope Continuous Profiling
 pyroscope = { version = "2.0", features = ["backend-pprof-rs"] }

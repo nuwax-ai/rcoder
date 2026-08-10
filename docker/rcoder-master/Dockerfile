@@ -101,13 +101,16 @@ RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
 
 # 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
-RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest
+# 使用官方 npm 源，国内镜像可能未同步平台二进制包（nuwaxcode-linux-arm64 等）
+RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest --registry=https://registry.npmjs.org/
 
 # 安装 nuwax-file-server（文件服务器）
-RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwax-file-server@latest
+# 使用官方 npm 源，国内镜像可能未同步
+RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwax-file-server@latest --registry=https://registry.npmjs.org/
 
 # 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
-RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest
+# 使用官方 npm 源，国内镜像可能未同步
+RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest --registry=https://registry.npmjs.org/
 
 # 配置 nuwaxcode - 禁用 websearch, webfetch 和 question 权限
 RUN mkdir -p /root/.config/opencode && \

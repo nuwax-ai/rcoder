@@ -55,14 +55,16 @@ RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
 
 # 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
-RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest
+# 使用官方 npm 源，国内镜像可能未同步
+RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest --registry=https://registry.npmjs.org/
 
 # 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
 # 使用 CACHEBUST 变量触发缓存失效
 # 安装失败时主动退出，避免构建包含不完整的镜像
+# 使用官方 npm 源，国内镜像可能未同步平台二进制包（nuwaxcode-linux-arm64 等）
 RUN echo "Cache bust: ${CACHEBUST}" && \
     echo "📦 开始安装 nuwaxcode..." && \
-    npm i -g nuwaxcode@latest && \
+    npm i -g nuwaxcode@latest --registry=https://registry.npmjs.org/ && \
     echo "✅ nuwaxcode 安装完成，开始验证..." && \
     which nuwaxcode && \
     echo "✅ nuwaxcode 验证成功: $(nuwaxcode -v)" || \

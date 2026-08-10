@@ -39,6 +39,7 @@ error.agent_container_oom: "计算环境因内存不足被重启,正在自动恢
 error.agent_container_crashloop: "计算环境启动异常,反复重启(退出码 {}),请联系管理员"
 error.agent_container_not_found: "计算环境未运行,请重新发起会话"
 error.agent_container_starting: "计算环境启动中,请稍后重试"
+error.model_unavailable: "模型服务暂不可用(无法连接或返回错误)。请检查模型配置或稍后重试。"
 
 # 服务状态
 error.service_unavailable: "服务暂时不可用"

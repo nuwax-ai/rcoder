@@ -1,0 +1,17 @@
+[package]
+name = "model_probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+shared_types = { workspace = true }
+genai = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+moka = { workspace = true }
+tracing = { workspace = true }

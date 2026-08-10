@@ -165,10 +165,10 @@ pub(crate) async fn handle_computer_chat_internal(
 
     // 🔧 关键修复：将 session 写入 SESSION_CACHE（SSE 进度流需要从这里读取）
     // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
+    // 仅成功且有有效 session_id 时才写入,避免预检失败/prepare 失败时创建 SESSION_CACHE[""]
     let session_id_str = output.session_id.clone();
-    if SESSION_CACHE.contains_key(&session_id_str) {
-        // 已存在，无需创建
-    } else {
+    if output.success && !session_id_str.is_empty() && !SESSION_CACHE.contains_key(&session_id_str)
+    {
         let data = SessionData::new(1000).await;
         match SESSION_CACHE.entry(session_id_str.clone()) {
             Entry::Occupied(_entry) => {

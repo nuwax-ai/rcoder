@@ -39,6 +39,7 @@ error.agent_container_oom: "Compute environment restarted due to out-of-memory, 
 error.agent_container_crashloop: "Compute environment is crash-looping (exit code {}). Please contact the administrator"
 error.agent_container_not_found: "Compute environment is not running. Please start a new session"
 error.agent_container_starting: "Compute environment is starting up, please retry shortly"
+error.model_unavailable: "Model service is unavailable (connection failed or returned an error). Check model config or retry later."
 
 # Service status
 error.service_unavailable: "Service temporarily unavailable"
