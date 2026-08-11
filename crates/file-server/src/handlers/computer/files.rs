@@ -1,5 +1,7 @@
-//! computer 文件类 handlers: get-file-list / delete-workspace / files-update /
-//! upload-file / upload-files / import-project。
+//! computer 文件**写类** handlers: delete-workspace / files-update / upload-file /
+//! upload-files / generate-file / import-project。
+//!
+//! 读类 handler (get-file-list / resolve-file / search-files) 见 [`super::files_read`]。
 
 use std::path::Path;
 
@@ -9,13 +11,11 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::error::AppError;
-use crate::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
+use crate::extract::{AppJson as Json, AppMultipart as Multipart};
 use crate::path_safety;
-use crate::service::{code as code_service, tree};
+use crate::service::code as code_service;
 
-use super::{
-    UserCidQuery, file_field, resolve_computer_target, text_field, validate_zip_ext, ws_path,
-};
+use super::{file_field, resolve_computer_target, text_field, validate_zip_ext, ws_path};
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -58,48 +58,6 @@ pub struct ImportProjectForm {
     pub custom_target_dir: Option<String>,
     #[schema(format = Binary)]
     pub file: String,
-}
-
-// ── get-file-list ───────────────────────────────────────────────────────────────
-
-/// `GET /api/computer/get-file-list` (对齐 nuwax getFileList):
-/// 轻量元信息遍历 (不读内容) + customTargetDir 覆盖; 目录不存在返回空数组。
-#[utoipa::path(
-    get,
-    path = "/get-file-list",
-    params(UserCidQuery),
-    responses(crate::openapi::JsonApiResponses),
-    tag = "Computer"
-)]
-pub(crate) async fn get_file_list(
-    State(state): State<AppState>,
-    Query(q): Query<UserCidQuery>,
-) -> Result<Json<Value>, AppError> {
-    let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
-        .await?;
-    // 对齐 nuwax: 目录不存在 → 返回空数组 (非报错)
-    if !crate::service::fs_util::path_exists(&path).await? {
-        return Ok(Json(json!({ "success": true, "files": [] })));
-    }
-    let mut files = tree::list_files_meta(&path, &state.config, q.proxy_path.as_deref()).await?;
-    // fileProxyUrl 追加 ?customTargetDir (对齐 nuwax; 值需 encodeURIComponent)
-    if let Some(ct) = q
-        .custom_target_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let suffix = format!(
-            "?customTargetDir={}",
-            code_service::encode_uri_component(ct)
-        );
-        for f in files.iter_mut() {
-            if let Some(u) = f.file_proxy_url.as_mut() {
-                u.push_str(&suffix);
-            }
-        }
-    }
-    Ok(Json(json!({ "success": true, "files": files })))
 }
 
 // ── delete-workspace ────────────────────────────────────────────────────────────
@@ -598,4 +556,6 @@ mod tests {
             .expect("file written under src/");
         assert_eq!(written, b"hi");
     }
+
+    // resolve_file / search_files handler 层测试已迁移至 files_read.rs。
 }

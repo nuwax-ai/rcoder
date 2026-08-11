@@ -83,6 +83,9 @@ percent-encoding = { workspace = true }
 # 文件系统无关的词法路径规范化（消除手写 Component 归约）
 path-clean = { workspace = true }
 
+# 并行目录遍历 (work-stealing 线程池), 用于 search-files 的无索引实时搜索。
+dua-core = { workspace = true }
+
 # Zip 解压/打包 (模板/upload/export/skills)
 zip = { workspace = true }
 

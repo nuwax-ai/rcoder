@@ -5,6 +5,7 @@
 /dist
 .idea
 /logs
+.zcode
 
 .classpath
 project_workspace

@@ -22,6 +22,7 @@ use super::multipart::{file_field, text_field, validate_zip_ext};
 pub(crate) mod archive;
 pub(crate) mod exec;
 pub(crate) mod files;
+pub(crate) mod files_read;
 mod process_capture;
 pub(crate) mod workspace;
 
@@ -63,7 +64,61 @@ pub(crate) struct UserCidQuery {
     pub user_id: String,
     pub c_id: String,
     #[serde(default)]
+    pub custom_target_dir: Option<String>,
+}
+
+/// `get-file-list` 查询参数: 在 `UserCidQuery` 基础上新增 `relativePath` / `recursive`
+/// (对齐 TS commit ba08d0c)。缺省 `recursive=true` (原全量递归), 向后兼容。
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FileListQuery {
+    pub user_id: String,
+    pub c_id: String,
+    #[serde(default)]
     pub proxy_path: Option<String>,
     #[serde(default)]
     pub custom_target_dir: Option<String>,
+    /// 相对工作区根的子目录 (可多级), 空 → 列根目录。
+    #[serde(default)]
+    pub relative_path: Option<String>,
+    /// 是否递归扁平列出; 默认 true。显式传 "false" → 仅当前目录一层。
+    /// 用 String 接收以对齐 TS `recursive === false || recursive === "false"` 语义。
+    #[serde(default)]
+    pub recursive: Option<String>,
+}
+
+/// `resolve-file` 查询参数 (对齐 TS resolveExistingFile)。
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResolveFileQuery {
+    pub user_id: String,
+    pub c_id: String,
+    #[serde(default)]
+    pub proxy_path: Option<String>,
+    #[serde(default)]
+    pub custom_target_dir: Option<String>,
+    pub file_path: String,
+}
+
+/// `search-files` 查询参数 (对齐 TS searchFiles)。
+/// `limit` / `max_visit` / `timeout_ms` 用 String 接收 + 手动 parse 正整数校验,
+/// 对齐 TS `requirePositiveInt` (由 Java 网关传入, 不设默认值)。
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SearchFilesQuery {
+    pub user_id: String,
+    pub c_id: String,
+    #[serde(default)]
+    pub proxy_path: Option<String>,
+    #[serde(default)]
+    pub custom_target_dir: Option<String>,
+    #[serde(default)]
+    pub relative_path: Option<String>,
+    pub kw: String,
+    pub limit: String,
+    pub max_visit: String,
+    pub timeout_ms: String,
 }

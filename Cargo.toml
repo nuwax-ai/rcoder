@@ -193,6 +193,9 @@ tree-sitter-rust = "0.24"                                          # 使用 crat
 sha2 = "0.11"
 hex = "0.4"
 walkdir = "2.5"
+# 并行目录遍历 (work-stealing 线程池), 用于 file-server search-files。
+# 取代手写 BFS: 零 syscall d_type + 多线程并行, dua-cli (gitoxide 作者 Byron 维护) 的核心库。
+dua-core = "2.41.1"
 # HTTP client。reqwest 0.13 的 default-tls 本就是 rustls(aws-lc-rs + rustls-platform-verifier 读 OS 根证书)，
 # 并无 openssl/native-tls。这里 default-features=false + 显式 rustls 固化“全 workspace 用 rustls”，
 # 防止未来 reqwest 改默认后悄悄回退；charset/http2/system-proxy 补回原默认特性。
