@@ -23,6 +23,9 @@ use serde::Serialize;
 use tokio::fs;
 
 use crate::config::Config;
+
+/// 遍历时保留的唯一隐藏文件 (其余 `.` 开头的文件跳过)。
+const KEEP_HIDDEN_FILE: &str = ".gitignore";
 use crate::error::{AppError, AppResult};
 use crate::path_safety;
 
@@ -166,7 +169,7 @@ async fn read_filtered_entries(
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
         // 隐藏文件 (除 .gitignore) 跳过 (对齐 nuwax computer traverseDirectory)
-        if name.starts_with('.') && name != ".gitignore" {
+        if name.starts_with('.') && name != KEEP_HIDDEN_FILE {
             continue;
         }
         let ft = entry.file_type().await?;

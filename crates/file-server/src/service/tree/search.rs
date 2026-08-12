@@ -19,6 +19,9 @@ use crate::error::{AppError, AppResult};
 
 use super::{FileEntry, build_file_proxy_url, resolve_subdir};
 
+/// 并行遍历线程上限: 取 CPU 并行度但封顶, 避免小目录过度开线程的调度开销。
+const MAX_SEARCH_THREADS: usize = 8;
+
 /// 搜索结果 (对齐 TS `{files, truncated, visited}`)。
 #[derive(Serialize)]
 pub struct SearchResult {
@@ -164,11 +167,11 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
         }
     };
 
-    // 线程数: 取可用并行度, 上限 8 (小目录避免过度开线程的调度开销)。
+    // 线程数: 取可用并行度, 上限 MAX_SEARCH_THREADS (小目录避免过度开线程的调度开销)。
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(8);
+        .min(MAX_SEARCH_THREADS);
 
     let walker = dua_core::walk(
         &ctx.search_root,
@@ -206,7 +209,7 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
         let name = entry.file_name.to_string_lossy().to_string();
 
         // 隐藏文件 (除 .gitignore) 跳过 (对齐 TS isExcludedSearchEntry)
-        if name.starts_with('.') && name != ".gitignore" {
+        if name.starts_with('.') && name != super::KEEP_HIDDEN_FILE {
             continue;
         }
         // 排除文件跳过

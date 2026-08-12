@@ -79,6 +79,22 @@ impl std::str::FromStr for DeploymentMode {
     }
 }
 
+// ── 默认值常量 (Default impl 与 load.rs env 回退共享, 单一事实源) ────────────────
+
+/// 遍历时排除的目录 (对齐 TS env.development TRAVERSE_EXCLUDE_DIRS)。
+pub(crate) const DEFAULT_TRAVERSE_EXCLUDE_DIRS: &str = "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.grok,.pi,.logs";
+/// 备份时排除的文件。
+pub(crate) const DEFAULT_BACKUP_TRAVERSE_EXCLUDE_FILES: &str =
+    "pnpm-lock.yaml,yarn.lock,package-lock.json";
+/// 内容遍历时排除的文件 (对齐 TS env.development CONTENT_TRAVERSE_EXCLUDE_FILES)。
+pub(crate) const DEFAULT_CONTENT_TRAVERSE_EXCLUDE_FILES: &str =
+    "AGENT.md,AGENTS.md,CLAUDE.md,pnpm-lock.yaml,yarn.lock,package-lock.json";
+/// 内联图片扩展名。
+pub(crate) const DEFAULT_INLINE_IMAGE_EXTENSIONS: &str =
+    ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif";
+/// zip-workspace 排除列表。
+pub(crate) const DEFAULT_ZIP_WORKSPACE_EXCLUDE: &str = ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json";
+
 /// 全局配置 (启动时构造一次, 经 AppState 共享)。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -208,21 +224,11 @@ impl Default for Config {
             log_read_max_bytes: 64 * 1024 * 1024,
             upload_allowed_extensions: vec![".zip".to_string()],
             attachment_allowed_extensions: default_attachment_extensions(),
-            traverse_exclude_dirs: split_default(
-                "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.grok,.pi,.logs",
-            ),
-            backup_traverse_exclude_files: split_default(
-                "pnpm-lock.yaml,yarn.lock,package-lock.json",
-            ),
-            content_traverse_exclude_files: split_default(
-                "AGENT.md,AGENTS.md,CLAUDE.md,pnpm-lock.yaml,yarn.lock,package-lock.json",
-            ),
-            inline_image_extensions: split_default(
-                ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif",
-            ),
-            zip_workspace_exclude: split_default(
-                ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json",
-            ),
+            traverse_exclude_dirs: split_default(DEFAULT_TRAVERSE_EXCLUDE_DIRS),
+            backup_traverse_exclude_files: split_default(DEFAULT_BACKUP_TRAVERSE_EXCLUDE_FILES),
+            content_traverse_exclude_files: split_default(DEFAULT_CONTENT_TRAVERSE_EXCLUDE_FILES),
+            inline_image_extensions: split_default(DEFAULT_INLINE_IMAGE_EXTENSIONS),
+            zip_workspace_exclude: split_default(DEFAULT_ZIP_WORKSPACE_EXCLUDE),
             git_enabled: false,
             git_default_author_name: "Nuwax File Server".to_string(),
             git_default_author_email: "git@nuwax.com".to_string(),

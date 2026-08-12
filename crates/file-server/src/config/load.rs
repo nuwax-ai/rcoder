@@ -211,23 +211,23 @@ impl Config {
             attachment_allowed_extensions: default_attachment_extensions(),
             traverse_exclude_dirs: env_list(
                 "TRAVERSE_EXCLUDE_DIRS",
-                "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.grok,.pi,.logs",
+                super::DEFAULT_TRAVERSE_EXCLUDE_DIRS,
             )?,
             backup_traverse_exclude_files: env_list(
                 "BACKUP_TRAVERSE_EXCLUDE_FILES",
-                "pnpm-lock.yaml,yarn.lock,package-lock.json",
+                super::DEFAULT_BACKUP_TRAVERSE_EXCLUDE_FILES,
             )?,
             content_traverse_exclude_files: env_list(
                 "CONTENT_TRAVERSE_EXCLUDE_FILES",
-                "AGENT.md,AGENTS.md,CLAUDE.md,pnpm-lock.yaml,yarn.lock,package-lock.json",
+                super::DEFAULT_CONTENT_TRAVERSE_EXCLUDE_FILES,
             )?,
             inline_image_extensions: env_list(
                 "INLINE_IMAGE_EXTENSIONS",
-                ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif",
+                super::DEFAULT_INLINE_IMAGE_EXTENSIONS,
             )?,
             zip_workspace_exclude: env_list(
                 "ZIP_WORKSPACE_EXCLUDE",
-                ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json",
+                super::DEFAULT_ZIP_WORKSPACE_EXCLUDE,
             )?,
             git_enabled: env_bool("GIT_ENABLED", false)?,
             git_default_author_name: env_str("GIT_DEFAULT_AUTHOR_NAME", "Nuwax File Server")?,
