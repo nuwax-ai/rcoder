@@ -92,34 +92,16 @@ impl FileServer {
             .layer(DefaultBodyLimit::max(request_body_limit))
             .layer(from_fn(request_id_layer))
             .layer(from_fn(locale_layer))
+            .layer(from_fn(request_log_layer))
             .layer(
-                TraceLayer::new_for_http()
-                    .make_span_with(|req: &axum::http::Request<_>| {
-                        tracing::info_span!(
-                            target: "file_server::http",
-                            "http_request",
-                            method = %req.method(),
-                            uri = %req.uri(),
-                        )
-                    })
-                    .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
-                        tracing::info!(
-                            target: "file_server::http",
-                            method = %req.method(),
-                            uri = %req.uri(),
-                            "request received"
-                        );
-                    })
-                    .on_response(
-                        |res: &Response<_>, latency: std::time::Duration, _span: &tracing::Span| {
-                            tracing::info!(
-                                target: "file_server::http",
-                                status = res.status().as_u16(),
-                                latency_ms = latency.as_millis(),
-                                "response sent"
-                            );
-                        },
-                    ),
+                TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        target: "file_server::http",
+                        "http_request",
+                        method = %req.method(),
+                        uri = %req.uri(),
+                    )
+                }),
             )
             .with_state(self.state.clone()))
     }
@@ -167,6 +149,23 @@ async fn locale_layer(req: Request, next: Next) -> Response {
         .and_then(|v| v.to_str().ok());
     let locale = shared_types::parse_accept_language(accept_lang);
     shared_types::scope_request_locale(locale, next.run(req)).await
+}
+
+/// 请求日志中间件: 记录每个请求的 method/uri/status/latency。
+/// 用 `file_server` target 确保写入文件日志 (file_layer 只收集 file_server target)。
+async fn request_log_layer(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().to_string();
+    let start = std::time::Instant::now();
+    let response = next.run(req).await;
+    tracing::info!(
+        method = %method,
+        uri = %uri,
+        status = response.status().as_u16(),
+        latency_ms = start.elapsed().as_millis(),
+        "request completed"
+    );
+    response
 }
 
 async fn not_found(req: Request) -> Response {
