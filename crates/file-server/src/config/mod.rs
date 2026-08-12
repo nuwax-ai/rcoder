@@ -215,7 +215,7 @@ impl Default for Config {
                 "pnpm-lock.yaml,yarn.lock,package-lock.json",
             ),
             content_traverse_exclude_files: split_default(
-                "pnpm-lock.yaml,yarn.lock,package-lock.json",
+                "AGENT.md,AGENTS.md,CLAUDE.md,pnpm-lock.yaml,yarn.lock,package-lock.json",
             ),
             inline_image_extensions: split_default(
                 ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif",

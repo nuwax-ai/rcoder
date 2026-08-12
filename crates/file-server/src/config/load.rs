@@ -219,7 +219,7 @@ impl Config {
             )?,
             content_traverse_exclude_files: env_list(
                 "CONTENT_TRAVERSE_EXCLUDE_FILES",
-                "pnpm-lock.yaml,yarn.lock,package-lock.json",
+                "AGENT.md,AGENTS.md,CLAUDE.md,pnpm-lock.yaml,yarn.lock,package-lock.json",
             )?,
             inline_image_extensions: env_list(
                 "INLINE_IMAGE_EXTENSIONS",
