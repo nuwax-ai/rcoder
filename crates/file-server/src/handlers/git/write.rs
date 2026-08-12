@@ -26,7 +26,7 @@ pub(crate) struct CommitBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
-    #[garde(length(min = 1))]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub message: String,
     #[serde(default)]
     #[garde(skip)]
@@ -254,7 +254,7 @@ pub(crate) struct TargetBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
-    #[garde(length(min = 1))]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub target: String,
 }
 
@@ -264,7 +264,7 @@ pub(crate) struct ResetBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
-    #[garde(length(min = 1))]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub target: String,
     #[serde(default)]
     #[garde(skip)]
@@ -277,7 +277,7 @@ pub(crate) struct RevertBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
-    #[garde(length(min = 1))]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub target: String,
     #[serde(default)]
     #[garde(skip)]

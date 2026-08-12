@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use axum::extract::State;
+use garde::Validate;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -14,6 +15,7 @@ use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
 use crate::path_safety;
 use crate::service::code as code_service;
+use crate::service::temp_file::TemporaryFile;
 
 use super::{file_field, resolve_computer_target, text_field, validate_zip_ext, ws_path};
 
@@ -135,6 +137,81 @@ pub(crate) async fn files_update(
 
 // ── upload-file / upload-files ──────────────────────────────────────────────────
 
+/// upload-file 必填字段 (multipart 提取后构造 + garde 校验; 文件字段用内置 required)。
+#[derive(garde::Validate)]
+struct UploadFileFields {
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    user_id: Option<String>,
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    cid: Option<String>,
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    file_path: Option<String>,
+    #[garde(required)]
+    data: Option<TemporaryFile>,
+}
+
+/// [`UploadFileFields`] 校验后的全必填形态 (parse, don't validate):
+/// garde 校验通过后由 [`UploadFileFields::into_validated`] 消费转换,
+/// 后续代码直接用非 Option 类型, 无需反复 ok_or_else。
+struct ValidatedUploadFile {
+    user_id: String,
+    cid: String,
+    file_path: String,
+    data: TemporaryFile,
+}
+
+impl UploadFileFields {
+    /// garde 校验 + 消费转换: 校验通过则返回全必填 [`ValidatedUploadFile`],
+    /// 失败返回 garde 校验错误。调用方拿到的值全部非 Option, 后续代码无需再处理 Option。
+    fn into_validated(self) -> Result<ValidatedUploadFile, AppError> {
+        self.validate().map_err(crate::error::from_garde)?;
+        // garde 已校验非空, 此处 ok_or_else 是防御性兜底 (不用 unwrap: 避免 panic)
+        Ok(ValidatedUploadFile {
+            user_id: self
+                .user_id
+                .ok_or_else(|| AppError::system("user_id missing after garde validation"))?,
+            cid: self
+                .cid
+                .ok_or_else(|| AppError::system("c_id missing after garde validation"))?,
+            file_path: self
+                .file_path
+                .ok_or_else(|| AppError::system("file_path missing after garde validation"))?,
+            data: self
+                .data
+                .ok_or_else(|| AppError::system("file missing after garde validation"))?,
+        })
+    }
+}
+
+/// upload-files 必填字段 (filePaths/files 数组允许为空, 仅 userId/cId 必填)。
+#[derive(garde::Validate)]
+struct UploadFilesFields {
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    user_id: Option<String>,
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    cid: Option<String>,
+}
+
+/// [`UploadFilesFields`] 校验后的全必填形态。
+struct ValidatedUploadFiles {
+    user_id: String,
+    cid: String,
+}
+
+impl UploadFilesFields {
+    fn into_validated(self) -> Result<ValidatedUploadFiles, AppError> {
+        self.validate().map_err(crate::error::from_garde)?;
+        Ok(ValidatedUploadFiles {
+            user_id: self
+                .user_id
+                .ok_or_else(|| AppError::system("user_id missing after garde validation"))?,
+            cid: self
+                .cid
+                .ok_or_else(|| AppError::system("c_id missing after garde validation"))?,
+        })
+    }
+}
+
 /// `POST /api/computer/upload-file` (对齐 nuwax computer uploadFile; multipart)。
 /// 返回 {success, message, fileSize} (不返回 filePath/originalname)。
 #[utoipa::path(post, path = "/upload-file", request_body(content = UploadFileForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
@@ -170,17 +247,19 @@ pub(crate) async fn upload_file(
             _ => {}
         }
     }
-    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
-    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
-    let file_path = file_path.ok_or_else(|| AppError::validation("filePath is required"))?;
-    let data = data.ok_or_else(|| AppError::validation("file is required"))?;
-    let ws = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref()).await?;
-    let target = path_safety::ensure_within(&ws, &file_path)?;
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let file_size = data.size();
-    crate::service::temp_file::copy_file(data.path(), &target).await?;
+    let fields = UploadFileFields {
+        user_id,
+        cid,
+        file_path,
+        data,
+    };
+    let v = fields.into_validated()?;
+    let ws =
+        resolve_computer_target(&state, &v.user_id, &v.cid, custom_target_dir.as_deref()).await?;
+    let target = path_safety::ensure_within(&ws, &v.file_path)?;
+    // copy_file 内部已 create_dir_all(parent), 无需重复
+    let file_size = v.data.size();
+    crate::service::temp_file::copy_file(v.data.path(), &target).await?;
     Ok(Json(json!({
         "success": true,
         "message": "File uploaded successfully",
@@ -190,14 +269,18 @@ pub(crate) async fn upload_file(
 
 // ── generate-file ───────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GenerateFileBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
     user_id: String,
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
     c_id: String,
     /// 文件名，可含相对子路径 (如 "src/foo.txt")；对齐 nuwax normalizeFilePath 会剥离前导 `/`。
+    #[garde(custom(crate::validation_rules::not_blank))]
     file_name: String,
     /// 文本内容，缺省视为空串。
     #[serde(default)]
@@ -223,11 +306,9 @@ pub(crate) async fn generate_file(
     State(state): State<AppState>,
     Json(body): Json<GenerateFileBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     // 对齐 TS generateFile: normalizedFileName = fileName.trim() (空判断只看 trim 后是否空)。
     let normalized = body.file_name.trim();
-    if normalized.is_empty() {
-        return Err(AppError::validation("fileName cannot be empty"));
-    }
     let content = body.content.unwrap_or_default();
     let ws = resolve_computer_target(
         &state,
@@ -292,12 +373,14 @@ pub(crate) async fn upload_files(
             _ => {}
         }
     }
-    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
-    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    let fields = UploadFilesFields { user_id, cid };
+    let v = fields.into_validated()?;
+    // 跨字段一致性 (文件路径与文件一一对应), 非纯字段校验, 保留手写
     if file_paths.len() != files_vec.len() {
         return Err(AppError::validation("filePaths and files count mismatch"));
     }
-    let ws = resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref()).await?;
+    let ws =
+        resolve_computer_target(&state, &v.user_id, &v.cid, custom_target_dir.as_deref()).await?;
     let total = file_paths.len();
     let mut success_count = 0usize;
     let mut results: Vec<Value> = Vec::new();
@@ -356,6 +439,41 @@ async fn write_file_create_parent(target: &Path, source: &Path) -> Result<(), Ap
 
 // ── import-project ──────────────────────────────────────────────────────────────
 
+/// import-project 必填字段 (userId/cId 必填非空 + zip 文件必填)。
+#[derive(garde::Validate)]
+struct ImportProjectFields {
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    user_id: Option<String>,
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    cid: Option<String>,
+    #[garde(required)]
+    data: Option<TemporaryFile>,
+}
+
+/// [`ImportProjectFields`] 校验后的全必填形态。
+struct ValidatedImportProject {
+    user_id: String,
+    cid: String,
+    data: TemporaryFile,
+}
+
+impl ImportProjectFields {
+    fn into_validated(self) -> Result<ValidatedImportProject, AppError> {
+        self.validate().map_err(crate::error::from_garde)?;
+        Ok(ValidatedImportProject {
+            user_id: self
+                .user_id
+                .ok_or_else(|| AppError::system("user_id missing after garde validation"))?,
+            cid: self
+                .cid
+                .ok_or_else(|| AppError::system("c_id missing after garde validation"))?,
+            data: self
+                .data
+                .ok_or_else(|| AppError::system("zip file missing after garde validation"))?,
+        })
+    }
+}
+
 /// `POST /api/computer/import-project` (对齐 nuwax computer importProject):
 /// 上传 zip → 解压 + removeTopLevelDir + 白名单保留合并到工作区。
 #[utoipa::path(post, path = "/import-project", request_body(content = ImportProjectForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
@@ -391,19 +509,18 @@ pub(crate) async fn import_project(
             _ => {}
         }
     }
-    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
-    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
-    let data = data.ok_or_else(|| AppError::validation("file is required"))?;
+    let fields = ImportProjectFields { user_id, cid, data };
+    let v = fields.into_validated()?;
     validate_zip_ext(file_name.as_deref())?;
     let target_dir =
-        resolve_computer_target(&state, &user_id, &cid, custom_target_dir.as_deref()).await?;
+        resolve_computer_target(&state, &v.user_id, &v.cid, custom_target_dir.as_deref()).await?;
     tokio::fs::create_dir_all(&target_dir).await?;
-    let res = crate::service::computer_ws::import_project(&target_dir, data.path()).await?;
+    let res = crate::service::computer_ws::import_project(&target_dir, v.data.path()).await?;
     Ok(Json(json!({
         "success": true,
         "message": "Project imported successfully",
-        "userId": user_id,
-        "cId": cid,
+        "userId": v.user_id,
+        "cId": v.cid,
         "targetDir": res.target_dir,
     })))
 }
@@ -526,7 +643,7 @@ mod tests {
             .err()
             .expect("empty fileName must be rejected");
         assert!(
-            err.to_string().contains("fileName cannot be empty"),
+            err.to_string().contains("cannot be empty"),
             "expected empty-fileName error, got: {err}"
         );
     }

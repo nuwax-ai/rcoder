@@ -122,7 +122,7 @@ pub async fn list_files_meta(
 /// - `None` / `""` / `"."` / `"/"` → `root` 本身;
 /// - 前导 `/` 剥离 → 兼容 `"/sub"` 这类写法 (对齐 TS `replace(/^[\/\\]+/,"")`);
 /// - 标准化后仍含 `..` (即 `..` 未被抵消, 越出根) → `Err`;
-/// - 绝对路径注入 (如 `"//etc"`) → `ensure_within_path` 兜底拒绝。
+/// - `ensure_within_path` (clean + starts_with) 做最终兜底, 双重保险。
 ///
 /// 最终经 [`path_safety::ensure_within_path`] (clean + starts_with) 兜底, 双重保险。
 pub(super) fn resolve_subdir(root: &Path, relative_path: Option<&str>) -> AppResult<PathBuf> {
@@ -155,9 +155,9 @@ pub(super) fn resolve_subdir(root: &Path, relative_path: Option<&str>) -> AppRes
 }
 
 /// 读取目录条目并按 nuwax 规则过滤 + 排序 (隐藏文件除 .gitignore / traverse_exclude_dirs /
-/// content_traverse_exclude_files; 目录在前 + 名字大小写不敏感)。供递归/单层/搜索复用。
+/// content_traverse_exclude_files; 目录在前 + 名字大小写不敏感)。供递归/单层遍历复用。
 /// 跳过既非目录也非文件的条目 (如符号链接断链), 对齐 TS `isDirectory()/isFile()` 行为。
-pub(super) async fn read_filtered_entries(
+async fn read_filtered_entries(
     dir: &Path,
     config: &Config,
 ) -> AppResult<Vec<(String, PathBuf, bool, bool)>> {
@@ -192,7 +192,7 @@ pub(super) async fn read_filtered_entries(
 }
 
 /// 计算相对 `root` 的 POSIX 风格路径。
-pub(super) fn make_relative_path(root: &Path, path: &Path) -> String {
+fn make_relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))

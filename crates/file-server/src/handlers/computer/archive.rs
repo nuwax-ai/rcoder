@@ -3,6 +3,7 @@
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use garde::Validate;
 use serde::Deserialize;
 
 use crate::AppState;
@@ -135,6 +136,7 @@ pub(crate) async fn download_all_files(
     State(state): State<AppState>,
     Query(q): Query<UserCidQuery>,
 ) -> Result<Response, AppError> {
+    q.validate().map_err(crate::error::from_garde)?;
     let src = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
         .await?;
     let prefix = format!("{}_{}/", q.user_id, q.c_id);

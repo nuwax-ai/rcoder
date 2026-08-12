@@ -15,7 +15,7 @@ use super::build_file_proxy_url;
 pub struct FileResolveResult {
     /// 相对根目录的 POSIX 风格路径 (与 TS `name` 一致)。
     pub name: String,
-    /// fileProxyUrl (含 customTargetDir 后缀); proxy_path 为空时为 None。
+    /// fileProxyUrl (不含 customTargetDir 后缀, 由 handler 统一追加); proxy_path 为空时为 None。
     pub file_proxy_url: Option<String>,
 }
 

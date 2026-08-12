@@ -18,6 +18,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use garde::Validate;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -31,11 +32,13 @@ use crate::service::userapp;
 use crate::service::userapp::tasks::BuildProgressEvent;
 
 /// `POST /api/userapp/build` 请求体。
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BuildUserAppBody {
     /// UserApp 标识（= workspace app_id = file-server project_id）。
     #[serde(deserialize_with = "deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub app_id: String,
     /// 多租户三级目录（可选，留空走单级；对齐 resolve_project）。
     #[serde(default, deserialize_with = "deserialize_optional_id_string")]
@@ -44,11 +47,14 @@ pub(crate) struct BuildUserAppBody {
     pub space_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImportProjectBody {
     #[serde(deserialize_with = "deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub app_id: String,
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub project_dir: String,
     #[serde(default, deserialize_with = "deserialize_optional_id_string")]
     pub tenant_id: Option<String>,
@@ -96,6 +102,7 @@ pub(crate) async fn build_workspace(
     State(state): State<AppState>,
     AppJson(body): AppJson<BuildUserAppBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let task_id = userapp::start_build_task(
         &state.build_tasks,
         state.resolver.clone(),
@@ -297,6 +304,7 @@ pub(crate) async fn detect_project(
     State(state): State<AppState>,
     AppJson(body): AppJson<ImportProjectBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let workspace = state
         .resolver
         .resolve_project(&crate::workspace::ProjectContext {
@@ -321,6 +329,7 @@ pub(crate) async fn confirm_project(
     State(state): State<AppState>,
     AppJson(body): AppJson<ImportProjectBody>,
 ) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let app_id = body.app_id.clone();
     let workspace = state
         .resolver

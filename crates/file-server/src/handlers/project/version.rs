@@ -3,6 +3,7 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use garde::Validate;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -13,11 +14,14 @@ use crate::extract::AppJson as Json;
 use crate::response;
 use crate::service::{project as project_service, version as version_service};
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BackupVersionBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
     #[serde(
         default,
@@ -44,13 +48,8 @@ pub(crate) async fn backup_current_version(
             "此接口已废弃,请使用 Git 版本管理 API（/api/git/*）",
         ));
     }
+    body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
-    if body.code_version.trim().is_empty() {
-        return Err(AppError::validation("codeVersion cannot be empty"));
-    }
     let ctx = ctx_from(
         &project_id,
         body.tenant_id,
@@ -71,12 +70,16 @@ pub(crate) async fn backup_current_version(
     })))
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RollbackBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub rollback_to: String,
     #[serde(
         default,
@@ -103,10 +106,8 @@ pub(crate) async fn rollback_version(
             "此接口已废弃,请使用 /api/git/rollback 进行版本回滚",
         ));
     }
+    body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
     let ctx = ctx_from(
         &project_id,
         body.tenant_id,
@@ -129,11 +130,14 @@ pub(crate) async fn rollback_version(
     })))
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExportBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
     #[serde(default)]
     pub export_type: Option<String>,
@@ -169,10 +173,8 @@ pub(crate) async fn export_project(
     State(state): State<AppState>,
     Json(body): Json<ExportBody>,
 ) -> Result<Response, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
     let ctx = ctx_from(
         &project_id,
         body.tenant_id,

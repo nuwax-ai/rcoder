@@ -11,6 +11,7 @@ pub mod response;
 pub mod routes;
 pub mod server;
 pub mod service;
+pub mod validation_rules;
 pub mod workspace;
 
 pub use workspace::{

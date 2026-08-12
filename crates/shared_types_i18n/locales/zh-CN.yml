@@ -173,3 +173,4 @@ grpc.status.vnc_ready: "VNC 服务已就绪"
 grpc.status.vnc_port_unreachable: "VNC 标记存在，但 noVNC 端口 6080 不可达"
 grpc.status.vnc_not_ready: "VNC 服务未就绪（启动中或启动失败）"
 grpc.status.vnc_backend_not_ready: "noVNC 代理就绪，但 Xvnc 后端（5900）无响应 — 后端可能卡死或已崩溃"
+

@@ -4,6 +4,7 @@
 //! files-update / upload / generate-file / import-project) 仍留在 [`super::files`]。
 
 use axum::extract::State;
+use garde::Validate;
 use serde_json::{Value, json};
 
 use crate::AppState;
@@ -29,6 +30,7 @@ pub(crate) async fn get_file_list(
     State(state): State<AppState>,
     Query(q): Query<FileListQuery>,
 ) -> Result<Json<Value>, AppError> {
+    q.validate().map_err(crate::error::from_garde)?;
     // 默认 true=原全量递归; 仅显式 "false" 时单层 (对齐 TS recursive === false || recursive === "false")。
     // 注: query 参数经 serde 解析均为字符串, 故只需匹配 "false"。
     // 提前计算: 所有返回点 (含目录不存在的早返回) 都需带上 recursive (对齐 TS 1.3.7)。
@@ -88,12 +90,10 @@ pub(crate) async fn resolve_file(
     State(state): State<AppState>,
     Query(q): Query<ResolveFileQuery>,
 ) -> Result<Json<Value>, AppError> {
+    q.validate().map_err(crate::error::from_garde)?;
     let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
         .await?;
     let file_path = q.file_path.trim();
-    if file_path.is_empty() {
-        return Err(AppError::validation("filePath cannot be empty"));
-    }
     // 目标根目录不存在 → exists:false (对齐 TS)
     if !crate::service::fs_util::path_exists(&path).await? {
         return Ok(Json(json!({ "success": true, "exists": false })));
@@ -137,14 +137,12 @@ pub(crate) async fn search_files(
     State(state): State<AppState>,
     Query(q): Query<SearchFilesQuery>,
 ) -> Result<Json<Value>, AppError> {
+    q.validate().map_err(crate::error::from_garde)?;
     let kw = q.kw.trim();
-    if kw.is_empty() {
-        return Err(AppError::validation("kw cannot be empty"));
-    }
-    // 对齐 TS requirePositiveInt: 必填正整数
-    let limit = require_positive_int(&q.limit, "limit")?;
-    let max_visit = require_positive_int(&q.max_visit, "maxVisit")?;
-    let timeout_ms = require_positive_int(&q.timeout_ms, "timeoutMs")?;
+    // garde positive_int 已保证正整数; 此处仅取数 (parse 失败逻辑不可达, 防御性处理)
+    let limit = parse_positive_int(&q.limit, "limit")?;
+    let max_visit = parse_positive_int(&q.max_visit, "maxVisit")?;
+    let timeout_ms = parse_positive_int(&q.timeout_ms, "timeoutMs")?;
 
     let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
         .await?;
@@ -193,18 +191,12 @@ pub(crate) async fn search_files(
     })))
 }
 
-/// 必填正整数校验 (对齐 TS `requirePositiveInt`)。
-fn require_positive_int(value: &str, field: &str) -> Result<usize, AppError> {
-    let n = value
+/// 取数 helper: 与 garde `positive_int` 规则配套 (校验已通过, parse 失败逻辑不可达)。
+fn parse_positive_int(value: &str, field: &str) -> Result<usize, AppError> {
+    value
         .trim()
         .parse::<usize>()
-        .map_err(|_| AppError::validation(format!("{field} must be a positive integer")))?;
-    if n == 0 {
-        return Err(AppError::validation(format!(
-            "{field} must be a positive integer"
-        )));
-    }
-    Ok(n)
+        .map_err(|_| AppError::system(format!("{field}: parse failed after garde validation")))
 }
 
 #[cfg(test)]
@@ -433,13 +425,13 @@ mod tests {
             c_id: "c".into(),
             proxy_path: None,
             custom_target_dir: None,
-            file_path: "   ".into(),
+            file_path: "".into(),
         });
         let err = resolve_file(State(state), q)
             .await
             .err()
             .expect("should reject");
-        assert!(err.to_string().contains("filePath cannot be empty"));
+        assert!(err.to_string().contains("file_path"));
     }
 
     #[tokio::test]
@@ -519,7 +511,7 @@ mod tests {
             .await
             .err()
             .expect("should reject");
-        assert!(err.to_string().contains("limit must be a positive integer"));
+        assert!(err.to_string().contains("must be a positive integer"));
     }
 
     #[tokio::test]
@@ -533,7 +525,7 @@ mod tests {
             proxy_path: None,
             custom_target_dir: None,
             relative_path: None,
-            kw: "   ".into(),
+            kw: "".into(),
             limit: "100".into(),
             max_visit: "1000".into(),
             timeout_ms: "5000".into(),
@@ -542,6 +534,6 @@ mod tests {
             .await
             .err()
             .expect("should reject");
-        assert!(err.to_string().contains("kw cannot be empty"));
+        assert!(err.to_string().contains("kw"));
     }
 }

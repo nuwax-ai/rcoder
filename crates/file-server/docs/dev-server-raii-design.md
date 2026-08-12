@@ -3,7 +3,7 @@
 > 目标读者：负责在 `crates/file-server` 落地 RAII 的实现 agent。
 > 前提结论：**`ViteManager` 已存在，就是 `DevServerManager`，无需重写。** 本文档只补 RAII guard 的正确落点。
 >
-> **状态（已落地）**：落点一（`shutdown_all` + `impl Drop` + main graceful shutdown）与落点三（`AllocGuard::disarm`）已实现并合入；落点二（`DevHandle`）当前无调用方，按 YAGNI 暂不引入；utoipa `ToSchema` 为全 crate 级缺口，单独立项。下文代码块为**实际实现**（已修复初稿中 graceful shutdown 信号未 await 的 bug）。
+> **状态（已落地）**：落点一（`shutdown_all` + `impl Drop` + main graceful shutdown）与落点三（`AllocGuard::disarm`）已实现并合入；落点二（`DevHandle`）当前无调用方，按 YAGNI 暂不引入；utoipa OpenAPI 文档化已全 crate 落地。下文代码块为**实际实现**（已修复初稿中 graceful shutdown 信号未 await 的 bug）。
 
 ---
 
@@ -261,7 +261,7 @@ port_alloc.disarm(); // 取代 std::mem::forget(port_alloc)
 | 单线程/单进程不用 dashmap | `DevServerManager` 用 `Mutex<HashMap>` + `Mutex<HashSet>`，**保持不变**，禁止引入 dashmap |
 | 生产禁用 `unwrap()`/`expect()` | 现有生产代码已用 `?`/`AppError`；**Drop 内用 `if let Ok(..)` / `unwrap_or_default`**，禁止 `.unwrap()`。测试代码可 `unwrap` |
 | Fail Fast | 启动失败（进程早退/端口耗尽/解析失败）已 Fail Fast 抛 `AppError`；Drop/shutdown 路径的失败 **记 warn 不 panic**（清理路径不能因一个进程失败影响其余） |
-| `utoipa` 给 HTTP 接口完备 OpenAPI | ⚠️ **这是全 crate 级缺口，不止 dev server**：当前 file-server 整体未引入 utoipa（无依赖、无 `#[utoipa::path]`、无 `ToSchema`）。dev server 响应体（`StartedDev`/`StoppedDev`/`KeepAliveResult`/`DevProcess`/`PortPoolStatus`/`ReadDevLogResult`）只是其中一部分。属 RAII 之外的配套缺口，建议单独立项（给 crate 加 utoipa 依赖 + router 改 `OpenApi` + 全路由补 `#[utoipa::path]`） |
+| `utoipa` 给 HTTP 接口完备 OpenAPI | ✅ **已落地（全 crate）**：file-server 已引入 `utoipa`/`utoipa-axum`/`utoipa-swagger-ui`，handler 统一加 `#[utoipa::path]`、共享响应体派生 `ToSchema`，路由经 `OpenApiRouter` 聚合并内嵌 Swagger UI（`/api-docs`）。dev server 接口（start-dev/stop-dev/restart-dev/list-dev/keep-alive 等）已纳入 OpenAPI 文档 |
 | 禁用 `unsafe` | `nix` 的 `kill`/`Pid` 是安全封装，无裸 `unsafe`，保持现状；新增代码不得引入 `unsafe` |
 | SOLID | `DevHandle`/`DevServerManager`/`PortPool` 单一职责已清晰；`shutdown_all`/`Drop` 属 manager 的生命周期职责 |
 
@@ -295,4 +295,4 @@ port_alloc.disarm(); // 取代 std::mem::forget(port_alloc)
 1. ✅ 落点三（`AllocGuard::disarm`）——最小改动，已落地。
 2. ✅ 落点一（`shutdown_all` + `impl Drop` + `main.rs` graceful shutdown）——修复孤儿进程泄漏，已落地。graceful shutdown 已验证：SIGTERM 后日志打印 "received SIGTERM, shutting down dev servers" 并干净退出。
 3. ⏸ 落点二（`DevHandle`）——无调用方，暂不实现（YAGNI）。
-4. ⏸ utoipa `ToSchema`——全 crate 级缺口，单独立项。
+4. ✅ utoipa OpenAPI 文档化——已全 crate 落地（依赖 + `#[utoipa::path]` + `ToSchema` + `OpenApiRouter` + Swagger UI）。

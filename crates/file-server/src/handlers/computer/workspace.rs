@@ -4,14 +4,78 @@
 use std::path::Path;
 
 use axum::extract::State;
+use garde::Validate;
 use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
+use crate::service::temp_file::TemporaryFile;
 use crate::service::{skills as skills_service, zip};
 
 use super::{file_field, text_field, validate_zip_ext, ws_path};
+
+/// multipart 必填文本字段 (userId/cId; 提取后构造 + garde 校验)。
+#[derive(garde::Validate)]
+struct WorkspaceFields {
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    user_id: Option<String>,
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    cid: Option<String>,
+}
+
+/// 校验 userId/cId 并取数 (对齐 TS "userId/cId is required" 语义)。
+fn require_workspace_fields(
+    user_id: Option<String>,
+    cid: Option<String>,
+) -> Result<(String, String), AppError> {
+    let fields = WorkspaceFields { user_id, cid };
+    fields.validate().map_err(crate::error::from_garde)?;
+    // 校验已保证必填; 取数 (失败逻辑不可达, 防御性处理)
+    Ok((
+        fields
+            .user_id
+            .ok_or_else(|| AppError::system("user_id missing after garde validation"))?,
+        fields
+            .cid
+            .ok_or_else(|| AppError::system("c_id missing after garde validation"))?,
+    ))
+}
+
+/// init-project-template 必填字段 (含模板 zip 文件)。
+#[derive(garde::Validate)]
+struct InitTemplateFields {
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    user_id: Option<String>,
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    cid: Option<String>,
+    #[garde(required)]
+    data: Option<TemporaryFile>,
+}
+
+/// [`InitTemplateFields`] 校验后的全必填形态。
+struct ValidatedInitTemplate {
+    user_id: String,
+    cid: String,
+    data: TemporaryFile,
+}
+
+impl InitTemplateFields {
+    fn into_validated(self) -> Result<ValidatedInitTemplate, AppError> {
+        self.validate().map_err(crate::error::from_garde)?;
+        Ok(ValidatedInitTemplate {
+            user_id: self
+                .user_id
+                .ok_or_else(|| AppError::system("user_id missing after garde validation"))?,
+            cid: self
+                .cid
+                .ok_or_else(|| AppError::system("c_id missing after garde validation"))?,
+            data: self
+                .data
+                .ok_or_else(|| AppError::system("template zip missing after garde validation"))?,
+        })
+    }
+}
 
 /// create-workspace 响应 (对齐 nuwax createWorkspace 响应字段)。
 /// workspaceRoot = COMPUTER_WORKSPACE_DIR; updatedSkills/failedSkills 空时不输出。
@@ -128,8 +192,7 @@ pub(crate) async fn create_workspace(
             _ => {}
         }
     }
-    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
-    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    let (user_id, cid) = require_workspace_fields(user_id, cid)?;
     if skill_zip.is_some() {
         validate_zip_ext(file_name.as_deref())?;
     }
@@ -198,8 +261,7 @@ pub(crate) async fn create_workspace_v2(
             _ => {}
         }
     }
-    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
-    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    let (user_id, cid) = require_workspace_fields(user_id, cid)?;
     state
         .skill_downloader
         .validate_url_count(skill_urls.len())?;
@@ -284,8 +346,7 @@ async fn push_skills_to_workspace_impl(
             _ => {}
         }
     }
-    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
-    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
+    let (user_id, cid) = require_workspace_fields(user_id, cid)?;
     state
         .skill_downloader
         .validate_url_count(skill_urls.len())?;
@@ -354,12 +415,11 @@ pub(crate) async fn init_project_template(
             _ => {}
         }
     }
-    let user_id = user_id.ok_or_else(|| AppError::validation("userId is required"))?;
-    let cid = cid.ok_or_else(|| AppError::validation("cId is required"))?;
-    let data = data.ok_or_else(|| AppError::validation("file (template zip) is required"))?;
-    let ws = ws_path(&state, &user_id, &cid).await?;
+    let fields = InitTemplateFields { user_id, cid, data };
+    let v = fields.into_validated()?;
+    let ws = ws_path(&state, &v.user_id, &v.cid).await?;
     tokio::fs::create_dir_all(&ws).await?;
-    zip::extract_to(data.path().to_path_buf(), ws.clone()).await?;
+    zip::extract_to(v.data.path().to_path_buf(), ws.clone()).await?;
     // git 双开关: GIT_ENABLED && enableGit → init + initial commit (对齐 nuwax)
     if state.config.git_enabled && enable_git {
         let an = state.config.git_default_author_name.clone();

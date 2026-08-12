@@ -2,7 +2,7 @@
 //!
 //! 错误响应体:
 //! ```jsonc
-//! { "success": false, "code": "<TYPE>",
+//! { "success": false, "code": "UNKNOWN_ERROR",
 //!   "error": { "type": "<TYPE>", "message": "...", "timestamp": "<CST>", "requestId": "..."[, "details": {}] } }
 //! ```
 //! HTTP 状态码由错误类型决定 (见 [`AppError::status_code`])。
@@ -17,6 +17,13 @@ use serde_json::{Value, json};
 pub enum AppError {
     /// VALIDATION_ERROR (400)
     Validation(String, Option<Value>),
+    /// VALIDATION_ERROR (400) — 带 i18n key 的校验错误 (英文 fallback, i18n_key)。
+    /// `into_response` 时优先用 `t(key, locale)` 翻译, 未命中则回退 fallback。
+    ///
+    /// 预留: 当前校验消息统一用英文 (garde + Validation), 此变体暂无生产调用方,
+    /// 供未来业务错误 i18n 使用 (locale 中间件已就绪)。
+    #[allow(dead_code, reason = "预留 i18n 入口, locale 中间件已就绪, 暂未接入")]
+    ValidationI18n(String, &'static str),
     /// BUSINESS_ERROR (400)
     Business(String),
     /// PERMISSION_ERROR (403)
@@ -39,6 +46,11 @@ impl AppError {
     }
     pub fn validation_with(msg: impl Into<String>, details: Value) -> Self {
         AppError::Validation(msg.into(), Some(details))
+    }
+    /// 带 i18n key 的校验错误: `fallback` 为英文兜底消息 (支持 String 动态拼接),
+    /// `key` 为 i18n 翻译 key。`into_response` 时优先按请求 locale 翻译 key, 未命中则用 fallback。
+    pub fn validation_i18n(fallback: impl Into<String>, key: &'static str) -> Self {
+        AppError::ValidationI18n(fallback.into(), key)
     }
     pub fn business(msg: impl Into<String>) -> Self {
         AppError::Business(msg.into())
@@ -64,7 +76,7 @@ impl AppError {
 
     fn type_name(&self) -> &'static str {
         match self {
-            AppError::Validation(..) => "VALIDATION_ERROR",
+            AppError::Validation(..) | AppError::ValidationI18n(..) => "VALIDATION_ERROR",
             AppError::Business(_) => "BUSINESS_ERROR",
             AppError::Permission(_) => "PERMISSION_ERROR",
             AppError::Resource(_) => "RESOURCE_ERROR",
@@ -77,7 +89,9 @@ impl AppError {
 
     fn status_code(&self) -> StatusCode {
         match self {
-            AppError::Validation(..) | AppError::Business(_) => StatusCode::BAD_REQUEST,
+            AppError::Validation(..) | AppError::ValidationI18n(..) | AppError::Business(_) => {
+                StatusCode::BAD_REQUEST
+            }
             AppError::Permission(_) => StatusCode::FORBIDDEN,
             AppError::Resource(_) => StatusCode::NOT_FOUND,
             AppError::Network(_) => StatusCode::BAD_GATEWAY,
@@ -88,6 +102,8 @@ impl AppError {
     fn message(&self) -> &str {
         match self {
             AppError::Validation(m, _) => m,
+            // 返回英文 fallback; 实际翻译在 into_response 里按 locale 做。
+            AppError::ValidationI18n(fallback, _) => fallback,
             AppError::Business(m) => m,
             AppError::Permission(m) => m,
             AppError::Resource(m) => m,
@@ -165,7 +181,21 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let typ = self.type_name();
-        let message = self.message().to_string();
+        // 对 ValidationI18n: 优先按请求 locale 翻译, 未命中则用 fallback。
+        // rust-i18n 未命中时返回 "{locale}.{key}" (如 "en-US.error.xxx"), 以此判断未命中。
+        let message = match &self {
+            AppError::ValidationI18n(fallback, key) => {
+                let locale = shared_types::current_request_locale();
+                let translated = shared_types::t(key, locale);
+                // 未命中格式: "{locale}.{key}" → 以 key 结尾且比 key 长
+                if translated.len() > key.len() && translated.ends_with(key) {
+                    fallback.clone()
+                } else {
+                    translated
+                }
+            }
+            _ => self.message().to_string(),
+        };
         let mut error = json!({
             "type": typ,
             "message": message,
@@ -247,5 +277,62 @@ mod tests {
     fn current_request_id_fallback_without_scope() {
         // task_local 未 scope 时回退 "unknown"
         assert_eq!(current_request_id(), "unknown");
+    }
+
+    #[test]
+    fn validation_i18n_type_name_and_status() {
+        let err = AppError::validation_i18n("test", "error.validation");
+        assert_eq!(err.type_name(), "VALIDATION_ERROR");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validation_i18n_message_returns_fallback() {
+        // message() (Display) 始终返回英文 fallback, 不做翻译
+        let err = AppError::validation_i18n("test fallback", "error.validation");
+        assert_eq!(err.message(), "test fallback");
+        assert_eq!(err.to_string(), "test fallback");
+    }
+
+    #[tokio::test]
+    async fn validation_i18n_into_response_translates_by_locale() {
+        // zh-CN locale: into_response 应返回 error.validation 的中文翻译
+        let result = shared_types::scope_request_locale("zh-CN", async {
+            let err = AppError::validation_i18n("test fallback", "error.validation");
+            let response = err.into_response();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            v["error"]["message"].as_str().unwrap().to_string()
+        })
+        .await;
+        // error.validation 的 zh-CN 翻译是 "参数验证失败"
+        assert_eq!(result, "参数验证失败");
+    }
+
+    #[tokio::test]
+    async fn validation_i18n_into_response_uses_en_us_when_no_locale() {
+        // 无 locale 上下文 → 回退 en-US → 翻译命中英文
+        let err = AppError::validation_i18n("test fallback", "error.validation");
+        let response = err.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        // error.validation 的 en-US 翻译是 "Validation failed"
+        assert_eq!(v["error"]["message"].as_str(), Some("Validation failed"));
+    }
+
+    #[tokio::test]
+    async fn validation_i18n_into_response_fallback_on_unknown_key() {
+        // key 不存在 → t() 返回 key 本身 → 走 fallback 分支
+        let err = AppError::validation_i18n("my fallback msg", "error.no_such_key_xyz");
+        let response = err.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["message"].as_str(), Some("my fallback msg"));
     }
 }

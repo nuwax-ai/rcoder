@@ -3,6 +3,7 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use garde::Validate;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -13,10 +14,12 @@ use crate::response;
 use crate::service::{tree, version as version_service};
 use crate::workspace::ProjectContext;
 
-#[derive(Deserialize, utoipa::IntoParams)]
+#[derive(Deserialize, Validate, utoipa::IntoParams)]
+#[garde(allow_unvalidated)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GetContentParams {
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
     pub command: Option<String>,
     pub proxy_path: Option<String>,
@@ -37,10 +40,10 @@ pub(crate) async fn get_project_content(
     State(state): State<AppState>,
     Query(params): Query<GetContentParams>,
 ) -> Response {
-    let project_id = params.project_id.trim();
-    if project_id.is_empty() {
-        return AppError::validation("Project ID cannot be empty").into_response();
+    if let Err(report) = params.validate() {
+        return crate::error::from_garde(report).into_response();
     }
+    let project_id = params.project_id.trim();
     let ctx = ProjectContext {
         project_id: project_id.to_string(),
         tenant_id: params.tenant_id.clone(),
@@ -81,11 +84,14 @@ pub(crate) async fn get_project_content(
     }
 }
 
-#[derive(Deserialize, utoipa::IntoParams)]
+#[derive(Deserialize, Validate, utoipa::IntoParams)]
+#[garde(allow_unvalidated)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GetByVersionParams {
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
     pub proxy_path: Option<String>,
     #[serde(default)]
@@ -116,10 +122,10 @@ pub(crate) async fn get_project_content_by_version(
         )
         .into_response();
     }
-    let project_id = params.project_id.trim();
-    if project_id.is_empty() {
-        return AppError::validation("Project ID cannot be empty").into_response();
+    if let Err(report) = params.validate() {
+        return crate::error::from_garde(report).into_response();
     }
+    let project_id = params.project_id.trim();
     let ctx = ProjectContext {
         project_id: project_id.to_string(),
         tenant_id: params.tenant_id.clone(),

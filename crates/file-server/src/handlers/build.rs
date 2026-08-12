@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use axum::extract::State;
+use garde::Validate;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -155,15 +156,19 @@ pub(crate) struct BuildQuery {
     isolation_type: Option<String>,
 }
 
-#[derive(Deserialize, utoipa::IntoParams)]
+#[derive(Deserialize, Validate, utoipa::IntoParams)]
+#[garde(allow_unvalidated)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct KeepAliveQuery {
+    #[garde(custom(crate::validation_rules::not_blank))]
     project_id: String,
     #[serde(default)]
+    #[garde(required)]
     pid: Option<u32>,
     port: u16,
     #[serde(default)]
+    #[garde(custom(crate::validation_rules::required_not_blank))]
     base_path: Option<String>,
     #[serde(default)]
     tenant_id: Option<String>,
@@ -253,10 +258,15 @@ pub(crate) async fn stop_dev(
     State(state): State<AppState>,
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<response::DevStopped>, AppError> {
-    q.pid
+    // pid 必填且非空 (BuildQuery 多 handler 共用, 仅 stop_dev 要求 pid; DTO 无法声明式校验)
+    if q.pid
         .as_deref()
-        .filter(|pid| !pid.trim().is_empty())
-        .ok_or_else(|| AppError::validation("Process ID cannot be empty"))?;
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        return Err(AppError::validation("pid: is required"));
+    }
     let stopped = state.dev_server.stop_dev(&q.project_id).await?;
     state.log_cache.delete(&q.project_id)?;
     // message 对齐 nuwax stopDevUtils: 全杀 "Stopped" / 部分杀 "Partially stopped..." / 无候选 "No running process found"
@@ -333,16 +343,18 @@ pub(crate) async fn keep_alive(
     State(state): State<AppState>,
     Query(q): Query<KeepAliveQuery>,
 ) -> Result<Json<response::KeepAlive>, AppError> {
-    // 对齐 nuwax buildRoutes: projectId/pid/port/basePath 必填校验
+    // 对齐 nuwax buildRoutes: projectId/pid/port/basePath 必填校验 (经 KeepAliveQuery garde)
+    q.validate().map_err(crate::error::from_garde)?;
+    // 校验已保证必填; 取数 (失败逻辑不可达, 防御性处理)
     let pid = q
         .pid
-        .ok_or_else(|| AppError::validation("pid is required"))?;
+        .ok_or_else(|| AppError::system("pid missing after garde validation"))?;
     let base_str = q
         .base_path
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::validation("basePath is required"))?;
+        .ok_or_else(|| AppError::system("base_path missing after garde validation"))?;
     let path = project_path_keep(&state, &q).await?;
     let result = state
         .dev_server

@@ -278,14 +278,12 @@ fn make_relative_posix(root: &Path, entry: &dua_core::Entry) -> String {
 }
 
 /// 关键字匹配 (对齐 TS `entryMatchesKeyword`): 文件名或相对路径含 kw (大小写不敏感)。
-/// 注: 调用方通常已预先 `kw.to_lowercase()`, 但本函数内部仍对 kw 做防御性 lower,
-/// 保证 "大小写不敏感" 契约不依赖调用方。
+/// `kw_lower` 须为已转小写的关键字 (由调用方 `kw.to_lowercase()` 保证)。
 fn entry_matches_keyword(relative_path: &str, entry_name: &str, kw_lower: &str) -> bool {
     if kw_lower.is_empty() {
         return false;
     }
-    let kw = kw_lower.to_lowercase();
-    entry_name.to_lowercase().contains(&kw) || relative_path.to_lowercase().contains(&kw)
+    entry_name.to_lowercase().contains(kw_lower) || relative_path.to_lowercase().contains(kw_lower)
 }
 
 #[cfg(test)]
@@ -513,8 +511,9 @@ mod tests {
 
     #[test]
     fn entry_matches_keyword_is_case_insensitive_substring() {
+        // kw 须为小写 (调用方保证); entry_name/relative_path 的大小写不敏感匹配
         assert!(entry_matches_keyword("src/Foo.ts", "Foo.ts", "foo"));
-        assert!(entry_matches_keyword("src/foo.ts", "foo.ts", "FOO"));
+        assert!(entry_matches_keyword("src/foo.ts", "foo.ts", "foo"));
         assert!(entry_matches_keyword("src/x.rs", "x.rs", "src/x"));
         assert!(!entry_matches_keyword("a.txt", "a.txt", "b"));
         assert!(!entry_matches_keyword("a.txt", "a.txt", "")); // 空 kw → false

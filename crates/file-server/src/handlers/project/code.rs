@@ -1,6 +1,7 @@
 //! project 文件增量/全量更新 handlers: specified-files-update / all-files-update。
 
 use axum::extract::State;
+use garde::Validate;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -10,11 +11,14 @@ use crate::error::AppError;
 use crate::extract::AppJson as Json;
 use crate::service::code as code_service;
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SpecifiedBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
     pub files: Vec<code_service::FileOp>,
     #[serde(
@@ -37,10 +41,8 @@ pub(crate) async fn specified_files_update(
     State(state): State<AppState>,
     Json(mut body): Json<SpecifiedBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
     // 路由层 decodeURIComponent (对齐 nuwax codeRoutes, 非空 string 才解, 失败保留原串)
     for op in body.files.iter_mut() {
         if let Some(c) = op.contents.as_mut()
@@ -71,11 +73,14 @@ pub(crate) async fn specified_files_update(
     })))
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AllFilesBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
     pub files: Vec<code_service::FileEntry>,
     #[serde(
@@ -104,10 +109,8 @@ pub(crate) async fn all_files_update(
     State(state): State<AppState>,
     Json(mut body): Json<AllFilesBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
     // decodeURIComponent: 仅 text 内容 (binary base64 跳过, 安全加固)
     for f in body.files.iter_mut() {
         if f.binary == Some(true) {

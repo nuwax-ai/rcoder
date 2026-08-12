@@ -10,6 +10,7 @@ pub mod dev_server;
 pub mod fs_util;
 pub mod git;
 pub mod log_cache;
+pub mod package_build;
 pub mod pnpm;
 pub mod pnpm_config;
 pub mod project;

@@ -18,7 +18,7 @@ pub(crate) struct BranchCreateBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
-    #[garde(length(min = 1))]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub branch_name: String,
     #[serde(default)]
     #[garde(skip)]
@@ -31,7 +31,7 @@ pub(crate) struct BranchNameBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
-    #[garde(length(min = 1))]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub branch_name: String,
     /// branch-delete 强制删除未合并分支 (对齐 nuwax deleteBranch force)。
     #[serde(default)]
@@ -45,7 +45,7 @@ pub(crate) struct TagCreateBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
-    #[garde(length(min = 1))]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub tag_name: String,
     #[serde(default)]
     #[garde(skip)]
@@ -58,7 +58,7 @@ pub(crate) struct TagNameBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
-    #[garde(length(min = 1))]
+    #[garde(custom(crate::validation_rules::not_blank))]
     pub tag_name: String,
 }
 

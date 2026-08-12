@@ -1,23 +1,29 @@
 //! Dev server 进程 spawn/kill/探活 (对齐 nuwax `processManager.js`)。
 //!
+//! 拆分: [`mod@self`] (spawn + run_command + 进程发现/探活) / [`signal`] (跨平台
+//! 进程组信号) / [`log_pipe`] (stdout/stderr 日志管道 + vite 噪音过滤)。
+//!
 //! 关键点 (对齐 nuwax):
 //! - `exec` 前缀让 child.pid == vite/next 本体 pid (非 sh wrapper)
 //! - `process_group(0)` 新进程组, kill 时 `kill(-pid)` 杀整组
 //! - env 最小化 (PATH + HOME + NODE_ENV=development + extra), env_clear 后显式赋值
 //! - detached: 丢弃 Child 句柄 (kill_on_drop=false), 进程独立存活, 靠 pid 杀
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::Local;
-#[cfg(unix)]
-use nix::sys::signal::{Signal, kill};
-#[cfg(unix)]
-use nix::unistd::{Pid, getpgid};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
 use crate::error::{AppError, AppResult};
+
+mod log_pipe;
+mod signal;
+
+pub use signal::*;
+
+use log_pipe::pipe_stream;
 
 /// dev server 启动参数 (program + args + env_extra)。
 pub struct DevArgs {
@@ -280,184 +286,6 @@ async fn drain_log_pipes(stdout: Option<JoinHandle<()>>, stderr: Option<JoinHand
     }
 }
 
-/// vite 在 DEBUG 模式（环境变量 `DEBUG` 含 `vite:*`）下，会把解析后的完整 config 对象
-/// dump 到 stderr，例如：
-/// ```text
-/// 2026-08-02T12:53:31.651Z vite:config using resolved config: {
-///   ...
-///   logger: {
-///     info: [Function: info],
-///     ...
-///     hasErrorLogged: [Function: hasErrorLogged]
-///   },
-///   packageCache: Map(1) { ... }
-/// }
-/// ```
-/// 这些 `[Function: ...]` 噪音被 `pipe_stream` 写进 dev 日志后，前端会把它当错误捞起来
-/// 发给 agent 处理，造成无谓排查。本过滤器检测 dump 起始行（`<ISO> vite:<ns>` 且本行
-/// 打开对象），按花括号深度跳过整个对象体；**单行 vite debug 与正常 vite 输出不受影响**。
-struct ViteNoiseFilter {
-    /// >0 表示正处在 vite config dump 对象体内部，按 `{`/`}` 深度判断何时结束。
-    depth: i32,
-}
-
-impl ViteNoiseFilter {
-    const fn new() -> Self {
-        Self { depth: 0 }
-    }
-
-    /// 该行是否应被丢弃（属于 vite debug 对象 dump）。
-    fn should_skip(&mut self, line: &str) -> bool {
-        if self.depth > 0 {
-            self.depth += brace_delta(line);
-            if self.depth <= 0 {
-                self.depth = 0;
-            }
-            return true;
-        }
-        // dump 起始：<ISO> vite:<ns> 开头，且本行净 `{` > 0（打开了对象）
-        if is_vite_debug_line(line) && brace_delta(line) > 0 {
-            self.depth = brace_delta(line);
-            return true;
-        }
-        false
-    }
-}
-
-/// 形如 `2026-08-02T12:53:31.651Z vite:config ...`：以数字（ISO 时间戳）开头，
-/// 前 40 字符内出现 ` vite:`（带前导空格，区别于路径里的 vite）。
-fn is_vite_debug_line(line: &str) -> bool {
-    let bytes = line.as_bytes();
-    if bytes.len() < 8 || !bytes[0].is_ascii_digit() {
-        return false;
-    }
-    line[..line.len().min(40)].contains(" vite:")
-}
-
-/// 本行 `{` 与 `}` 的净数量（跟踪对象 dump 何时闭合）。
-fn brace_delta(line: &str) -> i32 {
-    let mut delta = 0i32;
-    for c in line.chars() {
-        match c {
-            '{' => delta += 1,
-            '}' => delta -= 1,
-            _ => {}
-        }
-    }
-    delta
-}
-
-async fn pipe_stream<R>(reader: R, main: PathBuf, temp: PathBuf)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut lines = BufReader::new(reader).lines();
-    let mut noise = ViteNoiseFilter::new();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if noise.should_skip(&line) {
-            continue;
-        }
-        let prefixed = format!("[{}] {}", Local::now().format("%Y/%m/%d %H:%M:%S"), line);
-        // 日志写失败告警(#17):磁盘满/权限错误时可见,不再静默吞掉。
-        if let Err(e) = super::log::append_line(&main, &prefixed).await {
-            tracing::warn!(error = %e, "append_line (main log) failed");
-        }
-        if let Err(e) = super::log::append_line(&temp, &prefixed).await {
-            tracing::warn!(error = %e, "append_line (temp log) failed");
-        }
-    }
-}
-
-// ── unix: 进程组信号 (kill -pgid) ──────────────────────────────────────────
-/// 杀进程组 (对齐 nuwax killProcess): 优先 kill(-pid) SIGTERM, 降级 kill(pid)。
-/// PID 1 防御统一封装在 [`process_utils`]。
-/// 返回是否成功送出信号。
-#[cfg(unix)]
-pub fn kill_process_group(pid: u32) -> bool {
-    let Some(process_pid) = system_pid(pid) else {
-        return false;
-    };
-    process_utils::kill_process_group_with_fallback(process_pid.as_raw() as u32, Signal::SIGTERM)
-}
-
-/// 强杀进程组 (SIGKILL 升级): SIGTERM 宽限期后进程仍存活时调用, 优先 kill(-pid) SIGKILL, 降级 kill(pid)。
-#[cfg(unix)]
-pub fn kill_process_group_force(pid: u32) -> bool {
-    let Some(process_pid) = system_pid(pid) else {
-        return false;
-    };
-    process_utils::kill_process_group_with_fallback(process_pid.as_raw() as u32, Signal::SIGKILL)
-}
-
-/// 读取进程组 ID，用于 stop 去重：同一 Vite/pnpm 进程树只需 kill 一次。
-#[cfg(unix)]
-pub fn process_group_id(pid: u32) -> Option<u32> {
-    getpgid(Some(system_pid(pid)?))
-        .ok()
-        .and_then(|pgid| u32::try_from(pgid.as_raw()).ok())
-}
-
-/// 进程是否仍在运行 (kill pid 0 探活; 对齐 nuwax isProcessRunning)。
-#[cfg(unix)]
-pub fn is_process_running(pid: u32) -> bool {
-    let Some(process_pid) = system_pid(pid) else {
-        return false;
-    };
-    // kill(pid, None) == 信号 0, 不实际杀, 仅探测
-    match kill(process_pid, None) {
-        Ok(()) => true,
-        Err(nix::errno::Errno::EPERM) => true, // 存在但无权限
-        Err(_) => false,
-    }
-}
-
-/// 将 Tokio 返回的无符号 PID 安全转换为 Unix `pid_t`。
-/// PID 0 代表当前进程组，不允许作为外部子进程 PID 使用。
-#[cfg(unix)]
-fn system_pid(pid: u32) -> Option<Pid> {
-    i32::try_from(pid)
-        .ok()
-        .filter(|pid| *pid > 0)
-        .map(Pid::from_raw)
-}
-
-// ── windows: 无进程组概念，用 taskkill /T 递归杀进程树 ──────────────────────
-// SIGTERM 在 Windows 无直接对应；force=false 走 taskkill /T（尽量优雅），
-// force=true 加 /F 强杀整树。
-#[cfg(windows)]
-pub fn kill_process_group(pid: u32) -> bool {
-    kill_tree_windows(pid, false)
-}
-#[cfg(windows)]
-pub fn kill_process_group_force(pid: u32) -> bool {
-    kill_tree_windows(pid, true)
-}
-#[cfg(windows)]
-fn kill_tree_windows(pid: u32, force: bool) -> bool {
-    let mut cmd = std::process::Command::new("taskkill");
-    cmd.arg("/PID").arg(pid.to_string()).arg("/T");
-    if force {
-        cmd.arg("/F");
-    }
-    cmd.output().map(|o| o.status.success()).unwrap_or(false)
-}
-/// Windows 无进程组；返回 pid 本身用于 stop 去重（同 pid 只 kill 一次）。
-#[cfg(windows)]
-pub fn process_group_id(pid: u32) -> Option<u32> {
-    Some(pid)
-}
-/// tasklist 探活：CSV 输出首列含 "{pid}", 即在运行。
-#[cfg(windows)]
-pub fn is_process_running(pid: u32) -> bool {
-    let needle = format!("\"{pid}\",");
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(needle.as_str()))
-        .unwrap_or(false)
-}
-
 /// 轮询等待进程退出 (对齐 nuwax waitForProcessStop)。
 pub async fn wait_for_stop(pid: u32, interval_ms: u64, max_attempts: u32) {
     for _ in 0..max_attempts {
@@ -564,57 +392,7 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::ViteNoiseFilter;
     use super::contains_project_path_segment;
-    #[cfg(unix)]
-    use super::system_pid;
-
-    #[test]
-    fn vite_noise_filter_skips_whole_config_dump() {
-        let mut f = ViteNoiseFilter::new();
-        // dump header 打开对象 → 进入跳过
-        assert!(f.should_skip("2026-08-02T12:53:31.651Z vite:config using resolved config: {"));
-        // 对象体（噪音，含 hasErrorLogged）
-        assert!(f.should_skip("  logger: {"));
-        assert!(f.should_skip("    info: [Function: info],"));
-        assert!(f.should_skip("    hasErrorLogged: [Function: hasErrorLogged]"));
-        assert!(f.should_skip("  },"));
-        assert!(f.should_skip("  packageCache: Map(1) {"));
-        assert!(f.should_skip("    'fnpd_/app/x' => { dir: '/app/x', data: [Object] }"));
-        assert!(f.should_skip("  }"));
-        assert!(f.should_skip("}")); // 闭合顶层对象 → depth 回 0
-        // dump 结束后，正常行保留
-        assert!(!f.should_skip("VITE v5.0.0 ready in 340 ms"));
-    }
-
-    #[test]
-    fn vite_noise_filter_keeps_normal_and_single_line_debug() {
-        let mut f = ViteNoiseFilter::new();
-        assert!(!f.should_skip("VITE v5.0.0 ready in 340 ms"));
-        assert!(!f.should_skip("[vite] hmr update /src/App.tsx"));
-        // 单行 vite debug（没打开对象）不抑制
-        assert!(!f.should_skip(
-            "2026-08-02T12:53:31.632Z vite:config bundled config file loaded in 373ms"
-        ));
-        assert!(!f.should_skip("普通应用日志"));
-    }
-
-    #[test]
-    fn vite_noise_filter_ignores_non_vite_braces() {
-        let mut f = ViteNoiseFilter::new();
-        // 非 vite debug 行即使带花括号也不触发
-        assert!(!f.should_skip("12:00:00 app: render {"));
-        assert!(!f.should_skip("  data: 1"));
-        assert!(!f.should_skip("}"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn system_pid_rejects_values_outside_positive_pid_t_range() {
-        assert!(system_pid(0).is_none());
-        assert!(system_pid(u32::MAX).is_none());
-        assert_eq!(system_pid(1).map(nix::unistd::Pid::as_raw), Some(1));
-    }
 
     #[test]
     fn project_process_match_requires_a_path_segment_boundary() {

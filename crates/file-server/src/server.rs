@@ -91,6 +91,7 @@ impl FileServer {
             .fallback(not_found)
             .layer(DefaultBodyLimit::max(request_body_limit))
             .layer(from_fn(request_id_layer))
+            .layer(from_fn(locale_layer))
             .layer(
                 TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
                     tracing::info_span!(
@@ -136,6 +137,17 @@ async fn request_id_layer(req: Request, next: Next) -> Response {
         response.headers_mut().insert("x-request-id", value);
     }
     response
+}
+
+/// 解析 `Accept-Language` 头 → 注入请求级 locale task-local, 供 AppError i18n 翻译。
+/// 放在最外层 (在 request_id_layer 之外), 确保所有错误响应都能拿到 locale。
+async fn locale_layer(req: Request, next: Next) -> Response {
+    let accept_lang = req
+        .headers()
+        .get("accept-language")
+        .and_then(|v| v.to_str().ok());
+    let locale = shared_types::parse_accept_language(accept_lang);
+    shared_types::scope_request_locale(locale, next.run(req)).await
 }
 
 async fn not_found(req: Request) -> Response {
