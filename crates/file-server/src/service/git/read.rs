@@ -62,6 +62,8 @@ pub struct CommitInfo {
 
 /// 提交历史 (对齐 nuwax logHistory; first-parent)。
 /// `branch` 非空 → 从该 ref 起 walk (对齐 nuwax git.log({ ref: branch })); 默认 HEAD。
+///
+/// 仓库刚 init 尚无任何 commit 时 (HEAD 无法解析) → 返回空列表 (对齐 TS d1e5c8a)。
 pub fn log_history(
     repo: &Repository,
     max_count: usize,
@@ -69,15 +71,26 @@ pub fn log_history(
     branch: Option<&str>,
     file_path: Option<&str>,
 ) -> AppResult<Vec<CommitInfo>> {
+    // 解析起始 ref; 失败时若是"无 commit"场景 (空仓库), 返回空列表而非报错。
     let start_id = match branch {
-        Some(b) if !b.trim().is_empty() => repo
-            .rev_parse_single(b)
-            .map_err(|e| map_git_err(e, "git rev_parse branch"))?
-            .detach(),
-        _ => repo
-            .head_id()
-            .map_err(|e| map_git_err(e, "git head_id"))?
-            .detach(),
+        Some(b) if !b.trim().is_empty() => match repo.rev_parse_single(b) {
+            Ok(id) => id.detach(),
+            Err(e) => {
+                if is_no_commit_error(&e) {
+                    return Ok(Vec::new());
+                }
+                return Err(map_git_err(e, "git rev_parse branch"));
+            }
+        },
+        _ => match repo.head_id() {
+            Ok(id) => id.detach(),
+            Err(e) => {
+                if is_no_commit_error(&e) {
+                    return Ok(Vec::new());
+                }
+                return Err(map_git_err(e, "git head_id"));
+            }
+        },
     };
     let walk = repo
         .rev_walk([start_id])
@@ -283,4 +296,14 @@ pub fn get_status(repo: &Repository) -> AppResult<StatusResult> {
         v.dedup();
     }
     Ok(r)
+}
+
+/// 判断 gix 错误是否为"空仓库无 commit" (HEAD 无法解析)。
+/// 对齐 TS d1e5c8a: hasGitHead 预检 + catch 兜底 "does not have any commits"。
+fn is_no_commit_error(e: &impl std::fmt::Display) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("does not have any commits yet")
+        || msg.contains("unborn")
+        || msg.contains("could not find")
+        || msg.contains("not found")
 }
