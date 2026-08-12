@@ -93,14 +93,33 @@ impl FileServer {
             .layer(from_fn(request_id_layer))
             .layer(from_fn(locale_layer))
             .layer(
-                TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
-                    tracing::info_span!(
-                        target: "file_server::http",
-                        "http_request",
-                        method = %req.method(),
-                        uri = %req.uri(),
-                    )
-                }),
+                TraceLayer::new_for_http()
+                    .make_span_with(|req: &axum::http::Request<_>| {
+                        tracing::info_span!(
+                            target: "file_server::http",
+                            "http_request",
+                            method = %req.method(),
+                            uri = %req.uri(),
+                        )
+                    })
+                    .on_request(|req: &axum::http::Request<_>, _span: &tracing::Span| {
+                        tracing::info!(
+                            target: "file_server::http",
+                            method = %req.method(),
+                            uri = %req.uri(),
+                            "request received"
+                        );
+                    })
+                    .on_response(
+                        |res: &Response<_>, latency: std::time::Duration, _span: &tracing::Span| {
+                            tracing::info!(
+                                target: "file_server::http",
+                                status = res.status().as_u16(),
+                                latency_ms = latency.as_millis(),
+                                "response sent"
+                            );
+                        },
+                    ),
             )
             .with_state(self.state.clone()))
     }

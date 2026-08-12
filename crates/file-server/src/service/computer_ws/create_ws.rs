@@ -104,8 +104,10 @@ pub async fn create_workspace(
                             }
                             let name = entry.file_name().to_string_lossy().to_string();
                             let dst = skills_dir.join(&name);
-                            if let Err(e) = fs::remove_dir_all(&dst).await {
-                                tracing::warn!(error = %e, "clear existing skill dir before move failed (skipping)");
+                            if let Err(e) = fs::remove_dir_all(&dst).await
+                                && e.kind() != std::io::ErrorKind::NotFound
+                            {
+                                tracing::warn!(error = %e, "clear existing skill dir before move failed");
                             }
                             move_dir(&entry.path(), &dst).await?;
                             updated_skills.push(name);
@@ -225,8 +227,10 @@ async fn process_skill_url(
     let mut updated = Vec::new();
     for (name, src) in candidates {
         let dst = skills_dir.join(&name);
-        if let Err(e) = fs::remove_dir_all(&dst).await {
-            tracing::warn!(error = %e, "clear existing skill dir before move failed (skipping)");
+        if let Err(e) = fs::remove_dir_all(&dst).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, "clear existing skill dir before move failed");
         }
         move_dir(&src, &dst).await?;
         updated.push(name);

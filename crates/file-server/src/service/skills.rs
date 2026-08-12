@@ -137,8 +137,10 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
         let t_skills = t_root.join("skills");
         let t_agents = t_root.join("agents");
         // skills (先 rm 再 copy, 全量覆盖)
-        if let Err(e) = fs::remove_dir_all(&t_skills).await {
-            tracing::warn!(error = %e, "clear skills target dir before sync failed (skipping)");
+        if let Err(e) = fs::remove_dir_all(&t_skills).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, "clear skills target dir before sync failed");
         }
         fs::create_dir_all(&t_skills).await?;
         if has_skills {
@@ -146,8 +148,10 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
                 .await?;
         }
         // agents
-        if let Err(e) = fs::remove_dir_all(&t_agents).await {
-            tracing::warn!(error = %e, "clear agents target dir before sync failed (skipping)");
+        if let Err(e) = fs::remove_dir_all(&t_agents).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, "clear agents target dir before sync failed");
         }
         fs::create_dir_all(&t_agents).await?;
         if has_agents {
