@@ -1,6 +1,7 @@
 //! 业务服务层。
 
 pub mod agent_hooks;
+pub mod agent_store;
 pub mod build_error;
 pub mod build_generic;
 pub mod build_manager;
