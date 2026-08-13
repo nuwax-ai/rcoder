@@ -4,30 +4,23 @@
 //! 与会话工作区 `{COMPUTER_WORKSPACE_DIR}/{userId}/{cId}` 同属一棵树。
 //!
 //! 核心能力:
-//! - 锁机制 (`.sync.lock` 独占写, 5min 陈旧抢占)
-//! - 技能安装/覆盖 (`install_skill_dir`)
-//! - agents 整体替换 (`replace_agents_dir`)
+//! - 技能安装/覆盖 (`install_skill_dir`) — 逐个子目录原子覆盖, 天然并发安全
+//! - agents 更新 (`update_agents_dir`) — 逐个子目录并发覆盖, 无锁安全
 //! - 差集清理 (`prune_agent_skills`, 保留 `.dynamic_add.lock` 的)
 //! - 按需安装判断 (`agent_skill_exists`)
+//!
+//! **无锁设计**: 所有写操作都是"逐个子目录: 删旧 → rename 移入"的原子操作。
+//! 不同子目录天然无冲突; 同名子目录并发覆盖最终一致。不需要文件锁。
 
-use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use futures_util::future::try_join_all;
 use tokio::fs;
 
 use crate::error::AppResult;
 
-/// 独占创建选项 (O_CREAT|O_EXCL: 文件已存在则失败, 对齐 TS `fs.open(path, 'wx')`)。
-fn excl_create_opts() -> OpenOptions {
-    let mut opts = OpenOptions::new();
-    opts.create_new(true).write(true);
-    opts
-}
-
 const DYNAMIC_ADD_LOCK: &str = ".dynamic_add.lock";
-const SYNC_LOCK_NAME: &str = ".sync.lock";
-/// 锁过期时间: 5 分钟 (避免异常退出后永久卡死, 对齐 TS `SYNC_LOCK_STALE_MS`)。
-const SYNC_LOCK_STALE_MS: u64 = 5 * 60 * 1000;
 
 /// 智能体级实体存储路径: `{workspace_root}/{user_id}/.agent-store/{agent_id}`。
 pub fn agent_store_path(workspace_root: &Path, user_id: &str, agent_id: &str) -> PathBuf {
@@ -49,80 +42,6 @@ pub async fn ensure_agent_store_dirs(
     fs::create_dir_all(&skills_dir).await?;
     fs::create_dir_all(&agents_dir).await?;
     Ok((skills_dir, agents_dir))
-}
-
-/// 文件锁 guard: acquire 返回 `Some` 表示拿到锁, `None` 表示被占用 (调用方跳过更新)。
-pub struct AgentStoreLock {
-    lock_path: PathBuf,
-}
-
-impl AgentStoreLock {
-    /// 尝试获取写锁 (`O_CREAT | O_EXCL` 独占创建)。
-    /// 拿不到则检查陈旧度, 超过 `SYNC_LOCK_STALE_MS` 可抢占。
-    /// 返回 `None` 表示锁被占用且未过期 → 调用方跳过实体更新。
-    pub async fn try_acquire(
-        workspace_root: &Path,
-        user_id: &str,
-        agent_id: &str,
-    ) -> AppResult<Option<Self>> {
-        let store = agent_store_path(workspace_root, user_id, agent_id);
-        fs::create_dir_all(&store).await?;
-        let lock_path = store.join(SYNC_LOCK_NAME);
-
-        // 尝试独占创建 (O_CREAT|O_EXCL: 文件已存在则失败)
-        match excl_create_opts().open(&lock_path) {
-            Ok(_file) => {
-                // 写入 pid:timestamp (对齐 TS)
-                let content = format!(
-                    "{}:{}",
-                    std::process::id(),
-                    chrono::Utc::now().timestamp_millis()
-                );
-                if let Err(e) = fs::write(&lock_path, content).await {
-                    tracing::warn!(error = %e, "write lock content failed");
-                }
-                Ok(Some(Self { lock_path }))
-            }
-            Err(_) => {
-                // 锁已存在, 检查陈旧度
-                let meta = match fs::metadata(&lock_path).await {
-                    Ok(m) => m,
-                    Err(_) => return Ok(None), // 刚好被释放了, 但本次跳过
-                };
-                let modified = meta.modified();
-                let is_stale = modified.ok().is_none_or(|t| {
-                    t.elapsed()
-                        .map_or(true, |e| e.as_millis() as u64 > SYNC_LOCK_STALE_MS)
-                });
-                if is_stale {
-                    tracing::warn!(lock = %lock_path.display(), "stealing stale agent store lock");
-                    if let Err(e) = fs::remove_file(&lock_path).await {
-                        tracing::warn!(error = %e, "remove stale lock failed");
-                    }
-                    // 抢占后重试独占创建
-                    match excl_create_opts().open(&lock_path) {
-                        Ok(_f) => Ok(Some(Self { lock_path })),
-                        Err(_) => Ok(None),
-                    }
-                } else {
-                    tracing::info!(lock = %lock_path.display(), "agent store lock held, skipping update");
-                    Ok(None)
-                }
-            }
-        }
-    }
-}
-
-impl Drop for AgentStoreLock {
-    fn drop(&mut self) {
-        let path = self.lock_path.clone();
-        // best-effort 删除锁文件 (对齐 TS releaseAgentStoreLock)
-        tokio::spawn(async move {
-            if let Err(e) = fs::remove_file(&path).await {
-                tracing::warn!(error = %e, "release agent store lock failed");
-            }
-        });
-    }
 }
 
 /// 检查 skill 目录是否有 `.dynamic_add.lock`。
@@ -198,7 +117,7 @@ pub async fn install_skill_dir(
     // 删旧目标 (同名覆盖, NotFound 安全)
     match fs::remove_dir_all(&dest).await {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
     fs::create_dir_all(dest_skills_dir).await?;
@@ -215,28 +134,31 @@ pub async fn install_skill_dir(
     Ok(())
 }
 
-/// 用源 agents 目录整体替换实体 agents (每次 createWorkspace 刷新)。
-pub async fn replace_agents_dir(
-    src_agents_dir: Option<&Path>,
-    dest_agents_dir: &Path,
-) -> AppResult<()> {
-    // 删旧 (NotFound 安全)
-    match fs::remove_dir_all(dest_agents_dir).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-    if let Some(parent) = dest_agents_dir.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    if let Some(src) = src_agents_dir
+/// 逐个子目录并发覆盖更新 agents 目录 (无锁安全)。
+///
+/// 每个子目录独立操作: 删旧 → rename 移入。不同子目录天然无冲突;
+/// 同名子目录并发覆盖最终一致。目标目录始终存在, 无"目录空"窗口。
+pub async fn update_agents_dir(src: Option<&Path>, dest: &Path) -> AppResult<()> {
+    fs::create_dir_all(dest).await?;
+    if let Some(src) = src
         && src.exists()
     {
-        move_or_copy_directory(src, dest_agents_dir).await?;
-        return Ok(());
+        let mut entries = fs::read_dir(src).await?;
+        let mut tasks = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let dst = dest.join(entry.file_name());
+            let src_entry = entry.path();
+            tasks.push(async move {
+                match fs::remove_dir_all(&dst).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+                move_or_copy_directory(&src_entry, &dst).await
+            });
+        }
+        try_join_all(tasks).await?;
     }
-    // 无源 → 建空目录
-    fs::create_dir_all(dest_agents_dir).await?;
     Ok(())
 }
 
@@ -245,16 +167,139 @@ pub fn agent_skill_exists(skills_dir: &Path, skill_name: &str) -> bool {
     skills_dir.join(skill_name).is_dir()
 }
 
-/// rename 优先 (同分区秒移), EXDEV (跨设备) 回退 copy+rm。
+/// rename 优先 (同分区秒移), CrossesDevices (跨设备) 回退 copy+rm。
+/// 用 `ErrorKind::CrossesDevices` 跨平台检测 (Rust 1.85+ stabilized)。
 async fn move_or_copy_directory(src: &Path, dst: &Path) -> AppResult<()> {
     match fs::rename(src, dst).await {
         Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(18) => {
-            // EXDEV: 跨设备, 降级为 copy + rm
+        Err(e) if e.kind() == ErrorKind::CrossesDevices => {
+            // 跨设备: 降级为 copy + rm
             crate::service::fs_util::copy_dir_filtered(src, dst, &[], &[]).await?;
             fs::remove_dir_all(src).await?;
             Ok(())
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn install_skill_dir_copies_and_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest_dir = tmp.path().join("skills");
+
+        // v1
+        let src1 = tmp.path().join("src1");
+        fs::create_dir_all(&src1).await.unwrap();
+        fs::write(src1.join("SKILL.md"), "v1").await.unwrap();
+        install_skill_dir(&src1, &dest_dir, "my-skill", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(dest_dir.join("my-skill").join("SKILL.md"))
+                .await
+                .unwrap(),
+            "v1"
+        );
+
+        // 覆盖安装 v2 (源已被 rename 移走, 用新源)
+        let src2 = tmp.path().join("src2");
+        fs::create_dir_all(&src2).await.unwrap();
+        fs::write(src2.join("SKILL.md"), "v2").await.unwrap();
+        install_skill_dir(&src2, &dest_dir, "my-skill", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(dest_dir.join("my-skill").join("SKILL.md"))
+                .await
+                .unwrap(),
+            "v2"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_agents_dir_copies_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src_agents");
+        let dest = tmp.path().join("agents");
+        fs::create_dir_all(src.join("reviewer")).await.unwrap();
+        fs::create_dir_all(src.join("coder")).await.unwrap();
+        fs::write(src.join("reviewer/agent.md"), "r").await.unwrap();
+        fs::write(src.join("coder/agent.md"), "c").await.unwrap();
+
+        update_agents_dir(Some(&src), &dest).await.unwrap();
+
+        assert!(dest.join("reviewer/agent.md").exists());
+        assert!(dest.join("coder/agent.md").exists());
+    }
+
+    #[tokio::test]
+    async fn update_agents_dir_overwrites_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("agents");
+        // 旧内容
+        fs::create_dir_all(dest.join("old-agent")).await.unwrap();
+        fs::write(dest.join("old-agent/agent.md"), "old")
+            .await
+            .unwrap();
+
+        // 新源
+        let src = tmp.path().join("src_agents");
+        fs::create_dir_all(src.join("new-agent")).await.unwrap();
+        fs::write(src.join("new-agent/agent.md"), "new")
+            .await
+            .unwrap();
+
+        update_agents_dir(Some(&src), &dest).await.unwrap();
+
+        // 新的已写入
+        assert_eq!(
+            fs::read_to_string(dest.join("new-agent/agent.md"))
+                .await
+                .unwrap(),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_agents_dir_no_source_creates_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("agents");
+        update_agents_dir(None, &dest).await.unwrap();
+        assert!(dest.is_dir());
+    }
+
+    #[tokio::test]
+    async fn prune_removes_unlisted_non_dynamic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        fs::create_dir_all(skills.join("keep-me")).await.unwrap();
+        fs::create_dir_all(skills.join("delete-me")).await.unwrap();
+        fs::create_dir_all(skills.join("dynamic-me")).await.unwrap();
+        fs::write(skills.join("dynamic-me").join(DYNAMIC_ADD_LOCK), "123")
+            .await
+            .unwrap();
+
+        let (removed, kept_dynamic) = prune_agent_skills(&skills, &["keep-me".to_string()])
+            .await
+            .unwrap();
+
+        assert!(removed.contains(&"delete-me".to_string()));
+        assert!(!removed.contains(&"dynamic-me".to_string()));
+        assert!(kept_dynamic.contains(&"dynamic-me".to_string()));
+        assert!(skills.join("keep-me").exists());
+        assert!(!skills.join("delete-me").exists());
+        assert!(skills.join("dynamic-me").exists());
+    }
+
+    #[test]
+    fn agent_skill_exists_checks_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("my-skill")).unwrap();
+        assert!(agent_skill_exists(tmp.path(), "my-skill"));
+        assert!(!agent_skill_exists(tmp.path(), "nope"));
     }
 }
