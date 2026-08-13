@@ -6,6 +6,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::error::{AppError, AppResult};
 use crate::path_safety::safe_zip_entry;
@@ -31,9 +32,19 @@ const EXTRACTION_LIMITS: ExtractionLimits = ExtractionLimits {
 
 /// 异步解压 `zip_path` 到 `dst`。
 pub async fn extract_to(zip_path: PathBuf, dst: PathBuf) -> AppResult<()> {
+    let start = Instant::now();
+    let zip_display = zip_path.display().to_string();
+    let dst_display = dst.display().to_string();
     tokio::task::spawn_blocking(move || extract_blocking(&zip_path, &dst))
         .await
         .map_err(|e| AppError::system(format!("zip extract task join error: {e}")))??;
+    tracing::info!(
+        op = "zip_extract",
+        elapsed_ms = start.elapsed().as_millis(),
+        src = %zip_display,
+        dst = %dst_display,
+        "zip extraction completed"
+    );
     Ok(())
 }
 

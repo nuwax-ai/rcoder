@@ -24,6 +24,7 @@ pub struct ImportResult {
 /// 5. 合并 extractRoot → target (跳过白名单名), 失败则从 backupDir 回滚
 /// 6. 清理 backupDir + extractRoot
 pub async fn import_project(target_dir: &Path, zip_path: &Path) -> AppResult<ImportResult> {
+    let start = std::time::Instant::now();
     let parent = target_dir
         .parent()
         .ok_or_else(|| AppError::system("computer workspace has no parent"))?;
@@ -59,6 +60,13 @@ pub async fn import_project(target_dir: &Path, zip_path: &Path) -> AppResult<Imp
         }
         return Err(merge_err);
     }
+
+    tracing::info!(
+        op = "import_project",
+        elapsed_ms = start.elapsed().as_millis(),
+        target = %target_dir.display(),
+        "project import completed"
+    );
 
     Ok(ImportResult {
         user_id: String::new(),

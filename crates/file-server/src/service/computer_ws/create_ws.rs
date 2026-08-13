@@ -41,6 +41,7 @@ pub async fn create_workspace(
     hook_config: Option<crate::service::agent_hooks::HookConfigInput>,
     downloader: Option<&crate::service::skill_download::SkillDownloader>,
 ) -> AppResult<CreateWorkspaceResult> {
+    let start = std::time::Instant::now();
     let (skills_dir, agents_dir) = ensure_primary_agent_dirs(workspace).await?;
 
     // 保留含 .dynamic_add.lock 的 skill 子目录 (agents 无此逻辑)
@@ -73,6 +74,11 @@ pub async fn create_workspace(
     // 无 file 且无 skillUrls → syncAgents + 早退 (对齐 nuwax)
     if !had_file && !has_urls {
         crate::service::skills::sync_agents(workspace).await?;
+        tracing::info!(
+            op = "create_workspace",
+            elapsed_ms = start.elapsed().as_millis(),
+            "workspace creation completed (no file, no urls)"
+        );
         return Ok(CreateWorkspaceResult {
             message: "Workspace created (no uploaded file, no skills and agents)".to_string(),
             updated_skills,
@@ -178,6 +184,13 @@ pub async fn create_workspace(
             failed_skills.len()
         ));
     }
+
+    tracing::info!(
+        op = "create_workspace",
+        elapsed_ms = start.elapsed().as_millis(),
+        updated_skills = updated_skills.len(),
+        "workspace creation completed"
+    );
 
     Ok(CreateWorkspaceResult {
         message,

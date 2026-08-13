@@ -63,6 +63,7 @@ pub struct SearchParams<'a> {
 /// 遍历由 [`dua_core::walk`] 的 work-stealing 线程池驱动 (ParentFirst 顺序), 通过
 /// [`tokio::task::spawn_blocking`] 在阻塞线程执行, 不占用 async runtime。
 pub async fn search_files(params: SearchParams<'_>) -> AppResult<SearchResult> {
+    let start = Instant::now();
     let SearchParams {
         root,
         config,
@@ -124,6 +125,7 @@ pub async fn search_files(params: SearchParams<'_>) -> AppResult<SearchResult> {
         match_count = files.len(),
         visited,
         truncated,
+        elapsed_ms = start.elapsed().as_millis(),
         "file search completed"
     );
 

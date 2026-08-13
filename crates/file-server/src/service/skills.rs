@@ -129,6 +129,7 @@ pub fn sync_target_version() -> String {
 /// 从 10s+ (CephFS 逐文件复制) 降到 <1ms (单次 symlink syscall)。
 /// 各 agent 的 hook 配置 (`settings.json` / `hooks.json` / `plugins/` 等) 不受影响。
 pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
+    let start = std::time::Instant::now();
     let primary_skills = project_path.join(".agents").join("skills");
     let primary_agents = project_path.join(".agents").join("agents");
     let has_skills = crate::service::fs_util::path_exists(&primary_skills).await?;
@@ -139,6 +140,12 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
         sync_symlink(&primary_skills, &t_root.join("skills"), has_skills).await?;
         sync_symlink(&primary_agents, &t_root.join("agents"), has_agents).await?;
     }
+    tracing::info!(
+        op = "sync_agents",
+        elapsed_ms = start.elapsed().as_millis(),
+        targets = SYNC_TARGET_DIRS.len(),
+        "skills sync completed"
+    );
     // 版本 marker: 启动 reconciler 据此 O(1) 判断是否需补 sync
     // (写失败不阻断 sync 结果; 最坏 reconciler 下次多 sync 一次, 幂等兜底)
     if let Err(e) = fs::write(
@@ -152,11 +159,6 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-/// 用相对软链替代复制: 删旧目标 (可能是旧软链或旧目录) → 创建软链。
-/// 源不存在时创建空目录 (对齐原 has_skills=false 的行为)。
-///
-/// 软链用**相对路径** (如 `../.agents/skills`), 在同一工作区目录内,
-/// 跨 PVC / CephFS / NFS 始终可解析, 不依赖绝对路径。
 /// 用相对软链替代复制: 删旧目标 (可能是旧软链或旧目录) → 创建软链。
 /// 源不存在时创建空目录 (对齐原 has_skills=false 的行为)。
 ///
@@ -198,8 +200,9 @@ fn relative_path(src: &Path, base: &Path) -> PathBuf {
 }
 
 async fn copy_entry(src: &Path, dst: &Path) -> AppResult<()> {
+    let start = std::time::Instant::now();
     let ft = fs::metadata(src).await?;
-    if ft.is_dir() {
+    let result = if ft.is_dir() {
         crate::service::fs_util::copy_dir_filtered(src, dst, &[], &[]).await
     } else {
         if let Some(parent) = dst.parent() {
@@ -207,7 +210,14 @@ async fn copy_entry(src: &Path, dst: &Path) -> AppResult<()> {
         }
         fs::copy(src, dst).await?;
         Ok(())
-    }
+    };
+    tracing::debug!(
+        op = "copy_entry",
+        elapsed_ms = start.elapsed().as_millis(),
+        src = %src.display(),
+        "file copy completed"
+    );
+    result
 }
 
 async fn remove_dir_if_exists(path: &Path) -> AppResult<()> {

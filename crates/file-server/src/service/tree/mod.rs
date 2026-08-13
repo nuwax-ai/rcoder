@@ -16,6 +16,7 @@ pub use resolve::{FileResolveResult, resolve_existing_file};
 pub use search::{SearchParams, SearchResult, search_files};
 
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 use base64::Engine;
 use path_clean::PathClean;
@@ -59,6 +60,7 @@ pub async fn get_project_content(
     command: Option<&str>,
     proxy_path: Option<&str>,
 ) -> AppResult<ProjectContent> {
+    let start = Instant::now();
     let mut files = Vec::new();
     traverse(project_path, project_path, config, proxy_path, &mut files).await?;
     // 非 cpage_config 命令时过滤掉 cpage_config.json
@@ -66,6 +68,12 @@ pub async fn get_project_content(
         files.retain(|f| f.name != "cpage_config.json");
     }
     let (frontend_framework, dev_framework) = framework::detect_framework(project_path).await?;
+    tracing::info!(
+        op = "get_project_content",
+        elapsed_ms = start.elapsed().as_millis(),
+        file_count = files.len(),
+        "project content traversal completed"
+    );
     Ok(ProjectContent {
         files,
         frontend_framework,
@@ -79,8 +87,15 @@ pub async fn list_files(
     config: &Config,
     proxy_path: Option<&str>,
 ) -> AppResult<Vec<FileEntry>> {
+    let start = Instant::now();
     let mut files = Vec::new();
     traverse(root, root, config, proxy_path, &mut files).await?;
+    tracing::info!(
+        op = "list_files",
+        elapsed_ms = start.elapsed().as_millis(),
+        file_count = files.len(),
+        "file traversal completed"
+    );
     Ok(files)
 }
 
@@ -109,11 +124,19 @@ pub async fn list_files_meta(
         return Err(AppError::validation("relativePath must be a directory"));
     }
     let mut files = Vec::new();
+    let start = Instant::now();
     if recursive {
         traverse_meta(root, &list_dir, config, proxy_path, &mut files).await?;
     } else {
         list_directory_level(root, &list_dir, config, proxy_path, &mut files).await?;
     }
+    tracing::info!(
+        op = "list_files_meta",
+        elapsed_ms = start.elapsed().as_millis(),
+        file_count = files.len(),
+        recursive,
+        "file listing completed"
+    );
     Ok(files)
 }
 
