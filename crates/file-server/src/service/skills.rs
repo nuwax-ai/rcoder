@@ -159,12 +159,7 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-/// 用相对软链替代复制: 删旧目标 (可能是旧软链或旧目录) → 创建软链。
-/// 源不存在时创建空目录 (对齐原 has_skills=false 的行为)。
-///
-/// 软链用**相对路径** (如 `../.agents/skills`), 在同一工作区目录内,
-/// 跨 PVC / CephFS / NFS 始终可解析, 不依赖绝对路径。
-/// 用相对软链 (Unix) 或复制 (Windows) 同步 skills/agents 目录。
+/// 同步 skills/agents 目录: Unix 用相对软链, Windows 用复制。
 /// 源不存在时创建空目录。
 ///
 /// **跨平台策略**:
