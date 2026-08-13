@@ -67,7 +67,7 @@ Ceph 官方 + 诊断 P3:**node_modules、缓存、skills 这些可重建的小�
 
 | # | 方向 | 解决什么 | 收益 | 改动范围 | 风险 |
 |---|------|---------|------|---------|------|
-| 7 | **rcoder 主 Pod node_modules 本地化** | custom-page vite install 慢 | install 写本地(秒级→瞬时) | file-server + Helm | 测 vite/esbuild 对 symlink node_modules 兼容 |
+| 7 | **custom-page build pod**(vite 下沉 WebAgentRunner + node_modules 本地) | custom-page vite/install 慢(**根治**) | node_modules 走 pod 内 emptyDir | rcoder + 镜像(不碰 java) | 中,详见 [设计](custom-page-build-pod-design.md) |
 | 8 | **skills 彻底 tar 化** | skills 跨 Pod 共享 + 散文件 | N 写→1 写(~12ms) | file-server(打 tar) + agent-runner(解压本地) | 版本协调逻辑 |
 | 9 | **per-agent PVC + cephfs-root** | 配额/隔离/caps 巨头 | caps 减负 ~10% + 防写爆 + 治理 | rcoder(代码就绪) + Helm | 数据迁移(有 lazy_migrate + 回滚) |
 
@@ -107,13 +107,19 @@ Helm 层:rcoder 主 Pod + agent-runner 都挂 `/cache` → emptyDir(sizeLimit 10
 **收益**:install 下载缓存走本地(不写 CephFS)。零数据风险(缓存可重建)。
 **残留**:node_modules(产物)仍在项目目录(CephFS),但 pnpm store 本地后用 symlink materialize(条目写,比数据写少)。
 
-### #7 rcoder 主 Pod node_modules 本地化(custom-page vite)
+### #7 custom-page build pod:vite 下沉 WebAgentRunner + node_modules 本地化(根治)
 
-**现状**:custom-page vite 开发,rcoder 主 Pod 跑 pnpm install,node_modules 写 workspace(CephFS,18672 文件)。
+> 完整设计见 [custom-page-build-pod-design.md](custom-page-build-pod-design.md)。
 
-**方案**:rcoder Pod 加 emptyDir,项目 `node_modules` 软链 → 本地。pnpm install 写本地(hardlink 生效)。
-**风险**:vite/esbuild/pnpm 对 symlink node_modules 的兼容(edge case,需 .20 测)。
-**收益**:custom-page restart-dev 的 install 从秒级到瞬时。
+**最终方案**:把 vite/build 从 rcoder 主 Pod 下沉到 **WebAgentRunner pod**(单 pod:agent 对话 + 内嵌 file-server 一起),node_modules 走 pod 内 emptyDir(本地),源码留 CephFS(共享,HMR 正常)。
+
+**核心简化**:file-server 整体下沉到 pod → dev server 状态跟着走,**不用分布式重构**(化解了"跨 Pod 状态"的最大风险)。复用 WebAgentRunner ServiceType(不新增枚举、不碰 java)。
+
+**满足前提**:file-server 文件服务(源码 tree/git/下载)留控制面读 CephFS;build 接口自动 ensure WebAgentRunner(没起就拉起);对外 HTTP 接口不变。
+
+**改动**:7 项,集中在 `handlers/build.rs`(转发+ensure)+ Helm(emptyDir)+ port_proxy(端口路由)+ 镜像(内嵌 file-server)。全在 rcoder + 镜像范围,不扩散 java。
+
+**风险/.20 验证**:WebAgentRunner 内嵌 file-server 跑 dev server + HMR、node_modules 软链的 pnpm/esbuild 兼容、port_proxy 端口路由。有回滚开关(env 切回控制面 spawn vite)。
 
 ### #8 skills 彻底 tar 化(跨 Pod 共享优化)
 

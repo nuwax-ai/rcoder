@@ -164,6 +164,12 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
 ///
 /// 软链用**相对路径** (如 `../.agents/skills`), 在同一工作区目录内,
 /// 跨 PVC / CephFS / NFS 始终可解析, 不依赖绝对路径。
+/// 用相对软链 (Unix) 或复制 (Windows) 同步 skills/agents 目录。
+/// 源不存在时创建空目录。
+///
+/// **跨平台策略**:
+/// - Unix (Linux/macOS/CephFS): 相对软链 `../.agents/skills`, <1ms, 跨 PVC 安全
+/// - Windows (Electron): 逐文件复制 (NTFS 软链需管理员权限, 不可靠)
 async fn sync_symlink(src: &Path, dst: &Path, has_src: bool) -> AppResult<()> {
     // 删旧目标 (可能是旧软链、旧目录、不存在)
     match fs::remove_dir_all(dst).await {
@@ -171,15 +177,31 @@ async fn sync_symlink(src: &Path, dst: &Path, has_src: bool) -> AppResult<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    if has_src {
-        // 相对路径: 从 dst 的父目录出发到 src
+    if !has_src {
+        // 源不存在 → 创建空目录 (对齐原行为)
+        fs::create_dir_all(dst).await?;
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        // Unix: 相对软链 (从 dst 父目录出发到 src)
         let dst_parent = dst.parent().unwrap_or(Path::new("."));
         let rel = relative_path(src, dst_parent);
         std::os::unix::fs::symlink(&rel, dst)?;
-    } else {
-        // 源不存在 → 创建空目录 (对齐原行为)
-        fs::create_dir_all(dst).await?;
     }
+
+    #[cfg(windows)]
+    {
+        // Windows: 逐文件复制 (NTFS 软链需管理员权限, Electron 场景不可靠)
+        crate::service::fs_util::copy_dir_filtered(src, dst, &[], &[]).await?;
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        compile_error!("unsupported platform for sync_symlink");
+    }
+
     Ok(())
 }
 
@@ -269,8 +291,9 @@ mod tests {
 
         sync_symlink(&src, &dst, true).await.unwrap();
 
-        // 软链可解析 + 内容可读
-        assert!(dst.is_symlink(), "dst should be a symlink");
+        // Unix: 软链可解析 + 内容可读; Windows: 复制后内容可读
+        #[cfg(unix)]
+        assert!(dst.is_symlink(), "dst should be a symlink on unix");
         let content = fs::read_to_string(dst.join("SKILL.md")).await.unwrap();
         assert_eq!(content, "test");
     }
