@@ -124,40 +124,20 @@ pub fn sync_target_version() -> String {
 
 /// 以 `.agents` 为权威源, 全量 fan-out skills/agents 到五家 ACP agent 约定目录
 /// (对齐 nuwax AgentWorkspaceUtils syncAgents; PRIMARY_AGENT_TYPE="agents")。
+///
+/// 用**相对软链**替代逐文件复制: `.claude/skills → ../.agents/skills`。
+/// 从 10s+ (CephFS 逐文件复制) 降到 <1ms (单次 symlink syscall)。
+/// 各 agent 的 hook 配置 (`settings.json` / `hooks.json` / `plugins/` 等) 不受影响。
 pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     let primary_skills = project_path.join(".agents").join("skills");
     let primary_agents = project_path.join(".agents").join("agents");
-    // 权威源存在性循环外判定一次, 5 家 fan-out 共享;
-    // 原实现每家都 path_exists → 5 家 × {skills,agents} = 10 次冗余 stat (CephFS 上不便宜)。
     let has_skills = crate::service::fs_util::path_exists(&primary_skills).await?;
     let has_agents = crate::service::fs_util::path_exists(&primary_agents).await?;
     for agent_root in SYNC_TARGET_DIRS {
         let t_root = project_path.join(agent_root);
         fs::create_dir_all(&t_root).await?;
-        let t_skills = t_root.join("skills");
-        let t_agents = t_root.join("agents");
-        // skills (先 rm 再 copy, 全量覆盖)
-        if let Err(e) = fs::remove_dir_all(&t_skills).await
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(error = %e, "clear skills target dir before sync failed");
-        }
-        fs::create_dir_all(&t_skills).await?;
-        if has_skills {
-            crate::service::fs_util::copy_dir_filtered(&primary_skills, &t_skills, &[], &[])
-                .await?;
-        }
-        // agents
-        if let Err(e) = fs::remove_dir_all(&t_agents).await
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(error = %e, "clear agents target dir before sync failed");
-        }
-        fs::create_dir_all(&t_agents).await?;
-        if has_agents {
-            crate::service::fs_util::copy_dir_filtered(&primary_agents, &t_agents, &[], &[])
-                .await?;
-        }
+        sync_symlink(&primary_skills, &t_root.join("skills"), has_skills).await?;
+        sync_symlink(&primary_agents, &t_root.join("agents"), has_agents).await?;
     }
     // 版本 marker: 启动 reconciler 据此 O(1) 判断是否需补 sync
     // (写失败不阻断 sync 结果; 最坏 reconciler 下次多 sync 一次, 幂等兜底)
@@ -170,6 +150,51 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
         tracing::warn!(error = %e, "write sync_version marker failed (best-effort, skipping)");
     }
     Ok(())
+}
+
+/// 用相对软链替代复制: 删旧目标 (可能是旧软链或旧目录) → 创建软链。
+/// 源不存在时创建空目录 (对齐原 has_skills=false 的行为)。
+///
+/// 软链用**相对路径** (如 `../.agents/skills`), 在同一工作区目录内,
+/// 跨 PVC / CephFS / NFS 始终可解析, 不依赖绝对路径。
+/// 用相对软链替代复制: 删旧目标 (可能是旧软链或旧目录) → 创建软链。
+/// 源不存在时创建空目录 (对齐原 has_skills=false 的行为)。
+///
+/// 软链用**相对路径** (如 `../.agents/skills`), 在同一工作区目录内,
+/// 跨 PVC / CephFS / NFS 始终可解析, 不依赖绝对路径。
+async fn sync_symlink(src: &Path, dst: &Path, has_src: bool) -> AppResult<()> {
+    // 删旧目标 (可能是旧软链、旧目录、不存在)
+    match fs::remove_dir_all(dst).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if has_src {
+        // 相对路径: 从 dst 的父目录出发到 src
+        let dst_parent = dst.parent().unwrap_or(Path::new("."));
+        let rel = relative_path(src, dst_parent);
+        std::os::unix::fs::symlink(&rel, dst)?;
+    } else {
+        // 源不存在 → 创建空目录 (对齐原行为)
+        fs::create_dir_all(dst).await?;
+    }
+    Ok(())
+}
+
+/// 计算 `src` 相对 `base` 的路径: 找公共前缀, 剩余部分用 `..` 回退。
+fn relative_path(src: &Path, base: &Path) -> PathBuf {
+    let src_components: Vec<_> = src.components().collect();
+    let base_components: Vec<_> = base.components().collect();
+    let common = src_components
+        .iter()
+        .zip(base_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let ups = base_components.len() - common;
+    let mut result = PathBuf::new();
+    result.extend(std::iter::repeat_n("..", ups));
+    result.extend(src_components[common..].iter().map(|c| c.as_os_str()));
+    result
 }
 
 async fn copy_entry(src: &Path, dst: &Path) -> AppResult<()> {
@@ -218,5 +243,72 @@ mod tests {
         for d in SYNC_TARGET_DIRS {
             assert!(v.contains(*d), "version missing {d}");
         }
+    }
+
+    #[tokio::test]
+    async fn sync_symlink_creates_relative_symlink_when_src_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        // 模拟 .agents/skills + .claude/ 结构
+        let src = ws.join(".agents").join("skills");
+        fs::create_dir_all(&src).await.unwrap();
+        fs::write(src.join("SKILL.md"), "test").await.unwrap();
+        let dst_parent = ws.join(".claude");
+        fs::create_dir_all(&dst_parent).await.unwrap();
+        let dst = dst_parent.join("skills");
+
+        sync_symlink(&src, &dst, true).await.unwrap();
+
+        // 软链可解析 + 内容可读
+        assert!(dst.is_symlink(), "dst should be a symlink");
+        let content = fs::read_to_string(dst.join("SKILL.md")).await.unwrap();
+        assert_eq!(content, "test");
+    }
+
+    #[tokio::test]
+    async fn sync_symlink_creates_empty_dir_when_src_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join(".claude").join("skills");
+        sync_symlink(&tmp.path().join(".agents").join("skills"), &dst, false)
+            .await
+            .unwrap();
+        assert!(dst.is_dir(), "dst should be an empty directory");
+    }
+
+    #[tokio::test]
+    async fn sync_symlink_replaces_existing_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let src = ws.join(".agents").join("skills");
+        fs::create_dir_all(&src).await.unwrap();
+        fs::write(src.join("new.md"), "new").await.unwrap();
+
+        let dst = ws.join(".claude").join("skills");
+        // 先建旧目录 + 旧文件
+        fs::create_dir_all(&dst).await.unwrap();
+        fs::write(dst.join("old.md"), "old").await.unwrap();
+
+        sync_symlink(&src, &dst, true).await.unwrap();
+
+        // 旧文件已删 (被软链替换)
+        assert!(!dst.join("old.md").exists(), "old file should be gone");
+        // 新文件通过软链可读
+        assert_eq!(fs::read_to_string(dst.join("new.md")).await.unwrap(), "new");
+    }
+
+    #[test]
+    fn relative_path_same_level() {
+        // workspace/.agents/skills 相对 workspace/.claude → ../.agents/skills
+        let src = Path::new("/ws/.agents/skills");
+        let base = Path::new("/ws/.claude");
+        assert_eq!(relative_path(src, base), PathBuf::from("../.agents/skills"));
+    }
+
+    #[test]
+    fn relative_path_nested() {
+        // /a/b/c 相对 /a → b/c
+        let src = Path::new("/a/b/c");
+        let base = Path::new("/a");
+        assert_eq!(relative_path(src, base), PathBuf::from("b/c"));
     }
 }
