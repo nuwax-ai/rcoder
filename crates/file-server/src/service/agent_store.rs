@@ -10,11 +10,19 @@
 //! - 差集清理 (`prune_agent_skills`, 保留 `.dynamic_add.lock` 的)
 //! - 按需安装判断 (`agent_skill_exists`)
 
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
 use crate::error::AppResult;
+
+/// 独占创建选项 (O_CREAT|O_EXCL: 文件已存在则失败, 对齐 TS `fs.open(path, 'wx')`)。
+fn excl_create_opts() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).write(true);
+    opts
+}
 
 const DYNAMIC_ADD_LOCK: &str = ".dynamic_add.lock";
 const SYNC_LOCK_NAME: &str = ".sync.lock";
@@ -61,8 +69,8 @@ impl AgentStoreLock {
         fs::create_dir_all(&store).await?;
         let lock_path = store.join(SYNC_LOCK_NAME);
 
-        // 尝试独占创建
-        match fs::File::create(&lock_path).await {
+        // 尝试独占创建 (O_CREAT|O_EXCL: 文件已存在则失败)
+        match excl_create_opts().open(&lock_path) {
             Ok(_file) => {
                 // 写入 pid:timestamp (对齐 TS)
                 let content = format!(
@@ -91,7 +99,8 @@ impl AgentStoreLock {
                     if let Err(e) = fs::remove_file(&lock_path).await {
                         tracing::warn!(error = %e, "remove stale lock failed");
                     }
-                    match fs::File::create(&lock_path).await {
+                    // 抢占后重试独占创建
+                    match excl_create_opts().open(&lock_path) {
                         Ok(_f) => Ok(Some(Self { lock_path })),
                         Err(_) => Ok(None),
                     }
@@ -186,9 +195,11 @@ pub async fn install_skill_dir(
     as_dynamic: bool,
 ) -> AppResult<()> {
     let dest = dest_skills_dir.join(skill_name);
-    // 删旧目标 (同名覆盖)
+    // 删旧目标 (同名覆盖, NotFound 安全)
     match fs::remove_dir_all(&dest).await {
-        Ok(()) | Err(_) => {}
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     fs::create_dir_all(dest_skills_dir).await?;
     move_or_copy_directory(src, &dest).await?;
@@ -209,9 +220,11 @@ pub async fn replace_agents_dir(
     src_agents_dir: Option<&Path>,
     dest_agents_dir: &Path,
 ) -> AppResult<()> {
-    // 删旧
+    // 删旧 (NotFound 安全)
     match fs::remove_dir_all(dest_agents_dir).await {
-        Ok(()) | Err(_) => {}
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     if let Some(parent) = dest_agents_dir.parent() {
         fs::create_dir_all(parent).await?;
