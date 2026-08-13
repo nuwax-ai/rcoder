@@ -72,6 +72,28 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+/// `GET /api/version` — 版本协商 (对齐 TS v1.4.0 router.js)。
+/// Java 网关据此决定走 v2 新 API (agent-store) 还是旧 API。
+#[utoipa::path(
+    get,
+    path = "/api/version",
+    responses((status = 200, description = "Service version", body = VersionResponse)),
+    tag = "System"
+)]
+pub async fn version() -> Json<VersionResponse> {
+    Json(VersionResponse {
+        success: true,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
+/// `/api/version` 响应 (对齐 TS `{ success: true, version }`)。
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct VersionResponse {
+    pub success: bool,
+    pub version: String,
+}
+
 /// 当前 epoch 毫秒 (对齐 nuwax Date.now())。
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()

@@ -17,6 +17,7 @@ pub fn api_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(health::root))
         .routes(routes!(health::health))
+        .routes(routes!(health::version))
         .nest("/api/project", project_api_router())
         .nest("/api/git", git_router())
         .nest("/api/build", build_router())
