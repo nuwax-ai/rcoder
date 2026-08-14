@@ -22,7 +22,32 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    let cli_args = CliArgs::parse();
+    let mut cli_args = CliArgs::parse();
+
+    // 管理子命令模式 (rcoder file-server stop 等): 不启动服务, 不初始化 telemetry,
+    // 仅加载同源配置 (端口 + api key) 后 HTTP 调运行中的 rcoder 进程, 完成即退出。
+    if let Some(command) = cli_args.command.take() {
+        let cli_port = cli_args.port;
+        let config = load_config_with_args(cli_args)?;
+        let (action, fs_port) = match command {
+            crate::config::AdminCommand::FileServer { action } => match action {
+                crate::config::FileServerAction::Start { port } => ("start", port),
+                crate::config::FileServerAction::Stop => ("stop", None),
+                crate::config::FileServerAction::Restart { port } => ("restart", port),
+                crate::config::FileServerAction::Status => ("status", None),
+            },
+        };
+        let port = cli_port.unwrap_or(config.port);
+        let api_key = if config.api_key_auth.enabled {
+            Some(config.api_key_auth.api_key.clone())
+        } else {
+            None
+        };
+        rcoder::file_server_admin::run_cli_command(action, port, fs_port, api_key.as_deref())
+            .await?;
+        std::process::exit(0);
+    }
+
     let config = load_config_with_args(cli_args)?;
 
     let api_key_config = Arc::new(ArcSwap::from_pointee(config.api_key_auth.clone()));

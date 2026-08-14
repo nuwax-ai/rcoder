@@ -459,6 +459,9 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route("/health", get(handler::health_check))
         .with_state(state.clone());
 
+    // 内嵌 file-server 运行时启停 (迁移期 Rust↔TS 切换; 无 state, 受全局 API key 中间件保护)
+    let file_server_admin_routes = crate::file_server_admin::admin_routes();
+
     // P0-5: Agent Management 路由(全部 POST + body 解析)
     // - 简单 JSON 端点使用 I18nJsonOrQuery(同时支持 JSON body 和 ?project_id=xxx query)
     // - install 端点使用 multipart/form-data(file + metadata JSON 字段)
@@ -511,6 +514,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
 
     let mut router = Router::new()
         .merge(health_routes)
+        .merge(file_server_admin_routes)
         .merge(api_routes)
         .merge(computer_routes)
         .merge(devcomputer_routes)

@@ -4,6 +4,8 @@
 
 pub mod cleanup_task;
 pub mod config;
+pub mod file_server_admin;
+pub mod file_server_embed;
 pub mod grpc;
 pub mod handler;
 pub mod http_client;

@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -34,6 +34,40 @@ pub struct CliArgs {
     /// 默认后端服务端口
     #[arg(long = "backend-port")]
     pub default_backend_port: Option<u16>,
+
+    /// 管理子命令 (不传 = 正常启动服务)
+    #[command(subcommand)]
+    pub command: Option<AdminCommand>,
+}
+
+/// 管理子命令 (操作运行中的 rcoder 进程, 经 localhost HTTP)。
+#[derive(Subcommand, Debug)]
+pub enum AdminCommand {
+    /// 管理内嵌 file-server (迁移期 Rust↔TS 切换)
+    FileServer {
+        #[command(subcommand)]
+        action: FileServerAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum FileServerAction {
+    /// 启动内嵌 file-server (幂等)。--port 覆盖 env (FILE_SERVER_PORT/PORT), 优先级最高。
+    Start {
+        /// file-server 监听端口 (缺省: env FILE_SERVER_PORT/PORT > 默认 60000)
+        #[arg(short = 'P', long)]
+        port: Option<u16>,
+    },
+    /// 停止并释放端口 (幂等; 10s 超时强制)
+    Stop,
+    /// 停止后重新启动。--port 同 start。
+    Restart {
+        /// file-server 监听端口 (缺省: env FILE_SERVER_PORT/PORT > 默认 60000)
+        #[arg(short = 'P', long)]
+        port: Option<u16>,
+    },
+    /// 查看运行状态
+    Status,
 }
 
 // 从 shared_types 导入 API Key 鉴权配置
@@ -780,6 +814,7 @@ pub fn load_config() -> anyhow::Result<AppConfig> {
         enable_proxy: false,
         proxy_port: None,
         default_backend_port: None,
+        command: None,
     };
     load_config_with_args(cli_args)
 }
