@@ -10,8 +10,10 @@ use container_runtime_api::{
 };
 use k8s_openapi::api::core::v1::{
     Container as K8sContainer, ContainerPort, EnvVar, LocalObjectReference,
-    PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec, Probe, Volume, VolumeMount,
+    PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec, Probe, TopologySpreadConstraint,
+    Volume, VolumeMount,
 };
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use shared_types::{
     ContainerBasicInfo, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec, ServiceType,
@@ -225,6 +227,45 @@ impl KubernetesRuntime {
                 name: secret.clone(),
             }]
         });
+
+        // topologySpreadConstraints：强制 agent-runner 跨节点均衡分布，修复"全部堆在一个节点"
+        // 的调度失衡（根因：requests 50m 极低，调度器按 requests 以为节点很轻，反复选最闲节点）。
+        // 详见 docs/agent-runner-scheduling-balance.md。
+        // - topologyKey=hostname：按节点分散（每个 Node 一个 topology domain）。
+        // - labelSelector 用 app.kubernetes.io/name=<service_type>（与 build_standard_labels 写入的
+        //   label 完全一致），调度器统计【同类 agent-runner 的全局分布】（跨 STS），把新 pod 往
+        //   当前 pod 数最少的节点放。
+        // - whenUnsatisfiable=ScheduleAnyway：★软约束，绝不阻断创建。即使放到任何节点都会违反
+        //   maxSkew，也照常调度（只是优先选能减小 skew 的节点）。对 agent-runner 至关重要——绝
+        //   不能因均衡约束让 pod Pending、agent 创建失败（对比 DoNotSchedule：不满足就 Pending，
+        //   某节点被 cordon/资源不足时会卡住业务）。
+        // - maxSkew=5：⚠️ 在 ScheduleAnyway 下 maxSkew 的【具体数值几乎不影响结果】——它只在
+        //   DoNotSchedule 模式下才作为硬过滤阈值。ScheduleAnyway 下调度器永远优先 pod 最少的
+        //   节点（打分逻辑，与 maxSkew 数值无关），且 pod 总会被调度（不阻断）。这里取 5 只表示
+        //   "允许一定倾斜"的语义；填 2/5/20 实际行为几乎一致。要真正硬均衡需改用 DoNotSchedule，
+        //   但那会 Pending 业务，不采用。
+        let topology_spread_constraints: Option<Vec<TopologySpreadConstraint>> =
+            match service_type {
+                ServiceType::ComputerAgentRunner | ServiceType::WebAgentRunner => {
+                    let mut match_labels = std::collections::BTreeMap::new();
+                    match_labels.insert(
+                        "app.kubernetes.io/name".to_string(),
+                        service_type.to_string(),
+                    );
+                    Some(vec![TopologySpreadConstraint {
+                        max_skew: 5,
+                        topology_key: "kubernetes.io/hostname".to_string(),
+                        when_unsatisfiable: "ScheduleAnyway".to_string(),
+                        label_selector: Some(LabelSelector {
+                            match_labels: Some(match_labels),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }])
+                }
+                // UserAppBuilder / UserApp / 其他：非长驻 agent-runner 池，不参与均衡。
+                _ => None,
+            };
 
         Ok(PodSpec {
             volumes,
@@ -518,6 +559,7 @@ impl KubernetesRuntime {
             // /computer/agent/stop 是 gRPC 取消会话(进程继续), 故 Always 只补崩盘自愈、不冲突。
             restart_policy: Some("Always".to_string()),
             service_account_name: Some(self.config.service_account_name.clone()),
+            topology_spread_constraints,
             ..Default::default()
         })
     }

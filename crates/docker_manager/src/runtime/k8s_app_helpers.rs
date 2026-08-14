@@ -181,10 +181,14 @@ pub(crate) fn build_probe(
 ///   limits 大 → 单 Pod 突发不受限（最多 throttle / evict，不崩）。如需调整改下方固定值。
 ///
 /// 各字段固定 requests（按资源可压缩性区分）：
-/// - `cpu`（可压缩）：requests=`5m`。⚠️ cpu.shares 按 requests 算，5m 权重极低：节点 CPU
-///   严重争抢时此 pod 会被深度 throttle（可能慢到 healthcheck 失败/启动超时）。集群 CPU
-///   实测仅 5~7% 闲置，日常可轻松用超 requests；若遇 pod 启动超时或 healthcheck 失败，
-///   先排查是否 CPU 饿死，必要时调大（如 50m）。
+/// - `cpu`（可压缩）：requests=`50m`。cpu.shares 按 requests 算，5m 权重极低，节点 CPU
+///   严重争抢时此 pod 会被深度 throttle（曾观察到 healthcheck 失败/启动超时）。50m 是防
+///   CPU 饿死的最低安全值（约为实际峰值 100~1200m 的零头，不影响"低 requests + 高 limits
+///   超卖"的设计）。集群 CPU 实测仅 5~7% 闲置，日常可轻松用超 requests；若仍遇 pod 启动
+///   超时或 healthcheck 失败，先排查是否 CPU 饿死，再考虑继续调大。
+///   ⚠️ 50m 只缓解 throttle，**不解决调度均衡**：requests 仍很低，调度器仍按"节点很轻"
+///   看待，会把 pod 全堆在最闲节点。跨节点均衡由 PodSpec 的 topologySpreadConstraints
+///   保证（见 build_agent_pod_spec），不靠调 requests。
 /// - `memory`（不可压缩）：requests=`64Mi`。pod 开了 swap，内存吃紧可换出不易 OOM；
 ///   运行时实际可用到 limits 上限（swap + limits 双兜底）。⚠️ 代价：节点内存严重紧张时，
 ///   低 requests + 高实际占用的 pod 可能被优先 evict；集群内存余量充足（实测 13~34%）
@@ -202,7 +206,7 @@ pub(crate) fn build_decoupled_resources(
     let mut requests = BTreeMap::new();
     if let Some(c) = cpu {
         limits.insert("cpu".to_string(), Quantity(c));
-        requests.insert("cpu".to_string(), Quantity("5m".to_string()));
+        requests.insert("cpu".to_string(), Quantity("50m".to_string()));
     }
     if let Some(m) = memory {
         limits.insert("memory".to_string(), Quantity(m));
