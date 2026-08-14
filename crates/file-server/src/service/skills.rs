@@ -71,6 +71,116 @@ pub async fn push_skills_at(
     Ok(updated)
 }
 
+/// push_skills_to_agent_store 参数 (结构化入参, 避免 too_many_arguments)。
+pub struct PushToStoreParams<'a> {
+    /// 会话工作区父目录 (Local={root}/{userId}, Subvolume=subvolume_base)
+    pub user_root: &'a Path,
+    pub cid: &'a str,
+    pub agent_id: &'a str,
+    pub zip_path: Option<&'a Path>,
+    pub skill_urls: Vec<String>,
+    pub downloader: &'a SkillDownloader,
+}
+
+/// push-skills to agent-store (对齐 TS pushSkillsToAgentStore)。
+/// 动态技能写入实体目录 (打 `.dynamic_add.lock`), 并确保会话工作区软链。
+/// 调用前提: 会话工作区 `.agents/skills` 已是软链 (由 create_workspace_with_agent_store 建立)。
+pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppResult<Vec<String>> {
+    let PushToStoreParams {
+        user_root,
+        cid,
+        agent_id,
+        zip_path,
+        skill_urls,
+        downloader,
+    } = params;
+    let session_workspace = user_root.join(cid);
+    fs::create_dir_all(&session_workspace).await?;
+
+    let (agent_skills_dir, agent_agents_dir) =
+        crate::service::agent_store::ensure_agent_store_dirs(user_root, agent_id).await?;
+
+    let mut updated: Vec<String> = Vec::new();
+
+    // 处理上传 zip
+    if let Some(zip) = zip_path {
+        updated.extend(
+            install_skills_from_zip_dynamic(zip, &agent_skills_dir, &session_workspace).await?,
+        );
+    }
+
+    // 处理 skill_urls
+    for url in &skill_urls {
+        let downloaded = downloader.download(url).await?;
+        updated.extend(
+            install_skills_from_zip_dynamic(
+                downloaded.path(),
+                &agent_skills_dir,
+                &session_workspace,
+            )
+            .await?,
+        );
+    }
+
+    // 软链会话工作区 → agent-store (确保链接有效)
+    crate::service::agent_store::link_workspace_to_agent_store(
+        &session_workspace,
+        &agent_skills_dir,
+        &agent_agents_dir,
+    )
+    .await?;
+
+    tracing::info!(
+        op = "push_skills_to_agent_store",
+        updated_skills = updated.len(),
+        "pushed skills to agent store"
+    );
+    Ok(updated)
+}
+
+/// 解压 zip → 安装所有 skill 子目录到 agent-store (as_dynamic = true)。
+/// 动态安装的 skill 打 `.dynamic_add.lock`, prune 时保留。
+async fn install_skills_from_zip_dynamic(
+    zip_path: &Path,
+    agent_skills_dir: &Path,
+    session_workspace: &Path,
+) -> AppResult<Vec<String>> {
+    let tmp = session_workspace.join(".tmp");
+    fs::create_dir_all(&tmp).await?;
+    let extract_guard = crate::service::temp_file::tempdir_in(tmp, ".push-skill-").await?;
+    let extract_root = extract_guard.path().join("content");
+    fs::create_dir_all(&extract_root).await?;
+    crate::service::zip::extract_to(zip_path.to_path_buf(), extract_root.clone()).await?;
+
+    // 候选: 优先 skills/ 子目录, 否则顶层非隐藏目录
+    let skills_sub = extract_root.join("skills");
+    let base = if skills_sub.is_dir() {
+        skills_sub
+    } else {
+        extract_root
+    };
+    let mut updated = Vec::new();
+    let mut rd = fs::read_dir(&base).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        crate::service::agent_store::install_skill_dir(
+            &entry.path(),
+            agent_skills_dir,
+            &name,
+            true,
+        )
+        .await?;
+        updated.push(name);
+    }
+    Ok(updated)
+}
+
 async fn import_skill_archive(
     workspace: &Path,
     primary_skills: &Path,
@@ -115,7 +225,11 @@ async fn find_skills_dir(root: &Path) -> AppResult<Option<PathBuf>> {
 /// sync_agents fan-out 目标目录: 权威源 .agents/{skills,agents} → 各家 ACP agent 约定目录。
 /// 加新 agent 在此追加目录名即可 (注意: .agents 是权威源本身, 不在此列)。
 /// 源码实证: claude(.claude) / opencode(.opencode) / codex(.codex) / grok(.grok) / pi(.pi)。
-const SYNC_TARGET_DIRS: &[&str] = &[".claude", ".opencode", ".codex", ".grok", ".pi"];
+pub const SYNC_TARGET_DIRS: &[&str] = &[".claude", ".opencode", ".codex", ".grok", ".pi"];
+
+/// 所有 agent 目录 (含权威源 .agents + 各家 ACP 目录)。
+/// `link_workspace_to_agent_store` 用此列表把每个目录的 {skills,agents} 软链到 agent-store。
+pub const ALL_AGENT_DIRS: &[&str] = &[".agents", ".claude", ".opencode", ".codex", ".grok", ".pi"];
 
 /// fan-out 版本标识 (SYNC_TARGET_DIRS 派生): sync_agents 写入 `.agents/.sync_version`,
 /// 启动 reconciler 据此 O(1) 判断是否需补 sync。加新 agent 改 SYNC_TARGET_DIRS 即自动变版本。
@@ -126,7 +240,8 @@ pub fn sync_target_version() -> String {
 /// 以 `.agents` 为权威源, 全量 fan-out skills/agents 到五家 ACP agent 约定目录
 /// (对齐 nuwax AgentWorkspaceUtils syncAgents; PRIMARY_AGENT_TYPE="agents")。
 ///
-/// 10 个目录 (5 agent × {skills, agents}) 并发复制 (`try_join_all`);
+/// 10 个目录 (5 agent × {skills, agents}) 并发同步 (`try_join_all`);
+/// 优先软链 (零拷贝), 失败 fallback 实体复制。
 /// 各 agent 的 hook 配置 (`settings.json` / `hooks.json` / `plugins/` 等) 不受影响。
 pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     let start = std::time::Instant::now();
@@ -144,12 +259,12 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
         copy_targets.push((primary_agents.clone(), t_root.join("agents"), has_agents));
     }
 
-    // 并发复制: try_join_all 同时 poll 所有 future, 任一失败立即返回。
-    // 文件复制有 .await 让出点, tokio 自动调度, 不需要 spawn。
+    // 并发同步: try_join_all 同时 poll 所有 future, 任一失败立即返回。
+    // 内部优先软链, 失败 fallback copy; .await 让出点由 tokio 调度。
     try_join_all(
         copy_targets
             .into_iter()
-            .map(|(src, dst, has)| async move { sync_copy_dir(&src, &dst, has).await }),
+            .map(|(src, dst, has)| async move { sync_dir(&src, &dst, has).await }),
     )
     .await?;
 
@@ -171,18 +286,45 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-/// 复制单个目录 (先删旧 → 创建 → 递归复制)。源不存在时创建空目录。
-async fn sync_copy_dir(src: &Path, dst: &Path, has_src: bool) -> AppResult<()> {
+/// 同步单个目录 (优先软链 → fallback copy)。源不存在时创建空目录。
+async fn sync_dir(src: &Path, dst: &Path, has_src: bool) -> AppResult<()> {
+    // 删旧 dst (NotFound 安全)
     match fs::remove_dir_all(dst).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    if has_src {
-        crate::service::fs_util::copy_dir_filtered(src, dst, &[], &[]).await?;
-    } else {
+    if !has_src {
         fs::create_dir_all(dst).await?;
+        return Ok(());
     }
+    // 优先软链 (对齐 TS forceDirSymlink: .agents → 各家 ACP 目录)
+    match crate::service::agent_store::force_dir_symlink(dst, src).await {
+        Ok(()) => {
+            tracing::debug!(
+                src = %src.display(),
+                dst = %dst.display(),
+                "sync_dir: symlink created"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(
+                src = %src.display(),
+                dst = %dst.display(),
+                error = %e,
+                "sync_dir: symlink failed, fallback to copy"
+            );
+            // 软链失败后 dst 可能被部分清理, 确保 copy 前重新删除
+            match fs::remove_dir_all(dst).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+    // fallback copy
+    crate::service::fs_util::copy_dir_filtered(src, dst, &[], &[]).await?;
     Ok(())
 }
 
@@ -243,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_copy_dir_copies_files_when_src_exists() {
+    async fn sync_dir_links_or_copies_when_src_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         let src = ws.join(".agents").join("skills");
@@ -251,29 +393,34 @@ mod tests {
         fs::write(src.join("SKILL.md"), "test").await.unwrap();
         let dst = ws.join(".claude").join("skills");
 
-        sync_copy_dir(&src, &dst, true).await.unwrap();
+        sync_dir(&src, &dst, true).await.unwrap();
 
-        // 复制后内容可读
-        assert!(
-            !dst.is_symlink(),
-            "dst should be a real directory, not symlink"
-        );
+        // Unix: 优先软链; Windows/other: fallback copy (实体目录)
+        #[cfg(unix)]
+        {
+            assert!(dst.is_symlink(), "dst should be a symlink on unix");
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(!dst.is_symlink(), "dst should be a real directory");
+        }
+        // 内容可读 (软链和实体目录都透明)
         let content = fs::read_to_string(dst.join("SKILL.md")).await.unwrap();
         assert_eq!(content, "test");
     }
 
     #[tokio::test]
-    async fn sync_copy_dir_creates_empty_dir_when_src_absent() {
+    async fn sync_dir_creates_empty_dir_when_src_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let dst = tmp.path().join(".claude").join("skills");
-        sync_copy_dir(&tmp.path().join(".agents").join("skills"), &dst, false)
+        sync_dir(&tmp.path().join(".agents").join("skills"), &dst, false)
             .await
             .unwrap();
         assert!(dst.is_dir(), "dst should be an empty directory");
     }
 
     #[tokio::test]
-    async fn sync_copy_dir_replaces_existing_target() {
+    async fn sync_dir_replaces_existing_target() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         let src = ws.join(".agents").join("skills");
@@ -285,9 +432,9 @@ mod tests {
         fs::create_dir_all(&dst).await.unwrap();
         fs::write(dst.join("old.md"), "old").await.unwrap();
 
-        sync_copy_dir(&src, &dst, true).await.unwrap();
+        sync_dir(&src, &dst, true).await.unwrap();
 
-        // 旧文件已删 (被复制替换)
+        // 旧文件已删 (软链/copy 后 dst 指向 src, src 中无 old.md)
         assert!(!dst.join("old.md").exists(), "old file should be gone");
         // 新文件可读
         assert_eq!(fs::read_to_string(dst.join("new.md")).await.unwrap(), "new");

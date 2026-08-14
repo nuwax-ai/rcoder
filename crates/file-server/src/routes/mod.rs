@@ -73,17 +73,17 @@ fn git_router() -> OpenApiRouter<AppState> {
 /// `/api/build` 路由。
 fn build_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(build::start_dev))
-        .routes(routes!(build::stop_dev))
-        .routes(routes!(build::restart_dev))
-        .routes(routes!(build::list_dev))
-        .routes(routes!(build::keep_alive))
-        .routes(routes!(build::port_pool_status))
-        .routes(routes!(build::get_dev_log))
-        .routes(routes!(build::build_project))
+        .routes(routes!(build::dev::start_dev))
+        .routes(routes!(build::dev::stop_dev))
+        .routes(routes!(build::dev::restart_dev))
+        .routes(routes!(build::dev::list_dev))
+        .routes(routes!(build::dev::keep_alive))
+        .routes(routes!(build::dev::port_pool_status))
+        .routes(routes!(build::logs::get_dev_log))
+        .routes(routes!(build::build_exec::build_project))
         .routes(routes!(build_support::parse_build_error))
-        .routes(routes!(build::get_log_cache_stats))
-        .routes(routes!(build::clear_all_log_cache))
+        .routes(routes!(build::logs::get_log_cache_stats))
+        .routes(routes!(build::logs::clear_all_log_cache))
 }
 
 /// `/api/computer` 路由，包含静态文件入口。
@@ -99,16 +99,22 @@ fn computer_router() -> OpenApiRouter<AppState> {
         .routes(routes!(computer::archive::zip_workspace))
         .routes(routes!(computer::archive::download_all_files))
         .routes(routes!(computer::files::files_update))
-        .routes(routes!(computer::files::upload_file))
-        .routes(routes!(computer::files::upload_files))
-        .routes(routes!(computer::files::generate_file))
-        .routes(routes!(computer::files::import_project))
+        .routes(routes!(computer::files::upload::upload_file))
+        .routes(routes!(computer::files::upload::upload_files))
+        .routes(routes!(computer::files::generate::generate_file))
+        .routes(routes!(computer::files::import_project::import_project))
         .routes(routes!(computer::packages::cleanup_build_artifacts))
-        .routes(routes!(computer::workspace::create_workspace))
-        .routes(routes!(computer::workspace::create_workspace_v2))
-        .routes(routes!(computer::workspace::push_skills_to_workspace))
-        .routes(routes!(computer::workspace::push_skills_to_workspace_v2))
-        .routes(routes!(computer::workspace::init_project_template))
+        .routes(routes!(computer::workspace::create::create_workspace))
+        .routes(routes!(computer::workspace::create::create_workspace_v2))
+        .routes(routes!(
+            computer::workspace::push_skills::push_skills_to_workspace
+        ))
+        .routes(routes!(
+            computer::workspace::push_skills::push_skills_to_workspace_v2
+        ))
+        .routes(routes!(
+            computer::workspace::init_template::init_project_template
+        ))
         .routes(routes!(computer::packages::build_agent_package))
         .routes(routes!(static_files::serve_computer))
         .route(

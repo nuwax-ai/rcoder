@@ -7,7 +7,7 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
 
-use super::build::response;
+use super::build::logs::Simple;
 
 pub(super) fn normalize_build_base(base: Option<&str>) -> String {
     let base = base.map(str::trim).unwrap_or("/").to_string();
@@ -69,9 +69,9 @@ pub(crate) struct ParseErrorBody {
 pub(crate) async fn parse_build_error(
     State(_state): State<AppState>,
     Json(body): Json<ParseErrorBody>,
-) -> Result<Json<response::Simple>, AppError> {
+) -> Result<Json<Simple>, AppError> {
     let message = crate::service::build_error::parse(&body.error_message);
-    Ok(Json(response::Simple {
+    Ok(Json(Simple {
         success: true,
         message,
     }))

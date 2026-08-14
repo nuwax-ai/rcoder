@@ -119,3 +119,10 @@ tempfile = { workspace = true }
 
 # 异步流构造 (UserApp build 进度 SSE: async_stream::stream!)
 async-stream = { workspace = true }
+
+# 相对路径计算 (agent-store 软链: pathdiff::diff_paths)
+pathdiff = { workspace = true }
+
+# Windows 目录 junction (无特权软链, 仅 Windows 编译时引入)
+[target.'cfg(windows)'.dependencies]
+junction = "2.0"
