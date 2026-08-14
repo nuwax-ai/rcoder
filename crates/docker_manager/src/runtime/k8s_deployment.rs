@@ -37,6 +37,10 @@ pub(crate) const RCODER_LABEL_PREFIX: &str = "rcoder.io";
 /// UserApp Pod 主容器名：build_app_deployment 创建、deployment_to_status 按此名定位状态
 #[cfg(feature = "kubernetes")]
 pub(crate) const APP_CONTAINER_NAME: &str = "app";
+/// 所有 UserApp 共享的 app.kubernetes.io/name label 值：build_app_labels 写入，
+/// build_app_deployment 的 topologySpreadConstraints 也按它分组（跨 Deployment 统计）
+#[cfg(feature = "kubernetes")]
+pub(crate) const APP_NAME_LABEL_VALUE: &str = "user-app";
 
 /// UserApp K8s 资源命名 + 创建/伸缩/重启/删除/查询（pub(crate)，由 ContainerRuntime
 /// trait 的 Deployment 方法转调，rcoder 通过 trait 调用）。
@@ -90,7 +94,10 @@ impl KubernetesRuntime {
         space_id: Option<&str>,
     ) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
-        labels.insert(format!("{}/name", APP_LABEL_PREFIX), "user-app".to_string());
+        labels.insert(
+            format!("{}/name", APP_LABEL_PREFIX),
+            APP_NAME_LABEL_VALUE.to_string(),
+        );
         labels.insert(format!("{}/instance", APP_LABEL_PREFIX), app_id.to_string());
         labels.insert(
             format!("{}/managed-by", APP_LABEL_PREFIX),

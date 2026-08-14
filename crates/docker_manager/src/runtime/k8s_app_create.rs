@@ -29,9 +29,10 @@ use tracing::info;
 use shared_types::ServiceType;
 
 use super::k8s_app_helpers::{
-    build_app_resource_requirements, build_probe, config_hash_annotations, merge_app_annotations,
+    build_app_resource_requirements, build_hostname_spread_constraint, build_probe,
+    config_hash_annotations, merge_app_annotations,
 };
-use super::k8s_deployment::APP_CONTAINER_NAME;
+use super::k8s_deployment::{APP_CONTAINER_NAME, APP_NAME_LABEL_VALUE};
 #[cfg(feature = "kubernetes")]
 use super::k8s_pvc::K8sPvcOps;
 use super::kubernetes_runtime::KubernetesRuntime;
@@ -217,6 +218,15 @@ impl KubernetesRuntime {
             volumes,
             containers: vec![container],
             restart_policy: Some("Always".to_string()),
+            // topologySpreadConstraints：所有 UserApp 共享 label app.kubernetes.io/name=user-app
+            // （build_app_labels 写入），按它分组可把【N 个不同 app 的 Deployment】跨节点摊开
+            // （约束按 label 统计，跨 Deployment 生效）。单 Deployment replicas=1，组内无均衡
+            // 意义，价值全在跨 app。ScheduleAnyway 绝不阻断用户 app 创建；存量 Deployment
+            // 要等下次 SSA 更新触发 rollout，新 pod 才带约束（只影响新调度）。
+            // 策略细节见 build_hostname_spread_constraint。
+            topology_spread_constraints: Some(vec![build_hostname_spread_constraint(
+                APP_NAME_LABEL_VALUE,
+            )]),
             ..Default::default()
         };
 

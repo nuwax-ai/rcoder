@@ -67,6 +67,25 @@ topologySpreadConstraints:
 - **现有 pod 不迁移**(topologySpread 只影响新调度)
 - 今晚 drain 19 是契机:迁移的 25 个重新调度时,加上 topologySpread 会均匀分散到 13/34(不加则按调度器自然选择,13/34 都比 19 闲,也会分散但无保证)
 
+## 覆盖范围:rcoder 全部动态创建路径(2026-08-14 扩展)
+
+topologySpreadConstraints 是 K8s 原生的通用 pod 均衡机制(PodSpec 字段),但**必须每条
+创建路径显式注入**,且按 labelSelector 分组均衡(各组各管各的,非全局平均)。rcoder 动态
+创建的全部 4 类容器均已注入(共用 `build_hostname_spread_constraint`,策略单点维护):
+
+| 类型 | 创建路径 | 分组 label | 说明 |
+|------|---------|-----------|------|
+| ComputerAgentRunner | build_agent_pod_spec (STS) | name=computer-agent-runner | 首批覆盖 |
+| WebAgentRunner | build_agent_pod_spec (STS) | name=web-agent-runner | 首批覆盖 |
+| UserAppBuilder | build_agent_pod_spec (STS) | name=user-app-builder | 同款低 requests,并发 build 扎堆风险 |
+| UserApp | build_app_deployment (Deployment) | name=user-app(共享) | 跨 Deployment 统计: N 个不同 app 摊开 |
+
+- 4 类全部共用 `build_decoupled_resources`(低 requests 设计),故扎堆风险同源。
+- UserApp 每 app 是独立 Deployment(replicas=1),用**共享 label** `user-app` 分组才能跨
+  app 均衡(约束按 label 统计,不区分所属 Deployment)。
+- 生效时机:agent-runner 新建即生效;存量 UserApp Deployment 等下次 SSA 更新触发
+  rollout 后新 pod 才带约束(只影响新调度,存量不迁移)。
+
 ## 配套改动:requests cpu 5m → 50m
 
 与 topologySpread 同期落地(`build_decoupled_resources`)。这是注释里早就建议的

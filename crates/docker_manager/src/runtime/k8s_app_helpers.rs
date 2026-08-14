@@ -5,9 +5,11 @@
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{AppResourceRequirements, ContainerCreateParams, ExposeType};
 #[cfg(feature = "kubernetes")]
-use k8s_openapi::api::core::v1::{Probe, ResourceRequirements};
+use k8s_openapi::api::core::v1::{Probe, ResourceRequirements, TopologySpreadConstraint};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+#[cfg(feature = "kubernetes")]
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
@@ -229,6 +231,39 @@ pub(crate) fn build_decoupled_resources(
     })
 }
 
+/// 构建"按节点(hostname)均衡"的 topologySpreadConstraint（软约束），agent-runner 与
+/// UserApp 动态创建路径共用（统一均衡策略，改参数只改这一处）。
+///
+/// - `topologyKey=hostname`：每个 Node 一个 domain，pod 往节点间摊。
+/// - `labelSelector=app.kubernetes.io/name=<label_value>`：分组统计 key——只统计同 label
+///   的 pod（agent 侧与 `build_standard_labels`、app 侧与 `build_app_labels` 写入的 name
+///   label 值一致），各组各管各的均衡，跨 STS/跨 Deployment 统计。
+/// - `whenUnsatisfiable=ScheduleAnyway`：★绝不阻断调度。即使放到任何节点都违反 maxSkew
+///   也照常调度（优先选 pod 最少的节点）。业务 pod（agent-runner/用户 app）绝不能因均衡
+///   约束 Pending/创建失败（对比 DoNotSchedule：不满足就 Pending，会卡住业务，不采用）。
+/// - `maxSkew=5`：⚠️ ScheduleAnyway 下 maxSkew 只在 DoNotSchedule 模式才作硬过滤阈值；
+///   软约束模式下调度器永远优先 pod 最少的节点，与数值基本无关，取 5 仅表"允许一定倾斜"。
+///
+/// 根因分析与方案见 docs/agent-runner-scheduling-balance.md（requests 虚标致调度失衡）。
+#[cfg(feature = "kubernetes")]
+pub(crate) fn build_hostname_spread_constraint(label_value: &str) -> TopologySpreadConstraint {
+    let mut match_labels = BTreeMap::new();
+    match_labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        label_value.to_string(),
+    );
+    TopologySpreadConstraint {
+        max_skew: 5,
+        topology_key: "kubernetes.io/hostname".to_string(),
+        when_unsatisfiable: "ScheduleAnyway".to_string(),
+        label_selector: Some(LabelSelector {
+            match_labels: Some(match_labels),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// UserApp 资源需求 → ResourceRequirements（包一层共享 `build_decoupled_resources`）。
 ///
 /// UserApp 的 `ephemeral_storage` 未指定时回退 `storage`（与 agent 侧
@@ -278,12 +313,12 @@ mod tests {
     }
 
     #[test]
-    fn decoupled_resources_cpu_only_sets_5m_request() {
+    fn decoupled_resources_cpu_only_sets_50m_request() {
         let rr = build_decoupled_resources(Some("2".into()), None, None).unwrap();
         let limits = rr.limits.unwrap();
         let requests = rr.requests.unwrap();
         assert_eq!(limits["cpu"].0.clone(), "2");
-        assert_eq!(requests["cpu"].0.clone(), "5m");
+        assert_eq!(requests["cpu"].0.clone(), "50m");
         assert!(!limits.contains_key("memory"));
         assert!(!limits.contains_key("ephemeral-storage"));
     }
@@ -296,7 +331,7 @@ mod tests {
         let limits = rr.limits.unwrap();
         let requests = rr.requests.unwrap();
         assert_eq!(limits["cpu"].0.clone(), "1");
-        assert_eq!(requests["cpu"].0.clone(), "5m");
+        assert_eq!(requests["cpu"].0.clone(), "50m");
         assert_eq!(limits["memory"].0.clone(), "512Mi");
         assert_eq!(requests["memory"].0.clone(), "64Mi");
         assert_eq!(limits["ephemeral-storage"].0.clone(), "1Gi");
