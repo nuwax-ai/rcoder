@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::error::{AppError, AppResult};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectionResult {
     pub project_dir: String,

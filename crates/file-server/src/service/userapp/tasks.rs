@@ -30,14 +30,14 @@ const MAX_RETAINED_TASKS: usize = 1_000;
 pub type BuildTaskId = String;
 
 /// 任务类型:仅编译(发布编排已移 rcoder 侧,agent-runner 只负责 build)。
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildTaskKind {
     Build,
 }
 
 /// 任务状态(镜像 app_manager ReleaseStatus 语义)。
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildTaskStatus {
     Pending,
@@ -48,7 +48,7 @@ pub enum BuildTaskStatus {
 }
 
 /// 任务快照(GET /tasks/{id} 返回)。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildTaskSnapshot {
     pub id: BuildTaskId,

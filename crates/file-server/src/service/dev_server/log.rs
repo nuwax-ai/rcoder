@@ -130,7 +130,7 @@ where
 }
 
 /// 一行日志 (对齐 nuwax getDevLog 响应)。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct LogLine {
     pub line: usize,
     pub content: String,
@@ -208,7 +208,7 @@ pub async fn snapshot_dev_log(dir: &Path, log_type: &str) -> AppResult<Option<Lo
     }))
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ReadDevLogResult {
     pub logs: Vec<LogLine>,
     pub total_lines: usize,

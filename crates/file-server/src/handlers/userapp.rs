@@ -1,5 +1,8 @@
 //! UserApp workspace HTTP handlers（独立 `/api/userapp`，复用 `resolve_project`）。
 //!
+//! 响应格式：JSON 接口统一 `shared_types::HttpResult`（`{code, message, data, tid, success}`）；
+//! SSE（logs/stream）与静态文件（static）为特殊通道，不包 HttpResult。
+//!
 //! 异步编译/发布（task 10-12）：
 //! - `POST /build`：workspace 多项目打包（异步：返 taskId，进度经 task 流出）。
 //! - `GET  /tasks/{taskId}`：查任务状态快照（轮询通道）。
@@ -16,20 +19,103 @@ use std::time::Duration;
 use async_stream::stream;
 use axum::Json;
 use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use garde::Validate;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use shared_types::HttpResult;
 
 use crate::AppState;
-use crate::error::AppError;
+use crate::error::{AppError, AppResult};
 use crate::extract::deserialize_id_string;
 use crate::extract::deserialize_optional_id_string;
 use crate::extract::{AppJson, AppPath, AppQuery};
-use crate::service::dev_server::log::read_dev_log;
+use crate::service::dev_server::log::{ReadDevLogResult, read_dev_log};
 use crate::service::userapp;
-use crate::service::userapp::tasks::BuildProgressEvent;
+use crate::service::userapp::tasks::{BuildProgressEvent, BuildTaskSnapshot};
+
+// ── HttpResult 转换层 ──────────────────────────────────────────────────────────
+
+/// UserApp JSON 接口的统一响应：成功/失败都是 HttpResult shape + 语义 HTTP 状态码。
+///
+/// file-server 全局 AppError shape（`{success, code:"UNKNOWN_ERROR", error:{...}}`）服务于
+/// TS 对齐路由不能全局改；UserApp 是 Rust 独有新业务（TS 无此路由），此处将 AppError
+/// 映射为 HttpResult 错误（code/message + 4xx/5xx 状态码）。
+pub(crate) enum UserAppReply<T> {
+    Ok(T),
+    Err(AppError),
+}
+
+impl<T: Serialize> IntoResponse for UserAppReply<T> {
+    fn into_response(self) -> Response {
+        use shared_types::error_codes as ec;
+        match self {
+            UserAppReply::Ok(data) => Json(HttpResult::success(data)).into_response(),
+            UserAppReply::Err(e) => {
+                let (code, status) = match &e {
+                    AppError::Validation(..)
+                    | AppError::ValidationI18n(..)
+                    | AppError::Business(_) => (ec::ERR_VALIDATION, StatusCode::BAD_REQUEST),
+                    AppError::Resource(_) => (ec::ERR_NOT_FOUND, StatusCode::NOT_FOUND),
+                    AppError::Network(_) => (ec::ERR_SERVICE_UNAVAILABLE, StatusCode::BAD_GATEWAY),
+                    AppError::Permission(_)
+                    | AppError::System(_)
+                    | AppError::File(_)
+                    | AppError::Process(_) => (
+                        ec::ERR_INTERNAL_SERVER_ERROR,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    ),
+                };
+                let result = HttpResult::<T>::error(code, &e.to_string());
+                (status, Json(result)).into_response()
+            }
+        }
+    }
+}
+
+/// 便捷转换：`AppResult<T>` → `UserAppReply<T>`。
+fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
+    match r {
+        Ok(data) => UserAppReply::Ok(data),
+        Err(e) => UserAppReply::Err(e),
+    }
+}
+
+// ── data DTO（HttpResult.data 载荷）───────────────────────────────────────────
+
+/// build 响应 data（POST /build）。
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BuildCreatedData {
+    pub task_id: String,
+    pub status: String,
+}
+
+/// cancel 响应 data。
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CancelData {
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub already_terminal: Option<bool>,
+}
+
+/// detect 响应 data。
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DetectData {
+    pub detection: userapp::import::DetectionResult,
+}
+
+/// confirm 响应 data。
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfirmData {
+    pub path: String,
+}
 
 /// `POST /api/userapp/build` 请求体。
 #[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
@@ -95,55 +181,55 @@ pub(crate) struct StreamQuery {
     post,
     path = "/build",
     request_body = BuildUserAppBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已创建")),
     tag = "UserApp"
 )]
 pub(crate) async fn build_workspace(
     State(state): State<AppState>,
     AppJson(body): AppJson<BuildUserAppBody>,
-) -> Result<Json<Value>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
-    let task_id = userapp::start_build_task(
-        &state.build_tasks,
-        state.resolver.clone(),
-        state.build_manager.clone(),
-        body.app_id.clone(),
-        body.tenant_id.clone(),
-        body.space_id.clone(),
-        state.config.dev_command_timeout_secs,
-    )
-    .await?;
+) -> UserAppReply<BuildCreatedData> {
+    let result = async {
+        body.validate().map_err(crate::error::from_garde)?;
+        let task_id = userapp::start_build_task(
+            &state.build_tasks,
+            state.resolver.clone(),
+            state.build_manager.clone(),
+            body.app_id.clone(),
+            body.tenant_id.clone(),
+            body.space_id.clone(),
+            state.config.dev_command_timeout_secs,
+        )
+        .await?;
 
-    tracing::info!(app_id = %body.app_id, %task_id, "userapp build task started");
-
-    Ok(Json(json!({
-        "success": true,
-        "taskId": task_id,
-        "status": "pending",
-    })))
+        tracing::info!(app_id = %body.app_id, %task_id, "userapp build task started");
+        Ok(BuildCreatedData {
+            task_id,
+            status: "pending".to_string(),
+        })
+    };
+    reply(result.await)
 }
 
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}",
     params(("task_id" = String, Path, description = "任务ID")),
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = HttpResult<BuildTaskSnapshot>, description = "任务状态快照")),
     tag = "UserApp"
 )]
 pub(crate) async fn get_task(
     State(state): State<AppState>,
     AppPath(task_id): AppPath<String>,
-) -> Result<Json<Value>, AppError> {
-    let task = state
-        .build_tasks
-        .get(&task_id)
-        .await
-        .ok_or_else(|| AppError::resource(format!("build task not found: {task_id}")))?;
-    let snapshot = task.snapshot().await;
-    Ok(Json(json!({
-        "success": true,
-        "task": serde_json::to_value(&snapshot).unwrap_or(Value::Null),
-    })))
+) -> UserAppReply<BuildTaskSnapshot> {
+    let result = async {
+        let task = state
+            .build_tasks
+            .get(&task_id)
+            .await
+            .ok_or_else(|| AppError::resource(format!("build task not found: {task_id}")))?;
+        Ok(task.snapshot().await)
+    };
+    reply(result.await)
 }
 
 /// `GET /api/userapp/tasks/{taskId}/logs` —— 构建日志分页（复用 `read_dev_log`）。
@@ -151,38 +237,38 @@ pub(crate) async fn get_task(
     get,
     path = "/tasks/{task_id}/logs",
     params(("task_id" = String, Path, description = "任务ID"), TaskLogsQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "构建日志分页")),
     tag = "UserApp"
 )]
 pub(crate) async fn get_task_logs(
     State(state): State<AppState>,
     AppPath(task_id): AppPath<String>,
     AppQuery(q): AppQuery<TaskLogsQuery>,
-) -> Result<Json<Value>, AppError> {
-    let task = state
-        .build_tasks
-        .get(&task_id)
-        .await
-        .ok_or_else(|| AppError::resource(format!("build task not found: {task_id}")))?;
-    let ws_root = task
-        .workspace_root()
-        .await
-        .ok_or_else(|| AppError::resource("build task workspace not resolved yet"))?;
-    let dir = match q.service.as_deref() {
-        Some(service) if !service.is_empty() => {
-            shared_types::validate_service_id(service).map_err(|error| {
-                AppError::validation(format!("invalid log service selector: {error}"))
-            })?;
-            crate::path_safety::ensure_within(&ws_root.join("logs"), service)
-                .map_err(|_| AppError::validation("log service selector escapes workspace logs"))?
-        }
-        _ => ws_root.join("logs"),
+) -> UserAppReply<ReadDevLogResult> {
+    let result = async {
+        let task = state
+            .build_tasks
+            .get(&task_id)
+            .await
+            .ok_or_else(|| AppError::resource(format!("build task not found: {task_id}")))?;
+        let ws_root = task
+            .workspace_root()
+            .await
+            .ok_or_else(|| AppError::resource("build task workspace not resolved yet"))?;
+        let dir = match q.service.as_deref() {
+            Some(service) if !service.is_empty() => {
+                shared_types::validate_service_id(service).map_err(|error| {
+                    AppError::validation(format!("invalid log service selector: {error}"))
+                })?;
+                crate::path_safety::ensure_within(&ws_root.join("logs"), service).map_err(|_| {
+                    AppError::validation("log service selector escapes workspace logs")
+                })?
+            }
+            _ => ws_root.join("logs"),
+        };
+        read_dev_log(&dir, q.start_index, "main", state.config.log_read_max_bytes).await
     };
-    let result = read_dev_log(&dir, q.start_index, "main", state.config.log_read_max_bytes).await?;
-    Ok(Json(json!({
-        "success": true,
-        "logs": serde_json::to_value(&result).unwrap_or(Value::Null),
-    })))
+    reply(result.await)
 }
 
 /// `GET /api/userapp/tasks/{taskId}/logs/stream` —— 任务进度 SSE（实时通道）。
@@ -203,12 +289,15 @@ pub(crate) async fn stream_task_logs(
     State(state): State<AppState>,
     AppPath(task_id): AppPath<String>,
     AppQuery(q): AppQuery<StreamQuery>,
-) -> Result<impl IntoResponse, AppError> {
-    let task = state
-        .build_tasks
-        .get(&task_id)
-        .await
-        .ok_or_else(|| AppError::resource(format!("build task not found: {task_id}")))?;
+) -> Response {
+    // 错误路径 (task 不存在) 也走 HttpResult shape, 与同组 JSON 接口一致
+    // (成功路径是 SSE 流, 豁免 HttpResult)
+    let Some(task) = state.build_tasks.get(&task_id).await else {
+        return UserAppReply::<()>::Err(AppError::resource(format!(
+            "build task not found: {task_id}"
+        )))
+        .into_response();
+    };
     let (replay, mut rx) = task.subscribe(q.from_seq).await;
 
     let progress = stream! {
@@ -240,11 +329,13 @@ pub(crate) async fn stream_task_logs(
         }
     };
 
-    Ok(Sse::new(Box::pin(progress)).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    Sse::new(Box::pin(progress))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 /// `POST /api/userapp/tasks/{taskId}/cancel` —— 取消进行中的编译任务。
@@ -255,104 +346,113 @@ pub(crate) async fn stream_task_logs(
     post,
     path = "/tasks/{task_id}/cancel",
     params(("task_id" = String, Path, description = "任务ID")),
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = HttpResult<CancelData>, description = "取消结果")),
     tag = "UserApp"
 )]
 pub(crate) async fn cancel_task(
     State(state): State<AppState>,
     AppPath(task_id): AppPath<String>,
-) -> Result<Json<Value>, AppError> {
-    let task = state
-        .build_tasks
-        .get(&task_id)
-        .await
-        .ok_or_else(|| AppError::resource(format!("build task not found: {task_id}")))?;
-    if task.is_terminal().await {
-        return Ok(Json(json!({
-            "success": true,
-            "taskId": task_id,
-            "alreadyTerminal": true,
-        })));
-    }
-    task.cancel();
-    // 硬 cancel：kill 当前 build 进程组（run_command_to_log 用 process_group(0)，pid==pgid）。
-    if let Some(pid) = task.pid() {
-        let killed = crate::service::dev_server::process::kill_process_group(pid);
-        tracing::info!(%task_id, pid, killed, "build task cancelled, process group signalled");
-    } else {
-        tracing::info!(%task_id, "build task cancelled (no active pid; soft cancel via loop check)");
-    }
-    // 主动 emit Cancelled：若 build 在循环间隙（非 build_generic 内），靠此置终态；
-    // 若在 build_generic 内被 kill，错误分支的 is_cancelled 分支会 emit Cancelled
-    //（终态保护丢弃这里的重复）。
-    task.emit(BuildProgressEvent::Cancelled).await;
-    Ok(Json(json!({
-        "success": true,
-        "taskId": task_id,
-        "status": "cancelled",
-    })))
+) -> UserAppReply<CancelData> {
+    let result = async {
+        let task = state
+            .build_tasks
+            .get(&task_id)
+            .await
+            .ok_or_else(|| AppError::resource(format!("build task not found: {task_id}")))?;
+        if task.is_terminal().await {
+            return Ok(CancelData {
+                task_id,
+                status: None,
+                already_terminal: Some(true),
+            });
+        }
+        task.cancel();
+        // 硬 cancel：kill 当前 build 子进程组（run_command_to_log 用 process_group(0)，pid==pgid）。
+        if let Some(pid) = task.pid() {
+            let killed = crate::service::dev_server::process::kill_process_group(pid);
+            tracing::info!(%task_id, pid, killed, "build task cancelled, process group signalled");
+        } else {
+            tracing::info!(%task_id, "build task cancelled (no active pid; soft cancel via loop check)");
+        }
+        // 主动 emit Cancelled：若 build 在循环间隙（非 build_generic 内），靠此置终态；
+        // 若在 build_generic 内被 kill，错误分支的 is_cancelled 分支会 emit Cancelled
+        //（终态保护丢弃这里的重复）。
+        task.emit(BuildProgressEvent::Cancelled).await;
+        Ok(CancelData {
+            task_id,
+            status: Some("cancelled".to_string()),
+            already_terminal: None,
+        })
+    };
+    reply(result.await)
 }
 
 #[utoipa::path(
     post,
     path = "/projects/detect",
     request_body = ImportProjectBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = HttpResult<DetectData>, description = "项目探测结果")),
     tag = "UserApp"
 )]
 pub(crate) async fn detect_project(
     State(state): State<AppState>,
     AppJson(body): AppJson<ImportProjectBody>,
-) -> Result<Json<Value>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
-    let workspace = state
-        .resolver
-        .resolve_project(&crate::workspace::ProjectContext {
-            project_id: body.app_id,
-            tenant_id: body.tenant_id,
-            space_id: body.space_id,
-            isolation_type: None,
-        })
-        .await?;
-    let result = userapp::import::detect_project(&workspace, &body.project_dir).await?;
-    Ok(Json(json!({"success": true, "detection": result})))
+) -> UserAppReply<DetectData> {
+    let result = async {
+        body.validate().map_err(crate::error::from_garde)?;
+        let workspace = state
+            .resolver
+            .resolve_project(&crate::workspace::ProjectContext {
+                project_id: body.app_id,
+                tenant_id: body.tenant_id,
+                space_id: body.space_id,
+                isolation_type: None,
+            })
+            .await?;
+        let detection = userapp::import::detect_project(&workspace, &body.project_dir).await?;
+        Ok(DetectData { detection })
+    };
+    reply(result.await)
 }
 
 #[utoipa::path(
     post,
     path = "/projects/confirm",
     request_body = ImportProjectBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = HttpResult<ConfirmData>, description = "项目确认结果")),
     tag = "UserApp"
 )]
 pub(crate) async fn confirm_project(
     State(state): State<AppState>,
     AppJson(body): AppJson<ImportProjectBody>,
-) -> Result<Json<Value>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
-    let app_id = body.app_id.clone();
-    let workspace = state
-        .resolver
-        .resolve_project(&crate::workspace::ProjectContext {
-            project_id: body.app_id,
-            tenant_id: body.tenant_id,
-            space_id: body.space_id,
-            isolation_type: None,
-        })
-        .await?;
-    let path = userapp::import::confirm_project(&workspace, &body.project_dir).await?;
-    // workspace 级 git init（幂等）：本地版本管理 + publish snapshot commit 的前提。
-    // 放 handler 层（持有 config.git_enabled / author）；失败仅告警，不阻断 manifest 确认。
-    if state.config.git_enabled
-        && let Err(e) = crate::service::git::write::init_repo(
-            &workspace,
-            &state.config.git_default_author_name,
-            &state.config.git_default_author_email,
-        )
-    {
-        tracing::warn!(%app_id, error = %e, "workspace git init failed (non-blocking)");
-    }
-    Ok(Json(json!({"success": true, "path": path})))
+) -> UserAppReply<ConfirmData> {
+    let result = async {
+        body.validate().map_err(crate::error::from_garde)?;
+        let app_id = body.app_id.clone();
+        let workspace = state
+            .resolver
+            .resolve_project(&crate::workspace::ProjectContext {
+                project_id: body.app_id,
+                tenant_id: body.tenant_id,
+                space_id: body.space_id,
+                isolation_type: None,
+            })
+            .await?;
+        let path = userapp::import::confirm_project(&workspace, &body.project_dir).await?;
+        // workspace 级 git init（幂等）：本地版本管理 + publish snapshot commit 的前提。
+        // 放 handler 层（持有 config.git_enabled / author）；失败仅告警，不阻断 manifest 确认。
+        if state.config.git_enabled
+            && let Err(e) = crate::service::git::write::init_repo(
+                &workspace,
+                &state.config.git_default_author_name,
+                &state.config.git_default_author_email,
+            )
+        {
+            tracing::warn!(%app_id, error = %e, "workspace git init failed (non-blocking)");
+        }
+        Ok(ConfirmData { path })
+    };
+    reply(result.await)
 }
 
 // ── SSE helper ──────────────────────────────────────────────────────────────────
