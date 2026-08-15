@@ -319,6 +319,7 @@ impl SharedStream {
     /// 所有消息（含 seq=0 合成消息）broadcast 给客户端。
     fn dispatch_event(&self, ev: SharedEvent) {
         let seq = ev.seq;
+        let is_terminal = ev.message_type == "SessionPromptEnd";
         if seq > 0 {
             {
                 let mut ring = self.ring.lock();
@@ -344,6 +345,24 @@ impl SharedStream {
         // 流要等 idle 清理窗口才移除), 用 debug 避免日志刷屏。
         if let Err(send_err) = self.broadcast_tx.send(ev) {
             debug!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
+        }
+        // 🔚 turn 边界：终端事件（end_turn/error 等）广播后清空历史 ring。
+        //
+        // 修复"切换模型后第二轮对话 SSE 收到上一轮重复消息"：
+        // 前端收到 end_turn 即断开 SSE；下一轮重连（尤其换模型重置上下文时）常以
+        // last_seq=0 全量重放——若 ring 仍保留上一轮 seq 1..N，会把整轮旧消息重发。
+        // 清 ring 后重放为空，新客户端只收本轮实时消息；断线补齐语义仅覆盖"当前
+        // 未完成 turn"（跨轮历史属于前端自身状态/历史接口，不由 SSE replay 承载）。
+        //
+        // 注意：**不清 last_seq**——单调游标是后台流断开重连（from_seq=last_seq）不
+        // 回放旧消息的依据；agent_runner 侧在新一轮 chat 的 prepare 阶段也会清自己的
+        // ring，两侧配合正好构成完整边界。
+        if is_terminal {
+            self.clear_ring();
+            debug!(
+                "[SessionStream] terminal event dispatched, ring cleared for next turn: session_id={}, seq={}",
+                self.session_id, seq
+            );
         }
     }
 
@@ -870,6 +889,56 @@ mod tests {
             seq,
             timestamp: 0,
         })
+    }
+
+    fn terminal_event(seq: u64) -> Arc<ProgressEvent> {
+        Arc::new(ProgressEvent {
+            message_type: "SessionPromptEnd".into(),
+            sub_type: "end_turn".into(),
+            payload: "{}".into(),
+            request_id: None,
+            seq,
+            timestamp: 0,
+        })
+    }
+
+    /// 🔚 turn 边界语义：终端事件（SessionPromptEnd）广播后清空 ring——
+    /// 修复"换模型后第二轮对话 SSE 重放上一轮消息"。last_seq 保持单调
+    /// （后台流重连 from_seq=last_seq 不回放旧消息的依据）。
+    #[tokio::test]
+    async fn terminal_event_clears_ring_for_next_turn() {
+        let shared = SharedStream::new(
+            "s1".into(),
+            "127.0.0.1:1".into(),
+            Arc::new(GrpcChannelPool::new()),
+            "en",
+            Arc::new(|_| {}),
+            None,
+        )
+        .await;
+
+        // 第一轮：seq 1..3 + 终端事件 seq 4
+        shared.dispatch_event(arc_event(1, "turn1-a"));
+        shared.dispatch_event(arc_event(2, "turn1-b"));
+        shared.dispatch_event(arc_event(3, "turn1-c"));
+        shared.dispatch_event(terminal_event(4));
+
+        // 终端后 ring 已清：新客户端（last_seq=0，换模型重连的典型形态）重放为空
+        assert!(
+            shared.replay_since(0).is_empty(),
+            "ring must be cleared after terminal event"
+        );
+        // last_seq 保持单调（防后台流重连回放）
+        assert_eq!(shared.last_seq(), 4, "last_seq must stay monotonic");
+
+        // 第二轮：seq 5 起，重放只含新消息
+        shared.dispatch_event(arc_event(5, "turn2-a"));
+        let got: Vec<u64> = shared
+            .replay_since(0)
+            .into_iter()
+            .map(|ev| ev.seq)
+            .collect();
+        assert_eq!(got, vec![5], "next turn replay contains only new events");
     }
 
     /// SharedStream::new 会 spawn 后台 gRPC task（连 127.0.0.1:1 必失败，但不影响 dispatch_event
