@@ -68,18 +68,80 @@ async fn main() -> anyhow::Result<()> {
     docker_init::init_docker_manager(&bootstrap_result.config).await?;
     docker_init::startup_cleanup(&bootstrap_result.config).await;
 
-    // 提前创建 ProjectAdapter，以便同一 Arc 实例同时作为
-    // Arc<dyn ContainerLookup> 注入 Pingora 代理层（统一容器 IP 数据源）
-    // 和作为 AppState.projects 共享给业务逻辑。
+    // 提前创建存储后端（M4：按 config.storage 分叉 Memory/Postgres 枚举），
+    // 以便同一 Arc 实例同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层
+    // （统一容器 IP 数据源）和作为 AppState.projects 共享给业务逻辑。
     let cluster_domain = shared_types::get_k8s_cluster_domain();
-    let (projects, cleanup_rx) = ProjectAdapter::new(
-        bootstrap_result.config.app_manager.namespace.clone(),
-        cluster_domain.clone(),
-    );
-    let projects = Arc::new(projects);
+    let (projects_backend, cleanup_rx) = match bootstrap_result.config.storage.backend {
+        config::StorageBackend::Memory => {
+            let (adapter, cleanup_rx) = ProjectAdapter::new(
+                bootstrap_result.config.app_manager.namespace.clone(),
+                cluster_domain.clone(),
+            );
+            (ProjectStoreBackend::Memory(adapter), cleanup_rx)
+        }
+        // PG 模式 fail fast：未编译 feature / 连接失败 / 迁移失败均直接退出，
+        // 绝不静默降级内存（会造成 PG 与镜像分叉）
+        #[cfg(feature = "rcoder-pg")]
+        config::StorageBackend::Postgres => {
+            let pg_config = &bootstrap_result.config.storage.postgres;
+            let (store, cleanup_rx) = rcoder_storage::pg::PgStore::connect(
+                pg_config,
+                bootstrap_result.config.app_manager.namespace.clone(),
+                cluster_domain.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("[STORAGE_PG] postgres backend init failed: {e:#}");
+                std::process::exit(1);
+            });
+            (ProjectStoreBackend::Postgres(store), cleanup_rx)
+        }
+        #[cfg(not(feature = "rcoder-pg"))]
+        config::StorageBackend::Postgres => {
+            eprintln!(
+                "storage.backend=postgres 但二进制未编译 rcoder-pg feature；\
+                 请用 --features rcoder-pg 构建，或将 RCODER_STORAGE_BACKEND 设为 memory"
+            );
+            std::process::exit(1);
+        }
+    };
+    let projects = Arc::new(projects_backend);
+    // 关停 flush 用的克隆（AppState::new 会 move 主 Arc）
+    let projects_for_shutdown = Arc::clone(&projects);
 
-    // 克隆同一 Arc 实例供 Pingora 代理层使用（共享 DashMap 数据）。
-    // 必须先得到具体类型 Arc<ProjectAdapter>，再在其上做 unsized coercion
+    // M5：PG 模式的 publish 任务行持久化（与 PgStore 共池）。启动恢复：未终态任务
+    // 全部标记 failed（orchestrator 随进程消亡，running 必为僵尸）。
+    #[cfg(feature = "rcoder-pg")]
+    let publish_repo: Option<Arc<dyn rcoder_storage::publish_repo::PublishTaskPersistence>> =
+        if projects.is_postgres() {
+            let ProjectStoreBackend::Postgres(store) = &*projects else {
+                unreachable!("is_postgres 为真的分支");
+            };
+            let publish: Arc<dyn rcoder_storage::publish_repo::PublishTaskPersistence> = Arc::new(
+                rcoder_storage::pg::publish::PgPublishTaskPersistence::new(store.pool().clone()),
+            );
+            match publish.recover_running("rcoder restarted").await {
+                Ok(n) if n > 0 => {
+                    tracing::warn!(
+                        "[STORAGE_PG] recovered {n} orphaned publish tasks (marked failed)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[STORAGE_PG] publish task recovery failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+            Some(publish)
+        } else {
+            None
+        };
+    #[cfg(not(feature = "rcoder-pg"))]
+    let publish_repo: Option<Arc<dyn rcoder_storage::publish_repo::PublishTaskPersistence>> = None;
+
+    // 克隆同一 Arc 实例供 Pingora 代理层使用（共享底层数据）。
+    // 必须先得到具体类型 Arc<ProjectStoreBackend>，再在其上做 unsized coercion
     // 到 trait object，避免类型推断把 clone 的类型参数反向绑定为 dyn。
     let projects_for_lookup = Arc::clone(&projects);
     let container_lookup: Arc<dyn shared_types::ContainerLookup> = projects_for_lookup;
@@ -95,6 +157,32 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(app_manager::AppActivityRegistry::new(wake_timeout));
     let access_tracker: Arc<dyn shared_types::AppAccessTracker> = activity_registry.clone();
     let wake_control: Arc<dyn shared_types::AppWakeControl> = activity_registry.clone();
+
+    // M5：PG 模式的 activity 影子持久化——加载必须早于 AppState::new（内部的
+    // AppService::new/rebuild_stopped_apps 仅对未加载到的 Running app seed_accessed）
+    if projects.is_postgres() {
+        #[cfg(feature = "rcoder-pg")]
+        {
+            let ProjectStoreBackend::Postgres(store) = &*projects else {
+                unreachable!("is_postgres 为真的分支");
+            };
+            let activity_persistence: Arc<dyn shared_types::ActivityPersistence> = Arc::new(
+                rcoder_storage::pg::activity::PgActivityPersistence::new(store.pool().clone()),
+            );
+            match activity_persistence.load_all().await {
+                Ok(rows) => {
+                    let count = rows.len();
+                    activity_registry.apply_loaded(rows);
+                    tracing::info!("[STORAGE_PG] userapp_activity loaded: {count} rows");
+                }
+                Err(e) => {
+                    eprintln!("[STORAGE_PG] userapp_activity load failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+            activity_registry.set_persistence(activity_persistence);
+        }
+    }
 
     let proxy_result = proxy_init::init_proxy(
         &bootstrap_result.config,
@@ -172,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
             projects,
             cleanup_rx,
             activity_registry.clone(),
+            publish_repo,
         )
         .await?,
     );
@@ -192,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx.subscribe(),
         bootstrap_result.config.clone(),
         runtime_for_shutdown,
+        Some(projects_for_shutdown),
     )
     .await;
     server_handle.abort();

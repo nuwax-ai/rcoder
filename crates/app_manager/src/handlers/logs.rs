@@ -1,3 +1,5 @@
+//! 应用日志 handler（sources/query/stream，转发到 app 容器内 app-cli :3010）
+
 use std::sync::Arc;
 
 use axum::Json;
@@ -6,18 +8,25 @@ use axum::extract::{Path, State};
 use axum::http::{Response, StatusCode, header};
 use futures_util::TryStreamExt;
 use serde_json::Value;
-use shared_types::AppError;
+use shared_types::{AppError, HttpResult};
 
 use crate::models::{AppLogQueryRequest, AppOperationError};
 
 use super::AppManagerState;
 
+/// 查询应用声明的日志源与匹配到的日志文件（转发 app-cli /v1/logs/sources/query）
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/logs/sources/query",
-    params(("app_id" = String, Path)),
+    params(("app_id" = String, Path, description = "应用 ID")),
     request_body = AppLogQueryRequest,
-    responses((status = 200, description = "Declared log sources and matched files")),
+    responses(
+        (status = 200, description = "声明的日志源与匹配文件列表"),
+        (status = 400, description = "app-cli 拒绝请求（参数错误）", body = HttpResult<String>),
+        (status = 404, description = "应用不存在", body = HttpResult<String>),
+        (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
+        (status = 500, description = "连接 app-cli / 响应解析失败", body = HttpResult<String>)
+    ),
     tag = "应用日志"
 )]
 pub async fn query_app_log_sources(
@@ -28,12 +37,19 @@ pub async fn query_app_log_sources(
     forward_json(&state, &app_id, "/v1/logs/sources/query", request).await
 }
 
+/// 查询应用多服务日志快照（带 checkpoint 游标，支持增量拉取；转发 app-cli /v1/logs/query）
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/logs/query",
-    params(("app_id" = String, Path)),
+    params(("app_id" = String, Path, description = "应用 ID")),
     request_body = AppLogQueryRequest,
-    responses((status = 200, description = "Multi-service log snapshot and checkpoint cursor")),
+    responses(
+        (status = 200, description = "多服务日志快照与 checkpoint 游标"),
+        (status = 400, description = "app-cli 拒绝请求（参数错误）", body = HttpResult<String>),
+        (status = 404, description = "应用不存在", body = HttpResult<String>),
+        (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
+        (status = 500, description = "连接 app-cli / 响应解析失败", body = HttpResult<String>)
+    ),
     tag = "应用日志"
 )]
 pub async fn query_app_logs(
@@ -44,12 +60,19 @@ pub async fn query_app_logs(
     forward_json(&state, &app_id, "/v1/logs/query", request).await
 }
 
+/// 实时日志 SSE 流（转发 app-cli /v1/logs/stream，Content-Type: text/event-stream）
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/logs/stream",
-    params(("app_id" = String, Path)),
+    params(("app_id" = String, Path, description = "应用 ID")),
     request_body = AppLogQueryRequest,
-    responses((status = 200, description = "SSE log stream")),
+    responses(
+        (status = 200, description = "SSE 日志流（text/event-stream）"),
+        (status = 400, description = "app-cli 拒绝请求（参数错误）", body = HttpResult<String>),
+        (status = 404, description = "应用不存在", body = HttpResult<String>),
+        (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
+        (status = 500, description = "连接 app-cli / 建流失败", body = HttpResult<String>)
+    ),
     tag = "应用日志"
 )]
 pub async fn stream_app_logs_v1(

@@ -159,6 +159,15 @@ pub async fn startup_cleanup(config: &AppConfig) {
         info!("Container cleanup task already started (cleanup_config.enabled=false)");
         return;
     }
+    // PG 模式跳过启动清理：project/session/container 映射以 PG 为真源（启动全量加载），
+    // 用户容器跨 rcoder 重启存活；孤儿容器由 status_checker/cleaner/pod_ensure 兜底对账。
+    // （内存模式保留"重启即推倒重来 + 懒重建"的单节点自愈语义，行为零改动）
+    if config.storage.backend == crate::config::StorageBackend::Postgres {
+        info!(
+            "[STORAGE_PG] startup cleanup skipped (postgres mode: state restored from PG, agent containers survive restarts)"
+        );
+        return;
+    }
 
     match docker_manager::runtime::RuntimeManager::runtime_type() {
         RuntimeType::Docker => {

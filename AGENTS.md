@@ -51,3 +51,10 @@ cargo build --release --workspace
 - **agent_runner Pod 日志在 stdout** —— `kubectl logs` 可直接查看。
 - **可观测性栈**: OTLP 分布式追踪 + Prometheus 指标（`/metrics`）+ Pyroscope 持续剖析。
 - 架构和调试详细指引见 [CLAUDE.md](CLAUDE.md)。
+
+## 模块契约约定
+
+6. **跨 crate 契约一律定义在 shared_types** —— 供多个 crate 消费的 trait / 数据
+   契约（如 ContainerLookup、ProjectStore、ActivityPersistence、PublishTaskPersistence、
+   CleanupRequest）必须放 shared_types，不得散落消费方或实现方 crate（防领域类型
+   双头事实源；specs/rcoder-pg/spec.md 有完整模块图）。

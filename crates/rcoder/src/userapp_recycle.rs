@@ -68,13 +68,16 @@ impl UserAppRecycleScanner {
             .list_app_runtimes()
             .await
             .map_err(|e| anyhow::anyhow!("list_app_runtimes: {e}"))?;
-        let now = std::time::Instant::now();
+        // 闲置时长按 wall-clock 计算（last_accessed 为 DateTime，可跨重启持久化）；
+        // 负值（时钟回拨）按 0 处理
+        let now = chrono::Utc::now();
         let mut recycled = 0usize;
 
         for app in apps {
             let age = app.created_at.as_deref().and_then(age_of);
             let last_accessed = self.state.activity.last_accessed_at(&app.app_id);
-            let idle = last_accessed.map(|t| now.saturating_duration_since(t));
+            let idle =
+                last_accessed.map(|t| now.signed_duration_since(t).to_std().unwrap_or_default());
             let decision = decide_recycle(
                 &RecycleEvalInput {
                     replicas: app.replicas,

@@ -11,8 +11,8 @@ use shared_types::{ContainerBasicInfo, ContainerEntry, ProjectAndContainerInfo, 
 use tracing::info;
 
 use super::adapter::ProjectAdapter;
-use super::resource_reaper::CleanupRequest;
-use super::types::IdleContainerInfo;
+use shared_types::CleanupRequest;
+use shared_types::IdleContainerInfo;
 
 impl ProjectAdapter {
     // ========== 容器操作 ==========

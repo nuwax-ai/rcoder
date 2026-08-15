@@ -138,7 +138,7 @@ impl From<CancelResult> for CancelNotificationResponse {
 }
 
 /// Agent 服务状态
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, ToSchema)]
 pub enum AgentStatus {
     /// 等待处理 - 任务已提交到队列，等待 Worker 开始处理
     Pending,

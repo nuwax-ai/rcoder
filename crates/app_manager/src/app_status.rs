@@ -131,7 +131,12 @@ impl AppService {
                 }
                 stopped += 1;
             } else {
-                self.activity.seed_accessed(&s.app_id);
+                // M5：PG 持久化加载（apply_loaded）先于本 rebuild 执行时，
+                // 已恢复的历史 last_accessed 不被覆盖（保留真实闲置进度）；
+                // 仅对未加载到的 Running app 种入新鲜时间（完整 grace 周期）。
+                if self.activity.last_accessed_at(&s.app_id).is_none() {
+                    self.activity.seed_accessed(&s.app_id);
+                }
                 running += 1;
             }
         }

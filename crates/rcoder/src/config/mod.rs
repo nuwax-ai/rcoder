@@ -9,6 +9,9 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+mod storage;
+pub use storage::{StorageBackend, StorageConfig};
+
 /// 命令行参数
 #[derive(Parser, Debug)]
 #[command(name = "rcoder")]
@@ -99,6 +102,9 @@ pub struct AppConfig {
     /// UserApp 闲置自动回收 + 流量唤醒配置
     #[serde(default)]
     pub userapp_recycle: UserAppRecycleConfig,
+    /// 存储后端配置（rcoder-pg：memory=纯内存单节点，postgres=PG 持久化）
+    #[serde(default)]
+    pub storage: StorageConfig,
     /// API Key 鉴权配置
     #[serde(default)]
     pub api_key_auth: ApiKeyAuthConfig,
@@ -401,6 +407,7 @@ impl Default for AppConfig {
             kubernetes_config: None,
             cleanup_config: CleanupConfigSettings::default(),
             userapp_recycle: UserAppRecycleConfig::default(),
+            storage: StorageConfig::default(),
             api_key_auth: ApiKeyAuthConfig {
                 enabled: false,
                 api_key: generate_random_api_key(),
@@ -777,6 +784,8 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         "RCODER_USERAPP_PROTECTION_SECONDS",
         &mut config.userapp_recycle.protection_seconds,
     );
+
+    storage::apply_storage_env_overrides(&mut config)?;
 
     // 验证 API Key 配置
     if config.api_key_auth.enabled && config.api_key_auth.api_key.trim().is_empty() {

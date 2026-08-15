@@ -249,3 +249,28 @@ api_key_auth:
   # 示例：sk-a1b2c3d4e5f6789012345678abcdef01
   # 可以通过环境变量 RCODER_API_KEY 覆盖此配置
   api_key: "{{GENERATED_API_KEY}}"
+
+# 存储后端配置（rcoder-pg；默认 memory，docker compose 部署无需配置）
+# postgres 模式需二进制以 --features rcoder-pg 编译（k8s 变体），
+# 映射关系持久化到 PG，rcoder 重启后 session resolve 不丢、用户容器不被清理。
+# 所有字段均可用环境变量覆盖（env > 本文件 > 默认值）：
+#   RCODER_STORAGE_BACKEND / RCODER_PG_HOST / RCODER_PG_PORT / RCODER_PG_USERNAME /
+#   RCODER_PG_PASSWORD / RCODER_PG_DATABASE / RCODER_PG_URL / RCODER_PG_MAX_CONNECTIONS /
+#   RCODER_PG_CONNECT_TIMEOUT_SECS / RCODER_PG_STATEMENT_TIMEOUT_SECS
+storage:
+  # 存储后端：memory（默认，纯内存单节点）| postgres（PG 持久化，多副本前置条件）
+  backend: memory
+  # PG 连接配置（backend=postgres 时生效）
+  postgres:
+    # K8s 内通常是 <release>-pg.<namespace>.svc.cluster.local
+    host: ""
+    port: 5432
+    username: ""
+    # k8s 部署建议留空，经 RCODER_PG_PASSWORD env + Secret 注入
+    password: ""
+    database: rcoder
+    # 可选：整串 DSN，设置后优先于上面的离散字段（特殊字符/SSL 参数逃生口）
+    # url: "postgres://user:pass@host:5432/rcoder"
+    max_connections: 10
+    connect_timeout_secs: 10
+    statement_timeout_secs: 5

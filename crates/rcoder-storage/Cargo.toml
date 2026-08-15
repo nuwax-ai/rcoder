@@ -1,0 +1,40 @@
+[package]
+name = "rcoder-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+# PostgreSQL 持久化后端（write-behind + 启动全量加载）。
+# 默认不启用：docker compose / 内存路径完全不编译 sqlx。
+# rcoder 侧经 feature `rcoder-pg = ["kubernetes", "rcoder-storage/pg"]` 转发开启。
+pg = ["sqlx", "moka"]
+
+[lints]
+workspace = true
+
+[dependencies]
+shared_types = { workspace = true }
+
+# 内存镜像与并发结构
+dashmap = { workspace = true }
+lockmap = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+percent-encoding = { workspace = true }
+async-trait = { workspace = true }
+tokio-util = { workspace = true }
+
+# PG 后端（feature-gated）
+sqlx = { workspace = true, optional = true }
+# Touch 节流表（pg 模式：TTI 过期防 key 泄漏）
+moka = { workspace = true, optional = true }

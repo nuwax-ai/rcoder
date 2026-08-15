@@ -13,6 +13,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 use tokio::sync::{Notify, watch};
 use tokio::time::{sleep, timeout};
@@ -84,13 +85,27 @@ impl Drop for WakeGuard {
 }
 
 /// UserApp 活动状态注册表(in-memory,rcoder 单实例共享)
+///
+/// M5 起支持影子持久化：注入 [`shared_types::ActivityPersistence`] 后，
+/// 状态变更标脏，由 rcoder 侧 flusher 周期批量落 PG；启动时 `apply_loaded`
+/// 恢复跨重启的 last_accessed/stopped/wake_blocked（wake single-flight 等进程内
+/// 协调机制不持久化）。`last_accessed` 用 wall-clock（`DateTime<Utc>`）而非
+/// `Instant`（单调钟不可序列化）；节流与 epoch 复核语义不变。
 pub struct AppActivityRegistry {
-    /// app_id → 最近一次真实 HTTP 访问时刻(节流更新)
-    last_accessed: DashMap<String, Instant>,
+    /// app_id → 最近一次真实 HTTP 访问时刻(节流更新;wall-clock,可持久化)
+    pub(super) last_accessed: DashMap<String, DateTime<Utc>>,
     /// app_id → 已 stopped(scale0)标记;stop/start/wake/重启重建 共同维护
-    stopped: DashSet<String>,
+    pub(super) stopped: DashSet<String>,
     /// app_id → 用户主动停止或发布切换中的应用；流量不得自动唤醒。
-    wake_blocked: DashSet<String>,
+    pub(super) wake_blocked: DashSet<String>,
+    /// app_id → 待持久化脏行(flusher 周期 collect_dirty 落库)
+    pub(super) dirty: DashSet<String>,
+    /// app_id → 待删除行(forget_app 后由 flusher 清 PG)
+    pub(super) deleted: DashSet<String>,
+    /// 影子持久化(延迟注入;PG 模式 main 设置,内存模式保持 None)
+    ///
+    /// 字段 `pub(super)`：供 `activity_persistence_ops.rs`（同类型 extension-impl 拆分）访问。
+    pub(super) persistence: OnceLock<Arc<dyn shared_types::ActivityPersistence>>,
     /// app_id → 进行中的唤醒句目(并发合流)
     waking: Arc<DashMap<String, Arc<WakeHandle>>>,
     /// app_id → 正在执行的闲置回收过渡。
@@ -115,6 +130,9 @@ impl AppActivityRegistry {
             last_accessed: DashMap::new(),
             stopped: DashSet::new(),
             wake_blocked: DashSet::new(),
+            dirty: DashSet::new(),
+            deleted: DashSet::new(),
+            persistence: OnceLock::new(),
             waking: Arc::new(DashMap::new()),
             recycling: Arc::new(DashMap::new()),
             runtime: OnceLock::new(),
@@ -134,18 +152,21 @@ impl AppActivityRegistry {
     pub fn mark_stopped(&self, app_id: &str) {
         self.wake_blocked.remove(app_id);
         self.stopped.insert(app_id.to_string());
+        self.note_dirty(app_id);
     }
 
     /// 主动停止/发布切换：记录 scale0，但禁止流量自动拉起。
     pub fn mark_wake_blocked(&self, app_id: &str) {
         self.stopped.remove(app_id);
         self.wake_blocked.insert(app_id.to_string());
+        self.note_dirty(app_id);
     }
 
     /// 闲置回收完成后把停止状态转换为可由流量唤醒。
     pub fn mark_recycled(&self, app_id: &str) {
         self.wake_blocked.remove(app_id);
         self.stopped.insert(app_id.to_string());
+        self.note_dirty(app_id);
     }
 
     /// 是否有进行中的唤醒(回收扫描器据此跳过,避免与 in-flight wake 竞态)
@@ -162,6 +183,8 @@ impl AppActivityRegistry {
     pub fn forget_app(&self, app_id: &str) {
         self.last_accessed.remove(app_id);
         self.stopped.remove(app_id);
+        self.dirty.remove(app_id);
+        self.deleted.insert(app_id.to_string());
         self.wake_blocked.remove(app_id);
         if let dashmap::mapref::entry::Entry::Occupied(entry) =
             self.waking.entry(app_id.to_string())
@@ -185,7 +208,7 @@ impl AppActivityRegistry {
     pub fn try_begin_recycle(
         &self,
         app_id: &str,
-        observed_access: Instant,
+        observed_access: DateTime<Utc>,
     ) -> Option<RecycleTransition> {
         let signal = Arc::new(Notify::new());
         match self.recycling.entry(app_id.to_string()) {
@@ -231,12 +254,12 @@ impl AppActivityRegistry {
 
     /// 给 Running app 种入 last_accessed=now(rebuild_stopped_apps / 外部 start 用)
     pub fn seed_accessed(&self, app_id: &str) {
-        self.last_accessed
-            .insert(app_id.to_string(), Instant::now());
+        self.last_accessed.insert(app_id.to_string(), Utc::now());
+        self.note_dirty(app_id);
     }
 
     /// 返回上次访问时刻,供回收扫描器计算闲置时长;None=从未被访问(应视为 grace,不回收)。
-    pub fn last_accessed_at(&self, app_id: &str) -> Option<Instant> {
+    pub fn last_accessed_at(&self, app_id: &str) -> Option<DateTime<Utc>> {
         self.last_accessed.get(app_id).map(|r| *r)
     }
 
@@ -244,8 +267,8 @@ impl AppActivityRegistry {
     pub fn mark_running(&self, app_id: &str) {
         self.stopped.remove(app_id);
         self.wake_blocked.remove(app_id);
-        self.last_accessed
-            .insert(app_id.to_string(), Instant::now());
+        self.last_accessed.insert(app_id.to_string(), Utc::now());
+        self.note_dirty(app_id);
     }
 
     /// 仅供流量唤醒成功路径使用。唤醒不能清除并发到达的手动停止标记，
@@ -255,8 +278,8 @@ impl AppActivityRegistry {
             return false;
         }
         self.stopped.remove(app_id);
-        self.last_accessed
-            .insert(app_id.to_string(), Instant::now());
+        self.last_accessed.insert(app_id.to_string(), Utc::now());
+        self.note_dirty(app_id);
         !self.wake_blocked.contains(app_id)
     }
 
@@ -358,17 +381,21 @@ impl AppActivityRegistry {
 
 impl AppAccessTracker for AppActivityRegistry {
     fn touch(&self, app_id: &str) {
-        let now = Instant::now();
+        let now = Utc::now();
         // entry API:同一 shard 一次锁;Vacant 直接插,Occupied 仅超节流窗口才写
         match self.last_accessed.entry(app_id.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(mut e) => {
                 let prev = *e.get();
-                if now.saturating_duration_since(prev) >= self.throttle {
+                if now.signed_duration_since(prev)
+                    >= chrono::Duration::from_std(self.throttle).unwrap_or_default()
+                {
                     e.insert(now);
+                    self.note_dirty(app_id);
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
                 e.insert(now);
+                self.note_dirty(app_id);
             }
         }
     }

@@ -23,12 +23,16 @@ use shared_types::ProjectAndContainerInfo;
 use crate::{
     config::{ApiKeyAuthConfig, AppConfig},
     handler,
-    storage::ProjectAdapter,
+    storage::ProjectStoreBackend,
 };
 use agent_provisioning::AgentDownloadManager;
 use rcoder_telemetry::{HttpMetricsLayer, TelemetryGuard};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+// 存储契约 trait 引入作用域：AppState.projects 为枚举 ProjectStoreBackend，
+// 其上的 get/insert/... 方法均经 shared_types::ProjectStore 解析。
+use shared_types::ProjectStore as _;
 
 async fn locale_context_middleware(mut req: Request<axum::body::Body>, next: Next) -> Response {
     let locale = shared_types::parse_accept_language(
@@ -59,12 +63,13 @@ pub struct AppState {
     pub config: AppConfig,
     /// 项目适配器 - 纯 DashMap 内存存储 + RAII 自动资源回收
     ///
-    /// 使用 `Arc<ProjectAdapter>` 共享同一实例：
-    /// - AppState 业务逻辑通过 `state.projects.method()` 访问（Arc 自动 deref）
+    /// 使用 `Arc<ProjectStoreBackend>` 共享同一实例：
+    /// - AppState 业务逻辑通过 `state.projects.method()` 访问（Arc 自动 deref，
+    ///   方法经 ProjectStore trait 静态分发到 Memory/Postgres 后端）
     /// - 同一 `Arc` 作为 `Arc<dyn ContainerLookup>` 注入 Pingora 代理层，
     ///   使 /web/ttyd、/computer/ttyd 等路由能解析容器 IP
     ///   （DashMap 的 clone 是深拷贝，必须共享同一 Arc 实例才能保证数据一致）
-    pub projects: Arc<ProjectAdapter>,
+    pub projects: Arc<ProjectStoreBackend>,
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
     /// gRPC 连接池（用于与 agent_runner 通信）
@@ -109,11 +114,12 @@ impl AppState {
         container_prefix_rcoder: String,
         container_prefix_computer: String,
         runtime: Arc<dyn ContainerRuntime>,
-        projects: Arc<ProjectAdapter>,
+        projects: Arc<ProjectStoreBackend>,
         cleanup_rx: tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>,
         activity: Arc<app_manager::AppActivityRegistry>,
+        publish_repo: Option<Arc<dyn rcoder_storage::publish_repo::PublishTaskPersistence>>,
     ) -> anyhow::Result<Self> {
-        // ProjectAdapter 由调用方（main.rs）提前创建并注入，
+        // 存储后端（Memory/Postgres 枚举）由调用方（main.rs）按配置构造并注入，
         // 以便同一 Arc 实例可同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层。
         let cluster_domain = shared_types::get_k8s_cluster_domain();
 
@@ -157,7 +163,10 @@ impl AppState {
             app_service,
             activity,
             cluster_domain,
-            publish_tasks: Arc::new(crate::userapp_publish::PublishTaskStore::new()),
+            publish_tasks: Arc::new(match publish_repo {
+                Some(repo) => crate::userapp_publish::PublishTaskStore::with_repo(repo),
+                None => crate::userapp_publish::PublishTaskStore::new(),
+            }),
         })
     }
 
@@ -277,28 +286,16 @@ impl AppState {
     }
 
     /// 更新会话信息（已废弃，请用 `add_session_to_project` 或 `insert_project_with_session`）
+    ///
+    /// 存储契约（ProjectStore）只保留多 session 语义；本委托直接转发
+    /// `add_session_to_project`（adapter 侧废弃同名方法也是该语义）。
     #[inline]
     #[deprecated(
         since = "0.0.0",
         note = "非原子，请用 `add_session_to_project` 走多 session 路径"
     )]
-    #[allow(deprecated)]
     pub fn update_session(&self, project_id: &str, session_id: &str) {
-        self.projects.update_session(project_id, session_id);
-    }
-
-    /// 原子更新会话信息（已废弃，多 session 模型下 CAS 语义不再适用）
-    #[inline]
-    #[deprecated(since = "0.0.0", note = "CAS 语义在多 session 模型下不再适用")]
-    #[allow(dead_code, deprecated)]
-    pub fn update_session_atomic(
-        &self,
-        project_id: &str,
-        new_session_id: &str,
-        expected_current_session_id: Option<&str>,
-    ) -> bool {
-        self.projects
-            .update_session_atomic(project_id, new_session_id, expected_current_session_id)
+        let _ = self.projects.add_session_to_project(project_id, session_id);
     }
 
     /// 清除会话信息（清所有 session，agent stop 场景）
@@ -929,5 +926,64 @@ mod openapi_tests {
         ] {
             assert!(paths.contains_key(path), "OpenAPI path missing: {path}");
         }
+    }
+
+    /// UserApp（/api/v1/apps 前缀）全部端点的文档质量防回归：
+    /// 1. 每个操作必须有非空 summary 或 description（handler `///` doc 注释）；
+    /// 2. 200 响应必须有非空 description；
+    /// 3. 必须声明至少一个 4xx/5xx 错误响应（与 handler 实际错误分支对应）。
+    ///
+    /// 新增 UserApp 端点未写注释会在此失败——样板见 userapp_publish/handler.rs。
+    #[test]
+    fn userapp_openapi_annotations_are_complete() {
+        let document = ApiDoc::openapi();
+        let mut checked = 0usize;
+        for (path, item) in &document.paths.paths {
+            if !path.starts_with("/api/v1/apps") {
+                continue;
+            }
+            for operation in [&item.get, &item.post].into_iter().flatten() {
+                let described = operation
+                    .summary
+                    .as_ref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                    || operation
+                        .description
+                        .as_ref()
+                        .is_some_and(|d| !d.trim().is_empty());
+                assert!(
+                    described,
+                    "OpenAPI 操作缺少 doc 注释（summary/description 均为空）: {path}"
+                );
+
+                let responses = &operation.responses.responses;
+                let ok = responses
+                    .get("200")
+                    .unwrap_or_else(|| panic!("OpenAPI 操作缺少 200 响应: {path}"));
+                let utoipa::openapi::RefOr::T(ok) = ok else {
+                    panic!("200 响应不应为 $ref: {path}");
+                };
+                assert!(
+                    !ok.description.trim().is_empty(),
+                    "200 响应缺少 description: {path}"
+                );
+
+                let has_error_code = responses.keys().any(|code| {
+                    code.trim()
+                        .parse::<u16>()
+                        .is_ok_and(|c| (400..600).contains(&c))
+                });
+                assert!(
+                    has_error_code,
+                    "OpenAPI 操作未声明任何 4xx/5xx 错误响应: {path}"
+                );
+                checked += 1;
+            }
+        }
+        // 覆盖数下限：app_manager 32 + userapp_publish 6 端点。
+        assert!(
+            checked >= 38,
+            "UserApp OpenAPI 端点覆盖数异常偏少: {checked}"
+        );
     }
 }

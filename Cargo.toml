@@ -5,6 +5,7 @@ resolver = "2"
 
 default-members = [
     "crates/rcoder",
+    "crates/rcoder-storage",
     "crates/agent_runner",
     "crates/shared_types",
     "crates/docker_manager",
@@ -50,7 +51,7 @@ publish = false
 agent-client-protocol = { version = "2" }
 
 # MCP 协议 - rmcp 官方库
-rmcp = { version = "1.8"}
+rmcp = { version = "3.1"}
 # mcp-proxy convert fallback 参数解析与文件重写。
 mcp-proxy-args = { version = "=0.2.3" }
 
@@ -59,7 +60,7 @@ piper = "0.2"
 clap = { version = "4.6", features = ["derive", "env"] }
 
 # Async runtime
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat", "time"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
@@ -77,7 +78,7 @@ axum = { version = "0.8", features = [
 ] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace", "set-header", "fs"] }
-hyper = { version = "1.8", features = ["server", "http1", "http2"] }
+hyper = { version = "1.11", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 # gRPC。tonic 0.14 全系 TLS 特性均基于 rustls：tls-native-roots = rustls + 系统根证书(rustls-native-certs)，
 # 并非 native-tls。保留以信任私有部署的系统/私有 CA（与 reqwest 的 rustls-platform-verifier 一致）。
@@ -86,23 +87,23 @@ tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 tonic-prost-build = "0.14"
-http = "1.4"
-http-body = "1.0"
+http = "1.5"
+http-body = "1.1"
 http-body-util = "0.1"
 
 # WebSocket（终端中间层：接浏览器 + 连本地 ttyd）
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = "1.0.151"
 serde_yaml = "=0.9.33"
 serde_urlencoded = "0.7"
 schemars = { version = "1.2", features = ["derive"] }
 config = "0.15"
 
 # Validation
-garde = { version = "0.22.1", features = ["derive"] }
+garde = { version = "0.23.0", features = ["derive"] }
 
 # Error handling
 anyhow = "1.0"
@@ -128,7 +129,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 
 # UUID
-uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
+uuid = { version = "1.24", features = ["serde", "v4", "v7"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
@@ -149,7 +150,7 @@ bytes = "1.12"
 arrayvec = "0.7"
 arc-swap = "1.9"
 md5 = "0.8"
-process-wrap = { version = "9.0", features = ["tokio1", "process-group", "job-object"] }
+process-wrap = { version = "9.1", features = ["tokio1", "process-group", "job-object"] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
 url = { version = "2.5", features = ["serde"] }
@@ -165,12 +166,12 @@ lockmap = "0.2.3"
 convert_case = "0.11"
 # Persistent data structures for CoW-friendly multi-session tracking (C2/M3 fix)
 im = { version = "15.1", features = ["serde"] }
-handlebars = { version = "6.3", features = ["rust-embed"] }
-rust-embed = "8.0"
+handlebars = { version = "6.4", features = ["rust-embed"] }
+rust-embed = "8.12"
 zstd = "0.13"
 
 # Kubernetes
-kube = { version = "4.0", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
+kube = { version = "4.2", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 
 
@@ -184,7 +185,7 @@ nix = { version = "0.31.3", features = ["fs", "process", "term", "signal"] }
 # 仅在 Linux target 的 agent_runner 里引入（target-gated），Mac 开发编译不拉它。
 procfs = "0.18"
 unindent = "0.2"                                                   # 使用 crates.io 版本
-open = "5.0"                                                       # 使用 crates.io 版本
+open = "5.4"                                                       # 使用 crates.io 版本
 git2 = "0.21"
 tree-sitter-rust = "0.24"                                          # 使用 crates.io 版本
 
@@ -195,7 +196,7 @@ hex = "0.4"
 walkdir = "2.5"
 # 并行目录遍历 (work-stealing 线程池), 用于 file-server search-files。
 # 取代手写 BFS: 零 syscall d_type + 多线程并行, dua-cli (gitoxide 作者 Byron 维护) 的核心库。
-dua-core = "2.41.1"
+dua-core = "3.0.0"
 # HTTP client。reqwest 0.13 的 default-tls 本就是 rustls(aws-lc-rs + rustls-platform-verifier 读 OS 根证书)，
 # 并无 openssl/native-tls。这里 default-features=false + 显式 rustls 固化“全 workspace 用 rustls”，
 # 防止未来 reqwest 改默认后悄悄回退；charset/http2/system-proxy 补回原默认特性。
@@ -214,33 +215,33 @@ genai = "0.6.5"
 
 # 项目依赖 - 保留核心功能
 aho-corasick = "1.1"
-base64 = "0.22"
+base64 = "0.23"
 circular-buffer = "2.0"
-fancy-regex = "0.18"
+fancy-regex = "0.19"
 fuzzy = "0.0.1"
 globset = "0.4"
 image = "0.25"
 indexmap = "2.14"
 pathdiff = "0.2"
 postage = "0.5"
-regex = "1.12"
+regex = "1.13"
 semver = "1.0"
 # npm/node 版本范围语义（与 package.json 依赖版本一致；不同于 Cargo semver）
 node-semver = "2.2"
 shellexpand = "3.1"
-winnow = "1.0.3"
+winnow = "1.0.4"
 workspace-manifest = { path = "crates/workspace-manifest" }
 shlex = "2.0"
 smallvec = "1.15"
 
-toml = "1.1.2"
+toml = "1.1.4"
 which = "8.0"
 
 
 # Dev dependencies for testing
-ctor = "1.0.7"
+ctor = "1.0.13"
 pretty_assertions = "1.4"
-tempfile = "3.24"
+tempfile = "3.27"
 filetime = "0.2"
 rand = "0.10"
 tokio-test = "0.4"
@@ -254,7 +255,7 @@ flate2 = "1.1"
 tar = "0.4"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
-utoipa = { version = "5.4", features = ["axum_extras", "uuid", "chrono"] }
+utoipa = { version = "5.5", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-axum = "0.2"
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 
@@ -288,16 +289,30 @@ encoding_rs = "0.8"
 mime_guess = "2"
 
 # Git (file-server, 纯 Rust; gitoxide 0.85 源码可参考)
-gix = { version = "0.85", features = ["tree-editor"] }
+gix = { version = "0.86", features = ["tree-editor"] }
 
 # i18n (国际化)
 rust-i18n = "4"
+
+# PostgreSQL 持久化后端（rcoder-storage 的 pg feature）。
+# default-features=false + 显式 rustls：与全 workspace TLS 固化 rustls 的策略一致
+# （见 reqwest 注释）；不启用 macros（用 sqlx::query 运行时绑定，免编译期 DATABASE_URL）。
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "migrate",
+    "macros",
+    "chrono",
+    "json",
+] }
 
 # Internal crates
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }
 shared_types = { path = "crates/shared_types" }
 shared_types_grpc = { path = "crates/shared_types_grpc" }
 shared_types_i18n = { path = "crates/shared_types_i18n" }
+rcoder-storage = { path = "crates/rcoder-storage" }
 agent_config = { path = "crates/agent_config" }
 agent_abstraction = { path = "crates/agent_abstraction" }
 agent_provisioning = { path = "crates/agent_provisioning" }
@@ -310,7 +325,7 @@ file-server = { path = "crates/file-server" }
 model_probe = { path = "crates/model_probe" }
 
 # Pyroscope Continuous Profiling
-pyroscope = { version = "2.0", features = ["backend-pprof-rs"] }
+pyroscope = { version = "2.1", features = ["backend-pprof-rs"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

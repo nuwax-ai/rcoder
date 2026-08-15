@@ -46,6 +46,8 @@ fn format_relative_time(dt: DateTime<Utc>) -> String {
 
 use crate::grpc::GrpcChannelPool;
 use crate::router::AppState;
+// 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
+use shared_types::ProjectStore as _;
 use shared_types::grpc::GetContainerStatusRequest;
 
 /// 容器健康状态

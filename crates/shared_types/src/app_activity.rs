@@ -46,3 +46,33 @@ pub trait AppWakeControl: Send + Sync {
     /// - running → 立即返回 [`WakeOutcome::AlreadyRunning`]。
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome;
 }
+
+/// UserApp 活动状态的持久化行（AppActivityRegistry ↔ 存储后端的数据载体）
+#[derive(Debug, Clone)]
+pub struct ActivityRow {
+    /// UserApp 应用 ID
+    pub app_id: String,
+    /// 最近真实 HTTP 访问时间（wall-clock；None=从未访问）
+    pub last_accessed: Option<chrono::DateTime<chrono::Utc>>,
+    /// 已 scale-to-zero，可被流量唤醒
+    pub stopped: bool,
+    /// 用户主动停止/发布切换中，禁止流量自动唤醒
+    pub wake_blocked: bool,
+}
+
+/// AppActivityRegistry 的影子持久化契约（跨 crate：app_manager 产出/消费，rcoder-storage 实现）
+///
+/// registry 本体保持内存单例语义（wake single-flight/RecycleTransition 是进程内协调机制），
+/// 本契约只负责数据的跨重启持久化：flusher 周期批量落库、启动时全量加载回内存。
+/// 实现须保证幂等（upsert）。
+#[async_trait::async_trait]
+pub trait ActivityPersistence: Send + Sync {
+    /// 批量 upsert 活动状态行（flusher 每 ~5s 调用）
+    async fn flush_batch(&self, rows: Vec<ActivityRow>) -> anyhow::Result<()>;
+
+    /// 全量加载（启动时调用；空表返回空 Vec）
+    async fn load_all(&self) -> anyhow::Result<Vec<ActivityRow>>;
+
+    /// 删除单行（forget_app/delete_app 后调用）
+    async fn delete(&self, app_id: &str) -> anyhow::Result<()>;
+}

@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use super::*;
-use shared_types::ProjectExtendedFields;
+use shared_types::{ContainerBasicInfo, ProjectExtendedFields, ServiceType};
 
 /// 测试用的 K8s namespace
 const TEST_NAMESPACE: &str = "test-namespace";

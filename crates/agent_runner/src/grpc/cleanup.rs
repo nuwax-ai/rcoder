@@ -40,7 +40,7 @@ pub async fn send_session_prompt_end(
 pub async fn close_session_connection(session_id: &str) {
     // view() 在闭包返回后立即释放锁，无 Ref 暴露
     if let Some(session_data) = SESSION_CACHE.view(session_id, |_, d| d.clone()) {
-        session_data.close_current_connection();
+        session_data.close_all_connections();
     }
 }
 

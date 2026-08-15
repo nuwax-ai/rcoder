@@ -120,7 +120,7 @@ pub async fn subscribe_progress(
                 session_id_clone
             );
             match session_data.create_new_connection(100, from_seq).await {
-                Ok((replay_messages, message_rx, cancellation_token)) => {
+                Ok((conn_id, replay_messages, message_rx, cancellation_token)) => {
                     info!(
                         "[gRPC] Session connection created successfully: session_id={}, replay_count={}",
                         session_id_clone, replay_messages.len()
@@ -135,7 +135,7 @@ pub async fn subscribe_progress(
                         );
                         if tx.send(Ok(event)).await.is_err() {
                             debug!("[gRPC] Client disconnected during replay");
-                            session_data.close_current_connection();
+                            session_data.close_connection(conn_id);
                             return;
                         }
                     }
@@ -150,10 +150,10 @@ pub async fn subscribe_progress(
                     .await;
 
                     info!(
-                        "[gRPC] SubscribeProgress stream ended, cleaning up SSE sender: session_id={}, reason={}",
+                        "[gRPC] SubscribeProgress stream ended, cleaning up SSE sender: session_id={}, conn_id={conn_id}, reason={}",
                         session_id_clone, reason
                     );
-                    session_data.close_current_connection();
+                    session_data.close_connection(conn_id);
                 }
                 Err(e) => {
                     warn!("[gRPC] Failed to create session connection: {}", e);

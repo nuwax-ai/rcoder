@@ -1,16 +1,18 @@
-//! 存储层：纯 DashMap 内存存储 + RAII 自动资源回收
+//! 存储层装配（存储实现已迁至 rcoder-storage crate）
 //!
-//! 替代 DuckDB 内存模式，提供：
-//! - O(1) 热路径访问（project/session 查找）
-//! - 引用计数容器管理（共享容器安全）
-//! - RAII 清理（移除 project 时自动销毁无引用的容器）
+//! 自 M1 起 project/session/container 的存储实现（内存 + 后续 PG）整体迁至
+//! `rcoder-storage` crate，本模块只保留 rcoder 运行时侧组件：
+//! - [resource_reaper]: ResourceReaper（消费存储层 CleanupRequest，物理销毁容器
+//!   + 清理 gRPC 池/SSE 流/Pingora backend；依赖 grpc/pingora/docker_manager，属运行时编排）
+//! - 转发 re-export：调用方（router/cleanup_task/lib）路径不变，零改动兼容。
+//!
+//! 历史职责（纯 DashMap 内存存储 + RAII）见 rcoder-storage crate 文档。
 
-mod adapter;
-mod adapter_container_ops;
 mod resource_reaper;
-mod types;
 
-pub use adapter::ProjectAdapter;
-pub use resource_reaper::{CleanupRequest, ResourceReaper};
-pub use shared_types::ContainerEntry;
-pub use types::{IdleContainerInfo, StorageStats};
+pub use rcoder_storage::{
+    CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry, IdleContainerInfo, ProjectAdapter,
+    ProjectStoreBackend, StorageStats,
+};
+pub use resource_reaper::ResourceReaper;
+pub use shared_types::ProjectStore;

@@ -8,7 +8,9 @@ use super::{CleanupContext, CleanupStrategy, DestroyReason, ProjectInfo};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
+// 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
 use shared_types::ProjectAndContainerInfo;
+use shared_types::ProjectStore as _;
 use std::sync::Arc;
 use tracing::info;
 

@@ -16,6 +16,45 @@ pub enum PublishTaskStoreError {
         "app {app_id} already has an active publish/build task (task_id={task_id}); wait for it to finish or cancel it"
     )]
     AppBusy { app_id: String, task_id: String },
+    /// 持久化后端故障（M5：PG 模式 create/落库失败；不降级为纯内存，如实 500）
+    #[error("publish task persistence backend: {0}")]
+    Backend(String),
+}
+
+impl PublishTaskKind {
+    /// PG 行的 kind 字符串（与 serde lowercase 一致）
+    pub(crate) fn as_pg_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Publish => "publish",
+        }
+    }
+}
+
+impl PublishTaskStatus {
+    /// PG 行的 state 字符串（与 serde lowercase 一致）
+    pub(crate) fn as_pg_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Cancelling => "cancelling",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// PG 行 state 字符串 → 状态（未知值按 Failed 收敛，附告警由调用方处理）
+    pub(crate) fn from_pg_str(s: &str) -> Self {
+        match s {
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "cancelling" => Self::Cancelling,
+            "completed" => Self::Completed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Failed,
+        }
+    }
 }
 
 pub type PublishTaskId = String;

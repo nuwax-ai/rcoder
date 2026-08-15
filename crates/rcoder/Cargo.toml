@@ -29,6 +29,11 @@ ebpf-debug = ["docker_manager/ebpf-debug"]
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
 kubernetes = ["docker_manager/kubernetes", "shared_types/kubernetes", "app_manager/kubernetes", "file-server/kubernetes", "kube", "k8s-openapi"]
 
+# PostgreSQL 持久化存储后端（rcoder-storage/pg 转发）。
+# 运行期经 [storage].backend / RCODER_STORAGE_BACKEND=postgres 激活（env 可灰度回退 memory）；
+# 仅 k8s 编译变体启用（docker compose 路径不编译 sqlx，行为零改动）
+rcoder-pg = ["kubernetes", "rcoder-storage/pg"]
+
 [dev-dependencies]
 filetime = { workspace = true }
 
@@ -38,6 +43,7 @@ workspace = true
 [dependencies]
 # Internal crates
 shared_types = { workspace = true }
+rcoder-storage = { workspace = true }
 rcoder-proxy = { workspace = true }
 container-runtime-api = { workspace = true }
 download_utils = { workspace = true }

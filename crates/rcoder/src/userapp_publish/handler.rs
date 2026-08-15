@@ -119,11 +119,12 @@ fn conflict(msg: impl Into<String>) -> AppError {
 }
 
 /// publish/build 建任务失败映射:AppBusy(同 app 已有活跃任务)→ 409(U2 早拒绝);
-/// CapacityExceeded(全局容量)→ 保持 429。
+/// CapacityExceeded(全局容量)→ 429;Backend(PG 持久化故障)→ 500。
 fn create_task_error(error: PublishTaskStoreError) -> AppError {
     match error {
         PublishTaskStoreError::AppBusy { .. } => conflict(error.to_string()),
         PublishTaskStoreError::CapacityExceeded { .. } => too_many_requests(error.to_string()),
+        PublishTaskStoreError::Backend(message) => err(message),
     }
 }
 
@@ -236,7 +237,11 @@ pub async fn build(
     post,
     path = "/api/v1/apps/{app_id}/ensure-builder",
     params(("app_id" = String, Path)),
-    responses((status = 200, body = HttpResult<EnsureBuilderData>, description = "UserAppBuilder ensured")),
+    responses(
+        (status = 200, body = HttpResult<EnsureBuilderData>, description = "UserAppBuilder ensured"),
+        (status = 400, description = "Invalid app_id"),
+        (status = 500, description = "Internal server error")
+    ),
     tag = "UserApp 发布"
 )]
 pub async fn ensure_builder(
@@ -309,12 +314,12 @@ pub async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
 ) -> Result<Json<HttpResult<GetTaskData>>, AppError> {
-    let task = state
+    // M5：内存未命中回查 PG 快照（跨重启/跨副本状态可查；活任务走内存含事件游标）
+    let snapshot = state
         .publish_tasks
-        .get(&task_id)
+        .lookup_snapshot(&task_id)
         .await
         .ok_or_else(|| not_found(format!("publish task not found: {task_id}")))?;
-    let snapshot = task.snapshot().await;
     Ok(Json(HttpResult::success(GetTaskData { task: snapshot })))
 }
 
@@ -323,7 +328,11 @@ pub async fn get_task(
     get,
     path = "/api/v1/apps/publish/tasks/{task_id}/stream",
     params(("task_id" = String, Path), StreamQuery),
-    responses((status = 200, description = "Publish progress SSE", content_type = "text/event-stream")),
+    responses(
+        (status = 200, description = "Publish progress SSE", content_type = "text/event-stream"),
+        (status = 404, description = "Publish task not found"),
+        (status = 500, description = "Internal server error")
+    ),
     tag = "UserApp 发布"
 )]
 pub async fn stream_task(

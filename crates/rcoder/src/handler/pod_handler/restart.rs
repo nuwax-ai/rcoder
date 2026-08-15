@@ -1,5 +1,6 @@
 use super::helpers::*;
 use super::*;
+use shared_types::ProjectStore as _; // 存储契约 trait：state.projects（ProjectStoreBackend）方法经此解析
 
 /// 重启容器（销毁后重建）
 ///

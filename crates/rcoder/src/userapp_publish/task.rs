@@ -46,6 +46,20 @@ pub struct RemoteBuildTask {
     pub task_id: String,
 }
 
+/// 终态落库回调数据（store 注入 PG repo 的钩子载荷）
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalPersist {
+    pub status: PublishTaskStatus,
+    pub error: Option<String>,
+    pub release_id: Option<String>,
+    pub terminal_at: i64,
+}
+
+/// 终态钩子（fire-and-forget；闭包内部自行 spawn 异步落库）
+pub(crate) type OnTerminalFn = Arc<dyn Fn(TerminalPersist) + Send + Sync>;
+/// 阶段变更钩子（Stage 事件触发，频率低无需节流）
+pub(crate) type OnStageFn = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// 单个异步任务:状态 + 进度事件流 + cancel。
 ///
 /// 并发模型:所有可变状态在【一把】`state` 锁后;`emit`/`request_cancel`/`subscribe` 各取一次锁、
@@ -63,14 +77,37 @@ pub struct PublishTask {
     terminal_at: AtomicI64,
     created_at: i64,
     remote_build: Mutex<Option<RemoteBuildTask>>,
+    /// 终态 PG 落库钩子（M5；内存模式 None）
+    on_terminal: Option<OnTerminalFn>,
+    /// 阶段变更 PG 落库钩子（M5；内存模式 None）
+    on_stage: Option<OnStageFn>,
 }
 
 impl PublishTask {
     pub(super) fn new(app_id: String, project_id: String, kind: PublishTaskKind) -> Arc<Self> {
+        Self::with_hooks(
+            uuid::Uuid::now_v7().simple().to_string(),
+            app_id,
+            project_id,
+            kind,
+            None,
+            None,
+        )
+    }
+
+    /// 带持久化钩子构造（store 的 PG 模式注入；显式 id 保证与先落库的行一致）
+    pub(super) fn with_hooks(
+        id: PublishTaskId,
+        app_id: String,
+        project_id: String,
+        kind: PublishTaskKind,
+        on_terminal: Option<OnTerminalFn>,
+        on_stage: Option<OnStageFn>,
+    ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAP);
         let now = Utc::now().timestamp();
         Arc::new(Self {
-            id: uuid::Uuid::now_v7().simple().to_string(),
+            id,
             app_id,
             state: Mutex::new(TaskState {
                 project_id,
@@ -89,6 +126,8 @@ impl PublishTask {
             terminal_at: AtomicI64::new(0),
             created_at: now,
             remote_build: Mutex::new(None),
+            on_terminal,
+            on_stage,
         })
     }
 
@@ -121,21 +160,58 @@ impl PublishTask {
 
     /// 发进度事件:取一次 state 锁 → `publish_mut` → broadcast → 释放。终态后丢弃后续事件。
     pub async fn emit(&self, event: PublishEvent) {
-        let terminal = {
+        let (terminal_payload, stage_payload) = {
             let mut s = self.state.lock().await;
             let Some((seq, event, terminal)) = publish_mut(&mut s, event) else {
                 return;
             };
+            // 钩子载荷在事件被 tx.send 消费前提取（Stage/终态 payload 克隆）
+            let stage_payload = if let PublishEvent::Stage { stage } = &event {
+                Some(stage.clone())
+            } else {
+                None
+            };
+            let terminal_payload = terminal.then(|| match &event {
+                PublishEvent::Completed { release_id } => Some(TerminalPersist {
+                    status: PublishTaskStatus::Completed,
+                    error: None,
+                    release_id: Some(release_id.clone()),
+                    terminal_at: 0,
+                }),
+                PublishEvent::Failed { error } => Some(TerminalPersist {
+                    status: PublishTaskStatus::Failed,
+                    error: Some(error.clone()),
+                    release_id: None,
+                    terminal_at: 0,
+                }),
+                PublishEvent::Cancelled => Some(TerminalPersist {
+                    status: PublishTaskStatus::Cancelled,
+                    error: None,
+                    release_id: None,
+                    terminal_at: 0,
+                }),
+                _ => None,
+            });
             // broadcast 必须在持 state 锁内:与 subscribe 的"创建 receiver + 读 replay"互斥串行,
             // 否则同一事件可能既进 replay 又被 receiver 收到 → 重复(broadcast::send 非阻塞,持锁安全)。
             if let Err(send_err) = self.tx.send((seq, event)) {
                 tracing::warn!("build progress event send failed (consumer gone): {send_err}");
             }
-            terminal
+            (terminal_payload.flatten(), stage_payload)
         };
-        if terminal {
-            self.terminal_at
-                .store(Utc::now().timestamp(), Ordering::Release);
+        // 钩子在锁外触发（闭包内部自行 spawn 异步落库，不阻塞 emit 热路径）
+        if let Some(mut payload) = terminal_payload {
+            let at = Utc::now().timestamp();
+            self.terminal_at.store(at, Ordering::Release);
+            payload.terminal_at = at;
+            if let Some(hook) = &self.on_terminal {
+                hook(payload);
+            }
+        }
+        if let Some(stage) = stage_payload
+            && let Some(hook) = &self.on_stage
+        {
+            hook(&stage);
         }
     }
 

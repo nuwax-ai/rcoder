@@ -2,6 +2,8 @@
 
 use axum::{Json, extract::State, http::HeaderMap};
 use docker_manager::ContainerBasicInfo;
+// 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
+use shared_types::ProjectStore as _;
 use shared_types::{
     AppError, HttpResult, ResolvePermissionHttpRequest, ResolvePermissionRequestDto,
     ResolvePermissionResponseDto,

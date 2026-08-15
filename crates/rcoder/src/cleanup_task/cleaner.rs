@@ -5,6 +5,8 @@
 use anyhow::Result;
 use chrono::Utc;
 use dashmap::DashSet;
+// 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
+use shared_types::ProjectStore as _;
 use shared_types::ServiceType;
 use std::sync::Arc;
 use tokio::time::interval;

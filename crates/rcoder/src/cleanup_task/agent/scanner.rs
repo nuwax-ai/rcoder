@@ -5,6 +5,7 @@
 use crate::AgentStatus;
 use anyhow::Result;
 use chrono::Utc;
+use shared_types::ProjectStore as _; // 存储契约 trait：state.projects（ProjectStoreBackend）方法经此解析
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 

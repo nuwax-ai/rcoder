@@ -6,6 +6,8 @@
 
 use anyhow::{Context, Result, anyhow};
 
+// 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
+use shared_types::ProjectStore as _;
 use shared_types::{AGENT_FILE_SERVER_PORT, BuildProgressEvent, build_backend_addr};
 
 use crate::router::AppState;

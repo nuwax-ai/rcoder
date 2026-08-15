@@ -44,7 +44,8 @@ pub async fn create_app(
     path = "/api/v1/apps/query",
     request_body = QueryAppsRequest,
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<AppRuntimeInfo>>)
+        (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<AppRuntimeInfo>>),
+        (status = 500, description = "集群查询失败", body = HttpResult<String>)
     ),
     tag = "应用管理"
 )]
@@ -65,7 +66,8 @@ pub async fn query_apps(
     get,
     path = "/api/v1/apps/runtime",
     responses(
-        (status = 200, description = "对账成功", body = HttpResult<Vec<AppRuntimeInfo>>)
+        (status = 200, description = "对账成功", body = HttpResult<Vec<AppRuntimeInfo>>),
+        (status = 500, description = "集群查询失败", body = HttpResult<String>)
     ),
     tag = "应用管理"
 )]

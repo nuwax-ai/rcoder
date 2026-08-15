@@ -7,7 +7,7 @@ pub use build_event::BuildProgressEvent;
 
 // 清理请求模块
 pub mod cleanup_request;
-pub use cleanup_request::CleanupRequest;
+pub use cleanup_request::{CLEANUP_CHANNEL_CAPACITY, CleanupRequest};
 
 // 存储类型模块
 pub mod storage_types;
@@ -17,9 +17,15 @@ pub use storage_types::{IdleContainerInfo, StorageStats};
 pub mod container_lookup;
 pub use container_lookup::{ContainerLookup, ProjectScope};
 
+// project/session/container 映射存储契约（内存与 PG 双后端统一接口）
+pub mod project_store;
+pub use project_store::ProjectStore;
+
 // UserApp 活动追踪 + 流量唤醒接口模块（闲置自动回收 / wake-on-traffic）
 pub mod app_activity;
-pub use app_activity::{AppAccessTracker, AppWakeControl, WakeOutcome};
+pub use app_activity::{
+    ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, WakeOutcome,
+};
 
 // 容器条目模块（refcount + 活跃时间跟踪）
 pub mod container_entry;

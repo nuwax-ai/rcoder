@@ -247,7 +247,7 @@ pub async fn handle_computer_progress(
         session_id
     );
     // 2. 创建新的消息订阅（DashMap 锁已释放，此处 await 安全）
-    let (replay_messages, message_rx, _cancel_token) =
+    let (_conn_id, replay_messages, message_rx, _cancel_token) =
         match session_data.create_new_connection(1000, 0).await {
             Ok(conn) => conn,
             Err(e) => {

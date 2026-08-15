@@ -7,11 +7,10 @@
 use crate::service::PERMISSION_MANAGER;
 use crate::{SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
-use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -109,13 +108,25 @@ struct ConnectionState {
     cancel: CancellationToken,
 }
 
-/// 当前活跃 SSE 连接的不可变快照。消息热路径 lock-free 读取，重连/关闭原子替换整组状态。
-type CurrentConnection = Arc<ArcSwapOption<ConnectionState>>;
+/// 并发订阅者注册表（P2-M2 多订阅者改造）。
+///
+/// 历史实现是单槽 `ArcSwapOption`：新订阅者 swap 替换并 cancel 旧流
+/// （last-writer-wins）——单副本 rcoder 只有一条共享流时正确；多副本/多端同看
+/// 同一 session 时互相踢成死循环。改为 `conn_id → ConnectionState` 注册表：
+/// 新订阅不再取消既有流，各自持独立 channel/token，Push 遍历投递；
+/// 超过 [`MAX_SUBSCRIBERS`] 逐最旧（conn_id 单调，最小 id 即最旧）。
+///
+/// conn_id 由 SessionData 侧 AtomicU64 分配（session 内唯一）。
+type ConnectionRegistry = Arc<DashMap<u64, ConnectionState>>;
+
+/// 并发订阅者上限（多端同看场景的实际边界；超限逐最旧防滥用）
+const MAX_SUBSCRIBERS: usize = 8;
 
 pub struct SessionData {
     command_tx: mpsc::Sender<SessionCommand>,
-    // 🎯 极简优化：直接存储当前连接，无需命令传递
-    current_connection: CurrentConnection,
+    // 🎯 多订阅者注册表（见 ConnectionRegistry 文档）+ 单调 conn_id 分配器
+    connections: ConnectionRegistry,
+    next_conn_id: Arc<AtomicU64>,
     // 🔒 Critical fix: 存储 worker JoinHandle，用于检测 panic
     worker_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// session 的 stream epoch(每次 new 生成新值)。rcoder 据此判断 seq epoch 是否变化:
@@ -149,7 +160,8 @@ impl SessionData {
         let arc_start = std::time::Instant::now();
         let session = Arc::new(SessionData {
             command_tx,
-            current_connection: Arc::new(ArcSwapOption::empty()),
+            connections: Arc::new(DashMap::new()),
+            next_conn_id: Arc::new(AtomicU64::new(1)),
             worker_handle: Arc::new(tokio::sync::Mutex::new(None)),
             epoch: uuid::Uuid::now_v7().simple().to_string(),
             poisoned: AtomicBool::new(false),
@@ -160,11 +172,7 @@ impl SessionData {
         );
 
         let spawn_start = std::time::Instant::now();
-        let handle = SessionWorker::spawn(
-            max_size,
-            command_rx,
-            Arc::clone(&session.current_connection),
-        );
+        let handle = SessionWorker::spawn(max_size, command_rx, Arc::clone(&session.connections));
 
         // 🔒 Critical fix: 使用 async lock 替代 blocking_lock，避免阻塞 executor
         {
@@ -288,11 +296,15 @@ impl SessionData {
         }
     }
 
+    /// 建立新订阅连接。返回 `(conn_id, 回放消息, receiver, cancel_token)`；
+    /// conn_id 用于流结束时 [`SessionData::close_connection`] 精确关闭自己
+    /// （不误伤其他订阅者）。
     pub async fn create_new_connection(
         &self,
         buffer_size: usize,
         from_seq: u64,
     ) -> Result<(
+        u64,
         Vec<(u64, UnifiedSessionMessage)>,
         mpsc::Receiver<(u64, UnifiedSessionMessage)>,
         CancellationToken,
@@ -318,15 +330,38 @@ impl SessionData {
         );
 
         let setup_start = std::time::Instant::now();
-        let previous = self.current_connection.swap(Some(Arc::new(ConnectionState {
-            sender: tx,
-            cancel: cancellation_token.clone(),
-        })));
-        if let Some(previous) = previous {
-            previous.cancel.cancel();
+        // 注册新订阅（不取消既有流——多端同看的根本修复）；
+        // 超上限逐最旧（conn_id 单调，最小 id 即最早建立的连接）
+        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        self.connections.insert(
+            conn_id,
+            ConnectionState {
+                sender: tx,
+                cancel: cancellation_token.clone(),
+            },
+        );
+        while self.connections.len() > MAX_SUBSCRIBERS {
+            let Some(oldest) = self
+                .connections
+                .iter()
+                .min_by_key(|e| *e.key())
+                .map(|e| *e.key())
+            else {
+                break;
+            };
+            if oldest == conn_id {
+                break; // 并发下只剩自己，不逐
+            }
+            if let Some((_, evicted)) = self.connections.remove(&oldest) {
+                evicted.cancel.cancel();
+                warn!(
+                    "[create_new_connection] subscriber limit {MAX_SUBSCRIBERS} reached, evicted oldest conn {oldest}"
+                );
+            }
         }
         debug!(
-            "[create_new_connection] Connection state setup took: {:?}",
+            "[create_new_connection] subscriber {conn_id} registered (total {}), setup took {:?}",
+            self.connections.len(),
             setup_start.elapsed()
         );
 
@@ -353,7 +388,7 @@ impl SessionData {
             "[create_new_connection] Total connection creation took: {:?}",
             start_time.elapsed()
         );
-        Ok((replay_messages, rx, cancellation_token))
+        Ok((conn_id, replay_messages, rx, cancellation_token))
     }
 
     /// 检查 worker 是否已完成 (non-blocking)
@@ -394,24 +429,31 @@ impl SessionData {
         }
     }
 
-    /// 主动关闭当前 SSE 连接
-    ///
-    /// 当用户取消任务时，需要主动关闭 SSE 连接，而不是让客户端一直等待
-    ///
-    /// 关闭机制：
-    /// 1. 触发 CancellationToken，让 SSE 流立即退出循环
-    /// 2. 显式关闭 channel 发送端，让 rx.recv() 立即返回 None
-    /// 3. 清空连接状态，防止新的消息被发送
-    pub fn close_current_connection(&self) {
-        // 🎯 主动触发取消令牌，关闭 SSE 连接
-        if let Some(connection) = self.current_connection.swap(None) {
-            info!("[SessionData] Triggering CancellationToken to close SSE connection");
-            connection.cancel.cancel();
+    /// 当前订阅者数（测试/诊断用）
+    pub fn connections_len(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// 关闭指定订阅连接（流结束/断开时调用；只关自己，不误伤其他订阅者）
+    pub fn close_connection(&self, conn_id: u64) {
+        if let Some((_, connection)) = self.connections.remove(&conn_id) {
             info!(
-                "[SessionData] Explicitly closed channel sender; receiver disconnects immediately"
+                "[SessionData] Closing subscriber {conn_id}: CancellationToken triggered, sender dropped"
             );
-            // 当 Sender 被 drop 时，Receiver 的 recv() 会返回 None
-            // 这里通过 take() 将 sender 从 Option 中移除，触发 drop
+            connection.cancel.cancel();
+        }
+    }
+
+    /// 关闭全部订阅连接（任务取消 / 会话停止 / 新 prompt 前清场等
+    /// "终结所有观看端"语义的场景）
+    pub fn close_all_connections(&self) {
+        let count = self.connections.len();
+        for entry in self.connections.iter() {
+            entry.value().cancel.cancel();
+        }
+        self.connections.clear();
+        if count > 0 {
+            info!("[SessionData] Closed all {count} SSE subscriber connection(s)");
         }
     }
 }
@@ -419,15 +461,15 @@ impl SessionData {
 struct SessionWorker {
     max_size: usize,
     command_rx: mpsc::Receiver<SessionCommand>,
-    // 🎯 极简优化：直接共享连接状态，无需命令传递
-    current_connection: CurrentConnection,
+    // 🎯 多订阅者注册表（与 SessionData 共享）
+    connections: ConnectionRegistry,
 }
 
 impl SessionWorker {
     fn spawn(
         max_size: usize,
         command_rx: mpsc::Receiver<SessionCommand>,
-        current_connection: CurrentConnection,
+        connections: ConnectionRegistry,
     ) -> tokio::task::JoinHandle<()> {
         let start_time = std::time::Instant::now();
         debug!(
@@ -438,7 +480,7 @@ impl SessionWorker {
         let worker = SessionWorker {
             max_size,
             command_rx,
-            current_connection,
+            connections,
         };
 
         let spawn_start = std::time::Instant::now();
@@ -500,36 +542,41 @@ impl SessionWorker {
                         }
                     }
 
-                    let current_connection = self.current_connection.load();
-                    if let Some(connection) = current_connection.as_ref() {
+                    // 遍历全部订阅者投递；Closed 的连接在迭代结束后按 id 精确移除
+                    // （不在迭代中 remove——DashMap 迭代持 shard 锁，同 shard remove 会死锁）
+                    let mut closed_conns: Vec<u64> = Vec::new();
+                    for entry in self.connections.iter() {
                         use tokio::sync::mpsc::error::TrySendError;
-                        if let Err(send_err) = connection.sender.try_send((seq, message.clone())) {
+                        if let Err(send_err) = entry.value().sender.try_send((seq, message.clone()))
+                        {
                             match send_err {
                                 TrySendError::Full(_) => {
-                                    // buffer 满（客户端暂时慢）：不禁用 sender，等客户端消费后恢复
-                                    // 消息已在 ring buffer 中备份，不会真正丢失
+                                    // buffer 满（客户端暂时慢）：不禁用 sender；ring buffer 已备份
                                     warn!(
                                         "SSE sender buffer full, message buffered: message_type={:?}, sub_type={}",
                                         message.message_type, message.sub_type,
                                     );
                                 }
                                 TrySendError::Closed(_) => {
-                                    // receiver 已断开：禁用 sender，避免后续每条消息都 try_send 失败
-                                    // SubscribeProgress 会在 recv() 返回 None 时检测到并清理
+                                    // receiver 已断开：记录 id，迭代后移除（防重复失败刷日志）
+                                    closed_conns.push(*entry.key());
                                     warn!(
-                                        "SSE sender receiver dropped, disabling sender: message_type={:?}, sub_type={}",
-                                        message.message_type, message.sub_type,
-                                    );
-                                    // 仅当它仍是当前连接时清除，避免旧 receiver 关闭误删刚建立的新连接。
-                                    drop(
-                                        self.current_connection
-                                            .compare_and_swap(&*current_connection, None),
+                                        "SSE subscriber {} receiver dropped, will remove: message_type={:?}, sub_type={}",
+                                        entry.key(),
+                                        message.message_type,
+                                        message.sub_type,
                                     );
                                 }
                             }
                         }
-                    } else {
-                        // 连接不存在，跳过实时推送（记录为 info 级别，便于排查问题）
+                    }
+                    for id in closed_conns {
+                        if let Some((_, conn)) = self.connections.remove(&id) {
+                            conn.cancel.cancel();
+                        }
+                    }
+                    if self.connections.is_empty() {
+                        // 无订阅者，跳过实时推送（消息已在 ring buffer 备份）
                         info!(
                             "SSE sender missing, skipping real-time delivery (message buffered in ring buffer): message_type={:?}, sub_type={}, data={}",
                             message.message_type,
@@ -731,7 +778,7 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
             let cleared_count = if let Some((_, old_session_data)) =
                 SESSION_CACHE.remove(&old_session_id)
             {
-                old_session_data.close_current_connection();
+                old_session_data.close_all_connections();
                 info!(
                     "[ensure_project_session] Closed old session SSE connection: old_session_id={}",
                     old_session_id
@@ -899,31 +946,83 @@ mod tests {
         );
     }
 
+    /// P2-M2：多订阅者并存——新订阅不再 cancel 旧流（多端同看/多副本共享流的根修）；
+    /// close_connection 只关指定订阅者；close_all_connections 关全部。
     #[tokio::test]
-    async fn connection_swap_cancels_previous_and_close_drops_sender() {
+    async fn multi_subscriber_coexistence_and_selective_close() {
         let session = SessionData::new(8).await;
-        let (_, mut first_rx, first_cancel) = session
+        let (first_id, _first_replay, mut first_rx, first_cancel) = session
             .create_new_connection(8, 0)
             .await
             .expect("first connection");
-        let (_, mut second_rx, second_cancel) = session
+        let (_second_id, _second_replay, mut second_rx, second_cancel) = session
             .create_new_connection(8, 0)
             .await
             .expect("second connection");
 
-        assert!(first_cancel.is_cancelled());
-        assert!(!second_cancel.is_cancelled());
+        // 旧语义：新订阅 cancel 旧流。新语义：两者并存
         assert!(
-            first_rx.recv().await.is_none(),
-            "old sender must be dropped"
+            !first_cancel.is_cancelled(),
+            "new subscriber must NOT cancel existing stream"
+        );
+        assert!(!second_cancel.is_cancelled());
+
+        // 两个订阅者都收到实时消息
+        session.push_message(make_msg("m1"));
+        assert_eq!(
+            first_rx.recv().await.expect("first receives").1.sub_type,
+            "m1"
+        );
+        assert_eq!(
+            second_rx.recv().await.expect("second receives").1.sub_type,
+            "m1"
         );
 
-        session.close_current_connection();
-        assert!(second_cancel.is_cancelled());
+        // 关闭第一个：只影响自己
+        session.close_connection(first_id);
+        assert!(first_cancel.is_cancelled());
         assert!(
-            second_rx.recv().await.is_none(),
-            "closing must atomically drop current sender"
+            first_rx.recv().await.is_none(),
+            "closed subscriber sender must be dropped"
         );
+        assert!(!second_cancel.is_cancelled(), "peer subscriber unaffected");
+        session.push_message(make_msg("m2"));
+        assert_eq!(
+            second_rx
+                .recv()
+                .await
+                .expect("second still live")
+                .1
+                .sub_type,
+            "m2"
+        );
+
+        // close_all：清场语义（任务取消/会话停止）
+        session.close_all_connections();
+        assert!(second_cancel.is_cancelled());
+        assert!(second_rx.recv().await.is_none());
+    }
+
+    /// P2-M2：订阅者上限——超过 MAX_SUBSCRIBERS 逐最旧
+    #[tokio::test]
+    async fn subscriber_limit_evicts_oldest() {
+        let session = SessionData::new(8).await;
+        let mut first_cancel = None;
+        for i in 0..=(MAX_SUBSCRIBERS as u64) {
+            let (_id, _replay, _rx, cancel) = session
+                .create_new_connection(8, 0)
+                .await
+                .expect("connection {i}");
+            if i == 0 {
+                first_cancel = Some(cancel);
+            }
+        }
+        assert!(
+            first_cancel.expect("saved").is_cancelled(),
+            "oldest subscriber evicted at limit"
+        );
+        // 数量封顶
+        assert_eq!(session.connections_len(), MAX_SUBSCRIBERS);
     }
 
     fn make_agent_info(project_id: &str, session_id: &str) -> shared_types::ProjectAndAgentInfo {

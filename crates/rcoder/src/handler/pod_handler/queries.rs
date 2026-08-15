@@ -1,6 +1,7 @@
 use super::helpers::*;
 use super::*;
 use crate::handler::utils::is_known_identifier;
+use shared_types::ProjectStore as _; // 存储契约 trait：state.projects（ProjectStoreBackend）方法经此解析
 
 /// 获取当前容器数量
 ///

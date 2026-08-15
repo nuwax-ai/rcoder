@@ -7,6 +7,9 @@
 use axum::{extract::State, http::HeaderMap};
 use serde::Serialize;
 use std::sync::Arc;
+
+// 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
+use shared_types::ProjectStore as _;
 use tracing::info;
 use utoipa::ToSchema;
 

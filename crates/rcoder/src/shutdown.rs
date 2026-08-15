@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use container_runtime_api::ContainerRuntime;
 use docker_manager::container_stop;
 use docker_manager::runtime_selection::RuntimeType;
+use rcoder_storage::ProjectStoreBackend;
 use tracing::{error, info, warn};
 
 pub fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
@@ -71,10 +72,31 @@ pub async fn graceful_shutdown(
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     config: crate::config::AppConfig,
     runtime: Arc<dyn ContainerRuntime>,
+    projects: Option<Arc<ProjectStoreBackend>>,
 ) {
     let _ = shutdown_rx.recv().await;
 
     info!("starting graceful shutdown...");
+
+    // PG 模式：用户容器跨重启存活（多副本目标形态），跳过全量清删；
+    // 先 flush write-behind 队列（有界 5s），保证结构性 op 落盘后退出
+    if config.storage.backend == crate::config::StorageBackend::Postgres {
+        info!(
+            "[STORAGE_PG] container cleanup skipped (postgres mode: agent containers survive restarts)"
+        );
+        if let Some(backend) = &projects {
+            if !backend
+                .shutdown_flush(std::time::Duration::from_secs(5))
+                .await
+            {
+                error!("[STORAGE_PG] shutdown flush incomplete: some ops may be lost");
+            } else {
+                info!("[STORAGE_PG] shutdown flush completed");
+            }
+        }
+        info!(" RCoder graceful shutdown completed");
+        return;
+    }
 
     if let Err(e) = cleanup_all_containers(&config, &runtime).await {
         error!("container cleanup failed: {}", e);

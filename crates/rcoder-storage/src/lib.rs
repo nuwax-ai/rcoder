@@ -1,0 +1,38 @@
+//! rcoder 存储层 crate：project/session/container 映射的内存实现 + 可选 PG 持久化后端
+//!
+//! 自 rcoder/src/storage 迁出（M1）。提供：
+//! - O(1) 热路径访问（DashMap 分片内存镜像）
+//! - 引用计数容器管理（共享容器安全）
+//! - RAII 清理请求（CleanupRequest 经 mpsc 交给 rcoder 侧 ResourceReaper）
+//! - `pg` feature：PostgreSQL write-behind 持久化 + 启动全量加载（Phase 1 M3）
+//!
+//! 数据契约（CleanupRequest / StorageStats / IdleContainerInfo / ProjectStore）统一定义在
+//! shared_types（跨 crate 契约单一事实源），本 crate 仅转发导出。
+//!
+//! 模块组织：
+//! - adapter: ProjectAdapter 内存实现（project/session CRUD + ContainerLookup）
+//! - adapter_container_ops: 容器条目 CRUD/反查/引用计数（extension-impl 拆分）
+//! - backend: ProjectStoreBackend 枚举（静态分发）
+//! - config: PostgresConfig（rcoder config.yml `[storage.postgres]` 数据模型）
+//! - persist_ops: write-behind 队列的 op 模型
+//! - pg（cfg feature="pg"）: PgStore + writer + 启动加载
+
+mod adapter;
+mod adapter_container_ops;
+mod adapter_lookup;
+mod adapter_session_ops;
+mod adapter_store_impl;
+mod backend;
+pub mod config;
+#[cfg(feature = "pg")]
+mod persist_ops;
+pub mod publish_repo;
+
+#[cfg(feature = "pg")]
+pub mod pg;
+
+pub use adapter::ProjectAdapter;
+pub use backend::ProjectStoreBackend;
+pub use shared_types::{
+    CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry, IdleContainerInfo, StorageStats,
+};
