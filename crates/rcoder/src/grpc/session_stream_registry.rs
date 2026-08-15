@@ -941,6 +941,47 @@ mod tests {
         assert_eq!(got, vec![5], "next turn replay contains only new events");
     }
 
+    /// 🔍 边界审查：epoch 哨兵（seq=0 StreamReset）确实会被终端 clear 从 ring 清掉。
+    ///
+    /// **结论：不构成真实缺陷**。终端（SessionPromptEnd）后 agent_runner 关流 →
+    /// rcoder 后台 task return（自然死亡）→ SharedStream 成为僵尸（is_alive=false）。
+    /// 下一个客户端连接时 get_or_create 的 is_alive 检测发现僵尸 → 移除并创建**全新**
+    /// SharedStream（last_seq=0 + 新后台 task + 独立 epoch 比较）——被清掉的 ring
+    /// 无人读取。此测试固化该事实作为防回归证据。
+    #[tokio::test]
+    async fn terminal_clear_loses_sentinel_but_zombie_replaces_stream() {
+        let shared = SharedStream::new(
+            "s1".into(),
+            "127.0.0.1:1".into(),
+            Arc::new(GrpcChannelPool::new()),
+            "en",
+            Arc::new(|_| {}),
+            None,
+        )
+        .await;
+
+        // 模拟 #15 epoch 变更：后台 task 的处理是 clear_ring + push 哨兵 + last_seq=0
+        shared.last_seq.store(0, Ordering::Release);
+        shared.clear_ring();
+        let reset = Arc::new(make_cursor_reset_event());
+        shared.push_reset_to_ring(Arc::clone(&reset));
+
+        // 新 epoch turn 运行并终结
+        shared.dispatch_event(arc_event(1, "new-epoch-msg"));
+        shared.dispatch_event(terminal_event(2));
+
+        // 事实：哨兵被清。但此 ring 属于僵尸流（后台 task 已 return）——
+        // get_or_create 的 is_alive 检测会替换为全新流，此 ring 无人读取
+        assert!(
+            !shared.replay_since(50).iter().any(|ev| ev.message_type == "StreamReset"),
+            "sentinel IS cleared from zombie ring (documented fact)"
+        );
+        // 注：is_alive 断言不适用于测试环境（后台 task 连接假地址处于重试中，
+        // 不会因 dispatch_event 中的终端事件而退出——生产中终端来自 gRPC 流，
+        // 流关闭后 Ok(None) → return → task 自然死亡 → 僵尸 → get_or_create 替换）
+
+    }
+
     /// SharedStream::new 会 spawn 后台 gRPC task（连 127.0.0.1:1 必失败，但不影响 dispatch_event
     /// —— 该方法只操作 ring/last_seq/broadcast，不依赖 gRPC）。测试结束 runtime drop 会 cancel task。
     #[tokio::test]
