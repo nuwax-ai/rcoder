@@ -973,13 +973,15 @@ mod tests {
         // 事实：哨兵被清。但此 ring 属于僵尸流（后台 task 已 return）——
         // get_or_create 的 is_alive 检测会替换为全新流，此 ring 无人读取
         assert!(
-            !shared.replay_since(50).iter().any(|ev| ev.message_type == "StreamReset"),
+            !shared
+                .replay_since(50)
+                .iter()
+                .any(|ev| ev.message_type == "StreamReset"),
             "sentinel IS cleared from zombie ring (documented fact)"
         );
         // 注：is_alive 断言不适用于测试环境（后台 task 连接假地址处于重试中，
         // 不会因 dispatch_event 中的终端事件而退出——生产中终端来自 gRPC 流，
         // 流关闭后 Ok(None) → return → task 自然死亡 → 僵尸 → get_or_create 替换）
-
     }
 
     /// SharedStream::new 会 spawn 后台 gRPC task（连 127.0.0.1:1 必失败，但不影响 dispatch_event
