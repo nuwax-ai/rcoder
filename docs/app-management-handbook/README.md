@@ -113,11 +113,11 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate→confirm 链路
            POST   /api/v1/apps/{app_id}/db/create-database    新建 PG 库
 
 版本发布   POST   /api/v1/apps/{app_id}/releases/prepare               预备发布
-           POST   /api/v1/apps/{app_id}/releases/{rid}/activate        激活（切流）
-           POST   /api/v1/apps/{app_id}/releases/{rid}/confirm         确认健康结果
-           POST   /api/v1/apps/{app_id}/releases/{rid}/abort           中止 pending
+           POST   /api/v1/apps/{app_id}/releases/{release_id}/activate        激活（切流）
+           POST   /api/v1/apps/{app_id}/releases/{release_id}/confirm         确认健康结果
+           POST   /api/v1/apps/{app_id}/releases/{release_id}/abort           中止 pending
            GET    /api/v1/apps/{app_id}/releases                        列出版本
-           POST   /api/v1/apps/{app_id}/releases/{rid}/delete          删除记录
+           POST   /api/v1/apps/{app_id}/releases/{release_id}/delete          删除记录
 
 构建发布   POST   /api/v1/apps/{app_id}/ensure-builder               确保 Builder 容器
            POST   /api/v1/apps/{app_id}/build                        触发源码构建
