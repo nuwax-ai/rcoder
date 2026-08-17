@@ -19,11 +19,12 @@ use crate::adapter::ProjectAdapter;
 
 /// 存储后端（AppState.projects 的具体类型，经 `Arc<ProjectStoreBackend>` 共享）
 pub enum ProjectStoreBackend {
-    /// DashMap 纯内存实现
-    Memory(ProjectAdapter),
-    /// PG 持久化实现（内存镜像 + write-behind writer + 启动全量加载）
+    /// DashMap 纯内存实现（Arc 与 Postgres 变体对称：枚举恒为单指针大小）
+    Memory(Arc<ProjectAdapter>),
+    /// PG 持久化实现（内存镜像 + write-behind writer + 启动全量加载）。
+    /// Arc 包装：sync/leader/shadow 等后台任务需要独立句柄（pg 子树不反依赖本门面）
     #[cfg(feature = "pg")]
-    Postgres(crate::pg::PgStore),
+    Postgres(Arc<crate::pg::PgStore>),
 }
 
 impl ProjectStoreBackend {
@@ -37,9 +38,10 @@ impl ProjectStoreBackend {
         }
     }
 
-    /// PG 后端引用（P2：sync/leader 等后端特有任务的装配入口；Memory 为 None）
+    /// PG 后端引用（P2：sync/leader 等后端特有任务的装配入口；Memory 为 None）。
+    /// 返回 &Arc：调用方可 clone 独立句柄传给后台任务
     #[cfg(feature = "pg")]
-    pub fn postgres(&self) -> Option<&crate::pg::PgStore> {
+    pub fn postgres(&self) -> Option<&Arc<crate::pg::PgStore>> {
         match self {
             Self::Memory(_) => None,
             Self::Postgres(store) => Some(store),
@@ -315,7 +317,7 @@ mod tests {
     #[test]
     fn memory_backend_dispatches_through_trait() {
         let (adapter, _rx) = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
-        let backend = ProjectStoreBackend::Memory(adapter);
+        let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
 
         let mut info = ProjectAndContainerInfo::new("proj-1".into());
         info.set_service_type(Some(ServiceType::WebAgentRunner));
@@ -349,7 +351,7 @@ mod tests {
     #[test]
     fn memory_backend_implements_container_lookup() {
         let (adapter, _rx) = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
-        let backend = ProjectStoreBackend::Memory(adapter);
+        let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
 
         let mut info = ProjectAndContainerInfo::new("proj-2".into());
         info.set_service_type(Some(ServiceType::WebAgentRunner));
@@ -377,7 +379,7 @@ mod tests {
     #[test]
     fn memory_mirror_accessor() {
         let (adapter, _rx) = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
-        let backend = ProjectStoreBackend::Memory(adapter);
+        let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
         assert_eq!(backend.memory_mirror().get_stats().total_projects, 0);
     }
 }

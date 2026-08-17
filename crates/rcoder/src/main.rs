@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
                 bootstrap_result.config.app_manager.namespace.clone(),
                 cluster_domain.clone(),
             );
-            (ProjectStoreBackend::Memory(adapter), cleanup_rx)
+            (ProjectStoreBackend::Memory(Arc::new(adapter)), cleanup_rx)
         }
         // PG 模式 fail fast：未编译 feature / 连接失败 / 迁移失败均直接退出，
         // 绝不静默降级内存（会造成 PG 与镜像分叉）
@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("[STORAGE_PG] postgres backend init failed: {e:#}");
                 std::process::exit(1);
             });
-            (ProjectStoreBackend::Postgres(store), cleanup_rx)
+            (ProjectStoreBackend::Postgres(Arc::new(store)), cleanup_rx)
         }
         #[cfg(not(feature = "rcoder-pg"))]
         config::StorageBackend::Postgres => {

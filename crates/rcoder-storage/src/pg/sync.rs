@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 
 use super::load::{container_rows_to_map, hydrate_project};
 use super::repo;
-use crate::backend::ProjectStoreBackend;
+use super::PgStore;
 
 /// 同步周期（ClientIP affinity 下常规流量不受影响；故障切换陈旧窗口上限）
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -34,10 +34,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 同步循环（PG 模式由 rcoder background_tasks 拉起）。
 ///
-/// 持有 `Arc<ProjectStoreBackend>` 每 tick 经 `postgres()` 取借用（借用跨 await
-/// 合法：Arc 在任务内存活），避免 PgStore 自持 Arc 循环。
+/// 持有 `Arc<PgStore>` 独立句柄（从 `ProjectStoreBackend::postgres()` clone）——
+/// pg 子树不依赖 crate 根门面，依赖图保持单向（backend → pg）。
 pub async fn run_sync_loop(
-    projects: Arc<ProjectStoreBackend>,
+    store: Arc<PgStore>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     info!("[STORAGE_PG] cross-replica sync started (interval={SYNC_INTERVAL:?})");
@@ -46,10 +46,7 @@ pub async fn run_sync_loop(
             biased;
             _ = shutdown_rx.recv() => break,
             _ = tokio::time::sleep(SYNC_INTERVAL) => {
-                let Some(store) = projects.postgres() else {
-                    break; // 后端不可能中途切走（构造期决定），防御性退出
-                };
-                if let Err(e) = sync_once(store, store.inner(), store.pool()).await {
+                if let Err(e) = sync_once(&store, store.inner(), store.pool()).await {
                     warn!("[STORAGE_PG] cross-replica sync failed (will retry): {e:#}");
                 }
             }
@@ -60,7 +57,7 @@ pub async fn run_sync_loop(
 
 /// 单轮同步（pub(crate) 供集成测试直接驱动）
 pub(crate) async fn sync_once(
-    store: &crate::pg::PgStore,
+    store: &PgStore,
     inner: &crate::adapter::ProjectAdapter,
     pool: &PgPool,
 ) -> anyhow::Result<()> {

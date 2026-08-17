@@ -197,10 +197,10 @@ pub async fn start_all_background_tasks(
     let pg_sync_handle = if state.projects.is_postgres() {
         #[cfg(feature = "rcoder-pg")]
         {
-            let projects = Arc::clone(&state.projects);
+            let store = Arc::clone(state.projects.postgres().expect("is_postgres 为真"));
             let shutdown_rx = shutdown_tx.subscribe();
             Some(tokio::spawn(async move {
-                rcoder_storage::pg::sync::run_sync_loop(projects, shutdown_rx).await;
+                rcoder_storage::pg::sync::run_sync_loop(store, shutdown_rx).await;
             }))
         }
         #[cfg(not(feature = "rcoder-pg"))]
