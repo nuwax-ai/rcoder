@@ -196,7 +196,7 @@ hex = "0.4"
 walkdir = "2.5"
 # 并行目录遍历 (work-stealing 线程池), 用于 file-server search-files。
 # 取代手写 BFS: 零 syscall d_type + 多线程并行, dua-cli (gitoxide 作者 Byron 维护) 的核心库。
-dua-core = "3.0.0"
+dua-core = "3.1"
 # HTTP client。reqwest 0.13 的 default-tls 本就是 rustls(aws-lc-rs + rustls-platform-verifier 读 OS 根证书)，
 # 并无 openssl/native-tls。这里 default-features=false + 显式 rustls 固化“全 workspace 用 rustls”，
 # 防止未来 reqwest 改默认后悄悄回退；charset/http2/system-proxy 补回原默认特性。
@@ -326,6 +326,13 @@ model_probe = { path = "crates/model_probe" }
 
 # Pyroscope Continuous Profiling
 pyroscope = { version = "2.1", features = ["backend-pprof-rs"] }
+
+# 依赖不产出 debuginfo（DWARF）：调试走日志、不进依赖断点，依赖帧回溯缺行号可接受。
+# 收益：unpacked split-debuginfo 下依赖不再生成海量 .o 调试小文件
+# （曾致 deps 百万文件 / target 717GB 的随机小 IO 风暴），编译、链接、清理全面提速。
+# "*" 通配只匹配依赖，workspace 成员仍保留完整调试信息。
+[profile.dev.package."*"]
+debug = false
 
 # The profile that 'dist' will build with
 [profile.dist]
