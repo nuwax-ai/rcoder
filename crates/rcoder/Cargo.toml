@@ -36,6 +36,7 @@ rcoder-pg = ["kubernetes", "rcoder-storage/pg"]
 
 [dev-dependencies]
 filetime = { workspace = true }
+http-body-util = { workspace = true }
 
 [lints]
 workspace = true

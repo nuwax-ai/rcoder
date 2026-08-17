@@ -511,17 +511,15 @@ fn spawn_backend_task(
                         inner.status, inner.is_found, session_id
                     );
                     if inner.is_found && inner.status == "idle" {
+                        // 不再合成 SessionPromptEnd 断流——实测竞态：chat 发出后立即订阅
+                        // SSE（前端标准时序），agent 的 busy 状态翻转滞后于 prompt 传递，
+                        // 误判 idle 会杀掉整轮流（prompt_start/chunks 全部收不到）。
+                        // idle 的真实代价只是流挂着收 keep-alive，由 IDLE_CLEANUP_SECS
+                        // (30s) 兜底清理；真 turn 结束时终端事件会正常广播。
                         info!(
-                            "[SessionStream] agent idle, sending SessionPromptEnd: session_id={}",
+                            "[SessionStream] agent idle at subscribe time, proceeding to subscribe (chat→SSE race tolerated): session_id={}",
                             session_id
                         );
-                        let ev = make_prompt_end_event();
-                        if let Err(send_err) = shared.broadcast_tx.send(Arc::new(ev)) {
-                            warn!(
-                                "[SessionStream] broadcast send failed (no subscriber): {send_err}"
-                            );
-                        }
-                        return;
                     }
                     // epoch 比较(#15):同 epoch → 保留 last_seq(增量订阅);
                     // epoch 变化(agent 重启/worker panic 重建)→ 重置 last_seq + 清 ring + cursor-reset

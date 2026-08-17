@@ -74,7 +74,12 @@ pub async fn create_grpc_sse_stream(
         //    subscribe 先 replay 后:gap 里的事件在两边都有 → dedup(seq<=client_last_seq)去重。
         let mut bc_rx = shared.subscribe();
 
-        // 3. 增量补齐：从 ring 读取 seq > client_last_seq 的历史（断线重连补缺，不重复已收）
+        // 3. 补齐：从 ring 读取 seq > client_last_seq 的历史。
+        //    ⚠️ last_seq=0（无游标）必须全量重放本轮——前端是"chat 先发、SSE 后连"
+        //    的异步模式，连接建立时本轮事件早已产生，不重放会丢整轮（实测验证过）。
+        //    重连重复由前端按 messageId 聚合去重（agent_message_chunk 自带 messageId）。
+        //    增量路径：浏览器 EventSource 断线自动带 Last-Event-ID（服务端已发 id: seq）
+        //    或 ?last_seq= query → 只补断线窗口。
         for ev in shared.replay_since(client_last_seq) {
             if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
                 return; // 客户端断开，或历史已含终端事件
@@ -325,10 +330,55 @@ mod tests {
             Result<axum::response::sse::Event, std::convert::Infallible>,
         >(10);
         drop(rx); // 模拟 HTTP 客户端断开
-        let mut last_seq = 0_u64;
+        let mut last_seq = 0;
         let ev = make_event("AgentSessionUpdate", 5);
 
         let cont = forward_to_client(&tx, &ev, "s1", &mut last_seq).await;
         assert!(!cont, "send failure (client gone) must stop the task");
+    }
+
+    /// seq>=1 的真实事件必须带 SSE `id` 行（=seq）——浏览器 EventSource 断线
+    /// 自动重连凭此回传 Last-Event-ID，服务端才能只补增量不重放。
+    /// 走真实序列化路径（IntoResponse → body 文本）断言最终 wire 格式。
+    #[tokio::test]
+    async fn progress_event_to_sse_sets_id_for_real_seq() {
+        let ev = make_event("AgentSessionUpdate", 42);
+        let sse_event = progress_event_to_sse(&ev, "s1");
+        let text = render_sse_event(sse_event).await;
+        assert!(
+            text.contains("id: 42"),
+            "SSE wire format must carry id line, got: {text}"
+        );
+    }
+
+    /// seq=0 的合成消息（idle/error 哨兵）不设 id——0 是"无游标"哨兵语义，
+    /// 不能当作真实事件编号回传给客户端。
+    #[tokio::test]
+    async fn progress_event_to_sse_omits_id_for_zero_seq() {
+        let ev = make_event("SessionPromptEnd", 0);
+        let sse_event = progress_event_to_sse(&ev, "s1");
+        let text = render_sse_event(sse_event).await;
+        assert!(
+            !text.contains("id:"),
+            "synthetic seq=0 event must not carry id line, got: {text}"
+        );
+    }
+
+    /// 单事件经 axum SSE 序列化为 wire 文本（测试辅助）
+    async fn render_sse_event(event: axum::response::sse::Event) -> String {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt;
+
+        let resp = axum::response::Sse::new(futures_util::stream::once(async move {
+            Ok::<_, std::convert::Infallible>(event)
+        }))
+        .into_response();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect sse body")
+            .to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 }
