@@ -9,7 +9,7 @@ use shared_types::{
     AgentSessionUpdate, SessionNotify, SessionPromptEnd, SessionPromptError, SessionPromptStart,
 };
 
-use super::{SESSION_CACHE, push_session_update_with_project};
+use super::push_session_update_with_project;
 use tracing::{debug, info};
 
 /// SSE 消息推送器
@@ -38,41 +38,14 @@ impl SessionNotifier for SseSessionNotifier {
         session_id: &str,
         request_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 🧹 新任务开始时清空 ring buffer，防止回放过期的历史消息
-        // 这是清空 ring buffer 的最佳时机：
-        // 1. cancel/stop 后不能清空，因为需要通过 SSE 发送 SessionPromptEnd 给客户端
-        // 2. 在新任务开始时清空，确保不会回放上一次对话的消息
         info!(
             "[SseSessionNotifier] notify_prompt_start called: project_id={}, session_id={}",
             project_id, session_id
         );
 
-        if let Some(sd) = SESSION_CACHE.view(session_id, |_, d| d.clone()) {
-            info!(
-                "[SseSessionNotifier] SESSION_CACHE found for session_id={}, attempting to clear ring buffer",
-                session_id
-            );
-            // 水位清理：只清旧轮残留（cancel 在途的旧输出），本轮已流出的新消息不误伤。
-            // （全清在 chat prepare 已做过；此处若再全清会删掉本轮开头的消息。）
-            let cleared = sd.clear_stale_before_turn().await;
-            if cleared > 0 {
-                info!(
-                    "[SseSessionNotifier] Cleared {} stale (pre-turn) messages from ring buffer at prompt start: session_id={}",
-                    cleared, session_id
-                );
-            } else {
-                info!(
-                    "[SseSessionNotifier] Ring buffer already empty for session_id={}",
-                    session_id
-                );
-            }
-        } else {
-            info!(
-                "[SseSessionNotifier] SESSION_CACHE not found for session_id={}, skipping clear (new session)",
-                session_id
-            );
-        }
-
+        // 不在此清 ring：轮间清理由 chat prepare（prompt 前清）与终端即清
+        // （SessionPromptEnd push 后）保证。prompt_start 时刻清会误伤本轮已流出的
+        // 开头消息（实测曾误清 7 条）；旧轮残留此时已被 prepare 清空。
         let notify = SessionNotify::SessionPromptStart(SessionPromptStart {
             session_id: session_id.to_string(),
             request_id,

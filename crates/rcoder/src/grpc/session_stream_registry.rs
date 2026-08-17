@@ -319,6 +319,8 @@ impl SharedStream {
     /// 所有消息（含 seq=0 合成消息）broadcast 给客户端。
     fn dispatch_event(&self, ev: SharedEvent) {
         let seq = ev.seq;
+        // 终端判定：agent 异常退出的 error 事件在转换层已归一化为 End(sub_type="error")，
+        // 此处单一判定即覆盖正常/异常两种路径
         let is_terminal = ev.message_type == "SessionPromptEnd";
         if seq > 0 {
             {
