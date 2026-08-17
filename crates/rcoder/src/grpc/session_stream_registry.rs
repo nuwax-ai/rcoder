@@ -399,9 +399,9 @@ impl SharedStream {
             seq: 0,
             timestamp: now_millis(),
         });
-        if let Err(send_err) = self.broadcast_tx.send(end_ev) {
-            warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
-        }
+        // 走 dispatch_event：broadcast 之外还要清 ring（流被替换/清理时 ring 里的
+        // 半轮残留不得留给下一个复用该 session 的客户端）
+        self.dispatch_event(end_ev);
         self.cancel_token.cancel();
         // 不 await task：避免 get_or_create（HTTP 请求路径）阻塞——后台 task 在 get_client/get_status/
         // subscribe_progress 等连接阶段不响应 cancel，若 await 会卡住 HTTP 请求。task 会在 stream 循环
@@ -490,9 +490,8 @@ fn spawn_backend_task(
                     // 重试耗尽:必须发终态错误事件,否则 SharedStream 持 sender 不 Closed,
                     // 已连上的 HTTP SSE 客户端会永久 hang 在 recv()。错误文案用【当前】失败(#16a)。
                     let err_ev = make_terminal_error_event(shared.diag_ctx.as_ref(), locale).await;
-                    if let Err(send_err) = shared.broadcast_tx.send(Arc::new(err_ev)) {
-                        warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
-                    }
+                    // dispatch_event：broadcast + 终端清 ring（故障路径的半轮残留不得跨轮）
+                    shared.dispatch_event(Arc::new(err_ev));
                     return;
                 }
             };
@@ -604,14 +603,9 @@ fn spawn_backend_task(
                                     );
                                     // 兜底：若 agent_runner 未推 SessionPromptEnd 就关流，客户端转发 task 会 hang
                                     // （broadcast 不会 Closed，因 SharedStream 持有 sender）。补一个 terminal 事件唤醒退出。
-                                    if let Err(send_err) = shared
-                                        .broadcast_tx
-                                        .send(Arc::new(make_prompt_end_event()))
-                                    {
-                                        warn!(
-                                            "[SessionStream] broadcast send failed (no subscriber): {send_err}"
-                                        );
-                                    }
+                                    // 走 dispatch_event：agent 侧终端即清可能因流断没送达，ring 里的半轮
+                                    // 由这里统一清（终端 seq=0 → dispatch 只 broadcast+清 ring，不污染游标）。
+                                    shared.dispatch_event(Arc::new(make_prompt_end_event()));
                                     return;
                                 }
                                 Err(e) => {
@@ -630,13 +624,7 @@ fn spawn_backend_task(
                                         break; // 内层 loop 退出，外层重试
                                     }
                                     let err_ev = make_stream_error_event(e.code(), e.message());
-                                    if let Err(send_err) =
-                                        shared.broadcast_tx.send(Arc::new(err_ev))
-                                    {
-                                        warn!(
-                                            "[SessionStream] broadcast send failed (no subscriber): {send_err}"
-                                        );
-                                    }
+                                    shared.dispatch_event(Arc::new(err_ev));
                                     return;
                                 }
                             }
@@ -654,9 +642,8 @@ fn spawn_backend_task(
                     }
                     // 终态事件报告【当前】阶段错误,不用累积的过期错误(#16a)。
                     let err_ev = make_terminal_error_event(shared.diag_ctx.as_ref(), locale).await;
-                    if let Err(send_err) = shared.broadcast_tx.send(Arc::new(err_ev)) {
-                        warn!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
-                    }
+                    // dispatch_event：broadcast + 终端清 ring（故障路径的半轮残留不得跨轮）
+                    shared.dispatch_event(Arc::new(err_ev));
                     return;
                 }
             }
@@ -939,6 +926,39 @@ mod tests {
             .map(|ev| ev.seq)
             .collect();
         assert_eq!(got, vec![5], "next turn replay contains only new events");
+    }
+
+    /// 🔚 合成终端（seq=0，流断/故障路径的兜底 End/error）同样清 ring——
+    /// 本次修复锁定：agent 侧终端即清可能因 gRPC 断流没送达 rcoder，rcoder 的
+    /// 合成终端兜底若只 broadcast 不清 ring，半轮残留会留给下一个客户端。
+    #[tokio::test]
+    async fn synthetic_terminal_event_clears_ring() {
+        let shared = SharedStream::new(
+            "s-syn".into(),
+            "127.0.0.1:1".into(),
+            Arc::new(GrpcChannelPool::new()),
+            "en",
+            Arc::new(|_| {}),
+            None,
+        )
+        .await;
+
+        // 半轮写入（模拟流断时 ring 已积累的内容）
+        shared.dispatch_event(arc_event(1, "half-a"));
+        shared.dispatch_event(arc_event(2, "half-b"));
+
+        // 合成终端（seq=0）：只 broadcast + 清 ring，不写 ring 不动 last_seq
+        shared.dispatch_event(Arc::new(make_prompt_end_event()));
+
+        assert!(
+            shared.replay_since(0).is_empty(),
+            "synthetic terminal must clear ring (half-turn residue forbidden)"
+        );
+        assert_eq!(
+            shared.last_seq(),
+            2,
+            "seq=0 synthetic terminal must not touch last_seq"
+        );
     }
 
     /// 🔍 边界审查：epoch 哨兵（seq=0 StreamReset）确实会被终端 clear 从 ring 清掉。
