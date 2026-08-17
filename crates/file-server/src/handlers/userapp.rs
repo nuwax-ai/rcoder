@@ -210,6 +210,7 @@ pub(crate) async fn build_workspace(
     reply(result.await)
 }
 
+/// 获取 UserApp 构建任务状态快照（含进度日志摘要）
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}",
@@ -387,6 +388,7 @@ pub(crate) async fn cancel_task(
     reply(result.await)
 }
 
+/// 检测项目类型（分析文件结构推断 language/framework/build tool）
 #[utoipa::path(
     post,
     path = "/projects/detect",
@@ -415,6 +417,7 @@ pub(crate) async fn detect_project(
     reply(result.await)
 }
 
+/// 确认项目检测结果（用户选择/修正 detect 推断的项目类型后提交）
 #[utoipa::path(
     post,
     path = "/projects/confirm",
