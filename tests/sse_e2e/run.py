@@ -29,6 +29,7 @@ import re
 import sys
 import time
 import datetime
+import threading
 from pathlib import Path
 
 import requests
@@ -267,7 +268,6 @@ def scenario_two_turn_isolation(out: dict, backend: str = "openai"):
     last1 = max(ids1) if ids1 else 0
     # 第二轮（同 session，后台发——同步等待会错过 SSE 窗口；任务要够长，
     # acp-ts 后端短任务（倒数 3 个数）在 0.8s 连接前就终结清空了）
-    import threading
     def _round2():
         try:
             # 续话必须同时带 session_id + project_id：acp-ts(claude-code) 的 session
@@ -346,7 +346,6 @@ def scenario_no_session_reuse(out: dict, backend: str = "openai"):
     last1 = max(ids_of(evs1)) if ids_of(evs1) else 0
 
     # 第二轮：只带 user_id + project_id（不带 session_id —— 前端标准续话姿势）
-    import threading
     p2 = base_payload("我上一条消息问了什么？一句话概括，再写一行总结。", f"{RUN_TAG}-s9b", user, backend=backend)
     p2["project_id"] = pid
     assert "session_id" not in p2, "second round must NOT carry session_id"
@@ -406,7 +405,6 @@ def scenario_model_switch(out: dict):
         mp[k] = pro
     # 后台发 chat（同步等返回会错过 SSE——切模型场景 chat 会等到 error 终端才返回，
     # 届时终端即清已执行，SSE 只能收到空流）
-    import threading
     t = threading.Thread(target=lambda: chat(p2, timeout=120), daemon=True)
     t.start()
     time.sleep(0.8)
@@ -443,7 +441,6 @@ def scenario_anthropic_model_switch(out: dict):
     r1_text = chunks_text(evs1)
     c.ok("CAP" in r1_text or "一致" in r1_text, f"第一轮 CAP 回答（{r1_text[:40]!r}）")
 
-    import threading
     p2 = base_payload("我上一条问了什么？一句话概括，再三点解释 BASE 定理。",
                       f"{RUN_TAG}-s8b", user, backend="anthropic",
                       model=CFG.get("LLM_MODEL_PRO", ""))

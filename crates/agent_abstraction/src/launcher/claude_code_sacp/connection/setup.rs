@@ -242,6 +242,7 @@ pub(super) async fn create_or_load_session(
             }
             Err(_) => {
                 // LoadSession 超时，降级到 NewSessionRequest
+                resuming.store(false, Ordering::Release);
                 warn!(
                     "[SACP] LoadSession timeout ({}s), falling back to NewSession",
                     timeout_secs
