@@ -8,7 +8,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType, StorageStats};
 
-use super::adapter::ProjectAdapter;
+use super::ProjectAdapter;
 
 impl shared_types::ProjectStore for ProjectAdapter {
     fn get(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {

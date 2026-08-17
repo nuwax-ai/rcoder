@@ -10,7 +10,7 @@ use dashmap::mapref::entry::Entry;
 use shared_types::{ContainerBasicInfo, ContainerEntry, ProjectAndContainerInfo, ServiceType};
 use tracing::info;
 
-use super::adapter::ProjectAdapter;
+use super::ProjectAdapter;
 use shared_types::CleanupRequest;
 use shared_types::IdleContainerInfo;
 

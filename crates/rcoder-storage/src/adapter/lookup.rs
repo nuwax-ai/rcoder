@@ -6,7 +6,7 @@
 use shared_types::{ContainerBasicInfo, ServiceType};
 use tracing::debug;
 
-use super::adapter::ProjectAdapter;
+use super::ProjectAdapter;
 
 // ========== pingora backend 地址解析 ==========
 

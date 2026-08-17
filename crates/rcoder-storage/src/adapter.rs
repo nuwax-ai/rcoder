@@ -11,8 +11,17 @@
 //! - **写操作**: 使用 `entry()` API（精确锁定单条记录）
 //! - **禁止**: `get()` 返回的 guard 跨 map 操作（死锁风险）
 //!
-//! 容器记录类方法（save/delete/查询/闲置扫描/引用计数）见 `adapter_container_ops.rs`
-//! （同类型 extension-impl 拆分）。
+//! ## 子模块（同类型 extension-impl 拆分）
+//!
+//! - `container_ops`: 容器条目 CRUD/反查/引用计数
+//! - `lookup`: Pingora 查询面 + ContainerLookup 实现
+//! - `session_ops`: session 映射操作
+//! - `store_impl`: ProjectStore 契约实现
+
+mod container_ops;
+mod lookup;
+mod session_ops;
+mod store_impl;
 
 use std::sync::Arc;
 

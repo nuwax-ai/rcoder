@@ -10,18 +10,15 @@
 //! shared_types（跨 crate 契约单一事实源），本 crate 仅转发导出。
 //!
 //! 模块组织：
-//! - adapter: ProjectAdapter 内存实现（project/session CRUD + ContainerLookup）
-//! - adapter_container_ops: 容器条目 CRUD/反查/引用计数（extension-impl 拆分）
+//! - adapter: ProjectAdapter 内存实现（project/session CRUD + ContainerLookup）；
+//!   实现细节按职责拆为子模块 adapter/{container_ops,lookup,session_ops,store_impl}.rs
+//!   （同类型 extension-impl），tests.rs 为单元测试
 //! - backend: ProjectStoreBackend 枚举（静态分发）
 //! - config: PostgresConfig（rcoder config.yml `[storage.postgres]` 数据模型）
 //! - persist_ops: write-behind 队列的 op 模型
 //! - pg（cfg feature="pg"）: PgStore + writer + 启动加载
 
 mod adapter;
-mod adapter_container_ops;
-mod adapter_lookup;
-mod adapter_session_ops;
-mod adapter_store_impl;
 mod backend;
 pub mod config;
 #[cfg(feature = "pg")]

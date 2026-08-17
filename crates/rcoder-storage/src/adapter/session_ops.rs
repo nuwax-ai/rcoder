@@ -8,7 +8,7 @@ use std::sync::Arc;
 use dashmap::mapref::entry::Entry;
 use shared_types::ProjectAndContainerInfo;
 
-use super::adapter::{ProjectAdapter, container_entry_key};
+use super::{ProjectAdapter, container_entry_key};
 use tracing::debug;
 
 impl ProjectAdapter {
