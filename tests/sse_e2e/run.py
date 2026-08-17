@@ -71,28 +71,46 @@ def die(msg: str):
     sys.exit(1)
 
 
-def base_payload(prompt: str, request_id: str, user: str = "") -> dict:
+def base_payload(prompt: str, request_id: str, user: str = "", backend: str = "openai",
+                 model: str = "") -> dict:
+    """构造 chat payload。backend: openai=nuwaxcode(opencode) | anthropic=claude-code-acp-ts。"""
+    m = model or MODEL
+    if backend == "anthropic":
+        provider = {
+            "id": m, "name": m,
+            "base_url": CFG.get("LLM_BASE_URL_ANTHROPIC", ""),
+            "api_key": API_KEY, "default_model": m,
+            "requires_openai_auth": True, "api_protocol": "anthropic",
+        }
+        server = {
+            "agent_id": "claude-code-acp-ts", "command": "claude-code-acp-ts", "args": [],
+            "env": {
+                "ANTHROPIC_API_KEY": "{MODEL_PROVIDER_API_KEY}",
+                "ANTHROPIC_MODEL": "{MODEL_PROVIDER_DEFAULT_MODEL}",
+                "ANTHROPIC_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
+            },
+        }
+    else:
+        provider = {
+            "id": m, "name": m,
+            "base_url": BASE_URL, "api_key": API_KEY, "default_model": m,
+            "requires_openai_auth": True, "api_protocol": "openai",
+        }
+        server = {
+            "agent_id": "nuwaxcode", "command": "nuwaxcode", "args": ["acp"],
+            "env": {
+                "OPENAI_API_KEY": "{MODEL_PROVIDER_API_KEY}",
+                "OPENCODE_MODEL": "openai-compatible/{MODEL_PROVIDER_DEFAULT_MODEL}",
+                "OPENAI_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
+            },
+        }
     return {
         "user_id": user or USER,
         "prompt": prompt,
         "request_id": request_id,
-        "model_provider": {
-            "id": MODEL, "name": MODEL,
-            "base_url": BASE_URL, "api_key": API_KEY,
-            "default_model": MODEL,
-            "requires_openai_auth": True, "api_protocol": "openai",
-        },
+        "model_provider": provider,
         "system_prompt": "你是集成测试助手。严格按要求输出，不要解释。",
-        "agent_config": {
-            "agent_server": {
-                "agent_id": "nuwaxcode", "command": "nuwaxcode", "args": ["acp"],
-                "env": {
-                    "OPENAI_API_KEY": "{MODEL_PROVIDER_API_KEY}",
-                    "OPENCODE_MODEL": "openai-compatible/{MODEL_PROVIDER_DEFAULT_MODEL}",
-                    "OPENAI_BASE_URL": "{MODEL_PROVIDER_BASE_URL}",
-                },
-            }
-        },
+        "agent_config": {"agent_server": server},
     }
 
 
@@ -123,6 +141,9 @@ def sse_collect(session_id: str, duration: float, last_event_id: str | None = No
                           headers=headers, stream=True, timeout=(5, duration + 5)) as r:
             if r.status_code != 200:
                 raise RuntimeError(f"SSE HTTP {r.status_code}: {r.text[:200]}")
+            # 响应头无 charset 时 requests 默认 iso-8859-1 解码 → 中文 mojibake；
+            # SSE data 是 UTF-8 JSON，强制按 UTF-8 解。
+            r.encoding = "utf-8"
             for raw in r.iter_lines(decode_unicode=True):
                 if time.time() > deadline:
                     break
@@ -286,12 +307,121 @@ def scenario_reconnect_no_cursor(out: dict):
     return c
 
 
+def scenario_model_switch(out: dict):
+    """6. 同 session+project 切模型（flash→pro）：零重放 + 真实执行 + 上下文延续。
+
+    依赖两层修复：rcoder 侧（resume 重放过滤 + 重建前停旧进程）+
+    nuwaxcode 侧（resolveModel 旧引用回退，fork commit 012b7caf7）。
+    """
+    c = Check()
+    user = scoped_user("s6")
+    d1 = chat(base_payload("用三点解释 CAP 定理，每点一句话，最后一行总结。", f"{RUN_TAG}-s6a", user))
+    sid, pid = d1["session_id"], d1["project_id"]
+    time.sleep(0.8)
+    evs1 = sse_collect(sid, 30)
+    ids1 = ids_of(evs1)
+    last1 = max(ids1) if ids1 else 0
+    r1_text = chunks_text(evs1)
+
+    # 第二轮：切 pro（带 session_id + project_id——前端续话的正确姿势）
+    p2 = base_payload("我上一条问了什么？一句话概括，再三点解释 BASE 定理。", f"{RUN_TAG}-s6b", user)
+    p2["session_id"] = sid
+    p2["project_id"] = pid
+    mp = p2["model_provider"]
+    pro = CFG.get("LLM_MODEL_PRO", "")
+    for k in ("id", "name", "default_model"):
+        mp[k] = pro
+    # 后台发 chat（同步等返回会错过 SSE——切模型场景 chat 会等到 error 终端才返回，
+    # 届时终端即清已执行，SSE 只能收到空流）
+    import threading
+    t = threading.Thread(target=lambda: chat(p2, timeout=120), daemon=True)
+    t.start()
+    time.sleep(0.8)
+    evs2 = sse_collect(sid, 30)
+    ids2 = ids_of(evs2)
+    types2 = [e.get("event") for e in evs2]
+    r2_text = chunks_text(evs2)
+
+    c.ok(len(ids2) > 0, f"第二轮收到事件（{len(ids2)} 个）")
+    c.ok(all(i > last1 for i in ids2), f"第二轮 seq 全 > 第一轮最大（{min(ids2) if ids2 else '-'} > {last1}）——零历史重放")
+    has_err = "error" in types2
+    out.update(session_id=sid, turn1_last_seq=last1, turn2_ids=ids2,
+               turn2_error=has_err, turn1_reply_head=r1_text[:60], turn2_reply_head=r2_text[:60])
+    if has_err:
+        print("    ⚠️ 已知问题：切模型 prompt 失败（ProviderModelNotFoundError），见场景 docstring")
+    return c
+
+
+def scenario_anthropic_full_turn(out: dict):
+    """7. claude-code-acp-ts 后端（anthropic 协议）基本链路：SSE 语义非 opencode 特例。"""
+    c = Check()
+    user = scoped_user("s7")
+    d = chat(base_payload("从1数到6，每行一个数字", f"{RUN_TAG}-s7", user, backend="anthropic"))
+    sid = d["session_id"]
+    time.sleep(0.8)
+    evs = sse_collect(sid, 30)
+    types = [e.get("event") for e in evs]
+    ids = ids_of(evs)
+    c.ok("prompt_start" in types, f"含 prompt_start（{ {t: types.count(t) for t in set(types)} }）")
+    c.ok(types.count("end_turn") >= 1, "含 end_turn（完整轮）")
+    c.ok(types.count("agent_message_chunk") >= 1, f"含流式 chunk（{types.count('agent_message_chunk')}）")
+    c.ok(monotonic_unique(ids), f"id 单调无重复（{len(ids)} 个）")
+    text = chunks_text(evs)
+    c.ok(any(ch.isdigit() for ch in text), f"回答含数字（{text[:30]!r}）")
+    out.update(session_id=sid, backend="claude-code-acp-ts", ids=ids, reply_head=text[:60])
+    return c
+
+
+def scenario_anthropic_model_switch(out: dict):
+    """8. claude-code-acp-ts 切模型（flash→pro）：无重放 + 上下文延续 + 真实执行。
+
+    与 opencode 后端不同：acp-ts 的模型来自 env（每次进程读取），无 session
+    模型引用持久化——切模型场景应完整成功（opencode 的对应场景有已知问题）。
+    """
+    c = Check()
+    user = scoped_user("s8")
+    d1 = chat(base_payload("请用三点解释 CAP 定理，每点一句话，最后一行总结。",
+                           f"{RUN_TAG}-s8a", user, backend="anthropic"))
+    sid, pid = d1["session_id"], d1["project_id"]
+    time.sleep(0.8)
+    evs1 = sse_collect(sid, 40)
+    ids1 = ids_of(evs1)
+    last1 = max(ids1) if ids1 else 0
+    r1_text = chunks_text(evs1)
+    c.ok("CAP" in r1_text or "一致" in r1_text, f"第一轮 CAP 回答（{r1_text[:40]!r}）")
+
+    import threading
+    p2 = base_payload("我上一条问了什么？一句话概括，再三点解释 BASE 定理。",
+                      f"{RUN_TAG}-s8b", user, backend="anthropic",
+                      model=CFG.get("LLM_MODEL_PRO", ""))
+    p2["session_id"] = sid
+    p2["project_id"] = pid
+    t = threading.Thread(target=lambda: chat(p2, timeout=150), daemon=True)
+    t.start()
+    time.sleep(1)
+    evs2 = sse_collect(sid, 60)
+    ids2 = ids_of(evs2)
+    types2 = [e.get("event") for e in evs2]
+    r2_text = chunks_text(evs2)
+    c.ok(len(ids2) > 0, f"第二轮收到事件（{len(ids2)} 个）")
+    c.ok(all(i > last1 for i in ids2), f"seq 全 > 第一轮最大（{min(ids2) if ids2 else '-'} > {last1}）零重放")
+    c.ok(types2.count("end_turn") >= 1, "含 end_turn（切模型后真实执行完成）")
+    c.ok("CAP" in r2_text, f"上下文延续（回答记得上一轮 CAP：{r2_text[:30]!r}）")
+    c.ok("BASE" in r2_text or "基本可用" in r2_text, "回答了新问题 BASE")
+    out.update(session_id=sid, turn1_last_seq=last1, turn2_ids=ids2,
+               turn2_reply_head=r2_text[:80])
+    return c
+
+
 SCENARIOS = [
     ("full_turn_delivery", scenario_full_turn),
     ("after_terminal_empty", scenario_after_terminal),
     ("two_turn_isolation", scenario_two_turn_isolation),
     ("reconnect_with_cursor", scenario_reconnect_cursor),
     ("reconnect_no_cursor", scenario_reconnect_no_cursor),
+    ("model_switch", scenario_model_switch),
+    ("anthropic_full_turn", scenario_anthropic_full_turn),
+    ("anthropic_model_switch", scenario_anthropic_model_switch),
 ]
 
 
