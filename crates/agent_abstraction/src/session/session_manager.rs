@@ -56,7 +56,7 @@ use chrono::Utc;
 use shared_types::{
     AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo, SessionEntry,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::PromptMessage;
 use crate::diagnostics::DiagnosticsListener;
@@ -477,6 +477,22 @@ where
                             "🔄 [SESSION] Model config changed for session_id_hint, need to rebuild: project_id={}, session_id={}",
                             project_id, hint_sid
                         );
+                        // 🔪 显式停止旧 Agent 进程：仅靠 registry 覆盖/drop 不等待进程退出，
+                        // 双 opencode 进程同时持有同一 session 会导致新进程 prompt 立即
+                        // service failure（切模型场景实测）。
+                        if let Some(handle) = existing.lifecycle_handle() {
+                            if let Err(e) = handle.graceful_stop().await {
+                                warn!(
+                                    "[SESSION] graceful_stop old agent failed (continuing rebuild): {}",
+                                    e
+                                );
+                            } else {
+                                info!(
+                                    "[SESSION] old agent stopped before rebuild: project_id={}, session_id={}",
+                                    project_id, hint_sid
+                                );
+                            }
+                        }
                     }
                     // 会话无效，继续后续逻辑（可能需要重建）
                 } else {
@@ -573,6 +589,8 @@ where
 
             // 需要重建会话，先克隆必要数据并释放锁
             let session_id_str = existing.session_id().to_string();
+            // 停旧进程的句柄在释放 entry 锁前克隆（existing 借用自 entry）
+            let old_stop_handle = existing.lifecycle_handle().cloned();
             drop(occupied_entry); // 显式释放 entry 锁
 
             if channel_closed {
@@ -586,6 +604,20 @@ where
                     "Model config changed, restarting Agent session, project ID: {}, old session_id: {}",
                     project_id, session_id_str
                 );
+                // 🔪 同上：重建前显式停旧进程，防双进程同 session
+                if let Some(handle) = old_stop_handle.as_ref() {
+                    if let Err(e) = handle.graceful_stop().await {
+                        warn!(
+                            "[SESSION] graceful_stop old agent failed (continuing rebuild): {}",
+                            e
+                        );
+                    } else {
+                        info!(
+                            "[SESSION] old agent stopped before rebuild: project_id={}, old session_id={}",
+                            project_id, session_id_str
+                        );
+                    }
+                }
             }
 
             // 第二阶段：在不持有锁的情况下创建新会话

@@ -4,6 +4,7 @@
 //! 与会话更新通知分发逻辑。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::v1::SessionNotification;
 use agent_client_protocol::{Dispatch, Handled, JsonRpcMessage};
@@ -16,12 +17,25 @@ pub(super) async fn handle_incoming_dispatch<N: SessionNotifier>(
     dispatch: Dispatch,
     notifier: Arc<N>,
     project_id: String,
+    resuming: Arc<AtomicBool>,
 ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
     match dispatch {
         Dispatch::Notification(message) => {
             if SessionNotification::matches_method(&message.method) {
                 match SessionNotification::parse_message(&message.method, &message.params) {
                     Ok(notification) => {
+                        // 🔁 resume 重放过滤：session/load 期间 opencode 会把历史消息
+                        // （上一轮 user/agent 消息）作为通知重发——这是给 agent 进程重建
+                        // 上下文用的，不是新消息。若不过滤，切换模型（模型 id 变化触发
+                        // agent 重建 + resume）时 SSE 客户端会收到上一轮消息的完整重放
+                        // （"切模型后收到重复消息"的根因路径之一）。
+                        if resuming.load(Ordering::Acquire) {
+                            debug!(
+                                "[SACP] suppress replay during session/load: project_id={}, update={:?}",
+                                project_id, notification.update
+                            );
+                            return Ok(Handled::Yes);
+                        }
                         // notifier/project_id 按值持有且此后不再使用，直接 move，避免额外 clone
                         handle_session_notification(notification, notifier, project_id).await;
                         Ok(Handled::Yes)

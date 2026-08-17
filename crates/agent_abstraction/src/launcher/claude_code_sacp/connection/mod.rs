@@ -88,6 +88,8 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         diagnostics_listener,
     } = params;
 
+    // resume 窗口标志：session/load 期间为 true（通知 handler 据此过滤历史重放）
+    let resuming = Arc::new(AtomicBool::new(false));
     // 克隆变量供 handlers 使用
     let notifier_for_handlers = notifier.clone();
     let project_id_for_handlers = project_id.clone();
@@ -112,11 +114,13 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
             {
                 let notifier = notifier_for_handlers.clone();
                 let project_id = project_id_for_handlers.clone();
+                let resuming = resuming.clone();
                 async move |dispatch: Dispatch, _cx: ConnectionTo<Agent>| {
                     notification_handlers::handle_incoming_dispatch(
                         dispatch,
                         notifier.clone(),
                         project_id.clone(),
+                        resuming.clone(),
                     )
                     .await
                 }
@@ -152,6 +156,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
             let project_id_for_prompt = project_id_for_prompt_end.clone();
             let abnormal_exit_flag = abnormal_exit_flag.clone();
             let session_id_shared = session_id_shared.clone();
+            let resuming = resuming.clone();
 
             async move {
                 // 1. 初始化连接（INIT_TIMEOUT_SECS 秒超时）
@@ -173,6 +178,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     project_path,
                     mcp_servers,
                     &start_config,
+                    &resuming,
                 )
                 .await?;
 

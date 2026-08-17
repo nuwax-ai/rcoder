@@ -6,6 +6,7 @@
 //! 3. agent_mode=ask 时的 SetSessionModeRequest
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::v1::{
@@ -137,6 +138,7 @@ pub(super) async fn create_or_load_session(
     project_path: PathBuf,
     mcp_servers: Vec<McpServer>,
     start_config: &AgentStartConfig,
+    resuming: &Arc<AtomicBool>,
 ) -> Result<SessionId, agent_client_protocol::Error> {
     // 2. 构建 meta（包含系统提示词和可能的 resume）
     let system_prompt_meta = start_config.build_meta();
@@ -172,6 +174,8 @@ pub(super) async fn create_or_load_session(
     {
         // 有 resume_session_id，尝试加载历史会话
         info!("[SACP] Attempting to load existing session: {}", resume_id);
+        // resume 窗口开启：此期间的历史通知重放将被通知 handler 过滤
+        resuming.store(true, Ordering::Release);
 
         let load_request = LoadSessionRequest::new(resume_id.clone(), project_path.clone())
             .mcp_servers(mcp_servers.clone())
@@ -187,6 +191,7 @@ pub(super) async fn create_or_load_session(
         {
             Ok(Ok(_response)) => {
                 // LoadSession 成功，使用请求中的 session_id
+                resuming.store(false, Ordering::Release);
                 info!(
                     "[SACP] Session loaded successfully: {}, resuming session",
                     resume_id
@@ -195,6 +200,7 @@ pub(super) async fn create_or_load_session(
             }
             Ok(Err(load_err)) => {
                 // LoadSession 返回错误，降级到 NewSessionRequest
+                resuming.store(false, Ordering::Release);
                 warn!(
                     "[SACP] LoadSession failed, falling back to NewSession: {}",
                     load_err
