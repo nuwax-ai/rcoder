@@ -52,10 +52,12 @@ impl SessionNotifier for SseSessionNotifier {
                 "[SseSessionNotifier] SESSION_CACHE found for session_id={}, attempting to clear ring buffer",
                 session_id
             );
-            let cleared = sd.clear_message_buffer().await;
+            // 水位清理：只清旧轮残留（cancel 在途的旧输出），本轮已流出的新消息不误伤。
+            // （全清在 chat prepare 已做过；此处若再全清会删掉本轮开头的消息。）
+            let cleared = sd.clear_stale_before_turn().await;
             if cleared > 0 {
                 info!(
-                    "[SseSessionNotifier] Cleared {} stale messages from ring buffer at prompt start: session_id={}",
+                    "[SseSessionNotifier] Cleared {} stale (pre-turn) messages from ring buffer at prompt start: session_id={}",
                     cleared, session_id
                 );
             } else {

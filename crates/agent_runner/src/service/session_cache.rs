@@ -232,7 +232,7 @@ impl SessionData {
         let (tx, rx) = oneshot::channel();
         if self
             .command_tx
-            .send(SessionCommand::Clear { ack: tx })
+            .send(SessionCommand::ClearAll { ack: tx })
             .await
             .is_err()
         {
@@ -240,6 +240,21 @@ impl SessionData {
             return 0;
         }
         await_worker_reply("clear_message_buffer", WORKER_REPLY_TIMEOUT_SECS, rx).await
+    }
+
+    /// 只清旧轮残留（seq < 本轮水位）。prompt_start 通知用——防旧轮回放，不误伤本轮。
+    pub async fn clear_stale_before_turn(&self) -> usize {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(SessionCommand::ClearStale { ack: tx })
+            .await
+            .is_err()
+        {
+            warn!("Failed to send clear-stale command; worker has exited");
+            return 0;
+        }
+        await_worker_reply("clear_stale_before_turn", WORKER_REPLY_TIMEOUT_SECS, rx).await
     }
 
     /// 检查 worker 是否仍然存活
@@ -506,6 +521,8 @@ impl SessionWorker {
         // session 级单调递增的消息序号。注意：Clear 命令清空 ring buffer 内容但【不重置】
         // next_seq——否则新一轮 prompt 的 seq 从 1 重来，会与订阅方持有的 last_seq 撞车导致漏发。
         let mut next_seq: u64 = 1;
+        // 本轮水位（ClearAll 设为清空时刻的 next_seq）：ClearStale 只清 seq < 水位的旧轮残留。
+        let mut turn_watermark: u64 = 0;
 
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
@@ -584,14 +601,55 @@ impl SessionWorker {
                             truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
                         );
                     }
+
+                    // 终端即清（单消费者轮语义）：end_turn 已实时推送给在场订阅者后，
+                    // 立即清空 ring——轮结束后连入的消费者不得 replay 到本轮消息。
+                    // （ring 缓存的职责收窄为"chat 发出→SSE 连上"的时间差缓冲。）
+                    if should_buffer
+                        && matches!(
+                            message.message_type,
+                            crate::model::SessionMessageType::SessionPromptEnd
+                        )
+                    {
+                        let mut cleared = 0usize;
+                        while consumer.try_pop().is_some() {
+                            cleared += 1;
+                        }
+                        buffered_len = 0;
+                        info!(
+                            "[SessionWorker] terminal event delivered, ring cleared immediately: cleared={cleared}"
+                        );
+                    }
                 }
-                SessionCommand::Clear { ack } => {
+                SessionCommand::ClearAll { ack } => {
                     // 仅清空 ring buffer 内容；next_seq 保持单调（见 run 开头注释），不随 clear 重置。
                     let mut cleared = 0usize;
                     while consumer.try_pop().is_some() {
                         cleared += 1;
                     }
                     buffered_len = 0;
+                    turn_watermark = next_seq;
+                    let _ = ack.send(cleared);
+                }
+                SessionCommand::ClearStale { ack } => {
+                    // ring FIFO + seq 单调：队头最小。pop 到队头 seq >= 水位即止——
+                    // 只清旧轮残留（含 cancel 在途的旧输出），本轮新消息不误伤。
+                    // 水位 0 = 未设（notifier 先于任何 prepare 执行，如新 session 首轮）
+                    // → 全部视为旧残留，退化为全清。
+                    let mut cleared = 0usize;
+                    while buffered_len > 0
+                        && (turn_watermark == 0
+                            || consumer
+                                .try_peek()
+                                .is_some_and(|(s, _)| *s < turn_watermark))
+                    {
+                        if consumer.try_pop().is_some() {
+                            cleared += 1;
+                            buffered_len -= 1;
+                        } else {
+                            break;
+                        }
+                    }
                     let _ = ack.send(cleared);
                 }
                 SessionCommand::MessageCount { ack } => {
@@ -628,7 +686,14 @@ enum SessionCommand {
     Push {
         message: UnifiedSessionMessage,
     },
-    Clear {
+    /// 全清 + 设本轮水位（prepare/stop 等"新轮开始"边界用）。
+    /// 水位 = 清空时刻的 next_seq：此后 push 的消息属于本轮，ClearStale 不会误删。
+    ClearAll {
+        ack: oneshot::Sender<usize>,
+    },
+    /// 只清旧轮残留（seq < 本轮水位的）；本轮已流出的新消息不动。
+    /// prompt_start 通知时用——既清掉 cancel 在途的旧输出，又不误伤本轮开头。
+    ClearStale {
         ack: oneshot::Sender<usize>,
     },
     MessageCount {
@@ -851,6 +916,70 @@ mod tests {
             .map(|(s, _)| s)
             .collect();
         assert_eq!(got, vec![2, 3], "replay_since(1) must return only seq>1");
+    }
+
+    #[tokio::test]
+    async fn terminal_event_clears_ring_immediately() {
+        let sd = SessionData::new(64).await;
+        sd.push_message(make_msg("a")); // seq 1
+        sd.push_message(make_msg("b")); // seq 2
+        let mut end = make_msg("end");
+        end.message_type = SessionMessageType::SessionPromptEnd;
+        sd.push_message(end); // 终端：推送后 ring 立即清空
+
+        let got: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert!(
+            got.is_empty(),
+            "ring must be empty right after terminal event, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_stale_keeps_current_turn_messages() {
+        let sd = SessionData::new(64).await;
+        sd.push_message(make_msg("old1")); // seq 1（上一轮残留）
+        sd.push_message(make_msg("old2")); // seq 2
+
+        // prepare 边界：全清并设水位（此刻 next_seq=3）
+        let cleared = sd.clear_message_buffer().await;
+        assert_eq!(cleared, 2);
+
+        // 模拟 cancel 在途的旧消息混入（seq 3，但逻辑上属旧轮——由水位后的
+        // ClearStale 场景覆盖：本测试重点是新消息不误伤）+ 本轮新消息
+        sd.push_message(make_msg("new1")); // seq 3（本轮）
+        sd.push_message(make_msg("new2")); // seq 4（本轮）
+
+        // prompt_start 的水位清理：本轮消息（seq >= 水位 3）必须保留
+        let stale_cleared = sd.clear_stale_before_turn().await;
+        assert_eq!(stale_cleared, 0, "no pre-watermark messages to clear");
+
+        let got: Vec<u64> = sd
+            .replay_since(0)
+            .await
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(
+            got,
+            vec![3, 4],
+            "current-turn messages must survive ClearStale"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_stale_without_watermark_clears_all() {
+        // 未设水位的场景（notifier 先于任何 prepare 执行，如新 session 首轮）：
+        // ClearStale 退化为全清——全部内容都视为旧残留。
+        let sd = SessionData::new(64).await;
+        sd.push_message(make_msg("x1"));
+        sd.push_message(make_msg("x2"));
+        let cleared = sd.clear_stale_before_turn().await;
+        assert_eq!(cleared, 2, "no watermark set: all content is stale");
     }
 
     #[tokio::test]
