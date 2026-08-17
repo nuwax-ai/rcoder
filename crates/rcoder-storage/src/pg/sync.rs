@@ -23,9 +23,9 @@ use sqlx::PgPool;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+use super::PgStore;
 use super::load::{container_rows_to_map, hydrate_project};
 use super::repo;
-use super::PgStore;
 
 /// 同步周期（ClientIP affinity 下常规流量不受影响；故障切换陈旧窗口上限）
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -36,10 +36,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// 持有 `Arc<PgStore>` 独立句柄（从 `ProjectStoreBackend::postgres()` clone）——
 /// pg 子树不依赖 crate 根门面，依赖图保持单向（backend → pg）。
-pub async fn run_sync_loop(
-    store: Arc<PgStore>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) {
+pub async fn run_sync_loop(store: Arc<PgStore>, mut shutdown_rx: broadcast::Receiver<()>) {
     info!("[STORAGE_PG] cross-replica sync started (interval={SYNC_INTERVAL:?})");
     loop {
         tokio::select! {

@@ -17,8 +17,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::repo;
 use super::persist_ops::PersistOp;
+use super::repo;
 
 /// 单批最大 op 数（一批一事务）
 const BATCH_MAX: usize = 200;

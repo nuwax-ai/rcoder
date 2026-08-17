@@ -39,9 +39,9 @@ use tracing::info;
 
 use shared_types::{ContainerLookup, ProjectAndContainerInfo, ServiceType};
 
+use self::persist_ops::{ContainerSnapshot, PersistOp, ProjectSnapshot};
 use crate::adapter::{ProjectAdapter, container_entry_key};
 use crate::config::PostgresConfig;
-use self::persist_ops::{ContainerSnapshot, PersistOp, ProjectSnapshot};
 
 pub use writer::PersistWriter;
 
