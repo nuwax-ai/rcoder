@@ -15,14 +15,12 @@
 //!   （同类型 extension-impl），tests.rs 为单元测试
 //! - backend: ProjectStoreBackend 枚举（静态分发）
 //! - config: PostgresConfig（rcoder config.yml `[storage.postgres]` 数据模型）
-//! - persist_ops: write-behind 队列的 op 模型
-//! - pg（cfg feature="pg"）: PgStore + writer + 启动加载
+//! - pg（cfg feature="pg"）: PgStore + writer + 启动加载 + write-behind op 模型
+//!   （persist_ops）——feature 门控的代码全部收在本子树
 
 mod adapter;
 mod backend;
 pub mod config;
-#[cfg(feature = "pg")]
-mod persist_ops;
 pub mod publish_repo;
 
 #[cfg(feature = "pg")]

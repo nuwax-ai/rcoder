@@ -11,7 +11,7 @@ use shared_types::{
 
 use super::PgStore;
 use crate::adapter::{code_to_agent_status, container_entry_key};
-use crate::persist_ops::PersistOp;
+use super::persist_ops::PersistOp;
 
 impl ProjectStore for PgStore {
     fn get(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {

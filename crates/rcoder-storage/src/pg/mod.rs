@@ -13,6 +13,7 @@
 
 mod leader;
 mod load;
+mod persist_ops;
 mod repo;
 pub mod leader_selection {
     pub use super::leader::PgLeaderElection;
@@ -40,7 +41,7 @@ use shared_types::{ContainerLookup, ProjectAndContainerInfo, ServiceType};
 
 use crate::adapter::{ProjectAdapter, container_entry_key};
 use crate::config::PostgresConfig;
-use crate::persist_ops::{ContainerSnapshot, PersistOp, ProjectSnapshot};
+use self::persist_ops::{ContainerSnapshot, PersistOp, ProjectSnapshot};
 
 pub use writer::PersistWriter;
 

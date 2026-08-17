@@ -5,7 +5,7 @@
 
 use sqlx::{PgConnection, PgExecutor};
 
-use crate::persist_ops::{ContainerSnapshot, ProjectSnapshot};
+use crate::pg::persist_ops::{ContainerSnapshot, ProjectSnapshot};
 
 use super::rows::{ContainerRow, ProjectRow, SessionRow};
 
