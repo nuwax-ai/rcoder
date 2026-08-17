@@ -170,8 +170,17 @@ def sse_collect(session_id: str, duration: float, last_event_id: str | None = No
     return events
 
 
+# 连接元事件（非对话消息）：acp-ts 后端在 SSE 建立时会话信息通知。
+# "终端清空"断言的对象是对话消息，元事件不计入。
+META_EVENTS = {"session_info_update"}
+
+
 def ids_of(events: list[dict]) -> list[int]:
     return [e["id"] for e in events if "id" in e]
+
+
+def message_events(events: list[dict]) -> list[dict]:
+    return [e for e in events if e.get("event") not in META_EVENTS]
 
 
 def chunks_text(events: list[dict]) -> str:
@@ -209,11 +218,11 @@ def monotonic_unique(ids: list[int]) -> bool:
 
 # ---------------- 场景 ----------------
 
-def scenario_full_turn(out: dict):
+def scenario_full_turn(out: dict, backend: str = "openai"):
     """1. chat 后立刻连 SSE：完整轮 + id 单调 + id 行存在。"""
     c = Check()
-    user = scoped_user("s1")
-    data = chat(base_payload("从1数到6，每行一个数字", f"{RUN_TAG}-s1", user))
+    user = scoped_user(f"s1-{backend}")
+    data = chat(base_payload("从1数到6，每行一个数字", f"{RUN_TAG}-s1", user, backend=backend))
     sid = data["session_id"]
     time.sleep(0.8)
     evs = sse_collect(sid, 30)
@@ -231,31 +240,45 @@ def scenario_full_turn(out: dict):
     return c
 
 
-def scenario_after_terminal(out: dict):
+def scenario_after_terminal(out: dict, backend: str = "openai"):
     """2. turn 结束后连 SSE：0 事件（终端即清，无本轮残留）。"""
     c = Check()
-    user = scoped_user("s2")
-    data = chat(base_payload("回答一个字：好", f"{RUN_TAG}-s2", user))
+    user = scoped_user(f"s2-{backend}")
+    data = chat(base_payload("回答一个字：好", f"{RUN_TAG}-s2", user, backend=backend))
     sid = data["session_id"]
     time.sleep(12)  # 等 turn 完成（终端即清已执行）
     evs = sse_collect(sid, 6)
-    c.ok(len(evs) == 0, f"0 事件（实际 {len(evs)}：{[e.get('event') for e in evs][:5]}）")
+    msgs = message_events(evs)
+    c.ok(len(msgs) == 0, f"0 消息事件（实际 {len(msgs)}：{[e.get('event') for e in msgs][:5]}；"
+        f"元事件 {[e.get('event') for e in evs if e.get('event') in META_EVENTS]} 不计）")
     out.update(session_id=sid, received=len(evs))
     return c
 
 
-def scenario_two_turn_isolation(out: dict):
+def scenario_two_turn_isolation(out: dict, backend: str = "openai"):
     """3. 第二轮流不含第一轮（seq 隔离）。"""
     c = Check()
-    user = scoped_user("s3")
-    d1 = chat(base_payload("从1数到4，每行一个数字", f"{RUN_TAG}-s3a", user))
-    sid = d1["session_id"]
+    user = scoped_user(f"s3-{backend}")
+    d1 = chat(base_payload("从1数到4，每行一个数字", f"{RUN_TAG}-s3a", user, backend=backend))
+    sid, pid = d1["session_id"], d1["project_id"]
     time.sleep(0.8)
     evs1 = sse_collect(sid, 30)
     ids1 = ids_of(evs1)
     last1 = max(ids1) if ids1 else 0
-    # 第二轮（同 session）
-    chat({**base_payload("从10倒数到8，每行一个数字", f"{RUN_TAG}-s3b", user), "session_id": sid})
+    # 第二轮（同 session，后台发——同步等待会错过 SSE 窗口；任务要够长，
+    # acp-ts 后端短任务（倒数 3 个数）在 0.8s 连接前就终结清空了）
+    import threading
+    def _round2():
+        try:
+            # 续话必须同时带 session_id + project_id：acp-ts(claude-code) 的 session
+            # 存储按 cwd（project 目录）——不带 project_id 会生成新目录，跨目录
+            # resume 必然 Resource not found → 裸新建（丢上下文+换 session id）。
+            chat({**base_payload("写一篇300字左右的短文，主题：城市的夜晚。直接正文。",
+                                f"{RUN_TAG}-s3b", user, backend=backend),
+                  "session_id": sid, "project_id": pid})
+        except Exception as e:  # noqa: BLE001
+            print(f"    [round2 chat] {e}")
+    threading.Thread(target=_round2, daemon=True).start()
     time.sleep(0.8)
     evs2 = sse_collect(sid, 30)
     ids2 = ids_of(evs2)
@@ -267,11 +290,11 @@ def scenario_two_turn_isolation(out: dict):
     return c
 
 
-def scenario_reconnect_cursor(out: dict):
+def scenario_reconnect_cursor(out: dict, backend: str = "openai"):
     """4. turn 进行中断开，带 Last-Event-ID 重连：只收增量。"""
     c = Check()
-    user = scoped_user("s4")
-    d = chat(base_payload("写一篇600字左右的散文，主题：山间的清晨。直接正文。", f"{RUN_TAG}-s4", user))
+    user = scoped_user(f"s4-{backend}")
+    d = chat(base_payload("写一篇600字左右的散文，主题：山间的清晨。直接正文。", f"{RUN_TAG}-s4", user, backend=backend))
     sid = d["session_id"]
     time.sleep(1.2)
     evs1 = sse_collect(sid, 3, idle_stop=False)
@@ -287,11 +310,11 @@ def scenario_reconnect_cursor(out: dict):
     return c
 
 
-def scenario_reconnect_no_cursor(out: dict):
+def scenario_reconnect_no_cursor(out: dict, backend: str = "openai"):
     """5. turn 进行中断开，无游标重连：全量重放本轮（含本轮开头）。"""
     c = Check()
-    user = scoped_user("s5")
-    d = chat(base_payload("写一篇600字左右的散文，主题：海边的黄昏。直接正文。", f"{RUN_TAG}-s5", user))
+    user = scoped_user(f"s5-{backend}")
+    d = chat(base_payload("写一篇600字左右的散文，主题：海边的黄昏。直接正文。", f"{RUN_TAG}-s5", user, backend=backend))
     sid = d["session_id"]
     time.sleep(1.2)
     evs1 = sse_collect(sid, 3, idle_stop=False)
@@ -352,26 +375,6 @@ def scenario_model_switch(out: dict):
     return c
 
 
-def scenario_anthropic_full_turn(out: dict):
-    """7. claude-code-acp-ts 后端（anthropic 协议）基本链路：SSE 语义非 opencode 特例。"""
-    c = Check()
-    user = scoped_user("s7")
-    d = chat(base_payload("从1数到6，每行一个数字", f"{RUN_TAG}-s7", user, backend="anthropic"))
-    sid = d["session_id"]
-    time.sleep(0.8)
-    evs = sse_collect(sid, 30)
-    types = [e.get("event") for e in evs]
-    ids = ids_of(evs)
-    c.ok("prompt_start" in types, f"含 prompt_start（{ {t: types.count(t) for t in set(types)} }）")
-    c.ok(types.count("end_turn") >= 1, "含 end_turn（完整轮）")
-    c.ok(types.count("agent_message_chunk") >= 1, f"含流式 chunk（{types.count('agent_message_chunk')}）")
-    c.ok(monotonic_unique(ids), f"id 单调无重复（{len(ids)} 个）")
-    text = chunks_text(evs)
-    c.ok(any(ch.isdigit() for ch in text), f"回答含数字（{text[:30]!r}）")
-    out.update(session_id=sid, backend="claude-code-acp-ts", ids=ids, reply_head=text[:60])
-    return c
-
-
 def scenario_anthropic_model_switch(out: dict):
     """8. claude-code-acp-ts 切模型（flash→pro）：无重放 + 上下文延续 + 真实执行。
 
@@ -413,16 +416,45 @@ def scenario_anthropic_model_switch(out: dict):
     return c
 
 
+import functools
+
+# 双后端完整矩阵：SSE 轮次语义（完整轮/终端清/轮次隔离/带游标/无游标重连）
+# 在两个 ACP agent 实现上都必须成立——交叉验证非特例。
+# openai 后端=nuwaxcode(opencode)；anthropic 后端=claude-code-acp-ts。
 SCENARIOS = [
     ("full_turn_delivery", scenario_full_turn),
+    ("full_turn_acp_ts", functools.partial(scenario_full_turn, backend="anthropic")),
     ("after_terminal_empty", scenario_after_terminal),
+    ("after_terminal_acp_ts", functools.partial(scenario_after_terminal, backend="anthropic")),
     ("two_turn_isolation", scenario_two_turn_isolation),
+    ("two_turn_acp_ts", functools.partial(scenario_two_turn_isolation, backend="anthropic")),
     ("reconnect_with_cursor", scenario_reconnect_cursor),
+    ("reconnect_cursor_acp_ts", functools.partial(scenario_reconnect_cursor, backend="anthropic")),
     ("reconnect_no_cursor", scenario_reconnect_no_cursor),
+    ("reconnect_nocursor_acp_ts", functools.partial(scenario_reconnect_no_cursor, backend="anthropic")),
+    # 切模型（各后端独立链路）
     ("model_switch", scenario_model_switch),
-    ("anthropic_full_turn", scenario_anthropic_full_turn),
-    ("anthropic_model_switch", scenario_anthropic_model_switch),
+    ("model_switch_acp_ts", scenario_anthropic_model_switch),
 ]
+
+
+def cleanup_test_containers():
+    """主动删除本次测试创建的 agent 容器（dev-rcoder-agent-runner-<USER 前缀>）。
+
+    不等闲置回收：场景多时容器堆积会吃光宿主内存，拖慢甚至拖垮后续场景。
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", f"name=dev-rcoder-agent-runner-{USER}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        ids = [l for l in out.stdout.splitlines() if l.strip()]
+        if ids:
+            subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, timeout=60)
+            print(f"  🧹 已清理 {len(ids)} 个测试容器")
+    except Exception as e:  # noqa: BLE001
+        print(f"  ⚠️ 容器清理失败（不影响测试结果）: {e}")
 
 
 def main():
@@ -451,6 +483,7 @@ def main():
             rows.append((name, False, f"exception: {e}"))
             (OUT_DIR / f"{name}.json").write_text(
                 json.dumps(detail, ensure_ascii=False, indent=2, default=str))
+            cleanup_test_containers()
             continue
         detail["checks"] = [{"ok": p, "desc": d} for p, d in check.items]
         detail["duration_s"] = round(time.time() - t0, 1)
@@ -460,6 +493,7 @@ def main():
             print(ln)
         rows.append((name, check.passed, f"{detail['duration_s']}s"))
         print(f"  {'✅ PASS' if check.passed else '❌ FAIL'}")
+        cleanup_test_containers()
 
     # 汇总
     lines = [f"SSE E2E 集成测试  {RUN_TAG}", f"target: {RCODER}  model: {MODEL}  user: {USER}", ""]
