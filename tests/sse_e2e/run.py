@@ -330,6 +330,56 @@ def scenario_reconnect_no_cursor(out: dict, backend: str = "openai"):
     return c
 
 
+def scenario_no_session_reuse(out: dict, backend: str = "openai"):
+    """前端标准姿势：第二轮不带 session_id，只带 project_id——rcoder 内部
+    按 project→session 映射自动复用（resolve_forward_request）。
+
+    断言三件事：①响应返回的 session_id 与第一轮相同（复用非新建）
+    ②SSE 正常收到第二轮 ③上下文延续（模型记得第一轮）。
+    """
+    c = Check()
+    user = scoped_user(f"s9-{backend}")
+    d1 = chat(base_payload("请用三点解释 CAP 定理，每点一句话。", f"{RUN_TAG}-s9a", user, backend=backend))
+    sid, pid = d1["session_id"], d1["project_id"]
+    time.sleep(0.8)
+    evs1 = sse_collect(sid, 40)
+    last1 = max(ids_of(evs1)) if ids_of(evs1) else 0
+
+    # 第二轮：只带 user_id + project_id（不带 session_id —— 前端标准续话姿势）
+    import threading
+    p2 = base_payload("我上一条消息问了什么？一句话概括，再写一行总结。", f"{RUN_TAG}-s9b", user, backend=backend)
+    p2["project_id"] = pid
+    assert "session_id" not in p2, "second round must NOT carry session_id"
+    r2_holder = {}
+
+    def _round2():
+        try:
+            r2_holder["data"] = chat(p2, timeout=150)
+        except Exception as e:  # noqa: BLE001
+            r2_holder["error"] = str(e)
+
+    threading.Thread(target=_round2, daemon=True).start()
+    time.sleep(1)
+    evs2 = sse_collect(sid, 60)
+    ids2 = ids_of(evs2)
+    r2_text = chunks_text(evs2)
+    types2 = [e.get("event") for e in evs2]
+
+    d2 = r2_holder.get("data")
+    c.ok(d2 is not None, f"第二轮 chat 成功（{r2_holder.get('error', 'ok')[:60]}）")
+    if d2:
+        c.ok(d2["session_id"] == sid,
+             f"session_id 复用（响应 {d2['session_id'][:18]}.. == 第一轮 {sid[:18]}..）")
+    c.ok(len(ids2) > 0, f"SSE 收到第二轮事件（{len(ids2)} 个）")
+    c.ok(all(i > last1 for i in ids2), f"seq 延续全 > 第一轮（{min(ids2) if ids2 else '-'} > {last1}）")
+    c.ok(types2.count("end_turn") >= 1, "第二轮完整执行")
+    c.ok("CAP" in r2_text, f"上下文延续（记得 CAP：{r2_text[:30]!r}）")
+    out.update(session_id=sid, project_id=pid, turn1_last_seq=last1,
+               turn2_ids=ids2, reused_sid=(d2 or {}).get("session_id"),
+               turn2_reply_head=r2_text[:60])
+    return c
+
+
 def scenario_model_switch(out: dict):
     """6. 同 session+project 切模型（flash→pro）：零重放 + 真实执行 + 上下文延续。
 
@@ -435,6 +485,9 @@ SCENARIOS = [
     # 切模型（各后端独立链路）
     ("model_switch", scenario_model_switch),
     ("model_switch_acp_ts", scenario_anthropic_model_switch),
+    # 无 session_id 续话（前端标准姿势：rcoder 内部 project→session 映射复用）
+    ("no_session_reuse", scenario_no_session_reuse),
+    ("no_session_reuse_acp_ts", functools.partial(scenario_no_session_reuse, backend="anthropic")),
 ]
 
 
