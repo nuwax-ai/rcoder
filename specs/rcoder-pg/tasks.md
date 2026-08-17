@@ -65,10 +65,24 @@
 
 ## 待开发
 
-- [ ] **Phase 3：CNPG HA**（3 节点挂 1 仍可服务）——operator manifest（对照
-      PXC 范式）+ helm CR 模板 + values mode 开关 + 私仓镜像重写 + offline bundle
+- [x] **Phase 3：CNPG HA**（2026-08-17 完成，.20 单节点验证）
+      - operator manifest：`build-agent-docker/k8s/cnpg-operator/cnpg-1.30.0-upstream.yaml`
+        （committed 保留上游镜像名，部署脚本 sed 重写私仓）+ `scripts/deploy-cnpg-operator.sh`
+        （cluster-scoped 装在 cnpg-system，对照 deploy-pxc-operator.sh）
+      - helm CR 模板：`templates/storage/postgres-ha.yaml`（`postgres.mode=ha` 渲染
+        Cluster CR + superuser Secret）；`postgres.yaml` Secret 公共、STS 仅 single 渲染
+      - values mode 开关：`postgres.mode: single|ha` + `postgres.ha.{instances,tag,
+        podAntiAffinityType}`；rcoder `RCODER_PG_HOST` 按 mode 切 `-rw` 端点
+      - 私仓镜像：`{reg}/{ns}/cnpg/cloudnative-pg:1.30.0` + `cnpg/postgresql:17.9`
+        （make push-cnpg-images）；deploy.sh mode=ha 自动装 operator + 删旧 single STS
+      - **failover 实测（.20）**：删 primary → 新 primary 27s 就绪；rcoder 连接池自愈、
+        cross-replica sync 退避重试（窗口内 4 次 warn 后归零）、leader advisory lock
+        27s 内换手接管；写入数据 failover 前后零丢失
+      - 遗留：offline bundle 纳入 CNPG manifest+镜像（离线集群场景）；single→ha 的
+        生产数据迁移走 pg_dump 回灌（测试环境直接重建）
 - [ ] **多副本正式部署**：helm `replicaCount: 2` + PDB 开启 → 集群内 rcoder
       双副本运行（本地双进程已验证，集群内需构建正式镜像 ~40min）
+      （注：.20 双副本 + PG HA 已随 Phase 3 验证跑通；此处指正式 OCI 发版链路）
 - [ ] **Cilium Gateway SNAT 验证**：Gateway API 流量经 envoy SNAT 后
       ClientIP affinity 是否仍生效（影响多副本 SSE 粘性）
 - [ ] **projects version 列跨副本冲突检测**（Phase 2 预留，单副本无需）

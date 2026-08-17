@@ -140,8 +140,6 @@ pub async fn start_all_background_tasks(
     // P2-M3：单实例语义任务的拉起收敛为函数——memory 模式直接拉起，
     // PG 模式由 leader 监督任务按 leadership 代际拉起/停止。
     // （activity flush 与镜像 sync 是"每副本自身状态"任务，不在 leader 门控内。）
-    #[cfg_attr(feature = "rcoder-pg", allow(clippy::too_many_arguments))]
-    #[allow(unused_variables)]
     let (
         cleanup_handle,
         status_checker_handle,
