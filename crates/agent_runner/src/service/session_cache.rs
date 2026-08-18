@@ -8,8 +8,6 @@ use crate::service::PERMISSION_MANAGER;
 use crate::{SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
 use dashmap::DashMap;
-use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
@@ -409,356 +407,6 @@ impl SessionData {
     }
 }
 
-struct SessionWorker {
-    max_size: usize,
-    command_rx: mpsc::Receiver<SessionCommand>,
-    // 🎯 多订阅者注册表（与 SessionData 共享）
-    connections: ConnectionRegistry,
-    /// conn_id 分配器（与 SessionData 共享；Subscribe 命令在 worker 内分配）
-    next_conn_id: Arc<AtomicU64>,
-}
-
-impl SessionWorker {
-    fn spawn(
-        max_size: usize,
-        command_rx: mpsc::Receiver<SessionCommand>,
-        connections: ConnectionRegistry,
-        next_conn_id: Arc<AtomicU64>,
-    ) -> tokio::task::JoinHandle<()> {
-        let start_time = std::time::Instant::now();
-        debug!(
-            "[SessionWorker::spawn] Starting SessionWorker creation, max_size={}",
-            max_size
-        );
-
-        let worker = SessionWorker {
-            max_size,
-            command_rx,
-            connections,
-            next_conn_id,
-        };
-
-        let spawn_start = std::time::Instant::now();
-        let handle = tokio::spawn(worker.run());
-        debug!(
-            "[SessionWorker::spawn] tokio::spawn took: {:?}",
-            spawn_start.elapsed()
-        );
-        debug!(
-            "[SessionWorker::spawn] Total spawn took: {:?}",
-            start_time.elapsed()
-        );
-
-        handle
-    }
-
-    async fn run(mut self) {
-        // ring buffer 存 (seq, message)：seq 是 session 级单调递增的序号，
-        // 供订阅方增量 replay 与去重（见 SessionCommand::ReplaySince）。
-        let (mut producer, mut consumer) =
-            HeapRb::<(u64, UnifiedSessionMessage)>::new(self.max_size).split();
-        let mut buffered_len = 0usize;
-        // session 级单调递增的消息序号。注意：Clear 命令清空 ring buffer 内容但【不重置】
-        // next_seq——否则新一轮 prompt 的 seq 从 1 重来，会与订阅方持有的 last_seq 撞车导致漏发。
-        let mut next_seq: u64 = 1;
-
-        while let Some(cmd) = self.command_rx.recv().await {
-            match cmd {
-                SessionCommand::Subscribe {
-                    buffer_size,
-                    from_seq,
-                    ack,
-                } => {
-                    // 原子 seam：此刻无并发 Push——快照与注册之间零窗口。
-                    let (tx, rx) = mpsc::channel(buffer_size);
-                    let token = CancellationToken::new();
-                    let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-                    self.connections.insert(
-                        conn_id,
-                        ConnectionState {
-                            sender: tx,
-                            cancel: token.clone(),
-                        },
-                    );
-                    // 超上限逐最旧（conn_id 单调，最小 id 即最早）
-                    while self.connections.len() > MAX_SUBSCRIBERS {
-                        let Some(oldest) = self
-                            .connections
-                            .iter()
-                            .min_by_key(|e| *e.key())
-                            .map(|e| *e.key())
-                        else {
-                            break;
-                        };
-                        if oldest == conn_id {
-                            break;
-                        }
-                        if let Some((_, evicted)) = self.connections.remove(&oldest) {
-                            evicted.cancel.cancel();
-                            warn!(
-                                "[SessionWorker] subscriber limit {MAX_SUBSCRIBERS} reached, evicted oldest conn {oldest}"
-                            );
-                        }
-                    }
-                    // 快照：注册完成后取——注册后新 Push 只走 sender，
-                    // 快照只含注册前的 ring 内容，两路无重叠无缺口。
-                    let snapshot: Vec<(u64, UnifiedSessionMessage)> = consumer
-                        .iter()
-                        .filter(|(s, _)| *s > from_seq)
-                        .cloned()
-                        .collect();
-                    debug!(
-                        "[SessionWorker] Subscribe: conn {conn_id}, from_seq={from_seq}, replay {} of {} buffered",
-                        snapshot.len(),
-                        consumer.occupied_len()
-                    );
-                    if ack
-                        .send(SubscribeResult {
-                            conn_id,
-                            replay_messages: snapshot,
-                            rx,
-                            token: token.clone(),
-                        })
-                        .is_err()
-                    {
-                        // 订阅者已放弃：回滚注册
-                        self.connections.remove(&conn_id);
-                        warn!(
-                            "[SessionWorker] subscriber gone before ack, rolled back conn {conn_id}"
-                        );
-                    }
-                }
-                SessionCommand::Push { message } => {
-                    debug!(
-                        "[SessionWorker] Push message: message_type={:?}, sub_type={}, data={}",
-                        message.message_type, message.sub_type, message.data
-                    );
-
-                    let should_buffer = !matches!(
-                        message.message_type,
-                        crate::model::SessionMessageType::Heartbeat
-                    );
-
-                    // 入 buffer 的消息分配 session 级单调 seq；Heartbeat 等不入 buffer 的消息用
-                    // seq=0（哨兵：订阅方据此跳过去重，不更新消费游标）。
-                    let seq = if should_buffer {
-                        let s = next_seq;
-                        next_seq += 1;
-                        s
-                    } else {
-                        0
-                    };
-
-                    if should_buffer {
-                        if producer.is_full() {
-                            drop(consumer.try_pop());
-                            buffered_len = buffered_len.saturating_sub(1);
-                        }
-                        if producer.try_push((seq, message.clone())).is_ok() {
-                            buffered_len += 1;
-                        } else {
-                            warn!("Ring buffer push failed; real-time delivery only");
-                        }
-                    }
-
-                    // 遍历全部订阅者投递；Closed 的连接在迭代结束后按 id 精确移除
-                    // （不在迭代中 remove——DashMap 迭代持 shard 锁，同 shard remove 会死锁）
-                    let mut closed_conns: Vec<u64> = Vec::new();
-                    for entry in self.connections.iter() {
-                        use tokio::sync::mpsc::error::TrySendError;
-                        if let Err(send_err) = entry.value().sender.try_send((seq, message.clone()))
-                        {
-                            match send_err {
-                                TrySendError::Full(_) => {
-                                    // buffer 满（客户端暂时慢）：不禁用 sender；ring buffer 已备份
-                                    warn!(
-                                        "SSE sender buffer full, message buffered: message_type={:?}, sub_type={}",
-                                        message.message_type, message.sub_type,
-                                    );
-                                }
-                                TrySendError::Closed(_) => {
-                                    // receiver 已断开：记录 id，迭代后移除（防重复失败刷日志）
-                                    closed_conns.push(*entry.key());
-                                    warn!(
-                                        "SSE subscriber {} receiver dropped, will remove: message_type={:?}, sub_type={}",
-                                        entry.key(),
-                                        message.message_type,
-                                        message.sub_type,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    for id in closed_conns {
-                        if let Some((_, conn)) = self.connections.remove(&id) {
-                            conn.cancel.cancel();
-                        }
-                    }
-                    if self.connections.is_empty() {
-                        // 无订阅者，跳过实时推送（消息已在 ring buffer 备份）
-                        info!(
-                            "SSE sender missing, skipping real-time delivery (message buffered in ring buffer): message_type={:?}, sub_type={}, data={}",
-                            message.message_type,
-                            message.sub_type,
-                            truncate_message_for_log(&message.data, MAX_LOG_TRUNCATE_LEN)
-                        );
-                    }
-
-                    // 终端即清（单消费者轮语义）：SessionPromptEnd 实时推送给在场订阅者后
-                    // 立即清空 ring——轮结束后连入的消费者不得 replay 到本轮消息。
-                    // 注：agent 异常退出的 SessionPromptError 在 Notify→Message 转换层
-                    // 已归一化为 SessionPromptEnd(sub_type="error")，此处天然覆盖异常路径。
-                    // （ring 缓存的职责收窄为"chat 发出→SSE 连上"的时间差缓冲。）
-                    if should_buffer
-                        && matches!(
-                            message.message_type,
-                            crate::model::SessionMessageType::SessionPromptEnd
-                        )
-                    {
-                        let mut cleared = 0usize;
-                        while consumer.try_pop().is_some() {
-                            cleared += 1;
-                        }
-                        buffered_len = 0;
-                        info!(
-                            "[SessionWorker] terminal event delivered, ring cleared immediately: cleared={cleared}"
-                        );
-                    }
-                }
-                SessionCommand::Clear { ack } => {
-                    // 仅清空 ring buffer 内容；next_seq 保持单调（见 run 开头注释），不随 clear 重置。
-                    // 轮间清理 = chat prepare（prompt 前清）+ 终端即清（SessionPromptEnd 后清）
-                    // 两点保证；cancel 在途的旧轮尾巴混入属毫秒级已知边界（不产生重复，
-                    // 前端按 messageId 聚合归入旧消息）。
-                    let mut cleared = 0usize;
-                    while consumer.try_pop().is_some() {
-                        cleared += 1;
-                    }
-                    buffered_len = 0;
-                    let _ = ack.send(cleared);
-                }
-                SessionCommand::MessageCount { ack } => {
-                    let _ = ack.send(buffered_len);
-                }
-                SessionCommand::ReplaySince { from_seq, ack } => {
-                    // 非破坏性读取：用 consumer.iter() 扫描，不 pop，ring buffer 内容与顺序不变。
-                    // 只返回 seq > from_seq 的消息（增量补齐），消除"已收过的消息被重放"的重复。
-                    let occupied = consumer.occupied_len();
-                    let snapshot: Vec<(u64, UnifiedSessionMessage)> = consumer
-                        .iter()
-                        .filter(|(s, _)| *s > from_seq)
-                        .cloned()
-                        .collect();
-                    debug!(
-                        "[SessionWorker] ReplaySince: from_seq={}, matched {} of {} buffered messages (non-destructive)",
-                        from_seq,
-                        snapshot.len(),
-                        occupied
-                    );
-                    if let Err(e) = ack.send(snapshot) {
-                        warn!("session_cache ack send failed (subscriber gone): {e:?}");
-                    }
-                }
-            }
-        }
-
-        debug!("[SessionWorker] stopped");
-    }
-}
-
-#[derive(Debug)]
-/// 订阅建立结果（Subscribe 命令的 ack 载荷）：
-/// replay 快照 + 实时接收端 + 连接标识/取消令牌。
-struct SubscribeResult {
-    conn_id: u64,
-    replay_messages: Vec<(u64, UnifiedSessionMessage)>,
-    rx: mpsc::Receiver<(u64, UnifiedSessionMessage)>,
-    token: CancellationToken,
-}
-
-enum SessionCommand {
-    Push {
-        message: UnifiedSessionMessage,
-    },
-    /// 原子化订阅：在 worker 单线程内完成「replay 快照 + sender 注册」——
-    /// Push 与 Subscribe 串行处理，消除"注册后、快照前"窗口内消息既进 ring
-    /// 又进 sender 的双路投递（gRPC 流重复 → rcoder ring 重复条目 →
-    /// 无游标重连时吐给客户端，即偶发的 4/492 重叠窗口重复根因）。
-    Subscribe {
-        buffer_size: usize,
-        from_seq: u64,
-        ack: oneshot::Sender<SubscribeResult>,
-    },
-    Clear {
-        ack: oneshot::Sender<usize>,
-    },
-    MessageCount {
-        ack: oneshot::Sender<usize>,
-    },
-    /// 增量 replay：只返回 ring buffer 中 seq > from_seq 的消息（非破坏性读取）。
-    ReplaySince {
-        from_seq: u64,
-        ack: oneshot::Sender<Vec<(u64, UnifiedSessionMessage)>>,
-    },
-}
-
-/// 便捷函数：添加SessionNotify消息（自动转换为统一格式）
-///
-/// 如果 SESSION_CACHE 中不存在该 session_id 的条目，会自动创建。
-/// 这解决了 Agent 开始推送消息时 SESSION_CACHE 条目尚未由 HTTP 处理器创建的竞态问题。
-pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()> {
-    use dashmap::mapref::entry::Entry;
-
-    // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
-    // 之前 .await 在 entry() 作用域内执行，持有 shard 写锁跨 yield point，
-    // 导致同 shard 的所有并发操作被阻塞（包括其他 session 的 push/get）。
-    //
-    // 修复策略：
-    // 1. 快速路径：get() + 检查（只持 shard 读锁，不在锁内 await）
-    // 2. 慢速路径：先在 entry() 外部 await 创建 SessionData，再原子插入
-
-    // 快速路径：session 存在 → 检查 worker 状态 → 推送
-    // view() 在闭包返回后立即释放锁，无 Ref 暴露
-    if let Some(existing) = SESSION_CACHE.view(session_id, |_, d| d.clone()) {
-        if existing.has_worker_panicked().await {
-            // Worker panic：在 entry() 外部创建新 SessionData
-            warn!(
-                "[push_session_update] SessionWorker panicked for session_id={}, recreating...",
-                session_id
-            );
-            let new_data = SessionData::new(1000).await;
-            // entry API 原子替换（语义更明确）
-            SESSION_CACHE
-                .entry(session_id.to_string())
-                .and_modify(|d| *d = new_data.clone())
-                .or_insert_with(|| new_data.clone());
-            new_data.push_message(notify.to_unified_message());
-        } else {
-            existing.push_message(notify.to_unified_message());
-        }
-        return Ok(());
-    }
-
-    // 慢速路径：session 不存在 → 在 entry() 外部 await 创建
-    let data = SessionData::new(1000).await;
-    info!(
-        "[push_session_update] SESSION_CACHE auto-created: session_id={}",
-        session_id
-    );
-
-    // 原子插入（如果其他任务先创建了，则使用现有的）
-    let session_data = match SESSION_CACHE.entry(session_id.to_string()) {
-        Entry::Occupied(entry) => entry.get().clone(),
-        Entry::Vacant(entry) => {
-            entry.insert(data.clone());
-            data
-        }
-    };
-
-    session_data.push_message(notify.to_unified_message());
-    Ok(())
-}
-
 /// 便捷函数：添加SessionNotify消息并管理Project-Session映射
 ///
 /// 这个函数会自动确保project_id只对应一个活跃的session_id
@@ -882,360 +530,66 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::SessionMessageType;
-    use chrono::Utc;
+/// 便捷函数：添加SessionNotify消息（自动转换为统一格式）
+///
+/// 如果 SESSION_CACHE 中不存在该 session_id 的条目，会自动创建。
+/// 这解决了 Agent 开始推送消息时 SESSION_CACHE 条目尚未由 HTTP 处理器创建的竞态问题。
+pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()> {
+    use dashmap::mapref::entry::Entry;
 
-    fn make_msg(sub_type: &str) -> UnifiedSessionMessage {
-        UnifiedSessionMessage {
-            session_id: "test-session".to_string(),
-            message_type: SessionMessageType::AgentSessionUpdate,
-            sub_type: sub_type.to_string(),
-            data: serde_json::json!({}),
-            timestamp: Utc::now(),
-        }
-    }
+    // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
+    // 之前 .await 在 entry() 作用域内执行，持有 shard 写锁跨 yield point，
+    // 导致同 shard 的所有并发操作被阻塞（包括其他 session 的 push/get）。
+    //
+    // 修复策略：
+    // 1. 快速路径：get() + 检查（只持 shard 读锁，不在锁内 await）
+    // 2. 慢速路径：先在 entry() 外部 await 创建 SessionData，再原子插入
 
-    /// 🔒 竞态修复锁定：并发 push 期间建立订阅，输出（replay + 实时）不得有重复 seq。
-    /// 修复前 create_new_connection「先注册 sender 后取 ring 快照」的窗口内，
-    /// worker 的 Push 会既写 ring（被快照捕获）又 try_send 给 sender（实时），
-    /// 同一 seq 双路到达（gRPC 流重复的根因）；修复后快照+注册在 worker 单线程
-    /// 内原子完成（SessionCommand::Subscribe）。
-    #[tokio::test]
-    async fn subscribe_never_duplicates_under_concurrent_push() {
-        let sd = SessionData::new(4096).await;
-
-        let pusher = {
-            let sd = sd.clone();
-            tokio::spawn(async move {
-                for i in 0..2000u64 {
-                    sd.push_message(make_msg(&format!("m{i}")));
-                    if i % 100 == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                }
-            })
-        };
-
-        for _round in 0..40 {
-            let (conn_id, replay, mut rx, token) =
-                sd.create_new_connection(64, 0).await.expect("subscribe");
-            let mut seqs: Vec<u64> = replay.iter().map(|(s, _)| *s).collect();
-            // 收一小段实时（50ms 窗口）
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), async {
-                while let Some((s, _)) = rx.recv().await {
-                    seqs.push(s);
-                }
-            })
-            .await;
-            token.cancel();
-            sd.close_connection(conn_id);
-
-            let mut sorted = seqs.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            assert_eq!(
-                sorted.len(),
-                seqs.len(),
-                "duplicate seq in subscription output (round {_round}): {:?}",
-                seqs.iter()
-                    .fold(Vec::new(), |mut acc: Vec<u64>, s| {
-                        if acc.last() != Some(s) {
-                            acc.push(*s);
-                        }
-                        acc
-                    })
-                    .len()
+    // 快速路径：session 存在 → 检查 worker 状态 → 推送
+    // view() 在闭包返回后立即释放锁，无 Ref 暴露
+    if let Some(existing) = SESSION_CACHE.view(session_id, |_, d| d.clone()) {
+        if existing.has_worker_panicked().await {
+            // Worker panic：在 entry() 外部创建新 SessionData
+            warn!(
+                "[push_session_update] SessionWorker panicked for session_id={}, recreating...",
+                session_id
             );
+            let new_data = SessionData::new(1000).await;
+            // entry API 原子替换（语义更明确）
+            SESSION_CACHE
+                .entry(session_id.to_string())
+                .and_modify(|d| *d = new_data.clone())
+                .or_insert_with(|| new_data.clone());
+            new_data.push_message(notify.to_unified_message());
+        } else {
+            existing.push_message(notify.to_unified_message());
         }
-        pusher.await.expect("pusher");
+        return Ok(());
     }
 
-    #[tokio::test]
-    async fn replay_since_returns_only_messages_after_from_seq() {
-        let sd = SessionData::new(64).await;
-        sd.push_message(make_msg("a")); // seq 1
-        sd.push_message(make_msg("b")); // seq 2
-        sd.push_message(make_msg("c")); // seq 3
+    // 慢速路径：session 不存在 → 在 entry() 外部 await 创建
+    let data = SessionData::new(1000).await;
+    info!(
+        "[push_session_update] SESSION_CACHE auto-created: session_id={}",
+        session_id
+    );
 
-        let got: Vec<u64> = sd
-            .replay_since(1)
-            .await
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        assert_eq!(got, vec![2, 3], "replay_since(1) must return only seq>1");
-    }
-
-    #[tokio::test]
-    async fn prompt_error_flows_as_terminal_and_clears_ring() {
-        // agent 异常退出链路锁定：notify_prompt_error 的 SessionPromptError 在
-        // Notify→Message 转换层归一化为 SessionPromptEnd(sub_type="error")——
-        // 终端即清必须覆盖异常路径（防回归：改转换映射会破坏此覆盖，测试会红）。
-        let sid = "test-err-terminal";
-        let sd = SessionData::new(64).await;
-        SESSION_CACHE.insert(sid.to_string(), sd.clone());
-        sd.push_message(make_msg("half_output_1")); // 异常前的半截输出
-        sd.push_message(make_msg("half_output_2"));
-
-        let notify = SessionNotify::SessionPromptError(shared_types::SessionPromptError {
-            session_id: sid.to_string(),
-            error: agent_client_protocol::Error::new(-32603, "agent exited abnormally"),
-            request_id: None,
-        });
-        push_session_update_with_project("proj-err", sid, notify)
-            .await
-            .expect("push error notify");
-
-        let got: Vec<u64> = sd
-            .replay_since(0)
-            .await
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        assert!(
-            got.is_empty(),
-            "ring must be empty after agent-abnormal-exit error notify, got {got:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_event_clears_ring_immediately() {
-        let sd = SessionData::new(64).await;
-        sd.push_message(make_msg("a")); // seq 1
-        sd.push_message(make_msg("b")); // seq 2
-        let mut end = make_msg("end");
-        end.message_type = SessionMessageType::SessionPromptEnd;
-        sd.push_message(end); // 终端：推送后 ring 立即清空
-
-        let got: Vec<u64> = sd
-            .replay_since(0)
-            .await
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        assert!(
-            got.is_empty(),
-            "ring must be empty right after terminal event, got {got:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn seq_keeps_monotonic_across_clear() {
-        let sd = SessionData::new(64).await;
-        sd.push_message(make_msg("a")); // seq 1
-        sd.push_message(make_msg("b")); // seq 2
-        let cleared = sd.clear_message_buffer().await;
-        assert_eq!(cleared, 2);
-        sd.push_message(make_msg("c")); // seq 必须为 3（不随 clear 重置）
-
-        let got: Vec<u64> = sd
-            .replay_since(0)
-            .await
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        assert_eq!(got, vec![3], "seq must remain monotonic after clear");
-    }
-
-    #[tokio::test]
-    async fn replay_since_is_non_destructive() {
-        let sd = SessionData::new(64).await;
-        sd.push_message(make_msg("a"));
-        sd.push_message(make_msg("b"));
-
-        let first: Vec<u64> = sd
-            .replay_since(0)
-            .await
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        let second: Vec<u64> = sd
-            .replay_since(0)
-            .await
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        assert_eq!(first, second);
-        assert_eq!(first, vec![1, 2], "replay must not drain the buffer");
-    }
-
-    fn make_heartbeat() -> UnifiedSessionMessage {
-        UnifiedSessionMessage {
-            session_id: "test-session".to_string(),
-            message_type: SessionMessageType::Heartbeat,
-            sub_type: "ping".to_string(),
-            data: serde_json::json!({}),
-            timestamp: Utc::now(),
+    // 原子插入（如果其他任务先创建了，则使用现有的）
+    let session_data = match SESSION_CACHE.entry(session_id.to_string()) {
+        Entry::Occupied(entry) => entry.get().clone(),
+        Entry::Vacant(entry) => {
+            entry.insert(data.clone());
+            data
         }
-    }
+    };
 
-    #[tokio::test]
-    async fn heartbeat_not_buffered_and_does_not_advance_seq() {
-        let sd = SessionData::new(64).await;
-        sd.push_message(make_heartbeat()); // Heartbeat：不入 ring，seq=0，不递增 next_seq
-        sd.push_message(make_msg("a")); // seq 1
-        sd.push_message(make_heartbeat());
-        sd.push_message(make_msg("b")); // seq 2（Heartbeat 不占 seq 号）
-
-        let got: Vec<u64> = sd
-            .replay_since(0)
-            .await
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        assert_eq!(
-            got,
-            vec![1, 2],
-            "Heartbeat must not be buffered; seq must skip it"
-        );
-    }
-
-    #[tokio::test]
-    async fn ring_overflow_drops_oldest_and_keeps_seq_contiguous() {
-        let sd = SessionData::new(3).await; // 容量 3
-        sd.push_message(make_msg("a")); // seq 1
-        sd.push_message(make_msg("b")); // seq 2
-        sd.push_message(make_msg("c")); // seq 3
-        sd.push_message(make_msg("d")); // seq 4，挤掉 seq1
-        sd.push_message(make_msg("e")); // seq 5，挤掉 seq2
-
-        let got: Vec<u64> = sd
-            .replay_since(0)
-            .await
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        assert_eq!(
-            got,
-            vec![3, 4, 5],
-            "ring overflow drops oldest, seq stays contiguous"
-        );
-    }
-
-    /// P2-M2：多订阅者并存——新订阅不再 cancel 旧流（多端同看/多副本共享流的根修）；
-    /// close_connection 只关指定订阅者；close_all_connections 关全部。
-    #[tokio::test]
-    async fn multi_subscriber_coexistence_and_selective_close() {
-        let session = SessionData::new(8).await;
-        let (first_id, _first_replay, mut first_rx, first_cancel) = session
-            .create_new_connection(8, 0)
-            .await
-            .expect("first connection");
-        let (_second_id, _second_replay, mut second_rx, second_cancel) = session
-            .create_new_connection(8, 0)
-            .await
-            .expect("second connection");
-
-        // 旧语义：新订阅 cancel 旧流。新语义：两者并存
-        assert!(
-            !first_cancel.is_cancelled(),
-            "new subscriber must NOT cancel existing stream"
-        );
-        assert!(!second_cancel.is_cancelled());
-
-        // 两个订阅者都收到实时消息
-        session.push_message(make_msg("m1"));
-        assert_eq!(
-            first_rx.recv().await.expect("first receives").1.sub_type,
-            "m1"
-        );
-        assert_eq!(
-            second_rx.recv().await.expect("second receives").1.sub_type,
-            "m1"
-        );
-
-        // 关闭第一个：只影响自己
-        session.close_connection(first_id);
-        assert!(first_cancel.is_cancelled());
-        assert!(
-            first_rx.recv().await.is_none(),
-            "closed subscriber sender must be dropped"
-        );
-        assert!(!second_cancel.is_cancelled(), "peer subscriber unaffected");
-        session.push_message(make_msg("m2"));
-        assert_eq!(
-            second_rx
-                .recv()
-                .await
-                .expect("second still live")
-                .1
-                .sub_type,
-            "m2"
-        );
-
-        // close_all：清场语义（任务取消/会话停止）
-        session.close_all_connections();
-        assert!(second_cancel.is_cancelled());
-        assert!(second_rx.recv().await.is_none());
-    }
-
-    /// P2-M2：订阅者上限——超过 MAX_SUBSCRIBERS 逐最旧
-    #[tokio::test]
-    async fn subscriber_limit_evicts_oldest() {
-        let session = SessionData::new(8).await;
-        let mut first_cancel = None;
-        for i in 0..=(MAX_SUBSCRIBERS as u64) {
-            let (_id, _replay, _rx, cancel) = session
-                .create_new_connection(8, 0)
-                .await
-                .expect("connection {i}");
-            if i == 0 {
-                first_cancel = Some(cancel);
-            }
-        }
-        assert!(
-            first_cancel.expect("saved").is_cancelled(),
-            "oldest subscriber evicted at limit"
-        );
-        // 数量封顶
-        assert_eq!(session.connections_len(), MAX_SUBSCRIBERS);
-    }
-
-    fn make_agent_info(project_id: &str, session_id: &str) -> shared_types::ProjectAndAgentInfo {
-        use std::sync::Arc;
-        use tokio::sync::mpsc;
-        shared_types::ProjectAndAgentInfo {
-            project_id: project_id.to_string(),
-            session_id: agent_client_protocol::schema::v1::SessionId::new(Arc::from(session_id)),
-            prompt_tx: mpsc::channel(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY).0,
-            cancel_tx: mpsc::channel(shared_types::AGENT_CANCEL_CHANNEL_CAPACITY).0,
-            model_provider: None,
-            request_id: None,
-            status: shared_types::AgentStatus::Idle,
-            last_activity: Utc::now(),
-            created_at: Utc::now(),
-            stop_handle: None,
-            agent_binary_snapshot: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn ensure_project_session_ignores_stale_session_id() {
-        // C-slim 回归保护：agent 用过期/陌生 sessionId 推消息时，
-        // 不得反向改写 project 映射、不得 cancel 当前正在工作的真实 SSE。
-        let project = "cslim_stale_proj";
-        let real_sid = "ses_real_active";
-        let stale_sid = "753cf1fd-stale-not-registered";
-
-        let registry = &AGENT_REGISTRY;
-        registry.remove_by_project(project); // 幂等清理残留
-        registry.register(project, real_sid, make_agent_info(project, real_sid));
-
-        // stale_sid 从未注册 → get_project_by_session(stale_sid)=None → 只 buffer，返回 0
-        let cleared = ensure_project_session(project, stale_sid).await;
-        assert_eq!(
-            cleared, 0,
-            "stale sid must be ignored (buffer-only, no migration)"
-        );
-        assert_eq!(
-            registry.get_session_by_project(project).as_deref(),
-            Some(real_sid),
-            "active session mapping must NOT be overwritten by a stale sid"
-        );
-
-        registry.remove_by_project(project);
-    }
+    session_data.push_message(notify.to_unified_message());
+    Ok(())
 }
+
+#[cfg(test)]
+mod tests;
+mod worker;
+
+use worker::SessionCommand;
+pub(crate) use worker::SessionWorker;

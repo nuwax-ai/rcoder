@@ -17,15 +17,14 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer};
-use shared_types::grpc::{GetStatusRequest, ProgressEvent, ProgressRequest};
+use shared_types::grpc::ProgressEvent;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::Code;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::GrpcChannelPool;
-use super::new_request_with_locale;
 use crate::handler::utils::{DiagCtx, diagnose, root_cause_message};
 
 /// broadcast 每个 receiver 的缓冲（高频 agent_message_chunk 时给慢消费者足够窗口）
@@ -455,202 +454,6 @@ impl Drop for ClientGuard {
     }
 }
 
-/// 启动后台 gRPC 接收 task（一条 agent_runner SubscribeProgress 流）。
-///
-/// 流程：get_client → get_status(idle 检查) → subscribe_progress(from_seq=last_seq)
-/// → 收事件 dispatch。流断/出错重试（max_retries），彻底失败则 broadcast 错误事件后退出。
-fn spawn_backend_task(
-    shared: Arc<SharedStream>,
-    grpc_addr: String,
-    pool: Arc<GrpcChannelPool>,
-    locale: &'static str,
-    activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let session_id = shared.session_id.clone();
-        let cancel = shared.cancel_token.clone();
-        drop(activity_updater); // activity 已通过 dispatch_event 内部节流调用
-
-        for attempt in 1..=MAX_RETRIES {
-            if cancel.is_cancelled() {
-                return;
-            }
-            // 1. 从连接池获取客户端
-            let mut client = match pool.get_client(&grpc_addr).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        "[SessionStream] get_client failed (attempt {}/{}): {}",
-                        attempt, MAX_RETRIES, e
-                    );
-                    pool.remove(&grpc_addr).await;
-                    if attempt < MAX_RETRIES {
-                        continue;
-                    }
-                    // 重试耗尽:必须发终态错误事件,否则 SharedStream 持 sender 不 Closed,
-                    // 已连上的 HTTP SSE 客户端会永久 hang 在 recv()。错误文案用【当前】失败(#16a)。
-                    let err_ev = make_terminal_error_event(shared.diag_ctx.as_ref(), locale).await;
-                    // dispatch_event：broadcast + 终端清 ring（故障路径的半轮残留不得跨轮）
-                    shared.dispatch_event(Arc::new(err_ev));
-                    return;
-                }
-            };
-
-            // 2. get_status idle 检查（保留与旧 sse_stream 一致的语义）
-            let status_req = new_request_with_locale(
-                GetStatusRequest {
-                    project_id: String::new(),
-                    session_id: session_id.clone(),
-                },
-                locale,
-            );
-            match client.get_status(status_req).await {
-                Ok(resp) => {
-                    let inner = resp.into_inner();
-                    info!(
-                        "[SessionStream] GetStatus: status={}, is_found={}, session_id={}",
-                        inner.status, inner.is_found, session_id
-                    );
-                    if inner.is_found && inner.status == "idle" {
-                        // 不再合成 SessionPromptEnd 断流——实测竞态：chat 发出后立即订阅
-                        // SSE（前端标准时序），agent 的 busy 状态翻转滞后于 prompt 传递，
-                        // 误判 idle 会杀掉整轮流（prompt_start/chunks 全部收不到）。
-                        // idle 的真实代价只是流挂着收 keep-alive，由 IDLE_CLEANUP_SECS
-                        // (30s) 兜底清理；真 turn 结束时终端事件会正常广播。
-                        info!(
-                            "[SessionStream] agent idle at subscribe time, proceeding to subscribe (chat→SSE race tolerated): session_id={}",
-                            session_id
-                        );
-                    }
-                    // epoch 比较(#15):同 epoch → 保留 last_seq(增量订阅);
-                    // epoch 变化(agent 重启/worker panic 重建)→ 重置 last_seq + 清 ring + cursor-reset
-                    if let Some(ref new_epoch) = inner.stream_epoch {
-                        let changed = {
-                            let mut guard = shared.epoch.lock();
-                            match &*guard {
-                                None => {
-                                    *guard = Some(new_epoch.clone());
-                                    false
-                                }
-                                Some(old) if old == new_epoch => false,
-                                Some(_) => {
-                                    *guard = Some(new_epoch.clone());
-                                    true
-                                }
-                            }
-                        };
-                        if changed {
-                            warn!(
-                                "[SessionStream] epoch changed → reset last_seq + clear ring + cursor-reset: session_id={}",
-                                session_id
-                            );
-                            shared.last_seq.store(0, Ordering::Release);
-                            shared.clear_ring();
-                            // cursor-reset 哨兵同时进 ring + broadcast：ring 让断线重连客户端
-                            // 经 replay_since 收到它（broadcast 只投递订阅后的消息，重连客户端收不到）。
-                            let reset_ev = Arc::new(make_cursor_reset_event());
-                            shared.push_reset_to_ring(Arc::clone(&reset_ev));
-                            if let Err(send_err) = shared.broadcast_tx.send(reset_ev) {
-                                warn!(
-                                    "[SessionStream] broadcast send failed (no subscriber): {send_err}"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "[SessionStream] get_status failed, continue to subscribe: {}",
-                        e
-                    );
-                }
-            }
-
-            // 3. subscribe_progress，from_seq = last_seq（增量订阅）
-            let from_seq = shared.last_seq.load(Ordering::Acquire);
-            let req = new_request_with_locale(
-                ProgressRequest {
-                    session_id: session_id.clone(),
-                    from_seq: Some(from_seq),
-                },
-                locale,
-            );
-            match client.subscribe_progress(req).await {
-                Ok(resp) => {
-                    info!(
-                        "[SessionStream] SubscribeProgress established: session_id={}, from_seq={}",
-                        session_id, from_seq
-                    );
-                    let mut stream = resp.into_inner();
-                    loop {
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                info!("[SessionStream] cancelled, stopping: session_id={}", session_id);
-                                return;
-                            }
-                            msg = stream.message() => match msg {
-                                Ok(Some(ev)) => {
-                                    debug!(
-                                        "[SessionStream] event: session_id={}, seq={}, type={}, sub={}",
-                                        session_id, ev.seq, ev.message_type, ev.sub_type
-                                    );
-                                    shared.dispatch_event(Arc::new(ev));
-                                }
-                                Ok(None) => {
-                                    info!(
-                                        "[SessionStream] agent_runner stream ended normally: session_id={}",
-                                        session_id
-                                    );
-                                    // 兜底：若 agent_runner 未推 SessionPromptEnd 就关流，客户端转发 task 会 hang
-                                    // （broadcast 不会 Closed，因 SharedStream 持有 sender）。补一个 terminal 事件唤醒退出。
-                                    // 走 dispatch_event：agent 侧终端即清可能因流断没送达，ring 里的半轮
-                                    // 由这里统一清（终端 seq=0 → dispatch 只 broadcast+清 ring，不污染游标）。
-                                    shared.dispatch_event(Arc::new(make_prompt_end_event()));
-                                    return;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "[SessionStream] stream error: session_id={}, code={}, msg={}",
-                                        session_id, e.code(), e.message()
-                                    );
-                                    // 有 epoch 时:不在此重置 last_seq(下次 GetStatus epoch 比较决定,#15)。
-                                    // 无 epoch(旧 agent_runner 不发 stream_epoch)→ 保留旧行为:重置 last_seq=0
-                                    // 兜底重启(全量 replay 有重复但不丢数据;新 agent_runner 有 epoch 时由比较决定)。
-                                    if shared.epoch.lock().is_none() {
-                                        shared.last_seq.store(0, Ordering::Release);
-                                    }
-                                    if attempt < MAX_RETRIES {
-                                        pool.remove(&grpc_addr).await;
-                                        break; // 内层 loop 退出，外层重试
-                                    }
-                                    let err_ev = make_stream_error_event(e.code(), e.message());
-                                    shared.dispatch_event(Arc::new(err_ev));
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "[SessionStream] subscribe_progress failed (attempt {}/{}): {}",
-                        attempt, MAX_RETRIES, e
-                    );
-                    if attempt < MAX_RETRIES {
-                        pool.remove(&grpc_addr).await;
-                        continue;
-                    }
-                    // 终态事件报告【当前】阶段错误,不用累积的过期错误(#16a)。
-                    let err_ev = make_terminal_error_event(shared.diag_ctx.as_ref(), locale).await;
-                    // dispatch_event：broadcast + 终端清 ring（故障路径的半轮残留不得跨轮）
-                    shared.dispatch_event(Arc::new(err_ev));
-                    return;
-                }
-            }
-        }
-    })
-}
-
 /// 节流刷新 session 活跃时间（防 idle cleaner 误杀；与 sse_stream 语义一致）。
 fn maybe_update_activity(
     updater: &Arc<dyn Fn(&str) + Send + Sync>,
@@ -676,7 +479,7 @@ fn now_millis() -> i64 {
 }
 
 /// agent idle 时的 SessionPromptEnd 事件（seq=0 合成消息，客户端无条件转发）
-fn make_prompt_end_event() -> ProgressEvent {
+pub(crate) fn make_prompt_end_event() -> ProgressEvent {
     ProgressEvent {
         message_type: "SessionPromptEnd".to_string(),
         sub_type: "end_turn".to_string(),
@@ -689,7 +492,7 @@ fn make_prompt_end_event() -> ProgressEvent {
 }
 
 /// agent_runner 流传输中出错（seq=0 合成消息）
-fn make_stream_error_event(code: Code, _message: &str) -> ProgressEvent {
+pub(crate) fn make_stream_error_event(code: Code, _message: &str) -> ProgressEvent {
     let error_code = map_tonic_code(code);
     // 用 serde_json 构造,避免 format! 拼接产生非法 JSON(error_code 虽为静态串,
     // 统一走安全路径以便未来扩展)。
@@ -715,7 +518,10 @@ fn make_stream_error_event(code: Code, _message: &str) -> ProgressEvent {
 /// 容器缺失/启动中),给精准根因文案(与 chat 路径共用 [`root_cause_message`],两路一致);
 /// 无 DiagCtx(测试 / 无 runtime)→ 通用"Compute environment temporarily unavailable"。
 /// 错误码统一 [`ERR_AGENT_CONTAINER_UNAVAILABLE`](前端可据码退避重试)。
-async fn make_terminal_error_event(diag: Option<&Arc<DiagCtx>>, locale: &str) -> ProgressEvent {
+pub(crate) async fn make_terminal_error_event(
+    diag: Option<&Arc<DiagCtx>>,
+    locale: &str,
+) -> ProgressEvent {
     let code = shared_types::error_codes::ERR_AGENT_CONTAINER_UNAVAILABLE;
     let message = match diag {
         // 实时诊断根因 → 精准文案。诊断本身失败不阻断:diagnose() 内部已兜底默认诊断
@@ -744,7 +550,7 @@ async fn make_terminal_error_event(diag: Option<&Arc<DiagCtx>>, locale: &str) ->
 
 /// epoch 变化时的 cursor-reset 哨兵(seq=0):告知客户端重置去重游标(client_last_seq=0),
 /// 让新 epoch 的低 seq 事件不被静默丢弃(#15)。非终态(message_type≠SessionPromptEnd,不关流)。
-fn make_cursor_reset_event() -> ProgressEvent {
+pub(crate) fn make_cursor_reset_event() -> ProgressEvent {
     ProgressEvent {
         message_type: "StreamReset".to_string(),
         sub_type: "epoch_changed".to_string(),
@@ -759,7 +565,7 @@ fn make_cursor_reset_event() -> ProgressEvent {
     }
 }
 
-fn map_tonic_code(code: Code) -> &'static str {
+pub(crate) fn map_tonic_code(code: Code) -> &'static str {
     match code {
         Code::Unavailable => "GRPC_SERVICE_UNAVAILABLE",
         Code::Cancelled => "GRPC_CANCELLED",
@@ -769,390 +575,8 @@ fn map_tonic_code(code: Code) -> &'static str {
     }
 }
 
+mod backend_task;
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ringbuf::traits::{Consumer, Producer};
+mod tests;
 
-    #[test]
-    fn replay_since_filters_by_seq() {
-        // 构造一个 SharedStream 的 ring 直接测试 replay_since 逻辑
-        let mut ring: HeapRb<(u64, SharedEvent)> = HeapRb::new(10);
-        for seq in 1..=5 {
-            let ev = Arc::new(ProgressEvent {
-                message_type: "AgentSessionUpdate".into(),
-                sub_type: "test".into(),
-                payload: "{}".into(),
-                request_id: None,
-                seq,
-                timestamp: seq as i64,
-            });
-            drop(ring.try_push((seq, ev)));
-        }
-        let ring = Mutex::new(ring);
-        let got: Vec<u64> = ring
-            .lock()
-            .iter()
-            .filter(|(s, _)| *s > 3)
-            .map(|(s, _)| *s)
-            .collect();
-        assert_eq!(got, vec![4, 5]);
-    }
-
-    #[test]
-    fn replay_since_is_non_destructive() {
-        let mut ring: HeapRb<(u64, SharedEvent)> = HeapRb::new(10);
-        for seq in 1..=3 {
-            drop(ring.try_push((
-                seq,
-                Arc::new(ProgressEvent {
-                    message_type: "X".into(),
-                    sub_type: "y".into(),
-                    payload: "{}".into(),
-                    request_id: None,
-                    seq,
-                    timestamp: 0,
-                }),
-            )));
-        }
-        let ring = Mutex::new(ring);
-        let first: Vec<u64> = ring.lock().iter().map(|(s, _)| *s).collect();
-        let second: Vec<u64> = ring.lock().iter().map(|(s, _)| *s).collect();
-        assert_eq!(first, second, "iter must be non-destructive");
-        assert_eq!(first, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn registry_default_is_empty() {
-        let r = SessionStreamRegistry::default();
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn create_lock_is_removed_only_without_active_holders() {
-        let registry = SessionStreamRegistry::default();
-        let held = registry
-            .create_locks
-            .entry("session-a".to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-
-        registry.remove_unused_create_lock("session-a");
-        assert!(registry.create_locks.contains_key("session-a"));
-
-        drop(held);
-        registry.remove_unused_create_lock("session-a");
-        assert!(!registry.create_locks.contains_key("session-a"));
-    }
-
-    #[tokio::test]
-    async fn removing_matching_stream_cancels_its_backend_task() {
-        let registry = SessionStreamRegistry::default();
-        let shared = SharedStream::new(
-            "session-a".into(),
-            "127.0.0.1:1".into(),
-            Arc::new(GrpcChannelPool::new()),
-            "en",
-            Arc::new(|_| {}),
-            None,
-        )
-        .await;
-        registry
-            .streams
-            .insert("session-a".into(), Arc::clone(&shared));
-
-        assert!(!shared.cancel_token.is_cancelled());
-        assert!(registry.remove_and_shutdown("session-a", &shared));
-        assert!(shared.cancel_token.is_cancelled());
-        assert!(!registry.streams.contains_key("session-a"));
-    }
-
-    fn arc_event(seq: u64, sub: &str) -> Arc<ProgressEvent> {
-        Arc::new(ProgressEvent {
-            message_type: "AgentSessionUpdate".into(),
-            sub_type: sub.into(),
-            payload: "{}".into(),
-            request_id: None,
-            seq,
-            timestamp: 0,
-        })
-    }
-
-    fn terminal_event(seq: u64) -> Arc<ProgressEvent> {
-        Arc::new(ProgressEvent {
-            message_type: "SessionPromptEnd".into(),
-            sub_type: "end_turn".into(),
-            payload: "{}".into(),
-            request_id: None,
-            seq,
-            timestamp: 0,
-        })
-    }
-
-    /// 🔚 turn 边界语义：终端事件（SessionPromptEnd）广播后清空 ring——
-    /// 修复"换模型后第二轮对话 SSE 重放上一轮消息"。last_seq 保持单调
-    /// （后台流重连 from_seq=last_seq 不回放旧消息的依据）。
-    #[tokio::test]
-    async fn terminal_event_clears_ring_for_next_turn() {
-        let shared = SharedStream::new(
-            "s1".into(),
-            "127.0.0.1:1".into(),
-            Arc::new(GrpcChannelPool::new()),
-            "en",
-            Arc::new(|_| {}),
-            None,
-        )
-        .await;
-
-        // 第一轮：seq 1..3 + 终端事件 seq 4
-        shared.dispatch_event(arc_event(1, "turn1-a"));
-        shared.dispatch_event(arc_event(2, "turn1-b"));
-        shared.dispatch_event(arc_event(3, "turn1-c"));
-        shared.dispatch_event(terminal_event(4));
-
-        // 终端后 ring 已清：新客户端（last_seq=0，换模型重连的典型形态）重放为空
-        assert!(
-            shared.replay_since(0).is_empty(),
-            "ring must be cleared after terminal event"
-        );
-        // last_seq 保持单调（防后台流重连回放）
-        assert_eq!(shared.last_seq(), 4, "last_seq must stay monotonic");
-
-        // 第二轮：seq 5 起，重放只含新消息
-        shared.dispatch_event(arc_event(5, "turn2-a"));
-        let got: Vec<u64> = shared
-            .replay_since(0)
-            .into_iter()
-            .map(|ev| ev.seq)
-            .collect();
-        assert_eq!(got, vec![5], "next turn replay contains only new events");
-    }
-
-    /// 🔚 合成终端（seq=0，流断/故障路径的兜底 End/error）同样清 ring——
-    /// 本次修复锁定：agent 侧终端即清可能因 gRPC 断流没送达 rcoder，rcoder 的
-    /// 合成终端兜底若只 broadcast 不清 ring，半轮残留会留给下一个客户端。
-    #[tokio::test]
-    async fn synthetic_terminal_event_clears_ring() {
-        let shared = SharedStream::new(
-            "s-syn".into(),
-            "127.0.0.1:1".into(),
-            Arc::new(GrpcChannelPool::new()),
-            "en",
-            Arc::new(|_| {}),
-            None,
-        )
-        .await;
-
-        // 半轮写入（模拟流断时 ring 已积累的内容）
-        shared.dispatch_event(arc_event(1, "half-a"));
-        shared.dispatch_event(arc_event(2, "half-b"));
-
-        // 合成终端（seq=0）：只 broadcast + 清 ring，不写 ring 不动 last_seq
-        shared.dispatch_event(Arc::new(make_prompt_end_event()));
-
-        assert!(
-            shared.replay_since(0).is_empty(),
-            "synthetic terminal must clear ring (half-turn residue forbidden)"
-        );
-        assert_eq!(
-            shared.last_seq(),
-            2,
-            "seq=0 synthetic terminal must not touch last_seq"
-        );
-    }
-
-    /// 🔍 边界审查：epoch 哨兵（seq=0 StreamReset）确实会被终端 clear 从 ring 清掉。
-    ///
-    /// **结论：不构成真实缺陷**。终端（SessionPromptEnd）后 agent_runner 关流 →
-    /// rcoder 后台 task return（自然死亡）→ SharedStream 成为僵尸（is_alive=false）。
-    /// 下一个客户端连接时 get_or_create 的 is_alive 检测发现僵尸 → 移除并创建**全新**
-    /// SharedStream（last_seq=0 + 新后台 task + 独立 epoch 比较）——被清掉的 ring
-    /// 无人读取。此测试固化该事实作为防回归证据。
-    #[tokio::test]
-    async fn terminal_clear_loses_sentinel_but_zombie_replaces_stream() {
-        let shared = SharedStream::new(
-            "s1".into(),
-            "127.0.0.1:1".into(),
-            Arc::new(GrpcChannelPool::new()),
-            "en",
-            Arc::new(|_| {}),
-            None,
-        )
-        .await;
-
-        // 模拟 #15 epoch 变更：后台 task 的处理是 clear_ring + push 哨兵 + last_seq=0
-        shared.last_seq.store(0, Ordering::Release);
-        shared.clear_ring();
-        let reset = Arc::new(make_cursor_reset_event());
-        shared.push_reset_to_ring(Arc::clone(&reset));
-
-        // 新 epoch turn 运行并终结
-        shared.dispatch_event(arc_event(1, "new-epoch-msg"));
-        shared.dispatch_event(terminal_event(2));
-
-        // 事实：哨兵被清。但此 ring 属于僵尸流（后台 task 已 return）——
-        // get_or_create 的 is_alive 检测会替换为全新流，此 ring 无人读取
-        assert!(
-            !shared
-                .replay_since(50)
-                .iter()
-                .any(|ev| ev.message_type == "StreamReset"),
-            "sentinel IS cleared from zombie ring (documented fact)"
-        );
-        // 注：is_alive 断言不适用于测试环境（后台 task 连接假地址处于重试中，
-        // 不会因 dispatch_event 中的终端事件而退出——生产中终端来自 gRPC 流，
-        // 流关闭后 Ok(None) → return → task 自然死亡 → 僵尸 → get_or_create 替换）
-    }
-
-    /// SharedStream::new 会 spawn 后台 gRPC task（连 127.0.0.1:1 必失败，但不影响 dispatch_event
-    /// —— 该方法只操作 ring/last_seq/broadcast，不依赖 gRPC）。测试结束 runtime drop 会 cancel task。
-    #[tokio::test]
-    async fn dispatch_event_buffers_real_events_skips_synthetic() {
-        let shared = SharedStream::new(
-            "s1".into(),
-            "127.0.0.1:1".into(),
-            Arc::new(GrpcChannelPool::new()),
-            "en",
-            Arc::new(|_| {}),
-            None,
-        )
-        .await;
-
-        shared.dispatch_event(arc_event(1, "m1"));
-        shared.dispatch_event(arc_event(2, "m2"));
-        shared.dispatch_event(arc_event(0, "synthetic")); // seq=0 合成消息：不入 ring、不更新 last_seq
-
-        assert_eq!(shared.last_seq(), 2, "seq=0 must not update last_seq");
-        let got: Vec<u64> = shared
-            .replay_since(0)
-            .into_iter()
-            .map(|ev| ev.seq)
-            .collect();
-        assert_eq!(got, vec![1, 2], "only seq>0 events enter ring");
-    }
-
-    #[tokio::test]
-    async fn client_guard_increments_and_decrements_ref_count() {
-        let registry = Arc::new(SessionStreamRegistry::default());
-        let shared = SharedStream::new(
-            "s1".into(),
-            "127.0.0.1:1".into(),
-            Arc::new(GrpcChannelPool::new()),
-            "en",
-            Arc::new(|_| {}),
-            None,
-        )
-        .await;
-
-        assert_eq!(shared.ref_count.load(Ordering::Acquire), 0);
-        let guard1 = shared.acquire_client(Arc::clone(&registry));
-        let guard2 = shared.acquire_client(Arc::clone(&registry));
-        assert_eq!(shared.ref_count.load(Ordering::Acquire), 2);
-
-        drop(guard1);
-        assert_eq!(
-            shared.ref_count.load(Ordering::Acquire),
-            1,
-            "one guard dropped, one remains"
-        );
-
-        drop(guard2);
-        assert_eq!(
-            shared.ref_count.load(Ordering::Acquire),
-            0,
-            "all guards dropped → ref_count back to 0"
-        );
-        // 最后一个 guard drop 会 spawn 30s 延迟清理；测试结束 runtime drop 会 cancel 它。
-    }
-
-    #[tokio::test]
-    async fn shutdown_streams_by_addr_closes_only_matching_streams() {
-        let registry = SessionStreamRegistry::default();
-        let matched_a = SharedStream::new(
-            "session-a".into(),
-            "10.0.0.1:50051".into(),
-            Arc::new(GrpcChannelPool::new()),
-            "en",
-            Arc::new(|_| {}),
-            None,
-        )
-        .await;
-        let matched_b = SharedStream::new(
-            "session-b".into(),
-            "10.0.0.1:50051".into(),
-            Arc::new(GrpcChannelPool::new()),
-            "en",
-            Arc::new(|_| {}),
-            None,
-        )
-        .await;
-        let unmatched = SharedStream::new(
-            "session-c".into(),
-            "10.0.0.2:50051".into(),
-            Arc::new(GrpcChannelPool::new()),
-            "en",
-            Arc::new(|_| {}),
-            None,
-        )
-        .await;
-        registry
-            .streams
-            .insert("session-a".into(), Arc::clone(&matched_a));
-        registry
-            .streams
-            .insert("session-b".into(), Arc::clone(&matched_b));
-        registry
-            .streams
-            .insert("session-c".into(), Arc::clone(&unmatched));
-
-        // 只关闭匹配地址的流
-        let closed = registry.shutdown_streams_by_addr("10.0.0.1:50051");
-        assert_eq!(closed, 2, "两条匹配地址的流都应被关闭");
-        assert!(matched_a.cancel_token.is_cancelled());
-        assert!(matched_b.cancel_token.is_cancelled());
-        assert!(!registry.streams.contains_key("session-a"));
-        assert!(!registry.streams.contains_key("session-b"));
-
-        // 不匹配的流保留且未 cancel
-        assert!(!unmatched.cancel_token.is_cancelled());
-        assert!(registry.streams.contains_key("session-c"));
-        assert_eq!(registry.len(), 1);
-
-        // 幂等：重复关闭同一地址返回 0
-        assert_eq!(registry.shutdown_streams_by_addr("10.0.0.1:50051"), 0);
-    }
-
-    #[test]
-    fn shutdown_streams_by_addr_returns_zero_for_unknown_addr() {
-        let registry = SessionStreamRegistry::default();
-        assert_eq!(registry.shutdown_streams_by_addr("1.2.3.4:50051"), 0);
-    }
-
-    #[tokio::test]
-    async fn terminal_error_event_payload_is_valid_json() {
-        // 无 DiagCtx → 通用文案;payload 必须是合法 JSON(serde_json 构造,非 format! 拼接)。
-        let ev = make_terminal_error_event(None, "en-US").await;
-        let payload: serde_json::Value =
-            serde_json::from_str(&ev.payload).expect("payload must be valid JSON");
-        assert_eq!(
-            payload["code"],
-            shared_types::error_codes::ERR_AGENT_CONTAINER_UNAVAILABLE
-        );
-        assert!(
-            payload["message"].is_string(),
-            "message must be a JSON string"
-        );
-        assert_eq!(ev.message_type, "SessionPromptEnd");
-        assert_eq!(ev.sub_type, "error");
-        assert_eq!(ev.seq, 0, "synthetic terminal event uses seq=0");
-    }
-
-    #[test]
-    fn stream_error_payload_is_valid_json() {
-        let ev = make_stream_error_event(Code::Unavailable, "irrelevant");
-        let payload: serde_json::Value =
-            serde_json::from_str(&ev.payload).expect("payload must be valid JSON");
-        assert_eq!(payload["code"], "GRPC_SERVICE_UNAVAILABLE");
-        assert_eq!(payload["message"], "Agent execution error, please retry.");
-    }
-}
+pub(crate) use backend_task::spawn_backend_task;
