@@ -172,7 +172,12 @@ impl SessionData {
         );
 
         let spawn_start = std::time::Instant::now();
-        let handle = SessionWorker::spawn(max_size, command_rx, Arc::clone(&session.connections));
+        let handle = SessionWorker::spawn(
+            max_size,
+            command_rx,
+            Arc::clone(&session.connections),
+            Arc::clone(&session.next_conn_id),
+        );
 
         // 🔒 Critical fix: 使用 async lock 替代 blocking_lock，避免阻塞 executor
         {
@@ -309,86 +314,32 @@ impl SessionData {
         mpsc::Receiver<(u64, UnifiedSessionMessage)>,
         CancellationToken,
     )> {
-        let start_time = std::time::Instant::now();
-        debug!(
-            "[create_new_connection] Starting connection creation, buffer_size={}",
-            buffer_size
-        );
-
-        let token_start = std::time::Instant::now();
-        let cancellation_token = CancellationToken::new();
-        debug!(
-            "[create_new_connection] CancellationToken creation took: {:?}",
-            token_start.elapsed()
-        );
-
-        let channel_start = std::time::Instant::now();
-        let (tx, rx) = mpsc::channel(buffer_size);
-        debug!(
-            "[create_new_connection] mpsc channel creation took: {:?}",
-            channel_start.elapsed()
-        );
-
-        let setup_start = std::time::Instant::now();
-        // 注册新订阅（不取消既有流——多端同看的根本修复）；
-        // 超上限逐最旧（conn_id 单调，最小 id 即最早建立的连接）
-        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        self.connections.insert(
-            conn_id,
-            ConnectionState {
-                sender: tx,
-                cancel: cancellation_token.clone(),
-            },
-        );
-        while self.connections.len() > MAX_SUBSCRIBERS {
-            let Some(oldest) = self
-                .connections
-                .iter()
-                .min_by_key(|e| *e.key())
-                .map(|e| *e.key())
-            else {
-                break;
-            };
-            if oldest == conn_id {
-                break; // 并发下只剩自己，不逐
-            }
-            if let Some((_, evicted)) = self.connections.remove(&oldest) {
-                evicted.cancel.cancel();
-                warn!(
-                    "[create_new_connection] subscriber limit {MAX_SUBSCRIBERS} reached, evicted oldest conn {oldest}"
-                );
-            }
+        // 原子化订阅：快照与 sender 注册在 worker 单线程内完成（SessionCommand::Subscribe），
+        // 消除旧实现「先注册后快照」窗口内消息既进 ring 又进 sender 的双路投递
+        // （gRPC 流重复 → rcoder ring 重复条目 → 无游标重连吐给客户端的根因）。
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(SessionCommand::Subscribe {
+                buffer_size,
+                from_seq,
+                ack: ack_tx,
+            })
+            .await
+            .is_err()
+        {
+            anyhow::bail!("worker has exited");
         }
-        debug!(
-            "[create_new_connection] subscriber {conn_id} registered (total {}), setup took {:?}",
-            self.connections.len(),
-            setup_start.elapsed()
-        );
-
-        // 📼 回放 ring buffer 中的历史消息（在设置 current_connection 之后）
-        // 确保快照包含设置 current_connection 之前缓冲的所有消息
-        // 时序保证：
-        // 1. 设置 current_connection 后，新消息会通过 channel 发送
-        // 2. replay_buffer() 获取的是设置 current_connection 之前缓冲的消息
-        // 3. 这些消息不会通过 current_connection 发送，所以需要回放
-        let replay_start = std::time::Instant::now();
-        let replay_messages = self.replay_since(from_seq).await;
-        if !replay_messages.is_empty() {
-            info!(
-                "[create_new_connection] Replaying {} buffered messages",
-                replay_messages.len()
-            );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(WORKER_REPLY_TIMEOUT_SECS),
+            ack_rx,
+        )
+        .await
+        {
+            Ok(Ok(r)) => Ok((r.conn_id, r.replay_messages, r.rx, r.token)),
+            Ok(Err(_)) => anyhow::bail!("worker dropped subscribe ack"),
+            Err(_) => anyhow::bail!("subscribe ack timeout ({WORKER_REPLY_TIMEOUT_SECS}s)"),
         }
-        debug!(
-            "[create_new_connection] Replay took: {:?}",
-            replay_start.elapsed()
-        );
-
-        debug!(
-            "[create_new_connection] Total connection creation took: {:?}",
-            start_time.elapsed()
-        );
-        Ok((conn_id, replay_messages, rx, cancellation_token))
     }
 
     /// 检查 worker 是否已完成 (non-blocking)
@@ -463,6 +414,8 @@ struct SessionWorker {
     command_rx: mpsc::Receiver<SessionCommand>,
     // 🎯 多订阅者注册表（与 SessionData 共享）
     connections: ConnectionRegistry,
+    /// conn_id 分配器（与 SessionData 共享；Subscribe 命令在 worker 内分配）
+    next_conn_id: Arc<AtomicU64>,
 }
 
 impl SessionWorker {
@@ -470,6 +423,7 @@ impl SessionWorker {
         max_size: usize,
         command_rx: mpsc::Receiver<SessionCommand>,
         connections: ConnectionRegistry,
+        next_conn_id: Arc<AtomicU64>,
     ) -> tokio::task::JoinHandle<()> {
         let start_time = std::time::Instant::now();
         debug!(
@@ -481,6 +435,7 @@ impl SessionWorker {
             max_size,
             command_rx,
             connections,
+            next_conn_id,
         };
 
         let spawn_start = std::time::Instant::now();
@@ -509,6 +464,70 @@ impl SessionWorker {
 
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
+                SessionCommand::Subscribe {
+                    buffer_size,
+                    from_seq,
+                    ack,
+                } => {
+                    // 原子 seam：此刻无并发 Push——快照与注册之间零窗口。
+                    let (tx, rx) = mpsc::channel(buffer_size);
+                    let token = CancellationToken::new();
+                    let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+                    self.connections.insert(
+                        conn_id,
+                        ConnectionState {
+                            sender: tx,
+                            cancel: token.clone(),
+                        },
+                    );
+                    // 超上限逐最旧（conn_id 单调，最小 id 即最早）
+                    while self.connections.len() > MAX_SUBSCRIBERS {
+                        let Some(oldest) = self
+                            .connections
+                            .iter()
+                            .min_by_key(|e| *e.key())
+                            .map(|e| *e.key())
+                        else {
+                            break;
+                        };
+                        if oldest == conn_id {
+                            break;
+                        }
+                        if let Some((_, evicted)) = self.connections.remove(&oldest) {
+                            evicted.cancel.cancel();
+                            warn!(
+                                "[SessionWorker] subscriber limit {MAX_SUBSCRIBERS} reached, evicted oldest conn {oldest}"
+                            );
+                        }
+                    }
+                    // 快照：注册完成后取——注册后新 Push 只走 sender，
+                    // 快照只含注册前的 ring 内容，两路无重叠无缺口。
+                    let snapshot: Vec<(u64, UnifiedSessionMessage)> = consumer
+                        .iter()
+                        .filter(|(s, _)| *s > from_seq)
+                        .cloned()
+                        .collect();
+                    debug!(
+                        "[SessionWorker] Subscribe: conn {conn_id}, from_seq={from_seq}, replay {} of {} buffered",
+                        snapshot.len(),
+                        consumer.occupied_len()
+                    );
+                    if ack
+                        .send(SubscribeResult {
+                            conn_id,
+                            replay_messages: snapshot,
+                            rx,
+                            token: token.clone(),
+                        })
+                        .is_err()
+                    {
+                        // 订阅者已放弃：回滚注册
+                        self.connections.remove(&conn_id);
+                        warn!(
+                            "[SessionWorker] subscriber gone before ack, rolled back conn {conn_id}"
+                        );
+                    }
+                }
                 SessionCommand::Push { message } => {
                     debug!(
                         "[SessionWorker] Push message: message_type={:?}, sub_type={}, data={}",
@@ -648,9 +667,27 @@ impl SessionWorker {
 }
 
 #[derive(Debug)]
+/// 订阅建立结果（Subscribe 命令的 ack 载荷）：
+/// replay 快照 + 实时接收端 + 连接标识/取消令牌。
+struct SubscribeResult {
+    conn_id: u64,
+    replay_messages: Vec<(u64, UnifiedSessionMessage)>,
+    rx: mpsc::Receiver<(u64, UnifiedSessionMessage)>,
+    token: CancellationToken,
+}
+
 enum SessionCommand {
     Push {
         message: UnifiedSessionMessage,
+    },
+    /// 原子化订阅：在 worker 单线程内完成「replay 快照 + sender 注册」——
+    /// Push 与 Subscribe 串行处理，消除"注册后、快照前"窗口内消息既进 ring
+    /// 又进 sender 的双路投递（gRPC 流重复 → rcoder ring 重复条目 →
+    /// 无游标重连时吐给客户端，即偶发的 4/492 重叠窗口重复根因）。
+    Subscribe {
+        buffer_size: usize,
+        from_seq: u64,
+        ack: oneshot::Sender<SubscribeResult>,
     },
     Clear {
         ack: oneshot::Sender<usize>,
@@ -859,6 +896,61 @@ mod tests {
             data: serde_json::json!({}),
             timestamp: Utc::now(),
         }
+    }
+
+    /// 🔒 竞态修复锁定：并发 push 期间建立订阅，输出（replay + 实时）不得有重复 seq。
+    /// 修复前 create_new_connection「先注册 sender 后取 ring 快照」的窗口内，
+    /// worker 的 Push 会既写 ring（被快照捕获）又 try_send 给 sender（实时），
+    /// 同一 seq 双路到达（gRPC 流重复的根因）；修复后快照+注册在 worker 单线程
+    /// 内原子完成（SessionCommand::Subscribe）。
+    #[tokio::test]
+    async fn subscribe_never_duplicates_under_concurrent_push() {
+        let sd = SessionData::new(4096).await;
+
+        let pusher = {
+            let sd = sd.clone();
+            tokio::spawn(async move {
+                for i in 0..2000u64 {
+                    sd.push_message(make_msg(&format!("m{i}")));
+                    if i % 100 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })
+        };
+
+        for _round in 0..40 {
+            let (conn_id, replay, mut rx, token) =
+                sd.create_new_connection(64, 0).await.expect("subscribe");
+            let mut seqs: Vec<u64> = replay.iter().map(|(s, _)| *s).collect();
+            // 收一小段实时（50ms 窗口）
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+                while let Some((s, _)) = rx.recv().await {
+                    seqs.push(s);
+                }
+            })
+            .await;
+            token.cancel();
+            sd.close_connection(conn_id);
+
+            let mut sorted = seqs.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                seqs.len(),
+                "duplicate seq in subscription output (round {_round}): {:?}",
+                seqs.iter()
+                    .fold(Vec::new(), |mut acc: Vec<u64>, s| {
+                        if acc.last() != Some(s) {
+                            acc.push(*s);
+                        }
+                        acc
+                    })
+                    .len()
+            );
+        }
+        pusher.await.expect("pusher");
     }
 
     #[tokio::test]

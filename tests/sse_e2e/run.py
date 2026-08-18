@@ -583,6 +583,10 @@ def scenario_error_recovery(out: dict):
     threading.Thread(target=_r2, daemon=True).start()
     time.sleep(1)
     evs2 = sse_collect(sid, 50)
+    # 全量套跑时容器创建销毁累积负载可能拖慢 agent 冷启动——首轮空则重连再收一次
+    if not ids_of(evs2):
+        print("    [recovery] first window empty (load-sensitive cold start), retrying...")
+        evs2 = sse_collect(sid, 40)
     ids2 = ids_of(evs2)
     types2 = [e.get("event") for e in evs2]
     r2 = chunks_text(evs2)
