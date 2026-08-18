@@ -551,9 +551,10 @@ def scenario_error_recovery(out: dict):
     time.sleep(0.8)
     sse_collect(sid, 30)  # 收完首轮（等终端）
 
-    # error 轮：坏 base_url（连接立即失败，确定性注入）+ 后台发
+    # error 轮：无效 api_key（预检不校验 key、首次 LLM 调用 401 → 执行中 error，
+    # 产生 SSE 事件——区别于坏 base_url 在预检即被拒、SSE 无事件的设计行为）
     p_bad = base_payload("回答一个字：好", f"{RUN_TAG}-sg3b", user)
-    p_bad["model_provider"]["base_url"] = "https://invalid.example.invalid/v1"
+    p_bad["model_provider"]["api_key"] = "sk-invalid-key-for-testing"
     p_bad["session_id"], p_bad["project_id"] = sid, pid
 
     def _bad():
@@ -735,10 +736,7 @@ SCENARIOS = [
     ("cross_turn_acp_ts", functools.partial(scenario_cross_turn_reconnect, backend="anthropic")),
     ("concurrent_subscribers", scenario_concurrent_subscribers),
     ("concurrent_sub_acp_ts", functools.partial(scenario_concurrent_subscribers, backend="anthropic")),
-    # TODO: error_recovery 需"执行中错误"注入（坏 base_url 在模型预检阶段就被
-    # chat 响应拒绝，不产生 SSE 事件——设计行为）。待找执行中失败注入（如无效
-    # api_key 的首调用 401）后启用。
-    # ("error_recovery", scenario_error_recovery),
+    ("error_recovery", scenario_error_recovery),
     ("container_restart_recovery", scenario_container_restart_recovery),
 ]
 
