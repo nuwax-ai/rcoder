@@ -77,9 +77,16 @@ def cleanup_test_containers():
                 ["ssh", K8S_SSH, "kubectl", "-n", K8S_NS, "get", "sts,svc,pvc", "-o", "name"],
                 capture_output=True, text=True, timeout=30,
             )
+            # 双重保护：① -n 限定（prod ns 物理不在查询范围）；② 名字部分严格 startswith
+            # （生产集群同 ns 可能有他人 agent，前缀含本次运行的秒级时间戳 USER，绝不误删。
+            # PVC 名可能是 <sts名>-0 或 data-<sts名>-0 等形态，故 startswith 不带尾连字符）
             prefix = f"rcoder-computer-agent-runner-{USER}"
-            targets = [l.strip() for l in out.stdout.splitlines() if prefix in l]
+            targets = [
+                l.strip() for l in out.stdout.splitlines()
+                if "/" in l and l.strip().split("/", 1)[1].startswith(prefix)
+            ]
             if targets:
+                print(f"  🧹 待清理: {', '.join(t.split('/')[-1] for t in targets)}")
                 subprocess.run(
                     ["ssh", K8S_SSH, "kubectl", "-n", K8S_NS, "delete", *targets],
                     capture_output=True, timeout=180,
