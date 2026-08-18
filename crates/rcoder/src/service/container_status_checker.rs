@@ -308,14 +308,20 @@ impl ContainerStatusChecker {
                     .await;
 
                 if !container_exists {
-                    // 容器不存在，直接清理所有状态
+                    // 容器不存在：清理健康状态并计入失败（进入 skip 名单）。
+                    // 此前直接 return 不计数 → 消失容器的 project 每 30s 轮询都重查
+                    // （网络往返 + agent_runner 查询），历史残留 project 随时间线性
+                    // 放大轮询负载（compose 测试环境实测：20+ 死条目 × 2 轮/分钟）。
+                    // 计入失败后 skip_duration（默认 5 分钟）内跳过，容器若被
+                    // pod_ensure 重建，skip 窗口过后自然恢复检查。
+                    // 项目记录本身仍由清理任务（闲置回收，默认 10 分钟超时）统一移除。
                     info!(
                         " [STATUS_CHECKER] Container has been destroyed, cleaning up health state: {}",
                         lookup_key
                     );
                     self.health_states.remove(lookup_key);
                     self.state.grpc_pool.remove(&grpc_addr).await;
-                    // 注意：不移除存储中的项目记录，由清理任务统一处理
+                    self.record_failure(lookup_key, &grpc_addr, &e);
                     return Err(e);
                 }
 
