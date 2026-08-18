@@ -48,14 +48,17 @@
 
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, SessionId, TextContent};
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use chrono::Utc;
+use dashmap::DashMap;
 use shared_types::{
     AgentLifecycle, AgentStatus, ModelProviderConfig, ProjectAndAgentInfo, SessionEntry,
 };
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::PromptMessage;
@@ -65,6 +68,53 @@ use crate::traits::{
     AgentStartConfig, PermissionRequestHandler, SessionNotifier, SessionRegistry,
     YoloPermissionRequestHandler,
 };
+
+/// follower 等待 leader 的额外宽限（leader 的 CreateGuard drop 必先广播，
+/// follower 不应先超时——宽限覆盖 leader 提交/清理的尾部耗时）
+const SESSION_CREATE_FOLLOWER_GRACE: Duration = Duration::from_secs(10);
+/// leader 异常退出（panic）时广播给 follower 的失败原因
+const SESSION_CREATE_LEADER_ABORTED: &str = "session create leader aborted";
+
+/// 会话创建 single-flight 的结果（照搬 `AppActivityRegistry` wake 模式）
+type SessionCreateOutcome<E> = Result<(E, bool), String>;
+
+/// 进行中的会话创建句柄（leader 持 `tx`，follower `subscribe` 后等结果）
+struct SessionCreateHandle<E> {
+    tx: watch::Sender<Option<SessionCreateOutcome<E>>>,
+}
+
+/// RAII 守卫：leader 路径持有。drop 时（含 panic unwind）广播 outcome
+/// （panic 未写入 → 广播 Err 快速通知，follower 不干等 dead-man 超时）
+/// 并以 `Arc::ptr_eq` 防误删地移除 in_flight 条目。
+struct SessionCreateGuard<E> {
+    map: Arc<DashMap<String, Arc<SessionCreateHandle<E>>>>,
+    key: String,
+    handle: Arc<SessionCreateHandle<E>>,
+    /// leader 完成后写入 outcome；panic 时仍为 None → drop 发 aborted
+    outcome: Option<SessionCreateOutcome<E>>,
+}
+
+impl<E> Drop for SessionCreateGuard<E> {
+    fn drop(&mut self) {
+        let outcome = self
+            .outcome
+            .take()
+            .unwrap_or_else(|| Err(SESSION_CREATE_LEADER_ABORTED.to_string()));
+        if let Err(e) = self.handle.tx.send(Some(outcome)) {
+            debug!("[SESSION] create outcome send failed (no follower): {e}");
+        }
+        if let dashmap::mapref::entry::Entry::Occupied(entry) = self.map.entry(self.key.clone())
+            && Arc::ptr_eq(entry.get(), &self.handle)
+        {
+            entry.remove();
+        }
+    }
+}
+
+enum SessionCreateRole<E> {
+    Leader(Arc<SessionCreateHandle<E>>),
+    Follower(Arc<SessionCreateHandle<E>>),
+}
 
 /// ACP 会话管理器 (SACP 版本)
 ///
@@ -87,6 +137,9 @@ pub struct AcpSessionManager<N: SessionNotifier, R: SessionRegistry> {
     permission_handler: Arc<dyn PermissionRequestHandler>,
     /// 进程诊断监听器（可选，注入自 AcpClientBuilder）
     diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
+    /// project_id → 进行中的会话创建（并发合流：同 project 并发 chat 共享同一次
+    /// spawn，消除双 spawn + 败者 SIGKILL 健康进程）
+    in_flight: Arc<DashMap<String, Arc<SessionCreateHandle<R::Entry>>>>,
 }
 
 impl<N: SessionNotifier + 'static, R: SessionRegistry> AcpSessionManager<N, R>
@@ -133,6 +186,7 @@ where
             model_env_resolver,
             permission_handler,
             diagnostics_listener,
+            in_flight: Arc::new(DashMap::new()),
         }
     }
 
@@ -439,187 +493,138 @@ where
         &self,
         project_id: &str,
         project_path: PathBuf,
-        session_id_hint: Option<String>, // 🔥 修复：使用此参数查找现有会话
+        session_id_hint: Option<String>,
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         service_uuid: Option<String>,
     ) -> Result<(R::Entry, bool)> {
-        use dashmap::mapref::entry::Entry;
-
         let project_id_key = project_id.to_string();
 
-        // 🆕 第一阶段：如果提供了 session_id_hint，先尝试通过 session_id 查找现有会话
-        // 🔥 优化：使用 get_entry_by_session() 避免两次调用之间的竞态窗口
-        if let Some(ref hint_sid) = session_id_hint {
-            // 一次性查询：通过 session_id 直接获取 agent_info
-            if let Some(existing) = self.registry.get_entry_by_session(hint_sid) {
-                // 验证 project_id 是否匹配（防御性编程）
-                if existing.project_id() == project_id {
-                    let channel_closed = existing.is_channel_closed();
-                    let model_changed = existing.is_model_config_changed(&model_provider);
-
-                    if !channel_closed && !model_changed {
-                        info!(
-                            "[SESSION] Reusing existing session via session_id_hint: project_id={}, session_id={}",
-                            project_id, hint_sid
-                        );
-                        return Ok((existing, false));
-                    }
-
-                    if channel_closed {
-                        info!(
-                            "⚠️ [SESSION] Session channel closed for session_id_hint, need to rebuild: project_id={}, session_id={}",
-                            project_id, hint_sid
-                        );
-                    }
-                    if model_changed {
-                        info!(
-                            "🔄 [SESSION] Model config changed for session_id_hint, need to rebuild: project_id={}, session_id={}",
-                            project_id, hint_sid
-                        );
-                        // 🔪 显式停止旧 Agent 进程：仅靠 registry 覆盖/drop 不等待进程退出，
-                        // 双 opencode 进程同时持有同一 session 会导致新进程 prompt 立即
-                        // service failure（切模型场景实测）。
-                        if let Some(handle) = existing.lifecycle_handle() {
-                            if let Err(e) = handle.graceful_stop().await {
-                                warn!(
-                                    "[SESSION] graceful_stop old agent failed (continuing rebuild): {}",
-                                    e
-                                );
-                            } else {
-                                info!(
-                                    "[SESSION] old agent stopped before rebuild: project_id={}, session_id={}",
-                                    project_id, hint_sid
-                                );
-                            }
-                        }
-                    }
-                    // 会话无效，继续后续逻辑（可能需要重建）
-                } else {
-                    info!(
-                        "⚠️ [SESSION] session_id_hint belongs to different project: hint_project={}, current_project={}, session_id={}",
-                        existing.project_id(),
-                        project_id,
-                        hint_sid
-                    );
-                    // session_id 属于其他 project，不能复用，继续后续逻辑
-                }
-            } else {
-                info!(
-                    "🔍 [SESSION] session_id_hint does not exist in registry: session_id={}",
-                    hint_sid
-                );
-                // session_id 不存在，继续后续逻辑
-            }
+        // Phase A：session_id_hint 快速复用。不可复用（通道死/模型变）时统一进入
+        // 下方的创建合流——停旧由 Leader 独占执行（并发下只有一人停+建，不变式
+        // 从概率性变确定性）。
+        if let Some(ref hint_sid) = session_id_hint
+            && let Some(existing) = self.registry.get_entry_by_session(hint_sid)
+            && existing.project_id() == project_id
+            && !existing.is_channel_closed()
+            && !existing.is_model_config_changed(&model_provider)
+        {
+            info!(
+                "[SESSION] Reusing existing session via session_id_hint: project_id={}, session_id={}",
+                project_id, hint_sid
+            );
+            return Ok((existing, false));
         }
 
-        // 第一阶段：快速检查现有会话
-        if let Entry::Occupied(occupied_entry) = self.registry.entry(project_id_key.clone()) {
-            let existing = occupied_entry.get();
+        // Phase B：project entry 快速复用（Pending 占位符除外——它需要被替换）
+        if let Some(existing) = self.registry.get(&project_id_key)
+            && *existing.status() != AgentStatus::Pending
+            && !existing.is_channel_closed()
+            && !existing.is_model_config_changed(&model_provider)
+        {
+            info!("Reuse Agent session, project ID: {}", project_id);
+            return Ok((existing, false));
+        }
 
-            // 🔥 显式检查 Pending 状态 - PendingGuard 创建的占位符需要被替换
-            if *existing.status() == AgentStatus::Pending {
-                info!(
-                    "🔄 [SESSION] Detected Pending placeholder, preparing to replace: project_id={}",
-                    project_id
-                );
-                // 显式释放 entry 锁
-                drop(occupied_entry);
-
-                // 第二阶段：创建新会话（不持有锁）
-                let new_session = self
-                    .create_session_internal(
-                        project_id_key.clone(),
-                        project_path,
-                        model_provider,
-                        start_config,
-                        service_uuid,
-                    )
-                    .await?;
-
-                // 第三阶段：原子性替换（插入新会话，覆盖 pending 占位符）
-                match self.registry.entry(project_id_key.clone()) {
-                    Entry::Vacant(entry) => {
-                        let new_session_id = new_session.session_id().to_string();
-                        entry.insert(new_session.clone());
-                        info!(
-                            "✅ [SESSION] Inserted new session to replace pending: project_id={}, session_id={}",
-                            project_id, new_session_id
-                        );
-                        return Ok((new_session, true));
-                    }
-                    Entry::Occupied(mut entry) => {
-                        // 检查是 Pending 占位符还是其他线程创建的真实会话
-                        let current_session = entry.get();
-                        let current_status = current_session.status();
-
-                        if *current_status == AgentStatus::Pending {
-                            // 仍然是 Pending 占位符，替换它
-                            let old_session_id = current_session.session_id().to_string();
-                            let new_session_id = new_session.session_id().to_string();
-                            entry.insert(new_session.clone());
-                            info!(
-                                "✅ [SESSION] Replaced pending placeholder: project_id={}, {} → {}",
-                                project_id, old_session_id, new_session_id
-                            );
-                            return Ok((new_session, true));
-                        } else {
-                            // 其他线程已经创建了真实会话。复检通道活性再决定：
-                            // registry status 可能被垂死旧连接异步发出的
-                            // PromptEnd(Cancelled) 翻转（PendingGuard 语义被击穿），
-                            // status 不可作为裁决依据；通道是否存活才是硬事实。
-                            // existing 通道已死 → 它是残留死 entry，替换为我们的健康新会话
-                            if current_session.is_channel_closed() {
-                                let old_session_id = current_session.session_id().to_string();
-                                let new_session_id = new_session.session_id().to_string();
-                                entry.insert(new_session.clone());
-                                info!(
-                                    "✅ [SESSION] Replaced dead-channel entry left by concurrent creator: project_id={}, {} → {}",
-                                    project_id, old_session_id, new_session_id
-                                );
-                                return Ok((new_session, true));
-                            }
-                            let existing_session = current_session.clone();
-                            let created_session_id = new_session.session_id().to_string();
-                            let existing_session_id = existing_session.session_id().to_string();
-                            info!(
-                                "🔄 [SESSION] Detected concurrent creation (other thread already created real session): project_id={}, discarded session_id={}, using session_id={}",
-                                project_id, created_session_id, existing_session_id
-                            );
-                            // new_session 会被 drop，AgentLifecycleGuard 会清理 Agent 进程
-                            return Ok((existing_session, false));
-                        }
-                    }
-                }
+        // Phase C：需要创建/重建 → single-flight 决出 Leader/Follower。
+        // 同 project 并发 chat 共享同一次 spawn（消除双 spawn + 败者 SIGKILL
+        // 健康进程）；只在同步作用域内持有 DashMap entry guard，禁止跨 await。
+        let role = match self.in_flight.entry(project_id_key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(e) => {
+                SessionCreateRole::Follower(e.get().clone())
             }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                let (tx, _rx) = watch::channel(None);
+                let handle = Arc::new(SessionCreateHandle { tx });
+                e.insert(handle.clone());
+                SessionCreateRole::Leader(handle)
+            }
+        };
+        let timeout =
+            Duration::from_secs(start_config.acp_session_create_timeout_secs.unwrap_or(60));
+        match role {
+            SessionCreateRole::Leader(handle) => {
+                self.create_as_leader(
+                    handle,
+                    &project_id_key,
+                    project_path,
+                    model_provider,
+                    start_config,
+                    service_uuid,
+                )
+                .await
+            }
+            SessionCreateRole::Follower(handle) => {
+                self.join_as_follower(handle, &project_id_key, timeout, &model_provider)
+                    .await
+            }
+        }
+    }
 
+    /// Leader 路径：CreateGuard 保证退出时（含 panic）必广播 outcome 并移除条目。
+    async fn create_as_leader(
+        &self,
+        handle: Arc<SessionCreateHandle<R::Entry>>,
+        project_id: &str,
+        project_path: PathBuf,
+        model_provider: Option<ModelProviderConfig>,
+        start_config: AgentStartConfig,
+        service_uuid: Option<String>,
+    ) -> Result<(R::Entry, bool)> {
+        let mut guard = SessionCreateGuard {
+            map: self.in_flight.clone(),
+            key: project_id.to_string(),
+            handle: handle.clone(),
+            outcome: None,
+        };
+        let result = self
+            .create_session_leader_path(
+                project_id,
+                project_path,
+                model_provider,
+                start_config,
+                service_uuid,
+            )
+            .await;
+        guard.outcome = Some(result.clone());
+        result.map_err(anyhow::Error::msg)
+    }
+
+    /// Leader 的实际创建序列：停旧（若需）→ spawn → 全量提交（三 map）。
+    ///
+    /// 提交用 `registry.insert()`（AgentSessionRegistry 实现为 register()，
+    /// project/session 正反向映射一次一致）——替代旧的 entry.insert 单 map 写
+    /// + 事后补写反向映射的双写窗口。
+    async fn create_session_leader_path(
+        &self,
+        project_id: &str,
+        project_path: PathBuf,
+        model_provider: Option<ModelProviderConfig>,
+        start_config: AgentStartConfig,
+        service_uuid: Option<String>,
+    ) -> Result<(R::Entry, bool), String> {
+        // 停旧（若需）：Pending 占位符（dummy 通道）跳过；通道死/模型变才停。
+        // model_changed 停旧是切模型正确性的关键：双 opencode 进程同时持有同一
+        // session 会导致新进程 prompt 立即 service failure（切模型场景实测）。
+        if let Some(existing) = self.registry.get(project_id)
+            && *existing.status() != AgentStatus::Pending
+        {
+            let session_id_str = existing.session_id().to_string();
             let channel_closed = existing.is_channel_closed();
             let model_changed = existing.is_model_config_changed(&model_provider);
-
-            if !channel_closed && !model_changed {
-                info!("Reuse Agent session, project ID: {}", project_id);
-                return Ok((existing.clone(), false));
-            }
-
-            // 需要重建会话，先克隆必要数据并释放锁
-            let session_id_str = existing.session_id().to_string();
-            // 停旧进程的句柄在释放 entry 锁前克隆（existing 借用自 entry）
-            let old_stop_handle = existing.lifecycle_handle().cloned();
-            drop(occupied_entry); // 显式释放 entry 锁
-
             if channel_closed {
                 info!(
-                    "⚠️ Detected session channel closed (Agent process exited), rebuilding session, project ID: {}, old session_id: {}",
+                    "⚠️ [SESSION] Session channel closed, rebuilding: project_id={}, old session_id={}",
                     project_id, session_id_str
                 );
             }
             if model_changed {
                 info!(
-                    "Model config changed, restarting Agent session, project ID: {}, old session_id: {}",
+                    "🔄 [SESSION] Model config changed, restarting Agent session: project_id={}, old session_id={}",
                     project_id, session_id_str
                 );
-                // 🔪 同上：重建前显式停旧进程，防双进程同 session
-                if let Some(handle) = old_stop_handle.as_ref() {
+                // 🔪 显式停止旧 Agent 进程（graceful_stop 内部 CAS 幂等）
+                if let Some(handle) = existing.lifecycle_handle() {
                     if let Err(e) = handle.graceful_stop().await {
                         warn!(
                             "[SESSION] graceful_stop old agent failed (continuing rebuild): {}",
@@ -633,111 +638,80 @@ where
                     }
                 }
             }
-
-            // 第二阶段：在不持有锁的情况下创建新会话
-            let new_session = self
-                .create_session_internal(
-                    project_id_key.clone(),
-                    project_path,
-                    model_provider,
-                    start_config,
-                    service_uuid,
-                )
-                .await?;
-
-            // 第三阶段：原子性插入（使用 entry API 防止并发创建）
-            match self.registry.entry(project_id_key.clone()) {
-                Entry::Vacant(entry) => {
-                    // 其他线程还没有创建，使用我们创建的会话
-                    let new_session_id = new_session.session_id().to_string();
-                    entry.insert(new_session.clone());
-                    info!(
-                        "✅ Session rebuilt, project ID: {}, new session_id: {}",
-                        project_id, new_session_id
-                    );
-                    return Ok((new_session, true));
-                }
-                Entry::Occupied(mut entry) => {
-                    // 其他线程已经创建了会话：复检通道活性（同 Pending 分支，
-                    // status 可能被垂死连接的状态回写翻转，通道活性才是硬事实）
-                    if entry.get().is_channel_closed() {
-                        let old_session_id = entry.get().session_id().to_string();
-                        let new_session_id = new_session.session_id().to_string();
-                        entry.insert(new_session.clone());
-                        info!(
-                            "✅ [SESSION] Replaced dead-channel entry after rebuild race: project_id={}, {} → {}",
-                            project_id, old_session_id, new_session_id
-                        );
-                        return Ok((new_session, true));
-                    }
-                    // existing 健康，使用已存在的（丢弃我们创建的）
-                    let existing_session = entry.get().clone();
-                    let created_session_id = new_session.session_id().to_string();
-                    let existing_session_id = existing_session.session_id().to_string();
-                    info!(
-                        "🔄 [SESSION] Detected concurrent creation, using other thread's session: project_id={}, discarded session_id={}, using session_id={}",
-                        project_id, created_session_id, existing_session_id
-                    );
-                    // new_session 会被 drop，Session 的 Drop 实现会清理 Agent 进程
-                    return Ok((existing_session, false));
-                }
-            }
         }
 
-        // 会话不存在，需要创建新会话
-        info!(
-            "Session not found, creating new session, project ID: {}",
-            project_id
-        );
-
-        // 第二阶段：在不持有锁的情况下创建新会话
+        // 创建（spawn agent 进程 + 连接任务，阻塞至 session 就绪）
         let new_session = self
             .create_session_internal(
-                project_id_key.clone(),
+                project_id.to_string(),
                 project_path,
                 model_provider,
                 start_config,
                 service_uuid,
             )
-            .await?;
+            .await
+            .map_err(|e| e.to_string())?;
 
-        // 第三阶段：原子性插入
-        match self.registry.entry(project_id_key.clone()) {
-            Entry::Vacant(entry) => {
-                // 其他线程还没有创建，使用我们创建的会话
-                let session_id_str = new_session.session_id().to_string();
-                entry.insert(new_session.clone());
-                info!(
-                    "✅ New session created, project ID: {}, session_id: {}",
-                    project_id, session_id_str
-                );
-                Ok((new_session, true))
+        // 全量提交（三 map：覆盖 Pending 占位符/死 entry，正反向映射一致）
+        let new_session_id = new_session.session_id().to_string();
+        self.registry
+            .insert(project_id, &new_session_id, new_session.clone());
+        info!(
+            "✅ [SESSION] Session committed (single-flight leader): project_id={}, session_id={}",
+            project_id, new_session_id
+        );
+        Ok((new_session, true))
+    }
+
+    /// Follower 路径：subscribe 等 Leader 广播（CreateGuard drop 必 send 一次）。
+    async fn join_as_follower(
+        &self,
+        handle: Arc<SessionCreateHandle<R::Entry>>,
+        project_id: &str,
+        timeout: Duration,
+        model_provider: &Option<ModelProviderConfig>,
+    ) -> Result<(R::Entry, bool)> {
+        info!(
+            "[SESSION] joining in-flight session creation (single-flight follower): project_id={}",
+            project_id
+        );
+        let mut rx = handle.tx.subscribe();
+        // leader 可能已完成（borrow 直接拿到 Some）
+        let outcome = if let Some(outcome) = rx.borrow().clone() {
+            outcome
+        } else {
+            match tokio::time::timeout(timeout + SESSION_CREATE_FOLLOWER_GRACE, rx.changed()).await
+            {
+                Ok(Ok(())) => rx
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| Err("no outcome".into())),
+                Ok(Err(_)) => Err(SESSION_CREATE_LEADER_ABORTED.to_string()),
+                Err(_) => Err("session create join timeout".to_string()),
             }
-            Entry::Occupied(mut entry) => {
-                // 复检通道活性：并发创建的败者若发现 existing 已死（如残留的
-                // Pending 占位之外还有垂死 entry），替换而不是把死通道交给调用方
-                if entry.get().is_channel_closed() {
-                    let old_session_id = entry.get().session_id().to_string();
-                    let new_session_id = new_session.session_id().to_string();
-                    entry.insert(new_session.clone());
-                    info!(
-                        "✅ [SESSION] Replaced dead-channel entry after creation race: project_id={}, {} → {}",
-                        project_id, old_session_id, new_session_id
-                    );
-                    return Ok((new_session, true));
+        };
+        outcome
+            .map(|(entry, _)| {
+                // 复用 Leader 建好的会话：reuse 语义（is_new=false）——避免
+                // follower 的 chat 再次 register/重复 lifecycle watcher
+                info!(
+                    "[SESSION] joined leader's session (single-flight): project_id={}, session_id={}",
+                    project_id,
+                    entry.session_id()
+                );
+                (entry, false)
+            })
+            .map_err(anyhow::Error::msg)
+            .and_then(|(entry, is_new)| {
+                // 复检：Leader 刚建好即死 / 并发请求模型配置不同（并发切模型）
+                if entry.is_channel_closed() || entry.is_model_config_changed(model_provider) {
+                    return Err(anyhow::anyhow!(
+                        "in-flight session outcome stale (dead channel or model mismatch), caller retry will lead: project_id={}",
+                        project_id
+                    ));
                 }
-                // 其他线程已经创建了会话，使用已存在的（丢弃我们创建的）
-                let existing_session = entry.get().clone();
-                let created_session_id = new_session.session_id().to_string();
-                let existing_session_id = existing_session.session_id().to_string();
-                info!(
-                    "🔄 [SESSION] Detected concurrent creation, using session created by other thread: project_id={}, discarding session_id={}, using session_id={}",
-                    project_id, created_session_id, existing_session_id
-                );
-                // new_session 会被 drop，Session 的 Drop 实现会清理 Agent 进程
-                Ok((existing_session, false))
-            }
-        }
+                Ok((entry, is_new))
+            })
     }
 
     /// 发送 Prompt 到指定会话（仅文本）
@@ -895,4 +869,89 @@ mod prompt_channel_tests {
     // ModelProviderConfig 引用占位（构造完整 entry 的后续场景用）
     #[allow(dead_code)]
     fn _model_config_marker(_: Option<ModelProviderConfig>) {}
+}
+
+#[cfg(test)]
+mod single_flight_tests {
+    use super::*;
+    use tokio::sync::watch;
+
+    fn make_guard<E>(
+        map: Arc<DashMap<String, Arc<SessionCreateHandle<E>>>>,
+        key: &str,
+    ) -> (Arc<SessionCreateHandle<E>>, SessionCreateGuard<E>) {
+        let (tx, _rx) = watch::channel(None);
+        let handle = Arc::new(SessionCreateHandle { tx });
+        map.insert(key.to_string(), handle.clone());
+        let guard = SessionCreateGuard {
+            map,
+            key: key.to_string(),
+            handle: handle.clone(),
+            outcome: None,
+        };
+        (handle, guard)
+    }
+
+    /// Leader 正常完成：guard drop 广播 outcome，follower 唤醒
+    #[tokio::test]
+    async fn guard_drop_broadcasts_outcome() {
+        let map = Arc::new(DashMap::new());
+        let (handle, mut guard) = make_guard::<u8>(map.clone(), "p1");
+        let rx = handle.tx.subscribe();
+        guard.outcome = Some(Ok((42u8, true)));
+        drop(guard);
+        assert_eq!(*rx.borrow(), Some(Ok((42, true))));
+        assert!(!map.contains_key("p1"), "entry removed after drop");
+    }
+
+    /// Leader panic（未写 outcome）：drop 广播 aborted，follower 快速失败不干等
+    #[tokio::test]
+    async fn guard_drop_without_outcome_broadcasts_aborted() {
+        let map = Arc::new(DashMap::new());
+        let (handle, guard) = make_guard::<u8>(map.clone(), "p1");
+        let rx = handle.tx.subscribe();
+        drop(guard);
+        assert!(matches!(*rx.borrow(), Some(Err(ref e)) if e == SESSION_CREATE_LEADER_ABORTED));
+    }
+
+    /// ptr_eq 防误删：条目已被新一轮 Leader 替换时，旧 guard drop 不删新条目
+    #[tokio::test]
+    async fn stale_guard_does_not_remove_new_leader_entry() {
+        let map = Arc::new(DashMap::new());
+        let (_old_handle, guard) = make_guard(map.clone(), "p1");
+        // 新一轮 Leader 抢先注册（旧 guard 尚未 drop 的异常序列）
+        let (tx, _rx) = watch::channel(None);
+        let new_handle = Arc::new(SessionCreateHandle::<u8> { tx });
+        map.insert("p1".to_string(), new_handle.clone());
+        drop(guard);
+        assert!(
+            map.contains_key("p1"),
+            "new leader's entry must survive stale guard drop"
+        );
+        assert!(Arc::ptr_eq(map.get("p1").unwrap().value(), &new_handle));
+    }
+
+    /// follower 在 leader 完成前 subscribe：changed() 唤醒并取到 outcome
+    #[tokio::test]
+    async fn follower_wakes_on_leader_completion() {
+        let map = Arc::new(DashMap::new());
+        let (handle, mut guard) = make_guard::<u8>(map.clone(), "p1");
+        let mut rx = handle.tx.subscribe();
+        assert!(rx.borrow().is_none(), "not yet finished");
+        let waiter = tokio::spawn(async move {
+            loop {
+                if rx.changed().await.is_err() {
+                    return None;
+                }
+                if let Some(outcome) = rx.borrow().clone() {
+                    return Some(outcome);
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        guard.outcome = Some(Ok((7u8, true)));
+        drop(guard);
+        let outcome = waiter.await.unwrap().expect("waiter got outcome");
+        assert!(matches!(outcome, Ok((7, true))));
+    }
 }
