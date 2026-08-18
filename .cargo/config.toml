@@ -1,9 +1,0 @@
-# 临时：USTC 镜像不可达，本仓库内改用 rsproxy（sparse index）
-[source.crates-io]
-replace-with = 'rsproxy'
-
-[source.rsproxy]
-registry = "sparse+https://rsproxy.cn/index/"
-
-[registries.rsproxy]
-index = "sparse+https://rsproxy.cn/index/"
