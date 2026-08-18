@@ -631,6 +631,86 @@ def scenario_container_restart_recovery(out: dict):
     return c
 
 
+def _longest_common_snippet(a: str, b: str, win: int = 24) -> str:
+    """找 a 中长度 win 的连续片段是否逐字出现在 b 中（SSE 重放检测）。
+
+    模型自主复述只会语义相似，不会逐字复现 24+ 连续字符；
+    SSE 重放是 chunk 逐字重组——必命中。返回命中的片段（无则空串）。
+    """
+    for i in range(0, max(0, len(a) - win)):
+        frag = a[i:i + win]
+        if "\n" not in frag and frag in b:
+            return frag
+    return ""
+
+
+def scenario_model_switch_multi(out: dict, backend: str = "openai"):
+    """三连切模型（flash→pro→flash，同 project+session）+ 逐字重放检测。
+
+    每轮断言：seq 隔离（零旧轮事件）+ 完整执行 + 上下文延续 +
+    后续轮的流中不逐字包含前面轮回答的长片段（内容级重放检测——
+    比 seq 断言更贴近用户感知的"收到重复消息"）。
+    """
+    c = Check()
+    user = scoped_user(f"sm-{backend}")
+    pro = CFG.get("LLM_MODEL_PRO", "")
+    turns = [
+        ("flash", "请用三点解释 CAP 定理，每点一句话，最后单独一行总结。"),
+        ("pro", "请用三点解释 BASE 定理，每点一句话，最后单独一行总结。"),
+        ("flash", "请用两点对比 CAP 与 BASE 的关系，每点一句话。"),
+    ]
+    sid = pid = None
+    replies: list[str] = []
+    turn_last_seq = 0
+
+    for i, (model_tag, prompt) in enumerate(turns):
+        model = pro if model_tag == "pro" else ""
+        p = base_payload(prompt, f"{RUN_TAG}-sm{i}{backend}", user, backend=backend, model=model)
+        if sid:
+            p["session_id"], p["project_id"] = sid, pid
+
+        if sid is None:
+            # 首轮同步（拿 sid/pid 后立即收 SSE，turn 尚在进行）
+            d = chat(p)
+            sid, pid = d["session_id"], d["project_id"]
+            time.sleep(0.8)
+            evs = sse_collect(sid, 60)
+        else:
+            def _send(pl=p, idx=i):
+                try:
+                    chat(pl, timeout=150)
+                except Exception as e:  # noqa: BLE001
+                    print(f"    [turn{idx} chat] {str(e)[:60]}")
+
+            threading.Thread(target=_send, daemon=True).start()
+            time.sleep(1)
+            evs = sse_collect(sid, 60)
+
+        ids = ids_of(evs)
+        types = [e.get("event") for e in evs]
+        text = chunks_text(evs)
+        replies.append(text)
+        c.ok(len(ids) > 0, f"turn{i}({model_tag}) 收到事件（{len(ids)} 个）")
+        c.ok(all(x > turn_last_seq for x in ids),
+             f"turn{i} seq 全 > 前轮（min={min(ids) if ids else '-'} > {turn_last_seq}）")
+        c.ok(types.count("end_turn") >= 1, f"turn{i} 完整执行")
+        turn_last_seq = max(ids) if ids else turn_last_seq
+
+        # 逐字重放检测：本轮流不包含前面任何轮回答的 24 字连续片段
+        for j in range(i):
+            frag = _longest_common_snippet(replies[j], text)
+            c.ok(not frag,
+                 f"turn{i} 无 turn{j} 逐字重放（命中片段 {frag[:20]!r}）" if frag
+                 else f"turn{i} 无 turn{j} 逐字重放")
+
+    # 末轮上下文断言：应记得前两轮话题
+    c.ok("CAP" in replies[2] and "BASE" in replies[2],
+         f"末轮记得两个前序话题（{replies[2][:40]!r}）")
+    out.update(session_id=sid, project_id=pid, replies=[r[:60] for r in replies],
+               final_last_seq=turn_last_seq)
+    return c
+
+
 SCENARIOS = [
     ("full_turn_delivery", scenario_full_turn),
     ("full_turn_acp_ts", functools.partial(scenario_full_turn, backend="anthropic")),
@@ -645,6 +725,8 @@ SCENARIOS = [
     # 切模型（各后端独立链路）
     ("model_switch", scenario_model_switch),
     ("model_switch_acp_ts", scenario_anthropic_model_switch),
+    ("model_switch_multi", scenario_model_switch_multi),
+    ("model_switch_multi_acp_ts", functools.partial(scenario_model_switch_multi, backend="anthropic")),
     # 无 session_id 续话（前端标准姿势：rcoder 内部 project→session 映射复用）
     ("no_session_reuse", scenario_no_session_reuse),
     ("no_session_reuse_acp_ts", functools.partial(scenario_no_session_reuse, backend="anthropic")),
