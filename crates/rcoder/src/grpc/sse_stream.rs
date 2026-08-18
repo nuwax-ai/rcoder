@@ -6,7 +6,6 @@
 use chrono::{DateTime, Utc};
 use shared_types::{SessionMessageType, UnifiedSessionMessage};
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 /// 创建基于 gRPC 的 SSE 代理流
@@ -46,90 +45,167 @@ pub async fn create_grpc_sse_stream(
 {
     let (tx, rx) = tokio::sync::mpsc::channel(100);
 
-    // 每个 HTTP SSE 请求一个客户端转发 task：共享 session 的 agent_runner 流（fan-out），
-    // 按 last_seq 从 ring 增量补齐 + 订阅 broadcast 接实时，seq 去重重叠窗口。
+    // 每个 HTTP SSE 请求一条独立的 agent_runner SubscribeProgress 订阅（纯转发，
+    // agent_runner 唯一真源）：回放由订阅参数表达——带游标增量 / 首连全量兜
+    // chat→SSE 时间差 / 中间连接 live-only（不重放，防重复红线）。
     tokio::spawn(async move {
-        // 1. 获取或创建 session 共享流（每 session 一条 agent_runner SubscribeProgress 流）
-        let shared = registry
-            .get_or_create(
-                &session_id,
-                &grpc_addr,
-                pool,
-                locale,
-                activity_updater,
-                diag_ctx,
-            )
-            .await;
-        // 注册本消费者（ref_count +1）；guard drop 时 release_client（最后一个离开延迟清理共享流）
-        let _guard = shared.acquire_client(Arc::clone(&registry));
-
+        let is_first_client = registry.claim_first_client(&session_id);
         let mut client_last_seq = last_seq;
+        let initial_from = if last_seq > 0 {
+            last_seq
+        } else if is_first_client {
+            0
+        } else {
+            u64::MAX
+        };
         info!(
-            "🔗 [gRPC_SSE] client subscribed to shared stream: session_id={}, last_seq={}",
-            session_id, client_last_seq
+            "🔗 [gRPC_SSE] client stream started: session_id={}, last_seq={}, first_client={}, from_seq={}",
+            session_id, client_last_seq, is_first_client, initial_from
         );
 
-        // 2. 先订阅 broadcast(接实时),再 replay ring(补历史)——顺序不能反!
-        //    若 replay 先 subscribe 后,中间 dispatch 的事件不在 replay 也不在 receiver = 丢事件。
-        //    subscribe 先 replay 后:gap 里的事件在两边都有 → dedup(seq<=client_last_seq)去重。
-        let mut bc_rx = shared.subscribe();
+        // 活跃登记：容器销毁路径（reaper/destroyer）按 addr/session 取消本 task
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        registry.register_stream(&grpc_addr, &session_id, &cancel);
 
-        // 3. 补齐（仅限本流生命周期的首个客户端）：
-        //    - 首连（chat 先发、SSE 后连的异步模式）：replay ring 兜时间差——
-        //      连接建立时本轮事件已产生，不重放会丢整轮开头（实测验证过）。
-        //    - 重连/并发第二端（claim 返回 false）：纯实时流，不重放——消费即走，
-        //      重放已收消息违反防重复红线（前端自持历史，无需 SSE 补齐）。
-        //    - 带游标（EventSource 自动 Last-Event-ID / ?last_seq=）：视为明确续传，
-        //      无论首连与否都按游标增量补（用户主动声明缺口）。
-        //    idle 清理销毁重建 SharedStream 后首连资格自然重置——新一轮 turn
-        //    的首连仍兜时间差（此时旧轮已被终端清空，replay 无重复内容）。
-        let is_first_client = shared.claim_first_client();
-        if (client_last_seq > 0 || is_first_client)
-            && !replay_history(&shared, &tx, &session_id, &mut client_last_seq).await
-        {
-            return; // 客户端断开，或历史已含终端事件
-        }
+        let activity_secs = std::sync::atomic::AtomicI64::new(0);
+        let mut from_seq = initial_from;
 
-        // 4. 接实时事件(dedup 跳过 replay 已发的)
-        loop {
-            tokio::select! {
-                // HTTP 客户端断开（SSE Receiver 全 drop）→ 退出（_guard drop 时 release_client）
-                _ = tx.closed() => {
-                    info!(
-                        "🔌 [gRPC_SSE] client disconnected: session_id={}",
-                        session_id
+        for attempt in 1..=crate::grpc::session_stream_registry::MAX_RETRIES {
+            if cancel.is_cancelled() {
+                info!(
+                    "[gRPC_SSE] cancelled (container shutdown): session_id={}",
+                    session_id
+                );
+                return;
+            }
+            let mut client = match pool.get_client(&grpc_addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "[gRPC_SSE] get_client failed (attempt {}/{}): session_id={}, {}",
+                        attempt,
+                        crate::grpc::session_stream_registry::MAX_RETRIES,
+                        session_id,
+                        e
                     );
-                    return;
-                }
-                r = bc_rx.recv() => {
-                    // 去重：补齐阶段已发的（补齐与订阅之间窗口）跳过；
-                    // seq=0 合成消息（idle/error）无条件转发，不更新游标。
-                    let ev = match r {
-                        Ok(ev) => ev,
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            // 慢消费者丢消息：回退 ring 按 client_last_seq 补齐缺失
-                            warn!(
-                                "⚠️ [gRPC_SSE] client lagged by {}, replay from ring: session_id={}",
-                                n, session_id
-                            );
-                            if !replay_history(&shared, &tx, &session_id, &mut client_last_seq).await {
-                                return;
-                            }
-                            continue;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            info!(
-                                "✅ [gRPC_SSE] shared stream closed: session_id={}",
-                                session_id
-                            );
-                            return;
-                        }
-                    };
-                    if ev.seq != 0 && ev.seq <= client_last_seq {
+                    pool.remove(&grpc_addr).await;
+                    if attempt < crate::grpc::session_stream_registry::MAX_RETRIES {
                         continue;
                     }
-                    if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
-                        return; // 客户端断开，或终端事件（SessionPromptEnd）
+                    let err_ev = crate::grpc::session_stream_registry::make_terminal_error_event(
+                        diag_ctx.as_ref(),
+                        locale,
+                    )
+                    .await;
+                    let _ =
+                        forward_to_client(&tx, &err_ev, &session_id, &mut client_last_seq).await;
+                    registry.release_first_client_claim(&session_id);
+                    return;
+                }
+            };
+
+            let req = crate::grpc::locale_metadata::new_request_with_locale(
+                shared_types::grpc::ProgressRequest {
+                    session_id: session_id.clone(),
+                    from_seq: Some(from_seq),
+                },
+                locale,
+            );
+            let mut stream = match client.subscribe_progress(req).await {
+                Ok(resp) => resp.into_inner(),
+                Err(e) => {
+                    warn!(
+                        "[gRPC_SSE] subscribe failed (attempt {}/{}): session_id={}, {}",
+                        attempt,
+                        crate::grpc::session_stream_registry::MAX_RETRIES,
+                        session_id,
+                        e
+                    );
+                    if attempt < crate::grpc::session_stream_registry::MAX_RETRIES {
+                        pool.remove(&grpc_addr).await;
+                        continue;
+                    }
+                    let err_ev = crate::grpc::session_stream_registry::make_terminal_error_event(
+                        diag_ctx.as_ref(),
+                        locale,
+                    )
+                    .await;
+                    let _ =
+                        forward_to_client(&tx, &err_ev, &session_id, &mut client_last_seq).await;
+                    registry.release_first_client_claim(&session_id);
+                    return;
+                }
+            };
+            info!(
+                "[gRPC_SSE] SubscribeProgress established: session_id={}, from_seq={}",
+                session_id, from_seq
+            );
+
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        info!("[gRPC_SSE] cancelled (container shutdown): session_id={}", session_id);
+                        return;
+                    }
+                    _ = tx.closed() => {
+                        info!("🔌 [gRPC_SSE] client disconnected: session_id={}", session_id);
+                        return;
+                    }
+                    msg = stream.message() => match msg {
+                        Ok(Some(ev)) => {
+                            crate::grpc::session_stream_registry::maybe_update_activity(
+                                &activity_updater,
+                                &session_id,
+                                &activity_secs,
+                            );
+                            // seq 回退检测（替代旧 GetStatus/epoch 轮询）：agent_runner
+                            // 重启后新 epoch 从 1 重新计数，旧游标会把新事件当重复丢弃——
+                            // 先发 cursor-reset 哨兵并清零本地游标
+                            if ev.seq != 0 && ev.seq <= client_last_seq {
+                                warn!(
+                                    "⚠️ [gRPC_SSE] seq regression (agent restarted?): session_id={}, seq={}, cursor={}, resetting",
+                                    session_id, ev.seq, client_last_seq
+                                );
+                                let reset = crate::grpc::session_stream_registry::make_cursor_reset_event();
+                                if !forward_to_client(&tx, &reset, &session_id, &mut client_last_seq).await {
+                                    return;
+                                }
+                            }
+                            if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
+                                // turn 终态（end_turn/error）→ 归还首连资格（新一轮 turn
+                                // 的首连重新可兜时间差）；客户端断开 → 直接退出
+                                if crate::grpc::session_stream_registry::is_turn_terminal(
+                                    &ev.message_type, &ev.sub_type,
+                                ) {
+                                    registry.release_first_client_claim(&session_id);
+                                }
+                                return;
+                            }
+                        }
+                        Ok(None) => {
+                            // agent_runner 正常关流但未推终端（防御）：补终态避免客户端 hang
+                            let ev = crate::grpc::session_stream_registry::make_prompt_end_event();
+                            let _ = forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await;
+                            registry.release_first_client_claim(&session_id);
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "[gRPC_SSE] stream error: session_id={}, code={}, msg={}",
+                                session_id, e.code(), e.message()
+                            );
+                            if attempt < crate::grpc::session_stream_registry::MAX_RETRIES {
+                                pool.remove(&grpc_addr).await;
+                                from_seq = client_last_seq; // 增量重订
+                                break; // 内层退出，外层重试
+                            }
+                            let err_ev = crate::grpc::session_stream_registry::make_stream_error_event(
+                                e.code(), e.message(),
+                            );
+                            let _ = forward_to_client(&tx, &err_ev, &session_id, &mut client_last_seq).await;
+                            registry.release_first_client_claim(&session_id);
+                            return;
+                        }
                     }
                 }
             }
@@ -137,23 +213,6 @@ pub async fn create_grpc_sse_stream(
     });
 
     tokio_stream::wrappers::ReceiverStream::new(rx)
-}
-
-/// 从共享流 ring 补齐 `seq > client_last_seq` 的历史并转发。
-/// 返回 `false` = 调用方应结束 task（客户端断开或补齐中遇到终端事件）。
-/// 初始补齐与 Lagged 回退共用（原先两处相同循环）。
-async fn replay_history(
-    shared: &Arc<crate::grpc::session_stream_registry::SharedStream>,
-    tx: &tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
-    session_id: &str,
-    client_last_seq: &mut u64,
-) -> bool {
-    for ev in shared.replay_since(*client_last_seq) {
-        if !forward_to_client(tx, &ev, session_id, client_last_seq).await {
-            return false;
-        }
-    }
-    true
 }
 
 /// 转发一个 ProgressEvent 到 HTTP SSE channel。

@@ -1,184 +1,147 @@
-//! Session 级共享 SSE 流注册表
+//! per-client SSE 转发流注册表（agent_runner 唯一真源架构）。
 //!
-//! 对每个 session_id 维护【一条】共享的 agent_runner `SubscribeProgress` 流，
-//! 多个 HTTP SSE 客户端通过 `broadcast` fan-out 共享同一条流的输出，
-//! 从根上消除"每个 HTTP SSE 请求新建一条 agent_runner 流 → 各自全量 replay → 重复消息"。
+//! 架构（2026-08-19 去 ring 重构）：**每个 HTTP SSE 客户端一条独立的
+//! agent_runner `SubscribeProgress(from_seq)` 订阅**，rcoder 纯转发——
+//! 历史回放由 agent_runner 的订阅参数表达（from_seq=0 全量 / N 增量 /
+//! u64::MAX live-only），rcoder 不再缓存任何消息（原 SharedStream 的
+//! ring/replay/终端即清/fan-out 状态机整体移除）。
 //!
-//! 配合 agent_runner 的 seq 增量 replay（`ProgressEvent.seq`）：
-//! - 共享流后台 task 建立/重建时，向 agent_runner 传 `from_seq = last_seq`，只拉缺失部分。
-//! - HTTP 客户端按各自的消费游标从 ring 增量补齐，并跳过 broadcast 中 `seq <= 已收最大值`
-//!   的重叠消息（补齐与订阅之间的窗口去重）。
+//! 本注册表保留两件事：
+//! 1. **首连资格**（served_sessions）：无游标客户端"首连兜 chat→SSE 时间差
+//!    （from_seq=0 全量回放）vs 中间连接纯实时（不重放，防重复红线）"的裁决；
+//!    turn 终态（end_turn/error）时归还资格——新一轮 turn 的首连重新可兜。
+//! 2. **活跃流登记**（active）：容器销毁路径（reaper/restart/destroyer）按
+//!    grpc_addr / session_id 取消该容器上的所有客户端转发 task。
 
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
-use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Observer, Producer};
 use shared_types::grpc::ProgressEvent;
-use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::Code;
-use tracing::{debug, info, warn};
-
-use super::GrpcChannelPool;
-use crate::handler::utils::{DiagCtx, diagnose, root_cause_message};
-
-/// broadcast 每个 receiver 的缓冲（高频 agent_message_chunk 时给慢消费者足够窗口）
-const BROADCAST_CAPACITY: usize = 256;
-/// rcoder 侧历史 ring buffer 容量（与 agent_runner 一致，用于新客户端增量补齐 / Lagged 回退）
-const RING_CAPACITY: usize = 1000;
-/// 最后一个 HTTP 客户端断开后，延迟清理共享流的时间（处理前端短暂断线重连）
-const IDLE_CLEANUP_SECS: u64 = 30;
-/// activity_updater 节流间隔（与 sse_stream 一致）
-const ACTIVITY_UPDATE_THROTTLE_SECS: i64 = 10;
-/// agent_runner 流重试次数
-const MAX_RETRIES: u32 = 2;
-
-type SharedEvent = Arc<ProgressEvent>;
+use tracing::info;
 
 /// SSE 共享流关闭回调类型（参数为 grpc_addr）。
 /// 容器销毁路径（reaper/restart/ensure/destroyer）按地址关闭前端进度流。
 pub type ShutdownSseFn = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// Session → 共享流注册表（rcoder 进程级单例，挂在 `AppState`）。
+/// 流错误重试上限（连接失败/流错误的重试次数）
+pub(crate) const MAX_RETRIES: u32 = 2;
+
+/// activity 更新节流（秒）：收到 agent 任务进度事件时节流更新 project 活跃时间，
+/// 防止 cleanup_task 在长任务执行期间误判 idle。
+const ACTIVITY_UPDATE_THROTTLE_SECS: i64 = 10;
+
+/// 活跃 per-client 转发 task 的登记项（Weak：task 自然结束无需回表清理，
+/// 失效条目在下次登记/扫描时懒惰回收）
+struct ActiveStreamRegistration {
+    session_id: String,
+    token: std::sync::Weak<CancellationToken>,
+}
+
+/// SSE 流注册表（rcoder 进程级单例，挂在 `AppState`）。
 pub struct SessionStreamRegistry {
-    streams: DashMap<String, Arc<SharedStream>>,
-    /// 已服务过客户端的 session（首连资格的权威载体——跨 SharedStream 生命周期：
-    /// 长 turn + 30s idle 清理重连会重建 SharedStream，流级标志会丢失导致
-    /// 误重放已收消息。终端事件时移除条目 = 新一轮 turn 的首连重新获得资格）。
+    /// 已服务过客户端的 session（首连资格）：跨转发 task 生命周期——
+    /// 长 turn 中客户端断连重连不会误重放已收消息；终端事件时移除条目
+    /// = 新一轮 turn 的首连重新获得资格。
     served_sessions: DashMap<String, ()>,
-    /// per-session 创建锁：序列化 `get_or_create` 的慢速路径，避免并发创建多个 SharedStream。
-    /// 必要性：agent_runner 的 `current_connection` 是单连接模型（`create_new_connection` cancel 旧 token），
-    /// 若并发创建 N 个 SharedStream，它们各自建立的 agent_runner SubscribeProgress 流会互相 cancel 抖动，
-    /// 导致 registry 持有的流被反复 cancel、客户端收不到稳定事件。
-    create_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// grpc_addr → 活跃 per-client 转发 task（容器销毁按 addr 批量取消）
+    active: DashMap<String, Vec<ActiveStreamRegistration>>,
 }
 
 impl SessionStreamRegistry {
     pub fn new() -> Self {
         Self {
-            streams: DashMap::new(),
             served_sessions: DashMap::new(),
-            create_locks: DashMap::new(),
+            active: DashMap::new(),
         }
     }
 
-    /// 仅当 registry 中仍是指定实例时移除并关闭，避免快慢路径行为不一致。
-    fn remove_and_shutdown(&self, session_id: &str, expected: &Arc<SharedStream>) -> bool {
-        let Some((_, removed)) = self
-            .streams
-            .remove_if(session_id, |_, current| Arc::ptr_eq(current, expected))
-        else {
-            return false;
-        };
-        removed.shutdown();
-        true
+    /// 声明首连资格：该 session 第一次被客户端服务返回 true（其订阅
+    /// from_seq=0 全量回放，兜 chat→SSE 时间差），后续连接返回 false
+    /// （live-only，不重放——防重复红线）。turn 终态自动归还资格。
+    pub fn claim_first_client(&self, session_id: &str) -> bool {
+        self.served_sessions
+            .insert(session_id.to_string(), ())
+            .is_none()
     }
 
-    /// 强制关闭某 session 的共享流（容器销毁/项目删除时调用）。
-    /// 与 [`remove_and_shutdown`] 的 ptr_eq 精确清理不同，这是销毁语义：无条件移除该 session 的流，
-    /// 让后台 gRPC task 尽快退出，避免对已失效地址重试到 MAX_RETRIES。
-    pub fn shutdown_session(&self, session_id: &str) -> bool {
-        if let Some((_, removed)) = self.streams.remove(session_id) {
-            removed.shutdown();
-            self.remove_unused_create_lock(session_id);
-            true
-        } else {
-            false
-        }
+    /// turn 终态（end_turn/error）归还首连资格：新一轮 turn 的首个客户端
+    /// 重新可兜时间差。转发 task 在终端事件转发后调用。
+    pub fn release_first_client_claim(&self, session_id: &str) {
+        self.served_sessions.remove_if(session_id, |_, _| true);
     }
 
-    /// 获取或创建 session 的共享流。
-    ///
-    /// 并发安全：参照 `session_cache::push_session_update` 的快速路径(`view`) + 慢速路径(`entry` 外 await)，
-    /// 严守"不在 DashMap entry 持锁范围内 await"（项目规范，避免 shard 锁跨 yield 死锁）。
-    ///
-    /// grpc_addr 变化（容器重建）或后台 task 已退出时，作废旧流重建。
-    pub async fn get_or_create(
-        self: &Arc<Self>,
-        session_id: &str,
+    /// 登记活跃转发 task（转发 task 建立时调用；token 由 shutdown 路径取消）。
+    /// 懒惰回收：登记时清理同 addr 下已失效（Weak upgrade 失败）的旧条目。
+    pub(crate) fn register_stream(
+        &self,
         grpc_addr: &str,
-        pool: Arc<GrpcChannelPool>,
-        locale: &'static str,
-        activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
-        diag_ctx: Option<Arc<DiagCtx>>,
-    ) -> Arc<SharedStream> {
-        // 快速路径：存在 + grpc_addr 匹配 + 后台 task 存活 → 复用
-        if let Some(existing) = self.streams.view(session_id, |_, v| v.clone()) {
-            if existing.matches_addr(grpc_addr) && existing.is_alive() {
-                return existing;
-            }
-            // grpc_addr 变化（容器重建）或 task 已死 → 移除并 shutdown 旧 task（cancel 后台
-            // gRPC task，避免它继续重试已失效的旧 grpc_addr 而短暂泄漏资源）。
-            self.remove_and_shutdown(session_id, &existing);
-        }
-
-        // 慢速路径：per-session 创建锁序列化，避免并发创建多个 SharedStream
-        // （见 create_locks 字段注释：agent_runner 单连接模型下多个流会互相 cancel 抖动）。
-        let lock = self
-            .create_locks
-            .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _create_guard = lock.lock().await;
-
-        // double-check：持锁后，可能已有其他并发请求创建了可复用的流
-        if let Some(existing) = self.streams.view(session_id, |_, v| v.clone()) {
-            if existing.matches_addr(grpc_addr) && existing.is_alive() {
-                return existing;
-            }
-            // 这里可能移除另一个创建者刚插入但 grpc_addr 不匹配的活跃流，必须同步 cancel
-            // 它的后台 task；只 remove 会让 task 持有 Arc 并继续运行到自然断流。
-            self.remove_and_shutdown(session_id, &existing);
-        }
-
-        // 锁内创建（含 spawn 后台 task 的 await）；此时无并发创建者，安全。
-        let new_stream = SharedStream::new(
-            Arc::downgrade(self),
-            session_id.to_string(),
-            grpc_addr.to_string(),
-            pool,
-            locale,
-            activity_updater,
-            diag_ctx,
-        )
-        .await;
-        self.streams
-            .insert(session_id.to_string(), new_stream.clone());
-        new_stream
+        session_id: &str,
+        token: &Arc<CancellationToken>,
+    ) {
+        self.active
+            .entry(grpc_addr.to_string())
+            .and_modify(|list| {
+                list.retain(|r| r.token.upgrade().is_some());
+                list.push(ActiveStreamRegistration {
+                    session_id: session_id.to_string(),
+                    token: Arc::downgrade(token),
+                });
+            })
+            .or_insert_with(|| {
+                vec![ActiveStreamRegistration {
+                    session_id: session_id.to_string(),
+                    token: Arc::downgrade(token),
+                }]
+            });
     }
 
-    /// 按 grpc_addr 批量关闭共享流（容器销毁路径：reaper/restart/ensure/destroyer 调用）。
-    ///
-    /// 与 [`shutdown_session`] 的按 session_id 关闭不同，此方法用于"project/session 记录可能
-    /// 已被清空、只剩 grpc_addr 可用"的销毁路径。销毁语义：无条件移除匹配地址的流，先发终态
-    /// SessionPromptEnd 事件再 cancel 后台 task。幂等：重复调用返回 0。
-    pub fn shutdown_streams_by_addr(&self, grpc_addr: &str) -> usize {
-        // 两阶段：先迭代收集 (session_id, Arc)，再逐个 remove_if(ptr_eq) + shutdown。
-        // 避免在 DashMap 迭代持 shard 锁期间执行 shutdown 的 broadcast send。
-        let matches: Vec<(String, Arc<SharedStream>)> = self
-            .streams
-            .iter()
-            .filter(|entry| entry.value().matches_addr(grpc_addr))
-            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
-            .collect();
-        let total = matches.len();
+    /// 强制关闭某 session 的所有客户端转发流（容器销毁/项目删除时调用）。
+    /// 全表扫描（活跃 SSE 会话数量级小）；幂等。
+    pub fn shutdown_session(&self, session_id: &str) -> bool {
         let mut closed = 0usize;
-        for (session_id, shared) in matches {
-            // ptr_eq 确保只移除迭代时看到的同一实例（并发 get_or_create 可能已替换为新流）
-            if let Some((_, removed)) = self
-                .streams
-                .remove_if(&session_id, |_, current| Arc::ptr_eq(current, &shared))
-            {
-                removed.shutdown();
-                self.remove_unused_create_lock(&session_id);
-                closed += 1;
-            }
+        for mut entry in self.active.iter_mut() {
+            entry.value_mut().retain(|r| {
+                r.token.upgrade().is_some_and(|t| {
+                    if r.session_id == session_id {
+                        t.cancel();
+                        closed += 1;
+                        false
+                    } else {
+                        true
+                    }
+                })
+            });
         }
+        if closed > 0 {
+            info!(
+                "[SessionStream] shutdown_session: session_id={}, closed={}",
+                session_id, closed
+            );
+        }
+        closed > 0
+    }
+
+    /// 按 grpc_addr 批量关闭客户端转发流（容器销毁路径：reaper/restart/ensure/
+    /// destroyer 调用——"project/session 记录可能已被清空、只剩 grpc_addr 可用"）。
+    /// 幂等：重复调用返回 0。
+    pub fn shutdown_streams_by_addr(&self, grpc_addr: &str) -> usize {
+        let Some((_, mut list)) = self.active.remove(grpc_addr) else {
+            return 0;
+        };
+        let total = list.len();
+        let mut closed = 0usize;
+        list.retain(|r| {
+            if let Some(t) = r.token.upgrade() {
+                t.cancel();
+                closed += 1;
+                false
+            } else {
+                false // 失效条目一并清理
+            }
+        });
         info!(
             "[SessionStream] shutdown_streams_by_addr: grpc_addr={}, matched={}, closed={}",
             grpc_addr, total, closed
@@ -186,24 +149,13 @@ impl SessionStreamRegistry {
         closed
     }
 
-    /// 当前活跃共享流数量（测试 / 观测用）
+    /// 当前活跃登记的会话数（测试 / 观测用：按 addr 汇总）
     pub fn len(&self) -> usize {
-        self.streams.len()
-    }
-
-    fn remove_unused_create_lock(&self, session_id: &str) {
-        if let dashmap::mapref::entry::Entry::Occupied(entry) =
-            self.create_locks.entry(session_id.to_string())
-            && Arc::strong_count(entry.get()) == 1
-        {
-            // entry guard prevents a concurrent get_or_create from cloning this Arc between the
-            // strong-count check and removal. Any current/waiting creator contributes another Arc.
-            entry.remove();
-        }
+        self.active.iter().map(|e| e.value().len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.streams.is_empty()
+        self.active.is_empty()
     }
 }
 
@@ -213,298 +165,21 @@ impl Default for SessionStreamRegistry {
     }
 }
 
-/// 一个 session 的共享流：一条 agent_runner `SubscribeProgress` 后台 task + `broadcast` fan-out + 历史 ring。
-pub struct SharedStream {
-    session_id: String,
-    grpc_addr: String,
-    broadcast_tx: broadcast::Sender<SharedEvent>,
-    ring: Mutex<HeapRb<(u64, SharedEvent)>>,
-    ref_count: AtomicUsize,
-    last_seq: AtomicU64,
-    /// agent_runner 该 session 的 stream epoch(GetStatus 返回)。同 epoch → 保留 last_seq 增量订阅;
-    /// epoch 变化(agent 重启/worker panic 重建)→ 重置 last_seq + 清 ring + cursor-reset(#15)。
-    epoch: Mutex<Option<String>>,
-    last_activity_secs: AtomicI64,
-    activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
-    cancel_token: CancellationToken,
-    task_handle: OnceLock<JoinHandle<()>>,
-    /// 诊断上下文:后台 task 重试耗尽发终态错误事件时,据此做 OOM/crashloop 等精准诊断,
-    /// 替代通用文案。None(测试/无 runtime)→ 通用"Compute environment temporarily unavailable"。
-    diag_ctx: Option<Arc<DiagCtx>>,
-    /// 所属 registry 的弱引用：终端事件时移除 served_sessions 条目
-    /// （新一轮 turn 的首连重新获得 replay 资格）。Weak 防引用环
-    /// （registry.streams 强持有 SharedStream）。
-    registry: std::sync::Weak<SessionStreamRegistry>,
-}
-
-impl SharedStream {
-    async fn new(
-        registry: std::sync::Weak<SessionStreamRegistry>,
-        session_id: String,
-        grpc_addr: String,
-        pool: Arc<GrpcChannelPool>,
-        locale: &'static str,
-        activity_updater: Arc<dyn Fn(&str) + Send + Sync>,
-        diag_ctx: Option<Arc<DiagCtx>>,
-    ) -> Arc<Self> {
-        let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let shared = Arc::new(Self {
-            session_id: session_id.clone(),
-            grpc_addr: grpc_addr.clone(),
-            broadcast_tx,
-            ring: Mutex::new(HeapRb::<(u64, SharedEvent)>::new(RING_CAPACITY)),
-            ref_count: AtomicUsize::new(0),
-            last_seq: AtomicU64::new(0),
-            epoch: Mutex::new(None),
-            last_activity_secs: AtomicI64::new(0),
-            activity_updater: Arc::clone(&activity_updater),
-            cancel_token: CancellationToken::new(),
-            task_handle: OnceLock::new(),
-            diag_ctx: diag_ctx.clone(),
-            registry,
-        });
-
-        let handle = spawn_backend_task(
-            Arc::clone(&shared),
-            grpc_addr,
-            pool,
-            locale,
-            activity_updater,
-        );
-        if let Err(handle) = shared.task_handle.set(handle) {
-            handle.abort();
-            warn!(session_id = %shared.session_id, "backend task handle was initialized twice");
-        }
-        shared
-    }
-
-    fn matches_addr(&self, grpc_addr: &str) -> bool {
-        self.grpc_addr == grpc_addr
-    }
-
-    /// 后台 task 仍存活（未 cancel 且 JoinHandle 未结束）
-    fn is_alive(&self) -> bool {
-        if self.cancel_token.is_cancelled() {
-            return false;
-        }
-        match self.task_handle.get() {
-            Some(h) => !h.is_finished(),
-            None => false,
-        }
-    }
-
-    /// 注册一个 HTTP 客户端消费者（ref_count +1），返回 RAII guard。
-    /// guard 持有 `Arc<SharedStream>`，drop 时直接减【自己的】ref_count（见 ClientGuard::drop）。
-    pub fn acquire_client(self: &Arc<Self>, registry: Arc<SessionStreamRegistry>) -> ClientGuard {
-        self.ref_count.fetch_add(1, Ordering::AcqRel);
-        ClientGuard {
-            registry,
-            shared: Arc::clone(self),
-            session_id: self.session_id.clone(),
-        }
-    }
-
-    /// 当前已观察到的最大 seq（HTTP 客户端 ring 补齐的起点；agent_runner 流重建时的 from_seq）
-    pub fn last_seq(&self) -> u64 {
-        self.last_seq.load(Ordering::Acquire)
-    }
-
-    /// 订阅 broadcast（实时事件）
-    pub fn subscribe(&self) -> broadcast::Receiver<SharedEvent> {
-        self.broadcast_tx.subscribe()
-    }
-
-    /// 声明首连资格：该 session（registry 级，跨 SharedStream 生命周期）第一次
-    /// 被客户端服务返回 true（其 replay 用于兜 chat→SSE 时间差），后续连接返回
-    /// false（纯实时，不重放——防重复红线）。终端事件自动归还资格。
-    pub fn claim_first_client(&self) -> bool {
-        match self.registry.upgrade() {
-            Some(reg) => reg
-                .served_sessions
-                .insert(self.session_id.clone(), ())
-                .is_none(),
-            None => true, // registry 已销毁（仅测试场景）：退化为总是允许
-        }
-    }
-
-    /// 终端事件归还首连资格：新一轮 turn 的首个客户端重新可兜时间差。
-    /// dispatch_event 的终端分支调用（正常/异常/合成终端统一路径）。
-    fn release_first_client_claim(&self) {
-        if let Some(reg) = self.registry.upgrade() {
-            reg.served_sessions.remove_if(&self.session_id, |_, _| true);
-        }
-    }
-
-    /// 增量补齐：从 ring 读取 `seq > from_seq` 的事件（非破坏性，按 seq 升序）。
-    /// 用于 HTTP 客户端建连时补齐错过的历史；与 broadcast 实时流配合时需按 seq 去重重叠窗口。
-    pub fn replay_since(&self, from_seq: u64) -> Vec<SharedEvent> {
-        let ring = self.ring.lock();
-        ring.iter()
-            // seq=0 是 cursor-reset 哨兵：无条件返回，让断线重连客户端也能收到它并由
-            // forward_to_client 重置去重游标（修复 epoch 变更后重连丢事件）。
-            .filter(|(s, _)| *s == 0 || *s > from_seq)
-            .map(|(_, ev)| Arc::clone(ev))
-            .collect()
-    }
-
-    /// 后台 task 收到事件时调用：真实消息(seq>=1)存 ring + 更新 last_seq + 节流刷新 activity；
-    /// 所有消息（含 seq=0 合成消息）broadcast 给客户端。
-    fn dispatch_event(&self, ev: SharedEvent) {
-        let seq = ev.seq;
-        // 终端判定：agent 异常退出的 error 事件在转换层已归一化为 End(sub_type="error")，
-        // 此处单一判定即覆盖正常/异常两种路径。
-        // cancelled 不算 turn 边界：它是"用户连发消息自动取消当前任务"的常态事件
-        // （agent 随后继续执行新任务），清 ring/归还资格会破坏下一轮的 replay 语义。
-        let is_terminal = is_turn_terminal(&ev.message_type, &ev.sub_type);
-        if seq > 0 {
-            {
-                let mut ring = self.ring.lock();
-                if ring.is_full() {
-                    ring.try_pop();
-                }
-                if ring.try_push((seq, Arc::clone(&ev))).is_err() {
-                    warn!(
-                        "[SessionStream] ring push failed (full?), real-time only: session_id={}, seq={}",
-                        self.session_id, seq
-                    );
-                }
-            }
-            self.last_seq.store(seq, Ordering::Release);
-            maybe_update_activity(
-                &self.activity_updater,
-                &self.session_id,
-                &self.last_activity_secs,
-            );
-        }
-        // broadcast：无 receiver 时 send 返回 Err（客户端全断时事件只留 ring）。
-        // 高频路径 (每个流式 chunk 都经过), 且"无订阅者"是正常态 (客户端全断后
-        // 流要等 idle 清理窗口才移除), 用 debug 避免日志刷屏。
-        if let Err(send_err) = self.broadcast_tx.send(ev) {
-            debug!("[SessionStream] broadcast send failed (no subscriber): {send_err}");
-        }
-        // 🔚 turn 边界：终端事件（end_turn/error 等）广播后清空历史 ring。
-        //
-        // 修复"切换模型后第二轮对话 SSE 收到上一轮重复消息"：
-        // 前端收到 end_turn 即断开 SSE；下一轮重连（尤其换模型重置上下文时）常以
-        // last_seq=0 全量重放——若 ring 仍保留上一轮 seq 1..N，会把整轮旧消息重发。
-        // 清 ring 后重放为空，新客户端只收本轮实时消息；断线补齐语义仅覆盖"当前
-        // 未完成 turn"（跨轮历史属于前端自身状态/历史接口，不由 SSE replay 承载）。
-        //
-        // 注意：**不清 last_seq**——单调游标是后台流断开重连（from_seq=last_seq）不
-        // 回放旧消息的依据；agent_runner 侧在新一轮 chat 的 prepare 阶段也会清自己的
-        // ring，两侧配合正好构成完整边界。
-        if is_terminal {
-            self.clear_ring();
-            self.release_first_client_claim();
-            debug!(
-                "[SessionStream] terminal event dispatched, ring cleared for next turn: session_id={}, seq={}",
-                self.session_id, seq
-            );
-        }
-    }
-
-    /// 清空历史 ring(epoch 变化时调用,丢弃旧 epoch 的事件,避免新 epoch 重放旧事件)。
-    fn clear_ring(&self) {
-        let mut ring = self.ring.lock();
-        *ring = HeapRb::<(u64, SharedEvent)>::new(RING_CAPACITY);
-    }
-
-    /// 把 cursor-reset 哨兵(seq=0)写入 ring。
-    /// dispatch_event 跳过 seq=0 故单独推送；目的是让断线重连客户端经 replay_since 取到哨兵，
-    /// 进而由 forward_to_client 重置去重游标（broadcast 只投递订阅后的消息，重连客户端收不到）。
-    fn push_reset_to_ring(&self, ev: SharedEvent) {
-        let mut ring = self.ring.lock();
-        if ring.is_full() {
-            ring.try_pop();
-        }
-        drop(ring.try_push((0, ev)));
-    }
-
-    fn shutdown(&self) {
-        // 先通知所有连着的客户端：流即将结束。避免 task 被 cancel 后 broadcast Receiver 不 Closed
-        // （SharedStream 仍持有 sender）导致客户端转发 task hang。发 SessionPromptEnd 让
-        // forward_to_client 检测终端后优雅退出。
-        let end_ev = Arc::new(ProgressEvent {
-            message_type: "SessionPromptEnd".to_string(),
-            sub_type: "stream_ended".to_string(),
-            payload:
-                r#"{"reason":"StreamEnded","description":"Session stream replaced or cleaned up"}"#
-                    .to_string(),
-            request_id: None,
-            seq: 0,
-            timestamp: now_millis(),
-        });
-        // 走 dispatch_event：broadcast 之外还要清 ring（流被替换/清理时 ring 里的
-        // 半轮残留不得留给下一个复用该 session 的客户端）
-        self.dispatch_event(end_ev);
-        self.cancel_token.cancel();
-        // 不 await task：避免 get_or_create（HTTP 请求路径）阻塞——后台 task 在 get_client/get_status/
-        // subscribe_progress 等连接阶段不响应 cancel，若 await 会卡住 HTTP 请求。task 会在 stream 循环
-        // 响应 cancel 退出，或连接失败重试（MAX_RETRIES）耗尽退出；其持有的 Arc 随 task 退出回收，
-        // streams 已 remove_if，无泄漏。
-    }
-}
-
-/// HTTP 客户端消费 guard：持有 `Arc<SharedStream>`，drop 时直接减【自己的】ref_count
-/// （不按 session_id 反查 streams——grpc_addr 变化后 streams 里可能是新 SharedStream，反查会误减新的，
-///  且旧的永不减导致泄漏）。最后一个客户端离开时延迟清理，`remove_if` 用 `ptr_eq` 确保只删自己的 shared。
-pub struct ClientGuard {
-    registry: Arc<SessionStreamRegistry>,
-    shared: Arc<SharedStream>,
-    session_id: String,
-}
-
-impl Drop for ClientGuard {
-    fn drop(&mut self) {
-        let prev = self.shared.ref_count.fetch_sub(1, Ordering::AcqRel);
-        if prev > 1 {
-            return; // 仍有其他客户端连着
-        }
-        // 最后一个客户端离开 → 延迟清理（期间若有新客户端连入，ref_count>0，不清理）
-        let registry = Arc::clone(&self.registry);
-        let session_id = std::mem::take(&mut self.session_id);
-        let shared = Arc::clone(&self.shared);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                tokio::time::sleep(Duration::from_secs(IDLE_CLEANUP_SECS)).await;
-                if shared.ref_count.load(Ordering::Acquire) != 0 {
-                    return; // 期间有新客户端连入，放弃清理
-                }
-                // remove_if 用 ptr_eq：grpc_addr 变化后 streams 里可能是新 SharedStream，不能误删；
-                // 若本 shared 已不在 streams（被 grpc_addr 变化替换），返回 None，这里只让 Arc 随 drop 回收。
-                if let Some((_, removed)) = registry
-                    .streams
-                    .remove_if(&session_id, |_, v| Arc::ptr_eq(v, &shared))
-                {
-                    removed.shutdown();
-                    // 仅在没有创建者持有/等待这把锁时移除，避免同一 session 短暂出现两把锁，
-                    // 破坏 get_or_create 的 single-flight 保证。
-                    registry.remove_unused_create_lock(&session_id);
-                    info!(
-                        "[SessionStream] idle cleanup after {}s: session_id={}",
-                        IDLE_CLEANUP_SECS, session_id
-                    );
-                }
-            });
-        }
-    }
-}
-
-/// 节流刷新 session 活跃时间（防 idle cleaner 误杀；与 sse_stream 语义一致）。
 /// turn 边界终端：本轮任务真实结束（正常完成或错误终止）。
 /// `cancelled` 不算——它是"用户连发消息自动取消当前任务"的常态事件，agent 随后
-/// 继续执行新任务；此刻清 ring/归还首连资格会破坏下一轮的 replay 语义。
+/// 继续执行新任务；此刻归还首连资格会破坏下一轮的 replay 语义。
 pub(crate) fn is_turn_terminal(message_type: &str, sub_type: &str) -> bool {
     message_type == "SessionPromptEnd" && matches!(sub_type, "end_turn" | "error")
 }
 
-/// SSE 流关闭信号：turn 终态 + rcoder 内部合成的 `stream_ended`（流被替换/清理，
-/// 必须让客户端转发 task 退出并重连，否则 hang）。
+/// SSE 流关闭信号：turn 终态（end_turn/error）+ rcoder 内部合成的 `stream_ended`。
+/// cancelled 不关流——它是"用户连发消息自动取消"的常态事件，流保持供下一轮
+/// 实时投递（与 agent_runner 侧订阅判定对齐）。
 pub(crate) fn is_stream_closing(message_type: &str, sub_type: &str) -> bool {
     message_type == "SessionPromptEnd" && matches!(sub_type, "end_turn" | "error" | "stream_ended")
 }
 
-fn maybe_update_activity(
+pub(crate) fn maybe_update_activity(
     updater: &Arc<dyn Fn(&str) + Send + Sync>,
     session_id: &str,
     last_update_secs: &AtomicI64,
@@ -527,7 +202,7 @@ fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// agent idle 时的 SessionPromptEnd 事件（seq=0 合成消息，客户端无条件转发）
+/// agent_runner 正常关流但未推终端时的兜底 SessionPromptEnd（seq=0 合成消息）
 pub(crate) fn make_prompt_end_event() -> ProgressEvent {
     ProgressEvent {
         message_type: "SessionPromptEnd".to_string(),
@@ -543,8 +218,7 @@ pub(crate) fn make_prompt_end_event() -> ProgressEvent {
 /// agent_runner 流传输中出错（seq=0 合成消息）
 pub(crate) fn make_stream_error_event(code: Code, _message: &str) -> ProgressEvent {
     let error_code = map_tonic_code(code);
-    // 用 serde_json 构造,避免 format! 拼接产生非法 JSON(error_code 虽为静态串,
-    // 统一走安全路径以便未来扩展)。
+    // 用 serde_json 构造,避免 format! 拼接产生非法 JSON。
     let payload = serde_json::json!({
         "code": error_code,
         "message": "Agent execution error, please retry.",
@@ -562,26 +236,21 @@ pub(crate) fn make_stream_error_event(code: Code, _message: &str) -> ProgressEve
 
 /// gRPC 连接彻底失败(重试耗尽;seq=0 合成终态事件)。
 ///
-/// 不再把 transport 原文塞进 SSE 事件 —— 原文对用户无意义(transport error 多半不是根因),
-/// 且已在调用处 `warn!` 入日志供排查。有 [`DiagCtx`] 时做一次**实时诊断**(OOM/CrashLoop/
-/// 容器缺失/启动中),给精准根因文案(与 chat 路径共用 [`root_cause_message`],两路一致);
-/// 无 DiagCtx(测试 / 无 runtime)→ 通用"Compute environment temporarily unavailable"。
-/// 错误码统一 [`ERR_AGENT_CONTAINER_UNAVAILABLE`](前端可据码退避重试)。
+/// 有 [`DiagCtx`] 时做一次**实时诊断**(OOM/CrashLoop/容器缺失/启动中),给精准
+/// 根因文案;无 DiagCtx(测试 / 无 runtime)→ 通用文案。
 pub(crate) async fn make_terminal_error_event(
-    diag: Option<&Arc<DiagCtx>>,
+    diag: Option<&Arc<crate::handler::utils::DiagCtx>>,
     locale: &str,
 ) -> ProgressEvent {
+    use crate::handler::utils::{diagnose, root_cause_message};
     let code = shared_types::error_codes::ERR_AGENT_CONTAINER_UNAVAILABLE;
     let message = match diag {
-        // 实时诊断根因 → 精准文案。诊断本身失败不阻断:diagnose() 内部已兜底默认诊断
-        // (→ root_cause_message 的通用分支),不会让错误路径二次失败。
         Some(ctx) => {
             let d = diagnose(&ctx.runtime, &ctx.identifier, ctx.service_type.clone()).await;
             root_cause_message(&d, locale)
         }
         None => shared_types::error_codes::get_error_message(code, locale),
     };
-    // serde_json 构造,避免 format! 拼 JSON 产生非法 JSON。
     let payload = serde_json::json!({
         "code": code,
         "message": message,
@@ -597,8 +266,9 @@ pub(crate) async fn make_terminal_error_event(
     }
 }
 
-/// epoch 变化时的 cursor-reset 哨兵(seq=0):告知客户端重置去重游标(client_last_seq=0),
-/// 让新 epoch 的低 seq 事件不被静默丢弃(#15)。非终态(message_type≠SessionPromptEnd,不关流)。
+/// seq 回退（agent_runner 重启后新 epoch 从 1 重新计数）时的 cursor-reset 哨兵
+/// (seq=0):告知客户端重置去重游标,让新 epoch 的低 seq 事件不被静默丢弃。
+/// 非终态(message_type≠SessionPromptEnd,不关流)。
 pub(crate) fn make_cursor_reset_event() -> ProgressEvent {
     ProgressEvent {
         message_type: "StreamReset".to_string(),
@@ -618,14 +288,12 @@ pub(crate) fn map_tonic_code(code: Code) -> &'static str {
     match code {
         Code::Unavailable => "GRPC_SERVICE_UNAVAILABLE",
         Code::Cancelled => "GRPC_CANCELLED",
-        Code::DeadlineExceeded => "GRPC_TIMEOUT",
-        Code::Unknown => "GRPC_UNKNOWN_ERROR",
-        _ => "GRPC_ERROR",
+        Code::DeadlineExceeded => "GRPC_DEADLINE_EXCEEDED",
+        Code::NotFound => "GRPC_NOT_FOUND",
+        Code::PermissionDenied => "GRPC_PERMISSION_DENIED",
+        Code::Unauthenticated => "GRPC_UNAUTHENTICATED",
+        Code::Internal => "GRPC_INTERNAL",
+        Code::ResourceExhausted => "GRPC_RESOURCE_EXHAUSTED",
+        _ => "GRPC_UNKNOWN",
     }
 }
-
-mod backend_task;
-#[cfg(test)]
-mod tests;
-
-use backend_task::spawn_backend_task;
