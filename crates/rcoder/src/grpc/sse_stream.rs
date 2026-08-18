@@ -84,10 +84,10 @@ pub async fn create_grpc_sse_stream(
         //    idle 清理销毁重建 SharedStream 后首连资格自然重置——新一轮 turn
         //    的首连仍兜时间差（此时旧轮已被终端清空，replay 无重复内容）。
         let is_first_client = shared.claim_first_client();
-        if client_last_seq > 0 || is_first_client {
-            if !replay_history(&shared, &tx, &session_id, &mut client_last_seq).await {
-                return; // 客户端断开，或历史已含终端事件
-            }
+        if (client_last_seq > 0 || is_first_client)
+            && !replay_history(&shared, &tx, &session_id, &mut client_last_seq).await
+        {
+            return; // 客户端断开，或历史已含终端事件
         }
 
         // 4. 接实时事件(dedup 跳过 replay 已发的)

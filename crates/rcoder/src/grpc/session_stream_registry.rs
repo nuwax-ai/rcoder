@@ -9,7 +9,7 @@
 //! - HTTP 客户端按各自的消费游标从 ring 增量补齐，并跳过 broadcast 中 `seq <= 已收最大值`
 //!   的重叠消息（补齐与订阅之间的窗口去重）。
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -47,6 +47,10 @@ pub type ShutdownSseFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// Session → 共享流注册表（rcoder 进程级单例，挂在 `AppState`）。
 pub struct SessionStreamRegistry {
     streams: DashMap<String, Arc<SharedStream>>,
+    /// 已服务过客户端的 session（首连资格的权威载体——跨 SharedStream 生命周期：
+    /// 长 turn + 30s idle 清理重连会重建 SharedStream，流级标志会丢失导致
+    /// 误重放已收消息。终端事件时移除条目 = 新一轮 turn 的首连重新获得资格）。
+    served_sessions: DashMap<String, ()>,
     /// per-session 创建锁：序列化 `get_or_create` 的慢速路径，避免并发创建多个 SharedStream。
     /// 必要性：agent_runner 的 `current_connection` 是单连接模型（`create_new_connection` cancel 旧 token），
     /// 若并发创建 N 个 SharedStream，它们各自建立的 agent_runner SubscribeProgress 流会互相 cancel 抖动，
@@ -58,6 +62,7 @@ impl SessionStreamRegistry {
     pub fn new() -> Self {
         Self {
             streams: DashMap::new(),
+            served_sessions: DashMap::new(),
             create_locks: DashMap::new(),
         }
     }
@@ -133,6 +138,7 @@ impl SessionStreamRegistry {
 
         // 锁内创建（含 spawn 后台 task 的 await）；此时无并发创建者，安全。
         let new_stream = SharedStream::new(
+            Arc::downgrade(self),
             session_id.to_string(),
             grpc_addr.to_string(),
             pool,
@@ -225,15 +231,15 @@ pub struct SharedStream {
     /// 诊断上下文:后台 task 重试耗尽发终态错误事件时,据此做 OOM/crashloop 等精准诊断,
     /// 替代通用文案。None(测试/无 runtime)→ 通用"Compute environment temporarily unavailable"。
     diag_ctx: Option<Arc<DiagCtx>>,
-    /// 本 SharedStream 生命周期内是否已服务过 HTTP 客户端。
-    /// 仅首个客户端 replay ring（兜"chat 先发、SSE 后连"的时间差）；后续连接
-    /// （断线重连/并发第二端）纯实时流——消费即走，重放已收消息违反防重复红线。
-    /// idle 清理销毁重建后自然重置（新一轮 turn 的首连仍兜时间差）。
-    first_client_served: AtomicBool,
+    /// 所属 registry 的弱引用：终端事件时移除 served_sessions 条目
+    /// （新一轮 turn 的首连重新获得 replay 资格）。Weak 防引用环
+    /// （registry.streams 强持有 SharedStream）。
+    registry: std::sync::Weak<SessionStreamRegistry>,
 }
 
 impl SharedStream {
     async fn new(
+        registry: std::sync::Weak<SessionStreamRegistry>,
         session_id: String,
         grpc_addr: String,
         pool: Arc<GrpcChannelPool>,
@@ -255,7 +261,7 @@ impl SharedStream {
             cancel_token: CancellationToken::new(),
             task_handle: OnceLock::new(),
             diag_ctx: diag_ctx.clone(),
-            first_client_served: AtomicBool::new(false),
+            registry,
         });
 
         let handle = spawn_backend_task(
@@ -308,10 +314,25 @@ impl SharedStream {
         self.broadcast_tx.subscribe()
     }
 
-    /// 声明首连资格：本流生命周期内第一个 HTTP 客户端返回 true（其 replay
-    /// 用于兜 chat→SSE 时间差），后续连接返回 false（纯实时，不重放）。
+    /// 声明首连资格：该 session（registry 级，跨 SharedStream 生命周期）第一次
+    /// 被客户端服务返回 true（其 replay 用于兜 chat→SSE 时间差），后续连接返回
+    /// false（纯实时，不重放——防重复红线）。终端事件自动归还资格。
     pub fn claim_first_client(&self) -> bool {
-        !self.first_client_served.swap(true, Ordering::AcqRel)
+        match self.registry.upgrade() {
+            Some(reg) => reg
+                .served_sessions
+                .insert(self.session_id.clone(), ())
+                .is_none(),
+            None => true, // registry 已销毁（仅测试场景）：退化为总是允许
+        }
+    }
+
+    /// 终端事件归还首连资格：新一轮 turn 的首个客户端重新可兜时间差。
+    /// dispatch_event 的终端分支调用（正常/异常/合成终端统一路径）。
+    fn release_first_client_claim(&self) {
+        if let Some(reg) = self.registry.upgrade() {
+            reg.served_sessions.remove_if(&self.session_id, |_, _| true);
+        }
     }
 
     /// 增量补齐：从 ring 读取 `seq > from_seq` 的事件（非破坏性，按 seq 升序）。
@@ -372,6 +393,7 @@ impl SharedStream {
         // ring，两侧配合正好构成完整边界。
         if is_terminal {
             self.clear_ring();
+            self.release_first_client_claim();
             debug!(
                 "[SessionStream] terminal event dispatched, ring cleared for next turn: session_id={}, seq={}",
                 self.session_id, seq

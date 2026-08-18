@@ -76,6 +76,7 @@ fn create_lock_is_removed_only_without_active_holders() {
 async fn removing_matching_stream_cancels_its_backend_task() {
     let registry = SessionStreamRegistry::default();
     let shared = SharedStream::new(
+        std::sync::Weak::<SessionStreamRegistry>::new(),
         "session-a".into(),
         "127.0.0.1:1".into(),
         Arc::new(GrpcChannelPool::new()),
@@ -116,33 +117,57 @@ fn terminal_event(seq: u64) -> Arc<ProgressEvent> {
     })
 }
 
-/// 🔚 turn 边界语义：终端事件（SessionPromptEnd）广播后清空 ring——
-/// 修复"换模型后第二轮对话 SSE 重放上一轮消息"。last_seq 保持单调
-/// （后台流重连 from_seq=last_seq 不回放旧消息的依据）。
+/// 🔒 首连资格语义（registry 级，跨 SharedStream 生命周期 + 终端重置）：
+/// 同 session 仅首个客户端获得 replay 资格；重连/第二端不获得（防重复红线）；
+/// 终端事件归还资格（新一轮 turn 的首连重新可兜 chat→SSE 时间差）。
+/// 长 turn + idle 清理重建 SharedStream 的重连同样不获得（registry 级状态
+/// 不随流销毁丢失——流级标志的缺陷修复点）。
 #[tokio::test]
 async fn first_client_claim_semantics() {
-        let shared = SharedStream::new(
-            "s-first".into(),
-            "127.0.0.1:1".into(),
-            Arc::new(GrpcChannelPool::new()),
-            "en",
-            Arc::new(|_| {}),
-            None,
-        )
-        .await;
-
-        assert!(shared.claim_first_client(), "首个客户端获得 replay 资格");
-        assert!(!shared.claim_first_client(), "重连不获得（防重复红线）");
-        assert!(!shared.claim_first_client(), "并发第二端同样不获得");
-        // 累积事件后 ring 有内容——第四个连接（无游标）仍不 replay
-        shared.dispatch_event(arc_event(1, "late-arrival"));
-        assert!(!shared.claim_first_client());
-        assert_eq!(shared.replay_since(0).len(), 1, "ring 本身仍服务游标续传路径");
-    }
-
-    #[tokio::test]
-    async fn terminal_event_clears_ring_for_next_turn() {
+    let registry = Arc::new(SessionStreamRegistry::new());
     let shared = SharedStream::new(
+        Arc::downgrade(&registry),
+        "s-first".into(),
+        "127.0.0.1:1".into(),
+        Arc::new(GrpcChannelPool::new()),
+        "en",
+        Arc::new(|_| {}),
+        None,
+    )
+    .await;
+
+    assert!(shared.claim_first_client(), "首个客户端获得 replay 资格");
+    assert!(!shared.claim_first_client(), "重连不获得（防重复红线）");
+
+    // 终端事件归还资格（正常/异常/合成终端统一走 dispatch_event 的终端分支）
+    shared.dispatch_event(terminal_event(9));
+    assert!(
+        shared.claim_first_client(),
+        "终端后新一轮 turn 的首连重新获得资格"
+    );
+    assert!(!shared.claim_first_client(), "新 turn 内的重连同样不获得");
+
+    // 跨 SharedStream 生命周期：模拟 idle 清理重建——registry 级状态仍在
+    let shared2 = SharedStream::new(
+        Arc::downgrade(&registry),
+        "s-first".into(),
+        "127.0.0.1:1".into(),
+        Arc::new(GrpcChannelPool::new()),
+        "en",
+        Arc::new(|_| {}),
+        None,
+    )
+    .await;
+    assert!(
+        !shared2.claim_first_client(),
+        "流重建不重置资格（长 turn + idle 重连不重放）"
+    );
+}
+
+#[tokio::test]
+async fn terminal_event_clears_ring_for_next_turn() {
+    let shared = SharedStream::new(
+        std::sync::Weak::<SessionStreamRegistry>::new(),
         "s1".into(),
         "127.0.0.1:1".into(),
         Arc::new(GrpcChannelPool::new()),
@@ -182,6 +207,7 @@ async fn first_client_claim_semantics() {
 #[tokio::test]
 async fn synthetic_terminal_event_clears_ring() {
     let shared = SharedStream::new(
+        std::sync::Weak::<SessionStreamRegistry>::new(),
         "s-syn".into(),
         "127.0.0.1:1".into(),
         Arc::new(GrpcChannelPool::new()),
@@ -219,6 +245,7 @@ async fn synthetic_terminal_event_clears_ring() {
 #[tokio::test]
 async fn terminal_clear_loses_sentinel_but_zombie_replaces_stream() {
     let shared = SharedStream::new(
+        std::sync::Weak::<SessionStreamRegistry>::new(),
         "s1".into(),
         "127.0.0.1:1".into(),
         Arc::new(GrpcChannelPool::new()),
@@ -257,6 +284,7 @@ async fn terminal_clear_loses_sentinel_but_zombie_replaces_stream() {
 #[tokio::test]
 async fn dispatch_event_buffers_real_events_skips_synthetic() {
     let shared = SharedStream::new(
+        std::sync::Weak::<SessionStreamRegistry>::new(),
         "s1".into(),
         "127.0.0.1:1".into(),
         Arc::new(GrpcChannelPool::new()),
@@ -283,6 +311,7 @@ async fn dispatch_event_buffers_real_events_skips_synthetic() {
 async fn client_guard_increments_and_decrements_ref_count() {
     let registry = Arc::new(SessionStreamRegistry::default());
     let shared = SharedStream::new(
+        std::sync::Weak::<SessionStreamRegistry>::new(),
         "s1".into(),
         "127.0.0.1:1".into(),
         Arc::new(GrpcChannelPool::new()),
@@ -317,6 +346,7 @@ async fn client_guard_increments_and_decrements_ref_count() {
 async fn shutdown_streams_by_addr_closes_only_matching_streams() {
     let registry = SessionStreamRegistry::default();
     let matched_a = SharedStream::new(
+        std::sync::Weak::<SessionStreamRegistry>::new(),
         "session-a".into(),
         "10.0.0.1:50051".into(),
         Arc::new(GrpcChannelPool::new()),
@@ -326,6 +356,7 @@ async fn shutdown_streams_by_addr_closes_only_matching_streams() {
     )
     .await;
     let matched_b = SharedStream::new(
+        std::sync::Weak::<SessionStreamRegistry>::new(),
         "session-b".into(),
         "10.0.0.1:50051".into(),
         Arc::new(GrpcChannelPool::new()),
@@ -335,6 +366,7 @@ async fn shutdown_streams_by_addr_closes_only_matching_streams() {
     )
     .await;
     let unmatched = SharedStream::new(
+        std::sync::Weak::<SessionStreamRegistry>::new(),
         "session-c".into(),
         "10.0.0.2:50051".into(),
         Arc::new(GrpcChannelPool::new()),
