@@ -6601,6 +6601,7 @@ dependencies = [
  "futures 0.3.34",
  "futures-util",
  "garde",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "k8s-openapi",

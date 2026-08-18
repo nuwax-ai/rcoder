@@ -7,6 +7,7 @@
 /logs
 .zcode
 tests/sse_e2e/results
+tests/sse_e2e/__pycache__
 
 .classpath
 project_workspace
