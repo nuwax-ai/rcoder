@@ -80,10 +80,8 @@ pub async fn create_grpc_sse_stream(
         //    重连重复由前端按 messageId 聚合去重（agent_message_chunk 自带 messageId）。
         //    增量路径：浏览器 EventSource 断线自动带 Last-Event-ID（服务端已发 id: seq）
         //    或 ?last_seq= query → 只补断线窗口。
-        for ev in shared.replay_since(client_last_seq) {
-            if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
-                return; // 客户端断开，或历史已含终端事件
-            }
+        if !replay_history(&shared, &tx, &session_id, &mut client_last_seq).await {
+            return; // 客户端断开，或历史已含终端事件
         }
 
         // 4. 接实时事件(dedup 跳过 replay 已发的)
@@ -97,35 +95,35 @@ pub async fn create_grpc_sse_stream(
                     );
                     return;
                 }
-                r = bc_rx.recv() => match r {
-                    Ok(ev) => {
-                        // 去重：补齐阶段已发的（补齐与订阅之间窗口）跳过；
-                        // seq=0 合成消息（idle/error）无条件转发，不更新游标。
-                        if ev.seq != 0 && ev.seq <= client_last_seq {
-                            continue;
-                        }
-                        if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
-                            return; // 客户端断开，或终端事件（SessionPromptEnd）
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // 慢消费者丢消息：回退 ring 按 client_last_seq 补齐缺失
-                        warn!(
-                            "⚠️ [gRPC_SSE] client lagged by {}, replay from ring: session_id={}",
-                            n, session_id
-                        );
-                        for ev in shared.replay_since(client_last_seq) {
-                            if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
+                r = bc_rx.recv() => {
+                    // 去重：补齐阶段已发的（补齐与订阅之间窗口）跳过；
+                    // seq=0 合成消息（idle/error）无条件转发，不更新游标。
+                    let ev = match r {
+                        Ok(ev) => ev,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            // 慢消费者丢消息：回退 ring 按 client_last_seq 补齐缺失
+                            warn!(
+                                "⚠️ [gRPC_SSE] client lagged by {}, replay from ring: session_id={}",
+                                n, session_id
+                            );
+                            if !replay_history(&shared, &tx, &session_id, &mut client_last_seq).await {
                                 return;
                             }
+                            continue;
                         }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            info!(
+                                "✅ [gRPC_SSE] shared stream closed: session_id={}",
+                                session_id
+                            );
+                            return;
+                        }
+                    };
+                    if ev.seq != 0 && ev.seq <= client_last_seq {
+                        continue;
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        info!(
-                            "✅ [gRPC_SSE] shared stream closed: session_id={}",
-                            session_id
-                        );
-                        return;
+                    if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
+                        return; // 客户端断开，或终端事件（SessionPromptEnd）
                     }
                 }
             }
@@ -133,6 +131,23 @@ pub async fn create_grpc_sse_stream(
     });
 
     tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+/// 从共享流 ring 补齐 `seq > client_last_seq` 的历史并转发。
+/// 返回 `false` = 调用方应结束 task（客户端断开或补齐中遇到终端事件）。
+/// 初始补齐与 Lagged 回退共用（原先两处相同循环）。
+async fn replay_history(
+    shared: &Arc<crate::grpc::session_stream_registry::SharedStream>,
+    tx: &tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
+    session_id: &str,
+    client_last_seq: &mut u64,
+) -> bool {
+    for ev in shared.replay_since(*client_last_seq) {
+        if !forward_to_client(tx, &ev, session_id, client_last_seq).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// 转发一个 ProgressEvent 到 HTTP SSE channel。

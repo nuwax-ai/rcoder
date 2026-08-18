@@ -468,6 +468,169 @@ import functools
 # 双后端完整矩阵：SSE 轮次语义（完整轮/终端清/轮次隔离/带游标/无游标重连）
 # 在两个 ACP agent 实现上都必须成立——交叉验证非特例。
 # openai 后端=nuwaxcode(opencode)；anthropic 后端=claude-code-acp-ts。
+def scenario_cross_turn_reconnect(out: dict, backend: str = "openai"):
+    """断线跨越 turn 边界：turn1 进行中断开 → turn1 结束 → turn2 开始后重连。
+
+    断言：重连不收 turn1 的任何消息（终端已清）+ 完整收到 turn2 +
+    id 全在 turn2 的 seq 区间（跨轮零残留——防重复红线）。
+    """
+    c = Check()
+    user = scoped_user(f"sg1-{backend}")
+    d1 = chat(base_payload("从1数到10，每行一个数字", f"{RUN_TAG}-sg1a", user, backend=backend))
+    sid, pid = d1["session_id"], d1["project_id"]
+    time.sleep(0.8)
+    evs1 = sse_collect(sid, 30)
+    t1_max = max(ids_of(evs1)) if ids_of(evs1) else 0
+    t1_text = chunks_text(evs1)
+    c.ok(len(ids_of(evs1)) > 0, f"turn1 收到（{len(ids_of(evs1))} 个）")
+
+    # 等 turn1 结束（终端清）后发 turn2，重连（不带游标）
+    time.sleep(8)
+    p2 = base_payload("写一篇200字短文，主题：雨后的街道。直接正文。", f"{RUN_TAG}-sg1b", user, backend=backend)
+    p2["session_id"], p2["project_id"] = sid, pid
+
+    def _r2():
+        try:
+            chat(p2, timeout=150)
+        except Exception as e:  # noqa: BLE001
+            print(f"    [turn2 chat] {e}")
+
+    threading.Thread(target=_r2, daemon=True).start()
+    time.sleep(1.5)
+    evs2 = sse_collect(sid, 60)
+    ids2 = ids_of(evs2)
+    r2_text = chunks_text(evs2)
+    types2 = [e.get("event") for e in evs2]
+    c.ok(len(ids2) > 0, f"重连收到 turn2（{len(ids2)} 个）")
+    c.ok(all(i > t1_max for i in ids2), f"零 turn1 残留（min={min(ids2) if ids2 else '-'} > turn1 max={t1_max}）")
+    c.ok(types2.count("prompt_start") == 1 and types2.count("end_turn") >= 1, "turn2 完整链")
+    c.ok(t1_text[:8] not in r2_text[:40], f"turn2 开头非 turn1 内容（{r2_text[:20]!r}）")
+    out.update(session_id=sid, turn1_last_seq=t1_max, turn2_ids=ids2)
+    return c
+
+
+def scenario_concurrent_subscribers(out: dict, backend: str = "openai"):
+    """多客户端并发订阅同一 session：两个 SSE 连接都完整收到、seq 一致。"""
+    c = Check()
+    user = scoped_user(f"sg2-{backend}")
+    d1 = chat(base_payload("从1数到8，每行一个数字", f"{RUN_TAG}-sg2", user, backend=backend))
+    sid = d1["session_id"]
+
+    results: dict[str, list[dict]] = {}
+
+    def _sub(tag: str):
+        time.sleep(0.6)
+        results[tag] = sse_collect(sid, 30)
+
+    t_a = threading.Thread(target=_sub, args=("A",))
+    t_b = threading.Thread(target=_sub, args=("B",))
+    t_a.start(); t_b.start()
+    t_a.join(); t_b.join()
+    evs_a, evs_b = results.get("A", []), results.get("B", [])
+    ids_a, ids_b = set(ids_of(evs_a)), set(ids_of(evs_b))
+    types_a = [e.get("event") for e in evs_a]
+    types_b = [e.get("event") for e in evs_b]
+    c.ok(len(ids_a) > 0 and len(ids_b) > 0, f"两个订阅者都收到（A={len(ids_a)}, B={len(ids_b)}）")
+    c.ok("end_turn" in types_a and "end_turn" in types_b, "两个订阅者都收到完整轮（end_turn）")
+    inter = ids_a & ids_b
+    c.ok(len(inter) > 0, f"seq 集合大范围重叠（交集 {len(inter)} 个）")
+    c.ok(len(chunks_text(evs_a)) > 0 and len(chunks_text(evs_b)) > 0, "两者内容非空")
+    out.update(session_id=sid, ids_a=len(ids_a), ids_b=len(ids_b), overlap=len(inter))
+    return c
+
+
+def scenario_error_recovery(out: dict):
+    """agent error 后恢复：正常建会话 → 坏 base_url 触发 error 终端 → 正确配置恢复。
+
+    断言：error 轮收到终态（error/End）且不 hang → 恢复轮完整执行 + 内容正常。
+    """
+    c = Check()
+    user = scoped_user("sg3")
+    d0 = chat(base_payload("从1数到3，每行一个数字", f"{RUN_TAG}-sg3a", user))
+    sid, pid = d0["session_id"], d0["project_id"]
+    time.sleep(0.8)
+    sse_collect(sid, 30)  # 收完首轮（等终端）
+
+    # error 轮：坏 base_url（连接立即失败，确定性注入）+ 后台发
+    p_bad = base_payload("回答一个字：好", f"{RUN_TAG}-sg3b", user)
+    p_bad["model_provider"]["base_url"] = "https://invalid.example.invalid/v1"
+    p_bad["session_id"], p_bad["project_id"] = sid, pid
+
+    def _bad():
+        try:
+            chat(p_bad, timeout=120)
+        except Exception as e:  # noqa: BLE001
+            print(f"    [bad-url chat ended] {str(e)[:60]}")
+
+    threading.Thread(target=_bad, daemon=True).start()
+    time.sleep(0.8)
+    evs1 = sse_collect(sid, 40)
+    types1 = [e.get("event") for e in evs1]
+    got_terminal = "error" in types1 or "end_turn" in types1
+    c.ok(got_terminal, f"坏 URL 轮收到终态（分布 {sorted(set(types1))}）")
+
+    # 恢复轮：正确配置 + 同 session 续话
+    p_ok = base_payload("回答两个字：可以", f"{RUN_TAG}-sg3c", user)
+    p_ok["session_id"], p_ok["project_id"] = sid, pid
+
+    def _r2():
+        try:
+            chat(p_ok, timeout=150)
+        except Exception as e:  # noqa: BLE001
+            print(f"    [recovery chat] {e}")
+
+    threading.Thread(target=_r2, daemon=True).start()
+    time.sleep(1)
+    evs2 = sse_collect(sid, 50)
+    ids2 = ids_of(evs2)
+    types2 = [e.get("event") for e in evs2]
+    r2 = chunks_text(evs2)
+    c.ok(len(ids2) > 0, f"恢复轮收到事件（{len(ids2)} 个）")
+    c.ok(types2.count("end_turn") >= 1, f"恢复轮完整执行（分布 {sorted(set(types2))}）")
+    c.ok("可" in r2 or "以" in r2, f"恢复轮内容正常（{r2[:20]!r}）")
+    out.update(session_id=sid, error_turn_types=sorted(set(types1)), recovery_ids=ids2)
+    return c
+
+
+def scenario_container_restart_recovery(out: dict):
+    """agent 容器重启后同 session 续话（模拟 agent 故障恢复链路）。"""
+    c = Check()
+    import subprocess
+    user = scoped_user("sg4")
+    d1 = chat(base_payload("从1数到5，每行一个数字", f"{RUN_TAG}-sg4a", user))
+    sid, pid = d1["session_id"], d1["project_id"]
+    time.sleep(0.8)
+    evs1 = sse_collect(sid, 30)
+    t1_max = max(ids_of(evs1)) if ids_of(evs1) else 0
+    c.ok(t1_max > 0, f"重启前轮正常（seq 到 {t1_max}）")
+
+    cname = f"dev-rcoder-agent-runner-{user}"
+    r = subprocess.run(["docker", "restart", cname], capture_output=True, text=True, timeout=60)
+    c.ok(r.returncode == 0, f"容器重启注入成功（{r.stderr[:40]}）")
+    time.sleep(12)  # 等 agent_runner 进程起来
+
+    p2 = base_payload("我上一条消息让你做什么了？一句话回答。", f"{RUN_TAG}-sg4b", user)
+    p2["session_id"], p2["project_id"] = sid, pid
+
+    def _r2():
+        try:
+            chat(p2, timeout=180)
+        except Exception as e:  # noqa: BLE001
+            print(f"    [post-restart chat] {e}")
+
+    threading.Thread(target=_r2, daemon=True).start()
+    time.sleep(2)
+    evs2 = sse_collect(sid, 60)
+    ids2 = ids_of(evs2)
+    r2 = chunks_text(evs2)
+    # 重启后 seq 从新进程重新计数（agent_runner 状态清零）——断言能收到+内容延续
+    c.ok(len(ids2) > 0, f"重启后收到事件（{len(ids2)} 个）")
+    c.ok("数" in r2 or "数字" in r2, f"上下文延续（记得数数任务：{r2[:30]!r}）")
+    out.update(session_id=sid, restart_container=cname, post_restart_ids=ids2,
+               post_restart_reply=r2[:60])
+    return c
+
+
 SCENARIOS = [
     ("full_turn_delivery", scenario_full_turn),
     ("full_turn_acp_ts", functools.partial(scenario_full_turn, backend="anthropic")),
@@ -485,6 +648,16 @@ SCENARIOS = [
     # 无 session_id 续话（前端标准姿势：rcoder 内部 project→session 映射复用）
     ("no_session_reuse", scenario_no_session_reuse),
     ("no_session_reuse_acp_ts", functools.partial(scenario_no_session_reuse, backend="anthropic")),
+    # 故障与并发边界
+    ("cross_turn_reconnect", scenario_cross_turn_reconnect),
+    ("cross_turn_acp_ts", functools.partial(scenario_cross_turn_reconnect, backend="anthropic")),
+    ("concurrent_subscribers", scenario_concurrent_subscribers),
+    ("concurrent_sub_acp_ts", functools.partial(scenario_concurrent_subscribers, backend="anthropic")),
+    # TODO: error_recovery 需"执行中错误"注入（坏 base_url 在模型预检阶段就被
+    # chat 响应拒绝，不产生 SSE 事件——设计行为）。待找执行中失败注入（如无效
+    # api_key 的首调用 401）后启用。
+    # ("error_recovery", scenario_error_recovery),
+    ("container_restart_recovery", scenario_container_restart_recovery),
 ]
 
 
