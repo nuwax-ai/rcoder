@@ -6,6 +6,7 @@
 //! - `notification_handlers`: SessionNotification 等消息类型处理
 
 mod message_loop;
+mod model_sync;
 mod notification_handlers;
 mod setup;
 
@@ -72,6 +73,10 @@ pub(crate) struct SacpConnectionParams<N: SessionNotifier> {
     pub(crate) child_pid: u32,
     /// 子进程命令行（用于错误诊断）
     pub(crate) command_line: String,
+    /// 本次请求的模型 id（源自 model_provider，裸名如 `deepseek-v4-pro`）。
+    /// resume 后用于 `session/set_config_option(configId=model)` 对齐 session
+    /// 模型引用，值形态从 agent 的 configOptions 响应匹配
+    pub(crate) session_model_id: Option<String>,
     /// 进程诊断监听器（可选，注入自 AcpClientBuilder）
     pub(crate) diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
 }
@@ -104,6 +109,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         mut connection_failed_tx,
         child_pid,
         command_line,
+        session_model_id,
         diagnostics_listener,
     } = params;
 
@@ -171,6 +177,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
             let project_path = project_path.clone();
             let mcp_servers = mcp_servers.clone();
             let start_config = start_config.clone();
+            let session_model_id = session_model_id.clone();
             let notifier_for_prompt = notifier_for_prompt_end.clone();
             let project_id_for_prompt = project_id_for_prompt_end.clone();
             let abnormal_exit_flag = abnormal_exit_flag.clone();
@@ -191,7 +198,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 .await?;
 
                 // 2+3. 构建会话 meta 并创建/加载会话
-                let session_id = setup::create_or_load_session(
+                let outcome = setup::create_or_load_session(
                     &cx,
                     &project_id,
                     project_path,
@@ -200,6 +207,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     &resuming,
                 )
                 .await?;
+                let session_id = outcome.session_id;
 
                 info!(
                     "[SACP] ACP session ready, session_id={}",
@@ -209,6 +217,15 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 // 🆕 当 agent_mode=ask 时，通过 ACP 协议设置 session mode
                 setup::apply_ask_session_mode(&cx, &start_config, &command_line, &session_id)
                     .await;
+
+                // 🆕 resume 场景对齐 session 模型引用（防切模型后旧引用解析失败）
+                model_sync::sync_session_model_config(
+                    &cx,
+                    &session_model_id,
+                    &outcome.config_options,
+                    &session_id,
+                )
+                .await;
 
                 // 发送会话 ID 到主任务
                 if session_id_tx.send(session_id.clone()).is_err() {

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, InitializeRequest, LoadSessionRequest, McpServer, NewSessionRequest,
-    SessionId, SetSessionModeRequest,
+    SessionConfigOption, SessionId, SetSessionModeRequest,
 };
 use agent_client_protocol::{Agent, ConnectionTo};
 use tokio_util::sync::CancellationToken;
@@ -22,6 +22,14 @@ use crate::traits::AgentStartConfig;
 
 /// InitializeRequest 超时时间（秒）
 pub(super) const INIT_TIMEOUT_SECS: u64 = 50;
+
+/// 会话建立结果：session_id + LoadSession 响应透传的配置项
+pub(super) struct SessionSetupOutcome {
+    pub(super) session_id: SessionId,
+    /// 仅 LoadSession 成功路径填充（agent 声明的会话配置项，含模型选项），
+    /// 供 resume 后的模型引用同步使用
+    pub(super) config_options: Option<Vec<SessionConfigOption>>,
+}
 
 /// Step 1: 初始化 ACP 连接（INIT_TIMEOUT_SECS 秒超时，同时与 cancel_token 竞速）
 pub(super) async fn initialize_connection(
@@ -132,6 +140,10 @@ pub(super) async fn initialize_connection(
 /// - 有 resume_session_id 时优先 LoadSession，失败/超时降级到 NewSession
 /// - 无 resume_session_id 时直接 NewSession
 /// - 不使用 ? 提前返回，确保错误以字符串累积后统一映射为协议错误
+///
+/// 返回 [`SessionSetupOutcome`]：config_options 仅在 LoadSession 成功时从响应
+/// 透传（agent 声明的会话配置项，含模型选项），供 resume 后的模型引用同步
+/// 使用；NewSession 路径（含降级）引用由 agent 按当前 env 建立，为 None。
 pub(super) async fn create_or_load_session(
     cx: &ConnectionTo<Agent>,
     project_id: &str,
@@ -139,7 +151,7 @@ pub(super) async fn create_or_load_session(
     mcp_servers: Vec<McpServer>,
     start_config: &AgentStartConfig,
     resuming: &Arc<AtomicBool>,
-) -> Result<SessionId, agent_client_protocol::Error> {
+) -> Result<SessionSetupOutcome, agent_client_protocol::Error> {
     // 2. 构建 meta（包含系统提示词和可能的 resume）
     let system_prompt_meta = start_config.build_meta();
 
@@ -169,7 +181,7 @@ pub(super) async fn create_or_load_session(
 
     // 🔥 修复：使用 Result 累积错误，避免 ? 操作符提前返回
     // 无论成功失败，都确保能执行到 session_id_tx.send()
-    let session_result: Result<SessionId, String> = if let Some(ref resume_id) =
+    let session_result: Result<SessionSetupOutcome, String> = if let Some(ref resume_id) =
         start_config.resume_session_id
     {
         // 有 resume_session_id，尝试加载历史会话
@@ -192,13 +204,17 @@ pub(super) async fn create_or_load_session(
             .await
         };
         match load_outcome {
-            Ok(Ok(_response)) => {
-                // LoadSession 成功，使用请求中的 session_id
+            Ok(Ok(response)) => {
+                // LoadSession 成功，使用请求中的 session_id；
+                // config_options（agent 声明的会话配置项）透传给模型引用同步
                 info!(
                     "[SACP] Session loaded successfully: {}, resuming session",
                     resume_id
                 );
-                Ok(SessionId::from(resume_id.clone()))
+                Ok(SessionSetupOutcome {
+                    session_id: SessionId::from(resume_id.clone()),
+                    config_options: response.config_options,
+                })
             }
             Ok(Err(load_err)) => {
                 // LoadSession 返回错误，降级到 NewSessionRequest
@@ -231,7 +247,10 @@ pub(super) async fn create_or_load_session(
                 )
                 .await
                 {
-                    Ok(Ok(response)) => Ok(response.session_id),
+                    Ok(Ok(response)) => Ok(SessionSetupOutcome {
+                        session_id: response.session_id,
+                        config_options: None,
+                    }),
                     Ok(Err(new_err)) => Err(format!(
                         "[SACP] LoadSession failed ({}), NewSession also failed ({})",
                         load_err, new_err
@@ -272,7 +291,10 @@ pub(super) async fn create_or_load_session(
                 )
                 .await
                 {
-                    Ok(Ok(response)) => Ok(response.session_id),
+                    Ok(Ok(response)) => Ok(SessionSetupOutcome {
+                        session_id: response.session_id,
+                        config_options: None,
+                    }),
                     Ok(Err(new_err)) => Err(format!(
                         "[SACP] LoadSession timeout, NewSession failed ({})",
                         new_err
@@ -298,7 +320,10 @@ pub(super) async fn create_or_load_session(
         )
         .await
         {
-            Ok(Ok(response)) => Ok(response.session_id),
+            Ok(Ok(response)) => Ok(SessionSetupOutcome {
+                session_id: response.session_id,
+                config_options: None,
+            }),
             Ok(Err(e)) => Err(format!("[SACP] NewSession failed: {}", e)),
             Err(_) => Err(format!("[SACP] NewSession timeout ({}s)", timeout_secs)),
         }
@@ -306,15 +331,15 @@ pub(super) async fn create_or_load_session(
 
     // 🔥 关键修复：在闭包最后统一处理 session 创建结果
     // 确保无论成功失败都能执行到发送逻辑
-    let session_id = match session_result {
-        Ok(sid) => sid,
+    let outcome = match session_result {
+        Ok(outcome) => outcome,
         Err(err_msg) => {
             error!("[SACP] Session creation failed: {}", err_msg);
             return Err(agent_client_protocol::Error::new(1000, err_msg));
         }
     };
 
-    Ok(session_id)
+    Ok(outcome)
 }
 
 /// 🆕 当 agent_mode=ask 时，通过 ACP 协议设置 session mode

@@ -137,6 +137,12 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         };
 
         // 确定子进程最终启动环境（平台分支、UUID 替换、敏感回退、环境打印）
+        // 先取出模型 id（resume 后 session 模型引用同步的主源，源自
+        // model_provider），resolved_command 随即被 move 进 finalize
+        let session_model_id = resolved_command
+            .resolved_model_env
+            .as_ref()
+            .map(|env| env.default_model.clone());
         let finalized_env = finalize_subprocess_env(
             resolved_command,
             &project_id,
@@ -222,6 +228,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 spawn_project_id
             );
             let command_line_clone = spawn_command_line;
+            // resume 后同步 session 模型引用：裸模型 id（源自 model_provider），
+            // 值形态（provider 前缀）在协议现场从 agent 的 configOptions 响应匹配
+            let session_model_id = session_model_id.clone();
             let params = SacpConnectionParams {
                 project_path: project_path_clone,
                 project_id: project_id_clone.clone(),
@@ -239,6 +248,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 connection_failed_tx: connection_failed_tx.take(),
                 child_pid,
                 command_line: command_line_clone,
+                session_model_id,
                 diagnostics_listener: diagnostics_listener_for_task,
             };
             let result = run_sacp_connection(transport, params).await;
