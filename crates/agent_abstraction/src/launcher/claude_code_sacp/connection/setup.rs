@@ -174,24 +174,26 @@ pub(super) async fn create_or_load_session(
     {
         // 有 resume_session_id，尝试加载历史会话
         info!("[SACP] Attempting to load existing session: {}", resume_id);
-        // resume 窗口开启：此期间的历史通知重放将被通知 handler 过滤
-        resuming.store(true, Ordering::Release);
-
+        // resume 窗口守卫：块作用域覆盖整个 load 匹配（含降级路径），
+        // 任何出口 Drop 自动复位（替代此前手动 store 的三处复位——曾漏超时分支）
         let load_request = LoadSessionRequest::new(resume_id.clone(), project_path.clone())
             .mcp_servers(mcp_servers.clone())
             .meta(system_prompt_meta.clone());
 
         debug!("load_session_request: {:?}", load_request);
 
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(timeout_secs),
-            cx.send_request(load_request).block_task(),
-        )
-        .await
-        {
+        let load_outcome = {
+            let _resuming_guard =
+                crate::launcher::claude_code_sacp::connection::ResumingGuard::new(resuming.clone());
+            tokio::time::timeout(
+                tokio::time::Duration::from_secs(timeout_secs),
+                cx.send_request(load_request).block_task(),
+            )
+            .await
+        };
+        match load_outcome {
             Ok(Ok(_response)) => {
                 // LoadSession 成功，使用请求中的 session_id
-                resuming.store(false, Ordering::Release);
                 info!(
                     "[SACP] Session loaded successfully: {}, resuming session",
                     resume_id
@@ -200,7 +202,6 @@ pub(super) async fn create_or_load_session(
             }
             Ok(Err(load_err)) => {
                 // LoadSession 返回错误，降级到 NewSessionRequest
-                resuming.store(false, Ordering::Release);
                 warn!(
                     "[SACP] LoadSession failed, falling back to NewSession: {}",
                     load_err
@@ -242,7 +243,6 @@ pub(super) async fn create_or_load_session(
             }
             Err(_) => {
                 // LoadSession 超时，降级到 NewSessionRequest
-                resuming.store(false, Ordering::Release);
                 warn!(
                     "[SACP] LoadSession timeout ({}s), falling back to NewSession",
                     timeout_secs

@@ -11,7 +11,7 @@ mod setup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::v1::{
     McpServer, PromptRequest, RequestPermissionRequest, RequestPermissionResponse, SessionId,
@@ -27,6 +27,25 @@ use crate::diagnostics::DiagnosticsListener;
 use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::{AgentStartConfig, PermissionRequestContext, PermissionRequestHandler};
 use shared_types::error_codes;
+
+/// resume 窗口 RAII 守卫：创建时置位，Drop 时自动复位——任何出口
+/// （成功/失败/超时/`?` 提前返回/panic）都保证 resuming 归零，
+/// 从结构上杜绝"漏一个出口导致通知被永久过滤"的缺陷
+/// （曾因超时分支漏复位引入该 bug，870b102 修复后才重构为本形态）。
+pub(crate) struct ResumingGuard(Arc<AtomicBool>);
+
+impl ResumingGuard {
+    pub(crate) fn new(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for ResumingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// SACP 连接参数（封装 run_sacp_connection 的参数）
 pub(crate) struct SacpConnectionParams<N: SessionNotifier> {
@@ -234,4 +253,52 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod resuming_guard_tests {
+    use super::*;
+
+    #[test]
+    fn guard_resumes_flag_and_drop_resets() {
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let _g = ResumingGuard::new(flag.clone());
+            assert!(flag.load(Ordering::Acquire), "guard held: flag must be set");
+        }
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "guard dropped: flag must reset"
+        );
+    }
+
+    #[test]
+    fn guard_resets_on_early_return() {
+        // 模拟 load 失败提前返回路径：函数内创建 guard 后 ?/return，Drop 仍复位
+        fn fallible_load(flag: Arc<AtomicBool>) -> Result<(), ()> {
+            let _g = ResumingGuard::new(flag.clone());
+            Err(()) // 提前返回出口
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(fallible_load(flag.clone()).is_err());
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "early-return exit must reset flag"
+        );
+    }
+
+    #[test]
+    fn guard_resets_on_panic() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let f = flag.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _g = ResumingGuard::new(f.clone());
+            panic!("simulated load crash");
+        }));
+        assert!(result.is_err());
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "panic exit must reset flag (unwind runs Drop)"
+        );
+    }
 }
