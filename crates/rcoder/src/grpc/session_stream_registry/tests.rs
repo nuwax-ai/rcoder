@@ -120,7 +120,28 @@ fn terminal_event(seq: u64) -> Arc<ProgressEvent> {
 /// 修复"换模型后第二轮对话 SSE 重放上一轮消息"。last_seq 保持单调
 /// （后台流重连 from_seq=last_seq 不回放旧消息的依据）。
 #[tokio::test]
-async fn terminal_event_clears_ring_for_next_turn() {
+async fn first_client_claim_semantics() {
+        let shared = SharedStream::new(
+            "s-first".into(),
+            "127.0.0.1:1".into(),
+            Arc::new(GrpcChannelPool::new()),
+            "en",
+            Arc::new(|_| {}),
+            None,
+        )
+        .await;
+
+        assert!(shared.claim_first_client(), "首个客户端获得 replay 资格");
+        assert!(!shared.claim_first_client(), "重连不获得（防重复红线）");
+        assert!(!shared.claim_first_client(), "并发第二端同样不获得");
+        // 累积事件后 ring 有内容——第四个连接（无游标）仍不 replay
+        shared.dispatch_event(arc_event(1, "late-arrival"));
+        assert!(!shared.claim_first_client());
+        assert_eq!(shared.replay_since(0).len(), 1, "ring 本身仍服务游标续传路径");
+    }
+
+    #[tokio::test]
+    async fn terminal_event_clears_ring_for_next_turn() {
     let shared = SharedStream::new(
         "s1".into(),
         "127.0.0.1:1".into(),

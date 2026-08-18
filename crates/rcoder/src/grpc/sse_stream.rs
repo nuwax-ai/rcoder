@@ -74,14 +74,20 @@ pub async fn create_grpc_sse_stream(
         //    subscribe 先 replay 后:gap 里的事件在两边都有 → dedup(seq<=client_last_seq)去重。
         let mut bc_rx = shared.subscribe();
 
-        // 3. 补齐：从 ring 读取 seq > client_last_seq 的历史。
-        //    ⚠️ last_seq=0（无游标）必须全量重放本轮——前端是"chat 先发、SSE 后连"
-        //    的异步模式，连接建立时本轮事件早已产生，不重放会丢整轮（实测验证过）。
-        //    重连重复由前端按 messageId 聚合去重（agent_message_chunk 自带 messageId）。
-        //    增量路径：浏览器 EventSource 断线自动带 Last-Event-ID（服务端已发 id: seq）
-        //    或 ?last_seq= query → 只补断线窗口。
-        if !replay_history(&shared, &tx, &session_id, &mut client_last_seq).await {
-            return; // 客户端断开，或历史已含终端事件
+        // 3. 补齐（仅限本流生命周期的首个客户端）：
+        //    - 首连（chat 先发、SSE 后连的异步模式）：replay ring 兜时间差——
+        //      连接建立时本轮事件已产生，不重放会丢整轮开头（实测验证过）。
+        //    - 重连/并发第二端（claim 返回 false）：纯实时流，不重放——消费即走，
+        //      重放已收消息违反防重复红线（前端自持历史，无需 SSE 补齐）。
+        //    - 带游标（EventSource 自动 Last-Event-ID / ?last_seq=）：视为明确续传，
+        //      无论首连与否都按游标增量补（用户主动声明缺口）。
+        //    idle 清理销毁重建 SharedStream 后首连资格自然重置——新一轮 turn
+        //    的首连仍兜时间差（此时旧轮已被终端清空，replay 无重复内容）。
+        let is_first_client = shared.claim_first_client();
+        if client_last_seq > 0 || is_first_client {
+            if !replay_history(&shared, &tx, &session_id, &mut client_last_seq).await {
+                return; // 客户端断开，或历史已含终端事件
+            }
         }
 
         // 4. 接实时事件(dedup 跳过 replay 已发的)

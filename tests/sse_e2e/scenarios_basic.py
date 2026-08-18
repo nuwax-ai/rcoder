@@ -100,7 +100,10 @@ def scenario_reconnect_cursor(out: dict, backend: str = "openai"):
 
 
 def scenario_reconnect_no_cursor(out: dict, backend: str = "openai"):
-    """5. turn 进行中断开，无游标重连：全量重放本轮（含本轮开头）。"""
+    """5. turn 进行中断开，无游标重连：纯实时（零已收消息重放——防重复红线）。
+
+    首连已消费（首窗口 seq 1..N）→ 无游标重连不得再收到 <= N 的任何事件
+    （首连资格已被占：重连只收实时流）。区别于带游标场景的增量补齐。"""
     c = Check()
     user = scoped_user(f"s5-{backend}")
     d = chat(base_payload("写一篇600字左右的散文，主题：海边的黄昏。直接正文。", f"{RUN_TAG}-s5", user, backend=backend))
@@ -108,14 +111,15 @@ def scenario_reconnect_no_cursor(out: dict, backend: str = "openai"):
     time.sleep(1.2)
     evs1 = sse_collect(sid, 3, idle_stop=False)
     ids1 = ids_of(evs1)
-    first = min(ids1) if ids1 else None
-    c.ok(first is not None, f"首窗口收到事件（{len(ids1)} 个；空=turn 未开始产出，检查 agent 状态）")
+    last1 = max(ids1) if ids1 else None
+    c.ok(last1 is not None, f"首窗口收到事件（{len(ids1)} 个，到 seq={last1}）")
     evs2 = sse_collect(sid, 20)
     ids2 = ids_of(evs2)
-    # 无游标 = 本轮全量重放：重连流应包含本轮开头（存在 id <= 首窗口最小 id）
-    c.ok(any(i <= first for i in ids2), f"重放本轮开头（重连 min={min(ids2) if ids2 else '-'} <= 首窗口 min={first}）")
-    c.ok(monotonic_unique(ids2), "重放流 id 单调无重复")
-    out.update(session_id=sid, first_window_min=first, replay_ids=ids2)
+    # 无游标重连 = 纯实时：不得出现首窗口已收的任何 seq
+    c.ok(all(i > last1 for i in ids2),
+         f"零已收消息重放（重连收到 {len(ids2)} 个全 > {last1}，min={min(ids2) if ids2 else '-'}）")
+    c.ok(monotonic_unique(ids2), "重连流 id 单调无重复")
+    out.update(session_id=sid, first_window_last=last1, reconnect_ids=ids2)
     return c
 
 

@@ -9,7 +9,7 @@
 //! - HTTP 客户端按各自的消费游标从 ring 增量补齐，并跳过 broadcast 中 `seq <= 已收最大值`
 //!   的重叠消息（补齐与订阅之间的窗口去重）。
 
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -225,6 +225,11 @@ pub struct SharedStream {
     /// 诊断上下文:后台 task 重试耗尽发终态错误事件时,据此做 OOM/crashloop 等精准诊断,
     /// 替代通用文案。None(测试/无 runtime)→ 通用"Compute environment temporarily unavailable"。
     diag_ctx: Option<Arc<DiagCtx>>,
+    /// 本 SharedStream 生命周期内是否已服务过 HTTP 客户端。
+    /// 仅首个客户端 replay ring（兜"chat 先发、SSE 后连"的时间差）；后续连接
+    /// （断线重连/并发第二端）纯实时流——消费即走，重放已收消息违反防重复红线。
+    /// idle 清理销毁重建后自然重置（新一轮 turn 的首连仍兜时间差）。
+    first_client_served: AtomicBool,
 }
 
 impl SharedStream {
@@ -250,6 +255,7 @@ impl SharedStream {
             cancel_token: CancellationToken::new(),
             task_handle: OnceLock::new(),
             diag_ctx: diag_ctx.clone(),
+            first_client_served: AtomicBool::new(false),
         });
 
         let handle = spawn_backend_task(
@@ -300,6 +306,12 @@ impl SharedStream {
     /// 订阅 broadcast（实时事件）
     pub fn subscribe(&self) -> broadcast::Receiver<SharedEvent> {
         self.broadcast_tx.subscribe()
+    }
+
+    /// 声明首连资格：本流生命周期内第一个 HTTP 客户端返回 true（其 replay
+    /// 用于兜 chat→SSE 时间差），后续连接返回 false（纯实时，不重放）。
+    pub fn claim_first_client(&self) -> bool {
+        !self.first_client_served.swap(true, Ordering::AcqRel)
     }
 
     /// 增量补齐：从 ring 读取 `seq > from_seq` 的事件（非破坏性，按 seq 升序）。
