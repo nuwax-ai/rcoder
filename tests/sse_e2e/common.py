@@ -51,16 +51,22 @@ def load_env_local():
 
 
 CFG = load_env_local()
-RCODER = os.environ.get("RCODER_URL", CFG.get("RCODER_URL", "http://127.0.0.1:8090"))
+RCODER_URL_ENV = os.environ.get("RCODER_URL", "")
+RCODER = RCODER_URL_ENV or CFG.get("RCODER_URL", "http://127.0.0.1:8090")
 API_KEY = os.environ.get("LLM_API_KEY", CFG.get("LLM_API_KEY", ""))
 BASE_URL = os.environ.get("LLM_BASE_URL", CFG.get("LLM_BASE_URL", ""))
 MODEL = os.environ.get("LLM_MODEL", CFG.get("LLM_MODEL", ""))
+# K8s 模式（远端 rcoder）：TEST_K8S_SSH=user@host 时清理走远程 kubectl 删 STS/svc/PVC
+K8S_SSH = os.environ.get("TEST_K8S_SSH", "")
+K8S_NS = os.environ.get("TEST_K8S_NS", "nuwax-k8s-test")
 
 RUN_TAG = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 OUT_DIR = RESULTS_ROOT / RUN_TAG
 # 每场景独立 user → 独立 agent 容器/进程：场景间彻底隔离
 # （同一 user 的 agent 是 prompt 串行的，前一场景未完结的 turn 会被下一场景的 chat cancel）
-USER = f"user-pytest-{RUN_TAG}"
+# user 名长度 ≤23：K8s 模式资源名 = rcoder-computer-agent-runner-<user>[-headless] 须 ≤63 字符
+# （Docker 模式无此限制，统一短名不影响）；HHMMSS 保证同日多次运行不撞名
+USER = f"ue{RUN_TAG.split('_')[-1]}"
 
 
 def scoped_user(name: str) -> str:

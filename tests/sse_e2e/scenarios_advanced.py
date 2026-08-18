@@ -247,10 +247,18 @@ def scenario_container_restart_recovery(out: dict):
     t1_max = max(ids_of(evs1)) if ids_of(evs1) else 0
     c.ok(t1_max > 0, f"重启前轮正常（seq 到 {t1_max}）")
 
-    cname = f"dev-rcoder-agent-runner-{user}"
-    r = subprocess.run(["docker", "restart", cname], capture_output=True, text=True, timeout=60)
+    # 故障注入：Docker 模式重启本地容器；K8s 模式删 Pod 让 STS 重建（等效 agent 故障恢复）
+    from common import K8S_NS, K8S_SSH
+    cname = f"rcoder-computer-agent-runner-{user}-0" if K8S_SSH else f"dev-rcoder-agent-runner-{user}"
+    if K8S_SSH:
+        r = subprocess.run(
+            ["ssh", K8S_SSH, "kubectl", "-n", K8S_NS, "delete", "pod", cname, "--wait=false"],
+            capture_output=True, text=True, timeout=60)
+        time.sleep(20)  # 等 STS 重建 Pod + agent_runner 就绪
+    else:
+        r = subprocess.run(["docker", "restart", cname], capture_output=True, text=True, timeout=60)
+        time.sleep(12)  # 等 agent_runner 进程起来
     c.ok(r.returncode == 0, f"容器重启注入成功（{r.stderr[:40]}）")
-    time.sleep(12)  # 等 agent_runner 进程起来
 
     p2 = base_payload("我上一条消息让你做什么了？一句话回答。", f"{RUN_TAG}-sg4b", user)
     p2["session_id"], p2["project_id"] = sid, pid

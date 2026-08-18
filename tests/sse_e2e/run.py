@@ -63,12 +63,29 @@ SCENARIOS = [
 
 
 def cleanup_test_containers():
-    """主动删除本次测试创建的 agent 容器（dev-rcoder-agent-runner-<USER 前缀>）。
+    """主动删除本次测试创建的 agent 容器（不等闲置回收：场景多时容器堆积
+    会吃光宿主内存/节点盘，拖慢甚至拖垮后续场景）。
 
-    不等闲置回收：场景多时容器堆积会吃光宿主内存，拖慢甚至拖垮后续场景。
+    Docker 模式: docker rm dev-rcoder-agent-runner-<USER 前缀>；
+    K8s 模式(TEST_K8S_SSH 指定时): 远程 kubectl 删 STS/headless svc/PVC。
     """
     import subprocess
+    from common import K8S_NS, K8S_SSH
     try:
+        if K8S_SSH:
+            out = subprocess.run(
+                ["ssh", K8S_SSH, "kubectl", "-n", K8S_NS, "get", "sts,svc,pvc", "-o", "name"],
+                capture_output=True, text=True, timeout=30,
+            )
+            prefix = f"rcoder-computer-agent-runner-{USER}"
+            targets = [l.strip() for l in out.stdout.splitlines() if prefix in l]
+            if targets:
+                subprocess.run(
+                    ["ssh", K8S_SSH, "kubectl", "-n", K8S_NS, "delete", *targets],
+                    capture_output=True, timeout=180,
+                )
+                print(f"  🧹 已清理 {len(targets)} 个 K8s 资源（STS/svc/PVC）")
+            return
         out = subprocess.run(
             ["docker", "ps", "-aq", "--filter", f"name=dev-rcoder-agent-runner-{USER}"],
             capture_output=True, text=True, timeout=15,
