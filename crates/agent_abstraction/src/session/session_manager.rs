@@ -564,7 +564,21 @@ where
                             );
                             return Ok((new_session, true));
                         } else {
-                            // 其他线程已经创建了真实会话，使用已存在的（丢弃我们创建的）
+                            // 其他线程已经创建了真实会话。复检通道活性再决定：
+                            // registry status 可能被垂死旧连接异步发出的
+                            // PromptEnd(Cancelled) 翻转（PendingGuard 语义被击穿），
+                            // status 不可作为裁决依据；通道是否存活才是硬事实。
+                            // existing 通道已死 → 它是残留死 entry，替换为我们的健康新会话
+                            if current_session.is_channel_closed() {
+                                let old_session_id = current_session.session_id().to_string();
+                                let new_session_id = new_session.session_id().to_string();
+                                entry.insert(new_session.clone());
+                                info!(
+                                    "✅ [SESSION] Replaced dead-channel entry left by concurrent creator: project_id={}, {} → {}",
+                                    project_id, old_session_id, new_session_id
+                                );
+                                return Ok((new_session, true));
+                            }
                             let existing_session = current_session.clone();
                             let created_session_id = new_session.session_id().to_string();
                             let existing_session_id = existing_session.session_id().to_string();
@@ -643,8 +657,20 @@ where
                     );
                     return Ok((new_session, true));
                 }
-                Entry::Occupied(entry) => {
-                    // 其他线程已经创建了会话，使用已存在的（丢弃我们创建的）
+                Entry::Occupied(mut entry) => {
+                    // 其他线程已经创建了会话：复检通道活性（同 Pending 分支，
+                    // status 可能被垂死连接的状态回写翻转，通道活性才是硬事实）
+                    if entry.get().is_channel_closed() {
+                        let old_session_id = entry.get().session_id().to_string();
+                        let new_session_id = new_session.session_id().to_string();
+                        entry.insert(new_session.clone());
+                        info!(
+                            "✅ [SESSION] Replaced dead-channel entry after rebuild race: project_id={}, {} → {}",
+                            project_id, old_session_id, new_session_id
+                        );
+                        return Ok((new_session, true));
+                    }
+                    // existing 健康，使用已存在的（丢弃我们创建的）
                     let existing_session = entry.get().clone();
                     let created_session_id = new_session.session_id().to_string();
                     let existing_session_id = existing_session.session_id().to_string();
@@ -687,7 +713,19 @@ where
                 );
                 Ok((new_session, true))
             }
-            Entry::Occupied(entry) => {
+            Entry::Occupied(mut entry) => {
+                // 复检通道活性：并发创建的败者若发现 existing 已死（如残留的
+                // Pending 占位之外还有垂死 entry），替换而不是把死通道交给调用方
+                if entry.get().is_channel_closed() {
+                    let old_session_id = entry.get().session_id().to_string();
+                    let new_session_id = new_session.session_id().to_string();
+                    entry.insert(new_session.clone());
+                    info!(
+                        "✅ [SESSION] Replaced dead-channel entry after creation race: project_id={}, {} → {}",
+                        project_id, old_session_id, new_session_id
+                    );
+                    return Ok((new_session, true));
+                }
                 // 其他线程已经创建了会话，使用已存在的（丢弃我们创建的）
                 let existing_session = entry.get().clone();
                 let created_session_id = new_session.session_id().to_string();
@@ -737,15 +775,12 @@ where
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
-        session
-            .prompt_tx()
-            .send(prompt_request)
+        send_prompt_to_entry(&session, prompt_request)
             .await
             .map_err(|e| {
                 error!("send Prompt requestfailed: {:?}", e);
                 anyhow::anyhow!("Failed to send Prompt request: {:?}", e)
             })?;
-
         info!("Prompt request already sent, project ID: {}", project_id);
         Ok(())
     }
@@ -757,4 +792,107 @@ impl<N: SessionNotifier + 'static, R: SessionRegistry> std::fmt::Debug for AcpSe
             .field("session_count", &self.registry.count())
             .finish()
     }
+}
+
+/// 直接向 get_or_create_session 返回的 entry 发送 Prompt
+///
+/// 不按 project_id 重取——重取在"会话就绪到发送"之间开了 TOCTOU 窗口
+/// （并发重建期间可能取到通道已死的其它 entry，且 prompt_request 内的
+/// session_id 与实际通道不一致）。调用方持有刚裁决过的 entry，直发即可。
+///
+/// 返回裸 [`tokio::sync::mpsc::error::SendError`]：mpsc send 的失败原因
+/// 唯一（接收端 drop/通道关闭，即连接任务已退出），调用方以类型本身
+/// 判定"通道死亡"触发重建重试，无需 downcast。
+pub(crate) async fn send_prompt_to_entry(
+    session: &impl SessionEntry,
+    prompt_request: PromptRequest,
+) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<PromptRequest>> {
+    session.prompt_tx().send(prompt_request).await
+}
+
+#[cfg(test)]
+mod prompt_channel_tests {
+    use super::*;
+    use crate::acp::CancelNotificationRequestWrapper;
+    use chrono::Utc;
+    use shared_types::{AgentStatus, ModelProviderConfig, ProjectAndAgentInfo};
+    use tokio::sync::mpsc;
+
+    /// 构造仅含通道语义的测试 entry（lifecycle 等与本测试无关字段留 None）
+    fn test_entry(
+        project_id: &str,
+        prompt_tx: mpsc::Sender<PromptRequest>,
+        cancel_tx: mpsc::Sender<CancelNotificationRequestWrapper>,
+    ) -> ProjectAndAgentInfo {
+        let now = Utc::now();
+        ProjectAndAgentInfo {
+            project_id: project_id.to_string(),
+            session_id: SessionId::from("ses_test"),
+            prompt_tx,
+            cancel_tx,
+            model_provider: None,
+            request_id: None,
+            status: AgentStatus::Idle,
+            last_activity: now,
+            created_at: now,
+            stop_handle: None,
+            agent_binary_snapshot: None,
+        }
+    }
+
+    /// 通道接收端存活的 entry：is_channel_closed 必须为 false——
+    /// get_or_create_session 第三阶段据此裁决"用 existing"，语义锁死
+    #[test]
+    fn live_channel_is_not_closed() {
+        let (prompt_tx, prompt_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let entry = test_entry("p1", prompt_tx, cancel_tx);
+        assert!(!entry.is_channel_closed());
+        drop(prompt_rx); // 防优化告警：显式持有到断言后
+    }
+
+    /// 接收端 drop（连接任务退出）→ is_channel_closed 为 true——
+    /// 第三阶段据此触发"替换死 entry"，SendError 修复的裁决依据
+    #[test]
+    fn dropped_receiver_marks_channel_closed() {
+        let (prompt_tx, prompt_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let entry = test_entry("p1", prompt_tx, cancel_tx);
+        drop(prompt_rx);
+        assert!(entry.is_channel_closed());
+    }
+
+    /// send_prompt_to_entry 对死通道的错误必须可 downcast 到
+    /// mpsc SendError——acp_worker 的重试判定（修复 3）依赖此类型链
+    #[tokio::test]
+    async fn send_to_dead_entry_error_downcasts_to_send_error() {
+        let (prompt_tx, prompt_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        drop(prompt_rx);
+        let entry = test_entry("p1", prompt_tx, cancel_tx);
+
+        let request = PromptRequest::new(SessionId::from("ses_test"), Vec::new());
+        // Err 类型即 SendError（函数签名保证），Err 即"通道死亡"——修复 3 的重试依据
+        send_prompt_to_entry(&entry, request)
+            .await
+            .expect_err("dead channel must error");
+    }
+
+    /// 活通道直发成功（修复 2 的主路径）
+    #[tokio::test]
+    async fn send_to_live_entry_succeeds() {
+        let (prompt_tx, mut prompt_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let entry = test_entry("p1", prompt_tx, cancel_tx);
+
+        let request = PromptRequest::new(SessionId::from("ses_test"), Vec::new());
+        send_prompt_to_entry(&entry, request)
+            .await
+            .expect("live channel send");
+        assert!(prompt_rx.try_recv().is_ok());
+    }
+
+    // ModelProviderConfig 引用占位（构造完整 entry 的后续场景用）
+    #[allow(dead_code)]
+    fn _model_config_marker(_: Option<ModelProviderConfig>) {}
 }
