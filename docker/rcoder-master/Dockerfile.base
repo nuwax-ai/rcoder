@@ -57,7 +57,35 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Rust cargo 国内镜像配置 (rsproxy-sparse); rust:bookworm CARGO_HOME=/usr/local/cargo, dev 容器 cargo run/build 走加速源
-COPY .cargo/config.toml /usr/local/cargo/config.toml
+# heredoc 内联生成, 仓库不携带 .cargo/config.toml（项目级 cargo 源配置会与全局配置撞 URL 导致 Docker 构建失败）
+COPY <<'EOF' /usr/local/cargo/config.toml
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy]
+registry = "https://rsproxy.cn/crates.io-index"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[source.aliyun]
+registry = "https://mirrors.aliyun.com/crates.io-index"
+
+[source.aliyun-sparse]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+
+[source.tencent]
+registry = "https://mirrors.cloud.tencent.com/crates.io-index"
+
+[source.tencent-sparse]
+registry = "sparse+https://mirrors.cloud.tencent.com/crates.io-index/"
+
+[registries.rsproxy]
+index = "https://rsproxy.cn/crates.io-index"
+
+[net]
+git-fetch-with-cli = true
+EOF
 
 # 复制 npmrc 配置镜像（使用国内镜像加速）
 COPY .npmrc /root/.npmrc

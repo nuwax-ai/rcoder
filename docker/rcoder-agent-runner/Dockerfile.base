@@ -765,8 +765,42 @@ RUN npm install -g @zed-industries/claude-code-acp@latest && \
 # Rust 工具链已由 rust:bookworm 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
 # libssl-dev / pkg-config / build-essential 构成 已由 rust:bookworm (buildpack-deps) 预装, 不再单独 apt 装
 # (原此处 apt 装 libssl-dev/pkg-config/build-essential + rustup 安装, 均已冗余, 删除)。
-# cargo 镜像配置 (rsproxy-sparse) COPY 到 /usr/local/cargo/config.toml; runtime UserApp build 走加速源。
-COPY .cargo/config.toml /usr/local/cargo/config.toml
+# cargo 镜像配置 (rsproxy-sparse) 写到 /usr/local/cargo/config.toml; runtime UserApp build 走加速源。
+# heredoc 内联生成, 仓库不携带 .cargo/config.toml（项目级 cargo 源配置会与全局配置撞 URL 导致 Docker 构建失败）
+COPY <<'EOF' /usr/local/cargo/config.toml
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy]
+registry = "https://rsproxy.cn/crates.io-index"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[source.aliyun]
+registry = "https://mirrors.aliyun.com/crates.io-index"
+
+[source.aliyun-sparse]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+
+[source.tencent]
+registry = "https://mirrors.cloud.tencent.com/crates.io-index"
+
+[source.tencent-sparse]
+registry = "sparse+https://mirrors.cloud.tencent.com/crates.io-index/"
+
+[source.ustc]
+registry = "https://mirrors.ustc.edu.cn/crates.io-index"
+
+[source.ustc-sparse]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[registries.rsproxy]
+index = "https://rsproxy.cn/crates.io-index"
+
+[net]
+git-fetch-with-cli = true
+EOF
 
 # 安装 uv 到全局路径（需要 root）
 # 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
