@@ -613,4 +613,4 @@ mod backend_task;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use backend_task::spawn_backend_task;
+use backend_task::spawn_backend_task;
