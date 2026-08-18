@@ -224,9 +224,17 @@ async fn run_stream_loop(
                         // 重置空闲超时计时器
                         last_message_time = Instant::now();
 
+                        // 终端关流只认 end_turn/error：cancelled 仅是本轮中断，
+                        // agent 随后可能继续执行（切模型场景：迟到的取消余波
+                        // PromptEnd(Cancelled) 曾把活跃订阅误杀，事件全部退化为
+                        // ring buffer 积压，客户端空流）。cancelled 后由下一个
+                        // end_turn 或空闲超时自然收流。
                         let is_terminal_message = matches!(
                             unified_message.message_type,
                             crate::model::SessionMessageType::SessionPromptEnd
+                        ) && matches!(
+                            unified_message.sub_type.as_str(),
+                            "end_turn" | "error"
                         );
 
                         let event = unified_message_to_progress_event(seq, &unified_message);

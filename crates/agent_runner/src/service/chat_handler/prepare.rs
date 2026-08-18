@@ -239,11 +239,23 @@ pub(super) async fn prepare_session(
             sid, session_exists
         );
 
-        if !session_exists && SESSION_CACHE.remove(sid).is_some() {
-            info!(
-                "[ChatHandler] session does not exist in registry, removed from SESSION_CACHE: session_id={}",
-                sid
-            );
+        if !session_exists {
+            // registry 查不到 ≠ session 永久无效：切模型重建窗口 registry 短暂
+            // 无 entry 是正常状态，此刻 remove SESSION_CACHE 会把刚建立的
+            // SSE 订阅 sender 一起删掉（之后所有事件退化为 ring 积压、客户端
+            // 空流）。改为只清 ring——SessionData 的生命周期由 idle cleanup 统一管理。
+            if let Some(sd) = SESSION_CACHE.view(sid, |_, d| d.clone()) {
+                let cleared = sd.clear_message_buffer().await;
+                info!(
+                    "[ChatHandler] session not in registry (rebuild window?), kept SessionData with ring cleared ({} messages): session_id={}",
+                    cleared, sid
+                );
+            } else {
+                info!(
+                    "[ChatHandler] session not in registry and no SessionData cached: session_id={}",
+                    sid
+                );
+            }
         } else if session_exists {
             info!("[ChatHandler] Reusing existing session: session_id={}", sid);
             // 🧹 清空 ring buffer，防止回放过期的历史消息
