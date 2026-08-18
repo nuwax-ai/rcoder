@@ -168,7 +168,11 @@ async fn forward_to_client(
     session_id: &str,
     client_last_seq: &mut u64,
 ) -> bool {
-    let is_terminal = ev.message_type == "SessionPromptEnd";
+    // 关流判定：turn 终态（end_turn/error）+ rcoder 合成的 stream_ended。
+    // cancelled 不关流——它是"用户连发消息自动取消"的常态事件，agent 随后继续
+    // 执行新任务，流保持供下一轮实时投递（与 agent_runner 侧订阅判定对齐）。
+    let is_terminal =
+        super::session_stream_registry::is_stream_closing(&ev.message_type, &ev.sub_type);
     // cursor-reset(#15):epoch 变化 → 重置客户端去重游标,让新 epoch 的低 seq 事件不被去重丢弃。
     if ev.message_type == "StreamReset" {
         *client_last_seq = 0;
@@ -305,9 +309,17 @@ mod tests {
     use super::*;
 
     fn make_event(message_type: &str, seq: u64) -> shared_types::grpc::ProgressEvent {
+        make_prompt_end(message_type, "test", seq)
+    }
+
+    fn make_prompt_end(
+        message_type: &str,
+        sub_type: &str,
+        seq: u64,
+    ) -> shared_types::grpc::ProgressEvent {
         shared_types::grpc::ProgressEvent {
             message_type: message_type.to_string(),
-            sub_type: "test".to_string(),
+            sub_type: sub_type.to_string(),
             payload: "{}".to_string(),
             request_id: None,
             seq,
@@ -335,7 +347,7 @@ mod tests {
             Result<axum::response::sse::Event, std::convert::Infallible>,
         >(10);
         let mut last_seq = 10_u64;
-        let ev = make_event("SessionPromptEnd", 0); // 终端 + seq=0 合成消息
+        let ev = make_prompt_end("SessionPromptEnd", "end_turn", 0); // turn 终态 + seq=0 合成消息
 
         let cont = forward_to_client(&tx, &ev, "s1", &mut last_seq).await;
         assert!(
@@ -401,5 +413,48 @@ mod tests {
             .expect("collect sse body")
             .to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn forward_to_client_continues_on_cancelled() {
+        // cancelled = 用户连发消息自动取消当前任务：常态事件，不关流，
+        // 流保留给随后的新任务实时投递
+        let (tx, _rx) = tokio::sync::mpsc::channel::<
+            Result<axum::response::sse::Event, std::convert::Infallible>,
+        >(10);
+        let mut last_seq = 10_u64;
+        let ev = make_prompt_end("SessionPromptEnd", "cancelled", 11);
+
+        let cont = forward_to_client(&tx, &ev, "s", &mut last_seq).await;
+        assert!(cont, "cancelled must NOT close the stream");
+        assert_eq!(last_seq, 11);
+    }
+
+    #[tokio::test]
+    async fn forward_to_client_stops_on_error() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<
+            Result<axum::response::sse::Event, std::convert::Infallible>,
+        >(10);
+        let mut last_seq = 10_u64;
+        let ev = make_prompt_end("SessionPromptEnd", "error", 0);
+
+        let cont = forward_to_client(&tx, &ev, "s", &mut last_seq).await;
+        assert!(!cont, "error is a turn terminal and must close the stream");
+    }
+
+    #[tokio::test]
+    async fn forward_to_client_stops_on_stream_ended() {
+        // rcoder 合成的流替换信号必须关流，否则客户端转发 task hang
+        let (tx, _rx) = tokio::sync::mpsc::channel::<
+            Result<axum::response::sse::Event, std::convert::Infallible>,
+        >(10);
+        let mut last_seq = 10_u64;
+        let ev = make_prompt_end("SessionPromptEnd", "stream_ended", 0);
+
+        let cont = forward_to_client(&tx, &ev, "s", &mut last_seq).await;
+        assert!(
+            !cont,
+            "stream_ended must close the stream (client should reconnect)"
+        );
     }
 }

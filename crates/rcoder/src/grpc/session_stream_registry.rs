@@ -352,8 +352,10 @@ impl SharedStream {
     fn dispatch_event(&self, ev: SharedEvent) {
         let seq = ev.seq;
         // 终端判定：agent 异常退出的 error 事件在转换层已归一化为 End(sub_type="error")，
-        // 此处单一判定即覆盖正常/异常两种路径
-        let is_terminal = ev.message_type == "SessionPromptEnd";
+        // 此处单一判定即覆盖正常/异常两种路径。
+        // cancelled 不算 turn 边界：它是"用户连发消息自动取消当前任务"的常态事件
+        // （agent 随后继续执行新任务），清 ring/归还资格会破坏下一轮的 replay 语义。
+        let is_terminal = is_turn_terminal(&ev.message_type, &ev.sub_type);
         if seq > 0 {
             {
                 let mut ring = self.ring.lock();
@@ -489,6 +491,19 @@ impl Drop for ClientGuard {
 }
 
 /// 节流刷新 session 活跃时间（防 idle cleaner 误杀；与 sse_stream 语义一致）。
+/// turn 边界终端：本轮任务真实结束（正常完成或错误终止）。
+/// `cancelled` 不算——它是"用户连发消息自动取消当前任务"的常态事件，agent 随后
+/// 继续执行新任务；此刻清 ring/归还首连资格会破坏下一轮的 replay 语义。
+pub(crate) fn is_turn_terminal(message_type: &str, sub_type: &str) -> bool {
+    message_type == "SessionPromptEnd" && matches!(sub_type, "end_turn" | "error")
+}
+
+/// SSE 流关闭信号：turn 终态 + rcoder 内部合成的 `stream_ended`（流被替换/清理，
+/// 必须让客户端转发 task 退出并重连，否则 hang）。
+pub(crate) fn is_stream_closing(message_type: &str, sub_type: &str) -> bool {
+    message_type == "SessionPromptEnd" && matches!(sub_type, "end_turn" | "error" | "stream_ended")
+}
+
 fn maybe_update_activity(
     updater: &Arc<dyn Fn(&str) + Send + Sync>,
     session_id: &str,
