@@ -93,8 +93,13 @@ impl PublishTaskPersistence for PgPublishTaskPersistence {
             .map_err(map_err)
     }
 
-    async fn recover_running(&self, reason: &str) -> Result<u64, PublishRepoError> {
-        super::repo::publish_repo::recover_running(&self.pool, reason)
+    async fn recover_running(
+        &self,
+        reason: &str,
+        owner_pod: &str,
+        stale_before: DateTime<Utc>,
+    ) -> Result<u64, PublishRepoError> {
+        super::repo::publish_repo::recover_running(&self.pool, reason, owner_pod, stale_before)
             .await
             .map_err(map_err)
     }

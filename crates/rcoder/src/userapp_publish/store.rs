@@ -25,6 +25,12 @@ use rcoder_storage::publish_repo::{
 
 /// 终态任务在内存中保留 24h,便于前端重连查询（也是 PG 行的 TTL）。
 pub(crate) const TERMINAL_TASK_TTL_SECS: i64 = 24 * 60 * 60;
+/// 僵尸任务判定阈值：任务创建后超过此时长仍无终态 → 视为创建者已消亡，由启动
+/// 恢复/周期对账收敛为 failed（build 1800s + activate 最长 1800s + 下载余量）。
+pub const STALE_TASK_SECS: i64 = 2 * 60 * 60;
+/// repo.create 的 PG 往返超时（持 map 锁，超时冻结全部任务查询/取消——不能等
+/// sqlx 默认的 30s pool acquire）。
+const PG_CREATE_TIMEOUT_SECS: u64 = 5;
 /// 防止异常调用方无限创建任务。达上限时优先淘汰最旧终态任务。
 const MAX_RETAINED_TASKS: usize = 1_000;
 
@@ -111,6 +117,10 @@ impl PublishTaskStore {
         // 注：此处持 map 锁跨 repo.create 的 PG 往返——有意为之。create 是人级频率
         // （build/publish 按钮触发），U2"同 app 单活跃任务"语义本就需要创建串行化；
         // 换乐观方案（放锁→PG→复锁）会引入容量/占用两个竞窗，收益为零。
+        // 往返设 5s 超时：PG 不可达时 sqlx pool acquire 默认 30s，期间 map 锁冻结
+        // get/cancel/全部任务查询——5s 封顶把冻结面缩到可接受。超时后 INSERT 可能
+        // 实际成功（慢而未失败）→ 残留 running 行由周期 stale 对账收敛（见
+        // background_tasks）。
         if let Some(repo) = &self.repo {
             let task_id = uuid::Uuid::now_v7().simple().to_string();
             let created_at = Utc::now();
@@ -128,8 +138,26 @@ impl PublishTaskStore {
                 created_at,
                 terminal_at: None,
             };
-            if let Err(repo_err) = repo.create(&record).await {
-                return Err(map_repo_error(repo_err, app_id));
+            let create_outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(PG_CREATE_TIMEOUT_SECS), {
+                    let repo = Arc::clone(repo);
+                    let record = record.clone();
+                    async move { repo.create(&record).await }
+                })
+                .await;
+            match create_outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(repo_err)) => return Err(map_repo_error(repo_err, app_id)),
+                Err(_) => {
+                    tracing::error!(
+                        "[USERAPP_PUBLISH] repo.create timed out after {PG_CREATE_TIMEOUT_SECS}s \
+                         app_id={app_id} (a residual running row, if the INSERT eventually \
+                         succeeded, is reconciled by the stale task sweep)"
+                    );
+                    return Err(PublishTaskStoreError::Backend(format!(
+                        "publish task create timed out after {PG_CREATE_TIMEOUT_SECS}s"
+                    )));
+                }
             }
             // 终态/阶段钩子：fire-and-forget spawn 异步落库（不阻塞 emit 热路径）
             let terminal_repo = Arc::clone(repo);
@@ -138,20 +166,7 @@ impl PublishTaskStore {
                 let repo = Arc::clone(&terminal_repo);
                 let task_id = terminal_task_id.clone();
                 tokio::spawn(async move {
-                    let at = chrono::DateTime::from_timestamp(payload.terminal_at, 0)
-                        .unwrap_or_else(Utc::now);
-                    if let Err(e) = repo
-                        .update_terminal(
-                            &task_id,
-                            payload.status.as_pg_str(),
-                            at,
-                            payload.error.as_deref(),
-                            payload.release_id.as_deref(),
-                        )
-                        .await
-                    {
-                        tracing::error!("[USERAPP_PUBLISH] terminal persist failed: {e}");
-                    }
+                    persist_terminal_with_retry(&repo, &task_id, &payload).await;
                 });
             });
             let stage_repo = Arc::clone(repo);
@@ -189,13 +204,24 @@ impl PublishTaskStore {
 
     /// 快照查询：内存命中（活任务）→ 未命中回查 PG 行（跨重启/跨副本状态可查；
     /// `seq` 恒 0（无事件流），`updated_at` 取终态/创建时间戳）。
-    pub async fn lookup_snapshot(&self, id: &str) -> Option<PublishTaskSnapshot> {
+    ///
+    /// 错误如实上抛（`Err` = 存储故障应报 500；`Ok(None)` = 真不存在 404）——
+    /// 此前 `.ok()??` 把 Backend 错误吞成 None，PG 瞬断时 get_task 误报 404
+    /// "任务不存在"，误导调用方的重试/告警决策。
+    pub async fn lookup_snapshot(
+        &self,
+        id: &str,
+    ) -> Result<Option<PublishTaskSnapshot>, PublishRepoError> {
         if let Some(task) = self.get(id).await {
-            return Some(task.snapshot().await);
+            return Ok(Some(task.snapshot().await));
         }
-        let repo = self.repo.as_ref()?;
-        let record = repo.get(id).await.ok()??;
-        Some(snapshot_from_record(record))
+        let Some(repo) = self.repo.as_ref() else {
+            return Ok(None); // 内存模式：未命中即不存在
+        };
+        match repo.get(id).await {
+            Ok(record) => Ok(record.map(snapshot_from_record)),
+            Err(e) => Err(e),
+        }
     }
 
     /// 列表分页查询:PG 模式查 PG 行(覆盖多副本/重启/内存驱逐,24h TTL 窗口);
@@ -292,6 +318,49 @@ fn map_list_repo_error(error: PublishRepoError) -> PublishTaskStoreError {
 }
 
 /// PG 仓储错误 → store 错误（Busy 携带 PG 侧冲突详情；Backend 如实 500）
+/// 终态落库（带有限退避重试）：终态行是"每 app 单活跃任务"唯一索引的解锁钥匙，
+/// 一次 PG 瞬断落库失败会让该 app 后续发布永久 409 AppBusy（唯一解锁=重启 rcoder）。
+/// 3 次退避（1s/5s/25s）后仍失败交由周期 stale 对账兜底收敛 failed。
+///
+/// 设计取舍：update_terminal 不加"已是终态不许改"守卫——后到的真实终态覆盖
+/// 恢复期的误标是正确的收敛方向。
+async fn persist_terminal_with_retry(
+    repo: &Arc<dyn PublishTaskPersistence>,
+    task_id: &str,
+    payload: &TerminalPersist,
+) {
+    let at = chrono::DateTime::from_timestamp(payload.terminal_at, 0).unwrap_or_else(Utc::now);
+    let mut backoff_secs = 1u64;
+    for attempt in 1..=3 {
+        match repo
+            .update_terminal(
+                task_id,
+                payload.status.as_pg_str(),
+                at,
+                payload.error.as_deref(),
+                payload.release_id.as_deref(),
+            )
+            .await
+        {
+            Ok(()) => return,
+            Err(e) if attempt == 3 => {
+                tracing::error!(
+                    "[USERAPP_PUBLISH] terminal persist failed after {attempt} attempts, \
+                     awaiting stale reconciliation: {e}"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[USERAPP_PUBLISH] terminal persist attempt {attempt} failed, \
+                     retrying in {backoff_secs}s: {e}"
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+        backoff_secs *= 5;
+    }
+}
+
 fn map_repo_error(error: PublishRepoError, app_id: String) -> PublishTaskStoreError {
     match error {
         PublishRepoError::Busy(detail) => PublishTaskStoreError::AppBusy {
@@ -302,8 +371,10 @@ fn map_repo_error(error: PublishRepoError, app_id: String) -> PublishTaskStoreEr
     }
 }
 
-/// 本 Pod 名（owner_pod 诊断字段；K8s Downward API 注入 POD_NAME，退 HOSTNAME）
-fn owner_pod_name() -> String {
+/// 本 Pod 名（owner_pod 诊断字段 + recover_running 的归属过滤键；K8s Downward API
+/// 注入 POD_NAME，退 HOSTNAME——容器内默认即 Pod 名）。pub(crate)：main 的启动
+/// 恢复与 background_tasks 的周期对账共用同一标识。
+pub fn owner_pod_name() -> String {
     std::env::var("POD_NAME").unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_default())
 }
 

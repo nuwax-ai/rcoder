@@ -240,15 +240,25 @@ pub(crate) async fn update_stage<'e>(
 
 /// 启动恢复：未终态任务全部标记 failed（orchestrator 随进程消亡，running 必为僵尸）。
 /// 返回恢复行数。
+///
+/// 多副本安全：只收敛"本副本自己的（owner_pod 匹配）+ 无主的（NULL/空，单机或
+/// 旧数据）+ 超过 stale_before 仍无终态的僵尸"——其他副本的活跃任务不碰，滚动
+/// 更新新旧 Pod 并存窗口不会误杀（此前全库 UPDATE，新副本启动即打掉旧副本正在
+/// 正常执行的任务）。Pod 重建改名导致 owner 失配的场景由 stale_before 兜底。
 pub(crate) async fn recover_running<'e>(
     db: impl PgExecutor<'e>,
     reason: &str,
+    owner_pod: &str,
+    stale_before: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE publish_tasks SET state='failed', error=$1, terminal_at=now() \
-         WHERE terminal_at IS NULL",
+         WHERE terminal_at IS NULL \
+           AND (owner_pod = $2 OR owner_pod IS NULL OR owner_pod = '' OR created_at < $3)",
     )
     .bind(reason)
+    .bind(owner_pod)
+    .bind(stale_before)
     .execute(db)
     .await?;
     Ok(result.rows_affected())

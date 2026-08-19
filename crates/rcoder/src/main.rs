@@ -123,7 +123,17 @@ async fn main() -> anyhow::Result<()> {
                     store.pool().clone(),
                 ),
             );
-            match publish.recover_running("rcoder restarted").await {
+            match publish
+                .recover_running(
+                    "rcoder restarted",
+                    &rcoder::userapp_publish::store::owner_pod_name(),
+                    chrono::Utc::now()
+                        - chrono::Duration::seconds(
+                            rcoder::userapp_publish::store::STALE_TASK_SECS,
+                        ),
+                )
+                .await
+            {
                 Ok(n) if n > 0 => {
                     tracing::warn!(
                         "[STORAGE_PG] recovered {n} orphaned publish tasks (marked failed)"

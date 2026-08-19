@@ -80,9 +80,13 @@ async fn publish_persistence_roundtrip_and_constraints() {
     assert_eq!(got.state, "completed");
     assert_eq!(got.release_id.as_deref(), Some("rel-1"));
 
-    // recover_running：task-b 标记 failed
+    // recover_running：task-b（owner=test-pod，本副本）标记 failed
     let recovered = repo
-        .recover_running("rcoder restarted")
+        .recover_running(
+            "rcoder restarted",
+            "test-pod",
+            chrono::Utc::now() - chrono::Duration::hours(3),
+        )
         .await
         .expect("recover");
     assert!(recovered >= 1);
@@ -102,6 +106,116 @@ async fn publish_persistence_roundtrip_and_constraints() {
     let purged = repo.purge_expired(24 * 3600).await.expect("purge");
     assert!(purged >= 1, "expired terminal row must be purged");
     assert!(repo.get(&task_a).await.expect("get").is_none());
+}
+
+/// recover_running 的多副本安全：只收敛"本副本的 + 无主的 + 超时僵尸"，
+/// 其他副本的活跃任务不动（滚动更新新旧 Pod 并存窗口不误杀）。
+#[tokio::test]
+async fn recover_running_respects_owner_pod_and_staleness() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let _domain_guard = PUBLISH_DOMAIN_LOCK.lock().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&dsn)
+        .await
+        .expect("test pool");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrations");
+    let repo = crate::pg::userapp::publish::PgPublishTaskPersistence::new(pool.clone());
+    use crate::publish_repo::PublishTaskPersistence as _;
+
+    let suffix = uuid_suffix();
+    let record = |task_id: &str, app_id: &str, owner: Option<&str>, age: chrono::Duration| {
+        crate::publish_repo::PublishTaskRecord {
+            task_id: task_id.into(),
+            app_id: app_id.into(),
+            project_id: app_id.into(),
+            kind: "build".into(),
+            state: "running".into(),
+            stage: None,
+            release_id: None,
+            error: None,
+            progress: None,
+            owner_pod: owner.map(str::to_string),
+            created_at: chrono::Utc::now() - age,
+            terminal_at: None,
+        }
+    };
+
+    // 四个 app 各一条活行：本副本 / 其他副本 / 无主 / 其他副本的超时僵尸
+    // （后者兼模拟"Pod 重建改名后 owner 失配，靠 stale 兜底"的场景）
+    let mine = format!("task-mine-{suffix}");
+    let other = format!("task-other-{suffix}");
+    let noowner = format!("task-noown-{suffix}");
+    let stale = format!("task-stale-{suffix}");
+    repo.create(&record(
+        &mine,
+        &format!("app-mine-{suffix}"),
+        Some("pod-self"),
+        chrono::Duration::zero(),
+    ))
+    .await
+    .expect("create mine");
+    repo.create(&record(
+        &other,
+        &format!("app-other-{suffix}"),
+        Some("pod-other"),
+        chrono::Duration::zero(),
+    ))
+    .await
+    .expect("create other");
+    repo.create(&record(
+        &noowner,
+        &format!("app-noown-{suffix}"),
+        None,
+        chrono::Duration::zero(),
+    ))
+    .await
+    .expect("create noowner");
+    repo.create(&record(
+        &stale,
+        &format!("app-stale-{suffix}"),
+        Some("pod-other"),
+        chrono::Duration::hours(3),
+    ))
+    .await
+    .expect("create stale");
+
+    let recovered = repo
+        .recover_running(
+            "test recovery",
+            "pod-self",
+            chrono::Utc::now() - chrono::Duration::hours(2),
+        )
+        .await
+        .expect("recover");
+    // mine（owner 命中）+ noowner（无主）+ stale（超时僵尸）；other 不动
+    assert_eq!(recovered, 3, "own + unowned + stale rows converged");
+
+    for id in [&mine, &noowner, &stale] {
+        let got = repo.get(id).await.expect("get").expect("row");
+        assert_eq!(got.state, "failed", "{id} must be converged");
+    }
+    let got = repo.get(&other).await.expect("get").expect("row");
+    assert_eq!(
+        got.state, "running",
+        "another replica's active task must NOT be killed by this pod's recovery"
+    );
+
+    // 清理四条行防污染共享库（终态行由 purge_expired 兜底回收）
+    for id in [&mine, &other, &noowner, &stale] {
+        if let Err(cleanup_err) = repo
+            .update_terminal(id, "failed", chrono::Utc::now(), Some("test cleanup"), None)
+            .await
+        {
+            eprintln!("[cleanup] {id}: {cleanup_err}");
+        }
+    }
 }
 
 /// list:app_ids/kind/active_only 过滤、created_at DESC 排序、分页与 total。

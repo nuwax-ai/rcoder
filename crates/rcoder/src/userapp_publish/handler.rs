@@ -320,11 +320,14 @@ pub async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
 ) -> Result<Json<HttpResult<GetTaskData>>, AppError> {
-    // M5：内存未命中回查 PG 快照（跨重启/跨副本状态可查；活任务走内存含事件游标）
+    // M5：内存未命中回查 PG 快照（跨重启/跨副本状态可查；活任务走内存含事件游标）。
+    // 存储故障（Err）如实 500——此前 Backend 错误被吞成 404 "任务不存在"，
+    // 误导调用方的重试/告警决策。
     let snapshot = state
         .publish_tasks
         .lookup_snapshot(&task_id)
         .await
+        .map_err(|e| AppError::internal_server_error(&format!("publish task lookup failed: {e}")))?
         .ok_or_else(|| not_found(format!("publish task not found: {task_id}")))?;
     Ok(Json(HttpResult::success(GetTaskData { task: snapshot })))
 }

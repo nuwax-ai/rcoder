@@ -99,9 +99,16 @@ pub trait PublishTaskPersistence: Send + Sync {
         progress: Option<&Value>,
     ) -> Result<(), PublishRepoError>;
 
-    /// 启动恢复：未终态任务全部标记 failed（orchestrator 随进程消亡，running 必为僵尸）。
+    /// 启动恢复/僵尸对账：把"本副本的 + 无主的 + 早于 stale_before 仍无终态的"任务
+    /// 标记 failed（orchestrator 随进程消亡，running 必为僵尸）。多副本安全：其他副本
+    /// 的活跃任务不碰（owner_pod 过滤）——滚动更新新旧 Pod 并存窗口不误杀。
     /// 返回恢复行数。
-    async fn recover_running(&self, reason: &str) -> Result<u64, PublishRepoError>;
+    async fn recover_running(
+        &self,
+        reason: &str,
+        owner_pod: &str,
+        stale_before: DateTime<Utc>,
+    ) -> Result<u64, PublishRepoError>;
 
     /// 清理过期终态行（TTL 秒）。返回删除行数。
     async fn purge_expired(&self, ttl_secs: i64) -> Result<u64, PublishRepoError>;

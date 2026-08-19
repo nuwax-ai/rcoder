@@ -218,10 +218,43 @@ pub async fn start_all_background_tasks(
             flush_tick.tick().await; // 首个 tick 立即返回，跳过
             let mut purge_tick = tokio::time::interval(Duration::from_secs(3600));
             purge_tick.tick().await; // 同上
+            // 僵尸任务对账（10 分钟）：超过 STALE_TASK_SECS 仍无终态的行收敛为 failed。
+            // 每副本各跑（幂等 UPDATE 无害，无需 leader）——覆盖"终态落库重试 3 次仍
+            // 失败"与"Pod 重建改名导致启动恢复的 owner 过滤失配"两类漏网。
+            let mut reconcile_tick = tokio::time::interval(Duration::from_secs(600));
+            reconcile_tick.tick().await; // 同上
             loop {
                 tokio::select! {
                     biased;
                     _ = shutdown_rx.recv() => break,
+                    _ = reconcile_tick.tick() => {
+                        if let Some(repo) = state.publish_tasks.repo() {
+                            let stale_before = chrono::Utc::now()
+                                - chrono::Duration::seconds(
+                                    crate::userapp_publish::store::STALE_TASK_SECS,
+                                );
+                            match repo
+                                .recover_running(
+                                    "reconciled as stale",
+                                    &crate::userapp_publish::store::owner_pod_name(),
+                                    stale_before,
+                                )
+                                .await
+                            {
+                                Ok(n) if n > 0 => {
+                                    tracing::warn!(
+                                        "[STORAGE_PG] reconciled {n} stale publish tasks (marked failed)"
+                                    )
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "[STORAGE_PG] publish stale reconciliation failed: {e:#}"
+                                    )
+                                }
+                            }
+                        }
+                    },
                     _ = purge_tick.tick() => {
                         if let Some(repo) = state.publish_tasks.repo() {
                             match repo
