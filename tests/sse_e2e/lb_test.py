@@ -40,6 +40,16 @@ ENTRY_HOSTS = [
 NODEPORT = os.environ.get("LB_NODEPORT", "30295")
 
 
+
+def bg_chat(url: str, payload: dict):
+    """后台 chat 线程：异常必须可见（线程内异常默认被吞）"""
+    try:
+        chat_at(url, payload)
+        print(f"    [chat@{url}] ok")
+    except Exception as e:  # noqa: BLE001
+        print(f"    [chat@{url}] FAILED: {type(e).__name__}: {str(e)[:120]}")
+
+
 def chat_at(url: str, payload: dict) -> dict:
     """向指定 url 发 chat（与 common.chat 同校验）"""
     import requests
