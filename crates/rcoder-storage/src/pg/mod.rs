@@ -89,7 +89,12 @@ impl PgStore {
         let statement_timeout_ms = config.statement_timeout_secs() * 1000;
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections())
+            // 预热连接（启动即建，冷启动首批查询免付建连延迟）
+            .min_connections(config.min_connections())
             .acquire_timeout(Duration::from_secs(config.connect_timeout_secs()))
+            // 连接最大寿命：CNPG failover 后指向旧 primary 的僵尸连接，到期在
+            // release/recycle 时关闭重建即自愈（默认 600s，见 config.rs 注释）
+            .max_lifetime(Duration::from_secs(config.max_lifetime_secs()))
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
                     // SET 语句不支持参数占位符；set_config 是等价的标准做法且可参数化

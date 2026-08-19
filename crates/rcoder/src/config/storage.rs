@@ -84,6 +84,18 @@ pub(crate) fn apply_storage_env_overrides(config: &mut AppConfig) -> anyhow::Res
         pg.max_connections = Some(v);
         info!(" RCODER_PG_MAX_CONNECTIONS: {v}");
     }
+    if let Ok(val) = std::env::var("RCODER_PG_MIN_CONNECTIONS")
+        && let Ok(v) = val.parse::<u32>()
+    {
+        pg.min_connections = Some(v);
+        info!(" RCODER_PG_MIN_CONNECTIONS: {v}");
+    }
+    if let Ok(val) = std::env::var("RCODER_PG_MAX_LIFETIME_SECS")
+        && let Ok(v) = val.parse::<u64>()
+    {
+        pg.max_lifetime_secs = Some(v);
+        info!(" RCODER_PG_MAX_LIFETIME_SECS: {v}");
+    }
     if let Ok(val) = std::env::var("RCODER_PG_CONNECT_TIMEOUT_SECS")
         && let Ok(v) = val.parse::<u64>()
     {

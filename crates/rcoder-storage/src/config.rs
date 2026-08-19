@@ -10,10 +10,16 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_PG_PORT: u16 = 5432;
 /// 连接池默认大小（写穿透模式 QPS 低，10 足够）
 pub const DEFAULT_PG_MAX_CONNECTIONS: u32 = 10;
+/// 连接池默认预热连接数（启动即建，避免冷启动首批查询付建连延迟）
+pub const DEFAULT_PG_MIN_CONNECTIONS: u32 = 2;
 /// 默认连接超时（秒）
 pub const DEFAULT_PG_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// 默认语句超时（秒，防拖死请求）
 pub const DEFAULT_PG_STATEMENT_TIMEOUT_SECS: u64 = 5;
+/// 默认连接最大寿命（秒）。短于 sqlx 默认 30min：CNPG failover 后指向旧 primary 的
+/// 长寿命连接会变僵尸，到期（release/recycle 时）关闭重建即自愈——10min 是
+/// "failover 恢复上界"与"重建频率"的折中（建连 ms 级，重建开销可忽略）。
+pub const DEFAULT_PG_MAX_LIFETIME_SECS: u64 = 600;
 
 /// `[storage.postgres]` 配置段
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,10 +40,14 @@ pub struct PostgresConfig {
     pub url: Option<String>,
     /// 连接池大小（默认 10）
     pub max_connections: Option<u32>,
+    /// 预热连接数（默认 2；池维持的最少空闲连接，冷启动首批查询免建连）
+    pub min_connections: Option<u32>,
     /// 连接超时秒数（默认 10）
     pub connect_timeout_secs: Option<u64>,
     /// 语句超时秒数（默认 5）
     pub statement_timeout_secs: Option<u64>,
+    /// 连接最大寿命秒数（默认 600；CNPG failover 僵尸连接自愈上界）
+    pub max_lifetime_secs: Option<u64>,
 }
 
 impl Default for PostgresConfig {
@@ -50,8 +60,10 @@ impl Default for PostgresConfig {
             database: None,
             url: None,
             max_connections: Some(DEFAULT_PG_MAX_CONNECTIONS),
+            min_connections: Some(DEFAULT_PG_MIN_CONNECTIONS),
             connect_timeout_secs: Some(DEFAULT_PG_CONNECT_TIMEOUT_SECS),
             statement_timeout_secs: Some(DEFAULT_PG_STATEMENT_TIMEOUT_SECS),
+            max_lifetime_secs: Some(DEFAULT_PG_MAX_LIFETIME_SECS),
         }
     }
 }
@@ -103,6 +115,13 @@ impl PostgresConfig {
         self.max_connections.unwrap_or(DEFAULT_PG_MAX_CONNECTIONS)
     }
 
+    /// 预热连接数（带默认值兜底；不超过 max_connections）
+    pub fn min_connections(&self) -> u32 {
+        self.min_connections
+            .unwrap_or(DEFAULT_PG_MIN_CONNECTIONS)
+            .min(self.max_connections())
+    }
+
     /// 连接超时（带默认值兜底）
     pub fn connect_timeout_secs(&self) -> u64 {
         self.connect_timeout_secs
@@ -115,19 +134,27 @@ impl PostgresConfig {
             .unwrap_or(DEFAULT_PG_STATEMENT_TIMEOUT_SECS)
     }
 
+    /// 连接最大寿命（带默认值兜底）
+    pub fn max_lifetime_secs(&self) -> u64 {
+        self.max_lifetime_secs
+            .unwrap_or(DEFAULT_PG_MAX_LIFETIME_SECS)
+    }
+
     /// 脱敏描述（日志用，不含密码）
     pub fn describe(&self) -> String {
         if self.url.is_some() {
             return "<dsn via url>".to_string();
         }
         format!(
-            "{}:{}/{} pool={} connect_timeout={}s statement_timeout={}s",
+            "{}:{}/{} pool={}/{} connect_timeout={}s statement_timeout={}s max_lifetime={}s",
             self.host.as_deref().unwrap_or("?"),
             self.port.unwrap_or(DEFAULT_PG_PORT),
             self.database.as_deref().unwrap_or("?"),
             self.max_connections(),
+            self.min_connections(),
             self.connect_timeout_secs(),
             self.statement_timeout_secs(),
+            self.max_lifetime_secs(),
         )
     }
 }
@@ -232,5 +259,22 @@ mod tests {
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(!json.contains("secret"), "{json}");
+    }
+
+    /// 池参数兜底：默认值生效；min_connections 不超过 max_connections。
+    #[test]
+    fn pool_defaults_and_min_capped_by_max() {
+        let config = PostgresConfig::default();
+        assert_eq!(config.max_connections(), DEFAULT_PG_MAX_CONNECTIONS);
+        assert_eq!(config.min_connections(), DEFAULT_PG_MIN_CONNECTIONS);
+        assert_eq!(config.max_lifetime_secs(), DEFAULT_PG_MAX_LIFETIME_SECS);
+
+        let config = PostgresConfig {
+            // min 故意配大于 max（错误配置）：getter 兜底压到 max
+            min_connections: Some(20),
+            max_connections: Some(5),
+            ..PostgresConfig::default()
+        };
+        assert_eq!(config.min_connections(), 5);
     }
 }
