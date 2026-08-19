@@ -264,6 +264,24 @@ pub(crate) async fn recover_running<'e>(
     Ok(result.rows_affected())
 }
 
+/// 运行期周期对账（纯 staleness）：仅按创建时间收敛僵尸行，不碰任何未超时的
+/// 活跃任务（与 [`recover_running`] 的 owner 分支区分——后者仅启动时刻安全）。
+pub(crate) async fn reconcile_stale<'e>(
+    db: impl PgExecutor<'e>,
+    reason: &str,
+    stale_before: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE publish_tasks SET state='failed', error=$1, terminal_at=now() \\
+         WHERE terminal_at IS NULL AND created_at < $2",
+    )
+    .bind(reason)
+    .bind(stale_before)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// 清理过期终态行（TTL 秒）。返回删除行数。
 pub(crate) async fn purge_expired<'e>(
     db: impl PgExecutor<'e>,

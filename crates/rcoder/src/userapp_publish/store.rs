@@ -320,7 +320,7 @@ fn map_list_repo_error(error: PublishRepoError) -> PublishTaskStoreError {
 /// PG 仓储错误 → store 错误（Busy 携带 PG 侧冲突详情；Backend 如实 500）
 /// 终态落库（带有限退避重试）：终态行是"每 app 单活跃任务"唯一索引的解锁钥匙，
 /// 一次 PG 瞬断落库失败会让该 app 后续发布永久 409 AppBusy（唯一解锁=重启 rcoder）。
-/// 3 次退避（1s/5s/25s）后仍失败交由周期 stale 对账兜底收敛 failed。
+/// 共 3 次尝试、间隔 1s/5s；仍失败交由周期 stale 对账兜底收敛 failed。
 ///
 /// 设计取舍：update_terminal 不加"已是终态不许改"守卫——后到的真实终态覆盖
 /// 恢复期的误标是正确的收敛方向。
@@ -348,6 +348,7 @@ async fn persist_terminal_with_retry(
                     "[USERAPP_PUBLISH] terminal persist failed after {attempt} attempts, \
                      awaiting stale reconciliation: {e}"
                 );
+                return;
             }
             Err(e) => {
                 tracing::warn!(
@@ -372,8 +373,8 @@ fn map_repo_error(error: PublishRepoError, app_id: String) -> PublishTaskStoreEr
 }
 
 /// 本 Pod 名（owner_pod 诊断字段 + recover_running 的归属过滤键；K8s Downward API
-/// 注入 POD_NAME，退 HOSTNAME——容器内默认即 Pod 名）。pub(crate)：main 的启动
-/// 恢复与 background_tasks 的周期对账共用同一标识。
+/// 注入 POD_NAME，退 HOSTNAME——容器内默认即 Pod 名）。pub：bin（main.rs 启动恢复）
+/// 与 lib（background_tasks 对账）共用同一标识。
 pub fn owner_pod_name() -> String {
     std::env::var("POD_NAME").unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_default())
 }

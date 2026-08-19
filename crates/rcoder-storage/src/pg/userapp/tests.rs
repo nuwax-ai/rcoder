@@ -194,8 +194,10 @@ async fn recover_running_respects_owner_pod_and_staleness() {
         )
         .await
         .expect("recover");
-    // mine（owner 命中）+ noowner（无主）+ stale（超时僵尸）；other 不动
-    assert_eq!(recovered, 3, "own + unowned + stale rows converged");
+    // mine（owner 命中）+ noowner（无主）+ stale（超时僵尸）；other 不动。
+    // 计数只做下界断言——recover 是全库 UPDATE，共享库中其他残留 running 行可能
+    // 同时被收敛；owner 过滤的核心行为由下方逐行状态断言保证。
+    assert!(recovered >= 3, "own + unowned + stale rows converged (got {recovered})");
 
     for id in [&mine, &noowner, &stale] {
         let got = repo.get(id).await.expect("get").expect("row");

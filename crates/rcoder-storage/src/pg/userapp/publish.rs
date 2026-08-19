@@ -104,6 +104,16 @@ impl PublishTaskPersistence for PgPublishTaskPersistence {
             .map_err(map_err)
     }
 
+    async fn reconcile_stale(
+        &self,
+        reason: &str,
+        stale_before: DateTime<Utc>,
+    ) -> Result<u64, PublishRepoError> {
+        super::repo::publish_repo::reconcile_stale(&self.pool, reason, stale_before)
+            .await
+            .map_err(map_err)
+    }
+
     async fn purge_expired(&self, ttl_secs: i64) -> Result<u64, PublishRepoError> {
         super::repo::publish_repo::purge_expired(&self.pool, ttl_secs)
             .await

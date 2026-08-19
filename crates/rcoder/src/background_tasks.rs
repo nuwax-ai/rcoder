@@ -218,9 +218,12 @@ pub async fn start_all_background_tasks(
             flush_tick.tick().await; // 首个 tick 立即返回，跳过
             let mut purge_tick = tokio::time::interval(Duration::from_secs(3600));
             purge_tick.tick().await; // 同上
-            // 僵尸任务对账（10 分钟）：超过 STALE_TASK_SECS 仍无终态的行收敛为 failed。
-            // 每副本各跑（幂等 UPDATE 无害，无需 leader）——覆盖"终态落库重试 3 次仍
-            // 失败"与"Pod 重建改名导致启动恢复的 owner 过滤失配"两类漏网。
+            // 僵尸任务对账（10 分钟，纯 staleness）：超过 STALE_TASK_SECS 仍无终态的
+            // 行收敛为 failed。每副本各跑（幂等 UPDATE 无害，无需 leader）——覆盖
+            // "终态落库重试 3 次仍失败"与"Pod 重建改名导致启动恢复 owner 失配"两类
+            // 漏网。**不得改用 recover_running**：其 owner 分支不受超时约束，运行期
+            // 调用会把本副本正在执行的任务误标 failed（同 app 单活跃唯一索引随之
+            // 被击穿，可能产生双活构建）。
             let mut reconcile_tick = tokio::time::interval(Duration::from_secs(600));
             reconcile_tick.tick().await; // 同上
             loop {
@@ -234,11 +237,7 @@ pub async fn start_all_background_tasks(
                                     crate::userapp_publish::store::STALE_TASK_SECS,
                                 );
                             match repo
-                                .recover_running(
-                                    "reconciled as stale",
-                                    &crate::userapp_publish::store::owner_pod_name(),
-                                    stale_before,
-                                )
+                                .reconcile_stale("reconciled as stale", stale_before)
                                 .await
                             {
                                 Ok(n) if n > 0 => {

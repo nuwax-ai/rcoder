@@ -99,14 +99,27 @@ pub trait PublishTaskPersistence: Send + Sync {
         progress: Option<&Value>,
     ) -> Result<(), PublishRepoError>;
 
-    /// 启动恢复/僵尸对账：把"本副本的 + 无主的 + 早于 stale_before 仍无终态的"任务
-    /// 标记 failed（orchestrator 随进程消亡，running 必为僵尸）。多副本安全：其他副本
-    /// 的活跃任务不碰（owner_pod 过滤）——滚动更新新旧 Pod 并存窗口不误杀。
-    /// 返回恢复行数。
+    /// **仅启动时刻调用**的恢复：把"本副本的（owner_pod 匹配）+ 无主的 + 早于
+    /// stale_before 仍无终态的"任务标记 failed（进程刚启动、本副本必无在飞任务，
+    /// owner 命中即僵尸）。多副本安全：其他副本的活跃任务不碰——滚动更新新旧
+    /// Pod 并存窗口不误杀。返回恢复行数。
+    ///
+    /// 注意 owner 分支不受 staleness 约束，**运行期周期任务不得调用本方法**（会把
+    /// 本副本正在执行的任务误标 failed 并击穿同 app 单活跃唯一索引）——运行期对账
+    /// 用 [`Self::reconcile_stale`]。
     async fn recover_running(
         &self,
         reason: &str,
         owner_pod: &str,
+        stale_before: DateTime<Utc>,
+    ) -> Result<u64, PublishRepoError>;
+
+    /// 运行期周期对账（纯 staleness 语义）：仅收敛"早于 stale_before 仍无终态"的
+    /// 僵尸行（终态重试耗尽、Pod 重建改名导致 owner 失配等漏网的兜底）。不按
+    /// owner 区分——任何副本的活跃任务只要未超时都不碰。
+    async fn reconcile_stale(
+        &self,
+        reason: &str,
         stale_before: DateTime<Utc>,
     ) -> Result<u64, PublishRepoError>;
 
