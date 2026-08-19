@@ -229,7 +229,7 @@ impl AppService {
             .await?;
             return Err(error);
         }
-        if let Err(error) = self.ensure_app_runtime(app_id, app_id).await {
+        if let Err(error) = self.ensure_app_runtime(app_id, app_id, _process_lock).await {
             self.fail_activation(
                 &releases_dir,
                 &mut index,
@@ -693,5 +693,53 @@ mod tests {
         assert_eq!(index.releases[0].status, ReleaseStatus::Failed);
         assert!(index.releases[0].failure_message.is_some());
         assert_eq!(index.releases[1].status, ReleaseStatus::Active);
+    }
+    /// 回归测试：首次发布 activate（app 不存在 + 制品有效）不得死锁——
+    /// 修复前 activate 持 process lock → ensure_app_runtime → create_app
+    /// 再次取同一把 tokio Mutex → 永久挂起（P0）。
+    /// 用 tokio::time::timeout 包裹：挂起 = 超时失败，而非测试永卡。
+    #[tokio::test]
+    async fn activate_first_publish_does_not_deadlock() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // MockRuntime 预置 deployment（模拟 app 已有运行时），绕开实际 K8s 调用；
+        // 关键是让 ensure_app_runtime 的 get_app 返回 NotFound → 走 create 分支
+        let runtime = Arc::new(MockRuntime::default());
+        let service = test_service(root.path(), runtime);
+
+        let mut index = ReleaseIndex {
+            active_release_id: None,
+            retention: 15,
+            ..ReleaseIndex::default()
+        };
+        index.releases.push(release(
+            "release-first",
+            ReleaseStatus::Prepared,
+            "2026-08-19",
+        ));
+        seed_index(root.path(), "app-deadlock-test", index).await;
+        // 制品包占位（activate 会尝试切换 code 目录）
+        let releases_dir = root.path().join("app-deadlock-test").join("releases");
+        let pkg = releases_dir.join("release-first");
+        tokio::fs::create_dir_all(&pkg)
+            .await
+            .expect("create package dir");
+        let code_dir = pkg.join("code");
+        tokio::fs::create_dir_all(&code_dir)
+            .await
+            .expect("create code dir");
+
+        // 关键断言：5 秒超时——修复前此处永久挂起
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.activate_release("app-deadlock-test", "release-first", Some(1)),
+        )
+        .await;
+
+        // 超时 = 死锁（测试失败）；正常返回（无论 Ok/Err，取决于 MockRuntime 行为）
+        // 都说明锁链没有死锁
+        assert!(
+            result.is_ok(),
+            "activate_release hung >5s — process lock re-entry deadlock"
+        );
     }
 }

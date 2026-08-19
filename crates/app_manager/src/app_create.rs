@@ -11,26 +11,42 @@ use super::service::AppService;
 use super::utils::*;
 
 impl AppService {
-    /// 创建应用
+    /// 创建应用（公共入口：自动获取进程级发布锁）
+    ///
+    /// ⚠️ 调用方不得已持 `acquire_process_release_lock(app_id)` —— tokio Mutex
+    /// 不可重入，已持锁调用会永久挂起（activate 的 ensure_app_runtime 走
+    /// [`create_app_locked`] 内核避免此问题）。
     #[instrument(skip(self, request))]
     pub async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
         let app_id = self.validate_create_request(&request).await?;
         // 与 prepare/activate/confirm/delete-release/delete_app 串行: 防发布流水线
         // EnsureApp 建 Deployment 与并发 DELETE 互踩 (删成功但 Deployment 复活/
-        // 半删半建脏状态)。create_app 的调用方 (HTTP handler / orchestrator
-        // ensure_app) 均不持本锁, 无重入风险 (tokio Mutex 不可重入)。
-        let _process_lock = self.acquire_process_release_lock(&app_id).await;
+        // 半删半建脏状态)。
+        let process_lock = self.acquire_process_release_lock(&app_id).await;
+        self.create_app_locked(&app_id, request, process_lock).await
+    }
+
+    /// 已持锁内核：调用方持有该 app 的进程级发布锁（防止与发布流水线互踩），
+    /// 本函数不再取锁。供 `create_app` 公共包装和 `ensure_app_runtime`（activate
+    /// 锁内调用）共用——拆分正是为了消除 activate→ensure_app_runtime→create_app
+    /// 的重入死锁。
+    pub(super) async fn create_app_locked(
+        &self,
+        app_id: &str,
+        request: CreateAppRequest,
+        _process_lock: tokio::sync::OwnedMutexGuard<()>,
+    ) -> AppResult<AppInfo> {
         info!(
             "[APP] creating app: {} ({}, mode={:?})",
             request.name, app_id, self.config.access_mode
         );
-        self.provision_app_workspace(&app_id, &request).await?;
+        self.provision_app_workspace(app_id, &request).await?;
         // provision_app_workspace 失败不走此分支：PVC/目录保留，下次 create 幂等复用。
-        if let Err(error) = self.create_app_runtime(&app_id, &request).await {
+        if let Err(error) = self.create_app_runtime(app_id, &request).await {
             // 部分失败兜底（create_deployment 可能已部分建成/后续步骤残留）：
             // best-effort 删除 Deployment，容忍 NotFound（create_deployment 自身失败时
             // 尚未产生部署）；清理失败仅 warn，绝不覆盖原始错误。
-            if let Err(cleanup_error) = self.runtime.delete_deployment(&app_id).await {
+            if let Err(cleanup_error) = self.runtime.delete_deployment(app_id).await {
                 warn!(
                     "[APP] best-effort cleanup after create_app_runtime failure: delete_deployment app_id={app_id} failed (NotFound tolerated): {cleanup_error}"
                 );
@@ -38,17 +54,17 @@ impl AppService {
             return Err(error);
         }
         // 同 ID 删除后重建时，必须清除旧的 stopped/wake-blocked 内存态。
-        self.activity.mark_running(&app_id);
+        self.activity.mark_running(app_id);
         // 业务元数据落库/缓存（name/租户/业务创建时间;集群不持有。request 随后 move 进 assemble）
         self.metadata
             .record(
-                &app_id,
+                app_id,
                 Some(request.name.clone()),
                 request.tenant_id.clone(),
                 request.space_id.clone(),
             )
             .await;
-        Ok(self.assemble_app_info(app_id, request).await)
+        Ok(self.assemble_app_info(app_id.to_string(), request).await)
     }
 
     /// 校验创建请求并解析 app_id（app_id 规范 + 唯一性 + 资源格式 + 端口）。

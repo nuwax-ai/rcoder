@@ -30,10 +30,14 @@ pub(crate) const MAX_READY_TIMEOUT_SECS: u64 = 1800;
 impl AppService {
     /// 确保 app 计算单元存在：不存在则 create_app（幂等；image/ports 首次设定后恒定）。
     /// 首次发布时 activate 切流先于本调用（app 尚不存在，激活序列跳过 stop/start）。
+    ///
+    /// `process_lock`：调用方已持有的该 app 进程级发布锁——create 分支走
+    /// [`create_app_locked`]（已持锁内核），避免公共 `create_app` 的重入取锁死锁。
     pub(super) async fn ensure_app_runtime(
         &self,
         rcoder_app_id: &str,
         name: &str,
+        process_lock: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), AppOperationError> {
         match self.get_app(rcoder_app_id).await {
             Ok(_) => {
@@ -84,7 +88,9 @@ impl AppService {
             recycle_enabled: None,
             idle_timeout_seconds: None,
         };
-        self.create_app(request).await.map(|_| ())
+        self.create_app_locked(rcoder_app_id, request, process_lock)
+            .await
+            .map(|_| ())
     }
 
     /// 轮询 app 到 status=Running 且 health 非 Unhealthy；超时或进入 Error 则失败
