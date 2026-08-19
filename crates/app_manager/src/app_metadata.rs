@@ -43,8 +43,11 @@ impl AppMetadataStore {
     }
 
     /// create/update 成功后记录元数据（cache 写 + PG upsert 失败仅 warn 不阻塞业务）。
-    /// `created_at` 传 now()：SQL ON CONFLICT 不更新该列，仅首次 insert 生效——
-    /// update 场景调用方无需（也无法）知道原始创建时间。
+    ///
+    /// `created_at`：PG 侧 ON CONFLICT 不更新该列（仅首次 insert 生效）；内存 cache
+    /// 此前每次用 now() 整行覆盖——改一次名 cache 里的创建时间就被刷新，query 的
+    /// created_at 过滤随之漂移、重启后又回退为 PG 原值。现与 PG 对齐：cache 命中
+    /// 旧记录时回填原 created_at，仅首次插入用 now()。
     pub async fn record(
         &self,
         app_id: &str,
@@ -52,12 +55,17 @@ impl AppMetadataStore {
         tenant_id: Option<String>,
         space_id: Option<String>,
     ) {
+        let created_at = self
+            .cache
+            .get(app_id)
+            .map(|existing| existing.created_at)
+            .unwrap_or_else(chrono::Utc::now);
         let row = AppMetadataRecord {
             app_id: app_id.to_string(),
             name,
             tenant_id,
             space_id,
-            created_at: chrono::Utc::now(),
+            created_at,
         };
         if let Some(p) = self.persistence()
             && let Err(e) = p.upsert(&row).await
@@ -118,6 +126,29 @@ mod tests {
         let rows = persistence.load_all().await.expect("persisted");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].app_id, "app-a");
+    }
+
+    /// update 不刷新 created_at：cache 命中旧记录回填原值（与 PG ON CONFLICT 语义
+    /// 对齐——此前内存整行覆盖，改一次名创建时间就漂移）。
+    #[tokio::test]
+    async fn record_keeps_original_created_at_on_update() {
+        let store = AppMetadataStore::default();
+        store
+            .record("app-ts", Some("first".into()), None, None)
+            .await;
+        let original = store.lookup("app-ts").expect("cached").created_at;
+
+        // 让时间走一点，确保 now() 不同（chrono 精度足够分辨本测试的间隔）
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        store
+            .record("app-ts", Some("renamed".into()), None, None)
+            .await;
+        let updated = store.lookup("app-ts").expect("still cached");
+        assert_eq!(updated.name.as_deref(), Some("renamed"));
+        assert_eq!(
+            updated.created_at, original,
+            "created_at must not be refreshed by update"
+        );
     }
 
     #[tokio::test]

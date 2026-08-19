@@ -72,6 +72,25 @@ impl super::service::AppService {
     /// K8s：删 PVC 对象 → ceph-csi 回收 subvolume（配额释放）。Docker：无 PVC，trait 默认 no-op。
     /// 幂等：PVC 已不存在也返回成功。
     pub async fn destroy_app_storage(&self, app_id: &str, confirm: &str) -> AppResult<()> {
+        self.destroy_app_storage_keep_metadata(app_id, confirm)
+            .await?;
+        // 独立 storage/destroy 接口：与 PVC 同生命周期，元数据行同步删除
+        // （三档删除语义的第三档）。
+        self.metadata.record_deleted(app_id).await;
+        info!("[APP] app PVC destroyed: {}", app_id);
+        Ok(())
+    }
+
+    /// 销毁持久存储但**保留业务元数据行**（delete_app 的 purge 分支专用）。
+    ///
+    /// 三档删除语义：delete/purge 保留行（误删找回——重建同 ID 应用后 name/created_at
+    /// 仍在），仅独立的 storage/destroy 接口（[`Self::destroy_app_storage`]）删行。
+    /// 此前 purge 直接复用 destroy_app_storage 把行也删了，违反契约。
+    pub(super) async fn destroy_app_storage_keep_metadata(
+        &self,
+        app_id: &str,
+        confirm: &str,
+    ) -> AppResult<()> {
         validate_app_id(app_id)?;
         if confirm != app_id {
             return Err(AppOperationError::Validation(format!(
@@ -83,9 +102,7 @@ impl super::service::AppService {
             .destroy_app_pvc(app_id)
             .await
             .map_err(|e| map_runtime_error("destroy_app_pvc failed", e))?;
-        // PVC 不可逆销毁 → 业务元数据同步删行（delete/purge 保留,支持误删找回;destroy 与 PVC 同生命周期）
-        self.metadata.record_deleted(app_id).await;
-        info!("[APP] app PVC destroyed: {}", app_id);
+        info!("[APP] app PVC destroyed (metadata retained): {}", app_id);
         Ok(())
     }
 

@@ -454,8 +454,11 @@ impl AppService {
         // 3. purge=true 必须销毁持久存储（K8s: PVC + Ceph subvolume；Docker:
         //    workspace 目录），与 API 的“全部删除”语义一致。仅清空目录却保留 PVC
         //    会继续占用配额，并让成功响应与实际状态不一致。
+        //    元数据行**保留**（三档语义：delete/purge 保留行支持误删找回，仅独立
+        //    storage/destroy 接口删行）。
         if purge {
-            self.destroy_app_storage(app_id, app_id).await?;
+            self.destroy_app_storage_keep_metadata(app_id, app_id)
+                .await?;
             info!("[APP] persistent storage destroyed: {}", app_id);
         } else {
             info!(
@@ -864,6 +867,62 @@ mod tests {
             .await
             .expect_err("invalid sort_by must 400");
         assert!(matches!(error, AppOperationError::Validation(_)));
+    }
+
+    /// 三档删除语义：delete(purge=true) 销毁存储但**保留**元数据行（误删找回）；
+    /// 仅独立 storage/destroy 接口删行。
+    #[tokio::test]
+    async fn delete_app_purge_keeps_metadata_row_until_explicit_destroy() {
+        use crate::test_support::InMemoryMetadataPersistence;
+        use shared_types::AppMetadataPersistence as _;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let persistence = InMemoryMetadataPersistence::new(vec![]);
+        let service = test_service(root.path(), runtime);
+        service.set_metadata_persistence(persistence.clone());
+        let app_dir = root.path().join("app-purge");
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+
+        let mut create = create_request("app-purge");
+        create.name = "keep-me".into();
+        service.create_app(create).await.expect("create app");
+        assert!(service.metadata.lookup("app-purge").is_some());
+
+        service
+            .delete_app("app-purge", true, None)
+            .await
+            .expect("purge delete");
+        assert!(
+            service.metadata.lookup("app-purge").is_some(),
+            "purge must retain metadata row (three-tier contract)"
+        );
+        assert!(
+            persistence
+                .load_all()
+                .await
+                .expect("persisted")
+                .iter()
+                .any(|r| r.app_id == "app-purge"),
+            "PG row retained after purge"
+        );
+
+        service
+            .destroy_app_storage("app-purge", "app-purge")
+            .await
+            .expect("explicit destroy");
+        assert!(
+            service.metadata.lookup("app-purge").is_none(),
+            "explicit storage destroy deletes metadata row"
+        );
     }
 
     /// query_apps 的 name/created_at 过滤:纯内存模式（无 metadata 持久化）维持忽略

@@ -103,13 +103,16 @@ impl UserAppDeploymentRuntime for MockRuntime {
         Ok(())
     }
 
-    async fn delete_deployment(&self, _app_id: &str) -> ContainerRuntimeResult<()> {
+    async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         self.delete_calls.fetch_add(1, Ordering::SeqCst);
         if self.delete_fails.load(Ordering::SeqCst) {
             Err(ContainerRuntimeError::DockerError(
                 "mock delete_deployment failure".into(),
             ))
         } else {
+            // 与真实后端一致：删除后 status 查询 NotFound（purge 分支的
+            // ensure_app_deleted 依赖此移除 deployments 条目的行为）
+            self.deployments.remove(app_id);
             Ok(())
         }
     }
