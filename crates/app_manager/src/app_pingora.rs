@@ -66,6 +66,19 @@ impl AppService {
         http_ports.to_vec()
     }
 
+    /// 当前实际注册的 HTTP 端口（update 的恢复/兜底依据）。
+    ///
+    /// 比 `DeploymentStatus.ports` 反推可靠：Docker 后端的状态 ports 只含 TCP
+    /// （HTTP 走 Pingora 不做 binding），反推恒空——patch 失败恢复与 ports 缺省
+    /// 兜底用它才真正注册回路由。注意须在 `unregister_pingora_backends` **之前**
+    /// 调用（unregister 会移除注册表条目）。
+    pub(crate) fn registered_http_ports(&self, app_id: &str) -> Vec<u16> {
+        self.pingora_ports
+            .get(app_id)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default()
+    }
+
     /// 清理 app 曾注册的 Pingora backend（Pingora 模式）。Gateway 模式未注册过，直接返回。
     pub(crate) async fn unregister_pingora_backends(&self, app_id: &str) {
         if self.config.http_expose == HttpExpose::Gateway {

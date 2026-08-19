@@ -141,25 +141,28 @@ impl KubernetesRuntime {
         // Http）。strip_prefix 未持久化（仅体现在 HTTPRoute URLRewrite filter），读回
         // None——显式 false 的用户部分更新后回默认剥前缀行为（罕见配置，取舍见
         // ContainerSpecSnapshot.ports 文档）。空 ports = 未设置（None）。
-        let ports = container.and_then(|c| c.ports.as_ref()).map(|ps| {
-            let expose_map = deploy
-                .as_ref()
-                .and_then(|d| d.metadata.annotations.as_ref())
-                .and_then(|ann| ann.get(PORT_EXPOSE_ANNOTATION))
-                .map(|value| parse_port_expose(value))
-                .unwrap_or_default();
-            ps.iter()
-                .map(|p| AppPortSpec {
-                    name: p.name.clone().unwrap_or_default(),
-                    port: p.container_port as u16,
-                    expose_type: expose_map
-                        .get(&(p.container_port as u16))
-                        .cloned()
-                        .unwrap_or(ExposeType::Http),
-                    strip_prefix: None,
-                })
-                .collect::<Vec<_>>()
-        });
+        let ports = container
+            .and_then(|c| c.ports.as_ref())
+            .filter(|ps| !ps.is_empty())
+            .map(|ps| {
+                let expose_map = deploy
+                    .as_ref()
+                    .and_then(|d| d.metadata.annotations.as_ref())
+                    .and_then(|ann| ann.get(PORT_EXPOSE_ANNOTATION))
+                    .map(|value| parse_port_expose(value))
+                    .unwrap_or_default();
+                ps.iter()
+                    .map(|p| AppPortSpec {
+                        name: p.name.clone().unwrap_or_default(),
+                        port: p.container_port as u16,
+                        expose_type: expose_map
+                            .get(&(p.container_port as u16))
+                            .cloned()
+                            .unwrap_or(ExposeType::Http),
+                        strip_prefix: None,
+                    })
+                    .collect::<Vec<_>>()
+            });
 
         Ok(ContainerSpecSnapshot {
             command,

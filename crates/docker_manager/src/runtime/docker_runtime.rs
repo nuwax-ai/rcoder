@@ -405,6 +405,22 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         if let Some(s) = &params.space_id {
             labels.insert("space".to_string(), s.clone());
         }
+        // ports/command 元数据 label（update live 回退数据源）：Docker 侧 Http 走
+        // Pingora 注册、Tcp 走 port_bindings，ExposedPorts 无法完整还原（Http 读不
+        // 回、Tcp 被隐式 expose 后类型丢失、镜像 EXPOSE 幽灵端口混入）；command 无法
+        // 区分用户显式设置与镜像 CMD 固化（inspect 的 Config.cmd 是合并结果）。两者
+        // 用 label 显式持久化（与 K8s port-expose 注解同构），update 回退读回。
+        if let Some(ports) = &params.ports
+            && !ports.is_empty()
+        {
+            labels.insert(APP_PORTS_LABEL.to_string(), encode_ports_label(ports));
+        }
+        if let Some(command) = &params.command
+            && !command.is_empty()
+            && let Ok(encoded) = serde_json::to_string(command)
+        {
+            labels.insert(APP_COMMAND_LABEL.to_string(), encoded);
+        }
 
         // TCP port_bindings（host_port=None 让 Docker 自动分配）
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
@@ -766,12 +782,16 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             }
         };
         let cfg = inspect.config.as_ref();
-        // command 不读回：Docker inspect 的 Config.cmd 无法区分"用户显式设置"与
-        // "镜像 CMD 固化"（create 未指定 cmd 时 Docker 把镜像 CMD 写进容器 Config），
-        // 读回会把旧镜像的 CMD 钉死到换镜像后的新容器（update 换镜像+command 缺省的
-        // 典型升级场景必踩）。缺省=None → 走新镜像自己的 CMD，才是升级语义。
-        // （K8s 无此问题：container.command/args 未设时读回本就是 None。）
-        let command = None;
+        let labels = cfg.and_then(|c| c.labels.as_ref());
+        // command/ports：从元数据 label 读回（create 时写入，见 create_deployment 内
+        // 注释）。label 缺失 = 本版本之前创建的存量容器 → None（部分更新缺省会清空
+        // 对应字段，过渡态；重建容器后 label 补齐）。command 不从 Config.cmd 读回：
+        // 它无法区分"用户显式设置"与"镜像 CMD 固化"（create 未指定时 Docker 把镜像
+        // CMD 写进容器 Config），读回会把旧镜像 CMD 钉死到换镜像后的新容器。
+        let command = labels
+            .and_then(|l| l.get(APP_COMMAND_LABEL))
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+            .filter(|c| !c.is_empty());
         let env = cfg
             .and_then(|c| c.env.clone())
             .map(|envs| {
@@ -783,24 +803,12 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                     .collect::<HashMap<String, String>>()
             })
             .filter(|m| !m.is_empty());
-        // ports：ExposedPorts 声明还原端口列表（name 空串、expose_type 恒 Http、
-        // strip_prefix None——单机模式 TCP 经宿主映射无法区分，尽力回退保住端口号
-        // 不丢是主要目标，Http 兜底优于部分更新把对外端口全清空）。
-        let ports = cfg.and_then(|c| c.exposed_ports.as_ref()).map(|keys| {
-            let mut list: Vec<u16> = keys
-                .iter()
-                .filter_map(|key| key.split('/').next().and_then(|p| p.parse::<u16>().ok()))
-                .collect();
-            list.sort_unstable();
-            list.into_iter()
-                .map(|port| AppPortSpec {
-                    name: String::new(),
-                    port,
-                    expose_type: ExposeType::Http,
-                    strip_prefix: None,
-                })
-                .collect::<Vec<_>>()
-        });
+        // ports：label 编码还原（name 空串、strip_prefix None——Docker 单机模式这两项
+        // 无运行时语义；expose_type 精确保留 Http/Tcp 区分）。
+        let ports = labels
+            .and_then(|l| l.get(APP_PORTS_LABEL).map(String::as_str))
+            .map(parse_ports_label)
+            .filter(|ps| !ps.is_empty());
         let resources = inspect
             .host_config
             .as_ref()
@@ -1130,6 +1138,53 @@ fn app_deployment_name(app_id: &str) -> String {
     format!("{}-{app_id}", ServiceType::UserApp.container_prefix())
 }
 
+/// 容器 ports 元数据 label（update live 回退数据源；编码 "8080:http,5432:tcp"，
+/// 与 K8s `rcoder.io/port-expose` 注解同构——Docker 侧 Http/Tcp 均无完整运行时
+/// 落地可反推，见 create_deployment 内注释）。
+const APP_PORTS_LABEL: &str = "rcoder.io/app-ports";
+/// 容器 command 元数据 label（JSON 数组；create 时用户显式设置才写入）。
+const APP_COMMAND_LABEL: &str = "rcoder.io/app-command";
+
+/// ports → label 值（按端口排序编码，顺序无关 → 字符串稳定，避免无谓容器 diff）。
+fn encode_ports_label(ports: &[AppPortSpec]) -> String {
+    let mut entries: Vec<(u16, &ExposeType)> =
+        ports.iter().map(|p| (p.port, &p.expose_type)).collect();
+    entries.sort_by_key(|(port, _)| *port);
+    entries
+        .iter()
+        .map(|(port, et)| format!("{port}:{}", expose_type_str(et)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// label 值 → ports（容错：非法条目跳过；name 空串/strip_prefix None——Docker 单机
+/// 模式这两项无运行时语义）。
+fn parse_ports_label(raw: &str) -> Vec<AppPortSpec> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let mut it = entry.split(':');
+            let port: u16 = it.next()?.trim().parse().ok()?;
+            let et = match it.next()?.trim() {
+                "tcp" => ExposeType::Tcp,
+                _ => ExposeType::Http,
+            };
+            Some(AppPortSpec {
+                name: String::new(),
+                port,
+                expose_type: et,
+                strip_prefix: None,
+            })
+        })
+        .collect()
+}
+
+fn expose_type_str(e: &ExposeType) -> &'static str {
+    match e {
+        ExposeType::Http => "http",
+        ExposeType::Tcp => "tcp",
+    }
+}
+
 /// Docker `NanoCpus`（1 核 = 1e9）→ K8s Quantity 核数字符串（"1"/"0.5"）。
 /// update 回退用：读回的值将再次下发为 K8s/Docker 资源限制。
 fn docker_cpus_to_quantity(nano_cpus: i64) -> String {
@@ -1238,4 +1293,44 @@ fn extract_container_ports(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ports label 编解码往返：Http/Tcp 类型精确保留、编码按端口排序稳定。
+    #[test]
+    fn ports_label_roundtrip_preserves_expose_types() {
+        let ports = vec![
+            AppPortSpec {
+                name: "http".into(),
+                port: 8080,
+                expose_type: ExposeType::Http,
+                strip_prefix: Some(true),
+            },
+            AppPortSpec {
+                name: "db".into(),
+                port: 5432,
+                expose_type: ExposeType::Tcp,
+                strip_prefix: None,
+            },
+        ];
+        let encoded = encode_ports_label(&ports);
+        assert_eq!(encoded, "5432:tcp,8080:http");
+        let parsed = parse_ports_label(&encoded);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].port, 5432);
+        assert!(matches!(parsed[0].expose_type, ExposeType::Tcp));
+        assert_eq!(parsed[1].port, 8080);
+        assert!(matches!(parsed[1].expose_type, ExposeType::Http));
+    }
+
+    /// 解码容错：非法条目（非数字端口/缺类型）跳过，其余保留。
+    #[test]
+    fn ports_label_parse_skips_invalid_entries() {
+        let parsed = parse_ports_label("8080:http,abc:tcp,:http,9090:tcp");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|p| p.port == 8080 || p.port == 9090));
+    }
 }

@@ -334,23 +334,33 @@ impl AppService {
         let params = self
             .build_container_params_from_update(app_id, &request, &current)
             .await?;
+        // 恢复依据先取出（unregister 会移除注册表条目）：pingora_ports 里的是当前
+        // 实际生效的 Http 端口——比 current.ports 反推可靠（Docker 后端的状态 ports
+        // 只含 TCP，反推恒空会让恢复分支注册了个寂寞）。
+        let registered_http_ports = self.registered_http_ports(app_id);
         // 先注销旧 Pingora backend（K8s/Docker 都执行：Docker 旧 container_ip 失效；
         // K8s 下方按本次 http_ports 重新注册到 Service FQDN，注销-重注成对保证一致）。
         self.unregister_pingora_backends(app_id).await;
+        // http_ports 在 move 前从 params 提取：优先本次回退后的完整 ports（live 回退
+        // 后含全部端口的权威 desired）；读失败降级（params.ports=None）时退当前注册值。
+        let http_ports: Vec<u16> = params
+            .ports
+            .as_ref()
+            .map(|ps| {
+                ps.iter()
+                    .filter(|p| matches!(p.expose_type, RtExposeType::Http))
+                    .map(|p| p.port)
+                    .collect()
+            })
+            .unwrap_or(registered_http_ports);
         let info = match self.runtime.patch_deployment(params).await {
             Ok(info) => info,
             Err(e) => {
                 // patch 失败：Deployment 原样仍在运行，恢复 pingora 路由（对齐 delete_app
                 // 的失败恢复分支）——否则应用还在跑但 /proxy/apps/{id}/{port} 404，直到
                 // 下次成功 update 或进程重启。
-                let previous_http_ports: Vec<u16> = current
-                    .ports
-                    .iter()
-                    .filter(|p| p.expose_type == RtExposeType::Http)
-                    .map(|p| p.port)
-                    .collect();
                 let previous_host = current.pod_ip.clone().unwrap_or_default();
-                self.register_pingora_backends(app_id, &previous_http_ports, &previous_host)
+                self.register_pingora_backends(app_id, &http_ports, &previous_host)
                     .await;
                 return Err(map_runtime_error(
                     &format!("[APP] patch_deployment failed app_id={app_id}"),
@@ -358,20 +368,9 @@ impl AppService {
                 ));
             }
         };
-        // 重新注册 Pingora backend。http_ports 取本次请求 ports；若未带（K8s 下 update 常
-        // 只改 image/env 等部分字段），沿用当前 Deployment 的 HTTP 端口，保证与上面
-        // unregister 对称——否则部分更新会丢 Pingora 路由（app 经 /proxy/apps/{id}/{port} 变 502）。
+        // 重新注册 Pingora backend（与上面 unregister 对称——否则部分更新会丢
+        // Pingora 路由，app 经 /proxy/apps/{id}/{port} 变 502）。
         // 注：register 在 K8s 模式并非 no-op，会把 backend 指到 Service FQDN（与 create 一致）。
-        let http_ports = if request.ports.is_some() {
-            http_port_numbers(&request.ports)
-        } else {
-            current
-                .ports
-                .iter()
-                .filter(|p| p.expose_type == RtExposeType::Http)
-                .map(|p| p.port)
-                .collect::<Vec<u16>>()
-        };
         self.register_pingora_backends(app_id, &http_ports, &info.container_ip)
             .await;
         info!("[APP] app updated: {}", app_id);
