@@ -224,6 +224,14 @@ pub(crate) fn plan_retention(index: &mut ReleaseIndex) -> Vec<String> {
         .take(usize::from(index.retention.saturating_sub(1)))
         .map(|(_, id)| id)
         .collect();
+    // Failed 不参与 retention 计数、永不自动删除（失败现场保留供排查；清理由用户
+    // 手动 delete 触发）。此前的过滤让 Failed 既不进 keep 也不占名额，反而必然
+    // 落入 remove——每次成功激活都会清空全部失败版本，违反"失败现场保留"承诺。
+    for release in &index.releases {
+        if release.status == ReleaseStatus::Failed {
+            keep.insert(release.release_id.clone());
+        }
+    }
     if let Some(active) = active {
         keep.insert(active.to_owned());
     }
@@ -366,6 +374,36 @@ mod tests {
             .collect();
         assert_eq!(ids, std::collections::BTreeSet::from(["active", "recent"]));
         assert!(!root.path().join("packages/old.zip").exists());
+    }
+
+    /// Failed 版本不占 retention 名额、永不自动删除（成功激活后失败现场仍在）。
+    #[tokio::test]
+    async fn retention_keeps_failed_releases_without_consuming_slots() {
+        let mut index = ReleaseIndex {
+            active_release_id: Some("v3".into()),
+            pending_release_id: None,
+            previous_release_id: None,
+            retention: 2,
+            releases: vec![
+                release("v1", ReleaseStatus::Prepared, "2026-01-01"),
+                release("v2-failed", ReleaseStatus::Failed, "2026-01-02"),
+                release("v3", ReleaseStatus::Active, "2026-01-03"),
+                release("v4", ReleaseStatus::Prepared, "2026-01-04"),
+            ],
+        };
+        let removals = plan_retention(&mut index);
+        // retention=2 → active(v3) + 最近一个非 Failed(v4)；v1 淘汰；v2-failed 保留
+        // 且不占名额（否则被淘汰的会是 v4）。
+        assert_eq!(removals, vec!["v1".to_string()]);
+        let ids: std::collections::BTreeSet<_> = index
+            .releases
+            .iter()
+            .map(|item| item.release_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["v2-failed", "v3", "v4"])
+        );
     }
 
     #[tokio::test]
