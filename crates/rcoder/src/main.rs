@@ -119,7 +119,9 @@ async fn main() -> anyhow::Result<()> {
                 unreachable!("is_postgres 为真的分支");
             };
             let publish: Arc<dyn rcoder_storage::publish_repo::PublishTaskPersistence> = Arc::new(
-                rcoder_storage::pg::publish::PgPublishTaskPersistence::new(store.pool().clone()),
+                rcoder_storage::pg::userapp::publish::PgPublishTaskPersistence::new(
+                    store.pool().clone(),
+                ),
             );
             match publish.recover_running("rcoder restarted").await {
                 Ok(n) if n > 0 => {
@@ -167,7 +169,9 @@ async fn main() -> anyhow::Result<()> {
                 unreachable!("is_postgres 为真的分支");
             };
             let activity_persistence: Arc<dyn shared_types::ActivityPersistence> = Arc::new(
-                rcoder_storage::pg::activity::PgActivityPersistence::new(store.pool().clone()),
+                rcoder_storage::pg::userapp::activity::PgActivityPersistence::new(
+                    store.pool().clone(),
+                ),
             );
             match activity_persistence.load_all().await {
                 Ok(rows) => {

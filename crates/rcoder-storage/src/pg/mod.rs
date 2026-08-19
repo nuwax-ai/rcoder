@@ -24,11 +24,10 @@ pub mod sync;
 mod writer;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-pub mod activity;
-pub mod metadata;
-pub mod publish;
+// UserApp 业务域（publish/activity/metadata）归拢至子目录,与主服务文件隔离
+pub mod userapp;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};

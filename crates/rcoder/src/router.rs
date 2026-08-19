@@ -153,10 +153,11 @@ impl AppState {
                 let ProjectStoreBackend::Postgres(store) = &*projects else {
                     unreachable!("is_postgres 为真的分支");
                 };
-                let metadata_persistence: Arc<dyn shared_types::AppMetadataPersistence> =
-                    Arc::new(rcoder_storage::pg::metadata::PgAppMetadataPersistence::new(
+                let metadata_persistence: Arc<dyn shared_types::AppMetadataPersistence> = Arc::new(
+                    rcoder_storage::pg::userapp::metadata::PgAppMetadataPersistence::new(
                         store.pool().clone(),
-                    ));
+                    ),
+                );
                 match metadata_persistence.load_all().await {
                     Ok(rows) => {
                         app_service_instance.set_metadata_persistence(metadata_persistence);
