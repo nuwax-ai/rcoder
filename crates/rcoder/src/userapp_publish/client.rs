@@ -208,6 +208,9 @@ pub async fn get_build_snapshot(addr: &str, task_id: &str) -> anyhow::Result<Bui
 ///
 /// 后台 spawn:connect/非2xx/读取/缓冲错误经 channel 透传(orchestrator 拿到真因);接收端
 /// 退出时 `tx.closed()` 触发及时收尾(不留挂连接);终态事件后关闭。
+/// build 进度流的接收端（wait_build 断流重订阅时整体替换）。
+pub type BuildProgressReceiver = mpsc::Receiver<Result<BuildProgressEvent, BuildStreamError>>;
+
 pub fn subscribe_build_progress(
     addr: &str,
     task_id: &str,

@@ -196,7 +196,26 @@ pub async fn publish(
     let task_id = task.id.clone();
     let project_id = body.project_id.clone();
     tokio::spawn(async move {
-        orchestrator::run_publish(task, state, project_id, app_id).await;
+        // panic 兜底：spawn 的 JoinHandle 被丢弃，run_* 内部 panic 会被 tokio 静默
+        // 吞掉——任务停在 running 永不收敛，该 app 被 AppBusy 锁死直到重启。
+        // catch_unwind 后 emit Failed（emit 自带终态守卫，已终态时为 no-op）。
+        use futures::FutureExt as _;
+        let outcome = std::panic::AssertUnwindSafe(orchestrator::run_publish(
+            task.clone(),
+            state,
+            project_id,
+            app_id,
+        ))
+        .catch_unwind()
+        .await;
+        if let Err(panic) = outcome {
+            let detail = panic_message(&panic);
+            tracing::error!("[USERAPP_PUBLISH] publish orchestration panicked: {detail}");
+            task.emit(PublishEvent::Failed {
+                error: format!("internal panic: {detail}"),
+            })
+            .await;
+        }
     });
     Ok(Json(HttpResult::success(PublishTaskData {
         task_id,
@@ -240,7 +259,24 @@ pub async fn build(
     let task_id = task.id.clone();
     let project_id = body.project_id.clone();
     tokio::spawn(async move {
-        orchestrator::run_build(task, state, project_id, app_id).await;
+        // 同 publish：panic 兜底（见上方注释）
+        use futures::FutureExt as _;
+        let outcome = std::panic::AssertUnwindSafe(orchestrator::run_build(
+            task.clone(),
+            state,
+            project_id,
+            app_id,
+        ))
+        .catch_unwind()
+        .await;
+        if let Err(panic) = outcome {
+            let detail = panic_message(&panic);
+            tracing::error!("[USERAPP_PUBLISH] build orchestration panicked: {detail}");
+            task.emit(PublishEvent::Failed {
+                error: format!("internal panic: {detail}"),
+            })
+            .await;
+        }
     });
     Ok(Json(HttpResult::success(PublishTaskData {
         task_id,
@@ -465,4 +501,14 @@ fn is_terminal(ev: &PublishEvent) -> bool {
         ev,
         PublishEvent::Completed { .. } | PublishEvent::Failed { .. } | PublishEvent::Cancelled
     )
+}
+/// panic payload → 可读信息（&str / String 直接取，其他类型给占位）。
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }

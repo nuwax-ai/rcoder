@@ -83,6 +83,9 @@ async fn run_build_inner(
     project_id: &str,
     app_id: &str,
 ) -> Result<()> {
+    // 取消快速失败（与 run_publish_inner 对齐——此前 create 后立即取消仍会先跑完
+    // 可能数十秒的 builder ensure 才在 wait_build 开头响应）。
+    fail_if_cancelled(task)?;
     // ensure builder:未注册时自动创建(K8s 拉镜像可能数十秒,先亮阶段让前端可见)。
     task.emit(PublishEvent::Stage {
         stage: "EnsureBuilder".to_string(),

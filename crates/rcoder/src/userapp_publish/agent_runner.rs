@@ -115,7 +115,13 @@ async fn create_builder_and_register(
 
 /// 消费 agent-runner build SSE:透传进度到 task,终态返 BuildOutcome。
 /// 期间检查 task.is_cancelled → cancel_build + Cancelled。
-/// 流错误或断流(无终态)→ 查 task 快照收敛终态(不再吞成 "stream ended without terminal event")。
+///
+/// 断流容错：SSE 是进度流而非可靠性契约——网络瞬断/代理 idle 断连（build 可达
+/// 1800s，中间链路断连不罕见）时查任务快照，已终态按快照收敛；**仍非终态则退避
+/// 重订阅续上**（构建还在远端正常执行，一次断流就判死会把发布误杀为失败——远端
+/// 白烧资源无人收割，用户看到失败立即重试还得在远端排队）。5 次退避（2s..32s，
+/// 累计约 62s）耗尽仍非终态才 Err；file-server 侧 1800s 超时保证任务终态必达，
+/// 由 orchestrator 的终态兜底路径（stale 对账）收敛。
 pub(super) async fn wait_build(
     addr: &str,
     build_task_id: &str,
@@ -127,6 +133,7 @@ pub(super) async fn wait_build(
             .context("cancel agent-runner build before subscribing progress")?;
         return Ok(BuildOutcome::Cancelled);
     }
+    let mut resubscribes = 0usize;
     let mut rx = client::subscribe_build_progress(addr, build_task_id);
     loop {
         let item = tokio::select! {
@@ -139,7 +146,8 @@ pub(super) async fn wait_build(
             }
             item = rx.recv() => match item {
                 Some(item) => item,
-                None => return recover_outcome_from_snapshot(addr, build_task_id).await,
+                // 断流（通道关闭）与流级错误归一，统一走快照恢复/重订阅
+                None => Err(client::BuildStreamError::Read("build stream ended".to_string())),
             },
         };
         match item {
@@ -175,41 +183,92 @@ pub(super) async fn wait_build(
                 }
             }
             Err(e) => {
-                // 流级错误(connect/非2xx/读取/缓冲):log + snapshot 恢复(不再 log-then-close 让 orchestrator 瞎)。
+                // 流级错误(connect/非2xx/读取/缓冲/断流):log + 快照恢复(不再 log-then-close
+                // 让 orchestrator 瞎,也不再单次断流就判死)。
                 tracing::warn!(
                     task_id = %task.id,
                     remote_build_task_id = %build_task_id,
                     error = %e,
-                    "agent-runner build stream error, attempting snapshot recovery"
+                    "agent-runner build stream lost, attempting snapshot recovery"
                 );
-                return recover_outcome_from_snapshot(addr, build_task_id).await;
+                match recover_or_resubscribe(addr, build_task_id, task, &mut resubscribes).await? {
+                    StreamRecovery::Terminal(outcome) => return Ok(outcome),
+                    StreamRecovery::Resubscribed(new_rx) => rx = new_rx,
+                }
             }
         }
     }
 }
 
-/// 断流后查 agent-runner task 快照收敛终态。已终态(completed/failed/cancelled)按快照映射;
-/// 仍非终态或快照不可达 → Err(真因透传,不再吞成 "stream ended without terminal event")。
-async fn recover_outcome_from_snapshot(addr: &str, build_task_id: &str) -> Result<BuildOutcome> {
+/// 断流后的恢复分支结果。
+enum StreamRecovery {
+    /// 快照已终态：按快照映射 outcome。
+    Terminal(BuildOutcome),
+    /// 仍非终态且重试有余额：退避后重订阅成功，续上进度流。
+    Resubscribed(client::BuildProgressReceiver),
+}
+
+/// 断流恢复：查 agent-runner 任务快照。已终态(completed/failed/cancelled)按快照映射；
+/// 仍非终态 → 退避重订阅（5 次：2/4/8/16/32s；退避期间仍响应取消）。快照不可达或
+/// 重试耗尽 → Err（真因透传）。
+async fn recover_or_resubscribe(
+    addr: &str,
+    build_task_id: &str,
+    task: &PublishTask,
+    resubscribes: &mut usize,
+) -> Result<StreamRecovery> {
+    const RESUBSCRIBE_DELAYS_SECS: [u64; 5] = [2, 4, 8, 16, 32];
     let snap = client::get_build_snapshot(addr, build_task_id)
         .await
-        .context("snapshot recovery after build stream ended")?;
-    match snap.status.as_str() {
-        "completed" => {
-            let release_id = snap
+        .context("snapshot recovery after build stream lost")?;
+    let terminal = match snap.status.as_str() {
+        "completed" => Some(BuildOutcome::Completed {
+            release_id: snap
                 .release_id
                 .clone()
-                .ok_or_else(|| anyhow!("snapshot completed but missing releaseId"))?;
-            Ok(BuildOutcome::Completed { release_id })
-        }
-        "failed" => Ok(BuildOutcome::Failed(
+                .ok_or_else(|| anyhow!("snapshot completed but missing releaseId"))?,
+        }),
+        "failed" => Some(BuildOutcome::Failed(
             snap.error
                 .clone()
                 .unwrap_or_else(|| "build failed".to_string()),
         )),
-        "cancelled" => Ok(BuildOutcome::Cancelled),
-        other => Err(anyhow!(
-            "build stream ended and task still non-terminal (status={other})"
-        )),
+        "cancelled" => Some(BuildOutcome::Cancelled),
+        _non_terminal => None,
+    };
+    if let Some(outcome) = terminal {
+        return Ok(StreamRecovery::Terminal(outcome));
     }
+    if *resubscribes >= RESUBSCRIBE_DELAYS_SECS.len() {
+        return Err(anyhow!(
+            "build stream lost and task still non-terminal after {} resubscribe attempts \
+             (last status={})",
+            RESUBSCRIBE_DELAYS_SECS.len(),
+            snap.status
+        ));
+    }
+    let delay = RESUBSCRIBE_DELAYS_SECS[*resubscribes];
+    *resubscribes += 1;
+    tracing::warn!(
+        task_id = %task.id,
+        remote_build_task_id = %build_task_id,
+        attempt = *resubscribes,
+        total = RESUBSCRIBE_DELAYS_SECS.len(),
+        delay_secs = delay,
+        "build task still running, resubscribing after backoff"
+    );
+    // 退避期间仍响应取消（最长 32s 的窗口不该挡住用户取消）
+    tokio::select! {
+        biased;
+        _ = task.cancellation_notified() => {
+            if let Err(e) = client::cancel_build(addr, build_task_id).await {
+                tracing::warn!(%e, "cancel_build during backoff failed");
+            }
+            return Ok(StreamRecovery::Terminal(BuildOutcome::Cancelled));
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
+    }
+    Ok(StreamRecovery::Resubscribed(
+        client::subscribe_build_progress(addr, build_task_id),
+    ))
 }
