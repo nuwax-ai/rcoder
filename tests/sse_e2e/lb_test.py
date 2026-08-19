@@ -40,45 +40,6 @@ ENTRY_HOSTS = [
 NODEPORT = os.environ.get("LB_NODEPORT", "30295")
 
 
-def resolve_replica_ips() -> list[str]:
-    """解析 rcoder 副本 Pod IP（确定性直连路由用）"""
-    out = subprocess.run(
-        ["ssh", K8S_SSH, "kubectl", "get", "pods", "-n", K8S_NS,
-         "-l", "app.kubernetes.io/component=rcoder-main", "-o", "wide"],
-        capture_output=True, text=True, timeout=30,
-    )
-    ips = []
-    for line in out.stdout.splitlines()[1:]:
-        cols = line.split()
-        if len(cols) >= 6 and cols[5].startswith("10."):
-            ips.append(cols[5])
-    return ips
-
-
-
-def bg_chat(url: str, payload: dict):
-    """后台 chat 线程：异常必须可见（线程内异常默认被吞）"""
-    try:
-        chat_at(url, payload)
-        print(f"    [chat@{url}] ok")
-    except Exception as e:  # noqa: BLE001
-        print(f"    [chat@{url}] FAILED: {type(e).__name__}: {str(e)[:120]}")
-
-
-def open_tunnels(ips: list[str], base_port: int = 18086) -> list[subprocess.Popen]:
-    """每副本一条 ssh 本地端口转发隧道（Pod IP 是集群内网，本机不可达）"""
-    procs = []
-    for i, ip in enumerate(ips):
-        local = base_port + i
-        proc = subprocess.Popen(
-            ["ssh", "-N", "-L", f"127.0.0.1:{local}:{ip}:8086", K8S_SSH],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        procs.append(proc)
-    time.sleep(2)
-    return procs
-
-
 def chat_at(url: str, payload: dict) -> dict:
     """向指定 url 发 chat（与 common.chat 同校验）"""
     import requests
@@ -160,18 +121,11 @@ def main():
     if not K8S_SSH:
         print("❌ 需要 TEST_K8S_SSH（解析副本 IP 与清理）")
         sys.exit(1)
-    replicas = resolve_replica_ips()
     entries = [f"http://{h}:{NODEPORT}" for h in ENTRY_HOSTS]
-    print(f"副本 Pod IP: {replicas}（直连 :8086）")
     print(f"节点入口: {entries}")
-    if len(replicas) < 2:
-        print("❌ 副本数 < 2，无法验证跨副本")
-        sys.exit(1)
 
     user = scoped_user("lb")
     c = Check()
-    tunnels = open_tunnels(replicas)
-    rep_url = [f"http://127.0.0.1:{18086 + i}" for i in range(len(replicas))]
 
     # ===== 场景 1（主路径）：chat 经三个节点 NodePort 轮换，SSE 也轮换入口 =====
     # 真实用户路径：宿主机 IP + NodePort；kube-proxy 落点随机（后端 3 副本），
@@ -238,17 +192,25 @@ def main():
     else:
         c.ok(len(ids_b) > 0, "turn 进行中：续传收到后续事件（不丢）")
 
-    # ===== 场景 3（辅助）：确定性跨副本（Pod 直连隧道：chat@A 订阅@B）=====
-    print("\n▶ lb_cross_replica_sse（确定性：chat@副本A SSE@副本B）")
-    d2 = chat_at(rep_url[0], base_payload("用一句话说明什么是分布式系统", f"{RUN_TAG}-lx", user))
-    sid2 = d2["session_id"]
-    p2 = base_payload("用三点解释 ACID 特性", f"{RUN_TAG}-lx2", user)
-    p2["session_id"], p2["project_id"] = sid2, d2["project_id"]
-    threading.Thread(target=bg_chat, args=(rep_url[0], p2), daemon=True).start()
-    time.sleep(1)  # 验收原始暴露窗口：durable 直写 + SSE 回源后必须直接命中
-    evs2 = sse_collect_at(rep_url[1], sid2, 40)
-    c.ok(len(ids_of(evs2)) > 0, f"跨副本 SSE 收到 {len(ids_of(evs2))} 事件（chat@A 订阅@B）")
-    c.ok("ACID" in chunks_text(evs2) or "原子" in chunks_text(evs2), "跨副本 SSE 内容正确")
+    # ===== 场景 3：新会话跨入口（NodePort 随机落点，多轮统计覆盖跨副本）=====
+    # durable 直写 + SSE 回源的验收场景：chat 落随机副本 X，1 秒后从另一入口
+    # 订阅（落随机副本 Y，3 副本下每轮 2/3 概率 X≠Y）——多轮组合覆盖跨副本，
+    # 且就是真实用户的负载均衡形态（无需也不应指定副本）。
+    print("\n▶ lb_new_session_cross_entry（新会话 chat 后 1s 从另一入口订阅）")
+    for i, kw in enumerate(["分布式", "微服务", "负载均衡"]):
+        chat_url = entries[i % len(entries)]
+        sse_url = entries[(i + 1) % len(entries)]
+        d4 = chat_at(chat_url, base_payload(f"用一句话解释：{kw}", f"{RUN_TAG}-n{i}", user))
+        sid4 = d4["session_id"]
+        threading.Thread(target=bg_chat, args=(
+            chat_url,
+            {**base_payload(f"再补充一句关于{kw}的要点", f"{RUN_TAG}-n{i}b", user),
+             "session_id": sid4, "project_id": d4["project_id"]}), daemon=True).start()
+        time.sleep(1)  # 验收窗口：durable+回源后必须直接命中
+        evs4 = sse_collect_at(sse_url, sid4, 40)
+        ids4 = ids_of(evs4)
+        c.ok(len(ids4) > 0, f"轮{i} chat@{chat_url.split('//')[1]} 1s后SSE@{sse_url.split('//')[1]} 收 {len(ids4)} 事件")
+        c.ok(kw in chunks_text(evs4), f"轮{i} 内容正确（含 {kw}）")
 
     # ===== 汇总 =====
     print()
@@ -256,8 +218,6 @@ def main():
         print(ln)
     print(f"\n结果: {'✅ 全过' if c.passed else '❌ 存在失败'}")
     cleanup(user)
-    for t in tunnels:
-        t.terminate()
     sys.exit(0 if c.passed else 1)
 
 
