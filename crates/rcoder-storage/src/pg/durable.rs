@@ -81,11 +81,6 @@ impl PgStore {
                     session_id
                 );
                 // 降级：与 insert_with_session 的入队路径完全一致（幂等，writer 重放安全）
-                tracing::warn!(
-                    "[STORAGE_PG] durable commit failed, falling back to write-behind: project_id={}, session_id={}",
-                    session_project,
-                    session_id
-                );
                 self.persist_upsert(&info)?;
                 self.enqueue_structural(PersistOp::AddSession {
                     project_id: session_project,

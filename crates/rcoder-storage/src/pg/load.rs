@@ -175,7 +175,7 @@ impl super::PgStore {
             return Some(hit);
         }
         let fetched = repo::fetch_project_by_session(&self.pool, session_id).await?;
-        let hydrated = self.hydrate_fetched(fetched);
+        let hydrated = self.hydrate_fetched(session_id, fetched);
         tracing::info!(
             "[STORAGE_PG] session miss backfilled from PG: session_id={}, project_id={}",
             session_id,
@@ -185,9 +185,12 @@ impl super::PgStore {
     }
 
     /// 回源行组装为 info 并旁路写入内存镜像（数据本就来自 PG，回写不走持久化，
-    /// 与 sync.rs 的 hydrate 同模式——复用 load 的组装逻辑）
+    /// 与 sync.rs 的 hydrate 同模式——复用 load 的组装逻辑）。
+    /// `fetched_by` 是触发回源的 session_id（可能与 latest_session 不同）——
+    /// 必须一并补进镜像，否则该 session 键下次查询仍 miss（回源缓存失效）
     fn hydrate_fetched(
         &self,
+        fetched_by: &str,
         (project_row, container_row): (ProjectRow, Option<ContainerRow>),
     ) -> Arc<ProjectAndContainerInfo> {
         let mut container_by_name = HashMap::new();
@@ -206,11 +209,12 @@ impl super::PgStore {
         self.inner
             .insert_with_session(pid, Arc::clone(&info), None)
             .ok();
-        // 回源键是 sessions 表的 session_id（可能与 latest_session 不同）——
-        // 显式补齐该映射，让下次同 session 查询走内存命中
+        // latest_session 与回源键（可能不同）都补进镜像，下次任一键查询走内存
         if let Some(sid) = project_row.latest_session.as_deref() {
             self.inner.add_session_to_project(info.project_id(), sid);
         }
+        self.inner
+            .add_session_to_project(info.project_id(), fetched_by);
         info
     }
 }

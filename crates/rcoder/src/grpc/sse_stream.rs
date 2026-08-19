@@ -4,6 +4,12 @@
 //! 并转换为 SSE 事件返回给客户端
 
 use chrono::{DateTime, Utc};
+
+use super::session_stream_registry::{
+    MAX_RETRIES, is_stream_closing, is_turn_terminal, make_cursor_reset_event,
+    make_prompt_end_event, make_stream_error_event, make_terminal_error_event,
+    maybe_update_activity,
+};
 use shared_types::{SessionMessageType, UnifiedSessionMessage};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -70,7 +76,7 @@ pub async fn create_grpc_sse_stream(
         let activity_secs = std::sync::atomic::AtomicI64::new(0);
         let mut from_seq = initial_from;
 
-        for attempt in 1..=crate::grpc::session_stream_registry::MAX_RETRIES {
+        for attempt in 1..=MAX_RETRIES {
             if cancel.is_cancelled() {
                 info!(
                     "[gRPC_SSE] cancelled (container shutdown): session_id={}",
@@ -83,20 +89,13 @@ pub async fn create_grpc_sse_stream(
                 Err(e) => {
                     warn!(
                         "[gRPC_SSE] get_client failed (attempt {}/{}): session_id={}, {}",
-                        attempt,
-                        crate::grpc::session_stream_registry::MAX_RETRIES,
-                        session_id,
-                        e
+                        attempt, MAX_RETRIES, session_id, e
                     );
                     pool.remove(&grpc_addr).await;
-                    if attempt < crate::grpc::session_stream_registry::MAX_RETRIES {
+                    if attempt < MAX_RETRIES {
                         continue;
                     }
-                    let err_ev = crate::grpc::session_stream_registry::make_terminal_error_event(
-                        diag_ctx.as_ref(),
-                        locale,
-                    )
-                    .await;
+                    let err_ev = make_terminal_error_event(diag_ctx.as_ref(), locale).await;
                     let _ =
                         forward_to_client(&tx, &err_ev, &session_id, &mut client_last_seq).await;
                     registry.release_first_client_claim(&session_id);
@@ -116,20 +115,13 @@ pub async fn create_grpc_sse_stream(
                 Err(e) => {
                     warn!(
                         "[gRPC_SSE] subscribe failed (attempt {}/{}): session_id={}, {}",
-                        attempt,
-                        crate::grpc::session_stream_registry::MAX_RETRIES,
-                        session_id,
-                        e
+                        attempt, MAX_RETRIES, session_id, e
                     );
-                    if attempt < crate::grpc::session_stream_registry::MAX_RETRIES {
+                    if attempt < MAX_RETRIES {
                         pool.remove(&grpc_addr).await;
                         continue;
                     }
-                    let err_ev = crate::grpc::session_stream_registry::make_terminal_error_event(
-                        diag_ctx.as_ref(),
-                        locale,
-                    )
-                    .await;
+                    let err_ev = make_terminal_error_event(diag_ctx.as_ref(), locale).await;
                     let _ =
                         forward_to_client(&tx, &err_ev, &session_id, &mut client_last_seq).await;
                     registry.release_first_client_claim(&session_id);
@@ -153,7 +145,7 @@ pub async fn create_grpc_sse_stream(
                     }
                     msg = stream.message() => match msg {
                         Ok(Some(ev)) => {
-                            crate::grpc::session_stream_registry::maybe_update_activity(
+                            maybe_update_activity(
                                 &activity_updater,
                                 &session_id,
                                 &activity_secs,
@@ -166,7 +158,7 @@ pub async fn create_grpc_sse_stream(
                                     "⚠️ [gRPC_SSE] seq regression (agent restarted?): session_id={}, seq={}, cursor={}, resetting",
                                     session_id, ev.seq, client_last_seq
                                 );
-                                let reset = crate::grpc::session_stream_registry::make_cursor_reset_event();
+                                let reset = make_cursor_reset_event();
                                 if !forward_to_client(&tx, &reset, &session_id, &mut client_last_seq).await {
                                     return;
                                 }
@@ -174,7 +166,7 @@ pub async fn create_grpc_sse_stream(
                             if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
                                 // turn 终态（end_turn/error）→ 归还首连资格（新一轮 turn
                                 // 的首连重新可兜时间差）；客户端断开 → 直接退出
-                                if crate::grpc::session_stream_registry::is_turn_terminal(
+                                if is_turn_terminal(
                                     &ev.message_type, &ev.sub_type,
                                 ) {
                                     registry.release_first_client_claim(&session_id);
@@ -184,7 +176,7 @@ pub async fn create_grpc_sse_stream(
                         }
                         Ok(None) => {
                             // agent_runner 正常关流但未推终端（防御）：补终态避免客户端 hang
-                            let ev = crate::grpc::session_stream_registry::make_prompt_end_event();
+                            let ev = make_prompt_end_event();
                             let _ = forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await;
                             registry.release_first_client_claim(&session_id);
                             return;
@@ -194,12 +186,12 @@ pub async fn create_grpc_sse_stream(
                                 "[gRPC_SSE] stream error: session_id={}, code={}, msg={}",
                                 session_id, e.code(), e.message()
                             );
-                            if attempt < crate::grpc::session_stream_registry::MAX_RETRIES {
+                            if attempt < MAX_RETRIES {
                                 pool.remove(&grpc_addr).await;
                                 from_seq = client_last_seq; // 增量重订
                                 break; // 内层退出，外层重试
                             }
-                            let err_ev = crate::grpc::session_stream_registry::make_stream_error_event(
+                            let err_ev = make_stream_error_event(
                                 e.code(), e.message(),
                             );
                             let _ = forward_to_client(&tx, &err_ev, &session_id, &mut client_last_seq).await;
@@ -230,8 +222,7 @@ async fn forward_to_client(
     // 关流判定：turn 终态（end_turn/error）+ rcoder 合成的 stream_ended。
     // cancelled 不关流——它是"用户连发消息自动取消"的常态事件，agent 随后继续
     // 执行新任务，流保持供下一轮实时投递（与 agent_runner 侧订阅判定对齐）。
-    let is_terminal =
-        super::session_stream_registry::is_stream_closing(&ev.message_type, &ev.sub_type);
+    let is_terminal = is_stream_closing(&ev.message_type, &ev.sub_type);
     // cursor-reset(#15):epoch 变化 → 重置客户端去重游标,让新 epoch 的低 seq 事件不被去重丢弃。
     if ev.message_type == "StreamReset" {
         *client_last_seq = 0;
