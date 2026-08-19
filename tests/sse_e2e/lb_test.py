@@ -245,7 +245,7 @@ def main():
     p2 = base_payload("用三点解释 ACID 特性", f"{RUN_TAG}-lx2", user)
     p2["session_id"], p2["project_id"] = sid2, d2["project_id"]
     threading.Thread(target=bg_chat, args=(rep_url[0], p2), daemon=True).start()
-    time.sleep(4)  # write-behind 落 PG + async 复制追平窗口（新会话跨副本首读）
+    time.sleep(1)  # 验收原始暴露窗口：durable 直写 + SSE 回源后必须直接命中
     evs2 = sse_collect_at(rep_url[1], sid2, 40)
     c.ok(len(ids_of(evs2)) > 0, f"跨副本 SSE 收到 {len(ids_of(evs2))} 事件（chat@A 订阅@B）")
     c.ok("ACID" in chunks_text(evs2) or "原子" in chunks_text(evs2), "跨副本 SSE 内容正确")

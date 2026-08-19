@@ -311,11 +311,20 @@ pub(super) async fn update_session_mappings_after_response(
             Some(shared_types::ServiceType::ComputerAgentRunner),
         );
 
-        // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态
+        // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态。
+        // durable：PG 事务提交完成才返回——session_id 到达前端时任何副本可服务
         state
-            .insert_project_with_session(map_key.clone(), Arc::new(updated_info), &session_id)
+            .insert_project_with_session_durable(
+                map_key.clone(),
+                Arc::new(updated_info),
+                &session_id,
+            )
+            .await
             .map_err(|e| {
-                tracing::error!("[STORAGE] insert_project_with_session failed: {}", e);
+                tracing::error!(
+                    "[STORAGE] insert_project_with_session_durable failed: {}",
+                    e
+                );
                 e
             })?;
 
@@ -347,11 +356,20 @@ pub(super) async fn update_session_mappings_after_response(
             request.isolation_type.clone(),
         );
 
-        // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态
+        // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态。
+        // durable：PG 事务提交完成才返回——session_id 到达前端时任何副本可服务
         state
-            .insert_project_with_session(map_key.clone(), Arc::new(project_info), &session_id)
+            .insert_project_with_session_durable(
+                map_key.clone(),
+                Arc::new(project_info),
+                &session_id,
+            )
+            .await
             .map_err(|e| {
-                tracing::error!("[STORAGE] insert_project_with_session failed: {}", e);
+                tracing::error!(
+                    "[STORAGE] insert_project_with_session_durable failed: {}",
+                    e
+                );
                 e
             })?;
 

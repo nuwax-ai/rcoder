@@ -33,24 +33,25 @@ pub(super) async fn load_all(pool: &PgPool, inner: &ProjectAdapter) -> anyhow::R
 pub(super) fn container_rows_to_map(
     containers: Vec<ContainerRow>,
 ) -> HashMap<String, ContainerBasicInfo> {
-    let mut map = HashMap::new();
-    for row in containers {
-        map.insert(
-            row.container_name.clone(),
-            ContainerBasicInfo {
-                container_id: row.container_id.unwrap_or_default(),
-                container_name: row.container_name,
-                container_ip: row.container_ip,
-                internal_port: u16::try_from(row.internal_port).unwrap_or(0),
-                external_port: u16::try_from(row.external_port).unwrap_or(0),
-                project_id: row.logical_id,
-                status: row.status,
-                created_at: row.created_at,
-                service_url: row.service_url,
-            },
-        );
+    containers
+        .into_iter()
+        .map(|row| (row.container_name.clone(), container_row_to_basic(&row)))
+        .collect()
+}
+
+/// 单行转换（回源直查的单容器 hydrate 复用）
+pub(super) fn container_row_to_basic(row: &ContainerRow) -> ContainerBasicInfo {
+    ContainerBasicInfo {
+        container_id: row.container_id.clone().unwrap_or_default(),
+        container_name: row.container_name.clone(),
+        container_ip: row.container_ip.clone(),
+        internal_port: u16::try_from(row.internal_port).unwrap_or(0),
+        external_port: u16::try_from(row.external_port).unwrap_or(0),
+        project_id: row.logical_id.clone(),
+        status: row.status.clone(),
+        created_at: row.created_at,
+        service_url: row.service_url.clone(),
     }
-    map
 }
 
 /// project 行 → 领域对象（字段级重建；解码失败 warn 并跳过该字段）

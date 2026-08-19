@@ -80,7 +80,7 @@ async fn validate_and_get_session_context(
     // ========== 阶段 1: 获取项目信息（所有分支都需要） ==========
     // 🔧 优化：提前获取 project_info，避免后续重复查询
     // 同时获取 DockerManager（用于容器验证和降级查询）
-    let project_info = lookup_project_info_by_session(&state, session_id)?;
+    let project_info = lookup_project_info_by_session(&state, session_id).await?;
 
     let runtime = state.runtime().clone();
 
@@ -125,14 +125,16 @@ async fn validate_and_get_session_context(
 
 /// 阶段 1：按 session_id 查找项目信息
 #[allow(clippy::result_large_err)]
-fn lookup_project_info_by_session(
+async fn lookup_project_info_by_session(
     state: &Arc<crate::router::AppState>,
     session_id: &str,
 ) -> Result<Arc<ProjectAndContainerInfo>, Response> {
-    match state.get_by_session(session_id) {
+    // 内存镜像 miss → 回源直查 PG 主库一次（跨副本可见性兜底：新会话在
+    // write-behind/镜像同步窗口内、或 durable 降级场景；命中顺带 hydrate 镜像）
+    match state.get_by_session_with_fetch(session_id).await {
         Some(info) => {
             debug!(
-                " [SSE_PROXY] Getting project info from memory: session_id={}, project_id={}",
+                " [SSE_PROXY] Getting project info: session_id={}, project_id={}",
                 session_id,
                 info.project_id()
             );

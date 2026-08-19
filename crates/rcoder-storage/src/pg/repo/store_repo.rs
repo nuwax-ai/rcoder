@@ -261,3 +261,43 @@ pub(in crate::pg) async fn fetch_all_sessions<'e>(
         .fetch_all(db)
         .await
 }
+
+// ========== 按 session 单查（SSE 回源直查用） ==========
+
+/// sessions 表 PK 直查 → 该 project 的完整行（projects + containers）
+///
+/// SSE lookup miss 的回源路径：所有副本连 -rw 主库，durable 提交后必中。
+/// 返回 (ProjectRow, Option<ContainerRow>)——容器行可缺（FK ON DELETE SET NULL
+/// 或占位条目），hydrate_project 容忍缺容器。
+pub(in crate::pg) async fn fetch_project_by_session(
+    db: &sqlx::PgPool,
+    session_id: &str,
+) -> Option<(ProjectRow, Option<ContainerRow>)> {
+    let project = sqlx::query_as::<_, ProjectRow>(
+        "SELECT p.project_id, p.user_id, p.pod_id, p.tenant_id, p.space_id, \
+         p.isolation_type, p.container_name, p.latest_session, p.model_provider, \
+         p.request_id, p.agent_status, p.service_type, p.last_activity, p.created_at \
+         FROM projects p \
+         WHERE p.project_id = (SELECT project_id FROM sessions WHERE session_id = $1)",
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+
+    let container = match project.container_name.as_deref() {
+        Some(name) => sqlx::query_as::<_, ContainerRow>(
+            "SELECT container_name, container_id, logical_id, service_type, \
+                 container_ip, internal_port, external_port, status, service_url, \
+                 last_activity, created_at FROM containers WHERE container_name = $1",
+        )
+        .bind(name)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten(),
+        None => None,
+    };
+    Some((project, container))
+}

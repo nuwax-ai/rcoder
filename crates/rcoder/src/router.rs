@@ -268,6 +268,27 @@ impl AppState {
         self.projects.get_by_session_id(session_id)
     }
 
+    /// 会话创建 durable 直写（PG：内存 + 事务提交，返回即落库；降级不失败）。
+    /// chat 完成点调用——"session_id 返回给前端 = 任何副本可服务"的契约。
+    pub async fn insert_project_with_session_durable(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        self.projects
+            .insert_project_with_session_durable(project_id, info, session_id)
+            .await
+    }
+
+    /// 按 session_id 读（PG 模式 miss 回源直查一次 + hydrate；Memory 仅内存）
+    pub async fn get_by_session_with_fetch(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<ProjectAndContainerInfo>> {
+        self.projects.get_by_session_with_fetch(session_id).await
+    }
+
     /// 通过会话ID获取容器名称（用于容器重启后的容器查询）
     ///
     /// 与 `get_container_id_by_session` 不同，返回稳定的 `container_name`。

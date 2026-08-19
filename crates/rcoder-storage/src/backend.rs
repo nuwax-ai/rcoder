@@ -38,6 +38,40 @@ impl ProjectStoreBackend {
         }
     }
 
+    /// 会话创建的结构性 op **durable 直写**（PG 模式：内存 + sqlx 事务提交，
+    /// 方法返回即主库已提交；超时/失败降级 write-behind 队列，chat 不失败）。
+    /// Memory 模式等价普通内存写。chat 完成点调用——保证 session_id 返回给
+    /// 前端时任何副本回源直查必命中（跨副本可见性契约）。
+    pub async fn insert_project_with_session_durable(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Memory(inner) => inner.insert_with_session(project_id, info, Some(session_id)),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .insert_with_session_durable(project_id, info, session_id)
+                    .await
+            }
+        }
+    }
+
+    /// 按 session_id 读（PG 模式 miss 回源直查主库一次并 hydrate 镜像；
+    /// Memory 模式仅内存）。SSE lookup 的兜底路径。
+    pub async fn get_by_session_with_fetch(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<ProjectAndContainerInfo>> {
+        match self {
+            Self::Memory(inner) => inner.get_by_session_id(session_id),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.get_by_session_id_with_fetch(session_id).await,
+        }
+    }
+
     /// PG 后端引用（P2：sync/leader 等后端特有任务的装配入口；Memory 为 None）。
     /// 返回 &Arc：调用方可 clone 独立句柄传给后台任务
     #[cfg(feature = "pg")]

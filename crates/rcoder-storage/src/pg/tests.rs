@@ -579,3 +579,105 @@ async fn leader_election_mutual_exclusion() {
     );
     assert!(a.is_leader());
 }
+
+#[tokio::test]
+async fn durable_commit_returns_after_pg_visible() {
+    // durable 契约：方法返回（Ok）后，另起连接直查 PG 必然可见——
+    // "chat 返回 session_id = 任何副本回源直查必命中"的存储层基础
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&dsn)
+        .await
+        .expect("test pool");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrate");
+
+    let project_id = format!("pgdur-{}", uuid_suffix());
+    let session_id = format!("sess-{project_id}");
+    let (store, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect");
+
+    store
+        .insert_with_session_durable(
+            project_id.clone(),
+            info_for(&project_id, Some(container_for(&project_id))),
+            &session_id,
+        )
+        .await
+        .expect("durable insert");
+
+    // 另起连接直查（不经本 store 的内存/队列）——durable 返回即已提交
+    let fetched = super::repo::fetch_project_by_session(&pool, &session_id)
+        .await
+        .expect("durable committed row must be visible immediately");
+    assert_eq!(fetched.0.project_id, project_id);
+
+    // 内存镜像同步可见
+    assert!(store.get_by_session_id(&session_id).is_some());
+}
+
+#[tokio::test]
+async fn session_miss_backfills_from_pg_into_mirror() {
+    // 回源直查：镜像 miss → PG 查 → hydrate 进镜像（下次走内存命中）
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&dsn)
+        .await
+        .expect("test pool");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrate");
+
+    let project_id = format!("pgfetch-{}", uuid_suffix());
+    let session_id = format!("sess-{project_id}");
+
+    // 副本 A durable 写入（模拟 chat 落 A）
+    let (store_a, _rx_a) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect A");
+    store_a
+        .insert_with_session_durable(
+            project_id.clone(),
+            info_for(&project_id, Some(container_for(&project_id))),
+            &session_id,
+        )
+        .await
+        .expect("A durable insert");
+
+    // 副本 B（镜像空，模拟另一 rcoder 副本）——回源直查必中 + hydrate
+    let (store_b, _rx_b) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect B");
+    assert!(
+        store_b.inner().get_by_session_id(&session_id).is_none(),
+        "B mirror starts empty"
+    );
+    let fetched = store_b
+        .get_by_session_id_with_fetch(&session_id)
+        .await
+        .expect("B backfill from PG");
+    assert_eq!(fetched.project_id(), project_id);
+    // hydrate 后镜像命中（不再回源）
+    assert!(store_b.inner().get_by_session_id(&session_id).is_some());
+    // 未知 session 回源仍 miss
+    assert!(
+        store_b
+            .get_by_session_id_with_fetch("sess-nonexistent")
+            .await
+            .is_none()
+    );
+}
