@@ -616,6 +616,7 @@ async fn durable_commit_returns_after_pg_visible() {
     // 另起连接直查（不经本 store 的内存/队列）——durable 返回即已提交
     let fetched = super::repo::fetch_project_by_session(&pool, &session_id)
         .await
+        .expect("durable query ok")
         .expect("durable committed row must be visible immediately");
     assert_eq!(fetched.0.project_id, project_id);
 

@@ -174,7 +174,18 @@ impl super::PgStore {
         if let Some(hit) = self.inner.get_by_session_id(session_id) {
             return Some(hit);
         }
-        let fetched = repo::fetch_project_by_session(&self.pool, session_id).await?;
+        let fetched = match repo::fetch_project_by_session(&self.pool, session_id).await {
+            Ok(Some(rows)) => rows,
+            Ok(None) => return None, // 真 miss（session 不存在）
+            Err(e) => {
+                // DB 错误 ≠ miss：区分记录，避免把存储故障误判为"流量打到错误副本"
+                tracing::warn!(
+                    "[STORAGE_PG] session backfill fetch failed (treating as miss): session_id={}, error={e}",
+                    session_id
+                );
+                return None;
+            }
+        };
         let hydrated = self.hydrate_fetched(session_id, fetched);
         tracing::info!(
             "[STORAGE_PG] session miss backfilled from PG: session_id={}, project_id={}",

@@ -2,6 +2,7 @@
 //!
 //! 与 write-behind（writer.rs，高频幂等 op 的吞吐路径）互补：低频高价值的
 //! 结构性写在调用点同步提交，超时/失败降级回队列（HA 语义不变）。
+//! op 集与降级路径共用 [`structural_ops_for_insert`]（单一构造点，零漂移）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,9 +10,8 @@ use std::time::Duration;
 use shared_types::ProjectAndContainerInfo;
 
 use super::PgStore;
-use super::container_entry_key;
-use super::persist_ops::{ContainerSnapshot, PersistOp, ProjectSnapshot};
-use super::repo;
+use super::persist_ops::structural_ops_for_insert;
+use super::writer::execute_op;
 
 impl PgStore {
     /// 结构性写的事务直写超时：正常毫秒级完成；超时降级走 write-behind。
@@ -35,30 +35,20 @@ impl PgStore {
         self.inner
             .insert_with_session(project_id, Arc::clone(&info), Some(session_id))?;
 
-        // 2. 事务直写（与 persist_upsert 相同的 op 集：容器 + 项目 + 会话）
+        // 2. 事务直写（op 集单一构造点，复用 writer 的 execute_op 执行）
         let session_project = info.project_id().to_string();
-        let container_name = info.container_info().map(|_| container_entry_key(&info));
-        let snapshot = ProjectSnapshot::from_info(&info)?;
+        let ops = structural_ops_for_insert(&info, session_id)?;
         let durable = async {
-            let mut tx = self.pool.begin().await?;
-            if let Some(basic) = info.container_info()
-                && let Some(st) = info.service_type()
-            {
-                repo::upsert_container(
-                    &mut *tx,
-                    &ContainerSnapshot::from_info(&container_entry_key(&info), &basic, &st),
-                )
-                .await?;
+            let result: anyhow::Result<()> = async {
+                let mut tx = self.pool.begin().await?;
+                for op in &ops {
+                    execute_op(&mut tx, op).await?;
+                }
+                tx.commit().await?;
+                Ok(())
             }
-            repo::upsert_project(&mut *tx, &snapshot).await?;
-            repo::add_session(
-                &mut *tx,
-                &session_project,
-                session_id,
-                container_name.as_deref(),
-            )
-            .await?;
-            tx.commit().await
+            .await;
+            result
         };
         match tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, durable).await {
             Ok(Ok(())) => {
@@ -80,13 +70,11 @@ impl PgStore {
                     session_project,
                     session_id
                 );
-                // 降级：与 insert_with_session 的入队路径完全一致（幂等，writer 重放安全）
-                self.persist_upsert(&info)?;
-                self.enqueue_structural(PersistOp::AddSession {
-                    project_id: session_project,
-                    session_id: session_id.to_string(),
-                    container_name,
-                });
+                // 降级：op 集与成功路径同源（幂等，writer 重放安全；
+                // upsert 的 last_activity 防回退守卫拦住旧快照覆盖）
+                for op in ops {
+                    self.enqueue_structural(op);
+                }
                 Ok(())
             }
         }

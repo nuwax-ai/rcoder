@@ -177,10 +177,19 @@ async fn run(
     }
     let mut remaining = interrupted;
     let drain = async {
+        let mut dropped = 0usize;
         while let Ok(op) = rx.try_recv() {
             if op.is_structural() {
                 remaining.push(op);
+            } else {
+                // 与超深丢弃对称：幂等 op 关停丢弃也须归还 pending（wait_drained
+                // 的屏障语义依赖计数准确），否则关停后 barrier 永久超时
+                dropped += 1;
+                pending.fetch_sub(1, Ordering::AcqRel);
             }
+        }
+        if dropped > 0 {
+            tracing::debug!("[STORAGE_PG] shutdown drain dropped {dropped} idempotent ops");
         }
     };
     let _ = tokio::time::timeout(DRAIN_TIMEOUT, drain).await;
@@ -211,7 +220,7 @@ async fn execute_batch(pool: &PgPool, batch: &[PersistOp]) -> anyhow::Result<usi
 
 /// 单 op → repo 调用（全部幂等：upsert / delete，重放安全）。
 /// 事务内执行器解引用传参（官方 transaction 示例范式）。
-async fn execute_op(
+pub(in crate::pg) async fn execute_op(
     tx: &mut Transaction<'_, sqlx::Postgres>,
     op: &PersistOp,
 ) -> anyhow::Result<()> {

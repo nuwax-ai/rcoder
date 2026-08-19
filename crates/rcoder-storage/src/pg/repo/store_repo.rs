@@ -102,6 +102,11 @@ pub(in crate::pg) async fn upsert_project<'e>(
     p: &ProjectSnapshot,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
+        // 防回退守卫（WHERE ...last_activity >= ...）：durable 直写与 write-behind
+        // 队列可交错（writer 退避积压时，旧 UpsertProject 快照会在 durable 提交后
+        // 重放）——last_activity 随每次 chat 的 update_activity 单调刷新，旧快照
+        // 条件不满足被跳过，防止整行覆盖回退（latest_session/model_provider 等）。
+        // 相等放行：同 project 同毫秒的连续快照内容差异可忽略。
         r#"INSERT INTO projects
            (project_id, user_id, pod_id, tenant_id, space_id, isolation_type,
             container_name, latest_session, model_provider, request_id, agent_status,
@@ -116,7 +121,8 @@ pub(in crate::pg) async fn upsert_project<'e>(
              model_provider=EXCLUDED.model_provider, request_id=EXCLUDED.request_id,
              agent_status=EXCLUDED.agent_status, service_type=EXCLUDED.service_type,
              last_activity=EXCLUDED.last_activity, created_at=EXCLUDED.created_at,
-             version=projects.version+1"#,
+             version=projects.version+1
+           WHERE EXCLUDED.last_activity >= projects.last_activity"#,
     )
     .bind(&p.project_id)
     .bind(&p.user_id)
@@ -269,11 +275,16 @@ pub(in crate::pg) async fn fetch_all_sessions<'e>(
 /// SSE lookup miss 的回源路径：所有副本连 -rw 主库，durable 提交后必中。
 /// 返回 (ProjectRow, Option<ContainerRow>)——容器行可缺（FK ON DELETE SET NULL
 /// 或占位条目），hydrate_project 容忍缺容器。
+/// sessions 表 PK 直查 → 该 project 的完整行（projects + containers）。
+///
+/// SSE lookup miss 的回源路径：所有副本连 -rw 主库，durable 提交后必中。
+/// 返回 Result 区分 DB 错误与真 miss（调用方需分别处理：错误记日志告警，
+/// miss 才是"session 不存在"）。
 pub(in crate::pg) async fn fetch_project_by_session(
     db: &sqlx::PgPool,
     session_id: &str,
-) -> Option<(ProjectRow, Option<ContainerRow>)> {
-    let project = sqlx::query_as::<_, ProjectRow>(
+) -> Result<Option<(ProjectRow, Option<ContainerRow>)>, sqlx::Error> {
+    let Some(project) = sqlx::query_as::<_, ProjectRow>(
         "SELECT p.project_id, p.user_id, p.pod_id, p.tenant_id, p.space_id, \
          p.isolation_type, p.container_name, p.latest_session, p.model_provider, \
          p.request_id, p.agent_status, p.service_type, p.last_activity, p.created_at \
@@ -282,22 +293,22 @@ pub(in crate::pg) async fn fetch_project_by_session(
     )
     .bind(session_id)
     .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()?;
-
+    .await?
+    else {
+        return Ok(None);
+    };
     let container = match project.container_name.as_deref() {
-        Some(name) => sqlx::query_as::<_, ContainerRow>(
-            "SELECT container_name, container_id, logical_id, service_type, \
+        Some(name) => {
+            sqlx::query_as::<_, ContainerRow>(
+                "SELECT container_name, container_id, logical_id, service_type, \
                  container_ip, internal_port, external_port, status, service_url, \
                  last_activity, created_at FROM containers WHERE container_name = $1",
-        )
-        .bind(name)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten(),
+            )
+            .bind(name)
+            .fetch_optional(db)
+            .await?
+        }
         None => None,
     };
-    Some((project, container))
+    Ok(Some((project, container)))
 }

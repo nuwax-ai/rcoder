@@ -65,9 +65,16 @@ pub(crate) async fn sync_once(
         return Ok(());
     }
 
-    let containers = repo::fetch_all_containers(pool).await?;
-    let projects = repo::fetch_all_projects(pool).await?;
-    let sessions = repo::fetch_all_sessions(pool).await?;
+    // 三表读入单事务（REPEATABLE READ）：三次独立 pool acquire 会拿到三个
+    // 不同语句快照，跨快照可产生瞬态"孤儿 session"（project 在快照 1 有、
+    // 快照 2 无）触发误判。单事务保证三表同一一致性视图。
+    let mut snap_tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    let containers = repo::fetch_all_containers(&mut *snap_tx).await?;
+    let projects = repo::fetch_all_projects(&mut *snap_tx).await?;
+    let sessions = repo::fetch_all_sessions(&mut *snap_tx).await?;
+    drop(snap_tx); // 只读快照，即可释放
 
     // PG 侧索引
     let pg_project_ids: std::collections::HashSet<&str> =
@@ -75,21 +82,35 @@ pub(crate) async fn sync_once(
     let pg_session_ids: std::collections::HashSet<&str> =
         sessions.iter().map(|s| s.session_id.as_str()).collect();
 
-    // 1) 删除：镜像有而 PG 无（屏障保证 = 远端删除）
-    let mirror_projects = inner.iter();
-    for (project_id, _) in mirror_projects {
-        if !pg_project_ids.contains(project_id.as_str()) {
+    // 1) 删除：镜像有而 PG 无。排空屏障只覆盖屏障前的写——快照 fetch 之后
+    //    本地新增（内存有、op 尚在队列）会被误判为"远端删除"。对每个候选
+    //    做单行二次确认（短排空 + 直查）：屏障后新写若已落库则直查命中。
+    let mirror_projects: Vec<String> = inner.iter().into_iter().map(|(pid, _)| pid).collect();
+    for project_id in mirror_projects {
+        if !pg_project_ids.contains(project_id.as_str())
+            && !self_confirm_project_alive(store, pool, &project_id).await
+        {
             debug!("[STORAGE_PG] sync remove project {project_id} (deleted on peer replica)");
             inner.remove(&project_id);
         }
     }
-    // session 删除：镜像各 project 的 session 中不在 PG 的（经 inner 反查逐个清）
-    for (project_id, info) in inner.iter() {
-        for sid in info.sessions() {
-            if !pg_session_ids.contains(sid.as_str()) {
-                debug!("[STORAGE_PG] sync remove session {sid} (deleted on peer replica)");
-                inner.clear_session_one(&project_id, &sid);
-            }
+    // session 删除：镜像各 project 的 session 中不在 PG 的（同样二次确认）
+    let mirror_sessions: Vec<(String, String)> = inner
+        .iter()
+        .into_iter()
+        .flat_map(|(pid, info)| {
+            info.sessions()
+                .iter()
+                .map(|sid| (pid.clone(), sid.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for (project_id, sid) in mirror_sessions {
+        if !pg_session_ids.contains(sid.as_str())
+            && !self_confirm_session_alive(store, pool, &sid).await
+        {
+            debug!("[STORAGE_PG] sync remove session {sid} (deleted on peer replica)");
+            inner.clear_session_one(&project_id, &sid);
         }
     }
 
@@ -111,9 +132,16 @@ pub(crate) async fn sync_once(
         {
             continue; // 无变化
         }
-        let Some(info) = hydrate_project(&row, &container_by_name) else {
+        let Some(mut info) = hydrate_project(&row, &container_by_name) else {
             continue; // hydrate 内已告警（service_type 未知等）
         };
+        // merge 语义：整条 insert 会把快照后本地新增的 session 抛掉（hydrate
+        // 出的 info 无 session 集合）——先保留镜像现有 sessions 再替换
+        if let Some(current) = &existing {
+            for sid in current.sessions().iter() {
+                info.add_session(sid.clone());
+            }
+        }
         if let Err(e) = inner.insert(row.project_id.clone(), Arc::new(info)) {
             warn!(
                 "[STORAGE_PG] sync insert failed for {}: {e:#}（跳过）",
@@ -149,39 +177,128 @@ pub(crate) async fn sync_once(
     Ok(())
 }
 
-/// 镜像侧轻量签名（避开全字段深比较；volatile 的 last_activity 不参与，
-/// 容器以 container_name 对齐——行侧 container_name 即容器表键）
-type ProjectSig = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
-
-fn project_signature(info: &shared_types::ProjectAndContainerInfo) -> ProjectSig {
-    (
-        info.user_id().map(str::to_string),
-        info.pod_id().map(str::to_string),
-        info.container_info().map(|c| c.container_name),
-        info.latest_session().map(str::to_string),
-        info.request_id().map(str::to_string),
-        info.model_provider().map(|p| p.id.clone()),
-    )
+/// 镜像/行侧统一签名（字段拼接；volatile 的 last_activity/created_at/version 不参与）。
+/// 覆盖全部业务可变字段：漏字段 = 远端变更永不感知（镜像长期陈旧）——
+/// agent_status（状态同步）、租户三元组、service_type、model_provider 全量 JSON
+/// （base_url/api_key 变更不只看 id）都参与比对。
+fn project_signature(info: &shared_types::ProjectAndContainerInfo) -> String {
+    let mut sig = String::with_capacity(128);
+    sig.push_str("u:");
+    sig.push_str(info.user_id().unwrap_or(""));
+    sig.push_str("|p:");
+    sig.push_str(info.pod_id().unwrap_or(""));
+    sig.push_str("|c:");
+    sig.push_str(
+        &info
+            .container_info()
+            .map(|c| c.container_name)
+            .unwrap_or_default(),
+    );
+    sig.push_str("|s:");
+    sig.push_str(
+        info.latest_session()
+            .map(str::to_string)
+            .unwrap_or_default()
+            .as_str(),
+    );
+    sig.push_str("|r:");
+    sig.push_str(
+        info.request_id()
+            .map(str::to_string)
+            .unwrap_or_default()
+            .as_str(),
+    );
+    sig.push_str("|a:");
+    sig.push_str(&serde_json::to_string(&info.status()).unwrap_or_default());
+    sig.push_str("|t:");
+    sig.push_str(info.tenant_id().unwrap_or(""));
+    sig.push('/');
+    sig.push_str(info.space_id().unwrap_or(""));
+    sig.push('/');
+    sig.push_str(info.isolation_type().unwrap_or(""));
+    sig.push_str("|v:");
+    sig.push_str(&serde_json::to_string(&info.service_type()).unwrap_or_default());
+    sig.push_str("|m:");
+    sig.push_str(&serde_json::to_string(&info.model_provider()).unwrap_or_default());
+    sig
 }
 
-fn row_signature(row: &repo::ProjectRow) -> ProjectSig {
-    (
-        row.user_id.clone(),
-        row.pod_id.clone(),
-        row.container_name.clone(),
-        row.latest_session.clone(),
-        row.request_id.clone(),
-        row.model_provider
+fn row_signature(row: &repo::ProjectRow) -> String {
+    let mut sig = String::with_capacity(128);
+    sig.push_str("u:");
+    sig.push_str(row.user_id.as_deref().unwrap_or(""));
+    sig.push_str("|p:");
+    sig.push_str(row.pod_id.as_deref().unwrap_or(""));
+    sig.push_str("|c:");
+    sig.push_str(row.container_name.as_deref().unwrap_or(""));
+    sig.push_str("|s:");
+    sig.push_str(row.latest_session.as_deref().unwrap_or(""));
+    sig.push_str("|r:");
+    sig.push_str(row.request_id.as_deref().unwrap_or(""));
+    sig.push_str("|a:");
+    sig.push_str(
+        &row.agent_status
             .as_ref()
-            .and_then(|v| v.get("id"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-    )
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+    sig.push_str("|t:");
+    sig.push_str(row.tenant_id.as_deref().unwrap_or(""));
+    sig.push('/');
+    sig.push_str(row.space_id.as_deref().unwrap_or(""));
+    sig.push('/');
+    sig.push_str(row.isolation_type.as_deref().unwrap_or(""));
+    sig.push_str("|v:");
+    sig.push_str(row.service_type.as_deref().unwrap_or(""));
+    sig.push_str("|m:");
+    sig.push_str(
+        &row.model_provider
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+    sig
+}
+
+/// remove 候选的二次确认：短排空后直查该行是否已落库（屏障后新写防误删）。
+/// PG 故障时返回 true（宁可不删也不误删——下轮 sync 再收敛）。
+async fn self_confirm_project_alive(store: &PgStore, pool: &PgPool, project_id: &str) -> bool {
+    if store.wait_drained(Duration::from_millis(200)).await {
+        let sql = "SELECT 1 FROM projects WHERE project_id = $1";
+        match sqlx::query_scalar::<_, i32>(sql)
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                debug!("[STORAGE_PG] sync remove-confirm query failed (keeping): {e}");
+                true
+            }
+        }
+    } else {
+        true // 排空超时（writer 积压）：偏保守不删
+    }
+}
+
+/// session 版二次确认（sessions 表 PK 直查）
+async fn self_confirm_session_alive(store: &PgStore, pool: &PgPool, session_id: &str) -> bool {
+    if store.wait_drained(Duration::from_millis(200)).await {
+        let sql = "SELECT 1 FROM sessions WHERE session_id = $1";
+        match sqlx::query_scalar::<_, i32>(sql)
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                debug!("[STORAGE_PG] sync remove-confirm query failed (keeping): {e}");
+                true
+            }
+        }
+    } else {
+        true
+    }
 }

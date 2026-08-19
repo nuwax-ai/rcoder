@@ -90,13 +90,13 @@ impl ProjectStore for PgStore {
     ) -> anyhow::Result<()> {
         self.inner
             .insert_with_session(project_id, Arc::clone(&info), session_id)?;
-        self.persist_upsert(&info)?;
+        // op 集单一构造点（与 durable 直写/降级路径同源）
         if let Some(sid) = session_id {
-            self.enqueue_structural(PersistOp::AddSession {
-                project_id: info.project_id().to_string(),
-                session_id: sid.to_string(),
-                container_name: info.container_info().map(|_| container_entry_key(&info)),
-            });
+            for op in super::persist_ops::structural_ops_for_insert(&info, sid)? {
+                self.enqueue_structural(op);
+            }
+        } else {
+            self.persist_upsert(&info)?;
         }
         Ok(())
     }
@@ -200,14 +200,24 @@ impl ProjectStore for PgStore {
     fn update_agent_status(&self, project_id: &str, status: i32, message: &str) -> bool {
         if self.inner.update_agent_status(project_id, status, message) {
             let agent_status = code_to_agent_status(status, message);
-            if let Ok(value) = serde_json::to_value(agent_status) {
-                self.enqueue_throttled(
-                    &format!("a:{project_id}"),
-                    PersistOp::UpdateAgentStatus {
-                        project_id: project_id.to_string(),
-                        agent_status: value,
-                    },
-                );
+            match serde_json::to_value(agent_status) {
+                Ok(value) => {
+                    self.enqueue_throttled(
+                        &format!("a:{project_id}"),
+                        PersistOp::UpdateAgentStatus {
+                            project_id: project_id.to_string(),
+                            agent_status: value,
+                        },
+                    );
+                }
+                // 序列化几乎不会失败，一旦发生必须可见：内存已更新而 PG 永久丢失
+                Err(e) => {
+                    tracing::warn!(
+                        "[STORAGE_PG] agent_status serialize failed (not persisted): project_id={}, status={}, error={e}",
+                        project_id,
+                        status
+                    );
+                }
             }
             true
         } else {
