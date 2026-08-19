@@ -97,14 +97,18 @@ impl AppService {
     /// （activate 就绪窗口）。超时秒数由调用方传入（activate 请求体，已校验范围）。
     ///
     /// 容错：后端瞬时错误（API 抖动/网络瞬断）在就绪预算内记日志继续轮询——单次
-    /// 抖动不耗尽整个预算；`NotFound` 是"发布期间应用被用户删除"（删除是更高优先
-    /// 级的用户意图，等就绪阶段不持发布锁即为此），与普通就绪失败区分报错便于排查。
+    /// 抖动不耗尽整个预算；但**连续** [`MAX_CONSECUTIVE_POLL_ERRORS`] 次失败判死
+    /// （持续性故障如网络分区/RBAC 配错不该拖满整个预算才失败，最长 1800s）。
+    /// `NotFound` 是"发布期间应用被用户删除"（删除是更高优先级的用户意图），与
+    /// 普通就绪失败区分报错便于排查。
     pub(super) async fn wait_app_ready(
         &self,
         rcoder_app_id: &str,
         timeout_secs: u64,
     ) -> Result<(), AppOperationError> {
+        const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 5;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let mut consecutive_errors = 0u32;
         loop {
             if tokio::time::Instant::now() >= deadline {
                 return Err(AppOperationError::Backend(format!(
@@ -113,6 +117,7 @@ impl AppService {
             }
             match self.get_app(rcoder_app_id).await {
                 Ok(info) => {
+                    consecutive_errors = 0;
                     if info.status == AppStatus::Error {
                         return Err(AppOperationError::Backend(format!(
                             "app entered Error state (health={})",
@@ -129,8 +134,17 @@ impl AppService {
                     )));
                 }
                 Err(error) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
+                        return Err(AppOperationError::Backend(format!(
+                            "app readiness poll failed {consecutive_errors} consecutive \
+                             times: {error}"
+                        )));
+                    }
                     tracing::warn!(
                         app_id = %rcoder_app_id,
+                        attempt = consecutive_errors,
+                        max = MAX_CONSECUTIVE_POLL_ERRORS,
                         %error,
                         "readiness poll transient error, retrying within budget"
                     );

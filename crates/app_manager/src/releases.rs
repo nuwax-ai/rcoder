@@ -1075,4 +1075,38 @@ mod tests {
             "got: {error}"
         );
     }
+
+    /// 就绪轮询连续错误上限：持续性后端故障不拖满整个预算（3s 间隔 × 5 次 = 15s
+    /// 内判死），瞬时抖动（<5 次连续）仍在预算内恢复。
+    #[tokio::test]
+    async fn wait_app_ready_fails_fast_on_consecutive_backend_errors() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        runtime.deployments.insert(
+            "app-stuck".into(),
+            container_runtime_api::DeploymentStatus {
+                app_id: "app-stuck".into(),
+                replicas: 1,
+                ready_replicas: 1,
+                phase: "Running".into(),
+                ..Default::default()
+            },
+        );
+        let service = test_service(root.path(), runtime.clone());
+        // 持续注入错误（远多于上限 5 次）
+        runtime
+            .status_fails
+            .store(50, std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let error = service
+            .wait_app_ready("app-stuck", 300)
+            .await
+            .expect_err("persistent backend failure must fail fast");
+        assert!(error.to_string().contains("consecutive"), "got: {error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "must not drain the full readiness budget (elapsed {:?})",
+            started.elapsed()
+        );
+    }
 }
