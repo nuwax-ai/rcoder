@@ -29,6 +29,20 @@ pub(crate) async fn ensure_release_dirs(root: &Path) -> AppResult<()> {
     Ok(())
 }
 
+/// 读 code 目录自带的版本号（`release.lock.toml` 的 release_id；发布包解包时写入）。
+///
+/// 用途：区分"当前 code 是在线成功版本还是失败现场"——activate 的 `.rollback` 快照
+/// 覆盖判定与 rollback 的残留快照判定都依赖它。读不出（目录缺失/lock 损坏）返回
+/// None，调用方按各自保守策略处理。
+pub(crate) async fn read_code_release_id(app_dir: &Path) -> Option<String> {
+    let content = tokio::fs::read_to_string(app_dir.join("code").join("release.lock.toml"))
+        .await
+        .ok()?;
+    workspace_manifest::load_release_lock(&content)
+        .ok()
+        .map(|lock| lock.release_id)
+}
+
 /// 解压并校验 release staging。任一步失败都立即清理，避免损坏包持续占用 PVC。
 pub(crate) async fn stage_release_package(
     package: &Path,

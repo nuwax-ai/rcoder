@@ -26,12 +26,16 @@ use crate::service::AppService;
 /// get_container_app_dir 因此落到 `workspace_root/{app_id}`，测试用 tempdir 承接）。
 /// `specs` 预置 app 的 live desired 快照（get_app_container_spec 回退测试用；缺省空快照）。
 /// `deployments` 预置 app 运行时状态（query_apps/list 过滤测试用；缺省空列表）。
+/// `status_fails` 注入 get_deployment_status 的瞬时后端错误（wait_app_ready 容错测试）。
 #[derive(Default)]
 pub(crate) struct MockRuntime {
     pub delete_calls: AtomicUsize,
     pub delete_fails: AtomicBool,
     pub create_calls: AtomicUsize,
     pub create_fails: AtomicBool,
+    pub status_fails: AtomicUsize,
+    /// start_app（scale>0）后 phase 停在 Error：模拟新版本启动即崩（就绪失败测试）。
+    pub crash_on_start: AtomicBool,
     pub specs: DashMap<String, ContainerSpecSnapshot>,
     pub deployments: DashMap<String, DeploymentStatus>,
 }
@@ -64,6 +68,14 @@ impl UserAppDeploymentRuntime for MockRuntime {
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
+        // 注入的瞬时后端错误（模拟 API 抖动/网络瞬断），扣减后恢复
+        let pending = self.status_fails.load(Ordering::SeqCst);
+        if pending > 0 {
+            self.status_fails.store(pending - 1, Ordering::SeqCst);
+            return Err(ContainerRuntimeError::ConnectionError(
+                "injected transient failure".to_string(),
+            ));
+        }
         // 优先查预置 deployments（activate/rollback 测试）；未预置 → None
         // （start/stop 路径得到 NotFound，相关清理路径容忍）
         Ok(self
@@ -77,7 +89,16 @@ impl UserAppDeploymentRuntime for MockRuntime {
             let status = entry.value_mut();
             status.replicas = replicas;
             status.ready_replicas = replicas.max(0);
-            status.phase = if replicas == 0 { "Stopped" } else { "Running" }.into();
+            status.phase = if replicas == 0 {
+                "Stopped"
+            } else if self.crash_on_start.load(Ordering::SeqCst) {
+                // 注入"启动即崩"：start_app 后 phase=Error，activate 的 wait_app_ready
+                // 首个轮询即失败（无竞态地构造就绪失败场景）。
+                "Error"
+            } else {
+                "Running"
+            }
+            .into();
         }
         Ok(())
     }

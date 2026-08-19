@@ -95,6 +95,10 @@ impl AppService {
 
     /// 轮询 app 到 status=Running 且 health 非 Unhealthy；超时或进入 Error 则失败
     /// （activate 就绪窗口）。超时秒数由调用方传入（activate 请求体，已校验范围）。
+    ///
+    /// 容错：后端瞬时错误（API 抖动/网络瞬断）在就绪预算内记日志继续轮询——单次
+    /// 抖动不耗尽整个预算；`NotFound` 是"发布期间应用被用户删除"（删除是更高优先
+    /// 级的用户意图，等就绪阶段不持发布锁即为此），与普通就绪失败区分报错便于排查。
     pub(super) async fn wait_app_ready(
         &self,
         rcoder_app_id: &str,
@@ -107,15 +111,30 @@ impl AppService {
                     "app readiness poll timed out after {timeout_secs}s"
                 )));
             }
-            let info = self.get_app(rcoder_app_id).await?;
-            if info.status == AppStatus::Error {
-                return Err(AppOperationError::Backend(format!(
-                    "app entered Error state (health={})",
-                    info.health.status
-                )));
-            }
-            if info.status == AppStatus::Running && info.health.status != "Unhealthy" {
-                return Ok(());
+            match self.get_app(rcoder_app_id).await {
+                Ok(info) => {
+                    if info.status == AppStatus::Error {
+                        return Err(AppOperationError::Backend(format!(
+                            "app entered Error state (health={})",
+                            info.health.status
+                        )));
+                    }
+                    if info.status == AppStatus::Running && info.health.status != "Unhealthy" {
+                        return Ok(());
+                    }
+                }
+                Err(AppOperationError::NotFound(_)) => {
+                    return Err(AppOperationError::Backend(format!(
+                        "app {rcoder_app_id} was deleted while waiting for readiness"
+                    )));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        app_id = %rcoder_app_id,
+                        %error,
+                        "readiness poll transient error, retrying within budget"
+                    );
+                }
             }
             tokio::time::sleep(Duration::from_secs(READY_POLL_INTERVAL_SECS)).await;
         }
