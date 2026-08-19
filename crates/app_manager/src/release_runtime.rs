@@ -99,8 +99,9 @@ impl AppService {
     /// 容错：后端瞬时错误（API 抖动/网络瞬断）在就绪预算内记日志继续轮询——单次
     /// 抖动不耗尽整个预算；但**连续** [`MAX_CONSECUTIVE_POLL_ERRORS`] 次失败判死
     /// （持续性故障如网络分区/RBAC 配错不该拖满整个预算才失败，最长 1800s）。
-    /// `NotFound` 是"发布期间应用被用户删除"（删除是更高优先级的用户意图），与
-    /// 普通就绪失败区分报错便于排查。
+    /// `NotFound` 是"发布期间应用被用户删除"——等就绪阶段确实不持进程锁
+    /// （activate_release 的 guard 被 ensure_app_runtime 按值消费、其返回即释放；
+    /// 删除是更高优先级的用户意图），与普通就绪失败区分报错便于排查。
     pub(super) async fn wait_app_ready(
         &self,
         rcoder_app_id: &str,

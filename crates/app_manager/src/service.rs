@@ -226,10 +226,8 @@ impl AppService {
                     }
                     // (缺元数据排最后, 时间升序)：bool false < true 保证有元数据的排前
                     items.sort_by_key(|app| {
-                        (
-                            self.metadata.lookup(&app.app_id).is_none(),
-                            self.metadata.lookup(&app.app_id).map(|m| m.created_at),
-                        )
+                        let meta = self.metadata.lookup(&app.app_id);
+                        (meta.is_none(), meta.map(|m| m.created_at))
                     });
                 }
                 // 非法值 400（此前落入 `_ => {}` 不排序，但随后的 reverse 仍执行——
@@ -422,7 +420,10 @@ impl AppService {
         let release_lock = self.acquire_process_release_lock(app_id).await;
         info!("[APP] deleting app: {} (purge={})", app_id, purge);
 
-        // 1. Docker 模式：清理 Pingora backend
+        // 1. Docker 模式：清理 Pingora backend（恢复依据先取出——unregister 会移除
+        //    注册表条目；用注册表而非 previous.ports 反推，Docker 后端的状态 ports
+        //    只含 TCP、反推恒空）
+        let registered_http_ports = self.registered_http_ports(app_id);
         self.unregister_pingora_backends(app_id).await;
 
         // 2. 删除计算资源（K8s: Deployment/Service/HTTPRoute/NodePort/ConfigMap/Secret
@@ -431,15 +432,9 @@ impl AppService {
         self.activity.mark_wake_blocked(app_id);
         if let Err(error) = self.runtime.delete_deployment(app_id).await {
             self.restore_activity_state(app_id, &previous, previous_wake_on_traffic);
-            let http_ports = previous
-                .ports
-                .iter()
-                .filter(|port| port.expose_type == RtExposeType::Http)
-                .map(|port| port.port)
-                .collect::<Vec<_>>();
             self.register_pingora_backends(
                 app_id,
-                &http_ports,
+                &registered_http_ports,
                 previous.pod_ip.as_deref().unwrap_or_default(),
             )
             .await;
