@@ -11,6 +11,7 @@
 //!
 //! PG 为跨重启/跨副本的真源；容器运行态真源仍在 K8s/Docker API（label + 确定性命名）。
 
+mod durable;
 mod leader;
 mod load;
 mod persist_ops;
@@ -172,139 +173,6 @@ impl PgStore {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }
-
-    /// 结构性写的事务直写超时：正常毫秒级完成；超时降级走 write-behind。
-    const DURABLE_COMMIT_TIMEOUT: Duration = Duration::from_millis(600);
-
-    /// 会话创建的结构性 op **事务直写**（durable 路径）：
-    /// 内存镜像更新 + container/project/session 于同一 sqlx 事务提交——
-    /// 方法返回（Ok）即 PG 主库已提交，chat 侧据此保证"session_id 交到
-    /// 前端手上时任何副本回源直查必命中"。
-    ///
-    /// 提交超时/失败降级：事务丢弃（drop=rollback），改入 write-behind
-    /// 队列（现有异步路径）——chat 不失败（内存真源），可见性窗口仅在
-    /// PG 故障态退化。降级路径 op 会入队，成功路径不入队（无双写）。
-    pub async fn insert_with_session_durable(
-        &self,
-        project_id: String,
-        info: Arc<ProjectAndContainerInfo>,
-        session_id: &str,
-    ) -> anyhow::Result<()> {
-        // 1. 内存镜像（与 insert_with_session 的内存部分一致）
-        self.inner
-            .insert_with_session(project_id, Arc::clone(&info), Some(session_id))?;
-
-        // 2. 事务直写（与 persist_upsert 相同的 op 集：容器 + 项目 + 会话）
-        let session_project = info.project_id().to_string();
-        let container_name = info.container_info().map(|_| container_entry_key(&info));
-        let snapshot = ProjectSnapshot::from_info(&info)?;
-        let durable = async {
-            let mut tx = self.pool.begin().await?;
-            if let Some(basic) = info.container_info()
-                && let Some(st) = info.service_type()
-            {
-                repo::upsert_container(
-                    &mut *tx,
-                    &ContainerSnapshot::from_info(&container_entry_key(&info), &basic, &st),
-                )
-                .await?;
-            }
-            repo::upsert_project(&mut *tx, &snapshot).await?;
-            repo::add_session(
-                &mut *tx,
-                &session_project,
-                session_id,
-                container_name.as_deref(),
-            )
-            .await?;
-            tx.commit().await
-        };
-        match tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, durable).await {
-            Ok(Ok(())) => {
-                tracing::debug!(
-                    "[STORAGE_PG] durable commit ok: project_id={}, session_id={}",
-                    session_project,
-                    session_id
-                );
-                Ok(())
-            }
-            outcome => {
-                let reason = match outcome {
-                    Ok(Ok(())) => unreachable!("covered by first arm"),
-                    Ok(Err(e)) => format!("sql error: {e}"),
-                    Err(_) => "timeout".to_string(),
-                };
-                tracing::warn!(
-                    "[STORAGE_PG] durable commit failed ({reason}), falling back to write-behind: project_id={}, session_id={}",
-                    session_project,
-                    session_id
-                );
-                // 降级：与 insert_with_session 的入队路径完全一致（幂等，writer 重放安全）
-                tracing::warn!(
-                    "[STORAGE_PG] durable commit failed, falling back to write-behind: project_id={}, session_id={}",
-                    session_project,
-                    session_id
-                );
-                self.persist_upsert(&info)?;
-                self.enqueue_structural(PersistOp::AddSession {
-                    project_id: session_project,
-                    session_id: session_id.to_string(),
-                    container_name,
-                });
-                Ok(())
-            }
-        }
-    }
-
-    /// 按 session_id 读：内存镜像 hit 直接返回；miss 回源直查主库一次
-    /// （所有副本连 `-rw` 主库，无复制延迟——正常路径 durable 提交后必中），
-    /// 命中则 hydrate 进本地镜像（旁路持久化，此后走内存）。
-    pub async fn get_by_session_id_with_fetch(
-        &self,
-        session_id: &str,
-    ) -> Option<Arc<ProjectAndContainerInfo>> {
-        if let Some(hit) = self.inner.get_by_session_id(session_id) {
-            return Some(hit);
-        }
-        let fetched = repo::fetch_project_by_session(&self.pool, session_id).await?;
-        let hydrated = self.hydrate_fetched(fetched);
-        tracing::info!(
-            "[STORAGE_PG] session miss backfilled from PG: session_id={}, project_id={}",
-            session_id,
-            hydrated.project_id()
-        );
-        Some(hydrated)
-    }
-
-    /// 回源行组装为 info 并旁路写入内存镜像（数据本就来自 PG，回写不走持久化，
-    /// 与 sync.rs 的 hydrate 同模式——复用 load 的组装逻辑）
-    fn hydrate_fetched(
-        &self,
-        (project_row, container_row): (repo::rows::ProjectRow, Option<repo::rows::ContainerRow>),
-    ) -> Arc<ProjectAndContainerInfo> {
-        let mut container_by_name = std::collections::HashMap::new();
-        if let Some(row) = container_row {
-            let name = row.container_name.clone();
-            let basic = load::container_row_to_basic(&row);
-            container_by_name.insert(name, basic);
-        }
-        // 解析失败（枚举演进/缺 service_type）→ 兜底空 map：项目记录仍返回
-        //（SSE 只需要 project_id/container_name 路由信息）
-        let info = load::hydrate_project(&project_row, &container_by_name)
-            .unwrap_or_else(|| ProjectAndContainerInfo::new(project_row.project_id.clone()));
-        let info = Arc::new(info);
-        // 旁路写入镜像（数据来自 PG，不走持久化）
-        let pid = info.project_id().to_string();
-        self.inner
-            .insert_with_session(pid, Arc::clone(&info), None)
-            .ok();
-        // 回源键是 sessions 表的 session_id（可能与 latest_session 不同）——
-        // 显式补齐该映射，让下次同 session 查询走内存命中
-        if let Some(sid) = project_row.latest_session.as_deref() {
-            self.inner.add_session_to_project(info.project_id(), sid);
-        }
-        info
     }
 
     /// 非阻塞 enqueue（结构性 op）。队列无界，写入即返回。

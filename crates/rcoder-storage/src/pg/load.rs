@@ -160,3 +160,57 @@ fn parse_service_type(s: Option<&str>) -> Option<ServiceType> {
     use std::str::FromStr as _;
     s.and_then(|value: &str| ServiceType::from_str(value).ok())
 }
+
+// ========== SSE 回源直查（miss → PG 单查 → hydrate 镜像） ==========
+
+impl super::PgStore {
+    /// 按 session_id 读：内存镜像 hit 直接返回；miss 回源直查主库一次
+    /// （所有副本连 `-rw` 主库，无复制延迟——正常路径 durable 提交后必中），
+    /// 命中则 hydrate 进本地镜像（旁路持久化，此后走内存）。
+    pub async fn get_by_session_id_with_fetch(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<ProjectAndContainerInfo>> {
+        if let Some(hit) = self.inner.get_by_session_id(session_id) {
+            return Some(hit);
+        }
+        let fetched = repo::fetch_project_by_session(&self.pool, session_id).await?;
+        let hydrated = self.hydrate_fetched(fetched);
+        tracing::info!(
+            "[STORAGE_PG] session miss backfilled from PG: session_id={}, project_id={}",
+            session_id,
+            hydrated.project_id()
+        );
+        Some(hydrated)
+    }
+
+    /// 回源行组装为 info 并旁路写入内存镜像（数据本就来自 PG，回写不走持久化，
+    /// 与 sync.rs 的 hydrate 同模式——复用 load 的组装逻辑）
+    fn hydrate_fetched(
+        &self,
+        (project_row, container_row): (ProjectRow, Option<ContainerRow>),
+    ) -> Arc<ProjectAndContainerInfo> {
+        let mut container_by_name = HashMap::new();
+        if let Some(row) = container_row {
+            let name = row.container_name.clone();
+            let basic = container_row_to_basic(&row);
+            container_by_name.insert(name, basic);
+        }
+        // 解析失败（枚举演进/缺 service_type）→ 兜底空 map：项目记录仍返回
+        //（SSE 只需要 project_id/container_name 路由信息）
+        let info = hydrate_project(&project_row, &container_by_name)
+            .unwrap_or_else(|| ProjectAndContainerInfo::new(project_row.project_id.clone()));
+        let info = Arc::new(info);
+        // 旁路写入镜像（数据来自 PG，不走持久化）
+        let pid = info.project_id().to_string();
+        self.inner
+            .insert_with_session(pid, Arc::clone(&info), None)
+            .ok();
+        // 回源键是 sessions 表的 session_id（可能与 latest_session 不同）——
+        // 显式补齐该映射，让下次同 session 查询走内存命中
+        if let Some(sid) = project_row.latest_session.as_deref() {
+            self.inner.add_session_to_project(info.project_id(), sid);
+        }
+        info
+    }
+}
