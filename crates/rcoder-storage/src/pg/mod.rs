@@ -11,23 +11,21 @@
 //!
 //! PG 为跨重启/跨副本的真源；容器运行态真源仍在 K8s/Docker API（label + 确定性命名）。
 
-mod durable;
-mod leader;
-mod load;
-mod persist_ops;
-mod repo;
-pub mod leader_selection {
-    pub use super::leader::PgLeaderElection;
-}
-mod store_impl;
-pub mod sync;
-mod writer;
+// 两业务域目录化(开闭原则:改一个域不碰另一个域的文件):
+// - project_store/  主服务域(ProjectStore 契约的 PG 后端实现全部)
+// - userapp/        UserApp 业务域(publish/activity/metadata)
+mod project_store;
 
 #[cfg(test)]
-pub(crate) mod tests;
-
-// UserApp 业务域（publish/activity/metadata）归拢至子目录,与主服务文件隔离
+pub(crate) mod test_support;
 pub mod userapp;
+
+// 对外面保持原路径不变(rcoder 消费 pg::sync / pg::leader_selection / PersistWriter):
+pub use project_store::sync;
+pub use project_store::writer::PersistWriter;
+pub mod leader_selection {
+    pub use super::project_store::leader::PgLeaderElection;
+}
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -40,11 +38,9 @@ use tracing::info;
 
 use shared_types::{ContainerLookup, ProjectAndContainerInfo, ServiceType};
 
-use self::persist_ops::{ContainerSnapshot, PersistOp, ProjectSnapshot};
+use self::project_store::persist_ops::{ContainerSnapshot, PersistOp, ProjectSnapshot};
 use crate::adapter::{ProjectAdapter, container_entry_key};
 use crate::config::PostgresConfig;
-
-pub use writer::PersistWriter;
 
 /// Touch 类 op 的入队节流窗口（enqueue 前按 key 判断，零 PG 开销）
 const TOUCH_THROTTLE: Duration = Duration::from_secs(5);
@@ -138,7 +134,7 @@ impl PgStore {
             pending_ops,
             pool: pool.clone(),
         };
-        load::load_all(&pool, &store.inner).await?;
+        project_store::load::load_all(&pool, &store.inner).await?;
         let stats = store.inner.get_stats();
         info!(
             "[STORAGE_PG] boot load complete: projects={} containers={} sessions={}",

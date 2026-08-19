@@ -9,9 +9,9 @@ use shared_types::{
     ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore, ServiceType, StorageStats,
 };
 
-use super::PgStore;
 use super::persist_ops::PersistOp;
 use crate::adapter::{code_to_agent_status, container_entry_key};
+use crate::pg::PgStore;
 
 impl ProjectStore for PgStore {
     fn get(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {

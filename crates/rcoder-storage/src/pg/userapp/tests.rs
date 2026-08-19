@@ -2,13 +2,13 @@
 //!
 //! 运行条件与主测试套一致:`RCODER_PG_TEST_DSN` 指向可破坏的测试库,
 //! 未设置时静默跳过。公共 helper(test_dsn/wait_for/uuid_suffix)复用
-//! `crate::pg::tests`。
+//! `crate::pg::test_support`。
 
 #![cfg(all(test, feature = "pg"))]
 
 use sqlx::postgres::PgPoolOptions;
 
-use crate::pg::tests::{DSN_ENV, test_dsn, uuid_suffix};
+use crate::pg::test_support::{DSN_ENV, test_dsn, uuid_suffix};
 
 /// publish_tasks 域测试互斥锁:roundtrip 的 recover_running/purge_expired 是
 /// 全库 UPDATE/DELETE,并行会打掉其他测试的活任务行。域内测试串行(跨域无影响)。

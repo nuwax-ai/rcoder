@@ -23,9 +23,9 @@ use sqlx::PgPool;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use super::PgStore;
 use super::load::{container_rows_to_map, hydrate_project};
 use super::repo;
+use crate::pg::PgStore;
 
 /// 同步周期（ClientIP affinity 下常规流量不受影响；故障切换陈旧窗口上限）
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);

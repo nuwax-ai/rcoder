@@ -19,7 +19,7 @@ use super::repo::{self, ContainerRow, ProjectRow, SessionRow};
 use crate::adapter::ProjectAdapter;
 
 /// 全量加载（容器数 = 历史活跃容器，量级小）
-pub(super) async fn load_all(pool: &PgPool, inner: &ProjectAdapter) -> anyhow::Result<()> {
+pub(crate) async fn load_all(pool: &PgPool, inner: &ProjectAdapter) -> anyhow::Result<()> {
     let containers = repo::fetch_all_containers(pool).await?;
     let container_by_name = container_rows_to_map(containers);
     let projects = repo::fetch_all_projects(pool).await?;
@@ -163,7 +163,7 @@ fn parse_service_type(s: Option<&str>) -> Option<ServiceType> {
 
 // ========== SSE 回源直查（miss → PG 单查 → hydrate 镜像） ==========
 
-impl super::PgStore {
+impl crate::pg::PgStore {
     /// 按 session_id 读：内存镜像 hit 直接返回；miss 回源直查主库一次
     /// （所有副本连 `-rw` 主库，无复制延迟——正常路径 durable 提交后必中），
     /// 命中则 hydrate 进本地镜像（旁路持久化，此后走内存）。

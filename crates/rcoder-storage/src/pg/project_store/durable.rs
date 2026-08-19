@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use shared_types::ProjectAndContainerInfo;
 
-use super::PgStore;
 use super::persist_ops::structural_ops_for_insert;
 use super::writer::execute_op;
+use crate::pg::PgStore;
 
 impl PgStore {
     /// 结构性写的事务直写超时：正常毫秒级完成；超时降级走 write-behind。
