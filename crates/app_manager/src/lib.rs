@@ -9,6 +9,7 @@ mod activity_persistence_ops;
 pub mod activity_registry;
 pub mod app_create;
 pub mod app_db;
+pub(crate) mod app_metadata;
 pub mod app_ops;
 pub mod app_params;
 pub mod app_pingora;

@@ -27,6 +27,10 @@ pub use app_activity::{
     ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, WakeOutcome,
 };
 
+// UserApp 应用业务元数据（集群不持有的字段;query name/created_at 过滤数据源）
+pub mod app_metadata;
+pub use app_metadata::{AppMetadataPersistence, AppMetadataRecord};
+
 // 容器条目模块（refcount + 活跃时间跟踪）
 pub mod container_entry;
 pub use container_entry::ContainerEntry;

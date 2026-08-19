@@ -27,6 +27,7 @@ mod writer;
 mod tests;
 
 pub mod activity;
+pub mod metadata;
 pub mod publish;
 
 use std::sync::Arc;

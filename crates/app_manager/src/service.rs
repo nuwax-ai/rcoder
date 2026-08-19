@@ -21,6 +21,7 @@ use container_runtime_api::{ExposeType as RtExposeType, HttpExpose, UserAppRunti
 use rcoder_proxy::PingoraProxyService;
 
 use crate::AppActivityRegistry;
+use crate::app_metadata::AppMetadataStore;
 
 use super::config::{AppAccessMode, AppManagerConfig};
 use super::models::*;
@@ -46,6 +47,9 @@ pub struct AppService {
     /// 同一 rcoder 进程内按 app 串行化 release 操作。PVC 文件锁继续负责跨进程互斥；
     /// 先等异步锁可避免同 app 的并发请求长期占用 Tokio blocking 线程等待 flock。
     pub(crate) release_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// 应用业务元数据（name/租户/业务创建时间;集群不持有）。PG 模式 query 的
+    /// name/created_at 过滤数据源；纯内存模式恒空（过滤忽略+warn）。
+    pub(crate) metadata: AppMetadataStore,
 }
 
 impl AppService {
@@ -101,6 +105,7 @@ impl AppService {
             path_resolver,
             pingora_ports: DashMap::new(),
             release_locks: DashMap::new(),
+            metadata: AppMetadataStore::default(),
         };
         // K8s Pingora 模式：启动时从集群重建 Pingora backends——修复 pingora_ports 内存态
         // 丢失导致的重启 silent 404（list_deployments 的 expose_type 已由 Deployment annotation
@@ -140,7 +145,9 @@ impl AppService {
     ) -> AppResult<PaginatedResponse<AppRuntimeInfo>> {
         let mut items = self.list_app_runtimes().await?;
 
-        // 过滤（仅 status/app_ids 为运行时字段，可生效；name/created_at 需业务元数据，跳过）
+        // 过滤：status/app_ids 为运行时字段直接生效；name/created_at 需业务元数据
+        // （集群不持有），仅 PG 模式（metadata 持久化已注入）经内存 join 生效，
+        // 纯内存模式维持忽略 + warn（旧行为）。
         if let Some(filters) = &request.filters {
             if let Some(status) = &filters.status {
                 items.retain(|app| status.contains(&app.status));
@@ -149,17 +156,65 @@ impl AppService {
                 items.retain(|app| app_ids.contains(&app.app_id));
             }
             if filters.name.is_some() || filters.created_at.is_some() {
-                warn!(
-                    "[APP] query_apps name/created_at filters require business metadata, rcoder is stateless, ignored"
-                );
+                if self.metadata.persistence().is_some() {
+                    let name = filters.name.as_deref();
+                    // DateRange RFC3339 解析失败 → 400（过滤已生效，非法参数应被告知）
+                    let range = match &filters.created_at {
+                        Some(range) => {
+                            let start = chrono::DateTime::parse_from_rfc3339(&range.start)
+                                .map_err(|e| {
+                                    AppOperationError::Validation(format!(
+                                        "invalid created_at.start '{}': {e}",
+                                        range.start
+                                    ))
+                                })?
+                                .with_timezone(&chrono::Utc);
+                            let end = chrono::DateTime::parse_from_rfc3339(&range.end)
+                                .map_err(|e| {
+                                    AppOperationError::Validation(format!(
+                                        "invalid created_at.end '{}': {e}",
+                                        range.end
+                                    ))
+                                })?
+                                .with_timezone(&chrono::Utc);
+                            Some((start, end))
+                        }
+                        None => None,
+                    };
+                    items.retain(|app| {
+                        let Some(meta) = self.metadata.lookup(&app.app_id) else {
+                            // 无元数据记录的 app（非 PG 时代创建）不满足 name/created_at 过滤
+                            return false;
+                        };
+                        name.is_none_or(|n| meta.name.as_deref() == Some(n))
+                            && range.is_none_or(|(start, end)| {
+                                meta.created_at >= start && meta.created_at <= end
+                            })
+                    });
+                } else {
+                    warn!(
+                        "[APP] query_apps name/created_at filters require business metadata (PG mode), ignored"
+                    );
+                }
             }
         }
 
-        // 排序（仅 app_id 可用；默认升序，Desc 时降序）
-        if let Some(sort_by) = &request.sort_by
-            && (sort_by == "app_id" || sort_by == "name")
-        {
-            items.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+        // 排序（app_id 直接可用；name 经 metadata join，缺元数据排最后；默认升序）
+        if let Some(sort_by) = &request.sort_by {
+            match sort_by.as_str() {
+                "app_id" => {
+                    items.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+                }
+                "name" => {
+                    items.sort_by_key(|app| {
+                        self.metadata
+                            .lookup(&app.app_id)
+                            .and_then(|m| m.name)
+                            .unwrap_or_default()
+                    });
+                }
+                _ => {}
+            }
             if request.sort_order == Some(SortOrder::Desc) {
                 items.reverse();
             }
@@ -246,6 +301,15 @@ impl AppService {
         self.register_pingora_backends(app_id, &http_ports, &info.container_ip)
             .await;
         info!("[APP] app updated: {}", app_id);
+        // 业务元数据 upsert（name/租户随 update 刷新;created_at SQL 侧不更新）
+        self.metadata
+            .record(
+                app_id,
+                request.name.clone(),
+                request.tenant_id.clone(),
+                request.space_id.clone(),
+            )
+            .await;
         self.get_app(app_id).await
     }
 
@@ -588,5 +652,91 @@ mod tests {
             "original error must not be masked by cleanup failure, got: {error}"
         );
         assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// query_apps 的 name/created_at 过滤:纯内存模式（无 metadata 持久化）维持忽略
+    /// （全量返回,旧行为）;注入持久化（PG 模式同构）后经内存 join 生效。
+    #[tokio::test]
+    async fn query_apps_name_filter_respects_metadata_mode() {
+        use crate::test_support::InMemoryMetadataPersistence;
+        use container_runtime_api::DeploymentStatus;
+        use shared_types::{AppMetadataPersistence as _, AppMetadataRecord};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        for app_id in ["app-alpha", "app-beta"] {
+            runtime.deployments.insert(
+                app_id.into(),
+                DeploymentStatus {
+                    app_id: app_id.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let service = test_service(root.path(), runtime.clone());
+
+        let by_name = |name: &str| QueryAppsRequest {
+            page: None,
+            page_size: None,
+            filters: Some(AppFilters {
+                status: None,
+                name: Some(name.into()),
+                app_ids: None,
+                created_at: None,
+            }),
+            sort_by: None,
+            sort_order: None,
+        };
+
+        // 纯内存模式:name 过滤忽略（warn）,全量返回
+        let response = service.query_apps(by_name("alpha")).await.expect("query");
+        assert_eq!(response.items.len(), 2, "memory mode ignores name filter");
+
+        // 注入持久化 + 元数据:过滤生效
+        let persistence = InMemoryMetadataPersistence::new(vec![
+            AppMetadataRecord {
+                app_id: "app-alpha".into(),
+                name: Some("alpha".into()),
+                tenant_id: None,
+                space_id: None,
+                created_at: chrono::Utc::now() - chrono::Duration::hours(2),
+            },
+            AppMetadataRecord {
+                app_id: "app-beta".into(),
+                name: Some("beta".into()),
+                tenant_id: None,
+                space_id: None,
+                created_at: chrono::Utc::now(),
+            },
+        ]);
+        service.set_metadata_persistence(persistence.clone());
+        service.apply_metadata_loaded(persistence.load_all().await.expect("load"));
+
+        let response = service.query_apps(by_name("alpha")).await.expect("query");
+        assert_eq!(response.items.len(), 1, "name filter now effective");
+        assert_eq!(response.items[0].app_id, "app-alpha");
+
+        // created_at range:只含 2 小时前创建的 alpha
+        let now = chrono::Utc::now();
+        let response = service
+            .query_apps(QueryAppsRequest {
+                page: None,
+                page_size: None,
+                filters: Some(AppFilters {
+                    status: None,
+                    name: None,
+                    app_ids: None,
+                    created_at: Some(DateRange {
+                        start: (now - chrono::Duration::hours(3)).to_rfc3339(),
+                        end: (now - chrono::Duration::hours(1)).to_rfc3339(),
+                    }),
+                }),
+                sort_by: None,
+                sort_order: None,
+            })
+            .await
+            .expect("query by range");
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].app_id, "app-alpha");
     }
 }

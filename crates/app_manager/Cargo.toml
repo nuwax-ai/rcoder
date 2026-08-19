@@ -25,6 +25,9 @@ workspace-manifest = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 
+# shared_types 持久化契约(AppMetadataPersistence 等)的签名使用 anyhow::Result
+anyhow = { workspace = true }
+
 # HTTP server
 axum = { workspace = true }
 reqwest = { workspace = true }

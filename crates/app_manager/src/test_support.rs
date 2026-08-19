@@ -25,6 +25,7 @@ use crate::service::AppService;
 /// WorkspaceRuntime 全走默认实现（resolve_workspace_path → Ok(None)，
 /// get_container_app_dir 因此落到 `workspace_root/{app_id}`，测试用 tempdir 承接）。
 /// `specs` 预置 app 的 live desired 快照（get_app_container_spec 回退测试用；缺省空快照）。
+/// `deployments` 预置 app 运行时状态（query_apps/list 过滤测试用；缺省空列表）。
 #[derive(Default)]
 pub(crate) struct MockRuntime {
     pub delete_calls: AtomicUsize,
@@ -32,6 +33,7 @@ pub(crate) struct MockRuntime {
     pub create_calls: AtomicUsize,
     pub create_fails: AtomicBool,
     pub specs: DashMap<String, ContainerSpecSnapshot>,
+    pub deployments: DashMap<String, DeploymentStatus>,
 }
 
 #[async_trait]
@@ -48,6 +50,14 @@ impl UserAppDeploymentRuntime for MockRuntime {
             .get(app_id)
             .map(|s| s.clone())
             .unwrap_or_default())
+    }
+
+    async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
+        Ok(self
+            .deployments
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect())
     }
 
     async fn get_deployment_status(
@@ -112,6 +122,7 @@ pub(crate) fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime>) -> 
         path_resolver,
         pingora_ports: DashMap::new(),
         release_locks: DashMap::new(),
+        metadata: crate::app_metadata::AppMetadataStore::default(),
     }
 }
 
@@ -156,4 +167,42 @@ upstream_includes = []
 
 [services.env]
 "#
+}
+
+/// 内存版 [`shared_types::AppMetadataPersistence`]（query 过滤测试注入用；
+/// rows 可从测试侧直接读写断言）。
+pub(crate) struct InMemoryMetadataPersistence {
+    pub rows: std::sync::Mutex<Vec<shared_types::AppMetadataRecord>>,
+}
+
+impl InMemoryMetadataPersistence {
+    pub fn new(rows: Vec<shared_types::AppMetadataRecord>) -> Arc<Self> {
+        Arc::new(Self {
+            rows: std::sync::Mutex::new(rows),
+        })
+    }
+}
+
+#[async_trait]
+impl shared_types::AppMetadataPersistence for InMemoryMetadataPersistence {
+    async fn upsert(&self, record: &shared_types::AppMetadataRecord) -> anyhow::Result<()> {
+        let mut rows = self.rows.lock().expect("rows lock");
+        match rows.iter_mut().find(|r| r.app_id == record.app_id) {
+            Some(existing) => *existing = record.clone(),
+            None => rows.push(record.clone()),
+        }
+        Ok(())
+    }
+
+    async fn load_all(&self) -> anyhow::Result<Vec<shared_types::AppMetadataRecord>> {
+        Ok(self.rows.lock().expect("rows lock").clone())
+    }
+
+    async fn delete(&self, app_id: &str) -> anyhow::Result<()> {
+        self.rows
+            .lock()
+            .expect("rows lock")
+            .retain(|r| r.app_id != app_id);
+        Ok(())
+    }
 }

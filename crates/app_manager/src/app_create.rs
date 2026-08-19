@@ -39,6 +39,15 @@ impl AppService {
         }
         // 同 ID 删除后重建时，必须清除旧的 stopped/wake-blocked 内存态。
         self.activity.mark_running(&app_id);
+        // 业务元数据落库/缓存（name/租户/业务创建时间;集群不持有。request 随后 move 进 assemble）
+        self.metadata
+            .record(
+                &app_id,
+                Some(request.name.clone()),
+                request.tenant_id.clone(),
+                request.space_id.clone(),
+            )
+            .await;
         Ok(self.assemble_app_info(app_id, request).await)
     }
 

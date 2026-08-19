@@ -11,6 +11,7 @@
 //! 写路径幂等（upsert / delete），供 writer 整批重放。
 
 pub(in crate::pg) mod activity_repo;
+pub(in crate::pg) mod metadata_repo;
 pub(in crate::pg) mod publish_repo;
 pub(in crate::pg) mod rows;
 pub(in crate::pg) mod store_repo;

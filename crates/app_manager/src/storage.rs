@@ -83,6 +83,8 @@ impl super::service::AppService {
             .destroy_app_pvc(app_id)
             .await
             .map_err(|e| map_runtime_error("destroy_app_pvc failed", e))?;
+        // PVC 不可逆销毁 → 业务元数据同步删行（delete/purge 保留,支持误删找回;destroy 与 PVC 同生命周期）
+        self.metadata.record_deleted(app_id).await;
         info!("[APP] app PVC destroyed: {}", app_id);
         Ok(())
     }

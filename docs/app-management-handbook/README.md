@@ -141,7 +141,7 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate→confirm 链路
 | **logs follow** | `follow=true` 流式 | 未实现（快照） | 实时流用 `/logs/stream`（SSE） |
 | **stats CPU/内存** | 返回资源使用 | 返回默认空值 | 仅 `restart_count` 可靠 |
 | **Exec 健康检查** | 支持 | 不支持 | 传 `Exec` 返回 400，用 `Http`/`Tcp` |
-| **query 的 name/created_at 过滤** | 支持 | 忽略 | Java 本地 DB 二次过滤 |
+| **query 的 name/created_at 过滤** | 支持 | K8s+PG 模式生效（rcoder 侧 `userapp_metadata` 表存业务元数据）；Docker Compose 模式忽略（Java 本地二次过滤） |
 | **storage/query 的 tenant_id/space_id** | 支持 | 忽略 | 用 `app_ids` / `orphan_only` |
 | **HTTP 访问地址** | 读路径稳定返回 | rcoder 重启后读路径 `external.http` 可能 `null` | 以 create 响应为准或自行缓存 |
 

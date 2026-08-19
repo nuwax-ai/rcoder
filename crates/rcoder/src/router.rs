@@ -135,16 +135,40 @@ impl AppState {
             })?);
 
         // 初始化应用管理服务（Docker / K8s 统一构造，运行时由 access_mode 决定行为）
-        let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
-            app_manager::service::AppService::new(
-                config.app_manager.clone(),
-                runtime.clone(),
-                activity.clone(),
-                pingora.clone(),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
-        );
+        let app_service_instance = app_manager::service::AppService::new(
+            config.app_manager.clone(),
+            runtime.clone(),
+            activity.clone(),
+            pingora.clone(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?;
+
+        // P3：PG 模式的应用业务元数据持久化（query name/created_at 过滤数据源）。
+        // 装配在 AppService 构造后（内存 cache 在其内部）；load 失败阻断启动——
+        // 过滤数据缺失会让 query 语义静默漂移，宁可 Fail Fast。
+        if projects.is_postgres() {
+            #[cfg(feature = "rcoder-pg")]
+            {
+                let ProjectStoreBackend::Postgres(store) = &*projects else {
+                    unreachable!("is_postgres 为真的分支");
+                };
+                let metadata_persistence: Arc<dyn shared_types::AppMetadataPersistence> =
+                    Arc::new(rcoder_storage::pg::metadata::PgAppMetadataPersistence::new(
+                        store.pool().clone(),
+                    ));
+                match metadata_persistence.load_all().await {
+                    Ok(rows) => {
+                        app_service_instance.set_metadata_persistence(metadata_persistence);
+                        app_service_instance.apply_metadata_loaded(rows);
+                    }
+                    Err(e) => {
+                        anyhow::bail!("[STORAGE_PG] userapp_metadata load failed: {e:#}");
+                    }
+                }
+            }
+        }
+        let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(app_service_instance);
 
         Ok(Self {
             config,

@@ -1,7 +1,8 @@
 # rcoder-pg 数据模型
 
-迁移文件：`crates/rcoder-storage/migrations/0001_init.sql`（sqlx::migrate! 启动执行，
-advisory lock 保护多副本并发；全字段 COMMENT ON，`psql \d+` 可见）。
+迁移文件：`crates/rcoder-storage/migrations/`（0001_init + 0002_userapp_metadata；
+sqlx::migrate! 启动执行，advisory lock 保护多副本并发；全字段 COMMENT ON，
+`psql \d+` 可见）。
 
 ## 内存结构 → PG 映射
 
@@ -14,9 +15,10 @@ advisory lock 保护多副本并发；全字段 COMMENT ON，`psql \d+` 可见�
 | ContainerEntry.ref_count | 派生：count(projects where container_name=X)，不落库 |
 | AppActivityRegistry.last_accessed/stopped/wake_blocked | `userapp_activity` 表 |
 | PublishTaskStore.map 的任务状态 | `publish_tasks` 表（进度事件流留内存） |
+| AppMetadataStore.cache（name/租户/业务创建时间） | `userapp_metadata` 表（仅存集群不持有的字段） |
 | waking/recycling/session_stream_registry/grpc_pool 等瞬态 | 不迁移 |
 
-## 表清单（5 张）
+## 表清单（6 张）
 
 - **containers**：PK container_name（无容器时 logical_id 占位，container_id 可空）；
   version 乐观锁列（Phase 2 用）。
@@ -30,6 +32,11 @@ advisory lock 保护多副本并发；全字段 COMMENT ON，`psql \d+` 可见�
   `UNIQUE(app_id) WHERE terminal_at IS NULL` = 同 app 单活跃任务**（跨进程/跨副本
   的 AppBusy 409；约束名 `idx_publish_one_active_per_app`——错误映射按约束名区分，
   主键冲突不得误判为 Busy）。
+- **userapp_metadata**：PK app_id；UserApp 业务元数据（name/tenant/space/业务创建
+  时间——**集群不持有的字段**，desired 运行字段以 K8s/Docker 为事实源不镜像）。
+  create/update 成功后 upsert（created_at ON CONFLICT 不更新）；delete/purge 保留行
+  （误删找回），storage/destroy 删行（与 PVC 同生命周期）。query_apps 的
+  name/created_at 过滤经内存镜像 join 生效（纯内存模式忽略+warn）。
 
 ## 写侧（write-behind）
 
