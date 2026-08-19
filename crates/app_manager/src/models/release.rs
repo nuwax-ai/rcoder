@@ -1,4 +1,4 @@
-//! 应用发布模型（prepare/activate/confirm/abort 请求与 release 记录）
+//! 应用发布模型（prepare/activate/rollback 请求与 release 记录）
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -28,29 +28,20 @@ pub struct PrepareReleaseRequest {
 #[derive(Debug, Clone, Deserialize, Default, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActivateReleaseRequest {
-    /// 等待新版本就绪的超时秒数（可选；超时按失败处理走回滚）
-    #[schema(example = 120)]
+    /// 等待新版本就绪的超时秒数（可选；默认 300，范围 5..=1800——Java 等慢启动应用可调大）。
+    /// 就绪=status Running 且 health 非 Unhealthy；超时/进入 Error → 置 Failed **保留现场**
+    /// （code/rollback 快照/制品包均不动，供排查；恢复用 rollback 接口）。
+    /// 注意：等待期间本请求同步阻塞，调用方 HTTP 读超时须 ≥ 此值 + 余量。
+    #[schema(example = 300)]
     pub readiness_timeout_seconds: Option<u64>,
 }
 
-/// 确认发布健康结果请求
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ConfirmReleaseRequest {
-    /// 健康结论：true=提交（转 Active）；false=回滚到上一 Active 并置 Failed
-    #[schema(example = true)]
-    pub healthy: bool,
-    /// 附加说明（可选；false 时作为 failure_message 记录）
-    #[schema(example = "健康检查通过")]
-    pub message: Option<String>,
-}
-
-/// 中止 pending 发布请求（运维自救）
+/// 回滚发布请求（恢复最近一次成功版本）
 #[derive(Debug, Clone, Deserialize, Default, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AbortReleaseRequest {
-    /// 中止原因（可选；记入 failure_message，缺省 "release aborted"）
-    #[schema(example = "confirm 回滚失败后手动中止")]
+pub struct RollbackReleaseRequest {
+    /// 回滚原因（可选；记入失败版 failure_message 供追溯）
+    #[schema(example = "排查后放弃 v1.2.0，回退")]
     pub message: Option<String>,
 }
 
@@ -60,11 +51,12 @@ pub struct AbortReleaseRequest {
 pub enum ReleaseStatus {
     /// 已下载校验入库，未激活
     Prepared,
-    /// 激活中，等待 confirm 健康确认
+    /// 兼容读旧 index 的遗留值（confirm 两段式时代的"待确认"态）；读时归一化为 Failed，
+    /// 新代码不再产生。
     PendingStart,
     /// 当前生效版本
     Active,
-    /// 失败或已中止
+    /// 激活失败（现场保留：code=失败版、.rollback=上一版、制品包保留）
     Failed,
 }
 
@@ -79,7 +71,7 @@ pub struct ReleaseInfo {
     pub sha256: String,
     /// 制品字节数
     pub size_bytes: u64,
-    /// 发布状态（Prepared/PendingStart/Active/Failed）
+    /// 发布状态（Prepared/Active/Failed）
     pub status: ReleaseStatus,
     /// 入库时间（RFC3339）
     #[schema(example = "2026-08-14T10:30:00+08:00")]
@@ -95,10 +87,28 @@ pub struct ReleaseInfo {
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseIndex {
     pub active_release_id: Option<String>,
+    /// 兼容字段：confirm 两段式时代的"待确认 release"；新代码恒写 None（读旧 index
+    /// 经 [`ReleaseIndex::normalize_legacy_pending`] 归一化）。
     pub pending_release_id: Option<String>,
     pub previous_release_id: Option<String>,
     pub retention: u16,
     pub releases: Vec<ReleaseInfo>,
+}
+
+impl ReleaseIndex {
+    /// 旧 index 兼容：PendingStart 行归一化为 Failed（confirm 语义已内化进 activate，
+    /// 升级前卡在待确认的发布按"失败保留现场"处理，rollback 接口可恢复其 `.rollback` 快照）。
+    /// 纯内存变换，不写文件（下次写 index 自然持久化归一化结果）。
+    pub fn normalize_legacy_pending(&mut self) {
+        for release in &mut self.releases {
+            if release.status == ReleaseStatus::PendingStart {
+                release.status = ReleaseStatus::Failed;
+                release.failure_message =
+                    Some("legacy PendingStart normalized to Failed (confirm flow removed)".into());
+            }
+        }
+        self.pending_release_id = None;
+    }
 }
 
 /// release 列表响应（读 releases/index.json）
@@ -107,8 +117,8 @@ pub struct ReleaseIndex {
 pub struct ReleaseListResponse {
     /// 当前生效 release ID（无则 null）
     pub active_release_id: Option<String>,
-    /// 待确认（pending）release ID（无则 null）
-    pub pending_release_id: Option<String>,
+    /// 最近一次激活失败的 release ID（无则 null；恢复走 rollback 接口或重新 activate）
+    pub last_failed_release_id: Option<String>,
     /// 当前保留份数策略
     pub retention: u16,
     /// 保留策略内的 release 列表（新→旧）

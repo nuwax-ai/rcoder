@@ -62,10 +62,24 @@ impl UserAppDeploymentRuntime for MockRuntime {
 
     async fn get_deployment_status(
         &self,
-        _app_id: &str,
+        app_id: &str,
     ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
-        // 一律“不存在”：start/stop 路径得到 NotFound（confirm/stop 均容忍）
-        Ok(None)
+        // 优先查预置 deployments（activate/rollback 测试）；未预置 → None
+        // （start/stop 路径得到 NotFound，相关清理路径容忍）
+        Ok(self
+            .deployments
+            .get(app_id)
+            .map(|entry| entry.value().clone()))
+    }
+
+    async fn scale_deployment(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
+        if let Some(mut entry) = self.deployments.get_mut(app_id) {
+            let status = entry.value_mut();
+            status.replicas = replicas;
+            status.ready_replicas = replicas.max(0);
+            status.phase = if replicas == 0 { "Stopped" } else { "Running" }.into();
+        }
+        Ok(())
     }
 
     async fn delete_deployment(&self, _app_id: &str) -> ContainerRuntimeResult<()> {

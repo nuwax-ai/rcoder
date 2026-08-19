@@ -96,23 +96,21 @@ pub trait AppServiceTrait: Send + Sync {
         request: PrepareReleaseRequest,
     ) -> AppResult<ReleaseInfo>;
 
-    async fn activate_release(&self, app_id: &str, release_id: &str) -> AppResult<ReleaseInfo>;
-
-    async fn confirm_release(
+    /// 激活发布（单接口：切流 → ensure 运行容器 → 等就绪 → 提交/失败）。
+    /// 就绪失败返回 `Ok(ReleaseInfo{status:Failed})` 且**保留现场**（不自动回滚）。
+    /// `readiness_timeout` None=默认 300s（handler 层校验 5..=1800）。
+    async fn activate_release(
         &self,
         app_id: &str,
         release_id: &str,
-        healthy: bool,
-        message: Option<String>,
+        readiness_timeout: Option<u64>,
     ) -> AppResult<ReleaseInfo>;
 
-    /// 中止 pending 发布（index-only compare-and-clear）。
-    /// confirm(false) 自身失败导致 pending 卡死时的运维自救手段：仅当 pending 恰指该 release
-    /// 时置 Failed + 清 pending，不做任何文件/运行时操作。
-    async fn abort_release(
+    /// 回滚到最近一次成功版本（`.rollback` 快照恢复，秒级）。无快照时幂等返回当前
+    /// Active；首次发布失败（无旧版本）→ 409。
+    async fn rollback_release(
         &self,
         app_id: &str,
-        release_id: &str,
         message: Option<String>,
     ) -> AppResult<ReleaseInfo>;
 

@@ -489,28 +489,22 @@ impl super::AppServiceTrait for AppService {
         self.prepare_release(app_id, request).await
     }
 
-    async fn activate_release(&self, app_id: &str, release_id: &str) -> AppResult<ReleaseInfo> {
-        self.activate_release(app_id, release_id).await
-    }
-
-    async fn confirm_release(
+    async fn activate_release(
         &self,
         app_id: &str,
         release_id: &str,
-        healthy: bool,
-        message: Option<String>,
+        readiness_timeout: Option<u64>,
     ) -> AppResult<ReleaseInfo> {
-        self.confirm_release(app_id, release_id, healthy, message)
+        self.activate_release(app_id, release_id, readiness_timeout)
             .await
     }
 
-    async fn abort_release(
+    async fn rollback_release(
         &self,
         app_id: &str,
-        release_id: &str,
         message: Option<String>,
     ) -> AppResult<ReleaseInfo> {
-        self.abort_release(app_id, release_id, message).await
+        self.rollback_release(app_id, message).await
     }
 
     async fn list_releases(&self, app_id: &str) -> AppResult<ReleaseListResponse> {

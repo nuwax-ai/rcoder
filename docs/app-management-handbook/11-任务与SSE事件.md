@@ -110,7 +110,7 @@ data: {"taskId":"...","kind":"build","status":"running",...}
 | event | 说明 | data 关键字段 |
 |---|---|---|
 | `task_created` | 任务创建 | taskId, kind |
-| `stage` | 阶段变更 | stage: rcoder 侧 `EnsureBuilder`/`Build`/`Prepare`/`Activate`/`EnsureApp`/`WaitReady`/`Confirm`；agent-runner 侧 `downloading`/`compiling`/`packaging` |
+| `stage` | 阶段变更 | stage: rcoder 侧 `EnsureBuilder`/`Build`/`Prepare`/`Activate`；agent-runner 侧 `downloading`/`compiling`/`packaging` |
 | `build_progress` | 构建进度 chunk | data: {content: "..."} |
 | `task_completed` | 终态（成功） | releaseId |
 | `task_failed` | 终态（失败） | error |

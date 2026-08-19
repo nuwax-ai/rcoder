@@ -13,7 +13,7 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
 2. **HTTP 只用 GET + POST**（部署网关限制）。写操作把动词放进路径：`/delete`、`/update`、`/files/delete`、`/storage/delete`。
 3. **创建是异步的**——`POST /apps` 建完资源立即返回 `Starting`，不等 Ready；你轮询 `GET /apps/{id}` 观察 `Starting → Running`。
 4. **删除默认保留数据**——`delete` 只删计算面，保留 code/data/logs；要连数据清传 `purge:true`。
-5. **发布有四阶段**——build（构建）→ prepare（预备入库）→ activate（切流激活）→ confirm（健康确认/自动回滚）。见 [10-发布与版本管理](./10-发布与版本管理.md)。
+5. **发布有三阶段**——build（构建）→ prepare（预备入库）→ activate（切流+ensure 容器+等就绪，单接口收敛到 Active/Failed，失败**保留现场**）。失败后恢复用 rollback。见 [10-发布与版本管理](./10-发布与版本管理.md)。
 6. **判断错误看 `code` 字段**，别只看 HTTP 状态码。详见 [03-错误处理与重试](./03-错误处理与重试.md)。
 
 ---
@@ -31,7 +31,7 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
 | [07-前端项目部署](./07-前端项目部署.md) | 部署前端时读 | React/Vue + Vite 模板部署实测 |
 | [08-带数据库的应用部署](./08-带数据库的应用部署.md) | 需要数据库时读 | app-runtime 镜像内置 PG + pgweb + ttyd |
 | **[09-操作与运维接口](./09-操作与运维接口.md)** | **新增** | 启停/重启/回收策略/URL上传/存储销毁/数据库管理 |
-| **[10-发布与版本管理](./10-发布与版本管理.md)** | **新增** | 发布四阶段（build→prepare→activate→confirm）+ 版本回滚 + 状态机 |
+| **[10-发布与版本管理](./10-发布与版本管理.md)** | **新增** | 发布三阶段（build→prepare→activate）+ 失败保留现场 + rollback + 状态机 |
 | **[11-任务与SSE事件](./11-任务与SSE事件.md)** | **新增** | 构建发布任务查询 + SSE 实时进度事件格式 + 断线重连 |
 
 > **建议顺序**：01 → 02（快速浏览）→ 05（跑一遍场景）→ 06（发布流程）→ 遇到错误查 03 → 发布细节查 10/11。
@@ -57,7 +57,7 @@ http://<rcoder-host>:<port>/api/docs/openapi.json
 ```
 Day 1：读 01（概念）→ 用 Swagger UI 试调 POST /apps + GET /apps/{id}
 Day 2：读 05（场景）→ 跑通部署→访问链路
-Day 3：读 10（发布）→ 跑通 build→prepare→activate→confirm 链路
+Day 3：读 10（发布）→ 跑通 build→prepare→activate 链路
 ```
 
 ### 3. 常用地址
@@ -72,12 +72,12 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate→confirm 链路
 ### 4. 必须理解的 3 个语义
 
 1. **异步创建**：POST /apps 返回 Starting，你轮询 GET /apps/{id} 等到 Running。
-2. **发布确认**：activate 后必须 confirm——healthy=true 提交，healthy=false 自动回滚。不 confirm 的 release 会阻塞后续发布（用 abort 解锁）。
+2. **发布单接口收敛**：activate 同步"切流+等就绪"——status=Active 即成功；status=Failed（200 返回）即就绪失败且**现场保留**（code/快照/制品包不动，供排查），放弃新版调 rollback 一键恢复。注意等待期同步阻塞，HTTP 读超时要 ≥ readinessTimeoutSeconds。
 3. **错误看 code**：HTTP 状态码只分大类，具体原因看 response body 的 `code` + `message` 字段。
 
 ---
 
-## 接口总览（38 个）
+## 接口总览（37 个）
 
 ```
 生命周期   POST   /api/v1/apps                                创建（异步）
@@ -113,9 +113,8 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate→confirm 链路
            POST   /api/v1/apps/{app_id}/db/create-database    新建 PG 库
 
 版本发布   POST   /api/v1/apps/{app_id}/releases/prepare               预备发布
-           POST   /api/v1/apps/{app_id}/releases/{release_id}/activate        激活（切流）
-           POST   /api/v1/apps/{app_id}/releases/{release_id}/confirm         确认健康结果
-           POST   /api/v1/apps/{app_id}/releases/{release_id}/abort           中止 pending
+           POST   /api/v1/apps/{app_id}/releases/{release_id}/activate        激活（切流+等就绪）
+           POST   /api/v1/apps/{app_id}/releases/rollback             回滚最近成功版
            GET    /api/v1/apps/{app_id}/releases                        列出版本
            POST   /api/v1/apps/{app_id}/releases/{release_id}/delete          删除记录
 
@@ -158,4 +157,4 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate→confirm 链路
 
 ## 一句话总结
 
-> RCoder 是应用 Pod 引擎：**你持有 desired，RCoder 现场观测 observed；你发命令、它执行；你查状态、它读集群。** 发布体系则是：**build 出制品 → prepare 入库 → activate 切流 → confirm 定生死。**
+> RCoder 是应用 Pod 引擎：**你持有 desired，RCoder 现场观测 observed；你发命令、它执行；你查状态、它读集群。** 发布体系则是：**build 出制品 → prepare 入库 → activate 切流+等就绪定生死；失败留现场，rollback 显式恢复。**

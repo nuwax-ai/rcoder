@@ -34,16 +34,12 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             post(handlers::prepare_release),
         )
         .route(
+            "/api/v1/apps/{app_id}/releases/rollback",
+            post(handlers::rollback_release),
+        )
+        .route(
             "/api/v1/apps/{app_id}/releases/{release_id}/activate",
             post(handlers::activate_release),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases/{release_id}/confirm",
-            post(handlers::confirm_release),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases/{release_id}/abort",
-            post(handlers::abort_release),
         )
         .route(
             "/api/v1/apps/{app_id}/releases",

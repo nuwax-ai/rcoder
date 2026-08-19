@@ -208,22 +208,6 @@ async fn validate_staging(path: &Path, release_id: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub(crate) async fn code_release_id(code: &Path) -> AppResult<Option<String>> {
-    let path = code.join("release.lock.toml");
-    let content = match tokio::fs::read_to_string(&path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(map_io_error("read active release lock", error, false)),
-    };
-    let value: toml::Value = toml::from_str(&content).map_err(|error| {
-        AppOperationError::Backend(format!("parse active release lock: {error}"))
-    })?;
-    Ok(value
-        .get("release_id")
-        .and_then(toml::Value::as_str)
-        .map(str::to_owned))
-}
-
 pub(crate) fn plan_retention(index: &mut ReleaseIndex) -> Vec<String> {
     let active = index.active_release_id.as_deref();
     let mut ordered: Vec<_> = index

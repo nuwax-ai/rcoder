@@ -7,17 +7,18 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 
 use app_manager::models::PrepareReleaseRequest;
 
 use crate::router::AppState;
 
 use super::agent_runner::{BuildOutcome, ensure_agent_addr, wait_build};
-use super::app_lifecycle::{ensure_app, rcoder_app_id, wait_app_ready};
+use super::app_lifecycle::rcoder_app_id;
 use super::client;
 use super::task::PublishTask;
 use super::types::PublishEvent;
+use app_manager::models::ReleaseStatus;
 
 /// 独立 build 入口(spawn 调):触发 agent-runner build + 透传进度,终态 emit。
 pub async fn run_build(
@@ -161,8 +162,6 @@ async fn run_publish_inner(
         .to_string();
 
     let rcoder_app_id = rcoder_app_id(app_id);
-    let image = std::env::var("RCODER_RUNTIME_IMAGE_DIGEST")
-        .context("RCODER_RUNTIME_IMAGE_DIGEST env not set (app-runtime image for create_app)")?;
 
     // 2. prepare(包 url 指向 agent-runner file-server,app_manager 据此下载校验)。
     //    prepare 自带 ensure_app_workspace_ready + ensure_release_dirs,无需先 create_app。
@@ -187,106 +186,31 @@ async fn run_publish_inner(
         .await
         .map_err(|e| anyhow!("prepare_release: {e}"))?;
 
-    // 3. activate(切 code 目录 + 重启 app-runtime 容器;新 app 无容器则只解压 code)。
+    // 3. activate(单接口:切流 + ensure 容器 + 等就绪 → Active/Failed)。
+    //    就绪失败保留现场(不自动回滚),此处如实转任务 Failed——恢复由调用方显式
+    //    rollback 或重新发布,现场留给用户排查。
     fail_if_cancelled(task)?;
     task.emit(PublishEvent::Stage {
         stage: "Activate".to_string(),
     })
     .await;
-    state
+    match state
         .app_service
-        .activate_release(&rcoder_app_id, &release_id)
+        .activate_release(&rcoder_app_id, &release_id, None)
         .await
-        .map_err(|e| anyhow!("activate_release: {e}"))?;
-
-    // activate 之后的所有退出路径都必须收敛到 confirm。否则 readiness/取消失败
-    // 会永久留下 pending_release_id，阻塞后续发布。
-    let post_activate = async {
-        // 4. ensure_app:create app 运行时容器(image=app-runtime,端口 9080,health ready 端点)。
-        fail_if_cancelled(task)?;
-        task.emit(PublishEvent::Stage {
-            stage: "EnsureApp".to_string(),
-        })
-        .await;
-        ensure_app(state, &rcoder_app_id, app_id, &image).await?;
-
-        // 5. 轮询就绪:status=Running 且 health 非 Unhealthy。
-        fail_if_cancelled(task)?;
-        task.emit(PublishEvent::Stage {
-            stage: "WaitReady".to_string(),
-        })
-        .await;
-        wait_app_ready(state, &rcoder_app_id, task).await?;
-
-        // 6. confirm healthy → Active。
-        fail_if_cancelled(task)?;
-        task.emit(PublishEvent::Stage {
-            stage: "Confirm".to_string(),
-        })
-        .await;
-        state
-            .app_service
-            .confirm_release(
-                &rcoder_app_id,
-                &release_id,
-                true,
-                Some("publish auto-confirm".to_string()),
-            )
-            .await
-            .map_err(|e| anyhow!("confirm_release: {e}"))
-    }
-    .await;
-
-    if let Err(error) = post_activate {
-        let message = error.to_string();
-        let cancelled = task.is_cancelled();
-        match state
-            .app_service
-            .confirm_release(&rcoder_app_id, &release_id, false, Some(message.clone()))
-            .await
-        {
-            Ok(_) => {
-                // 回滚成功:取消 → 终态 Cancelled(在此 emit,顶层见 Ok 跳过);
-                // 非取消失败 → 交顶层 finalize_terminal emit Failed("已回滚")。
-                if cancelled {
-                    task.emit(PublishEvent::Cancelled).await;
-                    return Ok(());
-                }
-                return Err(anyhow!(
-                    "publish failed after activation and was rolled back: {message}"
-                ));
-            }
-            Err(rollback_error) => {
-                // 回滚失败是真实故障:必须以 Failed 暴露,绝不能被顶层 !is_terminal 吞掉(#6)。
-                let combined = format!(
-                    "publish failed after activation: {message}; rollback also failed: {rollback_error}"
-                );
-                // confirm(false) 自身失败时的兜底清 pending:abort_release 是 index-only CAS,
-                // 不做文件/运行时操作,即便 confirm 失败也能成功,防止 pending_release_id
-                // 永久残留导致 activate 守卫卡死后续所有发布。best-effort:失败仅记日志。
-                if let Err(abort_error) = state
-                    .app_service
-                    .abort_release(&rcoder_app_id, &release_id, Some(combined.clone()))
-                    .await
-                {
-                    tracing::error!(
-                        task_id = %task.id,
-                        app_id = %app_id,
-                        error = %abort_error,
-                        "best-effort abort_release failed; pending_release_id may remain stuck"
-                    );
-                }
-                tracing::error!(
-                    task_id = %task.id,
-                    app_id = %app_id,
-                    project_id = %project_id,
-                    error = %combined,
-                    "UserApp publish rollback failed"
-                );
-                task.emit(PublishEvent::Failed { error: combined }).await;
-                return Ok(()); // 已自 emit 终态,顶层见 Ok 跳过
-            }
+    {
+        Ok(release) if release.status == ReleaseStatus::Active => {}
+        Ok(release) => {
+            // Ok(Failed)=就绪失败(现场保留);failure_message 透传给任务
+            task.emit(PublishEvent::Failed {
+                error: release
+                    .failure_message
+                    .unwrap_or_else(|| "activation failed".to_string()),
+            })
+            .await;
+            return Ok(()); // 已自 emit 终态,顶层见 Ok 跳过
         }
+        Err(e) => return Err(anyhow!("activate_release: {e}")),
     }
 
     task.emit(PublishEvent::Completed {

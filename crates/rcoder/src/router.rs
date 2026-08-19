@@ -713,8 +713,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::set_recycle_policy,
         app_manager::handlers::prepare_release,
         app_manager::handlers::activate_release,
-        app_manager::handlers::confirm_release,
-        app_manager::handlers::abort_release,
+        app_manager::handlers::rollback_release,
         app_manager::handlers::list_releases,
         app_manager::handlers::delete_release,
         app_manager::handlers::query_app_log_sources,
@@ -966,6 +965,7 @@ mod openapi_tests {
         let paths = document.paths.paths;
         for path in [
             "/api/v1/apps/{app_id}/releases/prepare",
+            "/api/v1/apps/{app_id}/releases/rollback",
             "/api/v1/apps/{app_id}/logs/query",
             "/api/v1/apps/{app_id}/logs/stream",
             "/api/v1/apps/{app_id}/publish",
@@ -1029,9 +1029,9 @@ mod openapi_tests {
                 checked += 1;
             }
         }
-        // 覆盖数下限：app_manager 32 + userapp_publish 6 端点。
+        // 覆盖数下限：app_manager 31(删 confirm/abort 增 rollback) + userapp_publish 6 端点。
         assert!(
-            checked >= 38,
+            checked >= 37,
             "UserApp OpenAPI 端点覆盖数异常偏少: {checked}"
         );
     }

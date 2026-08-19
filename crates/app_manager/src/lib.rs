@@ -21,6 +21,7 @@ pub mod error;
 pub mod files;
 pub mod handlers;
 pub mod models;
+pub(crate) mod release_runtime;
 pub mod release_store;
 pub mod releases;
 pub mod routes;
