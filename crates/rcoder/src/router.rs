@@ -710,7 +710,6 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::create_database,
         app_manager::handlers::stream_app_logs_v1,
         app_manager::handlers::upload_from_url,
-        crate::userapp_publish::handler::ensure_builder,
         crate::userapp_publish::handler::publish,
         crate::userapp_publish::handler::build,
         crate::userapp_publish::handler::get_task,
@@ -1001,9 +1000,9 @@ mod openapi_tests {
                 checked += 1;
             }
         }
-        // 覆盖数下限：app_manager 32 + userapp_publish 6 端点。
+        // 覆盖数下限：app_manager 32 + userapp_publish 5 端点。
         assert!(
-            checked >= 38,
+            checked >= 37,
             "UserApp OpenAPI 端点覆盖数异常偏少: {checked}"
         );
     }

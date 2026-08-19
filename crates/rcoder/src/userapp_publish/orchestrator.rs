@@ -13,7 +13,7 @@ use app_manager::models::PrepareReleaseRequest;
 
 use crate::router::AppState;
 
-use super::agent_runner::{BuildOutcome, resolve_agent_addr, wait_build};
+use super::agent_runner::{BuildOutcome, ensure_agent_addr, wait_build};
 use super::app_lifecycle::{ensure_app, rcoder_app_id, wait_app_ready};
 use super::client;
 use super::task::PublishTask;
@@ -82,7 +82,12 @@ async fn run_build_inner(
     project_id: &str,
     app_id: &str,
 ) -> Result<()> {
-    let addr = resolve_agent_addr(state, project_id)?;
+    // ensure builder:未注册时自动创建(K8s 拉镜像可能数十秒,先亮阶段让前端可见)。
+    task.emit(PublishEvent::Stage {
+        stage: "EnsureBuilder".to_string(),
+    })
+    .await;
+    let addr = ensure_agent_addr(state, project_id).await?;
     task.emit(PublishEvent::Stage {
         stage: "Build".to_string(),
     })
@@ -110,7 +115,13 @@ async fn run_publish_inner(
     project_id: &str,
     app_id: &str,
 ) -> Result<()> {
-    let addr = resolve_agent_addr(state, project_id)?;
+    // 0. ensure builder:未注册时自动创建(K8s 拉镜像可能数十秒,先亮阶段让前端可见)。
+    fail_if_cancelled(task)?;
+    task.emit(PublishEvent::Stage {
+        stage: "EnsureBuilder".to_string(),
+    })
+    .await;
+    let addr = ensure_agent_addr(state, project_id).await?;
 
     // 1. build(透传 agent-runner 进度;拿 release_id)。
     fail_if_cancelled(task)?;

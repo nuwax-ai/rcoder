@@ -2,6 +2,8 @@
 //!
 //! - `POST /api/v1/apps/{app_id}/publish` —— 一键 build + 发布(body 带 agent-runner `projectId`)。
 //! - `POST /api/v1/apps/{app_id}/build`   —— 仅触发 agent-runner build + 透传进度。
+//!   两者都会自动 ensure UserAppBuilder(未注册时创建,orchestrator EnsureBuilder 阶段),
+//!   调用方一次调用即可,无需先建 builder。
 //! - `GET  /publish/tasks/{taskId}`        —— 任务快照(轮询)。
 //! - `GET  /publish/tasks/{taskId}/stream` —— 进度 SSE(回放 + 实时)。
 //! - `POST /publish/tasks/{taskId}/cancel` —— 取消(透传到 agent-runner cancel + kill 进程组)。
@@ -15,13 +17,11 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use container_runtime_api::ContainerCreateParams;
 use serde::Deserialize;
+use shared_types::HttpResult;
 use shared_types::error_codes::{
     ERR_INTERNAL_SERVER_ERROR, ERR_NOT_FOUND, ERR_TOO_MANY_REQUESTS, ERR_VALIDATION,
 };
-use shared_types::{HttpResult, ProjectAndContainerInfo, ServiceType};
-use tracing::info;
 
 use crate::AppError;
 use crate::router::AppState;
@@ -35,7 +35,6 @@ use super::{CancelAttempt, PublishEvent, PublishTaskKind, PublishTaskSnapshot, P
 pub fn routes() -> axum::Router<Arc<AppState>> {
     use axum::routing::{get, post};
     axum::Router::new()
-        .route("/api/v1/apps/{app_id}/ensure-builder", post(ensure_builder))
         .route("/api/v1/apps/{app_id}/publish", post(publish))
         .route("/api/v1/apps/{app_id}/build", post(build))
         .route("/api/v1/apps/publish/tasks/{task_id}", get(get_task))
@@ -70,15 +69,6 @@ pub struct StreamQuery {
 pub struct PublishTaskData {
     pub task_id: String,
     pub status: String,
-}
-
-/// ensure-builder 返回。
-#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct EnsureBuilderData {
-    pub app_id: String,
-    pub container_name: String,
-    pub container_ip: String,
 }
 
 /// get_task 返回(任务快照)。
@@ -142,6 +132,10 @@ fn validate_publish_identifiers(app_id: &str, project_id: &str) -> Result<(), Ap
 }
 
 /// `POST /api/v1/apps/{app_id}/publish` —— 一键自动构建发布。
+///
+/// UserAppBuilder 自动 ensure:未注册(含 rcoder 重启后注册丢失)时创建并注册,
+/// 调用方无需先建 builder;ensure 过程经 SSE `stage=EnsureBuilder` 可见,失败以任务
+/// `failed` 终态呈现。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/publish",
@@ -150,7 +144,6 @@ fn validate_publish_identifiers(app_id: &str, project_id: &str) -> Result<(), Ap
     responses(
         (status = 200, body = HttpResult<PublishTaskData>, description = "Publish task created"),
         (status = 400, description = "Invalid app_id / project_id"),
-        (status = 404, description = "Agent-runner not found for project"),
         (status = 409, description = "App already has an active publish/build task"),
         (status = 429, description = "Publish task capacity exhausted"),
         (status = 500, description = "Internal server error")
@@ -184,6 +177,9 @@ pub async fn publish(
 }
 
 /// `POST /api/v1/apps/{app_id}/build` —— 仅触发 agent-runner build(透传进度,不发布)。
+///
+/// UserAppBuilder 自动 ensure(同 publish):未注册时创建并注册,调用方无需先建 builder;
+/// ensure 过程经 SSE `stage=EnsureBuilder` 可见,失败以任务 `failed` 终态呈现。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/build",
@@ -192,7 +188,6 @@ pub async fn publish(
     responses(
         (status = 200, body = HttpResult<PublishTaskData>, description = "Build task created"),
         (status = 400, description = "Invalid app_id / project_id"),
-        (status = 404, description = "Agent-runner not found for project"),
         (status = 409, description = "App already has an active publish/build task"),
         (status = 429, description = "Publish task capacity exhausted"),
         (status = 500, description = "Internal server error")
@@ -224,79 +219,6 @@ pub async fn build(
         status: "pending".into(),
     })))
 }
-
-/// `POST /api/v1/apps/{app_id}/ensure-builder` —— 确保 UserAppBuilder pod 存在(幂等)。
-///
-/// 按 app_id 创建/复用 UserAppBuilder agent-runner pod(走 STS + per-app PVC
-/// `rcoder-app-{app_id}-workspace`,复用 `dev-rcoder-agent-runner` 镜像),并注册到
-/// `state.projects` 供 publish 流程的 `resolve_agent_addr` 据 app_id 定位。
-///
-/// 直接调 `runtime.create_container`(UserAppBuilder → `create_agent_container`),
-/// **不走 ComputerContainerManager**(避免 ComputerAgentRunner 专属的 lazy_migrate)。
-#[utoipa::path(
-    post,
-    path = "/api/v1/apps/{app_id}/ensure-builder",
-    params(("app_id" = String, Path)),
-    responses(
-        (status = 200, body = HttpResult<EnsureBuilderData>, description = "UserAppBuilder ensured"),
-        (status = 400, description = "Invalid app_id"),
-        (status = 500, description = "Internal server error")
-    ),
-    tag = "UserApp 发布"
-)]
-pub async fn ensure_builder(
-    State(state): State<Arc<AppState>>,
-    Path(app_id): Path<String>,
-) -> Result<Json<HttpResult<EnsureBuilderData>>, AppError> {
-    crate::handler::utils::validate_identifier(&app_id, "app_id")
-        .map_err(|error| validation(error.to_string()))?;
-    // UserAppBuilder identifier = project_id(app_id 兼任);host_workspace_path K8s 模式不用。
-    let params = ContainerCreateParams::builder()
-        .project_id(app_id.clone())
-        .user_id(app_id.clone())
-        .host_workspace_path("")
-        .service_type(ServiceType::UserAppBuilder)
-        .storage_size(DEFAULT_BUILDER_STORAGE_SIZE)
-        .build();
-
-    let container_info = state
-        .runtime()
-        .create_container(params)
-        .await
-        .map_err(|e| err(format!("ensure UserAppBuilder failed: {e}")))?;
-
-    // 注册到 state.projects(publish 的 resolve_agent_addr 据 app_id 查 container_name/ip)。
-    let project_info = if let Some(existing) = state.get_project(&app_id) {
-        let mut info = (*existing).clone();
-        info.set_container(Some(container_info.clone()));
-        info
-    } else {
-        let mut info = ProjectAndContainerInfo::new(app_id.clone());
-        info.set_service_type(Some(ServiceType::UserAppBuilder));
-        info.set_container(Some(container_info.clone()));
-        info
-    };
-    state
-        .insert_project(app_id.clone(), Arc::new(project_info))
-        .map_err(|e| {
-            tracing::error!(error = %e, "[USERAPP_PUBLISH] register builder to projects failed");
-            err(format!("register builder failed: {e}"))
-        })?;
-
-    info!(
-        "[USERAPP_PUBLISH] UserAppBuilder ensured: app_id={}, container={}, ip={}",
-        app_id, container_info.container_name, container_info.container_ip
-    );
-
-    Ok(Json(HttpResult::success(EnsureBuilderData {
-        app_id,
-        container_name: container_info.container_name,
-        container_ip: container_info.container_ip,
-    })))
-}
-
-/// UserAppBuilder per-app PVC 默认大小(后续可提到 config.yml 的 user-app-builder.service 段)。
-const DEFAULT_BUILDER_STORAGE_SIZE: &str = "10Gi";
 
 /// `GET /api/v1/apps/publish/tasks/{task_id}` —— 任务状态快照。
 #[utoipa::path(

@@ -75,12 +75,14 @@ data: {"taskId":"...","kind":"build","status":"running",...}
 | event | 说明 | data 关键字段 |
 |---|---|---|
 | `task_created` | 任务创建 | taskId, kind |
-| `stage` | 阶段变更 | stage: "downloading"/"compiling"/"packaging" |
+| `stage` | 阶段变更 | stage: rcoder 侧 `EnsureBuilder`/`Build`/`Prepare`/`Activate`/`EnsureApp`/`WaitReady`/`Confirm`；agent-runner 侧 `downloading`/`compiling`/`packaging` |
 | `build_progress` | 构建进度 chunk | data: {content: "..."} |
 | `task_completed` | 终态（成功） | releaseId |
 | `task_failed` | 终态（失败） | error |
 | `task_cancelled` | 终态（取消） | — |
 | `stream_lagged` | 消费者太慢被断开 | — （客户端应用 from_seq 重连） |
+
+> **Builder 自动创建**：`build`/`publish` 触发时若 UserAppBuilder 容器不存在（含 rcoder 重启后注册丢失），任务会先经 `stage=EnsureBuilder` 自动创建并注册（K8s 拉镜像可能数十秒），再进入 `stage=Build`。创建失败以任务 `failed` 终态呈现。
 
 **消费端去重**：按 `id`（seq）去重——`seq <= 已收最大值` 的事件丢弃。
 
@@ -109,24 +111,6 @@ curl -N "$RCODER/api/v1/apps/publish/tasks/$TASK_ID/stream?from_seq=$LAST_SEQ"
 ```
 
 > 取消是**请求**而非同步完成：远端 build 取消/回滚由 orchestrator 异步收敛。
-
----
-
-### POST `/apps/{app_id}/ensure-builder` — 确保 Builder 容器存在
-
-手动触发创建 UserApp Builder 容器（通常 build/publish 自动调用，一般无需手动）。
-
-**响应** `HttpResult<EnsureBuilderData>`：
-```jsonc
-{
-  "success": true,
-  "data": {
-    "app_id": "app-order-svc",
-    "container_name": "rcoder-app-app-order-svc-builder",
-    "container_ip": "10.42.0.123"
-  }
-}
-```
 
 ---
 
