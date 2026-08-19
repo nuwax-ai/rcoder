@@ -560,6 +560,70 @@ async fn publish_list_filters_and_pagination() {
     }
 }
 
+/// userapp_metadata:upsert 刷新 name/tenant/space 但**不刷新 created_at**
+/// （业务首次创建时间不可变）；load_all/delete roundtrip。
+#[tokio::test]
+async fn app_metadata_upsert_keeps_created_at_and_roundtrip() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&dsn)
+        .await
+        .expect("test pool");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrate");
+    let repo = crate::pg::metadata::PgAppMetadataPersistence::new(pool);
+    use shared_types::AppMetadataPersistence as _;
+    let app_id = format!("meta-{}", uuid_suffix());
+    let created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+
+    // 首次 upsert（create 语义）
+    repo.upsert(&shared_types::AppMetadataRecord {
+        app_id: app_id.clone(),
+        name: Some("v1".into()),
+        tenant_id: Some("tenant-1".into()),
+        space_id: None,
+        created_at,
+    })
+    .await
+    .expect("upsert v1");
+    // 二次 upsert（update 语义:name/space 刷新,created_at 传 now 但不得生效）
+    repo.upsert(&shared_types::AppMetadataRecord {
+        app_id: app_id.clone(),
+        name: Some("v2".into()),
+        tenant_id: None,
+        space_id: Some("space-2".into()),
+        created_at: chrono::Utc::now(),
+    })
+    .await
+    .expect("upsert v2");
+
+    let rows = repo.load_all().await.expect("load");
+    let row = rows
+        .iter()
+        .find(|r| r.app_id == app_id)
+        .expect("row loaded");
+    assert_eq!(row.name.as_deref(), Some("v2"), "name refreshed by upsert");
+    assert_eq!(row.space_id.as_deref(), Some("space-2"));
+    assert!(
+        row.tenant_id.is_none(),
+        "update 未携带的租户被置空（整段替换语义）"
+    );
+    assert_eq!(
+        row.created_at, created_at,
+        "created_at must NOT be refreshed by upsert"
+    );
+
+    repo.delete(&app_id).await.expect("delete");
+    let rows = repo.load_all().await.expect("reload");
+    assert!(rows.iter().all(|r| r.app_id != app_id));
+}
+
 /// P2-M1：跨副本可见性——副本 A 写入落库后，副本 B 经 sync_once 看到数据；
 /// A 删除后 B 同步移除。双 PgStore 连同一 PG 模拟双副本。
 #[tokio::test]
