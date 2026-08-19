@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore};
-use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
 
 use crate::config::PostgresConfig;
