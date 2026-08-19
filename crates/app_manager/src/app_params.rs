@@ -12,7 +12,7 @@ use container_runtime_api::{
 use shared_types::ServiceType;
 
 use super::models::*;
-use super::runtime_identity::inject_release_identity;
+use super::runtime_identity::{inject_release_identity, strip_release_identity};
 use super::service::AppService;
 use super::utils::*;
 
@@ -94,7 +94,12 @@ impl AppService {
             match self.runtime.get_app_container_spec(app_id).await {
                 Ok(spec) => (
                     request.command.clone().or(spec.command),
-                    request.env.clone().or(spec.env),
+                    // 读回的 env 必含 create 时注入的保留变量，先剥离再走 inject
+                    //（inject 从当前发布锁重新注入权威值；用户显式提交保留变量仍拒绝）。
+                    request.env.clone().or(spec.env.map(|mut env| {
+                        strip_release_identity(&mut env);
+                        env
+                    })),
                     request.secrets.clone().or(spec.secrets),
                     request
                         .resources
@@ -365,7 +370,17 @@ mod tests {
                     "-jar".into(),
                     "/app/code/app.jar".into(),
                 ]),
-                env: Some(HashMap::from([("SPRING_PROFILES".into(), "prod".into())])),
+                // 模拟真实后端读回：create 时注入的保留变量随 env 存进集群（ConfigMap/
+                // 容器 Config），live 快照必含——不剥离会让 update 部分 update 必 400。
+                env: Some(HashMap::from([
+                    ("SPRING_PROFILES".into(), "prod".into()),
+                    ("RCODER_PINGAP_VERSION".into(), "stale-from-cluster".into()),
+                    ("RCODER_PINGAP_COMMIT".into(), "stale-commit".into()),
+                    (
+                        "RCODER_RUNTIME_IMAGE_DIGEST".into(),
+                        "registry.example/app-runtime:OLD".into(),
+                    ),
+                ])),
                 secrets: Some(HashMap::from([("DB_PASSWORD".into(), "s3cr3t".into())])),
                 resources: Some(AppResourceRequirements {
                     cpu: Some("1".into()),
@@ -401,6 +416,22 @@ mod tests {
                 "-jar".to_string(),
                 "/app/code/app.jar".to_string()
             ])
+        );
+        // 业务 env 从 live 回退保留；保留变量被剥离后由 inject 从 release.lock.toml
+        // 重新注入权威值（而非集群里的旧值）。
+        let env = params.env.expect("env always set by builder");
+        assert_eq!(env.get("SPRING_PROFILES").map(String::as_str), Some("prod"));
+        assert_eq!(
+            env.get("RCODER_PINGAP_VERSION").map(String::as_str),
+            Some("0.13.7")
+        );
+        assert_eq!(
+            env.get("RCODER_PINGAP_COMMIT").map(String::as_str),
+            Some("abc123")
+        );
+        assert_eq!(
+            env.get("RCODER_RUNTIME_IMAGE_DIGEST").map(String::as_str),
+            Some("registry.example/app-runtime:0.1.140")
         );
         let secrets = params.secrets.expect("secrets fallback");
         assert_eq!(
@@ -462,6 +493,28 @@ mod tests {
             !secrets.contains_key("OLD"),
             "explicit secrets replace live snapshot"
         );
+    }
+
+    /// 用户显式提交保留变量仍拒绝（防伪造语义不受回退剥离影响）。
+    #[tokio::test]
+    async fn update_explicit_reserved_env_still_rejected() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let service = service_with_release_lock(root.path(), "app-reserved").await;
+        let mut request = empty_update_request("img:v2");
+        request.env = Some(HashMap::from([(
+            "RCODER_PINGAP_VERSION".to_owned(),
+            "user-value".to_owned(),
+        )]));
+
+        let error = service
+            .build_container_params_from_update(
+                "app-reserved",
+                &request,
+                &DeploymentStatus::default(),
+            )
+            .await
+            .expect_err("explicit reserved env must fail");
+        assert!(error.to_string().contains("reserved"), "{error}");
     }
 
     /// live 快照缺字段（如 Docker 的 secrets/health_check 恒 None）→ 维持旧行为（空）。

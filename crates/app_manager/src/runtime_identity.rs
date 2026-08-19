@@ -9,6 +9,17 @@ const RUNTIME_IDENTITY_KEYS: [&str; 3] = [
     "RCODER_RUNTIME_IMAGE_DIGEST",
 ];
 
+/// 从 live 集群读回的 env 中剥离系统保留变量（update 部分更新回退路径专用）。
+///
+/// 集群里的 env 携带 create 时注入的身份变量，原样进入 [`inject_release_identity`]
+/// 会被误判为"用户提交了保留变量"而 400；剥离后由 inject 从当前发布锁重新注入权威值
+/// （用户显式提交保留变量仍被拒绝，防伪造语义不变）。
+pub(crate) fn strip_release_identity(env: &mut HashMap<String, String>) {
+    for key in RUNTIME_IDENTITY_KEYS {
+        env.remove(key);
+    }
+}
+
 /// Load the immutable build identity from the active release lock and inject it
 /// into the UserApp container. Callers may not provide these reserved values.
 pub(crate) async fn inject_release_identity(
@@ -122,6 +133,19 @@ upstream_includes = []
             env.get("RCODER_PINGAP_COMMIT").map(String::as_str),
             Some("abc123")
         );
+    }
+
+    #[test]
+    fn strip_removes_only_reserved_keys() {
+        let mut env = HashMap::from([
+            ("SPRING_PROFILES".to_owned(), "prod".to_owned()),
+            ("RCODER_PINGAP_VERSION".to_owned(), "stale".to_owned()),
+            ("RCODER_PINGAP_COMMIT".to_owned(), "stale".to_owned()),
+            ("RCODER_RUNTIME_IMAGE_DIGEST".to_owned(), "stale".to_owned()),
+        ]);
+        strip_release_identity(&mut env);
+        assert_eq!(env.len(), 1, "business env kept, reserved stripped");
+        assert_eq!(env.get("SPRING_PROFILES").map(String::as_str), Some("prod"));
     }
 
     #[tokio::test]
