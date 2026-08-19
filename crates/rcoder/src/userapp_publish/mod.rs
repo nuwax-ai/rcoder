@@ -13,7 +13,7 @@
 
 pub mod agent_runner;
 pub mod app_lifecycle;
-pub mod client;
+mod client; // 仅 userapp_publish 内部消费(handler 不直接触达)
 pub mod handler;
 pub mod orchestrator;
 pub mod store;

@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use shared_types::BuildProgressEvent;
 use tokio::sync::mpsc;
@@ -20,6 +22,56 @@ const REQUEST_TIMEOUT_SECS: u64 = 120;
 const SSE_CHANNEL_CAP: usize = 128;
 /// SSE 单帧缓冲上限:超过仍找不到帧分隔符视为异常(防无分隔符的恶意/异常流撑爆内存)。
 const MAX_SSE_BUFFER: usize = 1024 * 1024;
+
+/// file-server UserApp 接口的 HttpResult 包装(消费侧镜像,泛型 data)。
+///
+/// file-server 侧统一返回 `{success, code, message, data}`(UserAppReply 层);
+/// rcoder 消费同一契约,经 [`parse_http_result`] 反序列化 + success 校验,
+/// 字段名(camelCase)只在 serde 声明处出现一次——不再 Value 手抠散落多处。
+#[derive(Debug, Deserialize)]
+struct FsReply<T> {
+    // success/code/message 的错误路径已在 parse_http_result 里经 Value 提取
+    // (extract_fs_error);此处仅反序列化关心的 data。Option 缺省即 None(泛型
+    // struct 上 #[serde(default)] 会强加 T: Default bound,故不标)。
+    data: Option<T>,
+}
+
+/// build 触发响应的 data(`{taskId}`)。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildStarted {
+    task_id: String,
+}
+
+/// build 任务快照的 data(`{status, releaseId, sha256, sizeBytes, fileName, error}`)。
+/// 消费方:orchestrator(产物摘要三字段)、agent_runner(断流恢复终态判定)。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BuildSnapshot {
+    pub status: String,
+    pub release_id: Option<String>,
+    pub error: Option<String>,
+    pub sha256: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub file_name: Option<String>,
+}
+
+/// 解析 HttpResult 包装响应:success=false/非 2xx → 错误(message 优先);
+/// data 缺失 → 错误(成功响应必有 data)。
+fn parse_http_result<T: DeserializeOwned>(
+    body: &Value,
+    status: reqwest::StatusCode,
+    where_: &str,
+) -> Result<T> {
+    if !status.is_success() || body.get("success").and_then(|s| s.as_bool()) == Some(false) {
+        return Err(extract_fs_error(body, status, where_));
+    }
+    let reply: FsReply<T> = serde_json::from_value(body.clone())
+        .with_context(|| format!("agent-runner {where_} response shape mismatch"))?;
+    reply
+        .data
+        .ok_or_else(|| anyhow!("agent-runner {where_} response missing data field: {body}"))
+}
 
 /// SSE 后台任务产生的流级错误(经 channel 透传给 orchestrator,不再静默 log-then-close)。
 #[derive(thiserror::Error, Debug)]
@@ -83,7 +135,7 @@ fn fs_error_from_bytes(bytes: &[u8], status: reqwest::StatusCode, where_: &str) 
     anyhow!("agent-runner {where_} -> HTTP {status}: {msg}")
 }
 
-/// 触发 agent-runner workspace build,返 taskId。
+/// 触发 agent-runner workspace build,返 taskId(类型化:HttpResult data.taskId)。
 pub async fn trigger_build(addr: &str, app_id: &str) -> Result<String> {
     let url = format!("{addr}/api/userapp/build");
     let resp = HTTP_CLIENT
@@ -95,19 +147,8 @@ pub async fn trigger_build(addr: &str, app_id: &str) -> Result<String> {
         .with_context(|| format!("agent-runner build request: {url}"))?;
     let status = resp.status();
     let body: Value = resp.json().await.context("parse build response")?;
-    if !status.is_success() || body.get("success").and_then(|s| s.as_bool()) == Some(false) {
-        return Err(extract_fs_error(&body, status, "build"));
-    }
-    // file-server UserApp 接口统一 HttpResult 包装:taskId 嵌在 data 内。
-    extract_build_task_id(&body)
-}
-
-/// 从 build 响应(HttpResult 包装)提取 data.taskId。
-fn extract_build_task_id(body: &Value) -> Result<String> {
-    body.pointer("/data/taskId")
-        .and_then(|t| t.as_str())
-        .map(String::from)
-        .ok_or_else(|| anyhow!("build response missing taskId: {body}"))
+    let started: BuildStarted = parse_http_result(&body, status, "build")?;
+    Ok(started.task_id)
 }
 
 /// 取消 agent-runner build 任务(软取消 + kill 进程组)。
@@ -130,8 +171,8 @@ pub async fn cancel_build(addr: &str, task_id: &str) -> Result<()> {
     Err(fs_error_from_bytes(bytes, status, "cancel"))
 }
 
-/// 取 build 任务快照(HttpResult data:`{status,releaseId,sha256,...}`)。
-pub async fn get_build_snapshot(addr: &str, task_id: &str) -> Result<Value> {
+/// 取 build 任务快照(类型化:HttpResult data → [`BuildSnapshot`])。
+pub async fn get_build_snapshot(addr: &str, task_id: &str) -> Result<BuildSnapshot> {
     let url = format!("{addr}/api/userapp/tasks/{task_id}");
     let resp = HTTP_CLIENT
         .get(&url)
@@ -141,10 +182,7 @@ pub async fn get_build_snapshot(addr: &str, task_id: &str) -> Result<Value> {
         .with_context(|| format!("agent-runner get task: {url}"))?;
     let status = resp.status();
     let body: Value = resp.json().await.context("parse task snapshot")?;
-    if !status.is_success() || body.get("success").and_then(|s| s.as_bool()) == Some(false) {
-        return Err(extract_fs_error(&body, status, "get task"));
-    }
-    extract_task_snapshot(&body)
+    parse_http_result(&body, status, "get task")
 }
 
 /// 订阅 agent-runner build 进度 SSE → `mpsc::Receiver<Result<BuildProgressEvent, BuildStreamError>>`。
@@ -274,14 +312,6 @@ fn find_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-fn extract_task_snapshot(body: &Value) -> Result<Value> {
-    // HttpResult 包装:快照对象直接是 data 字段(status/releaseId/sha256/...)。
-    body.get("data")
-        .filter(|data| data.is_object())
-        .cloned()
-        .ok_or_else(|| anyhow!("agent-runner get task response missing object field 'data'"))
-}
-
 /// 整体包下载 URL(rcoder prepare_release 的 url 字段;app_manager 据此从 agent-runner 拉包)。
 pub fn package_url(addr: &str, app_id: &str, file_name: &str) -> String {
     format!("{addr}/api/userapp/static/{app_id}/{file_name}")
@@ -303,45 +333,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_snapshot_requires_data_object() {
-        let task = extract_task_snapshot(&json!({
-            "success": true,
-            "data": {"sha256": "abc"}
-        }))
-        .expect("valid task snapshot");
-        assert_eq!(task["sha256"], "abc");
-
-        for invalid in [
-            json!({"success": true}),
-            json!({"success": true, "data": null}),
-            json!({"success": true, "data": "invalid"}),
-            // 旧错误契约(顶层 task)不再被接受:HttpResult 包装下必须走 data
-            json!({"success": true, "task": {"sha256": "abc"}}),
-        ] {
-            let error = extract_task_snapshot(&invalid).expect_err("data object is required");
-            assert!(error.to_string().contains("missing object field 'data'"));
-        }
+    fn snapshot_parsed_from_httpresult_data() {
+        let snap: BuildSnapshot = parse_http_result(
+            &json!({
+                "code": "0000", "message": "Operation successful",
+                "data": {"status": "completed", "releaseId": "rel-1", "sha256": "abc"},
+                "success": true
+            }),
+            reqwest::StatusCode::OK,
+            "get task",
+        )
+        .expect("valid snapshot");
+        assert_eq!(snap.status, "completed");
+        assert_eq!(snap.release_id.as_deref(), Some("rel-1"));
+        assert_eq!(snap.sha256.as_deref(), Some("abc"));
+        assert!(snap.size_bytes.is_none()); // 缺省字段 → None 而非反序列化失败
     }
 
     #[test]
     fn build_task_id_extracted_from_httpresult_data() {
-        let id = extract_build_task_id(&json!({
-            "code": "0000", "message": "Operation successful",
-            "data": {"taskId": "01a01a28", "status": "pending"},
-            "success": true
-        }))
+        let started: BuildStarted = parse_http_result(
+            &json!({
+                "code": "0000", "message": "Operation successful",
+                "data": {"taskId": "01a01a28", "status": "pending"},
+                "success": true
+            }),
+            reqwest::StatusCode::OK,
+            "build",
+        )
         .expect("valid build response");
-        assert_eq!(id, "01a01a28");
+        assert_eq!(started.task_id, "01a01a28");
+    }
 
-        // 旧错误契约(顶层 taskId)不再被接受
+    #[test]
+    fn httpresult_rejects_missing_data_and_error_shape() {
+        // 成功但缺 data → 错误(成功响应必有 data)
         for invalid in [
-            json!({"success": true, "taskId": "01a01a28"}),
-            json!({"success": true, "data": {"status": "pending"}}),
+            json!({"success": true}),
             json!({"success": true, "data": null}),
         ] {
-            let error = extract_build_task_id(&invalid).expect_err("data.taskId is required");
-            assert!(error.to_string().contains("missing taskId"));
+            let error = parse_http_result::<BuildStarted>(&invalid, reqwest::StatusCode::OK, "x")
+                .expect_err("data is required");
+            assert!(error.to_string().contains("missing data"), "{error}");
         }
+        // success=false → 走错误提取(message 透传)
+        let error = parse_http_result::<BuildStarted>(
+            &json!({"success": false, "message": "boom"}),
+            reqwest::StatusCode::OK,
+            "build",
+        )
+        .expect_err("failure reply");
+        assert!(error.to_string().contains("boom"), "{error}");
+        // 旧错误契约(顶层 taskId/task)不再被接受:HttpResult 包装下必须走 data
+        let error = parse_http_result::<BuildStarted>(
+            &json!({"success": true, "taskId": "01a01a28"}),
+            reqwest::StatusCode::OK,
+            "build",
+        )
+        .expect_err("top-level shape rejected");
+        assert!(error.to_string().contains("missing data"), "{error}");
     }
 
     #[test]

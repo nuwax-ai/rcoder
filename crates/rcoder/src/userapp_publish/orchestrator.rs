@@ -144,22 +144,20 @@ async fn run_publish_inner(
             return Ok(());
         }
     };
-    // build 产物摘要(sha/size/file_name)从 agent-runner task 快照取(file-server build 完成写入)。
+    // build 产物摘要(sha/size/file_name)从 agent-runner task 快照取(类型化,file-server
+    // build 完成写入;HttpResult data 已在 client 层解析)。
     let snap = client::get_build_snapshot(&addr, &build_task_id).await?;
     let sha256 = snap
-        .get("sha256")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("build snapshot missing sha256"))?
-        .to_string();
+        .sha256
+        .clone()
+        .ok_or_else(|| anyhow!("build snapshot missing sha256"))?;
     let size_bytes = snap
-        .get("sizeBytes")
-        .and_then(|v| v.as_u64())
+        .size_bytes
         .ok_or_else(|| anyhow!("build snapshot missing sizeBytes"))?;
     let file_name = snap
-        .get("fileName")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("build snapshot missing fileName"))?
-        .to_string();
+        .file_name
+        .clone()
+        .ok_or_else(|| anyhow!("build snapshot missing fileName"))?;
 
     let rcoder_app_id = rcoder_app_id(app_id);
 

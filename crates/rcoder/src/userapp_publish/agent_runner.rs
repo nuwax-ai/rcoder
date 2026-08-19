@@ -194,21 +194,18 @@ async fn recover_outcome_from_snapshot(addr: &str, build_task_id: &str) -> Resul
     let snap = client::get_build_snapshot(addr, build_task_id)
         .await
         .context("snapshot recovery after build stream ended")?;
-    let status = snap.get("status").and_then(|s| s.as_str()).unwrap_or("");
-    match status {
+    match snap.status.as_str() {
         "completed" => {
             let release_id = snap
-                .get("releaseId")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
+                .release_id
+                .clone()
                 .ok_or_else(|| anyhow!("snapshot completed but missing releaseId"))?;
             Ok(BuildOutcome::Completed { release_id })
         }
         "failed" => Ok(BuildOutcome::Failed(
-            snap.get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("build failed")
-                .to_owned(),
+            snap.error
+                .clone()
+                .unwrap_or_else(|| "build failed".to_string()),
         )),
         "cancelled" => Ok(BuildOutcome::Cancelled),
         other => Err(anyhow!(
