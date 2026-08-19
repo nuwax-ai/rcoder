@@ -43,6 +43,25 @@ pub enum PublishRepoError {
     Backend(String),
 }
 
+/// 任务列表查询过滤（全部可选；None/false = 不过滤，过滤条件下推 SQL）
+#[derive(Debug, Clone, Default)]
+pub struct PublishTaskQuery {
+    /// 按 app_id 集合过滤（None=全部）
+    pub app_ids: Option<Vec<String>>,
+    /// 按 kind 过滤（"build"/"publish"；None=全部）
+    pub kind: Option<String>,
+    /// 只返回未终态任务（terminal_at IS NULL）
+    pub active_only: bool,
+}
+
+/// 任务列表查询结果（分页页 + 总数；结构体而非元组，调用方可读解构）
+#[derive(Debug, Clone)]
+pub struct PublishTaskListResult {
+    pub items: Vec<PublishTaskRecord>,
+    /// 满足过滤条件的总行数（分页前）
+    pub total: u64,
+}
+
 /// PublishTask 持久化契约（PG 实现；内存模式 None）
 #[async_trait::async_trait]
 pub trait PublishTaskPersistence: Send + Sync {
@@ -52,6 +71,15 @@ pub trait PublishTaskPersistence: Send + Sync {
 
     /// 查询单行（get 的 PG 回退路径）
     async fn get(&self, task_id: &str) -> Result<Option<PublishTaskRecord>, PublishRepoError>;
+
+    /// 分页列出任务（`created_at DESC, task_id DESC`；覆盖多副本/重启/内存驱逐，24h TTL 窗口）。
+    /// page 从 1 起，page_size 由调用方校验范围。
+    async fn list(
+        &self,
+        query: &PublishTaskQuery,
+        page: u32,
+        page_size: u32,
+    ) -> Result<PublishTaskListResult, PublishRepoError>;
 
     /// 终态落库（state/terminal_at/error/release_id）
     async fn update_terminal(

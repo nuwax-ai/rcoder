@@ -3,12 +3,32 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgExecutor;
 
-use crate::publish_repo::PublishTaskRecord;
+use crate::publish_repo::{PublishTaskQuery, PublishTaskRecord};
 
 /// 唯一索引冲突的 PG SQLSTATE
 pub(crate) const UNIQUE_VIOLATION: &str = "23505";
 /// "同 app 单活跃任务"部分唯一索引名（错误映射按约束名区分，主键冲突不得误判 Busy）
 pub(crate) const ONE_ACTIVE_PER_APP_CONSTRAINT: &str = "idx_publish_one_active_per_app";
+
+/// list 的可选过滤 WHERE 片段（$1=app_ids text[]、$2=kind、$3=active_only；
+/// 参数为 NULL/false 时对应条件恒真，SQL 固定无需动态拼接）。
+/// sqlx 的 SQL 参数要求 'static，故用宏拼进下方两个常量（同参数同 WHERE，改动须同步）。
+macro_rules! list_filter_where {
+    () => {
+        "WHERE ($1::text[] IS NULL OR app_id = ANY($1)) \
+         AND ($2::text IS NULL OR kind = $2) \
+         AND ($3::bool = false OR terminal_at IS NULL)"
+    };
+}
+
+const LIST_COUNT_SQL: &str = concat!("SELECT count(*) FROM publish_tasks ", list_filter_where!());
+
+const LIST_PAGE_SQL: &str = concat!(
+    "SELECT task_id, app_id, project_id, kind, state, stage, release_id, error, \
+     progress, owner_pod, created_at, terminal_at FROM publish_tasks ",
+    list_filter_where!(),
+    " ORDER BY created_at DESC, task_id DESC LIMIT $4 OFFSET $5"
+);
 
 /// 创建任务行
 pub(crate) async fn create<'e>(
@@ -95,6 +115,88 @@ pub(crate) async fn get<'e>(
             terminal_at,
         },
     ))
+}
+
+/// 统计满足过滤条件的总行数（list 的 count 半边；与 list_page 同参数同 WHERE）
+pub(crate) async fn count<'e>(
+    db: impl PgExecutor<'e>,
+    query: &PublishTaskQuery,
+) -> Result<u64, sqlx::Error> {
+    let total: i64 = sqlx::query_scalar(LIST_COUNT_SQL)
+        .bind(query.app_ids.as_deref())
+        .bind(query.kind.as_deref())
+        .bind(query.active_only)
+        .fetch_one(db)
+        .await?;
+    Ok(total.max(0) as u64)
+}
+
+/// 分页列出任务（created_at DESC, task_id DESC；page 从 1 起，调用方校验范围）
+pub(crate) async fn list_page<'e>(
+    db: impl PgExecutor<'e>,
+    query: &PublishTaskQuery,
+    page: u32,
+    page_size: u32,
+) -> Result<Vec<PublishTaskRecord>, sqlx::Error> {
+    // sqlx 不支持 u64 绑定（PG 无无符号整型），LIMIT/OFFSET 统一 i64
+    let limit = page_size as i64;
+    let offset = (page.max(1) as i64 - 1) * limit;
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<String>,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+        ),
+    >(LIST_PAGE_SQL)
+    .bind(query.app_ids.as_deref())
+    .bind(query.kind.as_deref())
+    .bind(query.active_only)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                task_id,
+                app_id,
+                project_id,
+                kind,
+                state,
+                stage,
+                release_id,
+                error,
+                progress,
+                owner_pod,
+                created_at,
+                terminal_at,
+            )| PublishTaskRecord {
+                task_id,
+                app_id,
+                project_id,
+                kind,
+                state,
+                stage,
+                release_id,
+                error,
+                progress,
+                owner_pod,
+                created_at,
+                terminal_at,
+            },
+        )
+        .collect())
 }
 
 /// 终态落库（state/terminal_at/error/release_id）

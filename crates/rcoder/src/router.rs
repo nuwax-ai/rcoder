@@ -712,6 +712,7 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         app_manager::handlers::upload_from_url,
         crate::userapp_publish::handler::publish,
         crate::userapp_publish::handler::build,
+        crate::userapp_publish::handler::query_tasks,
         crate::userapp_publish::handler::get_task,
         crate::userapp_publish::handler::stream_task,
         crate::userapp_publish::handler::cancel_task,
@@ -841,9 +842,12 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
             container_runtime_api::AppPortStatus,
             container_runtime_api::AppEventInfo,
             crate::userapp_publish::handler::PublishBody,
+            crate::userapp_publish::handler::QueryPublishTasksRequest,
+            crate::userapp_publish::handler::PublishTaskFilters,
             crate::userapp_publish::PublishTaskKind,
             crate::userapp_publish::PublishTaskStatus,
             crate::userapp_publish::PublishTaskSnapshot,
+            app_manager::models::PaginatedResponse<crate::userapp_publish::PublishTaskSnapshot>,
         )
     ),
     tags(
@@ -942,6 +946,7 @@ mod openapi_tests {
             "/api/v1/apps/{app_id}/logs/stream",
             "/api/v1/apps/{app_id}/publish",
             "/api/v1/apps/{app_id}/build",
+            "/api/v1/apps/publish/tasks/query",
             "/api/v1/apps/publish/tasks/{task_id}/stream",
         ] {
             assert!(paths.contains_key(path), "OpenAPI path missing: {path}");
@@ -1000,9 +1005,9 @@ mod openapi_tests {
                 checked += 1;
             }
         }
-        // 覆盖数下限：app_manager 32 + userapp_publish 5 端点。
+        // 覆盖数下限：app_manager 32 + userapp_publish 6 端点。
         assert!(
-            checked >= 37,
+            checked >= 38,
             "UserApp OpenAPI 端点覆盖数异常偏少: {checked}"
         );
     }

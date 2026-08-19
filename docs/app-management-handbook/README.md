@@ -77,7 +77,7 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate→confirm 链路
 
 ---
 
-## 接口总览（37 个）
+## 接口总览（38 个）
 
 ```
 生命周期   POST   /api/v1/apps                                创建（异步）
@@ -121,6 +121,7 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate→confirm 链路
 
 构建发布   POST   /api/v1/apps/{app_id}/build                        触发源码构建（自动建 Builder）
            POST   /api/v1/apps/{app_id}/publish                      完整发布（一步）
+           POST   /api/v1/apps/publish/tasks/query                   任务列表分页查询
            GET    /api/v1/apps/publish/tasks/{task_id}               任务状态快照
            GET    /api/v1/apps/publish/tasks/{task_id}/stream        SSE 实时进度
            POST   /api/v1/apps/publish/tasks/{task_id}/cancel        取消任务

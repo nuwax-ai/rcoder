@@ -19,6 +19,11 @@ use crate::pg::{PgStore, sync};
 
 const DSN_ENV: &str = "RCODER_PG_TEST_DSN";
 
+/// publish_tasks 域测试互斥锁:roundtrip 的 recover_running/purge_expired 是
+/// 全库 UPDATE/DELETE,并行会打掉其他测试的活任务行。域内测试串行(跨域无影响)。
+/// tokio Mutex(非 std):guard 需跨测试内 await 持有。
+static PUBLISH_DOMAIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 测试库连接（未设 DSN → None → 用例跳过）
 async fn test_dsn() -> Option<String> {
     std::env::var(DSN_ENV).ok().filter(|s| !s.is_empty())
@@ -319,6 +324,7 @@ async fn publish_persistence_roundtrip_and_constraints() {
         eprintln!("[skip] {DSN_ENV} not set");
         return;
     };
+    let _domain_guard = PUBLISH_DOMAIN_LOCK.lock().await;
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&dsn)
@@ -399,6 +405,159 @@ async fn publish_persistence_roundtrip_and_constraints() {
     let purged = repo.purge_expired(24 * 3600).await.expect("purge");
     assert!(purged >= 1, "expired terminal row must be purged");
     assert!(repo.get(&task_a).await.expect("get").is_none());
+}
+
+/// list:app_ids/kind/active_only 过滤、created_at DESC 排序、分页与 total。
+/// 过滤一律带 app_ids 限定,防同库其他测试行污染断言。
+#[tokio::test]
+async fn publish_list_filters_and_pagination() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let _domain_guard = PUBLISH_DOMAIN_LOCK.lock().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&dsn)
+        .await
+        .expect("test pool");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrate");
+    let repo = crate::pg::publish::PgPublishTaskPersistence::new(pool);
+    use crate::publish_repo::PublishTaskPersistence as _;
+    let suffix = uuid_suffix();
+    let (app1, app2) = (format!("listapp1-{suffix}"), format!("listapp2-{suffix}"));
+    let now = chrono::Utc::now();
+
+    let record = |task_id: &str, app_id: &str, kind: &str, created_at| {
+        crate::publish_repo::PublishTaskRecord {
+            task_id: task_id.into(),
+            app_id: app_id.to_string(),
+            project_id: app_id.to_string(),
+            kind: kind.into(),
+            state: "running".into(),
+            stage: None,
+            release_id: None,
+            error: None,
+            progress: None,
+            owner_pod: None,
+            created_at,
+            terminal_at: None,
+        }
+    };
+    // t1 终态(app1/build,最旧)、t2 活(app1/publish)、t3 活(app2/build,最新)。
+    let t1 = format!("t1-{suffix}");
+    let t2 = format!("t2-{suffix}");
+    let t3 = format!("t3-{suffix}");
+    repo.create(&record(
+        &t1,
+        &app1,
+        "build",
+        now - chrono::Duration::hours(3),
+    ))
+    .await
+    .expect("create t1");
+    // U2 同 app 单活跃任务:t2(app1)须等 t1 终态后才可创建。
+    repo.update_terminal(
+        &t1,
+        "completed",
+        now - chrono::Duration::hours(2),
+        None,
+        None,
+    )
+    .await
+    .expect("terminal t1");
+    repo.create(&record(
+        &t2,
+        &app1,
+        "publish",
+        now - chrono::Duration::hours(2),
+    ))
+    .await
+    .expect("create t2");
+    repo.create(&record(
+        &t3,
+        &app2,
+        "build",
+        now - chrono::Duration::hours(1),
+    ))
+    .await
+    .expect("create t3");
+
+    let scoped = crate::publish_repo::PublishTaskQuery {
+        app_ids: Some(vec![app1.clone(), app2.clone()]),
+        kind: None,
+        active_only: false,
+    };
+
+    // 全量:created_at DESC → t3, t2, t1。
+    let result = repo.list(&scoped, 1, 10).await.expect("list all");
+    assert_eq!(result.total, 3);
+    let ids: Vec<&str> = result.items.iter().map(|r| r.task_id.as_str()).collect();
+    assert_eq!(ids, vec![t3.as_str(), t2.as_str(), t1.as_str()]);
+
+    // active_only:只剩 t2, t3。
+    let result = repo
+        .list(
+            &crate::publish_repo::PublishTaskQuery {
+                active_only: true,
+                ..scoped.clone()
+            },
+            1,
+            10,
+        )
+        .await
+        .expect("list active");
+    assert_eq!(result.total, 2);
+    assert!(result.items.iter().all(|r| r.terminal_at.is_none()));
+
+    // kind=publish:仅 t2。
+    let result = repo
+        .list(
+            &crate::publish_repo::PublishTaskQuery {
+                kind: Some("publish".into()),
+                ..scoped.clone()
+            },
+            1,
+            10,
+        )
+        .await
+        .expect("list by kind");
+    assert_eq!(result.total, 1);
+    assert_eq!(result.items[0].task_id, t2);
+
+    // app_ids=[app1]:t2, t1。
+    let result = repo
+        .list(
+            &crate::publish_repo::PublishTaskQuery {
+                app_ids: Some(vec![app1.clone()]),
+                ..scoped.clone()
+            },
+            1,
+            10,
+        )
+        .await
+        .expect("list by app");
+    assert_eq!(result.total, 2);
+
+    // 分页:page=1 size=2 → [t3, t2];page=2 → [t1];total 恒 3。
+    let result = repo.list(&scoped, 1, 2).await.expect("page 1");
+    assert_eq!(result.total, 3);
+    assert_eq!(result.items.len(), 2);
+    assert_eq!(result.items[0].task_id, t3);
+    assert_eq!(result.items[1].task_id, t2);
+    let result = repo.list(&scoped, 2, 2).await.expect("page 2");
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0].task_id, t1);
+
+    // 清理本测试行,不污染共享库。
+    for task_id in [&t1, &t2, &t3] {
+        repo.update_terminal(task_id, "failed", now, None, None)
+            .await
+            .expect("cleanup terminal");
+    }
 }
 
 /// P2-M1：跨副本可见性——副本 A 写入落库后，副本 B 经 sync_once 看到数据；

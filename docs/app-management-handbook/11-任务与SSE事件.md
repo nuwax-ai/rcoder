@@ -21,6 +21,41 @@ Pending → Running → (Cancelling) → Completed / Failed / Cancelled
 
 ## 任务查询接口
 
+### POST `/apps/publish/tasks/query` — 任务列表分页查询
+
+枚举任务（免调用方自记 task_id）。POST body 承载过滤与分页（与 `/apps/query` 惯例一致）。
+
+**请求体**：
+```jsonc
+{
+  "page": 1,
+  "pageSize": 20,
+  "filters": {
+    "appIds": ["app-order-svc"],   // 可选：按 app 过滤
+    "kind": "build",               // 可选：build | publish
+    "activeOnly": true             // 可选：只看未终态（对账：该 app 在跑任务吗）
+  }
+}
+```
+
+- `page` 默认 1（<1 → 400）；`pageSize` 默认 20，范围 1..=100（越界 → 400）；`filters` 可省略。
+- 排序 `createdAt DESC, taskId DESC`。
+
+**响应** `HttpResult<PaginatedResponse<PublishTaskSnapshot>>`：
+```jsonc
+{
+  "success": true,
+  "data": {
+    "items": [ { "id": "019...", "appId": "app-order-svc", "kind": "build", "status": "running", "stage": "Build", "seq": 15, ... } ],
+    "pagination": { "page": 1, "pageSize": 20, "total": 1, "totalPages": 1 }
+  }
+}
+```
+
+> **两种部署模式的语义差异**：
+> - **K8s + PG（多副本）**：查 PG 行——覆盖多副本、rcoder 重启、内存容量驱逐；窗口=终态 24h TTL（与单查口径一致）。`stage` 为异步落库快照（秒级滞后），实时进度请走单查/SSE。
+> - **Docker Compose（无 PG，单副本）**：遍历 rcoder 进程内存任务表——单副本即全量，但 **rcoder 重启后列表为空**（活任务随进程消亡，PG 回退也不存在）。
+
 ### GET `/apps/publish/tasks/{task_id}` — 任务状态快照
 
 **响应** `HttpResult<GetTaskData>`：

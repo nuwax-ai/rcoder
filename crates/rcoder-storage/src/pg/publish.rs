@@ -5,7 +5,10 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use super::repo::publish_repo::{ONE_ACTIVE_PER_APP_CONSTRAINT, UNIQUE_VIOLATION};
-use crate::publish_repo::{PublishRepoError, PublishTaskPersistence, PublishTaskRecord};
+use crate::publish_repo::{
+    PublishRepoError, PublishTaskListResult, PublishTaskPersistence, PublishTaskQuery,
+    PublishTaskRecord,
+};
 
 /// PG 实现
 pub struct PgPublishTaskPersistence {
@@ -42,6 +45,21 @@ impl PublishTaskPersistence for PgPublishTaskPersistence {
         super::repo::publish_repo::get(&self.pool, task_id)
             .await
             .map_err(map_err)
+    }
+
+    async fn list(
+        &self,
+        query: &PublishTaskQuery,
+        page: u32,
+        page_size: u32,
+    ) -> Result<PublishTaskListResult, PublishRepoError> {
+        let total = super::repo::publish_repo::count(&self.pool, query)
+            .await
+            .map_err(map_err)?;
+        let items = super::repo::publish_repo::list_page(&self.pool, query, page, page_size)
+            .await
+            .map_err(map_err)?;
+        Ok(PublishTaskListResult { items, total })
     }
 
     async fn update_terminal(

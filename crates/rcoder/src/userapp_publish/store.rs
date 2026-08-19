@@ -16,9 +16,12 @@ use tokio::sync::Mutex;
 
 use super::task::{OnStageFn, OnTerminalFn, PublishTask, TerminalPersist};
 use super::types::{
-    PublishTaskKind, PublishTaskSnapshot, PublishTaskStatus, PublishTaskStoreError,
+    PublishTaskKind, PublishTaskListPage, PublishTaskSnapshot, PublishTaskStatus,
+    PublishTaskStoreError,
 };
-use rcoder_storage::publish_repo::{PublishRepoError, PublishTaskPersistence, PublishTaskRecord};
+use rcoder_storage::publish_repo::{
+    PublishRepoError, PublishTaskPersistence, PublishTaskQuery, PublishTaskRecord,
+};
 
 /// 终态任务在内存中保留 24h,便于前端重连查询（也是 PG 行的 TTL）。
 pub(crate) const TERMINAL_TASK_TTL_SECS: i64 = 24 * 60 * 60;
@@ -192,27 +195,98 @@ impl PublishTaskStore {
         }
         let repo = self.repo.as_ref()?;
         let record = repo.get(id).await.ok()??;
-        let created_at = record.created_at.timestamp();
-        Some(PublishTaskSnapshot {
-            id: record.task_id,
-            app_id: record.app_id,
-            project_id: record.project_id,
-            kind: match record.kind.as_str() {
-                "build" => PublishTaskKind::Build,
-                _ => PublishTaskKind::Publish,
-            },
-            status: PublishTaskStatus::from_pg_str(&record.state),
-            stage: record.stage,
-            release_id: record.release_id,
-            error: record.error,
-            seq: 0,
-            created_at,
-            updated_at: record
-                .terminal_at
-                .map(|t| t.timestamp())
-                .unwrap_or(created_at),
-        })
+        Some(snapshot_from_record(record))
     }
+
+    /// 列表分页查询:PG 模式查 PG 行(覆盖多副本/重启/内存驱逐,24h TTL 窗口);
+    /// 纯内存模式(Docker Compose 单副本)遍历内存任务表。排序 `created_at DESC, task_id DESC`
+    /// (与 PG 下推排序一致,task_id tie-breaker 保证两口径稳定)。
+    /// page 从 1 起、page_size 范围由 handler 校验,此处仅做防御性 clamp。
+    pub async fn list_snapshots(
+        &self,
+        query: &PublishTaskQuery,
+        page: u32,
+        page_size: u32,
+    ) -> Result<PublishTaskListPage, PublishTaskStoreError> {
+        if let Some(repo) = &self.repo {
+            let result = repo
+                .list(query, page.max(1), page_size.clamp(1, 100))
+                .await
+                .map_err(map_list_repo_error)?;
+            return Ok(PublishTaskListPage {
+                items: result.items.into_iter().map(snapshot_from_record).collect(),
+                total: result.total,
+            });
+        }
+        // 内存分支:锁内只 clone Arc(遵守"map 锁内不取 task state 锁"纪律),放锁后逐个快照。
+        let tasks: Vec<Arc<PublishTask>> = {
+            let map = self.map.lock().await;
+            map.values().cloned().collect()
+        };
+        let mut snapshots = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            snapshots.push(task.snapshot().await);
+        }
+        snapshots.retain(|snap| {
+            query
+                .app_ids
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&snap.app_id))
+                && query
+                    .kind
+                    .as_deref()
+                    .is_none_or(|kind| kind == snap.kind.as_pg_str())
+                && (!query.active_only
+                    || snap.status != PublishTaskStatus::Completed
+                        && snap.status != PublishTaskStatus::Failed
+                        && snap.status != PublishTaskStatus::Cancelled)
+        });
+        snapshots.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        let total = snapshots.len() as u64;
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
+        let start = ((page - 1) * page_size) as usize;
+        let end = (start + page_size as usize).min(snapshots.len());
+        let items = if start < snapshots.len() {
+            snapshots[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(PublishTaskListPage { items, total })
+    }
+}
+
+/// PG 行 → 快照(`seq` 恒 0,`updated_at` 取终态/创建时间戳)。
+fn snapshot_from_record(record: PublishTaskRecord) -> PublishTaskSnapshot {
+    let created_at = record.created_at.timestamp();
+    PublishTaskSnapshot {
+        id: record.task_id,
+        app_id: record.app_id,
+        project_id: record.project_id,
+        kind: match record.kind.as_str() {
+            "build" => PublishTaskKind::Build,
+            _ => PublishTaskKind::Publish,
+        },
+        status: PublishTaskStatus::from_pg_str(&record.state),
+        stage: record.stage,
+        release_id: record.release_id,
+        error: record.error,
+        seq: 0,
+        created_at,
+        updated_at: record
+            .terminal_at
+            .map(|t| t.timestamp())
+            .unwrap_or(created_at),
+    }
+}
+
+/// list 的 PG 错误 → store 错误(list 无唯一索引冲突路径,Busy 不会出现,如实 Backend)。
+fn map_list_repo_error(error: PublishRepoError) -> PublishTaskStoreError {
+    PublishTaskStoreError::Backend(error.to_string())
 }
 
 /// PG 仓储错误 → store 错误（Busy 携带 PG 侧冲突详情；Backend 如实 500）
@@ -344,5 +418,108 @@ mod tests {
             .expect("task for a different app must not be rejected");
         assert_eq!(other.app_id(), "app-b");
         assert_eq!(store.map.lock().await.len(), 2);
+    }
+
+    /// 内存模式 list:app_ids/kind/active_only 过滤、created_at DESC(同秒退化为
+    /// task_id DESC)排序、分页与 total。数据:app-a 一个活 Build;app-b 一个终态
+    /// Build + 一个活 Publish(U2 同 app 单活跃任务,第二个须在第一个终态后创建)。
+    #[tokio::test]
+    async fn list_snapshots_memory_mode_filters_sorts_and_paginates() {
+        use rcoder_storage::publish_repo::PublishTaskQuery;
+
+        let store = PublishTaskStore::new();
+        store
+            .create("app-a".into(), "app-a".into(), PublishTaskKind::Build)
+            .await
+            .expect("active build for app-a");
+        let terminal = store
+            .create("app-b".into(), "app-b".into(), PublishTaskKind::Build)
+            .await
+            .expect("build for app-b");
+        terminal
+            .emit(PublishEvent::Failed {
+                error: "boom".into(),
+            })
+            .await;
+        store
+            .create("app-b".into(), "app-b".into(), PublishTaskKind::Publish)
+            .await
+            .expect("active publish for app-b after previous terminal");
+
+        // 全量:3 条;同秒创建,排序退化为 task_id DESC。
+        let page = store
+            .list_snapshots(&PublishTaskQuery::default(), 1, 10)
+            .await
+            .expect("list all");
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 3);
+        assert!(page.items[0].id > page.items[1].id && page.items[1].id > page.items[2].id);
+
+        // active_only:终态任务被过滤,剩 app-a 活 Build + app-b 活 Publish。
+        let page = store
+            .list_snapshots(
+                &PublishTaskQuery {
+                    active_only: true,
+                    ..Default::default()
+                },
+                1,
+                10,
+            )
+            .await
+            .expect("list active");
+        assert_eq!(page.total, 2);
+        assert!(
+            page.items
+                .iter()
+                .all(|snap| snap.app_id != "app-b" || snap.kind == PublishTaskKind::Publish)
+        );
+
+        // app_ids 过滤:app-a 仅 1 条。
+        let page = store
+            .list_snapshots(
+                &PublishTaskQuery {
+                    app_ids: Some(vec!["app-a".into()]),
+                    ..Default::default()
+                },
+                1,
+                10,
+            )
+            .await
+            .expect("list by app");
+        assert_eq!(page.total, 1);
+
+        // kind 过滤:build 2 条(app-a 活 + app-b 终态)。
+        let page = store
+            .list_snapshots(
+                &PublishTaskQuery {
+                    kind: Some("build".into()),
+                    ..Default::default()
+                },
+                1,
+                10,
+            )
+            .await
+            .expect("list by kind");
+        assert_eq!(page.total, 2);
+
+        // 分页:total 不随页大小变化,items 按页截取。
+        let page = store
+            .list_snapshots(&PublishTaskQuery::default(), 1, 2)
+            .await
+            .expect("page 1");
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 2);
+        let page2 = store
+            .list_snapshots(&PublishTaskQuery::default(), 2, 2)
+            .await
+            .expect("page 2");
+        assert_eq!(page2.items.len(), 1);
+        // 越界页:空 items,total 保持。
+        let page3 = store
+            .list_snapshots(&PublishTaskQuery::default(), 3, 2)
+            .await
+            .expect("page 3");
+        assert!(page3.items.is_empty());
+        assert_eq!(page3.total, 3);
     }
 }

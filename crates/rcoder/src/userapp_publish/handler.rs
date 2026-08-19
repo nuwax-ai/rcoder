@@ -4,6 +4,7 @@
 //! - `POST /api/v1/apps/{app_id}/build`   —— 仅触发 agent-runner build + 透传进度。
 //!   两者都会自动 ensure UserAppBuilder(未注册时创建,orchestrator EnsureBuilder 阶段),
 //!   调用方一次调用即可,无需先建 builder。
+//! - `POST /publish/tasks/query`           —— 任务列表分页查询(免调用方自记 task_id)。
 //! - `GET  /publish/tasks/{taskId}`        —— 任务快照(轮询)。
 //! - `GET  /publish/tasks/{taskId}/stream` —— 进度 SSE(回放 + 实时)。
 //! - `POST /publish/tasks/{taskId}/cancel` —— 取消(透传到 agent-runner cancel + kill 进程组)。
@@ -12,11 +13,13 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use app_manager::{PaginatedResponse, Pagination};
 use async_stream::stream;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use rcoder_storage::publish_repo::PublishTaskQuery;
 use serde::Deserialize;
 use shared_types::HttpResult;
 use shared_types::error_codes::{
@@ -37,6 +40,7 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
     axum::Router::new()
         .route("/api/v1/apps/{app_id}/publish", post(publish))
         .route("/api/v1/apps/{app_id}/build", post(build))
+        .route("/api/v1/apps/publish/tasks/query", post(query_tasks))
         .route("/api/v1/apps/publish/tasks/{task_id}", get(get_task))
         .route(
             "/api/v1/apps/publish/tasks/{task_id}/stream",
@@ -53,6 +57,30 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
 #[serde(rename_all = "camelCase")]
 pub struct PublishBody {
     pub project_id: String,
+}
+
+/// tasks/query 请求体(分页 + 可选过滤;POST body 承载,与 /apps/query 惯例一致)。
+#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryPublishTasksRequest {
+    /// 页码,从 1 起,默认 1
+    pub page: Option<u32>,
+    /// 每页数量,1..=100,默认 20
+    pub page_size: Option<u32>,
+    /// 过滤条件
+    pub filters: Option<PublishTaskFilters>,
+}
+
+/// 任务过滤(app_ids 精确集合 / kind / 只看未终态)。
+#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishTaskFilters {
+    /// 按 app_id 集合过滤(None=全部)
+    pub app_ids: Option<Vec<String>>,
+    /// build | publish(None=全部)
+    pub kind: Option<PublishTaskKind>,
+    /// 只看未终态任务(对账:该 app 现在有没有在跑的任务)
+    pub active_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -217,6 +245,62 @@ pub async fn build(
     Ok(Json(HttpResult::success(PublishTaskData {
         task_id,
         status: "pending".into(),
+    })))
+}
+
+/// `POST /api/v1/apps/publish/tasks/query` —— 任务列表分页查询。
+///
+/// 免去调用方自记 task_id。数据口径:PG 模式查 PG 行(覆盖多副本/rcoder 重启/内存
+/// 容量驱逐,窗口=终态 24h TTL);Docker Compose(无 PG 单副本)遍历内存任务表,
+/// rcoder 重启后列表为空。排序 `createdAt DESC, taskId DESC`。
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/publish/tasks/query",
+    request_body = QueryPublishTasksRequest,
+    responses(
+        (status = 200, body = HttpResult<PaginatedResponse<PublishTaskSnapshot>>, description = "Publish task page"),
+        (status = 400, description = "Invalid page/pageSize or filters.appIds"),
+        (status = 500, description = "Persistence backend error")
+    ),
+    tag = "UserApp 发布"
+)]
+pub async fn query_tasks(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<QueryPublishTasksRequest>,
+) -> Result<Json<HttpResult<PaginatedResponse<PublishTaskSnapshot>>>, AppError> {
+    let page = request.page.unwrap_or(1);
+    let page_size = request.page_size.unwrap_or(20);
+    if page < 1 {
+        return Err(validation("page must be >= 1"));
+    }
+    if !(1..=100).contains(&page_size) {
+        return Err(validation("pageSize must be within 1..=100"));
+    }
+    let filters = request.filters.unwrap_or_default();
+    if let Some(app_ids) = &filters.app_ids {
+        for app_id in app_ids {
+            crate::handler::utils::validate_identifier(app_id, "filters.appIds")
+                .map_err(|error| validation(error.to_string()))?;
+        }
+    }
+    let query = PublishTaskQuery {
+        app_ids: filters.app_ids,
+        kind: filters.kind.map(|kind| kind.as_pg_str().to_string()),
+        active_only: filters.active_only.unwrap_or(false),
+    };
+    let result = state
+        .publish_tasks
+        .list_snapshots(&query, page, page_size)
+        .await
+        .map_err(|error| err(error.to_string()))?;
+    Ok(Json(HttpResult::success(PaginatedResponse {
+        items: result.items,
+        pagination: Pagination {
+            page,
+            page_size,
+            total: result.total,
+            total_pages: ((result.total as f64) / (page_size as f64)).ceil() as u32,
+        },
     })))
 }
 

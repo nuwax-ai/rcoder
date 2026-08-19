@@ -4,7 +4,7 @@
 //! store/task(状态机)统一引用。加性演进(新增可选字段)沿用 `Option + serde(default)` 范式,
 //! 见 workspace-manifest crate 顶部"配置演进策略"。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use shared_types::BuildProgressEvent;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -60,7 +60,7 @@ impl PublishTaskStatus {
 pub type PublishTaskId = String;
 
 /// 任务类型:仅触发 agent-runner build / 全流程发布。
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PublishTaskKind {
     Build,
@@ -122,4 +122,11 @@ pub struct PublishTaskSnapshot {
     pub seq: u64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// 任务列表查询结果(items + 分页前总数;handler 据此组装 PaginatedResponse)。
+#[derive(Debug, Clone)]
+pub struct PublishTaskListPage {
+    pub items: Vec<PublishTaskSnapshot>,
+    pub total: u64,
 }
