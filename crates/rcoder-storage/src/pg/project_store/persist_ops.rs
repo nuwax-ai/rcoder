@@ -204,6 +204,33 @@ impl PersistOp {
     }
 }
 
+/// 会话创建的结构性 op 集（container + project + session）——单一构造点。
+///
+/// 此前"与 XX 完全一致"的注释散布 5 处靠人肉同步（入队路径/降级路径/
+/// durable 事务体），加字段必漏。所有消费方从这里取：
+/// - store_impl::insert_with_session → 逐个入队
+/// - durable::insert_with_session_durable → 事务内执行 + 降级入队
+pub(in crate::pg) fn structural_ops_for_insert(
+    info: &ProjectAndContainerInfo,
+    session_id: &str,
+) -> anyhow::Result<Vec<PersistOp>> {
+    let mut ops = Vec::with_capacity(3);
+    if let (Some(basic), Some(st)) = (info.container_info(), info.service_type()) {
+        ops.push(PersistOp::UpsertContainer(Box::new(
+            ContainerSnapshot::from_info(&container_entry_key(info), &basic, &st),
+        )));
+    }
+    ops.push(PersistOp::UpsertProject(Box::new(
+        ProjectSnapshot::from_info(info)?,
+    )));
+    ops.push(PersistOp::AddSession {
+        project_id: info.project_id().to_string(),
+        session_id: session_id.to_string(),
+        container_name: info.container_info().map(|_| container_entry_key(info)),
+    });
+    Ok(ops)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,31 +306,4 @@ mod tests {
             .is_structural()
         );
     }
-}
-
-/// 会话创建的结构性 op 集（container + project + session）——单一构造点。
-///
-/// 此前"与 XX 完全一致"的注释散布 5 处靠人肉同步（入队路径/降级路径/
-/// durable 事务体），加字段必漏。所有消费方从这里取：
-/// - store_impl::insert_with_session → 逐个入队
-/// - durable::insert_with_session_durable → 事务内执行 + 降级入队
-pub(in crate::pg) fn structural_ops_for_insert(
-    info: &ProjectAndContainerInfo,
-    session_id: &str,
-) -> anyhow::Result<Vec<PersistOp>> {
-    let mut ops = Vec::with_capacity(3);
-    if let (Some(basic), Some(st)) = (info.container_info(), info.service_type()) {
-        ops.push(PersistOp::UpsertContainer(Box::new(
-            ContainerSnapshot::from_info(&container_entry_key(info), &basic, &st),
-        )));
-    }
-    ops.push(PersistOp::UpsertProject(Box::new(
-        ProjectSnapshot::from_info(info)?,
-    )));
-    ops.push(PersistOp::AddSession {
-        project_id: info.project_id().to_string(),
-        session_id: session_id.to_string(),
-        container_name: info.container_info().map(|_| container_entry_key(info)),
-    });
-    Ok(ops)
 }
