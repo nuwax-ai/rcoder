@@ -209,14 +209,22 @@ pub async fn get_build_snapshot(addr: &str, task_id: &str) -> anyhow::Result<Bui
 /// 后台 spawn:connect/非2xx/读取/缓冲错误经 channel 透传(orchestrator 拿到真因);接收端
 /// 退出时 `tx.closed()` 触发及时收尾(不留挂连接);终态事件后关闭。
 /// build 进度流的接收端（wait_build 断流重订阅时整体替换）。
-pub type BuildProgressReceiver = mpsc::Receiver<Result<BuildProgressEvent, BuildStreamError>>;
+pub type BuildProgressReceiver = mpsc::Receiver<Result<SseItem, BuildStreamError>>;
 
-pub fn subscribe_build_progress(
-    addr: &str,
-    task_id: &str,
-) -> mpsc::Receiver<Result<BuildProgressEvent, BuildStreamError>> {
+/// 一帧已解析的 build 进度事件：file-server 的 SSE `id:`（事件 seq，续传游标）+
+/// 类型化事件。seq 由 file-server 侧 ring 分配（`Event::default().id(seq)`）。
+#[derive(Debug, Clone)]
+pub struct SseItem {
+    pub seq: Option<u64>,
+    pub event: BuildProgressEvent,
+}
+
+/// 订阅 build 进度 SSE（回放+实时）。`from_seq`：只回放 `seq >= from_seq` 的历史
+/// （file-server 端点参数）——断流重订阅传 `最后收到的 seq + 1` 续传，避免缺省 0
+/// 的全量回放把历史事件重复推给任务（前端日志整段重复、进度回跳）。
+pub fn subscribe_build_progress(addr: &str, task_id: &str, from_seq: u64) -> BuildProgressReceiver {
     let (tx, rx) = mpsc::channel(SSE_CHANNEL_CAP);
-    let url = format!("{addr}/api/userapp/tasks/{task_id}/logs/stream");
+    let url = format!("{addr}/api/userapp/tasks/{task_id}/logs/stream?from_seq={from_seq}");
     tokio::spawn(async move {
         let resp = match HTTP_CLIENT
             .get(&url)
@@ -271,15 +279,15 @@ pub fn subscribe_build_progress(
                         buffer.extend_from_slice(&chunk);
                         while let Some((end, delim_len)) = find_frame_end(&buffer) {
                             let frame: Vec<u8> = buffer.drain(..end + delim_len).collect();
-                            match parse_sse_data(&frame[..end]) {
-                                Ok(ev) => {
+                            match parse_sse_frame(&frame[..end]) {
+                                Ok(item) => {
                                     let terminal = matches!(
-                                        ev,
+                                        item.event,
                                         BuildProgressEvent::Completed { .. }
                                             | BuildProgressEvent::Failed { .. }
                                             | BuildProgressEvent::Cancelled
                                     );
-                                    if tx.send(Ok(ev)).await.is_err() {
+                                    if tx.send(Ok(item)).await.is_err() {
                                         return;
                                     }
                                     if terminal {
@@ -339,15 +347,20 @@ pub fn package_url(addr: &str, app_id: &str, file_name: &str) -> String {
     format!("{addr}/api/userapp/static/{app_id}/{file_name}")
 }
 
-/// 从 SSE 帧提取 `data:` 行,反序列化为类型化 `BuildProgressEvent`(Fail Fast:错误带类型)。
-fn parse_sse_data(frame: &[u8]) -> Result<BuildProgressEvent, SseParseError> {
+/// 从 SSE 帧提取 `id:`（事件 seq，可选）与 `data:` 行，反序列化为类型化
+/// `BuildProgressEvent`（Fail Fast:错误带类型）。
+fn parse_sse_frame(frame: &[u8]) -> Result<SseItem, SseParseError> {
     let text = std::str::from_utf8(frame)?;
+    let seq = text
+        .lines()
+        .find_map(|l| l.strip_prefix("id:"))
+        .and_then(|v| v.trim().parse::<u64>().ok());
     let data_line = text
         .lines()
         .find_map(|l| l.strip_prefix("data:").map(|s| s.trim_start()))
         .ok_or(SseParseError::NoDataLine)?;
-    let ev = serde_json::from_str(data_line)?;
-    Ok(ev)
+    let event = serde_json::from_str(data_line)?;
+    Ok(SseItem { seq, event })
 }
 
 #[cfg(test)]
@@ -419,25 +432,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_sse_data_extracts_typed_event() {
-        let frame = b"data: {\"event\":\"stage\",\"stage\":\"Build\"}\n\n";
-        let ev = parse_sse_data(frame).expect("valid frame");
-        assert!(matches!(ev, BuildProgressEvent::Stage { stage } if stage == "Build"));
+    fn parse_sse_frame_extracts_typed_event_and_seq() {
+        let frame = b"id: 42\ndata: {\"event\":\"stage\",\"stage\":\"Build\"}\n\n";
+        let item = parse_sse_frame(frame).expect("valid frame");
+        assert_eq!(item.seq, Some(42));
+        assert!(matches!(item.event, BuildProgressEvent::Stage { stage } if stage == "Build"));
+        // 无 id: 行 → seq None（续传游标缺失，调用方保持旧值）
+        let bare = parse_sse_frame(b"data: {\"event\":\"stage\",\"stage\":\"Build\"}\n\n")
+            .expect("valid frame without id");
+        assert_eq!(bare.seq, None);
+        // 非数字 id 容错为 None（不判帧无效）
+        let bad_id =
+            parse_sse_frame(b"id: abc\ndata: {\"event\":\"stage\",\"stage\":\"Build\"}\n\n")
+                .expect("bad id tolerated");
+        assert_eq!(bad_id.seq, None);
     }
 
     #[test]
-    fn parse_sse_data_no_data_line_is_not_data() {
+    fn parse_sse_frame_no_data_line_is_not_data() {
         // comment/keepalive 帧(无 data: 行)
         assert!(matches!(
-            parse_sse_data(b": keepalive\n\n"),
+            parse_sse_frame(b": keepalive\n\n"),
             Err(SseParseError::NoDataLine)
         ));
     }
 
     #[test]
-    fn parse_sse_data_bad_json_is_invalid() {
+    fn parse_sse_frame_bad_json_is_invalid() {
         assert!(matches!(
-            parse_sse_data(b"data: {not json\n\n"),
+            parse_sse_frame(b"id: 7\ndata: {not json\n\n"),
             Err(SseParseError::InvalidJson(_))
         ));
     }

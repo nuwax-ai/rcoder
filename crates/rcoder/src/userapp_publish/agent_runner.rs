@@ -117,11 +117,13 @@ async fn create_builder_and_register(
 /// 期间检查 task.is_cancelled → cancel_build + Cancelled。
 ///
 /// 断流容错：SSE 是进度流而非可靠性契约——网络瞬断/代理 idle 断连（build 可达
-/// 1800s，中间链路断连不罕见）时查任务快照，已终态按快照收敛；**仍非终态则退避
-/// 重订阅续上**（构建还在远端正常执行，一次断流就判死会把发布误杀为失败——远端
-/// 白烧资源无人收割，用户看到失败立即重试还得在远端排队）。5 次退避（2s..32s，
-/// 累计约 62s）耗尽仍非终态才 Err；file-server 侧 1800s 超时保证任务终态必达，
-/// 由 orchestrator 的终态兜底路径（stale 对账）收敛。
+/// 1800s，中间链路断连不罕见）时查任务快照（快照请求本身失败也纳入退避——同一次
+/// 瞬断常同时打掉流与快照），已终态按快照收敛；**仍非终态则退避重订阅续上**（构建
+/// 还在远端正常执行，一次断流就判死会把发布误杀为失败——远端白烧资源无人收割，
+/// 用户看到失败立即重试还得在远端排队）。重订阅带 `from_seq`（最后收到的远端
+/// seq+1）续传，只补断流窗口内错过的事件（缺省 0 的全量回放会把历史重复推给
+/// 任务：前端日志整段重复、进度回跳）。5 次退避（2s..32s）耗尽仍非终态才 Err；
+/// file-server 侧 1800s 超时保证任务终态必达，漏网由 stale 对账兜底收敛。
 pub(super) async fn wait_build(
     addr: &str,
     build_task_id: &str,
@@ -134,7 +136,9 @@ pub(super) async fn wait_build(
         return Ok(BuildOutcome::Cancelled);
     }
     let mut resubscribes = 0usize;
-    let mut rx = client::subscribe_build_progress(addr, build_task_id);
+    // 远端事件游标（file-server ring 分配的 SSE id）：重订阅时 from_seq=last+1 续传。
+    let mut last_seq: Option<u64> = None;
+    let mut rx = client::subscribe_build_progress(addr, build_task_id, 0);
     loop {
         let item = tokio::select! {
             biased;
@@ -151,7 +155,11 @@ pub(super) async fn wait_build(
             },
         };
         match item {
-            Ok(data) => {
+            Ok(item) => {
+                let data = item.event;
+                if let Some(seq) = item.seq {
+                    last_seq = Some(last_seq.map_or(seq, |prev| prev.max(seq)));
+                }
                 // 终态判定直接 match 类型化事件(类型保证 release_id 存在)。
                 let terminal_outcome: Option<BuildOutcome> = match &data {
                     BuildProgressEvent::Completed { release_id, .. } => {
@@ -191,7 +199,9 @@ pub(super) async fn wait_build(
                     error = %e,
                     "agent-runner build stream lost, attempting snapshot recovery"
                 );
-                match recover_or_resubscribe(addr, build_task_id, task, &mut resubscribes).await? {
+                match recover_or_resubscribe(addr, build_task_id, task, &mut resubscribes, last_seq)
+                    .await?
+                {
                     StreamRecovery::Terminal(outcome) => return Ok(outcome),
                     StreamRecovery::Resubscribed(new_rx) => rx = new_rx,
                 }
@@ -208,67 +218,112 @@ enum StreamRecovery {
     Resubscribed(client::BuildProgressReceiver),
 }
 
-/// 断流恢复：查 agent-runner 任务快照。已终态(completed/failed/cancelled)按快照映射；
-/// 仍非终态 → 退避重订阅（5 次：2/4/8/16/32s；退避期间仍响应取消）。快照不可达或
-/// 重试耗尽 → Err（真因透传）。
+/// 断流恢复：查 agent-runner 任务快照（失败纳入退避重试）。已终态(completed/
+/// failed/cancelled)按快照映射；仍非终态 → 退避重订阅（5 档：2/4/8/16/32s；退避
+/// 期间仍响应取消），重订阅带 `from_seq`（last_seq+1，None=0 全量——尚未收到过
+/// 任何事件时的正确语义）。快照与重订阅共享同一退避预算，耗尽 → Err（真因透传）。
 async fn recover_or_resubscribe(
     addr: &str,
     build_task_id: &str,
     task: &PublishTask,
     resubscribes: &mut usize,
+    last_seq: Option<u64>,
 ) -> Result<StreamRecovery> {
     const RESUBSCRIBE_DELAYS_SECS: [u64; 5] = [2, 4, 8, 16, 32];
-    let snap = client::get_build_snapshot(addr, build_task_id)
-        .await
-        .context("snapshot recovery after build stream lost")?;
-    let terminal = match snap.status.as_str() {
-        "completed" => Some(BuildOutcome::Completed {
-            release_id: snap
-                .release_id
-                .clone()
-                .ok_or_else(|| anyhow!("snapshot completed but missing releaseId"))?,
-        }),
-        "failed" => Some(BuildOutcome::Failed(
-            snap.error
-                .clone()
-                .unwrap_or_else(|| "build failed".to_string()),
-        )),
-        "cancelled" => Some(BuildOutcome::Cancelled),
-        _non_terminal => None,
-    };
-    if let Some(outcome) = terminal {
-        return Ok(StreamRecovery::Terminal(outcome));
-    }
-    if *resubscribes >= RESUBSCRIBE_DELAYS_SECS.len() {
-        return Err(anyhow!(
-            "build stream lost and task still non-terminal after {} resubscribe attempts \
-             (last status={})",
-            RESUBSCRIBE_DELAYS_SECS.len(),
-            snap.status
+    loop {
+        let snap = match client::get_build_snapshot(addr, build_task_id).await {
+            Ok(snap) => snap,
+            Err(e) => {
+                // 快照与流常命中同一次网络瞬断——纳入退避重试而非直接判死
+                if *resubscribes >= RESUBSCRIBE_DELAYS_SECS.len() {
+                    return Err(anyhow!(
+                        "build stream lost and snapshot unreachable after {} recovery \
+                         attempts: {e:#}",
+                        RESUBSCRIBE_DELAYS_SECS.len()
+                    ));
+                }
+                let delay = RESUBSCRIBE_DELAYS_SECS[*resubscribes];
+                *resubscribes += 1;
+                tracing::warn!(
+                    task_id = %task.id,
+                    remote_build_task_id = %build_task_id,
+                    attempt = *resubscribes,
+                    total = RESUBSCRIBE_DELAYS_SECS.len(),
+                    delay_secs = delay,
+                    error = %e,
+                    "build snapshot unreachable after stream loss, retrying after backoff"
+                );
+                if !backoff_respecting_cancel(addr, build_task_id, task, delay).await? {
+                    return Ok(StreamRecovery::Terminal(BuildOutcome::Cancelled));
+                }
+                continue;
+            }
+        };
+        let terminal = match snap.status.as_str() {
+            "completed" => Some(BuildOutcome::Completed {
+                release_id: snap
+                    .release_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("snapshot completed but missing releaseId"))?,
+            }),
+            "failed" => Some(BuildOutcome::Failed(
+                snap.error
+                    .clone()
+                    .unwrap_or_else(|| "build failed".to_string()),
+            )),
+            "cancelled" => Some(BuildOutcome::Cancelled),
+            _non_terminal => None,
+        };
+        if let Some(outcome) = terminal {
+            return Ok(StreamRecovery::Terminal(outcome));
+        }
+        if *resubscribes >= RESUBSCRIBE_DELAYS_SECS.len() {
+            return Err(anyhow!(
+                "build stream lost and task still non-terminal after {} resubscribe attempts \
+                 (last status={})",
+                RESUBSCRIBE_DELAYS_SECS.len(),
+                snap.status
+            ));
+        }
+        let delay = RESUBSCRIBE_DELAYS_SECS[*resubscribes];
+        *resubscribes += 1;
+        tracing::warn!(
+            task_id = %task.id,
+            remote_build_task_id = %build_task_id,
+            attempt = *resubscribes,
+            total = RESUBSCRIBE_DELAYS_SECS.len(),
+            delay_secs = delay,
+            "build task still running, resubscribing after backoff"
+        );
+        if !backoff_respecting_cancel(addr, build_task_id, task, delay).await? {
+            return Ok(StreamRecovery::Terminal(BuildOutcome::Cancelled));
+        }
+        return Ok(StreamRecovery::Resubscribed(
+            client::subscribe_build_progress(
+                addr,
+                build_task_id,
+                last_seq.map_or(0, |seq| seq + 1),
+            ),
         ));
     }
-    let delay = RESUBSCRIBE_DELAYS_SECS[*resubscribes];
-    *resubscribes += 1;
-    tracing::warn!(
-        task_id = %task.id,
-        remote_build_task_id = %build_task_id,
-        attempt = *resubscribes,
-        total = RESUBSCRIBE_DELAYS_SECS.len(),
-        delay_secs = delay,
-        "build task still running, resubscribing after backoff"
-    );
-    // 退避期间仍响应取消（最长 32s 的窗口不该挡住用户取消）
+}
+
+/// 退避等待（响应取消）。返回 false = 期间收到取消（已尽力 cancel_build），
+/// 调用方应收敛 Cancelled；true = 退避完成可继续。
+async fn backoff_respecting_cancel(
+    addr: &str,
+    build_task_id: &str,
+    task: &PublishTask,
+    delay_secs: u64,
+) -> Result<bool> {
     tokio::select! {
         biased;
         _ = task.cancellation_notified() => {
             if let Err(e) = client::cancel_build(addr, build_task_id).await {
                 tracing::warn!(%e, "cancel_build during backoff failed");
             }
-            return Ok(StreamRecovery::Terminal(BuildOutcome::Cancelled));
+            Ok(false)
         }
-        _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
+        _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => Ok(true),
     }
-    Ok(StreamRecovery::Resubscribed(
-        client::subscribe_build_progress(addr, build_task_id),
-    ))
 }
