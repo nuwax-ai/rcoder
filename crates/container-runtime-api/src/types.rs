@@ -298,7 +298,7 @@ pub enum HttpExpose {
 }
 
 /// 应用端口规格（创建时由调用方提供）
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct AppPortSpec {
     /// 端口名称
     pub name: String,
@@ -420,6 +420,12 @@ pub struct ContainerSpecSnapshot {
     /// 健康检查（K8s 从 liveness/readiness probe 反推 `build_probe` 的逆映射；
     /// Docker 无探针概念，恒 None）
     pub health_check: Option<AppHealthCheck>,
+    /// 端口配置（K8s 从 pod template container.ports + `rcoder.io/port-expose` 注解还原
+    /// name/port/expose_type——strip_prefix 未持久化，读回 None（显式 false 的用户部分
+    /// 更新后 HTTPRoute 回默认剥前缀行为）；Docker 从 Config.ExposedPorts 还原端口列表
+    /// （name 空串、expose_type 恒 Http、strip_prefix None——单机模式尽力回退，
+    /// 保住端口号不丢是主要目标）。
+    pub ports: Option<Vec<AppPortSpec>>,
 }
 
 /// 应用资源用量（运行时层；K8s 来自 metrics.k8s.io PodMetrics，Docker 可来自 bollard stats）。

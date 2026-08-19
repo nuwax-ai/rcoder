@@ -46,7 +46,7 @@ pub struct CreateAppRequest {
 }
 
 /// 查询应用请求
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct QueryAppsRequest {
     /// 页码
     pub page: Option<u32>,

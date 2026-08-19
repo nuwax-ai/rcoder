@@ -186,7 +186,9 @@ impl AppService {
                             // 无元数据记录的 app（非 PG 时代创建）不满足 name/created_at 过滤
                             return false;
                         };
-                        name.is_none_or(|n| meta.name.as_deref() == Some(n))
+                        // name 模糊匹配（contains，与 models 注释"按名称模糊搜索"对齐；
+                        // 此前精确匹配导致部分名称查询恒 0 条且无提示）
+                        name.is_none_or(|n| meta.name.as_deref().is_some_and(|v| v.contains(n)))
                             && range.is_none_or(|(start, end)| {
                                 meta.created_at >= start && meta.created_at <= end
                             })
@@ -199,13 +201,16 @@ impl AppService {
             }
         }
 
-        // 排序（app_id 直接可用；name 经 metadata join，缺元数据排最后；默认升序）
+        // 排序（app_id 直接可用；name/created_at 经 metadata join，缺元数据排最后；默认升序）
         if let Some(sort_by) = &request.sort_by {
             match sort_by.as_str() {
                 "app_id" => {
                     items.sort_by(|a, b| a.app_id.cmp(&b.app_id));
                 }
                 "name" => {
+                    if self.metadata.persistence().is_none() {
+                        warn!("[APP] sort_by=name requires business metadata (PG mode), no-op");
+                    }
                     items.sort_by_key(|app| {
                         self.metadata
                             .lookup(&app.app_id)
@@ -213,18 +218,52 @@ impl AppService {
                             .unwrap_or_default()
                     });
                 }
-                _ => {}
+                "created_at" => {
+                    if self.metadata.persistence().is_none() {
+                        warn!(
+                            "[APP] sort_by=created_at requires business metadata (PG mode), no-op"
+                        );
+                    }
+                    // (缺元数据排最后, 时间升序)：bool false < true 保证有元数据的排前
+                    items.sort_by_key(|app| {
+                        (
+                            self.metadata.lookup(&app.app_id).is_none(),
+                            self.metadata.lookup(&app.app_id).map(|m| m.created_at),
+                        )
+                    });
+                }
+                // 非法值 400（此前落入 `_ => {}` 不排序，但随后的 reverse 仍执行——
+                // 传 created_at 等未支持值+desc 会把默认顺序直接反转，半生效的静默错误）
+                other => {
+                    return Err(AppOperationError::Validation(format!(
+                        "sort_by must be one of app_id/name/created_at, got '{other}'"
+                    )));
+                }
             }
             if request.sort_order == Some(SortOrder::Desc) {
                 items.reverse();
             }
         }
 
-        // 分页
+        // 分页（对齐 query_storage/publish tasks 的校验口径：非法值 400 而非静默 clamp——
+        // 此前 page 超大在 debug 构建 u32 乘法溢出 panic、release 环绕返回错页数据；
+        // page_size=0 算出 total_pages=42 亿）
+        let page = request.page.unwrap_or(1);
+        let page_size = request.page_size.unwrap_or(20);
+        if page < 1 {
+            return Err(AppOperationError::Validation(
+                "page must be >= 1".to_string(),
+            ));
+        }
+        if !(1..=100).contains(&page_size) {
+            return Err(AppOperationError::Validation(
+                "pageSize must be within 1..=100".to_string(),
+            ));
+        }
         let total = items.len() as u64;
-        let page = request.page.unwrap_or(1).max(1);
-        let page_size = request.page_size.unwrap_or(20).min(100);
-        let start = ((page - 1) * page_size) as usize;
+        // u64 中间量防溢出（合法输入下 (page-1)*page_size 最大 ~4.3e11，超 usize 的
+        // 极端页码截断为越界空页而非 panic/环绕）
+        let start = ((page as u64 - 1) * page_size as u64) as usize;
         let end = (start + page_size as usize).min(items.len());
         let paged_items = if start < items.len() {
             items[start..end].to_vec()
@@ -264,6 +303,23 @@ impl AppService {
         request: UpdateAppRequest,
     ) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
+        // 与发布串行（同 create/delete 的 per-app 进程级发布锁），但**不排队傻等**——
+        // activate 等就绪可达 30 分钟，update 等它没有意义；锁被占（发布进行中）立即
+        // 409 让调用方稍后重试。delete 保持阻塞等待语义（清理动作，等一下无妨）。
+        // 无并发发布时锁条目可能不存在 → entry 建立并立刻拿到（try 必成功）。
+        let lock_arc = match self.release_locks.entry(app_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                entry.insert(lock.clone());
+                lock
+            }
+        };
+        let _update_lock = lock_arc.try_lock_owned().map_err(|_| {
+            AppOperationError::Conflict(format!(
+                "app {app_id} is being activated/published, retry after it finishes"
+            ))
+        })?;
         let current = self.fetch_runtime_status_or_err(app_id).await?;
         // 乐观锁：expected_resource_version 不匹配 → 409 Conflict
         // （Docker resource_version=None → 跳过校验，开发环境 last-write-wins 可接受）
@@ -281,9 +337,27 @@ impl AppService {
         // 先注销旧 Pingora backend（K8s/Docker 都执行：Docker 旧 container_ip 失效；
         // K8s 下方按本次 http_ports 重新注册到 Service FQDN，注销-重注成对保证一致）。
         self.unregister_pingora_backends(app_id).await;
-        let info = self.runtime.patch_deployment(params).await.map_err(|e| {
-            map_runtime_error(&format!("[APP] patch_deployment failed app_id={app_id}"), e)
-        })?;
+        let info = match self.runtime.patch_deployment(params).await {
+            Ok(info) => info,
+            Err(e) => {
+                // patch 失败：Deployment 原样仍在运行，恢复 pingora 路由（对齐 delete_app
+                // 的失败恢复分支）——否则应用还在跑但 /proxy/apps/{id}/{port} 404，直到
+                // 下次成功 update 或进程重启。
+                let previous_http_ports: Vec<u16> = current
+                    .ports
+                    .iter()
+                    .filter(|p| p.expose_type == RtExposeType::Http)
+                    .map(|p| p.port)
+                    .collect();
+                let previous_host = current.pod_ip.clone().unwrap_or_default();
+                self.register_pingora_backends(app_id, &previous_http_ports, &previous_host)
+                    .await;
+                return Err(map_runtime_error(
+                    &format!("[APP] patch_deployment failed app_id={app_id}"),
+                    e,
+                ));
+            }
+        };
         // 重新注册 Pingora backend。http_ports 取本次请求 ports；若未带（K8s 下 update 常
         // 只改 image/env 等部分字段），沿用当前 Deployment 的 HTTP 端口，保证与上面
         // unregister 对称——否则部分更新会丢 Pingora 路由（app 经 /proxy/apps/{id}/{port} 变 502）。
@@ -317,6 +391,8 @@ impl AppService {
                 request.space_id.clone(),
             )
             .await;
+        drop(_update_lock);
+        self.remove_unused_process_release_lock(app_id);
         self.get_app(app_id).await
     }
 
@@ -722,6 +798,72 @@ mod tests {
             Some("beta".into()),
             "explicit name overrides"
         );
+    }
+
+    /// update 与发布并发：发布锁被占 → 立即 409（不排队傻等 activate 的就绪窗口）。
+    #[tokio::test]
+    async fn update_app_conflicts_while_release_lock_held() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let service = test_service(root.path(), Arc::new(MockRuntime::default()));
+        let _publish_lock = service.acquire_process_release_lock("app-busy").await;
+
+        let request = UpdateAppRequest {
+            name: None,
+            image: Some("registry.example/app-runtime:v2".into()),
+            command: None,
+            env: None,
+            secrets: None,
+            resources: None,
+            ports: None,
+            health_check: None,
+            tenant_id: None,
+            space_id: None,
+            recycle_enabled: None,
+            idle_timeout_seconds: None,
+            expected_resource_version: None,
+        };
+        let error = service
+            .update_app("app-busy", request)
+            .await
+            .expect_err("update during publish must 409");
+        assert!(
+            matches!(error, AppOperationError::Conflict(_)),
+            "got: {error}"
+        );
+    }
+
+    /// query_apps 分页校验：page<1 / page_size∉[1,100] → 400（对齐 query_storage 与
+    /// publish tasks 口径；此前静默 clamp，超大 page 在 debug 构建乘法溢出 panic）。
+    #[tokio::test]
+    async fn query_apps_rejects_invalid_pagination_and_sort() {
+        let service = test_service(
+            tempfile::tempdir().expect("tempdir").path(),
+            Arc::new(MockRuntime::default()),
+        );
+        for (page, page_size) in [(0u32, 20u32), (1, 0), (1, 101)] {
+            let request = QueryAppsRequest {
+                page: Some(page),
+                page_size: Some(page_size),
+                ..QueryAppsRequest::default()
+            };
+            let error = service
+                .query_apps(request)
+                .await
+                .expect_err("invalid pagination must 400");
+            assert!(
+                matches!(error, AppOperationError::Validation(_)),
+                "page={page} page_size={page_size}: {error}"
+            );
+        }
+        let request = QueryAppsRequest {
+            sort_by: Some("bogus".into()),
+            ..QueryAppsRequest::default()
+        };
+        let error = service
+            .query_apps(request)
+            .await
+            .expect_err("invalid sort_by must 400");
+        assert!(matches!(error, AppOperationError::Validation(_)));
     }
 
     /// query_apps 的 name/created_at 过滤:纯内存模式（无 metadata 持久化）维持忽略

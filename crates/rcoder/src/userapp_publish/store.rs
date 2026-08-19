@@ -249,7 +249,9 @@ impl PublishTaskStore {
         let total = snapshots.len() as u64;
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
-        let start = ((page - 1) * page_size) as usize;
+        // u64 中间量防溢出（handler 已校验 page>=1，但无上限——debug 构建下 u32 乘法
+        // 溢出 panic；极端页码截断为越界空页）
+        let start = ((page as u64 - 1) * page_size as u64) as usize;
         let end = (start + page_size as usize).min(snapshots.len());
         let items = if start < snapshots.len() {
             snapshots[start..end].to_vec()

@@ -8,6 +8,7 @@ use tracing::warn;
 
 use container_runtime_api::{
     AppHealthCheck, AppPortSpec, AppResourceRequirements, ContainerCreateParams, DeploymentStatus,
+    ExposeType as RtExposeType,
 };
 use shared_types::ServiceType;
 
@@ -76,20 +77,23 @@ impl AppService {
                     .to_string(),
             )
         })?;
-        // 部分更新回退（方案C 扩展）：`command`/`env`/`secrets`/`resources`/`health_check`
-        // 任一为 None 时从 live 容器读当前值回退（与 `ports` 从运行时状态回退一致），
-        // 避免部分更新静默清空：
+        // 部分更新回退（方案C 扩展）：`command`/`env`/`secrets`/`resources`/`health_check`/
+        // `ports` 任一为 None 时从 live 容器读当前值回退，避免部分更新静默清空：
         //   - `command` 丢 → 镜像无 ENTRYPOINT 时 CrashLoop（container.args 为空）；
         //   - `env` 丢 → K8s `cleanup_orphan_port_resources` 删 ConfigMap → 容器丢环境变量；
         //   - `secrets`/`resources`/`health_check` 丢 → K8s 从 Secret/pod limits/probes 读回
-        //     （Docker 的 secrets/health_check 不可分/无探针 → 恒 None 等价旧行为）。
+        //     （Docker 的 secrets/health_check 不可分/无探针 → 恒 None 等价旧行为）；
+        //   - `ports` 丢 → SSA 清 container ports + `cleanup_orphan_port_resources` 删
+        //     HTTPRoute/NodePort → 对外入口全断（K8s 从 container.ports+port-expose 注解
+        //     读回；Docker 从 ExposedPorts 尽力读回）。
         // 仅在确实缺省时才读（省一次后端 GET）；读失败降级为旧行为（清空）+ warn，不阻塞 update。
         // 注：`tenant_id`/`space_id` 仍为部分更新清空（在 K8s label 上，调用方携带即可还原）。
-        let (command, env, secrets, resources, health_check) = if request.command.is_none()
+        let (command, env, secrets, resources, health_check, ports) = if request.command.is_none()
             || request.env.is_none()
             || request.secrets.is_none()
             || request.resources.is_none()
             || request.health_check.is_none()
+            || request.ports.is_none()
         {
             match self.runtime.get_app_container_spec(app_id).await {
                 Ok(spec) => (
@@ -109,6 +113,9 @@ impl AppService {
                         .health_check
                         .clone()
                         .or(spec.health_check.map(health_check_from_snapshot)),
+                    request.ports.clone().or(spec
+                        .ports
+                        .map(|ps| ps.iter().map(port_config_from_snapshot).collect())),
                 ),
                 Err(e) => {
                     warn!(
@@ -120,6 +127,7 @@ impl AppService {
                         request.secrets.clone(),
                         request.resources.clone(),
                         request.health_check.clone(),
+                        request.ports.clone(),
                     )
                 }
             }
@@ -130,6 +138,7 @@ impl AppService {
                 request.secrets.clone(),
                 request.resources.clone(),
                 request.health_check.clone(),
+                request.ports.clone(),
             )
         };
         self.build_params_inner(
@@ -139,7 +148,7 @@ impl AppService {
                 command,
                 env,
                 secrets,
-                ports: request.ports.clone(),
+                ports,
                 health_check,
                 resources,
                 tenant_id: request.tenant_id.clone(),
@@ -276,6 +285,19 @@ impl AppService {
     }
 }
 
+/// 运行时端口快照 → models::PortConfig（update ports 回退；与 `map_expose_type` 互逆）。
+fn port_config_from_snapshot(p: &AppPortSpec) -> PortConfig {
+    PortConfig {
+        name: p.name.clone(),
+        port: p.port,
+        expose_type: match p.expose_type {
+            RtExposeType::Http => ExposeType::Http,
+            RtExposeType::Tcp => ExposeType::Tcp,
+        },
+        strip_prefix: p.strip_prefix,
+    }
+}
+
 /// 运行时资源快照 → models::ResourceLimits（update 回退：读回的 Quantity 字符串原样复用）。
 fn resource_limits_from_snapshot(r: AppResourceRequirements) -> ResourceLimits {
     ResourceLimits {
@@ -396,6 +418,21 @@ mod tests {
                     initial_delay_seconds: None,
                     period_seconds: None,
                 }),
+                // K8s 读回示意：container.ports + port-expose 注解（含 TCP 端口）
+                ports: Some(vec![
+                    AppPortSpec {
+                        name: "http".into(),
+                        port: 8080,
+                        expose_type: RtExposeType::Http,
+                        strip_prefix: None,
+                    },
+                    AppPortSpec {
+                        name: "db".into(),
+                        port: 5432,
+                        expose_type: RtExposeType::Tcp,
+                        strip_prefix: None,
+                    },
+                ]),
             },
         );
         let service = test_service(root.path(), runtime);
@@ -446,6 +483,14 @@ mod tests {
         assert!(matches!(hc.check_type, RtHealthCheckType::Http));
         assert_eq!(hc.path.as_deref(), Some("/actuator/health"));
         assert_eq!(hc.port, Some(8080));
+        // ports 从 live 快照回退（此前缺省会清空全部对外端口）
+        let ports = params.ports.expect("ports fallback");
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].port, 8080);
+        assert!(matches!(ports[0].expose_type, RtExposeType::Http));
+        assert_eq!(ports[0].name, "http");
+        assert_eq!(ports[1].port, 5432);
+        assert!(matches!(ports[1].expose_type, RtExposeType::Tcp));
     }
 
     /// 显式传值优先：请求携带的 secrets/resources 覆盖 live 快照（整段替换语义不变）。
@@ -476,6 +521,7 @@ mod tests {
                     ephemeral_storage: None,
                 }),
                 health_check: None,
+                ports: None,
             },
         );
         let service = test_service(root.path(), runtime);

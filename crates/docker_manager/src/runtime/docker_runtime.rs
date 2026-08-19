@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use container_runtime_api::{
-    AgentContainerRuntime, AppPortStatus, ContainerCreateParams, ContainerLogEntry,
+    AgentContainerRuntime, AppPortSpec, AppPortStatus, ContainerCreateParams, ContainerLogEntry,
     ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot,
     DeploymentStatus, ExposeType, RemovedContainerInfo, RuntimeContainerInfo,
     UserAppDeploymentRuntime, WorkspaceRuntime,
@@ -766,7 +766,12 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             }
         };
         let cfg = inspect.config.as_ref();
-        let command = cfg.and_then(|c| c.cmd.clone());
+        // command 不读回：Docker inspect 的 Config.cmd 无法区分"用户显式设置"与
+        // "镜像 CMD 固化"（create 未指定 cmd 时 Docker 把镜像 CMD 写进容器 Config），
+        // 读回会把旧镜像的 CMD 钉死到换镜像后的新容器（update 换镜像+command 缺省的
+        // 典型升级场景必踩）。缺省=None → 走新镜像自己的 CMD，才是升级语义。
+        // （K8s 无此问题：container.command/args 未设时读回本就是 None。）
+        let command = None;
         let env = cfg
             .and_then(|c| c.env.clone())
             .map(|envs| {
@@ -778,6 +783,24 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                     .collect::<HashMap<String, String>>()
             })
             .filter(|m| !m.is_empty());
+        // ports：ExposedPorts 声明还原端口列表（name 空串、expose_type 恒 Http、
+        // strip_prefix None——单机模式 TCP 经宿主映射无法区分，尽力回退保住端口号
+        // 不丢是主要目标，Http 兜底优于部分更新把对外端口全清空）。
+        let ports = cfg.and_then(|c| c.exposed_ports.as_ref()).map(|keys| {
+            let mut list: Vec<u16> = keys
+                .iter()
+                .filter_map(|key| key.split('/').next().and_then(|p| p.parse::<u16>().ok()))
+                .collect();
+            list.sort_unstable();
+            list.into_iter()
+                .map(|port| AppPortSpec {
+                    name: String::new(),
+                    port,
+                    expose_type: ExposeType::Http,
+                    strip_prefix: None,
+                })
+                .collect::<Vec<_>>()
+        });
         let resources = inspect
             .host_config
             .as_ref()
@@ -794,6 +817,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             secrets: None,
             resources,
             health_check: None,
+            ports,
         })
     }
 
@@ -1117,16 +1141,18 @@ fn docker_cpus_to_quantity(nano_cpus: i64) -> String {
     }
 }
 
-/// Docker 字节内存限制 → K8s Quantity 字符串（就近 Ki/Mi/Gi 向下取整，不超原值）。
+/// Docker 字节内存限制 → K8s Quantity 字符串（无损换算：优先整 Gi/Mi/Ki 档，非整档
+/// 用更细档位精确表示——1.5Gi=1536Mi 而非缩水成 1Gi；非 Ki 整数倍的罕见值直接输出
+/// 字节数，K8s Quantity 合法且无损）。
 fn docker_memory_to_quantity(bytes: i64) -> String {
     const KI: i64 = 1024;
     const MI: i64 = 1024 * 1024;
     const GI: i64 = 1024 * 1024 * 1024;
-    if bytes >= GI {
+    if bytes >= GI && bytes % GI == 0 {
         format!("{}Gi", bytes / GI)
-    } else if bytes >= MI {
+    } else if bytes >= MI && bytes % MI == 0 {
         format!("{}Mi", bytes / MI)
-    } else if bytes >= KI {
+    } else if bytes >= KI && bytes % KI == 0 {
         format!("{}Ki", bytes / KI)
     } else {
         format!("{bytes}")
