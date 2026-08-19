@@ -4,6 +4,9 @@
 //! container_error_message。
 
 #[cfg(feature = "kubernetes")]
+use std::collections::HashMap;
+
+#[cfg(feature = "kubernetes")]
 use container_runtime_api::{
     AppPortStatus, ContainerRuntimeError, ContainerRuntimeResult, ContainerSpecSnapshot,
     DeploymentStatus, ExposeType,
@@ -41,11 +44,15 @@ impl KubernetesRuntime {
         Ok(Some(self.deployment_to_status(app_id, &deploy).await))
     }
 
-    /// 读 app 当前容器的 `command`/`env` 快照（update 部分更新回退用）。
+    /// 读 app 当前容器的 desired 快照（update 部分更新回退用）。
     ///
     /// - **command**：UserApp 存于 `container.args`（用镜像 ENTRYPOINT + 用户命令作 args），
     ///   兼顾 `container.command`（其他路径内联）→ `command.or(args)`。
     /// - **env**：UserApp env 走 ConfigMap（envFrom 引用 `{app}-config`），读 `.data` 还原字面值。
+    /// - **secrets**：Secret `{app}-secret`（写入用 string_data，API 返回在 `.data` 并 base64）。
+    /// - **resources**：pod template `resources.limits` 原样还原 Quantity 字符串
+    ///   （写入与读出同格式，无换算损耗；storage 是 per-app PVC 配额不在容器层，不读）。
+    /// - **health_check**：liveness/readiness probe 反推（`build_probe` 的逆映射）。
     ///
     /// 任一资源 404 → 对应字段 None（互不影响）。读失败上抛（update 调用方降级 warn）。
     /// 注：trait 方法 `ContainerRuntime::get_app_container_spec` 委派到这里（见 kubernetes_runtime.rs）。
@@ -53,17 +60,15 @@ impl KubernetesRuntime {
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<ContainerSpecSnapshot> {
-        // command：Deployment 主容器的 args（UserApp）/ command（其他）
-        let command = match self
+        use container_runtime_api::AppResourceRequirements;
+
+        // deployment GET 一次：command + resources + probes 同源提取。
+        let deploy = match self
             .deployments_api()
             .get(&self.app_deployment_name(app_id))
             .await
         {
-            Ok(deploy) => deploy
-                .spec
-                .and_then(|s| s.template.spec)
-                .and_then(|ps| ps.containers.into_iter().next())
-                .and_then(|c| c.command.or(c.args)),
+            Ok(deploy) => Some(deploy),
             Err(kube::Error::Api(ae)) if ae.code == 404 => None,
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
@@ -71,6 +76,25 @@ impl KubernetesRuntime {
                 )));
             }
         };
+        let container = deploy
+            .as_ref()
+            .and_then(|d| d.spec.as_ref())
+            .and_then(|s| s.template.spec.as_ref())
+            .and_then(|ps| ps.containers.first());
+        let command = container.and_then(|c| c.command.clone().or_else(|| c.args.clone()));
+        let resources = container
+            .and_then(|c| c.resources.as_ref())
+            .and_then(|r| r.limits.as_ref())
+            .map(|limits| AppResourceRequirements {
+                // Quantity 是 newtype String，取 .0 原样还原（写入读出同格式无换算）
+                cpu: limits.get("cpu").map(|q| q.0.clone()),
+                memory: limits.get("memory").map(|q| q.0.clone()),
+                storage: None,
+                ephemeral_storage: limits.get("ephemeral-storage").map(|q| q.0.clone()),
+            })
+            .filter(|r| r.cpu.is_some() || r.memory.is_some() || r.ephemeral_storage.is_some());
+        let health_check = container.and_then(probe_to_health_check);
+
         // env：ConfigMap `{app}-config`.data（apply_app_configmap 写入 = params.env 原样）
         let env = match self
             .configmaps_api()
@@ -88,7 +112,38 @@ impl KubernetesRuntime {
                 )));
             }
         };
-        Ok(ContainerSpecSnapshot { command, env })
+
+        // secrets：Secret `.data` base64 解码还原（写入走 string_data，API 侧自动转 data；
+        // 值类型是 ByteString，直接取内部字节，无需再按文本 base64 解码字符串）
+        let secrets = match self.secrets_api().get(&self.app_secret_name(app_id)).await {
+            Ok(secret) => secret.data.and_then(|data| {
+                data.into_iter()
+                    .map(|(key, value)| {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(&value.0)
+                            .map(|decoded| (key, String::from_utf8_lossy(&decoded).into_owned()))
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect::<Result<HashMap<String, String>, String>>()
+                    .ok()
+                    .filter(|m| !m.is_empty())
+            }),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => None,
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "get secret for container spec: {e}"
+                )));
+            }
+        };
+
+        Ok(ContainerSpecSnapshot {
+            command,
+            env,
+            secrets,
+            resources,
+            health_check,
+        })
     }
 
     /// 列出所有 rcoder-app-manager 托管的 app 状态（对账用）
@@ -224,7 +279,7 @@ impl KubernetesRuntime {
 
     /// TCP 端口的 node_port：查 NodePort Service，按 port name 关联（TCP 对外时用）。
     /// Service 不存在（无 TCP 端口）返空 map。
-    async fn collect_tcp_nodeports(&self, app_id: &str) -> std::collections::HashMap<String, u16> {
+    async fn collect_tcp_nodeports(&self, app_id: &str) -> HashMap<String, u16> {
         self.services_api()
             .get(&self.app_nodeport_name(app_id))
             .await
@@ -268,9 +323,9 @@ fn derive_phase(replicas: i32, ready_replicas: i32, error_message: &Option<Strin
 /// 缺失（旧 app）回退 NodePort 推导：在 NodePort Service 里 = Tcp，否则 Http。
 fn derive_port_statuses(
     deploy: &Deployment,
-    tcp_nodeports: &std::collections::HashMap<String, u16>,
+    tcp_nodeports: &HashMap<String, u16>,
 ) -> Vec<AppPortStatus> {
-    let port_expose: std::collections::HashMap<u16, ExposeType> = deploy
+    let port_expose: HashMap<u16, ExposeType> = deploy
         .metadata
         .annotations
         .as_ref()
@@ -374,6 +429,51 @@ pub(crate) fn container_error_message(
         ));
     }
     None
+}
+
+/// probes → [`container_runtime_api::AppHealthCheck`] 反推（`build_probe` 的逆映射）。
+///
+/// readiness http_get → `Http{path, port}`；tcp_socket → `Tcp{port}`；两者皆无 → None。
+/// 细节：`build_probe` 对缺省 path 写 "/"，反推 "/" → None；liveness http_get.path 与
+/// readiness path 不同时还原 `liveness_path`（相同则 None=复用 path）；delay/period 原样还原。
+#[cfg(feature = "kubernetes")]
+fn probe_to_health_check(
+    container: &k8s_openapi::api::core::v1::Container,
+) -> Option<container_runtime_api::AppHealthCheck> {
+    use container_runtime_api::{AppHealthCheck, HealthCheckType};
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+
+    fn probe_port(port: &IntOrString) -> Option<u16> {
+        match port {
+            IntOrString::Int(i) => u16::try_from(*i).ok(),
+            IntOrString::String(s) => s.parse().ok(),
+        }
+    }
+
+    let readiness = container.readiness_probe.as_ref()?;
+    let (check_type, port, path) = if let Some(http) = readiness.http_get.as_ref() {
+        let path = http.path.clone().filter(|p| p != "/");
+        (HealthCheckType::Http, probe_port(&http.port), path)
+    } else {
+        let tcp = readiness.tcp_socket.as_ref()?;
+        (HealthCheckType::Tcp, probe_port(&tcp.port), None)
+    };
+    let liveness_path = container
+        .liveness_probe
+        .as_ref()
+        .and_then(|lp| lp.http_get.as_ref())
+        .and_then(|lh| lh.path.clone())
+        .filter(|lp_path| lp_path != "/" && Some(lp_path) != path.as_ref());
+    Some(AppHealthCheck {
+        check_type,
+        path,
+        liveness_path,
+        port,
+        initial_delay_seconds: readiness
+            .initial_delay_seconds
+            .and_then(|s| u32::try_from(s).ok()),
+        period_seconds: readiness.period_seconds.and_then(|s| u32::try_from(s).ok()),
+    })
 }
 
 #[cfg(all(test, feature = "kubernetes"))]
@@ -531,7 +631,7 @@ mod tests {
                    {"name":"pg","containerPort":5432}
                ]}]}}}}"#,
         );
-        let mut nodeports = std::collections::HashMap::new();
+        let mut nodeports = HashMap::new();
         nodeports.insert("pg".to_string(), 30001u16);
         let ports = derive_port_statuses(&deploy, &nodeports);
         assert_eq!(ports.len(), 2);
@@ -552,7 +652,7 @@ mod tests {
                 {"name":"pg","containerPort":5432}
             ]}]}}}}"#,
         );
-        let mut nodeports = std::collections::HashMap::new();
+        let mut nodeports = HashMap::new();
         nodeports.insert("pg".to_string(), 30002u16);
         let ports = derive_port_statuses(&deploy, &nodeports);
         let pg = ports.iter().find(|p| p.port == 5432).unwrap();
@@ -568,7 +668,7 @@ mod tests {
             r#"{"metadata":{"annotations":{"rcoder.io/port-expose":"80:http"}},
                "spec":{"template":{"spec":{"containers":[{"name":"app"}]}}}}"#,
         );
-        let ports = derive_port_statuses(&deploy, &std::collections::HashMap::new());
+        let ports = derive_port_statuses(&deploy, &HashMap::new());
         assert!(ports.is_empty());
     }
 }

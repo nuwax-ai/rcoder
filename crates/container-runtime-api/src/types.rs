@@ -323,7 +323,7 @@ pub enum HealthCheckType {
 }
 
 /// 应用健康检查配置
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct AppHealthCheck {
     pub check_type: HealthCheckType,
     /// readiness 探针路径(Http 类型时)。
@@ -338,7 +338,7 @@ pub struct AppHealthCheck {
 }
 
 /// 应用资源需求（字符串格式：cpu="1"/"500m"，memory="512Mi"/"1Gi"，storage="10Gi"）
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct AppResourceRequirements {
     pub cpu: Option<String>,
     pub memory: Option<String>,
@@ -399,7 +399,7 @@ pub struct DeploymentStatus {
 /// app 容器当前 `command`/`env` 快照（`update` 部分更新回退用）。
 ///
 /// rcoder 无状态、不存业务元数据（name/image/command/env 由调用方持久化）。
-/// `update` 请求若漏 `command`/`env`，从 live 容器读当前值回退——与 `ports` 从运行时状态
+/// `update` 请求若漏字段，从 live 容器读当前值回退——与 `ports` 从运行时状态
 /// 回退一致，避免部分更新静默清空（`command` 丢 → 镜像无 ENTRYPOINT 时 CrashLoop；
 /// `env` 丢 → K8s `cleanup_orphan_port_resources` 删 ConfigMap → 容器丢环境变量）。
 ///
@@ -411,6 +411,15 @@ pub struct ContainerSpecSnapshot {
     pub command: Option<Vec<String>>,
     /// 字面值环境变量
     pub env: Option<HashMap<String, String>>,
+    /// 敏感环境变量（K8s 从 `{app}-secret` 读回 base64 解码；
+    /// Docker 与 env 合并存储不可分，恒 None——但 env 回退已含其值，容器行为不丢）
+    pub secrets: Option<HashMap<String, String>>,
+    /// 资源限制（K8s 从 pod template `resources.limits` 原样还原 Quantity 字符串；
+    /// Docker 从 inspect HostConfig 换算；storage 是 per-app PVC 配额不在容器层，恒 None）
+    pub resources: Option<AppResourceRequirements>,
+    /// 健康检查（K8s 从 liveness/readiness probe 反推 `build_probe` 的逆映射；
+    /// Docker 无探针概念，恒 None）
+    pub health_check: Option<AppHealthCheck>,
 }
 
 /// 应用资源用量（运行时层；K8s 来自 metrics.k8s.io PodMetrics，Docker 可来自 bollard stats）。

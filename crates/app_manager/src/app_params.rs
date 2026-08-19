@@ -76,28 +76,56 @@ impl AppService {
                     .to_string(),
             )
         })?;
-        // 问题④修复（方案C）：`command`/`env` 为 None 时从 live 容器读当前值回退（与 `ports`
-        // 从运行时状态回退一致），避免部分更新静默清空：
+        // 部分更新回退（方案C 扩展）：`command`/`env`/`secrets`/`resources`/`health_check`
+        // 任一为 None 时从 live 容器读当前值回退（与 `ports` 从运行时状态回退一致），
+        // 避免部分更新静默清空：
         //   - `command` 丢 → 镜像无 ENTRYPOINT 时 CrashLoop（container.args 为空）；
-        //   - `env` 丢 → K8s `cleanup_orphan_port_resources` 删 ConfigMap → 容器丢环境变量。
-        // 仅在确实缺省时才读（省一次 K8s GET）；读失败降级为旧行为（清空）+ warn，不阻塞 update。
-        // 注：`secrets`/`resources`/`health_check`/`tenant_id`/`space_id` 同为部分更新时静默清空，
-        // 但 severity 较低（不直接 CrashLoop），暂不在此次修复范围（可同法扩展）。
-        let (command, env) = if request.command.is_none() || request.env.is_none() {
+        //   - `env` 丢 → K8s `cleanup_orphan_port_resources` 删 ConfigMap → 容器丢环境变量；
+        //   - `secrets`/`resources`/`health_check` 丢 → K8s 从 Secret/pod limits/probes 读回
+        //     （Docker 的 secrets/health_check 不可分/无探针 → 恒 None 等价旧行为）。
+        // 仅在确实缺省时才读（省一次后端 GET）；读失败降级为旧行为（清空）+ warn，不阻塞 update。
+        // 注：`tenant_id`/`space_id` 仍为部分更新清空（在 K8s label 上，调用方携带即可还原）。
+        let (command, env, secrets, resources, health_check) = if request.command.is_none()
+            || request.env.is_none()
+            || request.secrets.is_none()
+            || request.resources.is_none()
+            || request.health_check.is_none()
+        {
             match self.runtime.get_app_container_spec(app_id).await {
                 Ok(spec) => (
                     request.command.clone().or(spec.command),
                     request.env.clone().or(spec.env),
+                    request.secrets.clone().or(spec.secrets),
+                    request
+                        .resources
+                        .clone()
+                        .or(spec.resources.map(resource_limits_from_snapshot)),
+                    request
+                        .health_check
+                        .clone()
+                        .or(spec.health_check.map(health_check_from_snapshot)),
                 ),
                 Err(e) => {
                     warn!(
-                        "[APP] get_app_container_spec failed app_id={app_id} (command/env may be cleared on partial update): {e}"
+                        "[APP] get_app_container_spec failed app_id={app_id} (missing fields may be cleared on partial update): {e}"
                     );
-                    (request.command.clone(), request.env.clone())
+                    (
+                        request.command.clone(),
+                        request.env.clone(),
+                        request.secrets.clone(),
+                        request.resources.clone(),
+                        request.health_check.clone(),
+                    )
                 }
             }
         } else {
-            (request.command.clone(), request.env.clone())
+            (
+                request.command.clone(),
+                request.env.clone(),
+                request.secrets.clone(),
+                request.resources.clone(),
+                request.health_check.clone(),
+            )
         };
         self.build_params_inner(
             app_id,
@@ -105,10 +133,10 @@ impl AppService {
                 image,
                 command,
                 env,
-                secrets: request.secrets.clone(),
+                secrets,
                 ports: request.ports.clone(),
-                health_check: request.health_check.clone(),
-                resources: request.resources.clone(),
+                health_check,
+                resources,
                 tenant_id: request.tenant_id.clone(),
                 space_id: request.space_id.clone(),
                 recycle_enabled: request.recycle_enabled.or(current.recycle_enabled),
@@ -240,5 +268,222 @@ impl AppService {
         }
 
         Ok(builder.build())
+    }
+}
+
+/// 运行时资源快照 → models::ResourceLimits（update 回退：读回的 Quantity 字符串原样复用）。
+fn resource_limits_from_snapshot(r: AppResourceRequirements) -> ResourceLimits {
+    ResourceLimits {
+        cpu: r.cpu,
+        memory: r.memory,
+        storage: r.storage,
+        ephemeral_storage: r.ephemeral_storage,
+    }
+}
+
+/// 运行时健康检查快照 → models::HealthCheckConfig（update 回退；
+/// check_type 反向映射——两枚举 variants 一一对应）。
+fn health_check_from_snapshot(hc: AppHealthCheck) -> HealthCheckConfig {
+    let check_type = match hc.check_type {
+        container_runtime_api::HealthCheckType::Http => HealthCheckType::Http,
+        container_runtime_api::HealthCheckType::Tcp => HealthCheckType::Tcp,
+        container_runtime_api::HealthCheckType::Exec => HealthCheckType::Exec,
+        container_runtime_api::HealthCheckType::None => HealthCheckType::None,
+    };
+    HealthCheckConfig {
+        check_type,
+        path: hc.path,
+        liveness_path: hc.liveness_path,
+        port: hc.port,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::UpdateAppRequest;
+    use crate::test_support::{MockRuntime, release_lock, test_service};
+    use container_runtime_api::{
+        AppHealthCheck, AppResourceRequirements, ContainerSpecSnapshot, DeploymentStatus,
+        HealthCheckType as RtHealthCheckType,
+    };
+    use std::sync::Arc;
+
+    fn empty_update_request(image: &str) -> UpdateAppRequest {
+        UpdateAppRequest {
+            name: None,
+            image: Some(image.to_owned()),
+            command: None,
+            env: None,
+            secrets: None,
+            resources: None,
+            ports: None,
+            health_check: None,
+            tenant_id: None,
+            space_id: None,
+            recycle_enabled: None,
+            idle_timeout_seconds: None,
+            expected_resource_version: None,
+        }
+    }
+
+    async fn service_with_release_lock(root: &std::path::Path, app_id: &str) -> AppService {
+        let app_dir = root.join(app_id);
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+        test_service(root, Arc::new(MockRuntime::default()))
+    }
+
+    /// 只传 image 的 update：secrets/resources/health_check 缺省时从 live 快照回退
+    /// （不再静默清空），command/env 同理。
+    #[tokio::test]
+    async fn update_missing_fields_fall_back_to_live_spec() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let app_dir = root.path().join("app-fb");
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+        runtime.specs.insert(
+            "app-fb".into(),
+            ContainerSpecSnapshot {
+                command: Some(vec![
+                    "java".into(),
+                    "-jar".into(),
+                    "/app/code/app.jar".into(),
+                ]),
+                env: Some(HashMap::from([("SPRING_PROFILES".into(), "prod".into())])),
+                secrets: Some(HashMap::from([("DB_PASSWORD".into(), "s3cr3t".into())])),
+                resources: Some(AppResourceRequirements {
+                    cpu: Some("1".into()),
+                    memory: Some("1Gi".into()),
+                    storage: None,
+                    ephemeral_storage: Some("2Gi".into()),
+                }),
+                health_check: Some(AppHealthCheck {
+                    check_type: RtHealthCheckType::Http,
+                    path: Some("/actuator/health".into()),
+                    liveness_path: None,
+                    port: Some(8080),
+                    initial_delay_seconds: None,
+                    period_seconds: None,
+                }),
+            },
+        );
+        let service = test_service(root.path(), runtime);
+
+        let params = service
+            .build_container_params_from_update(
+                "app-fb",
+                &empty_update_request("img:v2"),
+                &DeploymentStatus::default(),
+            )
+            .await
+            .expect("params with fallback");
+
+        assert_eq!(
+            params.command,
+            Some(vec![
+                "java".to_string(),
+                "-jar".to_string(),
+                "/app/code/app.jar".to_string()
+            ])
+        );
+        let secrets = params.secrets.expect("secrets fallback");
+        assert_eq!(
+            secrets.get("DB_PASSWORD").map(String::as_str),
+            Some("s3cr3t")
+        );
+        let resources = params.app_resources.expect("resources fallback");
+        assert_eq!(resources.cpu.as_deref(), Some("1"));
+        assert_eq!(resources.memory.as_deref(), Some("1Gi"));
+        assert_eq!(resources.ephemeral_storage.as_deref(), Some("2Gi"));
+        let hc = params.health_check.expect("health_check fallback");
+        assert!(matches!(hc.check_type, RtHealthCheckType::Http));
+        assert_eq!(hc.path.as_deref(), Some("/actuator/health"));
+        assert_eq!(hc.port, Some(8080));
+    }
+
+    /// 显式传值优先：请求携带的 secrets/resources 覆盖 live 快照（整段替换语义不变）。
+    #[tokio::test]
+    async fn update_explicit_fields_override_live_spec() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let app_dir = root.path().join("app-ov");
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+        runtime.specs.insert(
+            "app-ov".into(),
+            ContainerSpecSnapshot {
+                command: None,
+                env: None,
+                secrets: Some(HashMap::from([("OLD".into(), "old".into())])),
+                resources: Some(AppResourceRequirements {
+                    cpu: Some("1".into()),
+                    memory: None,
+                    storage: None,
+                    ephemeral_storage: None,
+                }),
+                health_check: None,
+            },
+        );
+        let service = test_service(root.path(), runtime);
+        let mut request = empty_update_request("img:v2");
+        request.secrets = Some(HashMap::from([("NEW".into(), "new".into())]));
+
+        let params = service
+            .build_container_params_from_update("app-ov", &request, &DeploymentStatus::default())
+            .await
+            .expect("params");
+
+        let secrets = params.secrets.expect("explicit secrets");
+        assert_eq!(secrets.get("NEW").map(String::as_str), Some("new"));
+        assert!(
+            !secrets.contains_key("OLD"),
+            "explicit secrets replace live snapshot"
+        );
+    }
+
+    /// live 快照缺字段（如 Docker 的 secrets/health_check 恒 None）→ 维持旧行为（空）。
+    #[tokio::test]
+    async fn update_fallback_absent_snapshot_field_stays_empty() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let service = service_with_release_lock(root.path(), "app-empty").await;
+
+        let params = service
+            .build_container_params_from_update(
+                "app-empty",
+                &empty_update_request("img:v2"),
+                &DeploymentStatus::default(),
+            )
+            .await
+            .expect("params");
+
+        assert!(
+            params.secrets.as_ref().is_none_or(|m| m.is_empty()),
+            "no snapshot → secrets empty (old behavior)"
+        );
+        assert!(params.app_resources.is_none());
+        assert!(params.health_check.is_none());
     }
 }

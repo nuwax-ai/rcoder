@@ -502,49 +502,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    use crate::test_support::{MockRuntime, test_service};
-
-    /// 合法 schema_version=1 release lock（build_container_params 的 inject_release_identity 需要）
-    fn release_lock() -> &'static str {
-        r#"
-schema_version = 1
-release_id = "release-1"
-workspace_name = "smoke"
-minimum_app_cli_version = "0.1.0"
-runtime_image_digest = "registry.example/app-runtime:0.1.140"
-
-[pingap]
-mode = "managed"
-version = "0.13.7"
-commit = "abc123"
-
-[[services]]
-service_id = "backend"
-name = "Backend"
-dir = "backend"
-type = "go"
-kind = "web"
-enabled = true
-port = 4100
-logs = []
-
-[services.run]
-command = ["./server"]
-migrate = []
-depends_on = []
-shutdown_timeout_seconds = 30
-
-[services.health]
-
-[services.proxy]
-path = "/"
-strip_prefix = false
-plugins = []
-upstream_includes = []
-
-[services.env]
-"#
-    }
+    use crate::test_support::{MockRuntime, release_lock, test_service};
 
     fn create_request(app_id: &str) -> CreateAppRequest {
         CreateAppRequest {

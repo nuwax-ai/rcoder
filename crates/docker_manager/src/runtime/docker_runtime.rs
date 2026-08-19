@@ -742,8 +742,12 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         }))
     }
 
-    /// 读 app 当前容器的 `command`/`env` 快照（update 部分更新回退用，见 trait 注释）。
-    /// Docker：command = `Config.cmd`，env = `Config.env`（`K=V` 数组）。容器不存在 → 空快照。
+    /// 读 app 当前容器的 desired 快照（update 部分更新回退用，见 trait 注释）。
+    /// Docker：command = `Config.cmd`，env = `Config.env`（`K=V` 数组）；
+    /// resources 从 inspect HostConfig 换算（NanoCpus→核数、字节→Quantity）。
+    /// secrets/health_check 恒 None：Docker create 时 env+secrets **合并**进容器 env
+    /// （不可分），而 Docker 无探针概念——env 回退已含 secrets 值，容器行为不丢。
+    /// 容器不存在 → 空快照。
     async fn get_app_container_spec(
         &self,
         app_id: &str,
@@ -774,7 +778,23 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                     .collect::<HashMap<String, String>>()
             })
             .filter(|m| !m.is_empty());
-        Ok(ContainerSpecSnapshot { command, env })
+        let resources = inspect
+            .host_config
+            .as_ref()
+            .map(|hc| container_runtime_api::AppResourceRequirements {
+                cpu: hc.nano_cpus.map(docker_cpus_to_quantity),
+                memory: hc.memory.map(docker_memory_to_quantity),
+                storage: None,
+                ephemeral_storage: None,
+            })
+            .filter(|r| r.cpu.is_some() || r.memory.is_some());
+        Ok(ContainerSpecSnapshot {
+            command,
+            env,
+            secrets: None,
+            resources,
+            health_check: None,
+        })
     }
 
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
@@ -1084,6 +1104,33 @@ impl DockerRuntime {
 /// 前缀取自 `ServiceType::UserApp::container_prefix()`，避免散落硬编码；改前缀只需改一处。
 fn app_deployment_name(app_id: &str) -> String {
     format!("{}-{app_id}", ServiceType::UserApp.container_prefix())
+}
+
+/// Docker `NanoCpus`（1 核 = 1e9）→ K8s Quantity 核数字符串（"1"/"0.5"）。
+/// update 回退用：读回的值将再次下发为 K8s/Docker 资源限制。
+fn docker_cpus_to_quantity(nano_cpus: i64) -> String {
+    let cores = nano_cpus as f64 / 1e9;
+    if cores.fract() == 0.0 {
+        format!("{}", cores as i64)
+    } else {
+        format!("{cores}")
+    }
+}
+
+/// Docker 字节内存限制 → K8s Quantity 字符串（就近 Ki/Mi/Gi 向下取整，不超原值）。
+fn docker_memory_to_quantity(bytes: i64) -> String {
+    const KI: i64 = 1024;
+    const MI: i64 = 1024 * 1024;
+    const GI: i64 = 1024 * 1024 * 1024;
+    if bytes >= GI {
+        format!("{}Gi", bytes / GI)
+    } else if bytes >= MI {
+        format!("{}Mi", bytes / MI)
+    } else if bytes >= KI {
+        format!("{}Ki", bytes / KI)
+    } else {
+        format!("{bytes}")
+    }
 }
 
 /// 将内部 `ContainerStatus` 映射为运行时 `ContainerRuntimeStatus`

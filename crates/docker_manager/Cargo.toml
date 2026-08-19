@@ -25,6 +25,9 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# K8s Secret `.data` base64 解码(read_app_container_spec secrets 回退)
+base64 = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
