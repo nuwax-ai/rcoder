@@ -301,11 +301,18 @@ impl AppService {
         self.register_pingora_backends(app_id, &http_ports, &info.container_ip)
             .await;
         info!("[APP] app updated: {}", app_id);
-        // 业务元数据 upsert（name/租户随 update 刷新;created_at SQL 侧不更新）
+        // 业务元数据 upsert（created_at SQL 侧不更新）。name 缺省回退已存值——
+        // update 语义里 name 是"仅元数据"调用方常不带,upsert 是整字段覆盖,
+        // 直传 None 会把业务名清空（query name 过滤随之失效）。tenant/space
+        // 保持与 label 相同的"携带即覆盖"语义（create 时的值不回退）。
+        let name = request
+            .name
+            .clone()
+            .or_else(|| self.metadata.lookup(app_id).and_then(|meta| meta.name));
         self.metadata
             .record(
                 app_id,
-                request.name.clone(),
+                name,
                 request.tenant_id.clone(),
                 request.space_id.clone(),
             )
@@ -646,6 +653,75 @@ mod tests {
             "original error must not be masked by cleanup failure, got: {error}"
         );
         assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 回归（userapp_metadata）：update 不带 name（name 是"仅元数据"调用方常省略）
+    /// 不得清空已存业务名——否则 query name 过滤对该 app 永久失效。带 name 则覆盖。
+    #[tokio::test]
+    async fn update_app_without_name_keeps_metadata_name() {
+        use crate::models::UpdateAppRequest;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let service = test_service(root.path(), runtime);
+        // create_app 需要 code/release.lock.toml
+        let app_dir = root.path().join("app-meta");
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+
+        let mut create = create_request("app-meta");
+        create.name = "alpha".into();
+        service.create_app(create).await.expect("create app");
+        assert_eq!(
+            service.metadata.lookup("app-meta").and_then(|m| m.name),
+            Some("alpha".into()),
+            "create records name"
+        );
+
+        let update_no_name = UpdateAppRequest {
+            name: None,
+            image: Some("registry.example/app-runtime:v2".into()),
+            command: None,
+            env: None,
+            secrets: None,
+            resources: None,
+            ports: None,
+            health_check: None,
+            tenant_id: None,
+            space_id: None,
+            recycle_enabled: None,
+            idle_timeout_seconds: None,
+            expected_resource_version: None,
+        };
+        service
+            .update_app("app-meta", update_no_name.clone())
+            .await
+            .expect("update without name");
+        assert_eq!(
+            service.metadata.lookup("app-meta").and_then(|m| m.name),
+            Some("alpha".into()),
+            "update without name must NOT clear recorded name"
+        );
+
+        let mut update_with_name = update_no_name;
+        update_with_name.image = Some("registry.example/app-runtime:v3".into());
+        update_with_name.name = Some("beta".into());
+        service
+            .update_app("app-meta", update_with_name)
+            .await
+            .expect("update with name");
+        assert_eq!(
+            service.metadata.lookup("app-meta").and_then(|m| m.name),
+            Some("beta".into()),
+            "explicit name overrides"
+        );
     }
 
     /// query_apps 的 name/created_at 过滤:纯内存模式（无 metadata 持久化）维持忽略

@@ -37,6 +37,9 @@ impl AppService {
         let _process_lock = self.acquire_process_release_lock(app_id).await;
         let _lock = acquire_lock(releases_dir.join(".operation.lock")).await?;
         let mut index = read_index(&releases_dir, retention).await?;
+        // 与 activate/rollback/list/delete 一致:读后归一化,append 后的 write_index
+        // 才不会把遗留 PendingStart 原样持久化回去。
+        index.normalize_legacy_pending();
         if let Some(existing) = index
             .releases
             .iter()

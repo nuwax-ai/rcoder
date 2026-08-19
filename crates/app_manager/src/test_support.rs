@@ -104,6 +104,16 @@ impl UserAppDeploymentRuntime for MockRuntime {
             ));
         }
         let project_id = params.project_id.unwrap_or_default();
+        // 登记 deployments（后续 get_app/update 流程的 fetch_runtime_status 需要）
+        self.deployments
+            .entry(project_id.clone())
+            .or_insert_with(|| DeploymentStatus {
+                app_id: project_id.clone(),
+                replicas: 1,
+                ready_replicas: 1,
+                phase: "Running".into(),
+                ..Default::default()
+            });
         Ok(ContainerBasicInfo {
             container_id: "mock-container-id".into(),
             container_name: format!("userapp-{project_id}"),
@@ -115,6 +125,14 @@ impl UserAppDeploymentRuntime for MockRuntime {
             created_at: chrono::Utc::now(),
             service_url: String::new(),
         })
+    }
+
+    async fn patch_deployment(
+        &self,
+        params: ContainerCreateParams,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        // update_app 路径：与 create 同构（不注入失败；登记 deployments 供 get_app）
+        self.create_deployment(params).await
     }
 }
 
