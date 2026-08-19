@@ -10,31 +10,19 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, anyhow};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use shared_types::BuildProgressEvent;
+use shared_types::HttpResult;
 use tokio::sync::mpsc;
 
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 const SSE_CHANNEL_CAP: usize = 128;
 /// SSE 单帧缓冲上限:超过仍找不到帧分隔符视为异常(防无分隔符的恶意/异常流撑爆内存)。
 const MAX_SSE_BUFFER: usize = 1024 * 1024;
-
-/// file-server UserApp 接口的 HttpResult 包装(消费侧镜像,泛型 data)。
-///
-/// file-server 侧统一返回 `{success, code, message, data}`(UserAppReply 层);
-/// rcoder 消费同一契约,经 [`parse_http_result`] 反序列化 + success 校验,
-/// 字段名(camelCase)只在 serde 声明处出现一次——不再 Value 手抠散落多处。
-#[derive(Debug, Deserialize)]
-struct FsReply<T> {
-    // success/code/message 的错误路径已在 parse_http_result 里经 Value 提取
-    // (extract_fs_error);此处仅反序列化关心的 data。Option 缺省即 None(泛型
-    // struct 上 #[serde(default)] 会强加 T: Default bound,故不标)。
-    data: Option<T>,
-}
 
 /// build 触发响应的 data(`{taskId}`)。
 #[derive(Debug, Deserialize)]
@@ -56,21 +44,52 @@ pub(crate) struct BuildSnapshot {
     pub file_name: Option<String>,
 }
 
-/// 解析 HttpResult 包装响应:success=false/非 2xx → 错误(message 优先);
-/// data 缺失 → 错误(成功响应必有 data)。
+/// agent-runner(file-server)HttpResult 响应解析错误(结构化:code/message 字段保留,
+/// 不揉进 anyhow 字符串;外层 anyhow Result 经 `?` 自动包装 Display)。
+#[derive(Debug, thiserror::Error)]
+enum FsReplyError {
+    /// 受控失败:HTTP 非 2xx 或业务 code != SUCCESS。
+    #[error("agent-runner {context} -> HTTP {http}: {message} (code={code})")]
+    Failure {
+        context: String,
+        http: u16,
+        code: String,
+        message: String,
+    },
+    /// 业务成功但缺 data 字段(成功响应必有 data)。
+    #[error("agent-runner {context}: success response missing data: {body}")]
+    MissingData { context: String, body: String },
+    /// 响应体不是 HttpResult 形态(网关 HTML / 全局 AppError 兜底等)。
+    #[error("{detail}")]
+    Shape { detail: anyhow::Error },
+}
+
+/// 解析 HttpResult 包装响应(直接复用 `shared_types::HttpResult`——file-server 的
+/// UserAppReply 层输出同一类型,客户端消费同一契约,单一事实源,不另建镜像)。
+///
+/// 成功判定按权威语义 `code == SUCCESS`(HttpResult 的 success 字段是序列化期
+/// 推导值、`#[serde(skip)]`,反序列化侧不可用)。
 fn parse_http_result<T: DeserializeOwned>(
     body: &Value,
     status: reqwest::StatusCode,
-    where_: &str,
-) -> Result<T> {
-    if !status.is_success() || body.get("success").and_then(|s| s.as_bool()) == Some(false) {
-        return Err(extract_fs_error(body, status, where_));
+    context: &str,
+) -> Result<T, FsReplyError> {
+    let reply: HttpResult<T> =
+        serde_json::from_value(body.clone()).map_err(|_| FsReplyError::Shape {
+            detail: extract_fs_error(body, status, context),
+        })?;
+    if !status.is_success() || reply.code != shared_types::error_codes::SUCCESS {
+        return Err(FsReplyError::Failure {
+            context: context.to_string(),
+            http: status.as_u16(),
+            code: reply.code,
+            message: reply.message,
+        });
     }
-    let reply: FsReply<T> = serde_json::from_value(body.clone())
-        .with_context(|| format!("agent-runner {where_} response shape mismatch"))?;
-    reply
-        .data
-        .ok_or_else(|| anyhow!("agent-runner {where_} response missing data field: {body}"))
+    reply.data.ok_or_else(|| FsReplyError::MissingData {
+        context: context.to_string(),
+        body: body.to_string(),
+    })
 }
 
 /// SSE 后台任务产生的流级错误(经 channel 透传给 orchestrator,不再静默 log-then-close)。
@@ -136,7 +155,7 @@ fn fs_error_from_bytes(bytes: &[u8], status: reqwest::StatusCode, where_: &str) 
 }
 
 /// 触发 agent-runner workspace build,返 taskId(类型化:HttpResult data.taskId)。
-pub async fn trigger_build(addr: &str, app_id: &str) -> Result<String> {
+pub async fn trigger_build(addr: &str, app_id: &str) -> anyhow::Result<String> {
     let url = format!("{addr}/api/userapp/build");
     let resp = HTTP_CLIENT
         .post(&url)
@@ -152,7 +171,7 @@ pub async fn trigger_build(addr: &str, app_id: &str) -> Result<String> {
 }
 
 /// 取消 agent-runner build 任务(软取消 + kill 进程组)。
-pub async fn cancel_build(addr: &str, task_id: &str) -> Result<()> {
+pub async fn cancel_build(addr: &str, task_id: &str) -> anyhow::Result<()> {
     let url = format!("{addr}/api/userapp/tasks/{task_id}/cancel");
     let resp = HTTP_CLIENT
         .post(&url)
@@ -172,7 +191,7 @@ pub async fn cancel_build(addr: &str, task_id: &str) -> Result<()> {
 }
 
 /// 取 build 任务快照(类型化:HttpResult data → [`BuildSnapshot`])。
-pub async fn get_build_snapshot(addr: &str, task_id: &str) -> Result<BuildSnapshot> {
+pub async fn get_build_snapshot(addr: &str, task_id: &str) -> anyhow::Result<BuildSnapshot> {
     let url = format!("{addr}/api/userapp/tasks/{task_id}");
     let resp = HTTP_CLIENT
         .get(&url)
@@ -182,7 +201,7 @@ pub async fn get_build_snapshot(addr: &str, task_id: &str) -> Result<BuildSnapsh
         .with_context(|| format!("agent-runner get task: {url}"))?;
     let status = resp.status();
     let body: Value = resp.json().await.context("parse task snapshot")?;
-    parse_http_result(&body, status, "get task")
+    Ok(parse_http_result(&body, status, "get task")?)
 }
 
 /// 订阅 agent-runner build 进度 SSE → `mpsc::Receiver<Result<BuildProgressEvent, BuildStreamError>>`。
@@ -367,31 +386,33 @@ mod tests {
 
     #[test]
     fn httpresult_rejects_missing_data_and_error_shape() {
-        // 成功但缺 data → 错误(成功响应必有 data)
+        // 成功(code=SUCCESS)但缺 data → MissingData(成功响应必有 data)
         for invalid in [
-            json!({"success": true}),
-            json!({"success": true, "data": null}),
+            json!({"code": "0000", "message": "ok"}),
+            json!({"code": "0000", "message": "ok", "data": null}),
         ] {
             let error = parse_http_result::<BuildStarted>(&invalid, reqwest::StatusCode::OK, "x")
                 .expect_err("data is required");
-            assert!(error.to_string().contains("missing data"), "{error}");
+            assert!(matches!(error, FsReplyError::MissingData { .. }), "{error}");
         }
-        // success=false → 走错误提取(message 透传)
+        // 业务失败(code != SUCCESS)→ Failure,message/code 结构化透传
         let error = parse_http_result::<BuildStarted>(
-            &json!({"success": false, "message": "boom"}),
+            &json!({"code": "ERR_BUILD_FAILED", "message": "boom"}),
             reqwest::StatusCode::OK,
             "build",
         )
         .expect_err("failure reply");
+        assert!(matches!(error, FsReplyError::Failure { .. }), "{error}");
         assert!(error.to_string().contains("boom"), "{error}");
-        // 旧错误契约(顶层 taskId/task)不再被接受:HttpResult 包装下必须走 data
+        assert!(error.to_string().contains("ERR_BUILD_FAILED"), "{error}");
+        // 旧顶层形态(无 code/message,taskId 在顶层)→ Shape 兜底拒绝
         let error = parse_http_result::<BuildStarted>(
             &json!({"success": true, "taskId": "01a01a28"}),
             reqwest::StatusCode::OK,
             "build",
         )
         .expect_err("top-level shape rejected");
-        assert!(error.to_string().contains("missing data"), "{error}");
+        assert!(matches!(error, FsReplyError::Shape { .. }), "{error}");
     }
 
     #[test]
