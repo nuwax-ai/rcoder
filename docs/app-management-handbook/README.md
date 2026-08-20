@@ -13,7 +13,7 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
 2. **HTTP 只用 GET + POST**（部署网关限制）。写操作把动词放进路径：`/delete`、`/update`、`/files/delete`、`/storage/delete`。
 3. **创建是异步的**——`POST /apps` 建完资源立即返回 `Starting`，不等 Ready；你轮询 `GET /apps/{id}` 观察 `Starting → Running`。
 4. **删除默认保留数据**——`delete` 只删计算面，保留 code/data/logs；要连数据清传 `purge:true`。
-5. **发布有三阶段**——build（构建）→ prepare（预备入库）→ activate（切流+ensure 容器+等就绪，单接口收敛到 Active/Failed，失败**保留现场**）。失败后恢复用 rollback。见 [10-发布与版本管理](./10-发布与版本管理.md)。
+5. **发布有三阶段**——build（构建）→ prepare（预备入库）→ activate（切流+ensure 容器+等就绪，单接口收敛到 active/failed，失败**保留现场**）。失败后恢复用 rollback。见 [10-发布与版本管理](./10-发布与版本管理.md)。
 6. **判断错误看 `code` 字段**，别只看 HTTP 状态码。详见 [03-错误处理与重试](./03-错误处理与重试.md)。
 
 ---
@@ -72,7 +72,7 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate 链路
 ### 4. 必须理解的 3 个语义
 
 1. **异步创建**：POST /apps 返回 Starting，你轮询 GET /apps/{id} 等到 Running。
-2. **发布单接口收敛**：activate 同步"切流+等就绪"——status=Active 即成功；status=Failed（200 返回）即就绪失败且**现场保留**（code/快照/制品包不动，供排查），放弃新版调 rollback 一键恢复。注意等待期同步阻塞，HTTP 读超时要 ≥ readinessTimeoutSeconds。
+2. **发布单接口收敛**：activate 同步"切流+等就绪"——status=active 即成功；status=failed（200 返回）即就绪失败且**现场保留**（code/快照/制品包不动，供排查），放弃新版调 rollback 一键恢复。注意等待期同步阻塞，HTTP 读超时要 ≥ readinessTimeoutSeconds。
 3. **错误看 code**：HTTP 状态码只分大类，具体原因看 response body 的 `code` + `message` 字段。
 
 ---
@@ -138,10 +138,10 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate 链路
 |---|---|---|---|
 | **镜像拉取/资源不足错误码** | 502/503 | 归 `ERR_BACKEND_ERROR`(500) | 看 `GET /apps/{id}` 的 `conditions[].reason` |
 | **logs follow** | `follow=true` 流式 | 未实现（快照） | 实时流用 `/logs/stream`（SSE） |
-| **stats CPU/内存** | 返回资源使用 | 返回默认空值 | 仅 `restart_count` 可靠 |
+| **stats CPU/内存** | 返回资源使用 | 返回默认空值 | 仅 `restartCount` 可靠 |
 | **Exec 健康检查** | 支持 | 不支持 | 传 `Exec` 返回 400，用 `Http`/`Tcp` |
 | **query 的 name/created_at 过滤** | 支持 | K8s+PG 模式生效（rcoder 侧 `userapp_metadata` 表存业务元数据）；Docker Compose 模式忽略（Java 本地二次过滤） |
-| **storage/query 的 tenant_id/space_id** | 支持 | 忽略 | 用 `app_ids` / `orphan_only` |
+| **storage/query 的 tenant_id/space_id** | 支持 | 忽略 | 用 `appIds` / `orphanOnly` |
 | **HTTP 访问地址** | 读路径稳定返回 | rcoder 重启后读路径 `external.http` 可能 `null` | 以 create 响应为准或自行缓存 |
 
 ---

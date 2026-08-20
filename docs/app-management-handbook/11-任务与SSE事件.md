@@ -65,16 +65,16 @@ Pending → Running → (Cancelling) → Completed / Failed / Cancelled
   "data": {
     "task": {
       "id": "019123456789abcdef",
-      "app_id": "app-order-svc",
-      "project_id": "app-order-svc",
+      "appId": "app-order-svc",
+      "projectId": "app-order-svc",
       "kind": "build",              // build | publish
       "status": "running",          // pending | running | cancelling | completed | failed | cancelled
       "stage": "compiling",         // 当前阶段标识
-      "release_id": null,           // completed 时回填
+      "releaseId": null,           // completed 时回填
       "error": null,                // failed 时的错误文案
       "seq": 15,                    // 当前事件序号（断线重连游标）
-      "created_at": 1786738599,
-      "updated_at": 1786738605
+      "createdAt": 1786738599,
+      "updatedAt": 1786738605
     }
   }
 }

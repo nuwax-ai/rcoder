@@ -204,7 +204,7 @@ impl AppService {
         // 排序（app_id 直接可用；name/created_at 经 metadata join，缺元数据排最后；默认升序）
         if let Some(sort_by) = &request.sort_by {
             match sort_by.as_str() {
-                "app_id" => {
+                "appId" => {
                     items.sort_by(|a, b| a.app_id.cmp(&b.app_id));
                 }
                 "name" => {
@@ -218,7 +218,7 @@ impl AppService {
                             .unwrap_or_default()
                     });
                 }
-                "created_at" => {
+                "createdAt" => {
                     if self.metadata.persistence().is_none() {
                         warn!(
                             "[APP] sort_by=created_at requires business metadata (PG mode), no-op"
@@ -234,7 +234,7 @@ impl AppService {
                 // 传 created_at 等未支持值+desc 会把默认顺序直接反转，半生效的静默错误）
                 other => {
                     return Err(AppOperationError::Validation(format!(
-                        "sort_by must be one of app_id/name/created_at, got '{other}'"
+                        "sort_by must be one of appId/name/createdAt, got '{other}'"
                     )));
                 }
             }
