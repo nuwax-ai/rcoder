@@ -69,7 +69,7 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
     let tokio_console_layer = config.console_layer.take();
     // span 耗时→直方图规则（SpanMetricsLayer；调用点 #[instrument] 零计时代码）
     let span_metrics = std::mem::take(&mut config.span_metrics);
-    let _ = subscriber::init_tracing_subscriber(
+    subscriber::init_tracing_subscriber(
         &config.service_name,
         tracer_provider.as_ref(),
         config.file_log.as_ref(),

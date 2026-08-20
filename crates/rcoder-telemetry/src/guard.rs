@@ -51,5 +51,16 @@ impl TelemetryGuard {
     pub fn service_name(&self) -> &str {
         &self.service_name
     }
+}
 
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        if self.tracer_provider.is_some() {
+            otlp::shutdown_tracer_provider();
+        }
+        info!(
+            "[Telemetry] Telemetry system shutdown: {}",
+            self.service_name
+        );
+    }
 }
