@@ -223,7 +223,6 @@ impl TraceIdJsonFormat {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn init_tracing_subscriber(
     service_name: &str,
     tracer_provider: Option<&SdkTracerProvider>,

@@ -111,7 +111,6 @@ impl AgentService for AgentServiceImpl {
         request: Request<GetContainerStatusRequest>,
     ) -> Result<Response<GetContainerStatusResponse>, Status> {
         // 后台状态探测无 traceparent（rcoder 有意不注入）——独立根 span
-        // 后台状态探测无 traceparent（rcoder 有意不注入）——独立根 span
         let span = rcoder_telemetry::grpc_span!("get_container_status", request.metadata());
         status::get_container_status(&self.app_state, request)
             .instrument(span)
