@@ -9,7 +9,6 @@ use super::commons::{AppStatus, HealthCheckConfig, PortConfig, ResourceLimits};
 
 /// 创建应用请求
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateAppRequest {
     /// 应用 ID（可选，外部指定；格式 `app-` + DNS-1123，如 `app-order-svc`；None=自动生成）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,7 +47,6 @@ pub struct CreateAppRequest {
 
 /// 查询应用请求
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct QueryAppsRequest {
     /// 页码
     pub page: Option<u32>,
@@ -64,7 +62,6 @@ pub struct QueryAppsRequest {
 
 /// 应用过滤条件
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct AppFilters {
     /// 按状态过滤
     pub status: Option<Vec<AppStatus>>,
@@ -78,7 +75,6 @@ pub struct AppFilters {
 
 /// 时间范围
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct DateRange {
     /// 起始时间（RFC3339）
     pub start: String,
@@ -101,7 +97,6 @@ pub enum SortOrder {
 /// `image` 必填（无法保留旧 image）；`ports`/`health_check` 为整段替换。
 /// `tenant_id`/`space_id` 携带以保持资源 label（rcoder 不主动修改租户归属）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateAppRequest {
     /// 应用名称（仅元数据，不影响 K8s 资源命名；rcoder 忽略）
     pub name: Option<String>,
@@ -140,7 +135,6 @@ pub struct UpdateAppRequest {
 /// 供计费侧免费↔付费 tier 变更调用：`recycle_enabled=false`（付费→不回收）/`true`（降级免费→恢复回收）。
 /// 比 `UpdateAppRequest` 轻——无需 image、不走全量 SSA。至少需传一个字段（皆 None → ERR_VALIDATION）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct RecyclePolicyRequest {
     /// 是否参与闲置回收。None=不改；Some(true)=可回收（免费默认）；Some(false)=永不回收（付费/常驻）。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,7 +146,6 @@ pub struct RecyclePolicyRequest {
 
 /// 删除应用请求
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct DeleteAppRequest {
     /// 是否同时清空持久存储（默认 `false`：只删计算面，保留数据面）
     #[serde(default)]

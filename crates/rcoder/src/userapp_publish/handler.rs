@@ -54,14 +54,12 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
 
 /// publish / build 请求体:agent-runner project_id(定位 build 目标)。
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct PublishBody {
     pub project_id: String,
 }
 
 /// tasks/query 请求体(分页 + 可选过滤;POST body 承载,与 /apps/query 惯例一致)。
 #[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct QueryPublishTasksRequest {
     /// 页码,从 1 起,默认 1
     pub page: Option<u32>,
@@ -73,7 +71,6 @@ pub struct QueryPublishTasksRequest {
 
 /// 任务过滤(app_ids 精确集合 / kind / 只看未终态)。
 #[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct PublishTaskFilters {
     /// 按 app_id 集合过滤(None=全部)
     pub app_ids: Option<Vec<String>>,
@@ -93,7 +90,6 @@ pub struct StreamQuery {
 
 /// publish / build 立即返回(task 已创建,后台 spawn)。
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct PublishTaskData {
     pub task_id: String,
     pub status: String,
@@ -101,14 +97,12 @@ pub struct PublishTaskData {
 
 /// get_task 返回(任务快照)。
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct GetTaskData {
     pub task: PublishTaskSnapshot,
 }
 
 /// cancel_task 返回(Accepted 时 already_terminal=None;AlreadyTerminal 时 Some(true))。
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct CancelTaskData {
     pub task_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]

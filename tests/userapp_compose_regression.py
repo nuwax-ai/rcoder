@@ -42,8 +42,8 @@ def test_tasks_query():
           isinstance(data.get("items"), list) and "total" in pagination,
           f"total={pagination.get('total')}, items={len(data.get('items') or [])}")
     r2 = requests.post(f"{BASE}/api/v1/apps/publish/tasks/query",
-                       json={"filters": {"activeOnly": True}}, timeout=TIMEOUT)
-    check("activeOnly 过滤查询返回 200", r2.status_code == 200, f"status={r2.status_code}")
+                       json={"filters": {"active_only": True}}, timeout=TIMEOUT)
+    check("active_only 过滤查询返回 200", r2.status_code == 200, f"status={r2.status_code}")
 
 
 def test_publish_identifiers():
@@ -52,34 +52,34 @@ def test_publish_identifiers():
         t0 = time.time()
         try:
             r = requests.post(f"{BASE}/api/v1/apps/BAD_ID/{kind}",
-                              json={"projectId": "also-bad"}, timeout=10)
+                              json={"project_id": "also-bad"}, timeout=10)
             elapsed = time.time() - t0
             check(f"{kind} 非法 app_id 返回 4xx 而非挂起",
                   400 <= r.status_code < 500 and elapsed < 5,
                   f"status={r.status_code}, {elapsed:.1f}s")
         except requests.Timeout:
             check(f"{kind} 非法 app_id 快速失败", False, "10s 超时（疑似挂起！）")
-    # projectId != appId → 400（UserAppBuilder 一 app 一 workspace 契约）
+    # project_id != app_id → 400（UserAppBuilder 一 app 一 workspace 契约）
     app_id = f"app-e2e-mismatch-{uuid.uuid4().hex[:6]}"
     r = requests.post(f"{BASE}/api/v1/apps/{app_id}/publish",
-                      json={"projectId": f"proj-{uuid.uuid4().hex[:8]}"}, timeout=10)
-    check("projectId != appId 被拒（400 契约校验）",
+                      json={"project_id": f"proj-{uuid.uuid4().hex[:8]}"}, timeout=10)
+    check("project_id != app_id 被拒（400 契约校验）",
           r.status_code == 400 and "must equal" in r.text,
           f"status={r.status_code}")
 
 
 def test_publish_reaches_terminal():
     print("▶ publish 合法请求 → 有限时间内到达终态（死锁修复行为面）")
-    # projectId == appId；agent 会话不存在 → ensure_agent_addr 失败 → failed
+    # project_id == app_id；agent 会话不存在 → ensure_agent_addr 失败 → failed
     ident = f"app-e2e-term-{uuid.uuid4().hex[:6]}"
     t0 = time.time()
     r = requests.post(f"{BASE}/api/v1/apps/{ident}/publish",
-                      json={"projectId": ident}, timeout=15)
+                      json={"project_id": ident}, timeout=15)
     check("publish 受理（200 任务创建）", r.status_code == 200,
           f"status={r.status_code}, body={r.text[:120]}")
     if r.status_code != 200:
         return
-    task_id = (r.json().get("data") or {}).get("taskId") or (r.json().get("data") or {}).get("task_id")
+    task_id = (r.json().get("data") or {}).get("task_id")
     deadline = time.time() + 180
     status = "unknown"
     while time.time() < deadline:
@@ -99,7 +99,7 @@ def test_publish_reaches_terminal():
     q = requests.post(f"{BASE}/api/v1/apps/publish/tasks/query",
                       json={"filters": {"appIds": [ident]}}, timeout=TIMEOUT)
     items = ((q.json().get("data") or {}).get("items")) if q.status_code == 200 else []
-    check("tasks/query 可按 appIds 过滤到该任务",
+    check("tasks/query 可按 app_ids 过滤到该任务",
           q.status_code == 200 and len(items) >= 1,
           f"status={q.status_code}, 命中={len(items or [])}")
 

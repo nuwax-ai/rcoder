@@ -5,7 +5,6 @@ use utoipa::ToSchema;
 
 /// 资源限制
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct ResourceLimits {
     /// CPU: "1", "500m", "0.5"
     pub cpu: Option<String>,
@@ -20,7 +19,6 @@ pub struct ResourceLimits {
 
 /// 端口配置
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct PortConfig {
     /// 端口名称: "http", "postgres"
     pub name: String,
@@ -47,7 +45,6 @@ pub enum ExposeType {
 
 /// 健康检查配置
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct HealthCheckConfig {
     /// 检查类型
     pub check_type: HealthCheckType,
@@ -84,7 +81,6 @@ pub enum AppStatus {
 
 /// 访问信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct AccessInfo {
     /// 外部访问（HTTP 地址 / TCP NodePort）
     pub external: ExternalAccess,
@@ -94,7 +90,6 @@ pub struct AccessInfo {
 
 /// 外部访问
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct ExternalAccess {
     /// HTTP 访问地址
     pub http: Option<String>,
@@ -104,7 +99,6 @@ pub struct ExternalAccess {
 
 /// TCP 端口映射
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct TcpPortMapping {
     /// 端口名称
     pub name: String,
@@ -116,7 +110,6 @@ pub struct TcpPortMapping {
 
 /// 内部访问
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct InternalAccess {
     /// 集群内完整域名（FQDN）
     pub domain: String,
@@ -128,7 +121,6 @@ pub struct InternalAccess {
 
 /// 内部端口
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct InternalPort {
     /// 端口名称
     pub name: String,

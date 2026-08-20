@@ -88,7 +88,6 @@ pub async fn upload_file(
 
 /// 从 URL 下载文件请求
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct UploadFromUrlRequest {
     /// 下载 URL（HTTP/HTTPS；允许内网 IP、localhost、集群域名和普通公网域名）
     pub url: String,
@@ -128,7 +127,6 @@ pub async fn upload_from_url(
 
 /// 列出文件查询参数
 #[derive(Debug, Deserialize, Default, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct ListFilesQuery {
     /// 子目录（相对 app 根，如 "code"/"data"/"logs"；默认列 app 根）
     pub path: Option<String>,
@@ -164,7 +162,6 @@ pub async fn list_files(
 
 /// 删除文件请求
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct DeleteFileRequest {
     /// 文件路径（app 根相对，如 "code/app.jar"，可指向 code/data/logs 下任意文件）
     pub path: String,

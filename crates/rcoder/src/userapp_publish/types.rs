@@ -82,7 +82,7 @@ pub enum PublishTaskStatus {
 
 /// 进度事件(给前端 SSE)。agent-runner build 进度原样透传(`BuildProgress.data`)。
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase", tag = "event")]
+#[serde(tag = "event", rename_all = "snake_case")]
 pub enum PublishEvent {
     /// 进入新发布阶段(publish: EnsureApp/Prepare/Activate/WaitReady/Confirm)。
     Stage { stage: String },
@@ -109,7 +109,6 @@ pub enum CancelAttempt {
 
 /// 任务快照(GET /tasks/{id} 返回)。
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct PublishTaskSnapshot {
     pub id: PublishTaskId,
     pub app_id: String,

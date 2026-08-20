@@ -29,16 +29,16 @@ Pending → Running → (Cancelling) → Completed / Failed / Cancelled
 ```jsonc
 {
   "page": 1,
-  "pageSize": 20,
+  "page_size": 20,
   "filters": {
-    "appIds": ["app-order-svc"],   // 可选：按 app 过滤
+    "app_ids": ["app-order-svc"],   // 可选：按 app 过滤
     "kind": "build",               // 可选：build | publish
-    "activeOnly": true             // 可选：只看未终态（对账：该 app 在跑任务吗）
+    "active_only": true             // 可选：只看未终态（对账：该 app 在跑任务吗）
   }
 }
 ```
 
-- `page` 默认 1（<1 → 400）；`pageSize` 默认 20，范围 1..=100（越界 → 400）；`filters` 可省略。
+- `page` 默认 1（<1 → 400）；`page_size` 默认 20，范围 1..=100（越界 → 400）；`filters` 可省略。
 - 排序 `createdAt DESC, taskId DESC`。
 
 **响应** `HttpResult<PaginatedResponse<PublishTaskSnapshot>>`：
@@ -46,8 +46,8 @@ Pending → Running → (Cancelling) → Completed / Failed / Cancelled
 {
   "success": true,
   "data": {
-    "items": [ { "id": "019...", "appId": "app-order-svc", "kind": "build", "status": "running", "stage": "Build", "seq": 15, ... } ],
-    "pagination": { "page": 1, "pageSize": 20, "total": 1, "totalPages": 1 }
+    "items": [ { "id": "019...", "app_id": "app-order-svc", "kind": "build", "status": "running", "stage": "Build", "seq": 15, ... } ],
+    "pagination": { "page": 1, "page_size": 20, "total": 1, "total_pages": 1 }
   }
 }
 ```
@@ -65,16 +65,16 @@ Pending → Running → (Cancelling) → Completed / Failed / Cancelled
   "data": {
     "task": {
       "id": "019123456789abcdef",
-      "appId": "app-order-svc",
-      "projectId": "app-order-svc",
+      "app_id": "app-order-svc",
+      "project_id": "app-order-svc",
       "kind": "build",              // build | publish
       "status": "running",          // pending | running | cancelling | completed | failed | cancelled
       "stage": "compiling",         // 当前阶段标识
-      "releaseId": null,           // completed 时回填
+      "release_id": null,           // completed 时回填
       "error": null,                // failed 时的错误文案
       "seq": 15,                    // 当前事件序号（断线重连游标）
-      "createdAt": 1786738599,
-      "updatedAt": 1786738605
+      "created_at": 1786738599,
+      "updated_at": 1786738605
     }
   }
 }
@@ -102,7 +102,7 @@ Last-Event-ID header 优先于 query 参数。
 ```
 event: <事件类型>
 id: <seq>
-data: {"taskId":"...","kind":"build","status":"running",...}
+data: {"task_id":"...","kind":"build","status":"running",...}
 
 ```
 

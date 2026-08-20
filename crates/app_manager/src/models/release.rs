@@ -5,7 +5,7 @@ use utoipa::ToSchema;
 
 /// 预备发布请求（下载制品包并校验入库，不切流）
 #[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct PrepareReleaseRequest {
     /// 发布 ID（调用方生成，幂等键之一：同 id + 同 sha256 + 同 size 重复 prepare 直接返回既有记录）
     #[schema(example = "rel-20260814-001")]
@@ -26,7 +26,7 @@ pub struct PrepareReleaseRequest {
 
 /// 激活发布请求
 #[derive(Debug, Clone, Deserialize, Default, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct ActivateReleaseRequest {
     /// 等待新版本就绪的超时秒数（可选；默认 300，范围 5..=1800——Java 等慢启动应用可调大）。
     /// 就绪=status Running 且 health 非 Unhealthy；超时/进入 Error → 置 Failed **保留现场**
@@ -38,7 +38,7 @@ pub struct ActivateReleaseRequest {
 
 /// 回滚发布请求（恢复最近一次成功版本）
 #[derive(Debug, Clone, Deserialize, Default, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackReleaseRequest {
     /// 回滚原因（可选；记入失败版 failure_message 供追溯）
     #[schema(example = "排查后放弃 v1.2.0，回退")]
@@ -69,7 +69,6 @@ pub enum ReleaseStatus {
 
 /// 单个 release 记录
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct ReleaseInfo {
     /// 发布 ID
     #[schema(example = "rel-20260814-001")]
@@ -91,7 +90,6 @@ pub struct ReleaseInfo {
 
 /// release 索引持久化结构（releases/index.json，仅内部使用不入 OpenAPI）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ReleaseIndex {
     pub active_release_id: Option<String>,
     /// 兼容字段：confirm 两段式时代的"待确认 release"；新代码恒写 None（读旧 index
@@ -120,7 +118,6 @@ impl ReleaseIndex {
 
 /// release 列表响应（读 releases/index.json）
 #[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct ReleaseListResponse {
     /// 当前生效 release ID（无则 null）
     pub active_release_id: Option<String>,

@@ -5,7 +5,7 @@ use utoipa::ToSchema;
 
 /// 应用日志查询请求（sources/query、query、stream 三个端点共用）
 #[derive(Debug, Clone, Default, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct AppLogQueryRequest {
     /// 服务/日志源选择器（空 = 全部服务全部源）
     pub selectors: Vec<AppLogSelector>,
@@ -25,7 +25,7 @@ pub struct AppLogQueryRequest {
 
 /// 服务/日志源选择器
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct AppLogSelector {
     /// 服务 ID（manifest 中声明的 service 名，如 "api"、"web"）
     pub service_id: String,
