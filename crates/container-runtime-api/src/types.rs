@@ -300,7 +300,6 @@ pub enum HttpExpose {
 
 /// 应用端口规格（创建时由调用方提供）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct AppPortSpec {
     /// 端口名称
     pub name: String,
@@ -352,7 +351,6 @@ pub struct AppResourceRequirements {
 
 /// 应用端口运行时状态（含实际分配的对外端口）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct AppPortStatus {
     pub name: String,
     pub port: u16,
