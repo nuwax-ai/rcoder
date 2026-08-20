@@ -291,7 +291,6 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let runtime_for_shutdown = state.runtime().clone();
-    // clone 传入 router——main 尾部优雅退出时仍持引用，调 flush_flame() 落盘火焰图
     let app = router::create_router(state, Some(Arc::clone(&bootstrap_result.telemetry)));
     let server_handle =
         server::start_http_server(app, bootstrap_result.config.port, shutdown_tx.clone()).await?;
@@ -304,10 +303,6 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
     server_handle.abort();
-
-    // tracing-flame 折叠栈确定性落盘：guard 以 Arc 共享进 router，进程退出时
-    // 引用计数不一定归零，纯 Drop flush 不可靠——优雅退出点显式 flush
-    bootstrap_result.telemetry.flush_flame();
 
     if let Some(pingora_shutdown_tx) = proxy_result.pingora_shutdown_tx {
         let _ = pingora_shutdown_tx.send(());

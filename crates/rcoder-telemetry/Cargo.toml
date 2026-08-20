@@ -11,7 +11,6 @@ publish = false
 workspace = true
 
 [dependencies]
-tracing-flame = { workspace = true, optional = true }
 # OpenTelemetry
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
@@ -46,8 +45,6 @@ futures = { workspace = true }
 pin-project-lite = { workspace = true }
 
 [features]
-# tracing 火焰图观测（flame feature；输出 .folded 文件，inferno-flamegraph 渲染）
-flame = ["dep:tracing-flame"]
 default = []
 # 启用完整的 OTLP 功能
 full = []

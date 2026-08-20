@@ -20,8 +20,6 @@ default = []
 # 生产环境默认不启用，需要显式添加 --features debug
 debug = []
 
-# tracing 火焰图（本地开发专用；RCODER_FLAME=输出路径 启用）
-flame = ["rcoder-telemetry/flame"]
 
 # tokio-console 观测（本地开发专用；编译须配 RUSTFLAGS="--cfg tokio_unstable"，
 # 见 make run-console / DEV_CONSOLE=1 make dev-hot）。release 不启用=零代码零开销。

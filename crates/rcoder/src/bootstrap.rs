@@ -113,26 +113,6 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
         },
     ]);
 
-    // tracing-flame 火焰图（flame feature；RCODER_FLAME=输出路径 启用）
-    // shadowing 绑定（同 console_obs 模式——多 feature 组合时 immutable 冲突）
-    // 空路径视为关闭（compose 以 RCODER_FLAME=${RCODER_FLAME:-} 透传时，未设置
-    // 会得到空串而非缺省——空路径会初始化出非法输出文件的 FlameLayer）
-    #[cfg(feature = "flame")]
-    let telemetry_config = match std::env::var("RCODER_FLAME")
-        .ok()
-        .filter(|path| !path.is_empty())
-    {
-        Some(path) => {
-            let flame_config = rcoder_telemetry::FlameConfig {
-                output_path: std::path::PathBuf::from(&path),
-                collapse_threads: true,
-            };
-            eprintln!("[BOOTSTRAP] tracing-flame enabled: {path}");
-            telemetry_config.with_flame_config(flame_config)
-        }
-        None => telemetry_config,
-    };
-
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let telemetry = Arc::new(telemetry);
 

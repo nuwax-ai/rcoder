@@ -27,8 +27,6 @@ pub struct TelemetryConfig {
     /// extra_layer 已被 file-server 嵌入场景占用。无 guard：console 服务器
     /// 任务自管理生命周期）
     pub console_layer: Option<BoxedLayer>,
-    /// tracing 火焰图配置（flame feature；None=未启用）
-    pub flame: Option<FlameConfig>,
     /// span 耗时→直方图指标规则（SpanMetricsLayer；空=不桥接）
     pub span_metrics: Vec<crate::span_metrics::SpanMetricRule>,
 }
@@ -52,19 +50,6 @@ pub struct OtlpConfig {
 pub struct PrometheusConfig {
     /// 是否启用 Prometheus 指标
     pub enabled: bool,
-}
-
-/// tracing 火焰图配置（`flame` feature 用）。
-///
-/// 每当 span enter/exit 时写入折叠栈数据到指定文件——事后用
-/// `inferno-flamegraph < output.folded > flame.svg` 渲染火焰图。
-/// 高并发下有非零开销，建议仅排查性能问题时临时开启。
-#[derive(Debug, Clone)]
-pub struct FlameConfig {
-    /// 输出文件路径（如 "logs/tracing.folded"）
-    pub output_path: PathBuf,
-    /// 是否合并不同线程的 span（true=单线程视图更简洁）
-    pub collapse_threads: bool,
 }
 
 /// 文件日志配置
@@ -104,7 +89,6 @@ impl Default for TelemetryConfig {
             extra_layer: None,
             extra_layer_guard: None,
             console_layer: None,
-            flame: None,
             span_metrics: Vec::new(),
         }
     }
@@ -219,7 +203,6 @@ impl TelemetryConfig {
             extra_layer: None,
             extra_layer_guard: None,
             console_layer: None,
-            flame: None,
             span_metrics: Vec::new(),
         }
     }
@@ -285,12 +268,6 @@ impl TelemetryConfig {
     pub fn with_extra_layer(mut self, layer: BoxedLayer, guard: WorkerGuard) -> Self {
         self.extra_layer = Some(layer);
         self.extra_layer_guard = Some(guard);
-        self
-    }
-
-    /// 配置 tracing 火焰图（flame feature）。
-    pub fn with_flame_config(mut self, config: FlameConfig) -> Self {
-        self.flame = Some(config);
         self
     }
 

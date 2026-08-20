@@ -223,12 +223,6 @@ impl TraceIdJsonFormat {
     }
 }
 
-/// flame feature 的 FlushGuard 类型别名（feature off 时退化为 unit）。
-#[cfg(feature = "flame")]
-pub(crate) type FlameGuard = tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>;
-#[cfg(not(feature = "flame"))]
-pub(crate) type FlameGuard = ();
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn init_tracing_subscriber(
     service_name: &str,
@@ -236,9 +230,8 @@ pub(crate) fn init_tracing_subscriber(
     file_log_config: Option<&FileLogConfig>,
     extra_layer: Option<BoxedLayer>,
     tokio_console_layer: Option<BoxedLayer>,
-    flame_config: Option<&crate::config::FlameConfig>,
     span_metrics: Vec<crate::span_metrics::SpanMetricRule>,
-) -> Result<Option<FlameGuard>> {
+) -> Result<()> {
     use opentelemetry::trace::TracerProvider;
 
     // 创建 EnvFilter（支持 RUST_LOG 环境变量）
@@ -329,40 +322,10 @@ pub(crate) fn init_tracing_subscriber(
         Some(tracing_opentelemetry::layer().with_tracer(tracer))
     };
 
-    // tracing-flame 火焰图 layer（flame feature）
-    #[cfg(feature = "flame")]
-    let (flame_layer, flame_guard) = match flame_config {
-        Some(fc) => {
-            use tracing_flame::FlameLayer;
-            if let Some(dir) = fc.output_path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let (layer, guard) = FlameLayer::with_file(&fc.output_path)?;
-            (
-                Some(layer.with_threads_collapsed(fc.collapse_threads)),
-                Some(guard),
-            )
-        }
-        None => (None, None),
-    };
-    #[cfg(not(feature = "flame"))]
-    let _ = flame_config;
-
     // 组装 subscriber 链
     let has_tokio_console = tokio_console_layer.is_some();
     // 顺序约束：stack_boxed_layers（BoxedLayer 只支持 Registry 顶层）最先；
     // TraceIdExtractor 是泛型 Layer<S>，可挂任意层之后
-    #[cfg(feature = "flame")]
-    let registry = tracing_subscriber::registry()
-        .with(stack_boxed_layers(extra_layer, tokio_console_layer))
-        .with(TraceIdExtractor)
-        .with(crate::span_metrics::SpanMetricsLayer::new(span_metrics))
-        .with(env_filter)
-        .with(console_layer)
-        .with(file_layer)
-        .with(flame_layer)
-        .with(otel_layer);
-    #[cfg(not(feature = "flame"))]
     let registry = tracing_subscriber::registry()
         .with(stack_boxed_layers(extra_layer, tokio_console_layer))
         .with(TraceIdExtractor)
@@ -375,22 +338,8 @@ pub(crate) fn init_tracing_subscriber(
     if has_tokio_console {
         info!("[Telemetry] tokio-console observation layer enabled");
     }
-    #[cfg(feature = "flame")]
-    if let Some(fc) = flame_config {
-        info!(
-            "[Telemetry] tracing-flame enabled (output: {:?})",
-            fc.output_path
-        );
-    }
 
-    #[cfg(feature = "flame")]
-    {
-        Ok(flame_guard)
-    }
-    #[cfg(not(feature = "flame"))]
-    {
-        Ok(None)
-    }
+    Ok(())
 }
 
 /// 两个 boxed layer（Option 包装，None 为 no-op）叠加为单层。
