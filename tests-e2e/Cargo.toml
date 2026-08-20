@@ -9,7 +9,6 @@ description = "黑盒 e2e 集成测试：/computer/chat + SSE 进度流（compos
 shared_types = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
 anyhow = { workspace = true }

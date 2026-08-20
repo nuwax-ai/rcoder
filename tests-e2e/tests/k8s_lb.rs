@@ -23,18 +23,14 @@ use rcoder_e2e::common::sse;
 use rcoder_e2e::common::{Backend, Env, TestUserGuard, chat_reported};
 use serde_json::json;
 
-/// K8s 节点入口列表（NodePort，配置见 Env.lb_entry_hosts）。多入口时
-/// kube-proxy 随机落点，多轮轮换自然遍历 "chat 落副本 X、SSE 落副本 Y"
-/// 的组合；单入口退化为同入口（SSE 语义断言仍有效）。
+/// K8s 节点入口列表（NodePort，配置见 Env.lb_entry_hosts；主机名或 IP 均可）。
+/// 多入口时 kube-proxy 随机落点，多轮轮换自然遍历 "chat 落副本 X、SSE 落
+/// 副本 Y" 的组合；单入口退化为同入口（SSE 语义断言仍有效）。
 fn k8s_entries(env: &Env) -> Vec<String> {
     env.lb_entry_hosts
         .split(',')
-        .filter_map(|h| {
-            h.trim()
-                .parse::<std::net::IpAddr>()
-                .ok()
-                .map(|_| h.trim().to_owned())
-        })
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
         .map(|h| format!("http://{h}:{}", env.lb_nodeport))
         .collect()
 }
@@ -42,12 +38,15 @@ fn k8s_entries(env: &Env) -> Vec<String> {
 /// K8s gate：TEST_K8S_SSH 存在 + 首入口 /health 可达。
 async fn k8s_or_skip(scenario: &str) -> Option<(Env, JsonlReporter, Vec<String>)> {
     let env = Env::load();
+    // entries 提前构造（环境行记录实际入口，排查时可见）
+    let entries = k8s_entries(&env);
     let report = JsonlReporter::begin(
         scenario,
         "k8s",
         json!({
             "rcoder": env.rcoder, "model": env.model, "user": env.user,
             "k8s_ssh": env.k8s_ssh, "k8s_ns": env.k8s_ns,
+            "entries": entries,
         }),
     );
     if env.k8s_ssh.is_empty() {
@@ -58,7 +57,6 @@ async fn k8s_or_skip(scenario: &str) -> Option<(Env, JsonlReporter, Vec<String>)
         report.skip("LLM config missing（.env.local / LLM_* 配置）");
         return None;
     }
-    let entries = k8s_entries(&env);
     if entries.is_empty() {
         report.skip("LB_ENTRY_HOSTS 未配置或解析为空（.env.local / 环境变量）");
         return None;

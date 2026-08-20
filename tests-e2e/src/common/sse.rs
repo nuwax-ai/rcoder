@@ -100,13 +100,24 @@ where
     // 当前帧的解析状态（对齐 axum SSE 帧序 event→id→data）
     let mut cur_event: Option<String> = None;
     let mut cur_seq: Option<u64> = None;
-    let mut end_turn_at: Option<Instant> = None;
+    // idle_stop：end_turn 后 1s 即退出。退出期限并入 select 竞争（而非
+    // 循环尾检查）——否则服务端不关流时会阻塞在 stream.next() 挂满整窗。
+    let mut idle_deadline: Option<tokio::time::Instant> = None;
 
     loop {
         let chunk = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(deadline) => {
                 return (events, EndedReason::Deadline);
+            }
+            // end_turn 后 1s 到点（未见过 end_turn 时该分支永久 pending）
+            _ = async {
+                match idle_deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                return (events, EndedReason::IdleAfterEndTurn);
             }
             c = stream.next() => match c {
                 None => return (events, EndedReason::StreamEnded),
@@ -145,18 +156,13 @@ where
                     cur_event = None;
                     cur_seq = None;
                     if is_end_turn && idle_stop {
-                        end_turn_at.get_or_insert_with(Instant::now);
+                        idle_deadline.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + Duration::from_secs(1)
+                        });
                     }
                 }
             }
             // 注释行（: keep-alive）与空行：忽略
-        }
-
-        // end_turn 已见且超 1s 无新行 → 提前返回
-        if let Some(seen) = end_turn_at
-            && seen.elapsed() > Duration::from_secs(1)
-        {
-            return (events, EndedReason::IdleAfterEndTurn);
         }
     }
 }

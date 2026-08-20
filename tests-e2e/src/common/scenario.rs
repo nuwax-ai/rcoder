@@ -37,9 +37,14 @@ pub async fn collect_reported(
     .await;
     let ids = sse::ids_of(&events);
     let text = sse::chunks_text(&events);
+    // Error 结束原因带详情（HTTP 状态/连接错误），供 jsonl 排查
+    let ended_reason = match &ended {
+        EndedReason::Error(detail) => format!("error: {detail}"),
+        other => other.as_str().to_owned(),
+    };
     report.subscribe_end(
         spec.phase,
-        ended.as_str(),
+        &ended_reason,
         events.len(),
         &ids,
         sse::type_counts(&events),

@@ -106,7 +106,13 @@ async fn test_publish_identifiers(env: &Env, report: &JsonlReporter) {
 
 /// publish 合法请求 → 有限时间内到达终态（不挂死）+ tasks/query 可过滤。
 async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
-    let ident = format!("app-e2e-rs-{}", &env.run_tag.replace('_', "")[..10]);
+    // ident 唯一化：run_tag(秒级)+pid——不同测试进程同秒启动也不撞名
+    // （publish 对同 app 的活跃任务重复受理会 409）
+    let ident = format!(
+        "app-e2e-rs-{}{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000
+    );
     let guard_app = ident.clone();
 
     let (status, body) = post_json(
@@ -200,7 +206,11 @@ async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
 
 /// 直接 create_app 被发布流水线约束拦截（UserApp 语义：app 容器只能由发布编排创建）。
 async fn test_app_create_requires_release_lock(env: &Env, report: &JsonlReporter) {
-    let app_id = format!("app-e2e-nolock-{}", &env.run_tag.replace('_', "")[..10]);
+    let app_id = format!(
+        "app-e2e-nolock-{}{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000
+    );
     let payload = json!({
         "appId": app_id,
         "name": "e2e-nolock-test",
