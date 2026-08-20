@@ -64,9 +64,32 @@ open flame.svg                          # 浏览器查看
 
 **与 Pyroscope 的区别**：Pyroscope 是 CPU 采样（哪些函数在烧 CPU），tracing-flame 是 span 耗时（哪些 async 路径在等待/耗时）。
 
+**⚠️ 实测结论（2026-08-20 对照实验）——folded 耗时数据会失真**：tracing-flame 的栈式计时
+假设单任务顺序嵌套，多任务并发 async 下系统性失真。对照实验：`grpc_dial` span 同源双记录，
+metrics 直方图 p50=3.1s / p99=10s，folded 里 max 仅 67ms（差 150 倍）；`forward_chat`（9-20s）
+在 folded 里 max 16ms。**耗时分析一律以 /metrics 的 span 直方图为准**（SpanMetricsLayer，
+on_new_span/on_close 墙钟、无栈假设），火焰图只看**调用结构与冷启动子阶段**（短同步段相对可信）。
+
 **读图要点**（实测经验）：
 - folded 里裸 `all-threads` 大数值行 = 停机时仍未关闭的后台 span / 线程空闲 gap，不代表热点，分析时跳过；
 - 只有 2 帧以上的栈才是真实 span 链；无子 span 的热点叶子帧（如 handler）说明该函数内部缺 `#[instrument]`，是可观测性缺口而非"函数本身慢"。
+
+## span 耗时指标（SpanMetricsLayer，精确计时）
+
+`#[instrument]` 的 span 即计时事实源，`SpanMetricsLayer` 在 span 关闭时自动记录直方图——
+**调用点零 `Instant` 侵入**。规则表在 `bootstrap.rs` 注册（span 名 → 指标族 + 标签）：
+
+| 指标族 | span | 含义 |
+|--------|------|------|
+| `grpc_request_duration_seconds{method="chat"}` | `forward_chat` | 整个模型回合（含重试/智能等待） |
+| `grpc_request_duration_seconds{method="dial"}` | `grpc_dial` | agent gRPC 连接建立（冷启动等待核心观测） |
+| `container_ensure_duration_seconds{op="ensure"}` | `ensure_container_ready` | 容器就绪端到端（冷启动） |
+| `sse_subscription_duration_seconds{kind="client"}` | `sse_subscribe` | SSE 订阅生命周期 |
+| `grpc_requests_total{method,status}` | 调用点显式 | dial/chat ok+error 计数 |
+| `sse_active_subscriptions` | RAII guard | SSE 在线订阅数 gauge |
+
+新函数要计时：加 `#[instrument]` + 在 bootstrap 规则表加一行（或复用现有 span 名），
+无需任何手动计时代码。
 
 ## 完整排查链路
 
