@@ -91,8 +91,10 @@ services:
     restart: unless-stopped
 
   # Tempo - 分布式追踪后端（OTLP traces 存储；配置见 docker/tempo/tempo.yml）
+  # 钉 2.9.0：3.x 移除 ingester/compactor 配置块（schema 大改），
+  # 生产升级 3.x 时用官方转换器 tempo config converter 迁移
   tempo:
-    image: grafana/tempo:latest
+    image: grafana/tempo:2.9.0
     container_name: rcoder-tempo
     command: ["-config.file=/etc/tempo/tempo.yml"]
     ports:
@@ -133,7 +135,8 @@ services:
     ports:
       - "9091:9090" # 宿主机 9091 → 容器 9090（避免端口冲突）
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # 目录级挂载：单文件挂载在宿主编辑（inode 替换）后会断链
+      - ./prometheus:/etc/prometheus:ro
       - prometheus-data:/prometheus
     environment:
       - TZ=Asia/Shanghai

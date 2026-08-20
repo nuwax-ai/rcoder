@@ -25,6 +25,19 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# Rust cargo 国内镜像配置（与 rcoder-master/Dockerfile.base 同款 heredoc 内联；
+# 裸 debian 容器无镜像源，直连 static.crates.io DNS 解析失败）
+COPY <<'EOF_CARGO' /root/.cargo/config.toml
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy]
+registry = "https://rsproxy.cn/crates.io-index"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+EOF_CARGO
+
 # 🎯 代码哈希标记：只有当 CRATES_HASH 变化时，以下步骤才会重新执行
 # 这样可以缓存上面的系统依赖和 Rust 安装
 ARG CRATES_HASH=unknown
