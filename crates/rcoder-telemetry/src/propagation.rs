@@ -63,12 +63,18 @@ impl Extractor for MetadataMapExtractor<'_> {
 /// // 现在 metadata 包含 traceparent 和 tracestate headers
 /// ```
 pub fn inject_context(metadata: &mut MetadataMap) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
     let propagator = TraceContextPropagator::new();
-    let cx = Context::current();
+    // 必须取当前 tracing span 的 otel context（存于 span extensions）——
+    // 纯 otel 的 Context::current() 在 tracing 世界是空 context（无 scope
+    // guard），注入会静默跳过 traceparent（零调用方时期潜伏的 bug）
+    let cx = tracing::Span::current().context();
     let mut injector = MetadataMapInjector(metadata);
     propagator.inject_context(&cx, &mut injector);
 
-    debug!("[Propagation] Trace context injected into gRPC metadata");
+    let tp = injector.0.get("traceparent").and_then(|v| v.to_str().ok());
+    debug!("[Propagation] gRPC metadata traceparent = {:?}", tp);
 }
 
 /// Extracting trace context from gRPC metadata
@@ -136,8 +142,11 @@ impl Extractor for HttpHeaderExtractor<'_> {
 ///
 /// * `headers` - HTTP headers
 pub fn inject_context_http(headers: &mut http::HeaderMap) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
     let propagator = TraceContextPropagator::new();
-    let cx = Context::current();
+    // 同 inject_context：取 tracing span 的 otel context 而非空 scope context
+    let cx = tracing::Span::current().context();
     let mut injector = HttpHeaderInjector(headers);
     propagator.inject_context(&cx, &mut injector);
 
@@ -247,3 +256,35 @@ mod tests {
         assert!(!cx.span().span_context().trace_id().to_string().is_empty());
     }
 }
+
+#[cfg(test)]
+mod inject_tests {
+    use super::inject_context;
+    use opentelemetry::trace::TracerProvider;
+    use tracing_subscriber::prelude::*;
+
+    /// inject_context 必须取当前 tracing span 的 otel context（span extensions），
+    /// 而非纯 otel scope 的 Context::current()（tracing 世界恒为空 → 静默跳过
+    /// traceparent —— 跨服务追踪断链的潜伏 bug 回归测试）
+    #[test]
+    fn inject_context_writes_traceparent_of_current_tracing_span() {
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("propagation-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("test_inject_span");
+            let _guard = span.enter();
+            let mut metadata = tonic::metadata::MetadataMap::new();
+            inject_context(&mut metadata);
+            let tp = metadata
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            // W3C: 00-{32 hex trace id}-{16 hex span id}-01
+            assert_eq!(tp.len(), 55, "traceparent 应写入有效值，实际: {tp:?}");
+        });
+    }
+}
+
