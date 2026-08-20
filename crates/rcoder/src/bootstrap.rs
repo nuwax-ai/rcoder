@@ -89,15 +89,19 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
     let telemetry_config = crate::console_obs::attach(telemetry_config);
 
     // tracing-flame 火焰图（flame feature；RCODER_FLAME=输出路径 启用）
+    // shadowing 绑定（同 console_obs 模式——多 feature 组合时 immutable 冲突）
     #[cfg(feature = "flame")]
-    if let Ok(path) = std::env::var("RCODER_FLAME") {
-        let flame_config = rcoder_telemetry::FlameConfig {
-            output_path: std::path::PathBuf::from(&path),
-            collapse_threads: true,
-        };
-        telemetry_config = telemetry_config.with_flame_config(flame_config);
-        eprintln!("[BOOTSTRAP] tracing-flame enabled: {path}");
-    }
+    let telemetry_config = match std::env::var("RCODER_FLAME") {
+        Ok(path) => {
+            let flame_config = rcoder_telemetry::FlameConfig {
+                output_path: std::path::PathBuf::from(&path),
+                collapse_threads: true,
+            };
+            eprintln!("[BOOTSTRAP] tracing-flame enabled: {path}");
+            telemetry_config.with_flame_config(flame_config)
+        }
+        Err(_) => telemetry_config,
+    };
 
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let telemetry = Arc::new(telemetry);
