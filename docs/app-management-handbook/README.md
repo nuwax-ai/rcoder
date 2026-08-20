@@ -128,7 +128,7 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate 链路
 代理访问   GET    /proxy/apps/{app_id}/{port}/{path}                 访问部署的应用
 ```
 
-所有响应统一包 `HttpResult<T> = { success, data, code, message, tid }`（releases 系列返回裸对象）。逐个字段含义见各章节。
+所有响应统一包 `HttpResult<T> = { success, data, code, message, tid }`（全部接口一致）。逐个字段含义见各章节。
 
 ---
 

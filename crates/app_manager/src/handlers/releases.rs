@@ -27,7 +27,7 @@ use super::AppManagerState;
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = PrepareReleaseRequest,
     responses(
-        (status = 200, description = "预备成功（或幂等命中既有记录），status=Prepared", body = ReleaseInfo),
+        (status = 200, description = "预备成功（或幂等命中既有记录），status=Prepared", body = HttpResult<ReleaseInfo>),
         (status = 400, description = "参数校验失败（release_id/sha256 格式、retention 越界、URL 非法）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "release_id 已存在但 sha256/size 不一致", body = HttpResult<String>),
@@ -39,10 +39,10 @@ pub async fn prepare_release(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
     Json(request): Json<PrepareReleaseRequest>,
-) -> Result<Json<ReleaseInfo>, AppError> {
-    Ok(Json(
+) -> Result<Json<HttpResult<ReleaseInfo>>, AppError> {
+    Ok(Json(HttpResult::success(
         state.app_service.prepare_release(&app_id, request).await?,
-    ))
+    )))
 }
 
 /// 激活发布（单接口：切流 → ensure 运行容器 → 等就绪 → 提交/失败）
@@ -63,7 +63,7 @@ pub async fn prepare_release(
     ),
     request_body = ActivateReleaseRequest,
     responses(
-        (status = 200, description = "status=Active（就绪提交）或 Failed（就绪失败，现场保留，用 rollback 恢复）", body = ReleaseInfo),
+        (status = 200, description = "status=Active（就绪提交）或 Failed（就绪失败，现场保留，用 rollback 恢复）", body = HttpResult<ReleaseInfo>),
         (status = 400, description = "参数校验失败（含 readiness_timeout_seconds 越界 5..=1800）", body = HttpResult<String>),
         (status = 404, description = "应用不存在 / release 不存在 / 制品包文件缺失", body = HttpResult<String>),
         (status = 500, description = "切流/拉起/索引写入失败（操作错误，非就绪失败）", body = HttpResult<String>)
@@ -74,7 +74,7 @@ pub async fn activate_release(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, release_id)): Path<(String, String)>,
     Json(request): Json<ActivateReleaseRequest>,
-) -> Result<Json<ReleaseInfo>, AppError> {
+) -> Result<Json<HttpResult<ReleaseInfo>>, AppError> {
     if let Some(seconds) = request.readiness_timeout_seconds
         && !(MIN_READY_TIMEOUT_SECS..=MAX_READY_TIMEOUT_SECS).contains(&seconds)
     {
@@ -85,12 +85,12 @@ pub async fn activate_release(
             ),
         ));
     }
-    Ok(Json(
+    Ok(Json(HttpResult::success(
         state
             .app_service
             .activate_release(&app_id, &release_id, request.readiness_timeout_seconds)
             .await?,
-    ))
+    )))
 }
 
 /// 回滚到最近一次成功版本（`.rollback` 快照恢复，秒级）
@@ -106,7 +106,7 @@ pub async fn activate_release(
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = RollbackReleaseRequest,
     responses(
-        (status = 200, description = "恢复后的 Active release（无快照时幂等返回当前 Active）", body = ReleaseInfo),
+        (status = 200, description = "恢复后的 Active release（无快照时幂等返回当前 Active）", body = HttpResult<ReleaseInfo>),
         (status = 400, description = "参数校验失败", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "首次发布失败，无旧版本可回滚", body = HttpResult<String>),
@@ -118,13 +118,13 @@ pub async fn rollback_release(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
     Json(request): Json<RollbackReleaseRequest>,
-) -> Result<Json<ReleaseInfo>, AppError> {
-    Ok(Json(
+) -> Result<Json<HttpResult<ReleaseInfo>>, AppError> {
+    Ok(Json(HttpResult::success(
         state
             .app_service
             .rollback_release(&app_id, request.message)
             .await?,
-    ))
+    )))
 }
 
 /// 列出应用全部 release（读 releases/index.json：active/最近失败指针 + 保留策略内列表）
@@ -133,7 +133,7 @@ pub async fn rollback_release(
     path = "/api/v1/apps/{app_id}/releases",
     params(("app_id" = String, Path, description = "应用 ID")),
     responses(
-        (status = 200, description = "查询成功", body = ReleaseListResponse),
+        (status = 200, description = "查询成功", body = HttpResult<ReleaseListResponse>),
         (status = 400, description = "参数校验失败", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 500, description = "索引读取失败", body = HttpResult<String>)
@@ -143,8 +143,10 @@ pub async fn rollback_release(
 pub async fn list_releases(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-) -> Result<Json<ReleaseListResponse>, AppError> {
-    Ok(Json(state.app_service.list_releases(&app_id).await?))
+) -> Result<Json<HttpResult<ReleaseListResponse>>, AppError> {
+    Ok(Json(HttpResult::success(
+        state.app_service.list_releases(&app_id).await?,
+    )))
 }
 
 /// 删除 release 记录与制品包（保留策略外的手工清理）
@@ -158,7 +160,7 @@ pub async fn list_releases(
         ("release_id" = String, Path, description = "发布 ID（非 active）")
     ),
     responses(
-        (status = 200, description = "删除成功", body = serde_json::Value),
+        (status = 200, description = "删除成功", body = HttpResult<String>),
         (status = 400, description = "参数校验失败", body = HttpResult<String>),
         (status = 404, description = "应用不存在 / release 不存在", body = HttpResult<String>),
         (status = 409, description = "active 状态的 release 不可删除", body = HttpResult<String>),
@@ -169,10 +171,10 @@ pub async fn list_releases(
 pub async fn delete_release(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, release_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<HttpResult<String>>, AppError> {
     state
         .app_service
         .delete_release(&app_id, &release_id)
         .await?;
-    Ok(Json(serde_json::json!({"success": true})))
+    Ok(Json(HttpResult::success("删除成功".to_string())))
 }
