@@ -223,15 +223,34 @@ impl TraceIdJsonFormat {
     }
 }
 
-pub(crate) fn init_tracing_subscriber(
-    service_name: &str,
-    tracer_provider: Option<&SdkTracerProvider>,
-    file_log_config: Option<&FileLogConfig>,
-    extra_layer: Option<BoxedLayer>,
-    tokio_console_layer: Option<BoxedLayer>,
-    span_metrics: Vec<crate::span_metrics::SpanMetricRule>,
-) -> Result<()> {
+/// subscriber 组装参数（init_tracing_subscriber 入参结构体——
+/// 多入参收拢为单一事实源，调用方构造清晰、扩展只加字段不改签名）
+pub(crate) struct SubscriberParams<'a> {
+    /// 服务名称（EnvFilter 默认指令 / tracer 标识）
+    pub service_name: &'a str,
+    /// OTLP TracerProvider（None 时装 no-op provider，保留 span context 基础设施）
+    pub tracer_provider: Option<&'a SdkTracerProvider>,
+    /// 文件日志配置（None 则无文件层）
+    pub file_log: Option<&'a FileLogConfig>,
+    /// 额外 boxed layer（如 file-server 独立日志）
+    pub extra_layer: Option<BoxedLayer>,
+    /// tokio-console 观测 layer（本地开发 feature 注入）
+    pub tokio_console_layer: Option<BoxedLayer>,
+    /// span 耗时→直方图规则（SpanMetricsLayer）
+    pub span_metrics: Vec<crate::span_metrics::SpanMetricRule>,
+}
+
+pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()> {
     use opentelemetry::trace::TracerProvider;
+
+    let SubscriberParams {
+        service_name,
+        tracer_provider,
+        file_log: file_log_config,
+        extra_layer,
+        tokio_console_layer,
+        span_metrics,
+    } = params;
 
     // 创建 EnvFilter（支持 RUST_LOG 环境变量）
     let mut env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
