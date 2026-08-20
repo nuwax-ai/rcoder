@@ -46,8 +46,9 @@ async fn k8s_or_skip(scenario: &str) -> Option<(Env, JsonlReporter, Vec<String>)
         scenario,
         "k8s",
         json!({
-            // rcoder 字段记实际入口（首入口；metrics diff 拉远端而非本地默认）
-            "rcoder": entries[0], "model": env.model, "user": env.user,
+            // rcoder 字段记实际入口（首入口；metrics diff 拉远端而非本地默认）。
+            // entries 可能为空（LB_ENTRY_HOSTS 未配置），此时先记空串、走下方 gate skip
+            "rcoder": entries.first().cloned().unwrap_or_default(), "model": env.model, "user": env.user,
             "k8s_ssh": env.k8s_ssh, "k8s_ns": env.k8s_ns,
             "entries": entries, "trace_id": env.trace_id,
         }),

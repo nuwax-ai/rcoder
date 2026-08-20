@@ -32,7 +32,7 @@ UserApp 全量业务接口已验证通过。长期运行的 UserApp 占用 K8s �
 **现状缺口**（勘探结论）：
 - `cleanup_task`（[cleaner.rs:206](../../crates/rcoder/src/cleanup_task/cleaner.rs)）**故意跳过 UserApp**——UserApp 不进 `state.projects` 表，扫描器看不到。
 - **无任何 per-app HTTP 访问记录**：pingora 只有 per-port 聚合计数器（[types.rs:45](../../crates/rcoder-proxy/src/service/types.rs)），多 app 共用端口无法归属；`/proxy/stats` 仅端口维度。
-- 现有 `last_activity`（[container_entry.rs:31](../../crates/shared_types/src/container_entry.rs)）只服务 agent-runner。
+- 现有 `last_activity`（[entry.rs:31](../../crates/shared_types/src/container/entry.rs)）只服务 agent-runner。
 - 停止分成两种业务语义：`recycle_app` 用于空闲回收，允许后续流量唤醒；`stop_app` 用于用户手动停止，必须持续保持停止，不能被访问意外拉起。二者都只 scale-to-zero，不删除 PVC。
 
 ### 1.2 功能需求

@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 // 进度事件类型复用 shared_types(file-server 发送 ↔ rcoder 接收,统一 wire)。
-pub use shared_types::build_event::BuildProgressEvent;
+pub use shared_types::BuildProgressEvent;
 
 /// 历史事件 ring 容量(断线重连 seq replay)。
 const RING_CAP: usize = 1000;

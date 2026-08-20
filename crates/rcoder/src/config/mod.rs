@@ -482,7 +482,7 @@ impl DockerConfig {
         // 为 RCoder 服务使用默认配置
         let rcoder_service = {
             info!("Using default config");
-            shared_types::service_config::default_rcoder_service_config()
+            shared_types::default_rcoder_service_config()
         };
 
         services.insert("web-agent-runner".to_string(), rcoder_service);
@@ -490,7 +490,7 @@ impl DockerConfig {
         // 为 AgentRunner 服务使用默认配置
         services.insert(
             "agent-runner".to_string(),
-            shared_types::service_config::default_agent_runner_service_config(),
+            shared_types::default_agent_runner_service_config(),
         );
 
         shared_types::MultiImageConfig {

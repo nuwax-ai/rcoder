@@ -10,12 +10,9 @@ use agent_client_protocol::schema::v1::{CancelNotification, SessionId};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use shared_types::{
-    AgentStatusResponse, ChatResponse, HttpResult, RcoderChatRequest, ServiceType,
-    agent_http_service::AgentHttpService,
-    rcoder_agent_types::{
-        RcoderAgentCancelRequest, RcoderAgentCancelResponse, RcoderAgentStopRequest,
-        RcoderAgentStopResponse,
-    },
+    AgentHttpService, AgentStatusResponse, ChatResponse, HttpResult, RcoderAgentCancelRequest,
+    RcoderAgentCancelResponse, RcoderAgentStopRequest, RcoderAgentStopResponse, RcoderChatRequest,
+    ServiceType,
 };
 use tokio::sync::oneshot;
 use tracing::{info, warn};
