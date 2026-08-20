@@ -288,3 +288,34 @@ mod inject_tests {
     }
 }
 
+/// gRPC 服务端入口 span 构造（traceparent 创建期挂接）——宏形式：
+/// tracing 的 span 名仅接受字面量（callsite 缓存），函数无法传动态名。
+///
+/// 与 HTTP 版 [`make_span_with_trace_parent`] 同语义：span 处于 Builder
+/// 状态时 set_parent（started 后会被 tracing-opentelemetry 拒绝——
+/// `SetParentError::AlreadyStarted`，intentional design），并把 trace_id
+/// 写为 span field（日志 JSON 顶层可见）。
+///
+/// 用法（tonic handler，替代 `#[instrument]`）：
+/// `let span = grpc_span!("chat", request.metadata());`
+/// `chat::chat(&self.app_state, request).instrument(span).await`
+#[macro_export]
+macro_rules! grpc_span {
+    ($name:literal, $metadata:expr) => {{
+        // 宏卫生：trait 导入必须置于块首（if 条件里的 .span() 也依赖之）
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let span = tracing::info_span!($name, trace_id = tracing::field::Empty);
+        let remote_cx = $crate::propagation::extract_context($metadata);
+        if remote_cx.span().span_context().is_valid() {
+            let trace_id = remote_cx.span().span_context().trace_id();
+            span.record("trace_id", tracing::field::display(trace_id));
+            if let Err(e) = span.set_parent(remote_cx) {
+                tracing::debug!(
+                    "[Propagation] gRPC span attach remote trace {trace_id} failed: {e}"
+                );
+            }
+        }
+        span
+    }};
+}
