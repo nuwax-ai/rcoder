@@ -6,11 +6,49 @@
 
 | 工具 | 用途 | 启用方式 | 排查场景 |
 |------|------|----------|----------|
+| **OTLP → Tempo** | 分布式追踪（跨服务全链路 trace） | compose 常开 | 全链路瀑布/火焰图、生产事故排查 |
 | **trace_id 日志注入** | 日志 JSON 顶层 trace_id 字段 | 自动（有 traceparent 时） | 跨服务全链路日志过滤 |
 | **tokio-console** | 异步任务/锁/waker 运行时观测 | `console` feature | 死锁、锁等待、任务泄漏 |
 | **tracing-flame** | span 耗时火焰图 | `flame` feature | 哪个 async 函数慢 |
 | **Pyroscope** | CPU 火焰图持续剖析 | 已部署（compose） | CPU 热点 |
 | **/metrics** | HTTP 请求量/延迟 | 默认开启 | 性能回归 |
+
+## OTLP → otel-collector → Tempo 分布式追踪（本地常开，与生产同拓扑）
+
+```
+rcoder (OTLP gRPC) ──┐
+                     ├──> otel-collector:4317 ──> tempo:4317 ──> Grafana (Tempo 数据源)
+agent_runner (OTLP) ─┘         └─ self-metrics :8888（Prometheus 抓取）
+```
+
+**为什么走 collector 而非直连 Tempo**：本地验证的就是生产拓扑（App → Collector → 后端）；
+后端重启/切换时 collector 缓冲重试兜底；探活噪声在 collector 过滤；:8888 指标是
+"span 丢没丢"的排障抓手。
+
+**链路组成**（compose 全部常开，无需手动操作）：
+- **注入**：e2e/上游带 `traceparent` → rcoder `http_request` span 继承 trace；
+  rcoder → agent_runner 的 gRPC 请求统一注入 W3C traceparent（`new_request_with_locale`）
+- **提取**：agent_runner 每个 gRPC handler 入口 `attach_trace_parent` 挂到同一 trace，
+  并把 trace_id 写进 span field——**agent 侧日志 JSON 顶层同样有 trace_id**（跨服务检索统一）
+- **过滤**：collector 丢掉 `/health`、`/metrics` 的 http_request span（探活噪声不进 Tempo）
+- **保留**：Tempo 72h（`docker/tempo/tempo.yml`）
+
+**查看**：Grafana http://localhost:3000（admin/admin）→ Explore → 数据源 Tempo
+- 按 trace_id 精确查：`Query type: TraceQL` 直接粘贴 trace_id（与日志 JSON 顶层的 trace_id 同值）
+- 按 service 查：`{resource.service.name = "rcoder"}` / `= "agent_runner"`
+- Trace 视图自带 **Flame graph** 与瀑布渲染；span 点按可见耗时；
+  `tracesToMetrics` 联动跳 Prometheus 查同款耗时直方图（SpanMetricsLayer）
+- 注意：agent 后台状态探测（get_status 等）无 traceparent，是独立根 trace（有意设计：
+  trace 跟随请求，不跟随后台任务）
+
+**生产升级路径**：
+1. K8s 部署 Tempo（S3/对象存储后端 + 多副本拆分）与 otel-collector（DaemonSet/Gateway）
+2. agent 容器 endpoint 由 `kubernetes_config.services.<svc>.environment` 的
+   `OTEL_EXPORTER_OTLP_ENDPOINT` 同名覆盖（机制已存在，零代码）
+3. 采样：`OTEL_TRACES_SAMPLER_ARG`（rcoder 侧比例采样）或 collector `tail_sampling`
+   processor（错误全留+正常抽样）
+4. Tempo 3.x 迁移用官方 `tempo config converter`（3.0 移除 ingester/compactor 配置块）
+5. 可叠加：trace to logs（Loki）、span profiles（与 Pyroscope CPU 火焰按 span 关联）
 
 ## trace_id 日志注入（自动）
 

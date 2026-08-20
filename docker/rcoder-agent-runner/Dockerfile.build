@@ -33,6 +33,8 @@ RUN echo "Code hash: ${CRATES_HASH}"
 # 复制 Cargo.toml 和 Cargo.lock
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# workspace 成员（tests-e2e 被 Cargo.toml members 引用，缺失则 manifest 加载失败）
+COPY tests-e2e ./tests-e2e
 
 # 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
 ARG CARGO_FLAGS
