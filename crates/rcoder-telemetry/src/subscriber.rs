@@ -133,8 +133,9 @@ pub(crate) fn init_tracing_subscriber(
     });
     // tokio-console 观测开启时必须放行 tokio/runtime target 的 trace 级事件
     // （任务/waker 事件为 trace 级；EnvFilter 的全局压制会挡住 per-layer
-    // 过滤的 console 层——实测矩阵：无放行 = 零任务）。与 RUST_LOG 叠加，
-    // 不影响 fmt/文件层的输出（这两个 target 无业务日志输出）。
+    // 过滤的 console 层——实测矩阵：无放行 = 零任务）。
+    // 注意：放行会让 fmt/文件层也收到这些事件（海量）——deny 过滤在下方
+    // console_layer/file_layer 的 filter_fn 中处理。
     if tokio_console_layer.is_some() {
         for directive in ["tokio=trace", "runtime=trace"] {
             if let Ok(d) = directive.parse() {
@@ -142,17 +143,27 @@ pub(crate) fn init_tracing_subscriber(
             }
         }
     }
+    // console 开启时 fmt/文件层需要额外 deny tokio/runtime target（海量 TRACE
+    // 任务事件会淹没正常日志——实测 3.4GB/分钟）
+    let deny_tokio = tokio_console_layer.is_some();
+    let make_deny_filter = |deny_tokio: bool| {
+        move |meta: &tracing::Metadata<'_>| {
+            let deny = meta.target().starts_with("file_server")
+                || (deny_tokio
+                    && (meta.target().starts_with("tokio")
+                        || meta.target().starts_with("runtime")));
+            !deny
+        }
+    };
 
-    // 创建控制台日志层（deny file_server → file-server 日志不进 rcoder console）
+    // 创建控制台日志层（deny file_server + console 开启时额外 deny tokio/runtime）
     let console_layer = fmt::layer()
         .with_target(true)
         .with_ansi(true)
         .with_thread_ids(false)
         .with_file(false)
         .with_line_number(false)
-        .with_filter(filter_fn(|meta: &tracing::Metadata<'_>| {
-            !meta.target().starts_with("file_server")
-        }));
+        .with_filter(filter_fn(make_deny_filter(deny_tokio)));
 
     // 创建文件日志层（deny file_server → file-server 日志不进 rcoder.log）
     let file_layer = if let Some(file_config) = file_log_config {
@@ -168,8 +179,7 @@ pub(crate) fn init_tracing_subscriber(
             .max_log_files(file_config.max_log_files)
             .build(&file_config.directory)?;
 
-        let deny_fs =
-            filter_fn(|meta: &tracing::Metadata<'_>| !meta.target().starts_with("file_server"));
+        let deny_fs = filter_fn(make_deny_filter(deny_tokio));
 
         if file_config.json_format {
             // JSON 格式文件日志 + trace_id/span_id 自动注入
