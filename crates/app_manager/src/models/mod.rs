@@ -29,3 +29,6 @@ pub use crate::error::{AppOperationError, AppResult};
 
 /// 应用端口运行时状态（来自 container-runtime-api，含实际分配的对外端口）
 pub use container_runtime_api::AppPortStatus;
+
+#[cfg(test)]
+mod wire_tests;

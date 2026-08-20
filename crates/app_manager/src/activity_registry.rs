@@ -514,7 +514,9 @@ mod tests {
 
     #[tokio::test]
     async fn touch_throttle_collapses_writes_within_window() {
-        let reg = AppActivityRegistry::new_with(Duration::from_secs(1), Duration::from_millis(100));
+        // 窗口取 500ms（循环名义 50ms 留 10 倍余量）：此前 100ms 窗口下负载漂移
+        // 可使循环实际超窗（实测 ~110ms），第一段断言高频 flaky
+        let reg = AppActivityRegistry::new_with(Duration::from_secs(1), Duration::from_millis(500));
         reg.touch("app-a");
         let t0 = reg.last_accessed_at("app-a").expect("first touch recorded");
 
@@ -526,7 +528,7 @@ mod tests {
         assert_eq!(reg.last_accessed_at("app-a"), Some(t0), "throttled");
 
         // 超过窗口后更新
-        sleep(Duration::from_millis(120)).await;
+        sleep(Duration::from_millis(600)).await;
         reg.touch("app-a");
         assert!(
             reg.last_accessed_at("app-a").unwrap() > t0,
