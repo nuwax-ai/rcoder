@@ -1,6 +1,6 @@
 //! UserApp 自动化构建发布 HTTP handler(rcoder 侧)。
 //!
-//! - `POST /api/v1/apps/{app_id}/publish` —— 一键 build + 发布(body 带 agent-runner `projectId`)。
+//! - `POST /api/v1/apps/{app_id}/publish` —— 一键 build + 发布(body 带 project_id，与 app_id 一致——UserAppBuilder 一 app 一 workspace)。
 //! - `POST /api/v1/apps/{app_id}/build`   —— 仅触发 agent-runner build + 透传进度。
 //!   两者都会自动 ensure UserAppBuilder(未注册时创建,orchestrator EnsureBuilder 阶段),
 //!   调用方一次调用即可,无需先建 builder。
@@ -147,7 +147,7 @@ fn validate_publish_identifiers(app_id: &str, project_id: &str) -> Result<(), Ap
         .map_err(|error| validation(error.to_string()))?;
     if app_id != project_id {
         return Err(validation(
-            "projectId must equal appId because each UserAppBuilder owns one app workspace",
+            "project_id must equal app_id because each UserAppBuilder owns one app workspace",
         ));
     }
     Ok(())
@@ -289,7 +289,7 @@ pub async fn build(
     request_body = QueryPublishTasksRequest,
     responses(
         (status = 200, body = HttpResult<PaginatedResponse<PublishTaskSnapshot>>, description = "Publish task page"),
-        (status = 400, description = "Invalid page/pageSize or filters.appIds"),
+        (status = 400, description = "Invalid page/page_size or filters.app_ids"),
         (status = 500, description = "Persistence backend error")
     ),
     tag = "UserApp 发布"
@@ -304,12 +304,12 @@ pub async fn query_tasks(
         return Err(validation("page must be >= 1"));
     }
     if !(1..=100).contains(&page_size) {
-        return Err(validation("pageSize must be within 1..=100"));
+        return Err(validation("page_size must be within 1..=100"));
     }
     let filters = request.filters.unwrap_or_default();
     if let Some(app_ids) = &filters.app_ids {
         for app_id in app_ids {
-            crate::handler::utils::validate_identifier(app_id, "filters.appIds")
+            crate::handler::utils::validate_identifier(app_id, "filters.app_ids")
                 .map_err(|error| validation(error.to_string()))?;
         }
     }

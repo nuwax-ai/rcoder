@@ -227,8 +227,8 @@ async fn stream_logs(
                     for (service_id, source_id) in failed_sources.difference(&current_failures) {
                         yield Ok(Event::default().event("source_recovered").data(
                             json!({
-                                "serviceId": service_id,
-                                "sourceId": source_id,
+                                "service_id": service_id,
+                                "source_id": source_id,
                             })
                             .to_string(),
                         ));

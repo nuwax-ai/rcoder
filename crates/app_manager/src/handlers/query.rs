@@ -67,7 +67,7 @@ pub async fn get_app_stats(
         ("app_id" = String, Path, description = "应用 ID")
     ),
     responses(
-        (status = 200, description = "查询成功", body = HttpResult<Vec<String>>),
+        (status = 200, description = "查询成功", body = HttpResult<Vec<container_runtime_api::AppEventInfo>>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "应用管理"

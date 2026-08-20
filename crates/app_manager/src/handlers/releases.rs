@@ -52,7 +52,7 @@ pub async fn prepare_release(
 ///   制品包不动，供排查；恢复用 rollback 接口）——返回 200 是发布结果而非系统错误，
 ///   调用方按 `data.status` 分支，不要按 HTTP 5xx 重试。
 /// - 幂等：目标 release 已 Active 时直接返回。
-/// - `readinessTimeoutSeconds` 默认 300、范围 5..=1800（Java 等慢启动应用可调大）。
+/// - `readiness_timeout_seconds` 默认 300、范围 5..=1800（Java 等慢启动应用可调大）。
 ///   **等待期间本请求同步阻塞**，调用方 HTTP 读超时须 ≥ 该值 + 余量。
 #[utoipa::path(
     post,
@@ -64,7 +64,7 @@ pub async fn prepare_release(
     request_body = ActivateReleaseRequest,
     responses(
         (status = 200, description = "status=Active（就绪提交）或 Failed（就绪失败，现场保留，用 rollback 恢复）", body = ReleaseInfo),
-        (status = 400, description = "参数校验失败（含 readinessTimeoutSeconds 越界 5..=1800）", body = HttpResult<String>),
+        (status = 400, description = "参数校验失败（含 readiness_timeout_seconds 越界 5..=1800）", body = HttpResult<String>),
         (status = 404, description = "应用不存在 / release 不存在 / 制品包文件缺失", body = HttpResult<String>),
         (status = 500, description = "切流/拉起/索引写入失败（操作错误，非就绪失败）", body = HttpResult<String>)
     ),
@@ -81,7 +81,7 @@ pub async fn activate_release(
         return Err(AppError::with_message(
             shared_types::error_codes::ERR_VALIDATION,
             format!(
-                "readinessTimeoutSeconds must be within {MIN_READY_TIMEOUT_SECS}..={MAX_READY_TIMEOUT_SECS}, got {seconds}"
+                "readiness_timeout_seconds must be within {MIN_READY_TIMEOUT_SECS}..={MAX_READY_TIMEOUT_SECS}, got {seconds}"
             ),
         ));
     }

@@ -255,7 +255,7 @@ impl AppService {
         }
         if !(1..=100).contains(&page_size) {
             return Err(AppOperationError::Validation(
-                "pageSize must be within 1..=100".to_string(),
+                "page_size must be within 1..=100".to_string(),
             ));
         }
         let total = items.len() as u64;

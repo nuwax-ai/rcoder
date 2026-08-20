@@ -10,7 +10,7 @@ pub const MAX_KEYWORD_BYTES: usize = 256;
 pub const MAX_CURSOR_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct LogQueryRequest {
     #[serde(default)]
     pub selectors: Vec<LogSelector>,
@@ -29,7 +29,7 @@ pub struct LogQueryRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct LogSelector {
     pub service_id: String,
     #[serde(default)]
@@ -37,7 +37,7 @@ pub struct LogSelector {
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+
 pub struct LogSourceInfo {
     pub service_id: String,
     pub source_id: String,
@@ -46,7 +46,7 @@ pub struct LogSourceInfo {
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+
 pub struct LogRecord {
     pub service_id: String,
     pub source_id: String,
@@ -58,7 +58,7 @@ pub struct LogRecord {
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+
 pub struct SourceError {
     pub service_id: String,
     pub source_id: String,
@@ -67,7 +67,7 @@ pub struct SourceError {
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+
 pub struct LogQueryResponse {
     pub logs: Vec<LogRecord>,
     pub source_errors: Vec<SourceError>,
@@ -90,4 +90,58 @@ pub struct SourceCursor {
 pub struct FileCursor {
     pub file: String,
     pub offset: u64,
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    /// wire 契约锁定：rcoder（AppLogQueryRequest，snake）原样转发到本端点——
+    /// 请求必须接受 snake 键（caef1f5 曾因 camelCase+deny_unknown_fields 断链，
+    /// 带 selectors 的请求 400）。deny_unknown_fields 同时兜底 camel 漂移。
+    #[test]
+    fn log_query_request_accepts_snake_wire() {
+        let req: LogQueryRequest = serde_json::from_str(
+            r#"{"selectors":[{"service_id":"backend-go","source_ids":["application"]}],"tail":200}"#,
+        )
+        .expect("snake wire from rcoder must deserialize");
+        assert_eq!(req.selectors.len(), 1);
+        assert_eq!(req.selectors[0].service_id, "backend-go");
+        assert_eq!(req.selectors[0].source_ids, vec!["application".to_string()]);
+
+        // camel 键必须被拒（deny_unknown_fields 防 wire 回潮）
+        assert!(serde_json::from_str::<LogQueryRequest>(
+            r#"{"selectors":[{"serviceId":"x"}]}"#
+        )
+        .is_err());
+    }
+
+    /// 响应 wire 锁定：service_id/source_errors/cursor_reset 全 snake（Java 契约）。
+    #[test]
+    fn log_query_response_serializes_snake_wire() {
+        let resp = LogQueryResponse {
+            logs: vec![LogRecord {
+                service_id: "backend".into(),
+                source_id: "application".into(),
+                file: "app.log".into(),
+                offset: 1,
+                timestamp: None,
+                level: Some("info".into()),
+                message: "hi".into(),
+            }],
+            source_errors: vec![SourceError {
+                service_id: "backend".into(),
+                source_id: "application".into(),
+                code: "E".into(),
+                message: "m".into(),
+            }],
+            cursor: "c".into(),
+            cursor_reset: true,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""service_id""#), "{json}");
+        assert!(json.contains(r#""source_errors""#), "{json}");
+        assert!(json.contains(r#""cursor_reset""#), "{json}");
+        assert!(!json.contains("serviceId"), "camel residue: {json}");
+    }
 }
