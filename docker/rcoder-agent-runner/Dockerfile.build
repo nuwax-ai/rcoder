@@ -50,6 +50,7 @@ COPY crates ./crates
 COPY tests-e2e ./tests-e2e
 # utoipa-swagger-ui build.rs 的 swagger-ui 资源：宿主预下载 vendor（构建容器直连
 # GitHub DNS 抖动失败率极高）；file:// URL 为该 build.rs 官方支持
+# ⚠️ 升级 utoipa-swagger-ui 时须同步更新此 zip 版本（当前对应 9.0.2 → v5.17.14）
 COPY docker/rcoder-agent-runner/deps/swagger-ui-v5.17.14.zip /build/deps/swagger-ui-v5.17.14.zip
 ENV SWAGGER_UI_DOWNLOAD_URL=file:///build/deps/swagger-ui-v5.17.14.zip
 
