@@ -50,6 +50,21 @@ cargo test -p rcoder-e2e --test compose_sse -- --test-threads=1 reconnect
 
 入口文件 `summary.json`（run 级）：全部场景 verdict + jsonl 路径 + 失败断言列表。
 
+## 服务端日志/trace 联动
+
+e2e 注入 W3C traceparent（rcoder 侧 `make_span_with_trace_parent` 提取继承），
+`scenario_begin` 行的 `environment.trace_id` 是本场景的 trace id；`session_id` 见
+chat_request 响应。排查链：
+
+```bash
+# ① jsonl 拿 trace_id / session_id
+head -1 tests-e2e/reports/<run>/<scenario>.jsonl | jq .environment.trace_id
+# ② 服务端日志（compose 挂载 ./logs/，按天滚动 JSON）按 session_id 检索
+grep 'ses_xxx' logs/rcoder.$(date +%Y-%m-%d) | jq .
+# ③ OTLP 开启的环境（K8s），trace_id 可在 Jaeger/Tempo 查全链路
+#    （e2e → rcoder → agent_runner 同一 trace；HttpResult.tid 即它）
+```
+
 agent 排查示例：
 
 ```bash
