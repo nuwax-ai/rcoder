@@ -105,13 +105,21 @@ where
 /// - OpenTelemetry Layer: 如果提供了 TracerProvider，将 span 发送到 OTLP
 /// - Extra Layer: 可选的外部注入 layer（如 file-server 独立日志，per-layer filter 独立过滤）
 /// - TokioConsole Layer: 可选的 tokio-console 观测 layer（本地开发 feature 注入）
+///
+/// 返回 flame feature 的 FlushGuard（feature off 时为 None）。
+#[cfg(feature = "flame")]
+pub(crate) type FlameGuard = tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>;
+#[cfg(not(feature = "flame"))]
+pub(crate) type FlameGuard = ();
+
 pub(crate) fn init_tracing_subscriber(
     service_name: &str,
     tracer_provider: Option<&SdkTracerProvider>,
     file_log_config: Option<&FileLogConfig>,
     extra_layer: Option<BoxedLayer>,
     tokio_console_layer: Option<BoxedLayer>,
-) -> Result<()> {
+    flame_config: Option<&crate::config::FlameConfig>,
+) -> Result<Option<FlameGuard>> {
     use opentelemetry::trace::TracerProvider;
 
     // 创建 EnvFilter（支持 RUST_LOG 环境变量）
@@ -211,24 +219,68 @@ pub(crate) fn init_tracing_subscriber(
         Some(tracing_opentelemetry::layer().with_tracer(tracer))
     };
 
+    // tracing-flame 火焰图 layer（flame feature；具体类型直接挂——不做
+    // BoxedLayer 装箱，因为 boxed layer 只能挂 Registry 顶层单层）
+    #[cfg(feature = "flame")]
+    let (flame_layer, flame_guard) = match flame_config {
+        Some(fc) => {
+            use tracing_flame::FlameLayer;
+            // 父目录确保存在
+            if let Some(dir) = fc.output_path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let (layer, guard) = FlameLayer::with_file(&fc.output_path)?;
+            (
+                Some(layer.with_threads_collapsed(fc.collapse_threads)),
+                Some(guard),
+            )
+        }
+        None => (None, None),
+    };
+    #[cfg(not(feature = "flame"))]
+    let _ = flame_config; // 未启用 feature 时忽略
+
     // 构建完整 subscriber 链：
-    // extra_layer 先注入到 Registry 上（Box<dyn Layer<Registry>> 直接匹配 Registry），
-    // 然后 env_filter（全局过滤）、console/file（deny file_server）、otel、tokio-console
-    // boxed layer 只能直接挂 Registry 顶层（Box<dyn Layer<Registry>>）——
-    // extra_layer 与 tokio_console_layer 叠加为单层注入
+    // boxed layer 只能直接挂 Registry 顶层——extra_layer 与 tokio_console_layer
+    // 经 stack_boxed_layers 叠加为单层注入；flame 是具体类型（非 boxed）可直接
+    // 挂在 file_layer 之后（Layer<S> 泛型于 S，不受 Registry-only 限制）
     let has_tokio_console = tokio_console_layer.is_some();
-    tracing_subscriber::registry()
+    // flame layer 直接挂 registry 链（具体类型，不受 boxed-only-on-Registry 限制）
+    #[cfg(feature = "flame")]
+    let registry = tracing_subscriber::registry()
         .with(stack_boxed_layers(extra_layer, tokio_console_layer))
         .with(env_filter)
         .with(console_layer)
         .with(file_layer)
-        .with(otel_layer)
-        .init();
+        .with(flame_layer)
+        .with(otel_layer);
+    #[cfg(not(feature = "flame"))]
+    let registry = tracing_subscriber::registry()
+        .with(stack_boxed_layers(extra_layer, tokio_console_layer))
+        .with(env_filter)
+        .with(console_layer)
+        .with(file_layer)
+        .with(otel_layer);
+    registry.init();
     if has_tokio_console {
         info!("[Telemetry] tokio-console observation layer enabled");
     }
+    #[cfg(feature = "flame")]
+    if let Some(fc) = flame_config {
+        info!(
+            "[Telemetry] tracing-flame enabled (output: {:?})",
+            fc.output_path
+        );
+    }
 
-    Ok(())
+    #[cfg(feature = "flame")]
+    {
+        Ok(flame_guard)
+    }
+    #[cfg(not(feature = "flame"))]
+    {
+        Ok(None)
+    }
 }
 
 /// 两个 boxed layer（Option 包装，None 为 no-op）叠加为单层。

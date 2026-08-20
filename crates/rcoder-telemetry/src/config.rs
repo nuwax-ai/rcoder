@@ -27,6 +27,8 @@ pub struct TelemetryConfig {
     /// extra_layer 已被 file-server 嵌入场景占用。无 guard：console 服务器
     /// 任务自管理生命周期）
     pub console_layer: Option<BoxedLayer>,
+    /// tracing 火焰图配置（flame feature；None=未启用）
+    pub flame: Option<FlameConfig>,
 }
 
 /// OTLP 导出器配置
@@ -87,6 +89,7 @@ impl Default for TelemetryConfig {
             extra_layer: None,
             extra_layer_guard: None,
             console_layer: None,
+            flame: None,
         }
     }
 }
@@ -200,6 +203,7 @@ impl TelemetryConfig {
             extra_layer: None,
             extra_layer_guard: None,
             console_layer: None,
+            flame: None,
         }
     }
 
@@ -267,6 +271,12 @@ impl TelemetryConfig {
         self
     }
 
+    /// 配置 tracing 火焰图（flame feature）。
+    pub fn with_flame_config(mut self, config: FlameConfig) -> Self {
+        self.flame = Some(config);
+        self
+    }
+
     /// 注入 tokio-console 观测 layer（rcoder/agent_runner 的 `console` feature
     /// 构造后传入；telemetry 自身不依赖 console-subscriber，经 BoxedLayer 泛化承载）。
     pub fn with_console_layer(mut self, layer: BoxedLayer) -> Self {
@@ -319,4 +329,17 @@ mod tests {
         assert_eq!(file_log.filename_prefix, "my-service");
         assert_eq!(file_log.directory, PathBuf::from("logs"));
     }
+}
+
+/// tracing 火焰图配置（`flame` feature 用）。
+///
+/// 每当 span enter/exit 时写入折叠栈数据到指定文件——事后用
+/// `inferno-flamegraph < output.folded > flame.svg` 渲染火焰图。
+/// 高并发下有非零开销，建议仅排查性能问题时临时开启。
+#[derive(Debug, Clone)]
+pub struct FlameConfig {
+    /// 输出文件路径（如 "logs/tracing.folded"）
+    pub output_path: PathBuf,
+    /// 是否合并不同线程的 span（true=单线程视图更简洁）
+    pub collapse_threads: bool,
 }

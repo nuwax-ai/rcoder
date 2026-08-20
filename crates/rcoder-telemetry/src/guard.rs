@@ -21,6 +21,9 @@ pub struct TelemetryGuard {
     pub(crate) service_name: String,
     /// 额外 layer 关联的 WorkerGuard（如 file-server 独立日志的 non_blocking guard）
     pub(crate) _extra_layer_guard: Option<WorkerGuard>,
+    /// tracing-flame FlushGuard（flame feature；进程退出时 flush 折叠栈数据）
+    #[cfg(feature = "flame")]
+    pub(crate) _flame_guard: Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>>,
 }
 
 impl TelemetryGuard {

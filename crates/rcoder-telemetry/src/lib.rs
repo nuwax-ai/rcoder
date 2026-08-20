@@ -47,7 +47,7 @@ pub mod propagation;
 pub mod subscriber;
 
 // Re-exports（外部消费面统一走 crate 根路径）
-pub use config::{FileLogConfig, OtlpConfig, PrometheusConfig, TelemetryConfig};
+pub use config::{FileLogConfig, FlameConfig, OtlpConfig, PrometheusConfig, TelemetryConfig};
 pub use guard::TelemetryGuard;
 pub use init::{init, init_prometheus_only};
 pub use middleware::{GrpcMetricsInterceptor, HttpMetricsLayer};

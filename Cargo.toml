@@ -115,6 +115,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 # tokio-console 嵌入端（本地观测 feature 用；须配 RUSTFLAGS="--cfg tokio_unstable" 编译）
 console-subscriber = "0.5.0"
+# tracing 火焰图（flame feature 用；输出 folded stack → inferno 渲染 SVG）
+tracing-flame = "0.2"
 
 # OpenTelemetry
 opentelemetry = "0.32"

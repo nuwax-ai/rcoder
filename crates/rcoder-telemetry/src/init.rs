@@ -67,12 +67,15 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
     // 变量 console_layer 命名区分；独立于 extra_layer 槽（file-server 嵌入占用）
     let has_tokio_console = config.console_layer.is_some(); // take 前记，供启动日志使用
     let tokio_console_layer = config.console_layer.take();
-    subscriber::init_tracing_subscriber(
+    // tracing-flame 火焰图配置（take 前记，供启动日志使用）
+    let flame_config = config.flame.take();
+    let _flame_guard = subscriber::init_tracing_subscriber(
         &config.service_name,
         tracer_provider.as_ref(),
         config.file_log.as_ref(),
         extra_layer,
         tokio_console_layer,
+        flame_config.as_ref(),
     )?;
 
     info!(
@@ -93,6 +96,8 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
         prometheus_handle,
         service_name: config.service_name,
         _extra_layer_guard: config.extra_layer_guard.take(),
+        #[cfg(feature = "flame")]
+        _flame_guard,
     })
 }
 
@@ -111,5 +116,7 @@ pub fn init_prometheus_only(service_name: impl Into<String>) -> Result<Telemetry
         prometheus_handle: Some(prometheus_handle),
         service_name,
         _extra_layer_guard: None,
+        #[cfg(feature = "flame")]
+        _flame_guard: None,
     })
 }

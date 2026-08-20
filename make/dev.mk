@@ -53,6 +53,13 @@ dev-restart: dev-build
 # 前提：docker-compose.yml 已挂载源码到 /app/src（首次需 make dev-restart 应用）。
 # 流程：容器内 cargo build --release --bin rcoder（增量）→ 替换 /app/bin/rcoder
 #       → docker restart 拉起新 binary。
+# tracing 火焰图模式（本地 cargo run）：flame feature；RCODER_FLAME 控制输出路径
+# 用法: make run-flame RCODER_FLAME=logs/tracing.folded
+# 事后: inferno-flamegraph < logs/tracing.folded > flame.svg（cargo install inferno）
+run-flame:
+	@echo "🔥 本地运行 rcoder（tracing 火焰图模式）..."
+	@export RCODER_FLAME=${RCODER_FLAME:-logs/tracing.folded}; 	cargo run -p rcoder --features flame; 	echo "📊 folded: $"
+
 # tokio-console 观测模式（本地 cargo run）：feature+RUSTFLAGS+独立 target 三件套
 # 连接: cargo install tokio-console && tokio-console localhost:6669
 run-console:
