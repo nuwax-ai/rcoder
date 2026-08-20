@@ -68,6 +68,17 @@ tokio-console http://localhost:6669
 死锁排查套路：`r` 进资源视图 → `l` 按持有时间排序 → 持有 `since` 持续
 增长的锁 + `t` 视图里卡在 `lock` 状态的任务 = 死锁对。
 
+## 与日志级别（RUST_LOG）的关系
+
+tokio 任务/waker 事件为 **trace 级**——EnvFilter 全局压制会挡住 console 层
+（现象：TUI 连上但零任务）。telemetry 已在 console 开启时自动给 EnvFilter
+叠加 `tokio=trace` + `runtime=trace`（精准放行，两 target 无业务日志，
+不影响 fmt/文件层输出），**无需任何 RUST_LOG 配置**。
+
+- 全局 `RUST_LOG=trace` 也能让 console 工作，但 hyper/tonic/bollard 等
+  依赖的 trace 日志海量，仅适合临时深挖，不建议常驻
+- 临时查某个库用精准指令：`RUST_LOG=debug,bollard=trace`
+
 ## 约束
 
 - release / CI 构建不带 feature、不带 RUSTFLAGS——二进制不含 console 代码
