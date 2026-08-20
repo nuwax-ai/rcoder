@@ -42,6 +42,17 @@ make run-console
 ## tracing-flame 火焰图
 
 ```bash
+# compose 容器（推荐，配合 e2e 负载采样）
+# ① make dev-hot 默认已带 flame feature（DEV_FLAME=1；DEV_FLAME=0 关闭）
+# ② 容器带输出路径重建（一次性）：
+RCODER_FLAME=/app/logs/flame.folded docker compose -f docker/docker-compose.yml up -d rcoder
+# ③ 跑负载（e2e / curl）
+# ④ 停机落盘（SIGTERM 优雅退出自动 flush），⚠️ 必须先拷贝再重启——
+#    重启会 truncate 同路径文件（FlameLayer 以 create 模式打开）：
+docker stop rcoder-rcoder-1
+cp docker/logs/flame.folded /tmp/flame-keep.folded
+docker start rcoder-rcoder-1
+
 # 本地运行（产生 .folded 文件）
 make run-flame                          # 默认 logs/tracing.folded
 make run-flame RCODER_FLAME=/tmp/f.folded
@@ -52,6 +63,10 @@ open flame.svg                          # 浏览器查看
 ```
 
 **与 Pyroscope 的区别**：Pyroscope 是 CPU 采样（哪些函数在烧 CPU），tracing-flame 是 span 耗时（哪些 async 路径在等待/耗时）。
+
+**读图要点**（实测经验）：
+- folded 里裸 `all-threads` 大数值行 = 停机时仍未关闭的后台 span / 线程空闲 gap，不代表热点，分析时跳过；
+- 只有 2 帧以上的栈才是真实 span 链；无子 span 的热点叶子帧（如 handler）说明该函数内部缺 `#[instrument]`，是可观测性缺口而非"函数本身慢"。
 
 ## 完整排查链路
 
