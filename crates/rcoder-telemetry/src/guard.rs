@@ -21,9 +21,14 @@ pub struct TelemetryGuard {
     pub(crate) service_name: String,
     /// 额外 layer 关联的 WorkerGuard（如 file-server 独立日志的 non_blocking guard）
     pub(crate) _extra_layer_guard: Option<WorkerGuard>,
-    /// tracing-flame FlushGuard（flame feature；进程退出时 flush 折叠栈数据）
+    /// tracing-flame FlushGuard（flame feature；Drop 时 flush 折叠栈数据）。
+    /// Mutex<Option<..>> 槽包装：Arc<TelemetryGuard> 克隆会进入 router（metrics
+    /// handler 等），进程退出时引用计数不一定归零——纯 Drop flush 不可靠，
+    /// 由 `flush_flame()` 显式 take→drop 保证确定性落盘。
     #[cfg(feature = "flame")]
-    pub(crate) _flame_guard: Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>>,
+    pub(crate) _flame_guard: Option<
+        std::sync::Mutex<Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>>>,
+    >,
 }
 
 impl TelemetryGuard {
@@ -54,6 +59,27 @@ impl TelemetryGuard {
     pub fn service_name(&self) -> &str {
         &self.service_name
     }
+
+    /// 显式 flush tracing-flame 折叠栈数据（进程优雅退出时调用）
+    ///
+    /// FlushGuard 依赖 Drop flush，但 guard 以 Arc 共享进 router 后，进程退出
+    /// 时引用计数不一定归零——此方法 take→drop 保证确定性落盘。
+    /// flame feature 未启用或未配置时为 no-op；重复调用幂等。
+    #[cfg(feature = "flame")]
+    pub fn flush_flame(&self) {
+        if let Some(slot) = &self._flame_guard
+            && let Ok(mut guard) = slot.lock()
+            && let Some(flush_guard) = guard.take()
+        {
+            info!("[Telemetry] flushing tracing-flame folded stacks...");
+            drop(flush_guard); // FlushGuard::Drop → 折叠栈写入输出文件
+            info!("[Telemetry] tracing-flame folded stacks flushed");
+        }
+    }
+
+    /// 显式 flush tracing-flame 折叠栈数据（flame feature 未启用时为 no-op）
+    #[cfg(not(feature = "flame"))]
+    pub fn flush_flame(&self) {}
 }
 
 impl Drop for TelemetryGuard {

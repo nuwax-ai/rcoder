@@ -28,6 +28,10 @@ services:
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}
       # 主容器禁用 ttyd（ttyd 在动态创建的容器中运行）
       - ENABLE_TTYD=false
+      # tracing-flame 火焰图输出路径（需 DEV_FLAME=1 make dev-hot 构建的 binary；
+      # 空/未设置 = 火焰图休眠零开销。用法: RCODER_FLAME=/app/logs/flame.folded
+      # docker compose up -d rcoder 重建容器后生效；停止容器时优雅退出自动落盘）
+      - RCODER_FLAME=${RCODER_FLAME:-}
     volumes:
       # 挂载 Docker socket
       - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock

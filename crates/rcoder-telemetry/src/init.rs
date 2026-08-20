@@ -96,8 +96,9 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
         prometheus_handle,
         service_name: config.service_name,
         _extra_layer_guard: config.extra_layer_guard.take(),
+        // Mutex 槽包装：flush_flame() 显式 take→drop 落盘（见 guard.rs 注释）
         #[cfg(feature = "flame")]
-        _flame_guard,
+        _flame_guard: _flame_guard.map(|g| std::sync::Mutex::new(Some(g))),
     })
 }
 

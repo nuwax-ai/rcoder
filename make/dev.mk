@@ -68,12 +68,13 @@ run-console:
 	cargo run -p rcoder --features console
 
 dev-hot:
-	@echo "🔥 容器内热编译 rcoder..."
+	@echo "🔥 容器内热编译 rcoder（DEV_FLAME 默认开启，DEV_FLAME=0 关闭）..."
 	@DEV_CID=$$(docker-compose -f docker/docker-compose.yml ps -q rcoder); \
 	if [ -z "$$DEV_CID" ]; then \
 		echo "❌ rcoder 容器未运行，请先 make dev-up"; exit 1; \
 	fi; \
-	docker exec -e DEV_CONSOLE="$${DEV_CONSOLE:-0}" $$DEV_CID bash /app/src/docker/dev-hot-build.sh && \
+	docker exec -e DEV_CONSOLE="$${DEV_CONSOLE:-0}" -e DEV_FLAME="$${DEV_FLAME:-1}" $$DEV_CID bash /app/src/docker/dev-hot-build.sh && \
 	echo "🔄 重启 rcoder 进程（拉起新 binary）..." && \
 	docker restart $$DEV_CID >/dev/null && \
 	echo "✅ 热编译完成（日志: docker logs -f $$DEV_CID）"
+	@echo "🔥 火焰图启用: RCODER_FLAME=/app/logs/flame.folded docker compose -f docker/docker-compose.yml up -d rcoder"

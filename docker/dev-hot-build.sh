@@ -40,20 +40,32 @@ fi
 
 # 3. 增量编译 rcoder binary（release；cargo target volume 持久化 → 增量）
 cd "$SRC_DIR"
+# DEV_FLAME=1（默认）：编译带 flame feature 的 binary——本地开发模式默认开启，
+#   配合 compose 的 RCODER_FLAME 环境变量输出火焰图（未设置 RCODER_FLAME 时零开销休眠）。
+#   DEV_FLAME=0 可关闭（feature 切换只重编 workspace crate，依赖缓存不受影响）。
 # DEV_CONSOLE=1：tokio-console 观测模式（独立 target-console 目录——RUSTFLAGS
-# 变化会使普通缓存指纹失效，隔离避免交替全量重编；宿主机连 localhost:6669）
+#   变化会使普通缓存指纹失效，隔离避免交替全量重编；宿主机连 localhost:6669；
+#   与 DEV_FLAME 可组合，features=console,flame）
+DEV_FLAME=$([ "${DEV_FLAME:-1}" = "1" ] && echo 1 || echo 0)
 if [ "${DEV_CONSOLE:-0}" = "1" ]; then
-    echo "🔨 cargo build --release --bin rcoder --features console（tokio-console；独立 target）..."
+    FEATURES="console"
+    [ "$DEV_FLAME" = "1" ] && FEATURES="$FEATURES,flame"
+    echo "🔨 cargo build --release --bin rcoder --features $FEATURES（tokio-console；独立 target）..."
     export RUSTFLAGS="--cfg tokio_unstable"
     export CARGO_TARGET_DIR="$SRC_DIR/target-console"
-    cargo build --release --bin rcoder --features console
+    cargo build --release --bin rcoder --features "$FEATURES"
     BIN_SRC="$CARGO_TARGET_DIR/release/rcoder"
     # start-rcoder.sh 优先用 /app/src/target/release/rcoder——必须清掉另一模式的
     # 旧产物，否则新二进制（/app/bin/rcoder）被跳过（8/19 陈旧产物事故同款坑）
     rm -f "$SRC_DIR/target/release/rcoder"
 else
-    echo "🔨 cargo build --release --bin rcoder（增量）..."
-    cargo build --release --bin rcoder
+    if [ "$DEV_FLAME" = "1" ]; then
+        echo "🔨 cargo build --release --bin rcoder --features flame（火焰图；增量）..."
+        cargo build --release --bin rcoder --features flame
+    else
+        echo "🔨 cargo build --release --bin rcoder（增量）..."
+        cargo build --release --bin rcoder
+    fi
     BIN_SRC="$SRC_DIR/target/release/rcoder"
     rm -f "$SRC_DIR/target-console/release/rcoder"
 fi
