@@ -6675,6 +6675,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcoder-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "shared_types",
+ "tokio",
+]
+
+[[package]]
 name = "rcoder-gateway"
 version = "0.1.3"
 dependencies = [

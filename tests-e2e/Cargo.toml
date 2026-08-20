@@ -1,0 +1,19 @@
+[package]
+name = "rcoder-e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "黑盒 e2e 集成测试：/computer/chat + SSE 进度流（compose/K8s 双环境门控；JSONL 报告供 agent 追溯）"
+
+[dependencies]
+shared_types = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures-util = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true

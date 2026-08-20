@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "tests-e2e"]
 exclude = ["tmp/*", "crates/app-cli"]
 resolver = "2"
 

@@ -45,3 +45,4 @@ crates/*/target/
 *.env.local
 tests/sse_e2e/results/
 tests/userapp_e2e_local/
+tests-e2e/reports/
