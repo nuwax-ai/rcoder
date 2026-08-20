@@ -97,7 +97,7 @@ def test_publish_reaches_terminal():
           f"status={status}, {elapsed:.0f}s")
     # tasks/query 按 appIds 过滤应能看到该任务
     q = requests.post(f"{BASE}/api/v1/apps/publish/tasks/query",
-                      json={"filters": {"appIds": [ident]}}, timeout=TIMEOUT)
+                      json={"filters": {"app_ids": [ident]}}, timeout=TIMEOUT)
     items = ((q.json().get("data") or {}).get("items")) if q.status_code == 200 else []
     check("tasks/query 可按 app_ids 过滤到该任务",
           q.status_code == 200 and len(items) >= 1,

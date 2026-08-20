@@ -3,6 +3,7 @@
 //! 与 Python 套件（tests/sse_e2e/common.py）语义对齐；配置读取同为
 //! "环境变量优先，仓库根 .env.local 兜底"（API key 等不进 git）。
 
+pub mod metrics;
 pub mod report;
 pub mod scenario;
 pub mod sse;
@@ -57,6 +58,8 @@ pub struct Env {
     pub lb_entry_hosts: String,
     /// K8s NodePort 端口（LB_NODEPORT，默认 30295）
     pub lb_nodeport: String,
+    /// 本场景的 W3C trace id（注入 traceparent header；jsonl 记录供检索）
+    pub trace_id: String,
     pub http: reqwest::Client,
     /// SSE 专用 client（与 chat 隔离连接池：排除 keep-alive 连接复用变量）
     pub sse_http: reqwest::Client,
@@ -102,6 +105,16 @@ impl Env {
         let cfg = load_env_local();
         let run_tag = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
         let hhmmss = run_tag.split('_').nth(1).unwrap_or("000000").to_owned();
+        // W3C traceparent 注入：e2e 发起 trace（每 Env 实例 = 每场景独立
+        // trace_id），rcoder 侧 make_span_with_trace_parent 提取继承——
+        // OTLP 开启时全链路同一 trace，失败排查用 trace_id 检索。
+        let trace_id = uuid::Uuid::new_v4().simple().to_string();
+        let span_id = &uuid::Uuid::new_v4().simple().to_string()[..16];
+        let traceparent = format!("00-{trace_id}-{span_id}-01");
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&traceparent) {
+            default_headers.insert("traceparent", v);
+        }
         Env {
             rcoder: cfg_or_env_or(&cfg, "RCODER_URL", "http://127.0.0.1:8090"),
             api_key: cfg_or_env(&cfg, "LLM_API_KEY"),
@@ -118,12 +131,15 @@ impl Env {
             k8s_ns: cfg_or_env_or(&cfg, "TEST_K8S_NS", "nuwax-k8s-test"),
             lb_entry_hosts: cfg_or_env(&cfg, "LB_ENTRY_HOSTS"),
             lb_nodeport: cfg_or_env_or(&cfg, "LB_NODEPORT", "30295"),
+            trace_id,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
+                .default_headers(default_headers.clone())
                 .build()
                 .expect("build http client"),
             sse_http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
+                .default_headers(default_headers)
                 .build()
                 .expect("build sse http client"),
         }
@@ -142,7 +158,7 @@ impl Env {
         let report = JsonlReporter::begin(
             scenario,
             backend,
-            json!({ "rcoder": env.rcoder, "model": env.model, "user": env.user }),
+            json!({ "rcoder": env.rcoder, "model": env.model, "user": env.user, "trace_id": env.trace_id }),
         );
         if env.api_key.is_empty() || env.model.is_empty() || env.base_url.is_empty() {
             report.skip(
@@ -178,7 +194,24 @@ impl Env {
         request_id: &str,
         user: &str,
     ) -> ComputerChatRequest {
-        let m = self.model.clone();
+        self.base_payload_with_model(backend, prompt, request_id, user, "")
+    }
+
+    /// 模型覆盖版（model_override 非空时替换 provider 的 id/name/default_model，
+    /// 对齐 Python base_payload 的 model= 参数——切模型场景用）。
+    pub fn base_payload_with_model(
+        &self,
+        backend: Backend,
+        prompt: &str,
+        request_id: &str,
+        user: &str,
+        model_override: &str,
+    ) -> ComputerChatRequest {
+        let m = if model_override.is_empty() {
+            self.model.clone()
+        } else {
+            model_override.to_owned()
+        };
         let (provider, server) = match backend {
             Backend::Anthropic => {
                 let provider = ModelProviderConfig {

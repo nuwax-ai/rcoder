@@ -119,3 +119,57 @@ pub async fn record_bg_chat(
 pub fn count_event(events: &[SseEvent], name: &str) -> usize {
     events.iter().filter(|e| e.event == name).count()
 }
+
+// ---- /metrics 前后快照 diff（性能观测）----
+
+use crate::common::metrics::MetricsSnapshot;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+/// 进程级上次快照（串行场景下 diff 即本场景增量）。
+fn metrics_before() -> &'static Mutex<Option<MetricsSnapshot>> {
+    static BEFORE: OnceLock<Mutex<Option<MetricsSnapshot>>> = OnceLock::new();
+    BEFORE.get_or_init(|| Mutex::new(None))
+}
+
+/// 场景收口拉 /metrics 与上次快照 diff 写 jsonl；不可达记 unavailable。
+/// assert_hard_all 的 async 上下文调用（Drop 路径不做——异常路径性能数据不重要）。
+pub async fn record_metrics_diff(report: &JsonlReporter) {
+    let Some(base_url) = &report.base_url else {
+        return;
+    };
+    let Some(now) = MetricsSnapshot::fetch(&report_metrics_client(), base_url).await else {
+        report.diagnostic("metrics_diff", "unavailable", "/metrics 不可达或未启用");
+        return;
+    };
+    let prev = metrics_before().lock().expect("metrics lock").take();
+    match prev {
+        Some(before) => {
+            let d = now.diff_json(&before);
+            report.diagnostic(
+                "metrics_diff",
+                &d.to_string(),
+                "chat 请求量/延迟增量（http_requests_total / duration histogram）",
+            );
+        }
+        None => {
+            report.diagnostic("metrics_diff", "baseline", "本进程首个场景，建立基线快照");
+        }
+    }
+    *metrics_before().lock().expect("metrics lock") = Some(now);
+}
+
+fn report_metrics_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .expect("metrics client")
+}
+
+/// 收尾统一断言：hard 断言有失败时让测试红，报告路径指向 jsonl。
+/// finish 前拉 /metrics 快照 diff（性能观测，不影响 verdict）。
+pub async fn assert_hard_all(report: JsonlReporter) {
+    record_metrics_diff(&report).await;
+    let path = report.path.display().to_string();
+    assert!(report.finish(), "场景失败：断言明细见 {path}");
+}

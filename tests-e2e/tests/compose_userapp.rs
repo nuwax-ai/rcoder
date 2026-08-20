@@ -57,7 +57,7 @@ async fn test_tasks_query(env: &Env, report: &JsonlReporter) {
     let (status2, _) = post_json(
         env,
         "/api/v1/apps/publish/tasks/query",
-        json!({"filters": {"activeOnly": true}}),
+        json!({"filters": {"active_only": true}}),
     )
     .await;
     report.assert_hard(
@@ -74,7 +74,7 @@ async fn test_publish_identifiers(env: &Env, report: &JsonlReporter) {
         let (status, _) = post_json(
             env,
             &format!("/api/v1/apps/BAD_ID/{kind}"),
-            json!({"projectId": "also-bad"}),
+            json!({"project_id": "also-bad"}),
         )
         .await;
         let elapsed = t0.elapsed();
@@ -88,7 +88,7 @@ async fn test_publish_identifiers(env: &Env, report: &JsonlReporter) {
     let (status, body) = post_json(
         env,
         "/api/v1/apps/app-e2e-mismatch-x1/publish",
-        json!({"projectId": "proj-different"}),
+        json!({"project_id": "proj-different"}),
     )
     .await;
     report.assert_hard(
@@ -118,7 +118,7 @@ async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
     let (status, body) = post_json(
         env,
         &format!("/api/v1/apps/{ident}/publish"),
-        json!({"projectId": ident}),
+        json!({"project_id": ident}),
     )
     .await;
     let ok = status.is_success() && http_ok(&body);
@@ -187,7 +187,7 @@ async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
     let (qs, qb) = post_json(
         env,
         "/api/v1/apps/publish/tasks/query",
-        json!({"filters": {"appIds": [ident]}}),
+        json!({"filters": {"app_ids": [ident]}}),
     )
     .await;
     let hit = qs.is_success()

@@ -72,6 +72,8 @@ pub struct JsonlReporter {
     pub path: PathBuf,
     scenario: String,
     backend: String,
+    /// rcoder 基地址（environment.rcoder；assert_hard_all 时拉 /metrics 做 diff）
+    pub base_url: Option<String>,
     started: Instant,
     hard_pass: Cell<u32>,
     hard_fail: Cell<u32>,
@@ -89,11 +91,16 @@ impl JsonlReporter {
             .write(true)
             .open(&path)
             .expect("open scenario jsonl");
+        let base_url = environment["rcoder"]
+            .as_str()
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned);
         let reporter = Self {
             file: Mutex::new(file),
             path,
             scenario: scenario.to_owned(),
             backend: backend.to_owned(),
+            base_url,
             started: Instant::now(),
             hard_pass: Cell::new(0),
             hard_fail: Cell::new(0),

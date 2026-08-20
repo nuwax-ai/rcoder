@@ -18,7 +18,9 @@
 use std::time::Duration;
 
 use rcoder_e2e::common::report::JsonlReporter;
-use rcoder_e2e::common::scenario::{CollectSpec, collect_reported, record_bg_chat, spawn_chat};
+use rcoder_e2e::common::scenario::{
+    CollectSpec, assert_hard_all, collect_reported, record_bg_chat, spawn_chat,
+};
 use rcoder_e2e::common::sse;
 use rcoder_e2e::common::{Backend, Env, TestUserGuard, chat_reported};
 use serde_json::json;
@@ -44,9 +46,10 @@ async fn k8s_or_skip(scenario: &str) -> Option<(Env, JsonlReporter, Vec<String>)
         scenario,
         "k8s",
         json!({
-            "rcoder": env.rcoder, "model": env.model, "user": env.user,
+            // rcoder 字段记实际入口（首入口；metrics diff 拉远端而非本地默认）
+            "rcoder": entries[0], "model": env.model, "user": env.user,
             "k8s_ssh": env.k8s_ssh, "k8s_ns": env.k8s_ns,
-            "entries": entries,
+            "entries": entries, "trace_id": env.trace_id,
         }),
     );
     if env.k8s_ssh.is_empty() {
@@ -82,11 +85,6 @@ async fn k8s_or_skip(scenario: &str) -> Option<(Env, JsonlReporter, Vec<String>)
             None
         }
     }
-}
-
-fn assert_hard_all(report: JsonlReporter) {
-    let path = report.path.display().to_string();
-    assert!(report.finish(), "场景失败：断言明细见 {path}");
 }
 
 /// 场景 1（主路径）：chat 三节点 NodePort 轮换 + SSE 入口轮换。
@@ -138,7 +136,7 @@ async fn scenario_entry_rotation() {
                         false,
                         format!("chat@{chat_url} 失败（见 chat_request 行）"),
                     );
-                    assert_hard_all(report);
+                    assert_hard_all(report).await;
                     return;
                 }
             }
@@ -210,7 +208,7 @@ async fn scenario_entry_rotation() {
             .unwrap_or_default();
         format!("末轮回答头 {last:?}")
     });
-    assert_hard_all(report);
+    assert_hard_all(report).await;
 }
 
 /// 轮次断言（收到事件 / seq 跨入口单源连续 / 完整执行 / 无前轮逐字重放）。
@@ -286,7 +284,7 @@ async fn scenario_cross_entry_cursor_reconnect() {
             false,
             "chat@A 失败（见 chat_request 行）".into(),
         );
-        assert_hard_all(report);
+        assert_hard_all(report).await;
         return;
     };
     let sid = d1.session_id;
@@ -362,7 +360,7 @@ async fn scenario_cross_entry_cursor_reconnect() {
             format!("续传 {} 个", ids_b.len()),
         );
     }
-    assert_hard_all(report);
+    assert_hard_all(report).await;
 }
 
 /// 场景 3：新会话 chat 后 1s 从另一入口订阅（durable 直写 + SSE 回源验收）。
@@ -393,7 +391,7 @@ async fn scenario_new_session_cross_entry() {
                 false,
                 format!("chat@{chat_url} 失败"),
             );
-            assert_hard_all(report);
+            assert_hard_all(report).await;
             return;
         };
         let sid = d.session_id.clone();
@@ -443,7 +441,7 @@ async fn scenario_new_session_cross_entry() {
             format!("拼接文本头 {:?}", text.chars().take(40).collect::<String>()),
         );
     }
-    assert_hard_all(report);
+    assert_hard_all(report).await;
 }
 
 fn short(url: &str) -> String {
