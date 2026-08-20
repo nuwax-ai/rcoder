@@ -8,6 +8,9 @@ use tracing::{error, info, warn};
 // 🆕 使用共享的遥测模块
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
+#[cfg(feature = "console")]
+mod console_obs;
+
 mod agent_mgmt;
 mod api_key_manager;
 mod auto_reload;
@@ -115,6 +118,10 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
     // 🆕 Initializing telemetry system（使用 rcoder-telemetry，包含控制台 + 文件日志）
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
+    // tokio-console 观测（console feature；shadowing 绑定——无 feature 时零代码）
+    #[cfg(feature = "console")]
+    let telemetry_config = console_obs::attach(telemetry_config);
+
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let _telemetry = Arc::new(telemetry);
 

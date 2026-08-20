@@ -14,6 +14,8 @@ name = "agent_runner"
 path = "src/lib.rs"
 
 [features]
+# tokio-console 观测（本地开发专用；编译须配 RUSTFLAGS="--cfg tokio_unstable"）
+console = ["dep:console-subscriber"]
 default = ["http-server", "grpc-server"]
 
 # HTTP 服务器功能：启用 HTTP REST API 和 SSE 进度流
@@ -56,6 +58,7 @@ model_probe = { workspace = true }
 file-server = { workspace = true }
 rcoder-proxy = { workspace = true, optional = true }
 rcoder-telemetry = { workspace = true }
+console-subscriber = { workspace = true, optional = true }
 
 clap = { workspace = true }
 # ACP Protocol - 官方 SDK（完全 Send-safe，无需 LocalSet）

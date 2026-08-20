@@ -35,6 +35,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
-ARG CARGO_FLAGS=""
+ARG CARGO_FLAGS
+# tokio-console 观测模式用（AGENT_CONSOLE=1 时传入 --cfg tokio_unstable）
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS="${RUSTFLAGS}"
 RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
     cargo build --release --bin agent_runner ${CARGO_FLAGS}

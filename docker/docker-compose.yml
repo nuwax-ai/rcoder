@@ -6,6 +6,7 @@ services:
       - "${RCODER_PORT:-8090}:${RCODER_PORT:-8090}"
       - "8089:8088" # Pingora 反向代理端口（VNC 代理、健康检查等）
       - "60001:60000"
+      - "6669:6669" # tokio-console 观测（DEV_CONSOLE=1 make dev-hot 构建时启用）
       - "8199:80"
       - "7681:7681" # ttyd Web 终端端口
     environment:
@@ -55,6 +56,8 @@ services:
       - rcoder-cargo-git:/root/.cargo/git
       # cargo target 缓存（独立 volume，避免 bind mount 拖慢 target 小文件 IO）
       - rcoder-target:/app/src/target
+      # tokio-console 观测构建的独立 target（RUSTFLAGS 指纹隔离，见 dev-hot-build.sh）
+      - rcoder-target-console:/app/src/target-console
     command: ["/bin/bash", "/app/start-rcoder.sh"]
     healthcheck:
       test:
@@ -124,3 +127,4 @@ volumes:
   rcoder-cargo-registry:
   rcoder-cargo-git:
   rcoder-target:
+  rcoder-target-console:

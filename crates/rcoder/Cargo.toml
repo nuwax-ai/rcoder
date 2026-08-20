@@ -20,6 +20,10 @@ default = []
 # 生产环境默认不启用，需要显式添加 --features debug
 debug = []
 
+# tokio-console 观测（本地开发专用；编译须配 RUSTFLAGS="--cfg tokio_unstable"，
+# 见 make run-console / DEV_CONSOLE=1 make dev-hot）。release 不启用=零代码零开销。
+console = ["dep:console-subscriber"]
+
 # 🔧 eBPF 调试模式：启用容器特权，允许使用 eBPF 诊断工具
 # 警告：仅在开发调试时使用，生产环境请勿启用
 # 此 feature 会传递给 docker_manager crate
@@ -56,6 +60,7 @@ app_manager = { path = "../app_manager" }
 arc-swap = { workspace = true }
 docker_manager = { workspace = true }
 rcoder-telemetry = { workspace = true }
+console-subscriber = { workspace = true, optional = true }
 
 clap = { workspace = true }
 async-trait = { workspace = true }

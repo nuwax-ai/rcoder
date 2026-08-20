@@ -8,6 +8,7 @@
 .zcode
 tests/sse_e2e/results
 tests/sse_e2e/__pycache__
+/target-console
 
 .classpath
 project_workspace
@@ -46,3 +47,5 @@ crates/*/target/
 tests/sse_e2e/results/
 tests/userapp_e2e_local/
 tests-e2e/reports/
+target-console/debug/build/ahash-8c244d12b1e0d55d/invoked.timestamp
+target-console/

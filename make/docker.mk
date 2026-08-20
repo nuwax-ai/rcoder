@@ -132,8 +132,16 @@ docker-build-agent-runner:
 	$(eval CRATES_HASH := $(shell find crates Cargo.toml Cargo.lock -name "*.rs" -o -name "Cargo.toml" -o -name "Cargo.lock" 2>/dev/null | sort | xargs cat 2>/dev/null | md5sum | cut -d' ' -f1))
 	@echo "🔑 业务代码哈希: $(CRATES_HASH)"
 	@# 🔥 关键修改：通过 CARGO_FEATURES 变量控制
-	@docker build --build-arg CRATES_HASH=$(CRATES_HASH) \
-		--build-arg CARGO_FLAGS="$(CARGO_FEATURES)" \
+	@# tokio-console 观测模式：AGENT_CONSOLE=1 时传 tokio_unstable RUSTFLAGS +
+	@# console feature（见 docs/console.md；普通构建零开销不传）
+	@if [ "$(AGENT_CONSOLE)" = "1" ]; then \
+		CONSOLE_RUSTFLAGS="--cfg tokio_unstable"; CONSOLE_FEATURES="console"; \
+	else \
+		CONSOLE_RUSTFLAGS=""; CONSOLE_FEATURES=""; \
+	fi; \
+	docker build --build-arg CRATES_HASH=$(CRATES_HASH) \
+		--build-arg CARGO_FLAGS="$(CARGO_FEATURES) $$CONSOLE_FEATURES" \
+		--build-arg RUSTFLAGS="$$CONSOLE_RUSTFLAGS" \
 		-f docker/rcoder-agent-runner/Dockerfile.build -t dev-rcoder-agent-runner-build .
 	@echo "📦 步骤2: 复制二进制文件到 agent-runner 目录..."
 	@# 创建容器并复制 agent_runner 二进制文件

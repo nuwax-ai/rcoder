@@ -1,9 +1,13 @@
 mod background_tasks;
 mod batch_migrate;
 mod bootstrap;
+
 mod cleanup_task;
 mod config;
 mod config_watcher;
+/// tokio-console 观测装配（`console` feature 专用）
+#[cfg(feature = "console")]
+mod console_obs;
 mod docker_init;
 mod handler;
 mod middleware;

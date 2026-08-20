@@ -84,6 +84,10 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
         }
     }
 
+    // tokio-console 观测（console feature；shadowing 绑定——无 feature 时零代码）
+    #[cfg(feature = "console")]
+    let telemetry_config = crate::console_obs::attach(telemetry_config);
+
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let telemetry = Arc::new(telemetry);
 

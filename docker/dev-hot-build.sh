@@ -39,19 +39,34 @@ if [ ! -f "$SRC_DIR/Cargo.toml" ]; then
 fi
 
 # 3. 增量编译 rcoder binary（release；cargo target volume 持久化 → 增量）
-echo "🔨 cargo build --release --bin rcoder（增量）..."
 cd "$SRC_DIR"
-cargo build --release --bin rcoder
+# DEV_CONSOLE=1：tokio-console 观测模式（独立 target-console 目录——RUSTFLAGS
+# 变化会使普通缓存指纹失效，隔离避免交替全量重编；宿主机连 localhost:6669）
+if [ "${DEV_CONSOLE:-0}" = "1" ]; then
+    echo "🔨 cargo build --release --bin rcoder --features console（tokio-console；独立 target）..."
+    export RUSTFLAGS="--cfg tokio_unstable"
+    export CARGO_TARGET_DIR="$SRC_DIR/target-console"
+    cargo build --release --bin rcoder --features console
+    BIN_SRC="$CARGO_TARGET_DIR/release/rcoder"
+    # start-rcoder.sh 优先用 /app/src/target/release/rcoder——必须清掉另一模式的
+    # 旧产物，否则新二进制（/app/bin/rcoder）被跳过（8/19 陈旧产物事故同款坑）
+    rm -f "$SRC_DIR/target/release/rcoder"
+else
+    echo "🔨 cargo build --release --bin rcoder（增量）..."
+    cargo build --release --bin rcoder
+    BIN_SRC="$SRC_DIR/target/release/rcoder"
+    rm -f "$SRC_DIR/target-console/release/rcoder"
+fi
 
 # 4. 替换运行 binary
-if [ ! -f "$SRC_DIR/target/release/rcoder" ]; then
-    echo "❌ 编译产物 $SRC_DIR/target/release/rcoder 未生成" >&2
+if [ ! -f "$BIN_SRC" ]; then
+    echo "❌ 编译产物 $BIN_SRC 未生成" >&2
     exit 1
 fi
 # 原子替换：直接 cp 覆盖正在运行的 binary 会 ETXTBSY（Text file busy），
 # 改为 cp 到临时文件 + mv（rename(2) 不受 ETXTBSY 限制；旧进程持旧 inode 继续跑，
 # 新进程用新文件）。docker restart 后拉起新 binary。
-cp "$SRC_DIR/target/release/rcoder" "$BIN_PATH.new"
+cp "$BIN_SRC" "$BIN_PATH.new"
 chmod +x "$BIN_PATH.new"
 mv -f "$BIN_PATH.new" "$BIN_PATH"
 
