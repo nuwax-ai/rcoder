@@ -5,6 +5,7 @@ use utoipa::ToSchema;
 
 /// 销毁 PVC 请求（高危·不可逆；强制 `confirm == app_id` 二次确认）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct DestroyStorageRequest {
     /// 必须等于 path 的 `app_id`（防误调 / 防脚本批量误删 / 防重放）
     pub confirm: String,
@@ -12,6 +13,7 @@ pub struct DestroyStorageRequest {
 
 /// 存储查询请求（**强制分页，无全量模式**——扫存储后端代价高）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct QueryStorageRequest {
     /// 页码（必填，从 1 开始）
     pub page: u32,
@@ -23,6 +25,7 @@ pub struct QueryStorageRequest {
 
 /// 存储过滤条件
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageFilters {
     /// `true` = 只返回"有数据、无对应运行应用"的孤儿存储
     pub orphan_only: Option<bool>,
@@ -36,6 +39,7 @@ pub struct StorageFilters {
 
 /// 存储信息（**不含 `size_bytes`**——CephFS 上不能用 du，见设计文档 §5.4）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageInfo {
     /// 应用 ID
     pub app_id: String,

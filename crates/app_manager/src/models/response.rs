@@ -15,6 +15,7 @@ use super::commons::{AccessInfo, AppStatus, ResourceLimits};
 /// `conditions[]` 给人/前端做细粒度诊断（如区分 CrashLoopBackOff vs ImagePullBackOff）。
 /// `last_transition_time` 在无状态下不持久追踪，通常为 `None`。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct Condition {
     /// 条件类型：Ready / Available / Progressing / Error
     #[serde(rename = "type")]
@@ -35,6 +36,7 @@ pub struct Condition {
 /// 后续读路径（get/start/stop/restart）返回 [`AppRuntimeInfo`]——rcoder 是无状态的应用
 /// pod 引擎，业务元数据（name/image/command/env 等）由调用方（Java）持久化。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct AppInfo {
     /// 应用 ID
     pub app_id: String,
@@ -70,6 +72,7 @@ pub struct AppInfo {
 /// 由 [`crate::service::AppService`] 调用 `ContainerRuntime::get_deployment_status` /
 /// `list_deployments` 实时组装，rcoder 重启后仍可查询（真正无状态）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct AppRuntimeInfo {
     /// 应用 ID
     pub app_id: String,
@@ -119,6 +122,7 @@ pub struct AppRuntimeInfo {
 
 /// 健康信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthInfo {
     /// 健康状态：Running/Starting/Unhealthy 等
     pub status: String,
@@ -130,6 +134,7 @@ pub struct HealthInfo {
 
 /// 实例信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct InstanceInfo {
     /// 实例名称（Pod 名）
     pub name: String,
@@ -149,6 +154,7 @@ pub struct InstanceInfo {
 
 /// Probe 信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ProbeInfo {
     /// Liveness 探针状态
     pub liveness: ProbeStatus,
@@ -158,6 +164,7 @@ pub struct ProbeInfo {
 
 /// Probe 状态
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ProbeStatus {
     /// 探针结果
     pub status: String,
@@ -167,6 +174,7 @@ pub struct ProbeStatus {
 
 /// 资源使用
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ResourceStats {
     /// CPU 使用
     pub cpu: CpuStats,
@@ -180,6 +188,7 @@ pub struct ResourceStats {
 
 /// CPU 使用统计
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CpuStats {
     /// CPU 使用率 (0-100)
     pub usage_percent: f64,
@@ -191,6 +200,7 @@ pub struct CpuStats {
 
 /// 内存使用统计
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryStats {
     /// 内存使用（字节）
     pub usage_bytes: u64,
@@ -202,6 +212,7 @@ pub struct MemoryStats {
 
 /// 网络使用统计
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct NetworkStats {
     /// 网络接收字节数
     pub rx_bytes: u64,
@@ -211,6 +222,7 @@ pub struct NetworkStats {
 
 /// 分页响应
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PaginatedResponse<T> {
     /// 数据条目
     pub items: Vec<T>,
@@ -220,6 +232,7 @@ pub struct PaginatedResponse<T> {
 
 /// 分页信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct Pagination {
     /// 当前页码
     pub page: u32,
@@ -233,6 +246,7 @@ pub struct Pagination {
 
 /// 文件上传结果
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadResult {
     /// 文件路径（单文件=target；压缩包=解压目录，app 根相对）
     pub file_path: String,
@@ -247,6 +261,7 @@ pub struct UploadResult {
 
 /// 文件信息
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct FileInfo {
     /// 文件路径（app 根相对）
     pub path: String,

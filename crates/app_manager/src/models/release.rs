@@ -47,16 +47,23 @@ pub struct RollbackReleaseRequest {
 
 /// 发布状态机
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-#[serde(rename_all = "PascalCase")]
+/// 序列化值小写（与 userapp_publish 任务状态口径一致：active/failed/completed…）；
+/// variant `alias` 兼容读存量 index.json 的 PascalCase 旧值（开发阶段数据，升级不
+/// 要求清理），写出一律小写。
+#[serde(rename_all = "lowercase")]
 pub enum ReleaseStatus {
     /// 已下载校验入库，未激活
+    #[serde(alias = "Prepared")]
     Prepared,
     /// 兼容读旧 index 的遗留值（confirm 两段式时代的"待确认"态）；读时归一化为 Failed，
     /// 新代码不再产生。
+    #[serde(alias = "PendingStart")]
     PendingStart,
     /// 当前生效版本
+    #[serde(alias = "Active")]
     Active,
     /// 激活失败（现场保留：code=失败版、.rollback=上一版、制品包保留）
+    #[serde(alias = "Failed")]
     Failed,
 }
 
