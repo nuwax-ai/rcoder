@@ -8,12 +8,9 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 
 use crate::{
-    AgentStatusResponse, ChatResponse, HttpResult, I18nJsonOrQuery, RcoderChatRequest,
-    agent_http_service::AgentHttpService,
-    rcoder_agent_types::{
-        RcoderAgentCancelRequest, RcoderAgentCancelResponse, RcoderAgentStopRequest,
-        RcoderAgentStopResponse,
-    },
+    AgentHttpService, AgentStatusResponse, ChatResponse, HttpResult, I18nJsonOrQuery,
+    RcoderAgentCancelRequest, RcoderAgentCancelResponse, RcoderAgentStopRequest,
+    RcoderAgentStopResponse, RcoderChatRequest,
 };
 
 /// 通用 Chat handler（适用于 POST /chat）

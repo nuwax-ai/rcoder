@@ -3,8 +3,7 @@
 //! 简化版本，只包含运行时配置，不包含提示词配置。
 //! 提示词由独立的 system_prompt 和 user_prompt 入参控制。
 
-use crate::agent_mgmt_types::PlatformEntry;
-use crate::service_config::ServiceResourceLimits;
+use crate::{PlatformEntry, ServiceResourceLimits};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;

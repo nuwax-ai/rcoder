@@ -1,5 +1,8 @@
+mod agent;
 mod container;
 mod model;
+mod runtime_config;
+mod userapp;
 
 // 容器域类型（高内聚收拢于 container/ 模块）—— 条目/查找/清理/统计 + 服务与隔离枚举
 pub use container::{
@@ -8,23 +11,16 @@ pub use container::{
     ServiceTypeError, StorageStats, get_enabled_service_types, get_supported_service_types,
 };
 
-// UserApp build 进度事件 —— file-server(发送)与 rcoder(接收)共享的类型化 DTO
-pub mod build_event;
-pub use build_event::BuildProgressEvent;
-
 // project/session/container 映射存储契约（内存与 PG 双后端统一接口）
 pub mod project_store;
 pub use project_store::ProjectStore;
 
-// UserApp 活动追踪 + 流量唤醒接口模块（闲置自动回收 / wake-on-traffic）
-pub mod app_activity;
-pub use app_activity::{
+// UserApp 域（高内聚收拢于 userapp/ 模块）—— 活动追踪/唤醒 + 业务元数据 + build 进度事件
+pub use userapp::activity::{
     ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, WakeOutcome,
 };
-
-// UserApp 应用业务元数据（集群不持有的字段;query name/created_at 过滤数据源）
-pub mod app_metadata;
-pub use app_metadata::{AppMetadataPersistence, AppMetadataRecord};
+pub use userapp::build_event::BuildProgressEvent;
+pub use userapp::metadata::{AppMetadataPersistence, AppMetadataRecord};
 
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）
 pub mod flexible_string;
@@ -43,24 +39,12 @@ pub use request_locale::{current_request_locale, scope_request_locale};
 pub mod i18n_extractors;
 pub use i18n_extractors::I18nJsonOrQuery;
 
-// Chat Agent 配置模块
-mod chat_agent_config;
-pub use chat_agent_config::{
-    AgentMode, AutoReloadConfig, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig,
-    ModelEnvBinding, ModelEnvBindingSource, ToolApprovalAction, ToolApprovalRule, VALID_TOOL_KINDS,
-};
-
 // API Key 验证器模块
 pub mod api_key_validator;
 pub use api_key_validator::{ApiKeyAuthConfig, ApiKeyAuthError, ApiKeyValidator};
 
-// 新增多镜像配置相关模块
-pub mod multi_image_config;
 pub mod permission_types;
 pub mod pg_utils;
-pub mod service_config;
-// K8s 运行时专用配置(与 docker_config 分家)
-pub mod k8s_config;
 pub use permission_types::{
     PermissionResolveRequest, ResolvePermissionHttpRequest, ResolvePermissionRequestDto,
     ResolvePermissionResponseDto,
@@ -99,9 +83,6 @@ pub use shared_types_i18n::{
 // Validation 模块
 pub mod validation;
 pub use validation::{garde_err_to_app_error, validate_identifier};
-
-pub mod quantity;
-pub use quantity::{parse_cpu_quantity, parse_memory_quantity, validate_k8s_storage_size};
 
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
 pub use shared_types_grpc::grpc;
@@ -163,17 +144,20 @@ pub use model::{
     VncStatusResponse,
 };
 
-// 导出多镜像配置相关类型
-pub use k8s_config::{
+// 部署配置域（高内聚收拢于 runtime_config/ 模块）—— Docker/K8s 双运行时配置族 + Quantity 解析
+pub use runtime_config::k8s::{
     K8sGlobalDefaults, K8sServiceConfig, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec,
     K8sVolumeType, KubernetesConfig,
 };
-pub use multi_image_config::{
+pub use runtime_config::multi_image::{
     GlobalImageDefaults, IMAGE_CACHE_DEFAULT_MAX_ENTRIES, IMAGE_CACHE_DEFAULT_TTL_SECS,
     ImageCacheConfig, ImageSelectionStrategy, MultiImageConfig, ProjectImageOverrides,
     create_default_multi_image_config, create_legacy_multi_image_config,
 };
-pub use service_config::{
+pub use runtime_config::quantity::{
+    parse_cpu_quantity, parse_memory_quantity, validate_k8s_storage_size,
+};
+pub use runtime_config::service::{
     ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits, ServiceSecurityConfig,
     default_agent_runner_service_config, default_rcoder_service_config,
 };
@@ -181,28 +165,20 @@ pub use service_config::{
 // 导出ChatPrompt的Builder
 pub use model::chat_prompt::ChatPromptBuilder;
 
-// Agent HTTP API 类型（rcoder 和 agent_runner 共用）
-pub mod agent_types;
-pub use agent_types::*;
-
-// Computer Agent HTTP API 类型
-pub mod computer_agent_types;
-pub use computer_agent_types::*;
-
-// RCoder Agent HTTP Service trait
-pub mod agent_http_service;
-pub use agent_http_service::AgentHttpService;
-
-// RCoder Agent HTTP API 类型
-pub mod rcoder_agent_types;
-pub use rcoder_agent_types::*;
-
-// 通用 HTTP Handlers（基于 trait）
-pub mod agent_mgmt_types;
-pub mod http_handlers;
+// Agent HTTP 契约域（高内聚收拢于 agent/ 模块）—— API 类型/服务 trait/通用 handler/安装管理/Chat 配置
+pub use agent::chat_config::{
+    AgentMode, AutoReloadConfig, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig,
+    ModelEnvBinding, ModelEnvBindingSource, ToolApprovalAction, ToolApprovalRule, VALID_TOOL_KINDS,
+};
+pub use agent::computer_types::*;
+// 模块 re-export：保住 agent_runner 的 `use shared_types::http_handlers;` 路径
+pub use agent::http_handlers;
+pub use agent::http_service::AgentHttpService;
+pub use agent::rcoder_types::*;
+pub use agent::types::*;
 
 // UserApp workspace manifest 类型（极轻量独立 crate，file-server build + app-cli runtime 共用）
-pub use agent_mgmt_types::{
+pub use agent::mgmt_types::{
     AGENT_CACHE_DIR, AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus,
     CheckAgentRequest, CheckAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR, GetAgentRequest,
     InstallAction, InstallAgentResponse, InstallBinaryRequest, InstallFromPackageManagerRequest,

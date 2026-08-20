@@ -3,8 +3,8 @@
 //! 定义了支持多种服务类型的 Docker 镜像配置系统，包括全局默认配置、
 //! 服务特定配置、选择策略和缓存机制。
 
-use crate::ServiceType;
-use crate::service_config::ServiceImageConfig;
+use super::service::ConfigValidationResult;
+use crate::{ServiceImageConfig, ServiceType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -123,7 +123,7 @@ pub enum ConfigError {
     #[error("service type '{0}' is disabled")]
     ServiceDisabled(String),
     #[error("image config error: {0}")]
-    ImageConfigError(String),
+    ImageError(String),
 }
 
 impl MultiImageConfig {
@@ -170,13 +170,13 @@ impl MultiImageConfig {
 
             // 验证服务配置
             match service_config.validate() {
-                crate::service_config::ConfigValidationResult::Valid => {
+                ConfigValidationResult::Valid => {
                     // 配置有效
                 }
-                crate::service_config::ConfigValidationResult::Warning(warning) => {
+                ConfigValidationResult::Warning(warning) => {
                     tracing::warn!("Warning in '{}' config: {}", service_key, warning);
                 }
-                crate::service_config::ConfigValidationResult::Error(error) => {
+                ConfigValidationResult::Error(error) => {
                     return Err(ConfigError::ValidationError(format!(
                         "Service '{}' config error: {}",
                         service_key, error
@@ -331,13 +331,13 @@ impl Default for MultiImageConfig {
         // 添加默认的 RCoder 服务配置
         services.insert(
             ServiceType::WebAgentRunner.to_string(),
-            crate::service_config::default_rcoder_service_config(),
+            crate::default_rcoder_service_config(),
         );
 
         // 添加默认的 ComputerAgentRunner 服务配置
         services.insert(
             ServiceType::ComputerAgentRunner.to_string(),
-            crate::service_config::default_agent_runner_service_config(),
+            crate::default_agent_runner_service_config(),
         );
 
         MultiImageConfig {
@@ -485,14 +485,14 @@ pub fn create_legacy_multi_image_config(
         || global_defaults.amd64_image.is_some()
         || global_defaults.default_image.is_some()
     {
-        let mut config = crate::service_config::default_rcoder_service_config();
+        let mut config = crate::default_rcoder_service_config();
         config.image = global_defaults.image.clone();
         config.arm64_image = global_defaults.arm64_image.clone();
         config.amd64_image = global_defaults.amd64_image.clone();
         config.default_image = global_defaults.default_image.clone();
         config
     } else {
-        crate::service_config::default_rcoder_service_config()
+        crate::default_rcoder_service_config()
     };
 
     let mut services = HashMap::new();
@@ -509,7 +509,7 @@ pub fn create_legacy_multi_image_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service_config::default_rcoder_service_config;
+    use crate::default_rcoder_service_config;
 
     #[test]
     fn test_default_multi_image_config() {

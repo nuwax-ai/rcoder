@@ -322,10 +322,10 @@ mod tests {
     // ---- 原 service_type 测试 ----
 
     fn create_test_config() -> MultiImageConfig {
-        use crate::multi_image_config::{
-            GlobalImageDefaults, ImageCacheConfig, ImageSelectionStrategy,
+        use crate::{
+            GlobalImageDefaults, ImageCacheConfig, ImageSelectionStrategy, ServiceImageConfig,
+            ServiceResourceLimits,
         };
-        use crate::service_config::{ServiceImageConfig, ServiceResourceLimits};
 
         let mut services = HashMap::new();
 
