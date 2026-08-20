@@ -102,20 +102,19 @@ Last-Event-ID header 优先于 query 参数。
 ```
 event: <事件类型>
 id: <seq>
-data: {"task_id":"...","kind":"build","status":"running",...}
+data: {"event":"<事件类型>", <事件字段...>}   // data 为事件对象全量（内嵌 event 标签）
 
 ```
 
-**事件类型清单**：
+**事件类型清单**（rcoder 任务 SSE 实际事件；字段 snake_case）：
 | event | 说明 | data 关键字段 |
 |---|---|---|
-| `task_created` | 任务创建 | taskId, kind |
-| `stage` | 阶段变更 | stage: rcoder 侧 `EnsureBuilder`/`Build`/`Prepare`/`Activate`；agent-runner 侧 `downloading`/`compiling`/`packaging` |
-| `build_progress` | 构建进度 chunk | data: {content: "..."} |
-| `task_completed` | 终态（成功） | releaseId |
-| `task_failed` | 终态（失败） | error |
-| `task_cancelled` | 终态（取消） | — |
-| `stream_lagged` | 消费者太慢被断开 | — （客户端应用 from_seq 重连） |
+| `stage` | 阶段变更 | `stage`：rcoder 侧 `EnsureBuilder`/`Build`/`Prepare`/`Activate` |
+| `build_progress` | agent-runner 构建进度原样透传 | `data`：agent-runner 事件对象（**内部字段保持 camelCase**，如 `releaseId`/`sizeBytes`/`buildOk`——与 agent-runner 链路一致；终态判定用外层事件，无需解析内层） |
+| `cancelling` | 取消已请求（非终态，通知前端"取消中"） | — |
+| `completed` | 终态（成功） | `release_id` |
+| `failed` | 终态（失败） | `error` |
+| `cancelled` | 终态（取消） | — |
 
 > **Builder 自动创建**：`build`/`publish` 触发时若 UserAppBuilder 容器不存在（含 rcoder 重启后注册丢失），任务会先经 `stage=EnsureBuilder` 自动创建并注册（K8s 拉镜像可能数十秒），再进入 `stage=Build`。创建失败以任务 `failed` 终态呈现。
 

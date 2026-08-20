@@ -84,7 +84,7 @@ pub enum PublishTaskStatus {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum PublishEvent {
-    /// 进入新发布阶段(publish: EnsureApp/Prepare/Activate/WaitReady/Confirm)。
+    /// 进入新发布阶段(publish: EnsureBuilder/Build/Prepare/Activate；build: EnsureBuilder/Build)。
     Stage { stage: String },
     /// 透传 agent-runner build 进度(Building/BuildOk/BuildFail,data=类型化事件)。
     BuildProgress { data: BuildProgressEvent },
@@ -128,4 +128,78 @@ pub struct PublishTaskSnapshot {
 pub struct PublishTaskListPage {
     pub items: Vec<PublishTaskSnapshot>,
     pub total: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 对外契约锁定（Java 消费）：SSE 事件名 snake_case、字段 snake_case。
+    /// caef1f5 由 camelCase 反转——序列化形态无测试锁定会静默漂移。
+    #[test]
+    fn publish_event_serializes_snake_case() {
+        let ev = serde_json::to_value(PublishEvent::Stage {
+            stage: "Build".into(),
+        })
+        .expect("stage event");
+        assert_eq!(ev["event"], "stage");
+        assert_eq!(ev["stage"], "Build");
+
+        let ev = serde_json::to_value(PublishEvent::BuildProgress {
+            data: BuildProgressEvent::Log {
+                service: "backend".into(),
+                line: "chunk".into(),
+            },
+        })
+        .expect("build progress event");
+        assert_eq!(ev["event"], "build_progress");
+        assert!(ev["data"].is_object(), "progress payload under data");
+
+        let ev = serde_json::to_value(PublishEvent::Cancelling).expect("cancelling");
+        assert_eq!(ev["event"], "cancelling");
+
+        let ev = serde_json::to_value(PublishEvent::Completed {
+            release_id: "rel-1".into(),
+        })
+        .expect("completed");
+        assert_eq!(ev["event"], "completed");
+        assert_eq!(ev["release_id"], "rel-1");
+
+        let ev = serde_json::to_value(PublishEvent::Failed {
+            error: "boom".into(),
+        })
+        .expect("failed");
+        assert_eq!(ev["event"], "failed");
+        assert_eq!(ev["error"], "boom");
+
+        assert_eq!(
+            serde_json::to_value(PublishEvent::Cancelled).expect("cancelled")["event"],
+            "cancelled"
+        );
+    }
+
+    /// 任务快照字段 snake_case（taskId→task_id 反转后的对外形态）。
+    #[test]
+    fn task_snapshot_serializes_snake_case() {
+        let snap = PublishTaskSnapshot {
+            id: PublishTaskId::new(),
+            app_id: "app-x".into(),
+            project_id: "app-x".into(),
+            kind: PublishTaskKind::Publish,
+            status: PublishTaskStatus::Failed,
+            stage: None,
+            release_id: None,
+            error: Some("boom".into()),
+            seq: 0,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let v = serde_json::to_value(&snap).expect("snapshot");
+        assert!(v.get("app_id").is_some(), "snake keys: {v}");
+        assert!(v.get("appId").is_none(), "camel residue: {v}");
+        assert!(v.get("project_id").is_some());
+        assert!(v.get("release_id").is_none_or(|_| true));
+        assert_eq!(v["status"], "failed", "status value lowercase");
+        assert_eq!(v["kind"], "publish", "kind value lowercase");
+    }
 }
