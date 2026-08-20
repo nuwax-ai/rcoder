@@ -36,7 +36,7 @@ pub(crate) fn init_tracing_subscriber(
     use opentelemetry::trace::TracerProvider;
 
     // 创建 EnvFilter（支持 RUST_LOG 环境变量）
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+    let mut env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // 默认日志级别
         format!(
             "{}=debug,tower_http=debug,axum=info,hyper=info,tonic=info",
@@ -44,6 +44,17 @@ pub(crate) fn init_tracing_subscriber(
         )
         .into()
     });
+    // tokio-console 观测开启时必须放行 tokio/runtime target 的 trace 级事件
+    // （任务/waker 事件为 trace 级；EnvFilter 的全局压制会挡住 per-layer
+    // 过滤的 console 层——实测矩阵：无放行 = 零任务）。与 RUST_LOG 叠加，
+    // 不影响 fmt/文件层的输出（这两个 target 无业务日志输出）。
+    if tokio_console_layer.is_some() {
+        for directive in ["tokio=trace", "runtime=trace"] {
+            if let Ok(d) = directive.parse() {
+                env_filter = env_filter.add_directive(d);
+            }
+        }
+    }
 
     // 创建控制台日志层（deny file_server → file-server 日志不进 rcoder console）
     let console_layer = fmt::layer()
