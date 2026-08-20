@@ -52,6 +52,19 @@ pub struct PrometheusConfig {
     pub enabled: bool,
 }
 
+/// tracing 火焰图配置（`flame` feature 用）。
+///
+/// 每当 span enter/exit 时写入折叠栈数据到指定文件——事后用
+/// `inferno-flamegraph < output.folded > flame.svg` 渲染火焰图。
+/// 高并发下有非零开销，建议仅排查性能问题时临时开启。
+#[derive(Debug, Clone)]
+pub struct FlameConfig {
+    /// 输出文件路径（如 "logs/tracing.folded"）
+    pub output_path: PathBuf,
+    /// 是否合并不同线程的 span（true=单线程视图更简洁）
+    pub collapse_threads: bool,
+}
+
 /// 文件日志配置
 #[derive(Debug, Clone)]
 pub struct FileLogConfig {
@@ -329,17 +342,4 @@ mod tests {
         assert_eq!(file_log.filename_prefix, "my-service");
         assert_eq!(file_log.directory, PathBuf::from("logs"));
     }
-}
-
-/// tracing 火焰图配置（`flame` feature 用）。
-///
-/// 每当 span enter/exit 时写入折叠栈数据到指定文件——事后用
-/// `inferno-flamegraph < output.folded > flame.svg` 渲染火焰图。
-/// 高并发下有非零开销，建议仅排查性能问题时临时开启。
-#[derive(Debug, Clone)]
-pub struct FlameConfig {
-    /// 输出文件路径（如 "logs/tracing.folded"）
-    pub output_path: PathBuf,
-    /// 是否合并不同线程的 span（true=单线程视图更简洁）
-    pub collapse_threads: bool,
 }

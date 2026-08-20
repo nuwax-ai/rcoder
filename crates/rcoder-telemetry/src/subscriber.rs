@@ -8,8 +8,8 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::info;
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{
-    EnvFilter, Layer, filter::filter_fn, fmt, fmt::format::Format, layer::SubscriberExt,
-    registry::Registry, util::SubscriberInitExt,
+    EnvFilter, Layer, filter::filter_fn, fmt, layer::SubscriberExt, registry::Registry,
+    util::SubscriberInitExt,
 };
 
 use crate::config::FileLogConfig;
@@ -17,17 +17,92 @@ use crate::config::FileLogConfig;
 /// 类型擦除的 tracing layer（用于跨 crate 注入额外日志层）。
 pub type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
 
-/// JSON 日志格式化包装器：在标准 JSON 输出末尾追加 OTel trace_id/span_id。
+// ============================================================
+// trace_id 类型化存储 + 自动提取（Layer + extensions 模式）
+// ============================================================
+
+/// trace_id 的 span extension 存储类型。
 ///
-/// OTLP layer 安装且当前 span 有 valid trace context 时（e2e 注入
-/// traceparent 或 OTLP exporter 创建的 span），自动追加两个字段：
-/// `"trace_id":"...","span_id":"..."`；无 OTel context 时不追加——
-/// 日志行为与裸 `Format<Json>` 完全一致（零破坏）。
-struct TraceIdFormat {
-    inner: Format<fmt::format::Json, fmt::time::SystemTime>,
+/// 由 [`TraceIdExtractor`] 在 `span.record("trace_id", ...)` 时自动截获并存入
+/// span extensions——后续 [`TraceIdJsonFormat`] 通过 `extensions().get::<TraceIdExt>()`
+/// 类型化读取（O(1) 查找），不做字符串解析。
+#[derive(Debug, Clone)]
+pub(crate) struct TraceIdExt(pub String);
+
+/// 拦截 `span.record("trace_id", ...)` 并存入 extensions 的 Layer。
+///
+/// `make_span_with_trace_parent` 调用 `span.record("trace_id", display(tid))` 时，
+/// tracing 会分发到所有 Layer 的 `on_record`——本 Layer 用 `Visit` 截获该字段值
+/// 并 `extensions_mut().insert(TraceIdExt(tid))`。与 tracing-opentelemetry 的
+/// `OtelDataLock` extensions 模式同构（结构化数据走 extensions，不走 fmt 字符串）。
+pub(crate) struct TraceIdExtractor;
+
+impl<S> Layer<S> for TraceIdExtractor
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = TraceIdVisitor::default();
+        values.record(&mut visitor);
+        if let Some(tid) = visitor.0
+            && let Some(span) = ctx.span(id)
+        {
+            span.extensions_mut().insert(TraceIdExt(tid));
+        }
+    }
 }
 
-impl<S, N> fmt::format::FormatEvent<S, N> for TraceIdFormat
+/// `Visit` 实现：识别 `trace_id` 字段（32 位 hex）。
+#[derive(Default)]
+struct TraceIdVisitor(Option<String>);
+
+impl tracing::field::Visit for TraceIdVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if Self::is_trace_id(field, value) {
+            self.0 = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        // `tracing::field::display(tid)` 走 record_debug（Display 的 Debug 包装）
+        if field.name() == "trace_id" {
+            let s = format!("{value:?}");
+            let s = s.trim_matches('"');
+            if Self::is_valid_hex(s) {
+                self.0 = Some(s.to_owned());
+            }
+        }
+    }
+}
+
+impl TraceIdVisitor {
+    fn is_trace_id(field: &tracing::field::Field, value: &str) -> bool {
+        field.name() == "trace_id" && Self::is_valid_hex(value)
+    }
+
+    /// W3C TraceId 格式：32 字符 hex
+    fn is_valid_hex(s: &str) -> bool {
+        s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
+    }
+}
+
+// ============================================================
+// 自定义 JSON 格式化：与标准 Format<Json> 同款内部实现 + 顶层 trace_id
+// ============================================================
+
+/// JSON 文件日志格式化器。
+///
+/// 内部实现与 `tracing_subscriber::fmt::format::Format<Json>` 完全同款
+/// （`serde_json::Serializer` + `serialize_map`），额外在 JSON root 注入
+/// `trace_id` 字段——这是 `FormatEvent` trait 的设计用途（官方扩展点）。
+pub(crate) struct TraceIdJsonFormat;
+
+impl<S, N> fmt::format::FormatEvent<S, N> for TraceIdJsonFormat
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
     N: for<'a> fmt::format::FormatFields<'a> + 'static,
@@ -38,80 +113,78 @@ where
         mut writer: fmt::format::Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> std::fmt::Result {
-        // 缓冲标准 JSON 输出（内部会写完整 JSON + 换行）
-        let mut buf = String::new();
-        {
-            let mut inner_writer = fmt::format::Writer::new(&mut buf);
-            <Format<fmt::format::Json, fmt::time::SystemTime> as fmt::format::FormatEvent<S, N>>::format_event(
-                &self.inner,
-                ctx,
-                inner_writer.by_ref(),
-                event,
-            )?;
+        use serde_json::{Map, Value, json};
+
+        let meta = event.metadata();
+        let mut obj = Map::new();
+
+        // === 与标准 Format<Json> 逐字段对齐 ===
+        let timestamp = chrono::Local::now().to_rfc3339();
+        obj.insert("timestamp".to_string(), json!(timestamp));
+
+        obj.insert("level".to_string(), json!(meta.level().as_str()));
+
+        // event 字段：用 Visit 收集到 JSON map（同标准 "fields" 对象）
+        let mut fields = Map::new();
+        event.record(&mut JsonFieldVisitor(&mut fields));
+        obj.insert("fields".to_string(), Value::Object(fields));
+
+        if let Some(filename) = meta.file() {
+            obj.insert("filename".to_string(), json!(filename));
         }
-        // 去掉尾部换行，在 `}` 前插入 trace_id
-        let json = buf.trim_end();
-        match (trace_id_from_span_chain(ctx), json.rfind('}')) {
-            (Some(tid), Some(pos)) => {
-                write!(
-                    writer,
-                    "{},\"trace_id\":\"{}\"{}",
-                    &json[..pos],
-                    tid,
-                    &json[pos..]
-                )?;
-            }
-            _ => write!(writer, "{}", json)?,
+        if let Some(line) = meta.line() {
+            obj.insert("line_number".to_string(), json!(line));
         }
-        writeln!(writer)
+        obj.insert("target".to_string(), json!(meta.target()));
+        obj.insert(
+            "threadId".to_string(),
+            json!(format!("{:?}", std::thread::current().id())),
+        );
+        obj.insert(
+            "threadName".to_string(),
+            json!(std::thread::current().name().unwrap_or("unnamed")),
+        );
+
+        // === span 上下文（当前 span 名）===
+        if let Some(span) = ctx.lookup_current() {
+            obj.insert("span".to_string(), json!(span.metadata().name()));
+        }
+
+        // === ★ trace_id 在 JSON ROOT（从 extensions 类型化读取）===
+        if let Some(tid) = Self::extract_trace_id(ctx) {
+            obj.insert("trace_id".to_string(), json!(tid));
+        }
+
+        // 序列化输出（单行 JSON）
+        let output = serde_json::to_string(&obj).map_err(|_| std::fmt::Error)?;
+        writeln!(writer, "{output}")
     }
 }
 
-/// 从当前 span 链向上查找 `trace_id` 字段（跳过无该字段的中间层）。
-///
-/// trace_id 由 `make_span_with_trace_parent` 作为 tracing span field 写入
-/// `http_request` span（不依赖 OTel layer——OTLP 关闭时也可见）。
-/// 事件可能在子 span（如 handler instrument span）中，需沿父链向上查找。
-fn trace_id_from_span_chain<S, N>(ctx: &fmt::FmtContext<'_, S, N>) -> Option<String>
-where
-    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    N: for<'a> fmt::format::FormatFields<'a> + 'static,
-{
-    use tracing_subscriber::fmt::FormattedFields;
-    // 显式使用 JsonFields（与 .json() 层的 fmt_fields 类型一致）——泛型 N
-    // 在运行时可能不匹配 FormattedFields 的实际类型参数
-    type JsonFmt = fmt::format::JsonFields;
-
-    let mut span = ctx.lookup_current()?;
-    loop {
-        if let Some(ff) = span.extensions().get::<FormattedFields<JsonFmt>>() {
-            let tid = serde_json::from_str::<serde_json::Value>(&ff.fields)
-                .ok()
-                .and_then(|v| v.get("trace_id")?.as_str().map(str::to_owned));
-            if tid.is_some() {
-                return tid;
+impl TraceIdJsonFormat {
+    /// 从当前 span 链的 extensions 提取 trace_id（泛型 N 版本）。
+    fn extract_trace_id<S, N>(ctx: &fmt::FmtContext<'_, S, N>) -> Option<String>
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        N: for<'a> fmt::format::FormatFields<'a> + 'static,
+    {
+        let mut span = ctx.lookup_current()?;
+        loop {
+            if let Some(ext) = span.extensions().get::<TraceIdExt>() {
+                return Some(ext.0.clone());
             }
+            span = span.parent()?;
         }
-        span = span.parent()?;
     }
 }
 
-/// 初始化 tracing subscriber
-///
-/// 配置以下层：
-/// - EnvFilter: 基于 RUST_LOG 环境变量的日志级别过滤
-/// - Console Layer: 控制台日志输出（deny `file_server` target，独立写入 file-server.log）
-/// - File Layer: 可选的文件日志输出（JSON 格式，按天滚动，deny `file_server` target）
-/// - OpenTelemetry Layer: 如果提供了 TracerProvider，将 span 发送到 OTLP
-/// - Extra Layer: 可选的外部注入 layer（如 file-server 独立日志，per-layer filter 独立过滤）
-/// - TokioConsole Layer: 可选的 tokio-console 观测 layer（本地开发 feature 注入）
-///
-/// 返回 flame feature 的 FlushGuard（feature off 时为 None）。
+/// flame feature 的 FlushGuard 类型别名（feature off 时退化为 unit）。
 #[cfg(feature = "flame")]
 pub(crate) type FlameGuard = tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>;
 #[cfg(not(feature = "flame"))]
 pub(crate) type FlameGuard = ();
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn init_tracing_subscriber(
     service_name: &str,
     tracer_provider: Option<&SdkTracerProvider>,
@@ -124,18 +197,14 @@ pub(crate) fn init_tracing_subscriber(
 
     // 创建 EnvFilter（支持 RUST_LOG 环境变量）
     let mut env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // 默认日志级别
         format!(
             "{}=debug,tower_http=debug,axum=info,hyper=info,tonic=info",
             service_name.replace('-', "_")
         )
         .into()
     });
-    // tokio-console 观测开启时必须放行 tokio/runtime target 的 trace 级事件
-    // （任务/waker 事件为 trace 级；EnvFilter 的全局压制会挡住 per-layer
-    // 过滤的 console 层——实测矩阵：无放行 = 零任务）。
-    // 注意：放行会让 fmt/文件层也收到这些事件（海量）——deny 过滤在下方
-    // console_layer/file_layer 的 filter_fn 中处理。
+    // tokio-console 观测开启时必须放行 tokio/runtime target 的 trace 级事件。
+    // 放行会让 fmt/文件层也收到（海量）——deny 过滤在 console/file layer 处理。
     if tokio_console_layer.is_some() {
         for directive in ["tokio=trace", "runtime=trace"] {
             if let Ok(d) = directive.parse() {
@@ -143,8 +212,6 @@ pub(crate) fn init_tracing_subscriber(
             }
         }
     }
-    // console 开启时 fmt/文件层需要额外 deny tokio/runtime target（海量 TRACE
-    // 任务事件会淹没正常日志——实测 3.4GB/分钟）
     let deny_tokio = tokio_console_layer.is_some();
     let make_deny_filter = |deny_tokio: bool| {
         move |meta: &tracing::Metadata<'_>| {
@@ -156,7 +223,7 @@ pub(crate) fn init_tracing_subscriber(
         }
     };
 
-    // 创建控制台日志层（deny file_server + console 开启时额外 deny tokio/runtime）
+    // 控制台日志层（deny file_server + console 开启时额外 deny tokio/runtime）
     let console_layer = fmt::layer()
         .with_target(true)
         .with_ansi(true)
@@ -165,43 +232,30 @@ pub(crate) fn init_tracing_subscriber(
         .with_line_number(false)
         .with_filter(filter_fn(make_deny_filter(deny_tokio)));
 
-    // 创建文件日志层（deny file_server → file-server 日志不进 rcoder.log）
+    // 文件日志层
     let file_layer = if let Some(file_config) = file_log_config {
-        // 创建日志目录
         if !file_config.directory.exists() {
             std::fs::create_dir_all(&file_config.directory)?;
         }
-
-        // 创建按天滚动的 appender
         let file_appender = tracing_appender::rolling::Builder::new()
             .rotation(Rotation::DAILY)
             .filename_prefix(&file_config.filename_prefix)
             .max_log_files(file_config.max_log_files)
             .build(&file_config.directory)?;
-
         let deny_fs = filter_fn(make_deny_filter(deny_tokio));
 
         if file_config.json_format {
-            // JSON 格式文件日志 + trace_id/span_id 自动注入
-            // （OTel context 存在时追加——e2e traceparent 或 OTLP 均适用）
-            let json_event_format = fmt::format()
-                .json()
-                .with_target(true)
-                .with_thread_ids(true)
-                .with_thread_names(true);
+            // JSON 格式：自定义 formatter + 顶层 trace_id
             Some(
                 fmt::layer()
-                    .json() // JsonFields 格式化（span/fields 的 JSON 键值）
-                    .event_format(TraceIdFormat {
-                        inner: json_event_format,
-                    })
+                    .json()
+                    .event_format(TraceIdJsonFormat)
                     .with_writer(file_appender)
                     .with_ansi(false)
                     .with_filter(deny_fs)
                     .boxed(),
             )
         } else {
-            // 纯文本格式文件日志
             Some(
                 fmt::layer()
                     .with_writer(file_appender)
@@ -215,27 +269,25 @@ pub(crate) fn init_tracing_subscriber(
         None
     };
 
-    // OTLP layer：有 exporter 用真实 provider；无 exporter 用 no-op
-    // （no-op 仍安装 OpenTelemetryLayer——提供 span context 存储基础设施：
-    // set_parent / span.context() / 日志 trace_id 注入依赖它；仅不 export）
+    // OTLP layer：有 exporter 用真实 provider；无 exporter 用全局 no-op
+    // （no-op 仍安装 OpenTelemetryLayer——提供 span context 存储基础设施）
     let otel_layer = {
+        static NOOP_PROVIDER: std::sync::OnceLock<SdkTracerProvider> = std::sync::OnceLock::new();
         let tracer = match tracer_provider {
             Some(provider) => provider.tracer(service_name.to_string()),
             None => {
-                let noop = SdkTracerProvider::builder().build();
-                noop.tracer(service_name.to_string())
+                let provider = NOOP_PROVIDER.get_or_init(|| SdkTracerProvider::builder().build());
+                provider.tracer(service_name.to_string())
             }
         };
         Some(tracing_opentelemetry::layer().with_tracer(tracer))
     };
 
-    // tracing-flame 火焰图 layer（flame feature；具体类型直接挂——不做
-    // BoxedLayer 装箱，因为 boxed layer 只能挂 Registry 顶层单层）
+    // tracing-flame 火焰图 layer（flame feature）
     #[cfg(feature = "flame")]
     let (flame_layer, flame_guard) = match flame_config {
         Some(fc) => {
             use tracing_flame::FlameLayer;
-            // 父目录确保存在
             if let Some(dir) = fc.output_path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
@@ -248,17 +300,18 @@ pub(crate) fn init_tracing_subscriber(
         None => (None, None),
     };
     #[cfg(not(feature = "flame"))]
-    let _ = flame_config; // 未启用 feature 时忽略
+    let _ = flame_config;
 
-    // 构建完整 subscriber 链：
-    // boxed layer 只能直接挂 Registry 顶层——extra_layer 与 tokio_console_layer
-    // 经 stack_boxed_layers 叠加为单层注入；flame 是具体类型（非 boxed）可直接
-    // 挂在 file_layer 之后（Layer<S> 泛型于 S，不受 Registry-only 限制）
+    // 组装 subscriber 链
     let has_tokio_console = tokio_console_layer.is_some();
-    // flame layer 直接挂 registry 链（具体类型，不受 boxed-only-on-Registry 限制）
+    // TraceIdExtractor 是具体类型（非 BoxedLayer），直接挂 Registry——但必须在
+    // stack_boxed_layers 之前（stack 期望 Registry 顶层），类型上 Layer<Registry> 满足
+    // TraceIdExtractor 是泛型 Layer<S>（可挂任意层之后）；stack_boxed_layers
+    // 的 BoxedLayer 只支持 Registry——必须最先挂
     #[cfg(feature = "flame")]
     let registry = tracing_subscriber::registry()
         .with(stack_boxed_layers(extra_layer, tokio_console_layer))
+        .with(TraceIdExtractor)
         .with(env_filter)
         .with(console_layer)
         .with(file_layer)
@@ -267,6 +320,7 @@ pub(crate) fn init_tracing_subscriber(
     #[cfg(not(feature = "flame"))]
     let registry = tracing_subscriber::registry()
         .with(stack_boxed_layers(extra_layer, tokio_console_layer))
+        .with(TraceIdExtractor)
         .with(env_filter)
         .with(console_layer)
         .with(file_layer)
@@ -294,11 +348,57 @@ pub(crate) fn init_tracing_subscriber(
 }
 
 /// 两个 boxed layer（Option 包装，None 为 no-op）叠加为单层。
-/// UFCS 显式走 tracing_subscriber::Layer::and_then——避开 Option::and_then
-/// 的方法解析歧义。
 fn stack_boxed_layers(
     a: Option<BoxedLayer>,
     b: Option<BoxedLayer>,
 ) -> tracing_subscriber::layer::Layered<Option<BoxedLayer>, Option<BoxedLayer>, Registry> {
     <Option<BoxedLayer> as Layer<Registry>>::and_then(a, b)
+}
+
+/// event 字段的 JSON Visit 收集器（把 event.record() 转为 JSON map）。
+struct JsonFieldVisitor<'a>(&'a mut serde_json::Map<String, serde_json::Value>);
+
+impl tracing::field::Visit for JsonFieldVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(
+            field.name().to_string(),
+            serde_json::json!(format!("{value:?}")),
+        );
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_error(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &(dyn std::error::Error + 'static),
+    ) {
+        self.0.insert(
+            field.name().to_string(),
+            serde_json::json!(value.to_string()),
+        );
+    }
 }
