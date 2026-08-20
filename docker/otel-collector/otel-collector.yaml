@@ -1,0 +1,38 @@
+# otel-collector 本地开发配置（与生产同拓扑：App → Collector → 后端）
+# 生产升级要点：exporter 换生产 Tempo endpoint；filter/healthcheck 可换/叠加 tail_sampling
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # 探活噪声过滤：/health、/metrics 的 http_request span 不进 Tempo
+  # （每 15~30s 一条 × docker healthcheck × e2e 高频探活，会淹没有效 trace）
+  # span 字段（uri/method 等）经 tracing-opentelemetry 导出为 span attributes
+  filter/healthcheck:
+    error_mode: ignore
+    traces:
+      span:
+        - 'name == "http_request" and (attributes["uri"] == "/health" or attributes["uri"] == "/metrics")'
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+service:
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [filter/healthcheck, batch]
+      exporters: [otlp/tempo]

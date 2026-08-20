@@ -72,6 +72,8 @@ docker_config:
           SERVICE_MODE: "full"
           API_PORT: "8086"
           PROJECT_WORKSPACE_BASE: "/app/project_workspace"
+          # OTLP 分布式追踪（App → otel-collector → Tempo；K8s 由 kubernetes_config.environment 同名覆盖）
+          OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
         command:
           - "/bin/bash"
           - "/app/agent-runner-start.sh"
@@ -130,6 +132,8 @@ docker_config:
           # 🔥 Agent 清理配置（闲置超时时间，秒）
           # 默认值: 3600 (1小时)
           RCODER_AGENT_IDLE_TIMEOUT_SECS: "3600"
+          # OTLP 分布式追踪（App → otel-collector → Tempo；K8s 由 kubernetes_config.environment 同名覆盖）
+          OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
           # 🖼️ 自定义壁纸配置
           # 通过挂载的 /app/assets 目录使用宿主机壁纸
           # 使用方法：在宿主机 ./wallpaper 目录放置 wallpaper.jpeg

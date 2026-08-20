@@ -32,6 +32,9 @@ services:
       # 空/未设置 = 火焰图休眠零开销。用法: RCODER_FLAME=/app/logs/flame.folded
       # docker compose up -d rcoder 重建容器后生效；停止容器时优雅退出自动落盘）
       - RCODER_FLAME=${RCODER_FLAME:-}
+      # OTLP 分布式追踪（与生产同拓扑：App → otel-collector → Tempo；service.name 自动=rcoder）
+      # Grafana Explore → Tempo 查看 trace（火焰图/瀑布），trace_id 与 JSON 日志一致
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
     volumes:
       # 挂载 Docker socket
       - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
@@ -87,6 +90,36 @@ services:
       - server
     restart: unless-stopped
 
+  # Tempo - 分布式追踪后端（OTLP traces 存储；配置见 docker/tempo/tempo.yml）
+  tempo:
+    image: grafana/tempo:latest
+    container_name: rcoder-tempo
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    ports:
+      - "3200:3200" # 查询 API（Grafana 数据源走容器网络，宿主映射供调试）
+    volumes:
+      - ./tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo-data:/var/tempo
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+
+  # otel-collector - 遥测收集管道（与生产同拓扑：App → Collector → 后端）
+  # 价值：后端解耦/缓冲重试/探活噪声过滤；自身指标 :8888（Prometheus 抓取，丢数排障抓手）
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: rcoder-otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports:
+      - "4317:4317" # OTLP gRPC（rcoder/agent 容器经服务名访问；宿主映射供调试）
+      - "4318:4318" # OTLP HTTP
+      - "8888:8888" # collector 自身指标
+    volumes:
+      - ./otel-collector/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+
   # Prometheus Server - 时序数据库，存储常规指标
   prometheus:
     image: prom/prometheus:latest
@@ -122,10 +155,12 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
+      - tempo
     restart: unless-stopped
 
 volumes:
   pyroscope-data:
+  tempo-data:
   prometheus-data:
   grafana-data:
   # 容器内热编译缓存（本地开发测试用）

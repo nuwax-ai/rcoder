@@ -26,9 +26,15 @@ pub fn inject_accept_language_metadata<T>(request: &mut tonic::Request<T>, local
 }
 
 /// Build a gRPC request with `accept-language` metadata.
+///
+/// 所有 rcoder → agent_runner 的 gRPC 请求构造统一入口：同时注入 W3C
+/// traceparent（当前 span 的 trace context），agent_runner 侧提取后挂到
+/// 同一 trace——跨服务全链路追踪（OTLP → Tempo）。OTLP 关闭时 context
+/// 无效、propagator 不写 header，无副作用。
 pub fn new_request_with_locale<T>(message: T, locale: &'static str) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
     inject_accept_language_metadata(&mut request, locale);
+    rcoder_telemetry::propagation::inject_context(request.metadata_mut());
     request
 }
 

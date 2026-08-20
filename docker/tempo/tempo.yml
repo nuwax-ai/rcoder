@@ -1,0 +1,40 @@
+# Tempo 单二进制本地开发配置（monolithic 模式 + local 存储后端）
+# 生产升级：换 S3/对象存储后端、多副本拆分 distributor/ingester/querier（见 docs/observability.md）
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  # 本地快速出块（默认 30m 太慢，dev 下 5m 落盘即可查）
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 72h
+
+querier:
+  max_concurrent_queries: 4
+
+query_frontend:
+  search:
+    query_timeout: 30s
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/traces
+
+# 本地禁用用量上报
+usage_report:
+  reporting_enabled: false

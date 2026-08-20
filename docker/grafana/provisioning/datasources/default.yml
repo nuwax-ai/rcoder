@@ -2,7 +2,9 @@ apiVersion: 1
 
 datasources:
   # Prometheus 数据源（容器内部网络）
+  # uid 固定供 Tempo tracesToMetrics 联动引用（见 tempo.yml）
   - name: Prometheus
+    uid: prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090
