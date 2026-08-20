@@ -1,21 +1,16 @@
 mod container;
 mod model;
 
+// 容器域类型（高内聚收拢于 container/ 模块）—— 条目/查找/清理/统计 + 服务与隔离枚举
+pub use container::{
+    CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry, ContainerLookup, IdleContainerInfo,
+    IsolationType, IsolationTypeError, MissingIdentifier, ProjectScope, ServiceType,
+    ServiceTypeError, StorageStats, get_enabled_service_types, get_supported_service_types,
+};
+
 // UserApp build 进度事件 —— file-server(发送)与 rcoder(接收)共享的类型化 DTO
 pub mod build_event;
 pub use build_event::BuildProgressEvent;
-
-// 清理请求模块
-pub mod cleanup_request;
-pub use cleanup_request::{CLEANUP_CHANNEL_CAPACITY, CleanupRequest};
-
-// 存储类型模块
-pub mod storage_types;
-pub use storage_types::{IdleContainerInfo, StorageStats};
-
-// 容器查找接口模块
-pub mod container_lookup;
-pub use container_lookup::{ContainerLookup, ProjectScope};
 
 // project/session/container 映射存储契约（内存与 PG 双后端统一接口）
 pub mod project_store;
@@ -30,10 +25,6 @@ pub use app_activity::{
 // UserApp 应用业务元数据（集群不持有的字段;query name/created_at 过滤数据源）
 pub mod app_metadata;
 pub use app_metadata::{AppMetadataPersistence, AppMetadataRecord};
-
-// 容器条目模块（refcount + 活跃时间跟踪）
-pub mod container_entry;
-pub use container_entry::ContainerEntry;
 
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）
 pub mod flexible_string;
@@ -68,7 +59,6 @@ pub mod multi_image_config;
 pub mod permission_types;
 pub mod pg_utils;
 pub mod service_config;
-pub mod service_type;
 // K8s 运行时专用配置(与 docker_config 分家)
 pub mod k8s_config;
 pub use permission_types::{
@@ -187,14 +177,6 @@ pub use service_config::{
     ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits, ServiceSecurityConfig,
     default_agent_runner_service_config, default_rcoder_service_config,
 };
-pub use service_type::{
-    MissingIdentifier, ServiceType, ServiceTypeError, get_enabled_service_types,
-    get_supported_service_types,
-};
-
-// 隔离类型模块
-pub mod isolation_type;
-pub use isolation_type::{IsolationType, IsolationTypeError};
 
 // 导出ChatPrompt的Builder
 pub use model::chat_prompt::ChatPromptBuilder;

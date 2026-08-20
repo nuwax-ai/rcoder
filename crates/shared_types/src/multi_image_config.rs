@@ -3,8 +3,8 @@
 //! 定义了支持多种服务类型的 Docker 镜像配置系统，包括全局默认配置、
 //! 服务特定配置、选择策略和缓存机制。
 
+use crate::ServiceType;
 use crate::service_config::ServiceImageConfig;
-use crate::service_type::ServiceType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;

@@ -18,8 +18,8 @@
 //! **策略约束**:`K8sVolumeType::HostPath` 被禁止(K8s builder 翻译时跳过并告警),
 //! 因为动态 agent pod 不可绑宿主机路径(多节点漂移、安全)。
 
+use crate::ServiceType;
 use crate::service_config::ServiceResourceLimits;
-use crate::service_type::ServiceType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

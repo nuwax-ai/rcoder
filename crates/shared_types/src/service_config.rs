@@ -2,7 +2,7 @@
 //!
 //! 定义了每个服务类型的镜像配置、环境变量、挂载点等信息。
 
-use crate::service_type::ServiceType;
+use crate::ServiceType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
