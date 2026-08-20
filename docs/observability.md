@@ -64,15 +64,21 @@ open flame.svg                          # 浏览器查看
 
 **与 Pyroscope 的区别**：Pyroscope 是 CPU 采样（哪些函数在烧 CPU），tracing-flame 是 span 耗时（哪些 async 路径在等待/耗时）。
 
-**⚠️ 实测结论（2026-08-20 对照实验）——folded 耗时数据会失真**：tracing-flame 的栈式计时
-假设单任务顺序嵌套，多任务并发 async 下系统性失真。对照实验：`grpc_dial` span 同源双记录，
-metrics 直方图 p50=3.1s / p99=10s，folded 里 max 仅 67ms（差 150 倍）；`forward_chat`（9-20s）
-在 folded 里 max 16ms。**耗时分析一律以 /metrics 的 span 直方图为准**（SpanMetricsLayer，
-on_new_span/on_close 墙钟、无栈假设），火焰图只看**调用结构与冷启动子阶段**（短同步段相对可信）。
+**⚠️ 实测结论（2026-08-20 对照实验）——folded 耗时数据会失真**：tracing-flame
+**不测 span 自身耗时**——源码（0.2.0 lib.rs:478）里每行数字 = `线程上距上一个 span 事件的
+墙钟间隔`（thread-local `LAST_EVENT`），在 span 切换时刻把 gap 归因给当前栈。单线程顺序
+嵌套（benchmark 场景）下这与耗时等价；多线程并发 async 下失效：①挂起期间线程被其他任务
+复用，gap 被无关事件不断重置；②tokio work-stealing 使任务跨线程迁移，thread-local 时钟断链。
+对照实验：`grpc_dial` span 同源双记录，metrics 直方图 p50=3.1s / p99=10s，folded 里 max 仅
+67ms（差 150 倍）；`forward_chat`（9-20s）在 folded 里 max 16ms。**耗时分析一律以
+/metrics 的 span 直方图为准**（SpanMetricsLayer，on_new_span/on_close 墙钟、无栈假设），
+火焰图只看**调用结构与冷启动子阶段**（父子链取自 registry，结构是准的）。
 
 **读图要点**（实测经验）：
-- folded 里裸 `all-threads` 大数值行 = 停机时仍未关闭的后台 span / 线程空闲 gap，不代表热点，分析时跳过；
-- 只有 2 帧以上的栈才是真实 span 链；无子 span 的热点叶子帧（如 handler）说明该函数内部缺 `#[instrument]`，是可观测性缺口而非"函数本身慢"。
+- folded 里裸 `all-threads` 大数值行 = `on_enter` 根 span 时把该线程的整段空闲 gap 记在
+  根上（线程刚被唤醒），不代表任何热点，分析时跳过；
+- 只有 2 帧以上的栈才是真实 span 链；无子 span 的热点叶子帧（如 handler）说明该函数内部
+  缺 `#[instrument]`，是可观测性缺口而非"函数本身慢"。
 
 ## span 耗时指标（SpanMetricsLayer，精确计时）
 
