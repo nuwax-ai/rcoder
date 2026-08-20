@@ -81,7 +81,9 @@ impl AgentService for AgentServiceImpl {
         request: Request<GrpcResolvePermissionRequest>,
     ) -> Result<Response<GrpcResolvePermissionResponse>, Status> {
         let span = rcoder_telemetry::grpc_span!("resolve_permission", request.metadata());
-        permission::resolve_permission(request).instrument(span).await
+        permission::resolve_permission(request)
+            .instrument(span)
+            .await
     }
 
     async fn get_status(
@@ -89,7 +91,9 @@ impl AgentService for AgentServiceImpl {
         request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
         let span = rcoder_telemetry::grpc_span!("get_status", request.metadata());
-        status::get_status(&self.app_state, request).instrument(span).await
+        status::get_status(&self.app_state, request)
+            .instrument(span)
+            .await
     }
 
     async fn stop_agent(
