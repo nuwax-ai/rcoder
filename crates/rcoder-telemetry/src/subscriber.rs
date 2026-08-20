@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use serde_json::{Map, Value, json};
 use tracing::info;
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{
@@ -113,13 +114,11 @@ where
         mut writer: fmt::format::Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> std::fmt::Result {
-        use serde_json::{Map, Value, json};
-
         let meta = event.metadata();
         let mut obj = Map::new();
 
-        // === 与标准 Format<Json> 逐字段对齐 ===
-        let timestamp = chrono::Local::now().to_rfc3339();
+        // === 与标准 Format<Json> 逐字段对齐（timestamp 含微秒精度）===
+        let timestamp = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
         obj.insert("timestamp".to_string(), json!(timestamp));
 
         obj.insert("level".to_string(), json!(meta.level().as_str()));
@@ -145,10 +144,10 @@ where
             json!(std::thread::current().name().unwrap_or("unnamed")),
         );
 
-        // === span 上下文（当前 span 名）===
-        if let Some(span) = ctx.lookup_current() {
-            obj.insert("span".to_string(), json!(span.metadata().name()));
-        }
+        // === span 上下文（完整 span 对象 + span 链数组，对齐标准 formatter）===
+        // 标准 Format<Json> 输出 "span":{...fields..., "name":"..."} 和
+        // "spans":[{...},...]（display_current_span/display_span_list 默认 true）
+        Self::insert_span_context(&mut obj, ctx);
 
         // === ★ trace_id 在 JSON ROOT（从 extensions 类型化读取）===
         if let Some(tid) = Self::extract_trace_id(ctx) {
@@ -174,6 +173,52 @@ impl TraceIdJsonFormat {
                 return Some(ext.0.clone());
             }
             span = span.parent()?;
+        }
+    }
+
+    /// 插入 `"span":{...}` 和 `"spans":[...]`——与标准 Format<Json> 对齐。
+    ///
+    /// 从每个 span 的 `FormattedFields<N>` 读取已格式化的字段（JSON 键值对），
+    /// 解析为 JSON Value 后加 `"name"` 字段。span 链按 current → parent 顺序。
+    fn insert_span_context<S, N>(obj: &mut Map<String, Value>, ctx: &fmt::FmtContext<'_, S, N>)
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        N: for<'a> fmt::format::FormatFields<'a> + 'static,
+    {
+        use tracing_subscriber::fmt::FormattedFields;
+
+        let mut spans_array = Vec::new();
+        let mut current = ctx.lookup_current();
+
+        while let Some(span) = current {
+            let mut span_obj = Map::new();
+            // 读取 FormattedFields（span 的已格式化字段——method/uri/trace_id 等）
+            let span_fields = span
+                .extensions()
+                .get::<FormattedFields<N>>()
+                .and_then(|ff| serde_json::from_str::<Value>(&ff.fields).ok())
+                .and_then(|v| match v {
+                    Value::Object(map) => Some(map),
+                    _ => None,
+                });
+            if let Some(fields) = span_fields {
+                for (k, v) in fields {
+                    span_obj.insert(k, v);
+                }
+            }
+            span_obj.insert("name".to_string(), json!(span.metadata().name()));
+
+            // 第一个（current）写入 "span"，全部写入 "spans"
+            if spans_array.is_empty() {
+                obj.insert("span".to_string(), Value::Object(span_obj.clone()));
+            }
+            spans_array.push(Value::Object(span_obj));
+
+            current = span.parent();
+        }
+
+        if !spans_array.is_empty() {
+            obj.insert("spans".to_string(), Value::Array(spans_array));
         }
     }
 }
@@ -304,10 +349,8 @@ pub(crate) fn init_tracing_subscriber(
 
     // 组装 subscriber 链
     let has_tokio_console = tokio_console_layer.is_some();
-    // TraceIdExtractor 是具体类型（非 BoxedLayer），直接挂 Registry——但必须在
-    // stack_boxed_layers 之前（stack 期望 Registry 顶层），类型上 Layer<Registry> 满足
-    // TraceIdExtractor 是泛型 Layer<S>（可挂任意层之后）；stack_boxed_layers
-    // 的 BoxedLayer 只支持 Registry——必须最先挂
+    // 顺序约束：stack_boxed_layers（BoxedLayer 只支持 Registry 顶层）最先；
+    // TraceIdExtractor 是泛型 Layer<S>，可挂任意层之后
     #[cfg(feature = "flame")]
     let registry = tracing_subscriber::registry()
         .with(stack_boxed_layers(extra_layer, tokio_console_layer))
@@ -356,39 +399,32 @@ fn stack_boxed_layers(
 }
 
 /// event 字段的 JSON Visit 收集器（把 event.record() 转为 JSON map）。
-struct JsonFieldVisitor<'a>(&'a mut serde_json::Map<String, serde_json::Value>);
+struct JsonFieldVisitor<'a>(&'a mut Map<String, Value>);
 
 impl tracing::field::Visit for JsonFieldVisitor<'_> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.0
-            .insert(field.name().to_string(), serde_json::json!(value));
+        self.0.insert(field.name().to_string(), json!(value));
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.insert(
-            field.name().to_string(),
-            serde_json::json!(format!("{value:?}")),
-        );
+        self.0
+            .insert(field.name().to_string(), json!(format!("{value:?}")));
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.0
-            .insert(field.name().to_string(), serde_json::json!(value));
+        self.0.insert(field.name().to_string(), json!(value));
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.0
-            .insert(field.name().to_string(), serde_json::json!(value));
+        self.0.insert(field.name().to_string(), json!(value));
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        self.0
-            .insert(field.name().to_string(), serde_json::json!(value));
+        self.0.insert(field.name().to_string(), json!(value));
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.0
-            .insert(field.name().to_string(), serde_json::json!(value));
+        self.0.insert(field.name().to_string(), json!(value));
     }
 
     fn record_error(
