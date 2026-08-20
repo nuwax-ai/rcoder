@@ -8,14 +8,93 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::info;
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{
-    EnvFilter, Layer, filter::filter_fn, fmt, layer::SubscriberExt, registry::Registry,
-    util::SubscriberInitExt,
+    EnvFilter, Layer, filter::filter_fn, fmt, fmt::format::Format, layer::SubscriberExt,
+    registry::Registry, util::SubscriberInitExt,
 };
 
 use crate::config::FileLogConfig;
 
 /// 类型擦除的 tracing layer（用于跨 crate 注入额外日志层）。
 pub type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
+
+/// JSON 日志格式化包装器：在标准 JSON 输出末尾追加 OTel trace_id/span_id。
+///
+/// OTLP layer 安装且当前 span 有 valid trace context 时（e2e 注入
+/// traceparent 或 OTLP exporter 创建的 span），自动追加两个字段：
+/// `"trace_id":"...","span_id":"..."`；无 OTel context 时不追加——
+/// 日志行为与裸 `Format<Json>` 完全一致（零破坏）。
+struct TraceIdFormat {
+    inner: Format<fmt::format::Json, fmt::time::SystemTime>,
+}
+
+impl<S, N> fmt::format::FormatEvent<S, N> for TraceIdFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::format::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        // 缓冲标准 JSON 输出（内部会写完整 JSON + 换行）
+        let mut buf = String::new();
+        {
+            let mut inner_writer = fmt::format::Writer::new(&mut buf);
+            <Format<fmt::format::Json, fmt::time::SystemTime> as fmt::format::FormatEvent<S, N>>::format_event(
+                &self.inner,
+                ctx,
+                inner_writer.by_ref(),
+                event,
+            )?;
+        }
+        // 去掉尾部换行，在 `}` 前插入 trace_id
+        let json = buf.trim_end();
+        match (trace_id_from_span_chain(ctx), json.rfind('}')) {
+            (Some(tid), Some(pos)) => {
+                write!(
+                    writer,
+                    "{},\"trace_id\":\"{}\"{}",
+                    &json[..pos],
+                    tid,
+                    &json[pos..]
+                )?;
+            }
+            _ => write!(writer, "{}", json)?,
+        }
+        writeln!(writer)
+    }
+}
+
+/// 从当前 span 链向上查找 `trace_id` 字段（跳过无该字段的中间层）。
+///
+/// trace_id 由 `make_span_with_trace_parent` 作为 tracing span field 写入
+/// `http_request` span（不依赖 OTel layer——OTLP 关闭时也可见）。
+/// 事件可能在子 span（如 handler instrument span）中，需沿父链向上查找。
+fn trace_id_from_span_chain<S, N>(ctx: &fmt::FmtContext<'_, S, N>) -> Option<String>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::format::FormatFields<'a> + 'static,
+{
+    use tracing_subscriber::fmt::FormattedFields;
+    // 显式使用 JsonFields（与 .json() 层的 fmt_fields 类型一致）——泛型 N
+    // 在运行时可能不匹配 FormattedFields 的实际类型参数
+    type JsonFmt = fmt::format::JsonFields;
+
+    let mut span = ctx.lookup_current()?;
+    loop {
+        if let Some(ff) = span.extensions().get::<FormattedFields<JsonFmt>>() {
+            let tid = serde_json::from_str::<serde_json::Value>(&ff.fields)
+                .ok()
+                .and_then(|v| v.get("trace_id")?.as_str().map(str::to_owned));
+            if tid.is_some() {
+                return tid;
+            }
+        }
+        span = span.parent()?;
+    }
+}
 
 /// 初始化 tracing subscriber
 ///
@@ -85,15 +164,21 @@ pub(crate) fn init_tracing_subscriber(
             filter_fn(|meta: &tracing::Metadata<'_>| !meta.target().starts_with("file_server"));
 
         if file_config.json_format {
-            // JSON 格式文件日志
+            // JSON 格式文件日志 + trace_id/span_id 自动注入
+            // （OTel context 存在时追加——e2e traceparent 或 OTLP 均适用）
+            let json_event_format = fmt::format()
+                .json()
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_thread_names(true);
             Some(
                 fmt::layer()
-                    .json()
+                    .json() // JsonFields 格式化（span/fields 的 JSON 键值）
+                    .event_format(TraceIdFormat {
+                        inner: json_event_format,
+                    })
                     .with_writer(file_appender)
                     .with_ansi(false)
-                    .with_target(true)
-                    .with_thread_ids(true)
-                    .with_thread_names(true)
                     .with_filter(deny_fs)
                     .boxed(),
             )
@@ -112,11 +197,19 @@ pub(crate) fn init_tracing_subscriber(
         None
     };
 
-    // OTLP layer（可选）
-    let otel_layer = tracer_provider.map(|provider| {
-        let tracer = provider.tracer(service_name.to_string());
-        tracing_opentelemetry::layer().with_tracer(tracer)
-    });
+    // OTLP layer：有 exporter 用真实 provider；无 exporter 用 no-op
+    // （no-op 仍安装 OpenTelemetryLayer——提供 span context 存储基础设施：
+    // set_parent / span.context() / 日志 trace_id 注入依赖它；仅不 export）
+    let otel_layer = {
+        let tracer = match tracer_provider {
+            Some(provider) => provider.tracer(service_name.to_string()),
+            None => {
+                let noop = SdkTracerProvider::builder().build();
+                noop.tracer(service_name.to_string())
+            }
+        };
+        Some(tracing_opentelemetry::layer().with_tracer(tracer))
+    };
 
     // 构建完整 subscriber 链：
     // extra_layer 先注入到 Registry 上（Box<dyn Layer<Registry>> 直接匹配 Registry），

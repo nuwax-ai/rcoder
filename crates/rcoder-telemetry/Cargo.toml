@@ -11,6 +11,7 @@ publish = false
 workspace = true
 
 [dependencies]
+serde_json = { workspace = true }
 # OpenTelemetry
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }

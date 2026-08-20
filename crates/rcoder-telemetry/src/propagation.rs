@@ -177,12 +177,20 @@ pub fn make_span_with_trace_parent<B>(req: &http::Request<B>) -> tracing::Span {
         "http_request",
         method = %req.method(),
         uri = %req.uri(),
+        // trace_id 直接作为 tracing span field（JSON 日志自动可见；无需
+        // OTel layer——OTLP 关闭时 set_parent 的 context 不生效，但 span
+        // field 始终可读）。OTLP 开启时额外 set_parent 做全链路 export。
+        trace_id = tracing::field::Empty,
     );
     let remote_cx = extract_context_http(req.headers());
     let valid = remote_cx.span().span_context().is_valid();
     if valid {
-        let trace_id = remote_cx.span().span_context().trace_id();
-        // set_parent 失败（span 已结束等）仅降级为根 span，不影响请求处理
+        let otel_span = remote_cx.span();
+        let sc = otel_span.span_context();
+        let trace_id = sc.trace_id();
+        // ① 直接写入 tracing span field（日志 JSON 可靠可见）
+        span.record("trace_id", tracing::field::display(trace_id));
+        // ② set_parent（OTLP 开启时全链路同一 trace export；失败仅降级）
         if let Err(e) = span.set_parent(remote_cx) {
             tracing::debug!("[Propagation] attach remote trace {trace_id} failed: {e}");
         } else {
