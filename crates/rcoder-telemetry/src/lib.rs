@@ -52,7 +52,7 @@ pub use prometheus::{
 };
 pub use propagation::{
     extract_context, extract_context_http, inject_context, inject_context_http,
-    set_global_propagator,
+    make_span_with_trace_parent, set_global_propagator,
 };
 
 use anyhow::Result;

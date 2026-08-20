@@ -163,6 +163,35 @@ pub fn extract_context_http(headers: &http::HeaderMap) -> Context {
     cx
 }
 
+/// tower_http TraceLayer 的 make_span_with 用 span 构造器：请求 span 继承
+/// 入站 W3C traceparent 指定的远端父上下文（e2e/上游注入 trace 贯通）；
+/// 无 header 或格式非法时退化为根 span（与原 TraceLayer 行为一致）。
+///
+/// 关联：OTLP 开启时全链路同一 trace；HttpResult 的 tid 经
+/// `Span::current().context()` 读取（子 span 关联需 OTLP layer 安装）。
+pub fn make_span_with_trace_parent<B>(req: &http::Request<B>) -> tracing::Span {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let span = tracing::info_span!(
+        "http_request",
+        method = %req.method(),
+        uri = %req.uri(),
+    );
+    let remote_cx = extract_context_http(req.headers());
+    let valid = remote_cx.span().span_context().is_valid();
+    if valid {
+        let trace_id = remote_cx.span().span_context().trace_id();
+        // set_parent 失败（span 已结束等）仅降级为根 span，不影响请求处理
+        if let Err(e) = span.set_parent(remote_cx) {
+            tracing::debug!("[Propagation] attach remote trace {trace_id} failed: {e}");
+        } else {
+            tracing::debug!("[Propagation] request span attached to remote trace: {trace_id}");
+        }
+    }
+    span
+}
+
 /// 设置全局 text map 传播器
 ///
 /// 应该在应用启动时调用一次。
