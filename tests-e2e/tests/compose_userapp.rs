@@ -121,7 +121,13 @@ async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
         json!({"project_id": ident}),
     )
     .await;
-    let ok = status.is_success() && http_ok(&body);
+    let task_id = body["data"]["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    // task_id 非空一并校验：键名漂移（读错字段得空串）会让后续轮询 404 循环
+    // 到超时，表象是"疑似挂死"——在受理处即拦截
+    let ok = status.is_success() && http_ok(&body) && !task_id.is_empty();
     report.assert_hard(
         "publish 受理（200 任务创建）",
         ok,
@@ -131,10 +137,6 @@ async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
         cleanup_builder(&guard_app);
         return;
     }
-    let task_id = body["data"]["taskId"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
 
     // 轮询到终态（failed/cancelled/completed）；agent workspace 不存在 → 业务性 failed
     let t0 = Instant::now();
@@ -163,7 +165,7 @@ async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
                     phase: "terminal_poll",
                     url: &env.rcoder,
                     ok: true,
-                    request_sanitized: json!({"taskId": task_id}),
+                    request_sanitized: json!({"task_id": task_id}),
                     response: Some(&b["data"]["task"]),
                     error: None,
                     elapsed_ms: t0.elapsed().as_millis(),
@@ -212,7 +214,7 @@ async fn test_app_create_requires_release_lock(env: &Env, report: &JsonlReporter
         std::process::id() % 1000
     );
     let payload = json!({
-        "appId": app_id,
+        "app_id": app_id,
         "name": "e2e-nolock-test",
         "image": "alpine:3.19",
         "command": ["sleep", "3600"],
