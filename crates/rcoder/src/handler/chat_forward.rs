@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::HttpResult;
 use crate::grpc::{
@@ -94,6 +94,11 @@ pub struct ForwardChatOpts<'a> {
 /// - 全部重试失败后返回本地化的 `ERR_GRPC_ERROR`。
 ///
 /// `make_params` 闭包在每次尝试前构造请求参数（各尝试间参数相同）。
+///
+/// span 覆盖整个 turn 等待（含重试/智能等待）——chat POST 的墙钟大头；
+/// 耗时指标由 SpanMetricsLayer 从 span 自动记录（method="chat"）；
+/// 出口仅记录业务结果计数。
+#[instrument(skip_all, fields(tag = %opts.log_tag))]
 pub async fn forward_chat(
     grpc_pool: &Arc<GrpcChannelPool>,
     mut grpc_addr: String,
@@ -115,6 +120,7 @@ pub async fn forward_chat(
                         "✅ [{}] gRPC response success: project_id={}, session_id={}",
                         opts.log_tag, chat_response.project_id, chat_response.session_id
                     );
+                    rcoder_telemetry::prometheus::record_grpc_request("chat", "ok");
                     return HttpResult::success(chat_response);
                 } else {
                     let error_msg = grpc_response
@@ -128,6 +134,7 @@ pub async fn forward_chat(
                         "❌ [{}] gRPC response error: code={}, message={}",
                         opts.log_tag, error_code, error_msg
                     );
+                    rcoder_telemetry::prometheus::record_grpc_request("chat", "error");
                     return HttpResult::error(&error_code, &error_msg);
                 }
             }
@@ -274,9 +281,11 @@ pub async fn forward_chat(
             &raw,
         )
         .await;
+        rcoder_telemetry::prometheus::record_grpc_request("chat", "error");
         return HttpResult::error(code.as_str(), msg.as_str());
     }
 
     // 无诊断上下文:保留原行为(通用 ERR_GRPC_ERROR)
+    rcoder_telemetry::prometheus::record_grpc_request("chat", "error");
     HttpResult::error_with_locale(shared_types::error_codes::ERR_GRPC_ERROR, locale)
 }

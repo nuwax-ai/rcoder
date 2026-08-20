@@ -21,7 +21,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 /// 格式化日期时间为标准格式（如：2026-01-12 15:04:30）
 fn format_datetime(dt: DateTime<Utc>) -> String {
@@ -589,8 +589,12 @@ pub fn start_container_status_checker(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // 执行容器状态检查
-                    if let Err(e) = checker.check_all_containers().await {
+                    // 执行容器状态检查（bg_status_check span：周期任务可观测）
+                    if let Err(e) = checker
+                        .check_all_containers()
+                        .instrument(tracing::info_span!("bg_status_check"))
+                        .await
+                    {
                         warn!(" [STATUS_CHECKER] Container status check failed: {}", e);
                     }
 

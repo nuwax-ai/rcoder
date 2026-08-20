@@ -69,6 +69,8 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
     let tokio_console_layer = config.console_layer.take();
     // tracing-flame 火焰图配置（take 前记，供启动日志使用）
     let flame_config = config.flame.take();
+    // span 耗时→直方图规则（SpanMetricsLayer；调用点 #[instrument] 零计时代码）
+    let span_metrics = std::mem::take(&mut config.span_metrics);
     let _flame_guard = subscriber::init_tracing_subscriber(
         &config.service_name,
         tracer_provider.as_ref(),
@@ -76,6 +78,7 @@ pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
         extra_layer,
         tokio_console_layer,
         flame_config.as_ref(),
+        span_metrics,
     )?;
 
     info!(

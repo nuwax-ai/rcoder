@@ -13,6 +13,7 @@ use super::*;
 /// - `space_id`: 空间 ID（可选）
 /// - `user_id`: 用户 ID（当 isolation_type 为 project 时使用）
 /// - `work_dir_id`: 工作目录标识符（可能是 project_id 或 agent_work_dir）
+#[instrument(skip_all, fields(user_id = %user_id, work_dir_id = %work_dir_id))]
 pub(super) async fn ensure_project_workspace_exists(
     isolation_type: Option<&str>,
     tenant_id: Option<&str>,

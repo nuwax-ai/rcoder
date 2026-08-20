@@ -29,6 +29,8 @@ pub struct TelemetryConfig {
     pub console_layer: Option<BoxedLayer>,
     /// tracing 火焰图配置（flame feature；None=未启用）
     pub flame: Option<FlameConfig>,
+    /// span 耗时→直方图指标规则（SpanMetricsLayer；空=不桥接）
+    pub span_metrics: Vec<crate::span_metrics::SpanMetricRule>,
 }
 
 /// OTLP 导出器配置
@@ -103,6 +105,7 @@ impl Default for TelemetryConfig {
             extra_layer_guard: None,
             console_layer: None,
             flame: None,
+            span_metrics: Vec::new(),
         }
     }
 }
@@ -217,6 +220,7 @@ impl TelemetryConfig {
             extra_layer_guard: None,
             console_layer: None,
             flame: None,
+            span_metrics: Vec::new(),
         }
     }
 
@@ -294,6 +298,17 @@ impl TelemetryConfig {
     /// 构造后传入；telemetry 自身不依赖 console-subscriber，经 BoxedLayer 泛化承载）。
     pub fn with_console_layer(mut self, layer: BoxedLayer) -> Self {
         self.console_layer = Some(layer);
+        self
+    }
+
+    /// 注册 span 耗时→直方图指标规则（见 [`crate::span_metrics`]）。
+    ///
+    /// 调用点只需 `#[instrument]`，耗时指标由 SpanMetricsLayer 自动记录。
+    pub fn with_span_metric_rules(
+        mut self,
+        rules: Vec<crate::span_metrics::SpanMetricRule>,
+    ) -> Self {
+        self.span_metrics = rules;
         self
     }
 }

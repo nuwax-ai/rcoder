@@ -18,7 +18,7 @@ use shared_types::grpc::agent_mgmt_service_client::AgentMgmtServiceClient;
 use shared_types::grpc::agent_service_client::AgentServiceClient;
 use std::time::Duration;
 use tonic::transport::Channel;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info};
 
 /// gRPC 连接池 TTL（5分钟）
 ///
@@ -123,30 +123,43 @@ impl GrpcChannelPool {
         // 慢路径：try_get_with 原子化"查或建"
         // 把 connect 放进 init future 内部，并发请求共享同一个 connect future
         let addr_key = addr.to_string();
+        // dial 计时由 grpc_dial span 承载（SpanMetricsLayer 规则记录直方图）
+        let dial_span = tracing::info_span!("grpc_dial", addr = %addr_key);
         let channel = self
             .channels
-            .try_get_with(addr_key, async move {
-                info!(" [gRPC] creating connection: {}", addr);
-                let endpoint = format!("http://{}", addr);
-                Channel::from_shared(endpoint)
-                    .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
-                    .connect_timeout(Duration::from_secs(shared_types::GRPC_CONNECT_TIMEOUT_SECS))
-                    .timeout(Duration::from_secs(shared_types::GRPC_REQUEST_TIMEOUT_SECS))
-                    .http2_keep_alive_interval(Duration::from_secs(30))
-                    .keep_alive_timeout(Duration::from_secs(10))
-                    .keep_alive_while_idle(true)
-                    .tcp_keepalive(Some(Duration::from_secs(60)))
-                    .tcp_nodelay(true)
-                    .connect()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))
-            })
+            .try_get_with(
+                addr_key,
+                async move {
+                    info!(" [gRPC] creating connection: {}", addr);
+                    let endpoint = format!("http://{}", addr);
+                    Channel::from_shared(endpoint)
+                        .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
+                        .connect_timeout(Duration::from_secs(
+                            shared_types::GRPC_CONNECT_TIMEOUT_SECS,
+                        ))
+                        .timeout(Duration::from_secs(shared_types::GRPC_REQUEST_TIMEOUT_SECS))
+                        .http2_keep_alive_interval(Duration::from_secs(30))
+                        .keep_alive_timeout(Duration::from_secs(10))
+                        .keep_alive_while_idle(true)
+                        .tcp_keepalive(Some(Duration::from_secs(60)))
+                        .tcp_nodelay(true)
+                        .connect()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))
+                }
+                .instrument(dial_span),
+            )
             .await
             .map_err(|e| {
-                warn!(" [gRPC] try_get_with failed: {}", e);
+                // debug 而非 warn：容器启动期拨号失败是业务常态（chat_forward
+                // 重试循环每次 attempt 已有 warn 级信号，这里再 warn 会重复刷屏
+                // ——实测 e2e 一轮 756 条）。可见性由 grpc dial 失败计数指标承担。
+                debug!(" [gRPC] dial failed (agent 可能未就绪): {}", e);
+                rcoder_telemetry::prometheus::record_grpc_request("dial", "error");
                 anyhow::anyhow!("Failed to get or create channel: {}", e)
             })?;
 
+        rcoder_telemetry::prometheus::record_grpc_request("dial", "ok");
         Ok(channel)
     }
 

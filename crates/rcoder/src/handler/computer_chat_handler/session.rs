@@ -5,7 +5,7 @@
 
 use shared_types::{ChatResponse, ComputerChatRequest};
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::{AppError, HttpResult, router::AppState};
 use docker_manager::ContainerBasicInfo;
@@ -14,6 +14,7 @@ use super::super::chat_forward::ChatFlowExit;
 
 /// 自动安装检查：如果 agent_server 携带 platforms，必须同时提供 agent_id、command、version
 /// 内置 agent（容器预装）跳过安装逻辑
+#[instrument(skip_all, fields(project_id = %project_id))]
 pub(super) async fn ensure_agent_installed_if_needed(
     state: &Arc<AppState>,
     request: &ComputerChatRequest,
@@ -128,6 +129,7 @@ pub(super) fn register_vnc_backend(
 /// 🆕 主动查询 Agent 状态 (User Request)
 /// 在转发请求前，主动查询 Agent 状态，确保状态是最新的。
 /// 这有助于在容器重启后，确认 Agent 是否真正处于空闲状态。
+#[instrument(skip_all, fields(project_id = %project_id))]
 pub(super) async fn probe_agent_status(
     state: &Arc<AppState>,
     container_info: &ContainerBasicInfo,
@@ -231,6 +233,7 @@ pub(super) fn resolve_forward_request(
 /// 更新会话映射（填充所有三个映射表，保持一致性）
 /// 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
 /// 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
+#[instrument(skip_all, fields(user_id = %user_id, project_id = %project_id))]
 pub(super) async fn update_session_mappings_after_response(
     state: &Arc<AppState>,
     result: &HttpResult<ChatResponse>,

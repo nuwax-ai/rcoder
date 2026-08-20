@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use container_runtime_api::ContainerRuntime;
 
@@ -57,9 +57,13 @@ pub fn start_container_sync_task(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // 同步缓存状态 - 清理失效的容器记录
+                    // 同步缓存状态 - 清理失效的容器记录（bg_container_sync span：周期任务可观测）
                     debug!("[CONTAINER_SYNC] Syncing container states...");
-                    match runtime.sync_states().await {
+                    match runtime
+                        .sync_states()
+                        .instrument(tracing::info_span!("bg_container_sync"))
+                        .await
+                    {
                         Ok((checked, removed)) => {
                             if !removed.is_empty() {
                                 info!(

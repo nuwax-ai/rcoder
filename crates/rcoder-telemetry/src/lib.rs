@@ -44,6 +44,7 @@ pub mod middleware;
 pub mod otlp;
 pub mod prometheus;
 pub mod propagation;
+pub mod span_metrics;
 pub mod subscriber;
 
 // Re-exports（外部消费面统一走 crate 根路径）
@@ -60,6 +61,7 @@ pub use propagation::{
     extract_context, extract_context_http, inject_context, inject_context_http,
     make_span_with_trace_parent, set_global_propagator,
 };
+pub use span_metrics::SpanMetricRule;
 pub use subscriber::BoxedLayer;
 
 #[cfg(test)]

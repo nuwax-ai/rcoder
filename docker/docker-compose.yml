@@ -12,7 +12,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - RCODER_PORT=${RCODER_PORT:-8090}
-      - RUST_LOG=debug # 设置调试日志级别
+      - RUST_LOG=debug,bollard=info,h2=info,hyper=info,tonic=info # debug 基线 + 收敛三方库噪声（bollard 全量 inspect JSON dump / h2 帧日志）
       # console layer 是 per-layer filter，但静态 level hint 需要全局放行
       # app_manager（UserApp）Docker 模式工作空间根（app-workspace 挂在 /app/app-workspace）；
       # 不设则默认 /app/project_workspace/apps，与挂载点不符，文件管理/storage 会路径错

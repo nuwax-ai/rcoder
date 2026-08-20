@@ -28,6 +28,7 @@ pub(super) struct ComputerForwardParams<'a> {
 
 /// 与 RCoder 的 forward_request_to_container_service 类似，
 /// 但专门用于 ComputerAgentRunner 模式。
+#[instrument(skip_all, fields(user_id = %params.request.user_id))]
 pub(super) async fn forward_computer_request_to_container(
     params: ComputerForwardParams<'_>,
 ) -> HttpResult<ChatResponse> {

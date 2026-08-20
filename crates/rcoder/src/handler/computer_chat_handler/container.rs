@@ -5,7 +5,7 @@
 
 use shared_types::ComputerChatRequest;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::{HttpResult, router::AppState, service::ComputerContainerManager};
 use docker_manager::ContainerBasicInfo;
@@ -23,6 +23,7 @@ use super::helpers::ensure_project_mapping_in_state;
 /// 4. 检测 user_id 变化（负载测试场景告警）
 /// 5. 立即写入存储映射（防止孤立容器清理器误清理）
 /// 6. 更新活动时间
+#[instrument(skip_all, fields(user_id = %user_id, project_id = %project_id))]
 pub(super) async fn ensure_container_ready(
     state: &Arc<AppState>,
     request: &ComputerChatRequest,
@@ -104,6 +105,7 @@ pub(super) async fn ensure_container_ready(
 ///
 /// 返回等待获得的容器信息（若等到了创建完成）；
 /// 返回 None 表示无需等待/等待超时/标记过期，调用方继续自行创建。
+#[instrument(skip_all, fields(user_id = %user_id))]
 async fn wait_for_concurrent_creation(
     state: &Arc<AppState>,
     user_id: &str,
@@ -187,6 +189,7 @@ async fn wait_for_concurrent_creation(
 }
 
 /// 正常创建容器：设置 pod_creating 标记防止并发，创建完成后广播通知
+#[instrument(skip_all, fields(user_id = %user_id, project_id = %project_id))]
 async fn create_container_with_marker(
     state: &Arc<AppState>,
     request: &ComputerChatRequest,
@@ -244,6 +247,7 @@ async fn create_container_with_marker(
 /// 容器 IP 为空时的修复：先清理旧容器再强制重建
 ///
 /// 必须先清理旧容器，否则 create_container 发现同名 "running" 容器会复用它
+#[instrument(skip_all, fields(user_id = %user_id, old_container_id = %container_info.container_id))]
 async fn recreate_container_with_empty_ip(
     state: &Arc<AppState>,
     request: &ComputerChatRequest,

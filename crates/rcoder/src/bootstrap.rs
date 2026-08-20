@@ -88,6 +88,31 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
     #[cfg(feature = "console")]
     let telemetry_config = crate::console_obs::attach(telemetry_config);
 
+    // span 耗时→直方图指标规则：调用点只写 #[instrument]，耗时指标由
+    // SpanMetricsLayer 自动记录（span 即计时事实源，零 Instant 侵入）
+    let telemetry_config = telemetry_config.with_span_metric_rules(vec![
+        rcoder_telemetry::SpanMetricRule {
+            span_name: "forward_chat",
+            metric: rcoder_telemetry::prometheus::GRPC_REQUEST_DURATION_SECONDS,
+            label: ("method", "chat"),
+        },
+        rcoder_telemetry::SpanMetricRule {
+            span_name: "grpc_dial",
+            metric: rcoder_telemetry::prometheus::GRPC_REQUEST_DURATION_SECONDS,
+            label: ("method", "dial"),
+        },
+        rcoder_telemetry::SpanMetricRule {
+            span_name: "ensure_container_ready",
+            metric: rcoder_telemetry::prometheus::CONTAINER_ENSURE_DURATION_SECONDS,
+            label: ("op", "ensure"),
+        },
+        rcoder_telemetry::SpanMetricRule {
+            span_name: "sse_subscribe",
+            metric: rcoder_telemetry::prometheus::SSE_SUBSCRIPTION_DURATION_SECONDS,
+            label: ("kind", "client"),
+        },
+    ]);
+
     // tracing-flame 火焰图（flame feature；RCODER_FLAME=输出路径 启用）
     // shadowing 绑定（同 console_obs 模式——多 feature 组合时 immutable 冲突）
     // 空路径视为关闭（compose 以 RCODER_FLAME=${RCODER_FLAME:-} 透传时，未设置

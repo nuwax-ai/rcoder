@@ -12,7 +12,7 @@ use super::session_stream_registry::{
 };
 use shared_types::{SessionMessageType, UnifiedSessionMessage};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 /// 创建基于 gRPC 的 SSE 代理流
 ///
@@ -51,11 +51,33 @@ pub async fn create_grpc_sse_stream(
 {
     let (tx, rx) = tokio::sync::mpsc::channel(100);
 
+    // SSE 在线订阅 gauge（RAII：spawn 的任务被 abort / 任何 return 路径都会 -1）
+    struct SubscriptionGuard;
+    impl SubscriptionGuard {
+        fn new() -> Self {
+            rcoder_telemetry::prometheus::inc_sse_subscription();
+            SubscriptionGuard
+        }
+    }
+    impl Drop for SubscriptionGuard {
+        fn drop(&mut self) {
+            rcoder_telemetry::prometheus::dec_sse_subscription();
+        }
+    }
+
     // 每个 HTTP SSE 请求一条独立的 agent_runner SubscribeProgress 订阅（纯转发，
     // agent_runner 唯一真源）：回放由订阅参数表达——带游标增量 / 首连全量兜
     // chat→SSE 时间差 / 中间连接 live-only（不重放，防重复红线）。
-    tokio::spawn(async move {
-        let is_first_client = registry.claim_first_client(&session_id);
+    // span 覆盖订阅任务整个生命周期（订阅 = 长等待，火焰图墙钟大头）。
+    let sse_span = tracing::info_span!(
+        "sse_subscribe",
+        session_id = %session_id,
+        addr = %grpc_addr
+    );
+    tokio::spawn(
+        async move {
+            let _subscription = SubscriptionGuard::new();
+            let is_first_client = registry.claim_first_client(&session_id);
         let mut client_last_seq = last_seq;
         let initial_from = if last_seq > 0 {
             last_seq
@@ -201,8 +223,10 @@ pub async fn create_grpc_sse_stream(
                     }
                 }
             }
+            }
         }
-    });
+        .instrument(sse_span),
+    );
 
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }

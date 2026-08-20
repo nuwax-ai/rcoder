@@ -237,6 +237,7 @@ pub(crate) fn init_tracing_subscriber(
     extra_layer: Option<BoxedLayer>,
     tokio_console_layer: Option<BoxedLayer>,
     flame_config: Option<&crate::config::FlameConfig>,
+    span_metrics: Vec<crate::span_metrics::SpanMetricRule>,
 ) -> Result<Option<FlameGuard>> {
     use opentelemetry::trace::TracerProvider;
 
@@ -355,6 +356,7 @@ pub(crate) fn init_tracing_subscriber(
     let registry = tracing_subscriber::registry()
         .with(stack_boxed_layers(extra_layer, tokio_console_layer))
         .with(TraceIdExtractor)
+        .with(crate::span_metrics::SpanMetricsLayer::new(span_metrics))
         .with(env_filter)
         .with(console_layer)
         .with(file_layer)
@@ -364,6 +366,7 @@ pub(crate) fn init_tracing_subscriber(
     let registry = tracing_subscriber::registry()
         .with(stack_boxed_layers(extra_layer, tokio_console_layer))
         .with(TraceIdExtractor)
+        .with(crate::span_metrics::SpanMetricsLayer::new(span_metrics))
         .with(env_filter)
         .with(console_layer)
         .with(file_layer)
