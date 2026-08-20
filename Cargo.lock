@@ -6835,6 +6835,7 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "futures 0.3.34",
  "http",
  "http-body",
@@ -6844,6 +6845,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "pin-project-lite",
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
