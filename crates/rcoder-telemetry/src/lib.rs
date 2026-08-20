@@ -3,8 +3,9 @@
 //! 提供统一的遥测功能，包括：
 //! - **OTLP Tracing**: 分布式追踪，支持 Jaeger/OTLP Collector
 //! - **Prometheus Metrics**: HTTP/gRPC 请求指标、业务指标
-//! - **Trace Propagation**: 跨服务 trace context 传播
+//! - **Trace Propagation**: 跨服务 trace context 传播（含 W3C traceparent 入站提取）
 //! - **Console & File Logging**: 控制台和文件日志输出
+//! - **tokio-console 观测**: 本地开发 feature（`console`，使用方 crate 定义）
 //!
 //! # 快速开始
 //!
@@ -37,13 +38,18 @@
 //! | `RUST_LOG` | 日志级别过滤 | `info` |
 
 pub mod config;
+pub mod guard;
+pub mod init;
 pub mod middleware;
 pub mod otlp;
 pub mod prometheus;
 pub mod propagation;
+pub mod subscriber;
 
-// Re-exports
+// Re-exports（外部消费面统一走 crate 根路径）
 pub use config::{FileLogConfig, OtlpConfig, PrometheusConfig, TelemetryConfig};
+pub use guard::TelemetryGuard;
+pub use init::{init, init_prometheus_only};
 pub use middleware::{GrpcMetricsInterceptor, HttpMetricsLayer};
 pub use prometheus::{
     dec_active_tasks, inc_active_tasks, record_agent_task, record_agent_task_duration,
@@ -54,299 +60,18 @@ pub use propagation::{
     extract_context, extract_context_http, inject_context, inject_context_http,
     make_span_with_trace_parent, set_global_propagator,
 };
-
-use anyhow::Result;
-use metrics_exporter_prometheus::PrometheusHandle;
-use opentelemetry_sdk::trace::SdkTracerProvider;
-use tracing::info;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_appender::rolling::Rotation;
-use tracing_subscriber::{
-    EnvFilter, Layer, filter::filter_fn, fmt, layer::SubscriberExt, registry::Registry,
-    util::SubscriberInitExt,
-};
-
-/// 类型擦除的 tracing layer（用于跨 crate 注入额外日志层）。
-pub type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
-
-/// 遥测系统 Guard
-///
-/// 持有遥测资源的生命周期，Drop 时自动清理。
-/// 同时提供 Prometheus 指标渲染功能。
-pub struct TelemetryGuard {
-    /// OTLP TracerProvider（可选）
-    tracer_provider: Option<SdkTracerProvider>,
-    /// Prometheus Handle（可选）
-    prometheus_handle: Option<PrometheusHandle>,
-    /// 服务名称
-    service_name: String,
-    /// 额外 layer 关联的 WorkerGuard（如 file-server 独立日志的 non_blocking guard）
-    _extra_layer_guard: Option<WorkerGuard>,
-}
-
-impl TelemetryGuard {
-    /// 渲染 Prometheus 指标
-    ///
-    /// 返回 Prometheus 文本格式的指标数据，
-    /// 可直接作为 `/metrics` 端点的响应。
-    ///
-    /// # Returns
-    ///
-    /// 如果 Prometheus 已启用，返回 `Some(metrics_text)`；
-    /// 否则返回 `None`。
-    pub fn render_metrics(&self) -> Option<String> {
-        self.prometheus_handle.as_ref().map(|h| h.render())
-    }
-
-    /// 检查 OTLP 是否已启用
-    pub fn is_otlp_enabled(&self) -> bool {
-        self.tracer_provider.is_some()
-    }
-
-    /// 检查 Prometheus 是否已启用
-    pub fn is_prometheus_enabled(&self) -> bool {
-        self.prometheus_handle.is_some()
-    }
-
-    /// 获取服务名称
-    pub fn service_name(&self) -> &str {
-        &self.service_name
-    }
-}
-
-impl Drop for TelemetryGuard {
-    fn drop(&mut self) {
-        if self.tracer_provider.is_some() {
-            otlp::shutdown_tracer_provider();
-        }
-        info!(
-            "[Telemetry] Telemetry system shutdown: {}",
-            self.service_name
-        );
-    }
-}
-
-/// 一键Initializing telemetry system
-///
-/// 根据配置初始化完整的遥测栈：
-/// - **Console 日志**: 始终启用，输出到标准输出
-/// - **OTLP Tracing**: 如果配置了 OTLP 端点，将 span 导出到 Jaeger/Collector
-/// - **Prometheus Metrics**: 如果启用，提供 `/metrics` 端点数据
-///
-/// # Arguments
-///
-/// * `config` - 遥测配置
-///
-/// # Returns
-///
-/// 返回 `TelemetryGuard`，持有遥测资源的生命周期。
-///
-/// # Example
-///
-/// ```no_run
-/// use rcoder_telemetry::{TelemetryConfig, init};
-///
-/// #[tokio::main]
-/// async fn main() -> anyhow::Result<()> {
-///     let config = TelemetryConfig::new("my-service")
-///         .with_otlp_endpoint("http://jaeger:4317")
-///         .with_prometheus();
-///
-///     let telemetry = init(config).await?;
-///
-///     // 应用逻辑...
-///
-///     Ok(())
-/// }
-/// ```
-pub async fn init(mut config: TelemetryConfig) -> Result<TelemetryGuard> {
-    // 设置全局传播器（在初始化 subscriber 之前）
-    set_global_propagator();
-
-    // 初始化 OTLP（如果配置了）
-    let tracer_provider = if let Some(ref otlp_config) = config.otlp {
-        let provider = otlp::init_tracer_provider(otlp_config, &config.service_name).await?;
-        otlp::set_global_tracer_provider(provider.clone());
-        Some(provider)
-    } else {
-        None
-    };
-
-    // Initializing Prometheus（如果配置了）
-    let prometheus_handle = if config.prometheus.is_some() {
-        Some(prometheus::init_prometheus()?)
-    } else {
-        None
-    };
-
-    // 🆕 初始化 tracing subscriber（包括控制台、文件、OpenTelemetry、额外 layer）
-    let has_extra_layer = config.extra_layer.is_some(); // take 前记，供下方启动日志使用
-    let extra_layer = config.extra_layer.take();
-    init_tracing_subscriber(
-        &config.service_name,
-        tracer_provider.as_ref(),
-        config.file_log.as_ref(),
-        extra_layer,
-    )?;
-
-    info!(
-        "[Telemetry] Initializing telemetry system: {}",
-        config.service_name
-    );
-    info!(
-        "✅ [Telemetry] Telemetry system initialization completed: OTLP={}, Prometheus={}, FileLog={}, ExtraLayer={}, Console=true",
-        tracer_provider.is_some(),
-        prometheus_handle.is_some(),
-        config.file_log.is_some(),
-        has_extra_layer
-    );
-
-    Ok(TelemetryGuard {
-        tracer_provider,
-        prometheus_handle,
-        service_name: config.service_name,
-        _extra_layer_guard: config.extra_layer_guard.take(),
-    })
-}
-
-/// 初始化 tracing subscriber
-///
-/// 配置以下层：
-/// - EnvFilter: 基于 RUST_LOG 环境变量的日志级别过滤
-/// - Console Layer: 控制台日志输出（deny `file_server` target，独立写入 file-server.log）
-/// - File Layer: 可选的文件日志输出（JSON 格式，按天滚动，deny `file_server` target）
-/// - OpenTelemetry Layer: 如果提供了 TracerProvider，将 span 发送到 OTLP
-/// - Extra Layer: 可选的外部注入 layer（如 file-server 独立日志，per-layer filter 独立过滤）
-fn init_tracing_subscriber(
-    service_name: &str,
-    tracer_provider: Option<&SdkTracerProvider>,
-    file_log_config: Option<&FileLogConfig>,
-    extra_layer: Option<BoxedLayer>,
-) -> Result<()> {
-    use opentelemetry::trace::TracerProvider;
-
-    // 创建 EnvFilter（支持 RUST_LOG 环境变量）
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // 默认日志级别
-        format!(
-            "{}=debug,tower_http=debug,axum=info,hyper=info,tonic=info",
-            service_name.replace('-', "_")
-        )
-        .into()
-    });
-
-    // 创建控制台日志层（deny file_server → file-server 日志不进 rcoder console）
-    let console_layer = fmt::layer()
-        .with_target(true)
-        .with_ansi(true)
-        .with_thread_ids(false)
-        .with_file(false)
-        .with_line_number(false)
-        .with_filter(filter_fn(|meta: &tracing::Metadata<'_>| {
-            !meta.target().starts_with("file_server")
-        }));
-
-    // 创建文件日志层（deny file_server → file-server 日志不进 rcoder.log）
-    let file_layer = if let Some(file_config) = file_log_config {
-        // 创建日志目录
-        if !file_config.directory.exists() {
-            std::fs::create_dir_all(&file_config.directory)?;
-        }
-
-        // 创建按天滚动的 appender
-        let file_appender = tracing_appender::rolling::Builder::new()
-            .rotation(Rotation::DAILY)
-            .filename_prefix(&file_config.filename_prefix)
-            .max_log_files(file_config.max_log_files)
-            .build(&file_config.directory)?;
-
-        let deny_fs =
-            filter_fn(|meta: &tracing::Metadata<'_>| !meta.target().starts_with("file_server"));
-
-        if file_config.json_format {
-            // JSON 格式文件日志
-            Some(
-                fmt::layer()
-                    .json()
-                    .with_writer(file_appender)
-                    .with_ansi(false)
-                    .with_target(true)
-                    .with_thread_ids(true)
-                    .with_thread_names(true)
-                    .with_filter(deny_fs)
-                    .boxed(),
-            )
-        } else {
-            // 纯文本格式文件日志
-            Some(
-                fmt::layer()
-                    .with_writer(file_appender)
-                    .with_ansi(false)
-                    .with_target(true)
-                    .with_filter(deny_fs)
-                    .boxed(),
-            )
-        }
-    } else {
-        None
-    };
-
-    // OTLP layer（可选）
-    let otel_layer = tracer_provider.map(|provider| {
-        let tracer = provider.tracer(service_name.to_string());
-        tracing_opentelemetry::layer().with_tracer(tracer)
-    });
-
-    // 构建完整 subscriber 链：
-    // extra_layer 先注入到 Registry 上（Box<dyn Layer<Registry>> 直接匹配 Registry），
-    // 然后 env_filter（全局过滤）、console/file（deny file_server）、otel
-    tracing_subscriber::registry()
-        .with(extra_layer)
-        .with(env_filter)
-        .with(console_layer)
-        .with(file_layer)
-        .with(otel_layer)
-        .init();
-
-    Ok(())
-}
-
-/// 仅Initializing Prometheus（不初始化 OTLP 和 tracing）
-///
-/// 适用于只需要 metrics 不需要 tracing 的场景。
-/// **注意**：此函数不会初始化 tracing subscriber，调用方需要自行初始化。
-pub fn init_prometheus_only(service_name: impl Into<String>) -> Result<TelemetryGuard> {
-    let service_name = service_name.into();
-    info!("[Telemetry] Initializing Prometheus: {}", service_name);
-
-    let prometheus_handle = prometheus::init_prometheus()?;
-
-    Ok(TelemetryGuard {
-        tracer_provider: None,
-        prometheus_handle: Some(prometheus_handle),
-        service_name,
-        _extra_layer_guard: None,
-    })
-}
+pub use subscriber::BoxedLayer;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_config_from_env() {
-        let config = TelemetryConfig::from_env("test-service");
-        assert_eq!(config.service_name, "test-service");
-    }
-
-    #[test]
-    fn test_config_builder() {
-        let config = TelemetryConfig::new("my-service")
-            .with_otlp_endpoint("http://localhost:4317")
-            .with_prometheus();
-
-        assert_eq!(config.service_name, "my-service");
-        assert!(config.otlp.is_some());
-        assert!(config.prometheus.is_some());
+    fn reexports_complete() {
+        // 门面完整性：核心类型经根路径可用（编译期检查）
+        fn assert_types(_: &TelemetryConfig, _: Option<BoxedLayer>) {}
+        let cfg = TelemetryConfig::from_env("facade-smoke");
+        assert_types(&cfg, None);
+        assert_eq!(cfg.service_name, "facade-smoke");
     }
 }
