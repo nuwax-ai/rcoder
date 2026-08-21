@@ -285,10 +285,9 @@ fn make_relative_posix(root: &Path, entry: &dua_core::Entry) -> String {
     let root_trimmed = root_str.trim_end_matches('/');
     // parent==root（根级条目）→ rel 空; parent=root/sub → "sub"; 非 root 前缀
     // （customTargetDir 等场景）→ 退化为绝对路径去前导斜杠。
-    let rel = if parent.starts_with(root_trimmed) {
-        parent[root_trimmed.len()..].trim_start_matches('/')
-    } else {
-        parent.trim_start_matches('/')
+    let rel = match parent.strip_prefix(root_trimmed) {
+        Some(rest) => rest.trim_start_matches('/'),
+        None => parent.trim_start_matches('/'),
     };
     let name = entry.file_name.to_string_lossy();
     let joined = if rel.is_empty() {

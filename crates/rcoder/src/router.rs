@@ -997,28 +997,32 @@ mod openapi_tests {
         }
     }
 
-    /// file-server 文档与主文档聚合在同一 Swagger UI（`create_swagger_ui`），
-    /// 此处锁定聚合的关键路径：UserApp workspace 打包链 + 项目创建入口。
+    /// file-server 文档**全量**聚合进 rcoder Swagger UI（`create_swagger_ui` 挂完整
+    /// openapi.json, 无裁剪）。此测试锁定聚合链路活着: 语义锚点 + 动态下限——
+    /// 逐条路径清单由 file-server 自己的 openapi 测试（总数 + contains_key）锁定,
+    /// 这里不重复维护; file-server 增删接口时下限断言自动跟随。
     #[test]
     fn file_server_document_covers_userapp_and_project_paths() {
         let document =
             file_server::openapi::document(file_server::routes::api_router().into_openapi());
-        let paths = document.paths.paths;
+        let paths = &document.paths.paths;
+        // 锚点: 项目创建入口 + UserApp 打包链 (跨域语义关键路径)
         for path in [
             "/api/project/create-project",
             "/api/userapp/build",
             "/api/userapp/projects/detect",
-            "/api/userapp/projects/confirm",
-            "/api/userapp/init-project-template",
-            "/api/userapp/get-file-list",
-            "/api/userapp/execute-command",
-            "/api/userapp/push-skills-to-workspace",
         ] {
             assert!(
                 paths.contains_key(path),
                 "file-server OpenAPI path missing: {path}"
             );
         }
+        let userapp_count = paths
+            .keys()
+            .filter(|p| p.starts_with("/api/userapp/"))
+            .count();
+        assert!(paths.len() >= 90, "聚合文档路径总数异常: {}", paths.len());
+        assert!(userapp_count >= 20, "userapp 路径数异常: {userapp_count}");
     }
 
     /// HTTP 层验证：两份 openapi.json 均由 Swagger UI 路由实际提供服务。
