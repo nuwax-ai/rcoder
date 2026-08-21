@@ -24,6 +24,12 @@ pub(super) struct ComputerForwardParams<'a> {
     pub(super) cluster_domain: &'a str,
     /// 容器运行时(连接失败时诊断 pod 真实根因)
     pub(super) runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
+    /// 目标容器类型（决定 agent_runner 侧 work_dir 定位与诊断通道）：
+    /// 普通对话 = ComputerAgentRunner；userApp 开发对话 = UserAppBuilder
+    pub(super) service_type: shared_types::ServiceType,
+    /// 诊断通道的容器 identifier（container_identifier 语义：
+    /// ComputerAgentRunner=user_id；UserAppBuilder=app_id）
+    pub(super) diagnostic_identifier: String,
 }
 
 /// 与 RCoder 的 forward_request_to_container_service 类似，
@@ -98,7 +104,7 @@ pub(super) async fn forward_computer_request_to_container(
             system_prompt: request.system_prompt.clone(),
             user_prompt: request.user_prompt.clone(),
             agent_config: request.agent_config.clone(),
-            service_type: Some(shared_types::ServiceType::ComputerAgentRunner),
+            service_type: Some(params.service_type.clone()),
             user_id: Some(request.user_id.clone()),
             is_devcomputer: params.is_devcomputer,
             agent_work_dir: request.agent_work_dir.clone(),
@@ -113,8 +119,8 @@ pub(super) async fn forward_computer_request_to_container(
             // 连接失败时诊断 pod 根因(OOM/CrashLoop/缺失)+ 智能等待 ready
             diagnostic: Some(crate::handler::chat_forward::DiagnosticCtx {
                 runtime: params.runtime,
-                identifier: params.request.user_id.clone(),
-                service_type: shared_types::ServiceType::ComputerAgentRunner,
+                identifier: params.diagnostic_identifier.clone(),
+                service_type: params.service_type.clone(),
             }),
         },
     )

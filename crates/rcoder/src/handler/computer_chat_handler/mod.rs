@@ -125,6 +125,9 @@ pub(crate) async fn handle_computer_chat_internal(
     }
 }
 
+/// userApp 开发对话的 service_type 标记值（`X-Service-Type` 同款词表）。
+const SERVICE_TYPE_USERAPP: &str = "userapp";
+
 /// Computer Chat 阶段编排（入口只留编排，各阶段见子模块）
 async fn run_computer_chat_flow(
     state: Arc<AppState>,
@@ -134,6 +137,16 @@ async fn run_computer_chat_flow(
 ) -> Result<HttpResult<ChatResponse>, ChatFlowExit> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
+
+    // userApp 开发对话分支：service_type=userapp → 该 app 的 UserAppBuilder 开发容器
+    // （ACP agent 直接在开发卷 workspace 工作，代码生成直接落卷）
+    if request
+        .service_type
+        .as_deref()
+        .is_some_and(|v| v.trim() == SERVICE_TYPE_USERAPP)
+    {
+        return run_userapp_dev_chat_flow(state, locale, request, is_devcomputer).await;
+    }
 
     // 1~3. 请求校验与路由解析（user_id / 隔离参数 / project_id / work_dir_id / 资源限制）
     let (project_id, work_dir_id) = validation::validate_and_prepare_request(&mut request, locale)?;
@@ -179,6 +192,8 @@ async fn run_computer_chat_flow(
         namespace: &state.config.app_manager.namespace,
         cluster_domain: &state.cluster_domain,
         runtime: state.runtime(),
+        service_type: shared_types::ServiceType::ComputerAgentRunner,
+        diagnostic_identifier: user_id.clone(),
     };
     let result = forward::forward_computer_request_to_container(forward_params).await;
 
@@ -190,6 +205,7 @@ async fn run_computer_chat_flow(
         &project_id,
         &container_info,
         &request,
+        &shared_types::ServiceType::ComputerAgentRunner,
     )
     .await?;
 
@@ -201,6 +217,155 @@ async fn run_computer_chat_flow(
     }
 
     Ok(result)
+}
+
+/// userApp 开发对话流程：project_id 必填=app_id，容器=该 app 的 UserAppBuilder
+/// 开发容器（per-app），workspace={USERAPP_WORKSPACE_DIR}/{app_id}（容器内）。
+///
+/// 与普通 computer 链路的差异：
+/// - 容器 ensure 走 `ensure_userapp_builder`（幂等，注册 state.projects 防孤立清理）
+/// - workspace 目录由容器内 file-server `ensure-workspace` 幂等创建（rcoder 无共享卷）
+/// - 跳过 VNC 注册（开发容器无桌面代理需求；devapps 可代理任意端口兜底）
+/// - 跳过 agent 自动安装（UserAppBuilder 安装策略 None）
+/// - gRPC service_type=UserAppBuilder → agent_runner work_dir 命中开发卷分支
+async fn run_userapp_dev_chat_flow(
+    state: Arc<AppState>,
+    locale: &'static str,
+    request: ComputerChatRequest,
+    is_devcomputer: bool,
+) -> Result<HttpResult<ChatResponse>, ChatFlowExit> {
+    // 1. 校验：user_id 必填 + project_id 必填（=app_id，不自动生成——app 语义明确）
+    if request.user_id.trim().is_empty() {
+        return Err(ChatFlowExit::Response(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_VALIDATION,
+            locale,
+        )));
+    }
+    let project_id = match request.project_id.as_deref() {
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+        _ => {
+            return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                "project_id (= app_id) is required for userApp dev chat",
+            )));
+        }
+    };
+    if let Err(e) = shared_types::validate_identifier(&project_id, "project_id") {
+        return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+            shared_types::error_codes::ERR_VALIDATION,
+            locale,
+            &e,
+        )));
+    }
+    let work_dir_id = project_id.clone();
+    let user_id = request.user_id.clone();
+    info!(
+        "🚀 [USERAPP_DEV_CHAT] user_id={}, app_id={}, session_id={:?}, prompt_len={}",
+        user_id,
+        project_id,
+        request.session_id,
+        request.prompt.len()
+    );
+
+    // 2. 容器 ensure（幂等；注册 state.projects）+ 活动时间刷新（防对话中被闲置回收）
+    let container_info =
+        crate::userapp_publish::agent_runner::ensure_userapp_builder(&state, &project_id)
+            .await
+            .map_err(|e| {
+                error!(
+                    "❌ [USERAPP_DEV_CHAT] ensure dev container failed: app_id={}: {e:#}",
+                    project_id
+                );
+                ChatFlowExit::Response(HttpResult::error_with_locale(
+                    shared_types::error_codes::ERR_CONTAINER_ERROR,
+                    locale,
+                ))
+            })?;
+    state.update_activity(&project_id);
+
+    // 3. workspace 就绪（容器内幂等建目录）
+    ensure_dev_workspace(&state, &container_info, &project_id, &user_id, locale).await?;
+
+    // 4. Agent 状态探活 + session 解析（复用 computer 实现，按 project_id 映射通用）
+    session::probe_agent_status(&state, &container_info, &project_id, locale).await;
+    let request_for_forward = session::resolve_forward_request(&state, &request, &project_id);
+
+    // 5. gRPC 转发（service_type=UserAppBuilder → agent_runner 开发卷 work_dir）
+    let forward_params = forward::ComputerForwardParams {
+        request: &request_for_forward,
+        project_id: &project_id,
+        work_dir_id: &work_dir_id,
+        container_info: &container_info,
+        grpc_pool: &state.grpc_pool,
+        locale,
+        is_devcomputer,
+        namespace: &state.config.app_manager.namespace,
+        cluster_domain: &state.cluster_domain,
+        runtime: state.runtime(),
+        service_type: shared_types::ServiceType::UserAppBuilder,
+        diagnostic_identifier: project_id.clone(),
+    };
+    let result = forward::forward_computer_request_to_container(forward_params).await;
+
+    // 6. 会话映射更新（service_type=UserAppBuilder；session→project 映射供 SSE/会话族接口路由）
+    session::update_session_mappings_after_response(
+        &state,
+        &result,
+        &user_id,
+        &project_id,
+        &container_info,
+        &request,
+        &shared_types::ServiceType::UserAppBuilder,
+    )
+    .await?;
+
+    if !result.is_success() && result.data.as_ref().is_none_or(|d| d.session_id.is_empty()) {
+        error!(
+            "❌ [USERAPP_DEV_CHAT] Container service returned error (no session_id): app_id={}, code={}, message={}",
+            project_id, result.code, result.message
+        );
+    }
+
+    Ok(result)
+}
+
+/// 容器内幂等建 workspace 目录（file-server `ensure-workspace`）。
+async fn ensure_dev_workspace(
+    state: &AppState,
+    container_info: &ContainerBasicInfo,
+    app_id: &str,
+    user_id: &str,
+    locale: &'static str,
+) -> Result<(), ChatFlowExit> {
+    use crate::userapp_publish::agent_runner::dev_file_server_addr;
+    let addr = dev_file_server_addr(state, container_info);
+    let resp = crate::http_client::shared_client()
+        .post(format!("{addr}/api/userapp/ensure-workspace"))
+        .json(&serde_json::json!({"appId": app_id, "userId": user_id}))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            error!(
+                "❌ [USERAPP_DEV_CHAT] ensure-workspace returned {status}: app_id={app_id}: {text}"
+            );
+            Err(ChatFlowExit::Response(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                locale,
+            )))
+        }
+        Err(e) => {
+            error!("❌ [USERAPP_DEV_CHAT] ensure-workspace request failed: app_id={app_id}: {e}");
+            Err(ChatFlowExit::Response(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                locale,
+            )))
+        }
+    }
 }
 
 // computer_chat_handler 目录化：按阶段拆分子模块

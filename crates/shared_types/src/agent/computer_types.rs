@@ -22,8 +22,19 @@ pub struct ComputerChatRequest {
 
     /// 项目 ID (可选) - 一个容器内可以有多个项目
     /// 若未提供，系统自动生成 UUID
+    /// userApp 开发对话场景（service_type=userapp）下必填且等于 app_id
+    /// （路由到该 app 的 UserAppBuilder 开发容器）
     #[schema(example = "proj_456")]
     pub project_id: Option<String>,
+
+    /// userApp 开发对话标记（可选，默认 None = 普通 computer 沙箱对话）。
+    ///
+    /// 值 `userapp`：本请求路由到该 app（project_id）的 UserAppBuilder 开发容器，
+    /// ACP agent 直接在开发卷 workspace（`{USERAPP_WORKSPACE_DIR}/{app_id}`）上
+    /// 工作，生成的代码直接落卷。仅开发阶段传；部署后无对话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "userapp")]
+    pub service_type: Option<String>,
 
     /// 用户输入的 prompt
     #[schema(example = "帮我打开浏览器访问 https://example.com")]

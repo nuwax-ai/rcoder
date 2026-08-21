@@ -111,8 +111,19 @@ pub async fn computer_agent_stop(
         user_id, pod_id, project_id, request.session_id
     );
 
-    // 2. 查找容器（根据 user_id 或 pod_id）
-    let container_info = if has_user_id {
+    // 2. 查找容器：project 映射优先（computer 与 userApp 开发对话都注册映射，
+    //    UserAppBuilder 开发容器仅存在于映射——user_id/pod_id 的 computer 查找
+    //    覆盖不了它）；映射 miss 再按 user_id/pod_id 走 computer 容器查找
+    let container_info = if let Some(mapped) = state
+        .get_project(project_id)
+        .and_then(|p| p.container_info())
+    {
+        info!(
+            "📦 [COMPUTER_STOP] Container resolved from project mapping: project_id={}, container_id={}",
+            project_id, mapped.container_id
+        );
+        Some(mapped)
+    } else if has_user_id {
         let uid = user_id
             .as_ref()
             .ok_or_else(|| AppError::validation_error("user_id is required"))?;

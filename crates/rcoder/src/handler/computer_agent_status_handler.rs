@@ -139,49 +139,64 @@ pub async fn computer_agent_status(
         identifier_display, project_id
     );
 
-    // 2. 查询容器信息（通过 Runtime）
-    // 获取容器标识符（user_id 或 pod_id）
-    let identifier = request.user_id.clone().or(request.pod_id.clone());
-    let identifier_str = identifier.as_deref().unwrap_or("");
-
-    // 获取容器信息（ComputerAgentRunner 使用 user_id 或 pod_id 作为容器标识）
-    let container_info = match state
-        .runtime()
-        .get_container_info_by_identifier(
-            identifier_str,
-            &shared_types::ServiceType::ComputerAgentRunner,
-        )
-        .await
-    {
-        Ok(Some(info)) => info,
-        Ok(None) => {
+    // 2. 查询容器信息：project 映射优先（userApp 开发对话的 UserAppBuilder 开发
+    //    容器仅存在于映射；computer 老场景也必注册映射）；miss 再按 user_id/pod_id
+    //    走 ComputerAgentRunner 查找
+    let mapped_container = state
+        .get_project(project_id)
+        .and_then(|p| p.container_info());
+    let container_info = match mapped_container {
+        Some(info) => {
             info!(
-                "📭 [COMPUTER_AGENT_STATUS] Container not found: identifier={}",
-                identifier_str
+                "📦 [COMPUTER_AGENT_STATUS] Container resolved from project mapping: project_id={}, container_id={}",
+                project_id, info.container_id
             );
-            // Early return: 直接 move request 的字段
-            return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
-                request.user_id.clone(),
-                project_id.to_string(),
-            )));
+            info
         }
-        Err(e) => {
-            error!(
-                "❌ [COMPUTER_AGENT_STATUS] Failed to query container info: identifier={}, error={}",
-                identifier_str, e
-            );
-            return Err(AppError::internal_server_error(&format!(
-                "Failed to query container info: {}",
-                e
-            )));
+        None => {
+            // 获取容器标识符（user_id 或 pod_id）
+            let identifier = request.user_id.clone().or(request.pod_id.clone());
+            let identifier_str = identifier.as_deref().unwrap_or("");
+
+            // 获取容器信息（ComputerAgentRunner 使用 user_id 或 pod_id 作为容器标识）
+            match state
+                .runtime()
+                .get_container_info_by_identifier(
+                    identifier_str,
+                    &shared_types::ServiceType::ComputerAgentRunner,
+                )
+                .await
+            {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    info!(
+                        "📭 [COMPUTER_AGENT_STATUS] Container not found: identifier={}",
+                        identifier_str
+                    );
+                    // Early return: 直接 move request 的字段
+                    return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(
+                        request.user_id.clone(),
+                        project_id.to_string(),
+                    )));
+                }
+                Err(e) => {
+                    error!(
+                        "❌ [COMPUTER_AGENT_STATUS] Failed to query container info: identifier={}, error={}",
+                        identifier_str, e
+                    );
+                    return Err(AppError::internal_server_error(&format!(
+                        "Failed to query container info: {}",
+                        e
+                    )));
+                }
+            }
         }
     };
-
     // 3. 检查容器是否运行中
     if container_info.status != "running" {
         info!(
             "⚠️ [COMPUTER_AGENT_STATUS] Container not running: identifier={}, status={}",
-            identifier_str, container_info.status
+            identifier_display, container_info.status
         );
         // Early return: 直接 move request 的字段
         return Ok(HttpResult::success(ComputerAgentStatusResponse::not_alive(

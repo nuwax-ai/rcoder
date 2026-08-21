@@ -241,6 +241,7 @@ pub(super) async fn update_session_mappings_after_response(
     project_id: &str,
     container_info: &ContainerBasicInfo,
     request: &ComputerChatRequest,
+    container_service_type: &shared_types::ServiceType,
 ) -> Result<(), AppError> {
     let Some(chat_response) = &result.data else {
         return Ok(());
@@ -261,31 +262,37 @@ pub(super) async fn update_session_mappings_after_response(
         result.is_success()
     );
 
-    // 从 Runtime API 获取最新容器信息，避免使用过期 IP
+    // 从 Runtime API 获取最新容器信息，避免使用过期 IP。
+    // 查找 identifier：ComputerAgentRunner=user_id（per-user 容器）；
+    // UserAppBuilder=project_id（userApp 开发对话的 per-app 开发容器）
+    let lookup_identifier = match container_service_type {
+        shared_types::ServiceType::UserAppBuilder => project_id,
+        _ => user_id,
+    };
     let container_info = match state
         .runtime()
-        .get_container_info_by_identifier(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+        .get_container_info_by_identifier(lookup_identifier, container_service_type)
         .await
     {
         Ok(Some(info)) => {
             info!(
-                "🔄 [COMPUTER_CHAT] Getting latest container info from Runtime API: user_id={}, container_id={}, container_ip={}",
-                user_id, info.container_id, info.container_ip
+                "🔄 [COMPUTER_CHAT] Getting latest container info from Runtime API: identifier={}, container_id={}, container_ip={}",
+                lookup_identifier, info.container_id, info.container_ip
             );
             info
         }
         Ok(None) => {
             warn!(
-                "⚠️ [COMPUTER_CHAT] Container not found in runtime: user_id={}, using cached container info",
-                user_id
+                "⚠️ [COMPUTER_CHAT] Container not found in runtime: identifier={}, using cached container info",
+                lookup_identifier
             );
             // 使用之前获取的容器信息
             container_info.clone()
         }
         Err(e) => {
             warn!(
-                "⚠️ [COMPUTER_CHAT] Failed to get container info from runtime: user_id={}, error={}, using cached container info",
-                user_id, e
+                "⚠️ [COMPUTER_CHAT] Failed to get container info from runtime: identifier={}, error={}, using cached container info",
+                lookup_identifier, e
             );
             // 使用之前获取的容器信息
             container_info.clone()
@@ -311,7 +318,7 @@ pub(super) async fn update_session_mappings_after_response(
             Some(container_info.clone()),
             request.model_provider.clone(),
             request.request_id.clone(),
-            Some(shared_types::ServiceType::ComputerAgentRunner),
+            Some(container_service_type.clone()),
         );
 
         // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态。
@@ -351,7 +358,7 @@ pub(super) async fn update_session_mappings_after_response(
             Some(container_info.clone()),
             request.model_provider.clone(),
             request.request_id.clone(),
-            Some(shared_types::ServiceType::ComputerAgentRunner),
+            Some(container_service_type.clone()),
         );
         project_info.set_scope(
             request.tenant_id.clone(),
