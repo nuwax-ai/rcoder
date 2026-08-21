@@ -234,7 +234,7 @@ pub fn build_http_addr(
 // === gRPC 超时配置 ===
 
 /// gRPC 连接超时（秒）
-pub const GRPC_CONNECT_TIMEOUT_SECS: u64 = 10;
+pub const GRPC_CONNECT_TIMEOUT_SECS: u64 = 3;
 
 /// gRPC 消息大小限制（字节）
 ///

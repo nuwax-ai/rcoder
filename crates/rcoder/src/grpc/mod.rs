@@ -7,6 +7,7 @@ pub mod chat_client;
 pub mod converters;
 pub mod error;
 pub mod locale_metadata;
+pub mod port_ready;
 pub mod session_stream_registry;
 pub mod sse_stream;
 

@@ -5,8 +5,8 @@
 //! 可重试错误清池重试 / 不可重试错误终止）。本模块将其收敛为单一实现，
 //! 差异点通过 [`ForwardChatOpts`] 参数化：
 //!
-//! - `retry_delay`：Computer 链路重试前等待 3s（给容器内 gRPC 服务启动时间）；
-//!   Web 链路不等待。
+//! - `retry_delay`：Computer 链路重试前等 gRPC 端口就绪（探测上限 30s，
+//!   覆盖容器冷启动窗口）；Web 链路不等待。
 //! - `re_resolve`：Web 链路在 Docker 模式下重试前按 name 实时重新解析容器 IP
 //!   （容器重启后 IP 漂移）；Computer 链路沿用原地址。
 //!
@@ -28,6 +28,10 @@ const MAX_RETRIES: u32 = 2;
 
 /// 智能等待 pod ready 的超时上限(容器冷启动 / OOM 重启恢复窗口)
 const AGENT_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 重试前 gRPC 端口就绪探测上限：覆盖 agent 容器 start-up.sh 冷启动窗口
+/// （本地实测 ~3s / 生产同源版 ~15s，含并发资源争抢余量）
+const PORT_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// pod ready 后给 gRPC server 的缓冲(readiness probe 通过 ≠ gRPC 立即可连)
 const AGENT_READY_RETRY_BUFFER: Duration = Duration::from_secs(1);
@@ -78,7 +82,8 @@ pub struct DiagnosticCtx<'a> {
 pub struct ForwardChatOpts<'a> {
     /// 日志标签（区分链路，如 "FORWARD" / "COMPUTER_FORWARD"）
     pub log_tag: &'static str,
-    /// 重试前等待时长（Computer 场景给 gRPC 服务启动时间；Web 传 None 不等待）
+    /// 重试前等待语义开关：Some(_) = 等 gRPC 端口就绪（探测上限 30s，Computer 场景；
+    /// 具体时长值不再使用）；None = 立即重试（Web 场景）
     pub retry_delay: Option<Duration>,
     /// 重试前是否重新解析容器地址（Web Docker 场景）
     pub re_resolve: Option<ReResolveCtx<'a>>,
@@ -181,13 +186,26 @@ pub async fn forward_chat(
                         }
                     }
 
-                    // 可重试错误：（可选等待）+ 清理连接池后重试
-                    if let Some(delay) = opts.retry_delay {
+                    // 可重试错误：（可选等待）+ 清理连接池后重试。
+                    // Computer 链路（retry_delay>0）用端口就绪探测替代固定 sleep：
+                    // 探测到 gRPC 端口监听立即重试（冷启动窗口内精确等待），
+                    // 超时（30s 上限）按原重试语义兜底继续——原固定 3s sleep 在
+                    // 生产 ~15s 冷启动窗口下要盲等多轮且每轮 dial 白耗超时
+                    if let Some(_delay) = opts.retry_delay {
+                        let ready = crate::grpc::port_ready::wait_grpc_port_ready(
+                            &grpc_addr,
+                            PORT_READY_WAIT_TIMEOUT,
+                        )
+                        .await;
                         info!(
-                            "🔄 [{}] Detected retryable error, waiting {:?} before retry...",
-                            opts.log_tag, delay
+                            "🔄 [{}] Detected retryable error, gRPC 端口探测{}, retrying...",
+                            opts.log_tag,
+                            if ready {
+                                "就绪"
+                            } else {
+                                "超时(兜底继续)"
+                            }
                         );
-                        tokio::time::sleep(delay).await;
                     } else {
                         info!(
                             "🔄 [{}] Detected retryable error, retrying...",
