@@ -319,7 +319,8 @@ pub(crate) async fn upload_files(
         }
     }
     let app_id = require_app_field(app_id, "appId")?;
-    let _user_id = require_app_field(user_id, "userId")?;
+    let user_id = require_app_field(user_id, "userId")?;
+    tracing::debug!(app_id = %app_id, user_id, "userapp upload-files");
     if file_paths.len() != files_vec.len() {
         return Err(AppError::validation("filePaths and files count mismatch"));
     }

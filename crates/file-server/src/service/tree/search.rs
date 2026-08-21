@@ -208,14 +208,15 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
             continue;
         }
 
-        let name = entry.file_name.to_string_lossy().to_string();
+        // Cow 借用, 不做 OsString→String 堆分配 (仅命中项最终进入结果)
+        let name = entry.file_name.to_string_lossy();
 
         // 隐藏文件 (除 .gitignore) 跳过 (对齐 TS isExcludedSearchEntry)
         if name.starts_with('.') && name != super::KEEP_HIDDEN_FILE {
             continue;
         }
         // 排除文件跳过
-        if ctx.exclude_files.contains(&name) {
+        if ctx.exclude_files.contains(&*name) {
             continue;
         }
 
@@ -223,7 +224,7 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
         let is_link = entry.file_type.is_symlink();
 
         // 排除目录: descend 已产出但不应出现在结果 (对齐 TS 完全跳过语义)
-        if is_dir && ctx.exclude_dirs.contains(&name) {
+        if is_dir && ctx.exclude_dirs.contains(&*name) {
             continue;
         }
 
@@ -232,7 +233,10 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
         // 相对 root 的 POSIX 路径 (搜索结果 name 字段)
         let rel = make_relative_posix(&ctx.root, &entry);
 
-        if !entry_matches_keyword(&rel, &name, &ctx.kw_lower) {
+        // 匹配只查 rel: name 是 rel 的尾段子串, contains(name) ⊆ contains(rel),
+        // TS 原版的两查在结果上等价于单查 rel。零分配大小写不敏感匹配
+        // (ASCII 快速路径; 非 ASCII fallback Unicode to_lowercase 保持语义)。
+        if !contains_ignore_case(&rel, &ctx.kw_lower) {
             continue;
         }
 
@@ -260,35 +264,72 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
     }
     // 迭代器 drop → dua_core Pool::drop → stop + wake_workers + join (优雅终止)
 
-    // 排序: 目录在前 + 名字大小写不敏感 (对齐 TS localeCompare)
-    matches.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    // 排序: 目录在前 + 名字大小写不敏感 (对齐 TS localeCompare)。
+    // cached_key: 每元素小写一次, 取代比较器每次比较的两次 to_lowercase 分配。
+    matches.sort_by_cached_key(|e| (std::cmp::Reverse(e.is_dir), e.name.to_lowercase()));
 
     (matches, truncated, visited)
 }
 
 /// 计算相对 `root` 的 POSIX 风格路径。
 ///
-/// dua_core::Entry 的 `parent_path` + `file_name` 组成完整绝对路径, strip_prefix(root)
+/// dua_core::Entry 的 `parent_path` + `file_name` 组成完整绝对路径, 去掉 root 前缀
 /// 得到相对路径。搜索根可能为 root 的子目录 (relative_path), 但条目路径是绝对的,
-/// 故 strip_prefix(root) 始终能得到正确的相对工作区路径。
+/// 故前缀裁剪始终能得到正确的相对工作区路径。
+///
+/// 性能: 每个访问条目都会调用 (命中前), 用"parent 切片 + format 拼接"一次分配,
+/// 取代 Path::join + strip_prefix + replace 的三次分配; Windows 分隔符条件替换。
 fn make_relative_posix(root: &Path, entry: &dua_core::Entry) -> String {
-    let full = entry.parent_path.join(&entry.file_name);
-    full.strip_prefix(root)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| full.to_string_lossy().replace('\\', "/"))
+    let parent = entry.parent_path.to_string_lossy();
+    let root_str = root.to_string_lossy();
+    let root_trimmed = root_str.trim_end_matches('/');
+    // parent==root（根级条目）→ rel 空; parent=root/sub → "sub"; 非 root 前缀
+    // （customTargetDir 等场景）→ 退化为绝对路径去前导斜杠。
+    let rel = if parent.starts_with(root_trimmed) {
+        parent[root_trimmed.len()..].trim_start_matches('/')
+    } else {
+        parent.trim_start_matches('/')
+    };
+    let name = entry.file_name.to_string_lossy();
+    let joined = if rel.is_empty() {
+        name.into_owned()
+    } else {
+        format!("{rel}/{name}")
+    };
+    if joined.contains('\\') {
+        joined.replace('\\', "/")
+    } else {
+        joined
+    }
 }
 
-/// 关键字匹配 (对齐 TS `entryMatchesKeyword`): 文件名或相对路径含 kw (大小写不敏感)。
-/// `kw_lower` 须为已转小写的关键字 (由调用方 `kw.to_lowercase()` 保证)。
-fn entry_matches_keyword(relative_path: &str, entry_name: &str, kw_lower: &str) -> bool {
+/// 大小写不敏感子串匹配 (kw 须已转小写, 由调用方保证; 空串恒 false)。
+///
+/// 性能: haystack/kw 均为 ASCII 时走零分配滑窗 (逐字节 ASCII 折叠比较);
+/// 任一非 ASCII 时 fallback `to_lowercase()` (Unicode 语义, 对齐 TS toLowerCase)。
+/// 搜索热路径每个访问条目调用一次, 分配开销是大目录场景的主要浪费源。
+fn contains_ignore_case(haystack: &str, kw_lower: &str) -> bool {
     if kw_lower.is_empty() {
         return false;
     }
-    entry_name.to_lowercase().contains(kw_lower) || relative_path.to_lowercase().contains(kw_lower)
+    if kw_lower.is_ascii() && haystack.is_ascii() {
+        let h = haystack.as_bytes();
+        let n = kw_lower.as_bytes();
+        if h.len() < n.len() {
+            return false;
+        }
+        'outer: for i in 0..=h.len() - n.len() {
+            for j in 0..n.len() {
+                if h[i + j].to_ascii_lowercase() != n[j] {
+                    continue 'outer;
+                }
+            }
+            return true;
+        }
+        false
+    } else {
+        haystack.to_lowercase().contains(kw_lower)
+    }
 }
 
 #[cfg(test)]
@@ -515,12 +556,20 @@ mod tests {
     }
 
     #[test]
-    fn entry_matches_keyword_is_case_insensitive_substring() {
-        // kw 须为小写 (调用方保证); entry_name/relative_path 的大小写不敏感匹配
-        assert!(entry_matches_keyword("src/Foo.ts", "Foo.ts", "foo"));
-        assert!(entry_matches_keyword("src/foo.ts", "foo.ts", "foo"));
-        assert!(entry_matches_keyword("src/x.rs", "x.rs", "src/x"));
-        assert!(!entry_matches_keyword("a.txt", "a.txt", "b"));
-        assert!(!entry_matches_keyword("a.txt", "a.txt", "")); // 空 kw → false
+    fn contains_ignore_case_is_case_insensitive_substring() {
+        // kw 须为小写 (调用方保证); 大小写不敏感子串匹配 (只查 rel, 与旧两查等价)
+        assert!(contains_ignore_case("src/Foo.ts", "foo"));
+        assert!(contains_ignore_case("src/foo.ts", "foo"));
+        assert!(contains_ignore_case("src/x.rs", "src/x")); // 路径段命中
+        assert!(!contains_ignore_case("a.txt", "b"));
+        assert!(!contains_ignore_case("a.txt", "")); // 空 kw → false
+    }
+
+    #[test]
+    fn contains_ignore_case_unicode_fallback() {
+        // 非 ASCII 走 Unicode to_lowercase fallback, 语义与 ASCII 快速路径一致
+        assert!(contains_ignore_case("数据/报表.csv", "报表"));
+        assert!(contains_ignore_case("Ähnlich.txt", "ähnlich")); // Unicode 折叠
+        assert!(!contains_ignore_case("数据/x.csv", "报表a"));
     }
 }

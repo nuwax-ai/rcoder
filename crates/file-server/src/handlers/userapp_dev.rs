@@ -230,7 +230,8 @@ pub(crate) async fn init_project_template(
         }
     }
     let app_id = require_app_field(app_id, "appId")?;
-    let _user_id = require_app_field(user_id, "userId")?;
+    let user_id = require_app_field(user_id, "userId")?;
+    tracing::debug!(app_id = %app_id, user_id, "userapp init-project-template");
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     let ws = resolve_userapp_dev(&app_id, None, &state.config)?;
     init_project_template_impl(&state, ws, data, enable_git).await
@@ -294,7 +295,8 @@ pub(crate) async fn push_skills_to_workspace(
         }
     }
     let app_id = require_app_field(app_id, "appId")?;
-    let _user_id = require_app_field(user_id, "userId")?;
+    let user_id = require_app_field(user_id, "userId")?;
+    tracing::debug!(app_id = %app_id, user_id, "userapp push-skills");
     let ws = resolve_userapp_dev(&app_id, None, &state.config)?;
     push_skills_impl(
         &state,
