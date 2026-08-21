@@ -8,7 +8,7 @@
 use axum::extract::State;
 use garde::Validate;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::computer::files::files_update_impl;
 use super::computer::files::generate::generate_file_impl;
@@ -204,7 +204,14 @@ pub(crate) async fn files_update(
         body.custom_target_dir.as_deref(),
         &state.config,
     )?;
-    files_update_impl(&path, body.files, &body.user_id, "appId", &body.app_id).await
+    let count = files_update_impl(&path, body.files).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "User files updated successfully",
+        "userId": body.user_id,
+        "appId": body.app_id,
+        "filesCount": count,
+    })))
 }
 
 // ── upload-file / upload-files ──────────────────────────────────────────────────
@@ -413,7 +420,14 @@ pub(crate) async fn import_project(
     let data: TemporaryFile = data.ok_or_else(|| AppError::validation("file is required"))?;
     validate_zip_ext(file_name.as_deref())?;
     let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.config)?;
-    import_project_impl(ws, data, &user_id, "appId", &app_id).await
+    let target = import_project_impl(ws, data).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Project imported successfully",
+        "userId": user_id,
+        "appId": app_id,
+        "targetDir": target,
+    })))
 }
 
 /// multipart 提取后必填字段校验 (空/缺失 → 400, 错误消息带字段名便于定位)。

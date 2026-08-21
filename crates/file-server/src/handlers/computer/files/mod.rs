@@ -74,18 +74,21 @@ pub(crate) async fn files_update(
         body.custom_target_dir.as_deref(),
     )
     .await?;
-    files_update_impl(&path, body.files, &body.user_id, "cId", &body.c_id).await
+    let count = files_update_impl(&path, body.files).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "User files updated successfully",
+        "userId": body.user_id,
+        "cId": body.c_id,
+        "filesCount": count,
+    })))
 }
 
-/// files-update 的 workspace 无关实现 (`id_label` 为工作区标识回显键名:
-/// computer 域 "cId" / userapp 域 "appId")。
+/// files-update 的 workspace 无关实现：返回写入的文件数（展示/回显归各域壳层）。
 pub(crate) async fn files_update_impl(
     ws: &Path,
     mut files: Vec<code_service::FileOp>,
-    user_id: &str,
-    id_label: &str,
-    id_value: &str,
-) -> Result<Json<Value>, AppError> {
+) -> Result<usize, AppError> {
     // 工作区不存在 → 创建 (对齐 nuwax computerFileUtils.updateFiles: !existsSync → mkdirSync recursive)。
     // 首次向全新 user/cId 工作区写入不应失败。
     tokio::fs::create_dir_all(ws).await?;
@@ -100,11 +103,5 @@ pub(crate) async fn files_update_impl(
     let count = files.len();
     // computer updateFiles: modify 用字节比较 (非 project 的行级 diff; 对齐 nuwax)
     code_service::apply_file_ops(ws, &files, code_service::ModifyStrategy::ByteCompare).await?;
-    let mut resp = serde_json::Map::new();
-    resp.insert("success".into(), json!(true));
-    resp.insert("message".into(), json!("User files updated successfully"));
-    resp.insert("userId".into(), json!(user_id));
-    resp.insert(id_label.into(), json!(id_value));
-    resp.insert("filesCount".into(), json!(count));
-    Ok(Json(Value::Object(resp)))
+    Ok(count)
 }
