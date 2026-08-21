@@ -37,7 +37,11 @@ pub(crate) async fn spawn_embedded_file_server() {
             return;
         }
     };
-    info!("file-server (embedded) starting on {}", address);
+    info!(
+        version = file_server::VERSION,
+        address = %address,
+        "file-server (embedded) starting"
+    );
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind(&address).await {
             Ok(listener) => {

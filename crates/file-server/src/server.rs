@@ -10,6 +10,7 @@ use axum::http::HeaderValue;
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use tower_http::trace::TraceLayer;
+use tracing::info;
 
 use crate::error::{AppError, REQUEST_ID, generate_request_id};
 use crate::{
@@ -107,6 +108,7 @@ impl FileServer {
     }
 
     pub async fn serve(self, listener: tokio::net::TcpListener) -> Result<()> {
+        self.log_startup(&listener);
         let dev_server = self.dev_server_manager();
         let result = axum::serve(listener, self.router()?).await;
         dev_server.shutdown_all().await;
@@ -121,12 +123,31 @@ impl FileServer {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.log_startup(&listener);
         let dev_server = self.dev_server_manager();
         let result = axum::serve(listener, self.router()?)
             .with_graceful_shutdown(shutdown)
             .await;
         dev_server.shutdown_all().await;
         result.context("serve file-server")
+    }
+
+    /// 启动留痕（target=file_server::server → 嵌入模式进独立日志文件）:
+    /// 版本 + 部署模式 + 三个 workspace 根（排查路径问题的第一手信息）。
+    fn log_startup(&self, listener: &tokio::net::TcpListener) {
+        let addr = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        info!(
+            version = crate::VERSION,
+            deployment_mode = ?self.state.config.deployment_mode,
+            project_source_dir = %self.state.config.project_source_dir.display(),
+            computer_workspace_dir = %self.state.config.computer_workspace_dir.display(),
+            userapp_workspace_dir = %self.state.config.userapp_workspace_dir.display(),
+            addr = %addr,
+            "file-server started"
+        );
     }
 }
 

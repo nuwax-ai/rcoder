@@ -22,6 +22,9 @@ pub use workspace::{
 use std::sync::Arc;
 
 pub use crate::config::Config;
+
+/// file-server 版本（编译期 crate 版本；health/openapi/启动日志共用单一事实源）。
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use crate::server::{FileServer, FileServerBuilder};
 pub use crate::service::build_manager::BuildManager;
 pub use crate::service::dev_server::DevServerManager;

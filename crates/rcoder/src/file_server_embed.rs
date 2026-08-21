@@ -245,8 +245,10 @@ pub async fn try_start(port_override: Option<u16>) -> Result<String, String> {
         cleanup_dead_instance().await;
     });
     info!(
-        "file-server (embedded) starting on {} (deployment mode: {:?})",
-        address, deployment_mode
+        version = file_server::VERSION,
+        address = %address,
+        deployment_mode = ?deployment_mode,
+        "file-server (embedded) starting"
     );
     *guard = Some(EmbeddedInstance {
         shutdown,
