@@ -19,3 +19,12 @@ pub struct CreateDatabaseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
 }
+
+/// database 目录 SQL 自动执行报告（发布 activate 后执行；失败仅收集不阻断）
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DatabaseSqlReport {
+    /// 执行成功的 SQL 文件（相对 code 根路径，按执行序）
+    pub executed: Vec<String>,
+    /// 执行失败的 SQL 文件与错误摘要（`{rel}: {stderr}`）
+    pub failed: Vec<String>,
+}

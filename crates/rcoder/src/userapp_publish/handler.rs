@@ -56,6 +56,18 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct PublishBody {
     pub project_id: String,
+    /// 是否在发布 activate 后自动执行包内 database 目录的 SQL 文件
+    /// （根 database/ 先 + 各子项目 database/，文件名升序；单文件失败仅日志不阻断）。
+    /// 缺省 true。
+    #[serde(default = "default_auto_execute_sql")]
+    pub auto_execute_sql: Option<bool>,
+    /// owner 用户 ID（补记 userapp_metadata；显式传优先于 create-workspace 注册值）
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
+fn default_auto_execute_sql() -> Option<bool> {
+    Some(true)
 }
 
 /// tasks/query 请求体(分页 + 可选过滤;POST body 承载,与 /apps/query 惯例一致)。
@@ -178,6 +190,20 @@ pub async fn publish(
     Json(body): Json<PublishBody>,
 ) -> Result<Json<HttpResult<PublishTaskData>>, AppError> {
     validate_publish_identifiers(&app_id, &body.project_id)?;
+    // owner 显式传入 → 补记 metadata（优先于 create-workspace 注册值）
+    if let Some(uid) = body.user_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        shared_types::validate_identifier(uid, "user_id").map_err(|e| AppError::bad_request(&e))?;
+        if let Err(e) = state
+            .app_service
+            .record_dev_registration(&app_id, uid.trim())
+            .await
+        {
+            tracing::warn!(
+                "[USERAPP_PUBLISH] record owner user_id failed (publish continues): {e}"
+            );
+        }
+    }
+    let auto_execute_sql = body.auto_execute_sql.unwrap_or(true);
     let task = state
         .publish_tasks
         .create(
@@ -199,6 +225,7 @@ pub async fn publish(
             state,
             project_id,
             app_id,
+            auto_execute_sql,
         ))
         .catch_unwind()
         .await;

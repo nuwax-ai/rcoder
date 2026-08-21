@@ -77,6 +77,9 @@ pub trait AppServiceTrait: Send + Sync {
         request: shared_types::AlignCredentialsRequest,
     ) -> AppResult<shared_types::AlignCredentialsOutcome>;
 
+    /// database 目录 SQL 自动执行（发布 activate 后；失败收集进 report 不阻断）
+    async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport>;
+
     /// 分页查询持久存储（强制分页，无全量模式）
     async fn query_storage(
         &self,

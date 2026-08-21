@@ -216,4 +216,96 @@ impl AppService {
         }
         Ok(())
     }
+
+    /// database 目录 SQL 自动执行（发布 activate 后调用；失败仅收集不阻断发布）。
+    ///
+    /// 扫描 code 目录（rcoder 视角 PVC 路径）下的 `database/*.sql`：
+    /// 1. code 根 `database/`（建库/扩展类，先执行）
+    /// 2. 各一级子项目 `{dir}/database/`（目录名排序）
+    ///
+    /// 目录内按文件名升序。逐文件 exec 容器内 `psql -f`（容器内路径 `/app/code/{rel}`，
+    /// `ON_ERROR_STOP=on` 单文件原子性），单文件失败收集进 report 继续下一文件。
+    pub async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport> {
+        validate_app_id(app_id)?;
+        let app_dir = self.get_container_app_dir(app_id).await?;
+        let code = app_dir.join("code");
+        if !code.is_dir() {
+            return Ok(DatabaseSqlReport {
+                executed: vec![],
+                failed: vec![],
+            });
+        }
+
+        // 收集 SQL（根 database 优先，子项目目录名序，目录内文件名升序）
+        let mut files: Vec<String> = Vec::new();
+        let root_db = code.join("database");
+        if root_db.is_dir() {
+            collect_sql_files(&root_db, "database", &mut files)?;
+        }
+        let mut subdirs: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&code).map_err(map_io_error_db)? {
+            let entry = entry.map_err(map_io_error_db)?;
+            if entry.file_type().map_err(map_io_error_db)?.is_dir()
+                && entry.path().join("database").is_dir()
+            {
+                subdirs.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+        subdirs.sort();
+        for dir in subdirs {
+            collect_sql_files(
+                &code.join(&dir).join("database"),
+                &format!("{dir}/database"),
+                &mut files,
+            )?;
+        }
+
+        let mut report = DatabaseSqlReport {
+            executed: Vec::new(),
+            failed: Vec::new(),
+        };
+        for rel in files {
+            let cmd = format!(
+                "psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" --set ON_ERROR_STOP=on -f '/app/code/{rel}'"
+            );
+            let r = self
+                .runtime
+                .exec(app_id, vec!["sh".to_string(), "-c".to_string(), cmd])
+                .await;
+            match r {
+                Ok(r) if r.exit_code == 0 => report.executed.push(rel),
+                Ok(r) => {
+                    report
+                        .failed
+                        .push(format!("{rel}: exit {}: {}", r.exit_code, r.stderr.trim()))
+                }
+                Err(e) => report.failed.push(format!("{rel}: exec failed: {e}")),
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// 收集目录下 `*.sql` 文件为 `{prefix}/{name}`（文件名升序）。
+fn collect_sql_files(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) -> AppResult<()> {
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(map_io_error_db)? {
+        let entry = entry.map_err(map_io_error_db)?;
+        let ft = entry.file_type().map_err(map_io_error_db)?;
+        if ft.is_file() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".sql") {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    for name in names {
+        out.push(format!("{prefix}/{name}"));
+    }
+    Ok(())
+}
+
+fn map_io_error_db(e: std::io::Error) -> AppOperationError {
+    AppOperationError::Backend(format!("scan database dir: {e}"))
 }

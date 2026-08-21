@@ -64,6 +64,20 @@ pub(super) async fn assemble_workspace_package(
                 add_dir_entries(&mut zw, &pingap, "pingap")?;
             }
 
+            // 4. database/ 目录（发布后平台自动按序执行其中的 .sql——见 rcoder 发布编排
+            //    的 database_sql 阶段；失败仅日志不阻断）。workspace 根先（建库/扩展类），
+            //    各子项目源目录补收（build 产物 zip 不含 database/）。
+            let database = ws_for_task.join("database");
+            if database.is_dir() {
+                add_dir_entries(&mut zw, &database, "database")?;
+            }
+            for proj in &built_for_task {
+                let proj_db = ws_for_task.join(&proj.path).join("database");
+                if proj_db.is_dir() {
+                    add_dir_entries(&mut zw, &proj_db, &format!("{}/database", proj.path))?;
+                }
+            }
+
             zw.finish()
                 .map_err(|e| AppError::file(format!("zip finish: {e}")))?;
             Ok(())
@@ -226,6 +240,19 @@ mod tests {
             "schema_version=1\n[workspace]\nname=\"x\"\n[pingap]\nmode=\"managed\"\n",
         )
         .unwrap();
+        // database 目录（workspace 根 + 子项目；发布后平台自动执行其中的 .sql）
+        std::fs::create_dir_all(ws_path.join("database")).unwrap();
+        std::fs::write(
+            ws_path.join("database/001_init.sql"),
+            "CREATE TABLE IF NOT EXISTS t(id int);\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws_path.join("userapp-backend/database")).unwrap();
+        std::fs::write(
+            ws_path.join("userapp-backend/database/001_orders.sql"),
+            "SELECT 1;\n",
+        )
+        .unwrap();
 
         let fe_zip = ws_path.join("userapp-frontend/userapp-frontend.zip");
         let be_zip = ws_path.join("userapp-backend/userapp-backend.zip");
@@ -301,6 +328,15 @@ mod tests {
                 .is_file()
         );
         assert!(root.join("userapp-backend/project.manifest.toml").is_file());
+        // database 目录进包（根 + 子项目源目录补收——artifact.zip 不含 database/）
+        assert_eq!(
+            std::fs::read_to_string(root.join("database/001_init.sql")).unwrap(),
+            "CREATE TABLE IF NOT EXISTS t(id int);\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("userapp-backend/database/001_orders.sql")).unwrap(),
+            "SELECT 1;\n"
+        );
     }
 
     #[tokio::test]

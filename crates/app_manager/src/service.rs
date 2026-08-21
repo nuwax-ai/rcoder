@@ -556,6 +556,10 @@ impl super::AppServiceTrait for AppService {
         self.align_db_credentials(app_id, request).await
     }
 
+    async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport> {
+        self.execute_database_sql(app_id).await
+    }
+
     async fn query_storage(
         &self,
         request: QueryStorageRequest,

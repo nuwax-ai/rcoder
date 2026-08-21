@@ -31,14 +31,15 @@ pub async fn run_build(
     finalize_terminal(&task, &app_id, &project_id, result, "build").await;
 }
 
-/// 全流程发布入口(spawn 调):build → ensure_app → prepare → activate → 轮询 → confirm。
+/// 全流程发布入口(spawn 调):build → ensure_app → prepare → activate → database_sql → Completed。
 pub async fn run_publish(
     task: Arc<PublishTask>,
     state: Arc<AppState>,
     project_id: String,
     app_id: String,
+    auto_execute_sql: bool,
 ) {
-    let result = run_publish_inner(&task, &state, &project_id, &app_id).await;
+    let result = run_publish_inner(&task, &state, &project_id, &app_id, auto_execute_sql).await;
     finalize_terminal(&task, &app_id, &project_id, result, "publish").await;
 }
 
@@ -118,6 +119,7 @@ async fn run_publish_inner(
     state: &AppState,
     project_id: &str,
     app_id: &str,
+    auto_execute_sql: bool,
 ) -> Result<()> {
     // 0. ensure builder:未注册时自动创建(K8s 拉镜像可能数十秒,先亮阶段让前端可见)。
     fail_if_cancelled(task)?;
@@ -212,6 +214,40 @@ async fn run_publish_inner(
             return Ok(()); // 已自 emit 终态,顶层见 Ok 跳过
         }
         Err(e) => return Err(anyhow!("activate_release: {e}")),
+    }
+
+    // 4. database SQL 自动执行（可选,发布请求 auto_execute_sql 缺省 true）：
+    //    activate 后包内容已落 app code 目录,app 容器 Running。
+    //    单文件失败仅 warn 收集（文件名+stderr）跳过,不阻断发布——SQL 幂等性由模板约定自带。
+    if auto_execute_sql {
+        fail_if_cancelled(task)?;
+        task.emit(PublishEvent::Stage {
+            stage: "DatabaseSql".to_string(),
+        })
+        .await;
+        match state.app_service.execute_database_sql(&rcoder_app_id).await {
+            Ok(report) => {
+                for rel in &report.executed {
+                    tracing::info!("[USERAPP_PUBLISH] database sql executed: {rel}");
+                }
+                for fail in &report.failed {
+                    tracing::warn!(
+                        "[USERAPP_PUBLISH] database sql failed (ignored, release continues): {fail}"
+                    );
+                }
+                tracing::info!(
+                    "[USERAPP_PUBLISH] database sql done: executed={}, failed={}",
+                    report.executed.len(),
+                    report.failed.len()
+                );
+            }
+            Err(e) => {
+                // 整阶段失败（如 code 目录不可达）同样不阻断发布,仅日志可见
+                tracing::warn!(
+                    "[USERAPP_PUBLISH] database sql stage failed (ignored, release continues): {e}"
+                );
+            }
+        }
     }
 
     task.emit(PublishEvent::Completed {
