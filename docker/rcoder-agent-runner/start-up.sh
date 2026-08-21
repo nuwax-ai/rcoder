@@ -749,42 +749,63 @@ function start_vnc_services() {
 	return 0
 }
 
-# ========== 桌面图标信任化 (xfdesktop 双击实体 .desktop 仍可能弹 untrusted) ==========
-# 三层: 1) 实体 + 属主 user + 可执行  2) gio set metadata::trusted (GIO 通用, 需 D-Bus session)
-#        3) 兜底禁 Thunar launch-confirm (恢复被删的 ae73d82 逻辑)
-# 需在 X11 + D-Bus 起来后 (start_vnc_services 成功后) 调用。任何一层失败都不阻断启动。
+# ========== 桌面图标信任化 ==========
+# xfdesktop 4.18 对桌面 launcher 的信任只看文件属性: 实体文件 + 属主 user + 可执行 755。
+# 不要写 gio metadata (metadata::trusted / xfce-exe-checksum) —— 实测反而有害:
+#   xfce-exe-checksum 校验时我们只能写 sha256(整个文件), 而 xfdesktop 期望 sha256(Exec 行),
+#   两者不等 → xfdesktop 判定 "launcher 被篡改" → 双击概率性弹 untrusted (还叠加写 metadata 与
+#   xfdesktop 读取的时序竞态)。清空 metadata、只靠文件属性后, 确定性不弹。
+# 故这里只保证文件属性 (骨架恢复 cp -aL 已给实体, 本函数兜底 chown/chmod), 不碰 gio、不重启 xfdesktop。
 function trust_desktop_icons() {
     local f
-    # 1) 实体 + 属主 user + 可执行 (xfdesktop 较宽容的信任条件)
+    # 1) 实体 + 属主 user(uid 1000) + 可执行 755  (XFCE 4.18 五件套 条件 1+2)
     for f in /home/user/Desktop/*.desktop; do
         [ -f "$f" ] || continue
         chown user:user "$f" 2>/dev/null || true
         chmod 755 "$f" 2>/dev/null || true
     done
-    # 2) gio set metadata::trusted + xfce-exe-checksum (XFCE 4.18 五件套: uid(user) + 755 + checksum + trusted)
-    if command -v gio >/dev/null 2>&1; then
-        local oh=$HOME od=$DISPLAY odb=${DBUS_SESSION_BUS_ADDRESS:-}
-        export HOME=/home/user DISPLAY=${DISPLAY:-:0}
-        [ -f /tmp/dbus-session-env ] && . /tmp/dbus-session-env     # 关键: gio set 要 DBUS 连 gvfsd, 否则 not supported
+
+    # 2) gio set metadata::xfce-exe-checksum + metadata::trusted  (五件套 条件 4+5)
+    #    xfdesktop 4.18 + GLib 2.74 桌面 launcher 信任要 5 条件全满足 (ef0bcdc 实测 chromium 五件套齐即不弹):
+    #      uid(user) + 755 + DBUS_SESSION + xfce-exe-checksum + trusted。
+    #    7a39a79 误判"只靠文件属性"删了 gio → 仅老图标靠 PVC 残留旧 metadata 不弹, 新图标/新 PVC 必弹。此处恢复。
+    #    gio set 要 D-Bus session 连上 gvfsd-metadata; 启动早期没就绪会静默失败 → 先探测 gvfsd (最长 30s) 再批量写。
+    [ -f /tmp/dbus-session-env ] && . /tmp/dbus-session-env
+    export HOME=/home/user
+    local _first _gvfs_ready=0 i
+    _first=$(ls /home/user/Desktop/*.desktop 2>/dev/null | head -1)
+    if [ -n "$_first" ] && [ -n "$DBUS_SESSION_BUS_ADDRESS" ]; then
+        for i in $(seq 1 60); do
+            gio set "$_first" metadata::trusted true 2>/dev/null && { _gvfs_ready=1; break; }
+            sleep 0.5
+        done
+    fi
+    if [ "$_gvfs_ready" = "1" ]; then
         for f in /home/user/Desktop/*.desktop; do
             [ -f "$f" ] || continue
             local cksum=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
             [ -n "$cksum" ] && gio set "$f" metadata::xfce-exe-checksum "$cksum" 2>/dev/null || true
             gio set "$f" metadata::trusted true 2>/dev/null || true
         done
-        export HOME=$oh DISPLAY=$od
-        [ -n "$odb" ] && export DBUS_SESSION_BUS_ADDRESS=$odb || unset DBUS_SESSION_BUS_ADDRESS
+        log_success "Desktop icons trusted (XFCE 4.18 五件套: uid+755+DBUS+checksum+trusted)"
+        # 3) 刷新 xfdesktop 缓存: gio set 写在 xfdesktop 启动之后, 它已缓存旧信任状态;
+        #    用 session env 重启 xfdesktop 让它重读 metadata (aaf10f4 的 refresh, 7a39a79 误删)。
+        if pgrep -x xfdesktop >/dev/null 2>&1; then
+            pkill -x xfdesktop 2>/dev/null || true
+            sleep 1
+            (env DISPLAY=:0 HOME=/home/user XDG_CURRENT_DESKTOP=XFCE \
+                 DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+                 nohup xfdesktop >/tmp/xfdesktop-trust.log 2>&1 &)
+            log "xfdesktop restarted to refresh desktop icon trust"
+        fi
+    else
+        log_warn "gvfs metadata 后端未就绪, gio set 跳过 (图标可能双击弹 untrusted; metadata 持久化在 PVC, 下次启动恢复)"
     fi
-    # 3) 兜底: 禁 Thunar 启动确认 (对 Thunar 内双击生效)
+
+    # 4) 兜底: 禁 Thunar 启动确认 (Thunar 文件管理器内双击 .desktop 时生效)
     if command -v xfconf-query >/dev/null 2>&1; then
         HOME=/home/user xfconf-query -c thunar -p /misc-executable-launch-confirm -s false 2>/dev/null || true
     fi
-    # 4) xfdesktop restart (刷新 GDesktopAppInfo 缓存; gio set 后旧 xfdesktop 进程仍缓存 untrusted,
-    #    --reload 不刷 GDesktopAppInfo, 必须 kill+restart 新进程读 metadata::trusted + checksum)
-    killall xfdesktop 2>/dev/null || true
-    sleep 1
-    DISPLAY=${DISPLAY:-:0} HOME=/home/user nohup xfdesktop >/dev/null 2>&1 &
-    log_success "Desktop icons trusted"
 }
 
 function start_display_and_desktop() {
@@ -1937,7 +1958,7 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             log_success "VNC services started successfully!"
             log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
             log_success "Direct VNC port: 5900"
-            # 桌面图标信任化 (xfdesktop 起来后; 后台延迟调用, 不阻塞主流程)
+            # 桌面图标信任化: 兜底保证文件属性(user属主+755); 骨架恢复 cp -aL 已做过, 这里后台二次确认, 不阻塞主流程
             ( sleep 3 && trust_desktop_icons ) &
         else
             log_error "VNC services failed to start, /tmp/novnc_port_ready will NOT be written"
@@ -2044,8 +2065,9 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             fi
         fi
 
-        # 🔥 注意：僵尸进程回收已由 agent_runner 的 process_reaper 模块处理
-        # agent_runner 作为 PID 1 会自动回收所有孤儿进程，无需脚本额外清理
+        # 注:孤儿/僵尸进程回收 + 信号转发由 agent_runner 内置的 pid1 库负责 —— start-up.sh
+        # exec 进 agent_runner 后,若它是 PID 1,pid1 会 re-exec 自己为子进程 + 本进程做监督
+        # (进程外 waitpid,不与 tokio::process 冲突)。旧 in-process process_reaper 模块已删。
     done
 ) &
 
@@ -2294,6 +2316,9 @@ export INPUT_METHOD=fcitx; \
 export LANG=C.UTF-8; \
 export LC_ALL=C.UTF-8; \
 export BROWSER=/usr/bin/chromium-browser-launcher; \
+export RCODER_EMBED_FILE_SERVER=true; \
+export PROJECT_SOURCE_DIR=/home/user; \
+export FILE_SERVER_PORT=60000; \
 export PATH=/usr/local/bin:/usr/local/cargo/bin:\$PATH"
 
 # 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）
