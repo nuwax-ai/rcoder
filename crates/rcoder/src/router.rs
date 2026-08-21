@@ -1009,6 +1009,10 @@ mod openapi_tests {
             "/api/userapp/build",
             "/api/userapp/projects/detect",
             "/api/userapp/projects/confirm",
+            "/api/userapp/init-project-template",
+            "/api/userapp/get-file-list",
+            "/api/userapp/execute-command",
+            "/api/userapp/push-skills-to-workspace",
         ] {
             assert!(
                 paths.contains_key(path),

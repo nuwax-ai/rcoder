@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn document_contains_every_registered_operation() {
         let document = generated_document();
-        assert_eq!(document.paths.paths.len(), 79);
+        assert_eq!(document.paths.paths.len(), 94);
         assert!(document.paths.paths.contains_key("/"));
         assert!(document.paths.paths.contains_key("/api/build/start-dev"));
         assert!(document.paths.paths.contains_key("/api/git/commit"));
@@ -175,6 +175,29 @@ mod tests {
                 .paths
                 .contains_key("/api/userapp/projects/confirm")
         );
+        // 文件操作镜像族（computer 域同参镜像, 15 个）
+        for path in [
+            "/api/userapp/get-file-list",
+            "/api/userapp/resolve-file",
+            "/api/userapp/search-files",
+            "/api/userapp/files-update",
+            "/api/userapp/upload-file",
+            "/api/userapp/upload-files",
+            "/api/userapp/generate-file",
+            "/api/userapp/import-project",
+            "/api/userapp/execute-command",
+            "/api/userapp/get-logs",
+            "/api/userapp/install-project",
+            "/api/userapp/zip-workspace",
+            "/api/userapp/download-all-files",
+            "/api/userapp/init-project-template",
+            "/api/userapp/push-skills-to-workspace",
+        ] {
+            assert!(
+                document.paths.paths.contains_key(path),
+                "userapp mirror path missing: {path}"
+            );
+        }
         assert!(
             document
                 .paths

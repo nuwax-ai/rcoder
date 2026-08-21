@@ -9,7 +9,8 @@ use utoipa_axum::routes;
 
 use crate::AppState;
 use crate::handlers::{
-    build, build_support, computer, git, health, project, static_files, userapp,
+    build, build_support, computer, git, health, project, static_files, userapp, userapp_dev,
+    userapp_files,
 };
 
 /// 业务路由与 OpenAPI 文档的唯一聚合入口。
@@ -133,7 +134,7 @@ fn page_router() -> OpenApiRouter<AppState> {
         )
 }
 
-/// `/api/userapp` 路由（workspace 多项目打包 + 取整体包）。
+/// `/api/userapp` 路由（workspace 多项目打包 + 文件操作镜像族 + 取整体包）。
 fn userapp_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(userapp::build_workspace))
@@ -143,6 +144,21 @@ fn userapp_router() -> OpenApiRouter<AppState> {
         .routes(routes!(userapp::cancel_task))
         .routes(routes!(userapp::detect_project))
         .routes(routes!(userapp::confirm_project))
+        .routes(routes!(userapp_files::get_file_list))
+        .routes(routes!(userapp_files::resolve_file))
+        .routes(routes!(userapp_files::search_files))
+        .routes(routes!(userapp_files::files_update))
+        .routes(routes!(userapp_files::upload_file))
+        .routes(routes!(userapp_files::upload_files))
+        .routes(routes!(userapp_files::generate_file))
+        .routes(routes!(userapp_files::import_project))
+        .routes(routes!(userapp_dev::execute_command))
+        .routes(routes!(userapp_dev::get_logs))
+        .routes(routes!(userapp_dev::install_project))
+        .routes(routes!(userapp_dev::zip_workspace))
+        .routes(routes!(userapp_dev::download_all_files))
+        .routes(routes!(userapp_dev::init_project_template))
+        .routes(routes!(userapp_dev::push_skills_to_workspace))
         .routes(routes!(static_files::serve_userapp))
         .route(
             "/static/{app_id}/{*rest}",
