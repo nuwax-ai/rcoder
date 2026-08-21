@@ -94,10 +94,21 @@ pub(crate) async fn zip_workspace(
     Json(body): Json<ZipBody>,
 ) -> Result<Response, AppError> {
     let src = ws_path(&state, &body.user_id, &body.c_id).await?;
+    let filename = format!("{}_{}.zip", body.user_id, body.c_id);
+    zip_workspace_impl(&state, src, body.exclude_dirs.unwrap_or_default(), filename).await
+}
+
+/// zip-workspace 的 workspace 无关实现 (filename 由壳层拼: computer=`{user}_{cId}.zip`)。
+pub(crate) async fn zip_workspace_impl(
+    state: &AppState,
+    src: std::path::PathBuf,
+    extra_exclude_dirs: Vec<String>,
+    filename: String,
+) -> Result<Response, AppError> {
     if !src.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
-    let tmp = computer_tmp_zip(&state).await?;
+    let tmp = computer_tmp_zip(state).await?;
     // mandatory(ZIP_WORKSPACE_EXCLUDE) ∪ extra(调用方 excludeDirs); 同时填 dirs 与 files,
     // 等价 nuwax archive.directory 的 "任一路径段命中集合则跳过" (对目录与文件同集合)。
     let merged: Vec<String> = state
@@ -105,7 +116,7 @@ pub(crate) async fn zip_workspace(
         .zip_workspace_exclude
         .iter()
         .cloned()
-        .chain(body.exclude_dirs.unwrap_or_default())
+        .chain(extra_exclude_dirs)
         .collect();
     let opts = zip::PackOpts {
         exclude_dirs: merged.clone(),
@@ -116,7 +127,6 @@ pub(crate) async fn zip_workspace(
         path_prefix: None,
     };
     zip::pack_with_opts(src, tmp.path().to_path_buf(), opts).await?;
-    let filename = format!("{}_{}.zip", body.user_id, body.c_id);
     zip_response(&filename, tmp).await
 }
 
@@ -141,7 +151,18 @@ pub(crate) async fn download_all_files(
         .await?;
     let prefix = format!("{}_{}/", q.user_id, q.c_id);
     let filename = format!("{}_{}.zip", q.user_id, q.c_id);
-    let tmp = computer_tmp_zip(&state).await?;
+    download_all_files_impl(&state, src, prefix, filename).await
+}
+
+/// download-all-files 的 workspace 无关实现 (prefix/filename 由壳层拼:
+/// computer=`{user}_{cId}/` 与 `{user}_{cId}.zip`)。
+pub(crate) async fn download_all_files_impl(
+    state: &AppState,
+    src: std::path::PathBuf,
+    prefix: String,
+    filename: String,
+) -> Result<Response, AppError> {
+    let tmp = computer_tmp_zip(state).await?;
 
     // 工作区不存在 → 空 zip 兜底 (仅含顶层目录条目, 对齐 nuwax)
     if !src.exists() {

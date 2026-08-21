@@ -3,6 +3,8 @@
 //! 从 `files` 拆出 (读/写分离, 避免单文件膨胀)。写类 handler (delete-workspace /
 //! files-update / upload / generate-file / import-project) 仍留在 [`super::files`]。
 
+use std::path::{Path, PathBuf};
+
 use axum::extract::State;
 use garde::Validate;
 use serde_json::{Value, json};
@@ -31,29 +33,54 @@ pub(crate) async fn get_file_list(
     Query(q): Query<FileListQuery>,
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
+    let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
+        .await?;
+    get_file_list_impl(
+        &state,
+        &path,
+        FileListParams {
+            proxy_path: q.proxy_path.as_deref(),
+            relative_path: q.relative_path.as_deref(),
+            recursive: q.recursive.as_deref(),
+            custom_target_dir: q.custom_target_dir.as_deref(),
+        },
+    )
+    .await
+}
+
+/// get-file-list 的 workspace 无关实现 (computer / userapp 域共用;
+/// 定位由各域壳层完成, 此处只收目标根路径 + 业务参数)。
+pub(crate) struct FileListParams<'a> {
+    pub proxy_path: Option<&'a str>,
+    pub relative_path: Option<&'a str>,
+    /// 原始 recursive 串: 缺省/非 "false" 均按递归 (对齐 TS)。
+    pub recursive: Option<&'a str>,
+    /// 原始 customTargetDir 串: 仅用于 fileProxyUrl 后缀 (定位语义由壳层消化)。
+    pub custom_target_dir: Option<&'a str>,
+}
+
+pub(crate) async fn get_file_list_impl(
+    state: &AppState,
+    path: &Path,
+    p: FileListParams<'_>,
+) -> Result<Json<Value>, AppError> {
     // 默认 true=原全量递归; 仅显式 "false" 时单层 (对齐 TS recursive === false || recursive === "false")。
     // 注: query 参数经 serde 解析均为字符串, 故只需匹配 "false"。
     // 提前计算: 所有返回点 (含目录不存在的早返回) 都需带上 recursive (对齐 TS 1.3.7)。
-    let is_recursive = !matches!(q.recursive.as_deref(), Some("false"));
-    let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
-        .await?;
+    let is_recursive = !matches!(p.recursive, Some("false"));
     // 对齐 nuwax: 目标根目录不存在 → 返回空数组 (非报错), 带 recursive
-    if !crate::service::fs_util::path_exists(&path).await? {
+    if !crate::service::fs_util::path_exists(path).await? {
         return Ok(Json(
             json!({ "success": true, "files": [], "recursive": is_recursive }),
         ));
     }
-    let ct = q
-        .custom_target_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let ct = trimmed_non_empty(p.custom_target_dir);
     // list_files_meta 内部解析 relativePath (越界 / 非目录抛 ValidationError → 400)。
     let mut files = tree::list_files_meta(
-        &path,
+        path,
         &state.config,
-        q.proxy_path.as_deref(),
-        q.relative_path.as_deref(),
+        p.proxy_path,
+        p.relative_path,
         is_recursive,
     )
     .await?;
@@ -93,17 +120,28 @@ pub(crate) async fn resolve_file(
     q.validate().map_err(crate::error::from_garde)?;
     let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
         .await?;
-    let file_path = q.file_path.trim();
+    resolve_file_impl(
+        path,
+        q.file_path.trim(),
+        q.proxy_path.as_deref(),
+        q.custom_target_dir.as_deref(),
+    )
+    .await
+}
+
+/// resolve-file 的 workspace 无关实现。
+pub(crate) async fn resolve_file_impl(
+    path: PathBuf,
+    file_path: &str,
+    proxy_path: Option<&str>,
+    custom_target_dir: Option<&str>,
+) -> Result<Json<Value>, AppError> {
     // 目标根目录不存在 → exists:false (对齐 TS)
     if !crate::service::fs_util::path_exists(&path).await? {
         return Ok(Json(json!({ "success": true, "exists": false })));
     }
-    let ct = q
-        .custom_target_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let result = tree::resolve_existing_file(&path, file_path, q.proxy_path.as_deref()).await?;
+    let ct = trimmed_non_empty(custom_target_dir);
+    let result = tree::resolve_existing_file(&path, file_path, proxy_path).await?;
     match result {
         Some(mut r) => {
             // customTargetDir 后缀统一在此追加 (对齐 nuwax)
@@ -138,19 +176,46 @@ pub(crate) async fn search_files(
     Query(q): Query<SearchFilesQuery>,
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
-    let kw = q.kw.trim();
-    // garde positive_int 已保证正整数; 此处仅取数 (parse 失败逻辑不可达, 防御性处理)
-    let limit = parse_positive_int(&q.limit, "limit")?;
-    let max_visit = parse_positive_int(&q.max_visit, "maxVisit")?;
-    let timeout_ms = parse_positive_int(&q.timeout_ms, "timeoutMs")?;
-
     let path = resolve_computer_target(&state, &q.user_id, &q.c_id, q.custom_target_dir.as_deref())
         .await?;
-    let ct = q
-        .custom_target_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    search_files_impl(
+        &state,
+        path,
+        SearchFilesParams {
+            proxy_path: q.proxy_path.as_deref(),
+            relative_path: q.relative_path.as_deref(),
+            kw: q.kw.trim(),
+            limit: &q.limit,
+            max_visit: &q.max_visit,
+            timeout_ms: &q.timeout_ms,
+            custom_target_dir: q.custom_target_dir.as_deref(),
+        },
+    )
+    .await
+}
+
+/// search-files 的 workspace 无关实现。
+pub(crate) struct SearchFilesParams<'a> {
+    pub proxy_path: Option<&'a str>,
+    pub relative_path: Option<&'a str>,
+    pub kw: &'a str,
+    pub limit: &'a str,
+    pub max_visit: &'a str,
+    pub timeout_ms: &'a str,
+    pub custom_target_dir: Option<&'a str>,
+}
+
+pub(crate) async fn search_files_impl(
+    state: &AppState,
+    path: PathBuf,
+    p: SearchFilesParams<'_>,
+) -> Result<Json<Value>, AppError> {
+    // garde positive_int 已保证正整数; 此处仅取数 (parse 失败逻辑不可达, 防御性处理)
+    let limit = parse_positive_int(p.limit, "limit")?;
+    let max_visit = parse_positive_int(p.max_visit, "maxVisit")?;
+    let timeout_ms = parse_positive_int(p.timeout_ms, "timeoutMs")?;
+
+    let ct = trimmed_non_empty(p.custom_target_dir);
     // 目标根目录不存在 → 空 (对齐 TS)
     if !crate::service::fs_util::path_exists(&path).await? {
         return Ok(Json(json!({
@@ -163,9 +228,9 @@ pub(crate) async fn search_files(
     let mut result = tree::search_files(tree::SearchParams {
         root: &path,
         config: &state.config,
-        proxy_path: q.proxy_path.as_deref(),
-        kw,
-        relative_path: q.relative_path.as_deref(),
+        proxy_path: p.proxy_path,
+        kw: p.kw,
+        relative_path: p.relative_path,
         limit,
         max_visit,
         timeout_ms: timeout_ms as u64,
@@ -191,6 +256,11 @@ pub(crate) async fn search_files(
     })))
 }
 
+/// trim 后非空才返回 (customTargetDir 的 URL 后缀语义)。
+pub(crate) fn trimmed_non_empty(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// 取数 helper: 与 garde `positive_int` 规则配套 (校验已通过, parse 失败逻辑不可达)。
 fn parse_positive_int(value: &str, field: &str) -> Result<usize, AppError> {
     value
@@ -210,7 +280,7 @@ mod tests {
     };
 
     /// 构造一个指向临时目录的 AppState (computer root = temp)，镜像 FileServerBuilder::build。
-    fn make_state(computer_root: std::path::PathBuf) -> AppState {
+    fn make_state(computer_root: PathBuf) -> AppState {
         let config = Arc::new(Config::default());
         let resolver: Arc<dyn WorkspaceResolver> = Arc::new(LocalWorkspaceResolver::new(
             config.project_source_dir.clone(),
@@ -231,7 +301,7 @@ mod tests {
     }
 
     /// 准备一个工作区并写入若干文件 (computer_root/u/c/...).
-    async fn seed_workspace(computer_root: &std::path::Path) {
+    async fn seed_workspace(computer_root: &Path) {
         let ws = computer_root.join("u").join("c");
         tokio::fs::create_dir_all(ws.join("sub")).await.unwrap();
         tokio::fs::write(ws.join("a.txt"), "a").await.unwrap();

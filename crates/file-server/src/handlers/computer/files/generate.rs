@@ -1,5 +1,7 @@
 //! generate-file handler: JSON 文本生成文件。
 
+use std::path::PathBuf;
+
 use axum::extract::State;
 use garde::Validate;
 use serde::Deserialize;
@@ -49,9 +51,6 @@ pub(crate) async fn generate_file(
     Json(body): Json<GenerateFileBody>,
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    // 对齐 TS generateFile: normalizedFileName = fileName.trim() (空判断只看 trim 后是否空)。
-    let normalized = body.file_name.trim();
-    let content = body.content.unwrap_or_default();
     let ws = resolve_computer_target(
         &state,
         &body.user_id,
@@ -59,9 +58,18 @@ pub(crate) async fn generate_file(
         body.custom_target_dir.as_deref(),
     )
     .await?;
+    generate_file_impl(ws, body.file_name.trim(), body.content.unwrap_or_default()).await
+}
+
+/// generate-file 的 workspace 无关实现 (`file_name` 已 trim; 内容缺省空串)。
+pub(crate) async fn generate_file_impl(
+    ws: PathBuf,
+    file_name: &str,
+    content: String,
+) -> Result<Json<Value>, AppError> {
     // 对齐 TS uploadFile.normalizeFilePath: 路径拼接时剥离前导 `/`
     // (允许 "src/foo.txt" 这类相对子路径;绝对路径会被 ensure_within 拒)。
-    let target = path_safety::ensure_within(&ws, normalized.trim_start_matches('/'))?;
+    let target = path_safety::ensure_within(&ws, file_name.trim_start_matches('/'))?;
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -73,7 +81,7 @@ pub(crate) async fn generate_file(
     Ok(Json(json!({
         "success": true,
         "message": "File generated successfully",
-        "fileName": normalized,
+        "fileName": file_name,
         "fileSize": file_size,
     })))
 }
@@ -89,7 +97,7 @@ mod tests {
     };
 
     /// 构造一个指向临时目录的 AppState (computer root = temp)，镜像 FileServerBuilder::build。
-    fn make_state(computer_root: std::path::PathBuf) -> AppState {
+    fn make_state(computer_root: PathBuf) -> AppState {
         let config = Arc::new(Config::default());
         let resolver: Arc<dyn WorkspaceResolver> = Arc::new(LocalWorkspaceResolver::new(
             config.project_source_dir.clone(),

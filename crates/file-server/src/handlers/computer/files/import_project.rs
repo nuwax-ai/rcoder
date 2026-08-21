@@ -96,13 +96,25 @@ pub(crate) async fn import_project(
     validate_zip_ext(file_name.as_deref())?;
     let target_dir =
         resolve_computer_target(&state, &v.user_id, &v.cid, custom_target_dir.as_deref()).await?;
+    import_project_impl(target_dir, v.data, &v.user_id, "cId", &v.cid).await
+}
+
+/// import-project 的 workspace 无关实现 (`id_label` 为工作区标识回显键名:
+/// computer 域 "cId" / userapp 域 "appId")。
+pub(crate) async fn import_project_impl(
+    target_dir: std::path::PathBuf,
+    data: TemporaryFile,
+    user_id: &str,
+    id_label: &str,
+    id_value: &str,
+) -> Result<Json<Value>, AppError> {
     tokio::fs::create_dir_all(&target_dir).await?;
-    let res = crate::service::computer_ws::import_project(&target_dir, v.data.path()).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Project imported successfully",
-        "userId": v.user_id,
-        "cId": v.cid,
-        "targetDir": res.target_dir,
-    })))
+    let res = crate::service::computer_ws::import_project(&target_dir, data.path()).await?;
+    let mut resp = serde_json::Map::new();
+    resp.insert("success".into(), json!(true));
+    resp.insert("message".into(), json!("Project imported successfully"));
+    resp.insert("userId".into(), json!(user_id));
+    resp.insert(id_label.into(), json!(id_value));
+    resp.insert("targetDir".into(), json!(res.target_dir));
+    Ok(Json(Value::Object(resp)))
 }

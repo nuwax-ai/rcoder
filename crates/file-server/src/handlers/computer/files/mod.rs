@@ -8,6 +8,8 @@ pub(crate) mod generate;
 pub(crate) mod import_project;
 pub(crate) mod upload;
 
+use std::path::Path;
+
 use axum::extract::State;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -51,19 +53,19 @@ pub(crate) async fn delete_workspace(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FilesUpdateBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    user_id: String,
+    pub(crate) user_id: String,
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    c_id: String,
-    files: Vec<code_service::FileOp>,
+    pub(crate) c_id: String,
+    pub(crate) files: Vec<code_service::FileOp>,
     #[serde(default)]
-    custom_target_dir: Option<String>,
+    pub(crate) custom_target_dir: Option<String>,
 }
 
 /// `POST /api/computer/files-update` (对齐 nuwax computer updateFiles; 增量 create/delete/rename/modify)。
 #[utoipa::path(post, path = "/files-update", request_body = FilesUpdateBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
 pub(crate) async fn files_update(
     State(state): State<AppState>,
-    Json(mut body): Json<FilesUpdateBody>,
+    Json(body): Json<FilesUpdateBody>,
 ) -> Result<Json<Value>, AppError> {
     let path = resolve_computer_target(
         &state,
@@ -72,30 +74,37 @@ pub(crate) async fn files_update(
         body.custom_target_dir.as_deref(),
     )
     .await?;
+    files_update_impl(&path, body.files, &body.user_id, "cId", &body.c_id).await
+}
+
+/// files-update 的 workspace 无关实现 (`id_label` 为工作区标识回显键名:
+/// computer 域 "cId" / userapp 域 "appId")。
+pub(crate) async fn files_update_impl(
+    ws: &Path,
+    mut files: Vec<code_service::FileOp>,
+    user_id: &str,
+    id_label: &str,
+    id_value: &str,
+) -> Result<Json<Value>, AppError> {
     // 工作区不存在 → 创建 (对齐 nuwax computerFileUtils.updateFiles: !existsSync → mkdirSync recursive)。
     // 首次向全新 user/cId 工作区写入不应失败。
-    tokio::fs::create_dir_all(&path).await?;
+    tokio::fs::create_dir_all(ws).await?;
     // decodeURIComponent 文本内容 (对齐 nuwax safeDecodePath)
-    for op in body.files.iter_mut() {
+    for op in files.iter_mut() {
         if let Some(c) = op.contents.as_mut()
             && !c.is_empty()
         {
             *c = code_service::decode_uri_component(c);
         }
     }
-    let count = body.files.len();
+    let count = files.len();
     // computer updateFiles: modify 用字节比较 (非 project 的行级 diff; 对齐 nuwax)
-    code_service::apply_file_ops(
-        &path,
-        &body.files,
-        code_service::ModifyStrategy::ByteCompare,
-    )
-    .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "User files updated successfully",
-        "userId": body.user_id,
-        "cId": body.c_id,
-        "filesCount": count,
-    })))
+    code_service::apply_file_ops(ws, &files, code_service::ModifyStrategy::ByteCompare).await?;
+    let mut resp = serde_json::Map::new();
+    resp.insert("success".into(), json!(true));
+    resp.insert("message".into(), json!("User files updated successfully"));
+    resp.insert("userId".into(), json!(user_id));
+    resp.insert(id_label.into(), json!(id_value));
+    resp.insert("filesCount".into(), json!(count));
+    Ok(Json(Value::Object(resp)))
 }

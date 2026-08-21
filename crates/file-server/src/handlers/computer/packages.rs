@@ -38,10 +38,19 @@ pub(crate) async fn install_project(
     Json(body): Json<InstallBody>,
 ) -> Result<Json<Value>, AppError> {
     let ws = ws_path(&state, &body.user_id, &body.c_id).await?;
+    install_project_impl(&state, ws, &body.programming_language).await
+}
+
+/// install-project 的 workspace 无关实现 (typescript→pnpm / python→pip, 按语言找 manifest)。
+pub(crate) async fn install_project_impl(
+    state: &AppState,
+    ws: PathBuf,
+    programming_language: &str,
+) -> Result<Json<Value>, AppError> {
     if !ws.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
-    let lang = body.programming_language.to_ascii_lowercase();
+    let lang = programming_language.to_ascii_lowercase();
     let skip = package_build::package_search_skip_dirs(&state.config.zip_workspace_exclude);
     let (program, args, project_dir): (&str, Vec<&str>, Option<PathBuf>) = match lang.as_str() {
         "typescript" | "ts" => {

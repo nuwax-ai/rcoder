@@ -99,15 +99,25 @@ pub(crate) async fn init_project_template(
     let fields = InitTemplateFields { user_id, cid, data };
     let v = fields.into_validated()?;
     let ws = ws_path(&state, &v.user_id, &v.cid).await?;
+    init_project_template_impl(&state, ws, v.data, enable_git).await
+}
+
+/// init-project-template 的 workspace 无关实现。
+pub(crate) async fn init_project_template_impl(
+    state: &AppState,
+    ws: std::path::PathBuf,
+    data: TemporaryFile,
+    enable_git: bool,
+) -> Result<Json<Value>, AppError> {
     tokio::fs::create_dir_all(&ws).await?;
-    zip::extract_to(v.data.path().to_path_buf(), ws.clone()).await?;
+    zip::extract_to(data.path().to_path_buf(), ws.clone()).await?;
     // git 双开关: GIT_ENABLED && enableGit → init + initial commit (对齐 nuwax)
     if state.config.git_enabled && enable_git {
         let an = state.config.git_default_author_name.clone();
         let ae = state.config.git_default_author_email.clone();
         // init_repo 内部已含 initial commit (ensure_repo + ensure_gitignore + commit_indexed)
         if let Err(e) = crate::service::git::init_repo(&ws, &an, &ae) {
-            tracing::warn!(error = %e, "git init_repo after template init failed (skipping)");
+            tracing::warn!(error = %e, "git init_repo after template init failed (skipped)");
         }
     }
     Ok(Json(json!({

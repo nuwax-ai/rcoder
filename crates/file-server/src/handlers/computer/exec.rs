@@ -43,6 +43,15 @@ pub(crate) async fn execute_command(
 ) -> Result<Json<Value>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let cwd = ws_path(&state, &body.user_id, &body.c_id).await?;
+    execute_command_impl(&state, cwd, &body.command).await
+}
+
+/// execute-command 的 workspace 无关实现 (cwd=workspace; command 经 shell -c)。
+pub(crate) async fn execute_command_impl(
+    state: &AppState,
+    cwd: PathBuf,
+    command: &str,
+) -> Result<Json<Value>, AppError> {
     if !cwd.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -53,7 +62,7 @@ pub(crate) async fn execute_command(
         if b.is_empty() { "sh" } else { b }
     };
     let mut cmd = tokio::process::Command::new(shell);
-    cmd.arg("-c").arg(&body.command);
+    cmd.arg("-c").arg(command);
     cmd.current_dir(&cwd);
     cmd.env("NODE_ENV", "development");
     cmd.env_remove("CI");
@@ -105,6 +114,15 @@ pub(crate) async fn get_logs(
     let log_dir = resolve_computer_target(&state, &q.user_id, &q.c_id, None)
         .await?
         .join(".logs");
+    get_logs_impl(&state, log_dir, q.tail_lines).await
+}
+
+/// get-logs 的 workspace 无关实现 (log_dir={ws}/.logs, 由壳层拼好)。
+pub(crate) async fn get_logs_impl(
+    state: &AppState,
+    log_dir: PathBuf,
+    tail_lines: usize,
+) -> Result<Json<Value>, AppError> {
     let empty_resp = |msg: &str| {
         Json(json!({
             "success": true,
@@ -136,7 +154,7 @@ pub(crate) async fn get_logs(
     // 过滤空行 (对齐 nuwax filter(l => l.length > 0))
     let all: Vec<&str> = content.split('\n').filter(|l| !l.is_empty()).collect();
     let total = all.len();
-    let start = total.saturating_sub(q.tail_lines);
+    let start = total.saturating_sub(tail_lines);
     let logs: Vec<Value> = all[start..]
         .iter()
         .enumerate()

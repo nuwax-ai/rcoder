@@ -155,10 +155,19 @@ pub(crate) async fn upload_file(
     let v = fields.into_validated()?;
     let ws =
         resolve_computer_target(&state, &v.user_id, &v.cid, custom_target_dir.as_deref()).await?;
-    let target = path_safety::ensure_within(&ws, &v.file_path)?;
+    upload_file_impl(&ws, &v.file_path, v.data).await
+}
+
+/// upload-file 的 workspace 无关实现。
+pub(crate) async fn upload_file_impl(
+    ws: &Path,
+    file_path: &str,
+    data: TemporaryFile,
+) -> Result<Json<Value>, AppError> {
+    let target = path_safety::ensure_within(ws, file_path)?;
     // copy_file 内部已 create_dir_all(parent), 无需重复
-    let file_size = v.data.size();
-    crate::service::temp_file::copy_file(v.data.path(), &target).await?;
+    let file_size = data.size();
+    crate::service::temp_file::copy_file(data.path(), &target).await?;
     Ok(Json(json!({
         "success": true,
         "message": "File uploaded successfully",
@@ -211,11 +220,20 @@ pub(crate) async fn upload_files(
     }
     let ws =
         resolve_computer_target(&state, &v.user_id, &v.cid, custom_target_dir.as_deref()).await?;
+    upload_files_impl(&ws, &file_paths, &files_vec).await
+}
+
+/// upload-files 的 workspace 无关实现 (单文件错误隔离: 单个失败不影响其余)。
+pub(crate) async fn upload_files_impl(
+    ws: &Path,
+    file_paths: &[String],
+    files_vec: &[(Option<String>, TemporaryFile)],
+) -> Result<Json<Value>, AppError> {
     let total = file_paths.len();
     let mut success_count = 0usize;
     let mut results: Vec<Value> = Vec::new();
-    for (fp, (original, data)) in file_paths.iter().zip(&files_vec) {
-        let target = match path_safety::ensure_within(&ws, fp) {
+    for (fp, (original, data)) in file_paths.iter().zip(files_vec) {
+        let target = match path_safety::ensure_within(ws, fp) {
             Ok(t) => t,
             Err(_) => {
                 results.push(json!({
