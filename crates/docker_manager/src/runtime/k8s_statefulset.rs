@@ -181,22 +181,28 @@ impl KubernetesRuntime {
                     .labels
                     .as_ref()
                     .and_then(|l| l.get(SERVICE_TYPE_LABEL));
+                let desired_ws_claim = workspace_claim_name(&pod_spec);
+                let existing_ws_claim = existing
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.template.spec.as_ref())
+                    .and_then(workspace_claim_name);
                 if existing_st != Some(&service_type.to_string()) {
                     warn!(
                         "[K8S-STS] {} exists but service_type mismatch (existing={:?}, requested={:?}); recreating",
                         sts_name, existing_st, service_type
                     );
-                    self.delete_agent_statefulset(identifier, service_type)
+                    self.recreate_agent_statefulset(identifier, service_type, pod_spec, replicas)
                         .await?;
-                    let sts =
-                        self.build_agent_statefulset(identifier, service_type, pod_spec, replicas)?;
-                    sts_api
-                        .create(&PostParams::default(), &sts)
-                        .await
-                        .map_err(|e| {
-                            ContainerRuntimeError::K8sError(format!("recreate sts: {e}"))
-                        })?;
-                    info!("[K8S-STS] recreated {} (type={:?})", sts_name, service_type);
+                } else if desired_ws_claim.is_some() && desired_ws_claim != existing_ws_claim {
+                    // workspace 卷漂移（如 builder per-app PVC → 开发共享卷的拓扑变更）:
+                    // STS template 不滚动更新, 不重建会与新代码定位分裂数据面（build 读不到源码）。
+                    warn!(
+                        "[K8S-STS] {} workspace PVC drift (existing={:?}, desired={:?}); recreating",
+                        sts_name, existing_ws_claim, desired_ws_claim
+                    );
+                    self.recreate_agent_statefulset(identifier, service_type, pod_spec, replicas)
+                        .await?;
                 } else {
                     // 类型匹配：scale 到期望 replicas（幂等）
                     self.scale_agent_statefulset(identifier, service_type, replicas)
@@ -222,6 +228,26 @@ impl KubernetesRuntime {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// 删旧重建 StatefulSet（service_type/卷漂移共用路径; PVC 数据不动）。
+    async fn recreate_agent_statefulset(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        pod_spec: PodSpec,
+        replicas: i32,
+    ) -> ContainerRuntimeResult<()> {
+        let sts_name = self.pod_name(identifier, service_type)?;
+        self.delete_agent_statefulset(identifier, service_type)
+            .await?;
+        let sts = self.build_agent_statefulset(identifier, service_type, pod_spec, replicas)?;
+        self.statefulsets()
+            .create(&PostParams::default(), &sts)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("recreate sts: {e}")))?;
+        info!("[K8S-STS] recreated {} (type={:?})", sts_name, service_type);
         Ok(())
     }
 
@@ -280,4 +306,15 @@ impl KubernetesRuntime {
             ))),
         }
     }
+}
+
+/// 取 PodSpec 里 name=workspace 卷的 PVC claim 名（漂移检测用）。
+fn workspace_claim_name(spec: &PodSpec) -> Option<String> {
+    spec.volumes
+        .as_ref()?
+        .iter()
+        .find(|v| v.name == "workspace")?
+        .persistent_volume_claim
+        .as_ref()
+        .map(|p| p.claim_name.clone())
 }

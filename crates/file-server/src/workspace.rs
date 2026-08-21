@@ -121,10 +121,12 @@ pub fn resolve_userapp_dev(
     custom_target_dir: Option<&str>,
     config: &crate::Config,
 ) -> AppResult<PathBuf> {
+    // identifier 校验先于 override（与 computer 域 resolve_computer_target 对称:
+    // 总是先校验定位字段, 再应用 customTargetDir 信任覆盖）
+    let app_id = validated_identifier(app_id, "appId")?;
     if let Some(ct) = non_empty(custom_target_dir) {
         return Ok(PathBuf::from(ct));
     }
-    let app_id = validated_identifier(app_id, "appId")?;
     Ok(config.userapp_workspace_dir.join(app_id))
 }
 

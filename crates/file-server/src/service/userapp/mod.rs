@@ -1,7 +1,7 @@
 //! UserApp workspace 多项目打包：两级 manifest → 遍历子项目 build_generic → 组装整体包。
 //!
-//! - `app_id` = file-server `project_id`（复用 [`WorkspaceResolver::resolve_project`]，
-//!   不新建 resolve_userapp）。workspace 根下有多个子项目（前端/后端/...）。
+//! - workspace 定位统一 [`crate::workspace::resolve_userapp_dev`]（UserApp 开发卷, 容器无关）。
+//!   workspace 根下有多个子项目（前端/后端/...）。
 //! - file-server 严格读取 Manifest v1，并自动发现一级子项目。
 //! - 组装成版本化整体包 `workspace-package-<release_id>.zip`，内含 release lock。
 //!

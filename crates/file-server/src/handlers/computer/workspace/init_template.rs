@@ -117,7 +117,7 @@ pub(crate) async fn init_project_template_impl(
         let ae = state.config.git_default_author_email.clone();
         // init_repo 内部已含 initial commit (ensure_repo + ensure_gitignore + commit_indexed)
         if let Err(e) = crate::service::git::init_repo(&ws, &an, &ae) {
-            tracing::warn!(error = %e, "git init_repo after template init failed (skipped)");
+            tracing::warn!(error = %e, "git init_repo after template init failed (skipping)");
         }
     }
     Ok(Json(json!({

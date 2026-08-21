@@ -388,13 +388,8 @@ impl<'a> AgentContainerStarter<'a> {
                     .await
                     {
                         Ok(userapp_host) => {
-                            if let Err(e) = std::fs::create_dir_all(&userapp_host) {
-                                warn!(
-                                    "[DOCKER_MGR] Failed to create userapp host dir {}: {}",
-                                    userapp_host.display(),
-                                    e
-                                );
-                            }
+                            // bind 源由 Docker daemon 自动创建, 不在 rcoder 容器内
+                            // mkdir 宿主路径（容器内无该父链, 恒失败徒增噪音）。
                             let target = match service_type {
                                 ServiceType::UserAppBuilder => "/app/userapp-workspace".to_string(),
                                 _ => shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string(),
@@ -411,10 +406,21 @@ impl<'a> AgentContainerStarter<'a> {
                                 target
                             );
                         }
-                        Err(e) => warn!(
-                            "[DOCKER_MGR] resolve userapp host path failed, skip dev volume: {}",
-                            e
-                        ),
+                        Err(e) => {
+                            if matches!(service_type, ServiceType::UserAppBuilder) {
+                                // builder 已跳过 per-app 主挂载, 共享卷是唯一 workspace——
+                                // 解析失败若静默跳过, build 数据面全错, fail fast。
+                                return Err(DockerError::ContainerCreationError(format!(
+                                    "UserAppBuilder userapp dev volume resolve failed \
+                                     (rcoder 容器需挂载 /app/userapp-workspace): {e}"
+                                )));
+                            }
+                            // 沙箱: 开发卷缺失只影响 UserApp 开发功能, warn 降级不阻断沙箱
+                            warn!(
+                                "[DOCKER_MGR] resolve userapp host path failed, skip dev volume: {}",
+                                e
+                            );
+                        }
                     }
                 }
             }

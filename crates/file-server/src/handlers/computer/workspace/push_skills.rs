@@ -81,8 +81,13 @@ async fn push_skills_to_workspace_impl(
             _ => {}
         }
     }
-    let (_user_id, cid) = require_workspace_fields(user_id, cid)?;
-    let ws = ws_path(&state, &_user_id, &cid).await?;
+    let (user_id, cid) = require_workspace_fields(user_id, cid)?;
+    // URL 数校验先于 ws_path（ws_path 在阶段2 Subvolume resolver 下有 ensure-PVC 副作用,
+    // 无效请求不应触发; 对齐抽取前的顺序）
+    state
+        .skill_downloader
+        .validate_url_count(skill_urls.len())?;
+    let ws = ws_path(&state, &user_id, &cid).await?;
     push_skills_impl(
         &state,
         &ws,
@@ -109,9 +114,6 @@ pub(crate) async fn push_skills_impl(
     agent_id: Option<&str>,
     allow_agent_store: bool,
 ) -> Result<Json<Value>, AppError> {
-    state
-        .skill_downloader
-        .validate_url_count(skill_urls.len())?;
     if !crate::service::fs_util::path_exists(ws).await? {
         return Err(AppError::resource("workspace does not exist"));
     }
@@ -133,6 +135,7 @@ pub(crate) async fn push_skills_impl(
             .await?
         } else {
             tracing::info!(
+                cid,
                 agent_id,
                 "push skills: agentId present but workspace not symlinked, use legacy path"
             );
