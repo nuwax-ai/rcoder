@@ -178,9 +178,11 @@ impl KubernetesRuntime {
             .or_else(|| docker_service.map(|sc| sc.workspace_container_path()))
             .unwrap_or_else(|| match service_type {
                 ServiceType::ComputerAgentRunner => "/home/user".to_string(),
-                // UserAppBuilder: UserApp 开发共享卷挂载点(file-server PROJECT_SOURCE_DIR/
-                // USERAPP_WORKSPACE_DIR 与之一致; PVC 名见 workspace_pvc_name 的共享卷特判)
-                ServiceType::UserAppBuilder => "/app/userapp-workspace".to_string(),
+                // UserAppBuilder 开发容器: per-app RWO PVC 整卷挂载（与镜像 start-up.sh
+                // 导出的 USERAPP_WORKSPACE_DIR 一致, file-server/agent_runner 均按此根工作）
+                ServiceType::UserAppBuilder => {
+                    shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string()
+                }
                 _ => "/app/project_workspace".to_string(),
             });
 
@@ -193,19 +195,6 @@ impl KubernetesRuntime {
             }),
             ..Default::default()
         }];
-        // computer 沙箱额外挂 UserApp 开发共享卷（helm 预建 RWX PVC）:
-        // /home/user/userapp-workspace/{app_id}/ ——沙箱 file-server 的 /api/userapp
-        // 镜像接口族（USERAPP_WORKSPACE_DIR）与 builder 共卷同构目录。
-        if matches!(service_type, ServiceType::ComputerAgentRunner) {
-            volumes_vec.push(Volume {
-                name: "userapp-workspace".to_string(),
-                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                    claim_name: super::k8s_pvc::userapp_shared_pvc_name(&self.namespace),
-                    read_only: Some(false),
-                }),
-                ..Default::default()
-            });
-        }
         let extra_volumes: Vec<K8sVolumeSpec> =
             k8s_service.map(|s| s.volumes.clone()).unwrap_or_default();
         for v in extra_volumes.iter().flat_map(Self::translate_k8s_volume) {
@@ -216,19 +205,10 @@ impl KubernetesRuntime {
         let mut volume_mounts_vec: Vec<VolumeMount> = vec![VolumeMount {
             name: "workspace".to_string(),
             mount_path: workspace_mount_path,
-            sub_path: workspace_sub_path, // computer→Some(user_id)，web→None
+            sub_path: workspace_sub_path, // computer→Some(user_id)，web→None；builder→None(整卷)
             read_only: Some(false),
             ..Default::default()
         }];
-        if matches!(service_type, ServiceType::ComputerAgentRunner) {
-            volume_mounts_vec.push(VolumeMount {
-                name: "userapp-workspace".to_string(),
-                mount_path: shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string(),
-                sub_path: None, // 整卷挂载, {app_id} 子目录在卷内
-                read_only: Some(false),
-                ..Default::default()
-            });
-        }
         let extra_mounts: Vec<K8sVolumeMountSpec> = k8s_service
             .map(|s| s.volume_mounts.clone())
             .unwrap_or_default();
@@ -324,28 +304,17 @@ impl KubernetesRuntime {
                         // (UserApp 实际走 create_deployment,不经此路径;
                         //  ComputerAgentRunner 走 start-up.sh 启 ttyd/VNC + agent_runner)
                         ServiceType::ComputerAgentRunner | ServiceType::UserApp => None,
-                        // UserAppBuilder 是 lean build agent(无桌面):显式跑 agent_runner
-                        // (读 kubernetes_config.user-app-builder.command),不经 start-up.sh/ttyd/VNC。
-                        // agent_runner 读 RCODER_EMBED_FILE_SERVER=true 内嵌 file-server(build 入口 :60000)。
-                        // 裸跑 fallback 用 agent-runner 镜像路径 /usr/local/bin/agent_runner(非 rcoder 主镜像的 /app/bin)。
-                        ServiceType::UserAppBuilder => {
-                            let cmd = k8s_service
-                                .and_then(|sc| {
-                                    if sc.command.is_empty() {
-                                        None
-                                    } else {
-                                        Some(sc.command.clone())
-                                    }
-                                })
-                                .unwrap_or_else(|| {
-                                    vec![
-                                        "/usr/local/bin/agent_runner".to_string(),
-                                        "--port".to_string(),
-                                        "8086".to_string(),
-                                    ]
-                                });
-                            Some(cmd)
-                        }
+                        // UserAppBuilder 完整开发容器: 默认镜像 ENTRYPOINT/start-up.sh
+                        // 起 agent_runner + 内嵌 file-server(60000) + PG 全套——userApp 的
+                        // 文件/exec/dev-server/构建/chat 开发对话都在此容器内执行;
+                        // kubernetes_config.user-app-builder.command 仍可显式覆盖。
+                        ServiceType::UserAppBuilder => k8s_service.and_then(|sc| {
+                            if sc.command.is_empty() {
+                                None
+                            } else {
+                                Some(sc.command.clone())
+                            }
+                        }),
                     },
                     env: {
                         let mut env_vars = vec![

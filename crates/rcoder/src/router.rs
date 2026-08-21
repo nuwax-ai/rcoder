@@ -144,6 +144,12 @@ impl AppState {
         .await
         .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?;
 
+        // UserApp 开发资源回收回调（app purge 时回收 UserAppBuilder 开发容器 +
+        // per-app PVC；app_manager 的 runtime 视图无 agent 能力，经契约委托本进程）
+        app_service_instance.set_dev_cleanup(Arc::new(
+            crate::userapp_publish::agent_runner::UserappDevResourcesCleanup::new(runtime.clone()),
+        ));
+
         // P3：PG 模式的应用业务元数据持久化（query name/created_at 过滤数据源）。
         // 装配在 AppService 构造后（内存 cache 在其内部）；load 失败阻断启动——
         // 过滤数据缺失会让 query 语义静默漂移，宁可 Fail Fast。

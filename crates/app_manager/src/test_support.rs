@@ -179,6 +179,7 @@ pub(crate) fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime>) -> 
         pingora_ports: DashMap::new(),
         release_locks: DashMap::new(),
         metadata: crate::app_metadata::AppMetadataStore::default(),
+        dev_cleanup: std::sync::RwLock::new(None),
     }
 }
 

@@ -316,12 +316,23 @@ impl<'a> AgentContainerStarter<'a> {
                                 std::path::PathBuf::from(&workspace_container),
                             )
                         }
-                        // RCoder/UserApp/UserAppBuilder: 一个 project_id/app_id 对应一个容器
+                        // UserAppBuilder 完整开发容器（per-app）:
+                        // 宿主 {userapp 根}/{app_id} → 容器 USERAPP_WORKSPACE_ROOT（整目录,
+                        // 无 {app_id} 子层——与 K8s per-app PVC 整卷挂载同构;
+                        // resolution path 由 config user-app-builder 段配置为
+                        // /app/userapp-workspace, 经 rcoder compose bind 反解宿主根）
+                        ServiceType::UserAppBuilder => {
+                            let pid = project_id.as_deref().unwrap_or("default");
+                            (
+                                pid.to_string(),
+                                std::path::PathBuf::from(
+                                    shared_types::paths::USERAPP_WORKSPACE_ROOT,
+                                ),
+                            )
+                        }
+                        // RCoder/UserApp: 一个 project_id 对应一个容器
                         // 挂载: 宿主机 /project_workspace/{project_id} → 容器 /project_workspace/{project_id}
-                        // (UserAppBuilder 在 K8s 走 per-app PVC 特判;Docker 模式复用此挂载)
-                        ServiceType::WebAgentRunner
-                        | ServiceType::UserApp
-                        | ServiceType::UserAppBuilder => {
+                        ServiceType::WebAgentRunner | ServiceType::UserApp => {
                             let pid = project_id.as_deref().unwrap_or("default");
                             (
                                 pid.to_string(),
@@ -330,11 +341,6 @@ impl<'a> AgentContainerStarter<'a> {
                         }
                     }
                 };
-
-                // UserAppBuilder 的 workspace 是共享开发卷（下方追加挂载整卷）,
-                // 跳过 per-app 子目录主挂载, 避免与共享卷挂载路径嵌套错乱。
-                let primary_mount_disabled =
-                    matches!(service_type, ServiceType::UserAppBuilder) && pod_id.is_none();
 
                 let host_mount = workspace_host_path.join(&host_sub);
 
@@ -357,7 +363,7 @@ impl<'a> AgentContainerStarter<'a> {
                     );
                 }
 
-                if !primary_mount_disabled {
+                {
                     let host_mount_str = host_mount.to_string_lossy().to_string();
                     let container_mount_str = container_mount.to_string_lossy().to_string();
                     auto_injected_paths.insert(container_mount_str.clone());
@@ -372,56 +378,6 @@ impl<'a> AgentContainerStarter<'a> {
                         host_mount.display(),
                         container_mount.display()
                     );
-                }
-
-                // UserApp 开发共享卷（与 K8s 共享 PVC 同构, {app_id}/ 子目录）:
-                // 沙箱 → USERAPP_WORKSPACE_ROOT=/home/user/userapp-workspace;
-                // builder → /app/userapp-workspace（与 helm builder 段 env 同路径）。
-                // 宿主根经 rcoder compose bind ./userapp-workspace 反解（用户侧 cleanup 寻址同源）。
-                if matches!(
-                    service_type,
-                    ServiceType::ComputerAgentRunner | ServiceType::UserAppBuilder
-                ) {
-                    match crate::path::resolve_container_path_to_host(std::path::Path::new(
-                        "/app/userapp-workspace",
-                    ))
-                    .await
-                    {
-                        Ok(userapp_host) => {
-                            // bind 源由 Docker daemon 自动创建, 不在 rcoder 容器内
-                            // mkdir 宿主路径（容器内无该父链, 恒失败徒增噪音）。
-                            let target = match service_type {
-                                ServiceType::UserAppBuilder => "/app/userapp-workspace".to_string(),
-                                _ => shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string(),
-                            };
-                            auto_injected_paths.insert(target.clone());
-                            builder = builder.add_mount(crate::MountPoint {
-                                host_path: userapp_host.to_string_lossy().to_string(),
-                                container_path: target.clone(),
-                                read_only: false,
-                            });
-                            info!(
-                                "[DOCKER_MGR] UserApp dev volume mount: {} -> {}",
-                                userapp_host.display(),
-                                target
-                            );
-                        }
-                        Err(e) => {
-                            if matches!(service_type, ServiceType::UserAppBuilder) {
-                                // builder 已跳过 per-app 主挂载, 共享卷是唯一 workspace——
-                                // 解析失败若静默跳过, build 数据面全错, fail fast。
-                                return Err(DockerError::ContainerCreationError(format!(
-                                    "UserAppBuilder userapp dev volume resolve failed \
-                                     (rcoder 容器需挂载 /app/userapp-workspace): {e}"
-                                )));
-                            }
-                            // 沙箱: 开发卷缺失只影响 UserApp 开发功能, warn 降级不阻断沙箱
-                            warn!(
-                                "[DOCKER_MGR] resolve userapp host path failed, skip dev volume: {}",
-                                e
-                            );
-                        }
-                    }
                 }
             }
             Err(e) => {

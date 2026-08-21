@@ -327,3 +327,65 @@ async fn backoff_respecting_cancel(
         _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => Ok(true),
     }
 }
+
+/// [`shared_types::UserappDevCleanup`] 实现：app 删除（purge）时回收 UserAppBuilder
+/// 开发资源——per-app 开发容器 + per-app RWO PVC +（Docker 模式）宿主 bind 目录。
+///
+/// 经契约注入 app_manager（其 runtime 视图无 agent 能力）；幂等，失败 best-effort
+/// 由调用方决定（purge 路径 warn 不阻断，下次收敛）。
+pub struct UserappDevResourcesCleanup {
+    runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
+}
+
+impl UserappDevResourcesCleanup {
+    pub fn new(runtime: Arc<dyn container_runtime_api::ContainerRuntime>) -> Self {
+        Self { runtime }
+    }
+}
+
+#[async_trait::async_trait]
+impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
+    async fn cleanup(&self, app_id: &str) -> Result<(), String> {
+        // 1. 停/删开发容器（幂等；失败不阻断 PVC 回收，K8s 下 PVC 有 Pod 引用时
+        //    pvc-protection 会挂住删除——容器先删是 PVC 能删的前提）
+        if let Err(e) = self
+            .runtime
+            .stop_container_by_identifier(app_id, &ServiceType::UserAppBuilder)
+            .await
+        {
+            tracing::warn!(
+                "[USERAPP_DEV_CLEANUP] stop dev container failed (continuing): app_id={app_id}: {e}"
+            );
+        } else {
+            info!("[USERAPP_DEV_CLEANUP] dev container stopped: app_id={app_id}");
+        }
+
+        // 2. per-app 开发 PVC 回收（幂等；Docker 模式 trait no-op）
+        self.runtime
+            .destroy_workspace_pvc(app_id, &ServiceType::UserAppBuilder)
+            .await
+            .map_err(|e| format!("destroy dev PVC failed: {e}"))?;
+
+        // 3. Docker 模式宿主 bind 目录清理（./userapp-workspace/{app_id}；
+        //    resolve 失败=rcoder 容器无该挂载（如 K8s 模式），跳过即可）
+        if let Ok(host_root) = docker_manager::resolve_container_path_to_host(std::path::Path::new(
+            shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+        ))
+        .await
+        {
+            let dev_dir = host_root.join(app_id);
+            if dev_dir.exists() {
+                tokio::fs::remove_dir_all(&dev_dir)
+                    .await
+                    .map_err(|e| format!("remove dev bind dir {}: {e}", dev_dir.display()))?;
+                info!(
+                    "[USERAPP_DEV_CLEANUP] dev bind dir removed: {}",
+                    dev_dir.display()
+                );
+            }
+        }
+
+        info!("[USERAPP_DEV_CLEANUP] dev resources cleaned: app_id={app_id}");
+        Ok(())
+    }
+}

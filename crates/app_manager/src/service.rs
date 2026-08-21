@@ -50,6 +50,9 @@ pub struct AppService {
     /// 应用业务元数据（name/租户/业务创建时间;集群不持有）。PG 模式 query 的
     /// name/created_at 过滤数据源；纯内存模式恒空（过滤忽略+warn）。
     pub(crate) metadata: AppMetadataStore,
+    /// UserApp 开发资源回收回调（宿主注入；purge 时回收 UserAppBuilder 开发容器
+    /// 与 per-app PVC——app_manager 的 runtime 视图无 agent 能力，经契约委托宿主）。
+    pub(crate) dev_cleanup: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevCleanup>>>,
 }
 
 impl AppService {
@@ -106,6 +109,7 @@ impl AppService {
             pingora_ports: DashMap::new(),
             release_locks: DashMap::new(),
             metadata: AppMetadataStore::default(),
+            dev_cleanup: std::sync::RwLock::new(None),
         };
         // K8s Pingora 模式：启动时从集群重建 Pingora backends——修复 pingora_ports 内存态
         // 丢失导致的重启 silent 404（list_deployments 的 expose_type 已由 Deployment annotation

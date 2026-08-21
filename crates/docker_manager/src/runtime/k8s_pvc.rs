@@ -129,16 +129,16 @@ pub(crate) trait K8sPvcOps {
     ) -> ContainerRuntimeResult<()>;
 }
 
-/// UserApp 开发共享卷 PVC 名（env `RCODER_USERAPP_WORKSPACE_PVC_NAME` 覆盖,
-/// 默认 `{ns}-rcoder-userapp-workspace`, 由 helm 模板预建——与
-/// RCODER_COMPUTER_WORKSPACE_PVC_NAME 同模式）。
+/// UserAppBuilder 开发卷的 storage class（env `RCODER_USERAPP_BUILDER_STORAGE_CLASS`
+/// 覆盖，默认 Ceph RBD 块存储）。开发卷 RWO 单容器独占——编译构建的大量小文件
+/// IO 走块设备，不经 CephFS 元数据面。
 #[cfg(feature = "kubernetes")]
-pub(crate) fn userapp_shared_pvc_name(namespace: &str) -> String {
-    std::env::var("RCODER_USERAPP_WORKSPACE_PVC_NAME")
+pub(crate) fn userapp_builder_storage_class() -> String {
+    std::env::var("RCODER_USERAPP_BUILDER_STORAGE_CLASS")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("{namespace}-rcoder-userapp-workspace"))
+        .unwrap_or_else(|| "rook-ceph-block".to_string())
 }
 
 #[cfg(feature = "kubernetes")]
@@ -149,12 +149,6 @@ impl K8sPvcOps for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
-        // UserAppBuilder 挂 UserApp 开发共享卷（与沙箱同一块, helm 预建 RWX PVC）:
-        // 源码由沙箱侧 /api/userapp 镜像接口族写入 `{卷}/{app_id}/`, builder 直接读同一
-        // 目录 build, 制品 zip 落同处经 serve_userapp HTTP 下载流转——不再需要 per-app PVC。
-        if matches!(service_type, ServiceType::UserAppBuilder) {
-            return Ok(userapp_shared_pvc_name(&self.namespace));
-        }
         let prefix = KubernetesRuntime::sanitize_k8s_name_part(
             &self.service_container_prefix(service_type)?,
         );
@@ -168,14 +162,6 @@ impl K8sPvcOps for KubernetesRuntime {
         service_type: &ServiceType,
         storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
-        // UserAppBuilder 的 workspace 是共享卷（helm 预建）, 不做 per-app ensure。
-        if matches!(service_type, ServiceType::UserAppBuilder) {
-            info!(
-                "[K8S] skip per-app PVC ensure for builder {} (shared userapp workspace, helm-managed)",
-                identifier
-            );
-            return Ok(());
-        }
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
 
         // Check if PVC already exists and its state
@@ -302,8 +288,16 @@ impl K8sPvcOps for KubernetesRuntime {
                 ..Default::default()
             },
             spec: Some(PersistentVolumeClaimSpec {
-                access_modes: Some(vec![self.config.access_mode.clone()]),
-                storage_class_name: Some(self.config.storage_class.clone()),
+                // UserAppBuilder 开发卷: RWO 单容器独占（Ceph RBD 块卷, storage class
+                // env 可覆盖）; 其余 service_type 用全局 access_mode/storage_class。
+                access_modes: Some(vec![match service_type {
+                    ServiceType::UserAppBuilder => "ReadWriteOnce".to_string(),
+                    _ => self.config.access_mode.clone(),
+                }]),
+                storage_class_name: Some(match service_type {
+                    ServiceType::UserAppBuilder => userapp_builder_storage_class(),
+                    _ => self.config.storage_class.clone(),
+                }),
                 resources: Some(VolumeResourceRequirements {
                     requests: Some({
                         let mut r = BTreeMap::new();
@@ -487,13 +481,8 @@ impl K8sPvcOps for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
-        // UserAppBuilder 的 workspace 是共享卷（全集群所有 app 共用）, 拒绝删除——
-        // 防御未来误调（唯一合法调用方是 UserApp per-app PVC 的 storage/destroy REST）。
-        if matches!(service_type, ServiceType::UserAppBuilder) {
-            return Err(ContainerRuntimeError::ConfigurationError(
-                "refusing to destroy the shared userapp workspace PVC".to_string(),
-            ));
-        }
+        // UserAppBuilder 现为 per-app RWO PVC（app 删除 purge 时随容器一并回收,
+        // 调用方为 UserApp 域 REST 流程, 符合"agent PVC 永不删"约束的例外面）。
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
 
         // 幂等: PVC 不存在直接返回成功 (Java 重试 / 对账安全)

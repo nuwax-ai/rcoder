@@ -1,12 +1,12 @@
 //! 开发阶段端口代理处理函数
 //!
 //! 处理 `/proxy/devapps/{user_id}/{app_id}/{port}/{*path}` 路径的反向代理。
-//! upstream 动态解析到**用户沙箱容器**（ComputerAgentRunner）的同端口——与部署后
-//! `/proxy/apps/*`（app_backends 注册表 → app 运行容器）对称的开发预览入口。
+//! upstream 动态解析到**该 app 的开发容器**（UserAppBuilder，per-app）的同端口——
+//! 与部署后 `/proxy/apps/*`（app_backends 注册表 → app 运行容器）对称的开发预览入口。
 //!
-//! 零注册零状态：user_id 经 `ContainerLookup`（AppState.projects 内存表 O(1)）
-//! 解析沙箱 IP，app_id 不参与解析（沙箱内端口已唯一），仅用于日志排障与
-//! 未来归属鉴权的锚点。沙箱内自装 pingap 的场景代理 9080 一个端口即整应用入口。
+//! 零注册零状态：app_id 经 `ContainerLookup::find_by_project_id`（AppState.projects
+//! 内存表 O(1)）解析开发容器 IP；user_id 不参与解析，仅用于日志排障与未来归属
+//! 鉴权的锚点。开发容器内自装 pingap 的场景代理 9080 一个端口即整应用入口。
 
 use matchit::Params;
 use pingora_core::Result as PingoraResult;
@@ -68,8 +68,9 @@ pub async fn handle_dev_port_proxy_request(
 
 /// 处理 devapps 代理的上游连接选择
 ///
-/// `find_by_user_id(user_id, ComputerAgentRunner)` 动态解析沙箱 IP（trait 校验
-/// service_type 防串用）；无沙箱 → 502（日志带 user_id/app_id 便于排障）。
+/// `find_by_project_id(app_id, UserAppBuilder)` 动态解析该 app 开发容器 IP
+/// （trait 校验 service_type 防串用——与 UserApp 运行容器隔离）；无容器 → 502
+/// （日志带 user_id/app_id 便于排障）。
 pub async fn handle_dev_port_proxy_upstream(
     ctx: &mut TrackingCtx,
     params: Params<'_, '_>,
@@ -95,14 +96,14 @@ pub async fn handle_dev_port_proxy_upstream(
     metrics.record_request_port(target_port);
     metrics.inc_active();
 
-    let sandbox_ip = container_lookup
+    let dev_container_ip = container_lookup
         .as_ref()
         .and_then(|lookup| {
-            lookup.find_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            lookup.find_by_project_id(app_id, &shared_types::ServiceType::UserAppBuilder)
         })
         .ok_or_else(|| {
             error!(
-                "devapps sandbox not found: user_id={}, app_id={}, port={}",
+                "devapps dev container not found: user_id={}, app_id={}, port={}",
                 user_id, app_id, target_port
             );
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502))
@@ -110,11 +111,15 @@ pub async fn handle_dev_port_proxy_upstream(
 
     debug!(
         "devapps route: user_id={}, app_id={}, {}:{}",
-        user_id, app_id, sandbox_ip, target_port
+        user_id, app_id, dev_container_ip, target_port
     );
 
     // 与 app 代理同款 peer（长连接，支持 WebSocket / HMR）
-    let mut peer = HttpPeer::new((sandbox_ip.as_str(), target_port), false, "".to_string());
+    let mut peer = HttpPeer::new(
+        (dev_container_ip.as_str(), target_port),
+        false,
+        "".to_string(),
+    );
     peer.options.connection_timeout = Some(Duration::from_secs(10));
     peer.options.read_timeout = None;
     peer.options.write_timeout = None;

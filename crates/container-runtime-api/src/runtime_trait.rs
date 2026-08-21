@@ -247,6 +247,19 @@ pub trait WorkspaceRuntime: Send + Sync {
     async fn destroy_app_pvc(&self, _app_id: &str) -> ContainerRuntimeResult<()> {
         Ok(()) // default no-op (Docker / 未实现)
     }
+
+    /// 按 service_type 销毁 workspace PVC（幂等；Docker 默认 no-op）。
+    ///
+    /// 现有调用方：UserAppBuilder 开发 PVC 回收（app purge 经 `UserappDevCleanup`
+    /// 契约）。UserApp 运行 PVC 走语义化包装 [`Self::destroy_app_pvc`]。
+    /// 调用方须保证该 service_type 的容器已停（PVC 无 Pod 引用才可删）。
+    async fn destroy_workspace_pvc(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(()) // default no-op (Docker / 未实现)
+    }
 }
 
 // ============================================================================

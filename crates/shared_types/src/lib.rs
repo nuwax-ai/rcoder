@@ -15,11 +15,12 @@ pub use container::{
 pub mod project_store;
 pub use project_store::ProjectStore;
 
-// UserApp 域（高内聚收拢于 userapp/ 模块）—— 活动追踪/唤醒 + 业务元数据 + build 进度事件
+// UserApp 域（高内聚收拢于 userapp/ 模块）—— 活动追踪/唤醒 + 业务元数据 + build 进度事件 + 开发资源回收契约
 pub use userapp::activity::{
     ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, WakeOutcome,
 };
 pub use userapp::build_event::BuildProgressEvent;
+pub use userapp::dev_cleanup::UserappDevCleanup;
 pub use userapp::metadata::{AppMetadataPersistence, AppMetadataRecord};
 
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）

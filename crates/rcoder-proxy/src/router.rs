@@ -69,12 +69,12 @@ pub enum RouteType {
 
     /// 开发阶段端口反向代理: `/proxy/devapps/{user_id}/{app_id}/{port}/{*path}`
     ///
-    /// - `user_id`: 用户 ID（动态解析其沙箱容器 IP，零注册零状态）
-    /// - `app_id`: 应用 ID（不参与解析，沙箱内端口已唯一；日志排障/鉴权锚点）
-    /// - `port`: 沙箱容器内端口（dev server 的 PortPool 端口或自装 pingap 的 9080）
+    /// - `user_id`: 用户 ID（不参与解析；日志排障/归属鉴权锚点）
+    /// - `app_id`: 应用 ID（动态解析该 app 的开发容器（UserAppBuilder，per-app）IP）
+    /// - `port`: 开发容器内端口（dev server 的 PortPool 端口或自装 pingap 的 9080）
     /// - `path`: 剩余路径
     ///
-    /// **目标**: 用户沙箱容器（ComputerAgentRunner）的同端口——与 AppPortProxy
+    /// **目标**: 该 app 开发容器（UserAppBuilder）的同端口——与 AppPortProxy
     /// （部署后 → app 运行容器）对称的开发预览入口。
     ///
     /// **示例**: `/proxy/devapps/6/app-1a2b3c4d/4000/api/users`
@@ -325,7 +325,7 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
                 e
             ))
         })?;
-    // 开发阶段代理: /proxy/devapps/{user_id}/{app_id}/{port}/{path} -> 用户沙箱同端口
+    // 开发阶段代理: /proxy/devapps/{user_id}/{app_id}/{port}/{path} -> 该 app 开发容器(UserAppBuilder)同端口
     router
         .insert(
             "/proxy/devapps/{user_id}/{app_id}/{port}/{*path}",

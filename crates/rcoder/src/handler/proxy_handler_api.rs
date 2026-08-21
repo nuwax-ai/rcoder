@@ -562,30 +562,30 @@ pub async fn proxy_to_app_with_path(
     Ok(resp)
 }
 
-/// Pingora 代理 - 开发阶段预览（用户沙箱 dev server，按 user_id+port 动态解析）
+/// Pingora 代理 - 开发阶段预览（app 开发容器 dev server，按 app_id 动态解析）
 #[utoipa::path(
     get,
     path = "/proxy/devapps/{user_id}/{app_id}/{port}/{*path}",
     tag = "应用管理",
-    summary = "Pingora 代理 - 开发阶段预览（沙箱 dev server，零注册动态解析）",
+    summary = "Pingora 代理 - 开发阶段预览（app 开发容器 dev server，零注册动态解析）",
     description = r#"
-访问开发阶段用户沙箱容器里的 dev server（`POST /api/userapp/dev/start` 启动，PortPool 分配端口），
-或沙箱自装 pingap/app-cli 的统一入口（端口 9080）。与部署访问 `/proxy/apps/{user_id}/{app_id}/{port}/{*path}`
-同构四段——**开发切部署前端只改 `devapps`→`apps` 一段**。
+访问开发阶段该 app 开发容器（UserAppBuilder，per-app）里的 dev server（`POST /api/userapp/dev/start`
+启动，PortPool 分配端口），或容器内自装 pingap/app-cli 的统一入口（端口 9080）。与部署访问
+`/proxy/apps/{user_id}/{app_id}/{port}/{*path}` 同构四段——**开发切部署前端只改 `devapps`→`apps` 一段**。
 
-- upstream 动态解析到该用户的沙箱容器（ComputerAgentRunner）同端口，**零注册零状态**：
+- upstream 动态解析到该 app 的开发容器（UserAppBuilder）同端口，**零注册零状态**：
   Java 用 `dev/start` 响应的 `port` + `user_id` + `app_id` 三元组直接拼 URL。
-- `app_id` 不参与解析（沙箱内端口已唯一），用于日志排障与未来归属鉴权。
-- 多 app 同沙箱并行：app-a（4000）/app-b（4001）各拼各的 URL。
-- 长连接支持（HMR/WebSocket）；无该用户沙箱 → 502；沙箱重建后有短窗口旧 IP（下次 ensure 修正）。
+- `user_id` 不参与解析（开发容器 per-app 定位），用于日志排障与未来归属鉴权。
+- 多 app 并行：每 app 独立开发容器独立端口池，app-a（4000）/app-b（4000）各拼各的 URL。
+- 长连接支持（HMR/WebSocket）；无该 app 开发容器 → 502；容器重建后有短窗口旧 IP（下次 ensure 修正）。
 
-> 例：`GET /proxy/devapps/u6/app-order-svc/4000/api/users` → 沙箱 `:4000/api/users`。
+> 例：`GET /proxy/devapps/u6/app-order-svc/4000/api/users` → 开发容器 `:4000/api/users`。
 > host（Pingora 入口）由调用方持有，详见应用管理手册 §12。
 "#,
     params(
-        ("user_id" = String, Path, description = "用户 ID（定位其沙箱容器）"),
-        ("app_id" = String, Path, description = "应用 ID（不参与解析；日志排障/鉴权锚点）"),
-        ("port" = u16, Path, description = "沙箱内端口（dev server 的 PortPool 端口或 pingap 的 9080）"),
+        ("user_id" = String, Path, description = "用户 ID（不参与解析；日志排障/鉴权锚点）"),
+        ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器）"),
+        ("port" = u16, Path, description = "开发容器内端口（dev server 的 PortPool 端口或 pingap 的 9080）"),
         ("path" = String, Path, description = "应用内的路径")
     ),
     responses(

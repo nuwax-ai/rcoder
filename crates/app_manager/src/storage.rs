@@ -102,19 +102,25 @@ impl super::service::AppService {
             .destroy_app_pvc(app_id)
             .await
             .map_err(|e| map_runtime_error("destroy_app_pvc failed", e))?;
-        // UserApp 开发共享卷目录清理（{共享卷}/{app_id}/ = 开发源码 + 构建制品 zip）:
-        // 共享卷本身永不删（全集群共用）, 只删本 app 子目录; 目录不存在幂等跳过
-        // （本地无挂载的环境同样安全）。rcoder 视角挂载点为部署契约固定路径。
-        let dev_dir =
-            std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(app_id);
-        if dev_dir.exists() {
-            tokio::fs::remove_dir_all(&dev_dir)
-                .await
-                .map_err(|e| map_io_error("failed to purge userapp dev volume", e, false))?;
-            info!(
-                "[APP] userapp dev volume dir removed: {}",
-                dev_dir.display()
-            );
+        // UserApp 开发资源回收（UserAppBuilder 开发容器 + per-app 开发 PVC）：
+        // 经 UserappDevCleanup 契约回调宿主（app_manager 的 runtime 视图无 agent
+        // 能力，ISP 分层）；best-effort——失败仅 warn 不阻断 purge，下次幂等收敛。
+        let dev_cleanup = self.dev_cleanup.read().expect("dev_cleanup lock").clone();
+        match dev_cleanup {
+            Some(cleanup) => {
+                if let Err(e) = cleanup.cleanup(app_id).await {
+                    warn!(
+                        "[APP] userapp dev resources cleanup failed (best-effort, will converge on next purge): app_id={app_id}: {e}"
+                    );
+                } else {
+                    info!("[APP] userapp dev resources cleaned: app_id={app_id}");
+                }
+            }
+            None => {
+                warn!(
+                    "[APP] dev cleanup not injected, skip UserAppBuilder resources recycle: app_id={app_id}"
+                );
+            }
         }
         info!("[APP] app PVC destroyed (metadata retained): {}", app_id);
         Ok(())

@@ -105,6 +105,12 @@ impl super::service::AppService {
         self.metadata.apply_loaded(rows);
         tracing::info!("[APP_METADATA] userapp_metadata loaded: {count} rows");
     }
+
+    /// 注入开发资源回收回调（宿主 rcoder 装配时调用；purge 回收 UserAppBuilder
+    /// 开发容器与 per-app PVC，app_manager 自身 runtime 视图无 agent 能力）。
+    pub fn set_dev_cleanup(&self, cleanup: Arc<dyn shared_types::UserappDevCleanup>) {
+        *self.dev_cleanup.write().expect("dev_cleanup lock") = Some(cleanup);
+    }
 }
 
 #[cfg(test)]

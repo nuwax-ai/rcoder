@@ -686,8 +686,17 @@ impl WorkspaceRuntime for KubernetesRuntime {
     async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         // 委派 K8sPvcOps::destroy_workspace_pvc (service_type=UserApp; 仅 UserApp 走此路径,
         // agent PVC 永不删)。trait 方法默认 no-op, Docker 不覆盖。
-        self.destroy_workspace_pvc(app_id, &ServiceType::UserApp)
-            .await
+        // 显式消歧: WorkspaceRuntime trait 也定义了同名方法(见下)。
+        K8sPvcOps::destroy_workspace_pvc(self, app_id, &ServiceType::UserApp).await
+    }
+
+    async fn destroy_workspace_pvc(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        // 消歧: 显式调 K8sPvcOps 同名方法（per-agent PVC 删除的实际实现）
+        K8sPvcOps::destroy_workspace_pvc(self, identifier, service_type).await
     }
 }
 
