@@ -130,15 +130,15 @@ pub(crate) trait K8sPvcOps {
 }
 
 /// UserAppBuilder 开发卷的 storage class（env `RCODER_USERAPP_BUILDER_STORAGE_CLASS`
-/// 覆盖，默认 Ceph RBD 块存储）。开发卷 RWO 单容器独占——编译构建的大量小文件
-/// IO 走块设备，不经 CephFS 元数据面。
+/// 显式覆盖；缺省 None = PVC 不指定 storageClassName → 集群 default StorageClass，
+/// 如 229/19 的 `ceph-rbd`——Ceph RBD 块存储）。开发卷 RWO 单容器独占：编译构建的
+/// 大量小文件 IO 走块设备，不经 CephFS 元数据面。
 #[cfg(feature = "kubernetes")]
-pub(crate) fn userapp_builder_storage_class() -> String {
+pub(crate) fn userapp_builder_storage_class() -> Option<String> {
     std::env::var("RCODER_USERAPP_BUILDER_STORAGE_CLASS")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "rook-ceph-block".to_string())
 }
 
 #[cfg(feature = "kubernetes")]
@@ -294,10 +294,13 @@ impl K8sPvcOps for KubernetesRuntime {
                     ServiceType::UserAppBuilder => "ReadWriteOnce".to_string(),
                     _ => self.config.access_mode.clone(),
                 }]),
-                storage_class_name: Some(match service_type {
+                // UserAppBuilder: RWO 单容器独占（Ceph RBD 块卷）。storage class
+                // env 可显式覆盖；缺省 None → 集群 default class（如 ceph-rbd）。
+                // 其余 service_type 用全局 storage_class。
+                storage_class_name: match service_type {
                     ServiceType::UserAppBuilder => userapp_builder_storage_class(),
-                    _ => self.config.storage_class.clone(),
-                }),
+                    _ => Some(self.config.storage_class.clone()),
+                },
                 resources: Some(VolumeResourceRequirements {
                     requests: Some({
                         let mut r = BTreeMap::new();
