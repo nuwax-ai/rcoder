@@ -58,12 +58,40 @@ fn missing_app_id_response() -> Response {
 }
 
 /// 定位（miss 幂等 ensure）开发容器 file-server addr。
+///
+/// 注册表脏值自愈：容器被外部删除（docker rm / 回收）后 state.projects 残留死 IP，
+/// 且 ensure 被注册表命中挡住不会重建——转发前轻量探活（GET /api/version，3s 超时），
+/// 失败则清注册重新 ensure（新容器新 IP），下一次请求即恢复。
 async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Response> {
-    let info = ensure_userapp_builder(state, app_id).await.map_err(|e| {
+    let mut info = ensure_userapp_builder(state, app_id).await.map_err(|e| {
         warn!("[USERAPP_FORWARD] ensure dev container failed: app_id={app_id}: {e:#}");
         HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}")).into_response()
     })?;
-    Ok(dev_file_server_addr(state, &info))
+    let mut addr = dev_file_server_addr(state, &info);
+    if !probe_dev_container(&addr).await {
+        warn!(
+            "[USERAPP_FORWARD] dev container probe failed (stale registry entry?), recreating: app_id={app_id}, addr={addr}"
+        );
+        state.remove_project(app_id);
+        info = ensure_userapp_builder(state, app_id).await.map_err(|e| {
+            warn!("[USERAPP_FORWARD] re-ensure dev container failed: app_id={app_id}: {e:#}");
+            HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
+                .into_response()
+        })?;
+        addr = dev_file_server_addr(state, &info);
+    }
+    Ok(addr)
+}
+
+/// 开发容器 file-server 轻量探活（连接失败/非 2xx 均视为不可用）。
+async fn probe_dev_container(addr: &str) -> bool {
+    crate::http_client::shared_client()
+        .get(format!("{addr}/api/version"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
 }
 
 /// 全量透传一个请求到该 app 开发容器的 file-server（同 path+query）。

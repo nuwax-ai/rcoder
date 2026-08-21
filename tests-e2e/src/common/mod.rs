@@ -283,6 +283,7 @@ impl Env {
         ComputerChatRequest {
             user_id: user.to_owned(),
             project_id: None,
+            service_type: None,
             prompt: prompt.to_owned(),
             session_id: None,
             attachments: Vec::new(),
