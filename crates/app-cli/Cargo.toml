@@ -20,10 +20,10 @@ path = "src/main.rs"
 workspace-manifest = { path = "../workspace-manifest" }
 # unix 进程组信号工具（含 PID 1 防御，与 rcoder workspace 共用同一实现）
 process_utils = { path = "../process_utils" }
-# pingap 官方配置类型（pin 到 v0.13.8 tag commit：crates.io 0.13.x 有发布 bug，用 git rev；
+# pingap 官方配置类型（pin 到 v0.13.9 tag commit：crates.io 0.13.x 有发布 bug，用 git rev；
 # 与 app-runtime-base 镜像里的 pingap 二进制版本保持一致，避免 config schema 漂移）
 # bollard/regex 隔离在 app-cli 自己的 Cargo.lock，不和 rcoder 冲突
-pingap-config = { git = "https://github.com/vicanso/pingap", rev = "07d1cce1b658418bb46c2dec1a49c43fd2f48268" }
+pingap-config = { git = "https://github.com/vicanso/pingap", rev = "f7f9eddb029a5b07438bead2e0fd3df763086567" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
