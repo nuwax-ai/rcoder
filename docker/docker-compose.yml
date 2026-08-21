@@ -40,6 +40,8 @@ services:
       - ./project_workspace:/app/project_workspace
       # 挂载 computer 项目工作目录
       - ./computer-project-workspace:/app/computer-project-workspace
+      # 挂载 UserApp 开发卷（沙箱/builder 共享 {app_id}/; rcoder 侧供 app 删除清理寻址）
+      - ./userapp-workspace:/app/userapp-workspace
       # 挂载工作目录
       - ./logs/:/app/logs
       # 挂载启动脚本

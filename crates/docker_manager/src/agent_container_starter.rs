@@ -331,6 +331,11 @@ impl<'a> AgentContainerStarter<'a> {
                     }
                 };
 
+                // UserAppBuilder 的 workspace 是共享开发卷（下方追加挂载整卷）,
+                // 跳过 per-app 子目录主挂载, 避免与共享卷挂载路径嵌套错乱。
+                let primary_mount_disabled =
+                    matches!(service_type, ServiceType::UserAppBuilder) && pod_id.is_none();
+
                 let host_mount = workspace_host_path.join(&host_sub);
 
                 // 创建宿主机挂载目录（通过容器内路径创建，volume 会传播到宿主机）
@@ -352,20 +357,66 @@ impl<'a> AgentContainerStarter<'a> {
                     );
                 }
 
-                let host_mount_str = host_mount.to_string_lossy().to_string();
-                let container_mount_str = container_mount.to_string_lossy().to_string();
-                auto_injected_paths.insert(container_mount_str.clone());
-                builder = builder.add_mount(crate::MountPoint {
-                    host_path: host_mount_str,
-                    container_path: container_mount_str,
-                    read_only: false,
-                });
+                if !primary_mount_disabled {
+                    let host_mount_str = host_mount.to_string_lossy().to_string();
+                    let container_mount_str = container_mount.to_string_lossy().to_string();
+                    auto_injected_paths.insert(container_mount_str.clone());
+                    builder = builder.add_mount(crate::MountPoint {
+                        host_path: host_mount_str,
+                        container_path: container_mount_str,
+                        read_only: false,
+                    });
 
-                info!(
-                    "[DOCKER_MGR] Auto workspace mount: {} -> {}",
-                    host_mount.display(),
-                    container_mount.display()
-                );
+                    info!(
+                        "[DOCKER_MGR] Auto workspace mount: {} -> {}",
+                        host_mount.display(),
+                        container_mount.display()
+                    );
+                }
+
+                // UserApp 开发共享卷（与 K8s 共享 PVC 同构, {app_id}/ 子目录）:
+                // 沙箱 → USERAPP_WORKSPACE_ROOT=/home/user/userapp-workspace;
+                // builder → /app/userapp-workspace（与 helm builder 段 env 同路径）。
+                // 宿主根经 rcoder compose bind ./userapp-workspace 反解（用户侧 cleanup 寻址同源）。
+                if matches!(
+                    service_type,
+                    ServiceType::ComputerAgentRunner | ServiceType::UserAppBuilder
+                ) {
+                    match crate::path::resolve_container_path_to_host(std::path::Path::new(
+                        "/app/userapp-workspace",
+                    ))
+                    .await
+                    {
+                        Ok(userapp_host) => {
+                            if let Err(e) = std::fs::create_dir_all(&userapp_host) {
+                                warn!(
+                                    "[DOCKER_MGR] Failed to create userapp host dir {}: {}",
+                                    userapp_host.display(),
+                                    e
+                                );
+                            }
+                            let target = match service_type {
+                                ServiceType::UserAppBuilder => "/app/userapp-workspace".to_string(),
+                                _ => shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string(),
+                            };
+                            auto_injected_paths.insert(target.clone());
+                            builder = builder.add_mount(crate::MountPoint {
+                                host_path: userapp_host.to_string_lossy().to_string(),
+                                container_path: target.clone(),
+                                read_only: false,
+                            });
+                            info!(
+                                "[DOCKER_MGR] UserApp dev volume mount: {} -> {}",
+                                userapp_host.display(),
+                                target
+                            );
+                        }
+                        Err(e) => warn!(
+                            "[DOCKER_MGR] resolve userapp host path failed, skip dev volume: {}",
+                            e
+                        ),
+                    }
+                }
             }
             Err(e) => {
                 warn!(

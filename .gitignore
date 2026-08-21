@@ -22,6 +22,7 @@ docker/rcoder-agent-runner/bin/agent_runner
 docker/rcoder-agent-runner/downloads
 docker/computer-cache
 docker/computer-project-workspace
+docker/userapp-workspace
 docker/logs
 
 # Stakpak session files
