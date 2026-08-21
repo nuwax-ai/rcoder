@@ -1,4 +1,4 @@
-//! UserApp workspace HTTP handlers（独立 `/api/userapp`，复用 `resolve_project`）。
+//! UserApp workspace HTTP handlers（独立 `/api/userapp`，workspace 定位统一走 UserApp 开发卷）。
 //!
 //! 响应格式：JSON 接口统一 `shared_types::HttpResult`（`{code, message, data, tid, success}`）；
 //! SSE（logs/stream）与静态文件（static）为特殊通道，不包 HttpResult。
@@ -29,7 +29,6 @@ use shared_types::HttpResult;
 use crate::AppState;
 use crate::error::{AppError, AppResult};
 use crate::extract::deserialize_id_string;
-use crate::extract::deserialize_optional_id_string;
 use crate::extract::{AppJson, AppPath, AppQuery};
 use crate::service::dev_server::log::{ReadDevLogResult, read_dev_log};
 use crate::service::userapp;
@@ -122,15 +121,10 @@ pub(crate) struct ConfirmData {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BuildUserAppBody {
-    /// UserApp 标识（= workspace app_id = file-server project_id）。
+    /// UserApp 标识（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）。
     #[serde(deserialize_with = "deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub app_id: String,
-    /// 多租户三级目录（可选，留空走单级；对齐 resolve_project）。
-    #[serde(default, deserialize_with = "deserialize_optional_id_string")]
-    pub tenant_id: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_id_string")]
-    pub space_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
@@ -142,10 +136,6 @@ pub(crate) struct ImportProjectBody {
     pub app_id: String,
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_dir: String,
-    #[serde(default, deserialize_with = "deserialize_optional_id_string")]
-    pub tenant_id: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_id_string")]
-    pub space_id: Option<String>,
 }
 
 /// 任务构建日志查询参数（`GET /tasks/{taskId}/logs`）。
@@ -192,11 +182,9 @@ pub(crate) async fn build_workspace(
         body.validate().map_err(crate::error::from_garde)?;
         let task_id = userapp::start_build_task(
             &state.build_tasks,
-            state.resolver.clone(),
+            &state.config,
             state.build_manager.clone(),
             body.app_id.clone(),
-            body.tenant_id.clone(),
-            body.space_id.clone(),
             state.config.dev_command_timeout_secs,
         )
         .await?;
@@ -402,15 +390,7 @@ pub(crate) async fn detect_project(
 ) -> UserAppReply<DetectData> {
     let result = async {
         body.validate().map_err(crate::error::from_garde)?;
-        let workspace = state
-            .resolver
-            .resolve_project(&crate::workspace::ProjectContext {
-                project_id: body.app_id,
-                tenant_id: body.tenant_id,
-                space_id: body.space_id,
-                isolation_type: None,
-            })
-            .await?;
+        let workspace = crate::workspace::resolve_userapp_dev(&body.app_id, None, &state.config)?;
         let detection = userapp::import::detect_project(&workspace, &body.project_dir).await?;
         Ok(DetectData { detection })
     };
@@ -432,15 +412,7 @@ pub(crate) async fn confirm_project(
     let result = async {
         body.validate().map_err(crate::error::from_garde)?;
         let app_id = body.app_id.clone();
-        let workspace = state
-            .resolver
-            .resolve_project(&crate::workspace::ProjectContext {
-                project_id: body.app_id,
-                tenant_id: body.tenant_id,
-                space_id: body.space_id,
-                isolation_type: None,
-            })
-            .await?;
+        let workspace = crate::workspace::resolve_userapp_dev(&body.app_id, None, &state.config)?;
         let path = userapp::import::confirm_project(&workspace, &body.project_dir).await?;
         // workspace 级 git init（幂等）：本地版本管理 + publish snapshot commit 的前提。
         // 放 handler 层（持有 config.git_enabled / author）；失败仅告警，不阻断 manifest 确认。

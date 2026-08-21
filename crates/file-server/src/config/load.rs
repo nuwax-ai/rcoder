@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use shared_types::AGENT_FILE_SERVER_PORT;
-use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
+use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, USERAPP_WORKSPACE_ROOT, WORKSPACE_ROOT};
 
 use super::Config;
 use super::DeploymentMode;
@@ -90,6 +90,7 @@ impl Config {
         };
         path!(project_source_dir, "PROJECT_SOURCE_DIR");
         path!(computer_workspace_dir, "COMPUTER_WORKSPACE_DIR");
+        path!(userapp_workspace_dir, "USERAPP_WORKSPACE_DIR");
         path!(service_log_dir, "FILE_SERVER_LOG_DIR");
         parse!(service_log_retention_days, "FILE_SERVER_LOG_RETENTION_DAYS");
         path!(init_project_dir, "INIT_PROJECT_DIR");
@@ -174,6 +175,10 @@ impl Config {
             computer_workspace_dir: PathBuf::from(env_str(
                 "COMPUTER_WORKSPACE_DIR",
                 COMPUTER_WORKSPACE_ROOT,
+            )?),
+            userapp_workspace_dir: PathBuf::from(env_str(
+                "USERAPP_WORKSPACE_DIR",
+                USERAPP_WORKSPACE_ROOT,
             )?),
             service_log_dir: PathBuf::from(env_str(
                 "FILE_SERVER_LOG_DIR",
@@ -273,6 +278,7 @@ impl Config {
             ("COMPUTER_LOG_DIR", &self.computer_log_dir),
             ("PROJECT_SOURCE_DIR", &self.project_source_dir),
             ("COMPUTER_WORKSPACE_DIR", &self.computer_workspace_dir),
+            ("USERAPP_WORKSPACE_DIR", &self.userapp_workspace_dir),
             ("FILE_SERVER_LOG_DIR", &self.service_log_dir),
         ] {
             if path.as_os_str().is_empty() {

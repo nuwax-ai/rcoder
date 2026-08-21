@@ -27,7 +27,6 @@ use std::sync::Arc;
 use crate::error::{AppError, AppResult};
 use crate::service::build_generic::{GenericBuildRequest, build_generic};
 use crate::service::build_manager::BuildManager;
-use crate::workspace::{ProjectContext, WorkspaceResolver};
 
 use assemble::assemble_workspace_package;
 use manifest::{ReleaseMetadata, build_release_lock, read_workspace_manifest};
@@ -55,30 +54,21 @@ struct BuiltProject {
 
 /// workspace 多项目打包主流程。
 ///
-/// 1. `resolve_project(app_id)` → workspace 根（app_id = project_id）
+/// 1. `resolve_userapp_dev(app_id)` → workspace 根（UserApp 开发卷）
 /// 2. 读 `workspace.manifest.toml` → 子项目列表
 /// 3. 遍历子项目：读 `project.manifest.toml` → `build_generic(cmd, artifact, cwd={ws}/{path})`
 /// 4. [`assemble::assemble_workspace_package`] 组装整体包（含 pingap 配置 + `.service-ports`）
 ///
 /// 返回版本化整体包及其 release ID、摘要和大小。
 pub async fn build_workspace_package(
-    resolver: &dyn WorkspaceResolver,
+    config: &crate::Config,
     build_manager: &BuildManager,
     app_id: &str,
-    tenant_id: Option<&str>,
-    space_id: Option<&str>,
     timeout_secs: u64,
     progress: Option<&BuildTask>,
 ) -> AppResult<WorkspaceBuildArtifact> {
-    // 1. workspace 根（app_id 复用 project_id）
-    let ws = resolver
-        .resolve_project(&ProjectContext {
-            project_id: app_id.to_string(),
-            tenant_id: tenant_id.map(str::to_string),
-            space_id: space_id.map(str::to_string),
-            isolation_type: None,
-        })
-        .await?;
+    // 1. workspace 根（UserApp 开发卷, 容器无关）
+    let ws = crate::workspace::resolve_userapp_dev(app_id, None, config)?;
     if !ws.is_dir() {
         return Err(AppError::resource(format!(
             "UserApp workspace not found: {} (app_id={app_id})",
@@ -224,11 +214,9 @@ pub async fn build_workspace_package(
 /// 非循环路径的 Err（如 release lock env 缺失）由这里兜底 emit Failed。
 pub async fn start_build_task(
     store: &BuildTaskStore,
-    resolver: Arc<dyn WorkspaceResolver>,
+    config: &Arc<crate::Config>,
     build_manager: Arc<BuildManager>,
     app_id: String,
-    tenant_id: Option<String>,
-    space_id: Option<String>,
     timeout_secs: u64,
 ) -> Result<BuildTaskId, AppError> {
     // 容量耗尽(全活跃任务达上限)→ 立即拒绝,不再越过上限插入(#12)。
@@ -238,15 +226,7 @@ pub async fn start_build_task(
         .map_err(|e| AppError::business(e.to_string()))?;
     // 预 resolve workspace 根并存入 task,供 logs/SSE handler 解析日志目录
     // ({workspace}/logs/{service}/)。resolve 失败则 emit Failed 终态,不 spawn。
-    match resolver
-        .resolve_project(&ProjectContext {
-            project_id: app_id.clone(),
-            tenant_id: tenant_id.clone(),
-            space_id: space_id.clone(),
-            isolation_type: None,
-        })
-        .await
-    {
+    match crate::workspace::resolve_userapp_dev(&app_id, None, config) {
         Ok(ws) => task.set_workspace_root(ws).await,
         Err(e) => {
             task.emit(BuildProgressEvent::Failed {
@@ -257,13 +237,12 @@ pub async fn start_build_task(
         }
     }
     let task_spawn = task.clone();
+    let config = Arc::clone(config);
     tokio::spawn(async move {
         let result = build_workspace_package(
-            resolver.as_ref(),
+            &config,
             build_manager.as_ref(),
             &app_id,
-            tenant_id.as_deref(),
-            space_id.as_deref(),
             timeout_secs,
             Some(&task_spawn),
         )

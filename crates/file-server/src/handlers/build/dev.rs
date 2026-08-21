@@ -75,6 +75,9 @@ pub(crate) struct PortPool {
 pub(crate) struct KeepAliveQuery {
     #[garde(custom(crate::validation_rules::not_blank))]
     project_id: String,
+    /// UserApp 开发卷定位 (可选, 与 projectId 二选一; 见 BuildQuery::app_id)。
+    #[serde(default)]
+    app_id: Option<String>,
     #[serde(default)]
     #[garde(required)]
     pid: Option<u32>,
@@ -91,6 +94,9 @@ pub(crate) struct KeepAliveQuery {
 }
 
 async fn project_path_keep(state: &AppState, q: &KeepAliveQuery) -> AppResult<std::path::PathBuf> {
+    if let Some(app_id) = q.app_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return crate::workspace::resolve_userapp_dev(app_id, None, &state.config);
+    }
     state
         .resolver
         .resolve_project(&crate::workspace::ProjectContext {

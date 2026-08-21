@@ -110,6 +110,24 @@ fn validated_identifier<'a>(value: &'a str, field: &str) -> AppResult<&'a str> {
     Ok(value)
 }
 
+/// UserApp 开发卷定位: `{config.userapp_workspace_dir}/{app_id}`。
+///
+/// 不走 [`WorkspaceResolver`] trait——开发卷是容器挂载事实 (env `USERAPP_WORKSPACE_DIR`
+/// 指向各自视角的挂载点), 沙箱与 builder 共享同一块卷同构目录, 与拓扑无关。
+/// `custom_target_dir` trim 非空则直接信任 (与 computer 域 `resolve_computer_target`
+/// 对称, 由调用方 Java 负责合法性)。
+pub fn resolve_userapp_dev(
+    app_id: &str,
+    custom_target_dir: Option<&str>,
+    config: &crate::Config,
+) -> AppResult<PathBuf> {
+    if let Some(ct) = non_empty(custom_target_dir) {
+        return Ok(PathBuf::from(ct));
+    }
+    let app_id = validated_identifier(app_id, "appId")?;
+    Ok(config.userapp_workspace_dir.join(app_id))
+}
+
 #[async_trait]
 impl WorkspaceResolver for LocalWorkspaceResolver {
     async fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf> {

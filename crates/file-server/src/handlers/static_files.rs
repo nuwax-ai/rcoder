@@ -92,13 +92,13 @@ pub(crate) async fn serve_page(
 
 /// `GET|OPTIONS /api/userapp/static/{appId}/{*rest}`（取整体包 workspace-package.zip）。
 ///
-/// `app_id` = workspace app_id = file-server project_id（复用 resolve_project）。
+/// `app_id` 定位走 UserApp 开发卷（`resolve_userapp_dev`，与 build/detect/confirm 同根）。
 /// 用 COMPUTER_CORS（暴露 Range/Content-Range，支持大产物断点续传）。
 #[utoipa::path(
     get,
     path = "/static/{app_id}/{*rest}",
     params(
-        ("app_id" = String, Path, description = "UserApp identifier (= workspace app_id = project_id)"),
+        ("app_id" = String, Path, description = "UserApp identifier (= workspace app_id)"),
         ("rest" = String, Path, description = "Workspace-relative file path (e.g. workspace-package.zip)")
     ),
     responses(
@@ -115,16 +115,7 @@ pub(crate) async fn serve_userapp(
     if app_id.trim().is_empty() {
         return cors_404(&req, &COMPUTER_CORS);
     }
-    let root = match state
-        .resolver
-        .resolve_project(&ProjectContext {
-            project_id: app_id.to_string(),
-            tenant_id: None,
-            space_id: None,
-            isolation_type: None,
-        })
-        .await
-    {
+    let root = match crate::workspace::resolve_userapp_dev(&app_id, None, &state.config) {
         Ok(root) => root,
         Err(error) => return error.into_response(),
     };

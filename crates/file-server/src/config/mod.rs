@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use shared_types::AGENT_FILE_SERVER_PORT;
-use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
+use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, USERAPP_WORKSPACE_ROOT, WORKSPACE_ROOT};
 
 pub use self::env::MAX_UPLOAD_FILE_SIZE_BYTES;
 use self::env::{default_attachment_extensions, split_default};
@@ -104,6 +104,8 @@ pub struct Config {
     pub port: u16,
     pub project_source_dir: PathBuf,
     pub computer_workspace_dir: PathBuf,
+    /// UserApp 开发卷根 (env `USERAPP_WORKSPACE_DIR`; 沙箱挂载点, 见 paths::USERAPP_WORKSPACE_ROOT)。
+    pub userapp_workspace_dir: PathBuf,
     pub service_log_dir: PathBuf,
     pub service_log_retention_days: usize,
 
@@ -197,6 +199,7 @@ impl Default for Config {
             port: AGENT_FILE_SERVER_PORT,
             project_source_dir: PathBuf::from(WORKSPACE_ROOT),
             computer_workspace_dir: PathBuf::from(COMPUTER_WORKSPACE_ROOT),
+            userapp_workspace_dir: PathBuf::from(USERAPP_WORKSPACE_ROOT),
             service_log_dir: PathBuf::from("/app/logs/file-server"),
             service_log_retention_days: 7,
             init_project_dir: PathBuf::from("/app/project_init"),

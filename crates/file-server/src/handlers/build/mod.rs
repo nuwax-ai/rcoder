@@ -21,6 +21,10 @@ use crate::workspace::ProjectContext;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BuildQuery {
     pub(crate) project_id: String,
+    /// UserApp 开发卷定位 (可选): 传 appId 时 workspace 走 UserApp 开发卷
+    /// (`{USERAPP_WORKSPACE_DIR}/{appId}`), 与 projectId 定位二选一。
+    #[serde(default)]
+    pub(crate) app_id: Option<String>,
     #[serde(default)]
     pub(crate) pid: Option<String>,
     #[serde(default)]
@@ -36,6 +40,9 @@ pub(crate) struct BuildQuery {
 
 /// 解析项目绝对路径 (dev/build handler 共享)。
 pub(crate) async fn project_path(state: &AppState, q: &BuildQuery) -> AppResult<PathBuf> {
+    if let Some(app_id) = q.app_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return crate::workspace::resolve_userapp_dev(app_id, None, &state.config);
+    }
     state
         .resolver
         .resolve_project(&ProjectContext {

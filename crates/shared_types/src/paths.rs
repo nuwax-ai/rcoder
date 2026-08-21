@@ -36,3 +36,17 @@ pub const WORKSPACE_ROOT: &str = "/app/project_workspace";
 /// /app/computer-project-workspace/{user_id}/{project_id}/
 /// ```
 pub const COMPUTER_WORKSPACE_ROOT: &str = "/app/computer-project-workspace";
+
+/// UserApp 开发卷根目录 (**沙箱容器视角**)。
+///
+/// 独立共享卷: 沙箱 (ComputerAgentRunner) 挂载点为 `/home/user/userapp-workspace`
+/// (K8s=共享 PVC `{ns}-rcoder-userapp-workspace`, Docker=bind `./userapp-workspace`);
+/// builder 容器挂同一块卷到 `/app/userapp-workspace` (env 覆盖本默认值)。
+/// file-server 全部 userapp 域接口 (文件操作镜像族 + build/detect/confirm/static)
+/// 定位统一为 `{USERAPP_WORKSPACE_DIR}/{app_id}`——容器无关, 拓扑无关。
+///
+/// 目录结构:
+/// ```text
+/// /home/user/userapp-workspace/{app_id}/
+/// ```
+pub const USERAPP_WORKSPACE_ROOT: &str = "/home/user/userapp-workspace";
