@@ -149,17 +149,24 @@ pub(crate) async fn serve_computer(
     if user_id.trim().is_empty() || c_id.trim().is_empty() {
         return cors_404(&req, &COMPUTER_CORS);
     }
-    // customTargetDir 非空 → 完全覆盖根 (对齐 nuwax, 不拼 user/cId)
-    let default_root = match state
-        .resolver
-        .resolve_computer(&ComputerContext {
-            user_id: user_id.to_string(),
-            cid: c_id.to_string(),
-        })
-        .await
-    {
-        Ok(root) => root,
-        Err(error) => return error.into_response(),
+    // userApp 分流（X-Service-Type=userapp）：根切到开发卷 `{USERAPP_WORKSPACE_DIR}/{cId}`
+    let default_root = if crate::extract::is_userapp_request() {
+        match crate::workspace::resolve_userapp_dev(&c_id, None, &state.config) {
+            Ok(root) => root,
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        match state
+            .resolver
+            .resolve_computer(&ComputerContext {
+                user_id: user_id.to_string(),
+                cid: c_id.to_string(),
+            })
+            .await
+        {
+            Ok(root) => root,
+            Err(error) => return error.into_response(),
+        }
     };
     // customTargetDir 非空 → 完全覆盖根 (对齐 nuwax, 不拼 user/cId);
     // 注: 不做根目录白名单限制 —— 容器内内网部署, 且用户客户端复用本模块逻辑,

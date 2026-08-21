@@ -33,6 +33,12 @@ pub(crate) mod workspace;
 // ── 跨组共享 helper (子模块经 super:: 访问) ──────────────────────────────────────
 
 async fn ws_path(state: &AppState, user_id: &str, cid: &str) -> Result<PathBuf, AppError> {
+    // userApp 分流（X-Service-Type=userapp，经反向代理/rcoder 拦截层透传）：
+    // workspace 从 computer 定位 `{COMPUTER_WORKSPACE_ROOT}/{userId}/{cId}` 切到
+    // 开发卷 `{USERAPP_WORKSPACE_DIR}/{cId}`（cId=app_id；本容器即该 app 的开发容器）。
+    if crate::extract::is_userapp_request() {
+        return crate::workspace::resolve_userapp_dev(cid, None, &state.config);
+    }
     state
         .resolver
         .resolve_computer(&ComputerContext {

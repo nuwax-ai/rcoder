@@ -93,6 +93,9 @@ impl FileServer {
             .layer(DefaultBodyLimit::max(request_body_limit))
             .layer(from_fn(request_id_layer))
             .layer(from_fn(locale_layer))
+            // userApp 分流标记（X-Service-Type=userapp → task-local；computer 域
+            // workspace 定位据此切开发卷）——容器内主场景层
+            .layer(from_fn(crate::extract::scope_userapp_flag))
             .layer(from_fn(request_log_layer))
             .layer(
                 TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {

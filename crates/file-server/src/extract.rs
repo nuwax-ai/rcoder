@@ -1,4 +1,9 @@
 //! HTTP 提取器适配层：把 Axum 原生 rejection 统一映射为 file-server `AppError`。
+//!
+//! 另含 userApp 分流标记（[`USERAPP_FLAG`]）：`X-Service-Type: userapp` 请求经
+//! 反向代理/rcoder 拦截层透传到容器内，由 [`scope_userapp_flag`] 中间件读 header
+//! 注入 task-local，computer 域 workspace 定位（`ws_path` 等）据此切换到
+//! userApp 开发卷——HTTP 层标记，与 ServiceType 枚举（容器编排层）互不相干。
 
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -7,6 +12,31 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 
 use crate::error::AppError;
+
+/// userApp 场景标记 header 名（小写；HTTP header 大小写不敏感）。
+pub const SERVICE_TYPE_HEADER: &str = "x-service-type";
+/// userApp 场景标记值（与 /api/userapp 前缀对齐）。
+pub const SERVICE_TYPE_USERAPP: &str = "userapp";
+
+// ── 请求级 userApp 分流标记 (task_local, 由请求中间件 scope 注入) ────────────────
+tokio::task_local! {
+    static USERAPP_FLAG: bool;
+}
+
+/// 当前请求是否为 userApp 场景（`X-Service-Type: userapp`；task_local 未设置时 false）。
+pub fn is_userapp_request() -> bool {
+    USERAPP_FLAG.try_with(|f| *f).unwrap_or(false)
+}
+
+/// 中间件：读 `X-Service-Type` header → task-local scope 注入（全部 handler 可读）。
+pub async fn scope_userapp_flag(req: Request, next: axum::middleware::Next) -> Response {
+    let is_userapp = req
+        .headers()
+        .get(SERVICE_TYPE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim() == SERVICE_TYPE_USERAPP);
+    USERAPP_FLAG.scope(is_userapp, next.run(req)).await
+}
 
 pub struct AppJson<T>(pub T);
 
@@ -142,7 +172,38 @@ mod tests {
     use serde::Deserialize;
     use tower::ServiceExt;
 
-    use super::AppJson;
+    use super::{AppJson, is_userapp_request};
+
+    /// task-local 分流标记：中间件 scope 注入后 handler 内可读，
+    /// 未设置（中间件外/普通请求）恒 false。
+    #[tokio::test]
+    async fn userapp_flag_scoped_by_middleware() {
+        let app = Router::new().route(
+            "/probe",
+            post(|| async { format!("{}", is_userapp_request()) }),
+        );
+        let app = app.layer(axum::middleware::from_fn(super::scope_userapp_flag));
+
+        // 带 X-Service-Type: userapp → handler 内 true
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(to_bytes(resp.into_body(), 1024).await.unwrap(), "true");
+
+        // 无 header → false
+        let resp = app
+            .oneshot(Request::post("/probe").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(to_bytes(resp.into_body(), 1024).await.unwrap(), "false");
+    }
 
     #[derive(Deserialize)]
     struct Input {
