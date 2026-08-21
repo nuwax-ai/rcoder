@@ -13,6 +13,7 @@ mod handler;
 mod middleware;
 mod proxy_init;
 mod router;
+mod router_docs;
 mod server;
 mod service;
 mod shutdown;

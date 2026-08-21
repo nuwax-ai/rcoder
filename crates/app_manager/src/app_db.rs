@@ -248,7 +248,14 @@ impl AppService {
             if entry.file_type().map_err(map_io_error_db)?.is_dir()
                 && entry.path().join("database").is_dir()
             {
-                subdirs.push(entry.file_name().to_string_lossy().to_string());
+                let dir = entry.file_name().to_string_lossy().to_string();
+                if is_shell_safe_path_component(&dir) {
+                    subdirs.push(dir);
+                } else {
+                    tracing::warn!(
+                        "[APP] skip database subdir with unsafe name (not [A-Za-z0-9._-]): {dir}"
+                    );
+                }
             }
         }
         subdirs.sort();
@@ -265,6 +272,8 @@ impl AppService {
             failed: Vec::new(),
         };
         for rel in files {
+            // rel 已过 is_shell_safe_path_component 白名单（收集时过滤），
+            // 单引号包裹下 shell 不可注入
             let cmd = format!(
                 "psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" --set ON_ERROR_STOP=on -f '/app/code/{rel}'"
             );
@@ -286,7 +295,19 @@ impl AppService {
     }
 }
 
+/// 路径段白名单：`[A-Za-z0-9._-]`（防 zip 内恶意文件名破坏 `sh -c` 命令行——
+/// 引号/空格/`$`/反斜杠等直接拒绝并日志可见，不做转义容错）。
+fn is_shell_safe_path_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
 /// 收集目录下 `*.sql` 文件为 `{prefix}/{name}`（文件名升序）。
+/// 文件名须过 [`is_shell_safe_path_component`] 白名单——不过者跳过并日志可见。
 fn collect_sql_files(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) -> AppResult<()> {
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(map_io_error_db)? {
@@ -295,7 +316,13 @@ fn collect_sql_files(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>)
         if ft.is_file() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(".sql") {
-                names.push(name);
+                if is_shell_safe_path_component(&name) {
+                    names.push(name);
+                } else {
+                    tracing::warn!(
+                        "[APP] skip database sql with unsafe filename (not [A-Za-z0-9._-]): {name}"
+                    );
+                }
             }
         }
     }
@@ -308,4 +335,25 @@ fn collect_sql_files(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>)
 
 fn map_io_error_db(e: std::io::Error) -> AppOperationError {
     AppOperationError::Backend(format!("scan database dir: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_safe_path_component_whitelist() {
+        assert!(is_shell_safe_path_component("001_init.sql"));
+        assert!(is_shell_safe_path_component("backend-go"));
+        assert!(is_shell_safe_path_component("V1__up.down.sql"));
+        // 引号/空格/$/反斜杠/中文 → 拒绝（zip 内恶意文件名防注入）
+        assert!(!is_shell_safe_path_component("it's.sql"));
+        assert!(!is_shell_safe_path_component("a b.sql"));
+        assert!(!is_shell_safe_path_component("$(id).sql"));
+        assert!(!is_shell_safe_path_component("back\\slash.sql"));
+        assert!(!is_shell_safe_path_component("建表.sql"));
+        assert!(!is_shell_safe_path_component(""));
+        assert!(!is_shell_safe_path_component("."));
+        assert!(!is_shell_safe_path_component(".."));
+    }
 }

@@ -130,7 +130,11 @@ pub(crate) async fn align_credentials(
                 .get_project(&body.app_id)
                 .and_then(|p| p.user_id().map(str::to_string))
                 .unwrap_or_else(|| body.app_id.clone());
-            ensure_workspace_ready(&addr, &body.app_id, &user_id).await?;
+            super::ensure_workspace_via_dev(&addr, &body.app_id, &user_id)
+                .await
+                .map_err(|e| {
+                    AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e)
+                })?;
             let runner = DevHttpRunner {
                 addr: &addr,
                 app_id: &body.app_id,
@@ -162,28 +166,4 @@ pub(crate) async fn align_credentials(
         outcome.reset_performed
     );
     Ok(HttpResult::success(outcome))
-}
-
-/// 容器内幂等建 workspace（execute-command 的 cwd 前置条件）。
-async fn ensure_workspace_ready(addr: &str, app_id: &str, user_id: &str) -> Result<(), AppError> {
-    let resp = crate::http_client::shared_client()
-        .post(format!("{addr}/api/userapp/ensure-workspace"))
-        .json(&json!({"appId": app_id, "userId": user_id}))
-        .send()
-        .await
-        .map_err(|e| {
-            AppError::with_message(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                format!("dev container ensure-workspace failed: {e}"),
-            )
-        })?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(AppError::with_message(
-            shared_types::error_codes::ERR_CONTAINER_ERROR,
-            format!("ensure-workspace returned {status}: {text}"),
-        ));
-    }
-    Ok(())
 }

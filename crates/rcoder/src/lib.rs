@@ -10,6 +10,7 @@ pub mod handler;
 pub mod http_client;
 pub mod middleware;
 pub mod router;
+pub mod router_docs;
 mod service;
 pub mod storage;
 pub mod userapp_forward;

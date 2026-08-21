@@ -20,7 +20,6 @@ use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use rcoder_storage::publish_repo::PublishTaskQuery;
-use serde::Deserialize;
 use shared_types::HttpResult;
 use shared_types::error_codes::{
     ERR_INTERNAL_SERVER_ERROR, ERR_NOT_FOUND, ERR_TOO_MANY_REQUESTS, ERR_VALIDATION,
@@ -30,9 +29,13 @@ use crate::AppError;
 use crate::router::AppState;
 
 use super::client;
+use super::models::{
+    CancelTaskData, GetTaskData, PublishBody, PublishTaskData, QueryPublishTasksRequest,
+    StreamQuery,
+};
 use super::orchestrator;
 use super::types::PublishTaskStoreError;
-use super::{CancelAttempt, PublishEvent, PublishTaskKind, PublishTaskSnapshot, PublishTaskStatus};
+use super::{CancelAttempt, PublishEvent, PublishTaskKind, PublishTaskSnapshot};
 
 /// 路由聚合(注册到 rcoder 主 router,与 app_manager 路由同 `/api/v1/apps` 前缀)。
 pub fn routes() -> axum::Router<Arc<AppState>> {
@@ -50,76 +53,6 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
             "/api/v1/apps/publish/tasks/{task_id}/cancel",
             post(cancel_task),
         )
-}
-
-/// publish / build 请求体:agent-runner project_id(定位 build 目标)。
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct PublishBody {
-    pub project_id: String,
-    /// 是否在发布 activate 后自动执行包内 database 目录的 SQL 文件
-    /// （根 database/ 先 + 各子项目 database/，文件名升序；单文件失败仅日志不阻断）。
-    /// 缺省 true。
-    #[serde(default = "default_auto_execute_sql")]
-    pub auto_execute_sql: Option<bool>,
-    /// owner 用户 ID（补记 userapp_metadata；显式传优先于 create-workspace 注册值）
-    #[serde(default)]
-    pub user_id: Option<String>,
-}
-
-fn default_auto_execute_sql() -> Option<bool> {
-    Some(true)
-}
-
-/// tasks/query 请求体(分页 + 可选过滤;POST body 承载,与 /apps/query 惯例一致)。
-#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
-pub struct QueryPublishTasksRequest {
-    /// 页码,从 1 起,默认 1
-    pub page: Option<u32>,
-    /// 每页数量,1..=100,默认 20
-    pub page_size: Option<u32>,
-    /// 过滤条件
-    pub filters: Option<PublishTaskFilters>,
-}
-
-/// 任务过滤(app_ids 精确集合 / kind / 只看未终态)。
-#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
-pub struct PublishTaskFilters {
-    /// 按 app_id 集合过滤(None=全部)
-    pub app_ids: Option<Vec<String>>,
-    /// build | publish(None=全部)
-    pub kind: Option<PublishTaskKind>,
-    /// 只看未终态任务(对账:该 app 现在有没有在跑的任务)
-    pub active_only: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct StreamQuery {
-    #[serde(default)]
-    pub from_seq: u64,
-}
-
-// ---- 类型化响应(HttpResult.data 载荷;错误链已是 HttpResult shape 零改动)----
-
-/// publish / build 立即返回(task 已创建,后台 spawn)。
-#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
-pub struct PublishTaskData {
-    pub task_id: String,
-    pub status: String,
-}
-
-/// get_task 返回(任务快照)。
-#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
-pub struct GetTaskData {
-    pub task: PublishTaskSnapshot,
-}
-
-/// cancel_task 返回(Accepted 时 already_terminal=None;AlreadyTerminal 时 Some(true))。
-#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
-pub struct CancelTaskData {
-    pub task_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub already_terminal: Option<bool>,
-    pub status: PublishTaskStatus,
 }
 
 fn err(msg: impl Into<String>) -> AppError {

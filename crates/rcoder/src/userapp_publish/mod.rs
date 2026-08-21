@@ -15,6 +15,7 @@ pub mod agent_runner;
 pub mod app_lifecycle;
 mod client; // 仅 userapp_publish 内部消费(handler 不直接触达)
 pub mod handler;
+pub mod models;
 pub mod orchestrator;
 pub mod store;
 pub mod task;
