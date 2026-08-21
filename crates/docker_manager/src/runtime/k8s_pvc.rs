@@ -170,6 +170,10 @@ impl K8sPvcOps for KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         // UserAppBuilder 的 workspace 是共享卷（helm 预建）, 不做 per-app ensure。
         if matches!(service_type, ServiceType::UserAppBuilder) {
+            info!(
+                "[K8S] skip per-app PVC ensure for builder {} (shared userapp workspace, helm-managed)",
+                identifier
+            );
             return Ok(());
         }
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
