@@ -87,7 +87,9 @@ fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BuildCreatedData {
+    /// 构建任务 ID（轮询 /tasks/{taskId} 与 SSE 订阅用）
     pub task_id: String,
+    /// 受理时状态（pending——异步任务已创建）
     pub status: String,
 }
 
@@ -95,6 +97,7 @@ pub(crate) struct BuildCreatedData {
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CancelData {
+    /// 被取消的任务 ID
     pub task_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -134,6 +137,7 @@ pub(crate) struct ImportProjectBody {
     #[serde(deserialize_with = "deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub app_id: String,
+    /// workspace 内的子项目目录名（模板 zip 的顶层目录；detect/confirm 的定位粒度）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_dir: String,
 }

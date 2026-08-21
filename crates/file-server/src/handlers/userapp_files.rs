@@ -33,20 +33,26 @@ use crate::workspace::resolve_userapp_dev;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappFileListQuery {
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default)]
     #[garde(skip)]
+    /// 预览 URL 前缀（fileProxyUrl 的 base）；缺省则响应不含 fileProxyUrl
     pub proxy_path: Option<String>,
     #[serde(default)]
     #[garde(skip)]
+    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
     #[serde(default)]
     #[garde(skip)]
+    /// 相对 workspace 根的子目录（可多级）；缺省列根目录
     pub relative_path: Option<String>,
     #[serde(default)]
     #[garde(skip)]
+    /// 是否递归展开子目录；缺省 true，显式 "false" 仅当前层
     pub recursive: Option<String>,
 }
 
@@ -84,16 +90,21 @@ pub(crate) async fn get_file_list(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappResolveFileQuery {
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default)]
     #[garde(skip)]
+    /// 预览 URL 前缀（fileProxyUrl 的 base）；缺省则响应不含 fileProxyUrl
     pub proxy_path: Option<String>,
     #[serde(default)]
     #[garde(skip)]
+    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// workspace 内相对路径的文件（必填非空）
     pub file_path: String,
 }
 
@@ -127,25 +138,34 @@ pub(crate) async fn resolve_file(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappSearchFilesQuery {
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default)]
     #[garde(skip)]
+    /// 预览 URL 前缀（fileProxyUrl 的 base）；缺省则响应不含 fileProxyUrl
     pub proxy_path: Option<String>,
     #[serde(default)]
     #[garde(skip)]
+    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
     #[serde(default)]
     #[garde(skip)]
+    /// 相对 workspace 根的子目录（可多级）；缺省列根目录
     pub relative_path: Option<String>,
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// 搜索关键字（文件名/相对路径子串，大小写不敏感；必填非空）
     pub kw: String,
     #[garde(custom(crate::validation_rules::positive_int))]
+    /// 命中条数上限（必填正整数）
     pub limit: String,
     #[garde(custom(crate::validation_rules::positive_int))]
+    /// 访问条目数硬上限，含未命中（必填正整数）
     pub max_visit: String,
     #[garde(custom(crate::validation_rules::positive_int))]
+    /// 超时毫秒数（必填正整数）
     pub timeout_ms: String,
 }
 
@@ -185,11 +205,15 @@ pub(crate) async fn search_files(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappFilesUpdateBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
+    /// 上传文件的二进制内容（重复字段，与 filePaths 一一对应）
     pub files: Vec<code_service::FileOp>,
     #[serde(default)]
+    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
 }
 
@@ -220,11 +244,16 @@ pub(crate) async fn files_update(
 #[derive(utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UserappUploadFileForm {
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
+    /// workspace 内相对路径的文件（必填非空）
     pub file_path: String,
+    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
     #[schema(format = Binary)]
+    /// 上传文件（zip 或单文件）
     pub file: String,
 }
 
@@ -232,10 +261,15 @@ pub struct UserappUploadFileForm {
 #[derive(utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UserappUploadFilesForm {
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
+    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
+    /// 每个文件的目标相对路径（与 files 一一对应，重复字段）
     pub file_paths: Vec<String>,
+    /// 上传文件的二进制内容（重复字段，与 filePaths 一一对应）
     pub files: Vec<crate::openapi::BinaryFile>,
 }
 
@@ -336,15 +370,20 @@ pub(crate) async fn upload_files(
 pub(crate) struct UserappGenerateFileBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// 文件名，可含相对子路径（如 "src/foo.txt"；自动剥前导 `/`）
     pub file_name: String,
     #[serde(default)]
+    /// 文本内容；缺省视为空串
     pub content: Option<String>,
     #[serde(default)]
+    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
 }
 
@@ -375,10 +414,14 @@ pub(crate) async fn generate_file(
 #[derive(utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UserappImportProjectForm {
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
+    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
     #[schema(format = Binary)]
+    /// 上传文件（zip 或单文件）
     pub file: String,
 }
 

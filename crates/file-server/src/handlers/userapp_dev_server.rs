@@ -36,13 +36,16 @@ fn app_id_of_key(key: &str) -> Option<&str> {
 pub(crate) struct DevOpBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     /// dev server 的 base path（vite --base 等; 缺省 "/"）。
     #[serde(default)]
     #[garde(skip)]
+    /// dev server 的 base path（vite --base 等）；缺省 "/"
     pub base_path: Option<String>,
 }
 
@@ -50,12 +53,15 @@ pub(crate) struct DevOpBody {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DevLogsQuery {
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     /// 日志起始行（分页, 默认 1）。
     #[serde(default = "default_start_index")]
+    /// 日志起始行（分页）；默认 1
     pub start_index: usize,
     /// "main"（当日汇总）或 "temp"（最新一次, 默认）。
     #[serde(default)]
+    /// 日志类型：main=当日汇总 / temp=最新一次（默认）
     pub log_type: Option<String>,
 }
 fn default_start_index() -> usize {

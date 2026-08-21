@@ -231,6 +231,67 @@ mod tests {
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 
+    /// 文档质量防回归: /api/userapp/* 全部接口的 path/query 参数与请求体 schema 字段
+    /// 必须有非空 description（doc comment 是唯一来源——新字段不写注释此处报红）。
+    #[test]
+    fn userapp_endpoints_fields_are_documented() {
+        let document = generated_document();
+        let mut checked_params = 0usize;
+        let mut checked_fields = 0usize;
+        for (path, item) in &document.paths.paths {
+            if !path.starts_with("/api/userapp/") {
+                continue;
+            }
+            for operation in [&item.get, &item.post].into_iter().flatten() {
+                if let Some(params) = &operation.parameters {
+                    for p in params {
+                        assert!(
+                            p.description.as_ref().is_some_and(|d| !d.trim().is_empty()),
+                            "{path} 参数 {:?} 缺少 description（补 doc comment）",
+                            p.name
+                        );
+                        checked_params += 1;
+                    }
+                }
+            }
+        }
+        // 组件 schema 的字段 description（Userapp* Form/Body 与 dev server 的 DTO）
+        for (name, schema) in &document
+            .components
+            .as_ref()
+            .expect("components present")
+            .schemas
+        {
+            if !name.starts_with("Userapp") && name != "DevOpBody" && name != "DevLogsQuery" {
+                continue;
+            }
+            let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(obj)) = schema
+            else {
+                continue;
+            };
+            for (field, value) in &obj.properties {
+                let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(field_obj)) =
+                    value
+                else {
+                    continue;
+                };
+                assert!(
+                    field_obj
+                        .description
+                        .as_ref()
+                        .is_some_and(|d| !d.trim().is_empty()),
+                    "schema {name} 字段 {field} 缺少 description（补 doc comment）"
+                );
+                checked_fields += 1;
+            }
+        }
+        assert!(checked_params > 30, "参数检查覆盖异常: {checked_params}");
+        assert!(
+            checked_fields > 20,
+            "schema 字段检查覆盖异常: {checked_fields}"
+        );
+    }
+
     #[test]
     fn generated_document_round_trips_as_openapi() {
         let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");

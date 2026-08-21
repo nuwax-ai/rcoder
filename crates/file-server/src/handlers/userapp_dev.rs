@@ -29,11 +29,14 @@ use crate::workspace::resolve_userapp_dev;
 pub(crate) struct UserappExecCommandBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// shell 命令串（经 shell -c 执行，cwd=workspace）
     pub command: String,
 }
 
@@ -57,11 +60,14 @@ pub(crate) async fn execute_command(
 pub(crate) struct UserappGetLogsQuery {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default = "default_tail_lines")]
+    /// 返回日志末尾行数；默认 200
     pub tail_lines: usize,
 }
 fn default_tail_lines() -> usize {
@@ -91,9 +97,12 @@ pub(crate) async fn get_logs(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappInstallBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
+    /// 语言：typescript/ts→pnpm install；python/py→pip install
     pub programming_language: String,
 }
 
@@ -114,10 +123,13 @@ pub(crate) async fn install_project(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappZipBody {
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default)]
+    /// 额外排除目录（与内置排除表合并，按任意路径段匹配）
     pub exclude_dirs: Option<Vec<String>>,
 }
 
@@ -148,11 +160,14 @@ pub(crate) async fn zip_workspace(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappDownloadQuery {
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
     #[garde(custom(crate::validation_rules::not_blank))]
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default)]
     #[garde(skip)]
+    /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
 }
 
@@ -184,10 +199,14 @@ pub(crate) async fn download_all_files(
 #[derive(utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UserappInitTemplateForm {
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[schema(format = Binary)]
+    /// 上传文件（zip 或单文件）
     pub file: String,
+    /// 是否 git init（双开关：GIT_ENABLED 且为 true 才执行）
     pub enable_git: Option<bool>,
 }
 
@@ -243,10 +262,14 @@ pub(crate) async fn init_project_template(
 #[derive(utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UserappPushSkillsForm {
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
+    /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[schema(format = Binary)]
+    /// 上传文件（zip 或单文件）
     pub file: Option<String>,
+    /// 技能 zip 的 URL 列表（JSON 数组或单值）
     pub skill_urls: Option<Vec<String>>,
     /// 智能体 ID (开发卷布局下不走 agent-store, 仅审计日志)
     pub agent_id: Option<String>,

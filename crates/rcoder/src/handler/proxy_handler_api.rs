@@ -508,6 +508,7 @@ pub async fn proxy_to_port_with_path(
 （此 axum 接口返回 307 重定向到 Pingora 端口；生产建议直接访问 Pingora 的 `/proxy/apps/{app_id}/{port}/{path}`）
 "#,
     params(
+        ("user_id" = String, Path, description = "归属用户 ID（不参与后端解析，与 devapps 统一四段形态）"),
         ("app_id" = String, Path, description = "应用 ID"),
         ("port" = u16, Path, description = "应用的 HTTP 端口"),
         ("path" = String, Path, description = "应用内的路径")
@@ -519,7 +520,7 @@ pub async fn proxy_to_port_with_path(
 )]
 pub async fn proxy_to_app_with_path(
     State(state): State<Arc<AppState>>,
-    Path((app_id, port, path)): Path<(String, u16, String)>,
+    Path((_user_id, app_id, port, path)): Path<(String, String, u16, String)>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
     let Some(proxy_config) = state.config.proxy_config.as_ref() else {
         return Err((
@@ -538,10 +539,84 @@ pub async fn proxy_to_app_with_path(
     } else {
         format!("/{}", path)
     };
-    // 重定向到 Pingora 的 app 专用代理路径（按 app_id+port 路由，多 app 同端口不冲突）
+    // 重定向到 Pingora 的 app 专用代理路径（四段; user_id 不参与解析, 统一形态）
     let location = format!(
-        "http://127.0.0.1:{}/proxy/apps/{}/{}{}",
-        listen_port, app_id, port, target_path
+        "http://127.0.0.1:{}/proxy/apps/{}/{}/{}{}",
+        listen_port, _user_id, app_id, port, target_path
+    );
+    let resp = axum::http::Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(axum::http::header::LOCATION, location)
+        .body(axum::body::Body::empty())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProxyErrorResponse {
+                    error: "RESPONSE_BUILD_ERROR".to_string(),
+                    message: format!("failed to build response: {}", e),
+                    target_port: port,
+                    timestamp: Utc::now().to_rfc3339(),
+                }),
+            )
+        })?;
+    Ok(resp)
+}
+
+/// Pingora 代理 - 开发阶段预览（用户沙箱 dev server，按 user_id+port 动态解析）
+#[utoipa::path(
+    get,
+    path = "/proxy/devapps/{user_id}/{app_id}/{port}/{*path}",
+    tag = "应用管理",
+    summary = "Pingora 代理 - 开发阶段预览（沙箱 dev server，零注册动态解析）",
+    description = r#"
+访问开发阶段用户沙箱容器里的 dev server（`POST /api/userapp/dev/start` 启动，PortPool 分配端口），
+或沙箱自装 pingap/app-cli 的统一入口（端口 9080）。与部署访问 `/proxy/apps/{user_id}/{app_id}/{port}/{*path}`
+同构四段——**开发切部署前端只改 `devapps`→`apps` 一段**。
+
+- upstream 动态解析到该用户的沙箱容器（ComputerAgentRunner）同端口，**零注册零状态**：
+  Java 用 `dev/start` 响应的 `port` + `user_id` + `app_id` 三元组直接拼 URL。
+- `app_id` 不参与解析（沙箱内端口已唯一），用于日志排障与未来归属鉴权。
+- 多 app 同沙箱并行：app-a（4000）/app-b（4001）各拼各的 URL。
+- 长连接支持（HMR/WebSocket）；无该用户沙箱 → 502；沙箱重建后有短窗口旧 IP（下次 ensure 修正）。
+
+> 例：`GET /proxy/devapps/u6/app-order-svc/4000/api/users` → 沙箱 `:4000/api/users`。
+> host（Pingora 入口）由调用方持有，详见应用管理手册 §12。
+"#,
+    params(
+        ("user_id" = String, Path, description = "用户 ID（定位其沙箱容器）"),
+        ("app_id" = String, Path, description = "应用 ID（不参与解析；日志排障/鉴权锚点）"),
+        ("port" = u16, Path, description = "沙箱内端口（dev server 的 PortPool 端口或 pingap 的 9080）"),
+        ("path" = String, Path, description = "应用内的路径")
+    ),
+    responses(
+        (status = 307, description = "重定向到 Pingora 代理服务", body = String),
+        (status = 503, description = "代理服务未启用", body = ProxyErrorResponse)
+    )
+)]
+pub async fn proxy_to_devapp_with_path(
+    State(state): State<Arc<AppState>>,
+    Path((user_id, app_id, port, path)): Path<(String, String, u16, String)>,
+) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
+    let Some(proxy_config) = state.config.proxy_config.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ProxyErrorResponse {
+                error: "PROXY_DISABLED".to_string(),
+                message: "Pingora proxy service not enabled".to_string(),
+                target_port: port,
+                timestamp: Utc::now().to_rfc3339(),
+            }),
+        ));
+    };
+    let listen_port = proxy_config.listen_port;
+    let target_path = if path.is_empty() || path == "/" {
+        "/".to_string()
+    } else {
+        format!("/{}", path)
+    };
+    let location = format!(
+        "http://127.0.0.1:{}/proxy/devapps/{}/{}/{}{}",
+        listen_port, user_id, app_id, port, target_path
     );
     let resp = axum::http::Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
