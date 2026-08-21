@@ -408,3 +408,56 @@ impl tracing::field::Visit for JsonFieldVisitor<'_> {
         );
     }
 }
+
+#[cfg(test)]
+mod extra_layer_tests {
+    use super::*;
+    use tracing_appender::non_blocking;
+    use tracing_subscriber::filter::Targets;
+
+    /// 复现生产装配：extra_layer（file-server 独立层, per-layer Targets）挂在 registry
+    /// 最内层、EnvFilter（RUST_LOG=debug,...）在外层——rcoder 主容器的真实拓扑。
+    /// 若该装配下 file_server 事件写不进文件, /app/logs/file-server 将全空（生产症状）。
+    #[test]
+    fn extra_layer_receives_file_server_events_under_global_debug_env_filter() {
+        let dir = std::env::temp_dir().join(format!("rcoder-tel-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let appender = tracing_appender::rolling::Builder::new()
+            .rotation(Rotation::NEVER)
+            .filename_prefix("fs-test.log")
+            .build(&dir)
+            .unwrap();
+        let (writer, guard) = non_blocking(appender);
+        let extra_layer = fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_filter(
+                Targets::new()
+                    .with_target("file_server", tracing::Level::INFO)
+                    .with_default(tracing_subscriber::filter::LevelFilter::OFF),
+            )
+            .boxed();
+
+        // 生产 compose 的 RUST_LOG（裸 debug 全局默认 + 三方收敛）
+        let env_filter = EnvFilter::new("debug,bollard=info,h2=info,hyper=info,tonic=info");
+
+        // 与 init_tracing_subscriber 同序: extra_layer 最内, env_filter 在外
+        let subscriber = tracing_subscriber::registry()
+            .with(Some(extra_layer))
+            .with(env_filter)
+            .with(fmt::layer().with_writer(std::io::sink));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "file_server::http", "hello from file server");
+            tracing::info!(target: "rcoder::bootstrap", "hello from rcoder");
+        });
+        drop(guard); // flush non_blocking 缓冲
+
+        let written = std::fs::read_to_string(dir.join("fs-test.log")).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            written.contains("hello from file server"),
+            "file_server 事件未写入 extra_layer 文件, 实际内容: {written:?}"
+        );
+    }
+}
