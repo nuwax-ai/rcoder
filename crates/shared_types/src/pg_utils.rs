@@ -47,6 +47,42 @@ pub fn pg_quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+// ── 容器内 PG 凭据对齐命令构造（userApp dev/prod 双环境共用；经各自执行通道跑 sh -c） ──
+
+/// sh 单引号安全包裹（`'` → `'\''`）——密码等自由文本进 shell 环境变量的标准转义。
+pub fn pg_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// 凭据验证命令（TCP scram 认证）：exit 0 = 传入密码与该账号当前密码一致。
+///
+/// 走 `-h 127.0.0.1` 强制 TCP（镜像 initdb `--auth-host=scram-sha-256`），
+/// 不落 trust 通道；`username` 须先过 [`validate_pg_identifier`] 白名单。
+pub fn pg_verify_credentials_cmd(username: &str, password: &str) -> String {
+    format!(
+        "PGPASSWORD={} psql -h 127.0.0.1 -U {} -d postgres -tAc 'SELECT 1'",
+        pg_shell_quote(password),
+        pg_quote_ident(username)
+    )
+}
+
+/// 角色存在检查命令（本地 trust 免密，`$POSTGRES_USER` 为镜像 ENV）。
+pub fn pg_role_exists_cmd(username: &str) -> String {
+    format!(
+        "psql -U \"$POSTGRES_USER\" -d postgres -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{}'\"",
+        pg_escape_literal(username)
+    )
+}
+
+/// 密码重置命令（本地 trust 免密 ALTER USER；任意已存在账号）。
+pub fn pg_alter_password_cmd(username: &str, password: &str) -> String {
+    format!(
+        "psql -U \"$POSTGRES_USER\" -d postgres -v ON_ERROR_STOP=1 -c \"ALTER USER {} WITH PASSWORD '{}'\"",
+        pg_quote_ident(username),
+        pg_escape_literal(password)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +139,25 @@ mod tests {
     fn quote_ident() {
         assert_eq!(pg_quote_ident("my db"), "\"my db\"");
         assert_eq!(pg_quote_ident("weird\"name"), "\"weird\"\"name\"");
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quote() {
+        assert_eq!(pg_shell_quote("plain"), "'plain'");
+        assert_eq!(pg_shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(pg_shell_quote("a'; rm -rf /"), r"'a'\''; rm -rf /'");
+    }
+
+    #[test]
+    fn verify_cmd_forces_tcp_scram() {
+        let cmd = pg_verify_credentials_cmd("app", "s3cret");
+        assert!(cmd.starts_with("PGPASSWORD='s3cret' psql -h 127.0.0.1"));
+        assert!(cmd.contains(r#"-U "app""#));
+    }
+
+    #[test]
+    fn alter_cmd_escapes_password_literal() {
+        let cmd = pg_alter_password_cmd("app", "pa'ss");
+        assert!(cmd.contains(r#"ALTER USER "app" WITH PASSWORD 'pa''ss'"#));
     }
 }

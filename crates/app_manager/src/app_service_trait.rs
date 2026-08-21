@@ -69,6 +69,14 @@ pub trait AppServiceTrait: Send + Sync {
     /// 新建 PG 库（exec psql CREATE DATABASE）
     async fn create_database(&self, app_id: &str, request: CreateDatabaseRequest) -> AppResult<()>;
 
+    /// PG 凭据对齐（UserApp 运行容器内）：验证传入密码，不一致则重置
+    /// （流程单头 `shared_types::align_pg_credentials`，exec 通道实现）
+    async fn align_db_credentials(
+        &self,
+        app_id: &str,
+        request: shared_types::AlignCredentialsRequest,
+    ) -> AppResult<shared_types::AlignCredentialsOutcome>;
+
     /// 分页查询持久存储（强制分页，无全量模式）
     async fn query_storage(
         &self,

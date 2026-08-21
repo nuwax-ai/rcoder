@@ -9,6 +9,7 @@
 //! 容器定位/创建复用 [`crate::userapp_publish::agent_runner::ensure_userapp_builder`]
 //! （幂等；注册 state.projects 防孤立清理）。
 
+pub(crate) mod db;
 mod forward;
 
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use crate::userapp_publish::agent_runner::{dev_file_server_addr, ensure_userapp_
 use crate::{AppError, HttpResult};
 
 // 分流 header 常量（X-Service-Type / X-App-Id）定义在 forward.rs（pub const，文档
-// 与跨模块引用锚点）；本模块仅转发 computer_intercept 拦截层给主 Router 装配。
+// 与跨模块引用锚点）；本模块转发 computer_intercept 拦截层给主 Router 装配。
 pub(crate) use forward::computer_intercept;
 
 /// userApp 域转发路由（挂 rcoder 主 Router；`/api/userapp` 族不再来自 file-server
@@ -34,6 +35,10 @@ pub(crate) use forward::computer_intercept;
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/userapp/workspace", post(create_workspace))
+        .route(
+            "/api/userapp/db/{env}/align-credentials",
+            post(db::align_credentials),
+        )
         .route("/api/userapp/{*rest}", any(forward::forward_userapp))
 }
 

@@ -20,6 +20,10 @@ pub use userapp::activity::{
     ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, WakeOutcome,
 };
 pub use userapp::build_event::BuildProgressEvent;
+pub use userapp::db_align::{
+    AlignCredentialsOutcome, AlignCredentialsRequest, CommandOutcome, PgCommandRunner,
+    align_pg_credentials,
+};
 pub use userapp::dev_cleanup::UserappDevCleanup;
 pub use userapp::metadata::{AppMetadataPersistence, AppMetadataRecord};
 

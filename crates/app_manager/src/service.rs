@@ -548,6 +548,14 @@ impl super::AppServiceTrait for AppService {
         self.create_database(app_id, request).await
     }
 
+    async fn align_db_credentials(
+        &self,
+        app_id: &str,
+        request: shared_types::AlignCredentialsRequest,
+    ) -> AppResult<shared_types::AlignCredentialsOutcome> {
+        self.align_db_credentials(app_id, request).await
+    }
+
     async fn query_storage(
         &self,
         request: QueryStorageRequest,

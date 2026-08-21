@@ -772,11 +772,14 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         crate::userapp_publish::handler::stream_task,
         crate::userapp_publish::handler::cancel_task,
         crate::userapp_forward::create_workspace,
+        crate::userapp_forward::db::align_credentials,
     ),
     components(
         schemas(
-            // userApp 转发层（create-workspace）
+            // userApp 转发层（create-workspace + PG 凭据对齐）
             crate::userapp_forward::CreateWorkspaceBody,
+            shared_types::AlignCredentialsRequest,
+            shared_types::AlignCredentialsOutcome,
             // 响应结构体
             shared_types::HealthCheckResponse,
             shared_types::AgentChatRequest,

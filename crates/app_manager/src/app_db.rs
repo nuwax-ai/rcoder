@@ -1,12 +1,40 @@
 //! UserApp 容器内 PostgreSQL 管理（从 service.rs 拆出，extension-impl）。
 //!
-//! reset-password / create-database（exec psql）+ exec_psql / database_exists / ensure_app_running。
+//! reset-password / create-database（exec psql）+ align_db_credentials（凭据对齐，
+//! 流程单头 `shared_types::align_pg_credentials`）+ exec_psql / database_exists / ensure_app_running。
 
+use async_trait::async_trait;
 use tracing::info;
 
 use super::models::*;
 use super::service::AppService;
 use super::utils::*;
+
+/// UserApp 运行容器 exec 通道（runtime exec → PgCommandRunner）。
+struct RuntimeExecRunner<'a> {
+    service: &'a AppService,
+    app_id: &'a str,
+}
+
+#[async_trait]
+impl shared_types::PgCommandRunner for RuntimeExecRunner<'_> {
+    async fn run(&self, command: &str) -> Result<shared_types::CommandOutcome, String> {
+        let r = self
+            .service
+            .runtime
+            .exec(
+                self.app_id,
+                vec!["sh".to_string(), "-c".to_string(), command.to_string()],
+            )
+            .await
+            .map_err(|e| format!("exec failed: {e}"))?;
+        Ok(shared_types::CommandOutcome {
+            exit_code: r.exit_code,
+            stdout: r.stdout,
+            stderr: r.stderr,
+        })
+    }
+}
 
 impl AppService {
     /// 重置 app 容器内 PG 密码(rcoder exec 容器内 psql ALTER USER,本地 trust 认证绕过当前密码)。
@@ -99,6 +127,30 @@ impl AppService {
             req.database, app_id
         );
         Ok(())
+    }
+
+    /// PG 凭据对齐（UserApp 运行容器内，prod 环境）：验证传入密码与账号当前密码
+    /// 是否一致（TCP scram），不一致则本地 trust ALTER USER 重置并复验。
+    /// 流程单头 [`shared_types::align_pg_credentials`]；密码不落日志。
+    pub async fn align_db_credentials(
+        &self,
+        app_id: &str,
+        req: shared_types::AlignCredentialsRequest,
+    ) -> AppResult<shared_types::AlignCredentialsOutcome> {
+        validate_app_id(app_id)?;
+        self.ensure_app_running(app_id).await?;
+        let runner = RuntimeExecRunner {
+            service: self,
+            app_id,
+        };
+        let outcome = shared_types::align_pg_credentials(&runner, &req.username, &req.password)
+            .await
+            .map_err(AppOperationError::Backend)?;
+        info!(
+            "[APP] PG credentials aligned (prod): app_id={}, username={}, reset_performed={}",
+            app_id, req.username, outcome.reset_performed
+        );
+        Ok(outcome)
     }
 
     /// exec 容器内 psql 命令，exit_code != 0 → Backend 错误（含 stderr 摘要）。
