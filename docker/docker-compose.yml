@@ -5,7 +5,6 @@ services:
     ports:
       - "${RCODER_PORT:-8090}:${RCODER_PORT:-8090}"
       - "8089:8088" # Pingora 反向代理端口（VNC 代理、健康检查等）
-      - "60001:60000"
       - "6669:6669" # tokio-console 观测（DEV_CONSOLE=1 make dev-hot 构建时启用）
       - "8199:80"
       - "7681:7681" # ttyd Web 终端端口
@@ -17,9 +16,8 @@ services:
       # app_manager（UserApp）Docker 模式工作空间根（app-workspace 挂在 /app/app-workspace）；
       # 不设则默认 /app/project_workspace/apps，与挂载点不符，文件管理/storage 会路径错
       - RCODER_WORKSPACE_ROOT=/app/app-workspace
-      # 阶段2: rcoder 嵌入 Rust file-server (端口 60000, 替代 nuwax-file-server 独立进程)
-      # Docker 模式无 Ceph, 嵌入后用 LocalWorkspaceResolver (共享 Docker volume)
-      - RCODER_EMBED_FILE_SERVER=true
+      # file-server 路由已常驻合并进主服务（主端口可达，无独立 60000 listener）；
+      # RCODER_EMBED_FILE_SERVER 仅 agent_runner 进程消费，rcoder 进程不再读取
       # 主容器嵌入 file-server 的 UserApp 开发卷根（挂载点 ./userapp-workspace → /app/userapp-workspace）
       - USERAPP_WORKSPACE_DIR=/app/userapp-workspace
       # UserApp release.lock 构建元数据；测试正式镜像时建议由 shell 覆盖 digest。

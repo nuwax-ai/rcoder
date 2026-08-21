@@ -1,29 +1,30 @@
-//! 阶段2 方案C: rcoder 同进程嵌入 file-server。
+//! file-server 路由合并进 rcoder 主服务（同进程同端口，无独立 listener）。
 //!
-//! [`spawn_embedded_file_server`] 在 rcoder 进程内启动 file-server axum (端口 60000),
-//! 经 [`SubvolumeWorkspaceResolver`] + 本模块 [`ContainerRuntimePathResolver`]
-//! (包 `Arc<dyn ContainerRuntime>::resolve_workspace_path`) 解析 per-agent CephFS
-//! subvolume 聚合路径。file-server 不加 kube 依赖, K8s 能力全经 rcoder ContainerRuntime。
+//! [`merged_router`] 构造 file-server 的基础路由（[`file_server::routes::api_router_base`]，
+//! 排除 `/`、`/health`、`/api/userapp` 与 swagger UI），由 `create_router` merge 进主
+//! Router——老业务路径（/api/project、/api/computer、/api/git、/api/build）在主端口即可用；
+//! userApp 域由 rcoder 侧转发层接管（透传到 per-app 开发容器内的 file-server）。
 //!
-//! env 开关 `RCODER_EMBED_FILE_SERVER=true|1` 启用 (灰度); 配套 start-services.sh
-//! 须检查本 env, 嵌入时不再单独启 file-server 二进制 (避免端口冲突)。
+//! 路由经 [`SubvolumeWorkspaceResolver`] + 本模块 [`ContainerRuntimePathResolver`]
+//! （包 `Arc<dyn ContainerRuntime>::resolve_workspace_path`）解析 per-agent CephFS
+//! subvolume 聚合路径。file-server 不加 kube 依赖，K8s 能力全经 rcoder ContainerRuntime。
 //!
-//! 运行时启停 (迁移期 Rust↔TS 切换): [`register_runtime`] + [`try_start`] + [`stop`]
-//! 由 admin API (`rcoder file-server stop/start/status` 子命令) 调用, rcoder 进程
-//! 不重启即可释放/重占 60000 端口。
+//! 历史：阶段2 方案C 曾为独立 60000 listener（`RCODER_EMBED_FILE_SERVER` 灰度 +
+//! 运行时启停 admin API）；60000 端口现让位给反向代理（分流 TS/Rust），admin API
+//! 与 CLI 子命令已删除。`RCODER_EMBED_FILE_SERVER` 仅剩 agent_runner 进程消费。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
+use axum::Router;
 use container_runtime_api::WorkspaceRuntime;
 use file_server::error::AppResult;
 use file_server::{
     Config, FileServer, SubvolumeWorkspaceResolver, WorkspacePathResolver, WorkspaceResolver,
 };
 use shared_types::ServiceType;
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// 包 `Arc<dyn WorkspaceRuntime>` 实现 file-server 的 [`WorkspacePathResolver`] 窄 trait。
@@ -158,19 +159,8 @@ async fn run_lazy_migrate(
     .await;
 }
 
-/// 运行中的内嵌 file-server 实例 (shutdown 信号 + serve task + 监听地址)。
-struct EmbeddedInstance {
-    shutdown: CancellationToken,
-    task: tokio::task::JoinHandle<()>,
-    address: String,
-}
-
-/// ContainerRuntime 全局注册 (main 无条件调用; embed flag 关闭时也存,
-/// 供运行时 `rcoder file-server start` 拉起)。
+/// ContainerRuntime 全局注册 (main 无条件调用)。
 static RUNTIME: OnceLock<Arc<dyn WorkspaceRuntime>> = OnceLock::new();
-
-/// 当前实例 (None = 未运行)。
-static INSTANCE: tokio::sync::Mutex<Option<EmbeddedInstance>> = tokio::sync::Mutex::const_new(None);
 
 /// 注册 ContainerRuntime (幂等, 首次生效; 重复注册保留首个)。
 pub fn register_runtime(runtime: Arc<dyn WorkspaceRuntime>) {
@@ -179,33 +169,13 @@ pub fn register_runtime(runtime: Arc<dyn WorkspaceRuntime>) {
     }
 }
 
-/// 当前运行状态: Some(address) = 运行中, None = 已停止。
-pub async fn status() -> Option<String> {
-    INSTANCE.lock().await.as_ref().map(|i| i.address.clone())
-}
-
-/// 启动内嵌 file-server (幂等)。
-/// 同步 bind (而非 spawn 内 bind), 返回时状态准确; 供启动流程与运行时 admin API 共用。
-/// `port_override`: CLI/API 显式指定端口 (优先级最高, 覆盖 env FILE_SERVER_PORT/PORT)。
-pub async fn try_start(port_override: Option<u16>) -> Result<String, String> {
-    let mut guard = INSTANCE.lock().await;
-    if let Some(instance) = guard.as_ref() {
-        // 已运行: 显式指定了不同端口时明确报错 (静默吞参数会误导调用方)
-        if let Some(port) = port_override {
-            let current = instance.address.rsplit(':').next().unwrap_or_default();
-            if current != port.to_string() {
-                return Err(format!(
-                    "already running on {}; stop first to change port",
-                    instance.address
-                ));
-            }
-        }
-        return Ok(instance.address.clone());
-    }
+/// 构造合并进 rcoder 主 Router 的 file-server 基础路由（无独立 listener/端口）。
+///
+/// 返回 `Err` 时主服务照常启动（缺 file-server 路由不致命，warn 可见）。
+pub fn merged_router() -> Result<Router, String> {
     let Some(runtime) = RUNTIME.get().cloned() else {
         return Err(
-            "workspace runtime not registered (embedded file-server disabled at startup)"
-                .to_string(),
+            "workspace runtime not registered (file-server routes not mounted)".to_string(),
         );
     };
 
@@ -213,83 +183,12 @@ pub async fn try_start(port_override: Option<u16>) -> Result<String, String> {
     let fs_resolver: Arc<dyn WorkspaceResolver> =
         Arc::new(SubvolumeWorkspaceResolver::new(path_resolver));
 
-    let mut fs_config = Config::load().map_err(|e| format!("load file-server config: {e:#}"))?;
-    // 端口优先级: args (显式覆盖) > env (Config::load 内部已处理) > 默认
-    if let Some(port) = port_override {
-        fs_config.port = port;
-    }
-    let address = format!("{}:{}", fs_config.listen_host, fs_config.port);
-    let deployment_mode = fs_config.deployment_mode;
+    let fs_config = Config::load().map_err(|e| format!("load file-server config: {e:#}"))?;
     let fs_server = FileServer::builder(fs_config)
         .with_workspace_resolver(fs_resolver)
         .build()
-        .map_err(|e| format!("build embedded file-server: {e:#}"))?;
-
-    let listener = tokio::net::TcpListener::bind(&address)
-        .await
-        .map_err(|e| format!("bind {address}: {e}"))?;
-
-    let shutdown = CancellationToken::new();
-    let token = shutdown.clone();
-    let listening_addr = address.clone();
-    let task = tokio::spawn(async move {
-        info!("file-server (embedded) listening on {}", listening_addr);
-        let result = fs_server
-            .serve_with_shutdown(listener, async move { token.cancelled().await })
-            .await;
-        if let Err(e) = &result {
-            warn!("embedded file-server serve exited: {e:#}");
-        }
-        // serve 意外退出 (错误/panic 恢复): 清理 INSTANCE, 避免脏状态
-        // (status 误报 running + try_start 幂等分支返回已死地址)
-        cleanup_dead_instance().await;
-    });
-    info!(
-        version = file_server::VERSION,
-        address = %address,
-        deployment_mode = ?deployment_mode,
-        "file-server (embedded) starting"
-    );
-    *guard = Some(EmbeddedInstance {
-        shutdown,
-        task,
-        address: address.clone(),
-    });
-    Ok(address)
-}
-
-/// serve task 结束后的 INSTANCE 清理 (正常 stop 已 take, 此处只兜底意外退出)。
-async fn cleanup_dead_instance() {
-    let mut guard = INSTANCE.lock().await;
-    // task 已结束: 若 INSTANCE 仍有值即本 task 的残留 (stop 路径会先 take 走;
-    // 新 start 放入的实例 task 尚未结束, 不会误删)
-    if guard.as_ref().is_some_and(|i| i.task.is_finished()) {
-        guard.take();
-        warn!("embedded file-server instance cleaned up after unexpected exit");
-    }
-}
-
-/// 停止内嵌 file-server (幂等)。
-/// cancel → 等 serve task 结束 (**10s 超时 abort + 再 await**, 确保 listener drop 端口释放);
-/// 返回时端口已释放, 外部服务 (如 TS nuwax-file-server) 可立即 bind。
-pub async fn stop() -> Result<(), String> {
-    let instance = INSTANCE.lock().await.take();
-    let Some(mut instance) = instance else {
-        return Ok(());
-    };
-    // 锁已释放 (guard 在上一行 drop), 等 task 期间不阻塞 status/start
-    instance.shutdown.cancel();
-    let timeout = std::time::Duration::from_secs(10);
-    if tokio::time::timeout(timeout, &mut instance.task)
-        .await
-        .is_err()
-    {
-        warn!("embedded file-server graceful stop timed out, aborting");
-        instance.task.abort();
-        // abort 仅调度取消, 再 await 确保 listener 已 drop (端口真正释放);
-        // JoinHandle 不会 self-drop 产生问题 (abort 后 await 必然立即返回)
-        drop((&mut instance.task).await);
-    }
-    info!("file-server (embedded) stopped, port released");
-    Ok(())
+        .map_err(|e| format!("build merged file-server: {e:#}"))?;
+    fs_server
+        .router_base()
+        .map_err(|e| format!("build merged file-server router: {e:#}"))
 }

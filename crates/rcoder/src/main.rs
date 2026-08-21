@@ -254,18 +254,11 @@ async fn main() -> anyhow::Result<()> {
     // 版本 marker 驱动, 已同步的 O(1) 跳过。env RCODER_SKILL_SYNC_RECONCILE_ON_STARTUP 默认 true。
     skill_sync_reconciler::spawn_skill_sync_reconciler();
 
-    // 阶段2 方案C: rcoder 同进程嵌入 file-server (FeatureFlags.embed_file_server, 灰度)。
-    // 启用时 rcoder 进程内 spawn file-server (端口 60000), 经 SubvolumeWorkspaceResolver
-    // 复用本进程 ContainerRuntime 解析 per-agent subvolume 聚合路径 (file-server 不加 kube 依赖)。
-    // 配套: start-services.sh 须检查本 env, 嵌入时不再单独启 file-server 二进制 (避免端口冲突)。
-    // runtime 无条件注册 (embed flag 关闭时也存), 供运行时 `rcoder file-server start` 拉起。
+    // file-server 路由合并进主服务（无独立 listener/端口；60000 让位反向代理）。
+    // runtime 无条件注册, create_router 经 merged_router() 构造基础路由挂进主 Router
+    // （project/computer/git/build 老路径 + SubvolumeWorkspaceResolver per-agent PVC 解析）。
     let ws_runtime: Arc<dyn container_runtime_api::WorkspaceRuntime> = runtime.clone();
     file_server_embed::register_runtime(ws_runtime);
-    if shared_types::FeatureFlags::get().embed_file_server
-        && let Err(e) = file_server_embed::try_start(None).await
-    {
-        warn!("embedded file-server not started: {e}");
-    }
 
     let state = Arc::new(
         AppState::new(

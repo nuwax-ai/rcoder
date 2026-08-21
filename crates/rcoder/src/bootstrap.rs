@@ -22,31 +22,7 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    let mut cli_args = CliArgs::parse();
-
-    // 管理子命令模式 (rcoder file-server stop 等): 不启动服务, 不初始化 telemetry,
-    // 仅加载同源配置 (端口 + api key) 后 HTTP 调运行中的 rcoder 进程, 完成即退出。
-    if let Some(command) = cli_args.command.take() {
-        let cli_port = cli_args.port;
-        let config = load_config_with_args(cli_args)?;
-        let (action, fs_port) = match command {
-            crate::config::AdminCommand::FileServer { action } => match action {
-                crate::config::FileServerAction::Start { port } => ("start", port),
-                crate::config::FileServerAction::Stop => ("stop", None),
-                crate::config::FileServerAction::Restart { port } => ("restart", port),
-                crate::config::FileServerAction::Status => ("status", None),
-            },
-        };
-        let port = cli_port.unwrap_or(config.port);
-        let api_key = if config.api_key_auth.enabled {
-            Some(config.api_key_auth.api_key.clone())
-        } else {
-            None
-        };
-        rcoder::file_server_admin::run_cli_command(action, port, fs_port, api_key.as_deref())
-            .await?;
-        std::process::exit(0);
-    }
+    let cli_args = CliArgs::parse();
 
     let config = load_config_with_args(cli_args)?;
 
@@ -58,29 +34,28 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
     let mut telemetry_config =
         TelemetryConfig::from_env("rcoder").with_file_log_config(file_log_config);
 
-    // 嵌入式 file-server：构建独立日志 layer + guard，注入到 rcoder 的 tracing subscriber
-    if shared_types::FeatureFlags::get().embed_file_server {
-        match file_server::Config::load() {
-            Ok(fs_config) => match file_server::logging::build_file_layer(&fs_config) {
-                Ok((layer, guard)) => {
-                    // tracing 尚未 init（下方才 init），用 eprintln 保证可见（与 main.rs 一致）
-                    eprintln!(
-                        "[BOOTSTRAP] file-server independent log layer injected: dir={}",
-                        fs_config.service_log_dir.display()
-                    );
-                    telemetry_config = telemetry_config.with_extra_layer(layer, guard);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[BOOTSTRAP] failed to build file-server log layer (falling back to rcoder.log): {e}"
-                    );
-                }
-            },
+    // file-server 路由常驻主服务 → 独立日志 layer 无条件注入（target=file_server
+    // 的请求日志/业务日志落 file-server 独立文件，不混入 rcoder.log）
+    match file_server::Config::load() {
+        Ok(fs_config) => match file_server::logging::build_file_layer(&fs_config) {
+            Ok((layer, guard)) => {
+                // tracing 尚未 init（下方才 init），用 eprintln 保证可见（与 main.rs 一致）
+                eprintln!(
+                    "[BOOTSTRAP] file-server independent log layer injected: dir={}",
+                    fs_config.service_log_dir.display()
+                );
+                telemetry_config = telemetry_config.with_extra_layer(layer, guard);
+            }
             Err(e) => {
                 eprintln!(
-                    "[BOOTSTRAP] failed to load file-server config (file-server logs will mix into rcoder.log): {e}"
+                    "[BOOTSTRAP] failed to build file-server log layer (falling back to rcoder.log): {e}"
                 );
             }
+        },
+        Err(e) => {
+            eprintln!(
+                "[BOOTSTRAP] failed to load file-server config (file-server logs will mix into rcoder.log): {e}"
+            );
         }
     }
 

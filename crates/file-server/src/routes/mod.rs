@@ -27,6 +27,25 @@ pub fn api_router() -> OpenApiRouter<AppState> {
         .nest("/api/userapp", userapp_router())
 }
 
+/// rcoder 主服务合并用的基础路由（全量 [`api_router`] 的子集）。
+///
+/// 排除项与原因：
+/// - `/`、`/health`：与 rcoder 主 Router 的健康检查路由冲突（axum merge 同路径 panic）
+/// - `/api/userapp` nest：userApp 域由 rcoder 侧转发层接管（透传到 per-app 开发容器），
+///   本地实现仅存在于开发容器内的 file-server
+/// - swagger UI（`/api-docs`）：rcoder 已在 `/api/docs` 聚合 file-server 全量文档
+///
+/// `/api/version` 保留：无冲突，供调用方探测 file-server 能力版本。
+pub fn api_router_base() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(health::version))
+        .nest("/api/project", project_api_router())
+        .nest("/api/git", git_router())
+        .nest("/api/build", build_router())
+        .nest("/api/computer", computer_router())
+        .nest("/api/page", page_router())
+}
+
 /// `/api/project` + code 路由。
 fn project_api_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()

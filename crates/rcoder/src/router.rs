@@ -502,9 +502,6 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route("/health", get(handler::health_check))
         .with_state(state.clone());
 
-    // 内嵌 file-server 运行时启停 (迁移期 Rust↔TS 切换; 无 state, 受全局 API key 中间件保护)
-    let file_server_admin_routes = crate::file_server_admin::admin_routes();
-
     // P0-5: Agent Management 路由(全部 POST + body 解析)
     // - 简单 JSON 端点使用 I18nJsonOrQuery(同时支持 JSON body 和 ?project_id=xxx query)
     // - install 端点使用 multipart/form-data(file + metadata JSON 字段)
@@ -557,7 +554,6 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
 
     let mut router = Router::new()
         .merge(health_routes)
-        .merge(file_server_admin_routes)
         .merge(api_routes)
         .merge(computer_routes)
         .merge(devcomputer_routes)
@@ -611,6 +607,17 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .layer(axum::middleware::from_fn(locale_context_middleware))
         // 内部 API（供 rcoder-gateway 调用，绕过 API Key 鉴权）
         .merge(create_internal_routes(state))
+        // file-server 基础路由（TS 移植版老路径：/api/project、/api/computer、/api/git、
+        // /api/build、/api/page；排除 /api/userapp——由 rcoder 转发层接管）。
+        // 与 TS 行为一致不设 API key → merge 在 api-key layer 之后（同 internal 先例）；
+        // 构造失败不阻断主服务启动（warn 可见，缺路由面可诊断）。
+        .merge(match crate::file_server_embed::merged_router() {
+            Ok(fs_router) => fs_router,
+            Err(e) => {
+                tracing::warn!("file-server routes not mounted on main service: {e}");
+                Router::new()
+            }
+        })
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             axum::http::header::HeaderName::from_static("x-frame-options"),
             axum::http::HeaderValue::from_static("DENY"),
@@ -961,8 +968,9 @@ pub struct ApiDoc;
 /// 创建 Swagger UI 路由。
 ///
 /// 聚合两份文档（UI 顶部下拉切换）：rcoder 主文档 + file-server 文档。
-/// file-server 接口在生产部署中宿主在 agent_runner 容器 60000 端口
-/// （rcoder 同进程嵌入模式下同端口直通），此处仅聚合文档、不挂载其路由。
+/// file-server 全量文档（含 /api/userapp）始终聚合在此；实际路由宿主：
+/// 老路径（project/computer/git/build）常驻 rcoder 主服务（`merged_router`），
+/// userapp 域由 rcoder 转发层接管、本地实现在 per-app 开发容器内 file-server（60000）。
 pub fn create_swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/api/docs")
         .url("/api/docs/openapi.json", ApiDoc::openapi())

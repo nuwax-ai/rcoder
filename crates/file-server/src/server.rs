@@ -107,6 +107,34 @@ impl FileServer {
             .with_state(self.state.clone()))
     }
 
+    /// 合并进 rcoder 主服务用的基础路由（[`crate::routes::api_router_base`]）。
+    ///
+    /// 与 [`Self::router`] 的差异：不含 swagger UI、不设 fallback（axum 不允许
+    /// 双 fallback merge 进主 Router）、不含 `/`、`/health`、`/api/userapp`
+    /// （排除原因见 `routes::api_router_base` 文档）。中间件层（body limit/
+    /// request_id/locale/请求日志/TraceLayer）随子路由生效于本子树。
+    pub fn router_base(&self) -> Result<Router> {
+        let request_body_limit = usize::try_from(self.state.config.request_body_max_bytes)
+            .context("REQUEST_BODY_MAX_BYTES exceeds platform usize")?;
+        let (api_router, _openapi) = crate::routes::api_router_base().split_for_parts();
+        Ok(api_router
+            .layer(DefaultBodyLimit::max(request_body_limit))
+            .layer(from_fn(request_id_layer))
+            .layer(from_fn(locale_layer))
+            .layer(from_fn(request_log_layer))
+            .layer(
+                TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        target: "file_server::http",
+                        "http_request",
+                        method = %req.method(),
+                        uri = %req.uri(),
+                    )
+                }),
+            )
+            .with_state(self.state.clone()))
+    }
+
     pub async fn serve(self, listener: tokio::net::TcpListener) -> Result<()> {
         self.log_startup(&listener);
         let dev_server = self.dev_server_manager();
@@ -174,19 +202,31 @@ async fn locale_layer(req: Request, next: Next) -> Response {
 
 /// 请求日志中间件: 记录每个请求的 method/uri/status/latency。
 /// 用 `file_server` target 确保写入文件日志 (file_layer 只收集 file_server target)。
+/// X-Service-Type / X-App-Id: userApp 分流 header（反代/Java 注入），排障关键信息。
 async fn request_log_layer(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().to_string();
+    let service_type = header_str(&req, "x-service-type");
+    let app_id = header_str(&req, "x-app-id");
     let start = std::time::Instant::now();
     let response = next.run(req).await;
     tracing::info!(
         method = %method,
         uri = %uri,
+        service_type = service_type.as_deref(),
+        app_id = app_id.as_deref(),
         status = response.status().as_u16(),
         latency_ms = start.elapsed().as_millis(),
         "request completed"
     );
     response
+}
+
+fn header_str(req: &Request, name: &str) -> Option<String> {
+    req.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
 }
 
 async fn not_found(req: Request) -> Response {
