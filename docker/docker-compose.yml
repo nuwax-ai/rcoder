@@ -18,8 +18,6 @@ services:
       - RCODER_WORKSPACE_ROOT=/app/app-workspace
       # file-server 路由已常驻合并进主服务（主端口可达，无独立 60000 listener）；
       # RCODER_EMBED_FILE_SERVER 仅 agent_runner 进程消费，rcoder 进程不再读取
-      # 主容器嵌入 file-server 的 UserApp 开发卷根（挂载点 ./userapp-workspace → /app/userapp-workspace）
-      - USERAPP_WORKSPACE_DIR=/app/userapp-workspace
       # UserApp release.lock 构建元数据；测试正式镜像时建议由 shell 覆盖 digest。
       - RCODER_PINGAP_VERSION=${RCODER_PINGAP_VERSION:-0.13.8}
       - RCODER_PINGAP_COMMIT=${RCODER_PINGAP_COMMIT:-07d1cce1b658418bb46c2dec1a49c43fd2f48268}
@@ -40,7 +38,10 @@ services:
       - ./project_workspace:/app/project_workspace
       # 挂载 computer 项目工作目录
       - ./computer-project-workspace:/app/computer-project-workspace
-      # 挂载 UserApp 开发卷（沙箱/builder 共享 {app_id}/; rcoder 侧供 app 删除清理寻址）
+      # UserApp 开发卷锚点（Docker 模式）：per-app bind 的宿主路径反解依据
+      # （user-app-builder 段 workspace_resolution_path=/app/userapp-workspace）；
+      # 开发容器实际挂宿主 ./userapp-workspace/{app_id} → 容器 /home/user/userapp-workspace，
+      # rcoder 主容器不再直接读写开发数据（per-app 独立卷语义）
       - ./userapp-workspace:/app/userapp-workspace
       # 挂载工作目录
       - ./logs/:/app/logs

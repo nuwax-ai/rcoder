@@ -192,9 +192,13 @@ docker_config:
             mount_type: "bind"
             resolve_from: "/app/assets"
 
-      # UserAppBuilder 服务配置(路B:UserApp 构建 agent-runner)
-      # 复用 dev-rcoder-agent-runner 镜像(容器隔离但镜像共享),独立 per-app PVC。
-      # 容器名 rcoder-app-builder-{app_id},PVC 复用运行时 rcoder-app-{app_id}-workspace。
+      # UserAppBuilder 服务配置: per-app 完整开发容器(agent_runner + 内嵌 file-server:60000 + PG 全套)
+      # 复用 dev-rcoder-agent-runner 镜像,默认 ENTRYPOINT/start-up.sh 启动(不设 command);
+      # 容器名 rcoder-app-builder-{app_id},K8s per-app RWO PVC / Docker per-app bind。
+      # workspace_resolution_path = Docker 模式宿主路径反解锚点(compose 挂载 ./userapp-workspace
+      # → /app/userapp-workspace);容器内挂载点用镜像默认 /home/user/userapp-workspace
+      # (不覆盖 USERAPP_WORKSPACE_DIR/PROJECT_SOURCE_DIR/PROJECT_WORKSPACE_BASE)。
+      # K8s 完整 env 在 build-agent-docker chart。
       user-app-builder:
         service_type: "user-app-builder"
         image: "dev-rcoder-agent-runner:latest"
@@ -206,16 +210,8 @@ docker_config:
         workspace_resolution_path: "/app/userapp-workspace"
         environment:
           RUST_LOG: "debug"
-          PROJECT_WORKSPACE_BASE: "/app/userapp-workspace"
-          # UserAppBuilder 跑内嵌 file-server(build 入口 :60000)
+          # agent_runner 进程读此 flag 启内嵌 file-server(build/文件接口入口 :60000)
           RCODER_EMBED_FILE_SERVER: "true"
-          PROJECT_SOURCE_DIR: "/app/userapp-workspace"
-          # UserApp 开发卷(builder 挂共享目录到本路径, 与沙箱 /home/user/userapp-workspace 同卷同构)
-          USERAPP_WORKSPACE_DIR: "/app/userapp-workspace"
-        command:
-          - "/usr/local/bin/agent_runner"
-          - "--port"
-          - "8086"
         resource_limits:
           memory_limit: 2147483648 # 2GB
           cpu_limit: 2.0

@@ -54,6 +54,10 @@ spec:
             # 这里用 env 覆盖成静态名 computer-workspace-pvc（与 web 对称，不硬编码 namespace）。
             - name: RCODER_COMPUTER_WORKSPACE_PVC_NAME
               value: "computer-workspace-pvc"
+            # UserAppBuilder 开发卷 storage class：per-app RWO PVC（代码默认 rook-ceph-block）。
+            # 本地 devspace 无 Rook，覆盖为 local-path；生产 Rook 集群不设此 env 用默认。
+            - name: RCODER_USERAPP_BUILDER_STORAGE_CLASS
+              value: "local-path"
             # UserApp HTTP 端口经 Gateway（HTTPRoute，标准 CR，controller 无关）。
             # 本地 devspace 用 Envoy Gateway（OrbStack 原生），生产用 Cilium Gateway，
             # 两者 gatewayClassName 不同但 Gateway 同名 nuwax-gateway/default。
