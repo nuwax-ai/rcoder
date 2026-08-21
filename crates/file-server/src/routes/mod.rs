@@ -10,7 +10,7 @@ use utoipa_axum::routes;
 use crate::AppState;
 use crate::handlers::{
     build, build_support, computer, git, health, project, static_files, userapp, userapp_dev,
-    userapp_files,
+    userapp_dev_server, userapp_files,
 };
 
 /// 业务路由与 OpenAPI 文档的唯一聚合入口。
@@ -159,6 +159,12 @@ fn userapp_router() -> OpenApiRouter<AppState> {
         .routes(routes!(userapp_dev::download_all_files))
         .routes(routes!(userapp_dev::init_project_template))
         .routes(routes!(userapp_dev::push_skills_to_workspace))
+        .routes(routes!(userapp_dev_server::dev_start))
+        .routes(routes!(userapp_dev_server::dev_stop))
+        .routes(routes!(userapp_dev_server::dev_restart))
+        .routes(routes!(userapp_dev_server::dev_build))
+        .routes(routes!(userapp_dev_server::dev_list))
+        .routes(routes!(userapp_dev_server::dev_logs))
         .routes(routes!(static_files::serve_userapp))
         .route(
             "/static/{app_id}/{*rest}",
@@ -186,5 +192,19 @@ mod tests {
                 .paths
                 .contains_key("/api/userapp/projects/confirm")
         );
+        // 开发服务生命周期 + 开发编译（/api/userapp/dev/*, 6 个）
+        for path in [
+            "/api/userapp/dev/start",
+            "/api/userapp/dev/stop",
+            "/api/userapp/dev/restart",
+            "/api/userapp/dev/build",
+            "/api/userapp/dev/list",
+            "/api/userapp/dev/logs",
+        ] {
+            assert!(
+                document.paths.paths.contains_key(path),
+                "userapp dev path missing: {path}"
+            );
+        }
     }
 }

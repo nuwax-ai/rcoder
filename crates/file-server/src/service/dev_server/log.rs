@@ -29,6 +29,9 @@ pub fn log_dir(cfg: &crate::Config, project_id: &str) -> PathBuf {
             _ => ("", ""),
         };
         cfg.computer_log_dir.join(user).join(cid)
+    } else if let Some(app_id) = project_id.strip_prefix("userapp:") {
+        // userapp:{appId} — 进程 key 前缀隔离剥掉, 日志目录用 appId（无冒号）
+        cfg.log_base_dir.join(app_id)
     } else {
         cfg.log_base_dir.join(project_id)
     }
