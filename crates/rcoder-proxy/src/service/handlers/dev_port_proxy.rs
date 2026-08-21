@@ -1,0 +1,125 @@
+//! 开发阶段端口代理处理函数
+//!
+//! 处理 `/proxy/devapps/{user_id}/{app_id}/{port}/{*path}` 路径的反向代理。
+//! upstream 动态解析到**用户沙箱容器**（ComputerAgentRunner）的同端口——与部署后
+//! `/proxy/apps/*`（app_backends 注册表 → app 运行容器）对称的开发预览入口。
+//!
+//! 零注册零状态：user_id 经 `ContainerLookup`（AppState.projects 内存表 O(1)）
+//! 解析沙箱 IP，app_id 不参与解析（沙箱内端口已唯一），仅用于日志排障与
+//! 未来归属鉴权的锚点。沙箱内自装 pingap 的场景代理 9080 一个端口即整应用入口。
+
+use matchit::Params;
+use pingora_core::Result as PingoraResult;
+use pingora_core::upstreams::peer::HttpPeer;
+use pingora_http::RequestHeader;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, error};
+
+use crate::service::types::{ProxyMetrics, TrackingCtx};
+use crate::service::utils;
+
+/// 处理 devapps 代理请求
+///
+/// 路径格式: `/proxy/devapps/{user_id}/{app_id}/{port}/{*path}` —— 提取三参数，
+/// 重写 URI 去掉前缀，设置代理标识头。
+pub async fn handle_dev_port_proxy_request(
+    upstream_request: &mut RequestHeader,
+    original_uri: &http::Uri,
+    params: Params<'_, '_>,
+) -> PingoraResult<()> {
+    let user_id = params.get("user_id").ok_or_else(|| {
+        error!("devapps proxy route missing user_id params");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+    })?;
+    let app_id = params.get("app_id").unwrap_or("");
+    let port_str = params.get("port").ok_or_else(|| {
+        error!("devapps proxy route missing port params");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+    })?;
+    let port: u16 = port_str.parse().map_err(|_| {
+        error!("devapps parse port failed: {port_str}");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+    })?;
+
+    // strip /proxy/devapps/{user_id}/{app_id}/{port}，保留尾斜杠
+    let original_path = original_uri.path();
+    let prefix = format!("/proxy/devapps/{user_id}/{app_id}/{port}");
+    let target_path = if original_path.len() <= prefix.len() {
+        "/".to_string()
+    } else {
+        original_path[prefix.len()..].to_string()
+    };
+
+    debug!(
+        "devapps proxy request: user_id={}, app_id={}, port={}, target_path={}",
+        user_id, app_id, port, target_path
+    );
+
+    upstream_request.insert_header("Host", "127.0.0.1")?;
+    let new_uri = utils::rewrite_uri(original_uri, target_path)?;
+    upstream_request.set_uri(new_uri);
+    utils::set_common_headers(upstream_request)?;
+    upstream_request.insert_header("X-Port-Proxy", "pingora-devapps-proxy")?;
+    upstream_request.insert_header("X-Target-Port", port.to_string())?;
+
+    Ok(())
+}
+
+/// 处理 devapps 代理的上游连接选择
+///
+/// `find_by_user_id(user_id, ComputerAgentRunner)` 动态解析沙箱 IP（trait 校验
+/// service_type 防串用）；无沙箱 → 502（日志带 user_id/app_id 便于排障）。
+pub async fn handle_dev_port_proxy_upstream(
+    ctx: &mut TrackingCtx,
+    params: Params<'_, '_>,
+    metrics: &Arc<ProxyMetrics>,
+    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
+) -> PingoraResult<Box<HttpPeer>> {
+    let user_id = params.get("user_id").ok_or_else(|| {
+        error!("devapps proxy upstream missing user_id params");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+    })?;
+    let app_id = params.get("app_id").unwrap_or("");
+    let port_str = params.get("port").ok_or_else(|| {
+        error!("devapps proxy upstream missing port params");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+    })?;
+    let target_port: u16 = port_str.parse().map_err(|_| {
+        error!("devapps parse port failed: {port_str}");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+    })?;
+
+    ctx.target_port = Some(target_port);
+    metrics.record_request();
+    metrics.record_request_port(target_port);
+    metrics.inc_active();
+
+    let sandbox_ip = container_lookup
+        .as_ref()
+        .and_then(|lookup| {
+            lookup.find_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+        })
+        .ok_or_else(|| {
+            error!(
+                "devapps sandbox not found: user_id={}, app_id={}, port={}",
+                user_id, app_id, target_port
+            );
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502))
+        })?;
+
+    debug!(
+        "devapps route: user_id={}, app_id={}, {}:{}",
+        user_id, app_id, sandbox_ip, target_port
+    );
+
+    // 与 app 代理同款 peer（长连接，支持 WebSocket / HMR）
+    let mut peer = HttpPeer::new((sandbox_ip.as_str(), target_port), false, "".to_string());
+    peer.options.connection_timeout = Some(Duration::from_secs(10));
+    peer.options.read_timeout = None;
+    peer.options.write_timeout = None;
+    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
+    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+
+    Ok(Box::new(peer))
+}

@@ -67,6 +67,19 @@ pub enum RouteType {
     /// **示例**: `/proxy/apps/app-1a2b3c4d/8080/api/users`
     AppPortProxy,
 
+    /// 开发阶段端口反向代理: `/proxy/devapps/{user_id}/{app_id}/{port}/{*path}`
+    ///
+    /// - `user_id`: 用户 ID（动态解析其沙箱容器 IP，零注册零状态）
+    /// - `app_id`: 应用 ID（不参与解析，沙箱内端口已唯一；日志排障/鉴权锚点）
+    /// - `port`: 沙箱容器内端口（dev server 的 PortPool 端口或自装 pingap 的 9080）
+    /// - `path`: 剩余路径
+    ///
+    /// **目标**: 用户沙箱容器（ComputerAgentRunner）的同端口——与 AppPortProxy
+    /// （部署后 → app 运行容器）对称的开发预览入口。
+    ///
+    /// **示例**: `/proxy/devapps/6/app-1a2b3c4d/4000/api/users`
+    DevPortProxy,
+
     /// 健康检查: `/health`
     ///
     /// **功能**: 返回 Pingora 代理服务的健康状态
@@ -308,6 +321,32 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
                 e
             ))
         })?;
+    // 开发阶段代理: /proxy/devapps/{user_id}/{app_id}/{port}/{path} -> 用户沙箱同端口
+    router
+        .insert(
+            "/proxy/devapps/{user_id}/{app_id}/{port}/{*path}",
+            RouteType::DevPortProxy,
+        )
+        .map_err(|e| {
+            tracing::error!("[ROUTER] devapps proxy route config failed: {}", e);
+            crate::ProxyError::RouteConfig(format!(
+                "Devapps proxy route configuration error: {}",
+                e
+            ))
+        })?;
+    // 兜底：/proxy/devapps/{user_id}/{app_id}/{port}（无尾随 path）
+    router
+        .insert(
+            "/proxy/devapps/{user_id}/{app_id}/{port}",
+            RouteType::DevPortProxy,
+        )
+        .map_err(|e| {
+            tracing::error!("[ROUTER] devapps proxy root route config failed: {}", e);
+            crate::ProxyError::RouteConfig(format!(
+                "Devapps proxy root route configuration error: {}",
+                e
+            ))
+        })?;
 
     // ========================================================================
     // 健康检查路由
@@ -542,6 +581,12 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
             "Fallback for API proxy health check (HEAD requests without path suffix)".to_string(),
         ),
         (
+            "/proxy/devapps/{user_id}/{app_id}/{port}/{*path}".to_string(),
+            "🧪 Dev apps port proxy".to_string(),
+            "Proxy to user's sandbox dev server at the given port (dev preview, zero-registration)"
+                .to_string(),
+        ),
+        (
             "/computer/audio/{user_id}/{project_id}/{*path}".to_string(),
             "🎵 Audio stream proxy".to_string(),
             "Proxy to user's container audio stream service (HTTP 6090 / WebSocket 6089)"
@@ -588,6 +633,21 @@ mod tests {
         assert_eq!(*matched.value, RouteType::PortProxy);
         assert_eq!(matched.params.get("port"), Some("8080"));
         assert_eq!(matched.params.get("path"), Some("api/status"));
+
+        // 测试 devapps 开发代理路由（带 path）
+        let matched = router
+            .at("/proxy/devapps/u6/app-abc123/4000/api/users")
+            .unwrap();
+        assert_eq!(*matched.value, RouteType::DevPortProxy);
+        assert_eq!(matched.params.get("user_id"), Some("u6"));
+        assert_eq!(matched.params.get("app_id"), Some("app-abc123"));
+        assert_eq!(matched.params.get("port"), Some("4000"));
+        assert_eq!(matched.params.get("path"), Some("api/users"));
+
+        // devapps 无尾随 path 兜底
+        let matched = router.at("/proxy/devapps/u6/app-abc123/4000").unwrap();
+        assert_eq!(*matched.value, RouteType::DevPortProxy);
+        assert_eq!(matched.params.get("port"), Some("4000"));
     }
 
     #[test]
@@ -658,7 +718,11 @@ mod tests {
     #[test]
     fn test_get_routes_documentation() {
         let docs = get_routes_documentation();
-        assert_eq!(docs.len(), 10);
+        assert_eq!(docs.len(), 11);
+        // devapps 开发代理文档在列（首条为 VNC 之前插入）
+        assert!(docs
+            .iter()
+            .any(|(p, t, _)| p.starts_with("/proxy/devapps") && t.contains("Dev apps")));
 
         // 验证 VNC 路由文档
         assert!(docs[0].0.contains("vnc"));
@@ -684,21 +748,25 @@ mod tests {
         assert!(docs[5].0.contains("api"));
         assert!(docs[5].1.contains("API"));
 
+        // 验证 devapps 开发代理路由文档（插在 audio 之前）
+        assert!(docs[6].0.contains("devapps"));
+        assert!(docs[6].1.contains("Dev apps"));
+
         // 验证音频代理路由文档
-        assert!(docs[6].0.contains("audio"));
-        assert!(docs[6].1.contains("Audio"));
+        assert!(docs[7].0.contains("audio"));
+        assert!(docs[7].1.contains("Audio"));
 
         // 验证 IME 代理路由文档
-        assert!(docs[7].0.contains("ime"));
-        assert!(docs[7].1.contains("IME"));
+        assert!(docs[8].0.contains("ime"));
+        assert!(docs[8].1.contains("IME"));
 
         // 验证 ttyd 代理路由文档
-        assert!(docs[8].0.contains("ttyd"));
-        assert!(docs[8].1.contains("ttyd"));
+        assert!(docs[9].0.contains("ttyd"));
+        assert!(docs[9].1.contains("ttyd"));
 
         // 验证 Web ttyd 代理路由文档
-        assert!(docs[9].0.contains("web/ttyd"));
-        assert!(docs[9].1.contains("Web"));
+        assert!(docs[10].0.contains("web/ttyd"));
+        assert!(docs[10].1.contains("Web"));
     }
 
     #[test]

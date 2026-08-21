@@ -168,6 +168,14 @@ impl ProxyHttp for PortProxy {
                 )
                 .await?;
             }
+            RouteType::DevPortProxy => {
+                handlers::dev_port_proxy::handle_dev_port_proxy_request(
+                    upstream_request,
+                    &original_uri,
+                    matched.params,
+                )
+                .await?;
+            }
             RouteType::HealthCheck => {
                 // 健康检查：代理到 Axum 的 /health 端点
                 // 这样既能验证 Pingora 正常运行，又能验证 Axum 正常运行
@@ -280,6 +288,15 @@ impl ProxyHttp for PortProxy {
                     matched.params,
                     &self.app_backends,
                     &self.metrics,
+                )
+                .await
+            }
+            RouteType::DevPortProxy => {
+                handlers::dev_port_proxy::handle_dev_port_proxy_upstream(
+                    ctx,
+                    matched.params,
+                    &self.metrics,
+                    &self.container_lookup,
                 )
                 .await
             }
