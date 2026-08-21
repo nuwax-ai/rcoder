@@ -178,7 +178,8 @@ impl KubernetesRuntime {
             .or_else(|| docker_service.map(|sc| sc.workspace_container_path()))
             .unwrap_or_else(|| match service_type {
                 ServiceType::ComputerAgentRunner => "/home/user".to_string(),
-                // UserAppBuilder: per-app PVC 挂载点(file-server PROJECT_SOURCE_DIR 与之一致)
+                // UserAppBuilder: UserApp 开发共享卷挂载点(file-server PROJECT_SOURCE_DIR/
+                // USERAPP_WORKSPACE_DIR 与之一致; PVC 名见 workspace_pvc_name 的共享卷特判)
                 ServiceType::UserAppBuilder => "/app/userapp-workspace".to_string(),
                 _ => "/app/project_workspace".to_string(),
             });

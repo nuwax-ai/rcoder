@@ -210,6 +210,8 @@ docker_config:
           # UserAppBuilder 跑内嵌 file-server(build 入口 :60000)
           RCODER_EMBED_FILE_SERVER: "true"
           PROJECT_SOURCE_DIR: "/app/userapp-workspace"
+          # UserApp 开发卷(builder 挂共享目录到本路径, 与沙箱 /home/user/userapp-workspace 同卷同构)
+          USERAPP_WORKSPACE_DIR: "/app/userapp-workspace"
         command:
           - "/usr/local/bin/agent_runner"
           - "--port"

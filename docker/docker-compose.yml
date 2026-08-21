@@ -20,6 +20,8 @@ services:
       # 阶段2: rcoder 嵌入 Rust file-server (端口 60000, 替代 nuwax-file-server 独立进程)
       # Docker 模式无 Ceph, 嵌入后用 LocalWorkspaceResolver (共享 Docker volume)
       - RCODER_EMBED_FILE_SERVER=true
+      # 主容器嵌入 file-server 的 UserApp 开发卷根（挂载点 ./userapp-workspace → /app/userapp-workspace）
+      - USERAPP_WORKSPACE_DIR=/app/userapp-workspace
       # UserApp release.lock 构建元数据；测试正式镜像时建议由 shell 覆盖 digest。
       - RCODER_PINGAP_VERSION=${RCODER_PINGAP_VERSION:-0.13.8}
       - RCODER_PINGAP_COMMIT=${RCODER_PINGAP_COMMIT:-07d1cce1b658418bb46c2dec1a49c43fd2f48268}
