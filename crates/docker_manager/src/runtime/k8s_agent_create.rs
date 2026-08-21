@@ -192,6 +192,19 @@ impl KubernetesRuntime {
             }),
             ..Default::default()
         }];
+        // computer 沙箱额外挂 UserApp 开发共享卷（helm 预建 RWX PVC）:
+        // /home/user/userapp-workspace/{app_id}/ ——沙箱 file-server 的 /api/userapp
+        // 镜像接口族（USERAPP_WORKSPACE_DIR）与 builder 共卷同构目录。
+        if matches!(service_type, ServiceType::ComputerAgentRunner) {
+            volumes_vec.push(Volume {
+                name: "userapp-workspace".to_string(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: super::k8s_pvc::userapp_shared_pvc_name(&self.namespace),
+                    read_only: Some(false),
+                }),
+                ..Default::default()
+            });
+        }
         let extra_volumes: Vec<K8sVolumeSpec> =
             k8s_service.map(|s| s.volumes.clone()).unwrap_or_default();
         for v in extra_volumes.iter().flat_map(Self::translate_k8s_volume) {
@@ -206,6 +219,15 @@ impl KubernetesRuntime {
             read_only: Some(false),
             ..Default::default()
         }];
+        if matches!(service_type, ServiceType::ComputerAgentRunner) {
+            volume_mounts_vec.push(VolumeMount {
+                name: "userapp-workspace".to_string(),
+                mount_path: shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string(),
+                sub_path: None, // 整卷挂载, {app_id} 子目录在卷内
+                read_only: Some(false),
+                ..Default::default()
+            });
+        }
         let extra_mounts: Vec<K8sVolumeMountSpec> = k8s_service
             .map(|s| s.volume_mounts.clone())
             .unwrap_or_default();

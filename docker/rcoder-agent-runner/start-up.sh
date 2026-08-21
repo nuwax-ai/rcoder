@@ -2318,6 +2318,7 @@ export LC_ALL=C.UTF-8; \
 export BROWSER=/usr/bin/chromium-browser-launcher; \
 export RCODER_EMBED_FILE_SERVER=true; \
 export PROJECT_SOURCE_DIR=/home/user; \
+export USERAPP_WORKSPACE_DIR=/home/user/userapp-workspace; \
 export FILE_SERVER_PORT=60000; \
 export PATH=/usr/local/bin:/usr/local/cargo/bin:\$PATH"
 

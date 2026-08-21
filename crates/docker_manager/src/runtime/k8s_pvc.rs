@@ -129,6 +129,18 @@ pub(crate) trait K8sPvcOps {
     ) -> ContainerRuntimeResult<()>;
 }
 
+/// UserApp 开发共享卷 PVC 名（env `RCODER_USERAPP_WORKSPACE_PVC_NAME` 覆盖,
+/// 默认 `{ns}-rcoder-userapp-workspace`, 由 helm 模板预建——与
+/// RCODER_COMPUTER_WORKSPACE_PVC_NAME 同模式）。
+#[cfg(feature = "kubernetes")]
+pub(crate) fn userapp_shared_pvc_name(namespace: &str) -> String {
+    std::env::var("RCODER_USERAPP_WORKSPACE_PVC_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{namespace}-rcoder-userapp-workspace"))
+}
+
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl K8sPvcOps for KubernetesRuntime {
@@ -137,15 +149,14 @@ impl K8sPvcOps for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
-        // UserAppBuilder 复用 UserApp 的 per-app PVC(rcoder-app-{id}-workspace),
-        // 使 build 产物与运行时 Deployment 共享同 PVC 数据(路B)。container_prefix 独立
-        // (rcoder-app-builder,容器名隔离)但 PVC 名复用 UserApp,故 ensure/pod/resolve 全一致。
-        let pvc_service_type = match service_type {
-            ServiceType::UserAppBuilder => &ServiceType::UserApp,
-            other => other,
-        };
+        // UserAppBuilder 挂 UserApp 开发共享卷（与沙箱同一块, helm 预建 RWX PVC）:
+        // 源码由沙箱侧 /api/userapp 镜像接口族写入 `{卷}/{app_id}/`, builder 直接读同一
+        // 目录 build, 制品 zip 落同处经 serve_userapp HTTP 下载流转——不再需要 per-app PVC。
+        if matches!(service_type, ServiceType::UserAppBuilder) {
+            return Ok(userapp_shared_pvc_name(&self.namespace));
+        }
         let prefix = KubernetesRuntime::sanitize_k8s_name_part(
-            &self.service_container_prefix(pvc_service_type)?,
+            &self.service_container_prefix(service_type)?,
         );
         let sanitized = identifier.replace('_', "-");
         Ok(format!("{}-{}-workspace", prefix, sanitized))
@@ -157,6 +168,10 @@ impl K8sPvcOps for KubernetesRuntime {
         service_type: &ServiceType,
         storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
+        // UserAppBuilder 的 workspace 是共享卷（helm 预建）, 不做 per-app ensure。
+        if matches!(service_type, ServiceType::UserAppBuilder) {
+            return Ok(());
+        }
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
 
         // Check if PVC already exists and its state
@@ -468,6 +483,13 @@ impl K8sPvcOps for KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
+        // UserAppBuilder 的 workspace 是共享卷（全集群所有 app 共用）, 拒绝删除——
+        // 防御未来误调（唯一合法调用方是 UserApp per-app PVC 的 storage/destroy REST）。
+        if matches!(service_type, ServiceType::UserAppBuilder) {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "refusing to destroy the shared userapp workspace PVC".to_string(),
+            ));
+        }
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
 
         // 幂等: PVC 不存在直接返回成功 (Java 重试 / 对账安全)
