@@ -81,6 +81,18 @@ APP_CLI_WORKSPACE=/app/code app-cli
 
 全部服务都因空 `[run].command` 被跳过时，视为启动失败（不允许"零服务"容器）。
 
+启动成功后打印运行拓扑汇总（终端与日志文件同步输出）：
+
+```text
+🔌 运行拓扑 entrypoint=http://0.0.0.0:9080:
+🔌   backend-python port=4583 running route=/api/python/ (strip_prefix=true)
+🔌   backend-worker port=4584 running internal (无 [proxy])
+```
+
+每条 `🚀 start <service_id> (<name>) on :<port> (pid=...)` 与汇总行都以
+service_id 为主标识（日志目录、pingap 路由同按 service_id 命名），从启动日志
+即可反查端口与路由，无需另读 effective config。
+
 **运行时注入给子服务的 env**（最后应用，manifest `[env]` 无法覆盖）：
 
 | env | 值 |

@@ -110,10 +110,10 @@ mod wire_tests {
         assert_eq!(req.selectors[0].source_ids, vec!["application".to_string()]);
 
         // camel 键必须被拒（deny_unknown_fields 防 wire 回潮）
-        assert!(serde_json::from_str::<LogQueryRequest>(
-            r#"{"selectors":[{"serviceId":"x"}]}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<LogQueryRequest>(r#"{"selectors":[{"serviceId":"x"}]}"#)
+                .is_err()
+        );
     }
 
     /// 响应 wire 锁定：service_id/source_errors/cursor_reset 全 snake（Java 契约）。

@@ -49,19 +49,19 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
         for spec in &specs {
             // migrate（如有）—— 失败 error 上报 + Fail Fast; stdout/stderr 已落 app-cli 日志。
             if !spec.run.migrate.is_empty() {
-                info!("🛠️  migrate {}", spec.name);
+                info!("🛠️  migrate {}", spec.service_id);
                 run_transient(&spec.run.migrate, &args.workspace.join(&spec.dir))
                     .await
-                    .with_context(|| format!("migrate {}", spec.name))?;
+                    .with_context(|| format!("migrate {}", spec.service_id))?;
             }
             // start
             if spec.run.command.is_empty() {
-                warn!("⚠️  {} 无 [run].command，跳过", spec.name);
+                warn!("⚠️  {} 无 [run].command，跳过", spec.service_id);
                 continue;
             }
             let child = start_service(spec, &args.workspace, &args.log_dir, &release.release_id)
-                .with_context(|| format!("start {}", spec.name))?;
-            children.push((spec.name.clone(), child));
+                .with_context(|| format!("start {}", spec.service_id))?;
+            children.push((spec.service_id.clone(), child));
             started_user_services += 1;
         }
         // 编译、完整验证并启动 Pingap；代理失败时 workspace 不得进入 ready。
@@ -71,6 +71,28 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
         error!("❌ startup failed, shutting down already-started children: {e:#}");
         shutdown_all(std::mem::take(&mut children), 5).await;
         return Err(e);
+    }
+
+    // 运行拓扑汇总：service_id → port → 路由一张表。日志目录、pingap upstream/路由
+    // 均按 service_id 命名，排查从启动日志直接反查，无需另读 effective config。
+    let started_ids: std::collections::BTreeSet<&str> =
+        children.iter().map(|(name, _)| name.as_str()).collect();
+    info!("🔌 运行拓扑 entrypoint=http://0.0.0.0:{PINGAP_PORT}:");
+    for spec in &specs {
+        let route = spec
+            .proxy
+            .as_ref()
+            .map(|proxy| format!("route={} (strip_prefix={})", proxy.path, proxy.strip_prefix))
+            .unwrap_or_else(|| "internal (无 [proxy])".into());
+        let state = if started_ids.contains(spec.service_id.as_str()) {
+            "running"
+        } else {
+            "skipped (无 [run].command)"
+        };
+        info!(
+            "🔌   {} port={} {state} {route}",
+            spec.service_id, spec.port
+        );
     }
 
     // 5. readiness —— 默认不强依赖后端 app(用户核心诉求:后端有 bug 起不来时容器仍 ready、可排查)。
@@ -268,7 +290,7 @@ fn start_service(
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn {}: {}", spec.name, spec.run.command.join(" ")))?;
+        .with_context(|| format!("spawn {}: {}", spec.service_id, spec.run.command.join(" ")))?;
 
     // pipe → 带轮转的日志文件（append 模式，不 truncate；超 10MB rotate，保留 3 份）
     if let Some(stdout) = child.stdout.take() {
@@ -285,7 +307,8 @@ fn start_service(
     }
 
     info!(
-        "🚀 start {} on :{} (pid={})",
+        "🚀 start {} ({}) on :{} (pid={})",
+        spec.service_id,
         spec.name,
         spec.port,
         child.id().unwrap_or(0)
