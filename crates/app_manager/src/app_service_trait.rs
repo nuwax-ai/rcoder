@@ -12,6 +12,10 @@ use super::models::*;
 ///   业务元数据由调用方（Java）持久化。
 #[async_trait]
 pub trait AppServiceTrait: Send + Sync {
+    /// 记录开发注册（userApp create-workspace 时 owner user_id 落库；
+    /// name 为空 = 开发期，部署 create_app 后 upsert 补全业务字段）
+    async fn record_dev_registration(&self, app_id: &str, user_id: &str) -> AppResult<()>;
+
     /// 创建应用（返回完整 [`AppInfo`]，rcoder 此时持有请求参数）
     async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo>;
 

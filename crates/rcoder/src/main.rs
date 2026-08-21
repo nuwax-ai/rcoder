@@ -17,6 +17,7 @@ mod server;
 mod service;
 mod shutdown;
 mod skill_sync_reconciler;
+mod userapp_forward;
 mod userapp_publish;
 mod userapp_recycle;
 mod utils;

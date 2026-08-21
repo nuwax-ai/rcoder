@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod router;
 mod service;
 pub mod storage;
+pub mod userapp_forward;
 pub mod userapp_publish;
 mod utils;
 pub mod vnc;

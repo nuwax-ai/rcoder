@@ -42,11 +42,27 @@ pub(super) enum BuildOutcome {
 /// (PVC/headless svc/STS 均 ensure 语义,已存在的 STS 复用并等 Ready),因此
 /// rcoder 重启后注册表(内存态)丢失时,首个 build/publish 会自愈重建注册。
 pub(super) async fn ensure_agent_addr(state: &AppState, project_id: &str) -> Result<String> {
-    let info = match registered_builder(state, project_id) {
-        Some(info) => info,
-        None => create_builder_and_register(state, project_id).await?,
-    };
-    Ok(file_server_addr(state, &info))
+    let info = ensure_userapp_builder(state, project_id).await?;
+    Ok(dev_file_server_addr(state, &info))
+}
+
+/// 确保 UserAppBuilder 开发容器存在（幂等）并返回容器信息。
+///
+/// 跨域公共入口：发布编排（build/publish）、文件转发层（`userapp_forward`）、
+/// chat 开发对话、create-workspace 共用——注册表命中复用，miss 创建注册。
+pub(crate) async fn ensure_userapp_builder(
+    state: &AppState,
+    app_id: &str,
+) -> Result<ContainerBasicInfo> {
+    match registered_builder(state, app_id) {
+        Some(info) => Ok(info),
+        None => create_builder_and_register(state, app_id).await,
+    }
+}
+
+/// 开发容器 file-server 地址（`http://{host}:60000`）。
+pub(crate) fn dev_file_server_addr(state: &AppState, info: &ContainerBasicInfo) -> String {
+    file_server_addr(state, info)
 }
 
 /// 纯解析:只查 state.projects,无副作用。

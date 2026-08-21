@@ -479,6 +479,14 @@ impl AppService {
 
 #[async_trait::async_trait]
 impl super::AppServiceTrait for AppService {
+    async fn record_dev_registration(&self, app_id: &str, user_id: &str) -> AppResult<()> {
+        // 开发注册：owner user_id 落库（name 空 = 开发期）；部署 create_app 后 upsert 补全
+        self.metadata
+            .record(app_id, None, Some(user_id.to_string()), None, None)
+            .await;
+        Ok(())
+    }
+
     async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
         self.create_app(request).await
     }

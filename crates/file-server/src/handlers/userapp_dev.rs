@@ -8,6 +8,7 @@ use axum::response::Response;
 use garde::Validate;
 use serde::Deserialize;
 use serde_json::Value;
+use serde_json::json;
 
 use super::computer::archive::{download_all_files_impl, zip_workspace_impl};
 use super::computer::exec::{execute_command_impl, get_logs_impl};
@@ -20,6 +21,40 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
 use crate::workspace::resolve_userapp_dev;
+
+// ── ensure-workspace ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[garde(allow_unvalidated)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UserappEnsureWorkspaceBody {
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    pub app_id: String,
+    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
+    /// 用户 ID（审计字段，不参与路径定位）
+    pub user_id: String,
+}
+
+/// `POST /api/userapp/ensure-workspace`: 幂等建 workspace 目录（create-workspace 链路首建；
+/// execute-command 等接口要求 cwd 已存在，故目录创建须先于业务调用）。
+#[utoipa::path(post, path = "/ensure-workspace", request_body = UserappEnsureWorkspaceBody, responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+pub(crate) async fn ensure_workspace(
+    State(state): State<AppState>,
+    Json(body): Json<UserappEnsureWorkspaceBody>,
+) -> Result<Json<Value>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
+    let ws = resolve_userapp_dev(&body.app_id, None, &state.config)?;
+    tokio::fs::create_dir_all(&ws)
+        .await
+        .map_err(|e| AppError::system(format!("create workspace {}: {e}", ws.display())))?;
+    Ok(Json(json!({
+        "success": true,
+        "workspace": ws.to_string_lossy(),
+    })))
+}
 
 // ── execute-command ─────────────────────────────────────────────────────────────
 

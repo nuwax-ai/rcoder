@@ -171,6 +171,7 @@ fn userapp_router() -> OpenApiRouter<AppState> {
         .routes(routes!(userapp_files::upload_files))
         .routes(routes!(userapp_files::generate_file))
         .routes(routes!(userapp_files::import_project))
+        .routes(routes!(userapp_dev::ensure_workspace))
         .routes(routes!(userapp_dev::execute_command))
         .routes(routes!(userapp_dev::get_logs))
         .routes(routes!(userapp_dev::install_project))

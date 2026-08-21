@@ -558,6 +558,9 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     let userapp_publish_routes =
         crate::userapp_publish::handler::routes().with_state(state.clone());
 
+    // userApp 文件域转发层: /api/userapp/{*rest} 通配透传 + create-workspace 显式入口
+    let userapp_forward_routes = crate::userapp_forward::routes().with_state(state.clone());
+
     let mut router = Router::new()
         .merge(health_routes)
         .merge(api_routes)
@@ -566,7 +569,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .merge(proxy_api_routes)
         .merge(agent_mgmt_routes)
         .merge(app_manager_routes)
-        .merge(userapp_publish_routes);
+        .merge(userapp_publish_routes)
+        .merge(userapp_forward_routes);
 
     // 仅在启用 debug feature 时添加调试路由
     #[cfg(feature = "debug")]
@@ -612,13 +616,18 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         }))
         .layer(axum::middleware::from_fn(locale_context_middleware))
         // 内部 API（供 rcoder-gateway 调用，绕过 API Key 鉴权）
-        .merge(create_internal_routes(state))
+        .merge(create_internal_routes(state.clone()))
         // file-server 基础路由（TS 移植版老路径：/api/project、/api/computer、/api/git、
         // /api/build、/api/page；排除 /api/userapp——由 rcoder 转发层接管）。
         // 与 TS 行为一致不设 API key → merge 在 api-key layer 之后（同 internal 先例）；
         // 构造失败不阻断主服务启动（warn 可见，缺路由面可诊断）。
+        // computer 域拦截层：header X-Service-Type=userapp 的请求短路转发到该 app
+        // 开发容器（反向代理转来的 TS 老路径，body 零解析）。
         .merge(match crate::file_server_embed::merged_router() {
-            Ok(fs_router) => fs_router,
+            Ok(fs_router) => fs_router.layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::userapp_forward::computer_intercept,
+            )),
             Err(e) => {
                 tracing::warn!("file-server routes not mounted on main service: {e}");
                 Router::new()
@@ -762,9 +771,12 @@ async fn metrics_handler(telemetry: Arc<TelemetryGuard>) -> impl IntoResponse {
         crate::userapp_publish::handler::get_task,
         crate::userapp_publish::handler::stream_task,
         crate::userapp_publish::handler::cancel_task,
+        crate::userapp_forward::create_workspace,
     ),
     components(
         schemas(
+            // userApp 转发层（create-workspace）
+            crate::userapp_forward::CreateWorkspaceBody,
             // 响应结构体
             shared_types::HealthCheckResponse,
             shared_types::AgentChatRequest,
