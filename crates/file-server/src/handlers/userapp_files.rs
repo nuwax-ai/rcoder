@@ -266,9 +266,9 @@ pub(crate) async fn upload_file(
             _ => {}
         }
     }
-    let app_id = require_app_field(app_id)?;
-    let user_id = require_app_field(user_id)?;
-    let file_path = require_app_field(file_path)?;
+    let app_id = require_app_field(app_id, "appId")?;
+    let user_id = require_app_field(user_id, "userId")?;
+    let file_path = require_app_field(file_path, "filePath")?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     tracing::debug!(app_id = %app_id, user_id = %user_id, "userapp upload-file");
     let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.config)?;
@@ -311,8 +311,8 @@ pub(crate) async fn upload_files(
             _ => {}
         }
     }
-    let app_id = require_app_field(app_id)?;
-    let _user_id = require_app_field(user_id)?;
+    let app_id = require_app_field(app_id, "appId")?;
+    let _user_id = require_app_field(user_id, "userId")?;
     if file_paths.len() != files_vec.len() {
         return Err(AppError::validation("filePaths and files count mismatch"));
     }
@@ -408,20 +408,20 @@ pub(crate) async fn import_project(
             _ => {}
         }
     }
-    let app_id = require_app_field(app_id)?;
-    let user_id = require_app_field(user_id)?;
+    let app_id = require_app_field(app_id, "appId")?;
+    let user_id = require_app_field(user_id, "userId")?;
     let data: TemporaryFile = data.ok_or_else(|| AppError::validation("file is required"))?;
     validate_zip_ext(file_name.as_deref())?;
     let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.config)?;
     import_project_impl(ws, data, &user_id, "appId", &app_id).await
 }
 
-/// multipart 提取后必填字段校验 (空/缺失 → 400)。
-pub(crate) fn require_app_field(value: Option<String>) -> Result<String, AppError> {
+/// multipart 提取后必填字段校验 (空/缺失 → 400, 错误消息带字段名便于定位)。
+pub(crate) fn require_app_field(value: Option<String>, field: &str) -> Result<String, AppError> {
     value
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::validation("required multipart field is missing or blank"))
+        .ok_or_else(|| AppError::validation(format!("{field} is required (missing or blank)")))
 }
 
 #[cfg(test)]
