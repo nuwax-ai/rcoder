@@ -50,3 +50,9 @@ pub const COMPUTER_WORKSPACE_ROOT: &str = "/app/computer-project-workspace";
 /// /home/user/userapp-workspace/{app_id}/
 /// ```
 pub const USERAPP_WORKSPACE_ROOT: &str = "/home/user/userapp-workspace";
+
+/// UserApp 开发卷根目录 (**rcoder 主容器视角**)。
+///
+/// rcoder 挂共享卷到此固定路径（helm deployment / docker-compose 均按此挂载），
+/// 供 app_manager purge/destroy 时清理 `{root}/{app_id}/`（开发源码 + 构建制品 zip）。
+pub const RCODER_USERAPP_WORKSPACE_ROOT: &str = "/app/userapp-workspace";

@@ -102,6 +102,20 @@ impl super::service::AppService {
             .destroy_app_pvc(app_id)
             .await
             .map_err(|e| map_runtime_error("destroy_app_pvc failed", e))?;
+        // UserApp 开发共享卷目录清理（{共享卷}/{app_id}/ = 开发源码 + 构建制品 zip）:
+        // 共享卷本身永不删（全集群共用）, 只删本 app 子目录; 目录不存在幂等跳过
+        // （本地无挂载的环境同样安全）。rcoder 视角挂载点为部署契约固定路径。
+        let dev_dir = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+            .join(app_id);
+        if dev_dir.exists() {
+            tokio::fs::remove_dir_all(&dev_dir)
+                .await
+                .map_err(|e| map_io_error("failed to purge userapp dev volume", e, false))?;
+            info!(
+                "[APP] userapp dev volume dir removed: {}",
+                dev_dir.display()
+            );
+        }
         info!("[APP] app PVC destroyed (metadata retained): {}", app_id);
         Ok(())
     }
