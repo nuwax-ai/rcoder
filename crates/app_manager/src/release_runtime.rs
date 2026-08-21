@@ -63,6 +63,13 @@ impl AppService {
         let request = CreateAppRequest {
             app_id: Some(rcoder_app_id.to_string()),
             name: name.to_string(),
+            // 发布链 ensure 无 user 上下文:回填已存 metadata(Java 先 create 的场景),
+            // 无值空串(record 侧转 None, 部署 URL 降级旧短形态)
+            user_id: self
+                .metadata
+                .lookup(rcoder_app_id)
+                .and_then(|m| m.user_id)
+                .unwrap_or_default(),
             image,
             command: None,
             env: None,

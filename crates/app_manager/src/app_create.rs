@@ -60,6 +60,8 @@ impl AppService {
             .record(
                 app_id,
                 Some(request.name.clone()),
+                // 内部 ensure 构造可能空串(无 user 上下文回填), 空串语义=未设置
+                Some(request.user_id.clone()).filter(|u| !u.trim().is_empty()),
                 request.tenant_id.clone(),
                 request.space_id.clone(),
             )
@@ -70,6 +72,13 @@ impl AppService {
     /// 校验创建请求并解析 app_id（app_id 规范 + 唯一性 + 资源格式 + 端口）。
     /// 任一校验失败 Fail Fast 返回 ERR_VALIDATION / ERR_APP_ALREADY_EXISTS。
     async fn validate_create_request(&self, request: &CreateAppRequest) -> AppResult<String> {
+        // user_id：归属用户（部署访问 URL 段 + metadata 数据源），identifier 规范。
+        // 空串放行——内部发布链 ensure 构造无 user 上下文（回填已存值或空，
+        // record 侧空转 None）；外部 REST 路径的必填由 handler 层校验兜底。
+        if !request.user_id.trim().is_empty() {
+            shared_types::validate_identifier(request.user_id.trim(), "user_id")
+                .map_err(AppOperationError::Validation)?;
+        }
         // app_id：外部指定（app- + DNS-1123，校验 + 唯一性）or 自动生成
         let app_id = match &request.app_id {
             Some(id) => {

@@ -52,6 +52,7 @@ impl AppMetadataStore {
         &self,
         app_id: &str,
         name: Option<String>,
+        user_id: Option<String>,
         tenant_id: Option<String>,
         space_id: Option<String>,
     ) {
@@ -63,6 +64,7 @@ impl AppMetadataStore {
         let row = AppMetadataRecord {
             app_id: app_id.to_string(),
             name,
+            user_id,
             tenant_id,
             space_id,
             created_at,
@@ -117,7 +119,13 @@ mod tests {
         let store = AppMetadataStore::default();
         store.set_persistence(persistence.clone());
         store
-            .record("app-a", Some("alpha".into()), Some("t1".into()), None)
+            .record(
+                "app-a",
+                Some("alpha".into()),
+                Some("u1".into()),
+                Some("t1".into()),
+                None,
+            )
             .await;
         let meta = store.lookup("app-a").expect("cached after record");
         assert_eq!(meta.name.as_deref(), Some("alpha"));
@@ -134,14 +142,14 @@ mod tests {
     async fn record_keeps_original_created_at_on_update() {
         let store = AppMetadataStore::default();
         store
-            .record("app-ts", Some("first".into()), None, None)
+            .record("app-ts", Some("first".into()), None, None, None)
             .await;
         let original = store.lookup("app-ts").expect("cached").created_at;
 
         // 让时间走一点，确保 now() 不同（chrono 精度足够分辨本测试的间隔）
         tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         store
-            .record("app-ts", Some("renamed".into()), None, None)
+            .record("app-ts", Some("renamed".into()), None, None, None)
             .await;
         let updated = store.lookup("app-ts").expect("still cached");
         assert_eq!(updated.name.as_deref(), Some("renamed"));
@@ -156,6 +164,7 @@ mod tests {
         let persistence = InMemoryMetadataPersistence::new(vec![AppMetadataRecord {
             app_id: "app-b".into(),
             name: Some("beta".into()),
+            user_id: None,
             tenant_id: None,
             space_id: None,
             created_at: chrono::Utc::now(),
@@ -174,6 +183,7 @@ mod tests {
         store.apply_loaded(vec![AppMetadataRecord {
             app_id: "app-c".into(),
             name: Some("gamma".into()),
+            user_id: None,
             tenant_id: None,
             space_id: None,
             created_at: chrono::Utc::now(),

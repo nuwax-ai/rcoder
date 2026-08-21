@@ -48,6 +48,7 @@ mod tests {
         let req: CreateAppRequest = serde_json::from_value(serde_json::json!({
             "app_id": "app-order-svc",
             "name": "订单服务",
+            "user_id": "u6",
             "image": "registry.example/app-runtime:1",
             "command": ["java", "-jar", "app.jar"],
             "env": {"APP_MODE": "prod"},
@@ -62,6 +63,7 @@ mod tests {
         }))
         .expect("snake request wire must deserialize");
         assert_eq!(req.app_id.as_deref(), Some("app-order-svc"));
+        assert_eq!(req.user_id, "u6");
         let ports = req.ports.as_ref().expect("ports");
         assert_eq!(ports.len(), 2);
         assert!(matches!(ports[0].expose_type, ExposeType::Http));

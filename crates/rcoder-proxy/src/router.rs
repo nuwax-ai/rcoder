@@ -298,10 +298,11 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
         })?;
 
     // app 专用端口代理（按 app_id+port 路由，解决多 app 同端口冲突）：
-    // /proxy/apps/{app_id}/{port}/{path} -> 对应 app 的后端（app_backends 表）
+    // /proxy/apps/{user_id}/{app_id}/{port}/{path} -> 对应 app 的后端（app_backends 表;
+    // user_id 不参与解析, 与 devapps 四段形态统一, 未来归属鉴权锚点）
     router
         .insert(
-            "/proxy/apps/{app_id}/{port}/{*path}",
+            "/proxy/apps/{user_id}/{app_id}/{port}/{*path}",
             RouteType::AppPortProxy,
         )
         .map_err(|e| {
@@ -311,9 +312,12 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
                 e
             ))
         })?;
-    // 兜底：/proxy/apps/{app_id}/{port}（无尾随 path）
+    // 兜底：/proxy/apps/{user_id}/{app_id}/{port}（无尾随 path）
     router
-        .insert("/proxy/apps/{app_id}/{port}", RouteType::AppPortProxy)
+        .insert(
+            "/proxy/apps/{user_id}/{app_id}/{port}",
+            RouteType::AppPortProxy,
+        )
         .map_err(|e| {
             tracing::error!("[ROUTER] app port proxy root route config failed: {}", e);
             crate::ProxyError::RouteConfig(format!(
@@ -628,6 +632,14 @@ mod tests {
         assert_eq!(matched.params.get("project_id"), Some("proj_456"));
         assert_eq!(matched.params.get("path"), Some("vnc.html"));
 
+        // 测试 app 代理路由（四段：user_id 不参与解析）
+        let matched = router.at("/proxy/apps/u6/app-abc/8080/api/users").unwrap();
+        assert_eq!(*matched.value, RouteType::AppPortProxy);
+        assert_eq!(matched.params.get("user_id"), Some("u6"));
+        assert_eq!(matched.params.get("app_id"), Some("app-abc"));
+        assert_eq!(matched.params.get("port"), Some("8080"));
+        assert_eq!(matched.params.get("path"), Some("api/users"));
+
         // 测试端口代理路由
         let matched = router.at("/proxy/8080/api/status").unwrap();
         assert_eq!(*matched.value, RouteType::PortProxy);
@@ -720,9 +732,10 @@ mod tests {
         let docs = get_routes_documentation();
         assert_eq!(docs.len(), 11);
         // devapps 开发代理文档在列（首条为 VNC 之前插入）
-        assert!(docs
-            .iter()
-            .any(|(p, t, _)| p.starts_with("/proxy/devapps") && t.contains("Dev apps")));
+        assert!(
+            docs.iter()
+                .any(|(p, t, _)| p.starts_with("/proxy/devapps") && t.contains("Dev apps"))
+        );
 
         // 验证 VNC 路由文档
         assert!(docs[0].0.contains("vnc"));

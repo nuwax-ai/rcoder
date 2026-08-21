@@ -33,6 +33,10 @@ pub async fn create_app(
     State(state): State<Arc<AppManagerState>>,
     Json(request): Json<CreateAppRequest>,
 ) -> Result<Json<HttpResult<AppInfo>>, AppError> {
+    // user_id 必填（外部 REST 入口；内部发布链 ensure 不经此处, 允许无值回填）
+    if request.user_id.trim().is_empty() {
+        return Err(AppError::bad_request("user_id: is required"));
+    }
     info!("[APP] creating app: {}", request.name);
     let app_info = state.app_service.create_app(request).await?;
     Ok(Json(HttpResult::success(app_info)))

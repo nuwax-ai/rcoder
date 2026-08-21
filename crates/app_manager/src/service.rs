@@ -380,10 +380,16 @@ impl AppService {
             .name
             .clone()
             .or_else(|| self.metadata.lookup(app_id).and_then(|meta| meta.name));
+        // user_id 仅 create 落值（update 请求不带），回填已存值防 upsert 覆盖清空
+        let user_id = self
+            .metadata
+            .lookup(app_id)
+            .and_then(|meta| meta.user_id.clone());
         self.metadata
             .record(
                 app_id,
                 name,
+                user_id,
                 request.tenant_id.clone(),
                 request.space_id.clone(),
             )
@@ -646,6 +652,7 @@ mod tests {
         CreateAppRequest {
             app_id: Some(app_id.to_owned()),
             name: "r2-app".into(),
+            user_id: "u-test".to_string(),
             image: "registry.example/app-runtime:test".into(),
             command: None,
             env: None,
@@ -962,6 +969,7 @@ mod tests {
             AppMetadataRecord {
                 app_id: "app-alpha".into(),
                 name: Some("alpha".into()),
+                user_id: None,
                 tenant_id: None,
                 space_id: None,
                 created_at: chrono::Utc::now() - chrono::Duration::hours(2),
@@ -969,6 +977,7 @@ mod tests {
             AppMetadataRecord {
                 app_id: "app-beta".into(),
                 name: Some("beta".into()),
+                user_id: None,
                 tenant_id: None,
                 space_id: None,
                 created_at: chrono::Utc::now(),

@@ -12,16 +12,18 @@ pub(in crate::pg) async fn upsert<'e>(
     record: &AppMetadataRecord,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"INSERT INTO userapp_metadata (app_id, name, tenant_id, space_id, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,now())
+        r#"INSERT INTO userapp_metadata (app_id, name, user_id, tenant_id, space_id, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,now())
            ON CONFLICT (app_id) DO UPDATE SET
              name=EXCLUDED.name,
+             user_id=EXCLUDED.user_id,
              tenant_id=EXCLUDED.tenant_id,
              space_id=EXCLUDED.space_id,
              updated_at=now()"#,
     )
     .bind(&record.app_id)
     .bind(&record.name)
+    .bind(&record.user_id)
     .bind(&record.tenant_id)
     .bind(&record.space_id)
     .bind(record.created_at)
@@ -36,6 +38,7 @@ type MetadataRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
     DateTime<Utc>,
 );
 
@@ -44,16 +47,17 @@ pub(in crate::pg) async fn fetch_all<'e>(
     db: impl PgExecutor<'e>,
 ) -> Result<Vec<AppMetadataRecord>, sqlx::Error> {
     let rows: Vec<MetadataRow> = sqlx::query_as(
-        "SELECT app_id, name, tenant_id, space_id, created_at FROM userapp_metadata",
+        "SELECT app_id, name, user_id, tenant_id, space_id, created_at FROM userapp_metadata",
     )
     .fetch_all(db)
     .await?;
     Ok(rows
         .into_iter()
         .map(
-            |(app_id, name, tenant_id, space_id, created_at)| AppMetadataRecord {
+            |(app_id, name, user_id, tenant_id, space_id, created_at)| AppMetadataRecord {
                 app_id,
                 name,
+                user_id,
                 tenant_id,
                 space_id,
                 created_at,

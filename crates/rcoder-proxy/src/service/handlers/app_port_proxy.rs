@@ -24,6 +24,7 @@ pub async fn handle_app_port_proxy_request(
     original_uri: &http::Uri,
     params: Params<'_, '_>,
 ) -> PingoraResult<()> {
+    let user_id = params.get("user_id").unwrap_or("");
     let app_id = params.get("app_id").ok_or_else(|| {
         error!("app port proxy route missing app_id params");
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
@@ -37,9 +38,10 @@ pub async fn handle_app_port_proxy_request(
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
 
-    // 从原始 URI 提取剩余路径（strip /proxy/apps/{app_id}/{port}，保留尾斜杠）
+    // 从原始 URI 提取剩余路径（strip /proxy/apps/{user_id}/{app_id}/{port}，保留尾斜杠）
+    // user_id 不参与后端解析（app_backends 按 (app_id, port)），仅统一四段形态
     let original_path = original_uri.path();
-    let prefix = format!("/proxy/apps/{}/{}", app_id, port);
+    let prefix = format!("/proxy/apps/{user_id}/{app_id}/{port}");
     let target_path = if original_path.len() <= prefix.len() {
         "/".to_string()
     } else {
@@ -47,8 +49,8 @@ pub async fn handle_app_port_proxy_request(
     };
 
     debug!(
-        "app portproxyrequest: app_id={}, port={}, target_path={}",
-        app_id, port, target_path
+        "app portproxyrequest: user_id={}, app_id={}, port={}, target_path={}",
+        user_id, app_id, port, target_path
     );
 
     upstream_request.insert_header("Host", "127.0.0.1")?;

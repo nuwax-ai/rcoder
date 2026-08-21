@@ -493,15 +493,16 @@ pub async fn proxy_to_port_with_path(
 /// Pingora 代理 - 访问部署的应用服务（按 app_id+port 路由，含路径）
 #[utoipa::path(
     get,
-    path = "/proxy/apps/{app_id}/{port}/{*path}",
+    path = "/proxy/apps/{user_id}/{app_id}/{port}/{*path}",
     tag = "应用管理",
     summary = "Pingora 代理 - 访问部署的应用服务（按 app_id 路由，含路径）",
     description = r#"
-访问 `POST /api/v1/apps` 部署的应用（HTTP 端口）。`access.external.http` 返回 `/proxy/apps/{app_id}/{port}`，即本接口。
+访问 `POST /api/v1/apps` 部署的应用（HTTP 端口）。`access.external.http` 返回 `/proxy/apps/{user_id}/{app_id}/{port}`，即本接口。
 按 (app_id, port) 路由到应用后端（K8s→`{app_id}-svc:{port}`，Docker→container_ip:{port}），**多 app 同端口不冲突**。
 
-> 例：app HTTP 端口 8080，`GET /apps/{id}` 返回 `access.external.http = "/proxy/apps/{app_id}/8080"`，
-> 访问该应用：`GET /proxy/apps/{app_id}/8080/api/users` → Pingora 代理到应用 `:8080/api/users`。
+> 例：app HTTP 端口 8080（归属 u6），`GET /apps/{id}` 返回 `access.external.http = "/proxy/apps/u6/{app_id}/8080"`，
+> 访问该应用：`GET /proxy/apps/u6/{app_id}/8080/api/users` → Pingora 代理到应用 `:8080/api/users`。
+> user_id 不参与后端解析，仅与开发预览 `/proxy/devapps/{user_id}/...` 统一四段形态。
 > host（Pingora 入口）由调用方持有，详见应用管理手册 §1.7。
 
 （此 axum 接口返回 307 重定向到 Pingora 端口；生产建议直接访问 Pingora 的 `/proxy/apps/{app_id}/{port}/{path}`）
