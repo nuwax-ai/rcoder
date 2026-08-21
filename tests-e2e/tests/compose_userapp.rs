@@ -115,6 +115,20 @@ async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
     );
     let guard_app = ident.clone();
 
+    // 前置：创建项目工作区（新架构 publish 要求 workspace 已初始化——
+    // ensure 开发容器 + 幂等建目录；缺失时容器内 build fail fast "workspace not found"）
+    let (ws_status, ws_body) = post_json(
+        env,
+        "/api/userapp/workspace",
+        json!({"appId": ident, "userId": "e2e-user"}),
+    )
+    .await;
+    report.diagnostic(
+        "create-workspace 前置（ensure 开发容器+建目录）",
+        &format!("{}", ws_status.as_u16()),
+        &format!("HTTP {ws_status}, body 截断: {}", trunc(&ws_body, 120)),
+    );
+
     let (status, body) = post_json(
         env,
         &format!("/api/v1/apps/{ident}/publish"),
@@ -216,6 +230,7 @@ async fn test_app_create_requires_release_lock(env: &Env, report: &JsonlReporter
     let payload = json!({
         "app_id": app_id,
         "name": "e2e-nolock-test",
+        "user_id": "e2e-user",
         "image": "alpine:3.19",
         "command": ["sleep", "3600"],
     });
