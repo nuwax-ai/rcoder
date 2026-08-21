@@ -957,11 +957,22 @@ RCoder AI 服务 API
 )]
 pub struct ApiDoc;
 
-/// 创建 Swagger UI 路由
+/// 创建 Swagger UI 路由。
+///
+/// 聚合两份文档（UI 顶部下拉切换）：rcoder 主文档 + file-server 文档。
+/// file-server 接口在生产部署中宿主在 agent_runner 容器 60000 端口
+/// （rcoder 同进程嵌入模式下同端口直通），此处仅聚合文档、不挂载其路由。
 pub fn create_swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/api/docs")
         .url("/api/docs/openapi.json", ApiDoc::openapi())
-        .config(utoipa_swagger_ui::Config::new(["/api/docs/openapi.json"]))
+        .url(
+            "/api/docs/file-server.json",
+            file_server::openapi::document(file_server::routes::api_router().into_openapi()),
+        )
+        .config(utoipa_swagger_ui::Config::new([
+            "/api/docs/openapi.json",
+            "/api/docs/file-server.json",
+        ]))
 }
 
 #[cfg(test)]
@@ -983,6 +994,50 @@ mod openapi_tests {
             "/api/v1/apps/publish/tasks/{task_id}/stream",
         ] {
             assert!(paths.contains_key(path), "OpenAPI path missing: {path}");
+        }
+    }
+
+    /// file-server 文档与主文档聚合在同一 Swagger UI（`create_swagger_ui`），
+    /// 此处锁定聚合的关键路径：UserApp workspace 打包链 + 项目创建入口。
+    #[test]
+    fn file_server_document_covers_userapp_and_project_paths() {
+        let document =
+            file_server::openapi::document(file_server::routes::api_router().into_openapi());
+        let paths = document.paths.paths;
+        for path in [
+            "/api/project/create-project",
+            "/api/userapp/build",
+            "/api/userapp/projects/detect",
+            "/api/userapp/projects/confirm",
+        ] {
+            assert!(
+                paths.contains_key(path),
+                "file-server OpenAPI path missing: {path}"
+            );
+        }
+    }
+
+    /// HTTP 层验证：两份 openapi.json 均由 Swagger UI 路由实际提供服务。
+    #[tokio::test]
+    async fn swagger_ui_serves_both_documents() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = Router::new().merge(create_swagger_ui());
+        for (path, needle) in [
+            ("/api/docs/openapi.json", "/api/v1/apps"),
+            ("/api/docs/file-server.json", "/api/userapp/build"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "GET {path} 非 200");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(text.contains(needle), "{path} 响应缺少 {needle}");
         }
     }
 
