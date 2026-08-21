@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
@@ -68,7 +67,12 @@ async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Resp
         HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}")).into_response()
     })?;
     let mut addr = dev_file_server_addr(state, &info);
-    if !probe_dev_container(&addr).await {
+    // 探活正缓存(30s): 每次转发都探活会给高频文件操作(批量列表/读写)平添一个
+    // RTT; 成功后窗口内免探。失败路径(自愈重建)不受缓存影响; 窗口内死容器漏检
+    // 可接受——send 失败仍会 502, 下一请求自愈。
+    let cache = PROBE_OK.get_or_init(dashmap::DashMap::new);
+    let probe_fresh = cache.get(app_id).is_some_and(|t| t.elapsed() < PROBE_TTL);
+    if !probe_fresh && !probe_dev_container(&addr).await {
         warn!(
             "[USERAPP_FORWARD] dev container probe failed (stale registry entry?), recreating: app_id={app_id}, addr={addr}"
         );
@@ -79,9 +83,20 @@ async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Resp
                 .into_response()
         })?;
         addr = dev_file_server_addr(state, &info);
+        // 重建的新容器可能仍在启动(agent_runner+file-server+PG 全套)——不写探活
+        // 缓存, 由本次 send 定成败; 下一请求重新探活
+        return Ok(addr);
+    }
+    if !probe_fresh {
+        cache.insert(app_id.to_string(), std::time::Instant::now());
     }
     Ok(addr)
 }
+
+/// 探活正缓存: app_id → 最近一次探活成功时刻(重建自愈后刷新)。
+static PROBE_OK: std::sync::OnceLock<dashmap::DashMap<String, std::time::Instant>> =
+    std::sync::OnceLock::new();
+const PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 开发容器 file-server 轻量探活（连接失败/非 2xx 均视为不可用）。
 async fn probe_dev_container(addr: &str) -> bool {
@@ -215,17 +230,24 @@ impl HttpResultError {
 
 impl IntoResponse for HttpResultError {
     fn into_response(self) -> Response {
+        // 与 shared_types::HttpResult 同形态(code=字符串错误码/message/data/tid/success),
+        // 但保留真实 HTTP 状态码(400/502 对代理与客户端有语义; HttpResult 的
+        // IntoResponse 恒 200, 不适用于透传层的传输级错误)
         let payload = serde_json::json!({
-            "code": self.status.as_u16(),
+            "code": error_code_for(self.status),
             "message": self.message,
             "data": serde_json::Value::Null,
             "success": false,
         });
-        let mut resp = (self.status, axum::Json(payload)).into_response();
-        resp.headers_mut().insert(
-            HeaderName::from_static("content-type"),
-            HeaderValue::from_static("application/json"),
-        );
-        resp
+        (self.status, axum::Json(payload)).into_response()
+    }
+}
+
+/// HTTP 状态码 → 全站字符串错误码(对齐 shared_types::error_codes 词表)。
+fn error_code_for(status: axum::http::StatusCode) -> &'static str {
+    match status {
+        axum::http::StatusCode::BAD_REQUEST => shared_types::error_codes::ERR_VALIDATION,
+        axum::http::StatusCode::BAD_GATEWAY => shared_types::error_codes::ERR_BACKEND_ERROR,
+        _ => shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
     }
 }

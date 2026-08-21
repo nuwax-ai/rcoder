@@ -339,8 +339,8 @@ pub fn create_swagger_ui() -> SwaggerUi {
 
 #[cfg(test)]
 mod openapi_tests {
-    use axum::Router;
     use super::*;
+    use axum::Router;
 
     #[test]
     fn userapp_release_log_and_publish_paths_are_documented() {

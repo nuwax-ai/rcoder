@@ -55,8 +55,11 @@ struct DevHttpRunner<'a> {
 #[async_trait]
 impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
     async fn run(&self, command: &str) -> Result<shared_types::CommandOutcome, String> {
+        // 30s 客户端超时: 容器内 execute-command 的服务端超时默认 1800s(为长构建
+        // 设计), psql 秒级命令若 PG hang 会拖死对齐接口——传输层兜底
         let resp = crate::http_client::shared_client()
             .post(format!("{}/api/userapp/execute-command", self.addr))
+            .timeout(std::time::Duration::from_secs(30))
             .json(&json!({"appId": self.app_id, "userId": self.user_id, "command": command}))
             .send()
             .await
@@ -142,17 +145,16 @@ pub(crate) async fn align_credentials(
             };
             shared_types::align_pg_credentials(&runner, &body.username, &body.password)
                 .await
-                .map_err(|e| {
-                    AppError::with_message(shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR, e)
-                })?
+                .map_err(|e| AppError::with_message(align_error_code(&e), e))?
         }
         DbEnv::Prod => state
             .app_service
             .align_db_credentials(&body.app_id, body.clone())
             .await
             .map_err(|e| {
+                // 与 dev 分支同一错误码分类（用户输入问题 400 / 容器侧执行失败 / 通用 500）
                 AppError::with_message(
-                    shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
+                    align_error_code(&e.to_string()),
                     format!("prod align failed: {e}"),
                 )
             })?,
@@ -166,4 +168,27 @@ pub(crate) async fn align_credentials(
         outcome.reset_performed
     );
     Ok(HttpResult::success(outcome))
+}
+
+/// 对齐流程错误的错误码分类：
+/// - 调用方输入问题（账号不存在/非法标识符/空密码）→ 400 语义（ERR_VALIDATION）
+/// - 容器侧执行失败（execute-command 通道断/PG 未就绪连接失败）→ ERR_CONTAINER_ERROR
+/// - 其余 → 通用 500
+///
+/// 依据 [`shared_types::align_pg_credentials`] 自产错误词表（可控，非 PG 原文透传）。
+fn align_error_code(err: &str) -> &'static str {
+    if err.contains("does not exist")
+        || err.contains("PG identifier")
+        || err.contains("must not be empty")
+    {
+        shared_types::error_codes::ERR_VALIDATION
+    } else if err.contains("execute-command")
+        || err.contains("ensure-workspace")
+        || err.contains("connection to server")
+        || err.contains("failed: Connection")
+    {
+        shared_types::error_codes::ERR_CONTAINER_ERROR
+    } else {
+        shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR
+    }
 }

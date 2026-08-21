@@ -48,6 +48,7 @@ pub(crate) async fn ensure_workspace_via_dev(
 ) -> Result<(), String> {
     let resp = crate::http_client::shared_client()
         .post(format!("{addr}/api/userapp/ensure-workspace"))
+        .timeout(std::time::Duration::from_secs(30))
         .json(&serde_json::json!({"appId": app_id, "userId": user_id}))
         .send()
         .await
