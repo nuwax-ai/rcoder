@@ -40,25 +40,44 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// 容器内 file-server 幂等建 workspace 目录（execute-command 等接口的 cwd 前置；
 /// create-workspace / chat 开发对话 / db 对齐共用的公共调用）。
 ///
+/// 全新容器的 file-server 有启动窗口（镜像全套 agent_runner+PG+file-server），
+/// 连接类失败按 5s/10s/15s 退避重试（HTTP 4xx/5xx 业务错误不重试，直接上抛）。
 /// 错误返回面向日志的描述串（调用方各自映射响应类型）。
 pub(crate) async fn ensure_workspace_via_dev(
     addr: &str,
     app_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
-    let resp = crate::http_client::shared_client()
-        .post(format!("{addr}/api/userapp/ensure-workspace"))
-        .timeout(std::time::Duration::from_secs(30))
-        .json(&serde_json::json!({"appId": app_id, "userId": user_id}))
-        .send()
-        .await
-        .map_err(|e| format!("dev container ensure-workspace failed: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("ensure-workspace returned {status}: {text}"));
+    const BACKOFF_SECS: [u64; 3] = [5, 10, 15];
+    let mut last_err = String::new();
+    for (attempt, delay) in std::iter::once(0u64).chain(BACKOFF_SECS.iter().copied()).enumerate() {
+        if attempt > 0 {
+            tracing::info!(
+                "[USERAPP_FORWARD] ensure-workspace retry {}/3 after {delay}s (dev container starting): app_id={app_id}",
+                attempt
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        }
+        let resp = crate::http_client::shared_client()
+            .post(format!("{addr}/api/userapp/ensure-workspace"))
+            .timeout(std::time::Duration::from_secs(30))
+            .json(&serde_json::json!({"appId": app_id, "userId": user_id}))
+            .send()
+            .await;
+        match resp {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) => {
+                // 业务错误（4xx/5xx 响应）重试无益，直接上抛
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("ensure-workspace returned {status}: {text}"));
+            }
+            Err(e) => {
+                last_err = format!("dev container ensure-workspace failed: {e}");
+            }
+        }
     }
-    Ok(())
+    Err(last_err)
 }
 
 #[cfg(test)]
