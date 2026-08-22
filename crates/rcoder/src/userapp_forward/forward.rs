@@ -20,14 +20,9 @@ use tracing::{info, warn};
 use crate::router::AppState;
 use crate::userapp_publish::agent_runner::{dev_file_server_addr, ensure_userapp_builder};
 
-/// userApp 场景标记 header（反向代理/Java 注入；容器内 computer handler 消费做
-/// workspace 切换）。值恒 `userapp`（与 /api/userapp 前缀对齐）。
-pub const SERVICE_TYPE_HEADER: &str = "x-service-type";
-pub const SERVICE_TYPE_USERAPP: &str = "userapp";
-
-/// 开发容器定位 header（Java 调 8086 的所有 userApp 请求统一携带——单一 header
-/// 定位，rcoder 零 body 解析，multipart/SSE 全覆盖）。
-pub const APP_ID_HEADER: &str = "x-app-id";
+// 分流契约常量（X-Service-Type / X-App-Id）定义在 shared_types（rcoder 转发层
+// 与容器内 file-server 共用的单一事实源）。
+pub use shared_types::{APP_ID_HEADER, SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
 
 /// 逐跳头：转发前剥离（reqwest/上游自行生成；host 逐跳重写）。
 const HOP_BY_HOP: [&str; 6] = [

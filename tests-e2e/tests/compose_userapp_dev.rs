@@ -284,7 +284,7 @@ async fn scenario_userapp_chat_full_turn(backend: Backend) {
         &format!("{}-udc", env.run_tag),
         user,
     );
-    req.service_type = Some("userapp".to_owned());
+    req.service_type = Some(shared_types::ChatServiceScope::Userapp);
     req.project_id = Some(app.clone());
 
     let Ok(data) = chat_reported(&env, &report, "turn1", &env.rcoder, &req).await else {
@@ -380,7 +380,7 @@ async fn scenario_userapp_two_turn_isolation(backend: Backend) {
 
     let mk_req = |prompt: &str, tag: &str| {
         let mut r = env.base_payload(backend, prompt, &format!("{}-{tag}", env.run_tag), user);
-        r.service_type = Some("userapp".to_owned());
+        r.service_type = Some(shared_types::ChatServiceScope::Userapp);
         r.project_id = Some(app.clone());
         r
     };

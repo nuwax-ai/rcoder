@@ -56,3 +56,12 @@ pub const USERAPP_WORKSPACE_ROOT: &str = "/home/user/userapp-workspace";
 /// rcoder 挂共享卷到此固定路径（helm deployment / docker-compose 均按此挂载），
 /// 供 app_manager purge/destroy 时清理 `{root}/{app_id}/`（开发源码 + 构建制品 zip）。
 pub const RCODER_USERAPP_WORKSPACE_ROOT: &str = "/app/userapp-workspace";
+
+/// UserApp 运行容器内的应用代码根（**部署契约**：activate 后整体包落此目录，
+/// app-runtime 镜像挂载点；database 目录 SQL 执行等容器内路径拼接收口于此）。
+/// ```text
+/// /app/code/                        ← workspace 整体包解包根
+/// /app/code/database/*.sql          ← 平台自动执行的根级 SQL
+/// /app/code/{子项目}/database/*.sql ← 子项目级 SQL
+/// ```
+pub const APP_CODE_ROOT: &str = "/app/code";

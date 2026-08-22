@@ -135,14 +135,10 @@ async fn run_computer_chat_flow(
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
 
-    // userApp 开发对话分支：service_type=userapp → 该 app 的 UserAppBuilder 开发容器
+    // userApp 开发对话分支：service_type=Userapp → 该 app 的 UserAppBuilder 开发容器
     // （ACP agent 直接在开发卷 workspace 工作，代码生成直接落卷）。
-    // 标记值与 X-Service-Type header 同一词表（userapp_forward::SERVICE_TYPE_USERAPP）
-    if request
-        .service_type
-        .as_deref()
-        .is_some_and(|v| v.trim() == crate::userapp_forward::SERVICE_TYPE_USERAPP)
-    {
+    // 枚举穷尽：未来加业务域变体时此处编译期提醒补分支。
+    if request.service_type == Some(shared_types::ChatServiceScope::Userapp) {
         return run_userapp_dev_chat_flow(state, locale, request, is_devcomputer).await;
     }
 

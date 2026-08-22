@@ -21,10 +21,11 @@ pub use userapp::activity::{
 };
 pub use userapp::build_event::BuildProgressEvent;
 pub use userapp::db_align::{
-    AlignCredentialsOutcome, AlignCredentialsRequest, CommandOutcome, PgCommandRunner,
+    AlignCredentialsOutcome, AlignCredentialsRequest, AlignError, CommandOutcome, PgCommandRunner,
     align_pg_credentials,
 };
 pub use userapp::dev_cleanup::UserappDevCleanup;
+pub use userapp::forward_contract::{APP_ID_HEADER, SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
 pub use userapp::metadata::{AppMetadataPersistence, AppMetadataRecord};
 
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）

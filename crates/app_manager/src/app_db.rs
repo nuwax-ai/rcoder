@@ -53,14 +53,12 @@ impl AppService {
         self.ensure_app_running(app_id).await?;
         // 容器内 sh 展开 $POSTGRES_USER(镜像 ENV,create 时用户 env 覆盖);rcoder 无状态不知值。
         // psql -U $POSTGRES_USER 本地 trust 认证(start-app.sh initdb --auth-local=trust)免密。
-        // SQL 字符串里 ' 转义为 ''(防注入)。ON_ERROR_STOP=1:出错 exit≠0。
-        let safe_pw = req.new_password.replace('\'', "''");
+        // 命令构造统一走 pg_utils(转义单头; username 传 "$POSTGRES_USER" 字面量——
+        // pg_quote_ident 仅包双引号, shell 层 $ 展开保持, 行为与旧手拼一致)。
         let cmd = vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!(
-                r#"psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "ALTER USER \"$POSTGRES_USER\" WITH PASSWORD '{safe_pw}'""#,
-            ),
+            shared_types::pg_utils::pg_alter_password_cmd("$POSTGRES_USER", &req.new_password),
         ];
         self.exec_psql(
             app_id,
@@ -145,7 +143,15 @@ impl AppService {
         };
         let outcome = shared_types::align_pg_credentials(&runner, &req.username, &req.password)
             .await
-            .map_err(AppOperationError::Backend)?;
+            .map_err(|e| match e {
+                // 调用方输入问题（非法标识符/角色不存在）→ Validation（400 语义）；
+                // 容器侧执行失败 → Backend
+                shared_types::AlignError::InvalidInput(m)
+                | shared_types::AlignError::RoleMissing(m) => AppOperationError::Validation(m),
+                shared_types::AlignError::Command { .. } => {
+                    AppOperationError::Backend(e.to_string())
+                }
+            })?;
         info!(
             "[APP] PG credentials aligned (prod): app_id={}, username={}, reset_performed={}",
             app_id, req.username, outcome.reset_performed
@@ -223,7 +229,8 @@ impl AppService {
     /// 1. code 根 `database/`（建库/扩展类，先执行）
     /// 2. 各一级子项目 `{dir}/database/`（目录名排序）
     ///
-    /// 目录内按文件名升序。逐文件 exec 容器内 `psql -f`（容器内路径 `/app/code/{rel}`，
+    /// 目录内按文件名升序。逐文件 exec 容器内 `psql -f`（容器内路径
+    /// `{APP_CODE_ROOT}/{rel}`，
     /// `ON_ERROR_STOP=on` 单文件原子性），单文件失败收集进 report 继续下一文件。
     pub async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport> {
         validate_app_id(app_id)?;
@@ -275,7 +282,9 @@ impl AppService {
             // rel 已过 is_shell_safe_path_component 白名单（收集时过滤），
             // 单引号包裹下 shell 不可注入
             let cmd = format!(
-                "psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" --set ON_ERROR_STOP=on -f '/app/code/{rel}'"
+                "psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" --set ON_ERROR_STOP=on -f '{}/{}'",
+                shared_types::paths::APP_CODE_ROOT,
+                rel
             );
             let r = self
                 .runtime

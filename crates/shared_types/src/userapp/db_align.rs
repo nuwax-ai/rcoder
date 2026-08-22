@@ -50,6 +50,30 @@ pub trait PgCommandRunner: Send + Sync {
     async fn run(&self, command: &str) -> Result<CommandOutcome, String>;
 }
 
+/// 凭据对齐流程错误（类型化——调用方按 variant 映射 HTTP 错误码，
+/// 不做错误字符串匹配这类脆弱分类）。
+#[derive(Debug)]
+pub enum AlignError {
+    /// 调用方输入问题（非法标识符/空密码）→ 400 语义
+    InvalidInput(String),
+    /// 目标 PG 角色不存在（对齐只重置密码，不建号）→ 400 语义
+    RoleMissing(String),
+    /// 容器侧执行失败（通道断/PG 未就绪/SQL 失败）→ 502/500 语义
+    Command { stage: &'static str, detail: String },
+}
+
+impl std::fmt::Display for AlignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput(m) => write!(f, "{m}"),
+            Self::RoleMissing(m) => write!(f, "{m}"),
+            Self::Command { stage, detail } => write!(f, "{stage}: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for AlignError {}
+
 /// 凭据对齐核心流程（验证 → 角色存在检查 → 重置 → 复验）。
 ///
 /// 错误信息面向日志与 Java 排障；**不含密码**（只回 username）。
@@ -57,16 +81,22 @@ pub async fn align_pg_credentials(
     runner: &dyn PgCommandRunner,
     username: &str,
     password: &str,
-) -> Result<AlignCredentialsOutcome, String> {
-    validate_pg_identifier(username)?;
+) -> Result<AlignCredentialsOutcome, AlignError> {
+    validate_pg_identifier(username).map_err(AlignError::InvalidInput)?;
     if password.is_empty() {
-        return Err("password must not be empty".to_string());
+        return Err(AlignError::InvalidInput(
+            "password must not be empty".to_string(),
+        ));
     }
 
     // 1. 验证（TCP scram）：exit 0 = 一致，直接返回
     let verify = runner
         .run(&pg_verify_credentials_cmd(username, password))
-        .await?;
+        .await
+        .map_err(|e| AlignError::Command {
+            stage: "verify credentials",
+            detail: e,
+        })?;
     if verify.exit_code == 0 {
         return Ok(AlignCredentialsOutcome {
             aligned: true,
@@ -75,39 +105,53 @@ pub async fn align_pg_credentials(
     }
 
     // 2. 不一致 → 角色存在检查（区分"密码不同"与"账号不存在"，后者明确报错）
-    let exists = runner.run(&pg_role_exists_cmd(username)).await?;
+    let exists = runner
+        .run(&pg_role_exists_cmd(username))
+        .await
+        .map_err(|e| AlignError::Command {
+            stage: "role-exists check",
+            detail: e,
+        })?;
     if exists.exit_code != 0 {
-        return Err(format!(
-            "role-exists check failed for username `{username}`: {}",
-            exists.stderr.trim()
-        ));
+        return Err(AlignError::Command {
+            stage: "role-exists check",
+            detail: exists.stderr.trim().to_string(),
+        });
     }
     if exists.stdout.trim() != "1" {
-        return Err(format!(
+        return Err(AlignError::RoleMissing(format!(
             "PG role `{username}` does not exist; create it first (align only resets passwords)"
-        ));
+        )));
     }
 
     // 3. 重置（trust ALTER USER）
     let alter = runner
         .run(&pg_alter_password_cmd(username, password))
-        .await?;
+        .await
+        .map_err(|e| AlignError::Command {
+            stage: "alter password",
+            detail: e,
+        })?;
     if alter.exit_code != 0 {
-        return Err(format!(
-            "ALTER USER `{username}` failed: {}",
-            alter.stderr.trim()
-        ));
+        return Err(AlignError::Command {
+            stage: "alter password",
+            detail: alter.stderr.trim().to_string(),
+        });
     }
 
     // 4. 复验（scram 确认生效）
     let reverify = runner
         .run(&pg_verify_credentials_cmd(username, password))
-        .await?;
+        .await
+        .map_err(|e| AlignError::Command {
+            stage: "re-verify after reset",
+            detail: e,
+        })?;
     if reverify.exit_code != 0 {
-        return Err(format!(
-            "password was reset but verification still failed for `{username}`: {}",
-            reverify.stderr.trim()
-        ));
+        return Err(AlignError::Command {
+            stage: "re-verify after reset",
+            detail: reverify.stderr.trim().to_string(),
+        });
     }
     Ok(AlignCredentialsOutcome {
         aligned: true,
@@ -202,7 +246,10 @@ mod tests {
         let err = align_pg_credentials(&runner, "nobody", "pw")
             .await
             .unwrap_err();
-        assert!(err.contains("does not exist"), "got: {err}");
+        assert!(
+            matches!(err, AlignError::RoleMissing(_)),
+            "expect RoleMissing, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -211,7 +258,7 @@ mod tests {
         let err = align_pg_credentials(&runner, "bad-name", "pw")
             .await
             .unwrap_err();
-        assert!(err.contains("PG identifier"));
+        assert!(matches!(err, AlignError::InvalidInput(_)));
         assert!(runner.seen.lock().unwrap().is_empty());
     }
 }

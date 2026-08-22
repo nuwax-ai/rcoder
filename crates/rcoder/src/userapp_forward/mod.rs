@@ -20,9 +20,9 @@ use axum::routing::{any, post};
 
 use crate::router::AppState;
 
-// 分流 header 常量（X-Service-Type / X-App-Id）定义在 forward.rs；本模块转发
-// computer_intercept 拦截层与标记值常量（chat 的 body service_type 与 header 同词表）。
-pub use forward::SERVICE_TYPE_USERAPP;
+// 分流 header 常量（X-Service-Type / X-App-Id）定义在 shared_types（与容器内
+// file-server 共用单一事实源）；本模块转发 computer_intercept 拦截层给主 Router
+// 装配。chat body 的 service_type 词表由 shared_types::ChatServiceScope 枚举承载。
 pub(crate) use forward::computer_intercept;
 
 /// userApp 域转发路由（挂 rcoder 主 Router；`/api/userapp` 族不再来自 file-server
@@ -50,7 +50,10 @@ pub(crate) async fn ensure_workspace_via_dev(
 ) -> Result<(), String> {
     const BACKOFF_SECS: [u64; 3] = [5, 10, 15];
     let mut last_err = String::new();
-    for (attempt, delay) in std::iter::once(0u64).chain(BACKOFF_SECS.iter().copied()).enumerate() {
+    for (attempt, delay) in std::iter::once(0u64)
+        .chain(BACKOFF_SECS.iter().copied())
+        .enumerate()
+    {
         if attempt > 0 {
             tracing::info!(
                 "[USERAPP_FORWARD] ensure-workspace retry {}/3 after {delay}s (dev container starting): app_id={app_id}",

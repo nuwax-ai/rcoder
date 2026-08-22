@@ -145,18 +145,22 @@ pub(crate) async fn align_credentials(
             };
             shared_types::align_pg_credentials(&runner, &body.username, &body.password)
                 .await
-                .map_err(|e| AppError::with_message(align_error_code(&e), e))?
+                .map_err(|e| AppError::with_message(align_error_code(&e), e.to_string()))?
         }
         DbEnv::Prod => state
             .app_service
             .align_db_credentials(&body.app_id, body.clone())
             .await
             .map_err(|e| {
-                // 与 dev 分支同一错误码分类（用户输入问题 400 / 容器侧执行失败 / 通用 500）
-                AppError::with_message(
-                    align_error_code(&e.to_string()),
-                    format!("prod align failed: {e}"),
-                )
+                // 与 dev 分支同一错误码语义：Validation（输入问题）→ ERR_VALIDATION；
+                // 其余（容器侧执行失败）→ ERR_CONTAINER_ERROR
+                let code = match &e {
+                    app_manager::AppOperationError::Validation(_) => {
+                        shared_types::error_codes::ERR_VALIDATION
+                    }
+                    _ => shared_types::error_codes::ERR_CONTAINER_ERROR,
+                };
+                AppError::with_message(code, format!("prod align failed: {e}"))
             })?,
     };
 
@@ -170,25 +174,14 @@ pub(crate) async fn align_credentials(
     Ok(HttpResult::success(outcome))
 }
 
-/// 对齐流程错误的错误码分类：
-/// - 调用方输入问题（账号不存在/非法标识符/空密码）→ 400 语义（ERR_VALIDATION）
-/// - 容器侧执行失败（execute-command 通道断/PG 未就绪连接失败）→ ERR_CONTAINER_ERROR
-/// - 其余 → 通用 500
-///
-/// 依据 [`shared_types::align_pg_credentials`] 自产错误词表（可控，非 PG 原文透传）。
-fn align_error_code(err: &str) -> &'static str {
-    if err.contains("does not exist")
-        || err.contains("PG identifier")
-        || err.contains("must not be empty")
-    {
-        shared_types::error_codes::ERR_VALIDATION
-    } else if err.contains("execute-command")
-        || err.contains("ensure-workspace")
-        || err.contains("connection to server")
-        || err.contains("failed: Connection")
-    {
-        shared_types::error_codes::ERR_CONTAINER_ERROR
-    } else {
-        shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR
+/// 对齐流程错误的错误码映射（类型化 variant 匹配）：
+/// [`shared_types::AlignError::InvalidInput`] / [`RoleMissing`] 为调用方输入问题
+/// （400 语义）；[`Command`] 为容器侧执行失败（ERR_CONTAINER_ERROR）。
+fn align_error_code(err: &shared_types::AlignError) -> &'static str {
+    match err {
+        shared_types::AlignError::InvalidInput(_) | shared_types::AlignError::RoleMissing(_) => {
+            shared_types::error_codes::ERR_VALIDATION
+        }
+        shared_types::AlignError::Command { .. } => shared_types::error_codes::ERR_CONTAINER_ERROR,
     }
 }

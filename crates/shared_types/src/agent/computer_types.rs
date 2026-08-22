@@ -9,6 +9,17 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::{Attachment, ChatAgentConfig, ModelProviderConfig};
 
+/// `/computer/chat` 的业务域路由标记（枚举而非自由字符串——匹配处穷尽，
+/// 词表单一事实源；值与 `X-Service-Type` header 同为 `userapp`）。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatServiceScope {
+    /// userApp 开发对话：路由到该 app 的 UserAppBuilder 开发容器
+    Userapp,
+}
+
 /// Computer Agent 聊天请求
 ///
 /// 与标准 ChatRequest 的主要区别：
@@ -29,12 +40,13 @@ pub struct ComputerChatRequest {
 
     /// userApp 开发对话标记（可选，默认 None = 普通 computer 沙箱对话）。
     ///
-    /// 值 `userapp`：本请求路由到该 app（project_id）的 UserAppBuilder 开发容器，
+    /// `Userapp`：本请求路由到该 app（project_id）的 UserAppBuilder 开发容器，
     /// ACP agent 直接在开发卷 workspace（`{USERAPP_WORKSPACE_DIR}/{app_id}`）上
     /// 工作，生成的代码直接落卷。仅开发阶段传；部署后无对话。
+    /// wire 词表 snake_case（`"userapp"`）；未知值反序列化即拒（fail-fast，
+    /// 不静默回落 computer——路由错容器比 400 更难排查）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(example = "userapp")]
-    pub service_type: Option<String>,
+    pub service_type: Option<ChatServiceScope>,
 
     /// 用户输入的 prompt
     #[schema(example = "帮我打开浏览器访问 https://example.com")]

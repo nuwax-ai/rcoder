@@ -13,10 +13,8 @@ use axum::response::{IntoResponse, Response};
 
 use crate::error::AppError;
 
-/// userApp 场景标记 header 名（小写；HTTP header 大小写不敏感）。
-pub const SERVICE_TYPE_HEADER: &str = "x-service-type";
-/// userApp 场景标记值（与 /api/userapp 前缀对齐）。
-pub const SERVICE_TYPE_USERAPP: &str = "userapp";
+// 分流契约常量与 rcoder 转发层共用 shared_types 单一事实源。
+pub use shared_types::{SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
 
 // ── 请求级 userApp 分流标记 (task_local, 由请求中间件 scope 注入) ────────────────
 tokio::task_local! {
