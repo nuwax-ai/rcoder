@@ -84,4 +84,6 @@ mod loader;
 mod sections;
 
 pub use loader::load_config_with_args;
-pub use sections::{AgentCleanupConfig, AgentConcurrencyConfig, GrpcTimeoutConfig, ProxyConfig};
+pub use sections::{
+    AgentCleanupConfig, AgentConcurrencyConfig, GrpcTimeoutConfig, HealthCheckConfig, ProxyConfig,
+};
