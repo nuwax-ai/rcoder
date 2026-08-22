@@ -20,7 +20,7 @@ const RETENTION_MIN: u16 = 2;
 const RETENTION_FALLBACK: u16 = 15;
 const RETENTION_MAX_FALLBACK: u16 = 100;
 
-pub(crate) async fn ensure_release_dirs(root: &Path) -> AppResult<()> {
+pub(super) async fn ensure_release_dirs(root: &Path) -> AppResult<()> {
     for directory in ["packages", ".incoming", ".staging", ".rollback"] {
         tokio::fs::create_dir_all(root.join(directory))
             .await
@@ -34,7 +34,7 @@ pub(crate) async fn ensure_release_dirs(root: &Path) -> AppResult<()> {
 /// 用途：区分"当前 code 是在线成功版本还是失败现场"——activate 的 `.rollback` 快照
 /// 覆盖判定与 rollback 的残留快照判定都依赖它。读不出（目录缺失/lock 损坏）返回
 /// None，调用方按各自保守策略处理。
-pub(crate) async fn read_code_release_id(app_dir: &Path) -> Option<String> {
+pub(super) async fn read_code_release_id(app_dir: &Path) -> Option<String> {
     let content = tokio::fs::read_to_string(app_dir.join("code").join("release.lock.toml"))
         .await
         .ok()?;
@@ -44,7 +44,7 @@ pub(crate) async fn read_code_release_id(app_dir: &Path) -> Option<String> {
 }
 
 /// 解压并校验 release staging。任一步失败都立即清理，避免损坏包持续占用 PVC。
-pub(crate) async fn stage_release_package(
+pub(super) async fn stage_release_package(
     package: &Path,
     staging: &Path,
     release_id: &str,
@@ -77,7 +77,7 @@ pub(crate) async fn stage_release_package(
     result
 }
 
-pub(crate) async fn acquire_lock(path: PathBuf) -> AppResult<std::fs::File> {
+pub(super) async fn acquire_lock(path: PathBuf) -> AppResult<std::fs::File> {
     tokio::task::spawn_blocking(move || {
         let file = OpenOptions::new()
             .create(true)
@@ -94,7 +94,7 @@ pub(crate) async fn acquire_lock(path: PathBuf) -> AppResult<std::fs::File> {
     .map_err(|error| AppOperationError::Backend(format!("release lock task: {error}")))?
 }
 
-pub(crate) async fn read_index(root: &Path, retention: u16) -> AppResult<ReleaseIndex> {
+pub(super) async fn read_index(root: &Path, retention: u16) -> AppResult<ReleaseIndex> {
     let path = root.join("index.json");
     match tokio::fs::read(&path).await {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -107,7 +107,7 @@ pub(crate) async fn read_index(root: &Path, retention: u16) -> AppResult<Release
     }
 }
 
-pub(crate) async fn write_index(root: &Path, index: &ReleaseIndex) -> AppResult<()> {
+pub(super) async fn write_index(root: &Path, index: &ReleaseIndex) -> AppResult<()> {
     let bytes = serde_json::to_vec_pretty(index)
         .map_err(|error| AppOperationError::Backend(format!("serialize release index: {error}")))?;
     let temp = root.join("index.json.tmp");
@@ -139,7 +139,7 @@ pub(crate) async fn write_index(root: &Path, index: &ReleaseIndex) -> AppResult<
     Ok(())
 }
 
-pub(crate) async fn verify_package(
+pub(super) async fn verify_package(
     path: &Path,
     release_id: &str,
     expected_sha256: Option<&str>,
@@ -205,7 +205,7 @@ pub(crate) async fn verify_package(
     .map_err(|error| AppOperationError::Backend(format!("verify release task: {error}")))?
 }
 
-async fn validate_staging(path: &Path, release_id: &str) -> AppResult<()> {
+pub(super) async fn validate_staging(path: &Path, release_id: &str) -> AppResult<()> {
     if !path.join("workspace.manifest.toml").is_file() || !path.join("release.lock.toml").is_file()
     {
         return Err(AppOperationError::Validation(
@@ -226,7 +226,7 @@ async fn validate_staging(path: &Path, release_id: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub(crate) fn plan_retention(index: &mut ReleaseIndex) -> Vec<String> {
+pub(super) fn plan_retention(index: &mut ReleaseIndex) -> Vec<String> {
     let active = index.active_release_id.as_deref();
     let mut ordered: Vec<_> = index
         .releases
@@ -265,7 +265,7 @@ pub(crate) fn plan_retention(index: &mut ReleaseIndex) -> Vec<String> {
     remove
 }
 
-pub(crate) async fn remove_release_packages(root: &Path, release_ids: &[String]) {
+pub(super) async fn remove_release_packages(root: &Path, release_ids: &[String]) {
     for release_id in release_ids {
         let path = root.join("packages").join(format!("{release_id}.zip"));
         if let Err(error) = tokio::fs::remove_file(path).await
@@ -276,7 +276,7 @@ pub(crate) async fn remove_release_packages(root: &Path, release_ids: &[String])
     }
 }
 
-pub(crate) async fn remove_dir_if_exists(path: &Path) -> AppResult<()> {
+pub(super) async fn remove_dir_if_exists(path: &Path) -> AppResult<()> {
     if let Err(error) = tokio::fs::remove_dir_all(path).await
         && error.kind() != std::io::ErrorKind::NotFound
     {
@@ -285,7 +285,7 @@ pub(crate) async fn remove_dir_if_exists(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-pub(crate) fn release_retention(requested: Option<u16>) -> AppResult<u16> {
+pub(super) fn release_retention(requested: Option<u16>) -> AppResult<u16> {
     let default = env_u16("RCODER_APP_RELEASE_RETENTION_DEFAULT", RETENTION_FALLBACK)?;
     let maximum = env_u16("RCODER_APP_RELEASE_RETENTION_MAX", RETENTION_MAX_FALLBACK)?;
     if !(RETENTION_MIN..=RETENTION_MAX_FALLBACK).contains(&maximum) {
@@ -302,7 +302,7 @@ pub(crate) fn release_retention(requested: Option<u16>) -> AppResult<u16> {
     Ok(value)
 }
 
-fn env_u16(name: &str, fallback: u16) -> AppResult<u16> {
+pub(super) fn env_u16(name: &str, fallback: u16) -> AppResult<u16> {
     match std::env::var(name) {
         Ok(value) => value.parse().map_err(|error| {
             AppOperationError::Validation(format!("invalid {name}={value}: {error}"))
@@ -314,7 +314,7 @@ fn env_u16(name: &str, fallback: u16) -> AppResult<u16> {
     }
 }
 
-pub(crate) fn validate_release_id(release_id: &str) -> AppResult<()> {
+pub(super) fn validate_release_id(release_id: &str) -> AppResult<()> {
     if release_id.is_empty()
         || release_id.len() > 64
         || !release_id
@@ -328,7 +328,7 @@ pub(crate) fn validate_release_id(release_id: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub(crate) fn validate_sha256(value: &str) -> AppResult<()> {
+pub(super) fn validate_sha256(value: &str) -> AppResult<()> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(AppOperationError::Validation(
             "sha256 must contain exactly 64 hexadecimal characters".into(),
@@ -337,7 +337,7 @@ pub(crate) fn validate_sha256(value: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub(crate) fn map_download_error(error: DownloadError) -> AppOperationError {
+pub(super) fn map_download_error(error: DownloadError) -> AppOperationError {
     match error {
         DownloadError::InvalidUrl(message) => AppOperationError::Validation(message),
         other => AppOperationError::Backend(format!("download release failed: {other}")),

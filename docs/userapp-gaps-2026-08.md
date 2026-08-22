@@ -1,3 +1,5 @@
+> 注：app_manager 已于 2026-08-22 按域重组——本文引用的 `src/releases.rs` 现位于 `src/release_flow/releases.rs`，`release_store.rs` → `release_flow/store.rs`，`app_params.rs` → `runtime/params.rs` 等对应。
+
 # UserApp 差距清单(2026-08)
 
 > 本文记录对 UserApp「发布 / 运行时 / 日志」链路做设计↔实现↔文档交叉核查后发现的待修项。每条含

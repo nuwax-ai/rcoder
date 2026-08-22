@@ -89,7 +89,7 @@ impl AppService {
     /// 创建应用工作空间子目录（code/data/logs）。在 ensure_app_workspace_ready (K8s ensure PVC +
     /// 等 subvolumePath) 之后、create_deployment (Docker bind mount 需源目录存在) 之前调用。
     /// Docker: 共享 Local; K8s: per-app PVC 根 (ensure_app_workspace_ready 已确保 resolve 成功)。
-    pub(crate) async fn create_app_dirs(&self, app_id: &str) -> AppResult<()> {
+    pub(super) async fn create_app_dirs(&self, app_id: &str) -> AppResult<()> {
         let app_dir = self.get_container_app_dir(app_id).await?;
         fs::create_dir_all(app_dir.join("code"))
             .await

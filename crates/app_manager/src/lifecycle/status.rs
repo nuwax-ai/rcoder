@@ -51,7 +51,7 @@ impl AppService {
     /// 确认 app 存在（集群中有 Deployment/容器），不存在返回"应用不存在"错误。
     /// 调用方（start/stop/restart）据此返回 404，方便 Java 区分并触发 create 重建，
     /// 而非收到 generic 500 误以为系统故障。
-    pub(crate) async fn ensure_app_exists(&self, app_id: &str) -> AppResult<()> {
+    pub(super) async fn ensure_app_exists(&self, app_id: &str) -> AppResult<()> {
         self.fetch_runtime_status_or_err(app_id).await.map(|_| ())
     }
 
@@ -155,7 +155,7 @@ impl AppService {
     }
 
     /// 构建访问信息（按 `http_expose` 决定 HTTP path；一律只返 path，host 由 Java 拼）
-    pub(crate) fn build_access_info(&self, app_id: &str, ports: &[AppPortStatus]) -> AccessInfo {
+    pub(super) fn build_access_info(&self, app_id: &str, ports: &[AppPortStatus]) -> AccessInfo {
         let http_port = ports.iter().find(|p| p.expose_type == RtExposeType::Http);
 
         // 一律只返 path，host 由 Java 拼（Java 必然已知 RCoder / gateway 入口，否则访问不了）：
