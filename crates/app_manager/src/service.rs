@@ -582,6 +582,22 @@ impl super::AppServiceTrait for AppService {
         self.query_storage(request).await
     }
 
+    async fn start_app_enhanced(
+        &self,
+        app_id: &str,
+        request: StartAppRequest,
+    ) -> AppResult<StartAppResult> {
+        self.start_app_enhanced(app_id, request).await
+    }
+
+    async fn restart_app_enhanced(
+        &self,
+        app_id: &str,
+        request: StartAppRequest,
+    ) -> AppResult<StartAppResult> {
+        self.restart_app_enhanced(app_id, request).await
+    }
+
     async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         self.start_app(app_id).await
     }

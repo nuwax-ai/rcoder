@@ -220,42 +220,23 @@ async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
     );
 }
 
-/// 直接 create_app 被发布流水线约束拦截（UserApp 语义：app 容器只能由发布编排创建）。
-async fn test_app_create_requires_release_lock(env: &Env, report: &JsonlReporter) {
+/// create REST 面已删（统一 start 入口）：start 无 url 传统启动，app 不存在 → 404
+async fn test_start_without_app_is_404(env: &Env, report: &JsonlReporter) {
     let app_id = format!(
-        "app-e2e-nolock-{}{}",
+        "app-e2e-nostart-{}{}",
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );
-    // image 不传：验证默认运行时镜像解析（env RCODER_RUNTIME_IMAGE_DIGEST；
-    // 本场景断言的是 release lock 拦截，镜像解析须先通过——缺省链路一并覆盖）
-    let payload = json!({
-        "app_id": app_id,
-        "name": "e2e-nolock-test",
-        "user_id": "e2e-user",
-        "command": ["sleep", "3600"],
-    });
-    let (status, body) = post_json(env, "/api/v1/apps", payload).await;
-    let rejected = (status.as_u16() == 400 || status.as_u16() == 409 || status.as_u16() == 500)
-        && body["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("release lock"));
-    report.assert_hard(
-        "无 release lock 创建被拒（ERR_INVALID_STATE）",
-        rejected,
-        format!("HTTP {status}, {}", trunc(&body, 150)),
-    );
-    let resp = env
-        .http
-        .get(format!("{}/api/v1/apps/{app_id}", env.rcoder))
-        .timeout(Duration::from_secs(10))
-        .send()
+    let (status, _body) = post_json(
+        env,
+        &format!("/api/v1/apps/{app_id}/start"),
+        json!({}),
+    )
         .await;
-    let get_status = resp.map(|r| r.status().as_u16()).unwrap_or(0);
     report.assert_hard(
-        "失败后无残留 app",
-        get_status == 404,
-        format!("GET HTTP {get_status}"),
+        "start 不存在的 app（无 url）→ 404（create 已删，首次创建走发布链/url 部署）",
+        status.as_u16() == 404,
+        format!("HTTP {status}"),
     );
 }
 
@@ -273,7 +254,7 @@ async fn userapp_compose_regression() {
     test_tasks_query(&env, &report).await;
     test_publish_identifiers(&env, &report).await;
     test_publish_reaches_terminal(&env, &report).await;
-    test_app_create_requires_release_lock(&env, &report).await;
+    test_start_without_app_is_404(&env, &report).await;
 
     let path = report.path.display().to_string();
     assert!(report.finish(), "场景失败：断言明细见 {path}");

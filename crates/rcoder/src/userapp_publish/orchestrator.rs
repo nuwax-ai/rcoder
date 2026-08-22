@@ -182,7 +182,7 @@ async fn run_publish_inner(
                 release_id: release_id.clone(),
                 url,
                 sha256,
-                size_bytes,
+                size_bytes: Some(size_bytes),
                 retention: None,
             },
         )

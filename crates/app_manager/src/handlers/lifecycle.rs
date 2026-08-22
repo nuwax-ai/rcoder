@@ -12,35 +12,10 @@ use shared_types::{AppError, HttpResult};
 
 use super::state::AppManagerState;
 use crate::models::{
-    AppInfo, AppRuntimeInfo, CreateAppRequest, DeleteAppRequest, PaginatedResponse,
-    QueryAppsRequest, UpdateAppRequest,
+    AppRuntimeInfo, DeleteAppRequest, PaginatedResponse, QueryAppsRequest, UpdateAppRequest,
 };
 
-/// 创建应用
-#[utoipa::path(
-    post,
-    path = "/api/v1/apps",
-    request_body = CreateAppRequest,
-    responses(
-        (status = 200, description = "创建成功", body = HttpResult<AppInfo>),
-        (status = 400, description = "请求参数错误", body = HttpResult<String>),
-        (status = 409, description = "应用已存在", body = HttpResult<String>)
-    ),
-    tag = "应用管理"
-)]
-#[instrument(skip(state, request), fields(app_name = %request.name))]
-pub async fn create_app(
-    State(state): State<Arc<AppManagerState>>,
-    Json(request): Json<CreateAppRequest>,
-) -> Result<Json<HttpResult<AppInfo>>, AppError> {
-    // user_id 必填（外部 REST 入口；内部发布链 ensure 不经此处, 允许无值回填）
-    if request.user_id.trim().is_empty() {
-        return Err(AppError::bad_request("user_id: is required"));
-    }
-    info!("[APP] creating app: {}", request.name);
-    let app_info = state.app_service.create_app(request).await?;
-    Ok(Json(HttpResult::success(app_info)))
-}
+// create REST 面已删除（统一走 POST /{app_id}/start：不存在则由发布链/ url 部署自动创建）。
 
 /// 查询应用列表（实时查集群 + 过滤/分页；仅 status/app_ids 过滤生效）
 #[utoipa::path(

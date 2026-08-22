@@ -90,8 +90,23 @@ pub trait AppServiceTrait: Send + Sync {
         request: QueryStorageRequest,
     ) -> AppResult<PaginatedResponse<StorageInfo>>;
 
-    /// 启动应用（scale replicas = 1）
+    /// 启动应用（scale replicas = 1；内部传统语义，发布链/编排用）
     async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
+
+    /// 统一部署+启动（无参数 = 传统 start；带 url = 轻量部署 prepare→activate→启动；
+    /// 可选 env/idle/pg 对齐）——REST 面删除 create 后的统一入口
+    async fn start_app_enhanced(
+        &self,
+        app_id: &str,
+        request: StartAppRequest,
+    ) -> AppResult<StartAppResult>;
+
+    /// restart 变体（同款可选参数；无 url 时走传统 restart）
+    async fn restart_app_enhanced(
+        &self,
+        app_id: &str,
+        request: StartAppRequest,
+    ) -> AppResult<StartAppResult>;
 
     /// 停止应用（scale replicas = 0）
     async fn stop_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;

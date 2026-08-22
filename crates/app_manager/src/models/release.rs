@@ -13,12 +13,13 @@ pub struct PrepareReleaseRequest {
     /// 制品 zip 下载地址（HTTP/HTTPS，由 rcoder 服务端下载）
     #[schema(example = "https://registry.example.com/app-order-svc/rel-001.zip")]
     pub url: String,
-    /// 制品 sha256（64 位十六进制，小写；下载后校验一致性）
+    /// 制品 sha256（64 位十六进制小写；下载后校验一致性）。**空串 = 跳过哈希校验**
+    ///（信任内网源的 start+url 轻量部署场景；zip 结构与 release.lock 校验始终执行）
     #[schema(example = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")]
     pub sha256: String,
-    /// 制品字节数（与实际下载大小比对）
+    /// 制品字节数（与实际下载大小比对）。None = 不校验大小（实际值入库）
     #[schema(example = 10485760)]
-    pub size_bytes: u64,
+    pub size_bytes: Option<u64>,
     /// 保留份数（可选；缺省取环境配置默认值，须在允许区间内）
     #[schema(example = 3)]
     pub retention: Option<u16>,

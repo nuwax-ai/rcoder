@@ -71,7 +71,6 @@ use crate::handler;
         handler::devcomputer_notify_resolved,
         handler::devcomputer_agent_progress_notification,
         // 应用管理接口
-        app_manager::handlers::create_app,
         app_manager::handlers::query_apps,
         app_manager::handlers::get_app,
         app_manager::handlers::update_app,
@@ -219,7 +218,9 @@ use crate::handler;
             handler::InstallMetadataBody,
             handler::InstallMultipartBody,
             // 应用管理相关结构体
-            app_manager::models::CreateAppRequest,
+            app_manager::models::StartAppRequest,
+            app_manager::models::StartAppResult,
+            app_manager::models::StartPgCredential,
             app_manager::models::AppInfo,
             app_manager::models::AppRuntimeInfo,
             app_manager::models::AppStatus,
@@ -469,9 +470,9 @@ mod openapi_tests {
                 checked += 1;
             }
         }
-        // 覆盖数下限：app_manager 31(删 confirm/abort 增 rollback) + userapp_publish 6 端点。
+        // 覆盖数下限：app_manager（删 create REST 面，31→30）+ userapp_publish 6 端点。
         assert!(
-            checked >= 37,
+            checked >= 36,
             "UserApp OpenAPI 端点覆盖数异常偏少: {checked}"
         );
     }

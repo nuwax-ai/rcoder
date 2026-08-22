@@ -142,18 +142,20 @@ pub(crate) async fn write_index(root: &Path, index: &ReleaseIndex) -> AppResult<
 pub(crate) async fn verify_package(
     path: &Path,
     release_id: &str,
-    expected_sha256: &str,
-    expected_size: u64,
+    expected_sha256: Option<&str>,
+    expected_size: Option<u64>,
 ) -> AppResult<()> {
     let path = path.to_path_buf();
     let release_id = release_id.to_owned();
-    let expected_sha256 = expected_sha256.to_ascii_lowercase();
+    let expected_sha256 = expected_sha256.map(str::to_ascii_lowercase);
     tokio::task::spawn_blocking(move || {
         let metadata = std::fs::metadata(&path)
             .map_err(|error| map_io_error("stat release package", error, false))?;
-        if metadata.len() != expected_size {
+        if let Some(expected) = expected_size
+            && metadata.len() != expected
+        {
             return Err(AppOperationError::Validation(format!(
-                "release size mismatch: expected {expected_size}, got {}",
+                "release size mismatch: expected {expected}, got {}",
                 metadata.len()
             )));
         }
@@ -171,9 +173,11 @@ pub(crate) async fn verify_package(
             hasher.update(&buffer[..read]);
         }
         let actual = hex::encode(hasher.finalize());
-        if actual != expected_sha256 {
+        if let Some(expected) = expected_sha256.as_deref()
+            && actual != expected
+        {
             return Err(AppOperationError::Validation(format!(
-                "release sha256 mismatch: expected {expected_sha256}, got {actual}"
+                "release sha256 mismatch: expected {expected}, got {actual}"
             )));
         }
         let file = std::fs::File::open(&path)

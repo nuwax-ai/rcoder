@@ -28,7 +28,10 @@ impl AppService {
     ) -> AppResult<ReleaseInfo> {
         validate_app_id(app_id)?;
         validate_release_id(&request.release_id)?;
-        validate_sha256(&request.sha256)?;
+        // 空 sha256 = 跳过校验（start+url 轻量部署；非空仍严格 64 位 hex）
+        if !request.sha256.trim().is_empty() {
+            validate_sha256(&request.sha256)?;
+        }
         let retention = release_retention(request.retention)?;
         self.ensure_app_workspace_ready(app_id, None).await?;
         let app_dir = self.get_container_app_dir(app_id).await?;
@@ -47,9 +50,15 @@ impl AppService {
         {
             // 幂等键归一化：存储侧恒 lowercase（append 时 to_ascii_lowercase），大写
             // hex 重试同样幂等命中，而非误报"digest 不一致"409。
-            if existing.sha256 == request.sha256.to_ascii_lowercase()
-                && existing.size_bytes == request.size_bytes
-            {
+            let sha_match = if request.sha256.trim().is_empty() {
+                existing.sha256.is_empty()
+            } else {
+                existing.sha256 == request.sha256.to_ascii_lowercase()
+            };
+            let size_match = request
+                .size_bytes
+                .is_none_or(|expected| existing.size_bytes == expected);
+            if sha_match && size_match {
                 return Ok(existing.clone());
             }
             return Err(AppOperationError::Conflict(format!(
@@ -64,13 +73,19 @@ impl AppService {
         let package = releases_dir
             .join("packages")
             .join(format!("{}.zip", request.release_id));
+        let mut downloaded_size: u64 = 0;
         let result = async {
             let downloader = Downloader::new(DownloadConfig::default());
-            downloader
+            let expected_sha: Option<&str> = if request.sha256.trim().is_empty() {
+                None
+            } else {
+                Some(request.sha256.as_str())
+            };
+            downloaded_size = downloader
                 .download_to_file(
                     &request.url,
                     &incoming,
-                    Some(&request.sha256),
+                    expected_sha,
                     &CancellationToken::new(),
                 )
                 .await
@@ -78,7 +93,7 @@ impl AppService {
             verify_package(
                 &incoming,
                 &request.release_id,
-                &request.sha256,
+                expected_sha,
                 request.size_bytes,
             )
             .await?;
@@ -101,7 +116,7 @@ impl AppService {
         let release = ReleaseInfo {
             release_id: request.release_id,
             sha256: request.sha256.to_ascii_lowercase(),
-            size_bytes: request.size_bytes,
+            size_bytes: request.size_bytes.unwrap_or(downloaded_size),
             status: ReleaseStatus::Prepared,
             created_at: Utc::now().to_rfc3339(),
             activated_at: None,

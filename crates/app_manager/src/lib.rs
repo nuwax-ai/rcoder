@@ -14,6 +14,7 @@ pub mod app_ops;
 pub mod app_params;
 pub mod app_pingora;
 pub mod app_service_trait;
+mod app_start;
 pub mod app_status;
 pub mod app_workspace;
 pub mod config;
