@@ -471,41 +471,38 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         // userApp 开发域终端/桌面代理的 307 文档接口（实际流量走 Pingora 8088；
         // 此处提供 Swagger 文档 + 可直接调用的重定向语义，对齐 devapp 先例）
         .route(
-            "/proxy/userapp/ttyd/{app_id}/{*path}",
+            "/userapp/ttyd/{app_id}/{*path}",
             get(handler::proxy_to_userapp_ttyd),
         )
         .route(
-            "/proxy/userapp/ttyd/{app_id}",
+            "/userapp/ttyd/{app_id}",
             get(handler::proxy_to_userapp_ttyd_redirect_root),
         )
         .route(
-            "/proxy/userapp/vnc/{app_id}/{*path}",
+            "/userapp/vnc/{app_id}/{*path}",
             get(handler::proxy_to_userapp_vnc),
         )
         .route(
-            "/proxy/userapp/vnc/{app_id}",
+            "/userapp/vnc/{app_id}",
             get(handler::proxy_to_userapp_vnc_redirect_root),
         )
         .route(
-            "/proxy/userapp/audio/{app_id}/{*path}",
+            "/userapp/audio/{app_id}/{*path}",
             get(handler::proxy_to_userapp_audio),
         )
         .route(
-            "/proxy/userapp/audio/{app_id}",
+            "/userapp/audio/{app_id}",
             get(handler::proxy_to_userapp_audio_redirect_root),
         )
         .route(
-            "/proxy/userapp/ime/{app_id}/{*path}",
+            "/userapp/ime/{app_id}/{*path}",
             get(handler::proxy_to_userapp_ime),
         )
         .route(
-            "/proxy/userapp/ime/{app_id}",
+            "/userapp/ime/{app_id}",
             get(handler::proxy_to_userapp_ime_redirect_root),
         )
-        .route(
-            "/proxy/userapp/routes",
-            get(handler::userapp_proxy_routes_doc),
-        )
+        .route("/userapp/routes", get(handler::userapp_proxy_routes_doc))
         .with_state(state.clone());
 
     // DevComputer 调试路由 — 委托给 /computer/* 处理器，共享同一个容器

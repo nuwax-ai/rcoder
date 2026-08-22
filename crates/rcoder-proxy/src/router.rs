@@ -80,16 +80,16 @@ pub enum RouteType {
     /// **示例**: `/proxy/devapps/6/app-1a2b3c4d/4000/api/users`
     DevPortProxy,
 
-    /// userApp 开发域终端代理族: `/proxy/userapp/{ttyd,vnc,audio,ime}/{app_id}/{*path}`
+    /// userApp 开发域终端代理族: `/userapp/{ttyd,vnc,audio,ime}/{app_id}/{*path}`
     ///
     /// 按 **app_id** 定位该 app 的 UserAppBuilder 开发容器（镜像同款：ttyd/noVNC/
     /// 音频/IME 全套），与 computer 族（user_id 定位沙箱）对称的开发场景入口。
     ///
-    /// **ttyd**: `/proxy/userapp/ttyd/{app_id}/{*path}` → 容器 ws_terminal(17681) → ttyd 本体；
+    /// **ttyd**: `/userapp/ttyd/{app_id}/{*path}` → 容器 ws_terminal(17681) → ttyd 本体；
     ///   终端 cwd = 开发卷 `{USERAPP_WORKSPACE_ROOT}/{app_id}`（X-Ttyd-Service-Type 注入）
-    /// **vnc**: `/proxy/userapp/vnc/{app_id}/{*path}` → 容器 noVNC(6080, HTTP+WS)
-    /// **audio**: `/proxy/userapp/audio/{app_id}/{*path}` → ws* 6089 流 / 其余 6090 静态
-    /// **ime**: `/proxy/userapp/ime/{app_id}/{*path}` → 容器 IME(6091, WebSocket)
+    /// **vnc**: `/userapp/vnc/{app_id}/{*path}` → 容器 noVNC(6080, HTTP+WS)
+    /// **audio**: `/userapp/audio/{app_id}/{*path}` → ws* 6089 流 / 其余 6090 静态
+    /// **ime**: `/userapp/ime/{app_id}/{*path}` → 容器 IME(6091, WebSocket)
     ///
     /// 定位走 find_by_project_id(app_id, UserAppBuilder)（注册表），miss → 404
     /// （提示先创建 workspace）；不走 vnc_backends（user_id 键空间，防撞键）。
@@ -386,26 +386,14 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
     // userApp 开发域终端/桌面代理族（与 computer 族对称，app_id 定位 UserAppBuilder 开发容器）。
     // 兜底路由（无尾随 path）与通配成对注册——matchit 的 {*path} 至少 1 字符。
     for (prefix, route) in [
-        (
-            "/proxy/userapp/ttyd/{app_id}/{*path}",
-            RouteType::DevTtydProxy,
-        ),
-        ("/proxy/userapp/ttyd/{app_id}", RouteType::DevTtydProxy),
-        (
-            "/proxy/userapp/vnc/{app_id}/{*path}",
-            RouteType::DevVncProxy,
-        ),
-        ("/proxy/userapp/vnc/{app_id}", RouteType::DevVncProxy),
-        (
-            "/proxy/userapp/audio/{app_id}/{*path}",
-            RouteType::DevAudioProxy,
-        ),
-        ("/proxy/userapp/audio/{app_id}", RouteType::DevAudioProxy),
-        (
-            "/proxy/userapp/ime/{app_id}/{*path}",
-            RouteType::DevImeProxy,
-        ),
-        ("/proxy/userapp/ime/{app_id}", RouteType::DevImeProxy),
+        ("/userapp/ttyd/{app_id}/{*path}", RouteType::DevTtydProxy),
+        ("/userapp/ttyd/{app_id}", RouteType::DevTtydProxy),
+        ("/userapp/vnc/{app_id}/{*path}", RouteType::DevVncProxy),
+        ("/userapp/vnc/{app_id}", RouteType::DevVncProxy),
+        ("/userapp/audio/{app_id}/{*path}", RouteType::DevAudioProxy),
+        ("/userapp/audio/{app_id}", RouteType::DevAudioProxy),
+        ("/userapp/ime/{app_id}/{*path}", RouteType::DevImeProxy),
+        ("/userapp/ime/{app_id}", RouteType::DevImeProxy),
     ] {
         router.insert(prefix, route).map_err(|e| {
             tracing::error!("[ROUTER] userapp dev terminal route {prefix} config failed: {e}");
@@ -750,14 +738,14 @@ mod tests {
 
         // 四协议通配 + 兜底（无尾随 path）成对
         for (path, expected) in [
-            ("/proxy/userapp/ttyd/app-1/ws", RouteType::DevTtydProxy),
-            ("/proxy/userapp/ttyd/app-1", RouteType::DevTtydProxy),
-            ("/proxy/userapp/vnc/app-1/vnc.html", RouteType::DevVncProxy),
-            ("/proxy/userapp/vnc/app-1", RouteType::DevVncProxy),
-            ("/proxy/userapp/audio/app-1/ws", RouteType::DevAudioProxy),
-            ("/proxy/userapp/audio/app-1", RouteType::DevAudioProxy),
-            ("/proxy/userapp/ime/app-1/connect", RouteType::DevImeProxy),
-            ("/proxy/userapp/ime/app-1", RouteType::DevImeProxy),
+            ("/userapp/ttyd/app-1/ws", RouteType::DevTtydProxy),
+            ("/userapp/ttyd/app-1", RouteType::DevTtydProxy),
+            ("/userapp/vnc/app-1/vnc.html", RouteType::DevVncProxy),
+            ("/userapp/vnc/app-1", RouteType::DevVncProxy),
+            ("/userapp/audio/app-1/ws", RouteType::DevAudioProxy),
+            ("/userapp/audio/app-1", RouteType::DevAudioProxy),
+            ("/userapp/ime/app-1/connect", RouteType::DevImeProxy),
+            ("/userapp/ime/app-1", RouteType::DevImeProxy),
         ] {
             let matched = router.at(path).expect(path);
             assert_eq!(*matched.value, expected, "path={path}");

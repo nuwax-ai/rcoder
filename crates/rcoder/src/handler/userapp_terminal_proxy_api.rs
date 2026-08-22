@@ -1,4 +1,4 @@
-//! userApp 开发域终端/桌面代理的文档接口（`/proxy/userapp/{ttyd,vnc,audio,ime}/{app_id}`）。
+//! userApp 开发域终端/桌面代理的文档接口（`/userapp/{ttyd,vnc,audio,ime}/{app_id}`）。
 //!
 //! 纯 OpenAPI 文档接口（同 `proxy_to_app/devapp_with_path` 先例）：实际流量由
 //! Pingora 代理服务处理（容器 8088，K8s NodePort 30435），不经过 rcoder 主服务。
@@ -41,8 +41,7 @@ async fn redirect_doc_response(
     } else {
         format!("/{}", path)
     };
-    let location =
-        format!("http://127.0.0.1:{listen_port}/proxy/userapp/{kind}/{app_id}{target_path}");
+    let location = format!("http://127.0.0.1:{listen_port}/userapp/{kind}/{app_id}{target_path}");
     axum::http::Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(axum::http::header::LOCATION, location)
@@ -63,7 +62,7 @@ async fn redirect_doc_response(
 /// Pingora 代理 - userApp 开发域 ttyd 终端
 #[utoipa::path(
     get,
-    path = "/proxy/userapp/ttyd/{app_id}/{*path}",
+    path = "/userapp/ttyd/{app_id}/{*path}",
     tag = "应用管理",
     summary = "Pingora 代理 - userApp 开发域 Web 终端（ttyd，按 app_id 定位开发容器）",
     description = r#"
@@ -78,7 +77,7 @@ async fn redirect_doc_response(
 - 前置：`POST /api/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（rcoder 容器 8088 / K8s NodePort 30435），须直连 Pingora 不走 rcoder 主端口。
 
-> 例：`GET /proxy/userapp/ttyd/app-order-svc/`（终端页面）；WebSocket `/proxy/userapp/ttyd/app-order-svc/ws`。
+> 例：`GET /userapp/ttyd/app-order-svc/`（终端页面）；WebSocket `/userapp/ttyd/app-order-svc/ws`。
 "#,
     params(
         ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器；workspace 须已创建）"),
@@ -100,7 +99,7 @@ pub async fn proxy_to_userapp_ttyd(
 /// Pingora 代理 - userApp 开发域远程桌面（noVNC）
 #[utoipa::path(
     get,
-    path = "/proxy/userapp/vnc/{app_id}/{*path}",
+    path = "/userapp/vnc/{app_id}/{*path}",
     tag = "应用管理",
     summary = "Pingora 代理 - userApp 开发域远程桌面（noVNC，按 app_id 定位开发容器）",
     description = r#"
@@ -111,7 +110,7 @@ pub async fn proxy_to_userapp_ttyd(
 - 前置：`POST /api/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（8088 / K8s NodePort 30435）。
 
-> 例：`GET /proxy/userapp/vnc/app-order-svc/vnc.html`（桌面页面）；WebSocket `/proxy/userapp/vnc/app-order-svc/websockify`。
+> 例：`GET /userapp/vnc/app-order-svc/vnc.html`（桌面页面）；WebSocket `/userapp/vnc/app-order-svc/websockify`。
 "#,
     params(
         ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器）"),
@@ -133,7 +132,7 @@ pub async fn proxy_to_userapp_vnc(
 /// Pingora 代理 - userApp 开发域语音（audio）
 #[utoipa::path(
     get,
-    path = "/proxy/userapp/audio/{app_id}/{*path}",
+    path = "/userapp/audio/{app_id}/{*path}",
     tag = "应用管理",
     summary = "Pingora 代理 - userApp 开发域语音（audio，按 app_id 定位开发容器）",
     description = r#"
@@ -146,7 +145,7 @@ pub async fn proxy_to_userapp_vnc(
 - 前置：`POST /api/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（8088 / K8s NodePort 30435）。
 
-> 例：`GET /proxy/userapp/audio/app-order-svc/`（播放器页面）；WebSocket `/proxy/userapp/audio/app-order-svc/ws`。
+> 例：`GET /userapp/audio/app-order-svc/`（播放器页面）；WebSocket `/userapp/audio/app-order-svc/ws`。
 "#,
     params(
         ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器）"),
@@ -168,7 +167,7 @@ pub async fn proxy_to_userapp_audio(
 /// Pingora 代理 - userApp 开发域输入法（IME）
 #[utoipa::path(
     get,
-    path = "/proxy/userapp/ime/{app_id}/{*path}",
+    path = "/userapp/ime/{app_id}/{*path}",
     tag = "应用管理",
     summary = "Pingora 代理 - userApp 开发域输入法（IME，按 app_id 定位开发容器）",
     description = r#"
@@ -179,7 +178,7 @@ pub async fn proxy_to_userapp_audio(
 - 前置：`POST /api/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（8088 / K8s NodePort 30435）。
 
-> 例：`WebSocket /proxy/userapp/ime/app-order-svc/connect`。
+> 例：`WebSocket /userapp/ime/app-order-svc/connect`。
 "#,
     params(
         ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器）"),
@@ -201,7 +200,7 @@ pub async fn proxy_to_userapp_ime(
 /// 开发域终端代理入口一览（文档辅助接口：Java 拼接 URL 的速查表）。
 #[utoipa::path(
     get,
-    path = "/proxy/userapp/routes",
+    path = "/userapp/routes",
     tag = "应用管理",
     summary = "userApp 开发域代理路由一览（终端/桌面/语音/输入法/端口预览）",
     description = "userApp 开发阶段的 Pingora 代理入口速查（全部按 app_id 定位 UserAppBuilder 开发容器，前置 POST /api/userapp/workspace）。",
@@ -212,19 +211,19 @@ pub async fn proxy_to_userapp_ime(
 pub async fn userapp_proxy_routes_doc() -> Json<Value> {
     Json(json!({
         "terminal": {
-            "ttyd（Web 终端，cwd=开发卷/{app_id}）": "/proxy/userapp/ttyd/{app_id}/{path}",
+            "ttyd（Web 终端，cwd=开发卷/{app_id}）": "/userapp/ttyd/{app_id}/{path}",
             "ws 子协议": "tty", "upstream": "ws_terminal(17681) → ttyd(7681)"
         },
         "desktop": {
-            "vnc（noVNC 远程桌面）": "/proxy/userapp/vnc/{app_id}/{path}",
+            "vnc（noVNC 远程桌面）": "/userapp/vnc/{app_id}/{path}",
             "upstream": "noVNC(6080, HTTP+websockify WS)"
         },
         "audio": {
-            "语音": "/proxy/userapp/audio/{app_id}/{path}",
+            "语音": "/userapp/audio/{app_id}/{path}",
             "分流": "ws* → 6089 流；其余 → 6090 静态"
         },
         "ime": {
-            "输入法": "/proxy/userapp/ime/{app_id}/{path}",
+            "输入法": "/userapp/ime/{app_id}/{path}",
             "upstream": "IME(6091, WebSocket connect)"
         },
         "portPreview": {
@@ -235,7 +234,7 @@ pub async fn userapp_proxy_routes_doc() -> Json<Value> {
     }))
 }
 
-// ── 根路径（无尾随 path）变体：/proxy/userapp/{kind}/{app_id} → 同款 307（path 置空） ──
+// ── 根路径（无尾随 path）变体：/userapp/{kind}/{app_id} → 同款 307（path 置空） ──
 
 macro_rules! root_redirect {
     ($fn_name:ident, $kind:expr) => {

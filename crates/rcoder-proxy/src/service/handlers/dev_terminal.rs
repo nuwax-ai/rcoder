@@ -1,4 +1,4 @@
-//! userApp 开发域终端/桌面代理（`/proxy/userapp/{ttyd,vnc,audio,ime}/{app_id}` 族，与 /proxy/apps、/proxy/devapps 同前缀）。
+//! userApp 开发域终端/桌面代理（`/userapp/{ttyd,vnc,audio,ime}/{app_id}` 族，与 /proxy/apps、/proxy/devapps 同前缀）。
 //!
 //! 与 computer 族（`/computer/*`，按 user_id 定位沙箱）对称的开发场景入口：
 //! 按 **app_id** 定位该 app 的 UserAppBuilder 开发容器（镜像同款——内含
@@ -74,7 +74,7 @@ fn target_path_of(params: &Params<'_, '_>) -> String {
 
 // ── ttyd ────────────────────────────────────────────────────────────────────────
 
-/// `/proxy/userapp/ttyd/{app_id}/{*path}` 请求重写。
+/// `/userapp/ttyd/{app_id}/{*path}` 请求重写。
 pub async fn handle_dev_ttyd_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,
@@ -136,7 +136,7 @@ pub async fn handle_dev_ttyd_upstream(
 
 // ── VNC（noVNC） ────────────────────────────────────────────────────────────────
 
-/// `/proxy/userapp/vnc/{app_id}/{*path}` 请求重写。
+/// `/userapp/vnc/{app_id}/{*path}` 请求重写。
 pub async fn handle_dev_vnc_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,
@@ -192,7 +192,7 @@ pub async fn handle_dev_vnc_upstream(
 
 // ── 音频 ────────────────────────────────────────────────────────────────────────
 
-/// `/proxy/userapp/audio/{app_id}/{*path}` 请求重写（ws → 6089 流，其余 → 6090 静态；
+/// `/userapp/audio/{app_id}/{*path}` 请求重写（ws → 6089 流，其余 → 6090 静态；
 /// 分流规则与 computer 族 audio 一致）。
 pub async fn handle_dev_audio_request(
     upstream_request: &mut RequestHeader,
@@ -261,7 +261,7 @@ pub async fn handle_dev_audio_upstream(
 
 // ── IME ─────────────────────────────────────────────────────────────────────────
 
-/// `/proxy/userapp/ime/{app_id}/{*path}` 请求重写。
+/// `/userapp/ime/{app_id}/{*path}` 请求重写。
 pub async fn handle_dev_ime_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,
