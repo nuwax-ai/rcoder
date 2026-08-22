@@ -114,7 +114,7 @@ impl HttpServerHandle {
 /// # 示例
 ///
 /// ```no_run
-/// use agent_runner::{AgentSessionService, start_http_server, HttpServerConfig, AppConfig, ProxyConfig, HealthCheckConfig};
+/// use agent_runner::{AgentSessionService, start_http_server, HttpServerConfig, AppConfig, ProxyConfig};
 /// use std::sync::Arc;
 /// use std::path::PathBuf;
 ///
@@ -138,13 +138,8 @@ impl HttpServerHandle {
 ///                 default_backend_port: 8080,
 ///                 backend_host: "127.0.0.1".to_string(),
 ///                 port_param: "port".to_string(),
-///                 health_check: HealthCheckConfig {
-///                     enabled: true,
-///                     interval_seconds: 5,
-///                     timeout_seconds: 1,
-///                     healthy_threshold: 2,
-///                     unhealthy_threshold: 3,
-///                 },
+///                 // health_check 详 HealthCheckConfig（agent_runner::config）文档
+///                 ..Default::default()
 ///             }),
 ///             ..Default::default()
 ///         },
