@@ -165,8 +165,12 @@ impl K8sPvcOps for KubernetesRuntime {
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
 
         // Check if PVC already exists and its state
-        let pvc_status = match self.pvcs().get(&pvc_name).await {
+        let (pvc_status, existing_sc) = match self.pvcs().get(&pvc_name).await {
             Ok(pvc) => {
+                let sc = pvc
+                    .spec
+                    .as_ref()
+                    .and_then(|sp| sp.storage_class_name.clone());
                 if pvc.metadata.deletion_timestamp.is_some() {
                     // PVC is in Terminating state — it's being deleted.
                     // We must wait for it to be fully removed before creating a new one,
@@ -175,13 +179,13 @@ impl K8sPvcOps for KubernetesRuntime {
                         "[K8S] PVC {} is in Terminating state, waiting for deletion to complete...",
                         pvc_name
                     );
-                    "terminating"
+                    ("terminating", sc)
                 } else {
                     info!("[K8S] PVC {} already exists and is active", pvc_name);
-                    "active"
+                    ("active", sc)
                 }
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => "not_found",
+            Err(kube::Error::Api(ae)) if ae.code == 404 => ("not_found", None),
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "Failed to check PVC '{}': {}",
@@ -192,8 +196,26 @@ impl K8sPvcOps for KubernetesRuntime {
 
         match pvc_status {
             "active" => {
+                // 漂移可见：既有 PVC 的 storageClassName 与本 service_type 期望不一致
+                // （env 切换前创建/运维预建）时 warn——静默复用会让存储语义与配置脱节。
+                // PVC 未显式设 SC（None）= 用集群 default，不比对。
+                let expected_sc = match service_type {
+                    ServiceType::UserAppBuilder => userapp_builder_storage_class(),
+                    _ => Some(self.config.storage_class.clone()),
+                };
+                if let (Some(existing), Some(expected)) = (&existing_sc, &expected_sc)
+                    && existing != expected
+                {
+                    warn!(
+                        "[K8S] PVC {} storageClassName={existing:?} differs from expected {expected:?} (service_type={service_type}):                          reusing existing, storage semantics may drift",
+                        pvc_name
+                    );
+                }
                 // PVC exists and is not being deleted — reuse it.
                 // WaitForFirstConsumer PVCs will be Bound once a Pod referencing them is scheduled.
+                // 漂移可见：既有 PVC 的 accessModes/storageClassName 与本 service_type
+                // 期望不一致（env 切换前创建/运维预建）时 warn——静默复用会让 RWO
+                // 单容器独占的调度假设与实际存储能力脱节。
                 info!(
                     "[K8S] PVC {} already exists, skipping Bound check (WaitForFirstConsumer)",
                     pvc_name

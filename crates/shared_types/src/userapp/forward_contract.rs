@@ -13,3 +13,20 @@ pub const SERVICE_TYPE_USERAPP: &str = "userapp";
 /// 开发容器定位 header：Java 调 rcoder 主服务的所有 userApp 请求统一携带，
 /// rcoder 零 body 解析定位 per-app 开发容器（multipart/SSE 全覆盖）。
 pub const APP_ID_HEADER: &str = "x-app-id";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// chat body 的 service_type 枚举 wire 值必须与 X-Service-Type header 值同词表
+    /// （chat 分支与转发分流共用 `userapp` 标记）——一处改名另一处漂移即在此报红。
+    #[test]
+    fn chat_scope_wire_matches_header_value() {
+        let wire = serde_json::to_value(crate::ChatServiceScope::Userapp).expect("serialize");
+        assert_eq!(
+            wire.as_str().expect("string variant"),
+            SERVICE_TYPE_USERAPP,
+            "ChatServiceScope::Userapp wire 值与 SERVICE_TYPE_USERAPP 漂移"
+        );
+    }
+}

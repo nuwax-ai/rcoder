@@ -21,7 +21,7 @@ use tower_http::services::ServeFile;
 
 use crate::AppState;
 use crate::extract::{AppPath as AxumPath, AppQuery as Query};
-use crate::workspace::{ComputerContext, ProjectContext};
+use crate::workspace::ProjectContext;
 
 /// CORS 头配置 (两套路由不同)。
 struct CorsConfig {
@@ -149,25 +149,12 @@ pub(crate) async fn serve_computer(
     if user_id.trim().is_empty() || c_id.trim().is_empty() {
         return cors_404(&req, &COMPUTER_CORS);
     }
-    // userApp 分流（X-Service-Type=userapp）：根切到开发卷 `{USERAPP_WORKSPACE_DIR}/{cId}`
-    let default_root = if crate::extract::is_userapp_request() {
-        match crate::workspace::resolve_userapp_dev(&c_id, None, &state.config) {
+    // userApp 分流与 computer 定位经公共收口（与 ws_path 单头，防两处漂移）
+    let default_root =
+        match super::computer::computer_root_for_request(&state, &user_id, &c_id).await {
             Ok(root) => root,
             Err(error) => return error.into_response(),
-        }
-    } else {
-        match state
-            .resolver
-            .resolve_computer(&ComputerContext {
-                user_id: user_id.to_string(),
-                cid: c_id.to_string(),
-            })
-            .await
-        {
-            Ok(root) => root,
-            Err(error) => return error.into_response(),
-        }
-    };
+        };
     // customTargetDir 非空 → 完全覆盖根 (对齐 nuwax, 不拼 user/cId);
     // 注: 不做根目录白名单限制 —— 容器内内网部署, 且用户客户端复用本模块逻辑,
     // 每个用户电脑上的路径各不相同, 限制根路径会误伤正常业务。

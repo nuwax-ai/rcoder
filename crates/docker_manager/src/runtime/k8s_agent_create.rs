@@ -172,10 +172,19 @@ impl KubernetesRuntime {
             .multi_image_config
             .get_service_config(service_type);
 
-        // workspace 挂载路径(K8s 模式 computer→/home/user, web→/app/project_workspace)
+        // workspace 挂载路径(K8s 模式 computer→/home/user, web→/app/project_workspace)。
+        // UserAppBuilder 不走 docker fallback：docker 段的 workspace_resolution_path 是
+        // rcoder 容器视角的宿主反解锚点（/app/userapp-workspace），K8s 下误用会把
+        // PVC 挂到 overlay 路径造成数据面分裂——k8s 配置缺失时直接用镜像契约默认。
         let workspace_mount_path = k8s_service
             .map(|sc| sc.workspace_container_path())
-            .or_else(|| docker_service.map(|sc| sc.workspace_container_path()))
+            .or_else(|| {
+                if matches!(service_type, ServiceType::UserAppBuilder) {
+                    None
+                } else {
+                    docker_service.map(|sc| sc.workspace_container_path())
+                }
+            })
             .unwrap_or_else(|| match service_type {
                 ServiceType::ComputerAgentRunner => "/home/user".to_string(),
                 // UserAppBuilder 开发容器: per-app RWO PVC 整卷挂载（与镜像 start-up.sh

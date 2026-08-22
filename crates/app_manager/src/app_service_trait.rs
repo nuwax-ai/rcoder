@@ -80,6 +80,10 @@ pub trait AppServiceTrait: Send + Sync {
     /// database 目录 SQL 自动执行（发布 activate 后；失败收集进 report 不阻断）
     async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport>;
 
+    /// 查 app 的 owner user_id（userapp_metadata；create-workspace/publish 注册）。
+    /// 未注册返回 None（调用方自行兜底）。
+    async fn get_app_owner(&self, app_id: &str) -> Option<String>;
+
     /// 分页查询持久存储（强制分页，无全量模式）
     async fn query_storage(
         &self,

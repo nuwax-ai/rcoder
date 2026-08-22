@@ -323,11 +323,15 @@ impl<'a> AgentContainerStarter<'a> {
                         // /app/userapp-workspace, 经 rcoder compose bind 反解宿主根）
                         ServiceType::UserAppBuilder => {
                             let pid = project_id.as_deref().unwrap_or("default");
+                            // 容器目标拼 {app_id} 一层：host {根}/{app_id} 单层挂到
+                            // {ROOT}/{app_id}——与 K8s（PVC 整卷挂 ROOT，卷内 {app_id}
+                            // 一层）盘上布局对称，按 {根}/{app_id} 做备份/迁移不漂移
                             (
                                 pid.to_string(),
                                 std::path::PathBuf::from(
                                     shared_types::paths::USERAPP_WORKSPACE_ROOT,
-                                ),
+                                )
+                                .join(pid),
                             )
                         }
                         // RCoder/UserApp: 一个 project_id 对应一个容器
@@ -381,6 +385,14 @@ impl<'a> AgentContainerStarter<'a> {
                 }
             }
             Err(e) => {
+                if matches!(service_type, ServiceType::UserAppBuilder) {
+                    // builder 的 workspace 是"数据即产品"卷（开发源码+制品）：
+                    // 解析失败若继续，容器健康照常但所有开发数据落 overlay 临时层、
+                    // 回收即丢——fail fast 优于静默降级（computer/web 容器可降级）
+                    return Err(DockerError::ContainerCreationError(format!(
+                        "UserAppBuilder workspace host path resolve failed                          (rcoder 容器需挂载 userapp-workspace 锚点): {e}"
+                    )));
+                }
                 warn!(
                     "[DOCKER_MGR] Failed to resolve workspace host path, skipping auto mount: {}",
                     e

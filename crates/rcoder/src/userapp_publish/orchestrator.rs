@@ -219,8 +219,9 @@ async fn run_publish_inner(
     // 4. database SQL 自动执行（可选,发布请求 auto_execute_sql 缺省 true）：
     //    activate 后包内容已落 app code 目录,app 容器 Running。
     //    单文件失败仅 warn 收集（文件名+stderr）跳过,不阻断发布——SQL 幂等性由模板约定自带。
+    //    注意此处不再 fail_if_cancelled：release 已 Active 流量已切，若因取消返回 Err
+    //    顶层会 emit Cancelled——任务终态撒谎（调用方以为未发布会重发），照常收敛 Completed。
     if auto_execute_sql {
-        fail_if_cancelled(task)?;
         task.emit(PublishEvent::Stage {
             stage: "DatabaseSql".to_string(),
         })

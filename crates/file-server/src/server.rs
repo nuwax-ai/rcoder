@@ -124,6 +124,11 @@ impl FileServer {
             .layer(DefaultBodyLimit::max(request_body_limit))
             .layer(from_fn(request_id_layer))
             .layer(from_fn(locale_layer))
+            // userApp 分流标记同 router()（防御性）：内嵌模式下带 X-Service-Type
+            // 的请求按约定被 rcoder 拦截层短路，不会进入本地 handler——但这是
+            // 跨 crate 的隐式顺序约定，无编译器保证；带上此层后即使约定被打破，
+            // 分流也只是 no-op（is_userapp_request 恒 false）而非行为漂移。
+            .layer(from_fn(crate::extract::scope_userapp_flag))
             .layer(from_fn(request_log_layer))
             .layer(
                 TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {

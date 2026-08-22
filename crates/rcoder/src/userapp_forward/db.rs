@@ -128,10 +128,12 @@ pub(crate) async fn align_credentials(
                     )
                 })?;
             let addr = dev_file_server_addr(&state, &info);
-            // 审计 user_id：metadata owner 优先，缺省 app_id（不参与定位）
+            // 审计 user_id：metadata owner（create-workspace/publish 落库的事实源）
+            // 优先，缺省 app_id（不参与定位）。
             let user_id = state
-                .get_project(&body.app_id)
-                .and_then(|p| p.user_id().map(str::to_string))
+                .app_service
+                .get_app_owner(&body.app_id)
+                .await
                 .unwrap_or_else(|| body.app_id.clone());
             super::ensure_workspace_via_dev(&addr, &body.app_id, &user_id)
                 .await

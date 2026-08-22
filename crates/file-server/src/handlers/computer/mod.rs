@@ -33,9 +33,20 @@ pub(crate) mod workspace;
 // ── 跨组共享 helper (子模块经 super:: 访问) ──────────────────────────────────────
 
 async fn ws_path(state: &AppState, user_id: &str, cid: &str) -> Result<PathBuf, AppError> {
-    // userApp 分流（X-Service-Type=userapp，经反向代理/rcoder 拦截层透传）：
-    // workspace 从 computer 定位 `{COMPUTER_WORKSPACE_ROOT}/{userId}/{cId}` 切到
-    // 开发卷 `{USERAPP_WORKSPACE_DIR}/{cId}`（cId=app_id；本容器即该 app 的开发容器）。
+    computer_root_for_request(state, user_id, cid).await
+}
+
+/// computer 域请求根目录（userApp 分流单头收口——ws_path 与静态文件共用，
+/// 消除两处独立 if 的漂移面）。
+///
+/// userApp 分流（X-Service-Type=userapp，经反向代理/rcoder 拦截层透传）：
+/// workspace 从 computer 定位 `{COMPUTER_WORKSPACE_ROOT}/{userId}/{cId}` 切到
+/// 开发卷 `{USERAPP_WORKSPACE_DIR}/{cId}`（cId=app_id；本容器即该 app 的开发容器）。
+pub(crate) async fn computer_root_for_request(
+    state: &AppState,
+    user_id: &str,
+    cid: &str,
+) -> Result<PathBuf, AppError> {
     if crate::extract::is_userapp_request() {
         return crate::workspace::resolve_userapp_dev(cid, None, &state.config);
     }

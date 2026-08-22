@@ -480,9 +480,20 @@ impl AppService {
 #[async_trait::async_trait]
 impl super::AppServiceTrait for AppService {
     async fn record_dev_registration(&self, app_id: &str, user_id: &str) -> AppResult<()> {
-        // 开发注册：owner user_id 落库（name 空 = 开发期）；部署 create_app 后 upsert 补全
+        // 开发注册：owner user_id 权威覆盖；已部署 app 的业务字段（name/tenant/space
+        // 由 create_app 落库）合并保留——record 是整行 upsert，全传 None 会把
+        // 已部署应用的 name/租户列 NULL 掉（query-by-name 过滤随之失效）
+        let existing = self.metadata.lookup(app_id);
+        let (name, tenant, space) = match &existing {
+            Some(row) => (
+                row.name.clone(),
+                row.tenant_id.clone(),
+                row.space_id.clone(),
+            ),
+            None => (None, None, None),
+        };
         self.metadata
-            .record(app_id, None, Some(user_id.to_string()), None, None)
+            .record(app_id, name, Some(user_id.to_string()), tenant, space)
             .await;
         Ok(())
     }
@@ -558,6 +569,10 @@ impl super::AppServiceTrait for AppService {
 
     async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport> {
         self.execute_database_sql(app_id).await
+    }
+
+    async fn get_app_owner(&self, app_id: &str) -> Option<String> {
+        self.metadata.lookup(app_id).and_then(|r| r.user_id)
     }
 
     async fn query_storage(

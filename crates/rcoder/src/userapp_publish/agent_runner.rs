@@ -351,11 +351,16 @@ async fn backoff_respecting_cancel(
 /// 由调用方决定（purge 路径 warn 不阻断，下次收敛）。
 pub struct UserappDevResourcesCleanup {
     runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
+    /// 宿主注册表（purge 后同步摘除，防下一个请求 ensure 复活已删 app 的容器+PVC）。
+    projects: Arc<crate::storage::ProjectStoreBackend>,
 }
 
 impl UserappDevResourcesCleanup {
-    pub fn new(runtime: Arc<dyn container_runtime_api::ContainerRuntime>) -> Self {
-        Self { runtime }
+    pub fn new(
+        runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
+        projects: Arc<crate::storage::ProjectStoreBackend>,
+    ) -> Self {
+        Self { runtime, projects }
     }
 }
 
@@ -400,6 +405,13 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
                 );
             }
         }
+
+        // 4. 摘注册与探活缓存：purge 后注册表残留死 IP 会让下一个请求
+        //    ensure→探活失败→重建（已删 app 的容器+PVC 复活）
+        if let Some(_removed) = self.projects.remove(app_id) {
+            info!("[USERAPP_DEV_CLEANUP] dev registry entry removed: app_id={app_id}");
+        }
+        crate::userapp_forward::invalidate_probe_cache(app_id);
 
         info!("[USERAPP_DEV_CLEANUP] dev resources cleaned: app_id={app_id}");
         Ok(())

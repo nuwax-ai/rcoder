@@ -53,12 +53,11 @@ impl AppService {
         self.ensure_app_running(app_id).await?;
         // 容器内 sh 展开 $POSTGRES_USER(镜像 ENV,create 时用户 env 覆盖);rcoder 无状态不知值。
         // psql -U $POSTGRES_USER 本地 trust 认证(start-app.sh initdb --auth-local=trust)免密。
-        // 命令构造统一走 pg_utils(转义单头; username 传 "$POSTGRES_USER" 字面量——
-        // pg_quote_ident 仅包双引号, shell 层 $ 展开保持, 行为与旧手拼一致)。
+        // 重置目标用 SQL 的 CURRENT_USER(= 连接用户), 消除 shell 双引号变量展开依赖。
         let cmd = vec![
             "sh".to_string(),
             "-c".to_string(),
-            shared_types::pg_utils::pg_alter_password_cmd("$POSTGRES_USER", &req.new_password),
+            shared_types::pg_utils::pg_alter_current_user_password_cmd(&req.new_password),
         ];
         self.exec_psql(
             app_id,
@@ -86,12 +85,15 @@ impl AppService {
                 req.database
             )));
         }
-        // CREATE DATABASE "{db}"[ OWNER "{owner}"] —— 双引号 PG 标识符," 转义为 ""
-        let safe_db = req.database.replace('"', "\"\"");
+        // CREATE DATABASE "{db}"[ OWNER "{owner}"] —— 标识符引经 pg_utils 单头
+        // （validate 白名单本就拒绝 "，此处转义为纵深防御）
+        let safe_db = shared_types::pg_utils::pg_quote_ident(&req.database)
+            .trim_matches('"')
+            .to_string();
         let owner_clause = req
             .owner
             .as_ref()
-            .map(|o| format!(" OWNER \"{}\"", o.replace('"', "\"\"")))
+            .map(|o| format!(" OWNER {}", shared_types::pg_utils::pg_quote_ident(o)))
             .unwrap_or_default();
         let cmd = vec![
             "sh".to_string(),
@@ -136,6 +138,13 @@ impl AppService {
         req: shared_types::AlignCredentialsRequest,
     ) -> AppResult<shared_types::AlignCredentialsOutcome> {
         validate_app_id(app_id)?;
+        // 路径参数与 body.app_id 双头：不一致即拒（防路由键与语义键分裂）
+        if req.app_id != app_id {
+            return Err(AppOperationError::Validation(format!(
+                "path app_id {app_id} != body app_id {}",
+                req.app_id
+            )));
+        }
         self.ensure_app_running(app_id).await?;
         let runner = RuntimeExecRunner {
             service: self,
@@ -243,40 +252,76 @@ impl AppService {
             });
         }
 
-        // 收集 SQL（根 database 优先，子项目目录名序，目录内文件名升序）
+        // 同步 fs 扫描放 spawn_blocking：对象是 per-app PVC（CephFS 网络卷），
+        // 挂载抖动时 read_dir/file_type/is_dir 会阻塞 tokio worker
+        // （release_store 已有同款先例）。
         let mut files: Vec<String> = Vec::new();
-        let root_db = code.join("database");
-        if root_db.is_dir() {
-            collect_sql_files(&root_db, "database", &mut files)?;
+        let mut scan_errors: Vec<String> = Vec::new();
+        let code_for_task = code.clone();
+        let (root_files, root_err) = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            match collect_sql_files(&code_for_task.join("database"), "database", &mut out) {
+                Ok(()) => (out, None),
+                Err(e) => (out, Some(format!("database: scan failed: {e}"))),
+            }
+        })
+        .await
+        .map_err(|e| AppOperationError::Backend(format!("scan task join: {e}")))?;
+        files.extend(root_files);
+        if let Some(e) = root_err {
+            // "失败不阻断"契约对扫描同样成立：根目录扫描失败收集进 report 继续
+            scan_errors.push(e);
         }
-        let mut subdirs: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&code).map_err(map_io_error_db)? {
-            let entry = entry.map_err(map_io_error_db)?;
-            if entry.file_type().map_err(map_io_error_db)?.is_dir()
-                && entry.path().join("database").is_dir()
-            {
-                let dir = entry.file_name().to_string_lossy().to_string();
-                if is_shell_safe_path_component(&dir) {
-                    subdirs.push(dir);
-                } else {
-                    tracing::warn!(
-                        "[APP] skip database subdir with unsafe name (not [A-Za-z0-9._-]): {dir}"
-                    );
+        // 子项目 database 目录发现（同步 fs 同样入 blocking；每目录扫描失败收集进 report 继续）
+        let code_for_scan = code.clone();
+        let subdirs: Vec<String> = tokio::task::spawn_blocking(move || {
+            let mut subdirs = Vec::new();
+            let entries = match std::fs::read_dir(&code_for_scan) {
+                Ok(rd) => rd,
+                Err(_) => return subdirs,
+            };
+            for entry in entries.flatten() {
+                if entry
+                    .file_type()
+                    .is_ok_and(|ft| ft.is_dir())
+                    && entry.path().join("database").is_dir()
+                {
+                    let dir = entry.file_name().to_string_lossy().to_string();
+                    if is_shell_safe_path_component(&dir) {
+                        subdirs.push(dir);
+                    } else {
+                        tracing::warn!(
+                            "[APP] skip database subdir with unsafe name (not [A-Za-z0-9._-]): {dir}"
+                        );
+                    }
                 }
             }
-        }
-        subdirs.sort();
+            subdirs.sort();
+            subdirs
+        })
+        .await
+        .map_err(|e| AppOperationError::Backend(format!("scan task join: {e}")))?;
         for dir in subdirs {
-            collect_sql_files(
-                &code.join(&dir).join("database"),
-                &format!("{dir}/database"),
-                &mut files,
-            )?;
+            let dir_db = code.join(&dir).join("database");
+            let prefix = format!("{dir}/database");
+            let (dir_files, dir_err) = tokio::task::spawn_blocking(move || {
+                let mut out = Vec::new();
+                match collect_sql_files(&dir_db, &prefix, &mut out) {
+                    Ok(()) => (out, None),
+                    Err(e) => (out, Some(format!("{prefix}: scan failed: {e}"))),
+                }
+            })
+            .await
+            .map_err(|e| AppOperationError::Backend(format!("scan task join: {e}")))?;
+            files.extend(dir_files);
+            if let Some(e) = dir_err {
+                scan_errors.push(e);
+            }
         }
 
         let mut report = DatabaseSqlReport {
             executed: Vec::new(),
-            failed: Vec::new(),
+            failed: scan_errors,
         };
         for rel in files {
             // rel 已过 is_shell_safe_path_component 白名单（收集时过滤），

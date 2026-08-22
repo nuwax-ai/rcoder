@@ -24,6 +24,7 @@ use crate::router::AppState;
 // file-server 共用单一事实源）；本模块转发 computer_intercept 拦截层给主 Router
 // 装配。chat body 的 service_type 词表由 shared_types::ChatServiceScope 枚举承载。
 pub(crate) use forward::computer_intercept;
+pub(crate) use forward::invalidate_probe_cache;
 
 /// userApp 域转发路由（挂 rcoder 主 Router；`/api/userapp` 族不再来自 file-server
 /// 本地路由——路由合并时已排除）。

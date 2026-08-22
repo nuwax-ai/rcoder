@@ -24,24 +24,56 @@ use crate::userapp_publish::agent_runner::{dev_file_server_addr, ensure_userapp_
 // 与容器内 file-server 共用的单一事实源）。
 pub use shared_types::{APP_ID_HEADER, SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
 
-/// 逐跳头：转发前剥离（reqwest/上游自行生成；host 逐跳重写）。
-const HOP_BY_HOP: [&str; 6] = [
+/// 逐跳头静态表：转发前剥离（reqwest/上游自行生成；host 逐跳重写）。
+const HOP_BY_HOP: [&str; 10] = [
     "connection",
     "host",
     "content-length",
     "transfer-encoding",
     "keep-alive",
     "upgrade",
+    "te",
+    "trailer",
+    "proxy-authenticate",
+    "proxy-authorization",
 ];
 
-/// 解析 app_id header（None = 缺失/空，调用方返回 400 HttpResult）。
+/// 判定请求/响应头是否逐跳剥离：静态表 ∪ `Connection` 头动态列出的头
+/// （RFC 9110 §7.6.1：`Connection: X-Foo` 则 X-Foo 亦是逐跳——静态表无法穷尽）。
+fn is_hop_by_hop(name: &str, connection_listed: &[&str]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    HOP_BY_HOP.contains(&lower.as_str()) || connection_listed.contains(&lower.as_str())
+}
+
+/// 从 headers 提取 Connection 头动态声明的逐跳头名列表（小写化）。
+fn connection_listed_tokens(headers: &axum::http::HeaderMap) -> Vec<String> {
+    headers
+        .get("connection")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 解析并校验 app_id header（None = 缺失/空/非法，调用方返回 400 HttpResult）。
+///
+/// identifier 白名单必做：`computer_intercept` 挂在无鉴权的 file-server 路由面
+/// （与 TS 一致性设计），app_id 原样进入容器标识与 Docker bind 宿主路径拼接
+/// （`host_root.join(app_id)`），含 `/` 即逃逸开发卷根把宿主任意目录挂进容器。
 fn require_app_id(req: &Request) -> Option<String> {
-    req.headers()
+    let raw = req
+        .headers()
         .get(APP_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+        .filter(|s| !s.is_empty())?;
+    shared_types::validate_identifier(raw, "app_id").ok()?;
+    Some(raw.to_owned())
 }
 
 fn missing_app_id_response() -> Response {
@@ -71,7 +103,17 @@ async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Resp
         warn!(
             "[USERAPP_FORWARD] dev container probe failed (stale registry entry?), recreating: app_id={app_id}, addr={addr}"
         );
-        state.remove_project(app_id);
+        // 就地清 container 字段而非 remove_project：remove 在 PG 模式会持久化删除
+        // project 行及其 sessions（刚 durable 写入的会话映射全丢、跨副本路由失效），
+        // 且需先关 SSE 流避免后台 gRPC 对死地址空转——探活仅 3s 超时单次判定，
+        // 高负载抖动即触发，破坏性过大。清 container 让 ensure 走重建路径即可。
+        state.shutdown_sse_streams_for_project(app_id);
+        if let Some(mut info) = state.get_project(app_id).map(|p| (*p).clone()) {
+            info.set_container(None);
+            if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(info)) {
+                warn!("[USERAPP_FORWARD] clear stale container field failed: app_id={app_id}: {e}");
+            }
+        }
         info = ensure_userapp_builder(state, app_id).await.map_err(|e| {
             warn!("[USERAPP_FORWARD] re-ensure dev container failed: app_id={app_id}: {e:#}");
             HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
@@ -92,6 +134,13 @@ async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Resp
 static PROBE_OK: std::sync::OnceLock<dashmap::DashMap<String, std::time::Instant>> =
     std::sync::OnceLock::new();
 const PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 摘除探活正缓存条目（app purge 后调用，防缓存内残留已删 app 的健康时刻）。
+pub(crate) fn invalidate_probe_cache(app_id: &str) {
+    if let Some(cache) = PROBE_OK.get() {
+        cache.remove(app_id);
+    }
+}
 
 /// 开发容器 file-server 轻量探活（连接失败/非 2xx 均视为不可用）。
 async fn probe_dev_container(addr: &str) -> bool {
@@ -116,9 +165,13 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
     let target = format!("{addr}{}", req.uri());
 
     let (parts, body) = req.into_parts();
+    let listed = connection_listed_tokens(&parts.headers);
     let mut outbound = crate::http_client::shared_client().request(parts.method, &target);
     for (name, value) in &parts.headers {
-        if HOP_BY_HOP.contains(&name.as_str()) {
+        if is_hop_by_hop(
+            name.as_str(),
+            &listed.iter().map(String::as_str).collect::<Vec<_>>(),
+        ) {
             continue;
         }
         outbound = outbound.header(name, value);
@@ -138,9 +191,13 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
     };
 
     let status = upstream.status();
+    let resp_listed = connection_listed_tokens(upstream.headers());
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream.headers() {
-        if HOP_BY_HOP.contains(&name.as_str()) {
+        if is_hop_by_hop(
+            name.as_str(),
+            &resp_listed.iter().map(String::as_str).collect::<Vec<_>>(),
+        ) {
             continue;
         }
         builder = builder.header(name, value);

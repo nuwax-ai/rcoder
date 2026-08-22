@@ -67,19 +67,50 @@ pub fn pg_verify_credentials_cmd(username: &str, password: &str) -> String {
 }
 
 /// 角色存在检查命令（本地 trust 免密，`$POSTGRES_USER` 为镜像 ENV）。
+/// `username` 须先过 [`validate_pg_identifier`] 白名单（调用方保证）；
+/// SQL 参数整体单引号包裹作纵深防御。
 pub fn pg_role_exists_cmd(username: &str) -> String {
-    format!(
-        "psql -U \"$POSTGRES_USER\" -d postgres -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{}'\"",
+    let sql = format!(
+        "SELECT 1 FROM pg_roles WHERE rolname='{}'",
         pg_escape_literal(username)
+    );
+    format!(
+        "psql -U \"$POSTGRES_USER\" -d postgres -tAc {}",
+        pg_shell_quote(&sql)
     )
 }
 
 /// 密码重置命令（本地 trust 免密 ALTER USER；任意已存在账号）。
+///
+/// `-c` 的 SQL 参数整体经 [`pg_shell_quote`] 单引号包裹——密码是自由文本，
+/// 不能落 shell 双引号（`$`/反引号/`"` 在双引号内保持活性：注入 + 含特殊字符
+/// 的密码先被 shell 改写、复验必失败的密码损坏双重问题）。SQL 串内的 `'` 已由
+/// [`pg_escape_literal`] 转为 `''`，在 shell 单引号内安全。
 pub fn pg_alter_password_cmd(username: &str, password: &str) -> String {
-    format!(
-        "psql -U \"$POSTGRES_USER\" -d postgres -v ON_ERROR_STOP=1 -c \"ALTER USER {} WITH PASSWORD '{}'\"",
+    let sql = format!(
+        "ALTER USER {} WITH PASSWORD '{}'",
         pg_quote_ident(username),
         pg_escape_literal(password)
+    );
+    format!(
+        "psql -U \"$POSTGRES_USER\" -d postgres -v ON_ERROR_STOP=1 -c {}",
+        pg_shell_quote(&sql)
+    )
+}
+
+/// 超户自身密码重置命令（本地 trust；重置目标 = 当前连接用户 = `$POSTGRES_USER`）。
+///
+/// 用 SQL 的 `CURRENT_USER` 取代把 `"$POSTGRES_USER"` 内嵌进命令行——后者依赖
+/// shell 双引号开合的巧合展开（POSTGRES_USER 含空格还会分词），前者由 psql 会话
+/// 身份直接解析，无变量展开依赖。
+pub fn pg_alter_current_user_password_cmd(password: &str) -> String {
+    let sql = format!(
+        "ALTER USER CURRENT_USER WITH PASSWORD '{}'",
+        pg_escape_literal(password)
+    );
+    format!(
+        "psql -U \"$POSTGRES_USER\" -d postgres -v ON_ERROR_STOP=1 -c {}",
+        pg_shell_quote(&sql)
     )
 }
 
@@ -158,6 +189,38 @@ mod tests {
     #[test]
     fn alter_cmd_escapes_password_literal() {
         let cmd = pg_alter_password_cmd("app", "pa'ss");
-        assert!(cmd.contains(r#"ALTER USER "app" WITH PASSWORD 'pa''ss'"#));
+        // 双层转义正确性：PG 层 ' → ''（SQL 串内），再经 shell 层整体单引号包裹
+        // （' → '\''）——期望串用同一构造器合成，避免手算两层叠加
+        let sql = format!(
+            "ALTER USER {} WITH PASSWORD '{}'",
+            pg_quote_ident("app"),
+            pg_escape_literal("pa'ss")
+        );
+        assert!(cmd.contains(&pg_shell_quote(&sql)), "got: {cmd}");
+    }
+
+    #[test]
+    fn alter_cmd_shell_quotes_sql_argument() {
+        // shell 注入面：密码含 $/`/" 时不得在命令行保持活性——SQL 参数须整体单引号包裹。
+        // 断言用运行时构造的串，避开 raw 字符串与嵌套引号的定界歧义。
+        let password: String = ['a', '$', '`', 'b', '"', 'c'].into_iter().collect();
+        let cmd = pg_alter_password_cmd("app", &password);
+        let expected_prefix = format!("-c 'ALTER USER {} WITH PASSWORD '", pg_quote_ident("app"));
+        assert!(
+            cmd.contains(&expected_prefix),
+            "SQL 参数未单引号包裹: {cmd}"
+        );
+        let double_quoted_sql = "-c \"ALTER".to_string();
+        assert!(
+            !cmd.contains(&double_quoted_sql),
+            "不应再有双引号包 SQL: {cmd}"
+        );
+    }
+
+    #[test]
+    fn alter_current_user_cmd_has_no_variable_expansion_dependency() {
+        let cmd = pg_alter_current_user_password_cmd("pw");
+        assert!(cmd.contains("ALTER USER CURRENT_USER"));
+        assert!(cmd.contains(r#"-c 'ALTER"#));
     }
 }

@@ -145,7 +145,10 @@ impl AppState {
         // UserApp 开发资源回收回调（app purge 时回收 UserAppBuilder 开发容器 +
         // per-app PVC；app_manager 的 runtime 视图无 agent 能力，经契约委托本进程）
         app_service_instance.set_dev_cleanup(Arc::new(
-            crate::userapp_publish::agent_runner::UserappDevResourcesCleanup::new(runtime.clone()),
+            crate::userapp_publish::agent_runner::UserappDevResourcesCleanup::new(
+                runtime.clone(),
+                projects.clone(),
+            ),
         ));
 
         // P3：PG 模式的应用业务元数据持久化（query name/created_at 过滤数据源）。

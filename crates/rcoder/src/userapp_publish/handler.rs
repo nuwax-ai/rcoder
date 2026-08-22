@@ -123,7 +123,19 @@ pub async fn publish(
     Json(body): Json<PublishBody>,
 ) -> Result<Json<HttpResult<PublishTaskData>>, AppError> {
     validate_publish_identifiers(&app_id, &body.project_id)?;
-    // owner 显式传入 → 补记 metadata（优先于 create-workspace 注册值）
+    let auto_execute_sql = body.auto_execute_sql.unwrap_or(true);
+    let task = state
+        .publish_tasks
+        .create(
+            app_id.clone(),
+            body.project_id.clone(),
+            PublishTaskKind::Publish,
+        )
+        .await
+        .map_err(create_task_error)?;
+
+    // owner 补记在任务创建成功之后（创建前写入：409/429 被拒时 owner 已被覆盖，
+    // 且 handler 层不持有 service 层的写职责下沉）；合并语义见 record_dev_registration
     if let Some(uid) = body.user_id.as_deref().filter(|s| !s.trim().is_empty()) {
         shared_types::validate_identifier(uid, "user_id").map_err(|e| AppError::bad_request(&e))?;
         if let Err(e) = state
@@ -136,16 +148,6 @@ pub async fn publish(
             );
         }
     }
-    let auto_execute_sql = body.auto_execute_sql.unwrap_or(true);
-    let task = state
-        .publish_tasks
-        .create(
-            app_id.clone(),
-            body.project_id.clone(),
-            PublishTaskKind::Publish,
-        )
-        .await
-        .map_err(create_task_error)?;
     let task_id = task.id.clone();
     let project_id = body.project_id.clone();
     tokio::spawn(async move {

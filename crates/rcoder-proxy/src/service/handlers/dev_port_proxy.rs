@@ -32,7 +32,10 @@ pub async fn handle_dev_port_proxy_request(
         error!("devapps proxy route missing user_id params");
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
-    let app_id = params.get("app_id").unwrap_or("");
+    let app_id = params.get("app_id").ok_or_else(|| {
+        error!("devapps proxy route missing app_id params");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+    })?;
     let port_str = params.get("port").ok_or_else(|| {
         error!("devapps proxy route missing port params");
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
@@ -81,7 +84,10 @@ pub async fn handle_dev_port_proxy_upstream(
         error!("devapps proxy upstream missing user_id params");
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
-    let app_id = params.get("app_id").unwrap_or("");
+    let app_id = params.get("app_id").ok_or_else(|| {
+        error!("devapps proxy upstream missing app_id params");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+    })?;
     let port_str = params.get("port").ok_or_else(|| {
         error!("devapps proxy upstream missing port params");
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
@@ -91,10 +97,21 @@ pub async fn handle_dev_port_proxy_upstream(
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
 
+    // 端口黑名单：开发容器内跑着 PG/file-server/agent_runner 等基础设施服务，
+    // 任意端口直达等于从边缘暴露数据库与命令执行面——只放行开发预览流量。
+    if DEVAPPS_BLOCKED_PORTS.contains(&target_port) {
+        error!(
+            "devapps proxy blocked infrastructure port: user_id={}, app_id={}, port={}",
+            user_id, app_id, target_port
+        );
+        return Err(pingora_core::Error::new(
+            pingora_core::ErrorType::HTTPStatus(403),
+        ));
+    }
+
     ctx.target_port = Some(target_port);
     metrics.record_request();
     metrics.record_request_port(target_port);
-    metrics.inc_active();
 
     let dev_container_ip = container_lookup
         .as_ref()
@@ -108,6 +125,10 @@ pub async fn handle_dev_port_proxy_upstream(
             );
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502))
         })?;
+
+    // inc_active 放在 peer 构造前（成功路径）：lookup 失败的 502 不会进
+    // response_filter（dec_active 只在那里执行），提前 inc 会造成 gauge 单调虚增
+    metrics.inc_active();
 
     debug!(
         "devapps route: user_id={}, app_id={}, {}:{}",
@@ -128,3 +149,9 @@ pub async fn handle_dev_port_proxy_upstream(
 
     Ok(Box::new(peer))
 }
+
+/// devapps 代理的端口黑名单：开发容器内的基础设施端口（PG/file-server/
+/// agent_runner HTTP/gRPC/ttyd/VNC/ime），从边缘直达即暴露数据库与命令执行面。
+/// 开发预览（dev server 端口池/自装 pingap 9080）不受影响；归属校验为后续项
+/// （需调用方身份信息，当前 user_id 仅日志）。
+const DEVAPPS_BLOCKED_PORTS: [u16; 7] = [5432, 50051, 60000, 8086, 6080, 17681, 7681];
