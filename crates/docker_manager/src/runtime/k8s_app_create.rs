@@ -288,6 +288,26 @@ impl KubernetesRuntime {
         if ports.is_empty() {
             return Ok(());
         }
+        // 运行容器终端/PG 控制台固定端口随 Service 一并暴露——
+        // `/userapp/{ttyd,pgweb}/{app_id}/runtime` 代理上游为 Service FQDN，
+        // 若 7681/8081 不在 Service ports 内，代理连接将超时（app-runtime
+        // 镜像 supervisor 恒起 ttyd/pgweb，targetPort 恒可达）。
+        let mut ports = ports;
+        for (name, port) in [
+            ("ttyd", shared_types::TTYD_PORT),
+            ("pgweb", shared_types::PGWEB_PORT),
+        ] {
+            let already = ports.iter().any(|p| p.port == port as i32);
+            if !already {
+                ports.push(ServicePort {
+                    name: Some(name.to_string()),
+                    port: port as i32,
+                    target_port: Some(IntOrString::Int(port as i32)),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                });
+            }
+        }
         let tenant_id = params.tenant_id.as_deref();
         let space_id = params.space_id.as_deref();
         let svc = Service {
