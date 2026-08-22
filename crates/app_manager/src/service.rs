@@ -692,7 +692,7 @@ mod tests {
             app_id: Some(app_id.to_owned()),
             name: "r2-app".into(),
             user_id: "u-test".to_string(),
-            image: "registry.example/app-runtime:test".into(),
+            image: Some("registry.example/app-runtime:test".into()),
             command: None,
             env: None,
             secrets: None,

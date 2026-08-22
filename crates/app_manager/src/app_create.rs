@@ -30,12 +30,28 @@ impl AppService {
     /// 本函数不再取锁。供 `create_app` 公共包装和 `ensure_app_runtime`（activate
     /// 锁内调用）共用——拆分正是为了消除 activate→ensure_app_runtime→create_app
     /// 的重入死锁。
+    ///
+    /// 入口统一解析默认镜像（单一收口）：image 缺省 → 平台默认运行时镜像
+    /// （env `RCODER_RUNTIME_IMAGE_DIGEST`，测试/生产由部署注入；与发布链
+    /// ensure_app_runtime 同源）。填充后全链路（params/AppInfo）恒 Some。
     pub(super) async fn create_app_locked(
         &self,
         app_id: &str,
         request: CreateAppRequest,
         _process_lock: tokio::sync::OwnedMutexGuard<()>,
     ) -> AppResult<AppInfo> {
+        // 默认镜像单一收口（见函数 doc）：填充后 params/AppInfo 全链路恒 Some
+        let mut request = request;
+        if request
+            .image
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            request.image = Some(super::app_params::default_runtime_image(
+                &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
+            )?);
+        }
         info!(
             "[APP] creating app: {} ({}, mode={:?})",
             request.name, app_id, self.config.access_mode
@@ -256,7 +272,7 @@ impl AppService {
             name: request.name,
             status,
             message,
-            image: request.image,
+            image: request.image.clone().unwrap_or_default(),
             command: request.command.unwrap_or_default(),
             replicas: 1,
             access,

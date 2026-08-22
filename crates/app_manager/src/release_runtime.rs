@@ -70,7 +70,7 @@ impl AppService {
                 .lookup(rcoder_app_id)
                 .and_then(|m| m.user_id)
                 .unwrap_or_default(),
-            image,
+            image: Some(image),
             command: None,
             env: None,
             secrets: None,

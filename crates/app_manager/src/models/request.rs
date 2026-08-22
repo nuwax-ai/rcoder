@@ -18,10 +18,13 @@ pub struct CreateAppRequest {
     /// 归属用户 ID（部署访问 URL `/proxy/apps/{user_id}/{app_id}/{port}` 的组成段；
     /// 存 userapp_metadata.user_id，"我的应用"过滤/归属校验数据源）
     pub user_id: String,
-    /// 容器镜像（**完整地址**，含 registry + 命名空间，如 `nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/app-runtime`）。
-    /// 由调用方提前准备好并 push 到 registry；RCoder 不构建镜像。初期不限定镜像列表。
-    /// 命名空间区分环境：`nuwax-k8s-test`（测试）/ `nuwax-k8s-prod`（线上）。
-    pub image: String,
+    /// 容器镜像（可选；完整地址含 registry + 命名空间）。
+    ///
+    /// **缺省 = 平台默认运行时镜像**（env `RCODER_RUNTIME_IMAGE_DIGEST`，部署层按
+    /// 环境注入——测试/生产各一份，与发布链 `ensure_app_runtime` 同源）。当前
+    /// userApp 统一单一 app-runtime 镜像，调用方通常无需传；显式传入用于临时
+    /// 指定特殊版本（如灰度）。env 未配置且未传入 → ERR_BACKEND_ERROR。
+    pub image: Option<String>,
     /// 启动命令
     pub command: Option<Vec<String>>,
     /// 环境变量（存储到 ConfigMap）
@@ -97,13 +100,16 @@ pub enum SortOrder {
 ///
 /// **rcoder 无状态**：不持有旧 desired state，无法做"部分字段保留"。因此本请求语义为
 /// **全量替换**——调用方（Java，desired state 的 source of truth）需发送完整新状态。
-/// `image` 必填（无法保留旧 image）；`ports`/`health_check` 为整段替换。
+/// `image` 可选——缺失时用平台默认运行时镜像（env `RCODER_RUNTIME_IMAGE_DIGEST`，
+/// 与 create 同源；等于"滚动到当前默认镜像版本"）；`ports`/`health_check` 为整段替换。
 /// `tenant_id`/`space_id` 携带以保持资源 label（rcoder 不主动修改租户归属）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateAppRequest {
     /// 应用名称（仅元数据，不影响 K8s 资源命名；rcoder 忽略）
     pub name: Option<String>,
-    /// 容器镜像（**必填**，rcoder 无状态无法保留旧 image；缺失 → ERR_VALIDATION）
+    /// 容器镜像（可选；缺失 = 平台默认运行时镜像 env `RCODER_RUNTIME_IMAGE_DIGEST`，
+    /// 与 create 同源。rcoder 无状态不持有旧 desired——缺省语义是"用当前默认"而非
+    /// "保留旧值"）
     pub image: Option<String>,
     /// 启动命令
     pub command: Option<Vec<String>>,

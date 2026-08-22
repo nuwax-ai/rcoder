@@ -227,11 +227,12 @@ async fn test_app_create_requires_release_lock(env: &Env, report: &JsonlReporter
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );
+    // image 不传：验证默认运行时镜像解析（env RCODER_RUNTIME_IMAGE_DIGEST；
+    // 本场景断言的是 release lock 拦截，镜像解析须先通过——缺省链路一并覆盖）
     let payload = json!({
         "app_id": app_id,
         "name": "e2e-nolock-test",
         "user_id": "e2e-user",
-        "image": "alpine:3.19",
         "command": ["sleep", "3600"],
     });
     let (status, body) = post_json(env, "/api/v1/apps", payload).await;
