@@ -345,19 +345,281 @@ pub(super) fn default_runtime_image(env_value: &Option<String>) -> AppResult<Str
 }
 
 #[cfg(test)]
-mod default_image_tests {
-    use super::default_runtime_image;
+mod tests {
+    use super::*;
+    use crate::models::UpdateAppRequest;
+    use crate::test_support::{MockRuntime, release_lock, test_service};
+    use container_runtime_api::{
+        AppHealthCheck, AppResourceRequirements, ContainerSpecSnapshot, DeploymentStatus,
+        HealthCheckType as RtHealthCheckType,
+    };
+    use std::sync::Arc;
 
-    #[test]
-    fn env_present_resolves() {
-        let img = default_runtime_image(&Some(" registry.example/app-runtime:0.1.9 ".into()))
-            .expect("resolve");
-        assert_eq!(img, "registry.example/app-runtime:0.1.9");
+    fn empty_update_request(image: &str) -> UpdateAppRequest {
+        UpdateAppRequest {
+            name: None,
+            image: Some(image.to_owned()),
+            command: None,
+            env: None,
+            secrets: None,
+            resources: None,
+            ports: None,
+            health_check: None,
+            tenant_id: None,
+            space_id: None,
+            recycle_enabled: None,
+            idle_timeout_seconds: None,
+            expected_resource_version: None,
+        }
     }
 
-    #[test]
-    fn env_blank_is_missing() {
-        assert!(default_runtime_image(&Some("   ".into())).is_err());
-        assert!(default_runtime_image(&None).is_err());
+    async fn service_with_release_lock(root: &std::path::Path, app_id: &str) -> AppService {
+        let app_dir = root.join(app_id);
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+        test_service(root, Arc::new(MockRuntime::default()))
+    }
+
+    /// 只传 image 的 update：secrets/resources/health_check 缺省时从 live 快照回退
+    /// （不再静默清空），command/env 同理。
+    #[tokio::test]
+    async fn update_missing_fields_fall_back_to_live_spec() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let app_dir = root.path().join("app-fb");
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+        runtime.specs.insert(
+            "app-fb".into(),
+            ContainerSpecSnapshot {
+                command: Some(vec![
+                    "java".into(),
+                    "-jar".into(),
+                    "/app/code/app.jar".into(),
+                ]),
+                // 模拟真实后端读回：create 时注入的保留变量随 env 存进集群（ConfigMap/
+                // 容器 Config），live 快照必含——不剥离会让 update 部分 update 必 400。
+                env: Some(HashMap::from([
+                    ("SPRING_PROFILES".into(), "prod".into()),
+                    ("RCODER_PINGAP_VERSION".into(), "stale-from-cluster".into()),
+                    ("RCODER_PINGAP_COMMIT".into(), "stale-commit".into()),
+                    (
+                        "RCODER_RUNTIME_IMAGE_DIGEST".into(),
+                        "registry.example/app-runtime:OLD".into(),
+                    ),
+                ])),
+                secrets: Some(HashMap::from([("DB_PASSWORD".into(), "s3cr3t".into())])),
+                resources: Some(AppResourceRequirements {
+                    cpu: Some("1".into()),
+                    memory: Some("1Gi".into()),
+                    storage: None,
+                    ephemeral_storage: Some("2Gi".into()),
+                }),
+                health_check: Some(AppHealthCheck {
+                    check_type: RtHealthCheckType::Http,
+                    path: Some("/actuator/health".into()),
+                    liveness_path: None,
+                    port: Some(8080),
+                    initial_delay_seconds: None,
+                    period_seconds: None,
+                }),
+                // K8s 读回示意：container.ports + port-expose 注解（含 TCP 端口）
+                ports: Some(vec![
+                    AppPortSpec {
+                        name: "http".into(),
+                        port: 8080,
+                        expose_type: RtExposeType::Http,
+                        strip_prefix: None,
+                    },
+                    AppPortSpec {
+                        name: "db".into(),
+                        port: 5432,
+                        expose_type: RtExposeType::Tcp,
+                        strip_prefix: None,
+                    },
+                ]),
+            },
+        );
+        let service = test_service(root.path(), runtime);
+
+        let params = service
+            .build_container_params_from_update(
+                "app-fb",
+                &empty_update_request("img:v2"),
+                &DeploymentStatus::default(),
+            )
+            .await
+            .expect("params with fallback");
+
+        assert_eq!(
+            params.command,
+            Some(vec![
+                "java".to_string(),
+                "-jar".to_string(),
+                "/app/code/app.jar".to_string()
+            ])
+        );
+        // 业务 env 从 live 回退保留；保留变量被剥离后由 inject 从 release.lock.toml
+        // 重新注入权威值（而非集群里的旧值）。
+        let env = params.env.expect("env always set by builder");
+        assert_eq!(env.get("SPRING_PROFILES").map(String::as_str), Some("prod"));
+        assert_eq!(
+            env.get("RCODER_PINGAP_VERSION").map(String::as_str),
+            Some("0.13.7")
+        );
+        assert_eq!(
+            env.get("RCODER_PINGAP_COMMIT").map(String::as_str),
+            Some("abc123")
+        );
+        assert_eq!(
+            env.get("RCODER_RUNTIME_IMAGE_DIGEST").map(String::as_str),
+            Some("registry.example/app-runtime:0.1.140")
+        );
+        let secrets = params.secrets.expect("secrets fallback");
+        assert_eq!(
+            secrets.get("DB_PASSWORD").map(String::as_str),
+            Some("s3cr3t")
+        );
+        let resources = params.app_resources.expect("resources fallback");
+        assert_eq!(resources.cpu.as_deref(), Some("1"));
+        assert_eq!(resources.memory.as_deref(), Some("1Gi"));
+        assert_eq!(resources.ephemeral_storage.as_deref(), Some("2Gi"));
+        let hc = params.health_check.expect("health_check fallback");
+        assert!(matches!(hc.check_type, RtHealthCheckType::Http));
+        assert_eq!(hc.path.as_deref(), Some("/actuator/health"));
+        assert_eq!(hc.port, Some(8080));
+        // ports 从 live 快照回退（此前缺省会清空全部对外端口）
+        let ports = params.ports.expect("ports fallback");
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].port, 8080);
+        assert!(matches!(ports[0].expose_type, RtExposeType::Http));
+        assert_eq!(ports[0].name, "http");
+        assert_eq!(ports[1].port, 5432);
+        assert!(matches!(ports[1].expose_type, RtExposeType::Tcp));
+    }
+
+    /// 显式传值优先：请求携带的 secrets/resources 覆盖 live 快照（整段替换语义不变）。
+    #[tokio::test]
+    async fn update_explicit_fields_override_live_spec() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        let app_dir = root.path().join("app-ov");
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+        runtime.specs.insert(
+            "app-ov".into(),
+            ContainerSpecSnapshot {
+                command: None,
+                env: None,
+                secrets: Some(HashMap::from([("OLD".into(), "old".into())])),
+                resources: Some(AppResourceRequirements {
+                    cpu: Some("1".into()),
+                    memory: None,
+                    storage: None,
+                    ephemeral_storage: None,
+                }),
+                health_check: None,
+                ports: None,
+            },
+        );
+        let service = test_service(root.path(), runtime);
+        let mut request = empty_update_request("img:v2");
+        request.secrets = Some(HashMap::from([("NEW".into(), "new".into())]));
+
+        let params = service
+            .build_container_params_from_update("app-ov", &request, &DeploymentStatus::default())
+            .await
+            .expect("params");
+
+        let secrets = params.secrets.expect("explicit secrets");
+        assert_eq!(secrets.get("NEW").map(String::as_str), Some("new"));
+        assert!(
+            !secrets.contains_key("OLD"),
+            "explicit secrets replace live snapshot"
+        );
+    }
+
+    /// 用户显式提交保留变量仍拒绝（防伪造语义不受回退剥离影响）。
+    #[tokio::test]
+    async fn update_explicit_reserved_env_still_rejected() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let service = service_with_release_lock(root.path(), "app-reserved").await;
+        let mut request = empty_update_request("img:v2");
+        request.env = Some(HashMap::from([(
+            "RCODER_PINGAP_VERSION".to_owned(),
+            "user-value".to_owned(),
+        )]));
+
+        let error = service
+            .build_container_params_from_update(
+                "app-reserved",
+                &request,
+                &DeploymentStatus::default(),
+            )
+            .await
+            .expect_err("explicit reserved env must fail");
+        assert!(error.to_string().contains("reserved"), "{error}");
+    }
+
+    /// live 快照缺字段（如 Docker 的 secrets/health_check 恒 None）→ 维持旧行为（空）。
+    #[tokio::test]
+    async fn update_fallback_absent_snapshot_field_stays_empty() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let service = service_with_release_lock(root.path(), "app-empty").await;
+
+        let params = service
+            .build_container_params_from_update(
+                "app-empty",
+                &empty_update_request("img:v2"),
+                &DeploymentStatus::default(),
+            )
+            .await
+            .expect("params");
+
+        assert!(
+            params.secrets.as_ref().is_none_or(|m| m.is_empty()),
+            "no snapshot → secrets empty (old behavior)"
+        );
+        assert!(params.app_resources.is_none());
+        assert!(params.health_check.is_none());
+    }
+
+    #[cfg(test)]
+    mod default_image {
+        use super::default_runtime_image;
+
+        #[test]
+        fn env_present_resolves() {
+            let img = default_runtime_image(&Some(" registry.example/app-runtime:0.1.9 ".into()))
+                .expect("resolve");
+            assert_eq!(img, "registry.example/app-runtime:0.1.9");
+        }
+
+        #[test]
+        fn env_blank_is_missing() {
+            assert!(default_runtime_image(&Some("   ".into())).is_err());
+            assert!(default_runtime_image(&None).is_err());
+        }
     }
 }
