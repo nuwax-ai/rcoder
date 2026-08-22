@@ -6,9 +6,9 @@ use tracing::{info, instrument, warn};
 
 use container_runtime_api::DeploymentStatus;
 
-use super::models::*;
-use super::service::AppService;
-use super::utils::*;
+use crate::models::*;
+use crate::service::AppService;
+use crate::utils::*;
 
 impl AppService {
     /// 启动应用（scale replicas = 1）
@@ -103,7 +103,7 @@ impl AppService {
         self.get_app(app_id).await
     }
 
-    pub(super) fn restore_activity_state(
+    pub(crate) fn restore_activity_state(
         &self,
         app_id: &str,
         previous: &DeploymentStatus,

@@ -7,10 +7,10 @@ use tracing::{info, warn};
 use container_runtime_api::{DeploymentStatus, ExposeType as RtExposeType, HttpExpose};
 use shared_types::ServiceType;
 
-use super::config::AppAccessMode;
-use super::models::*;
-use super::service::AppService;
-use super::utils::*;
+use crate::config::AppAccessMode;
+use crate::models::*;
+use crate::service::AppService;
+use crate::utils::*;
 
 impl AppService {
     /// 实时查询单个应用运行时状态（None 表示不存在）

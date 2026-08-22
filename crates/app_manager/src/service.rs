@@ -21,7 +21,7 @@ use container_runtime_api::{ExposeType as RtExposeType, HttpExpose, UserAppRunti
 use rcoder_proxy::PingoraProxyService;
 
 use crate::AppActivityRegistry;
-use crate::app_metadata::AppMetadataStore;
+use crate::runtime::metadata::AppMetadataStore;
 
 use super::config::{AppAccessMode, AppManagerConfig};
 use super::models::*;
@@ -703,7 +703,7 @@ mod tests {
 
     use crate::test_support::{MockRuntime, release_lock, test_service};
 
-    fn create_request(app_id: &str) -> CreateAppRequest {
+    pub(crate) fn create_request(app_id: &str) -> CreateAppRequest {
         CreateAppRequest {
             app_id: Some(app_id.to_owned()),
             name: "r2-app".into(),
@@ -724,7 +724,7 @@ mod tests {
 
     /// R2：create_app_runtime 失败——断言 delete_deployment 兜底被调用、原始错误原样返回（不被清理覆盖）。
     #[tokio::test]
-    async fn create_app_runtime_failure_triggers_best_effort_cleanup() {
+    pub(crate) async fn create_app_runtime_failure_triggers_best_effort_cleanup() {
         let root = tempfile::tempdir().expect("tempdir");
         let runtime = Arc::new(MockRuntime::default());
         runtime.create_fails.store(true, Ordering::SeqCst);
@@ -761,7 +761,7 @@ mod tests {
 
     /// R2 对照：清理自身失败也不改变原始错误（只 warn）。
     #[tokio::test]
-    async fn create_app_cleanup_failure_keeps_original_error() {
+    pub(crate) async fn create_app_cleanup_failure_keeps_original_error() {
         let root = tempfile::tempdir().expect("tempdir");
         let runtime = Arc::new(MockRuntime::default());
         runtime.create_fails.store(true, Ordering::SeqCst);
@@ -793,7 +793,7 @@ mod tests {
     /// 回归（userapp_metadata）：update 不带 name（name 是"仅元数据"调用方常省略）
     /// 不得清空已存业务名——否则 query name 过滤对该 app 永久失效。带 name 则覆盖。
     #[tokio::test]
-    async fn update_app_without_name_keeps_metadata_name() {
+    pub(crate) async fn update_app_without_name_keeps_metadata_name() {
         use crate::models::UpdateAppRequest;
 
         let root = tempfile::tempdir().expect("tempdir");
@@ -861,7 +861,7 @@ mod tests {
 
     /// update 与发布并发：发布锁被占 → 立即 409（不排队傻等 activate 的就绪窗口）。
     #[tokio::test]
-    async fn update_app_conflicts_while_release_lock_held() {
+    pub(crate) async fn update_app_conflicts_while_release_lock_held() {
         let root = tempfile::tempdir().expect("tempdir");
         let service = test_service(root.path(), Arc::new(MockRuntime::default()));
         let _publish_lock = service.acquire_process_release_lock("app-busy").await;
@@ -894,7 +894,7 @@ mod tests {
     /// query_apps 分页校验：page<1 / page_size∉[1,100] → 400（对齐 query_storage 与
     /// publish tasks 口径；此前静默 clamp，超大 page 在 debug 构建乘法溢出 panic）。
     #[tokio::test]
-    async fn query_apps_rejects_invalid_pagination_and_sort() {
+    pub(crate) async fn query_apps_rejects_invalid_pagination_and_sort() {
         let service = test_service(
             tempfile::tempdir().expect("tempdir").path(),
             Arc::new(MockRuntime::default()),
@@ -928,7 +928,7 @@ mod tests {
     /// 三档删除语义：delete(purge=true) 销毁存储但**保留**元数据行（误删找回）；
     /// 仅独立 storage/destroy 接口删行。
     #[tokio::test]
-    async fn delete_app_purge_keeps_metadata_row_until_explicit_destroy() {
+    pub(crate) async fn delete_app_purge_keeps_metadata_row_until_explicit_destroy() {
         use crate::test_support::InMemoryMetadataPersistence;
         use shared_types::AppMetadataPersistence as _;
 
@@ -984,7 +984,7 @@ mod tests {
     /// query_apps 的 name/created_at 过滤:纯内存模式（无 metadata 持久化）维持忽略
     /// （全量返回,旧行为）;注入持久化（PG 模式同构）后经内存 join 生效。
     #[tokio::test]
-    async fn query_apps_name_filter_respects_metadata_mode() {
+    pub(crate) async fn query_apps_name_filter_respects_metadata_mode() {
         use crate::test_support::InMemoryMetadataPersistence;
         use container_runtime_api::DeploymentStatus;
         use shared_types::{AppMetadataPersistence as _, AppMetadataRecord};

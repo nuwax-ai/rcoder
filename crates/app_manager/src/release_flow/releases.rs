@@ -7,14 +7,14 @@ use download_utils::{DownloadConfig, Downloader};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument, warn};
 
-use crate::models::{
-    AppOperationError, AppResult, PrepareReleaseRequest, ReleaseInfo, ReleaseListResponse,
-    ReleaseStatus,
-};
-use crate::release_store::{
+use super::store::{
     acquire_lock, ensure_release_dirs, map_download_error, plan_retention, read_code_release_id,
     read_index, release_retention, remove_dir_if_exists, remove_release_packages,
     stage_release_package, validate_release_id, validate_sha256, verify_package, write_index,
+};
+use crate::models::{
+    AppOperationError, AppResult, PrepareReleaseRequest, ReleaseInfo, ReleaseListResponse,
+    ReleaseStatus,
 };
 use crate::service::AppService;
 use crate::utils::{map_io_error, validate_app_id};
@@ -156,7 +156,7 @@ impl AppService {
         release_id: &str,
         readiness_timeout: Option<u64>,
     ) -> AppResult<ReleaseInfo> {
-        use crate::release_runtime::{
+        use super::runtime::{
             DEFAULT_READY_TIMEOUT_SECS, MAX_READY_TIMEOUT_SECS, MIN_READY_TIMEOUT_SECS,
         };
         validate_app_id(app_id)?;
@@ -517,7 +517,7 @@ impl AppService {
         Ok(())
     }
 
-    pub(super) async fn acquire_process_release_lock(
+    pub(crate) async fn acquire_process_release_lock(
         &self,
         app_id: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
@@ -532,7 +532,7 @@ impl AppService {
         lock.lock_owned().await
     }
 
-    pub(super) fn remove_unused_process_release_lock(&self, app_id: &str) {
+    pub(crate) fn remove_unused_process_release_lock(&self, app_id: &str) {
         if let dashmap::mapref::entry::Entry::Occupied(entry) =
             self.release_locks.entry(app_id.to_owned())
             && Arc::strong_count(entry.get()) == 1

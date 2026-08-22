@@ -6,9 +6,9 @@
 use async_trait::async_trait;
 use tracing::info;
 
-use super::models::*;
-use super::service::AppService;
-use super::utils::*;
+use crate::models::*;
+use crate::service::AppService;
+use crate::utils::*;
 
 /// UserApp 运行容器 exec 通道（runtime exec → PgCommandRunner）。
 struct RuntimeExecRunner<'a> {

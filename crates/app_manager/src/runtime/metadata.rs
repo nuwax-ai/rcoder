@@ -93,7 +93,7 @@ impl AppMetadataStore {
     }
 }
 
-impl super::service::AppService {
+impl crate::service::AppService {
     /// 注入元数据持久化（PG 模式 main 在 AppService 构造后调用）。
     pub fn set_metadata_persistence(&self, p: Arc<dyn shared_types::AppMetadataPersistence>) {
         self.metadata.set_persistence(p);

@@ -6,9 +6,9 @@ use chrono::Utc;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use super::models::*;
-use super::service::AppService;
-use super::utils::*;
+use crate::models::*;
+use crate::service::AppService;
+use crate::utils::*;
 
 impl AppService {
     /// 创建应用（公共入口：自动获取进程级发布锁）
@@ -34,7 +34,7 @@ impl AppService {
     /// 入口统一解析默认镜像（单一收口）：image 缺省 → 平台默认运行时镜像
     /// （env `RCODER_RUNTIME_IMAGE_DIGEST`，测试/生产由部署注入；与发布链
     /// ensure_app_runtime 同源）。填充后全链路（params/AppInfo）恒 Some。
-    pub(super) async fn create_app_locked(
+    pub(crate) async fn create_app_locked(
         &self,
         app_id: &str,
         request: CreateAppRequest,
@@ -48,7 +48,7 @@ impl AppService {
             .map(str::trim)
             .is_none_or(str::is_empty)
         {
-            request.image = Some(super::app_params::default_runtime_image(
+            request.image = Some(crate::runtime::params::default_runtime_image(
                 &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
             )?);
         }

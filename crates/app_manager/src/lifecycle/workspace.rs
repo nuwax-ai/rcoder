@@ -8,9 +8,9 @@ use tokio::fs;
 
 use shared_types::ServiceType;
 
-use super::models::*;
-use super::service::AppService;
-use super::utils::*;
+use crate::models::*;
+use crate::service::AppService;
+use crate::utils::*;
 
 impl AppService {
     /// ensure UserApp per-app 工作空间就绪 (K8s): ensure PVC 带 requests.storage 用户配额 + 重试
@@ -112,7 +112,7 @@ impl AppService {
     ///   运行时适配, 非 per-app 失败)。
     /// - K8s per-app resolve 失败 (Err): **Fail Fast** 返回 Backend 错误, 不 fallback 共享
     ///   (避免 per-app PVC + 共享 PVC 数据面分裂, 见 code-review M1/M2)。
-    pub(super) async fn get_container_app_dir(&self, app_id: &str) -> AppResult<PathBuf> {
+    pub(crate) async fn get_container_app_dir(&self, app_id: &str) -> AppResult<PathBuf> {
         match self
             .runtime
             .resolve_workspace_path(app_id, &ServiceType::UserApp)

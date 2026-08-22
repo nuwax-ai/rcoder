@@ -12,10 +12,10 @@ use download_utils::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::models::*;
-use super::utils::*;
+use crate::models::*;
+use crate::utils::*;
 
-impl super::service::AppService {
+impl crate::service::AppService {
     /// 上传文件 / 压缩包。
     ///
     /// 自动判断（魔数）：zip/tar.gz 压缩包 → 解压到 `target` 目录；其它 → 单文件存 `target`。

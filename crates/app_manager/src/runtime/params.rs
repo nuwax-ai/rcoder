@@ -12,10 +12,10 @@ use container_runtime_api::{
 };
 use shared_types::ServiceType;
 
-use super::models::*;
-use super::runtime_identity::{inject_release_identity, strip_release_identity};
-use super::service::AppService;
-use super::utils::*;
+use crate::models::*;
+use crate::release_flow::identity::{inject_release_identity, strip_release_identity};
+use crate::service::AppService;
+use crate::utils::*;
 
 /// build_params_inner 的入参聚合（消除 too_many_arguments，create/update 两路统一填充）。
 ///
@@ -329,7 +329,7 @@ fn health_check_from_snapshot(hc: AppHealthCheck) -> HealthCheckConfig {
 /// 解析平台默认运行时镜像（单一 app-runtime 镜像策略：测试/生产由部署 env 区分，
 /// 与发布链 `ensure_app_runtime` 同读 `RCODER_RUNTIME_IMAGE_DIGEST`）。
 /// env 未配置且调用方未显式传 image → Backend 错误（部署缺配置，fail fast）。
-pub(super) fn default_runtime_image(env_value: &Option<String>) -> AppResult<String> {
+pub(crate) fn default_runtime_image(env_value: &Option<String>) -> AppResult<String> {
     env_value
         .as_deref()
         .map(str::trim)

@@ -4,10 +4,10 @@ use tracing::{info, warn};
 
 use shared_types::ServiceType;
 
-use super::models::*;
-use super::utils::*;
+use crate::models::*;
+use crate::utils::*;
 
-impl super::service::AppService {
+impl crate::service::AppService {
     // ===== 持久存储管理（v2 §5.4）=====
     // 删应用默认保留数据；这组接口让 Java 显式管理残留存储。
     // StorageInfo 不含 size_bytes——CephFS 上不能用 du（详见设计文档 §5.4）。
@@ -86,7 +86,7 @@ impl super::service::AppService {
     /// 三档删除语义：delete/purge 保留行（误删找回——重建同 ID 应用后 name/created_at
     /// 仍在），仅独立的 storage/destroy 接口（[`Self::destroy_app_storage`]）删行。
     /// 此前 purge 直接复用 destroy_app_storage 把行也删了，违反契约。
-    pub(super) async fn destroy_app_storage_keep_metadata(
+    pub(crate) async fn destroy_app_storage_keep_metadata(
         &self,
         app_id: &str,
         confirm: &str,

@@ -13,7 +13,7 @@ use crate::models::{
     ActivateReleaseRequest, PrepareReleaseRequest, ReleaseInfo, ReleaseListResponse,
     RollbackReleaseRequest,
 };
-use crate::release_runtime::{MAX_READY_TIMEOUT_SECS, MIN_READY_TIMEOUT_SECS};
+use crate::release_flow::runtime::{MAX_READY_TIMEOUT_SECS, MIN_READY_TIMEOUT_SECS};
 
 use super::AppManagerState;
 

@@ -7,10 +7,10 @@ use tracing::{info, warn};
 use container_runtime_api::{ExposeType as RtExposeType, HttpExpose};
 use shared_types::ServiceType;
 
-use super::config::AppAccessMode;
-use super::models::*;
-use super::service::AppService;
-use super::utils::*;
+use crate::config::AppAccessMode;
+use crate::models::*;
+use crate::service::AppService;
+use crate::utils::*;
 
 impl AppService {
     /// 为 HTTP 端口注册 Pingora backend（Pingora 模式，Docker/K8s 统一）。

@@ -7,28 +7,17 @@
 
 mod activity_persistence_ops;
 pub mod activity_registry;
-pub mod app_create;
-pub mod app_db;
-pub(crate) mod app_metadata;
-pub mod app_ops;
-pub mod app_params;
-pub mod app_pingora;
 pub mod app_service_trait;
-mod app_start;
-pub mod app_status;
-pub mod app_workspace;
 pub mod config;
 pub mod error;
-pub mod files;
 pub mod handlers;
+mod lifecycle;
 pub mod models;
-pub(crate) mod release_runtime;
-pub mod release_store;
-pub mod releases;
+mod ops;
+mod release_flow;
 pub mod routes;
-mod runtime_identity;
+mod runtime;
 pub mod service;
-pub mod storage;
 #[cfg(test)]
 mod test_support;
 pub mod utils;
