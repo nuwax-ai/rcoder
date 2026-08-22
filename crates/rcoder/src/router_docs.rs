@@ -53,6 +53,8 @@ use crate::handler;
         handler::proxy_to_userapp_vnc,
         handler::proxy_to_userapp_audio,
         handler::proxy_to_userapp_ime,
+        handler::proxy_to_userapp_runtime_ttyd,
+        handler::proxy_to_userapp_runtime_pgweb,
         handler::userapp_proxy_routes_doc,
         handler::proxy_with_query_params,
         // P0-4: Agent Management 转发层
@@ -416,9 +418,10 @@ mod openapi_tests {
         }
     }
 
-    /// UserApp（/api/v1/apps 前缀）全部端点的文档质量防回归：
+    /// UserApp 全部对接端点（`/api/v1/apps` + `/userapp/` 代理文档接口）的文档质量
+    /// 防回归：
     /// 1. 每个操作必须有非空 summary 或 description（handler `///` doc 注释）；
-    /// 2. 200 响应必须有非空 description；
+    /// 2. 成功响应（2xx/3xx——/userapp/ 文档接口的成功码是 307）必须有非空 description；
     /// 3. 必须声明至少一个 4xx/5xx 错误响应（与 handler 实际错误分支对应）。
     ///
     /// 新增 UserApp 端点未写注释会在此失败——样板见 userapp_publish/handler.rs。
@@ -427,7 +430,17 @@ mod openapi_tests {
         let document = ApiDoc::openapi();
         let mut checked = 0usize;
         for (path, item) in &document.paths.paths {
-            if !path.starts_with("/api/v1/apps") {
+            // /userapp/routes 速查表是纯静态文档接口（无错误分支），不在质量检查内
+            let is_userapp_proxy_doc = [
+                "/userapp/ttyd",
+                "/userapp/vnc",
+                "/userapp/audio",
+                "/userapp/ime",
+                "/userapp/pgweb",
+            ]
+            .iter()
+            .any(|prefix| path.starts_with(prefix));
+            if !path.starts_with("/api/v1/apps") && !is_userapp_proxy_doc {
                 continue;
             }
             for operation in [&item.get, &item.post].into_iter().flatten() {
@@ -445,15 +458,21 @@ mod openapi_tests {
                 );
 
                 let responses = &operation.responses.responses;
-                let ok = responses
-                    .get("200")
-                    .unwrap_or_else(|| panic!("OpenAPI 操作缺少 200 响应: {path}"));
-                let utoipa::openapi::RefOr::T(ok) = ok else {
-                    panic!("200 响应不应为 $ref: {path}");
+                let success = responses.keys().find_map(|code| {
+                    let status = code.trim().parse::<u16>().ok()?;
+                    (200..400).contains(&status).then_some(code.clone())
+                });
+                let success =
+                    success.unwrap_or_else(|| panic!("OpenAPI 操作缺少 2xx/3xx 成功响应: {path}"));
+                let utoipa::openapi::RefOr::T(ok) = responses
+                    .get(&success)
+                    .unwrap_or_else(|| panic!("OpenAPI 操作缺少 {success} 响应: {path}"))
+                else {
+                    panic!("{success} 响应不应为 $ref: {path}")
                 };
                 assert!(
                     !ok.description.trim().is_empty(),
-                    "200 响应缺少 description: {path}"
+                    "{success} 响应缺少 description: {path}"
                 );
 
                 let has_error_code = responses.keys().any(|code| {
@@ -468,9 +487,10 @@ mod openapi_tests {
                 checked += 1;
             }
         }
-        // 覆盖数下限：app_manager（删 create REST 面，31→30）+ userapp_publish 6 端点。
+        // 覆盖数下限：app_manager 30（删 create REST 面）+ userapp_publish 6 端点
+        // + /userapp/ 代理文档 6（开发域 ttyd/vnc/audio/ime + 运行容器 ttyd/pgweb）。
         assert!(
-            checked >= 35,
+            checked >= 41,
             "UserApp OpenAPI 端点覆盖数异常偏少: {checked}"
         );
     }

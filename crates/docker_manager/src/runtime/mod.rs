@@ -3,7 +3,9 @@
 //! This module provides container runtime abstraction to support both
 //! Docker and Kubernetes backends.
 
+pub(crate) mod docker_app_runtime;
 pub mod docker_runtime;
+pub(crate) mod k8s_runtime_helpers;
 pub mod kubernetes_runtime;
 pub mod manager;
 

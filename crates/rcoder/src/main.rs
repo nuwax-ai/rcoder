@@ -2,6 +2,7 @@ mod background_tasks;
 mod batch_migrate;
 mod bootstrap;
 
+mod app_state;
 mod cleanup_task;
 mod config;
 mod config_watcher;
@@ -248,6 +249,14 @@ async fn main() -> anyhow::Result<()> {
     // 注入 runtime 到活动注册表（wake 需要 scale + 查 status；启动早期 OnceLock 为空，此处填充）。
     // trait upcasting: Arc<dyn ContainerRuntime> → Arc<dyn UserAppRuntime>（supertrait，Rust 1.86+）
     activity_registry.set_runtime(runtime.clone());
+
+    // userApp 运行容器终端/数据库代理的 IPv4 解析回填（Docker 模式 ttyd 只 bind
+    // IPv4，见 shared_types::AppRuntimeIpResolver；Pingora 已启动——ArcSwap 槽生效）。
+    if let Some(pingora_service) = proxy_result.pingora_service.as_ref() {
+        pingora_service.set_app_runtime_ip_resolver(Arc::new(
+            proxy_init::DockerRuntimeIpResolver::new(runtime.clone()),
+        ));
+    }
 
     // 阶段2 批量迁移: 启动后台 task 将共享 PVC 老数据一次性迁到 per-agent PVC (env 开关, 默认 false)
     batch_migrate::spawn_if_enabled(runtime.clone());

@@ -15,7 +15,7 @@ use axum::{
 };
 use tower::ServiceExt;
 
-use rcoder::handler::agent_mgmt_handler as handler;
+use rcoder::handler::agent_mgmt as handler;
 
 // === JSON body 反序列化测试 ===
 

@@ -2,6 +2,7 @@
 //!
 //! 提供 ACP 协议集成和 AI 代理管理功能
 
+pub mod app_state;
 pub mod cleanup_task;
 pub mod config;
 pub mod file_server_embed;

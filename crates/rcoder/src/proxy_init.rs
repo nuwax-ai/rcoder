@@ -8,6 +8,37 @@ use tracing::{error, info};
 
 use crate::config::AppConfig;
 
+/// userApp 运行容器 IPv4 解析（Docker 模式；经 `ContainerRuntime` 实时查）。
+///
+/// 动机见 `shared_types::AppRuntimeIpResolver` 文档——dual-stack 网络下容器名
+/// DNS 的 AAAA 会让 pingora 连 IPv6，而 app-runtime 的 ttyd 只 bind IPv4。
+pub struct DockerRuntimeIpResolver {
+    runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
+}
+
+impl DockerRuntimeIpResolver {
+    pub fn new(runtime: Arc<dyn container_runtime_api::ContainerRuntime>) -> Self {
+        Self { runtime }
+    }
+}
+
+#[async_trait::async_trait]
+impl shared_types::AppRuntimeIpResolver for DockerRuntimeIpResolver {
+    async fn resolve_runtime_container_ip(&self, app_id: &str) -> Option<String> {
+        if let Err(e) = shared_types::validate_identifier(app_id, "app_id") {
+            tracing::debug!("[RUNTIME_IP] invalid app_id: {e}");
+            return None;
+        }
+        self.runtime
+            .get_container_info_by_identifier(app_id, &shared_types::ServiceType::UserApp)
+            .await
+            .ok()
+            .flatten()
+            .map(|info| info.container_ip)
+            .filter(|ip| !ip.is_empty())
+    }
+}
+
 pub struct ProxyInitResult {
     pub proxy_handle: Option<tokio::task::JoinHandle<()>>,
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
