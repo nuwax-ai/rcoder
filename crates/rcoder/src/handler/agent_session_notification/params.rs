@@ -9,7 +9,8 @@ use utoipa::{IntoParams, ToSchema};
 /// 会话通知路径参数
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 // pod_id/tenant_id/space_id/isolation_type 是 API 契约预留参数（前端可传，
-// 当前服务端未消费），不可删除，故显式压制 dead_code 警告
+// serde 反序列化消费但服务端暂未读取业务值）；删除会改变对外契约形状，
+// 属 wire 兼容性保留的定向豁免（字段是否消费是产品决策，非 lint 规避）。
 #[allow(dead_code)]
 pub struct SessionNotificationParams {
     /// 会话ID，用于标识特定的会话连接

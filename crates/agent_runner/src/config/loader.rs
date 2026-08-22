@@ -320,18 +320,6 @@ pub fn load_config_with_args(cli_args: CliArgs) -> AppConfig {
     config
 }
 
-/// 加载配置（保留旧接口以保持兼容性）
-pub fn load_config() -> AppConfig {
-    let cli_args = CliArgs {
-        port: None,
-        projects_dir: None,
-        enable_proxy: false,
-        proxy_port: None,
-        default_backend_port: None,
-    };
-    load_config_with_args(cli_args)
-}
-
 /// 从文件加载配置
 fn load_config_from_file() -> anyhow::Result<AppConfig> {
     let config_content = fs::read_to_string(CONFIG_FILE)

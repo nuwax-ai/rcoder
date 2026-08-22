@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// 命令行参数
 #[derive(Parser, Debug)]
-#[command(name = "rcoder")]
+#[command(name = "agent_runner")]
 #[command(about = "AI-powered development platform")]
 #[command(version)]
 pub struct CliArgs {

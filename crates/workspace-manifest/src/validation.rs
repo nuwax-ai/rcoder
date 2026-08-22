@@ -169,8 +169,7 @@ pub fn validate_project_at(manifest: &ProjectManifest, dir: &str) -> Vec<Validat
                 .with_hint("set a human-readable name, e.g. name = \"Java Backend B\""),
         );
     }
-    if validate_argv_issue(&manifest.build.command, "build.command").is_some() {
-        let issue = validate_argv_issue(&manifest.build.command, "build.command").unwrap();
+    if let Some(issue) = validate_argv_issue(&manifest.build.command, "build.command") {
         issues.push(locate(issue).at_field("build.command").with_hint(
             "argv array, e.g. [\"sh\", \"scripts/build.sh\"]; needs a shell? use [\"sh\", \"-c\", \"...\"]",
         ));
@@ -217,13 +216,11 @@ pub fn validate_project_at(manifest: &ProjectManifest, dir: &str) -> Vec<Validat
     if let Some(proxy) = &manifest.proxy
         && let Some(issue) = http_path_issue(&proxy.path, "proxy.path")
     {
-        {
-            issues.push(
-                locate(issue)
-                    .at_field("proxy.path")
-                    .with_hint("absolute URL path, unique per service, e.g. \"/api/java-b/\""),
-            );
-        }
+        issues.push(
+            locate(issue)
+                .at_field("proxy.path")
+                .with_hint("absolute URL path, unique per service, e.g. \"/api/java-b/\""),
+        );
     }
     for (field, path) in [
         ("health.startup_path", &manifest.health.startup_path),
@@ -340,6 +337,7 @@ pub fn collect_topology_issues(projects: &[DiscoveredProject]) -> Vec<Validation
     let mut issues = Vec::new();
     let mut ids: BTreeMap<String, &DiscoveredProject> = BTreeMap::new();
     let mut routes: BTreeMap<String, &DiscoveredProject> = BTreeMap::new();
+    let mut catch_all_reported = false;
     for project in &enabled {
         let id = project.service_id();
         if let Some(previous) = ids.get(id) {
@@ -383,7 +381,10 @@ pub fn collect_topology_issues(projects: &[DiscoveredProject]) -> Vec<Validation
             } else {
                 routes.insert(proxy.path.clone(), project);
             }
+            // catch-all 冲突只报一次（在第二个声明方出现时）：按 catch_all_reported
+            // 去重，N 个 "/" 服务不再产生 N 条几乎相同的报告。
             if proxy.path == "/"
+                && !catch_all_reported
                 && let Some(previous_catch_all) = enabled.iter().find(|other| {
                     other.service_id() != project.service_id()
                         && other
@@ -393,6 +394,7 @@ pub fn collect_topology_issues(projects: &[DiscoveredProject]) -> Vec<Validation
                             .is_some_and(|proxy| proxy.path == "/")
                 })
             {
+                catch_all_reported = true;
                 issues.push(
                     ValidationIssue::new(format!(
                         "multiple catch-all routes (proxy.path = \"/\"): \"{}\" (dir {}) and \"{}\" (dir {})",
@@ -433,7 +435,9 @@ pub fn collect_topology_issues(projects: &[DiscoveredProject]) -> Vec<Validation
                     .at_service(project.service_id())
                     .at_field("run.depends_on")
                     .with_hint(format!(
-                        "either create {dependency}/project.manifest.toml, enable it, or drop the dependency"
+                        "check {dependency}: it may be disabled, missing, or have its own \
+                         validation errors listed above (fix those first — do NOT remove this \
+                         dependency to silence the error)"
                     )),
                 );
             }
@@ -453,6 +457,8 @@ pub fn validate_topology(projects: &[DiscoveredProject]) -> Result<Vec<String>, 
         .iter()
         .filter(|project| project.manifest.project.enabled)
         .collect();
+    // collect_topology_issues 已含环检测（cycle_issues），此处无环必成序——
+    // topological_order 的 cycle Err 分支在此调用路径不可达，仅保留 Ok 语义。
     topological_order(&enabled)
 }
 
@@ -562,7 +568,7 @@ fn collect_log_issues(sources: &[LogSource]) -> Vec<ValidationIssue> {
                     "logs source id must be a DNS-1123 label: {}",
                     source.id
                 ))
-                .at_field(format!("logs.sources[id={}] .id", source.id)),
+                .at_field(format!("logs.sources[id={}].id", source.id)),
             );
         }
         if !ids.insert(&source.id) {

@@ -52,18 +52,31 @@ pub(crate) async fn ensure_workspace_via_dev(
     // 五档退避最坏 120s：agent_runner(file-server 60000) 在宿主高负载（多 builder 并发
     // 构建/对话）下启动可超 30s——原三档 30s 上限在 e2e 六场景并行时实测不够
     // （后发容器被先发容器负载拖慢 → 60000 连接失败）。
+    // 总预算 150s 封顶：无封顶时五档 sleep(120s)+六次 timeout(最坏 180s)≈300s，
+    // 而上游客户端（浏览器/网关 60-120s）必然先超时，服务端剩余退避全部白跑、
+    // 还占用 axum 连接与 tokio task。
     const BACKOFF_SECS: [u64; 5] = [5, 10, 15, 30, 60];
+    const TOTAL_BUDGET_SECS: u64 = 150;
+    let deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(TOTAL_BUDGET_SECS);
     let mut last_err = String::new();
     for (attempt, delay) in std::iter::once(0u64)
         .chain(BACKOFF_SECS.iter().copied())
         .enumerate()
     {
         if attempt > 0 {
+            let sleep = std::time::Duration::from_secs(delay);
+            if tokio::time::Instant::now() + sleep >= deadline {
+                tracing::warn!(
+                    "[USERAPP_FORWARD] ensure-workspace budget {TOTAL_BUDGET_SECS}s exhausted, stop retrying: app_id={app_id}"
+                );
+                break;
+            }
             tracing::info!(
                 "[USERAPP_FORWARD] ensure-workspace retry {}/5 after {delay}s (dev container starting): app_id={app_id}",
                 attempt
             );
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            tokio::time::sleep(sleep).await;
         }
         let resp = crate::http_client::shared_client()
             .post(format!("{addr}/api/userapp/ensure-workspace"))

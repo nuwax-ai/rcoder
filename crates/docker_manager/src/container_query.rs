@@ -685,16 +685,23 @@ impl DockerManager {
         }
 
         // 2. 实时查询 Docker API (构造名称)
-        // 使用 service_config.container_prefix() 获取配置的前缀
-        let prefix = match self.get_service_config(service_type).await {
-            Ok(config) => config.container_prefix().to_string(),
-            Err(e) => {
-                warn!(
-                    "[FIND_CONTAINER] Failed to get service config, using default prefix: service_type={:?}, error={}",
-                    service_type, e
-                );
+        // UserApp/UserAppBuilder 短路多镜像配置查询：这两类从不配置 service image
+        // （get_service_config 必 Err 且每次深克隆 MultiImageConfig + warn 日志），
+        // 前缀直接取 ServiceType 常量——runtime 终端代理每请求走此路径。
+        let prefix = match service_type {
+            shared_types::ServiceType::UserApp | shared_types::ServiceType::UserAppBuilder => {
                 service_type.container_prefix().to_string()
             }
+            _ => match self.get_service_config(service_type).await {
+                Ok(config) => config.container_prefix().to_string(),
+                Err(e) => {
+                    warn!(
+                        "[FIND_CONTAINER] Failed to get service config, using default prefix: service_type={:?}, error={}",
+                        service_type, e
+                    );
+                    service_type.container_prefix().to_string()
+                }
+            },
         };
         // 容器名统一走 DockerUtils::generate_container_name（含合法性校验，与创建路径一致）
         let expected_container_name =
@@ -879,16 +886,23 @@ impl DockerManager {
         }
 
         // 2. 实时查询 Docker API (构造名称)
-        // 使用 service_config.container_prefix() 获取配置的前缀
-        let prefix = match self.get_service_config(service_type).await {
-            Ok(config) => config.container_prefix().to_string(),
-            Err(e) => {
-                warn!(
-                    "[FIND_CONTAINER] Failed to get service config, using default prefix: service_type={:?}, error={}",
-                    service_type, e
-                );
+        // UserApp/UserAppBuilder 短路多镜像配置查询：这两类从不配置 service image
+        // （get_service_config 必 Err 且每次深克隆 MultiImageConfig + warn 日志），
+        // 前缀直接取 ServiceType 常量——runtime 终端代理每请求走此路径。
+        let prefix = match service_type {
+            shared_types::ServiceType::UserApp | shared_types::ServiceType::UserAppBuilder => {
                 service_type.container_prefix().to_string()
             }
+            _ => match self.get_service_config(service_type).await {
+                Ok(config) => config.container_prefix().to_string(),
+                Err(e) => {
+                    warn!(
+                        "[FIND_CONTAINER] Failed to get service config, using default prefix: service_type={:?}, error={}",
+                        service_type, e
+                    );
+                    service_type.container_prefix().to_string()
+                }
+            },
         };
         // 容器名统一走 DockerUtils::generate_container_name（含合法性校验，与创建路径一致）
         let expected_container_name =

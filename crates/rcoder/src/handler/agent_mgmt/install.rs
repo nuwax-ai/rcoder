@@ -4,10 +4,8 @@ use axum::Json;
 use axum::extract::State;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-#[allow(unused_imports)] // `json!` 仅在 `#[schema(example = json!(...))]` 宏内使用
-use serde_json::json;
 use shared_types::{
-    AgentIdentity, AppError, HttpResult, InstallType, RoutingParams, ServiceType, error_codes as ec,
+    AgentIdentity, AppError, HttpResult, InstallType, RoutingParams, error_codes as ec,
 };
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -142,7 +140,7 @@ pub async fn install_agent(
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             "file" => {
-                // 写入临时文件,避免大文件常驻内存;上传过程中边收边写,
+                // 写入临时文件,串行化接收并推迟内存峰值时刻（fwd_install 需完整 Bytes，峰值仍为文件全量）;上传过程中边收边写,
                 // 仅在转发时才整体读回 Bytes。
                 // 使用 channel 将 chunk 流式传到阻塞线程,逐块落盘。
                 let mut total: u64 = 0;
@@ -352,12 +350,7 @@ pub async fn install_from_url(
         ));
     }
 
-    // 根据参数动态判断 ServiceType
-    let service_type = if body.routing.user_id.is_some() || body.routing.pod_id.is_some() {
-        ServiceType::ComputerAgentRunner
-    } else {
-        ServiceType::WebAgentRunner
-    };
+    let service_type = super::helpers::infer_service_type(&body.routing);
 
     let strategy = super::super::agent_install_strategy::create_strategy(&service_type)
         .ok_or_else(|| {
@@ -368,10 +361,7 @@ pub async fn install_from_url(
         })?;
 
     // 构造最小化的 ProjectAndContainerInfo 用于解析安装目录
-    let mut project = shared_types::ProjectAndContainerInfo::new(String::new());
-    project.set_user_id(body.routing.user_id.clone());
-    project.set_pod_id(body.routing.pod_id.clone());
-    project.set_service_type(Some(service_type.clone()));
+    let project = super::helpers::minimal_install_project(&body.routing, service_type.clone());
 
     let install_ctx = strategy.resolve_install_context(&project, &body.routing)?;
 

@@ -17,17 +17,17 @@ use super::kubernetes_runtime::KubernetesRuntime;
 
 impl KubernetesRuntime {
     /// Get the Pod API
-    pub(crate) fn pods(&self) -> Api<Pod> {
+    pub(super) fn pods(&self) -> Api<Pod> {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
     /// Get the PVC API
-    pub(crate) fn pvcs(&self) -> Api<PersistentVolumeClaim> {
+    pub(super) fn pvcs(&self) -> Api<PersistentVolumeClaim> {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
     /// Get the HTTPRoute API（gateway.networking.k8s.io/v1 动态资源；apply / delete by name / label 扫 / 条件删共用）
-    pub(crate) fn httproute_api(&self) -> Api<DynamicObject> {
+    pub(super) fn httproute_api(&self) -> Api<DynamicObject> {
         let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
         let ar = ApiResource::from_gvk(&gvk);
         Api::namespaced_with(self.client.clone(), &self.namespace, &ar)
@@ -36,11 +36,11 @@ impl KubernetesRuntime {
     /// Get the PV API (cluster-scoped)
     ///
     /// 阶段2: 读 PV `csi.volumeAttributes.subvolumePath` (rcoder 挂根聚合)。
-    pub(crate) fn pvs(&self) -> Api<PersistentVolume> {
+    pub(super) fn pvs(&self) -> Api<PersistentVolume> {
         Api::<PersistentVolume>::all(self.client.clone())
     }
 
-    pub(crate) fn service_container_prefix(
+    pub(super) fn service_container_prefix(
         &self,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
@@ -68,7 +68,7 @@ impl KubernetesRuntime {
         Ok(service_type.container_prefix().to_string())
     }
 
-    pub(crate) fn sanitize_k8s_name_part(input: &str) -> String {
+    pub(super) fn sanitize_k8s_name_part(input: &str) -> String {
         input
             .to_ascii_lowercase()
             .chars()
@@ -89,7 +89,7 @@ impl KubernetesRuntime {
     /// 优先级:env(RCODER_DOCKER_IMAGE* / RCODER_DOCKER_IMAGE_COMPUTER)> `kubernetes_config`
     /// (完全分家后的主数据源)> `multi_image_config`(docker_config,过渡期安全兜底,
     /// 避免旧 chart 未带 kubernetes_config 时选不到镜像)> 硬编码默认值。
-    pub(crate) fn select_image(&self, service_type: &ServiceType) -> String {
+    pub(super) fn select_image(&self, service_type: &ServiceType) -> String {
         // 1. 优先使用环境变量（允许运行时覆盖;deployment.yaml 注入）
         // 注意：ComputerAgentRunner 必须优先检查 RCODER_DOCKER_IMAGE_COMPUTER
         match service_type {
@@ -215,7 +215,7 @@ impl KubernetesRuntime {
     /// 委派给共享 `build_decoupled_resources`（与 UserApp 侧 `build_app_resource_requirements`
     /// 共用 requests/limits 解耦策略，值一致）。仅在此做入参转换：ServiceResourceLimits 的
     /// memory(bytes f64）/cpu（核数 f64）归一化为 K8s Quantity 字符串。
-    pub(crate) fn build_resource_requirements(
+    pub(super) fn build_resource_requirements(
         limits: &ServiceResourceLimits,
     ) -> Option<ResourceRequirements> {
         // memory 字节 → Mi；cpu 核数 → 十进制字符串（K8s Quantity 原生接受）
@@ -254,7 +254,7 @@ impl KubernetesRuntime {
     }
 
     /// Build container basic info from runtime container info
-    pub(crate) async fn build_container_basic_info(
+    pub(super) async fn build_container_basic_info(
         &self,
         project_id: &str,
         pod_info: &RuntimeContainerInfo,

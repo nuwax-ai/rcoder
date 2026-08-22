@@ -24,8 +24,6 @@
 //! 所有错误用 `AppError` 表达(axum 自动映射成 HTTP 状态 + 业务错误码 JSON)。
 //! 18 个 agent-runner 业务码 + 2 个转发层专用码(见 `error_codes`)。
 
-// === HTTP 请求体(与 gRPC proto 解耦) ===
-
 mod helpers;
 mod install;
 mod query;

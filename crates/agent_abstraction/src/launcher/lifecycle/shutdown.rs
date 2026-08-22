@@ -174,7 +174,7 @@ impl AgentLifecycleGuard {
 
         #[cfg(not(unix))]
         {
-            debug!("Unix platform, skipping process group stop");
+            debug!("Non-Unix platform, skipping process group stop");
         }
 
         Ok(())
@@ -264,7 +264,7 @@ impl Drop for AgentLifecycleGuard {
 
             #[cfg(not(unix))]
             {
-                debug!("[Claude] Unix platform, skipping process group stop");
+                debug!("[Claude] Non-Unix platform, skipping process group stop");
             }
 
             // 注意：后台回收任务 (reaper_task) 会自动完成

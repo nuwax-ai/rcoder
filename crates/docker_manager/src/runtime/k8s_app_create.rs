@@ -285,19 +285,22 @@ impl KubernetesRuntime {
                     .collect()
             })
             .unwrap_or_default();
-        if ports.is_empty() {
-            return Ok(());
-        }
+        let mut ports = ports;
         // 运行容器终端/PG 控制台固定端口随 Service 一并暴露——
         // `/userapp/{ttyd,pgweb}/{app_id}/runtime` 代理上游为 Service FQDN，
         // 若 7681/8081 不在 Service ports 内，代理连接将超时（app-runtime
         // 镜像 supervisor 恒起 ttyd/pgweb，targetPort 恒可达）。
-        let mut ports = ports;
+        // 用户 ports 为空时同样需要本 Service（仅含 ttyd/pgweb 也建）——
+        // 平台内定四要素下 ports 恒非空，此分支防御直接 REST create 的调用方。
         for (name, port) in [
             ("ttyd", shared_types::TTYD_PORT),
             ("pgweb", shared_types::PGWEB_PORT),
         ] {
-            let already = ports.iter().any(|p| p.port == port as i32);
+            // 同名同值才算已存在：仅端口号命中而 name 不同时会造出两个同名
+            // ServicePort（K8s 校验 port names must be unique 拒绝整个对象）。
+            let already = ports
+                .iter()
+                .any(|p| p.name.as_deref() == Some(name) && p.port == port as i32);
             if !already {
                 ports.push(ServicePort {
                     name: Some(name.to_string()),

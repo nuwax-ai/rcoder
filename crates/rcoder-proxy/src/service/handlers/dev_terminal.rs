@@ -355,15 +355,21 @@ async fn find_runtime_addr(
     {
         return Ok(ip);
     }
-    container_lookup
-        .as_ref()
-        .and_then(|lookup| lookup.find_app_runtime_addr(app_id))
-        .ok_or_else(|| {
-            info!("[RUNTIME_TERMINAL] runtime addr unavailable: app_id={app_id}");
-            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
-                format!("runtime address for app {app_id} unavailable (not deployed?)"),
-            )
-        })
+    // lookup 未注入是装配缺陷（基础设施问题，所有 app 一致失败），与
+    // "app 未部署"（连接失败 502，由确定性命名构造不查存在性保证）语义不同——
+    // 前者 503 明示，避免误导排障方向。
+    let lookup = container_lookup.as_ref().ok_or_else(|| {
+        error!("[RUNTIME_TERMINAL] container lookup not configured (proxy assembly defect)");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(503)).more_context(
+            "container lookup not configured for runtime terminal proxy".to_string(),
+        )
+    })?;
+    lookup.find_app_runtime_addr(app_id).ok_or_else(|| {
+        info!("[RUNTIME_TERMINAL] runtime addr unavailable: app_id={app_id}");
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
+            format!("runtime address for app {app_id} unavailable"),
+        )
+    })
 }
 
 /// `/userapp/ttyd/{app_id}/runtime/{*path}` 请求重写（直连 ttyd 本体 7681）。

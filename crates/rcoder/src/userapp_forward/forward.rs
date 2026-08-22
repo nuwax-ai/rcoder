@@ -41,8 +41,10 @@ const HOP_BY_HOP: [&str; 10] = [
 /// 判定请求/响应头是否逐跳剥离：静态表 ∪ `Connection` 头动态列出的头
 /// （RFC 9110 §7.6.1：`Connection: X-Foo` 则 X-Foo 亦是逐跳——静态表无法穷尽）。
 fn is_hop_by_hop(name: &str, connection_listed: &[&str]) -> bool {
-    let lower = name.to_ascii_lowercase();
-    HOP_BY_HOP.contains(&lower.as_str()) || connection_listed.contains(&lower.as_str())
+    HOP_BY_HOP.contains(&name.to_ascii_lowercase().as_str())
+        || connection_listed
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(name))
 }
 
 /// 从 headers 提取 Connection 头动态声明的逐跳头名列表（小写化）。
@@ -166,12 +168,11 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
 
     let (parts, body) = req.into_parts();
     let listed = connection_listed_tokens(&parts.headers);
+    // 循环外一次构造引用视图（原先每个 header 重建一次 Vec）
+    let listed_refs: Vec<&str> = listed.iter().map(String::as_str).collect();
     let mut outbound = crate::http_client::shared_client().request(parts.method, &target);
     for (name, value) in &parts.headers {
-        if is_hop_by_hop(
-            name.as_str(),
-            &listed.iter().map(String::as_str).collect::<Vec<_>>(),
-        ) {
+        if is_hop_by_hop(name.as_str(), &listed_refs) {
             continue;
         }
         outbound = outbound.header(name, value);
@@ -192,12 +193,10 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
 
     let status = upstream.status();
     let resp_listed = connection_listed_tokens(upstream.headers());
+    let resp_listed_refs: Vec<&str> = resp_listed.iter().map(String::as_str).collect();
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream.headers() {
-        if is_hop_by_hop(
-            name.as_str(),
-            &resp_listed.iter().map(String::as_str).collect::<Vec<_>>(),
-        ) {
+        if is_hop_by_hop(name.as_str(), &resp_listed_refs) {
             continue;
         }
         builder = builder.header(name, value);

@@ -12,7 +12,7 @@ use crate::*;
 /// K8s 下容器刚创建时 Pod 虽已 Ready，但 agent_runner 的 gRPC server 可能仍在启动，
 /// 直接转发 Chat RPC 会 transport error。这里仿照 computer_chat_handler 做状态探活，
 /// 并加重试以真正等待 gRPC server 就绪（正常情况下首次即成功，无额外延迟）。
-pub(crate) async fn probe_agent_runner_readiness(
+pub(super) async fn probe_agent_runner_readiness(
     state: &Arc<AppState>,
     container_info: &ContainerBasicInfo,
     project_id: &str,

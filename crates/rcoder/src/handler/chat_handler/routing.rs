@@ -17,7 +17,7 @@ use crate::{AppError, HttpResult, router::AppState};
 /// 第一步：获取或创建容器（默认使用 ServiceType::WebAgentRunner）；
 /// 第二步：获取或创建 ProjectAndContainerInfo（使用存储）；
 /// 随后立即更新活动时间，防止 gRPC 请求期间被 cleanup_task 误清理。
-pub(crate) async fn resolve_container_target(
+pub(super) async fn resolve_container_target(
     state: &Arc<AppState>,
     request: &AgentChatRequest,
     project_id: &str,
@@ -46,7 +46,7 @@ pub(crate) async fn resolve_container_target(
         service::container_manager::ContainerManager::get_or_create_container(container_options)
             .await?;
 
-    // 第二步：获取或创建 ProjectAndContainerInfo - 使用 存储
+    // 第二步：获取或创建 ProjectAndContainerInfo - 使用存储
     drop(ensure_project_record(
         state,
         request,
@@ -64,7 +64,7 @@ pub(crate) async fn resolve_container_target(
 }
 
 /// 获取或创建 ProjectAndContainerInfo（存在则按需更新扩展状态，不存在则新建）
-pub(crate) fn ensure_project_record(
+pub(super) fn ensure_project_record(
     state: &Arc<AppState>,
     request: &AgentChatRequest,
     project_id: &str,
@@ -161,7 +161,7 @@ pub(crate) fn ensure_project_record(
 
 /// 自动安装检查：如果 agent_server 携带 platforms，必须同时提供 agent_id、command、version
 /// 内置 agent（容器预装）跳过安装逻辑
-pub(crate) async fn ensure_chat_agent_installed_if_needed(
+pub(super) async fn ensure_chat_agent_installed_if_needed(
     state: &Arc<AppState>,
     request: &AgentChatRequest,
     project_id: &str,
@@ -248,7 +248,7 @@ pub(crate) async fn ensure_chat_agent_installed_if_needed(
 /// 🆕 自动查找 session_id 逻辑
 /// 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id，
 /// 并克隆 request 注入解析后的 session_id 用于转发。
-pub(crate) fn resolve_chat_forward_request(
+pub(super) fn resolve_chat_forward_request(
     state: &Arc<AppState>,
     request: &AgentChatRequest,
     project_id: &str,

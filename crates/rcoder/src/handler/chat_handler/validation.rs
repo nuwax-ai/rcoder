@@ -17,7 +17,7 @@ use super::types::ChatRouteTarget;
 /// 包含：project_id 生成、work_dir_id 解析与校验、隔离类型参数校验、
 /// 工作空间路径构建、资源限制校验。
 #[allow(clippy::result_large_err)]
-pub(crate) fn validate_and_route_chat_request(
+pub(super) fn validate_and_route_chat_request(
     request: &mut AgentChatRequest,
     locale: &'static str,
 ) -> Result<ChatRouteTarget, ChatFlowExit> {
@@ -107,7 +107,7 @@ pub(crate) fn validate_and_route_chat_request(
 /// 隔离类型参数校验：pod_id 存在时 isolation_type/tenant_id/space_id 必须非空，
 /// 且 isolation_type 值有效（大小写不敏感）
 #[allow(clippy::result_large_err)]
-pub(crate) fn validate_chat_isolation_params(
+pub(super) fn validate_chat_isolation_params(
     request: &AgentChatRequest,
     locale: &'static str,
 ) -> Result<(), ChatFlowExit> {

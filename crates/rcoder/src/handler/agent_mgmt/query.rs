@@ -2,7 +2,7 @@
 
 use axum::Json;
 use axum::extract::State;
-use shared_types::{AppError, HttpResult, InstallType, ServiceType, error_codes as ec};
+use shared_types::{AppError, HttpResult, InstallType, error_codes as ec};
 use std::sync::Arc;
 use tracing::{instrument, warn};
 
@@ -70,19 +70,12 @@ pub async fn list_agents(
 
     // 优先从文件直接读取注册表（支持 rcoder 直接安装的场景）
     // 根据参数动态判断 ServiceType
-    let service_type = if body.routing.user_id.is_some() || body.routing.pod_id.is_some() {
-        ServiceType::ComputerAgentRunner
-    } else {
-        ServiceType::WebAgentRunner
-    };
+    let service_type = super::helpers::infer_service_type(&body.routing);
 
     let strategy = super::super::agent_install_strategy::create_strategy(&service_type);
     if let Some(strategy) = strategy {
         // 构造最小化的 ProjectAndContainerInfo 用于解析安装目录
-        let mut project = shared_types::ProjectAndContainerInfo::new(String::new());
-        project.set_user_id(body.routing.user_id.clone());
-        project.set_pod_id(body.routing.pod_id.clone());
-        project.set_service_type(Some(service_type));
+        let project = super::helpers::minimal_install_project(&body.routing, service_type);
 
         if let Ok(install_ctx) = strategy.resolve_install_context(&project, &body.routing) {
             let registry_path = install_ctx.install_dir.join("registry.json");

@@ -5,9 +5,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
-use shared_types::NOVNC_PORT;
 use std::sync::Arc;
-use tracing::{info, warn};
 use utoipa::ToSchema;
 
 use super::super::utils::I18nPath;
@@ -170,7 +168,6 @@ ws.send('ls -la\n'); // 发送命令
 ```
 "#
 )]
-#[allow(dead_code)]
 pub async fn computer_ttyd_proxy(
     State(_state): State<Arc<AppState>>,
     I18nPath((user_id, project_id, path)): I18nPath<(String, String, Option<String>)>,
@@ -193,32 +190,6 @@ pub async fn computer_ttyd_proxy(
 // ============================================================================
 // 辅助函数
 // ============================================================================
-
-/// 检查 VNC 服务是否可用
-///
-/// 尝试连接到容器的 noVNC 端口，验证服务是否运行
-#[allow(dead_code)]
-async fn check_vnc_available(container_ip: &str) -> bool {
-    use tokio::net::TcpStream;
-    use tokio::time::{Duration, timeout};
-
-    let addr = format!("{}:{}", container_ip, NOVNC_PORT);
-
-    match timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await {
-        Ok(Ok(_)) => {
-            info!("[DESKTOP_VNC] VNC reachable: {}", addr);
-            true
-        }
-        Ok(Err(e)) => {
-            warn!("[DESKTOP_VNC] VNC connectionfailed: {} - {}", addr, e);
-            false
-        }
-        Err(_) => {
-            warn!("[DESKTOP_VNC] VNC connectiontimeout: {}", addr);
-            false
-        }
-    }
-}
 
 // ============================================================================
 // 单元测试

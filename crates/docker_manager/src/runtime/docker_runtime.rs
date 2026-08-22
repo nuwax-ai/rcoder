@@ -21,14 +21,14 @@ use crate::DockerManager;
 
 /// Docker 内存态回收策略（Docker 无 K8s 注解；字段 None = 未设/沿用默认）。
 #[derive(Clone, Copy, Default)]
-pub(crate) struct RecyclePolicy {
-    pub(crate) recycle_enabled: Option<bool>,
-    pub(crate) idle_timeout_seconds: Option<u64>,
+pub(super) struct RecyclePolicy {
+    pub(super) recycle_enabled: Option<bool>,
+    pub(super) idle_timeout_seconds: Option<u64>,
 }
 
 impl RecyclePolicy {
     /// merge：参数为 None 则保留旧值（self），Some 则覆盖。返回新策略。
-    pub(crate) fn merge(
+    pub(super) fn merge(
         self,
         recycle_enabled: Option<bool>,
         idle_timeout_seconds: Option<u64>,
@@ -42,12 +42,12 @@ impl RecyclePolicy {
 
 /// Docker runtime implementation wrapping DockerManager
 pub struct DockerRuntime {
-    pub(crate) inner: Arc<DockerManager>,
+    pub(super) inner: Arc<DockerManager>,
     /// TTL cache for list_containers result (15 seconds)
     list_cache: Cache<(), Vec<RuntimeContainerInfo>>,
     /// UserApp 闲置回收策略（Docker 无 K8s 注解，改用内存态；dev 模式可接受重启丢失，
     /// 与 pingora_ports 同架构）。app_id → RecyclePolicy，merge 语义。
-    pub(crate) recycle_policy: DashMap<String, RecyclePolicy>,
+    pub(super) recycle_policy: DashMap<String, RecyclePolicy>,
 }
 
 impl DockerRuntime {
@@ -64,7 +64,7 @@ impl DockerRuntime {
     }
 
     /// 读 app 的回收策略（内存态）。未设置 → 默认（recyclable）。
-    pub(crate) fn recycle_policy_of(&self, app_id: &str) -> RecyclePolicy {
+    pub(super) fn recycle_policy_of(&self, app_id: &str) -> RecyclePolicy {
         self.recycle_policy
             .get(app_id)
             .map(|e| *e.value())
@@ -402,19 +402,19 @@ impl DockerRuntime {
 /// UserApp 容器/Deployment 命名（单一来源，与 K8s 侧 `KubernetesRuntime::app_deployment_name` 对称）。
 ///
 /// 前缀取自 `ServiceType::UserApp::container_prefix()`，避免散落硬编码；改前缀只需改一处。
-pub(crate) fn app_deployment_name(app_id: &str) -> String {
+pub(super) fn app_deployment_name(app_id: &str) -> String {
     format!("{}-{app_id}", ServiceType::UserApp.container_prefix())
 }
 
 /// 容器 ports 元数据 label（update live 回退数据源；编码 "8080:http,5432:tcp"，
 /// 与 K8s `rcoder.io/port-expose` 注解同构——Docker 侧 Http/Tcp 均无完整运行时
 /// 落地可反推，见 create_deployment 内注释）。
-pub(crate) const APP_PORTS_LABEL: &str = "rcoder.io/app-ports";
+pub(super) const APP_PORTS_LABEL: &str = "rcoder.io/app-ports";
 /// 容器 command 元数据 label（JSON 数组；create 时用户显式设置才写入）。
-pub(crate) const APP_COMMAND_LABEL: &str = "rcoder.io/app-command";
+pub(super) const APP_COMMAND_LABEL: &str = "rcoder.io/app-command";
 
 /// ports → label 值（按端口排序编码，顺序无关 → 字符串稳定，避免无谓容器 diff）。
-pub(crate) fn encode_ports_label(ports: &[AppPortSpec]) -> String {
+pub(super) fn encode_ports_label(ports: &[AppPortSpec]) -> String {
     let mut entries: Vec<(u16, &ExposeType)> =
         ports.iter().map(|p| (p.port, &p.expose_type)).collect();
     entries.sort_by_key(|(port, _)| *port);
@@ -427,7 +427,7 @@ pub(crate) fn encode_ports_label(ports: &[AppPortSpec]) -> String {
 
 /// label 值 → ports（容错：非法条目跳过；name 空串/strip_prefix None——Docker 单机
 /// 模式这两项无运行时语义）。
-pub(crate) fn parse_ports_label(raw: &str) -> Vec<AppPortSpec> {
+pub(super) fn parse_ports_label(raw: &str) -> Vec<AppPortSpec> {
     raw.split(',')
         .filter_map(|entry| {
             let mut it = entry.split(':');
@@ -446,7 +446,7 @@ pub(crate) fn parse_ports_label(raw: &str) -> Vec<AppPortSpec> {
         .collect()
 }
 
-pub(crate) fn expose_type_str(e: &ExposeType) -> &'static str {
+pub(super) fn expose_type_str(e: &ExposeType) -> &'static str {
     match e {
         ExposeType::Http => "http",
         ExposeType::Tcp => "tcp",
@@ -455,7 +455,7 @@ pub(crate) fn expose_type_str(e: &ExposeType) -> &'static str {
 
 /// Docker `NanoCpus`（1 核 = 1e9）→ K8s Quantity 核数字符串（"1"/"0.5"）。
 /// update 回退用：读回的值将再次下发为 K8s/Docker 资源限制。
-pub(crate) fn docker_cpus_to_quantity(nano_cpus: i64) -> String {
+pub(super) fn docker_cpus_to_quantity(nano_cpus: i64) -> String {
     let cores = nano_cpus as f64 / 1e9;
     if cores.fract() == 0.0 {
         format!("{}", cores as i64)
@@ -467,7 +467,7 @@ pub(crate) fn docker_cpus_to_quantity(nano_cpus: i64) -> String {
 /// Docker 字节内存限制 → K8s Quantity 字符串（无损换算：优先整 Gi/Mi/Ki 档，非整档
 /// 用更细档位精确表示——1.5Gi=1536Mi 而非缩水成 1Gi；非 Ki 整数倍的罕见值直接输出
 /// 字节数，K8s Quantity 合法且无损）。
-pub(crate) fn docker_memory_to_quantity(bytes: i64) -> String {
+pub(super) fn docker_memory_to_quantity(bytes: i64) -> String {
     const KI: i64 = 1024;
     const MI: i64 = 1024 * 1024;
     const GI: i64 = 1024 * 1024 * 1024;
@@ -503,7 +503,7 @@ fn map_container_status(status: &crate::types::ContainerStatus) -> ContainerRunt
 ///
 /// Docker 容器可能同时连接多个网络（主网络 + 自定义），`networks.values().next()`
 /// 会非确定性地取一个。优先按主网络名定位，确保拿到 Pingora backend 应指向的 IP。
-pub(crate) fn extract_container_ip(
+pub(super) fn extract_container_ip(
     inspect: &bollard::models::ContainerInspectResponse,
     preferred_network: Option<&str>,
 ) -> String {
@@ -533,7 +533,7 @@ pub(crate) fn extract_container_ip(
 /// Docker 仅对 TCP 端口做 port_bindings（create_deployment 时），HTTP 端口走 Pingora
 /// 不做 binding，故此处只还原 TCP；name 用 `tcp-{port}`（Docker 无端口名概念，调用方
 /// 按 port 而非 name 匹配 external_port）。
-pub(crate) fn extract_container_ports(
+pub(super) fn extract_container_ports(
     inspect: &bollard::models::ContainerInspectResponse,
 ) -> Vec<AppPortStatus> {
     let Some(ports_map) = inspect

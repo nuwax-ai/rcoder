@@ -69,12 +69,25 @@ pub fn discover_projects_lenient(
 ) -> Result<(Vec<DiscoveredProject>, Vec<ValidationIssue>), DiscoverError> {
     let mut discovered: Vec<(String, ProjectManifest)> = Vec::new();
     let mut issues = Vec::new();
-    let mut entries: Vec<_> = std::fs::read_dir(ws_root)
+    let dir_entries = std::fs::read_dir(ws_root)
         .map_err(|error| DiscoverError::ReadDir {
             path: ws_root.display().to_string(),
             source: error.to_string(),
         })?
-        .filter_map(|entry| entry.ok())
+        .collect::<Vec<_>>();
+    // 枚举 IO 错误收集为 issue（不静默吞掉——模块缺失会引发 depends_on 连锁误报）。
+    let mut entries: Vec<_> = dir_entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                issues.push(
+                    ValidationIssue::new(format!("directory entry read failed: {error}"))
+                        .at_file(ws_root.display().to_string()),
+                );
+                None
+            }
+        })
         .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
         .map(|entry| {
             let dir = entry.file_name().to_string_lossy().to_string();

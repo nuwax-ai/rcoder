@@ -170,8 +170,13 @@ impl AppService {
                 .patch_wake_on_traffic(app_id, enabled)
                 .await
                 .map_err(|e| {
+                    // recycle 字段已生效（上方 patch 成功）：整体报错需注明部分
+                    // 生效态，避免计费侧按"全部未生效"重放整组 patch。
                     map_runtime_error(
-                        &format!("[APP] patch_wake_on_traffic failed app_id={app_id}"),
+                        &format!(
+                            "[APP] patch_wake_on_traffic failed app_id={app_id} \
+                             (recycle_enabled/idle_timeout already applied)",
+                        ),
                         e,
                     )
                 })?;

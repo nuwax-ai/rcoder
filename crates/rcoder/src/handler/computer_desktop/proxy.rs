@@ -157,7 +157,6 @@ window.open('/computer/vnc/user_123/proj_456/vnc.html', '_blank');
 ```
 "#
 )]
-#[allow(dead_code)]
 pub async fn computer_desktop_proxy(
     State(_state): State<Arc<AppState>>,
     I18nPath((user_id, project_id, path)): I18nPath<(String, String, Option<String>)>,

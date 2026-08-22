@@ -90,6 +90,14 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             "/computer/desktop/{user_id}/{project_id}",
             get(handler::computer_desktop_vnc),
         )
+        .route(
+            "/computer/desktop-proxy/{user_id}/{project_id}/{*path}",
+            get(handler::computer_desktop_proxy),
+        )
+        .route(
+            "/computer/ttyd/{user_id}/{project_id}/{*path}",
+            get(handler::computer_ttyd_proxy),
+        )
         // Pod 容器管理接口
         .route("/computer/pod/count", get(handler::pod_count))
         .route("/computer/pod/list", get(handler::pod_list))

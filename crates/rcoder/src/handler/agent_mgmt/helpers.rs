@@ -4,7 +4,9 @@
 
 use std::str::FromStr;
 
-use shared_types::{AppError, IsolationType, RoutingParams, ServiceType, error_codes as ec};
+use shared_types::{
+    AppError, IsolationType, ProjectAndContainerInfo, RoutingParams, ServiceType, error_codes as ec,
+};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -83,7 +85,7 @@ pub(super) async fn resolve_container_target(
     state: &Arc<AppState>,
     project_id: Option<&str>,
     routing: &RoutingParams,
-) -> Result<Arc<shared_types::ProjectAndContainerInfo>, AppError> {
+) -> Result<Arc<ProjectAndContainerInfo>, AppError> {
     // Path A: project_id 优先（向后兼容）
     if let Some(pid) = project_id.filter(|s| !s.is_empty()) {
         return state.get_project(pid).ok_or_else(|| {
@@ -120,7 +122,7 @@ pub(super) async fn resolve_container_target(
                 )
             })?;
 
-        let mut info = shared_types::ProjectAndContainerInfo::new(String::new());
+        let mut info = ProjectAndContainerInfo::new(String::new());
         info.set_user_id(routing.user_id.clone());
         info.set_pod_id(routing.pod_id.clone());
         info.set_container(Some(container_info));
@@ -135,6 +137,28 @@ pub(super) async fn resolve_container_target(
     ))
 }
 
+/// 从 routing 参数推断 ServiceType（query/install 两域共用：user_id/pod_id 任一
+/// 存在 → ComputerAgentRunner 沙箱语义，否则 WebAgentRunner 项目语义）。
+pub(super) fn infer_service_type(routing: &RoutingParams) -> ServiceType {
+    if routing.user_id.is_some() || routing.pod_id.is_some() {
+        ServiceType::ComputerAgentRunner
+    } else {
+        ServiceType::WebAgentRunner
+    }
+}
+
+/// 构造最小化 ProjectAndContainerInfo（安装目录解析只需 user/pod/service_type）。
+pub(super) fn minimal_install_project(
+    routing: &RoutingParams,
+    service_type: ServiceType,
+) -> ProjectAndContainerInfo {
+    let mut project = ProjectAndContainerInfo::new(String::new());
+    project.set_user_id(routing.user_id.clone());
+    project.set_pod_id(routing.pod_id.clone());
+    project.set_service_type(Some(service_type));
+    project
+}
+
 pub(super) fn build_ctx(state: &Arc<AppState>) -> AgentMgmtForwardCtx {
     AgentMgmtForwardCtx::from_state(
         state.grpc_pool.clone(),
@@ -143,5 +167,3 @@ pub(super) fn build_ctx(state: &Arc<AppState>) -> AgentMgmtForwardCtx {
         shared_types::current_request_locale(),
     )
 }
-
-// === Handlers ===

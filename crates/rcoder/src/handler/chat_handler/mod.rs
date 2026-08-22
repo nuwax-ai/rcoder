@@ -14,11 +14,11 @@ mod routing;
 mod types;
 mod validation;
 
-pub(crate) use probe::probe_agent_runner_readiness;
-pub(crate) use routing::{
+use probe::probe_agent_runner_readiness;
+use routing::{
     ensure_chat_agent_installed_if_needed, resolve_chat_forward_request, resolve_container_target,
 };
-pub(crate) use validation::validate_and_route_chat_request;
+use validation::validate_and_route_chat_request;
 
 use types::{ChatRouteTarget, ForwardContext};
 
@@ -152,8 +152,6 @@ async fn run_chat_flow(
         namespace: &state.config.app_manager.namespace,
         cluster_domain: &state.cluster_domain,
         runtime: state.runtime(),
-        rcoder_prefix: &state.container_prefix_rcoder,
-        computer_prefix: &state.container_prefix_computer,
         locale,
     };
     let result =
@@ -177,7 +175,7 @@ async fn run_chat_flow(
     result.map_err(ChatFlowExit::Fatal)
 }
 
-/// 响应后状态更新 - 使用 存储
+/// 响应后状态更新 - 使用存储
 /// 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
 /// 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
 fn update_session_mapping_from_response(

@@ -447,7 +447,7 @@ mod prompt_channel_tests {
     use crate::session::session_manager::send_prompt_to_entry;
     use agent_client_protocol::schema::v1::{PromptRequest, SessionId};
     use chrono::Utc;
-    use shared_types::{AgentStatus, ModelProviderConfig, ProjectAndAgentInfo};
+    use shared_types::{AgentStatus, ProjectAndAgentInfo};
     use tokio::sync::mpsc;
 
     /// 构造仅含通道语义的测试 entry（lifecycle 等与本测试无关字段留 None）
@@ -525,8 +525,6 @@ mod prompt_channel_tests {
     }
 
     // ModelProviderConfig 引用占位（构造完整 entry 的后续场景用）
-    #[allow(dead_code)]
-    fn _model_config_marker(_: Option<ModelProviderConfig>) {}
 }
 
 #[cfg(test)]
