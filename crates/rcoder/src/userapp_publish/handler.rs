@@ -41,7 +41,6 @@ use super::{CancelAttempt, PublishEvent, PublishTaskKind, PublishTaskSnapshot};
 pub fn routes() -> axum::Router<Arc<AppState>> {
     use axum::routing::{get, post};
     axum::Router::new()
-        .route("/api/v1/apps/{app_id}/publish", post(publish))
         .route("/api/v1/apps/{app_id}/build", post(build))
         .route("/api/v1/apps/publish/tasks/query", post(query_tasks))
         .route("/api/v1/apps/publish/tasks/{task_id}", get(get_task))
@@ -98,88 +97,9 @@ fn validate_publish_identifiers(app_id: &str, project_id: &str) -> Result<(), Ap
     Ok(())
 }
 
-/// `POST /api/v1/apps/{app_id}/publish` —— 一键自动构建发布。
-///
-/// UserAppBuilder 自动 ensure:未注册(含 rcoder 重启后注册丢失)时创建并注册,
-/// 调用方无需先建 builder;ensure 过程经 SSE `stage=EnsureBuilder` 可见,失败以任务
-/// `failed` 终态呈现。
-#[utoipa::path(
-    post,
-    path = "/api/v1/apps/{app_id}/publish",
-    params(("app_id" = String, Path)),
-    request_body = PublishBody,
-    responses(
-        (status = 200, body = HttpResult<PublishTaskData>, description = "Publish task created"),
-        (status = 400, description = "Invalid app_id / project_id"),
-        (status = 409, description = "App already has an active publish/build task"),
-        (status = 429, description = "Publish task capacity exhausted"),
-        (status = 500, description = "Internal server error")
-    ),
-    tag = "UserApp 发布"
-)]
-pub async fn publish(
-    State(state): State<Arc<AppState>>,
-    Path(app_id): Path<String>,
-    Json(body): Json<PublishBody>,
-) -> Result<Json<HttpResult<PublishTaskData>>, AppError> {
-    validate_publish_identifiers(&app_id, &body.project_id)?;
-    let auto_execute_sql = body.auto_execute_sql.unwrap_or(true);
-    let task = state
-        .publish_tasks
-        .create(
-            app_id.clone(),
-            body.project_id.clone(),
-            PublishTaskKind::Publish,
-        )
-        .await
-        .map_err(create_task_error)?;
-
-    // owner 补记在任务创建成功之后（创建前写入：409/429 被拒时 owner 已被覆盖，
-    // 且 handler 层不持有 service 层的写职责下沉）；合并语义见 record_dev_registration
-    if let Some(uid) = body.user_id.as_deref().filter(|s| !s.trim().is_empty()) {
-        shared_types::validate_identifier(uid, "user_id").map_err(|e| AppError::bad_request(&e))?;
-        if let Err(e) = state
-            .app_service
-            .record_dev_registration(&app_id, uid.trim())
-            .await
-        {
-            tracing::warn!(
-                "[USERAPP_PUBLISH] record owner user_id failed (publish continues): {e}"
-            );
-        }
-    }
-    let task_id = task.id.clone();
-    let project_id = body.project_id.clone();
-    tokio::spawn(async move {
-        // panic 兜底：spawn 的 JoinHandle 被丢弃，run_* 内部 panic 会被 tokio 静默
-        // 吞掉——任务停在 running 永不收敛，该 app 被 AppBusy 锁死直到重启。
-        // catch_unwind 后 emit Failed（emit 自带终态守卫，已终态时为 no-op）。
-        use futures::FutureExt as _;
-        let outcome = std::panic::AssertUnwindSafe(orchestrator::run_publish(
-            task.clone(),
-            state,
-            project_id,
-            app_id,
-            auto_execute_sql,
-        ))
-        .catch_unwind()
-        .await;
-        if let Err(panic) = outcome {
-            let detail = panic_message(&panic);
-            tracing::error!("[USERAPP_PUBLISH] publish orchestration panicked: {detail}");
-            task.emit(PublishEvent::Failed {
-                error: format!("internal panic: {detail}"),
-            })
-            .await;
-        }
-    });
-    Ok(Json(HttpResult::success(PublishTaskData {
-        task_id,
-        status: "pending".into(),
-    })))
-}
-
-/// `POST /api/v1/apps/{app_id}/build` —— 仅触发 agent-runner build(透传进度,不发布)。
+/// `POST /api/v1/apps/{app_id}/build` —— 云端构建（Java 分步编排的第一步）：
+/// 触发 agent-runner build 产出 workspace-package-{release_id}.zip，任务快照含
+/// 产物摘要（file_name/sha256/size_bytes——Java 轮询后经 static 取包中转部署）。
 ///
 /// UserAppBuilder 自动 ensure(同 publish):未注册时创建并注册,调用方无需先建 builder;
 /// ensure 过程经 SSE `stage=EnsureBuilder` 可见,失败以任务 `failed` 终态呈现。
@@ -203,6 +123,19 @@ pub async fn build(
     Json(body): Json<PublishBody>,
 ) -> Result<Json<HttpResult<PublishTaskData>>, AppError> {
     validate_publish_identifiers(&app_id, &body.project_id)?;
+
+    // owner 补记（build 是 publish 删除后的 owner 注册来源之一；合并语义见
+    // record_dev_registration——已注册字段不被覆盖）
+    if let Some(uid) = body.user_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        shared_types::validate_identifier(uid, "user_id").map_err(|e| AppError::bad_request(&e))?;
+        if let Err(e) = state
+            .app_service
+            .record_dev_registration(&app_id, uid.trim())
+            .await
+        {
+            tracing::warn!("[USERAPP_BUILD] record owner user_id failed (build continues): {e}");
+        }
+    }
     let task = state
         .publish_tasks
         .create(

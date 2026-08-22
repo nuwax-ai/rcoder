@@ -30,6 +30,11 @@ pub struct StartAppRequest {
     /// （对齐失败不阻断部署，结果见响应 `pg_aligned` 字段，可重试）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pg: Option<StartPgCredential>,
+    /// 是否在部署 activate 后自动执行包内 database 目录 SQL（根 database/ 先 +
+    /// 各子项目 database/，文件名升序；单文件失败仅收集进 `sql_report` 不阻断）。
+    /// 缺省 true；false 跳过。仅 url 部署时生效。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_execute_sql: Option<bool>,
 }
 
 /// PG 凭据（start/restart 部署时自动对齐）。
@@ -57,4 +62,8 @@ pub struct StartAppResult {
     /// PG 对齐失败详情（pg_aligned=false 时）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pg_error: Option<String>,
+    /// 包内 database SQL 自动执行报告（url 部署且 auto_execute_sql 未关时；
+    /// executed=成功文件列表，failed=失败详情——失败不阻断部署）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_report: Option<super::db::DatabaseSqlReport>,
 }

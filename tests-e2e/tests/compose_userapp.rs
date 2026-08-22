@@ -69,7 +69,7 @@ async fn test_tasks_query(env: &Env, report: &JsonlReporter) {
 
 /// publish/build 标识校验：非法 app_id 快速失败（不挂起——activate 死锁修复的行为面）。
 async fn test_publish_identifiers(env: &Env, report: &JsonlReporter) {
-    for kind in ["publish", "build"] {
+    for kind in ["build"] {
         let t0 = Instant::now();
         let (status, _) = post_json(
             env,
@@ -84,10 +84,10 @@ async fn test_publish_identifiers(env: &Env, report: &JsonlReporter) {
             format!("HTTP {status}, {:.1}s", elapsed.as_secs_f64()),
         );
     }
-    // projectId != appId：UserAppBuilder 一 app 一 workspace 契约
+    // projectId != appId：UserAppBuilder 一 app 一 workspace 契约（build 侧）
     let (status, body) = post_json(
         env,
-        "/api/v1/apps/app-e2e-mismatch-x1/publish",
+        "/api/v1/apps/app-e2e-mismatch-x1/build",
         json!({"project_id": "proj-different"}),
     )
     .await;
@@ -104,7 +104,8 @@ async fn test_publish_identifiers(env: &Env, report: &JsonlReporter) {
     );
 }
 
-/// publish 合法请求 → 有限时间内到达终态（不挂死）+ tasks/query 可过滤。
+/// build 合法请求 → 有限时间内到达终态（不挂死）+ tasks/query 可过滤。
+/// （publish 一键编排已删——Java 分步编排；此处验证 build 任务的终态收敛）
 async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
     // ident 唯一化：run_tag(秒级)+pid——不同测试进程同秒启动也不撞名
     // （publish 对同 app 的活跃任务重复受理会 409）
@@ -131,7 +132,7 @@ async fn test_publish_reaches_terminal(env: &Env, report: &JsonlReporter) {
 
     let (status, body) = post_json(
         env,
-        &format!("/api/v1/apps/{ident}/publish"),
+        &format!("/api/v1/apps/{ident}/build"),
         json!({"project_id": ident}),
     )
     .await;
@@ -227,12 +228,7 @@ async fn test_start_without_app_is_404(env: &Env, report: &JsonlReporter) {
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );
-    let (status, _body) = post_json(
-        env,
-        &format!("/api/v1/apps/{app_id}/start"),
-        json!({}),
-    )
-        .await;
+    let (status, _body) = post_json(env, &format!("/api/v1/apps/{app_id}/start"), json!({})).await;
     report.assert_hard(
         "start 不存在的 app（无 url）→ 404（create 已删，首次创建走发布链/url 部署）",
         status.as_u16() == 404,

@@ -64,6 +64,8 @@ pub type PublishTaskId = String;
 #[serde(rename_all = "lowercase")]
 pub enum PublishTaskKind {
     Build,
+    /// 已废弃（一键 publish 编排已删，改 Java 分步编排 + start+url 部署）：
+    /// 变体仅为读 PG 存量历史行保留，不再创建新任务。
     Publish,
 }
 
@@ -91,7 +93,7 @@ pub enum PublishEvent {
     /// 取消已请求(非终态):任务进入 Cancelling,通知前端"取消中"。终态 Cancelled/Failed 由 orchestrator emit。
     Cancelling,
     /// 任务完成(build 产 release_id;publish 发布 Active)。
-    Completed { release_id: String },
+    Completed { release_id: Option<String> },
     /// 任务失败。
     Failed { error: String },
     /// 任务被取消。
@@ -117,10 +119,24 @@ pub struct PublishTaskSnapshot {
     pub status: PublishTaskStatus,
     pub stage: Option<String>,
     pub release_id: Option<String>,
+    /// build 产物摘要（Completed 后有值——Java 轮询取包依据：
+    /// `GET /api/userapp/static/{app_id}/{file_name}` + header `X-App-Id`）
+    pub artifact: Option<ArtifactDigest>,
     pub error: Option<String>,
     pub seq: u64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// build 产物摘要（文件名 + 内容哈希 + 大小；来自 file-server build 快照）。
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct ArtifactDigest {
+    /// 制品文件名（workspace-package-{release_id}.zip，static 下载路径的尾段）
+    pub file_name: String,
+    /// 制品 sha256（64 位 hex——start+url 部署时作为校验值传入，幂等键组成）
+    pub sha256: String,
+    /// 制品字节数
+    pub size_bytes: u64,
 }
 
 /// 任务列表查询结果(items + 分页前总数;handler 据此组装 PaginatedResponse)。
@@ -159,7 +175,7 @@ mod tests {
         assert_eq!(ev["event"], "cancelling");
 
         let ev = serde_json::to_value(PublishEvent::Completed {
-            release_id: "rel-1".into(),
+            release_id: Some("rel-1".into()),
         })
         .expect("completed");
         assert_eq!(ev["event"], "completed");
@@ -189,6 +205,7 @@ mod tests {
             status: PublishTaskStatus::Failed,
             stage: None,
             release_id: None,
+            artifact: None,
             error: Some("boom".into()),
             seq: 0,
             created_at: 1,

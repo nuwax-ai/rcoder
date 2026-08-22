@@ -27,7 +27,7 @@ const DEFAULT_BUILDER_STORAGE_SIZE: &str = "10Gi";
 
 /// build 等待结果(消费 agent-runner build SSE 终态事件得出)。
 pub(super) enum BuildOutcome {
-    Completed { release_id: String },
+    Completed,
     Failed(String),
     Cancelled,
 }
@@ -178,11 +178,7 @@ pub(super) async fn wait_build(
                 }
                 // 终态判定直接 match 类型化事件(类型保证 release_id 存在)。
                 let terminal_outcome: Option<BuildOutcome> = match &data {
-                    BuildProgressEvent::Completed { release_id, .. } => {
-                        Some(BuildOutcome::Completed {
-                            release_id: release_id.clone(),
-                        })
-                    }
+                    BuildProgressEvent::Completed { .. } => Some(BuildOutcome::Completed),
                     BuildProgressEvent::Failed { error } => {
                         Some(BuildOutcome::Failed(error.clone()))
                     }
@@ -276,12 +272,7 @@ async fn recover_or_resubscribe(
             }
         };
         let terminal = match snap.status.as_str() {
-            "completed" => Some(BuildOutcome::Completed {
-                release_id: snap
-                    .release_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("snapshot completed but missing releaseId"))?,
-            }),
+            "completed" => Some(BuildOutcome::Completed),
             "failed" => Some(BuildOutcome::Failed(
                 snap.error
                     .clone()

@@ -32,7 +32,7 @@ Pending → Running → (Cancelling) → Completed / Failed / Cancelled
   "page_size": 20,
   "filters": {
     "app_ids": ["app-order-svc"],   // 可选：按 app 过滤
-    "kind": "build",               // 可选：build | publish
+    "kind": "build",               // 可选：build（publish 已废弃，仅为读存量历史行保留）
     "active_only": true             // 可选：只看未终态（对账：该 app 在跑任务吗）
   }
 }
@@ -67,7 +67,7 @@ Pending → Running → (Cancelling) → Completed / Failed / Cancelled
       "id": "019123456789abcdef",
       "app_id": "app-order-svc",
       "project_id": "app-order-svc",
-      "kind": "build",              // build | publish
+      "kind": "build",              // build（publish 已废弃）
       "status": "running",          // pending | running | cancelling | completed | failed | cancelled
       "stage": "compiling",         // 当前阶段标识
       "release_id": null,           // completed 时回填
@@ -116,7 +116,7 @@ data: {"event":"<事件类型>", <事件字段...>}   // data 为事件对象全
 | `failed` | 终态（失败） | `error` |
 | `cancelled` | 终态（取消） | — |
 
-> **Builder 自动创建**：`build`/`publish` 触发时若 UserAppBuilder 容器不存在（含 rcoder 重启后注册丢失），任务会先经 `stage=EnsureBuilder` 自动创建并注册（K8s 拉镜像可能数十秒），再进入 `stage=Build`。创建失败以任务 `failed` 终态呈现。
+> **Builder 自动创建**：`build` 触发时若 UserAppBuilder 容器不存在（含 rcoder 重启后注册丢失），任务会先经 `stage=EnsureBuilder` 自动创建并注册（K8s 拉镜像可能数十秒），再进入 `stage=Build`。创建失败以任务 `failed` 终态呈现。
 
 **消费端去重**：按 `id`（seq）去重——`seq <= 已收最大值` 的事件丢弃。
 

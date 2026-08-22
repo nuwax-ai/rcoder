@@ -302,6 +302,8 @@ fn snapshot_from_record(record: PublishTaskRecord) -> PublishTaskSnapshot {
         status: PublishTaskStatus::from_pg_str(&record.state),
         stage: record.stage,
         release_id: record.release_id,
+        // PG 行不含产物摘要（仅内存快照，任务重启后 Java 走 SSE/file-server 快照兜底）
+        artifact: None,
         error: record.error,
         seq: 0,
         created_at,
@@ -420,7 +422,7 @@ mod tests {
             .expect("first task");
         completed
             .emit(PublishEvent::Completed {
-                release_id: "release-a".into(),
+                release_id: Some("release-a".to_string()),
             })
             .await;
 

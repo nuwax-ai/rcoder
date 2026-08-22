@@ -7,6 +7,7 @@
 //! `super::types`,全局任务表见 `super::store`。agent-runner 的 build 进度经 `super::client`
 //! 透传给前端(rcoder SSE),叠加发布阶段(Stage)。
 
+use super::types::ArtifactDigest;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -34,6 +35,9 @@ struct TaskState {
     status: PublishTaskStatus,
     stage: Option<String>,
     release_id: Option<String>,
+    /// build 产物摘要（终态时经 file-server 快照回填——Java 轮询取包依据；
+    /// 仅内存快照，不落 PG 行：产物文件在 builder 卷上，任务表只管编排状态）
+    artifact: Option<ArtifactDigest>,
     error: Option<String>,
     seq: u64,
     history: VecDeque<(u64, PublishEvent)>,
@@ -115,6 +119,7 @@ impl PublishTask {
                 status: PublishTaskStatus::Pending,
                 stage: None,
                 release_id: None,
+                artifact: None,
                 error: None,
                 seq: 0,
                 history: VecDeque::with_capacity(RING_CAP),
@@ -132,6 +137,11 @@ impl PublishTask {
     }
 
     /// 当前快照(查询用)。
+    /// 终态回填产物摘要（run_build Completed 分支调用）。
+    pub async fn set_artifact(&self, artifact: ArtifactDigest) {
+        self.state.lock().await.artifact = Some(artifact);
+    }
+
     pub async fn snapshot(&self) -> PublishTaskSnapshot {
         let s = self.state.lock().await;
         PublishTaskSnapshot {
@@ -142,6 +152,7 @@ impl PublishTask {
             status: s.status,
             stage: s.stage.clone(),
             release_id: s.release_id.clone(),
+            artifact: s.artifact.clone(),
             error: s.error.clone(),
             seq: s.seq,
             created_at: self.created_at,
@@ -175,7 +186,7 @@ impl PublishTask {
                 PublishEvent::Completed { release_id } => Some(TerminalPersist {
                     status: PublishTaskStatus::Completed,
                     error: None,
-                    release_id: Some(release_id.clone()),
+                    release_id: release_id.clone(),
                     terminal_at: 0,
                 }),
                 PublishEvent::Failed { error } => Some(TerminalPersist {
@@ -353,7 +364,7 @@ fn apply_event(state: &mut TaskState, event: &PublishEvent) {
         PublishEvent::BuildProgress { .. } => state.status = PublishTaskStatus::Running,
         PublishEvent::Cancelling => state.status = PublishTaskStatus::Cancelling,
         PublishEvent::Completed { release_id } => {
-            state.release_id = Some(release_id.clone());
+            state.release_id = release_id.clone();
             state.status = PublishTaskStatus::Completed;
         }
         PublishEvent::Failed { error } => {
@@ -388,7 +399,7 @@ mod tests {
     async fn concurrent_terminal_events_commit_exactly_once() {
         let task = PublishTask::new("app-a".into(), "app-a".into(), PublishTaskKind::Publish);
         let completed = task.emit(PublishEvent::Completed {
-            release_id: "release-1".into(),
+            release_id: Some("release-1".to_string()),
         });
         let failed = task.emit(PublishEvent::Failed {
             error: "late failure".into(),
@@ -444,7 +455,7 @@ mod tests {
     async fn request_cancel_returns_already_terminal_for_terminal_task() {
         let task = PublishTask::new("app-a".into(), "app-a".into(), PublishTaskKind::Publish);
         task.emit(PublishEvent::Completed {
-            release_id: "r1".into(),
+            release_id: Some("r1".to_string()),
         })
         .await;
 

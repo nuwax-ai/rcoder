@@ -101,7 +101,6 @@ use crate::handler;
         app_manager::handlers::create_database,
         app_manager::handlers::stream_app_logs_v1,
         app_manager::handlers::upload_from_url,
-        crate::userapp_publish::handler::publish,
         crate::userapp_publish::handler::build,
         crate::userapp_publish::handler::query_tasks,
         crate::userapp_publish::handler::get_task,
@@ -357,7 +356,6 @@ mod openapi_tests {
             "/api/v1/apps/{app_id}/releases/rollback",
             "/api/v1/apps/{app_id}/logs/query",
             "/api/v1/apps/{app_id}/logs/stream",
-            "/api/v1/apps/{app_id}/publish",
             "/api/v1/apps/{app_id}/build",
             "/api/v1/apps/publish/tasks/query",
             "/api/v1/apps/publish/tasks/{task_id}/stream",
@@ -472,7 +470,7 @@ mod openapi_tests {
         }
         // 覆盖数下限：app_manager（删 create REST 面，31→30）+ userapp_publish 6 端点。
         assert!(
-            checked >= 36,
+            checked >= 35,
             "UserApp OpenAPI 端点覆盖数异常偏少: {checked}"
         );
     }

@@ -12,7 +12,6 @@
 //! `orchestrator`(流程编排入口)组合上述两者。对外契约统一从本模块父路径取。
 
 pub mod agent_runner;
-pub mod app_lifecycle;
 mod client; // 仅 userapp_publish 内部消费(handler 不直接触达)
 pub mod handler;
 pub mod models;

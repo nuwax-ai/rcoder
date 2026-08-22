@@ -26,7 +26,7 @@ impl AppService {
     ) -> AppResult<StartAppResult> {
         validate_app_id(app_id)?;
 
-        let release_id = if let Some(url) = request
+        let (release_id, sql_report) = if let Some(url) = request
             .url
             .as_deref()
             .map(str::trim)
@@ -36,7 +36,7 @@ impl AppService {
         } else {
             // 传统启动（app 必须已存在——create 已从 REST 面移除，首次创建走发布链或 url 部署）
             self.start_app(app_id).await?;
-            None
+            (None, None)
         };
 
         // env / idle 对已存在 app 生效（整段替换，与 update 同语义）
@@ -64,6 +64,7 @@ impl AppService {
             release_id,
             pg_aligned,
             pg_error,
+            sql_report,
         })
     }
 
@@ -87,7 +88,7 @@ impl AppService {
         app_id: &str,
         request: StartAppRequest,
     ) -> AppResult<StartAppResult> {
-        let release_id = if let Some(url) = request
+        let (release_id, sql_report) = if let Some(url) = request
             .url
             .as_deref()
             .map(str::trim)
@@ -95,7 +96,7 @@ impl AppService {
         {
             self.deploy_from_url(app_id, url, &request).await?
         } else {
-            None
+            (None, None)
         };
         if request.env.is_some() || request.idle_timeout_seconds.is_some() {
             self.apply_start_overrides(app_id, &request).await?;
@@ -118,17 +119,19 @@ impl AppService {
             release_id,
             pg_aligned,
             pg_error,
+            sql_report,
         })
     }
 
     /// 轻量部署链：release_id 解析（自动生成或显式）→ prepare → activate。
     /// 返回生效的 release_id。
+    #[allow(clippy::type_complexity)]
     async fn deploy_from_url(
         &self,
         app_id: &str,
         url: &str,
         request: &StartAppRequest,
-    ) -> AppResult<Option<String>> {
+    ) -> AppResult<(Option<String>, Option<DatabaseSqlReport>)> {
         let release_id = match request
             .release_id
             .as_deref()
@@ -177,7 +180,32 @@ impl AppService {
                 release.failure_message.unwrap_or_default()
             )));
         }
-        Ok(Some(release_id))
+
+        // 包内 database SQL 自动执行（原 publish 编排语义迁移：缺省开；单文件失败
+        // 仅收集进 report 不阻断部署——SQL 幂等性由模板约定自带）
+        let mut sql_report: Option<DatabaseSqlReport> = None;
+        if request.auto_execute_sql.unwrap_or(true) {
+            match self.execute_database_sql(app_id).await {
+                Ok(report) => {
+                    for rel in &report.executed {
+                        info!("[APP] start-deploy database sql executed: {rel}");
+                    }
+                    for fail in &report.failed {
+                        warn!("[APP] start-deploy database sql failed (ignored): {fail}");
+                    }
+                    info!(
+                        "[APP] start-deploy database sql done: executed={}, failed={}",
+                        report.executed.len(),
+                        report.failed.len()
+                    );
+                    sql_report = Some(report);
+                }
+                Err(e) => {
+                    warn!("[APP] start-deploy database sql stage failed (ignored): {e}");
+                }
+            }
+        }
+        Ok((Some(release_id), sql_report))
     }
 
     /// env / idle 覆盖（对已存在 app；复用 update 的整段替换语义）。

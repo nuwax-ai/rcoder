@@ -342,11 +342,6 @@ fn find_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-/// 整体包下载 URL(rcoder prepare_release 的 url 字段;app_manager 据此从 agent-runner 拉包)。
-pub fn package_url(addr: &str, app_id: &str, file_name: &str) -> String {
-    format!("{addr}/api/userapp/static/{app_id}/{file_name}")
-}
-
 /// 从 SSE 帧提取 `id:`（事件 seq，可选）与 `data:` 行，反序列化为类型化
 /// `BuildProgressEvent`（Fail Fast:错误带类型）。
 fn parse_sse_frame(frame: &[u8]) -> Result<SseItem, SseParseError> {

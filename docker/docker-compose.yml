@@ -21,7 +21,7 @@ services:
       # UserApp release.lock 构建元数据；测试正式镜像时建议由 shell 覆盖 digest。
       - RCODER_PINGAP_VERSION=${RCODER_PINGAP_VERSION:-0.13.8}
       - RCODER_PINGAP_COMMIT=${RCODER_PINGAP_COMMIT:-07d1cce1b658418bb46c2dec1a49c43fd2f48268}
-      - RCODER_RUNTIME_IMAGE_DIGEST=${RCODER_RUNTIME_IMAGE_DIGEST:-sha256:local-development}
+      - RCODER_RUNTIME_IMAGE_DIGEST=${RCODER_RUNTIME_IMAGE_DIGEST:-nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/app-runtime:0.1.186-arm64}
       # 🎯 关键：获取docker sock,用于检测宿主机路径
       - DOCKER_SOCKET_PATH=${DOCKER_SOCKET_PATH:-/var/run/docker.sock}
       # 主容器禁用 ttyd（ttyd 在动态创建的容器中运行）
