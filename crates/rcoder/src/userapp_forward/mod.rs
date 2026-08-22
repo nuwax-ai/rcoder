@@ -49,7 +49,10 @@ pub(crate) async fn ensure_workspace_via_dev(
     app_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
-    const BACKOFF_SECS: [u64; 3] = [5, 10, 15];
+    // 五档退避最坏 120s：agent_runner(file-server 60000) 在宿主高负载（多 builder 并发
+    // 构建/对话）下启动可超 30s——原三档 30s 上限在 e2e 六场景并行时实测不够
+    // （后发容器被先发容器负载拖慢 → 60000 连接失败）。
+    const BACKOFF_SECS: [u64; 5] = [5, 10, 15, 30, 60];
     let mut last_err = String::new();
     for (attempt, delay) in std::iter::once(0u64)
         .chain(BACKOFF_SECS.iter().copied())
@@ -57,7 +60,7 @@ pub(crate) async fn ensure_workspace_via_dev(
     {
         if attempt > 0 {
             tracing::info!(
-                "[USERAPP_FORWARD] ensure-workspace retry {}/3 after {delay}s (dev container starting): app_id={app_id}",
+                "[USERAPP_FORWARD] ensure-workspace retry {}/5 after {delay}s (dev container starting): app_id={app_id}",
                 attempt
             );
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;

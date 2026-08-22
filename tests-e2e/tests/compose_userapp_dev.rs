@@ -11,7 +11,20 @@
 //! - userApp 开发对话全轮：session 创建（project_id=app_id 回显）+ SSE 事件流
 //!   （/computer/progress/{sid} 经 session→project 映射路由到开发容器）
 
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// 套件级串行锁：单节点（mac Docker Desktop / K8s 单节点）资源天花板下，多场景并行
+/// 建 builder 容器会拖慢后发容器的 agent_runner 启动（60000 连接超退避窗）。
+/// 代码级固化串行，免去 --test-threads=1 依赖。
+static SCENARIO_GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn scenario_gate() -> tokio::sync::MutexGuard<'static, ()> {
+    SCENARIO_GATE
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 use rcoder_e2e::common::report::JsonlReporter;
 use rcoder_e2e::common::scenario::{CollectSpec, assert_hard_all, collect_reported, count_event};
@@ -87,6 +100,7 @@ fn trunc(v: &Value, n: usize) -> String {
 // ============================================================
 #[tokio::test]
 async fn userapp_dev_files_two_entry_points() {
+    let _gate = scenario_gate().await;
     let scenario = "userapp_dev_files";
     let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
         return;
@@ -190,6 +204,7 @@ async fn userapp_dev_files_two_entry_points() {
 // ============================================================
 #[tokio::test]
 async fn userapp_dev_pg_align_idempotent() {
+    let _gate = scenario_gate().await;
     let scenario = "userapp_dev_pg_align";
     let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
         return;
@@ -353,11 +368,13 @@ async fn scenario_userapp_chat_full_turn(backend: Backend) {
 
 #[tokio::test]
 async fn userapp_dev_chat_full_turn_openai() {
+    let _gate = scenario_gate().await;
     scenario_userapp_chat_full_turn(Backend::Openai).await;
 }
 
 #[tokio::test]
 async fn userapp_dev_chat_full_turn_anthropic() {
+    let _gate = scenario_gate().await;
     scenario_userapp_chat_full_turn(Backend::Anthropic).await;
 }
 
@@ -481,10 +498,12 @@ async fn scenario_userapp_two_turn_isolation(backend: Backend) {
 
 #[tokio::test]
 async fn userapp_dev_two_turn_isolation_openai() {
+    let _gate = scenario_gate().await;
     scenario_userapp_two_turn_isolation(Backend::Openai).await;
 }
 
 #[tokio::test]
 async fn userapp_dev_two_turn_isolation_anthropic() {
+    let _gate = scenario_gate().await;
     scenario_userapp_two_turn_isolation(Backend::Anthropic).await;
 }
