@@ -114,8 +114,11 @@ fn managed_config(release: &ReleaseLock) -> Result<PingapConfig> {
             })
         })
         .collect();
-    let content = build_pingap_config(&entries)?
-        .ok_or_else(|| anyhow::anyhow!("workspace has no proxied web service"))?;
+    let content = build_pingap_config(&entries)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "workspace has no proxied web service: none of the enabled services declares a [proxy] section\n     fix:   pick the service that serves HTTP and add, in its project.manifest.toml:\n            [proxy]\n            path = \"/api/<service_id>/\"\n            strip_prefix = true"
+        )
+    })?;
     PingapConfig::new(content.as_bytes(), true).context("parse managed Pingap config")
 }
 

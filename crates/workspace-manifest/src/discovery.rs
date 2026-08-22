@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use crate::{DiscoverError, DiscoveredProject, ProjectManifest, parse_project, validate_topology};
+use crate::{
+    DiscoverError, DiscoveredProject, ProjectManifest, ValidationIssue, collect_topology_issues,
+    manifest_file_of, parse_project, parse_project_toml, validate_project_at, validate_topology,
+};
 
 /// 扫描 workspace 根的一级子目录，发现并解析所有 `project.manifest.toml`。
 ///
@@ -54,4 +57,67 @@ pub fn assemble_discovered(
     discovered.sort_by(|a, b| a.service_id().cmp(b.service_id()));
     validate_topology(&discovered).map_err(|error| DiscoverError::Validation(error.to_string()))?;
     Ok(discovered)
+}
+
+/// 宽松发现：扫描全部模块，**解析/校验失败不中断**，全部收集为 issue 返回。
+///
+/// 供 app-cli devtool / 诊断入口呈现"一次看全"的错误清单（fast-fail 版
+/// [`discover_projects`] 只报第一个错，适合构建链快速失败）。
+/// TOML 解析错误自带行列号（`toml` crate），以 `<dir>/project.manifest.toml` 定位。
+pub fn discover_projects_lenient(
+    ws_root: &Path,
+) -> Result<(Vec<DiscoveredProject>, Vec<ValidationIssue>), DiscoverError> {
+    let mut discovered: Vec<(String, ProjectManifest)> = Vec::new();
+    let mut issues = Vec::new();
+    let mut entries: Vec<_> = std::fs::read_dir(ws_root)
+        .map_err(|error| DiscoverError::ReadDir {
+            path: ws_root.display().to_string(),
+            source: error.to_string(),
+        })?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .map(|entry| {
+            let dir = entry.file_name().to_string_lossy().to_string();
+            (dir, entry.path().join("project.manifest.toml"))
+        })
+        .filter(|(_, path)| path.is_file())
+        .collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (dir, path) in entries {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                issues.push(
+                    ValidationIssue::new(format!("cannot read manifest: {error}"))
+                        .at_file(manifest_file_of(&dir)),
+                );
+                continue;
+            }
+        };
+        // 仅反序列化：语法错误与语义校验分开呈现（语义问题由收集式校验统一
+        // 四段式渲染，避免对已含 field/fix 的文本再包一层通用提示）。
+        match parse_project_toml(&content) {
+            Ok(manifest) => {
+                let file_issues = validate_project_at(&manifest, &dir);
+                if file_issues.is_empty() {
+                    discovered.push((dir, manifest));
+                } else {
+                    issues.extend(file_issues);
+                }
+            }
+            Err(error) => issues.push(
+                ValidationIssue::new(error.to_string())
+                    .at_file(manifest_file_of(&dir))
+                    .with_hint("fix the TOML syntax/type error at the reported line, then re-run"),
+            ),
+        }
+    }
+    // 单文件全过的模块间拓扑校验（service_id/proxy 路由/依赖）。
+    let mut all: Vec<DiscoveredProject> = discovered
+        .into_iter()
+        .map(|(dir, manifest)| DiscoveredProject { dir, manifest })
+        .collect();
+    all.sort_by(|a, b| a.service_id().cmp(b.service_id()));
+    issues.extend(collect_topology_issues(&all));
+    Ok((all, issues))
 }

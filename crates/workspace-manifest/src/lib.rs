@@ -35,13 +35,14 @@ mod release_lock;
 mod types;
 mod validation;
 
-pub use discovery::{assemble_discovered, discover_projects};
+pub use discovery::{assemble_discovered, discover_projects, discover_projects_lenient};
 pub use error::{DiscoverError, LoadError, ManifestError};
 pub use release_lock::{ReleaseMetadata, build_release_lock, load_release_lock};
 pub use types::*;
 pub use validation::{
-    parse_project, parse_workspace, validate_project, validate_service_id, validate_topology,
-    validate_workspace,
+    ValidationIssue, collect_topology_issues, collect_workspace_issues, manifest_file_of,
+    parse_project, parse_project_toml, parse_workspace, validate_project, validate_project_at,
+    validate_service_id, validate_topology, validate_workspace,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;

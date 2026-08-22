@@ -7,7 +7,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use workspace_manifest::{ReleaseMetadata, build_release_lock, discover_projects, parse_workspace};
+use workspace_manifest::{
+    ReleaseMetadata, build_release_lock, discover_projects_lenient, parse_workspace,
+};
 
 use crate::proxy::compiler::compile_effective_config;
 
@@ -44,7 +46,20 @@ pub async fn gen_lock(workspace: &Path) -> Result<()> {
         std::fs::read_to_string(&ws_path).with_context(|| format!("read {}", ws_path.display()))?;
     let ws_manifest = parse_workspace(&ws_content).context("parse workspace.manifest.toml")?;
 
-    let projects = discover_projects(workspace).context("discover projects")?;
+    // 宽松发现：单模块 TOML/校验错误不中断扫描，全部问题一次呈现——
+    // 用户/agent 拿到完整清单可一轮修完，而不是"修一个 → 重跑 → 下一个错"。
+    let (projects, issues) =
+        discover_projects_lenient(workspace).context("discover projects")?;
+    if !issues.is_empty() {
+        println!("❌ manifest 校验发现 {} 个问题:", issues.len());
+        for (index, issue) in issues.iter().enumerate() {
+            println!("  {}. {}", index + 1, issue);
+        }
+        anyhow::bail!(
+            "manifest validation failed with {} issue(s); fix the files above and re-run",
+            issues.len()
+        );
+    }
 
     println!("📋 发现 {} 个 enabled 服务:", projects.len());
     for project in &projects {
