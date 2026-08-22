@@ -78,69 +78,46 @@ impl AppService {
             Some(img) => img.clone(),
             None => default_runtime_image(&std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok())?,
         };
-        // 部分更新回退（方案C 扩展）：`command`/`env`/`secrets`/`resources`/`health_check`/
-        // `ports` 任一为 None 时从 live 容器读当前值回退，避免部分更新静默清空：
-        //   - `command` 丢 → 镜像无 ENTRYPOINT 时 CrashLoop（container.args 为空）；
+        // 部分更新回退（方案C 扩展）：`env`/`secrets`/`resources` 任一为 None 时从 live
+        // 容器读当前值回退，避免部分更新静默清空：
         //   - `env` 丢 → K8s `cleanup_orphan_port_resources` 删 ConfigMap → 容器丢环境变量；
-        //   - `secrets`/`resources`/`health_check` 丢 → K8s 从 Secret/pod limits/probes 读回
-        //     （Docker 的 secrets/health_check 不可分/无探针 → 恒 None 等价旧行为）；
-        //   - `ports` 丢 → SSA 清 container ports + `cleanup_orphan_port_resources` 删
-        //     HTTPRoute/NodePort → 对外入口全断（K8s 从 container.ports+port-expose 注解
-        //     读回；Docker 从 ExposedPorts 尽力读回）。
-        // 仅在确实缺省时才读（省一次后端 GET）；读失败降级为旧行为（清空）+ warn，不阻塞 update。
-        // 注：`tenant_id`/`space_id` 仍为部分更新清空（在 K8s label 上，调用方携带即可还原）。
-        let (command, env, secrets, resources, health_check, ports) = if request.command.is_none()
-            || request.env.is_none()
-            || request.secrets.is_none()
-            || request.resources.is_none()
-            || request.health_check.is_none()
-            || request.ports.is_none()
+        //   - `secrets`/`resources` 丢 → K8s 从 Secret/pod limits 读回（Docker secrets
+        //     不可分 → 恒 None 等价旧行为）。
+        // `command`/`ports`/`health_check` **恒 live 回退**——v2 四要素平台内定（命令=manifest
+        // 自动、HTTP 端口=pingap 9080 唯一、探针=app-cli 3010），UpdateAppRequest 已不再
+        // 暴露这三字段（防调用方误传破坏发布链内定值），update 无权更改。
+        let (command, env, secrets, resources, health_check, ports) = match self
+            .runtime
+            .get_app_container_spec(app_id)
+            .await
         {
-            match self.runtime.get_app_container_spec(app_id).await {
-                Ok(spec) => (
-                    request.command.clone().or(spec.command),
-                    // 读回的 env 必含 create 时注入的保留变量，先剥离再走 inject
-                    //（inject 从当前发布锁重新注入权威值；用户显式提交保留变量仍拒绝）。
-                    request.env.clone().or(spec.env.map(|mut env| {
-                        strip_release_identity(&mut env);
-                        env
-                    })),
-                    request.secrets.clone().or(spec.secrets),
-                    request
-                        .resources
-                        .clone()
-                        .or(spec.resources.map(resource_limits_from_snapshot)),
-                    request
-                        .health_check
-                        .clone()
-                        .or(spec.health_check.map(health_check_from_snapshot)),
-                    request.ports.clone().or(spec
-                        .ports
-                        .map(|ps| ps.iter().map(port_config_from_snapshot).collect())),
-                ),
-                Err(e) => {
-                    warn!(
-                        "[APP] get_app_container_spec failed app_id={app_id} (missing fields may be cleared on partial update): {e}"
-                    );
-                    (
-                        request.command.clone(),
-                        request.env.clone(),
-                        request.secrets.clone(),
-                        request.resources.clone(),
-                        request.health_check.clone(),
-                        request.ports.clone(),
-                    )
-                }
+            Ok(spec) => (
+                spec.command,
+                // 读回的 env 必含 create 时注入的保留变量，先剥离再走 inject
+                //（inject 从当前发布锁重新注入权威值；用户显式提交保留变量仍拒绝）。
+                request.env.clone().or(spec.env.map(|mut env| {
+                    strip_release_identity(&mut env);
+                    env
+                })),
+                request.secrets.clone().or(spec.secrets),
+                request
+                    .resources
+                    .clone()
+                    .or(spec.resources.map(resource_limits_from_snapshot)),
+                spec.health_check.map(health_check_from_snapshot),
+                spec.ports
+                    .map(|ps| ps.iter().map(port_config_from_snapshot).collect()),
+            ),
+            Err(e) => {
+                warn!(
+                    "[APP] get_app_container_spec failed app_id={app_id} (spec fields unavailable, update aborted): {e}"
+                );
+                // 读回失败=command/ports/health_check 无权威值可依——上抛而非带空值
+                // SSA（空 ports 会触发 cleanup_orphan_port_resources 断掉对外入口）。
+                return Err(AppOperationError::Backend(format!(
+                    "cannot read live container spec for update: {e}"
+                )));
             }
-        } else {
-            (
-                request.command.clone(),
-                request.env.clone(),
-                request.secrets.clone(),
-                request.resources.clone(),
-                request.health_check.clone(),
-                request.ports.clone(),
-            )
         };
         self.build_params_inner(
             app_id,
@@ -359,12 +336,9 @@ mod tests {
         UpdateAppRequest {
             name: None,
             image: Some(image.to_owned()),
-            command: None,
             env: None,
             secrets: None,
             resources: None,
-            ports: None,
-            health_check: None,
             tenant_id: None,
             space_id: None,
             recycle_enabled: None,

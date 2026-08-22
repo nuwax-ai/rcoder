@@ -143,7 +143,11 @@ impl AppService {
     ) -> AppResult<AppRuntimeInfo> {
         validate_app_id(app_id)?;
         // Fail Fast:先校验请求形状,再查 app 是否存在(空请求不浪费 K8s GET)
-        validate_recycle_policy_fields(request.recycle_enabled, request.idle_timeout_seconds)?;
+        validate_recycle_policy_fields(
+            request.recycle_enabled,
+            request.idle_timeout_seconds,
+            request.wake_on_traffic,
+        )?;
         self.ensure_app_exists(app_id).await?;
         self.runtime
             .patch_recycle_policy(
@@ -158,9 +162,23 @@ impl AppService {
                     e,
                 )
             })?;
+        // 流量唤醒语义独立注解（rcoder.io/wake-on-traffic），trait 默认 no-op
+        //（无持久注解能力的 runtime 安全降级）；patch 失败上抛——注解写入是
+        // 显式请求语义，静默丢弃会让 wake_on_traffic 回读与期望不一致。
+        if let Some(enabled) = request.wake_on_traffic {
+            self.runtime
+                .patch_wake_on_traffic(app_id, enabled)
+                .await
+                .map_err(|e| {
+                    map_runtime_error(
+                        &format!("[APP] patch_wake_on_traffic failed app_id={app_id}"),
+                        e,
+                    )
+                })?;
+        }
         info!(
-            "[APP] recycle policy updated: {} (enabled={:?}, idle_timeout={:?})",
-            app_id, request.recycle_enabled, request.idle_timeout_seconds
+            "[APP] recycle policy updated: {} (enabled={:?}, idle_timeout={:?}, wake_on_traffic={:?})",
+            app_id, request.recycle_enabled, request.idle_timeout_seconds, request.wake_on_traffic
         );
         self.get_app(app_id).await
     }
@@ -225,10 +243,11 @@ impl AppService {
 fn validate_recycle_policy_fields(
     recycle_enabled: Option<bool>,
     idle_timeout_seconds: Option<u64>,
+    wake_on_traffic: Option<bool>,
 ) -> AppResult<()> {
-    if recycle_enabled.is_none() && idle_timeout_seconds.is_none() {
+    if recycle_enabled.is_none() && idle_timeout_seconds.is_none() && wake_on_traffic.is_none() {
         return Err(AppOperationError::Validation(
-            "recycle-policy requires at least one of recycle_enabled / idle_timeout_seconds"
+            "recycle-policy requires at least one of recycle_enabled / idle_timeout_seconds / wake_on_traffic"
                 .to_string(),
         ));
     }
@@ -241,12 +260,13 @@ mod tests {
 
     #[test]
     fn recycle_policy_requires_at_least_one_field() {
-        // 两字段皆 None → Fail Fast
-        assert!(validate_recycle_policy_fields(None, None).is_err());
+        // 三字段皆 None → Fail Fast
+        assert!(validate_recycle_policy_fields(None, None, None).is_err());
         // 任一 Some → Ok
-        assert!(validate_recycle_policy_fields(Some(true), None).is_ok());
-        assert!(validate_recycle_policy_fields(Some(false), None).is_ok());
-        assert!(validate_recycle_policy_fields(None, Some(60)).is_ok());
-        assert!(validate_recycle_policy_fields(Some(true), Some(60)).is_ok());
+        assert!(validate_recycle_policy_fields(Some(true), None, None).is_ok());
+        assert!(validate_recycle_policy_fields(Some(false), None, None).is_ok());
+        assert!(validate_recycle_policy_fields(None, Some(60), None).is_ok());
+        assert!(validate_recycle_policy_fields(None, None, Some(false)).is_ok());
+        assert!(validate_recycle_policy_fields(Some(true), Some(60), Some(true)).is_ok());
     }
 }

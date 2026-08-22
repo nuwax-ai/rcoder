@@ -14,6 +14,11 @@ use utoipa::ToSchema;
 pub struct StartAppRequest {
     /// 制品包下载 URL（workspace 整体包 zip）。给出即触发轻量部署链。
     pub url: Option<String>,
+    /// owner 用户 ID（可选补记——与 build 同款兜底语义：显式传优先，注册
+    /// `userapp_metadata` owner，供 `/proxy/apps/{user_id}/...` URL 拼接与
+    /// "我的应用"归属过滤；None=不改动已有记录）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     /// 发布版本标记（幂等键）。缺省自动生成（`rel-{时间戳}-{随机}`）并在响应返回；
     /// 显式传入时同 id+同内容重复部署幂等命中。
     pub release_id: Option<String>,

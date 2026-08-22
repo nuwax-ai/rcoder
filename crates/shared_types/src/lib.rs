@@ -6,9 +6,10 @@ mod userapp;
 
 // 容器域类型（高内聚收拢于 container/ 模块）—— 条目/查找/清理/统计 + 服务与隔离枚举
 pub use container::{
-    CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry, ContainerLookup, IdleContainerInfo,
-    IsolationType, IsolationTypeError, MissingIdentifier, ProjectScope, ServiceType,
-    ServiceTypeError, StorageStats, get_enabled_service_types, get_supported_service_types,
+    AppRuntimeIpResolver, CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry,
+    ContainerLookup, IdleContainerInfo, IsolationType, IsolationTypeError, MissingIdentifier,
+    ProjectScope, ServiceType, ServiceTypeError, StorageStats, get_enabled_service_types,
+    get_supported_service_types,
 };
 
 // project/session/container 映射存储契约（内存与 PG 双后端统一接口）

@@ -9,6 +9,8 @@ use tracing::{info, warn};
 use crate::models::*;
 use crate::service::AppService;
 use crate::utils::*;
+// record_dev_registration 是 AppServiceTrait 方法（trait impl 在 service.rs）
+use crate::AppServiceTrait;
 
 impl AppService {
     /// 统一部署+启动。
@@ -88,6 +90,17 @@ impl AppService {
         app_id: &str,
         request: StartAppRequest,
     ) -> AppResult<StartAppResult> {
+        // owner 兜底注册（与 build 同款补记语义：显式传优先；workspace 接口是主注册
+        // 来源）。失败仅告警——owner 缺失不影响部署本身（URL 拼接归属是消费侧问题）。
+        if let Some(user_id) = request
+            .user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && let Err(e) = self.record_dev_registration(app_id, user_id).await
+        {
+            warn!("[APP] start owner registration failed (ignored): app_id={app_id}: {e}");
+        }
         let (release_id, sql_report) = if let Some(url) = request
             .url
             .as_deref()
@@ -219,12 +232,9 @@ impl AppService {
             let update = UpdateAppRequest {
                 name: None,
                 image: None,
-                command: None,
                 env: request.env.clone(),
                 secrets: None,
                 resources: None,
-                ports: None,
-                health_check: None,
                 tenant_id: None,
                 space_id: None,
                 expected_resource_version: current.resource_version.clone(),
@@ -240,6 +250,7 @@ impl AppService {
                 RecyclePolicyRequest {
                     recycle_enabled: Some(idle > 0),
                     idle_timeout_seconds: Some(idle),
+                    wake_on_traffic: None,
                 },
             )
             .await?;

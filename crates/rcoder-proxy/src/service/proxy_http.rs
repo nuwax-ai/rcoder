@@ -14,7 +14,7 @@ use tracing::{debug, error, warn};
 
 use crate::router::RouteType;
 
-use super::{PortProxy, TrackingCtx, handlers, utils};
+use super::{PortProxy, TrackingCtx, utils};
 
 /// 唤醒超时/失败时 503 响应的 Retry-After(秒)。客户端据此延后重试(app 仍在后台启动)。
 const WAKE_503_RETRY_AFTER_SECS: &str = "15";
@@ -141,145 +141,15 @@ impl ProxyHttp for PortProxy {
 
         let original_uri = upstream_request.uri.clone();
 
-        match matched.value {
-            RouteType::VncProxy => {
-                handlers::vnc::handle_vnc_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    ctx,
-                )
-                .await?;
-            }
-            RouteType::PortProxy => {
-                handlers::port_proxy::handle_port_proxy_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    self.use_round_robin,
-                )
-                .await?;
-            }
-            RouteType::AppPortProxy => {
-                handlers::app_port_proxy::handle_app_port_proxy_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                )
-                .await?;
-            }
-            RouteType::DevPortProxy => {
-                handlers::dev_port_proxy::handle_dev_port_proxy_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                )
-                .await?;
-            }
-            RouteType::HealthCheck => {
-                // 健康检查：代理到 Axum 的 /health 端点
-                // 这样既能验证 Pingora 正常运行，又能验证 Axum 正常运行
-                debug!(
-                    "Health check request: {} - proxying to Axum ({})",
-                    path, self.default_backend_port
-                );
-
-                // 修改请求路径为 /health
-                let health_uri = http::Uri::from_static("/health");
-                upstream_request.set_uri(health_uri);
-
-                // 设置目标端口为默认后端端口 (Axum)
-                ctx.target_port = Some(self.default_backend_port);
-            }
-            RouteType::ApiProxy => {
-                handlers::api_proxy::handle_api_proxy_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    ctx,
-                    &self.api_key_manager,
-                )
-                .await?;
-            }
-            RouteType::AudioProxy => {
-                handlers::audio::handle_audio_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    ctx,
-                    &self.vnc_backends,
-                )
-                .await?;
-            }
-            RouteType::ImeProxy => {
-                handlers::ime::handle_ime_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    ctx,
-                    &self.vnc_backends,
-                )
-                .await?;
-            }
-            RouteType::TtydProxy => {
-                handlers::ttyd::handle_ttyd_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    ctx,
-                )
-                .await?;
-            }
-            RouteType::WebTtydProxy => {
-                handlers::ttyd::handle_web_ttyd_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    &self.container_lookup,
-                )
-                .await?;
-            }
-            RouteType::DevTtydProxy => {
-                handlers::dev_terminal::handle_dev_ttyd_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    ctx,
-                )
-                .await?;
-            }
-            RouteType::DevVncProxy => {
-                handlers::dev_terminal::handle_dev_vnc_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    ctx,
-                )
-                .await?;
-            }
-            RouteType::DevAudioProxy => {
-                handlers::dev_terminal::handle_dev_audio_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    ctx,
-                    &self.metrics,
-                    &self.container_lookup,
-                )
-                .await?;
-            }
-            RouteType::DevImeProxy => {
-                handlers::dev_terminal::handle_dev_ime_request(
-                    upstream_request,
-                    &original_uri,
-                    matched.params,
-                    ctx,
-                    &self.metrics,
-                    &self.container_lookup,
-                )
-                .await?;
-            }
-        }
+        self.dispatch_upstream_request(
+            *matched.value,
+            matched.params,
+            upstream_request,
+            &original_uri,
+            ctx,
+            &path,
+        )
+        .await?;
 
         Ok(())
     }
@@ -301,136 +171,8 @@ impl ProxyHttp for PortProxy {
             pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
         })?;
 
-        match matched.value {
-            RouteType::VncProxy => {
-                handlers::vnc::handle_vnc_upstream(
-                    ctx,
-                    matched.params,
-                    &self.vnc_backends,
-                    &self.metrics,
-                    &self.container_lookup,
-                )
-                .await
-            }
-            RouteType::PortProxy => {
-                handlers::port_proxy::handle_port_proxy_upstream(
-                    ctx,
-                    matched.params,
-                    &self.backends,
-                    &self.backend_host,
-                    &self.metrics,
-                )
-                .await
-            }
-            RouteType::AppPortProxy => {
-                handlers::app_port_proxy::handle_app_port_proxy_upstream(
-                    ctx,
-                    matched.params,
-                    &self.app_backends,
-                    &self.metrics,
-                )
-                .await
-            }
-            RouteType::DevPortProxy => {
-                handlers::dev_port_proxy::handle_dev_port_proxy_upstream(
-                    ctx,
-                    matched.params,
-                    &self.metrics,
-                    &self.container_lookup,
-                )
-                .await
-            }
-            RouteType::HealthCheck => {
-                // 健康检查已在 upstream_request_filter 中设置 target_port
-                // 这里返回对应的后端 peer
-                let target_port = ctx.target_port.unwrap_or(self.default_backend_port);
-
-                // 记录指标
-                self.metrics.record_request();
-                self.metrics.inc_active();
-
-                // 返回 Axum 服务的 peer
-                let peer = Box::new(HttpPeer::new(
-                    ("127.0.0.1", target_port),
-                    false,
-                    "".to_string(),
-                ));
-
-                Ok(peer)
-            }
-            RouteType::ApiProxy => {
-                handlers::api_proxy::handle_api_proxy_upstream(
-                    ctx,
-                    matched.params,
-                    &self.api_key_manager,
-                    &self.metrics,
-                )
-                .await
-            }
-            RouteType::AudioProxy => {
-                handlers::audio::handle_audio_upstream(
-                    ctx,
-                    matched.params,
-                    &self.vnc_backends,
-                    &self.metrics,
-                )
-                .await
-            }
-            RouteType::ImeProxy => {
-                handlers::ime::handle_ime_upstream(
-                    ctx,
-                    matched.params,
-                    &self.vnc_backends,
-                    &self.metrics,
-                )
-                .await
-            }
-            RouteType::TtydProxy => {
-                handlers::ttyd::handle_ttyd_upstream(
-                    ctx,
-                    matched.params,
-                    &self.vnc_backends,
-                    &self.metrics,
-                    &self.container_lookup,
-                )
-                .await
-            }
-            RouteType::WebTtydProxy => {
-                handlers::ttyd::handle_web_ttyd_upstream(
-                    ctx,
-                    matched.params,
-                    &self.vnc_backends,
-                    &self.project_backends,
-                    &self.metrics,
-                    &self.container_lookup,
-                )
-                .await
-            }
-            RouteType::DevTtydProxy => {
-                handlers::dev_terminal::handle_dev_ttyd_upstream(
-                    ctx,
-                    matched.params,
-                    &self.metrics,
-                    &self.container_lookup,
-                )
-                .await
-            }
-            RouteType::DevVncProxy => {
-                handlers::dev_terminal::handle_dev_vnc_upstream(
-                    ctx,
-                    matched.params,
-                    &self.metrics,
-                    &self.container_lookup,
-                )
-                .await
-            }
-            RouteType::DevAudioProxy => {
-                handlers::dev_terminal::handle_dev_audio_upstream(ctx, &self.metrics).await
-            }
-            RouteType::DevImeProxy => {
-                handlers::dev_terminal::handle_dev_ime_upstream(ctx, &self.metrics).await
-            }
-        }
+        self.dispatch_upstream_peer(*matched.value, matched.params, ctx)
+            .await
     }
 
     /// 连接到上游后的回调

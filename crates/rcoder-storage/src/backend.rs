@@ -329,6 +329,14 @@ impl ContainerLookup for ProjectStoreBackend {
         }
     }
 
+    fn find_app_runtime_addr(&self, app_id: &str) -> Option<String> {
+        match self {
+            Self::Memory(inner) => inner.find_app_runtime_addr(app_id),
+            #[cfg(feature = "pg")]
+            Self::Postgres(inner) => inner.find_app_runtime_addr(app_id),
+        }
+    }
+
     fn find_project_scope(
         &self,
         project_id: &str,

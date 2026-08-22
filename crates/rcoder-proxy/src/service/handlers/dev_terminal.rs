@@ -321,3 +321,177 @@ pub async fn handle_dev_ime_upstream(
     peer.options.idle_timeout = Some(Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
+
+// ── 运行容器（部署后的生产环境）───────────────────────────────────────────────
+//
+// `/userapp/{ttyd,pgweb}/{app_id}/runtime/{*path}`：与上面的开发域四服务对称，
+// 但目标是 `ServiceType::UserApp` 运行容器（app-runtime 镜像）。两处关键差异：
+// 1. 定位走 `find_app_runtime_addr`（确定性命名构造）——运行容器不进 projects
+//    注册表（project_to_container[app_id] 单值键被 builder 占用）；
+// 2. **不经 ws_terminal（17681）**——运行容器没有 agent_runner，ttyd 直连本体
+//    TTYD_PORT=7681（WebSocket upgrade 由 Pingora HTTP 代理直接透传）。
+// app 未部署/已停止 → 构造地址连接失败 502（语义见 trait 文档）。
+
+/// 解析运行容器地址（app_id 先过 identifier 白名单）。
+///
+/// Docker 模式优先经 `AppRuntimeIpResolver` 实时取容器 **IPv4**——dual-stack
+/// 网络下容器名 DNS 的 AAAA 记录会被 pingora 选中，而 app-runtime 的 ttyd 只
+/// bind IPv4（7681 ConnectRefused）；resolver 未注入/未命中时回退确定性命名构造
+/// （K8s = Service FQDN，Docker = 容器名）。
+async fn find_runtime_addr(
+    ip_slot: &arc_swap::ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>,
+    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
+    app_id: &str,
+) -> Result<String, Box<pingora_core::Error>> {
+    if let Err(e) = shared_types::validate_identifier(app_id, "app_id") {
+        warn!("[RUNTIME_TERMINAL] invalid app_id: {}", e);
+        return Err(pingora_core::Error::new(
+            pingora_core::ErrorType::HTTPStatus(400),
+        ));
+    }
+    if !shared_types::is_kubernetes_runtime()
+        && let Some(resolver) = ip_slot.load_full()
+        && let Some(ip) = resolver.resolve_runtime_container_ip(app_id).await
+    {
+        return Ok(ip);
+    }
+    container_lookup
+        .as_ref()
+        .and_then(|lookup| lookup.find_app_runtime_addr(app_id))
+        .ok_or_else(|| {
+            info!("[RUNTIME_TERMINAL] runtime addr unavailable: app_id={app_id}");
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
+                format!("runtime address for app {app_id} unavailable (not deployed?)"),
+            )
+        })
+}
+
+/// `/userapp/ttyd/{app_id}/runtime/{*path}` 请求重写（直连 ttyd 本体 7681）。
+///
+/// 定位在 upstream 阶段完成（pingora 生命周期 `upstream_peer` 先于
+/// `upstream_request_filter`——与开发域 ttyd/vnc 同构），此处只重写 URI/Host。
+pub async fn handle_runtime_ttyd_request(
+    upstream_request: &mut RequestHeader,
+    original_uri: &http::Uri,
+    params: Params<'_, '_>,
+    ctx: &TrackingCtx,
+) -> PingoraResult<()> {
+    let app_id = require_app_id(&params)?;
+    let target_path = runtime_target_path_of(&params);
+    debug!(
+        "[RUNTIME_TTYD] app_id={}, target_path={}",
+        app_id, target_path
+    );
+
+    let host = ctx.vnc_target_ip.as_deref().unwrap_or("127.0.0.1");
+    upstream_request.insert_header("Host", host)?;
+    let new_uri = utils::rewrite_uri(original_uri, target_path)?;
+    upstream_request.set_uri(new_uri);
+    utils::set_common_headers(upstream_request)?;
+    // 直连 ttyd 本体：X-Ttyd-Proxy 族头是 ws_terminal(17681) 中间层的契约，
+    // 运行容器没有该层——不注入（ttyd 忽略未知头，注入反而误导排障）。
+    Ok(())
+}
+
+/// 运行态 ttyd 上游：定位运行容器 + 直连 ttyd 本体（TTYD_PORT=7681，WebSocket）。
+pub async fn handle_runtime_ttyd_upstream(
+    ctx: &mut TrackingCtx,
+    params: Params<'_, '_>,
+    metrics: &Arc<ProxyMetrics>,
+    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
+    ip_slot: &arc_swap::ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>,
+) -> PingoraResult<Box<HttpPeer>> {
+    let app_id = require_app_id(&params)?;
+    let container_addr = find_runtime_addr(ip_slot, container_lookup, &app_id).await?;
+
+    metrics.record_request();
+    metrics.inc_active();
+    ctx.vnc_target_ip = Some(container_addr.clone());
+    debug!(
+        "[RUNTIME_TTYD] app_id={} -> {}:{}",
+        app_id,
+        container_addr,
+        shared_types::TTYD_PORT
+    );
+
+    let mut peer = HttpPeer::new(
+        (container_addr.as_str(), shared_types::TTYD_PORT),
+        false,
+        "".to_string(),
+    );
+    peer.options.connection_timeout = Some(Duration::from_secs(10));
+    peer.options.read_timeout = None;
+    peer.options.write_timeout = None;
+    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
+    // 终端会话可长开；与开发域 ttyd 同档
+    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+    Ok(Box::new(peer))
+}
+
+/// `/userapp/pgweb/{app_id}/runtime/{*path}` 请求重写（HTTP 直连 PGWEB_PORT）。
+///
+/// 定位在 upstream 阶段完成（同 runtime ttyd 的生命周期说明）。
+pub async fn handle_runtime_pgweb_request(
+    upstream_request: &mut RequestHeader,
+    original_uri: &http::Uri,
+    params: Params<'_, '_>,
+    ctx: &TrackingCtx,
+) -> PingoraResult<()> {
+    let app_id = require_app_id(&params)?;
+    let target_path = runtime_target_path_of(&params);
+    debug!(
+        "[RUNTIME_PGWEB] app_id={}, target_path={}",
+        app_id, target_path
+    );
+
+    let host = ctx.vnc_target_ip.as_deref().unwrap_or("127.0.0.1");
+    upstream_request.insert_header("Host", host)?;
+    let new_uri = utils::rewrite_uri(original_uri, target_path)?;
+    upstream_request.set_uri(new_uri);
+    utils::set_common_headers(upstream_request)?;
+    Ok(())
+}
+
+/// 运行态 pgweb 上游：定位运行容器 + 直连 PGWEB_PORT=8081（普通 HTTP）。
+pub async fn handle_runtime_pgweb_upstream(
+    ctx: &mut TrackingCtx,
+    params: Params<'_, '_>,
+    metrics: &Arc<ProxyMetrics>,
+    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
+    ip_slot: &arc_swap::ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>,
+) -> PingoraResult<Box<HttpPeer>> {
+    let app_id = require_app_id(&params)?;
+    let container_addr = find_runtime_addr(ip_slot, container_lookup, &app_id).await?;
+
+    metrics.record_request();
+    metrics.inc_active();
+    ctx.vnc_target_ip = Some(container_addr.clone());
+    debug!(
+        "[RUNTIME_PGWEB] app_id={} -> {}:{}",
+        app_id,
+        container_addr,
+        shared_types::PGWEB_PORT
+    );
+
+    let mut peer = HttpPeer::new(
+        (container_addr.as_str(), shared_types::PGWEB_PORT),
+        false,
+        "".to_string(),
+    );
+    peer.options.connection_timeout = Some(Duration::from_secs(10));
+    peer.options.read_timeout = None;
+    peer.options.write_timeout = None;
+    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
+    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+    Ok(Box::new(peer))
+}
+
+/// 运行态剩余路径 → 目标路径。与开发域 `target_path_of` 的差异：路由
+/// `/userapp/{service}/{app_id}/runtime/{*path}` 中 `runtime` 是静态段，
+/// 剩余 path 可为空（归一 "/"）。
+fn runtime_target_path_of(params: &Params<'_, '_>) -> String {
+    match params.get("path") {
+        Some(p) if !p.is_empty() => format!("/{p}"),
+        _ => "/".to_string(),
+    }
+}

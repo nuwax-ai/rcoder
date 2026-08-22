@@ -17,7 +17,7 @@ use crate::models::{AppRuntimeInfo, RecyclePolicyRequest, StartAppRequest, Start
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body(
         content = StartAppRequest,
-        description = "全可选——无 body 或空对象 = 传统启动（scale=1）。带 url 触发轻量部署：下载 zip → prepare → activate（切流+等就绪，失败保留旧版本现场）→ 启动；release_id 缺省自动生成并在响应返回；sha256 可选校验；env/idle_timeout_seconds 覆盖；pg 凭据自动对齐（不一致重置，失败不阻断部署）"
+        description = "全可选——无 body 或空对象 = 传统启动（scale=1）。带 url 触发轻量部署：下载 zip → prepare → activate（切流+等就绪，失败保留旧版本现场）→ 启动；release_id 缺省自动生成并在响应返回；sha256 可选校验；user_id 可选补记 owner（与 build 同语义）；env/idle_timeout_seconds 覆盖；pg 凭据自动对齐（不一致重置，失败不阻断部署）"
     ),
     responses(
         (status = 200, description = "启动/部署成功", body = HttpResult<StartAppResult>),
@@ -105,7 +105,7 @@ pub async fn restart_app(
 /// 设置闲置回收策略（动态、免重启：免费↔付费 tier 变更）
 ///
 /// strategic-merge Deployment 注解,不碰 pod template → 不触发 rollout,下个扫描 tick 生效。
-/// 比 update 轻（无需 image）。两字段皆 None → 400。
+/// 比 update 轻（无需 image）。三字段（recycle_enabled/idle_timeout_seconds/wake_on_traffic）皆 None → 400。
 #[utoipa::path(
     post,
     path = "/api/v1/apps/{app_id}/recycle-policy",
@@ -115,7 +115,7 @@ pub async fn restart_app(
     request_body = RecyclePolicyRequest,
     responses(
         (status = 200, description = "策略已更新（免重启）", body = HttpResult<AppRuntimeInfo>),
-        (status = 400, description = "参数错误（两字段皆空）", body = HttpResult<String>),
+        (status = 400, description = "参数错误（三字段皆空）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "应用管理"

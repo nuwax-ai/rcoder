@@ -13,6 +13,7 @@
 //! 本模块（mod.rs）仅保留 struct 定义 + 构造（new/builders/create_pingora_proxy）+ Clone。
 
 mod backends;
+mod dispatch;
 mod proxy_http;
 
 pub mod handlers;
@@ -20,7 +21,7 @@ pub mod types;
 pub mod utils;
 
 use anyhow::Result;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use matchit::Router;
 use std::collections::HashMap;
@@ -66,6 +67,9 @@ pub struct PingoraProxyService {
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
     /// UserApp 流量唤醒（stopped app 收到请求时 hold-and-wait 拉起）
     wake_control: Option<Arc<dyn shared_types::AppWakeControl>>,
+    /// userApp 运行容器 IPv4 解析（Docker 模式；ArcSwap 槽——启动后经
+    /// [`Self::set_app_runtime_ip_resolver`] 回填，PortProxy 共享同槽实时见）
+    pub(crate) app_runtime_ip_slot: Arc<ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>>,
 }
 
 /// 为了兼容现有接口，我们保留原来的 PortProxyService 别名
@@ -99,6 +103,8 @@ pub struct PortProxy {
     /// UserApp 访问追踪 + 流量唤醒（/proxy/apps/* 路由用）
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
     wake_control: Option<Arc<dyn shared_types::AppWakeControl>>,
+    /// userApp 运行容器 IPv4 解析槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) app_runtime_ip_slot: Arc<ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>>,
 }
 
 impl PingoraProxyService {
@@ -122,7 +128,17 @@ impl PingoraProxyService {
             container_lookup: None,
             access_tracker: None,
             wake_control: None,
+            app_runtime_ip_slot: Arc::new(ArcSwapOption::from(None)),
         }
+    }
+
+    /// 回填 userApp 运行容器 IPv4 解析器（启动后调用——main 侧 RuntimeManager
+    /// 就绪晚于 Pingora 启动；PortProxy 共享槽，无锁生效）。
+    pub fn set_app_runtime_ip_resolver(
+        &self,
+        resolver: Arc<dyn shared_types::AppRuntimeIpResolver>,
+    ) {
+        self.app_runtime_ip_slot.store(Some(Arc::new(resolver)));
     }
 
     /// 设置容器查找服务（统一数据源）
@@ -196,6 +212,7 @@ impl PingoraProxyService {
             container_lookup: self.container_lookup.clone(),
             access_tracker: self.access_tracker.clone(),
             wake_control: self.wake_control.clone(),
+            app_runtime_ip_slot: self.app_runtime_ip_slot.clone(),
         })
     }
 }
@@ -216,6 +233,7 @@ impl Clone for PingoraProxyService {
             container_lookup: self.container_lookup.clone(),
             access_tracker: self.access_tracker.clone(),
             wake_control: self.wake_control.clone(),
+            app_runtime_ip_slot: self.app_runtime_ip_slot.clone(),
         }
     }
 }

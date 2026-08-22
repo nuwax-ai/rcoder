@@ -236,6 +236,10 @@ impl ContainerLookup for PgStore {
         self.inner.find_by_pod_id(pod_id, service_type)
     }
 
+    fn find_app_runtime_addr(&self, app_id: &str) -> Option<String> {
+        self.inner.find_app_runtime_addr(app_id)
+    }
+
     fn find_project_scope(
         &self,
         project_id: &str,

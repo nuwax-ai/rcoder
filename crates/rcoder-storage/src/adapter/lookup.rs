@@ -69,6 +69,25 @@ impl shared_types::ContainerLookup for ProjectAdapter {
         Some(self.resolve_backend_addr(&entry.info()))
     }
 
+    fn find_app_runtime_addr(&self, app_id: &str) -> Option<String> {
+        if let Err(e) = shared_types::validate_identifier(app_id, "app_id") {
+            debug!("[CONTAINER_LOOKUP] invalid app_id for runtime addr: {e}");
+            return None;
+        }
+        // 确定性命名构造（trait 文档：运行容器不进 projects 注册表，键被 builder 占用）
+        let container_name = format!("{}-{app_id}", ServiceType::UserApp.container_prefix());
+        if shared_types::is_kubernetes_runtime() {
+            Some(shared_types::build_k8s_service_fqdn(
+                &container_name,
+                &self.namespace,
+                &self.cluster_domain,
+            ))
+        } else {
+            // Docker：同 user-defined network 内容器名可 DNS 解析
+            Some(container_name)
+        }
+    }
+
     /// 根据 pod_id 和 service_type 查找容器 IP（共享容器场景）
     ///
     /// 通过 pod_id_to_project_id 索引找到 project_id，

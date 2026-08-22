@@ -402,6 +402,7 @@ async fn app_metadata_upsert_keeps_created_at_and_roundtrip() {
     repo.upsert(&shared_types::AppMetadataRecord {
         app_id: app_id.clone(),
         name: Some("v1".into()),
+        user_id: Some("u-1".into()),
         tenant_id: Some("tenant-1".into()),
         space_id: None,
         created_at,
@@ -412,6 +413,7 @@ async fn app_metadata_upsert_keeps_created_at_and_roundtrip() {
     repo.upsert(&shared_types::AppMetadataRecord {
         app_id: app_id.clone(),
         name: Some("v2".into()),
+        user_id: Some("u-1".into()),
         tenant_id: None,
         space_id: Some("space-2".into()),
         created_at: chrono::Utc::now(),

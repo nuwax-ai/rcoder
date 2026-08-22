@@ -98,11 +98,12 @@ pub enum SortOrder {
 
 /// 更新应用请求
 ///
-/// **rcoder 无状态**：不持有旧 desired state，无法做"部分字段保留"。因此本请求语义为
-/// **全量替换**——调用方（Java，desired state 的 source of truth）需发送完整新状态。
-/// `image` 可选——缺失时用平台默认运行时镜像（env `RCODER_RUNTIME_IMAGE_DIGEST`，
-/// 与 create 同源；等于"滚动到当前默认镜像版本"）；`ports`/`health_check` 为整段替换。
-/// `tenant_id`/`space_id` 携带以保持资源 label（rcoder 不主动修改租户归属）。
+/// **可更新面 = 元数据/资源面**：`env`/`secrets`/`resources`（None=沿用 live 值回退，
+/// 显式传=整段替换）+ `recycle`/`idle`/`tenant`/`space`/乐观锁。
+/// **command/ports/health_check 不可更新**——v2 四要素平台内定（启动命令=manifest 自动、
+/// HTTP 入口=pingap 9080 唯一、探针=app-cli 3010），update 恒从 live 容器 spec 读回，
+/// 防调用方误传破坏发布链内定值。`image` 可选——缺失=滚动到平台默认运行时镜像
+/// （env `RCODER_RUNTIME_IMAGE_DIGEST`）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateAppRequest {
     /// 应用名称（仅元数据，不影响 K8s 资源命名；rcoder 忽略）
@@ -111,18 +112,12 @@ pub struct UpdateAppRequest {
     /// 与 create 同源。rcoder 无状态不持有旧 desired——缺省语义是"用当前默认"而非
     /// "保留旧值"）
     pub image: Option<String>,
-    /// 启动命令
-    pub command: Option<Vec<String>>,
-    /// 环境变量
+    /// 环境变量（None=沿用 live 值；显式传=整段替换，与 start 部署语义一致）
     pub env: Option<HashMap<String, String>>,
-    /// 敏感信息
+    /// 敏感信息（None=沿用 live 值；显式传=整段替换）
     pub secrets: Option<HashMap<String, String>>,
-    /// 资源限制
+    /// 资源限制（None=沿用 live 值）
     pub resources: Option<ResourceLimits>,
-    /// 端口配置（整段替换）
-    pub ports: Option<Vec<PortConfig>>,
-    /// 健康检查配置
-    pub health_check: Option<HealthCheckConfig>,
     /// 租户 ID（携带以保持 label）
     pub tenant_id: Option<String>,
     /// 空间 ID（携带以保持 label）
@@ -151,6 +146,12 @@ pub struct RecyclePolicyRequest {
     /// 闲置回收阈值秒数（per-app 覆盖全局）。None=不改/沿用。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_timeout_seconds: Option<u64>,
+    /// scale-to-zero（stop）期间是否允许流量自动唤醒。None=不改；Some 覆盖
+    /// `rcoder.io/wake-on-traffic` 注解（与 recycle_enabled 同族的计费 tier 动态开关：
+    /// 付费常驻=false 不唤醒 / 免费可回收=true 流量唤醒）。响应字段
+    /// `AppRuntimeInfo.wake_on_traffic` 回读。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_on_traffic: Option<bool>,
 }
 
 /// 删除应用请求

@@ -73,7 +73,7 @@ mod tests {
         assert_eq!(req.idle_timeout_seconds, Some(600));
     }
 
-    /// update 请求：五字段缺省回退语义的入口结构 snake 键。
+    /// update 请求：可更新面（env/secrets/resources 等）snake 键 + 已删字段向后兼容。
     #[test]
     fn update_app_request_accepts_snake_wire() {
         let req: UpdateAppRequest = serde_json::from_value(serde_json::json!({
@@ -82,15 +82,30 @@ mod tests {
         }))
         .expect("partial update snake wire");
         assert_eq!(req.image.as_deref(), Some("registry.example/app-runtime:2"));
-        assert!(req.command.is_none() && req.env.is_none() && req.ports.is_none());
+        assert!(req.env.is_none() && req.secrets.is_none() && req.resources.is_none());
 
         let full: UpdateAppRequest = serde_json::from_value(serde_json::json!({
             "image": "i",
-            "ports": [{"name": "http", "port": 8080, "expose_type": "http"}],
+            "env": {"A": "1"},
             "recycle_enabled": false
         }))
         .expect("full update snake wire");
         assert!(full.recycle_enabled.is_some());
+        assert_eq!(
+            full.env.as_ref().and_then(|e| e.get("A")),
+            Some(&"1".to_string())
+        );
+
+        // v2 四要素内定后 command/ports/health_check 已从请求面删除——旧调用方
+        // 仍传这些键时必须静默忽略（无 deny_unknown_fields），而非 422 反序列化失败。
+        let legacy: Result<UpdateAppRequest, _> = serde_json::from_value(serde_json::json!({
+            "image": "i",
+            "command": ["java", "-jar", "app.jar"],
+            "ports": [{"name": "http", "port": 8080, "expose_type": "http"}],
+            "health_check": {"check_type": "http", "path": "/health", "port": 8080}
+        }));
+        let legacy = legacy.expect("legacy callers sending removed fields must not break");
+        assert_eq!(legacy.image.as_deref(), Some("i"));
     }
 
     /// query 请求：filters/sort 键与 SortOrder 小写值。
