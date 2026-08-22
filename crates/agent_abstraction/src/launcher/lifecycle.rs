@@ -22,7 +22,6 @@
 
 use anyhow::Result;
 use dashmap::DashMap;
-use process_wrap::tokio::ChildWrapper;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -31,33 +30,11 @@ use std::sync::{
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
 
 use agent_client_protocol::schema::v1::SessionId;
 use shared_types::{AgentLifecycle, ModelProviderConfig};
 
-use crate::diagnostics::{DiagnosticsListener, ProcessDiagnostics};
-
-/// Claude 进程启动参数
-///
-/// 将多个构造函数参数封装为结构体，提升可读性和可维护性。
-pub struct ClaudeProcessParams {
-    pub project_id: String,
-    pub session_id: SessionId,
-    pub child_process: Box<dyn ChildWrapper>,
-    pub stderr_task: JoinHandle<()>,
-    pub cancel_token: CancellationToken,
-    pub shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
-    pub project_uuid_map: Option<Arc<DashMap<String, String>>>,
-    pub service_uuid: Option<String>,
-    pub abnormal_exit_flag: Option<Arc<AtomicBool>>,
-    /// 🔥 新增：详细的退出信息（signal、exit_code），用于生成更有意义的错误消息
-    pub exit_detail: Option<Arc<Mutex<Option<ExitDetail>>>>,
-    pub diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
-    pub process_command: String,
-    pub process_args: Vec<String>,
-    pub working_dir: PathBuf,
-}
+use crate::diagnostics::DiagnosticsListener;
 
 /// Agent生命周期守卫
 ///
@@ -89,33 +66,33 @@ impl std::fmt::Debug for AgentLifecycleGuard {
     }
 }
 
-struct AgentLifecycleInner {
-    project_id: String,
-    session_id: SessionId,
+pub(crate) struct AgentLifecycleInner {
+    pub(crate) project_id: String,
+    pub(crate) session_id: SessionId,
     /// 🔥 进程组 ID（当前实现：使用 child.pid 作为伪进程组）
     ///
     /// 注意：当前实现使用子进程的 PID 作为 PGID。
     /// - 如果子进程通过 setsid() 创建了真正的进程组，kill(-pgid) 会杀死整个进程树
     /// - 如果子进程没有创建进程组，kill(-pgid) 只会杀死子进程本身
     /// - 未来可以使用 process-wrap 库创建真正的进程组
-    pgid: u32,
-    cancel_token: CancellationToken,
-    resources: AgentResources,
-    stopped: AtomicBool,
+    pub(crate) pgid: u32,
+    pub(crate) cancel_token: CancellationToken,
+    pub(crate) resources: AgentResources,
+    pub(crate) stopped: AtomicBool,
     /// 🔥 共享的 API 密钥管理器引用（用于自动清理）
-    shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    pub(crate) shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
     /// 🔥 project_id -> service_uuid 映射（用于清理时查找 UUID）
-    project_uuid_map: Option<Arc<DashMap<String, String>>>,
+    pub(crate) project_uuid_map: Option<Arc<DashMap<String, String>>>,
     /// 🔥 关联的 service_uuid（用于清理时定位配置）
-    service_uuid: Option<String>,
+    pub(crate) service_uuid: Option<String>,
     /// 🔥 P0-2 接线: 进程诊断监听器
-    diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
+    pub(crate) diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
     /// 启动命令（用于构造 ProcessDiagnostics）
-    process_command: String,
+    pub(crate) process_command: String,
     /// 启动参数（用于构造 ProcessDiagnostics）
-    process_args: Vec<String>,
+    pub(crate) process_args: Vec<String>,
     /// 工作目录（用于构造 ProcessDiagnostics）
-    working_dir: PathBuf,
+    pub(crate) working_dir: PathBuf,
 }
 
 /// Agent资源管理枚举
@@ -123,528 +100,13 @@ struct AgentLifecycleInner {
 /// ## 后台回收版本
 ///
 /// 存储后台任务句柄，确保子进程被 wait() 回收
-enum AgentResources {
+pub(crate) enum AgentResources {
     Claude {
         /// stderr 任务句柄
         stderr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
         /// 后台回收任务（已启动，会 wait() 子进程）
         _reaper_task: JoinHandle<()>,
     },
-}
-
-impl AgentLifecycleGuard {
-    /// 为Claude Agent创建生命周期守卫（便捷入口，默认无密钥管理器/诊断监听器）
-    ///
-    /// **注意**：此构造函数不携带 `diagnostics_listener`、`process_command` 等诊断信息，
-    /// reaper 退出时不会触发 `on_process_error` / `on_process_exited` 回调。
-    /// 如需完整诊断能力，请使用 [`new_claude_full`]。
-    ///
-    /// # 参数
-    ///
-    /// * `child_process` - 已启动的子进程（必须是进程组组长）
-    /// * `stderr_task` - stderr 读取任务
-    /// * `cancel_token` - 取消令牌
-    ///
-    /// # 僵尸进程避免
-    ///
-    /// 此函数会立即启动后台任务等待子进程，确保子进程退出时被回收。
-    pub fn new_claude(
-        project_id: String,
-        session_id: SessionId,
-        child_process: Box<dyn ChildWrapper>,
-        stderr_task: JoinHandle<()>,
-        cancel_token: CancellationToken,
-    ) -> Result<Self> {
-        Self::new_claude_full(ClaudeProcessParams {
-            project_id,
-            session_id,
-            child_process,
-            stderr_task,
-            cancel_token,
-            shared_api_key_manager: None,
-            project_uuid_map: None,
-            service_uuid: None,
-            abnormal_exit_flag: None,
-            exit_detail: None,
-            diagnostics_listener: None,
-            process_command: String::new(),
-            process_args: Vec::new(),
-            working_dir: PathBuf::new(),
-        })
-    }
-
-    /// 完整构造函数：通过结构体参数创建生命周期守卫
-    ///
-    /// 支持所有可选功能：密钥管理器、异常退出标志、诊断监听器等。
-    ///
-    /// # Errors
-    ///
-    /// 子进程 PID 不存在或为 0 时返回初始化错误。
-    pub fn new_claude_full(params: ClaudeProcessParams) -> Result<Self> {
-        let ClaudeProcessParams {
-            project_id,
-            session_id,
-            mut child_process,
-            stderr_task,
-            cancel_token,
-            shared_api_key_manager,
-            project_uuid_map,
-            service_uuid,
-            abnormal_exit_flag,
-            exit_detail,
-            diagnostics_listener,
-            process_command,
-            process_args,
-            working_dir,
-        } = params;
-        let pid = child_process.id().filter(|pid| *pid != 0).ok_or_else(|| {
-            anyhow::anyhow!("lifecycle child process has no valid PID: project_id={project_id}")
-        })?;
-
-        // 🔥 进程组 ID 等于组长进程的 PID
-        // process-wrap 的 ProcessGroup 使用 setpgid(0, 0) 创建新进程组，使进程成为组长
-        let pgid = pid;
-        let project_id_clone = project_id.clone();
-        let session_id_str = session_id.0.to_string();
-
-        // 🔥 关键：立即启动后台回收任务
-        // 这个任务会等待子进程退出，确保不会产生僵尸进程
-        // 当子进程退出时，设置 abnormal_exit_flag 并触发 cancel_token
-        // 让 SACP 连接层检测到并发送 SSE 通知
-        let cancel_token_for_reaper = cancel_token.clone();
-        let abnormal_exit_flag_clone = abnormal_exit_flag.clone();
-        let exit_detail_clone = exit_detail.clone();
-        let project_id_for_reaper = project_id.clone();
-        let listener_for_reaper = diagnostics_listener.clone();
-        let command_for_reaper = process_command.clone();
-        let args_for_reaper = process_args.clone();
-        let working_dir_for_reaper = working_dir.clone();
-        let reaper_task = tokio::spawn(async move {
-            info!(
-                "[ProcessReaper] 开始监控 Agent 进程: project_id={}, pid={}, pgid={}",
-                project_id_for_reaper, pid, pgid
-            );
-
-            // 🔥 优先等待子进程退出，而不是响应取消信号
-            // 这确保了即使收到取消信号，也能正确检测进程是否已退出
-            let wait_result = child_process.wait().await;
-
-            // 检查是否是外部取消（用户主动 stop）
-            let was_cancelled = cancel_token_for_reaper.is_cancelled();
-
-            let mut should_report_error = false;
-            let mut exit_code_opt: Option<i32> = None;
-            let mut error_msg: Option<String> = None;
-
-            match wait_result {
-                Ok(status) => {
-                    // 获取详细的退出信息
-                    let exit_code = status.code();
-                    #[cfg(unix)]
-                    let signal = {
-                        use std::os::unix::process::ExitStatusExt;
-                        status.signal()
-                    };
-                    #[cfg(not(unix))]
-                    let signal: Option<i32> = None;
-
-                    exit_code_opt = exit_code;
-
-                    if !status.success() {
-                        // 🔥 非零退出码或被信号杀死 = 异常退出
-                        if let Some(ref flag) = abnormal_exit_flag_clone {
-                            // 只有非用户主动取消时才标记为异常
-                            if !was_cancelled {
-                                flag.store(true, Ordering::SeqCst);
-                            }
-                        }
-                        // 🔥 新增：设置详细的退出信息，用于生成更有意义的错误消息
-                        if let Some(ref exit_detail) = exit_detail_clone
-                            && !was_cancelled
-                        {
-                            let detail = analyze_exit_detail(exit_code, signal);
-                            let mut guard = exit_detail.lock().await;
-                            *guard = Some(detail);
-                        }
-                        // 只有非用户主动取消时才视为需要报告错误
-                        if !was_cancelled {
-                            should_report_error = true;
-                            error_msg = Some(format!(
-                                "non-zero exit (code={:?}, signal={:?})",
-                                exit_code, signal
-                            ));
-                        }
-                        warn!(
-                            "[ProcessReaper] Agent 进程异常退出: project_id={}, pid={}, pgid={}, exit_code={:?}, signal={:?}, was_cancelled={}",
-                            project_id_for_reaper, pid, pgid, exit_code, signal, was_cancelled
-                        );
-                    } else {
-                        info!(
-                            "[ProcessReaper] Agent 进程正常退出: project_id={}, pid={}, pgid={}, exit_code={:?}",
-                            project_id_for_reaper, pid, pgid, exit_code
-                        );
-                    }
-                }
-                Err(e) => {
-                    // wait 失败，可能是进程已被其他方式回收
-                    if let Some(ref flag) = abnormal_exit_flag_clone
-                        && !was_cancelled
-                    {
-                        flag.store(true, Ordering::SeqCst);
-                    }
-                    if !was_cancelled {
-                        should_report_error = true;
-                        error_msg = Some(format!("wait() failed: {}", e));
-                    }
-                    warn!(
-                        "[ProcessReaper] Agent 进程 wait() 失败: project_id={}, pid={}, pgid={}, error={}, was_cancelled={}",
-                        project_id_for_reaper, pid, pgid, e, was_cancelled
-                    );
-                }
-            }
-
-            // P0-2 接线: 把退出事件转给 listener
-            // 规则: 非用户主动取消 + 异常(非 0 退出 / wait 失败) → on_process_error
-            //       其他情况(0 退出 / 用户主动取消) → on_process_exited
-            if let Some(ref listener) = listener_for_reaper {
-                let diagnostics = ProcessDiagnostics {
-                    command: command_for_reaper,
-                    args: args_for_reaper,
-                    working_dir: working_dir_for_reaper,
-                    pid,
-                    exit_code: exit_code_opt,
-                    stderr_tail: Vec::new(),
-                    command_exists: true,
-                    startup_duration_ms: 0,
-                    acp_init_success: false,
-                    error_message: error_msg,
-                };
-                if should_report_error {
-                    listener.on_process_error(&diagnostics);
-                } else {
-                    listener.on_process_exited(&diagnostics);
-                }
-            }
-
-            // 🔥 关键：触发 cancel_token，通知 SACP 连接层进程已退出
-            // 这会让 SACP 连接检测到并发送 SSE 错误通知，然后断开连接
-            if !was_cancelled {
-                info!(
-                    "[ProcessReaper] 触发 cancel_token，通知 SACP 连接断开: project_id={}, pid={}",
-                    project_id_for_reaper, pid
-                );
-                cancel_token_for_reaper.cancel();
-            } else {
-                debug!(
-                    "[ProcessReaper] cancel_token 已被外部取消，跳过: project_id={}, pid={}",
-                    project_id_for_reaper, pid
-                );
-            }
-        });
-
-        let resources = AgentResources::Claude {
-            stderr_task: Arc::new(Mutex::new(Some(stderr_task))),
-            _reaper_task: reaper_task,
-        };
-
-        let inner = Arc::new(AgentLifecycleInner {
-            project_id: project_id_clone,
-            session_id,
-            pgid,
-            cancel_token,
-            resources,
-            stopped: AtomicBool::new(false),
-            shared_api_key_manager,
-            project_uuid_map,
-            service_uuid,
-            diagnostics_listener,
-            process_command,
-            process_args,
-            working_dir,
-        });
-
-        info!(
-            "[LifecycleGuard] 创建 Claude Agent 守卫: project_id={}, pgid={}, session_id={}",
-            project_id, pgid, session_id_str
-        );
-
-        Ok(Self { inner })
-    }
-
-    /// 优雅停止agent
-    ///
-    /// 带升级机制：SIGTERM → 等 500ms → SIGKILL（见 kill_process_group）。
-    /// 注：容器内子进程若为 PID 1 则信号被内核忽略，此时跳过进程组信号、
-    /// 仅发 cancel 信号并依赖 init 收割（见 kill_process_group 的 pgid==1 防御）。
-    ///
-    /// ## 进程组终止
-    ///
-    /// 使用 `process-wrap` 创建真正的进程组，发送信号到 `-pgid` 会终止：
-    /// - 子进程（进程组组长）
-    /// - 所有孙进程（同一进程组中的进程）
-    pub async fn graceful_stop(&self) -> Result<()> {
-        // 🔥 使用原子 CAS 操作确保只执行一次清理
-        // compare_exchange 返回 Ok 表示成功将 false 改为 true，即当前线程获得清理权
-        // 返回 Err 表示已经被其他地方清理（Drop 或其他 graceful_stop 调用）
-        let should_cleanup = self
-            .inner
-            .stopped
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-
-        if !should_cleanup {
-            debug!("Agent already stopped, skipping graceful stop");
-            return Ok(());
-        }
-
-        info!(
-            "Gracefully stopping Claude agent for project: {}, pgid={}",
-            self.inner.project_id, self.inner.pgid
-        );
-
-        // 1. 发送取消信号
-        self.inner.cancel_token.cancel();
-
-        // 2. 终止进程组
-        self.kill_process_group(false).await?;
-
-        info!(
-            "Gracefully stopped Claude agent for project: {}",
-            self.inner.project_id
-        );
-        Ok(())
-    }
-
-    /// 发送取消信号（非阻塞）
-    pub fn cancel(&self) {
-        debug!("Sending cancel signal to agent: {}", self.inner.project_id);
-        self.inner.cancel_token.cancel();
-    }
-
-    /// 检查是否已停止
-    pub fn is_stopped(&self) -> bool {
-        self.inner.stopped.load(Ordering::SeqCst)
-    }
-
-    /// 获取取消令牌
-    pub fn cancellation_token(&self) -> &CancellationToken {
-        &self.inner.cancel_token
-    }
-
-    /// 🔥 终止进程组
-    ///
-    /// 向 `-pgid` 发送信号，杀死整个进程组
-    ///
-    /// # Unix 信号语义
-    ///
-    /// - `kill(pgid, SIGTERM)` - 发送给单个进程
-    /// - `kill(-pgid, SIGTERM)` - 发送给整个进程组
-    /// - `kill(0, SIGTERM)` - 发送给调用者自己的进程组（危险！）
-    ///
-    /// # 参数
-    ///
-    /// * `force` - 是否强制使用 SIGKILL（否则使用 SIGTERM）
-    #[allow(unused_variables)]
-    async fn kill_process_group(&self, force: bool) -> Result<()> {
-        #[cfg(unix)]
-        {
-            let pgid = self.inner.pgid;
-            use nix::errno::Errno;
-            use nix::sys::signal::{Signal, kill};
-            use nix::unistd::Pid;
-
-            // 🔥 关键防御性检查：pgid 不能为 0
-            // kill(0, SIGKILL) 会杀死调用者自己的进程组，这是危险的
-            if pgid == 0 {
-                warn!(
-                    "[LifecycleGuard] 进程组 ID 为 0，跳过进程组终止（可能是初始化失败）: project_id={}",
-                    self.inner.project_id
-                );
-                return Ok(());
-            }
-
-            // 🔥 PID 1 防御：子进程以 ProcessGroup::leader() 启动，pgid == child_pid。
-            // 在 docker exec 等场景子进程可能拿到 pid 1，此时：
-            // - kill(-1, SIG) 语义是「所有进程组」，绝不能发；
-            // - 内核默认忽略 PID 1 的未注册信号（含 SIGTERM/SIGKILL）。
-            // 依赖容器内 init（如 tini）兼作孤儿进程收割者（见本模块顶部说明）。
-            if pgid == 1 {
-                warn!(
-                    "[LifecycleGuard] pgid==1（子进程为容器 PID 1），跳过进程组信号终止，\
-                     仅依赖 cancel 信号与 init 收割: project_id={}",
-                    self.inner.project_id
-                );
-                return Ok(());
-            }
-
-            // 🔥 关键：pgid 必须在 i32 范围内才能安全转换为负数
-            // Linux PIDs 最大可达 4,194,304，远小于 i32::MAX (2,147,483,647)
-            // 但为了防御性编程，仍然检查
-            if pgid > i32::MAX as u32 {
-                warn!(
-                    "[LifecycleGuard] 进程组 ID {} 超出 i32 范围，跳过进程组终止: project_id={}",
-                    pgid, self.inner.project_id
-                );
-                return Ok(());
-            }
-
-            // 🔥 关键：使用负的进程组 ID（真实的进程组 ID）
-            // -pgid 表示发送信号到整个进程组，而不仅仅是进程组组长
-            let target = Pid::from_raw(-(pgid as i32));
-
-            let signal = if force {
-                Signal::SIGKILL
-            } else {
-                Signal::SIGTERM
-            };
-
-            match kill(target, signal) {
-                Ok(_) => {
-                    debug!("already sent signal: pgid={}, signal={:?}", pgid, signal);
-
-                    // 如果是 SIGTERM，等待一段时间让进程优雅退出
-                    if !force {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-                        // 强制杀死进程组
-                        let _ = kill(target, Signal::SIGKILL);
-                        debug!("already force killed: pgid={}", pgid);
-                    }
-                }
-                Err(Errno::ESRCH) => {
-                    // 进程组已退出，这是正常的
-                    debug!("process group already exited: pgid={}", pgid);
-                }
-                Err(Errno::EPERM) => {
-                    // 权限不足，无法终止进程组
-                    warn!(
-                        "[LifecycleGuard] 权限不足，无法终止进程组: pgid={}, project_id={}",
-                        pgid, self.inner.project_id
-                    );
-                }
-                Err(e) => {
-                    // 其他错误（如 EINVAL、EFAULT 等）
-                    debug!(" kill failed: pgid={}, error={:?}", pgid, e);
-                }
-            }
-
-            info!("Claude process group stopped: pgid={}", pgid);
-        }
-
-        #[cfg(not(unix))]
-        {
-            debug!("Unix platform, skipping process group stop");
-        }
-
-        Ok(())
-    }
-}
-
-impl Clone for AgentLifecycleGuard {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-impl Drop for AgentLifecycleGuard {
-    fn drop(&mut self) {
-        let strong_count = Arc::strong_count(&self.inner);
-
-        debug!(
-            "[Claude] AgentLifecycleGuard::drop 开始: project_id={}, pgid={}, strong_count={}",
-            self.inner.project_id, self.inner.pgid, strong_count
-        );
-
-        // 🔥 使用原子 CAS 操作确保只执行一次清理
-        // 不再依赖引用计数，因为引用计数可能因为多处 clone 而不准确
-        // compare_exchange 返回 Ok 表示成功将 false 改为 true，即当前线程获得清理权
-        // 返回 Err 表示已经被其他线程清理，当前线程无需操作
-        let should_cleanup = self
-            .inner
-            .stopped
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-
-        if should_cleanup {
-            debug!(
-                "[Claude] AgentLifecycleGuard 获得清理权，开始清理资源: {}",
-                self.inner.project_id
-            );
-
-            // 发送取消信号
-            self.inner.cancel_token.cancel();
-
-            // 注意：API 密钥配置的清理由 agent_runner 层的 stop_agent 方法统一负责
-            // 包括：
-            // - shared_api_key_manager 中的配置
-            // - project_uuid_map 中的映射
-            //
-            // 这样避免双重清理，确保资源只被清理一次
-
-            // 🔥 同步终止进程组
-            #[cfg(unix)]
-            {
-                use nix::sys::signal::{Signal, kill};
-                use nix::unistd::Pid;
-
-                let pgid = self.inner.pgid;
-
-                // 🔥 关键防御性检查：pgid 不能为 0 且必须在 i32 范围内
-                // kill(0, SIGKILL) 会杀死调用者自己的进程组，这是危险的
-                if pgid == 0 {
-                    debug!(
-                        "[Claude] 进程组 ID 为 0，跳过进程组终止: project_id={}",
-                        self.inner.project_id
-                    );
-                } else if pgid > i32::MAX as u32 {
-                    debug!(
-                        "[Claude] 进程组 ID {} 超出 i32 范围，跳过进程组终止: project_id={}",
-                        pgid, self.inner.project_id
-                    );
-                } else {
-                    let target = Pid::from_raw(-(pgid as i32));
-
-                    if let Err(e) = kill(target, Signal::SIGKILL) {
-                        // 进程可能已经退出，这是正常的
-                        debug!(
-                            "[Claude] 终止进程组失败（可能已退出）: pgid={}, error={}",
-                            pgid, e
-                        );
-                    } else {
-                        info!(
-                            "[Claude] 进程组已终止: pgid={}, project_id={}",
-                            pgid, self.inner.project_id
-                        );
-                    }
-                }
-            }
-
-            #[cfg(not(unix))]
-            {
-                debug!("[Claude] Unix platform, skipping process group stop");
-            }
-
-            // 注意：后台回收任务 (reaper_task) 会自动完成
-            // 不需要在这里等待或取消
-
-            info!(
-                "[Claude] AgentLifecycleGuard 清理完成: project_id={}",
-                self.inner.project_id
-            );
-        } else {
-            debug!(
-                "[Claude] AgentLifecycleGuard 跳过清理（已被其他引用清理）: project_id={}",
-                self.inner.project_id
-            );
-        }
-
-        debug!(
-            "[Claude] AgentLifecycleGuard::drop 完成: project_id={}",
-            self.inner.project_id
-        );
-    }
 }
 
 // 为AgentLifecycleGuard实现AgentLifecycle trait
@@ -717,7 +179,7 @@ impl ExitDetail {
 ///
 /// # Returns
 /// ExitDetail 枚举
-fn analyze_exit_detail(exit_code: Option<i32>, signal: Option<i32>) -> ExitDetail {
+pub(crate) fn analyze_exit_detail(exit_code: Option<i32>, signal: Option<i32>) -> ExitDetail {
     // 优先检查信号（SIGKILL、SIGTERM 等）
     if let Some(sig) = signal {
         match sig {
@@ -743,3 +205,8 @@ fn analyze_exit_detail(exit_code: Option<i32>, signal: Option<i32>) -> ExitDetai
 
     ExitDetail::Unknown
 }
+
+mod shutdown;
+mod spawn;
+
+pub use spawn::ClaudeProcessParams;
