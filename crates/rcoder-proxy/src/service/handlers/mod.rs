@@ -6,6 +6,7 @@ pub mod api_proxy;
 pub mod app_port_proxy;
 pub mod audio;
 pub mod dev_port_proxy;
+pub mod dev_terminal;
 pub mod ime;
 pub mod port_proxy;
 pub mod ttyd;

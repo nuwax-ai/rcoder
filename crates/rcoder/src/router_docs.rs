@@ -49,6 +49,11 @@ use crate::handler;
         handler::proxy_to_port_with_path,
         handler::proxy_to_app_with_path,
         handler::proxy_to_devapp_with_path,
+        handler::proxy_to_userapp_ttyd,
+        handler::proxy_to_userapp_vnc,
+        handler::proxy_to_userapp_audio,
+        handler::proxy_to_userapp_ime,
+        handler::userapp_proxy_routes_doc,
         handler::proxy_with_query_params,
         // P0-4: Agent Management 转发层
         handler::list_agents,

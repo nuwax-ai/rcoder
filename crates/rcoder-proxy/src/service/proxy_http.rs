@@ -239,6 +239,46 @@ impl ProxyHttp for PortProxy {
                 )
                 .await?;
             }
+            RouteType::DevTtydProxy => {
+                handlers::dev_terminal::handle_dev_ttyd_request(
+                    upstream_request,
+                    &original_uri,
+                    matched.params,
+                    ctx,
+                )
+                .await?;
+            }
+            RouteType::DevVncProxy => {
+                handlers::dev_terminal::handle_dev_vnc_request(
+                    upstream_request,
+                    &original_uri,
+                    matched.params,
+                    ctx,
+                )
+                .await?;
+            }
+            RouteType::DevAudioProxy => {
+                handlers::dev_terminal::handle_dev_audio_request(
+                    upstream_request,
+                    &original_uri,
+                    matched.params,
+                    ctx,
+                    &self.metrics,
+                    &self.container_lookup,
+                )
+                .await?;
+            }
+            RouteType::DevImeProxy => {
+                handlers::dev_terminal::handle_dev_ime_request(
+                    upstream_request,
+                    &original_uri,
+                    matched.params,
+                    ctx,
+                    &self.metrics,
+                    &self.container_lookup,
+                )
+                .await?;
+            }
         }
 
         Ok(())
@@ -365,6 +405,30 @@ impl ProxyHttp for PortProxy {
                     &self.container_lookup,
                 )
                 .await
+            }
+            RouteType::DevTtydProxy => {
+                handlers::dev_terminal::handle_dev_ttyd_upstream(
+                    ctx,
+                    matched.params,
+                    &self.metrics,
+                    &self.container_lookup,
+                )
+                .await
+            }
+            RouteType::DevVncProxy => {
+                handlers::dev_terminal::handle_dev_vnc_upstream(
+                    ctx,
+                    matched.params,
+                    &self.metrics,
+                    &self.container_lookup,
+                )
+                .await
+            }
+            RouteType::DevAudioProxy => {
+                handlers::dev_terminal::handle_dev_audio_upstream(ctx, &self.metrics).await
+            }
+            RouteType::DevImeProxy => {
+                handlers::dev_terminal::handle_dev_ime_upstream(ctx, &self.metrics).await
             }
         }
     }

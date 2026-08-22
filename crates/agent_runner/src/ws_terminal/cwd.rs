@@ -23,6 +23,8 @@ use shared_types::paths::WORKSPACE_ROOT;
 
 /// ComputerAgentRunner 容器内项目目录前缀（per-user 容器，不受隔离模式影响）
 const HOME_PREFIX: &str = "/home/user";
+/// userApp 开发卷根（UserAppBuilder 终端 cwd 前缀）。
+const USERAPP_PREFIX: &str = shared_types::paths::USERAPP_WORKSPACE_ROOT;
 
 // WebAgentRunner 工作区根用 shared_types::paths::WORKSPACE_ROOT (单一事实源, 不再本地定义)
 
@@ -65,12 +67,15 @@ pub fn resolve_project_cwd(
             // per-user 容器：项目目录恒为单级 /home/user/{project_id}
             resolve_in_candidates(project_id, &[HOME_PREFIX])
         }
-        Some(ServiceType::WebAgentRunner)
-        | Some(ServiceType::UserApp)
-        | Some(ServiceType::UserAppBuilder) => {
+        Some(ServiceType::UserAppBuilder) => {
+            // userApp 开发容器的终端：workspace = 开发卷 {USERAPP_WORKSPACE_ROOT}/{app_id}
+            // （与 chat 的 work_dir、file-server 的 resolve_userapp_dev 同根——
+            // /userapp/ttyd/{app_id} 经 Pingora 注入本 service_type 到达此处）
+            resolve_in_candidates(project_id, &[USERAPP_PREFIX])
+        }
+        Some(ServiceType::WebAgentRunner) | Some(ServiceType::UserApp) => {
             // 共享容器三级优先，单项目隔离单级兜底
-            // UserApp 不由 agent_runner 托管；UserAppBuilder 经 file-server build,终端 cwd 兜底此路径
-            // (此处仅兜底,运行时不应进入)
+            // UserApp 不由 agent_runner 托管（app_manager Deployment 路径）
             let prefixes = build_web_prefixes(tenant, space);
             let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
             resolve_in_candidates(project_id, &refs)
