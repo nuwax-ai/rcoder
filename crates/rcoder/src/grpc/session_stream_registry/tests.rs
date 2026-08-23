@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use tonic::Code;
 
 fn registry() -> Arc<SessionStreamRegistry> {
     Arc::new(SessionStreamRegistry::new())
@@ -28,10 +29,21 @@ async fn first_client_claim_semantics() {
     assert!(!reg.claim_first_client("s1"), "reconnect stays live-only");
     // turn 终态归还 → 新一轮 turn 的首连重新获得资格
     reg.release_first_client_claim("s1");
-    assert!(reg.claim_first_client("s1"), "claim restored after turn terminal");
-    // cancelled 不归还（业务常态事件，调用方不触发 release——此处验证 release 本身幂等）
+    assert!(
+        reg.claim_first_client("s1"),
+        "claim restored after turn terminal"
+    );
+    // 连续 double release（release 幂等）后：资格恰好可再授予一次，且只授予一次
     reg.release_first_client_claim("s1");
-    assert!(!reg.claim_first_client("s1"), "double release must not re-grant");
+    reg.release_first_client_claim("s1");
+    assert!(
+        reg.claim_first_client("s1"),
+        "claim available after double release"
+    );
+    assert!(
+        !reg.claim_first_client("s1"),
+        "second claim still live-only"
+    );
 }
 
 /// 跨 session 隔离：s1 的资格状态不影响 s2
@@ -39,11 +51,17 @@ async fn first_client_claim_semantics() {
 async fn claim_is_per_session() {
     let reg = registry();
     assert!(reg.claim_first_client("s1"));
-    assert!(reg.claim_first_client("s2"), "independent sessions claim independently");
+    assert!(
+        reg.claim_first_client("s2"),
+        "independent sessions claim independently"
+    );
 }
 
 fn token_pair() -> (Arc<CancellationToken>, Arc<CancellationToken>) {
-    (Arc::new(CancellationToken::new()), Arc::new(CancellationToken::new()))
+    (
+        Arc::new(CancellationToken::new()),
+        Arc::new(CancellationToken::new()),
+    )
 }
 
 /// 按 addr 关闭：只取消匹配地址的登记流，失效 Weak 一并回收
@@ -107,7 +125,7 @@ async fn terminal_error_event_payload_is_valid_json() {
 
 #[test]
 fn stream_error_payload_is_valid_json() {
-    let ev = make_stream_error_event(tonic::Code::Unavailable, "boom");
+    let ev = make_stream_error_event(Code::Unavailable, "boom");
     assert_eq!(ev.sub_type, "error");
     assert!(serde_json::from_str::<serde_json::Value>(&ev.payload).is_ok());
 }
@@ -131,5 +149,8 @@ fn terminal_classification_semantics() {
     assert!(!is_turn_terminal("SessionPromptEnd", "cancelled"));
     assert!(is_stream_closing("SessionPromptEnd", "stream_ended"));
     assert!(!is_stream_closing("SessionPromptEnd", "cancelled"));
-    assert!(!is_stream_closing("AgentSessionUpdate", "agent_message_chunk"));
+    assert!(!is_stream_closing(
+        "AgentSessionUpdate",
+        "agent_message_chunk"
+    ));
 }

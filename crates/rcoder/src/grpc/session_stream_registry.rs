@@ -297,3 +297,6 @@ pub(crate) fn map_tonic_code(code: Code) -> &'static str {
         _ => "GRPC_UNKNOWN",
     }
 }
+
+#[cfg(test)]
+mod tests;
