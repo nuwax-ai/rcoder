@@ -106,10 +106,10 @@ async fn main() -> anyhow::Result<()> {
             match publish
                 .recover_running(
                     "rcoder restarted",
-                    &rcoder::userapp_publish::store::owner_pod_name(),
+                    &userapp_publish::store::owner_pod_name(),
                     chrono::Utc::now()
                         - chrono::Duration::seconds(
-                            rcoder::userapp_publish::store::STALE_TASK_SECS,
+                            userapp_publish::store::STALE_TASK_SECS,
                         ),
                 )
                 .await
