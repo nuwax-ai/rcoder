@@ -457,13 +457,48 @@ pub fn validate_topology(projects: &[DiscoveredProject]) -> Result<Vec<String>, 
         .iter()
         .filter(|project| project.manifest.project.enabled)
         .collect();
-    // collect_topology_issues 已含环检测（cycle_issues），此处无环必成序——
-    // topological_order 的 cycle Err 分支在此调用路径不可达，仅保留 Ok 语义。
-    topological_order(&enabled)
+    // collect_topology_issues 已含环检测（cycle_issues→topo_sort），issues 为空
+    // 则图必无环——topo_sort 必 Ok（Err 集仅在有环/缺依赖时非空，均已被上方拦截）。
+    match topo_sort(&enabled) {
+        Ok(order) => Ok(order),
+        Err(_) => Err(ManifestError::Validation(
+            "internal: topology passed validation but sort found a cycle".into(),
+        )),
+    }
 }
 
 /// 依赖环检测：报出环上的全部服务及各自声明文件。
 fn cycle_issues(enabled: &[&DiscoveredProject]) -> Vec<ValidationIssue> {
+    match topo_sort(enabled) {
+        Ok(_) => Vec::new(),
+        Err(cycle_ids) => {
+            let files: Vec<String> = enabled
+                .iter()
+                .filter(|project| cycle_ids.contains(&project.service_id().to_owned()))
+                .map(|project| manifest_file_of(&project.dir))
+                .collect();
+            vec![
+                ValidationIssue::new(format!(
+                    "service dependency cycle detected among: {}",
+                    cycle_ids.join(", ")
+                ))
+                .at_field("run.depends_on")
+                .with_hint(format!(
+                    "break the cycle in one of: {} (depends_on must form a DAG)",
+                    files.join(", ")
+                )),
+            ]
+        }
+    }
+}
+
+/// Kahn 拓扑排序内核（cycle_issues 与 validate_topology 的单一实现）：
+/// `Ok(order)` = 拓扑序；`Err(cycle_ids)` = 环上剩余服务 id（无法出队者）。
+///
+/// 注：依赖指向 disabled/missing 服务时同样无人出队，会被归入 Err 集——
+/// 调用方（collect_topology_issues）已在之前产出 missing-dep issue，fast-fail
+/// 路径不会把伪环信息呈现给用户。
+fn topo_sort(enabled: &[&DiscoveredProject]) -> Result<Vec<String>, Vec<String>> {
     let dependencies: BTreeMap<String, BTreeSet<String>> = enabled
         .iter()
         .map(|project| {
@@ -486,69 +521,7 @@ fn cycle_issues(enabled: &[&DiscoveredProject]) -> Vec<ValidationIssue> {
             .map(|(id, _)| id.clone())
             .collect();
         if ready.is_empty() {
-            let cycle_ids: Vec<&String> = remaining.keys().collect();
-            let files: Vec<String> = enabled
-                .iter()
-                .filter(|project| remaining.contains_key(project.service_id()))
-                .map(|project| manifest_file_of(&project.dir))
-                .collect();
-            return vec![
-                ValidationIssue::new(format!(
-                    "service dependency cycle detected among: {}",
-                    cycle_ids
-                        .iter()
-                        .map(|id| id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-                .at_field("run.depends_on")
-                .with_hint(format!(
-                    "break the cycle in one of: {} (depends_on must form a DAG)",
-                    files.join(", ")
-                )),
-            ];
-        }
-        for id in ready {
-            remaining.remove(&id);
-            result.push(id);
-        }
-    }
-    Vec::new()
-}
-
-/// 路由冲突时的建议路径：按 service_id 生成唯一前缀（与冲突原值无关——
-/// 冲突本身说明原值不可共用，建议值必须直接可抄）。
-fn suggest_path(service_id: &str, _conflicting: &str) -> String {
-    format!("/{service_id}/")
-}
-
-fn topological_order(projects: &[&DiscoveredProject]) -> Result<Vec<String>, ManifestError> {
-    let dependencies: BTreeMap<String, BTreeSet<String>> = projects
-        .iter()
-        .map(|project| {
-            (
-                project.service_id().to_owned(),
-                project.manifest.run.depends_on.iter().cloned().collect(),
-            )
-        })
-        .collect();
-    let mut remaining = dependencies;
-    let mut result = Vec::new();
-    while !remaining.is_empty() {
-        let ready: Vec<String> = remaining
-            .iter()
-            .filter(|(_, dependencies)| {
-                dependencies
-                    .iter()
-                    .all(|dependency| result.contains(dependency))
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        if ready.is_empty() {
-            let ids = remaining.keys().cloned().collect::<Vec<_>>().join(", ");
-            return Err(ManifestError::Validation(format!(
-                "service dependency cycle detected among: {ids}"
-            )));
+            return Err(remaining.keys().cloned().collect());
         }
         for id in ready {
             remaining.remove(&id);
@@ -556,6 +529,12 @@ fn topological_order(projects: &[&DiscoveredProject]) -> Result<Vec<String>, Man
         }
     }
     Ok(result)
+}
+
+/// 路由冲突时的建议路径：按 service_id 生成唯一前缀（与冲突原值无关——
+/// 冲突本身说明原值不可共用，建议值必须直接可抄）。
+fn suggest_path(service_id: &str, _conflicting: &str) -> String {
+    format!("/{service_id}/")
 }
 
 fn collect_log_issues(sources: &[LogSource]) -> Vec<ValidationIssue> {

@@ -197,66 +197,48 @@ pub async fn agent_session_notification(
     I18nPath(params): I18nPath<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
     headers: axum::http::HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
-    let locale = shared_types::current_request_locale();
-    let session_id = &params.session_id;
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
     info!(
-        " [SSE_PROXY] Received SSE connection request: session_id={:?}",
-        session_id
+        "[SSE_PROXY] Received SSE connection request: session_id={:?}",
+        params.session_id
     );
-
-    // 使用核心验证函数获取上下文
-    let (project_id, container_name, container_ip) =
-        validate_and_get_session_context(state.clone(), session_id).await?;
-
-    // 构造活跃时间更新闭包（捕获 state 引用）
-    // Bug 5 修复：SSE 流收到非心跳事件时节流调用此闭包
-    let activity_updater: Arc<dyn Fn(&str) + Send + Sync> = {
-        let state = state.clone();
-        Arc::new(move |sid: &str| state.update_session_activity(sid))
-    };
-
-    // 使用通用函数创建 SSE 响应流
-    // 优先用 Last-Event-ID header（浏览器 EventSource 断线重连自动带），其次 ?last_seq= query
-    let last_seq = headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .or(params.last_seq)
-        .unwrap_or(0);
-    // 构建 diag_ctx：根据 project 的 service_type 自动选诊断标识。
-    // ComputerAgentRunner → user_id,WebAgentRunner → project_id。
-    // 这样 Web 路径 SSE 断流时也能做 OOM/crashloop 精准诊断。
-    let diag_ctx = state.get_project(&project_id).and_then(|p| {
-        let st = p.service_type()?;
-        let id = match &st {
-            shared_types::ServiceType::ComputerAgentRunner => p.user_id().map(|u| u.to_string()),
-            _ => Some(project_id.clone()),
-        };
-        id.map(|identifier| {
-            Arc::new(crate::handler::utils::DiagCtx {
-                runtime: state.runtime().clone(),
-                identifier,
-                service_type: st.clone(),
-            })
-        })
-    });
-    let params = SseStreamParams {
-        container_name,
-        container_ip,
-        session_id: session_id.to_string(),
-        project_id,
-        grpc_pool: state.grpc_pool.clone(),
-        locale,
-        service_type: shared_types::ServiceType::WebAgentRunner,
-        activity_updater,
-        namespace: state.config.app_manager.namespace.clone(),
-        cluster_domain: state.cluster_domain.clone(),
-        registry: state.session_stream_registry.clone(),
-        diag_ctx,
-        last_seq,
-    };
-    build_sse_stream_from_container_name(params).await
+    // 路由定制：按 project 实际 service_type 选流标签与诊断标识——
+    // ComputerAgentRunner → user_id，其余 → project_id（Web 路径断流时也能
+    // 做 OOM/crashloop 精准诊断）；流标签用实际值（原硬编码 WebAgentRunner，
+    // computer 项目的流日志标签错——深审修复）。
+    sse_notification_impl(
+        state,
+        &params,
+        &headers,
+        Box::new(|state, project_id| match state.get_project(project_id) {
+            Some(project) => {
+                let service_type = project
+                    .service_type()
+                    .unwrap_or(shared_types::ServiceType::WebAgentRunner);
+                let identifier = match &service_type {
+                    shared_types::ServiceType::ComputerAgentRunner => {
+                        project.user_id().map(|u| u.to_string())
+                    }
+                    _ => Some(project_id.to_string()),
+                };
+                SseRouteContext {
+                    service_type: service_type.clone(),
+                    diag_ctx: identifier.map(|identifier| {
+                        Arc::new(crate::handler::utils::DiagCtx {
+                            runtime: state.runtime().clone(),
+                            identifier,
+                            service_type,
+                        })
+                    }),
+                }
+            }
+            None => SseRouteContext {
+                service_type: shared_types::ServiceType::WebAgentRunner,
+                diag_ctx: None,
+            },
+        }),
+    )
+    .await
 }
 
 #[utoipa::path(
@@ -348,61 +330,93 @@ pub async fn computer_agent_progress_notification(
     I18nPath(params): I18nPath<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
     headers: axum::http::HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
+    info!(
+        "[SSE_PROXY] Received Computer Agent SSE connection request: session_id={:?}",
+        params.session_id
+    );
+    // 路由定制：固定 ComputerAgentRunner 语义；诊断 identifier = user_id
+    //（断流重试耗尽时据此做 OOM/crashloop 精准诊断；拿不到 → None 回退通用文案）。
+    sse_notification_impl(
+        state,
+        &params,
+        &headers,
+        Box::new(|state, project_id| {
+            let diag_ctx = state
+                .get_project(project_id)
+                .and_then(|p| p.user_id().map(|u| u.to_string()))
+                .map(|identifier| {
+                    Arc::new(crate::handler::utils::DiagCtx {
+                        runtime: state.runtime().clone(),
+                        identifier,
+                        service_type: shared_types::ServiceType::ComputerAgentRunner,
+                    })
+                });
+            SseRouteContext {
+                service_type: shared_types::ServiceType::ComputerAgentRunner,
+                diag_ctx,
+            }
+        }),
+    )
+    .await
+}
+
+/// 两个 SSE 通知 handler 的共享实现（验证 → activity_updater → last_seq →
+/// SseStreamParams → build 流）。两入口仅在**路由定制**上有差异——流标签
+/// `service_type` 与断流诊断 `diag_ctx` 的选取策略，经 [`SseRouteContext`]
+/// 闭包注入（validate 之后才有 project_id，故闭包以 project_id 为入参）。
+struct SseRouteContext {
+    service_type: shared_types::ServiceType,
+    diag_ctx: Option<Arc<crate::handler::utils::DiagCtx>>,
+}
+
+/// 路由定制闭包类型（validate 后以 project_id 调用，产出流标签与诊断标识）。
+type RouteCtxFn = Box<dyn FnOnce(&Arc<crate::router::AppState>, &str) -> SseRouteContext + Send>;
+
+async fn sse_notification_impl(
+    state: Arc<crate::router::AppState>,
+    params: &SessionNotificationParams,
+    headers: &axum::http::HeaderMap,
+    route_ctx: RouteCtxFn,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
-    info!(
-        " [SSE_PROXY] Received Computer Agent SSE connection request: session_id={:?}",
-        session_id
-    );
 
-    // 使用与 agent_session_notification 相同的验证逻辑
     let (project_id, container_name, container_ip) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
-    // 构造活跃时间更新闭包（捕获 state 引用）
-    // Bug 5 修复：SSE 流收到非心跳事件时节流调用此闭包
+    // 活跃时间更新闭包（捕获 state 引用）；SSE 流收到非心跳事件时节流调用。
     let activity_updater: Arc<dyn Fn(&str) + Send + Sync> = {
         let state = state.clone();
         Arc::new(move |sid: &str| state.update_session_activity(sid))
     };
 
-    // 使用通用函数创建 SSE 响应流
-    // 优先用 Last-Event-ID header（浏览器 EventSource 断线重连自动带），其次 ?last_seq= query
+    // 游标：优先 Last-Event-ID header（浏览器 EventSource 断线重连自动带），
+    // 其次 ?last_seq= query，缺省从头。
     let last_seq = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .or(params.last_seq)
         .unwrap_or(0);
-    // Computer Agent: 诊断 identifier = user_id(SSE 断流重试耗尽时,据此做 OOM/crashloop
-    // 等精准诊断,替代通用文案)。拿不到 user_id → None → 回退通用文案。
-    let diag_ctx = state
-        .get_project(&project_id)
-        .and_then(|p| p.user_id().map(|u| u.to_string()))
-        .map(|identifier| {
-            Arc::new(crate::handler::utils::DiagCtx {
-                runtime: state.runtime().clone(),
-                identifier,
-                service_type: shared_types::ServiceType::ComputerAgentRunner,
-            })
-        });
-    let params = SseStreamParams {
+
+    let route = route_ctx(&state, &project_id);
+    let stream_params = SseStreamParams {
         container_name,
         container_ip,
         session_id: session_id.to_string(),
         project_id,
         grpc_pool: state.grpc_pool.clone(),
         locale,
-        service_type: shared_types::ServiceType::ComputerAgentRunner,
+        service_type: route.service_type,
         activity_updater,
         namespace: state.config.app_manager.namespace.clone(),
         cluster_domain: state.cluster_domain.clone(),
         registry: state.session_stream_registry.clone(),
-        diag_ctx,
+        diag_ctx: route.diag_ctx,
         last_seq,
     };
-    build_sse_stream_from_container_name(params).await
+    build_sse_stream_from_container_name(stream_params).await
 }
 
 /// 创建错误响应
