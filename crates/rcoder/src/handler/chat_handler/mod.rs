@@ -163,7 +163,7 @@ async fn run_chat_flow(
     );
 
     // 响应后状态更新
-    update_session_mapping_from_response(&state, &result, &project_id);
+    update_session_mapping_from_response(&state, &result, &project_id).await;
 
     if result.as_ref().map_or(true, |r| {
         !r.is_success() && r.data.as_ref().is_none_or(|d| d.session_id.is_empty())
@@ -179,7 +179,7 @@ async fn run_chat_flow(
 /// 响应后状态更新 - 使用存储
 /// 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
 /// 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
-fn update_session_mapping_from_response(
+async fn update_session_mapping_from_response(
     state: &Arc<AppState>,
     result: &Result<HttpResult<ChatResponse>, AppError>,
     project_id: &str,
@@ -204,15 +204,26 @@ fn update_session_mapping_from_response(
         http_result.is_success()
     );
 
-    // C1 修复：用 add_session_to_project 走多 session 单步原子路径，
-    // 取代历史非原子的 update_session（write_session_index + entry 两步）。
-    // 多 session 模型：一个 project 可同时持有多条活跃 session（多窗口场景）。
-    let added = state.add_session_to_project(project_id, &session_id);
-    if !added {
-        warn!(
-            "[CHAT] Project missing during session association, may have been concurrently removed: project_id={}, session_id={}",
-            project_id, session_id
-        );
+    // 多 session 模型（一个 project 可同时持有多条活跃 session）+ durable：
+    // PG 事务提交完成才返回——session_id 到达前端时任何副本回源直查必命中
+    // （与 computer 域 session.rs 同契约；此前走 write-behind，多副本下 SSE
+    // 首连可能回源 miss 404）
+    match state.add_session_durable(project_id, &session_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(
+                "[CHAT] Project missing during session association, may have been concurrently removed: project_id={}, session_id={}",
+                project_id, session_id
+            );
+        }
+        Err(e) => {
+            // PG 内部已降级 write-behind，此处 Err 仅剩镜像写失败等罕见分支；
+            // chat 响应照常返回（agent 已执行成功，映射由队列兜底）
+            warn!(
+                "[CHAT] Session association degraded: project_id={}, session_id={}, err={}",
+                project_id, session_id, e
+            );
+        }
     }
 
     info!(

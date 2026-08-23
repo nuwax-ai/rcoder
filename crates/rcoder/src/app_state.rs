@@ -228,7 +228,15 @@ impl AppState {
     /// 删除项目（替代 project_and_agent_map.remove）
     #[inline]
     pub fn remove_project(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
-        self.projects.remove(project_id)
+        let removed = self.projects.remove(project_id);
+        // session 终结：归还 served_sessions 首连资格条目（防无界累积；调用方
+        // 已先行 shutdown_sse_streams_for_project 关流，此处只清资格登记）
+        if let Some(info) = &removed {
+            for sid in info.sessions() {
+                self.session_stream_registry.release_first_client_claim(&sid);
+            }
+        }
+        removed
     }
 
     /// 关闭某 project 关联的所有 SSE 共享流（容器销毁/项目删除前调用）。
@@ -319,6 +327,17 @@ impl AppState {
         self.projects.add_session_to_project(project_id, session_id)
     }
 
+    /// 追加 session 的 durable 变体（/chat 响应后映射补录）——跨副本可见性
+    /// 契约：返回 Ok(true) 即主库已提交（PG 内部超时降级 write-behind）。
+    /// Memory 模式等价普通内存写。返回 Ok(false) = project 不存在。
+    pub async fn add_session_durable(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        self.projects.add_session_durable(project_id, session_id).await
+    }
+
     /// 更新会话信息（已废弃，请用 `add_session_to_project` 或 `insert_project_with_session`）
     ///
     /// 存储契约（ProjectStore）只保留多 session 语义；本委托直接转发
@@ -333,15 +352,27 @@ impl AppState {
     }
 
     /// 清除会话信息（清所有 session，agent stop 场景）
-    #[inline]
     pub fn clear_session(&self, project_id: &str) {
+        // 先取 sessions 快照：session 终结时同步归还 served_sessions 首连资格
+        // 条目——turn 进行中客户端全部断开的 session 不会再触发流侧 release，
+        // 不在此清理会按历史 session 数无界累积
+        let sids: Vec<String> = self
+            .get_project(project_id)
+            .map(|info| info.sessions().into_iter().collect())
+            .unwrap_or_default();
         self.projects.clear_session(project_id);
+        for sid in sids {
+            self.session_stream_registry.release_first_client_claim(&sid);
+        }
     }
 
     /// 清除单个 session（保留 project 的其他 session）
-    #[inline]
     pub fn clear_session_one(&self, project_id: &str, session_id: &str) -> bool {
-        self.projects.clear_session_one(project_id, session_id)
+        let removed = self.projects.clear_session_one(project_id, session_id);
+        if removed {
+            self.session_stream_registry.release_first_client_claim(session_id);
+        }
+        removed
     }
 
     /// 更新项目活动时间，返回实际更新使用的时间戳

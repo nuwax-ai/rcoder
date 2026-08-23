@@ -51,7 +51,8 @@ pub(super) async fn ensure_container_ready(
     // 容器管理器应该已经处理了空 IP 的情况，但缓存/Docker API 可能返回不一致结果
     // 如果 IP 为空，先清理旧容器再强制重建（不返回错误给客户端）
     let container_info = if container_info.container_ip.trim().is_empty() {
-        recreate_container_with_empty_ip(state, request, user_id, &container_info).await?
+        recreate_container_with_empty_ip(state, request, user_id, project_id, &container_info)
+            .await?
     } else {
         container_info
     };
@@ -252,6 +253,7 @@ async fn recreate_container_with_empty_ip(
     state: &Arc<AppState>,
     request: &ComputerChatRequest,
     user_id: &str,
+    project_id: &str,
     container_info: &ContainerBasicInfo,
 ) -> Result<ContainerBasicInfo, ChatFlowExit> {
     warn!(
@@ -259,9 +261,10 @@ async fn recreate_container_with_empty_ip(
          user_id={}, old_container_id={}",
         user_id, container_info.container_id
     );
-    // 容器 IP 已空（被外部 kill）→ 旧 grpc_addr 不可用；按 project 维度关该 user 的 SSE 流，
+    // 容器 IP 已空（被外部 kill）→ 旧 grpc_addr 不可用；按 project 维度关流
+    //（computer 域存储 key = project_id——传 user_id 是查不到的，一条流都关不掉），
     // 避免前端挂在已死旧流上等重试耗尽。重建后新 IP 由 get_or_create 自动建新流。
-    state.shutdown_sse_streams_for_project(user_id);
+    state.shutdown_sse_streams_for_project(project_id);
     // 必须先清理旧容器，否则 create_container 发现同名 "running" 容器会复用它
     let container_identifier = request.pod_id.as_deref().unwrap_or(user_id);
     if let Err(e) = state

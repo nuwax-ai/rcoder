@@ -59,6 +59,22 @@ impl ProjectStoreBackend {
         }
     }
 
+    /// 追加 session 的 durable 变体（/chat 域响应后映射补录）：与
+    /// [`Self::insert_project_with_session_durable`] 同契约——返回 `Ok(true)`
+    /// 即主库已提交（超时/失败内部降级 write-behind，chat 不失败）。
+    /// Memory 模式等价普通内存写。返回 `Ok(false)` = project 不存在。
+    pub async fn add_session_durable(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        match self {
+            Self::Memory(inner) => Ok(inner.add_session_to_project(project_id, session_id)),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.add_session_durable(project_id, session_id).await,
+        }
+    }
+
     /// 按 session_id 读（PG 模式 miss 回源直查主库一次并 hydrate 镜像；
     /// Memory 模式仅内存）。SSE lookup 的兜底路径。
     pub async fn get_by_session_with_fetch(

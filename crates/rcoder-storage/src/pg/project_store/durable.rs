@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use shared_types::ProjectAndContainerInfo;
 
-use super::persist_ops::structural_ops_for_insert;
+use super::persist_ops::{PersistOp, structural_ops_for_insert};
 use super::writer::execute_op;
+use crate::adapter::container_entry_key;
 use crate::pg::PgStore;
 
 impl PgStore {
@@ -76,6 +77,68 @@ impl PgStore {
                     self.enqueue_structural(op);
                 }
                 Ok(())
+            }
+        }
+    }
+
+    /// 追加 session 的 durable 变体（/chat 域响应后映射补录）：
+    /// 内存 add + AddSession 单条事务直写，超时/失败降级 write-behind
+    /// （降级后由队列按序重放——project 行若尚未 flush 会在队列中先于
+    /// AddSession 执行，FK 依赖最终成立）。
+    ///
+    /// 返回 `Ok(false)` 表示 project 不存在（并发删除，内存 add 未发生）。
+    pub async fn add_session_durable(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        // 1. 内存镜像（与 add_session_to_project 的内存部分一致）
+        if !self.inner.add_session_to_project(project_id, session_id) {
+            return Ok(false);
+        }
+        let container_name = self
+            .inner
+            .get(project_id)
+            .map(|info| container_entry_key(&info));
+
+        // 2. 单条事务直写
+        let op = PersistOp::AddSession {
+            project_id: project_id.to_string(),
+            session_id: session_id.to_string(),
+            container_name,
+        };
+        let durable = async {
+            let result: anyhow::Result<()> = async {
+                let mut tx = self.pool.begin().await?;
+                execute_op(&mut tx, &op).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+            .await;
+            result
+        };
+        match tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, durable).await {
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    "[STORAGE_PG] durable add_session ok: project_id={}, session_id={}",
+                    project_id,
+                    session_id
+                );
+                Ok(true)
+            }
+            outcome => {
+                let reason = match outcome {
+                    Ok(Ok(())) => unreachable!("covered by first arm"),
+                    Ok(Err(e)) => format!("sql error: {e}"),
+                    Err(_) => "timeout".to_string(),
+                };
+                tracing::warn!(
+                    "[STORAGE_PG] durable add_session failed ({reason}), falling back to write-behind: project_id={}, session_id={}",
+                    project_id,
+                    session_id
+                );
+                self.enqueue_structural(op);
+                Ok(true)
             }
         }
     }
