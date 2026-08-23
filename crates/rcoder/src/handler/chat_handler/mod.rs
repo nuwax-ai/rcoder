@@ -14,6 +14,8 @@ mod routing;
 mod types;
 mod validation;
 
+use crate::grpc;
+use crate::handler;
 use probe::probe_agent_runner_readiness;
 use routing::{
     ensure_chat_agent_installed_if_needed, resolve_chat_forward_request, resolve_container_target,
@@ -32,7 +34,6 @@ use docker_manager::ContainerBasicInfo;
 
 use crate::handler::chat_forward::ChatFlowExit;
 use crate::handler::utils::{I18nJsonOrQuery, get_locale_from_headers};
-use crate::*;
 use crate::{AppError, HttpResult, router::AppState};
 
 /// 处理聊天请求 - 转发到容器化 agent_runner 服务
@@ -139,13 +140,13 @@ async fn run_chat_flow(
     ensure_chat_agent_installed_if_needed(&state, request, &project_id, locale, &service_type)
         .await?;
 
-    // 🆕 自动查找 session_id 并克隆 request 用于转发
+    // 第三段·会话：自动查找 session_id 并克隆 request 用于转发
     let request_for_forward = resolve_chat_forward_request(&state, request, &project_id);
 
-    // 2.5 主动探测 agent_runner gRPC 是否就绪
+    // 第三段·探活：agent_runner gRPC 就绪探测（长冷启动下 dial 前置）
     probe_agent_runner_readiness(&state, &container_info, &project_id, locale).await;
 
-    // 第三步：转发请求到容器服务（使用全局连接池）
+    // 第三段·转发：请求发往容器服务（全局连接池）
     info!("[CHAT] Forwarding request to container service");
     let ctx = ForwardContext {
         grpc_pool: &state.grpc_pool,

@@ -243,6 +243,7 @@ fn trunc(v: &Value, n: usize) -> String {
 
 #[tokio::test]
 async fn userapp_compose_regression() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
     let scenario = "userapp_compose";
     let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
         return;

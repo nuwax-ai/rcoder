@@ -41,11 +41,11 @@ impl AgentStatusChecker {
             Ok(Err(e)) => {
                 // gRPC 失败 = 状态"未知",不是"空闲"。若当 idle 清理,会误杀刚 OOM 重启、
                 // 进程尚未就绪的 agent(gRPC 窗口期连不上)。改返 Err,让 scanner 本轮跳过。
-                debug!(" [status_checker] gRPC Query failed (state unknown): {}", e);
+                debug!("[status_checker] gRPC Query failed (state unknown): {}", e);
                 Err(e)
             }
             Err(_) => {
-                debug!(" [status_checker] gRPC timeout (state unknown)");
+                debug!("[status_checker] gRPC timeout (state unknown)");
                 Err(anyhow::anyhow!("gRPC query timeout"))
             }
         }
@@ -68,7 +68,7 @@ impl AgentStatusChecker {
         let status = response.into_inner();
 
         debug!(
-            " [status_checker] Container status: is_active={}, active_tasks={}",
+            "[status_checker] Container status: is_active={}, active_tasks={}",
             status.is_active, status.active_tasks
         );
 

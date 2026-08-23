@@ -77,8 +77,11 @@ pub async fn computer_desktop_vnc(
     I18nPath(params): I18nPath<DesktopPathParams>,
 ) -> Result<HttpResult<DesktopAccessResponse>, AppError> {
     let locale = get_locale_from_headers(&headers);
-    let user_id = params.user_id.clone();
-    let project_id = params.project_id.clone();
+    let DesktopPathParams {
+        user_id,
+        project_id,
+        ..
+    } = params;
 
     // 1. 验证参数（校验失败返回 Err(AppError)，由 status_from_code 映射为 400/404，
     //    与 utoipa 声明对齐；不再用 Ok(HttpResult::error) 返回 HTTP 200）

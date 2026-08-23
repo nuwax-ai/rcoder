@@ -133,12 +133,12 @@ impl ConfigWatcher {
                                 Err(e) => {
                                     if attempt == max_retries {
                                         warn!(
-                                            " [CONFIG_WATCHER] config reload failed after {} attempts: {}",
+                                            "[CONFIG_WATCHER] config reload failed after {} attempts: {}",
                                             max_retries, e
                                         );
                                     } else {
                                         warn!(
-                                            " [CONFIG_WATCHER] config reload attempt {}/{} failed: {}, retrying in {}ms",
+                                            "[CONFIG_WATCHER] config reload attempt {}/{} failed: {}, retrying in {}ms",
                                             attempt,
                                             max_retries,
                                             e,

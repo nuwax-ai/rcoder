@@ -59,7 +59,7 @@ pub(crate) async fn build_sse_stream_from_container_name(
         &params.cluster_domain,
     );
     info!(
-        " [gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
+        "[gRPC_SSE] Establishing {} gRPC SSE proxy connection: {}, project_id={}",
         params.service_type, grpc_addr, params.project_id
     );
 

@@ -36,7 +36,7 @@ pub(super) async fn validate_and_get_session_context(
     let mut container_name = match state.get_container_name_by_session(session_id) {
         Some(name) => {
             debug!(
-                " [SSE_PROXY] Getting container name from storage: session_id={}, container_name={}",
+                "[SSE_PROXY] Getting container name from storage: session_id={}, container_name={}",
                 session_id, name
             );
             name
@@ -63,7 +63,7 @@ pub(super) async fn validate_and_get_session_context(
     // 注意：由于阶段 3 已经处理了 project_info.container_info() 为 None 的情况
     // （通过 Docker API 降级查询），这里无需再次验证容器信息的完整性
     info!(
-        " [SSE_PROXY] All validations passed: session_id={}, project_id={}, container_name={}, container_ip={}",
+        "[SSE_PROXY] All validations passed: session_id={}, project_id={}, container_name={}, container_ip={}",
         session_id, project_id, container_name, container_ip
     );
     Ok((project_id, container_name, container_ip))
@@ -80,7 +80,7 @@ pub(super) async fn lookup_project_info_by_session(
     match state.get_by_session_with_fetch(session_id).await {
         Some(info) => {
             debug!(
-                " [SSE_PROXY] Getting project info: session_id={}, project_id={}",
+                "[SSE_PROXY] Getting project info: session_id={}, project_id={}",
                 session_id,
                 info.project_id()
             );
@@ -88,7 +88,7 @@ pub(super) async fn lookup_project_info_by_session(
         }
         None => {
             error!(
-                " [SSE_PROXY] Project info for session not found: session_id={}",
+                "[SSE_PROXY] Project info for session not found: session_id={}",
                 session_id
             );
             Err(create_error_response(
@@ -112,7 +112,7 @@ pub(super) async fn resolve_container_name_fallback(
     session_id: &str,
 ) -> Result<String, Response> {
     info!(
-        " [SSE_PROXY] session_id record not found in storage, executing fallback query: session_id={}, project_id={}",
+        "[SSE_PROXY] session_id record not found in storage, executing fallback query: session_id={}, project_id={}",
         session_id,
         project_info.project_id()
     );
@@ -135,7 +135,7 @@ pub(super) async fn resolve_container_name_fallback(
             match project_info.container_info() {
                 Some(container) => {
                     info!(
-                        " [SSE_PROXY] Fallback query succeeded: got container name from project_info: container_name={}",
+                        "[SSE_PROXY] Fallback query succeeded: got container name from project_info: container_name={}",
                         container.container_name
                     );
                     Ok(container.container_name.clone())
@@ -145,7 +145,7 @@ pub(super) async fn resolve_container_name_fallback(
                     // 这通常发生在容器刚创建但尚未写入 存储 的情况
                     // 阶段 3 会通过 Docker API 验证容器是否存在
                     warn!(
-                        " [SSE_PROXY] No container info in project_info, using project_id as container name: project_id={}",
+                        "[SSE_PROXY] No container info in project_info, using project_id as container name: project_id={}",
                         project_info.project_id()
                     );
                     Ok(project_info.project_id().to_string())
@@ -179,7 +179,7 @@ pub(super) async fn resolve_container_name_by_user_id(
     {
         Ok(Some(info)) => {
             info!(
-                " [SSE_PROXY] Fallback query succeeded: getting container via user_id in real-time: user_id={}, container_name={}",
+                "[SSE_PROXY] Fallback query succeeded: getting container via user_id in real-time: user_id={}, container_name={}",
                 user_id, info.container_name
             );
             Ok(info.container_name)
@@ -224,7 +224,7 @@ pub(super) async fn verify_container_with_memory_preference(
 ) -> Result<String, Response> {
     if let Some(container) = project_info.container_info() {
         info!(
-            " [SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
+            "[SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
             container.container_name, container.container_ip
         );
         // 🎯 关键修复：使用内存中的 container_name（它是最新的）
@@ -235,7 +235,7 @@ pub(super) async fn verify_container_with_memory_preference(
 
     // 内存中没有容器信息，调用 Docker API 实时查询
     warn!(
-        " [SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
+        "[SSE_PROXY] Container info missing in memory, calling runtime query: container_name={}",
         container_name
     );
     let computer_prefix = &state.container_prefix_computer;
@@ -256,7 +256,7 @@ pub(super) async fn verify_container_with_memory_preference(
         Ok(Some(result)) => {
             if result.status == container_runtime_api::ContainerRuntimeStatus::Running {
                 info!(
-                    " [SSE_PROXY] Runtime query successful, container is running: container_name={}",
+                    "[SSE_PROXY] Runtime query successful, container is running: container_name={}",
                     container_name
                 );
                 Ok(container_name)
@@ -270,7 +270,7 @@ pub(super) async fn verify_container_with_memory_preference(
         }
         Ok(None) => {
             error!(
-                " [SSE_PROXY] Container does not exist: container_name={}",
+                "[SSE_PROXY] Container does not exist: container_name={}",
                 container_name
             );
             Err(create_error_response(
@@ -280,7 +280,7 @@ pub(super) async fn verify_container_with_memory_preference(
             ))
         }
         Err(e) => {
-            error!(" [SSE_PROXY] Runtime query failed: {}", e);
+            error!("[SSE_PROXY] Runtime query failed: {}", e);
             Err(create_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,

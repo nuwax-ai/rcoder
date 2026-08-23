@@ -88,7 +88,7 @@ pub async fn handle_computer_status(
         }
         None => {
             // Agent 不存在
-            warn!(" [HTTP] Agent not found: project_id={}", project_id);
+            warn!("[HTTP] Agent not found: project_id={}", project_id);
 
             ComputerAgentStatusResponse {
                 user_id: request.user_id.clone(),

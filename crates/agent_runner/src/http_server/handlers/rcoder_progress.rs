@@ -225,7 +225,7 @@ pub async fn handle_rcoder_progress(
         }
         None => {
             warn!(
-                " [RCoder] Session not found in SESSION_CACHE: session_id={}",
+                "[RCoder] Session not found in SESSION_CACHE: session_id={}",
                 session_id
             );
             return Err((

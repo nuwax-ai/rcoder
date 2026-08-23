@@ -79,7 +79,7 @@ pub async fn pod_ensure(
     )?;
 
     info!(
-        " [POD_ENSURE] Ensuring container exists: user_id={}, project_id={}, service_type={}, container_identifier={}",
+        "[POD_ENSURE] Ensuring container exists: user_id={}, project_id={}, service_type={}, container_identifier={}",
         request.user_id, request.project_id, service_type, container_identifier
     );
 
@@ -99,7 +99,7 @@ pub async fn pod_ensure(
         // 标记超过 60 秒视为过期（创建方可能已崩溃），忽略并继续
         if elapsed < std::time::Duration::from_secs(60) {
             info!(
-                " [POD_ENSURE] Container is being created, waiting for completion: container_identifier={}, elapsed={:?}",
+                "[POD_ENSURE] Container is being created, waiting for completion: container_identifier={}, elapsed={:?}",
                 container_identifier, elapsed
             );
 
@@ -137,7 +137,7 @@ pub async fn pod_ensure(
                         .await
                     {
                         info!(
-                            " [POD_ENSURE] Wait succeeded, container ready: container_identifier={}, container_id={}",
+                            "[POD_ENSURE] Wait succeeded, container ready: container_identifier={}, container_id={}",
                             container_identifier, info.container_id
                         );
                         waited_container_info = Some(info);
@@ -146,7 +146,7 @@ pub async fn pod_ensure(
                 Err(_) => {
                     // 超时处理
                     warn!(
-                        " [POD_ENSURE] Wait for container creation timeout (30s): container_identifier={}",
+                        "[POD_ENSURE] Wait for container creation timeout (30s): container_identifier={}",
                         container_identifier
                     );
                 }
@@ -184,7 +184,7 @@ pub async fn pod_ensure(
                         e
                     })?;
                 debug!(
-                    " [POD_ENSURE] project record updated: project_id={}, user_id={}, container_id={}",
+                    "[POD_ENSURE] project record updated: project_id={}, user_id={}, container_id={}",
                     request.project_id, request.user_id, info.container_id
                 );
 
@@ -204,13 +204,13 @@ pub async fn pod_ensure(
             }
             // 等待超时，继续正常的创建流程（此时标记可能已过期被清理）
             warn!(
-                " [POD_ENSURE] Wait for container creation timeout (30s), will continue to try creating: container_identifier={}",
+                "[POD_ENSURE] Wait for container creation timeout (30s), will continue to try creating: container_identifier={}",
                 container_identifier
             );
         } else {
             // 标记过期，清理后继续
             warn!(
-                " [POD_ENSURE] Creation mark expired ({:?}), cleaning up and continuing",
+                "[POD_ENSURE] Creation mark expired ({:?}), cleaning up and continuing",
                 elapsed
             );
             state.pod_creating.remove(&container_identifier);
@@ -233,7 +233,7 @@ pub async fn pod_ensure(
         Some(result) if result.status == container_runtime_api::ContainerRuntimeStatus::Running => {
             // 容器存在且正在运行，无需创建
             info!(
-                " [POD_ENSURE] Container already exists and running: container_id={}, status={:?}",
+                "[POD_ENSURE] Container already exists and running: container_id={}, status={:?}",
                 result.container_id, result.status
             );
             false
@@ -241,7 +241,7 @@ pub async fn pod_ensure(
         Some(result) => {
             // 容器存在但未运行（Exited 等状态），需要删除并重建
             warn!(
-                " [POD_ENSURE] Container exists but not running: container_id={}, status={:?}, will delete and recreate",
+                "[POD_ENSURE] Container exists but not running: container_id={}, status={:?}, will delete and recreate",
                 result.container_id, result.status
             );
 
@@ -252,7 +252,7 @@ pub async fn pod_ensure(
                 .await
                 .map_err(|e| {
                     error!(
-                        " [POD_ENSURE] Failed to delete old container: container_id={}, error={}",
+                        "[POD_ENSURE] Failed to delete old container: container_id={}, error={}",
                         result.container_id, e
                     );
                     AppError::internal_server_error(&format!(
@@ -262,7 +262,7 @@ pub async fn pod_ensure(
                 })?;
 
             info!(
-                " [POD_ENSURE] Old container deleted: container_id={}",
+                "[POD_ENSURE] Old container deleted: container_id={}",
                 result.container_id
             );
 
@@ -283,13 +283,13 @@ pub async fn pod_ensure(
             // ⏱️ 等待 Docker 完全释放容器资源（避免竞态条件）
             // Docker 删除是异步操作，立即创建同名容器可能导致资源冲突
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            debug!(" [POD_ENSURE] container resources already released");
+            debug!("[POD_ENSURE] container resources already released");
 
             true
         }
         None => {
             // 容器不存在，需要创建
-            info!(" [POD_ENSURE] container not found, will create new container");
+            info!("[POD_ENSURE] container not found, will create new container");
             true
         }
     };
@@ -303,7 +303,7 @@ pub async fn pod_ensure(
             .insert(container_identifier.clone(), create_started);
 
         info!(
-            " [POD_ENSURE] Creation marker set: container_identifier={}, user_id={}, project_id={}, max_attempts=3",
+            "[POD_ENSURE] Creation marker set: container_identifier={}, user_id={}, project_id={}, max_attempts=3",
             container_identifier, request.user_id, request.project_id
         );
 
@@ -318,7 +318,7 @@ pub async fn pod_ensure(
         for attempt in 1..=max_attempts {
             let attempt_started = Instant::now();
             info!(
-                " [POD_ENSURE] Container creation attempt {}/{} started: container_identifier={}, elapsed_since_marker={:?}",
+                "[POD_ENSURE] Container creation attempt {}/{} started: container_identifier={}, elapsed_since_marker={:?}",
                 attempt,
                 max_attempts,
                 container_identifier,
@@ -343,7 +343,7 @@ pub async fn pod_ensure(
             {
                 Ok(info) => {
                     info!(
-                        " [POD_ENSURE] Container created successfully (attempt {}): container_id={}, ip={}, attempt_elapsed={:?}, total_elapsed={:?}",
+                        "[POD_ENSURE] Container created successfully (attempt {}): container_id={}, ip={}, attempt_elapsed={:?}, total_elapsed={:?}",
                         attempt,
                         info.container_id,
                         info.container_ip,
@@ -357,7 +357,7 @@ pub async fn pod_ensure(
                     last_error = Some(e);
                     if attempt < max_attempts {
                         warn!(
-                            " [POD_ENSURE] Container creation failed (attempt {}/{}), will retry: error={}, attempt_elapsed={:?}, total_elapsed={:?}",
+                            "[POD_ENSURE] Container creation failed (attempt {}/{}), will retry: error={}, attempt_elapsed={:?}, total_elapsed={:?}",
                             attempt,
                             max_attempts,
                             last_error
@@ -391,7 +391,7 @@ pub async fn pod_ensure(
         match result {
             Some(info) => {
                 debug!(
-                    " [POD_ENSURE] Clearing creation marker after success: container_identifier={}, total_elapsed={:?}",
+                    "[POD_ENSURE] Clearing creation marker after success: container_identifier={}, total_elapsed={:?}",
                     container_identifier,
                     create_started.elapsed()
                 );
@@ -405,7 +405,7 @@ pub async fn pod_ensure(
             }
             None => {
                 debug!(
-                    " [POD_ENSURE] Clearing creation marker after failure: container_identifier={}, total_elapsed={:?}",
+                    "[POD_ENSURE] Clearing creation marker after failure: container_identifier={}, total_elapsed={:?}",
                     container_identifier,
                     create_started.elapsed()
                 );
@@ -433,7 +433,7 @@ pub async fn pod_ensure(
                 // Docker API 确认容器在运行，但内部 map 还没同步
                 // 短暂等待让内部 map 同步，而不是直接重建
                 warn!(
-                    " [POD_ENSURE] Container running but internal mapping not ready, waiting for sync: container_identifier={}",
+                    "[POD_ENSURE] Container running but internal mapping not ready, waiting for sync: container_identifier={}",
                     container_identifier
                 );
 
@@ -446,7 +446,7 @@ pub async fn pod_ensure(
                     {
                         Ok(Some(info)) => {
                             info!(
-                                " [POD_ENSURE] Internal mapping synced (retry {}): container_id={}",
+                                "[POD_ENSURE] Internal mapping synced (retry {}): container_id={}",
                                 retry_attempt, info.container_id
                             );
                             retry_info = Some(info);
@@ -463,7 +463,7 @@ pub async fn pod_ensure(
                     None => {
                         // 3次重试后仍失败，才考虑重建
                         warn!(
-                            " [POD_ENSURE] Wait for sync timeout, attempting to recreate: container_identifier={}",
+                            "[POD_ENSURE] Wait for sync timeout, attempting to recreate: container_identifier={}",
                             container_identifier
                         );
 
@@ -511,14 +511,14 @@ pub async fn pod_ensure(
                         match result {
                             Ok(info) => {
                                 info!(
-                                    " [POD_ENSURE] Container recreated successfully: container_id={}",
+                                    "[POD_ENSURE] Container recreated successfully: container_id={}",
                                     info.container_id
                                 );
                                 (info, true)
                             }
                             Err(e) => {
                                 error!(
-                                    " [POD_ENSURE] Container recreation failed: container_identifier={}, error={}",
+                                    "[POD_ENSURE] Container recreation failed: container_identifier={}, error={}",
                                     container_identifier, e
                                 );
                                 return Err(e);
@@ -529,7 +529,7 @@ pub async fn pod_ensure(
             }
             Err(e) => {
                 error!(
-                    " [POD_ENSURE] Failed to get container full info: container_identifier={}, error={}",
+                    "[POD_ENSURE] Failed to get container full info: container_identifier={}, error={}",
                     container_identifier, e
                 );
                 return Err(AppError::internal_server_error(&format!(
@@ -574,7 +574,7 @@ pub async fn pod_ensure(
             e
         })?;
     debug!(
-        " [POD_ENSURE] project record updated: project_id={}, user_id={}, container_id={}",
+        "[POD_ENSURE] project record updated: project_id={}, user_id={}, container_id={}",
         request.project_id, request.user_id, container_info.container_id
     );
 

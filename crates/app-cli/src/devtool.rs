@@ -56,7 +56,8 @@ pub async fn gen_lock(workspace: &Path) -> Result<()> {
             println!("  {}. {}", index + 1, issue);
         }
         anyhow::bail!(
-            "manifest validation failed with {} issue(s); fix the files above and re-run",
+            "manifest validation failed with {} issue(s); fix the files above and re-run \
+             (note: any existing release.lock.toml was NOT updated — do not run against a stale lock)",
             issues.len()
         );
     }

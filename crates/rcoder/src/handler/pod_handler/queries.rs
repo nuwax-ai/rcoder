@@ -21,7 +21,7 @@ use shared_types::ProjectStore as _; // 存储契约 trait：state.projects（Pr
 pub async fn pod_count(
     State(state): State<Arc<AppState>>,
 ) -> Result<HttpResult<PodCountResponse>, AppError> {
-    debug!(" [POD_COUNT] Getting container count");
+    debug!("[POD_COUNT] Getting container count");
 
     // 获取全局 Runtime
     let runtime = state.runtime().clone();
@@ -74,7 +74,7 @@ pub async fn pod_count(
     };
 
     debug!(
-        " [POD_COUNT] Container count completed: total={}, rcoder={}, computer_agent_runner={}",
+        "[POD_COUNT] Container count completed: total={}, rcoder={}, computer_agent_runner={}",
         total_count, rcoder_count, computer_count
     );
 
@@ -106,7 +106,7 @@ pub async fn pod_list(
     State(state): State<Arc<AppState>>,
     I18nQuery(params): I18nQuery<PodListQuery>,
 ) -> Result<HttpResult<PodListResponse>, AppError> {
-    debug!(" [POD_LIST] get containers: limit={:?}", params.limit);
+    debug!("[POD_LIST] get containers: limit={:?}", params.limit);
 
     // 1. 获取 runtime 容器列表
     let runtime = state.runtime().clone();
@@ -242,7 +242,7 @@ pub async fn pod_list(
     };
 
     info!(
-        " [POD_LIST] Container list retrieved: total={}, returned={}, paginated={}",
+        "[POD_LIST] Container list retrieved: total={}, returned={}, paginated={}",
         total, returned, paginated
     );
 

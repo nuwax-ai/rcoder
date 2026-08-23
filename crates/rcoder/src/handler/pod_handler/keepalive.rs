@@ -74,7 +74,7 @@ pub async fn pod_keepalive(
             request.space_id.as_deref(),
         ) {
             info!(
-                " [POD_KEEPALIVE] Using pod_id for container lookup: pod_id={}, isolation_type={}, tenant_id={}, space_id={}",
+                "[POD_KEEPALIVE] Using pod_id for container lookup: pod_id={}, isolation_type={}, tenant_id={}, space_id={}",
                 pod_id, it, tid, sid
             );
         }
@@ -90,7 +90,7 @@ pub async fn pod_keepalive(
     };
 
     info!(
-        " [POD_KEEPALIVE] Container keepalive: user_id={}, project_id={}, container_identifier={}",
+        "[POD_KEEPALIVE] Container keepalive: user_id={}, project_id={}, container_identifier={}",
         request.user_id, request.project_id, container_identifier
     );
 
@@ -109,7 +109,7 @@ pub async fn pod_keepalive(
         Some(info) => info,
         None => {
             info!(
-                " [POD_KEEPALIVE] container not found: container_identifier={}",
+                "[POD_KEEPALIVE] container not found: container_identifier={}",
                 container_identifier
             );
             return Ok(HttpResult::error_with_locale(
@@ -214,7 +214,7 @@ pub async fn pod_keepalive(
     };
 
     info!(
-        " [POD_KEEPALIVE] Keepalive completed: existed={}, created={}, time_until_cleanup={}s",
+        "[POD_KEEPALIVE] Keepalive completed: existed={}, created={}, time_until_cleanup={}s",
         !created, created, idle_timeout_seconds
     );
 

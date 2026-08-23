@@ -70,7 +70,7 @@ impl GrpcChannelPool {
             .time_to_idle(Duration::from_secs(CHANNEL_TTL_SECS))
             .eviction_listener(|key, _value, cause| {
                 debug!(
-                    " [gRPC] moka evicted connection: addr={}, cause={:?}",
+                    "[gRPC] moka evicted connection: addr={}, cause={:?}",
                     key, cause
                 );
             })
@@ -116,7 +116,7 @@ impl GrpcChannelPool {
     async fn get_or_create_channel(&self, addr: &str) -> Result<Channel> {
         // 快速路径：moka get 是 lock-free 的
         if let Some(channel) = self.channels.get(addr).await {
-            debug!(" [gRPC] reuse connection: {}", addr);
+            debug!("[gRPC] reuse connection: {}", addr);
             return Ok(channel);
         }
 
@@ -130,7 +130,7 @@ impl GrpcChannelPool {
             .try_get_with(
                 addr_key,
                 async move {
-                    info!(" [gRPC] creating connection: {}", addr);
+                    info!("[gRPC] creating connection: {}", addr);
                     let endpoint = format!("http://{}", addr);
                     Channel::from_shared(endpoint)
                         .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
@@ -154,7 +154,7 @@ impl GrpcChannelPool {
                 // debug 而非 warn：容器启动期拨号失败是业务常态（chat_forward
                 // 重试循环每次 attempt 已有 warn 级信号，这里再 warn 会重复刷屏
                 // ——实测 e2e 一轮 756 条）。可见性由 grpc dial 失败计数指标承担。
-                debug!(" [gRPC] dial failed (agent 可能未就绪): {}", e);
+                debug!("[gRPC] dial failed (agent 可能未就绪): {}", e);
                 rcoder_telemetry::prometheus::record_grpc_request("dial", "error");
                 anyhow::anyhow!("Failed to get or create channel: {}", e)
             })?;
@@ -177,14 +177,14 @@ impl GrpcChannelPool {
         let had = self.channels.contains_key(addr);
         self.channels.invalidate(addr).await;
         if had {
-            info!(" [gRPC] removed connection: {}", addr);
+            info!("[gRPC] removed connection: {}", addr);
         }
     }
 
     /// 清空所有连接
     pub fn clear(&self) {
         self.channels.invalidate_all();
-        info!(" [gRPC] cleared all connections");
+        info!("[gRPC] cleared all connections");
     }
 
     /// 获取当前连接数

@@ -20,6 +20,18 @@ pub struct HealthCheckConfig {
     pub unhealthy_threshold: u32,
 }
 
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 5,
+            timeout_seconds: 1,
+            healthy_threshold: 2,
+            unhealthy_threshold: 3,
+        }
+    }
+}
+
 /// 代理 HTTP 客户端配置（用于协议转换时连接上游 API）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyHttpClientConfig {
@@ -70,6 +82,19 @@ pub struct ProxyConfig {
     /// HTTP 客户端配置（用于协议转换时连接上游 API）
     #[serde(default)]
     pub http_client: ProxyHttpClientConfig,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            listen_port: 8088,
+            default_backend_port: 8086,
+            backend_host: "127.0.0.1".to_string(),
+            port_param: "port".to_string(),
+            health_check: HealthCheckConfig::default(),
+            http_client: ProxyHttpClientConfig::default(),
+        }
+    }
 }
 
 /// 日志清理配置
@@ -274,31 +299,6 @@ pub struct DockerConfig {
     pub cache_max_capacity: Option<u64>,
 }
 
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        Self {
-            listen_port: 8088,
-            default_backend_port: 8086,
-            backend_host: "127.0.0.1".to_string(),
-            port_param: "port".to_string(),
-            health_check: HealthCheckConfig::default(),
-            http_client: ProxyHttpClientConfig::default(),
-        }
-    }
-}
-
-impl Default for HealthCheckConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            interval_seconds: 5,
-            timeout_seconds: 1,
-            healthy_threshold: 2,
-            unhealthy_threshold: 3,
-        }
-    }
-}
-
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
@@ -435,7 +435,7 @@ impl DockerConfig {
                 Ok(seconds) => self.container_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        " [CONFIG] Failed to parse RCODER_CONTAINER_TTL '{}': {}, using default",
+                        "[CONFIG] Failed to parse RCODER_CONTAINER_TTL '{}': {}, using default",
                         val,
                         e
                     );
@@ -450,7 +450,7 @@ impl DockerConfig {
                 Ok(seconds) => self.api_timeout_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        " [CONFIG] Failed to parse RCODER_API_TIMEOUT_SECONDS '{}': {}, using default",
+                        "[CONFIG] Failed to parse RCODER_API_TIMEOUT_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -465,7 +465,7 @@ impl DockerConfig {
                 Ok(seconds) => self.api_timeout_quick_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        " [CONFIG] Failed to parse RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, using default",
+                        "[CONFIG] Failed to parse RCODER_API_TIMEOUT_QUICK_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -480,7 +480,7 @@ impl DockerConfig {
                 Ok(seconds) => self.cache_status_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        " [CONFIG] Failed to parse RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, using default",
+                        "[CONFIG] Failed to parse RCODER_CACHE_STATUS_TTL_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -495,7 +495,7 @@ impl DockerConfig {
                 Ok(seconds) => self.cache_network_ttl_seconds = Some(seconds),
                 Err(e) => {
                     tracing::warn!(
-                        " [CONFIG] Failed to parse RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, using default",
+                        "[CONFIG] Failed to parse RCODER_CACHE_NETWORK_TTL_SECONDS '{}': {}, using default",
                         val,
                         e
                     );
@@ -510,7 +510,7 @@ impl DockerConfig {
                 Ok(capacity) => self.cache_max_capacity = Some(capacity),
                 Err(e) => {
                     tracing::warn!(
-                        " [CONFIG] Failed to parse RCODER_CACHE_MAX_CAPACITY '{}': {}, using default",
+                        "[CONFIG] Failed to parse RCODER_CACHE_MAX_CAPACITY '{}': {}, using default",
                         val,
                         e
                     );

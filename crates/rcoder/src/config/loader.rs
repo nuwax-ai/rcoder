@@ -28,7 +28,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         }
     } else {
         info!(
-            "configfilenot found, createddefaultconfigfile: {}",
+            "config file not found, created default config file: {}",
             CONFIG_FILE
         );
         let default_config = AppConfig::default();

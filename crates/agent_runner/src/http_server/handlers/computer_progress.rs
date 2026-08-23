@@ -224,7 +224,7 @@ pub async fn handle_computer_progress(
         }
         None => {
             warn!(
-                " [HTTP] Session not found in SESSION_CACHE: session_id={}",
+                "[HTTP] Session not found in SESSION_CACHE: session_id={}",
                 session_id
             );
             return Err((

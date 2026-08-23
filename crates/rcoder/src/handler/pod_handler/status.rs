@@ -78,7 +78,7 @@ pub async fn pod_status(
             params.space_id.as_deref(),
         ) {
             info!(
-                " [POD_STATUS] Using pod_id for container lookup: pod_id={}, isolation_type={}, tenant_id={}, space_id={}",
+                "[POD_STATUS] Using pod_id for container lookup: pod_id={}, isolation_type={}, tenant_id={}, space_id={}",
                 pod_id, it, tid, sid
             );
         }
@@ -88,7 +88,7 @@ pub async fn pod_status(
     };
 
     info!(
-        " [POD_STATUS] Querying container status: project_id={:?}, user_id={:?}, pod_id={:?}, container_identifier={:?}",
+        "[POD_STATUS] Querying container status: project_id={:?}, user_id={:?}, pod_id={:?}, container_identifier={:?}",
         params.project_id, params.user_id, params.pod_id, container_identifier
     );
 
@@ -129,7 +129,7 @@ pub async fn pod_status(
             };
 
             info!(
-                " [POD_STATUS] Container status: alive={}, status={}, container_id={}",
+                "[POD_STATUS] Container status: alive={}, status={}, container_id={}",
                 is_running, status_str, result.container_id
             );
 
@@ -173,7 +173,7 @@ pub async fn pod_status(
                 };
 
                 info!(
-                    " [POD_STATUS] Found container by project_id: alive={}, container_id={}",
+                    "[POD_STATUS] Found container by project_id: alive={}, container_id={}",
                     is_running, result.container_id
                 );
 
@@ -203,7 +203,7 @@ pub async fn pod_status(
 
     // 6. 未找到容器
     info!(
-        " [POD_STATUS] Container not found: user_id={:?}, project_id={:?}",
+        "[POD_STATUS] Container not found: user_id={:?}, project_id={:?}",
         params.user_id, params.project_id
     );
 
@@ -290,7 +290,7 @@ pub async fn pod_vnc_status(
     }
 
     info!(
-        " [POD_VNC_STATUS] Querying VNC status: user_id={:?}, project_id={:?}, pod_id={:?}",
+        "[POD_VNC_STATUS] Querying VNC status: user_id={:?}, project_id={:?}, pod_id={:?}",
         user_id, project_id, pod_id
     );
 
@@ -330,7 +330,7 @@ pub async fn pod_vnc_status(
         Some(info) => info,
         None => {
             info!(
-                " [POD_VNC_STATUS] Container does not exist: user_id={:?}, project_id={:?}",
+                "[POD_VNC_STATUS] Container does not exist: user_id={:?}, project_id={:?}",
                 user_id, project_id
             );
             return Ok(HttpResult::error_with_locale(
@@ -343,7 +343,7 @@ pub async fn pod_vnc_status(
     // 5. 检查容器是否正在运行
     if result.status != container_runtime_api::ContainerRuntimeStatus::Running {
         info!(
-            " [POD_VNC_STATUS] Container not running: container_id={}",
+            "[POD_VNC_STATUS] Container not running: container_id={}",
             result.container_id
         );
         return Ok(HttpResult::success(VncStatusResponse {
@@ -391,7 +391,7 @@ pub async fn pod_vnc_status(
                 Ok(response) => {
                     let resp = response.into_inner();
                     info!(
-                        " [POD_VNC_STATUS] gRPC call successful: vnc_ready={}, novnc_ready={}",
+                        "[POD_VNC_STATUS] gRPC call successful: vnc_ready={}, novnc_ready={}",
                         resp.vnc_ready, resp.novnc_ready
                     );
 

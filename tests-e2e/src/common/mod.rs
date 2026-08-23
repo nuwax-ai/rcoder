@@ -498,3 +498,45 @@ mod tests {
         assert!(!s.to_string().contains("sk-SECRET"));
     }
 }
+
+/// 跨进程文件锁（flock 独占，持有到 guard drop）。
+///
+/// compose_userapp 与 compose_userapp_dev 是两个测试二进制（cargo test 并行跑），
+/// 各自的进程内 OnceLock 串行锁互相不可见——都建 rcoder-app-builder-* 容器，
+/// 并发时单节点资源竞争复现"后发容器 agent_runner 启动超退避窗"。本锁以
+/// 共享文件 flock 实现跨二进制互斥。
+/// 跨进程互斥锁（TCP 端口占位：bind 成功即持锁，进程退出由内核自动释放，
+/// 无锁文件残留问题）。compose_userapp 与 compose_userapp_dev 是两个测试二进制
+/// （cargo test 并行跑），各自的进程内 OnceLock 串行锁互相不可见——都建
+/// rcoder-app-builder-* 容器，并发时单节点资源竞争复现"后发容器 agent_runner
+/// 启动超退避窗"。经独占端口互斥，实现跨二进制串行。
+pub mod cross_bin_lock {
+    use std::net::TcpListener;
+    use std::sync::OnceLock;
+
+    /// 锁端口：高位非常见服务端口，专属本测试框架。
+    const LOCK_PORT: u16 = 39471;
+
+    static HELD: OnceLock<TcpListener> = OnceLock::new();
+
+    /// 阻塞获取跨二进制互斥锁（另一测试二进制持有时自旋等待；
+    /// 其进程退出后端口立即释放）。
+    pub fn acquire() {
+        if HELD.get().is_some() {
+            return;
+        }
+        loop {
+            match TcpListener::bind(("127.0.0.1", LOCK_PORT)) {
+                Ok(listener) => {
+                    // set 失败=本进程二次 acquire（HELD.get 短路已挡）；listener 存
+                    // 入 static 持有到进程退出——端口即锁，内核在进程退出时释放。
+                    if HELD.set(listener).is_err() {
+                        unreachable!("cross_bin_lock acquired twice in one process");
+                    }
+                    return;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+            }
+        }
+    }
+}

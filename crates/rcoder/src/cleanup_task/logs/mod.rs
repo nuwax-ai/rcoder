@@ -37,7 +37,7 @@ impl LogCleaner {
         // 检查目录是否存在
         if !log_path.exists() {
             debug!(
-                " [log_cleaner] Log directory does not exist, skipping cleanup: {}",
+                "[log_cleaner] Log directory does not exist, skipping cleanup: {}",
                 self.log_dir
             );
             return Ok(LogCleanupStats::default());
@@ -46,14 +46,14 @@ impl LogCleaner {
         // 检查是否是目录
         if !log_path.is_dir() {
             warn!(
-                " [log_cleaner] Path is not a directory, skip cleanup: {}",
+                "[log_cleaner] Path is not a directory, skip cleanup: {}",
                 self.log_dir
             );
             return Ok(LogCleanupStats::default());
         }
 
         info!(
-            " [log_cleaner] Starting log directory cleanup: {}, retention: {} days",
+            "[log_cleaner] Starting log directory cleanup: {}, retention: {} days",
             self.log_dir,
             self.retention_duration.as_secs() / 86400
         );
@@ -62,7 +62,7 @@ impl LogCleaner {
         let cutoff_time = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(duration) => duration.as_secs(),
             Err(e) => {
-                warn!(" [log_cleaner] Invalid timestamp, skip cleanup: {}", e);
+                warn!("[log_cleaner] Invalid timestamp, skip cleanup: {}", e);
                 return Ok(LogCleanupStats::default());
             }
         };
@@ -72,7 +72,7 @@ impl LogCleaner {
         let mut entries = match fs::read_dir(log_path).await {
             Ok(entries) => entries,
             Err(e) => {
-                warn!(" [log_cleaner] Failed to read directory: {}", e);
+                warn!("[log_cleaner] Failed to read directory: {}", e);
                 return Ok(LogCleanupStats::default());
             }
         };
@@ -83,7 +83,7 @@ impl LogCleaner {
             let metadata = match entry.metadata().await {
                 Ok(m) => m,
                 Err(e) => {
-                    debug!(" [log_cleaner] get file failed: {:?} - {}", path, e);
+                    debug!("[log_cleaner] get file failed: {:?} - {}", path, e);
                     continue;
                 }
             };
@@ -92,10 +92,7 @@ impl LogCleaner {
             let modified = match metadata.modified() {
                 Ok(time) => time,
                 Err(e) => {
-                    debug!(
-                        " [log_cleaner] get modified time failed: {:?} - {}",
-                        path, e
-                    );
+                    debug!("[log_cleaner] get modified time failed: {:?} - {}", path, e);
                     continue;
                 }
             };
@@ -104,7 +101,7 @@ impl LogCleaner {
             let modified_secs = match modified.duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => duration.as_secs(),
                 Err(_) => {
-                    debug!(" [log_cleaner] skip: {:?}", path);
+                    debug!("[log_cleaner] skip: {:?}", path);
                     continue;
                 }
             };
@@ -120,14 +117,14 @@ impl LogCleaner {
                             stats.files_deleted += 1;
                             stats.bytes_freed += file_size;
                             debug!(
-                                " [log_cleaner] Deleting expired file: {:?} ({:.2} MB)",
+                                "[log_cleaner] Deleting expired file: {:?} ({:.2} MB)",
                                 path,
                                 file_size as f64 / 1024.0 / 1024.0
                             );
                         }
                         Err(e) => {
                             stats.failed_deletions += 1;
-                            warn!(" [log_cleaner] Failed to delete file: {:?} - {}", path, e);
+                            warn!("[log_cleaner] Failed to delete file: {:?} - {}", path, e);
                         }
                     }
                 } else if metadata.is_dir() {
@@ -135,12 +132,12 @@ impl LogCleaner {
                     match fs::remove_dir_all(&path).await {
                         Ok(_) => {
                             stats.dirs_deleted += 1;
-                            debug!(" [log_cleaner] Deleted directory: {:?}", path);
+                            debug!("[log_cleaner] Deleted directory: {:?}", path);
                         }
                         Err(e) => {
                             stats.failed_deletions += 1;
                             warn!(
-                                " [log_cleaner] Failed to delete directory: {:?} - {}",
+                                "[log_cleaner] Failed to delete directory: {:?} - {}",
                                 path, e
                             );
                         }
@@ -151,7 +148,7 @@ impl LogCleaner {
 
         if stats.files_deleted > 0 || stats.dirs_deleted > 0 {
             info!(
-                " [log_cleaner] Log cleanup completed: deleted {} files, {} dirs, freed {:.2} MB",
+                "[log_cleaner] Log cleanup completed: deleted {} files, {} dirs, freed {:.2} MB",
                 stats.files_deleted,
                 stats.dirs_deleted,
                 stats.bytes_freed as f64 / 1024.0 / 1024.0

@@ -11,6 +11,38 @@ use tracing::{debug, info, warn};
 
 use super::AgentLifecycleGuard;
 
+/// 向进程组发送信号（同步内核：防御检查 + 单次 kill 发送）。
+///
+/// `kill_process_group`（async，含优雅等待）与 `Drop`（同步，不能 await）共用；
+/// 返回 `Ok(false)` 表示防御性跳过（pgid 非法），`Ok(true)` 表示信号已发出，
+/// `Err` 为真实 kill 失败。
+#[cfg(unix)]
+fn send_signal_to_group(
+    pgid: u32,
+    signal: nix::sys::signal::Signal,
+    project_id: &str,
+) -> std::result::Result<bool, nix::errno::Errno> {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    // 🔥 pgid 不能为 0：kill(0, SIGKILL) 会杀死调用者自己的进程组
+    if pgid == 0 {
+        debug!(
+            "[LifecycleGuard] 进程组 ID 为 0，跳过进程组信号（可能是初始化失败）: project_id={project_id}"
+        );
+        return Ok(false);
+    }
+    // 🔥 pgid 必须在 i32 范围内才能安全转换为负数
+    if pgid > i32::MAX as u32 {
+        debug!(
+            "[LifecycleGuard] 进程组 ID {pgid} 超出 i32 范围，跳过进程组信号: project_id={project_id}"
+        );
+        return Ok(false);
+    }
+    // 🔥 负 pgid = 发送到整个进程组（而非仅组长）
+    let target = Pid::from_raw(-(pgid as i32));
+    kill(target, signal).map(|_| true)
+}
+
 /// 优雅停止agent
 ///
 /// 带升级机制：SIGTERM → 等 500ms → SIGKILL（见 kill_process_group）。
@@ -118,26 +150,15 @@ impl AgentLifecycleGuard {
                 return Ok(());
             }
 
-            // 🔥 关键：pgid 必须在 i32 范围内才能安全转换为负数
-            // Linux PIDs 最大可达 4,194,304，远小于 i32::MAX (2,147,483,647)
-            // 但为了防御性编程，仍然检查
-            if pgid > i32::MAX as u32 {
-                warn!(
-                    "[LifecycleGuard] 进程组 ID {} 超出 i32 范围，跳过进程组终止: project_id={}",
-                    pgid, self.inner.project_id
-                );
-                return Ok(());
-            }
-
-            // 🔥 关键：使用负的进程组 ID（真实的进程组 ID）
-            // -pgid 表示发送信号到整个进程组，而不仅仅是进程组组长
-            let target = Pid::from_raw(-(pgid as i32));
-
             let signal = if force {
                 Signal::SIGKILL
             } else {
                 Signal::SIGTERM
             };
+            let target = Pid::from_raw(
+                -i32::try_from(pgid)
+                    .map_err(|_| anyhow::anyhow!("pgid {pgid} out of i32 range"))?,
+            );
 
             match kill(target, signal) {
                 Ok(_) => {
@@ -227,38 +248,19 @@ impl Drop for AgentLifecycleGuard {
             // 🔥 同步终止进程组
             #[cfg(unix)]
             {
-                use nix::sys::signal::{Signal, kill};
-                use nix::unistd::Pid;
+                use nix::sys::signal::Signal;
 
                 let pgid = self.inner.pgid;
 
-                // 🔥 关键防御性检查：pgid 不能为 0 且必须在 i32 范围内
-                // kill(0, SIGKILL) 会杀死调用者自己的进程组，这是危险的
-                if pgid == 0 {
-                    debug!(
-                        "[Claude] 进程组 ID 为 0，跳过进程组终止: project_id={}",
-                        self.inner.project_id
-                    );
-                } else if pgid > i32::MAX as u32 {
-                    debug!(
-                        "[Claude] 进程组 ID {} 超出 i32 范围，跳过进程组终止: project_id={}",
+                // 防御性跳过（Ok(false)）或进程已退出（Err）都不再追发
+                if matches!(
+                    send_signal_to_group(pgid, Signal::SIGKILL, &self.inner.project_id),
+                    Ok(true)
+                ) {
+                    info!(
+                        "[Claude] 进程组已终止: pgid={}, project_id={}",
                         pgid, self.inner.project_id
                     );
-                } else {
-                    let target = Pid::from_raw(-(pgid as i32));
-
-                    if let Err(e) = kill(target, Signal::SIGKILL) {
-                        // 进程可能已经退出，这是正常的
-                        debug!(
-                            "[Claude] 终止进程组失败（可能已退出）: pgid={}, error={}",
-                            pgid, e
-                        );
-                    } else {
-                        info!(
-                            "[Claude] 进程组已终止: pgid={}, project_id={}",
-                            pgid, self.inner.project_id
-                        );
-                    }
                 }
             }
 

@@ -88,7 +88,7 @@ impl ContainerDestroyer {
         container_ip: &str,
     ) -> Result<()> {
         info!(
-            " [destroyer] Starting container destruction: container_name={}, service_type={:?}, identifier={}, reason={}",
+            "[destroyer] Starting container destruction: container_name={}, service_type={:?}, identifier={}, reason={}",
             container_name,
             service_type,
             container_identifier,
@@ -96,7 +96,7 @@ impl ContainerDestroyer {
         );
 
         // 输出详细原因
-        debug!(" [destroyer] destroy reason: {}", reason.description());
+        debug!("[destroyer] destroy reason: {}", reason.description());
 
         // 1. 物理销毁: 走 ContainerRuntime trait
         //    按 identifier 销毁 (name 稳定); 两后端对"容器已不存在"都幂等返回 Ok。
@@ -117,7 +117,7 @@ impl ContainerDestroyer {
         // 清理 gRPC 连接池中的旧连接（避免复用已失效的 TCP 连接）。
         // Docker 环境 container_ip 为空时跳过(K8s 用 FQDN 不依赖 ip)。
         if !self.is_kubernetes && container_ip.is_empty() {
-            debug!(" [destroyer] Container IP is empty, skipping gRPC cleanup");
+            debug!("[destroyer] Container IP is empty, skipping gRPC cleanup");
             return Ok(());
         }
         let grpc_addr = shared_types::build_grpc_addr(
@@ -147,14 +147,14 @@ impl ContainerDestroyer {
             {
                 let _unused: Option<String> = pingora_service.remove_project_backend(pid);
                 debug!(
-                    " [destroyer] Cleaned up project_backends: project_id={}",
+                    "[destroyer] Cleaned up project_backends: project_id={}",
                     pid
                 );
             }
         }
 
         info!(
-            " [destroyer] Container destruction completed: container_name={}, identifier={}, reason={}",
+            "[destroyer] Container destruction completed: container_name={}, identifier={}, reason={}",
             container_name,
             container_identifier,
             reason.as_str()

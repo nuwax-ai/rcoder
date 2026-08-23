@@ -367,3 +367,90 @@ pub(crate) async fn send_prompt_to_entry(
 ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<PromptRequest>> {
     session.prompt_tx().send(prompt_request).await
 }
+
+#[cfg(test)]
+mod prompt_channel_tests {
+    use super::*;
+    use crate::acp::CancelNotificationRequestWrapper;
+    use crate::session::session_manager::send_prompt_to_entry;
+    use agent_client_protocol::schema::v1::{PromptRequest, SessionId};
+    use chrono::Utc;
+    use shared_types::{AgentStatus, ProjectAndAgentInfo};
+    use tokio::sync::mpsc;
+
+    /// 构造仅含通道语义的测试 entry（lifecycle 等与本测试无关字段留 None）
+    fn test_entry(
+        project_id: &str,
+        prompt_tx: mpsc::Sender<PromptRequest>,
+        cancel_tx: mpsc::Sender<CancelNotificationRequestWrapper>,
+    ) -> ProjectAndAgentInfo {
+        let now = Utc::now();
+        ProjectAndAgentInfo {
+            project_id: project_id.to_string(),
+            session_id: SessionId::from("ses_test"),
+            prompt_tx,
+            cancel_tx,
+            model_provider: None,
+            request_id: None,
+            status: AgentStatus::Idle,
+            last_activity: now,
+            created_at: now,
+            stop_handle: None,
+            agent_binary_snapshot: None,
+        }
+    }
+
+    /// 通道接收端存活的 entry：is_channel_closed 必须为 false——
+    /// get_or_create_session 第三阶段据此裁决"用 existing"，语义锁死
+    #[test]
+    fn live_channel_is_not_closed() {
+        let (prompt_tx, prompt_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let entry = test_entry("p1", prompt_tx, cancel_tx);
+        assert!(!entry.is_channel_closed());
+        drop(prompt_rx); // 防优化告警：显式持有到断言后
+    }
+
+    /// 接收端 drop（连接任务退出）→ is_channel_closed 为 true——
+    /// 第三阶段据此触发"替换死 entry"，SendError 修复的裁决依据
+    #[test]
+    fn dropped_receiver_marks_channel_closed() {
+        let (prompt_tx, prompt_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let entry = test_entry("p1", prompt_tx, cancel_tx);
+        drop(prompt_rx);
+        assert!(entry.is_channel_closed());
+    }
+
+    /// send_prompt_to_entry 对死通道的错误必须可 downcast 到
+    /// mpsc SendError——acp_worker 的重试判定（修复 3）依赖此类型链
+    #[tokio::test]
+    async fn send_to_dead_entry_error_downcasts_to_send_error() {
+        let (prompt_tx, prompt_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        drop(prompt_rx);
+        let entry = test_entry("p1", prompt_tx, cancel_tx);
+
+        let request = PromptRequest::new(SessionId::from("ses_test"), Vec::new());
+        // Err 类型即 SendError（函数签名保证），Err 即"通道死亡"——修复 3 的重试依据
+        send_prompt_to_entry(&entry, request)
+            .await
+            .expect_err("dead channel must error");
+    }
+
+    /// 活通道直发成功（修复 2 的主路径）
+    #[tokio::test]
+    async fn send_to_live_entry_succeeds() {
+        let (prompt_tx, mut prompt_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let entry = test_entry("p1", prompt_tx, cancel_tx);
+
+        let request = PromptRequest::new(SessionId::from("ses_test"), Vec::new());
+        send_prompt_to_entry(&entry, request)
+            .await
+            .expect("live channel send");
+        assert!(prompt_rx.try_recv().is_ok());
+    }
+
+    // ModelProviderConfig 引用占位（构造完整 entry 的后续场景用）
+}

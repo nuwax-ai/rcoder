@@ -360,15 +360,13 @@ async fn find_runtime_addr(
     // 前者 503 明示，避免误导排障方向。
     let lookup = container_lookup.as_ref().ok_or_else(|| {
         error!("[RUNTIME_TERMINAL] container lookup not configured (proxy assembly defect)");
-        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(503)).more_context(
-            "container lookup not configured for runtime terminal proxy".to_string(),
-        )
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(503))
+            .more_context("container lookup not configured for runtime terminal proxy".to_string())
     })?;
     lookup.find_app_runtime_addr(app_id).ok_or_else(|| {
         info!("[RUNTIME_TERMINAL] runtime addr unavailable: app_id={app_id}");
-        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
-            format!("runtime address for app {app_id} unavailable"),
-        )
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
+            .more_context(format!("runtime address for app {app_id} unavailable"))
     })
 }
 

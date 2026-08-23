@@ -372,11 +372,12 @@ pub async fn install_from_url(
     );
 
     // 调用核心安装函数（复用 ensure_agent_installed 的逻辑）
+    // 上方 require_field 已校验 version 非空——此处 unwrap 不可达（防御性 expect 便于溯源）
     let version = body
         .agent
         .version
         .as_deref()
-        .ok_or_else(|| AppError::with_message(ec::ERR_VALIDATION, "version is required"))?;
+        .expect("version checked non-empty by require_field above");
 
     let (download_result, platform_key) = agent_provisioning::install_agent(
         &state.agent_download_manager,

@@ -100,6 +100,7 @@ fn trunc(v: &Value, n: usize) -> String {
 // ============================================================
 #[tokio::test]
 async fn userapp_dev_files_two_entry_points() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
     let _gate = scenario_gate().await;
     let scenario = "userapp_dev_files";
     let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
@@ -204,6 +205,7 @@ async fn userapp_dev_files_two_entry_points() {
 // ============================================================
 #[tokio::test]
 async fn userapp_dev_pg_align_idempotent() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
     let _gate = scenario_gate().await;
     let scenario = "userapp_dev_pg_align";
     let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
@@ -368,12 +370,14 @@ async fn scenario_userapp_chat_full_turn(backend: Backend) {
 
 #[tokio::test]
 async fn userapp_dev_chat_full_turn_openai() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
     let _gate = scenario_gate().await;
     scenario_userapp_chat_full_turn(Backend::Openai).await;
 }
 
 #[tokio::test]
 async fn userapp_dev_chat_full_turn_anthropic() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
     let _gate = scenario_gate().await;
     scenario_userapp_chat_full_turn(Backend::Anthropic).await;
 }
@@ -498,12 +502,14 @@ async fn scenario_userapp_two_turn_isolation(backend: Backend) {
 
 #[tokio::test]
 async fn userapp_dev_two_turn_isolation_openai() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
     let _gate = scenario_gate().await;
     scenario_userapp_two_turn_isolation(Backend::Openai).await;
 }
 
 #[tokio::test]
 async fn userapp_dev_two_turn_isolation_anthropic() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
     let _gate = scenario_gate().await;
     scenario_userapp_two_turn_isolation(Backend::Anthropic).await;
 }

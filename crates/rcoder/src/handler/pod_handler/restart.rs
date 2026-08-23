@@ -80,7 +80,7 @@ pub async fn pod_restart(
     )?;
 
     info!(
-        " [POD_RESTART] Restarting container: user_id={}, project_id={}, service_type={}, container_identifier={}",
+        "[POD_RESTART] Restarting container: user_id={}, project_id={}, service_type={}, container_identifier={}",
         request.user_id, request.project_id, service_type, container_identifier
     );
 
@@ -105,7 +105,7 @@ pub async fn pod_restart(
         {
             Ok(()) => {
                 info!(
-                    " [POD_RESTART] Agent 原地重启完成（fast，volume 未 unstage）: container_identifier={}",
+                    "[POD_RESTART] Agent 原地重启完成（fast，volume 未 unstage）: container_identifier={}",
                     container_identifier
                 );
                 // 原地重启不换 pod（同 UID）→ 复用 existing_container 的 container_id；
@@ -127,14 +127,14 @@ pub async fn pod_restart(
                     message: "Container restarted in-place (fast), can access virtual desktop via VNC (Agent service not started)".to_string(),
                 };
                 info!(
-                    " [POD_RESTART] Completed (in-place): container_id={}",
+                    "[POD_RESTART] Completed (in-place): container_id={}",
                     response.container_info.container_id
                 );
                 return Ok(HttpResult::success(response));
             }
             Err(e) => {
                 warn!(
-                    " [POD_RESTART] 原地重启失败，回落 destroy+recreate: container_identifier={}, err={:?}",
+                    "[POD_RESTART] 原地重启失败，回落 destroy+recreate: container_identifier={}, err={:?}",
                     container_identifier, e
                 );
                 // 落入下方 destroy+recreate 兜底
@@ -145,7 +145,7 @@ pub async fn pod_restart(
     // 3. 如果容器存在，先销毁
     if let Some(container_info) = existing_container {
         info!(
-            " [POD_RESTART] Destroying existing container: container_id={}",
+            "[POD_RESTART] Destroying existing container: container_id={}",
             container_info.container_id
         );
 
@@ -155,7 +155,7 @@ pub async fn pod_restart(
             .projects
             .delete_container_with_projects(&container_info.container_id);
         info!(
-            " [POD_RESTART] Cleaned up old container records: container_id={}, container_deleted={}, deleted_projects={}",
+            "[POD_RESTART] Cleaned up old container records: container_id={}, container_deleted={}, deleted_projects={}",
             container_info.container_id, container_deleted, deleted_projects
         );
 
@@ -168,12 +168,12 @@ pub async fn pod_restart(
         {
             // 记录错误但继续尝试创建新容器
             error!(
-                " [POD_RESTART] Failed to stop container (will continue creating new container): container_id={}, error={}",
+                "[POD_RESTART] Failed to stop container (will continue creating new container): container_id={}, error={}",
                 container_info.container_id, e
             );
         } else {
             info!(
-                " [POD_RESTART] Container destroyed: container_id={}",
+                "[POD_RESTART] Container destroyed: container_id={}",
                 container_info.container_id
             );
         }
@@ -204,7 +204,7 @@ pub async fn pod_restart(
                 Ok(Some(_)) => {
                     if i == 0 {
                         info!(
-                            " [POD_RESTART] Container still exists, waiting for cleanup: container_identifier={}",
+                            "[POD_RESTART] Container still exists, waiting for cleanup: container_identifier={}",
                             container_identifier
                         );
                     }
@@ -212,7 +212,7 @@ pub async fn pod_restart(
                 }
                 Ok(None) => {
                     info!(
-                        " [POD_RESTART] Confirmed container removed: container_identifier={}",
+                        "[POD_RESTART] Confirmed container removed: container_identifier={}",
                         container_identifier
                     );
                     deletion_confirmed = true;
@@ -232,7 +232,7 @@ pub async fn pod_restart(
 
         if !deletion_confirmed {
             warn!(
-                " [POD_RESTART] Wait for container removal timeout, subsequent creation may fail: container_identifier={}",
+                "[POD_RESTART] Wait for container removal timeout, subsequent creation may fail: container_identifier={}",
                 container_identifier
             );
         }
@@ -244,7 +244,7 @@ pub async fn pod_restart(
 
     // 5. 强制创建新容器
     info!(
-        " [POD_RESTART] Force creating new container: container_identifier={}, service_type={}",
+        "[POD_RESTART] Force creating new container: container_identifier={}, service_type={}",
         container_identifier, service_type
     );
 
@@ -265,7 +265,7 @@ pub async fn pod_restart(
     .await?;
 
     info!(
-        " [POD_RESTART] New container created successfully: container_id={}",
+        "[POD_RESTART] New container created successfully: container_id={}",
         container_info.container_id
     );
 
@@ -323,7 +323,7 @@ pub async fn pod_restart(
     };
 
     info!(
-        " [POD_RESTART] Completed: was_existing={}, container_id={}",
+        "[POD_RESTART] Completed: was_existing={}, container_id={}",
         was_existing, container_info.container_id
     );
 

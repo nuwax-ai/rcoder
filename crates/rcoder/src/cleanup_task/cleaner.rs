@@ -99,7 +99,7 @@ impl AgentCleaner {
         match self.log_cleaner.cleanup_once().await {
             Ok(log_stats) => {
                 if log_stats.files_deleted > 0 || log_stats.failed_deletions > 0 {
-                    info!(" [cleaner] Cleanup completed: {}", log_stats.summary());
+                    info!("[cleaner] Cleanup completed: {}", log_stats.summary());
                 }
             }
             Err(e) => {
@@ -177,11 +177,11 @@ impl AgentCleaner {
                             destroyed_containers.insert(name);
                         }
                     }
-                    info!(" [cleaner] Agent cleanup succeeded: {}", project_id);
+                    info!("[cleaner] Agent cleanup succeeded: {}", project_id);
                 }
                 Err(e) => {
                     current_stats.failed_cleaned += 1;
-                    warn!(" [cleaner] Agent cleanup failed: {} - {}", project_id, e);
+                    warn!("[cleaner] Agent cleanup failed: {} - {}", project_id, e);
                 }
             }
         }
@@ -196,11 +196,11 @@ impl AgentCleaner {
 
         let duration = start_time.elapsed();
         info!(
-            " [cleaner] Cleanup completed, duration: {:.2}s, this run: {}",
+            "[cleaner] Cleanup completed, duration: {:.2}s, this run: {}",
             duration.as_secs_f64(),
             current_stats.summary()
         );
-        info!(" [cleaner] Stats: {}", self.stats.summary());
+        info!("[cleaner] Stats: {}", self.stats.summary());
 
         Ok(current_stats)
     }
@@ -208,7 +208,7 @@ impl AgentCleaner {
     /// 清理单个 agent
     /// 返回 Ok(true) 表示销毁了容器，Ok(false) 表示只删除了记录、或跳过清理（竞态保护时项目仍活跃）
     async fn cleanup_agent(&self, project_id: &str) -> Result<bool> {
-        info!(" [cleaner] Starting cleanup agent: {}", project_id);
+        info!("[cleaner] Starting cleanup agent: {}", project_id);
 
         // 1. 获取项目信息
         let agent_info = self
@@ -223,7 +223,7 @@ impl AgentCleaner {
         let idle_secs = (Utc::now() - agent_info.last_activity()).num_seconds();
         if idle_secs < self.config.idle_timeout.as_secs() as i64 {
             info!(
-                " [cleaner] Project activity refreshed after scan, skip cleanup: project_id={}, idle_secs={}s",
+                "[cleaner] Project activity refreshed after scan, skip cleanup: project_id={}, idle_secs={}s",
                 project_id, idle_secs
             );
             return Ok(false);
@@ -259,7 +259,7 @@ impl AgentCleaner {
                 .projects
                 .update_agent_status(project_id, 0, "idle");
             info!(
-                " [cleaner] 📌 idle 标记(保留复用): project_id={}, idle_secs={}s < long_idle={}s",
+                "[cleaner] 📌 idle 标记(保留复用): project_id={}, idle_secs={}s < long_idle={}s",
                 project_id,
                 idle_secs,
                 self.config.long_idle_timeout.as_secs()
@@ -285,14 +285,14 @@ impl AgentCleaner {
             let first_hit = self.pending_destroy.insert(grace_key.clone());
             if first_hit {
                 info!(
-                    " [cleaner] 🔁 idle first seen, will reconfirm next scan before destroy: project_id={}, container={}",
+                    "[cleaner] 🔁 idle first seen, will reconfirm next scan before destroy: project_id={}, container={}",
                     project_id, grace_key
                 );
                 return Ok(false); // 容器还活着：不销毁、不删 project 记录
             }
             // 连续第二次命中：本轮 scanner 仍判闲置 + 上面 idle_secs 复核仍超时 → 继续销毁
             info!(
-                " [cleaner] 🔁 idle confirmed (2nd consecutive scan), proceeding to destroy: project_id={}, container={}",
+                "[cleaner] 🔁 idle confirmed (2nd consecutive scan), proceeding to destroy: project_id={}, container={}",
                 project_id, grace_key
             );
             self.pending_destroy.remove(&grace_key);

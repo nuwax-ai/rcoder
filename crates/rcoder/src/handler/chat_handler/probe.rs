@@ -5,8 +5,8 @@ use tracing::{debug, warn};
 
 use docker_manager::ContainerBasicInfo;
 
+use crate::grpc;
 use crate::router::AppState;
-use crate::*;
 
 /// 2.5 主动探测 agent_runner gRPC 是否就绪
 /// K8s 下容器刚创建时 Pod 虽已 Ready，但 agent_runner 的 gRPC server 可能仍在启动，

@@ -82,7 +82,7 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
         }
 
         info!(
-            " [DEBUG] docker_config.network_base_name = {:?}",
+            "[DEBUG] docker_config.network_base_name = {:?}",
             docker_config.network_base_name
         );
         if let Some(ref network_base_name) = docker_config.network_base_name {
