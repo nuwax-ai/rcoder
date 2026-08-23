@@ -272,7 +272,7 @@ pub(crate) async fn reconcile_stale<'e>(
     stale_before: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE publish_tasks SET state='failed', error=$1, terminal_at=now() \\
+        "UPDATE publish_tasks SET state='failed', error=$1, terminal_at=now() \
          WHERE terminal_at IS NULL AND created_at < $2",
     )
     .bind(reason)

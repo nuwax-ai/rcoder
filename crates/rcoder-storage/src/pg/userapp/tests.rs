@@ -93,6 +93,21 @@ async fn publish_persistence_roundtrip_and_constraints() {
     let got = repo.get(&task_b).await.expect("get").expect("row");
     assert_eq!(got.state, "failed");
 
+    // reconcile_stale：纯 staleness 对账。曾因 SQL 行续行误写成 `\\`（Rust 转义出
+    // 字面反斜杠进语句文本），每轮对账恒语法错且被 warn 吞掉——此直调是防回归锚点。
+    let task_c = format!("task-c-{app_id}");
+    let mut old_running = record(&task_c, "running");
+    old_running.created_at = chrono::Utc::now() - chrono::Duration::hours(3);
+    repo.create(&old_running).await.expect("create old running");
+    let staled = repo
+        .reconcile_stale("stale reconcile", chrono::Utc::now())
+        .await
+        .expect("reconcile stale");
+    assert!(staled >= 1, "zombie row past stale_before must be converged");
+    let got = repo.get(&task_c).await.expect("get").expect("row");
+    assert_eq!(got.state, "failed");
+    assert!(got.terminal_at.is_some(), "reconcile must set terminal_at");
+
     // purge_expired：终态行过期清理（created_at 很久以前不影响——按 terminal_at；此处造一条过期行）
     repo.update_terminal(
         &task_a,

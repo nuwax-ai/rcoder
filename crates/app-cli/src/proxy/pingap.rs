@@ -82,7 +82,10 @@ pub fn build_pingap_config(entries: &[ProxyEntry]) -> anyhow::Result<Option<Stri
         if !is_catchall {
             loc.path = Some(e.proxy.path.clone());
             if e.proxy.strip_prefix {
-                loc.rewrite = Some(format!("^{}(.*) /$1", e.proxy.path));
+                // path 是字面前缀，须正则转义：元字符（如 `(`、`|`）裸拼会改变捕获组
+                // 编号或把正则切成 alternation，路由静默错乱（校验层只拒绝 `..`/`?`/`#`，
+                // 放行这些元字符——生成层必须自守）
+                loc.rewrite = Some(format!("^{}(.*) /$1", regex::escape(&e.proxy.path)));
             }
         }
         cfg.locations.insert(format!("{name}Location"), loc);
@@ -138,6 +141,7 @@ mod tests {
             "{toml_text}"
         );
         assert!(toml_text.contains("path = \"/api/\""), "{toml_text}");
+        // regex::escape 只转义真元字符，`/` 不在其中——普通路径输出不变
         assert!(
             toml_text.contains("rewrite = \"^/api/(.*) /$1\""),
             "{toml_text}"
@@ -147,5 +151,26 @@ mod tests {
             toml_text.contains("\"pingap:compressionUpstream\""),
             "{toml_text}"
         );
+    }
+
+    /// path 是字面前缀：元字符必须转义，否则 `v(1)` 会把 `$1` 捕获组从 `(.*)`
+    /// 漂移到 `(1)`，所有请求被改写成组内字面量——路由静默错乱。
+    #[test]
+    fn rewrite_escapes_regex_metacharacters_in_path() {
+        let entries = vec![entry("backend", 4001, "/api/v(1)/", true)];
+        let toml_text = build_pingap_config(&entries)
+            .expect("serialize")
+            .expect("non-empty config");
+        let parsed: toml::Value = toml::from_str(&toml_text).expect("reparse generated config");
+        let rewrite = parsed["locations"]["backendLocation"]["rewrite"]
+            .as_str()
+            .expect("rewrite field");
+        // 语义验证：pattern（空格前段）按 Rust regex 解析，捕获组 1 必须恒为尾部 (.*)，
+        // 且字面路径（含元字符原样）能命中
+        let pattern = rewrite.split(' ').next().expect("pattern segment");
+        let re = regex::Regex::new(pattern).expect("rewrite pattern must compile");
+        let caps = re.captures("/api/v(1)/x").expect("literal path must match");
+        assert_eq!(caps.get(1).map(|m| m.as_str()), Some("x"));
+        assert_eq!(caps.get(2), None, "metacharacters must not add capture groups");
     }
 }

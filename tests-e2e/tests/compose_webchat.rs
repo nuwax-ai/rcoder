@@ -62,10 +62,8 @@ async fn webchat_full_turn(backend: &str) {
         &format!("{}-f1", env.run_tag),
     );
     let Ok(data) = chat_web_reported(&env, &report, "turn1", &req).await else {
+        report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
         assert_hard_all(report).await;
-        if let Some(pid) = req.project_id {
-            cleanup_project(&pid);
-        }
         return;
     };
     let sid = data.session_id.clone();
@@ -77,6 +75,11 @@ async fn webchat_full_turn(backend: &str) {
         format!("回显 {:?}", data.project_id),
     );
     let project = data.project_id.clone();
+    // 服务端生成 project 的容器清理守卫（panic 安全；chat 失败路径无 project 可清，
+    // 依赖服务端闲置回收）
+    let _project_guard = ProjectGuard {
+        project_id: project.clone(),
+    };
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     let (events, _) =
@@ -100,7 +103,6 @@ async fn webchat_full_turn(backend: &str) {
         chunk_count >= 1,
         format!("count={chunk_count}"),
     );
-    cleanup_project(&project);
     assert_hard_all(report).await;
 }
 
@@ -139,8 +141,8 @@ async fn webchat_project_reuse() {
     let d1 = match chat_web_reported(&env, &report, "turn1", &req1).await {
         Ok(d) => d,
         Err(_) => {
+            report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
             assert_hard_all(report).await;
-            cleanup_project(&pid);
             return;
         }
     };
@@ -152,6 +154,7 @@ async fn webchat_project_reuse() {
     );
     req2.project_id = Some(pid.clone());
     let Ok(d2) = chat_web_reported(&env, &report, "turn2", &req2).await else {
+        report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
         assert_hard_all(report).await;
         return;
     };
@@ -192,6 +195,7 @@ async fn webchat_two_turn_seq() {
         project_id: pid.clone(),
     };
     let Ok(d1) = chat_web_reported(&env, &report, "turn1", &req1).await else {
+        report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
         assert_hard_all(report).await;
         return;
     };
@@ -207,6 +211,7 @@ async fn webchat_two_turn_seq() {
     req2.project_id = Some(pid.clone());
     req2.session_id = Some(sid1.clone());
     let Ok(d2) = chat_web_reported(&env, &report, "turn2", &req2).await else {
+        report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
         assert_hard_all(report).await;
         return;
     };

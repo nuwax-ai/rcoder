@@ -16,6 +16,7 @@ pub(crate) mod utils;
 pub(crate) mod vnc_probe;
 
 // HTTP 停止路径复用 gRPC 的清理逻辑（含 graceful_stop），故 crate 内重导出
+#[cfg(feature = "http-server")]
 pub(crate) use cleanup::remove_agent_and_cleanup;
 
 use std::sync::Arc;

@@ -1,23 +1,14 @@
 use clap::Parser;
-#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
+use tracing::error;
 
 // 🆕 使用共享的遥测模块
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
-#[cfg(feature = "console")]
-#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
-// 🔥 Pyroscope Profiler 模块（可选：需要 pyroscope feature）
-#[cfg(feature = "pyroscope")]
-// 🔥 OpenTelemetry 追踪模块（可选：保留用于向后兼容）
-// HTTP 服务器模块 (仅在 http-server feature 启用时)
-#[cfg(feature = "http-server")]
-// ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
-// VNC 桌面连接活跃度计数（读 /proc/net/tcp 数 noVNC 端口 ESTABLISHED 连接，
-// 供 get_active_tasks_count 折入 active_tasks，使「桌面开着」的容器不被闲置回收）
 pub use agent_runner::model::*;
 
 use agent_runner::config::{CliArgs, load_config_with_args};
@@ -200,8 +191,6 @@ async fn agent_runner_main() -> anyhow::Result<()> {
     info!("[MAIN] AgentSessionService created");
 
     // 🆕 P0-1: 创建 Agent 管理注册表(从磁盘加载,失败则用空注册表 + 警告)
-    // 注:用二进制自己的 `crate::agent_mgmt` 模块(与 agent_runner::router::AppState 同编译单元),
-    //     lib 和 binary 是两个独立 crate,类型不能混用。
     let agent_mgmt_path_manager = agent_runner::agent_mgmt::PathManager::new();
     let agent_mgmt_registry =
         match agent_runner::agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone()) {
