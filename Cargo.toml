@@ -272,7 +272,7 @@ pingora-core = { version = "0.8", features = ["rustls"] }
 pingora-http = "0.8"
 pingora-proxy = { version = "0.8", features = ["rustls"] }
 pingora-load-balancing = { version = "0.8", features = ["rustls"] }
-matchit = "0.9.2"
+matchit = "0.8"
 structopt = "0.3"
 
 bollard = { version = "0.21" }

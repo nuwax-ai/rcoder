@@ -691,7 +691,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "itoa",
- "matchit 0.8.4",
+ "matchit",
  "memchr",
  "mime",
  "multer",
@@ -4812,12 +4812,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
-name = "matchit"
-version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8863b587001c1b9a8a4e36008cebc6b3612cb1226fe2de94858e06092687b608"
-
-[[package]]
 name = "maybe-uninit"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6765,7 +6759,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes 1.12.1",
- "matchit 0.9.2",
+ "matchit",
  "moka",
  "pingora",
  "pingora-core",
@@ -6792,7 +6786,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "http",
- "matchit 0.9.2",
+ "matchit",
  "pingora",
  "pingora-core",
  "pingora-http",

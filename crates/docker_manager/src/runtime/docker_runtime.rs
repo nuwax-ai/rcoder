@@ -144,7 +144,9 @@ impl AgentContainerRuntime for DockerRuntime {
                     project_id: identifier.to_string(),
                     status: String::from(pod.status),
                     created_at: pod.created_at,
-                    service_url: format!("http://{}", pod.container_ip),
+                    // 唯一消费方（DockerRuntimeIpResolver）只读 container_ip；
+                    // service_url 是 v1 agent 容器遗留字段，此处填空避免每请求死分配
+                    service_url: String::new(),
                 }))
             }
         }
