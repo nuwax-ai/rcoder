@@ -103,7 +103,10 @@ async fn publish_persistence_roundtrip_and_constraints() {
         .reconcile_stale("stale reconcile", chrono::Utc::now())
         .await
         .expect("reconcile stale");
-    assert!(staled >= 1, "zombie row past stale_before must be converged");
+    assert!(
+        staled >= 1,
+        "zombie row past stale_before must be converged"
+    );
     let got = repo.get(&task_c).await.expect("get").expect("row");
     assert_eq!(got.state, "failed");
     assert!(got.terminal_at.is_some(), "reconcile must set terminal_at");

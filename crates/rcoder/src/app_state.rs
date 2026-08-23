@@ -233,7 +233,8 @@ impl AppState {
         // 已先行 shutdown_sse_streams_for_project 关流，此处只清资格登记）
         if let Some(info) = &removed {
             for sid in info.sessions() {
-                self.session_stream_registry.release_first_client_claim(&sid);
+                self.session_stream_registry
+                    .release_first_client_claim(&sid);
             }
         }
         removed
@@ -335,7 +336,9 @@ impl AppState {
         project_id: &str,
         session_id: &str,
     ) -> anyhow::Result<bool> {
-        self.projects.add_session_durable(project_id, session_id).await
+        self.projects
+            .add_session_durable(project_id, session_id)
+            .await
     }
 
     /// 更新会话信息（已废弃，请用 `add_session_to_project` 或 `insert_project_with_session`）
@@ -362,7 +365,8 @@ impl AppState {
             .unwrap_or_default();
         self.projects.clear_session(project_id);
         for sid in sids {
-            self.session_stream_registry.release_first_client_claim(&sid);
+            self.session_stream_registry
+                .release_first_client_claim(&sid);
         }
     }
 
@@ -370,7 +374,8 @@ impl AppState {
     pub fn clear_session_one(&self, project_id: &str, session_id: &str) -> bool {
         let removed = self.projects.clear_session_one(project_id, session_id);
         if removed {
-            self.session_stream_registry.release_first_client_claim(session_id);
+            self.session_stream_registry
+                .release_first_client_claim(session_id);
         }
         removed
     }

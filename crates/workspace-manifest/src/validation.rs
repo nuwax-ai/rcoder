@@ -467,7 +467,7 @@ pub fn validate_topology(projects: &[DiscoveredProject]) -> Result<Vec<String>, 
     }
 }
 
-/// 依赖环检测：报出环上的全部服务及各自声明文件。
+/// 依赖环检测：报出无法出队的服务（真环成员 + 被环阻塞的下游）及各自声明文件。
 fn cycle_issues(enabled: &[&DiscoveredProject]) -> Vec<ValidationIssue> {
     match topo_sort(enabled) {
         Ok(_) => Vec::new(),
@@ -479,12 +479,14 @@ fn cycle_issues(enabled: &[&DiscoveredProject]) -> Vec<ValidationIssue> {
                 .collect();
             vec![
                 ValidationIssue::new(format!(
-                    "service dependency cycle detected among: {}",
+                    "service dependency cycle detected (or blocked by a cycle): {}",
                     cycle_ids.join(", ")
                 ))
                 .at_field("run.depends_on")
                 .with_hint(format!(
-                    "break the cycle in one of: {} (depends_on must form a DAG)",
+                    "break the cycle in one of: {} (depends_on must form a DAG; \
+                     non-cycle members in the list are blocked downstream — fix \
+                     the cycle and they resolve themselves)",
                     files.join(", ")
                 )),
             ]
@@ -493,18 +495,28 @@ fn cycle_issues(enabled: &[&DiscoveredProject]) -> Vec<ValidationIssue> {
 }
 
 /// Kahn 拓扑排序内核（cycle_issues 与 validate_topology 的单一实现）：
-/// `Ok(order)` = 拓扑序；`Err(cycle_ids)` = 环上剩余服务 id（无法出队者）。
+/// `Ok(order)` = 拓扑序；`Err(cycle_ids)` = 无法出队的服务 id。
 ///
-/// 注：依赖指向 disabled/missing 服务时同样无人出队，会被归入 Err 集——
-/// 调用方（collect_topology_issues）已在之前产出 missing-dep issue，fast-fail
-/// 路径不会把伪环信息呈现给用户。
+/// 构图时过滤指向 enabled 集之外的依赖——缺依赖已由上方产出专属 issue
+/// （含修复指引），不过滤会被归入 Err 集，在 lenient 全量呈现里制造
+/// "cycle detected" 伪环误报（缺依赖的服务自身无环）。真环的下游无辜
+/// 节点（依赖环成员）仍会留在 Err 集，报文措辞 accordingly。
 fn topo_sort(enabled: &[&DiscoveredProject]) -> Result<Vec<String>, Vec<String>> {
+    let ids: std::collections::HashSet<&str> =
+        enabled.iter().map(|project| project.service_id()).collect();
     let dependencies: BTreeMap<String, BTreeSet<String>> = enabled
         .iter()
         .map(|project| {
             (
                 project.service_id().to_owned(),
-                project.manifest.run.depends_on.iter().cloned().collect(),
+                project
+                    .manifest
+                    .run
+                    .depends_on
+                    .iter()
+                    .filter(|dependency| ids.contains(dependency.as_str()))
+                    .cloned()
+                    .collect(),
             )
         })
         .collect();
@@ -715,6 +727,34 @@ mod tests {
             },
         ];
         assert!(validate_topology(&cycle).is_err());
+    }
+
+    /// 依赖目标缺失/被剔除时不得产出"伪环"：lenient 全量呈现里，缺依赖已由
+    /// 专属 issue 报告（含修复指引），依赖它的服务自身无环——再报
+    /// "cycle detected" 会误导用户/agent 去改不存在的环。
+    #[test]
+    fn missing_dependency_does_not_report_fake_cycle() {
+        let projects = vec![
+            DiscoveredProject {
+                dir: "api".into(),
+                manifest: project("api", &["db"]),
+            },
+            // db 缺失（如 lenient 模式下因自身校验错误被剔除）
+        ];
+        let issues = collect_topology_issues(&projects);
+        let fake = issues
+            .iter()
+            .any(|issue| issue.to_string().contains("cycle"));
+        assert!(
+            !fake,
+            "missing dependency must not fabricate a cycle: {issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.to_string().contains("missing or disabled")),
+            "missing-dependency issue must still be reported"
+        );
     }
 
     #[test]

@@ -2,9 +2,9 @@ use clap::Parser;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
 #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 use tracing::error;
+use tracing::{info, warn};
 
 // 🆕 使用共享的遥测模块
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};

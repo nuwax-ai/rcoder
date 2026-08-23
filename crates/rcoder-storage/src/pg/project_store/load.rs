@@ -235,7 +235,8 @@ impl crate::pg::PgStore {
         // latest_session 与回源键（可能不同）都补进镜像，下次任一键查询走内存
         //（restore：不刷 last_activity/容器活跃）
         if let Some(sid) = project_row.latest_session.as_deref() {
-            self.inner.restore_session_to_project(info.project_id(), sid);
+            self.inner
+                .restore_session_to_project(info.project_id(), sid);
         }
         self.inner
             .restore_session_to_project(info.project_id(), fetched_by);

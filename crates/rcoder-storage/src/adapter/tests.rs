@@ -98,13 +98,18 @@ fn test_restore_session_preserves_last_activity() {
     let stale = Utc::now() - chrono::Duration::hours(3);
     info.set_timestamps(stale, stale);
     let before = info.last_activity();
-    adapter.insert(project_id.to_string(), Arc::new(info)).unwrap();
+    adapter
+        .insert(project_id.to_string(), Arc::new(info))
+        .unwrap();
 
     // add 路径：活跃时间推进（用户真实操作语义）
     let mut info2 = create_test_info("other-1");
     let t0 = Utc::now();
     info2.add_session("s-warmup");
-    assert!(info2.last_activity() > t0, "add_session must bump last_activity");
+    assert!(
+        info2.last_activity() > t0,
+        "add_session must bump last_activity"
+    );
 
     // restore 路径：时间戳不动（boot/回源恢复语义）
     let restored = adapter.restore_session_to_project(project_id, "s-boot");
@@ -115,7 +120,10 @@ fn test_restore_session_preserves_last_activity() {
         before,
         "restore must not touch last_activity"
     );
-    assert!(got.sessions().contains("s-boot"), "session set must be restored");
+    assert!(
+        got.sessions().contains("s-boot"),
+        "session set must be restored"
+    );
 
     // 索引登记照常：按 session 键可查
     assert!(adapter.get_by_session_id("s-boot").is_some());

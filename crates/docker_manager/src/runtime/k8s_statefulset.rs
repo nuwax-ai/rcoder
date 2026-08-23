@@ -243,10 +243,39 @@ impl KubernetesRuntime {
         self.delete_agent_statefulset(identifier, service_type)
             .await?;
         let sts = self.build_agent_statefulset(identifier, service_type, pod_spec, replicas)?;
-        self.statefulsets()
-            .create(&PostParams::default(), &sts)
-            .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("recreate sts: {e}")))?;
+        // Foreground 删除的对象要等 pod 全部终止（agent pod grace 15s + preStop）
+        // 才真正消失，紧随的 create 会撞 409 AlreadyExists——按 PVC 同款模式
+        // 限时重试（ensure_workspace_pvc 先例）
+        let create_start = std::time::Instant::now();
+        let max_create_wait = std::time::Duration::from_secs(60);
+        loop {
+            match self
+                .statefulsets()
+                .create(&PostParams::default(), &sts)
+                .await
+            {
+                Ok(_) => break,
+                Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                    if create_start.elapsed() > max_create_wait {
+                        return Err(ContainerRuntimeError::K8sError(format!(
+                            "recreate sts {sts_name}: still exists after {:.1}s of retries",
+                            create_start.elapsed().as_secs_f64()
+                        )));
+                    }
+                    warn!(
+                        "[K8S-STS] {} still being deleted (409), retrying in 2s... (elapsed {:.1}s)",
+                        sts_name,
+                        create_start.elapsed().as_secs_f64()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(e) => {
+                    return Err(ContainerRuntimeError::K8sError(format!(
+                        "recreate sts: {e}"
+                    )));
+                }
+            }
+        }
         info!("[K8S-STS] recreated {} (type={:?})", sts_name, service_type);
         Ok(())
     }

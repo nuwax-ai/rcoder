@@ -347,7 +347,21 @@ async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
         buf
     });
 
-    let status = child.wait().await.context("wait migrate")?;
+    // migrate 超时兜底：命令等待 stdin / 死循环时会永久卡住启动阶段
+    //（不进 supervise、readiness 恒 false、supervisord 也不重启它——进程
+    // 没退出），与 readiness 120s / bg_chat 150s 同款有限等待
+    const MIGRATE_TIMEOUT: Duration = Duration::from_secs(300);
+    let status = match tokio::time::timeout(MIGRATE_TIMEOUT, child.wait()).await {
+        Ok(status) => status.context("wait migrate")?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "migrate timed out after {}s: {}",
+                MIGRATE_TIMEOUT.as_secs(),
+                argv.join(" ")
+            );
+        }
+    };
     let out = out_task.await.unwrap_or_default();
     let err = err_task.await.unwrap_or_default();
 

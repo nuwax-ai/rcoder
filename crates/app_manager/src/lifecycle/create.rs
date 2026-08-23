@@ -165,6 +165,14 @@ impl AppService {
                         p.port
                     )));
                 }
+                // Service 端口保留名：ttyd/pgweb 由平台恒补（运行容器终端/PG
+                // 控制台的代理上游），用户占用会挤掉恒补暴露（K8s 端口名唯一）
+                if p.name == "ttyd" || p.name == "pgweb" {
+                    return Err(AppOperationError::Validation(format!(
+                        "port name '{}' is reserved for platform builtin services (ttyd=7681, pgweb=8081)",
+                        p.name
+                    )));
+                }
             }
         }
         Ok(app_id)

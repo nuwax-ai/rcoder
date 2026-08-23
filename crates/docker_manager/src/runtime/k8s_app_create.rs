@@ -23,7 +23,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
 use kube::api::Patch;
 #[cfg(feature = "kubernetes")]
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(feature = "kubernetes")]
 use shared_types::ServiceType;
@@ -296,20 +296,23 @@ impl KubernetesRuntime {
             ("ttyd", shared_types::TTYD_PORT),
             ("pgweb", shared_types::PGWEB_PORT),
         ] {
-            // 同名同值才算已存在：仅端口号命中而 name 不同时会造出两个同名
-            // ServicePort（K8s 校验 port names must be unique 拒绝整个对象）。
-            let already = ports
-                .iter()
-                .any(|p| p.name.as_deref() == Some(name) && p.port == port as i32);
-            if !already {
-                ports.push(ServicePort {
-                    name: Some(name.to_string()),
-                    port: port as i32,
-                    target_port: Some(IntOrString::Int(port as i32)),
-                    protocol: Some("TCP".to_string()),
-                    ..Default::default()
-                });
+            // 撞名即跳过（不论端口值）：再 push 同名端口会撞 K8s 校验
+            // "port names must be unique"，整个 Service 被拒绝。用户占用保留名
+            // 属自担行为（7681/8081 未暴露，对应 runtime 代理将不可达）。
+            if let Some(conflict) = ports.iter().find(|p| p.name.as_deref() == Some(name)) {
+                warn!(
+                    "[K8S] app {} Service port name '{}' occupied by user port {}, skipping builtin exposure",
+                    app_id, name, conflict.port
+                );
+                continue;
             }
+            ports.push(ServicePort {
+                name: Some(name.to_string()),
+                port: port as i32,
+                target_port: Some(IntOrString::Int(port as i32)),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            });
         }
         let tenant_id = params.tenant_id.as_deref();
         let space_id = params.space_id.as_deref();
