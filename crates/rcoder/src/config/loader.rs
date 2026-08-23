@@ -145,7 +145,6 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     Ok(config)
 }
 
-
 /// 从文件加载配置
 fn load_config_from_file() -> anyhow::Result<AppConfig> {
     let config_content = fs::read_to_string(CONFIG_FILE)
