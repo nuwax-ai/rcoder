@@ -9,54 +9,28 @@ use tracing::{error, info, warn};
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
 #[cfg(feature = "console")]
-mod console_obs;
-
-mod agent_mgmt;
-mod api_key_manager;
-mod auto_reload;
-mod config;
 #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
-mod grpc;
-mod handler;
-mod model;
-mod proxy_agent;
-
 // 🔥 Pyroscope Profiler 模块（可选：需要 pyroscope feature）
 #[cfg(feature = "pyroscope")]
-mod profiler;
-
 // 🔥 OpenTelemetry 追踪模块（可选：保留用于向后兼容）
 #[allow(dead_code)]
-mod otel_tracing;
-
-mod router;
-mod service;
-mod shutdown;
-mod utils;
-
 // HTTP 服务器模块 (仅在 http-server feature 启用时)
 #[cfg(feature = "http-server")]
-mod http_server;
-
 // ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
-mod file_server_embed;
-mod ws_terminal;
 // VNC 桌面连接活跃度计数（读 /proc/net/tcp 数 noVNC 端口 ESTABLISHED 连接，
 // 供 get_active_tasks_count 折入 active_tasks，使「桌面开着」的容器不被闲置回收）
-mod vnc_activity;
+pub use agent_runner::model::*;
 
-pub use model::*;
-
-use config::{CliArgs, load_config_with_args};
-use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
+use agent_runner::config::{CliArgs, load_config_with_args};
+use agent_runner::proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
-use router::AppState;
-use service::AgentSessionService;
-use shutdown::{set_panic_hook, setup_shutdown_handler};
-use utils::spawn_tool_version_log;
+use agent_runner::router::AppState;
+use agent_runner::service::AgentSessionService;
+use agent_runner::shutdown::{set_panic_hook, setup_shutdown_handler};
+use agent_runner::utils::spawn_tool_version_log;
 
 fn create_model_env_resolver(
-    config: &config::AppConfig,
+    config: &agent_runner::config::AppConfig,
 ) -> Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> {
     #[cfg(feature = "proxy")]
     {
@@ -120,7 +94,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
     // tokio-console 观测（console feature；shadowing 绑定——无 feature 时零代码）
     #[cfg(feature = "console")]
-    let telemetry_config = console_obs::attach(telemetry_config);
+    let telemetry_config = agent_runner::console_obs::attach(telemetry_config);
 
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let _telemetry = Arc::new(telemetry);
@@ -138,9 +112,9 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
     // 🆕 Pyroscope Profiler 初始化（可选：需要 pyroscope feature）
     #[cfg(feature = "pyroscope")]
-    let _pyroscope_guard: Option<profiler::ProfilerGuard> = {
+    let _pyroscope_guard: Option<agent_runner::profiler::ProfilerGuard> = {
         info!("Pyroscope profiling feature enabled");
-        match profiler::init_pyroscope_profiler_default() {
+        match agent_runner::profiler::init_pyroscope_profiler_default() {
             Ok(guard) => {
                 info!("Pyroscope profiler initialized successfully");
                 Some(guard)
@@ -168,7 +142,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
     // 异步初始化内置 agent 版本缓存（不阻塞主流程）
     tokio::spawn(async {
-        agent_mgmt::checker::init_builtin_agent_versions().await;
+        agent_runner::agent_mgmt::checker::init_builtin_agent_versions().await;
     });
 
     // 解析命令行参数
@@ -204,7 +178,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
     info!("[MAIN] Shared API key DashMap created");
 
     #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
-    let api_key_manager = Arc::new(api_key_manager::ApiKeyManager::from_shared(
+    let api_key_manager = Arc::new(agent_runner::api_key_manager::ApiKeyManager::from_shared(
         shared_api_key_manager.clone(),
     ));
 
@@ -227,31 +201,33 @@ async fn agent_runner_main() -> anyhow::Result<()> {
     info!("[MAIN] AgentSessionService created");
 
     // 🆕 P0-1: 创建 Agent 管理注册表(从磁盘加载,失败则用空注册表 + 警告)
-    // 注:用二进制自己的 `crate::agent_mgmt` 模块(与 router::AppState 同编译单元),
+    // 注:用二进制自己的 `crate::agent_mgmt` 模块(与 agent_runner::router::AppState 同编译单元),
     //     lib 和 binary 是两个独立 crate,类型不能混用。
-    let agent_mgmt_path_manager = agent_mgmt::PathManager::new();
-    let agent_mgmt_registry = match agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone())
-    {
-        Ok(r) => {
-            info!(
-                "[MAIN] Agent management registry loaded: total={}, builtin={}",
-                r.total(),
-                r.builtin_count()
-            );
-            Arc::new(r)
-        }
-        Err(e) => {
-            tracing::warn!("[MAIN] Failed to load agent management registry, starting empty: {e}");
-            Arc::new(agent_mgmt::AgentRegistry::empty(
-                agent_mgmt_path_manager.clone(),
-            ))
-        }
-    };
+    let agent_mgmt_path_manager = agent_runner::agent_mgmt::PathManager::new();
+    let agent_mgmt_registry =
+        match agent_runner::agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone()) {
+            Ok(r) => {
+                info!(
+                    "[MAIN] Agent management registry loaded: total={}, builtin={}",
+                    r.total(),
+                    r.builtin_count()
+                );
+                Arc::new(r)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[MAIN] Failed to load agent management registry, starting empty: {e}"
+                );
+                Arc::new(agent_runner::agent_mgmt::AgentRegistry::empty(
+                    agent_mgmt_path_manager.clone(),
+                ))
+            }
+        };
 
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
     {
-        use http_server::{HttpServerConfig, start_http_server};
+        use agent_runner::http_server::{HttpServerConfig, start_http_server};
         // 🔥 1. 可选：启动 gRPC 服务（当 grpc-server feature 启用时）
         #[cfg(feature = "grpc-server")]
         let grpc_handle = {
@@ -278,13 +254,13 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
             // gRPC 消息大小限制
             let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
-                grpc::AgentServiceImpl::new(grpc_state.clone()),
+                agent_runner::grpc::AgentServiceImpl::new(grpc_state.clone()),
             )
             .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
             .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
             // P0-1: Agent 管理 gRPC 服务
-            let agent_mgmt_service = agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+            let agent_mgmt_service = agent_runner::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
                 agent_mgmt_registry.clone(),
                 agent_mgmt_path_manager.clone(),
             );
@@ -325,13 +301,13 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         // 🔥 1.5. 启动 ttyd WS 终端中间层（tokio-tungstenite：接浏览器 + 连本地 ttyd）
         //         cd 逻辑由代码每次连接（含重连）控制，解决 WS 重连不进项目目录的问题
         tokio::spawn(async move {
-            ws_terminal::start_ws_terminal().await;
+            agent_runner::ws_terminal::start_ws_terminal().await;
         });
 
         // 🔥 1.6. 可选：启动嵌入式 file-server (RCODER_EMBED_FILE_SERVER=true)
         //         让 workspace build 在 agent-runner 全量工具链下执行 (UserApp)
         if shared_types::FeatureFlags::get().embed_file_server {
-            file_server_embed::spawn_embedded_file_server().await;
+            agent_runner::file_server_embed::spawn_embedded_file_server().await;
         }
 
         // 🔥 2. 创建 HttpServerConfig（包含所有配置）
@@ -422,7 +398,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
         // gRPC 消息大小限制
         let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
-            grpc::AgentServiceImpl::new(grpc_state.clone()),
+            agent_runner::grpc::AgentServiceImpl::new(grpc_state.clone()),
         )
         .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
@@ -460,8 +436,10 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         // 启动轻量 HTTP 健康检查服务（供 docker_manager 健康检查使用）
         let health_port = config.port; // 默认 8086，来自 --port 参数
         let _health_handle = tokio::spawn(async move {
+            use agent_runner::handler::health_handler::{
+                build_health_response, check_grpc_port_simple,
+            };
             use axum::{Json, Router, routing::get};
-            use handler::health_handler::{build_health_response, check_grpc_port_simple};
 
             async fn health_check()
             -> Json<shared_types::HttpResult<shared_types::HealthCheckResponse>> {
@@ -506,7 +484,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         // 启动 Pingora（如有配置且启用了 proxy feature）
         #[cfg(feature = "proxy")]
         let pingora_result = {
-            use proxy_agent::start_pingora;
+            use agent_runner::proxy_agent::start_pingora;
 
             if let Some(proxy_config) = &config.proxy_config {
                 Some(start_pingora(proxy_config, shared_api_key_manager.clone())?)

@@ -2,18 +2,28 @@
 //!
 //! 提供 AI 代理运行时和 ACP 协议集成
 
+// 单树化：全部模块在 lib 树唯一声明（main.rs 只做编排入口经 `agent_runner::`）。
 pub mod agent_mgmt;
 pub mod api_key_manager;
 pub mod auto_reload;
-mod config;
+pub mod config;
+/// tokio-console 观测（`console` feature 专用装配）
+#[cfg(feature = "console")]
+pub mod console_obs;
+/// 内嵌 file-server（env RCODER_EMBED_FILE_SERVER 运行时开关，编译期无门控）
+pub mod file_server_embed;
 pub mod grpc;
-mod handler;
-mod model;
+pub mod handler;
+pub mod model;
 pub mod otel_tracing; // 🔥 设为 public，供其他模块使用
-mod proxy_agent;
+/// Pyroscope Profiler（`pyroscope` feature 专用）
+#[cfg(feature = "pyroscope")]
+pub mod profiler;
+pub mod proxy_agent;
 pub mod router;
 pub mod service; // 🔥 设为 public，供测试使用
-mod utils;
+pub mod shutdown;
+pub mod utils;
 
 // 条件性编译：HTTP 服务器模块
 #[cfg(feature = "http-server")]

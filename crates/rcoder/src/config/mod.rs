@@ -1,7 +1,3 @@
-// 配置模块由 binary (main.rs) 通过 CLI args 使用；lib 内部不直接调用
-// load_config* 与一些 helper 方法，故抑制 dead_code。
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 use clap::Parser;

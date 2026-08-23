@@ -21,7 +21,7 @@ use tracing::{info, warn};
 /// `Config::load()`(自读 env)+ `FileServer::builder(config).build()`(默认
 /// `LocalWorkspaceResolver`)+ `tokio::spawn` serve。任何阶段失败只 `warn!`,
 /// 不阻断 agent_runner 主循环(对齐 rcoder)。
-pub(crate) async fn spawn_embedded_file_server() {
+pub async fn spawn_embedded_file_server() {
     let fs_config = match Config::load() {
         Ok(c) => c,
         Err(e) => {

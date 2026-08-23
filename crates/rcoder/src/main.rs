@@ -1,37 +1,10 @@
-mod background_tasks;
-mod batch_migrate;
-mod bootstrap;
-
-mod app_state;
-mod cleanup_task;
-mod config;
-mod config_watcher;
-/// tokio-console 观测装配（`console` feature 专用）
-#[cfg(feature = "console")]
-mod console_obs;
-mod docker_init;
-mod handler;
-mod middleware;
-mod proxy_init;
-mod router;
-mod router_docs;
-mod server;
-mod service;
-mod shutdown;
-mod skill_sync_reconciler;
-mod userapp_forward;
-mod userapp_publish;
-mod userapp_recycle;
-mod utils;
-mod workspace_migrate;
-
+// 单树化后 bin 只做编排入口：全部模块经 `rcoder::`（lib 树唯一编译）。
 use std::sync::Arc;
 
 use tracing::{info, warn};
 
+use rcoder::app_state::AppState;
 use rcoder::*;
-
-use router::AppState;
 
 use docker_manager::runtime_selection::RuntimeType;
 
