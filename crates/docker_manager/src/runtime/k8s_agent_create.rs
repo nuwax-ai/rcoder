@@ -61,14 +61,18 @@ impl KubernetesRuntime {
                 .await?;
         }
 
-        // Check if pod already exists and is running
-        // .cloned() 让 cached 成为 owned,读守卫在条件求值结束即释放 —— 否则守卫会跨下面
-        // get_container_info_by_identifier_inner().await,而后者会再次进入同一把 RwLock;
-        // tokio RwLock 写优先,并发 ensure+stop 时会自死锁。
-        if let Some(entry) = self.pod_cache.read().await.get(identifier).cloned()
-            && entry.cached_at.elapsed() < POD_CACHE_TTL
-            && entry.info.status == ContainerRuntimeStatus::Running
-        {
+        // Check if pod already exists and is running.
+        // 读守卫物化到独立块内结束（scrutinee 临时值在 Rust 里存活到整个 if 语句
+        // 结束——即便 .cloned() 只解决 entry 的数据借用，guard 仍会跨下方 await；
+        // 若 body 内再入 pod_cache 写锁即自死锁，tokio RwLock 不可升级）。
+        let cached_running = {
+            let entry = self.pod_cache.read().await.get(identifier).cloned();
+            entry.is_some_and(|entry| {
+                entry.cached_at.elapsed() < POD_CACHE_TTL
+                    && entry.info.status == ContainerRuntimeStatus::Running
+            })
+        };
+        if cached_running {
             info!("[K8S] Pod {} already exists and is running", pod_name);
             return self
                 .get_container_info_by_identifier_inner(identifier, &service_type)

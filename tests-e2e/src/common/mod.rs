@@ -499,17 +499,6 @@ mod tests {
     }
 }
 
-/// 跨进程文件锁（flock 独占，持有到 guard drop）。
-///
-/// compose_userapp 与 compose_userapp_dev 是两个测试二进制（cargo test 并行跑），
-/// 各自的进程内 OnceLock 串行锁互相不可见——都建 rcoder-app-builder-* 容器，
-/// 并发时单节点资源竞争复现"后发容器 agent_runner 启动超退避窗"。本锁以
-/// 共享文件 flock 实现跨二进制互斥。
-/// 跨进程互斥锁（TCP 端口占位：bind 成功即持锁，进程退出由内核自动释放，
-/// 无锁文件残留问题）。compose_userapp 与 compose_userapp_dev 是两个测试二进制
-/// （cargo test 并行跑），各自的进程内 OnceLock 串行锁互相不可见——都建
-/// rcoder-app-builder-* 容器，并发时单节点资源竞争复现"后发容器 agent_runner
-/// 启动超退避窗"。经独占端口互斥，实现跨二进制串行。
 pub mod cross_bin_lock {
     use std::net::TcpListener;
     use std::sync::OnceLock;
@@ -535,7 +524,14 @@ pub mod cross_bin_lock {
                     }
                     return;
                 }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+                Err(_) => {
+                    // TOCTOU 自愈：同进程兄弟线程可能已 bind 成功并 set HELD——
+                    // 不回查会永久自旋（端口被本进程持有到退出）。
+                    if HELD.get().is_some() {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
             }
         }
     }

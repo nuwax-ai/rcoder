@@ -108,9 +108,7 @@ async fn main() -> anyhow::Result<()> {
                     "rcoder restarted",
                     &userapp_publish::store::owner_pod_name(),
                     chrono::Utc::now()
-                        - chrono::Duration::seconds(
-                            userapp_publish::store::STALE_TASK_SECS,
-                        ),
+                        - chrono::Duration::seconds(userapp_publish::store::STALE_TASK_SECS),
                 )
                 .await
             {

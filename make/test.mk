@@ -36,7 +36,7 @@ test-all:
 test-e2e-compose:
 	@echo "🧪 Rust e2e（compose 环境；串行；报告在 tests-e2e/reports/）..."
 	@status=0; \
-	cargo test -p rcoder-e2e --test compose_sse --test compose_session --test compose_userapp -- --test-threads=1 || status=$$?; \
+	cargo test -p rcoder-e2e --test compose_sse --test compose_session --test compose_userapp --test compose_userapp_dev --test compose_webchat -- --test-threads=1 || status=$$?; \
 	latest=$$(ls -t tests-e2e/reports/ 2>/dev/null | head -1); \
 	echo ""; \
 	if [ -n "$$latest" ]; then \

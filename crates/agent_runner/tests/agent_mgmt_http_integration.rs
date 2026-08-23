@@ -1,3 +1,5 @@
+#![cfg(feature = "http-server")]
+
 //! Agent Management HTTP 路由集成测试 (P0-1g)
 //!
 //! 直接构建 `agent_mgmt` 子路由,用 `tower::ServiceExt::oneshot` 发送请求,

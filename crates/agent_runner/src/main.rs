@@ -13,7 +13,6 @@ use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 // 🔥 Pyroscope Profiler 模块（可选：需要 pyroscope feature）
 #[cfg(feature = "pyroscope")]
 // 🔥 OpenTelemetry 追踪模块（可选：保留用于向后兼容）
-#[allow(dead_code)]
 // HTTP 服务器模块 (仅在 http-server feature 启用时)
 #[cfg(feature = "http-server")]
 // ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
@@ -404,7 +403,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
         // P0-1: Agent 管理 gRPC 服务
-        let agent_mgmt_service = crate::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+        let agent_mgmt_service = agent_runner::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
             agent_mgmt_registry.clone(),
             agent_mgmt_path_manager.clone(),
         );

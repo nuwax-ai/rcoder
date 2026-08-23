@@ -29,6 +29,18 @@ fn cleanup_project(project_id: &str) {
     );
 }
 
+/// WebAgentRunner 容器清理守卫（Drop 语义，panic 安全——对齐 TestUserGuard 模式；
+/// TestUserGuard 只清 agent-runner 前缀，管不到 dev-master-rcoder-{project_id}）。
+struct ProjectGuard {
+    project_id: String,
+}
+
+impl Drop for ProjectGuard {
+    fn drop(&mut self) {
+        cleanup_project(&self.project_id);
+    }
+}
+
 /// full_turn 骨架（两后端共用）：不带 project_id → 自动生成回显 + SSE 完整轮。
 async fn webchat_full_turn(backend: &str) {
     let scenario = "webchat_full_turn";
@@ -121,6 +133,9 @@ async fn webchat_project_reuse() {
     // 显式 project_id（复用语义的前提）
     req1.project_id = Some(format!("{}-webchat-reuse", env.run_tag));
     let pid = req1.project_id.clone().unwrap();
+    let _project_guard = ProjectGuard {
+        project_id: pid.clone(),
+    };
     let d1 = match chat_web_reported(&env, &report, "turn1", &req1).await {
         Ok(d) => d,
         Err(_) => {
@@ -138,7 +153,6 @@ async fn webchat_project_reuse() {
     req2.project_id = Some(pid.clone());
     let Ok(d2) = chat_web_reported(&env, &report, "turn2", &req2).await else {
         assert_hard_all(report).await;
-        cleanup_project(&pid);
         return;
     };
     // 语义锚点：两轮同 project → 会话归属一致（session 复用时相等；新建时
@@ -153,7 +167,6 @@ async fn webchat_project_reuse() {
         !d2.session_id.is_empty(),
         d2.session_id.clone(),
     );
-    cleanup_project(&pid);
     assert_hard_all(report).await;
 }
 
@@ -175,9 +188,11 @@ async fn webchat_two_turn_seq() {
     );
     req1.project_id = Some(format!("{}-webchat-seq", env.run_tag));
     let pid = req1.project_id.clone().unwrap();
+    let _project_guard = ProjectGuard {
+        project_id: pid.clone(),
+    };
     let Ok(d1) = chat_web_reported(&env, &report, "turn1", &req1).await else {
         assert_hard_all(report).await;
-        cleanup_project(&pid);
         return;
     };
     let sid1 = d1.session_id.clone();
@@ -193,7 +208,6 @@ async fn webchat_two_turn_seq() {
     req2.session_id = Some(sid1.clone());
     let Ok(d2) = chat_web_reported(&env, &report, "turn2", &req2).await else {
         assert_hard_all(report).await;
-        cleanup_project(&pid);
         return;
     };
     let sid2 = d2.session_id.clone();
@@ -209,11 +223,26 @@ async fn webchat_two_turn_seq() {
         !e2.is_empty(),
         format!("events={}", e2.len()),
     );
+    // seq 隔离（对齐 computer 域断言模式）：第二轮全部 id > 第一轮最大 id
+    let ids1: Vec<u64> = e1.iter().filter_map(|e| e.seq).collect();
+    let ids2: Vec<u64> = e2.iter().filter_map(|e| e.seq).collect();
+    if let (Some(max1), Some(min2)) = (ids1.iter().max(), ids2.iter().min()) {
+        report.assert_hard(
+            "第二轮 seq 全 > 首轮最大",
+            min2 > max1,
+            format!("max1={max1} min2={min2}"),
+        );
+    } else {
+        report.assert_hard(
+            "两轮均含带 seq 事件",
+            !ids1.is_empty() && !ids2.is_empty(),
+            format!("ids1={} ids2={}", ids1.len(), ids2.len()),
+        );
+    }
     report.assert_hard(
         "turn2 含 end_turn",
         count_event(&e2, "end_turn") >= 1,
         format!("events={}", e2.len()),
     );
-    cleanup_project(&pid);
     assert_hard_all(report).await;
 }

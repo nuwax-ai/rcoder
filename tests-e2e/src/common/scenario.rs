@@ -117,7 +117,6 @@ pub async fn record_bg_chat(
 }
 
 /// web 域 collect（`/agent/progress/{sid}` 端点版；computer 域用 collect_reported）。
-#[allow(clippy::too_many_arguments)]
 pub async fn collect_reported_web(
     env: &Env,
     report: &JsonlReporter,

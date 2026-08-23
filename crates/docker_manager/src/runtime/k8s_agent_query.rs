@@ -30,7 +30,12 @@ impl KubernetesRuntime {
         // Try cache first
         // .cloned() 让 cached 成为 owned,读守卫在条件求值结束即释放 —— 否则守卫跨下面
         // build_container_basic_info().await 持续占读锁,卡住写者(stop/cleanup)。
-        if let Some(entry) = self.pod_cache.read().await.get(identifier).cloned()
+        // 读守卫物化到独立块（guard 跨 await 地雷同 k8s_agent_create.rs 修正注释）。
+        let entry = {
+            let guard = self.pod_cache.read().await;
+            guard.get(identifier).cloned()
+        };
+        if let Some(entry) = entry
             && entry.cached_at.elapsed() < POD_CACHE_TTL
             && entry.info.status == ContainerRuntimeStatus::Running
         {
@@ -133,11 +138,17 @@ impl KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
-        // Check cache first（TTL 未过期才命中，避免外部删除后返旧）
-        if let Some(entry) = self.pod_cache.read().await.get(identifier)
-            && entry.cached_at.elapsed() < POD_CACHE_TTL
-        {
-            return Ok(Some(entry.info.clone()));
+        // Check cache first（TTL 未过期才命中，避免外部删除后返旧）。
+        // 读守卫物化（同上——guard 不跨下方 pods().get() 的网络 await）。
+        let cached = {
+            let guard = self.pod_cache.read().await;
+            guard
+                .get(identifier)
+                .filter(|entry| entry.cached_at.elapsed() < POD_CACHE_TTL)
+                .map(|entry| entry.info.clone())
+        };
+        if let Some(info) = cached {
+            return Ok(Some(info));
         }
 
         // 1) Query by concrete pod name

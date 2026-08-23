@@ -14,7 +14,7 @@ pub mod config;
 pub mod config_watcher;
 /// tokio-console 观测装配（`console` feature 专用）
 #[cfg(feature = "console")]
-pub mod console_obs;
+pub(crate) mod console_obs;
 pub mod docker_init;
 pub mod file_server_embed;
 pub mod grpc;
@@ -25,16 +25,16 @@ pub mod proxy_init;
 pub mod router;
 pub mod router_docs;
 pub mod server;
-pub mod service;
+pub(crate) mod service;
 pub mod shutdown;
 pub mod skill_sync_reconciler;
 pub mod storage;
 pub mod userapp_forward;
 pub mod userapp_publish;
-pub mod userapp_recycle;
-pub mod utils;
+pub(crate) mod userapp_recycle;
+pub(crate) mod utils;
 pub mod vnc;
-pub mod workspace_migrate;
+pub(crate) mod workspace_migrate;
 
 // 重新导出主要的类型和函数
 pub use storage::{ProjectAdapter, ProjectStore, ProjectStoreBackend};

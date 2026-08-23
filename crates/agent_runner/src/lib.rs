@@ -5,7 +5,6 @@
 // 单树化：全部模块在 lib 树唯一声明（main.rs 只做编排入口经 `agent_runner::`）。
 pub mod agent_mgmt;
 pub mod api_key_manager;
-pub mod auto_reload;
 pub mod config;
 /// tokio-console 观测（`console` feature 专用装配）
 #[cfg(feature = "console")]
@@ -34,7 +33,7 @@ pub mod ws_terminal;
 
 // VNC 桌面连接活跃度计数（读 /proc/net/tcp 数 noVNC 端口 ESTABLISHED 连接，
 // 供 get_active_tasks_count 折入 active_tasks，使「桌面开着」的容器不被闲置回收）
-pub mod vnc_activity;
+pub(crate) mod vnc_activity;
 
 // 测试辅助模块 (仅在 testing feature 启用时编译)
 #[cfg(feature = "testing")]
