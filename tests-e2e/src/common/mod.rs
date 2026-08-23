@@ -540,3 +540,78 @@ pub mod cross_bin_lock {
         }
     }
 }
+
+/// `/chat`（Web Agent Runner 域）payload：与 computer 域同构，去 user_id/service_type
+/// （project_id 缺省 None——验 /chat 特有的自动生成路径）。
+pub fn base_payload_web(
+    env: &Env,
+    backend: Backend,
+    prompt: &str,
+    request_id: &str,
+) -> shared_types::AgentChatRequest {
+    let computer = env.base_payload(backend, prompt, request_id, "web-e2e-unused");
+    shared_types::AgentChatRequest {
+        project_id: computer.project_id,
+        prompt: computer.prompt,
+        session_id: computer.session_id,
+        attachments: computer.attachments,
+        data_source_attachments: computer.data_source_attachments,
+        model_provider: computer.model_provider,
+        request_id: computer.request_id,
+        system_prompt: computer.system_prompt,
+        user_prompt: computer.user_prompt,
+        agent_config: computer.agent_config,
+        pod_id: computer.pod_id,
+        tenant_id: computer.tenant_id,
+        space_id: computer.space_id,
+        isolation_type: computer.isolation_type,
+        agent_work_dir: computer.agent_work_dir,
+    }
+}
+
+/// `/chat` 全流程留痕版（平行 chat_reported，绑定 AgentChatRequest）。
+pub async fn chat_web_reported(
+    env: &Env,
+    report: &JsonlReporter,
+    phase: &str,
+    req: &shared_types::AgentChatRequest,
+) -> Result<ChatResponse> {
+    let url = format!("{}/chat", env.rcoder);
+    let t0 = Instant::now();
+    let mut req_sanitized = serde_json::to_value(req).unwrap_or_default();
+    if let Some(mp) = req_sanitized["model_provider"].as_object_mut() {
+        mp.remove("api_key");
+    }
+    let resp = env
+        .http
+        .post(&url)
+        .timeout(Duration::from_secs(180))
+        .json(req)
+        .send()
+        .await
+        .map_err(|e| anyhow!("chat request: {e}"))?;
+    let status = resp.status();
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("parse chat response: {e}"))?;
+    let result: Result<ChatResponse> =
+        if !status.is_success() || body["code"].as_str() != Some("0000") {
+            Err(anyhow!(
+                "chat failed via {url}: HTTP {status}, body: {body}"
+            ))
+        } else {
+            serde_json::from_value(body["data"].clone())
+                .map_err(|e| anyhow!("chat response data 反序列化: {e}"))
+        };
+    report.chat_request(ChatTrace {
+        phase,
+        url: &url,
+        ok: result.is_ok(),
+        request_sanitized: req_sanitized.clone(),
+        response: None,
+        error: result.as_ref().err().map(|e| e.to_string()).as_deref(),
+        elapsed_ms: t0.elapsed().as_millis(),
+    });
+    result
+}

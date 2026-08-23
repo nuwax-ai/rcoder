@@ -60,14 +60,29 @@ pub async fn collect<F>(
     duration_s: f64,
     last_event_id: Option<u64>,
     idle_stop: bool,
-    mut on_event: F,
+    on_event: F,
 ) -> (Vec<SseEvent>, EndedReason)
 where
     F: FnMut(&SseEvent),
 {
     let url = format!("{base_url}/computer/progress/{session_id}");
+    collect_at(http, &url, duration_s, last_event_id, idle_stop, on_event).await
+}
+
+/// 指定完整 URL 的收集变体（web 域 `/agent/progress/{sid}` 等非 computer 端点）。
+pub async fn collect_at<F>(
+    http: &reqwest::Client,
+    url: &str,
+    duration_s: f64,
+    last_event_id: Option<u64>,
+    idle_stop: bool,
+    mut on_event: F,
+) -> (Vec<SseEvent>, EndedReason)
+where
+    F: FnMut(&SseEvent),
+{
     let mut req = http
-        .get(&url)
+        .get(url)
         // 对齐 Python 套件(requests 仅 HTTP/1.1)；axum SSE 对 h2 客户端的
         // 流行为未在本套件验证过，固定 1.1 排除协议层变量。
         .version(reqwest::Version::HTTP_11)

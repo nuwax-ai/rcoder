@@ -116,6 +116,35 @@ pub async fn record_bg_chat(
     report.chat_request(trace);
 }
 
+/// web 域 collect（`/agent/progress/{sid}` 端点版；computer 域用 collect_reported）。
+#[allow(clippy::too_many_arguments)]
+pub async fn collect_reported_web(
+    env: &Env,
+    report: &JsonlReporter,
+    phase: &str,
+    entry: &str,
+    sid: &str,
+    duration_s: f64,
+) -> (Vec<SseEvent>, EndedReason) {
+    let url = format!("{entry}/agent/progress/{sid}");
+    report.subscribe_begin(phase, &url, None);
+    let (events, ended) = sse::collect_at(&env.sse_http, &url, duration_s, None, false, |ev| {
+        report.sse_event(phase, ev.seq, &ev.event, &ev.data, ev.t_ms)
+    })
+    .await;
+    let ids = sse::ids_of(&events);
+    let text = sse::chunks_text(&events);
+    report.subscribe_end(
+        phase,
+        ended.as_str(),
+        events.len(),
+        &ids,
+        sse::type_counts(&events),
+        &text,
+    );
+    (events, ended)
+}
+
 pub fn count_event(events: &[SseEvent], name: &str) -> usize {
     events.iter().filter(|e| e.event == name).count()
 }
