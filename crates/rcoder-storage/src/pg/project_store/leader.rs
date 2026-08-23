@@ -69,17 +69,30 @@ async fn run(
         }
 
         if is_leader.load(Ordering::Acquire) {
-            // 保活探测：连接死亡（网络分区/PG 重启）→ 让位（服务端锁随连接释放）
+            // 保活探测：连接死亡（网络分区/PG 重启）→ 让位（服务端锁随连接释放）。
+            // 应用层超时兜底：TCP 半开（交换机静默丢包）下语句到不了服务器，
+            // statement_timeout 不生效，裸等会挂到内核 TCP 超时（分钟级）——
+            // 期间 PG 侧锁已随连接死亡释放、他副本已抢主，形成双主窗口。
+            // 超时按 POLL_INTERVAL 判死让位，双主窗口收敛到轮询量级。
             let Some(conn) = lock_conn.as_mut() else {
                 // 不变式破坏（leader 必有持锁连接）：防御性复位
                 warn!("[STORAGE_PG] leader invariant broken (no lock conn), stepping down");
                 is_leader.store(false, Ordering::Release);
                 continue;
             };
-            if sqlx::query("SELECT 1").execute(&mut *conn).await.is_err() {
-                warn!("[STORAGE_PG] leader lock connection lost, stepping down");
-                is_leader.store(false, Ordering::Release);
-                lock_conn = None;
+            let probe = sqlx::query("SELECT 1").execute(&mut *conn);
+            match tokio::time::timeout(POLL_INTERVAL, probe).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!("[STORAGE_PG] leader lock connection lost ({e}), stepping down");
+                    is_leader.store(false, Ordering::Release);
+                    lock_conn = None;
+                }
+                Err(_) => {
+                    warn!("[STORAGE_PG] leader probe timed out (half-open conn?), stepping down");
+                    is_leader.store(false, Ordering::Release);
+                    lock_conn = None;
+                }
             }
         } else {
             // 抢锁：独立连接 + session 级 advisory lock（连接存活期间持有）

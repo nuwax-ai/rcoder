@@ -26,6 +26,9 @@ const BATCH_MAX: usize = 200;
 const DROP_DEPTH_THRESHOLD: usize = 10_000;
 /// 重试退避上限
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
+/// 整批重试上限：超过后拆单定位坏 op（防单条非瞬态错误永久堵塞队列头——
+/// 后续全部结构性 op 永不落库，PG 与镜像永久分叉直到重启）
+const MAX_BATCH_RETRIES: u32 = 5;
 /// 优雅关停的排空等待上限（结构性 op 尽力落盘）
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -137,6 +140,7 @@ async fn run(
         }
 
         // 整批重试（cancel 可打断：未落盘批次并入关停排空集合，尽力最后一次）
+        let mut retries: u32 = 0;
         loop {
             match execute_batch(&pool, &batch).await {
                 Ok(size) => {
@@ -147,8 +151,9 @@ async fn run(
                     break;
                 }
                 Err(e) => {
+                    retries += 1;
                     error!(
-                        "[STORAGE_PG] batch failed ({} ops, retry in {:?}): {e:#}",
+                        "[STORAGE_PG] batch failed ({} ops, attempt {retries}, retry in {:?}): {e:#}",
                         batch.len(),
                         backoff
                     );
@@ -163,6 +168,27 @@ async fn run(
                         break;
                     }
                     backoff = (backoff * 2).min(MAX_BACKOFF);
+                    // 瞬态错误（PG 抖动）整批重放安全；持续失败到界说明批内混有
+                    // 非瞬态错误（典型：跨副本交错导致 AddSession 的 FK violation
+                    // ——project 行已被清理 leader 删除）——拆单执行定位坏 op，
+                    // 确定性错误丢弃并告警，保住批内其余 op 与队列后续的推进
+                    if retries >= MAX_BATCH_RETRIES {
+                        warn!(
+                            "[STORAGE_PG] batch still failing after {retries} attempts, isolating per-op"
+                        );
+                        let (committed, quarantined) =
+                            isolate_poison_ops(&pool, &batch, &cancel).await;
+                        pending.fetch_sub(committed as i64, Ordering::AcqRel);
+                        for (op, err) in quarantined {
+                            error!(
+                                "[STORAGE_PG] dropped non-transient op (mirror/PG may diverge; \
+                                 next sync/backfill will reconcile): op={op:?}, error={err:#}"
+                            );
+                            pending.fetch_sub(1, Ordering::AcqRel);
+                        }
+                        backoff = Duration::from_secs(1);
+                        break;
+                    }
                 }
             }
         }
@@ -216,6 +242,59 @@ async fn execute_batch(pool: &PgPool, batch: &[PersistOp]) -> anyhow::Result<usi
     }
     tx.commit().await?;
     Ok(batch.len())
+}
+
+/// 拆单定位坏 op：逐条独立事务执行，成功的照常落库；失败的按 SQLSTATE 分类——
+/// 确定性错误（FK violation 23503 / unique 23505 / 语法 42601 等，重放必败）
+/// 进隔离清单丢弃，瞬态错误（连接类）也丢弃但本轮已尽力（下次 sync 收敛）。
+/// 返回 (成功数, 被丢弃的 (op, 错误))。
+async fn isolate_poison_ops(
+    pool: &PgPool,
+    batch: &[PersistOp],
+    cancel: &CancellationToken,
+) -> (usize, Vec<(PersistOp, anyhow::Error)>) {
+    let mut quarantined = Vec::new();
+    let mut committed = 0usize;
+    for op in batch {
+        if cancel.is_cancelled() {
+            // 关停打断：剩余 op 无法判定，作为隔离处理交给上层日志（关停路径
+            // 的 flush_and_stop 有自己的排空逻辑）
+            quarantined.push((op.clone(), anyhow::anyhow!("cancelled during isolation")));
+            continue;
+        }
+        match execute_batch(pool, std::slice::from_ref(op)).await {
+            Ok(_) => committed += 1,
+            Err(e) => {
+                if is_deterministic_pg_error(&e) {
+                    // 重放必败（如 FK violation：project 已被清理 leader 删除，
+                    // AddSession 永远无法满足依赖）——丢弃并告警，让队列前进
+                    quarantined.push((op.clone(), e));
+                } else {
+                    // 瞬态错误在拆单后仍失败（PG 仍不可达）：丢弃但语义不同
+                    //（若不丢弃会与整批重试死循环）；靠 sync/backfill 收敛
+                    quarantined.push((op.clone(), e));
+                }
+            }
+        }
+    }
+    (committed, quarantined)
+}
+
+/// PG 确定性错误判定（SQLSTATE 前缀）：
+/// 23xxx = 完整性冲突（FK/unique/检查）、42xxx = 语法/类型、22xxx = 数据格式。
+/// 这些错误重放必败，与连接类瞬态错误（重放可能成功）相对。
+fn is_deterministic_pg_error(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if let Some(db_err) = cause.downcast_ref::<sqlx::Error>()
+            && let sqlx::Error::Database(db) = db_err
+            && let Some(code) = db.code()
+        {
+            let s = code.to_string();
+            return s.starts_with("23") || s.starts_with("42") || s.starts_with("22");
+        }
+        // 连接池/IO 类 sqlx 错误 → 瞬态
+    }
+    false
 }
 
 /// 单 op → repo 调用（全部幂等：upsert / delete，重放安全）。

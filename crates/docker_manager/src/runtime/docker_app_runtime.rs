@@ -356,8 +356,11 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         use bollard::query_parameters::RemoveContainerOptions;
         let name = app_deployment_name(app_id);
         let client = self.inner.get_docker_client();
-        // best-effort: 容器可能不存在，忽略删除失败
-        if let Err(e) = client
+        // 404 容忍 + 真实失败透传（对齐 K8s 侧 k8s_app_lifecycle 契约）：
+        // 调用方 delete_app(purge=true) 依赖本步成功才继续 destroy_app_pvc
+        //（Docker 语义=删 workspace 目录）——全量吞错会让容器还在运行而
+        // bind mount 源目录被删，写入进入孤儿 inode，数据丢失
+        match client
             .remove_container(
                 &name,
                 Some(RemoveContainerOptions {
@@ -367,11 +370,30 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             )
             .await
         {
-            tracing::debug!(
-                "[DOCKER] Best-effort delete container {} failed (may not exist): {}",
-                name,
-                e
-            );
+            Ok(()) => {}
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                tracing::debug!("[DOCKER] delete container {} not found, skip", name);
+            }
+            Err(e) => {
+                // daemon 短暂不可达等瞬态：先查存在性区分（存在但删失败=透传）
+                let exists = client
+                    .inspect_container(&name, None)
+                    .await
+                    .map(|_| true)
+                    .unwrap_or(false);
+                if exists {
+                    return Err(ContainerRuntimeError::DockerError(format!(
+                        "delete container {name}: {e}"
+                    )));
+                }
+                tracing::debug!(
+                    "[DOCKER] delete container {} vanished concurrently ({}), skip",
+                    name,
+                    e
+                );
+            }
         }
         // 清理内存态回收策略（K8s 靠注解随 Deployment 自动消失；Docker 需显式清，防孤儿堆积）
         drop(self.recycle_policy.remove(app_id));

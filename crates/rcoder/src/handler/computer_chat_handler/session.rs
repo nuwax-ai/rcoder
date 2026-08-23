@@ -7,7 +7,7 @@ use shared_types::{ChatResponse, ComputerChatRequest};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::{AppError, HttpResult, router::AppState};
+use crate::{HttpResult, router::AppState};
 use docker_manager::ContainerBasicInfo;
 
 use super::super::chat_forward::ChatFlowExit;
@@ -242,16 +242,16 @@ pub(super) async fn update_session_mappings_after_response(
     container_info: &ContainerBasicInfo,
     request: &ComputerChatRequest,
     container_service_type: &shared_types::ServiceType,
-) -> Result<(), AppError> {
+) {
     let Some(chat_response) = &result.data else {
-        return Ok(());
+        return;
     };
 
     let session_id = chat_response.session_id.clone();
 
     // 只有当 session_id 非空时才更新映射
     if session_id.is_empty() {
-        return Ok(());
+        return;
     }
 
     info!(
@@ -330,13 +330,15 @@ pub(super) async fn update_session_mappings_after_response(
                 &session_id,
             )
             .await
-            .map_err(|e| {
-                tracing::error!(
-                    "[STORAGE] insert_project_with_session_durable failed: {}",
+            .unwrap_or_else(|e| {
+                // 降级不失败：gRPC chat 已成功、agent 已执行，映射写入失败时把
+                // 成功响应变 500 会让客户端重试重复发消息——PG 内部已降级
+                // write-behind，此处 Err 仅剩镜像写失败等罕见分支，warn 即可
+                tracing::warn!(
+                    "[STORAGE] session mapping degraded (durable fallback applied): {}",
                     e
                 );
-                e
-            })?;
+            });
 
         info!(
             "🔄 [COMPUTER_CHAT] Updated existing container mapping: user_id={}, project_id={}, session_id={} (last_activity refreshed)",
@@ -375,13 +377,15 @@ pub(super) async fn update_session_mappings_after_response(
                 &session_id,
             )
             .await
-            .map_err(|e| {
-                tracing::error!(
-                    "[STORAGE] insert_project_with_session_durable failed: {}",
+            .unwrap_or_else(|e| {
+                // 降级不失败：gRPC chat 已成功、agent 已执行，映射写入失败时把
+                // 成功响应变 500 会让客户端重试重复发消息——PG 内部已降级
+                // write-behind，此处 Err 仅剩镜像写失败等罕见分支，warn 即可
+                tracing::warn!(
+                    "[STORAGE] session mapping degraded (durable fallback applied): {}",
                     e
                 );
-                e
-            })?;
+            });
 
         info!(
             "🆕 [COMPUTER_CHAT] Created new container mapping: user_id={}, project_id={}, session_id={}",
@@ -400,6 +404,4 @@ pub(super) async fn update_session_mappings_after_response(
             user_id, project_id, session_id, result.code, result.message
         );
     }
-
-    Ok(())
 }

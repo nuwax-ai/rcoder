@@ -227,6 +227,23 @@ impl AppState {
 
     /// 删除项目（替代 project_and_agent_map.remove）
     #[inline]
+    /// 删除 project——durable 变体（stop/清理路径，消队列倒挂窗口）。
+    pub async fn remove_project_durable(
+        &self,
+        project_id: &str,
+    ) -> Option<Arc<ProjectAndContainerInfo>> {
+        let removed = self.projects.remove_durable(project_id).await;
+        // session 终结：归还 served_sessions 首连资格条目（防无界累积；调用方
+        // 已先行 shutdown_sse_streams_for_project 关流，此处只清资格登记）
+        if let Some(info) = &removed {
+            for sid in info.sessions() {
+                self.session_stream_registry
+                    .release_first_client_claim(&sid);
+            }
+        }
+        removed
+    }
+
     pub fn remove_project(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
         let removed = self.projects.remove(project_id);
         // session 终结：归还 served_sessions 首连资格条目（防无界累积；调用方
@@ -354,11 +371,25 @@ impl AppState {
         let _ = self.projects.add_session_to_project(project_id, session_id);
     }
 
-    /// 清除会话信息（清所有 session，agent stop 场景）
-    pub fn clear_session(&self, project_id: &str) {
+    /// 清除会话信息（清所有 session，agent stop 场景）——durable 变体：
+    /// stop 路径调用（与插入类 durable 同事务语义，消队列倒挂窗口）。
+    pub async fn clear_session_durable(&self, project_id: &str) {
         // 先取 sessions 快照：session 终结时同步归还 served_sessions 首连资格
         // 条目——turn 进行中客户端全部断开的 session 不会再触发流侧 release，
         // 不在此清理会按历史 session 数无界累积
+        let sids: Vec<String> = self
+            .get_project(project_id)
+            .map(|info| info.sessions().into_iter().collect())
+            .unwrap_or_default();
+        self.projects.clear_session_durable(project_id).await;
+        for sid in sids {
+            self.session_stream_registry
+                .release_first_client_claim(&sid);
+        }
+    }
+
+    /// 清除会话信息（同步版：非 stop 路径/测试用；stop 链路走 durable 版）
+    pub fn clear_session(&self, project_id: &str) {
         let sids: Vec<String> = self
             .get_project(project_id)
             .map(|info| info.sessions().into_iter().collect())
@@ -370,7 +401,20 @@ impl AppState {
         }
     }
 
-    /// 清除单个 session（保留 project 的其他 session）
+    /// 清除单个 session（保留 project 的其他 session）——durable 变体。
+    pub async fn clear_session_one_durable(&self, project_id: &str, session_id: &str) -> bool {
+        let removed = self
+            .projects
+            .clear_session_one_durable(project_id, session_id)
+            .await;
+        if removed {
+            self.session_stream_registry
+                .release_first_client_claim(session_id);
+        }
+        removed
+    }
+
+    /// 清除单个 session（同步版）
     pub fn clear_session_one(&self, project_id: &str, session_id: &str) -> bool {
         let removed = self.projects.clear_session_one(project_id, session_id);
         if removed {

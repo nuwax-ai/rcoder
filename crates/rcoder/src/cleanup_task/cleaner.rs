@@ -155,7 +155,7 @@ impl AgentCleaner {
                 && destroyed_containers.contains(name)
             {
                 // 容器已被销毁，只需删除项目记录
-                self.state.remove_project(&project_id);
+                self.state.remove_project_durable(&project_id).await;
                 current_stats.total_cleaned += 1;
                 current_stats.success_cleaned += 1;
                 info!(
@@ -348,7 +348,8 @@ impl AgentCleaner {
             let (deleted, project_count) = self
                 .state
                 .projects
-                .delete_container_with_projects(&container_id);
+                .delete_container_with_projects_durable(&container_id)
+                .await;
             info!(
                 "[cleaner] Deleted container and {} associated projects from storage: container_id={}, container_deleted={}",
                 project_count, container_id, deleted
@@ -357,7 +358,7 @@ impl AgentCleaner {
             // 容器未销毁（仅超时等原因）：只删除当前项目记录
             // 先关闭该 project 的 SSE 共享流（remove_project 会清空 sessions 集合）
             self.state.shutdown_sse_streams_for_project(project_id);
-            self.state.remove_project(project_id);
+            self.state.remove_project_durable(project_id).await;
             info!(
                 "[cleaner] Removed project record only (container not destroyed): project_id={}",
                 project_id

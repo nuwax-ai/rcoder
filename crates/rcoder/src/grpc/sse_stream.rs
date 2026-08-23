@@ -12,7 +12,7 @@ use super::session_stream_registry::{
 };
 use shared_types::{SessionMessageType, UnifiedSessionMessage};
 use std::sync::Arc;
-use tracing::{Instrument, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 /// 创建基于 gRPC 的 SSE 代理流
 ///
@@ -74,10 +74,20 @@ pub async fn create_grpc_sse_stream(
         session_id = %session_id,
         addr = %grpc_addr
     );
+    // panic 兜底备件：原体 move 走 tx/registry，panic 路径需要独立的
+    // 下发通道与资格归还句柄（Arc clone，廉价）
+    let panic_tx = tx.clone();
+    let panic_sid = session_id.clone();
+    let panic_registry = Arc::clone(&registry);
     tokio::spawn(
         async move {
-            let _subscription = SubscriptionGuard::new();
-            let is_first_client = registry.claim_first_client(&session_id);
+            // panic 兜底：转发 task panic 时 JoinHandle 已被丢弃（无人观察），
+            // tx drop → SSE 流无终态直接结束，EventSource 自动重连掩盖问题。
+            // 包 catch_unwind：合成错误终态下发 + 结构化日志留痕 + 资格归还。
+            let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                async move {
+                    let _subscription = SubscriptionGuard::new();
+                    let is_first_client = registry.claim_first_client(&session_id);
         let mut client_last_seq = last_seq;
         let initial_from = if last_seq > 0 {
             last_seq
@@ -223,6 +233,20 @@ pub async fn create_grpc_sse_stream(
                     }
                 }
             }
+            }
+            }
+            ))
+            .await;
+            if outcome.is_err() {
+                error!(
+                    "💥 [gRPC_SSE] forward task panicked: session_id={} (synthesizing terminal error)",
+                    panic_sid
+                );
+                let err_ev =
+                    make_stream_error_event(tonic::Code::Internal, "forward task panicked");
+                let sse_event = progress_event_to_sse(&err_ev, &panic_sid);
+                drop(panic_tx.send(Ok(sse_event)).await);
+                panic_registry.release_first_client_claim(&panic_sid);
             }
         }
         .instrument(sse_span),

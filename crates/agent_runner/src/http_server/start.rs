@@ -29,6 +29,11 @@ pub struct HttpServerConfig {
     pub agent_session_service: Arc<AgentSessionService>,
     /// 共享 API Key Manager
     pub shared_api_key_manager: Arc<dashmap::DashMap<String, shared_types::ModelProviderConfig>>,
+    /// 跨协议共享的 project_id → service_uuid 映射（gRPC 与 HTTP 双开时必须
+    /// 注入同一实例——两份独立 map 互不可见：经 gRPC 发起的 StopAgent 找不到
+    /// HTTP 域写入的映射，shared_api_key_manager 中该 uuid 的 api_key 永不被
+    /// 清理，进程内敏感配置累积）。None = 自建（单协议形态，无跨协议清理需求）。
+    pub project_uuid_map: Option<Arc<dashmap::DashMap<String, String>>>,
     /// P0-1: Agent 管理注册表(可选,启用 /agent-mgmt/* 路由)
     pub agent_mgmt_registry: Option<Arc<crate::agent_mgmt::AgentRegistry>>,
     /// P0-1: Agent 安装目录管理(可选,启用 /agent-mgmt/* 路由)
@@ -145,6 +150,7 @@ impl HttpServerHandle {
 ///         },
 ///         agent_session_service,
 ///         shared_api_key_manager: Arc::new(dashmap::DashMap::new()),
+///         project_uuid_map: None,       // 单 HTTP 形态自建；gRPC 双开时注入共享实例
 ///         agent_mgmt_registry: None,    // P0-1: 不启用 /agent-mgmt/* 路由
 ///         agent_mgmt_path_manager: None,
 ///     };
@@ -188,6 +194,7 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
         config.app_config.clone(),
         config.agent_session_service,
         config.shared_api_key_manager,
+        config.project_uuid_map,
     );
 
     // 2.5 P0-1: 启用 agent_mgmt 路由(若提供)

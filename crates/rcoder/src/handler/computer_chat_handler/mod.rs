@@ -201,7 +201,7 @@ async fn run_computer_chat_flow(
         &request,
         &shared_types::ServiceType::ComputerAgentRunner,
     )
-    .await?;
+    .await;
 
     if !result.is_success() && result.data.as_ref().is_none_or(|d| d.session_id.is_empty()) {
         error!(
@@ -321,7 +321,7 @@ async fn run_userapp_dev_chat_flow(
         &request,
         &shared_types::ServiceType::UserAppBuilder,
     )
-    .await?;
+    .await;
 
     if !result.is_success() && result.data.as_ref().is_none_or(|d| d.session_id.is_empty()) {
         error!(

@@ -38,13 +38,15 @@ impl AppState {
         config: AppConfig,
         agent_session_service: Arc<AgentSessionService>,
         shared_api_key_manager: Arc<DashMap<String, shared_types::ModelProviderConfig>>,
+        project_uuid_map: Option<Arc<DashMap<String, String>>>,
     ) -> Self {
         Self {
             config,
             agent_session_service: agent_session_service.clone(),
             api_key_manager: Arc::new(ApiKeyManager::from_shared(shared_api_key_manager.clone())),
             shared_api_key_manager,
-            project_uuid_map: Arc::new(DashMap::new()),
+            // 注入共享实例（gRPC 双开时跨协议清理可见）；None = 单 HTTP 形态自建
+            project_uuid_map: project_uuid_map.unwrap_or_else(|| Arc::new(DashMap::new())),
             agent_mgmt_http_state: None,
         }
     }

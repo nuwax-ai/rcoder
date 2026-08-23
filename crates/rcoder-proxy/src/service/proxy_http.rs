@@ -264,12 +264,18 @@ impl ProxyHttp for PortProxy {
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<Option<Duration>> {
-        // 如果是 4xx/5xx 响应，收集错误响应体
+        // 如果是 4xx/5xx 响应，收集错误响应体（封顶 64KB：网关 HTML 大页/
+        // 误配代理到的默认站点会让单请求内存随 body 线性增长）
         if let Some(status) = ctx.upstream_status
             && status >= 400
             && let Some(body_bytes) = body
         {
-            ctx.error_body_buf.extend_from_slice(body_bytes);
+            const MAX_ERROR_BODY: usize = 64 * 1024;
+            let remaining = MAX_ERROR_BODY.saturating_sub(ctx.error_body_buf.len());
+            if remaining > 0 {
+                ctx.error_body_buf
+                    .extend_from_slice(&body_bytes[..remaining.min(body_bytes.len())]);
+            }
         }
 
         Ok(None)

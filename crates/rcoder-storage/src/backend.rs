@@ -75,6 +75,55 @@ impl ProjectStoreBackend {
         }
     }
 
+    /// 结构性删除的 durable 变体（stop/清理路径）：与插入类 durable 同事务
+    /// 语义——消除"remove 入队 → durable insert 提交 → writer 重放删行"的
+    /// 倒挂窗口（跨副本可见性契约）。Memory 模式等价普通内存删。
+    pub async fn remove_durable(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        match self {
+            Self::Memory(inner) => inner.remove(project_id),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.remove_durable(project_id).await,
+        }
+    }
+
+    /// [`Self::remove_durable`] 的 clear_session 同构（stop 清全部会话）。
+    pub async fn clear_session_durable(&self, project_id: &str) {
+        match self {
+            Self::Memory(inner) => inner.clear_session(project_id),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.clear_session_durable(project_id).await,
+        }
+    }
+
+    /// [`Self::remove_durable`] 的单 session 删除同构。
+    pub async fn clear_session_one_durable(&self, project_id: &str, session_id: &str) -> bool {
+        match self {
+            Self::Memory(inner) => inner.clear_session_one(project_id, session_id),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .clear_session_one_durable(project_id, session_id)
+                    .await
+            }
+        }
+    }
+
+    /// [`Self::remove_durable`] 的容器级删除同构（容器销毁路径）。
+    pub async fn delete_container_with_projects_durable(
+        &self,
+        container_id: &str,
+    ) -> (bool, usize) {
+        match self {
+            Self::Memory(inner) => inner.delete_container_with_projects(container_id),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .delete_container_with_projects_durable(container_id)
+                    .await
+            }
+        }
+    }
+
     /// 按 session_id 读（PG 模式 miss 回源直查主库一次并 hydrate 镜像；
     /// Memory 模式仅内存）。SSE lookup 的兜底路径。
     pub async fn get_by_session_with_fetch(

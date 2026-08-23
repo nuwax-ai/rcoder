@@ -335,27 +335,40 @@ pub async fn computer_agent_progress_notification(
         "[SSE_PROXY] Received Computer Agent SSE connection request: session_id={:?}",
         params.session_id
     );
-    // 路由定制：固定 ComputerAgentRunner 语义；诊断 identifier = user_id
-    //（断流重试耗尽时据此做 OOM/crashloop 精准诊断；拿不到 → None 回退通用文案）。
+    // 路由定制：computer 入口默认 ComputerAgentRunner 语义；但 UserAppBuilder
+    // 项目（userapp dev chat 的 SSE 经 /devcomputer 委托本入口）按 project 实际
+    // service_type 分发——容器定位 identifier 取 project_id（app_id），否则断流
+    // 诊断会查 user 的 computer 容器而非 app 开发容器（与通用入口对齐）
     sse_notification_impl(
         state,
         &params,
         &headers,
-        Box::new(|state, project_id| {
-            let diag_ctx = state
-                .get_project(project_id)
-                .and_then(|p| p.user_id().map(|u| u.to_string()))
-                .map(|identifier| {
-                    Arc::new(crate::handler::utils::DiagCtx {
-                        runtime: state.runtime().clone(),
-                        identifier,
-                        service_type: shared_types::ServiceType::ComputerAgentRunner,
-                    })
-                });
-            SseRouteContext {
-                service_type: shared_types::ServiceType::ComputerAgentRunner,
-                diag_ctx,
+        Box::new(|state, project_id| match state.get_project(project_id) {
+            Some(project) => {
+                let service_type = project
+                    .service_type()
+                    .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
+                let identifier = match &service_type {
+                    shared_types::ServiceType::ComputerAgentRunner => {
+                        project.user_id().map(|u| u.to_string())
+                    }
+                    _ => Some(project_id.to_string()),
+                };
+                SseRouteContext {
+                    service_type: service_type.clone(),
+                    diag_ctx: identifier.map(|identifier| {
+                        Arc::new(crate::handler::utils::DiagCtx {
+                            runtime: state.runtime().clone(),
+                            identifier,
+                            service_type,
+                        })
+                    }),
+                }
             }
+            None => SseRouteContext {
+                service_type: shared_types::ServiceType::ComputerAgentRunner,
+                diag_ctx: None,
+            },
         }),
     )
     .await

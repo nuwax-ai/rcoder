@@ -172,8 +172,24 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         shared_api_key_manager.clone(),
     ));
 
+    // 跨协议共享的 project_id → service_uuid 映射：gRPC 域创建（chat 路径
+    // insert），HTTP 域注入同一实例——两份独立 map 会让 gRPC StopAgent 找不到
+    // HTTP 域写入的映射，shared_api_key_manager 中该 uuid 的 api_key 永不清理
     #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
     let project_uuid_map: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+    // HTTP 侧注入视图：grpc 双开时共享；http-only 时 None（AppState 自建，
+    // 单协议形态无跨协议清理需求）
+    #[allow(unused_variables)]
+    let http_shared_uuid_map: Option<Arc<DashMap<String, String>>> = {
+        #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
+        {
+            Some(project_uuid_map.clone())
+        }
+        #[cfg(all(not(feature = "grpc-server"), feature = "http-server"))]
+        {
+            None
+        }
+    };
 
     let model_env_resolver: Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> =
         create_model_env_resolver(&config);
@@ -304,6 +320,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
             app_config: config.clone(),
             agent_session_service: agent_session_service.clone(),
             shared_api_key_manager: shared_api_key_manager.clone(),
+            project_uuid_map: http_shared_uuid_map.clone(),
             agent_mgmt_registry: Some(agent_mgmt_registry.clone()),
             agent_mgmt_path_manager: Some(agent_mgmt_path_manager.clone()),
         };

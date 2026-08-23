@@ -28,6 +28,15 @@ pub(super) fn validate_and_route_chat_request(
             project_id
         }
     };
+    // 客户端提供的 project_id 直接进容器命名/存储 key/gRPC 请求——畸形值
+    //（超长/特殊字符）会 500 或污染存储键，源头校验（自动生成值恒合法跳过）
+    if let Err(e) = shared_types::validate_identifier(&project_id, "project_id") {
+        return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+            shared_types::error_codes::ERR_VALIDATION,
+            locale,
+            &e,
+        )));
+    }
 
     // 确定用于拼接工作目录的标识符
     // agent_work_dir 用于替代 project_id 参与工作目录路径拼接

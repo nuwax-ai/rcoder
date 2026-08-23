@@ -107,6 +107,79 @@ impl PgStore {
             session_id: session_id.to_string(),
             container_name,
         };
+        self.execute_structural_durable(op, "add_session").await;
+        Ok(true)
+    }
+
+    /// 结构性删除的 durable 变体：内存删 + 单条事务直写。
+    ///
+    /// 消除 durable 直写与 write-behind 队列的**倒挂窗口**：删除走队列时，
+    /// 时序可为 remove 入队 → durable insert 提交返回 → writer 重放积压的
+    /// RemoveProject 把 durable 刚提交的行删掉（破坏"返回即落库"跨副本可见
+    /// 性契约）。删除类与插入类同走同步事务后，PG 行级锁串行化天然保序——
+    /// 最终态取决于真实调用顺序。低频路径（stop/清理），同步代价可忽略。
+    pub async fn remove_durable(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        let removed = self.inner.remove(project_id)?;
+        self.touch_throttled.invalidate(&format!("p:{project_id}"));
+        self.execute_structural_durable(
+            PersistOp::RemoveProject {
+                project_id: project_id.to_string(),
+            },
+            "remove",
+        )
+        .await;
+        Some(removed)
+    }
+
+    /// [`Self::remove_durable`] 的 clear_session 同构（stop 场景清全部会话）。
+    pub async fn clear_session_durable(&self, project_id: &str) {
+        self.inner.clear_session(project_id);
+        self.execute_structural_durable(
+            PersistOp::ClearSessions {
+                project_id: project_id.to_string(),
+            },
+            "clear_sessions",
+        )
+        .await;
+    }
+
+    /// [`Self::remove_durable`] 的单 session 删除同构。
+    pub async fn clear_session_one_durable(&self, project_id: &str, session_id: &str) -> bool {
+        if !self.inner.clear_session_one(project_id, session_id) {
+            return false;
+        }
+        self.touch_throttled.invalidate(&format!("s:{session_id}"));
+        self.execute_structural_durable(
+            PersistOp::RemoveSession {
+                session_id: session_id.to_string(),
+            },
+            "remove_session",
+        )
+        .await;
+        true
+    }
+
+    /// [`Self::remove_durable`] 的容器级删除同构（容器销毁路径）。
+    pub async fn delete_container_with_projects_durable(
+        &self,
+        container_id: &str,
+    ) -> (bool, usize) {
+        let result = self.inner.delete_container_with_projects(container_id);
+        if result.0 {
+            self.execute_structural_durable(
+                PersistOp::DeleteContainerWithProjects {
+                    container_id: container_id.to_string(),
+                },
+                "delete_container",
+            )
+            .await;
+        }
+        result
+    }
+
+    /// 单条结构性 op 的事务直写（600ms 超时降级 write-behind 队列）。
+    /// op 已在内存侧生效——降级入队由 writer 幂等重放兜底。
+    async fn execute_structural_durable(&self, op: PersistOp, name: &str) {
         let durable = async {
             let result: anyhow::Result<()> = async {
                 let mut tx = self.pool.begin().await?;
@@ -119,12 +192,7 @@ impl PgStore {
         };
         match tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, durable).await {
             Ok(Ok(())) => {
-                tracing::debug!(
-                    "[STORAGE_PG] durable add_session ok: project_id={}, session_id={}",
-                    project_id,
-                    session_id
-                );
-                Ok(true)
+                tracing::debug!("[STORAGE_PG] durable {name} ok: op={op:?}",);
             }
             outcome => {
                 let reason = match outcome {
@@ -133,12 +201,9 @@ impl PgStore {
                     Err(_) => "timeout".to_string(),
                 };
                 tracing::warn!(
-                    "[STORAGE_PG] durable add_session failed ({reason}), falling back to write-behind: project_id={}, session_id={}",
-                    project_id,
-                    session_id
+                    "[STORAGE_PG] durable {name} failed ({reason}), falling back to write-behind: op={op:?}",
                 );
                 self.enqueue_structural(op);
-                Ok(true)
             }
         }
     }

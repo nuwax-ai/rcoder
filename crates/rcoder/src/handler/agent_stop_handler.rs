@@ -81,7 +81,10 @@ async fn destroy_container_for_project(
             if let Some(ref pingora) = state.pingora_service {
                 let _unused = pingora.remove_project_backend(&container_info.project_id);
             }
-            state.remove_project(&container_info.project_id);
+            // durable：删除与插入类同走同步事务，消队列倒挂窗口
+            state
+                .remove_project_durable(&container_info.project_id)
+                .await;
         }
 
         info!(

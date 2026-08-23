@@ -1,6 +1,5 @@
 use super::helpers::*;
 use super::*;
-use shared_types::ProjectStore as _; // 存储契约 trait：state.projects（ProjectStoreBackend）方法经此解析
 
 /// 重启容器（销毁后重建）
 ///
@@ -153,7 +152,8 @@ pub async fn pod_restart(
         // 使用 container_id 删除,确保清理该容器关联的所有 project_id
         let (container_deleted, deleted_projects) = state
             .projects
-            .delete_container_with_projects(&container_info.container_id);
+            .delete_container_with_projects_durable(&container_info.container_id)
+            .await;
         info!(
             "[POD_RESTART] Cleaned up old container records: container_id={}, container_deleted={}, deleted_projects={}",
             container_info.container_id, container_deleted, deleted_projects

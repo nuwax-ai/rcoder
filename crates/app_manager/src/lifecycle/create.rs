@@ -18,12 +18,53 @@ impl AppService {
     /// [`create_app_locked`] 内核避免此问题）。
     #[instrument(skip(self, request))]
     pub async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
-        let app_id = self.validate_create_request(&request).await?;
-        // 与 prepare/activate/confirm/delete-release/delete_app 串行: 防发布流水线
-        // EnsureApp 建 Deployment 与并发 DELETE 互踩 (删成功但 Deployment 复活/
-        // 半删半建脏状态)。
-        let process_lock = self.acquire_process_release_lock(&app_id).await;
-        self.create_app_locked(&app_id, request, process_lock).await
+        // 跨进程互斥（多副本 TOCTOU）：唯一性检查（get_deployment_status miss）
+        // 与 SSA create（同 manager force 合并）之间无原子性——两副本并发 create
+        // 同名 app 时后者静默覆盖前者。create 低频，workspace 根级 flock 全局
+        // 串行化换取检查-创建原子窗口（ensure_app_runtime 的锁内 create_app_locked
+        // 无并发 create 语义，不取本锁避免与 activate 重入等待）。
+        let create_guard = self.acquire_global_create_lock().await?;
+        let result = async {
+            let app_id = self.validate_create_request(&request).await?;
+            // 与 prepare/activate/confirm/delete-release/delete_app 串行: 防发布流水线
+            // EnsureApp 建 Deployment 与并发 DELETE 互踩 (删成功但 Deployment 复活/
+            // 半删半建脏状态)。
+            let process_lock = self.acquire_process_release_lock(&app_id).await;
+            self.create_app_locked(&app_id, request, process_lock).await
+        }
+        .await;
+        drop(create_guard);
+        result
+    }
+
+    /// workspace 根级创建互斥锁（跨进程 flock；文件随 guard drop 解锁）。
+    /// K8s 模式根 = cephfs 共享挂载（rcoder 有写权限——ensure_app_workspace_ready
+    /// 同根建目录），多副本天然互斥；Docker 单进程形态下 flock 无害。
+    async fn acquire_global_create_lock(&self) -> AppResult<std::fs::File> {
+        use fs2::FileExt as _;
+        use std::io::Write as _;
+        let lock_path =
+            std::path::PathBuf::from(self.config.get_workspace_root()).join(".create.lock");
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = lock_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| map_io_error("ensure create lock parent", e, false))?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .map_err(|e| map_io_error("open create lock", e, false))?;
+            // flock 在部分平台对只读句柄拒绝独占锁，touch 保证可写语义
+            drop(write!(file, ""));
+            file.lock_exclusive()
+                .map_err(|e| map_io_error("lock create operation", e, false))?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| AppOperationError::Backend(format!("create lock task: {e}")))?
     }
 
     /// 已持锁内核：调用方持有该 app 的进程级发布锁（防止与发布流水线互踩），
