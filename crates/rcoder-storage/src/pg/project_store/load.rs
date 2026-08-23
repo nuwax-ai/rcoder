@@ -143,10 +143,11 @@ pub(super) fn apply_snapshot(
             continue;
         }
         for sid in rest {
-            inner.add_session_to_project(&row.project_id, sid);
+            // restore 变体：回放不刷 last_activity/容器活跃（idle 计时不因重启归零）
+            inner.restore_session_to_project(&row.project_id, sid);
         }
         for sid in latest {
-            inner.add_session_to_project(&row.project_id, sid);
+            inner.restore_session_to_project(&row.project_id, sid);
         }
         loaded += 1;
     }
@@ -212,20 +213,32 @@ impl crate::pg::PgStore {
         }
         // 解析失败（枚举演进/缺 service_type）→ 兜底空 map：项目记录仍返回
         //（SSE 只需要 project_id/container_name 路由信息）
-        let info = hydrate_project(&project_row, &container_by_name)
+        let mut info = hydrate_project(&project_row, &container_by_name)
             .unwrap_or_else(|| ProjectAndContainerInfo::new(project_row.project_id.clone()));
+        // merge 语义（与 sync_once 一致）：整条 insert 会把本地镜像已有的其他
+        // session 键抛掉——同 project 多 session 并发回源时互相驱逐，回源缓存
+        // 永不生效（每消息一次主库查询）
+        if let Some(existing) = self.inner.get(&project_row.project_id) {
+            for sid in existing.sessions().iter() {
+                info.restore_session(sid.clone());
+            }
+        }
         let info = Arc::new(info);
         // 旁路写入镜像（数据来自 PG，不走持久化）
         let pid = info.project_id().to_string();
-        self.inner
-            .insert_with_session(pid, Arc::clone(&info), None)
-            .ok();
+        if let Err(e) = self.inner.insert_with_session(pid, Arc::clone(&info), None) {
+            warn!(
+                "[STORAGE_PG] backfill mirror insert failed: project_id={}, err={e:#}",
+                project_row.project_id
+            );
+        }
         // latest_session 与回源键（可能不同）都补进镜像，下次任一键查询走内存
+        //（restore：不刷 last_activity/容器活跃）
         if let Some(sid) = project_row.latest_session.as_deref() {
-            self.inner.add_session_to_project(info.project_id(), sid);
+            self.inner.restore_session_to_project(info.project_id(), sid);
         }
         self.inner
-            .add_session_to_project(info.project_id(), fetched_by);
+            .restore_session_to_project(info.project_id(), fetched_by);
         info
     }
 }

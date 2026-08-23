@@ -95,6 +95,31 @@ impl ProjectAdapter {
         true
     }
 
+    /// 恢复专用变体（boot 加载 / 回源 hydrate）：session 集合与索引登记语义
+    /// 与 [`Self::add_session_to_project`] 一致，但不刷新 `last_activity` 与
+    /// 容器活跃——恢复动作不代表用户活跃，时间戳以持久化行为准。
+    pub fn restore_session_to_project(&self, project_id: &str, session_id: &str) -> bool {
+        let mut existed = false;
+        let mut ck_opt: Option<String> = None;
+        if let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) {
+            let info = Arc::make_mut(e.get_mut());
+            info.restore_session(session_id);
+            existed = true;
+            ck_opt = Some(container_entry_key(info));
+        }
+        if !existed {
+            return false;
+        }
+        let ck = ck_opt.unwrap_or_else(|| {
+            self.project_to_container
+                .view(project_id, |_, v| v.clone())
+                .unwrap_or_default()
+        });
+        self.session_index
+            .insert(session_id.to_string(), (ck, project_id.to_string()));
+        true
+    }
+
     /// 插入项目并添加 session 映射（原子操作，消除 CAS 竞态）
     ///
     /// **多 session 语义（C2 修复）**：本方法只往 session_index *追加* 条目，

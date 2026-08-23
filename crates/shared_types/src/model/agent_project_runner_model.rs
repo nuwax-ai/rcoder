@@ -118,6 +118,17 @@ impl ProjectCoreState {
         self.last_activity = Utc::now();
     }
 
+    /// 恢复专用（boot 加载 / sync 重建 / 回源 hydrate）：与 [`Self::add_session`]
+    /// 的集合语义一致，但**不触碰 `last_activity`**——活跃时间以持久化行为准，
+    /// 恢复动作本身不代表用户活跃（否则重启/回源即把全部 idle 计时归零，
+    /// 闲置回收系统性推迟，且"恢复时刻"会经后续 upsert 写回 PG 污染活跃历史）。
+    pub fn restore_session(&mut self, session_id: impl Into<String>) {
+        let sid = session_id.into();
+        let set = Arc::make_mut(&mut self.sessions);
+        set.insert(sid.clone());
+        self.latest_session = Some(sid);
+    }
+
     /// 移除指定 session
     ///
     /// 返回 true 表示该 session 之前存在并已被移除。
@@ -353,6 +364,15 @@ impl ProjectAndContainerInfo {
     pub fn add_session(&mut self, session_id: impl Into<String>) {
         self.state.update_core(|core| {
             core.add_session(session_id);
+        });
+    }
+
+    /// 恢复专用（boot 加载 / sync 重建 / 回源 hydrate）：集合语义同
+    /// [`Self::add_session`]，但不触碰 last_activity——恢复动作不代表用户
+    /// 活跃，时间戳以持久化行为准（否则重启/回源即把 idle 计时归零）。
+    pub fn restore_session(&mut self, session_id: impl Into<String>) {
+        self.state.update_core(|core| {
+            core.restore_session(session_id);
         });
     }
 

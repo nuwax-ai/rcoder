@@ -17,6 +17,11 @@ pub(in crate::pg) async fn upsert_container<'e>(
     c: &ContainerSnapshot,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
+        // 防回退守卫（与 upsert_project 同构）：durable 降级快照与 write-behind
+        // 重放可交错——created_at 跨容器重建单调（同容器名的重建必是新时刻），
+        // 旧快照条件不满足被跳过，防止 container_ip/status/service_url 回退
+        //（SSE/Pingora 按 PG 回源 hydrate 后会路由到旧 IP）。
+        // 相等放行：同容器的正常字段更新（IP 漂移等）created_at 不变。
         r#"INSERT INTO containers
            (container_name, container_id, logical_id, service_type, container_ip,
             internal_port, external_port, status, service_url, last_activity, created_at, version)
@@ -27,7 +32,8 @@ pub(in crate::pg) async fn upsert_container<'e>(
              internal_port=EXCLUDED.internal_port, external_port=EXCLUDED.external_port,
              status=EXCLUDED.status, service_url=EXCLUDED.service_url,
              last_activity=EXCLUDED.last_activity, created_at=EXCLUDED.created_at,
-             version=containers.version+1"#,
+             version=containers.version+1
+           WHERE EXCLUDED.created_at >= containers.created_at"#,
     )
     .bind(&c.container_name)
     .bind(&c.container_id)
@@ -51,8 +57,11 @@ pub(in crate::pg) async fn touch_container<'e>(
     container_name: &str,
     last_activity: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), sqlx::Error> {
+    // 单调条件：积压重放的旧 Touch 不得把 last_activity 拉回（保持
+    // upsert_* 防回退守卫所依赖的单调前提）
     sqlx::query(
-        "UPDATE containers SET last_activity=$2, version=version+1 WHERE container_name=$1",
+        "UPDATE containers SET last_activity=$2, version=version+1 \
+         WHERE container_name=$1 AND $2 > last_activity",
     )
     .bind(container_name)
     .bind(last_activity)
@@ -161,11 +170,15 @@ pub(in crate::pg) async fn touch_project<'e>(
     project_id: &str,
     last_activity: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE projects SET last_activity=$2, version=version+1 WHERE project_id=$1")
-        .bind(project_id)
-        .bind(last_activity)
-        .execute(db)
-        .await?;
+    // 单调条件：积压重放的旧 Touch 不得把 last_activity 拉回（idle 判据不回摆）
+    sqlx::query(
+        "UPDATE projects SET last_activity=$2, version=version+1 \
+         WHERE project_id=$1 AND $2 > last_activity",
+    )
+    .bind(project_id)
+    .bind(last_activity)
+    .execute(db)
+    .await?;
     Ok(())
 }
 

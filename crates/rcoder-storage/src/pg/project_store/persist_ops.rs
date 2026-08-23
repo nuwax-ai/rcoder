@@ -118,7 +118,9 @@ impl ContainerSnapshot {
             external_port: i32::from(info.external_port),
             status: info.status.clone(),
             service_url: info.service_url.clone(),
-            last_activity: info.created_at.max(info.created_at),
+            // ContainerBasicInfo 无独立活跃时间字段，容器行 last_activity 以
+            // 创建时刻为基准（活跃刷新走 touch_container）
+            last_activity: info.created_at,
             created_at: info.created_at,
         }
     }

@@ -87,6 +87,44 @@ fn test_session_operations() {
     assert!(!added2);
 }
 
+/// restore_session_to_project：恢复路径不刷 last_activity（idle 计时不因
+/// 重启/回源归零），但 session 集合与索引照常登记。
+#[test]
+fn test_restore_session_preserves_last_activity() {
+    let adapter = make_adapter();
+    let project_id = "test-project-restore";
+
+    let mut info = create_test_info(project_id);
+    let stale = Utc::now() - chrono::Duration::hours(3);
+    info.set_timestamps(stale, stale);
+    let before = info.last_activity();
+    adapter.insert(project_id.to_string(), Arc::new(info)).unwrap();
+
+    // add 路径：活跃时间推进（用户真实操作语义）
+    let mut info2 = create_test_info("other-1");
+    let t0 = Utc::now();
+    info2.add_session("s-warmup");
+    assert!(info2.last_activity() > t0, "add_session must bump last_activity");
+
+    // restore 路径：时间戳不动（boot/回源恢复语义）
+    let restored = adapter.restore_session_to_project(project_id, "s-boot");
+    assert!(restored, "restore 在 project 存在时应返回 true");
+    let got = adapter.get(project_id).unwrap();
+    assert_eq!(
+        got.last_activity(),
+        before,
+        "restore must not touch last_activity"
+    );
+    assert!(got.sessions().contains("s-boot"), "session set must be restored");
+
+    // 索引登记照常：按 session 键可查
+    assert!(adapter.get_by_session_id("s-boot").is_some());
+
+    // 不存在的 project：false 且不写索引（与 add 同防孤儿语义）
+    assert!(!adapter.restore_session_to_project("nonexistent", "s-x"));
+    assert!(adapter.get_by_session_id("s-x").is_none());
+}
+
 #[test]
 fn test_iter() {
     let adapter = make_adapter();

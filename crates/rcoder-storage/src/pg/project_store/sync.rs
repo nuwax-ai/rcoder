@@ -137,9 +137,10 @@ pub(crate) async fn sync_once(
         };
         // merge 语义：整条 insert 会把快照后本地新增的 session 抛掉（hydrate
         // 出的 info 无 session 集合）——先保留镜像现有 sessions 再替换
+        //（restore：重建不刷 last_activity，活跃历史以持久化行为准）
         if let Some(current) = &existing {
             for sid in current.sessions().iter() {
-                info.add_session(sid.clone());
+                info.restore_session(sid.clone());
             }
         }
         if let Err(e) = inner.insert(row.project_id.clone(), Arc::new(info)) {
@@ -219,7 +220,14 @@ fn project_signature(info: &shared_types::ProjectAndContainerInfo) -> String {
     sig.push_str("|v:");
     sig.push_str(&serde_json::to_string(&info.service_type()).unwrap_or_default());
     sig.push_str("|m:");
-    sig.push_str(&serde_json::to_string(&info.model_provider()).unwrap_or_default());
+    // model_provider 须走 Value 归一：结构体直接序列化是字段声明序，jsonb 行解码
+    // 的 Value::to_string 是字典序（serde_json Map 默认 BTreeMap）——不归一则
+    // 凡带 model_provider 的 project 恒判 changed，每轮 sync 全量误重建
+    sig.push_str(
+        &serde_json::to_value(info.model_provider())
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
     sig
 }
 
