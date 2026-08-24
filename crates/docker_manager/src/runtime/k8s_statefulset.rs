@@ -316,7 +316,7 @@ impl KubernetesRuntime {
     /// STS 模板仅在创建时固化，rcoder 升版后存量 agent 继续跑旧镜像；本方法
     /// 实读 STS 模板里 agent 容器的 image 与 [`Self::select_image`]（现读 env，
     /// 升版后自然携带新 tag）对比。404 视为无漂移（无 STS 即无换代需求）。
-    pub(crate) async fn is_agent_image_drifted(
+    pub(crate) async fn is_agent_image_drifted_inner(
         &self,
         identifier: &str,
         service_type: &ServiceType,
@@ -331,12 +331,18 @@ impl KubernetesRuntime {
                 )));
             }
         };
+        // 按容器名定位（不依赖位次）：build 时 agent 主容器在首位，防御
+        // sidecar 列表构造演进导致的位次变化
         let existing_image = sts
             .spec
             .as_ref()
             .and_then(|spec| spec.template.spec.as_ref())
-            .and_then(|spec| spec.containers.first())
-            .and_then(|c| c.image.clone());
+            .and_then(|spec| {
+                spec.containers
+                    .iter()
+                    .find(|c| c.name == "agent")
+                    .and_then(|c| c.image.clone())
+            });
         let desired_image = self.select_image(service_type);
         let drifted = existing_image
             .as_deref()
@@ -419,11 +425,13 @@ fn workspace_claim_name(spec: &PodSpec) -> Option<String> {
         .map(|p| p.claim_name.clone())
 }
 
-/// agent PodSpec 的规范化指纹（模板漂移检测）：serde_json 序列化经 Value 的
-/// BTreeMap 字典序规范化（字段序/键序无关），再 DefaultHasher（与
-/// config_hash_annotations 同款——跨进程确定、零新依赖）。涵盖镜像/env/
-/// command/sidecar/资源等全部模板内容；build_agent_pod_spec 无时间/随机
-/// 成分，同参数构造恒等。
+/// agent PodSpec 的规范化指纹（模板漂移检测）：serde_json 序列化为规范文本
+/// 后 DefaultHasher（与 config_hash_annotations 同款——跨进程确定、零新依赖）。
+/// 确定性依据：结构体字段写出序固定（同版本二进制恒定；workspace 开
+/// preserve_order 时 Value::Object 为 IndexMap 插入序=字段声明序，未开时为
+/// BTreeMap 字典序——两种模式下同输入输出都稳定），k8s_openapi 的 map 字段
+/// 本身是 BTreeMap 恒字典序。涵盖镜像/env/command/sidecar/资源等全部模板
+/// 内容；build_agent_pod_spec 无时间/随机成分，同参数构造恒等。
 fn agent_template_hash(pod_spec: &PodSpec) -> String {
     let canonical = serde_json::to_value(pod_spec)
         .ok()
