@@ -14,6 +14,7 @@ use super::agent_runner::{BuildOutcome, ensure_agent_addr, wait_build};
 use super::client;
 use super::task::PublishTask;
 use super::types::PublishEvent;
+use super::types::PublishStage;
 
 /// 独立 build 入口(spawn 调):触发 agent-runner build + 透传进度,终态 emit。
 pub async fn run_build(
@@ -72,12 +73,12 @@ async fn run_build_inner(
     fail_if_cancelled(task)?;
     // ensure builder:未注册时自动创建(K8s 拉镜像可能数十秒,先亮阶段让前端可见)。
     task.emit(PublishEvent::Stage {
-        stage: "EnsureBuilder".to_string(),
+        stage: PublishStage::EnsureBuilder,
     })
     .await;
     let addr = ensure_agent_addr(state, project_id).await?;
     task.emit(PublishEvent::Stage {
-        stage: "Build".to_string(),
+        stage: PublishStage::Build,
     })
     .await;
     let build_task_id = client::trigger_build(&addr, app_id).await?;

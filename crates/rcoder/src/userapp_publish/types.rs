@@ -4,6 +4,8 @@
 //! store/task(状态机)统一引用。加性演进(新增可选字段)沿用 `Option + serde(default)` 范式,
 //! 见 workspace-manifest crate 顶部"配置演进策略"。
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use shared_types::BuildProgressEvent;
 
@@ -82,12 +84,32 @@ pub enum PublishTaskStatus {
     Cancelled,
 }
 
+/// 任务阶段（枚举化：编译期防拼写漂移 + swagger 枚举合法值供 Java 对接）。
+/// wire 值 = 变体名（serde 默认），与历史字符串完全一致——前端零感知。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub enum PublishStage {
+    /// 确保 builder 存在（未注册时自动创建；K8s 拉镜像可能数十秒，先亮阶段让前端可见）。
+    EnsureBuilder,
+    /// 编译执行中（远端 build 任务已触发，进度经 BuildProgress 透传）。
+    Build,
+}
+
+impl fmt::Display for PublishStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 与序列化值一致（落库 PG stage 列 / 日志 / format! 共用）
+        match self {
+            Self::EnsureBuilder => write!(f, "EnsureBuilder"),
+            Self::Build => write!(f, "Build"),
+        }
+    }
+}
+
 /// 进度事件(给前端 SSE)。agent-runner build 进度原样透传(`BuildProgress.data`)。
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum PublishEvent {
-    /// 进入新发布阶段(publish: EnsureBuilder/Build/Prepare/Activate；build: EnsureBuilder/Build)。
-    Stage { stage: String },
+    /// 进入新阶段。
+    Stage { stage: PublishStage },
     /// 透传 agent-runner build 进度(Building/BuildOk/BuildFail,data=类型化事件)。
     BuildProgress { data: BuildProgressEvent },
     /// 取消已请求(非终态):任务进入 Cancelling,通知前端"取消中"。终态 Cancelled/Failed 由 orchestrator emit。
@@ -117,6 +139,8 @@ pub struct PublishTaskSnapshot {
     pub project_id: String,
     pub kind: PublishTaskKind,
     pub status: PublishTaskStatus,
+    /// 阶段名（枚举序列化值；PG 回读透传字符串——历史行可能含已删除
+    /// 阶段的值，不做枚举解析以免丢信息）
     pub stage: Option<String>,
     pub release_id: Option<String>,
     /// build 产物摘要（Completed 后有值——Java 轮询取包依据：
@@ -155,7 +179,7 @@ mod tests {
     #[test]
     fn publish_event_serializes_snake_case() {
         let ev = serde_json::to_value(PublishEvent::Stage {
-            stage: "Build".into(),
+            stage: PublishStage::Build,
         })
         .expect("stage event");
         assert_eq!(ev["event"], "stage");

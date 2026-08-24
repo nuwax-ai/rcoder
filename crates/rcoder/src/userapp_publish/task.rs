@@ -7,7 +7,7 @@
 //! `super::types`,全局任务表见 `super::store`。agent-runner 的 build 进度经 `super::client`
 //! 透传给前端(rcoder SSE),叠加发布阶段(Stage)。
 
-use super::types::ArtifactDigest;
+use super::types::{ArtifactDigest, PublishStage};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -36,7 +36,7 @@ struct TaskState {
     project_id: String,
     kind: PublishTaskKind,
     status: PublishTaskStatus,
-    stage: Option<String>,
+    stage: Option<PublishStage>,
     release_id: Option<String>,
     /// build 产物摘要（终态时经 file-server 快照回填——Java 轮询取包依据；
     /// 仅内存快照，不落 PG 行：产物文件在 builder 卷上，任务表只管编排状态）
@@ -153,7 +153,7 @@ impl PublishTask {
             project_id: s.project_id.clone(),
             kind: s.kind,
             status: s.status,
-            stage: s.stage.clone(),
+            stage: s.stage.map(|st| st.to_string()),
             release_id: s.release_id.clone(),
             artifact: s.artifact.clone(),
             error: s.error.clone(),
@@ -181,7 +181,7 @@ impl PublishTask {
             };
             // 钩子载荷在事件被 tx.send 消费前提取（Stage/终态 payload 克隆）
             let stage_payload = if let PublishEvent::Stage { stage } = &event {
-                Some(stage.clone())
+                Some(stage.to_string())
             } else {
                 None
             };
@@ -233,7 +233,7 @@ impl PublishTask {
         if let Some(stage) = stage_payload
             && let Some(hook) = &self.on_stage
         {
-            hook(&stage);
+            hook(&stage.to_string());
         }
     }
 
@@ -434,7 +434,7 @@ fn apply_event(state: &mut TaskState, event: &PublishEvent) {
     state.updated_at = Utc::now().timestamp();
     match event {
         PublishEvent::Stage { stage } => {
-            state.stage = Some(stage.clone());
+            state.stage = Some(*stage);
             state.status = PublishTaskStatus::Running;
         }
         PublishEvent::BuildProgress { .. } => state.status = PublishTaskStatus::Running,
@@ -513,7 +513,7 @@ mod tests {
         assert!(replay.is_empty());
 
         task.emit(PublishEvent::Stage {
-            stage: "Build".into(),
+            stage: PublishStage::Build,
         })
         .await;
         let (seq, event) = receiver.recv().await.expect("live event");
@@ -558,7 +558,7 @@ mod tests {
     async fn request_cancel_transitions_running_to_cancelling() {
         let task = PublishTask::new("app-a".into(), "app-a".into(), PublishTaskKind::Publish);
         task.emit(PublishEvent::Stage {
-            stage: "Build".into(),
+            stage: PublishStage::Build,
         })
         .await;
         assert_eq!(task.status().await, PublishTaskStatus::Running);
