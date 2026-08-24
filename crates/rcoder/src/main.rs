@@ -186,6 +186,9 @@ async fn main() -> anyhow::Result<()> {
     .await;
     proxy_init::log_proxy_info(&bootstrap_result.config);
 
+    // panic 位置+消息进 tracing 文件日志（catch_unwind 兜底只拿得到消息文本，
+    // 位置原本只在默认 hook 的 stderr——两路日志，排障对不上代码行）
+    shutdown::set_panic_hook();
     let shutdown_tx = shutdown::setup_signal_handlers();
 
     let _config_watcher = if bootstrap_result.config_watcher_enabled {

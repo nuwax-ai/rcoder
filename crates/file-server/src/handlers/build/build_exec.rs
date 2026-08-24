@@ -48,7 +48,8 @@ pub(crate) async fn build_project(
 /// UserApp 域（Java/Go 多服务）**不走本函数**：其编译入口是 manifest 驱动
 /// 的 `service::userapp::build_workspace_package`（project.manifest.toml 的
 /// [build].command，/api/userapp/build 与 /api/userapp/dev/rebuild 共用）。
-pub(crate) async fn build_project_impl(    state: &AppState,
+pub(crate) async fn build_project_impl(
+    state: &AppState,
     path: &std::path::Path,
     project_id: &str,
     base_path: Option<&str>,

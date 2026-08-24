@@ -9,6 +9,32 @@ use docker_manager::runtime_selection::RuntimeType;
 use rcoder_storage::ProjectStoreBackend;
 use tracing::{error, info, warn};
 
+/// 全局 panic hook：panic 信息（含 `file:line:column` 位置）进 tracing
+/// 结构化日志（文件日志按天滚动——排障主通道）。
+///
+/// 背景：catch_unwind 的兜底（publish/build 编排、SSE 转发 task 等）只能从
+/// payload 拿到消息文本，**位置只在默认 hook 的 stderr 里**——容器 stderr
+/// 与 tracing 文件日志是两路，按日志排查定位不到代码行。此处统一补齐，
+/// 并保留默认 hook 的 stderr 输出（Docker/K8s 容器日志兼容）。
+pub fn set_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        error!(target: "panic", location = %location, "💥 panic: {message}");
+        default_hook(info);
+    }));
+}
+
 pub fn setup_signal_handlers() -> tokio::sync::broadcast::Sender<()> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
 
