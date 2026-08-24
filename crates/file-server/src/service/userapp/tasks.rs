@@ -29,11 +29,16 @@ const MAX_RETAINED_TASKS: usize = 1_000;
 
 pub type BuildTaskId = String;
 
-/// 任务类型:仅编译(发布编排已移 rcoder 侧,agent-runner 只负责 build)。
+/// 任务类型。Build = 发布打包（zip 制品）；DevBuild/DevRebuild = 开发编译
+/// （dist 产物，不打包；Rebuild 编译成功后自动重启 dev server——Completed
+/// 的制品四字段为占位空值，调用方按 status/error 消费，rebuild 后的新端口
+/// 经 `GET /api/userapp/dev/list` 查询）。
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum BuildTaskKind {
     Build,
+    DevBuild,
+    DevRebuild,
 }
 
 /// 任务状态(镜像 app_manager ReleaseStatus 语义)。

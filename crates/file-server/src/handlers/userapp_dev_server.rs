@@ -11,7 +11,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::build::build_exec::build_project_impl;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
@@ -106,7 +105,9 @@ pub(crate) struct UserappDevList {
 
 // ── handlers ───────────────────────────────────────────────────────────────────
 
-/// `POST /api/userapp/dev/start`: 启动开发服务（端口池分配 + pnpm install + 探活等待）。
+/// `POST /api/userapp/dev/start`: 启动开发服务（UserApp workspace = spawn
+/// app-cli 按 manifest run.command 编排全栈，pingap 9080 统一入口；web 域
+/// 项目走原 vite 路径端口池分配）。
 #[utoipa::path(
     post,
     path = "/dev/start",
@@ -195,71 +196,171 @@ pub(crate) async fn dev_restart(
     }))
 }
 
-/// `POST /api/userapp/dev/build`: 开发编译（package.json scripts.build;
-/// install + build + dist 拷贝, 失败返回解析后的友好错误）。与顶层
-/// `/api/userapp/build`（workspace 打包出发布制品）语义不同。
+/// `POST /api/userapp/dev/build`: 异步开发编译（立即返回 taskId）。
+/// 编译在后台执行（manifest 同核：逐子项目执行 project.manifest.toml 的
+/// build.command，可能与发布打包完全同核——dev 编译通过 = 可部署；可能耗时
+/// 数分钟，同步等待会断上游超时）。进度/结果查询复用任务族接口：轮询
+/// `GET /api/userapp/tasks/{taskId}`（快照含 Failed 的错误信息）、SSE
+/// `GET /api/userapp/tasks/{taskId}/logs/stream`、日志分页
+/// `GET /api/userapp/tasks/{taskId}/logs`。与 `/api/userapp/build`（生产
+/// 构建语义）共用编译内核，差异仅消费场景：dev 不进发布制品链。
 #[utoipa::path(
     post,
     path = "/dev/build",
     request_body = DevOpBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = UserappDevTaskCreated, description = "构建任务已创建（taskId）")),
     tag = "UserApp"
 )]
 pub(crate) async fn dev_build(
     State(state): State<AppState>,
     Json(body): Json<DevOpBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UserappDevTaskCreated>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev build");
-    let ws = resolve_userapp_dev(&body.app_id, None, &state.config)?;
-    build_project_impl(
-        &state,
-        &ws,
-        &dev_key(&body.app_id),
+    let task_id = spawn_dev_task(
+        state,
         &body.app_id,
-        body.base_path.as_deref(),
+        body.base_path.map(|s| s.to_string()),
+        crate::service::userapp::tasks::BuildTaskKind::DevBuild,
     )
     .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Build completed",
-        "appId": body.app_id,
-    })))
+    Ok(Json(UserappDevTaskCreated {
+        app_id: body.app_id,
+        task_id,
+        status: "pending".to_string(),
+    }))
 }
 
-/// `POST /api/userapp/dev/rebuild`: 一键编译 + 重启（agent 改完代码后单次调用）。
-/// 编译成功才重启——编译失败透传错误、旧 dev server 原样保留（可继续用
-/// 旧版本测试，不因中间态断流）；成功后返回新 pid/port（前端据此拼
-/// `/proxy/devapps/...` 预览 URL）。
+/// `POST /api/userapp/dev/rebuild`: 异步一键编译 + 启动（agent 改完代码后
+/// 单次调用，开发阶段闭环）。manifest 同核编译成功后自动重启 dev 服务
+/// （app-cli 重拉全栈，新代码生效）；编译失败任务终态 Failed、旧服务原样
+/// 保留（可继续用旧版本测试，不因中间态断流）。返回 taskId，终态后端口经
+/// `GET /api/userapp/dev/list` 查询（UserApp workspace 恒为 pingap 9080）。
 #[utoipa::path(
     post,
     path = "/dev/rebuild",
     request_body = DevOpBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = UserappDevTaskCreated, description = "重建任务已创建（taskId）")),
     tag = "UserApp"
 )]
 pub(crate) async fn dev_rebuild(
     State(state): State<AppState>,
     Json(body): Json<DevOpBody>,
-) -> Result<Json<UserappDevStarted>, AppError> {
+) -> Result<Json<UserappDevTaskCreated>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev rebuild");
-    let ws = resolve_userapp_dev(&body.app_id, None, &state.config)?;
-    let key = dev_key(&body.app_id);
-    // 先编译：失败即返回（旧服务不动）
-    build_project_impl(&state, &ws, &key, &body.app_id, body.base_path.as_deref()).await?;
-    // 编译成功：重启（stop + start，端口池重分配）
-    let started: StartedDev = state
-        .dev_server
-        .restart_dev(&key, &ws, body.base_path.as_deref())
-        .await?;
-    Ok(Json(UserappDevStarted {
-        success: true,
-        message: "Rebuilt and restarted".to_string(),
+    let task_id = spawn_dev_task(
+        state,
+        &body.app_id,
+        body.base_path.map(|s| s.to_string()),
+        crate::service::userapp::tasks::BuildTaskKind::DevRebuild,
+    )
+    .await?;
+    Ok(Json(UserappDevTaskCreated {
         app_id: body.app_id,
-        pid: started.pid,
-        port: started.port,
+        task_id,
+        status: "pending".to_string(),
     }))
+}
+
+/// dev 异步编译任务受理响应（POST /dev/build、/dev/rebuild）。
+/// camelCase 对齐 BuildCreatedData（Java 同一消费面）。
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UserappDevTaskCreated {
+    /// 应用 ID
+    pub app_id: String,
+    /// 异步任务 ID（轮询 /api/userapp/tasks/{taskId}、SSE /api/userapp/tasks/{taskId}/logs/stream）
+    pub task_id: String,
+    /// 受理时状态（pending——后台任务已创建）
+    pub status: String,
+}
+
+/// dev 编译任务的公共骨架：create task + resolve workspace + spawn 后台执行。
+/// DevBuild = 仅编译；DevRebuild = 编译成功后自动重启 dev server。
+/// 终态：Completed（制品四字段占位空）/ Failed（友好错误）。
+async fn spawn_dev_task(
+    state: AppState,
+    app_id: &str,
+    base_path: Option<String>,
+    kind: crate::service::userapp::tasks::BuildTaskKind,
+) -> Result<String, AppError> {
+    let task = state
+        .build_tasks
+        .create(app_id.to_string(), kind)
+        .await
+        .map_err(|e| AppError::business(e.to_string()))?;
+    match resolve_userapp_dev(app_id, None, &state.config) {
+        Ok(ws) => task.set_workspace_root(ws.clone()).await,
+        Err(e) => {
+            task.emit(shared_types::BuildProgressEvent::Failed {
+                error: format!("resolve workspace: {e}"),
+            })
+            .await;
+            return Ok(task.id.clone());
+        }
+    }
+    let app_id = app_id.to_string();
+    let task_clone = task.clone();
+    tokio::spawn(async move {
+        let key = dev_key(&app_id);
+        let ws = task_clone.workspace_root().await.unwrap_or_else(|| {
+            // set_workspace_root 已成功才走到 spawn；防御分支
+            std::path::PathBuf::from(".")
+        });
+        // manifest 同核编译（单一编译事实源）：discover_projects → 逐子项目
+        // 执行 project.manifest.toml 的 [build].command——与发布打包
+        // build_workspace_package 完全同核（顺带产出制品 zip，dev 编译通过
+        // = 可部署）。此前误用 web 域的 package.json/pnpm 引擎（vite 项目
+        // 专用），对 UserApp 模板项目（Java/Go 多服务）不适用。
+        let progress = task_clone.clone();
+        let result = crate::service::userapp::build_workspace_package(
+            &state.config,
+            &state.build_manager,
+            &app_id,
+            state.config.dev_command_timeout_secs,
+            Some(&progress),
+        )
+        .await;
+        let outcome = async {
+            result?;
+            if matches!(
+                kind,
+                crate::service::userapp::tasks::BuildTaskKind::DevRebuild
+            ) {
+                // 编译成功：重启 dev 服务（失败则整体 Failed——旧服务已被
+                // stop，语义上本轮重建失败，下次重试）
+                state
+                    .dev_server
+                    .restart_dev(&key, &ws, base_path.as_deref())
+                    .await?;
+            }
+            Ok::<(), AppError>(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => {
+                task_clone
+                    .emit(shared_types::BuildProgressEvent::Completed {
+                        // dev 任务无发布制品——占位（调用方按 status 消费，
+                        // 新端口经 dev/list 查询）
+                        release_id: String::new(),
+                        sha256: String::new(),
+                        size_bytes: 0,
+                        file_name: String::new(),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                task_clone
+                    .emit(shared_types::BuildProgressEvent::Failed {
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+        }
+    });
+    Ok(task.id.clone())
 }
 
 /// `GET /api/userapp/dev/list`: 在跑的 UserApp 开发服务列表（不含 web/computer 项目）。

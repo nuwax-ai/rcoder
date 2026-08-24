@@ -79,6 +79,15 @@ impl DevServerManager {
         project_path: &Path,
         base_path: Option<&str>,
     ) -> AppResult<StartedDev> {
+        // UserApp workspace 分流：workspace.manifest.toml 存在 → app-cli 引擎。
+        // manifest 多服务（Java/Go 等）的正确运行态 = app-cli 按 run.command
+        // 编排全栈 + pingap 9080 统一入口（[proxy] 路由）；开发容器 per-app，
+        // 9080 无冲突。原 package.json/vite 引擎是 web 域（单 vite dev server）
+        // 移植，对多服务模板不适用——web/computer 项目（无 workspace manifest）
+        // 继续走原路径。
+        if project_path.join("workspace.manifest.toml").exists() {
+            return self.start_dev_manifest(project_id, project_path).await;
+        }
         // 幂等: 已运行则返回现有 pid/port
         if let Some(p) = lock(&self.processes)?.get(project_id).cloned() {
             return Ok(StartedDev {
@@ -207,6 +216,100 @@ impl DevServerManager {
         port_alloc.disarm(); // 分配成功且就绪, 不再归还端口 (Drop 变 no-op)
 
         Ok(StartedDev { pid, port })
+    }
+
+    /// UserApp workspace 的 dev 启动（app-cli 引擎）：spawn 常驻 `app-cli
+    /// --workspace <ws>` ——按 manifest run.command 拉起全部服务 + pingap
+    /// 9080 统一入口（多服务编排/健康检查/失败清理都由 app-cli 负责）。
+    ///
+    /// 端口恒 9080（pingap 主入口，per-app 开发容器无冲突），不走 PortPool；
+    /// 探活沿用 poll_alive（app-cli 早退=manifest 校验失败被拦截；HTTP 未
+    /// 就绪但进程存活=宽松通过，与 vite 路径同语义）。app-cli 自身文件日志
+    /// 指 `<log_dir>/app-cli/`，stdout/stderr 管道照走 main_log（dev/logs 可读）。
+    async fn start_dev_manifest(
+        &self,
+        project_id: &str,
+        project_path: &Path,
+    ) -> AppResult<StartedDev> {
+        const PINGAP_ENTRY_PORT: u16 = 9080;
+        // 幂等: 已运行则返回现有 pid/port（app-cli 路径与 vite 路径同表登记）
+        if let Some(p) = lock(&self.processes)?.get(project_id).cloned() {
+            return Ok(StartedDev {
+                pid: p.pid,
+                port: p.port,
+            });
+        }
+
+        let ldir = log::log_dir(&self.config, project_id);
+        tokio::fs::create_dir_all(ldir.join("app-cli"))
+            .await
+            .map_err(|e| AppError::system(format!("create app-cli log dir: {e}")))?;
+        let now = process::now_ms();
+        let main_log = ldir.join(log::main_log_name());
+        let temp_log = ldrtemp(&ldir, now);
+
+        // 管理 API 绑随机端口（dev 场景无人消费，避免多实例撞 3010）
+        let (child, stdout, stderr) = process::spawn_dev(
+            "app-cli",
+            &[
+                "--workspace".to_string(),
+                project_path.display().to_string(),
+                "--log-dir".to_string(),
+                ldir.join("app-cli").display().to_string(),
+                "--admin-addr".to_string(),
+                "127.0.0.1:0".to_string(),
+            ],
+            project_path,
+            &[],
+        )?;
+        let pid = child
+            .id()
+            .ok_or_else(|| AppError::system("spawned app-cli has no pid"))?;
+        let stderr_ring: Arc<StderrRing> = Arc::new(Mutex::new(
+            std::collections::VecDeque::with_capacity(STDERR_RING_CAP),
+        ));
+        if let Some(out) = stdout {
+            log::spawn_log_pipe(out, main_log.clone(), temp_log.clone());
+        }
+        if let Some(err) = stderr {
+            log::spawn_log_pipe_with_ring(
+                err,
+                main_log.clone(),
+                temp_log.clone(),
+                stderr_ring.clone(),
+            );
+        }
+        drop(child);
+
+        // 早退检测 + 宽松就绪（pingap 按 [proxy] path 路由，根路径可能 404——
+        // HTTP 判不通但进程存活即通过）
+        self.poll_alive(
+            pid,
+            PINGAP_ENTRY_PORT,
+            None,
+            &stderr_ring,
+            &|port, _base, timeout_ms| {
+                Box::pin(process::is_project_alive(port, Some("/"), timeout_ms))
+            },
+        )
+        .await?;
+
+        lock(&self.processes)?.insert(
+            project_id.to_string(),
+            DevProcess {
+                pid,
+                port: PINGAP_ENTRY_PORT,
+                project_id: project_id.to_string(),
+                started_at: now,
+                log_dir: ldir.clone(),
+                temp_log_name: log::temp_log_name(now),
+            },
+        );
+
+        Ok(StartedDev {
+            pid,
+            port: PINGAP_ENTRY_PORT,
+        })
     }
 
     /// 就绪轮询: 进程早退 → Err (读 stderr ring 分类成结构化错误); HTTP 就绪 → Ok;
