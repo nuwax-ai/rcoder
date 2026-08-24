@@ -308,10 +308,11 @@ async fn agent_runner_main() -> anyhow::Result<()> {
             agent_runner::ws_terminal::start_ws_terminal().await;
         });
 
-        // 🔥 1.6. 可选：启动嵌入式 file-server (RCODER_EMBED_FILE_SERVER=true)
-        //         让 workspace build 在 agent-runner 全量工具链下执行 (UserApp)
+        // 🔥 1.6. 可选：内嵌 file-server (RCODER_EMBED_FILE_SERVER=true)
+        //         路由 merge 进 8086 主服务（create_router 内按开关注入）；
+        //         60000 由 file-server-proxy 前置接管（AllRust → 本进程 8086）
         if shared_types::FeatureFlags::get().embed_file_server {
-            agent_runner::file_server_embed::spawn_embedded_file_server().await;
+            agent_runner::file_server_embed::spawn_file_server_proxy(config.port).await;
         }
 
         // 🔥 2. 创建 HttpServerConfig（包含所有配置）

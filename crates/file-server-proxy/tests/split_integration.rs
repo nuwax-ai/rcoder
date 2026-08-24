@@ -61,6 +61,7 @@ async fn service_type_header_decides_upstream_and_lifecycle() {
         listen_port: PROXY_PORT,
         rust_upstream_port: RUST_UPSTREAM_PORT,
         ts_upstream_port: TS_UPSTREAM_PORT,
+        policy: file_server_proxy::RoutePolicy::UserappSplit,
     });
 
     // ── 生命周期: start → status ──
@@ -94,6 +95,13 @@ async fn service_type_header_decides_upstream_and_lifecycle() {
     assert!(
         computer.contains("upstream-ts"),
         "非 userapp 业务声明应走 TS: {computer}"
+    );
+
+    // path 判据（Java 未接 header 期的兜底）：/api/userapp/* 无 header 也走 Rust
+    let by_path = http_get("/api/userapp/dev/start", &[]).await;
+    assert!(
+        by_path.contains("upstream-rust"),
+        "/api/userapp/* 前缀应走 Rust: {by_path}"
     );
 
     // health 探活走 TS（脚本健康检查依赖此行为）

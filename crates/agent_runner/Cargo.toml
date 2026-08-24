@@ -56,6 +56,7 @@ agent_provisioning = { workspace = true }
 download_utils = { workspace = true }
 model_probe = { workspace = true }
 file-server = { workspace = true }
+file-server-proxy = { workspace = true }
 rcoder-proxy = { workspace = true, optional = true }
 rcoder-telemetry = { workspace = true }
 console-subscriber = { workspace = true, optional = true }

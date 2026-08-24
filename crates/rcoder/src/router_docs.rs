@@ -108,13 +108,11 @@ use crate::handler;
         crate::userapp_publish::handler::get_task,
         crate::userapp_publish::handler::stream_task,
         crate::userapp_publish::handler::cancel_task,
-        crate::userapp_forward::workspace::create_workspace,
         crate::userapp_forward::db::align_credentials,
     ),
     components(
         schemas(
-            // userApp 转发层（create-workspace + PG 凭据对齐）
-            crate::userapp_forward::workspace::CreateWorkspaceBody,
+            // userApp 转发层（PG 凭据对齐；create-workspace 为内部接口不入文档）
             shared_types::AlignCredentialsRequest,
             shared_types::AlignCredentialsOutcome,
             // 响应结构体
@@ -327,6 +325,34 @@ pub struct ApiDoc;
 
 /// 创建 Swagger UI 路由。
 ///
+/// 内部路由 path（file-server-proxy 分流代理的上游镜像接口）：路由保留、对外
+/// 文档不暴露——Java 同事调 computer 域同名接口，带 `x-service-type: userapp`
+/// header 经 60000 分流代理内部路由到这些；直接暴露会让调用方绕过分流契约。
+const INTERNAL_USERAPP_PATHS: [&str; 13] = [
+    "/api/userapp/download-all-files",
+    "/api/userapp/files-update",
+    "/api/userapp/generate-file",
+    "/api/userapp/get-file-list",
+    "/api/userapp/import-project",
+    "/api/userapp/execute-command",
+    "/api/userapp/push-skills-to-workspace",
+    "/api/userapp/resolve-file",
+    "/api/userapp/search-files",
+    "/api/userapp/upload-file",
+    "/api/userapp/upload-files",
+    "/api/userapp/workspace",
+    "/api/userapp/zip-workspace",
+];
+
+/// 从文档剔除内部路由 path（components 中失去引用的 schema 残留无害，不追引
+/// 用图清理）。
+fn strip_internal_userapp_paths(document: &mut utoipa::openapi::OpenApi) {
+    document
+        .paths
+        .paths
+        .retain(|path, _| !INTERNAL_USERAPP_PATHS.contains(&path.as_str()));
+}
+
 /// 聚合两份文档（UI 顶部下拉切换）：rcoder 主文档 + file-server 文档。
 /// file-server 全量文档（含 /api/userapp）始终聚合在此；实际路由宿主：
 /// 老路径（project/computer/git/build）常驻 rcoder 主服务（`merged_router`），
@@ -335,18 +361,23 @@ pub struct ApiDoc;
 /// 主文档额外合入 userApp 业务域（file-server 的 `/api/userapp/*` 路径 +
 /// schemas）——Swagger 默认打开主文档即见 userApp 全貌（dev 生命周期/编译/
 /// 文件/静态），无需切下拉；其余 file-server 域（project/computer/git 等）
-/// 仍只在 file-server.json，防主文档膨胀。
+/// 仍只在 file-server.json，防主文档膨胀。两份文档均剔除
+/// [`INTERNAL_USERAPP_PATHS`]（分流代理的内部路由面）。
 pub fn create_swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/api/docs")
         .url("/api/docs/openapi.json", primary_document())
-        .url(
-            "/api/docs/file-server.json",
-            file_server::openapi::document(file_server::routes::api_router().into_openapi()),
-        )
+        .url("/api/docs/file-server.json", file_server_document())
         .config(utoipa_swagger_ui::Config::new([
             "/api/docs/openapi.json",
             "/api/docs/file-server.json",
         ]))
+}
+
+/// file-server 下拉文档 = file-server 全量文档剔除内部路由 path。
+fn file_server_document() -> utoipa::openapi::OpenApi {
+    let mut doc = file_server::openapi::document(file_server::routes::api_router().into_openapi());
+    strip_internal_userapp_paths(&mut doc);
+    doc
 }
 
 /// 主文档 = rcoder 应用管理 + userApp 业务域（选择性合入）。
@@ -358,6 +389,7 @@ fn primary_document() -> utoipa::openapi::OpenApi {
         .paths
         .paths
         .retain(|path, _| path.starts_with("/api/userapp"));
+    strip_internal_userapp_paths(&mut userapp);
     doc.merge(userapp);
     doc
 }
@@ -384,14 +416,13 @@ mod openapi_tests {
         }
     }
 
-    /// file-server 文档**全量**聚合进 rcoder Swagger UI（`create_swagger_ui` 挂完整
-    /// openapi.json, 无裁剪）。此测试锁定聚合链路活着: 语义锚点 + 动态下限——
-    /// 逐条路径清单由 file-server 自己的 openapi 测试（总数 + contains_key）锁定,
-    /// 这里不重复维护; file-server 增删接口时下限断言自动跟随。
+    /// file-server 文档聚合进 rcoder Swagger UI（全量剔除
+    /// [`INTERNAL_USERAPP_PATHS`] 内部路由面后挂载）。此测试锁定聚合链路活着:
+    /// 语义锚点 + 动态下限——逐条路径清单由 file-server 自己的 openapi 测试
+    /// （总数 + contains_key）锁定, 这里不重复维护。
     #[test]
     fn file_server_document_covers_userapp_and_project_paths() {
-        let document =
-            file_server::openapi::document(file_server::routes::api_router().into_openapi());
+        let document = file_server_document();
         let paths = &document.paths.paths;
         // 锚点: 项目创建入口 + UserApp 打包链 (跨域语义关键路径)
         for path in [
@@ -408,8 +439,42 @@ mod openapi_tests {
             .keys()
             .filter(|p| p.starts_with("/api/userapp/"))
             .count();
-        assert!(paths.len() >= 90, "聚合文档路径总数异常: {}", paths.len());
-        assert!(userapp_count >= 20, "userapp 路径数异常: {userapp_count}");
+        // 全量 100 paths - 12 个内部镜像 path(file-server 侧) = 88
+        assert!(paths.len() >= 85, "聚合文档路径总数异常: {}", paths.len());
+        assert!(userapp_count >= 15, "userapp 路径数异常: {userapp_count}");
+    }
+
+    /// 内部路由面防回归: 13 个 [`INTERNAL_USERAPP_PATHS`]（file-server-proxy 分流
+    /// 代理的上游镜像接口）不得出现在任何一份对外文档；同时保留面锚点仍在
+    /// （userApp 公开域: dev 生命周期/编译/打包/任务/静态）。
+    #[test]
+    fn internal_userapp_paths_are_hidden_from_docs() {
+        let primary = primary_document();
+        for path in INTERNAL_USERAPP_PATHS {
+            assert!(
+                !primary.paths.paths.contains_key(path),
+                "主文档泄露内部路由: {path}"
+            );
+        }
+        let file_server_doc = file_server_document();
+        for path in INTERNAL_USERAPP_PATHS {
+            assert!(
+                !file_server_doc.paths.paths.contains_key(path),
+                "file-server 文档泄露内部路由: {path}"
+            );
+        }
+        // 保留面锚点（不在内部清单的 userApp 公开接口）
+        for anchor in [
+            "/api/userapp/build",
+            "/api/userapp/dev/start",
+            "/api/userapp/get-logs",
+            "/api/userapp/projects/detect",
+        ] {
+            assert!(
+                primary.paths.paths.contains_key(anchor),
+                "主文档缺 userApp 公开路径: {anchor}"
+            );
+        }
     }
 
     /// HTTP 层验证：两份 openapi.json 均由 Swagger UI 路由实际提供服务。

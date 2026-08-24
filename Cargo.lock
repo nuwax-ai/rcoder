@@ -162,6 +162,7 @@ dependencies = [
  "derive_builder",
  "download_utils",
  "file-server",
+ "file-server-proxy",
  "flate2",
  "futures 0.3.34",
  "futures-util",

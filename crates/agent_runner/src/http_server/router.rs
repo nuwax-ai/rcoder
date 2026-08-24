@@ -197,6 +197,21 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         Router::new()
     };
 
+    // 内嵌 file-server 路由（RCODER_EMBED_FILE_SERVER=true；路径族 /api/* 与
+    // agent_runner 自身路由零冲突）。构造失败降级空 Router（warn 可见，与
+    // rcoder 主服务的 merged_router 同款语义）
+    let file_server_routes = if shared_types::FeatureFlags::get().embed_file_server {
+        match crate::file_server_embed::merged_router() {
+            Ok(fs_router) => fs_router,
+            Err(e) => {
+                tracing::warn!("file-server routes not mounted on agent_runner: {e}");
+                Router::new()
+            }
+        }
+    } else {
+        Router::new()
+    };
+
     // 组合路由
     Router::new()
         .merge(computer_routes)
@@ -204,6 +219,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(rcoder_routes)
         .merge(api_routes)
         .merge(agent_mgmt_routes)
+        .merge(file_server_routes)
         .merge(create_swagger_ui())
         .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // 🔥 50MB body 限制
 }
