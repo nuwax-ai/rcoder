@@ -31,6 +31,8 @@ use crate::service::AppService;
 pub(crate) struct MockRuntime {
     pub delete_calls: AtomicUsize,
     pub delete_fails: AtomicBool,
+    /// list_deployments 穿透计数（查询缓存测试用）
+    pub list_calls: AtomicUsize,
     pub create_calls: AtomicUsize,
     pub create_fails: AtomicBool,
     pub status_fails: AtomicUsize,
@@ -57,6 +59,7 @@ impl UserAppDeploymentRuntime for MockRuntime {
     }
 
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
+        self.list_calls.fetch_add(1, Ordering::Relaxed);
         Ok(self
             .deployments
             .iter()
@@ -180,6 +183,7 @@ pub(crate) fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime>) -> 
         release_locks: DashMap::new(),
         metadata: crate::runtime::metadata::AppMetadataStore::default(),
         dev_cleanup: std::sync::RwLock::new(None),
+        deploy_list_cache: tokio::sync::Mutex::new(None),
     }
 }
 

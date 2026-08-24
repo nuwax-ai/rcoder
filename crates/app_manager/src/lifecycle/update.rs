@@ -121,6 +121,7 @@ impl AppService {
             .await;
         drop(_update_lock);
         self.remove_unused_process_release_lock(app_id);
+        self.invalidate_deploy_cache().await;
         self.get_app(app_id).await
     }
 
@@ -194,6 +195,7 @@ impl AppService {
 
         drop(release_lock);
         self.remove_unused_process_release_lock(app_id);
+        self.invalidate_deploy_cache().await;
         Ok(())
     }
 }

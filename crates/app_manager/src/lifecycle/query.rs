@@ -1,6 +1,10 @@
 //! UserApp 查询面（从 service.rs 拆出，extension-impl）。
 //!
-//! list_app_runtimes（对账）/ query_apps（分页过滤）/ get_app（详情）——全部实时查集群。
+//! list_app_runtimes（对账）/ query_apps（分页过滤）/ get_app（详情）——
+//! 列表类查询经 TTL 缓存（防轮询穿透到 Docker daemon/K8s apiserver，
+//! daemon 无响应曾把调用方整个挂死）；get_app 详情为单 app 直查不缓存。
+
+use std::time::Duration;
 
 use tracing::{instrument, warn};
 
@@ -9,18 +13,58 @@ use crate::service::AppService;
 use crate::utils::*;
 
 impl AppService {
+    /// 列表缓存 TTL：管理界面轮询频率量级内的最大陈旧窗口；写操作
+    /// （create/delete/update/start）会主动失效，实际一致性窗口更小。
+    const DEPLOY_LIST_TTL: Duration = Duration::from_secs(3);
+    /// 穿透查询的超时兜底：daemon/apiserver 无响应时快速报错，
+    /// 而不是把 HTTP 请求挂死到连接超时（Docker daemon 高负载实战）。
+    const DEPLOY_LIST_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
     #[instrument(skip(self))]
     pub async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>> {
-        let statuses = self
-            .runtime
-            .list_deployments()
-            .await
-            .map_err(|e| map_runtime_error("[APP] list_deployments failed", e))?;
+        let statuses = self.list_deployments_cached().await?;
         Ok(statuses
             .into_iter()
             .map(|s| self.build_runtime_info(s))
             .collect())
+    }
+
+    /// `list_deployments` 的缓存版（query_apps / list_app_runtimes 共用）：
+    /// TTL 内直接返回快照；过期穿透查询——持 tokio Mutex 期间并发请求等待，
+    /// 天然 single-flight 防击穿（只有一个请求打到 daemon）；穿透带超时。
+    async fn list_deployments_cached(
+        &self,
+    ) -> AppResult<Vec<container_runtime_api::DeploymentStatus>> {
+        let mut guard = self.deploy_list_cache.lock().await;
+        if let Some(entry) = guard.as_ref()
+            && entry.fetched_at.elapsed() < Self::DEPLOY_LIST_TTL
+        {
+            return Ok(entry.items.clone());
+        }
+        let statuses = tokio::time::timeout(
+            Self::DEPLOY_LIST_QUERY_TIMEOUT,
+            self.runtime.list_deployments(),
+        )
+        .await
+        .map_err(|_| {
+            AppOperationError::Backend(format!(
+                "list deployments timed out after {}s (docker daemon / apiserver unresponsive?)",
+                Self::DEPLOY_LIST_QUERY_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| map_runtime_error("[APP] list_deployments failed", e))?;
+        *guard = Some(crate::service::DeployListCacheEntry {
+            fetched_at: tokio::time::Instant::now(),
+            items: statuses.clone(),
+        });
+        Ok(statuses)
+    }
+
+    /// 查询缓存失效（写路径调用：create/delete/update/start 等改变
+    /// Deployment 集合或状态的操作成功后）。
+    pub(crate) async fn invalidate_deploy_cache(&self) {
+        *self.deploy_list_cache.lock().await = None;
     }
 
     /// 查询应用列表（实时查集群 + 过滤/分页）
@@ -172,5 +216,86 @@ impl AppService {
         validate_app_id(app_id)?;
         let status = self.fetch_runtime_status_or_err(app_id).await?;
         Ok(self.build_runtime_info(status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{MockRuntime, test_service};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    fn deployed(runtime: &MockRuntime, app_id: &str) {
+        runtime.deployments.insert(
+            app_id.to_string(),
+            container_runtime_api::DeploymentStatus {
+                app_id: app_id.to_string(),
+                replicas: 1,
+                ready_replicas: 1,
+                phase: "Running".to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// TTL 内命中缓存：多次查询只穿透一次到 runtime。
+    #[tokio::test]
+    async fn deploy_list_cache_hits_within_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        deployed(&runtime, "app-a");
+        let svc = test_service(tmp.path(), runtime.clone());
+
+        let r1 = svc.list_app_runtimes().await.unwrap();
+        let r2 = svc.list_app_runtimes().await.unwrap();
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r2.len(), 1);
+        assert_eq!(
+            runtime.list_calls.load(Ordering::Relaxed),
+            1,
+            "second query within TTL must hit cache"
+        );
+    }
+
+    /// 写路径失效：invalidate 后下一次查询重新穿透。
+    #[tokio::test]
+    async fn deploy_list_cache_invalidated_by_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        deployed(&runtime, "app-a");
+        let svc = test_service(tmp.path(), runtime.clone());
+
+        drop(svc.list_app_runtimes().await.unwrap());
+        deployed(&runtime, "app-b"); // 模拟并发新建（绕过 service 写路径）
+        svc.invalidate_deploy_cache().await;
+        let r = svc.list_app_runtimes().await.unwrap();
+        assert_eq!(r.len(), 2, "invalidated cache must refetch");
+        assert_eq!(runtime.list_calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// TTL 过期重查（时间推进用真实 sleep 的短替代：直接操纵缓存时间戳）。
+    #[tokio::test]
+    async fn deploy_list_cache_expires_after_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        deployed(&runtime, "app-a");
+        let svc = test_service(tmp.path(), runtime.clone());
+
+        drop(svc.list_app_runtimes().await.unwrap());
+        // 把缓存时间戳拨回 TTL 之前，模拟过期
+        {
+            let mut guard = svc.deploy_list_cache.lock().await;
+            if let Some(entry) = guard.as_mut() {
+                entry.fetched_at = tokio::time::Instant::now()
+                    - (AppService::DEPLOY_LIST_TTL + Duration::from_secs(1));
+            }
+        }
+        drop(svc.list_app_runtimes().await.unwrap());
+        assert_eq!(
+            runtime.list_calls.load(Ordering::Relaxed),
+            2,
+            "expired cache must refetch"
+        );
     }
 }

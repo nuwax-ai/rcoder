@@ -17,7 +17,7 @@ use docker_manager::path::HostPathResolver;
 use moka::sync::Cache;
 use tracing::{info, warn};
 
-use container_runtime_api::{HttpExpose, UserAppRuntime};
+use container_runtime_api::{DeploymentStatus, HttpExpose, UserAppRuntime};
 use rcoder_proxy::PingoraProxyService;
 
 use crate::AppActivityRegistry;
@@ -53,6 +53,18 @@ pub struct AppService {
     /// UserApp 开发资源回收回调（宿主注入；purge 时回收 UserAppBuilder 开发容器
     /// 与 per-app PVC——app_manager 的 runtime 视图无 agent 能力，经契约委托宿主）。
     pub(crate) dev_cleanup: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevCleanup>>>,
+    /// Deployment 列表查询缓存（TTL + 写路径失效 + single-flight）。防查询面
+    /// 轮询频繁穿透到 Docker daemon/K8s apiserver——Docker daemon 高负载下
+    /// API 可能无响应，穿透查询会挂死调用方（实战踩过：编译镜像期间 daemon
+    /// 排队，容器操作全部卡住）。tokio Mutex 天然 single-flight：缓存过期时
+    /// 并发请求只有一个穿透，其余等锁后直接命中新缓存（防击穿）。
+    pub(crate) deploy_list_cache: tokio::sync::Mutex<Option<DeployListCacheEntry>>,
+}
+
+/// deploy_list_cache 的条目：写入时刻 + 列表快照。
+pub(crate) struct DeployListCacheEntry {
+    pub fetched_at: tokio::time::Instant,
+    pub items: Vec<DeploymentStatus>,
 }
 
 impl AppService {
@@ -107,6 +119,7 @@ impl AppService {
             pingora,
             path_resolver,
             pingora_ports: DashMap::new(),
+            deploy_list_cache: tokio::sync::Mutex::new(None),
             release_locks: DashMap::new(),
             metadata: AppMetadataStore::default(),
             dev_cleanup: std::sync::RwLock::new(None),

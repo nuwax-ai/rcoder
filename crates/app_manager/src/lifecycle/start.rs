@@ -60,6 +60,7 @@ impl AppService {
             None => (None, None),
         };
 
+        self.invalidate_deploy_cache().await;
         let runtime = self.get_app(app_id).await?;
         Ok(StartAppResult {
             runtime,
@@ -126,6 +127,7 @@ impl AppService {
             },
             None => (None, None),
         };
+        self.invalidate_deploy_cache().await;
         let runtime = self.get_app(app_id).await?;
         Ok(StartAppResult {
             runtime,

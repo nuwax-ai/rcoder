@@ -176,8 +176,14 @@ impl KubernetesRuntime {
 
     /// 列出所有 rcoder-app-manager 托管的 app 状态（对账用）
     pub async fn list_app_status(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
-        let lp = ListParams::default()
-            .labels(&format!("{}/managed-by={APP_MANAGED_BY}", APP_LABEL_PREFIX));
+        let lp = ListParams {
+            label_selector: Some(format!("{}/managed-by={APP_MANAGED_BY}", APP_LABEL_PREFIX)),
+            // resourceVersion=0 走 apiserver watch cache（内存读）——不带 rv 的
+            // list 是 quorum read（等 etcd 多副本确认），查询面高频轮询会把
+            // 压力传导到 etcd；列表展示容忍 cache 的短暂陈旧
+            resource_version: Some("0".to_string()),
+            ..Default::default()
+        };
         let deploys = self
             .deployments_api()
             .list(&lp)
@@ -270,7 +276,12 @@ impl KubernetesRuntime {
         &self,
         app_id: &str,
     ) -> (String, String, u32, Option<String>, Option<String>) {
-        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
+        let lp = ListParams {
+            label_selector: Some(format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX)),
+            // 查询面同样走 watch cache（与 list_app_status 一致）
+            resource_version: Some("0".to_string()),
+            ..Default::default()
+        };
         match self.pods_api().list(&lp).await {
             Ok(pods) => pods
                 .items

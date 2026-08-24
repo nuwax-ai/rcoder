@@ -45,6 +45,9 @@ impl AppService {
             ))),
         };
         drop(create_guard);
+        if result.is_ok() {
+            self.invalidate_deploy_cache().await;
+        }
         result
     }
 
