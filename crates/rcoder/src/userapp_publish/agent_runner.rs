@@ -398,8 +398,10 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
         }
 
         // 4. 摘注册与探活缓存：purge 后注册表残留死 IP 会让下一个请求
-        //    ensure→探活失败→重建（已删 app 的容器+PVC 复活）
-        if let Some(_removed) = self.projects.remove(app_id) {
+        //    ensure→探活失败→重建（已删 app 的容器+PVC 复活）。
+        //    durable：purge 期间并发 dev chat 的 durable insert 与本删除同走
+        //    同步事务（消除"remove 入队→durable 提交→writer 重放删行"倒挂）
+        if self.projects.remove_durable(app_id).await.is_some() {
             info!("[USERAPP_DEV_CLEANUP] dev registry entry removed: app_id={app_id}");
         }
         crate::userapp_forward::invalidate_probe_cache(app_id);

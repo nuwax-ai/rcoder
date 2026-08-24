@@ -119,10 +119,17 @@ pub(super) async fn dispatch_task(
             .shared_api_key_manager
             .insert(service_uuid_ref.to_string(), provider.clone());
 
-        // 存储 project_id -> UUID 映射（用于后续清理时查找）
-        context
+        // 存储 project_id -> UUID 映射（用于后续清理时查找）。多轮 chat 每轮
+        // 生成新 uuid 覆盖旧映射——insert 拿回旧 uuid（DashMap 返回旧 value）
+        // 并连带清理其 api_key 条目，否则旧 uuid 的 ModelProviderConfig（含
+        // 明文 api_key）成为永不清理的孤儿（stop 路径只清"当前映射指向的 uuid"）
+        if let Some(old_uuid) = context
             .project_uuid_map
-            .insert(project_id.to_string(), service_uuid_ref.to_string());
+            .insert(project_id.to_string(), service_uuid_ref.to_string())
+        {
+            context.shared_api_key_manager.remove(&old_uuid);
+            debug!("[ChatHandler] Replaced API config mapping, evicted old uuid={old_uuid}");
+        }
 
         info!(
             "[ChatHandler] Stored API config: service_uuid={}, provider_name={}, base_url={}",

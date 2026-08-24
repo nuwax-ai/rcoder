@@ -377,22 +377,32 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 tracing::debug!("[DOCKER] delete container {} not found, skip", name);
             }
             Err(e) => {
-                // daemon 短暂不可达等瞬态：先查存在性区分（存在但删失败=透传）
-                let exists = client
-                    .inspect_container(&name, None)
-                    .await
-                    .map(|_| true)
-                    .unwrap_or(false);
-                if exists {
-                    return Err(ContainerRuntimeError::DockerError(format!(
-                        "delete container {name}: {e}"
-                    )));
+                // 非 404 失败：inspect 二次确认区分"并发消失"与"真删除失败"。
+                // 仅 inspect 明确 404 才判不存在（容忍并发删除）；inspect 自身
+                // 失败（含 daemon 不可达——remove/inspect 同时连不上）保守透传
+                // ——吞掉会让 purge 在 daemon 故障期删 workspace 目录，容器在跑
+                // 而 bind mount 源被删 = 数据丢失
+                match client.inspect_container(&name, None).await {
+                    Ok(_) => {
+                        return Err(ContainerRuntimeError::DockerError(format!(
+                            "delete container {name}: {e}"
+                        )));
+                    }
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => {
+                        tracing::debug!(
+                            "[DOCKER] delete container {} vanished concurrently ({e}), skip",
+                            name
+                        );
+                    }
+                    Err(inspect_err) => {
+                        return Err(ContainerRuntimeError::DockerError(format!(
+                            "delete container {name} failed: {e} (existence check also failed: {inspect_err})"
+                        )));
+                    }
                 }
-                tracing::debug!(
-                    "[DOCKER] delete container {} vanished concurrently ({}), skip",
-                    name,
-                    e
-                );
             }
         }
         // 清理内存态回收策略（K8s 靠注解随 Deployment 自动消失；Docker 需显式清，防孤儿堆积）

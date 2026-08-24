@@ -151,7 +151,6 @@ pub async fn pod_restart(
         // 从存储中彻底移除旧容器及其所有关联记录
         // 使用 container_id 删除,确保清理该容器关联的所有 project_id
         let (container_deleted, deleted_projects) = state
-            .projects
             .delete_container_with_projects_durable(&container_info.container_id)
             .await;
         info!(

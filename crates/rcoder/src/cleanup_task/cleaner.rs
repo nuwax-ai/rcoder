@@ -358,7 +358,6 @@ impl AgentCleaner {
             }
             let (deleted, project_count) = self
                 .state
-                .projects
                 .delete_container_with_projects_durable(&container_id)
                 .await;
             info!(
@@ -392,7 +391,7 @@ impl AgentCleaner {
         if info.container_info().is_none() {
             return false; // 无容器记录：无换代对象
         }
-        // identifier 单一事实源（与销毁路径的 strategy 判定一致：pod_id 优先 →
+        // identifier 单一事实源（与**创建路径**一致：pod_id 优先 →
         // Computer 用 user_id → Web/UserApp 用 project_id），防止此处的 STS 定位
         // 与创建路径分叉
         let identifier = match service_type.container_identifier(

@@ -430,10 +430,22 @@ fn workspace_claim_name(spec: &PodSpec) -> Option<String> {
 /// 确定性依据：结构体字段写出序固定（同版本二进制恒定；workspace 开
 /// preserve_order 时 Value::Object 为 IndexMap 插入序=字段声明序，未开时为
 /// BTreeMap 字典序——两种模式下同输入输出都稳定），k8s_openapi 的 map 字段
-/// 本身是 BTreeMap 恒字典序。涵盖镜像/env/command/sidecar/资源等全部模板
-/// 内容；build_agent_pod_spec 无时间/随机成分，同参数构造恒等。
+/// 本身是 BTreeMap 恒字典序。涵盖镜像/env/command/sidecar 等版本相关内容；
+/// build_agent_pod_spec 无时间/随机成分，同参数构造恒等。
+///
+/// **per-request 字段剔除**：resources（用户可调资源限额）与 TENANT_ID/
+/// SPACE_ID/ISOLATION_TYPE（请求携带时才注入）随请求抖动，混入指纹会让
+/// 同版本的 ensure 对比误报 drift（参数噪声淹没版本信号）；这些字段的
+/// 期望变更本来也不在滚动/重建语义内（ensure 恒不更新模板）。
 fn agent_template_hash(pod_spec: &PodSpec) -> String {
-    let canonical = serde_json::to_value(pod_spec)
+    let mut spec = pod_spec.clone();
+    for container in &mut spec.containers {
+        container.resources = None;
+        if let Some(env) = &mut container.env {
+            env.retain(|e| !matches!(e.name.as_str(), "TENANT_ID" | "SPACE_ID" | "ISOLATION_TYPE"));
+        }
+    }
+    let canonical = serde_json::to_value(&spec)
         .ok()
         .and_then(|v| serde_json::to_string(&v).ok())
         .unwrap_or_default();
@@ -492,5 +504,43 @@ mod tests {
         }
         let after = agent_template_hash(&spec);
         assert_ne!(before, after);
+    }
+
+    /// per-request 字段豁免：resources 与 TENANT_ID/SPACE_ID/ISOLATION_TYPE 随
+    /// 请求抖动，不得进入指纹（否则同版本 ensure 对比误报 drift，参数噪声
+    /// 淹没版本信号）。
+    #[test]
+    fn template_hash_ignores_per_request_fields() {
+        let base = sample_pod_spec("repo/rcoder:0.1.230");
+        // 调资源限额
+        let mut with_resources = base.clone();
+        with_resources.containers[0].resources =
+            Some(k8s_openapi::api::core::v1::ResourceRequirements {
+                limits: Some([("cpu".to_string(), quantity("2"))].into_iter().collect()),
+                ..Default::default()
+            });
+        assert_eq!(
+            agent_template_hash(&base),
+            agent_template_hash(&with_resources),
+            "resources change must not affect template hash"
+        );
+        // 注入隔离 env
+        let mut with_isolation = base.clone();
+        if let Some(env) = with_isolation.containers[0].env.as_mut() {
+            env.push(k8s_openapi::api::core::v1::EnvVar {
+                name: "TENANT_ID".to_string(),
+                value: Some("t1".to_string()),
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            agent_template_hash(&base),
+            agent_template_hash(&with_isolation),
+            "isolation env must not affect template hash"
+        );
+    }
+
+    fn quantity(v: &str) -> k8s_openapi::apimachinery::pkg::api::resource::Quantity {
+        k8s_openapi::apimachinery::pkg::api::resource::Quantity(v.to_string())
     }
 }

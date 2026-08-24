@@ -225,8 +225,6 @@ impl AppState {
             .insert_with_session(project_id, info, Some(session_id))
     }
 
-    /// 删除项目（替代 project_and_agent_map.remove）
-    #[inline]
     /// 删除 project——durable 变体（stop/清理路径，消队列倒挂窗口）。
     pub async fn remove_project_durable(
         &self,
@@ -242,6 +240,39 @@ impl AppState {
             }
         }
         removed
+    }
+
+    /// 容器级删除（容器销毁路径，连带全部 project 记录）——durable 变体。
+    ///
+    /// 与 [`Self::remove_project_durable`] 同语义：删除前按 container_id 归还
+    /// 各 project 的 served_sessions 资格（直连 backend 会漏——被 cancel 的
+    /// 转发 task 不走 turn 终态 release，条目泄漏到进程重启）。
+    /// 返回 (容器是否删除, 关联 project 数)。
+    pub async fn delete_container_with_projects_durable(
+        &self,
+        container_id: &str,
+    ) -> (bool, usize) {
+        // 删除前枚举该容器全部 project 的 sessions 归还资格（backend 删除后
+        // 记录即消失，无法再据此枚举）
+        let sids: Vec<String> = self
+            .projects
+            .iter()
+            .into_iter()
+            .filter(|(_, info)| {
+                info.container_info()
+                    .is_some_and(|c| c.container_id == container_id)
+            })
+            .flat_map(|(_, info)| info.sessions().into_iter())
+            .collect();
+        let result = self
+            .projects
+            .delete_container_with_projects_durable(container_id)
+            .await;
+        for sid in sids {
+            self.session_stream_registry
+                .release_first_client_claim(&sid);
+        }
+        result
     }
 
     pub fn remove_project(&self, project_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {

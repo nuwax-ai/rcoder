@@ -245,6 +245,10 @@ impl ProxyHttp for PortProxy {
         // 减少活跃连接数
         self.metrics.dec_active();
 
+        // 记录上游状态码：upstream_response_body_filter 据此收集 4xx/5xx 错误体
+        //（此前从未写入，收集分支是死代码）
+        ctx.upstream_status = Some(status.as_u16());
+
         // 只在 API 代理场景打印详细日志
         if ctx.upstream_host.is_some() {
             debug!(
@@ -275,6 +279,16 @@ impl ProxyHttp for PortProxy {
             if remaining > 0 {
                 ctx.error_body_buf
                     .extend_from_slice(&body_bytes[..remaining.min(body_bytes.len())]);
+            }
+            // 流结束时消费：错误体首 1KB 打日志（排障——网关 HTML 大页/
+            // 误配默认站点的根因就在 body 里；buffer 本身 64KB 封顶防膨胀）
+            if _end_of_stream && !ctx.error_body_buf.is_empty() {
+                let head: Vec<u8> = ctx.error_body_buf.iter().copied().take(1024).collect();
+                debug!(
+                    "[PORT_PROXY] upstream {} error body: {}",
+                    ctx.upstream_status.unwrap_or(0),
+                    String::from_utf8_lossy(&head)
+                );
             }
         }
 

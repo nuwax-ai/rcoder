@@ -192,7 +192,9 @@ impl PgStore {
         };
         match tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, durable).await {
             Ok(Ok(())) => {
-                tracing::debug!("[STORAGE_PG] durable {name} ok: op={op:?}",);
+                // 只打 op.kind()：op 全量 Debug 会含 ProjectSnapshot 的
+                // model_provider（明文 api_key），防止日后接入 UpsertProject 泄密
+                tracing::debug!("[STORAGE_PG] durable {name} ok: op={}", op.kind());
             }
             outcome => {
                 let reason = match outcome {
@@ -201,7 +203,8 @@ impl PgStore {
                     Err(_) => "timeout".to_string(),
                 };
                 tracing::warn!(
-                    "[STORAGE_PG] durable {name} failed ({reason}), falling back to write-behind: op={op:?}",
+                    "[STORAGE_PG] durable {name} failed ({reason}), falling back to write-behind: op={}",
+                    op.kind()
                 );
                 self.enqueue_structural(op);
             }

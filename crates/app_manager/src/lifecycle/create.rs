@@ -24,15 +24,26 @@ impl AppService {
         // 串行化换取检查-创建原子窗口（ensure_app_runtime 的锁内 create_app_locked
         // 无并发 create 语义，不取本锁避免与 activate 重入等待）。
         let create_guard = self.acquire_global_create_lock().await?;
-        let result = async {
+        // 锁内有界：validate（K8s 网络调用）+ PVC 等待 + SSA 无应用层超时——
+        // 持锁方挂死（进程冻结/网络黑洞）会让全舰队 create 无限期排队。
+        // 120s 上限（常态秒级完成；超时返回错误，锁随 guard drop 释放）
+        const CREATE_LOCK_WORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        let work = async {
             let app_id = self.validate_create_request(&request).await?;
             // 与 prepare/activate/confirm/delete-release/delete_app 串行: 防发布流水线
             // EnsureApp 建 Deployment 与并发 DELETE 互踩 (删成功但 Deployment 复活/
             // 半删半建脏状态)。
             let process_lock = self.acquire_process_release_lock(&app_id).await;
             self.create_app_locked(&app_id, request, process_lock).await
-        }
-        .await;
+        };
+        let result = match tokio::time::timeout(CREATE_LOCK_WORK_TIMEOUT, work).await {
+            Ok(result) => result,
+            Err(_) => Err(AppOperationError::Backend(format!(
+                "create_app timed out after {}s (global create lock held too long; \
+                 check K8s API reachability)",
+                CREATE_LOCK_WORK_TIMEOUT.as_secs()
+            ))),
+        };
         drop(create_guard);
         result
     }
@@ -40,6 +51,11 @@ impl AppService {
     /// workspace 根级创建互斥锁（跨进程 flock；文件随 guard drop 解锁）。
     /// K8s 模式根 = cephfs 共享挂载（rcoder 有写权限——ensure_app_workspace_ready
     /// 同根建目录），多副本天然互斥；Docker 单进程形态下 flock 无害。
+    ///
+    /// 部署前提：跨副本互斥要求 workspace 卷为 **RWX 共享挂载**（RWO 卷多副本
+    /// 本就无法共挂，互斥退化为单进程锁——无害但 TOCTOU 修复不生效）。
+    /// CephFS flock 在 MDS failover 窗口可能静默丢失（advisory 锁无客户端
+    /// 通知），create 低频场景可接受。
     async fn acquire_global_create_lock(&self) -> AppResult<std::fs::File> {
         use fs2::FileExt as _;
         use std::io::Write as _;
