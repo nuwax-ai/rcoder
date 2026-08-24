@@ -303,17 +303,10 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         }
 
         // 🔥 1.5. 启动 ttyd WS 终端中间层（tokio-tungstenite：接浏览器 + 连本地 ttyd）
-        //         cd 逻辑由代码每次连接（含重连）控制，解决 WS 重连不进项目目录的问题
+        //         cd 逻辑由代码每次连接（含重连）时执行，解决 WS 重连不进项目目录的问题
         tokio::spawn(async move {
             agent_runner::ws_terminal::start_ws_terminal().await;
         });
-
-        // 🔥 1.6. 可选：内嵌 file-server (RCODER_EMBED_FILE_SERVER=true)
-        //         路由 merge 进 8086 主服务（create_router 内按开关注入）；
-        //         60000 由 file-server-proxy 前置接管（AllRust → 本进程 8086）
-        if shared_types::FeatureFlags::get().embed_file_server {
-            agent_runner::file_server_embed::spawn_file_server_proxy(config.port).await;
-        }
 
         // 🔥 2. 创建 HttpServerConfig（包含所有配置）
         let http_config = HttpServerConfig {
@@ -328,6 +321,14 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
         // 🔥 3. 启动 HTTP 服务器（内部会启动 Pingora）
         let _handle = start_http_server(http_config).await?;
+
+        // 🔥 3.5 可选：内嵌 file-server (RCODER_EMBED_FILE_SERVER=true)
+        //         路由 merge 进 8086 主服务（create_router 内按开关注入）；
+        //         60000 由 file-server-proxy 前置接管（AllRust → 本进程 8086）。
+        //         置于 HTTP server 之后: 避免 proxy 先占 60000 而上游 8086 未就绪的 502 窗口
+        if shared_types::FeatureFlags::get().embed_file_server {
+            agent_runner::file_server_embed::spawn_file_server_proxy(config.port).await;
+        }
 
         // 🔥 4. 同时等待 gRPC（如果有）和信号
         info!("HTTP + Pingora services started; running until shutdown signal is received");

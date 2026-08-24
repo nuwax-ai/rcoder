@@ -143,5 +143,5 @@ impl Default for AppConfig {
 mod loader;
 mod sections;
 
-pub use loader::{load_api_key_config_from_file, load_config_with_args};
+pub use loader::{load_api_key_config_from_file, load_config_for_cli, load_config_with_args};
 pub use sections::{CleanupConfigSettings, DockerConfig, ProxyConfig, UserAppRecycleConfig};

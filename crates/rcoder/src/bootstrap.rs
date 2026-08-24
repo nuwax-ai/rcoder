@@ -7,7 +7,7 @@ use clap::Parser;
 use rcoder_telemetry::{FileLogConfig, TelemetryConfig, TelemetryGuard};
 use tracing::info;
 
-use crate::config::{CliArgs, load_config_with_args};
+use crate::config::{CliArgs, load_config_for_cli, load_config_with_args};
 
 pub struct BootstrapResult {
     pub config: crate::config::AppConfig,
@@ -28,7 +28,7 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
     // 仅加载同源配置 (端口 + api key) 后 HTTP 调运行中的 rcoder 进程, 完成即退出。
     if let Some(command) = cli_args.command.take() {
         let cli_port = cli_args.port;
-        let config = load_config_with_args(cli_args)?;
+        let config = load_config_for_cli(cli_args)?;
         let action = match command {
             crate::config::AdminCommand::FileServer { action } => match action {
                 crate::config::FileServerAction::Start => "start",

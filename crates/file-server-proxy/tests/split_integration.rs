@@ -9,7 +9,8 @@ const PROXY_PORT: u16 = 46000;
 const RUST_UPSTREAM_PORT: u16 = 48086;
 const TS_UPSTREAM_PORT: u16 = 46001;
 
-/// 极简 HTTP 上游：收到请求即回 200 + 标识体（足以验证分流归属）。
+/// 极简 HTTP 上游：回 200 + 标识体 + 回显 `x-probe` header 的全部出现值
+/// （多值 header 透传断言依据）。
 async fn spawn_marker_upstream(port: u16, marker: &'static str) {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -17,16 +18,26 @@ async fn spawn_marker_upstream(port: u16, marker: &'static str) {
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
-                continue;
+                // listener 关闭等致命错误不再紧循环
+                break;
             };
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
                 if let Err(e) = sock.read(&mut buf).await {
                     eprintln!("marker upstream read error: {e}");
                 }
+                let text = String::from_utf8_lossy(&buf);
+                let probes: Vec<&str> = text
+                    .lines()
+                    .filter_map(|l| {
+                        let (name, value) = l.split_once(':')?;
+                        name.eq_ignore_ascii_case("x-probe").then(|| value.trim())
+                    })
+                    .collect();
+                let body = format!("{marker} probes=[{}]", probes.join(","));
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{marker}",
-                    marker.len()
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
                 );
                 if let Err(e) = sock.write_all(resp.as_bytes()).await {
                     eprintln!("marker upstream write error: {e}");
@@ -102,6 +113,21 @@ async fn service_type_header_decides_upstream_and_lifecycle() {
     assert!(
         by_path.contains("upstream-rust"),
         "/api/userapp/* 前缀应走 Rust: {by_path}"
+    );
+
+    // 多值 header 透传（append 语义: 同名多值不丢——Cookie 链等场景）
+    let multi = http_get(
+        "/health",
+        &[
+            ("x-probe", "first"),
+            ("x-probe", "second"),
+            ("x-probe", "third"),
+        ],
+    )
+    .await;
+    assert!(
+        multi.contains("first") && multi.contains("second") && multi.contains("third"),
+        "同名多值 header 应全部透传: {multi}"
     );
 
     // health 探活走 TS（脚本健康检查依赖此行为）

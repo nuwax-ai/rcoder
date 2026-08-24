@@ -247,15 +247,19 @@ async fn main() -> anyhow::Result<()> {
 
     // 60000 file-server 分流反代（Java/外部入口，独立 crate file-server-proxy）：
     // x-service-type: userapp → 本主服务（8086），其余 → TS nuwax-file-server（60001）。
-    // 配置无条件注册（段缺失用默认端口，供运行时 `rcoder file-server start` 拉起）；
-    // 段存在时自动启动（本地 dev 无段则不监听 60000）。运行时启停经
+    // 配置无条件注册（段缺失时兜底默认端口但 rust 上游对准本服务实际端口，
+    // 供运行时 `rcoder file-server start` 拉起）；段存在时自动启动（本地 dev 无段
+    // 则不监听 60000）。运行时启停经
     // /api/system/file-server/*（`rcoder file-server {start,stop,restart,status}`）。
     file_server_proxy::init(
         bootstrap_result
             .config
             .file_server_proxy
             .clone()
-            .unwrap_or_default(),
+            .unwrap_or_else(|| file_server_proxy::FileServerProxyConfig {
+                rust_upstream_port: bootstrap_result.config.port,
+                ..file_server_proxy::FileServerProxyConfig::default()
+            }),
     );
     if bootstrap_result.config.file_server_proxy.is_some() {
         // 同步 bind 语义：启动失败（如端口被占）此刻即报，不留到首个请求

@@ -439,7 +439,9 @@ mod openapi_tests {
             .keys()
             .filter(|p| p.starts_with("/api/userapp/"))
             .count();
-        // 全量 100 paths - 12 个内部镜像 path(file-server 侧) = 88
+        // 全量 100 paths - 12 个内部镜像 path(file-server 侧; 第 13 条
+        // /api/userapp/workspace 仅存在于 rcoder 侧转发路由, 对 file-server 文档
+        // 是永不命中的防御条目) = 88
         assert!(paths.len() >= 85, "聚合文档路径总数异常: {}", paths.len());
         assert!(userapp_count >= 15, "userapp 路径数异常: {userapp_count}");
     }

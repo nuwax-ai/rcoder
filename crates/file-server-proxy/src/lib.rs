@@ -169,26 +169,46 @@ pub fn init(config: FileServerProxyConfig) {
 }
 
 /// 当前运行状态：Some(address) = 运行中，None = 已停止。
+///
+/// 顺带自愈：serve task 已死（意外退出且 spawn 内 cleanup 被 panic 跳过等）时
+/// 就地清掉死实例，避免 status 误报 running。
 pub async fn status() -> Option<String> {
-    INSTANCE.lock().await.as_ref().map(|i| i.address.clone())
+    let mut guard = INSTANCE.lock().await;
+    reap_dead_instance(&mut guard);
+    guard.as_ref().map(|i| i.address.clone())
+}
+
+/// map 内实例的 task 已结束则清掉（幂等；serve panic 跳过 spawn 内 cleanup 的兜底）。
+fn reap_dead_instance(guard: &mut tokio::sync::MutexGuard<'_, Option<RunningInstance>>) {
+    if guard.as_ref().is_some_and(|i| i.task.is_finished()) {
+        guard.take();
+        warn!("file-server 分流代理 serve 已退出, 死实例状态自愈为已停止");
+    }
 }
 
 /// 启动分流代理（幂等）。同步 bind（而非 spawn 内 bind），返回时状态准确。
 pub async fn try_start() -> Result<String, String> {
     let mut guard = INSTANCE.lock().await;
+    reap_dead_instance(&mut guard);
     if let Some(instance) = guard.as_ref() {
         return Ok(instance.address.clone());
     }
-    let config = CONFIG.get().cloned().unwrap_or_default();
+    let config = CONFIG.get().cloned().unwrap_or_else(|| {
+        warn!("file-server-proxy 配置未 init, 回落默认端口 (60000 → 8086/60001)");
+        FileServerProxyConfig::default()
+    });
 
     let address = format!("0.0.0.0:{}", config.listen_port);
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .map_err(|e| format!("bind {address} 失败（端口被占用?）: {e}"))?;
 
+    // 上游 hang 防堆积: 连接 5s 建立超时; 整请求超时在 proxy_request 内包装
+    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    connector.set_connect_timeout(Some(std::time::Duration::from_secs(5)));
     let client: ProxyClient =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http();
+            .build(connector);
 
     let shutdown = CancellationToken::new();
     let token = shutdown.clone();
@@ -272,7 +292,9 @@ async fn serve(
                                 async move { proxy_request(req, client, config).await }
                             });
                             let io = hyper_util::rt::TokioIo::new(io);
-                            // with_upgrades: 万一上游有 WebSocket 语义不致硬拒（当前无 ws 路由）
+                            // 注: 本代理不透传 WebSocket(upgrade 已列入 hop-by-hop 剥除);
+                            // with_upgrades 仅为 hyper 连接层的 upgrade 协商宽容,
+                            // 避免 h1 客户端带 upgrade 头时连接被硬断
                             let conn = hyper::server::conn::http1::Builder::new()
                                 .serve_connection(io, service);
                             if let Err(e) = conn.with_upgrades().await {
@@ -303,12 +325,21 @@ async fn proxy_request(
 ) -> Result<hyper::Response<ProxyBody>, std::convert::Infallible> {
     let (parts, body) = req.into_parts();
 
+    let path = parts.uri.path();
     let service_type = parts
         .headers
         .get(SERVICE_TYPE_HEADER)
         .and_then(|v| v.to_str().ok());
-    let port = match config.upstream_port_for(parts.uri.path(), service_type) {
-        Upstream::Rust(port) => port,
+    let port = match config.upstream_port_for(path, service_type) {
+        Upstream::Rust(port) => {
+            // AllRust 白名单: 60000 只放行 file-server 语义路径, 不把上游 8086 的
+            // 全量路由面（/chat、/agent-mgmt/* 等集群内面）推到对外入口
+            if config.policy == RoutePolicy::AllRust && !all_rust_path_allowed(path) {
+                warn!("AllRust 白名单外路径已拒绝: {path}");
+                return Ok(not_found("path not served on this entry"));
+            }
+            port
+        }
         Upstream::Ts(port) => port,
     };
 
@@ -321,12 +352,15 @@ async fn proxy_request(
     let mut upstream = hyper::Request::builder()
         .method(parts.method.clone())
         .uri(format!("http://127.0.0.1:{port}{path_query}"));
-    if let Some(headers) = upstream.headers_mut() {
-        for (name, value) in parts.headers.iter() {
-            // hop-by-hop headers 不跨代理转发
-            if !is_hop_by_hop(name.as_str()) {
-                headers.insert(name.clone(), value.clone());
-            }
+    let Some(headers) = upstream.headers_mut() else {
+        // 仅 asterisk-form (`OPTIONS *`) 等异常 request-target 会走到这里
+        error!("file-server 分流代理构造上游请求失败: 无效 request-target {path_query:?}");
+        return Ok(bad_request("invalid request-target"));
+    };
+    for (name, value) in parts.headers.iter() {
+        // hop-by-hop headers 不跨代理转发; append 保多值 header (Cookie 链等)
+        if !is_hop_by_hop(name.as_str()) {
+            headers.append(name.clone(), value.clone());
         }
     }
 
@@ -339,7 +373,20 @@ async fn proxy_request(
         }
     };
 
-    match client.request(upstream_req).await {
+    // 整请求 300s 超时（宽限大文件上传/慢接口; 防"上游接受连接后不响应"无限堆积）
+    const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    let upstream_result =
+        match tokio::time::timeout(UPSTREAM_REQUEST_TIMEOUT, client.request(upstream_req)).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                error!(
+                    "file-server 分流代理上游 127.0.0.1:{port} 请求超时 \
+                     ({UPSTREAM_REQUEST_TIMEOUT:?}, path {path_query})"
+                );
+                return Ok(bad_gateway("file-server upstream timeout"));
+            }
+        };
+    match upstream_result {
         Ok(resp) => {
             let (mut parts, body) = resp.into_parts();
             for h in HOP_BY_HOP {
@@ -351,26 +398,34 @@ async fn proxy_request(
             ))
         }
         Err(e) => {
+            // 对外文案不泄露内部拓扑, 详情在日志
             error!(
                 "file-server 分流代理上游 127.0.0.1:{port} 请求失败 \
                  (path {path_query}, service_type={service_type:?}): {e}"
             );
-            Ok(bad_gateway(&format!(
-                "upstream 127.0.0.1:{port} unreachable: {e}"
-            )))
+            Ok(bad_gateway("file-server upstream unavailable"))
         }
     }
 }
 
 /// hop-by-hop header 集合（RFC 7231 §6.1 / 2616 §13.5.1）。
-const HOP_BY_HOP: [&str; 6] = [
+const HOP_BY_HOP: [&str; 7] = [
     "connection",
     "keep-alive",
     "proxy-connection",
     "transfer-encoding",
     "te",
     "trailer",
+    // upgrade 也是 hop-by-hop：本代理不透传 WebSocket（当前 file-server 无 ws 路由），
+    // 剥除可防"孤立 upgrade 头"到达上游引发歧义
+    "upgrade",
 ];
+
+/// AllRust 模式的 60000 入口白名单：file-server 语义路径（`/api/*`、`/health`、`/`、
+/// swagger `/api-docs*`）。UserappSplit 的 rust 分支无需白名单——其判据本身已窄面。
+fn all_rust_path_allowed(path: &str) -> bool {
+    path == "/health" || path == "/" || path.starts_with("/api/") || path.starts_with("/api-docs")
+}
 
 fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
@@ -378,14 +433,28 @@ fn is_hop_by_hop(name: &str) -> bool {
 
 /// 502 错误响应（body 归一到 ProxyBody；Full 的 error 为 Infallible，不可达分支）。
 fn bad_gateway(msg: &str) -> hyper::Response<ProxyBody> {
+    error_response(hyper::StatusCode::BAD_GATEWAY, msg)
+}
+
+/// 400 错误响应（异常 request-target 等）。
+fn bad_request(msg: &str) -> hyper::Response<ProxyBody> {
+    error_response(hyper::StatusCode::BAD_REQUEST, msg)
+}
+
+/// 404：AllRust 白名单外的路径（此入口不服务该路径——不放行 8086 全量路由面）。
+fn not_found(msg: &str) -> hyper::Response<ProxyBody> {
+    error_response(hyper::StatusCode::NOT_FOUND, msg)
+}
+
+fn error_response(status: hyper::StatusCode, msg: &str) -> hyper::Response<ProxyBody> {
     let body = http_body_util::Full::new(Bytes::from(msg.to_string()))
         .map_err(|e| match e {})
         .boxed();
     hyper::Response::builder()
-        .status(hyper::StatusCode::BAD_GATEWAY)
+        .status(status)
         .header("content-type", "text/plain; charset=utf-8")
         .body(body)
-        .expect("static 502 response parts are valid")
+        .expect("static error response parts are valid")
 }
 
 #[cfg(test)]
@@ -518,7 +587,34 @@ mod tests {
     fn hop_by_hop_detection() {
         assert!(is_hop_by_hop("Connection"));
         assert!(is_hop_by_hop("keep-alive"));
+        assert!(is_hop_by_hop("upgrade"));
         assert!(!is_hop_by_hop("x-service-type"));
         assert!(!is_hop_by_hop("content-type"));
+    }
+
+    /// AllRust 白名单: file-server 语义路径放行, 上游 8086 的其余路由面
+    /// （/chat、/agent-mgmt/* 等集群内面）不放行——防 60000 入口裸暴露。
+    #[test]
+    fn all_rust_whitelist_gates_rust_upstream_surface() {
+        for path in [
+            "/api/version",
+            "/api/computer/create-workspace",
+            "/api/userapp/dev/start",
+            "/health",
+            "/",
+            "/api-docs/openapi.json",
+        ] {
+            assert!(all_rust_path_allowed(path), "{path} 应放行");
+        }
+        for path in [
+            "/chat",
+            "/computer/chat",
+            "/agent/stop",
+            "/agent-mgmt/agents/install-from-url",
+            "/ready",
+            "/proxy/3000/x",
+        ] {
+            assert!(!all_rust_path_allowed(path), "{path} 应拒绝(白名单外)");
+        }
     }
 }

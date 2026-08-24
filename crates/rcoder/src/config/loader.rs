@@ -139,6 +139,21 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     Ok(config)
 }
 
+/// CLI 管理子命令专用的配置加载：文件缺失时**不落盘生成**默认配置
+/// （`rcoder file-server status` 这类只读短命令不应有写文件副作用），
+/// 仅用内存默认值补齐端口/API key 后返回。
+pub fn load_config_for_cli(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
+    if std::path::Path::new(CONFIG_FILE).exists() {
+        return load_config_with_args(cli_args);
+    }
+    info!("{CONFIG_FILE} 不存在, CLI 子命令使用内存默认配置（不写盘）");
+    let mut config = AppConfig::default();
+    if let Some(port) = cli_args.port {
+        config.port = port;
+    }
+    Ok(config)
+}
+
 /// 从文件加载配置
 fn load_config_from_file() -> anyhow::Result<AppConfig> {
     let config_content = fs::read_to_string(CONFIG_FILE)
