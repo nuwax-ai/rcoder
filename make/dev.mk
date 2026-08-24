@@ -66,7 +66,12 @@ dev-hot:
 	if [ -z "$$DEV_CID" ]; then \
 		echo "❌ rcoder 容器未运行，请先 make dev-up"; exit 1; \
 	fi; \
-	docker exec -e DEV_CONSOLE="$${DEV_CONSOLE:-0}" $$DEV_CID bash /app/src/docker/dev-hot-build.sh && \
+	docker exec -e DEV_CONSOLE="$${DEV_CONSOLE:-1}" $$DEV_CID bash /app/src/docker/dev-hot-build.sh && \
 	echo "🔄 重启 rcoder 进程（拉起新 binary）..." && \
 	docker restart $$DEV_CID >/dev/null && \
-	echo "✅ 热编译完成（日志: docker logs -f $$DEV_CID）"
+	echo "✅ 热编译完成（日志: docker logs -f $$DEV_CID）" && \
+	echo "🖥️  tokio-console 已随服务启用（独立 target 缓存无重编代价）：make console 连接面板；DEV_CONSOLE=0 make dev-hot 关闭"
+
+## 连接本地 dev 容器的 tokio-console TUI 面板（6669 已随 compose 映射宿主）
+console:
+	@tokio-console localhost:6669
