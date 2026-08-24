@@ -46,6 +46,9 @@ pub use shared_types::{SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
 /// userApp 业务路由前缀（header 未接入期的兜底判据）。
 pub const USERAPP_PATH_PREFIX: &str = "/api/userapp";
 
+/// 60000（对外入口）与 60001（TS 内部端口）的单一事实源见 shared_types。
+pub use shared_types::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT};
+
 /// 统一响应 body（上游 Incoming 与本地错误 Full 的归一）。
 type ProxyBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 
@@ -72,9 +75,9 @@ pub struct FileServerProxyConfig {
 impl Default for FileServerProxyConfig {
     fn default() -> Self {
         Self {
-            listen_port: 60000,
+            listen_port: AGENT_FILE_SERVER_PORT,
             rust_upstream_port: 8086,
-            ts_upstream_port: 60001,
+            ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,
             policy: RoutePolicy::default(),
         }
     }
@@ -82,13 +85,16 @@ impl Default for FileServerProxyConfig {
 
 /// 路由策略——同一 crate 服务两种部署形态。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RoutePolicy {
-    /// rcoder 主 pod 形态：userApp 判据（path 前缀或 header）→ rust 上游，
-    /// 其余 → ts 上游（存量域继续 TS nuwax-file-server）
+    /// 分流模式（embedFileServer=false）：userApp 判据（path 前缀或
+    /// `x-service-type` header）→ rust 上游，其余 → ts 上游
+    /// （存量域继续 TS nuwax-file-server）
     #[default]
     UserappSplit,
-    /// agent-runner 容器形态：一律 rust 上游（现状行为等价——容器内 60000 进来
-    /// 的全部进内嵌 Rust file-server；ts 上游为复用面决策后的切换预留）
+    /// 全 Rust 模式（embedFileServer=true / agent-runner 容器形态）：一律
+    /// rust 上游，全部流量由 Rust 重写的 file-server 承载（TS 热备于
+    /// [`NUWAX_FILE_SERVER_INTERNAL_PORT`]，不接收流量）
     AllRust,
 }
 
@@ -388,6 +394,29 @@ mod tests {
 
     fn cfg() -> FileServerProxyConfig {
         FileServerProxyConfig::default()
+    }
+
+    /// config.yml wire 契约：策略值为 snake_case（helm 模板渲染依赖此形态）。
+    #[test]
+    fn policy_serializes_snake_case() {
+        assert_eq!(
+            serde_yaml::to_string(&RoutePolicy::UserappSplit)
+                .unwrap()
+                .trim(),
+            "userapp_split"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&RoutePolicy::AllRust).unwrap().trim(),
+            "all_rust"
+        );
+        let parsed: RoutePolicy = serde_yaml::from_str("all_rust").unwrap();
+        assert_eq!(parsed, RoutePolicy::AllRust);
+        // 段缺 policy 字段 → 默认 UserappSplit（存量 config 兼容）
+        let parsed: FileServerProxyConfig = serde_yaml::from_str(
+            "listen_port: 60000\nrust_upstream_port: 8086\nts_upstream_port: 60001\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.policy, RoutePolicy::UserappSplit);
     }
 
     /// 主 pod 形态（UserappSplit 默认策略）：header 与 path 双判据。

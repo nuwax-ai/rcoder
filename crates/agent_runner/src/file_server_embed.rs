@@ -29,8 +29,7 @@ use file_server::{Config, FileServer};
 use file_server_proxy::{FileServerProxyConfig, RoutePolicy};
 use tracing::{info, warn};
 
-/// 对外 file-server 入口端口（proxy 监听；外部契约固定 60000）。
-const FILE_SERVER_PORT_DEFAULT: u16 = 60000;
+use file_server_proxy::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT};
 
 /// 构造合并进 agent_runner 主 Router 的 file-server 路由（无独立 listener/端口）。
 ///
@@ -52,11 +51,11 @@ pub fn merged_router() -> Result<Router, String> {
 /// `rust_upstream_port`: agent_runner HTTP 端口（main 的 `config.port`）。
 /// 失败只 `warn!` 不阻断（外部经 60000 的请求会 502，8086 直连路径不受影响）。
 pub async fn spawn_file_server_proxy(rust_upstream_port: u16) {
-    let listen_port = env_port("FILE_SERVER_PORT", FILE_SERVER_PORT_DEFAULT);
+    let listen_port = env_port("FILE_SERVER_PORT", AGENT_FILE_SERVER_PORT);
     file_server_proxy::init(FileServerProxyConfig {
         listen_port,
         rust_upstream_port,
-        ts_upstream_port: 60001,
+        ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,
         policy: RoutePolicy::AllRust,
     });
     match file_server_proxy::try_start().await {

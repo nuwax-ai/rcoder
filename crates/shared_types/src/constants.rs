@@ -116,7 +116,12 @@ pub const PGWEB_PORT: u16 = 8081;
 /// - file-server 自身默认监听端口（可被 `FILE_SERVER_PORT`/`PORT` env 覆盖）
 /// - docker_manager 在 K8s Service/containerPort 上暴露该端口
 /// - rcoder `userapp_publish` 连接该端口
+/// - file-server-proxy 对外入口端口（rcoder 主 pod 与 agent-runner 容器双形态）
 pub const AGENT_FILE_SERVER_PORT: u16 = 60_000;
+
+/// TS nuwax-file-server 的容器内部端口（file-server-proxy 的存量域上游；
+/// 60000 由代理接管后 TS 恒退此端口，两形态热切换零重启）。
+pub const NUWAX_FILE_SERVER_INTERNAL_PORT: u16 = 60_001;
 
 // === K8s 配置 ===
 

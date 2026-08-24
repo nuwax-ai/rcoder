@@ -2256,6 +2256,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "serde",
+ "serde_yaml",
  "shared_types",
  "tokio",
  "tokio-util",
