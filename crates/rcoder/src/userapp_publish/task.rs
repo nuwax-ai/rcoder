@@ -27,6 +27,9 @@ const RING_CAP: usize = 1000;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 /// broadcast 通道容量(实时 SSE fan-out)。
 const BROADCAST_CAP: usize = 256;
+/// 终态 ring 截尾保留条数(终态事件 + 尾部上下文)。终态任务快照的内存
+/// 从典型 ~100KB 压到 ~2-3KB，终态后重连 replay 语义不变(见 publish_mut)。
+const TERMINAL_KEEP_TAIL: usize = 8;
 
 /// 任务可变状态:全部收在【一把】`state` 锁后(status/seq/history 同步变更,保证一致性)。
 struct TaskState {
@@ -171,7 +174,7 @@ impl PublishTask {
 
     /// 发进度事件:取一次 state 锁 → `publish_mut` → broadcast → 释放。终态后丢弃后续事件。
     pub async fn emit(&self, event: PublishEvent) {
-        let (terminal_payload, stage_payload) = {
+        let (terminal_payload, stage_payload, log_detail) = {
             let mut s = self.state.lock().await;
             let Some((seq, event, terminal)) = publish_mut(&mut s, event) else {
                 return;
@@ -203,13 +206,21 @@ impl PublishTask {
                 }),
                 _ => None,
             });
+            // 追溯日志材料在锁内构造（轻量），日志本身锁外打——文件 IO 不进 state 锁
+            let log_detail = event_log_detail(seq, terminal, &event);
             // broadcast 必须在持 state 锁内:与 subscribe 的"创建 receiver + 读 replay"互斥串行,
             // 否则同一事件可能既进 replay 又被 receiver 收到 → 重复(broadcast::send 非阻塞,持锁安全)。
             if let Err(send_err) = self.tx.send((seq, event)) {
                 tracing::warn!("build progress event send failed (consumer gone): {send_err}");
             }
-            (terminal_payload.flatten(), stage_payload)
+            (terminal_payload.flatten(), stage_payload, log_detail)
         };
+        // 追溯通道（用户拍板复用主日志）：事件全过程进 logs/rcoder.YYYY-MM-DD
+        //（jsonl 按天滚动），grep task_id 回溯任务全程；终态 error/release_id
+        // 全文留痕——被 64KB ring 上限截掉的超长错误在此完整可查
+        tracing::info!(target: "userapp_publish",
+            task_id = %self.id, app_id = %self.app_id, detail = %log_detail,
+            "publish event");
         // 钩子在锁外触发（闭包内部自行 spawn 异步落库，不阻塞 emit 热路径）
         if let Some(mut payload) = terminal_payload {
             let at = Utc::now().timestamp();
@@ -320,6 +331,28 @@ fn is_terminal_status(status: PublishTaskStatus) -> bool {
     )
 }
 
+/// 事件的单行日志摘要（emit 的追溯留痕）：seq + 终态标记 + 事件类型。
+/// 终态带 error/release_id **全文**（排障核心——被 64KB ring 上限截掉的
+/// 超长错误在此完整）；BuildProgress 的类型化 data 截短防巨长行。
+fn event_log_detail(seq: u64, terminal: bool, event: &PublishEvent) -> String {
+    let kind = match event {
+        PublishEvent::Stage { stage } => format!("Stage({stage})"),
+        PublishEvent::BuildProgress { data } => {
+            let raw = format!("{data:?}");
+            let brief: String = raw.chars().take(160).collect();
+            format!("BuildProgress({brief})")
+        }
+        PublishEvent::Cancelling => "Cancelling".to_string(),
+        PublishEvent::Completed { release_id } => format!(
+            "Completed(release_id={})",
+            release_id.as_deref().unwrap_or("-")
+        ),
+        PublishEvent::Failed { error } => format!("Failed(error={error})"),
+        PublishEvent::Cancelled => "Cancelled".to_string(),
+    };
+    format!("seq={seq} terminal={terminal} {kind}")
+}
+
 /// 临界逻辑(自由函数,吃 `&mut TaskState`、无 `&self`):终态检查 → #11 截断 → apply → seq → ring。
 /// 返回 `(seq, event, terminal)`:event 供调用方在【持 state 锁期间】做 broadcast(必须在锁内,
 /// 与 subscribe 的"创建 receiver + 读 replay"串行,防同一事件既进 replay 又进 broadcast);
@@ -351,6 +384,17 @@ fn publish_mut(state: &mut TaskState, event: PublishEvent) -> Option<(u64, Publi
         state.history.pop_front();
     }
     state.history.push_back((seq, event.clone()));
+    // 终态瘦身：任务结束后 ring 的唯一服务窗口是"同副本客户端终态后短期
+    // 重连，replay 尾部终态事件收结果"——保留最后 KEEP_TAIL 条足够，全量
+    // 保留（典型 ~100KB/任务 × 24h TTL）纯属浪费。被 drain 的旧事件超出
+    // 任何重连游标需求（seq 过滤 >=，迟订阅者要的是终态在不在尾巴上）。
+    // 追溯全量过程走主日志（emit 的 info 留痕）。
+    if terminal {
+        let overflow = state.history.len().saturating_sub(TERMINAL_KEEP_TAIL);
+        if overflow > 0 {
+            state.history.drain(..overflow);
+        }
+    }
     Some((seq, event, terminal))
 }
 
@@ -379,6 +423,49 @@ fn apply_event(state: &mut TaskState, event: &PublishEvent) {
 mod tests {
     use super::*;
     use shared_types::BuildProgressEvent;
+
+    /// 终态截尾：超过 KEEP_TAIL 的进度事件后进终态 → ring 只留尾部
+    /// TERMINAL_KEEP_TAIL 条，末条为终态事件、seq 严格单调；迟订阅者
+    ///（from_seq=0）replay 仍以终态收尾。
+    #[tokio::test]
+    async fn terminal_trims_ring_to_tail() {
+        let task = PublishTask::new("app-t".into(), "app-t".into(), PublishTaskKind::Build);
+        for i in 0..(TERMINAL_KEEP_TAIL * 3) {
+            task.emit(PublishEvent::BuildProgress {
+                data: BuildProgressEvent::Building {
+                    service: format!("svc-{i}"),
+                },
+            })
+            .await;
+        }
+        task.emit(PublishEvent::Failed {
+            error: "boom".into(),
+        })
+        .await;
+
+        let s = task.state.lock().await;
+        assert!(
+            s.history.len() <= TERMINAL_KEEP_TAIL,
+            "terminal must trim ring to tail, got {}",
+            s.history.len()
+        );
+        assert_eq!(s.history.len(), TERMINAL_KEEP_TAIL);
+        let (_last_seq, last_event) = s.history.back().expect("non-empty after terminal");
+        assert!(matches!(last_event, PublishEvent::Failed { .. }));
+        // seq 严格单调（截掉的是头部旧事件，保留段连续性不受影响）
+        let seqs: Vec<u64> = s.history.iter().map(|(seq, _)| *seq).collect();
+        let sorted_unique = seqs.windows(2).all(|w| w[0] < w[1]);
+        assert!(sorted_unique, "seqs strictly increasing: {seqs:?}");
+        drop(s);
+
+        // 迟订阅者（from_seq=0）replay 语义：末条为终态事件（handler 遇终态关流）
+        let (replay, _rx) = task.subscribe(0).await;
+        assert!(!replay.is_empty());
+        assert!(matches!(
+            replay.last().map(|(_, e)| e),
+            Some(PublishEvent::Failed { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn subscription_has_no_gap_between_replay_and_live_events() {

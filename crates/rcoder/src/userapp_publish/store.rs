@@ -32,7 +32,9 @@ pub const STALE_TASK_SECS: i64 = 2 * 60 * 60;
 /// sqlx 默认的 30s pool acquire）。
 const PG_CREATE_TIMEOUT_SECS: u64 = 5;
 /// 防止异常调用方无限创建任务。达上限时优先淘汰最旧终态任务。
-const MAX_RETAINED_TASKS: usize = 1_000;
+/// 10000：终态任务经 ring 截尾（task.rs TERMINAL_KEEP_TAIL）瘦身到 ~2-3KB，
+/// 全终态稳态 ≈ 20-30MB 可控；任务过程追溯走主日志（不占内存）。
+const MAX_RETAINED_TASKS: usize = 10_000;
 
 /// 全局任务表(内存;短期。发布产物由 app_manager release index 持久)。
 pub struct PublishTaskStore {
