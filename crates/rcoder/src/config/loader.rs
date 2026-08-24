@@ -15,17 +15,11 @@ use super::{ApiKeyAuthConfig, AppConfig, CONFIG_FILE, CliArgs, generate_random_a
 
 pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
     let mut config = if std::path::Path::new(CONFIG_FILE).exists() {
-        // 尝试从文件加载配置
-        match load_config_from_file() {
-            Ok(file_config) => {
-                info!("Config file already loaded: {}", CONFIG_FILE);
-                file_config
-            }
-            Err(e) => {
-                warn!("Failed to load config file, using default config: {}", e);
-                AppConfig::default()
-            }
-        }
+        // fail fast: 配置文件存在但解析失败 → 直接退出（不降级默认配置带病运行）。
+        // 历史教训（0.1.233 部署事故）：降级默认值后 docker_config 无镜像，
+        // 报错与真因（configmap 模板缩进坏）隔三层，CrashLoop 排障一小时；
+        // 真实解析错误含行号列号，直接暴露才是最短路径
+        load_config_from_file()?
     } else {
         info!(
             "config file not found, created default config file: {}",
@@ -248,4 +242,43 @@ fn create_default_config_file(_config: &AppConfig) -> anyhow::Result<()> {
     info!("Created default config file: {}", CONFIG_FILE);
     info!(" Loaded API Key (not set)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+    use std::env;
+    use std::fs;
+    use std::process;
+
+    /// fail fast 防回归：配置文件存在但解析失败必须返回 Err（不降级默认配置）。
+    /// 历史教训（0.1.233 部署事故）：降级默认值后报错与真因隔三层
+    /// （configmap 缩进坏 → missing field 被吞 → 默认 docker_config 无镜像
+    /// → CrashLoop 报 image=None）。
+    #[test]
+    fn malformed_config_file_fails_fast_instead_of_defaulting() {
+        let dir = env::temp_dir().join(format!("rcoder-badcfg-{}", process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        // health_check 缺必填字段（复刻事故形态：模板缩进坏导致字段跌出 health_check）
+        fs::write(
+            dir.join(CONFIG_FILE),
+            "proxy_config:\n  listen_port: 8088\n  health_check:\n    enabled: true\n",
+        )
+        .expect("write");
+
+        let origin = env::current_dir().expect("cwd");
+        env::set_current_dir(&dir).expect("chdir");
+        let result = load_config_with_args(CliArgs::try_parse_from(["rcoder"]).expect("cli args"));
+        // 恢复 cwd 尽早执行（断言失败也不留脏 cwd）
+        let _ = env::set_current_dir(origin);
+        fs::remove_dir_all(&dir).ok();
+
+        let err = result.expect_err("坏配置必须 fail fast 而非降级默认配置");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to parse config file"),
+            "错误信息应指向配置解析: {msg}"
+        );
+    }
 }
