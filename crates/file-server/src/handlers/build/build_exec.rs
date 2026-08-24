@@ -33,14 +33,7 @@ pub(crate) async fn build_project(
     Query(q): Query<BuildQuery>,
 ) -> Result<Json<BuildDone>, AppError> {
     let path = project_path(&state, &q).await?;
-    build_project_impl(
-        &state,
-        &path,
-        &q.project_id,
-        &q.project_id,
-        q.base_path.as_deref(),
-    )
-    .await?;
+    build_project_impl(&state, &path, &q.project_id, q.base_path.as_deref()).await?;
     Ok(Json(BuildDone {
         success: true,
         message: "Build completed".to_string(),
@@ -48,22 +41,22 @@ pub(crate) async fn build_project(
     }))
 }
 
-/// build 的 workspace 无关实现（install + build + dist 拷贝, 响应归各域壳层）。
-///
-/// `key` 是 build-guard/日志读取的 key（UserApp 域传 `userapp:{appId}`, 与 web 项目
-/// projectId 空间隔离, log_dir 会剥前缀）; `log_id` 是日志目录与 dist 目标目录名
-/// （UserApp 域传裸 appId, 目录名不带冒号）。
+/// **web/computer 域**的编译实现（package.json scripts.build + pnpm install
+/// + vite build + dist 拷贝）——本函数就是 package.json 引擎本体，仅服务
+/// vite 前端项目（`GET /api/build/build`）。
+/// UserApp 域（Java/Go 多服务）**不走本函数**：其编译入口是 manifest 驱动
+/// 的 `service::userapp::build_workspace_package`（project.manifest.toml 的
+/// [build].command，/api/userapp/build 与 /api/userapp/dev/rebuild 共用）。
 pub(crate) async fn build_project_impl(
     state: &AppState,
     path: &std::path::Path,
-    key: &str,
-    log_id: &str,
+    project_id: &str,
     base_path: Option<&str>,
 ) -> Result<(), AppError> {
     if !path.exists() {
         return Err(AppError::resource("project does not exist"));
     }
-    let log_dir = crate::service::dev_server::log::log_dir(&state.config, key);
+    let log_dir = crate::service::dev_server::log::log_dir(&state.config, project_id);
     tokio::fs::create_dir_all(&log_dir)
         .await
         .map_err(|e| AppError::system(format!("create build log dir: {e}")))?;
@@ -88,7 +81,7 @@ pub(crate) async fn build_project_impl(
 
     // 并发控制: 全局信号量 + 项目级互斥 (对齐 nuwax buildingProjects + MAX_BUILD_CONCURRENCY)
     // 立即拒绝超容量/同项目重复 build；guard 在所有退出路径自动释放。
-    let _build_guard = state.build_manager.try_start(key)?;
+    let _build_guard = state.build_manager.try_start(project_id)?;
 
     // install (对齐 nuwax: 失败则整体 build 失败, 透传 "Dependency installation failed")
     let install_logs = LogFiles::new(&main_log, &temp_log);
@@ -131,11 +124,11 @@ pub(crate) async fn build_project_impl(
 
     // 拷贝 dist → {DIST_TARGET_DIR}/{projectId}/dist/ (Rust fs, 无 rm -rf shell;
     // 错误为类型化 io::Error, 路径经 PathBuf::join 无注入)
-    let dst = state.config.dist_target_dir.join(log_id).join("dist");
+    let dst = state.config.dist_target_dir.join(project_id).join("dist");
     let src = path.join("dist");
     if !src.exists() {
         // 无产物视为成功收尾 (对齐旧壳行为), 响应构造归壳层
-        tracing::warn!(key, path = %src.display(), "build produced no dist directory");
+        tracing::warn!(project_id, path = %src.display(), "build produced no dist directory");
         return Ok(());
     }
     let src2 = src.clone();
