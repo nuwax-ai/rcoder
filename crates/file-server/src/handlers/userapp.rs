@@ -14,9 +14,12 @@
 //! 详见 `docs/application-management-service-v2-design.md` §5。
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
+
+use crate::service::userapp::UserappBuildTask;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -359,18 +362,7 @@ pub(crate) async fn cancel_task(
                 already_terminal: Some(true),
             });
         }
-        task.cancel();
-        // 硬 cancel：kill 当前 build 子进程组（run_command_to_log 用 process_group(0)，pid==pgid）。
-        if let Some(pid) = task.pid() {
-            let killed = crate::service::dev_server::process::kill_process_group(pid);
-            tracing::info!(%task_id, pid, killed, "build task cancelled, process group signalled");
-        } else {
-            tracing::info!(%task_id, "build task cancelled (no active pid; soft cancel via loop check)");
-        }
-        // 主动 emit Cancelled：若 build 在循环间隙（非 build_generic 内），靠此置终态；
-        // 若在 build_generic 内被 kill，错误分支的 is_cancelled 分支会 emit Cancelled
-        //（终态保护丢弃这里的重复）。
-        task.emit(BuildProgressEvent::Cancelled).await;
+        cancel_build_task(&task).await;
         Ok(CancelData {
             task_id,
             status: Some("cancelled".to_string()),
@@ -378,6 +370,23 @@ pub(crate) async fn cancel_task(
         })
     };
     reply(result.await)
+}
+
+/// 任务的取消内核（soft cancel + kill 编译进程组 + emit Cancelled 终态）。
+/// cancel_task handler 与 dev_stop 的在途任务联动取消共用。
+pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
+    task.cancel();
+    // 硬 cancel：kill 当前 build 子进程组（run_command_to_log 用 process_group(0)，pid==pgid）。
+    if let Some(pid) = task.pid() {
+        let killed = crate::service::dev_server::process::kill_process_group(pid);
+        tracing::info!(task_id = %task.id, pid, killed, "build task cancelled, process group signalled");
+    } else {
+        tracing::info!(task_id = %task.id, "build task cancelled (no active pid; soft cancel via loop check)");
+    }
+    // 主动 emit Cancelled：若 build 在循环间隙（非 build_generic 内），靠此置终态；
+    // 若在 build_generic 内被 kill，错误分支的 is_cancelled 分支会 emit Cancelled
+    //（终态保护丢弃这里的重复）。
+    task.emit(BuildProgressEvent::Cancelled).await;
 }
 
 /// 检测项目类型（分析文件结构推断 language/framework/build tool）

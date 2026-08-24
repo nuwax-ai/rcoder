@@ -33,6 +33,8 @@ use manifest::{ReleaseMetadata, build_release_lock, read_workspace_manifest};
 
 use tasks::{BuildProgressEvent, BuildTask, BuildTaskId, BuildTaskKind, BuildTaskStore};
 
+pub(crate) use tasks::BuildTask as UserappBuildTask;
+
 /// 整体包产物文件名（放在 workspace 根，供 `GET /api/userapp/static` 下载）。
 pub const WORKSPACE_PACKAGE_PREFIX: &str = "workspace-package-";
 

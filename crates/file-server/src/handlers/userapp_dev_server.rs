@@ -141,12 +141,26 @@ pub(crate) async fn dev_start(
     responses(crate::openapi::JsonApiResponses),
     tag = "UserApp"
 )]
+/// `POST /api/userapp/dev/stop`: 停止开发服务（按 appId 定位进程组, 无需 pid）。
+/// **联动取消该 app 在途的 start/restart 任务**——否则编译中的任务会在
+/// 编译完成后把刚停的服务重新拉起（停止意图被异步任务推翻）。
 pub(crate) async fn dev_stop(
     State(state): State<AppState>,
     Json(body): Json<DevOpBody>,
 ) -> Result<Json<UserappDevStopped>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let key = dev_key(&body.app_id);
+    // 先取消在途任务（kill 编译进程组 + 终态 Cancelled），再停服务——
+    // 顺序保证任务侧不会再有 start 动作追上来
+    for task in state.build_tasks.active_tasks_for_app(&body.app_id).await {
+        if !task.is_terminal().await {
+            tracing::info!(
+                app_id = %body.app_id, task_id = %task.id,
+                "[DEV_STOP] cancelling in-flight dev task (stop intent)"
+            );
+            super::userapp::cancel_build_task(&task).await;
+        }
+    }
     let stopped: StoppedDev = state.dev_server.stop_dev(&key).await?;
     state.log_cache.delete(&key)?;
     let all_killed = stopped.killed_pids.iter().all(|k| k.killed);
@@ -269,7 +283,27 @@ async fn spawn_dev_task(
         )
         .await;
         let outcome = async {
+            // Start 快速路径：服务已在跑 → 跳过编译直接完成（恢复旧同步
+            // start 的廉价幂等——否则白编译数分钟且已运行进程不加载新代码；
+            // 要上新代码用 restart）
+            if matches!(action, DevTaskAction::Start)
+                && state
+                    .dev_server
+                    .list_dev()?
+                    .iter()
+                    .any(|p| p.project_id == key)
+            {
+                tracing::info!(%app_id, "dev already running; start task completes without rebuild");
+                return Ok::<(), AppError>(());
+            }
             result?;
+            // 编译成功但任务已被取消（cancel 落在编译完成后的打包/探活窗口
+            // ——pid 已清零只软取消）：不再执行启停，保持"取消=无副作用"
+            // 与终态 Cancelled 一致
+            if task_clone.is_cancelled() {
+                tracing::info!(%app_id, "dev task cancelled after build; skipping start/restart");
+                return Ok(());
+            }
             // 编译成功：按 action 启动/重启（app-cli 全栈新代码生效；失败整体
             // Failed——restart 场景旧服务已被 stop，语义上本轮失败，下次重试）
             match action {
@@ -303,11 +337,16 @@ async fn spawn_dev_task(
                     .await;
             }
             Err(e) => {
-                task_clone
-                    .emit(shared_types::BuildProgressEvent::Failed {
-                        error: e.to_string(),
-                    })
-                    .await;
+                // 守卫对齐兄弟实现（start_build_task）：cancel 已置终态时不再
+                // emit Failed（防"cancel 接口返回 cancelled 但终态是 Failed"
+                // 的竞态不一致）
+                if !task_clone.is_cancelled() && !task_clone.is_terminal().await {
+                    task_clone
+                        .emit(shared_types::BuildProgressEvent::Failed {
+                            error: e.to_string(),
+                        })
+                        .await;
+                }
             }
         }
     });

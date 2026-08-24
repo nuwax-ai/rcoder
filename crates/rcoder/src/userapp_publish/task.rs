@@ -218,7 +218,7 @@ impl PublishTask {
         // 追溯通道（用户拍板复用主日志）：事件全过程进 logs/rcoder.YYYY-MM-DD
         //（jsonl 按天滚动），grep task_id 回溯任务全程；终态 error/release_id
         // 全文留痕——被 64KB ring 上限截掉的超长错误在此完整可查
-        tracing::info!(target: "userapp_publish",
+        tracing::info!(target: "rcoder::userapp_publish",
             task_id = %self.id, app_id = %self.app_id, detail = %log_detail,
             "publish event");
         // 钩子在锁外触发（闭包内部自行 spawn 异步落库，不阻塞 emit 热路径）
@@ -338,8 +338,9 @@ fn event_log_detail(seq: u64, terminal: bool, event: &PublishEvent) -> String {
     let kind = match event {
         PublishEvent::Stage { stage } => format!("Stage({stage})"),
         PublishEvent::BuildProgress { data } => {
-            let raw = format!("{data:?}");
-            let brief: String = raw.chars().take(160).collect();
+            // 按变体取关键字段（不全文 Debug 格式化——锁内每事件省一次
+            // 全量序列化，且字段名元数据不吃掉截断窗口）
+            let brief = build_progress_brief(data);
             format!("BuildProgress({brief})")
         }
         PublishEvent::Cancelling => "Cancelling".to_string(),
@@ -347,10 +348,37 @@ fn event_log_detail(seq: u64, terminal: bool, event: &PublishEvent) -> String {
             "Completed(release_id={})",
             release_id.as_deref().unwrap_or("-")
         ),
-        PublishEvent::Failed { error } => format!("Failed(error={error})"),
+        // error 截 256KB：远端构建错误全文透传长度不可控（巨长单行拖慢同步
+        // writer、撑大按天滚动的 jsonl）；全文真源在 PG 终态行
+        PublishEvent::Failed { error } => {
+            format!("Failed(error={})", truncate_chars(error, 256 * 1024))
+        }
         PublishEvent::Cancelled => "Cancelled".to_string(),
     };
     format!("seq={seq} terminal={terminal} {kind}")
+}
+
+/// 按变体的 build 进度摘要（service 名 + 错误首段），截 160 字符。
+fn build_progress_brief(data: &shared_types::BuildProgressEvent) -> String {
+    use shared_types::BuildProgressEvent as E;
+    let raw = match data {
+        E::Stage { stage } => format!("Stage({stage})"),
+        E::Building { service } | E::BuildOk { service } => service.to_string(),
+        E::BuildFail { service, error } => {
+            format!("{service}: {}", truncate_chars(error, 120))
+        }
+        E::Log { service, line } => format!("{service}: {}", truncate_chars(line, 120)),
+        other => format!("{other:?}"),
+    };
+    truncate_chars(&raw, 160).to_string()
+}
+
+/// 字符边界安全的截断（不切多字节字符中段）。
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
 }
 
 /// 临界逻辑(自由函数,吃 `&mut TaskState`、无 `&self`):终态检查 → #11 截断 → apply → seq → ring。
@@ -389,10 +417,14 @@ fn publish_mut(state: &mut TaskState, event: PublishEvent) -> Option<(u64, Publi
     // 保留（典型 ~100KB/任务 × 24h TTL）纯属浪费。被 drain 的旧事件超出
     // 任何重连游标需求（seq 过滤 >=，迟订阅者要的是终态在不在尾巴上）。
     // 追溯全量过程走主日志（emit 的 info 留痕）。
+    // shrink_to_fit 必不可少：VecDeque drain 不归还缓冲区——任务创建时
+    // with_capacity(RING_CAP) 预分配了 88KB/千槽，截到 8 条后容量仍 1000，
+    // 10000 容量的终态滞留将全额占用 ~840MB（与瘦身目标背道而驰）。
     if terminal {
         let overflow = state.history.len().saturating_sub(TERMINAL_KEEP_TAIL);
         if overflow > 0 {
             state.history.drain(..overflow);
+            state.history.shrink_to_fit();
         }
     }
     Some((seq, event, terminal))
@@ -453,6 +485,13 @@ mod tests {
         let (_last_seq, last_event) = s.history.back().expect("non-empty after terminal");
         assert!(matches!(last_event, PublishEvent::Failed { .. }));
         // seq 严格单调（截掉的是头部旧事件，保留段连续性不受影响）
+        // H1 防回归：drain 不归还缓冲区——必须 shrink_to_fit，否则
+        // with_capacity(1000) 的 88KB 千槽随终态滞留 24h（10000 容量 ≈840MB）
+        assert!(
+            s.history.capacity() <= TERMINAL_KEEP_TAIL * 2,
+            "terminal trim must shrink ring buffer, capacity={}",
+            s.history.capacity()
+        );
         let seqs: Vec<u64> = s.history.iter().map(|(seq, _)| *seq).collect();
         let sorted_unique = seqs.windows(2).all(|w| w[0] < w[1]);
         assert!(sorted_unique, "seqs strictly increasing: {seqs:?}");

@@ -101,6 +101,11 @@ struct TaskState {
 /// 保持在锁外:供 cancel/store/同步 on_pid 回调无锁读写。
 pub struct BuildTask {
     pub id: BuildTaskId,
+    /// 所属 app（锁外不可变：供 store 在 map 锁内无锁做 per-app 扫描——
+    /// dev_stop 联动取消在途任务用，与 rcoder PublishTask 的 app_id 同款设计）
+    pub app_id: String,
+    /// 任务类型（锁外不可变，同上）
+    pub kind: BuildTaskKind,
     state: Mutex<TaskState>,
     tx: broadcast::Sender<(u64, BuildProgressEvent)>,
     cancelled: AtomicBool,
@@ -117,6 +122,8 @@ impl BuildTask {
         let now = Utc::now().timestamp();
         Arc::new(Self {
             id: Uuid::now_v7().simple().to_string(),
+            app_id: app_id.clone(),
+            kind,
             state: Mutex::new(TaskState {
                 app_id,
                 kind,
@@ -391,6 +398,20 @@ impl BuildTaskStore {
 
     pub async fn get(&self, id: &str) -> Option<Arc<BuildTask>> {
         self.map.lock().await.get(id).cloned()
+    }
+
+    /// 该 app 的在途（非终态）任务列表——dev_stop 联动取消用：不取消的话，
+    /// 编译中的 start/restart 任务会在编译完成后把刚停的服务重新拉起，
+    /// 停止意图被异步任务推翻。map 锁内原子读 terminal_at + 锁外不可变
+    /// app_id，无锁嵌套。
+    pub async fn active_tasks_for_app(&self, app_id: &str) -> Vec<Arc<BuildTask>> {
+        self.map
+            .lock()
+            .await
+            .values()
+            .filter(|t| t.terminal_at.load(Ordering::Acquire) == 0 && t.app_id == app_id)
+            .cloned()
+            .collect()
     }
 }
 
