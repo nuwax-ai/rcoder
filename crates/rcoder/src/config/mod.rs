@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 mod storage;
@@ -31,6 +31,32 @@ pub struct CliArgs {
     /// 默认后端服务端口
     #[arg(long = "backend-port")]
     pub default_backend_port: Option<u16>,
+
+    /// 管理子命令 (不传 = 正常启动服务)
+    #[command(subcommand)]
+    pub command: Option<AdminCommand>,
+}
+
+/// 管理子命令 (操作运行中的 rcoder 进程, 经 localhost HTTP)。
+#[derive(Subcommand, Debug)]
+pub enum AdminCommand {
+    /// 管理 60000 file-server 分流反向代理 (开发测试期 TS↔分流代理切换对比)
+    FileServer {
+        #[command(subcommand)]
+        action: FileServerAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum FileServerAction {
+    /// 启动分流反向代理 (幂等; 端口取 config.yml file_server_proxy 段, 默认 60000)
+    Start,
+    /// 停止并释放 60000 端口 (幂等; 10s 超时强制) —— 释放后可起 TS nuwax-file-server 直跑对比
+    Stop,
+    /// 停止后重新启动
+    Restart,
+    /// 查看运行状态
+    Status,
 }
 
 // 从 shared_types 导入 API Key 鉴权配置

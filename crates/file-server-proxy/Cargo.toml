@@ -16,13 +16,19 @@ workspace = true
 
 [dependencies]
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-async-trait = { workspace = true }
+bytes = { workspace = true }
+
+# 轻量 HTTP 反代用 hyper: 生命周期需可编程 start/stop/restart
+# (pingora Server run_forever 无停机 API, 无法支撑运行时切换 60000 归属)
+hyper = { workspace = true, features = ["client"] }
+hyper-util = { workspace = true, features = ["client", "client-legacy"] }
+http-body-util = { workspace = true }
 
 # 跨 crate 契约: x-service-type 分流 header 定义在 shared_types（防双头事实源）
 shared_types = { workspace = true }
 
-# Pingora dependencies - 与 rcoder-proxy 同源的真正 Pingora 库
-pingora-core = { workspace = true }
-pingora-proxy = { workspace = true }
+[dev-dependencies]
+tokio = { workspace = true }

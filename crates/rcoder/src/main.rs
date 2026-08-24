@@ -246,20 +246,22 @@ async fn main() -> anyhow::Result<()> {
     file_server_embed::register_runtime(ws_runtime);
 
     // 60000 file-server 分流反代（Java/外部入口，独立 crate file-server-proxy）：
-    // /api/userapp* → 本主服务（8086），其余 → TS nuwax-file-server（60001）。
-    // config.yml 无 file_server_proxy 段则不启动（本地 dev 形态）。
-    if let Some(fs_proxy_config) = bootstrap_result.config.file_server_proxy.clone() {
-        let (fs_proxy_shutdown_tx, fs_proxy_shutdown_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            // 持有 sender 至任务结束——进程生命周期内不触发关闭信号
-            let _hold = fs_proxy_shutdown_tx;
-            if let Err(e) =
-                file_server_proxy::run_file_server_proxy(fs_proxy_config, fs_proxy_shutdown_rx)
-                    .await
-            {
-                error!("file-server 分流代理启动失败: {e}");
-            }
-        });
+    // x-service-type: userapp → 本主服务（8086），其余 → TS nuwax-file-server（60001）。
+    // 配置无条件注册（段缺失用默认端口，供运行时 `rcoder file-server start` 拉起）；
+    // 段存在时自动启动（本地 dev 无段则不监听 60000）。运行时启停经
+    // /api/system/file-server/*（`rcoder file-server {start,stop,restart,status}`）。
+    file_server_proxy::init(
+        bootstrap_result
+            .config
+            .file_server_proxy
+            .clone()
+            .unwrap_or_default(),
+    );
+    if bootstrap_result.config.file_server_proxy.is_some() {
+        // 同步 bind 语义：启动失败（如端口被占）此刻即报，不留到首个请求
+        if let Err(e) = file_server_proxy::try_start().await {
+            error!("file-server 分流代理启动失败: {e}");
+        }
     }
 
     let state = Arc::new(

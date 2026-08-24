@@ -1,5 +1,6 @@
-//! 分流反向代理集成测试：真实 pingora 代理 + 两个标记上游，
-//! 验证 `x-service-type` header 决定业务归属（Rust/TS 上游）全链路。
+//! 分流反向代理集成测试：真实 hyper 代理 + 两个标记上游，
+//! 验证 `x-service-type` header 决定业务归属（Rust/TS 上游）全链路，
+//! 以及 try_start/stop 生命周期（端口释放后可重启）。
 
 use file_server_proxy::{FileServerProxyConfig, SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,12 +21,16 @@ async fn spawn_marker_upstream(port: u16, marker: &'static str) {
             };
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
-                let _ = sock.read(&mut buf).await;
+                if let Err(e) = sock.read(&mut buf).await {
+                    eprintln!("marker upstream read error: {e}");
+                }
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{marker}",
                     marker.len()
                 );
-                let _ = sock.write_all(resp.as_bytes()).await;
+                if let Err(e) = sock.write_all(resp.as_bytes()).await {
+                    eprintln!("marker upstream write error: {e}");
+                }
             });
         }
     });
@@ -48,35 +53,30 @@ async fn http_get(path: &str, headers: &[(&str, &str)]) -> String {
 }
 
 #[tokio::test]
-async fn service_type_header_decides_upstream() {
-    // macOS 沙箱下 rustls-native-certs 读 keychain 受限（pingora Server::new 初始化
-    // 平台根证书失败）；指定 PEM 绕过。生产容器为 Linux（/etc/ssl/certs），不受影响。
-    // 必须 earliest：在任何 Server::new 之前生效。
-    // SAFETY: 测试启动早期、tokio worker 尚未并发读该 env，无实际竞争窗口。
-    unsafe {
-        if std::env::var("SSL_CERT_FILE").is_err() {
-            std::env::set_var("SSL_CERT_FILE", "/etc/ssl/cert.pem");
-        }
-    }
-
+async fn service_type_header_decides_upstream_and_lifecycle() {
     spawn_marker_upstream(RUST_UPSTREAM_PORT, "upstream-rust").await;
     spawn_marker_upstream(TS_UPSTREAM_PORT, "upstream-ts").await;
 
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let proxy = tokio::spawn(async move {
-        let cfg = FileServerProxyConfig {
-            listen_port: PROXY_PORT,
-            rust_upstream_port: RUST_UPSTREAM_PORT,
-            ts_upstream_port: TS_UPSTREAM_PORT,
-        };
-        // 持有 sender 防止代理提前收到关闭信号
-        let _hold = _shutdown_tx;
-        file_server_proxy::run_file_server_proxy(cfg, shutdown_rx).await
+    file_server_proxy::init(FileServerProxyConfig {
+        listen_port: PROXY_PORT,
+        rust_upstream_port: RUST_UPSTREAM_PORT,
+        ts_upstream_port: TS_UPSTREAM_PORT,
     });
-    // 等代理完成 bind 预检与 pingora 启动
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // 同一路径, header 决定归属
+    // ── 生命周期: start → status ──
+    assert!(file_server_proxy::status().await.is_none(), "初始未运行");
+    let addr = file_server_proxy::try_start().await.expect("start");
+    assert!(addr.contains(&PROXY_PORT.to_string()));
+    assert!(file_server_proxy::status().await.is_some(), "运行中");
+    // 幂等: 重复 start 返回同一地址
+    assert_eq!(
+        file_server_proxy::try_start().await.expect("re-start"),
+        addr
+    );
+    // 等代理 accept 循环就绪
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // ── 分流: 同一路径, header 决定归属 ──
     let path = "/api/computer/create-workspace";
     let no_header = http_get(path, &[]).await;
     assert!(
@@ -100,5 +100,25 @@ async fn service_type_header_decides_upstream() {
     let health = http_get("/health", &[]).await;
     assert!(health.contains("upstream-ts"), "/health 应走 TS: {health}");
 
-    let _ = proxy.abort();
+    // ── 生命周期: stop → 端口释放 → 可重启 ──
+    file_server_proxy::stop().await.expect("stop");
+    assert!(file_server_proxy::status().await.is_none(), "停止后无状态");
+    // stop 返回时端口已释放: 立即重 bind 必须成功（外部服务如 TS 可立即占用 60000）
+    let rebind = tokio::net::TcpListener::bind(("127.0.0.1", PROXY_PORT))
+        .await
+        .expect("stop 返回后端口应已释放");
+    drop(rebind);
+
+    // 重启后分流继续工作
+    file_server_proxy::try_start()
+        .await
+        .expect("re-start after stop");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let again = http_get(path, &[(SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP)]).await;
+    assert!(
+        again.contains("upstream-rust"),
+        "重启后 userapp 仍走 Rust: {again}"
+    );
+
+    file_server_proxy::stop().await.expect("final stop");
 }

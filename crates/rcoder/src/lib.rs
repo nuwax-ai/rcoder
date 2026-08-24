@@ -16,6 +16,7 @@ pub mod config_watcher;
 #[cfg(feature = "console")]
 pub(crate) mod console_obs;
 pub mod docker_init;
+pub mod file_server_admin;
 pub mod file_server_embed;
 pub mod grpc;
 pub mod handler;

@@ -279,6 +279,10 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
     // userApp 文件域转发层: /api/userapp/{*rest} 通配透传 + create-workspace 显式入口
     let userapp_forward_routes = crate::userapp_forward::routes().with_state(state.clone());
 
+    // file-server 分流代理运行时启停 (无 state, 受全局 API key 中间件保护;
+    // `rcoder file-server {start,stop,restart,status}` CLI 的服务端)
+    let file_server_admin_routes = crate::file_server_admin::admin_routes();
+
     let mut router = Router::new()
         .merge(health_routes)
         .merge(api_routes)
@@ -288,7 +292,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .merge(agent_mgmt_routes)
         .merge(app_manager_routes)
         .merge(userapp_publish_routes)
-        .merge(userapp_forward_routes);
+        .merge(userapp_forward_routes)
+        .merge(file_server_admin_routes);
 
     // 仅在启用 debug feature 时添加调试路由
     #[cfg(feature = "debug")]

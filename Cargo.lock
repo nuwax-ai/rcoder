@@ -2250,12 +2250,14 @@ dependencies = [
 name = "file-server-proxy"
 version = "0.1.3"
 dependencies = [
- "async-trait",
- "pingora-core",
- "pingora-proxy",
+ "bytes 1.12.1",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "shared_types",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
