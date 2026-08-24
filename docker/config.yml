@@ -30,6 +30,14 @@ cleanup_config:
   # 默认值: 300 (5分钟)
   container_protection_seconds: 300
 
+# 60000 file-server 分流代理（本地 dev 形态: all_rust 全走本服务主端口;
+# 本地无 TS nuwax-file-server, userapp_split 的存量域上游 60001 不存在）
+file_server_proxy:
+  listen_port: 60000
+  rust_upstream_port: 8090
+  ts_upstream_port: 60001
+  policy: all_rust
+
 # Pingora 反向代理配置
 proxy_config:
   listen_port: 8088
