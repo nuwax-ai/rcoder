@@ -423,7 +423,7 @@ mod openapi_tests {
         let app = Router::new().merge(create_swagger_ui());
         for (path, needle) in [
             ("/api/docs/openapi.json", "/api/v1/apps"),
-            ("/api/docs/openapi.json", "/api/userapp/dev/rebuild"),
+            ("/api/docs/openapi.json", "/api/userapp/dev/start"),
             ("/api/docs/file-server.json", "/api/userapp/build"),
         ] {
             let response = app
@@ -443,7 +443,7 @@ mod openapi_tests {
     #[test]
     fn primary_document_merges_userapp_domain_only() {
         let paths = &primary_document().paths.paths;
-        for anchor in ["/api/userapp/dev/rebuild", "/api/userapp/build"] {
+        for anchor in ["/api/userapp/dev/start", "/api/userapp/build"] {
             assert!(
                 paths.contains_key(anchor),
                 "主文档缺 userApp 路径: {anchor}"

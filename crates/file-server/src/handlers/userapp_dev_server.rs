@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::service::dev_server::{DevProcess, KilledPid, StartedDev, StoppedDev};
+use crate::service::dev_server::{DevProcess, KilledPid, StoppedDev};
 use crate::workspace::resolve_userapp_dev;
 
 /// 进程表 key（与 web projectId 空间隔离; log_dir 剥前缀）。
@@ -71,16 +71,6 @@ fn default_start_index() -> usize {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UserappDevStarted {
-    pub success: bool,
-    pub message: String,
-    pub app_id: String,
-    pub pid: u32,
-    pub port: u16,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct UserappDevStopped {
     pub success: bool,
     pub message: String,
@@ -107,33 +97,39 @@ pub(crate) struct UserappDevList {
 
 // ── handlers ───────────────────────────────────────────────────────────────────
 
-/// `POST /api/userapp/dev/start`: 启动开发服务（UserApp workspace = spawn
-/// app-cli 按 manifest run.command 编排全栈，pingap 9080 统一入口；web 域
-/// 项目走原 vite 路径端口池分配）。
+/// `POST /api/userapp/dev/start`: 异步编译 + 启动（编译可能数分钟，立即返
+/// taskId）。manifest 同核编译（与生产构建同核，dev 编译通过=可部署）成功
+/// 后启动 dev 服务（UserApp workspace = spawn app-cli 按 manifest
+/// run.command 编排全栈，pingap 9080 统一入口）；编译失败任务终态 Failed、
+/// 不启动。进度/结果：轮询 `GET /api/userapp/tasks/{taskId}`、SSE
+/// `/api/userapp/tasks/{taskId}/logs/stream`；终态后端口经
+/// `GET /api/userapp/dev/list` 查询（UserApp workspace 恒为 pingap 9080）。
+/// 入参 basePath 对 UserApp workspace（manifest/app-cli 引擎）**无效**
+/// ——pingap 路由前缀由各服务 project.manifest.toml `[proxy].path` 决定。
 #[utoipa::path(
     post,
     path = "/dev/start",
     request_body = DevOpBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = UserappDevTaskCreated, description = "启动任务已创建（taskId）")),
     tag = "UserApp"
 )]
 pub(crate) async fn dev_start(
     State(state): State<AppState>,
     Json(body): Json<DevOpBody>,
-) -> Result<Json<UserappDevStarted>, AppError> {
+) -> Result<Json<UserappDevTaskCreated>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev start");
-    let ws = resolve_userapp_dev(&body.app_id, None, &state.config)?;
-    let started: StartedDev = state
-        .dev_server
-        .start_dev(&dev_key(&body.app_id), &ws, body.base_path.as_deref())
-        .await?;
-    Ok(Json(UserappDevStarted {
-        success: true,
-        message: "Development server started".to_string(),
+    let task_id = spawn_dev_task(
+        state,
+        &body.app_id,
+        body.base_path.map(|s| s.to_string()),
+        DevTaskAction::Start,
+    )
+    .await?;
+    Ok(Json(UserappDevTaskCreated {
         app_id: body.app_id,
-        pid: started.pid,
-        port: started.port,
+        task_id,
+        status: "pending".to_string(),
     }))
 }
 
@@ -170,58 +166,32 @@ pub(crate) async fn dev_stop(
     }))
 }
 
-/// `POST /api/userapp/dev/restart`: 重启开发服务（stop + start）。
+/// `POST /api/userapp/dev/restart`: 异步编译 + 重启（agent 改完代码后的
+/// 开发闭环——**重启前必须先编译**，新代码才生效；编译可能数分钟，立即返
+/// taskId）。manifest 同核编译成功后 stop + start（app-cli 重拉全栈）；
+/// 编译失败任务终态 Failed、旧服务原样保留（可继续用旧版本测试，不因
+/// 中间态断流）。进度/结果查询同 start。入参 basePath 对 UserApp
+/// workspace 无效（同 start 的说明）。
 #[utoipa::path(
     post,
     path = "/dev/restart",
     request_body = DevOpBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = UserappDevTaskCreated, description = "重启任务已创建（taskId）")),
     tag = "UserApp"
 )]
 pub(crate) async fn dev_restart(
     State(state): State<AppState>,
     Json(body): Json<DevOpBody>,
-) -> Result<Json<UserappDevStarted>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
-    tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev restart");
-    let ws = resolve_userapp_dev(&body.app_id, None, &state.config)?;
-    let started: StartedDev = state
-        .dev_server
-        .restart_dev(&dev_key(&body.app_id), &ws, body.base_path.as_deref())
-        .await?;
-    Ok(Json(UserappDevStarted {
-        success: true,
-        message: "Development server restarted".to_string(),
-        app_id: body.app_id,
-        pid: started.pid,
-        port: started.port,
-    }))
-}
-
-/// `POST /api/userapp/dev/rebuild`: 异步一键编译 + 启动（agent 改完代码后
-/// 单次调用，开发阶段闭环）。manifest 同核编译成功后自动重启 dev 服务
-/// （app-cli 重拉全栈，新代码生效）；编译失败任务终态 Failed、旧服务原样
-/// 保留（可继续用旧版本测试，不因中间态断流）。返回 taskId，终态后端口经
-/// `GET /api/userapp/dev/list` 查询（UserApp workspace 恒为 pingap 9080）。
-/// "只编译不启动"用 `/api/userapp/build`（生产构建，同核编译）——本域不再
-/// 单设纯编译接口（与生产构建无增量）。
-/// 入参 basePath 对 UserApp workspace（manifest/app-cli 引擎）**无效**
-/// ——pingap 路由前缀由各服务 project.manifest.toml `[proxy].path` 决定。
-#[utoipa::path(
-    post,
-    path = "/dev/rebuild",
-    request_body = DevOpBody,
-    responses((status = 200, body = UserappDevTaskCreated, description = "重建任务已创建（taskId）")),
-    tag = "UserApp"
-)]
-pub(crate) async fn dev_rebuild(
-    State(state): State<AppState>,
-    Json(body): Json<DevOpBody>,
 ) -> Result<Json<UserappDevTaskCreated>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
-    tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev rebuild");
-    let task_id =
-        spawn_dev_task(state, &body.app_id, body.base_path.map(|s| s.to_string())).await?;
+    tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev restart");
+    let task_id = spawn_dev_task(
+        state,
+        &body.app_id,
+        body.base_path.map(|s| s.to_string()),
+        DevTaskAction::Restart,
+    )
+    .await?;
     Ok(Json(UserappDevTaskCreated {
         app_id: body.app_id,
         task_id,
@@ -229,7 +199,7 @@ pub(crate) async fn dev_rebuild(
     }))
 }
 
-/// dev 异步编译任务受理响应（POST /dev/build、/dev/rebuild）。
+/// dev 异步任务受理响应（POST /dev/start、/dev/restart——编译+启停）。
 /// camelCase 对齐 BuildCreatedData（Java 同一消费面）。
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -242,20 +212,28 @@ pub(crate) struct UserappDevTaskCreated {
     pub status: String,
 }
 
-/// dev/rebuild 任务骨架：create task（kind=dev_rebuild）+ resolve workspace +
-/// spawn 后台执行（manifest 同核编译 → 成功后重启 dev 服务）。
+/// dev 任务的后置动作（编译成功后执行哪个生命周期操作）。
+pub(crate) enum DevTaskAction {
+    Start,
+    Restart,
+}
+
+/// dev 任务骨架：create task + resolve workspace + spawn 后台执行
+/// （manifest 同核编译 → 成功后按 action 启动/重启 dev 服务）。
 /// 终态：Completed（制品四字段占位空）/ Failed（友好错误）。
 async fn spawn_dev_task(
     state: AppState,
     app_id: &str,
     base_path: Option<String>,
+    action: DevTaskAction,
 ) -> Result<String, AppError> {
+    let kind = match action {
+        DevTaskAction::Start => crate::service::userapp::tasks::BuildTaskKind::DevStart,
+        DevTaskAction::Restart => crate::service::userapp::tasks::BuildTaskKind::DevRestart,
+    };
     let task = state
         .build_tasks
-        .create(
-            app_id.to_string(),
-            crate::service::userapp::tasks::BuildTaskKind::DevRebuild,
-        )
+        .create(app_id.to_string(), kind)
         .await
         .map_err(|e| AppError::business(e.to_string()))?;
     match resolve_userapp_dev(app_id, None, &state.config) {
@@ -292,12 +270,22 @@ async fn spawn_dev_task(
         .await;
         let outcome = async {
             result?;
-            // 编译成功：重启 dev 服务（app-cli 重拉全栈新代码生效；重启失败
-            // 整体 Failed——旧服务已被 stop，语义上本轮重建失败，下次重试）
-            state
-                .dev_server
-                .restart_dev(&key, &ws, base_path.as_deref())
-                .await?;
+            // 编译成功：按 action 启动/重启（app-cli 全栈新代码生效；失败整体
+            // Failed——restart 场景旧服务已被 stop，语义上本轮失败，下次重试）
+            match action {
+                DevTaskAction::Start => {
+                    state
+                        .dev_server
+                        .start_dev(&key, &ws, base_path.as_deref())
+                        .await?;
+                }
+                DevTaskAction::Restart => {
+                    state
+                        .dev_server
+                        .restart_dev(&key, &ws, base_path.as_deref())
+                        .await?;
+                }
+            }
             Ok::<(), AppError>(())
         }
         .await;
