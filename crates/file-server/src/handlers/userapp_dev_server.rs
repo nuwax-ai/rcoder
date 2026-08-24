@@ -41,10 +41,12 @@ pub(crate) struct DevOpBody {
     #[garde(custom(crate::validation_rules::not_blank))]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
-    /// dev server 的 base path（vite --base 等; 缺省 "/"）。
     #[serde(default)]
     #[garde(skip)]
-    /// dev server 的 base path（vite --base 等）；缺省 "/"
+    /// dev server 的 base path（vite --base 等）；缺省 "/"。
+    /// **仅 web 域项目（vite dev server）生效**——UserApp workspace
+    /// （manifest/app-cli 引擎）不消费：pingap 路由前缀由各服务的
+    /// project.manifest.toml `[proxy].path` 决定，传了无效果。
     pub base_path: Option<String>,
 }
 
@@ -203,6 +205,8 @@ pub(crate) async fn dev_restart(
 /// `GET /api/userapp/dev/list` 查询（UserApp workspace 恒为 pingap 9080）。
 /// "只编译不启动"用 `/api/userapp/build`（生产构建，同核编译）——本域不再
 /// 单设纯编译接口（与生产构建无增量）。
+/// 入参 basePath 对 UserApp workspace（manifest/app-cli 引擎）**无效**
+/// ——pingap 路由前缀由各服务 project.manifest.toml `[proxy].path` 决定。
 #[utoipa::path(
     post,
     path = "/dev/rebuild",
