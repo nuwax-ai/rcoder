@@ -122,19 +122,21 @@ pub async fn build(
     Path(app_id): Path<String>,
     Json(body): Json<PublishBody>,
 ) -> Result<Json<HttpResult<PublishTaskData>>, AppError> {
+    use garde::Validate as _;
+    // garde 声明式校验（project_id/user_id 的 identifier 规则在 DTO 标注）
+    body.validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
     validate_publish_identifiers(&app_id, &body.project_id)?;
 
     // owner 补记（build 是 publish 删除后的 owner 注册来源之一；合并语义见
-    // record_dev_registration——已注册字段不被覆盖）
-    if let Some(uid) = body.user_id.as_deref().filter(|s| !s.trim().is_empty()) {
-        shared_types::validate_identifier(uid, "user_id").map_err(|e| AppError::bad_request(&e))?;
-        if let Err(e) = state
+    // record_dev_registration——已注册字段不被覆盖）。格式已由 garde 校验
+    if let Some(uid) = body.user_id.as_deref().filter(|s| !s.trim().is_empty())
+        && let Err(e) = state
             .app_service
             .record_dev_registration(&app_id, uid.trim())
             .await
-        {
-            tracing::warn!("[USERAPP_BUILD] record owner user_id failed (build continues): {e}");
-        }
+    {
+        tracing::warn!("[USERAPP_BUILD] record owner user_id failed (build continues): {e}");
     }
     let task = state
         .publish_tasks

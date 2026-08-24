@@ -24,6 +24,7 @@ pub mod proxy_handler_api;
 mod sse_builder;
 pub mod userapp_terminal_proxy_api;
 pub mod utils;
+pub mod validation_rules;
 
 // 调试处理器（仅在启用 debug feature 时可用）
 #[cfg(feature = "debug")]

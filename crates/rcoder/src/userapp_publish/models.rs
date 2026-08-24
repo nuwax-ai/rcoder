@@ -5,11 +5,16 @@ use serde::Deserialize;
 use super::types::{PublishTaskKind, PublishTaskSnapshot, PublishTaskStatus};
 
 /// build 请求体:agent-runner project_id(定位 build 目标)。
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+/// 字段校验经 garde 声明式标注（identifier 规则：[A-Za-z0-9_-]、≤64——
+/// 进容器名/PVC 名/subPath 的标识符约束），handler 不再手动校验。
+#[derive(Debug, Deserialize, garde::Validate, utoipa::ToSchema)]
 pub struct PublishBody {
+    #[garde(custom(crate::handler::validation_rules::identifier))]
     pub project_id: String,
-    /// owner 用户 ID（补记 userapp_metadata；显式传优先于 create-workspace 注册值）
+    /// owner 用户 ID（补记 userapp_metadata；显式传优先于 create-workspace 注册值；
+    /// 可选——None/空白跳过，非空校验 identifier 格式）
     #[serde(default)]
+    #[garde(custom(crate::handler::validation_rules::optional_identifier))]
     pub user_id: Option<String>,
 }
 
