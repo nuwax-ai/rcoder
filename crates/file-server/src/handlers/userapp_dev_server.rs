@@ -227,6 +227,41 @@ pub(crate) async fn dev_build(
     })))
 }
 
+/// `POST /api/userapp/dev/rebuild`: 一键编译 + 重启（agent 改完代码后单次调用）。
+/// 编译成功才重启——编译失败透传错误、旧 dev server 原样保留（可继续用
+/// 旧版本测试，不因中间态断流）；成功后返回新 pid/port（前端据此拼
+/// `/proxy/devapps/...` 预览 URL）。
+#[utoipa::path(
+    post,
+    path = "/dev/rebuild",
+    request_body = DevOpBody,
+    responses(crate::openapi::JsonApiResponses),
+    tag = "UserApp"
+)]
+pub(crate) async fn dev_rebuild(
+    State(state): State<AppState>,
+    Json(body): Json<DevOpBody>,
+) -> Result<Json<UserappDevStarted>, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
+    tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev rebuild");
+    let ws = resolve_userapp_dev(&body.app_id, None, &state.config)?;
+    let key = dev_key(&body.app_id);
+    // 先编译：失败即返回（旧服务不动）
+    build_project_impl(&state, &ws, &key, &body.app_id, body.base_path.as_deref()).await?;
+    // 编译成功：重启（stop + start，端口池重分配）
+    let started: StartedDev = state
+        .dev_server
+        .restart_dev(&key, &ws, body.base_path.as_deref())
+        .await?;
+    Ok(Json(UserappDevStarted {
+        success: true,
+        message: "Rebuilt and restarted".to_string(),
+        app_id: body.app_id,
+        pid: started.pid,
+        port: started.port,
+    }))
+}
+
 /// `GET /api/userapp/dev/list`: 在跑的 UserApp 开发服务列表（不含 web/computer 项目）。
 #[utoipa::path(
     get,

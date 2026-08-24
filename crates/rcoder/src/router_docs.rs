@@ -331,9 +331,14 @@ pub struct ApiDoc;
 /// file-server 全量文档（含 /api/userapp）始终聚合在此；实际路由宿主：
 /// 老路径（project/computer/git/build）常驻 rcoder 主服务（`merged_router`），
 /// userapp 域由 rcoder 转发层接管、本地实现在 per-app 开发容器内 file-server（60000）。
+///
+/// 主文档额外合入 userApp 业务域（file-server 的 `/api/userapp/*` 路径 +
+/// schemas）——Swagger 默认打开主文档即见 userApp 全貌（dev 生命周期/编译/
+/// 文件/静态），无需切下拉；其余 file-server 域（project/computer/git 等）
+/// 仍只在 file-server.json，防主文档膨胀。
 pub fn create_swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/api/docs")
-        .url("/api/docs/openapi.json", ApiDoc::openapi())
+        .url("/api/docs/openapi.json", primary_document())
         .url(
             "/api/docs/file-server.json",
             file_server::openapi::document(file_server::routes::api_router().into_openapi()),
@@ -342,6 +347,19 @@ pub fn create_swagger_ui() -> SwaggerUi {
             "/api/docs/openapi.json",
             "/api/docs/file-server.json",
         ]))
+}
+
+/// 主文档 = rcoder 应用管理 + userApp 业务域（选择性合入）。
+fn primary_document() -> utoipa::openapi::OpenApi {
+    let mut doc = ApiDoc::openapi();
+    let mut userapp =
+        file_server::openapi::document(file_server::routes::api_router().into_openapi());
+    userapp
+        .paths
+        .paths
+        .retain(|path, _| path.starts_with("/api/userapp"));
+    doc.merge(userapp);
+    doc
 }
 
 #[cfg(test)]
@@ -395,6 +413,7 @@ mod openapi_tests {
     }
 
     /// HTTP 层验证：两份 openapi.json 均由 Swagger UI 路由实际提供服务。
+    /// 主文档额外验证 userApp 域已合入（默认打开即可见）。
     #[tokio::test]
     async fn swagger_ui_serves_both_documents() {
         use axum::body::{Body, to_bytes};
@@ -404,6 +423,7 @@ mod openapi_tests {
         let app = Router::new().merge(create_swagger_ui());
         for (path, needle) in [
             ("/api/docs/openapi.json", "/api/v1/apps"),
+            ("/api/docs/openapi.json", "/api/userapp/dev/rebuild"),
             ("/api/docs/file-server.json", "/api/userapp/build"),
         ] {
             let response = app
@@ -416,6 +436,23 @@ mod openapi_tests {
             let text = String::from_utf8_lossy(&body);
             assert!(text.contains(needle), "{path} 响应缺少 {needle}");
         }
+    }
+
+    /// 主文档选择性合入的语义锁定：userApp 域（/api/userapp/*）在、其余
+    /// file-server 域（project 等）不在（防主文档膨胀）。
+    #[test]
+    fn primary_document_merges_userapp_domain_only() {
+        let paths = &primary_document().paths.paths;
+        for anchor in ["/api/userapp/dev/rebuild", "/api/userapp/build"] {
+            assert!(
+                paths.contains_key(anchor),
+                "主文档缺 userApp 路径: {anchor}"
+            );
+        }
+        assert!(
+            !paths.contains_key("/api/project/create-project"),
+            "project 域不应合入主文档（留在 file-server.json）"
+        );
     }
 
     /// UserApp 全部对接端点（`/api/v1/apps` + `/userapp/` 代理文档接口）的文档质量
