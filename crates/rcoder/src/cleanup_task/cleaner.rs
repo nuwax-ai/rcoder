@@ -254,7 +254,18 @@ impl AgentCleaner {
 
         // 短期闲置（idle > idle_timeout 但 < long_idle_timeout）：标记 Idle、保留容器 + project 复用，
         // 不销毁、不删 project。只有长期闲置（>= long_idle_timeout）才走下方二次确认 + 销毁链。
-        if destroy_reason.is_some() && idle_secs < self.config.long_idle_timeout.as_secs() as i64 {
+        //
+        // 🔄 滚动升级放行：镜像漂移（rcoder 已升版而 agent 仍旧版——STS 模板仅创建时
+        // 固化）时跳过"标记保留"，直接落入下方二次确认 + 销毁链——换代阈值从
+        // long_idle(1h) 收紧到 idle_timeout(10min)。本分支仅在 idle > idle_timeout 时
+        // 到达（活跃会话不受影响），且仍享二次确认闸门保护。
+        let rollout_ready = destroy_reason.is_some()
+            && idle_secs < self.config.long_idle_timeout.as_secs() as i64
+            && self.check_image_drift(&agent_info, &service_type).await;
+        if destroy_reason.is_some()
+            && idle_secs < self.config.long_idle_timeout.as_secs() as i64
+            && !rollout_ready
+        {
             self.state
                 .projects
                 .update_agent_status(project_id, 0, "idle");
@@ -366,6 +377,58 @@ impl AgentCleaner {
         }
 
         Ok(container_destroyed)
+    }
+
+    /// 滚动升级判据：agent 容器镜像是否落后于当前进程期望。
+    ///
+    /// 仅对短期闲置候选调用（活跃 agent 与长期闲置均不查——后者本来就会销毁
+    /// 换代），控制 K8s API 量。查询失败按不漂移处理（换代不因 API 抖动误触发）；
+    /// Docker 模式 runtime 恒返回 false（容器重建即新镜像）。
+    async fn check_image_drift(
+        &self,
+        info: &Arc<shared_types::ProjectAndContainerInfo>,
+        service_type: &ServiceType,
+    ) -> bool {
+        if info.container_info().is_none() {
+            return false; // 无容器记录：无换代对象
+        }
+        // identifier 单一事实源（与销毁路径的 strategy 判定一致：pod_id 优先 →
+        // Computer 用 user_id → Web/UserApp 用 project_id），防止此处的 STS 定位
+        // 与创建路径分叉
+        let identifier = match service_type.container_identifier(
+            info.pod_id(),
+            info.user_id(),
+            Some(info.project_id()),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                debug!("[cleaner] rollout check skipped (no identifier): {e}");
+                return false;
+            }
+        };
+        match self
+            .state
+            .runtime()
+            .is_agent_image_drifted(identifier, service_type)
+            .await
+        {
+            Ok(true) => {
+                info!(
+                    "[cleaner] 🔄 agent image drifted, will roll on idle: project_id={}, identifier={}",
+                    info.project_id(),
+                    identifier
+                );
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                warn!(
+                    "[cleaner] image drift check failed (skip rollout this round): {}",
+                    e
+                );
+                false
+            }
+        }
     }
 
     /// 运行清理任务（定时）。收到 shutdown 信号后优雅退出。

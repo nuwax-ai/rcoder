@@ -25,6 +25,10 @@ use super::KubernetesRuntime;
 /// rcoder.io/service-type label key（与 build_standard_labels 写入的一致，用于 STS 重名时类型校验）
 const SERVICE_TYPE_LABEL: &str = "rcoder.io/service-type";
 
+/// rcoder.io/template-hash 注解 key：创建时记录期望 PodSpec 的指纹，
+/// ensure 时对比感知模板漂移（镜像/env/command/sidecar/资源等全部内容）。
+pub(crate) const TEMPLATE_HASH_ANNOTATION: &str = "rcoder.io/template-hash";
+
 impl KubernetesRuntime {
     /// StatefulSet API 访问器（与 pods()/pvcs() 对齐）。
     pub(crate) fn statefulsets(&self) -> Api<StatefulSet> {
@@ -123,6 +127,8 @@ impl KubernetesRuntime {
     }
 
     /// 构造 StatefulSet（replicas + pod 模板 = 现有 PodSpec；serviceName 指向 headless svc）。
+    /// 顶层注解记录模板指纹——ensure 时对比感知漂移（镜像/env/command 等升级
+    /// 后，存量 STS 不会自动更新模板，指纹差异是唯一可见信号）。
     fn build_agent_statefulset(
         &self,
         identifier: &str,
@@ -133,11 +139,17 @@ impl KubernetesRuntime {
         let sts_name = self.pod_name(identifier, service_type)?;
         let headless = self.agent_headless_svc_name(identifier, service_type)?;
         let labels = build_standard_labels(identifier, service_type);
+        let template_hash = agent_template_hash(&pod_spec);
         Ok(StatefulSet {
             metadata: ObjectMeta {
                 name: Some(sts_name.clone()),
                 namespace: Some(self.namespace.clone()),
                 labels: Some(labels.clone()),
+                annotations: Some(
+                    [(TEMPLATE_HASH_ANNOTATION.to_string(), template_hash)]
+                        .into_iter()
+                        .collect(),
+                ),
                 ..Default::default()
             },
             spec: Some(StatefulSetSpec {
@@ -204,6 +216,25 @@ impl KubernetesRuntime {
                     self.recreate_agent_statefulset(identifier, service_type, pod_spec, replicas)
                         .await?;
                 } else {
+                    // 模板漂移可见化（第三维）：镜像/env/command 等模板内容升级后，
+                    // 存量 STS 不会自动更新（STS 模板仅在创建时固化）——对比指纹
+                    // 不一致时 warn 留痕，不主动重建（chat 路径 = 活跃会话，滚动
+                    // 由 cleaner 的空闲换代路径负责）。存量无注解（功能上线前创建）
+                    // 视为未知，不告警（避免升级后全量误报）。
+                    let existing_hash = existing
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|a| a.get(TEMPLATE_HASH_ANNOTATION));
+                    let desired_hash = agent_template_hash(&pod_spec);
+                    if let Some(existing_hash) = existing_hash
+                        && existing_hash != &desired_hash
+                    {
+                        warn!(
+                            "[K8S-STS] {} template drift detected (existing_hash={}, desired_hash={}); keeping running pod — idle recycle will roll it",
+                            sts_name, existing_hash, desired_hash
+                        );
+                    }
                     // 类型匹配：scale 到期望 replicas（幂等）
                     self.scale_agent_statefulset(identifier, service_type, replicas)
                         .await?;
@@ -280,6 +311,46 @@ impl KubernetesRuntime {
         Ok(())
     }
 
+    /// 存量 agent STS 的容器镜像是否落后于当前进程期望（空闲滚动升级判据）。
+    ///
+    /// STS 模板仅在创建时固化，rcoder 升版后存量 agent 继续跑旧镜像；本方法
+    /// 实读 STS 模板里 agent 容器的 image 与 [`Self::select_image`]（现读 env，
+    /// 升版后自然携带新 tag）对比。404 视为无漂移（无 STS 即无换代需求）。
+    pub(crate) async fn is_agent_image_drifted(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        let sts_name = self.pod_name(identifier, service_type)?;
+        let sts = match self.statefulsets().get(&sts_name).await {
+            Ok(sts) => sts,
+            Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(false),
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "get sts {sts_name}: {e}"
+                )));
+            }
+        };
+        let existing_image = sts
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.spec.as_ref())
+            .and_then(|spec| spec.containers.first())
+            .and_then(|c| c.image.clone());
+        let desired_image = self.select_image(service_type);
+        let drifted = existing_image
+            .as_deref()
+            .map(|img| img != desired_image)
+            .unwrap_or(false);
+        if drifted {
+            info!(
+                "[K8S-STS] {} image drifted: existing={:?}, desired={}",
+                sts_name, existing_image, desired_image
+            );
+        }
+        Ok(drifted)
+    }
+
     /// scale StatefulSet 到指定 replicas（patch spec.replicas）。
     pub(crate) async fn scale_agent_statefulset(
         &self,
@@ -346,4 +417,72 @@ fn workspace_claim_name(spec: &PodSpec) -> Option<String> {
         .persistent_volume_claim
         .as_ref()
         .map(|p| p.claim_name.clone())
+}
+
+/// agent PodSpec 的规范化指纹（模板漂移检测）：serde_json 序列化经 Value 的
+/// BTreeMap 字典序规范化（字段序/键序无关），再 DefaultHasher（与
+/// config_hash_annotations 同款——跨进程确定、零新依赖）。涵盖镜像/env/
+/// command/sidecar/资源等全部模板内容；build_agent_pod_spec 无时间/随机
+/// 成分，同参数构造恒等。
+fn agent_template_hash(pod_spec: &PodSpec) -> String {
+    let canonical = serde_json::to_value(pod_spec)
+        .ok()
+        .and_then(|v| serde_json::to_string(&v).ok())
+        .unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::Hasher as _;
+    hasher.write(canonical.as_bytes());
+    format!("{:016x}", hasher.finish())
+}
+
+#[cfg(all(test, feature = "kubernetes"))]
+mod tests {
+    use super::*;
+
+    fn sample_pod_spec(image: &str) -> PodSpec {
+        use k8s_openapi::api::core::v1::{Container, EnvVar};
+        PodSpec {
+            containers: vec![Container {
+                name: "agent".to_string(),
+                image: Some(image.to_string()),
+                env: Some(vec![EnvVar {
+                    name: "AGENT_MODE".to_string(),
+                    value: Some("standard".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 确定性：同参数两次构造（独立对象）指纹相等——跨副本/重启稳定是
+    /// 漂移检测不误报的前提。
+    #[test]
+    fn template_hash_is_deterministic_for_same_input() {
+        let a = agent_template_hash(&sample_pod_spec("repo/rcoder:0.1.230"));
+        let b = agent_template_hash(&sample_pod_spec("repo/rcoder:0.1.230"));
+        assert_eq!(a, b);
+        assert!(!a.is_empty());
+    }
+
+    /// 敏感性：镜像变更必须反映到指纹（升版检测的主场景）。
+    #[test]
+    fn template_hash_changes_when_image_changes() {
+        let old = agent_template_hash(&sample_pod_spec("repo/rcoder:0.1.230"));
+        let new = agent_template_hash(&sample_pod_spec("repo/rcoder:0.1.231"));
+        assert_ne!(old, new);
+    }
+
+    /// 敏感性：非镜像字段（env）变更也必须反映（config 变更场景）。
+    #[test]
+    fn template_hash_changes_when_env_changes() {
+        let mut spec = sample_pod_spec("repo/rcoder:0.1.230");
+        let before = agent_template_hash(&spec);
+        if let Some(env) = spec.containers[0].env.as_mut() {
+            env[0].value = Some("advanced".to_string());
+        }
+        let after = agent_template_hash(&spec);
+        assert_ne!(before, after);
+    }
 }

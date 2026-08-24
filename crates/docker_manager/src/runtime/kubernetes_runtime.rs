@@ -269,6 +269,14 @@ impl AgentContainerRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn is_agent_image_drifted(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        self.is_agent_image_drifted(identifier, service_type).await
+    }
+
     async fn is_container_running(&self, project_id: &str) -> ContainerRuntimeResult<bool> {
         Ok(self
             .find_container(project_id, &ServiceType::WebAgentRunner)

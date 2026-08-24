@@ -102,6 +102,19 @@ pub trait AgentContainerRuntime: Send + Sync {
         self.stop_container(identifier).await
     }
 
+    /// agent 容器镜像是否漂移（当前进程期望 vs 存量容器实际）。
+    ///
+    /// 空闲滚动升级判据：true = 该 agent 落后于当前版本，闲置回收时可提前
+    /// 换代（销毁后下次 ensure 用新模板重建）。默认 false——Docker 模式
+    /// 容器重建即新镜像、测试桩无此语义，均不覆写。
+    async fn is_agent_image_drifted(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
     /// Get container status
     async fn is_container_running(&self, project_id: &str) -> ContainerRuntimeResult<bool>;
 
