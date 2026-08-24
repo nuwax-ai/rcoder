@@ -324,6 +324,7 @@ container-runtime-api = { path = "crates/container-runtime-api" }
 download_utils = { path = "crates/download_utils" }
 process_utils = { path = "crates/process_utils" }
 file-server = { path = "crates/file-server" }
+file-server-proxy = { path = "crates/file-server-proxy" }
 model_probe = { path = "crates/model_probe" }
 
 # Pyroscope Continuous Profiling

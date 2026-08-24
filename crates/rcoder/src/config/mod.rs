@@ -48,6 +48,11 @@ pub struct AppConfig {
     pub port: u16,
     /// 反向代理配置
     pub proxy_config: Option<ProxyConfig>,
+    /// file-server 分流反向代理（60000 入口：userApp → 主服务, 其余 → TS nuwax-file-server）
+    ///
+    /// 段缺失 → None → 不监听 60000（本地 dev 形态）；K8s 部署经 helm 渲染此段。
+    #[serde(default)]
+    pub file_server_proxy: Option<file_server_proxy::FileServerProxyConfig>,
     /// Docker 配置(docker 运行时读,K8s 不读)
     pub docker_config: Option<DockerConfig>,
     /// K8s 运行时配置(K8s 运行时读,docker 不读;与 docker_config 完全分家)
@@ -94,6 +99,7 @@ impl Default for AppConfig {
             projects_dir: PathBuf::from("./project_workspace"),
             port: 8087,
             proxy_config: Some(ProxyConfig::default()),
+            file_server_proxy: None,
             docker_config: Some(DockerConfig::default()),
             kubernetes_config: None,
             cleanup_config: CleanupConfigSettings::default(),

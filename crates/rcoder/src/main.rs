@@ -1,7 +1,7 @@
 // 单树化后 bin 只做编排入口：全部模块经 `rcoder::`（lib 树唯一编译）。
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use rcoder::app_state::AppState;
 use rcoder::*;
@@ -244,6 +244,23 @@ async fn main() -> anyhow::Result<()> {
     // （project/computer/git/build 老路径 + SubvolumeWorkspaceResolver per-agent PVC 解析）。
     let ws_runtime: Arc<dyn container_runtime_api::WorkspaceRuntime> = runtime.clone();
     file_server_embed::register_runtime(ws_runtime);
+
+    // 60000 file-server 分流反代（Java/外部入口，独立 crate file-server-proxy）：
+    // /api/userapp* → 本主服务（8086），其余 → TS nuwax-file-server（60001）。
+    // config.yml 无 file_server_proxy 段则不启动（本地 dev 形态）。
+    if let Some(fs_proxy_config) = bootstrap_result.config.file_server_proxy.clone() {
+        let (fs_proxy_shutdown_tx, fs_proxy_shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            // 持有 sender 至任务结束——进程生命周期内不触发关闭信号
+            let _hold = fs_proxy_shutdown_tx;
+            if let Err(e) =
+                file_server_proxy::run_file_server_proxy(fs_proxy_config, fs_proxy_shutdown_rx)
+                    .await
+            {
+                error!("file-server 分流代理启动失败: {e}");
+            }
+        });
+    }
 
     let state = Arc::new(
         AppState::new(

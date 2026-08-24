@@ -55,6 +55,7 @@ container-runtime-api = { workspace = true }
 download_utils = { workspace = true }
 agent_provisioning = { workspace = true }
 file-server = { workspace = true }
+file-server-proxy = { workspace = true }
 app_manager = { path = "../app_manager" }
 
 # 🚀 无锁配置热更新

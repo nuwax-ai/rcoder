@@ -1,0 +1,28 @@
+[package]
+name = "file-server-proxy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "file_server_proxy"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+
+# 跨 crate 契约: x-service-type 分流 header 定义在 shared_types（防双头事实源）
+shared_types = { workspace = true }
+
+# Pingora dependencies - 与 rcoder-proxy 同源的真正 Pingora 库
+pingora-core = { workspace = true }
+pingora-proxy = { workspace = true }
