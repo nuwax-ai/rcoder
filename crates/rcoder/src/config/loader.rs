@@ -271,7 +271,9 @@ mod tests {
         env::set_current_dir(&dir).expect("chdir");
         let result = load_config_with_args(CliArgs::try_parse_from(["rcoder"]).expect("cli args"));
         // 恢复 cwd 尽早执行（断言失败也不留脏 cwd）
-        let _ = env::set_current_dir(origin);
+        if let Err(e) = env::set_current_dir(origin) {
+            eprintln!("restore cwd failed: {e}");
+        }
         fs::remove_dir_all(&dir).ok();
 
         let err = result.expect_err("坏配置必须 fail fast 而非降级默认配置");
