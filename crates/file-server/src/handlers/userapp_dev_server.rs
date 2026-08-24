@@ -196,46 +196,13 @@ pub(crate) async fn dev_restart(
     }))
 }
 
-/// `POST /api/userapp/dev/build`: 异步开发编译（立即返回 taskId）。
-/// 编译在后台执行（manifest 同核：逐子项目执行 project.manifest.toml 的
-/// build.command，可能与发布打包完全同核——dev 编译通过 = 可部署；可能耗时
-/// 数分钟，同步等待会断上游超时）。进度/结果查询复用任务族接口：轮询
-/// `GET /api/userapp/tasks/{taskId}`（快照含 Failed 的错误信息）、SSE
-/// `GET /api/userapp/tasks/{taskId}/logs/stream`、日志分页
-/// `GET /api/userapp/tasks/{taskId}/logs`。与 `/api/userapp/build`（生产
-/// 构建语义）共用编译内核，差异仅消费场景：dev 不进发布制品链。
-#[utoipa::path(
-    post,
-    path = "/dev/build",
-    request_body = DevOpBody,
-    responses((status = 200, body = UserappDevTaskCreated, description = "构建任务已创建（taskId）")),
-    tag = "UserApp"
-)]
-pub(crate) async fn dev_build(
-    State(state): State<AppState>,
-    Json(body): Json<DevOpBody>,
-) -> Result<Json<UserappDevTaskCreated>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
-    tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev build");
-    let task_id = spawn_dev_task(
-        state,
-        &body.app_id,
-        body.base_path.map(|s| s.to_string()),
-        crate::service::userapp::tasks::BuildTaskKind::DevBuild,
-    )
-    .await?;
-    Ok(Json(UserappDevTaskCreated {
-        app_id: body.app_id,
-        task_id,
-        status: "pending".to_string(),
-    }))
-}
-
 /// `POST /api/userapp/dev/rebuild`: 异步一键编译 + 启动（agent 改完代码后
 /// 单次调用，开发阶段闭环）。manifest 同核编译成功后自动重启 dev 服务
 /// （app-cli 重拉全栈，新代码生效）；编译失败任务终态 Failed、旧服务原样
 /// 保留（可继续用旧版本测试，不因中间态断流）。返回 taskId，终态后端口经
 /// `GET /api/userapp/dev/list` 查询（UserApp workspace 恒为 pingap 9080）。
+/// "只编译不启动"用 `/api/userapp/build`（生产构建，同核编译）——本域不再
+/// 单设纯编译接口（与生产构建无增量）。
 #[utoipa::path(
     post,
     path = "/dev/rebuild",
@@ -249,13 +216,8 @@ pub(crate) async fn dev_rebuild(
 ) -> Result<Json<UserappDevTaskCreated>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev rebuild");
-    let task_id = spawn_dev_task(
-        state,
-        &body.app_id,
-        body.base_path.map(|s| s.to_string()),
-        crate::service::userapp::tasks::BuildTaskKind::DevRebuild,
-    )
-    .await?;
+    let task_id =
+        spawn_dev_task(state, &body.app_id, body.base_path.map(|s| s.to_string())).await?;
     Ok(Json(UserappDevTaskCreated {
         app_id: body.app_id,
         task_id,
@@ -276,18 +238,20 @@ pub(crate) struct UserappDevTaskCreated {
     pub status: String,
 }
 
-/// dev 编译任务的公共骨架：create task + resolve workspace + spawn 后台执行。
-/// DevBuild = 仅编译；DevRebuild = 编译成功后自动重启 dev server。
+/// dev/rebuild 任务骨架：create task（kind=dev_rebuild）+ resolve workspace +
+/// spawn 后台执行（manifest 同核编译 → 成功后重启 dev 服务）。
 /// 终态：Completed（制品四字段占位空）/ Failed（友好错误）。
 async fn spawn_dev_task(
     state: AppState,
     app_id: &str,
     base_path: Option<String>,
-    kind: crate::service::userapp::tasks::BuildTaskKind,
 ) -> Result<String, AppError> {
     let task = state
         .build_tasks
-        .create(app_id.to_string(), kind)
+        .create(
+            app_id.to_string(),
+            crate::service::userapp::tasks::BuildTaskKind::DevRebuild,
+        )
         .await
         .map_err(|e| AppError::business(e.to_string()))?;
     match resolve_userapp_dev(app_id, None, &state.config) {
@@ -324,17 +288,12 @@ async fn spawn_dev_task(
         .await;
         let outcome = async {
             result?;
-            if matches!(
-                kind,
-                crate::service::userapp::tasks::BuildTaskKind::DevRebuild
-            ) {
-                // 编译成功：重启 dev 服务（失败则整体 Failed——旧服务已被
-                // stop，语义上本轮重建失败，下次重试）
-                state
-                    .dev_server
-                    .restart_dev(&key, &ws, base_path.as_deref())
-                    .await?;
-            }
+            // 编译成功：重启 dev 服务（app-cli 重拉全栈新代码生效；重启失败
+            // 整体 Failed——旧服务已被 stop，语义上本轮重建失败，下次重试）
+            state
+                .dev_server
+                .restart_dev(&key, &ws, base_path.as_deref())
+                .await?;
             Ok::<(), AppError>(())
         }
         .await;

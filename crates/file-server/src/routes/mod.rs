@@ -182,7 +182,6 @@ fn userapp_router() -> OpenApiRouter<AppState> {
         .routes(routes!(userapp_dev_server::dev_start))
         .routes(routes!(userapp_dev_server::dev_stop))
         .routes(routes!(userapp_dev_server::dev_restart))
-        .routes(routes!(userapp_dev_server::dev_build))
         .routes(routes!(userapp_dev_server::dev_rebuild))
         .routes(routes!(userapp_dev_server::dev_list))
         .routes(routes!(userapp_dev_server::dev_logs))
@@ -213,12 +212,11 @@ mod tests {
                 .paths
                 .contains_key("/api/userapp/projects/confirm")
         );
-        // 开发服务生命周期 + 开发编译（/api/userapp/dev/*, 7 个）
+        // 开发服务生命周期 + 一键重建（/api/userapp/dev/*, 6 个）
         for path in [
             "/api/userapp/dev/start",
             "/api/userapp/dev/stop",
             "/api/userapp/dev/restart",
-            "/api/userapp/dev/build",
             "/api/userapp/dev/rebuild",
             "/api/userapp/dev/list",
             "/api/userapp/dev/logs",
