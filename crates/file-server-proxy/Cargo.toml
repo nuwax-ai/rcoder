@@ -1,17 +1,26 @@
 [package]
 name = "file-server-proxy"
-version.workspace = true
+# 独立版本号: 支持 file-server-proxy 单独打 tag (file-server-proxy-v*) 经 CI 发
+# npm/OSS, 与 rcoder 主版本解耦 (与 crates/file-server 同款纪律)。
+version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# 内嵌 Rust file-server (npm 独立分发形态): proxy 单二进制自带 rust 上游,
+# 同进程 task 绑 127.0.0.1:{RUST_UPSTREAM_PORT}。容器/rcoder 嵌入形态不启用
+# (上游由 supervisord 独立进程/宿主进程提供)。
+embed-file-server = ["dep:file-server"]
+
 [lib]
 name = "file_server_proxy"
 path = "src/lib.rs"
 
-# 独立入口：生产运行容器形态（supervisord program），60000 → 本容器 file-server。
+# 独立入口：默认=生产运行容器形态（纯转发，supervisord program，60000 → 本容器
+# file-server）；--features embed-file-server = npm 独立分发形态（内嵌 rust 上游）。
 [[bin]]
 name = "file-server-proxy"
 path = "src/main.rs"
@@ -37,6 +46,9 @@ shared_types = { workspace = true }
 
 # bin 入口的日志初始化（lib 内只发事件不装 subscriber）
 tracing-subscriber = { workspace = true }
+
+# npm 独立形态的可选内嵌 rust 上游 (feature embed-file-server)
+file-server = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }

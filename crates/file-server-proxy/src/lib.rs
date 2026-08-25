@@ -83,7 +83,7 @@ impl Default for FileServerProxyConfig {
     }
 }
 
-/// 路由策略——同一 crate 服务两种部署形态。
+/// 路由策略——同一 crate 服务多种部署形态。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutePolicy {
@@ -96,6 +96,36 @@ pub enum RoutePolicy {
     /// rust 上游，全部流量由 Rust 重写的 file-server 承载（TS 热备于
     /// [`NUWAX_FILE_SERVER_INTERNAL_PORT`]，不接收流量）
     AllRust,
+    /// 全 TS 模式（npm 独立形态的后端选择之一）：一律 ts 上游，全部流量
+    /// 由 TS nuwax-file-server 承载——Rust 侧故障时的回退/AB 对照档。
+    /// 无路径白名单（TS 本就是全量老路由面，白名单语义不适用）。
+    AllTs,
+}
+
+impl RoutePolicy {
+    /// 策略的 wire 值（serde/CLI/env 共用词汇表）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RoutePolicy::UserappSplit => "userapp_split",
+            RoutePolicy::AllRust => "all_rust",
+            RoutePolicy::AllTs => "all_ts",
+        }
+    }
+}
+
+/// 解析策略值（env/CLI 入口共用；serde 之外的运行时入口）。
+///
+/// 受认可值与 serde wire 契约一致：`userapp_split|all_rust|all_ts`。
+/// 非法值返回 Err（带受认可值清单，调用方 exit 前可直接展示）。
+pub fn parse_route_policy(value: &str) -> Result<RoutePolicy, String> {
+    match value.trim() {
+        "userapp_split" => Ok(RoutePolicy::UserappSplit),
+        "all_rust" => Ok(RoutePolicy::AllRust),
+        "all_ts" => Ok(RoutePolicy::AllTs),
+        other => Err(format!(
+            "invalid route policy {other:?}: expected one of userapp_split | all_rust | all_ts"
+        )),
+    }
 }
 
 /// 业务域分流的选中上游。
@@ -128,12 +158,14 @@ impl FileServerProxyConfig {
     /// - [`RoutePolicy::UserappSplit`]：`/api/userapp*` 前缀或
     ///   `x-service-type: userapp` header（任一命中）→ Rust 上游，其余 → TS 上游
     /// - [`RoutePolicy::AllRust`]：一律 Rust 上游
+    /// - [`RoutePolicy::AllTs`]：一律 TS 上游
     pub fn upstream_port_for(&self, path: &str, service_type_header: Option<&str>) -> Upstream {
         let to_rust = match self.policy {
             RoutePolicy::UserappSplit => {
                 is_userapp_path(path) || is_userapp_service_type(service_type_header)
             }
             RoutePolicy::AllRust => true,
+            RoutePolicy::AllTs => false,
         };
         if to_rust {
             Upstream::Rust(self.rust_upstream_port)
@@ -478,8 +510,14 @@ mod tests {
             serde_yaml::to_string(&RoutePolicy::AllRust).unwrap().trim(),
             "all_rust"
         );
+        assert_eq!(
+            serde_yaml::to_string(&RoutePolicy::AllTs).unwrap().trim(),
+            "all_ts"
+        );
         let parsed: RoutePolicy = serde_yaml::from_str("all_rust").unwrap();
         assert_eq!(parsed, RoutePolicy::AllRust);
+        let parsed: RoutePolicy = serde_yaml::from_str("all_ts").unwrap();
+        assert_eq!(parsed, RoutePolicy::AllTs);
         // 段缺 policy 字段 → 默认 UserappSplit（存量 config 兼容）
         let parsed: FileServerProxyConfig = serde_yaml::from_str(
             "listen_port: 60000\nrust_upstream_port: 8086\nts_upstream_port: 60001\n",
@@ -564,6 +602,64 @@ mod tests {
                 c.upstream_port_for(path, header),
                 Upstream::Rust(60002),
                 "{path} {header:?} 应一律走内嵌 Rust"
+            );
+        }
+    }
+
+    /// 全 TS 模式（AllTs）：一律 TS 上游——userApp 判据在此模式下不生效
+    /// （后端选择整体切 TS 时不存在"部分路径仍走 Rust"的语义）。
+    #[test]
+    fn all_ts_policy_routes_everything_to_ts() {
+        let c = FileServerProxyConfig {
+            listen_port: 60000,
+            rust_upstream_port: 8086,
+            ts_upstream_port: 41234,
+            policy: RoutePolicy::AllTs,
+        };
+        for (path, header) in [
+            ("/health", None),
+            ("/api/userapp/dev/start", None),
+            // userApp 显式 header 也走 TS——全 TS 语义优先于域判据
+            ("/api/computer/get-file-list", Some("userapp")),
+            ("/api/version", None),
+            ("/", None),
+        ] {
+            assert_eq!(
+                c.upstream_port_for(path, header),
+                Upstream::Ts(41234),
+                "{path} {header:?} 应一律走 TS"
+            );
+        }
+    }
+
+    /// parse_route_policy：与 serde wire 词汇表一致（含容差 trim 与非法值报错）。
+    #[test]
+    fn parse_route_policy_accepts_wire_vocabulary() {
+        assert_eq!(
+            parse_route_policy("userapp_split").unwrap(),
+            RoutePolicy::UserappSplit
+        );
+        assert_eq!(
+            parse_route_policy("all_rust").unwrap(),
+            RoutePolicy::AllRust
+        );
+        assert_eq!(parse_route_policy("all_ts").unwrap(), RoutePolicy::AllTs);
+        // trim 容差（env 值尾随空白是常见脏数据）
+        assert_eq!(parse_route_policy(" all_ts\n").unwrap(), RoutePolicy::AllTs);
+        // as_str 与 parse 互逆
+        for policy in [
+            RoutePolicy::UserappSplit,
+            RoutePolicy::AllRust,
+            RoutePolicy::AllTs,
+        ] {
+            assert_eq!(parse_route_policy(policy.as_str()).unwrap(), policy);
+        }
+        // 非法值：报错文案带受认可值清单（调用方直接展示给用户）
+        for bad in ["", "split", "ALL_RUST", "userapp"] {
+            let err = parse_route_policy(bad).unwrap_err();
+            assert!(
+                err.contains("userapp_split | all_rust | all_ts"),
+                "{bad:?} 报错应含受认可值清单: {err}"
             );
         }
     }

@@ -1,7 +1,6 @@
 //! 独立二进制可选的日志初始化；嵌入式调用方可使用自己的 subscriber。
 
 use anyhow::{Context, Result};
-use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::{LevelFilter, Targets};
@@ -13,6 +12,9 @@ use crate::Config;
 
 /// 类型擦除的 tracing layer（供嵌入式注入到外部 subscriber）。
 pub type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
+
+/// non-blocking 文件日志的刷盘 guard（公开 API 的返回类型，须可被调用方命名/持有）。
+pub use tracing_appender::non_blocking::WorkerGuard;
 
 /// 构造 file-server 独立日志的 fmt layer + WorkerGuard（供嵌入式注入到外部 subscriber）。
 ///
