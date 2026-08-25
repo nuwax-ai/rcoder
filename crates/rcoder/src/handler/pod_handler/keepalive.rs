@@ -149,7 +149,10 @@ pub async fn pod_keepalive(
             let mut project_info = ProjectAndContainerInfo::new(request.project_id.clone());
             project_info.set_user_id(Some(request.user_id.clone()));
             project_info.set_pod_id(request.pod_id.clone());
-            project_info.set_service_type(Some(ServiceType::ComputerAgentRunner));
+            // 记录解析出的真实类型（含 user-app/user-app-builder 场景）——下游
+            // cleanup 策略选择与 adapter 索引门控依赖此标签；曾误硬编码
+            // ComputerAgentRunner 导致补建的 userApp 记录走错回收策略
+            project_info.set_service_type(Some(service_type.clone()));
             project_info.set_scope(
                 request.tenant_id.clone(),
                 request.space_id.clone(),
