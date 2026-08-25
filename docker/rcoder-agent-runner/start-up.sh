@@ -1881,6 +1881,19 @@ function prepare_pg() {
     export POSTGRES_DB="${POSTGRES_DB:-dev}"
     export PGWEB_PORT="${PGWEB_PORT:-8081}"
 
+    # dbx-web(DBX 数据库 Web GUI):默认配置导出,supervisor conf.d/dbx.conf 进程继承。
+    # 密码不设默认 → 首访浏览器自设(存 $DBX_DATA_DIR/dbx.db);需固定密码时注入 DBX_PASSWORD env。
+    export DBX_PORT="${DBX_PORT:-4224}"
+    export DBX_DATA_DIR="${DBX_DATA_DIR:-/home/user/.dbx}"
+    export DBX_STATIC_DIR="${DBX_STATIC_DIR:-/usr/local/share/dbx/static}"
+    # 首次播种本地 PG 连接:dbx-web 启动时每次免认证导入 $DBX_DATA_DIR/connections.json
+    # (导入后改名 .bak + INSERT OR IGNORE,幂等;字段 snake_case 见 dbx-core ConnectionConfigData)
+    if [ ! -e "$DBX_DATA_DIR/dbx.db" ] && [ ! -e "$DBX_DATA_DIR/connections.json" ]; then
+        mkdir -p "$DBX_DATA_DIR"
+        printf '[{"id":"local-pg","name":"Local PostgreSQL","db_type":"postgres","host":"127.0.0.1","port":5432,"username":"%s","password":"%s","database":"%s"}]\n' \
+            "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB" > "$DBX_DATA_DIR/connections.json"
+    fi
+
     mkdir -p /app/logs
     # 仅备好 PGDATA 目录归属（瞬时: 无 fsync、无递归 chown）。
     # 只 chown .pgdata 本身，不碰 /home/user —— 旧版 `chown -R $(dirname $PGDATA)`
@@ -1888,11 +1901,12 @@ function prepare_pg() {
     # 项目文件属主错改成 postgres。
     install -d -o postgres -g postgres "$PGDATA"
 
-    # 连接信息（供用户参考；postgres/pgweb 进程由 supervisor 管）
+    # 连接信息（供用户参考；postgres/pgweb/dbx-web 进程由 supervisor 管）
     cat > /home/user/pg-connection.txt <<EOF
 PostgreSQL 开发数据库:
   容器内: host=localhost port=5432 user=$POSTGRES_USER password=$POSTGRES_PASSWORD database=$POSTGRES_DB sslmode=disable
 pgweb: http://localhost:$PGWEB_PORT  (Add Connection 填上述信息)
+dbx:   http://localhost:$DBX_PORT  (已预置上述连接, 双击桌面 DBX 图标即用; 首访设密码)
 EOF
     log "PG prepared (PGDATA=$PGDATA); initdb/postgres 由 supervisor 异步拉起"
 }
@@ -1914,7 +1928,7 @@ initialize_user_home
 # VNC/XFCE/MCP/audio/IME 仍由下方 start-up.sh 管（保留自定义）
 prepare_pg                                       # PG 非阻塞准备（initdb 已异步进 supervisor）
 supervisord -c /etc/supervisor/supervisord.conf  # daemon，autostart postgres/pgweb/ttyd
-log "supervisord started (manages: postgresql, pgweb, ttyd — autorestart on crash)"
+log "supervisord started (manages: postgresql, pgweb, dbx, ttyd — autorestart on crash)"
 
 # ========== MCP Proxy 服务在 X11 就绪后启动 ==========
 # 注意：chrome-devtools-mcp 需要 X11 来启动 Chromium 浏览器
@@ -2318,7 +2332,8 @@ export LC_ALL=C.UTF-8; \
 export BROWSER=/usr/bin/chromium-browser-launcher; \
 export RCODER_EMBED_FILE_SERVER=true; \
 export PROJECT_SOURCE_DIR=/home/user; \
-export USERAPP_WORKSPACE_DIR=/home/user/userapp-workspace; \
+export USERAPP_WORKSPACE_DIR=\${USERAPP_WORKSPACE_DIR:-/home/user}; \
+export USERAPP_LOG_DIR=\${USERAPP_LOG_DIR:-/home/user/logs}; \
 export FILE_SERVER_PORT=60000; \
 export PATH=/usr/local/bin:/usr/local/cargo/bin:\$PATH"
 

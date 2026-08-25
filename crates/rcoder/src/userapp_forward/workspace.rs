@@ -26,11 +26,12 @@ pub struct CreateWorkspaceBody {
 
 /// `POST /api/userapp/workspace`：创建项目显式入口（幂等）。
 ///
-/// 1. ensure 该 app 的开发容器（UserAppBuilder，per-app RWO 卷；K8s 走 STS+PVC
+/// 1. metadata 注册 owner user_id（name 空 = 开发期；部署 create_app 后补全；
+///    先于 ensure——builder 宿主树分区依赖 owner user_id）
+/// 2. ensure 该 app 的开发容器（UserAppBuilder，per-app RWO 卷；K8s 走 STS+PVC
 ///    ensure，Docker 走 per-app bind）
-/// 2. 容器内 file-server 幂等建 workspace 目录 `{USERAPP_WORKSPACE_DIR}/{appId}`
+/// 3. 容器内 file-server 幂等建 workspace 目录 `{USERAPP_WORKSPACE_DIR}/{appId}`
 ///    （execute-command 等接口要求目录已存在）
-/// 3. metadata 注册 owner user_id（name 空 = 开发期；部署 create_app 后补全）
 #[utoipa::path(
     post,
     path = "/api/userapp/workspace",
@@ -53,27 +54,10 @@ pub(crate) async fn create_workspace(
     shared_types::validate_identifier(&body.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
 
-    // 1. ensure 开发容器（幂等；注册 state.projects）
-    let info = ensure_userapp_builder(&state, &body.app_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                "[USERAPP_FORWARD] ensure dev container failed: app_id={}: {e:#}",
-                body.app_id
-            );
-            AppError::with_message(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                format!("ensure dev container failed: {e:#}"),
-            )
-        })?;
-
-    // 2. 容器内建 workspace 目录（幂等）
-    let addr = dev_file_server_addr(&state, &info);
-    super::ensure_workspace_via_dev(&addr, &body.app_id, &body.user_id)
-        .await
-        .map_err(|e| AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e))?;
-
-    // 3. metadata 注册 owner（部署前即可被发布编排/apps URL 拼接查到）
+    // 1. metadata 注册 owner（部署前即可被发布编排/apps URL 拼接查到）。
+    //    **必须先于 ensure 开发容器**：builder 挂载压平的宿主树 dev/{user_id}/{app_id}
+    //    组装依赖 owner user_id（create_builder_and_register 查元数据），先注册后
+    //    ensure 才能首次创建即落正确分区（否则兜底 app_id 分区）。
     state
         .app_service
         .record_dev_registration(&body.app_id, &body.user_id)
@@ -88,6 +72,26 @@ pub(crate) async fn create_workspace(
                 format!("record dev registration failed: {e}"),
             )
         })?;
+
+    // 2. ensure 开发容器（幂等；注册 state.projects）
+    let info = ensure_userapp_builder(&state, &body.app_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "[USERAPP_FORWARD] ensure dev container failed: app_id={}: {e:#}",
+                body.app_id
+            );
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                format!("ensure dev container failed: {e:#}"),
+            )
+        })?;
+
+    // 3. 容器内建 workspace 目录（幂等）
+    let addr = dev_file_server_addr(&state, &info);
+    super::ensure_workspace_via_dev(&addr, &body.app_id, &body.user_id)
+        .await
+        .map_err(|e| AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e))?;
 
     info!(
         "[USERAPP_FORWARD] workspace created: app_id={}, user_id={}, container={}, ip={}",

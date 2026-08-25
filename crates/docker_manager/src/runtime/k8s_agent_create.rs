@@ -180,6 +180,8 @@ impl KubernetesRuntime {
         // UserAppBuilder 不走 docker fallback：docker 段的 workspace_resolution_path 是
         // rcoder 容器视角的宿主反解锚点（/app/userapp-workspace），K8s 下误用会把
         // PVC 挂到 overlay 路径造成数据面分裂——k8s 配置缺失时直接用镜像契约默认。
+        // （UserAppBuilder 的实际挂载不走此单挂载点——见下方 volume_mounts 的
+        //  三 subPath 压平分支，此值对 builder 不生效。）
         let workspace_mount_path = k8s_service
             .map(|sc| sc.workspace_container_path())
             .or_else(|| {
@@ -191,8 +193,8 @@ impl KubernetesRuntime {
             })
             .unwrap_or_else(|| match service_type {
                 ServiceType::ComputerAgentRunner => "/home/user".to_string(),
-                // UserAppBuilder 开发容器: per-app RWO PVC 整卷挂载（与镜像 start-up.sh
-                // 导出的 USERAPP_WORKSPACE_DIR 一致, file-server/agent_runner 均按此根工作）
+                // UserAppBuilder 开发容器: 挂载压平（三 subPath 分支在 volume_mounts
+                // 构造处短路），此兜底值不生效，仅为 match 完备性保留
                 ServiceType::UserAppBuilder => {
                     shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string()
                 }
@@ -215,13 +217,62 @@ impl KubernetesRuntime {
         }
 
         // 构建 volume_mounts: workspace 挂载 + 翻译 kubernetes_config 额外挂载(挂到 agent 容器)
-        let mut volume_mounts_vec: Vec<VolumeMount> = vec![VolumeMount {
-            name: "workspace".to_string(),
-            mount_path: workspace_mount_path,
-            sub_path: workspace_sub_path, // computer→Some(user_id)，web→None；builder→None(整卷)
-            read_only: Some(false),
-            ..Default::default()
-        }];
+        let mut volume_mounts_vec: Vec<VolumeMount> =
+            if matches!(service_type, ServiceType::UserAppBuilder) {
+                // UserAppBuilder 开发容器: 同一块 per-app RWO PVC 的四个 subPath 视图
+                // （挂载压平）。卷内布局 {app_id}/ + data/ + logs/ + agent-store/
+                // （一卷一 app 拍平, env/user 层只存在于宿主/卷内, 容器内不体现）;
+                // 容器内路径是平台契约（file-server USERAPP_WORKSPACE_DIR / PGDATA /
+                // DBX_DATA_DIR env 均按此注入; .agent-store 挂载点与 agent_store.rs
+                // 的 user_root/.agent-store 契约对齐——workspace 内相对软链
+                // `../.agent-store/...` 恰好解析到该挂载点）, 不读
+                // workspace_container_path 配置——误配会造成数据面分裂（同上方排除
+                // docker fallback 的理由）。subPath 目录由 kubelet 挂载时自动创建
+                // （运行中勿在容器内删除, 重启后挂载点失效）。
+                vec![
+                    VolumeMount {
+                        name: "workspace".to_string(),
+                        mount_path: format!(
+                            "{}/{}",
+                            shared_types::paths::USERAPP_DEV_HOME,
+                            identifier
+                        ),
+                        sub_path: Some(identifier.to_string()),
+                        read_only: Some(false),
+                        ..Default::default()
+                    },
+                    VolumeMount {
+                        name: "workspace".to_string(),
+                        mount_path: shared_types::paths::USERAPP_DEV_DATA.to_string(),
+                        sub_path: Some("data".to_string()),
+                        read_only: Some(false),
+                        ..Default::default()
+                    },
+                    VolumeMount {
+                        name: "workspace".to_string(),
+                        mount_path: shared_types::paths::USERAPP_DEV_LOGS.to_string(),
+                        sub_path: Some("logs".to_string()),
+                        read_only: Some(false),
+                        ..Default::default()
+                    },
+                    VolumeMount {
+                        name: "workspace".to_string(),
+                        mount_path: shared_types::paths::USERAPP_DEV_AGENT_STORE.to_string(),
+                        sub_path: Some("agent-store".to_string()),
+                        read_only: Some(false),
+                        ..Default::default()
+                    },
+                ]
+            } else {
+                // computer→subPath=Some(user_id)，web→共享 PVC subPath；builder 不走此分支
+                vec![VolumeMount {
+                    name: "workspace".to_string(),
+                    mount_path: workspace_mount_path,
+                    sub_path: workspace_sub_path,
+                    read_only: Some(false),
+                    ..Default::default()
+                }]
+            };
         let extra_mounts: Vec<K8sVolumeMountSpec> = k8s_service
             .map(|s| s.volume_mounts.clone())
             .unwrap_or_default();
@@ -399,6 +450,20 @@ impl KubernetesRuntime {
                                 merged_env.insert(k.clone(), v.clone());
                             }
                         }
+                        // UserAppBuilder 挂载压平契约 env 是平台注入的固定值（与三
+                        // subPath 挂载点绑定）——先从 merged_env 摘除, 防 config
+                        // environment 覆盖造成数据面分裂（PGDATA 落 overlay = builder
+                        // 重建丢库）。
+                        if matches!(service_type, ServiceType::UserAppBuilder) {
+                            for var in [
+                                "USERAPP_WORKSPACE_DIR",
+                                "USERAPP_LOG_DIR",
+                                "PGDATA",
+                                "DBX_DATA_DIR",
+                            ] {
+                                merged_env.remove(var);
+                            }
+                        }
                         for (k, v) in &merged_env {
                             if RESERVED.contains(&k.as_str()) {
                                 continue;
@@ -408,6 +473,27 @@ impl KubernetesRuntime {
                                 value: Some(v.clone()),
                                 ..Default::default()
                             });
+                        }
+                        // UserAppBuilder 挂载压平契约 env（与上方三 subPath 挂载点绑定,
+                        // 值为 shared_types::paths 单一事实源）。PGDATA/DBX_DATA_DIR
+                        // 使 dev PG/dbx 数据落卷持久（镜像脚本均为 ${VAR:-...} 覆盖模式,
+                        // 无 env 时落 overlay, builder 重建即丢）。
+                        if matches!(service_type, ServiceType::UserAppBuilder) {
+                            for (name, value) in [
+                                (
+                                    "USERAPP_WORKSPACE_DIR",
+                                    shared_types::paths::USERAPP_DEV_HOME,
+                                ),
+                                ("USERAPP_LOG_DIR", shared_types::paths::USERAPP_DEV_LOGS),
+                                ("PGDATA", shared_types::paths::USERAPP_DEV_PGDATA),
+                                ("DBX_DATA_DIR", shared_types::paths::USERAPP_DEV_DBX_DATA),
+                            ] {
+                                env_vars.push(EnvVar {
+                                    name: name.to_string(),
+                                    value: Some(value.to_string()),
+                                    ..Default::default()
+                                });
+                            }
                         }
                         // 透传 UserApp build 必需 env 给 agent-runner（build 在 agent-runner 执行）:
                         // release lock 三元组（rcoder 自身 env 已有，来自 helm runtime identity 注入）。

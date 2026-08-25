@@ -139,10 +139,19 @@ async fn create_builder_and_register(
     state: &AppState,
     project_id: &str,
 ) -> Result<ContainerBasicInfo> {
+    // user_id 取 app 元数据的 owner（userapp_metadata，create-workspace/publish
+    // 注册落库）——挂载压平模型的宿主树 dev/{user_id}/{app_id} 需要真实 user_id；
+    // 查不到（存量 app 元数据缺失）兜底 app_id 兼任（旧布局语义）。
+    let owner_user_id = state
+        .app_service
+        .get_app_owner(project_id)
+        .await
+        .filter(|uid| !uid.trim().is_empty())
+        .unwrap_or_else(|| project_id.to_string());
     // UserAppBuilder identifier = project_id(app_id 兼任);host_workspace_path K8s 模式不用。
     let params = ContainerCreateParams::builder()
         .project_id(project_id.to_string())
-        .user_id(project_id.to_string())
+        .user_id(owner_user_id)
         .host_workspace_path("")
         .service_type(ServiceType::UserAppBuilder)
         .storage_size(DEFAULT_BUILDER_STORAGE_SIZE)
@@ -425,21 +434,56 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
             .await
             .map_err(|e| format!("destroy dev PVC failed: {e}"))?;
 
-        // 3. Docker 模式宿主 bind 目录清理（./userapp-workspace/{app_id}；
-        //    resolve 失败=rcoder 容器无该挂载（如 K8s 模式），跳过即可）
-        if let Ok(host_root) = docker_manager::resolve_container_path_to_host(std::path::Path::new(
-            shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
-        ))
-        .await
+        // 3. Docker 模式开发卷目录清理：经 **rcoder 容器内锚点路径**删除（bind 双向
+        //    同步宿主）。不 resolve 宿主绝对路径——它在 rcoder 容器内不可见（OrbStack
+        //    下是 VM fs，非宿主共享），历史实现因此静默失效（宿主 userapp-workspace
+        //    残留 app-* 目录的根因）。K8s 模式锚点无 bind，is_dir false 自然跳过。
+        //    新布局 dev/{user_id}/ 下四目录 + 旧布局 {锚点}/{app_id} 硬切遗留；
+        //    user_id 不经 trait 契约传递（仅 app_id），按 app_id 唯一性通配扫
+        //    dev/*/ 一层定位属主目录（per-user 目录数小，遍历成本可忽略）。
         {
-            let dev_dir = host_root.join(app_id);
-            if dev_dir.exists() {
-                tokio::fs::remove_dir_all(&dev_dir)
+            let sub_paths = [
+                app_id.to_string(),
+                format!("data/{app_id}"),
+                format!("logs/{app_id}"),
+                format!("agent-store/{app_id}"),
+            ];
+            let dev_root = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+                .join("dev");
+            if dev_root.is_dir() {
+                let mut rd = tokio::fs::read_dir(&dev_root)
                     .await
-                    .map_err(|e| format!("remove dev bind dir {}: {e}", dev_dir.display()))?;
+                    .map_err(|e| format!("read dev root {}: {e}", dev_root.display()))?;
+                while let Some(user_dir) = rd
+                    .next_entry()
+                    .await
+                    .map_err(|e| format!("iterate dev root: {e}"))?
+                {
+                    for sub in &sub_paths {
+                        let target = user_dir.path().join(sub);
+                        if target.exists() {
+                            tokio::fs::remove_dir_all(&target).await.map_err(|e| {
+                                format!("remove dev bind dir {}: {e}", target.display())
+                            })?;
+                            info!(
+                                "[USERAPP_DEV_CLEANUP] dev bind dir removed: {}",
+                                target.display()
+                            );
+                        }
+                    }
+                }
+            }
+            // 旧布局（{app_id} 直挂锚点根下）硬切遗留清理
+            let legacy_dir =
+                std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+                    .join(app_id);
+            if legacy_dir.exists() {
+                tokio::fs::remove_dir_all(&legacy_dir)
+                    .await
+                    .map_err(|e| format!("remove legacy dev dir {}: {e}", legacy_dir.display()))?;
                 info!(
-                    "[USERAPP_DEV_CLEANUP] dev bind dir removed: {}",
-                    dev_dir.display()
+                    "[USERAPP_DEV_CLEANUP] legacy dev dir removed: {}",
+                    legacy_dir.display()
                 );
             }
         }

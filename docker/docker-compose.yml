@@ -41,8 +41,10 @@ services:
       - ./computer-project-workspace:/app/computer-project-workspace
       # UserApp 开发卷锚点（Docker 模式）：per-app bind 的宿主路径反解依据
       # （user-app-builder 段 workspace_resolution_path=/app/userapp-workspace）；
-      # 开发容器实际挂宿主 ./userapp-workspace/{app_id} → 容器 /home/user/userapp-workspace，
-      # rcoder 主容器不再直接读写开发数据（per-app 独立卷语义）
+      # 宿主树 dev/{user_id}/{app_id} + data/{app_id} + logs/{app_id} + agent-store/{app_id}
+      # 四目录分别 bind → 容器 /home/user/{app_id} + /home/user/data + /home/user/logs +
+      # /home/user/.agent-store（挂载压平：env/user 层只在宿主树）；prod/{user_id}/data/{app_id}
+      # bind → UserApp 运行容器 /home/user/{app_id}（PG/dbx 持久数据与发布卷解耦）
       - ./userapp-workspace:/app/userapp-workspace
       # 挂载工作目录
       - ./logs/:/app/logs

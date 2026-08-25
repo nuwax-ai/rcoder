@@ -57,6 +57,33 @@ pub const USERAPP_WORKSPACE_ROOT: &str = "/home/user/userapp-workspace";
 /// 供 app_manager purge/destroy 时清理 `{root}/{app_id}/`（开发源码 + 构建制品 zip）。
 pub const RCODER_USERAPP_WORKSPACE_ROOT: &str = "/app/userapp-workspace";
 
+// ── UserApp 开发容器（UserAppBuilder）挂载压平契约 ─────────────────────────────
+//
+// 宿主机/K8s 卷内是完整树（compose: `{根}/dev/{user_id}/{app_id}/ + data/{app_id}/
+// + logs/{app_id}/`；K8s: per-app PVC 卷内 `{app_id}/ + data/ + logs/`），
+// 挂载把 env/user 层吸收——容器内只看到自己的三个目录，压平为：
+
+/// 开发容器内 workspace 父目录（`USERAPP_WORKSPACE_DIR` env 值；
+/// workspace = `{USERAPP_DEV_HOME}/{app_id}`，file-server 定位不变仍按 app_id）。
+pub const USERAPP_DEV_HOME: &str = "/home/user";
+
+/// 开发容器内持久数据目录（PG/dbx；`PGDATA`/`DBX_DATA_DIR` env 值的父目录）。
+pub const USERAPP_DEV_DATA: &str = "/home/user/data";
+
+/// 开发容器内持久日志目录（`USERAPP_LOG_DIR` env 值，TS file-server 同名约定）。
+pub const USERAPP_DEV_LOGS: &str = "/home/user/logs";
+
+/// 开发容器内 agent-store 实体存储目录（file-server `agent_store.rs` 契约
+/// `user_root/.agent-store`——userapp 场景 user_root=/home/user；skills 经
+/// 相对软链进 workspace `{app_id}/` 使用，挂载点布局与同一棵树路径一致）。
+pub const USERAPP_DEV_AGENT_STORE: &str = "/home/user/.agent-store";
+
+/// 开发容器内 PG 数据目录（`PGDATA` env 注入值）。
+pub const USERAPP_DEV_PGDATA: &str = "/home/user/data/pg";
+
+/// 开发容器内 dbx 数据目录（`DBX_DATA_DIR` env 注入值）。
+pub const USERAPP_DEV_DBX_DATA: &str = "/home/user/data/dbx";
+
 /// UserApp 运行容器内的应用代码根（**部署契约**：activate 后整体包落此目录，
 /// app-runtime 镜像挂载点；database 目录 SQL 执行等容器内路径拼接收口于此）。
 /// ```text

@@ -4,7 +4,7 @@
 //! 职责：参数解析 → 旧容器清理 → 配置准备 → 委托 create_container → 健康检查
 
 use container_runtime_api::ContainerCreateParams;
-use shared_types::ContainerBasicInfo;
+use shared_types::{ContainerBasicInfo, ServiceType};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -214,6 +214,21 @@ impl<'a> AgentContainerStarter<'a> {
 
         // 部署模式标识: start-up.sh 据此 source extra (Docker Compose 下 /home/user 是 bind mount, 需修权限)
         builder = builder.env("DEPLOY_MODE", "docker");
+
+        // UserAppBuilder 挂载压平契约 env（与 mounts.rs 三 bind 挂载点绑定, 值为
+        // shared_types::paths 单一事实源; 最后设置覆盖 config environment——否则
+        // PGDATA 落 overlay, builder 重建丢库）。PGDATA/DBX_DATA_DIR 使 dev 数据
+        // 落卷持久（镜像 start-up.sh 均为 ${VAR:-...} 覆盖模式）。
+        if matches!(service_type, ServiceType::UserAppBuilder) {
+            builder = builder
+                .env(
+                    "USERAPP_WORKSPACE_DIR",
+                    shared_types::paths::USERAPP_DEV_HOME,
+                )
+                .env("USERAPP_LOG_DIR", shared_types::paths::USERAPP_DEV_LOGS)
+                .env("PGDATA", shared_types::paths::USERAPP_DEV_PGDATA)
+                .env("DBX_DATA_DIR", shared_types::paths::USERAPP_DEV_DBX_DATA);
+        }
 
         // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配
 

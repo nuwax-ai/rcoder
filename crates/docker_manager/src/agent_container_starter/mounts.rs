@@ -141,19 +141,19 @@ pub(super) async fn apply_auto_mounts(
                             std::path::PathBuf::from(&workspace_container),
                         )
                     }
-                    // UserAppBuilder 完整开发容器（per-app）:
-                    // 宿主 {userapp 根}/{app_id} → 容器 USERAPP_WORKSPACE_ROOT（整目录,
-                    // 无 {app_id} 子层——与 K8s per-app PVC 整卷挂载同构;
+                    // UserAppBuilder 完整开发容器（per-app）——挂载压平:
+                    // 宿主 {根}/dev/{user_id}/{app_id} → 容器 /home/user/{app_id}
+                    // （env/user 层只在宿主树, 容器内不体现）; data/logs 两个兄弟
+                    // 挂载在主挂载之后追加。user_id 缺失兜底 app_id（防御旧调用方,
+                    // create_builder_and_register 已传真实值）。
                     // resolution path 由 config user-app-builder 段配置为
-                    // /app/userapp-workspace, 经 rcoder compose bind 反解宿主根）
+                    // /app/userapp-workspace, 经 rcoder compose bind 反解宿主根。
                     ServiceType::UserAppBuilder => {
                         let pid = project_id.unwrap_or("default");
-                        // 容器目标拼 {app_id} 一层：host {根}/{app_id} 单层挂到
-                        // {ROOT}/{app_id}——与 K8s（PVC 整卷挂 ROOT，卷内 {app_id}
-                        // 一层）盘上布局对称，按 {根}/{app_id} 做备份/迁移不漂移
+                        let uid = user_id.unwrap_or(pid);
                         (
-                            pid.to_string(),
-                            std::path::PathBuf::from(shared_types::paths::USERAPP_WORKSPACE_ROOT)
+                            format!("dev/{uid}/{pid}"),
+                            std::path::PathBuf::from(shared_types::paths::USERAPP_DEV_HOME)
                                 .join(pid),
                         )
                     }
@@ -205,6 +205,59 @@ pub(super) async fn apply_auto_mounts(
                     host_mount.display(),
                     container_mount.display()
                 );
+            }
+
+            // UserAppBuilder 追加三个数据挂载（压平模型四挂载的后三个）:
+            // 宿主 {根}/dev/{user_id}/data/{app_id} → 容器 /home/user/data（PG/dbx
+            // 持久数据, env 注入见 start()）、{根}/dev/{user_id}/logs/{app_id} →
+            // /home/user/logs（容器级持久日志, USERAPP_LOG_DIR 约定）、
+            // {根}/dev/{user_id}/agent-store/{app_id} → /home/user/.agent-store
+            // （file-server agent_store.rs 的 user_root/.agent-store 契约; workspace
+            // 内相对软链 ../.agent-store/... 恰好解析到该挂载点）。
+            // 与 K8s 四 subPath 挂载（同一块 PVC 卷内）容器内路径完全同构。
+            // 注: 宿主树 symlink 从宿主视角断链（多 app 分层 vs 容器内拍平的固有
+            // 差异）——宿主侧只删不解析（purge），无影响。
+            if pod_id.is_none() && matches!(service_type, ServiceType::UserAppBuilder) {
+                let pid = project_id.unwrap_or("default");
+                let uid = user_id.unwrap_or(pid);
+                for (sub, container_path) in [
+                    (
+                        format!("dev/{uid}/data/{pid}"),
+                        shared_types::paths::USERAPP_DEV_DATA,
+                    ),
+                    (
+                        format!("dev/{uid}/logs/{pid}"),
+                        shared_types::paths::USERAPP_DEV_LOGS,
+                    ),
+                    (
+                        format!("dev/{uid}/agent-store/{pid}"),
+                        shared_types::paths::USERAPP_DEV_AGENT_STORE,
+                    ),
+                ] {
+                    let hm = workspace_host_path.join(&sub);
+                    // 宿主目录预创建（rcoder 容器内经 bind 同步宿主; bind 源必须存在）
+                    let hdc = std::path::PathBuf::from(workspace_resolution).join(&sub);
+                    if let Err(e) = std::fs::create_dir_all(&hdc) {
+                        warn!(
+                            "[DOCKER_MGR] Failed to create dev data directory {}: {}",
+                            hdc.display(),
+                            e
+                        );
+                    }
+                    let hm_str = hm.to_string_lossy().to_string();
+                    let cm_str = container_path.to_string();
+                    auto_injected_paths.insert(cm_str.clone());
+                    builder = builder.add_mount(crate::MountPoint {
+                        host_path: hm_str,
+                        container_path: cm_str,
+                        read_only: false,
+                    });
+                    info!(
+                        "[DOCKER_MGR] Auto dev data mount: {} -> {}",
+                        hm.display(),
+                        container_path
+                    );
+                }
             }
         }
         Err(e) => {

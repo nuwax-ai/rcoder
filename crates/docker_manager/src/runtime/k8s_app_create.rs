@@ -167,33 +167,70 @@ impl KubernetesRuntime {
             },
         ]);
 
-        // 额外直接注入 APP_ID 环境变量
-        let env = Some(vec![EnvVar {
-            name: "APP_ID".to_string(),
-            value: Some(app_id.to_string()),
-            ..Default::default()
-        }]);
+        // 额外直接注入 APP_ID 环境变量 + PG/dbx 数据目录 env（数据卷挂载点绑定，
+        // start-app.sh 均为 ${VAR:-...} 覆盖模式——不注入则落旧默认 /app/data）
+        let env = Some(vec![
+            EnvVar {
+                name: "APP_ID".to_string(),
+                value: Some(app_id.to_string()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "PGDATA".to_string(),
+                value: Some(format!("/home/user/{app_id}/pg")),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "DBX_DATA_DIR".to_string(),
+                value: Some(format!("/home/user/{app_id}/dbx")),
+                ..Default::default()
+            },
+        ]);
 
         // UserApp (K8s 永远 per-app): per-app RWO RBD PVC (subPath=None), 由
         // create_app_resources ensure。rcoder **不挂载**该卷（RBD 无 subvolumePath，
         // 挂根聚合天然不可达）——部署经 env 注入 APP_DEPLOY_URL 由 app-cli 启动段
         // 下载解压，文件操作经容器内 file-server-proxy (:60000)。
         // UserApp 代码路径独立于主线 (Web/Computer 走 create_container 共享 PVC)。
-        let volumes = Some(vec![Volume {
-            name: "app-workspace".to_string(),
-            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                claim_name: self.app_workspace_pvc_name(app_id)?,
+        //
+        // 第二块 per-app RWO RBD 数据卷（`-data` 后缀）：挂 /home/user/{app_id}，
+        // 承载 PG/dbx 持久数据（env 指向其内）——与发布卷解耦，重置发布存储
+        // 不再连数据一起清。RWO 单 pod 独占（Deployment replicas=1）；pod 重建
+        // 需等 volume detach→attach（秒级，K8s 自动处理）。
+        let volumes = Some(vec![
+            Volume {
+                name: "app-workspace".to_string(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: self.app_workspace_pvc_name(app_id)?,
+                    read_only: Some(false),
+                }),
+                ..Default::default()
+            },
+            Volume {
+                name: "app-data".to_string(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: self.app_data_pvc_name(app_id)?,
+                    read_only: Some(false),
+                }),
+                ..Default::default()
+            },
+        ]);
+        let volume_mounts = Some(vec![
+            VolumeMount {
+                name: "app-workspace".to_string(),
+                mount_path: "/app".to_string(),
+                sub_path: None,
                 read_only: Some(false),
-            }),
-            ..Default::default()
-        }]);
-        let volume_mounts = Some(vec![VolumeMount {
-            name: "app-workspace".to_string(),
-            mount_path: "/app".to_string(),
-            sub_path: None,
-            read_only: Some(false),
-            ..Default::default()
-        }]);
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "app-data".to_string(),
+                mount_path: format!("/home/user/{app_id}"),
+                sub_path: None,
+                read_only: Some(false),
+                ..Default::default()
+            },
+        ]);
 
         let container = K8sContainer {
             name: APP_CONTAINER_NAME.to_string(),
@@ -558,6 +595,9 @@ impl KubernetesRuntime {
             params.storage_size.as_deref(),
         )
         .await?;
+        // 0.5 per-app 数据卷（PG/dbx 持久数据, 挂 /home/user/{app_id}）——与发布卷
+        //     同 ensure 语义（幂等, 销毁随 destroy_app_pvc 一并回收）
+        self.ensure_app_data_pvc(app_id, None).await?;
         // 1. ConfigMap（env）
         if let Some(env) = &params.env
             && !env.is_empty()

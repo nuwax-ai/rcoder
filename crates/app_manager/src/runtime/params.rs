@@ -33,6 +33,10 @@ struct AppParamsInput {
     space_id: Option<String>,
     recycle_enabled: Option<bool>,
     idle_timeout_seconds: Option<u64>,
+    /// app owner 用户 ID（create 路径来自 CreateAppRequest.user_id；update 路径 None
+    /// → inner 从元数据查）。Docker 模式数据卷 bind 源（prod/{user_id}/data/{app_id}）
+    /// 与宿主树分区依赖它；K8s 不消费（env/挂载只用 app_id）。
+    user_id: Option<String>,
 }
 
 impl AppService {
@@ -57,6 +61,7 @@ impl AppService {
                 space_id: request.space_id.clone(),
                 recycle_enabled: request.recycle_enabled,
                 idle_timeout_seconds: request.idle_timeout_seconds,
+                user_id: Some(request.user_id.clone()),
             },
         )
         .await
@@ -135,6 +140,8 @@ impl AppService {
                 idle_timeout_seconds: request
                     .idle_timeout_seconds
                     .or(current.idle_timeout_seconds),
+                // update 请求不携带 user_id（身份不变）→ inner 从元数据查
+                user_id: None,
             },
         )
         .await
@@ -162,6 +169,7 @@ impl AppService {
             space_id,
             recycle_enabled,
             idle_timeout_seconds,
+            user_id,
         } = input;
 
         // RBD 卷形态：rcoder 不读卷上 release.lock 注入身份变量——只做保留键治理
@@ -256,6 +264,15 @@ impl AppService {
         // recycle 配置 → ContainerCreateParams → Deployment 注解(rcoder.io/recycle-enabled / idle-timeout-seconds)
         if let Some(re) = recycle_enabled {
             builder = builder.recycle_enabled(re);
+        }
+        // owner user_id：input 显式值（create）优先，update 路径查元数据；两处皆无则
+        // 不设置（runtime 侧兜底 app_id——旧 app 元数据缺失场景）。Docker 模式数据卷
+        // bind 源（prod/{user_id}/data/{app_id}）按它分区。
+        let owner_user_id = user_id
+            .filter(|uid| !uid.trim().is_empty())
+            .or_else(|| self.metadata.lookup(app_id).and_then(|r| r.user_id));
+        if let Some(uid) = owner_user_id {
+            builder = builder.user_id(uid);
         }
         if let Some(it) = idle_timeout_seconds {
             builder = builder.idle_timeout_seconds(it);

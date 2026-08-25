@@ -84,12 +84,18 @@ impl AppService {
         // 同 ID 删除后重建时，必须清除旧的 stopped/wake-blocked 内存态。
         self.activity.mark_running(app_id);
         // 业务元数据落库/缓存（name/租户/业务创建时间;集群不持有。request 随后 move 进 assemble）
+        // user_id：request 显式值优先；空串=未设置（内部 ensure 构造无 user 上下文），
+        // **回填已存值**——create-workspace/build 已注册的 owner 不被覆盖清空
+        // （record 是整行 upsert；start-deploy 经此路径，清空会让 purge 的
+        // prod/{user_id}/data 定位与 apps 代理 URL 拼接丢 owner）。
+        let user_id = Some(request.user_id.clone())
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| self.metadata.lookup(app_id).and_then(|m| m.user_id.clone()));
         self.metadata
             .record(
                 app_id,
                 Some(request.name.clone()),
-                // 内部 ensure 构造可能空串(无 user 上下文回填), 空串语义=未设置
-                Some(request.user_id.clone()).filter(|u| !u.trim().is_empty()),
+                user_id,
                 request.tenant_id.clone(),
                 request.space_id.clone(),
             )

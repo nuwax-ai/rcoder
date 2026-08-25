@@ -148,6 +148,30 @@ impl crate::service::AppService {
             .destroy_app_pvc(app_id)
             .await
             .map_err(|e| map_runtime_error("destroy_app_pvc failed", e))?;
+        // Docker 模式追加：per-app 数据卷 bind 目录（{userapp 锚点}/prod/{user_id}/
+        // data/{app_id}）——对应 K8s destroy_app_pvc 删 `-data` PVC（已含，此分支
+        // 不执行）。硬错不吞：destroy 是显式高危操作（confirm=app_id），残留即孤儿；
+        // 失败时外层 record_deleted 未执行，幂等重试收敛。user_id 查元数据（行此时尚
+        // 未删），缺失兜底 app_id（与 bind 源组装的兜底一致）。
+        if !shared_types::is_kubernetes_runtime() {
+            let uid = self
+                .metadata
+                .lookup(app_id)
+                .and_then(|r| r.user_id)
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| app_id.to_string());
+            let data_dir = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+                .join("prod")
+                .join(&uid)
+                .join("data")
+                .join(app_id);
+            if data_dir.exists() {
+                tokio::fs::remove_dir_all(&data_dir)
+                    .await
+                    .map_err(|e| map_io_error("destroy app data dir failed", e, false))?;
+                info!("[APP] app data dir destroyed: {}", data_dir.display());
+            }
+        }
         // UserApp 开发资源回收（UserAppBuilder 开发容器 + per-app 开发 PVC）：
         // 经 UserappDevCleanup 契约回调宿主（app_manager 的 runtime 视图无 agent
         // 能力，ISP 分层）；best-effort——失败仅 warn 不阻断 purge，下次幂等收敛。

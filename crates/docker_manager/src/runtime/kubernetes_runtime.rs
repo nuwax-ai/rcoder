@@ -438,7 +438,10 @@ impl WorkspaceRuntime for KubernetesRuntime {
         // 委派 K8sPvcOps::destroy_workspace_pvc (service_type=UserApp; 仅 UserApp 走此路径,
         // agent PVC 永不删)。trait 方法默认 no-op, Docker 不覆盖。
         // 显式消歧: WorkspaceRuntime trait 也定义了同名方法(见下)。
-        K8sPvcOps::destroy_workspace_pvc(self, app_id, &ServiceType::UserApp).await
+        K8sPvcOps::destroy_workspace_pvc(self, app_id, &ServiceType::UserApp).await?;
+        // per-app 数据卷（PG/dbx, `-data` 后缀）随发布卷一并回收；幂等（不存在 no-op）。
+        // 失败不吞：半清理状态（数据卷残留=孤儿计费）比整体失败更难对账。
+        K8sPvcOps::destroy_app_data_pvc(self, app_id).await
     }
 
     async fn destroy_workspace_pvc(

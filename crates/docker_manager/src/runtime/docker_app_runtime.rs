@@ -51,15 +51,22 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         let container_name = app_deployment_name(&app_id);
 
         // bind 源目录先建（原 app_manager create_app_dirs 职责随 RBD 卷形态下沉到
-        // runtime——Docker daemon 对不存在源的 bind 挂载会落在宿主自动创建，但
-        // 显式 mkdir 保证 rcoder 视角可见且权限可控）
+        // runtime）。**必须 mkdir 容器内路径**（RCODER_WORKSPACE_ROOT/{app_id}，经
+        // compose bind 双向同步宿主，daemon 即刻可见）——直接 mkdir 宿主绝对路径
+        // 在 rcoder 容器内执行会落 OrbStack VM fs（非宿主共享），daemon 看不见 →
+        // bind 源缺失 400。
         if !params.host_workspace_path.is_empty() {
-            let host_ws = params.host_workspace_path.as_str();
-            tokio::fs::create_dir_all(host_ws).await.map_err(|e| {
-                ContainerRuntimeError::DockerError(format!(
-                    "create host workspace dir {host_ws}: {e}"
-                ))
-            })?;
+            let container_ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
+                .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
+            let container_ws = std::path::Path::new(&container_ws_root).join(&app_id);
+            tokio::fs::create_dir_all(&container_ws)
+                .await
+                .map_err(|e| {
+                    ContainerRuntimeError::DockerError(format!(
+                        "create workspace dir {}: {e}",
+                        container_ws.display()
+                    ))
+                })?;
         }
 
         // env（env + secrets 合并；Docker 模式无 Secret 概念）
@@ -70,6 +77,14 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         if let Some(s) = &params.secrets {
             env_map.extend(s.clone());
         }
+        // PG/dbx 数据目录 env（与数据卷挂载点 /home/user/{app_id} 绑定，平台注入
+        // 覆盖用户 env——否则落旧默认 /app/data 与发布卷耦合）。start-app.sh 均为
+        // ${VAR:-...} 覆盖模式。
+        env_map.insert("PGDATA".to_string(), format!("/home/user/{app_id}/pg"));
+        env_map.insert(
+            "DBX_DATA_DIR".to_string(),
+            format!("/home/user/{app_id}/dbx"),
+        );
         let env_vec: Vec<String> = env_map.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         // labels（供对账/list 过滤）
@@ -114,16 +129,56 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             }
         }
 
-        // workspace bind mount（host_workspace_path → /app）
-        let mounts = if !params.host_workspace_path.is_empty() {
-            Some(vec![Mount {
+        // workspace bind mount（host_workspace_path → /app）+ per-app 数据卷 bind
+        // （宿主 {userapp 根}/prod/{user_id}/data/{app_id} → /home/user/{app_id}，
+        // PG/dbx 持久数据与发布卷解耦；env PGDATA/DBX_DATA_DIR 指向其内）。
+        // 数据卷锚点反解失败 fail fast——静默降级 = PG 落容器 overlay，容器删除即丢库
+        // （与 builder 卷同款 fail-fast 语义）。
+        let mut mounts_vec: Vec<Mount> = Vec::new();
+        if !params.host_workspace_path.is_empty() {
+            mounts_vec.push(Mount {
                 target: Some("/app".to_string()),
                 source: Some(params.host_workspace_path.clone()),
                 typ: Some(MountType::BIND),
                 ..Default::default()
-            }])
-        } else {
+            });
+
+            let uid = params.user_id.clone().unwrap_or_else(|| app_id.to_string());
+            let rel = format!("prod/{uid}/data/{app_id}");
+            let host_root = crate::path::resolve_container_path_to_host(std::path::Path::new(
+                shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+            ))
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::DockerError(format!(
+                    "UserApp data volume host path resolve failed (rcoder 容器需挂载 userapp-workspace 锚点): {e}"
+                ))
+            })?;
+            let host_data = host_root.join(&rel);
+            // 预创建（rcoder 容器内经 bind 同步宿主；bind 源必须存在）
+            let precreate =
+                std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(&rel);
+            if let Err(e) = tokio::fs::create_dir_all(&precreate).await {
+                tracing::warn!(
+                    "[DOCKER_APP] create data dir {} failed (continuing): {e}",
+                    precreate.display()
+                );
+            }
+            tracing::info!(
+                "[DOCKER_APP] app data mount: {} -> /home/user/{app_id}",
+                host_data.display()
+            );
+            mounts_vec.push(Mount {
+                target: Some(format!("/home/user/{app_id}")),
+                source: Some(host_data.to_string_lossy().to_string()),
+                typ: Some(MountType::BIND),
+                ..Default::default()
+            });
+        }
+        let mounts = if mounts_vec.is_empty() {
             None
+        } else {
+            Some(mounts_vec)
         };
 
         // 加入主网络（与 rcoder 同网络，Pingora 才能通过 container_ip 访问）
