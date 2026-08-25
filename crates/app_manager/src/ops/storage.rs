@@ -107,6 +107,26 @@ impl crate::service::AppService {
         {
             return Err(map_io_error("failed to clear storage", e, false));
         }
+        // per-app 数据卷目录（prod/{user_id}/data/{app_id}——PG/dbx 持久数据）：
+        // "清空持久数据"语义的主体。K8s 分支 destroy_app_pvc 已删 data PVC（上 方
+        // return），此处仅 Docker。owner 查元数据，缺失兜底 app_id（与 bind 源
+        // 组装的兜底一致；元数据行在 clear 场景恒保留）。
+        let uid = self
+            .metadata
+            .lookup(app_id)
+            .and_then(|r| r.user_id)
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| app_id.to_string());
+        let data_dir = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+            .join("prod")
+            .join(&uid)
+            .join("data")
+            .join(app_id);
+        if data_dir.exists()
+            && let Err(e) = Self::purge_dir_contents(&data_dir).await
+        {
+            return Err(map_io_error("failed to clear app data", e, false));
+        }
         info!("[APP] app storage cleared: {}", app_id);
         Ok(())
     }

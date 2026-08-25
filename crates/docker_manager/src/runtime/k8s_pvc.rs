@@ -704,7 +704,7 @@ impl KubernetesRuntime {
         // invalidate subvolPath cache (destroy 打破 resolve_subvolume_path 的 "PVC 不可变" 假设;
         // 不清则重建同 app_id 时 resolve 命中脏值 → 读老 subvol → 数据面分裂)
         self.subvolume_path_cache.write().await.remove(pvc_name);
-        info!("[K8S] workspace PVC destroyed: {}", pvc_name);
+        info!("[K8S] PVC destroyed: {}", pvc_name);
         Ok(())
     }
 }

@@ -143,8 +143,8 @@ pub(super) async fn apply_auto_mounts(
                     }
                     // UserAppBuilder 完整开发容器（per-app）——挂载压平:
                     // 宿主 {根}/dev/{user_id}/{app_id} → 容器 /home/user/{app_id}
-                    // （env/user 层只在宿主树, 容器内不体现）; data/logs 两个兄弟
-                    // 挂载在主挂载之后追加。user_id 缺失兜底 app_id（防御旧调用方,
+                    // （env/user 层只在宿主树, 容器内不体现）; data/logs/agent-store 三个
+                    // 兄弟挂载在主挂载之后追加。user_id 缺失兜底 app_id（防御旧调用方,
                     // create_builder_and_register 已传真实值）。
                     // resolution path 由 config user-app-builder 段配置为
                     // /app/userapp-workspace, 经 rcoder compose bind 反解宿主根。

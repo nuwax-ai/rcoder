@@ -474,7 +474,7 @@ impl KubernetesRuntime {
                                 ..Default::default()
                             });
                         }
-                        // UserAppBuilder 挂载压平契约 env（与上方三 subPath 挂载点绑定,
+                        // UserAppBuilder 挂载压平契约 env（与上方四 subPath 挂载点绑定,
                         // 值为 shared_types::paths 单一事实源）。PGDATA/DBX_DATA_DIR
                         // 使 dev PG/dbx 数据落卷持久（镜像脚本均为 ${VAR:-...} 覆盖模式,
                         // 无 env 时落 overlay, builder 重建即丢）。
