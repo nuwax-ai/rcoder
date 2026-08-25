@@ -155,8 +155,12 @@ pub struct PublishTaskSnapshot {
 /// build 产物摘要（文件名 + 内容哈希 + 大小；来自 file-server build 快照）。
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ArtifactDigest {
-    /// 制品文件名（workspace-package-{release_id}.zip，static 下载路径的尾段）
+    /// 制品文件名（workspace-package-{release_id}.zip 纯文件名段）
     pub file_name: String,
+    /// 相对 workspace 根的产物路径（builds/workspace-package-{release_id}.zip）——
+    /// Java 取包 URL `/api/userapp/static/{appId}/{artifact_path}` 的拼装段
+    /// （file_name 不含目录前缀，拼接必须用本字段）。
+    pub artifact_path: String,
     /// 制品 sha256（64 位 hex——start+url 部署时作为校验值传入，幂等键组成）
     pub sha256: String,
     /// 制品字节数

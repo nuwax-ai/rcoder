@@ -94,6 +94,10 @@ pub(crate) struct BuildCreatedData {
     pub task_id: String,
     /// 受理时状态（pending——异步任务已创建）
     pub status: String,
+    /// 预生成的产物相对路径（`builds/workspace-package-{releaseId}.zip`，release_id
+    /// 创建时即生成）：构建完成前即可确定取包 URL
+    /// `/api/userapp/static/{appId}/{artifactPath}`（实际下载需任务 completed 后）。
+    pub artifact_path: String,
 }
 
 /// cancel 响应 data。
@@ -127,10 +131,15 @@ pub(crate) struct ConfirmData {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BuildUserAppBody {
-    /// UserApp 标识（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）。
+    /// UserApp 标识（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）。
     #[serde(deserialize_with = "deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub app_id: String,
+    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 时组装宿主树
+    /// `dev/{user_id}/{app_id}` 用；file-server 侧仅日志审计，不参与容器内定位）。
+    #[serde(deserialize_with = "deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub user_id: String,
 }
 
 #[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
@@ -140,6 +149,11 @@ pub(crate) struct ImportProjectBody {
     #[serde(deserialize_with = "deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub app_id: String,
+    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
+    /// 侧仅日志审计，不参与容器内定位）。
+    #[serde(deserialize_with = "deserialize_id_string")]
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub user_id: String,
     /// workspace 内的子项目目录名（模板 zip 的顶层目录；detect/confirm 的定位粒度）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_dir: String,
@@ -170,7 +184,7 @@ pub(crate) struct StreamQuery {
     pub from_seq: u64,
 }
 
-/// `POST /api/userapp/build` —— 异步发起 workspace 打包，立即返 taskId。
+/// `POST /api/userapp/build` —— 异步发起 workspace 打包，立即返 taskId + 产物路径。
 ///
 /// 编译在后台 spawn 执行（`start_build_task`）；进度经 task 流出（轮询 `/tasks/{id}` +
 /// SSE `/tasks/{id}/logs/stream`）。同 app_id 排队由 `BuildManager` per-project 互斥保证。
@@ -187,7 +201,7 @@ pub(crate) async fn build_workspace(
 ) -> UserAppReply<BuildCreatedData> {
     let result = async {
         body.validate().map_err(crate::error::from_garde)?;
-        let task_id = userapp::start_build_task(
+        let (task_id, artifact_path) = userapp::start_build_task(
             &state.build_tasks,
             &state.config,
             state.build_manager.clone(),
@@ -196,10 +210,11 @@ pub(crate) async fn build_workspace(
         )
         .await?;
 
-        tracing::info!(app_id = %body.app_id, %task_id, "userapp build task started");
+        tracing::info!(app_id = %body.app_id, user_id = %body.user_id, %task_id, %artifact_path, "userapp build task started");
         Ok(BuildCreatedData {
             task_id,
             status: "pending".to_string(),
+            artifact_path,
         })
     };
     reply(result.await)

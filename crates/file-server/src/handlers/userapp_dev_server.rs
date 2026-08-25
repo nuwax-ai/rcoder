@@ -39,7 +39,8 @@ pub(crate) struct DevOpBody {
     pub app_id: String,
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
-    /// 用户 ID（审计字段，不参与路径定位）
+    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树
+    /// `dev/{user_id}/{app_id}` 用；file-server 侧日志审计，不参与容器内定位）
     pub user_id: String,
     #[serde(default)]
     #[garde(skip)]
@@ -56,6 +57,9 @@ pub(crate) struct DevOpBody {
 pub(crate) struct DevLogsQuery {
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
+    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；
+    /// file-server 侧不参与容器内定位）
+    pub user_id: String,
     /// 日志起始行（分页, 默认 1）。
     #[serde(default = "default_start_index")]
     /// 日志起始行（分页）；默认 1
@@ -250,6 +254,12 @@ async fn spawn_dev_task(
         .create(app_id.to_string(), kind)
         .await
         .map_err(|e| AppError::business(e.to_string()))?;
+    // release_id 预生成（与 start_build_task 对称）：快照 pending 期即有确定性
+    // artifactPath；build_workspace_package 同核产出制品 zip 落同一路径。
+    let release_id = uuid::Uuid::now_v7().simple().to_string();
+    let artifact_rel_path = crate::service::userapp::workspace_artifact_rel_path(&release_id);
+    task.set_artifact_path(release_id.clone(), artifact_rel_path.clone())
+        .await;
     match resolve_userapp_dev(app_id, None, &state.config) {
         Ok(ws) => task.set_workspace_root(ws.clone()).await,
         Err(e) => {
@@ -278,6 +288,7 @@ async fn spawn_dev_task(
             &state.config,
             &state.build_manager,
             &app_id,
+            &release_id,
             state.config.dev_command_timeout_secs,
             Some(&progress),
         )
@@ -327,12 +338,15 @@ async fn spawn_dev_task(
             Ok(()) => {
                 task_clone
                     .emit(shared_types::BuildProgressEvent::Completed {
-                        // dev 任务无发布制品——占位（调用方按 status 消费，
-                        // 新端口经 dev/list 查询）
-                        release_id: String::new(),
+                        // dev 任务消费方按 status/端口（dev/list）取结果；制品字段
+                        // 仍带真实值（同核编译产出制品 zip，artifactPath 可用于
+                        // 手动取包校验）。快速路径（跳过编译）时制品不存在，
+                        // 该路径仅是预期值。
+                        release_id: release_id.clone(),
                         sha256: String::new(),
                         size_bytes: 0,
                         file_name: String::new(),
+                        artifact_path: artifact_rel_path.clone(),
                     })
                     .await;
             }
@@ -393,6 +407,7 @@ pub(crate) async fn dev_logs(
     State(state): State<AppState>,
     Query(q): Query<DevLogsQuery>,
 ) -> Result<Json<Value>, AppError> {
+    tracing::debug!(app_id = %q.app_id, user_id = %q.user_id, "userapp dev logs");
     let result = state
         .dev_server
         .read_dev_log(

@@ -90,7 +90,8 @@ pub(crate) async fn serve_page(
 
 // ── userapp static ─────────────────────────────────────────────────────────────
 
-/// `GET|OPTIONS /api/userapp/static/{appId}/{*rest}`（取整体包 workspace-package.zip）。
+/// `GET|OPTIONS /api/userapp/static/{appId}/{*rest}`（取整体包
+/// `builds/workspace-package-{releaseId}.zip`——rest 即任务快照的 `artifactPath`）。
 ///
 /// `app_id` 定位走 UserApp 开发卷（`resolve_userapp_dev`，与 build/detect/confirm 同根）。
 /// 用 COMPUTER_CORS（暴露 Range/Content-Range，支持大产物断点续传）。
@@ -99,7 +100,7 @@ pub(crate) async fn serve_page(
     path = "/static/{app_id}/{*rest}",
     params(
         ("app_id" = String, Path, description = "UserApp identifier (= workspace app_id)"),
-        ("rest" = String, Path, description = "Workspace-relative file path (e.g. workspace-package.zip)")
+        ("rest" = String, Path, description = "Workspace-relative file path (e.g. builds/workspace-package-{releaseId}.zip)")
     ),
     responses(
         (status = 200, description = "Static file", body = crate::openapi::BinaryFile, content_type = "application/octet-stream"),

@@ -35,6 +35,9 @@ use tokio_util::sync::CancellationToken;
 pub struct AppFilesUploadForm {
     /// UserApp 应用 ID（定位 = resolve_userapp_dev；单 app 模式须与归属一致）
     pub app_id: String,
+    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
+    /// 侧仅日志审计，不参与容器内定位）
+    pub user_id: String,
     /// app 根相对目标（压缩包=解压目录；单文件=文件路径）
     pub target: String,
     /// 压缩包解压后单层归一（默认 false）
@@ -51,6 +54,7 @@ pub(crate) async fn upload(
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut app_id = None;
+    let mut user_id = None;
     let mut target = None;
     let mut flatten = false;
     let mut data = None;
@@ -61,6 +65,7 @@ pub(crate) async fn upload(
     {
         match field.name().unwrap_or("") {
             "appId" => app_id = Some(text_field(field).await?),
+            "userId" => user_id = Some(text_field(field).await?),
             "target" => target = Some(text_field(field).await?),
             "flatten" => flatten = matches!(text_field(field).await?.trim(), "true" | "1" | "yes"),
             "file" => {
@@ -77,11 +82,12 @@ pub(crate) async fn upload(
         }
     }
     let app_id = require_app_field(app_id, "appId")?;
+    let user_id = require_app_field(user_id, "userId")?;
     let target = require_app_field(target, "target")?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     let root = resolve_userapp_dev(&app_id, None, &state.config)?;
     let result = upload_impl(&root, &target, flatten, data.path(), data.size()).await?;
-    info!(app_id = %app_id, target = %target, "app-files upload done");
+    info!(app_id = %app_id, user_id = %user_id, target = %target, "app-files upload done");
     Ok(Json(json!({
         "success": true,
         "file_path": result.file_path,
@@ -179,6 +185,9 @@ pub struct AppFilesUploadFromUrlBody {
     pub flatten: bool,
     /// UserApp 应用 ID（定位）
     pub app_id: String,
+    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
+    /// 侧仅日志审计，不参与容器内定位）
+    pub user_id: String,
 }
 
 /// `POST /api/userapp/app-files/upload-from-url`: 容器内流式下载后走上传核心。
@@ -204,7 +213,7 @@ pub(crate) async fn upload_from_url(
         .map(|m| m.len())
         .map_err(|e| AppError::system(format!("stat downloaded file: {e}")))?;
     let result = upload_impl(&root, &body.target, body.flatten, tmp.path(), size).await?;
-    info!(app_id = %body.app_id, url = %body.url, "app-files upload-from-url done");
+    info!(app_id = %body.app_id, user_id = %body.user_id, url = %body.url, "app-files upload-from-url done");
     Ok(Json(json!({
         "success": true,
         "file_path": result.file_path,
@@ -221,6 +230,9 @@ pub(crate) async fn upload_from_url(
 pub struct AppFilesListParams {
     /// UserApp 应用 ID（定位）
     pub app_id: String,
+    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
+    /// 侧仅审计，不参与容器内定位）
+    pub user_id: String,
     /// app 根相对子目录（缺省列根）
     #[serde(default)]
     pub path: Option<String>,
@@ -238,6 +250,7 @@ pub(crate) async fn list(
     State(state): State<AppState>,
     Query(params): Query<AppFilesListParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    tracing::debug!(app_id = %params.app_id, user_id = %params.user_id, "app-files list");
     let root = resolve_userapp_dev(&params.app_id, None, &state.config)?;
     if !root.exists() {
         return Ok(Json(json!({"success": true, "files": []})));
@@ -298,6 +311,9 @@ pub(crate) async fn list(
 pub struct AppFilesDeleteBody {
     /// UserApp 应用 ID（定位）
     pub app_id: String,
+    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
+    /// 侧仅日志审计，不参与容器内定位）
+    pub user_id: String,
     /// app 根相对文件/目录
     pub path: String,
 }
@@ -308,6 +324,7 @@ pub(crate) async fn delete(
     State(state): State<AppState>,
     Json(body): Json<AppFilesDeleteBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    info!(app_id = %body.app_id, user_id = %body.user_id, path = %body.path, "app-files delete");
     let root = resolve_userapp_dev(&body.app_id, None, &state.config)?;
     if !root.exists() {
         return Err(AppError::resource(format!(

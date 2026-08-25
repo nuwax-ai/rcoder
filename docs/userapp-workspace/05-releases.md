@@ -1,6 +1,8 @@
 # 版本化发布与回滚
 
-产物名为 `workspace-package-<release_id>.zip`，根目录必须包含
+产物名为 `workspace-package-<release_id>.zip`（落 workspace 的 `builds/` 子目录——
+build 任务创建时即可从响应/快照的 `artifactPath` 字段拿到确定性相对路径，取包走
+`GET /api/userapp/static/{appId}/{artifactPath}`），根目录必须包含
 `workspace.manifest.toml` 和 `release.lock.toml`。
 
 ```text

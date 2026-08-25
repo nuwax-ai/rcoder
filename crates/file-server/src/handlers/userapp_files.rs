@@ -588,6 +588,7 @@ mod tests {
             State(state),
             AppJson(super::super::userapp::ImportProjectBody {
                 app_id: "app-1".into(),
+                user_id: "u1".into(),
                 project_dir: "demo-app".into(),
             }),
         )

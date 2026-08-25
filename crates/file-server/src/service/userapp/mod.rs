@@ -3,7 +3,7 @@
 //! - workspace 定位统一 [`crate::workspace::resolve_userapp_dev`]（UserApp 开发卷, 容器无关）。
 //!   workspace 根下有多个子项目（前端/后端/...）。
 //! - file-server 严格读取 Manifest v1，并自动发现一级子项目。
-//! - 组装成版本化整体包 `workspace-package-<release_id>.zip`，内含 release lock。
+//! - 组装成版本化整体包 `builds/workspace-package-<release_id>.zip`，内含 release lock。
 //!
 //! 子模块：
 //! - [`manifest`]：两级 manifest 类型 + 解析
@@ -35,13 +35,26 @@ use tasks::{BuildProgressEvent, BuildTask, BuildTaskId, BuildTaskKind, BuildTask
 
 pub(crate) use tasks::BuildTask as UserappBuildTask;
 
-/// 整体包产物文件名（放在 workspace 根，供 `GET /api/userapp/static` 下载）。
+/// 整体包产物文件名前缀（产物落 `{ws}/builds/` 子目录，见 [`WORKSPACE_BUILDS_DIR`]，
+/// 供 `GET /api/userapp/static/{appId}/{artifactPath}` 下载）。
 pub const WORKSPACE_PACKAGE_PREFIX: &str = "workspace-package-";
+
+/// workspace 内的构建产物目录（整体包落 `{ws}/builds/`；模板 .gitignore 忽略）。
+pub const WORKSPACE_BUILDS_DIR: &str = "builds";
+
+/// 拼 workspace 相对产物路径（`builds/workspace-package-{release_id}.zip`）——
+/// build 创建响应/任务快照/Completed 事件的 `artifactPath` 同源。
+pub fn workspace_artifact_rel_path(release_id: &str) -> String {
+    format!("{WORKSPACE_BUILDS_DIR}/{WORKSPACE_PACKAGE_PREFIX}{release_id}.zip")
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceBuildArtifact {
     pub release_id: String,
+    /// 产物绝对路径（`{ws}/builds/{file_name}`）。
     pub path: PathBuf,
+    /// 相对 workspace 根的产物路径（`builds/{file_name}`）——static 取包 URL 拼段。
+    pub rel_path: String,
     pub file_name: String,
     pub sha256: String,
     pub size_bytes: u64,
@@ -61,11 +74,14 @@ struct BuiltProject {
 /// 3. 遍历子项目：读 `project.manifest.toml` → `build_generic(cmd, artifact, cwd={ws}/{path})`
 /// 4. [`assemble::assemble_workspace_package`] 组装整体包（含 pingap 配置 + `.service-ports`）
 ///
+/// `release_id` 由调用方预生成（start_build_task 在任务创建时生成并预置进 task
+/// 快照——创建响应即可返回确定性产物路径），本函数不再内部生成。
 /// 返回版本化整体包及其 release ID、摘要和大小。
 pub async fn build_workspace_package(
     config: &crate::Config,
     build_manager: &BuildManager,
     app_id: &str,
+    release_id: &str,
     timeout_secs: u64,
     progress: Option<&BuildTask>,
 ) -> AppResult<WorkspaceBuildArtifact> {
@@ -180,7 +196,6 @@ pub async fn build_workspace_package(
         });
     }
 
-    let release_id = uuid::Uuid::now_v7().simple().to_string();
     let pingap_version = required_release_metadata("RCODER_PINGAP_VERSION")?;
     let pingap_commit = required_release_metadata("RCODER_PINGAP_COMMIT")?;
     let runtime_image_digest = required_release_metadata("RCODER_RUNTIME_IMAGE_DIGEST")?;
@@ -188,7 +203,7 @@ pub async fn build_workspace_package(
         &manifest,
         &discovered,
         ReleaseMetadata {
-            release_id: &release_id,
+            release_id,
             pingap_version: &pingap_version,
             pingap_commit: &pingap_commit,
             minimum_app_cli_version: env!("CARGO_PKG_VERSION"),
@@ -197,35 +212,50 @@ pub async fn build_workspace_package(
     )
     .map_err(|e| AppError::business(e.to_string()))?;
     let file_name = format!("{WORKSPACE_PACKAGE_PREFIX}{release_id}.zip");
-    let path = assemble_workspace_package(&ws, &built, &lock, &file_name).await?;
+    // 产物落 {ws}/builds/ 子目录（assemble 的 ws.join(file_name) + create_dir_all(parent)
+    // 天然支持含子目录前缀的 file_name）
+    let rel_path = workspace_artifact_rel_path(release_id);
+    let path = assemble_workspace_package(&ws, &built, &lock, &rel_path).await?;
     let (sha256, size_bytes) = hash_file(&path).await?;
     Ok(WorkspaceBuildArtifact {
-        release_id,
+        release_id: release_id.to_string(),
         path,
+        rel_path,
         file_name,
         sha256,
         size_bytes,
     })
 }
 
-/// 异步发起 build 任务（不阻塞，立即返 taskId）。进度事件经 task 流出（SSE/轮询）。
+/// 异步发起 build 任务（不阻塞，立即返 taskId + 预生成的产物相对路径）。进度事件
+/// 经 task 流出（SSE/轮询）。
 ///
 /// 同 app_id 互斥由 `build_workspace_package` 最外层 `try_start(app_id)` 持有的
 /// `BuildGuard` 保证(覆盖整个构建周期,跨所有子项目)。重复构建立即返回 409 fail-fast
 /// (非排队);该 guard 同时占用 1 个全局并发 permit,以引用传给每个子项目 build_generic。
 /// 非循环路径的 Err（如 release lock env 缺失）由这里兜底 emit Failed。
+///
+/// 返回 `(task_id, artifact_path)`——artifact_path 为预生成的确定性产物相对路径
+/// （release_id 在此预生成，创建响应即可返回）。
 pub async fn start_build_task(
     store: &BuildTaskStore,
     config: &Arc<crate::Config>,
     build_manager: Arc<BuildManager>,
     app_id: String,
     timeout_secs: u64,
-) -> Result<BuildTaskId, AppError> {
+) -> Result<(BuildTaskId, String), AppError> {
     // 容量耗尽(全活跃任务达上限)→ 立即拒绝,不再越过上限插入(#12)。
     let task = store
         .create(app_id.clone(), BuildTaskKind::Build)
         .await
         .map_err(|e| AppError::business(e.to_string()))?;
+    // release_id 预生成并预置进快照：创建响应（BuildCreatedData.artifactPath）与
+    // pending 期轮询即可见确定性产物路径；build_workspace_package 消费同一值,
+    // Completed 事件携带一致路径覆盖（两处同源）。
+    let release_id = uuid::Uuid::now_v7().simple().to_string();
+    let artifact_path = workspace_artifact_rel_path(&release_id);
+    task.set_artifact_path(release_id.clone(), artifact_path.clone())
+        .await;
     // 预 resolve workspace 根并存入 task,供 logs/SSE handler 解析日志目录
     // ({workspace}/logs/{service}/)。resolve 失败则 emit Failed 终态,不 spawn。
     match crate::workspace::resolve_userapp_dev(&app_id, None, config) {
@@ -235,7 +265,7 @@ pub async fn start_build_task(
                 error: format!("resolve workspace: {e}"),
             })
             .await;
-            return Ok(task.id.clone());
+            return Ok((task.id.clone(), artifact_path));
         }
     }
     let task_spawn = task.clone();
@@ -245,6 +275,7 @@ pub async fn start_build_task(
             &config,
             build_manager.as_ref(),
             &app_id,
+            &release_id,
             timeout_secs,
             Some(&task_spawn),
         )
@@ -259,6 +290,7 @@ pub async fn start_build_task(
                         sha256: artifact.sha256.clone(),
                         size_bytes: artifact.size_bytes,
                         file_name: artifact.file_name.clone(),
+                        artifact_path: artifact.rel_path.clone(),
                     })
                     .await;
             }
@@ -273,7 +305,7 @@ pub async fn start_build_task(
             }
         }
     });
-    Ok(task.id.clone())
+    Ok((task.id.clone(), artifact_path))
 }
 
 fn required_release_metadata(name: &str) -> AppResult<String> {

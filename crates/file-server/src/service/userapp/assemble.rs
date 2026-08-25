@@ -189,7 +189,10 @@ mod tests {
     use crate::service::zip; // 本地 zip::extract_to（解整体包做断言；非 test 代码用 ::zip 外部 crate raw copy）
     use shared_types::{LockedPingap, PingapMode};
 
-    const TEST_PACKAGE: &str = "workspace-package-test-release.zip";
+    /// 产物相对路径（含 builds/ 子目录前缀——生产调用方传 rel_path 形态）。
+    const TEST_PACKAGE_REL: &str = "builds/workspace-package-test-release.zip";
+    /// 纯文件名段。
+    const TEST_PACKAGE_FILE: &str = "workspace-package-test-release.zip";
 
     fn test_lock() -> ReleaseLock {
         ReleaseLock {
@@ -290,10 +293,18 @@ mod tests {
             },
         ];
 
-        let out = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE)
+        let out = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE_REL)
             .await
             .expect("assemble workspace package");
-        assert_eq!(out.file_name().unwrap().to_str().unwrap(), TEST_PACKAGE);
+        assert_eq!(
+            out.file_name().unwrap().to_str().unwrap(),
+            TEST_PACKAGE_FILE
+        );
+        // 产物落 {ws}/builds/ 子目录（父目录自动创建）
+        assert_eq!(
+            out.parent().unwrap().file_name().unwrap().to_str().unwrap(),
+            "builds"
+        );
 
         // 解开整体包校验预定义结构
         let extract_dst = tempfile::tempdir().expect("extract tempdir");
@@ -352,7 +363,7 @@ mod tests {
             artifact: fe_zip,
         }];
 
-        let out = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE)
+        let out = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE_REL)
             .await
             .expect("assemble without entry files");
         let extract_dst = tempfile::tempdir().expect("extract tempdir");
@@ -381,11 +392,12 @@ mod tests {
             artifact: bad_zip,
         }];
 
-        let result = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE).await;
+        let result =
+            assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE_REL).await;
         assert!(result.is_err(), "assemble should fail on corrupt artifact");
 
         // 失败后半成品版本包必须被清理。
-        let out = ws_path.join(TEST_PACKAGE);
+        let out = ws_path.join(TEST_PACKAGE_REL);
         assert!(
             !out.exists(),
             "partial workspace package should be cleaned up on failure"

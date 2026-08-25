@@ -25,13 +25,16 @@ pub enum BuildProgressEvent {
     /// 一行日志(实时 tail)
     #[serde(rename_all = "camelCase")]
     Log { service: String, line: String },
-    /// 任务完成(build 产 release_id + 包摘要)
+    /// 任务完成(build 产 release_id + 包摘要)。`artifact_path` 为相对 workspace
+    /// 根的产物路径（`builds/workspace-package-{releaseId}.zip`）——取包 URL
+    /// `/api/userapp/static/{appId}/{artifactPath}` 的直接拼装段。
     #[serde(rename_all = "camelCase")]
     Completed {
         release_id: String,
         sha256: String,
         size_bytes: u64,
         file_name: String,
+        artifact_path: String,
     },
     /// 任务失败
     Failed { error: String },
@@ -43,7 +46,7 @@ pub enum BuildProgressEvent {
 mod tests {
     use super::*;
 
-    /// wire 全 camelCase:tag 值(buildOk)+ 字段(releaseId/sizeBytes/fileName)。
+    /// wire 全 camelCase:tag 值(buildOk)+ 字段(releaseId/sizeBytes/fileName/artifactPath)。
     #[test]
     fn completed_event_serializes_all_camel_case() {
         let ev = BuildProgressEvent::Completed {
@@ -51,6 +54,7 @@ mod tests {
             sha256: "abc".into(),
             size_bytes: 1024,
             file_name: "r1.zip".into(),
+            artifact_path: "builds/r1.zip".into(),
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(
@@ -72,6 +76,10 @@ mod tests {
         assert!(
             json.contains(r#""sha256":"abc""#),
             "sha256 unchanged: {json}"
+        );
+        assert!(
+            json.contains(r#""artifactPath":"builds/r1.zip""#),
+            "artifactPath camelCase: {json}"
         );
         // round-trip
         let back: BuildProgressEvent = serde_json::from_str(&json).unwrap();
@@ -102,6 +110,7 @@ mod tests {
                 sha256: "s".into(),
                 size_bytes: 1,
                 file_name: "f".into(),
+                artifact_path: "builds/f".into(),
             },
             BuildProgressEvent::Failed { error: "e".into() },
             BuildProgressEvent::Cancelled,

@@ -81,25 +81,39 @@ async fn run_build_inner(
         stage: PublishStage::Build,
     })
     .await;
-    let build_task_id = client::trigger_build(&addr, app_id).await?;
+    // build 请求体 userId 必填（file-server 挂载压平契约字段）：优先 app 元数据
+    // owner（handler 在 build 受理时已 record_dev_registration），查不到兜底 app_id。
+    let build_user_id = state
+        .app_service
+        .get_app_owner(app_id)
+        .await
+        .filter(|uid| !uid.trim().is_empty())
+        .unwrap_or_else(|| app_id.to_string());
+    let build_task_id = client::trigger_build(&addr, app_id, &build_user_id).await?;
     task.set_remote_build(addr.clone(), build_task_id.clone())
         .await;
     match wait_build(&addr, &build_task_id, task).await? {
         BuildOutcome::Completed => {
             // 产物摘要回填（file-server build 快照是唯一真源：release_id/sha256/
-            // size/file_name 由构建侧 hash_file 计算）：Java 轮询任务快照即可取包，
-            // 不必从 SSE 事件捞。快照拉取失败不阻断终态（终态是构建成败的事实，
-            // 摘要是附加数据）；但**字段不全时不得拼半截摘要**——file_name 是
-            // Java 取包 URL（/static/{app_id}/{file_name}）的关键依据，空串会拼
-            // 出坏 URL，比无摘要更糟。Completed 任务缺 file_name 属协议异常
-            // （远端版本不匹配/数据损坏），按摘要不可用降级 + error 留痕。
+            // size/file_name/artifact_path 由构建侧 hash_file 计算）：Java 轮询任务
+            // 快照即可取包，不必从 SSE 事件捞。快照拉取失败不阻断终态（终态是构建
+            // 成败的事实，摘要是附加数据）；但**字段不全时不得拼半截摘要**——
+            // artifact_path 是 Java 取包 URL（/static/{app_id}/{artifactPath}）的
+            // 关键依据，空串会拼出坏 URL，比无摘要更糟。Completed 任务缺字段属
+            // 协议异常（远端版本不匹配/数据损坏），按摘要不可用降级 + error 留痕。
             match client::get_build_snapshot(&addr, &build_task_id).await {
                 Ok(snap) => {
                     let release_id = snap.release_id.clone();
-                    match (&snap.file_name, &snap.sha256, snap.size_bytes) {
-                        (Some(file_name), Some(sha256), Some(size_bytes)) => {
+                    match (
+                        &snap.file_name,
+                        &snap.artifact_path,
+                        &snap.sha256,
+                        snap.size_bytes,
+                    ) {
+                        (Some(file_name), Some(artifact_path), Some(sha256), Some(size_bytes)) => {
                             task.set_artifact(super::types::ArtifactDigest {
                                 file_name: file_name.clone(),
+                                artifact_path: artifact_path.clone(),
                                 sha256: sha256.clone(),
                                 size_bytes,
                             })

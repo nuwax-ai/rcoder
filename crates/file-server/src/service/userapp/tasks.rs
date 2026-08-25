@@ -67,6 +67,9 @@ pub struct BuildTaskSnapshot {
     pub sha256: Option<String>,
     pub size_bytes: Option<u64>,
     pub file_name: Option<String>,
+    /// 相对 workspace 根的产物路径(`builds/workspace-package-{releaseId}.zip`)——
+    /// 任务创建时预生成(pending 期即有值),Java 取包 URL 直接拼段。
+    pub artifact_path: Option<String>,
     pub error: Option<String>,
     pub seq: u64,
     pub created_at: i64,
@@ -85,6 +88,8 @@ struct TaskState {
     sha256: Option<String>,
     size_bytes: Option<u64>,
     file_name: Option<String>,
+    /// 相对 workspace 根的产物路径(start_build_task 预生成时 set;Completed 一致覆盖)。
+    artifact_path: Option<String>,
     error: Option<String>,
     /// workspace 根 (build/publish 工作区): logs/SSE 查询路径解析用。预 resolve 后存入。
     workspace_root: Option<PathBuf>,
@@ -134,6 +139,7 @@ impl BuildTask {
                 sha256: None,
                 size_bytes: None,
                 file_name: None,
+                artifact_path: None,
                 error: None,
                 workspace_root: None,
                 seq: 0,
@@ -162,6 +168,7 @@ impl BuildTask {
             sha256: s.sha256.clone(),
             size_bytes: s.size_bytes,
             file_name: s.file_name.clone(),
+            artifact_path: s.artifact_path.clone(),
             error: s.error.clone(),
             seq: s.seq,
             created_at: self.created_at,
@@ -177,6 +184,14 @@ impl BuildTask {
     /// 记录 workspace 根 (start_build_task 预 resolve 后存入),供 logs/SSE 解析日志目录。
     pub async fn set_workspace_root(&self, root: PathBuf) {
         self.state.lock().await.workspace_root = Some(root);
+    }
+
+    /// 预置产物路径与 release_id（start_build_task 预生成 release_id 后存入,
+    /// 快照 pending 期即可见;Completed 事件携带一致值覆盖,两处同源不漂移）。
+    pub async fn set_artifact_path(&self, release_id: String, artifact_path: String) {
+        let mut s = self.state.lock().await;
+        s.release_id = Some(release_id);
+        s.artifact_path = Some(artifact_path);
     }
 
     /// workspace 根; 任务 resolve 前为 None (logs handler 据此判断日志目录是否就绪)。
@@ -315,11 +330,13 @@ fn apply_event(state: &mut TaskState, event: &BuildProgressEvent) {
             sha256,
             size_bytes,
             file_name,
+            artifact_path,
         } => {
             state.release_id = Some(release_id.clone());
             state.sha256 = Some(sha256.clone());
             state.size_bytes = Some(*size_bytes);
             state.file_name = Some(file_name.clone());
+            state.artifact_path = Some(artifact_path.clone());
             state.status = BuildTaskStatus::Completed;
         }
         BuildProgressEvent::Failed { error } => {
@@ -442,6 +459,7 @@ mod tests {
             sha256: "a".repeat(64),
             size_bytes: 1,
             file_name: "release-1.zip".into(),
+            artifact_path: "builds/release-1.zip".into(),
         });
         let failed = task.emit(BuildProgressEvent::Failed {
             error: "late failure".into(),
@@ -490,6 +508,7 @@ mod tests {
                 sha256: "a".repeat(64),
                 size_bytes: 1,
                 file_name: "release-a.zip".into(),
+                artifact_path: "builds/release-a.zip".into(),
             })
             .await;
 

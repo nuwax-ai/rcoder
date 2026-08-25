@@ -31,8 +31,9 @@ struct BuildStarted {
     task_id: String,
 }
 
-/// build 任务快照的 data(`{status, releaseId, sha256, sizeBytes, fileName, error}`)。
-/// 消费方:orchestrator(产物摘要三字段)、agent_runner(断流恢复终态判定)。
+/// build 任务快照的 data(`{status, releaseId, sha256, sizeBytes, fileName,
+/// artifactPath, error}`)。消费方:orchestrator(产物摘要四字段)、agent_runner
+/// (断流恢复终态判定)。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BuildSnapshot {
@@ -42,6 +43,9 @@ pub(crate) struct BuildSnapshot {
     pub sha256: Option<String>,
     pub size_bytes: Option<u64>,
     pub file_name: Option<String>,
+    /// 相对 workspace 根的产物路径（builds/...）——Java 取包 URL 拼段（尾段 file_name
+    /// 已不含目录前缀，拼接须用本字段）。
+    pub artifact_path: Option<String>,
 }
 
 /// agent-runner(file-server)HttpResult 响应解析错误(结构化:code/message 字段保留,
@@ -155,12 +159,12 @@ fn fs_error_from_bytes(bytes: &[u8], status: reqwest::StatusCode, where_: &str) 
 }
 
 /// 触发 agent-runner workspace build,返 taskId(类型化:HttpResult data.taskId)。
-pub async fn trigger_build(addr: &str, app_id: &str) -> anyhow::Result<String> {
+pub async fn trigger_build(addr: &str, app_id: &str, user_id: &str) -> anyhow::Result<String> {
     let url = format!("{addr}/api/userapp/build");
     let resp = HTTP_CLIENT
         .post(&url)
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .json(&json!({ "appId": app_id }))
+        .json(&json!({ "appId": app_id, "userId": user_id }))
         .send()
         .await
         .with_context(|| format!("agent-runner build request: {url}"))?;

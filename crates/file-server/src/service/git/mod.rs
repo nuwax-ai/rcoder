@@ -32,6 +32,9 @@ pub const DEFAULT_GITIGNORE_ENTRIES: &[&str] = &[
     "dist/",
     "dist-packages/",
     "build/",
+    // userApp 整体包产物（{ws}/builds/——ensure_gitignore append-only,
+    // 存量 workspace 下次 git 操作自动补齐）
+    "builds/",
     ".idea/",
     ".vscode/",
     ".DS_Store",
