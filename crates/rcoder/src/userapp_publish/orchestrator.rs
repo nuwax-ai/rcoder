@@ -104,16 +104,21 @@ async fn run_build_inner(
             match client::get_build_snapshot(&addr, &build_task_id).await {
                 Ok(snap) => {
                     let release_id = snap.release_id.clone();
-                    match (
-                        &snap.file_name,
-                        &snap.artifact_path,
-                        &snap.sha256,
-                        snap.size_bytes,
-                    ) {
-                        (Some(file_name), Some(artifact_path), Some(sha256), Some(size_bytes)) => {
+                    match (&snap.file_name, &snap.sha256, snap.size_bytes) {
+                        (Some(file_name), Some(sha256), Some(size_bytes)) => {
+                            // artifact_path 缺失 = 旧版 builder（产物落 workspace 根,
+                            // STS 模板不自动更新——升级窗口内存量 builder 无此字段）：
+                            // 回退 file_name 作相对路径，恰好是旧版的正确取包路径
+                            // （/static/{app_id}/{file_name}）。非空串兜底——语义等价
+                            // 旧协议，升级窗口不断链。
+                            let artifact_path = snap
+                                .artifact_path
+                                .clone()
+                                .filter(|p| !p.trim().is_empty())
+                                .unwrap_or_else(|| file_name.clone());
                             task.set_artifact(super::types::ArtifactDigest {
                                 file_name: file_name.clone(),
-                                artifact_path: artifact_path.clone(),
+                                artifact_path,
                                 sha256: sha256.clone(),
                                 size_bytes,
                             })
