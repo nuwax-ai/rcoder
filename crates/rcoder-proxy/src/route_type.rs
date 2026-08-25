@@ -90,6 +90,22 @@ pub enum RouteType {
     RuntimeTtydProxy,
     RuntimePgwebProxy,
 
+    /// DBX 数据库 Web GUI 两阶段代理族: `/proxy/{dev,prod}/dbx/{app_id}/{*path}`
+    ///
+    /// dbx-web（60+ 数据库 GUI，两镜像 supervisor 恒起 :4224）按 **app_id** 定位，
+    /// stage 静态段区分定位方式（与 devapps/apps 端口代理族的 dev/prod 语义对齐）：
+    /// **dev**: `/proxy/dev/dbx/{app_id}/{*path}` → UserAppBuilder 开发容器
+    ///   （agent-runner 镜像）；注册表 find_by_project_id(app_id, UserAppBuilder)，
+    ///   未建 workspace → 404（同 dev 终端族）
+    /// **prod**: `/proxy/prod/dbx/{app_id}/{*path}` → UserApp 运行容器
+    ///   （app-runtime 镜像）；find_app_runtime_addr 确定性命名构造，
+    ///   未部署/停止 → 上游连接失败 502（同 runtime 族）
+    ///
+    /// 代理剥前缀直连 root 模式 dbx（同 pgweb）：前端 webPath.ts 从
+    /// location.pathname 运行时推断 base，API/WS 自动拼回 `/proxy/{stage}/dbx/{app_id}`。
+    DevDbxProxy,
+    ProdDbxProxy,
+
     /// 健康检查: `/health`
     ///
     /// **功能**: 返回 Pingora 代理服务的健康状态

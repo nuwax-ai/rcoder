@@ -250,6 +250,23 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
         })?;
     }
 
+    // DBX 数据库 Web GUI 两阶段代理族（dev=开发容器 / prod=运行容器，均直连 :4224）。
+    // 静态段 dev/prod/dbx 按 matchit 静态优先级压过既有 `/proxy/{port}/{*path}` 参数路由
+    // （PortProxy 的 port 语义为数字，"dev"/"prod" 不构成合法端口，无歧义）。
+    for (prefix, route) in [
+        ("/proxy/dev/dbx/{app_id}/{*path}", RouteType::DevDbxProxy),
+        ("/proxy/dev/dbx/{app_id}", RouteType::DevDbxProxy),
+        ("/proxy/prod/dbx/{app_id}/{*path}", RouteType::ProdDbxProxy),
+        ("/proxy/prod/dbx/{app_id}", RouteType::ProdDbxProxy),
+    ] {
+        router.insert(prefix, route).map_err(|e| {
+            tracing::error!("[ROUTER] dbx proxy route {prefix} config failed: {e}");
+            crate::ProxyError::RouteConfig(format!(
+                "dbx proxy route {prefix} configuration error: {e}"
+            ))
+        })?;
+    }
+
     router
         .insert("/health", RouteType::HealthCheck)
         .map_err(|e| {
@@ -641,6 +658,69 @@ mod tests {
         assert_eq!(
             *router.at("/proxy/apps/u1/app-1/4000/x").unwrap().value,
             RouteType::AppPortProxy
+        );
+
+        // dbx 两阶段族：静态段 dev/prod/dbx 优先于 /proxy/{port} 参数路由，
+        // path 剥前缀语义（app_id + 剩余 path）与 userapp 族一致。
+        // 尾斜杠路径（`/app-1/`）在裸 router 会因 {*path} ≥1 字符落进
+        // /proxy/{port} 兜底——生产匹配前必经 normalize_path 剥尾斜杠
+        //（proxy_http 两处同款），故尾斜杠用例按归一化后断言（同既有家族语义）。
+        for (path, expected, expected_app, expected_rest) in [
+            (
+                "/proxy/dev/dbx/app-1",
+                RouteType::DevDbxProxy,
+                "app-1",
+                None,
+            ),
+            (
+                "/proxy/dev/dbx/app-1/api/auth/check",
+                RouteType::DevDbxProxy,
+                "app-1",
+                Some("api/auth/check"),
+            ),
+            (
+                "/proxy/dev/dbx/app-1/assets/index.js",
+                RouteType::DevDbxProxy,
+                "app-1",
+                Some("assets/index.js"),
+            ),
+            (
+                "/proxy/prod/dbx/app-1",
+                RouteType::ProdDbxProxy,
+                "app-1",
+                None,
+            ),
+            (
+                "/proxy/prod/dbx/app-1/api/connection/list",
+                RouteType::ProdDbxProxy,
+                "app-1",
+                Some("api/connection/list"),
+            ),
+        ] {
+            let matched = router.at(path).expect(path);
+            assert_eq!(*matched.value, expected, "path={path}");
+            assert_eq!(
+                matched.params.get("app_id"),
+                Some(expected_app),
+                "app_id param path={path}"
+            );
+            assert_eq!(
+                matched.params.get("path"),
+                expected_rest,
+                "rest path param path={path}"
+            );
+        }
+        // 尾斜杠经 normalize_path 归一后仍命中 dbx 族
+        let normalized = crate::service::utils::normalize_path("/proxy/dev/dbx/app-1/");
+        assert_eq!(
+            *router.at(normalized).unwrap().value,
+            RouteType::DevDbxProxy
+        );
+
+        // 与 /proxy/{port} 数字端口族互不干扰：数字端口仍走 PortProxy
+        assert_eq!(
+            *router.at("/proxy/8080/some/path").unwrap().value,
+            RouteType::PortProxy
         );
     }
 

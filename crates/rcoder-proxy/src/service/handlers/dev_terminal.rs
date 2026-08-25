@@ -28,7 +28,7 @@ use crate::service::utils;
 
 /// 按 app_id 解析 UserAppBuilder 开发容器 IP（app_id 先过 identifier 白名单，
 /// 防 header 注入与路径拼接逃逸）。
-fn find_dev_container(
+pub(crate) fn find_dev_container(
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
     app_id: &str,
 ) -> Result<String, Box<pingora_core::Error>> {
@@ -56,7 +56,7 @@ fn find_dev_container(
 }
 
 /// 提取并校验 app_id 路径参数。
-fn require_app_id(params: &Params<'_, '_>) -> Result<String, Box<pingora_core::Error>> {
+pub(crate) fn require_app_id(params: &Params<'_, '_>) -> Result<String, Box<pingora_core::Error>> {
     let app_id = params.get("app_id").ok_or_else(|| {
         error!("[DEV_TERMINAL] route missing app_id param");
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
@@ -338,7 +338,7 @@ pub async fn handle_dev_ime_upstream(
 /// 网络下容器名 DNS 的 AAAA 记录会被 pingora 选中，而 app-runtime 的 ttyd 只
 /// bind IPv4（7681 ConnectRefused）；resolver 未注入/未命中时回退确定性命名构造
 /// （K8s = Service FQDN，Docker = 容器名）。
-async fn find_runtime_addr(
+pub(crate) async fn find_runtime_addr(
     ip_slot: &arc_swap::ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>,
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
     app_id: &str,
@@ -493,7 +493,7 @@ pub async fn handle_runtime_pgweb_upstream(
 /// 运行态剩余路径 → 目标路径。与开发域 `target_path_of` 的差异：路由
 /// `/userapp/{service}/{app_id}/runtime/{*path}` 中 `runtime` 是静态段，
 /// 剩余 path 可为空（归一 "/"）。
-fn runtime_target_path_of(params: &Params<'_, '_>) -> String {
+pub(crate) fn runtime_target_path_of(params: &Params<'_, '_>) -> String {
     match params.get("path") {
         Some(p) if !p.is_empty() => format!("/{p}"),
         _ => "/".to_string(),

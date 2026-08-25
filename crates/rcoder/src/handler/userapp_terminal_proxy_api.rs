@@ -4,6 +4,8 @@
 //!   UserAppBuilder 开发容器（与 computer 族按 user_id 定位沙箱对称）。
 //! - **运行域**：`/userapp/{ttyd,pgweb}/{app_id}/runtime`——按 app_id 定位
 //!   `ServiceType::UserApp` 运行容器（部署后的生产环境，线上排障）。
+//! - **DBX 两阶段**：`/proxy/{dev,prod}/dbx/{app_id}`——DBX 数据库 Web GUI
+//!   的开发/生产双入口（dev=开发容器 404 语义；prod=运行容器 502 语义）。
 //!
 //! 纯 OpenAPI 文档接口（同 `proxy_to_app/devapp_with_path` 先例）：实际流量由
 //! Pingora 代理服务处理（容器 8088，K8s NodePort 30435），不经过 rcoder 主服务。
@@ -31,6 +33,18 @@ async fn redirect_doc_response(
     suffix: &str,
     path: String,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
+    redirect_doc_response_at(state, format!("/userapp/{kind}"), app_id, suffix, path).await
+}
+
+/// `redirect_doc_response` 的泛化体：`prefix` 为 Pingora 侧路由前缀
+/// （userapp 族 = `/userapp/{kind}`；dbx 族 = `/proxy/{dev,prod}/dbx`）。
+async fn redirect_doc_response_at(
+    state: &AppState,
+    prefix: String,
+    app_id: String,
+    suffix: &str,
+    path: String,
+) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
     let Some(proxy_config) = state.config.proxy_config.as_ref() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -48,8 +62,7 @@ async fn redirect_doc_response(
     } else {
         format!("/{}", path)
     };
-    let location =
-        format!("http://127.0.0.1:{listen_port}/userapp/{kind}/{app_id}{suffix}{target_path}");
+    let location = format!("http://127.0.0.1:{listen_port}{prefix}/{app_id}{suffix}{target_path}");
     axum::http::Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(axum::http::header::LOCATION, location)
@@ -239,6 +252,11 @@ pub async fn userapp_proxy_routes_doc() -> Json<Value> {
             "ttyd（Web 终端，cwd=/app，直连 ttyd 本体不经 ws_terminal）": "/userapp/ttyd/{app_id}/runtime/{path}",
             "pgweb（容器内 PG 的 Web 控制台）": "/userapp/pgweb/{app_id}/runtime/{path}"
         },
+        "dbx": {
+            "说明": "DBX 数据库 Web GUI（60+ 数据库，supervisor 恒起 4224）；两阶段入口，代理剥前缀直连 root 模式（前端自推断 base）",
+            "dev（开发容器 UserAppBuilder；未建 workspace → 404）": "/proxy/dev/dbx/{app_id}/{path}",
+            "prod（运行容器 UserApp；未部署 → 502）": "/proxy/prod/dbx/{app_id}/{path}"
+        },
         "portPreview": {
             "devapps（任意 dev 端口预览）": "/proxy/devapps/{user_id}/{app_id}/{port}/{path}",
             "说明": "基础设施端口(5432/60000/8086/50051/6080/17681/7681/6089-6091) 已封禁，终端/桌面请走上表专用入口"
@@ -350,3 +368,96 @@ macro_rules! runtime_root_redirect {
 
 runtime_root_redirect!(proxy_to_userapp_runtime_ttyd_redirect_root, "ttyd");
 runtime_root_redirect!(proxy_to_userapp_runtime_pgweb_redirect_root, "pgweb");
+
+// ── DBX 数据库 Web GUI 两阶段：/proxy/{dev,prod}/dbx/{app_id}/{*path} ──
+
+/// Pingora 代理 - DBX 数据库 Web GUI（开发阶段，UserAppBuilder 开发容器）
+#[utoipa::path(
+    get,
+    path = "/proxy/dev/dbx/{app_id}/{*path}",
+    tag = "应用管理",
+    summary = "Pingora 代理 - DBX 数据库 Web GUI（开发阶段，按 app_id 定位开发容器）",
+    description = r"
+访问该 app **开发容器**（UserAppBuilder，agent-runner 镜像）内的 DBX 数据库
+Web GUI（60+ 数据库，supervisor 恒起 4224）——开发阶段查库/改数据的全功能控制台
+（容器内 PG 已预置连接 + 首访浏览器设密码；也可连远端库）。
+
+- 与 pgweb（运行容器专用、只读排障向）互补：DBX 是两阶段全功能 GUI。
+- 前置：`POST /api/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
+- 代理剥前缀直连 root 模式 dbx（前端运行时自推断 base path，API/WS 自动拼回本前缀）。
+- host = Pingora 入口（rcoder 容器 8088 / K8s NodePort 30435），须直连 Pingora 不走 rcoder 主端口。
+
+> 例：`GET /proxy/dev/dbx/app-order-svc/`（DBX 控制台页面）。
+",
+    params(
+        ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器；workspace 须已创建）"),
+        ("path" = String, Path, description = "dbx 内路径（`/` 控制台页面；`api/*` REST；WebSocket 透传）")
+    ),
+    responses(
+        (status = 307, description = "重定向到 Pingora 代理服务", body = String),
+        (status = 404, description = "该 app 的开发容器未创建（先调 POST /api/userapp/workspace）", body = String),
+        (status = 503, description = "代理服务未启用", body = ProxyErrorResponse)
+    )
+)]
+pub async fn proxy_to_dev_dbx(
+    State(state): State<Arc<AppState>>,
+    Path((app_id, path)): Path<(String, String)>,
+) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
+    redirect_doc_response_at(&state, "/proxy/dev/dbx".to_string(), app_id, "", path).await
+}
+
+/// Pingora 代理 - DBX 数据库 Web GUI（生产阶段，UserApp 运行容器）
+#[utoipa::path(
+    get,
+    path = "/proxy/prod/dbx/{app_id}/{*path}",
+    tag = "应用管理",
+    summary = "Pingora 代理 - DBX 数据库 Web GUI（生产阶段，按 app_id 定位运行容器）",
+    description = r"
+访问该 app **运行容器**（`ServiceType::UserApp`，app-runtime 镜像——部署后的生产环境）
+内的 DBX 数据库 Web GUI（supervisor 恒起 4224），供线上查库排障。
+
+- 容器内 PG 由 supervisor 恒起（`/app/data/pg` 持久于 app 的 RWX PVC）；
+  dbx 已预置该连接（首访浏览器设密码，存容器内 dbx.db）。
+- **app 未部署/已停止 → 上游连接失败 502**（区别于 dev 阶段未注册 404）。
+- host = Pingora 入口（rcoder 容器 8088 / K8s NodePort 30435）。
+
+> 例：`GET /proxy/prod/dbx/app-order-svc/`（DBX 控制台页面）。
+",
+    params(
+        ("app_id" = String, Path, description = "应用 ID（定位其运行容器）"),
+        ("path" = String, Path, description = "dbx 内路径（`/` 控制台页面）")
+    ),
+    responses(
+        (status = 307, description = "重定向到 Pingora 代理服务", body = String),
+        (status = 502, description = "app 未部署或已停止（运行容器不可达）", body = String),
+        (status = 503, description = "代理服务未启用", body = ProxyErrorResponse)
+    )
+)]
+pub async fn proxy_to_prod_dbx(
+    State(state): State<Arc<AppState>>,
+    Path((app_id, path)): Path<(String, String)>,
+) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
+    redirect_doc_response_at(&state, "/proxy/prod/dbx".to_string(), app_id, "", path).await
+}
+
+/// dbx 两阶段代理根路径变体（无尾随 path → 同款 307）。
+macro_rules! dbx_root_redirect {
+    ($fn_name:ident, $stage:expr) => {
+        pub async fn $fn_name(
+            State(state): State<Arc<AppState>>,
+            Path(app_id): Path<String>,
+        ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
+            redirect_doc_response_at(
+                &state,
+                format!("/proxy/{}/dbx", $stage),
+                app_id,
+                "",
+                String::new(),
+            )
+            .await
+        }
+    };
+}
+
+dbx_root_redirect!(proxy_to_dev_dbx_redirect_root, "dev");
+dbx_root_redirect!(proxy_to_prod_dbx_redirect_root, "prod");
