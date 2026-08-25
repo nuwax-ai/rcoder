@@ -116,6 +116,34 @@ impl FileServer {
     /// 双 fallback merge 进主 Router）、不含 `/`、`/health`、`/api/userapp`
     /// （排除原因见 `routes::api_router_base` 文档）。中间件层（body limit/
     /// request_id/locale/请求日志/TraceLayer）随子路由生效于本子树。
+    /// agent-runner 开发容器内嵌形态（[`crate::routes::api_router_container`]）：
+    /// 全量业务路由**含 `/api/userapp`**（容器是 userApp 域本地实现的宿主），
+    /// 不含 swagger/fallback/`/`/`/health`（与宿主 agent_runner 冲突）。
+    /// 中间件栈与 [`Self::router_base`] 一致（含 scope_userapp_flag——容器内
+    /// X-Service-Type 切开发卷的主场景层）。
+    pub fn router_container(&self) -> Result<Router> {
+        let request_body_limit = usize::try_from(self.state.config.request_body_max_bytes)
+            .context("REQUEST_BODY_MAX_BYTES exceeds platform usize")?;
+        let (api_router, _openapi) = crate::routes::api_router_container().split_for_parts();
+        Ok(api_router
+            .layer(DefaultBodyLimit::max(request_body_limit))
+            .layer(from_fn(request_id_layer))
+            .layer(from_fn(locale_layer))
+            .layer(from_fn(crate::extract::scope_userapp_flag))
+            .layer(from_fn(request_log_layer))
+            .layer(
+                TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        target: "file_server::http",
+                        "http_request",
+                        method = %req.method(),
+                        uri = %req.uri(),
+                    )
+                }),
+            )
+            .with_state(self.state.clone()))
+    }
+
     pub fn router_base(&self) -> Result<Router> {
         let request_body_limit = usize::try_from(self.state.config.request_body_max_bytes)
             .context("REQUEST_BODY_MAX_BYTES exceeds platform usize")?;

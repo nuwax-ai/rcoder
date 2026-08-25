@@ -46,6 +46,23 @@ pub fn api_router_base() -> OpenApiRouter<AppState> {
         .nest("/api/page", page_router())
 }
 
+/// agent-runner 开发容器内嵌形态路由（全量 [`api_router`] 的子集）。
+///
+/// 与 [`api_router_base`] 的关键差异：**保留 `/api/userapp` nest**——开发容器是
+/// userApp 域本地实现的宿主（rcoder 转发层的上游），丢了它容器就失去本职
+/// （曾因误用 base 集导致容器内 /api/userapp/* 全 404）。
+/// 排除项：`/`、`/health`（与宿主 agent_runner 冲突）、swagger（宿主有自己的文档面）。
+pub fn api_router_container() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(health::version))
+        .nest("/api/project", project_api_router())
+        .nest("/api/git", git_router())
+        .nest("/api/build", build_router())
+        .nest("/api/computer", computer_router())
+        .nest("/api/page", page_router())
+        .nest("/api/userapp", userapp_router())
+}
+
 /// `/api/project` + code 路由。
 fn project_api_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
