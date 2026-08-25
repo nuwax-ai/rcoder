@@ -13,6 +13,7 @@
 
 pub mod agent_runner;
 mod client; // 仅 userapp_publish 内部消费(handler 不直接触达)
+mod dev_cleanup; // UserappDevResourcesCleanup（app_state 经 agent_runner 路径引用）
 pub mod handler;
 pub mod models;
 pub mod orchestrator;
