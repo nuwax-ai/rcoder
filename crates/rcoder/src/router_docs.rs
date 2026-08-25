@@ -541,8 +541,8 @@ mod openapi_tests {
         for (path, item) in &document.paths.paths {
             // /userapp/routes 速查表是纯静态文档接口（无错误分支），不在质量检查内
             let is_userapp_proxy_doc = ["/userapp/dev/", "/userapp/prod/"]
-            .iter()
-            .any(|prefix| path.starts_with(prefix));
+                .iter()
+                .any(|prefix| path.starts_with(prefix));
             if !path.starts_with("/api/v1/apps") && !is_userapp_proxy_doc {
                 continue;
             }

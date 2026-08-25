@@ -181,11 +181,17 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
     // userApp 开发域终端/桌面代理族（与 computer 族对称，app_id 定位 UserAppBuilder 开发容器）。
     // 兜底路由（无尾随 path）与通配成对注册——matchit 的 {*path} 至少 1 字符。
     for (prefix, route) in [
-        ("/userapp/dev/ttyd/{app_id}/{*path}", RouteType::DevTtydProxy),
+        (
+            "/userapp/dev/ttyd/{app_id}/{*path}",
+            RouteType::DevTtydProxy,
+        ),
         ("/userapp/dev/ttyd/{app_id}", RouteType::DevTtydProxy),
         ("/userapp/dev/vnc/{app_id}/{*path}", RouteType::DevVncProxy),
         ("/userapp/dev/vnc/{app_id}", RouteType::DevVncProxy),
-        ("/userapp/dev/audio/{app_id}/{*path}", RouteType::DevAudioProxy),
+        (
+            "/userapp/dev/audio/{app_id}/{*path}",
+            RouteType::DevAudioProxy,
+        ),
         ("/userapp/dev/audio/{app_id}", RouteType::DevAudioProxy),
         ("/userapp/dev/ime/{app_id}/{*path}", RouteType::DevImeProxy),
         ("/userapp/dev/ime/{app_id}", RouteType::DevImeProxy),
@@ -210,10 +216,7 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
             "/userapp/prod/pgweb/{app_id}/{*path}",
             RouteType::RuntimePgwebProxy,
         ),
-        (
-            "/userapp/prod/pgweb/{app_id}",
-            RouteType::RuntimePgwebProxy,
-        ),
+        ("/userapp/prod/pgweb/{app_id}", RouteType::RuntimePgwebProxy),
     ] {
         router.insert(prefix, route).map_err(|e| {
             tracing::error!("[ROUTER] userapp prod terminal route {prefix} config failed: {e}");
@@ -228,7 +231,10 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
     for (prefix, route) in [
         ("/userapp/dev/dbx/{app_id}/{*path}", RouteType::DevDbxProxy),
         ("/userapp/dev/dbx/{app_id}", RouteType::DevDbxProxy),
-        ("/userapp/prod/dbx/{app_id}/{*path}", RouteType::ProdDbxProxy),
+        (
+            "/userapp/prod/dbx/{app_id}/{*path}",
+            RouteType::ProdDbxProxy,
+        ),
         ("/userapp/prod/dbx/{app_id}", RouteType::ProdDbxProxy),
     ] {
         router.insert(prefix, route).map_err(|e| {
@@ -591,7 +597,11 @@ mod tests {
                 RouteType::RuntimeTtydProxy,
                 "app-1",
             ),
-            ("/userapp/prod/ttyd/app-1", RouteType::RuntimeTtydProxy, "app-1"),
+            (
+                "/userapp/prod/ttyd/app-1",
+                RouteType::RuntimeTtydProxy,
+                "app-1",
+            ),
             (
                 "/userapp/prod/pgweb/app-1/static/favicon.ico",
                 RouteType::RuntimePgwebProxy,
@@ -603,7 +613,11 @@ mod tests {
                 "app-1",
             ),
             // 开发域路由不被 prod 段劫持
-            ("/userapp/dev/ttyd/app-1/ws", RouteType::DevTtydProxy, "app-1"),
+            (
+                "/userapp/dev/ttyd/app-1/ws",
+                RouteType::DevTtydProxy,
+                "app-1",
+            ),
         ] {
             let matched = router.at(path).expect(path);
             assert_eq!(*matched.value, expected, "path={path}");
@@ -616,7 +630,12 @@ mod tests {
 
         // dbx 两阶段（工具族形态）：app_id + 剩余 path 剥前缀语义与族内一致
         for (path, expected, expected_app, expected_rest) in [
-            ("/userapp/dev/dbx/app-1", RouteType::DevDbxProxy, "app-1", None),
+            (
+                "/userapp/dev/dbx/app-1",
+                RouteType::DevDbxProxy,
+                "app-1",
+                None,
+            ),
             (
                 "/userapp/dev/dbx/app-1/api/auth/check",
                 RouteType::DevDbxProxy,
@@ -739,7 +758,8 @@ mod tests {
         // userApp dev 流量代理文档在列（首条为 VNC 之前插入）
         assert!(
             docs.iter()
-                .any(|(p, t, _)| p.starts_with("/proxy/userapp/dev") && t.contains("dev app traffic"))
+                .any(|(p, t, _)| p.starts_with("/proxy/userapp/dev")
+                    && t.contains("dev app traffic"))
         );
 
         // 验证 VNC 路由文档

@@ -76,36 +76,35 @@ pub async fn handle_prod_app_upstream(
     metrics.record_request();
 
     // 主路径：pingap 统一入口；回退：该 app 唯一已注册端口
-    let (resolved_host, resolved_port) = if let Some(host) =
-        app_backends.get(&(app_id.to_string(), shared_types::APP_ENTRY_PORT))
-    {
-        (host.value().clone(), shared_types::APP_ENTRY_PORT)
-    } else {
-        let mut candidates = app_backends.iter().filter(|e| e.key().0 == app_id);
-        let sole = match (candidates.next(), candidates.next()) {
-            (Some(e), None) => Some((e.value().clone(), e.key().1)),
-            _ => None,
+    let (resolved_host, resolved_port) =
+        if let Some(host) = app_backends.get(&(app_id.to_string(), shared_types::APP_ENTRY_PORT)) {
+            (host.value().clone(), shared_types::APP_ENTRY_PORT)
+        } else {
+            let mut candidates = app_backends.iter().filter(|e| e.key().0 == app_id);
+            let sole = match (candidates.next(), candidates.next()) {
+                (Some(e), None) => Some((e.value().clone(), e.key().1)),
+                _ => None,
+            };
+            match sole {
+                Some((host, port)) => {
+                    debug!(
+                        "prod app fallback to sole registered port: app_id={}, port={}",
+                        app_id, port
+                    );
+                    (host, port)
+                }
+                None => {
+                    error!(
+                        "prod app backend not registered: app_id={} (expected APP_ENTRY_PORT={})",
+                        app_id,
+                        shared_types::APP_ENTRY_PORT
+                    );
+                    return Err(pingora_core::Error::new(
+                        pingora_core::ErrorType::HTTPStatus(502),
+                    ));
+                }
+            }
         };
-        match sole {
-            Some((host, port)) => {
-                debug!(
-                    "prod app fallback to sole registered port: app_id={}, port={}",
-                    app_id, port
-                );
-                (host, port)
-            }
-            None => {
-                error!(
-                    "prod app backend not registered: app_id={} (expected APP_ENTRY_PORT={})",
-                    app_id,
-                    shared_types::APP_ENTRY_PORT
-                );
-                return Err(pingora_core::Error::new(
-                    pingora_core::ErrorType::HTTPStatus(502),
-                ));
-            }
-        }
-    };
 
     ctx.target_port = Some(resolved_port);
     metrics.record_request_port(resolved_port);

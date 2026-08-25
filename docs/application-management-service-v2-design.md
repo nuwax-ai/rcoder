@@ -660,7 +660,7 @@ AppActivityRegistry (in-memory, rcoder 单实例):
 ```
 
 三个组件共享 `AppActivityRegistry`（内存态）：
-- **访问追踪**：Pingora `request_filter` 对 `/proxy/apps/{id}/...` 路由调 `touch(app_id)`，
+- **访问追踪**：Pingora `request_filter` 对 `/proxy/userapp/prod/{user_id}/{id}/...` 路由调 `touch(app_id)`，
   5s 节流写入 `last_accessed`。
 - **回收扫描器**：后台 `tokio::time::interval` 循环，枚举 Running app，比对 `last_accessed`
   与阈值，命中 → `recycle_app(scale0)` + `mark_recycled`。判定逻辑抽纯函数 `decide_recycle`

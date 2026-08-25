@@ -405,5 +405,9 @@ stage_tool_redirect!(proxy_to_userapp_audio_redirect_root, "dev", "audio");
 stage_tool_redirect!(proxy_to_userapp_ime_redirect_root, "dev", "ime");
 stage_tool_redirect!(proxy_to_dev_dbx_redirect_root, "dev", "dbx");
 stage_tool_redirect!(proxy_to_userapp_runtime_ttyd_redirect_root, "prod", "ttyd");
-stage_tool_redirect!(proxy_to_userapp_runtime_pgweb_redirect_root, "prod", "pgweb");
+stage_tool_redirect!(
+    proxy_to_userapp_runtime_pgweb_redirect_root,
+    "prod",
+    "pgweb"
+);
 stage_tool_redirect!(proxy_to_prod_dbx_redirect_root, "prod", "dbx");

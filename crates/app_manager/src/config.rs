@@ -91,7 +91,7 @@ pub struct AppManagerConfig {
     pub access_mode: AppAccessMode,
 
     /// HTTP 服务对外暴露策略（v2 D10）：Pingora（默认，两后端统一）/ Gateway（可选，HTTPRoute）。
-    /// 决定 HTTP 端口走 RCoder 内置 Pingora（`/proxy/apps/{app_id}/{port}`）还是外部 Gateway（`/apps/{id}`）。
+    /// 决定 HTTP 端口走 RCoder 内置 Pingora（`/proxy/userapp/prod/{user_id}/{app_id}`，免端口）还是外部 Gateway（`/apps/{id}`）。
     /// **只从 env `RCODER_APP_HTTP_EXPOSE` 读取**（serde skip，禁止 config.yml 覆盖）——
     /// 保证与 docker_manager K8s 后端（也读 env）同源一致。
     #[serde(skip, default = "http_expose_from_env")]

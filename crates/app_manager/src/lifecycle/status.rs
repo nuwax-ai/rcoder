@@ -65,7 +65,7 @@ impl AppService {
         // Gateway 模式：K8s status.ports 已含 HTTP（HTTPRoute backendRef），无需补。
         // ⚠️ 重启风险（pingora_ports 内存态丢失，已知限制）：
         //   - Docker：HTTP 端口补不出 → access.external.http = null（Java 可感知降级）
-        //   - K8s Pingora：status.ports（containerPort）仍含 HTTP → access 返有效 /proxy/apps/{app_id}/{port}，
+        //   - K8s Pingora：status.ports（containerPort）仍含 HTTP → access 返有效 /proxy/userapp/prod/{user_id}/{app_id}，
         //     但 Pingora backend 未重注册 → 访问 404（静默坏路径）。根治：启动从 containerPorts 重建 backends（TODO）
         let ports = if self.config.http_expose == HttpExpose::Pingora {
             let mut merged = status.ports.clone();
@@ -174,7 +174,9 @@ impl AppService {
                     match self.owner_user_id(app_id) {
                         Some(user_id) => Some(format!("/proxy/userapp/prod/{user_id}/{app_id}")),
                         None => {
-                            warn!("[APP] metadata user_id missing, cannot build access URL: {app_id}");
+                            warn!(
+                                "[APP] metadata user_id missing, cannot build access URL: {app_id}"
+                            );
                             None
                         }
                     }

@@ -1,4 +1,4 @@
-//! DBX 数据库 Web GUI 两阶段代理（`/proxy/{dev,prod}/dbx/{app_id}` 族）。
+//! DBX 数据库 Web GUI 两阶段代理（`/userapp/{dev,prod}/dbx/{app_id}` 工具族）。
 //!
 //! dbx-web（60+ 数据库 GUI，supervisor 恒起 `DBX_PORT`=4224）的开发/生产双入口：
 //! - **dev**：UserAppBuilder 开发容器（agent-runner 镜像）——注册表
@@ -8,7 +8,7 @@
 //!
 //! 代理剥前缀直连 root 模式 dbx（同 pgweb）：dbx 前端 `webPath.ts` 从
 //! location.pathname 运行时推断 base，index.html 全相对引用，API/WS 调用
-//! 自动拼回 `/proxy/{stage}/dbx/{app_id}` 前缀——无需容器侧配置
+//! 自动拼回 `/userapp/{stage}/dbx/{app_id}` 前缀——无需容器侧配置
 //! `DBX_PUBLIC_BASE_PATH`。WebSocket（redis pubsub 等）由 Pingora 透传。
 
 use std::sync::Arc;
@@ -61,7 +61,7 @@ fn dbx_peer(container_addr: &str) -> Box<HttpPeer> {
     Box::new(peer)
 }
 
-/// `/proxy/dev/dbx/{app_id}/{*path}` 请求重写（定位在 upstream 阶段完成，同族先例）。
+/// `/userapp/dev/dbx/{app_id}/{*path}` 请求重写（定位在 upstream 阶段完成，同族先例）。
 pub async fn handle_dev_dbx_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,
@@ -93,7 +93,7 @@ pub async fn handle_dev_dbx_upstream(
     Ok(dbx_peer(&container_addr))
 }
 
-/// `/proxy/prod/dbx/{app_id}/{*path}` 请求重写。
+/// `/userapp/prod/dbx/{app_id}/{*path}` 请求重写。
 pub async fn handle_prod_dbx_request(
     upstream_request: &mut RequestHeader,
     original_uri: &http::Uri,

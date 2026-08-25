@@ -104,7 +104,10 @@ pub async fn handle_dev_app_upstream(
 
     debug!(
         "dev app route: user_id={}, app_id={}, {}:{}",
-        user_id, app_id, dev_container_ip, shared_types::APP_ENTRY_PORT
+        user_id,
+        app_id,
+        dev_container_ip,
+        shared_types::APP_ENTRY_PORT
     );
 
     // 与 prod app 代理同款 peer（长连接，支持 WebSocket / HMR）

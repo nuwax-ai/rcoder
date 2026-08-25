@@ -387,18 +387,15 @@ pub async fn proxy_to_port(
     get,
     path = "/proxy/{port}/{*path}",
     tag = "proxy",
-    summary = "Pingora 代理 - 访问部署的应用服务（含路径）",
+    summary = "Pingora 代理 - 通用本机端口代理（含路径）",
     description = r#"
 重定向请求到 Pingora 代理服务，包含完整路径信息。
 
-## 访问部署的应用服务（重点）
-通过 `POST /api/v1/apps` 部署的应用（HTTP 端口），其访问入口 `access.external.http` 返回
-`/proxy/{port}`，即本接口。用法：`GET /proxy/{应用的 HTTP 端口}/{路径}` → 经 Pingora 代理到应用后端
-（K8s 转发到 `{app_id}-svc:{port}`，Docker 转发到 container_ip:{port}）。
-
-> 例：app HTTP 端口 8080，`GET /apps/{id}` 返回 `access.external.http = "/proxy/8080"`，
-> 访问该应用：`GET /proxy/8080/api/users` → Pingora 代理到应用 `:8080/api/users`。
-> host（RCoder 入口）由调用方持有，详见应用管理手册 §1.7。
+## 通用端口代理（本机调试用）
+`/proxy/{port}` 按端口号代理到 **rcoder 容器本机** 的 `127.0.0.1:{port}`（本机服务调试入口）。
+**不是** userApp 应用的访问入口——应用访问走免端口专用路由
+`/proxy/userapp/prod/{user_id}/{app_id}/{*path}`（见 `proxy_to_app_with_path`），
+容器内控制台（ttyd/pgweb/dbx）走 `/userapp/{dev,prod}/{tool}/{app_id}`。
 
 ## 工作原理
 此接口会返回 307 重定向，将请求转发到 Pingora 代理服务的实际端口和路径。

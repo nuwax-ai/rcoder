@@ -324,7 +324,7 @@ pub async fn handle_dev_ime_upstream(
 
 // ── 运行容器（部署后的生产环境）───────────────────────────────────────────────
 //
-// `/userapp/{ttyd,pgweb}/{app_id}/runtime/{*path}`：与上面的开发域四服务对称，
+// `/userapp/prod/{ttyd,pgweb}/{app_id}/{*path}`：与上面的开发域工具族对称，
 // 但目标是 `ServiceType::UserApp` 运行容器（app-runtime 镜像）。两处关键差异：
 // 1. 定位走 `find_app_runtime_addr`（确定性命名构造）——运行容器不进 projects
 //    注册表（project_to_container[app_id] 单值键被 builder 占用）；
@@ -370,7 +370,7 @@ pub(crate) async fn find_runtime_addr(
     })
 }
 
-/// `/userapp/ttyd/{app_id}/runtime/{*path}` 请求重写（直连 ttyd 本体 7681）。
+/// `/userapp/prod/ttyd/{app_id}/{*path}` 请求重写（直连 ttyd 本体 7681）。
 ///
 /// 定位在 upstream 阶段完成（pingora 生命周期 `upstream_peer` 先于
 /// `upstream_request_filter`——与开发域 ttyd/vnc 同构），此处只重写 URI/Host。
@@ -432,7 +432,7 @@ pub async fn handle_runtime_ttyd_upstream(
     Ok(Box::new(peer))
 }
 
-/// `/userapp/pgweb/{app_id}/runtime/{*path}` 请求重写（HTTP 直连 PGWEB_PORT）。
+/// `/userapp/prod/pgweb/{app_id}/{*path}` 请求重写（HTTP 直连 PGWEB_PORT）。
 ///
 /// 定位在 upstream 阶段完成（同 runtime ttyd 的生命周期说明）。
 pub async fn handle_runtime_pgweb_request(
@@ -490,9 +490,8 @@ pub async fn handle_runtime_pgweb_upstream(
     Ok(Box::new(peer))
 }
 
-/// 运行态剩余路径 → 目标路径。与开发域 `target_path_of` 的差异：路由
-/// `/userapp/{service}/{app_id}/runtime/{*path}` 中 `runtime` 是静态段，
-/// 剩余 path 可为空（归一 "/"）。
+/// 剩余路径 → 目标路径（空归一 "/"）。工具族路由 `/userapp/{stage}/{tool}/{app_id}/{*path}`
+/// 中 tool 为静态段，剩余 path 可为空；与开发域 `target_path_of` 语义一致。
 pub(crate) fn runtime_target_path_of(params: &Params<'_, '_>) -> String {
     match params.get("path") {
         Some(p) if !p.is_empty() => format!("/{p}"),

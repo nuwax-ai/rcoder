@@ -333,8 +333,8 @@ impl KubernetesRuntime {
             .unwrap_or_default();
         let mut ports = ports;
         // 运行容器固定端口随 Service 一并暴露——
-        // `/userapp/{ttyd,pgweb}/{app_id}/runtime` 与 `/proxy/prod/dbx/{app_id}`
-        // 代理上游为 Service FQDN，若 7681/8081/4224 不在 Service ports 内，
+        // `/userapp/prod/{ttyd,pgweb,dbx}/{app_id}` 代理上游为 Service FQDN，
+        // 若 7681/8081/4224 不在 Service ports 内，
         // 代理连接将超时（app-runtime 镜像 supervisor 恒起 ttyd/pgweb/dbx-web，
         // targetPort 恒可达）。
         // 60000 = 容器内 file-server-proxy（rcoder 转发层 prod 文件操作的上游，
