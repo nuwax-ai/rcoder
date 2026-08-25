@@ -200,14 +200,25 @@ async function cmdStart(flags) {
       stdio: ["ignore", logFd, logFd],
       windowsHide: true,
     });
+    // spawn 异步失败（binary 缺失/不可执行）必须监听，否则 uncaught 'error' 崩溃
+    let spawnError = null;
+    child.on("error", (err) => {
+      spawnError = err;
+    });
     child.unref();
     state.pid = child.pid;
     writeState(state);
     if (!(await waitTcpUp(listenPort, 10000))) {
-      killAndWait(child.pid).catch(() => {});
-      clearState();
       const tail = readLogTail();
-      fail(`proxy did not listen on ${listenPort} within 10s${tail}`);
+      // 先清完自己拉起的进程（proxy + managed TS）再报错退出，防泄漏
+      await killAndWait(child.pid).catch(() => {});
+      if (tsManaged) await tsStop().catch(() => {});
+      clearState();
+      fail(
+        spawnError
+          ? `failed to execute ${binaryPath}: ${spawnError.message}`
+          : `proxy did not listen on ${listenPort} within 10s${tail}`,
+      );
     }
     console.log(
       `file-server-proxy started (detached, pid ${child.pid}): http://127.0.0.1:${listenPort} ` +
@@ -255,7 +266,14 @@ async function cmdStart(flags) {
 
   child.on("error", (err) => {
     clearState();
-    fail(`failed to execute ${binaryPath}: ${err.message}`);
+    if (tsManaged) {
+      // spawn 失败也带走自己拉起的 TS，防泄漏（fail 同步退出不等 promise）
+      tsStop()
+        .catch(() => {})
+        .finally(() => fail(`failed to execute ${binaryPath}: ${err.message}`));
+    } else {
+      fail(`failed to execute ${binaryPath}: ${err.message}`);
+    }
   });
 }
 
