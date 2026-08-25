@@ -88,10 +88,10 @@ async fn main() {
     #[cfg(feature = "embed-file-server")]
     let _log_guard = match prepare_embed(rust_upstream_port) {
         Ok((config, guard)) => {
-            if let Some(config) = config {
-                if let Err(e) = spawn_embedded_file_server(config).await {
-                    fail(e);
-                }
+            if let Some(config) = config
+                && let Err(e) = spawn_embedded_file_server(config).await
+            {
+                fail(e);
             }
             guard
         }
