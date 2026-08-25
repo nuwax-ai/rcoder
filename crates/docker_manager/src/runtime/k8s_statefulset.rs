@@ -366,14 +366,13 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         let sts_name = self.pod_name(identifier, service_type)?;
         let sts_api = self.statefulsets();
-        // SSA patch：只改 replicas（field manager 独立，不误伤其他字段）
+        // Merge patch 只改 replicas（不触碰其他字段, 无需 SSA）。
+        // ⚠️ 不可加 .force()：force 是 SSA(Apply) 的字段所有权语义, kube 客户端
+        // 对 force + Merge 组合直接拒绝（"force only works with Patch::Apply"）——
+        // 旧版 kube 静默忽略此组合, 依赖升级后校验生效即 latent bug 显形。
         let patch = serde_json::json!({ "spec": { "replicas": replicas } });
         sts_api
-            .patch(
-                &sts_name,
-                &PatchParams::default().force(),
-                &Patch::Merge(patch),
-            )
+            .patch(&sts_name, &PatchParams::default(), &Patch::Merge(patch))
             .await
             .map_err(|e| ContainerRuntimeError::K8sError(format!("scale sts {sts_name}: {e}")))?;
         debug!("[K8S-STS] scaled {} to replicas={}", sts_name, replicas);
