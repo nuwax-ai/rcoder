@@ -231,7 +231,8 @@ impl DevServerManager {
         project_id: &str,
         project_path: &Path,
     ) -> AppResult<StartedDev> {
-        const PINGAP_ENTRY_PORT: u16 = 9080;
+        // 单一来源 shared_types::APP_ENTRY_PORT（release 流程、Pingora 免端口代理同值）
+        const PINGAP_ENTRY_PORT: u16 = shared_types::APP_ENTRY_PORT;
         // 幂等: 已运行则返回现有 pid/port（app-cli 路径与 vite 路径同表登记）
         if let Some(p) = lock(&self.processes)?.get(project_id).cloned() {
             return Ok(StartedDev {

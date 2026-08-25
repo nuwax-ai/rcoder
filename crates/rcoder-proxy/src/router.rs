@@ -133,60 +133,37 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
             ))
         })?;
 
-    // app 专用端口代理（按 app_id+port 路由，解决多 app 同端口冲突）：
-    // /proxy/apps/{user_id}/{app_id}/{port}/{path} -> 对应 app 的后端（app_backends 表;
-    // user_id 不参与解析, 与 devapps 四段形态统一, 未来归属鉴权锚点）
-    router
-        .insert(
-            "/proxy/apps/{user_id}/{app_id}/{port}/{*path}",
-            RouteType::AppPortProxy,
-        )
-        .map_err(|e| {
-            tracing::error!("[ROUTER] app port proxy route config failed: {}", e);
+    // userApp 应用流量族（免端口，业务域前缀 userapp——/proxy 为跨业务共享命名空间）：
+    // /proxy/userapp/{stage}/{user_id}/{app_id}/{path} -> 内部固定拨 pingap 统一入口
+    // APP_ENTRY_PORT(9080)（prod 走 app_backends 注册表 + 单端口回退；dev 走注册表
+    // 定位开发容器）；user_id 不参与解析, 未来归属鉴权锚点。
+    // stage 段 dev/prod 与 /userapp/{dev,prod} 工具族语义统一——切环境只改一段。
+    // 兜底（无尾随 path）与通配成对注册——matchit 的 {*path} 至少 1 字符。
+    for (prefix, route) in [
+        (
+            "/proxy/userapp/prod/{user_id}/{app_id}/{*path}",
+            RouteType::ProdAppProxy,
+        ),
+        (
+            "/proxy/userapp/prod/{user_id}/{app_id}",
+            RouteType::ProdAppProxy,
+        ),
+        (
+            "/proxy/userapp/dev/{user_id}/{app_id}/{*path}",
+            RouteType::DevAppProxy,
+        ),
+        (
+            "/proxy/userapp/dev/{user_id}/{app_id}",
+            RouteType::DevAppProxy,
+        ),
+    ] {
+        router.insert(prefix, route).map_err(|e| {
+            tracing::error!("[ROUTER] userapp app traffic route {prefix} config failed: {e}");
             crate::ProxyError::RouteConfig(format!(
-                "App port proxy route configuration error: {}",
-                e
+                "userapp app traffic route {prefix} configuration error: {e}"
             ))
         })?;
-    // 兜底：/proxy/apps/{user_id}/{app_id}/{port}（无尾随 path）
-    router
-        .insert(
-            "/proxy/apps/{user_id}/{app_id}/{port}",
-            RouteType::AppPortProxy,
-        )
-        .map_err(|e| {
-            tracing::error!("[ROUTER] app port proxy root route config failed: {}", e);
-            crate::ProxyError::RouteConfig(format!(
-                "App port proxy root route configuration error: {}",
-                e
-            ))
-        })?;
-    // 开发阶段代理: /proxy/devapps/{user_id}/{app_id}/{port}/{path} -> 该 app 开发容器(UserAppBuilder)同端口
-    router
-        .insert(
-            "/proxy/devapps/{user_id}/{app_id}/{port}/{*path}",
-            RouteType::DevPortProxy,
-        )
-        .map_err(|e| {
-            tracing::error!("[ROUTER] devapps proxy route config failed: {}", e);
-            crate::ProxyError::RouteConfig(format!(
-                "Devapps proxy route configuration error: {}",
-                e
-            ))
-        })?;
-    // 兜底：/proxy/devapps/{user_id}/{app_id}/{port}（无尾随 path）
-    router
-        .insert(
-            "/proxy/devapps/{user_id}/{app_id}/{port}",
-            RouteType::DevPortProxy,
-        )
-        .map_err(|e| {
-            tracing::error!("[ROUTER] devapps proxy root route config failed: {}", e);
-            crate::ProxyError::RouteConfig(format!(
-                "Devapps proxy root route configuration error: {}",
-                e
-            ))
-        })?;
+    }
 
     // ========================================================================
     // 健康检查路由
@@ -204,14 +181,14 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
     // userApp 开发域终端/桌面代理族（与 computer 族对称，app_id 定位 UserAppBuilder 开发容器）。
     // 兜底路由（无尾随 path）与通配成对注册——matchit 的 {*path} 至少 1 字符。
     for (prefix, route) in [
-        ("/userapp/ttyd/{app_id}/{*path}", RouteType::DevTtydProxy),
-        ("/userapp/ttyd/{app_id}", RouteType::DevTtydProxy),
-        ("/userapp/vnc/{app_id}/{*path}", RouteType::DevVncProxy),
-        ("/userapp/vnc/{app_id}", RouteType::DevVncProxy),
-        ("/userapp/audio/{app_id}/{*path}", RouteType::DevAudioProxy),
-        ("/userapp/audio/{app_id}", RouteType::DevAudioProxy),
-        ("/userapp/ime/{app_id}/{*path}", RouteType::DevImeProxy),
-        ("/userapp/ime/{app_id}", RouteType::DevImeProxy),
+        ("/userapp/dev/ttyd/{app_id}/{*path}", RouteType::DevTtydProxy),
+        ("/userapp/dev/ttyd/{app_id}", RouteType::DevTtydProxy),
+        ("/userapp/dev/vnc/{app_id}/{*path}", RouteType::DevVncProxy),
+        ("/userapp/dev/vnc/{app_id}", RouteType::DevVncProxy),
+        ("/userapp/dev/audio/{app_id}/{*path}", RouteType::DevAudioProxy),
+        ("/userapp/dev/audio/{app_id}", RouteType::DevAudioProxy),
+        ("/userapp/dev/ime/{app_id}/{*path}", RouteType::DevImeProxy),
+        ("/userapp/dev/ime/{app_id}", RouteType::DevImeProxy),
     ] {
         router.insert(prefix, route).map_err(|e| {
             tracing::error!("[ROUTER] userapp dev terminal route {prefix} config failed: {e}");
@@ -221,43 +198,38 @@ pub fn create_router() -> Result<Router<RouteType>, crate::ProxyError> {
         })?;
     }
 
-    // userApp 运行容器（部署后的生产环境）终端/数据库控制台代理族。
-    // `/runtime` 静态段与开发域通配共存——matchit trie 静态段优先于 {*path}，
-    // 且合法 app_id 恒以 `app-` 前缀开头（validate_identifier），与 "runtime" 无歧义。
+    // userApp 生产域工具族（运行容器，部署后的生产环境）。
+    // stage 段 prod 与开发域工具族对称（原 `/runtime` 静态段随路径风格统一退役）。
     for (prefix, route) in [
         (
-            "/userapp/ttyd/{app_id}/runtime/{*path}",
+            "/userapp/prod/ttyd/{app_id}/{*path}",
             RouteType::RuntimeTtydProxy,
         ),
+        ("/userapp/prod/ttyd/{app_id}", RouteType::RuntimeTtydProxy),
         (
-            "/userapp/ttyd/{app_id}/runtime",
-            RouteType::RuntimeTtydProxy,
-        ),
-        (
-            "/userapp/pgweb/{app_id}/runtime/{*path}",
+            "/userapp/prod/pgweb/{app_id}/{*path}",
             RouteType::RuntimePgwebProxy,
         ),
         (
-            "/userapp/pgweb/{app_id}/runtime",
+            "/userapp/prod/pgweb/{app_id}",
             RouteType::RuntimePgwebProxy,
         ),
     ] {
         router.insert(prefix, route).map_err(|e| {
-            tracing::error!("[ROUTER] userapp runtime terminal route {prefix} config failed: {e}");
+            tracing::error!("[ROUTER] userapp prod terminal route {prefix} config failed: {e}");
             crate::ProxyError::RouteConfig(format!(
-                "userapp runtime terminal route {prefix} configuration error: {e}"
+                "userapp prod terminal route {prefix} configuration error: {e}"
             ))
         })?;
     }
 
-    // DBX 数据库 Web GUI 两阶段代理族（dev=开发容器 / prod=运行容器，均直连 :4224）。
-    // 静态段 dev/prod/dbx 按 matchit 静态优先级压过既有 `/proxy/{port}/{*path}` 参数路由
-    // （PortProxy 的 port 语义为数字，"dev"/"prod" 不构成合法端口，无歧义）。
+    // DBX 数据库 Web GUI 两阶段（dev=开发容器 / prod=运行容器，均直连 :4224）——
+    // 归入工具族 stage 前缀风格（与 ttyd/vnc/audio/ime/pgweb 同一形态）。
     for (prefix, route) in [
-        ("/proxy/dev/dbx/{app_id}/{*path}", RouteType::DevDbxProxy),
-        ("/proxy/dev/dbx/{app_id}", RouteType::DevDbxProxy),
-        ("/proxy/prod/dbx/{app_id}/{*path}", RouteType::ProdDbxProxy),
-        ("/proxy/prod/dbx/{app_id}", RouteType::ProdDbxProxy),
+        ("/userapp/dev/dbx/{app_id}/{*path}", RouteType::DevDbxProxy),
+        ("/userapp/dev/dbx/{app_id}", RouteType::DevDbxProxy),
+        ("/userapp/prod/dbx/{app_id}/{*path}", RouteType::ProdDbxProxy),
+        ("/userapp/prod/dbx/{app_id}", RouteType::ProdDbxProxy),
     ] {
         router.insert(prefix, route).map_err(|e| {
             tracing::error!("[ROUTER] dbx proxy route {prefix} config failed: {e}");
@@ -487,9 +459,9 @@ pub fn get_routes_documentation() -> Vec<(String, String, String)> {
             "Fallback for API proxy health check (HEAD requests without path suffix)".to_string(),
         ),
         (
-            "/proxy/devapps/{user_id}/{app_id}/{port}/{*path}".to_string(),
-            "🧪 Dev apps port proxy".to_string(),
-            "Proxy to user's sandbox dev server at the given port (dev preview, zero-registration)"
+            "/proxy/userapp/dev/{user_id}/{app_id}/{*path}".to_string(),
+            "🧪 userApp dev app traffic proxy".to_string(),
+            "Proxy to the app's dev container pingap entry (APP_ENTRY_PORT, zero-registration)"
                 .to_string(),
         ),
         (
@@ -534,12 +506,13 @@ mod tests {
         assert_eq!(matched.params.get("project_id"), Some("proj_456"));
         assert_eq!(matched.params.get("path"), Some("vnc.html"));
 
-        // 测试 app 代理路由（四段：user_id 不参与解析）
-        let matched = router.at("/proxy/apps/u6/app-abc/8080/api/users").unwrap();
-        assert_eq!(*matched.value, RouteType::AppPortProxy);
+        // 测试 userApp 生产应用流量代理（免端口，user_id 不参与解析）
+        let matched = router
+            .at("/proxy/userapp/prod/u6/app-abc/api/users")
+            .unwrap();
+        assert_eq!(*matched.value, RouteType::ProdAppProxy);
         assert_eq!(matched.params.get("user_id"), Some("u6"));
         assert_eq!(matched.params.get("app_id"), Some("app-abc"));
-        assert_eq!(matched.params.get("port"), Some("8080"));
         assert_eq!(matched.params.get("path"), Some("api/users"));
 
         // 测试端口代理路由
@@ -548,20 +521,16 @@ mod tests {
         assert_eq!(matched.params.get("port"), Some("8080"));
         assert_eq!(matched.params.get("path"), Some("api/status"));
 
-        // 测试 devapps 开发代理路由（带 path）
+        // userApp 开发应用流量代理（带 path）+ 无尾随 path 兜底
         let matched = router
-            .at("/proxy/devapps/u6/app-abc123/4000/api/users")
+            .at("/proxy/userapp/dev/u6/app-abc123/api/users")
             .unwrap();
-        assert_eq!(*matched.value, RouteType::DevPortProxy);
+        assert_eq!(*matched.value, RouteType::DevAppProxy);
         assert_eq!(matched.params.get("user_id"), Some("u6"));
         assert_eq!(matched.params.get("app_id"), Some("app-abc123"));
-        assert_eq!(matched.params.get("port"), Some("4000"));
         assert_eq!(matched.params.get("path"), Some("api/users"));
-
-        // devapps 无尾随 path 兜底
-        let matched = router.at("/proxy/devapps/u6/app-abc123/4000").unwrap();
-        assert_eq!(*matched.value, RouteType::DevPortProxy);
-        assert_eq!(matched.params.get("port"), Some("4000"));
+        let matched = router.at("/proxy/userapp/dev/u6/app-abc123").unwrap();
+        assert_eq!(*matched.value, RouteType::DevAppProxy);
     }
 
     #[test]
@@ -600,46 +569,41 @@ mod tests {
     fn test_userapp_dev_terminal_routes() {
         let router = create_router().expect("router");
 
-        // 四协议通配 + 兜底（无尾随 path）成对
+        // 开发域工具族（stage 段 dev）通配 + 兜底（无尾随 path）成对
         for (path, expected) in [
-            ("/userapp/ttyd/app-1/ws", RouteType::DevTtydProxy),
-            ("/userapp/ttyd/app-1", RouteType::DevTtydProxy),
-            ("/userapp/vnc/app-1/vnc.html", RouteType::DevVncProxy),
-            ("/userapp/vnc/app-1", RouteType::DevVncProxy),
-            ("/userapp/audio/app-1/ws", RouteType::DevAudioProxy),
-            ("/userapp/audio/app-1", RouteType::DevAudioProxy),
-            ("/userapp/ime/app-1/connect", RouteType::DevImeProxy),
-            ("/userapp/ime/app-1", RouteType::DevImeProxy),
+            ("/userapp/dev/ttyd/app-1/ws", RouteType::DevTtydProxy),
+            ("/userapp/dev/ttyd/app-1", RouteType::DevTtydProxy),
+            ("/userapp/dev/vnc/app-1/vnc.html", RouteType::DevVncProxy),
+            ("/userapp/dev/vnc/app-1", RouteType::DevVncProxy),
+            ("/userapp/dev/audio/app-1/ws", RouteType::DevAudioProxy),
+            ("/userapp/dev/audio/app-1", RouteType::DevAudioProxy),
+            ("/userapp/dev/ime/app-1/connect", RouteType::DevImeProxy),
+            ("/userapp/dev/ime/app-1", RouteType::DevImeProxy),
         ] {
             let matched = router.at(path).expect(path);
             assert_eq!(*matched.value, expected, "path={path}");
         }
 
-        // 运行容器（runtime 静态段）：与开发域通配共存——静态段优先于 {*path}，
-        // 且 app-1/ws 仍走开发域、app-1/runtime/* 走运行域
+        // 生产域工具族（stage 段 prod，原 /runtime 段退役）：与开发域 stage 段区分
         for (path, expected, expected_app) in [
             (
-                "/userapp/ttyd/app-1/runtime/token",
+                "/userapp/prod/ttyd/app-1/ws/token",
                 RouteType::RuntimeTtydProxy,
                 "app-1",
             ),
+            ("/userapp/prod/ttyd/app-1", RouteType::RuntimeTtydProxy, "app-1"),
             (
-                "/userapp/ttyd/app-1/runtime",
-                RouteType::RuntimeTtydProxy,
-                "app-1",
-            ),
-            (
-                "/userapp/pgweb/app-1/runtime/static/favicon.ico",
+                "/userapp/prod/pgweb/app-1/static/favicon.ico",
                 RouteType::RuntimePgwebProxy,
                 "app-1",
             ),
             (
-                "/userapp/pgweb/app-1/runtime",
+                "/userapp/prod/pgweb/app-1",
                 RouteType::RuntimePgwebProxy,
                 "app-1",
             ),
-            // 开发域路由不被 runtime 段劫持
-            ("/userapp/ttyd/app-1/ws", RouteType::DevTtydProxy, "app-1"),
+            // 开发域路由不被 prod 段劫持
+            ("/userapp/dev/ttyd/app-1/ws", RouteType::DevTtydProxy, "app-1"),
         ] {
             let matched = router.at(path).expect(path);
             assert_eq!(*matched.value, expected, "path={path}");
@@ -650,48 +614,29 @@ mod tests {
             );
         }
 
-        // 与 /proxy/devapps、/proxy/apps 互不干扰
-        assert_eq!(
-            *router.at("/proxy/devapps/u1/app-1/4000/x").unwrap().value,
-            RouteType::DevPortProxy
-        );
-        assert_eq!(
-            *router.at("/proxy/apps/u1/app-1/4000/x").unwrap().value,
-            RouteType::AppPortProxy
-        );
-
-        // dbx 两阶段族：静态段 dev/prod/dbx 优先于 /proxy/{port} 参数路由，
-        // path 剥前缀语义（app_id + 剩余 path）与 userapp 族一致。
-        // 尾斜杠路径（`/app-1/`）在裸 router 会因 {*path} ≥1 字符落进
-        // /proxy/{port} 兜底——生产匹配前必经 normalize_path 剥尾斜杠
-        //（proxy_http 两处同款），故尾斜杠用例按归一化后断言（同既有家族语义）。
+        // dbx 两阶段（工具族形态）：app_id + 剩余 path 剥前缀语义与族内一致
         for (path, expected, expected_app, expected_rest) in [
+            ("/userapp/dev/dbx/app-1", RouteType::DevDbxProxy, "app-1", None),
             (
-                "/proxy/dev/dbx/app-1",
-                RouteType::DevDbxProxy,
-                "app-1",
-                None,
-            ),
-            (
-                "/proxy/dev/dbx/app-1/api/auth/check",
+                "/userapp/dev/dbx/app-1/api/auth/check",
                 RouteType::DevDbxProxy,
                 "app-1",
                 Some("api/auth/check"),
             ),
             (
-                "/proxy/dev/dbx/app-1/assets/index.js",
+                "/userapp/dev/dbx/app-1/assets/index.js",
                 RouteType::DevDbxProxy,
                 "app-1",
                 Some("assets/index.js"),
             ),
             (
-                "/proxy/prod/dbx/app-1",
+                "/userapp/prod/dbx/app-1",
                 RouteType::ProdDbxProxy,
                 "app-1",
                 None,
             ),
             (
-                "/proxy/prod/dbx/app-1/api/connection/list",
+                "/userapp/prod/dbx/app-1/api/connection/list",
                 RouteType::ProdDbxProxy,
                 "app-1",
                 Some("api/connection/list"),
@@ -710,12 +655,42 @@ mod tests {
                 "rest path param path={path}"
             );
         }
-        // 尾斜杠经 normalize_path 归一后仍命中 dbx 族
-        let normalized = crate::service::utils::normalize_path("/proxy/dev/dbx/app-1/");
-        assert_eq!(
-            *router.at(normalized).unwrap().value,
-            RouteType::DevDbxProxy
-        );
+
+        // 旧路径风格已退役（clean break）：不得命中 userapp 家族任何变体。
+        // 注：/proxy/apps/...、/proxy/dev/... 旧前缀会落进 /proxy/{port} 泛化路由
+        //（port 段非数字 → handler 400），属预期行为，不算命中。
+        for old_path in [
+            "/userapp/ttyd/app-1/ws",
+            "/userapp/pgweb/app-1/runtime",
+            "/proxy/apps/u1/app-1/4000/x",
+            "/proxy/devapps/u1/app-1/4000/x",
+            "/proxy/dev/dbx/app-1/api/auth/check",
+        ] {
+            let path = crate::service::utils::normalize_path(old_path);
+            let hits_userapp_family = router
+                .at(path)
+                .ok()
+                .map(|m| {
+                    matches!(
+                        *m.value,
+                        RouteType::DevTtydProxy
+                            | RouteType::DevVncProxy
+                            | RouteType::DevAudioProxy
+                            | RouteType::DevImeProxy
+                            | RouteType::DevDbxProxy
+                            | RouteType::ProdDbxProxy
+                            | RouteType::RuntimeTtydProxy
+                            | RouteType::RuntimePgwebProxy
+                            | RouteType::ProdAppProxy
+                            | RouteType::DevAppProxy
+                    )
+                })
+                .unwrap_or(false);
+            assert!(
+                !hits_userapp_family,
+                "old-style path must not hit userapp family: {old_path}"
+            );
+        }
 
         // 与 /proxy/{port} 数字端口族互不干扰：数字端口仍走 PortProxy
         assert_eq!(
@@ -761,10 +736,10 @@ mod tests {
     fn test_get_routes_documentation() {
         let docs = get_routes_documentation();
         assert_eq!(docs.len(), 11);
-        // devapps 开发代理文档在列（首条为 VNC 之前插入）
+        // userApp dev 流量代理文档在列（首条为 VNC 之前插入）
         assert!(
             docs.iter()
-                .any(|(p, t, _)| p.starts_with("/proxy/devapps") && t.contains("Dev apps"))
+                .any(|(p, t, _)| p.starts_with("/proxy/userapp/dev") && t.contains("dev app traffic"))
         );
 
         // 验证 VNC 路由文档
@@ -791,9 +766,9 @@ mod tests {
         assert!(docs[5].0.contains("api"));
         assert!(docs[5].1.contains("API"));
 
-        // 验证 devapps 开发代理路由文档（插在 audio 之前）
-        assert!(docs[6].0.contains("devapps"));
-        assert!(docs[6].1.contains("Dev apps"));
+        // 验证 userApp dev 流量代理路由文档（插在 audio 之前）
+        assert!(docs[6].0.contains("/proxy/userapp/dev"));
+        assert!(docs[6].1.contains("dev app traffic"));
 
         // 验证音频代理路由文档
         assert!(docs[7].0.contains("audio"));

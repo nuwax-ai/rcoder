@@ -219,7 +219,7 @@ async fn run_computer_chat_flow(
 /// 与普通 computer 链路的差异：
 /// - 容器 ensure 走 `ensure_userapp_builder`（幂等，注册 state.projects 防孤立清理）
 /// - workspace 目录由容器内 file-server `ensure-workspace` 幂等创建（rcoder 无共享卷）
-/// - 跳过 VNC 注册（开发容器无桌面代理需求；devapps 可代理任意端口兜底）
+/// - 跳过 VNC 注册（开发容器无桌面代理需求；工具族/流量族 stage 入口已覆盖）
 /// - 跳过 agent 自动安装（UserAppBuilder 安装策略 None）
 /// - gRPC service_type=UserAppBuilder → agent_runner work_dir 命中开发卷分支
 async fn run_userapp_dev_chat_flow(

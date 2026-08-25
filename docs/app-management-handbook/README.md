@@ -122,7 +122,7 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate 链路
            GET    /api/v1/apps/publish/tasks/{task_id}/stream        SSE 实时进度
            POST   /api/v1/apps/publish/tasks/{task_id}/cancel        取消任务
 
-代理访问   GET    /proxy/apps/{user_id}/{app_id}/{port}/{path}                 访问部署的应用
+代理访问   GET    /proxy/userapp/prod/{user_id}/{app_id}/{path}                 访问部署的应用
 ```
 
 所有响应统一包 `HttpResult<T> = { success, data, code, message, tid }`（全部接口一致）。逐个字段含义见各章节。

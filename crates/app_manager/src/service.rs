@@ -7,7 +7,7 @@
 //!
 //! K8s 模式 `create_deployment` 创建 ConfigMap/Secret/ClusterIP Service/Deployment；
 //! HTTP 入口按 `http_expose`：Pingora（默认，两后端统一，本服务注册 Pingora backend
-//! `/proxy/apps/{app_id}/{port}` → 后端 host：Docker container_ip / K8s ClusterIP FQDN）或 Gateway
+//! `/proxy/userapp/prod/{user_id}/{app_id}` → 后端 host：Docker container_ip / K8s ClusterIP FQDN）或 Gateway
 //! （可选，K8s 建 HTTPRoute `/apps/{id}`）。TCP 初期不对外。Docker 模式建容器入主网络。
 
 use std::sync::Arc;

@@ -3,7 +3,7 @@
 //! 容器内形态：
 //!
 //! ```text
-//! 外部(rcoder userapp_forward / devapps 探活 / Java) → :60000 file-server-proxy
+//! 外部(rcoder userapp_forward / Java) → :60000 file-server-proxy
 //!   └─ AllRust → 127.0.0.1:{agent_runner HTTP 端口}
 //! agent_runner HTTP (8086) = 自身路由(/chat /computer/* /health …) + file-server 路由
 //!   (/api/project /api/computer /api/git /api/build /api/version …，两族路径零冲突)

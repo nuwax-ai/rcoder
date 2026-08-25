@@ -13,7 +13,8 @@ use crate::models::{AppOperationError, CreateAppRequest, HealthCheckConfig, Port
 use crate::service::AppService;
 
 /// app-runtime 容器公网端口（pingap 监听，对外 Service + PortConfig 用）。
-const APP_HTTP_PORT: u16 = 9080;
+/// 单一来源 shared_types::APP_ENTRY_PORT（dev 容器 manifest 流程、Pingora 免端口代理同值）。
+const APP_HTTP_PORT: u16 = shared_types::APP_ENTRY_PORT;
 /// app-cli 管理 API 端口（K8s 探针打这里：app-cli 自身提供 /health+/ready，不强依赖后端 app）。
 const APP_CLI_ADMIN_PORT: u16 = 3010;
 /// app-cli 提供的探针路径（liveness=进程活，readiness=初始化完成/可选桥接后端）。

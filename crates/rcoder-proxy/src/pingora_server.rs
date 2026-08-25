@@ -85,7 +85,7 @@ impl PingoraServerManager {
         self
     }
 
-    /// 设置 UserApp 访问追踪（闲置回收的 HTTP 访问信号源，/proxy/apps/* 路由用）
+    /// 设置 UserApp 访问追踪（闲置回收的 HTTP 访问信号源，/proxy/userapp/prod/* 路由用）
     pub fn with_access_tracker(mut self, tracker: Arc<dyn shared_types::AppAccessTracker>) -> Self {
         let new_service = (*self.service).clone().with_access_tracker(tracker);
         self.service = Arc::new(new_service);

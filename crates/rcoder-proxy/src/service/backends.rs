@@ -90,7 +90,7 @@ impl PingoraProxyService {
         }
     }
 
-    /// 添加 app 后端（按 app_id+port 路由，用于 /proxy/apps/{app_id}/{port}）。
+    /// 添加 app 后端（免端口代理按 (app_id, APP_ENTRY_PORT) 优先查，用于 /proxy/userapp/prod）。
     /// 同步（DashMap），与 vnc/project 一致。
     pub fn add_app_backend(&self, app_id: &str, port: u16, host: String) {
         self.app_backends

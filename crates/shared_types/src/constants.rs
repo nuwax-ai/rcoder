@@ -105,16 +105,26 @@ pub const WS_TERMINAL_PORT: u16 = 17681;
 /// pgweb 端口（app-runtime 容器恒为 8081）
 ///
 /// app-runtime 镜像 supervisor 恒起 pgweb（`--listen=8081`），供 userApp 运行容器的
-/// 数据库 Web 控制台；经 Pingora `/userapp/pgweb/{app_id}/runtime` 代理暴露。
+/// 数据库 Web 控制台；经 Pingora `/userapp/prod/pgweb/{app_id}` 代理暴露。
 pub const PGWEB_PORT: u16 = 8081;
 
 /// dbx-web 端口（agent-runner 与 app-runtime 容器恒为 4224）
 ///
 /// DBX 数据库 Web GUI（60+ 数据库），两镜像 supervisor 均恒起（无 CLI 参数，全 env 配置）。
-/// 经 Pingora `/proxy/dev/dbx/{app_id}`（UserAppBuilder 开发容器）与
-/// `/proxy/prod/dbx/{app_id}`（UserApp 运行容器）两阶段代理暴露；
+/// 经 Pingora `/userapp/dev/dbx/{app_id}`（UserAppBuilder 开发容器）与
+/// `/userapp/prod/dbx/{app_id}`（UserApp 运行容器）两阶段代理暴露；
 /// dbx 前端运行时自推断 base path（webPath.ts），代理剥前缀直连 root 模式即可。
 pub const DBX_PORT: u16 = 4224;
+
+/// userApp 应用统一入口端口（pingap 监听，恒为 9080）
+///
+/// 容器内 app-cli 编排的 pingap 统一入口：dev 容器（UserAppBuilder，manifest 流程
+/// `start_dev_manifest` 恒起 pingap）与 prod 运行容器（release 流程 pin 唯一 HTTP 端口）
+/// 同值。Pingora 应用流量族 `/proxy/userapp/{dev,prod}/{user_id}/{app_id}` 免端口——
+/// 内部固定拨此端口，调用方无需传端口。
+/// 与 app-cli 本地 `PINGAP_PORT`（crates/app-cli/src/proxy/pingap.rs，因 workspace
+/// exclude 锁隔离不便引 shared_types）同值互指，两处须同步改。
+pub const APP_ENTRY_PORT: u16 = 9080;
 
 /// agent-runner 内嵌 file-server 端口
 ///

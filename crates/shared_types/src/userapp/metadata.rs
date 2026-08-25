@@ -16,7 +16,7 @@ pub struct AppMetadataRecord {
     pub app_id: String,
     /// 业务名称（仅元数据，集群不持有）
     pub name: Option<String>,
-    /// 归属用户 ID（仅元数据，集群不持有；部署访问 URL `/proxy/apps/{user_id}/...`
+    /// 归属用户 ID（仅元数据，集群不持有；部署访问 URL `/proxy/userapp/prod/{user_id}/...`
     /// 与未来"我的应用"过滤/归属校验的数据源。存量行可空）
     pub user_id: Option<String>,
     /// 租户 ID（冗余自资源 label，便于查询过滤）

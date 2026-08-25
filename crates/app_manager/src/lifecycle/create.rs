@@ -155,7 +155,7 @@ impl AppService {
         }
 
         // 端口校验：HTTP 端口数上限放开（app-runtime 镜像单容器带 pgweb 8081 + ttyd 7681 + 用户应用端口）
-        // Pingora path 路由 /proxy/apps/{app_id}/{port}/ 按 (app_id, port) 区分，天然支持多 HTTP 端口
+        // Pingora 免端口路由 /proxy/userapp/prod 按 (app_id, APP_ENTRY_PORT) 优先（多 HTTP 端口仍全量注册）
         // gateway 模式（HTTPRoute）仍只支持单 HTTP，在 k8s_deployment 侧单独拦截（这里不拦，让 Pingora 模式可用）
         let http_port_count = request
             .ports
@@ -230,7 +230,7 @@ impl AppService {
             "[APP] app resources created: {} (container={})",
             app_id, container_info.container_name
         );
-        // Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/apps/{app_id}/{port} → container_ip）
+        // Docker 模式：为 HTTP 端口注册 Pingora backend（/proxy/userapp/prod 免端口代理按 APP_ENTRY_PORT 优查 → container_ip）
         // 注册错误忽略不阻断：pingora backend 幂等可重建（update/restart/启动时 rebuild 会补齐），
         // 不应因注册失败回滚已建成的 Deployment。
         let http_ports = http_port_numbers(&request.ports);

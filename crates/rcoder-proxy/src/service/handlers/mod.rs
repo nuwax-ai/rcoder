@@ -3,10 +3,10 @@
 //! 包含各种代理类型的请求处理和上游选择函数。
 
 pub mod api_proxy;
-pub mod app_port_proxy;
+pub mod app_proxy;
 pub mod audio;
 pub mod dbx;
-pub mod dev_port_proxy;
+pub mod dev_app_proxy;
 pub mod dev_terminal;
 pub mod ime;
 pub mod port_proxy;

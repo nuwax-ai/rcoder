@@ -29,7 +29,7 @@ impl ProxyHttp for PortProxy {
 
     /// 请求过滤阶段：UserApp 访问追踪 + 流量唤醒。
     ///
-    /// 仅 `/proxy/apps/{user_id}/{app_id}/{port}/...` 路由触发：
+    /// 仅 `/proxy/userapp/prod/{user_id}/{app_id}/...` 路由触发：
     /// 1. `touch(app_id)` 记录最近 HTTP 访问（闲置回收信号源，内部节流）；
     /// 2. 若 app stopped → `ensure_running`（hold-and-wait ≤60s）拉起；超时/失败 → 503+Retry-After。
     /// 其余路由直接放行（Ok(false) → 继续 upstream_peer）。
@@ -38,15 +38,16 @@ impl ProxyHttp for PortProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> PingoraResult<bool> {
-        // 仅 /proxy/apps/* 路由需要访问追踪 + 唤醒;前缀快滤,避免每请求都走 matchit 树匹配
-        // (其余路由 /proxy/{port}、/web/ttyd、/computer/vnc、/api/* 等直接放行)
+        // 仅 /proxy/userapp/prod/* 路由需要访问追踪 + 唤醒;前缀快滤,避免每请求都走 matchit 树匹配
+        // (其余路由 /proxy/{port}、/web/ttyd、/computer/vnc、/api/* 等直接放行;
+        //  dev 流量无闲置回收语义,不触发)
         let path = Self::normalize_path(session.req_header().uri.path());
-        if !path.starts_with("/proxy/apps/") {
+        if !path.starts_with("/proxy/userapp/prod/") {
             return Ok(false);
         }
         let app_id: Option<String> = match self.router.at(path) {
             Ok(m) => match m.value {
-                RouteType::AppPortProxy => m.params.get("app_id").map(|s| s.to_string()),
+                RouteType::ProdAppProxy => m.params.get("app_id").map(|s| s.to_string()),
                 _ => None,
             },
             Err(_) => None,

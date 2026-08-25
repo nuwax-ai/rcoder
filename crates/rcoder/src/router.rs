@@ -133,72 +133,72 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .route("/proxy/status", get(handler::proxy_status))
         .route("/proxy/stats", get(handler::proxy_stats))
         .route("/proxy/config", get(handler::proxy_config))
-        // userApp 开发域终端/桌面代理的 307 文档接口（实际流量走 Pingora 8088；
+        // userApp 工具族 307 文档接口（实际流量走 Pingora 8088；stage 段 dev/prod 统一：
         // 此处提供 Swagger 文档 + 可直接调用的重定向语义，对齐 devapp 先例）
+        // 开发域（UserAppBuilder 开发容器）：ttyd/vnc/audio/ime/dbx
         .route(
-            "/userapp/ttyd/{app_id}/{*path}",
+            "/userapp/dev/ttyd/{app_id}/{*path}",
             get(handler::proxy_to_userapp_ttyd),
         )
         .route(
-            "/userapp/ttyd/{app_id}",
+            "/userapp/dev/ttyd/{app_id}",
             get(handler::proxy_to_userapp_ttyd_redirect_root),
         )
         .route(
-            "/userapp/vnc/{app_id}/{*path}",
+            "/userapp/dev/vnc/{app_id}/{*path}",
             get(handler::proxy_to_userapp_vnc),
         )
         .route(
-            "/userapp/vnc/{app_id}",
+            "/userapp/dev/vnc/{app_id}",
             get(handler::proxy_to_userapp_vnc_redirect_root),
         )
         .route(
-            "/userapp/audio/{app_id}/{*path}",
+            "/userapp/dev/audio/{app_id}/{*path}",
             get(handler::proxy_to_userapp_audio),
         )
         .route(
-            "/userapp/audio/{app_id}",
+            "/userapp/dev/audio/{app_id}",
             get(handler::proxy_to_userapp_audio_redirect_root),
         )
         .route(
-            "/userapp/ime/{app_id}/{*path}",
+            "/userapp/dev/ime/{app_id}/{*path}",
             get(handler::proxy_to_userapp_ime),
         )
         .route(
-            "/userapp/ime/{app_id}",
+            "/userapp/dev/ime/{app_id}",
             get(handler::proxy_to_userapp_ime_redirect_root),
         )
-        // userApp 运行容器（部署后的生产环境）终端/数据库控制台 307 文档接口
         .route(
-            "/userapp/ttyd/{app_id}/runtime/{*path}",
-            get(handler::proxy_to_userapp_runtime_ttyd),
-        )
-        .route(
-            "/userapp/ttyd/{app_id}/runtime",
-            get(handler::proxy_to_userapp_runtime_ttyd_redirect_root),
-        )
-        .route(
-            "/userapp/pgweb/{app_id}/runtime/{*path}",
-            get(handler::proxy_to_userapp_runtime_pgweb),
-        )
-        .route(
-            "/userapp/pgweb/{app_id}/runtime",
-            get(handler::proxy_to_userapp_runtime_pgweb_redirect_root),
-        )
-        // DBX 数据库 Web GUI 两阶段 307 文档接口（dev=开发容器 / prod=运行容器）
-        .route(
-            "/proxy/dev/dbx/{app_id}/{*path}",
+            "/userapp/dev/dbx/{app_id}/{*path}",
             get(handler::proxy_to_dev_dbx),
         )
         .route(
-            "/proxy/dev/dbx/{app_id}",
+            "/userapp/dev/dbx/{app_id}",
             get(handler::proxy_to_dev_dbx_redirect_root),
         )
+        // 生产域（运行容器，部署后的生产环境）：ttyd/pgweb/dbx
         .route(
-            "/proxy/prod/dbx/{app_id}/{*path}",
+            "/userapp/prod/ttyd/{app_id}/{*path}",
+            get(handler::proxy_to_userapp_runtime_ttyd),
+        )
+        .route(
+            "/userapp/prod/ttyd/{app_id}",
+            get(handler::proxy_to_userapp_runtime_ttyd_redirect_root),
+        )
+        .route(
+            "/userapp/prod/pgweb/{app_id}/{*path}",
+            get(handler::proxy_to_userapp_runtime_pgweb),
+        )
+        .route(
+            "/userapp/prod/pgweb/{app_id}",
+            get(handler::proxy_to_userapp_runtime_pgweb_redirect_root),
+        )
+        .route(
+            "/userapp/prod/dbx/{app_id}/{*path}",
             get(handler::proxy_to_prod_dbx),
         )
         .route(
-            "/proxy/prod/dbx/{app_id}",
+            "/userapp/prod/dbx/{app_id}",
             get(handler::proxy_to_prod_dbx_redirect_root),
         )
         .route("/userapp/routes", get(handler::userapp_proxy_routes_doc))

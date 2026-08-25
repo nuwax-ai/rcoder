@@ -159,19 +159,27 @@ impl AppService {
         let http_port = ports.iter().find(|p| p.expose_type == RtExposeType::Http);
 
         // 一律只返 path，host 由 Java 拼（Java 必然已知 RCoder / gateway 入口，否则访问不了）：
-        // - Pingora 模式（默认，两后端统一）：/proxy/apps/{user_id}/{app_id}/{port}
-        //   （与开发预览 /proxy/devapps/{user_id}/{app_id}/{port} 同构四段；
-        //   user_id 来自 userapp_metadata，缺值（存量行/内部 ensure 无上下文）降级旧短形态）
+        // - Pingora 模式（默认，两后端统一）：/proxy/userapp/prod/{user_id}/{app_id}
+        //   （免端口——代理内部固定拨 pingap 统一入口 APP_ENTRY_PORT=9080；
+        //   与开发预览 /proxy/userapp/dev/{user_id}/{app_id} 同构，切环境只改 dev→prod；
+        //   user_id 来自 userapp_metadata，缺值（存量行/内部 ensure 无上下文）无法锚定
+        //   归属 → 返 None 由调用方降级处理）
         // - Gateway 模式（K8s 可选）：/apps/{app_id}
         // TCP 初期不对外（external.tcp 空）；internal 始终给 ClusterIP FQDN / 容器名。
         let http_url = match self.config.http_expose {
-            HttpExpose::Pingora => http_port.map(|p| match self.owner_user_id(app_id) {
-                Some(user_id) => format!("/proxy/apps/{user_id}/{app_id}/{}", p.port),
-                None => {
-                    warn!("[APP] metadata user_id missing, access URL degrades to short form: {app_id}");
-                    format!("/proxy/apps/{app_id}/{}", p.port)
+            HttpExpose::Pingora => {
+                if http_port.is_none() {
+                    None
+                } else {
+                    match self.owner_user_id(app_id) {
+                        Some(user_id) => Some(format!("/proxy/userapp/prod/{user_id}/{app_id}")),
+                        None => {
+                            warn!("[APP] metadata user_id missing, cannot build access URL: {app_id}");
+                            None
+                        }
+                    }
                 }
-            }),
+            }
             HttpExpose::Gateway => http_port.map(|_| format!("/apps/{}", app_id)),
         };
 

@@ -54,7 +54,7 @@ pub struct PingoraProxyService {
     /// 用于 /web/ttyd/{user_id}/{project_id} 路由（共享容器场景）
     pub project_backends: Arc<DashMap<String, String>>,
     /// app 后端映射: (app_id, port) -> host
-    /// 用于 /proxy/apps/{app_id}/{port} 路由（app_manager 部署的应用，按 app_id+port 路由避免同端口冲突）
+    /// 用于 /proxy/userapp/prod/{user_id}/{app_id} 路由（app_manager 部署的应用，按 (app_id, APP_ENTRY_PORT) 路由）
     pub app_backends: Arc<DashMap<(String, u16), String>>,
     /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
     /// 用于 /api/{service_name}/{*path} 路由
@@ -89,7 +89,7 @@ pub struct PortProxy {
     vnc_backends: Arc<DashMap<String, String>>,
     /// Project 后端映射: project_id -> container_ip
     project_backends: Arc<DashMap<String, String>>,
-    /// app 后端映射: (app_id, port) -> host（/proxy/apps/{app_id}/{port} 路由）
+    /// app 后端映射: (app_id, port) -> host（/proxy/userapp/prod 免端口代理按 (app_id, APP_ENTRY_PORT) 查）
     app_backends: Arc<DashMap<(String, u16), String>>,
     /// 路由表
     router: Router<RouteType>,
@@ -100,7 +100,7 @@ pub struct PortProxy {
     api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
     /// 容器查找服务（统一数据源）
     container_lookup: Option<Arc<dyn shared_types::ContainerLookup>>,
-    /// UserApp 访问追踪 + 流量唤醒（/proxy/apps/* 路由用）
+    /// UserApp 访问追踪 + 流量唤醒（/proxy/userapp/prod/* 路由用）
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
     wake_control: Option<Arc<dyn shared_types::AppWakeControl>>,
     /// userApp 运行容器 IPv4 解析槽（与 PingoraProxyService 共享同一 Arc）

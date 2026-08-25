@@ -42,16 +42,16 @@ impl PortProxy {
                 )
                 .await?;
             }
-            RouteType::AppPortProxy => {
-                handlers::app_port_proxy::handle_app_port_proxy_request(
+            RouteType::ProdAppProxy => {
+                handlers::app_proxy::handle_prod_app_request(
                     upstream_request,
                     original_uri,
                     params,
                 )
                 .await?;
             }
-            RouteType::DevPortProxy => {
-                handlers::dev_port_proxy::handle_dev_port_proxy_request(
+            RouteType::DevAppProxy => {
+                handlers::dev_app_proxy::handle_dev_app_request(
                     upstream_request,
                     original_uri,
                     params,
@@ -215,8 +215,8 @@ impl PortProxy {
                 )
                 .await
             }
-            RouteType::AppPortProxy => {
-                handlers::app_port_proxy::handle_app_port_proxy_upstream(
+            RouteType::ProdAppProxy => {
+                handlers::app_proxy::handle_prod_app_upstream(
                     ctx,
                     params,
                     &self.app_backends,
@@ -224,8 +224,8 @@ impl PortProxy {
                 )
                 .await
             }
-            RouteType::DevPortProxy => {
-                handlers::dev_port_proxy::handle_dev_port_proxy_upstream(
+            RouteType::DevAppProxy => {
+                handlers::dev_app_proxy::handle_dev_app_upstream(
                     ctx,
                     params,
                     &self.metrics,

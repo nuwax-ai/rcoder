@@ -1,4 +1,4 @@
-//! userApp 开发域终端/桌面代理（`/userapp/{ttyd,vnc,audio,ime}/{app_id}` 族，与 /proxy/apps、/proxy/devapps 同前缀）。
+//! userApp 开发域工具代理（`/userapp/dev/{ttyd,vnc,audio,ime}/{app_id}` 族；prod 工具族与本族同形态）。
 //!
 //! 与 computer 族（`/computer/*`，按 user_id 定位沙箱）对称的开发场景入口：
 //! 按 **app_id** 定位该 app 的 UserAppBuilder 开发容器（镜像同款——内含
