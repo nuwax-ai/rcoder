@@ -280,3 +280,54 @@ pub(super) fn timestamp_to_utc8_string(timestamp_millis: u64) -> String {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
 }
+
+// ============================================================================
+// userApp 分派（app_id / app_stage 入参）
+// ============================================================================
+
+/// pod 接口族的 userApp 分派目标。
+pub(super) enum AppTarget {
+    /// 无 app_id——走既有 agent/computer 路径
+    NotApp,
+    /// 开发容器（UserAppBuilder：虚拟终端/文件服务/PG 全套开发栈）
+    Dev(String),
+    /// 生产 Deployment（AppService 托管）
+    Prod(String),
+}
+
+/// 解析 userApp 分派目标。
+///
+/// 校验规则：
+/// - `app_id` 与 `service_type` 互斥（userApp 容器类型由 `app_stage` 推导，防双头语义）
+/// - `app_stage` 依附于 `app_id`（单独出现视为无效）
+/// - `app_id` 过 identifier 白名单（进入容器名/bind 路径拼接，防注入）
+pub(super) fn parse_app_target(
+    app_id: Option<&str>,
+    app_stage: Option<&str>,
+    service_type: Option<&str>,
+) -> Result<AppTarget, String> {
+    let Some(app_id) = app_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        if app_stage.is_some_and(|s| !s.trim().is_empty()) {
+            return Err("app_stage requires app_id".to_string());
+        }
+        return Ok(AppTarget::NotApp);
+    };
+    if service_type.is_some_and(|s| !s.trim().is_empty()) {
+        return Err(
+            "app_id and service_type are mutually exclusive (userApp 容器类型由 app_stage 推导)"
+                .to_string(),
+        );
+    }
+    shared_types::validate_identifier(app_id, "app_id").map_err(|e| e.to_string())?;
+    match app_stage
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("dev")
+    {
+        "dev" => Ok(AppTarget::Dev(app_id.to_owned())),
+        "prod" => Ok(AppTarget::Prod(app_id.to_owned())),
+        other => Err(format!(
+            "invalid app_stage {other:?}: expected \"dev\" or \"prod\""
+        )),
+    }
+}

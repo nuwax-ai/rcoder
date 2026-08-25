@@ -102,6 +102,8 @@ pub async fn internal_pod_ensure(
                 space_id: None,
                 isolation_type: None,
                 service_type: None,
+                app_id: None,
+                app_stage: None,
             };
 
             let state_clone = state.clone();

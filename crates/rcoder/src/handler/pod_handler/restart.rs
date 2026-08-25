@@ -27,6 +27,126 @@ pub async fn pod_restart(
 ) -> Result<HttpResult<RestartPodResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 
+    // 0. userApp 分派（app_id 存在即短路 agent 流程）
+    match parse_app_target(
+        request.app_id.as_deref(),
+        request.app_stage.as_deref(),
+        request.service_type.as_deref(),
+    ) {
+        Ok(AppTarget::NotApp) => {}
+        Ok(AppTarget::Dev(app_id)) => {
+            // 原地重启优先（K8s：pod 名/IP/60000 转发地址不变，dev 运行态全保）；
+            // Docker 运行时无原地重启（trait 默认 NotImplemented）→ 回落
+            // stop + ensure 正路重建（per-app 卷保留，dev 数据不丢）
+            let existed = state
+                .runtime()
+                .get_container_info_by_identifier(&app_id, &ServiceType::UserAppBuilder)
+                .await
+                .ok()
+                .flatten();
+            let Some(existing) = existed else {
+                return Ok(HttpResult::error_with_message(
+                    shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                    locale,
+                    &format!("userapp dev container not found: app_id={app_id}"),
+                ));
+            };
+            let inplace = state
+                .runtime()
+                .restart_container_inplace(&app_id, &ServiceType::UserAppBuilder)
+                .await;
+            let (info, message) = match inplace {
+                Ok(()) => {
+                    info!("[POD_RESTART] userapp dev 容器原地重启完成: app_id={app_id}");
+                    (
+                        existing.clone(),
+                        "UserApp dev 容器已原地重启（地址不变）".to_string(),
+                    )
+                }
+                Err(e) => {
+                    info!(
+                        "[POD_RESTART] userapp dev 原地重启不可用（Docker 运行时等），回落重建: app_id={app_id}: {e:#}"
+                    );
+                    state
+                        .runtime()
+                        .stop_container_by_identifier(&app_id, &ServiceType::UserAppBuilder)
+                        .await
+                        .map_err(|e| {
+                            error!("[POD_RESTART] userapp dev stop failed: app_id={app_id}: {e:#}");
+                            AppError::with_message(
+                                shared_types::error_codes::ERR_BACKEND_ERROR,
+                                format!("userapp dev restart (stop phase) failed: {e:#}"),
+                            )
+                        })?;
+                    // 清注册表 container 字段（防 ensure 命中死注册不重建——
+                    // 同 userapp_forward 探活自愈的就地清模式，不 remove_project
+                    // 以保 PG 侧 project 行与会话映射）
+                    state.shutdown_sse_streams_for_project(&app_id);
+                    if let Some(mut info) = state.get_project(&app_id).map(|p| (*p).clone()) {
+                        info.set_container(None);
+                        if let Err(e) = state.insert_project(app_id.clone(), Arc::new(info)) {
+                            warn!(
+                                "[POD_RESTART] clear stale container field failed: app_id={app_id}: {e}"
+                            );
+                        }
+                    }
+                    let recreated = crate::userapp_publish::agent_runner::ensure_userapp_builder(
+                        &state, &app_id,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("[POD_RESTART] userapp dev recreate failed: app_id={app_id}: {e:#}");
+                        AppError::with_message(
+                            shared_types::error_codes::ERR_BACKEND_ERROR,
+                            format!("userapp dev restart (recreate phase) failed: {e:#}"),
+                        )
+                    })?;
+                    (
+                        recreated,
+                        "UserApp dev 容器已重建（卷保留，数据不丢）".to_string(),
+                    )
+                }
+            };
+            info!("[POD_RESTART] userapp dev 容器重启完成: app_id={app_id}");
+            return Ok(HttpResult::success(RestartPodResponse {
+                was_existing: true,
+                restarted: true,
+                container_info: PodContainerInfo {
+                    container_id: info.container_id.clone(),
+                    status: "Running".to_string(),
+                },
+                message,
+            }));
+        }
+        Ok(AppTarget::Prod(app_id)) => {
+            state.app_service.restart_app(&app_id).await.map_err(|e| {
+                error!("[POD_RESTART] userapp prod restart failed: app_id={app_id}: {e:#}");
+                AppError::with_message(
+                    shared_types::error_codes::ERR_BACKEND_ERROR,
+                    format!("userapp prod restart failed: {e:#}"),
+                )
+            })?;
+            info!("[POD_RESTART] userapp prod 滚动重启完成: app_id={app_id}");
+            return Ok(HttpResult::success(RestartPodResponse {
+                was_existing: true,
+                restarted: true,
+                container_info: PodContainerInfo {
+                    container_id: app_id.clone(),
+                    status: "Running".to_string(),
+                },
+                message: "UserApp 生产实例已滚动重启".to_string(),
+            }));
+        }
+        Err(e) => {
+            error!("[POD_RESTART] invalid app target: {}", e);
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &e,
+            ));
+        }
+    }
+
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[POD_RESTART] user_id is required");

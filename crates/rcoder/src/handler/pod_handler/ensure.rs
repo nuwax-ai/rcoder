@@ -27,6 +27,88 @@ pub async fn pod_ensure(
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 
+    // 0. userApp 分派（app_id 存在即短路 agent 流程）
+    match parse_app_target(
+        request.app_id.as_deref(),
+        request.app_stage.as_deref(),
+        request.service_type.as_deref(),
+    ) {
+        Ok(AppTarget::NotApp) => {}
+        Ok(AppTarget::Dev(app_id)) => {
+            let existed_before = state
+                .get_project(&app_id)
+                .and_then(|p| p.container_info().is_some().then_some(()))
+                .is_some();
+            let info = crate::userapp_publish::agent_runner::ensure_userapp_builder(
+                &state, &app_id,
+            )
+            .await
+            .map_err(|e| {
+                error!("[POD_ENSURE] ensure userapp dev container failed: app_id={app_id}: {e:#}");
+                AppError::with_message(
+                    shared_types::error_codes::ERR_BACKEND_ERROR,
+                    format!("ensure userapp dev container failed: {e:#}"),
+                )
+            })?;
+            info!(
+                "[POD_ENSURE] userapp dev container ready: app_id={app_id}, container={}, ip={}",
+                info.container_name, info.container_ip
+            );
+            return Ok(HttpResult::success(EnsurePodResponse {
+                created: !existed_before,
+                container_info: PodContainerInfo {
+                    container_id: info.container_id.clone(),
+                    status: info.status.clone(),
+                },
+                message: "UserApp dev 容器已就绪（虚拟终端/文件服务经反向代理访问）".to_string(),
+            }));
+        }
+        Ok(AppTarget::Prod(app_id)) => {
+            use shared_types::AppWakeControl;
+            let outcome = state.activity.ensure_running(&app_id).await;
+            let (ok, message) = match &outcome {
+                shared_types::WakeOutcome::Ready => (
+                    true,
+                    "UserApp 生产实例已唤醒（wake_on_traffic 已启用）".to_string(),
+                ),
+                shared_types::WakeOutcome::AlreadyRunning => {
+                    (false, "UserApp 生产实例已在运行".to_string())
+                }
+                shared_types::WakeOutcome::Timeout => {
+                    error!("[POD_ENSURE] userapp prod wake timeout: app_id={app_id}");
+                    (false, String::new())
+                }
+                shared_types::WakeOutcome::Failed(e) => {
+                    error!("[POD_ENSURE] userapp prod wake failed: app_id={app_id}: {e}");
+                    (false, String::new())
+                }
+            };
+            if !ok && message.is_empty() {
+                return Ok(HttpResult::error_with_message(
+                    shared_types::error_codes::ERR_BACKEND_ERROR,
+                    locale,
+                    &format!("userapp prod ensure failed: {outcome:?}"),
+                ));
+            }
+            return Ok(HttpResult::success(EnsurePodResponse {
+                created: ok,
+                container_info: PodContainerInfo {
+                    container_id: app_id.clone(),
+                    status: "Running".to_string(),
+                },
+                message,
+            }));
+        }
+        Err(e) => {
+            error!("[POD_ENSURE] invalid app target: {}", e);
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &e,
+            ));
+        }
+    }
+
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[POD_ENSURE] user_id is required");

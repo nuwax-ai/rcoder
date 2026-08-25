@@ -25,6 +25,99 @@ pub async fn pod_keepalive(
 ) -> Result<HttpResult<KeepalivePodResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 
+    // 0. userApp 分派（app_id 存在即短路 agent 流程）
+    match parse_app_target(
+        request.app_id.as_deref(),
+        request.app_stage.as_deref(),
+        request.service_type.as_deref(),
+    ) {
+        Ok(AppTarget::NotApp) => {}
+        Ok(AppTarget::Dev(app_id)) => {
+            // ensure 顺带注册表自愈（死容器重建）；刷新 last_activity 维持存活
+            // （此前 builder 活跃仅靠 chat——Java 周期 keepalive 即可维持）
+            let (previous, existed_before) = {
+                let prev = state
+                    .get_project(&app_id)
+                    .map(|p| p.last_activity().timestamp_millis().max(0) as u64)
+                    .unwrap_or(0);
+                let existed = state
+                    .get_project(&app_id)
+                    .and_then(|p| p.container_info().is_some().then_some(()))
+                    .is_some();
+                (prev, existed)
+            };
+            let info = crate::userapp_publish::agent_runner::ensure_userapp_builder(
+                &state, &app_id,
+            )
+            .await
+            .map_err(|e| {
+                error!(
+                    "[POD_KEEPALIVE] ensure userapp dev container failed: app_id={app_id}: {e:#}"
+                );
+                AppError::with_message(
+                    shared_types::error_codes::ERR_BACKEND_ERROR,
+                    format!("ensure userapp dev container failed: {e:#}"),
+                )
+            })?;
+            let current = state
+                .update_activity(&app_id)
+                .map(|t| t.timestamp_millis().max(0) as u64)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis().max(0) as u64);
+            let idle_timeout_seconds = state.config.cleanup_config.idle_timeout_seconds;
+            let created = !existed_before;
+            info!(
+                "[POD_KEEPALIVE] userapp dev container alive: app_id={app_id}, container={}",
+                info.container_name
+            );
+            return Ok(HttpResult::success(KeepalivePodResponse {
+                existed: existed_before,
+                created,
+                container_info: PodContainerInfo {
+                    container_id: info.container_id.clone(),
+                    status: info.status.clone(),
+                },
+                previous_activity_time: previous,
+                current_activity_time: current,
+                previous_activity_time_str: timestamp_to_utc8_string(previous),
+                current_activity_time_str: timestamp_to_utc8_string(current),
+                time_until_cleanup: idle_timeout_seconds,
+                message: format!(
+                    "UserApp dev 容器已保活, {} minutes until auto cleanup",
+                    idle_timeout_seconds / 60
+                ),
+            }));
+        }
+        Ok(AppTarget::Prod(app_id)) => {
+            // 生产回收信号源（AppAccessTracker, 5s 节流）
+            use shared_types::AppAccessTracker;
+            state.activity.touch(&app_id);
+            let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            info!("[POD_KEEPALIVE] userapp prod app touched: app_id={app_id}");
+            return Ok(HttpResult::success(KeepalivePodResponse {
+                existed: true,
+                created: false,
+                container_info: PodContainerInfo {
+                    container_id: app_id.clone(),
+                    status: "Running".to_string(),
+                },
+                previous_activity_time: now,
+                current_activity_time: now,
+                previous_activity_time_str: timestamp_to_utc8_string(now),
+                current_activity_time_str: timestamp_to_utc8_string(now),
+                time_until_cleanup: 0,
+                message: "UserApp 生产实例活跃信号已刷新（闲置回收计时重置）".to_string(),
+            }));
+        }
+        Err(e) => {
+            error!("[POD_KEEPALIVE] invalid app target: {}", e);
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                locale,
+                &e,
+            ));
+        }
+    }
+
     // 1. 验证参数
     if request.user_id.trim().is_empty() {
         error!("[POD_KEEPALIVE] user_id is required");

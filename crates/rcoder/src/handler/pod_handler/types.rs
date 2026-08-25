@@ -142,9 +142,24 @@ pub struct EnsurePodRequest {
     /// 服务类型，决定创建哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    ///
+    /// 注意：与 app_id 互斥（userApp 场景的容器类型由 app_stage 推导）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
+
+    /// UserApp 容器标识（可选；存在即进入 userApp 分派——启动/保活/重启
+    /// userApp 容器，启用其虚拟终端(ttyd)与文件服务等）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "app_789")]
+    pub app_id: Option<String>,
+
+    /// UserApp 容器阶段（可选，缺省 "dev"）
+    /// - "dev": 开发容器（UserAppBuilder，含虚拟终端/文件服务/PG 全套开发栈）
+    /// - "prod": 生产 Deployment（AppService 托管）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
 }
 
 /// 启动容器响应
@@ -223,6 +238,16 @@ pub struct KeepalivePodRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
+
+    /// UserApp 容器标识（可选；存在即进入 userApp 分派——保活/重启 userApp 容器）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "app_789")]
+    pub app_id: Option<String>,
+
+    /// UserApp 容器阶段（可选，缺省 "dev"；dev=开发容器 UserAppBuilder / prod=生产 Deployment）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
 }
 
 /// 容器保活响应
@@ -315,6 +340,16 @@ pub struct RestartPodRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
+
+    /// UserApp 容器标识（可选；存在即进入 userApp 分派——保活/重启 userApp 容器）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "app_789")]
+    pub app_id: Option<String>,
+
+    /// UserApp 容器阶段（可选，缺省 "dev"；dev=开发容器 UserAppBuilder / prod=生产 Deployment）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
 }
 
 /// 重启容器响应

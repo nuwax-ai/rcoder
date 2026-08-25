@@ -176,3 +176,50 @@ fn test_validate_resource_limits_cpu_boundary() {
     };
     assert!(validate_resource_limits(&limits).is_ok());
 }
+
+// ============================================================================
+// userApp 分派（parse_app_target）
+// ============================================================================
+
+#[test]
+fn app_target_no_app_id_falls_through_to_agent_path() {
+    // 无 app_id 无 app_stage → agent/computer 既有路径
+    assert!(matches!(
+        parse_app_target(None, None, Some("computer-agent-runner")),
+        Ok(AppTarget::NotApp)
+    ));
+}
+
+#[test]
+fn app_target_dev_and_prod_dispatch() {
+    assert!(matches!(
+        parse_app_target(Some("app-1"), None, None),
+        Ok(AppTarget::Dev(id)) if id == "app-1"
+    ));
+    assert!(matches!(
+        parse_app_target(Some("app-1"), Some("dev"), None),
+        Ok(AppTarget::Dev(id)) if id == "app-1"
+    ));
+    assert!(matches!(
+        parse_app_target(Some("app-1"), Some("prod"), None),
+        Ok(AppTarget::Prod(id)) if id == "app-1"
+    ));
+    // 空串 app_id 视为未传（回 agent 路径）
+    assert!(matches!(
+        parse_app_target(Some("  "), None, None),
+        Ok(AppTarget::NotApp)
+    ));
+}
+
+#[test]
+fn app_target_validates_stage_and_conflicts() {
+    // app_id 与 service_type 互斥
+    assert!(parse_app_target(Some("app-1"), None, Some("computer-agent-runner")).is_err());
+    // 非法 stage 值
+    assert!(parse_app_target(Some("app-1"), Some("staging"), None).is_err());
+    // app_stage 依附于 app_id
+    assert!(parse_app_target(None, Some("dev"), None).is_err());
+    // identifier 白名单（防容器名/bind 路径注入）
+    assert!(parse_app_target(Some("../escape"), None, None).is_err());
+    assert!(parse_app_target(Some("app/1"), None, None).is_err());
+}
