@@ -61,12 +61,10 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
         //    user_id 不经 trait 契约传递（仅 app_id），按 app_id 唯一性通配扫
         //    dev/*/ 一层定位属主目录（per-user 目录数小，遍历成本可忽略）。
         {
-            let sub_paths = [
-                app_id.to_string(),
-                format!("data/{app_id}"),
-                format!("logs/{app_id}"),
-                format!("agent-store/{app_id}"),
-            ];
+            // 四段后缀 = 挂载压平布局的 app 侧段（单一事实源
+            // paths::userapp_dev_app_suffixes；uid 不经 trait 契约传递，通配扫
+            // dev/*/ 一层定位属主目录后拼后缀）
+            let sub_paths = shared_types::paths::userapp_dev_app_suffixes(app_id);
             let dev_root = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
                 .join("dev");
             if dev_root.is_dir() {

@@ -84,6 +84,32 @@ pub const USERAPP_DEV_PGDATA: &str = "/home/user/data/pg";
 /// 开发容器内 dbx 数据目录（`DBX_DATA_DIR` env 注入值）。
 pub const USERAPP_DEV_DBX_DATA: &str = "/home/user/data/dbx";
 
+// ── 挂载压平布局子路径（宿主树定位的单一事实源）──────────────────────────────
+// compose mounts（四 bind 组装）、dev cleanup（purge 通配清理）、
+// docker_app_runtime/app_manager（prod 数据目录定位）共用——改布局只动这里。
+
+/// UserApp 开发卷宿主树 `dev/{user_id}/` 下四目录的 app 侧后缀段
+/// （`{app_id}` / `data/{app_id}` / `logs/{app_id}` / `agent-store/{app_id}`）。
+pub fn userapp_dev_app_suffixes(app_id: &str) -> [String; 4] {
+    [
+        app_id.to_string(),
+        format!("data/{app_id}"),
+        format!("logs/{app_id}"),
+        format!("agent-store/{app_id}"),
+    ]
+}
+
+/// UserApp 开发卷宿主树四目录的完整子路径（`dev/{user_id}/…`，锚点相对）。
+pub fn userapp_dev_subpaths(user_id: &str, app_id: &str) -> [String; 4] {
+    userapp_dev_app_suffixes(app_id).map(|s| format!("dev/{user_id}/{s}"))
+}
+
+/// UserApp prod 数据目录子路径（`prod/{user_id}/data/{app_id}`，锚点相对）——
+/// 运行容器数据卷 bind 源与 purge/clear 清理定位共用。
+pub fn userapp_prod_data_subpath(user_id: &str, app_id: &str) -> String {
+    format!("prod/{user_id}/data/{app_id}")
+}
+
 /// UserApp 运行容器内的应用代码根（**部署契约**：activate 后整体包落此目录，
 /// app-runtime 镜像挂载点；database 目录 SQL 执行等容器内路径拼接收口于此）。
 /// ```text

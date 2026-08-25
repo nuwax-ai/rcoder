@@ -144,7 +144,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             });
 
             let uid = params.user_id.clone().unwrap_or_else(|| app_id.to_string());
-            let rel = format!("prod/{uid}/data/{app_id}");
+            let rel = shared_types::paths::userapp_prod_data_subpath(&uid, &app_id);
             let host_root = crate::path::resolve_container_path_to_host(std::path::Path::new(
                 shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
             ))

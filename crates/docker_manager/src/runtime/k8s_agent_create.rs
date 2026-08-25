@@ -181,7 +181,7 @@ impl KubernetesRuntime {
         // rcoder 容器视角的宿主反解锚点（/app/userapp-workspace），K8s 下误用会把
         // PVC 挂到 overlay 路径造成数据面分裂——k8s 配置缺失时直接用镜像契约默认。
         // （UserAppBuilder 的实际挂载不走此单挂载点——见下方 volume_mounts 的
-        //  三 subPath 压平分支，此值对 builder 不生效。）
+        //  四 subPath 压平分支，此值对 builder 不生效。）
         let workspace_mount_path = k8s_service
             .map(|sc| sc.workspace_container_path())
             .or_else(|| {
@@ -193,7 +193,7 @@ impl KubernetesRuntime {
             })
             .unwrap_or_else(|| match service_type {
                 ServiceType::ComputerAgentRunner => "/home/user".to_string(),
-                // UserAppBuilder 开发容器: 挂载压平（三 subPath 分支在 volume_mounts
+                // UserAppBuilder 开发容器: 挂载压平（四 subPath 分支在 volume_mounts
                 // 构造处短路），此兜底值不生效，仅为 match 完备性保留
                 ServiceType::UserAppBuilder => {
                     shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string()

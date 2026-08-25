@@ -36,7 +36,7 @@ pub(crate) fn build_agent_env_vars(
             value: Some(service_type_str.to_string()),
             ..Default::default()
         },
-        // 部署模式标识: start-up.sh 据此 source extra (K8s 下 /home/user 是 PVC, 跳过 bind mount 权限修复)
+        // 部署模式标识: start-up.sh 据此 source extra (K8s 下 workspace 是 PVC, 跳过 bind mount 权限修复)
         EnvVar {
             name: "DEPLOY_MODE".to_string(),
             value: Some("k8s".to_string()),
@@ -44,21 +44,21 @@ pub(crate) fn build_agent_env_vars(
         },
     ];
     // 多租户环境变量（agent_runner 用于构建工作目录路径）
-    if let Some(ref tid) = params.tenant_id {
+    if let Some(tid) = &params.tenant_id {
         env_vars.push(EnvVar {
             name: "TENANT_ID".to_string(),
             value: Some(tid.clone()),
             ..Default::default()
         });
     }
-    if let Some(ref sid) = params.space_id {
+    if let Some(sid) = &params.space_id {
         env_vars.push(EnvVar {
             name: "SPACE_ID".to_string(),
             value: Some(sid.clone()),
             ..Default::default()
         });
     }
-    if let Some(ref it) = params.isolation_type {
+    if let Some(it) = &params.isolation_type {
         env_vars.push(EnvVar {
             name: "ISOLATION_TYPE".to_string(),
             value: Some(it.clone()),
@@ -89,7 +89,7 @@ pub(crate) fn build_agent_env_vars(
             merged_env.insert(k.clone(), v.clone());
         }
     }
-    // UserAppBuilder 挂载压平契约 env 是平台注入的固定值（与三
+    // UserAppBuilder 挂载压平契约 env 是平台注入的固定值（与四
     // subPath 挂载点绑定）——先从 merged_env 摘除, 防 config
     // environment 覆盖造成数据面分裂（PGDATA 落 overlay = builder
     // 重建丢库）。

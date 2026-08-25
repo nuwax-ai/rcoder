@@ -82,6 +82,21 @@ impl crate::service::AppService {
         }
     }
 
+    /// per-app 数据卷的 rcoder 容器内锚点路径（`{锚点}/prod/{user_id}/data/{app_id}`，
+    /// bind 双向同步宿主——Docker 模式 clear/destroy 的数据目录定位）。
+    /// owner user_id 查元数据，缺失/空白兜底 app_id（与 docker_app_runtime 组装
+    /// bind 源的兜底一致）。
+    fn app_data_dir(&self, app_id: &str) -> std::path::PathBuf {
+        let uid = self
+            .metadata
+            .lookup(app_id)
+            .and_then(|r| r.user_id)
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| app_id.to_string());
+        std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+            .join(shared_types::paths::userapp_prod_data_subpath(&uid, app_id))
+    }
+
     /// 清空应用持久存储内容（数据语义；卷对象去留按运行时能力）。
     /// 安全约束：仅当 app 计算资源已不存在时允许（否则 INVALID_STATE）。
     /// - K8s/RBD：rcoder 不可挂载无法逐文件清 → 删 PVC（下次 create 自动重建空卷，
@@ -111,17 +126,7 @@ impl crate::service::AppService {
         // "清空持久数据"语义的主体。K8s 分支 destroy_app_pvc 已删 data PVC（上 方
         // return），此处仅 Docker。owner 查元数据，缺失兜底 app_id（与 bind 源
         // 组装的兜底一致；元数据行在 clear 场景恒保留）。
-        let uid = self
-            .metadata
-            .lookup(app_id)
-            .and_then(|r| r.user_id)
-            .filter(|u| !u.trim().is_empty())
-            .unwrap_or_else(|| app_id.to_string());
-        let data_dir = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
-            .join("prod")
-            .join(&uid)
-            .join("data")
-            .join(app_id);
+        let data_dir = self.app_data_dir(app_id);
         if data_dir.exists()
             && let Err(e) = Self::purge_dir_contents(&data_dir).await
         {
@@ -174,17 +179,7 @@ impl crate::service::AppService {
         // 失败时外层 record_deleted 未执行，幂等重试收敛。user_id 查元数据（行此时尚
         // 未删），缺失兜底 app_id（与 bind 源组装的兜底一致）。
         if !shared_types::is_kubernetes_runtime() {
-            let uid = self
-                .metadata
-                .lookup(app_id)
-                .and_then(|r| r.user_id)
-                .filter(|u| !u.trim().is_empty())
-                .unwrap_or_else(|| app_id.to_string());
-            let data_dir = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
-                .join("prod")
-                .join(&uid)
-                .join("data")
-                .join(app_id);
+            let data_dir = self.app_data_dir(app_id);
             if data_dir.exists() {
                 tokio::fs::remove_dir_all(&data_dir)
                     .await
