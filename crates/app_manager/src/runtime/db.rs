@@ -232,90 +232,57 @@ impl AppService {
         Ok(())
     }
 
-    /// database 目录 SQL 自动执行（发布 activate 后调用；失败仅收集不阻断发布）。
+    /// database 目录 SQL 自动执行（部署就绪后调用；失败仅收集不阻断）。
     ///
-    /// 扫描 code 目录（rcoder 视角 PVC 路径）下的 `database/*.sql`：
+    /// 目录列举经容器内 `find`（RBD 卷 rcoder 不可挂载；SQL 内容执行本就在
+    /// 容器内 psql，列举同侧天然一致）：
     /// 1. code 根 `database/`（建库/扩展类，先执行）
     /// 2. 各一级子项目 `{dir}/database/`（目录名排序）
     ///
     /// 目录内按文件名升序。逐文件 exec 容器内 `psql -f`（容器内路径
-    /// `{APP_CODE_ROOT}/{rel}`，
-    /// `ON_ERROR_STOP=on` 单文件原子性），单文件失败收集进 report 继续下一文件。
+    /// `{APP_CODE_ROOT}/{rel}`，`ON_ERROR_STOP=on` 单文件原子性），单文件失败
+    /// 收集进 report 继续下一文件。find 输出逐段过
+    /// [`is_shell_safe_path_component`] 白名单（防恶意文件名注入 `sh -c` 命令行）。
     pub async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport> {
         validate_app_id(app_id)?;
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        let code = app_dir.join("code");
-        if !code.is_dir() {
-            return Ok(DatabaseSqlReport {
-                executed: vec![],
-                failed: vec![],
-            });
-        }
+        // 根 database 先、子项目后（-mindepth 3 排除根目录自身）
+        const FIND_CMD: &str = concat!(
+            "find /app/code/database -maxdepth 1 -type f -name '*.sql' 2>/dev/null | sort; ",
+            "find /app/code -mindepth 3 -maxdepth 3 -type f -path '*/database/*.sql' 2>/dev/null | sort",
+        );
+        let output = self
+            .runtime
+            .exec(
+                app_id,
+                vec!["sh".to_string(), "-c".to_string(), FIND_CMD.to_string()],
+            )
+            .await
+            .map_err(|e| map_runtime_error("[APP] database sql scan exec failed", e))?;
 
-        // 同步 fs 扫描放 spawn_blocking：对象是 per-app PVC（CephFS 网络卷），
-        // 挂载抖动时 read_dir/file_type/is_dir 会阻塞 tokio worker
-        // （release_store 已有同款先例）。
+        let code_prefix = format!("{}/", shared_types::paths::APP_CODE_ROOT);
         let mut files: Vec<String> = Vec::new();
         let mut scan_errors: Vec<String> = Vec::new();
-        let code_for_task = code.clone();
-        let (root_files, root_err) = tokio::task::spawn_blocking(move || {
-            let mut out = Vec::new();
-            match collect_sql_files(&code_for_task.join("database"), "database", &mut out) {
-                Ok(()) => (out, None),
-                Err(e) => (out, Some(format!("database: scan failed: {e}"))),
-            }
-        })
-        .await
-        .map_err(|e| AppOperationError::Backend(format!("scan task join: {e}")))?;
-        files.extend(root_files);
-        if let Some(e) = root_err {
-            // "失败不阻断"契约对扫描同样成立：根目录扫描失败收集进 report 继续
-            scan_errors.push(e);
-        }
-        // 子项目 database 目录发现（同步 fs 同样入 blocking；每目录扫描失败收集进 report 继续）
-        let code_for_scan = code.clone();
-        let subdirs: Vec<String> = tokio::task::spawn_blocking(move || {
-            let mut subdirs = Vec::new();
-            let entries = match std::fs::read_dir(&code_for_scan) {
-                Ok(rd) => rd,
-                Err(_) => return subdirs,
-            };
-            for entry in entries.flatten() {
-                if entry
-                    .file_type()
-                    .is_ok_and(|ft| ft.is_dir())
-                    && entry.path().join("database").is_dir()
-                {
-                    let dir = entry.file_name().to_string_lossy().to_string();
-                    if is_shell_safe_path_component(&dir) {
-                        subdirs.push(dir);
-                    } else {
-                        tracing::warn!(
-                            "[APP] skip database subdir with unsafe name (not [A-Za-z0-9._-]): {dir}"
-                        );
-                    }
+        if output.exit_code != 0 {
+            // "失败不阻断"契约：扫描失败收集进 report（executed 空）继续返回
+            scan_errors.push(format!(
+                "database scan failed: exit {}: {}",
+                output.exit_code,
+                output.stderr.trim()
+            ));
+        } else {
+            for line in output.stdout.lines() {
+                let rel = line.trim().strip_prefix(&code_prefix).unwrap_or("");
+                if rel.is_empty() {
+                    continue;
                 }
-            }
-            subdirs.sort();
-            subdirs
-        })
-        .await
-        .map_err(|e| AppOperationError::Backend(format!("scan task join: {e}")))?;
-        for dir in subdirs {
-            let dir_db = code.join(&dir).join("database");
-            let prefix = format!("{dir}/database");
-            let (dir_files, dir_err) = tokio::task::spawn_blocking(move || {
-                let mut out = Vec::new();
-                match collect_sql_files(&dir_db, &prefix, &mut out) {
-                    Ok(()) => (out, None),
-                    Err(e) => (out, Some(format!("{prefix}: scan failed: {e}"))),
+                // 逐段白名单（与旧本地扫描一致：非 [A-Za-z0-9._-] 段拒绝并日志可见）
+                if rel.split('/').all(is_shell_safe_path_component) {
+                    files.push(rel.to_string());
+                } else {
+                    tracing::warn!(
+                        "[APP] skip database sql with unsafe path segments (not [A-Za-z0-9._-]): {rel}"
+                    );
                 }
-            })
-            .await
-            .map_err(|e| AppOperationError::Backend(format!("scan task join: {e}")))?;
-            files.extend(dir_files);
-            if let Some(e) = dir_err {
-                scan_errors.push(e);
             }
         }
 
@@ -360,37 +327,6 @@ fn is_shell_safe_path_component(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
-/// 收集目录下 `*.sql` 文件为 `{prefix}/{name}`（文件名升序）。
-/// 文件名须过 [`is_shell_safe_path_component`] 白名单——不过者跳过并日志可见。
-fn collect_sql_files(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) -> AppResult<()> {
-    let mut names: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(map_io_error_db)? {
-        let entry = entry.map_err(map_io_error_db)?;
-        let ft = entry.file_type().map_err(map_io_error_db)?;
-        if ft.is_file() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".sql") {
-                if is_shell_safe_path_component(&name) {
-                    names.push(name);
-                } else {
-                    tracing::warn!(
-                        "[APP] skip database sql with unsafe filename (not [A-Za-z0-9._-]): {name}"
-                    );
-                }
-            }
-        }
-    }
-    names.sort();
-    for name in names {
-        out.push(format!("{prefix}/{name}"));
-    }
-    Ok(())
-}
-
-fn map_io_error_db(e: std::io::Error) -> AppOperationError {
-    AppOperationError::Backend(format!("scan database dir: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,7 +336,7 @@ mod tests {
         assert!(is_shell_safe_path_component("001_init.sql"));
         assert!(is_shell_safe_path_component("backend-go"));
         assert!(is_shell_safe_path_component("V1__up.down.sql"));
-        // 引号/空格/$/反斜杠/中文 → 拒绝（zip 内恶意文件名防注入）
+        // 引号/空格/$/反斜杠/中文 → 拒绝（恶意文件名防注入）
         assert!(!is_shell_safe_path_component("it's.sql"));
         assert!(!is_shell_safe_path_component("a b.sql"));
         assert!(!is_shell_safe_path_component("$(id).sql"));

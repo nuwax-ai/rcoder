@@ -108,6 +108,14 @@ pub const WS_TERMINAL_PORT: u16 = 17681;
 /// 数据库 Web 控制台；经 Pingora `/userapp/pgweb/{app_id}/runtime` 代理暴露。
 pub const PGWEB_PORT: u16 = 8081;
 
+/// dbx-web 端口（agent-runner 与 app-runtime 容器恒为 4224）
+///
+/// DBX 数据库 Web GUI（60+ 数据库），两镜像 supervisor 均恒起（无 CLI 参数，全 env 配置）。
+/// 经 Pingora `/proxy/dev/dbx/{app_id}`（UserAppBuilder 开发容器）与
+/// `/proxy/prod/dbx/{app_id}`（UserApp 运行容器）两阶段代理暴露；
+/// dbx 前端运行时自推断 base path（webPath.ts），代理剥前缀直连 root 模式即可。
+pub const DBX_PORT: u16 = 4224;
+
 /// agent-runner 内嵌 file-server 端口
 ///
 /// agent-runner 内嵌的 file-server 监听端口（UserApp workspace build / package 下载；

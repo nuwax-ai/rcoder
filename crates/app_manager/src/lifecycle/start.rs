@@ -7,6 +7,7 @@
 use tracing::{info, warn};
 
 use crate::models::*;
+use crate::release_flow::runtime::DEFAULT_READY_TIMEOUT_SECS;
 use crate::service::AppService;
 use crate::utils::*;
 // record_dev_registration 是 AppServiceTrait 方法（trait impl 在 service.rs）
@@ -138,8 +139,13 @@ impl AppService {
         })
     }
 
-    /// 轻量部署链：release_id 解析（自动生成或显式）→ prepare → activate。
-    /// 返回生效的 release_id。
+    /// 轻量部署链（RBD 卷形态·容器中心化）：env 注入部署三元组 → ensure/re-apply
+    /// 运行容器（config-hash 变更 → Recreate 换 Pod）→ 等就绪 → 包内 SQL 执行。
+    ///
+    /// 下载/解压/换 code 由容器内 app-cli 部署段完成（sha256 校验、marker 幂等
+    /// 重启不重下载、上一代保留 `/app/.previous`）；失败 = supervisord 重试耗尽 →
+    /// readiness 超时由 `wait_app_ready` 上报，code/ 现场不破坏（发布链失败语义
+    /// 保持）。回滚 = 用旧制品 URL 重新 start。
     #[allow(clippy::type_complexity)]
     async fn deploy_from_url(
         &self,
@@ -156,48 +162,83 @@ impl AppService {
             Some(id) => id.to_string(),
             None => generate_release_id(),
         };
+        validate_release_id_fs_safe(&release_id)?;
 
-        // sha256 缺省时 prepare 需要一个占位值——看 prepare 的幂等键：sha256 参与
-        // 既有记录比对。缺省校验场景用 url 内容哈希后填入（下载后真实值）；
-        // 简化：sha256 未给时生成全零占位会让重试幂等失效——改为必经下载后校验
-        // 通道不可绕过的前提下，用时间戳随机占位（同 release_id 重发即 409 提示
-        // 显式传 sha256）。这里采用：未给 sha256 时跳过校验（占位 "" 不参与比对）
+        // 空 sha256 = 跳过校验（信任内网源；app-cli 侧同语义），仍参与 env 传递
         let sha256 = request
             .sha256
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
 
         info!(
             "[APP] start-deploy: app_id={app_id}, release_id={release_id}, url={url}, sha256_given={}",
             !sha256.is_empty()
         );
 
-        // prepare：下载 + 入库（release 不存在则创建；幂等键 release_id+sha256+size）
-        self.prepare_release(
-            app_id,
-            PrepareReleaseRequest {
-                release_id: release_id.clone(),
-                url: url.to_string(),
-                sha256: sha256.to_string(),
-                size_bytes: None,
-                retention: None,
-            },
-        )
-        .await?;
+        // 1. PVC ensure（K8s；Docker no-op）
+        self.ensure_app_workspace_ready(app_id, None).await?;
 
-        // activate：切流 + ensure 容器 + 等就绪（失败保留现场——发布链语义）
-        let release = self.activate_release(app_id, &release_id, None).await?;
-        if release.status != ReleaseStatus::Active {
-            return Err(AppOperationError::InvalidState(format!(
-                "activation failed: {}",
-                release.failure_message.unwrap_or_default()
-            )));
+        // 2. env 组装：request.env 整段替换 or live 回退；剥离历史保留键（防误伤）
+        // + 校验用户显式键（防伪造）；叠加部署三元组（权威覆盖业务同名键）。
+        let mut env = match request.env.clone() {
+            Some(e) => e,
+            None => match self.runtime.get_app_container_spec(app_id).await {
+                Ok(spec) => spec.env.unwrap_or_default(),
+                Err(e) => {
+                    // 首次部署（app 不存在）无 live 可回退；存在但读回失败不阻断——
+                    // 部署三元组仍注入，业务 env 丢失由调用方重试自愈
+                    tracing::warn!(
+                        "[APP] start-deploy env live fallback failed (empty base): app_id={app_id}: {e}"
+                    );
+                    std::collections::HashMap::new()
+                }
+            },
+        };
+        crate::release_flow::identity::strip_release_identity(&mut env);
+        crate::release_flow::identity::ensure_no_reserved_env(&env)?;
+        env.insert("APP_DEPLOY_URL".to_string(), url.to_string());
+        env.insert("APP_RELEASE_ID".to_string(), release_id.clone());
+        env.insert("APP_DEPLOY_SHA256".to_string(), sha256);
+
+        // 3. ensure/re-apply 运行容器：env 变更 → config-hash → Recreate rollout
+        //    → 新 Pod 启动时 app-cli 部署段生效
+        match self.get_app(app_id).await {
+            Ok(_) => {
+                // 已存在 → update 通道（env 显式整段替换，其余字段 live 回退）。
+                // 镜像缺省 = 当前平台默认（RCODER_RUNTIME_IMAGE_DIGEST）——重新部署
+                // 顺带收敛运行时镜像到最新配置（对齐"大升级全量更新"运维语义）。
+                // 乐观锁跳过：部署是权威写，last-write-wins。
+                let update = UpdateAppRequest {
+                    name: None,
+                    image: None,
+                    env: Some(env),
+                    secrets: None,
+                    resources: None,
+                    tenant_id: None,
+                    space_id: None,
+                    expected_resource_version: None,
+                    recycle_enabled: None,
+                    idle_timeout_seconds: None,
+                };
+                self.update_app(app_id, update).await?;
+            }
+            Err(AppOperationError::NotFound(_)) => {
+                // 首次部署 → ensure 创建（镜像/端口/探针平台内定，env 携带部署三元组）
+                let lock = self.acquire_process_release_lock(app_id).await;
+                self.ensure_app_runtime(app_id, app_id, Some(env), lock)
+                    .await?;
+            }
+            Err(e) => return Err(e),
         }
 
-        // 包内 database SQL 自动执行（原 publish 编排语义迁移：缺省开；单文件失败
-        // 仅收集进 report 不阻断部署——SQL 幂等性由模板约定自带）
+        // 4. 等就绪（下载/解压/起服务全在 readiness 窗口内，默认预算 300s）
+        self.wait_app_ready(app_id, DEFAULT_READY_TIMEOUT_SECS)
+            .await?;
+
+        // 5. 包内 database SQL 自动执行（缺省开；单文件失败仅收集进 report 不阻断）
         let mut sql_report: Option<DatabaseSqlReport> = None;
         if request.auto_execute_sql.unwrap_or(true) {
             match self.execute_database_sql(app_id).await {
@@ -296,9 +337,26 @@ fn generate_release_id() -> String {
     )
 }
 
+/// release_id 进容器 env 且 app-cli 侧拼 fs 路径（`.incoming/{id}`/`.staging/{id}`），
+/// 白名单与 app-cli deploy 段同规则：`[A-Za-z0-9._-]+`、无前导点（rollout 前
+/// fail fast，不等到容器内才报）。
+fn validate_release_id_fs_safe(release_id: &str) -> AppResult<()> {
+    let ok = !release_id.is_empty()
+        && !release_id.starts_with('.')
+        && release_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if !ok {
+        return Err(AppOperationError::Validation(format!(
+            "release_id must be [A-Za-z0-9._-]+ with no leading dot, got '{release_id}'"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::generate_release_id;
+    use super::{generate_release_id, validate_release_id_fs_safe};
 
     #[test]
     fn release_id_shape_and_uniqueness() {
@@ -307,5 +365,14 @@ mod tests {
         assert!(a.starts_with("rel-"), "got {a}");
         assert_ne!(a, b);
         assert_eq!(a.len(), "rel-".len() + 12 + 1 + 8);
+        assert!(validate_release_id_fs_safe(&a).is_ok());
+    }
+
+    #[test]
+    fn release_id_fs_safe_rejects_traversal() {
+        assert!(validate_release_id_fs_safe("../evil").is_err());
+        assert!(validate_release_id_fs_safe("a/b").is_err());
+        assert!(validate_release_id_fs_safe(".hidden").is_err());
+        assert!(validate_release_id_fs_safe("rel-abc_1.2").is_ok());
     }
 }

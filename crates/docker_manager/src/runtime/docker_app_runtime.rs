@@ -50,6 +50,18 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         })?;
         let container_name = app_deployment_name(&app_id);
 
+        // bind 源目录先建（原 app_manager create_app_dirs 职责随 RBD 卷形态下沉到
+        // runtime——Docker daemon 对不存在源的 bind 挂载会落在宿主自动创建，但
+        // 显式 mkdir 保证 rcoder 视角可见且权限可控）
+        if !params.host_workspace_path.is_empty() {
+            let host_ws = params.host_workspace_path.as_str();
+            tokio::fs::create_dir_all(host_ws).await.map_err(|e| {
+                ContainerRuntimeError::DockerError(format!(
+                    "create host workspace dir {host_ws}: {e}"
+                ))
+            })?;
+        }
+
         // env（env + secrets 合并；Docker 模式无 Secret 概念）
         let mut env_map: HashMap<String, String> = HashMap::new();
         if let Some(e) = &params.env {

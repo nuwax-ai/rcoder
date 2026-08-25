@@ -62,4 +62,3 @@ tokio-util = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 zip = { workspace = true }
-fs2 = "0.4"

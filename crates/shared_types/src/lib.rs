@@ -26,7 +26,10 @@ pub use userapp::db_align::{
     align_pg_credentials,
 };
 pub use userapp::dev_cleanup::UserappDevCleanup;
-pub use userapp::forward_contract::{APP_ID_HEADER, SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
+pub use userapp::forward_contract::{
+    APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER,
+    SERVICE_TYPE_USERAPP,
+};
 pub use userapp::metadata::{AppMetadataPersistence, AppMetadataRecord};
 
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）

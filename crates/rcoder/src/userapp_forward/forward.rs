@@ -1,13 +1,17 @@
-//! userApp 文件域透传层：rcoder 主服务（8086）→ per-app 开发容器内 file-server（60000）。
+//! userApp 文件域透传层：rcoder 主服务（8086）→ 目标容器内 file-server-proxy（60000）。
 //!
-//! 两类入口共用 [`forward_to_dev`]：
+//! **dev/prod 两阶段分派**（`X-App-Stage` header，缺省 dev——同一 app_id 可同时
+//! 存在开发容器与生产 Deployment，必须显式区分）：
+//! - `dev`：UserAppBuilder 开发容器（注册表定位 + 探活自愈，miss 幂等 ensure）
+//! - `prod`：UserApp 生产运行容器（存在性检查 + 唤醒 + 确定性命名定位）
+//!
+//! 两类入口共用 [`forward_to_dev`]/[`forward_to_prod`]：
 //! - `/api/userapp/{*rest}` 通配透传（Java 直调的新接口族）
 //! - `/api/computer/*` 拦截层（反向代理转来的 TS 老路径 + `X-Service-Type: userapp`
 //!   header 分流，路径原样 body 零解析——multipart 在代理层不可解，复杂度内聚于此）
 //!
 //! 透传语义：method/path/query/headers/body 全量流式转发（含 multipart 上传与 SSE
-//! 日志流）；容器定位按 `X-App-Id` → UserAppBuilder（per-app，与 UserApp 运行容器
-//! 经 ServiceType 隔离），miss 幂等 ensure；容器不在线 502。
+//! 日志流）；容器定位按 `X-App-Id`，容器不在线 502（dev）/ 503+Retry-After（prod 唤醒失败）。
 
 use std::sync::Arc;
 
@@ -20,9 +24,12 @@ use tracing::{info, warn};
 use crate::router::AppState;
 use crate::userapp_publish::agent_runner::{dev_file_server_addr, ensure_userapp_builder};
 
-// 分流契约常量（X-Service-Type / X-App-Id）定义在 shared_types（rcoder 转发层
-// 与容器内 file-server 共用的单一事实源）。
-pub use shared_types::{APP_ID_HEADER, SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
+// 分流契约常量（X-Service-Type / X-App-Id / X-App-Stage）定义在 shared_types
+// （rcoder 转发层与容器内 file-server 共用的单一事实源）。
+pub use shared_types::{
+    APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER,
+    SERVICE_TYPE_USERAPP,
+};
 
 /// 逐跳头静态表：转发前剥离（reqwest/上游自行生成；host 逐跳重写）。
 const HOP_BY_HOP: [&str; 10] = [
@@ -155,15 +162,11 @@ async fn probe_dev_container(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 全量透传一个请求到该 app 开发容器的 file-server（同 path+query）。
+/// 全量透传一个请求到目标 addr（同 path+query）——dev/prod 两阶段共用内核。
 ///
 /// body 走流（axum Body → reqwest stream），multipart 无需感知；响应同样流式
 /// （bytes_stream → axum Body），SSE（tasks/{id}/logs/stream 等）天然支持。
-pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request) -> Response {
-    let addr = match resolve_dev_addr(state, app_id).await {
-        Ok(addr) => addr,
-        Err(resp) => return resp,
-    };
+async fn forward_to_addr(target_label: &str, app_id: &str, addr: &str, req: Request) -> Response {
     let target = format!("{addr}{}", req.uri());
 
     let (parts, body) = req.into_parts();
@@ -186,8 +189,10 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
             warn!(
                 "[USERAPP_FORWARD] upstream request failed: app_id={app_id}, target={target}: {e}"
             );
-            return HttpResultError::bad_gateway(format!("dev container request failed: {e}"))
-                .into_response();
+            return HttpResultError::bad_gateway(format!(
+                "{target_label} container request failed: {e}"
+            ))
+            .into_response();
         }
     };
 
@@ -207,6 +212,139 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
     }
 }
 
+/// 全量透传一个请求到该 app 开发容器的 file-server（同 path+query）。
+pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request) -> Response {
+    let addr = match resolve_dev_addr(state, app_id).await {
+        Ok(addr) => addr,
+        Err(resp) => return resp,
+    };
+    forward_to_addr("dev", app_id, &addr, req).await
+}
+
+/// 全量透传一个请求到该 app 生产运行容器的 file-server-proxy（同 path+query）。
+///
+/// 定位语义（与 pod ensure prod 分支同款）：
+/// 1. 存在性检查（`get_app`）——`ensure_running` 对不存在的 app 返回 AlreadyRunning
+///    （stopped-set 语义），必须前置拦截防幻报；
+/// 2. 唤醒——闲置回收（scale 0）的 app 自动拉起（用户拍板：文件操作前容器没启动
+///    要自动启动）；Timeout/Failed → 503 + Retry-After（对齐 proxy_http 流量唤醒）；
+/// 3. 地址——K8s 确定性命名 FQDN（Service 换 Pod DNS 自愈）；Docker 直查容器 IPv4
+///    （容器名 DNS 可能返回 AAAA 而容器内 file-server 只 bind IPv4）。
+///
+/// 唤醒后立刻转发可能与容器内 file-server 启动赛跑（connect refused → 502）——
+/// 客户端重试/下一请求即恢复，不做二次等待。
+pub(crate) async fn forward_to_prod(state: &AppState, app_id: &str, req: Request) -> Response {
+    let addr = match resolve_prod_addr(state, app_id).await {
+        Ok(addr) => addr,
+        Err(resp) => return *resp,
+    };
+    forward_to_addr("prod runtime", app_id, &addr, req).await
+}
+
+/// 定位（含唤醒）生产运行容器 file-server addr（`http://{host}:60000`）。
+async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box<Response>> {
+    // 幻报拦截：不存在的 app 直接 404（pod ensure prod 同款语义）
+    if let Err(e) = state.app_service.get_app(app_id).await {
+        info!(
+            "[USERAPP_FORWARD] prod forward target check failed (treated as not found): app_id={app_id}: {e}"
+        );
+        return Err(Box::new(
+            HttpResultError::not_found(format!(
+                "userapp prod app not found or unavailable: {app_id}"
+            ))
+            .into_response(),
+        ));
+    }
+    // 唤醒（仅 stopped 真时触发——Running 高频文件操作零开销）
+    use shared_types::AppWakeControl;
+    if state.activity.is_stopped(app_id) {
+        match state.activity.ensure_running(app_id).await {
+            shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
+            shared_types::WakeOutcome::Timeout => {
+                warn!("[USERAPP_FORWARD] prod wake timeout: app_id={app_id}");
+                return Err(Box::new(
+                    HttpResultError::service_unavailable(
+                        format!("app {app_id} wake timed out; retry later"),
+                        WAKE_503_RETRY_AFTER_SECS,
+                    )
+                    .into_response(),
+                ));
+            }
+            shared_types::WakeOutcome::Failed(e) => {
+                warn!("[USERAPP_FORWARD] prod wake failed: app_id={app_id}: {e}");
+                return Err(Box::new(
+                    HttpResultError::service_unavailable(
+                        format!("app {app_id} wake failed: {e}"),
+                        WAKE_503_RETRY_AFTER_SECS,
+                    )
+                    .into_response(),
+                ));
+            }
+        }
+    }
+    // 地址解析
+    let host = if shared_types::is_kubernetes_runtime() {
+        use shared_types::ContainerLookup;
+        state.projects.find_app_runtime_addr(app_id)
+    } else {
+        // Docker：直查容器 IPv4（同 pod restart 的 UserApp 定位模式）
+        state
+            .runtime()
+            .get_container_info_by_identifier(app_id, &shared_types::ServiceType::UserApp)
+            .await
+            .ok()
+            .flatten()
+            .map(|info| info.container_ip)
+            .filter(|ip| !ip.is_empty())
+    };
+    match host.filter(|h| !h.is_empty()) {
+        Some(host) => Ok(format!(
+            "http://{host}:{}",
+            shared_types::AGENT_FILE_SERVER_PORT
+        )),
+        None => {
+            // 走到这里 = get_app 成功但容器定位失败（回收过渡态等）
+            warn!("[USERAPP_FORWARD] prod runtime addr unavailable: app_id={app_id}");
+            Err(Box::new(
+                HttpResultError::not_found(format!("runtime address for app {app_id} unavailable"))
+                    .into_response(),
+            ))
+        }
+    }
+}
+
+/// 唤醒 503 的 Retry-After 秒数（对齐 proxy_http 流量唤醒面）。
+const WAKE_503_RETRY_AFTER_SECS: u32 = 15;
+
+/// dev/prod 阶段分派解析：缺省 dev（向后兼容既有无 header 调用）；
+/// 未知值 fail-fast 400（header 拼错不该静默落错容器）。
+fn parse_app_stage(req: &Request) -> Result<AppStage, Box<Response>> {
+    let Some(value) = req
+        .headers()
+        .get(APP_STAGE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(AppStage::Dev);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        v if v == APP_STAGE_DEV => Ok(AppStage::Dev),
+        v if v == APP_STAGE_PROD => Ok(AppStage::Prod),
+        other => Err(Box::new(
+            HttpResultError::bad_request(format!(
+                "invalid `{APP_STAGE_HEADER}` value '{other}'; expected `{APP_STAGE_DEV}` or `{APP_STAGE_PROD}`"
+            ))
+            .into_response(),
+        )),
+    }
+}
+
+enum AppStage {
+    Dev,
+    Prod,
+}
+
 /// `/api/userapp/{*rest}` 通配透传 handler。
 pub(crate) async fn forward_userapp(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -215,17 +353,34 @@ pub(crate) async fn forward_userapp(
     let Some(app_id) = require_app_id(&req) else {
         return missing_app_id_response();
     };
-    info!(
-        "[USERAPP_FORWARD] {} {} -> dev container (app_id={app_id})",
-        req.method(),
-        req.uri().path()
-    );
-    forward_to_dev(&state, &app_id, req).await
+    let stage = match parse_app_stage(&req) {
+        Ok(stage) => stage,
+        Err(resp) => return *resp,
+    };
+    match stage {
+        AppStage::Dev => {
+            info!(
+                "[USERAPP_FORWARD] {} {} -> dev container (app_id={app_id})",
+                req.method(),
+                req.uri().path()
+            );
+            forward_to_dev(&state, &app_id, req).await
+        }
+        AppStage::Prod => {
+            info!(
+                "[USERAPP_FORWARD] {} {} -> prod runtime container (app_id={app_id})",
+                req.method(),
+                req.uri().path()
+            );
+            forward_to_prod(&state, &app_id, req).await
+        }
+    }
 }
 
 /// `/api/computer/*` 拦截层：header `X-Service-Type: userapp` 即短路转发该 app
-/// 开发容器**同路径**（TS 路径原样、body 零解析，header 随请求透传供容器内
+/// 目标容器**同路径**（TS 路径原样、body 零解析，header 随请求透传供容器内
 /// computer handler 消费做 workspace 切换）；无该 header 落本地移植 handler。
+/// `X-App-Stage` 同样生效（缺省 dev，与 /api/userapp/* 分派一致）。
 pub(crate) async fn computer_intercept(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     req: Request,
@@ -242,11 +397,26 @@ pub(crate) async fn computer_intercept(
     let Some(app_id) = require_app_id(&req) else {
         return missing_app_id_response();
     };
-    info!(
-        "[USERAPP_FORWARD] intercepted computer request {} -> dev container (app_id={app_id})",
-        req.uri().path()
-    );
-    forward_to_dev(&state, &app_id, req).await
+    let stage = match parse_app_stage(&req) {
+        Ok(stage) => stage,
+        Err(resp) => return *resp,
+    };
+    match stage {
+        AppStage::Dev => {
+            info!(
+                "[USERAPP_FORWARD] intercepted computer request {} -> dev container (app_id={app_id})",
+                req.uri().path()
+            );
+            forward_to_dev(&state, &app_id, req).await
+        }
+        AppStage::Prod => {
+            info!(
+                "[USERAPP_FORWARD] intercepted computer request {} -> prod runtime container (app_id={app_id})",
+                req.uri().path()
+            );
+            forward_to_prod(&state, &app_id, req).await
+        }
+    }
 }
 
 // ── HttpResult 错误响应（透传层自身错误；上游业务响应原样透传不重包装） ──────────
@@ -254,6 +424,8 @@ pub(crate) async fn computer_intercept(
 struct HttpResultError {
     status: axum::http::StatusCode,
     message: String,
+    /// 503 唤醒类错误的 Retry-After 秒数（对齐 proxy_http 流量唤醒面）。
+    retry_after_secs: Option<u32>,
 }
 
 impl HttpResultError {
@@ -261,6 +433,7 @@ impl HttpResultError {
         Self {
             status: axum::http::StatusCode::BAD_REQUEST,
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -268,6 +441,23 @@ impl HttpResultError {
         Self {
             status: axum::http::StatusCode::BAD_GATEWAY,
             message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::NOT_FOUND,
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    fn service_unavailable(message: impl Into<String>, retry_after_secs: u32) -> Self {
+        Self {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            retry_after_secs: Some(retry_after_secs),
         }
     }
 
@@ -275,6 +465,7 @@ impl HttpResultError {
         Self {
             status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 }
@@ -282,7 +473,7 @@ impl HttpResultError {
 impl IntoResponse for HttpResultError {
     fn into_response(self) -> Response {
         // 与 shared_types::HttpResult 同形态(code=字符串错误码/message/data/tid/success),
-        // 但保留真实 HTTP 状态码(400/502 对代理与客户端有语义; HttpResult 的
+        // 但保留真实 HTTP 状态码(400/404/502/503 对代理与客户端有语义; HttpResult 的
         // IntoResponse 恒 200, 不适用于透传层的传输级错误)
         let payload = serde_json::json!({
             "code": error_code_for(self.status),
@@ -290,7 +481,13 @@ impl IntoResponse for HttpResultError {
             "data": serde_json::Value::Null,
             "success": false,
         });
-        (self.status, axum::Json(payload)).into_response()
+        let mut response = (self.status, axum::Json(payload)).into_response();
+        if let Some(secs) = self.retry_after_secs
+            && let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string())
+        {
+            response.headers_mut().insert("retry-after", value);
+        }
+        response
     }
 }
 
@@ -298,7 +495,10 @@ impl IntoResponse for HttpResultError {
 fn error_code_for(status: axum::http::StatusCode) -> &'static str {
     match status {
         axum::http::StatusCode::BAD_REQUEST => shared_types::error_codes::ERR_VALIDATION,
-        axum::http::StatusCode::BAD_GATEWAY => shared_types::error_codes::ERR_BACKEND_ERROR,
+        axum::http::StatusCode::NOT_FOUND => shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE | axum::http::StatusCode::BAD_GATEWAY => {
+            shared_types::error_codes::ERR_BACKEND_ERROR
+        }
         _ => shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
     }
 }

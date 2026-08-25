@@ -70,6 +70,11 @@ async-trait = { workspace = true }
 # 时间 (错误响应 timestamp)
 chrono = { workspace = true }
 
+# app-files 转发族：容器内流式下载 + zip/tar.gz 解压（与 app_manager 原实现同源）
+download_utils = { workspace = true }
+# 下载取消令牌（download_to_file 签名要求）
+tokio-util = { workspace = true }
+
 # 编码检测 / content-type 推断
 encoding_rs = { workspace = true }
 mime_guess = { workspace = true }

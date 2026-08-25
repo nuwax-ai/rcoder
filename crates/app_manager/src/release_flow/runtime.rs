@@ -23,20 +23,18 @@ const APP_READINESS_PATH: &str = "/ready";
 const READY_POLL_INTERVAL_SECS: u64 = 3;
 /// 就绪等待默认超时秒数（activate 请求体 readinessTimeoutSeconds 可覆盖，范围 5..=1800）。
 pub(crate) const DEFAULT_READY_TIMEOUT_SECS: u64 = 300;
-/// 就绪等待超时上下限（与 build 超时 DEV_COMMAND_TIMEOUT_SECS=1800 对齐上限）。
-pub(crate) const MIN_READY_TIMEOUT_SECS: u64 = 5;
-pub(crate) const MAX_READY_TIMEOUT_SECS: u64 = 1800;
 
 impl AppService {
     /// 确保 app 计算单元存在：不存在则 create_app（幂等；image/ports 首次设定后恒定）。
-    /// 首次发布时 activate 切流先于本调用（app 尚不存在，激活序列跳过 stop/start）。
     ///
+    /// `deploy_env`：部署三元组等 env 随 create 注入（start {url} 首次部署路径）。
     /// `process_lock`：调用方已持有的该 app 进程级发布锁——create 分支走
     /// [`create_app_locked`]（已持锁内核），避免公共 `create_app` 的重入取锁死锁。
-    pub(super) async fn ensure_app_runtime(
+    pub(crate) async fn ensure_app_runtime(
         &self,
         rcoder_app_id: &str,
         name: &str,
+        deploy_env: Option<std::collections::HashMap<String, String>>,
         process_lock: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), AppOperationError> {
         match self.get_app(rcoder_app_id).await {
@@ -72,7 +70,7 @@ impl AppService {
                 .unwrap_or_default(),
             image: Some(image),
             command: None,
-            env: None,
+            env: deploy_env,
             secrets: None,
             resources: None,
             ports: Some(vec![PortConfig {
@@ -109,7 +107,7 @@ impl AppService {
     /// `NotFound` 是"发布期间应用被用户删除"——等就绪阶段确实不持进程锁
     /// （activate_release 的 guard 被 ensure_app_runtime 按值消费、其返回即释放；
     /// 删除是更高优先级的用户意图），与普通就绪失败区分报错便于排查。
-    pub(super) async fn wait_app_ready(
+    pub(crate) async fn wait_app_ready(
         &self,
         rcoder_app_id: &str,
         timeout_secs: u64,

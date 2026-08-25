@@ -15,6 +15,22 @@ pub(super) fn env_str(key: &str, default: &str) -> Result<String> {
     }
 }
 
+/// 可选字符串 env：未设置 → None；设置但 trim 为空 → None（显式关闭）；否则 Some(trim)。
+pub(super) fn env_opt_string(key: &str) -> Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(anyhow!(error)).context(format!("read environment variable {key}")),
+    }
+}
+
 pub(super) fn env_bool(key: &str, default: bool) -> Result<bool> {
     match std::env::var(key) {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {

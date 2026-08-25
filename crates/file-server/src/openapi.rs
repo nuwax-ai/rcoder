@@ -128,10 +128,24 @@ mod tests {
     #[test]
     fn document_contains_every_registered_operation() {
         let document = generated_document();
-        assert_eq!(document.paths.paths.len(), 100);
+        // 100 = 镜像族+build+dev 全量；+4 = app-files 转发族（rcoder /apps 文件面
+        // 的容器侧实现）。路由增删须同步本计数（防"注册了但没进文档"回归）。
+        assert_eq!(document.paths.paths.len(), 104);
         assert!(document.paths.paths.contains_key("/"));
         assert!(document.paths.paths.contains_key("/api/build/start-dev"));
         assert!(document.paths.paths.contains_key("/api/git/commit"));
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/userapp/app-files/upload")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/userapp/app-files/list")
+        );
         assert!(
             document
                 .paths

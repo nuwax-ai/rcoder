@@ -139,6 +139,34 @@ impl AppService {
         svc.rebuild_stopped_apps().await?;
         Ok(svc)
     }
+
+    /// 获取该 app 的进程级发布锁（create/update/start-deploy/delete 串行化）。
+    /// 原 release_flow/releases.rs 遗产——卷上 releases 编排删除后锁本身仍服务
+    /// 生命周期互斥，迁入 service.rs（`release_locks` 字段所在）。
+    pub(crate) async fn acquire_process_release_lock(
+        &self,
+        app_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = match self.release_locks.entry(app_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                entry.insert(lock.clone());
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    /// 锁条目无人持有（strong_count==1，仅 map 自身）时移除，防 DashMap 无界增长。
+    pub(crate) fn remove_unused_process_release_lock(&self, app_id: &str) {
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            self.release_locks.entry(app_id.to_owned())
+            && Arc::strong_count(entry.get()) == 1
+        {
+            entry.remove();
+        }
+    }
 }
 
 // list/query/get/update/delete 编排实现拆至 lifecycle/{query,update}.rs（extension-impl）。
@@ -285,40 +313,6 @@ impl super::AppServiceTrait for AppService {
         request: RecyclePolicyRequest,
     ) -> AppResult<AppRuntimeInfo> {
         self.set_recycle_policy(app_id, request).await
-    }
-
-    async fn prepare_release(
-        &self,
-        app_id: &str,
-        request: PrepareReleaseRequest,
-    ) -> AppResult<ReleaseInfo> {
-        self.prepare_release(app_id, request).await
-    }
-
-    async fn activate_release(
-        &self,
-        app_id: &str,
-        release_id: &str,
-        readiness_timeout: Option<u64>,
-    ) -> AppResult<ReleaseInfo> {
-        self.activate_release(app_id, release_id, readiness_timeout)
-            .await
-    }
-
-    async fn rollback_release(
-        &self,
-        app_id: &str,
-        message: Option<String>,
-    ) -> AppResult<ReleaseInfo> {
-        self.rollback_release(app_id, message).await
-    }
-
-    async fn list_releases(&self, app_id: &str) -> AppResult<ReleaseListResponse> {
-        self.list_releases(app_id).await
-    }
-
-    async fn delete_release(&self, app_id: &str, release_id: &str) -> AppResult<()> {
-        self.delete_release(app_id, release_id).await
     }
 
     async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats> {

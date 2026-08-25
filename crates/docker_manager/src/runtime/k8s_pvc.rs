@@ -129,16 +129,28 @@ pub(crate) trait K8sPvcOps {
     ) -> ContainerRuntimeResult<()>;
 }
 
-/// UserAppBuilder 开发卷的 storage class（env `RCODER_USERAPP_BUILDER_STORAGE_CLASS`
-/// 显式覆盖；缺省 None = PVC 不指定 storageClassName → 集群 default StorageClass，
-/// 如 229/19 的 `ceph-rbd`——Ceph RBD 块存储）。开发卷 RWO 单容器独占：编译构建的
-/// 大量小文件 IO 走块设备，不经 CephFS 元数据面。
+/// UserApp 域（生产运行卷 + builder 开发卷）的 storage class（env
+/// `RCODER_USERAPP_STORAGE_CLASS` 显式覆盖，兼容回退旧名
+/// `RCODER_USERAPP_BUILDER_STORAGE_CLASS`；缺省 None = PVC 不指定
+/// storageClassName → 集群 default StorageClass，如 229/19 的 `ceph-rbd`
+/// ——Ceph RBD 块存储）。UserApp 两类卷均 RWO 单容器独占：rcoder 不挂卷
+/// （零挂载访问，文件操作经容器内 file-server），编译构建/运行数据走块设备，
+/// 不经 CephFS 元数据面。
 #[cfg(feature = "kubernetes")]
-pub(crate) fn userapp_builder_storage_class() -> Option<String> {
-    std::env::var("RCODER_USERAPP_BUILDER_STORAGE_CLASS")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+pub(crate) fn userapp_storage_class() -> Option<String> {
+    for key in [
+        "RCODER_USERAPP_STORAGE_CLASS",
+        "RCODER_USERAPP_BUILDER_STORAGE_CLASS",
+    ] {
+        if let Some(value) = std::env::var(key)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 #[cfg(feature = "kubernetes")]
@@ -200,7 +212,7 @@ impl K8sPvcOps for KubernetesRuntime {
                 // （env 切换前创建/运维预建）时 warn——静默复用会让存储语义与配置脱节。
                 // PVC 未显式设 SC（None）= 用集群 default，不比对。
                 let expected_sc = match service_type {
-                    ServiceType::UserAppBuilder => userapp_builder_storage_class(),
+                    ServiceType::UserApp | ServiceType::UserAppBuilder => userapp_storage_class(),
                     _ => Some(self.config.storage_class.clone()),
                 };
                 if let (Some(existing), Some(expected)) = (&existing_sc, &expected_sc)
@@ -310,17 +322,20 @@ impl K8sPvcOps for KubernetesRuntime {
                 ..Default::default()
             },
             spec: Some(PersistentVolumeClaimSpec {
-                // UserAppBuilder 开发卷: RWO 单容器独占（Ceph RBD 块卷, storage class
-                // env 可覆盖）; 其余 service_type 用全局 access_mode/storage_class。
+                // UserApp 域（生产运行卷 + builder 开发卷）: RWO 单容器独占
+                // （Ceph RBD 块卷, storage class env 可覆盖）; 其余 service_type
+                // 用全局 access_mode/storage_class。
                 access_modes: Some(vec![match service_type {
-                    ServiceType::UserAppBuilder => "ReadWriteOnce".to_string(),
+                    ServiceType::UserApp | ServiceType::UserAppBuilder => {
+                        "ReadWriteOnce".to_string()
+                    }
                     _ => self.config.access_mode.clone(),
                 }]),
-                // UserAppBuilder: RWO 单容器独占（Ceph RBD 块卷）。storage class
+                // UserApp 域: RWO 单容器独占（Ceph RBD 块卷）。storage class
                 // env 可显式覆盖；缺省 None → 集群 default class（如 ceph-rbd）。
                 // 其余 service_type 用全局 storage_class。
                 storage_class_name: match service_type {
-                    ServiceType::UserAppBuilder => userapp_builder_storage_class(),
+                    ServiceType::UserApp | ServiceType::UserAppBuilder => userapp_storage_class(),
                     _ => Some(self.config.storage_class.clone()),
                 },
                 resources: Some(VolumeResourceRequirements {

@@ -106,6 +106,12 @@ pub struct Config {
     pub computer_workspace_dir: PathBuf,
     /// UserApp 开发卷根 (env `USERAPP_WORKSPACE_DIR`; 沙箱挂载点, 见 paths::USERAPP_WORKSPACE_ROOT)。
     pub userapp_workspace_dir: PathBuf,
+    /// 单 app 模式归属 (env `USERAPP_SINGLE_APP_ID`)。
+    ///
+    /// Some 时本 file-server 只服务该 app——**生产运行容器形态**：卷根即 app 根
+    /// (`resolve_userapp_dev` 不 join app_id、拒绝不匹配 appId 与 customTargetDir)。
+    /// None = 开发容器形态（多 app 共享开发卷，现状）。
+    pub userapp_single_app_id: Option<String>,
     pub service_log_dir: PathBuf,
     pub service_log_retention_days: usize,
 
@@ -200,6 +206,7 @@ impl Default for Config {
             project_source_dir: PathBuf::from(WORKSPACE_ROOT),
             computer_workspace_dir: PathBuf::from(COMPUTER_WORKSPACE_ROOT),
             userapp_workspace_dir: PathBuf::from(USERAPP_WORKSPACE_ROOT),
+            userapp_single_app_id: None,
             service_log_dir: PathBuf::from("/app/logs/file-server"),
             service_log_retention_days: 7,
             init_project_dir: PathBuf::from("/app/project_init"),

@@ -28,26 +28,6 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             "/api/v1/apps/{app_id}/recycle-policy",
             post(handlers::set_recycle_policy),
         )
-        .route(
-            "/api/v1/apps/{app_id}/releases/prepare",
-            post(handlers::prepare_release),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases/rollback",
-            post(handlers::rollback_release),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases/{release_id}/activate",
-            post(handlers::activate_release),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases",
-            get(handlers::list_releases),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases/{release_id}/delete",
-            post(handlers::delete_release),
-        )
         // 查询接口
         .route(
             "/api/v1/apps/{app_id}/logs/sources/query",

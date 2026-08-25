@@ -13,7 +13,7 @@ use container_runtime_api::{
 use shared_types::ServiceType;
 
 use crate::models::*;
-use crate::release_flow::identity::{inject_release_identity, strip_release_identity};
+use crate::release_flow::identity::{ensure_no_reserved_env, strip_release_identity};
 use crate::service::AppService;
 use crate::utils::*;
 
@@ -164,8 +164,10 @@ impl AppService {
             idle_timeout_seconds,
         } = input;
 
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        let env = inject_release_identity(&app_dir, env.unwrap_or_default()).await?;
+        // RBD 卷形态：rcoder 不读卷上 release.lock 注入身份变量——只做保留键治理
+        // （用户显式提交 → 400 防伪造；调用方需自行先 strip live 读回值）。
+        let env = env.unwrap_or_default();
+        ensure_no_reserved_env(&env)?;
 
         // 端口：models::PortConfig → container_runtime_api::AppPortSpec
         let app_ports: Vec<AppPortSpec> = ports
@@ -210,12 +212,12 @@ impl AppService {
             ephemeral_storage: r.ephemeral_storage.clone(),
         });
 
-        // 宿主机工作空间路径（Docker 模式 bind mount 源；K8s 模式 runtime 用 subPath，忽略此值）
-        let host_workspace_path = self
-            .get_host_app_dir(app_id)
-            .await
-            .to_string_lossy()
-            .to_string();
+        // Docker bind mount 宿主源路径（K8s per-app PVC 由 runtime ensure，此值空串占位）
+        let host_workspace_path = if shared_types::is_kubernetes_runtime() {
+            String::new()
+        } else {
+            self.get_host_app_dir(app_id).to_string_lossy().to_string()
+        };
 
         let mut builder = ContainerCreateParams::builder()
             .project_id(app_id.to_string())
@@ -348,16 +350,11 @@ mod tests {
     }
 
     async fn service_with_release_lock(root: &std::path::Path, app_id: &str) -> AppService {
+        // RBD 卷形态：build params 不再读卷上 release.lock（原 fixture 目录仅保留 app 目录结构）
         let app_dir = root.join(app_id);
         tokio::fs::create_dir_all(app_dir.join("code"))
             .await
             .expect("create code dir");
-        tokio::fs::write(
-            app_dir.join("code").join("release.lock.toml"),
-            release_lock(),
-        )
-        .await
-        .expect("write release lock");
         test_service(root, Arc::new(MockRuntime::default()))
     }
 
@@ -447,21 +444,22 @@ mod tests {
                 "/app/code/app.jar".to_string()
             ])
         );
-        // 业务 env 从 live 回退保留；保留变量被剥离后由 inject 从 release.lock.toml
-        // 重新注入权威值（而非集群里的旧值）。
+        // 业务 env 从 live 回退保留；保留变量被剥离且**不再回注**（RBD 卷形态：
+        // rcoder 不读卷上 release.lock——身份变量本来就在容器内 lock 里，app-cli
+        // 自行消费）。
         let env = params.env.expect("env always set by builder");
         assert_eq!(env.get("SPRING_PROFILES").map(String::as_str), Some("prod"));
-        assert_eq!(
-            env.get("RCODER_PINGAP_VERSION").map(String::as_str),
-            Some("0.13.7")
+        assert!(
+            !env.contains_key("RCODER_PINGAP_VERSION"),
+            "reserved key stripped, not re-injected"
         );
-        assert_eq!(
-            env.get("RCODER_PINGAP_COMMIT").map(String::as_str),
-            Some("abc123")
+        assert!(
+            !env.contains_key("RCODER_PINGAP_COMMIT"),
+            "reserved key stripped, not re-injected"
         );
-        assert_eq!(
-            env.get("RCODER_RUNTIME_IMAGE_DIGEST").map(String::as_str),
-            Some("registry.example/app-runtime:0.1.140")
+        assert!(
+            !env.contains_key("RCODER_RUNTIME_IMAGE_DIGEST"),
+            "reserved key stripped, not re-injected"
         );
         let secrets = params.secrets.expect("secrets fallback");
         assert_eq!(

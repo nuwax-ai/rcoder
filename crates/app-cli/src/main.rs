@@ -27,6 +27,33 @@ async fn main() -> anyhow::Result<()> {
         args.pingap_bin.display()
     );
 
+    // 部署段（生产 RBD 卷形态）：APP_DEPLOY_URL 注入时下载制品包并切换 code/。
+    // 必须先于 api / 编排读 release.lock（api::serve 与 supervisor 都读 lock）；
+    // 首次部署无 code 时 api 起不来，:3010 由部署段的 liveness 托管应答探针
+    // （防大制品下载窗口 kubelet 误杀）。失败退出非零 → supervisord 重试
+    // （code/ 现场不破坏，readiness 超时由 rcoder wait_app_ready 上报）。
+    if app_cli::deploy::deploy_requested() {
+        // 占位失败（端口被占等）不阻断部署本身：warn 后裸跑（最坏 liveness 抖动）
+        let hold = match app_cli::deploy::LivenessHold::start(&args.admin_addr) {
+            Ok(hold) => Some(hold),
+            Err(e) => {
+                tracing::warn!(
+                    "liveness hold bind {} failed, deploy continues without hold: {e:#}",
+                    args.admin_addr
+                );
+                None
+            }
+        };
+        let deploy_result = app_cli::deploy::run_from_env(&args.workspace).await;
+        if let Some(hold) = hold {
+            hold.release().await;
+        }
+        if let Err(e) = deploy_result {
+            tracing::error!("❌ deploy stage failed: {e:#}");
+            anyhow::bail!("deploy stage failed");
+        }
+    }
+
     // 管理 API（后台并发跑；supervisor 退出时 abort）
     let api_addr = args.admin_addr.clone();
     let api_log_dir = args.log_dir.clone();

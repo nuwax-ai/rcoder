@@ -4,7 +4,6 @@ use container_runtime_api::{
     ContainerRuntimeError, DeploymentStatus, ExposeType as RtExposeType,
     HealthCheckType as RtHealthCheckType,
 };
-use download_utils::ArchiveError;
 use shared_types::ServiceType;
 
 use super::models::*;
@@ -39,42 +38,6 @@ pub(super) fn map_io_error(ctx: &str, e: std::io::Error, is_file_op: bool) -> Ap
         }
         _ => AppOperationError::Backend(format!("{ctx}: {e}")),
     }
-}
-
-/// `ArchiveError`（download_utils 解压错误）→ `AppOperationError`。
-/// 非法路径 / 解压超限 / 无效压缩包 → `Validation`（400，客户端错误）；
-/// IO → `Backend`（500）。
-pub(super) fn map_archive_error(e: ArchiveError) -> AppOperationError {
-    match e {
-        ArchiveError::PathTraversal(msg) => {
-            AppOperationError::Validation(format!("archive contains illegal path: {msg}"))
-        }
-        ArchiveError::InvalidArchive(msg) => {
-            AppOperationError::Validation(format!("invalid archive: {msg}"))
-        }
-        ArchiveError::Io(e) => map_io_error("archive IO error", e, true),
-    }
-}
-
-/// canonicalize `target` 并校验仍在 `canonical_app_dir` 内（path traversal 防护）。
-///
-/// 文件操作（upload/extract/list/delete）共用。
-/// 调用前需保证 `target` 已存在（否则 canonicalize 抛 OS 错误 → Backend）；
-/// 需要 NotFound 语义的调用方（如日志文件读取）应先 `target.exists()` 守卫。
-/// `canonical_app_dir` 应由调用方预先 canonicalize（通常在创建目录后立即取）。
-pub(super) fn ensure_within_app_dir(
-    target: &std::path::Path,
-    canonical_app_dir: &std::path::Path,
-) -> AppResult<std::path::PathBuf> {
-    let canonical = target
-        .canonicalize()
-        .map_err(|e| map_io_error("failed to resolve path", e, false))?;
-    if !canonical.starts_with(canonical_app_dir) {
-        return Err(AppOperationError::Validation(
-            "path is outside app dir".to_string(),
-        ));
-    }
-    Ok(canonical)
 }
 
 /// 校验 upload target（app 根相对路径）。

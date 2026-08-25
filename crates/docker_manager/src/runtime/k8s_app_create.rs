@@ -9,7 +9,7 @@ use container_runtime_api::{
     ContainerRuntimeResult, ExposeType, HttpExpose,
 };
 #[cfg(feature = "kubernetes")]
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapEnvSource, Container as K8sContainer, ContainerPort, EnvFromSource, EnvVar,
@@ -174,8 +174,10 @@ impl KubernetesRuntime {
             ..Default::default()
         }]);
 
-        // UserApp (K8s 永远 per-app): per-app CephFS subvolume PVC (subPath=None, subvolume 天然边界),
-        // 由 create_app_resources ensure。rcoder 经挂根聚合 ({cephfs_root}/{subvolumePath}) 访问。
+        // UserApp (K8s 永远 per-app): per-app RWO RBD PVC (subPath=None), 由
+        // create_app_resources ensure。rcoder **不挂载**该卷（RBD 无 subvolumePath，
+        // 挂根聚合天然不可达）——部署经 env 注入 APP_DEPLOY_URL 由 app-cli 启动段
+        // 下载解压，文件操作经容器内 file-server-proxy (:60000)。
         // UserApp 代码路径独立于主线 (Web/Computer 走 create_container 共享 PVC)。
         let volumes = Some(vec![Volume {
             name: "app-workspace".to_string(),
@@ -242,6 +244,13 @@ impl KubernetesRuntime {
             },
             spec: Some(DeploymentSpec {
                 replicas: Some(1),
+                // RWO 块卷（RBD）单挂载：Recreate 先删旧 Pod 再建新 Pod，避免
+                // RollingUpdate maxSurge=1 期间新旧 Pod 争抢同一块卷的
+                // Multi-Attach 错误（单副本本就有停机窗口，语义不变）。
+                strategy: Some(DeploymentStrategy {
+                    type_: Some("Recreate".to_string()),
+                    ..Default::default()
+                }),
                 selector: LabelSelector {
                     match_labels: Some(selector_labels),
                     ..Default::default()
@@ -286,15 +295,20 @@ impl KubernetesRuntime {
             })
             .unwrap_or_default();
         let mut ports = ports;
-        // 运行容器终端/PG 控制台固定端口随 Service 一并暴露——
-        // `/userapp/{ttyd,pgweb}/{app_id}/runtime` 代理上游为 Service FQDN，
-        // 若 7681/8081 不在 Service ports 内，代理连接将超时（app-runtime
-        // 镜像 supervisor 恒起 ttyd/pgweb，targetPort 恒可达）。
-        // 用户 ports 为空时同样需要本 Service（仅含 ttyd/pgweb 也建）——
+        // 运行容器固定端口随 Service 一并暴露——
+        // `/userapp/{ttyd,pgweb}/{app_id}/runtime` 与 `/proxy/prod/dbx/{app_id}`
+        // 代理上游为 Service FQDN，若 7681/8081/4224 不在 Service ports 内，
+        // 代理连接将超时（app-runtime 镜像 supervisor 恒起 ttyd/pgweb/dbx-web，
+        // targetPort 恒可达）。
+        // 60000 = 容器内 file-server-proxy（rcoder 转发层 prod 文件操作的上游，
+        // AllRust → 8086 Rust file-server；单 app 模式）。
+        // 用户 ports 为空时同样需要本 Service（仅含固定端口也建）——
         // 平台内定四要素下 ports 恒非空，此分支防御直接 REST create 的调用方。
         for (name, port) in [
             ("ttyd", shared_types::TTYD_PORT),
             ("pgweb", shared_types::PGWEB_PORT),
+            ("dbx", shared_types::DBX_PORT),
+            ("file-server", shared_types::AGENT_FILE_SERVER_PORT),
         ] {
             // 撞名即跳过（不论端口值）：再 push 同名端口会撞 K8s 校验
             // "port names must be unique"，整个 Service 被拒绝。用户占用保留名

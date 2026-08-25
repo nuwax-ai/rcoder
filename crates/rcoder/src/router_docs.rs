@@ -55,6 +55,8 @@ use crate::handler;
         handler::proxy_to_userapp_ime,
         handler::proxy_to_userapp_runtime_ttyd,
         handler::proxy_to_userapp_runtime_pgweb,
+        handler::proxy_to_dev_dbx,
+        handler::proxy_to_prod_dbx,
         handler::userapp_proxy_routes_doc,
         handler::proxy_with_query_params,
         // P0-4: Agent Management 转发层
@@ -81,11 +83,6 @@ use crate::handler;
         app_manager::handlers::stop_app,
         app_manager::handlers::restart_app,
         app_manager::handlers::set_recycle_policy,
-        app_manager::handlers::prepare_release,
-        app_manager::handlers::activate_release,
-        app_manager::handlers::rollback_release,
-        app_manager::handlers::list_releases,
-        app_manager::handlers::delete_release,
         app_manager::handlers::query_app_log_sources,
         app_manager::handlers::query_app_logs,
         app_manager::handlers::get_app_health,
@@ -404,15 +401,23 @@ mod openapi_tests {
         let document = ApiDoc::openapi();
         let paths = document.paths.paths;
         for path in [
-            "/api/v1/apps/{app_id}/releases/prepare",
-            "/api/v1/apps/{app_id}/releases/rollback",
+            // releases 五接口已随 RBD 卷形态删除（部署只走 start+url，见 handbook 10）
             "/api/v1/apps/{app_id}/logs/query",
             "/api/v1/apps/{app_id}/logs/stream",
             "/api/v1/apps/{app_id}/build",
             "/api/v1/apps/publish/tasks/query",
             "/api/v1/apps/publish/tasks/{task_id}/stream",
+            "/api/v1/apps/{app_id}/start",
         ] {
             assert!(paths.contains_key(path), "OpenAPI path missing: {path}");
+        }
+        // 删除面防复活：releases 路径不得再出现
+        for gone in [
+            "/api/v1/apps/{app_id}/releases/prepare",
+            "/api/v1/apps/{app_id}/releases/rollback",
+            "/api/v1/apps/{app_id}/releases/{release_id}/activate",
+        ] {
+            assert!(!paths.contains_key(gone), "deleted path reappeared: {gone}");
         }
     }
 
@@ -541,6 +546,8 @@ mod openapi_tests {
                 "/userapp/audio",
                 "/userapp/ime",
                 "/userapp/pgweb",
+                "/proxy/dev/dbx",
+                "/proxy/prod/dbx",
             ]
             .iter()
             .any(|prefix| path.starts_with(prefix));
@@ -591,10 +598,11 @@ mod openapi_tests {
                 checked += 1;
             }
         }
-        // 覆盖数下限：app_manager 30（删 create REST 面）+ userapp_publish 6 端点
-        // + /userapp/ 代理文档 6（开发域 ttyd/vnc/audio/ime + 运行容器 ttyd/pgweb）。
+        // 覆盖数下限：app_manager 25（create REST 面 + releases 五接口已删）+
+        // userapp_publish 6 端点 + /userapp/ 代理文档 6（开发域 ttyd/vnc/audio/ime
+        // + 运行容器 ttyd/pgweb）+ dbx 两阶段代理文档 2（dev/prod）。
         assert!(
-            checked >= 41,
+            checked >= 38,
             "UserApp OpenAPI 端点覆盖数异常偏少: {checked}"
         );
     }

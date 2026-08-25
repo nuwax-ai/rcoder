@@ -252,6 +252,21 @@ pub trait WorkspaceRuntime: Send + Sync {
         Ok(()) // default no-op (Docker / 未实现)
     }
 
+    /// 解析 identifier 对应持久卷的**标识字符串**（storage 面展示/对账用）。
+    ///
+    /// K8s: 返回 PVC 名（`{prefix}-{id}-workspace`——RBD 卷 rcoder 不可挂载，
+    /// 无路径视角，PVC 名即存储事实）；Docker: 返回 bind 源目录路径
+    /// （`RCODER_WORKSPACE_ROOT/{app_id}`，rcoder 同宿主可直读）。
+    async fn workspace_volume_name(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "workspace_volume_name not supported by this runtime".to_string(),
+        ))
+    }
+
     /// 销毁 per-app PVC(UserApp 专用;Docker 默认 no-op)。
     ///
     /// K8s: 删 PVC 对象 → ceph-csi 回收 subvolume(释放配额)。调用方须保证 app 已 delete

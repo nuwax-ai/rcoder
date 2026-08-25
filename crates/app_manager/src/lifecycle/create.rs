@@ -18,72 +18,24 @@ impl AppService {
     /// [`create_app_locked`] 内核避免此问题）。
     #[instrument(skip(self, request))]
     pub async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo> {
-        // 跨进程互斥（多副本 TOCTOU）：唯一性检查（get_deployment_status miss）
-        // 与 SSA create（同 manager force 合并）之间无原子性——两副本并发 create
-        // 同名 app 时后者静默覆盖前者。create 低频，workspace 根级 flock 全局
-        // 串行化换取检查-创建原子窗口（ensure_app_runtime 的锁内 create_app_locked
-        // 无并发 create 语义，不取本锁避免与 activate 重入等待）。
-        let create_guard = self.acquire_global_create_lock().await?;
-        // 锁内有界：validate（K8s 网络调用）+ PVC 等待 + SSA 无应用层超时——
-        // 持锁方挂死（进程冻结/网络黑洞）会让全舰队 create 无限期排队。
-        // 120s 上限（常态秒级完成；超时返回错误，锁随 guard drop 释放）
-        const CREATE_LOCK_WORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-        let work = async {
-            let app_id = self.validate_create_request(&request).await?;
-            // 与 prepare/activate/confirm/delete-release/delete_app 串行: 防发布流水线
-            // EnsureApp 建 Deployment 与并发 DELETE 互踩 (删成功但 Deployment 复活/
-            // 半删半建脏状态)。
-            let process_lock = self.acquire_process_release_lock(&app_id).await;
-            self.create_app_locked(&app_id, request, process_lock).await
-        };
-        let result = match tokio::time::timeout(CREATE_LOCK_WORK_TIMEOUT, work).await {
-            Ok(result) => result,
-            Err(_) => Err(AppOperationError::Backend(format!(
-                "create_app timed out after {}s (global create lock held too long; \
-                 check K8s API reachability)",
-                CREATE_LOCK_WORK_TIMEOUT.as_secs()
-            ))),
-        };
-        drop(create_guard);
+        // ⚠️ 调用方不得已持 `acquire_process_release_lock(app_id)` —— tokio Mutex
+        // 不可重入，已持锁调用会永久挂起（activate 的 ensure_app_runtime 走
+        // [`create_app_locked`] 内核避免此问题）。
+        //
+        // 多副本并发 create 同名 app：历史方案是 workspace 根级 flock（依赖 CephFS
+        // RWX 共享挂载）——RBD 卷形态下 rcoder 不再挂卷，flock 基础不复存在，删除。
+        // 现状语义：两副本并发 create 同名 → SSA force 合并（后写覆盖）。create 已
+        // 从 REST 面删除（仅内部 ensure/start-deploy 路径），且 Java 六步编排串行，
+        // 风险面收敛；如未来需要强互斥再引入 PG advisory lock。
+        let app_id = self.validate_create_request(&request).await?;
+        // 与发布流水线/delete 串行: 防发布流水线 EnsureApp 建 Deployment 与并发
+        // DELETE 互踩 (删成功但 Deployment 复活/半删半建脏状态)。
+        let process_lock = self.acquire_process_release_lock(&app_id).await;
+        let result = self.create_app_locked(&app_id, request, process_lock).await;
         if result.is_ok() {
             self.invalidate_deploy_cache().await;
         }
         result
-    }
-
-    /// workspace 根级创建互斥锁（跨进程 flock；文件随 guard drop 解锁）。
-    /// K8s 模式根 = cephfs 共享挂载（rcoder 有写权限——ensure_app_workspace_ready
-    /// 同根建目录），多副本天然互斥；Docker 单进程形态下 flock 无害。
-    ///
-    /// 部署前提：跨副本互斥要求 workspace 卷为 **RWX 共享挂载**（RWO 卷多副本
-    /// 本就无法共挂，互斥退化为单进程锁——无害但 TOCTOU 修复不生效）。
-    /// CephFS flock 在 MDS failover 窗口可能静默丢失（advisory 锁无客户端
-    /// 通知），create 低频场景可接受。
-    async fn acquire_global_create_lock(&self) -> AppResult<std::fs::File> {
-        use fs2::FileExt as _;
-        use std::io::Write as _;
-        let lock_path =
-            std::path::PathBuf::from(self.config.get_workspace_root()).join(".create.lock");
-        tokio::task::spawn_blocking(move || {
-            if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| map_io_error("ensure create lock parent", e, false))?;
-            }
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
-                .map_err(|e| map_io_error("open create lock", e, false))?;
-            // flock 在部分平台对只读句柄拒绝独占锁，touch 保证可写语义
-            drop(write!(file, ""));
-            file.lock_exclusive()
-                .map_err(|e| map_io_error("lock create operation", e, false))?;
-            Ok(file)
-        })
-        .await
-        .map_err(|e| AppOperationError::Backend(format!("create lock task: {e}")))?
     }
 
     /// 已持锁内核：调用方持有该 app 的进程级发布锁（防止与发布流水线互踩），
@@ -238,10 +190,12 @@ impl AppService {
         Ok(app_id)
     }
 
-    /// provision：ensure per-app PVC（带用户配额 requests.storage + 等 subvolumePath）+ 建工作空间目录。
+    /// provision：ensure per-app PVC（带用户配额 requests.storage）。
     ///
-    /// 顺序硬约束：K8s ensure PVC 必须在 create_app_dirs + create_deployment 之前——首次 ensure
-    /// 带配额，否则 create_deployment 内 ensure 命中 active 复用会丢配额。Docker 模式 no-op。
+    /// 顺序硬约束：K8s ensure PVC 必须在 create_deployment 之前——首次 ensure
+    /// 带配额，否则 create_deployment 内 ensure 命中 active 复用会丢配额。
+    /// 工作空间目录（code/data/logs）不再由 rcoder 建：K8s 镜像自带 + app-cli
+    /// 部署段换 code/；Docker bind 源目录由 docker runtime 在 create 前建。
     async fn provision_app_workspace(
         &self,
         app_id: &str,
@@ -251,12 +205,7 @@ impl AppService {
             .resources
             .as_ref()
             .and_then(|r| r.storage.as_deref());
-        self.ensure_app_workspace_ready(app_id, storage_size)
-            .await?;
-        // 创建工作空间目录（code/data/logs）—— Docker: 共享 Local (create_deployment bind mount 源,
-        // 必须先存在); K8s: per-app PVC 根 (ensure_app_workspace_ready 已 ensure + 等 subvolumePath)。
-        self.create_app_dirs(app_id).await?;
-        Ok(())
+        self.ensure_app_workspace_ready(app_id, storage_size).await
     }
 
     /// 创建运行时资源：build params → create_deployment → 注册 Pingora backend。

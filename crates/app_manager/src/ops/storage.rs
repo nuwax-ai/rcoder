@@ -1,4 +1,10 @@
 //! 持久存储管理（query/delete storage + orphan 检测）
+//!
+//! RBD 卷形态（rcoder 零挂载）：`exists` = PVC 归属（K8s label 集）/目录存在
+//! （Docker）；`path` = PVC 名（K8s，非可挂载路径）/bind 源目录（Docker）；
+//! `modified_at` 仅 Docker 可得（K8s 需容器运行，降级 None）。
+//! `clear`：K8s = 删 PVC（数据清空语义等价——RBD 不可挂载无法逐文件清，
+//! 卷在下次 create 自动重建）；Docker = 清目录内容。
 
 use tracing::{info, warn};
 
@@ -10,26 +16,53 @@ use crate::utils::*;
 impl crate::service::AppService {
     // ===== 持久存储管理（v2 §5.4）=====
     // 删应用默认保留数据；这组接口让 Java 显式管理残留存储。
-    // StorageInfo 不含 size_bytes——CephFS 上不能用 du（详见设计文档 §5.4）。
+    // StorageInfo 不含 size_bytes——需容器运行时 exec du，跨面语义不稳（见设计文档 §5.4）。
 
-    /// 查询单个应用的持久存储状态（O(1) stat，不递归）。
+    /// 查询单个应用的持久存储状态。
     pub async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo> {
         validate_app_id(app_id)?;
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        let metadata = tokio::fs::metadata(&app_dir).await.ok();
-        let exists = metadata.is_some();
-        let modified_at = metadata
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
         let is_orphan = self.is_storage_orphan(app_id).await;
+        let (exists, path) = self.storage_path_info(app_id).await?;
+        let modified_at = if shared_types::is_kubernetes_runtime() {
+            None // RBD 卷不可挂载，无路径视角；容器 exec stat 属运行时依赖，降级
+        } else {
+            tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+        };
         Ok(StorageInfo {
             app_id: app_id.to_string(),
             exists,
-            path: app_dir.to_string_lossy().to_string(),
+            path: path.to_string_lossy().to_string(),
             modified_at,
             is_orphan,
         })
+    }
+
+    /// 存储标识 + 存在性（K8s：PVC 名 + label 集含否；Docker：bind 目录 + 本地 stat）。
+    async fn storage_path_info(&self, app_id: &str) -> AppResult<(bool, std::path::PathBuf)> {
+        let path = self
+            .runtime
+            .workspace_volume_name(app_id, &ServiceType::UserApp)
+            .await
+            .map_err(|e| map_runtime_error("[APP] workspace_volume_name failed", e))?;
+        let path = std::path::PathBuf::from(path);
+        if shared_types::is_kubernetes_runtime() {
+            // PVC 归属 = label 集（list_workspace_identifiers 枚举 per-app PVC，
+            // 含已 delete 的孤儿）；path 字段是 PVC 名而非可挂载路径
+            let exists = self
+                .runtime
+                .list_workspace_identifiers(&ServiceType::UserApp)
+                .await
+                .map_err(|e| map_runtime_error("[APP] list_workspace_identifiers failed", e))?
+                .contains(&app_id.to_string());
+            Ok((exists, path))
+        } else {
+            let exists = tokio::fs::metadata(&path).await.is_ok();
+            Ok((exists, path))
+        }
     }
 
     /// 校验 app 计算资源已不存在（clear/destroy 共用前置：必须先 delete app，否则 INVALID_STATE）。
@@ -49,13 +82,26 @@ impl crate::service::AppService {
         }
     }
 
-    /// 清空应用持久存储内容（留 PVC，可恢复）。安全约束：仅当 app 计算资源已不存在时允许（否则 INVALID_STATE）。
+    /// 清空应用持久存储内容（数据语义；卷对象去留按运行时能力）。
+    /// 安全约束：仅当 app 计算资源已不存在时允许（否则 INVALID_STATE）。
+    /// - K8s/RBD：rcoder 不可挂载无法逐文件清 → 删 PVC（下次 create 自动重建空卷，
+    ///   数据清空语义等价；handbook 注明）。
+    /// - Docker：清 bind 目录内容（留目录本身，可恢复）。
     pub async fn clear_app_storage(&self, app_id: &str) -> AppResult<()> {
         validate_app_id(app_id)?;
         self.ensure_app_deleted(app_id, "clearing storage").await?;
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        // K8s per-agent: app_dir = per-app PVC 根 (ceph-csi subvol 根), 清空内容不删根
-        // (删 subvol 根破坏 PV subvolumePath → pod 重启挂载异常)
+        if shared_types::is_kubernetes_runtime() {
+            self.runtime
+                .destroy_app_pvc(app_id)
+                .await
+                .map_err(|e| map_runtime_error("destroy_app_pvc (clear storage) failed", e))?;
+            info!(
+                "[APP] app storage cleared (PVC removed, recreated empty on next create): {}",
+                app_id
+            );
+            return Ok(());
+        }
+        let app_dir = self.get_host_app_dir(app_id);
         if app_dir.exists()
             && let Err(e) = Self::purge_dir_contents(&app_dir).await
         {
@@ -69,7 +115,7 @@ impl crate::service::AppService {
     ///
     /// 安全约束：① 仅当 app 计算资源已不存在（已 delete）时允许（否则 INVALID_STATE）；
     /// ② body `confirm` 必须等于 app_id（否则 VALIDATION，防误调/防脚本批量误删）。
-    /// K8s：删 PVC 对象 → ceph-csi 回收 subvolume（配额释放）。Docker：无 PVC，trait 默认 no-op。
+    /// K8s：删 PVC 对象。Docker：无 PVC，等价删 bind 目录。
     /// 幂等：PVC 已不存在也返回成功。
     pub async fn destroy_app_storage(&self, app_id: &str, confirm: &str) -> AppResult<()> {
         self.destroy_app_storage_keep_metadata(app_id, confirm)
@@ -126,9 +172,7 @@ impl crate::service::AppService {
         Ok(())
     }
 
-    /// 清空目录内容 (逐子项 remove), 保留目录本身。
-    /// purge per-agent PVC 根 (ceph-csi subvol 根) 必须用此 —— `remove_dir_all` 删 subvol 根
-    /// 会破坏 PV `csi.volumeAttributes.subvolumePath` (PVC 仍在但 subvol 路径不存在 → pod 重启挂载异常)。
+    /// 清空目录内容 (逐子项 remove), 保留目录本身（Docker 模式专用）。
     pub(super) async fn purge_dir_contents(dir: &std::path::Path) -> std::io::Result<()> {
         let mut rd = tokio::fs::read_dir(dir).await?;
         while let Some(entry) = rd.next_entry().await? {
@@ -176,8 +220,7 @@ impl crate::service::AppService {
             .collect();
         // 候选 = 所有"有持久数据"的 app：枚举 UserApp 的 per-app PVC（含**已 delete 但
         // PVC 保留的孤儿**）——这才是 orphan 检测的数据源。再并入运行中的 app（existing，
-        // 兜底；正常 running app 都有 PVC，已含）。list_deployments 只能拿运行中的，看不到
-        // 孤儿 PVC，故旧实现（候选仅来自 existing）会让 storage/query 永远查不到孤儿。
+        // 兜底；正常 running app 都有 PVC，已含）。
         let mut entries: std::collections::HashSet<String> = self
             .runtime
             .list_workspace_identifiers(&ServiceType::UserApp)
@@ -214,32 +257,30 @@ impl crate::service::AppService {
         let mut items = Vec::with_capacity(paged.len());
         for app_id in paged {
             let is_orphan = !existing.contains(&app_id);
-            // resolve 失败 (K8s per-app PVC 未就绪) 不中断整个列表: warn + 标记 not exist
-            let (exists, path, modified_at) = match self.get_container_app_dir(&app_id).await {
-                Ok(app_dir) => {
-                    let metadata = tokio::fs::metadata(&app_dir).await.ok();
-                    let modified_at = metadata
-                        .as_ref()
-                        .and_then(|m| m.modified().ok())
-                        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
-                    (
-                        metadata.is_some(),
-                        app_dir.to_string_lossy().to_string(),
-                        modified_at,
-                    )
-                }
+            // 单项标识解析失败（瞬时 K8s API 抖动）不中断整个列表：warn + 标记 not exist
+            let (exists, path) = match self.storage_path_info(&app_id).await {
+                Ok(ok) => ok,
                 Err(e) => {
                     warn!(
                         "[APP] list storage resolve {} failed, mark not exist: {}",
                         app_id, e
                     );
-                    (false, String::new(), None)
+                    (false, std::path::PathBuf::new())
                 }
+            };
+            let modified_at = if shared_types::is_kubernetes_runtime() {
+                None
+            } else {
+                tokio::fs::metadata(&path)
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
             };
             items.push(StorageInfo {
                 app_id,
                 exists,
-                path,
+                path: path.to_string_lossy().to_string(),
                 modified_at,
                 is_orphan,
             });

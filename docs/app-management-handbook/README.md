@@ -52,7 +52,7 @@ http://<rcoder-host>:<port>/api/docs
 http://<rcoder-host>:<port>/api/docs/openapi.json
 ```
 
-> Swagger 按功能分组（tag）：**应用管理**（生命周期/操作/日志/文件/存储/数据库）、**应用发布**（releases 版本管理）、**UserApp 发布**（build/publish 任务）。
+> Swagger 按功能分组（tag）：**应用管理**（生命周期/操作/日志/文件/存储/数据库）、**应用发布**（start+url 部署，releases 接口已删除——见第 10 章）、**UserApp 发布**（build/publish 任务）。
 
 ### 2. 最小对接路径
 
@@ -114,11 +114,6 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate 链路
 数据库     POST   /api/v1/apps/{app_id}/db/reset-password     重置 PG 密码
            POST   /api/v1/apps/{app_id}/db/create-database    新建 PG 库
 
-版本发布   POST   /api/v1/apps/{app_id}/releases/prepare               预备发布
-           POST   /api/v1/apps/{app_id}/releases/{release_id}/activate        激活（切流+等就绪）
-           POST   /api/v1/apps/{app_id}/releases/rollback             回滚最近成功版
-           GET    /api/v1/apps/{app_id}/releases                        列出版本
-           POST   /api/v1/apps/{app_id}/releases/{release_id}/delete          删除记录
 
 构建发布   POST   /api/v1/apps/{app_id}/build                        触发源码构建（自动建 Builder）
            POST   /api/v1/apps/{app_id}/publish                      完整发布（一步）

@@ -9,8 +9,8 @@ use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, USERAPP_WORKSPACE_ROOT, WORKS
 use super::Config;
 use super::DeploymentMode;
 use super::env::{
-    MAX_UPLOAD_FILE_SIZE_BYTES, default_attachment_extensions, env_bool, env_list, env_parse,
-    env_str, request_body_max_bytes, validate_request_body_limit, validate_upload_limit,
+    MAX_UPLOAD_FILE_SIZE_BYTES, default_attachment_extensions, env_bool, env_list, env_opt_string,
+    env_parse, env_str, request_body_max_bytes, validate_request_body_limit, validate_upload_limit,
 };
 
 impl Config {
@@ -91,6 +91,7 @@ impl Config {
         path!(project_source_dir, "PROJECT_SOURCE_DIR");
         path!(computer_workspace_dir, "COMPUTER_WORKSPACE_DIR");
         path!(userapp_workspace_dir, "USERAPP_WORKSPACE_DIR");
+        self.userapp_single_app_id = env_opt_string("USERAPP_SINGLE_APP_ID")?;
         path!(service_log_dir, "FILE_SERVER_LOG_DIR");
         parse!(service_log_retention_days, "FILE_SERVER_LOG_RETENTION_DAYS");
         path!(init_project_dir, "INIT_PROJECT_DIR");
@@ -180,6 +181,7 @@ impl Config {
                 "USERAPP_WORKSPACE_DIR",
                 USERAPP_WORKSPACE_ROOT,
             )?),
+            userapp_single_app_id: env_opt_string("USERAPP_SINGLE_APP_ID")?,
             service_log_dir: PathBuf::from(env_str(
                 "FILE_SERVER_LOG_DIR",
                 "/app/logs/file-server",
@@ -284,6 +286,14 @@ impl Config {
             if path.as_os_str().is_empty() {
                 return Err(anyhow!("{name} must not be empty"));
             }
+        }
+        // 单 app 模式归属须过 identifier 白名单（该值直接参与路径与 appId 比对）
+        if let Some(single) = self.userapp_single_app_id.as_deref()
+            && shared_types::validate_identifier(single, "USERAPP_SINGLE_APP_ID").is_err()
+        {
+            return Err(anyhow!(
+                "USERAPP_SINGLE_APP_ID must be a valid identifier: '{single}'"
+            ));
         }
         if self.dev_port_range_start == 0 {
             return Err(anyhow!("DEV_PORT_RANGE_START must be greater than zero"));

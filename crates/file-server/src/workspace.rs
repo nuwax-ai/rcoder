@@ -116,6 +116,11 @@ fn validated_identifier<'a>(value: &'a str, field: &str) -> AppResult<&'a str> {
 /// 指向各自视角的挂载点), 沙箱与 builder 共享同一块卷同构目录, 与拓扑无关。
 /// `custom_target_dir` trim 非空则直接信任 (与 computer 域 `resolve_computer_target`
 /// 对称, 由调用方 Java 负责合法性)。
+///
+/// **单 app 模式**（`config.userapp_single_app_id` = Some，生产运行容器形态）：
+/// 卷根即 app 根——路径直接返回 `userapp_workspace_dir`（不 join app_id），
+/// appId 必须与本容器归属一致（防跨 app 误操作），`custom_target_dir` 信任
+/// 覆盖一并收紧（fail-closed）。
 pub fn resolve_userapp_dev(
     app_id: &str,
     custom_target_dir: Option<&str>,
@@ -124,6 +129,24 @@ pub fn resolve_userapp_dev(
     // identifier 校验先于 override（与 computer 域 resolve_computer_target 对称:
     // 总是先校验定位字段, 再应用 customTargetDir 信任覆盖）
     let app_id = validated_identifier(app_id, "appId")?;
+    if let Some(single) = config
+        .userapp_single_app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if app_id != single {
+            return Err(AppError::validation(format!(
+                "appId '{app_id}' does not match this single-app file-server (owns '{single}')"
+            )));
+        }
+        if non_empty(custom_target_dir).is_some() {
+            return Err(AppError::validation(
+                "customTargetDir is not allowed in single-app mode",
+            ));
+        }
+        return Ok(config.userapp_workspace_dir.clone());
+    }
     if let Some(ct) = non_empty(custom_target_dir) {
         return Ok(PathBuf::from(ct));
     }
@@ -387,5 +410,54 @@ mod tests {
             cid: "../../outside".into(),
         };
         assert!(resolver.resolve_computer(&computer).await.is_err());
+    }
+
+    // ── 单 app 模式（生产运行容器形态）──────────────────────────────────────
+
+    fn dev_config(single: Option<&str>) -> crate::Config {
+        crate::Config {
+            userapp_workspace_dir: PathBuf::from("/app"),
+            userapp_single_app_id: single.map(str::to_string),
+            ..crate::Config::default()
+        }
+    }
+
+    #[test]
+    fn single_app_mode_returns_root_without_app_id_join() {
+        let config = dev_config(Some("app-abc123"));
+        let path = resolve_userapp_dev("app-abc123", None, &config).expect("resolve");
+        // 卷根即 app 根：不 join app_id（生产运行容器 /app = code/data/logs）
+        assert_eq!(path, PathBuf::from("/app"));
+    }
+
+    #[test]
+    fn single_app_mode_rejects_mismatched_app_id() {
+        let config = dev_config(Some("app-abc123"));
+        let err = resolve_userapp_dev("app-other", None, &config)
+            .expect_err("mismatched appId must be rejected");
+        assert!(err.to_string().contains("single-app"));
+    }
+
+    #[test]
+    fn single_app_mode_rejects_custom_target_dir() {
+        let config = dev_config(Some("app-abc123"));
+        let err = resolve_userapp_dev("app-abc123", Some("/etc"), &config)
+            .expect_err("customTargetDir must be rejected in single-app mode");
+        assert!(err.to_string().contains("customTargetDir"));
+    }
+
+    #[test]
+    fn blank_single_app_id_falls_back_to_dev_semantics() {
+        // trim 为空 = 未启用单 app 模式（显式置空关闭），走开发容器 join 语义
+        let config = dev_config(Some("   "));
+        let path = resolve_userapp_dev("app-abc123", None, &config).expect("resolve");
+        assert_eq!(path, PathBuf::from("/app/app-abc123"));
+    }
+
+    #[test]
+    fn dev_mode_still_joins_app_id() {
+        let config = dev_config(None);
+        let path = resolve_userapp_dev("app-abc123", None, &config).expect("resolve");
+        assert_eq!(path, PathBuf::from("/app/app-abc123"));
     }
 }

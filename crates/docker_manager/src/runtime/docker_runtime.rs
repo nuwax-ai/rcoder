@@ -328,6 +328,20 @@ impl AgentContainerRuntime for DockerRuntime {
 /// **仅 `destroy_app_pvc` 重写** (Docker 模式 destroy = 删 app workspace 目录, 对应 K8s 删 PVC+subvolume).
 #[async_trait]
 impl WorkspaceRuntime for DockerRuntime {
+    async fn workspace_volume_name(
+        &self,
+        app_id: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        // Docker 持久卷 = bind 源目录（与 destroy_app_pvc 同源路径）
+        let ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
+            .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
+        Ok(std::path::Path::new(&ws_root)
+            .join(app_id)
+            .to_string_lossy()
+            .to_string())
+    }
+
     async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         // Docker 无 PVC 概念；destroy = 删除 app workspace 目录（对应 K8s 删 PVC + subvolume）。
         // 路径同 service 层 get_container_app_dir 的 Docker 分支：RCODER_WORKSPACE_ROOT/{app_id}

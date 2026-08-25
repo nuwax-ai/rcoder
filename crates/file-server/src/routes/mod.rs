@@ -9,8 +9,8 @@ use utoipa_axum::routes;
 
 use crate::AppState;
 use crate::handlers::{
-    build, build_support, computer, git, health, project, static_files, userapp, userapp_dev,
-    userapp_dev_server, userapp_files,
+    build, build_support, computer, git, health, project, static_files, userapp, userapp_app_files,
+    userapp_dev, userapp_dev_server, userapp_files,
 };
 
 /// 业务路由与 OpenAPI 文档的唯一聚合入口。
@@ -188,6 +188,10 @@ fn userapp_router() -> OpenApiRouter<AppState> {
         .routes(routes!(userapp_files::upload_files))
         .routes(routes!(userapp_files::generate_file))
         .routes(routes!(userapp_files::import_project))
+        .routes(routes!(userapp_app_files::upload))
+        .routes(routes!(userapp_app_files::upload_from_url))
+        .routes(routes!(userapp_app_files::list))
+        .routes(routes!(userapp_app_files::delete))
         .routes(routes!(userapp_dev::ensure_workspace))
         .routes(routes!(userapp_dev::execute_command))
         .routes(routes!(userapp_dev::get_logs))

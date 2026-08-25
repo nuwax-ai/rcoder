@@ -11,6 +11,11 @@ publish = false
 name = "file_server_proxy"
 path = "src/lib.rs"
 
+# 独立入口：生产运行容器形态（supervisord program），60000 → 本容器 file-server。
+[[bin]]
+name = "file-server-proxy"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
@@ -29,6 +34,9 @@ http-body-util = { workspace = true }
 
 # 跨 crate 契约: x-service-type 分流 header 定义在 shared_types（防双头事实源）
 shared_types = { workspace = true }
+
+# bin 入口的日志初始化（lib 内只发事件不装 subscriber）
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }

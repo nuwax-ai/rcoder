@@ -8,7 +8,6 @@
 #[cfg(test)]
 mod tests {
     use crate::models::commons::{ExposeType, HealthCheckType};
-    use crate::models::release::{ActivateReleaseRequest, ReleaseInfo, ReleaseStatus};
     use crate::models::request::{
         AppFilters, CreateAppRequest, QueryAppsRequest, SortOrder, UpdateAppRequest,
     };
@@ -195,51 +194,6 @@ mod tests {
         assert_eq!(v["pagination"]["page_size"], 20);
         assert_eq!(v["pagination"]["total_pages"], 1);
         assert_no_camel(&v, "PaginatedResponse");
-    }
-
-    /// ReleaseInfo：字段 snake；ReleaseStatus 写小写、读兼容 PascalCase 存量 index.json。
-    #[test]
-    fn release_info_snake_wire_and_status_alias() {
-        let info = ReleaseInfo {
-            release_id: "rel-1".into(),
-            sha256: "0".repeat(64),
-            size_bytes: 1024,
-            status: ReleaseStatus::Active,
-            created_at: "2026-08-20T00:00:00Z".into(),
-            activated_at: Some("2026-08-20T01:00:00Z".into()),
-            failure_message: None,
-        };
-        let v = serde_json::to_value(&info).expect("serialize release");
-        assert_eq!(v["status"], "active", "写出一律小写");
-        assert_eq!(v["release_id"], "rel-1");
-        assert_eq!(v["size_bytes"], 1024);
-        assert_no_camel(&v, "ReleaseInfo");
-
-        // 存量 index.json（camelCase 键已不存在场景外的 PascalCase 值）读兼容：
-        // caef1f5 前的 index 存 "Active"/"Failed"，alias 保证升级可读
-        let legacy = serde_json::from_value::<ReleaseInfo>(serde_json::json!({
-            "releaseId": "rel-1", "sha256": "0", "sizeBytes": 1,
-            "status": "Active", "createdAt": "t"
-        }));
-        // 字段层不做旧 camel 兼容（清数据直切决策）——仅值层 alias 生效：
-        // 构造只差值形态的 snake 载荷验证 alias
-        assert!(legacy.is_err(), "字段层旧 camel 键按决策不兼容（需清数据）");
-        let snake_legacy_value = serde_json::from_value::<ReleaseInfo>(serde_json::json!({
-            "release_id": "rel-1", "sha256": "0", "size_bytes": 1,
-            "status": "Active", "created_at": "t"
-        }))
-        .expect("PascalCase 值经 alias 读兼容");
-        assert!(matches!(snake_legacy_value.status, ReleaseStatus::Active));
-    }
-
-    /// activate 请求：readiness_timeout_seconds snake 键。
-    #[test]
-    fn activate_request_accepts_snake_wire() {
-        let req: ActivateReleaseRequest = serde_json::from_value(serde_json::json!({
-            "readiness_timeout_seconds": 300
-        }))
-        .expect("activate snake wire");
-        assert_eq!(req.readiness_timeout_seconds, Some(300));
     }
 
     /// storage 查询：orphan_only/app_ids snake + StorageInfo 响应 is_orphan。

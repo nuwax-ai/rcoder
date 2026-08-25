@@ -124,34 +124,6 @@ pub trait AppServiceTrait: Send + Sync {
         request: RecyclePolicyRequest,
     ) -> AppResult<AppRuntimeInfo>;
 
-    async fn prepare_release(
-        &self,
-        app_id: &str,
-        request: PrepareReleaseRequest,
-    ) -> AppResult<ReleaseInfo>;
-
-    /// 激活发布（单接口：切流 → ensure 运行容器 → 等就绪 → 提交/失败）。
-    /// 就绪失败返回 `Ok(ReleaseInfo{status:Failed})` 且**保留现场**（不自动回滚）。
-    /// `readiness_timeout` None=默认 300s（handler 层校验 5..=1800）。
-    async fn activate_release(
-        &self,
-        app_id: &str,
-        release_id: &str,
-        readiness_timeout: Option<u64>,
-    ) -> AppResult<ReleaseInfo>;
-
-    /// 回滚到最近一次成功版本（`.rollback` 快照恢复，秒级）。无快照时幂等返回当前
-    /// Active；首次发布失败（无旧版本）→ 409。
-    async fn rollback_release(
-        &self,
-        app_id: &str,
-        message: Option<String>,
-    ) -> AppResult<ReleaseInfo>;
-
-    async fn list_releases(&self, app_id: &str) -> AppResult<ReleaseListResponse>;
-
-    async fn delete_release(&self, app_id: &str, release_id: &str) -> AppResult<()>;
-
     /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
     async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats>;
 

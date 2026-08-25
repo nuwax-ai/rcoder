@@ -209,6 +209,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "charset",
     "http2",
     "system-proxy",
+    "multipart",
 ] }
 
 # Multi-AI provider client (Anthropic/OpenAI 协议抽象,用于 model_probe 探活)

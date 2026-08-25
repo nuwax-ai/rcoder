@@ -1,26 +1,85 @@
-//! 文件管理（upload/list/delete + 压缩包解压）
+//! 文件管理转发层（RBD 卷形态·容器中心化）。
+//!
+//! 四接口（upload / upload-from-url / files / files-delete）不再直读写卷——
+//! rcoder 对生产 RBD 卷零挂载。改为：**唤醒**（闲置回收的 app 自动拉起）→
+//! 解析运行容器地址（pod IP）→ 转发容器内 file-server-proxy (:60000) 的
+//! `/api/userapp/app-files/*` 内部契约。file-server 侧同语义实现（魔数识别
+//! zip/tar.gz 解压 + flatten、app 根相对路径、防穿越），REST 契约（handbook）
+//! 对 Java 保持不变。
 
-use std::io::Write;
+use tracing::{info, instrument, warn};
 
-use chrono::Utc;
-use tokio::fs;
-use tracing::{info, instrument};
-
-use download_utils::{
-    ArchiveError, DownloadConfig, DownloadError, Downloader, detect_file_type, extract_tar_gz,
-    extract_zip, normalize_extracted_dir,
-};
-use tokio_util::sync::CancellationToken;
+use serde::Deserialize;
+use shared_types::AppWakeControl;
 
 use crate::models::*;
+use crate::service::AppService;
 use crate::utils::*;
 
-impl crate::service::AppService {
-    /// 上传文件 / 压缩包。
+/// 运行容器 file-server-proxy 端口（与 ttyd 7681 / pgweb 8081 同为固定端口）。
+const APP_FILE_SERVER_PORT: u16 = shared_types::AGENT_FILE_SERVER_PORT;
+
+/// file-server app-files 族响应 DTO（形状对齐 app_manager DTO，snake 键）。
+#[derive(Debug, Deserialize)]
+struct UploadResp {
+    file_path: String,
+    file_size: u64,
+    uploaded_at: String,
+    #[serde(default)]
+    extracted_count: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileEntry {
+    path: String,
+    size: u64,
+    is_dir: bool,
+    modified_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListResp {
+    #[serde(default)]
+    files: Vec<FileEntry>,
+}
+
+impl AppService {
+    /// 唤醒 + 解析运行容器文件服务基址（`http://{pod_ip}:60000`）。
+    ///
+    /// 幻报拦截：`ensure_running` 对不存在的 app 返回 AlreadyRunning（stopped-set
+    /// 语义），后续 `get_app` NotFound 兜底 404。
+    async fn app_files_base(&self, app_id: &str) -> AppResult<String> {
+        match self.activity.ensure_running(app_id).await {
+            shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
+            shared_types::WakeOutcome::Timeout => {
+                return Err(AppOperationError::InvalidState(format!(
+                    "app {app_id} wake timed out; retry later"
+                )));
+            }
+            shared_types::WakeOutcome::Failed(e) => {
+                return Err(AppOperationError::InvalidState(format!(
+                    "app {app_id} wake failed: {e}"
+                )));
+            }
+        }
+        let runtime = self.get_app(app_id).await?;
+        let ip = runtime
+            .health
+            .instance
+            .map(|instance| instance.ip)
+            .filter(|ip| !ip.is_empty())
+            .ok_or_else(|| {
+                AppOperationError::InvalidState(format!(
+                    "app {app_id} has no ready runtime IP for file access"
+                ))
+            })?;
+        Ok(format!("http://{ip}:{APP_FILE_SERVER_PORT}"))
+    }
+
+    /// 上传文件 / 压缩包（转发容器内 file-server，解压/flatten 语义同旧直读写实现）。
     ///
     /// 自动判断（魔数）：zip/tar.gz 压缩包 → 解压到 `target` 目录；其它 → 单文件存 `target`。
     /// 单文件：`target`=文件路径（如 `code/app.jar`）；压缩包：`target`=解压目录（如 `code/`）。
-    /// 安全：复用 download_utils 的 zip slip + 1GiB 大小防护，叠加 app 根 canonicalize 校验。
     #[instrument(skip(self, file_data))]
     pub async fn upload_file(
         &self,
@@ -30,63 +89,46 @@ impl crate::service::AppService {
         flatten: bool,
     ) -> AppResult<UploadResult> {
         validate_app_id(app_id)?;
-        validate_upload_target(target)?; // create_dir_all 前拦截 ../ 与绝对路径（避免副作用泄漏）
+        validate_upload_target(target)?;
         if file_data.is_empty() {
             return Err(AppOperationError::Validation(
                 "file data is empty".to_string(),
             ));
         }
-        // 所有参数校验通过后，确保 workspace 就绪（K8s: 建 per-app PVC；Docker: no-op）。
-        // 放参数校验后：避免非法参数（../、空文件）导致副作用（建孤儿 PVC）。
-        // 支持"先 upload 准备文件 → 再 create 启动"工作流（upload 不依赖 create 已执行）。
-        self.ensure_app_workspace_ready(app_id, None).await?;
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        fs::create_dir_all(&app_dir)
+        let base = self.app_files_base(app_id).await?;
+        let file_name = std::path::Path::new(target)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "uploaded_file".to_string());
+        let part = reqwest::multipart::Part::bytes(file_data).file_name(file_name);
+        let form = reqwest::multipart::Form::new()
+            .text("appId", app_id.to_string())
+            .text("target", target.to_string())
+            .text("flatten", flatten.to_string())
+            .part("file", part);
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/userapp/app-files/upload"))
+            .multipart(form)
+            .send()
             .await
-            .map_err(|e| map_io_error("failed to create app dir", e, false))?;
-        let canonical_app_dir = app_dir
-            .canonicalize()
-            .map_err(|e| map_io_error("failed to resolve app dir", e, false))?;
-
-        // 魔数判断压缩包类型（不靠文件名后缀，app.jar.zip 也能识别为 zip）
-        let file_type = detect_file_type(&file_data).to_string();
-        match file_type.as_str() {
-            "zip" | "tar.gz" => {
-                self.extract_archive(
-                    app_id,
-                    file_data,
-                    file_type,
-                    target,
-                    flatten,
-                    &canonical_app_dir,
-                )
-                .await
-            }
-            _ => {
-                // 单文件分支（target=文件路径，app 根相对）
-                let file_path = app_dir.join(target);
-                // 防穿越：canonicalize 父目录后校验仍在 app 目录内（与 delete_file 对称）
-                if let Some(parent) = file_path.parent() {
-                    fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| map_io_error("failed to create parent dir", e, false))?;
-                    ensure_within_app_dir(parent, &canonical_app_dir)?;
-                }
-                fs::write(&file_path, &file_data)
-                    .await
-                    .map_err(|e| map_io_error("failed to write file", e, true))?;
-                Ok(UploadResult {
-                    file_path: target.to_string(),
-                    file_size: file_data.len() as u64,
-                    uploaded_at: Utc::now().to_rfc3339(),
-                    extracted_count: None,
-                })
-            }
-        }
+            .map_err(|e| forward_error("upload", app_id, e))?;
+        let resp = check_status(resp, "upload", app_id).await?;
+        let parsed: UploadResp = resp.json().await.map_err(|e| {
+            AppOperationError::Backend(format!("upload response decode (app {app_id}): {e}"))
+        })?;
+        info!(
+            "[APP] file uploaded via container file-server: {} -> {} ({} bytes)",
+            app_id, parsed.file_path, parsed.file_size
+        );
+        Ok(UploadResult {
+            file_path: parsed.file_path,
+            file_size: parsed.file_size,
+            uploaded_at: parsed.uploaded_at,
+            extracted_count: parsed.extracted_count,
+        })
     }
 
-    /// 从 URL 下载 → 复用 upload_file（魔数识别 + 解压 + zip slip + canonicalize 全复用）。
-    /// 私有化部署默认允许 HTTP、内网 IP、localhost 和集群内域名；仅限制为 HTTP(S) 协议。
+    /// 从 URL 部署文件（容器内流式下载后走上传核心——大制品不进 rcoder 内存）。
     #[instrument(skip(self))]
     pub async fn upload_from_url(
         &self,
@@ -97,80 +139,42 @@ impl crate::service::AppService {
     ) -> AppResult<UploadResult> {
         validate_app_id(app_id)?;
         validate_upload_target(target)?;
-        let downloader = Downloader::new(DownloadConfig::default());
-        let cancel = CancellationToken::new();
-        // 下载到临时文件（NamedTempFile 闭包结束自动删）
-        let tmp = tokio::task::spawn_blocking(tempfile::NamedTempFile::new)
+        let base = self.app_files_base(app_id).await?;
+        let body = serde_json::json!({
+            "appId": app_id,
+            "url": url,
+            "target": target,
+            "flatten": flatten,
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/userapp/app-files/upload-from-url"))
+            .json(&body)
+            .send()
             .await
-            .map_err(|e| AppOperationError::Backend(format!("tempfile task failed: {e}")))?
-            .map_err(|e| map_io_error("failed to create tempfile", e, false))?;
-        downloader
-            .download_to_file(url, tmp.path(), None, &cancel)
-            .await
-            .map_err(map_download_error)?;
-        let file_data = fs::read(tmp.path())
-            .await
-            .map_err(|e| map_io_error("failed to read downloaded file", e, false))?;
-        // 复用 upload_file：魔数识别 + 解压 + 安全全复用
-        self.upload_file(app_id, file_data, target, flatten).await
-    }
-
-    /// 解压压缩包（zip/tar.gz）到 target 目录（app 根相对）。
-    pub(super) async fn extract_archive(
-        &self,
-        app_id: &str,
-        file_data: Vec<u8>,
-        file_type: String,
-        target: &str,
-        flatten: bool,
-        canonical_app_dir: &std::path::Path,
-    ) -> AppResult<UploadResult> {
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        let dest = app_dir.join(target.trim_end_matches('/'));
-        fs::create_dir_all(&dest)
-            .await
-            .map_err(|e| map_io_error("failed to create extraction dir", e, false))?;
-        let canonical_dest = ensure_within_app_dir(&dest, canonical_app_dir)?;
-
-        let file_size = file_data.len() as u64;
-        let dest_clone = canonical_dest.clone();
-        // spawn_blocking：写临时文件 + 解压（同步 IO，不阻塞 tokio；TempPath 闭包结束自动删）
-        let count = tokio::task::spawn_blocking(move || -> Result<usize, ArchiveError> {
-            let mut tmp = tempfile::NamedTempFile::new()?;
-            tmp.write_all(&file_data)?;
-            let tmp_path = tmp.into_temp_path();
-            match file_type.as_str() {
-                "tar.gz" => extract_tar_gz(&tmp_path, &dest_clone),
-                "zip" => extract_zip(&tmp_path, &dest_clone),
-                _ => Err(ArchiveError::InvalidArchive(format!(
-                    "unsupported: {file_type}"
-                ))),
-            }
-        })
-        .await
-        .map_err(|e| AppOperationError::Backend(format!("extraction task failed: {e}")))?
-        .map_err(map_archive_error)?;
-
-        if flatten {
-            normalize_extracted_dir(&canonical_dest).map_err(map_archive_error)?;
-        }
+            .map_err(|e| forward_error("upload-from-url", app_id, e))?;
+        let resp = check_status(resp, "upload-from-url", app_id).await?;
+        let parsed: UploadResp = resp.json().await.map_err(|e| {
+            AppOperationError::Backend(format!(
+                "upload-from-url response decode (app {app_id}): {e}"
+            ))
+        })?;
         info!(
-            "[APP] archive extracted: {} -> {} ({} files, flatten={})",
-            app_id, target, count, flatten
+            "[APP] file deployed from url via container file-server: {} -> {}",
+            app_id, parsed.file_path
         );
         Ok(UploadResult {
-            file_path: target.to_string(),
-            file_size,
-            uploaded_at: Utc::now().to_rfc3339(),
-            extracted_count: Some(count),
+            file_path: parsed.file_path,
+            file_size: parsed.file_size,
+            uploaded_at: parsed.uploaded_at,
+            extracted_count: parsed.extracted_count,
         })
     }
 
     /// 列出文件（app 根目录，或其子目录如 "code"/"data"/"logs"）。
     ///
-    /// `subpath` 为 None/空 → 列 app 根；否则列 `app_dir/{subpath}`。返回的 `path` 字段是
-    /// **app-root-relative**（如 "code/app.jar"），可直接作为 upload 的 target / delete 的 path，
-    /// 与这两个接口的约定一致。防穿越：子目录 canonicalize 后必须仍在 app 目录内。
+    /// `subpath` 为 None/空 → 列 app 根；返回的 `path` 字段是 **app-root-relative**
+    /// （如 "code/app.jar"），可直接作为 upload 的 target / delete 的 path（契约
+    /// 同旧直读写实现）。
     #[instrument(skip(self))]
     pub async fn list_files(
         &self,
@@ -178,100 +182,109 @@ impl crate::service::AppService {
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>> {
         validate_app_id(app_id)?;
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        if !app_dir.exists() {
-            return Ok(vec![]);
+        let base = self.app_files_base(app_id).await?;
+        let mut url = format!(
+            "{base}/api/userapp/app-files/list?appId={}",
+            urlencode(app_id)
+        );
+        if let Some(p) = subpath.map(str::trim).filter(|p| !p.is_empty()) {
+            url.push_str("&path=");
+            url.push_str(&urlencode(p));
         }
-        let canonical_app_dir = app_dir
-            .canonicalize()
-            .map_err(|e| map_io_error("failed to resolve app dir", e, false))?;
-        // subpath 归一化：去尾部 '/'，空 → 列 app 根
-        let sub = subpath
-            .map(|p| p.trim_end_matches('/'))
-            .filter(|p| !p.is_empty());
-        let target_dir = match sub {
-            Some(p) => {
-                let full = app_dir.join(p);
-                if !full.exists() {
-                    return Ok(vec![]);
-                }
-                ensure_within_app_dir(&full, &canonical_app_dir)?
-            }
-            None => canonical_app_dir,
-        };
-        // 返回 app-root-relative 路径（sub 存在时前缀 "sub/"）
-        let rel_prefix = sub.map(|p| format!("{p}/")).unwrap_or_default();
-        let mut files = Vec::new();
-        let mut entries = fs::read_dir(&target_dir)
+        let resp = reqwest::Client::new()
+            .get(url)
+            .send()
             .await
-            .map_err(|e| map_io_error("failed to read dir", e, false))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| map_io_error("failed to traverse dir", e, false))?
-        {
-            let metadata = entry
-                .metadata()
-                .await
-                .map_err(|e| map_io_error("failed to read file metadata", e, false))?;
-            files.push(FileInfo {
-                path: format!("{rel_prefix}{}", entry.file_name().to_string_lossy()),
-                size: metadata.len(),
-                is_dir: metadata.is_dir(),
-                modified_at: metadata
-                    .modified()
-                    .map(|t| {
-                        let datetime: chrono::DateTime<Utc> = t.into();
-                        datetime.to_rfc3339()
-                    })
-                    .unwrap_or_default(),
-            });
-        }
-        Ok(files)
+            .map_err(|e| forward_error("list-files", app_id, e))?;
+        let resp = check_status(resp, "list-files", app_id).await?;
+        let parsed: ListResp = resp.json().await.map_err(|e| {
+            AppOperationError::Backend(format!("list-files response decode (app {app_id}): {e}"))
+        })?;
+        Ok(parsed
+            .files
+            .into_iter()
+            .map(|f| FileInfo {
+                path: f.path,
+                size: f.size,
+                is_dir: f.is_dir,
+                modified_at: f.modified_at,
+            })
+            .collect())
     }
 
-    /// 删除文件
+    /// 删除文件（app 根相对路径，可指向 code/ data/ logs/）。
     #[instrument(skip(self))]
     pub async fn delete_file(&self, app_id: &str, file_path: &str) -> AppResult<()> {
         validate_app_id(app_id)?;
-        // file_path 相对 app 根目录（与 upload_file 的 target 同约定：可指向 code/ data/ logs/）
-        let app_dir = self.get_container_app_dir(app_id).await?;
-        if !app_dir.exists() {
-            return Err(AppOperationError::NotFound(format!(
-                "app dir does not exist: {app_id}"
-            )));
+        if file_path.trim().is_empty() {
+            return Err(AppOperationError::Validation(
+                "file path is empty".to_string(),
+            ));
         }
-        let full_path = app_dir.join(file_path);
-        // 先 exists 守卫，避免 canonicalize 对不存在路径抛 OS 错误（导致 500 而非 404）
-        if !full_path.exists() {
-            return Err(AppOperationError::FileNotFound(format!(
-                "file does not exist: {file_path}"
-            )));
-        }
-        // 安全检查：canonicalize 后确保路径仍在 app 目录内（防 ../ 穿越到外部）
-        let canonical_app_dir = app_dir
-            .canonicalize()
-            .map_err(|e| map_io_error("failed to resolve app dir", e, false))?;
-        let canonical_path = ensure_within_app_dir(&full_path, &canonical_app_dir)?;
-
-        if canonical_path.is_dir() {
-            fs::remove_dir_all(&canonical_path)
-                .await
-                .map_err(|e| map_io_error("failed to remove dir", e, false))?;
-        } else {
-            fs::remove_file(&canonical_path)
-                .await
-                .map_err(|e| map_io_error("failed to remove file", e, true))?;
-        }
-        info!("[APP] file deleted: {}", file_path);
+        let base = self.app_files_base(app_id).await?;
+        let body = serde_json::json!({"appId": app_id, "path": file_path});
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/userapp/app-files/delete"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| forward_error("delete-file", app_id, e))?;
+        let checked = check_status(resp, "delete-file", app_id).await?;
+        drop(checked);
+        info!(
+            "[APP] file deleted via container file-server: {}",
+            file_path
+        );
         Ok(())
     }
 }
 
-/// download_utils::DownloadError → AppOperationError（非法/非 HTTP(S) URL → 400；其余 → 500）
-fn map_download_error(e: DownloadError) -> AppOperationError {
-    match e {
-        DownloadError::InvalidUrl(msg) => AppOperationError::Validation(msg),
-        other => AppOperationError::Backend(format!("download failed: {other}")),
+/// 非 2xx → 对应错误（携带容器侧错误信息，便于 Java/排障定位）。
+async fn check_status(
+    resp: reqwest::Response,
+    op: &str,
+    app_id: &str,
+) -> AppResult<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    warn!("[APP] app-files forward {op} non-success (app {app_id}): {status} {body}");
+    Err(match status {
+        reqwest::StatusCode::NOT_FOUND => AppOperationError::NotFound(format!("{op}: {body}")),
+        reqwest::StatusCode::BAD_REQUEST => AppOperationError::Validation(format!("{op}: {body}")),
+        _ => AppOperationError::Backend(format!("{op} failed: {status} {body}")),
+    })
+}
+
+fn forward_error(op: &str, app_id: &str, e: reqwest::Error) -> AppOperationError {
+    AppOperationError::Backend(format!(
+        "forward {op} to container file-server (app {app_id}) failed: {e}"
+    ))
+}
+
+/// query 参数百分号编码（防 `&`/空格 截断 query）。
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urlencode_encodes_reserved_chars() {
+        assert_eq!(urlencode("a b&c=d"), "a%20b%26c%3Dd");
+        assert_eq!(urlencode("app-1.2_x"), "app-1.2_x");
     }
 }

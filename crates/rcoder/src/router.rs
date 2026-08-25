@@ -184,6 +184,23 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
             "/userapp/pgweb/{app_id}/runtime",
             get(handler::proxy_to_userapp_runtime_pgweb_redirect_root),
         )
+        // DBX 数据库 Web GUI 两阶段 307 文档接口（dev=开发容器 / prod=运行容器）
+        .route(
+            "/proxy/dev/dbx/{app_id}/{*path}",
+            get(handler::proxy_to_dev_dbx),
+        )
+        .route(
+            "/proxy/dev/dbx/{app_id}",
+            get(handler::proxy_to_dev_dbx_redirect_root),
+        )
+        .route(
+            "/proxy/prod/dbx/{app_id}/{*path}",
+            get(handler::proxy_to_prod_dbx),
+        )
+        .route(
+            "/proxy/prod/dbx/{app_id}",
+            get(handler::proxy_to_prod_dbx_redirect_root),
+        )
         .route("/userapp/routes", get(handler::userapp_proxy_routes_doc))
         .with_state(state.clone());
 

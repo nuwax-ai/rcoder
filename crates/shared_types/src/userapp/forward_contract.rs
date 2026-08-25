@@ -14,6 +14,17 @@ pub const SERVICE_TYPE_USERAPP: &str = "userapp";
 /// rcoder 零 body 解析定位 per-app 开发容器（multipart/SSE 全覆盖）。
 pub const APP_ID_HEADER: &str = "x-app-id";
 
+/// dev/prod 阶段分派 header（文件操作转发目标）：`dev`（缺省，开发容器 builder）
+/// / `prod`（生产运行容器，唤醒后转发其 :60000）。与 pod 接口族 `app_stage`
+/// 字段同词表——同一 app_id 可同时存在 builder 与生产 Deployment，必须显式区分。
+pub const APP_STAGE_HEADER: &str = "x-app-stage";
+
+/// [`APP_STAGE_HEADER`] 的值：开发阶段（UserAppBuilder 开发容器）。
+pub const APP_STAGE_DEV: &str = "dev";
+
+/// [`APP_STAGE_HEADER`] 的值：生产阶段（UserApp 运行容器）。
+pub const APP_STAGE_PROD: &str = "prod";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28,5 +39,12 @@ mod tests {
             SERVICE_TYPE_USERAPP,
             "ChatServiceScope::Userapp wire 值与 SERVICE_TYPE_USERAPP 漂移"
         );
+    }
+
+    /// pod 接口族 app_stage 值域与转发层 x-app-stage 值域同词表（dev/prod）。
+    #[test]
+    fn app_stage_values_match_pod_field_vocabulary() {
+        assert_eq!(APP_STAGE_DEV, "dev");
+        assert_eq!(APP_STAGE_PROD, "prod");
     }
 }

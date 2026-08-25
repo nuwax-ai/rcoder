@@ -343,6 +343,16 @@ impl AgentContainerRuntime for KubernetesRuntime {
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl WorkspaceRuntime for KubernetesRuntime {
+    async fn workspace_volume_name(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        // RBD 卷 rcoder 不可挂载（无路径视角）——PVC 名即存储事实
+        use super::k8s_pvc::K8sPvcOps;
+        self.workspace_pvc_name(identifier, service_type)
+    }
+
     async fn resolve_workspace_path(
         &self,
         identifier: &str,
