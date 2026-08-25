@@ -223,3 +223,25 @@ fn app_target_validates_stage_and_conflicts() {
     assert!(parse_app_target(Some("../escape"), None, None).is_err());
     assert!(parse_app_target(Some("app/1"), None, None).is_err());
 }
+
+/// 契约钉住：userApp 请求只传 app_id/app_stage 即可反序列化（user_id/project_id
+/// 有 serde default 兜底，agent 路径空值校验在后）——Java 最小请求形态。
+#[test]
+fn userapp_minimal_request_deserializes_without_user_or_project() {
+    for raw in [
+        r#"{"app_id":"app-1"}"#,
+        r#"{"app_id":"app-1","app_stage":"dev"}"#,
+        r#"{"app_id":"app-1","app_stage":"prod"}"#,
+    ] {
+        let ensured: EnsurePodRequest = serde_json::from_str(raw)
+            .unwrap_or_else(|e| panic!("EnsurePodRequest {raw} 应可反序列化: {e}"));
+        assert_eq!(ensured.user_id, "");
+        assert_eq!(ensured.app_id.as_deref(), Some("app-1"));
+        let ka: KeepalivePodRequest = serde_json::from_str(raw)
+            .unwrap_or_else(|e| panic!("KeepalivePodRequest {raw} 应可反序列化: {e}"));
+        assert!(ka.app_stage.is_some() || ka.app_stage.is_none());
+        let rs: RestartPodRequest = serde_json::from_str(raw)
+            .unwrap_or_else(|e| panic!("RestartPodRequest {raw} 应可反序列化: {e}"));
+        assert_eq!(rs.project_id, "");
+    }
+}

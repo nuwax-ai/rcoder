@@ -14,7 +14,7 @@ use shared_types::{
     AGENT_FILE_SERVER_PORT, BuildProgressEvent, ContainerBasicInfo, ProjectAndContainerInfo,
     ServiceType, build_backend_addr,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::router::AppState;
 
@@ -58,6 +58,53 @@ pub(crate) async fn ensure_userapp_builder(
         Some(info) => Ok(info),
         None => create_builder_and_register(state, app_id).await,
     }
+}
+
+/// 探活自愈版 [`ensure_userapp_builder`]：注册命中后连容器 file-server 探活
+/// （3s 超时），失败视为注册脏值（容器被外部删除）→ 清注册重建。
+///
+/// 供低频管理面调用（pod ensure/keepalive）：**先探活再返回**，防"注册表命中
+/// 死容器"幻报就绪；热路径（转发/chat/publish）不适用——它们有自己的节流
+/// 探活（forward 30s 正缓存）或按需自愈语义。
+///
+/// 返回 `(info, created)`——created 由本函数判定（探活失败重建/miss 创建=true，
+/// 复用=false），调用方无需再读注册表推断。
+pub(crate) async fn ensure_userapp_builder_probed(
+    state: &AppState,
+    app_id: &str,
+) -> Result<(ContainerBasicInfo, bool)> {
+    if let Some(info) = registered_builder(state, app_id) {
+        let addr = dev_file_server_addr(state, &info);
+        if probe_file_server(&addr).await {
+            return Ok((info, false));
+        }
+        warn!(
+            "[USERAPP_ENSURE] dev container probe failed (stale registry?), recreating: app_id={app_id}, addr={addr}"
+        );
+        // 就地清 container 字段而非 remove_project（保 PG project 行与会话映射）
+        state.shutdown_sse_streams_for_project(app_id);
+        if let Some(mut stale) = state.get_project(app_id).map(|p| (*p).clone()) {
+            stale.set_container(None);
+            if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(stale)) {
+                warn!("[USERAPP_ENSURE] clear stale container field failed: app_id={app_id}: {e}");
+            }
+        }
+        let info = create_builder_and_register(state, app_id).await?;
+        return Ok((info, true));
+    }
+    let info = create_builder_and_register(state, app_id).await?;
+    Ok((info, true))
+}
+
+/// 开发容器 file-server 轻量探活（连接失败/非 2xx 均不可用）。
+async fn probe_file_server(addr: &str) -> bool {
+    crate::http_client::shared_client()
+        .get(format!("{addr}/api/version"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
 }
 
 /// 开发容器 file-server 地址（`http://{host}:60000`）。

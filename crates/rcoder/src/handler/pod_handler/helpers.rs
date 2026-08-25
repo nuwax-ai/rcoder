@@ -331,3 +331,8 @@ pub(super) fn parse_app_target(
         )),
     }
 }
+
+/// userApp 分派参数校验失败的统一响应（ensure/keepalive/restart 三 handler 复用）。
+pub(super) fn invalid_app_target_response<T>(locale: &str, e: &str) -> HttpResult<T> {
+    HttpResult::error_with_message(shared_types::error_codes::ERR_VALIDATION, locale, e)
+}

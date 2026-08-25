@@ -34,78 +34,11 @@ pub async fn pod_ensure(
         request.service_type.as_deref(),
     ) {
         Ok(AppTarget::NotApp) => {}
-        Ok(AppTarget::Dev(app_id)) => {
-            let existed_before = state
-                .get_project(&app_id)
-                .and_then(|p| p.container_info().is_some().then_some(()))
-                .is_some();
-            let info = crate::userapp_publish::agent_runner::ensure_userapp_builder(
-                &state, &app_id,
-            )
-            .await
-            .map_err(|e| {
-                error!("[POD_ENSURE] ensure userapp dev container failed: app_id={app_id}: {e:#}");
-                AppError::with_message(
-                    shared_types::error_codes::ERR_BACKEND_ERROR,
-                    format!("ensure userapp dev container failed: {e:#}"),
-                )
-            })?;
-            info!(
-                "[POD_ENSURE] userapp dev container ready: app_id={app_id}, container={}, ip={}",
-                info.container_name, info.container_ip
-            );
-            return Ok(HttpResult::success(EnsurePodResponse {
-                created: !existed_before,
-                container_info: PodContainerInfo {
-                    container_id: info.container_id.clone(),
-                    status: info.status.clone(),
-                },
-                message: "UserApp dev 容器已就绪（虚拟终端/文件服务经反向代理访问）".to_string(),
-            }));
-        }
-        Ok(AppTarget::Prod(app_id)) => {
-            use shared_types::AppWakeControl;
-            let outcome = state.activity.ensure_running(&app_id).await;
-            let (ok, message) = match &outcome {
-                shared_types::WakeOutcome::Ready => (
-                    true,
-                    "UserApp 生产实例已唤醒（wake_on_traffic 已启用）".to_string(),
-                ),
-                shared_types::WakeOutcome::AlreadyRunning => {
-                    (false, "UserApp 生产实例已在运行".to_string())
-                }
-                shared_types::WakeOutcome::Timeout => {
-                    error!("[POD_ENSURE] userapp prod wake timeout: app_id={app_id}");
-                    (false, String::new())
-                }
-                shared_types::WakeOutcome::Failed(e) => {
-                    error!("[POD_ENSURE] userapp prod wake failed: app_id={app_id}: {e}");
-                    (false, String::new())
-                }
-            };
-            if !ok && message.is_empty() {
-                return Ok(HttpResult::error_with_message(
-                    shared_types::error_codes::ERR_BACKEND_ERROR,
-                    locale,
-                    &format!("userapp prod ensure failed: {outcome:?}"),
-                ));
-            }
-            return Ok(HttpResult::success(EnsurePodResponse {
-                created: ok,
-                container_info: PodContainerInfo {
-                    container_id: app_id.clone(),
-                    status: "Running".to_string(),
-                },
-                message,
-            }));
-        }
+        Ok(AppTarget::Dev(app_id)) => return ensure_userapp_dev(&state, app_id).await,
+        Ok(AppTarget::Prod(app_id)) => return ensure_userapp_prod(&state, locale, app_id).await,
         Err(e) => {
             error!("[POD_ENSURE] invalid app target: {}", e);
-            return Ok(HttpResult::error_with_message(
-                shared_types::error_codes::ERR_VALIDATION,
-                locale,
-                &e,
-            ));
+            return Ok(invalid_app_target_response(locale, &e));
         }
     }
 
@@ -679,4 +612,93 @@ pub async fn pod_ensure(
     };
 
     Ok(HttpResult::success(response))
+}
+
+// ============================================================================
+// userApp 分派实现（app_id/app_stage）
+// ============================================================================
+
+/// ensure 的 userApp dev 分支：探活自愈版 ensure（注册脏值/死容器重建），
+/// created 由探活版判定（复用=false / 重建或新建=true）。
+async fn ensure_userapp_dev(
+    state: &Arc<AppState>,
+    app_id: String,
+) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+    let (info, created) =
+        crate::userapp_publish::agent_runner::ensure_userapp_builder_probed(state, &app_id)
+            .await
+            .map_err(|e| {
+                error!("[POD_ENSURE] ensure userapp dev container failed: app_id={app_id}: {e:#}");
+                AppError::with_message(
+                    shared_types::error_codes::ERR_BACKEND_ERROR,
+                    format!("ensure userapp dev container failed: {e:#}"),
+                )
+            })?;
+    info!(
+        "[POD_ENSURE] userapp dev container ready: app_id={app_id}, container={}, ip={}",
+        info.container_name, info.container_ip
+    );
+    Ok(HttpResult::success(EnsurePodResponse {
+        created,
+        container_info: PodContainerInfo {
+            container_id: info.container_id.clone(),
+            status: info.status.clone(),
+        },
+        message: "UserApp dev 容器已就绪（虚拟终端/文件服务经反向代理访问）".to_string(),
+    }))
+}
+
+/// ensure 的 userApp prod 分支：先验存在（防对不存在 app_id 幻报 AlreadyRunning），
+/// 再唤醒（Ready/AlreadyRunning 成功，Timeout/Failed 报错）。
+async fn ensure_userapp_prod(
+    state: &Arc<AppState>,
+    locale: &str,
+    app_id: String,
+) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+    // 存在性校验：ensure_running 只在 stopped 集合命中时走唤醒，不存在的 app
+    // 会返回 AlreadyRunning——必须先经 get_app 拦住幻报
+    if let Err(e) = state.app_service.get_app(&app_id).await {
+        error!("[POD_ENSURE] userapp prod app not found: app_id={app_id}: {e:#}");
+        return Ok(HttpResult::error_with_message(
+            shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+            locale,
+            &format!("userapp prod app not found: {e:#}"),
+        ));
+    }
+    use shared_types::AppWakeControl;
+    let outcome = state.activity.ensure_running(&app_id).await;
+    match outcome {
+        shared_types::WakeOutcome::Ready => Ok(HttpResult::success(EnsurePodResponse {
+            created: true,
+            container_info: PodContainerInfo {
+                container_id: app_id.clone(),
+                status: "Running".to_string(),
+            },
+            message: "UserApp 生产实例已唤醒（wake_on_traffic 已启用）".to_string(),
+        })),
+        shared_types::WakeOutcome::AlreadyRunning => Ok(HttpResult::success(EnsurePodResponse {
+            created: false,
+            container_info: PodContainerInfo {
+                container_id: app_id.clone(),
+                status: "Running".to_string(),
+            },
+            message: "UserApp 生产实例已在运行".to_string(),
+        })),
+        shared_types::WakeOutcome::Timeout => {
+            error!("[POD_ENSURE] userapp prod wake timeout: app_id={app_id}");
+            Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_BACKEND_ERROR,
+                locale,
+                "userapp prod ensure failed: wake timeout",
+            ))
+        }
+        shared_types::WakeOutcome::Failed(e) => {
+            error!("[POD_ENSURE] userapp prod wake failed: app_id={app_id}: {e}");
+            Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_BACKEND_ERROR,
+                locale,
+                &format!("userapp prod ensure failed: {e}"),
+            ))
+        }
+    }
 }

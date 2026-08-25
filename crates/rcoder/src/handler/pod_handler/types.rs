@@ -101,10 +101,12 @@ pub struct PodListResponse {
 pub struct EnsurePodRequest {
     /// 用户唯一标识符 (必填)
     #[schema(example = "user_123")]
+    #[serde(default)]
     pub user_id: String,
 
     /// 项目唯一标识符 (必填)
     #[schema(example = "proj_456")]
+    #[serde(default)]
     pub project_id: String,
 
     /// 可选的资源限制配置
@@ -179,7 +181,7 @@ pub struct EnsurePodResponse {
 /// 容器基本信息（对外接口）
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PodContainerInfo {
-    /// 容器 ID
+    /// 容器 ID（userApp 生产 Deployment 无单容器概念，此字段为 app 标识）
     #[schema(example = "abc123def456")]
     pub container_id: String,
 
@@ -197,10 +199,12 @@ pub struct PodContainerInfo {
 pub struct KeepalivePodRequest {
     /// 用户唯一标识符
     #[schema(example = "user_123")]
+    #[serde(default)]
     pub user_id: String,
 
     /// 项目唯一标识符
     #[schema(example = "proj_456")]
+    #[serde(default)]
     pub project_id: String,
 
     // === 新增字段 (多租户隔离支持) ===
@@ -235,6 +239,8 @@ pub struct KeepalivePodRequest {
     /// 服务类型，决定创建哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    ///
+    /// 注意：与 app_id 互斥（userApp 场景的容器类型由 app_stage 推导）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
@@ -296,10 +302,12 @@ pub struct KeepalivePodResponse {
 pub struct RestartPodRequest {
     /// 用户唯一标识符 (必填)
     #[schema(example = "user_123")]
+    #[serde(default)]
     pub user_id: String,
 
     /// 项目唯一标识符 (必填)
     #[schema(example = "proj_456")]
+    #[serde(default)]
     pub project_id: String,
 
     /// 可选的资源限制配置
@@ -337,6 +345,8 @@ pub struct RestartPodRequest {
     /// 服务类型，决定创建哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    ///
+    /// 注意：与 app_id 互斥（userApp 场景的容器类型由 app_stage 推导）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
