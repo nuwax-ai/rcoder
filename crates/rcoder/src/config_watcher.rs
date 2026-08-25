@@ -14,21 +14,22 @@
 //! # 使用示例
 //!
 //! ```no_run
-//! use std::sync::{Arc, RwLock};
 //! use std::path::PathBuf;
-//! # use crate::config::ApiKeyAuthConfig;
-//! # use crate::config_watcher::ConfigWatcher;
+//! use std::sync::Arc;
+//! use arc_swap::ArcSwap;
+//! use rcoder::config::ApiKeyAuthConfig;
+//! use rcoder::config_watcher::ConfigWatcher;
 //!
 //! let api_key_config = Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig::default()));
 //! let config_path = PathBuf::from("config.yml");
 //!
 //! match ConfigWatcher::new(config_path, api_key_config) {
-//!     Ok(watcher) => {
-//! println!("config watcher already started");
+//!     Ok(_watcher) => {
+//!         println!("config watcher already started");
 //!         // watcher 必须保持存活,否则监控会停止
 //!     }
 //!     Err(e) => {
-//! eprintln!("config watcher start failed: {}", e);
+//!         eprintln!("config watcher start failed: {}", e);
 //!     }
 //! }
 //! ```
