@@ -2,8 +2,8 @@
 name = "file-server-proxy"
 # 独立版本号: 支持 file-server-proxy 单独打 tag (file-server-proxy-v*) 经 CI 发
 # npm/OSS, 与 rcoder 主版本解耦 (与 crates/file-server 同款纪律)。
-# 0.1.2: start 存活判定 health 化 + detached child 僵尸修复
-version = "0.1.2"
+# 0.2.0: file-server 默认集成(lib 直连,无内部 8086)+ ts_first 策略 + CLI 参数化
+version = "0.2.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -11,17 +11,19 @@ repository.workspace = true
 publish = false
 
 [features]
-# 内嵌 Rust file-server (npm 独立分发形态): proxy 单二进制自带 rust 上游,
-# 同进程 task 绑 127.0.0.1:{RUST_UPSTREAM_PORT}。容器/rcoder 嵌入形态不启用
-# (上游由 supervisord 独立进程/宿主进程提供)。
-embed-file-server = ["dep:file-server"]
+# 默认集成 file-server(以 lib 方式进程内直连)——裸 `cargo build -p file-server-proxy`
+# 即产出 npm 同款单二进制(自带 rust 上游)。容器/rcoder 嵌入形态不受影响:
+# additive feature 只多编译不激活(运行时 EMBED_FILE_SERVER 未设即纯转发)。
+default = ["embed-file-server"]
+embed-file-server = ["dep:file-server", "dep:axum", "dep:tower"]
 
 [lib]
 name = "file_server_proxy"
 path = "src/lib.rs"
 
-# 独立入口：默认=生产运行容器形态（纯转发，supervisord program，60000 → 本容器
-# file-server）；--features embed-file-server = npm 独立分发形态（内嵌 rust 上游）。
+# 独立入口：默认(default feature)=npm 独立分发形态（file-server 以 lib 集成，
+# rust 域进程内直连）；--no-default-features=纯转发形态（容器 supervisord 用，
+# 上游由外部进程提供）。CLI 参数 > env > 默认，详见 src/main.rs 文档。
 [[bin]]
 name = "file-server-proxy"
 path = "src/main.rs"
@@ -41,6 +43,7 @@ bytes = { workspace = true }
 hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["client", "client-legacy"] }
 http-body-util = { workspace = true }
+http-body = { workspace = true }
 
 # 跨 crate 契约: x-service-type 分流 header 定义在 shared_types（防双头事实源）
 shared_types = { workspace = true }
@@ -48,8 +51,10 @@ shared_types = { workspace = true }
 # bin 入口的日志初始化（lib 内只发事件不装 subscriber）
 tracing-subscriber = { workspace = true }
 
-# npm 独立形态的可选内嵌 rust 上游 (feature embed-file-server)
+# npm 独立形态的可选集成依赖 (feature embed-file-server)
 file-server = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }

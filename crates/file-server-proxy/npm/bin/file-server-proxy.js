@@ -49,7 +49,7 @@ for (const stream of [process.stdout, process.stderr]) {
 
 const DEFAULT_LISTEN_PORT = 60000;
 const DEFAULT_RUST_PORT = 8086;
-const POLICIES = new Set(["userapp_split", "all_rust", "all_ts"]);
+const POLICIES = new Set(["userapp_split", "all_rust", "all_ts", "ts_first"]);
 // TS_UPSTREAM_PORT 的缺省值与 Rust 侧 NUWAX_FILE_SERVER_INTERNAL_PORT 一致；仅在
 // all_rust（不用 TS）时作为占位传入
 const FALLBACK_TS_PORT = 60001;
@@ -58,7 +58,7 @@ function usage() {
   return `file-server-proxy ${VERSION}
 
 Usage:
-  file-server-proxy start [--policy <userapp_split|all_rust|all_ts>]
+  file-server-proxy start [--policy <userapp_split|all_rust|all_ts|ts_first>]
                           [--port <60000>] [--rust-port <8086>]
                           [--ts-port <N>] [--detached]
   file-server-proxy stop [--all]
@@ -71,6 +71,8 @@ Policies:
                   everything else → nuwax-file-server (default)
   all_rust       everything → embedded rust file-server (no TS process needed)
   all_ts         everything → nuwax-file-server
+  ts_first       only /api/userapp* → embedded rust; legacy paths → TS even
+                  with x-service-type header (TS handles service_type in-band)
 
 Environment:
   FILE_SERVER_PROXY_BINARY      use a custom proxy binary (skip OSS download)
@@ -190,6 +192,11 @@ async function cmdStart(flags) {
     ROUTE_POLICY: flags.policy,
     EMBED_FILE_SERVER: "1",
   };
+  // 0.2.0+ 二进制走 CLI 参数（参数>env>默认）；env 同步保留双通道——兼容
+  // FILE_SERVER_PROXY_BINARY 指向旧版二进制（只认 env）的场景
+  const binaryArgs = ["--embed", "--policy", flags.policy, "--port", String(listenPort),
+    "--rust-port", String(rustPort)];
+  if (tsPort) binaryArgs.push("--ts-port", String(tsPort));
 
   const state = {
     pid: null, // spawn 后回填
@@ -205,7 +212,7 @@ async function cmdStart(flags) {
   if (flags.detached) {
     fs.mkdirSync(path.dirname(logPath()), { recursive: true });
     const logFd = fs.openSync(logPath(), "a");
-    const child = spawn(binaryPath, [], {
+    const child = spawn(binaryPath, binaryArgs, {
       env: childEnv,
       detached: true,
       stdio: ["ignore", logFd, logFd],
@@ -254,7 +261,7 @@ async function cmdStart(flags) {
   }
 
   // 前台模式：stdio 继承（日志直接可见），Ctrl-C/SIGTERM 整体清理后随码退出。
-  const child = spawn(binaryPath, [], {
+  const child = spawn(binaryPath, binaryArgs, {
     env: childEnv,
     stdio: "inherit",
     windowsHide: true,
@@ -343,7 +350,7 @@ async function cmdStatus() {
     console.log(`file-server-proxy: running (pid ${state.pid}, ${state.detached ? "detached" : "foreground"})`);
     console.log(`  entry : http://127.0.0.1:${state.port} (${entry})`);
     console.log(`  policy: ${state.policy}`);
-    console.log(`  rust  : 127.0.0.1:${state.rustPort} (embedded)`);
+    console.log(`  rust  : in-process (embedded, no internal port)`);
     if (state.tsPort) {
       const tsHealth = (await probeHealth(state.tsPort)) ? "health ok" : "health down";
       console.log(

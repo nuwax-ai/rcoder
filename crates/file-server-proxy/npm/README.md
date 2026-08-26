@@ -22,17 +22,31 @@ npm install @nuwax-ai/file-server-proxy
 ```
 外部调用方 ──→ :60000 file-server-proxy（单 Rust 进程）
                  ├─ 分流代理（本二进制）
-                 ├─ 内嵌 Rust file-server（127.0.0.1:8086，随代理同进程）
+                 ├─ 内嵌 Rust file-server（以 lib 集成，rust 域请求进程内 oneshot
+                 │  直调——无内部监听端口、零 loopback 跳）
                  └─ TS nuwax-file-server（唯一额外进程，随机端口，由 CLI 拉起托管）
 ```
 
-三档路由策略（`--policy`）：
+四档路由策略（`--policy`；同一词汇表贯穿 helm/config.yml/CLI/env 三层）：
 
 | 策略 | 行为 | TS 进程 |
 |---|---|---|
 | `userapp_split`（默认） | `/api/userapp*` 或 `x-service-type: userapp` → 内嵌 Rust；其余 → TS | 需要 |
 | `all_rust` | 全部 → 内嵌 Rust file-server（路径白名单：`/api/*`、`/health`、`/`、`/api-docs*`） | 不需要 |
 | `all_ts` | 全部 → TS nuwax-file-server | 需要 |
+| `ts_first` | **仅** `/api/userapp*` → 内嵌 Rust；存量同名接口全走 TS——**含带 `x-service-type` 标记的请求**（header 判据失效，由 TS 以 `service_type` 入参内部处理 userApp 业务） | 需要 |
+
+> `ts_first` 的前提：TS 源工程（nuwax-file-server）已支持 `service_type` 入参处理
+> userApp 业务。TS 未就绪时切此模式 = 存量 userApp 业务按 TS 普通业务处理（正是
+> 验证 TS 兼容性的切换目的）。
+
+### 三层控制链路（过渡期切流同一词汇表）
+
+| 层 | 控制入口 | 生效方式 |
+|---|---|---|
+| K8s/helm | `rcoder.fileServerProxyPolicy`（values，四值直配） | configmap → config.yml，pod 重启生效 |
+| 容器/bin | `file-server-proxy --policy <四值>` 或 `ROUTE_POLICY` env（参数优先） | 改 supervisord conf → `supervisorctl reread && update` |
+| npm CLI | `file-server-proxy start --policy <四值>` | start/restart 生效 |
 
 ## 命令
 
@@ -63,7 +77,7 @@ file-server-proxy --version
 | 端口 | 服务 | 说明 |
 |---|---|---|
 | 60000 | file-server-proxy | 对外唯一入口（`--port` 可改） |
-| 8086 | 内嵌 Rust file-server | 仅 loopback（`--rust-port` 可改） |
+| —（无内部端口） | 内嵌 Rust file-server | 以 lib 集成进程内直连；`--rust-port` 仅纯转发形态（`--no-embed`/`EMBED_FILE_SERVER=0`，上游为外部进程）时生效 |
 | 随机 | nuwax-file-server | 仅 loopback（`--ts-port` 固定） |
 
 ## 内嵌 Rust file-server 的环境变量
@@ -103,7 +117,7 @@ file-server-proxy --version
 - **`start` 报 already running**：先 `stop`；`status` 看 pid；
 - **60000 端口被占**：本机 rcoder 本地开发也可能占 60000——用 `--port` 换口，或先停占用方；
 - **TS start 报 stale lock**：见上文 120 秒自愈窗口；
-- **代理 502**：上游（内嵌 Rust 8086 / TS 随机口）未就绪或已死——`status` 检查，必要时 `restart`；后台模式日志在 `os.tmpdir()/file-server-proxy/proxy.log`。
+- **代理 502**：上游（TS 随机口 / 直连内嵌 rust 异常）未就绪或已死——`status` 检查，必要时 `restart`；后台模式日志在 `os.tmpdir()/file-server-proxy/proxy.log`。
 
 ## 版本与发版
 

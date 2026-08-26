@@ -49,8 +49,11 @@ pub const USERAPP_PATH_PREFIX: &str = "/api/userapp";
 /// 60000（对外入口）与 60001（TS 内部端口）的单一事实源见 shared_types。
 pub use shared_types::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT};
 
-/// 统一响应 body（上游 Incoming 与本地错误 Full 的归一）。
-type ProxyBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+/// 统一响应 body（上游 Incoming / 直连 axum Body 与本地错误 Full 的归一）。
+/// hyper 连接层只要求 `HttpBody + Send`——不设 Sync 约束（axum 的 `Body`
+/// 非 Sync，`BoxBody` 的 Sync 要求会把直连路径挡在门外）。
+pub type ProxyBody =
+    std::pin::Pin<Box<dyn http_body::Body<Data = Bytes, Error = std::io::Error> + Send>>;
 
 /// 上游 HTTP 客户端（连接池复用）。
 type ProxyClient = hyper_util::client::legacy::Client<
@@ -87,43 +90,51 @@ impl Default for FileServerProxyConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutePolicy {
-    /// 分流模式（embedFileServer=false）：userApp 判据（path 前缀或
+    /// 分流模式（现状兼容，生产在跑）：userApp 判据（path 前缀或
     /// `x-service-type` header）→ rust 上游，其余 → ts 上游
-    /// （存量域继续 TS nuwax-file-server）
+    /// （存量域继续 TS nuwax-file-server；TS 尚未支持 service_type 入参时
+    /// 存量路径上的 userApp 业务必须由 Rust 承载）
     #[default]
     UserappSplit,
-    /// 全 Rust 模式（embedFileServer=true / agent-runner 容器形态）：一律
-    /// rust 上游，全部流量由 Rust 重写的 file-server 承载（TS 热备于
-    /// [`NUWAX_FILE_SERVER_INTERNAL_PORT`]，不接收流量）
+    /// 全 Rust 模式（切流终态）：一律 rust 上游，全部流量由 Rust 重写的
+    /// file-server 承载（TS 热备于 [`NUWAX_FILE_SERVER_INTERNAL_PORT`]，不接流量）
     AllRust,
-    /// 全 TS 模式（npm 独立形态的后端选择之一）：一律 ts 上游，全部流量
-    /// 由 TS nuwax-file-server 承载——Rust 侧故障时的回退/AB 对照档。
-    /// 无路径白名单（TS 本就是全量老路由面，白名单语义不适用）。
+    /// 全 TS 模式（npm 独立形态的回退/AB 对照档）：一律 ts 上游。
+    /// 无路径白名单（TS 本就是全量老路由面，白名单语义不适用）；
+    /// TS 没有的 userApp 新接口（/api/userapp/*）在此模式下由 TS 返回 404。
     AllTs,
+    /// TS 优先模式（过渡切流档）：**仅** Rust 独有接口（`/api/userapp*`，TS 无
+    /// 此路由）→ rust 上游；存量同名接口**全走 TS**（含带 `x-service-type`
+    /// 标记的请求——header 判据在此模式下失效，由 TS 以 service_type 入参
+    /// 内部消费 userApp 业务）。验证 TS 侧 userApp 能力就绪后的整体切流形态。
+    TsFirst,
 }
 
 impl RoutePolicy {
-    /// 策略的 wire 值（serde/CLI/env 共用词汇表）。
+    /// 策略的 wire 值（serde/CLI/env/helm 共用词汇表）。
     pub const fn as_str(self) -> &'static str {
         match self {
             RoutePolicy::UserappSplit => "userapp_split",
             RoutePolicy::AllRust => "all_rust",
             RoutePolicy::AllTs => "all_ts",
+            RoutePolicy::TsFirst => "ts_first",
         }
     }
 }
 
 /// 解析策略值（env/CLI 入口共用；serde 之外的运行时入口）。
 ///
-/// 受认可值与 serde wire 契约一致：`userapp_split|all_rust|all_ts`。
+/// 受认可值与 serde wire 契约一致：`userapp_split|all_rust|all_ts|ts_first`。
 /// 非法值返回 Err（带受认可值清单，调用方 exit 前可直接展示）。
 pub fn parse_route_policy(value: &str) -> Result<RoutePolicy, String> {
     match value.trim() {
         "userapp_split" => Ok(RoutePolicy::UserappSplit),
         "all_rust" => Ok(RoutePolicy::AllRust),
         "all_ts" => Ok(RoutePolicy::AllTs),
+        "ts_first" => Ok(RoutePolicy::TsFirst),
         other => Err(format!(
-            "invalid route policy {other:?}: expected one of userapp_split | all_rust | all_ts"
+            "invalid route policy {other:?}: expected one of \
+             userapp_split | all_rust | all_ts | ts_first"
         )),
     }
 }
@@ -159,6 +170,8 @@ impl FileServerProxyConfig {
     ///   `x-service-type: userapp` header（任一命中）→ Rust 上游，其余 → TS 上游
     /// - [`RoutePolicy::AllRust`]：一律 Rust 上游
     /// - [`RoutePolicy::AllTs`]：一律 TS 上游
+    /// - [`RoutePolicy::TsFirst`]：仅 `/api/userapp*` → Rust 上游（header 判据
+    ///   失效，存量同名接口含 userApp 标记一律 TS）
     pub fn upstream_port_for(&self, path: &str, service_type_header: Option<&str>) -> Upstream {
         let to_rust = match self.policy {
             RoutePolicy::UserappSplit => {
@@ -166,6 +179,7 @@ impl FileServerProxyConfig {
             }
             RoutePolicy::AllRust => true,
             RoutePolicy::AllTs => false,
+            RoutePolicy::TsFirst => is_userapp_path(path),
         };
         if to_rust {
             Upstream::Rust(self.rust_upstream_port)
@@ -176,6 +190,65 @@ impl FileServerProxyConfig {
 }
 
 // ── 全局生命周期管理（admin API / CLI 复刻自 f55f230 的内嵌 file-server 模式）──
+
+/// 进程内直连通道（feature `embed-file-server`；npm/Electron 独立形态）。
+///
+/// 设置后 rust 域请求不再经 loopback 转发 `127.0.0.1:{rust_upstream_port}`，
+/// 而是直接 `router.oneshot(request)` 进程内调用（file-server 以 lib 集成，
+/// 单二进制单监听口）。容器/rcoder 嵌入形态不设置本值，转发路径原样。
+#[cfg(feature = "embed-file-server")]
+mod in_process {
+    use std::sync::RwLock;
+
+    static ROUTER: RwLock<Option<axum::Router>> = RwLock::new(None);
+
+    /// 注册直连 router（幂等覆盖；bin 启动装配时调用）。
+    pub fn set_in_process_router(router: axum::Router) {
+        match ROUTER.write() {
+            Ok(mut guard) => *guard = Some(router),
+            Err(poisoned) => {
+                *poisoned.into_inner() = Some(router);
+            }
+        }
+    }
+
+    /// 清除直连 router（测试复位；清除后回 loopback 转发路径）。
+    pub fn clear_in_process_router() {
+        match ROUTER.write() {
+            Ok(mut guard) => *guard = None,
+            Err(poisoned) => {
+                *poisoned.into_inner() = None;
+            }
+        }
+    }
+
+    /// 取当前直连 router 的克隆（per-request clone 是 axum 官方模式，Arc 浅拷贝）。
+    pub(super) fn take() -> Option<axum::Router> {
+        ROUTER.read().ok().and_then(|guard| guard.clone())
+    }
+}
+
+#[cfg(feature = "embed-file-server")]
+pub use in_process::{clear_in_process_router, set_in_process_router};
+
+/// 直连调用（feature 门控）：oneshot 进 file-server 的 axum Router，响应 body
+/// 归一到 [`ProxyBody`]。handler 层错误（路由/中间件 panic 被 tower 捕获等）→ 502。
+#[cfg(feature = "embed-file-server")]
+async fn call_in_process(
+    router: axum::Router,
+    req: hyper::Request<Incoming>,
+) -> hyper::Response<ProxyBody> {
+    use tower::ServiceExt;
+    match router.oneshot(req).await {
+        // 直连不经网络代理跳，hop-by-hop 头不做剥除（我们即服务器，与独立
+        // file-server bin 直连行为一致；hyper 连接层的 keep-alive 语义照常）
+        Ok(resp) => resp.map(|body| Box::pin(body.map_err(std::io::Error::other)) as ProxyBody),
+        Err(e) => {
+            error!("file-server 分流代理直调内嵌 file-server 失败: {e}");
+            bad_gateway("file-server upstream error")
+        }
+    }
+}
 
 /// 运行中的代理实例（shutdown 信号 + serve task + 监听地址）。
 struct RunningInstance {
@@ -370,6 +443,12 @@ async fn proxy_request(
                 warn!("AllRust 白名单外路径已拒绝: {path}");
                 return Ok(not_found("path not served on this entry"));
             }
+            // 进程内直连（embed 形态装配后）：原请求重组后直接 oneshot 进
+            // file-server 的 axum Router，不经 loopback 转发
+            #[cfg(feature = "embed-file-server")]
+            if let Some(router) = in_process::take() {
+                return Ok(call_in_process(router, hyper::Request::from_parts(parts, body)).await);
+            }
             port
         }
         Upstream::Ts(port) => port,
@@ -426,7 +505,7 @@ async fn proxy_request(
             }
             Ok(hyper::Response::from_parts(
                 parts,
-                body.map_err(std::io::Error::other).boxed(),
+                Box::pin(body.map_err(std::io::Error::other)),
             ))
         }
         Err(e) => {
@@ -479,9 +558,8 @@ fn not_found(msg: &str) -> hyper::Response<ProxyBody> {
 }
 
 fn error_response(status: hyper::StatusCode, msg: &str) -> hyper::Response<ProxyBody> {
-    let body = http_body_util::Full::new(Bytes::from(msg.to_string()))
-        .map_err(|e| match e {})
-        .boxed();
+    let body: ProxyBody =
+        Box::pin(http_body_util::Full::new(Bytes::from(msg.to_string())).map_err(|e| match e {}));
     hyper::Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
@@ -514,10 +592,16 @@ mod tests {
             serde_yaml::to_string(&RoutePolicy::AllTs).unwrap().trim(),
             "all_ts"
         );
+        assert_eq!(
+            serde_yaml::to_string(&RoutePolicy::TsFirst).unwrap().trim(),
+            "ts_first"
+        );
         let parsed: RoutePolicy = serde_yaml::from_str("all_rust").unwrap();
         assert_eq!(parsed, RoutePolicy::AllRust);
         let parsed: RoutePolicy = serde_yaml::from_str("all_ts").unwrap();
         assert_eq!(parsed, RoutePolicy::AllTs);
+        let parsed: RoutePolicy = serde_yaml::from_str("ts_first").unwrap();
+        assert_eq!(parsed, RoutePolicy::TsFirst);
         // 段缺 policy 字段 → 默认 UserappSplit（存量 config 兼容）
         let parsed: FileServerProxyConfig = serde_yaml::from_str(
             "listen_port: 60000\nrust_upstream_port: 8086\nts_upstream_port: 60001\n",
@@ -644,6 +728,10 @@ mod tests {
             RoutePolicy::AllRust
         );
         assert_eq!(parse_route_policy("all_ts").unwrap(), RoutePolicy::AllTs);
+        assert_eq!(
+            parse_route_policy("ts_first").unwrap(),
+            RoutePolicy::TsFirst
+        );
         // trim 容差（env 值尾随空白是常见脏数据）
         assert_eq!(parse_route_policy(" all_ts\n").unwrap(), RoutePolicy::AllTs);
         // as_str 与 parse 互逆
@@ -651,15 +739,56 @@ mod tests {
             RoutePolicy::UserappSplit,
             RoutePolicy::AllRust,
             RoutePolicy::AllTs,
+            RoutePolicy::TsFirst,
         ] {
             assert_eq!(parse_route_policy(policy.as_str()).unwrap(), policy);
         }
         // 非法值：报错文案带受认可值清单（调用方直接展示给用户）
-        for bad in ["", "split", "ALL_RUST", "userapp"] {
+        for bad in ["", "split", "ALL_RUST", "userapp", "ts-first"] {
             let err = parse_route_policy(bad).unwrap_err();
             assert!(
-                err.contains("userapp_split | all_rust | all_ts"),
+                err.contains("userapp_split | all_rust | all_ts | ts_first"),
                 "{bad:?} 报错应含受认可值清单: {err}"
+            );
+        }
+    }
+
+    /// TS 优先模式（TsFirst）：存量同名接口全走 TS——**含 userApp 标记**
+    /// （header 判据失效，由 TS 以 service_type 入参消费）；仅 Rust 独有的
+    /// `/api/userapp*` 走 rust。与 UserappSplit 的差异点就在 header 判据。
+    #[test]
+    fn ts_first_policy_routes_legacy_to_ts_even_with_userapp_header() {
+        let c = FileServerProxyConfig {
+            listen_port: 60000,
+            rust_upstream_port: 8086,
+            ts_upstream_port: 60001,
+            policy: RoutePolicy::TsFirst,
+        };
+        // Rust 独有接口 → rust
+        for path in [
+            "/api/userapp",
+            "/api/userapp/dev/start",
+            "/api/userapp/files",
+        ] {
+            assert_eq!(
+                c.upstream_port_for(path, None),
+                Upstream::Rust(8086),
+                "{path}"
+            );
+        }
+        // 存量同名接口 → TS；带 userApp 标记也走 TS（差异点/语义铁证）
+        for (path, header) in [
+            ("/api/computer/get-file-list", None),
+            ("/api/computer/get-file-list", Some("userapp")),
+            ("/api/project/content", Some("userapp")),
+            ("/health", None),
+            ("/api/version", None),
+            ("/api/userapplication", None),
+        ] {
+            assert_eq!(
+                c.upstream_port_for(path, header),
+                Upstream::Ts(60001),
+                "{path} {header:?} 应走 TS"
             );
         }
     }
