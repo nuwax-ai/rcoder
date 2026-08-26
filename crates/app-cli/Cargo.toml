@@ -55,6 +55,8 @@ reqwest = { version = "0.13", default-features = false, features = [
     "system-proxy",
 ] }
 semver = "1"
+# supervisord XML-RPC 响应解析（服务托管引擎）
+roxmltree = "0.20"
 # Pingap admin 鉴权头：sha256("{user}:{pass}:{ts}")（pingap plugin/admin.rs 算法，非 Basic Auth）
 sha2 = "0.10"
 # 部署段解压制品包（与 rcoder workspace zip 同版本；deflate 足够覆盖平台制品）

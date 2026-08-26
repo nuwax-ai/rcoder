@@ -69,12 +69,15 @@ pub(super) struct AppState {
 }
 
 impl AppState {
-    /// 按当前 release/部署代构造日志服务（idle → 空服务集）。
+    /// 按当前 release/部署代/引擎布局构造日志服务（idle → 空服务集）。
     fn logs(&self) -> LogService {
         match self.server.release() {
-            Some(release) => {
-                LogService::with_boot_id(release, self.log_dir.clone(), self.server.boot_id())
-            }
+            Some(release) => LogService::with_boot_id(
+                release,
+                self.log_dir.clone(),
+                self.server.boot_id(),
+                self.server.log_layout(),
+            ),
             None => LogService::idle(self.log_dir.clone()),
         }
     }

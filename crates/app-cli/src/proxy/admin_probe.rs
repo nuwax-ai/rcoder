@@ -54,7 +54,7 @@ pub fn admin_port() -> u16 {
     }
 }
 
-/// supervisor 启动 pingap 时注册一次；后续 reload 确认读取。重复注册以首次为准。
+/// 注册 admin 端点；后续 reload 确认读取。重复注册以首次为准。
 pub fn register_admin_endpoint(
     addr: String,
     user: String,
@@ -64,6 +64,22 @@ pub fn register_admin_endpoint(
         addr,
         user,
         password,
+    })
+}
+
+/// 进程级 ensure：首次调用生成随机凭证并注册（loopback admin addr），后续调用
+/// 复用既有端点（凭证生命周期绑定 app-cli 进程——supervisord 托管下 pingap
+/// program 崩溃重启由 supervisord 用同一 spec/凭证拉起，probe 侧无需刷新；
+/// 同进程换代编排也复用，避免 OnceLock 重写限制）。
+pub fn ensure_admin_endpoint() -> &'static AdminEndpoint {
+    ADMIN_ENDPOINT.get_or_init(|| {
+        let user = uuid::Uuid::new_v4().simple().to_string();
+        let password = uuid::Uuid::new_v4().simple().to_string();
+        AdminEndpoint {
+            addr: format!("127.0.0.1:{}", admin_port()),
+            user,
+            password,
+        }
     })
 }
 

@@ -60,9 +60,15 @@ async fn main() -> anyhow::Result<()> {
         Some(app_cli::config::Command::Serve) => {
             return app_cli::server::serve(&args).await;
         }
-        Some(app_cli::config::Command::RunService { service_id: _ }) => {
-            // 第 2 批实现（supervisord 动态 program 的服务包装）
-            anyhow::bail!("run-service: not yet implemented (arriving with supervisord host)");
+        Some(app_cli::config::Command::RunService {
+            release_id,
+            service_id,
+        }) => {
+            if let Err(e) = app_cli::run_service::run(release_id, service_id, &args) {
+                eprintln!("run-service {release_id}/{service_id}: {e:#}");
+                std::process::exit(1);
+            }
+            unreachable!("exec replaced process image");
         }
         None => {}
     }

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 /// UserApp 容器运行时编排器。
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 #[command(
     name = "app-cli",
     version,
@@ -58,7 +58,10 @@ pub enum Command {
 
     /// 单服务进程包装（supervisord 动态 program 的 command）：读 spec → exec 服务本体。
     RunService {
-        /// 服务 ID（对应 release.lock.services[].service_id）。
+        /// 部署代（spec 目录段 = /run/app-cli/specs/{RELEASE_ID}/）。
+        #[arg(value_name = "RELEASE_ID")]
+        release_id: String,
+        /// 服务 ID（对应 release.lock.services[].service_id；pingap 用 "pingap"）。
         #[arg(value_name = "SERVICE_ID")]
         service_id: String,
     },

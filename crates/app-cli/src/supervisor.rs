@@ -21,17 +21,19 @@ use crate::runtime_status::RuntimeStatusService;
 
 /// 编排主入口（legacy 直跑形态：一次性编排，无外部取消源）。
 pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result<()> {
-    run_inner(args, runtime_status, None).await
+    run_inner(args, runtime_status, None, None).await
 }
 
 /// 编排主入口（server 形态：`cancel` 触发 = 优雅停全部子服务后 Ok 返回，
-/// 供热部署切换/容器 SIGTERM 级联停服）。
+/// 供热部署切换/容器 SIGTERM 级联停服；`on_running` 在编排完成进入 supervise
+/// 时发送一次——server 据此把相位切到 Running）。
 pub async fn run_with_cancel(
     args: CliArgs,
     runtime_status: RuntimeStatusService,
     cancel: tokio_util::sync::CancellationToken,
+    on_running: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
-    run_inner(&args, runtime_status, Some(cancel)).await
+    run_inner(&args, runtime_status, Some(cancel), on_running).await
 }
 
 /// 等 SIGTERM 的可复用 future（server 主循环 select 消费；Unix handler 安装
@@ -44,6 +46,7 @@ async fn run_inner(
     args: &CliArgs,
     runtime_status: RuntimeStatusService,
     cancel: Option<tokio_util::sync::CancellationToken>,
+    on_running: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     runtime_status.set_ready(false);
     // 1. 自动发现子项目 + 组装服务清单
@@ -166,6 +169,9 @@ async fn run_inner(
         "✅ all services started, supervising {} process(es)",
         children.len()
     );
+    if let Some(notify) = on_running {
+        let _ = notify.send(());
+    }
     let shutdown_timeout = specs
         .iter()
         .map(|service| service.run.shutdown_timeout_seconds)
@@ -176,7 +182,9 @@ async fn run_inner(
     Ok(())
 }
 
-fn validate_runtime_compatibility(release: &workspace_manifest::ReleaseLock) -> Result<()> {
+pub(crate) fn validate_runtime_compatibility(
+    release: &workspace_manifest::ReleaseLock,
+) -> Result<()> {
     let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
         .context("parse current app-cli version")?;
     let minimum = semver::Version::parse(&release.minimum_app_cli_version)
@@ -215,7 +223,7 @@ fn validate_runtime_compatibility(release: &workspace_manifest::ReleaseLock) -> 
 // ── PG 等待 ──────────────────────────────────────────────────────────────────
 
 /// pg_isready 轮询（最多 30 次 × 2s = 60s），失败不阻断（PG 可能晚于 app-cli 启）。
-async fn wait_for_pg() -> Result<()> {
+pub(crate) async fn wait_for_pg() -> Result<()> {
     // 本地开发逃生开关：前端服务不依赖 PG 时跳过 60s pg_isready 轮询（生产环境不设）。
     if std::env::var_os("APP_CLI_SKIP_PG_WAIT").is_some() {
         warn!("⏭  APP_CLI_SKIP_PG_WAIT set; skipping PostgreSQL readiness check (dev only)");
@@ -252,7 +260,7 @@ async fn wait_for_pg() -> Result<()> {
 ///
 /// 仅在 workspace.manifest `[health].bridge_service` 显式配置时调用(只等那一个后端)。
 /// 默认(不配 bridge)不调本函数 —— app-cli 自给 /ready,不强依赖任何后端。
-async fn wait_for_service_ready(spec: &ServiceSpec) -> Result<()> {
+pub(crate) async fn wait_for_service_ready(spec: &ServiceSpec) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
@@ -344,7 +352,7 @@ fn start_service(
 ///
 /// 捕获 stdout/stderr（不 `Stdio::null()` 丢弃）：成功走 `info!`，失败带 stderr 返回错误，
 /// 便于排障（Fail Fast：暴露而非吞掉）。
-async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
+pub(crate) async fn run_transient(argv: &[String], cwd: &Path) -> Result<()> {
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(cwd)

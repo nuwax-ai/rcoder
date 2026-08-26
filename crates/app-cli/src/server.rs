@@ -23,9 +23,11 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::CliArgs;
+use crate::log::service::LogLayout;
 use crate::manifest::ReleaseLock;
 use crate::runtime_status::RuntimeStatusService;
 use crate::supervisor;
+use crate::supervisord_host::SupervisordHost;
 
 /// server 全局状态（api 层与主循环共享；读多写少，std RwLock 短临界区不跨 await）。
 pub struct ServerState {
@@ -38,6 +40,8 @@ pub struct ServerState {
     deploy_tx: tokio::sync::mpsc::UnboundedSender<DeployRequest>,
     deploy_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<DeployRequest>>,
     cancel: CancellationToken,
+    /// 日志布局（跟随服务托管引擎；serve 探测后设置，legacy 默认 Builtin）。
+    log_layout: RwLock<LogLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +116,7 @@ impl ServerState {
             deploy_tx,
             deploy_rx: tokio::sync::Mutex::new(deploy_rx),
             cancel: CancellationToken::new(),
+            log_layout: RwLock::new(LogLayout::Builtin),
         }
     }
 
@@ -180,6 +185,14 @@ impl ServerState {
     pub(crate) fn runtime_status(&self) -> RuntimeStatusService {
         self.ready.clone()
     }
+
+    pub(crate) fn log_layout(&self) -> LogLayout {
+        *self.log_layout.read().expect("log layout lock")
+    }
+
+    pub(crate) fn set_log_layout(&self, layout: LogLayout) {
+        *self.log_layout.write().expect("log layout lock") = layout;
+    }
 }
 
 /// serve 主入口：api 常驻 + 状态机主循环（阻塞至 SIGTERM）。
@@ -228,10 +241,27 @@ pub async fn serve(args: &CliArgs) -> Result<()> {
         first_request = Some(InitialAction::Existing);
     }
 
-    server_loop(args, &state, first_request).await;
+    // 服务托管引擎探测：supervisord socket 可用（容器形态）→ 动态 program 托管
+    //（per-service 隔离重启）；否则 builtin（裸跑/dev，与 legacy 同引擎）。
+    let host = SupervisordHost::detect().await;
+    state.set_log_layout(if host.is_some() {
+        LogLayout::Supervisord
+    } else {
+        LogLayout::Builtin
+    });
+
+    server_loop(args, &state, host, first_request).await;
     state.cancel.cancel();
     api_handle.abort();
     Ok(())
+}
+
+/// 等待结果三态（两引擎共用）。
+enum Next {
+    /// 回外层等待（Failed/服务退出保持等待，可再部署）。
+    Wait,
+    Redeploy(InitialAction),
+    Exit,
 }
 
 /// 状态机主循环：初始动作（env 部署 / 卷上既有版本直接编排 / 空容器挂 Idle）→
@@ -243,7 +273,12 @@ enum InitialAction {
     Existing,
 }
 
-async fn server_loop(args: &CliArgs, state: &Arc<ServerState>, first: Option<InitialAction>) {
+async fn server_loop(
+    args: &CliArgs,
+    state: &Arc<ServerState>,
+    host: Option<SupervisordHost>,
+    first: Option<InitialAction>,
+) {
     let mut pending: Option<InitialAction> = first;
     loop {
         // 取下一个动作：有待处理的直接用，否则挂 Idle 等受理/信号
@@ -301,29 +336,66 @@ async fn server_loop(args: &CliArgs, state: &Arc<ServerState>, first: Option<Ini
             }
         }
 
-        // 编排 supervise（可被下一次部署请求打断：cancel → 停服 → 回 Deploying）。
-        // rx guard 与 sup 并存：select 三个分支共享，不跨分支持有锁 await（mutex
-        // guard 只在 recv().await 上被 poll，tokio Mutex 语义允许）。
+        // ── 引擎分派：supervisord 托管（编排完成即返回，服务由 supervisord
+        // per-service 重启）与 builtin（编排+supervise 阻塞在同一 task）──
         let mut hot_rx = state.deploy_rx.lock().await;
+        if let Some(host) = &host {
+            let runtime_status = state.runtime_status();
+            if let Err(e) = host
+                .orchestrate(
+                    args,
+                    &state.release().expect("release set"),
+                    &runtime_status,
+                )
+                .await
+            {
+                tracing::error!("server: orchestration failed: {e:#}");
+                state.set_phase(ServerPhase::Failed(format!("orchestrate: {e:#}")));
+                let _ = host.stop_all().await;
+                continue;
+            }
+            state.set_phase(ServerPhase::Running);
+            let next = tokio::select! {
+                maybe = hot_rx.recv() => match maybe {
+                    Some(next_req) => Next::Redeploy(InitialAction::Deploy(next_req)),
+                    None => Next::Exit,
+                },
+                () = crate::supervisor::sigterm_watch() => Next::Exit,
+            };
+            match next {
+                Next::Exit => {
+                    let _ = host.stop_all().await;
+                    return;
+                }
+                Next::Wait => {}
+                Next::Redeploy(action) => {
+                    let _ = host.stop_all().await;
+                    pending = Some(action);
+                }
+            }
+            continue;
+        }
+
+        // builtin：编排 supervise（可被下一次部署请求打断：cancel → 停服 → 回
+        // Deploying）；编排完成进 supervise 时经 on_running 通知 → 相位切 Running。
         let cancel = state.cancel.child_token();
         let runtime_status = state.runtime_status();
+        let (running_tx, mut running_rx) = tokio::sync::oneshot::channel::<()>();
         let mut sup = tokio::spawn(supervisor::run_with_cancel(
             args.clone(),
             runtime_status,
             cancel.clone(),
+            Some(running_tx),
         ));
-        // 单次三路等待：编排结束（失败/服务退出 → Failed 或保持等待，可再部署）/
-        // 热部署（停服 → 回 Deploying）/ SIGTERM（级联停服，进程随容器退出）。
-        enum Next {
-            /// 回外层等待下一个部署请求（Failed/Idle 保持，不自动重编排——失败重试
-            /// 由调用方显式发起，防 migrate 反复失败的死循环）。
-            Wait,
-            Redeploy(InitialAction),
-            Exit,
-        }
+        // 先等编排就绪（Running）；就绪后递进一轮等终态/热部署/信号。
         let next = tokio::select! {
-            outcome = &mut sup => match outcome {
-                // 服务退出/信号/cancel 后 supervise 正常返回：内置引擎不自动重编排
+            result = &mut running_rx => {
+                if result.is_ok() {
+                    state.set_phase(ServerPhase::Running);
+                }
+                tokio::select! {
+                    outcome = &mut sup => match outcome {
+                        // 服务退出/信号/cancel 后 supervise 正常返回：内置引擎不自动重编排
                 //（supervisord 引擎下服务崩溃由 supervisord per-service 重启，不走到这）
                 Ok(Ok(())) => {
                     tracing::warn!("server: orchestration ended (service exit or signal)");
@@ -351,11 +423,29 @@ async fn server_loop(args: &CliArgs, state: &Arc<ServerState>, first: Option<Ini
                 }
                 None => Next::Exit,
             },
+                    () = crate::supervisor::sigterm_watch() => {
+                        cancel.cancel();
+                        let _ = sup.await;
+                        Next::Exit
+                    }
+                }
+            }
+            maybe = hot_rx.recv() => match maybe {
+                Some(next_req) => {
+                    tracing::info!("server: hot deploy received, stopping current services");
+                    cancel.cancel();
+                    if let Err(join) = sup.await {
+                        tracing::error!("server: orchestration task panicked during cancel: {join}");
+                    }
+                    Next::Redeploy(InitialAction::Deploy(next_req))
+                }
+                None => Next::Exit,
+            },
             () = crate::supervisor::sigterm_watch() => {
                 cancel.cancel();
                 let _ = sup.await;
                 Next::Exit
-            }
+            },
         };
         match next {
             Next::Exit => return,

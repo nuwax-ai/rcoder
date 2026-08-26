@@ -22,17 +22,35 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// runtime 日志源为平台注入：supervisor 会为每个服务落盘 runtime.out.log /
 /// runtime.err.log（轮转命名 runtime.out.N.log），即使 manifest 未声明也应可查。
 /// 纯内存变换，不写回 release.lock；用户已声明同 id source 时以用户声明为准，不覆盖。
-fn inject_runtime_log_sources(release: &mut ReleaseLock) {
+fn inject_runtime_log_sources(release: &mut ReleaseLock, layout: LogLayout) {
     for service in &mut release.services {
-        if !service.logs.iter().any(|source| source.id == "runtime") {
-            service.logs.push(LogSource {
-                id: "runtime".into(),
-                glob: "runtime.*.log".into(),
-                format: LogFormat::Text,
-                multiline_start_pattern: None,
-            });
+        if service.logs.iter().any(|source| source.id == "runtime") {
+            continue;
         }
+        let glob = match layout {
+            LogLayout::Builtin => "runtime.*.log".to_string(),
+            // supervisord 单目录合流文件：{svc}.log（glob 相对 services/ 目录）
+            LogLayout::Supervisord => format!("{}.log", service.service_id),
+        };
+        service.logs.push(LogSource {
+            id: "runtime".into(),
+            glob,
+            format: LogFormat::Text,
+            multiline_start_pattern: None,
+        });
     }
+}
+
+/// runtime 日志源（服务 stdout/stderr 落盘）的目录布局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogLayout {
+    /// builtin 引擎：app-cli 亲自 pipe 服务 stdout → `{log_root}/{svc}/runtime.*.log`。
+    #[default]
+    Builtin,
+    /// supervisord 引擎：program stdout 由 supervisord 落盘
+    /// `{log_root}/services/{svc}.log`（redirect_stderr 合流，轮转由 supervisord 管）。
+    /// 用户声明源（应用自写文件，APP_LOG_DIR={log_root}/{svc}）两布局目录一致。
+    Supervisord,
 }
 
 #[derive(Clone)]
@@ -42,6 +60,7 @@ pub struct LogService {
     services: Vec<LockedService>,
     log_root: PathBuf,
     boot_id: String,
+    layout: LogLayout,
 }
 
 #[derive(Clone)]
@@ -58,8 +77,12 @@ struct MatchedLogFile {
 }
 
 impl LogService {
-    pub fn new(mut release: ReleaseLock, log_root: PathBuf) -> Self {
-        inject_runtime_log_sources(&mut release);
+    pub fn new(release: ReleaseLock, log_root: PathBuf) -> Self {
+        Self::with_layout(release, log_root, LogLayout::Builtin)
+    }
+
+    pub fn with_layout(mut release: ReleaseLock, log_root: PathBuf, layout: LogLayout) -> Self {
+        inject_runtime_log_sources(&mut release, layout);
         Self {
             services: release
                 .services
@@ -68,6 +91,7 @@ impl LogService {
                 .collect(),
             log_root,
             boot_id: uuid::Uuid::new_v4().simple().to_string(),
+            layout,
         }
     }
 
@@ -77,13 +101,19 @@ impl LogService {
             services: Vec::new(),
             log_root,
             boot_id: "idle".to_string(),
+            layout: LogLayout::Builtin,
         }
     }
 
     /// server 动态形态：按当前 release + 部署代（=release_id）构造——换代后
     /// 旧 cursor 的 boot_id 不匹配 → cursor_reset 重放（语义与进程代际一致）。
-    pub fn with_boot_id(mut release: ReleaseLock, log_root: PathBuf, boot_id: String) -> Self {
-        inject_runtime_log_sources(&mut release);
+    pub fn with_boot_id(
+        mut release: ReleaseLock,
+        log_root: PathBuf,
+        boot_id: String,
+        layout: LogLayout,
+    ) -> Self {
+        inject_runtime_log_sources(&mut release, layout);
         Self {
             services: release
                 .services
@@ -92,6 +122,7 @@ impl LogService {
                 .collect(),
             log_root,
             boot_id,
+            layout,
         }
     }
 
@@ -286,7 +317,13 @@ impl LogService {
     }
 
     fn match_files(&self, selected: &SelectedSource) -> Result<Vec<MatchedLogFile>> {
-        let directory = self.log_root.join(&selected.service_id);
+        let directory = if self.layout == LogLayout::Supervisord && selected.source.id == "runtime"
+        {
+            self.log_root.join("services")
+        } else {
+            // 用户声明源（应用自写文件）两布局同目录：{log_root}/{svc}/
+            self.log_root.join(&selected.service_id)
+        };
         let matcher = Glob::new(&selected.source.glob)
             .with_context(|| format!("invalid source glob {}", selected.source.glob))?
             .compile_matcher();

@@ -19,8 +19,12 @@ pub mod idle;
 pub mod log;
 pub mod manifest;
 pub mod proxy;
+pub mod run_service;
 pub mod runtime_status;
 pub mod server;
 pub mod supervisor;
+pub mod supervisord_host;
+pub mod svc_spec;
+pub mod xmlrpc;
 
 pub use config::CliArgs;
