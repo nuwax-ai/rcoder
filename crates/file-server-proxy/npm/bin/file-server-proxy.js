@@ -36,6 +36,17 @@ const {
 
 const VERSION = require("../package.json").version;
 
+// 管道消费方提前关闭（`| head`、`| grep -m1` 等）时 stdout 写入 EPIPE——node 默认
+// uncaught crash（退出码 1 + 丑陋栈）；输出被截断是调用方意图，按其静默退出。
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream && typeof stream.on === "function") {
+    stream.on("error", (err) => {
+      if (err.code === "EPIPE") process.exit(0);
+      throw err;
+    });
+  }
+}
+
 const DEFAULT_LISTEN_PORT = 60000;
 const DEFAULT_RUST_PORT = 8086;
 const POLICIES = new Set(["userapp_split", "all_rust", "all_ts"]);
