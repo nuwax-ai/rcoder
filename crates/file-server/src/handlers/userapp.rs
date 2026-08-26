@@ -9,7 +9,7 @@
 //! - `GET  /tasks/{taskId}/logs`：查构建日志（分页，复用 `read_dev_log`）。
 //! - `GET  /tasks/{taskId}/logs/stream`：任务进度 SSE（实时通道，进度事件推送）。
 //! - `POST /tasks/{taskId}/cancel`：取消进行中的编译任务（软取消 + kill 进程组）。
-//! - `GET  /static/{app_id}/{*rest}`：取整体包（复用 `serve_from_root` + COMPUTER_CORS）。
+//! - `GET  /static/{app_id}`：按 app 直下最新构建整体包（复用 `serve_from_root` + COMPUTER_CORS）。
 //!
 //! 详见 `docs/application-management-service-v2-design.md` §5。
 
@@ -95,8 +95,8 @@ pub(crate) struct BuildCreatedData {
     /// 受理时状态（pending——异步任务已创建）
     pub status: String,
     /// 预生成的产物相对路径（`builds/workspace-package-{releaseId}.zip`，release_id
-    /// 创建时即生成）：构建完成前即可确定取包 URL
-    /// `/api/userapp/static/{appId}/{artifactPath}`（实际下载需任务 completed 后）。
+    /// 创建时即生成）——信息字段：标识本次构建的产物位置；实际取包按 app 直下
+    /// `GET /api/userapp/static/{appId}`（服务端选最新产物，无需传路径）。
     pub artifact_path: String,
 }
 

@@ -216,7 +216,7 @@ mod tests {
             document
                 .paths
                 .paths
-                .contains_key("/api/userapp/static/{app_id}/{rest}")
+                .contains_key("/api/userapp/static/{app_id}")
         );
         assert!(
             document

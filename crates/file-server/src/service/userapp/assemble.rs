@@ -17,7 +17,9 @@ use super::manifest::ReleaseLock;
 /// ZipWriter 绑定磁盘文件（组装整体包用）。别名避免在多个 helper 签名里重复长类型。
 type ZipWriterFile = ::zip::ZipWriter<std::fs::File>;
 
-/// 组装整体包。失败时清理半成品，避免静态下载服务返回损坏包。
+/// 组装整体包。写入经 `.part` 临时文件 + rename 原子落盘——最终名只承载完整包
+/// （GET static 按"最新文件名"选包，永不会命中写一半的半成品；中断残留的 `.part`
+/// 不带 `.zip` 后缀，不会被选中，下次构建同 release_id 时截断重写）。
 pub(super) async fn assemble_workspace_package(
     ws: &Path,
     built: &[BuiltProject],
@@ -25,19 +27,21 @@ pub(super) async fn assemble_workspace_package(
     file_name: &str,
 ) -> AppResult<std::path::PathBuf> {
     let out = ws.join(file_name);
+    let part = out.with_extension("zip.part");
     let out_for_task = out.clone();
+    let part_for_task = part.clone();
     let ws_for_task = ws.to_path_buf();
     let built_for_task = built.to_vec();
     let lock_toml = toml::to_string_pretty(release_lock)
         .map_err(|e| AppError::system(format!("serialize release.lock.toml: {e}")))?;
 
     tokio::task::spawn_blocking(move || -> AppResult<()> {
-        // 失败时清理半成品 zip，避免后续 GET static 服务到一个损坏包（404 优于坏包）
+        // 失败时清理半成品 .part（最终名只经 rename 出现，天然无半截包）
         let result = (|| -> AppResult<()> {
-            if let Some(parent) = out_for_task.parent() {
+            if let Some(parent) = part_for_task.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let out_file = std::fs::File::create(&out_for_task)
+            let out_file = std::fs::File::create(&part_for_task)
                 .map_err(|e| AppError::file(format!("create workspace package: {e}")))?;
             let mut zw = ZipWriterFile::new(out_file);
 
@@ -80,12 +84,15 @@ pub(super) async fn assemble_workspace_package(
 
             zw.finish()
                 .map_err(|e| AppError::file(format!("zip finish: {e}")))?;
+            // 原子落盘：rename 同目录内生效，最终名瞬间从无到有完整包
+            std::fs::rename(&part_for_task, &out_for_task)
+                .map_err(|e| AppError::file(format!("finalize workspace package: {e}")))?;
             Ok(())
         })();
         if result.is_err()
-            && let Err(e) = std::fs::remove_file(&out_for_task)
+            && let Err(e) = std::fs::remove_file(&part_for_task)
         {
-            tracing::warn!(error = %e, "cleanup failed assemble output file failed (skipping)");
+            tracing::warn!(error = %e, "cleanup partial artifact failed (skipping)");
         }
         result
     })

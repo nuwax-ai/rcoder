@@ -35,8 +35,8 @@ use tasks::{BuildProgressEvent, BuildTask, BuildTaskId, BuildTaskKind, BuildTask
 
 pub(crate) use tasks::BuildTask as UserappBuildTask;
 
-/// 整体包产物文件名前缀（产物落 `{ws}/builds/` 子目录，见 [`WORKSPACE_BUILDS_DIR`]，
-/// 供 `GET /api/userapp/static/{appId}/{artifactPath}` 下载）。
+/// 整体包产物文件名前缀（产物落 `{ws}/builds/` 子目录，见 [`WORKSPACE_BUILDS_DIR`]；
+/// `GET /api/userapp/static/{appId}` 按 app 直下最新产物）。
 pub const WORKSPACE_PACKAGE_PREFIX: &str = "workspace-package-";
 
 /// workspace 内的构建产物目录（整体包落 `{ws}/builds/`；模板 .gitignore 忽略）。
@@ -53,7 +53,8 @@ pub struct WorkspaceBuildArtifact {
     pub release_id: String,
     /// 产物绝对路径（`{ws}/builds/{file_name}`）。
     pub path: PathBuf,
-    /// 相对 workspace 根的产物路径（`builds/{file_name}`）——static 取包 URL 拼段。
+    /// 相对 workspace 根的产物路径（`builds/{file_name}`）——快照/事件的
+    /// `artifactPath` 信息字段（取包走 `/api/userapp/static/{appId}` 按 app 直下）。
     pub rel_path: String,
     pub file_name: String,
     pub sha256: String,

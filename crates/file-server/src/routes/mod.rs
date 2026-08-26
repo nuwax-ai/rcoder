@@ -206,10 +206,7 @@ fn userapp_router() -> OpenApiRouter<AppState> {
         .routes(routes!(userapp_dev_server::dev_list))
         .routes(routes!(userapp_dev_server::dev_logs))
         .routes(routes!(static_files::serve_userapp))
-        .route(
-            "/static/{app_id}/{*rest}",
-            options(static_files::serve_userapp),
-        )
+        .route("/static/{app_id}", options(static_files::serve_userapp))
 }
 
 #[cfg(test)]
