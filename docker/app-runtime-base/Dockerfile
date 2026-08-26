@@ -125,6 +125,8 @@ RUN curl -sSL https://raw.githubusercontent.com/vicanso/pingap/main/install.sh \
 COPY --from=app-cli-builder /build/crates/app-cli/target/release/app-cli /usr/local/bin/app-cli
 
 # 复制 supervisor 配置 + ENTRYPOINT 启动脚本
+# 主配置显式化：unix socket XML-RPC 控制通道（app-cli server 动态托管用户服务）
+COPY docker/app-runtime-base/supervisord.conf /etc/supervisor/supervisord.conf
 COPY docker/app-runtime-base/app-runtime.supervisor.conf /etc/supervisor/conf.d/app-runtime.conf
 COPY docker/app-runtime-base/start-app.sh /usr/local/bin/start-app.sh
 RUN chmod +x /usr/local/bin/start-app.sh

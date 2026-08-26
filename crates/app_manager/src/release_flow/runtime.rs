@@ -63,6 +63,12 @@ impl AppService {
                     .to_string(),
             )
         })?;
+        // 热部署令牌：创建时注入一次、恒定（后续 update 不覆盖——or_insert 语义
+        // 不适用于此处：update 通道走 build_container_params_from_update 的 live
+        // 回退，token 自然保留）。app-cli server 侧 /v1/deploy 鉴权消费。
+        let mut env = deploy_env.unwrap_or_default();
+        env.entry("APP_CLI_DEPLOY_TOKEN".to_string())
+            .or_insert_with(|| uuid::Uuid::new_v4().simple().to_string());
         let request = CreateAppRequest {
             app_id: Some(rcoder_app_id.to_string()),
             name: name.to_string(),
@@ -73,7 +79,7 @@ impl AppService {
                 .unwrap_or_default(),
             image: Some(image),
             command: None,
-            env: deploy_env,
+            env: Some(env),
             secrets: None,
             resources: None,
             ports: Some(vec![PortConfig {

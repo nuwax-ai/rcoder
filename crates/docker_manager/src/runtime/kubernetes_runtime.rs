@@ -18,7 +18,6 @@ use container_runtime_api::{
 use kube::Config;
 #[cfg(feature = "kubernetes")]
 use kube::api::ListParams;
-use kube::api::Patch;
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
 #[cfg(feature = "kubernetes")]
@@ -454,6 +453,9 @@ impl WorkspaceRuntime for KubernetesRuntime {
         K8sPvcOps::destroy_workspace_pvc(self, identifier, service_type).await
     }
 }
+
+#[cfg(feature = "kubernetes")]
+use kube::api::Patch;
 
 #[cfg(feature = "kubernetes")]
 #[async_trait]

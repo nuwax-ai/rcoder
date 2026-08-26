@@ -47,14 +47,17 @@ PostgreSQL 连接信息:
 EOF
 
 # ============================================================================
-# 2. 注册 app-cli。
-#    Manifest v1 的服务命令只来自 release.lock.toml；镜像 CMD / API command 不再
-#    直接启动单一用户进程，避免绕过多服务编排、健康检查、代理和日志能力。
+# 2. 注册 app-cli server。
+#    常驻 server 形态（serve 子命令）：无论是否部署都在（无部署=Idle 态照常
+#    应答 :3010 探针，空容器不 CrashLoop）；用户服务由 server 经 supervisord
+#    XML-RPC 注册为动态 program（app-svc-* / app-pingap，见 conf.d/50 分片），
+#    per-service 隔离重启。部署三元组 env（APP_DEPLOY_URL 等）与热部署令牌
+#    （APP_CLI_DEPLOY_TOKEN）由 rcoder 注入，此处不干预。
 # ============================================================================
 APP_CONF=/etc/supervisor/conf.d/99-app.conf
 cat > "$APP_CONF" <<EOF
 [program:app-cli]
-command=/usr/local/bin/app-cli
+command=/usr/local/bin/app-cli serve
 directory=/app/code
 priority=40
 autostart=true
@@ -68,7 +71,7 @@ stopwaitsecs=45
 stdout_logfile=/app/logs/app-cli.out.log
 stderr_logfile=/app/logs/app-cli.err.log
 EOF
-echo "🚀 app-cli registered (workspace=/app/code)"
+echo "🚀 app-cli server registered (workspace=/app/code)"
 
 # ============================================================================
 # 3. 启动 supervisor(前台 PID 1)
