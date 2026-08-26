@@ -29,13 +29,13 @@ use garde::Validate;
 use serde::{Deserialize, Serialize};
 use shared_types::HttpResult;
 
-use crate::AppState;
-use crate::error::{AppError, AppResult};
-use crate::extract::deserialize_id_string;
-use crate::extract::{AppJson, AppPath, AppQuery};
-use crate::service::dev_server::log::{ReadDevLogResult, read_dev_log};
+use crate::UserAppState;
 use crate::service::userapp;
 use crate::service::userapp::tasks::{BuildProgressEvent, BuildTaskSnapshot, BuildTaskStatus};
+use file_server::error::{AppError, AppResult};
+use file_server::extract::deserialize_id_string;
+use file_server::extract::{AppJson, AppPath, AppQuery};
+use file_server::service::dev_server::log::{ReadDevLogResult, read_dev_log};
 
 // ── HttpResult 转换层 ──────────────────────────────────────────────────────────
 
@@ -134,12 +134,12 @@ pub(crate) struct ConfirmData {
 pub(crate) struct BuildUserAppBody {
     /// UserApp 标识（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）。
     #[serde(deserialize_with = "deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     pub app_id: String,
     /// 用户 ID（挂载压平契约字段：rcoder ensure builder 时组装宿主树
     /// `dev/{user_id}/{app_id}` 用；file-server 侧仅日志审计，不参与容器内定位）。
     #[serde(deserialize_with = "deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     pub user_id: String,
 }
 
@@ -148,15 +148,15 @@ pub(crate) struct BuildUserAppBody {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImportProjectBody {
     #[serde(deserialize_with = "deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     pub app_id: String,
     /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
     /// 侧仅日志审计，不参与容器内定位）。
     #[serde(deserialize_with = "deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     pub user_id: String,
     /// workspace 内的子项目目录名（模板 zip 的顶层目录；detect/confirm 的定位粒度）
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     pub project_dir: String,
 }
 
@@ -197,17 +197,17 @@ pub(crate) struct StreamQuery {
     tag = "UserApp"
 )]
 pub(crate) async fn build_workspace(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     AppJson(body): AppJson<BuildUserAppBody>,
 ) -> UserAppReply<BuildCreatedData> {
     let result = async {
-        body.validate().map_err(crate::error::from_garde)?;
+        body.validate().map_err(file_server::error::from_garde)?;
         let (task_id, artifact_path) = userapp::start_build_task(
             &state.build_tasks,
-            &state.config,
-            state.build_manager.clone(),
+            &state.fs.config,
+            state.fs.build_manager.clone(),
             body.app_id.clone(),
-            state.config.dev_command_timeout_secs,
+            state.fs.config.dev_command_timeout_secs,
         )
         .await?;
 
@@ -230,7 +230,7 @@ pub(crate) async fn build_workspace(
     tag = "UserApp"
 )]
 pub(crate) async fn get_task(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     AppPath(task_id): AppPath<String>,
 ) -> UserAppReply<BuildTaskSnapshot> {
     let result = async {
@@ -253,7 +253,7 @@ pub(crate) async fn get_task(
     tag = "UserApp"
 )]
 pub(crate) async fn get_task_logs(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     AppPath(task_id): AppPath<String>,
     AppQuery(q): AppQuery<TaskLogsQuery>,
 ) -> UserAppReply<ReadDevLogResult> {
@@ -272,13 +272,19 @@ pub(crate) async fn get_task_logs(
                 shared_types::validate_service_id(service).map_err(|error| {
                     AppError::validation(format!("invalid log service selector: {error}"))
                 })?;
-                crate::path_safety::ensure_within(&ws_root.join("logs"), service).map_err(|_| {
-                    AppError::validation("log service selector escapes workspace logs")
-                })?
+                file_server::path_safety::ensure_within(&ws_root.join("logs"), service).map_err(
+                    |_| AppError::validation("log service selector escapes workspace logs"),
+                )?
             }
             _ => ws_root.join("logs"),
         };
-        read_dev_log(&dir, q.start_index, "main", state.config.log_read_max_bytes).await
+        read_dev_log(
+            &dir,
+            q.start_index,
+            "main",
+            state.fs.config.log_read_max_bytes,
+        )
+        .await
     };
     reply(result.await)
 }
@@ -290,15 +296,22 @@ pub(crate) async fn get_task_logs(
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}/logs/stream",
-    params(("task_id" = String, Path, description = "任务ID"), StreamQuery),
+    params(
+        ("task_id" = String, Path, description = "任务ID"),
+        StreamQuery,
+    ),
     responses(
-        (status = 200, description = "SSE build progress stream", content_type = "text/event-stream"),
-        (status = 404, description = "Task not found"),
+        (
+            status = 200,
+            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 1 递增，断线重连带 `?fromSeq=<最后seq+1>` 回放续传。\n\n事件清单（event 名 → data 载荷）：\n- `stage` → `{'event':'stage','stage':'<阶段名>'}`（任务进入新阶段）\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始编译某服务）\n- `build_ok` → `{'event':'buildOk','service':'...'}`（服务编译成功；注意 data 内 tag 为 camelCase）\n- `build_fail` → `{'event':'buildFail','service':'...','error':'...'}`\n- `log` → `{'event':'log','service':'...','line':'<一行实时日志>'}`\n- `completed`（终态）→ `{'event':'completed','releaseId':'...','sha256':'...','sizeBytes':N,'fileName':'...','artifactPath':'builds/workspace-package-{releaseId}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端用 fromSeq 重连续传\n\n终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
+            content_type = "text/event-stream",
+        ),
+        (status = 404, description = "Task not found（HttpResult JSON，非 SSE）"),
     ),
     tag = "UserApp"
 )]
 pub(crate) async fn stream_task_logs(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     AppPath(task_id): AppPath<String>,
     AppQuery(q): AppQuery<StreamQuery>,
 ) -> Response {
@@ -362,7 +375,7 @@ pub(crate) async fn stream_task_logs(
     tag = "UserApp"
 )]
 pub(crate) async fn cancel_task(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     AppPath(task_id): AppPath<String>,
 ) -> UserAppReply<CancelData> {
     let result = async {
@@ -394,7 +407,7 @@ pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
     task.cancel();
     // 硬 cancel：kill 当前 build 子进程组（run_command_to_log 用 process_group(0)，pid==pgid）。
     if let Some(pid) = task.pid() {
-        let killed = crate::service::dev_server::process::kill_process_group(pid);
+        let killed = file_server::service::dev_server::process::kill_process_group(pid);
         tracing::info!(task_id = %task.id, pid, killed, "build task cancelled, process group signalled");
     } else {
         tracing::info!(task_id = %task.id, "build task cancelled (no active pid; soft cancel via loop check)");
@@ -414,12 +427,13 @@ pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
     tag = "UserApp"
 )]
 pub(crate) async fn detect_project(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     AppJson(body): AppJson<ImportProjectBody>,
 ) -> UserAppReply<DetectData> {
     let result = async {
-        body.validate().map_err(crate::error::from_garde)?;
-        let workspace = crate::workspace::resolve_userapp_dev(&body.app_id, None, &state.config)?;
+        body.validate().map_err(file_server::error::from_garde)?;
+        let workspace =
+            file_server::workspace::resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
         let detection = userapp::import::detect_project(&workspace, &body.project_dir).await?;
         Ok(DetectData { detection })
     };
@@ -435,21 +449,22 @@ pub(crate) async fn detect_project(
     tag = "UserApp"
 )]
 pub(crate) async fn confirm_project(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     AppJson(body): AppJson<ImportProjectBody>,
 ) -> UserAppReply<ConfirmData> {
     let result = async {
-        body.validate().map_err(crate::error::from_garde)?;
+        body.validate().map_err(file_server::error::from_garde)?;
         let app_id = body.app_id.clone();
-        let workspace = crate::workspace::resolve_userapp_dev(&body.app_id, None, &state.config)?;
+        let workspace =
+            file_server::workspace::resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
         let path = userapp::import::confirm_project(&workspace, &body.project_dir).await?;
         // workspace 级 git init（幂等）：本地版本管理 + publish snapshot commit 的前提。
         // 放 handler 层（持有 config.git_enabled / author）；失败仅告警，不阻断 manifest 确认。
-        if state.config.git_enabled
-            && let Err(e) = crate::service::git::write::init_repo(
+        if state.fs.config.git_enabled
+            && let Err(e) = file_server::service::git::write::init_repo(
                 &workspace,
-                &state.config.git_default_author_name,
-                &state.config.git_default_author_email,
+                &state.fs.config.git_default_author_name,
+                &state.fs.config.git_default_author_email,
             )
         {
             tracing::warn!(%app_id, error = %e, "workspace git init failed (non-blocking)");
