@@ -289,11 +289,8 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GiB（upload 压缩包，覆盖全局 50MB）
         .with_state(app_manager_state);
 
-    // UserApp 自动化构建发布(rcoder 侧编排):publish/build + task 查询/SSE/cancel
-    let userapp_publish_routes =
-        crate::userapp_publish::handler::routes().with_state(state.clone());
-
     // userApp 文件域转发层: /api/userapp/{*rest} 通配透传 + create-workspace 显式入口
+    // （build/tasks/static 等构建链接口均在 file-server 侧，经此转发直达 builder）
     let userapp_forward_routes = crate::userapp_forward::routes().with_state(state.clone());
 
     // file-server 分流代理运行时启停 (无 state, 受全局 API key 中间件保护;
@@ -308,7 +305,6 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .merge(proxy_api_routes)
         .merge(agent_mgmt_routes)
         .merge(app_manager_routes)
-        .merge(userapp_publish_routes)
         .merge(userapp_forward_routes)
         .merge(file_server_admin_routes);
 

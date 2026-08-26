@@ -21,7 +21,6 @@
 mod adapter;
 mod backend;
 pub mod config;
-pub mod publish_repo;
 
 #[cfg(feature = "pg")]
 pub mod pg;

@@ -100,11 +100,6 @@ use crate::handler;
         app_manager::handlers::create_database,
         app_manager::handlers::stream_app_logs_v1,
         app_manager::handlers::upload_from_url,
-        crate::userapp_publish::handler::build,
-        crate::userapp_publish::handler::query_tasks,
-        crate::userapp_publish::handler::get_task,
-        crate::userapp_publish::handler::stream_task,
-        crate::userapp_publish::handler::cancel_task,
         crate::userapp_forward::db::align_credentials,
     ),
     components(
@@ -236,13 +231,6 @@ use crate::handler;
             app_manager::models::CreateDatabaseRequest,
             container_runtime_api::AppPortStatus,
             container_runtime_api::AppEventInfo,
-            crate::userapp_publish::models::PublishBody,
-            crate::userapp_publish::models::QueryPublishTasksRequest,
-            crate::userapp_publish::models::PublishTaskFilters,
-            crate::userapp_publish::PublishTaskKind,
-            crate::userapp_publish::PublishTaskStatus,
-            crate::userapp_publish::PublishTaskSnapshot,
-            app_manager::models::PaginatedResponse<crate::userapp_publish::PublishTaskSnapshot>,
         )
     ),
     tags(
@@ -404,18 +392,21 @@ mod openapi_tests {
             // releases 五接口已随 RBD 卷形态删除（部署只走 start+url，见 handbook 10）
             "/api/v1/apps/{app_id}/logs/query",
             "/api/v1/apps/{app_id}/logs/stream",
-            "/api/v1/apps/{app_id}/build",
-            "/api/v1/apps/publish/tasks/query",
-            "/api/v1/apps/publish/tasks/{task_id}/stream",
             "/api/v1/apps/{app_id}/start",
         ] {
             assert!(paths.contains_key(path), "OpenAPI path missing: {path}");
         }
-        // 删除面防复活：releases 路径不得再出现
+        // 删除面防复活：releases + rcoder 侧 publish 任务体系路径不得再出现
+        // （构建链收敛为 file-server /api/userapp/* 接口族，rcoder 不再做发布编排）
         for gone in [
             "/api/v1/apps/{app_id}/releases/prepare",
             "/api/v1/apps/{app_id}/releases/rollback",
             "/api/v1/apps/{app_id}/releases/{release_id}/activate",
+            "/api/v1/apps/{app_id}/build",
+            "/api/v1/apps/publish/tasks/query",
+            "/api/v1/apps/publish/tasks/{task_id}",
+            "/api/v1/apps/publish/tasks/{task_id}/stream",
+            "/api/v1/apps/publish/tasks/{task_id}/cancel",
         ] {
             assert!(!paths.contains_key(gone), "deleted path reappeared: {gone}");
         }
@@ -533,7 +524,7 @@ mod openapi_tests {
     /// 2. 成功响应（2xx/3xx——/userapp/ 文档接口的成功码是 307）必须有非空 description；
     /// 3. 必须声明至少一个 4xx/5xx 错误响应（与 handler 实际错误分支对应）。
     ///
-    /// 新增 UserApp 端点未写注释会在此失败——样板见 userapp_publish/handler.rs。
+    /// 新增 UserApp 端点未写注释会在此失败——样板见 app_manager/handlers（/api/v1/apps 族）。
     #[test]
     fn userapp_openapi_annotations_are_complete() {
         let document = ApiDoc::openapi();
@@ -591,10 +582,10 @@ mod openapi_tests {
             }
         }
         // 覆盖数下限：app_manager 25（create REST 面 + releases 五接口已删）+
-        // userapp_publish 6 端点 + /userapp/ 代理文档 6（开发域 ttyd/vnc/audio/ime
+        // app_manager /api/v1/apps 族 + /userapp/ 代理文档 6（开发域 ttyd/vnc/audio/ime
         // + 运行容器 ttyd/pgweb）+ dbx 两阶段代理文档 2（dev/prod）。
         assert!(
-            checked >= 38,
+            checked >= 33,
             "UserApp OpenAPI 端点覆盖数异常偏少: {checked}"
         );
     }

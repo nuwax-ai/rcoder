@@ -409,16 +409,15 @@ async fn restart_userapp_dev(
                     warn!("[POD_RESTART] clear stale container field failed: app_id={app_id}: {e}");
                 }
             }
-            let recreated =
-                crate::userapp_publish::agent_runner::ensure_userapp_builder(state, &app_id)
-                    .await
-                    .map_err(|e| {
-                        error!("[POD_RESTART] userapp dev recreate failed: app_id={app_id}: {e:#}");
-                        AppError::with_message(
-                            shared_types::error_codes::ERR_BACKEND_ERROR,
-                            format!("userapp dev restart (recreate phase) failed: {e:#}"),
-                        )
-                    })?;
+            let recreated = crate::userapp_builder::ensure_userapp_builder(state, &app_id)
+                .await
+                .map_err(|e| {
+                    error!("[POD_RESTART] userapp dev recreate failed: app_id={app_id}: {e:#}");
+                    AppError::with_message(
+                        shared_types::error_codes::ERR_BACKEND_ERROR,
+                        format!("userapp dev restart (recreate phase) failed: {e:#}"),
+                    )
+                })?;
             (
                 recreated,
                 "UserApp dev 容器已重建（卷保留，数据不丢）".to_string(),

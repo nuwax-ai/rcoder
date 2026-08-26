@@ -260,18 +260,15 @@ async fn keepalive_userapp_dev(
         .is_some_and(|p| p.container_info().is_some());
     drop(registered);
 
-    let (info, created) =
-        crate::userapp_publish::agent_runner::ensure_userapp_builder_probed(state, &app_id)
-            .await
-            .map_err(|e| {
-                error!(
-                    "[POD_KEEPALIVE] ensure userapp dev container failed: app_id={app_id}: {e:#}"
-                );
-                AppError::with_message(
-                    shared_types::error_codes::ERR_BACKEND_ERROR,
-                    format!("ensure userapp dev container failed: {e:#}"),
-                )
-            })?;
+    let (info, created) = crate::userapp_builder::ensure_userapp_builder_probed(state, &app_id)
+        .await
+        .map_err(|e| {
+            error!("[POD_KEEPALIVE] ensure userapp dev container failed: app_id={app_id}: {e:#}");
+            AppError::with_message(
+                shared_types::error_codes::ERR_BACKEND_ERROR,
+                format!("ensure userapp dev container failed: {e:#}"),
+            )
+        })?;
     let current = state
         .update_activity(&app_id)
         .map(|t| t.timestamp_millis().max(0) as u64)

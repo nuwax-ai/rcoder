@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
 use crate::router::AppState;
-use crate::userapp_publish::agent_runner::{dev_file_server_addr, ensure_userapp_builder};
+use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder};
 
 // 分流契约常量（X-Service-Type / X-App-Id / X-App-Stage）定义在 shared_types
 // （rcoder 转发层与容器内 file-server 共用的单一事实源）。

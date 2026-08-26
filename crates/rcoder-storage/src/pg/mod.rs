@@ -13,7 +13,7 @@
 
 // 两业务域目录化(开闭原则:改一个域不碰另一个域的文件):
 // - project_store/  主服务域(ProjectStore 契约的 PG 后端实现全部)
-// - userapp/        UserApp 业务域(publish/activity/metadata)
+// - userapp/        UserApp 业务域(activity/metadata)
 mod project_store;
 
 #[cfg(test)]
@@ -62,7 +62,7 @@ pub struct PgStore {
     /// 在途 op 计数（enqueue 自增 / writer 提交后自减）。
     /// sync 任务用它做排空屏障：归零后读 PG 即包含本副本全部已提交写。
     pending_ops: Arc<AtomicI64>,
-    /// 连接池（activity/publish 等兄弟持久化组件共用）
+    /// 连接池（activity 等兄弟持久化组件共用）
     pool: sqlx::PgPool,
 }
 
@@ -153,7 +153,7 @@ impl PgStore {
         &self.writer
     }
 
-    /// 连接池（activity/publish 等兄弟持久化组件构造用）
+    /// 连接池（activity 等兄弟持久化组件构造用）
     pub fn pool(&self) -> &sqlx::PgPool {
         &self.pool
     }

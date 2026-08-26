@@ -1,0 +1,159 @@
+//! UserAppBuilder 开发容器 ensure 与定位。
+//!
+//! 跨域公共入口：文件转发层（`userapp_forward`）、chat 开发对话、create-workspace、
+//! start/restart 部署链共用——注册表命中复用，miss 创建注册。
+//!
+//! 构建任务本体在 agent-runner 容器内 file-server（`/api/userapp/build` + tasks 查询），
+//! rcoder 不再做发布任务编排（旧 publish 任务体系已随 `/api/v1/apps/publish` 接口族删除）。
+
+mod dev_cleanup;
+
+pub use dev_cleanup::UserappDevResourcesCleanup;
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use container_runtime_api::ContainerCreateParams;
+// 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
+use shared_types::ProjectStore as _;
+use shared_types::{
+    AGENT_FILE_SERVER_PORT, ContainerBasicInfo, ProjectAndContainerInfo, ServiceType,
+    build_backend_addr,
+};
+use tracing::{info, warn};
+
+use crate::router::AppState;
+
+/// UserAppBuilder per-app PVC 默认大小(后续可提到 config.yml 的 user-app-builder.service 段)。
+const DEFAULT_BUILDER_STORAGE_SIZE: &str = "10Gi";
+
+/// 确保 UserAppBuilder 开发容器存在（幂等）并返回容器信息。
+pub(crate) async fn ensure_userapp_builder(
+    state: &AppState,
+    app_id: &str,
+) -> Result<ContainerBasicInfo> {
+    match registered_builder(state, app_id) {
+        Some(info) => Ok(info),
+        None => create_builder_and_register(state, app_id).await,
+    }
+}
+
+/// 探活自愈版 [`ensure_userapp_builder`]：注册命中后连容器 file-server 探活
+/// （3s 超时），失败视为注册脏值（容器被外部删除）→ 清注册重建。
+///
+/// 供低频管理面调用（pod ensure/keepalive）：**先探活再返回**，防"注册表命中
+/// 死容器"幻报就绪；热路径（转发/chat）不适用——它们有自己的节流
+/// 探活（forward 30s 正缓存）或按需自愈语义。
+///
+/// 返回 `(info, created)`——created 由本函数判定（探活失败重建/miss 创建=true，
+/// 复用=false），调用方无需再读注册表推断。
+pub(crate) async fn ensure_userapp_builder_probed(
+    state: &AppState,
+    app_id: &str,
+) -> Result<(ContainerBasicInfo, bool)> {
+    if let Some(info) = registered_builder(state, app_id) {
+        let addr = dev_file_server_addr(state, &info);
+        if probe_file_server(&addr).await {
+            return Ok((info, false));
+        }
+        tracing::warn!(
+            "[USERAPP_ENSURE] dev container probe failed (stale registry?), recreating: app_id={app_id}, addr={addr}"
+        );
+        // 就地清 container 字段而非 remove_project（保 PG project 行与会话映射）
+        state.shutdown_sse_streams_for_project(app_id);
+        if let Some(mut stale) = state.get_project(app_id).map(|p| (*p).clone()) {
+            stale.set_container(None);
+            if let Err(e) = state.insert_project(app_id.to_string(), Arc::new(stale)) {
+                warn!("[USERAPP_ENSURE] clear stale container field failed: app_id={app_id}: {e}");
+            }
+        }
+        let info = create_builder_and_register(state, app_id).await?;
+        return Ok((info, true));
+    }
+    let info = create_builder_and_register(state, app_id).await?;
+    Ok((info, true))
+}
+
+/// 开发容器 file-server 轻量探活（连接失败/非 2xx 均不可用）。
+async fn probe_file_server(addr: &str) -> bool {
+    crate::http_client::shared_client()
+        .get(format!("{addr}/api/version"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// 开发容器 file-server 地址（`http://{host}:60000`）。
+pub(crate) fn dev_file_server_addr(state: &AppState, info: &ContainerBasicInfo) -> String {
+    let host = build_backend_addr(
+        &info.container_name,
+        &info.container_ip,
+        &state.config.app_manager.namespace,
+        &state.cluster_domain,
+    );
+    format!("http://{host}:{AGENT_FILE_SERVER_PORT}")
+}
+
+/// 纯解析:只查 state.projects,无副作用。
+fn registered_builder(state: &AppState, project_id: &str) -> Option<ContainerBasicInfo> {
+    state
+        .projects
+        .get(project_id)
+        .and_then(|p| p.container_info())
+}
+
+/// 创建 UserAppBuilder(幂等)并注册进 state.projects,返回容器信息。
+///
+/// 直接调 `runtime.create_container`(UserAppBuilder → `create_agent_container`),
+/// **不走 ComputerContainerManager**(避免 ComputerAgentRunner 专属的 lazy_migrate)。
+async fn create_builder_and_register(
+    state: &AppState,
+    project_id: &str,
+) -> Result<ContainerBasicInfo> {
+    // user_id 取 app 元数据的 owner（userapp_metadata，create-workspace/start
+    // 注册落库）——挂载压平模型的宿主树 dev/{user_id}/{app_id} 需要真实 user_id；
+    // 查不到（存量 app 元数据缺失）兜底 app_id 兼任（旧布局语义）。
+    let owner_user_id = state
+        .app_service
+        .get_app_owner(project_id)
+        .await
+        .filter(|uid| !uid.trim().is_empty())
+        .unwrap_or_else(|| project_id.to_string());
+    // UserAppBuilder identifier = project_id(app_id 兼任);host_workspace_path K8s 模式不用。
+    let params = ContainerCreateParams::builder()
+        .project_id(project_id.to_string())
+        .user_id(owner_user_id)
+        .host_workspace_path("")
+        .service_type(ServiceType::UserAppBuilder)
+        .storage_size(DEFAULT_BUILDER_STORAGE_SIZE)
+        .build();
+
+    let container_info = state
+        .runtime()
+        .create_container(params)
+        .await
+        .context("ensure UserAppBuilder failed")?;
+
+    // 注册到 state.projects(后续转发/部署据 project_id 查 container_name/ip)。
+    let project_info = if let Some(existing) = state.get_project(project_id) {
+        let mut info = (*existing).clone();
+        info.set_container(Some(container_info.clone()));
+        info
+    } else {
+        let mut info = ProjectAndContainerInfo::new(project_id.to_string());
+        info.set_service_type(Some(ServiceType::UserAppBuilder));
+        info.set_container(Some(container_info.clone()));
+        info
+    };
+    state
+        .insert_project(project_id.to_string(), Arc::new(project_info))
+        .context("register UserAppBuilder to projects failed")?;
+
+    info!(
+        "[USERAPP_BUILDER] UserAppBuilder ensured: app_id={}, container={}, ip={}",
+        project_id, container_info.container_name, container_info.container_ip
+    );
+    Ok(container_info)
+}

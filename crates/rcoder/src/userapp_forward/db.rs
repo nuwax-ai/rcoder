@@ -17,7 +17,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::router::AppState;
-use crate::userapp_publish::agent_runner::{dev_file_server_addr, ensure_userapp_builder};
+use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder};
 use crate::{AppError, HttpResult};
 
 /// 目标环境路径段。

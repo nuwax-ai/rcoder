@@ -6,7 +6,7 @@
 //! - [`db`]：`POST /api/userapp/db/{env}/align-credentials` PG 凭据对齐
 //! - 本模块：路由聚合 + 开发容器 ensure-workspace 公共调用
 //!
-//! 容器定位/创建复用 [`crate::userapp_publish::agent_runner::ensure_userapp_builder`]
+//! 容器定位/创建复用 [`crate::userapp_builder::ensure_userapp_builder`]
 //! （幂等；注册 state.projects 防孤立清理）。
 
 pub(crate) mod db;

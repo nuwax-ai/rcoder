@@ -80,8 +80,6 @@ pub struct AppState {
     pub activity: Arc<app_manager::AppActivityRegistry>,
     /// K8s 集群域名（用于构建 K8s Service FQDN）
     pub cluster_domain: String,
-    /// UserApp 自动化构建发布任务表(rcoder 侧编排:正向调 agent-runner build + 同进程 app_manager 发布)。
-    pub publish_tasks: Arc<crate::userapp_publish::PublishTaskStore>,
 }
 
 impl AppState {
@@ -96,7 +94,6 @@ impl AppState {
         projects: Arc<ProjectStoreBackend>,
         cleanup_rx: tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>,
         activity: Arc<app_manager::AppActivityRegistry>,
-        publish_repo: Option<Arc<dyn rcoder_storage::publish_repo::PublishTaskPersistence>>,
     ) -> anyhow::Result<Self> {
         // 存储后端（Memory/Postgres 枚举）由调用方（main.rs）按配置构造并注入，
         // 以便同一 Arc 实例可同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层。
@@ -126,7 +123,7 @@ impl AppState {
         // UserApp 开发资源回收回调（app purge 时回收 UserAppBuilder 开发容器 +
         // per-app PVC；app_manager 的 runtime 视图无 agent 能力，经契约委托本进程）
         app_service_instance.set_dev_cleanup(Arc::new(
-            crate::userapp_publish::agent_runner::UserappDevResourcesCleanup::new(
+            crate::userapp_builder::UserappDevResourcesCleanup::new(
                 runtime.clone(),
                 projects.clone(),
             ),
@@ -176,10 +173,6 @@ impl AppState {
             app_service,
             activity,
             cluster_domain,
-            publish_tasks: Arc::new(match publish_repo {
-                Some(repo) => crate::userapp_publish::PublishTaskStore::with_repo(repo),
-                None => crate::userapp_publish::PublishTaskStore::new(),
-            }),
         })
     }
 

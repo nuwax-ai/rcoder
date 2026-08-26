@@ -90,46 +90,6 @@ async fn main() -> anyhow::Result<()> {
     // 关停 flush 用的克隆（AppState::new 会 move 主 Arc）
     let projects_for_shutdown = Arc::clone(&projects);
 
-    // M5：PG 模式的 publish 任务行持久化（与 PgStore 共池）。启动恢复：未终态任务
-    // 全部标记 failed（orchestrator 随进程消亡，running 必为僵尸）。
-    #[cfg(feature = "rcoder-pg")]
-    let publish_repo: Option<Arc<dyn rcoder_storage::publish_repo::PublishTaskPersistence>> =
-        if projects.is_postgres() {
-            let ProjectStoreBackend::Postgres(store) = &*projects else {
-                unreachable!("is_postgres 为真的分支");
-            };
-            let publish: Arc<dyn rcoder_storage::publish_repo::PublishTaskPersistence> = Arc::new(
-                rcoder_storage::pg::userapp::publish::PgPublishTaskPersistence::new(
-                    store.pool().clone(),
-                ),
-            );
-            match publish
-                .recover_running(
-                    "rcoder restarted",
-                    &userapp_publish::store::owner_pod_name(),
-                    chrono::Utc::now()
-                        - chrono::Duration::seconds(userapp_publish::store::STALE_TASK_SECS),
-                )
-                .await
-            {
-                Ok(n) if n > 0 => {
-                    tracing::warn!(
-                        "[STORAGE_PG] recovered {n} orphaned publish tasks (marked failed)"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("[STORAGE_PG] publish task recovery failed: {e:#}");
-                    std::process::exit(1);
-                }
-            }
-            Some(publish)
-        } else {
-            None
-        };
-    #[cfg(not(feature = "rcoder-pg"))]
-    let publish_repo: Option<Arc<dyn rcoder_storage::publish_repo::PublishTaskPersistence>> = None;
-
     // 克隆同一 Arc 实例供 Pingora 代理层使用（共享底层数据）。
     // 必须先得到具体类型 Arc<ProjectStoreBackend>，再在其上做 unsized coercion
     // 到 trait object，避免类型推断把 clone 的类型参数反向绑定为 dyn。
@@ -279,7 +239,6 @@ async fn main() -> anyhow::Result<()> {
             projects,
             cleanup_rx,
             activity_registry.clone(),
-            publish_repo,
         )
         .await?,
     );
