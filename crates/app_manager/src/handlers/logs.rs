@@ -1,4 +1,9 @@
-//! 应用日志 handler（sources/query/stream，转发到 app 容器内 app-cli :3010）
+//! 应用日志 handler（sources/query/stream，转发到 app 容器内 app-cli :3010）。
+//!
+//! JSON 转发（sources/query、query）是**透明代理**：透传 app-cli 的状态码 +
+//! 响应体——app-cli 侧统一 `HttpResult` 信封（`{code,message,data,tid,success}`），
+//! 成功失败都以信封直达调用方，code/message 保真不二次包装；仅连接/读取失败
+//! 由 rcoder 生成自己的 HttpResult 错误（AppError 路径）。SSE（stream）豁免信封。
 
 use std::sync::Arc;
 
@@ -7,7 +12,6 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{Response, StatusCode, header};
 use futures_util::TryStreamExt;
-use serde_json::Value;
 use shared_types::{AppError, HttpResult};
 
 use crate::models::{AppLogQueryRequest, AppOperationError};
@@ -21,11 +25,11 @@ use super::AppManagerState;
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = AppLogQueryRequest,
     responses(
-        (status = 200, description = "声明的日志源与匹配文件列表"),
-        (status = 400, description = "app-cli 拒绝请求（参数错误）", body = HttpResult<String>),
+        (status = 200, description = "透明转发 app-cli 的 HttpResult 信封（data=声明的日志源与匹配文件列表）"),
+        (status = 400, description = "app-cli 拒绝请求（参数错误，信封透传）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
-        (status = 500, description = "连接 app-cli / 响应解析失败", body = HttpResult<String>)
+        (status = 500, description = "连接 app-cli / 响应读取失败", body = HttpResult<String>)
     ),
     tag = "应用日志"
 )]
@@ -33,7 +37,7 @@ pub async fn query_app_log_sources(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
     Json(request): Json<AppLogQueryRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response<Body>, AppError> {
     forward_json(&state, &app_id, "/v1/logs/sources/query", request).await
 }
 
@@ -44,11 +48,11 @@ pub async fn query_app_log_sources(
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = AppLogQueryRequest,
     responses(
-        (status = 200, description = "多服务日志快照与 checkpoint 游标"),
-        (status = 400, description = "app-cli 拒绝请求（参数错误）", body = HttpResult<String>),
+        (status = 200, description = "透明转发 app-cli 的 HttpResult 信封（data=多服务日志快照与 checkpoint 游标）"),
+        (status = 400, description = "app-cli 拒绝请求（参数错误，信封透传）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
-        (status = 500, description = "连接 app-cli / 响应解析失败", body = HttpResult<String>)
+        (status = 500, description = "连接 app-cli / 响应读取失败", body = HttpResult<String>)
     ),
     tag = "应用日志"
 )]
@@ -56,7 +60,7 @@ pub async fn query_app_logs(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
     Json(request): Json<AppLogQueryRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response<Body>, AppError> {
     forward_json(&state, &app_id, "/v1/logs/query", request).await
 }
 
@@ -67,7 +71,11 @@ pub async fn query_app_logs(
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body = AppLogQueryRequest,
     responses(
-        (status = 200, description = "SSE 日志流（text/event-stream）"),
+        (
+            status = 200,
+            description = "SSE 实时日志流（转发容器内 app-cli，轮询周期 500ms；首轮带 tail 默认 100 行，后续增量）。每条消息 `event:<事件名>` + `data:<JSON>`，字段 snake_case。\n\n事件清单：\n- `log` → 日志行：`{'service_id':'web','source_id':'runtime','file':'web.log','offset':123,'timestamp':'...','level':'INFO','message':'一行日志'}`（timestamp/level 可空，文本格式日志无时间戳解析）\n- `source_error` → 某日志源读取失败：`{'service_id':'...','source_id':'...','code':'...','message':'...'}`（去重：同源只报一次）\n- `source_recovered` → 失败源恢复：`{'service_id':'...','source_id':'...'}`\n- `cursor_reset` → 游标失效（跨部署代/游标损坏）：`{'message':'...'}`，客户端应丢弃本地 cursor 从 tail 重新开始\n- `checkpoint` → data 为新游标字符串（base64，可直接回填请求体 cursor 断线续传）\n- `heartbeat` → 保活（每 15s），data='{}'\n\n断线续传：把最近一次 checkpoint 的值作为请求体 cursor 重发即可从断点继续；重新部署后游标代际变化会收到 cursor_reset。",
+            content_type = "text/event-stream",
+        ),
         (status = 400, description = "app-cli 拒绝请求（参数错误）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
@@ -108,12 +116,15 @@ pub async fn stream_app_logs_v1(
         .map_err(|error| backend(format!("build SSE response: {error}")).into())
 }
 
+/// 透明代理：透传 app-cli 的状态码 + 响应体（含 Content-Type）。app-cli 侧
+/// 成功失败都是 HttpResult 信封，直达调用方不二次包装；仅连接/读取失败
+/// 走 rcoder 自己的 AppError→HttpResult 错误。
 async fn forward_json(
     state: &Arc<AppManagerState>,
     app_id: &str,
     path: &str,
     request: AppLogQueryRequest,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response<Body>, AppError> {
     let base = runtime_api_base(state, app_id).await?;
     let response = state
         .http_client
@@ -121,22 +132,22 @@ async fn forward_json(
         .json(&request)
         .send()
         .await
-        .map_err(|error| backend(format!("connect to app-cli logs API: {error}")))?;
+        .map_err(|error| {
+            AppError::from(backend(format!("connect to app-cli logs API: {error}")))
+        })?;
     let status = response.status();
-    let value: Value = response
-        .json()
+    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+    let body = response
+        .bytes()
         .await
-        .map_err(|error| backend(format!("parse app-cli logs response: {error}")))?;
-    if status.is_client_error() {
-        return Err(AppOperationError::Validation(format!(
-            "app-cli rejected log query ({status}): {value}"
-        ))
-        .into());
+        .map_err(|error| AppError::from(backend(format!("read app-cli logs response: {error}"))))?;
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
     }
-    if !status.is_success() {
-        return Err(backend(format!("app-cli log query failed ({status}): {value}")).into());
-    }
-    Ok(Json(value))
+    builder
+        .body(Body::from(body))
+        .map_err(|error| AppError::from(backend(format!("build forwarded log response: {error}"))))
 }
 
 async fn runtime_api_base(state: &Arc<AppManagerState>, app_id: &str) -> Result<String, AppError> {
