@@ -20,6 +20,7 @@ pub mod log;
 pub mod manifest;
 pub mod proxy;
 pub mod runtime_status;
+pub mod server;
 pub mod supervisor;
 
 pub use config::CliArgs;

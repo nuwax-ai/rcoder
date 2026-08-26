@@ -19,8 +19,32 @@ use crate::proxy::compiler::compile_and_validate;
 use crate::proxy::pingap::PINGAP_PORT;
 use crate::runtime_status::RuntimeStatusService;
 
-/// 编排主入口。
+/// 编排主入口（legacy 直跑形态：一次性编排，无外部取消源）。
 pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result<()> {
+    run_inner(args, runtime_status, None).await
+}
+
+/// 编排主入口（server 形态：`cancel` 触发 = 优雅停全部子服务后 Ok 返回，
+/// 供热部署切换/容器 SIGTERM 级联停服）。
+pub async fn run_with_cancel(
+    args: CliArgs,
+    runtime_status: RuntimeStatusService,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    run_inner(&args, runtime_status, Some(cancel)).await
+}
+
+/// 等 SIGTERM 的可复用 future（server 主循环 select 消费；Unix handler 安装
+/// 失败降级为永不完成，由其他分支兜底）。
+pub(crate) async fn sigterm_watch() {
+    wait_sigterm().await
+}
+
+async fn run_inner(
+    args: &CliArgs,
+    runtime_status: RuntimeStatusService,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+) -> Result<()> {
     runtime_status.set_ready(false);
     // 1. 自动发现子项目 + 组装服务清单
     let release = manifest::read_release_lock(&args.workspace).context("load release lock")?;
@@ -137,7 +161,7 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
         anyhow::bail!("no service started");
     }
 
-    // 5. supervise（阻塞直到任一退出或信号）
+    // 5. supervise（阻塞直到任一退出或信号或外部取消）
     info!(
         "✅ all services started, supervising {} process(es)",
         children.len()
@@ -147,7 +171,7 @@ pub async fn run(args: &CliArgs, runtime_status: RuntimeStatusService) -> Result
         .map(|service| service.run.shutdown_timeout_seconds)
         .max()
         .unwrap_or(30);
-    supervise(children, shutdown_timeout).await;
+    supervise(children, shutdown_timeout, cancel).await;
     runtime_status.set_ready(false);
     Ok(())
 }
@@ -453,13 +477,26 @@ async fn start_pingap(
 /// 优雅停机宽限期（秒）：先 SIGTERM，超时后 SIGKILL。
 /// 对齐 agent_runner shutdown 惯例，避免 DB/写文件类子进程丢未刷盘数据。
 /// 阻塞直到收到 SIGINT/SIGTERM 或任一子进程退出 → 优雅停止所有子进程 → return。
-async fn supervise(mut children: Vec<(String, Child)>, shutdown_timeout_seconds: u64) {
+async fn supervise(
+    mut children: Vec<(String, Child)>,
+    shutdown_timeout_seconds: u64,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("📡 received SIGINT, shutting down");
         }
         _ = wait_sigterm() => {
             info!("📡 received SIGTERM, shutting down");
+        }
+        // server 形态的外部取消（热部署切换 / 容器停服级联）：与信号同路径优雅停
+        () = async {
+            match cancel {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            info!("📡 orchestration cancelled (hot deploy / shutdown), stopping services");
         }
         exited = poll_any_exit(&mut children) => {
             if let Some(name) = exited {

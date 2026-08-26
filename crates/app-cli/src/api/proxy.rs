@@ -59,7 +59,7 @@ pub(super) async fn reload(
             "reloaded": true,
             "verified": true,
             "configHash": outcome.expected_hash,
-            "releaseId": state.release.release_id,
+            "releaseId": state.server.boot_id(),
             "effectiveConfigPath": outcome.config_path,
         }))),
         Err(error) => {
@@ -105,14 +105,24 @@ pub(super) async fn reload(
 )]
 pub(super) async fn status(State(state): State<AppState>) -> Json<Value> {
     let path = effective_path(&state);
-    Json(json!({
-        "releaseId": state.release.release_id,
-        "mode": format!("{:?}", state.release.pingap.mode).to_ascii_lowercase(),
-        "configured": path.is_file(),
-        "effectiveConfigPath": path,
-        "pingapVersion": state.release.pingap.version,
-        "pingapCommit": state.release.pingap.commit,
-    }))
+    match state.server.release() {
+        Some(release) => Json(json!({
+            "releaseId": release.release_id,
+            "mode": format!("{:?}", release.pingap.mode).to_ascii_lowercase(),
+            "configured": path.is_file(),
+            "effectiveConfigPath": path,
+            "pingapVersion": release.pingap.version,
+            "pingapCommit": release.pingap.commit,
+        })),
+        None => Json(json!({
+            "releaseId": serde_json::Value::Null,
+            "mode": "idle",
+            "configured": false,
+            "effectiveConfigPath": path,
+            "pingapVersion": serde_json::Value::Null,
+            "pingapCommit": serde_json::Value::Null,
+        })),
+    }
 }
 
 #[utoipa::path(
@@ -127,7 +137,7 @@ pub(super) async fn effective_config(
     let path = effective_path(&state);
     tokio::fs::read_to_string(&path)
         .await
-        .map(|content| Json(json!({"releaseId": state.release.release_id, "toml": content})))
+        .map(|content| Json(json!({"releaseId": state.server.boot_id(), "toml": content})))
         .map_err(|error| {
             proxy_error(anyhow::anyhow!(
                 "read effective Pingap config {}: {error}",
@@ -143,8 +153,13 @@ pub(super) async fn effective_config(
     tag = "Runtime Proxy"
 )]
 pub(super) async fn upstreams(State(state): State<AppState>) -> Json<Value> {
+    let services = state
+        .server
+        .release()
+        .map(|r| r.services)
+        .unwrap_or_default();
     Json(json!({
-        "upstreams": state.release.services.iter().filter(|service| service.enabled).map(|service| {
+        "upstreams": services.iter().filter(|service| service.enabled).map(|service| {
             json!({
                 "serviceId": service.service_id,
                 "address": format!("127.0.0.1:{}", service.port),
@@ -155,11 +170,14 @@ pub(super) async fn upstreams(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn compile(state: &AppState) -> anyhow::Result<CompileOutcome> {
+    let release = state.server.release().ok_or_else(|| {
+        anyhow::anyhow!("no release deployed (idle); proxy endpoints unavailable")
+    })?;
     compile_and_validate(
         &state.workspace,
         &runtime_root(),
         &state.pingap_bin,
-        &state.release,
+        &release,
     )
     .await
 }
@@ -187,7 +205,7 @@ async fn rollback_to_previous(target: &Path) -> anyhow::Result<()> {
 
 fn effective_path(state: &AppState) -> PathBuf {
     runtime_root()
-        .join(&state.release.release_id)
+        .join(state.server.boot_id())
         .join("pingap.toml")
 }
 

@@ -54,6 +54,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 形态分派：serve = 常驻 server（容器形态）；无子命令 = legacy 直跑
+    //（file-server dev 链的兼容入口，行为与 serve 演化前一致）。
+    match &args.command {
+        Some(app_cli::config::Command::Serve) => {
+            return app_cli::server::serve(&args).await;
+        }
+        Some(app_cli::config::Command::RunService { service_id: _ }) => {
+            // 第 2 批实现（supervisord 动态 program 的服务包装）
+            anyhow::bail!("run-service: not yet implemented (arriving with supervisord host)");
+        }
+        None => {}
+    }
+
     // idle 判定：未部署（无 release.lock——start 无 url 创建的空容器）→ 最小形态
     // 常驻应答探针（防 kubelet liveness 杀容器），等 start{url} 部署换 Pod 替换本
     // 进程。lock 存在但损坏不进 idle——走下方正常链 fail-fast（supervisord 重试
@@ -63,19 +76,26 @@ async fn main() -> anyhow::Result<()> {
         return Ok(()); // 仅 SIGTERM（容器终止/被替换）到达
     }
 
-    // 管理 API（后台并发跑；supervisor 退出时 abort）
+    // 管理 API（后台并发跑；supervisor 退出时 abort）——legacy 形态以静态
+    // ServerState 承载（读 lock 后直接 Running 相位，readiness 跟随 runtime_status）
+    let legacy_state =
+        std::sync::Arc::new(app_cli::server::ServerState::new(runtime_status.clone()));
+    if let Ok(release) = app_cli::manifest::read_release_lock(&args.workspace) {
+        legacy_state.set_release(release);
+        legacy_state.set_phase(app_cli::server::ServerPhase::Running);
+    }
     let api_addr = args.admin_addr.clone();
     let api_log_dir = args.log_dir.clone();
     let api_workspace = args.workspace.clone();
     let api_pingap_bin = args.pingap_bin.clone();
-    let api_runtime_status = runtime_status.clone();
+    let api_state = legacy_state.clone();
     let api_handle = tokio::spawn(async move {
         if let Err(error) = app_cli::api::serve(
             &api_addr,
             api_workspace,
             api_log_dir,
             api_pingap_bin,
-            api_runtime_status,
+            api_state,
         )
         .await
         {

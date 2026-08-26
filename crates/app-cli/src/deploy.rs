@@ -63,6 +63,28 @@ pub fn deploy_requested() -> bool {
     env_non_empty("APP_DEPLOY_URL").is_some()
 }
 
+/// 从 env 三元组解析部署请求（server 启动时的首次部署判定）。
+/// 契约与 [`run_from_env`] 一致：URL 在而 RELEASE_ID 缺 = 契约违背（Err）。
+pub fn request_from_env() -> Result<crate::server::DeployRequest> {
+    let Some(url) = env_non_empty("APP_DEPLOY_URL") else {
+        bail!("APP_DEPLOY_URL not set");
+    };
+    let Some(release_id) = env_non_empty("APP_RELEASE_ID") else {
+        bail!("APP_DEPLOY_URL is set but APP_RELEASE_ID is missing — deploy env contract violated");
+    };
+    let sha256 = env_non_empty("APP_DEPLOY_SHA256").map(|s| s.to_ascii_lowercase());
+    if let Some(sha) = &sha256
+        && (sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        bail!("APP_DEPLOY_SHA256 must be 64 hex characters, got '{sha}'");
+    }
+    Ok(crate::server::DeployRequest {
+        url,
+        release_id,
+        sha256,
+    })
+}
+
 /// 部署期间的 liveness 端口托管。
 ///
 /// 首次部署时 `/app/code` 尚不存在，api::serve（读 release.lock）无法启动，
@@ -122,7 +144,7 @@ impl LivenessHold {
 }
 
 /// 执行一次部署（marker 未命中时）。
-async fn deploy(
+pub(crate) async fn deploy(
     workspace: &Path,
     url: &str,
     release_id: &str,

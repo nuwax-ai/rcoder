@@ -6,7 +6,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use workspace_manifest::{LockedService, ReleaseLock, load_release_lock};
+pub use workspace_manifest::ReleaseLock;
+use workspace_manifest::{LockedService, load_release_lock};
 
 pub type ServiceSpec = LockedService;
 

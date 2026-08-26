@@ -1,4 +1,8 @@
 //! app-cli internal management API.
+//!
+//! server 形态下 AppState 持 `Arc<ServerState>`：release/phase 随部署动态变化
+//! （idle 态全部日志/代理端点降级，探针按状态机应答）；legacy 直跑形态由
+//! main 构造等价 ServerState（读 lock 后直接 Running 相位），路由面零分叉。
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -14,12 +18,13 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::Stream;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use utoipa::OpenApi;
 
 use crate::log::model::{LogQueryRequest, LogQueryResponse, LogSourceInfo};
 use crate::log::service::LogService;
-use crate::runtime_status::RuntimeStatusService;
+use crate::server::{DeployRequest, ServerState};
 
 mod proxy;
 
@@ -29,6 +34,8 @@ mod proxy;
         query_sources,
         query_logs,
         stream_logs,
+        submit_deploy,
+        deploy_status,
         proxy::validate,
         proxy::reload,
         proxy::status,
@@ -41,22 +48,36 @@ mod proxy;
         LogQueryResponse,
         LogSourceInfo,
         crate::log::model::LogRecord,
-        crate::log::model::SourceError
+        crate::log::model::SourceError,
+        DeployBody,
+        crate::server::DeployStatus,
     )),
     tags(
         (name = "Runtime Logs", description = "Multi-service declared file logs"),
-        (name = "Runtime Proxy", description = "Pingap validation and runtime status")
+        (name = "Runtime Proxy", description = "Pingap validation and runtime status"),
+        (name = "Runtime Deploy", description = "Hot deploy without pod replacement")
     )
 )]
 struct ApiDoc;
 
 #[derive(Clone)]
 pub(super) struct AppState {
-    logs: LogService,
+    server: Arc<ServerState>,
     workspace: PathBuf,
     pingap_bin: PathBuf,
-    release: workspace_manifest::ReleaseLock,
-    runtime_status: RuntimeStatusService,
+    log_dir: PathBuf,
+}
+
+impl AppState {
+    /// 按当前 release/部署代构造日志服务（idle → 空服务集）。
+    fn logs(&self) -> LogService {
+        match self.server.release() {
+            Some(release) => {
+                LogService::with_boot_id(release, self.log_dir.clone(), self.server.boot_id())
+            }
+            None => LogService::idle(self.log_dir.clone()),
+        }
+    }
 }
 
 pub async fn serve(
@@ -64,22 +85,21 @@ pub async fn serve(
     workspace: PathBuf,
     log_dir: PathBuf,
     pingap_bin: PathBuf,
-    runtime_status: RuntimeStatusService,
+    server: Arc<ServerState>,
 ) -> Result<()> {
-    let release = crate::manifest::read_release_lock(&workspace)?;
     let state = AppState {
-        logs: LogService::new(release.clone(), log_dir),
+        server,
         workspace,
         pingap_bin,
-        release,
-        runtime_status,
+        log_dir,
     };
     let app = Router::new()
-        // liveness 探针:app-cli 进程能响应即活(永远 200,不依赖任何后端)。
+        // liveness 探针:app-cli 进程能响应即活(永远 200,不依赖任何后端/部署态)。
         // 后端 app 有 bug 起不来时,liveness 不杀容器,用户可 kubectl exec 进去排查。
         .route("/health", get(health))
-        // readiness 探针:默认 app-cli 初始化完成(与后端无关);配了 [health].bridge_service
-        // 才桥接到那个后端的 readiness_path 深检查(fail→503 摘流,但 liveness 仍 200)。
+        // readiness 探针:状态机驱动——Idle=基础设施就绪(PG/ttyd/dbx supervisord
+        // 自治,空容器可用);Running=编排完成/bridge 桥接;Deploying/Orchestrating/
+        // Failed=503(摘流不杀)。
         .route("/ready", get(ready))
         .route("/openapi.json", get(openapi))
         .route("/v1/logs/sources/query", post(query_sources))
@@ -90,6 +110,8 @@ pub async fn serve(
         .route("/v1/proxy/status", get(proxy::status))
         .route("/v1/proxy/effective-config", get(proxy::effective_config))
         .route("/v1/proxy/upstreams", get(proxy::upstreams))
+        .route("/v1/deploy", post(submit_deploy))
+        .route("/v1/deploy/status", get(deploy_status))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -112,19 +134,120 @@ async fn health() -> (StatusCode, Json<Value>) {
     )
 }
 
-/// `/ready` — readiness 探针:默认 app-cli 初始化完成;配了 bridge_service 时反映桥接后端就绪。
+/// `/ready` — readiness 探针:状态机驱动（见路由注册处注释）。
 async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    if state.runtime_status.is_ready() {
+    let phase = state.server.phase();
+    if state.server.readiness_ok() {
         (
             StatusCode::OK,
-            Json(json!({ "status": "ready", "service": "app-cli" })),
+            Json(json!({ "status": "ready", "phase": phase.as_str() })),
         )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "not_ready", "service": "app-cli" })),
+            Json(json!({ "status": "not_ready", "phase": phase.as_str() })),
         )
     }
+}
+
+/// `POST /v1/deploy` 请求体（热部署）。
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub(super) struct DeployBody {
+    /// 制品包下载 URL（workspace 整体包 zip）。
+    pub url: String,
+    /// 发布版本标记（幂等键）。
+    pub release_id: String,
+    /// 制品 sha256（64 位十六进制小写，可选——给出则下载后校验）。
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// `POST /v1/deploy` — 热部署受理（不换 Pod：PG/ttyd/dbx 不断连，仅应用服务切换）。
+///
+/// 鉴权：请求头 `X-Deploy-Token` 必须等于容器 env `APP_CLI_DEPLOY_TOKEN`
+///（未设置该 env = 端点禁用，403——安全默认）。进行中相位（deploying/
+/// orchestrating）拒绝 409；受理后由 server 主循环执行（下载成功才停旧服务）。
+#[utoipa::path(
+    post,
+    path = "/v1/deploy",
+    request_body = DeployBody,
+    params(("X-Deploy-Token" = String, Header, description = "Deploy token (container env APP_CLI_DEPLOY_TOKEN)")),
+    responses(
+        (status = 202, description = "Deploy accepted; poll /v1/deploy/status"),
+        (status = 403, description = "Token missing/mismatch or endpoint disabled"),
+        (status = 409, description = "Deploy already in progress"),
+        (status = 400, description = "Invalid body (sha256 shape etc.)")
+    ),
+    tag = "Runtime Deploy"
+)]
+async fn submit_deploy(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<DeployBody>,
+) -> (StatusCode, Json<Value>) {
+    match authorize_deploy(&headers) {
+        Ok(()) => {}
+        Err(message) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "code": "DEPLOY_FORBIDDEN", "message": message })),
+            );
+        }
+    }
+    if let Some(sha) = body.sha256.as_deref()
+        && (sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "code": "INVALID_SHA256", "message": "sha256 must be 64 hex characters" }),
+            ),
+        );
+    }
+    match state.server.try_accept_deploy(DeployRequest {
+        url: body.url,
+        release_id: body.release_id,
+        sha256: body.sha256,
+    }) {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "status": "accepted", "poll": "/v1/deploy/status" })),
+        ),
+        Err(message) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "code": "DEPLOY_IN_PROGRESS", "message": message })),
+        ),
+    }
+}
+
+/// 校验部署令牌：env 未配置 = 端点禁用（安全默认——:3010 在 pod 网络内可达）。
+fn authorize_deploy(headers: &axum::http::HeaderMap) -> Result<(), String> {
+    let expected = std::env::var("APP_CLI_DEPLOY_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| "deploy endpoint disabled (APP_CLI_DEPLOY_TOKEN not set)".to_string())?;
+    let provided = headers
+        .get("x-deploy-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if provided == expected {
+        Ok(())
+    } else {
+        Err("deploy token mismatch".to_string())
+    }
+}
+
+/// `GET /v1/deploy/status` — 部署进度快照（phase/release_id/error）。
+#[utoipa::path(
+    get,
+    path = "/v1/deploy/status",
+    responses(
+        (status = 200, body = crate::server::DeployStatus, description = "Current deploy/server phase"),
+    ),
+    tag = "Runtime Deploy"
+)]
+async fn deploy_status(State(state): State<AppState>) -> Json<crate::server::DeployStatus> {
+    Json(state.server.deploy_status())
 }
 
 #[utoipa::path(
@@ -142,7 +265,7 @@ async fn query_sources(
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Json<Vec<LogSourceInfo>>, (StatusCode, Json<Value>)> {
     state
-        .logs
+        .logs()
         .sources(request)
         .await
         .map(Json)
@@ -166,7 +289,7 @@ async fn query_logs(
     let cancelled = Arc::new(AtomicBool::new(false));
     let _cancel_on_drop = CancelOnDrop(cancelled.clone());
     state
-        .logs
+        .logs()
         .query_with_cancel(request, cancelled)
         .await
         .map(Json)
@@ -188,10 +311,13 @@ async fn stream_logs(
     Json(mut request): Json<LogQueryRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
     state
-        .logs
+        .logs()
         .sources(request.clone())
         .await
         .map_err(bad_request)?;
+    // 注意：流生命周期内用同一份 LogService 快照（游标/源清单不因并发部署换代
+    // 而漂移；换代后 cursor boot_id 不匹配 → cursor_reset 事件，客户端自然重放）
+    let logs = state.logs();
     let stream = async_stream::stream! {
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelOnDrop(cancelled.clone());
@@ -202,12 +328,12 @@ async fn stream_logs(
             if !first {
                 request.tail = None;
             }
-            match state.logs.query_with_cancel(request.clone(), cancelled.clone()).await {
+            match logs.query_with_cancel(request.clone(), cancelled.clone()).await {
                 Ok(response) => {
                     if response.cursor_reset {
                         yield Ok(Event::default()
                             .event("cursor_reset")
-                            .data(json!({"message": "cursor belongs to a previous app-cli boot"}).to_string()));
+                            .data(json!({"message": "cursor belongs to a previous deploy generation"}).to_string()));
                     }
                     for record in response.logs {
                         if let Ok(data) = serde_json::to_string(&record) {

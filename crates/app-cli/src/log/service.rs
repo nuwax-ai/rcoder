@@ -37,7 +37,9 @@ fn inject_runtime_log_sources(release: &mut ReleaseLock) {
 
 #[derive(Clone)]
 pub struct LogService {
-    release: ReleaseLock,
+    /// enabled 服务集（已注入 runtime 日志源）。server 动态形态下每次查询按当前
+    /// release 构造；空集 = 未部署（idle）——查询返回空、游标按代际失效。
+    services: Vec<LockedService>,
     log_root: PathBuf,
     boot_id: String,
 }
@@ -59,9 +61,37 @@ impl LogService {
     pub fn new(mut release: ReleaseLock, log_root: PathBuf) -> Self {
         inject_runtime_log_sources(&mut release);
         Self {
-            release,
+            services: release
+                .services
+                .into_iter()
+                .filter(|service| service.enabled)
+                .collect(),
             log_root,
             boot_id: uuid::Uuid::new_v4().simple().to_string(),
+        }
+    }
+
+    /// 未部署（idle）形态：空服务集，boot_id 固定 "idle"（无代际可言）。
+    pub fn idle(log_root: PathBuf) -> Self {
+        Self {
+            services: Vec::new(),
+            log_root,
+            boot_id: "idle".to_string(),
+        }
+    }
+
+    /// server 动态形态：按当前 release + 部署代（=release_id）构造——换代后
+    /// 旧 cursor 的 boot_id 不匹配 → cursor_reset 重放（语义与进程代际一致）。
+    pub fn with_boot_id(mut release: ReleaseLock, log_root: PathBuf, boot_id: String) -> Self {
+        inject_runtime_log_sources(&mut release);
+        Self {
+            services: release
+                .services
+                .into_iter()
+                .filter(|service| service.enabled)
+                .collect(),
+            log_root,
+            boot_id,
         }
     }
 
@@ -187,10 +217,8 @@ impl LogService {
     fn select(&self, request: &LogQueryRequest) -> Result<Vec<SelectedSource>> {
         self.validate_request(request)?;
         let enabled: BTreeMap<&str, &LockedService> = self
-            .release
             .services
             .iter()
-            .filter(|service| service.enabled)
             .map(|service| (service.service_id.as_str(), service))
             .collect();
         let mut selected = Vec::new();
