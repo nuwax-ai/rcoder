@@ -23,7 +23,8 @@ pub use userapp::activity::{
 pub use userapp::build_event::BuildProgressEvent;
 pub use userapp::db_admin::{
     DbAdminError, DbUserUpsertOutcome, UserappDbCreateDatabaseRequest,
-    UserappDbResetPasswordRequest, create_pg_database, upsert_pg_user,
+    UserappDbResetPasswordRequest, create_pg_database, sync_dbx_after_password_change,
+    upsert_pg_user,
 };
 pub use userapp::db_align::{
     AlignCredentialsOutcome, AlignCredentialsRequest, AlignError, CommandOutcome, PgCommandRunner,

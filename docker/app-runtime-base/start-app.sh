@@ -25,7 +25,9 @@ export DBX_PORT="${DBX_PORT:-4224}"
 export DBX_DATA_DIR="${DBX_DATA_DIR:-/home/user/data/dbx}"
 export DBX_STATIC_DIR="${DBX_STATIC_DIR:-/usr/local/share/dbx/static}"
 # 首次播种本地 PG 连接:dbx-web 启动时每次免认证导入 $DBX_DATA_DIR/connections.json
-# (导入后改名 .bak + INSERT OR IGNORE,幂等;字段 snake_case 见 dbx-core ConnectionConfigData)
+# (导入后改名 .bak;fork dbx 为按 id upsert 吸收——文件存在=同步意图,rcoder
+# 改密链 align/reset-password 重写本文件+重启 dbx 即完成 local-pg 凭据同步;
+# 字段 snake_case 见 dbx-core ConnectionConfigData)
 if [ ! -e "$DBX_DATA_DIR/dbx.db" ] && [ ! -e "$DBX_DATA_DIR/connections.json" ]; then
     mkdir -p "$DBX_DATA_DIR"
     printf '[{"id":"local-pg","name":"Local PostgreSQL","db_type":"postgres","host":"127.0.0.1","port":5432,"username":"%s","password":"%s","database":"%s"}]\n' \

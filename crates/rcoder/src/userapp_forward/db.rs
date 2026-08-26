@@ -323,12 +323,39 @@ pub(crate) async fn reset_password(
                     ),
                 ));
             }
+            // dbx 预置连接同步（best-effort）：重置目标即 local-pg 在用账号，
+            // 恒同步；失败仅 warn——密码已生效，不阻断响应。
+            if let Err(e) =
+                shared_types::sync_dbx_after_password_change(&runner, None, &body.new_password)
+                    .await
+            {
+                tracing::warn!(
+                    "[USERAPP_DB_ADMIN] dbx connection sync failed (password already applied): env={}, app_id={}: {e}",
+                    env.as_str(),
+                    body.app_id
+                );
+            }
             "密码已重置".to_string()
         }
         Some(username) => {
             let outcome = shared_types::upsert_pg_user(&runner, username, &body.new_password)
                 .await
                 .map_err(|e| AppError::with_message(db_admin_error_code(&e), e.to_string()))?;
+            // dbx 预置连接同步（best-effort，条件内建）：仅当指定账号 ==
+            // $POSTGRES_USER（local-pg 在用账号）时才动 local-pg；重置业务账号跳过。
+            if let Err(e) = shared_types::sync_dbx_after_password_change(
+                &runner,
+                Some(username),
+                &body.new_password,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "[USERAPP_DB_ADMIN] dbx connection sync failed (password already applied): env={}, app_id={}, username={username}: {e}",
+                    env.as_str(),
+                    body.app_id
+                );
+            }
             match outcome {
                 shared_types::DbUserUpsertOutcome::Created => "账号已创建并设置密码".to_string(),
                 shared_types::DbUserUpsertOutcome::Reset => "密码已重置".to_string(),

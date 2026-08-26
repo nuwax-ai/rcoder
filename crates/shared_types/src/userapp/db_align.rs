@@ -32,6 +32,13 @@ pub struct AlignCredentialsOutcome {
     pub aligned: bool,
     /// 是否执行了重置（false=传入密码本就与当前一致）
     pub reset_performed: bool,
+    /// dbx 预置连接同步命令执行结果（仅重置发生后触发；None=未触发——
+    /// 密码本就一致或指定账号非 local-pg 在用账号，无事可做）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbx_synced: Option<bool>,
+    /// dbx 同步失败详情（成功/未触发为 None；**不含密码**）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbx_error: Option<String>,
 }
 
 /// 命令执行结果（exit_code + 输出；与 runtime exec 的 ExecResult 对齐）。
@@ -101,6 +108,8 @@ pub async fn align_pg_credentials(
         return Ok(AlignCredentialsOutcome {
             aligned: true,
             reset_performed: false,
+            dbx_synced: None,
+            dbx_error: None,
         });
     }
 
@@ -153,9 +162,27 @@ pub async fn align_pg_credentials(
             detail: reverify.stderr.trim().to_string(),
         });
     }
+
+    // 5. dbx 预置连接同步（仅重置发生后）：重写 connections.json + 重启 dbx
+    //    （fork dbx 启动按 id upsert 吸收）。命令条件内建——指定账号非
+    //    local-pg 在用账号（$POSTGRES_USER）时无事可做 exit 0。
+    //    失败不阻断：密码已生效，结果落字段供 Java 感知重试；错误不含密码。
+    let (dbx_synced, dbx_error) = match runner
+        .run(&crate::pg_utils::dbx_sync_cmd_for_user(username, password))
+        .await
+    {
+        Ok(r) if r.exit_code == 0 => (Some(true), None),
+        Ok(r) => (
+            Some(false),
+            Some(format!("exit {}: {}", r.exit_code, r.stderr.trim())),
+        ),
+        Err(e) => (Some(false), Some(e)),
+    };
     Ok(AlignCredentialsOutcome {
         aligned: true,
         reset_performed: true,
+        dbx_synced,
+        dbx_error,
     })
 }
 
@@ -186,6 +213,8 @@ mod tests {
                 "role_exists"
             } else if cmd.contains("ALTER USER") {
                 "alter"
+            } else if cmd.contains("connections.json") {
+                "dbx_sync"
             } else {
                 "unknown"
             }
@@ -213,6 +242,7 @@ mod tests {
         let runner = ScriptedRunner::new(vec![ok(0, "1")]);
         let out = align_pg_credentials(&runner, "app", "pw").await.unwrap();
         assert!(out.aligned && !out.reset_performed);
+        assert_eq!(out.dbx_synced, None, "未重置不触发 dbx 同步");
         assert_eq!(runner.seen.lock().unwrap().len(), 1);
         assert_eq!(
             ScriptedRunner::kind_of(&runner.seen.lock().unwrap()[0]),
@@ -227,9 +257,12 @@ mod tests {
             ok(0, "1"),          // 角色存在
             ok(0, "ALTER USER"), // 重置成功
             ok(0, "1"),          // 复验通过
+            ok(0, ""),           // dbx 同步成功
         ]);
         let out = align_pg_credentials(&runner, "app", "pw").await.unwrap();
         assert!(out.aligned && out.reset_performed);
+        assert_eq!(out.dbx_synced, Some(true));
+        assert!(out.dbx_error.is_none());
         let kinds: Vec<&str> = runner
             .seen
             .lock()
@@ -237,7 +270,29 @@ mod tests {
             .iter()
             .map(|c| ScriptedRunner::kind_of(c))
             .collect();
-        assert_eq!(kinds, vec!["verify", "role_exists", "alter", "verify"]);
+        assert_eq!(
+            kinds,
+            vec!["verify", "role_exists", "alter", "verify", "dbx_sync"]
+        );
+    }
+
+    #[tokio::test]
+    async fn dbx_sync_failure_does_not_block_alignment() {
+        let runner = ScriptedRunner::new(vec![
+            ok(2, ""),           // verify 失败
+            ok(0, "1"),          // 角色存在
+            ok(0, "ALTER USER"), // 重置成功
+            ok(0, "1"),          // 复验通过
+            ok(1, "dbx down"),   // dbx 同步失败
+        ]);
+        let out = align_pg_credentials(&runner, "app", "pw").await.unwrap();
+        assert!(out.aligned && out.reset_performed, "同步失败不阻断对齐");
+        assert_eq!(out.dbx_synced, Some(false));
+        assert!(
+            out.dbx_error.as_deref().unwrap().starts_with("exit 1"),
+            "got: {:?}",
+            out.dbx_error
+        );
     }
 
     #[tokio::test]
