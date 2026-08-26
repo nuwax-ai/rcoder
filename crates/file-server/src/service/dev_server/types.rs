@@ -47,9 +47,11 @@ pub struct StoppedDev {
     pub killed_pids: Vec<KilledPid>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct KilledPid {
+    /// 被杀进程 PID
     pub pid: u32,
+    /// 是否杀灭成功
     pub killed: bool,
 }
 

@@ -333,44 +333,83 @@ impl WorkspaceRuntime for DockerRuntime {
         app_id: &str,
         _service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
-        // Docker 持久卷 = bind 源目录（与 destroy_app_pvc 同源路径）
-        let ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
-            .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
-        Ok(std::path::Path::new(&ws_root)
-            .join(app_id)
-            .to_string_lossy()
-            .to_string())
+        // Docker 持久卷 = userapp-workspace prod 树四目录（uid 维度经通配定位，
+        // 无单一物理路径）——返回展示标识串（与 K8s 返回 PVC 名对称：标识而非
+        // 可 stat 路径；存在性判定由调用方 storage 层用元数据 uid 精确定位）。
+        if app_id.is_empty() || app_id.contains('/') || app_id.contains('\\') {
+            return Err(ContainerRuntimeError::DockerError(format!(
+                "workspace_volume_name: invalid app_id {app_id:?}"
+            )));
+        }
+        Ok(format!(
+            "{}/prod/*/{}",
+            shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+            app_id
+        ))
     }
 
     async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
-        // Docker 无 PVC 概念；destroy = 删除 app workspace 目录（对应 K8s 删 PVC + subvolume）。
-        // 路径同 service 层 get_container_app_dir 的 Docker 分支：RCODER_WORKSPACE_ROOT/{app_id}
-        // （默认 /app/project_workspace/apps，与 AppManagerConfig::get_workspace_root 同源）。
-        // 幂等：目录不存在返回 Ok（对应 K8s PVC 404→Ok）。app_id 经 service 层 validate_app_id
-        // 校验（DNS-1123，无 .. / 路径穿越），join 安全。
-        let ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
-            .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
-        // 防御：service 层 validate_app_id 已保证 DNS-1123，但 runtime 层独立校验，
-        // 拒绝路径分隔符，防止新增未校验调用路径导致任意目录删除。
+        // Docker 无 PVC 概念；destroy = 删 userapp-workspace prod 树该 app 的四目录
+        // （workspace + data/logs/agent-store，对应 K8s 删单卷 PVC）+ 兜底删旧
+        // RCODER_WORKSPACE_ROOT/{app_id} 制品目录（四目录化前的旧布局孤儿）。
+        // uid 不在本层（无元数据视图）→ 通配扫 `prod/*/` 一层按
+        // userapp_prod_subpaths(uid, app_id) 精确匹配四段——与 dev cleanup
+        // （dev_cleanup.rs 通配 dev/*/）完全同款模式，顺带覆盖 uid 兜底不一致的目录。
+        // 幂等：目录不存在返回 Ok（对应 K8s PVC 404→Ok）。app_id 经 service 层
+        // validate_app_id 校验（DNS-1123，无 .. / 路径穿越），join 安全。
         if app_id.is_empty() || app_id.contains('/') || app_id.contains('\\') {
             return Err(ContainerRuntimeError::DockerError(format!(
                 "destroy_app_pvc: invalid app_id {app_id:?}"
             )));
         }
-        let app_dir = std::path::Path::new(&ws_root).join(app_id);
-        if app_dir.exists() {
-            tokio::fs::remove_dir_all(&app_dir).await.map_err(|e| {
+        let prod_root =
+            std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join("prod");
+        if prod_root.is_dir() {
+            let uid_entries = std::fs::read_dir(&prod_root)
+                .map_err(|e| {
+                    ContainerRuntimeError::DockerError(format!(
+                        "destroy_app_pvc: read_dir {}: {e}",
+                        prod_root.display()
+                    ))
+                })?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            for uid in uid_entries {
+                for sub in shared_types::paths::userapp_prod_subpaths(&uid, app_id) {
+                    let dir =
+                        std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+                            .join(&sub);
+                    if dir.exists() {
+                        tokio::fs::remove_dir_all(&dir).await.map_err(|e| {
+                            ContainerRuntimeError::DockerError(format!(
+                                "destroy_app_pvc: remove {}: {}",
+                                dir.display(),
+                                e
+                            ))
+                        })?;
+                        tracing::info!("[Docker] app prod dir destroyed: {}", dir.display());
+                    }
+                }
+            }
+        }
+        // 旧布局兜底：RCODER_WORKSPACE_ROOT/{app_id}（默认 /app/project_workspace/apps，
+        // 与 AppManagerConfig::get_workspace_root 同源）——存量升级后制品目录孤儿。
+        let ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
+            .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
+        let legacy_dir = std::path::Path::new(&ws_root).join(app_id);
+        if legacy_dir.exists() {
+            tokio::fs::remove_dir_all(&legacy_dir).await.map_err(|e| {
                 ContainerRuntimeError::DockerError(format!(
-                    "destroy_app_pvc: remove {}: {}",
-                    app_dir.display(),
+                    "destroy_app_pvc: remove legacy {}: {}",
+                    legacy_dir.display(),
                     e
                 ))
             })?;
-            tracing::info!("[Docker] app workspace destroyed: {}", app_dir.display());
-        } else {
             tracing::info!(
-                "[Docker] app workspace not found, destroy no-op (idempotent): {}",
-                app_dir.display()
+                "[Docker] legacy app workspace destroyed: {}",
+                legacy_dir.display()
             );
         }
         Ok(())

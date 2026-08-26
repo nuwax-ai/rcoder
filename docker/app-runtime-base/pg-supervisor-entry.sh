@@ -3,14 +3,14 @@
 # supervisor `program:postgresql` 入口（由 supervisor 以 user=postgres 运行）。
 # UserApp(app-runtime)版: PG 首次 initdb 异步化 —— 不再在 start-app.sh 同步阻塞,
 # 避免 UserApp 首启慢被 liveness 杀(restartPolicy=Always → CrashLoopBackOff)。
-# PGDATA=/app/data/pg(PVC), 重启不丢; PG_VERSION 存在则跳过 initdb。
+# PGDATA=/home/user/data/pg(挂载卷), 重启不丢; PG_VERSION 存在则跳过 initdb。
 # 幂等 + 末尾 exec postgres 前台(supervisor 直追 PID, 无需 gosu/su)。
 # 对齐 agent-runner 的 pg-supervisor-entry.sh, 仅默认值不同(PGDATA/user/db)。
 # =============================================================================
 set -u
 
 PG_BIN=/usr/lib/postgresql/16/bin
-: "${PGDATA:=/app/data/pg}"
+: "${PGDATA:=/home/user/data/pg}"
 : "${POSTGRES_USER:=app}"
 : "${POSTGRES_PASSWORD:=app}"
 : "${POSTGRES_DB:=app}"

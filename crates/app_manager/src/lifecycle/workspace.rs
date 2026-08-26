@@ -1,10 +1,8 @@
 //! UserApp workspace PVC 就绪（从 service.rs 拆出，extension-impl）。
 //!
 //! RBD 卷形态（rcoder 零挂载）：本模块只剩 PVC ensure——rcoder 不再解析卷路径、
-//! 不再建目录（code/data/logs 由 app-runtime 镜像 + app-cli 部署段在容器内就位），
-//! Docker bind 源目录由 docker runtime 在 create_deployment 前建。
-
-use std::path::PathBuf;
+//! 不再建目录（prod 四目录由 runtime 在 create_deployment 前经 userapp-workspace
+//! 锚点预创建 + 容器内挂载就位）。
 
 use shared_types::ServiceType;
 
@@ -32,18 +30,5 @@ impl AppService {
             .map_err(|e| {
                 AppOperationError::Backend(format!("ensure UserApp PVC (app_id={app_id}): {e}"))
             })
-    }
-
-    /// Docker 模式 bind mount 宿主源路径（K8s per-app PVC 不用此值）。
-    ///
-    /// `workspace_root/{app_id}` 经 HostPathResolver 反解为宿主路径（rcoder 通常也
-    /// 运行在容器内）；解析失败回退原路径。
-    pub(crate) fn get_host_app_dir(&self, app_id: &str) -> PathBuf {
-        let p = PathBuf::from(self.config.get_workspace_root()).join(app_id);
-        if let Some(resolver) = self.path_resolver.get("default") {
-            resolver.resolve_to_host_path(&p).unwrap_or(p)
-        } else {
-            p
-        }
     }
 }

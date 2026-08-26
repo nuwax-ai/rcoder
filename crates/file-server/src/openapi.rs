@@ -306,6 +306,45 @@ mod tests {
         );
     }
 
+    /// 新契约接口响应必须包 HttpResult 信封（`{code, message, data, tid, success}`），
+    /// 防响应形态漂移回裸 JSON / TS 风格。TS 迁移镜像族（userapp_files/app_files、
+    /// execute-command 等 15 个）豁免——保持 nuwax-file-server 原形态。
+    #[test]
+    fn userapp_new_contract_endpoints_are_http_result_enveloped() {
+        let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
+        let paths = value["paths"].as_object().expect("paths object");
+        // 6 个 Rust 新契约接口（TS 无对应端点）：dev 生命周期 5 + ensure-workspace
+        let expected_refs = [
+            ("/api/userapp/dev/start", "HttpResult_UserappDevTaskCreated"),
+            ("/api/userapp/dev/stop", "HttpResult_UserappDevStopped"),
+            (
+                "/api/userapp/dev/restart",
+                "HttpResult_UserappDevTaskCreated",
+            ),
+            ("/api/userapp/dev/list", "HttpResult_UserappDevList"),
+            ("/api/userapp/dev/logs", "HttpResult_ReadDevLogResult"),
+            (
+                "/api/userapp/ensure-workspace",
+                "HttpResult_UserappEnsureWorkspaceData",
+            ),
+        ];
+        for (path, expected_schema) in expected_refs {
+            let operation = paths[path]
+                .get("post")
+                .or_else(|| paths[path].get("get"))
+                .unwrap_or_else(|| panic!("{path} must be registered"));
+            let schema = &operation["responses"]["200"]["content"]["application/json"]["schema"];
+            let reference = schema["$ref"].as_str().unwrap_or_else(|| {
+                panic!("{path} 200 response must $ref a named schema, got: {schema}")
+            });
+            assert_eq!(
+                reference,
+                format!("#/components/schemas/{expected_schema}"),
+                "{path} 响应必须包 HttpResult 信封（data 载荷 = {expected_schema}）"
+            );
+        }
+    }
+
     #[test]
     fn generated_document_round_trips_as_openapi() {
         let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");

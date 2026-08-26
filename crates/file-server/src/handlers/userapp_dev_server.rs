@@ -4,17 +4,23 @@
 //! 进程 key 用 `userapp:{appId}` 前缀与 web 项目的 projectId 空间隔离
 //! （appId≡project_id 同值时, web 项目 workspace 在 project 树 / UserApp 在开发卷,
 //! 同 key 会互踩路径）; 对外响应一律剥前缀回 appId。
+//!
+//! 响应格式：JSON 接口统一 `shared_types::HttpResult` 信封
+//! （`{code, message, data, tid, success}`，经 `UserAppReply` 包装，与 build 域一致）；
+//! data 载荷内不再重复 `success` 字段。
 
 use axum::extract::State;
 use garde::Validate;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::{Value, json};
+use shared_types::HttpResult;
 
+use super::userapp::{UserAppReply, reply};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::service::dev_server::{DevProcess, KilledPid, StoppedDev};
+use crate::service::dev_server::{DevProcess, KilledPid, ReadDevLogResult, StoppedDev};
+use crate::service::userapp::tasks::BuildTaskStatus;
 use crate::workspace::resolve_userapp_dev;
 
 /// 进程表 key（与 web projectId 空间隔离; log_dir 剥前缀）。
@@ -73,29 +79,37 @@ fn default_start_index() -> usize {
     1
 }
 
-#[derive(Serialize)]
+/// dev/stop 响应 data（POST /dev/stop）。
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappDevStopped {
-    pub success: bool,
+    /// 停止结果消息（"Stopped" / "No running process found" / "Partially stopped but continue execution"）
     pub message: String,
+    /// 应用 ID
     pub app_id: String,
+    /// 被停进程 ID（按 appId 定位进程组，无需 pid，恒为 null）
     pub pid: Option<u32>,
+    /// 被杀进程 PID 明细（killed 标记是否杀灭成功）
     pub killed_pids: Vec<KilledPid>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappDevProcess {
+    /// 应用 ID
     pub app_id: String,
+    /// 主进程 PID
     pub pid: u32,
+    /// 服务端口（UserApp workspace 恒为 pingap 9080 统一入口）
     pub port: u16,
+    /// 启动时间（Unix 毫秒）
     pub started_at: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappDevList {
-    pub success: bool,
+    /// 在跑的 UserApp 开发服务列表（不含 web/computer 项目进程）
     pub list: Vec<UserappDevProcess>,
 }
 
@@ -114,27 +128,30 @@ pub(crate) struct UserappDevList {
     post,
     path = "/dev/start",
     request_body = DevOpBody,
-    responses((status = 200, body = UserappDevTaskCreated, description = "启动任务已创建（taskId）")),
+    responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "启动任务已创建（taskId）")),
     tag = "UserApp"
 )]
 pub(crate) async fn dev_start(
     State(state): State<AppState>,
     Json(body): Json<DevOpBody>,
-) -> Result<Json<UserappDevTaskCreated>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
-    tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev start");
-    let task_id = spawn_dev_task(
-        state,
-        &body.app_id,
-        body.base_path.map(|s| s.to_string()),
-        DevTaskAction::Start,
-    )
-    .await?;
-    Ok(Json(UserappDevTaskCreated {
-        app_id: body.app_id,
-        task_id,
-        status: "pending".to_string(),
-    }))
+) -> UserAppReply<UserappDevTaskCreated> {
+    let result = async {
+        body.validate().map_err(crate::error::from_garde)?;
+        tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev start");
+        let task_id = spawn_dev_task(
+            state,
+            &body.app_id,
+            body.base_path.map(|s| s.to_string()),
+            DevTaskAction::Start,
+        )
+        .await?;
+        Ok(UserappDevTaskCreated {
+            app_id: body.app_id,
+            task_id,
+            status: BuildTaskStatus::Pending,
+        })
+    };
+    reply(result.await)
 }
 
 /// `POST /api/userapp/dev/stop`: 停止开发服务（按 appId 定位进程组, 无需 pid）。
@@ -142,7 +159,7 @@ pub(crate) async fn dev_start(
     post,
     path = "/dev/stop",
     request_body = DevOpBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = HttpResult<UserappDevStopped>, description = "停止结果（含进程组杀灭明细）")),
     tag = "UserApp"
 )]
 /// `POST /api/userapp/dev/stop`: 停止开发服务（按 appId 定位进程组, 无需 pid）。
@@ -151,37 +168,39 @@ pub(crate) async fn dev_start(
 pub(crate) async fn dev_stop(
     State(state): State<AppState>,
     Json(body): Json<DevOpBody>,
-) -> Result<Json<UserappDevStopped>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
-    let key = dev_key(&body.app_id);
-    // 先取消在途任务（kill 编译进程组 + 终态 Cancelled），再停服务——
-    // 顺序保证任务侧不会再有 start 动作追上来
-    for task in state.build_tasks.active_tasks_for_app(&body.app_id).await {
-        if !task.is_terminal().await {
-            tracing::info!(
-                app_id = %body.app_id, task_id = %task.id,
-                "[DEV_STOP] cancelling in-flight dev task (stop intent)"
-            );
-            super::userapp::cancel_build_task(&task).await;
+) -> UserAppReply<UserappDevStopped> {
+    let result = async {
+        body.validate().map_err(crate::error::from_garde)?;
+        let key = dev_key(&body.app_id);
+        // 先取消在途任务（kill 编译进程组 + 终态 Cancelled），再停服务——
+        // 顺序保证任务侧不会再有 start 动作追上来
+        for task in state.build_tasks.active_tasks_for_app(&body.app_id).await {
+            if !task.is_terminal().await {
+                tracing::info!(
+                    app_id = %body.app_id, task_id = %task.id,
+                    "[DEV_STOP] cancelling in-flight dev task (stop intent)"
+                );
+                super::userapp::cancel_build_task(&task).await;
+            }
         }
-    }
-    let stopped: StoppedDev = state.dev_server.stop_dev(&key).await?;
-    state.log_cache.delete(&key)?;
-    let all_killed = stopped.killed_pids.iter().all(|k| k.killed);
-    let message = if stopped.killed_pids.is_empty() {
-        "No running process found"
-    } else if all_killed {
-        "Stopped"
-    } else {
-        "Partially stopped but continue execution"
+        let stopped: StoppedDev = state.dev_server.stop_dev(&key).await?;
+        state.log_cache.delete(&key)?;
+        let all_killed = stopped.killed_pids.iter().all(|k| k.killed);
+        let message = if stopped.killed_pids.is_empty() {
+            "No running process found"
+        } else if all_killed {
+            "Stopped"
+        } else {
+            "Partially stopped but continue execution"
+        };
+        Ok(UserappDevStopped {
+            message: message.to_string(),
+            app_id: body.app_id,
+            pid: None,
+            killed_pids: stopped.killed_pids,
+        })
     };
-    Ok(Json(UserappDevStopped {
-        success: true,
-        message: message.to_string(),
-        app_id: body.app_id,
-        pid: None,
-        killed_pids: stopped.killed_pids,
-    }))
+    reply(result.await)
 }
 
 /// `POST /api/userapp/dev/restart`: 异步编译 + 重启（agent 改完代码后的
@@ -194,30 +213,33 @@ pub(crate) async fn dev_stop(
     post,
     path = "/dev/restart",
     request_body = DevOpBody,
-    responses((status = 200, body = UserappDevTaskCreated, description = "重启任务已创建（taskId）")),
+    responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "重启任务已创建（taskId）")),
     tag = "UserApp"
 )]
 pub(crate) async fn dev_restart(
     State(state): State<AppState>,
     Json(body): Json<DevOpBody>,
-) -> Result<Json<UserappDevTaskCreated>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
-    tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev restart");
-    let task_id = spawn_dev_task(
-        state,
-        &body.app_id,
-        body.base_path.map(|s| s.to_string()),
-        DevTaskAction::Restart,
-    )
-    .await?;
-    Ok(Json(UserappDevTaskCreated {
-        app_id: body.app_id,
-        task_id,
-        status: "pending".to_string(),
-    }))
+) -> UserAppReply<UserappDevTaskCreated> {
+    let result = async {
+        body.validate().map_err(crate::error::from_garde)?;
+        tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev restart");
+        let task_id = spawn_dev_task(
+            state,
+            &body.app_id,
+            body.base_path.map(|s| s.to_string()),
+            DevTaskAction::Restart,
+        )
+        .await?;
+        Ok(UserappDevTaskCreated {
+            app_id: body.app_id,
+            task_id,
+            status: BuildTaskStatus::Pending,
+        })
+    };
+    reply(result.await)
 }
 
-/// dev 异步任务受理响应（POST /dev/start、/dev/restart——编译+启停）。
+/// dev 异步任务受理响应 data（POST /dev/start、/dev/restart——编译+启停）。
 /// camelCase 对齐 BuildCreatedData（Java 同一消费面）。
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -226,8 +248,9 @@ pub(crate) struct UserappDevTaskCreated {
     pub app_id: String,
     /// 异步任务 ID（轮询 /api/userapp/tasks/{taskId}、SSE /api/userapp/tasks/{taskId}/logs/stream）
     pub task_id: String,
-    /// 受理时状态（pending——后台任务已创建）
-    pub status: String,
+    /// 受理时状态（恒为 pending——后台任务已创建；与 /tasks/{taskId} 轮询共用
+    /// BuildTaskStatus 状态机，序列化值 "pending"）
+    pub status: BuildTaskStatus,
 }
 
 /// dev 任务的后置动作（编译成功后执行哪个生命周期操作）。
@@ -371,28 +394,26 @@ async fn spawn_dev_task(
 #[utoipa::path(
     get,
     path = "/dev/list",
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = HttpResult<UserappDevList>, description = "在跑的 UserApp 开发服务列表")),
     tag = "UserApp"
 )]
-pub(crate) async fn dev_list(
-    State(state): State<AppState>,
-) -> Result<Json<UserappDevList>, AppError> {
-    let processes: Vec<DevProcess> = state.dev_server.list_dev()?;
-    let list = processes
-        .into_iter()
-        .filter_map(|p| {
-            app_id_of_key(&p.project_id).map(|app_id| UserappDevProcess {
-                app_id: app_id.to_string(),
-                pid: p.pid,
-                port: p.port,
-                started_at: p.started_at,
+pub(crate) async fn dev_list(State(state): State<AppState>) -> UserAppReply<UserappDevList> {
+    let result = async {
+        let processes: Vec<DevProcess> = state.dev_server.list_dev()?;
+        let list = processes
+            .into_iter()
+            .filter_map(|p| {
+                app_id_of_key(&p.project_id).map(|app_id| UserappDevProcess {
+                    app_id: app_id.to_string(),
+                    pid: p.pid,
+                    port: p.port,
+                    started_at: p.started_at,
+                })
             })
-        })
-        .collect();
-    Ok(Json(UserappDevList {
-        success: true,
-        list,
-    }))
+            .collect();
+        Ok(UserappDevList { list })
+    };
+    reply(result.await)
 }
 
 /// `GET /api/userapp/dev/logs`: 开发服务日志（main=当日汇总 / temp=最新一次）。
@@ -400,13 +421,13 @@ pub(crate) async fn dev_list(
     get,
     path = "/dev/logs",
     params(DevLogsQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "开发服务日志分页")),
     tag = "UserApp"
 )]
 pub(crate) async fn dev_logs(
     State(state): State<AppState>,
     Query(q): Query<DevLogsQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> UserAppReply<ReadDevLogResult> {
     tracing::debug!(app_id = %q.app_id, user_id = %q.user_id, "userapp dev logs");
     let result = state
         .dev_server
@@ -415,14 +436,8 @@ pub(crate) async fn dev_logs(
             q.start_index,
             q.log_type.as_deref().unwrap_or("temp"),
         )
-        .await?;
-    let mut resp = json!({ "success": true, "appId": q.app_id });
-    if let (Some(map), Some(Value::Object(extra))) =
-        (resp.as_object_mut(), serde_json::to_value(&result).ok())
-    {
-        map.extend(extra);
-    }
-    Ok(Json(resp))
+        .await;
+    reply(result)
 }
 
 #[cfg(test)]

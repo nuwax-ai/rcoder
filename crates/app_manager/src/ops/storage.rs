@@ -60,7 +60,10 @@ impl crate::service::AppService {
                 .contains(&app_id.to_string());
             Ok((exists, path))
         } else {
-            let exists = tokio::fs::metadata(&path).await.is_ok();
+            // Docker：workspace_volume_name 返回的是展示标识（prod 树通配串，
+            // 非可 stat 路径）——存在性用元数据 uid 精确定位 prod 树 workspace 段。
+            let ws_dir = self.app_prod_dirs(app_id)[0].clone();
+            let exists = tokio::fs::metadata(&ws_dir).await.is_ok();
             Ok((exists, path))
         }
     }
@@ -82,26 +85,28 @@ impl crate::service::AppService {
         }
     }
 
-    /// per-app 数据卷的 rcoder 容器内锚点路径（`{锚点}/prod/{user_id}/data/{app_id}`，
-    /// bind 双向同步宿主——Docker 模式 clear/destroy 的数据目录定位）。
-    /// owner user_id 查元数据，缺失/空白兜底 app_id（与 docker_app_runtime 组装
-    /// bind 源的兜底一致）。
-    fn app_data_dir(&self, app_id: &str) -> std::path::PathBuf {
+    /// per-app prod 四目录的 rcoder 容器内锚点路径（`{锚点}/prod/{user_id}/` 下
+    /// `{app_id}/ + data/{app_id}/ + logs/{app_id}/ + agent-store/{app_id}/`，bind
+    /// 双向同步宿主——Docker 模式 clear 的四目录定位；布局单一事实源
+    /// [`shared_types::paths::userapp_prod_subpaths`]）。owner user_id 查元数据，
+    /// 缺失/空白兜底 app_id（与 docker_app_runtime 组装 bind 源的兜底一致）。
+    fn app_prod_dirs(&self, app_id: &str) -> [std::path::PathBuf; 4] {
         let uid = self
             .metadata
             .lookup(app_id)
             .and_then(|r| r.user_id)
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| app_id.to_string());
-        std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
-            .join(shared_types::paths::userapp_prod_data_subpath(&uid, app_id))
+        shared_types::paths::userapp_prod_subpaths(&uid, app_id).map(|sub| {
+            std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(sub)
+        })
     }
 
     /// 清空应用持久存储内容（数据语义；卷对象去留按运行时能力）。
     /// 安全约束：仅当 app 计算资源已不存在时允许（否则 INVALID_STATE）。
     /// - K8s/RBD：rcoder 不可挂载无法逐文件清 → 删 PVC（下次 create 自动重建空卷，
     ///   数据清空语义等价；handbook 注明）。
-    /// - Docker：清 bind 目录内容（留目录本身，可恢复）。
+    /// - Docker：清 prod 四目录内容（留目录本身，可恢复）。
     pub async fn clear_app_storage(&self, app_id: &str) -> AppResult<()> {
         validate_app_id(app_id)?;
         self.ensure_app_deleted(app_id, "clearing storage").await?;
@@ -116,21 +121,15 @@ impl crate::service::AppService {
             );
             return Ok(());
         }
-        let app_dir = self.get_host_app_dir(app_id);
-        if app_dir.exists()
-            && let Err(e) = Self::purge_dir_contents(&app_dir).await
-        {
-            return Err(map_io_error("failed to clear storage", e, false));
-        }
-        // per-app 数据卷目录（prod/{user_id}/data/{app_id}——PG/dbx 持久数据）：
-        // "清空持久数据"语义的主体。K8s 分支 destroy_app_pvc 已删 data PVC（上 方
-        // return），此处仅 Docker。owner 查元数据，缺失兜底 app_id（与 bind 源
-        // 组装的兜底一致；元数据行在 clear 场景恒保留）。
-        let data_dir = self.app_data_dir(app_id);
-        if data_dir.exists()
-            && let Err(e) = Self::purge_dir_contents(&data_dir).await
-        {
-            return Err(map_io_error("failed to clear app data", e, false));
+        // prod 四目录（workspace 发布制品 + PG/dbx 数据 + 日志 + agent-store）：
+        // "清空持久存储"语义的主体；owner 查元数据（元数据行在 clear 场景恒保留），
+        // 缺失兜底 app_id（与 bind 源组装的兜底一致）。
+        for dir in self.app_prod_dirs(app_id) {
+            if dir.exists()
+                && let Err(e) = Self::purge_dir_contents(&dir).await
+            {
+                return Err(map_io_error("failed to clear app storage", e, false));
+            }
         }
         info!("[APP] app storage cleared: {}", app_id);
         Ok(())
@@ -169,24 +168,16 @@ impl crate::service::AppService {
             )));
         }
         self.ensure_app_deleted(app_id, "destroying PVC").await?;
+        // K8s：删单卷 PVC（destroy 内兜底回收存量 `-data` PVC）。
+        // Docker：destroy_app_pvc 删 prod 树该 app 四目录（通配 prod/*/ 一层，
+        // 与 dev cleanup 同款模式）+ 旧 RCODER_WORKSPACE_ROOT 制品目录兜底——
+        // 双形态"删持久卷"语义在此收口，本层不再单独删目录（防双删漂移）。
+        // 失败不吞：destroy 是显式高危操作（confirm=app_id），残留即孤儿；
+        // 失败时外层 record_deleted 未执行，幂等重试收敛。
         self.runtime
             .destroy_app_pvc(app_id)
             .await
             .map_err(|e| map_runtime_error("destroy_app_pvc failed", e))?;
-        // Docker 模式追加：per-app 数据卷 bind 目录（{userapp 锚点}/prod/{user_id}/
-        // data/{app_id}）——对应 K8s destroy_app_pvc 删 `-data` PVC（已含，此分支
-        // 不执行）。硬错不吞：destroy 是显式高危操作（confirm=app_id），残留即孤儿；
-        // 失败时外层 record_deleted 未执行，幂等重试收敛。user_id 查元数据（行此时尚
-        // 未删），缺失兜底 app_id（与 bind 源组装的兜底一致）。
-        if !shared_types::is_kubernetes_runtime() {
-            let data_dir = self.app_data_dir(app_id);
-            if data_dir.exists() {
-                tokio::fs::remove_dir_all(&data_dir)
-                    .await
-                    .map_err(|e| map_io_error("destroy app data dir failed", e, false))?;
-                info!("[APP] app data dir destroyed: {}", data_dir.display());
-            }
-        }
         // UserApp 开发资源回收（UserAppBuilder 开发容器 + per-app 开发 PVC）：
         // 经 UserappDevCleanup 契约回调宿主（app_manager 的 runtime 视图无 agent
         // 能力，ISP 分层）；best-effort——失败仅 warn 不阻断 purge，下次幂等收敛。

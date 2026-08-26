@@ -28,7 +28,6 @@ use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder};
 // （rcoder 转发层与容器内 file-server 共用的单一事实源）。
 pub use shared_types::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER,
-    SERVICE_TYPE_USERAPP,
 };
 
 /// 逐跳头静态表：转发前剥离（reqwest/上游自行生成；host 逐跳重写）。
@@ -390,7 +389,7 @@ pub(crate) async fn computer_intercept(
         .headers()
         .get(SERVICE_TYPE_HEADER)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim() == SERVICE_TYPE_USERAPP);
+        .is_some_and(shared_types::is_userapp_service_type_value);
     if !is_userapp {
         return next.run(req).await;
     }

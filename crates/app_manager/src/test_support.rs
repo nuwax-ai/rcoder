@@ -7,8 +7,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use docker_manager::path::HostPathResolver;
-use moka::sync::Cache;
 
 use container_runtime_api::{
     ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ContainerSpecSnapshot,
@@ -179,14 +177,11 @@ pub(crate) fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime>) -> 
         access_mode: AppAccessMode::Docker,
         ..AppManagerConfig::default()
     };
-    let path_resolver: Cache<String, Arc<HostPathResolver>> =
-        Cache::builder().max_capacity(1).build();
     AppService {
         config,
         runtime: runtime as Arc<dyn UserAppRuntime>,
         activity: Arc::new(AppActivityRegistry::new(Duration::from_secs(300))),
         pingora: None,
-        path_resolver,
         pingora_ports: DashMap::new(),
         release_locks: DashMap::new(),
         metadata: crate::runtime::metadata::AppMetadataStore::default(),

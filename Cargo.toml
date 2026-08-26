@@ -261,6 +261,7 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 utoipa = { version = "5.5", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-axum = "0.2"
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 
 ringbuf = "0.5"

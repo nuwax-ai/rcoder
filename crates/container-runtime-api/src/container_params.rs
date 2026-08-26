@@ -15,8 +15,6 @@ pub struct ContainerCreateParams {
     pub project_id: Option<String>,
     /// User identifier (used as container name base for ComputerAgentRunner)
     pub user_id: Option<String>,
-    /// Workspace path on host
-    pub host_workspace_path: String,
     /// Service type determining container purpose
     pub service_type: ServiceType,
     /// Optional resource constraints
@@ -67,7 +65,6 @@ impl ContainerCreateParams {
 pub struct ContainerCreateParamsBuilder {
     project_id: Option<String>,
     user_id: Option<String>,
-    host_workspace_path: Option<String>,
     service_type: Option<ServiceType>,
     resource_limits: Option<ServiceResourceLimits>,
     pod_id: Option<String>,
@@ -95,11 +92,6 @@ impl ContainerCreateParamsBuilder {
 
     pub fn user_id(mut self, user_id: impl Into<String>) -> Self {
         self.user_id = Some(user_id.into());
-        self
-    }
-
-    pub fn host_workspace_path(mut self, host_workspace_path: impl Into<String>) -> Self {
-        self.host_workspace_path = Some(host_workspace_path.into());
         self
     }
 
@@ -192,7 +184,6 @@ impl ContainerCreateParamsBuilder {
         ContainerCreateParams {
             project_id: self.project_id,
             user_id: self.user_id,
-            host_workspace_path: self.host_workspace_path.unwrap_or_default(),
             service_type: self.service_type.unwrap_or(ServiceType::WebAgentRunner),
             resource_limits: self.resource_limits,
             pod_id: self.pod_id,

@@ -69,11 +69,11 @@ pub(crate) trait K8sPvcOps {
         storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()>;
 
-    /// UserApp 生产运行容器的 per-app 数据卷名。
+    /// UserApp 生产运行容器历史第二块数据卷（`-data` 后缀）的卷名。
     ///
-    /// 格式：`{container_prefix}-{sanitized_id}-data`（与 workspace 卷同 prefix
-    /// 不同后缀）。承载 PG/dbx 持久数据（挂 `/home/user/{app_id}`），与发布卷
-    /// （`-workspace`，挂 `/app`）解耦——重置发布卷不再连数据一起清。
+    /// 格式：`{container_prefix}-{sanitized_id}-data`。**已随单卷四 subPath 化退役**
+    /// （prod 卷内 `{app_id}/ data/ logs/ agent-store/` 四目录平级，挂载在
+    /// workspace 卷上）——仅 destroy_app_pvc 兜底回收存量旧 PVC 时使用。
     fn app_data_pvc_name(&self, app_id: &str) -> ContainerRuntimeResult<String>;
 
     /// 确保 UserApp per-app 数据卷存在，不存在则创建。

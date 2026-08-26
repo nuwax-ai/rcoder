@@ -50,25 +50,6 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         })?;
         let container_name = app_deployment_name(&app_id);
 
-        // bind 源目录先建（原 app_manager create_app_dirs 职责随 RBD 卷形态下沉到
-        // runtime）。**必须 mkdir 容器内路径**（RCODER_WORKSPACE_ROOT/{app_id}，经
-        // compose bind 双向同步宿主，daemon 即刻可见）——直接 mkdir 宿主绝对路径
-        // 在 rcoder 容器内执行会落 OrbStack VM fs（非宿主共享），daemon 看不见 →
-        // bind 源缺失 400。
-        if !params.host_workspace_path.is_empty() {
-            let container_ws_root = std::env::var("RCODER_WORKSPACE_ROOT")
-                .unwrap_or_else(|_| "/app/project_workspace/apps".to_string());
-            let container_ws = std::path::Path::new(&container_ws_root).join(&app_id);
-            tokio::fs::create_dir_all(&container_ws)
-                .await
-                .map_err(|e| {
-                    ContainerRuntimeError::DockerError(format!(
-                        "create workspace dir {}: {e}",
-                        container_ws.display()
-                    ))
-                })?;
-        }
-
         // env（env + secrets 合并；Docker 模式无 Secret 概念）
         let mut env_map: HashMap<String, String> = HashMap::new();
         if let Some(e) = &params.env {
@@ -77,14 +58,26 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         if let Some(s) = &params.secrets {
             env_map.extend(s.clone());
         }
-        // PG/dbx 数据目录 env（与数据卷挂载点 /home/user/{app_id} 绑定，平台注入
-        // 覆盖用户 env——否则落旧默认 /app/data 与发布卷耦合）。start-app.sh 均为
-        // ${VAR:-...} 覆盖模式。
-        env_map.insert("PGDATA".to_string(), format!("/home/user/{app_id}/pg"));
+        // 平台注入 env（与压平挂载点绑定，覆盖用户 env——否则落镜像旧默认
+        // /app/data 与发布卷耦合）。start-app.sh 均为 ${VAR:-...} 覆盖模式；
+        // USERAPP_WORKSPACE_DIR 由镜像 supervisor conf 经 %(ENV_…)s 透传
+        // （本地直跑无此 env 时镜像缺省回退 /app）。
+        env_map.insert(
+            "PGDATA".to_string(),
+            shared_types::paths::USERAPP_DEV_PGDATA.to_string(),
+        );
         env_map.insert(
             "DBX_DATA_DIR".to_string(),
-            format!("/home/user/{app_id}/dbx"),
+            shared_types::paths::USERAPP_DEV_DBX_DATA.to_string(),
         );
+        env_map.insert(
+            "USERAPP_WORKSPACE_DIR".to_string(),
+            format!("{}/{}", shared_types::paths::USERAPP_DEV_HOME, app_id),
+        );
+        // APP_ID：镜像 supervisor conf 经 %(ENV_APP_ID)s 消费（file-server 的
+        // USERAPP_SINGLE_APP_ID），对齐 K8s 注入——Docker 缺失会让 supervisord
+        // 插值失败直接拒启
+        env_map.insert("APP_ID".to_string(), app_id.to_string());
         let env_vec: Vec<String> = env_map.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         // labels（供对账/list 过滤）
@@ -129,48 +122,45 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             }
         }
 
-        // workspace bind mount（host_workspace_path → /app）+ per-app 数据卷 bind
-        // （宿主 {userapp 根}/prod/{user_id}/data/{app_id} → /home/user/{app_id}，
-        // PG/dbx 持久数据与发布卷解耦；env PGDATA/DBX_DATA_DIR 指向其内）。
-        // 数据卷锚点反解失败 fail fast——静默降级 = PG 落容器 overlay，容器删除即丢库
+        // ── UserApp prod 四目录压平挂载（与 dev builder 完全同构）─────────────────
+        //
+        // 宿主 {userapp 根}/prod/{user_id}/ 下 `{app_id}/ + data/{app_id}/ +
+        // logs/{app_id}/ + agent-store/{app_id}/`（布局单一事实源
+        // [`shared_types::paths::userapp_prod_subpaths`]）→ 容器内
+        // /home/user/{app_id}（workspace=发布代码根）、/home/user/data、
+        // /home/user/logs、/home/user/.agent-store——app 间数据完全隔离。
+        // 锚点反解失败 fail fast——静默降级 = PG/制品落容器 overlay，容器删除即丢
         // （与 builder 卷同款 fail-fast 语义）。
-        let mut mounts_vec: Vec<Mount> = Vec::new();
-        if !params.host_workspace_path.is_empty() {
-            mounts_vec.push(Mount {
-                target: Some("/app".to_string()),
-                source: Some(params.host_workspace_path.clone()),
-                typ: Some(MountType::BIND),
-                ..Default::default()
-            });
-
-            let uid = params.user_id.clone().unwrap_or_else(|| app_id.to_string());
-            let rel = shared_types::paths::userapp_prod_data_subpath(&uid, &app_id);
-            let host_root = crate::path::resolve_container_path_to_host(std::path::Path::new(
-                shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+        let uid = params.user_id.clone().unwrap_or_else(|| app_id.to_string());
+        let host_root = crate::path::resolve_container_path_to_host(std::path::Path::new(
+            shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+        ))
+        .await
+        .map_err(|e| {
+            ContainerRuntimeError::DockerError(format!(
+                "UserApp prod volume host path resolve failed (rcoder 容器需挂载 userapp-workspace 锚点): {e}"
             ))
-            .await
-            .map_err(|e| {
-                ContainerRuntimeError::DockerError(format!(
-                    "UserApp data volume host path resolve failed (rcoder 容器需挂载 userapp-workspace 锚点): {e}"
-                ))
-            })?;
-            let host_data = host_root.join(&rel);
+        })?;
+        let subs = shared_types::paths::userapp_prod_subpaths(&uid, &app_id);
+        let mut mounts_vec: Vec<Mount> = Vec::with_capacity(4);
+        for (rel, target) in subs.iter().zip(prod_flat_container_paths(&app_id)) {
             // 预创建（rcoder 容器内经 bind 同步宿主；bind 源必须存在）
             let precreate =
-                std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(&rel);
+                std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join(rel);
             if let Err(e) = tokio::fs::create_dir_all(&precreate).await {
                 tracing::warn!(
-                    "[DOCKER_APP] create data dir {} failed (continuing): {e}",
+                    "[DOCKER_APP] create prod dir {} failed (continuing): {e}",
                     precreate.display()
                 );
             }
+            let host_path = host_root.join(rel);
             tracing::info!(
-                "[DOCKER_APP] app data mount: {} -> /home/user/{app_id}",
-                host_data.display()
+                "[DOCKER_APP] prod flat mount: {} -> {target}",
+                host_path.display()
             );
             mounts_vec.push(Mount {
-                target: Some(format!("/home/user/{app_id}")),
-                source: Some(host_data.to_string_lossy().to_string()),
+                target: Some(target),
+                source: Some(host_path.to_string_lossy().to_string()),
                 typ: Some(MountType::BIND),
                 ..Default::default()
             });
@@ -857,5 +847,48 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             }
         });
         Ok(rx)
+    }
+}
+
+/// prod 压平挂载的容器内路径四元组（与 [`shared_types::paths::userapp_prod_subpaths`]
+/// 段序一一配对）：workspace=`/home/user/{app_id}`（发布代码根）、
+/// data/logs/agent-store 三常量——与 dev builder 容器内布局完全同图。
+pub(crate) fn prod_flat_container_paths(app_id: &str) -> [String; 4] {
+    [
+        format!("{}/{}", shared_types::paths::USERAPP_DEV_HOME, app_id),
+        shared_types::paths::USERAPP_DEV_DATA.to_string(),
+        shared_types::paths::USERAPP_DEV_LOGS.to_string(),
+        shared_types::paths::USERAPP_DEV_AGENT_STORE.to_string(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prod_flat_mounts_pair_with_layout_source() {
+        let subs = shared_types::paths::userapp_prod_subpaths("u1", "a1");
+        let targets = prod_flat_container_paths("a1");
+        // 段序配对：workspace/data/logs/agent-store → /home/user 下四挂载点
+        assert_eq!(
+            targets,
+            [
+                "/home/user/a1".to_string(),
+                "/home/user/data".to_string(),
+                "/home/user/logs".to_string(),
+                "/home/user/.agent-store".to_string(),
+            ]
+        );
+        // 每对 bind 的宿主段与容器内路径语义对应（workspace 段名=app_id 本身）
+        assert_eq!(subs[0], "prod/u1/a1");
+        assert!(subs[1].ends_with("data/a1") && targets[1].ends_with("/data"));
+        assert!(subs[2].ends_with("logs/a1") && targets[2].ends_with("/logs"));
+        assert!(subs[3].ends_with("agent-store/a1") && targets[3].ends_with("/.agent-store"));
+        // data 段兼容视图与布局事实源一致（清理链存量调用方依赖）
+        assert_eq!(
+            subs[1],
+            shared_types::paths::userapp_prod_data_subpath("u1", "a1")
+        );
     }
 }

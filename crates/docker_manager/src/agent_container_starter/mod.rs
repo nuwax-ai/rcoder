@@ -35,7 +35,6 @@ impl<'a> AgentContainerStarter<'a> {
         let ContainerCreateParams {
             project_id,
             user_id,
-            host_workspace_path,
             service_type,
             resource_limits: request_resource_limits,
             pod_id,
@@ -51,15 +50,12 @@ impl<'a> AgentContainerStarter<'a> {
         let start_phase = Instant::now();
 
         info!(
-            "Starting Agent container: project_id={:?}, user_id={:?}, type={:?}, host_path={}, pod_id={:?}, isolation_type={:?}",
-            project_id, user_id, service_type, host_workspace_path, pod_id, isolation_type
+            "Starting Agent container: project_id={:?}, user_id={:?}, type={:?}, pod_id={:?}, isolation_type={:?}",
+            project_id, user_id, service_type, pod_id, isolation_type
         );
 
-        // 1. 在宿主机上预创建工作目录
-        // 1. 检查工作目录是否已存在（通过绑定挂载，容器内创建会自动同步）
-        debug!("[DOCKER_MGR] checkworkdirectory: {}", host_workspace_path);
-        // 绑定挂载机制：容器内创建目录会自动同步到宿主机
-        // 所以这里不需要额外创建目录
+        // 挂载目录预创建由 apply_auto_mounts 统一处理（绑定挂载机制：rcoder 容器内
+        // 创建目录会自动同步宿主机，bind 源即刻可见）。
 
         // 2. 清理旧容器（如果提供了 project_id）
         if let Some(ref id) = project_id
@@ -110,9 +106,8 @@ impl<'a> AgentContainerStarter<'a> {
             variables.insert("space_id".to_string(), sid.clone());
         }
 
-        let container_work_path = service_config.resolve_container_path(&variables);
-
-        // 构建基础配置
+        // 构建基础配置（workspace 挂载统一走 apply_auto_mounts 的 auto-inject，
+        // host_workspace_path 参数已退役——历史恒空串，主挂载分支从不触发）。
         let mut builder = ContainerConfigBuilder::new(container_id.clone())
             .image(image)
             .name_prefix(service_config.container_prefix())
@@ -135,21 +130,6 @@ impl<'a> AgentContainerStarter<'a> {
         }
         if let Some(sid) = space_id_ref {
             builder = builder.space_id(sid);
-        }
-
-        // 只在 host_workspace_path 非空时添加主挂载点
-        // 如果为空，表示完全依赖 mounts 配置（例如 ComputerAgentRunner）
-        if !host_workspace_path.is_empty() {
-            builder = builder
-                .host_path(host_workspace_path.to_string())
-                .container_path(container_work_path.clone());
-
-            debug!(
-                "[DOCKER_MANAGER] Main mount: {} -> {}",
-                host_workspace_path, container_work_path
-            );
-        } else {
-            debug!("[DOCKER_MANAGER] Skip mount, no mounts config");
         }
 
         // 先获取借用字段，因为后续字段会被移动

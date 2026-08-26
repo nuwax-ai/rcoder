@@ -2,13 +2,16 @@
 //!
 //! 与 [`super::userapp_files`] 同约定: computer 域同参镜像 (`appId`/`userId`),
 //! 定位 `resolve_userapp_dev` = `{USERAPP_WORKSPACE_DIR}/{appId}`, 复用 computer impl。
+//! 例外: `ensure-workspace` 为 Rust 独有新契约（TS 无对应端点）, 响应用
+//! `HttpResult` 信封（同 build/dev-server 域）。
 
 use axum::extract::State;
 use axum::response::Response;
 use garde::Validate;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
+use shared_types::HttpResult;
 
 use super::computer::archive::{download_all_files_impl, zip_workspace_impl};
 use super::computer::exec::{execute_command_impl, get_logs_impl};
@@ -16,6 +19,8 @@ use super::computer::packages::install_project_impl;
 use super::computer::workspace::init_template::init_project_template_impl;
 use super::computer::workspace::push_skills::push_skills_impl;
 use super::multipart::{file_field, text_field};
+use super::userapp::UserAppReply;
+use super::userapp::reply;
 use super::userapp_files::require_app_field;
 use crate::AppState;
 use crate::error::AppError;
@@ -38,22 +43,32 @@ pub(crate) struct UserappEnsureWorkspaceBody {
     pub user_id: String,
 }
 
+/// ensure-workspace 响应 data。
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UserappEnsureWorkspaceData {
+    /// 建好的 workspace 绝对路径（容器内视角，`{USERAPP_WORKSPACE_DIR}/{appId}`）
+    pub workspace: String,
+}
+
 /// `POST /api/userapp/ensure-workspace`: 幂等建 workspace 目录（create-workspace 链路首建；
 /// execute-command 等接口要求 cwd 已存在，故目录创建须先于业务调用）。
-#[utoipa::path(post, path = "/ensure-workspace", request_body = UserappEnsureWorkspaceBody, responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/ensure-workspace", request_body = UserappEnsureWorkspaceBody, responses((status = 200, body = HttpResult<UserappEnsureWorkspaceData>, description = "workspace 目录已就绪（含绝对路径）")), tag = "UserApp")]
 pub(crate) async fn ensure_workspace(
     State(state): State<AppState>,
     Json(body): Json<UserappEnsureWorkspaceBody>,
-) -> Result<Json<Value>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
-    let ws = resolve_userapp_dev(&body.app_id, None, &state.config)?;
-    tokio::fs::create_dir_all(&ws)
-        .await
-        .map_err(|e| AppError::system(format!("create workspace {}: {e}", ws.display())))?;
-    Ok(Json(json!({
-        "success": true,
-        "workspace": ws.to_string_lossy(),
-    })))
+) -> UserAppReply<UserappEnsureWorkspaceData> {
+    let result = async {
+        body.validate().map_err(crate::error::from_garde)?;
+        let ws = resolve_userapp_dev(&body.app_id, None, &state.config)?;
+        tokio::fs::create_dir_all(&ws)
+            .await
+            .map_err(|e| AppError::system(format!("create workspace {}: {e}", ws.display())))?;
+        Ok(UserappEnsureWorkspaceData {
+            workspace: ws.to_string_lossy().to_string(),
+        })
+    };
+    reply(result.await)
 }
 
 // ── execute-command ─────────────────────────────────────────────────────────────

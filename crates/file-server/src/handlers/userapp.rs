@@ -35,7 +35,7 @@ use crate::extract::deserialize_id_string;
 use crate::extract::{AppJson, AppPath, AppQuery};
 use crate::service::dev_server::log::{ReadDevLogResult, read_dev_log};
 use crate::service::userapp;
-use crate::service::userapp::tasks::{BuildProgressEvent, BuildTaskSnapshot};
+use crate::service::userapp::tasks::{BuildProgressEvent, BuildTaskSnapshot, BuildTaskStatus};
 
 // ── HttpResult 转换层 ──────────────────────────────────────────────────────────
 
@@ -76,8 +76,8 @@ impl<T: Serialize> IntoResponse for UserAppReply<T> {
     }
 }
 
-/// 便捷转换：`AppResult<T>` → `UserAppReply<T>`。
-fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
+/// 便捷转换：`AppResult<T>` → `UserAppReply<T>`（userapp_dev* 新契约接口复用）。
+pub(crate) fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
     match r {
         Ok(data) => UserAppReply::Ok(data),
         Err(e) => UserAppReply::Err(e),
@@ -92,8 +92,9 @@ fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
 pub(crate) struct BuildCreatedData {
     /// 构建任务 ID（轮询 /tasks/{taskId} 与 SSE 订阅用）
     pub task_id: String,
-    /// 受理时状态（pending——异步任务已创建）
-    pub status: String,
+    /// 受理时状态（恒为 pending——异步任务已创建；与 /tasks/{taskId} 轮询共用
+    /// BuildTaskStatus 状态机，序列化值 "pending"）
+    pub status: BuildTaskStatus,
     /// 预生成的产物相对路径（`builds/workspace-package-{releaseId}.zip`，release_id
     /// 创建时即生成）——信息字段：标识本次构建的产物位置；实际取包按 app 直下
     /// `GET /api/userapp/static/{appId}`（服务端选最新产物，无需传路径）。
@@ -107,7 +108,7 @@ pub(crate) struct CancelData {
     /// 被取消的任务 ID
     pub task_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
+    pub status: Option<BuildTaskStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub already_terminal: Option<bool>,
 }
@@ -213,7 +214,7 @@ pub(crate) async fn build_workspace(
         tracing::info!(app_id = %body.app_id, user_id = %body.user_id, %task_id, %artifact_path, "userapp build task started");
         Ok(BuildCreatedData {
             task_id,
-            status: "pending".to_string(),
+            status: BuildTaskStatus::Pending,
             artifact_path,
         })
     };
@@ -380,7 +381,7 @@ pub(crate) async fn cancel_task(
         cancel_build_task(&task).await;
         Ok(CancelData {
             task_id,
-            status: Some("cancelled".to_string()),
+            status: Some(BuildTaskStatus::Cancelled),
             already_terminal: None,
         })
     };

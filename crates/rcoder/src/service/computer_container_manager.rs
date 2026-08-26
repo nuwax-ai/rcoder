@@ -254,7 +254,6 @@ impl ComputerContainerManager {
         let mut params_builder = ContainerCreateParams::builder()
             .project_id(container_identifier) // 用于容器名称生成和查找
             .user_id(&options.user_id) // user_id 用于容器内配置
-            .host_workspace_path("")
             .service_type(options.service_type.clone());
 
         // 只有在有资源限制时才设置

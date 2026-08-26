@@ -121,11 +121,11 @@ async fn create_builder_and_register(
         .await
         .filter(|uid| !uid.trim().is_empty())
         .unwrap_or_else(|| project_id.to_string());
-    // UserAppBuilder identifier = project_id(app_id 兼任);host_workspace_path K8s 模式不用。
+    // UserAppBuilder identifier = project_id(app_id 兼任);挂载由 mounts/k8s_agent_create
+    // auto-inject 统一组装（dev 四目录压平）。
     let params = ContainerCreateParams::builder()
         .project_id(project_id.to_string())
         .user_id(owner_user_id)
-        .host_workspace_path("")
         .service_type(ServiceType::UserAppBuilder)
         .storage_size(DEFAULT_BUILDER_STORAGE_SIZE)
         .build();

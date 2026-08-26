@@ -167,8 +167,9 @@ impl KubernetesRuntime {
             },
         ]);
 
-        // 额外直接注入 APP_ID 环境变量 + PG/dbx 数据目录 env（数据卷挂载点绑定，
-        // start-app.sh 均为 ${VAR:-...} 覆盖模式——不注入则落旧默认 /app/data）
+        // 额外直接注入 APP_ID + 平台 env（压平挂载点绑定；直接 env 优先于
+        // envFrom，覆盖 ConfigMap 用户值——start-app.sh 均为 ${VAR:-...} 覆盖模式，
+        // 镜像缺省回退 /app 仅本地直跑语义）。
         let env = Some(vec![
             EnvVar {
                 name: "APP_ID".to_string(),
@@ -177,60 +178,57 @@ impl KubernetesRuntime {
             },
             EnvVar {
                 name: "PGDATA".to_string(),
-                value: Some(format!("/home/user/{app_id}/pg")),
+                value: Some(shared_types::paths::USERAPP_DEV_PGDATA.to_string()),
                 ..Default::default()
             },
             EnvVar {
                 name: "DBX_DATA_DIR".to_string(),
-                value: Some(format!("/home/user/{app_id}/dbx")),
+                value: Some(shared_types::paths::USERAPP_DEV_DBX_DATA.to_string()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "USERAPP_WORKSPACE_DIR".to_string(),
+                value: Some(format!(
+                    "{}/{}",
+                    shared_types::paths::USERAPP_DEV_HOME,
+                    app_id
+                )),
                 ..Default::default()
             },
         ]);
 
-        // UserApp (K8s 永远 per-app): per-app RWO RBD PVC (subPath=None), 由
-        // create_app_resources ensure。rcoder **不挂载**该卷（RBD 无 subvolumePath，
-        // 挂根聚合天然不可达）——部署经 env 注入 APP_DEPLOY_URL 由 app-cli 启动段
-        // 下载解压，文件操作经容器内 file-server-proxy (:60000)。
-        // UserApp 代码路径独立于主线 (Web/Computer 走 create_container 共享 PVC)。
-        //
-        // 第二块 per-app RWO RBD 数据卷（`-data` 后缀）：挂 /home/user/{app_id}，
-        // 承载 PG/dbx 持久数据（env 指向其内）——与发布卷解耦，重置发布存储
-        // 不再连数据一起清。RWO 单 pod 独占（Deployment replicas=1）；pod 重建
-        // 需等 volume detach→attach（秒级，K8s 自动处理）。
-        let volumes = Some(vec![
-            Volume {
-                name: "app-workspace".to_string(),
-                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                    claim_name: self.app_workspace_pvc_name(app_id)?,
-                    read_only: Some(false),
-                }),
-                ..Default::default()
-            },
-            Volume {
-                name: "app-data".to_string(),
-                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                    claim_name: self.app_data_pvc_name(app_id)?,
-                    read_only: Some(false),
-                }),
-                ..Default::default()
-            },
-        ]);
-        let volume_mounts = Some(vec![
-            VolumeMount {
-                name: "app-workspace".to_string(),
-                mount_path: "/app".to_string(),
-                sub_path: None,
+        // ── UserApp prod 单卷四 subPath 压平挂载（与 dev builder 完全同构）──────
+        // per-app RWO RBD PVC 一块（卷内 `{app_id}/ + data/ + logs/ + agent-store/`
+        // 四目录平级，subPath 目录由 kubelet 挂载时自动创建），四 subPath 挂到
+        // 容器内 /home/user/{app_id}（workspace=发布代码根）、/home/user/data、
+        // /home/user/logs、/home/user/.agent-store——段序与布局单一事实源
+        // [`shared_types::paths::userapp_prod_subpaths`] 一一配对。
+        // rcoder **不挂载**该卷（RBD 无 subvolumePath，挂根聚合天然不可达）——
+        // 部署经 env 注入 APP_DEPLOY_URL 由 app-cli 启动段下载解压，文件操作经
+        // 容器内 file-server-proxy (:60000)。UserApp 代码路径独立于主线
+        // (Web/Computer 走 create_container 共享 PVC)。RWO 单 pod 独占
+        // (Deployment replicas=1)；pod 重建需等 volume detach→attach（秒级，
+        // K8s 自动处理）。
+        let volumes = Some(vec![Volume {
+            name: "app-workspace".to_string(),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: self.app_workspace_pvc_name(app_id)?,
                 read_only: Some(false),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "app-data".to_string(),
-                mount_path: format!("/home/user/{app_id}"),
-                sub_path: None,
-                read_only: Some(false),
-                ..Default::default()
-            },
-        ]);
+            }),
+            ..Default::default()
+        }]);
+        let volume_mounts = Some(
+            app_flat_volume_mounts(app_id)
+                .into_iter()
+                .map(|(sub_path, mount_path)| VolumeMount {
+                    name: "app-workspace".to_string(),
+                    mount_path,
+                    sub_path: Some(sub_path),
+                    read_only: Some(false),
+                    ..Default::default()
+                })
+                .collect(),
+        );
 
         let container = K8sContainer {
             name: APP_CONTAINER_NAME.to_string(),
@@ -585,19 +583,17 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<Vec<AppPortStatus>> {
         let tenant_id = params.tenant_id.as_deref();
         let space_id = params.space_id.as_deref();
-        // 0. workspace PVC: UserApp (K8s 永远 per-app) ensure per-app CephFS subvolume
-        //    (配额由 requests.storage 经 CSI 服务端设, 绕开 client setfattr; PVC 默认保留,
-        //    重建时 ensure "active" 分支复用; 销毁走 destroy_app_pvc)。create_app 流程已在
-        //    app_manager ensure_app_workspace_ready 预 ensure + 等 subvolumePath 就绪, 这里命中 "active" 复用分支。
+        // 0. workspace PVC: UserApp (K8s 永远 per-app) per-app RWO RBD 单卷——
+        //    卷内四目录（{app_id}/ data/ logs/ agent-store/）经 subPath 挂载，
+        //    subPath 目录由 kubelet 自动创建，故只 ensure 单块 PVC
+        //    （历史第二块 `-data` PVC 已随单卷化退役；destroy 侧兜底回收存量）。
+        //    销毁走 destroy_app_pvc。
         self.ensure_workspace_pvc(
             app_id,
             &ServiceType::UserApp,
             params.storage_size.as_deref(),
         )
         .await?;
-        // 0.5 per-app 数据卷（PG/dbx 持久数据, 挂 /home/user/{app_id}）——与发布卷
-        //     同 ensure 语义（幂等, 销毁随 destroy_app_pvc 一并回收）
-        self.ensure_app_data_pvc(app_id, None).await?;
         // 1. ConfigMap（env）
         if let Some(env) = &params.env
             && !env.is_empty()
@@ -661,5 +657,67 @@ impl KubernetesRuntime {
         // 6. TCP 端口：初期不对外（仅 ClusterIP 集群内访问，见步骤 3 apply_app_service）。
         //    apply_app_nodeport 保留供未来启用 TCP 对外暴露时调用。
         Ok(external_ports)
+    }
+}
+
+/// prod 单卷四 subPath 压平挂载映射（卷内子目录 → 容器内路径），段序与
+/// [`shared_types::paths::userapp_prod_subpaths`] 一一配对——与 dev builder
+/// （k8s_agent_create UserAppBuilder 分支）完全同构；subPath 目录由 kubelet
+/// 挂载时自动创建。
+pub(crate) fn app_flat_volume_mounts(app_id: &str) -> [(String, String); 4] {
+    [
+        (
+            app_id.to_string(),
+            format!("{}/{}", shared_types::paths::USERAPP_DEV_HOME, app_id),
+        ),
+        (
+            "data".to_string(),
+            shared_types::paths::USERAPP_DEV_DATA.to_string(),
+        ),
+        (
+            "logs".to_string(),
+            shared_types::paths::USERAPP_DEV_LOGS.to_string(),
+        ),
+        (
+            "agent-store".to_string(),
+            shared_types::paths::USERAPP_DEV_AGENT_STORE.to_string(),
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_flat_volume_mounts_mirror_dev_layout() {
+        let mounts = app_flat_volume_mounts("a1");
+        assert_eq!(
+            mounts,
+            [
+                ("a1".to_string(), "/home/user/a1".to_string()),
+                ("data".to_string(), "/home/user/data".to_string()),
+                ("logs".to_string(), "/home/user/logs".to_string()),
+                (
+                    "agent-store".to_string(),
+                    "/home/user/.agent-store".to_string()
+                ),
+            ]
+        );
+        // 段序与布局事实源配对：卷内 {app_id}/ 对应宿主树 workspace 段，
+        // data/logs/agent-store 平级子目录对应宿主树三数据段的 app 子层
+        let subs = shared_types::paths::userapp_prod_subpaths("u1", "a1");
+        assert_eq!(subs[0], "prod/u1/a1");
+        assert!(mounts[0].0 == "a1" && mounts[0].1.ends_with("/a1"));
+        for (m, sub_suffix) in mounts
+            .iter()
+            .skip(1)
+            .zip(["data/a1", "logs/a1", "agent-store/a1"])
+        {
+            assert!(
+                sub_suffix.starts_with(&m.0),
+                "卷内平级目录 {m:?} 应是宿主段 {sub_suffix} 的前缀"
+            );
+        }
     }
 }

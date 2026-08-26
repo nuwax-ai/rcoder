@@ -9,6 +9,7 @@
 tests/sse_e2e/results
 tests/sse_e2e/__pycache__
 /target-console
+docker/app-runtime-base/downloads/
 
 .classpath
 project_workspace

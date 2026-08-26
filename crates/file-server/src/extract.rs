@@ -32,7 +32,7 @@ pub async fn scope_userapp_flag(req: Request, next: axum::middleware::Next) -> R
         .headers()
         .get(SERVICE_TYPE_HEADER)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim() == SERVICE_TYPE_USERAPP);
+        .is_some_and(shared_types::is_userapp_service_type_value);
     USERAPP_FLAG.scope(is_userapp, next.run(req)).await
 }
 
@@ -194,6 +194,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(to_bytes(resp.into_body(), 1024).await.unwrap(), "true");
+
+        // 大小写不敏感变体（单一事实源 shared_types::is_userapp_service_type_value）
+        for variant in ["UserApp", "USERAPP"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/probe")
+                        .header(super::SERVICE_TYPE_HEADER, variant)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                to_bytes(resp.into_body(), 1024).await.unwrap(),
+                "true",
+                "{variant}"
+            );
+        }
 
         // 无 header → false
         let resp = app

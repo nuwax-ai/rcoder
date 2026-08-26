@@ -83,6 +83,7 @@ impl std::str::FromStr for ServiceType {
             "computer-agent-runner" => Ok(ServiceType::ComputerAgentRunner),
             "user-app" => Ok(ServiceType::UserApp),
             "user-app-builder" => Ok(ServiceType::UserAppBuilder),
+            "userapp" => Ok(ServiceType::UserApp),
             // 大驼峰格式（兼容旧配置）
             "WebAgentRunner" => Ok(ServiceType::WebAgentRunner),
             "ComputerAgentRunner" => Ok(ServiceType::ComputerAgentRunner),
@@ -443,6 +444,10 @@ mod tests {
         // UserApp 多格式
         assert_eq!(
             "user-app".parse::<ServiceType>().unwrap(),
+            ServiceType::UserApp
+        );
+        assert_eq!(
+            "userapp".parse::<ServiceType>().unwrap(),
             ServiceType::UserApp
         );
         assert_eq!(

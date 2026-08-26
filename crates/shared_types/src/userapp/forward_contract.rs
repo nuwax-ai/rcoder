@@ -7,8 +7,19 @@
 pub const SERVICE_TYPE_HEADER: &str = "x-service-type";
 
 /// userApp 场景标记值（与 /api/userapp 前缀对齐；chat body 的 `service_type`
-/// 字段同词表）。
+/// 字段同词表）。匹配不区分大小写（[`is_userapp_service_type_value`] 归一后比较），
+/// 但推荐 wire 上一律传全小写 `userapp`。
 pub const SERVICE_TYPE_USERAPP: &str = "userapp";
+
+/// 判断 `x-service-type` header 值是否标记 userApp 场景。
+///
+/// 值经 trim + ASCII 小写归一后与 [`SERVICE_TYPE_USERAPP`] 比较——`userapp` /
+/// `UserApp` / `USERAPP` 等大小写变体均命中（Java 侧约定不区分大小写）。
+/// 三个消费点（rcoder computer_intercept、file-server-proxy 60000 分流、
+/// 容器内 file-server scope 注入）统一走本函数，禁止各自重写比较逻辑。
+pub fn is_userapp_service_type_value(value: &str) -> bool {
+    value.trim().to_ascii_lowercase() == SERVICE_TYPE_USERAPP
+}
 
 /// 开发容器定位 header：Java 调 rcoder 主服务的所有 userApp 请求统一携带，
 /// rcoder 零 body 解析定位 per-app 开发容器（multipart/SSE 全覆盖）。
@@ -46,5 +57,17 @@ mod tests {
     fn app_stage_values_match_pod_field_vocabulary() {
         assert_eq!(APP_STAGE_DEV, "dev");
         assert_eq!(APP_STAGE_PROD, "prod");
+    }
+
+    /// x-service-type 值匹配：大小写不敏感 + 前后空白容忍；非 userapp 值不命中。
+    #[test]
+    fn service_type_value_matching_is_case_insensitive() {
+        assert!(is_userapp_service_type_value("userapp"));
+        assert!(is_userapp_service_type_value("UserApp"));
+        assert!(is_userapp_service_type_value("USERAPP"));
+        assert!(is_userapp_service_type_value("  userapp  "));
+        assert!(!is_userapp_service_type_value("user-app"));
+        assert!(!is_userapp_service_type_value("computer-agent-runner"));
+        assert!(!is_userapp_service_type_value(""));
     }
 }

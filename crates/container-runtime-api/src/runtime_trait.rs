@@ -255,8 +255,9 @@ pub trait WorkspaceRuntime: Send + Sync {
     /// 解析 identifier 对应持久卷的**标识字符串**（storage 面展示/对账用）。
     ///
     /// K8s: 返回 PVC 名（`{prefix}-{id}-workspace`——RBD 卷 rcoder 不可挂载，
-    /// 无路径视角，PVC 名即存储事实）；Docker: 返回 bind 源目录路径
-    /// （`RCODER_WORKSPACE_ROOT/{app_id}`，rcoder 同宿主可直读）。
+    /// 无路径视角，PVC 名即存储事实）；Docker: 返回 userapp-workspace prod 树
+    /// 通配标识（`{锚点}/prod/*/{app_id}`——四目录无单一物理路径，存在性由
+    /// storage 层按元数据 uid 精确定位）。
     async fn workspace_volume_name(
         &self,
         _identifier: &str,

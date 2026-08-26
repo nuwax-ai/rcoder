@@ -220,17 +220,12 @@ impl AppService {
             ephemeral_storage: r.ephemeral_storage.clone(),
         });
 
-        // Docker bind mount 宿主源路径（K8s per-app PVC 由 runtime ensure，此值空串占位）
-        let host_workspace_path = if shared_types::is_kubernetes_runtime() {
-            String::new()
-        } else {
-            self.get_host_app_dir(app_id).to_string_lossy().to_string()
-        };
+        // 挂载：K8s per-app PVC 由 runtime ensure；Docker 亦由 runtime 统一走
+        // userapp-workspace 锚点组装 prod 四目录 bind（host_workspace_path 参数已退役）。
 
         let mut builder = ContainerCreateParams::builder()
             .project_id(app_id.to_string())
             .service_type(ServiceType::UserApp)
-            .host_workspace_path(host_workspace_path)
             .image_override(image)
             .env(env)
             .secrets(secrets.unwrap_or_default())

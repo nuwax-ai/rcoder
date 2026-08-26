@@ -1,8 +1,9 @@
-//! OpenAPI 文档聚合与 Swagger UI（从 router.rs 拆出；路由组装仍在 router.rs）。
+//! OpenAPI 文档聚合与文档 UI（从 router.rs 拆出；路由组装仍在 router.rs）。
 //!
 //! [`ApiDoc`] 是 rcoder 主文档的 utoipa 声明（paths/components 全量），
 //! [`create_swagger_ui`] 聚合两份文档（主文档 + file-server 全量文档，
-//! UI 顶部下拉切换）。
+//! UI 顶部下拉切换），[`create_scalar_docs`] 以 Scalar 界面提供同样两份
+//! 文档（每份独立页面，供对比选用）。
 
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -358,6 +359,28 @@ pub fn create_swagger_ui() -> SwaggerUi {
         ]))
 }
 
+/// Scalar 风格文档 UI（与 Swagger UI 并存试用，文档构造完全复用）。
+///
+/// 一实例一文档（Scalar 无多文档下拉），两份文档挂两个页面：
+/// - `/api/docs/scalar`：主文档（应用管理 + userApp 业务域）
+/// - `/api/docs/scalar/file-server`：file-server 全量文档
+///
+/// 注意：Scalar 的 UI JS 由页面从公网 CDN（jsdelivr）加载，spec 本身
+/// 内嵌在返回的 HTML 中——浏览器无法出网时页面会白屏（Swagger UI 资产
+/// 是编译期内嵌的，不受影响）；届时用 `custom_html` 换自托管 JS。
+/// 路由共存依赖 matchit static 优先于 `/api/docs/{*rest}` 通配。
+pub fn create_scalar_docs() -> axum::Router {
+    use utoipa_scalar::{Scalar, Servable};
+    // `.title()` 在已发布的 0.3.0 尚未提供（master 未发版），页面标题
+    // 用默认 "Scalar"；升级 0.4+ 可补。
+    axum::Router::new()
+        .merge(Scalar::with_url("/api/docs/scalar", primary_document()))
+        .merge(Scalar::with_url(
+            "/api/docs/scalar/file-server",
+            file_server_document(),
+        ))
+}
+
 /// file-server 下拉文档 = file-server 全量文档剔除内部路由 path。
 fn file_server_document() -> utoipa::openapi::OpenApi {
     let mut doc = file_server::openapi::document(file_server::routes::api_router().into_openapi());
@@ -501,6 +524,50 @@ mod openapi_tests {
         }
     }
 
+    /// Scalar 文档页 HTTP 层验证：两个页面均实际提供服务，spec 内嵌于
+    /// HTML（含各文档语义锚点路径）。与 SwaggerUi 同 Router merge 构造
+    /// 即验证 `/api/docs/{*rest}` 通配与 `/api/docs/scalar` static 共存
+    /// 不冲突（冲突会在 merge 时 panic）。
+    #[tokio::test]
+    async fn scalar_docs_serve_both_documents() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .merge(create_swagger_ui())
+            .merge(create_scalar_docs());
+        for (path, needle) in [
+            // 主文档页：Scalar 引导脚本 + spec 锚点（应用管理 + userApp）
+            ("/api/docs/scalar", "@scalar/api-reference"),
+            ("/api/docs/scalar", "/api/v1/apps"),
+            ("/api/docs/scalar", "/api/userapp/dev/start"),
+            // file-server 页：全量文档锚点
+            ("/api/docs/scalar/file-server", "/api/userapp/build"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "GET {path} 非 200");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(text.contains(needle), "{path} 响应缺少 {needle}");
+        }
+        // Swagger UI 原有路由不受 Scalar 挂载影响（static 优先不改变通配兜底）
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/docs/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET /api/docs/ 非 200");
+    }
+
     /// 主文档选择性合入的语义锁定：userApp 域（/api/userapp/*）在、其余
     /// file-server 域（project 等）不在（防主文档膨胀）。
     #[test]
@@ -587,6 +654,77 @@ mod openapi_tests {
         assert!(
             checked >= 33,
             "UserApp OpenAPI 端点覆盖数异常偏少: {checked}"
+        );
+    }
+
+    /// 文档质量防回归：`/computer/pod/*` 接口的 GET 参数与 POST 请求体 DTO 字段
+    /// 必须有非空 description（doc comment 是 swagger description 唯一来源，
+    /// 同事看 swagger 对接；pod 域此前零字段级覆盖，userApp 三字段形态
+    /// service_type=userapp/app_id/app_stage 靠此测试守卫）。
+    #[test]
+    fn pod_endpoints_fields_are_documented() {
+        let document = ApiDoc::openapi();
+        let mut checked_params = 0usize;
+        let mut checked_fields = 0usize;
+        for (path, item) in &document.paths.paths {
+            if !path.starts_with("/computer/pod/") {
+                continue;
+            }
+            for operation in [&item.get, &item.post].into_iter().flatten() {
+                if let Some(params) = &operation.parameters {
+                    for p in params {
+                        assert!(
+                            p.description.as_ref().is_some_and(|d| !d.trim().is_empty()),
+                            "{path} 参数 {:?} 缺少 description（补 doc comment）",
+                            p.name
+                        );
+                        checked_params += 1;
+                    }
+                }
+            }
+        }
+        // 请求体 DTO（POST 三兄弟）的 schema 字段（$ref 字段如 resource_limits 跳过）
+        for (name, schema) in &document
+            .components
+            .as_ref()
+            .expect("components present")
+            .schemas
+        {
+            if !matches!(
+                name.as_str(),
+                "EnsurePodRequest" | "KeepalivePodRequest" | "RestartPodRequest"
+            ) {
+                continue;
+            }
+            let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(obj)) = schema
+            else {
+                continue;
+            };
+            for (field, value) in &obj.properties {
+                let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(field_obj)) =
+                    value
+                else {
+                    continue;
+                };
+                assert!(
+                    field_obj
+                        .description
+                        .as_ref()
+                        .is_some_and(|d| !d.trim().is_empty()),
+                    "schema {name} 字段 {field} 缺少 description（补 doc comment）"
+                );
+                checked_fields += 1;
+            }
+        }
+        // 动态下限防空转：GET status/vnc-status 各 9 参数（含新增 app_id/app_stage）；
+        // 三个 POST DTO 各 9 个内联字段（resource_limits 为 $ref 不计）。
+        assert!(
+            checked_params >= 16,
+            "pod 接口参数覆盖数异常偏少: {checked_params}"
+        );
+        assert!(
+            checked_fields >= 24,
+            "pod 请求体字段覆盖数异常偏少: {checked_fields}"
         );
     }
 }

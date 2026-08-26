@@ -298,7 +298,12 @@ pub(super) enum AppTarget {
 /// 解析 userApp 分派目标。
 ///
 /// 校验规则：
-/// - `app_id` 与 `service_type` 互斥（userApp 容器类型由 `app_stage` 推导，防双头语义）
+/// - `service_type` 为 UserApp 变体（大小写不敏感，复用 `ServiceType::FromStr`
+///   词表：`userapp`/`user-app`/`application`/`app`）时与 `app_id` 搭配**放行**——
+///   userApp 场景统一三字段形态（Java 侧 `service_type=userapp` + `app_id` +
+///   `app_stage`）；其余 service_type 值与 `app_id` 仍互斥（userApp 容器类型由
+///   `app_stage` 推导，防双头语义）
+/// - `service_type` 为 UserApp 变体但缺 `app_id` → 报错（防误走 agent 路径空查）
 /// - `app_stage` 依附于 `app_id`（单独出现视为无效）
 /// - `app_id` 过 identifier 白名单（进入容器名/bind 路径拼接，防注入）
 pub(super) fn parse_app_target(
@@ -306,15 +311,23 @@ pub(super) fn parse_app_target(
     app_stage: Option<&str>,
     service_type: Option<&str>,
 ) -> Result<AppTarget, String> {
+    let service_type = service_type.map(str::trim).filter(|s| !s.is_empty());
+    let service_type_is_userapp = service_type
+        .map(|s| s.to_ascii_lowercase())
+        .is_some_and(|s| matches!(s.parse::<ServiceType>(), Ok(ServiceType::UserApp)));
     let Some(app_id) = app_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        if service_type_is_userapp {
+            return Err("service_type 'userapp' requires app_id".to_string());
+        }
         if app_stage.is_some_and(|s| !s.trim().is_empty()) {
             return Err("app_stage requires app_id".to_string());
         }
         return Ok(AppTarget::NotApp);
     };
-    if service_type.is_some_and(|s| !s.trim().is_empty()) {
+    if service_type.is_some() && !service_type_is_userapp {
         return Err(
-            "app_id and service_type are mutually exclusive (userApp 容器类型由 app_stage 推导)"
+            "app_id and non-userapp service_type are mutually exclusive \
+             (userApp 场景请传 service_type=userapp 与 app_id 搭配；容器类型由 app_stage 推导)"
                 .to_string(),
         );
     }

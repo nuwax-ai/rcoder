@@ -212,12 +212,15 @@ APP_RUNTIME_DIR := docker/app-runtime-base
 # 构建 dev-app-runtime-base（基础设施层: PG/pgweb/ttyd/supervisor + Rust app-cli）
 docker-build-app-runtime-base:
 	@echo "🐳 构建 dev-app-runtime-base:latest ..."
-	@docker build -t dev-app-runtime-base:latest -f $(APP_RUNTIME_DIR)/Dockerfile .
+	@docker build --build-context rcoder=$(PWD) \
+		--build-arg PINGAP_VERSION=0.13.7 \
+		--build-arg PINGAP_COMMIT=f7f9eddb029a5b07438bead2e0fd3df763086567 \
+		-t dev-app-runtime-base:latest -f $(APP_RUNTIME_DIR)/Dockerfile $(APP_RUNTIME_DIR)
 	@echo "✅ dev-app-runtime-base:latest 构建完成"
 
 # 构建 dev-app-runtime（多语言运行时: base + Node/Python/Java/Go），UserApp 部署用此镜像
 docker-build-app-runtime: docker-build-app-runtime-base
 	@echo "🐳 构建 dev-app-runtime:latest（基于 dev-app-runtime-base）..."
 	@docker build --build-arg BASE_IMAGE=dev-app-runtime-base:latest \
-		-t dev-app-runtime:latest -f $(APP_RUNTIME_DIR)/Dockerfile.runtime .
+		-t dev-app-runtime:latest -f $(APP_RUNTIME_DIR)/Dockerfile.runtime $(APP_RUNTIME_DIR)
 	@echo "✅ dev-app-runtime:latest 构建完成"

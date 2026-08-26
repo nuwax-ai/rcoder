@@ -29,12 +29,30 @@ use shared_types::ProjectStore as _; // 存储契约 trait：state.projects（Pr
     summary = "查询容器状态（是否存活）",
     description = "根据 user_id 或 project_id 查询对应容器是否存活"
 )]
-#[instrument(skip(state), fields(project_id = ?params.project_id, user_id = ?params.user_id))]
+#[instrument(skip(state), fields(project_id = ?params.project_id, user_id = ?params.user_id, app_id = ?params.app_id))]
 pub async fn pod_status(
     State(state): State<Arc<AppState>>,
     I18nQuery(params): I18nQuery<PodStatusQuery>,
 ) -> Result<HttpResult<PodStatusResponse>, AppError> {
     let locale = shared_types::current_request_locale();
+
+    // 0. userApp 分派（app_id 存在即短路 agent 流程；service_type=userapp 搭配放行）
+    match parse_app_target(
+        params.app_id.as_deref(),
+        params.app_stage.as_deref(),
+        params.service_type.as_deref(),
+    ) {
+        Ok(AppTarget::NotApp) => {}
+        Ok(AppTarget::Dev(app_id)) => return status_userapp_dev(&state, app_id).await,
+        Ok(AppTarget::Prod(app_id)) => return status_userapp_prod(&state, app_id).await,
+        Err(e) => {
+            error!("[POD_STATUS] invalid app target: {}", e);
+            return Err(AppError::with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                e,
+            ));
+        }
+    }
 
     // 1. 验证参数：至少需要 pod_id、user_id 或 project_id 之一
     if params.pod_id.is_none() && params.user_id.is_none() && params.project_id.is_none() {
@@ -220,6 +238,110 @@ pub async fn pod_status(
     }))
 }
 
+// ============================================================================
+// userApp 分派实现（app_id/app_stage/service_type=userapp）
+// ============================================================================
+
+/// status 的 userApp dev 分支：查询 UserAppBuilder 开发容器实时状态（只读，
+/// 不触发探活自愈——那是 ensure/keepalive 的职责）。
+async fn status_userapp_dev(
+    state: &Arc<AppState>,
+    app_id: String,
+) -> Result<HttpResult<PodStatusResponse>, AppError> {
+    let timestamp = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let existing = state
+        .runtime()
+        .get_container_info_by_identifier(&app_id, &ServiceType::UserAppBuilder)
+        .await
+        .map_err(|e| {
+            error!("[POD_STATUS] userapp dev container lookup failed: app_id={app_id}: {e:#}");
+            AppError::internal_server_error(&format!("userapp dev container lookup failed: {e:#}"))
+        })?;
+    let Some(info) = existing else {
+        info!("[POD_STATUS] userapp dev container not found: app_id={app_id}");
+        return Ok(HttpResult::success(PodStatusResponse {
+            alive: false,
+            status: "not_found".to_string(),
+            container_id: None,
+            container_name: None,
+            timestamp,
+            message: format!("UserApp dev container not found (app_id={app_id})"),
+        }));
+    };
+    // ContainerBasicInfo.status 是运行时自由字符串（"Running"/"Starting"/pod phase），
+    // 大小写容忍比较（K8s Pod phase 为 "Running"）。
+    let is_running = info.status.eq_ignore_ascii_case("Running");
+    info!(
+        "[POD_STATUS] userapp dev container status: app_id={app_id}, alive={}, container_id={}",
+        is_running, info.container_id
+    );
+    Ok(HttpResult::success(PodStatusResponse {
+        alive: is_running,
+        status: if is_running { "running" } else { "stopped" }.to_string(),
+        container_id: Some(info.container_id),
+        container_name: Some(info.container_name),
+        timestamp,
+        message: if is_running {
+            "UserApp dev container is running".to_string()
+        } else {
+            format!(
+                "UserApp dev container exists but status is: {:?}",
+                info.status
+            )
+        },
+    }))
+}
+
+/// status 的 userApp prod 分支：alive 按探针口径（`ready_replicas > 0`——prod
+/// Deployment 创建时默认配 readinessProbe 打 app-cli `/ready`，ready_replicas 即
+/// "探针通过副本数"）。app 不存在→not_found（200）；集群 API 故障→500，不伪装成
+/// not_found（防客户端误判容器已销毁触发 ensure 重建风暴，与 agent 路径同款语义）。
+async fn status_userapp_prod(
+    state: &Arc<AppState>,
+    app_id: String,
+) -> Result<HttpResult<PodStatusResponse>, AppError> {
+    let timestamp = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let runtime_info = match state.app_service.get_app(&app_id).await {
+        Ok(info) => info,
+        Err(app_manager::AppOperationError::NotFound(_)) => {
+            info!("[POD_STATUS] userapp prod app not found: app_id={app_id}");
+            return Ok(HttpResult::success(PodStatusResponse {
+                alive: false,
+                status: "not_found".to_string(),
+                container_id: None,
+                container_name: None,
+                timestamp,
+                message: format!("UserApp prod app not found (app_id={app_id})"),
+            }));
+        }
+        Err(e) => {
+            error!("[POD_STATUS] userapp prod app query failed: app_id={app_id}: {e:#}");
+            return Err(AppError::internal_server_error(&format!(
+                "userapp prod app query failed: {e:#}"
+            )));
+        }
+    };
+    let alive = runtime_info.ready_replicas > 0;
+    info!(
+        "[POD_STATUS] userapp prod app status: app_id={app_id}, alive={}, phase={}, replicas={}/{} ready",
+        alive, runtime_info.phase, runtime_info.ready_replicas, runtime_info.replicas
+    );
+    Ok(HttpResult::success(PodStatusResponse {
+        alive,
+        status: runtime_info.phase.to_ascii_lowercase(),
+        container_id: Some(app_id),
+        container_name: None,
+        timestamp,
+        message: format!(
+            "phase={}, health={}, replicas={}/{} ready",
+            runtime_info.phase,
+            runtime_info.health.status,
+            runtime_info.ready_replicas,
+            runtime_info.replicas
+        ),
+    }))
+}
+
 /// 查询容器 VNC 服务状态
 ///
 /// 根据 user_id 或 project_id 定位容器，查询 VNC/noVNC 服务是否已启动就绪。
@@ -239,12 +361,41 @@ pub async fn pod_status(
     summary = "查询容器 VNC 服务状态",
     description = "根据 user_id 或 project_id 定位子容器，查询 VNC/noVNC 服务是否已启动就绪"
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state), fields(app_id = ?params.app_id))]
 pub async fn pod_vnc_status(
     State(state): State<Arc<AppState>>,
     I18nQuery(params): I18nQuery<VncStatusQuery>,
 ) -> Result<HttpResult<VncStatusResponse>, AppError> {
     let locale = shared_types::current_request_locale();
+
+    // 0. userApp 分派（app_id 存在即短路 agent 流程；service_type=userapp 搭配放行）
+    match parse_app_target(
+        params.app_id.as_deref(),
+        params.app_stage.as_deref(),
+        params.service_type.as_deref(),
+    ) {
+        Ok(AppTarget::NotApp) => {}
+        Ok(AppTarget::Dev(app_id)) => return vnc_status_userapp_dev(&state, locale, app_id).await,
+        Ok(AppTarget::Prod(app_id)) => {
+            // 生产容器跑用户业务应用（无 VNC/noVNC、无 agent_runner 可供 gRPC 探测），
+            // 恒报 not-ready（200）——调用方统一轮询逻辑无需分叉处理错误分支。
+            info!("[POD_VNC_STATUS] userapp prod container has no VNC: app_id={app_id}");
+            return Ok(HttpResult::success(VncStatusResponse {
+                vnc_ready: false,
+                novnc_ready: false,
+                message: "VNC is not available for userApp prod containers".to_string(),
+                uptime_seconds: Some(0),
+                container_id: None,
+            }));
+        }
+        Err(e) => {
+            error!("[POD_VNC_STATUS] invalid app target: {}", e);
+            return Err(AppError::with_message(
+                shared_types::error_codes::ERR_VALIDATION,
+                e,
+            ));
+        }
+    }
 
     // 1. 参数验证：pod_id、user_id 和 project_id 不能同时为空
     let user_id = params.user_id.as_deref().filter(|s| !s.trim().is_empty());
@@ -414,6 +565,102 @@ pub async fn pod_vnc_status(
         }
         Err(e) => {
             error!("[POD_VNC_STATUS] gRPC connection failed: {}", e);
+            Ok(HttpResult::error_with_locale(
+                shared_types::error_codes::ERR_GRPC_ERROR,
+                locale,
+            ))
+        }
+    }
+}
+
+/// vnc-status 的 userApp dev 分支：开发容器（UserAppBuilder）复用 agent-runner
+/// 镜像，VNC 栈（Xvnc 5900 + noVNC 6080）实际在跑（桌面入口
+/// `/userapp/dev/vnc/{app_id}`）——走既有 gRPC 链路真查容器内探针。
+/// 不注册 `vnc_backends`：那是 computer 域 user_id 键空间，userApp VNC 走独立
+/// app_id 路由（ContainerLookup 动态解析）。
+async fn vnc_status_userapp_dev(
+    state: &Arc<AppState>,
+    locale: &'static str,
+    app_id: String,
+) -> Result<HttpResult<VncStatusResponse>, AppError> {
+    let existing = state
+        .runtime()
+        .get_container_info_by_identifier(&app_id, &ServiceType::UserAppBuilder)
+        .await
+        .map_err(|e| {
+            error!("[POD_VNC_STATUS] userapp dev container lookup failed: app_id={app_id}: {e:#}");
+            AppError::internal_server_error(&format!("userapp dev container lookup failed: {e:#}"))
+        })?;
+    let result = match existing {
+        Some(info) => info,
+        None => {
+            info!("[POD_VNC_STATUS] userapp dev container does not exist: app_id={app_id}");
+            return Ok(HttpResult::error_with_message(
+                shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+                locale,
+                &format!("userapp dev container not found: app_id={app_id}"),
+            ));
+        }
+    };
+    if !result.status.eq_ignore_ascii_case("Running") {
+        info!(
+            "[POD_VNC_STATUS] userapp dev container not running: container_id={}",
+            result.container_id
+        );
+        return Ok(HttpResult::success(VncStatusResponse {
+            vnc_ready: false,
+            novnc_ready: false,
+            message: "Container not running".to_string(),
+            uptime_seconds: Some(0),
+            container_id: Some(result.container_id),
+        }));
+    }
+
+    // gRPC 真查（与 agent 路径同链路：K8s 用 Service FQDN，Docker 用容器 IP）
+    let grpc_addr = shared_types::build_grpc_addr(
+        &result.container_name,
+        &result.container_ip,
+        &state.config.app_manager.namespace,
+        &state.cluster_domain,
+    );
+
+    match state.grpc_pool.get_client(&grpc_addr).await {
+        Ok(mut client) => {
+            let grpc_request = crate::grpc::new_request_with_locale(
+                shared_types::grpc::GetVncStatusRequest {
+                    user_id: None,
+                    project_id: Some(app_id.clone()),
+                },
+                locale,
+            );
+
+            match client.get_vnc_status(grpc_request).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    info!(
+                        "[POD_VNC_STATUS] userapp dev gRPC ok: app_id={app_id}, vnc_ready={}, novnc_ready={}",
+                        resp.vnc_ready, resp.novnc_ready
+                    );
+
+                    Ok(HttpResult::success(VncStatusResponse {
+                        vnc_ready: resp.vnc_ready,
+                        novnc_ready: resp.novnc_ready,
+                        message: resp.message,
+                        uptime_seconds: Some(resp.uptime_seconds),
+                        container_id: Some(result.container_id),
+                    }))
+                }
+                Err(e) => {
+                    error!("[POD_VNC_STATUS] userapp dev gRPC call failed: app_id={app_id}: {e}");
+                    Ok(HttpResult::error_with_locale(
+                        shared_types::error_codes::ERR_GRPC_ERROR,
+                        locale,
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            error!("[POD_VNC_STATUS] userapp dev gRPC connection failed: app_id={app_id}: {e}");
             Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
                 locale,

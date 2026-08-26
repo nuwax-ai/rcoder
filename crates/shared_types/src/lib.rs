@@ -28,7 +28,7 @@ pub use userapp::db_align::{
 pub use userapp::dev_cleanup::UserappDevCleanup;
 pub use userapp::forward_contract::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER,
-    SERVICE_TYPE_USERAPP,
+    SERVICE_TYPE_USERAPP, is_userapp_service_type_value,
 };
 pub use userapp::metadata::{AppMetadataPersistence, AppMetadataRecord};
 

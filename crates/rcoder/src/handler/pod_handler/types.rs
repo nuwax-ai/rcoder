@@ -144,14 +144,14 @@ pub struct EnsurePodRequest {
     /// 服务类型，决定创建哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
-    ///
-    /// 注意：与 app_id 互斥（userApp 场景的容器类型由 app_stage 推导）
+    /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，
+    ///   容器类型由 app_stage 推导；其余值与 app_id 互斥
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
 
     /// UserApp 容器标识（可选；存在即进入 userApp 分派——启动/保活/重启
-    /// userApp 容器，启用其虚拟终端(ttyd)与文件服务等）
+    /// userApp 容器，启用其虚拟终端(ttyd)与文件服务等；与 service_type=userapp 搭配）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "app_789")]
     pub app_id: Option<String>,
@@ -239,13 +239,14 @@ pub struct KeepalivePodRequest {
     /// 服务类型，决定创建哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
-    ///
-    /// 注意：与 app_id 互斥（userApp 场景的容器类型由 app_stage 推导）
+    /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，
+    ///   容器类型由 app_stage 推导；其余值与 app_id 互斥
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
 
-    /// UserApp 容器标识（可选；存在即进入 userApp 分派——保活/重启 userApp 容器）
+    /// UserApp 容器标识（可选；存在即进入 userApp 分派——保活/重启 userApp 容器；
+    /// 与 service_type=userapp 搭配）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "app_789")]
     pub app_id: Option<String>,
@@ -345,13 +346,14 @@ pub struct RestartPodRequest {
     /// 服务类型，决定创建哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
-    ///
-    /// 注意：与 app_id 互斥（userApp 场景的容器类型由 app_stage 推导）
+    /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，
+    ///   容器类型由 app_stage 推导；其余值与 app_id 互斥
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
 
-    /// UserApp 容器标识（可选；存在即进入 userApp 分派——保活/重启 userApp 容器）
+    /// UserApp 容器标识（可选；存在即进入 userApp 分派——保活/重启 userApp 容器；
+    /// 与 service_type=userapp 搭配）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "app_789")]
     pub app_id: Option<String>,
@@ -427,13 +429,27 @@ pub struct PodStatusQuery {
     #[schema(example = "tenant")]
     pub isolation_type: Option<String>,
 
-    /// 服务类型，决定创建哪种类型的容器
+    /// 服务类型，决定查询哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，查询 UserApp 容器状态
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[param(example = "computer-agent-runner")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
+
+    /// UserApp 容器标识（可选；存在即进入 userApp 分派——查询 UserApp 容器状态；
+    /// 与 service_type=userapp 搭配，userApp 场景可不传 user_id/project_id）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "app_789")]
+    #[schema(example = "app_789")]
+    pub app_id: Option<String>,
+
+    /// UserApp 容器阶段（可选，缺省 "dev"；dev=开发容器 UserAppBuilder / prod=生产 Deployment）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "dev")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
 }
 
 /// 查询容器状态响应
@@ -510,11 +526,26 @@ pub struct VncStatusQuery {
     #[schema(example = "tenant")]
     pub isolation_type: Option<String>,
 
-    /// 服务类型，决定创建哪种类型的容器
+    /// 服务类型，决定查询哪种类型的容器
     /// - "computer-agent-runner" (默认): ComputerAgentRunner 容器，标识符为 user_id
     /// - "web-agent-runner": WebAgentRunner 容器，标识符为 project_id
+    /// - "userapp" (userApp 场景，大小写不敏感): 与 app_id 搭配传入，
+    ///   查询 UserApp 容器状态（prod 恒 vnc_ready=false——生产容器无 VNC）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[param(example = "computer-agent-runner")]
     #[schema(example = "computer-agent-runner")]
     pub service_type: Option<String>,
+
+    /// UserApp 容器标识（可选；存在即进入 userApp 分派——查询 UserApp 容器 VNC 状态；
+    /// 与 service_type=userapp 搭配，userApp 场景可不传 user_id/project_id）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "app_789")]
+    #[schema(example = "app_789")]
+    pub app_id: Option<String>,
+
+    /// UserApp 容器阶段（可选，缺省 "dev"；dev=开发容器 UserAppBuilder / prod=生产 Deployment）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[param(example = "dev")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
 }

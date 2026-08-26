@@ -171,9 +171,10 @@ fn is_userapp_path(path: &str) -> bool {
 }
 
 /// userApp 业务判定的 header 判据：`x-service-type` 值为 `userapp`
-/// （wire 值小写，严格相等）。
+/// （大小写不敏感 + 前后空白容忍，单一事实源
+/// [`shared_types::is_userapp_service_type_value`]）。
 fn is_userapp_service_type(header_value: Option<&str>) -> bool {
-    header_value.is_some_and(|v| v == SERVICE_TYPE_USERAPP)
+    header_value.is_some_and(shared_types::is_userapp_service_type_value)
 }
 
 impl FileServerProxyConfig {
@@ -662,19 +663,24 @@ mod tests {
             c.upstream_port_for("/api/userapplication", None),
             Upstream::Ts(60001)
         );
-        // 非本业务域声明（computer 等）与非法值一律 TS——契约违规 404 可见而非静默误路由
+        // 非本业务域声明（computer 等）与空值一律 TS——契约违规 404 可见而非静默误路由
         assert_eq!(
             c.upstream_port_for("/api/computer/x", Some("computer")),
-            Upstream::Ts(60001)
-        );
-        assert_eq!(
-            c.upstream_port_for("/api/computer/x", Some("UserApp")),
             Upstream::Ts(60001)
         );
         assert_eq!(
             c.upstream_port_for("/api/computer/x", Some("")),
             Upstream::Ts(60001)
         );
+        // 大小写不敏感：userapp 的任意大小写变体（含前后空白）均命中 Rust 上游
+        // （单一事实源 shared_types::is_userapp_service_type_value）
+        for variant in ["UserApp", "USERAPP", " userapp "] {
+            assert_eq!(
+                c.upstream_port_for("/api/computer/x", Some(variant)),
+                Upstream::Rust(8086),
+                "{variant}"
+            );
+        }
     }
 
     /// 容器形态（AllRust）：一律内嵌 Rust 上游（现状行为等价）。

@@ -145,7 +145,6 @@ async fn create_container_for_request(
     // 容器命名由 runtime 层通过 pod_id 处理
     let mut params_builder = ContainerCreateParams::builder()
         .project_id(options.project_id)
-        .host_workspace_path("") // 空字符串，表示不使用硬编码挂载
         .service_type(options.service_type.clone());
 
     // 只有在有资源限制时才设置

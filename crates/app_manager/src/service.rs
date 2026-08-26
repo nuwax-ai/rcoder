@@ -13,9 +13,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use docker_manager::path::HostPathResolver;
-use moka::sync::Cache;
-use tracing::{info, warn};
+use tracing::info;
 
 use container_runtime_api::{DeploymentStatus, HttpExpose, UserAppRuntime};
 use rcoder_proxy::PingoraProxyService;
@@ -38,7 +36,6 @@ pub struct AppService {
     /// Pingora 代理（Docker 模式用于注册 HTTP backend；K8s 模式通常为 None）
     pub(crate) pingora: Option<Arc<PingoraProxyService>>,
     /// 路径解析器缓存（单例；Docker 模式将 rcoder 容器内路径解析为宿主机路径）
-    pub(crate) path_resolver: Cache<String, Arc<HostPathResolver>>,
     /// Docker 模式 Pingora backend 端口登记（app_id → 注册的 HTTP 端口列表）
     ///
     /// 这是**操作副作用的临时缓存**（非业务元数据）：delete 时需要知道曾注册过哪些端口
@@ -75,23 +72,6 @@ impl AppService {
         activity: Arc<AppActivityRegistry>,
         pingora: Option<Arc<PingoraProxyService>>,
     ) -> AppResult<Self> {
-        let path_resolver: Cache<String, Arc<HostPathResolver>> =
-            Cache::builder().max_capacity(1).build();
-
-        // 初始化路径解析器（失败不致命，Docker 模式回退到容器内路径）
-        match HostPathResolver::new().await {
-            Ok(resolver) => {
-                info!("[APP] path resolver initialized");
-                path_resolver.insert("default".to_string(), Arc::new(resolver));
-            }
-            Err(e) => {
-                warn!(
-                    "[APP] path resolver init failed, using container path: {}",
-                    e
-                );
-            }
-        }
-
         // K8s 模式：启动时校验前置条件（RBAC 等）。失败直接返回，
         // 避免 rcoder 显示健康、直到首次创建 app 才暴露 403。
         if config.access_mode == AppAccessMode::Kubernetes {
@@ -117,7 +97,6 @@ impl AppService {
             runtime,
             activity,
             pingora,
-            path_resolver,
             pingora_ports: DashMap::new(),
             deploy_list_cache: tokio::sync::Mutex::new(None),
             release_locks: DashMap::new(),

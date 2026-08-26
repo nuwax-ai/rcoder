@@ -213,7 +213,7 @@ fn app_target_dev_and_prod_dispatch() {
 
 #[test]
 fn app_target_validates_stage_and_conflicts() {
-    // app_id 与 service_type 互斥
+    // app_id 与非 userapp 的 service_type 互斥
     assert!(parse_app_target(Some("app-1"), None, Some("computer-agent-runner")).is_err());
     // 非法 stage 值
     assert!(parse_app_target(Some("app-1"), Some("staging"), None).is_err());
@@ -222,6 +222,33 @@ fn app_target_validates_stage_and_conflicts() {
     // identifier 白名单（防容器名/bind 路径注入）
     assert!(parse_app_target(Some("../escape"), None, None).is_err());
     assert!(parse_app_target(Some("app/1"), None, None).is_err());
+}
+
+/// userApp 场景统一三字段形态：service_type=userapp（大小写不敏感）与 app_id
+/// 搭配放行分派；无 app_id 时单独的 userapp 标记报错（防误走 agent 路径空查）。
+#[test]
+fn app_target_accepts_userapp_service_type_alongside_app_id() {
+    // userapp 搭配 app_id → 正常分派（缺省/显式 dev 与 prod）
+    assert!(matches!(
+        parse_app_target(Some("app-1"), None, Some("userapp")),
+        Ok(AppTarget::Dev(id)) if id == "app-1"
+    ));
+    assert!(matches!(
+        parse_app_target(Some("app-1"), Some("prod"), Some("userapp")),
+        Ok(AppTarget::Prod(id)) if id == "app-1"
+    ));
+    // 大小写不敏感 + 既有 ServiceType 变体同义
+    for variant in ["USERAPP", "UserApp", "user-app"] {
+        assert!(
+            matches!(
+                parse_app_target(Some("app-1"), None, Some(variant)),
+                Ok(AppTarget::Dev(_))
+            ),
+            "service_type={variant:?} 应视为 userapp 变体放行"
+        );
+    }
+    // userapp 标记缺 app_id → 报错（不走 agent 路径空查 UserApp 容器）
+    assert!(parse_app_target(None, None, Some("userapp")).is_err());
 }
 
 /// 契约钉住：userApp 请求只传 app_id/app_stage 即可反序列化（user_id/project_id
@@ -244,4 +271,32 @@ fn userapp_minimal_request_deserializes_without_user_or_project() {
             .unwrap_or_else(|e| panic!("RestartPodRequest {raw} 应可反序列化: {e}"));
         assert_eq!(rs.project_id, "");
     }
+}
+
+/// 契约钉住：GET 两接口的 userApp 三字段 query 形态可反序列化（userapp 与
+/// app_id/app_stage 搭配；user_id/project_id 不传为 None）——Java 统一传参形态。
+#[test]
+fn userapp_query_deserializes_with_three_field_form() {
+    // serde_urlencoded 是 axum Query 底层（I18nQuery 纯透传），用同一引擎验证。
+    for raw in [
+        "service_type=userapp&app_id=app-1",
+        "service_type=userapp&app_id=app-1&app_stage=dev",
+        "service_type=userapp&app_id=app-1&app_stage=prod",
+    ] {
+        let ps: PodStatusQuery = serde_urlencoded::from_str(raw)
+            .unwrap_or_else(|e| panic!("PodStatusQuery {raw} 应可反序列化: {e}"));
+        assert_eq!(ps.service_type.as_deref(), Some("userapp"));
+        assert_eq!(ps.app_id.as_deref(), Some("app-1"));
+        assert!(ps.user_id.is_none() && ps.project_id.is_none());
+
+        let vs: VncStatusQuery = serde_urlencoded::from_str(raw)
+            .unwrap_or_else(|e| panic!("VncStatusQuery {raw} 应可反序列化: {e}"));
+        assert_eq!(vs.service_type.as_deref(), Some("userapp"));
+        assert_eq!(vs.app_id.as_deref(), Some("app-1"));
+    }
+    // 仅 app_id（service_type/app_stage 缺省）也可——与 POST 三兄弟最小契约对齐
+    let ps: PodStatusQuery = serde_urlencoded::from_str("app_id=app-1")
+        .unwrap_or_else(|e| panic!("PodStatusQuery 应可反序列化: {e}"));
+    assert_eq!(ps.app_id.as_deref(), Some("app-1"));
+    assert!(ps.service_type.is_none() && ps.app_stage.is_none());
 }

@@ -240,26 +240,25 @@ impl AppService {
     /// 2. 各一级子项目 `{dir}/database/`（目录名排序）
     ///
     /// 目录内按文件名升序。逐文件 exec 容器内 `psql -f`（容器内路径
-    /// `{APP_CODE_ROOT}/{rel}`，`ON_ERROR_STOP=on` 单文件原子性），单文件失败
+    /// `{app_code_root(app_id)}/{rel}`，`ON_ERROR_STOP=on` 单文件原子性），单文件失败
     /// 收集进 report 继续下一文件。find 输出逐段过
     /// [`is_shell_safe_path_component`] 白名单（防恶意文件名注入 `sh -c` 命令行）。
     pub async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport> {
         validate_app_id(app_id)?;
+        // 容器内代码根（workspace 压平挂载 /home/user/{app_id} 之下）
+        let code_root = shared_types::paths::app_code_root(app_id);
         // 根 database 先、子项目后（-mindepth 3 排除根目录自身）
-        const FIND_CMD: &str = concat!(
-            "find /app/code/database -maxdepth 1 -type f -name '*.sql' 2>/dev/null | sort; ",
-            "find /app/code -mindepth 3 -maxdepth 3 -type f -path '*/database/*.sql' 2>/dev/null | sort",
+        let find_cmd = format!(
+            "find {code_root}/database -maxdepth 1 -type f -name '*.sql' 2>/dev/null | sort; \
+             find {code_root} -mindepth 3 -maxdepth 3 -type f -path '*/database/*.sql' 2>/dev/null | sort"
         );
         let output = self
             .runtime
-            .exec(
-                app_id,
-                vec!["sh".to_string(), "-c".to_string(), FIND_CMD.to_string()],
-            )
+            .exec(app_id, vec!["sh".to_string(), "-c".to_string(), find_cmd])
             .await
             .map_err(|e| map_runtime_error("[APP] database sql scan exec failed", e))?;
 
-        let code_prefix = format!("{}/", shared_types::paths::APP_CODE_ROOT);
+        let code_prefix = format!("{code_root}/");
         let mut files: Vec<String> = Vec::new();
         let mut scan_errors: Vec<String> = Vec::new();
         if output.exit_code != 0 {
@@ -294,8 +293,7 @@ impl AppService {
             // rel 已过 is_shell_safe_path_component 白名单（收集时过滤），
             // 单引号包裹下 shell 不可注入
             let cmd = format!(
-                "psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" --set ON_ERROR_STOP=on -f '{}/{}'",
-                shared_types::paths::APP_CODE_ROOT,
+                "psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" --set ON_ERROR_STOP=on -f '{code_root}/{}'",
                 rel
             );
             let r = self

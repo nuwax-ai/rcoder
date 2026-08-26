@@ -331,6 +331,7 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
 
     router
         .merge(crate::router_docs::create_swagger_ui())
+        .merge(crate::router_docs::create_scalar_docs())
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB body 大小限制
         // HTTP 请求日志（target: tower_http → rcoder.log）+ W3C traceparent 提取
         // （入站 trace 贯通：e2e 注入 traceparent 时请求 span 继承远端 trace）
