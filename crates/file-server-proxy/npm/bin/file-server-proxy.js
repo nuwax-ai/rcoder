@@ -32,6 +32,7 @@ const {
   killAndWait,
   tcpUp,
   waitTcpFree,
+  stateDir,
 } = require("../lib/daemon");
 
 const VERSION = require("../package.json").version;
@@ -191,6 +192,11 @@ async function cmdStart(flags) {
     TS_UPSTREAM_PORT: String(tsPort ?? FALLBACK_TS_PORT),
     ROUTE_POLICY: flags.policy,
     EMBED_FILE_SERVER: "1",
+    // 文件日志目录兜底：默认 /app/... 是容器路径，本机不可写（Rust 侧另有
+    // tmpdir 回退，这里显式给 npm 场景一个稳定可预期位置）
+    FILE_SERVER_LOG_DIR:
+      process.env.FILE_SERVER_LOG_DIR ||
+      path.join(stateDir(), "logs"),
   };
   // 0.2.0+ 二进制走 CLI 参数（参数>env>默认）；env 同步保留双通道——兼容
   // FILE_SERVER_PROXY_BINARY 指向旧版二进制（只认 env）的场景

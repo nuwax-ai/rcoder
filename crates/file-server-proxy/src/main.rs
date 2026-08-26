@@ -258,15 +258,61 @@ async fn main() {
 }
 
 /// 直连装配：加载 file-server 配置（工作目录/日志）+ 一次组装全局 subscriber
-/// （console + file-server 按日滚动文件日志）+ 独立全量 Router 注册进直连通道。
+/// （console + **双文件日志**：file-server.log 收 `file_server` target、
+/// file-server-proxy.log 收 `file_server_proxy` target——代理自身的分流决策/
+/// 上游错误/生命周期独立成文件，排查文件服务问题互不淹没）+ 独立全量 Router
+/// 注册进直连通道。
 ///
-/// 返回的 guard 必须持有到 main 结束（文件日志完整刷盘）。
+/// 日志目录不可用（npm 本机默认 /app/... 建不了）时回退系统临时目录——对齐
+/// TS 源工程 appConfig 的 LOG_BASE_DIR 回退行为（本机人体工学优先，容器内
+/// 配置错误仍经 warn 留痕可见）。
+///
+/// 返回的 (file-server guard, proxy guard) 必须持有到 main 结束（文件日志完整
+/// 刷盘——guard 仅 Drop 语义，tuple 解构成 `_` 绑定持有，与 file-server bin 同款）。
 #[cfg(feature = "embed-file-server")]
-fn prepare_embed() -> Result<Option<file_server::logging::WorkerGuard>, String> {
-    let config = file_server::Config::load()
+fn prepare_embed() -> Result<
+    Option<(
+        file_server::logging::WorkerGuard,
+        file_server::logging::WorkerGuard,
+    )>,
+    String,
+> {
+    let mut config = file_server::Config::load()
         .map_err(|e| format!("load embedded file-server config: {e:#}"))?;
-    let (file_layer, guard) = file_server::logging::build_file_layer(&config)
-        .map_err(|e| format!("build embedded file-server log layer: {e:#}"))?;
+    // 日志目录回退：默认 /app/... 是容器路径，npm/mac 本机不可写——回退 tmpdir
+    let (file_layer, fs_guard) = match file_server::logging::build_file_layer(&config) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!(
+                "file-server-proxy: 日志目录 {} 不可用 ({e:#}), 回退系统临时目录",
+                config.service_log_dir.display()
+            );
+            config.service_log_dir = std::env::temp_dir().join("file-server-proxy").join("logs");
+            file_server::logging::build_file_layer(&config)
+                .map_err(|e| format!("build embedded file-server log layer: {e:#}"))?
+        }
+    };
+
+    // proxy 独立文件日志（与 file-server 同目录、独立文件名、同款按日滚动与保留数）
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    let proxy_appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("file-server-proxy.log")
+        .max_log_files(config.service_log_retention_days)
+        .build(&config.service_log_dir)
+        .map_err(|e| format!("build proxy log appender: {e}"))?;
+    let (proxy_writer, proxy_guard) = tracing_appender::non_blocking(proxy_appender);
+    let proxy_file_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(proxy_writer)
+        .with_filter(
+            Targets::new()
+                .with_target("file_server_proxy", tracing::Level::INFO)
+                .with_default(LevelFilter::OFF),
+        );
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new(
             "file_server=info,file_server_proxy=info,tower_http=info",
@@ -277,9 +323,14 @@ fn prepare_embed() -> Result<Option<file_server::logging::WorkerGuard>, String> 
     use tracing_subscriber::util::SubscriberInitExt;
     tracing_subscriber::registry()
         .with(file_layer)
+        .with(proxy_file_layer)
         .with(filter)
         .with(console)
         .init();
+    tracing::info!(
+        log_dir = %config.service_log_dir.display(),
+        "双文件日志已启用: file-server.log(内嵌 file-server) + file-server-proxy.log(代理)"
+    );
     let server = file_server::FileServer::builder(config)
         .build()
         .map_err(|e| format!("build embedded file-server: {e:#}"))?;
@@ -290,7 +341,7 @@ fn prepare_embed() -> Result<Option<file_server::logging::WorkerGuard>, String> 
         .map_err(|e| format!("build embedded file-server router: {e:#}"))?;
     file_server_proxy::set_in_process_router(router);
     tracing::info!("内嵌 file-server 直连已装配（进程内 router，无内部监听端口）");
-    Ok(Some(guard))
+    Ok(Some((fs_guard, proxy_guard)))
 }
 
 #[cfg(test)]

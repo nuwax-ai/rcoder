@@ -2,9 +2,9 @@
 name = "file-server-proxy"
 # 独立版本号: 支持 file-server-proxy 单独打 tag (file-server-proxy-v*) 经 CI 发
 # npm/OSS, 与 rcoder 主版本解耦 (与 crates/file-server 同款纪律)。
-# 0.2.1: 文档/文案修缮（lib 模块文档补四策略与直连概览；npm start 成功消息
-# 去除直连模式下误导的 rust=8086 展示）
-version = "0.2.1"
+# 0.2.2: 独立双文件日志+日志目录本机回退（用户指正：proxy 要有独立日志方便排查）
+# 0.2.1 子项见 git 历史
+version = "0.2.2"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -16,7 +16,7 @@ publish = false
 # 即产出 npm 同款单二进制(自带 rust 上游)。容器/rcoder 嵌入形态不受影响:
 # additive feature 只多编译不激活(运行时 EMBED_FILE_SERVER 未设即纯转发)。
 default = ["embed-file-server"]
-embed-file-server = ["dep:file-server", "dep:axum", "dep:tower"]
+embed-file-server = ["dep:file-server", "dep:axum", "dep:tower", "dep:tracing-appender"]
 
 [lib]
 name = "file_server_proxy"
@@ -56,6 +56,7 @@ tracing-subscriber = { workspace = true }
 file-server = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
+tracing-appender = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }

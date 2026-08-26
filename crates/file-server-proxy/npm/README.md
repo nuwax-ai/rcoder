@@ -72,6 +72,19 @@ file-server-proxy --version
 - 没有实例时以随机端口拉起（`status` 显示 `managed`，`stop`/前台退出时连带停止）；
 - 若上次异常退出留下陈旧启动锁，TS 自带 120 秒自动清理窗口——期间 `start` 报错属预期，稍候重试即可。
 
+## 日志
+
+**双文件日志**（按日滚动，目录 = `FILE_SERVER_LOG_DIR`，本机未设时兜底
+`os.tmpdir()/file-server-proxy/logs`；目录不可用时 Rust 侧自动回退系统临时目录）：
+
+| 文件 | 内容 | 排查什么 |
+|---|---|---|
+| `file-server-proxy.log` | 代理自身：分流决策/上游错误/生命周期 | 请求走错边、502、启停问题 |
+| `file-server.log` | 内嵌 file-server：请求日志/业务错误 | 文件操作本身（上传/列表/删除） |
+
+后台模式的 console 输出另存 `os.tmpdir()/file-server-proxy/proxy.log`（npm CLI 的
+stdout 重定向）；`file-server-proxy status` 不读日志，排障直接看上表文件。
+
 ## 端口总览
 
 | 端口 | 服务 | 说明 |

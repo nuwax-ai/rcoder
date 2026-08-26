@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "file-server-proxy"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "bytes 1.12.1",
@@ -2266,6 +2266,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 
