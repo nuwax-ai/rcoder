@@ -193,7 +193,7 @@ pub(crate) struct StreamQuery {
     post,
     path = "/build",
     request_body = BuildUserAppBody,
-    responses((status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已创建")),
+    responses((status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 taskId（轮询/SSE 用）与 artifactPath（受理时即确定：builds/workspace-package-{releaseId}.zip，releaseId 预生成）+ status=pending。同 app_id 已有活跃任务时在队列排队（per-app 互斥）；全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{taskId} 或订阅 GET /tasks/{taskId}/logs/stream（SSE）；构建日志分页 GET /tasks/{taskId}/logs。")),
     tag = "UserApp"
 )]
 pub(crate) async fn build_workspace(
@@ -226,7 +226,7 @@ pub(crate) async fn build_workspace(
     get,
     path = "/tasks/{task_id}",
     params(("task_id" = String, Path, description = "任务ID")),
-    responses((status = 200, body = HttpResult<BuildTaskSnapshot>, description = "任务状态快照")),
+    responses((status = 200, body = HttpResult<BuildTaskSnapshot>, description = "任务状态快照（轮询通道，建议 2-3s 间隔）。关键字段：status（pending/running/completed/failed/cancelled——后三者为终态，到终态即可停止轮询）、currentService（正在编译的服务）、releaseId/sha256/sizeBytes/fileName/artifactPath（completed 时有值：产物摘要）、error（failed 时有值）、seq（事件游标，对齐 SSE 的 id）。终态快照保留 24h 供回查。")),
     tag = "UserApp"
 )]
 pub(crate) async fn get_task(
@@ -249,7 +249,7 @@ pub(crate) async fn get_task(
     get,
     path = "/tasks/{task_id}/logs",
     params(("task_id" = String, Path, description = "任务ID"), TaskLogsQuery),
-    responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "构建日志分页")),
+    responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "构建日志分页（历史日志文件读取，非 SSE）。query：service=子项目目录名（留空=workspace 根日志）；startIndex=起始行号（1-based，用上批响应的 totalLines 翻页）。响应 data：logs[{line,content}]（行号+内容）、totalLines（总行数）、startIndex、logFileName。日志按天滚动（dev-YYYY-MM-DD.log），只读当前文件。")),
     tag = "UserApp"
 )]
 pub(crate) async fn get_task_logs(
@@ -303,7 +303,7 @@ pub(crate) async fn get_task_logs(
     responses(
         (
             status = 200,
-            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 1 递增，断线重连带 `?fromSeq=<最后seq+1>` 回放续传。\n\n事件清单（event 名 → data 载荷）：\n- `stage` → `{'event':'stage','stage':'<阶段名>'}`（任务进入新阶段）\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始编译某服务）\n- `build_ok` → `{'event':'buildOk','service':'...'}`（服务编译成功；注意 data 内 tag 为 camelCase）\n- `build_fail` → `{'event':'buildFail','service':'...','error':'...'}`\n- `log` → `{'event':'log','service':'...','line':'<一行实时日志>'}`\n- `completed`（终态）→ `{'event':'completed','releaseId':'...','sha256':'...','sizeBytes':N,'fileName':'...','artifactPath':'builds/workspace-package-{releaseId}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端用 fromSeq 重连续传\n\n终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
+            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 1 递增，断线重连带 `?fromSeq=<最后seq+1>` 回放续传。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始编译某服务）\n- `build_ok` → `{'event':'buildOk','service':'...'}`（服务编译成功；注意 data 内 tag 为 camelCase）\n- `build_fail` → `{'event':'buildFail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','releaseId':'...','sha256':'...','sizeBytes':N,'fileName':'...','artifactPath':'builds/workspace-package-{releaseId}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端用 fromSeq 重连续传\n\n说明：构建日志经独立接口 `GET /tasks/{taskId}/logs` 分页查询，不走本流；`stage`/`log` 两种事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
             content_type = "text/event-stream",
         ),
         (status = 404, description = "Task not found（HttpResult JSON，非 SSE）"),
@@ -371,7 +371,7 @@ pub(crate) async fn stream_task_logs(
     post,
     path = "/tasks/{task_id}/cancel",
     params(("task_id" = String, Path, description = "任务ID")),
-    responses((status = 200, body = HttpResult<CancelData>, description = "取消结果")),
+    responses((status = 200, body = HttpResult<CancelData>, description = "取消结果。双重取消：软取消（置 flag）+ kill 编译进程组；已到终态的任务返回 alreadyTerminal=true 幂等成功。取消成功后任务流发 cancelled 终态事件（SSE）")),
     tag = "UserApp"
 )]
 pub(crate) async fn cancel_task(

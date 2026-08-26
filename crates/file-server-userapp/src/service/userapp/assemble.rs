@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use crate::error::{AppError, AppResult};
+use file_server::error::{AppError, AppResult};
 
 use super::BuiltProject;
 use super::manifest::ReleaseLock;
@@ -193,7 +193,7 @@ fn add_file_if_exists(zw: &mut ZipWriterFile, ws_root: &Path, rel_path: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::zip; // 本地 zip::extract_to（解整体包做断言；非 test 代码用 ::zip 外部 crate raw copy）
+    use file_server::service::zip; // 本地 zip::extract_to（解整体包做断言；非 test 代码用 ::zip 外部 crate raw copy）
     use shared_types::{LockedPingap, PingapMode};
 
     /// 产物相对路径（含 builds/ 子目录前缀——生产调用方传 rel_path 形态）。

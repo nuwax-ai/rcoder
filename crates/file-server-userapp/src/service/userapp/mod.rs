@@ -1,6 +1,6 @@
 //! UserApp workspace 多项目打包：两级 manifest → 遍历子项目 build_generic → 组装整体包。
 //!
-//! - workspace 定位统一 [`crate::workspace::resolve_userapp_dev`]（UserApp 开发卷, 容器无关）。
+//! - workspace 定位统一 [`file_server::workspace::resolve_userapp_dev`]（UserApp 开发卷, 容器无关）。
 //!   workspace 根下有多个子项目（前端/后端/...）。
 //! - file-server 严格读取 Manifest v1，并自动发现一级子项目。
 //! - 组装成版本化整体包 `builds/workspace-package-<release_id>.zip`，内含 release lock。
@@ -24,9 +24,9 @@ pub use manifest::{
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::error::{AppError, AppResult};
-use crate::service::build_generic::{GenericBuildRequest, build_generic};
-use crate::service::build_manager::BuildManager;
+use file_server::error::{AppError, AppResult};
+use file_server::service::build_generic::{GenericBuildRequest, build_generic};
+use file_server::service::build_manager::BuildManager;
 
 use assemble::assemble_workspace_package;
 use manifest::{ReleaseMetadata, build_release_lock, read_workspace_manifest};
@@ -79,7 +79,7 @@ struct BuiltProject {
 /// 快照——创建响应即可返回确定性产物路径），本函数不再内部生成。
 /// 返回版本化整体包及其 release ID、摘要和大小。
 pub async fn build_workspace_package(
-    config: &crate::Config,
+    config: &file_server::Config,
     build_manager: &BuildManager,
     app_id: &str,
     release_id: &str,
@@ -87,7 +87,7 @@ pub async fn build_workspace_package(
     progress: Option<&BuildTask>,
 ) -> AppResult<WorkspaceBuildArtifact> {
     // 1. workspace 根（UserApp 开发卷, 容器无关）
-    let ws = crate::workspace::resolve_userapp_dev(app_id, None, config)?;
+    let ws = file_server::workspace::resolve_userapp_dev(app_id, None, config)?;
     if !ws.is_dir() {
         return Err(AppError::resource(format!(
             "UserApp workspace not found: {} (app_id={app_id})",
@@ -134,7 +134,7 @@ pub async fn build_workspace_package(
         }
         let log_dir = ws.join("logs").join(&proj.dir);
         // path 安全校验 + 拼接（防 `../` 穿越 workspace）
-        let proj_dir = crate::path_safety::ensure_within(&ws, &proj.dir).map_err(|_| {
+        let proj_dir = file_server::path_safety::ensure_within(&ws, &proj.dir).map_err(|_| {
             AppError::validation(format!(
                 "project path escapes workspace: {} (=\"{}\")",
                 proj.dir,
@@ -240,7 +240,7 @@ pub async fn build_workspace_package(
 /// （release_id 在此预生成，创建响应即可返回）。
 pub async fn start_build_task(
     store: &BuildTaskStore,
-    config: &Arc<crate::Config>,
+    config: &Arc<file_server::Config>,
     build_manager: Arc<BuildManager>,
     app_id: String,
     timeout_secs: u64,
@@ -259,7 +259,7 @@ pub async fn start_build_task(
         .await;
     // 预 resolve workspace 根并存入 task,供 logs/SSE handler 解析日志目录
     // ({workspace}/logs/{service}/)。resolve 失败则 emit Failed 终态,不 spawn。
-    match crate::workspace::resolve_userapp_dev(&app_id, None, config) {
+    match file_server::workspace::resolve_userapp_dev(&app_id, None, config) {
         Ok(ws) => task.set_workspace_root(ws).await,
         Err(e) => {
             task.emit(BuildProgressEvent::Failed {

@@ -1,0 +1,71 @@
+[package]
+name = "file-server-userapp"
+# 跟随 file-server 版本线（同仓库同批次演进；分发经 file-server-proxy npm 链，无独立 tag）。
+version = "0.1.1"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "UserApp domain (build/tasks/dev-server/file mirror APIs) split from file-server; assembles full/container routers"
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "file_server_userapp"
+path = "src/lib.rs"
+
+[dependencies]
+# 宿主 crate：TS 对齐路由 + 共享设施（error/extract/AppState/computer impl/dev_server 等）
+file-server = { workspace = true }
+# 共享类型（HttpResult 信封 / manifest / BuildProgressEvent / userapp 常量）
+shared_types = { workspace = true }
+
+# Web 框架
+axum = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+
+# 异步运行时
+tokio = { workspace = true, features = ["full"] }
+
+# 日志
+tracing = { workspace = true }
+
+# 序列化
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+toml = { workspace = true }
+
+# 校验
+garde = { workspace = true, features = ["derive"] }
+
+# 错误处理
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# 安全临时文件（app-files 转发族下载暂存）
+tempfile = { workspace = true }
+
+# app-files 转发族：容器内流式下载 + 解压
+download_utils = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+
+# Zip 打包 (workspace 打包链)
+zip = { workspace = true }
+uuid = { workspace = true }
+
+# 异步流构造 (build 进度 SSE)
+async-stream = { workspace = true }
+
+# 时间 (任务快照时间戳)
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

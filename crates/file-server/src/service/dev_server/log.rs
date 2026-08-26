@@ -213,9 +213,13 @@ pub async fn snapshot_dev_log(dir: &Path, log_type: &str) -> AppResult<Option<Lo
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ReadDevLogResult {
+    /// 日志行列表（含行号，snake_case wire）
     pub logs: Vec<LogLine>,
+    /// 该日志文件总行数（分页导航：startIndex 超过它表示读完）
     pub total_lines: usize,
+    /// 本批起始行号（1-based）
     pub start_index: usize,
+    /// 实际读取的日志文件名（按日期滚动的当前文件）
     pub log_file_name: String,
 }
 

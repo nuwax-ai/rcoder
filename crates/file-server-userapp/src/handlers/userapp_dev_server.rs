@@ -16,12 +16,12 @@ use serde::Serialize;
 use shared_types::HttpResult;
 
 use super::userapp::{UserAppReply, reply};
-use crate::AppState;
-use crate::error::AppError;
-use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::service::dev_server::{DevProcess, KilledPid, ReadDevLogResult, StoppedDev};
+use crate::UserAppState;
 use crate::service::userapp::tasks::BuildTaskStatus;
-use crate::workspace::resolve_userapp_dev;
+use file_server::error::AppError;
+use file_server::extract::{AppJson as Json, AppQuery as Query};
+use file_server::service::dev_server::{DevProcess, KilledPid, ReadDevLogResult, StoppedDev};
+use file_server::workspace::resolve_userapp_dev;
 
 /// 进程表 key（与 web projectId 空间隔离; log_dir 剥前缀）。
 fn dev_key(app_id: &str) -> String {
@@ -39,12 +39,12 @@ fn app_id_of_key(key: &str) -> Option<&str> {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DevOpBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树
     /// `dev/{user_id}/{app_id}` 用；file-server 侧日志审计，不参与容器内定位）
     pub user_id: String,
@@ -132,11 +132,11 @@ pub(crate) struct UserappDevList {
     tag = "UserApp"
 )]
 pub(crate) async fn dev_start(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<DevOpBody>,
 ) -> UserAppReply<UserappDevTaskCreated> {
     let result = async {
-        body.validate().map_err(crate::error::from_garde)?;
+        body.validate().map_err(file_server::error::from_garde)?;
         tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev start");
         let task_id = spawn_dev_task(
             state,
@@ -166,11 +166,11 @@ pub(crate) async fn dev_start(
 /// **联动取消该 app 在途的 start/restart 任务**——否则编译中的任务会在
 /// 编译完成后把刚停的服务重新拉起（停止意图被异步任务推翻）。
 pub(crate) async fn dev_stop(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<DevOpBody>,
 ) -> UserAppReply<UserappDevStopped> {
     let result = async {
-        body.validate().map_err(crate::error::from_garde)?;
+        body.validate().map_err(file_server::error::from_garde)?;
         let key = dev_key(&body.app_id);
         // 先取消在途任务（kill 编译进程组 + 终态 Cancelled），再停服务——
         // 顺序保证任务侧不会再有 start 动作追上来
@@ -183,8 +183,8 @@ pub(crate) async fn dev_stop(
                 super::userapp::cancel_build_task(&task).await;
             }
         }
-        let stopped: StoppedDev = state.dev_server.stop_dev(&key).await?;
-        state.log_cache.delete(&key)?;
+        let stopped: StoppedDev = state.fs.dev_server.stop_dev(&key).await?;
+        state.fs.log_cache.delete(&key)?;
         let all_killed = stopped.killed_pids.iter().all(|k| k.killed);
         let message = if stopped.killed_pids.is_empty() {
             "No running process found"
@@ -217,11 +217,11 @@ pub(crate) async fn dev_stop(
     tag = "UserApp"
 )]
 pub(crate) async fn dev_restart(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<DevOpBody>,
 ) -> UserAppReply<UserappDevTaskCreated> {
     let result = async {
-        body.validate().map_err(crate::error::from_garde)?;
+        body.validate().map_err(file_server::error::from_garde)?;
         tracing::info!(app_id = %body.app_id, user_id = %body.user_id, "userapp dev restart");
         let task_id = spawn_dev_task(
             state,
@@ -263,7 +263,7 @@ pub(crate) enum DevTaskAction {
 /// （manifest 同核编译 → 成功后按 action 启动/重启 dev 服务）。
 /// 终态：Completed（制品四字段占位空）/ Failed（友好错误）。
 async fn spawn_dev_task(
-    state: AppState,
+    state: UserAppState,
     app_id: &str,
     base_path: Option<String>,
     action: DevTaskAction,
@@ -283,7 +283,7 @@ async fn spawn_dev_task(
     let artifact_rel_path = crate::service::userapp::workspace_artifact_rel_path(&release_id);
     task.set_artifact_path(release_id.clone(), artifact_rel_path.clone())
         .await;
-    match resolve_userapp_dev(app_id, None, &state.config) {
+    match resolve_userapp_dev(app_id, None, &state.fs.config) {
         Ok(ws) => task.set_workspace_root(ws.clone()).await,
         Err(e) => {
             task.emit(shared_types::BuildProgressEvent::Failed {
@@ -308,11 +308,11 @@ async fn spawn_dev_task(
         // 专用），对 UserApp 模板项目（Java/Go 多服务）不适用。
         let progress = task_clone.clone();
         let result = crate::service::userapp::build_workspace_package(
-            &state.config,
-            &state.build_manager,
+            &state.fs.config,
+            &state.fs.build_manager,
             &app_id,
             &release_id,
-            state.config.dev_command_timeout_secs,
+            state.fs.config.dev_command_timeout_secs,
             Some(&progress),
         )
         .await;
@@ -322,7 +322,7 @@ async fn spawn_dev_task(
             // 要上新代码用 restart）
             if matches!(action, DevTaskAction::Start)
                 && state
-                    .dev_server
+                    .fs.dev_server
                     .list_dev()?
                     .iter()
                     .any(|p| p.project_id == key)
@@ -343,13 +343,13 @@ async fn spawn_dev_task(
             match action {
                 DevTaskAction::Start => {
                     state
-                        .dev_server
+                        .fs.dev_server
                         .start_dev(&key, &ws, base_path.as_deref())
                         .await?;
                 }
                 DevTaskAction::Restart => {
                     state
-                        .dev_server
+                        .fs.dev_server
                         .restart_dev(&key, &ws, base_path.as_deref())
                         .await?;
                 }
@@ -397,9 +397,9 @@ async fn spawn_dev_task(
     responses((status = 200, body = HttpResult<UserappDevList>, description = "在跑的 UserApp 开发服务列表")),
     tag = "UserApp"
 )]
-pub(crate) async fn dev_list(State(state): State<AppState>) -> UserAppReply<UserappDevList> {
+pub(crate) async fn dev_list(State(state): State<UserAppState>) -> UserAppReply<UserappDevList> {
     let result = async {
-        let processes: Vec<DevProcess> = state.dev_server.list_dev()?;
+        let processes: Vec<DevProcess> = state.fs.dev_server.list_dev()?;
         let list = processes
             .into_iter()
             .filter_map(|p| {
@@ -425,11 +425,12 @@ pub(crate) async fn dev_list(State(state): State<AppState>) -> UserAppReply<User
     tag = "UserApp"
 )]
 pub(crate) async fn dev_logs(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Query(q): Query<DevLogsQuery>,
 ) -> UserAppReply<ReadDevLogResult> {
     tracing::debug!(app_id = %q.app_id, user_id = %q.user_id, "userapp dev logs");
     let result = state
+        .fs
         .dev_server
         .read_dev_log(
             &dev_key(&q.app_id),
@@ -457,8 +458,8 @@ mod tests {
     /// log_dir 剥 userapp: 前缀（目录名不带冒号）。
     #[test]
     fn log_dir_strips_userapp_prefix() {
-        let cfg = crate::Config::default();
-        let dir = crate::service::dev_server::log::log_dir(&cfg, "userapp:my-app");
+        let cfg = file_server::Config::default();
+        let dir = file_server::service::dev_server::log::log_dir(&cfg, "userapp:my-app");
         assert!(dir.ends_with("my-app"), "dir={}", dir.display());
     }
 

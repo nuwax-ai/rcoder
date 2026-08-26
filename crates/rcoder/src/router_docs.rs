@@ -381,9 +381,11 @@ pub fn create_scalar_docs() -> axum::Router {
         ))
 }
 
-/// file-server 下拉文档 = file-server 全量文档剔除内部路由 path。
+/// file-server 下拉文档 = file-server 全量文档（TS 对齐域）+ userApp 域文档
+/// （file-server-userapp crate 独立产出）剔除内部路由 path。
 fn file_server_document() -> utoipa::openapi::OpenApi {
     let mut doc = file_server::openapi::document(file_server::routes::api_router().into_openapi());
+    doc.merge(file_server_userapp::document());
     strip_internal_userapp_paths(&mut doc);
     doc
 }
@@ -391,12 +393,7 @@ fn file_server_document() -> utoipa::openapi::OpenApi {
 /// 主文档 = rcoder 应用管理 + userApp 业务域（选择性合入）。
 fn primary_document() -> utoipa::openapi::OpenApi {
     let mut doc = ApiDoc::openapi();
-    let mut userapp =
-        file_server::openapi::document(file_server::routes::api_router().into_openapi());
-    userapp
-        .paths
-        .paths
-        .retain(|path, _| path.starts_with("/api/userapp"));
+    let mut userapp = file_server_userapp::document();
     strip_internal_userapp_paths(&mut userapp);
     doc.merge(userapp);
     doc
@@ -406,6 +403,42 @@ fn primary_document() -> utoipa::openapi::OpenApi {
 mod openapi_tests {
     use super::*;
     use axum::Router;
+
+    /// 运行日志 SSE 契约锚点：事件清单必须出现在 description 里（同事按 swagger
+    /// 直读对接，描述被精简回一句话在此报红——对齐 file-server-userapp 同款测试）。
+    #[test]
+    fn app_logs_stream_description_carries_sse_contract() {
+        let document = ApiDoc::openapi();
+        let item = document
+            .paths
+            .paths
+            .get("/api/v1/apps/{app_id}/logs/stream")
+            .expect("logs/stream path documented");
+        let op = item.post.as_ref().expect("POST operation");
+        let resp = op
+            .responses
+            .responses
+            .get("200")
+            .expect("200 response present");
+        let desc = match resp {
+            utoipa::openapi::RefOr::Ref(_) => panic!("200 response is a $ref"),
+            utoipa::openapi::RefOr::T(r) => r.description.clone(),
+        };
+        for token in [
+            "log",
+            "source_error",
+            "source_recovered",
+            "cursor_reset",
+            "checkpoint",
+            "heartbeat",
+            "cursor",
+        ] {
+            assert!(
+                desc.contains(token),
+                "logs/stream 描述缺 SSE 事件锚点 {token}"
+            );
+        }
+    }
 
     #[test]
     fn userapp_release_log_and_publish_paths_are_documented() {

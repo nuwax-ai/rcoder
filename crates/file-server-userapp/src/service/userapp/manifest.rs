@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::error::{AppError, AppResult};
+use file_server::error::{AppError, AppResult};
 
 pub use shared_types::{
     BuildSection, ProjectManifest, ProjectMeta, ProxySection, RunSection, WorkspaceManifest,

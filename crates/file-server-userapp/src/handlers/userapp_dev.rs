@@ -13,19 +13,19 @@ use serde::Serialize;
 use serde_json::Value;
 use shared_types::HttpResult;
 
-use super::computer::archive::{download_all_files_impl, zip_workspace_impl};
-use super::computer::exec::{execute_command_impl, get_logs_impl};
-use super::computer::packages::install_project_impl;
-use super::computer::workspace::init_template::init_project_template_impl;
-use super::computer::workspace::push_skills::push_skills_impl;
-use super::multipart::{file_field, text_field};
 use super::userapp::UserAppReply;
 use super::userapp::reply;
 use super::userapp_files::require_app_field;
-use crate::AppState;
-use crate::error::AppError;
-use crate::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
-use crate::workspace::resolve_userapp_dev;
+use crate::UserAppState;
+use file_server::error::AppError;
+use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
+use file_server::handlers::computer::archive::{download_all_files_impl, zip_workspace_impl};
+use file_server::handlers::computer::exec::{execute_command_impl, get_logs_impl};
+use file_server::handlers::computer::packages::install_project_impl;
+use file_server::handlers::computer::workspace::init_template::init_project_template_impl;
+use file_server::handlers::computer::workspace::push_skills::push_skills_impl;
+use file_server::handlers::multipart::{file_field, text_field};
+use file_server::workspace::resolve_userapp_dev;
 
 // ── ensure-workspace ────────────────────────────────────────────────────────────
 
@@ -33,12 +33,12 @@ use crate::workspace::resolve_userapp_dev;
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappEnsureWorkspaceBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
 }
@@ -55,12 +55,12 @@ pub(crate) struct UserappEnsureWorkspaceData {
 /// execute-command 等接口要求 cwd 已存在，故目录创建须先于业务调用）。
 #[utoipa::path(post, path = "/ensure-workspace", request_body = UserappEnsureWorkspaceBody, responses((status = 200, body = HttpResult<UserappEnsureWorkspaceData>, description = "workspace 目录已就绪（含绝对路径）")), tag = "UserApp")]
 pub(crate) async fn ensure_workspace(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<UserappEnsureWorkspaceBody>,
 ) -> UserAppReply<UserappEnsureWorkspaceData> {
     let result = async {
-        body.validate().map_err(crate::error::from_garde)?;
-        let ws = resolve_userapp_dev(&body.app_id, None, &state.config)?;
+        body.validate().map_err(file_server::error::from_garde)?;
+        let ws = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
         tokio::fs::create_dir_all(&ws)
             .await
             .map_err(|e| AppError::system(format!("create workspace {}: {e}", ws.display())))?;
@@ -77,28 +77,28 @@ pub(crate) async fn ensure_workspace(
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappExecCommandBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// shell 命令串（经 shell -c 执行，cwd=workspace）
     pub command: String,
 }
 
 /// `POST /api/userapp/execute-command`: 终端命令执行 (cwd=workspace, shell -c + 超时捕获)。
-#[utoipa::path(post, path = "/execute-command", request_body = UserappExecCommandBody, responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/execute-command", request_body = UserappExecCommandBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn execute_command(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<UserappExecCommandBody>,
 ) -> Result<Json<Value>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
-    let cwd = resolve_userapp_dev(&body.app_id, None, &state.config)?;
-    execute_command_impl(&state, cwd, &body.command).await
+    body.validate().map_err(file_server::error::from_garde)?;
+    let cwd = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
+    execute_command_impl(&state.fs, cwd, &body.command).await
 }
 
 // ── get-logs ────────────────────────────────────────────────────────────────────
@@ -108,12 +108,12 @@ pub(crate) async fn execute_command(
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappGetLogsQuery {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default = "default_tail_lines")]
@@ -129,16 +129,16 @@ fn default_tail_lines() -> usize {
     get,
     path = "/get-logs",
     params(UserappGetLogsQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses(file_server::openapi::JsonApiResponses),
     tag = "UserApp"
 )]
 pub(crate) async fn get_logs(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Query(q): Query<UserappGetLogsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    q.validate().map_err(crate::error::from_garde)?;
-    let log_dir = resolve_userapp_dev(&q.app_id, None, &state.config)?.join(".logs");
-    get_logs_impl(&state, log_dir, q.tail_lines).await
+    q.validate().map_err(file_server::error::from_garde)?;
+    let log_dir = resolve_userapp_dev(&q.app_id, None, &state.fs.config)?.join(".logs");
+    get_logs_impl(&state.fs, log_dir, q.tail_lines).await
 }
 
 // ── install-project ─────────────────────────────────────────────────────────────
@@ -146,10 +146,10 @@ pub(crate) async fn get_logs(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappInstallBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     /// 语言：typescript/ts→pnpm install；python/py→pip install
@@ -157,14 +157,14 @@ pub(crate) struct UserappInstallBody {
 }
 
 /// `POST /api/userapp/install-project`: 依赖安装 (typescript→pnpm / python→pip)。
-#[utoipa::path(post, path = "/install-project", request_body = UserappInstallBody, responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/install-project", request_body = UserappInstallBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn install_project(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<UserappInstallBody>,
 ) -> Result<Json<Value>, AppError> {
     tracing::debug!(app_id = %body.app_id, user_id = %body.user_id, "userapp install-project");
-    let ws = resolve_userapp_dev(&body.app_id, None, &state.config)?;
-    install_project_impl(&state, ws, &body.programming_language).await
+    let ws = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
+    install_project_impl(&state.fs, ws, &body.programming_language).await
 }
 
 // ── zip-workspace ───────────────────────────────────────────────────────────────
@@ -172,10 +172,10 @@ pub(crate) async fn install_project(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappZipBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default)]
@@ -189,18 +189,24 @@ pub(crate) struct UserappZipBody {
     path = "/zip-workspace",
     request_body = UserappZipBody,
     responses(
-        (status = 200, description = "Workspace ZIP archive", body = crate::openapi::BinaryFile, content_type = "application/zip"),
-        crate::openapi::ErrorApiResponses
+        (status = 200, description = "Workspace ZIP archive", body = file_server::openapi::BinaryFile, content_type = "application/zip"),
+        file_server::openapi::ErrorApiResponses
     ),
     tag = "UserApp"
 )]
 pub(crate) async fn zip_workspace(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<UserappZipBody>,
 ) -> Result<Response, AppError> {
-    let src = resolve_userapp_dev(&body.app_id, None, &state.config)?;
+    let src = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
     let filename = format!("{}_{}.zip", body.user_id, body.app_id);
-    zip_workspace_impl(&state, src, body.exclude_dirs.unwrap_or_default(), filename).await
+    zip_workspace_impl(
+        &state.fs,
+        src,
+        body.exclude_dirs.unwrap_or_default(),
+        filename,
+    )
+    .await
 }
 
 // ── download-all-files ──────────────────────────────────────────────────────────
@@ -209,10 +215,10 @@ pub(crate) async fn zip_workspace(
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappDownloadQuery {
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default)]
@@ -227,20 +233,20 @@ pub(crate) struct UserappDownloadQuery {
     path = "/download-all-files",
     params(UserappDownloadQuery),
     responses(
-        (status = 200, description = "Workspace ZIP archive", body = crate::openapi::BinaryFile, content_type = "application/zip"),
-        crate::openapi::ErrorApiResponses
+        (status = 200, description = "Workspace ZIP archive", body = file_server::openapi::BinaryFile, content_type = "application/zip"),
+        file_server::openapi::ErrorApiResponses
     ),
     tag = "UserApp"
 )]
 pub(crate) async fn download_all_files(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Query(q): Query<UserappDownloadQuery>,
 ) -> Result<Response, AppError> {
-    q.validate().map_err(crate::error::from_garde)?;
-    let src = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.config)?;
+    q.validate().map_err(file_server::error::from_garde)?;
+    let src = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
     let prefix = format!("{}_{}/", q.user_id, q.app_id);
     let filename = format!("{}_{}.zip", q.user_id, q.app_id);
-    download_all_files_impl(&state, src, prefix, filename).await
+    download_all_files_impl(&state.fs, src, prefix, filename).await
 }
 
 // ── init-project-template ───────────────────────────────────────────────────────
@@ -262,9 +268,9 @@ pub struct UserappInitTemplateForm {
 
 /// `POST /api/userapp/init-project-template`: 模板 zip 解压初始化开发卷 workspace
 /// (可选 git init, 双开关 GIT_ENABLED && enableGit)。UserApp 开发的起点接口。
-#[utoipa::path(post, path = "/init-project-template", request_body(content = UserappInitTemplateForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/init-project-template", request_body(content = UserappInitTemplateForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn init_project_template(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     let mut app_id = None;
@@ -283,8 +289,8 @@ pub(crate) async fn init_project_template(
                 data = Some(
                     file_field(
                         field,
-                        state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        state.fs.config.upload_max_file_size_bytes,
+                        &state.fs.config.upload_project_dir.join("temp"),
                     )
                     .await?,
                 )
@@ -302,8 +308,8 @@ pub(crate) async fn init_project_template(
     let user_id = require_app_field(user_id, "userId")?;
     tracing::debug!(app_id = %app_id, user_id, "userapp init-project-template");
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
-    let ws = resolve_userapp_dev(&app_id, None, &state.config)?;
-    init_project_template_impl(&state, ws, data, enable_git).await
+    let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
+    init_project_template_impl(&state.fs, ws, data, enable_git).await
 }
 
 // ── push-skills-to-workspace ────────────────────────────────────────────────────
@@ -327,9 +333,9 @@ pub struct UserappPushSkillsForm {
 
 /// `POST /api/userapp/push-skills-to-workspace`: 技能推送 (zip/skillUrls)。
 /// 开发卷布局下技能一律推 `{ws}/.agents/skills` (legacy 路径)。
-#[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = UserappPushSkillsForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = UserappPushSkillsForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn push_skills_to_workspace(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     let mut app_id = None;
@@ -349,8 +355,8 @@ pub(crate) async fn push_skills_to_workspace(
                 zip_data = Some(
                     file_field(
                         field,
-                        state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        state.fs.config.upload_max_file_size_bytes,
+                        &state.fs.config.upload_project_dir.join("temp"),
                     )
                     .await?,
                 )
@@ -370,9 +376,9 @@ pub(crate) async fn push_skills_to_workspace(
     let app_id = require_app_field(app_id, "appId")?;
     let user_id = require_app_field(user_id, "userId")?;
     tracing::debug!(app_id = %app_id, user_id, "userapp push-skills");
-    let ws = resolve_userapp_dev(&app_id, None, &state.config)?;
+    let ws = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     push_skills_impl(
-        &state,
+        &state.fs,
         &ws,
         &app_id,
         zip_data.as_ref(),

@@ -1,0 +1,280 @@
+//! `/api/userapp` 路由与文档（自 file-server routes/mod.rs 迁出）。
+
+use axum::routing::options;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+use crate::UserAppState;
+use crate::handlers::{
+    static_files, userapp, userapp_app_files, userapp_dev, userapp_dev_server, userapp_files,
+};
+
+/// `/api/userapp` 路由（workspace 多项目打包 + 文件操作镜像族 + 取整体包）。
+fn userapp_router() -> OpenApiRouter<UserAppState> {
+    OpenApiRouter::new()
+        .routes(routes!(userapp::build_workspace))
+        .routes(routes!(userapp::get_task))
+        .routes(routes!(userapp::get_task_logs))
+        .routes(routes!(userapp::stream_task_logs))
+        .routes(routes!(userapp::cancel_task))
+        .routes(routes!(userapp::detect_project))
+        .routes(routes!(userapp::confirm_project))
+        .routes(routes!(userapp_files::get_file_list))
+        .routes(routes!(userapp_files::resolve_file))
+        .routes(routes!(userapp_files::search_files))
+        .routes(routes!(userapp_files::files_update))
+        .routes(routes!(userapp_files::upload_file))
+        .routes(routes!(userapp_files::upload_files))
+        .routes(routes!(userapp_files::generate_file))
+        .routes(routes!(userapp_files::import_project))
+        .routes(routes!(userapp_app_files::upload))
+        .routes(routes!(userapp_app_files::upload_from_url))
+        .routes(routes!(userapp_app_files::list))
+        .routes(routes!(userapp_app_files::delete))
+        .routes(routes!(userapp_dev::ensure_workspace))
+        .routes(routes!(userapp_dev::execute_command))
+        .routes(routes!(userapp_dev::get_logs))
+        .routes(routes!(userapp_dev::install_project))
+        .routes(routes!(userapp_dev::zip_workspace))
+        .routes(routes!(userapp_dev::download_all_files))
+        .routes(routes!(userapp_dev::init_project_template))
+        .routes(routes!(userapp_dev::push_skills_to_workspace))
+        .routes(routes!(userapp_dev_server::dev_start))
+        .routes(routes!(userapp_dev_server::dev_stop))
+        .routes(routes!(userapp_dev_server::dev_restart))
+        .routes(routes!(userapp_dev_server::dev_list))
+        .routes(routes!(userapp_dev_server::dev_logs))
+        .routes(routes!(static_files::serve_userapp))
+        .route("/static/{app_id}", options(static_files::serve_userapp))
+}
+
+/// userApp 域顶层：nest `/api/userapp` 前缀（路径注解为相对路径，文档收集时
+/// 自动带前缀——与 file-server 侧原组织一致）。
+pub(crate) fn userapp_top_router() -> OpenApiRouter<UserAppState> {
+    OpenApiRouter::new().nest("/api/userapp", userapp_router())
+}
+
+/// userApp 域独立 OpenAPI 文档（含 UserApp tag；rcoder 聚合与本地 swagger 用）。
+#[derive(OpenApi)]
+#[openapi(
+    info(title = "file-server-userapp", description = "UserApp domain APIs (build/tasks/dev-server/file mirror)"),
+    tags((name = "UserApp", description = "UserApp workspace 构建/任务/开发服务/文件镜像族"))
+)]
+struct ApiDoc;
+
+/// 组装好的域文档：ApiDoc 基础 + 路由收集（路径带 `/api/userapp` 前缀）。
+pub fn document() -> utoipa::openapi::OpenApi {
+    use utoipa::OpenApi as _;
+    let mut doc = ApiDoc::openapi();
+    doc.merge(userapp_top_router().into_openapi());
+    doc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 路径锚点 + 计数守卫（自 file-server openapi.rs 迁入）：路由全量注册且
+    /// 路径规约（无 `{*}` 通配残留——OpenAPI path template 写作 `{rest}`）。
+    #[test]
+    fn document_contains_every_registered_operation() {
+        let document = document();
+        for path in [
+            "/api/userapp/build",
+            "/api/userapp/tasks/{task_id}",
+            "/api/userapp/tasks/{task_id}/logs",
+            "/api/userapp/tasks/{task_id}/logs/stream",
+            "/api/userapp/tasks/{task_id}/cancel",
+            "/api/userapp/projects/detect",
+            "/api/userapp/projects/confirm",
+            "/api/userapp/get-file-list",
+            "/api/userapp/resolve-file",
+            "/api/userapp/search-files",
+            "/api/userapp/files-update",
+            "/api/userapp/upload-file",
+            "/api/userapp/upload-files",
+            "/api/userapp/generate-file",
+            "/api/userapp/import-project",
+            "/api/userapp/app-files/upload",
+            "/api/userapp/app-files/upload-from-url",
+            "/api/userapp/app-files/list",
+            "/api/userapp/app-files/delete",
+            "/api/userapp/ensure-workspace",
+            "/api/userapp/execute-command",
+            "/api/userapp/get-logs",
+            "/api/userapp/install-project",
+            "/api/userapp/zip-workspace",
+            "/api/userapp/download-all-files",
+            "/api/userapp/init-project-template",
+            "/api/userapp/push-skills-to-workspace",
+            "/api/userapp/dev/start",
+            "/api/userapp/dev/stop",
+            "/api/userapp/dev/restart",
+            "/api/userapp/dev/list",
+            "/api/userapp/dev/logs",
+            "/api/userapp/static/{app_id}",
+        ] {
+            assert!(
+                document.paths.paths.contains_key(path),
+                "userapp path missing: {path}"
+            );
+        }
+        assert_eq!(document.paths.paths.len(), 33);
+        assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
+    }
+
+    /// 对接级描述锚点：SSE 事件契约与关键任务语义必须出现在 description 里——
+    /// 同事按 swagger 直读对接，描述被精简回一句话会在此处报红。
+    #[test]
+    fn sse_and_task_endpoints_carry_event_contracts() {
+        let document = document();
+        let success_desc = |path: &str| -> String {
+            let item = document
+                .paths
+                .paths
+                .get(path)
+                .unwrap_or_else(|| panic!("path {path} missing"));
+            let op = item
+                .get
+                .as_ref()
+                .or(item.post.as_ref())
+                .unwrap_or_else(|| panic!("operation {path} missing"));
+            let resp = op
+                .responses
+                .responses
+                .get("200")
+                .unwrap_or_else(|| panic!("{path} has no 200 response"));
+            match resp {
+                utoipa::openapi::RefOr::Ref(_) => panic!("{path} 200 response is a $ref"),
+                utoipa::openapi::RefOr::T(resp) => resp.description.clone(),
+            }
+        };
+
+        let sse = success_desc("/api/userapp/tasks/{task_id}/logs/stream");
+        for token in [
+            "building",
+            "build_ok",
+            "completed",
+            "failed",
+            "cancelled",
+            "stream_lagged",
+            "fromSeq",
+            "keep-alive",
+            "artifactPath",
+        ] {
+            assert!(sse.contains(token), "SSE 描述缺事件/协议锚点 {token}");
+        }
+
+        let build = success_desc("/api/userapp/build");
+        assert!(
+            build.contains("taskId") && build.contains("artifactPath") && build.contains("pending"),
+            "build 受理描述缺关键语义"
+        );
+
+        let task = success_desc("/api/userapp/tasks/{task_id}");
+        assert!(
+            task.contains("completed") && task.contains("轮询"),
+            "task 快照描述缺终态/轮询语义"
+        );
+    }
+
+    /// 文档质量防回归: 全部接口的 path/query 参数与请求体 schema 字段必须有
+    /// 非空 description（doc comment 是唯一来源——新字段不写注释此处报红）。
+    /// 自 file-server openapi.rs 迁入。
+    #[test]
+    fn userapp_endpoints_fields_are_documented() {
+        let document = document();
+        let mut checked_params = 0usize;
+        let mut checked_fields = 0usize;
+        for (path, item) in &document.paths.paths {
+            for operation in [&item.get, &item.post].into_iter().flatten() {
+                if let Some(params) = &operation.parameters {
+                    for p in params {
+                        assert!(
+                            p.description.as_ref().is_some_and(|d| !d.trim().is_empty()),
+                            "{path} 参数 {:?} 缺少 description（补 doc comment）",
+                            p.name
+                        );
+                        checked_params += 1;
+                    }
+                }
+            }
+        }
+        // 组件 schema 的字段 description（Userapp* Form/Body 与 dev server 的 DTO）
+        for (name, schema) in &document
+            .components
+            .as_ref()
+            .expect("components present")
+            .schemas
+        {
+            if !name.starts_with("Userapp") && name != "DevOpBody" && name != "DevLogsQuery" {
+                continue;
+            }
+            let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(obj)) = schema
+            else {
+                continue;
+            };
+            for (field, value) in &obj.properties {
+                let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(field_obj)) =
+                    value
+                else {
+                    continue;
+                };
+                assert!(
+                    field_obj
+                        .description
+                        .as_ref()
+                        .is_some_and(|d| !d.trim().is_empty()),
+                    "schema {name} 字段 {field} 缺少 description（补 doc comment）"
+                );
+                checked_fields += 1;
+            }
+        }
+        assert!(checked_params > 30, "参数检查覆盖异常: {checked_params}");
+        assert!(
+            checked_fields > 20,
+            "schema 字段检查覆盖异常: {checked_fields}"
+        );
+    }
+
+    /// 新契约接口响应必须包 HttpResult 信封（`{code, message, data, tid, success}`），
+    /// 防响应形态漂移回裸 JSON / TS 风格。TS 迁移镜像族（userapp_files/app_files、
+    /// execute-command 等 15 个）豁免——保持 nuwax-file-server 原形态。
+    /// 自 file-server openapi.rs 迁入。
+    #[test]
+    fn userapp_new_contract_endpoints_are_http_result_enveloped() {
+        let value = serde_json::to_value(document()).expect("serialize OpenAPI");
+        let paths = value["paths"].as_object().expect("paths object");
+        // 6 个 Rust 新契约接口（TS 无对应端点）：dev 生命周期 5 + ensure-workspace
+        let expected_refs = [
+            ("/api/userapp/dev/start", "HttpResult_UserappDevTaskCreated"),
+            ("/api/userapp/dev/stop", "HttpResult_UserappDevStopped"),
+            (
+                "/api/userapp/dev/restart",
+                "HttpResult_UserappDevTaskCreated",
+            ),
+            ("/api/userapp/dev/list", "HttpResult_UserappDevList"),
+            ("/api/userapp/dev/logs", "HttpResult_ReadDevLogResult"),
+            (
+                "/api/userapp/ensure-workspace",
+                "HttpResult_UserappEnsureWorkspaceData",
+            ),
+        ];
+        for (path, expected_schema) in expected_refs {
+            let operation = paths[path]
+                .get("post")
+                .or_else(|| paths[path].get("get"))
+                .unwrap_or_else(|| panic!("{path} must be registered"));
+            let schema = &operation["responses"]["200"]["content"]["application/json"]["schema"];
+            let reference = schema["$ref"].as_str().unwrap_or_else(|| {
+                panic!("{path} 200 response must $ref a named schema, got: {schema}")
+            });
+            assert_eq!(
+                reference,
+                format!("#/components/schemas/{expected_schema}"),
+                "{path} 响应必须包 HttpResult 信封（data 载荷 = {expected_schema}）"
+            );
+        }
+    }
+}

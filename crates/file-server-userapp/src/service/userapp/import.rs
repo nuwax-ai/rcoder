@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::error::{AppError, AppResult};
+use file_server::error::{AppError, AppResult};
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -18,7 +18,7 @@ pub struct DetectionResult {
 
 pub async fn detect_project(workspace: &Path, project_dir: &str) -> AppResult<DetectionResult> {
     validate_project_dir(project_dir)?;
-    let project = crate::path_safety::ensure_within(workspace, project_dir)
+    let project = file_server::path_safety::ensure_within(workspace, project_dir)
         .map_err(|_| AppError::validation("projectDir escapes workspace"))?;
     if !project.is_dir() {
         return Err(AppError::resource(format!(
@@ -79,7 +79,7 @@ format = "{log_format}"
 
 pub async fn confirm_project(workspace: &Path, project_dir: &str) -> AppResult<String> {
     validate_project_dir(project_dir)?;
-    let project = crate::path_safety::ensure_within(workspace, project_dir)
+    let project = file_server::path_safety::ensure_within(workspace, project_dir)
         .map_err(|_| AppError::validation("projectDir escapes workspace"))?;
     let draft = project.join("project.manifest.draft.toml");
     let content = tokio::fs::read_to_string(&draft)

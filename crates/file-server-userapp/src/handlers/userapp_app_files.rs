@@ -15,11 +15,11 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
-use crate::AppState;
-use crate::error::{AppError, AppResult};
-use crate::handlers::multipart::{file_field, text_field};
+use crate::UserAppState;
 use crate::handlers::userapp_files::require_app_field;
-use crate::workspace::resolve_userapp_dev;
+use file_server::error::{AppError, AppResult};
+use file_server::handlers::multipart::{file_field, text_field};
+use file_server::workspace::resolve_userapp_dev;
 
 use download_utils::{
     DownloadConfig, Downloader, detect_file_type_from_path, extract_tar_gz, extract_zip,
@@ -48,9 +48,9 @@ pub struct AppFilesUploadForm {
 }
 
 /// `POST /api/userapp/app-files/upload`: 单次上传（zip/tar.gz 自动解压；单文件直写）。
-#[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn upload(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut app_id = None;
@@ -72,8 +72,8 @@ pub(crate) async fn upload(
                 data = Some(
                     file_field(
                         field,
-                        state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        state.fs.config.upload_max_file_size_bytes,
+                        &state.fs.config.upload_project_dir.join("temp"),
                     )
                     .await?,
                 )
@@ -85,7 +85,7 @@ pub(crate) async fn upload(
     let user_id = require_app_field(user_id, "userId")?;
     let target = require_app_field(target, "target")?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
-    let root = resolve_userapp_dev(&app_id, None, &state.config)?;
+    let root = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     let result = upload_impl(&root, &target, flatten, data.path(), data.size()).await?;
     info!(app_id = %app_id, user_id = %user_id, target = %target, "app-files upload done");
     Ok(Json(json!({
@@ -191,12 +191,12 @@ pub struct AppFilesUploadFromUrlBody {
 }
 
 /// `POST /api/userapp/app-files/upload-from-url`: 容器内流式下载后走上传核心。
-#[utoipa::path(post, path = "/app-files/upload-from-url", request_body = AppFilesUploadFromUrlBody, responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/app-files/upload-from-url", request_body = AppFilesUploadFromUrlBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn upload_from_url(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<AppFilesUploadFromUrlBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let root = resolve_userapp_dev(&body.app_id, None, &state.config)?;
+    let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
     let downloader = Downloader::new(DownloadConfig::default());
     let cancel = CancellationToken::new();
     let tmp = tokio::task::spawn_blocking(tempfile::NamedTempFile::new)
@@ -243,15 +243,15 @@ pub struct AppFilesListParams {
     get,
     path = "/app-files/list",
     params(AppFilesListParams),
-    responses(crate::openapi::JsonApiResponses),
+    responses(file_server::openapi::JsonApiResponses),
     tag = "UserApp"
 )]
 pub(crate) async fn list(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Query(params): Query<AppFilesListParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     tracing::debug!(app_id = %params.app_id, user_id = %params.user_id, "app-files list");
-    let root = resolve_userapp_dev(&params.app_id, None, &state.config)?;
+    let root = resolve_userapp_dev(&params.app_id, None, &state.fs.config)?;
     if !root.exists() {
         return Ok(Json(json!({"success": true, "files": []})));
     }
@@ -319,13 +319,13 @@ pub struct AppFilesDeleteBody {
 }
 
 /// `POST /api/userapp/app-files/delete`: 删除文件或目录（防穿越）。
-#[utoipa::path(post, path = "/app-files/delete", request_body = AppFilesDeleteBody, responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/app-files/delete", request_body = AppFilesDeleteBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn delete(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<AppFilesDeleteBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     info!(app_id = %body.app_id, user_id = %body.user_id, path = %body.path, "app-files delete");
-    let root = resolve_userapp_dev(&body.app_id, None, &state.config)?;
+    let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
     if !root.exists() {
         return Err(AppError::resource(format!(
             "app root does not exist: {}",

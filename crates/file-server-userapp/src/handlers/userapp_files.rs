@@ -10,20 +10,20 @@ use garde::Validate;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::computer::files::files_update_impl;
-use super::computer::files::generate::generate_file_impl;
-use super::computer::files::import_project::import_project_impl;
-use super::computer::files::upload::{upload_file_impl, upload_files_impl};
-use super::computer::files_read::{
+use crate::UserAppState;
+use file_server::error::AppError;
+use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
+use file_server::handlers::computer::files::files_update_impl;
+use file_server::handlers::computer::files::generate::generate_file_impl;
+use file_server::handlers::computer::files::import_project::import_project_impl;
+use file_server::handlers::computer::files::upload::{upload_file_impl, upload_files_impl};
+use file_server::handlers::computer::files_read::{
     FileListParams, SearchFilesParams, get_file_list_impl, resolve_file_impl, search_files_impl,
 };
-use super::multipart::{file_field, text_field, validate_zip_ext};
-use crate::AppState;
-use crate::error::AppError;
-use crate::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
-use crate::service::code as code_service;
-use crate::service::temp_file::TemporaryFile;
-use crate::workspace::resolve_userapp_dev;
+use file_server::handlers::multipart::{file_field, text_field, validate_zip_ext};
+use file_server::service::code as code_service;
+use file_server::service::temp_file::TemporaryFile;
+use file_server::workspace::resolve_userapp_dev;
 
 // ── get-file-list ───────────────────────────────────────────────────────────────
 
@@ -32,10 +32,10 @@ use crate::workspace::resolve_userapp_dev;
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappFileListQuery {
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default)]
@@ -61,17 +61,17 @@ pub(crate) struct UserappFileListQuery {
     get,
     path = "/get-file-list",
     params(UserappFileListQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses(file_server::openapi::JsonApiResponses),
     tag = "UserApp"
 )]
 pub(crate) async fn get_file_list(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Query(q): Query<UserappFileListQuery>,
 ) -> Result<Json<Value>, AppError> {
-    q.validate().map_err(crate::error::from_garde)?;
-    let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.config)?;
+    q.validate().map_err(file_server::error::from_garde)?;
+    let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
     get_file_list_impl(
-        &state,
+        &state.fs,
         &path,
         FileListParams {
             proxy_path: q.proxy_path.as_deref(),
@@ -89,10 +89,10 @@ pub(crate) async fn get_file_list(
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappResolveFileQuery {
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default)]
@@ -103,7 +103,7 @@ pub(crate) struct UserappResolveFileQuery {
     #[garde(skip)]
     /// 目标根目录覆盖；trim 后非空则直接信任作为 workspace 根（Java 侧负责合法性）
     pub custom_target_dir: Option<String>,
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// workspace 内相对路径的文件（必填非空）
     pub file_path: String,
 }
@@ -113,15 +113,15 @@ pub(crate) struct UserappResolveFileQuery {
     get,
     path = "/resolve-file",
     params(UserappResolveFileQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses(file_server::openapi::JsonApiResponses),
     tag = "UserApp"
 )]
 pub(crate) async fn resolve_file(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Query(q): Query<UserappResolveFileQuery>,
 ) -> Result<Json<Value>, AppError> {
-    q.validate().map_err(crate::error::from_garde)?;
-    let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.config)?;
+    q.validate().map_err(file_server::error::from_garde)?;
+    let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
     resolve_file_impl(
         path,
         q.file_path.trim(),
@@ -137,10 +137,10 @@ pub(crate) async fn resolve_file(
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappSearchFilesQuery {
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     #[serde(default)]
@@ -155,16 +155,16 @@ pub(crate) struct UserappSearchFilesQuery {
     #[garde(skip)]
     /// 相对 workspace 根的子目录（可多级）；缺省列根目录
     pub relative_path: Option<String>,
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 搜索关键字（文件名/相对路径子串，大小写不敏感；必填非空）
     pub kw: String,
-    #[garde(custom(crate::validation_rules::positive_int))]
+    #[garde(custom(file_server::validation_rules::positive_int))]
     /// 命中条数上限（必填正整数）
     pub limit: String,
-    #[garde(custom(crate::validation_rules::positive_int))]
+    #[garde(custom(file_server::validation_rules::positive_int))]
     /// 访问条目数硬上限，含未命中（必填正整数）
     pub max_visit: String,
-    #[garde(custom(crate::validation_rules::positive_int))]
+    #[garde(custom(file_server::validation_rules::positive_int))]
     /// 超时毫秒数（必填正整数）
     pub timeout_ms: String,
 }
@@ -174,17 +174,17 @@ pub(crate) struct UserappSearchFilesQuery {
     get,
     path = "/search-files",
     params(UserappSearchFilesQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses(file_server::openapi::JsonApiResponses),
     tag = "UserApp"
 )]
 pub(crate) async fn search_files(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Query(q): Query<UserappSearchFilesQuery>,
 ) -> Result<Json<Value>, AppError> {
-    q.validate().map_err(crate::error::from_garde)?;
-    let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.config)?;
+    q.validate().map_err(file_server::error::from_garde)?;
+    let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
     search_files_impl(
-        &state,
+        &state.fs,
         path,
         SearchFilesParams {
             proxy_path: q.proxy_path.as_deref(),
@@ -204,10 +204,10 @@ pub(crate) async fn search_files(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappFilesUpdateBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
     /// 上传文件的二进制内容（重复字段，与 filePaths 一一对应）
@@ -218,15 +218,15 @@ pub(crate) struct UserappFilesUpdateBody {
 }
 
 /// `POST /api/userapp/files-update`: 批量文件增删改 (modify 字节比较)。
-#[utoipa::path(post, path = "/files-update", request_body = UserappFilesUpdateBody, responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/files-update", request_body = UserappFilesUpdateBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn files_update(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<UserappFilesUpdateBody>,
 ) -> Result<Json<Value>, AppError> {
     let path = resolve_userapp_dev(
         &body.app_id,
         body.custom_target_dir.as_deref(),
-        &state.config,
+        &state.fs.config,
     )?;
     let count = files_update_impl(&path, body.files).await?;
     Ok(Json(json!({
@@ -270,13 +270,13 @@ pub struct UserappUploadFilesForm {
     /// 每个文件的目标相对路径（与 files 一一对应，重复字段）
     pub file_paths: Vec<String>,
     /// 上传文件的二进制内容（重复字段，与 filePaths 一一对应）
-    pub files: Vec<crate::openapi::BinaryFile>,
+    pub files: Vec<file_server::openapi::BinaryFile>,
 }
 
 /// `POST /api/userapp/upload-file`: 单文件上传 (multipart)。
-#[utoipa::path(post, path = "/upload-file", request_body(content = UserappUploadFileForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/upload-file", request_body(content = UserappUploadFileForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn upload_file(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     let mut app_id = None;
@@ -298,8 +298,8 @@ pub(crate) async fn upload_file(
                 data = Some(
                     file_field(
                         field,
-                        state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        state.fs.config.upload_max_file_size_bytes,
+                        &state.fs.config.upload_project_dir.join("temp"),
                     )
                     .await?,
                 )
@@ -312,14 +312,14 @@ pub(crate) async fn upload_file(
     let file_path = require_app_field(file_path, "filePath")?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     tracing::debug!(app_id = %app_id, user_id = %user_id, "userapp upload-file");
-    let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.config)?;
+    let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
     upload_file_impl(&ws, &file_path, data).await
 }
 
 /// `POST /api/userapp/upload-files`: 多文件上传 (单文件错误隔离)。
-#[utoipa::path(post, path = "/upload-files", request_body(content = UserappUploadFilesForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/upload-files", request_body(content = UserappUploadFilesForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn upload_files(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     let mut app_id = None;
@@ -343,8 +343,8 @@ pub(crate) async fn upload_files(
                     original,
                     file_field(
                         field,
-                        state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        state.fs.config.upload_max_file_size_bytes,
+                        &state.fs.config.upload_project_dir.join("temp"),
                     )
                     .await?,
                 ));
@@ -358,7 +358,7 @@ pub(crate) async fn upload_files(
     if file_paths.len() != files_vec.len() {
         return Err(AppError::validation("filePaths and files count mismatch"));
     }
-    let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.config)?;
+    let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
     upload_files_impl(&ws, &file_paths, &files_vec).await
 }
 
@@ -368,15 +368,15 @@ pub(crate) async fn upload_files(
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserappGenerateFileBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub app_id: String,
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 用户 ID（审计字段，不参与路径定位）
     pub user_id: String,
-    #[garde(custom(crate::validation_rules::not_blank))]
+    #[garde(custom(file_server::validation_rules::not_blank))]
     /// 文件名，可含相对子路径（如 "src/foo.txt"；自动剥前导 `/`）
     pub file_name: String,
     #[serde(default)]
@@ -392,18 +392,18 @@ pub(crate) struct UserappGenerateFileBody {
     post,
     path = "/generate-file",
     request_body = UserappGenerateFileBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses(file_server::openapi::JsonApiResponses),
     tag = "UserApp"
 )]
 pub(crate) async fn generate_file(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     Json(body): Json<UserappGenerateFileBody>,
 ) -> Result<Json<Value>, AppError> {
-    body.validate().map_err(crate::error::from_garde)?;
+    body.validate().map_err(file_server::error::from_garde)?;
     let ws = resolve_userapp_dev(
         &body.app_id,
         body.custom_target_dir.as_deref(),
-        &state.config,
+        &state.fs.config,
     )?;
     generate_file_impl(ws, body.file_name.trim(), body.content.unwrap_or_default()).await
 }
@@ -426,9 +426,9 @@ pub struct UserappImportProjectForm {
 }
 
 /// `POST /api/userapp/import-project`: 上传项目 zip 解压合并到开发卷 workspace。
-#[utoipa::path(post, path = "/import-project", request_body(content = UserappImportProjectForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "UserApp")]
+#[utoipa::path(post, path = "/import-project", request_body(content = UserappImportProjectForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp")]
 pub(crate) async fn import_project(
-    State(state): State<AppState>,
+    State(state): State<UserAppState>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     let mut app_id = None;
@@ -450,8 +450,8 @@ pub(crate) async fn import_project(
                 data = Some(
                     file_field(
                         field,
-                        state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        state.fs.config.upload_max_file_size_bytes,
+                        &state.fs.config.upload_project_dir.join("temp"),
                     )
                     .await?,
                 );
@@ -463,7 +463,7 @@ pub(crate) async fn import_project(
     let user_id = require_app_field(user_id, "userId")?;
     let data: TemporaryFile = data.ok_or_else(|| AppError::validation("file is required"))?;
     validate_zip_ext(file_name.as_deref())?;
-    let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.config)?;
+    let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
     let target = import_project_impl(ws, data).await?;
     Ok(Json(json!({
         "success": true,
@@ -487,14 +487,16 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::extract::AppJson;
-    use crate::{
-        AppState, BuildManager, BuildTaskStore, Config, DevServerManager, LocalWorkspaceResolver,
-        LogCacheManager, SkillDownloader, WorkspaceResolver,
+    use crate::UserAppState;
+    use crate::service::userapp::tasks::BuildTaskStore;
+    use file_server::extract::AppJson;
+    use file_server::{
+        BuildManager, Config, DevServerManager, LocalWorkspaceResolver, LogCacheManager,
+        SkillDownloader, WorkspaceResolver,
     };
 
     /// userapp 版 make_state: `userapp_workspace_dir` 指向 tempdir (resolve_userapp_dev 的根)。
-    fn make_state(userapp_root: std::path::PathBuf) -> AppState {
+    fn make_state(userapp_root: std::path::PathBuf) -> UserAppState {
         let config = Arc::new(Config {
             userapp_workspace_dir: userapp_root,
             ..Config::default()
@@ -503,7 +505,7 @@ mod tests {
             config.project_source_dir.clone(),
             config.computer_workspace_dir.clone(),
         ));
-        AppState {
+        let fs = file_server::AppState {
             resolver,
             dev_server: Arc::new(DevServerManager::new(config.clone())),
             build_manager: Arc::new(BuildManager::new(config.max_build_concurrency)),
@@ -511,9 +513,12 @@ mod tests {
             skill_downloader: Arc::new(
                 SkillDownloader::new(&config).expect("construct skill downloader"),
             ),
-            build_tasks: Arc::new(BuildTaskStore::new()),
             config,
             started_at: std::time::Instant::now(),
+        };
+        UserAppState {
+            fs,
+            build_tasks: Arc::new(BuildTaskStore::new()),
         }
     }
 
@@ -527,10 +532,13 @@ mod tests {
             zw.write_all(content.as_bytes()).unwrap();
         }
         let bytes = zw.finish().unwrap().into_inner();
-        let mut writer =
-            crate::service::temp_file::TemporaryFileWriter::create(parent, "test-zip-", u64::MAX)
-                .await
-                .expect("create temp writer");
+        let mut writer = file_server::service::temp_file::TemporaryFileWriter::create(
+            parent,
+            "test-zip-",
+            u64::MAX,
+        )
+        .await
+        .expect("create temp writer");
         writer
             .write(&bytes::Bytes::from(bytes))
             .await
@@ -556,9 +564,9 @@ mod tests {
             &tmp.path().join("zips"),
         )
         .await;
-        let ws = resolve_userapp_dev("app-1", None, &state.config).unwrap();
-        super::super::computer::workspace::init_template::init_project_template_impl(
-            &state, ws, data, false,
+        let ws = resolve_userapp_dev("app-1", None, &state.fs.config).unwrap();
+        file_server::handlers::computer::workspace::init_template::init_project_template_impl(
+            &state.fs, ws, data, false,
         )
         .await
         .expect("init template");
