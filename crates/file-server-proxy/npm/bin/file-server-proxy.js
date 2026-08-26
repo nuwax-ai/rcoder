@@ -253,7 +253,7 @@ async function cmdStart(flags) {
     }
     console.log(
       `file-server-proxy started (detached, pid ${child.pid}): http://127.0.0.1:${listenPort} ` +
-        `[policy=${flags.policy} rust=127.0.0.1:${rustPort}` +
+        `[policy=${flags.policy} rust=in-process (embedded)` +
         `${tsPort ? ` ts=127.0.0.1:${tsPort}${tsManaged ? " (managed)" : " (reused)"}` : ""}]`,
     );
     console.log(`  log: ${logPath()}`);

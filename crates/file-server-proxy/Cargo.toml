@@ -2,8 +2,9 @@
 name = "file-server-proxy"
 # 独立版本号: 支持 file-server-proxy 单独打 tag (file-server-proxy-v*) 经 CI 发
 # npm/OSS, 与 rcoder 主版本解耦 (与 crates/file-server 同款纪律)。
-# 0.2.0: file-server 默认集成(lib 直连,无内部 8086)+ ts_first 策略 + CLI 参数化
-version = "0.2.0"
+# 0.2.1: 文档/文案修缮（lib 模块文档补四策略与直连概览；npm start 成功消息
+# 去除直连模式下误导的 rust=8086 展示）
+version = "0.2.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
