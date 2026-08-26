@@ -102,12 +102,16 @@ use crate::handler;
         app_manager::handlers::stream_app_logs_v1,
         app_manager::handlers::upload_from_url,
         crate::userapp_forward::db::align_credentials,
+        crate::userapp_forward::db::reset_password,
+        crate::userapp_forward::db::create_database,
     ),
     components(
         schemas(
-            // userApp 转发层（PG 凭据对齐；create-workspace 为内部接口不入文档）
+            // userApp 转发层（PG 凭据对齐/账号库管理；create-workspace 为内部接口不入文档）
             shared_types::AlignCredentialsRequest,
             shared_types::AlignCredentialsOutcome,
+            shared_types::UserappDbResetPasswordRequest,
+            shared_types::UserappDbCreateDatabaseRequest,
             // 响应结构体
             shared_types::HealthCheckResponse,
             shared_types::AgentChatRequest,

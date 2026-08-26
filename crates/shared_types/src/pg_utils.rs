@@ -114,6 +114,50 @@ pub fn pg_alter_current_user_password_cmd(password: &str) -> String {
     )
 }
 
+/// 建号命令（本地 trust `CREATE ROLE ... LOGIN`；userApp 账号 upsert 的"不存在"分支）。
+///
+/// `username` 须先过 [`validate_pg_identifier`] 白名单（调用方保证）；
+/// 标识符经 [`pg_quote_ident`]、密码字面量经 [`pg_escape_literal`]、SQL 整体经
+/// [`pg_shell_quote`] 单引号包裹——三层防线与 [`pg_alter_password_cmd`] 同款。
+pub fn pg_create_role_cmd(username: &str, password: &str) -> String {
+    let sql = format!(
+        "CREATE ROLE {} LOGIN PASSWORD '{}'",
+        pg_quote_ident(username),
+        pg_escape_literal(password)
+    );
+    format!(
+        "psql -U \"$POSTGRES_USER\" -d postgres -v ON_ERROR_STOP=1 -c {}",
+        pg_shell_quote(&sql)
+    )
+}
+
+/// 库存在性检查命令（本地 trust `-tAc`：命中输出 `1`、未命中输出空——
+/// 比 CREATE 失败后解析 stderr 稳定，PG 不支持 CREATE DATABASE IF NOT EXISTS）。
+/// `db` 须先过 [`validate_pg_identifier`] 白名单；SQL 参数整体单引号包裹作纵深防御。
+pub fn pg_database_exists_cmd(db: &str) -> String {
+    let sql = format!(
+        "SELECT 1 FROM pg_database WHERE datname='{}'",
+        pg_escape_literal(db)
+    );
+    format!(
+        "psql -U \"$POSTGRES_USER\" -d postgres -tAc {}",
+        pg_shell_quote(&sql)
+    )
+}
+
+/// 建库命令（本地 trust `CREATE DATABASE`，可选 OWNER）。
+/// `db`/`owner` 须先过 [`validate_pg_identifier`] 白名单（调用方保证）。
+pub fn pg_create_database_cmd(db: &str, owner: Option<&str>) -> String {
+    let owner_clause = owner
+        .map(|o| format!(" OWNER {}", pg_quote_ident(o)))
+        .unwrap_or_default();
+    let sql = format!("CREATE DATABASE {}{owner_clause}", pg_quote_ident(db));
+    format!(
+        "psql -U \"$POSTGRES_USER\" -d postgres -v ON_ERROR_STOP=1 -c {}",
+        pg_shell_quote(&sql)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +266,47 @@ mod tests {
         let cmd = pg_alter_current_user_password_cmd("pw");
         assert!(cmd.contains("ALTER USER CURRENT_USER"));
         assert!(cmd.contains(r#"-c 'ALTER"#));
+    }
+
+    #[test]
+    fn create_role_cmd_shape_and_escaping() {
+        let cmd = pg_create_role_cmd("biz_user", "pa'ss");
+        // SQL 层：标识符双引号 + 密码 ' → ''；shell 层整体单引号包裹
+        let sql = format!(
+            "CREATE ROLE {} LOGIN PASSWORD '{}'",
+            pg_quote_ident("biz_user"),
+            pg_escape_literal("pa'ss")
+        );
+        assert_eq!(
+            cmd,
+            format!(
+                "psql -U \"$POSTGRES_USER\" -d postgres -v ON_ERROR_STOP=1 -c {}",
+                pg_shell_quote(&sql)
+            )
+        );
+        // 注入面：密码里的 shell 元字符被整体关在单引号内
+        assert!(cmd.contains(&pg_shell_quote(&sql)));
+    }
+
+    #[test]
+    fn database_exists_cmd_uses_plain_output() {
+        let cmd = pg_database_exists_cmd("mydb");
+        // -tAc 纯输出（命中 1/未命中空），不靠 stderr 文本判定；
+        // SQL 经 shell 层转义（' → '\''），期望串用同款构造器合成避免手算叠加
+        let sql = format!(
+            "SELECT 1 FROM pg_database WHERE datname='{}'",
+            pg_escape_literal("mydb")
+        );
+        assert!(cmd.contains(" -tAc "));
+        assert!(cmd.contains(&pg_shell_quote(&sql)));
+    }
+
+    #[test]
+    fn create_database_cmd_owner_clause() {
+        let bare = pg_create_database_cmd("mydb", None);
+        assert!(bare.contains(r#"CREATE DATABASE "mydb""#));
+        assert!(!bare.contains("OWNER"));
+        let owned = pg_create_database_cmd("mydb", Some("biz_user"));
+        assert!(owned.contains(r#"CREATE DATABASE "mydb" OWNER "biz_user""#));
     }
 }

@@ -35,6 +35,14 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/userapp/db/{env}/align-credentials",
             post(db::align_credentials),
         )
+        .route(
+            "/api/userapp/db/{env}/reset-password",
+            post(db::reset_password),
+        )
+        .route(
+            "/api/userapp/db/{env}/create-database",
+            post(db::create_database),
+        )
         .route("/api/userapp/{*rest}", any(forward::forward_userapp))
 }
 

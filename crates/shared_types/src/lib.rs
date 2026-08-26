@@ -21,6 +21,10 @@ pub use userapp::activity::{
     ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, WakeOutcome,
 };
 pub use userapp::build_event::BuildProgressEvent;
+pub use userapp::db_admin::{
+    DbAdminError, DbUserUpsertOutcome, UserappDbCreateDatabaseRequest,
+    UserappDbResetPasswordRequest, create_pg_database, upsert_pg_user,
+};
 pub use userapp::db_align::{
     AlignCredentialsOutcome, AlignCredentialsRequest, AlignError, CommandOutcome, PgCommandRunner,
     align_pg_credentials,
