@@ -1,6 +1,6 @@
 name: release-file-server-proxy
 
-# 发布 file-server-proxy 二进制（--features embed-file-server，内嵌 rust file-server）
+# 发布 file-server-proxy 二进制（default feature=embed-file-server 直连集成内嵌 rust file-server）
 # 到阿里云 OSS + 发布 @nuwax-ai/file-server-proxy npm 包装包（依赖 nuwax-file-server 精确 pin）。
 # 触发：推 tag `file-server-proxy-v*`（稳定 / 预发布）或手动 workflow_dispatch。
 # 与 release-file-server.yml / rcoder release.yml 互不干扰——靠 tag 前缀隔离。
@@ -76,7 +76,7 @@ jobs:
           rustup show
           rustup target add ${{ matrix.target }}
 
-      # protoc/nasm 与 release-file-server.yml 同款保留：embed-file-server 形态的
+      # protoc/nasm 与 release-file-server.yml 同款保留：default embed 直连形态的
       # 依赖树包含 file-server 全树（prost/reqwest rustls aws-lc-rs），构建需求一致。
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -108,9 +108,9 @@ jobs:
           USE_ZIG: ${{ matrix.zig }}
         run: |
           if [ "$USE_ZIG" = "true" ]; then
-            cargo zigbuild --release --target "$TARGET" -p file-server-proxy --bin file-server-proxy --features embed-file-server
+            cargo zigbuild --release --target "$TARGET" -p file-server-proxy --bin file-server-proxy
           else
-            cargo build --release --target "$TARGET" -p file-server-proxy --bin file-server-proxy --features embed-file-server
+            cargo build --release --target "$TARGET" -p file-server-proxy --bin file-server-proxy
           fi
 
       - name: Package archive

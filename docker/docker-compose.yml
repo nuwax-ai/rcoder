@@ -78,6 +78,26 @@ services:
       start_period: 60s
     restart: always
 
+  # TS nuwax-file-server——60000 分流代理的存量域上游（ts_first/userapp_split 验证用）。
+  # 与 rcoder 共享网络栈（network_mode）：proxy lib 的 TS 上游固定 127.0.0.1:60001，
+  # 生产形态二者同容器（start-services.sh），本地以此等价模拟。
+  # npm 装进 named volume，容器重启不重装；版本与 npm 包 @nuwax-ai/file-server-proxy
+  # 的精确 pin 同源（1.4.2）。
+  nuwax-file-server:
+    image: node:22-bookworm-slim
+    network_mode: "service:rcoder"
+    restart: unless-stopped
+    environment:
+      - PORT=60001
+      - NODE_ENV=production
+    working_dir: /opt/ts
+    volumes:
+      - rcoder-ts-npm:/opt/ts
+    command: >
+      sh -c "if [ ! -d node_modules/nuwax-file-server ];
+             then npm install nuwax-file-server@1.4.2 --no-fund --no-audit; fi &&
+             exec node node_modules/nuwax-file-server/dist/server.js"
+
   # Pyroscope Server - 持续剖析数据存储和可视化
   pyroscope:
     image: grafana/pyroscope:latest
@@ -173,3 +193,5 @@ volumes:
   rcoder-cargo-git:
   rcoder-target:
   rcoder-target-console:
+  # TS nuwax-file-server 的 node_modules 缓存（容器重启不重装）
+  rcoder-ts-npm:
