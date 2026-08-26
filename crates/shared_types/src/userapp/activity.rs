@@ -41,8 +41,10 @@ pub trait AppWakeControl: Send + Sync {
     /// app 是否处于 stopped（scale replicas==0）。读内存表，O(1)，供 Pingora 快速短路。
     fn is_stopped(&self, app_id: &str) -> bool;
 
-    /// 确保 app Running：
-    /// - stopped → 唤醒（scale→1 + 轮询 Ready，hold-and-wait ≤ wake_timeout），并发请求合流；
+    /// 确保 app Running（**有请求即唤醒**：闲置回收与手动 stop 统一可唤醒——
+    /// 请求本身就是拉起授权；唤醒过程中新到的手动 stop 由实现尊重，后到者赢）：
+    /// - stopped/wake_blocked → 唤醒（scale→1 + 轮询 Ready，hold-and-wait ≤
+    ///   wake_timeout），并发请求合流；
     /// - running → 立即返回 [`WakeOutcome::AlreadyRunning`]。
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome;
 }

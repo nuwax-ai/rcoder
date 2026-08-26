@@ -171,6 +171,10 @@ mod tests {
         let re = regex::Regex::new(pattern).expect("rewrite pattern must compile");
         let caps = re.captures("/api/v(1)/x").expect("literal path must match");
         assert_eq!(caps.get(1).map(|m| m.as_str()), Some("x"));
-        assert_eq!(caps.get(2), None, "metacharacters must not add capture groups");
+        assert_eq!(
+            caps.get(2),
+            None,
+            "metacharacters must not add capture groups"
+        );
     }
 }

@@ -54,6 +54,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // idle 判定：未部署（无 release.lock——start 无 url 创建的空容器）→ 最小形态
+    // 常驻应答探针（防 kubelet liveness 杀容器），等 start{url} 部署换 Pod 替换本
+    // 进程。lock 存在但损坏不进 idle——走下方正常链 fail-fast（supervisord 重试
+    // 后 FATAL，损坏 lock 是需人工介入的异常态，静默 idle 会掩盖问题）。
+    if !args.workspace.join("release.lock.toml").exists() {
+        app_cli::idle::serve_forever(&args.admin_addr).await;
+        return Ok(()); // 仅 SIGTERM（容器终止/被替换）到达
+    }
+
     // 管理 API（后台并发跑；supervisor 退出时 abort）
     let api_addr = args.admin_addr.clone();
     let api_log_dir = args.log_dir.clone();

@@ -103,9 +103,7 @@ impl LivenessHold {
                         )
                     }),
                 )
-                .fallback(|| async {
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE
-                });
+                .fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE });
             // 无限等待：task 被 abort（deploy 结束时）即整体退出
             let _ = axum::serve(listener, app).await;
         });
@@ -115,10 +113,10 @@ impl LivenessHold {
     /// 释放端口（abort serve task；listener 随 task 结束 drop）。
     pub async fn release(self) {
         self.task.abort();
-        if let Err(e) = self.task.await {
-            if !e.is_cancelled() {
-                warn!("liveness hold exited with error: {e}");
-            }
+        if let Err(e) = self.task.await
+            && !e.is_cancelled()
+        {
+            warn!("liveness hold exited with error: {e}");
         }
     }
 }
@@ -131,9 +129,12 @@ async fn deploy(
     expected_sha: Option<&str>,
 ) -> Result<()> {
     validate_release_id_fs_safe(release_id)?;
-    let volume_root = workspace
-        .parent()
-        .with_context(|| format!("workspace {} has no parent for volume root", workspace.display()))?;
+    let volume_root = workspace.parent().with_context(|| {
+        format!(
+            "workspace {} has no parent for volume root",
+            workspace.display()
+        )
+    })?;
 
     // 1. marker 幂等：同 release_id 且 code 在位 → 跳过
     if let Some(state) = read_state(volume_root).await
@@ -258,10 +259,7 @@ async fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
                 .by_index(index)
                 .with_context(|| format!("zip entry #{index}"))?;
             let Some(rel) = entry.enclosed_name() else {
-                bail!(
-                    "zip entry escapes destination (zip-slip): {}",
-                    entry.name()
-                );
+                bail!("zip entry escapes destination (zip-slip): {}", entry.name());
             };
             let out_path = dest.join(rel);
             if entry.is_dir() {
@@ -298,7 +296,10 @@ async fn read_state(volume_root: &Path) -> Option<DeployState> {
     match toml::from_str(&content) {
         Ok(state) => Some(state),
         Err(e) => {
-            warn!("parse {} failed ({e}); treating as no marker", path.display());
+            warn!(
+                "parse {} failed ({e}); treating as no marker",
+                path.display()
+            );
             None
         }
     }
@@ -383,11 +384,8 @@ format = "jsonl"
         let mut buf = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut buf);
         for (name, content) in entries {
-            zip.start_file(
-                *name,
-                zip::write::SimpleFileOptions::default(),
-            )
-            .expect("start file");
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .expect("start file");
             std::io::Write::write_all(&mut zip, content.as_bytes()).expect("write entry");
         }
         zip.finish().expect("finish zip");
@@ -415,7 +413,10 @@ format = "jsonl"
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
-            socket.write_all(header.as_bytes()).await.expect("write head");
+            socket
+                .write_all(header.as_bytes())
+                .await
+                .expect("write head");
             socket.write_all(&body).await.expect("write body");
         });
         format!("http://{addr}/artifact.zip")
@@ -454,10 +455,12 @@ format = "jsonl"
         assert_eq!(state.release_id, "rel-001");
         assert_eq!(state.sha256, sha);
         // .part 已清理
-        assert!(!volume_root_of(&workspace)
-            .join(INCOMING_DIR)
-            .join("rel-001.zip.part")
-            .exists());
+        assert!(
+            !volume_root_of(&workspace)
+                .join(INCOMING_DIR)
+                .join("rel-001.zip.part")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -531,16 +534,26 @@ format = "jsonl"
         let (_dir, workspace) = make_volume();
         let zip_v1 = build_zip(&[("release.lock.toml", MINIMAL_LOCK), ("v.txt", "1")]);
         let url1 = serve_once(zip_v1).await;
-        deploy(&workspace, &url1, "rel-001", None).await.expect("v1");
+        deploy(&workspace, &url1, "rel-001", None)
+            .await
+            .expect("v1");
 
         let lock_v2 = MINIMAL_LOCK.replace("test-release-0001", "test-release-0002");
         let zip_v2 = build_zip(&[("release.lock.toml", &lock_v2), ("v.txt", "2")]);
         let url2 = serve_once(zip_v2).await;
-        deploy(&workspace, &url2, "rel-002", None).await.expect("v2");
+        deploy(&workspace, &url2, "rel-002", None)
+            .await
+            .expect("v2");
 
-        assert_eq!(std::fs::read_to_string(workspace.join("v.txt")).unwrap(), "2");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("v.txt")).unwrap(),
+            "2"
+        );
         let previous = volume_root_of(&workspace).join(PREVIOUS_DIR);
-        assert_eq!(std::fs::read_to_string(previous.join("v.txt")).unwrap(), "1");
+        assert_eq!(
+            std::fs::read_to_string(previous.join("v.txt")).unwrap(),
+            "1"
+        );
     }
 
     #[test]

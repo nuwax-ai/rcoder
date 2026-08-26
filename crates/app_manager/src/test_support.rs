@@ -40,6 +40,9 @@ pub(crate) struct MockRuntime {
     pub crash_on_start: AtomicBool,
     pub specs: DashMap<String, ContainerSpecSnapshot>,
     pub deployments: DashMap<String, DeploymentStatus>,
+    /// create/patch 收到的参数调用历史（key=project_id 按序追加；断言取首次创建
+    /// 参数用——update 通道的 re-apply 会以 live 回退值再次进入本方法）
+    pub create_params_history: DashMap<String, Vec<ContainerCreateParams>>,
 }
 
 #[async_trait]
@@ -130,7 +133,12 @@ impl UserAppDeploymentRuntime for MockRuntime {
                 "mock create_deployment failure".into(),
             ));
         }
-        let project_id = params.project_id.unwrap_or_default();
+        let project_id = params.project_id.clone().unwrap_or_default();
+        // 捕获参数调用历史（首次创建的 ports/env 断言用）
+        self.create_params_history
+            .entry(project_id.clone())
+            .or_default()
+            .push(params.clone());
         // 登记 deployments（后续 get_app/update 流程的 fetch_runtime_status 需要）
         self.deployments
             .entry(project_id.clone())

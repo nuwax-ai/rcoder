@@ -271,16 +271,20 @@ impl AppActivityRegistry {
         self.note_dirty(app_id);
     }
 
-    /// 仅供流量唤醒成功路径使用。唤醒不能清除并发到达的手动停止标记，
-    /// 否则在途的 scale1 可能覆盖 stop_app 的 scale0。
-    fn try_mark_woken(&self, app_id: &str) -> bool {
-        if self.wake_blocked.contains(app_id) {
+    /// 仅供流量唤醒成功路径使用。
+    /// `preexisting_block`：唤醒启动前 app 已手动 stop（wake_blocked）——请求即
+    /// 授权覆盖历史 stop，成功时一并解除阻断。唤醒**过程中**新到的手动 stop
+    /// （在途 scale1 可能覆盖 stop_app 的 scale0）仍需尊重 → 返回 false，
+    /// 由调用方补偿 scale0（时间后到者赢）。
+    fn try_mark_woken(&self, app_id: &str, preexisting_block: bool) -> bool {
+        if !preexisting_block && self.wake_blocked.contains(app_id) {
             return false;
         }
         self.stopped.remove(app_id);
+        self.wake_blocked.remove(app_id);
         self.last_accessed.insert(app_id.to_string(), Utc::now());
         self.note_dirty(app_id);
-        !self.wake_blocked.contains(app_id)
+        true
     }
 
     async fn keep_intentionally_stopped(
@@ -295,11 +299,11 @@ impl AppActivityRegistry {
 
     /// leader 实际执行唤醒:scale→1 + 轮询直到 Running/Error/超时
     async fn wake_leader(&self, app_id: &str) -> WakeOutcome {
-        // double-check:进入 leader 前可能已被别处拉起
-        if self.wake_blocked.contains(app_id) {
-            return WakeOutcome::Failed("app is intentionally stopped".into());
-        }
-        if !self.stopped.contains(app_id) {
+        // 唤醒启动前已手动 stop（wake_blocked）：请求即授权覆盖历史 stop
+        //（有请求即唤醒语义）；记录基线，唤醒**过程中**新到的 stop 才触发
+        // 竞争补偿——时间后到者赢，并发 stop 语义不破。
+        let preexisting_block = self.wake_blocked.contains(app_id);
+        if !preexisting_block && !self.stopped.contains(app_id) {
             return WakeOutcome::AlreadyRunning;
         }
         let rt = match self.runtime.get() {
@@ -312,19 +316,19 @@ impl AppActivityRegistry {
         if let Err(e) = rt.scale_deployment(app_id, 1).await {
             return WakeOutcome::Failed(format!("scale_deployment: {e}"));
         }
-        if self.wake_blocked.contains(app_id) {
+        if !preexisting_block && self.wake_blocked.contains(app_id) {
             return Self::keep_intentionally_stopped(&rt, app_id).await;
         }
         // 轮询 get_deployment_status 直到 Running / Error / 超时
         let deadline = Instant::now() + self.wake_timeout;
         loop {
-            if self.wake_blocked.contains(app_id) {
+            if !preexisting_block && self.wake_blocked.contains(app_id) {
                 return Self::keep_intentionally_stopped(&rt, app_id).await;
             }
             match rt.get_deployment_status(app_id).await {
                 Ok(Some(s)) if s.phase == "Running" => {
-                    // 唤醒成功不能覆盖并发手动 stop；若竞争失败，补偿 scale0。
-                    if !self.try_mark_woken(app_id) {
+                    // 唤醒成功不能覆盖**并发**手动 stop；若竞争失败，补偿 scale0。
+                    if !self.try_mark_woken(app_id, preexisting_block) {
                         return Self::keep_intentionally_stopped(&rt, app_id).await;
                     }
                     debug!("[ACTIVITY] app {} woken (Ready)", app_id);
@@ -412,10 +416,10 @@ impl AppWakeControl for AppActivityRegistry {
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
         // 回收过渡期的请求必须等 scale0 完成，再由唤醒 single-flight scale1。
         self.wait_for_recycle_transition(app_id).await;
-        if self.wake_blocked.contains(app_id) {
-            return WakeOutcome::Failed("app is intentionally stopped".into());
-        }
-        if !self.stopped.contains(app_id) {
+        // 有请求即唤醒（2026-08 拍板）：手动 stop（wake_blocked）不再拒绝——
+        // 请求本身就是把 app 拉起来的授权；唤醒过程中新到的 stop 由
+        // wake_leader 的竞争保护尊重（时间后到者赢）。
+        if !self.stopped.contains(app_id) && !self.wake_blocked.contains(app_id) {
             return WakeOutcome::AlreadyRunning;
         }
         // 只在同步作用域内持有 DashMap entry guard，禁止 shard 锁跨越 await。
@@ -587,7 +591,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn intentional_stop_is_not_woken_by_traffic() {
+    async fn manually_stopped_app_is_woken_by_traffic() {
+        // 有请求即唤醒（2026-08 拍板）：手动 stop（wake_blocked）不再拒绝——
+        // 请求即授权拉起；成功后阻断标志一并解除（is_stopped 归 false）
         let reg =
             AppActivityRegistry::new_with(Duration::from_millis(50), Duration::from_millis(1));
         let runtime = Arc::new(MockRuntime::new(true));
@@ -597,8 +603,10 @@ mod tests {
 
         let outcome = reg.ensure_running("app-manual").await;
 
-        assert!(matches!(outcome, WakeOutcome::Failed(_)));
-        assert_eq!(scale_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(outcome, WakeOutcome::Ready), "got {outcome:?}");
+        assert_eq!(scale_calls.load(Ordering::SeqCst), 1);
+        assert!(!reg.is_wake_blocked("app-manual"));
+        assert!(!reg.is_stopped("app-manual"));
     }
 
     #[tokio::test]
@@ -724,14 +732,21 @@ mod tests {
     }
 
     #[test]
-    fn wake_completion_cannot_clear_concurrent_manual_stop() {
+    fn wake_completion_respects_concurrent_but_not_preexisting_stop() {
         let registry = AppActivityRegistry::new(Duration::from_secs(2));
+        // 唤醒过程中新到的手动 stop（preexisting_block=false）：唤醒不得覆盖 → false
         registry.mark_stopped("app-stop-race");
         registry.mark_wake_blocked("app-stop-race");
-
-        assert!(!registry.try_mark_woken("app-stop-race"));
+        assert!(!registry.try_mark_woken("app-stop-race", false));
         assert!(registry.is_wake_blocked("app-stop-race"));
         assert!(registry.is_stopped("app-stop-race"));
+
+        // 唤醒启动前已手动 stop（preexisting_block=true）：请求即授权 → true 并清两表
+        let registry2 = AppActivityRegistry::new(Duration::from_secs(2));
+        registry2.mark_wake_blocked("app-stop-old");
+        assert!(registry2.try_mark_woken("app-stop-old", true));
+        assert!(!registry2.is_wake_blocked("app-stop-old"));
+        assert!(!registry2.is_stopped("app-stop-old"));
     }
 
     #[test]

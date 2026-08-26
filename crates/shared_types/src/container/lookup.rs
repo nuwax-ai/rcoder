@@ -62,8 +62,10 @@ pub trait ContainerLookup: Send + Sync {
     /// K8s = Service FQDN（Pod 重建 DNS 自愈）；Docker = 容器名（同网络 Docker DNS 解析；
     /// dual-stack 网络下调用方应优先经 [`AppRuntimeIpResolver`] 取 IPv4，本方法为回退）。
     ///
-    /// 构造不查集群——app 未部署/已停止时返回的地址连接失败（代理 502），
-    /// 调用方应把 502 语义解释为"应用未运行"。app_id 须过 identifier 白名单（调用方校验）。
+    /// 构造不查集群——app 未部署时返回的地址连接失败（代理 502），调用方应把
+    /// 502 语义解释为"应用未运行"。已停止（scale0）的 app 由代理层流量唤醒拉起
+    ///（见 request_filter 工具族/业务流量分支），地址构造无需感知。app_id 须过
+    /// identifier 白名单（调用方校验）。
     fn find_app_runtime_addr(&self, app_id: &str) -> Option<String> {
         let _ = app_id;
         None

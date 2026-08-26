@@ -29,6 +29,9 @@ impl AppService {
     /// 确保 app 计算单元存在：不存在则 create_app（幂等；image/ports 首次设定后恒定）。
     ///
     /// `deploy_env`：部署三元组等 env 随 create 注入（start {url} 首次部署路径）。
+    /// `user_id`：显式 owner（start 无 url 创建空容器的场景，Docker 数据卷分区
+    /// `prod/{user_id}/data/{app_id}` 依赖）；None = metadata 回退（发布链 ensure
+    /// 无 user 上下文，Java 先 create 的场景回填已存值）。
     /// `process_lock`：调用方已持有的该 app 进程级发布锁——create 分支走
     /// [`create_app_locked`]（已持锁内核），避免公共 `create_app` 的重入取锁死锁。
     pub(crate) async fn ensure_app_runtime(
@@ -36,6 +39,7 @@ impl AppService {
         rcoder_app_id: &str,
         name: &str,
         deploy_env: Option<std::collections::HashMap<String, String>>,
+        user_id: Option<String>,
         process_lock: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), AppOperationError> {
         match self.get_app(rcoder_app_id).await {
@@ -62,12 +66,10 @@ impl AppService {
         let request = CreateAppRequest {
             app_id: Some(rcoder_app_id.to_string()),
             name: name.to_string(),
-            // 发布链 ensure 无 user 上下文:回填已存 metadata(Java 先 create 的场景),
-            // 无值空串(record 侧转 None, 部署 URL 降级旧短形态)
-            user_id: self
-                .metadata
-                .lookup(rcoder_app_id)
-                .and_then(|m| m.user_id)
+            // owner 优先级：显式传入 > metadata 回填(Java 先 create 的场景)；
+            // 均无值空串(record 侧转 None, 部署 URL 降级旧短形态)
+            user_id: user_id
+                .or_else(|| self.metadata.lookup(rcoder_app_id).and_then(|m| m.user_id))
                 .unwrap_or_default(),
             image: Some(image),
             command: None,

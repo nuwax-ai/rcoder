@@ -208,18 +208,71 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     );
 }
 
-/// create REST 面已删（统一 start 入口）：start 无 url 传统启动，app 不存在 → 404
-async fn test_start_without_app_is_404(env: &Env, report: &JsonlReporter) {
-    let app_id = format!(
-        "app-e2e-nostart-{}{}",
+/// start 无 url 三态语义：不存在 + 缺 user_id → 400；不存在 + 带 user_id → 创建
+/// 空容器（200，基础设施形态）；restart 无 url 对不存在 app → 仍 404（重启不创建）。
+async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
+    let suffix = format!(
+        "{}{}",
         &env.run_tag.replace('_', "")[..10],
         std::process::id() % 1000
     );
-    let (status, _body) = post_json(env, &format!("/api/v1/apps/{app_id}/start"), json!({})).await;
+
+    // ① 不存在 + 缺 user_id → 400（数据卷分区依赖）
+    let (s1, b1) = post_json(
+        env,
+        &format!("/api/v1/apps/app-e2e-nokey-{suffix}/start"),
+        json!({}),
+    )
+    .await;
     report.assert_hard(
-        "start 不存在的 app（无 url）→ 404（create 已删，首次创建走发布链/url 部署）",
-        status.as_u16() == 404,
-        format!("HTTP {status}"),
+        "start 无 url 创建空容器缺 user_id → 400",
+        s1.as_u16() == 400,
+        format!("HTTP {s1}, {}", trunc(&b1, 100)),
+    );
+
+    // ② 不存在 + 带 user_id → 200 创建空容器（Running，无部署内容）
+    let app_id = format!("app-e2e-empty-{suffix}");
+    let (s2, b2) = post_json(
+        env,
+        &format!("/api/v1/apps/{app_id}/start"),
+        json!({"userId": "e2e-user"}),
+    )
+    .await;
+    let created = s2.is_success() && http_ok(&b2);
+    report.assert_hard(
+        "start 无 url 对不存在 app 创建空容器（200）",
+        created,
+        format!("HTTP {s2}, body 截断: {}", trunc(&b2, 150)),
+    );
+    if created {
+        let status = b2["data"]["runtime"]["status"].as_str().unwrap_or("");
+        report.assert_hard(
+            "空容器状态 Running（基础设施形态就绪）",
+            status == "running",
+            format!("status={status}"),
+        );
+        // cleanup：删除 app（purge 连数据卷一起清，防 compose 环境残留）
+        drop(
+            post_json(
+                env,
+                &format!("/api/v1/apps/{app_id}/delete"),
+                json!({"purge": true}),
+            )
+            .await,
+        );
+    }
+
+    // ③ restart 无 url 对不存在 app → 404（重启语义不创建）
+    let (s3, _) = post_json(
+        env,
+        &format!("/api/v1/apps/app-e2e-norestart-{suffix}/restart"),
+        json!({}),
+    )
+    .await;
+    report.assert_hard(
+        "restart 无 url 对不存在的 app → 404（不创建）",
+        s3.as_u16() == 404,
+        format!("HTTP {s3}"),
     );
 }
 
@@ -238,7 +291,7 @@ async fn userapp_compose_regression() {
     test_publish_endpoints_removed(&env, &report).await;
     test_build_identifier_validation(&env, &report).await;
     test_build_reaches_terminal(&env, &report).await;
-    test_start_without_app_is_404(&env, &report).await;
+    test_start_without_app_semantics(&env, &report).await;
 
     let path = report.path.display().to_string();
     assert!(report.finish(), "场景失败：断言明细见 {path}");

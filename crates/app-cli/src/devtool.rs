@@ -48,8 +48,7 @@ pub async fn gen_lock(workspace: &Path) -> Result<()> {
 
     // 宽松发现：单模块 TOML/校验错误不中断扫描，全部问题一次呈现——
     // 用户/agent 拿到完整清单可一轮修完，而不是"修一个 → 重跑 → 下一个错"。
-    let (projects, issues) =
-        discover_projects_lenient(workspace).context("discover projects")?;
+    let (projects, issues) = discover_projects_lenient(workspace).context("discover projects")?;
     if !issues.is_empty() {
         println!("❌ manifest 校验发现 {} 个问题:", issues.len());
         for (index, issue) in issues.iter().enumerate() {

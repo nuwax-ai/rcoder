@@ -330,7 +330,8 @@ pub async fn handle_dev_ime_upstream(
 //    注册表（project_to_container[app_id] 单值键被 builder 占用）；
 // 2. **不经 ws_terminal（17681）**——运行容器没有 agent_runner，ttyd 直连本体
 //    TTYD_PORT=7681（WebSocket upgrade 由 Pingora HTTP 代理直接透传）。
-// app 未部署/已停止 → 构造地址连接失败 502（语义见 trait 文档）。
+// app 未部署 → 构造地址连接失败 502（语义见 trait 文档）；已停止（scale0）由
+// request_filter 的工具族流量唤醒拉起（不 touch，见 proxy_http）。
 
 /// 解析运行容器地址（app_id 先过 identifier 白名单）。
 ///

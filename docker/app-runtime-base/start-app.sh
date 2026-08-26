@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# app-runtime ENTRYPOINT —— supervisor 管 PG + pgweb + ttyd + 用户应用
-# 用户 command(CMD args / $@)动态生成 [program:app],随容器启动
+# app-runtime ENTRYPOINT —— supervisor 管 PG + pgweb + ttyd + app-cli
+# app-cli 从 /app/code/release.lock.toml 编排 workspace 内的全部用户服务与 Pingap。
 # supervisor 作 PID 1:docker stop SIGTERM → 优雅停 PG(INT 信号)不丢数据
 # ============================================================================
 set -e
@@ -11,6 +11,19 @@ export POSTGRES_USER="${POSTGRES_USER:-app}"
 export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-app}"
 export POSTGRES_DB="${POSTGRES_DB:-app}"
 export PGWEB_PORT="${PGWEB_PORT:-8081}"
+
+# dbx-web(DBX 数据库 Web GUI):默认配置导出,supervisor [program:dbx] 继承。
+# 密码不设默认 → 首访浏览器自设(存 $DBX_DATA_DIR/dbx.db);需固定密码时注入 DBX_PASSWORD env。
+export DBX_PORT="${DBX_PORT:-4224}"
+export DBX_DATA_DIR="${DBX_DATA_DIR:-/app/data/dbx}"
+export DBX_STATIC_DIR="${DBX_STATIC_DIR:-/usr/local/share/dbx/static}"
+# 首次播种本地 PG 连接:dbx-web 启动时每次免认证导入 $DBX_DATA_DIR/connections.json
+# (导入后改名 .bak + INSERT OR IGNORE,幂等;字段 snake_case 见 dbx-core ConnectionConfigData)
+if [ ! -e "$DBX_DATA_DIR/dbx.db" ] && [ ! -e "$DBX_DATA_DIR/connections.json" ]; then
+    mkdir -p "$DBX_DATA_DIR"
+    printf '[{"id":"local-pg","name":"Local PostgreSQL","db_type":"postgres","host":"127.0.0.1","port":5432,"username":"%s","password":"%s","database":"%s"}]\n' \
+        "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB" > "$DBX_DATA_DIR/connections.json"
+fi
 
 mkdir -p /app/data /app/logs /app/config /app/code
 # PGDATA 属主备好(非递归, 瞬时)。PGDATA 落 /app/data(PVC), 首次 initdb 慢。
@@ -34,37 +47,28 @@ PostgreSQL 连接信息:
 EOF
 
 # ============================================================================
-# 2. 生成用户应用的 supervisor program(动态 command)
-#    $@ = docker CMD args(UserApp 的用户 command)
+# 2. 注册 app-cli。
+#    Manifest v1 的服务命令只来自 release.lock.toml；镜像 CMD / API command 不再
+#    直接启动单一用户进程，避免绕过多服务编排、健康检查、代理和日志能力。
 # ============================================================================
 APP_CONF=/etc/supervisor/conf.d/99-app.conf
-if [ $# -gt 0 ]; then
-    # printf %q 转义每个 arg —— supervisor shlex 正确解析含空格/特殊字符的 command
-    ESCAPED=""
-    for arg in "$@"; do
-        ESCAPED+="$(printf '%q ' "$arg")"
-    done
-    cat > "$APP_CONF" <<EOF
-[program:app]
-command=$ESCAPED
+cat > "$APP_CONF" <<EOF
+[program:app-cli]
+command=/usr/local/bin/app-cli
 directory=/app/code
 priority=40
 autostart=true
 autorestart=true
 startsecs=5
-stdout_logfile=/app/logs/app.out.log
-stderr_logfile=/app/logs/app.err.log
+startretries=10
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stopwaitsecs=45
+stdout_logfile=/app/logs/app-cli.out.log
+stderr_logfile=/app/logs/app-cli.err.log
 EOF
-    echo "🚀 User app registered: $ESCAPED"
-else
-    cat > "$APP_CONF" <<EOF
-[program:app]
-command=sleep infinity
-autostart=false
-autorestart=false
-EOF
-    echo "⚠️ No user command; running PG/pgweb/ttyd only"
-fi
+echo "🚀 app-cli registered (workspace=/app/code)"
 
 # ============================================================================
 # 3. 启动 supervisor(前台 PID 1)

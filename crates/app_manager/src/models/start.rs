@@ -10,13 +10,18 @@ use utoipa::ToSchema;
 /// 带 `url` 即触发**轻量部署**（下载 zip → prepare → activate → 启动），
 /// 是 Java 直发制品包的统一入口（不经 build）；失败语义对齐发布链
 /// （activate 就绪失败保留旧版本现场 + Failed 状态）。
+///
+/// start 无 `url` 且 app 不存在时**创建空容器**（基础设施形态：PG/ttyd/dbx
+/// 常驻 + app-cli idle 等部署，此形态 `user_id` 必填）；restart 无 `url` 对
+/// 不存在的 app 仍 404（重启语义不创建）。
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct StartAppRequest {
     /// 制品包下载 URL（workspace 整体包 zip）。给出即触发轻量部署链。
     pub url: Option<String>,
-    /// owner 用户 ID（可选补记——与 build 同款兜底语义：显式传优先，注册
-    /// `userapp_metadata` owner，供 `/proxy/userapp/prod/{user_id}/...` URL 拼接与
-    /// "我的应用"归属过滤；None=不改动已有记录）。
+    /// owner 用户 ID。start 无 url 创建空容器时**必填**（数据卷分区依赖）；
+    /// 已存在 app 的启动/部署时可选补记——与 build 同款兜底语义：显式传优先，
+    /// 注册 `userapp_metadata` owner，供 `/proxy/userapp/prod/{user_id}/...` URL
+    /// 拼接与"我的应用"归属过滤；None=不改动已有记录。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
     /// 发布版本标记（幂等键）。缺省自动生成（`rel-{时间戳}-{随机}`）并在响应返回；

@@ -37,8 +37,16 @@ impl AppService {
         {
             self.deploy_from_url(app_id, url, &request).await?
         } else {
-            // 传统启动（app 必须已存在——create 已从 REST 面移除，首次创建走发布链或 url 部署）
-            self.start_app(app_id).await?;
+            // 无 url 传统启动三态：app 已存在 → scale1 启动；不存在 → 创建空容器
+            //（基础设施形态：PG/ttyd/dbx 常驻 + app-cli idle 等部署，容器内
+            // 无应用——用户可先连库建表/开终端，后续 start{url} 部署承接）。
+            match self.start_app(app_id).await {
+                Ok(_) => {}
+                Err(AppOperationError::NotFound(_)) => {
+                    self.ensure_empty_runtime(app_id, &request).await?;
+                }
+                Err(e) => return Err(e),
+            }
             (None, None)
         };
 
@@ -226,9 +234,10 @@ impl AppService {
                 self.update_app(app_id, update).await?;
             }
             Err(AppOperationError::NotFound(_)) => {
-                // 首次部署 → ensure 创建（镜像/端口/探针平台内定，env 携带部署三元组）
+                // 首次部署 → ensure 创建（镜像/端口/探针平台内定，env 携带部署三元组）；
+                // user_id 走 metadata 回退（发布链无 user 上下文）
                 let lock = self.acquire_process_release_lock(app_id).await;
-                self.ensure_app_runtime(app_id, app_id, Some(env), lock)
+                self.ensure_app_runtime(app_id, app_id, Some(env), None, lock)
                     .await?;
             }
             Err(e) => return Err(e),
@@ -262,6 +271,53 @@ impl AppService {
             }
         }
         Ok((Some(release_id), sql_report))
+    }
+
+    /// 创建空容器（start 无 url 对不存在 app 的形态）：容器即基础设施——
+    /// PG/ttyd/dbx 由镜像 supervisord 常驻，app-cli 进 idle 等部署（无
+    /// release.lock → 探针应答 + 等 Pod 被部署动作替换）。后续 `start{url}`
+    /// 走 update 通道注入部署三元组 → Recreate 换 Pod 完成部署，双 PVC
+    /// 数据面（含空容器阶段建的表）无缝承接。
+    ///
+    /// 不调 wait_app_ready：空容器无应用就绪概念，readiness 由 idle app-cli
+    /// 秒级应答，get_app 很快转 Running。
+    async fn ensure_empty_runtime(&self, app_id: &str, request: &StartAppRequest) -> AppResult<()> {
+        // Docker 模式数据卷 bind 源 prod/{user_id}/data/{app_id} 依赖真实 user_id
+        //（K8s 不消费，但统一要求——owner 分区语义单值）
+        let user_id = request
+            .user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                AppOperationError::Validation(
+                    "user_id is required when starting a non-existent app \
+                     (empty app provisioning; existing apps start without it)"
+                        .to_string(),
+                )
+            })?
+            .to_string();
+
+        info!(
+            "[APP] provisioning empty app (infrastructure only, no deployment): \
+             app_id={app_id}, user_id={user_id}"
+        );
+
+        // PVC ensure（K8s；Docker no-op）
+        self.ensure_app_workspace_ready(app_id, None).await?;
+
+        // env：整段替换（app 不存在无 live 可回退）；剥离历史保留键 + 校验；
+        // **不注入部署三元组**——容器内 app-cli 据此判定未部署进 idle
+        let mut env = request.env.clone().unwrap_or_default();
+        crate::release_flow::identity::strip_release_identity(&mut env);
+        crate::release_flow::identity::ensure_no_reserved_env(&env)?;
+
+        // ensure 创建：ports=http:9080 + 探针=3010 与部署容器平台内定一致——
+        // update 通道无权改 ports（恒 live 回退），空容器若缺 9080，后续部署的
+        // 应用入口流量永久断流
+        let lock = self.acquire_process_release_lock(app_id).await;
+        self.ensure_app_runtime(app_id, app_id, Some(env), Some(user_id), lock)
+            .await
     }
 
     /// env / idle 覆盖（对已存在 app；复用 update 的整段替换语义）。
@@ -357,6 +413,11 @@ fn validate_release_id_fs_safe(release_id: &str) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{generate_release_id, validate_release_id_fs_safe};
+    use crate::AppServiceTrait;
+    use crate::models::StartAppRequest;
+    use crate::test_support::{MockRuntime, test_service};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn release_id_shape_and_uniqueness() {
@@ -374,5 +435,127 @@ mod tests {
         assert!(validate_release_id_fs_safe("a/b").is_err());
         assert!(validate_release_id_fs_safe(".hidden").is_err());
         assert!(validate_release_id_fs_safe("rel-abc_1.2").is_ok());
+    }
+
+    fn with_runtime_image_env() {
+        // ensure_app_runtime 读 env 决定默认镜像；同值重复 set 对并行测试无害
+        //（edition 2024 set_var 为 unsafe：测试进程单线程 env 写入，无并发读取者）
+        unsafe {
+            std::env::set_var(
+                "RCODER_RUNTIME_IMAGE_DIGEST",
+                "registry.test/app-runtime:ut",
+            );
+        }
+    }
+
+    /// start 无 url 对不存在的 app → 创建空容器（三态之一）：
+    /// create 恰好一次；owner 落 metadata（user_id 分区依据）；env 无部署三元组。
+    #[tokio::test]
+    async fn start_no_url_creates_empty_app_when_missing() {
+        with_runtime_image_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        let svc = test_service(tmp.path(), runtime.clone());
+
+        let request = StartAppRequest {
+            user_id: Some("u-empty".into()),
+            env: Some([("APP_FOO".to_string(), "1".to_string())].into()),
+            ..Default::default()
+        };
+        let result = svc.start_app_enhanced("app-empty-1", request).await;
+        assert!(
+            result.is_ok(),
+            "empty app provisioning must succeed: {result:?}"
+        );
+        // 计数含创建后的 env override（apply_start_overrides 走 update 通道幂等
+        // re-apply；真实 runtime 为 SSA patch 不触发 rollout，Mock 的 patch=create 同构）
+        assert!(
+            runtime.create_calls.load(Ordering::SeqCst) >= 1,
+            "empty app must be created"
+        );
+        // 运行状态就位（get_app 可见）
+        assert_eq!(
+            result.unwrap().runtime.status,
+            crate::models::AppStatus::Running
+        );
+        // owner 落 metadata：后续 Docker 数据卷分区（prod/{user}/data/{app}）依据
+        assert_eq!(
+            svc.get_app_owner("app-empty-1").await.as_deref(),
+            Some("u-empty")
+        );
+        // 首次创建参数（apply_start_overrides 的 update re-apply 会追加第二次调用，
+        // 取 history 首条）：ports 含平台内定 9080（缺它后续部署的应用入口断流）
+        // + env 无部署三元组
+        let params = runtime
+            .create_params_history
+            .get("app-empty-1")
+            .and_then(|v| v.first().cloned())
+            .expect("create params must be captured");
+        let env = params.env.as_ref().expect("env captured");
+        assert_eq!(env.get("APP_FOO").map(String::as_str), Some("1"));
+        assert!(
+            !env.contains_key("APP_DEPLOY_URL"),
+            "empty app must NOT carry deploy env (app-cli idles on absence)"
+        );
+        let ports = params.ports.as_ref().expect("ports captured");
+        assert!(
+            ports.iter().any(|p| p.port == shared_types::APP_ENTRY_PORT),
+            "platform entry port 9080 must be present (update channel cannot add it later)"
+        );
+    }
+
+    /// start 无 url 对不存在的 app 且缺 user_id → 400（数据卷分区依赖），
+    /// 不触发任何 create。
+    #[tokio::test]
+    async fn start_no_url_without_user_id_is_rejected() {
+        with_runtime_image_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        let svc = test_service(tmp.path(), runtime.clone());
+
+        let err = svc
+            .start_app_enhanced("app-empty-2", StartAppRequest::default())
+            .await
+            .expect_err("missing user_id must be rejected");
+        assert!(
+            matches!(err, crate::error::AppOperationError::Validation(_)),
+            "got {err:?}"
+        );
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 已存在 app 的 start 无 url → 传统启动（scale1），不重复创建。
+    #[tokio::test]
+    async fn start_no_url_existing_app_scales_without_create() {
+        with_runtime_image_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        runtime.deployments.insert(
+            "app-exist-1".into(),
+            container_runtime_api::DeploymentStatus {
+                app_id: "app-exist-1".into(),
+                replicas: 0,
+                ready_replicas: 0,
+                phase: "Stopped".into(),
+                ..Default::default()
+            },
+        );
+        let svc = test_service(tmp.path(), runtime.clone());
+
+        let result = svc
+            .start_app_enhanced(
+                "app-exist-1",
+                StartAppRequest {
+                    user_id: None,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            runtime.create_calls.load(Ordering::SeqCst),
+            0,
+            "existing app start must reuse (scale), not create"
+        );
     }
 }

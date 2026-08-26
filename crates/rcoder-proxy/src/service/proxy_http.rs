@@ -29,39 +29,37 @@ impl ProxyHttp for PortProxy {
 
     /// 请求过滤阶段：UserApp 访问追踪 + 流量唤醒。
     ///
-    /// 仅 `/proxy/userapp/prod/{user_id}/{app_id}/...` 路由触发：
-    /// 1. `touch(app_id)` 记录最近 HTTP 访问（闲置回收信号源，内部节流）；
-    /// 2. 若 app stopped → `ensure_running`（hold-and-wait ≤60s）拉起；超时/失败 → 503+Retry-After。
+    /// 两类 prod 路由触发唤醒（stopped app → `ensure_running` hold-and-wait ≤60s
+    /// 拉起；超时/失败 → 503+Retry-After）：
+    /// - `/proxy/userapp/prod/{user_id}/{app_id}/...` 应用业务流量：**touch + wake**
+    ///   （touch 记录最近访问，是闲置回收的信号源）；
+    /// - `/userapp/prod/{ttyd,pgweb,dbx}/{app_id}` 工具族：**只 wake 不 touch**
+    ///   （终端/DB 客户端连接不算业务活跃——挂终端不阻止闲置回收，回收后下次
+    ///   连接自动唤醒再转发，ttyd 前端自动重连兜底首连窗口）。
     /// 其余路由直接放行（Ok(false) → 继续 upstream_peer）。
     async fn request_filter(
         &self,
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> PingoraResult<bool> {
-        // 仅 /proxy/userapp/prod/* 路由需要访问追踪 + 唤醒;前缀快滤,避免每请求都走 matchit 树匹配
-        // (其余路由 /proxy/{port}、/web/ttyd、/computer/vnc、/api/* 等直接放行;
-        //  dev 流量无闲置回收语义,不触发)
+        // 前缀快滤，避免每请求都走 matchit 树匹配（其余路由 /proxy/{port}、
+        // /web/ttyd、/computer/vnc、/api/* 等直接放行；dev 流量无闲置回收语义，不触发）
         let path = Self::normalize_path(session.req_header().uri.path());
-        if !path.starts_with("/proxy/userapp/prod/") {
-            return Ok(false);
-        }
-        let app_id: Option<String> = match self.router.at(path) {
-            Ok(m) => match m.value {
-                RouteType::ProdAppProxy => m.params.get("app_id").map(|s| s.to_string()),
-                _ => None,
-            },
-            Err(_) => None,
-        };
-
-        if let Some(app_id) = app_id {
-            // ① 访问追踪
-            if let Some(ref tracker) = self.access_tracker {
+        if let Some((app_id, touch)) = classify_wake_target(&self.router, path) {
+            // ① 访问追踪（仅业务流量）
+            if touch && let Some(ref tracker) = self.access_tracker {
                 tracker.touch(&app_id);
             }
-            // ② 流量唤醒（stopped app 才触发）
+            // ② 流量唤醒（stopped app 才触发；手动 stop 与闲置回收统一——
+            //    有请求即唤醒，见 AppWakeControl::ensure_running 语义）
             if let Some(ref wc) = self.wake_control
                 && wc.is_stopped(&app_id)
             {
+                tracing::info!(
+                    "[WAKE] {} traffic wakes stopped app: {}",
+                    if touch { "app" } else { "tool" },
+                    app_id
+                );
                 match wc.ensure_running(&app_id).await {
                     shared_types::WakeOutcome::Ready
                     | shared_types::WakeOutcome::AlreadyRunning => { /* 放行到 upstream */ }
@@ -301,5 +299,78 @@ impl PortProxy {
     /// 规范化路径（去除尾部斜杠）
     fn normalize_path(raw: &str) -> &str {
         utils::normalize_path(raw)
+    }
+}
+
+/// 唤醒目标分类：路径 → `(app_id, touch)`。
+///
+/// - `/proxy/userapp/prod/...` 应用业务流量 → touch=true（闲置回收信号源）；
+/// - `/userapp/prod/{ttyd,pgweb,dbx}/{app_id}` 工具族 → touch=false（终端/DB
+///   连接不算业务活跃，不刷新闲置计时——挂终端不阻止回收，回收后下次连接再唤醒）；
+/// - 其余路由 → None（不触发唤醒）。
+fn classify_wake_target(router: &matchit::Router<RouteType>, path: &str) -> Option<(String, bool)> {
+    let is_app_traffic = path.starts_with("/proxy/userapp/prod/");
+    let is_tool_traffic = path.starts_with("/userapp/prod/");
+    if !is_app_traffic && !is_tool_traffic {
+        return None;
+    }
+    match router.at(path) {
+        Ok(m) => match m.value {
+            RouteType::ProdAppProxy => m.params.get("app_id").map(|s| (s.to_string(), true)),
+            RouteType::RuntimeTtydProxy
+            | RouteType::RuntimePgwebProxy
+            | RouteType::ProdDbxProxy => m.params.get("app_id").map(|s| (s.to_string(), false)),
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::create_router;
+    use matchit::Router;
+
+    fn test_router() -> Router<RouteType> {
+        create_router().expect("router build")
+    }
+
+    /// 工具族路由：识别为唤醒目标且不 touch（挂终端不算业务活跃）。
+    #[test]
+    fn tool_routes_wake_without_touch() {
+        let router = test_router();
+        // classify 接收 request_filter 规范化后的路径（尾部斜杠已剥）
+        for path in [
+            "/userapp/prod/ttyd/app-1",
+            "/userapp/prod/ttyd/app-1/token.js",
+            "/userapp/prod/pgweb/app-1",
+            "/userapp/prod/dbx/app-1",
+        ] {
+            let (app_id, touch) =
+                classify_wake_target(&router, path).unwrap_or_else(|| panic!("{path} unmatched"));
+            assert_eq!(app_id, "app-1", "{path}");
+            assert!(!touch, "tool traffic must not refresh idle timer: {path}");
+        }
+    }
+
+    /// 应用业务流量：touch + wake。
+    #[test]
+    fn app_traffic_wakes_with_touch() {
+        let router = test_router();
+        let (app_id, touch) = classify_wake_target(&router, "/proxy/userapp/prod/u1/app-1/x")
+            .expect("app proxy route must match");
+        assert_eq!(app_id, "app-1");
+        assert!(touch);
+    }
+
+    /// 非唤醒路由与 dev 工具族不触发。
+    #[test]
+    fn other_routes_do_not_wake() {
+        let router = test_router();
+        assert!(classify_wake_target(&router, "/api/userapp/build").is_none());
+        assert!(classify_wake_target(&router, "/web/ttyd/u1").is_none());
+        // dev 工具族走 builder 注册表定位，不在 prod 唤醒范围
+        assert!(classify_wake_target(&router, "/userapp/dev/ttyd/app-1").is_none());
     }
 }

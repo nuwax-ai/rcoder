@@ -15,6 +15,7 @@ pub mod api;
 pub mod config;
 pub mod deploy;
 pub mod devtool;
+pub mod idle;
 pub mod log;
 pub mod manifest;
 pub mod proxy;
