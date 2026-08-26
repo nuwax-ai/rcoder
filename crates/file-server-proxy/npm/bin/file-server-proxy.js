@@ -21,7 +21,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const { ensureBinary } = require("../lib/index");
-const { ensureTs, tsStop, probeHealth, probeExistingTs } = require("../lib/orchestrate");
+const { ensureTs, tsStop, probeHealth, probeExistingTs, waitForHttpHealth } =
+  require("../lib/orchestrate");
 const {
   logPath,
   readState,
@@ -30,7 +31,6 @@ const {
   pidAlive,
   killAndWait,
   tcpUp,
-  waitTcpUp,
   waitTcpFree,
 } = require("../lib/daemon");
 
@@ -202,13 +202,24 @@ async function cmdStart(flags) {
     });
     // spawn 异步失败（binary 缺失/不可执行）必须监听，否则 uncaught 'error' 崩溃
     let spawnError = null;
+    // detached child 立即退出（bind 失败等）会成为僵尸——父进程不 wait 时
+    // pidAlive 对僵尸恒真（骗过存活判定）。挂 exit 监听让 node 自动 reap 并置标志。
+    let childDead = false;
     child.on("error", (err) => {
       spawnError = err;
+      childDead = true;
+    });
+    child.on("exit", () => {
+      childDead = true;
     });
     child.unref();
     state.pid = child.pid;
     writeState(state);
-    if (!(await waitTcpUp(listenPort, 10000))) {
+    // 存活判定用 /health：经代理转发上游的 200 能证明"听者是我们的 proxy"——
+    // 端口被第三方占用（探测连到占用者但无 HTTP 响应）与 child 秒退（bind 失败
+    // 等）都给不出健康响应；childDead 兜底僵尸场景（exit 监听置标志 + 自动 reap）。
+    const healthy = await waitForHttpHealth(listenPort, 10000);
+    if (!healthy || childDead) {
       const tail = readLogTail();
       // 先清完自己拉起的进程（proxy + managed TS）再报错退出，防泄漏
       await killAndWait(child.pid).catch(() => {});
@@ -217,7 +228,9 @@ async function cmdStart(flags) {
       fail(
         spawnError
           ? `failed to execute ${binaryPath}: ${spawnError.message}`
-          : `proxy did not listen on ${listenPort} within 10s${tail}`,
+          : childDead
+            ? `proxy exited before becoming healthy on ${listenPort}${tail}`
+            : `proxy did not become healthy on ${listenPort} within 10s${tail}`,
       );
     }
     console.log(

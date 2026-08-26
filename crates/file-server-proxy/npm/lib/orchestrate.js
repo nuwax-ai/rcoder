@@ -72,13 +72,20 @@ async function probeHealth(port, timeoutMs = 2000) {
   }
 }
 
-// 轮询等待健康（拉起 TS 后的就绪确认）。
-async function waitHealth(port, timeoutMs, label = "service") {
+// 轮询等待 /health 通过（返回 boolean，不抛异常——守护 start 的存活判定用：
+// /health 经代理转发上游，能证明"听者是我们的 proxy"，比 tcp 探测/进程探测更本质）。
+async function waitForHttpHealth(port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await probeHealth(port)) return true;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
+  return false;
+}
+
+// 轮询等待健康（超时抛异常，带标签；拉起 TS 后的就绪确认）。
+async function waitHealth(port, timeoutMs, label = "service") {
+  if (await waitForHttpHealth(port, timeoutMs)) return true;
   throw new Error(
     `${label} on 127.0.0.1:${port} did not become healthy within ${timeoutMs}ms`,
   );
@@ -204,6 +211,7 @@ module.exports = {
   readTsPid,
   probeHealth,
   waitHealth,
+  waitForHttpHealth,
   getFreePort,
   getFreePortWithRetry,
   probeExistingTs,
