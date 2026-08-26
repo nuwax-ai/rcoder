@@ -188,7 +188,7 @@ COPY .npmrc /root/.npmrc
 
 # 创建目录结构（本地直跑兜底路径 /app/*；容器部署时挂载卷优先生效，
 # /home/user/{data,logs} 由挂载卷提供，此处 mkdir 仅直跑场景兜底）
-RUN mkdir -p /app/{code,config} /home/user/{data,logs} /run/app-cli/pingap
+RUN mkdir -p /app/code /app/config /home/user/data /home/user/logs /run/app-cli/pingap
 
 # PG / pgweb / dbx-web / workspace 默认配置(可被 UserApp env 覆盖——rcoder 创建
 # 容器时注入 USERAPP_WORKSPACE_DIR=/home/user/{app_id} 等；此层默认=本地直跑语义)
