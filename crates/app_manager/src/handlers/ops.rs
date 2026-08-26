@@ -17,11 +17,11 @@ use crate::models::{AppRuntimeInfo, RecyclePolicyRequest, StartAppRequest, Start
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body(
         content = StartAppRequest,
-        description = "全可选——无 body 或空对象 = 传统启动（scale=1）。带 url 触发轻量部署：下载 zip → prepare → activate（切流+等就绪，失败保留旧版本现场）→ 启动；release_id 缺省自动生成并在响应返回；sha256 可选校验；user_id 可选补记 owner（与 build 同语义）；env/idle_timeout_seconds 覆盖；pg 凭据自动对齐（不一致重置，失败不阻断部署）"
+        description = "全可选——无 body 或空对象 = 传统启动（app 不存在时带 user_id 即创建空容器：基础设施形态，PG/ttyd/dbx 可用）。带 url 触发部署：deploy_mode 缺省 pod（env 注入 → Recreate 换 Pod），hot = 容器内原地换应用（不换 Pod、PG/终端不断连；前置不满足自动回退 pod）；release_id 缺省自动生成并在响应返回；sha256 可选校验；user_id 可选补记 owner（与 build 同语义）；env/idle_timeout_seconds 覆盖；pg 凭据自动对齐（不一致重置，失败不阻断部署）"
     ),
     responses(
         (status = 200, description = "启动/部署成功", body = HttpResult<StartAppResult>),
-        (status = 404, description = "应用不存在（无 url 传统启动）", body = HttpResult<String>),
+        (status = 400, description = "创建空容器缺 user_id / deploy_mode 非法值", body = HttpResult<String>),
         (status = 409, description = "release 幂等冲突（同 id 不同内容）", body = HttpResult<String>)
     ),
     tag = "应用管理"

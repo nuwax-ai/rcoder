@@ -45,6 +45,23 @@ pub struct StartAppRequest {
     /// 缺省 true；false 跳过。仅 url 部署时生效。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_execute_sql: Option<bool>,
+    /// 部署模式（仅带 url 时生效）：`pod`（缺省）= env 注入 → Recreate 换 Pod 部署；
+    /// `hot` = 调容器内 app-cli `/v1/deploy` 原地换应用——不换 Pod、PG/ttyd/dbx
+    /// 不断连。hot 的一切前置不满足（app 不存在/不在跑/容器为旧镜像）自动回退
+    /// pod 模式。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deploy_mode: Option<DeployMode>,
+}
+
+/// 部署模式枚举（非法值 serde 直接 400）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DeployMode {
+    #[default]
+    /// 换 Pod 部署（缺省）：env → ConfigMap → Recreate，新 Pod 下载部署。
+    Pod,
+    /// 热部署：容器内原地换应用（前置不满足自动回退 Pod）。
+    Hot,
 }
 
 /// PG 凭据（start/restart 部署时自动对齐）。

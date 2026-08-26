@@ -182,9 +182,20 @@ impl AppService {
             .to_string();
 
         info!(
-            "[APP] start-deploy: app_id={app_id}, release_id={release_id}, url={url}, sha256_given={}",
-            !sha256.is_empty()
+            "[APP] start-deploy: app_id={app_id}, release_id={release_id}, url={url}, sha256_given={}, mode={:?}",
+            !sha256.is_empty(),
+            request.deploy_mode.unwrap_or_default(),
         );
+
+        // 0. 热部署分派：hot 且 app 已在跑 → 容器内 API 原地换应用（不换 Pod，
+        //    PG/ttyd/dbx 不断连）；前置不满足自动落回下方换 Pod 权威链
+        if request.deploy_mode == Some(DeployMode::Hot)
+            && let Some(()) = self
+                .try_deploy_via_container_api(app_id, url, &release_id, &sha256)
+                .await?
+        {
+            return Ok((Some(release_id), None));
+        }
 
         // 1. PVC ensure（K8s；Docker no-op）
         self.ensure_app_workspace_ready(app_id, None).await?;

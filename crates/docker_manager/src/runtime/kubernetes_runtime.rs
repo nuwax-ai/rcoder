@@ -18,6 +18,7 @@ use container_runtime_api::{
 use kube::Config;
 #[cfg(feature = "kubernetes")]
 use kube::api::ListParams;
+use kube::api::Patch;
 #[cfg(feature = "kubernetes")]
 use kube::client::Client;
 #[cfg(feature = "kubernetes")]
@@ -458,6 +459,34 @@ impl WorkspaceRuntime for KubernetesRuntime {
 #[async_trait]
 impl UserAppDeploymentRuntime for KubernetesRuntime {
     // ===== Deployment 生命周期（UserApp 专用，转调 k8s_deployment.rs 的 inherent 方法）=====
+
+    /// 热部署收敛：仅更新 ConfigMap data，**保留原 labels/metadata、不触碰
+    /// Deployment**（config-hash 注解不动 → 无 Recreate → 热部署效果保持）。
+    async fn update_env_configmap(
+        &self,
+        app_id: &str,
+        env: &std::collections::HashMap<String, String>,
+    ) -> ContainerRuntimeResult<()> {
+        let name = self.app_config_name(app_id);
+        let api = self.configmaps_api();
+        // 先读现有对象保 labels（tenant/space 归属标记随 apply 字段所有权走，
+        // 重建不带上会被 SSA 抹掉）
+        let existing = api
+            .get(&name)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("get configmap {name}: {e}")))?;
+        let mut cm = existing;
+        cm.data = Some(env.clone().into_iter().collect());
+        let body = serde_json::to_value(&cm)
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("serialize configmap: {e}")))?;
+        api.patch(&name, &Self::ssa_patch_params(), &Patch::Apply(body))
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("apply configmap (env-only): {e}"))
+            })?;
+        Ok(())
+    }
+
     async fn create_deployment(
         &self,
         params: ContainerCreateParams,

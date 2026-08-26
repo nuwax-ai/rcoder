@@ -312,6 +312,20 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// 仅更新 app env 的 ConfigMap（K8s），**不触碰 Deployment 模板**——热部署成功后
+    /// 把部署三元组收敛进 env（Pod 重建时恢复最新版本），又不触发 config-hash
+    /// 变更导致的 Recreate（保持热部署"不换 Pod"的效果）。
+    ///
+    /// Docker 无 ConfigMap 概念（env 恒为容器创建时注入）：默认 no-op——热部署后
+    /// 容器重启将按 env 种子部署（本地开发已知限制，生产 K8s 不受影响）。
+    async fn update_env_configmap(
+        &self,
+        _app_id: &str,
+        _env: &std::collections::HashMap<String, String>,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(())
+    }
+
     /// 更新一个已存在的 Deployment/容器（全量替换 desired state）。
     ///
     /// K8s：SSA re-apply 全部资源（幂等）+ 清理不再需要的端口/配置资源（orphan）。
