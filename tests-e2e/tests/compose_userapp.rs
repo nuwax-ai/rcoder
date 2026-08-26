@@ -235,7 +235,7 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     let (s2, b2) = post_json(
         env,
         &format!("/api/v1/apps/{app_id}/start"),
-        json!({"userId": "e2e-user"}),
+        json!({"user_id": "e2e-user"}),
     )
     .await;
     let created = s2.is_success() && http_ok(&b2);
@@ -245,7 +245,7 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
         format!("HTTP {s2}, body 截断: {}", trunc(&b2, 150)),
     );
     if created {
-        let status = b2["data"]["runtime"]["status"].as_str().unwrap_or("");
+        let status = b2["data"]["status"].as_str().unwrap_or("");
         report.assert_hard(
             "空容器状态 Running（基础设施形态就绪）",
             status == "running",
