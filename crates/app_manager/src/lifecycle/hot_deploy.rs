@@ -25,6 +25,18 @@ const APP_CLI_ADMIN_PORT: u16 = 3010;
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const HOT_DEPLOY_BUDGET: Duration = Duration::from_secs(300);
 
+/// 解析 `/v1/deploy/status` 的 phase：新形态信封 `data.phase`，旧形态顶层
+/// `phase`（双兼容——app-cli 与 rcoder 任一侧先发版都不破坏热部署轮询；
+/// 两处都缺失返回 None = 继续轮询）。
+fn deploy_status_phase(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("data")
+        .and_then(|data| data.get("phase"))
+        .or_else(|| value.get("phase"))
+        .and_then(|phase| phase.as_str())
+        .map(str::to_string)
+}
+
 impl AppService {
     /// 尝试热部署。`Ok(Some(()))` = 完成（调用方跳过换 Pod 链，直接进 SQL 执行
     /// 等后续）；`Ok(None)` = 前置不满足，回退换 Pod；`Err` = 受理后失败（现场
@@ -138,7 +150,7 @@ impl AppService {
                     .json::<serde_json::Value>()
                     .await
                     .ok()
-                    .and_then(|v| v.get("phase").and_then(|p| p.as_str()).map(str::to_string)),
+                    .and_then(|v| deploy_status_phase(&v)),
                 _ => None,
             };
             match phase.as_deref() {
@@ -196,6 +208,7 @@ impl AppService {
 
 #[cfg(test)]
 mod tests {
+    use super::deploy_status_phase;
     use crate::models::StartAppRequest;
     use crate::test_support::{MockRuntime, test_service};
     use std::sync::Arc;
@@ -238,6 +251,25 @@ mod tests {
         assert!(
             outcome.is_none(),
             "missing token must fall back to pod path"
+        );
+    }
+
+    /// /v1/deploy/status phase 解析双兼容：新信封形态 data.phase + 旧裸形态
+    /// 顶层 phase（任一发版顺序都不挂）；两处都缺 → None（继续轮询）。
+    #[test]
+    fn deploy_status_phase_reads_envelope_and_legacy_shapes() {
+        let envelope = serde_json::json!({
+            "code": "0000", "message": "success", "tid": null, "success": true,
+            "data": { "phase": "deploying", "release_id": "rel-1" }
+        });
+        assert_eq!(deploy_status_phase(&envelope).as_deref(), Some("deploying"));
+
+        let legacy = serde_json::json!({ "phase": "running", "release_id": "rel-1" });
+        assert_eq!(deploy_status_phase(&legacy).as_deref(), Some("running"));
+
+        assert_eq!(
+            deploy_status_phase(&serde_json::json!({ "code": "0000", "data": null })),
+            None
         );
     }
 

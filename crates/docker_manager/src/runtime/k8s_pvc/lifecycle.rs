@@ -1,7 +1,6 @@
-//! PVC ensure/destroy 核心（workspace 卷与 UserApp data 卷共用）。
-//!
-//! `ensure_pvc_core`: 存在检查/terminating 等待/SC 漂移可见/创建 409 重试。
-//! `destroy_pvc_core`: 幂等删除 + 60s Terminating 等待 → 强删 grace=0。
+//! PVC ensure/destroy 核心。ensure 核心（workspace 卷）：存在检查/terminating
+//! 等待/SC 漂移可见/创建重试；destroy 核心：幂等删除 + 60s Terminating 等待 →
+//! 强删 grace=0（另被 UserApp data 卷存量兜底回收复用）。
 
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
@@ -23,10 +22,7 @@ use crate::runtime::kubernetes_runtime::KubernetesRuntime;
 
 #[cfg(feature = "kubernetes")]
 impl KubernetesRuntime {
-    /// data 卷默认容量（PG + dbx 持久数据，独立于发布卷的 50Gi 默认）。
-    pub(super) const DEFAULT_APP_DATA_STORAGE_SIZE: &'static str = "20Gi";
-
-    /// PVC ensure 核心（workspace 卷与 UserApp data 卷共用）：存在检查/terminating
+    /// PVC ensure 核心（workspace 卷）：存在检查/terminating
     /// 等待/SC 漂移可见/创建重试。`service_type_label` 仅作为 PVC label 值。
     pub(super) async fn ensure_pvc_core(
         &self,

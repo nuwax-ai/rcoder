@@ -155,17 +155,23 @@ app-cli 自带两个探针，K8s 的 liveness/readiness 直接指向管理 API�
 
 ## 管理 API（默认 :3010）
 
+**响应形态**：JSON 端点统一 `HttpResult` 信封 `{code, message, data, tid, success}`
+（`"0000"`=成功；失败 `data` 恒 `null` + 端点特定错误码如 `INVALID_LOG_QUERY`），并保留
+语义 HTTP 状态码（202/400/403/409）。**豁免信封**：`/health`、`/ready`（kubelet 探针只看
+状态码）、`/v1/logs/stream`（SSE 事件流）、`/v1/proxy/effective-config`（TOML 文本直读）。
+
 ### 探针与元信息
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | liveness，恒 200 |
-| GET | `/ready` | readiness，200 / 503 |
+| GET | `/health` | liveness，恒 200（豁免信封） |
+| GET | `/ready` | readiness，200 / 503（豁免信封） |
 | GET | `/openapi.json` | 完整 OpenAPI schema（utoipa 生成） |
 
 ### 日志（Runtime Logs）
 
-三个接口共用同一请求体（全 snake_case wire）：
+三个接口共用同一请求体（全 snake_case wire）；`sources/query` 与 `query` 响应为
+HttpResult 信封（data = 日志源列表 / 日志快照对象），`stream` 为 SSE（豁免信封）：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -200,7 +206,8 @@ SSE 事件类型：`log`（单条记录）、`source_error` / `source_recovered`
 断线续传）、`heartbeat`（15s）。
 
 外部访问走 rcoder 转发：`POST /api/v1/apps/{app_id}/logs/{sources/query|query|stream}`
-（body 原样转发，详见 [04-logs.md](04-logs.md)）。
+（rcoder 透明代理——请求/响应体与状态码原样透传，信封直达调用方，详见
+[04-logs.md](04-logs.md)）。
 
 ### 代理（Runtime Proxy）
 

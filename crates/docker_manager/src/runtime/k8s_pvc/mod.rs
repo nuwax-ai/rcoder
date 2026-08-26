@@ -4,19 +4,28 @@
 //! 使用 trait extension 模式为 `KubernetesRuntime` 添加 PVC 操作方法。
 //!
 //! 拆分（~500 行基线）: trait 定义 + 各入口方法在本模块；ensure/destroy 的
-//! 共用核心（terminating 等待/漂移可见/创建重试/强删轮询, workspace 卷与
-//! UserApp data 卷共用）在 [`lifecycle`]。
+//! 共用核心（terminating 等待/漂移可见/创建重试/强删轮询）在 [`lifecycle`]
+//! ——ensure 核心服务 workspace 卷；destroy 核心另被 data 卷兜底回收复用。
 
 #[cfg(feature = "kubernetes")]
 mod lifecycle;
 
 /// 默认 PVC 存储大小（当请求未指定 storage_size 时使用）
 ///
-/// 50Gi 配合 cephfs 共享存储，作为「接口入参 resource_limits.storage_size」与
-/// 「config.yml resource_limits.storage_size」均未指定时的最终兜底
-/// （详见 K8sPvcOps::ensure_workspace_pvc）。
+/// agent/computer 域的 CephFS 卷是共享数据目录，**不构成业务容量约束**
+/// （真实上限是 CephFS 池容量）——此 50Gi 仅是 PVC 对象 spec 必填的惯性
+/// 兜底值，作为「接口入参 resource_limits.storage_size」与「config.yml
+/// resource_limits.storage_size」均未指定时的最终兜底。磁盘空间限制语义
+/// 仅存在于 UserApp 域独立 RBD 卷（见 [`DEFAULT_USERAPP_PVC_STORAGE_SIZE`]）。
 #[cfg(feature = "kubernetes")]
 const DEFAULT_PVC_STORAGE_SIZE: &str = "50Gi";
+
+/// UserApp 域（生产运行卷 + builder 开发卷）的默认容量兜底——per-app RBD
+/// 块设备独占，是唯一有真实磁盘空间限制语义的卷型（RBD image size 即硬
+/// 上限）；仅当 create 请求未带 `resources.storage` / builder ensure 未
+/// 显式传 size 时生效（已存在 PVC 复用旧值，不自动扩容）。
+#[cfg(feature = "kubernetes")]
+const DEFAULT_USERAPP_PVC_STORAGE_SIZE: &str = "100Gi";
 
 #[cfg(feature = "kubernetes")]
 use async_trait::async_trait;
@@ -75,18 +84,6 @@ pub(crate) trait K8sPvcOps {
     /// （prod 卷内 `{app_id}/ data/ logs/ agent-store/` 四目录平级，挂载在
     /// workspace 卷上）——仅 destroy_app_pvc 兜底回收存量旧 PVC 时使用。
     fn app_data_pvc_name(&self, app_id: &str) -> ContainerRuntimeResult<String>;
-
-    /// 确保 UserApp per-app 数据卷存在，不存在则创建。
-    ///
-    /// RWO + UserApp 域 RBD 存储类（同 workspace 卷，`userapp_storage_class()`）；
-    /// label `service_type=user-app-data`（独立于运行卷的 user-app——RBD PV 无
-    /// `csi.volumeAttributes.subvolumePath`，混入运行卷 label 会被 CephFS
-    /// subvolumePath 解析逻辑误处理）。
-    async fn ensure_app_data_pvc(
-        &self,
-        app_id: &str,
-        storage_size: Option<&str>,
-    ) -> ContainerRuntimeResult<()>;
 
     /// 销毁 UserApp per-app 数据卷（app purge 时随 `-workspace` 卷一并回收）。
     /// 幂等：PVC 不存在返回 Ok。
@@ -195,15 +192,19 @@ impl K8sPvcOps for KubernetesRuntime {
         storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-        // UserApp 域（生产运行卷 + builder 开发卷）: RWO + RBD（env 可覆盖）;
-        // 其余 service_type 用全局 access_mode/storage_class。
-        let (access_mode, storage_class_name) = match service_type {
-            ServiceType::UserApp | ServiceType::UserAppBuilder => {
-                ("ReadWriteOnce".to_string(), userapp_storage_class())
-            }
+        // UserApp 域（生产运行卷 + builder 开发卷）: RWO + RBD（env 可覆盖）,
+        // 兜底容量 100Gi; 其余 service_type 用全局 access_mode/storage_class
+        // 与 50Gi 兜底。
+        let (access_mode, storage_class_name, default_size) = match service_type {
+            ServiceType::UserApp | ServiceType::UserAppBuilder => (
+                "ReadWriteOnce".to_string(),
+                userapp_storage_class(),
+                DEFAULT_USERAPP_PVC_STORAGE_SIZE,
+            ),
             _ => (
                 self.config.access_mode.clone(),
                 Some(self.config.storage_class.clone()),
+                DEFAULT_PVC_STORAGE_SIZE,
             ),
         };
         self.ensure_pvc_core(
@@ -211,7 +212,7 @@ impl K8sPvcOps for KubernetesRuntime {
             &service_type.to_string(),
             access_mode,
             storage_class_name,
-            storage_size.unwrap_or(DEFAULT_PVC_STORAGE_SIZE),
+            storage_size.unwrap_or(default_size),
         )
         .await
     }
@@ -222,23 +223,6 @@ impl K8sPvcOps for KubernetesRuntime {
         );
         let sanitized = app_id.replace('_', "-");
         Ok(format!("{}-{}-data", prefix, sanitized))
-    }
-
-    async fn ensure_app_data_pvc(
-        &self,
-        app_id: &str,
-        storage_size: Option<&str>,
-    ) -> ContainerRuntimeResult<()> {
-        let pvc_name = self.app_data_pvc_name(app_id)?;
-        self.ensure_pvc_core(
-            &pvc_name,
-            // 独立 label：RBD PV 无 subvolumePath，勿混入 user-app 的 CephFS 解析面
-            "user-app-data",
-            "ReadWriteOnce".to_string(),
-            userapp_storage_class(),
-            storage_size.unwrap_or(Self::DEFAULT_APP_DATA_STORAGE_SIZE),
-        )
-        .await
     }
 
     async fn wait_for_pvc_bound(&self, pvc_name: &str) -> ContainerRuntimeResult<()> {

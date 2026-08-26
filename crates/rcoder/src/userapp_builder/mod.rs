@@ -25,7 +25,7 @@ use tracing::{info, warn};
 use crate::router::AppState;
 
 /// UserAppBuilder per-app PVC 默认大小(后续可提到 config.yml 的 user-app-builder.service 段)。
-const DEFAULT_BUILDER_STORAGE_SIZE: &str = "10Gi";
+const DEFAULT_BUILDER_STORAGE_SIZE: &str = "100Gi";
 
 /// 确保 UserAppBuilder 开发容器存在（幂等）并返回容器信息。
 pub(crate) async fn ensure_userapp_builder(

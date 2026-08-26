@@ -13,12 +13,14 @@ POST /api/v1/apps/{app_id}/logs/query
 POST /api/v1/apps/{app_id}/logs/stream
 ```
 
-内部 API 使用相同 body，路径为 `/v1/logs/...`。流接口返回 SSE，浏览器必须使用
-`fetch + ReadableStream`。
+内部 API 使用相同 body，路径为 `/v1/logs/...`。`sources/query` 与 `query` 的响应为
+`HttpResult` 信封 `{code, message, data, tid, success}`（rcoder 透明转发，信封直达；
+data = 日志源列表 / 日志快照对象 `logs`/`source_errors`/`cursor`/`cursor_reset`）；
+流接口返回 SSE（豁免信封），浏览器必须使用 `fetch + ReadableStream`。
 
 ```json
 {
-  "selectors": [{"serviceId":"backend-go","sourceIds":["application"]}],
+  "selectors": [{"service_id":"backend-go","source_ids":["application"]}],
   "levels": ["WARN", "ERROR"],
   "keyword": "timeout",
   "since": "2026-07-29T10:00:00+08:00",

@@ -3,6 +3,11 @@
 //! server 形态下 AppState 持 `Arc<ServerState>`：release/phase 随部署动态变化
 //! （idle 态全部日志/代理端点降级，探针按状态机应答）；legacy 直跑形态由
 //! main 构造等价 ServerState（读 lock 后直接 Running 相位），路由面零分叉。
+//!
+//! 响应形态：JSON 端点统一 [`envelope::HttpResult`] 信封
+//! （`{code, message, data, tid, success}`，保留语义状态码）；豁免 = SSE
+//! （`/v1/logs/stream`）、kubelet 探针（`/health`、`/ready`）、TOML 文本
+//! （`/v1/proxy/effective-config`）。
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -12,13 +17,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::Json;
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
 use futures::Stream;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{Value, json};
 use utoipa::OpenApi;
 
@@ -26,7 +34,10 @@ use crate::log::model::{LogQueryRequest, LogQueryResponse, LogSourceInfo};
 use crate::log::service::LogService;
 use crate::server::{DeployRequest, ServerState};
 
+mod envelope;
 mod proxy;
+
+use envelope::ApiJson;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -50,6 +61,7 @@ mod proxy;
         crate::log::model::LogRecord,
         crate::log::model::SourceError,
         DeployBody,
+        DeployAcceptedData,
         crate::server::DeployStatus,
     )),
     tags(
@@ -96,7 +108,19 @@ pub async fn serve(
         pingap_bin,
         log_dir,
     };
-    let app = Router::new()
+    let app = api_router(state);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind app-cli API {addr}"))?;
+    tracing::info!("app-cli management API listening on http://{addr}");
+    axum::serve(listener, app)
+        .await
+        .context("serve app-cli management API")
+}
+
+/// 管理 API 路由（serve 与测试共用）。
+fn api_router(state: AppState) -> Router {
+    Router::new()
         // liveness 探针:app-cli 进程能响应即活(永远 200,不依赖任何后端/部署态)。
         // 后端 app 有 bug 起不来时,liveness 不杀容器,用户可 kubectl exec 进去排查。
         .route("/health", get(health))
@@ -115,14 +139,7 @@ pub async fn serve(
         .route("/v1/proxy/upstreams", get(proxy::upstreams))
         .route("/v1/deploy", post(submit_deploy))
         .route("/v1/deploy/status", get(deploy_status))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind app-cli API {addr}"))?;
-    tracing::info!("app-cli management API listening on http://{addr}");
-    axum::serve(listener, app)
-        .await
-        .context("serve app-cli management API")
+        .with_state(state)
 }
 
 async fn openapi() -> Json<utoipa::openapi::OpenApi> {
@@ -165,6 +182,15 @@ pub(super) struct DeployBody {
     pub sha256: Option<String>,
 }
 
+/// `POST /v1/deploy` 受理成功响应 data。
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct DeployAcceptedData {
+    /// 受理状态（"accepted"）
+    pub status: String,
+    /// 轮询部署进度的端点路径
+    pub poll: String,
+}
+
 /// `POST /v1/deploy` — 热部署受理（不换 Pod：PG/ttyd/dbx 不断连，仅应用服务切换）。
 ///
 /// 鉴权：请求头 `X-Deploy-Token` 必须等于容器 env `APP_CLI_DEPLOY_TOKEN`
@@ -176,35 +202,28 @@ pub(super) struct DeployBody {
     request_body = DeployBody,
     params(("X-Deploy-Token" = String, Header, description = "Deploy token (container env APP_CLI_DEPLOY_TOKEN)")),
     responses(
-        (status = 202, description = "Deploy accepted; poll /v1/deploy/status"),
-        (status = 403, description = "Token missing/mismatch or endpoint disabled"),
-        (status = 409, description = "Deploy already in progress"),
-        (status = 400, description = "Invalid body (sha256 shape etc.)")
+        (status = 202, body = envelope::HttpResult<DeployAcceptedData>, description = "Deploy accepted; poll /v1/deploy/status"),
+        (status = 403, body = envelope::HttpResult<String>, description = "Token missing/mismatch or endpoint disabled"),
+        (status = 409, body = envelope::HttpResult<String>, description = "Deploy already in progress"),
+        (status = 400, body = envelope::HttpResult<String>, description = "Invalid body (sha256 shape etc.)")
     ),
     tag = "Runtime Deploy"
 )]
 async fn submit_deploy(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<DeployBody>,
-) -> (StatusCode, Json<Value>) {
-    match authorize_deploy(&headers) {
-        Ok(()) => {}
-        Err(message) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "code": "DEPLOY_FORBIDDEN", "message": message })),
-            );
-        }
+    ApiJson(body): ApiJson<DeployBody>,
+) -> Response {
+    if let Err(message) = authorize_deploy(&headers) {
+        return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
     }
     if let Some(sha) = body.sha256.as_deref()
         && (sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()))
     {
-        return (
+        return envelope::error(
             StatusCode::BAD_REQUEST,
-            Json(
-                json!({ "code": "INVALID_SHA256", "message": "sha256 must be 64 hex characters" }),
-            ),
+            "INVALID_SHA256",
+            "sha256 must be 64 hex characters",
         );
     }
     match state.server.try_accept_deploy(DeployRequest {
@@ -212,14 +231,14 @@ async fn submit_deploy(
         release_id: body.release_id,
         sha256: body.sha256,
     }) {
-        Ok(()) => (
+        Ok(()) => envelope::ok(
             StatusCode::ACCEPTED,
-            Json(json!({ "status": "accepted", "poll": "/v1/deploy/status" })),
+            DeployAcceptedData {
+                status: "accepted".to_string(),
+                poll: "/v1/deploy/status".to_string(),
+            },
         ),
-        Err(message) => (
-            StatusCode::CONFLICT,
-            Json(json!({ "code": "DEPLOY_IN_PROGRESS", "message": message })),
-        ),
+        Err(message) => envelope::error(StatusCode::CONFLICT, "DEPLOY_IN_PROGRESS", message),
     }
 }
 
@@ -245,12 +264,12 @@ fn authorize_deploy(headers: &axum::http::HeaderMap) -> Result<(), String> {
     get,
     path = "/v1/deploy/status",
     responses(
-        (status = 200, body = crate::server::DeployStatus, description = "Current deploy/server phase"),
+        (status = 200, body = envelope::HttpResult<crate::server::DeployStatus>, description = "Current deploy/server phase"),
     ),
     tag = "Runtime Deploy"
 )]
-async fn deploy_status(State(state): State<AppState>) -> Json<crate::server::DeployStatus> {
-    Json(state.server.deploy_status())
+async fn deploy_status(State(state): State<AppState>) -> Response {
+    envelope::ok(StatusCode::OK, state.server.deploy_status())
 }
 
 #[utoipa::path(
@@ -258,21 +277,19 @@ async fn deploy_status(State(state): State<AppState>) -> Json<crate::server::Dep
     path = "/v1/logs/sources/query",
     request_body = LogQueryRequest,
     responses(
-        (status = 200, body = Vec<LogSourceInfo>),
-        (status = 400, description = "Invalid selector or query")
+        (status = 200, body = envelope::HttpResult<Vec<LogSourceInfo>>, description = "Declared log sources and matched files"),
+        (status = 400, body = envelope::HttpResult<String>, description = "Invalid selector or query")
     ),
     tag = "Runtime Logs"
 )]
 async fn query_sources(
     State(state): State<AppState>,
-    Json(request): Json<LogQueryRequest>,
-) -> Result<Json<Vec<LogSourceInfo>>, (StatusCode, Json<Value>)> {
-    state
-        .logs()
-        .sources(request)
-        .await
-        .map(Json)
-        .map_err(bad_request)
+    ApiJson(request): ApiJson<LogQueryRequest>,
+) -> Response {
+    match state.logs().sources(request).await {
+        Ok(data) => envelope::ok(StatusCode::OK, data),
+        Err(error) => bad_request(error),
+    }
 }
 
 #[utoipa::path(
@@ -280,23 +297,21 @@ async fn query_sources(
     path = "/v1/logs/query",
     request_body = LogQueryRequest,
     responses(
-        (status = 200, body = LogQueryResponse),
-        (status = 400, description = "Invalid selector or query")
+        (status = 200, body = envelope::HttpResult<LogQueryResponse>, description = "Multi-service log snapshot with checkpoint cursor"),
+        (status = 400, body = envelope::HttpResult<String>, description = "Invalid selector or query")
     ),
     tag = "Runtime Logs"
 )]
 async fn query_logs(
     State(state): State<AppState>,
-    Json(request): Json<LogQueryRequest>,
-) -> Result<Json<LogQueryResponse>, (StatusCode, Json<Value>)> {
+    ApiJson(request): ApiJson<LogQueryRequest>,
+) -> Response {
     let cancelled = Arc::new(AtomicBool::new(false));
     let _cancel_on_drop = CancelOnDrop(cancelled.clone());
-    state
-        .logs()
-        .query_with_cancel(request, cancelled)
-        .await
-        .map(Json)
-        .map_err(bad_request)
+    match state.logs().query_with_cancel(request, cancelled).await {
+        Ok(data) => envelope::ok(StatusCode::OK, data),
+        Err(error) => bad_request(error),
+    }
 }
 
 #[utoipa::path(
@@ -305,19 +320,18 @@ async fn query_logs(
     request_body = LogQueryRequest,
     responses(
         (status = 200, description = "SSE events: log, source_error, source_recovered, cursor_reset, checkpoint, heartbeat"),
-        (status = 400, description = "Invalid selector or query")
+        (status = 400, body = envelope::HttpResult<String>, description = "Invalid selector or query")
     ),
     tag = "Runtime Logs"
 )]
 async fn stream_logs(
     State(state): State<AppState>,
-    Json(mut request): Json<LogQueryRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
-    state
-        .logs()
-        .sources(request.clone())
-        .await
-        .map_err(bad_request)?;
+    ApiJson(mut request): ApiJson<LogQueryRequest>,
+) -> Response {
+    // 参数错在建流前 → 信封 400（流本身是 SSE，豁免信封）
+    if let Err(error) = state.logs().sources(request.clone()).await {
+        return bad_request(error);
+    }
     // 注意：流生命周期内用同一份 LogService 快照（游标/源清单不因并发部署换代
     // 而漂移；换代后 cursor boot_id 不匹配 → cursor_reset 事件，客户端自然重放）
     let logs = state.logs();
@@ -381,11 +395,18 @@ async fn stream_logs(
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     };
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .event(Event::default().event("heartbeat").data("{}")),
-    ))
+    // handler 返回 Response 后，async_stream yield 的 Result 错误类型失去
+    // 签名锚点（改造前由 `Result<Sse<impl Stream<..>>, _>` 签名推断），此处
+    // 显式固定。
+    let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        Box::pin(stream);
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .event(Event::default().event("heartbeat").data("{}")),
+        )
+        .into_response()
 }
 
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -396,12 +417,142 @@ impl Drop for CancelOnDrop {
     }
 }
 
-fn bad_request(error: anyhow::Error) -> (StatusCode, Json<Value>) {
-    (
+fn bad_request(error: anyhow::Error) -> Response {
+    envelope::error(
         StatusCode::BAD_REQUEST,
-        Json(json!({
-            "code": "INVALID_LOG_QUERY",
-            "message": error.to_string(),
-        })),
+        "INVALID_LOG_QUERY",
+        error.to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_status::RuntimeStatusService;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::util::ServiceExt;
+
+    /// idle 态 AppState（无 release）：日志空集、proxy 端点走 idle 降级错误。
+    fn test_state() -> AppState {
+        AppState {
+            server: Arc::new(ServerState::new(RuntimeStatusService::default())),
+            workspace: PathBuf::from("/nonexistent"),
+            pingap_bin: PathBuf::from("/bin/true"),
+            log_dir: tempfile::tempdir().unwrap().keep(),
+        }
+    }
+
+    async fn call(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = api_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&bytes).expect("response body is JSON");
+        (status, value)
+    }
+
+    /// 成功信封：恒 5 键、data 载荷透出（idle 空 selector → 空日志快照）。
+    #[tokio::test]
+    async fn logs_query_success_envelope() {
+        let state = test_state();
+        let (status, body) = call(&state, "POST", "/v1/logs/query", r#"{"selectors": []}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "0000");
+        assert_eq!(body["success"], true);
+        assert_eq!(body["tid"], serde_json::Value::Null);
+        assert!(body["data"]["logs"].as_array().unwrap().is_empty());
+        assert_eq!(body["data"].as_object().unwrap().len(), 4);
+    }
+
+    /// 业务错误信封：INVALID_LOG_QUERY + data 恒 null（未知 service selector）。
+    #[tokio::test]
+    async fn logs_query_invalid_selector_error_envelope() {
+        let state = test_state();
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/v1/logs/query",
+            r#"{"selectors": [{"service_id": "nope"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_LOG_QUERY");
+        assert_eq!(body["success"], false);
+        assert_eq!(body["data"], serde_json::Value::Null);
+        assert!(body["message"].as_str().unwrap().contains("nope"));
+    }
+
+    /// 请求体解析失败也回信封（不漏 axum 默认纯文本 400）。
+    #[tokio::test]
+    async fn invalid_json_body_rejected_with_envelope() {
+        let state = test_state();
+        let (status, body) = call(&state, "POST", "/v1/logs/query", "not-json").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_BODY");
+        assert_eq!(body["success"], false);
+    }
+
+    /// 无令牌 → 403 信封（env 未配置=端点禁用 / 已配置但不匹配，两路都是
+    /// DEPLOY_FORBIDDEN，测试不依赖宿主机 env）。
+    #[tokio::test]
+    async fn deploy_without_token_403_envelope() {
+        let state = test_state();
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/v1/deploy",
+            r#"{"url": "http://x/p.zip", "release_id": "rel-1"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "DEPLOY_FORBIDDEN");
+        assert_eq!(body["data"], serde_json::Value::Null);
+    }
+
+    /// deploy/status 成功信封：data.phase 为状态机相位（初始 idle）。
+    #[tokio::test]
+    async fn deploy_status_envelope() {
+        let state = test_state();
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "0000");
+        assert_eq!(body["data"]["phase"], "idle");
+        assert_eq!(body["success"], true);
+    }
+
+    /// proxy/status idle 信封：data.mode=idle、releaseId=null。
+    #[tokio::test]
+    async fn proxy_status_idle_envelope() {
+        let state = test_state();
+        let (status, body) = call(&state, "GET", "/v1/proxy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "0000");
+        assert_eq!(body["data"]["mode"], "idle");
+        assert_eq!(body["data"]["releaseId"], serde_json::Value::Null);
+    }
+
+    /// proxy/validate idle 错误信封：PINGAP_CONFIG_INVALID + data=null。
+    #[tokio::test]
+    async fn proxy_validate_idle_error_envelope() {
+        let state = test_state();
+        let (status, body) = call(&state, "POST", "/v1/proxy/validate", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "PINGAP_CONFIG_INVALID");
+        assert_eq!(body["data"], serde_json::Value::Null);
+    }
 }

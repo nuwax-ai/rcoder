@@ -148,8 +148,10 @@ impl SupervisordHost {
         pingap_spec.write().context("write pingap spec")?;
         ServiceSpecFile::prune_other_generations(&release.release_id);
 
-        // 4. 生成并重载 program conf
-        let conf = render_programs_conf(release, &specs, &args.log_dir);
+        // 4. 生成并重载 program conf（supervisord 不建日志目录——服务日志目录预建）
+        std::fs::create_dir_all(args.log_dir.join("services"))
+            .with_context(|| format!("create {}", args.log_dir.join("services").display()))?;
+        let conf = render_programs_conf(release, &specs, &args.log_dir, &args.workspace);
         write_conf(&self.conf_path, &conf)?;
         if let Err(e) = self.client.reload_config().await {
             bail!("supervisord reloadConfig: {e:#}");
@@ -279,6 +281,7 @@ pub(crate) fn render_programs_conf(
     release: &ReleaseLock,
     specs: &[ServiceSpec],
     log_dir: &Path,
+    workspace: &Path,
 ) -> String {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
@@ -305,7 +308,7 @@ pub(crate) fn render_programs_conf(
              stdout_logfile_maxbytes={LOG_MAXBYTES}\n\
              stdout_logfile_backups={LOG_BACKUPS}\n\
              redirect_stderr=true\n\n",
-            spec.dir,
+            workspace.join(&spec.dir).display(),
             spec.run.shutdown_timeout_seconds,
             service_log.display(),
         ));
@@ -314,7 +317,7 @@ pub(crate) fn render_programs_conf(
     out.push_str(&format!(
         "[program:{PINGAP_PROGRAM}]\n\
          command={exe} run-service {rid} pingap\n\
-         directory=/app/code\n\
+         directory={}\n\
          autostart=false\n\
          autorestart=true\n\
          startsecs=3\n\
@@ -327,6 +330,7 @@ pub(crate) fn render_programs_conf(
          stdout_logfile_maxbytes={LOG_MAXBYTES}\n\
          stdout_logfile_backups={LOG_BACKUPS}\n\
          redirect_stderr=true\n",
+        workspace.display(),
         pingap_log.display(),
     ));
     out
@@ -420,10 +424,16 @@ NODE_ENV = "production"
             services: specs.clone(),
             bridge_service: None,
         };
-        let conf = render_programs_conf(&release, &specs, Path::new("/app/logs"));
+        let conf = render_programs_conf(
+            &release,
+            &specs,
+            Path::new("/app/logs"),
+            Path::new("/app/code"),
+        );
         assert!(conf.contains("[program:app-svc-web]"));
         assert!(conf.contains("run-service rel-t web"));
         assert!(conf.contains("stopwaitsecs=45"));
+        assert!(conf.contains("directory=/app/code/web"));
         assert!(conf.contains("stdout_logfile=/app/logs/services/web.log"));
         assert!(conf.contains("redirect_stderr=true"));
         assert!(conf.contains("[program:app-pingap]"));
