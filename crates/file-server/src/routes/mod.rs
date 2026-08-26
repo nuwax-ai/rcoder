@@ -2,18 +2,19 @@
 //!
 //! 本模块只维护 method、URL 前缀与 handler 的映射。HTTP 提取、DTO、utoipa 注解
 //! 位于 [`crate::handlers`]，业务实现位于 [`crate::service`]。
+//!
+//! `/api/userapp` 域已拆出至 file-server-userapp crate（洋葱模型：依赖本 crate
+//! 共享设施）；全量/container 形态的 userapp 子树由该 crate 的组装函数提供
+//! （`file_server_userapp::full_router` / `container_router`）。
 
 use axum::routing::options;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::AppState;
-use crate::handlers::{
-    build, build_support, computer, git, health, project, static_files, userapp, userapp_app_files,
-    userapp_dev, userapp_dev_server, userapp_files,
-};
+use crate::handlers::{build, build_support, computer, git, health, project, static_files};
 
-/// 业务路由与 OpenAPI 文档的唯一聚合入口。
+/// 业务路由与 OpenAPI 文档的唯一聚合入口（TS 对齐路由族）。
 pub fn api_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(health::root))
@@ -24,15 +25,14 @@ pub fn api_router() -> OpenApiRouter<AppState> {
         .nest("/api/build", build_router())
         .nest("/api/computer", computer_router())
         .nest("/api/page", page_router())
-        .nest("/api/userapp", userapp_router())
 }
 
 /// rcoder 主服务合并用的基础路由（全量 [`api_router`] 的子集）。
 ///
 /// 排除项与原因：
 /// - `/`、`/health`：与 rcoder 主 Router 的健康检查路由冲突（axum merge 同路径 panic）
-/// - `/api/userapp` nest：userApp 域由 rcoder 侧转发层接管（透传到 per-app 开发容器），
-///   本地实现仅存在于开发容器内的 file-server
+/// - `/api/userapp`：userApp 域由 rcoder 侧转发层接管（透传到 per-app 开发容器），
+///   本地实现仅存在于开发容器内（file-server-userapp crate）
 /// - swagger UI（`/api-docs`）：rcoder 已在 `/api/docs` 聚合 file-server 全量文档
 ///
 /// `/api/version` 保留：无冲突，供调用方探测 file-server 能力版本。
@@ -48,10 +48,10 @@ pub fn api_router_base() -> OpenApiRouter<AppState> {
 
 /// agent-runner 开发容器内嵌形态路由（全量 [`api_router`] 的子集）。
 ///
-/// 与 [`api_router_base`] 的关键差异：**保留 `/api/userapp` nest**——开发容器是
-/// userApp 域本地实现的宿主（rcoder 转发层的上游），丢了它容器就失去本职
-/// （曾因误用 base 集导致容器内 /api/userapp/* 全 404）。
-/// 排除项：`/`、`/health`（与宿主 agent_runner 冲突）、swagger（宿主有自己的文档面）。
+/// 与 [`api_router_base`] 的差异：不含 swagger/fallback/`/`、`/health`（与宿主
+/// agent_runner 冲突）。`/api/userapp` 子树由调用方（agent_runner embed）经
+/// `file_server_userapp::container_router` 追加——开发容器是 userApp 域本地
+/// 实现的宿主（曾因误用 base 集导致容器内 /api/userapp/* 全 404）。
 pub fn api_router_container() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(health::version))
@@ -60,7 +60,6 @@ pub fn api_router_container() -> OpenApiRouter<AppState> {
         .nest("/api/build", build_router())
         .nest("/api/computer", computer_router())
         .nest("/api/page", page_router())
-        .nest("/api/userapp", userapp_router())
 }
 
 /// `/api/project` + code 路由。
@@ -168,79 +167,4 @@ fn page_router() -> OpenApiRouter<AppState> {
             "/static/{project_id}/{*rest}",
             options(static_files::serve_page),
         )
-}
-
-/// `/api/userapp` 路由（workspace 多项目打包 + 文件操作镜像族 + 取整体包）。
-fn userapp_router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new()
-        .routes(routes!(userapp::build_workspace))
-        .routes(routes!(userapp::get_task))
-        .routes(routes!(userapp::get_task_logs))
-        .routes(routes!(userapp::stream_task_logs))
-        .routes(routes!(userapp::cancel_task))
-        .routes(routes!(userapp::detect_project))
-        .routes(routes!(userapp::confirm_project))
-        .routes(routes!(userapp_files::get_file_list))
-        .routes(routes!(userapp_files::resolve_file))
-        .routes(routes!(userapp_files::search_files))
-        .routes(routes!(userapp_files::files_update))
-        .routes(routes!(userapp_files::upload_file))
-        .routes(routes!(userapp_files::upload_files))
-        .routes(routes!(userapp_files::generate_file))
-        .routes(routes!(userapp_files::import_project))
-        .routes(routes!(userapp_app_files::upload))
-        .routes(routes!(userapp_app_files::upload_from_url))
-        .routes(routes!(userapp_app_files::list))
-        .routes(routes!(userapp_app_files::delete))
-        .routes(routes!(userapp_dev::ensure_workspace))
-        .routes(routes!(userapp_dev::execute_command))
-        .routes(routes!(userapp_dev::get_logs))
-        .routes(routes!(userapp_dev::install_project))
-        .routes(routes!(userapp_dev::zip_workspace))
-        .routes(routes!(userapp_dev::download_all_files))
-        .routes(routes!(userapp_dev::init_project_template))
-        .routes(routes!(userapp_dev::push_skills_to_workspace))
-        .routes(routes!(userapp_dev_server::dev_start))
-        .routes(routes!(userapp_dev_server::dev_stop))
-        .routes(routes!(userapp_dev_server::dev_restart))
-        .routes(routes!(userapp_dev_server::dev_list))
-        .routes(routes!(userapp_dev_server::dev_logs))
-        .routes(routes!(static_files::serve_userapp))
-        .route("/static/{app_id}", options(static_files::serve_userapp))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn userapp_routes_are_registered_in_openapi() {
-        let document = api_router().into_openapi();
-        assert!(document.paths.paths.contains_key("/api/userapp/build"));
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/projects/detect")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/projects/confirm")
-        );
-        // 开发服务生命周期（start/restart 均为编译+启停异步任务）
-        for path in [
-            "/api/userapp/dev/start",
-            "/api/userapp/dev/stop",
-            "/api/userapp/dev/restart",
-            "/api/userapp/dev/list",
-            "/api/userapp/dev/logs",
-        ] {
-            assert!(
-                document.paths.paths.contains_key(path),
-                "userapp dev path missing: {path}"
-            );
-        }
-    }
 }

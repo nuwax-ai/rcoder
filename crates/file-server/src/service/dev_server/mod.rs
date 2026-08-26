@@ -24,7 +24,7 @@ pub use error_classify::{STDERR_RING_CAP, StderrRing, ViteStartupError};
 pub use log::{ReadDevLogResult, read_dev_log};
 pub use port_pool::{PortAllocation, PortPool, PortPoolStatus};
 pub use process::{is_process_running, is_project_alive, kill_process_group, now_ms};
-use types::KeepAliveResult;
+pub use types::KeepAliveResult;
 pub use types::{DevProcess, DevServerManager, KilledPid, StartedDev, StoppedDev};
 
 use std::path::Path;

@@ -6,14 +6,9 @@
 
 pub(crate) mod build;
 pub(crate) mod build_support;
-pub(crate) mod computer;
+pub mod computer;
 pub(crate) mod git;
 pub(crate) mod health;
-mod multipart;
+pub mod multipart;
 pub(crate) mod project;
-pub(crate) mod static_files;
-pub(crate) mod userapp;
-pub(crate) mod userapp_app_files;
-pub(crate) mod userapp_dev;
-pub(crate) mod userapp_dev_server;
-pub(crate) mod userapp_files;
+pub mod static_files;

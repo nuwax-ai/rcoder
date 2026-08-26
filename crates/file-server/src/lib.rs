@@ -3,7 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod extract;
-pub(crate) mod handlers;
+pub mod handlers;
 pub mod logging;
 pub mod openapi;
 pub mod path_safety;
@@ -31,7 +31,6 @@ pub use crate::service::dev_server::DevServerManager;
 pub use crate::service::log_cache::LogCacheManager;
 pub use crate::service::skill_download::SkillDownloader;
 pub use crate::service::skills::{sync_agents, sync_target_version};
-pub use crate::service::userapp::tasks::BuildTaskStore;
 
 /// axum 共享状态: 持有工作区解析器 + 全局配置 + dev server 进程管理器。
 #[derive(Clone)]
@@ -42,7 +41,5 @@ pub struct AppState {
     pub build_manager: Arc<BuildManager>,
     pub log_cache: Arc<LogCacheManager>,
     pub skill_downloader: Arc<SkillDownloader>,
-    /// UserApp 异步编译/发布任务表 (内存, 短期; 发布产物由 rcoder app_manager release index 持久)。
-    pub build_tasks: Arc<BuildTaskStore>,
     pub started_at: std::time::Instant,
 }

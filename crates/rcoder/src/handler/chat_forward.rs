@@ -43,10 +43,19 @@ const AGENT_READY_RETRY_BUFFER: Duration = Duration::from_secs(1);
 ///   形式返回客户端（HTTP 200 + 错误体）；
 /// - [`ChatFlowExit::Fatal`]：基础设施错误，按原语义以 `Err(AppError)` 向上传播。
 pub enum ChatFlowExit {
-    /// 以业务错误响应提前结束（保持原 `Ok(HttpResult::...)` 语义）
-    Response(HttpResult<ChatResponse>),
+    /// 以业务错误响应提前结束（保持原 `Ok(HttpResult::...)` 语义）。
+    /// 装箱：`HttpResult<ChatResponse>` 较大（>128B），Result 按 `?` 传播时按指针
+    /// 移动——构造统一走 [`ChatFlowExit::response`]。
+    Response(Box<HttpResult<ChatResponse>>),
     /// 以 AppError 提前结束（保持原 `Err(AppError)` 语义）
     Fatal(crate::AppError),
+}
+
+impl ChatFlowExit {
+    /// 业务信封提前退出的便捷构造（内部装箱）。
+    pub fn response(body: HttpResult<ChatResponse>) -> Self {
+        ChatFlowExit::Response(Box::new(body))
+    }
 }
 
 impl From<crate::AppError> for ChatFlowExit {

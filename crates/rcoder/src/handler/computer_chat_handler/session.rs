@@ -38,7 +38,7 @@ pub(super) async fn ensure_agent_installed_if_needed(
             error!(
                 "[COMPUTER_CHAT] Validation failed: agent_id is required when platforms is provided"
             );
-            return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+            return Err(ChatFlowExit::response(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
                 "agent_id is required and cannot be empty when platforms is provided",
@@ -53,7 +53,7 @@ pub(super) async fn ensure_agent_installed_if_needed(
                 error!(
                     "[COMPUTER_CHAT] Validation failed: command is required when platforms is provided"
                 );
-                return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+                return Err(ChatFlowExit::response(HttpResult::error_with_message(
                     shared_types::error_codes::ERR_VALIDATION,
                     locale,
                     "command is required and cannot be empty when platforms is provided",
@@ -66,7 +66,7 @@ pub(super) async fn ensure_agent_installed_if_needed(
                 error!(
                     "[COMPUTER_CHAT] Validation failed: version is required when platforms is provided"
                 );
-                return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+                return Err(ChatFlowExit::response(HttpResult::error_with_message(
                     shared_types::error_codes::ERR_VALIDATION,
                     locale,
                     "version is required and cannot be empty when platforms is provided",

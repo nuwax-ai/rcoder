@@ -159,7 +159,7 @@ pub(crate) async fn upload_file(
 }
 
 /// upload-file 的 workspace 无关实现。
-pub(crate) async fn upload_file_impl(
+pub async fn upload_file_impl(
     ws: &Path,
     file_path: &str,
     data: TemporaryFile,
@@ -224,7 +224,7 @@ pub(crate) async fn upload_files(
 }
 
 /// upload-files 的 workspace 无关实现 (单文件错误隔离: 单个失败不影响其余)。
-pub(crate) async fn upload_files_impl(
+pub async fn upload_files_impl(
     ws: &Path,
     file_paths: &[String],
     files_vec: &[(Option<String>, TemporaryFile)],

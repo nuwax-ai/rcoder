@@ -103,7 +103,7 @@ pub(crate) async fn init_project_template(
 }
 
 /// init-project-template 的 workspace 无关实现。
-pub(crate) async fn init_project_template_impl(
+pub async fn init_project_template_impl(
     state: &AppState,
     ws: std::path::PathBuf,
     data: TemporaryFile,

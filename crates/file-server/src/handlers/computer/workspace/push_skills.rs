@@ -105,7 +105,7 @@ async fn push_skills_to_workspace_impl(
 /// `allow_agent_store`: 是否允许 agent-store 软链分支 (computer 布局 `{root}/{user}/{cid}`
 /// 下 `ws.parent()` 即用户根, 语义成立; userapp 开发卷布局下 parent 是共享卷根,
 /// 该分支不适用, 传 false 一律走 legacy `push_skills_at` 写 `{ws}/.agents/skills`)。
-pub(crate) async fn push_skills_impl(
+pub async fn push_skills_impl(
     state: &AppState,
     ws: &std::path::Path,
     cid: &str,

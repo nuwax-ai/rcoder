@@ -22,13 +22,13 @@ use super::multipart::{file_field, text_field, validate_zip_ext};
 // ID 字段反序列化 helper (deserialize_id_string / deserialize_optional_id_string) 已提升至
 // `crate::extract`, 供 computer / project 等所有 handler 共用。
 
-pub(crate) mod archive;
-pub(crate) mod exec;
-pub(crate) mod files;
-pub(crate) mod files_read;
-pub(crate) mod packages;
+pub mod archive;
+pub mod exec;
+pub mod files;
+pub mod files_read;
+pub mod packages;
 mod process_capture;
-pub(crate) mod workspace;
+pub mod workspace;
 
 // ── 跨组共享 helper (子模块经 super:: 访问) ──────────────────────────────────────
 

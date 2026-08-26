@@ -163,6 +163,7 @@ dependencies = [
  "download_utils",
  "file-server",
  "file-server-proxy",
+ "file-server-userapp",
  "flate2",
  "futures 0.3.34",
  "futures-util",
@@ -2255,6 +2256,7 @@ dependencies = [
  "axum",
  "bytes 1.12.1",
  "file-server",
+ "file-server-userapp",
  "http-body",
  "http-body-util",
  "hyper",
@@ -2268,6 +2270,36 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "file-server-userapp"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "bytes 1.12.1",
+ "chrono",
+ "download_utils",
+ "file-server",
+ "futures-util",
+ "garde",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "shared_types",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "utoipa",
+ "utoipa-axum",
+ "uuid",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -6688,6 +6720,7 @@ dependencies = [
  "download_utils",
  "file-server",
  "file-server-proxy",
+ "file-server-userapp",
  "filetime",
  "futures 0.3.34",
  "futures-util",

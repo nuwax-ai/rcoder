@@ -20,7 +20,7 @@ pub(super) async fn dispatch_task(
     session_id: &Option<String>,
     request_id: &str,
     preparation: &SessionPreparation,
-) -> Result<AgentRequest, ChatHandlerOutput> {
+) -> Result<AgentRequest, Box<ChatHandlerOutput>> {
     // ========== 步骤5: 获取项目工作目录 ==========
     let project_dir = input.project_dir.clone();
     info!(
@@ -33,7 +33,7 @@ pub(super) async fn dispatch_task(
         && let Err(e) = tokio::fs::create_dir_all(&project_dir).await
     {
         error!("[ChatHandler] Failed to create project directory: {}", e);
-        return Err(ChatHandlerOutput::error(
+        return Err(Box::new(ChatHandlerOutput::error(
             project_id.to_string(),
             session_id.clone().unwrap_or_default(),
             format!(
@@ -42,7 +42,7 @@ pub(super) async fn dispatch_task(
                 e
             ),
             error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-        ));
+        )));
     }
 
     // ========== 步骤6: 构建 ChatPrompt 和 PromptMessage ==========
@@ -74,7 +74,7 @@ pub(super) async fn dispatch_task(
         Ok(prompt) => prompt,
         Err(e) => {
             error!("[ChatHandler] Failed to build ChatPrompt: {}", e);
-            return Err(ChatHandlerOutput::error(
+            return Err(Box::new(ChatHandlerOutput::error(
                 project_id.to_string(),
                 session_id.clone().unwrap_or_default(),
                 format!(
@@ -83,7 +83,7 @@ pub(super) async fn dispatch_task(
                     e
                 ),
                 error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-            ));
+            )));
         }
     };
 

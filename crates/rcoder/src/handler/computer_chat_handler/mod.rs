@@ -120,7 +120,7 @@ pub(crate) async fn handle_computer_chat_internal(
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     match run_computer_chat_flow(state, headers, request, is_devcomputer).await {
         Ok(result) => Ok(result),
-        Err(ChatFlowExit::Response(response)) => Ok(response),
+        Err(ChatFlowExit::Response(boxed)) => Ok(*boxed),
         Err(ChatFlowExit::Fatal(e)) => Err(e),
     }
 }
@@ -230,7 +230,7 @@ async fn run_userapp_dev_chat_flow(
 ) -> Result<HttpResult<ChatResponse>, ChatFlowExit> {
     // 1. 校验：user_id 必填 + project_id 必填（=app_id，不自动生成——app 语义明确）
     if request.user_id.trim().is_empty() {
-        return Err(ChatFlowExit::Response(HttpResult::error_with_locale(
+        return Err(ChatFlowExit::response(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
         )));
@@ -238,7 +238,7 @@ async fn run_userapp_dev_chat_flow(
     let project_id = match request.project_id.as_deref() {
         Some(id) if !id.trim().is_empty() => id.trim().to_string(),
         _ => {
-            return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+            return Err(ChatFlowExit::response(HttpResult::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
                 "project_id (= app_id) is required for userApp dev chat",
@@ -246,7 +246,7 @@ async fn run_userapp_dev_chat_flow(
         }
     };
     if let Err(e) = shared_types::validate_identifier(&project_id, "project_id") {
-        return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+        return Err(ChatFlowExit::response(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
             &e,
@@ -270,7 +270,7 @@ async fn run_userapp_dev_chat_flow(
                 "❌ [USERAPP_DEV_CHAT] ensure dev container failed: app_id={}: {e:#}",
                 project_id
             );
-            ChatFlowExit::Response(HttpResult::error_with_locale(
+            ChatFlowExit::response(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_CONTAINER_ERROR,
                 locale,
             ))
@@ -283,7 +283,7 @@ async fn run_userapp_dev_chat_flow(
         crate::userapp_forward::ensure_workspace_via_dev(&addr, &project_id, &user_id).await
     {
         error!("[USERAPP_DEV_CHAT] {e}: app_id={project_id}");
-        return Err(ChatFlowExit::Response(HttpResult::error_with_locale(
+        return Err(ChatFlowExit::response(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_CONTAINER_ERROR,
             locale,
         )));

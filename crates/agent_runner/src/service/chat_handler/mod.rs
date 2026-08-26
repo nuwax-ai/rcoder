@@ -51,7 +51,7 @@ pub async fn handle_chat_core(
     // ========== 阶段1: 会话准备（ensure session/registry） ==========
     let preparation = match prepare::prepare_session(&input, &project_id, &session_id).await {
         Ok(preparation) => preparation,
-        Err(output) => return output,
+        Err(output) => return *output,
     };
 
     // ========== 阶段2: 任务下发 ==========
@@ -66,7 +66,7 @@ pub async fn handle_chat_core(
     .await
     {
         Ok(agent_request) => agent_request,
-        Err(output) => return output,
+        Err(output) => return *output,
     };
 
     // ========== 阶段3: 结果组装 ==========

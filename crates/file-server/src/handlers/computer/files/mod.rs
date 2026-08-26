@@ -4,9 +4,9 @@
 //! [`generate`] (generate-file 文本生成) / [`import_project`] (import-project zip) /
 //! 读类见 [`super::files_read`]。
 
-pub(crate) mod generate;
-pub(crate) mod import_project;
-pub(crate) mod upload;
+pub mod generate;
+pub mod import_project;
+pub mod upload;
 
 use std::path::Path;
 
@@ -85,7 +85,7 @@ pub(crate) async fn files_update(
 }
 
 /// files-update 的 workspace 无关实现：返回写入的文件数（展示/回显归各域壳层）。
-pub(crate) async fn files_update_impl(
+pub async fn files_update_impl(
     ws: &Path,
     mut files: Vec<code_service::FileOp>,
 ) -> Result<usize, AppError> {

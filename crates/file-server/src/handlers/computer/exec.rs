@@ -47,7 +47,7 @@ pub(crate) async fn execute_command(
 }
 
 /// execute-command 的 workspace 无关实现 (cwd=workspace; command 经 shell -c)。
-pub(crate) async fn execute_command_impl(
+pub async fn execute_command_impl(
     state: &AppState,
     cwd: PathBuf,
     command: &str,
@@ -118,7 +118,7 @@ pub(crate) async fn get_logs(
 }
 
 /// get-logs 的 workspace 无关实现 (log_dir={ws}/.logs, 由壳层拼好)。
-pub(crate) async fn get_logs_impl(
+pub async fn get_logs_impl(
     state: &AppState,
     log_dir: PathBuf,
     tail_lines: usize,

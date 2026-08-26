@@ -42,7 +42,7 @@ pub(crate) async fn install_project(
 }
 
 /// install-project 的 workspace 无关实现 (typescript→pnpm / python→pip, 按语言找 manifest)。
-pub(crate) async fn install_project_impl(
+pub async fn install_project_impl(
     state: &AppState,
     ws: PathBuf,
     programming_language: &str,

@@ -31,7 +31,7 @@ pub(super) fn validate_and_route_chat_request(
     // 客户端提供的 project_id 直接进容器命名/存储 key/gRPC 请求——畸形值
     //（超长/特殊字符）会 500 或污染存储键，源头校验（自动生成值恒合法跳过）
     if let Err(e) = shared_types::validate_identifier(&project_id, "project_id") {
-        return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+        return Err(ChatFlowExit::response(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
             &e,
@@ -48,7 +48,7 @@ pub(super) fn validate_and_route_chat_request(
 
     // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）
     if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
-        return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+        return Err(ChatFlowExit::response(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
             &e,
@@ -125,7 +125,7 @@ pub(super) fn validate_chat_isolation_params(
 
     if request.isolation_type.is_none() {
         error!("[CHAT] Validation failed: isolation_type is required when pod_id is provided");
-        return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+        return Err(ChatFlowExit::response(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
             "isolation_type is required when pod_id is provided",
@@ -133,7 +133,7 @@ pub(super) fn validate_chat_isolation_params(
     }
     if request.tenant_id.is_none() {
         error!("[CHAT] Validation failed: tenant_id is required when pod_id is provided");
-        return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+        return Err(ChatFlowExit::response(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
             "tenant_id is required when pod_id is provided",
@@ -141,7 +141,7 @@ pub(super) fn validate_chat_isolation_params(
     }
     if request.space_id.is_none() {
         error!("[CHAT] Validation failed: space_id is required when pod_id is provided");
-        return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+        return Err(ChatFlowExit::response(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
             "space_id is required when pod_id is provided",
@@ -156,7 +156,7 @@ pub(super) fn validate_chat_isolation_params(
             "[CHAT] Validation failed: invalid isolation_type '{}', expected tenant|space|project",
             it
         );
-        return Err(ChatFlowExit::Response(HttpResult::error_with_message(
+        return Err(ChatFlowExit::response(HttpResult::error_with_message(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
             &format!(

@@ -27,7 +27,7 @@ pub(super) async fn cancel_current_task(
     cancel_tx: &tokio::sync::mpsc::Sender<CancelNotificationRequestWrapper>,
     session_id: &str,
     project_id: &str,
-) -> Result<(), ChatHandlerOutput> {
+) -> Result<(), Box<ChatHandlerOutput>> {
     info!(
         "[ChatHandler] Cancelling current task: project_id={}, session_id={}",
         project_id, session_id
@@ -39,12 +39,12 @@ pub(super) async fn cancel_current_task(
             "[ChatHandler] Cancel channel closed: project_id={}, session_id={}",
             project_id, session_id
         );
-        return Err(ChatHandlerOutput::error(
+        return Err(Box::new(ChatHandlerOutput::error(
             project_id.to_string(),
             session_id.to_string(),
             error_codes::get_i18n_message_default("error.cancel_channel_closed"),
             error_codes::ERR_SERVICE_UNAVAILABLE.to_string(),
-        ));
+        )));
     }
 
     // 2. 创建 oneshot channel 等待取消结果
@@ -61,7 +61,7 @@ pub(super) async fn cancel_current_task(
             "[ChatHandler] Failed to send cancel notification: project_id={}, error={}",
             project_id, e
         );
-        return Err(ChatHandlerOutput::error(
+        return Err(Box::new(ChatHandlerOutput::error(
             project_id.to_string(),
             session_id.to_string(),
             format!(
@@ -70,7 +70,7 @@ pub(super) async fn cancel_current_task(
                 e
             ),
             error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-        ));
+        )));
     }
 
     // 4. 等待取消结果（超时 10 秒）
@@ -105,7 +105,7 @@ pub(super) async fn cancel_current_task(
                     "[ChatHandler] Cancel failed: project_id={}, error={}",
                     project_id, error_msg
                 );
-                Err(ChatHandlerOutput::error(
+                Err(Box::new(ChatHandlerOutput::error(
                     project_id.to_string(),
                     session_id.to_string(),
                     format!(
@@ -114,7 +114,7 @@ pub(super) async fn cancel_current_task(
                         error_msg
                     ),
                     error_codes::ERR_AGENT_ERROR.to_string(),
-                ))
+                )))
             }
         }
         Ok(Err(_)) => {
@@ -122,24 +122,24 @@ pub(super) async fn cancel_current_task(
                 "[ChatHandler] Cancel result channel dropped: project_id={}",
                 project_id
             );
-            Err(ChatHandlerOutput::error(
+            Err(Box::new(ChatHandlerOutput::error(
                 project_id.to_string(),
                 session_id.to_string(),
                 error_codes::get_i18n_message_default("error.cancel_channel_dropped"),
                 error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-            ))
+            )))
         }
         Err(_) => {
             error!(
                 "[ChatHandler] Cancel timeout (10s): project_id={}",
                 project_id
             );
-            Err(ChatHandlerOutput::error(
+            Err(Box::new(ChatHandlerOutput::error(
                 project_id.to_string(),
                 session_id.to_string(),
                 error_codes::get_i18n_message_default("error.cancel_timeout"),
                 error_codes::ERR_CANCEL_FAILED.to_string(),
-            ))
+            )))
         }
     }
 }

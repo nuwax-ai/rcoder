@@ -103,7 +103,7 @@ pub async fn handle_chat(
 ) -> Result<HttpResult<ChatResponse>, AppError> {
     match run_chat_flow(state, headers, &mut request).await {
         Ok(result) => Ok(result),
-        Err(ChatFlowExit::Response(response)) => Ok(response),
+        Err(ChatFlowExit::Response(boxed)) => Ok(*boxed),
         Err(ChatFlowExit::Fatal(e)) => Err(e),
     }
 }

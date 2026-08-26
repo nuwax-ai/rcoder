@@ -1,6 +1,5 @@
 //! 可嵌入的 file-server 组装与服务入口。
 
-use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -10,12 +9,11 @@ use axum::http::HeaderValue;
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use tower_http::trace::TraceLayer;
-use tracing::info;
 
 use crate::error::{AppError, REQUEST_ID, generate_request_id};
 use crate::{
-    AppState, BuildManager, BuildTaskStore, Config, DevServerManager, LocalWorkspaceResolver,
-    LogCacheManager, SkillDownloader, WorkspaceResolver,
+    AppState, BuildManager, Config, DevServerManager, LocalWorkspaceResolver, LogCacheManager,
+    SkillDownloader, WorkspaceResolver,
 };
 
 pub struct FileServerBuilder {
@@ -57,7 +55,6 @@ impl FileServerBuilder {
             build_manager: Arc::new(BuildManager::new(config.max_build_concurrency)),
             log_cache: Arc::new(LogCacheManager::new(&config)),
             skill_downloader,
-            build_tasks: Arc::new(BuildTaskStore::new()),
             config,
             started_at: std::time::Instant::now(),
         };
@@ -83,31 +80,22 @@ impl FileServer {
         self.state.dev_server.clone()
     }
 
+    /// 共享状态句柄（file-server-userapp 组装 full/container Router 用：
+    /// 其 UserAppState 持本 state 的 Arc 引用共享单例设施）。
+    pub fn state(&self) -> AppState {
+        self.state.clone()
+    }
+
     pub fn router(&self) -> Result<Router> {
         let request_body_limit = usize::try_from(self.state.config.request_body_max_bytes)
             .context("REQUEST_BODY_MAX_BYTES exceeds platform usize")?;
         let (api_router, openapi) = crate::routes::api_router().split_for_parts();
-        Ok(api_router
+        let routed = api_router
             .merge(crate::openapi::swagger_ui(openapi))
-            .fallback(not_found)
-            .layer(DefaultBodyLimit::max(request_body_limit))
-            .layer(from_fn(request_id_layer))
-            .layer(from_fn(locale_layer))
-            // userApp 分流标记（X-Service-Type=userapp → task-local；computer 域
-            // workspace 定位据此切开发卷）——容器内主场景层
-            .layer(from_fn(crate::extract::scope_userapp_flag))
-            .layer(from_fn(request_log_layer))
-            .layer(
-                TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
-                    tracing::info_span!(
-                        target: "file_server::http",
-                        "http_request",
-                        method = %req.method(),
-                        uri = %req.uri(),
-                    )
-                }),
-            )
-            .with_state(self.state.clone()))
+            .fallback(not_found);
+        // userApp 分流标记（X-Service-Type=userapp → task-local；computer 域
+        // workspace 定位据此切开发卷）——容器内主场景层，含于公共栈
+        Ok(apply_common_layers(routed, request_body_limit).with_state(self.state.clone()))
     }
 
     /// 合并进 rcoder 主服务用的基础路由（[`crate::routes::api_router_base`]）。
@@ -125,94 +113,52 @@ impl FileServer {
         let request_body_limit = usize::try_from(self.state.config.request_body_max_bytes)
             .context("REQUEST_BODY_MAX_BYTES exceeds platform usize")?;
         let (api_router, _openapi) = crate::routes::api_router_container().split_for_parts();
-        Ok(api_router
-            .layer(DefaultBodyLimit::max(request_body_limit))
-            .layer(from_fn(request_id_layer))
-            .layer(from_fn(locale_layer))
-            .layer(from_fn(crate::extract::scope_userapp_flag))
-            .layer(from_fn(request_log_layer))
-            .layer(
-                TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
-                    tracing::info_span!(
-                        target: "file_server::http",
-                        "http_request",
-                        method = %req.method(),
-                        uri = %req.uri(),
-                    )
-                }),
-            )
-            .with_state(self.state.clone()))
+        Ok(apply_common_layers(api_router, request_body_limit).with_state(self.state.clone()))
     }
 
     pub fn router_base(&self) -> Result<Router> {
         let request_body_limit = usize::try_from(self.state.config.request_body_max_bytes)
             .context("REQUEST_BODY_MAX_BYTES exceeds platform usize")?;
         let (api_router, _openapi) = crate::routes::api_router_base().split_for_parts();
-        Ok(api_router
-            .layer(DefaultBodyLimit::max(request_body_limit))
-            .layer(from_fn(request_id_layer))
-            .layer(from_fn(locale_layer))
-            // userApp 分流标记同 router()（防御性）：内嵌模式下带 X-Service-Type
-            // 的请求按约定被 rcoder 拦截层短路，不会进入本地 handler——但这是
-            // 跨 crate 的隐式顺序约定，无编译器保证；带上此层后即使约定被打破，
-            // 分流也只是 no-op（is_userapp_request 恒 false）而非行为漂移。
-            .layer(from_fn(crate::extract::scope_userapp_flag))
-            .layer(from_fn(request_log_layer))
-            .layer(
-                TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
-                    tracing::info_span!(
-                        target: "file_server::http",
-                        "http_request",
-                        method = %req.method(),
-                        uri = %req.uri(),
-                    )
-                }),
-            )
-            .with_state(self.state.clone()))
+        // userApp 分流标记含于公共栈（防御性）：内嵌模式下带 X-Service-Type
+        // 的请求按约定被 rcoder 拦截层短路，不会进入本地 handler——但这是
+        // 跨 crate 的隐式顺序约定，无编译器保证；带上此层后即使约定被打破，
+        // 分流也只是 no-op（is_userapp_request 恒 false）而非行为漂移。
+        Ok(apply_common_layers(api_router, request_body_limit).with_state(self.state.clone()))
     }
 
-    pub async fn serve(self, listener: tokio::net::TcpListener) -> Result<()> {
-        self.log_startup(&listener);
-        let dev_server = self.dev_server_manager();
-        let result = axum::serve(listener, self.router()?).await;
-        dev_server.shutdown_all().await;
-        result.context("serve file-server")
-    }
+    // serve/serve_with_shutdown 已随独立 bin 删除（npm 分发统一走
+    // file-server-proxy 的全量组装形态，见 file_server_userapp::full_router）。
+}
 
-    pub async fn serve_with_shutdown<F>(
-        self,
-        listener: tokio::net::TcpListener,
-        shutdown: F,
-    ) -> Result<()>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.log_startup(&listener);
-        let dev_server = self.dev_server_manager();
-        let result = axum::serve(listener, self.router()?)
-            .with_graceful_shutdown(shutdown)
-            .await;
-        dev_server.shutdown_all().await;
-        result.context("serve file-server")
-    }
-
-    /// 启动留痕（target=file_server::server → 嵌入模式进独立日志文件）:
-    /// 版本 + 部署模式 + 三个 workspace 根（排查路径问题的第一手信息）。
-    fn log_startup(&self, listener: &tokio::net::TcpListener) {
-        let addr = listener
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-        info!(
-            version = crate::VERSION,
-            deployment_mode = ?self.state.config.deployment_mode,
-            project_source_dir = %self.state.config.project_source_dir.display(),
-            computer_workspace_dir = %self.state.config.computer_workspace_dir.display(),
-            userapp_workspace_dir = %self.state.config.userapp_workspace_dir.display(),
-            addr = %addr,
-            "file-server started"
-        );
-    }
+/// 公共中间件栈（body limit → request_id → locale → userApp 分流标记 → 请求日志
+/// → TraceLayer；后添加的层在最外层）。
+///
+/// `router()`/`router_container()`/`router_base()` 三形态与 file-server-userapp
+/// 组装的 userapp 子树共用本函数——**单一事实源**，中间件演进只改这里。
+/// 泛型于 state 类型（from_fn 中间件不依赖 state），调用方各自 `with_state`。
+/// `scope_userapp_flag` 对 userapp 子树是 no-op（其 handler 不读该 flag），包含
+/// 无行为差异。
+pub fn apply_common_layers<S: Clone + Send + Sync + 'static>(
+    router: Router<S>,
+    request_body_limit: usize,
+) -> Router<S> {
+    router
+        .layer(DefaultBodyLimit::max(request_body_limit))
+        .layer(from_fn(request_id_layer))
+        .layer(from_fn(locale_layer))
+        .layer(from_fn(crate::extract::scope_userapp_flag))
+        .layer(from_fn(request_log_layer))
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    target: "file_server::http",
+                    "http_request",
+                    method = %req.method(),
+                    uri = %req.uri(),
+                )
+            }),
+        )
 }
 
 async fn request_id_layer(req: Request, next: Next) -> Response {

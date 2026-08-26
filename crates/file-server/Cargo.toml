@@ -26,9 +26,6 @@ kubernetes = []
 name = "file_server"
 path = "src/lib.rs"
 
-[[bin]]
-name = "file-server"
-path = "src/main.rs"
 
 [dependencies]
 # 共享类型 (WORKSPACE_ROOT / COMPUTER_WORKSPACE_ROOT 常量)

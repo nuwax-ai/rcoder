@@ -334,10 +334,10 @@ fn prepare_embed() -> Result<
     let server = file_server::FileServer::builder(config)
         .build()
         .map_err(|e| format!("build embedded file-server: {e:#}"))?;
-    // 独立全量集（含 /、/health、swagger 与完整中间件栈），与独立 file-server
-    // bin 同一 Router——直连行为与独立进程完全同构
-    let router = server
-        .router()
+    // 独立全量集（含 /、/health、swagger 与完整中间件栈 + /api/userapp 子树——
+    // userApp 域拆至 file-server-userapp crate，组装经其 full_router）——直连行为
+    // 与原独立 file-server bin 完全同构
+    let router = file_server_userapp::full_router(&server)
         .map_err(|e| format!("build embedded file-server router: {e:#}"))?;
     file_server_proxy::set_in_process_router(router);
     tracing::info!("内嵌 file-server 直连已装配（进程内 router，无内部监听端口）");

@@ -9,7 +9,7 @@ use crate::service::temp_file::{TemporaryFile, TemporaryFileWriter};
 
 const MAX_TEXT_FIELD_BYTES: usize = 1024 * 1024;
 
-pub(super) async fn text_field(mut field: Field<'_>) -> AppResult<String> {
+pub async fn text_field(mut field: Field<'_>) -> AppResult<String> {
     let mut data = Vec::new();
     while let Some(chunk) = field
         .chunk()
@@ -34,7 +34,7 @@ pub(super) async fn text_field(mut field: Field<'_>) -> AppResult<String> {
     })
 }
 
-pub(super) async fn file_field(
+pub async fn file_field(
     mut field: Field<'_>,
     max_bytes: u64,
     temp_dir: &Path,
@@ -51,7 +51,7 @@ pub(super) async fn file_field(
 }
 
 /// `.zip` 扩展名校验（对齐 nuwax multer fileFilter）。
-pub(super) fn validate_zip_ext(filename: Option<&str>) -> AppResult<()> {
+pub fn validate_zip_ext(filename: Option<&str>) -> AppResult<()> {
     let is_zip = filename
         .and_then(|name| Path::new(name).extension())
         .and_then(|extension| extension.to_str())

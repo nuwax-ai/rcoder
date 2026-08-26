@@ -5,8 +5,8 @@
 //! [`init_template`] (init-project-template)。本 mod.rs 仅做模块声明 + 共享校验辅助。
 
 pub(crate) mod create;
-pub(crate) mod init_template;
-pub(crate) mod push_skills;
+pub mod init_template;
+pub mod push_skills;
 
 use garde::Validate;
 

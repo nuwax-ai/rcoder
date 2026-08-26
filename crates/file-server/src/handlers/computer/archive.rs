@@ -99,7 +99,7 @@ pub(crate) async fn zip_workspace(
 }
 
 /// zip-workspace 的 workspace 无关实现 (filename 由壳层拼: computer=`{user}_{cId}.zip`)。
-pub(crate) async fn zip_workspace_impl(
+pub async fn zip_workspace_impl(
     state: &AppState,
     src: std::path::PathBuf,
     extra_exclude_dirs: Vec<String>,
@@ -156,7 +156,7 @@ pub(crate) async fn download_all_files(
 
 /// download-all-files 的 workspace 无关实现 (prefix/filename 由壳层拼:
 /// computer=`{user}_{cId}/` 与 `{user}_{cId}.zip`)。
-pub(crate) async fn download_all_files_impl(
+pub async fn download_all_files_impl(
     state: &AppState,
     src: std::path::PathBuf,
     prefix: String,

@@ -96,10 +96,11 @@ fn missing_app_id_response() -> Response {
 /// 注册表脏值自愈：容器被外部删除（docker rm / 回收）后 state.projects 残留死 IP，
 /// 且 ensure 被注册表命中挡住不会重建——转发前轻量探活（GET /api/version，3s 超时），
 /// 失败则清注册重新 ensure（新容器新 IP），下一次请求即恢复。
-async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Response> {
+async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Box<Response>> {
     let mut info = ensure_userapp_builder(state, app_id).await.map_err(|e| {
         warn!("[USERAPP_FORWARD] ensure dev container failed: app_id={app_id}: {e:#}");
-        HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}")).into_response()
+        HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
+            .into_boxed_response()
     })?;
     let mut addr = dev_file_server_addr(state, &info);
     // 探活正缓存(30s): 每次转发都探活会给高频文件操作(批量列表/读写)平添一个
@@ -125,7 +126,7 @@ async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Resp
         info = ensure_userapp_builder(state, app_id).await.map_err(|e| {
             warn!("[USERAPP_FORWARD] re-ensure dev container failed: app_id={app_id}: {e:#}");
             HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
-                .into_response()
+                .into_boxed_response()
         })?;
         addr = dev_file_server_addr(state, &info);
         // 重建的新容器可能仍在启动(agent_runner+file-server+PG 全套)——不写探活
@@ -215,7 +216,7 @@ async fn forward_to_addr(target_label: &str, app_id: &str, addr: &str, req: Requ
 pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request) -> Response {
     let addr = match resolve_dev_addr(state, app_id).await {
         Ok(addr) => addr,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     forward_to_addr("dev", app_id, &addr, req).await
 }
@@ -466,6 +467,12 @@ impl HttpResultError {
             message: message.into(),
             retry_after_secs: None,
         }
+    }
+
+    /// 装箱响应（`Result` 的 Err 侧按指针传播——`Response` >128B，
+    /// resolve_dev_addr 等深链函数避免按值 move）。
+    fn into_boxed_response(self) -> Box<Response> {
+        Box::new(self.into_response())
     }
 }
 

@@ -13,10 +13,7 @@ use axum::{
     Json,
     extract::State,
     http::HeaderMap,
-    response::{
-        Response,
-        sse::{Event, Sse},
-    },
+    response::sse::{Event, Sse},
 };
 use futures_util::stream::Stream;
 use shared_types::{
@@ -321,6 +318,6 @@ pub async fn devcomputer_agent_progress_notification(
     params: I18nPath<SessionNotificationParams>,
     state: State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     computer_agent_progress_notification(params, state, headers).await
 }

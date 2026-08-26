@@ -16,7 +16,7 @@ publish = false
 # 即产出 npm 同款单二进制(自带 rust 上游)。容器/rcoder 嵌入形态不受影响:
 # additive feature 只多编译不激活(运行时 EMBED_FILE_SERVER 未设即纯转发)。
 default = ["embed-file-server"]
-embed-file-server = ["dep:file-server", "dep:axum", "dep:tower", "dep:tracing-appender"]
+embed-file-server = ["dep:file-server", "dep:file-server-userapp", "dep:axum", "dep:tower", "dep:tracing-appender"]
 
 [lib]
 name = "file_server_proxy"
@@ -54,6 +54,7 @@ tracing-subscriber = { workspace = true }
 
 # npm 独立形态的可选集成依赖 (feature embed-file-server)
 file-server = { workspace = true, optional = true }
+file-server-userapp = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tracing-appender = { workspace = true, optional = true }

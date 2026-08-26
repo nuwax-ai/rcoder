@@ -62,7 +62,7 @@ pub(crate) async fn generate_file(
 }
 
 /// generate-file 的 workspace 无关实现 (`file_name` 已 trim; 内容缺省空串)。
-pub(crate) async fn generate_file_impl(
+pub async fn generate_file_impl(
     ws: PathBuf,
     file_name: &str,
     content: String,
@@ -92,8 +92,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        AppState, BuildManager, BuildTaskStore, Config, DevServerManager, LocalWorkspaceResolver,
-        LogCacheManager, SkillDownloader, WorkspaceResolver,
+        AppState, BuildManager, Config, DevServerManager, LocalWorkspaceResolver, LogCacheManager,
+        SkillDownloader, WorkspaceResolver,
     };
 
     /// 构造一个指向临时目录的 AppState (computer root = temp)，镜像 FileServerBuilder::build。
@@ -111,7 +111,6 @@ mod tests {
             skill_downloader: Arc::new(
                 SkillDownloader::new(&config).expect("construct skill downloader"),
             ),
-            build_tasks: Arc::new(BuildTaskStore::new()),
             config,
             started_at: std::time::Instant::now(),
         }

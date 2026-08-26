@@ -23,7 +23,7 @@ pub(super) async fn prepare_session(
     input: &ChatHandlerInput,
     project_id: &str,
     session_id: &Option<String>,
-) -> Result<SessionPreparation, ChatHandlerOutput> {
+) -> Result<SessionPreparation, Box<ChatHandlerOutput>> {
     // ========== 步骤1: 查询现有 Agent 状态 ==========
     // 优先通过 session_id 查找，回退到 project_id 查找
     // 用 view 闭包访问 agent_info:闭包返回即释放读锁,无 Ref 暴露 —— 结构上杜绝守卫跨
@@ -63,12 +63,12 @@ pub(super) async fn prepare_session(
             if let Some(ref command) = server.command {
                 if let Err(e) = checker::check_agent_exists(command) {
                     error!("[ChatHandler] Agent not found: {}", e);
-                    return Err(ChatHandlerOutput::error(
+                    return Err(Box::new(ChatHandlerOutput::error(
                         project_id.to_string(),
                         session_id.clone().unwrap_or_default(),
                         e,
                         error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
-                    ));
+                    )));
                 }
 
                 // 兜底自装：bundle 缺失时（正常情况 rcoder 已装好，走不到这里）主动安装；
@@ -106,12 +106,12 @@ pub(super) async fn prepare_session(
                                     "[ChatHandler] fallback self-install: cache dir init failed: {}",
                                     e
                                 );
-                                return Err(ChatHandlerOutput::error(
+                                return Err(Box::new(ChatHandlerOutput::error(
                                     project_id.to_string(),
                                     session_id.clone().unwrap_or_default(),
                                     format!("agent cache dir unavailable: {}", e),
                                     error_codes::ERR_AGENT_MGMT_INSTALL_FAILED.to_string(),
-                                ));
+                                )));
                             }
                         };
                         let args = server.args.clone().unwrap_or_default();
@@ -132,12 +132,12 @@ pub(super) async fn prepare_session(
                                  version={}, error={:?}",
                                 agent_id, version, e
                             );
-                            return Err(ChatHandlerOutput::error(
+                            return Err(Box::new(ChatHandlerOutput::error(
                                 project_id.to_string(),
                                 session_id.clone().unwrap_or_default(),
                                 format!("agent bundle missing and self-install failed: {}", e),
                                 error_codes::ERR_AGENT_MGMT_INSTALL_FAILED.to_string(),
-                            ));
+                            )));
                         }
                         warn!(
                             "[ChatHandler] fallback self-install OK: agent_id={}, version={}",
@@ -152,7 +152,7 @@ pub(super) async fn prepare_session(
                             version,
                             install_root.display()
                         );
-                        return Err(ChatHandlerOutput::error(
+                        return Err(Box::new(ChatHandlerOutput::error(
                             project_id.to_string(),
                             session_id.clone().unwrap_or_default(),
                             format!(
@@ -160,7 +160,7 @@ pub(super) async fn prepare_session(
                                 agent_id, version
                             ),
                             error_codes::ERR_AGENT_MGMT_INSTALL_FAILED.to_string(),
-                        ));
+                        )));
                     }
                 }
 
@@ -175,12 +175,12 @@ pub(super) async fn prepare_session(
         // 默认 agent
         if let Err(e) = checker::check_agent_exists(shared_types::DEFAULT_AGENT_ID) {
             error!("[ChatHandler] Default agent not found: {}", e);
-            return Err(ChatHandlerOutput::error(
+            return Err(Box::new(ChatHandlerOutput::error(
                 project_id.to_string(),
                 session_id.clone().unwrap_or_default(),
                 e,
                 error_codes::ERR_AGENT_MGMT_NOT_FOUND.to_string(),
-            ));
+            )));
         }
         checker::get_agent_version(shared_types::DEFAULT_AGENT_ID).await
     };

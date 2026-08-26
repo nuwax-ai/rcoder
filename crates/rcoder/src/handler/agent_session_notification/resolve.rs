@@ -1,14 +1,13 @@
 //! 会话上下文校验与容器名解析（从 agent_session_notification.rs 拆出）。
 
-use axum::http::StatusCode;
-use axum::response::Response;
+use crate::AppError;
 use tracing::{debug, error, info, warn};
 
 use shared_types::ProjectAndContainerInfo;
 use std::sync::Arc;
 
 use super::super::utils::container_identity_from_name;
-use super::create_error_response;
+use super::create_session_error;
 
 /// 核心验证函数：验证会话并获取容器名称
 ///
@@ -22,7 +21,7 @@ use super::create_error_response;
 pub(super) async fn validate_and_get_session_context(
     state: Arc<crate::router::AppState>,
     session_id: &str,
-) -> Result<(String, String, String), Response> {
+) -> Result<(String, String, String), AppError> {
     // ========== 阶段 1: 获取项目信息（所有分支都需要） ==========
     // 🔧 优化：提前获取 project_info，避免后续重复查询
     // 同时获取 DockerManager（用于容器验证和降级查询）
@@ -74,7 +73,7 @@ pub(super) async fn validate_and_get_session_context(
 pub(super) async fn lookup_project_info_by_session(
     state: &Arc<crate::router::AppState>,
     session_id: &str,
-) -> Result<Arc<ProjectAndContainerInfo>, Response> {
+) -> Result<Arc<ProjectAndContainerInfo>, AppError> {
     // 内存镜像 miss → 回源直查 PG 主库一次（跨副本可见性兜底：新会话在
     // write-behind/镜像同步窗口内、或 durable 降级场景；命中顺带 hydrate 镜像）
     match state.get_by_session_with_fetch(session_id).await {
@@ -91,8 +90,7 @@ pub(super) async fn lookup_project_info_by_session(
                 "[SSE_PROXY] Project info for session not found: session_id={}",
                 session_id
             );
-            Err(create_error_response(
-                StatusCode::NOT_FOUND,
+            Err(create_session_error(
                 "SESSION_NOT_FOUND",
                 "Session does not exist or has expired. Please submit a new request.",
             ))
@@ -110,7 +108,7 @@ pub(super) async fn resolve_container_name_fallback(
     project_info: &Arc<ProjectAndContainerInfo>,
     runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     session_id: &str,
-) -> Result<String, Response> {
+) -> Result<String, AppError> {
     info!(
         "[SSE_PROXY] session_id record not found in storage, executing fallback query: session_id={}, project_id={}",
         session_id,
@@ -160,14 +158,13 @@ pub(super) async fn resolve_container_name_by_user_id(
     project_info: &Arc<ProjectAndContainerInfo>,
     runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     session_id: &str,
-) -> Result<String, Response> {
+) -> Result<String, AppError> {
     let Some(user_id) = project_info.user_id() else {
         error!(
             "[SSE_PROXY] Missing user_id in ComputerAgentRunner mode: session_id={}",
             session_id
         );
-        return Err(create_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+        return Err(create_session_error(
             "INVALID_DATA",
             "Project missing user identifier",
         ));
@@ -189,8 +186,7 @@ pub(super) async fn resolve_container_name_by_user_id(
                 "[SSE_PROXY] Fallback query failed: container not found: user_id={}",
                 user_id
             );
-            Err(create_error_response(
-                StatusCode::NOT_FOUND,
+            Err(create_session_error(
                 "CONTAINER_NOT_FOUND",
                 &format!("container not found: user_id={}", user_id),
             ))
@@ -200,8 +196,7 @@ pub(super) async fn resolve_container_name_by_user_id(
                 "[SSE_PROXY] Fallback query failed: failed to query container: {}",
                 e
             );
-            Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+            Err(create_session_error(
                 "CONTAINER_ERROR",
                 &format!("Failed to query container: {}", e),
             ))
@@ -221,7 +216,7 @@ pub(super) async fn verify_container_with_memory_preference(
     runtime: &Arc<dyn container_runtime_api::ContainerRuntime>,
     project_info: &Arc<ProjectAndContainerInfo>,
     container_name: String,
-) -> Result<String, Response> {
+) -> Result<String, AppError> {
     if let Some(container) = project_info.container_info() {
         info!(
             "[SSE_PROXY] Using container info from memory: container_name={}, container_ip={}",
@@ -261,8 +256,7 @@ pub(super) async fn verify_container_with_memory_preference(
                 );
                 Ok(container_name)
             } else {
-                Err(create_error_response(
-                    StatusCode::NOT_FOUND,
+                Err(create_session_error(
                     "SESSION_EXPIRED",
                     "Session has been cleaned up due to inactivity. Please submit a new request.",
                 ))
@@ -273,16 +267,14 @@ pub(super) async fn verify_container_with_memory_preference(
                 "[SSE_PROXY] Container does not exist: container_name={}",
                 container_name
             );
-            Err(create_error_response(
-                StatusCode::NOT_FOUND,
+            Err(create_session_error(
                 "SESSION_EXPIRED",
                 "Container not found. Please submit a new request.",
             ))
         }
         Err(e) => {
             error!("[SSE_PROXY] Runtime query failed: {}", e);
-            Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+            Err(create_session_error(
                 shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
                 "Error checking session status. Please retry later.",
             ))

@@ -3,13 +3,12 @@
 //! 从 `agent_session_notification` 迁出：封装 gRPC SSE 流的构建逻辑，
 //! 供 `agent_session_notification` 与 `computer_agent_progress_notification` 共用。
 
-use axum::response::{
-    Response,
-    sse::{Event, KeepAlive, Sse},
-};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::stream::Stream;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tracing::info;
+
+use crate::AppError;
 
 /// SSE 流构建参数
 ///
@@ -50,7 +49,7 @@ pub(crate) struct SseStreamParams {
 /// 通过 container_name 创建 gRPC SSE 流
 pub(crate) async fn build_sse_stream_from_container_name(
     params: SseStreamParams,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, AppError> {
     // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
     let grpc_addr = shared_types::build_grpc_addr(
         &params.container_name,

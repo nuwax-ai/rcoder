@@ -15,14 +15,11 @@ use resolve::validate_and_get_session_context;
 
 use super::sse_builder::{SseStreamParams, build_sse_stream_from_container_name};
 use super::utils::I18nPath;
+use crate::AppError;
 use crate::HttpResult;
 use axum::{
     extract::State,
-    http::StatusCode,
-    response::{
-        Response,
-        sse::{Event, Sse},
-    },
+    response::sse::{Event, Sse},
 };
 use futures_util::stream::Stream;
 use std::{convert::Infallible, sync::Arc};
@@ -197,7 +194,7 @@ pub async fn agent_session_notification(
     I18nPath(params): I18nPath<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
     headers: axum::http::HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, AppError> {
     info!(
         "[SSE_PROXY] Received SSE connection request: session_id={:?}",
         params.session_id
@@ -330,7 +327,7 @@ pub async fn computer_agent_progress_notification(
     I18nPath(params): I18nPath<SessionNotificationParams>,
     State(state): State<Arc<crate::router::AppState>>,
     headers: axum::http::HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, AppError> {
     info!(
         "[SSE_PROXY] Received Computer Agent SSE connection request: session_id={:?}",
         params.session_id
@@ -391,7 +388,7 @@ async fn sse_notification_impl(
     params: &SessionNotificationParams,
     headers: &axum::http::HeaderMap,
     route_ctx: RouteCtxFn,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, Response> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, AppError> {
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
 
@@ -432,24 +429,20 @@ async fn sse_notification_impl(
     build_sse_stream_from_container_name(stream_params).await
 }
 
-/// 创建错误响应
-pub(super) fn create_error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    let locale = shared_types::current_request_locale();
+/// 创建错误（渲染交 [`AppError::into_response`]：status 由错误码推导、body 为
+/// HttpResult 信封 + locale 感知，具体 message 进响应与 `error!` 日志）。
+///
+/// 行为说明（相对旧 `create_error_response` 手拼形态）：HTTP status 与响应 shape
+/// 等价（同一错误码体系）；body 的 message 从"错误码通用 i18n 文案"变为具体的
+/// `message` 参数（信息量更大）；`INVALID_DATA` 旧调用点曾传 500 但映射后语义
+/// 是参数错误，现统一为 400（修正存量 status/code 矛盾）。
+pub(super) fn create_session_error(code: &str, message: &str) -> AppError {
     let mapped_code = map_error_code_for_locale(code);
-    let localized_message = shared_types::get_error_message(mapped_code, locale);
-    let error_body = HttpResult::<()>::error(mapped_code, &localized_message);
-    let json_body = serde_json::to_string(&error_body).unwrap_or_default();
-
     debug!(
-        "[SSE_PROXY] create error response: code={}, status={}, locale={}, original_message={}",
-        code, status, locale, message
+        "[SSE_PROXY] create session error: code={} -> mapped={}, message={}",
+        code, mapped_code, message
     );
-
-    Response::builder()
-        .status(status)
-        .header("Content-Type", "application/json")
-        .body(json_body.into())
-        .unwrap_or_else(|_| Response::new("Internal Server Error".into()))
+    AppError::with_message(mapped_code, message)
 }
 
 pub(super) fn map_error_code_for_locale(code: &str) -> &str {

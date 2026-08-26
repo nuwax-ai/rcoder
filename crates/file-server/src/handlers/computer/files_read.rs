@@ -50,7 +50,7 @@ pub(crate) async fn get_file_list(
 
 /// get-file-list 的 workspace 无关实现 (computer / userapp 域共用;
 /// 定位由各域壳层完成, 此处只收目标根路径 + 业务参数)。
-pub(crate) struct FileListParams<'a> {
+pub struct FileListParams<'a> {
     pub proxy_path: Option<&'a str>,
     pub relative_path: Option<&'a str>,
     /// 原始 recursive 串: 缺省/非 "false" 均按递归 (对齐 TS)。
@@ -59,7 +59,7 @@ pub(crate) struct FileListParams<'a> {
     pub custom_target_dir: Option<&'a str>,
 }
 
-pub(crate) async fn get_file_list_impl(
+pub async fn get_file_list_impl(
     state: &AppState,
     path: &Path,
     p: FileListParams<'_>,
@@ -130,7 +130,7 @@ pub(crate) async fn resolve_file(
 }
 
 /// resolve-file 的 workspace 无关实现。
-pub(crate) async fn resolve_file_impl(
+pub async fn resolve_file_impl(
     path: PathBuf,
     file_path: &str,
     proxy_path: Option<&str>,
@@ -195,7 +195,7 @@ pub(crate) async fn search_files(
 }
 
 /// search-files 的 workspace 无关实现。
-pub(crate) struct SearchFilesParams<'a> {
+pub struct SearchFilesParams<'a> {
     pub proxy_path: Option<&'a str>,
     pub relative_path: Option<&'a str>,
     pub kw: &'a str,
@@ -205,7 +205,7 @@ pub(crate) struct SearchFilesParams<'a> {
     pub custom_target_dir: Option<&'a str>,
 }
 
-pub(crate) async fn search_files_impl(
+pub async fn search_files_impl(
     state: &AppState,
     path: PathBuf,
     p: SearchFilesParams<'_>,
@@ -275,8 +275,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        AppState, BuildManager, BuildTaskStore, Config, DevServerManager, LocalWorkspaceResolver,
-        LogCacheManager, SkillDownloader, WorkspaceResolver,
+        AppState, BuildManager, Config, DevServerManager, LocalWorkspaceResolver, LogCacheManager,
+        SkillDownloader, WorkspaceResolver,
     };
 
     /// 构造一个指向临时目录的 AppState (computer root = temp)，镜像 FileServerBuilder::build。
@@ -294,7 +294,6 @@ mod tests {
             skill_downloader: Arc::new(
                 SkillDownloader::new(&config).expect("construct skill downloader"),
             ),
-            build_tasks: Arc::new(BuildTaskStore::new()),
             config,
             started_at: std::time::Instant::now(),
         }

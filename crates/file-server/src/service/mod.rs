@@ -20,6 +20,5 @@ pub mod skills;
 pub mod temp_file;
 pub mod tree;
 pub mod upload;
-pub mod userapp;
 pub mod version;
 pub mod zip;

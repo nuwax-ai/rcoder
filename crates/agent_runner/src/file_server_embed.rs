@@ -33,19 +33,19 @@ use file_server_proxy::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT}
 
 /// 构造合并进 agent_runner 主 Router 的 file-server 路由（无独立 listener/端口）。
 ///
-/// 用 **container 路由集**（`router_container`：全量业务路由含 `/api/userapp`——
-/// 开发容器是 userApp 域本地实现的宿主，rcoder 转发层的上游；曾误用
+/// 用 **container 路由集**（`file_server_userapp::container_router`：全量业务路由
+/// 含 `/api/userapp`——开发容器是 userApp 域本地实现的宿主，rcoder 转发层的上游；
+/// userApp 域已拆至 file-server-userapp crate，组装经其完成。曾误用
 /// `router_base`（排除 userapp 的 rcoder 主进程集）导致容器内 /api/userapp/*
 /// 全 404）。返回 `Err` 时主服务照常启动（缺路由不致命，warn 可见）——
 /// 与 rcoder 主服务的降级语义同款。
 pub fn merged_router() -> Result<Router, String> {
-    let fs_config = Config::load().map_err(|e| format!("load file-server config: {e:#}"))?;
+    let fs_config = Config::load().map_err(|e| format!("load file-server config: {e}"))?;
     let fs_server = FileServer::builder(fs_config)
         .build()
-        .map_err(|e| format!("build merged file-server: {e:#}"))?;
-    fs_server
-        .router_container()
-        .map_err(|e| format!("build merged file-server router: {e:#}"))
+        .map_err(|e| format!("build merged file-server: {e}"))?;
+    file_server_userapp::container_router(&fs_server)
+        .map_err(|e| format!("build merged file-server router: {e}"))
 }
 
 /// 启动 60000 前置分流代理（AllRust → agent_runner 自身 HTTP 端口）。

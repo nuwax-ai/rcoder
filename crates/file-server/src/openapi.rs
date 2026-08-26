@@ -87,8 +87,7 @@ pub enum ErrorApiResponses {
         (name = "Build", description = "Build and Vite dev-server lifecycle"),
         (name = "Git", description = "Git repository operations"),
         (name = "Computer", description = "Computer workspace operations"),
-        (name = "Static", description = "Project and workspace static files"),
-        (name = "UserApp", description = "UserApp workspace build and static")
+        (name = "Static", description = "Project and workspace static files")
     )
 )]
 struct ApiMetadata;
@@ -128,24 +127,13 @@ mod tests {
     #[test]
     fn document_contains_every_registered_operation() {
         let document = generated_document();
-        // 100 = 镜像族+build+dev 全量；+4 = app-files 转发族（rcoder /apps 文件面
-        // 的容器侧实现）。路由增删须同步本计数（防"注册了但没进文档"回归）。
-        assert_eq!(document.paths.paths.len(), 104);
+        // 71 = TS 对齐域全量（镜像族+build+dev）。userApp 域 33 条已拆至
+        // file-server-userapp crate（其 routes.rs 测试守卫）。路由增删须同步本计数
+        // （防"注册了但没进文档"回归）。
+        assert_eq!(document.paths.paths.len(), 71);
         assert!(document.paths.paths.contains_key("/"));
         assert!(document.paths.paths.contains_key("/api/build/start-dev"));
         assert!(document.paths.paths.contains_key("/api/git/commit"));
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/app-files/upload")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/app-files/list")
-        );
         assert!(
             document
                 .paths
@@ -176,174 +164,19 @@ mod tests {
                 .paths
                 .contains_key("/api/page/static/{project_id}/{rest}")
         );
-        assert!(document.paths.paths.contains_key("/api/userapp/build"));
+        // userApp 域已拆出：本文档不得再出现 /api/userapp 路径（防回流）
         assert!(
-            document
+            !document
                 .paths
                 .paths
-                .contains_key("/api/userapp/projects/detect")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/projects/confirm")
-        );
-        // 文件操作镜像族（computer 域同参镜像, 15 个）
-        for path in [
-            "/api/userapp/get-file-list",
-            "/api/userapp/resolve-file",
-            "/api/userapp/search-files",
-            "/api/userapp/files-update",
-            "/api/userapp/upload-file",
-            "/api/userapp/upload-files",
-            "/api/userapp/generate-file",
-            "/api/userapp/import-project",
-            "/api/userapp/execute-command",
-            "/api/userapp/get-logs",
-            "/api/userapp/install-project",
-            "/api/userapp/zip-workspace",
-            "/api/userapp/download-all-files",
-            "/api/userapp/init-project-template",
-            "/api/userapp/push-skills-to-workspace",
-        ] {
-            assert!(
-                document.paths.paths.contains_key(path),
-                "userapp mirror path missing: {path}"
-            );
-        }
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/static/{app_id}")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/tasks/{task_id}")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/tasks/{task_id}/logs")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/tasks/{task_id}/logs/stream")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/tasks/{task_id}/cancel")
+                .keys()
+                .any(|path| path.starts_with("/api/userapp"))
         );
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 
-    /// 文档质量防回归: /api/userapp/* 全部接口的 path/query 参数与请求体 schema 字段
-    /// 必须有非空 description（doc comment 是唯一来源——新字段不写注释此处报红）。
-    #[test]
-    fn userapp_endpoints_fields_are_documented() {
-        let document = generated_document();
-        let mut checked_params = 0usize;
-        let mut checked_fields = 0usize;
-        for (path, item) in &document.paths.paths {
-            if !path.starts_with("/api/userapp/") {
-                continue;
-            }
-            for operation in [&item.get, &item.post].into_iter().flatten() {
-                if let Some(params) = &operation.parameters {
-                    for p in params {
-                        assert!(
-                            p.description.as_ref().is_some_and(|d| !d.trim().is_empty()),
-                            "{path} 参数 {:?} 缺少 description（补 doc comment）",
-                            p.name
-                        );
-                        checked_params += 1;
-                    }
-                }
-            }
-        }
-        // 组件 schema 的字段 description（Userapp* Form/Body 与 dev server 的 DTO）
-        for (name, schema) in &document
-            .components
-            .as_ref()
-            .expect("components present")
-            .schemas
-        {
-            if !name.starts_with("Userapp") && name != "DevOpBody" && name != "DevLogsQuery" {
-                continue;
-            }
-            let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(obj)) = schema
-            else {
-                continue;
-            };
-            for (field, value) in &obj.properties {
-                let utoipa::openapi::RefOr::T(utoipa::openapi::schema::Schema::Object(field_obj)) =
-                    value
-                else {
-                    continue;
-                };
-                assert!(
-                    field_obj
-                        .description
-                        .as_ref()
-                        .is_some_and(|d| !d.trim().is_empty()),
-                    "schema {name} 字段 {field} 缺少 description（补 doc comment）"
-                );
-                checked_fields += 1;
-            }
-        }
-        assert!(checked_params > 30, "参数检查覆盖异常: {checked_params}");
-        assert!(
-            checked_fields > 20,
-            "schema 字段检查覆盖异常: {checked_fields}"
-        );
-    }
-
-    /// 新契约接口响应必须包 HttpResult 信封（`{code, message, data, tid, success}`），
-    /// 防响应形态漂移回裸 JSON / TS 风格。TS 迁移镜像族（userapp_files/app_files、
-    /// execute-command 等 15 个）豁免——保持 nuwax-file-server 原形态。
-    #[test]
-    fn userapp_new_contract_endpoints_are_http_result_enveloped() {
-        let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
-        let paths = value["paths"].as_object().expect("paths object");
-        // 6 个 Rust 新契约接口（TS 无对应端点）：dev 生命周期 5 + ensure-workspace
-        let expected_refs = [
-            ("/api/userapp/dev/start", "HttpResult_UserappDevTaskCreated"),
-            ("/api/userapp/dev/stop", "HttpResult_UserappDevStopped"),
-            (
-                "/api/userapp/dev/restart",
-                "HttpResult_UserappDevTaskCreated",
-            ),
-            ("/api/userapp/dev/list", "HttpResult_UserappDevList"),
-            ("/api/userapp/dev/logs", "HttpResult_ReadDevLogResult"),
-            (
-                "/api/userapp/ensure-workspace",
-                "HttpResult_UserappEnsureWorkspaceData",
-            ),
-        ];
-        for (path, expected_schema) in expected_refs {
-            let operation = paths[path]
-                .get("post")
-                .or_else(|| paths[path].get("get"))
-                .unwrap_or_else(|| panic!("{path} must be registered"));
-            let schema = &operation["responses"]["200"]["content"]["application/json"]["schema"];
-            let reference = schema["$ref"].as_str().unwrap_or_else(|| {
-                panic!("{path} 200 response must $ref a named schema, got: {schema}")
-            });
-            assert_eq!(
-                reference,
-                format!("#/components/schemas/{expected_schema}"),
-                "{path} 响应必须包 HttpResult 信封（data 载荷 = {expected_schema}）"
-            );
-        }
-    }
+    // userapp 字段文档/HttpResult 信封两测试已随域迁至 file-server-userapp crate
+    // （routes.rs 测试模块）——本文档不再含 /api/userapp 路径。
 
     #[test]
     fn generated_document_round_trips_as_openapi() {

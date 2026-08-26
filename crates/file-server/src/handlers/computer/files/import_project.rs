@@ -107,7 +107,7 @@ pub(crate) async fn import_project(
 }
 
 /// import-project 的 workspace 无关实现：解压合并并返回目标目录（展示/回显归各域壳层）。
-pub(crate) async fn import_project_impl(
+pub async fn import_project_impl(
     target_dir: std::path::PathBuf,
     data: TemporaryFile,
 ) -> Result<String, AppError> {

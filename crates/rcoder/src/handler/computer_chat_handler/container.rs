@@ -237,7 +237,7 @@ async fn create_container_with_marker(
         Ok(info) => Ok(info),
         Err(e) => {
             error!("[COMPUTER_CHAT] Failed to get or create container: {}", e);
-            Err(ChatFlowExit::Response(HttpResult::error_with_locale(
+            Err(ChatFlowExit::response(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_CONTAINER_ERROR,
                 locale,
             )))
