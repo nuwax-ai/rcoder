@@ -245,6 +245,29 @@ async fn resolve_exec_target(
                         format!("ensure dev container failed: {e:#}"),
                     )
                 })?;
+            // builder 内 PG 可能刚 initdb（新容器/重建后），等就绪再执行改密命令
+            let runner = ExecRunner {
+                runtime: &state.runtime().clone(),
+                target: &info.container_name,
+            };
+            let wait = runner
+                .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "[USERAPP_DB_ADMIN] wait dev PG ready failed: app_id={app_id}: {e}"
+                    );
+                    AppError::with_message(
+                        shared_types::error_codes::ERR_CONTAINER_ERROR,
+                        format!("wait dev PG ready failed: {e}"),
+                    )
+                })?;
+            if wait.exit_code != 0 {
+                return Err(AppError::with_message(
+                    shared_types::error_codes::ERR_CONTAINER_ERROR,
+                    "dev builder postgres not ready after ensure",
+                ));
+            }
             Ok(info.container_name)
         }
         DbEnv::Prod => {
@@ -264,6 +287,29 @@ async fn resolve_exec_target(
                         "userapp prod app wake failed or timeout (still starting), retry later",
                     ));
                 }
+            }
+            // 唤醒后容器内 PG 启动窗口：等就绪再交还 exec 目标
+            let runner = ExecRunner {
+                runtime: &state.runtime().clone(),
+                target: app_id,
+            };
+            let wait = runner
+                .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "[USERAPP_DB_ADMIN] wait prod PG ready failed: app_id={app_id}: {e}"
+                    );
+                    AppError::with_message(
+                        shared_types::error_codes::ERR_CONTAINER_ERROR,
+                        format!("wait prod PG ready failed: {e}"),
+                    )
+                })?;
+            if wait.exit_code != 0 {
+                return Err(AppError::with_message(
+                    shared_types::error_codes::ERR_CONTAINER_ERROR,
+                    "userapp prod postgres not ready after wake",
+                ));
             }
             Ok(app_id.to_string())
         }

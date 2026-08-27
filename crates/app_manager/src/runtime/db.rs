@@ -241,6 +241,7 @@ impl AppService {
     /// validate_app_id 由调用方先做（Fail Fast：参数校验在 runtime 调用前）。
     async fn ensure_app_running(&self, app_id: &str) -> AppResult<()> {
         use shared_types::AppWakeControl;
+        use shared_types::PgCommandRunner as _;
         match self.activity.ensure_running(app_id).await {
             shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
             shared_types::WakeOutcome::Timeout => {
@@ -255,6 +256,22 @@ impl AppService {
             }
         }
         self.get_app(app_id).await?;
+        // 容器内 PG 就绪等待（唤醒后 initdb/PG 启动窗口内 exec psql 会撞竞态）；
+        // AlreadyRunning 时 pg_isready 首轮即过，开销一次探测。
+        let runner = RuntimeExecRunner {
+            service: self,
+            app_id,
+        };
+        let wait = runner
+            .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
+            .await
+            .map_err(AppOperationError::Backend)?;
+        if wait.exit_code != 0 {
+            return Err(AppOperationError::InvalidState(format!(
+                "app {app_id} postgres not ready after wake: {}",
+                wait.stderr.trim()
+            )));
+        }
         Ok(())
     }
 
@@ -416,19 +433,20 @@ mod tests {
         // 唤醒生效：scale(1) 后 phase=Running
         assert_eq!(runtime.deployments.get("app-w1").unwrap().phase, "Running");
 
-        // exec 序列：先 ALTER USER（trust 改密），后 dbx 同步（重写 connections.json
-        // + supervisorctl restart dbx）
+        // exec 序列：PG 就绪等待（唤醒后启动窗口）→ ALTER USER（trust 改密）
+        // → dbx 同步（重写 connections.json + supervisorctl restart dbx）
         let calls = runtime.exec_calls.get("app-w1").unwrap().clone();
-        assert!(calls.len() >= 2, "expect alter + dbx sync, got: {calls:?}");
+        assert!(calls.len() >= 3, "expect wait + alter + dbx sync, got: {calls:?}");
+        assert!(calls[0].contains("pg_isready"), "got: {:?}", calls[0]);
         assert!(
-            calls[0].contains("ALTER USER CURRENT_USER"),
+            calls[1].contains("ALTER USER CURRENT_USER"),
             "got: {:?}",
-            calls[0]
+            calls[1]
         );
         assert!(
-            calls[1].contains("connections.json") && calls[1].contains("supervisorctl"),
+            calls[2].contains("connections.json") && calls[2].contains("supervisorctl"),
             "dbx 同步命令应紧随改密, got: {:?}",
-            calls[1]
+            calls[2]
         );
         // 密码不落 exec 记录之外的日志不可断言,但命令本身含密码属预期(容器内执行)
     }

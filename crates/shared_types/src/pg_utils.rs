@@ -47,6 +47,16 @@ pub fn pg_quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// PG 就绪等待命令（容器内 `pg_isready` 轮询，`timeout_secs` 预算）——
+/// 唤醒/刚建的容器 phase=Running 不等于容器内 PG 已可连（initdb/启动窗口），
+/// 改密类 exec 前置执行可避免竞态。exit 0=就绪；超时 exit 1（stderr 有原因）。
+pub fn pg_wait_ready_cmd(timeout_secs: usize) -> String {
+    format!(
+        "for i in $(seq 1 {timeout_secs}); do pg_isready -q >/dev/null 2>&1 && exit 0; sleep 1; done; \
+echo 'postgres not ready' >&2; exit 1"
+    )
+}
+
 // ── 容器内 PG 凭据对齐命令构造（userApp dev/prod 双环境共用；经各自执行通道跑 sh -c） ──
 
 /// sh 单引号安全包裹（`'` → `'\''`）——密码等自由文本进 shell 环境变量的标准转义。
