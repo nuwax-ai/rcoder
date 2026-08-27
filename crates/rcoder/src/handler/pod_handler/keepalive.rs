@@ -32,7 +32,9 @@ pub async fn pod_keepalive(
         request.service_type.as_deref(),
     ) {
         Ok(AppTarget::NotApp) => {}
-        Ok(AppTarget::Dev(app_id)) => return keepalive_userapp_dev(&state, app_id).await,
+        Ok(AppTarget::Dev(app_id)) => {
+            return keepalive_userapp_dev(&state, app_id, request.user_id.as_str()).await;
+        }
         Ok(AppTarget::Prod(app_id)) => return keepalive_userapp_prod(&state, app_id).await,
         Err(e) => {
             error!("[POD_KEEPALIVE] invalid app target: {}", e);
@@ -248,6 +250,7 @@ pub async fn pod_keepalive(
 async fn keepalive_userapp_dev(
     state: &Arc<AppState>,
     app_id: String,
+    user_id: &str,
 ) -> Result<HttpResult<KeepalivePodResponse>, AppError> {
     // 单次读取防两读间记录变动（previous 与 existed 自洽）
     let registered = state.get_project(&app_id);
@@ -260,15 +263,18 @@ async fn keepalive_userapp_dev(
         .is_some_and(|p| p.container_info().is_some());
     drop(registered);
 
-    let (info, created) = crate::userapp_builder::ensure_userapp_builder_probed(state, &app_id)
-        .await
-        .map_err(|e| {
-            error!("[POD_KEEPALIVE] ensure userapp dev container failed: app_id={app_id}: {e:#}");
-            AppError::with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                format!("ensure userapp dev container failed: {e:#}"),
-            )
-        })?;
+    let (info, created) =
+        crate::userapp_builder::ensure_userapp_builder_probed(state, &app_id, Some(user_id))
+            .await
+            .map_err(|e| {
+                error!(
+                    "[POD_KEEPALIVE] ensure userapp dev container failed: app_id={app_id}: {e:#}"
+                );
+                AppError::with_message(
+                    shared_types::error_codes::ERR_BACKEND_ERROR,
+                    format!("ensure userapp dev container failed: {e:#}"),
+                )
+            })?;
     let current = state
         .update_activity(&app_id)
         .map(|t| t.timestamp_millis().max(0) as u64)

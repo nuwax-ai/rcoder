@@ -100,11 +100,13 @@ fn missing_app_id_response() -> Response {
 /// 且 ensure 被注册表命中挡住不会重建——转发前轻量探活（GET /api/version，3s 超时），
 /// 失败则清注册重新 ensure（新容器新 IP），下一次请求即恢复。
 async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Box<Response>> {
-    let mut info = ensure_userapp_builder(state, app_id).await.map_err(|e| {
-        warn!("[USERAPP_FORWARD] ensure dev container failed: app_id={app_id}: {e:#}");
-        HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
-            .into_boxed_response()
-    })?;
+    let mut info = ensure_userapp_builder(state, app_id, None)
+        .await
+        .map_err(|e| {
+            warn!("[USERAPP_FORWARD] ensure dev container failed: app_id={app_id}: {e:#}");
+            HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
+                .into_boxed_response()
+        })?;
     let mut addr = dev_file_server_addr(state, &info);
     // 探活正缓存(30s): 每次转发都探活会给高频文件操作(批量列表/读写)平添一个
     // RTT; 成功后窗口内免探。失败路径(自愈重建)不受缓存影响; 窗口内死容器漏检
@@ -126,11 +128,13 @@ async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Box<
                 warn!("[USERAPP_FORWARD] clear stale container field failed: app_id={app_id}: {e}");
             }
         }
-        info = ensure_userapp_builder(state, app_id).await.map_err(|e| {
-            warn!("[USERAPP_FORWARD] re-ensure dev container failed: app_id={app_id}: {e:#}");
-            HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
-                .into_boxed_response()
-        })?;
+        info = ensure_userapp_builder(state, app_id, None)
+            .await
+            .map_err(|e| {
+                warn!("[USERAPP_FORWARD] re-ensure dev container failed: app_id={app_id}: {e:#}");
+                HttpResultError::bad_gateway(format!("dev container unavailable: {e:#}"))
+                    .into_boxed_response()
+            })?;
         addr = dev_file_server_addr(state, &info);
         // 重建的新容器可能仍在启动(agent_runner+file-server+PG 全套)——不写探活
         // 缓存, 由本次 send 定成败; 下一请求重新探活
@@ -463,7 +467,7 @@ URI 折叠为容器内平铺路径 `/api/v1/userapp/projects/detect` 后流式�
         (status = 200, description = "探测结果（HttpResult 信封，data 含类型推断与文件清单）", body = HttpResult<serde_json::Value>),
         (status = 400, description = "env 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
     ),
-    tag = "UserApp · 开发与构建",
+    tag = "UserApp · dev · 工作区与工具链",
 )]
 pub(crate) async fn flat_dev_projects_detect(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -493,7 +497,7 @@ pub(crate) async fn flat_dev_projects_detect(
         (status = 200, description = "确认结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
         (status = 400, description = "env 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
     ),
-    tag = "UserApp · 开发与构建",
+    tag = "UserApp · dev · 工作区与工具链",
 )]
 pub(crate) async fn flat_dev_projects_confirm(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -523,7 +527,7 @@ pub(crate) async fn flat_dev_projects_confirm(
         (status = 200, description = "安装结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
         (status = 400, description = "env 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
     ),
-    tag = "UserApp · 开发与构建",
+    tag = "UserApp · dev · 工作区与工具链",
 )]
 pub(crate) async fn flat_dev_install_project(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,

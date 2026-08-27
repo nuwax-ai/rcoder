@@ -34,7 +34,9 @@ pub async fn pod_ensure(
         request.service_type.as_deref(),
     ) {
         Ok(AppTarget::NotApp) => {}
-        Ok(AppTarget::Dev(app_id)) => return ensure_userapp_dev(&state, app_id).await,
+        Ok(AppTarget::Dev(app_id)) => {
+            return ensure_userapp_dev(&state, app_id, request.user_id.as_str()).await;
+        }
         Ok(AppTarget::Prod(app_id)) => return ensure_userapp_prod(&state, locale, app_id).await,
         Err(e) => {
             error!("[POD_ENSURE] invalid app target: {}", e);
@@ -623,16 +625,18 @@ pub async fn pod_ensure(
 async fn ensure_userapp_dev(
     state: &Arc<AppState>,
     app_id: String,
+    user_id: &str,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
-    let (info, created) = crate::userapp_builder::ensure_userapp_builder_probed(state, &app_id)
-        .await
-        .map_err(|e| {
-            error!("[POD_ENSURE] ensure userapp dev container failed: app_id={app_id}: {e:#}");
-            AppError::with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                format!("ensure userapp dev container failed: {e:#}"),
-            )
-        })?;
+    let (info, created) =
+        crate::userapp_builder::ensure_userapp_builder_probed(state, &app_id, Some(user_id))
+            .await
+            .map_err(|e| {
+                error!("[POD_ENSURE] ensure userapp dev container failed: app_id={app_id}: {e:#}");
+                AppError::with_message(
+                    shared_types::error_codes::ERR_BACKEND_ERROR,
+                    format!("ensure userapp dev container failed: {e:#}"),
+                )
+            })?;
     info!(
         "[POD_ENSURE] userapp dev container ready: app_id={app_id}, container={}, ip={}",
         info.container_name, info.container_ip

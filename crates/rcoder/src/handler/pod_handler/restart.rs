@@ -34,7 +34,9 @@ pub async fn pod_restart(
         request.service_type.as_deref(),
     ) {
         Ok(AppTarget::NotApp) => {}
-        Ok(AppTarget::Dev(app_id)) => return restart_userapp_dev(&state, locale, app_id).await,
+        Ok(AppTarget::Dev(app_id)) => {
+            return restart_userapp_dev(&state, locale, app_id, request.user_id.as_str()).await;
+        }
         Ok(AppTarget::Prod(app_id)) => return restart_userapp_prod(&state, app_id).await,
         Err(e) => {
             error!("[POD_RESTART] invalid app target: {}", e);
@@ -355,6 +357,7 @@ async fn restart_userapp_dev(
     state: &Arc<AppState>,
     locale: &str,
     app_id: String,
+    user_id: &str,
 ) -> Result<HttpResult<RestartPodResponse>, AppError> {
     // 区分查询错误与真不存在（K8s API 瞬断不应误报 404 语义）
     let existed = state
@@ -409,15 +412,16 @@ async fn restart_userapp_dev(
                     warn!("[POD_RESTART] clear stale container field failed: app_id={app_id}: {e}");
                 }
             }
-            let recreated = crate::userapp_builder::ensure_userapp_builder(state, &app_id)
-                .await
-                .map_err(|e| {
-                    error!("[POD_RESTART] userapp dev recreate failed: app_id={app_id}: {e:#}");
-                    AppError::with_message(
-                        shared_types::error_codes::ERR_BACKEND_ERROR,
-                        format!("userapp dev restart (recreate phase) failed: {e:#}"),
-                    )
-                })?;
+            let recreated =
+                crate::userapp_builder::ensure_userapp_builder(state, &app_id, Some(user_id))
+                    .await
+                    .map_err(|e| {
+                        error!("[POD_RESTART] userapp dev recreate failed: app_id={app_id}: {e:#}");
+                        AppError::with_message(
+                            shared_types::error_codes::ERR_BACKEND_ERROR,
+                            format!("userapp dev restart (recreate phase) failed: {e:#}"),
+                        )
+                    })?;
             (
                 recreated,
                 "UserApp dev 容器已重建（卷保留，数据不丢）".to_string(),

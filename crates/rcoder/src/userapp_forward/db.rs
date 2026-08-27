@@ -111,7 +111,7 @@ pub(crate) async fn align_credentials(
         DbEnv::Dev => {
             // 开发容器：ensure（幂等 + 探活自愈，stopped/exited builder 自动重建）
             // + ensure-workspace（execute-command 的 cwd 前置）
-            let (info, _recreated) = ensure_userapp_builder_probed(&state, &body.app_id)
+            let (info, _recreated) = ensure_userapp_builder_probed(&state, &body.app_id, None)
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -226,7 +226,7 @@ async fn resolve_exec_target(
 ) -> Result<String, AppError> {
     match env {
         DbEnv::Dev => {
-            let (info, _recreated) = ensure_userapp_builder_probed(state, app_id)
+            let (info, _recreated) = ensure_userapp_builder_probed(state, app_id, None)
                 .await
                 .map_err(|e| {
                     tracing::error!(

@@ -14,7 +14,7 @@ pub use dev_locator::UserappDevLocator;
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use container_runtime_api::ContainerCreateParams;
 // 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
 use shared_types::ProjectStore as _;
@@ -30,13 +30,17 @@ use crate::router::AppState;
 const DEFAULT_BUILDER_STORAGE_SIZE: &str = "100Gi";
 
 /// 确保 UserAppBuilder 开发容器存在（幂等）并返回容器信息。
+///
+/// `explicit_user_id`：请求入参显式携带的 owner（优先档；`None`/空白视为未传，
+/// 走 metadata 注册值）。新建容器时用于组装宿主树 `dev/{user_id}/{app_id}`。
 pub(crate) async fn ensure_userapp_builder(
     state: &AppState,
     app_id: &str,
+    explicit_user_id: Option<&str>,
 ) -> Result<ContainerBasicInfo> {
     match registered_builder(state, app_id) {
         Some(info) => Ok(info),
-        None => create_builder_and_register(state, app_id).await,
+        None => create_builder_and_register(state, app_id, explicit_user_id).await,
     }
 }
 
@@ -52,6 +56,7 @@ pub(crate) async fn ensure_userapp_builder(
 pub(crate) async fn ensure_userapp_builder_probed(
     state: &AppState,
     app_id: &str,
+    explicit_user_id: Option<&str>,
 ) -> Result<(ContainerBasicInfo, bool)> {
     if let Some(info) = registered_builder(state, app_id) {
         let addr = dev_file_server_addr(state, &info);
@@ -69,10 +74,10 @@ pub(crate) async fn ensure_userapp_builder_probed(
                 warn!("[USERAPP_ENSURE] clear stale container field failed: app_id={app_id}: {e}");
             }
         }
-        let info = create_builder_and_register(state, app_id).await?;
+        let info = create_builder_and_register(state, app_id, explicit_user_id).await?;
         return Ok((info, true));
     }
-    let info = create_builder_and_register(state, app_id).await?;
+    let info = create_builder_and_register(state, app_id, explicit_user_id).await?;
     Ok((info, true))
 }
 
@@ -113,16 +118,16 @@ fn registered_builder(state: &AppState, project_id: &str) -> Option<ContainerBas
 async fn create_builder_and_register(
     state: &AppState,
     project_id: &str,
+    explicit_user_id: Option<&str>,
 ) -> Result<ContainerBasicInfo> {
-    // user_id 取 app 元数据的 owner（userapp_metadata，create-workspace/start
-    // 注册落库）——挂载压平模型的宿主树 dev/{user_id}/{app_id} 需要真实 user_id；
-    // 查不到（存量 app 元数据缺失）兜底 app_id 兼任（旧布局语义）。
-    let owner_user_id = state
-        .app_service
-        .get_app_owner(project_id)
-        .await
-        .filter(|uid| !uid.trim().is_empty())
-        .unwrap_or_else(|| project_id.to_string());
+    // owner 解析三档：显式传（请求入参）> userapp_metadata.owner（create-workspace/
+    // start 注册落库）> fail-fast 报错。绝不兜底 app_id 兼任——旧兜底会把宿主树
+    // 挂成 dev/{app_id}/{app_id} 孤儿目录（数据落错树不可回收，且对调用方不可见）。
+    let metadata_owner = state.app_service.get_app_owner(project_id).await;
+    let owner_user_id =
+        resolve_owner(explicit_user_id, metadata_owner.as_deref()).with_context(|| {
+            format!("cannot resolve owner user_id for app {project_id}; pass user_id explicitly")
+        })?;
     // UserAppBuilder identifier = project_id(app_id 兼任);挂载由 mounts/k8s_agent_create
     // auto-inject 统一组装（dev 四目录压平）。
     let params = ContainerCreateParams::builder()
@@ -158,4 +163,40 @@ async fn create_builder_and_register(
         project_id, container_info.container_name, container_info.container_ip
     );
     Ok(container_info)
+}
+
+/// dev 宿主树 owner 解析（纯函数）：显式传 > metadata 注册值 > 报错。
+///
+/// 空白字符串视为未传（pod 分派层 body 字段可能携空串）。
+fn resolve_owner(explicit: Option<&str>, metadata: Option<&str>) -> Result<String> {
+    if let Some(uid) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(uid.to_string());
+    }
+    if let Some(uid) = metadata.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(uid.to_string());
+    }
+    Err(anyhow!("missing user_id"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_owner;
+
+    /// owner 三档：显式优先（含空白显式降级）> metadata > fail-fast。
+    #[test]
+    fn resolve_owner_prefers_explicit_then_metadata_then_fails() {
+        // 显式传优先（与 metadata 冲突时显式赢）
+        assert_eq!(
+            resolve_owner(Some("u-explicit"), Some("u-meta")).unwrap(),
+            "u-explicit"
+        );
+        // 显式空白 → 降级 metadata
+        assert_eq!(resolve_owner(Some("  "), Some("u-meta")).unwrap(), "u-meta");
+        // 无显式 → metadata
+        assert_eq!(resolve_owner(None, Some("u-meta")).unwrap(), "u-meta");
+        // metadata 空白 → 视为未注册
+        assert!(resolve_owner(None, Some(" ")).is_err());
+        // 双缺 → fail-fast（绝不兜底 app_id 建孤儿目录树）
+        assert!(resolve_owner(None, None).is_err());
+    }
 }

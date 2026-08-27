@@ -263,18 +263,19 @@ async fn run_userapp_dev_chat_flow(
     );
 
     // 2. 容器 ensure（幂等；注册 state.projects）+ 活动时间刷新（防对话中被闲置回收）
-    let container_info = crate::userapp_builder::ensure_userapp_builder(&state, &project_id)
-        .await
-        .map_err(|e| {
-            error!(
-                "❌ [USERAPP_DEV_CHAT] ensure dev container failed: app_id={}: {e:#}",
-                project_id
-            );
-            ChatFlowExit::response(HttpResult::error_with_locale(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                locale,
-            ))
-        })?;
+    let container_info =
+        crate::userapp_builder::ensure_userapp_builder(&state, &project_id, Some(&user_id))
+            .await
+            .map_err(|e| {
+                error!(
+                    "❌ [USERAPP_DEV_CHAT] ensure dev container failed: app_id={}: {e:#}",
+                    project_id
+                );
+                ChatFlowExit::response(HttpResult::error_with_locale(
+                    shared_types::error_codes::ERR_CONTAINER_ERROR,
+                    locale,
+                ))
+            })?;
     state.update_activity(&project_id);
 
     // 3. workspace 就绪（容器内幂等建目录；userapp_forward 公共调用）
