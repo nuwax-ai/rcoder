@@ -17,14 +17,13 @@ use crate::models::{
 };
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
-use file_server::handlers::computer::files::files_update_impl;
-use file_server::handlers::computer::files::generate::generate_file_impl;
-use file_server::handlers::computer::files::import_project::import_project_impl;
-use file_server::handlers::computer::files::upload::{upload_file_impl, upload_files_impl};
-use file_server::handlers::computer::files_read::{
+use file_server::ops::files::{
+    files_update_impl, generate_file_impl, import_project_impl, upload_file_impl, upload_files_impl,
+};
+use file_server::ops::files_read::{
     FileListParams, SearchFilesParams, get_file_list_impl, resolve_file_impl, search_files_impl,
 };
-use file_server::handlers::multipart::{file_field, text_field, validate_zip_ext};
+use file_server::ops::multipart::{file_field, text_field, validate_zip_ext};
 use file_server::service::temp_file::TemporaryFile;
 use file_server::workspace::resolve_userapp_dev;
 
@@ -36,7 +35,7 @@ use file_server::workspace::resolve_userapp_dev;
     path = "/get-file-list",
     params(UserappFileListQuery),
     responses(file_server::openapi::JsonApiResponses),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · 双态 · 文件镜像"
 )]
 pub(crate) async fn get_file_list(
     State(state): State<UserAppState>,
@@ -65,7 +64,7 @@ pub(crate) async fn get_file_list(
     path = "/resolve-file",
     params(UserappResolveFileQuery),
     responses(file_server::openapi::JsonApiResponses),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · 双态 · 文件镜像"
 )]
 pub(crate) async fn resolve_file(
     State(state): State<UserAppState>,
@@ -90,7 +89,7 @@ pub(crate) async fn resolve_file(
     path = "/search-files",
     params(UserappSearchFilesQuery),
     responses(file_server::openapi::JsonApiResponses),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · 双态 · 文件镜像"
 )]
 pub(crate) async fn search_files(
     State(state): State<UserAppState>,
@@ -117,7 +116,7 @@ pub(crate) async fn search_files(
 // ── files-update ────────────────────────────────────────────────────────────────
 
 /// 批量文件增删改（modify 字节比较）
-#[utoipa::path(post, path = "/files-update", request_body = UserappFilesUpdateBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
+#[utoipa::path(post, path = "/files-update", request_body = UserappFilesUpdateBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 双态 · 文件镜像")]
 pub(crate) async fn files_update(
     State(state): State<UserAppState>,
     Json(body): Json<UserappFilesUpdateBody>,
@@ -140,7 +139,7 @@ pub(crate) async fn files_update(
 // ── upload-file / upload-files ──────────────────────────────────────────────────
 
 /// 单文件上传（multipart）
-#[utoipa::path(post, path = "/upload-file", request_body(content = UserappUploadFileForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
+#[utoipa::path(post, path = "/upload-file", request_body(content = UserappUploadFileForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 双态 · 文件镜像")]
 pub(crate) async fn upload_file(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
@@ -183,7 +182,7 @@ pub(crate) async fn upload_file(
 }
 
 /// 多文件上传（单文件错误隔离）
-#[utoipa::path(post, path = "/upload-files", request_body(content = UserappUploadFilesForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
+#[utoipa::path(post, path = "/upload-files", request_body(content = UserappUploadFilesForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 双态 · 文件镜像")]
 pub(crate) async fn upload_files(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
@@ -236,7 +235,7 @@ pub(crate) async fn upload_files(
     path = "/generate-file",
     request_body = UserappGenerateFileBody,
     responses(file_server::openapi::JsonApiResponses),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · 双态 · 文件镜像"
 )]
 pub(crate) async fn generate_file(
     State(state): State<UserAppState>,
@@ -254,7 +253,7 @@ pub(crate) async fn generate_file(
 // ── import-project ──────────────────────────────────────────────────────────────
 
 /// 上传项目 zip 解压合并到开发卷 workspace
-#[utoipa::path(post, path = "/import-project", request_body(content = UserappImportProjectForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
+#[utoipa::path(post, path = "/import-project", request_body(content = UserappImportProjectForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 双态 · 文件镜像")]
 pub(crate) async fn import_project(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
@@ -393,11 +392,9 @@ mod tests {
         )
         .await;
         let ws = resolve_userapp_dev("app-1", None, &state.fs.config).unwrap();
-        file_server::handlers::computer::workspace::init_template::init_project_template_impl(
-            &state.fs, ws, data, false,
-        )
-        .await
-        .expect("init template");
+        file_server::ops::workspace::init_project_template_impl(&state.fs, ws, data, false)
+            .await
+            .expect("init template");
 
         // 2. get-file-list (镜像壳 Query handler) 应看到模板文件
         let q = Query(UserappFileListQuery {

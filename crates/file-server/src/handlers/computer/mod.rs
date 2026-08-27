@@ -15,7 +15,7 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::workspace::ComputerContext;
 
-use super::multipart::{file_field, text_field, validate_zip_ext};
+use crate::ops::multipart::validate_zip_ext;
 
 // ID 字段反序列化 helper (deserialize_id_string / deserialize_optional_id_string) 已提升至
 // `crate::extract`, 供 computer / project 等所有 handler 共用。
@@ -25,7 +25,6 @@ pub mod exec;
 pub mod files;
 pub mod files_read;
 pub mod packages;
-mod process_capture;
 pub mod workspace;
 
 // ── 跨组共享 helper (子模块经 super:: 访问) ──────────────────────────────────────

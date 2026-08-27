@@ -2,15 +2,17 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::super::{file_field, text_field, ws_path};
+use crate::ops::init_project_template_impl;
+use crate::ops::multipart::{file_field, text_field};
+
+use super::super::ws_path;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
 use crate::models::InitProjectTemplateForm;
 use crate::service::temp_file::TemporaryFile;
-use crate::service::zip;
 
 /// init-project-template 必填字段 (含模板 zip 文件)。
 #[derive(garde::Validate)]
@@ -92,29 +94,4 @@ pub(crate) async fn init_project_template(
     let v = fields.into_validated()?;
     let ws = ws_path(&state, &v.user_id, &v.cid).await?;
     init_project_template_impl(&state, ws, v.data, enable_git).await
-}
-
-/// init-project-template 的 workspace 无关实现。
-pub async fn init_project_template_impl(
-    state: &AppState,
-    ws: std::path::PathBuf,
-    data: TemporaryFile,
-    enable_git: bool,
-) -> Result<Json<Value>, AppError> {
-    tokio::fs::create_dir_all(&ws).await?;
-    zip::extract_to(data.path().to_path_buf(), ws.clone()).await?;
-    // git 双开关: GIT_ENABLED && enableGit → init + initial commit (对齐 nuwax)
-    if state.config.git_enabled && enable_git {
-        let an = state.config.git_default_author_name.clone();
-        let ae = state.config.git_default_author_email.clone();
-        // init_repo 内部已含 initial commit (ensure_repo + ensure_gitignore + commit_indexed)
-        if let Err(e) = crate::service::git::init_repo(&ws, &an, &ae) {
-            tracing::warn!(error = %e, "git init_repo after template init failed (skipping)");
-        }
-    }
-    Ok(Json(json!({
-        "success": true,
-        "message": "Project template initialized successfully",
-        "workspaceRoot": ws.display().to_string(),
-    })))
 }

@@ -1,17 +1,17 @@
 //! upload-file / upload-files handlers: multipart 单文件与批量上传。
 
-use std::path::Path;
-
 use axum::extract::State;
 use garde::Validate;
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::super::{file_field, resolve_computer_target, text_field};
+use crate::ops::multipart::{file_field, text_field};
+use crate::ops::{upload_file_impl, upload_files_impl};
+
+use super::super::resolve_computer_target;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
 use crate::models::{UploadFileForm, UploadFilesForm};
-use crate::path_safety;
 use crate::service::temp_file::TemporaryFile;
 
 /// upload-file 必填字段 (multipart 提取后构造 + garde 校验; 文件字段用内置 required)。
@@ -138,23 +138,6 @@ pub(crate) async fn upload_file(
     upload_file_impl(&ws, &v.file_path, v.data).await
 }
 
-/// upload-file 的 workspace 无关实现。
-pub async fn upload_file_impl(
-    ws: &Path,
-    file_path: &str,
-    data: TemporaryFile,
-) -> Result<Json<Value>, AppError> {
-    let target = path_safety::ensure_within(ws, file_path)?;
-    // copy_file 内部已 create_dir_all(parent), 无需重复
-    let file_size = data.size();
-    crate::service::temp_file::copy_file(data.path(), &target).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "File uploaded successfully",
-        "fileSize": file_size,
-    })))
-}
-
 /// 批量上传文件
 ///
 /// 对齐 nuwax computer uploadFiles; 多文件 multipart。
@@ -203,66 +186,4 @@ pub(crate) async fn upload_files(
     let ws =
         resolve_computer_target(&state, &v.user_id, &v.cid, custom_target_dir.as_deref()).await?;
     upload_files_impl(&ws, &file_paths, &files_vec).await
-}
-
-/// upload-files 的 workspace 无关实现 (单文件错误隔离: 单个失败不影响其余)。
-pub async fn upload_files_impl(
-    ws: &Path,
-    file_paths: &[String],
-    files_vec: &[(Option<String>, TemporaryFile)],
-) -> Result<Json<Value>, AppError> {
-    let total = file_paths.len();
-    let mut success_count = 0usize;
-    let mut results: Vec<Value> = Vec::new();
-    for (fp, (original, data)) in file_paths.iter().zip(files_vec) {
-        let target = match path_safety::ensure_within(ws, fp) {
-            Ok(t) => t,
-            Err(_) => {
-                results.push(json!({
-                    "success": false,
-                    "filePath": fp,
-                    "originalname": original,
-                    "error": "Invalid file path",
-                }));
-                continue;
-            }
-        };
-        let file_size = data.size();
-        match write_file_create_parent(&target, data.path()).await {
-            Ok(()) => {
-                success_count += 1;
-                results.push(json!({
-                    "success": true,
-                    "filePath": fp,
-                    "originalname": original,
-                    "message": "File uploaded successfully",
-                    "fileSize": file_size,
-                }));
-            }
-            Err(e) => {
-                results.push(json!({
-                    "success": false,
-                    "filePath": fp,
-                    "originalname": original,
-                    "error": e.to_string(),
-                }));
-            }
-        }
-    }
-    let fail_count = total - success_count;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Batch upload completed",
-        "totalCount": total,
-        "successCount": success_count,
-        "failCount": fail_count,
-        "results": results,
-    })))
-}
-
-/// 写文件 (父目录自动创建); 用于 upload-files 单文件隔离错误。
-async fn write_file_create_parent(target: &Path, source: &Path) -> Result<(), AppError> {
-    crate::service::temp_file::copy_file(source, target)
-        .await
-        .map(|_| ())
 }

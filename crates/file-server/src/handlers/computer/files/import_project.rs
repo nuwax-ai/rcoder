@@ -4,7 +4,10 @@ use axum::extract::State;
 use garde::Validate;
 use serde_json::{Value, json};
 
-use super::super::{file_field, resolve_computer_target, text_field, validate_zip_ext};
+use crate::ops::import_project_impl;
+use crate::ops::multipart::{file_field, text_field};
+
+use super::super::{resolve_computer_target, validate_zip_ext};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
@@ -96,14 +99,4 @@ pub(crate) async fn import_project(
         "cId": v.cid,
         "targetDir": target,
     })))
-}
-
-/// import-project 的 workspace 无关实现：解压合并并返回目标目录（展示/回显归各域壳层）。
-pub async fn import_project_impl(
-    target_dir: std::path::PathBuf,
-    data: TemporaryFile,
-) -> Result<String, AppError> {
-    tokio::fs::create_dir_all(&target_dir).await?;
-    let res = crate::service::computer_ws::import_project(&target_dir, data.path()).await?;
-    Ok(res.target_dir)
 }

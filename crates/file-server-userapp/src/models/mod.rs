@@ -67,6 +67,39 @@ mod tests {
         assert!(visited > 8, "sanity: 至少扫描 8 个源文件, 实际 {visited}");
     }
 
+    /// 跨 crate 边界守卫：本 crate 不得引用 `file_server::handlers`——file-server
+    /// 的 HTTP 边界层只对自己的路由开放；跨 crate 共享实现一律走
+    /// `file_server::ops` / `service` / `models` / `error` / `extract`。
+    /// 匹配串拼接构造避免守卫自身命中。
+    #[test]
+    fn never_import_file_server_handlers() {
+        let marker = ["file_server::", "handlers"].concat();
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        visit(
+            &src,
+            &mut |file, content| {
+                let relative = file.strip_prefix(&src).unwrap_or(file);
+                for line in content.lines() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("//") || trimmed.starts_with("//!") {
+                        continue;
+                    }
+                    if line.contains(&marker) {
+                        offenders.push(format!("{}: {}", relative.display(), line.trim()));
+                    }
+                }
+            },
+            &mut 0usize,
+        );
+        assert!(
+            offenders.is_empty(),
+            "跨 crate 禁止引用 {}（共享实现走 ops/service/models）：\n{}",
+            marker,
+            offenders.join("\n")
+        );
+    }
+
     fn visit(dir: &Path, f: &mut dyn FnMut(&Path, &str), visited: &mut usize) {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,

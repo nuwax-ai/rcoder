@@ -57,10 +57,18 @@ pub(crate) fn userapp_top_router() -> OpenApiRouter<UserAppState> {
 }
 
 /// userApp 域独立 OpenAPI 文档（含 UserApp tag；rcoder 聚合与本地 swagger 用）。
+///
+/// tag 体系与 rcoder 主文档同源（环境维度分组）；声明顺序即 UI 分组顺序。
 #[derive(OpenApi)]
 #[openapi(
     info(title = "file-server-userapp", description = "UserApp domain APIs (build/tasks/dev-server/file mirror)"),
-    tags((name = "UserApp · 开发与构建", description = "开发工作区、构建任务与文件镜像（file-server 进程侧服务）"))
+    tags(
+        (name = "UserApp · dev · 构建任务", description = "dev 专属（目标容器恒为 UserAppBuilder 开发容器）：构建触发、任务查询/取消与进度 SSE、制品包下载"),
+        (name = "UserApp · dev · 工作区与工具链", description = "dev 专属（目标容器 UserAppBuilder 开发容器）：workspace 创建、命令执行、打包下载、模板与技能安装、项目类型探测确认"),
+        (name = "UserApp · dev · 进程管理", description = "dev 专属（目标容器 UserAppBuilder 开发容器，路径自带 dev）：dev server 进程启停/列表/日志"),
+        (name = "UserApp · 双态 · 文件镜像", description = "dev/prod 双态（X-App-Stage header 分派，缺省 dev）：TS 老接口族文件操作（camelCase 永久契约）"),
+        (name = "UserApp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{env} 段分派）：文件上传/管理与存储卷查询/清理/销毁")
+    )
 )]
 struct ApiDoc;
 

@@ -1,15 +1,17 @@
 //! push-skills-to-workspace v1/v2 handlers: 技能推送 (可选 agent-store 路径)。
 
 use axum::extract::State;
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::super::{file_field, text_field, ws_path};
+use crate::ops::multipart::{file_field, text_field};
+use crate::ops::push_skills_impl;
+
+use super::super::ws_path;
 use super::require_workspace_fields;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
 use crate::models::PushSkillsForm;
-use crate::service::skills as skills_service;
 
 /// 技能推送到工作区
 ///
@@ -90,81 +92,4 @@ async fn push_skills_to_workspace_impl(
         true,
     )
     .await
-}
-
-/// push-skills 的 workspace 无关实现。
-///
-/// `allow_agent_store`: 是否允许 agent-store 软链分支 (computer 布局 `{root}/{user}/{cid}`
-/// 下 `ws.parent()` 即用户根, 语义成立; userapp 开发卷布局下 parent 是共享卷根,
-/// 该分支不适用, 传 false 一律走 legacy `push_skills_at` 写 `{ws}/.agents/skills`)。
-pub async fn push_skills_impl(
-    state: &AppState,
-    ws: &std::path::Path,
-    cid: &str,
-    zip_data: Option<&crate::service::temp_file::TemporaryFile>,
-    skill_urls: Vec<String>,
-    agent_id: Option<&str>,
-    allow_agent_store: bool,
-) -> Result<Json<Value>, AppError> {
-    if !crate::service::fs_util::path_exists(ws).await? {
-        return Err(AppError::resource("workspace does not exist"));
-    }
-
-    // 有 agentId 且 workspace 已软链 → 写 agent-store; 否则旧路径 (对齐 TS pushSkillsToWorkspace)
-    let agent_id = agent_id.map(|s| s.trim()).filter(|s| !s.is_empty());
-    let updated = if allow_agent_store && let Some(agent_id) = agent_id {
-        let skills_path = ws.join(".agents").join("skills");
-        if crate::service::agent_store::is_dir_link(&skills_path) {
-            let user_root = ws.parent().unwrap_or(ws).to_path_buf();
-            skills_service::push_skills_to_agent_store(skills_service::PushToStoreParams {
-                user_root: &user_root,
-                cid,
-                agent_id,
-                zip_path: zip_data.map(|file| file.path()),
-                skill_urls,
-                downloader: &state.skill_downloader,
-            })
-            .await?
-        } else {
-            tracing::info!(
-                cid,
-                agent_id,
-                "push skills: agentId present but workspace not symlinked, use legacy path"
-            );
-            skills_service::push_skills_at(
-                ws,
-                zip_data.map(|file| file.path()),
-                skill_urls,
-                &state.skill_downloader,
-            )
-            .await?
-        }
-    } else {
-        if let Some(agent_id) = agent_id {
-            tracing::info!(
-                agent_id,
-                "push skills: agent-store path disabled, use legacy path"
-            );
-        }
-        skills_service::push_skills_at(
-            ws,
-            zip_data.map(|file| file.path()),
-            skill_urls,
-            &state.skill_downloader,
-        )
-        .await?
-    };
-    // message 对齐 nuwax pushSkillsToWorkspace: 有 skills → "Pushed N skills: a, b";
-    // 无 → "No valid skill directories found in file or skillUrls"
-    let message = if updated.is_empty() {
-        "No valid skill directories found in file or skillUrls".to_string()
-    } else {
-        format!("Pushed {} skills: {}", updated.len(), updated.join(", "))
-    };
-    Ok(Json(json!({
-        "success": true,
-        "message": message,
-        "workspaceRoot": ws.display().to_string(),
-        "updatedSkills": updated,
-    })))
 }

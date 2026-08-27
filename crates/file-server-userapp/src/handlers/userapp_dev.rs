@@ -22,12 +22,11 @@ use crate::models::{
 };
 use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
-use file_server::handlers::computer::archive::{download_all_files_impl, zip_workspace_impl};
-use file_server::handlers::computer::exec::{execute_command_impl, get_logs_impl};
-use file_server::handlers::computer::packages::install_project_impl;
-use file_server::handlers::computer::workspace::init_template::init_project_template_impl;
-use file_server::handlers::computer::workspace::push_skills::push_skills_impl;
-use file_server::handlers::multipart::{file_field, text_field};
+use file_server::ops::archive::{download_all_files_impl, zip_workspace_impl};
+use file_server::ops::exec::{execute_command_impl, get_logs_impl};
+use file_server::ops::install_project_impl;
+use file_server::ops::multipart::{file_field, text_field};
+use file_server::ops::workspace::{init_project_template_impl, push_skills_impl};
 use file_server::workspace::resolve_userapp_dev;
 
 // ── ensure-workspace ────────────────────────────────────────────────────────────
@@ -36,7 +35,7 @@ use file_server::workspace::resolve_userapp_dev;
 ///
 /// create-workspace 链路首建；execute-command 等接口要求 cwd 已存在，
 /// 故目录创建须先于业务调用。
-#[utoipa::path(post, path = "/ensure-workspace", request_body = UserappEnsureWorkspaceBody, responses((status = 200, body = HttpResult<UserappEnsureWorkspaceData>, description = "workspace 目录已就绪（含绝对路径）")), tag = "UserApp · 开发与构建")]
+#[utoipa::path(post, path = "/ensure-workspace", request_body = UserappEnsureWorkspaceBody, responses((status = 200, body = HttpResult<UserappEnsureWorkspaceData>, description = "workspace 目录已就绪（含绝对路径）")), tag = "UserApp · dev · 工作区与工具链")]
 pub(crate) async fn ensure_workspace(
     State(state): State<UserAppState>,
     Json(body): Json<UserappEnsureWorkspaceBody>,
@@ -59,7 +58,7 @@ pub(crate) async fn ensure_workspace(
 /// 终端命令执行（cwd=workspace）
 ///
 /// 经 shell -c 执行，带超时捕获。
-#[utoipa::path(post, path = "/execute-command", request_body = UserappExecCommandBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
+#[utoipa::path(post, path = "/execute-command", request_body = UserappExecCommandBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · dev · 工作区与工具链")]
 pub(crate) async fn execute_command(
     State(state): State<UserAppState>,
     Json(body): Json<UserappExecCommandBody>,
@@ -79,7 +78,7 @@ pub(crate) async fn execute_command(
     path = "/get-logs",
     params(UserappGetLogsQuery),
     responses(file_server::openapi::JsonApiResponses),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 工作区与工具链"
 )]
 pub(crate) async fn get_logs(
     State(state): State<UserAppState>,
@@ -95,7 +94,7 @@ pub(crate) async fn get_logs(
 /// 依赖安装
 ///
 /// typescript→pnpm install；python→pip install。
-#[utoipa::path(post, path = "/install-project", request_body = UserappInstallBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
+#[utoipa::path(post, path = "/install-project", request_body = UserappInstallBody, responses(file_server::openapi::JsonApiResponses), tag = "UserApp · dev · 工作区与工具链")]
 pub(crate) async fn install_project(
     State(state): State<UserAppState>,
     Json(body): Json<UserappInstallBody>,
@@ -116,7 +115,7 @@ pub(crate) async fn install_project(
         (status = 200, description = "Workspace ZIP archive", body = file_server::models::BinaryFile, content_type = "application/zip"),
         file_server::openapi::ErrorApiResponses
     ),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 工作区与工具链"
 )]
 pub(crate) async fn zip_workspace(
     State(state): State<UserAppState>,
@@ -146,7 +145,7 @@ pub(crate) async fn zip_workspace(
         (status = 200, description = "Workspace ZIP archive", body = file_server::models::BinaryFile, content_type = "application/zip"),
         file_server::openapi::ErrorApiResponses
     ),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 工作区与工具链"
 )]
 pub(crate) async fn download_all_files(
     State(state): State<UserAppState>,
@@ -165,7 +164,7 @@ pub(crate) async fn download_all_files(
 ///
 /// 模板 zip 解压到 workspace；可选 git init（双开关：GIT_ENABLED 且 enableGit 为 true 才执行）。
 /// UserApp 开发的起点接口。
-#[utoipa::path(post, path = "/init-project-template", request_body(content = UserappInitTemplateForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
+#[utoipa::path(post, path = "/init-project-template", request_body(content = UserappInitTemplateForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · dev · 工作区与工具链")]
 pub(crate) async fn init_project_template(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
@@ -214,7 +213,7 @@ pub(crate) async fn init_project_template(
 /// 技能推送（zip/skillUrls）
 ///
 /// 开发卷布局下技能一律推 `{ws}/.agents/skills`（legacy 路径）。
-#[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = UserappPushSkillsForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · 开发与构建")]
+#[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = UserappPushSkillsForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "UserApp · dev · 工作区与工具链")]
 pub(crate) async fn push_skills_to_workspace(
     State(state): State<UserAppState>,
     mut multipart: Multipart,

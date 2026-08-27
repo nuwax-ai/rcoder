@@ -1,17 +1,16 @@
 //! generate-file handler: JSON 文本生成文件。
 
-use std::path::PathBuf;
-
 use axum::extract::State;
 use garde::Validate;
-use serde_json::{Value, json};
+use serde_json::Value;
+
+use crate::ops::generate_file_impl;
 
 use super::super::resolve_computer_target;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
 use crate::models::GenerateFileBody;
-use crate::path_safety;
 
 /// 生成文本文件
 ///
@@ -42,34 +41,10 @@ pub(crate) async fn generate_file(
     generate_file_impl(ws, body.file_name.trim(), body.content.unwrap_or_default()).await
 }
 
-/// generate-file 的 workspace 无关实现 (`file_name` 已 trim; 内容缺省空串)。
-pub async fn generate_file_impl(
-    ws: PathBuf,
-    file_name: &str,
-    content: String,
-) -> Result<Json<Value>, AppError> {
-    // 对齐 TS uploadFile.normalizeFilePath: 路径拼接时剥离前导 `/`
-    // (允许 "src/foo.txt" 这类相对子路径;绝对路径会被 ensure_within 拒)。
-    let target = path_safety::ensure_within(&ws, file_name.trim_start_matches('/'))?;
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let bytes = content.as_bytes();
-    let file_size = bytes.len();
-    tokio::fs::write(&target, bytes)
-        .await
-        .map_err(|e| AppError::system(format!("write generated file failed: {e}")))?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "File generated successfully",
-        "fileName": file_name,
-        "fileSize": file_size,
-    })))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use crate::{

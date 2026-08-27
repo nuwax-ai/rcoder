@@ -8,8 +8,6 @@ pub mod generate;
 pub mod import_project;
 pub mod upload;
 
-use std::path::Path;
-
 use axum::extract::State;
 use serde_json::{Value, json};
 
@@ -17,8 +15,8 @@ use super::{resolve_computer_target, ws_path};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
-use crate::models::{DeleteWorkspaceBody, FileOp, FilesUpdateBody};
-use crate::service::code as code_service;
+use crate::models::{DeleteWorkspaceBody, FilesUpdateBody};
+use crate::ops::files_update_impl;
 
 // ── delete-workspace ────────────────────────────────────────────────────────────
 
@@ -65,23 +63,4 @@ pub(crate) async fn files_update(
         "cId": body.c_id,
         "filesCount": count,
     })))
-}
-
-/// files-update 的 workspace 无关实现：返回写入的文件数（展示/回显归各域壳层）。
-pub async fn files_update_impl(ws: &Path, mut files: Vec<FileOp>) -> Result<usize, AppError> {
-    // 工作区不存在 → 创建 (对齐 nuwax computerFileUtils.updateFiles: !existsSync → mkdirSync recursive)。
-    // 首次向全新 user/cId 工作区写入不应失败。
-    tokio::fs::create_dir_all(ws).await?;
-    // decodeURIComponent 文本内容 (对齐 nuwax safeDecodePath)
-    for op in files.iter_mut() {
-        if let Some(c) = op.contents.as_mut()
-            && !c.is_empty()
-        {
-            *c = code_service::decode_uri_component(c);
-        }
-    }
-    let count = files.len();
-    // computer updateFiles: modify 用字节比较 (非 project 的行级 diff; 对齐 nuwax)
-    code_service::apply_file_ops(ws, &files, code_service::ModifyStrategy::ByteCompare).await?;
-    Ok(count)
 }

@@ -119,7 +119,7 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
     path = "/build",
     request_body = BuildUserAppBody,
     responses((status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有活跃任务时在队列排队（per-app 互斥）；全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE）；构建日志分页 GET /tasks/{task_id}/logs。")),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 构建任务"
 )]
 pub(crate) async fn build_workspace(
     State(state): State<UserAppState>,
@@ -169,7 +169,7 @@ pub(crate) async fn build_workspace(
 终态快照保留 24h 供回查；不存在/已清理 → 404。
 "#,
     responses((status = 200, body = HttpResult<BuildTaskSnapshot>, description = "任务状态快照（轮询通道，建议 2-3s 间隔）。关键字段：status（pending/running/completed/failed/cancelled——后三者为终态，到终态即可停止轮询）、current_service（正在编译的服务）、release_id/sha256/size_bytes/file_name/artifact_path（completed 时有值：产物摘要）、error（failed 时有值）、seq（事件游标 = 已推送事件数，恰为下一条事件的 seq；从轮询切 SSE 续传时可直接作 from_seq 传，但勿直接作 Last-Event-ID 头——头语义是最后收到事件的 id，比本值小 1，直接用会漏一条事件）。终态快照保留 24h 供回查。")),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 构建任务"
 )]
 pub(crate) async fn get_task(
     State(state): State<UserAppState>,
@@ -197,7 +197,7 @@ pub(crate) async fn get_task(
     path = "/tasks/{task_id}/logs",
     params(("task_id" = String, Path, description = "任务ID"), TaskLogsQuery),
     responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "构建日志分页（历史日志文件读取，非 SSE）。query：service=子项目目录名（留空=workspace 根日志）；start_index=起始行号（1-based，用上批响应的 total_lines 翻页）。响应 data：logs[{line,content}]（行号+内容）、total_lines（总行数）、start_index、log_file_name。日志按天滚动（dev-YYYY-MM-DD.log），只读当前文件。")),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 构建任务"
 )]
 pub(crate) async fn get_task_logs(
     State(state): State<UserAppState>,
@@ -256,7 +256,7 @@ pub(crate) async fn get_task_logs(
         ),
         (status = 404, description = "Task not found（HttpResult JSON，非 SSE）"),
     ),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 构建任务"
 )]
 pub(crate) async fn stream_task_logs(
     State(state): State<UserAppState>,
@@ -325,7 +325,7 @@ pub(crate) async fn stream_task_logs(
     path = "/tasks/{task_id}/cancel",
     params(("task_id" = String, Path, description = "任务ID")),
     responses((status = 200, body = HttpResult<CancelData>, description = "取消结果。双重取消：软取消（置 flag）+ kill 编译进程组；已到终态的任务返回 already_terminal=true 幂等成功。取消成功后任务流发 cancelled 终态事件（SSE）")),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 构建任务"
 )]
 pub(crate) async fn cancel_task(
     State(state): State<UserAppState>,
@@ -379,7 +379,7 @@ pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
     path = "/projects/detect",
     request_body = ImportProjectBody,
     responses((status = 200, body = HttpResult<DetectData>, description = "项目探测结果")),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 工作区与工具链"
 )]
 pub(crate) async fn detect_project(
     State(state): State<UserAppState>,
@@ -403,7 +403,7 @@ pub(crate) async fn detect_project(
     path = "/projects/confirm",
     request_body = ImportProjectBody,
     responses((status = 200, body = HttpResult<ConfirmData>, description = "项目确认结果")),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 工作区与工具链"
 )]
 pub(crate) async fn confirm_project(
     State(state): State<UserAppState>,

@@ -9,6 +9,5 @@ pub(crate) mod build_support;
 pub mod computer;
 pub(crate) mod git;
 pub(crate) mod health;
-pub mod multipart;
 pub(crate) mod project;
 pub mod static_files;

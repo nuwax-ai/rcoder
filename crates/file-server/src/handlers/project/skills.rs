@@ -4,11 +4,12 @@ use axum::extract::State;
 use garde::Validate;
 use serde_json::json;
 
-use super::{ctx_from, file_field, text_field};
+use super::ctx_from;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
 use crate::models::PushProjectSkillsForm;
+use crate::ops::multipart::{file_field, text_field};
 use crate::service::skills as skills_service;
 
 /// project_id 必填 (multipart 提取后构造 + garde 校验)。

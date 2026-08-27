@@ -9,7 +9,7 @@ use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use file_server::extract::AppPath as AxumPath;
 use file_server::extract::AppQuery;
-use file_server::handlers::static_files::{COMPUTER_CORS, cors_404, serve_from_root};
+use file_server::ops::static_share::{COMPUTER_CORS, cors_404, serve_from_root};
 use file_server::workspace::resolve_userapp_dev;
 
 /// 下载构建整体包
@@ -34,7 +34,7 @@ use file_server::workspace::resolve_userapp_dev;
         (status = 200, description = "Build artifact zip（缺省最新产物；?release_id= 指定版本）", body = file_server::models::BinaryFile, content_type = "application/zip"),
         (status = 404, description = "无产物，或 ?release_id= 指定的版本不存在（含非法字符被拒）")
     ),
-    tag = "UserApp · 开发与构建"
+    tag = "UserApp · dev · 构建任务"
 )]
 pub async fn serve_userapp(
     State(state): State<UserAppState>,

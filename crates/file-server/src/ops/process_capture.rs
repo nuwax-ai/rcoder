@@ -10,13 +10,13 @@ use crate::error::{AppError, AppResult};
 
 const MAX_CAPTURE_BYTES: usize = 50 * 1024 * 1024;
 
-pub(super) struct CaptureResult {
+pub struct CaptureResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
 }
 
-pub(super) async fn capture_command(
+pub async fn capture_command(
     command: &mut Command,
     label: &str,
     timeout_secs: u64,
@@ -77,7 +77,7 @@ pub(super) async fn capture_command(
     })
 }
 
-pub(super) async fn run_capture(
+pub async fn run_capture(
     program: &str,
     args: &[&str],
     cwd: &std::path::Path,

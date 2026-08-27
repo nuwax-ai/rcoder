@@ -7,6 +7,7 @@ pub mod handlers;
 pub mod logging;
 pub mod models;
 pub mod openapi;
+pub mod ops;
 pub mod path_safety;
 pub mod response;
 pub mod routes;

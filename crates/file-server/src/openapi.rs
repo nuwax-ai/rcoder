@@ -56,7 +56,13 @@ pub enum ErrorApiResponses {
         (name = "Build", description = "Build and Vite dev-server lifecycle"),
         (name = "Git", description = "Git repository operations"),
         (name = "Computer", description = "Computer workspace operations"),
-        (name = "Static", description = "Project and workspace static files")
+        (name = "Static", description = "Project and workspace static files"),
+        // userapp 域 tag（file_server_document 会 merge file-server-userapp 域文档；
+        // 未在此声明则 merge 后 UI 分组顺序退化为 operation 首现顺序。TS 老族与
+        // app-files 在两份聚合文档均属内部剔除面，其 tag 只在容器侧独立文档声明）
+        (name = "UserApp · dev · 构建任务", description = "dev 专属（目标容器恒为 UserAppBuilder 开发容器）：构建触发、任务查询/取消与进度 SSE、制品包下载"),
+        (name = "UserApp · dev · 工作区与工具链", description = "dev 专属（目标容器 UserAppBuilder 开发容器）：workspace 创建、命令执行、打包下载、模板与技能安装、项目类型探测确认"),
+        (name = "UserApp · dev · 进程管理", description = "dev 专属（目标容器 UserAppBuilder 开发容器，路径自带 dev）：dev server 进程启停/列表/日志")
     )
 )]
 struct ApiMetadata;
