@@ -1,7 +1,8 @@
 //! userApp 文件域转发层（rcoder 侧编排，实际处理在 per-app 开发容器内 file-server）。
 //!
-//! - [`forward`]：`/api/v1/userapp/{*rest}` 通配透传 + `/api/computer/*` 拦截层
-//!   （`X-Service-Type: userapp` 分流，反向代理转来的 TS 老路径原样透传）
+//! - [`forward`]：`/api/v1/userapp` 显式透传清单（见
+//!   [`CONTAINER_PASS_THROUGH_PATHS`]），并承接 `/api/computer/*` 拦截层
+//!   （`X-Service-Type: userapp` 分流时反向代理转来的 TS 老路径原样透传）
 //! - [`workspace`]：`POST /api/v1/userapp/workspace` 创建项目显式入口
 //! - [`db`]：`POST /api/v1/userapp/db/{env}/align-credentials` PG 凭据对齐
 //! - 本模块：路由聚合 + 开发容器 ensure-workspace 公共调用
@@ -15,8 +16,7 @@ pub(crate) mod workspace;
 
 use std::sync::Arc;
 
-use axum::routing::Router;
-use axum::routing::{any, post};
+use axum::routing::{Router, any, post};
 
 use crate::router::AppState;
 
@@ -26,10 +26,112 @@ use crate::router::AppState;
 pub(crate) use forward::computer_intercept;
 pub(crate) use forward::invalidate_probe_cache;
 
-/// userApp 域转发路由（挂 rcoder 主 Router；`/api/v1/userapp` 族不再来自 file-server
-/// 本地路由——路由合并时已排除）。
+/// 容器 file-server 对外接口的**显式透传清单**（全路径；handler 统一复用
+/// [`forward::forward_userapp`]，method/path/query/body 原样流式转发，容器侧
+/// 自答 405/404）。
+///
+/// 早先是单条 `{*rest}` catch-all 兜底：分派语义只在源码可见（OpenAPI 文档由
+/// 注解静态聚合、路由真值却靠兜底）、未声明路径误差传到容器错误形态漂移，
+/// 且与 app_manager 的 `{app_id}` 参数路由进入同一棵 matchit 树后结构性冲突
+/// （同段 param 与 catch-all 不共存）启动即 panic——故逐条显式枚举。其中 12 条
+/// TS 同名老路径族虽已从主文档剔除（分流代理内部面），仍可能有残留调用方经
+/// rcoder 访问，照常登记保持可达。
+///
+/// 单一事实源供路由生成本处消费；与容器侧/主文档的一致性由守卫测试锁定
+/// （`pass_through_paths_all_exist_in_container_doc` 防死链、
+/// `primary_userapp_paths_are_fully_handled_by_route_tables` 双向闭包）——
+/// 容器新增对外接口须同步登记此表，契约变更当场报红，不再依赖人肉对齐。
+pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
+    // 构建链（builder 编排：构建/任务流转/项目探测确认）
+    "/api/v1/userapp/build",
+    "/api/v1/userapp/tasks/{task_id}",
+    "/api/v1/userapp/tasks/{task_id}/logs",
+    "/api/v1/userapp/tasks/{task_id}/logs/stream",
+    "/api/v1/userapp/tasks/{task_id}/cancel",
+    "/api/v1/userapp/projects/detect",
+    "/api/v1/userapp/projects/confirm",
+    // 文件镜像（TS nuwax-file-server 同名老接口族）
+    "/api/v1/userapp/get-file-list",
+    "/api/v1/userapp/resolve-file",
+    "/api/v1/userapp/search-files",
+    "/api/v1/userapp/files-update",
+    "/api/v1/userapp/upload-file",
+    "/api/v1/userapp/upload-files",
+    "/api/v1/userapp/generate-file",
+    "/api/v1/userapp/import-project",
+    // 容器文件操作（新形态 app-files 族）
+    "/api/v1/userapp/app-files/upload",
+    "/api/v1/userapp/app-files/upload-from-url",
+    "/api/v1/userapp/app-files/list",
+    "/api/v1/userapp/app-files/delete",
+    // 开发工具链
+    "/api/v1/userapp/ensure-workspace",
+    "/api/v1/userapp/execute-command",
+    "/api/v1/userapp/get-logs",
+    "/api/v1/userapp/install-project",
+    "/api/v1/userapp/zip-workspace",
+    "/api/v1/userapp/download-all-files",
+    "/api/v1/userapp/init-project-template",
+    "/api/v1/userapp/push-skills-to-workspace",
+    // dev server 进程管理
+    "/api/v1/userapp/dev/start",
+    "/api/v1/userapp/dev/stop",
+    "/api/v1/userapp/dev/restart",
+    "/api/v1/userapp/dev/list",
+    "/api/v1/userapp/dev/logs",
+    // 静态资源（按 releaseId 取包；注解侧另挂 OPTIONS，any 已覆盖）
+    "/api/v1/userapp/static/{app_id}",
+];
+
+/// rcoder 本地实现的 userapp 路径快照等守卫夹具（仅供测试；随测试编译，
+/// 避免运行时 dead_code 告警）。
+#[cfg(test)]
+pub(crate) mod guard_tables {
+    /// rcoder 本地实现的 userapp 路径快照（`routes()` 显式入口部分；
+    /// 守卫闭包比对用——改动路由须同步）。
+    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 4] = [
+        "/api/v1/userapp/workspace",
+        "/api/v1/userapp/db/{env}/align-credentials",
+        "/api/v1/userapp/db/{env}/reset-password",
+        "/api/v1/userapp/db/{env}/create-database",
+    ];
+
+    /// app_manager 具体路由路径快照（crates/app_manager/src/routes.rs；同样供
+    /// 守卫闭包比对——该清单增删须同步）。
+    pub(crate) const APP_MANAGER_PATHS: [&str; 25] = [
+        "/api/v1/userapp/query",
+        "/api/v1/userapp/runtime",
+        "/api/v1/userapp/{app_id}",
+        "/api/v1/userapp/{app_id}/update",
+        "/api/v1/userapp/{app_id}/delete",
+        "/api/v1/userapp/{app_id}/start",
+        "/api/v1/userapp/{app_id}/stop",
+        "/api/v1/userapp/{app_id}/restart",
+        "/api/v1/userapp/{app_id}/recycle-policy",
+        "/api/v1/userapp/{app_id}/logs/sources/query",
+        "/api/v1/userapp/{app_id}/logs/query",
+        "/api/v1/userapp/{app_id}/logs/stream",
+        "/api/v1/userapp/{app_id}/health",
+        "/api/v1/userapp/{app_id}/stats",
+        "/api/v1/userapp/{app_id}/events",
+        "/api/v1/userapp/{app_id}/upload",
+        "/api/v1/userapp/{app_id}/upload-from-url",
+        "/api/v1/userapp/{app_id}/files",
+        "/api/v1/userapp/{app_id}/files/delete",
+        "/api/v1/userapp/{app_id}/storage",
+        "/api/v1/userapp/{app_id}/storage/clear",
+        "/api/v1/userapp/{app_id}/storage/destroy",
+        "/api/v1/userapp/storage/query",
+        "/api/v1/userapp/{app_id}/db/reset-password",
+        "/api/v1/userapp/{app_id}/db/create-database",
+    ];
+}
+
+/// userApp 域路由（挂 rcoder 主 Router）：本地实现入口 + 显式透传清单。
+///
+/// `/api/v1/userapp` 族不再来自 file-server 本地路由——聚合文档时已剔除。
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new()
+    let mut router = Router::new()
         .route(
             "/api/v1/userapp/workspace",
             post(workspace::create_workspace),
@@ -45,8 +147,11 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/v1/userapp/db/{env}/create-database",
             post(db::create_database),
-        )
-        .route("/api/v1/userapp/{*rest}", any(forward::forward_userapp))
+        );
+    for path in CONTAINER_PASS_THROUGH_PATHS {
+        router = router.route(path, any(forward::forward_userapp));
+    }
+    router
 }
 
 /// 容器内 file-server 幂等建 workspace 目录（execute-command 等接口的 cwd 前置；
@@ -114,6 +219,7 @@ pub(crate) async fn ensure_workspace_via_dev(
 #[cfg(test)]
 mod tests {
     use super::workspace::CreateWorkspaceBody;
+    use super::*;
 
     #[test]
     fn create_workspace_body_is_camel_case() {
@@ -121,5 +227,49 @@ mod tests {
         let body: CreateWorkspaceBody = serde_json::from_value(raw).expect("deserialize");
         assert_eq!(body.app_id, "app-1");
         assert_eq!(body.user_id, "u1");
+    }
+
+    #[test]
+    fn container_pass_through_paths_are_unique() {
+        let unique: std::collections::HashSet<_> = CONTAINER_PASS_THROUGH_PATHS.iter().collect();
+        assert_eq!(
+            unique.len(),
+            CONTAINER_PASS_THROUGH_PATHS.len(),
+            "duplicate pass-through path registered"
+        );
+    }
+
+    /// 启动 panic 回归锚：userapp 域全部 pattern 平铺注册必须成功。此前
+    /// `{*rest}` catch-all 与 `{app_id}` 参数段同树时 matchit 直接 panic，
+    /// 且该炸点只有起服务才暴露（单测不构建整棵 router）——以同等 pattern
+    /// 集合在此固化为快门；今后再往本域引入 catch-all 形态路径即红。
+    #[test]
+    fn merged_userapp_route_table_builds_without_matchit_conflict() {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        let mut table = Router::<()>::new();
+        for path in guard_tables::LOCAL_USERAPP_PATHS
+            .iter()
+            .chain(guard_tables::APP_MANAGER_PATHS.iter())
+            .chain(CONTAINER_PASS_THROUGH_PATHS.iter())
+        {
+            table = table.route(path, any(ok));
+        }
+        // 构建即完成 matchit 插入校验，结果无需保留
+        drop(table);
+    }
+
+    /// 防死链：每条透传路由必须仍存在于容器侧对外文档——容器已删除接口仍在
+    /// 此登记的话，请求会一路 404 到容器才暴露，链路不可见。
+    #[test]
+    fn pass_through_paths_all_exist_in_container_doc() {
+        let document = file_server_userapp::document();
+        for path in CONTAINER_PASS_THROUGH_PATHS {
+            assert!(
+                document.paths.paths.contains_key(*path),
+                "pass-through path missing in container doc: {path}"
+            );
+        }
     }
 }

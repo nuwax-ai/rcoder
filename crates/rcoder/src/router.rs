@@ -289,8 +289,10 @@ pub fn create_router(state: Arc<AppState>, telemetry: Option<Arc<TelemetryGuard>
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GiB（upload 压缩包，覆盖全局 50MB）
         .with_state(app_manager_state);
 
-    // userApp 文件域转发层: /api/v1/userapp/{*rest} 通配透传 + create-workspace 显式入口
-    // （build/tasks/static 等构建链接口均在 file-server 侧，经此转发直达 builder）
+    // userApp 文件域转发层: /api/v1/userapp 本地入口 + 容器侧接口显式透传清单
+    // （build/tasks/static 等构建链接口在 file-server 侧，逐条登记于
+    // CONTAINER_PASS_THROUGH_PATHS；原 {*rest} 通配与 {app_id} 参数路由同树时
+    // matchit 冲突启动即 panic，已移除）
     let userapp_forward_routes = crate::userapp_forward::routes().with_state(state.clone());
 
     // file-server 分流代理运行时启停 (无 state, 受全局 API key 中间件保护;

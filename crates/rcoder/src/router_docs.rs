@@ -609,6 +609,34 @@ mod openapi_tests {
         );
     }
 
+    /// 运行时承接面与文档面双向闭包：主文档可见的每个 userapp path 必须被
+    /// 三张登记表（本地实现 / app_manager / 容器透传）覆盖，透传清单每条必居
+    /// 「主文档可见」或「INTERNAL 内部剔除」两态——接口上下线忘同步登记表
+    /// 当场报红（此前透传靠 catch-all 兜底，此类漂移不可见）。
+    #[test]
+    fn primary_userapp_paths_are_fully_handled_by_route_tables() {
+        use crate::userapp_forward::CONTAINER_PASS_THROUGH_PATHS;
+        use crate::userapp_forward::guard_tables::{APP_MANAGER_PATHS, LOCAL_USERAPP_PATHS};
+        let document = primary_document();
+        for path in document.paths.paths.keys() {
+            if !path.starts_with("/api/v1/userapp/") {
+                continue;
+            }
+            assert!(
+                LOCAL_USERAPP_PATHS.contains(&path.as_str())
+                    || APP_MANAGER_PATHS.contains(&path.as_str())
+                    || CONTAINER_PASS_THROUGH_PATHS.contains(&path.as_str()),
+                "primary doc userapp path has no runtime route: {path}"
+            );
+        }
+        for path in CONTAINER_PASS_THROUGH_PATHS.iter().copied() {
+            assert!(
+                document.paths.paths.contains_key(path) || INTERNAL_USERAPP_PATHS.contains(&path),
+                "pass-through path neither in primary doc nor internal-stripped: {path}"
+            );
+        }
+    }
+
     /// 运行日志 SSE 契约锚点：事件清单必须出现在 description 里（同事按 swagger
     /// 直读对接，描述被精简回一句话在此报红——对齐 file-server-userapp 同款测试）。
     #[test]
