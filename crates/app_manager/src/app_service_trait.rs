@@ -59,16 +59,6 @@ pub trait AppServiceTrait: Send + Sync {
     /// 销毁应用持久存储 PVC（高危·不可逆·释放配额；需 confirm==app_id，仅 app 已 delete 后允许）
     async fn destroy_app_storage(&self, app_id: &str, confirm: &str) -> AppResult<()>;
 
-    /// 重置 app 容器内 PG 密码（exec psql ALTER USER，本地 trust 认证绕过当前密码）
-    async fn reset_db_password(
-        &self,
-        app_id: &str,
-        request: ResetDbPasswordRequest,
-    ) -> AppResult<()>;
-
-    /// 新建 PG 库（exec psql CREATE DATABASE）
-    async fn create_database(&self, app_id: &str, request: CreateDatabaseRequest) -> AppResult<()>;
-
     /// PG 凭据对齐（UserApp 运行容器内）：验证传入密码，不一致则重置
     /// （流程单头 `shared_types::align_pg_credentials`，exec 通道实现）
     async fn align_db_credentials(

@@ -93,13 +93,4 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             "/api/v1/userapp/storage/query",
             post(handlers::query_storage),
         )
-        // 数据库管理（app-runtime 镜像单容器自带 PG；rcoder exec psql 操作）
-        .route(
-            "/api/v1/userapp/{app_id}/db/reset-password",
-            post(handlers::reset_db_password),
-        )
-        .route(
-            "/api/v1/userapp/{app_id}/db/create-database",
-            post(handlers::create_database),
-        )
 }

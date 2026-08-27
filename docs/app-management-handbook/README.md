@@ -111,8 +111,8 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate 链路
            POST   /api/v1/userapp/{app_id}/storage/destroy      销毁 PVC（高危·不可逆）
            POST   /api/v1/userapp/storage/query                  分页查询存储
 
-数据库     POST   /api/v1/userapp/{app_id}/db/reset-password     重置 PG 密码
-           POST   /api/v1/userapp/{app_id}/db/create-database    新建 PG 库
+数据库     POST   /api/v1/userapp/db/{env}/reset-password        重置/创建 PG 账号密码（env=dev|prod）
+           POST   /api/v1/userapp/db/{env}/create-database       新建 PG 库（env=dev|prod）
 
 
 构建发布   POST   /api/v1/userapp/{app_id}/build                        触发源码构建（自动建 Builder）

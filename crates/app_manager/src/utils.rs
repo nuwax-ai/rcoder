@@ -100,34 +100,6 @@ pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 校验 PG 标识符（数据库名 / 用户名）：首字符字母或下划线，其余字母/数字/下划线，≤63 字符。
-/// 防 SQL 注入（标识符进双引号，但严格白名单更稳）。
-pub(super) fn validate_pg_identifier(name: &str) -> AppResult<()> {
-    if name.is_empty() || name.len() > 63 {
-        return Err(AppOperationError::Validation(
-            "PG identifier must be 1..=63 chars".to_string(),
-        ));
-    }
-    // 首字符：必须字母或下划线（is_empty 已由上方长度校验拦截，无需再处理 None）
-    if let Some(first) = name.chars().next()
-        && !(first.is_ascii_alphabetic() || first == '_')
-    {
-        return Err(AppOperationError::Validation(
-            "PG identifier must start with letter or '_'".to_string(),
-        ));
-    }
-    if !name
-        .chars()
-        .skip(1)
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Err(AppOperationError::Validation(
-            "PG identifier: only [a-zA-Z0-9_] allowed".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// 从 PortConfig 列表提取 HTTP 端口号（供 Pingora backend 注册，create/update 共用）
 pub(super) fn http_port_numbers(ports: &Option<Vec<PortConfig>>) -> Vec<u16> {
     ports
@@ -305,40 +277,6 @@ mod tests {
     fn validate_app_id_err_trailing_dash() {
         // 尾部 '-' 非法
         assert!(validate_app_id("app-trailing-").is_err());
-    }
-
-    // ---------------- validate_pg_identifier ----------------
-
-    #[test]
-    fn validate_pg_identifier_ok() {
-        assert!(validate_pg_identifier("mydb").is_ok());
-        assert!(validate_pg_identifier("_underscore").is_ok());
-        assert!(validate_pg_identifier("MixedCase123").is_ok());
-    }
-
-    #[test]
-    fn validate_pg_identifier_err_empty() {
-        assert!(validate_pg_identifier("").is_err());
-    }
-
-    #[test]
-    fn validate_pg_identifier_err_starts_with_digit() {
-        assert!(validate_pg_identifier("1num").is_err());
-    }
-
-    #[test]
-    fn validate_pg_identifier_err_dash() {
-        assert!(validate_pg_identifier("has-dash").is_err());
-    }
-
-    #[test]
-    fn validate_pg_identifier_err_space() {
-        assert!(validate_pg_identifier("has space").is_err());
-    }
-
-    #[test]
-    fn validate_pg_identifier_err_injection() {
-        assert!(validate_pg_identifier("a;b").is_err());
     }
 
     // ---------------- validate_upload_target ----------------

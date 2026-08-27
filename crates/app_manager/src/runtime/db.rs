@@ -1,7 +1,10 @@
 //! UserApp 容器内 PostgreSQL 管理（从 service.rs 拆出，extension-impl）。
 //!
-//! reset-password / create-database（exec psql）+ align_db_credentials（凭据对齐，
-//! 流程单头 `shared_types::align_pg_credentials`）+ exec_psql / database_exists / ensure_app_running。
+//! 职责：`align_db_credentials`（凭据对齐，流程单头
+//! `shared_types::align_pg_credentials`）与 exec 前置 `ensure_app_running`。
+//! 改密/建库 HTTP 面已按拍板下线，统一走 rcoder 转发层
+//! `/api/v1/userapp/db/{env}/*`——userapp_forward::db 的 env 双环境 +
+//! username upsert + dbx 同步为超集实现。
 
 use async_trait::async_trait;
 use tracing::info;
@@ -37,111 +40,6 @@ impl shared_types::PgCommandRunner for RuntimeExecRunner<'_> {
 }
 
 impl AppService {
-    /// 重置 app 容器内 PG 密码(rcoder exec 容器内 psql ALTER USER,本地 trust 认证绕过当前密码)。
-    /// 解决"用户忘记密码进不去 pgweb"的死锁(pgweb 要当前密码,rcoder 用容器内 trust 免密)。
-    pub async fn reset_db_password(
-        &self,
-        app_id: &str,
-        req: ResetDbPasswordRequest,
-    ) -> AppResult<()> {
-        validate_app_id(app_id)?;
-        if req.new_password.is_empty() {
-            return Err(AppOperationError::Validation(
-                "new_password must not be empty".to_string(),
-            ));
-        }
-        self.ensure_app_running(app_id).await?;
-        // 容器内 sh 展开 $POSTGRES_USER(镜像 ENV,create 时用户 env 覆盖);rcoder 无状态不知值。
-        // psql -U $POSTGRES_USER 本地 trust 认证(start-app.sh initdb --auth-local=trust)免密。
-        // 重置目标用 SQL 的 CURRENT_USER(= 连接用户), 消除 shell 双引号变量展开依赖。
-        let cmd = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            shared_types::pg_utils::pg_alter_current_user_password_cmd(&req.new_password),
-        ];
-        self.exec_psql(
-            app_id,
-            cmd,
-            &format!("[APP] reset_db_password failed app_id={app_id}"),
-        )
-        .await?;
-        // dbx 预置连接同步（best-effort）：重置目标即 local-pg 在用账号（超户），
-        // 恒同步；失败仅 warn——密码已生效，不阻断响应（与 userapp_forward 版同款）。
-        let runner = RuntimeExecRunner {
-            service: self,
-            app_id,
-        };
-        if let Err(e) =
-            shared_types::sync_dbx_after_password_change(&runner, None, &req.new_password).await
-        {
-            tracing::warn!(
-                "[APP] dbx connection sync failed (password already applied): app_id={app_id}: {e}"
-            );
-        }
-        info!("[APP] PG password reset: {}", app_id);
-        Ok(())
-    }
-
-    /// 新建 PG 库(rcoder exec 容器内 psql CREATE DATABASE)。API 化建库(Java/CI 自动化)。
-    pub async fn create_database(&self, app_id: &str, req: CreateDatabaseRequest) -> AppResult<()> {
-        validate_app_id(app_id)?;
-        validate_pg_identifier(&req.database)?;
-        if let Some(owner) = &req.owner {
-            validate_pg_identifier(owner)?;
-        }
-        self.ensure_app_running(app_id).await?;
-        // 先查是否已存在(check-then-act): PG 不支持 CREATE DATABASE IF NOT EXISTS、也不能进事务/DO 块。
-        // 故先 SELECT pg_database 判定, 避免 CREATE 失败后靠 stderr 文本(随 PG 版本/locale 变)判"已存在"。
-        if self.database_exists(app_id, &req.database).await? {
-            return Err(AppOperationError::AlreadyExists(format!(
-                "database {} already exists",
-                req.database
-            )));
-        }
-        // CREATE DATABASE "{db}"[ OWNER "{owner}"] —— 标识符引经 pg_utils 单头
-        // （validate 白名单本就拒绝 "，此处转义为纵深防御）
-        let safe_db = shared_types::pg_utils::pg_quote_ident(&req.database)
-            .trim_matches('"')
-            .to_string();
-        let owner_clause = req
-            .owner
-            .as_ref()
-            .map(|o| format!(" OWNER {}", shared_types::pg_utils::pg_quote_ident(o)))
-            .unwrap_or_default();
-        let cmd = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            format!(
-                r#"psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE "{safe_db}"{owner_clause}'"#,
-            ),
-        ];
-        let ctx = format!("[APP] create_database failed app_id={app_id}");
-        let r = self
-            .runtime
-            .exec(app_id, cmd)
-            .await
-            .map_err(|e| map_runtime_error(&ctx, e))?;
-        if r.exit_code != 0 {
-            // 罕见竞态: SELECT 时不存在、CREATE 时被并发创建 → 再查一次精确判定, 仍不靠 stderr 文本。
-            if self.database_exists(app_id, &req.database).await? {
-                return Err(AppOperationError::AlreadyExists(format!(
-                    "database {} already exists",
-                    req.database
-                )));
-            }
-            return Err(AppOperationError::Backend(format!(
-                "{ctx}: exit {}: {}",
-                r.exit_code,
-                r.stderr.trim()
-            )));
-        }
-        info!(
-            "[APP] database created: {} (app_id={})",
-            req.database, app_id
-        );
-        Ok(())
-    }
-
     /// PG 凭据对齐（UserApp 运行容器内，prod 环境）：验证传入密码与账号当前密码
     /// 是否一致（TCP scram），不一致则本地 trust ALTER USER 重置并复验。
     /// 流程单头 [`shared_types::align_pg_credentials`]；密码不落日志。
@@ -181,53 +79,6 @@ impl AppService {
         Ok(outcome)
     }
 
-    /// exec 容器内 psql 命令，exit_code != 0 → Backend 错误（含 stderr 摘要）。
-    ///
-    /// reset_db_password 共用。create_database 因需区分"库已存在"(AlreadyExists) 不复用此函数。
-    async fn exec_psql(&self, app_id: &str, command: Vec<String>, ctx: &str) -> AppResult<()> {
-        let r = self
-            .runtime
-            .exec(app_id, command)
-            .await
-            .map_err(|e| map_runtime_error(ctx, e))?;
-        if r.exit_code != 0 {
-            return Err(AppOperationError::Backend(format!(
-                "{ctx}: exit {}: {}",
-                r.exit_code,
-                r.stderr.trim()
-            )));
-        }
-        Ok(())
-    }
-
-    /// 查询 app 容器 PG 里某库是否已存在（psql `-tAc SELECT pg_database`）。
-    /// `-tAc` 取无表头纯输出: 命中输出 `1`、未命中输出空 → 比 CREATE 失败后解析 stderr 稳定。
-    /// `db` 已过 `validate_pg_identifier` 白名单(`[a-zA-Z0-9_]`), 安全内联到字符串字面量。
-    /// create_database 用此做 check-then-act(替代旧版靠 stderr 文本判"已存在")。
-    async fn database_exists(&self, app_id: &str, db: &str) -> AppResult<bool> {
-        let cmd = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            format!(
-                r#"psql -U "$POSTGRES_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='{db}'""#,
-            ),
-        ];
-        let ctx = format!("[APP] check database exists failed app_id={app_id}");
-        let r = self
-            .runtime
-            .exec(app_id, cmd)
-            .await
-            .map_err(|e| map_runtime_error(&ctx, e))?;
-        if r.exit_code != 0 {
-            return Err(AppOperationError::Backend(format!(
-                "{ctx}: exit {}: {}",
-                r.exit_code,
-                r.stderr.trim()
-            )));
-        }
-        Ok(r.stdout.trim() == "1")
-    }
-
     /// 确保 app 处于运行状态（exec 类容器内操作的前置）。
     ///
     /// Stopped/ScaledDown 时**自动唤醒**（activity registry 的 single-flight
@@ -237,7 +88,7 @@ impl AppService {
     /// `get_app` 兜 404（ensure_running 对不存在的 app 恒 AlreadyRunning 幻报，
     /// stopped 集合未命中不 scale）。
     ///
-    /// reset_db_password / create_database / align_db_credentials 共用。
+    /// 仅 `align_db_credentials` 消费（改密/建库 HTTP 面已统一走转发层，见模块注释）。
     /// validate_app_id 由调用方先做（Fail Fast：参数校验在 runtime 调用前）。
     async fn ensure_app_running(&self, app_id: &str) -> AppResult<()> {
         use shared_types::AppWakeControl;
@@ -386,118 +237,5 @@ mod tests {
         assert!(!is_shell_safe_path_component(""));
         assert!(!is_shell_safe_path_component("."));
         assert!(!is_shell_safe_path_component(".."));
-    }
-
-    use crate::models::ResetDbPasswordRequest;
-    use crate::test_support::{MockRuntime, test_service};
-    use std::sync::Arc;
-
-    /// 预置 Running 并经平台 stop 路径停掉（scale0 + registry mark_stopped——
-    /// ensure_running 只感知"平台标记的 stopped"，外部直接改 deployment phase
-    /// 它不认）。
-    async fn stopped_via_platform(service: &AppService, runtime: &MockRuntime, app_id: &str) {
-        runtime.deployments.insert(
-            app_id.to_string(),
-            container_runtime_api::DeploymentStatus {
-                app_id: app_id.to_string(),
-                replicas: 1,
-                ready_replicas: 1,
-                phase: "Running".to_string(),
-                ..Default::default()
-            },
-        );
-        service.stop_app(app_id).await.expect("platform stop");
-        assert_eq!(runtime.deployments.get(app_id).unwrap().phase, "Stopped");
-    }
-
-    #[tokio::test]
-    async fn reset_db_password_wakes_stopped_app_and_syncs_dbx() {
-        let runtime = Arc::new(MockRuntime::default());
-        let service = test_service(
-            std::path::Path::new("/tmp/app-manager-test-ws"),
-            runtime.clone(),
-        );
-        service.activity.set_runtime(runtime.clone());
-        stopped_via_platform(&service, &runtime, "app-w1").await;
-
-        service
-            .reset_db_password(
-                "app-w1",
-                ResetDbPasswordRequest {
-                    new_password: "pw-new".to_string(),
-                },
-            )
-            .await
-            .expect("stopped app 应被自动唤醒后改密成功");
-
-        // 唤醒生效：scale(1) 后 phase=Running
-        assert_eq!(runtime.deployments.get("app-w1").unwrap().phase, "Running");
-
-        // exec 序列：PG 就绪等待（唤醒后启动窗口）→ ALTER USER（trust 改密）
-        // → dbx 同步（重写 connections.json + supervisorctl restart dbx）
-        let calls = runtime.exec_calls.get("app-w1").unwrap().clone();
-        assert!(calls.len() >= 3, "expect wait + alter + dbx sync, got: {calls:?}");
-        assert!(calls[0].contains("pg_isready"), "got: {:?}", calls[0]);
-        assert!(
-            calls[1].contains("ALTER USER CURRENT_USER"),
-            "got: {:?}",
-            calls[1]
-        );
-        assert!(
-            calls[2].contains("connections.json") && calls[2].contains("supervisorctl"),
-            "dbx 同步命令应紧随改密, got: {:?}",
-            calls[2]
-        );
-        // 密码不落 exec 记录之外的日志不可断言,但命令本身含密码属预期(容器内执行)
-    }
-
-    #[tokio::test]
-    async fn reset_db_password_wake_failed_reports_invalid_state() {
-        let runtime = Arc::new(MockRuntime::default());
-        let service = test_service(
-            std::path::Path::new("/tmp/app-manager-test-ws"),
-            runtime.clone(),
-        );
-        service.activity.set_runtime(runtime.clone());
-        stopped_via_platform(&service, &runtime, "app-w2").await;
-        runtime
-            .crash_on_start
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        let err = service
-            .reset_db_password(
-                "app-w2",
-                ResetDbPasswordRequest {
-                    new_password: "pw".to_string(),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, AppOperationError::InvalidState(ref m) if m.contains("wake failed")),
-            "唤醒失败(启动即 Error)应报 InvalidState, got: {err}"
-        );
-        // 改密与 dbx 同步均未执行
-        assert!(runtime.exec_calls.get("app-w2").is_none());
-    }
-
-    #[tokio::test]
-    async fn reset_db_password_missing_app_reports_not_found() {
-        let runtime = Arc::new(MockRuntime::default());
-        let service = test_service(std::path::Path::new("/tmp/app-manager-test-ws"), runtime);
-        // 不预置 deployment：ensure_running 幻报 AlreadyRunning 后由 get_app 兜 404
-        let err = service
-            .reset_db_password(
-                "app-missing",
-                ResetDbPasswordRequest {
-                    new_password: "pw".to_string(),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, AppOperationError::NotFound(_)),
-            "不存在的 app 应 404 语义, got: {err}"
-        );
     }
 }

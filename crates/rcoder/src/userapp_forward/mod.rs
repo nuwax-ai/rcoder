@@ -97,8 +97,9 @@ pub(crate) mod guard_tables {
     ];
 
     /// app_manager 具体路由路径快照（crates/app_manager/src/routes.rs；同样供
-    /// 守卫闭包比对——该清单增删须同步）。
-    pub(crate) const APP_MANAGER_PATHS: [&str; 25] = [
+    /// 守卫闭包比对——该清单增删须同步。原 `{app_id}/db/*` 两路已下线，数据库
+    /// 管理统一走转发层 `/api/v1/userapp/db/{env}/*`）。
+    pub(crate) const APP_MANAGER_PATHS: [&str; 23] = [
         "/api/v1/userapp/query",
         "/api/v1/userapp/runtime",
         "/api/v1/userapp/{app_id}",
@@ -122,8 +123,6 @@ pub(crate) mod guard_tables {
         "/api/v1/userapp/{app_id}/storage/clear",
         "/api/v1/userapp/{app_id}/storage/destroy",
         "/api/v1/userapp/storage/query",
-        "/api/v1/userapp/{app_id}/db/reset-password",
-        "/api/v1/userapp/{app_id}/db/create-database",
     ];
 }
 

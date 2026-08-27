@@ -7,9 +7,11 @@
 //! - [`query`]：health / stats / events
 //! - [`files`]：upload / list / delete
 //! - [`storage`]：get / clear / destroy / query（v2 §5.4）
-//! - [`db`]：reset-password / create-database
+//!
+//! 数据库管理原属 [`db`] 子模块（`{app_id}/db/*`），已按拍板下线——统一走
+//! rcoder 转发层的 `/api/v1/userapp/db/{env}/*`（env 双环境 + username upsert
+//! + dbx 同步的超集实现，见 rcoder userapp_forward::db）。
 
-pub mod db;
 pub mod files;
 pub mod lifecycle;
 pub mod logs;
@@ -18,7 +20,6 @@ pub mod query;
 pub mod state;
 pub mod storage;
 
-pub use db::*;
 pub use files::*;
 pub use lifecycle::*;
 pub use logs::*;

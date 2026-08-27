@@ -97,8 +97,6 @@ use crate::handler;
         app_manager::handlers::clear_app_storage,
         app_manager::handlers::destroy_app_storage,
         app_manager::handlers::query_storage,
-        app_manager::handlers::reset_db_password,
-        app_manager::handlers::create_database,
         app_manager::handlers::stream_app_logs_v1,
         app_manager::handlers::upload_from_url,
         crate::userapp_forward::db::align_credentials,
@@ -573,11 +571,11 @@ mod openapi_tests {
                 }
             }
         }
-        // 口径：生命周期12 + 日志3 + 文件存储8 + 数据库5 + 终端代理12 +
+        // 口径：生命周期12 + 日志3 + 文件存储8 + 数据库3 + 终端代理12 +
         // 开发构建 20（userapp crate 33 条中 13 条内部路径已按 INTERNAL_USERAPP_PATHS 剔除）
         assert!(
-            userapp_ops >= 60,
-            "UserApp 系 operation 计数下限（60）未达: {userapp_ops}"
+            userapp_ops >= 58,
+            "UserApp 系 operation 计数下限（58）未达: {userapp_ops}"
         );
 
         let tag_of = |path: &str, method: &str| sole_tag("primary", &document, path, method);
@@ -594,7 +592,7 @@ mod openapi_tests {
             "UserApp · 文件与存储"
         );
         assert_eq!(
-            tag_of("/api/v1/userapp/{app_id}/db/reset-password", "post"),
+            tag_of("/api/v1/userapp/db/{env}/reset-password", "post"),
             "UserApp · 数据库"
         );
         assert_eq!(

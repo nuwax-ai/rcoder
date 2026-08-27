@@ -219,18 +219,6 @@ impl super::AppServiceTrait for AppService {
         self.destroy_app_storage(app_id, confirm).await
     }
 
-    async fn reset_db_password(
-        &self,
-        app_id: &str,
-        request: ResetDbPasswordRequest,
-    ) -> AppResult<()> {
-        self.reset_db_password(app_id, request).await
-    }
-
-    async fn create_database(&self, app_id: &str, request: CreateDatabaseRequest) -> AppResult<()> {
-        self.create_database(app_id, request).await
-    }
-
     async fn align_db_credentials(
         &self,
         app_id: &str,
