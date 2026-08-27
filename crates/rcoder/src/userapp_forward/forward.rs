@@ -305,13 +305,9 @@ fn require_query_app_id(query: Option<&str>) -> Result<String, HttpResultError> 
 
 /// static/{app_id} 的 query `user_id` 必填（🟢 ensure 显式档：懒创建容器
 /// 宿主树分区直取，不依赖 metadata 注册）。非 static 路径返回 None（不要求）。
-fn require_static_user_id(
-    path: &str,
-    query: Option<&str>,
-) -> Result<Option<String>, HttpResultError> {
-    if !path.starts_with("/api/v1/userapp/static/") {
-        return Ok(None);
-    }
+/// static/{app_id} 的 query `user_id` 必填（🟢 ensure 显式档：懒创建容器
+/// 宿主树分区直取，不依赖 metadata 注册）。调用方已按 static 前缀分派。
+fn require_static_user_id(query: Option<&str>) -> Result<String, HttpResultError> {
     let raw = query_param(query, "user_id")
         .map(str::trim)
         .filter(|s| !s.is_empty());
@@ -321,7 +317,7 @@ fn require_static_user_id(
         ));
     };
     shared_types::validate_identifier(raw, "user_id")
-        .map(|_| Some(raw.to_string()))
+        .map(|_| raw.to_string())
         .map_err(HttpResultError::bad_request)
 }
 
@@ -554,6 +550,25 @@ pub(crate) async fn forward_userapp(
         return forward_to_dev(&state, &app_id, req, None).await;
     }
 
+    // static/{app_id}：构建链 dev-only（制品 zip 在 dev workspace，prod 容器必
+    // 404——忽略 X-App-Stage，与 tasks 族同语义），query user_id 必填（🟢 ensure
+    // 显式档）。校验先于 header 定位：必填契约不因 stage 取值被绕过。
+    if path.starts_with("/api/v1/userapp/static/") {
+        let user_id = match require_static_user_id(query.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+        let Some(app_id) = require_app_id(&req) else {
+            return missing_app_id_response();
+        };
+        info!(
+            "[USERAPP_FORWARD] {} {} -> dev container (static, app_id={app_id})",
+            req.method(),
+            req.uri().path()
+        );
+        return forward_to_dev(&state, &app_id, req, Some(&user_id)).await;
+    }
+
     let Some(app_id) = require_app_id(&req) else {
         return missing_app_id_response();
     };
@@ -588,16 +603,13 @@ pub(crate) async fn forward_userapp(
                     DevAbsentAction::Ensure => unreachable!("Ensure 已被 short_circuit 条件排除"),
                 };
             }
-            let explicit_user = match require_static_user_id(&path, query.as_deref()) {
-                Ok(v) => v,
-                Err(e) => return e.into_response(),
-            };
             info!(
                 "[USERAPP_FORWARD] {} {} -> dev container (app_id={app_id})",
                 req.method(),
                 req.uri().path()
             );
-            forward_to_dev(&state, &app_id, req, explicit_user.as_deref()).await
+            // 透传族 body 内 user_id 流式不解析——显式档仅 static（已前移）传值
+            forward_to_dev(&state, &app_id, req, None).await
         }
         UserappStage::Prod => {
             info!(
@@ -970,27 +982,16 @@ mod tests {
     }
 
     #[test]
-    fn static_user_id_required_only_on_static_paths() {
-        // 非 static 路径不要求（None）
+    fn static_user_id_required_and_validated() {
+        // 必填（缺失 / 只有其他参数 → 400）
+        assert!(require_static_user_id(None).is_err());
+        assert!(require_static_user_id(Some("release_id=r1")).is_err());
         assert_eq!(
-            require_static_user_id("/api/v1/userapp/build", None).unwrap(),
-            None
-        );
-        // static 路径必填
-        assert!(require_static_user_id("/api/v1/userapp/static/app-1", None).is_err());
-        assert_eq!(
-            require_static_user_id(
-                "/api/v1/userapp/static/app-1",
-                Some("release_id=r1&user_id=u1")
-            )
-            .unwrap(),
-            Some("u1".to_string())
+            require_static_user_id(Some("release_id=r1&user_id=u1")).unwrap(),
+            "u1"
         );
         // 白名单校验（含 / 即拒）
-        assert!(
-            require_static_user_id("/api/v1/userapp/static/app-1", Some("user_id=../evil"))
-                .is_err()
-        );
+        assert!(require_static_user_id(Some("user_id=../evil")).is_err());
     }
 
     /// 短路信封形状：cancel 幂等终态（与容器侧 CancelData 同构）。

@@ -72,9 +72,7 @@ pub async fn query_app_log_sources(
     Query(params): Query<LogsAccessParams>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage).ok_or_else(|| {
-        AppError::validation_error("path segment `app_stage` must be `dev` or `prod`")
-    })?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     shared_types::validate_identifier(&params.user_id, "user_id")
         .map_err(|e| AppError::validation_error(&e))?;
     let base = state
@@ -117,9 +115,7 @@ pub async fn query_app_logs(
     Query(params): Query<LogsAccessParams>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage).ok_or_else(|| {
-        AppError::validation_error("path segment `app_stage` must be `dev` or `prod`")
-    })?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     shared_types::validate_identifier(&params.user_id, "user_id")
         .map_err(|e| AppError::validation_error(&e))?;
     let base = state
@@ -162,9 +158,7 @@ pub async fn stream_app_logs_v1(
     Query(params): Query<LogsAccessParams>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage).ok_or_else(|| {
-        AppError::validation_error("path segment `app_stage` must be `dev` or `prod`")
-    })?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     shared_types::validate_identifier(&params.user_id, "user_id")
         .map_err(|e| AppError::validation_error(&e))?;
     let base = state

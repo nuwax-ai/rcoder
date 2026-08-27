@@ -20,6 +20,18 @@ pub mod query;
 pub mod state;
 pub mod storage;
 
+/// 路径段 `{app_stage}` 解析（非法统一 400 + 全站一致文案）。
+///
+/// handlers 十三处同款三行模式收敛：UserappStage::parse + ok_or_else(bad_request
+/// (invalid_app_stage_error))。
+pub(super) fn parse_app_stage_param(
+    raw: &str,
+) -> Result<shared_types::UserappStage, shared_types::AppError> {
+    shared_types::UserappStage::parse(raw).ok_or_else(|| {
+        shared_types::AppError::bad_request(&shared_types::invalid_app_stage_error(raw))
+    })
+}
+
 pub use files::*;
 pub use lifecycle::*;
 pub use logs::*;

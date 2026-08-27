@@ -101,7 +101,7 @@ pub(crate) async fn align_credentials(
     Json(body): Json<shared_types::AlignCredentialsRequest>,
 ) -> Result<HttpResult<shared_types::AlignCredentialsOutcome>, AppError> {
     let app_stage = UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request("path segment `app_stage` must be `dev` or `prod`"))?;
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
     shared_types::validate_identifier(&body.user_id, "user_id")
@@ -125,8 +125,7 @@ pub(crate) async fn align_credentials(
                         )
                     })?;
             let addr = dev_file_server_addr(&state, &info);
-            let user_id = body.user_id.clone();
-            super::ensure_workspace_via_dev(&addr, &body.app_id, &user_id)
+            super::ensure_workspace_via_dev(&addr, &body.app_id, &body.user_id)
                 .await
                 .map_err(|e| {
                     AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e)
@@ -134,7 +133,7 @@ pub(crate) async fn align_credentials(
             let runner = DevHttpRunner {
                 addr: &addr,
                 app_id: &body.app_id,
-                user_id: &user_id,
+                user_id: &body.user_id,
             };
             shared_types::align_pg_credentials(&runner, &body.username, &body.password)
                 .await
@@ -352,7 +351,7 @@ pub(crate) async fn reset_password(
     Json(body): Json<shared_types::UserappDbResetPasswordRequest>,
 ) -> Result<HttpResult<String>, AppError> {
     let app_stage = UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request("path segment `app_stage` must be `dev` or `prod`"))?;
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
     shared_types::validate_identifier(&body.user_id, "user_id")
@@ -446,7 +445,7 @@ pub(crate) async fn create_database(
     Json(body): Json<shared_types::UserappDbCreateDatabaseRequest>,
 ) -> Result<HttpResult<String>, AppError> {
     let app_stage = UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request("path segment `app_stage` must be `dev` or `prod`"))?;
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
     shared_types::validate_identifier(&body.user_id, "user_id")

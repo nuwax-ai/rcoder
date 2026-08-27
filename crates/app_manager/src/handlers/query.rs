@@ -43,9 +43,7 @@ pub async fn get_app_health(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
 ) -> Result<Json<HttpResult<HealthInfo>>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage).ok_or_else(|| {
-        AppError::validation_error("path segment `app_stage` must be `dev` or `prod`")
-    })?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     info!(
         "[APP] getting app health: {} app_stage={}",
         app_id,
@@ -92,9 +90,7 @@ pub async fn get_app_stats(
     Path((app_id, app_stage)): Path<(String, String)>,
     Query(params): Query<StatsParams>,
 ) -> Result<Json<HttpResult<ResourceStats>>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage).ok_or_else(|| {
-        AppError::validation_error("path segment `app_stage` must be `dev` or `prod`")
-    })?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     // 标识符白名单校验（user_id 进宿主机卷路径分区与审计留痕，含 `/` 即逃逸）
     shared_types::validate_identifier(&params.user_id, "user_id")
         .map_err(|e| AppError::validation_error(&e))?;

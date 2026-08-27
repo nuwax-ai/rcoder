@@ -44,8 +44,7 @@ pub async fn upload_file(
     Path((app_id, app_stage)): Path<(String, String)>,
     mut multipart: Multipart,
 ) -> Result<Json<HttpResult<UploadResult>>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     info!(
         "[APP] uploading file: {} (app_stage={})",
         app_id,
@@ -152,8 +151,7 @@ pub async fn upload_from_url(
     Path((app_id, app_stage)): Path<(String, String)>,
     Json(req): Json<UploadFromUrlRequest>,
 ) -> Result<Json<HttpResult<UploadResult>>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     info!(
         "[APP] upload from url: {} (app_stage={}, url={})",
         app_id,
@@ -208,8 +206,7 @@ pub async fn list_files(
     Path((app_id, app_stage)): Path<(String, String)>,
     Query(q): Query<ListFilesQuery>,
 ) -> Result<Json<HttpResult<Vec<FileInfo>>>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     shared_types::validate_identifier(&q.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
     info!(
@@ -261,8 +258,7 @@ pub async fn delete_file(
     Path((app_id, app_stage)): Path<(String, String)>,
     Json(request): Json<DeleteFileRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     shared_types::validate_identifier(&request.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
     info!(

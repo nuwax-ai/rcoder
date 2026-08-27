@@ -280,17 +280,9 @@ impl AppService {
             let runtime = self.get_app(app_id).await?;
             return Ok(runtime.health);
         }
-        // health 不在接口面收 user_id（⚪/dev🟢 不补参）——dev 懒创建走 metadata
-        // owner 链（None = 无显式入参，由 ensure 侧取值链降级 metadata；空白
-        // 值在此过滤，不以空串哨兵下传）
-        let explicit_user = self
-            .metadata
-            .lookup(app_id)
-            .and_then(|r| r.user_id)
-            .filter(|uid| !uid.trim().is_empty());
-        let base = self
-            .app_files_base(app_stage, app_id, explicit_user.as_deref())
-            .await?;
+        // health 不在接口面收 user_id（⚪/dev🟢 不补参）——传 None 走 metadata
+        // owner 链（ensure 侧取值链自降级，无需此处预查）
+        let base = self.app_files_base(app_stage, app_id, None).await?;
         let ok = reqwest::Client::new()
             .get(format!("{base}/health"))
             .timeout(std::time::Duration::from_secs(5))

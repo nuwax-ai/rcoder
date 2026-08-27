@@ -45,8 +45,7 @@ pub async fn get_app_storage(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
 ) -> Result<Json<HttpResult<StorageInfo>>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     info!(
         "[APP] getting app storage: {} (app_stage={})",
         app_id,
@@ -86,8 +85,7 @@ pub async fn clear_app_storage(
     Path((app_id, app_stage)): Path<(String, String)>,
     Json(req): Json<ClearStorageRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     shared_types::validate_identifier(&req.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
     info!(
@@ -130,8 +128,7 @@ pub async fn destroy_app_storage(
     Path((app_id, app_stage)): Path<(String, String)>,
     Json(req): Json<DestroyStorageRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     shared_types::validate_identifier(&req.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
     info!(
@@ -177,8 +174,7 @@ pub async fn query_storage(
     Path(app_stage): Path<String>,
     Json(request): Json<QueryStorageRequest>,
 ) -> Result<Json<HttpResult<PaginatedResponse<StorageInfo>>>, AppError> {
-    let app_stage = shared_types::UserappStage::parse(&app_stage)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    let app_stage = super::parse_app_stage_param(&app_stage)?;
     info!(
         "[APP] querying storage list (app_stage={}): page={} page_size={}",
         app_stage.as_str(),
