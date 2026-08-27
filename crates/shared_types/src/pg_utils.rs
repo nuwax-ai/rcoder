@@ -183,15 +183,15 @@ pub fn pg_json_escape(value: &str) -> String {
     out
 }
 
-/// local-pg 预置连接的 json 头段（`{` 到 `database` 值开引号为止）——
+/// local-pg 预置连接的 json 头段（数组开括号 `[` 到 `database` 值开引号为止）——
 /// `username`/`password` 已转义嵌入，database 值留给 `"$POSTGRES_DB"` 展开。
 fn dbx_local_pg_head(username_json: &str, password_json: &str) -> String {
     format!(
-        r#"{{"id":"local-pg","name":"Local PostgreSQL","db_type":"postgres","host":"127.0.0.1","port":5432,"username":"{username_json}","password":"{password_json}","database":""#
+        r#"[{{"id":"local-pg","name":"Local PostgreSQL","db_type":"postgres","host":"127.0.0.1","port":5432,"username":"{username_json}","password":"{password_json}","database":""#
     )
 }
 
-const DBX_JSON_TAIL: &str = "}]";
+const DBX_JSON_TAIL: &str = "\"}]";
 const DBX_SUPERVISORCTL_RESTART: &str =
     "supervisorctl -c /etc/supervisor/supervisord.conf restart dbx";
 
@@ -214,8 +214,8 @@ pub fn dbx_sync_cmd_for_user(username: &str, password: &str) -> String {
 /// dbx 预置连接同步命令（superuser 版，无条件）：重置目标就是 `$POSTGRES_USER`
 /// （CURRENT_USER 语义），恒同步；username 经 `"$POSTGRES_USER"` 展开。
 pub fn dbx_sync_cmd_superuser(password: &str) -> String {
-    let head = r#"{"id":"local-pg","name":"Local PostgreSQL","db_type":"postgres","host":"127.0.0.1","port":5432,"username":""#;
-    let mid = format!(r#","password":"{}","database":""#, pg_json_escape(password));
+    let head = dbx_superuser_head();
+    let mid = dbx_superuser_mid(password);
     format!(
         "printf '%s%s%s%s%s' {} \"$POSTGRES_USER\" {} \"$POSTGRES_DB\" '{}' > \"$DBX_DATA_DIR/connections.json\" && {DBX_SUPERVISORCTL_RESTART}",
         pg_shell_quote(head),
@@ -224,9 +224,31 @@ pub fn dbx_sync_cmd_superuser(password: &str) -> String {
     )
 }
 
+/// superuser 版 json 头段（到 `username` 值开引号为止，username 留给
+/// `"$POSTGRES_USER"` 展开）。
+fn dbx_superuser_head() -> &'static str {
+    r#"[{"id":"local-pg","name":"Local PostgreSQL","db_type":"postgres","host":"127.0.0.1","port":5432,"username":""#
+}
+
+/// superuser 版 json 中段（**闭 username 引号起**，password 转义嵌入，到
+/// `database` 值开引号为止，database 留给 `"$POSTGRES_DB"` 展开）。
+fn dbx_superuser_mid(password: &str) -> String {
+    format!(r#"","password":"{}","database":""#, pg_json_escape(password))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 重组 printf 段为完整 json 并验证可解析（database 展开位以 D 占位）——
+    /// 历史 bug：DBX_JSON_TAIL 丢 database 闭引号，dbx 侧解析失败空导入。
+    fn assert_dbx_json_parses(head: &str) {
+        let reassembled = format!(r#"{head}D{}"#, "\"}]");
+        let v: serde_json::Value = serde_json::from_str(&reassembled)
+            .unwrap_or_else(|e| panic!("拼装 json 不可解析: {e}\n{reassembled}"));
+        assert_eq!(v[0]["id"], "local-pg");
+        assert_eq!(v[0]["database"], "D");
+    }
 
     #[test]
     fn validate_ok() {
@@ -405,6 +427,7 @@ mod tests {
         // 密码在 json 头段内且整体经 shell 单引号包裹（元字符失活）
         let head = dbx_local_pg_head("app", "s3cret");
         assert!(cmd.contains(&pg_shell_quote(&head)), "got: {cmd}");
+        assert_dbx_json_parses(&head);
         // database 经 $POSTGRES_DB 展开（printf 多段拼接）
         assert!(cmd.contains("\"$POSTGRES_DB\""));
     }
@@ -418,6 +441,7 @@ mod tests {
         let cmd = dbx_sync_cmd_for_user("app", &password);
         let head = dbx_local_pg_head("app", &pg_json_escape(&password));
         assert!(cmd.contains(&pg_shell_quote(&head)), "got: {cmd}");
+        assert_dbx_json_parses(&head);
     }
 
     #[test]
@@ -426,7 +450,17 @@ mod tests {
         assert!(cmd.starts_with("printf '%s%s%s%s%s'"), "got: {cmd}");
         assert!(cmd.contains("\"$POSTGRES_USER\""));
         assert!(cmd.contains("\"$POSTGRES_DB\""));
-        assert!(cmd.contains(&pg_shell_quote(r#","password":"pw1","database":""#)));
+        // mid 段从生产构造函数取（防测试/生产字面量脱节——历史 bug：mid 丢
+        // username 闭引号，测试手写字面量恰好"正确"没锁住）
+        let mid = dbx_superuser_mid("pw1");
+        assert!(cmd.contains(&pg_shell_quote(&mid)));
+        // head+U+mid+D+tail 重组完整 json 并解析（生产各段同源拼装）
+        let full = format!("{}U{}D{}", dbx_superuser_head(), mid, DBX_JSON_TAIL);
+        let v: serde_json::Value = serde_json::from_str(&full)
+            .unwrap_or_else(|e| panic!("superuser 拼装 json 不可解析: {e}\n{full}"));
+        assert_eq!(v[0]["username"], "U");
+        assert_eq!(v[0]["password"], "pw1");
+        assert_eq!(v[0]["database"], "D");
         // superuser 版无条件（重置目标就是 $POSTGRES_USER）
         assert!(!cmd.contains("if ["));
     }
