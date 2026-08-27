@@ -87,6 +87,16 @@ fn dbx_superuser_mid(password: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 重组 printf 段为完整 json 并验证可解析（database 展开位以 D 占位）——
+    /// 历史 bug：DBX_JSON_TAIL 丢 database 闭引号，dbx 侧解析失败空导入。
+    fn assert_dbx_json_parses(head: &str) {
+        let reassembled = format!(r#"{head}D{}"#, "\"}]");
+        let v: serde_json::Value = serde_json::from_str(&reassembled)
+            .unwrap_or_else(|e| panic!("拼装 json 不可解析: {e}\n{reassembled}"));
+        assert_eq!(v[0]["id"], "local-pg");
+        assert_eq!(v[0]["database"], "D");
+    }
+
     #[test]
     fn json_escape_minimal_set() {
         assert_eq!(pg_json_escape("plain"), "plain");
@@ -149,14 +159,5 @@ mod tests {
         assert_eq!(v[0]["database"], "D");
         // superuser 版无条件（重置目标就是 $POSTGRES_USER）
         assert!(!cmd.contains("if ["));
-    }
-    /// 重组 printf 段为完整 json 并验证可解析（database 展开位以 D 占位）——
-    /// 历史 bug：DBX_JSON_TAIL 丢 database 闭引号，dbx 侧解析失败空导入。
-    fn assert_dbx_json_parses(head: &str) {
-        let reassembled = format!(r#"{head}D{}"#, "\"}]");
-        let v: serde_json::Value = serde_json::from_str(&reassembled)
-            .unwrap_or_else(|e| panic!("拼装 json 不可解析: {e}\n{reassembled}"));
-        assert_eq!(v[0]["id"], "local-pg");
-        assert_eq!(v[0]["database"], "D");
     }
 }

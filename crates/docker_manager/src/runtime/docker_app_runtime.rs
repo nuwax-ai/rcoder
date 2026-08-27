@@ -124,13 +124,8 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         }
 
         // 挂载组装（prod 四目录压平，与 dev builder 同构）在 docker_app_mounts.rs——
-        // 锚点反解 fail fast + 预创建 + 四 bind。
-        let mounts_vec = build_prod_flat_mounts(&app_id, params.user_id.as_deref()).await?;
-        let mounts = if mounts_vec.is_empty() {
-            None
-        } else {
-            Some(mounts_vec)
-        };
+        // 锚点反解 fail fast + 预创建 + 四 bind（恒四个，非空）。
+        let mounts = Some(build_prod_flat_mounts(&app_id, params.user_id.as_deref()).await?);
 
         // 加入主网络（与 rcoder 同网络，Pingora 才能通过 container_ip 访问）
         // 同时保留网络名，供 start 后按网卡定位 container_ip（多网卡时避免 values().next() 取错）

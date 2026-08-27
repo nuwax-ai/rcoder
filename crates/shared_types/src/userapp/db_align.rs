@@ -32,8 +32,10 @@ pub struct AlignCredentialsOutcome {
     pub aligned: bool,
     /// 是否执行了重置（false=传入密码本就与当前一致）
     pub reset_performed: bool,
-    /// dbx 预置连接同步命令执行结果（仅重置发生后触发；None=未触发——
-    /// 密码本就一致或指定账号非 local-pg 在用账号，无事可做）。
+    /// dbx 预置连接同步命令执行结果（仅重置发生后触发）：
+    /// true=执行成功（含"指定账号非 local-pg 在用账号、无事可做"——命令条件
+    /// 内建，条件不满足同样 exit 0）；false=执行失败（详情见 dbx_error）；
+    /// None=未触发（密码本就一致，未发生重置）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dbx_synced: Option<bool>,
     /// dbx 同步失败详情（成功/未触发为 None；**不含密码**）。
