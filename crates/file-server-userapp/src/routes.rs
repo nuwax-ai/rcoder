@@ -271,6 +271,52 @@ mod tests {
                 && task.contains("勿直接作 Last-Event-ID"),
             "task 快照描述缺终态/轮询/seq 游标语义"
         );
+
+        // static 取包: releaseId 可选参数（按版本取包）必须在文档参数清单里
+        let static_op = document
+            .paths
+            .paths
+            .get("/api/v1/userapp/static/{app_id}")
+            .and_then(|item| item.get.as_ref())
+            .expect("static path missing");
+        assert!(
+            static_op
+                .parameters
+                .as_ref()
+                .is_some_and(|params| params.iter().any(|p| p.name == "releaseId"
+                    && matches!(p.parameter_in, utoipa::openapi::path::ParameterIn::Query))),
+            "static 接口参数缺 releaseId Query 声明（按版本取包是对外契约）"
+        );
+    }
+
+    /// 全域兜底: `in=path` 只允许出现在路径模板同名占位符上。
+    ///
+    /// utoipa-axum 从 handler 签名自动发现 Query struct 时, 会按 Path extractor
+    /// 推断 parameter_in——handler 同时有 Path 参数 + 裸名 Query struct 引用时,
+    /// query 字段全部被误标 path（同事按 swagger 对接即错）。struct 上的
+    /// `#[into_params(parameter_in = Query)]` 显式声明可覆盖; 本测试锁死
+    /// 整个域不再出现任何误标（新增 Query struct 忘声明即报红）。
+    #[test]
+    fn query_params_never_mislabeled_as_path() {
+        let document = document();
+        for (path, item) in &document.paths.paths {
+            for op in [&item.get, &item.post].into_iter().flatten() {
+                let Some(params) = &op.parameters else {
+                    continue;
+                };
+                for p in params {
+                    if matches!(p.parameter_in, utoipa::openapi::path::ParameterIn::Path)
+                        && !path.contains(&format!("{{{}}}", p.name))
+                    {
+                        panic!(
+                            "参数 {name} 被标为 path 但路径模板无同名占位符 ({path}); \
+                             Query struct 需 #[into_params(parameter_in = Query)] 显式声明",
+                            name = p.name
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// 文档质量防回归: 全部接口的 path/query 参数与请求体 schema 字段必须有

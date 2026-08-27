@@ -9,7 +9,7 @@
 //! - `GET  /tasks/{taskId}/logs`：查构建日志（分页，复用 `read_dev_log`）。
 //! - `GET  /tasks/{taskId}/logs/stream`：任务进度 SSE（实时通道，进度事件推送）。
 //! - `POST /tasks/{taskId}/cancel`：取消进行中的编译任务（软取消 + kill 进程组）。
-//! - `GET  /static/{app_id}`：按 app 直下最新构建整体包（复用 `serve_from_root` + COMPUTER_CORS）。
+//! - `GET  /static/{app_id}`：按 app 直下构建整体包（缺省最新；`?releaseId=` 指定版本）。
 //!
 //! 详见 `docs/application-management-service-v2-design.md` §5。
 
@@ -97,7 +97,8 @@ pub(crate) struct BuildCreatedData {
     pub status: BuildTaskStatus,
     /// 预生成的产物相对路径（`builds/workspace-package-{releaseId}.zip`，release_id
     /// 创建时即生成）——信息字段：标识本次构建的产物位置；实际取包按 app 直下
-    /// `GET /api/v1/userapp/static/{appId}`（服务端选最新产物，无需传路径）。
+    /// `GET /api/v1/userapp/static/{appId}`（缺省最新产物；带 `?releaseId=` 精确
+    /// 取本版本，回滚/比对指定版本用）。
     pub artifact_path: String,
 }
 
@@ -161,8 +162,12 @@ pub(crate) struct ImportProjectBody {
 }
 
 /// 任务构建日志查询参数（`GET /tasks/{taskId}/logs`）。
+///
+/// `parameter_in` 必须显式声明：utoipa-axum 自动发现会按 Path extractor 把
+/// query 字段误标 path（swagger 对接即错），显式声明优先。
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[serde(rename_all = "camelCase")]
+#[into_params(parameter_in = Query)]
 pub(crate) struct TaskLogsQuery {
     /// 子项目目录名（= service_id）；留空读 workspace 根日志目录。
     #[serde(default)]
@@ -177,8 +182,12 @@ fn default_start_index() -> usize {
 }
 
 /// SSE 订阅参数（`GET /tasks/{taskId}/logs/stream`）。
+///
+/// `parameter_in` 必须显式声明：utoipa-axum 自动发现会按 Path extractor 把
+/// query 字段误标 path（swagger 对接即错），显式声明优先。
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[serde(rename_all = "camelCase")]
+#[into_params(parameter_in = Query)]
 pub(crate) struct StreamQuery {
     /// 从哪个 seq 开始回放（含该 seq；0 = 从头）。仅作兜底——
     /// 请求带 `Last-Event-ID` 头时以头为准（头值 + 1 = 本值语义），query 被忽略。
