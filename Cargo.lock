@@ -1941,6 +1941,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared_types",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tonic",

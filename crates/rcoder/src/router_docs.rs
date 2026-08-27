@@ -588,7 +588,7 @@ mod openapi_tests {
             "UserApp · 日志"
         );
         assert_eq!(
-            tag_of("/api/v1/userapp/{app_id}/storage", "get"),
+            tag_of("/api/v1/userapp/{app_id}/{env}/storage", "get"),
             "UserApp · 文件与存储"
         );
         assert_eq!(

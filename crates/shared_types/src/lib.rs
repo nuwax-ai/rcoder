@@ -31,6 +31,8 @@ pub use userapp::db_align::{
     align_pg_credentials,
 };
 pub use userapp::dev_cleanup::UserappDevCleanup;
+pub use userapp::dev_locator::UserappDevLocator;
+pub use userapp::env::{UserappEnv, invalid_env_error};
 pub use userapp::forward_contract::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER,
     SERVICE_TYPE_USERAPP, is_userapp_service_type_value,
@@ -102,8 +104,8 @@ pub use validation::{garde_err_to_app_error, validate_identifier};
 // UserApp 日志域契约（rcoder ↔ app-cli 单一事实源；OpenAPI schema 同源派生）
 pub mod app_cli_logs;
 pub use app_cli_logs::{
-    LogQueryRequest, LogQueryResponse, LogRecord, LogSelector, LogSourceInfo, SourceError,
-    MAX_CURSOR_BYTES, MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE,
+    LogQueryRequest, LogQueryResponse, LogRecord, LogSelector, LogSourceInfo, MAX_CURSOR_BYTES,
+    MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE, SourceError,
 };
 
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）

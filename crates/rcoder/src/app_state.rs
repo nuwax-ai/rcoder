@@ -94,7 +94,7 @@ impl AppState {
         projects: Arc<ProjectStoreBackend>,
         cleanup_rx: tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>,
         activity: Arc<app_manager::AppActivityRegistry>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         // 存储后端（Memory/Postgres 枚举）由调用方（main.rs）按配置构造并注入，
         // 以便同一 Arc 实例可同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层。
         let cluster_domain = shared_types::get_k8s_cluster_domain();
@@ -110,19 +110,23 @@ impl AppState {
                 anyhow::anyhow!("failed to initialize agent download manager: {}", e)
             })?);
 
-        // 初始化应用管理服务（Docker / K8s 统一构造，运行时由 access_mode 决定行为）
-        let app_service_instance = app_manager::service::AppService::new(
-            config.app_manager.clone(),
-            runtime.clone(),
-            activity.clone(),
-            pingora.clone(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?;
+        // 初始化应用管理服务（Docker / K8s 统一构造，运行时由 access_mode 决定行为）。
+        // 保留具体类型 Arc：dev_locator 注入需要在其上调用 inherent setter
+        // （发生在下方 Self Arc 包装之后——locator 以 Weak 回指 state）。
+        let app_service_arc: Arc<app_manager::service::AppService> = Arc::new(
+            app_manager::service::AppService::new(
+                config.app_manager.clone(),
+                runtime.clone(),
+                activity.clone(),
+                pingora.clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to initialize app service: {}", e))?,
+        );
 
         // UserApp 开发资源回收回调（app purge 时回收 UserAppBuilder 开发容器 +
         // per-app PVC；app_manager 的 runtime 视图无 agent 能力，经契约委托本进程）
-        app_service_instance.set_dev_cleanup(Arc::new(
+        app_service_arc.set_dev_cleanup(Arc::new(
             crate::userapp_builder::UserappDevResourcesCleanup::new(
                 runtime.clone(),
                 projects.clone(),
@@ -145,8 +149,8 @@ impl AppState {
                 );
                 match metadata_persistence.load_all().await {
                     Ok(rows) => {
-                        app_service_instance.set_metadata_persistence(metadata_persistence);
-                        app_service_instance.apply_metadata_loaded(rows);
+                        app_service_arc.set_metadata_persistence(metadata_persistence);
+                        app_service_arc.apply_metadata_loaded(rows);
                     }
                     Err(e) => {
                         anyhow::bail!("[STORAGE_PG] userapp_metadata load failed: {e:#}");
@@ -154,9 +158,9 @@ impl AppState {
                 }
             }
         }
-        let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(app_service_instance);
+        let app_service: Arc<dyn app_manager::AppServiceTrait> = app_service_arc.clone();
 
-        Ok(Self {
+        let state = Arc::new(Self {
             config,
             projects,
             pingora_service: pingora,
@@ -173,7 +177,16 @@ impl AppState {
             app_service,
             activity,
             cluster_domain,
-        })
+        });
+
+        // userApp 文件/存储接口 env=dev 分支的开发容器定位回调（幂等 ensure +
+        // 探活自愈 + file-server 地址解析）。Weak 挂接防
+        // AppState → app_service → dev_locator → AppState 引用环。
+        app_service_arc.set_dev_locator(Arc::new(crate::userapp_builder::UserappDevLocator::new(
+            Arc::downgrade(&state),
+        )));
+
+        Ok(state)
     }
 
     /// 获取容器运行时引用（替代 RuntimeManager::get()）

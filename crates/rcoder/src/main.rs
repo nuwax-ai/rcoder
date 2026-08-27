@@ -228,20 +228,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let state = Arc::new(
-        AppState::new(
-            bootstrap_result.config.clone(),
-            proxy_result.pingora_service.clone(),
-            bootstrap_result.api_key_config,
-            container_prefix_rcoder,
-            container_prefix_computer,
-            runtime,
-            projects,
-            cleanup_rx,
-            activity_registry.clone(),
-        )
-        .await?,
-    );
+    // AppState::new 返回 Arc<Self>（内部完成 dev_locator 等需回指 state 的装配）
+    let state = AppState::new(
+        bootstrap_result.config.clone(),
+        proxy_result.pingora_service.clone(),
+        bootstrap_result.api_key_config,
+        container_prefix_rcoder,
+        container_prefix_computer,
+        runtime,
+        projects,
+        cleanup_rx,
+        activity_registry.clone(),
+    )
+    .await?;
 
     let _bg_handles = background_tasks::start_all_background_tasks(
         &bootstrap_result.config,

@@ -50,6 +50,9 @@ pub struct AppService {
     /// UserApp 开发资源回收回调（宿主注入；purge 时回收 UserAppBuilder 开发容器
     /// 与 per-app PVC——app_manager 的 runtime 视图无 agent 能力，经契约委托宿主）。
     pub(crate) dev_cleanup: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevCleanup>>>,
+    /// UserApp 开发容器定位回调（宿主注入；文件/存储接口 `env=dev` 分支经此
+    /// ensure/定位 UserAppBuilder 的 file-server——同 dev_cleanup 的委托根因）。
+    pub(crate) dev_locator: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevLocator>>>,
     /// Deployment 列表查询缓存（TTL + 写路径失效 + single-flight）。防查询面
     /// 轮询频繁穿透到 Docker daemon/K8s apiserver——Docker daemon 高负载下
     /// API 可能无响应，穿透查询会挂死调用方（实战踩过：编译镜像期间 daemon
@@ -102,6 +105,7 @@ impl AppService {
             release_locks: DashMap::new(),
             metadata: AppMetadataStore::default(),
             dev_cleanup: std::sync::RwLock::new(None),
+            dev_locator: std::sync::RwLock::new(None),
         };
         // K8s Pingora 模式：启动时从集群重建 Pingora backends——修复 pingora_ports 内存态
         // 丢失导致的重启 silent 404（list_deployments 的 expose_type 已由 Deployment annotation
@@ -207,16 +211,29 @@ impl super::AppServiceTrait for AppService {
             .await
     }
 
-    async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo> {
-        self.get_app_storage(app_id).await
+    async fn get_app_storage(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+    ) -> AppResult<StorageInfo> {
+        self.get_app_storage(env, app_id).await
     }
 
-    async fn clear_app_storage(&self, app_id: &str) -> AppResult<()> {
-        self.clear_app_storage(app_id).await
+    async fn clear_app_storage(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+    ) -> AppResult<()> {
+        self.clear_app_storage(env, app_id).await
     }
 
-    async fn destroy_app_storage(&self, app_id: &str, confirm: &str) -> AppResult<()> {
-        self.destroy_app_storage(app_id, confirm).await
+    async fn destroy_app_storage(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+        confirm: &str,
+    ) -> AppResult<()> {
+        self.destroy_app_storage(env, app_id, confirm).await
     }
 
     async fn align_db_credentials(
@@ -237,9 +254,10 @@ impl super::AppServiceTrait for AppService {
 
     async fn query_storage(
         &self,
+        env: shared_types::UserappEnv,
         request: QueryStorageRequest,
     ) -> AppResult<PaginatedResponse<StorageInfo>> {
-        self.query_storage(request).await
+        self.query_storage(env, request).await
     }
 
     async fn start_app_enhanced(
@@ -295,30 +313,44 @@ impl super::AppServiceTrait for AppService {
 
     async fn upload_file(
         &self,
+        env: shared_types::UserappEnv,
         app_id: &str,
         file_data: Vec<u8>,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult> {
-        self.upload_file(app_id, file_data, target, flatten).await
+        self.upload_file(env, app_id, file_data, target, flatten)
+            .await
     }
 
     async fn upload_from_url(
         &self,
+        env: shared_types::UserappEnv,
         app_id: &str,
         url: &str,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult> {
-        self.upload_from_url(app_id, url, target, flatten).await
+        self.upload_from_url(env, app_id, url, target, flatten)
+            .await
     }
 
-    async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> AppResult<Vec<FileInfo>> {
-        self.list_files(app_id, subpath).await
+    async fn list_files(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+        subpath: Option<&str>,
+    ) -> AppResult<Vec<FileInfo>> {
+        self.list_files(env, app_id, subpath).await
     }
 
-    async fn delete_file(&self, app_id: &str, file_path: &str) -> AppResult<()> {
-        self.delete_file(app_id, file_path).await
+    async fn delete_file(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+        file_path: &str,
+    ) -> AppResult<()> {
+        self.delete_file(env, app_id, file_path).await
     }
 }
 
@@ -731,7 +763,7 @@ mod tests {
         );
 
         service
-            .destroy_app_storage("app-purge", "app-purge")
+            .destroy_app_storage(shared_types::UserappEnv::Prod, "app-purge", "app-purge")
             .await
             .expect("explicit destroy");
         assert!(

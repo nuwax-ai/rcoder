@@ -59,11 +59,12 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/v1/userapp/upload-files",
     "/api/v1/userapp/generate-file",
     "/api/v1/userapp/import-project",
-    // 容器文件操作（新形态 app-files 族）
+    // 容器文件操作（新形态 app-files 族；clear=rcoder dev storage/clear 的容器侧实现）
     "/api/v1/userapp/app-files/upload",
     "/api/v1/userapp/app-files/upload-from-url",
     "/api/v1/userapp/app-files/list",
     "/api/v1/userapp/app-files/delete",
+    "/api/v1/userapp/app-files/clear",
     // 开发工具链
     "/api/v1/userapp/ensure-workspace",
     "/api/v1/userapp/execute-command",
@@ -98,7 +99,8 @@ pub(crate) mod guard_tables {
 
     /// app_manager 具体路由路径快照（crates/app_manager/src/routes.rs；同样供
     /// 守卫闭包比对——该清单增删须同步。原 `{app_id}/db/*` 两路已下线，数据库
-    /// 管理统一走转发层 `/api/v1/userapp/db/{env}/*`）。
+    /// 管理统一走转发层 `/api/v1/userapp/db/{env}/*`；文件/存储八接口已加
+    /// `{env}` 段显式分派 dev/prod）。
     pub(crate) const APP_MANAGER_PATHS: [&str; 23] = [
         "/api/v1/userapp/query",
         "/api/v1/userapp/runtime",
@@ -115,14 +117,14 @@ pub(crate) mod guard_tables {
         "/api/v1/userapp/{app_id}/health",
         "/api/v1/userapp/{app_id}/stats",
         "/api/v1/userapp/{app_id}/events",
-        "/api/v1/userapp/{app_id}/upload",
-        "/api/v1/userapp/{app_id}/upload-from-url",
-        "/api/v1/userapp/{app_id}/files",
-        "/api/v1/userapp/{app_id}/files/delete",
-        "/api/v1/userapp/{app_id}/storage",
-        "/api/v1/userapp/{app_id}/storage/clear",
-        "/api/v1/userapp/{app_id}/storage/destroy",
-        "/api/v1/userapp/storage/query",
+        "/api/v1/userapp/{app_id}/{env}/upload",
+        "/api/v1/userapp/{app_id}/{env}/upload-from-url",
+        "/api/v1/userapp/{app_id}/{env}/files",
+        "/api/v1/userapp/{app_id}/{env}/files/delete",
+        "/api/v1/userapp/{app_id}/{env}/storage",
+        "/api/v1/userapp/{app_id}/{env}/storage/clear",
+        "/api/v1/userapp/{app_id}/{env}/storage/destroy",
+        "/api/v1/userapp/storage/{env}/query",
     ];
 }
 

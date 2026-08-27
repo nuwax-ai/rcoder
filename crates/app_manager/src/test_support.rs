@@ -13,7 +13,7 @@ use container_runtime_api::{
     DeploymentStatus, StorageResizeOutcome, UserAppDeploymentRuntime, UserAppRuntime,
     WorkspaceRuntime,
 };
-use shared_types::ContainerBasicInfo;
+use shared_types::{ContainerBasicInfo, ServiceType};
 
 use crate::activity_registry::AppActivityRegistry;
 use crate::config::{AppAccessMode, AppManagerConfig};
@@ -52,13 +52,45 @@ pub(crate) struct MockRuntime {
     /// exec 收到的命令历史（key=app_id 按序追加；exit 恒 0——dbx 同步链路断言用；
     /// 需注入失败时用 resize_fails 同款模式扩展）。
     pub exec_calls: DashMap<String, Vec<String>>,
+    /// workspace_volume_name 收到的 (app_id, service_type debug) 历史——storage
+    /// env 分派断言用（dev→UserAppBuilder / prod→UserApp）。
+    pub volume_name_calls: DashMap<String, Vec<String>>,
+    /// list_workspace_identifiers 按 service_type 的返回预置 + 调用计数
+    /// （storage get/query 的 env 分派断言用）。
+    pub workspace_ids: DashMap<String, Vec<String>>,
+    pub list_workspace_calls: AtomicUsize,
 }
 
 #[async_trait]
 impl WorkspaceRuntime for MockRuntime {
     // 其余 workspace 族方法走默认实现（resolve_workspace_path → Ok(None)，
     // get_container_app_dir 因此落到 `workspace_root/{app_id}`，测试用 tempdir 承接）；
-    // 仅覆写 resize_app_storage（update 扩容链路断言需要记录与注入）。
+    // 覆写 resize_app_storage（update 扩容链路断言需要记录与注入）与
+    // workspace_volume_name / list_workspace_identifiers（storage env 分派断言）。
+    async fn workspace_volume_name(
+        &self,
+        app_id: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        self.volume_name_calls
+            .entry(app_id.to_string())
+            .or_default()
+            .push(format!("{service_type:?}"));
+        Ok(format!("vol-{app_id}"))
+    }
+
+    async fn list_workspace_identifiers(
+        &self,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        self.list_workspace_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .workspace_ids
+            .get(&format!("{service_type:?}"))
+            .map(|v| v.clone())
+            .unwrap_or_default())
+    }
+
     async fn resize_app_storage(
         &self,
         app_id: &str,
@@ -242,6 +274,7 @@ pub(crate) fn test_service(workspace_root: &Path, runtime: Arc<MockRuntime>) -> 
         release_locks: DashMap::new(),
         metadata: crate::runtime::metadata::AppMetadataStore::default(),
         dev_cleanup: std::sync::RwLock::new(None),
+        dev_locator: std::sync::RwLock::new(None),
         deploy_list_cache: tokio::sync::Mutex::new(None),
     }
 }

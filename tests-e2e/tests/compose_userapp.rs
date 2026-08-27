@@ -276,6 +276,152 @@ async fn test_start_without_app_semantics(env: &Env, report: &JsonlReporter) {
     );
 }
 
+/// env 维度文件/存储链路（`{app_id}/{env}/*` 八接口新形态的 dev 侧回归锚）：
+/// create-workspace → upload(dev) → files(dev) 断言 → storage(dev) 查询 →
+/// storage/{env}/query 清单 → 非法 env 400 → destroy(dev) 回收 → exists 复查。
+async fn test_env_scoped_files_and_storage(env: &Env, report: &JsonlReporter) {
+    let ident = format!(
+        "app-e2e-env-{}{}",
+        &env.run_tag.replace('_', "")[..10],
+        std::process::id() % 1000
+    );
+    let guard_app = ident.clone();
+
+    // 前置：建 workspace（ensure 开发容器 + 幂等建目录——upload/dev 链路的载体）
+    let (ws_s, ws_b) = post_json(
+        env,
+        "/api/userapp/workspace",
+        json!({"app_id": ident, "user_id": "e2e-user"}),
+    )
+    .await;
+    let ws_ok = ws_s.is_success() && http_ok(&ws_b);
+    report.assert_hard(
+        "create-workspace 前置（dev 链路载体）",
+        ws_ok,
+        format!("HTTP {ws_s}, body 截断: {}", trunc(&ws_b, 120)),
+    );
+    if !ws_ok {
+        cleanup_builder(&guard_app);
+        return;
+    }
+
+    // upload(dev)：multipart 单文件直传（target 相对开发容器 workspace 根）
+    let part = reqwest::multipart::Part::bytes(b"e2e-dev-upload").file_name("hello.txt");
+    let form = reqwest::multipart::Form::new()
+        .text("target", "hello.txt")
+        .part("file", part);
+    let resp = env
+        .http
+        .post(format!("{}/api/v1/userapp/{ident}/dev/upload", env.rcoder))
+        .timeout(Duration::from_secs(120))
+        .multipart(form)
+        .send()
+        .await
+        .expect("upload(dev)");
+    let up_status = resp.status();
+    let up_body: Value = resp.json().await.unwrap_or(Value::Null);
+    report.assert_hard(
+        "upload(dev) 受理（200 + data.file_path 含上传名）",
+        up_status.is_success()
+            && http_ok(&up_body)
+            && up_body["data"]["file_path"]
+                .as_str()
+                .is_some_and(|p| p.contains("hello.txt")),
+        format!("HTTP {up_status}, body 截断: {}", trunc(&up_body, 150)),
+    );
+
+    // files(dev)：workspace 根列表含上传文件
+    let resp = env
+        .http
+        .get(format!("{}/api/v1/userapp/{ident}/dev/files", env.rcoder))
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .expect("files(dev)");
+    let ls_status = resp.status();
+    let ls_body: Value = resp.json().await.unwrap_or(Value::Null);
+    let listed = ls_status.is_success()
+        && http_ok(&ls_body)
+        && ls_body["data"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|f| f["path"] == "hello.txt"));
+    report.assert_hard(
+        "files(dev) 列表含上传文件（env=dev 根=workspace）",
+        listed,
+        format!("HTTP {ls_status}, body 截断: {}", trunc(&ls_body, 150)),
+    );
+
+    // storage(dev)：workspace 已建 → exists=true
+    let (st_s, st_b) = get_json(env, &format!("/api/v1/userapp/{ident}/dev/storage")).await;
+    report.assert_hard(
+        "storage(dev) exists=true（workspace 就绪）",
+        st_s.is_success() && http_ok(&st_b) && st_b["data"]["exists"] == true,
+        format!("HTTP {st_s}, body 截断: {}", trunc(&st_b, 150)),
+    );
+
+    // storage/{env}/query：dev 清单含该 app
+    let (q_s, q_b) = post_json(
+        env,
+        "/api/v1/userapp/storage/dev/query",
+        json!({"page": 1, "page_size": 50, "filters": {"app_ids": [ident]}}),
+    )
+    .await;
+    report.assert_hard(
+        "storage/dev/query 清单含本 app",
+        q_s.is_success()
+            && http_ok(&q_b)
+            && q_b["data"]["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|i| i["app_id"] == ident)),
+        format!("HTTP {q_s}, body 截断: {}", trunc(&q_b, 150)),
+    );
+
+    // env 必填校验：非法值 400
+    let (bad_s, _) = get_json(env, &format!("/api/v1/userapp/{ident}/staging/storage")).await;
+    report.assert_hard(
+        "非法 env → 400（必填显式，无缺省）",
+        bad_s.as_u16() == 400,
+        format!("HTTP {bad_s}"),
+    );
+
+    // destroy(dev)：confirm=app_id → 回收整个开发环境（容器+卷+目录）
+    let (d_s, d_b) = post_json(
+        env,
+        &format!("/api/v1/userapp/{ident}/dev/storage/destroy"),
+        json!({"confirm": ident}),
+    )
+    .await;
+    report.assert_hard(
+        "storage/dev/destroy 回收开发环境",
+        d_s.is_success() && http_ok(&d_b),
+        format!("HTTP {d_s}, body 截断: {}", trunc(&d_b, 150)),
+    );
+
+    // 回收后复查：exists=false
+    let (re_s, re_b) = get_json(env, &format!("/api/v1/userapp/{ident}/dev/storage")).await;
+    report.assert_hard(
+        "destroy 后 storage(dev) exists=false",
+        re_s.is_success() && http_ok(&re_b) && re_b["data"]["exists"] == false,
+        format!("HTTP {re_s}, body 截断: {}", trunc(&re_b, 150)),
+    );
+
+    cleanup_builder(&guard_app);
+}
+
+/// GET + HttpResult 解析（本文件 env 场景共用）。
+async fn get_json(env: &Env, path: &str) -> (reqwest::StatusCode, Value) {
+    let resp = env
+        .http
+        .get(format!("{}{path}", env.rcoder))
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .expect("http get");
+    let status = resp.status();
+    let body = resp.json().await.unwrap_or(Value::Null);
+    (status, body)
+}
+
 fn trunc(v: &Value, n: usize) -> String {
     let s = v.to_string();
     s.chars().take(n).collect()
@@ -292,6 +438,7 @@ async fn userapp_compose_regression() {
     test_build_identifier_validation(&env, &report).await;
     test_build_reaches_terminal(&env, &report).await;
     test_start_without_app_semantics(&env, &report).await;
+    test_env_scoped_files_and_storage(&env, &report).await;
 
     let path = report.path.display().to_string();
     assert!(report.finish(), "场景失败：断言明细见 {path}");

@@ -62,35 +62,38 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             "/api/v1/userapp/{app_id}/events",
             get(handlers::get_app_events),
         )
-        // 文件管理
+        // 文件管理（env 显式分派：dev=开发容器 workspace / prod=运行容器 /app）
         .route(
-            "/api/v1/userapp/{app_id}/upload",
+            "/api/v1/userapp/{app_id}/{env}/upload",
             post(handlers::upload_file),
         )
         .route(
-            "/api/v1/userapp/{app_id}/upload-from-url",
+            "/api/v1/userapp/{app_id}/{env}/upload-from-url",
             post(handlers::upload_from_url),
         )
-        .route("/api/v1/userapp/{app_id}/files", get(handlers::list_files))
         .route(
-            "/api/v1/userapp/{app_id}/files/delete",
+            "/api/v1/userapp/{app_id}/{env}/files",
+            get(handlers::list_files),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/{env}/files/delete",
             post(handlers::delete_file),
         )
-        // 持久存储管理（v2 §5.4）
+        // 持久存储管理（v2 §5.4；env=dev 为开发卷/开发环境语义）
         .route(
-            "/api/v1/userapp/{app_id}/storage",
+            "/api/v1/userapp/{app_id}/{env}/storage",
             get(handlers::get_app_storage),
         )
         .route(
-            "/api/v1/userapp/{app_id}/storage/clear",
+            "/api/v1/userapp/{app_id}/{env}/storage/clear",
             post(handlers::clear_app_storage),
         )
         .route(
-            "/api/v1/userapp/{app_id}/storage/destroy",
+            "/api/v1/userapp/{app_id}/{env}/storage/destroy",
             post(handlers::destroy_app_storage),
         )
         .route(
-            "/api/v1/userapp/storage/query",
+            "/api/v1/userapp/storage/{env}/query",
             post(handlers::query_storage),
         )
 }

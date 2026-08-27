@@ -322,30 +322,54 @@ impl AgentContainerRuntime for DockerRuntime {
     }
 }
 
-/// Docker 不实现 WorkspaceRuntime 的 `resolve_*` / `list_workspace_identifiers` / `ensure_workspace`
-/// (file-server 经 trait upcast 拿到 DockerRuntime 时这些方法命中 trait 默认 Ok(None)/Ok(vec![])/Ok(()),
+/// Docker 不实现 WorkspaceRuntime 的 `resolve_*` / `ensure_workspace`
+/// (file-server 经 trait upcast 拿到 DockerRuntime 时这些方法命中 trait 默认 Ok(None)/Ok(()),
 /// 走 LocalWorkspaceResolver 降级 —— 符合 Docker 模式设计)。
-/// **仅 `destroy_app_pvc` 重写** (Docker 模式 destroy = 删 app workspace 目录, 对应 K8s 删 PVC+subvolume).
+/// `list_workspace_identifiers` 仅实现 dev（UserAppBuilder）形态（目录树扫描），
+/// prod 维持 trait 默认空（孤儿检测依赖 list_deployments 兜底——存量缺口）。
+/// **`destroy_app_pvc` 重写** (Docker 模式 destroy = 删 app workspace 目录, 对应 K8s 删 PVC+subvolume).
 #[async_trait]
 impl WorkspaceRuntime for DockerRuntime {
     async fn workspace_volume_name(
         &self,
         app_id: &str,
-        _service_type: &ServiceType,
+        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<String> {
-        // Docker 持久卷 = userapp-workspace prod 树四目录（uid 维度经通配定位，
+        // Docker 持久卷 = userapp-workspace 树四目录（uid 维度经通配定位，
         // 无单一物理路径）——返回展示标识串（与 K8s 返回 PVC 名对称：标识而非
         // 可 stat 路径；存在性判定由调用方 storage 层用元数据 uid 精确定位）。
+        // dev（UserAppBuilder）与 prod（UserApp）仅树前缀一层之差。
         if app_id.is_empty() || app_id.contains('/') || app_id.contains('\\') {
             return Err(ContainerRuntimeError::DockerError(format!(
                 "workspace_volume_name: invalid app_id {app_id:?}"
             )));
         }
+        let stage = if *service_type == ServiceType::UserAppBuilder {
+            "dev"
+        } else {
+            "prod"
+        };
         Ok(format!(
-            "{}/prod/*/{}",
+            "{}/{stage}/*/{}",
             shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
             app_id
         ))
+    }
+
+    /// Docker 无 PVC label 集——dev（UserAppBuilder）形态按 dev 树目录扫描反解
+    /// identifier：`dev/{uid}/` 一层 × 其下 app 目录（跳过同层的 data/logs/
+    /// agent-store 三个兄弟目录，它们按 app_id 键不是 uid）。prod 形态维持
+    /// 空（Docker 孤儿检测非关键，见 trait 注释）。
+    async fn list_workspace_identifiers(
+        &self,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        if *service_type != ServiceType::UserAppBuilder {
+            return Ok(vec![]);
+        }
+        let dev_root =
+            std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT).join("dev");
+        scan_dev_workspace_identifiers(&dev_root).await
     }
 
     async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
@@ -618,6 +642,44 @@ pub(super) fn extract_container_ports(
         .collect()
 }
 
+/// dev 树 identifier 扫描（`list_workspace_identifiers(UserAppBuilder)` 的实现体，
+/// 提为自由函数便于单测）：`dev/{uid}/` 一层 × 其下 app 目录；跳过同层按 app_id
+/// 键的 data/logs/agent-store 兄弟目录；dev 树不存在 = 空（幂等）。
+async fn scan_dev_workspace_identifiers(
+    dev_root: &std::path::Path,
+) -> ContainerRuntimeResult<Vec<String>> {
+    let mut uid_entries = match tokio::fs::read_dir(dev_root).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => {
+            return Err(ContainerRuntimeError::DockerError(format!(
+                "list dev workspace identifiers: read {}: {e}",
+                dev_root.display()
+            )));
+        }
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    while let Ok(Some(uid_dir)) = uid_entries.next_entry().await {
+        let uid_path = uid_dir.path();
+        if !uid_path.is_dir() {
+            continue;
+        }
+        let Ok(mut app_entries) = tokio::fs::read_dir(&uid_path).await else {
+            continue;
+        };
+        while let Ok(Some(app_dir)) = app_entries.next_entry().await {
+            let name = app_dir.file_name().to_string_lossy().to_string();
+            if matches!(name.as_str(), "data" | "logs" | "agent-store") {
+                continue;
+            }
+            if app_dir.path().is_dir() {
+                ids.insert(name);
+            }
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,5 +717,35 @@ mod tests {
         let parsed = parse_ports_label("8080:http,abc:tcp,:http,9090:tcp");
         assert_eq!(parsed.len(), 2);
         assert!(parsed.iter().all(|p| p.port == 8080 || p.port == 9090));
+    }
+
+    /// dev 树 identifier 扫描：跨 uid 去重、跳过 data/logs/agent-store 兄弟目录、
+    /// 排序稳定；树不存在返回空（幂等）。
+    #[tokio::test]
+    async fn dev_workspace_scan_collects_apps_across_uids_skipping_siblings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // 两个 uid 各持有不同 app；data/logs/agent-store 下也有按 app_id 键的目录，
+        // 但它们是兄弟段不是 uid，不得进入结果；文件与非 dev 内容忽略
+        for (uid, app) in [("u1", "app-a"), ("u2", "app-b"), ("u1", "app-c")] {
+            std::fs::create_dir_all(root.join(uid).join(app)).expect("mkdir app");
+        }
+        for sibling in ["data", "logs", "agent-store"] {
+            std::fs::create_dir_all(root.join("u1").join(sibling).join("app-a"))
+                .expect("mkdir sibling");
+        }
+        std::fs::write(root.join("u1").join("notes.txt"), "").expect("write file");
+
+        let ids = scan_dev_workspace_identifiers(root).await.expect("scan");
+        assert_eq!(ids, vec!["app-a", "app-b", "app-c"]);
+    }
+
+    #[tokio::test]
+    async fn dev_workspace_scan_empty_when_tree_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ids = scan_dev_workspace_identifiers(&dir.path().join("dev"))
+            .await
+            .expect("scan");
+        assert!(ids.is_empty());
     }
 }

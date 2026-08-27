@@ -111,6 +111,12 @@ impl crate::service::AppService {
     pub fn set_dev_cleanup(&self, cleanup: Arc<dyn shared_types::UserappDevCleanup>) {
         *self.dev_cleanup.write().expect("dev_cleanup lock") = Some(cleanup);
     }
+
+    /// 注入开发容器定位回调（宿主 rcoder 装配时调用；文件/存储接口 `env=dev`
+    /// 分支经此幂等 ensure UserAppBuilder 并解析其 file-server 地址）。
+    pub fn set_dev_locator(&self, locator: Arc<dyn shared_types::UserappDevLocator>) {
+        *self.dev_locator.write().expect("dev_locator lock") = Some(locator);
+    }
 }
 
 #[cfg(test)]

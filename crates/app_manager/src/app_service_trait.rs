@@ -50,14 +50,26 @@ pub trait AppServiceTrait: Send + Sync {
         expected_resource_version: Option<&str>,
     ) -> AppResult<()>;
 
-    /// 查询单个应用持久存储状态（v2 §5.4，O(1) stat，不含 size_bytes）
-    async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo>;
+    /// 查询单个应用持久存储状态（prod=运行卷 / dev=开发卷；O(1) stat，不含 size_bytes）
+    async fn get_app_storage(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+    ) -> AppResult<StorageInfo>;
 
-    /// 清空应用持久存储内容（留 PVC，可恢复；仅当 app 已 delete 时允许，否则 INVALID_STATE）
-    async fn clear_app_storage(&self, app_id: &str) -> AppResult<()>;
+    /// 清空应用持久存储内容（prod：留 PVC 可恢复，仅当 app 已 delete；dev：清空
+    /// workspace 内容留容器留卷——"重置开发工作区"）
+    async fn clear_app_storage(&self, env: shared_types::UserappEnv, app_id: &str)
+    -> AppResult<()>;
 
-    /// 销毁应用持久存储 PVC（高危·不可逆·释放配额；需 confirm==app_id，仅 app 已 delete 后允许）
-    async fn destroy_app_storage(&self, app_id: &str, confirm: &str) -> AppResult<()>;
+    /// 销毁应用持久存储（prod：删 PVC，需 confirm==app_id 且 app 已 delete；
+    /// dev：销毁整个开发环境=builder 容器+dev 卷+目录，不动 metadata）
+    async fn destroy_app_storage(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+        confirm: &str,
+    ) -> AppResult<()>;
 
     /// PG 凭据对齐（UserApp 运行容器内）：验证传入密码，不一致则重置
     /// （流程单头 `shared_types::align_pg_credentials`，exec 通道实现）
@@ -74,9 +86,10 @@ pub trait AppServiceTrait: Send + Sync {
     /// 未注册返回 None（调用方自行兜底）。
     async fn get_app_owner(&self, app_id: &str) -> Option<String>;
 
-    /// 分页查询持久存储（强制分页，无全量模式）
+    /// 分页查询持久存储（强制分页，无全量模式；prod=运行卷清单，dev=开发卷清单）
     async fn query_storage(
         &self,
+        env: shared_types::UserappEnv,
         request: QueryStorageRequest,
     ) -> AppResult<PaginatedResponse<StorageInfo>>;
 
@@ -123,9 +136,11 @@ pub trait AppServiceTrait: Send + Sync {
         app_id: &str,
     ) -> AppResult<Vec<container_runtime_api::AppEventInfo>>;
 
-    /// 上传文件 / 压缩包（魔数判断：zip/tar.gz → 解压到 target 目录；单文件存 target；flatten 剥 wrapper）
+    /// 上传文件 / 压缩包（魔数判断：zip/tar.gz → 解压到 target 目录；单文件存 target；flatten 剥 wrapper）。
+    /// env=prod 转发运行容器（target 相对 /app 根）；env=dev 转发开发容器（target 相对 workspace 根）
     async fn upload_file(
         &self,
+        env: shared_types::UserappEnv,
         app_id: &str,
         file_data: Vec<u8>,
         target: &str,
@@ -135,15 +150,27 @@ pub trait AppServiceTrait: Send + Sync {
     /// 从 HTTP(S) URL 下载文件/压缩包并上传；允许内网地址，复用 upload_file 解压和路径安全校验。
     async fn upload_from_url(
         &self,
+        env: shared_types::UserappEnv,
         app_id: &str,
         url: &str,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult>;
 
-    /// 列出文件（app 根或其子目录 code/data/logs；subpath=None 列 app 根）
-    async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> AppResult<Vec<FileInfo>>;
+    /// 列出文件（app 根或其子目录 code/data/logs；subpath=None 列 app 根。
+    /// dev 环境根基准为开发容器 workspace 根）
+    async fn list_files(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+        subpath: Option<&str>,
+    ) -> AppResult<Vec<FileInfo>>;
 
     /// 删除文件（app 根相对路径，可指向 code/data/logs 下任意文件）
-    async fn delete_file(&self, app_id: &str, file_path: &str) -> AppResult<()>;
+    async fn delete_file(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+        file_path: &str,
+    ) -> AppResult<()>;
 }

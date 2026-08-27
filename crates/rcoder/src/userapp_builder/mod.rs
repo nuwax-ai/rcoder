@@ -7,8 +7,10 @@
 //! rcoder 不再做发布任务编排（旧 publish 任务体系已随 `/api/v1/userapp/publish` 接口族删除）。
 
 mod dev_cleanup;
+mod dev_locator;
 
 pub use dev_cleanup::UserappDevResourcesCleanup;
+pub use dev_locator::UserappDevLocator;
 
 use std::sync::Arc;
 
