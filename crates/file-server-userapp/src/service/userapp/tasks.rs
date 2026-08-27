@@ -55,7 +55,6 @@ pub enum BuildTaskStatus {
 
 /// 任务快照(GET /tasks/{id} 返回)。
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct BuildTaskSnapshot {
     pub id: BuildTaskId,
     pub app_id: String,
@@ -67,7 +66,7 @@ pub struct BuildTaskSnapshot {
     pub sha256: Option<String>,
     pub size_bytes: Option<u64>,
     pub file_name: Option<String>,
-    /// 相对 workspace 根的产物路径(`builds/workspace-package-{releaseId}.zip`)——
+    /// 相对 workspace 根的产物路径(`builds/workspace-package-{release_id}.zip`)——
     /// 任务创建时预生成(pending 期即有值),Java 取包 URL 直接拼段。
     pub artifact_path: Option<String>,
     pub error: Option<String>,

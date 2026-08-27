@@ -31,7 +31,6 @@ use file_server::workspace::resolve_userapp_dev;
 
 #[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct UserappEnsureWorkspaceBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -45,7 +44,6 @@ pub(crate) struct UserappEnsureWorkspaceBody {
 
 /// ensure-workspace 响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct UserappEnsureWorkspaceData {
     /// 建好的 workspace 绝对路径（容器内视角，`{USERAPP_WORKSPACE_DIR}/{appId}`）
     pub workspace: String,

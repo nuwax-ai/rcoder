@@ -1,5 +1,5 @@
 //! `GET|OPTIONS /api/v1/userapp/static/{app_id}`——按 app 直下构建整体包
-//!（缺省最新产物，可选 `?releaseId=` 按版本精确定位）。
+//!（缺省最新产物，可选 `?release_id=` 按版本精确定位）。
 
 use std::path::Path;
 
@@ -19,10 +19,9 @@ use file_server::extract::AppQuery;
 /// 时按 Path extractor 推断 in（会把 query 字段误标 path——swagger 对接即错），
 /// 容器级显式声明优先于自动推断。
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[serde(rename_all = "camelCase")]
 #[into_params(parameter_in = Query)]
 pub struct StaticQuery {
-    /// 可选：按 release_id 精确取包（定位 `builds/workspace-package-{releaseId}.zip`）。
+    /// 可选：按 release_id 精确取包（定位 `builds/workspace-package-{release_id}.zip`）。
     /// 缺省 = 最新产物。release_id 只允许字母数字与连字符（服务端生成的 UUID 形态），
     /// 其余字符一律拒绝（防路径注入）；指定的版本不存在时 404。
     #[serde(default)]
@@ -31,12 +30,12 @@ pub struct StaticQuery {
 
 /// 下载构建整体包
 ///
-/// 缺省最新，`?releaseId=` 指定版本。
+/// 缺省最新，`?release_id=` 指定版本。
 /// 调用方只按 app 定位（产物就是每次构建出的一个整体 zip，无需传文件路径）：
-/// - 不带 `releaseId`：服务端在 `{ws}/builds/` 下选 `workspace-package-*.zip`
+/// - 不带 `release_id`：服务端在 `{ws}/builds/` 下选 `workspace-package-*.zip`
 ///   文件名字典序最大者——文件名含 UUIDv7（时间有序），字典序最大即最新构建产物；
 ///   zip 写入经 part+rename 原子落盘（见 assemble），目录内不存在半截文件。
-/// - 带 `releaseId`：精确定位该版本的产物文件（回滚/比对指定版本用）。
+/// - 带 `release_id`：精确定位该版本的产物文件（回滚/比对指定版本用）。
 ///
 /// `app_id` 定位走 UserApp 开发卷（`resolve_userapp_dev`，与 build/detect/confirm 同根）。
 /// 用 COMPUTER_CORS（暴露 Range/Content-Range，支持大产物断点续传）。
@@ -48,8 +47,8 @@ pub struct StaticQuery {
         StaticQuery,
     ),
     responses(
-        (status = 200, description = "Build artifact zip（缺省最新产物；?releaseId= 指定版本）", body = file_server::openapi::BinaryFile, content_type = "application/zip"),
-        (status = 404, description = "无产物，或 ?releaseId= 指定的版本不存在（含非法字符被拒）")
+        (status = 200, description = "Build artifact zip（缺省最新产物；?release_id= 指定版本）", body = file_server::openapi::BinaryFile, content_type = "application/zip"),
+        (status = 404, description = "无产物，或 ?release_id= 指定的版本不存在（含非法字符被拒）")
     ),
     tag = "UserApp · 开发与构建"
 )]
@@ -66,7 +65,7 @@ pub async fn serve_userapp(
         Ok(root) => root,
         Err(error) => return error.into_response(),
     };
-    // 空串视同未传（保持"最新产物"语义，避免 ?releaseId= 误触 404）
+    // 空串视同未传（保持"最新产物"语义，避免 ?release_id= 误触 404）
     let release_id = q
         .release_id
         .as_deref()

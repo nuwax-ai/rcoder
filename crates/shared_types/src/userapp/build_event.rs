@@ -3,15 +3,15 @@
 //! 历史:file-server 定义、rcoder 以字符串键(`event`/`release_id`/`error`)重复解析,
 //! 字段重命名会静默断链。统一到此模块,两端共用同一类型,消除漂移。
 //!
-//! wire casing 统一 camelCase(tag 值 + 字段)。修掉原来 serde 意外的混合
-//! (容器 rename_all 只作用于 tag,struct-variant 字段是 snake_case)。每个 struct variant
-//! 显式 `#[serde(rename_all = "camelCase")]` 让字段也驼峰化。
+//! wire casing 统一 snake_case(tag 值 + 字段)——userApp Java 契约全 snake 定案,
+//! 且 tag 值与 SSE `event:` 名(build_ok/build_fail)一致,消费端只记一套事件名。
+//! variant 字段本就是 snake_case Rust 命名,无需逐 variant 附加属性。
 
 use serde::{Deserialize, Serialize};
 
 /// build 进度事件(file-server 经 SSE 发送,rcoder 接收)。`tag = "event"` 内部标签枚举。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
-#[serde(tag = "event", rename_all = "camelCase")]
+#[serde(tag = "event", rename_all = "snake_case")]
 pub enum BuildProgressEvent {
     /// 进入新阶段
     Stage { stage: String },
@@ -20,15 +20,12 @@ pub enum BuildProgressEvent {
     /// 某服务编译成功
     BuildOk { service: String },
     /// 某服务编译失败
-    #[serde(rename_all = "camelCase")]
     BuildFail { service: String, error: String },
     /// 一行日志(实时 tail)
-    #[serde(rename_all = "camelCase")]
     Log { service: String, line: String },
     /// 任务完成(build 产 release_id + 包摘要)。`artifact_path` 为相对 workspace
-    /// 根的产物路径（`builds/workspace-package-{releaseId}.zip`）——信息字段，
-    /// 取包按 app 直下 `/api/v1/userapp/static/{appId}`（服务端选最新产物）。
-    #[serde(rename_all = "camelCase")]
+    /// 根的产物路径（`builds/workspace-package-{release_id}.zip`）——信息字段，
+    /// 取包按 app 直下 `/api/v1/userapp/static/{app_id}`（服务端选最新产物）。
     Completed {
         release_id: String,
         sha256: String,
@@ -46,9 +43,10 @@ pub enum BuildProgressEvent {
 mod tests {
     use super::*;
 
-    /// wire 全 camelCase:tag 值(buildOk)+ 字段(releaseId/sizeBytes/fileName/artifactPath)。
+    /// wire 全 snake_case:tag 值(build_ok/build_fail)+ 字段(release_id/size_bytes/file_name/artifact_path)。
+    /// tag 与 SSE `event:` 名一致——消费端只记一套事件名。
     #[test]
-    fn completed_event_serializes_all_camel_case() {
+    fn completed_event_serializes_all_snake_case() {
         let ev = BuildProgressEvent::Completed {
             release_id: "r1".into(),
             sha256: "abc".into(),
@@ -59,27 +57,27 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(
             json.contains(r#""event":"completed""#),
-            "tag camelCase: {json}"
+            "tag snake_case: {json}"
         );
         assert!(
-            json.contains(r#""releaseId":"r1""#),
-            "releaseId camelCase: {json}"
+            json.contains(r#""release_id":"r1""#),
+            "release_id snake_case: {json}"
         );
         assert!(
-            json.contains(r#""sizeBytes":1024"#),
-            "sizeBytes camelCase: {json}"
+            json.contains(r#""size_bytes":1024"#),
+            "size_bytes snake_case: {json}"
         );
         assert!(
-            json.contains(r#""fileName":"r1.zip""#),
-            "fileName camelCase: {json}"
+            json.contains(r#""file_name":"r1.zip""#),
+            "file_name snake_case: {json}"
         );
         assert!(
             json.contains(r#""sha256":"abc""#),
             "sha256 unchanged: {json}"
         );
         assert!(
-            json.contains(r#""artifactPath":"builds/r1.zip""#),
-            "artifactPath camelCase: {json}"
+            json.contains(r#""artifact_path":"builds/r1.zip""#),
+            "artifact_path snake_case: {json}"
         );
         // round-trip
         let back: BuildProgressEvent = serde_json::from_str(&json).unwrap();
@@ -87,15 +85,15 @@ mod tests {
     }
 
     #[test]
-    fn build_fail_tag_is_camel_case() {
+    fn build_fail_tag_is_snake_case() {
         let ev = BuildProgressEvent::BuildFail {
             service: "web".into(),
             error: "boom".into(),
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(
-            json.contains(r#""event":"buildFail""#),
-            "tag buildFail: {json}"
+            json.contains(r#""event":"build_fail""#),
+            "tag build_fail: {json}"
         );
         let back: BuildProgressEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);

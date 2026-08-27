@@ -7,7 +7,9 @@
 //! 开发容器 = `{ws}/{app_id}`（对称可用，虽然 app_manager 只对生产容器转发）。
 //!
 //! 与 userapp_files.rs（Java 15 镜像族）的区别：本族是 rcoder↔file-server 的内部
-//! 契约（字段直传、响应形状对齐 app_manager DTO），不经 Java。
+//! 契约（字段直传、响应形状对齐 app_manager DTO），不经 Java。请求键 snake_case；
+//! appId/userId 双键兼容（serde alias + multipart 双臂）是过渡措施——存量容器
+//! digest 烙印不换镜像，rcoder 双写两键直到存量换代后清理。
 
 use axum::Json;
 use axum::extract::{Multipart, Query, State};
@@ -27,11 +29,10 @@ use download_utils::{
 };
 use tokio_util::sync::CancellationToken;
 
-// ── 上传（multipart: appId / target / flatten / file）────────────────────────────
+// ── 上传（multipart: app_id / target / flatten / file；appId/userId 双键过渡）─────
 
 #[allow(dead_code, reason = "OpenAPI-only multipart schema")]
 #[derive(utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct AppFilesUploadForm {
     /// UserApp 应用 ID（定位 = resolve_userapp_dev；单 app 模式须与归属一致）
     pub app_id: String,
@@ -66,8 +67,9 @@ pub(crate) async fn upload(
         .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
     {
         match field.name().unwrap_or("") {
-            "appId" => app_id = Some(text_field(field).await?),
-            "userId" => user_id = Some(text_field(field).await?),
+            // 双键过渡：新 rcoder 发 snake，旧容器/新容器互通期间 camel 别名保留
+            "app_id" | "appId" => app_id = Some(text_field(field).await?),
+            "user_id" | "userId" => user_id = Some(text_field(field).await?),
             "target" => target = Some(text_field(field).await?),
             "flatten" => flatten = matches!(text_field(field).await?.trim(), "true" | "1" | "yes"),
             "file" => {
@@ -83,13 +85,16 @@ pub(crate) async fn upload(
             _ => {}
         }
     }
-    let app_id = require_app_field(app_id, "appId")?;
-    let user_id = require_app_field(user_id, "userId")?;
+    let app_id = require_app_field(app_id, "app_id")?;
+    // user_id 仅审计（调用方 rcoder 转发链不携带——内部契约不要求），带到则日志留痕
+    let user_id = user_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let target = require_app_field(target, "target")?;
     let data = data.ok_or_else(|| AppError::validation("file is required"))?;
     let root = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     let result = upload_impl(&root, &target, flatten, data.path(), data.size()).await?;
-    info!(app_id = %app_id, user_id = %user_id, target = %target, "app-files upload done");
+    info!(app_id = %app_id, user_id = user_id.as_deref().unwrap_or(""), target = %target, "app-files upload done");
     Ok(Json(json!({
         "success": true,
         "file_path": result.file_path,
@@ -176,7 +181,6 @@ async fn upload_impl(
 // ── upload-from-url（json）───────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct AppFilesUploadFromUrlBody {
     /// 制品/文件下载地址（HTTP(S)）
     pub url: String,
@@ -185,11 +189,13 @@ pub struct AppFilesUploadFromUrlBody {
     /// 压缩包解压后单层归一（默认 false）
     #[serde(default)]
     pub flatten: bool,
-    /// UserApp 应用 ID（定位）
+    /// UserApp 应用 ID（定位）。camel 别名为旧 rcoder 过渡兼容，存量容器换代后清理。
+    #[serde(alias = "appId")]
     pub app_id: String,
-    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
-    /// 侧仅日志审计，不参与容器内定位）
-    pub user_id: String,
+    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带；9252a29 曾改必填造成
+    /// rcoder 转发 422 断链，回退为可选审计字段）。camel 别名同上。
+    #[serde(default, alias = "userId")]
+    pub user_id: Option<String>,
 }
 
 /// 容器内流式下载后走上传核心
@@ -215,7 +221,7 @@ pub(crate) async fn upload_from_url(
         .map(|m| m.len())
         .map_err(|e| AppError::system(format!("stat downloaded file: {e}")))?;
     let result = upload_impl(&root, &body.target, body.flatten, tmp.path(), size).await?;
-    info!(app_id = %body.app_id, user_id = %body.user_id, url = %body.url, "app-files upload-from-url done");
+    info!(app_id = %body.app_id, user_id = body.user_id.as_deref().unwrap_or(""), url = %body.url, "app-files upload-from-url done");
     Ok(Json(json!({
         "success": true,
         "file_path": result.file_path,
@@ -228,13 +234,13 @@ pub(crate) async fn upload_from_url(
 // ── 列表（GET ?path=）───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[serde(rename_all = "camelCase")]
 pub struct AppFilesListParams {
-    /// UserApp 应用 ID（定位）
+    /// UserApp 应用 ID（定位）。camel 别名为旧 rcoder 过渡兼容，存量容器换代后清理。
+    #[serde(alias = "appId")]
     pub app_id: String,
-    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
-    /// 侧仅审计，不参与容器内定位）
-    pub user_id: String,
+    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。camel 别名同上。
+    #[serde(default, alias = "userId")]
+    pub user_id: Option<String>,
     /// app 根相对子目录（缺省列根）
     #[serde(default)]
     pub path: Option<String>,
@@ -252,7 +258,7 @@ pub(crate) async fn list(
     State(state): State<UserAppState>,
     Query(params): Query<AppFilesListParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    tracing::debug!(app_id = %params.app_id, user_id = %params.user_id, "app-files list");
+    tracing::debug!(app_id = %params.app_id, user_id = params.user_id.as_deref().unwrap_or(""), "app-files list");
     let root = resolve_userapp_dev(&params.app_id, None, &state.fs.config)?;
     if !root.exists() {
         return Ok(Json(json!({"success": true, "files": []})));
@@ -309,13 +315,13 @@ pub(crate) async fn list(
 // ── 删除（json {path}）──────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct AppFilesDeleteBody {
-    /// UserApp 应用 ID（定位）
+    /// UserApp 应用 ID（定位）。camel 别名为旧 rcoder 过渡兼容，存量容器换代后清理。
+    #[serde(alias = "appId")]
     pub app_id: String,
-    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
-    /// 侧仅日志审计，不参与容器内定位）
-    pub user_id: String,
+    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。camel 别名同上。
+    #[serde(default, alias = "userId")]
+    pub user_id: Option<String>,
     /// app 根相对文件/目录
     pub path: String,
 }
@@ -326,7 +332,7 @@ pub(crate) async fn delete(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesDeleteBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    info!(app_id = %body.app_id, user_id = %body.user_id, path = %body.path, "app-files delete");
+    info!(app_id = %body.app_id, user_id = body.user_id.as_deref().unwrap_or(""), path = %body.path, "app-files delete");
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
     if !root.exists() {
         return Err(AppError::resource(format!(

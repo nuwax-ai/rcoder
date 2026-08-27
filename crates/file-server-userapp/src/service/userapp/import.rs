@@ -7,7 +7,6 @@ use serde::Serialize;
 use file_server::error::{AppError, AppResult};
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct DetectionResult {
     pub project_dir: String,
     pub detected_type: String,
@@ -19,7 +18,7 @@ pub struct DetectionResult {
 pub async fn detect_project(workspace: &Path, project_dir: &str) -> AppResult<DetectionResult> {
     validate_project_dir(project_dir)?;
     let project = file_server::path_safety::ensure_within(workspace, project_dir)
-        .map_err(|_| AppError::validation("projectDir escapes workspace"))?;
+        .map_err(|_| AppError::validation("project_dir escapes workspace"))?;
     if !project.is_dir() {
         return Err(AppError::resource(format!(
             "import project directory not found: {project_dir}"
@@ -80,7 +79,7 @@ format = "{log_format}"
 pub async fn confirm_project(workspace: &Path, project_dir: &str) -> AppResult<String> {
     validate_project_dir(project_dir)?;
     let project = file_server::path_safety::ensure_within(workspace, project_dir)
-        .map_err(|_| AppError::validation("projectDir escapes workspace"))?;
+        .map_err(|_| AppError::validation("project_dir escapes workspace"))?;
     let draft = project.join("project.manifest.draft.toml");
     let content = tokio::fs::read_to_string(&draft)
         .await
@@ -167,7 +166,7 @@ fn normalize_service_id(project_dir: &str) -> AppResult<String> {
     let name = Path::new(project_dir)
         .file_name()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| AppError::validation("projectDir must have a UTF-8 directory name"))?;
+        .ok_or_else(|| AppError::validation("project_dir must have a UTF-8 directory name"))?;
     let normalized = name
         .to_ascii_lowercase()
         .chars()
@@ -183,7 +182,7 @@ fn normalize_service_id(project_dir: &str) -> AppResult<String> {
         .to_owned();
     if normalized.is_empty() || normalized.len() > 63 {
         return Err(AppError::validation(
-            "cannot derive a DNS-1123 service_id from projectDir",
+            "cannot derive a DNS-1123 service_id from project_dir",
         ));
     }
     Ok(normalized)
@@ -195,7 +194,7 @@ fn validate_project_dir(project_dir: &str) -> AppResult<()> {
         || components.next().is_some()
     {
         return Err(AppError::validation(
-            "projectDir must name exactly one workspace-level child directory",
+            "project_dir must name exactly one workspace-level child directory",
         ));
     }
     Ok(())

@@ -1,9 +1,9 @@
-//! `/api/v1/userapp/dev/*`: UserApp 开发阶段的服务生命周期 + 开发编译（新契约, appId 唯一 key）。
+//! `/api/v1/userapp/dev/*`: UserApp 开发阶段的服务生命周期 + 开发编译（新契约, app_id 唯一 key）。
 //!
 //! 复用 file-server 的 DevServerManager（进程/端口池/探活/日志）与 build 流水线,
-//! 进程 key 用 `userapp:{appId}` 前缀与 web 项目的 projectId 空间隔离
-//! （appId≡project_id 同值时, web 项目 workspace 在 project 树 / UserApp 在开发卷,
-//! 同 key 会互踩路径）; 对外响应一律剥前缀回 appId。
+//! 进程 key 用 `userapp:{app_id}` 前缀与 web 项目的 projectId 空间隔离
+//! （app_id≡project_id 同值时, web 项目 workspace 在 project 树 / UserApp 在开发卷,
+//! 同 key 会互踩路径）; 对外响应一律剥前缀回 app_id。
 //!
 //! 响应格式：JSON 接口统一 `shared_types::HttpResult` 信封
 //! （`{code, message, data, tid, success}`，经 `UserAppReply` 包装，与 build 域一致）；
@@ -28,7 +28,7 @@ fn dev_key(app_id: &str) -> String {
     format!("userapp:{app_id}")
 }
 
-/// key → 对外 appId（非本域 key 返回 None）。
+/// key → 对外 app_id（非本域 key 返回 None）。
 fn app_id_of_key(key: &str) -> Option<&str> {
     key.strip_prefix("userapp:")
 }
@@ -37,11 +37,10 @@ fn app_id_of_key(key: &str) -> Option<&str> {
 
 #[derive(Deserialize, Validate, utoipa::ToSchema)]
 #[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct DevOpBody {
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     #[serde(deserialize_with = "file_server::extract::deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -59,9 +58,8 @@ pub(crate) struct DevOpBody {
 
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct DevLogsQuery {
-    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）
+    /// UserApp 应用 ID（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{app_id}`）
     pub app_id: String,
     /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；
     /// file-server 侧不参与容器内定位）
@@ -81,20 +79,18 @@ fn default_start_index() -> usize {
 
 /// dev/stop 响应 data（POST /dev/stop）。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct UserappDevStopped {
     /// 停止结果消息（"Stopped" / "No running process found" / "Partially stopped but continue execution"）
     pub message: String,
     /// 应用 ID
     pub app_id: String,
-    /// 被停进程 ID（按 appId 定位进程组，无需 pid，恒为 null）
+    /// 被停进程 ID（按 app_id 定位进程组，无需 pid，恒为 null）
     pub pid: Option<u32>,
     /// 被杀进程 PID 明细（killed 标记是否杀灭成功）
     pub killed_pids: Vec<KilledPid>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct UserappDevProcess {
     /// 应用 ID
     pub app_id: String,
@@ -107,7 +103,6 @@ pub(crate) struct UserappDevProcess {
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct UserappDevList {
     /// 在跑的 UserApp 开发服务列表（不含 web/computer 项目进程）
     pub list: Vec<UserappDevProcess>,
@@ -117,11 +112,11 @@ pub(crate) struct UserappDevList {
 
 /// 编译并启动 dev 服务
 ///
-/// 异步任务：编译可能数分钟，受理即返 taskId。manifest 同核编译（与生产构建同核，dev 编译通过=可部署）
+/// 异步任务：编译可能数分钟，受理即返 task_id。manifest 同核编译（与生产构建同核，dev 编译通过=可部署）
 /// 成功后启动 dev 服务（UserApp workspace = spawn app-cli 按 manifest
 /// run.command 编排全栈，pingap 9080 统一入口）；编译失败任务终态 Failed、
-/// 不启动。进度/结果：轮询 `GET /api/v1/userapp/tasks/{taskId}`、SSE
-/// `/api/v1/userapp/tasks/{taskId}/logs/stream`；终态后端口经
+/// 不启动。进度/结果：轮询 `GET /api/v1/userapp/tasks/{task_id}`、SSE
+/// `/api/v1/userapp/tasks/{task_id}/logs/stream`；终态后端口经
 /// `GET /api/v1/userapp/dev/list` 查询（UserApp workspace 恒为 pingap 9080）。
 /// 入参 basePath 对 UserApp workspace（manifest/app-cli 引擎）**无效**
 /// ——pingap 路由前缀由各服务 project.manifest.toml `[proxy].path` 决定。
@@ -129,7 +124,7 @@ pub(crate) struct UserappDevList {
     post,
     path = "/dev/start",
     request_body = DevOpBody,
-    responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "启动任务已创建（taskId）")),
+    responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "启动任务已创建（task_id）")),
     tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn dev_start(
@@ -157,7 +152,7 @@ pub(crate) async fn dev_start(
 
 /// 停止开发服务
 ///
-/// 按 appId 定位进程组，无需 pid。
+/// 按 app_id 定位进程组，无需 pid。
 /// **联动取消该 app 在途的 start/restart 任务**——否则编译中的任务会在
 /// 编译完成后把刚停的服务重新拉起（停止意图被异步任务推翻）。
 #[utoipa::path(
@@ -207,7 +202,7 @@ pub(crate) async fn dev_stop(
 
 /// 编译并重启 dev 服务
 ///
-/// agent 改完代码后的开发闭环——**重启前必须先编译**，新代码才生效；异步任务立即返 taskId，编译
+/// agent 改完代码后的开发闭环——**重启前必须先编译**，新代码才生效；异步任务立即返 task_id，编译
 /// 可能数分钟。manifest 同核编译成功后 stop + start（app-cli 重拉全栈）；
 /// 编译失败任务终态 Failed、旧服务原样保留（可继续用旧版本测试，不因
 /// 中间态断流）。进度/结果查询同 start。入参 basePath 对 UserApp
@@ -216,7 +211,7 @@ pub(crate) async fn dev_stop(
     post,
     path = "/dev/restart",
     request_body = DevOpBody,
-    responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "重启任务已创建（taskId）")),
+    responses((status = 200, body = HttpResult<UserappDevTaskCreated>, description = "重启任务已创建（task_id）")),
     tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn dev_restart(
@@ -243,15 +238,14 @@ pub(crate) async fn dev_restart(
 }
 
 /// dev 异步任务受理响应 data（POST /dev/start、/dev/restart——编译+启停）。
-/// camelCase 对齐 BuildCreatedData（Java 同一消费面）。
+/// 字段 snake_case 对齐 BuildCreatedData（Java 同一消费面）。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct UserappDevTaskCreated {
     /// 应用 ID
     pub app_id: String,
-    /// 异步任务 ID（轮询 /api/v1/userapp/tasks/{taskId}、SSE /api/v1/userapp/tasks/{taskId}/logs/stream）
+    /// 异步任务 ID（轮询 /api/v1/userapp/tasks/{task_id}、SSE /api/v1/userapp/tasks/{task_id}/logs/stream）
     pub task_id: String,
-    /// 受理时状态（恒为 pending——后台任务已创建；与 /tasks/{taskId} 轮询共用
+    /// 受理时状态（恒为 pending——后台任务已创建；与 /tasks/{task_id} 轮询共用
     /// BuildTaskStatus 状态机，序列化值 "pending"）
     pub status: BuildTaskStatus,
 }
@@ -281,7 +275,7 @@ async fn spawn_dev_task(
         .await
         .map_err(|e| AppError::business(e.to_string()))?;
     // release_id 预生成（与 start_build_task 对称）：快照 pending 期即有确定性
-    // artifactPath；build_workspace_package 同核产出制品 zip 落同一路径。
+    // artifact_path；build_workspace_package 同核产出制品 zip 落同一路径。
     let release_id = uuid::Uuid::now_v7().simple().to_string();
     let artifact_rel_path = crate::service::userapp::workspace_artifact_rel_path(&release_id);
     task.set_artifact_path(release_id.clone(), artifact_rel_path.clone())
@@ -365,7 +359,7 @@ async fn spawn_dev_task(
                 task_clone
                     .emit(shared_types::BuildProgressEvent::Completed {
                         // dev 任务消费方按 status/端口（dev/list）取结果；制品字段
-                        // 仍带真实值（同核编译产出制品 zip，artifactPath 可用于
+                        // 仍带真实值（同核编译产出制品 zip，artifact_path 可用于
                         // 手动取包校验）。快速路径（跳过编译）时制品不存在，
                         // 该路径仅是预期值。
                         release_id: release_id.clone(),
@@ -452,7 +446,7 @@ pub(crate) async fn dev_logs(
 mod tests {
     use super::*;
 
-    /// key 前缀隔离: appId → userapp:{appId}; 仅识别本域 key。
+    /// key 前缀隔离: app_id → userapp:{app_id}; 仅识别本域 key。
     #[test]
     fn dev_key_roundtrip_and_filtering() {
         assert_eq!(dev_key("my-app"), "userapp:my-app");

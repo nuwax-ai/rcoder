@@ -36,14 +36,14 @@ use tasks::{BuildProgressEvent, BuildTask, BuildTaskId, BuildTaskKind, BuildTask
 pub(crate) use tasks::BuildTask as UserappBuildTask;
 
 /// 整体包产物文件名前缀（产物落 `{ws}/builds/` 子目录，见 [`WORKSPACE_BUILDS_DIR`]；
-/// `GET /api/v1/userapp/static/{appId}` 按 app 直下取包——缺省最新，`?releaseId=` 指定版本）。
+/// `GET /api/v1/userapp/static/{app_id}` 按 app 直下取包——缺省最新，`?release_id=` 指定版本）。
 pub const WORKSPACE_PACKAGE_PREFIX: &str = "workspace-package-";
 
 /// workspace 内的构建产物目录（整体包落 `{ws}/builds/`；模板 .gitignore 忽略）。
 pub const WORKSPACE_BUILDS_DIR: &str = "builds";
 
 /// 拼 workspace 相对产物路径（`builds/workspace-package-{release_id}.zip`）——
-/// build 创建响应/任务快照/Completed 事件的 `artifactPath` 同源。
+/// build 创建响应/任务快照/Completed 事件的 `artifact_path` 同源。
 pub fn workspace_artifact_rel_path(release_id: &str) -> String {
     format!("{WORKSPACE_BUILDS_DIR}/{WORKSPACE_PACKAGE_PREFIX}{release_id}.zip")
 }
@@ -54,8 +54,8 @@ pub struct WorkspaceBuildArtifact {
     /// 产物绝对路径（`{ws}/builds/{file_name}`）。
     pub path: PathBuf,
     /// 相对 workspace 根的产物路径（`builds/{file_name}`）——快照/事件的
-    /// `artifactPath` 信息字段（取包走 `/api/v1/userapp/static/{appId}`，带
-    /// `?releaseId={release_id}` 精确取本版本）。
+    /// `artifact_path` 信息字段（取包走 `/api/v1/userapp/static/{app_id}`，带
+    /// `?release_id={release_id}` 精确取本版本）。
     pub rel_path: String,
     pub file_name: String,
     pub sha256: String,
@@ -229,7 +229,7 @@ pub async fn build_workspace_package(
     })
 }
 
-/// 异步发起 build 任务（不阻塞，立即返 taskId + 预生成的产物相对路径）。进度事件
+/// 异步发起 build 任务（不阻塞，立即返 task_id + 预生成的产物相对路径）。进度事件
 /// 经 task 流出（SSE/轮询）。
 ///
 /// 同 app_id 互斥由 `build_workspace_package` 最外层 `try_start(app_id)` 持有的
@@ -251,7 +251,7 @@ pub async fn start_build_task(
         .create(app_id.clone(), BuildTaskKind::Build)
         .await
         .map_err(|e| AppError::business(e.to_string()))?;
-    // release_id 预生成并预置进快照：创建响应（BuildCreatedData.artifactPath）与
+    // release_id 预生成并预置进快照：创建响应（BuildCreatedData.artifact_path）与
     // pending 期轮询即可见确定性产物路径；build_workspace_package 消费同一值,
     // Completed 事件携带一致路径覆盖（两处同源）。
     let release_id = uuid::Uuid::now_v7().simple().to_string();

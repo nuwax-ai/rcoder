@@ -4,12 +4,12 @@
 //! SSE（logs/stream）与静态文件（static）为特殊通道，不包 HttpResult。
 //!
 //! 异步编译/发布（task 10-12）：
-//! - `POST /build`：workspace 多项目打包（异步：返 taskId，进度经 task 流出）。
-//! - `GET  /tasks/{taskId}`：查任务状态快照（轮询通道）。
-//! - `GET  /tasks/{taskId}/logs`：查构建日志（分页，复用 `read_dev_log`）。
-//! - `GET  /tasks/{taskId}/logs/stream`：任务进度 SSE（实时通道，进度事件推送）。
-//! - `POST /tasks/{taskId}/cancel`：取消进行中的编译任务（软取消 + kill 进程组）。
-//! - `GET  /static/{app_id}`：按 app 直下构建整体包（缺省最新；`?releaseId=` 指定版本）。
+//! - `POST /build`：workspace 多项目打包（异步：返 task_id，进度经 task 流出）。
+//! - `GET  /tasks/{task_id}`：查任务状态快照（轮询通道）。
+//! - `GET  /tasks/{task_id}/logs`：查构建日志（分页，复用 `read_dev_log`）。
+//! - `GET  /tasks/{task_id}/logs/stream`：任务进度 SSE（实时通道，进度事件推送）。
+//! - `POST /tasks/{task_id}/cancel`：取消进行中的编译任务（软取消 + kill 进程组）。
+//! - `GET  /static/{app_id}`：按 app 直下构建整体包（缺省最新；`?release_id=` 指定版本）。
 //!
 //! 详见 `docs/application-management-service-v2-design.md` §5。
 
@@ -88,23 +88,21 @@ pub(crate) fn reply<T>(r: AppResult<T>) -> UserAppReply<T> {
 
 /// build 响应 data（POST /build）。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct BuildCreatedData {
-    /// 构建任务 ID（轮询 /tasks/{taskId} 与 SSE 订阅用）
+    /// 构建任务 ID（轮询 /tasks/{task_id} 与 SSE 订阅用）
     pub task_id: String,
-    /// 受理时状态（恒为 pending——异步任务已创建；与 /tasks/{taskId} 轮询共用
+    /// 受理时状态（恒为 pending——异步任务已创建；与 /tasks/{task_id} 轮询共用
     /// BuildTaskStatus 状态机，序列化值 "pending"）
     pub status: BuildTaskStatus,
-    /// 预生成的产物相对路径（`builds/workspace-package-{releaseId}.zip`，release_id
+    /// 预生成的产物相对路径（`builds/workspace-package-{release_id}.zip`，release_id
     /// 创建时即生成）——信息字段：标识本次构建的产物位置；实际取包按 app 直下
-    /// `GET /api/v1/userapp/static/{appId}`（缺省最新产物；带 `?releaseId=` 精确
+    /// `GET /api/v1/userapp/static/{app_id}`（缺省最新产物；带 `?release_id=` 精确
     /// 取本版本，回滚/比对指定版本用）。
     pub artifact_path: String,
 }
 
 /// cancel 响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct CancelData {
     /// 被取消的任务 ID
     pub task_id: String,
@@ -116,14 +114,12 @@ pub(crate) struct CancelData {
 
 /// detect 响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct DetectData {
     pub detection: userapp::import::DetectionResult,
 }
 
 /// confirm 响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct ConfirmData {
     pub path: String,
 }
@@ -131,7 +127,6 @@ pub(crate) struct ConfirmData {
 /// `POST /api/v1/userapp/build` 请求体。
 #[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
 #[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct BuildUserAppBody {
     /// UserApp 标识（workspace 定位 = `{USERAPP_WORKSPACE_DIR}/{appId}`）。
     #[serde(deserialize_with = "deserialize_id_string")]
@@ -146,7 +141,6 @@ pub(crate) struct BuildUserAppBody {
 
 #[derive(Debug, Deserialize, Validate, utoipa::ToSchema)]
 #[garde(allow_unvalidated)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct ImportProjectBody {
     #[serde(deserialize_with = "deserialize_id_string")]
     #[garde(custom(file_server::validation_rules::not_blank))]
@@ -161,12 +155,11 @@ pub(crate) struct ImportProjectBody {
     pub project_dir: String,
 }
 
-/// 任务构建日志查询参数（`GET /tasks/{taskId}/logs`）。
+/// 任务构建日志查询参数（`GET /tasks/{task_id}/logs`）。
 ///
 /// `parameter_in` 必须显式声明：utoipa-axum 自动发现会按 Path extractor 把
 /// query 字段误标 path（swagger 对接即错），显式声明优先。
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[serde(rename_all = "camelCase")]
 #[into_params(parameter_in = Query)]
 pub(crate) struct TaskLogsQuery {
     /// 子项目目录名（= service_id）；留空读 workspace 根日志目录。
@@ -181,12 +174,11 @@ fn default_start_index() -> usize {
     1
 }
 
-/// SSE 订阅参数（`GET /tasks/{taskId}/logs/stream`）。
+/// SSE 订阅参数（`GET /tasks/{task_id}/logs/stream`）。
 ///
 /// `parameter_in` 必须显式声明：utoipa-axum 自动发现会按 Path extractor 把
 /// query 字段误标 path（swagger 对接即错），显式声明优先。
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[serde(rename_all = "camelCase")]
 #[into_params(parameter_in = Query)]
 pub(crate) struct StreamQuery {
     /// 从哪个 seq 开始回放（含该 seq；0 = 从头）。仅作兜底——
@@ -195,10 +187,10 @@ pub(crate) struct StreamQuery {
     pub from_seq: u64,
 }
 
-/// 解析 SSE 续传游标：`Last-Event-ID` 头优先，`?fromSeq=` query 兜底。
+/// 解析 SSE 续传游标：`Last-Event-ID` 头优先，`?from_seq=` query 兜底。
 ///
 /// SSE 规范（WHATWG）语义：断线重连时 `Last-Event-ID` 头的值是客户端最后收到
-/// 事件的 `id:`，服务端应回放该 id **之后**的事件；而 `fromSeq` 是"从哪个 seq
+/// 事件的 `id:`，服务端应回放该 id **之后**的事件；而 `from_seq` 是"从哪个 seq
 /// 开始（含）"，故头值需 +1 换算。头存在但非数字时忽略头回退 query
 ///（EventSource 不会发非数字 id，此分支只有手写客户端会触发，info 留痕）。
 fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
@@ -208,7 +200,7 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
             Err(_) => {
                 tracing::info!(
                     raw,
-                    "Last-Event-ID header not numeric, fall back to fromSeq query"
+                    "Last-Event-ID header not numeric, fall back to from_seq query"
                 );
                 query_from_seq
             }
@@ -219,13 +211,13 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
 
 /// 发起 workspace 打包
 ///
-/// 异步任务：编译在后台 spawn 执行（`start_build_task`），受理即返 taskId；进度经 task 流出（轮询 `/tasks/{id}` +
+/// 异步任务：编译在后台 spawn 执行（`start_build_task`），受理即返 task_id；进度经 task 流出（轮询 `/tasks/{id}` +
 /// SSE `/tasks/{id}/logs/stream`）。同 app_id 排队由 `BuildManager` per-project 互斥保证。
 #[utoipa::path(
     post,
     path = "/build",
     request_body = BuildUserAppBody,
-    responses((status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 taskId（轮询/SSE 用）与 artifactPath（受理时即确定：builds/workspace-package-{releaseId}.zip，releaseId 预生成）+ status=pending。同 app_id 已有活跃任务时在队列排队（per-app 互斥）；全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{taskId} 或订阅 GET /tasks/{taskId}/logs/stream（SSE）；构建日志分页 GET /tasks/{taskId}/logs。")),
+    responses((status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有活跃任务时在队列排队（per-app 互斥）；全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE）；构建日志分页 GET /tasks/{task_id}/logs。")),
     tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn build_workspace(
@@ -260,7 +252,7 @@ pub(crate) async fn build_workspace(
     get,
     path = "/tasks/{task_id}",
     params(("task_id" = String, Path, description = "任务ID")),
-    responses((status = 200, body = HttpResult<BuildTaskSnapshot>, description = "任务状态快照（轮询通道，建议 2-3s 间隔）。关键字段：status（pending/running/completed/failed/cancelled——后三者为终态，到终态即可停止轮询）、currentService（正在编译的服务）、releaseId/sha256/sizeBytes/fileName/artifactPath（completed 时有值：产物摘要）、error（failed 时有值）、seq（事件游标 = 已推送事件数，恰为下一条事件的 seq；从轮询切 SSE 续传时可直接作 fromSeq 传，但勿直接作 Last-Event-ID 头——头语义是最后收到事件的 id，比本值小 1，直接用会漏一条事件）。终态快照保留 24h 供回查。")),
+    responses((status = 200, body = HttpResult<BuildTaskSnapshot>, description = "任务状态快照（轮询通道，建议 2-3s 间隔）。关键字段：status（pending/running/completed/failed/cancelled——后三者为终态，到终态即可停止轮询）、current_service（正在编译的服务）、release_id/sha256/size_bytes/file_name/artifact_path（completed 时有值：产物摘要）、error（failed 时有值）、seq（事件游标 = 已推送事件数，恰为下一条事件的 seq；从轮询切 SSE 续传时可直接作 from_seq 传，但勿直接作 Last-Event-ID 头——头语义是最后收到事件的 id，比本值小 1，直接用会漏一条事件）。终态快照保留 24h 供回查。")),
     tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn get_task(
@@ -285,7 +277,7 @@ pub(crate) async fn get_task(
     get,
     path = "/tasks/{task_id}/logs",
     params(("task_id" = String, Path, description = "任务ID"), TaskLogsQuery),
-    responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "构建日志分页（历史日志文件读取，非 SSE）。query：service=子项目目录名（留空=workspace 根日志）；startIndex=起始行号（1-based，用上批响应的 totalLines 翻页）。响应 data：logs[{line,content}]（行号+内容）、totalLines（总行数）、startIndex、logFileName。日志按天滚动（dev-YYYY-MM-DD.log），只读当前文件。")),
+    responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "构建日志分页（历史日志文件读取，非 SSE）。query：service=子项目目录名（留空=workspace 根日志）；start_index=起始行号（1-based，用上批响应的 total_lines 翻页）。响应 data：logs[{line,content}]（行号+内容）、total_lines（总行数）、start_index、log_file_name。日志按天滚动（dev-YYYY-MM-DD.log），只读当前文件。")),
     tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn get_task_logs(
@@ -334,13 +326,13 @@ pub(crate) async fn get_task_logs(
     path = "/tasks/{task_id}/logs/stream",
     params(
         ("task_id" = String, Path, description = "任务ID"),
-        ("Last-Event-ID" = Option<String>, Header, description = "SSE 规范续传头（优先）：断线重连时填最后收到事件的 id（即上一条消息的 seq），服务端从该 id 之后回放。浏览器 EventSource 自动重连会自动携带，无需手动处理。与 fromSeq 同时存在时以本头为准。"),
+        ("Last-Event-ID" = Option<String>, Header, description = "SSE 规范续传头（优先）：断线重连时填最后收到事件的 id（即上一条消息的 seq），服务端从该 id 之后回放。浏览器 EventSource 自动重连会自动携带，无需手动处理。与 from_seq 同时存在时以本头为准。"),
         StreamQuery,
     ),
     responses(
         (
             status = 200,
-            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 0 递增（首条事件 id:0）。断线续传两种方式（二选一）：① 请求带 `Last-Event-ID: <最后收到的seq>` 头（SSE 规范标准方式，浏览器 EventSource 自动重连自动携带，服务端从该 seq 之后回放）；② query `?fromSeq=<最后seq+1>`（从该 seq 开始含本身回放；头存在时被忽略）。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始编译某服务）\n- `build_ok` → `{'event':'buildOk','service':'...'}`（服务编译成功；注意 data 内 tag 为 camelCase）\n- `build_fail` → `{'event':'buildFail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','releaseId':'...','sha256':'...','sizeBytes':N,'fileName':'...','artifactPath':'builds/workspace-package-{releaseId}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端按上述任一方式带游标重连续传\n\n说明：构建日志经独立接口 `GET /tasks/{taskId}/logs` 分页查询，不走本流；`stage`/`log` 两种事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
+            description = "SSE 任务进度流。每条消息 `id:<seq>` + `event:<事件名>` + `data:<JSON>`；seq 从 0 递增（首条事件 id:0）。断线续传两种方式（二选一）：① 请求带 `Last-Event-ID: <最后收到的seq>` 头（SSE 规范标准方式，浏览器 EventSource 自动重连自动携带，服务端从该 seq 之后回放）；② query `?from_seq=<最后seq+1>`（从该 seq 开始含本身回放；头存在时被忽略）。\n\n事件清单（event 名 → data 载荷）：\n- `building` → `{'event':'building','service':'<服务ID>'}`（开始编译某服务）\n- `build_ok` → `{'event':'build_ok','service':'...'}`（服务编译成功）\n- `build_fail` → `{'event':'build_fail','service':'...','error':'...'}`\n- `completed`（终态）→ `{'event':'completed','release_id':'...','sha256':'...','size_bytes':N,'file_name':'...','artifact_path':'builds/workspace-package-{release_id}.zip'}`\n- `failed`（终态）→ `{'event':'failed','error':'...'}`\n- `cancelled`（终态）→ `{'event':'cancelled'}`\n- `stream_lagged`（协议事件）→ `{'event':'stream_lagged','skipped':N}`——消费端落后超 broadcast 容量，服务端关流，客户端按上述任一方式带游标重连续传\n\n说明：构建日志经独立接口 `GET /tasks/{task_id}/logs` 分页查询，不走本流；`stage`/`log` 两种事件类型为协议预留，当前任务流不发送。终态事件（completed/failed/cancelled）后服务端关闭流；每 15s 发 `: keep-alive` 注释行保活。task 不存在时非 SSE：HttpResult JSON + 404。",
             content_type = "text/event-stream",
         ),
         (status = 404, description = "Task not found（HttpResult JSON，非 SSE）"),
@@ -413,7 +405,7 @@ pub(crate) async fn stream_task_logs(
     post,
     path = "/tasks/{task_id}/cancel",
     params(("task_id" = String, Path, description = "任务ID")),
-    responses((status = 200, body = HttpResult<CancelData>, description = "取消结果。双重取消：软取消（置 flag）+ kill 编译进程组；已到终态的任务返回 alreadyTerminal=true 幂等成功。取消成功后任务流发 cancelled 终态事件（SSE）")),
+    responses((status = 200, body = HttpResult<CancelData>, description = "取消结果。双重取消：软取消（置 flag）+ kill 编译进程组；已到终态的任务返回 already_terminal=true 幂等成功。取消成功后任务流发 cancelled 终态事件（SSE）")),
     tag = "UserApp · 开发与构建"
 )]
 pub(crate) async fn cancel_task(

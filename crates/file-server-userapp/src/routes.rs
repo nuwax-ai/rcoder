@@ -222,10 +222,10 @@ mod tests {
             "cancelled",
             "stream_lagged",
             "Last-Event-ID",
-            "fromSeq",
+            "from_seq",
             "从 0 递增",
             "keep-alive",
-            "artifactPath",
+            "artifact_path",
         ] {
             assert!(sse.contains(token), "SSE 描述缺事件/协议锚点 {token}");
         }
@@ -257,7 +257,9 @@ mod tests {
 
         let build = success_desc("/api/v1/userapp/build");
         assert!(
-            build.contains("taskId") && build.contains("artifactPath") && build.contains("pending"),
+            build.contains("task_id")
+                && build.contains("artifact_path")
+                && build.contains("pending"),
             "build 受理描述缺关键语义"
         );
 
@@ -265,14 +267,14 @@ mod tests {
         assert!(
             task.contains("completed")
                 && task.contains("轮询")
-                // 快照 seq 语义指引必须保留: 已发事件数=下一条 seq, 可直接作 fromSeq、
+                // 快照 seq 语义指引必须保留: 已发事件数=下一条 seq, 可直接作 from_seq、
                 // 勿作 Last-Event-ID(差 1, 直接用会漏事件)——同事按文档写续传逻辑
-                && task.contains("fromSeq")
+                && task.contains("from_seq")
                 && task.contains("勿直接作 Last-Event-ID"),
             "task 快照描述缺终态/轮询/seq 游标语义"
         );
 
-        // static 取包: releaseId 可选参数（按版本取包）必须在文档参数清单里
+        // static 取包: release_id 可选参数（按版本取包）必须在文档参数清单里
         let static_op = document
             .paths
             .paths
@@ -283,9 +285,9 @@ mod tests {
             static_op
                 .parameters
                 .as_ref()
-                .is_some_and(|params| params.iter().any(|p| p.name == "releaseId"
+                .is_some_and(|params| params.iter().any(|p| p.name == "release_id"
                     && matches!(p.parameter_in, utoipa::openapi::path::ParameterIn::Query))),
-            "static 接口参数缺 releaseId Query 声明（按版本取包是对外契约）"
+            "static 接口参数缺 release_id Query 声明（按版本取包是对外契约）"
         );
     }
 
