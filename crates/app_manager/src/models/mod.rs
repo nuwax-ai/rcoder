@@ -6,10 +6,12 @@
 //! - [`response`]：API 响应体
 //! - [`storage`]：持久存储管理（v2 §5.4）
 //! - [`db`]：数据库管理（app-runtime 自带 PG）
+//!
+//! 日志域 DTO 原属本目录，已下沉 `shared_types::app_cli_logs`（跨进程单一
+//! 事实源）。
 
 pub mod commons;
 pub mod db;
-pub mod logs;
 pub mod request;
 pub mod response;
 pub mod start;
@@ -17,7 +19,6 @@ pub mod storage;
 
 pub use commons::*;
 pub use db::*;
-pub use logs::*;
 pub use request::*;
 pub use response::*;
 pub use start::*;

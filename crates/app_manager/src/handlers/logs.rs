@@ -4,6 +4,9 @@
 //! 响应体——app-cli 侧统一 `HttpResult` 信封（`{code,message,data,tid,success}`），
 //! 成功失败都以信封直达调用方，code/message 保真不二次包装；仅连接/读取失败
 //! 由 rcoder 生成自己的 HttpResult 错误（AppError 路径）。SSE（stream）豁免信封。
+//!
+//! wire DTO 与 app-cli 同源（`shared_types::app_cli_logs`），文档响应 schema
+//! 因此可见具体字段定义。
 
 use std::sync::Arc;
 
@@ -12,9 +15,9 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{Response, StatusCode, header};
 use futures_util::TryStreamExt;
-use shared_types::{AppError, HttpResult};
+use shared_types::{AppError, HttpResult, LogQueryRequest, LogQueryResponse, LogSourceInfo};
 
-use crate::models::{AppLogQueryRequest, AppOperationError};
+use crate::models::AppOperationError;
 
 use super::AppManagerState;
 
@@ -25,9 +28,13 @@ use super::AppManagerState;
     post,
     path = "/api/v1/userapp/{app_id}/logs/sources/query",
     params(("app_id" = String, Path, description = "应用 ID")),
-    request_body = AppLogQueryRequest,
+    request_body = LogQueryRequest,
     responses(
-        (status = 200, description = "透明转发 app-cli 的 HttpResult 信封（data=声明的日志源与匹配文件列表）"),
+        (
+            status = 200,
+            description = "查询成功（HttpResult 信封 data=声明日志源与匹配文件列表）",
+            body = HttpResult<Vec<LogSourceInfo>>
+        ),
         (status = 400, description = "app-cli 拒绝请求（参数错误，信封透传）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
@@ -38,7 +45,7 @@ use super::AppManagerState;
 pub async fn query_app_log_sources(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    Json(request): Json<AppLogQueryRequest>,
+    Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
     forward_json(&state, &app_id, "/v1/logs/sources/query", request).await
 }
@@ -50,9 +57,13 @@ pub async fn query_app_log_sources(
     post,
     path = "/api/v1/userapp/{app_id}/logs/query",
     params(("app_id" = String, Path, description = "应用 ID")),
-    request_body = AppLogQueryRequest,
+    request_body = LogQueryRequest,
     responses(
-        (status = 200, description = "透明转发 app-cli 的 HttpResult 信封（data=多服务日志快照与 checkpoint 游标）"),
+        (
+            status = 200,
+            description = "查询成功（HttpResult 信封 data=多服务日志快照；cursor 回填下次请求可断点续拉）",
+            body = HttpResult<LogQueryResponse>
+        ),
         (status = 400, description = "app-cli 拒绝请求（参数错误，信封透传）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
@@ -63,7 +74,7 @@ pub async fn query_app_log_sources(
 pub async fn query_app_logs(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    Json(request): Json<AppLogQueryRequest>,
+    Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
     forward_json(&state, &app_id, "/v1/logs/query", request).await
 }
@@ -75,7 +86,7 @@ pub async fn query_app_logs(
     post,
     path = "/api/v1/userapp/{app_id}/logs/stream",
     params(("app_id" = String, Path, description = "应用 ID")),
-    request_body = AppLogQueryRequest,
+    request_body = LogQueryRequest,
     responses(
         (
             status = 200,
@@ -92,7 +103,7 @@ pub async fn query_app_logs(
 pub async fn stream_app_logs_v1(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-    Json(request): Json<AppLogQueryRequest>,
+    Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
     let base = runtime_api_base(&state, &app_id).await?;
     let response = state
@@ -129,7 +140,7 @@ async fn forward_json(
     state: &Arc<AppManagerState>,
     app_id: &str,
     path: &str,
-    request: AppLogQueryRequest,
+    request: LogQueryRequest,
 ) -> Result<Response<Body>, AppError> {
     let base = runtime_api_base(state, app_id).await?;
     let response = state

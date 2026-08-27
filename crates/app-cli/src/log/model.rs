@@ -1,79 +1,17 @@
+//! 日志域 wire 模型。
+//!
+//! 请求/响应 DTO 已下沉 `shared_types::app_cli_logs`（跨进程契约单一事实源，
+//! rcoder 的 OpenAPI 文档 schema 同源派生）；本文件 re-export 保持既有
+//! 引用点稳定，游标内部持久态（checkpoint base64 载荷）仍是 app-cli 私有。
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 
-pub const MAX_SERVICES: usize = 64;
-pub const MAX_SOURCES: usize = 128;
-pub const MAX_TAIL_PER_SOURCE: usize = 10_000;
-pub const MAX_KEYWORD_BYTES: usize = 256;
-pub const MAX_CURSOR_BYTES: usize = 64 * 1024;
-
-#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct LogQueryRequest {
-    #[serde(default)]
-    pub selectors: Vec<LogSelector>,
-    #[serde(default)]
-    pub levels: Vec<String>,
-    #[serde(default)]
-    pub keyword: Option<String>,
-    #[serde(default)]
-    pub since: Option<String>,
-    #[serde(default)]
-    pub until: Option<String>,
-    #[serde(default)]
-    pub tail: Option<usize>,
-    #[serde(default)]
-    pub cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct LogSelector {
-    pub service_id: String,
-    #[serde(default)]
-    pub source_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-
-pub struct LogSourceInfo {
-    pub service_id: String,
-    pub source_id: String,
-    pub format: String,
-    pub matched_files: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-
-pub struct LogRecord {
-    pub service_id: String,
-    pub source_id: String,
-    pub file: String,
-    pub offset: u64,
-    pub timestamp: Option<String>,
-    pub level: Option<String>,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-
-pub struct SourceError {
-    pub service_id: String,
-    pub source_id: String,
-    pub code: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-
-pub struct LogQueryResponse {
-    pub logs: Vec<LogRecord>,
-    pub source_errors: Vec<SourceError>,
-    pub cursor: String,
-    pub cursor_reset: bool,
-}
+pub use shared_types::{
+    LogQueryRequest, LogQueryResponse, LogRecord, LogSelector, LogSourceInfo, SourceError,
+    MAX_CURSOR_BYTES, MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE,
+};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CursorState {

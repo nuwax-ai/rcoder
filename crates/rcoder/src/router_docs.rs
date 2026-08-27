@@ -112,6 +112,13 @@ use crate::handler;
             shared_types::AlignCredentialsOutcome,
             shared_types::UserappDbResetPasswordRequest,
             shared_types::UserappDbCreateDatabaseRequest,
+            // 日志域 wire DTO（与容器内 app-cli 同源；logs/sources/query + logs/query 响应面）
+            shared_types::LogQueryRequest,
+            shared_types::LogSelector,
+            shared_types::LogSourceInfo,
+            shared_types::LogRecord,
+            shared_types::SourceError,
+            shared_types::LogQueryResponse,
             // 响应结构体
             shared_types::HealthCheckResponse,
             shared_types::AgentChatRequest,

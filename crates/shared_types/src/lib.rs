@@ -99,6 +99,13 @@ pub use shared_types_i18n::{
 pub mod validation;
 pub use validation::{garde_err_to_app_error, validate_identifier};
 
+// UserApp 日志域契约（rcoder ↔ app-cli 单一事实源；OpenAPI schema 同源派生）
+pub mod app_cli_logs;
+pub use app_cli_logs::{
+    LogQueryRequest, LogQueryResponse, LogRecord, LogSelector, LogSourceInfo, SourceError,
+    MAX_CURSOR_BYTES, MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE,
+};
+
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
 pub use shared_types_grpc::grpc;
 
