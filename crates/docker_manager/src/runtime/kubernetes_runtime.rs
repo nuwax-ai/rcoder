@@ -671,7 +671,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
     async fn get_app_resource_usage_for(
         &self,
         app_id: &str,
-        service_type: &shared_types::ServiceType,
+        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<container_runtime_api::ResourceUsage> {
         self.app_resource_usage_for(app_id, service_type).await
     }
