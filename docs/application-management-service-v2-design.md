@@ -603,18 +603,21 @@ GET /api/v1/userapp/{app_id}/events
 ### 9.3 文件和存储
 
 ```text
-POST /api/v1/userapp/{app_id}/upload
-POST /api/v1/userapp/{app_id}/upload-from-url
-GET  /api/v1/userapp/{app_id}/files
-POST /api/v1/userapp/{app_id}/files/delete
+POST /api/v1/userapp/{app_id}/{env}/upload
+POST /api/v1/userapp/{app_id}/{env}/upload-from-url
+GET  /api/v1/userapp/{app_id}/{env}/files
+POST /api/v1/userapp/{app_id}/{env}/files/delete
 
-GET  /api/v1/userapp/{app_id}/storage
-POST /api/v1/userapp/{app_id}/storage/clear
-POST /api/v1/userapp/{app_id}/storage/destroy
-POST /api/v1/userapp/storage/query
+GET  /api/v1/userapp/{app_id}/{env}/storage
+POST /api/v1/userapp/{app_id}/{env}/storage/clear
+POST /api/v1/userapp/{app_id}/{env}/storage/destroy
+POST /api/v1/userapp/storage/{env}/query
 ```
 
-文件路径一律是 app 根相对路径。禁止绝对路径、`..` 和符号链接逃逸。
+文件路径一律是**环境根相对**路径（prod=`/app`；dev=开发容器 workspace 根）。
+`{env}` 路径段必填（dev|prod，非法 400）——同一 app_id 可同时存在开发容器与运行
+容器，显式分派；dev 分支经 `UserappDevLocator` 契约幂等 ensure UserAppBuilder
+并转发其 file-server。禁止绝对路径、`..` 和符号链接逃逸。
 
 常规发布不得再通过 upload 覆盖 `/app/code`；release API 是代码版本的唯一发布入口。
 upload 只保留给开发、导入和显式文件管理场景。

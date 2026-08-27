@@ -164,7 +164,7 @@ stop_container_by_identifier_inner()  // k8s_agent_pod.rs
   —— PVC 保留（日志 "PVC preserved for reuse"），不删——
 ```
 
-**PVC 保留策略（数据安全硬约束）**：agent 侧 PVC **永不删除**——`stop_container_by_identifier_inner`（k8s_agent_pod.rs）只删 ClusterIP/headless Service + STS + 等 pod 终止，全程不碰 PVC（数据复用，下次 ensure 重建挂回）。`K8sPvcOps` trait（k8s_pvc.rs）提供 `ensure_workspace_pvc` / `resolve_subvolume_path` / `resize_workspace_pvc` / `destroy_workspace_pvc` 等方法；其中 **`destroy_workspace_pvc` 是唯一的 PVC 删除入口，仅 UserApp 经独立 REST 接口 `POST /apps/{id}/storage/destroy` 显式调用**（见 `docs/application-management-service-v2-design.md` §5.4），agent 停止流程不调用。早期 JuiceFS + 裸 Pod 时代的 `delete_workspace_pvc` / `wait_for_pvc_removable` 已在 STS + CephFS + per-agent PVC 改造后移除，由 `destroy_workspace_pvc` 取代。
+**PVC 保留策略（数据安全硬约束）**：agent 侧 PVC **永不删除**——`stop_container_by_identifier_inner`（k8s_agent_pod.rs）只删 ClusterIP/headless Service + STS + 等 pod 终止，全程不碰 PVC（数据复用，下次 ensure 重建挂回）。`K8sPvcOps` trait（k8s_pvc.rs）提供 `ensure_workspace_pvc` / `resolve_subvolume_path` / `resize_workspace_pvc` / `destroy_workspace_pvc` 等方法；其中 **`destroy_workspace_pvc` 是唯一的 PVC 删除入口，仅 UserApp 经独立 REST 接口 `POST /api/v1/userapp/{app_id}/{env}/storage/destroy` 显式调用**（见 `docs/application-management-service-v2-design.md` §9.3；dev 环境销毁走 `UserappDevCleanup` 四步回收），agent 停止流程不调用。早期 JuiceFS + 裸 Pod 时代的 `delete_workspace_pvc` / `wait_for_pvc_removable` 已在 STS + CephFS + per-agent PVC 改造后移除，由 `destroy_workspace_pvc` 取代。
 
 **关键文件**：
 - `crates/docker_manager/src/runtime/k8s_agent_pod.rs` - 核心：`stop_container_by_identifier_inner`（STS 销毁流程）+ `restart_agent_container_inplace`（原地重启）

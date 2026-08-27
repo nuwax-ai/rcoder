@@ -10,7 +10,7 @@ RCoder 对外提供一套 REST API，让你把一个多语言容器镜像（Java
 ## 5 分钟速览
 
 1. **RCoder 是应用 Pod 引擎**——desired（业务字段）归你，observed（运行状态）归 RCoder；create/update 时按你传的执行，读时实时查集群返回。
-2. **HTTP 只用 GET + POST**（部署网关限制）。写操作把动词放进路径：`/delete`、`/update`、`/files/delete`、`/storage/delete`。
+2. **HTTP 只用 GET + POST**（部署网关限制）。写操作把动词放进路径：`/delete`、`/update`、`/files/delete`、`/storage/clear`。
 3. **创建是异步的**——`POST /apps` 建完资源立即返回 `Starting`，不等 Ready；你轮询 `GET /apps/{id}` 观察 `Starting → Running`。
 4. **删除默认保留数据**——`delete` 只删计算面，保留 code/data/logs；要连数据清传 `purge:true`。
 5. **发布有三阶段**——build（构建）→ prepare（预备入库）→ activate（切流+ensure 容器+等就绪，单接口收敛到 active/failed，失败**保留现场**）。失败后恢复用 rollback。见 [10-发布与版本管理](./10-发布与版本管理.md)。
@@ -101,15 +101,16 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate 链路
            GET    /api/v1/userapp/{app_id}/stats                 资源使用（best-effort）
            GET    /api/v1/userapp/{app_id}/events                应用事件
 
-文件管理   POST   /api/v1/userapp/{app_id}/upload                上传文件（multipart）
-           POST   /api/v1/userapp/{app_id}/upload-from-url       从 URL 下载并上传
-           GET    /api/v1/userapp/{app_id}/files                 列出文件
-           POST   /api/v1/userapp/{app_id}/files/delete          删除文件
+文件管理   POST   /api/v1/userapp/{app_id}/{env}/upload                上传文件（multipart）
+           POST   /api/v1/userapp/{app_id}/{env}/upload-from-url       从 URL 下载并上传
+           GET    /api/v1/userapp/{app_id}/{env}/files                 列出文件
+           POST   /api/v1/userapp/{app_id}/{env}/files/delete          删除文件
+           （{env}=dev|prod 必填：dev=开发容器 workspace / prod=运行容器 /app，详见 02）
 
-持久存储   GET    /api/v1/userapp/{app_id}/storage               查询存储状态
-           POST   /api/v1/userapp/{app_id}/storage/clear         清空内容（留 PVC）
-           POST   /api/v1/userapp/{app_id}/storage/destroy      销毁 PVC（高危·不可逆）
-           POST   /api/v1/userapp/storage/query                  分页查询存储
+持久存储   GET    /api/v1/userapp/{app_id}/{env}/storage               查询存储状态
+           POST   /api/v1/userapp/{app_id}/{env}/storage/clear         清空内容（prod 留 PVC / dev 留容器留卷）
+           POST   /api/v1/userapp/{app_id}/{env}/storage/destroy      销毁（prod 删 PVC / dev 销毁整个开发环境）
+           POST   /api/v1/userapp/storage/{env}/query                  分页查询存储
 
 数据库     POST   /api/v1/userapp/db/{env}/reset-password        重置/创建 PG 账号密码（env=dev|prod）
            POST   /api/v1/userapp/db/{env}/create-database       新建 PG 库（env=dev|prod）
