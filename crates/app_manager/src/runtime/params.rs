@@ -83,8 +83,9 @@ impl AppService {
             Some(img) => img.clone(),
             None => default_runtime_image(&std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok())?,
         };
-        // 部分更新回退（方案C 扩展）：`env`/`secrets`/`resources` 任一为 None 时从 live
-        // 容器读当前值回退，避免部分更新静默清空：
+        // 部分更新回退（方案C 扩展）：`env`/`secrets` 为 None 时从 live 容器读当前值
+        // 回退，避免部分更新静默清空；`resources` 同因但为**字段级**回退（见下方
+        // merge_resource_limits）：
         //   - `env` 丢 → K8s `cleanup_orphan_port_resources` 删 ConfigMap → 容器丢环境变量；
         //   - `secrets`/`resources` 丢 → K8s 从 Secret/pod limits 读回（Docker secrets
         //     不可分 → 恒 None 等价旧行为）。
@@ -105,10 +106,10 @@ impl AppService {
                     env
                 })),
                 request.secrets.clone().or(spec.secrets),
-                request
-                    .resources
-                    .clone()
-                    .or(spec.resources.map(resource_limits_from_snapshot)),
+                // resources **字段级**合并（非整体 or）：request 携带字段生效，None 字段
+                // 回退 live 值——整体回退会让"只传 storage 扩容"清空 live 的 cpu/memory
+                // limit，且 ephemeral-storage 回退链跳到新 storage 值。
+                merge_resource_limits(request.resources.as_ref(), spec.resources.as_ref()),
                 spec.health_check.map(health_check_from_snapshot),
                 spec.ports
                     .map(|ps| ps.iter().map(port_config_from_snapshot).collect()),
@@ -297,6 +298,29 @@ fn resource_limits_from_snapshot(r: AppResourceRequirements) -> ResourceLimits {
         memory: r.memory,
         storage: r.storage,
         ephemeral_storage: r.ephemeral_storage,
+    }
+}
+
+/// update 的 resources 字段级合并：request 携带字段生效，None 字段回退 live 值；
+/// request 整体为 None 时保持旧语义（live 整体回退）。
+/// ephemeral_storage 独立回退（不跳 storage 值——那是 create 侧 build 链的兜底，
+/// update 语义下 live 值才是权威）。
+fn merge_resource_limits(
+    request: Option<&ResourceLimits>,
+    live: Option<&AppResourceRequirements>,
+) -> Option<ResourceLimits> {
+    match (request, live) {
+        (Some(req), Some(live)) => Some(ResourceLimits {
+            cpu: req.cpu.clone().or_else(|| live.cpu.clone()),
+            memory: req.memory.clone().or_else(|| live.memory.clone()),
+            storage: req.storage.clone().or_else(|| live.storage.clone()),
+            ephemeral_storage: req
+                .ephemeral_storage
+                .clone()
+                .or_else(|| live.ephemeral_storage.clone()),
+        }),
+        (Some(req), None) => Some(req.clone()),
+        (None, live) => live.cloned().map(resource_limits_from_snapshot),
     }
 }
 
@@ -497,6 +521,60 @@ mod tests {
     }
 
     /// 显式传值优先：请求携带的 secrets/resources 覆盖 live 快照（整段替换语义不变）。
+    /// 字段级合并：request 只带 storage（扩容场景）→ live 的 cpu/memory/
+    /// ephemeral_storage 保留（旧整体回退会清空 live limit，且 ephemeral
+    /// 跳到 storage 值）。
+    #[tokio::test]
+    async fn update_resources_field_level_merge_keeps_live_limits() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = Arc::new(MockRuntime::default());
+        runtime.specs.insert(
+            "app-fm".into(),
+            ContainerSpecSnapshot {
+                resources: Some(AppResourceRequirements {
+                    cpu: Some("1".into()),
+                    memory: Some("1Gi".into()),
+                    storage: Some("50Gi".into()),
+                    ephemeral_storage: Some("2Gi".into()),
+                }),
+                ..Default::default()
+            },
+        );
+        let service = test_service(root.path(), runtime);
+
+        let mut request = empty_update_request("img:v2");
+        request.resources = Some(ResourceLimits {
+            cpu: None,
+            memory: None,
+            storage: Some("200Gi".into()),
+            ephemeral_storage: None,
+        });
+
+        let params = service
+            .build_container_params_from_update("app-fm", &request, &DeploymentStatus::default())
+            .await
+            .expect("params");
+
+        let ar = params.app_resources.expect("resources present");
+        assert_eq!(ar.cpu.as_deref(), Some("1"), "live cpu kept");
+        assert_eq!(ar.memory.as_deref(), Some("1Gi"), "live memory kept");
+        assert_eq!(
+            ar.storage.as_deref(),
+            Some("200Gi"),
+            "explicit storage wins"
+        );
+        assert_eq!(
+            ar.ephemeral_storage.as_deref(),
+            Some("2Gi"),
+            "live ephemeral kept (must not jump to storage value)"
+        );
+        assert_eq!(
+            params.storage_size.as_deref(),
+            Some("200Gi"),
+            "resize target propagated to storage_size"
+        );
+    }
+
     #[tokio::test]
     async fn update_explicit_fields_override_live_spec() {
         let root = tempfile::tempdir().expect("tempdir");

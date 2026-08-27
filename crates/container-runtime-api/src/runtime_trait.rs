@@ -2,7 +2,7 @@
 //!
 //! 阶段3 ISP 拆分: 原 `ContainerRuntime` 32 方法拆为 3 个聚焦子 trait + 1 个聚合 super-trait:
 //! - [`AgentContainerRuntime`] (Group A, 13): agent 容器生命周期 (create/stop/find/list/health).
-//! - [`WorkspaceRuntime`]    (Group B, 5):  workspace/file-server PVC 解析 (resolve/ensure/destroy).
+//! - [`WorkspaceRuntime`]    (Group B, 8):  workspace/file-server PVC 解析 (resolve/ensure/resize/destroy).
 //! - [`UserAppDeploymentRuntime`] (Group C, 14): UserApp Deployment CRUD (create/patch/scale/logs/exec).
 //! - [`ContainerRuntime`]:    聚合 super-trait = A + B + C; 旧调用点零改 (`Arc<dyn ContainerRuntime>`).
 //! - [`UserAppRuntime`]:      B + C 视图; 供 app_manager 收紧 (不需 agent 能力).
@@ -16,7 +16,7 @@ use super::container_params::ContainerCreateParams;
 use super::types::{
     AgentPodDiagnostic, AppEventInfo, ContainerLogEntry, ContainerRuntimeError,
     ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus,
-    ExecResult, RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo,
+    ExecResult, RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo, StorageResizeOutcome,
 };
 
 // mpsc 仍在 lib.rs re-export（`container_runtime_api::mpsc::Receiver` 被 docker_manager /
@@ -275,6 +275,20 @@ pub trait WorkspaceRuntime: Send + Sync {
     /// 见 `docs/application-management-service-v2-design.md` §5.4 destroy。
     async fn destroy_app_pvc(&self, _app_id: &str) -> ContainerRuntimeResult<()> {
         Ok(()) // default no-op (Docker / 未实现)
+    }
+
+    /// 调整 per-app PVC 容量（UserApp 专用；K8s PVC **只扩不能缩**）。
+    ///
+    /// K8s: 读 PVC 当前 `requests.storage` → 等量 no-op / 更大 patch 扩容
+    /// （external-resizer 异步生效，不重建 Pod）/ 更小 [`StorageResizeOutcome::ShrinkRejected`]
+    /// 事实上抛（调用方转 400）。Docker 默认 no-op（bind 目录无容量语义）。
+    /// 前提：StorageClass `allowVolumeExpansion=true`，否则 patch 被接受但静默不生效。
+    async fn resize_app_storage(
+        &self,
+        _app_id: &str,
+        _new_size: &str,
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        Ok(StorageResizeOutcome::Noop) // default no-op (Docker / 未实现)
     }
 
     /// 按 service_type 销毁 workspace PVC（幂等；Docker 默认 no-op）。

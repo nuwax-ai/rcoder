@@ -339,7 +339,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
+    use crate::models::ResourceLimits;
     use crate::test_support::{MockRuntime, release_lock, test_service};
+    use container_runtime_api::StorageResizeOutcome;
 
     pub(crate) fn create_request(app_id: &str) -> CreateAppRequest {
         CreateAppRequest {
@@ -520,6 +522,143 @@ mod tests {
         assert!(
             matches!(error, AppOperationError::Conflict(_)),
             "got: {error}"
+        );
+    }
+
+    /// update 前置：create 一个 running app（fetch_runtime_status 需要 Deployment
+    /// 存在），返回 service 与 runtime 句柄（resize/patch 调用断言用）。
+    async fn created_app_service(
+        root: &std::path::Path,
+        app_id: &str,
+    ) -> (AppService, Arc<MockRuntime>) {
+        let runtime = Arc::new(MockRuntime::default());
+        let service = test_service(root, runtime.clone());
+        let app_dir = root.join(app_id);
+        tokio::fs::create_dir_all(app_dir.join("code"))
+            .await
+            .expect("create code dir");
+        tokio::fs::write(
+            app_dir.join("code").join("release.lock.toml"),
+            release_lock(),
+        )
+        .await
+        .expect("write release lock");
+        service
+            .create_app(create_request(app_id))
+            .await
+            .expect("create app");
+        (service, runtime)
+    }
+
+    fn update_request_with_storage(storage: Option<&str>) -> UpdateAppRequest {
+        UpdateAppRequest {
+            name: None,
+            image: Some("registry.example/app-runtime:v2".into()),
+            env: None,
+            secrets: None,
+            resources: storage.map(|s| ResourceLimits {
+                cpu: None,
+                memory: None,
+                storage: Some(s.to_string()),
+                ephemeral_storage: None,
+            }),
+            tenant_id: None,
+            space_id: None,
+            recycle_enabled: None,
+            idle_timeout_seconds: None,
+            expected_resource_version: None,
+        }
+    }
+
+    /// update 带 resources.storage → resize_app_storage 收到扩容目标，update 整体成功。
+    #[tokio::test]
+    pub(crate) async fn update_app_storage_resize_triggered() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (service, runtime) = created_app_service(root.path(), "app-resize").await;
+        let create_calls_before = runtime.create_calls.load(Ordering::SeqCst);
+
+        service
+            .update_app("app-resize", update_request_with_storage(Some("200Gi")))
+            .await
+            .expect("update with storage");
+
+        assert_eq!(
+            runtime.resize_calls.get("app-resize").map(|c| c.clone()),
+            Some(vec!["200Gi".to_string()]),
+            "resize target forwarded"
+        );
+        assert_eq!(
+            runtime.create_calls.load(Ordering::SeqCst),
+            create_calls_before + 1,
+            "patch_deployment still applied after successful resize"
+        );
+    }
+
+    /// 缩容拒绝（ShrinkRejected）→ update 整体 400 Validation，且 patch 不再执行
+    /// （resize 在 patch 之前——阻断顺序防"语义错误却滚动生效"）。
+    #[tokio::test]
+    pub(crate) async fn update_app_storage_shrink_rejected_blocks_update() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (service, runtime) = created_app_service(root.path(), "app-shrink").await;
+        *runtime.resize_outcome.lock().expect("outcome lock") =
+            Some(StorageResizeOutcome::ShrinkRejected {
+                current: "200Gi".into(),
+                requested: "50Gi".into(),
+            });
+        let create_calls_before = runtime.create_calls.load(Ordering::SeqCst);
+
+        let error = service
+            .update_app("app-shrink", update_request_with_storage(Some("50Gi")))
+            .await
+            .expect_err("shrink must be rejected");
+        assert!(
+            matches!(error, AppOperationError::Validation(_)),
+            "got: {error}"
+        );
+        assert_eq!(
+            runtime.create_calls.load(Ordering::SeqCst),
+            create_calls_before,
+            "patch_deployment must NOT run when resize rejected"
+        );
+    }
+
+    /// resize 后端失败 → update 整体失败（storage 字段承诺生效，不静默降级）。
+    #[tokio::test]
+    pub(crate) async fn update_app_storage_resize_failure_blocks_update() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (service, runtime) = created_app_service(root.path(), "app-rfail").await;
+        runtime.resize_fails.store(true, Ordering::SeqCst);
+        let create_calls_before = runtime.create_calls.load(Ordering::SeqCst);
+
+        let error = service
+            .update_app("app-rfail", update_request_with_storage(Some("200Gi")))
+            .await
+            .expect_err("resize failure must block update");
+        assert!(
+            matches!(error, AppOperationError::Backend(_)),
+            "got: {error}"
+        );
+        assert_eq!(
+            runtime.create_calls.load(Ordering::SeqCst),
+            create_calls_before,
+            "patch_deployment must NOT run when resize failed"
+        );
+    }
+
+    /// update 不带 resources.storage（None 或无 storage 字段）→ resize 不触发。
+    #[tokio::test]
+    pub(crate) async fn update_app_without_storage_skips_resize() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (service, runtime) = created_app_service(root.path(), "app-nosize").await;
+
+        service
+            .update_app("app-nosize", update_request_with_storage(None))
+            .await
+            .expect("update without storage");
+
+        assert!(
+            runtime.resize_calls.is_empty(),
+            "resize must not be called without storage"
         );
     }
 

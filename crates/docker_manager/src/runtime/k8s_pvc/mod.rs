@@ -30,7 +30,7 @@ const DEFAULT_USERAPP_PVC_STORAGE_SIZE: &str = "100Gi";
 #[cfg(feature = "kubernetes")]
 use async_trait::async_trait;
 #[cfg(feature = "kubernetes")]
-use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
+use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult, StorageResizeOutcome};
 #[cfg(feature = "kubernetes")]
 use shared_types::ServiceType;
 #[cfg(feature = "kubernetes")]
@@ -46,7 +46,7 @@ use super::kubernetes_runtime::KubernetesRuntime;
 /// - PVC 创建 (`ensure_workspace_pvc`)
 /// - PVC 绑定等待 (`wait_for_pvc_bound`)
 /// - subvolume 路径解析 (`resolve_subvolume_path`, 阶段2 rcoder 挂根聚合)
-/// - PVC 配额扩容 (`resize_workspace_pvc`, 阶段2 配额调整)
+/// - UserApp PVC 容量调整 (`resize_app_pvc`, 只扩不缩)
 ///
 /// - PVC 销毁 (`destroy_workspace_pvc`, 仅 UserApp 经 REST `storage/destroy` 显式调用)
 ///
@@ -118,19 +118,17 @@ pub(crate) trait K8sPvcOps {
         pvc_name: &str,
     ) -> ContainerRuntimeResult<String>;
 
-    /// 扩容 workspace PVC (CephFS subvolume 配额调整)
+    /// 调整 UserApp per-app 运行卷容量（`WorkspaceRuntime::resize_app_storage` 的 K8s 内核）。
     ///
-    /// patch PVC `spec.resources.requests.storage` → ceph-csi external-resizer 自动
-    /// 调 `ceph fs subvolume resize` (SC `allowVolumeExpansion=true`)。只扩不能缩。
-    /// 阶段2 配额管理: 初始 `ensure_workspace_pvc` 设 requests.storage (subvolume create --size),
-    /// 本方法调调整 (subvolume resize)。
-    #[allow(dead_code)]
-    async fn resize_workspace_pvc(
+    /// 读 PVC 当前 `requests.storage` → quantity 归一比较：等量 no-op；更大 merge
+    /// patch 扩容（external-resizer 异步生效，在线扩文件系统不重建 Pod）；更小
+    /// [`StorageResizeOutcome::ShrinkRejected`] 事实上抛（错误决策归 app_manager 域层）。
+    /// 前提：StorageClass `allowVolumeExpansion=true`，否则 patch 被接受但静默不生效。
+    async fn resize_app_pvc(
         &self,
-        identifier: &str,
-        service_type: &ServiceType,
+        app_id: &str,
         new_size: &str,
-    ) -> ContainerRuntimeResult<()>;
+    ) -> ContainerRuntimeResult<StorageResizeOutcome>;
 
     /// 销毁 workspace PVC + CephFS subvolume (释放配额, 不可逆)。
     ///
@@ -321,33 +319,84 @@ impl K8sPvcOps for KubernetesRuntime {
         Ok(subvolume_path)
     }
 
-    async fn resize_workspace_pvc(
+    async fn resize_app_pvc(
         &self,
-        identifier: &str,
-        service_type: &ServiceType,
+        app_id: &str,
         new_size: &str,
-    ) -> ContainerRuntimeResult<()> {
-        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-        // merge patch spec.resources.requests.storage → ceph-csi external-resizer
-        // 自动调 `ceph fs subvolume resize` (SC allowVolumeExpansion=true)
-        let patch = serde_json::json!({
-            "spec": { "resources": { "requests": { "storage": new_size } } }
-        });
-        let pp = kube::api::PatchParams::default();
-        self.pvcs()
-            .patch(&pvc_name, &pp, &kube::api::Patch::Merge(&patch))
-            .await
-            .map_err(|e| {
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        let pvc_name = self.workspace_pvc_name(app_id, &ServiceType::UserApp)?;
+        let pvc = self.pvcs().get(&pvc_name).await.map_err(|e| match e {
+            kube::Error::Api(ae) if ae.code == 404 => ContainerRuntimeError::ContainerNotFound(
+                format!("PVC '{pvc_name}' for app {app_id} not found"),
+            ),
+            other => {
+                ContainerRuntimeError::K8sError(format!("Failed to get PVC '{pvc_name}': {other}"))
+            }
+        })?;
+        let current = pvc
+            .spec
+            .as_ref()
+            .and_then(|s| s.resources.as_ref())
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|r| r.get("storage"))
+            .map(|q| q.0.clone()) // Quantity(newtype) → 内部字符串
+            .ok_or_else(|| {
                 ContainerRuntimeError::K8sError(format!(
-                    "Failed to patch PVC '{}' requests.storage to {}: {}",
-                    pvc_name, new_size, e
+                    "PVC '{pvc_name}' has no spec.resources.requests.storage"
                 ))
             })?;
-        info!(
-            "[K8S] PVC {} resize requested -> {} (ceph-csi auto subvolume resize)",
-            pvc_name, new_size
-        );
-        Ok(())
+        match compare_storage_quantity(&current, new_size) {
+            StorageVerdict::Equal => {
+                info!(
+                    "[K8S] PVC {} resize no-op: requested {} equals current {}",
+                    pvc_name, new_size, current
+                );
+                Ok(StorageResizeOutcome::AlreadyEqual)
+            }
+            StorageVerdict::Shrink => {
+                // Ok 载事实（K8s 层不做错误决策）；app_manager 收到后转 400
+                info!(
+                    "[K8S] PVC {} resize rejected: requested {} < current {} (K8s PVC 不可缩容)",
+                    pvc_name, new_size, current
+                );
+                Ok(StorageResizeOutcome::ShrinkRejected {
+                    requested: new_size.to_string(),
+                    current,
+                })
+            }
+            StorageVerdict::Grow => {
+                // merge patch requests.storage → external-resizer 异步扩容（在线，
+                // kubelet 扩文件系统不重建 Pod）；SC 须 allowVolumeExpansion=true
+                let patch = serde_json::json!({
+                    "spec": { "resources": { "requests": { "storage": new_size } } }
+                });
+                self.pvcs()
+                    .patch(
+                        &pvc_name,
+                        &kube::api::PatchParams::default(),
+                        &kube::api::Patch::Merge(&patch),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ContainerRuntimeError::K8sError(format!(
+                            "Failed to patch PVC '{}' requests.storage to {}: {}",
+                            pvc_name, new_size, e
+                        ))
+                    })?;
+                info!(
+                    "[K8S] PVC {} resize requested: {} -> {} (external-resizer async, online)",
+                    pvc_name, current, new_size
+                );
+                Ok(StorageResizeOutcome::Resized {
+                    from: current,
+                    to: new_size.to_string(),
+                })
+            }
+            StorageVerdict::Invalid => Err(ContainerRuntimeError::ConfigurationError(format!(
+                "invalid storage quantity (current={current:?}, requested={new_size:?}); \
+                 expected K8s Quantity format like \"100Gi\""
+            ))),
+        }
     }
 
     async fn destroy_workspace_pvc(
@@ -363,5 +412,79 @@ impl K8sPvcOps for KubernetesRuntime {
     async fn destroy_app_data_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         let pvc_name = self.app_data_pvc_name(app_id)?;
         self.destroy_pvc_core(&pvc_name).await
+    }
+}
+
+/// quantity 归一比较结果（`resize_app_pvc` 决策用）。
+#[cfg(feature = "kubernetes")]
+#[derive(Debug, PartialEq, Eq)]
+enum StorageVerdict {
+    Grow,
+    Equal,
+    Shrink,
+    Invalid,
+}
+
+/// 比较两个 K8s storage quantity（`parse_memory_quantity` 归一为字节数）。
+/// 单位混写等量（"100Gi" vs "102400Mi" / 纯数字字节）判 Equal；
+/// 任一非法格式判 Invalid（防 stored PVC 上的怪值静默走进 patch）。
+#[cfg(feature = "kubernetes")]
+fn compare_storage_quantity(current: &str, requested: &str) -> StorageVerdict {
+    match (
+        shared_types::parse_memory_quantity(current),
+        shared_types::parse_memory_quantity(requested),
+    ) {
+        (Some(cur), Some(req)) if req > cur => StorageVerdict::Grow,
+        (Some(cur), Some(req)) if req == cur => StorageVerdict::Equal,
+        (Some(_), Some(_)) => StorageVerdict::Shrink,
+        _ => StorageVerdict::Invalid,
+    }
+}
+
+#[cfg(all(test, feature = "kubernetes"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compare_storage_quantity_verdicts() {
+        assert_eq!(
+            compare_storage_quantity("50Gi", "100Gi"),
+            StorageVerdict::Grow
+        );
+        assert_eq!(
+            compare_storage_quantity("100Gi", "50Gi"),
+            StorageVerdict::Shrink
+        );
+        assert_eq!(
+            compare_storage_quantity("100Gi", "100Gi"),
+            StorageVerdict::Equal
+        );
+        // 单位混写等量：归一为字节数后比较（100Gi = 102400Mi = 107374182400B）
+        assert_eq!(
+            compare_storage_quantity("100Gi", "102400Mi"),
+            StorageVerdict::Equal
+        );
+        assert_eq!(
+            compare_storage_quantity("107374182400", "100Gi"),
+            StorageVerdict::Equal
+        );
+        // 十进制 vs 二进制：100G(1e11) < 100Gi(≈1.07e11) → 判缩容
+        assert_eq!(
+            compare_storage_quantity("100Gi", "100G"),
+            StorageVerdict::Shrink
+        );
+        // 非法格式（未识别后缀 / 负数 / 空串）→ Invalid，不静默 patch
+        assert_eq!(
+            compare_storage_quantity("100XX", "200Gi"),
+            StorageVerdict::Invalid
+        );
+        assert_eq!(
+            compare_storage_quantity("100Gi", "-5Gi"),
+            StorageVerdict::Invalid
+        );
+        assert_eq!(
+            compare_storage_quantity("", "100Gi"),
+            StorageVerdict::Invalid
+        );
     }
 }

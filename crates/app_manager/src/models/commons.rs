@@ -10,7 +10,10 @@ pub struct ResourceLimits {
     pub cpu: Option<String>,
     /// 内存: "512Mi", "1Gi"
     pub memory: Option<String>,
-    /// 存储: "10Gi"（仅 K8s，UserApp 用于 ephemeral-storage 回退）
+    /// 存储: "100Gi"（仅 K8s 有效，per-app PVC 容量）。create=首次容量（缺省
+    /// 100Gi）；update=扩容目标（**仅扩不缩**，缩容请求返回 400；在线生效不
+    /// 重建 Pod）。未指定 ephemeral_storage 时亦回退本值。Docker 模式无 PVC
+    /// 容量语义（no-op）
     pub storage: Option<String>,
     /// 临时存储限制（overlay 可写层，K8s ephemeral-storage）
     /// 未指定时回退到 storage 值

@@ -349,6 +349,23 @@ pub struct AppResourceRequirements {
     pub ephemeral_storage: Option<String>,
 }
 
+/// PVC 容量调整结果（`resize_app_storage` 返回；仅日志/域层决策用，不进 HTTP 响应）。
+///
+/// K8s PVC 只扩不能缩（API server 硬限制），缩容请求以 [`Self::ShrinkRejected`]
+/// 事实形态上抛，由调用方（app_manager）转语义错误——K8s 层不做错误决策。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageResizeOutcome {
+    /// 已提交扩容 patch（external-resizer 异步生效，秒~分钟级；kubelet 在线
+    /// 扩展文件系统，不重建 Pod）。from/to 为 quantity 原始字符串。
+    Resized { from: String, to: String },
+    /// 请求值与当前值等量（quantity 归一比较，如 "100Gi" == "102400Mi"），no-op。
+    AlreadyEqual,
+    /// 该 runtime 无 PVC 容量语义（Docker bind 目录等），no-op。
+    Noop,
+    /// 请求值小于当前值——K8s PVC 不支持缩容。
+    ShrinkRejected { current: String, requested: String },
+}
+
 /// 应用端口运行时状态（含实际分配的对外端口）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppPortStatus {

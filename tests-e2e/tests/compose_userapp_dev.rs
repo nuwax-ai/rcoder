@@ -251,6 +251,16 @@ async fn userapp_dev_pg_align_idempotent() {
         ok_first,
         format!("data: {:?}", first.as_ref().map(|d| trunc(d, 80))),
     );
+    // 重置发生 → dbx 同步命令已执行（username=dev 即 local-pg 在用账号；
+    // fork dbx 的 upsert 吸收由本地冒烟深验，e2e 断命令链路通）
+    let ok_dbx = first
+        .as_ref()
+        .is_some_and(|d| d["dbx_synced"].as_bool() == Some(true));
+    report.assert_hard(
+        "重置后 dbx 同步命令执行成功（dbx_synced=true）",
+        ok_dbx,
+        format!("data: {:?}", first.as_ref().map(|d| trunc(d, 80))),
+    );
     if !ok_first {
         assert_hard_all(report).await;
         cleanup_builder(&app);
@@ -268,6 +278,13 @@ async fn userapp_dev_pg_align_idempotent() {
     report.assert_hard(
         "同密码复调 reset_performed=false（幂等）",
         ok_second,
+        trunc(&b2, 120),
+    );
+    // 未重置 → dbx 同步未触发（serde skip → JSON 无该字段）
+    let ok_dbx_idle = http_ok(&b2) && b2["data"]["dbx_synced"].is_null();
+    report.assert_hard(
+        "未重置不触发 dbx 同步（dbx_synced 缺省）",
+        ok_dbx_idle,
         trunc(&b2, 120),
     );
 

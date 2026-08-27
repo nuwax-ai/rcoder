@@ -11,8 +11,8 @@ use chrono::Utc;
 use container_runtime_api::{
     AgentContainerRuntime, ContainerCreateParams, ContainerLogEntry, ContainerRuntimeError,
     ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus,
-    HttpExpose, RemovedContainerInfo, RuntimeContainerInfo, UserAppDeploymentRuntime,
-    WorkspaceRuntime,
+    HttpExpose, RemovedContainerInfo, RuntimeContainerInfo, StorageResizeOutcome,
+    UserAppDeploymentRuntime, WorkspaceRuntime,
 };
 #[cfg(feature = "kubernetes")]
 use kube::Config;
@@ -451,6 +451,16 @@ impl WorkspaceRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         // 消歧: 显式调 K8sPvcOps 同名方法（per-agent PVC 删除的实际实现）
         K8sPvcOps::destroy_workspace_pvc(self, identifier, service_type).await
+    }
+
+    async fn resize_app_storage(
+        &self,
+        app_id: &str,
+        new_size: &str,
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        // 委派 K8sPvcOps::resize_app_pvc（读当前值→比较→patch/事实拒绝）。
+        // trait 方法默认 no-op, Docker 不覆盖（bind 目录无容量语义）。
+        K8sPvcOps::resize_app_pvc(self, app_id, new_size).await
     }
 }
 

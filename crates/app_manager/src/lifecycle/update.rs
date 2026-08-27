@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
-use container_runtime_api::ExposeType as RtExposeType;
+use container_runtime_api::{ExposeType as RtExposeType, StorageResizeOutcome};
 
 use crate::models::*;
 use crate::service::AppService;
@@ -57,6 +57,43 @@ impl AppService {
         let params = self
             .build_container_params_from_update(app_id, &request, &current)
             .await?;
+        // storage 扩容前置（pingora unregister 之前——失败零副作用直接返回）：
+        // K8s 下 resources.storage 是 per-app PVC 扩容目标（仅扩不缩、在线生效
+        // 不重建 Pod）；Docker no-op。失败阻断整个 update——该字段对外承诺生效，
+        // 静默降级会让调用方以为已扩容。
+        if let Some(new_size) = params.storage_size.as_deref() {
+            match self.runtime.resize_app_storage(app_id, new_size).await {
+                Ok(StorageResizeOutcome::Resized { from, to }) => {
+                    info!(
+                        "[APP] storage resized app_id={app_id}: {from} -> {to} (external-resizer async)"
+                    );
+                }
+                Ok(StorageResizeOutcome::AlreadyEqual) => {
+                    info!(
+                        "[APP] storage resize no-op app_id={app_id}: requested {new_size} equals current"
+                    );
+                }
+                Ok(StorageResizeOutcome::Noop) => {
+                    debug!(
+                        "[APP] storage resize no-op (runtime without PVC capacity) app_id={app_id}: {new_size}"
+                    );
+                }
+                Ok(StorageResizeOutcome::ShrinkRejected {
+                    current: cur,
+                    requested,
+                }) => {
+                    return Err(AppOperationError::Validation(format!(
+                        "K8s PVC supports expansion only: app {app_id} requested {requested} < current {cur}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(map_runtime_error(
+                        &format!("[APP] resize_app_storage failed app_id={app_id}"),
+                        e,
+                    ));
+                }
+            }
+        }
         // 恢复依据先取出（unregister 会移除注册表条目）：pingora_ports 里的是当前
         // 实际生效的 Http 端口——比 current.ports 反推可靠（Docker 后端的状态 ports
         // 只含 TCP，反推恒空会让恢复分支注册了个寂寞）。

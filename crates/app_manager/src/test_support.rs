@@ -10,7 +10,8 @@ use dashmap::DashMap;
 
 use container_runtime_api::{
     ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ContainerSpecSnapshot,
-    DeploymentStatus, UserAppDeploymentRuntime, UserAppRuntime, WorkspaceRuntime,
+    DeploymentStatus, StorageResizeOutcome, UserAppDeploymentRuntime, UserAppRuntime,
+    WorkspaceRuntime,
 };
 use shared_types::ContainerBasicInfo;
 
@@ -41,10 +42,45 @@ pub(crate) struct MockRuntime {
     /// create/patch 收到的参数调用历史（key=project_id 按序追加；断言取首次创建
     /// 参数用——update 通道的 re-apply 会以 live 回退值再次进入本方法）
     pub create_params_history: DashMap<String, Vec<ContainerCreateParams>>,
+    /// resize_app_storage 收到的目标值历史（key=app_id 按序追加；断言 update 是否
+    /// 触发扩容/传值）。
+    pub resize_calls: DashMap<String, Vec<String>>,
+    /// 注入 resize_app_storage 失败（true → ConnectionError → update 应整体失败）。
+    pub resize_fails: AtomicBool,
+    /// 注入 resize_app_storage 返回 outcome（None → 默认模拟 K8s Grow 成功）。
+    pub resize_outcome: std::sync::Mutex<Option<StorageResizeOutcome>>,
 }
 
 #[async_trait]
-impl WorkspaceRuntime for MockRuntime {}
+impl WorkspaceRuntime for MockRuntime {
+    // 其余 workspace 族方法走默认实现（resolve_workspace_path → Ok(None)，
+    // get_container_app_dir 因此落到 `workspace_root/{app_id}`，测试用 tempdir 承接）；
+    // 仅覆写 resize_app_storage（update 扩容链路断言需要记录与注入）。
+    async fn resize_app_storage(
+        &self,
+        app_id: &str,
+        new_size: &str,
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        self.resize_calls
+            .entry(app_id.to_string())
+            .or_default()
+            .push(new_size.to_string());
+        if self.resize_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "mock resize_app_storage failure".into(),
+            ));
+        }
+        Ok(self
+            .resize_outcome
+            .lock()
+            .expect("resize_outcome lock")
+            .clone()
+            .unwrap_or_else(|| StorageResizeOutcome::Resized {
+                from: "100Gi".into(),
+                to: new_size.to_string(),
+            }))
+    }
+}
 
 #[async_trait]
 impl UserAppDeploymentRuntime for MockRuntime {
