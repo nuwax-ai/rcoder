@@ -1,6 +1,6 @@
 //! 工作区装配共享实现：init-project-template / push-skills。
 //!
-//! 自 handlers/computer/workspace/* 抽出（壳留守原处）。
+//! 壳在 handlers/computer/workspace/*。
 
 use std::path::Path;
 

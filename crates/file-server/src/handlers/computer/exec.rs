@@ -12,7 +12,7 @@ use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
 use crate::models::{ExecCommandBody, GetLogsQuery};
 
-use crate::ops::{execute_command_impl, get_logs_impl};
+use crate::ops::exec::{execute_command_impl, get_logs_impl};
 
 use super::{resolve_computer_target, ws_path};
 

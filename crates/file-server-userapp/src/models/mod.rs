@@ -2,32 +2,25 @@
 //!
 //! 规则：凡派生 `utoipa::ToSchema` 或 `utoipa::IntoParams` 的结构体/枚举
 //! 一律定义在 `models/` 下，handlers 与 service 都从这里引用。类型名、
-//! serde 属性、schema 名与搬迁前逐字节一致（wire 零变更，routes.rs 守卫
-//! 测试锁定）。
+//! serde 属性、schema 名是 wire 契约，改动须同批核查 routes.rs 守卫测试。
 //!
 //! 分组：[`task`]（构建任务域共享：BuildTaskKind/Status/Snapshot）/
-//! [`request`]（请求体 + Query + multipart 占位）/ [`response`]（HttpResult
-//! .data 载荷）。跨 crate 共享类型（KilledPid/BinaryFile/FileOp）从
-//! `file_server::models` 引用（洋葱模型单向依赖，单一事实源在 file-server）。
+//! [`request`]（workspace/文件镜像/dev 生命周期域请求体 + Query + multipart
+//! 占位）/ [`app_files`]（rcoder app-files 转发链内部契约请求）/
+//! [`response`]（HttpResult.data 载荷）。跨 crate 共享类型
+//! （KilledPid/BinaryFile/FileOp）从 `file_server::models` 引用（洋葱模型
+//! 单向依赖，单一事实源在 file-server）。子模块经 glob 展平再导出，
+//! 消费方一律 `crate::models::X`。
 
+pub mod app_files;
 pub mod request;
 pub mod response;
 pub mod task;
 
-pub use request::{
-    AppFilesClearBody, AppFilesDeleteBody, AppFilesListParams, AppFilesUploadForm,
-    AppFilesUploadFromUrlBody, BuildUserAppBody, DevLogsQuery, DevOpBody, ImportProjectBody,
-    StaticQuery, StreamQuery, TaskLogsQuery, UserappDownloadQuery, UserappEnsureWorkspaceBody,
-    UserappExecCommandBody, UserappFileListQuery, UserappFilesUpdateBody, UserappGenerateFileBody,
-    UserappGetLogsQuery, UserappImportProjectForm, UserappInitTemplateForm, UserappInstallBody,
-    UserappPushSkillsForm, UserappResolveFileQuery, UserappSearchFilesQuery, UserappUploadFileForm,
-    UserappUploadFilesForm, UserappZipBody,
-};
-pub use response::{
-    BuildCreatedData, CancelData, ConfirmData, DetectData, DetectionResult, UserappDevList,
-    UserappDevProcess, UserappDevStopped, UserappDevTaskCreated, UserappEnsureWorkspaceData,
-};
-pub use task::{BuildTaskId, BuildTaskKind, BuildTaskSnapshot, BuildTaskStatus};
+pub use app_files::*;
+pub use request::*;
+pub use response::*;
+pub use task::*;
 
 #[cfg(test)]
 mod tests {

@@ -17,19 +17,12 @@ use std::path::PathBuf;
 
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
 
 use crate::AppState;
 use crate::extract::{AppPath as AxumPath, AppQuery as Query};
+use crate::models::CustomTargetQuery;
 use crate::ops::static_share::{COMPUTER_CORS, PAGE_CORS, cors_404, serve_from_root};
 use crate::workspace::ProjectContext;
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CustomTargetQuery {
-    #[serde(default)]
-    custom_target_dir: Option<String>,
-}
 
 // ── page static ────────────────────────────────────────────────────────────────
 

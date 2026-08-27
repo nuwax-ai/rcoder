@@ -4,7 +4,7 @@ use axum::extract::State;
 use serde_json::Value;
 
 use crate::ops::multipart::{file_field, text_field};
-use crate::ops::push_skills_impl;
+use crate::ops::workspace::push_skills_impl;
 
 use super::super::ws_path;
 use super::require_workspace_fields;

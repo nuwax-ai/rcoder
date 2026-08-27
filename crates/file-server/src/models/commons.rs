@@ -1,4 +1,4 @@
-//! 全 crate 公共响应信封与 OpenAPI 二进制占位（原 openapi.rs 内联定义）。
+//! 全 crate 公共响应信封与 OpenAPI 二进制占位。
 
 use serde::Serialize;
 use serde_json::Value;

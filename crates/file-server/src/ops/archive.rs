@@ -1,7 +1,7 @@
 //! 打包下载共享实现：zip-workspace / download-all-files。
 //!
-//! 自 handlers/computer/archive.rs 抽出（壳与 utf8_percent_encode 测试随迁——
-//! 测试的对象是随迁的私有 helper）。
+//! 壳在 handlers/computer/archive.rs；utf8_percent_encode 的单测随 helper
+//! 留在本文件。
 
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};

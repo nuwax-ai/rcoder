@@ -16,7 +16,7 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
 use crate::models::{DeleteWorkspaceBody, FilesUpdateBody};
-use crate::ops::files_update_impl;
+use crate::ops::files::files_update_impl;
 
 // ── delete-workspace ────────────────────────────────────────────────────────────
 

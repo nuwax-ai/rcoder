@@ -1,6 +1,6 @@
 //! 文件读类共享实现：get-file-list / resolve-file / search-files。
 //!
-//! 自 handlers/computer/files_read.rs 抽出（壳与测试留守原处）；参数经
+//! 壳与 handler 层测试在 handlers/computer/files_read.rs；参数经
 //! `FileListParams` / `SearchFilesParams` 借用结构传入，定位（computer 树或
 //! userapp 开发卷）由各域壳层完成。
 

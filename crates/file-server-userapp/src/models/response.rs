@@ -1,4 +1,4 @@
-//! 响应载荷 DTO（HttpResult.data 载荷，原各 handler 文件内联定义）。
+//! 响应载荷 DTO（HttpResult.data 载荷）。
 
 use serde::Serialize;
 
@@ -43,7 +43,7 @@ pub struct ConfirmData {
     pub path: String,
 }
 
-/// detect_project 检测结果（原 service/userapp/import.rs 内联定义）。
+/// detect_project 检测结果（service::userapp::import 的返回值）。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DetectionResult {
     pub project_dir: String,

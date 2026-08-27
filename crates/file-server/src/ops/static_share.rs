@@ -1,8 +1,8 @@
 //! 静态文件服务共享面：CORS 配置族 + serve_from_root + 响应辅助。
 //!
-//! 自 handlers/static_files.rs 抽出（serve_page / serve_computer 壳留守；
+//! serve_page / serve_computer 壳在 handlers/static_files.rs；
 //! file-server-userapp 的 userapp static 取包复用本层——Range 断点续传走
-//! COMPUTER_CORS 头集）。
+//! COMPUTER_CORS 头集。
 
 use std::path::Path;
 

@@ -1,4 +1,4 @@
-//! 响应载荷 DTO（原 handlers 与 service 层内联定义）。
+//! 响应载荷 DTO。
 //!
 //! `SkillFailure` / `KilledPid` / `LogLine` / `ReadDevLogResult` 原定义在
 //! service 层但被 wire 契约内嵌（既是运行时数据又是响应形状）——归入 models
@@ -232,7 +232,7 @@ pub struct BuildDone {
 }
 
 /// 运行中的 dev server 记录（内存状态 + list-dev wire 双面；log_dir/temp_log_name
-/// 不上 wire）。原 service/dev_server/types.rs 定义，DevServerManager 继续引用。
+/// 不上 wire）。DevServerManager 内存状态直接持有本类型。
 #[derive(Debug, Clone, serde::Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DevProcess {
@@ -250,7 +250,7 @@ pub struct DevProcess {
     pub temp_log_name: String,
 }
 
-/// 端口池分配明细（port-pool-status 内嵌；原 service/dev_server/port_pool.rs 定义）。
+/// 端口池分配明细（port-pool-status 内嵌；PortPoolStatus 快照持有同型列表）。
 #[derive(Debug, Clone, serde::Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PortAllocation {

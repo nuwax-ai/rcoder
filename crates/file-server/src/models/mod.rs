@@ -1,43 +1,32 @@
 //! wire 契约类型集中地（对齐 app_manager/models 范式）。
 //!
-//! 规则：凡派生 `utoipa::ToSchema` 或 `utoipa::IntoParams` 的结构体/枚举
-//! 一律定义在 `models/` 下，handlers 与 service 都从这里引用——models 是
-//! 最底层共享层（无 crate 内依赖），消除 DTO 散落 handlers/service 两层的
-//! 问题。类型名、serde 属性、schema 名与搬迁前逐字节一致（wire 零变更，
-//! openapi.rs 守卫测试锁定）。
+//! 规则：凡派生 `utoipa::ToSchema` / `utoipa::IntoParams` 的结构体/枚举，
+//! 以及被 HTTP 提取器反序列化的 wire 契约结构（无 utoipa 派生、参数在
+//! path 注解里逐项声明的 GitLogQuery/CustomTargetQuery 形态），一律定义在
+//! `models/` 下——models 是最底层共享层，handlers 与 service 都从这里引用。
+//! 类型名、serde 属性、schema 名是 wire 契约，改动须同批核查守卫测试。
 //!
-//! 分组：[`commons`]（全 crate 公共信封）/ [`code`]（跨 project/computer/
-//! userapp 共享的文件操作契约）/ [`forms`]（OpenAPI-only multipart 占位）/
-//! [`request`]（JSON 请求体 + Query 参数）/ [`response`]（响应载荷）。
-//! 非 wire 契约的领域内部类型（TaskState、DevServerManager 等）不在此处。
+//! 分组：[`commons`]（公共信封）/ [`code`]（跨域文件操作契约）/ [`forms`]
+//! （OpenAPI-only multipart 占位）/ [`request`]（build+project 域请求）/
+//! [`computer`]（computer 域请求）/ [`git`]（git 域请求）/ [`response`]
+//! （响应载荷）。非 wire 契约的领域内部类型（TaskState、DevServerManager
+//! 等）不在此处。子模块经 glob 展平再导出，消费方一律 `crate::models::X`。
 
 pub mod code;
 pub mod commons;
+pub mod computer;
 pub mod forms;
+pub mod git;
 pub mod request;
 pub mod response;
 
-pub use code::{FileEntry, FileOp, FileOperation};
-pub use commons::{BinaryFile, ErrorDetail, ErrorResponse, SuccessResponse};
-pub use forms::{
-    CreateWorkspaceForm, CreateWorkspaceV2Form, ImportProjectForm, InitProjectTemplateForm,
-    PushProjectSkillsForm, PushSkillsForm, UploadAttachmentForm, UploadBatchFilesForm,
-    UploadFileForm, UploadFilesForm, UploadProjectForm, UploadSingleFileForm,
-};
-pub use request::{
-    AllFilesBody, BackupVersionBody, BranchCreateBody, BranchNameBody, BuildAgentBody, BuildQuery,
-    CleanupBuildArtifactsBody, CommitBody, CopyProjectBody, CreateProjectBody, DeleteParams,
-    DeleteWorkspaceBody, DevLogQuery, DiffBody, ExecCommandBody, ExportBody, FileContentBody,
-    FileListQuery, FilesBody, FilesUpdateBody, GenerateFileBody, GetByVersionParams,
-    GetContentParams, GetLogsQuery, GitLogQuery, GitQuery, GitWriteBody, InstallBody,
-    KeepAliveQuery, ParseErrorBody, ResetBody, ResolveFileQuery, RevertBody, RollbackBody,
-    SearchFilesQuery, SpecifiedBody, TagCreateBody, TagNameBody, TargetBody, UserCidQuery, ZipBody,
-};
-pub use response::{
-    BuildDone, CreateWorkspaceResponse, DevList, DevLog, DevProcess, DevStarted, DevStopped,
-    HealthResponse, KeepAlive, KilledPid, LogCacheStats, LogCacheStatsData, LogLine, MemoryUsage,
-    PortAllocation, PortPool, ReadDevLogResult, Simple, SkillFailure, VersionResponse,
-};
+pub use code::*;
+pub use commons::*;
+pub use computer::*;
+pub use forms::*;
+pub use git::*;
+pub use request::*;
+pub use response::*;
 
 #[cfg(test)]
 mod tests {

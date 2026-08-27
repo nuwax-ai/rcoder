@@ -1,6 +1,6 @@
 //! 依赖安装共享实现：install-project。
 //!
-//! 自 handlers/computer/packages.rs 抽出（壳留守原处）；子进程捕获经
+//! 壳在 handlers/computer/packages.rs；子进程捕获经
 //! [`super::process_capture`]。
 
 use std::path::PathBuf;

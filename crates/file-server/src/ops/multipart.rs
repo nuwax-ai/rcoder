@@ -1,4 +1,4 @@
-//! HTTP multipart 共享读取与校验工具（跨 crate 共享面，自 handlers/multipart.rs 迁入）。
+//! HTTP multipart 共享读取与校验工具（跨 crate 共享面）。
 
 use std::path::Path;
 

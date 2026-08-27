@@ -1,6 +1,6 @@
 //! 执行/日志类共享实现：execute-command / get-logs。
 //!
-//! 自 handlers/computer/exec.rs 抽出（壳留守原处）；子进程捕获经
+//! 壳在 handlers/computer/exec.rs；子进程捕获经
 //! [`super::process_capture`]。
 
 use std::path::{Path, PathBuf};

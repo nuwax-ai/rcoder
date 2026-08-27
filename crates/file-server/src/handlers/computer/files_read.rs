@@ -12,7 +12,7 @@ use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
 use crate::models::{FileListQuery, ResolveFileQuery, SearchFilesQuery};
 
-use crate::ops::{
+use crate::ops::files_read::{
     FileListParams, SearchFilesParams, get_file_list_impl, resolve_file_impl, search_files_impl,
 };
 

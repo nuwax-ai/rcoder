@@ -4,7 +4,7 @@ use axum::extract::State;
 use garde::Validate;
 use serde_json::Value;
 
-use crate::ops::generate_file_impl;
+use crate::ops::files::generate_file_impl;
 
 use super::super::resolve_computer_target;
 use crate::AppState;

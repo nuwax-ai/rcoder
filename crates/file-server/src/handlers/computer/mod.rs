@@ -15,8 +15,6 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::workspace::ComputerContext;
 
-use crate::ops::multipart::validate_zip_ext;
-
 // ID 字段反序列化 helper (deserialize_id_string / deserialize_optional_id_string) 已提升至
 // `crate::extract`, 供 computer / project 等所有 handler 共用。
 

@@ -1,8 +1,8 @@
-//! 构建任务域共享类型（原 service/userapp/tasks.rs 内联定义）。
+//! 构建任务域共享类型。
 //!
 //! 既是任务状态机核心（TaskState/BuildTask 字段）又是 wire 契约（GET
-//! /tasks/{task_id} 直接序列化 BuildTaskSnapshot）——归入 models 后 service
-//! 继续从这里引用（对齐 app_manager service 依赖 models 的形态）。
+//! /tasks/{task_id} 直接序列化 BuildTaskSnapshot）。TaskState/BuildTaskStore
+//! 留在 service，直接引用本层类型（对齐 app_manager service 依赖 models 的形态）。
 
 use serde::Serialize;
 

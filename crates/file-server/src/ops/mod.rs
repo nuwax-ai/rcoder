@@ -1,14 +1,14 @@
 //! 共享操作层（extractor 之后、service 之前的「workspace 无关实现」）。
 //!
-//! 这层的函数从各域 handler 壳抽出：壳负责 utoipa 注解、参数提取与 garde
-//! 校验，本层收已解析的参数（路径/TemporaryFile/简单参数结构）执行操作并
-//! 构造响应。file-server 自己的 handler 壳与 file-server-userapp（跨 crate）
-//! 都从这里消费——**跨 crate 禁止引用 `crate::handlers`**，共享实现一律下沉
-//! 到本层或 service/models（handlers→handlers 是被拆除的畸形形态）。
+//! 分层契约：壳（handlers）负责 utoipa 注解、参数提取与 garde 校验；本层
+//! 收已解析的参数（路径/TemporaryFile/简单参数结构）执行操作并构造响应。
+//! file-server 自己的 handler 壳与 file-server-userapp（跨 crate）都从这层
+//! 消费——跨 crate 引用 `crate::handlers` 被编译器禁止（handlers 为
+//! pub(crate)），共享实现一律在本层或 service/models。
 //!
-//! 文件按 handlers/computer 域 1:1 镜像；multipart/static_share 为 HTTP 边界
-//! 工具。impl 签名自 handler 抽出时保持不变（`&AppState` 依赖 config 与
-//! skill_downloader）。
+//! 文件与 handlers/computer 域 1:1 镜像；multipart/static_share 为 HTTP 边界
+//! 工具。impl 签名收 `&AppState`（实际依赖 config 与 skill_downloader）。
+//! 引用风格统一走子模块路径（`ops::files::xxx_impl`），不做平铺 re-export。
 
 pub mod archive;
 pub mod exec;
@@ -19,22 +19,6 @@ pub mod packages;
 pub mod process_capture;
 pub mod static_share;
 pub mod workspace;
-
-pub use archive::{download_all_files_impl, zip_workspace_impl};
-pub use exec::{execute_command_impl, get_logs_impl};
-pub use files::{
-    files_update_impl, generate_file_impl, import_project_impl, upload_file_impl, upload_files_impl,
-};
-pub use files_read::{
-    FileListParams, SearchFilesParams, get_file_list_impl, resolve_file_impl, search_files_impl,
-};
-pub use multipart::{file_field, text_field, validate_zip_ext};
-pub use packages::install_project_impl;
-pub use process_capture::{CaptureResult, capture_command, run_capture};
-pub use static_share::{
-    COMPUTER_CORS, CorsConfig, add_cors_headers, cors_404, origin_value, serve_from_root,
-};
-pub use workspace::{init_project_template_impl, push_skills_impl};
 
 #[cfg(test)]
 mod tests {

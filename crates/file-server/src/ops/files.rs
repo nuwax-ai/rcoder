@@ -1,6 +1,6 @@
 //! 文件写类共享实现：files-update / upload-file(s) / generate-file / import-project。
 //!
-//! 自 handlers/computer/files/* 抽出（壳与测试留守原处）。
+//! 壳与 handler 层测试在 handlers/computer/files/*。
 
 use std::path::Path;
 

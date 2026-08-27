@@ -1,7 +1,8 @@
-//! 请求体、Query 参数与 OpenAPI multipart 占位（原各 handler 文件内联定义）。
+//! workspace / 文件镜像 / dev 生命周期域的请求体、Query 参数与 OpenAPI
+//! multipart 占位。
 //!
-//! serde 属性、garde 校验、字段 doc comment 与迁移前逐字节一致；原
-//! `pub(crate)` 统一放宽为 `pub`（models 是 crate 内公共层）。
+//! serde 属性、garde 校验与字段 doc comment 是 wire 契约的一部分；字段为
+//! `pub`（models 是 crate 内公共层）。
 
 use garde::Validate;
 use serde::Deserialize;
@@ -391,74 +392,6 @@ pub struct UserappImportProjectForm {
     #[schema(format = Binary)]
     /// 上传文件（zip 或单文件）
     pub file: String,
-}
-
-// ── app-files 域（userapp_app_files.rs，rcoder 转发链内部契约）────────────────
-
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(utoipa::ToSchema)]
-pub struct AppFilesUploadForm {
-    /// UserApp 应用 ID（定位 = resolve_userapp_dev；单 app 模式须与归属一致）
-    pub app_id: String,
-    /// 用户 ID（挂载压平契约字段：rcoder ensure builder 组装宿主树用；file-server
-    /// 侧仅日志审计，不参与容器内定位）
-    pub user_id: String,
-    /// app 根相对目标（压缩包=解压目录；单文件=文件路径）
-    pub target: String,
-    /// 压缩包解压后单层归一（默认 false）
-    pub flatten: Option<bool>,
-    #[schema(format = Binary)]
-    /// 上传内容（zip / tar.gz / 单文件，魔数自动识别）
-    pub file: String,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct AppFilesUploadFromUrlBody {
-    /// 制品/文件下载地址（HTTP(S)）
-    pub url: String,
-    /// app 根相对目标
-    pub target: String,
-    /// 压缩包解压后单层归一（默认 false）
-    #[serde(default)]
-    pub flatten: bool,
-    /// UserApp 应用 ID（定位）。
-    pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带；9252a29 曾改必填造成
-    /// rcoder 转发 422 断链，回退为可选审计字段）。
-    #[serde(default)]
-    pub user_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct AppFilesListParams {
-    /// UserApp 应用 ID（定位）。
-    pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。
-    #[serde(default)]
-    pub user_id: Option<String>,
-    /// app 根相对子目录（缺省列根）
-    #[serde(default)]
-    pub path: Option<String>,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct AppFilesDeleteBody {
-    /// UserApp 应用 ID（定位）。
-    pub app_id: String,
-    /// 用户 ID（仅审计日志，可选——rcoder 转发链不携带）。
-    #[serde(default)]
-    pub user_id: Option<String>,
-    /// app 根相对文件/目录
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct AppFilesClearBody {
-    /// UserApp 应用 ID（定位）。
-    pub app_id: String,
-    /// 用户 ID（仅审计日志，可选）。
-    #[serde(default)]
-    pub user_id: Option<String>,
 }
 
 // ── dev server 生命周期域（userapp_dev_server.rs）───────────────────────────────

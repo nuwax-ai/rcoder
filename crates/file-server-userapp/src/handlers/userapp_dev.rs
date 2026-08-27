@@ -24,8 +24,8 @@ use file_server::error::AppError;
 use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
 use file_server::ops::archive::{download_all_files_impl, zip_workspace_impl};
 use file_server::ops::exec::{execute_command_impl, get_logs_impl};
-use file_server::ops::install_project_impl;
 use file_server::ops::multipart::{file_field, text_field};
+use file_server::ops::packages::install_project_impl;
 use file_server::ops::workspace::{init_project_template_impl, push_skills_impl};
 use file_server::workspace::resolve_userapp_dev;
 

@@ -11,7 +11,7 @@
 //! TS 对齐路由（/api/project、/api/computer 等）仍在 file-server，不受本 crate 影响。
 
 pub mod error;
-pub mod handlers;
+pub(crate) mod handlers;
 pub mod models;
 pub mod routes;
 pub mod service;

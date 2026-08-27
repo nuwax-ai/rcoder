@@ -9,7 +9,7 @@ use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
 use crate::models::{UserCidQuery, ZipBody};
 
-use crate::ops::{download_all_files_impl, zip_workspace_impl};
+use crate::ops::archive::{download_all_files_impl, zip_workspace_impl};
 
 use super::{resolve_computer_target, ws_path};
 
