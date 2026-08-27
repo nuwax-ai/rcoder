@@ -145,10 +145,17 @@ impl crate::service::AppService {
     /// - `dev`：经开发容器 file-server 清空 workspace 内容（**留容器留卷**——
     ///   "重置开发工作区"语义；开发容器常驻，卷重建要求先销毁容器，得不偿失）。
     ///   幂等；容器内为旧镜像（无 clear 端点）时 404 上抛 Backend。
-    pub async fn clear_app_storage(&self, env: UserappEnv, app_id: &str) -> AppResult<()> {
+    pub async fn clear_app_storage(
+        &self,
+        env: UserappEnv,
+        app_id: &str,
+        user_id: &str,
+    ) -> AppResult<()> {
         validate_app_id(app_id)?;
         if env == UserappEnv::Dev {
-            let base = self.app_files_base(UserappEnv::Dev, app_id).await?;
+            let base = self
+                .app_files_base(UserappEnv::Dev, app_id, user_id)
+                .await?;
             let resp = reqwest::Client::new()
                 .post(format!("{base}/api/v1/userapp/app-files/clear"))
                 .timeout(std::time::Duration::from_secs(60))
@@ -207,6 +214,7 @@ impl crate::service::AppService {
         &self,
         env: UserappEnv,
         app_id: &str,
+        user_id: &str,
         confirm: &str,
     ) -> AppResult<()> {
         if env == UserappEnv::Dev {
@@ -242,7 +250,10 @@ impl crate::service::AppService {
         // 独立 storage/destroy 接口：与 PVC 同生命周期，元数据行同步删除
         // （三档删除语义的第三档）。
         self.metadata.record_deleted(app_id).await;
-        info!("[APP] app PVC destroyed: {}", app_id);
+        // user_id 审计留痕：Docker 下宿主目录定位由 destroy_app_pvc 的
+        // prod/*/ 通配扫描兜底（正确性不依赖 metadata），显式值用于对账与
+        // 未来精确直删。
+        info!("[APP] app PVC destroyed: {} (user_id={})", app_id, user_id);
         Ok(())
     }
 
@@ -564,7 +575,11 @@ mod tests {
         struct StubDevLocator;
         #[async_trait::async_trait]
         impl shared_types::UserappDevLocator for StubDevLocator {
-            async fn dev_file_server_addr(&self, _app_id: &str) -> Result<String, String> {
+            async fn dev_file_server_addr(
+                &self,
+                _app_id: &str,
+                _user_id: Option<&str>,
+            ) -> Result<String, String> {
                 Ok("http://127.0.0.1:60000".to_string())
             }
             async fn dev_container_alive(&self, _app_id: &str) -> Result<bool, String> {

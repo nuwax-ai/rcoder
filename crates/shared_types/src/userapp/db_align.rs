@@ -19,6 +19,9 @@ use crate::pg_utils::{
 pub struct AlignCredentialsRequest {
     /// 应用 ID（定位 dev=开发容器 / prod=运行容器）
     pub app_id: String,
+    /// 归属用户 ID（dev 容器懒创建时宿主树 `dev/{user_id}/{app_id}` 分区依据；
+    /// 必填，白名单校验）
+    pub user_id: String,
     /// PG 账号名（已存在的任意账号；须过 PG 标识符白名单）
     pub username: String,
     /// 目标密码（开发与部署环境对齐后的值）
@@ -164,6 +167,20 @@ pub async fn align_pg_credentials(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// wire 契约：user_id 必填（dev 容器懒创建宿主树分区依据）——缺字段即拒。
+    #[test]
+    fn align_request_requires_user_id() {
+        let ok: AlignCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "app_id": "app-1", "user_id": "u1", "username": "u", "password": "p",
+        }))
+        .expect("full body deserializes");
+        assert_eq!(ok.user_id, "u1");
+        let missing = serde_json::json!({
+            "app_id": "app-1", "username": "u", "password": "p",
+        });
+        assert!(serde_json::from_value::<AlignCredentialsRequest>(missing).is_err());
+    }
 
     /// 脚本化 runner：按命令内容返回预设 exit_code（验证 pg_verify_credentials_cmd
     /// 生成的前缀识别请求类型）。

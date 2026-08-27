@@ -28,11 +28,15 @@ impl UserappDevLocator {
 
 #[async_trait::async_trait]
 impl shared_types::UserappDevLocator for UserappDevLocator {
-    async fn dev_file_server_addr(&self, app_id: &str) -> Result<String, String> {
+    async fn dev_file_server_addr(
+        &self,
+        app_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<String, String> {
         let state = self.state()?;
         // 低频管理面语义：先探活再返回（注册表命中死容器时自愈重建），
         // 与 pod ensure/keepalive 同款；热路径转发层不走这里（自有 30s 探活缓存）。
-        let (info, created) = ensure_userapp_builder_probed(&state, app_id, None)
+        let (info, created) = ensure_userapp_builder_probed(&state, app_id, user_id)
             .await
             .map_err(|e| format!("ensure UserAppBuilder (app {app_id}): {e:#}"))?;
         if created {

@@ -106,31 +106,28 @@ pub(crate) async fn align_credentials(
         .ok_or_else(|| AppError::bad_request("path segment `env` must be `dev` or `prod`"))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
+    shared_types::validate_identifier(&body.user_id, "user_id")
+        .map_err(|e| AppError::bad_request(&e))?;
 
     let outcome = match env {
         DbEnv::Dev => {
-            // 开发容器：ensure（幂等 + 探活自愈，stopped/exited builder 自动重建）
-            // + ensure-workspace（execute-command 的 cwd 前置）
-            let (info, _recreated) = ensure_userapp_builder_probed(&state, &body.app_id, None)
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "[USERAPP_DB_ALIGN] ensure dev container failed: app_id={}: {e:#}",
-                        body.app_id
-                    );
-                    AppError::with_message(
-                        shared_types::error_codes::ERR_CONTAINER_ERROR,
-                        format!("ensure dev container failed: {e:#}"),
-                    )
-                })?;
+            // 开发容器：ensure（幂等 + 探活自愈，stopped/exited builder 自动重建；
+            // owner 显式档=body user_id）+ ensure-workspace（execute-command 的 cwd 前置）
+            let (info, _recreated) =
+                ensure_userapp_builder_probed(&state, &body.app_id, Some(&body.user_id))
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "[USERAPP_DB_ALIGN] ensure dev container failed: app_id={}: {e:#}",
+                            body.app_id
+                        );
+                        AppError::with_message(
+                            shared_types::error_codes::ERR_CONTAINER_ERROR,
+                            format!("ensure dev container failed: {e:#}"),
+                        )
+                    })?;
             let addr = dev_file_server_addr(&state, &info);
-            // 审计 user_id：metadata owner（create-workspace/publish 落库的事实源）
-            // 优先，缺省 app_id（不参与定位）。
-            let user_id = state
-                .app_service
-                .get_app_owner(&body.app_id)
-                .await
-                .unwrap_or_else(|| body.app_id.clone());
+            let user_id = body.user_id.clone();
             super::ensure_workspace_via_dev(&addr, &body.app_id, &user_id)
                 .await
                 .map_err(|e| {
@@ -223,10 +220,11 @@ async fn resolve_exec_target(
     state: &AppState,
     env: DbEnv,
     app_id: &str,
+    user_id: &str,
 ) -> Result<String, AppError> {
     match env {
         DbEnv::Dev => {
-            let (info, _recreated) = ensure_userapp_builder_probed(state, app_id, None)
+            let (info, _recreated) = ensure_userapp_builder_probed(state, app_id, Some(user_id))
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -359,11 +357,13 @@ pub(crate) async fn reset_password(
         .ok_or_else(|| AppError::bad_request("path segment `env` must be `dev` or `prod`"))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
+    shared_types::validate_identifier(&body.user_id, "user_id")
+        .map_err(|e| AppError::bad_request(&e))?;
     if body.new_password.is_empty() {
         return Err(AppError::bad_request("new_password must not be empty"));
     }
 
-    let target = resolve_exec_target(&state, env, &body.app_id).await?;
+    let target = resolve_exec_target(&state, env, &body.app_id, &body.user_id).await?;
     let runtime = state.runtime().clone();
     let runner = ExecRunner {
         runtime: &runtime,
@@ -451,8 +451,10 @@ pub(crate) async fn create_database(
         .ok_or_else(|| AppError::bad_request("path segment `env` must be `dev` or `prod`"))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
+    shared_types::validate_identifier(&body.user_id, "user_id")
+        .map_err(|e| AppError::bad_request(&e))?;
 
-    let target = resolve_exec_target(&state, env, &body.app_id).await?;
+    let target = resolve_exec_target(&state, env, &body.app_id, &body.user_id).await?;
     let runtime = state.runtime().clone();
     let runner = ExecRunner {
         runtime: &runtime,

@@ -17,14 +17,27 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{Response, StatusCode, header};
 use futures_util::TryStreamExt;
+use serde::Deserialize;
 use shared_types::{AppError, HttpResult, LogQueryRequest, LogQueryResponse, LogSourceInfo};
 
 use crate::models::AppOperationError;
 
 use super::AppManagerState;
+
+/// logs 三接口共用的 query 定位参数。
+///
+/// `parameter_in` 必须显式声明：utoipa-axum 自动发现会按 Path extractor 把
+/// query 字段误标 path（项目既有约定），容器级显式声明优先。
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct LogsAccessParams {
+    /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
+    /// `dev/{user_id}/{app_id}` 分区依据）
+    pub user_id: String,
+}
 
 /// 查询应用日志源
 ///
@@ -56,11 +69,17 @@ use super::AppManagerState;
 pub async fn query_app_log_sources(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, env)): Path<(String, String)>,
+    Query(params): Query<LogsAccessParams>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
     let env = shared_types::UserappEnv::parse(&env)
         .ok_or_else(|| AppError::validation_error("path segment `env` must be `dev` or `prod`"))?;
-    let base = state.app_service.log_api_base(env, &app_id).await?;
+    shared_types::validate_identifier(&params.user_id, "user_id")
+        .map_err(|e| AppError::validation_error(&e))?;
+    let base = state
+        .app_service
+        .log_api_base(env, &app_id, &params.user_id)
+        .await?;
     forward_json(&state, base.clone(), "/v1/logs/sources/query", request).await
 }
 
@@ -94,11 +113,17 @@ sources/query。
 pub async fn query_app_logs(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, env)): Path<(String, String)>,
+    Query(params): Query<LogsAccessParams>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
     let env = shared_types::UserappEnv::parse(&env)
         .ok_or_else(|| AppError::validation_error("path segment `env` must be `dev` or `prod`"))?;
-    let base = state.app_service.log_api_base(env, &app_id).await?;
+    shared_types::validate_identifier(&params.user_id, "user_id")
+        .map_err(|e| AppError::validation_error(&e))?;
+    let base = state
+        .app_service
+        .log_api_base(env, &app_id, &params.user_id)
+        .await?;
     forward_json(&state, base, "/v1/logs/query", request).await
 }
 
@@ -132,11 +157,17 @@ SSE 实时日志流（500ms 轮询内核）：事件清单与断线续传协议�
 pub async fn stream_app_logs_v1(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, env)): Path<(String, String)>,
+    Query(params): Query<LogsAccessParams>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
     let env = shared_types::UserappEnv::parse(&env)
         .ok_or_else(|| AppError::validation_error("path segment `env` must be `dev` or `prod`"))?;
-    let base = state.app_service.log_api_base(env, &app_id).await?;
+    shared_types::validate_identifier(&params.user_id, "user_id")
+        .map_err(|e| AppError::validation_error(&e))?;
+    let base = state
+        .app_service
+        .log_api_base(env, &app_id, &params.user_id)
+        .await?;
     let response = state
         .http_client
         .post(format!("{base}/v1/logs/stream"))

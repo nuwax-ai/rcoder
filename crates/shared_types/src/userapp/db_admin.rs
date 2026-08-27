@@ -20,6 +20,9 @@ use crate::pg_utils::{
 pub struct UserappDbResetPasswordRequest {
     /// 应用 ID（定位 dev=开发容器 / prod=运行容器）
     pub app_id: String,
+    /// 归属用户 ID（dev 容器懒创建时宿主树 `dev/{user_id}/{app_id}` 分区依据；
+    /// 必填，白名单校验）
+    pub user_id: String,
     /// 新密码（非空；允许任意字符含特殊符号）
     pub new_password: String,
     /// 目标账号名（可选，须过 PG 标识符白名单）：
@@ -34,6 +37,9 @@ pub struct UserappDbResetPasswordRequest {
 pub struct UserappDbCreateDatabaseRequest {
     /// 应用 ID（定位 dev=开发容器 / prod=运行容器）
     pub app_id: String,
+    /// 归属用户 ID（dev 容器懒创建时宿主树 `dev/{user_id}/{app_id}` 分区依据；
+    /// 必填，白名单校验）
+    pub user_id: String,
     /// 新建数据库名（PG 标识符白名单校验）
     pub database: String,
     /// 库 owner（可选，PG 标识符白名单校验；缺省 = 执行者 superuser）
@@ -194,6 +200,34 @@ mod tests {
     use super::super::db_align::{CommandOutcome, PgCommandRunner};
     use super::*;
     use std::sync::Mutex;
+
+    /// wire 契约：user_id 必填——缺字段即拒（reset-password / create-database 两 body）。
+    #[test]
+    fn db_admin_requests_require_user_id() {
+        let reset: UserappDbResetPasswordRequest = serde_json::from_value(serde_json::json!({
+            "app_id": "app-1", "user_id": "u1", "new_password": "p",
+        }))
+        .expect("full reset body");
+        assert_eq!(reset.user_id, "u1");
+        assert!(
+            serde_json::from_value::<UserappDbResetPasswordRequest>(serde_json::json!({
+                "app_id": "app-1", "new_password": "p",
+            }))
+            .is_err()
+        );
+
+        let create: UserappDbCreateDatabaseRequest = serde_json::from_value(serde_json::json!({
+            "app_id": "app-1", "user_id": "u1", "database": "db1",
+        }))
+        .expect("full create body");
+        assert_eq!(create.user_id, "u1");
+        assert!(
+            serde_json::from_value::<UserappDbCreateDatabaseRequest>(serde_json::json!({
+                "app_id": "app-1", "database": "db1",
+            }))
+            .is_err()
+        );
+    }
 
     /// 脚本化 runner：按命令内容返回预设结果（与 db_align 的 ScriptedRunner 同款）。
     struct ScriptedRunner {

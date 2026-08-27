@@ -3,9 +3,21 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// 清空应用持久存储请求
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ClearStorageRequest {
+    /// 归属用户 ID（必填，白名单校验；dev 分支经容器清 workspace 时开发容器
+    /// 懒创建的宿主树 `dev/{user_id}/{app_id}` 分区依据）
+    pub user_id: String,
+}
+
 /// 销毁 PVC 请求（高危·不可逆；强制 `confirm == app_id` 二次确认）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DestroyStorageRequest {
+    /// 归属用户 ID（必填，白名单校验；Docker compose 部署下销毁宿主树
+    /// `prod/{user_id}/` 该 app 四目录的定位与审计依据——K8s 走 PVC 对象、
+    /// Docker 走 prod/*/ 通配扫描兜底，显式值用于对账与未来精确直删）
+    pub user_id: String,
     /// 必须等于 path 的 `app_id`（防误调 / 防脚本批量误删 / 防重放）
     pub confirm: String,
 }
@@ -47,4 +59,34 @@ pub struct StorageInfo {
     pub modified_at: Option<String>,
     /// 是否孤儿（无对应运行应用）
     pub is_orphan: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// wire 契约：clear/destroy body 的 user_id 必填——缺字段即拒。
+    #[test]
+    fn storage_requests_require_user_id() {
+        let clear: ClearStorageRequest =
+            serde_json::from_value(serde_json::json!({"user_id": "u1"})).expect("clear body");
+        assert_eq!(clear.user_id, "u1");
+        assert!(
+            serde_json::from_value::<ClearStorageRequest>(serde_json::json!({})).is_err(),
+            "clear 缺 user_id 应拒"
+        );
+
+        let destroy: DestroyStorageRequest = serde_json::from_value(serde_json::json!({
+            "user_id": "u1", "confirm": "app-1",
+        }))
+        .expect("destroy body");
+        assert_eq!(destroy.user_id, "u1");
+        assert!(
+            serde_json::from_value::<DestroyStorageRequest>(serde_json::json!({
+                "confirm": "app-1",
+            }))
+            .is_err(),
+            "destroy 缺 user_id 应拒"
+        );
+    }
 }

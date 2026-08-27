@@ -11,7 +11,9 @@ use tracing::{info, instrument};
 use shared_types::{AppError, HttpResult};
 
 use super::state::AppManagerState;
-use crate::models::{DestroyStorageRequest, PaginatedResponse, QueryStorageRequest, StorageInfo};
+use crate::models::{
+    ClearStorageRequest, DestroyStorageRequest, PaginatedResponse, QueryStorageRequest, StorageInfo,
+};
 
 /// 查询应用持久存储状态
 #[utoipa::path(
@@ -65,9 +67,10 @@ pub async fn get_app_storage(
         ("app_id" = String, Path, description = "应用 ID"),
         ("env" = String, Path, description = "目标环境：`dev`=重置开发工作区（清内容留容器留卷）/ `prod`=清运行卷（K8s 删 PVC 重建空卷；Docker 清目录内容）")
     ),
+    request_body = ClearStorageRequest,
     responses(
         (status = 200, description = "清空成功", body = HttpResult<String>),
-        (status = 400, description = "env 非法", body = HttpResult<String>),
+        (status = 400, description = "env 非法 / user_id 缺失或非法", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "prod 下应用仍存在，需先 delete", body = HttpResult<String>),
         (status = 502, description = "dev 下开发容器不可达（或容器内无 clear 端点——旧镜像需换代）", body = HttpResult<String>)
@@ -78,15 +81,22 @@ pub async fn get_app_storage(
 pub async fn clear_app_storage(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, env)): Path<(String, String)>,
+    Json(req): Json<ClearStorageRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
     let env = shared_types::UserappEnv::parse(&env)
         .ok_or_else(|| AppError::bad_request(&shared_types::invalid_env_error(&env)))?;
+    shared_types::validate_identifier(&req.user_id, "user_id")
+        .map_err(|e| AppError::bad_request(&e))?;
     info!(
-        "[APP] clearing app storage: {} (env={})",
+        "[APP] clearing app storage: {} (env={}, user_id={})",
         app_id,
-        env.as_str()
+        env.as_str(),
+        req.user_id
     );
-    state.app_service.clear_app_storage(env, &app_id).await?;
+    state
+        .app_service
+        .clear_app_storage(env, &app_id, &req.user_id)
+        .await?;
     Ok(Json(HttpResult::success("存储已清空".to_string())))
 }
 
@@ -119,14 +129,17 @@ pub async fn destroy_app_storage(
 ) -> Result<Json<HttpResult<String>>, AppError> {
     let env = shared_types::UserappEnv::parse(&env)
         .ok_or_else(|| AppError::bad_request(&shared_types::invalid_env_error(&env)))?;
+    shared_types::validate_identifier(&req.user_id, "user_id")
+        .map_err(|e| AppError::bad_request(&e))?;
     info!(
-        "[APP] destroying app storage: {} (env={})",
+        "[APP] destroying app storage: {} (env={}, user_id={})",
         app_id,
-        env.as_str()
+        env.as_str(),
+        req.user_id
     );
     state
         .app_service
-        .destroy_app_storage(env, &app_id, &req.confirm)
+        .destroy_app_storage(env, &app_id, &req.user_id, &req.confirm)
         .await?;
     Ok(Json(HttpResult::success(
         "存储已销毁，配额已释放".to_string(),

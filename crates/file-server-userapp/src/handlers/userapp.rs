@@ -154,7 +154,10 @@ pub(crate) async fn build_workspace(
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}",
-    params(("task_id" = String, Path, description = "任务ID")),
+    params(
+        ("app_id" = String, Query, description = "构建链定位 app_id（**rcoder 转发层消费**：目标开发容器定位与容器不在时的短路判定；经 rcoder 访问必填、白名单校验，容器侧不读取）"),
+        ("task_id" = String, Path, description = "任务ID"),
+    ),
     description = r#"
 返回构建任务的完整状态机快照。典型用法：
 
@@ -195,7 +198,11 @@ pub(crate) async fn get_task(
 #[utoipa::path(
     get,
     path = "/tasks/{task_id}/logs",
-    params(("task_id" = String, Path, description = "任务ID"), TaskLogsQuery),
+    params(
+        ("app_id" = String, Query, description = "构建链定位 app_id（**rcoder 转发层消费**：目标开发容器定位与容器不在时的短路判定；经 rcoder 访问必填、白名单校验，容器侧不读取）"),
+        ("task_id" = String, Path, description = "任务ID"),
+        TaskLogsQuery,
+    ),
     responses((status = 200, body = HttpResult<ReadDevLogResult>, description = "构建日志分页（历史日志文件读取，非 SSE）。query：service=子项目目录名（留空=workspace 根日志）；start_index=起始行号（1-based，用上批响应的 total_lines 翻页）。响应 data：logs[{line,content}]（行号+内容）、total_lines（总行数）、start_index、log_file_name。日志按天滚动（dev-YYYY-MM-DD.log），只读当前文件。")),
     tag = "UserApp · dev · 构建任务"
 )]
@@ -244,6 +251,7 @@ pub(crate) async fn get_task_logs(
     get,
     path = "/tasks/{task_id}/logs/stream",
     params(
+        ("app_id" = String, Query, description = "构建链定位 app_id（**rcoder 转发层消费**：目标开发容器定位与容器不在时的短路判定；经 rcoder 访问必填、白名单校验，容器侧不读取）"),
         ("task_id" = String, Path, description = "任务ID"),
         ("Last-Event-ID" = Option<String>, Header, description = "SSE 规范续传头（优先）：断线重连时填最后收到事件的 id（即上一条消息的 seq），服务端从该 id 之后回放。浏览器 EventSource 自动重连会自动携带，无需手动处理。与 from_seq 同时存在时以本头为准。"),
         StreamQuery,
@@ -323,7 +331,10 @@ pub(crate) async fn stream_task_logs(
 #[utoipa::path(
     post,
     path = "/tasks/{task_id}/cancel",
-    params(("task_id" = String, Path, description = "任务ID")),
+    params(
+        ("app_id" = String, Query, description = "构建链定位 app_id（**rcoder 转发层消费**：目标开发容器定位与容器不在时的短路判定；经 rcoder 访问必填、白名单校验，容器侧不读取）"),
+        ("task_id" = String, Path, description = "任务ID"),
+    ),
     responses((status = 200, body = HttpResult<CancelData>, description = "取消结果。双重取消：软取消（置 flag）+ kill 编译进程组；已到终态的任务返回 already_terminal=true 幂等成功。取消成功后任务流发 cancelled 终态事件（SSE）")),
     tag = "UserApp · dev · 构建任务"
 )]

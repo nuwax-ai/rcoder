@@ -54,7 +54,12 @@ impl AppService {
     /// - `env=dev`：经 `UserappDevLocator` 契约幂等 ensure UserAppBuilder（探活
     ///   自愈，开发容器常驻无唤醒语义——app_manager 的 runtime 视图无 agent
     ///   能力，委托宿主 rcoder）。
-    pub(crate) async fn app_files_base(&self, env: UserappEnv, app_id: &str) -> AppResult<String> {
+    pub(crate) async fn app_files_base(
+        &self,
+        env: UserappEnv,
+        app_id: &str,
+        user_id: &str,
+    ) -> AppResult<String> {
         if env == UserappEnv::Dev {
             let locator = self
                 .dev_locator
@@ -64,11 +69,14 @@ impl AppService {
                 .ok_or_else(|| {
                     AppOperationError::Backend("dev container locator not injected".to_string())
                 })?;
-            return locator.dev_file_server_addr(app_id).await.map_err(|e| {
-                AppOperationError::Backend(format!(
-                    "locate dev container file-server (app {app_id}): {e}"
-                ))
-            });
+            return locator
+                .dev_file_server_addr(app_id, Some(user_id))
+                .await
+                .map_err(|e| {
+                    AppOperationError::Backend(format!(
+                        "locate dev container file-server (app {app_id}): {e}"
+                    ))
+                });
         }
         match self.activity.ensure_running(app_id).await {
             shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
@@ -107,6 +115,7 @@ impl AppService {
         &self,
         env: UserappEnv,
         app_id: &str,
+        user_id: &str,
         file_data: Vec<u8>,
         target: &str,
         flatten: bool,
@@ -118,7 +127,7 @@ impl AppService {
                 "file data is empty".to_string(),
             ));
         }
-        let base = self.app_files_base(env, app_id).await?;
+        let base = self.app_files_base(env, app_id, user_id).await?;
         let file_name = std::path::Path::new(target)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -157,13 +166,14 @@ impl AppService {
         &self,
         env: UserappEnv,
         app_id: &str,
+        user_id: &str,
         url: &str,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult> {
         validate_app_id(app_id)?;
         validate_upload_target(target)?;
-        let base = self.app_files_base(env, app_id).await?;
+        let base = self.app_files_base(env, app_id, user_id).await?;
         let body = serde_json::json!({
             "app_id": app_id,
             "url": url,
@@ -204,10 +214,11 @@ impl AppService {
         &self,
         env: UserappEnv,
         app_id: &str,
+        user_id: &str,
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>> {
         validate_app_id(app_id)?;
-        let base = self.app_files_base(env, app_id).await?;
+        let base = self.app_files_base(env, app_id, user_id).await?;
         let mut url = format!(
             "{base}/api/v1/userapp/app-files/list?app_id={}",
             urlencode(app_id)
@@ -243,6 +254,7 @@ impl AppService {
         &self,
         env: UserappEnv,
         app_id: &str,
+        user_id: &str,
         file_path: &str,
     ) -> AppResult<()> {
         validate_app_id(app_id)?;
@@ -251,7 +263,7 @@ impl AppService {
                 "file path is empty".to_string(),
             ));
         }
-        let base = self.app_files_base(env, app_id).await?;
+        let base = self.app_files_base(env, app_id, user_id).await?;
         let body = serde_json::json!({"app_id": app_id, "path": file_path});
         let resp = reqwest::Client::new()
             .post(format!("{base}/api/v1/userapp/app-files/delete"))

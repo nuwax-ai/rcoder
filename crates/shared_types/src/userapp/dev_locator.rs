@@ -16,7 +16,14 @@ use async_trait::async_trait;
 pub trait UserappDevLocator: Send + Sync {
     /// 幂等 ensure 开发容器并返回其 file-server 基址（`http://{host}:60000`）。
     /// 错误返回面向日志/响应的描述串（调用方各自映射错误码）。
-    async fn dev_file_server_addr(&self, app_id: &str) -> Result<String, String>;
+    ///
+    /// `user_id`：请求入参显式携带的 owner（懒创建容器宿主树
+    /// `dev/{user_id}/{app_id}` 分区的显式档；`None`/空白走 metadata 注册值）。
+    async fn dev_file_server_addr(
+        &self,
+        app_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<String, String>;
 
     /// 开发容器是否在（dev 卷 orphan 判定用；不 ensure）。`Err` = 探测失败
     /// （调用方保守判非 orphan，与 prod 侧 `is_storage_orphan` 的保守语义对齐）。

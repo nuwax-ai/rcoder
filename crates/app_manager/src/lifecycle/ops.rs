@@ -280,7 +280,14 @@ impl AppService {
             let runtime = self.get_app(app_id).await?;
             return Ok(runtime.health);
         }
-        let base = self.app_files_base(env, app_id).await?;
+        // health 不在接口面收 user_id（⚪/dev🟢 不补参）——dev 懒创建走 metadata
+        // owner 链（空值经 resolve_owner 空白档降级 metadata，不破坏 fail-fast）
+        let user_id = self
+            .metadata
+            .lookup(app_id)
+            .and_then(|r| r.user_id)
+            .unwrap_or_default();
+        let base = self.app_files_base(env, app_id, &user_id).await?;
         let ok = reqwest::Client::new()
             .get(format!("{base}/health"))
             .timeout(std::time::Duration::from_secs(5))
@@ -296,12 +303,14 @@ impl AppService {
     }
 
     /// 日志管理面转发基址（容器内 app-cli :3010）。prod=运行实例 IP；
-    /// dev=从 `UserappDevLocator.dev_file_server_addr`（:60000）解析 host 重拼端口。
+    /// dev=从 `UserappDevLocator.dev_file_server_addr`（:60000）解析 host 重拼端口
+    /// （user_id 为 dev 懒创建容器的显式 owner 档）。
     #[instrument(skip(self))]
     pub async fn log_api_base(
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
     ) -> AppResult<String> {
         validate_app_id(app_id)?;
         if env == shared_types::UserappEnv::Prod {
@@ -318,7 +327,7 @@ impl AppService {
                 })?;
             return Ok(format!("http://{ip}:3010"));
         }
-        let file_server = self.app_files_base(env, app_id).await?;
+        let file_server = self.app_files_base(env, app_id, user_id).await?;
         // http://{host}:60000 → http://{host}:3010（host 段原样保留，仅换管理端口）
         let host = file_server
             .trim_start_matches("http://")

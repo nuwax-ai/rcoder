@@ -57,7 +57,10 @@ impl AppService {
 
         // PG 对齐（部署完成后 app Running，exec 通道可用）
         let (pg_aligned, pg_error) = match &request.pg {
-            Some(cred) => match self.align_start_pg(app_id, cred).await {
+            Some(cred) => match self
+                .align_start_pg(app_id, request.user_id.as_deref(), cred)
+                .await
+            {
                 Ok(()) => (Some(true), None),
                 Err(e) => {
                     warn!(
@@ -125,7 +128,10 @@ impl AppService {
             self.apply_start_overrides(app_id, &request).await?;
         }
         let (pg_aligned, pg_error) = match &request.pg {
-            Some(cred) => match self.align_start_pg(app_id, cred).await {
+            Some(cred) => match self
+                .align_start_pg(app_id, request.user_id.as_deref(), cred)
+                .await
+            {
                 Ok(()) => (Some(true), None),
                 Err(e) => {
                     warn!(
@@ -379,11 +385,17 @@ impl AppService {
     }
 
     /// PG 对齐（start 语境：仅对结果分级，不阻断部署——与 db/align 接口同一核心）。
-    async fn align_start_pg(&self, app_id: &str, cred: &StartPgCredential) -> AppResult<()> {
+    async fn align_start_pg(
+        &self,
+        app_id: &str,
+        user_id: Option<&str>,
+        cred: &StartPgCredential,
+    ) -> AppResult<()> {
         self.align_db_credentials(
             app_id,
             shared_types::AlignCredentialsRequest {
                 app_id: app_id.to_string(),
+                user_id: user_id.unwrap_or_default().to_string(),
                 username: cred.username.clone(),
                 password: cred.password.clone(),
             },

@@ -59,8 +59,12 @@ pub trait AppServiceTrait: Send + Sync {
 
     /// 清空应用持久存储内容（prod：留 PVC 可恢复，仅当 app 已 delete；dev：清空
     /// workspace 内容留容器留卷——"重置开发工作区"）
-    async fn clear_app_storage(&self, env: shared_types::UserappEnv, app_id: &str)
-    -> AppResult<()>;
+    async fn clear_app_storage(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+        user_id: &str,
+    ) -> AppResult<()>;
 
     /// 销毁应用持久存储（prod：删 PVC，需 confirm==app_id 且 app 已 delete；
     /// dev：销毁整个开发环境=builder 容器+dev 卷+目录，不动 metadata）
@@ -68,6 +72,7 @@ pub trait AppServiceTrait: Send + Sync {
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
         confirm: &str,
     ) -> AppResult<()>;
 
@@ -147,7 +152,12 @@ pub trait AppServiceTrait: Send + Sync {
 
     /// 日志/管理面转发基址（app-cli :3010）：prod=运行实例 IP；dev=开发容器 host
     /// 解析重拼。logs 三接口的透明转发源
-    async fn log_api_base(&self, env: shared_types::UserappEnv, app_id: &str) -> AppResult<String>;
+    async fn log_api_base(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+        user_id: &str,
+    ) -> AppResult<String>;
 
     /// 获取应用事件（K8s Events API：调度/拉取/启动/崩溃；仅 prod 运行容器——
     /// 调用方 handler 层负责环境校验）
@@ -162,6 +172,7 @@ pub trait AppServiceTrait: Send + Sync {
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
         file_data: Vec<u8>,
         target: &str,
         flatten: bool,
@@ -172,6 +183,7 @@ pub trait AppServiceTrait: Send + Sync {
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
         url: &str,
         target: &str,
         flatten: bool,
@@ -183,6 +195,7 @@ pub trait AppServiceTrait: Send + Sync {
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>>;
 
@@ -191,6 +204,7 @@ pub trait AppServiceTrait: Send + Sync {
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
         file_path: &str,
     ) -> AppResult<()>;
 }

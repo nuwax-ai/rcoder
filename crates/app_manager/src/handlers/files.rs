@@ -52,6 +52,7 @@ pub async fn upload_file(
     let mut file_name: Option<String> = None;
     let mut target_path: Option<String> = None;
     let mut flatten = false; // 压缩包上传：是否剥单层 wrapper 目录（默认 false 保留结构）
+    let mut user_id: Option<String> = None;
 
     // 解析 multipart 数据
     while let Some(field) = multipart
@@ -80,6 +81,12 @@ pub async fn upload_file(
                 })?;
                 flatten = data == "true" || data == "1";
             }
+            "user_id" => {
+                let data = field.text().await.map_err(|e| {
+                    AppError::bad_request(&format!("failed to read user_id: {}", e))
+                })?;
+                user_id = Some(data);
+            }
             _ => {}
         }
     }
@@ -88,10 +95,13 @@ pub async fn upload_file(
     let data = file_data.ok_or_else(|| AppError::bad_request("missing file field"))?;
     let name = file_name.unwrap_or_else(|| "uploaded_file".to_string());
     let target = target_path.unwrap_or_else(|| format!("code/{}", name));
+    let user_id = user_id.ok_or_else(|| AppError::bad_request("missing user_id field"))?;
+    shared_types::validate_identifier(&user_id, "user_id")
+        .map_err(|e| AppError::bad_request(&e))?;
 
     let result = state
         .app_service
-        .upload_file(env, &app_id, data, &target, flatten)
+        .upload_file(env, &app_id, &user_id, data, &target, flatten)
         .await?;
 
     Ok(Json(HttpResult::success(result)))
@@ -100,6 +110,9 @@ pub async fn upload_file(
 /// 从 URL 下载文件请求
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UploadFromUrlRequest {
+    /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
+    /// `dev/{user_id}/{app_id}` 分区依据）
+    pub user_id: String,
     /// 下载 URL（HTTP/HTTPS；允许内网 IP、localhost、集群域名和普通公网域名）
     pub url: String,
     /// 目标路径（app 根相对；单文件=文件路径，压缩包=解压目录如 "code/"；默认 "code/"）
@@ -145,16 +158,21 @@ pub async fn upload_from_url(
     );
     let target = req.target.unwrap_or_else(|| "code/".to_string());
     let flatten = req.flatten.unwrap_or(false);
+    shared_types::validate_identifier(&req.user_id, "user_id")
+        .map_err(|e| AppError::bad_request(&e))?;
     let result = state
         .app_service
-        .upload_from_url(env, &app_id, &req.url, &target, flatten)
+        .upload_from_url(env, &app_id, &req.user_id, &req.url, &target, flatten)
         .await?;
     Ok(Json(HttpResult::success(result)))
 }
 
 /// 列出文件查询参数
-#[derive(Debug, Deserialize, Default, ToSchema)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ListFilesQuery {
+    /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
+    /// `dev/{user_id}/{app_id}` 分区依据）
+    pub user_id: String,
     /// 子目录（相对 app 根，如 "code"/"data"/"logs"；默认列 app 根）
     pub path: Option<String>,
 }
@@ -188,15 +206,18 @@ pub async fn list_files(
 ) -> Result<Json<HttpResult<Vec<FileInfo>>>, AppError> {
     let env = shared_types::UserappEnv::parse(&env)
         .ok_or_else(|| AppError::bad_request(&shared_types::invalid_env_error(&env)))?;
+    shared_types::validate_identifier(&q.user_id, "user_id")
+        .map_err(|e| AppError::bad_request(&e))?;
     info!(
-        "[APP] listing files: {} (env={}, subpath={:?})",
+        "[APP] listing files: {} (env={}, user_id={}, subpath={:?})",
         app_id,
         env.as_str(),
+        q.user_id,
         q.path
     );
     let files = state
         .app_service
-        .list_files(env, &app_id, q.path.as_deref())
+        .list_files(env, &app_id, &q.user_id, q.path.as_deref())
         .await?;
     Ok(Json(HttpResult::success(files)))
 }
@@ -204,6 +225,9 @@ pub async fn list_files(
 /// 删除文件请求
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct DeleteFileRequest {
+    /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
+    /// `dev/{user_id}/{app_id}` 分区依据）
+    pub user_id: String,
     /// 文件路径（app 根相对，如 "code/app.jar"，可指向 code/data/logs 下任意文件）
     pub path: String,
 }
@@ -235,15 +259,18 @@ pub async fn delete_file(
 ) -> Result<Json<HttpResult<String>>, AppError> {
     let env = shared_types::UserappEnv::parse(&env)
         .ok_or_else(|| AppError::bad_request(&shared_types::invalid_env_error(&env)))?;
+    shared_types::validate_identifier(&request.user_id, "user_id")
+        .map_err(|e| AppError::bad_request(&e))?;
     info!(
-        "[APP] deleting file: {}/{} (env={})",
+        "[APP] deleting file: {}/{} (env={}, user_id={})",
         app_id,
         request.path,
-        env.as_str()
+        env.as_str(),
+        request.user_id
     );
     state
         .app_service
-        .delete_file(env, &app_id, &request.path)
+        .delete_file(env, &app_id, &request.user_id, &request.path)
         .await?;
     Ok(Json(HttpResult::success("文件删除成功".to_string())))
 }

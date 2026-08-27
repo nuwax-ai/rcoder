@@ -223,17 +223,20 @@ impl super::AppServiceTrait for AppService {
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
     ) -> AppResult<()> {
-        self.clear_app_storage(env, app_id).await
+        self.clear_app_storage(env, app_id, user_id).await
     }
 
     async fn destroy_app_storage(
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
         confirm: &str,
     ) -> AppResult<()> {
-        self.destroy_app_storage(env, app_id, confirm).await
+        self.destroy_app_storage(env, app_id, user_id, confirm)
+            .await
     }
 
     async fn align_db_credentials(
@@ -316,8 +319,13 @@ impl super::AppServiceTrait for AppService {
         self.get_app_health(env, app_id).await
     }
 
-    async fn log_api_base(&self, env: shared_types::UserappEnv, app_id: &str) -> AppResult<String> {
-        self.log_api_base(env, app_id).await
+    async fn log_api_base(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+        user_id: &str,
+    ) -> AppResult<String> {
+        self.log_api_base(env, app_id, user_id).await
     }
 
     async fn get_app_events(
@@ -331,11 +339,12 @@ impl super::AppServiceTrait for AppService {
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
         file_data: Vec<u8>,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult> {
-        self.upload_file(env, app_id, file_data, target, flatten)
+        self.upload_file(env, app_id, user_id, file_data, target, flatten)
             .await
     }
 
@@ -343,11 +352,12 @@ impl super::AppServiceTrait for AppService {
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
         url: &str,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult> {
-        self.upload_from_url(env, app_id, url, target, flatten)
+        self.upload_from_url(env, app_id, user_id, url, target, flatten)
             .await
     }
 
@@ -355,18 +365,20 @@ impl super::AppServiceTrait for AppService {
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>> {
-        self.list_files(env, app_id, subpath).await
+        self.list_files(env, app_id, user_id, subpath).await
     }
 
     async fn delete_file(
         &self,
         env: shared_types::UserappEnv,
         app_id: &str,
+        user_id: &str,
         file_path: &str,
     ) -> AppResult<()> {
-        self.delete_file(env, app_id, file_path).await
+        self.delete_file(env, app_id, user_id, file_path).await
     }
 }
 
@@ -779,7 +791,12 @@ mod tests {
         );
 
         service
-            .destroy_app_storage(shared_types::UserappEnv::Prod, "app-purge", "app-purge")
+            .destroy_app_storage(
+                shared_types::UserappEnv::Prod,
+                "app-purge",
+                "u-purge",
+                "app-purge",
+            )
             .await
             .expect("explicit destroy");
         assert!(
