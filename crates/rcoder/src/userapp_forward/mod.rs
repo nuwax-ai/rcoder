@@ -197,7 +197,13 @@ pub(crate) async fn ensure_workspace_via_dev(
         let resp = crate::http_client::shared_client()
             .post(format!("{addr}/api/v1/userapp/ensure-workspace"))
             .timeout(std::time::Duration::from_secs(30))
-            .json(&serde_json::json!({"appId": app_id, "userId": user_id}))
+            // 双键过渡：新容器读 snake，存量容器（digest 烙印不换镜像）读 camel；
+            // 两侧 DTO 均无 deny_unknown_fields，多出的键被忽略——存量容器全量
+            // 代号后删 camel 键。
+            .json(&serde_json::json!({
+                "app_id": app_id, "appId": app_id,
+                "user_id": user_id, "userId": user_id,
+            }))
             .send()
             .await;
         match resp {
@@ -222,11 +228,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_workspace_body_is_camel_case() {
-        let raw = serde_json::json!({"appId": "app-1", "userId": "u1"});
+    fn create_workspace_body_is_snake_case() {
+        let raw = serde_json::json!({"app_id": "app-1", "user_id": "u1"});
         let body: CreateWorkspaceBody = serde_json::from_value(raw).expect("deserialize");
         assert_eq!(body.app_id, "app-1");
         assert_eq!(body.user_id, "u1");
+        // 旧 camel wire 已废弃：未知键被忽略后必填字段缺失即拒
+        let legacy = serde_json::json!({"appId": "app-1", "userId": "u1"});
+        assert!(serde_json::from_value::<CreateWorkspaceBody>(legacy).is_err());
     }
 
     #[test]

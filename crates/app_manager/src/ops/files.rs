@@ -20,6 +20,10 @@ use crate::utils::*;
 const APP_FILE_SERVER_PORT: u16 = shared_types::AGENT_FILE_SERVER_PORT;
 
 /// file-server app-files 族响应 DTO（形状对齐 app_manager DTO，snake 键）。
+///
+/// 请求侧 app_id 双键发送（app_id+appId）：存量容器 digest 烙印不换镜像、
+/// 旧 DTO 只认 camel 键（snake 键被静默忽略后 app_id 为空 → 错路由）；新容器
+/// snake 主键 + camel alias 双收。存量容器全量换代后删 camel 键。
 #[derive(Debug, Deserialize)]
 struct UploadResp {
     file_path: String,
@@ -102,6 +106,7 @@ impl AppService {
             .unwrap_or_else(|| "uploaded_file".to_string());
         let part = reqwest::multipart::Part::bytes(file_data).file_name(file_name);
         let form = reqwest::multipart::Form::new()
+            .text("app_id", app_id.to_string())
             .text("appId", app_id.to_string())
             .text("target", target.to_string())
             .text("flatten", flatten.to_string())
@@ -141,6 +146,7 @@ impl AppService {
         validate_upload_target(target)?;
         let base = self.app_files_base(app_id).await?;
         let body = serde_json::json!({
+            "app_id": app_id,
             "appId": app_id,
             "url": url,
             "target": target,
@@ -184,7 +190,8 @@ impl AppService {
         validate_app_id(app_id)?;
         let base = self.app_files_base(app_id).await?;
         let mut url = format!(
-            "{base}/api/v1/userapp/app-files/list?appId={}",
+            "{base}/api/v1/userapp/app-files/list?app_id={}&appId={}",
+            urlencode(app_id),
             urlencode(app_id)
         );
         if let Some(p) = subpath.map(str::trim).filter(|p| !p.is_empty()) {
@@ -222,7 +229,7 @@ impl AppService {
             ));
         }
         let base = self.app_files_base(app_id).await?;
-        let body = serde_json::json!({"appId": app_id, "path": file_path});
+        let body = serde_json::json!({"app_id": app_id, "appId": app_id, "path": file_path});
         let resp = reqwest::Client::new()
             .post(format!("{base}/api/v1/userapp/app-files/delete"))
             .json(&body)

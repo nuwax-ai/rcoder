@@ -16,7 +16,6 @@ use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder};
 use crate::{AppError, HttpResult};
 
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateWorkspaceBody {
     /// UserApp 应用 ID（同时是开发容器与 workspace 目录的标识）
     pub app_id: String,
@@ -30,7 +29,7 @@ pub struct CreateWorkspaceBody {
 ///    先于 ensure——builder 宿主树分区依赖 owner user_id）
 /// 2. ensure 该 app 的开发容器（UserAppBuilder，per-app RWO 卷；K8s 走 STS+PVC
 ///    ensure，Docker 走 per-app bind）
-/// 3. 容器内 file-server 幂等建 workspace 目录 `{USERAPP_WORKSPACE_DIR}/{appId}`
+/// 3. 容器内 file-server 幂等建 workspace 目录 `{USERAPP_WORKSPACE_DIR}/{app_id}`
 ///    （execute-command 等接口要求目录已存在）
 #[utoipa::path(
     post,
@@ -98,9 +97,9 @@ pub(crate) async fn create_workspace(
         body.app_id, body.user_id, info.container_name, info.container_ip
     );
     Ok(HttpResult::success(json!({
-        "appId": body.app_id,
-        "userId": body.user_id,
-        "containerName": info.container_name,
-        "containerIp": info.container_ip,
+        "app_id": body.app_id,
+        "user_id": body.user_id,
+        "container_name": info.container_name,
+        "container_ip": info.container_ip,
     })))
 }
