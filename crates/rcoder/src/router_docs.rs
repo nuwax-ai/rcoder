@@ -247,13 +247,18 @@ use crate::handler;
         )
     ),
     tags(
-        (name = "UserApp · 生产运维", description = "userApp 生产环境（运行容器）操作接口：部署启动、停止重启、更新与回收策略"),
-        (name = "UserApp · 生命周期", description = "应用查询/详情/健康/统计/事件与删除（含 dev/prod 双环境观测）"),
-        (name = "UserApp · 日志", description = "应用日志：日志源、检索与 SSE 实时流"),
-        (name = "UserApp · 文件与存储", description = "应用文件上传/管理与存储卷查询/清理"),
-        (name = "UserApp · 数据库", description = "应用 PostgreSQL 账号与数据库管理（dev/prod）"),
-        (name = "UserApp · 终端与代理", description = "终端入口（ttyd/VNC/dbx/pgweb）与流量代理（/proxy/userapp）"),
-        (name = "UserApp · 开发与构建", description = "开发工作区、构建任务与文件镜像（file-server 进程侧服务）"),
+        (name = "UserApp · dev · 构建任务", description = "dev 专属（目标容器恒为 UserAppBuilder 开发容器）：构建触发、任务查询/取消与进度 SSE、制品包下载"),
+        (name = "UserApp · dev · 工作区与工具链", description = "dev 专属（目标容器 UserAppBuilder 开发容器）：workspace 创建、命令执行、打包下载、模板与技能安装、项目类型探测确认"),
+        (name = "UserApp · dev · 进程管理", description = "dev 专属（目标容器 UserAppBuilder 开发容器，路径自带 dev）：dev server 进程启停/列表/日志"),
+        (name = "UserApp · dev · 终端工具", description = "dev 专属（目标容器 UserAppBuilder 开发容器）：ttyd/VNC/audio/ime/dbx 开发终端入口"),
+        (name = "UserApp · prod · 部署与启停", description = "prod 专属（目标为 UserApp 生产运行容器/Deployment）：部署启动、停止、重启与配置更新"),
+        (name = "UserApp · prod · 应用查询", description = "prod 专属：应用详情、分页查询与运行时清单"),
+        (name = "UserApp · prod · 终端工具", description = "prod 专属（目标容器 UserApp 生产运行容器）：ttyd/pgweb/dbx 生产终端入口"),
+        (name = "UserApp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{env} 段分派）：文件上传/管理与存储卷查询/清理/销毁"),
+        (name = "UserApp · 双态 · 日志", description = "dev/prod 双态（路径 {env} 段分派）：日志源、检索与 SSE 实时流，转发容器内 app-cli"),
+        (name = "UserApp · 双态 · 数据库", description = "dev/prod 双态（路径 {env} 段分派）：应用 PostgreSQL 凭据对齐/改密/建库"),
+        (name = "UserApp · 双态 · 生命周期", description = "dev/prod 双态（路径 {env} 段分派）：健康/统计/事件、回收策略与删除"),
+        (name = "UserApp · 访问入口", description = "流量代理（/proxy/userapp/{dev,prod}，前端切换只改 dev→prod 一段）与终端代理路由速查表"),
         (name = "computer", description = "Computer Agent 桌面、聊天与容器内 PG 管理接口"),
         (name = "pod", description = "Pod 容器管理接口（监控/保活/重启；支持 service_type=userapp 分派 dev/prod 容器）"),
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),
@@ -419,6 +424,7 @@ fn file_server_document() -> utoipa::openapi::OpenApi {
     let mut doc = file_server::openapi::document(file_server::routes::api_router().into_openapi());
     doc.merge(file_server_userapp::document());
     strip_internal_userapp_paths(&mut doc);
+    prune_empty_tags(&mut doc);
     doc
 }
 
@@ -428,7 +434,36 @@ fn primary_document() -> utoipa::openapi::OpenApi {
     let mut userapp = file_server_userapp::document();
     strip_internal_userapp_paths(&mut userapp);
     doc.merge(userapp);
+    prune_empty_tags(&mut doc);
     doc
+}
+
+/// 剪掉「已声明但无 operation 引用」的 tag：merge 进来的容器域文档自带 tag
+/// 声明（如 TS 老族的 `双态 · 文件镜像`），其路径在聚合文档可能整族被内部
+/// 剔除——留着会变成 UI 空分组（Swagger 渲染空区块）。声明的分组顺序对有
+/// operation 的 tag 不受影响。
+fn prune_empty_tags(document: &mut utoipa::openapi::OpenApi) {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in document.paths.paths.values() {
+        let ops = [
+            &item.get,
+            &item.post,
+            &item.put,
+            &item.delete,
+            &item.options,
+            &item.head,
+            &item.patch,
+            &item.trace,
+        ];
+        for op in ops.into_iter().flatten() {
+            if let Some(tags) = op.tags.as_ref() {
+                used.extend(tags.iter().cloned());
+            }
+        }
+    }
+    if let Some(tags) = document.tags.as_mut() {
+        tags.retain(|t| used.contains(&t.name));
+    }
 }
 
 #[cfg(test)]
@@ -528,9 +563,10 @@ mod openapi_tests {
         tags.remove(0)
     }
 
-    /// 主文档按业务域分组：UserApp 六个子类 tag 声明齐全且顺序最前（UI 分组
-    /// 顺序 = tags 声明顺序）、legacy tag（应用管理/应用日志/Computer Agent）
-    /// 全文清零、UserApp 系 operation 计数下限、分域锚点逐一断言。
+    /// 主文档按环境维度分组：UserApp 十三个子类 tag（dev 专属 → prod 专属 →
+    /// 双态 → 访问入口）声明齐全且顺序最前（UI 分组顺序 = tags 声明顺序）、
+    /// legacy tag（应用管理/应用日志/Computer Agent）全文清零、UserApp 系
+    /// operation 计数下限、分域锚点逐一断言。
     #[test]
     fn primary_document_groups_userapp_by_business_domain() {
         let document = primary_document();
@@ -541,12 +577,18 @@ mod openapi_tests {
             .map(|t| t.name.as_str())
             .collect();
         let userapp_tags = [
-            "UserApp · 生命周期",
-            "UserApp · 日志",
-            "UserApp · 文件与存储",
-            "UserApp · 数据库",
-            "UserApp · 终端与代理",
-            "UserApp · 开发与构建",
+            "UserApp · dev · 构建任务",
+            "UserApp · dev · 工作区与工具链",
+            "UserApp · dev · 进程管理",
+            "UserApp · dev · 终端工具",
+            "UserApp · prod · 部署与启停",
+            "UserApp · prod · 应用查询",
+            "UserApp · prod · 终端工具",
+            "UserApp · 双态 · 文件与存储",
+            "UserApp · 双态 · 日志",
+            "UserApp · 双态 · 数据库",
+            "UserApp · 双态 · 生命周期",
+            "UserApp · 访问入口",
         ];
         let mut prev: Option<usize> = None;
         for tag in userapp_tags {
@@ -566,7 +608,20 @@ mod openapi_tests {
             tag_names.first().is_some_and(|n| n.starts_with("UserApp")),
             "UserApp 子类必须排在 tags 声明最前"
         );
-        for legacy in ["应用管理", "应用日志", "Computer Agent"] {
+        // 环境维度重组前的旧功能面 tag 视同 legacy：声明与 operation 双清零
+        let legacy_tags = [
+            "应用管理",
+            "应用日志",
+            "Computer Agent",
+            "UserApp · 生命周期",
+            "UserApp · 日志",
+            "UserApp · 文件与存储",
+            "UserApp · 数据库",
+            "UserApp · 终端与代理",
+            "UserApp · 开发与构建",
+            "UserApp · 生产运维",
+        ];
+        for legacy in legacy_tags {
             assert!(
                 !tag_names.contains(&legacy),
                 "legacy tag 声明残留: {legacy}"
@@ -579,7 +634,7 @@ mod openapi_tests {
                 for tag in op.tags.iter().flatten() {
                     let tag = tag.as_str();
                     assert!(
-                        tag != "应用管理" && tag != "应用日志" && tag != "Computer Agent",
+                        !legacy_tags.contains(&tag),
                         "{method} {path}: legacy tag 残留: {tag}"
                     );
                     if tag.starts_with("UserApp") {
@@ -588,48 +643,131 @@ mod openapi_tests {
                 }
             }
         }
-        // 口径（{env} 显式化后）：生产运维6(start/stop/restart/update/delete/recycle-policy)
-        // + 生命周期7(query/runtime/{app_id}/health/stats/events 生命期侧) + 日志3×2形态近似…
-        // 精确值以实际聚合为准（内部剔除 21 条后实测 UserApp 系 op 总数=54），下限防漂移不设满额
+        // 口径（环境维度 tag 重组后同前）：内部剔除 21 条后实测 UserApp 系 op
+        // 总数=54，下限防漂移不设满额
         assert!(
             userapp_ops >= 54,
             "UserApp 系 operation 计数下限（54）未达: {userapp_ops}"
         );
 
         let tag_of = |path: &str, method: &str| sole_tag("primary", &document, path, method);
+        // 环境维度锚点：dev 专属 / prod 专属 / 双态 / 访问入口 各至少一条
         assert_eq!(
-            tag_of("/api/v1/userapp/{app_id}/start", "post"),
-            "UserApp · 生产运维"
+            tag_of("/api/v1/userapp/build", "post"),
+            "UserApp · dev · 构建任务"
         );
         assert_eq!(
-            tag_of("/api/v1/userapp/{app_id}/{env}/logs/stream", "post"),
-            "UserApp · 日志"
+            tag_of("/api/v1/userapp/static/{app_id}", "get"),
+            "UserApp · dev · 构建任务"
+        );
+        assert_eq!(
+            tag_of("/api/v1/userapp/dev/stop", "post"),
+            "UserApp · dev · 进程管理"
+        );
+        assert_eq!(
+            tag_of("/api/v1/userapp/{app_id}/start", "post"),
+            "UserApp · prod · 部署与启停"
+        );
+        assert_eq!(
+            tag_of("/api/v1/userapp/{app_id}/stop", "post"),
+            "UserApp · prod · 部署与启停"
         );
         assert_eq!(
             tag_of("/api/v1/userapp/{app_id}/{env}/storage", "get"),
-            "UserApp · 文件与存储"
+            "UserApp · 双态 · 文件与存储"
+        );
+        assert_eq!(
+            tag_of("/api/v1/userapp/{app_id}/{env}/logs/stream", "post"),
+            "UserApp · 双态 · 日志"
         );
         assert_eq!(
             tag_of("/api/v1/userapp/db/{env}/reset-password", "post"),
-            "UserApp · 数据库"
+            "UserApp · 双态 · 数据库"
         );
         assert_eq!(
             tag_of("/api/v1/userapp/db/{env}/align-credentials", "post"),
-            "UserApp · 数据库"
+            "UserApp · 双态 · 数据库"
+        );
+        assert_eq!(
+            tag_of("/api/v1/userapp/{app_id}/{env}/health", "get"),
+            "UserApp · 双态 · 生命周期"
         );
         assert_eq!(
             tag_of("/proxy/userapp/dev/{user_id}/{app_id}/{*path}", "get"),
-            "UserApp · 终端与代理"
+            "UserApp · 访问入口"
         );
-        assert_eq!(tag_of("/userapp/routes", "get"), "UserApp · 终端与代理");
-        assert_eq!(
-            tag_of("/api/v1/userapp/build", "post"),
-            "UserApp · 开发与构建"
-        );
+        assert_eq!(tag_of("/userapp/routes", "get"), "UserApp · 访问入口");
         assert_eq!(
             tag_of("/computer/db/{user_id}/reset-password", "post"),
             "computer"
         );
+    }
+
+    /// 环境维度防回归：UserApp 系 operation 的 tag 必须带环境段（dev/prod/双态
+    /// 三选一）或属于「访问入口」——今后新增接口随手写无环境维度的 tag 即红，
+    /// 保证 Scalar 分组永远可按 dev 专属 / prod 专属 / 双态辨识。
+    #[test]
+    fn userapp_tags_carry_environment_dimension() {
+        let document = primary_document();
+        let mut userapp_ops = 0usize;
+        for (path, item) in &document.paths.paths {
+            for (method, op) in operations_of(item) {
+                for tag in op.tags.iter().flatten() {
+                    let tag = tag.as_str();
+                    if !tag.starts_with("UserApp") {
+                        continue;
+                    }
+                    userapp_ops += 1;
+                    let well_formed = tag.starts_with("UserApp · dev · ")
+                        || tag.starts_with("UserApp · prod · ")
+                        || tag.starts_with("UserApp · 双态 · ")
+                        || tag == "UserApp · 访问入口";
+                    assert!(
+                        well_formed,
+                        "{method} {path}: UserApp tag 缺环境维度（须为 \
+                         `UserApp · dev|prod|双态 · 功能` 或 `UserApp · 访问入口`）: {tag}"
+                    );
+                }
+            }
+        }
+        assert!(
+            userapp_ops >= 54,
+            "UserApp 系 operation 计数下限（54）未达: {userapp_ops}"
+        );
+        // 三个环境组都必须非空：分组退化（全塞一组/环境段丢失）当场报红
+        for prefix in ["UserApp · dev · ", "UserApp · prod · ", "UserApp · 双态 · "] {
+            assert!(
+                document
+                    .tags
+                    .iter()
+                    .flatten()
+                    .any(|t| t.name.starts_with(prefix)),
+                "tags 声明缺失环境组: {prefix}"
+            );
+        }
+        // 声明的 UserApp tag 必有 operation 引用：merge 进来的容器域声明遇
+        // 整族内部剔除会变空组（UI 空区块），prune_empty_tags 已剪、此处锁死
+        let declared: Vec<&str> = document
+            .tags
+            .iter()
+            .flatten()
+            .map(|t| t.name.as_str())
+            .filter(|n| n.starts_with("UserApp"))
+            .collect();
+        let used: std::collections::HashSet<&str> = document
+            .paths
+            .paths
+            .values()
+            .flat_map(operations_of)
+            .flat_map(|(_, op)| op.tags.iter().flatten().map(String::as_str))
+            .filter(|t| t.starts_with("UserApp"))
+            .collect();
+        for tag in declared {
+            assert!(
+                used.contains(tag),
+                "声明了但零 operation 的空 UserApp tag: {tag}"
+            );
+        }
     }
 
     /// 运行时承接面与文档面双向闭包：主文档可见的每个 userapp path 必须被

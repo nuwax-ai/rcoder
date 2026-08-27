@@ -51,7 +51,7 @@ use super::AppManagerState;
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
         (status = 500, description = "连接 app-cli / 响应读取失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · 日志"
+    tag = "UserApp · 双态 · 日志"
 )]
 pub async fn query_app_log_sources(
     State(state): State<Arc<AppManagerState>>,
@@ -89,7 +89,7 @@ sources/query。
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
         (status = 500, description = "连接 app-cli / 响应读取失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · 日志"
+    tag = "UserApp · 双态 · 日志"
 )]
 pub async fn query_app_logs(
     State(state): State<Arc<AppManagerState>>,
@@ -127,7 +127,7 @@ SSE 实时日志流（500ms 轮询内核）：事件清单与断线续传协议�
         (status = 409, description = "应用无就绪实例 IP（未运行/未就绪），无法访问日志", body = HttpResult<String>),
         (status = 500, description = "连接 app-cli / 建流失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · 日志"
+    tag = "UserApp · 双态 · 日志"
 )]
 pub async fn stream_app_logs_v1(
     State(state): State<Arc<AppManagerState>>,

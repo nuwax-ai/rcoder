@@ -36,7 +36,7 @@ use crate::models::{HealthInfo, ResourceStats};
         (status = 400, description = "env 非法（仅 dev|prod）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · 双态 · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn get_app_health(
@@ -79,7 +79,7 @@ pub struct StatsParams {
         (status = 400, description = "参数错误（user_id 缺失/非法）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · 双态 · 生命周期"
 )]
 #[instrument(skip(state, params))]
 pub async fn get_app_stats(
@@ -122,7 +122,7 @@ pub async fn get_app_stats(
         (status = 400, description = "env 非法或 dev 不支持（本接口仅 prod）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · 双态 · 生命周期"
 )]
 #[instrument(skip(state))]
 pub async fn get_app_events(

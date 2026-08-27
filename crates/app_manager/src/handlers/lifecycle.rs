@@ -28,7 +28,7 @@ use crate::models::{
         (status = 200, description = "查询成功", body = HttpResult<PaginatedResponse<AppRuntimeInfo>>),
         (status = 500, description = "集群查询失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · prod · 应用查询"
 )]
 #[instrument(skip(state, request))]
 pub async fn query_apps(
@@ -50,7 +50,7 @@ pub async fn query_apps(
         (status = 200, description = "对账成功", body = HttpResult<Vec<AppRuntimeInfo>>),
         (status = 500, description = "集群查询失败", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · prod · 应用查询"
 )]
 #[instrument(skip(state))]
 pub async fn list_app_runtimes(
@@ -80,7 +80,7 @@ pub async fn list_app_runtimes(
         (status = 200, description = "查询成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · prod · 应用查询"
 )]
 #[instrument(skip(state))]
 pub async fn get_app(
@@ -107,7 +107,7 @@ pub async fn get_app(
         (status = 200, description = "更新成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生产运维"
+    tag = "UserApp · prod · 部署与启停"
 )]
 #[instrument(skip(state, request))]
 pub async fn update_app(
@@ -150,7 +150,7 @@ pub async fn update_app(
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "resource_version 不匹配", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生产运维"
+    tag = "UserApp · 双态 · 生命周期"
 )]
 #[instrument(skip(state, body))]
 pub async fn delete_app(

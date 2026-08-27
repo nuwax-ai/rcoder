@@ -458,7 +458,7 @@ pub async fn proxy_to_port_with_path(
 #[utoipa::path(
     get,
     path = "/proxy/userapp/prod/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · 终端与代理",
+    tag = "UserApp · 访问入口",
     summary = "按 app_id 访问部署的应用服务",
     description = r#"
 访问 `POST /api/v1/userapp` 部署的应用。`access.external.http` 返回 `/proxy/userapp/prod/{user_id}/{app_id}`，即本接口。
@@ -531,7 +531,7 @@ pub async fn proxy_to_app_with_path(
 #[utoipa::path(
     get,
     path = "/proxy/userapp/dev/{user_id}/{app_id}/{*path}",
-    tag = "UserApp · 终端与代理",
+    tag = "UserApp · 访问入口",
     summary = "开发容器预览入口",
     description = r#"
 访问开发阶段该 app 开发容器（UserAppBuilder，per-app）内的应用。与部署访问
