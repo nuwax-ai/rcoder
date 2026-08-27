@@ -73,12 +73,12 @@ async fn create_workspace(env: &Env, report: &JsonlReporter, app_id: &str, user:
     let (status, body) = post_json(
         env,
         "/api/userapp/workspace",
-        json!({"appId": app_id, "userId": user}),
+        json!({"app_id": app_id, "user_id": user}),
     )
     .await;
     let ok = status.is_success()
         && http_ok(&body)
-        && body["data"]["containerName"]
+        && body["data"]["container_name"]
             .as_str()
             .is_some_and(|n| n.contains(app_id));
     report.assert_hard(

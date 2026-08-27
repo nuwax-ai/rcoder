@@ -57,7 +57,7 @@ async fn test_publish_endpoints_removed(env: &Env, report: &JsonlReporter) {
 }
 
 /// file-server build 入口校验：缺转发 header `X-App-Id` → 400 快速失败（不挂起、
-/// 无容器副作用）。body 内 appId 格式的严格校验是 TS 对齐语义（file-server 侧
+/// 无容器副作用）。body 内 app_id 格式的严格校验是 TS 对齐语义（file-server 侧
 /// 仅 not_blank），随 nuwax-file-server 改造对齐，不在本测试范围。
 async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
     let t0 = Instant::now();
@@ -65,7 +65,7 @@ async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
         .http
         .post(format!("{}/api/userapp/build", env.rcoder))
         .timeout(Duration::from_secs(30))
-        .json(&json!({"appId": "app-e2e-noheader", "userId": "e2e-user"}))
+        .json(&json!({"app_id": "app-e2e-noheader", "user_id": "e2e-user"}))
         .send()
         .await
         .expect("http post");
@@ -78,7 +78,7 @@ async fn test_build_identifier_validation(env: &Env, report: &JsonlReporter) {
     );
 }
 
-/// file-server 构建链终态收敛：create-workspace → build 受理（taskId + artifactPath）
+/// file-server 构建链终态收敛：create-workspace → build 受理（task_id + artifact_path）
 /// → tasks 轮询到终态（不挂死）→ static 按 app 直下（completed=200 / failed=404）。
 async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     // ident 唯一化：run_tag(秒级)+pid——不同测试进程同秒启动也不撞名
@@ -94,7 +94,7 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
     let (ws_status, ws_body) = post_json(
         env,
         "/api/userapp/workspace",
-        json!({"appId": ident, "userId": "e2e-user"}),
+        json!({"app_id": ident, "user_id": "e2e-user"}),
     )
     .await;
     report.diagnostic(
@@ -108,29 +108,29 @@ async fn test_build_reaches_terminal(env: &Env, report: &JsonlReporter) {
         .post(format!("{}/api/userapp/build", env.rcoder))
         .timeout(Duration::from_secs(60))
         .header("X-App-Id", &ident)
-        .json(&json!({"appId": ident, "userId": "e2e-user"}))
+        .json(&json!({"app_id": ident, "user_id": "e2e-user"}))
         .send()
         .await
         .expect("http post");
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
-    let task_id = body["data"]["taskId"]
+    let task_id = body["data"]["task_id"]
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    let artifact_path = body["data"]["artifactPath"]
+    let artifact_path = body["data"]["artifact_path"]
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    // taskId 非空一并校验：键名漂移（读错字段得空串）会让后续轮询 404 循环
-    // 到超时，表象是"疑似挂死"——在受理处即拦截。artifactPath 为受理即有的
+    // task_id 非空一并校验：键名漂移（读错字段得空串）会让后续轮询 404 循环
+    // 到超时，表象是"疑似挂死"——在受理处即拦截。artifact_path 为受理即有的
     // 信息字段（快照同源）
     let ok = status.is_success()
         && http_ok(&body)
         && !task_id.is_empty()
         && artifact_path.starts_with("builds/workspace-package-");
     report.assert_hard(
-        "build 受理（200 + taskId + artifactPath 预生成）",
+        "build 受理（200 + task_id + artifact_path 预生成）",
         ok,
         format!("HTTP {status}, body 截断: {}", trunc(&body, 120)),
     );

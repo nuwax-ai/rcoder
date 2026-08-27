@@ -1,5 +1,12 @@
 # 11. 构建发布任务与 SSE 事件
 
+> **⚠️ 本文大部分内容已过时（2026-08-27 标注）**：rcoder 侧 publish 任务体系
+> （`/api/v1/userapp/publish/tasks/*`）与 releases 五接口已删除（构建链收敛为
+> file-server `/api/v1/userapp/*` 接口族：`POST /build`、`GET /tasks/{task_id}`、
+> `GET /tasks/{task_id}/logs/stream`、`POST /tasks/{task_id}/cancel`，任务快照与
+> SSE 事件契约以 rcoder 聚合 swagger 为准——字段 snake_case）。本文保留作历史
+> 参照，对接勿按本文接口路径开发。
+
 > 构建发布是异步任务，本文说明任务状态查询与 SSE 实时进度事件格式。
 
 ---

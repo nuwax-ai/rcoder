@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Docker Compose 部署模式下的 UserApp / app_manager 回归测试。
 
+**已废弃（2026-08-27）**：本脚本打面的 publish 编排 / POST /api/v1/userapp 创建
+等接口已随发布链路重构删除（b6e7029 起），运行必 404。权威回归面已迁移到
+Rust e2e 套件 `tests-e2e/tests/compose_userapp*.rs`；保留本文件仅作历史参照，
+勿再维护。
+
 覆盖 compose 模式可直接验证的面（K8s 专属链路除外）：
   1. tasks/query 列表接口（compose = 内存任务表遍历，分页结构）
   2. app 创建约束：UserApp 语义下必须先有 active release lock（发布流水线独占创建）

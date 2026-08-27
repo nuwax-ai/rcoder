@@ -1,8 +1,12 @@
 # 版本化发布与回滚
 
+> **⚠️ 本文 releases 五接口（prepare/activate/confirm/list/delete）已删除
+> （2026-08-27 标注）**——部署统一走 `POST /api/v1/userapp/{app_id}/start`（url
+> 轻量部署），版本回滚由 start+url 指定历史制品实现。保留作历史参照。
+
 产物名为 `workspace-package-<release_id>.zip`（落 workspace 的 `builds/` 子目录——
-build 任务创建时即可从响应/快照的 `artifactPath` 字段拿到确定性相对路径，取包走
-`GET /api/v1/userapp/static/{appId}/{artifactPath}`），根目录必须包含
+build 任务创建时即可从响应/快照的 `artifact_path` 字段拿到确定性相对路径，取包走
+`GET /api/v1/userapp/static/{app_id}?release_id=<id>`），根目录必须包含
 `workspace.manifest.toml` 和 `release.lock.toml`。
 
 ```text

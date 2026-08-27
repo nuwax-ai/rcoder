@@ -17,10 +17,12 @@ workspace/
 POST /api/v1/userapp/build
 Content-Type: application/json
 
-{"appId":"app-example"}
+{"app_id":"app-example","user_id":"u-1"}
 ```
 
-响应包含 `releaseId`、版本化 zip 路径、SHA-256、大小和 schemaVersion。构建命令直接按 argv
+响应（HttpResult 信封）`data` 含 `task_id` 与预生成的 `artifact_path`；轮询
+`GET /api/v1/userapp/tasks/{task_id}` 到终态后，快照含 `release_id`、SHA-256、
+产物大小与文件名。构建命令直接按 argv
 执行，不经过隐式 shell；需要 shell 功能时显式配置 `["sh","-c","..."]`。
 
 file-server 构建前必须配置 `RCODER_PINGAP_VERSION`、`RCODER_PINGAP_COMMIT` 和
