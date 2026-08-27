@@ -103,8 +103,9 @@ pub(crate) fn dev_file_server_addr(state: &AppState, info: &ContainerBasicInfo) 
     format!("http://{host}:{AGENT_FILE_SERVER_PORT}")
 }
 
-/// 纯解析:只查 state.projects,无副作用。
-fn registered_builder(state: &AppState, project_id: &str) -> Option<ContainerBasicInfo> {
+/// 纯解析:只查 state.projects,无副作用（短路语义 peek 复用——只读判定
+/// 容器注册在否，不 ensure 不自愈）。
+pub(crate) fn registered_builder(state: &AppState, project_id: &str) -> Option<ContainerBasicInfo> {
     state
         .projects
         .get(project_id)
