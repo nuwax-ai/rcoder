@@ -12,7 +12,7 @@ mod dev_locator;
 pub use dev_cleanup::UserappDevResourcesCleanup;
 pub use dev_locator::UserappDevLocator;
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result, anyhow};
 use container_runtime_api::ContainerCreateParams;
@@ -177,6 +177,12 @@ fn resolve_owner(explicit: Option<&str>, metadata: Option<&str>) -> Result<Strin
         return Ok(uid.to_string());
     }
     Err(anyhow!("missing user_id"))
+}
+
+/// 供 bin 装配（main.rs）构造 Pingora 代理的 dev 容器懒启动回调
+/// （`UserappDevLocator` 实现 `UserappDevEnsure` 契约；`new` 为 crate 内可见）。
+pub fn dev_ensure_for_proxy(state: Weak<AppState>) -> Arc<UserappDevLocator> {
+    Arc::new(UserappDevLocator::new(state))
 }
 
 #[cfg(test)]

@@ -30,7 +30,7 @@ pub use userapp::db_align::{
     align_pg_credentials,
 };
 pub use userapp::dev_cleanup::UserappDevCleanup;
-pub use userapp::dev_locator::UserappDevLocator;
+pub use userapp::dev_locator::{UserappDevEnsure, UserappDevLocator};
 pub use userapp::env::{UserappEnv, invalid_env_error};
 pub use userapp::forward_contract::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER,

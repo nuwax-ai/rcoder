@@ -28,8 +28,13 @@ use crate::service::utils;
 
 /// 按 app_id 解析 UserAppBuilder 开发容器 IP（app_id 先过 identifier 白名单，
 /// 防 header 注入与路径拼接逃逸）。
-pub(crate) fn find_dev_container(
+///
+/// 懒启动：注册表 miss 时经 `UserappDevEnsure` 回调自动 ensure 创建（开终端是
+/// 使用语义；owner 走 metadata 链——浏览器终端 URL 无入参携带能力），
+/// ensure 失败或回调未注入才 404（指引先建工作区）。
+pub(crate) async fn find_dev_container(
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
+    dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
     app_id: &str,
 ) -> Result<String, Box<pingora_core::Error>> {
     if let Err(e) = shared_types::validate_identifier(app_id, "app_id") {
@@ -38,21 +43,43 @@ pub(crate) fn find_dev_container(
             pingora_core::ErrorType::HTTPStatus(400),
         ));
     }
-    container_lookup
+    if let Some(ip) = container_lookup
         .as_ref()
         .and_then(|lookup| {
             lookup.find_by_project_id(app_id, &shared_types::ServiceType::UserAppBuilder)
         })
-        .ok_or_else(|| {
-            info!(
-                "[DEV_TERMINAL] dev container not found: app_id={app_id} (create workspace first)"
+        .filter(|ip| !ip.is_empty())
+    {
+        return Ok(ip);
+    }
+    // miss → 懒启动（metadata owner 链；显式 user_id 恒 None——URL 无携带位）。
+    // 槽未回填（AppState 就绪前）视为未注入，维持 404 指引。
+    let Some(ensurer) = dev_ensure.load_full() else {
+        info!("[DEV_TERMINAL] dev container not found: app_id={app_id} (create workspace first)");
+        return Err(not_found_error(app_id));
+    };
+    match ensurer.ensure_dev_container(app_id, None).await {
+        Ok(info) if !info.container_ip.is_empty() => {
+            info!("[DEV_TERMINAL] dev container ensured on demand: app_id={app_id}");
+            Ok(info.container_ip)
+        }
+        Ok(info) => {
+            warn!("[DEV_TERMINAL] ensured dev container has no ip: app_id={app_id}, info={info:?}");
+            Err(not_found_error(app_id))
+        }
+        Err(e) => {
+            warn!(
+                "[DEV_TERMINAL] ensure dev container failed: app_id={app_id}: {e} (create workspace first)"
             );
-            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
-                format!(
-                    "userapp dev container for app {app_id} not found, please create workspace first"
-                ),
-            )
-        })
+            Err(not_found_error(app_id))
+        }
+    }
+}
+
+fn not_found_error(app_id: &str) -> Box<pingora_core::Error> {
+    pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(format!(
+        "userapp dev container for app {app_id} not found, please create workspace first"
+    ))
 }
 
 /// 提取并校验 app_id 路径参数。
@@ -106,9 +133,10 @@ pub async fn handle_dev_ttyd_upstream(
     params: Params<'_, '_>,
     metrics: &Arc<ProxyMetrics>,
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
+    dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
-    let container_ip = find_dev_container(container_lookup, &app_id)?;
+    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id).await?;
 
     metrics.record_request();
     metrics.inc_active();
@@ -163,9 +191,10 @@ pub async fn handle_dev_vnc_upstream(
     params: Params<'_, '_>,
     metrics: &Arc<ProxyMetrics>,
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
+    dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
-    let container_ip = find_dev_container(container_lookup, &app_id)?;
+    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id).await?;
 
     metrics.record_request();
     metrics.inc_active();
@@ -201,6 +230,7 @@ pub async fn handle_dev_audio_request(
     ctx: &mut TrackingCtx,
     metrics: &Arc<ProxyMetrics>,
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
+    dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
 ) -> PingoraResult<()> {
     let app_id = require_app_id(&params)?;
     let remaining = params.get("path").unwrap_or("");
@@ -216,7 +246,7 @@ pub async fn handle_dev_audio_request(
         format!("/{remaining}")
     };
 
-    let container_ip = find_dev_container(container_lookup, &app_id)?;
+    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id).await?;
     metrics.record_request();
     metrics.record_request_port(target_port);
     ctx.target_port = Some(target_port);
@@ -269,11 +299,12 @@ pub async fn handle_dev_ime_request(
     ctx: &mut TrackingCtx,
     metrics: &Arc<ProxyMetrics>,
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
+    dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
 ) -> PingoraResult<()> {
     let app_id = require_app_id(&params)?;
     let target_path = target_path_of(&params);
 
-    let container_ip = find_dev_container(container_lookup, &app_id)?;
+    let container_ip = find_dev_container(container_lookup, dev_ensure, &app_id).await?;
     metrics.record_request();
     metrics.record_request_port(crate::service::types::IME_PORT);
     ctx.target_port = Some(crate::service::types::IME_PORT);

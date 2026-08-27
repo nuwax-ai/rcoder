@@ -55,3 +55,23 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
             .map_err(|e| format!("find UserAppBuilder (app {app_id}): {e}"))
     }
 }
+
+/// 终端代理（rcoder-proxy）的 dev 容器懒启动回调：容器不在时自动 ensure
+/// 创建（owner 走 metadata 链——浏览器终端 URL 无入参携带能力）。
+#[async_trait::async_trait]
+impl shared_types::UserappDevEnsure for UserappDevLocator {
+    async fn ensure_dev_container(
+        &self,
+        app_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<shared_types::ContainerBasicInfo, String> {
+        let state = self.state()?;
+        let (info, created) = ensure_userapp_builder_probed(&state, app_id, user_id)
+            .await
+            .map_err(|e| format!("ensure UserAppBuilder (app {app_id}): {e:#}"))?;
+        if created {
+            tracing::info!("[USERAPP_DEV_LOCATOR] builder ensured on demand: app_id={app_id}");
+        }
+        Ok(info)
+    }
+}

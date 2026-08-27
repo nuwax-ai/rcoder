@@ -242,6 +242,16 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    // dev 终端代理（ttyd/vnc/audio/ime/dbx）的懒启动回调回填：开终端是使用
+    // 语义，开发容器不在时自动 ensure 创建而非 404（owner 走 metadata 链——
+    // 浏览器终端 URL 无入参携带能力）。AppState 就绪晚于 Pingora 启动，
+    // ArcSwap 槽回填生效（与 set_app_runtime_ip_resolver 同款时序）。
+    if let Some(pingora_service) = proxy_result.pingora_service.as_ref() {
+        pingora_service.set_dev_ensure(userapp_builder::dev_ensure_for_proxy(Arc::downgrade(
+            &state,
+        )));
+    }
+
     let _bg_handles = background_tasks::start_all_background_tasks(
         &bootstrap_result.config,
         state.clone(),

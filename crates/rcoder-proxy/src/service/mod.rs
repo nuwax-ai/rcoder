@@ -67,6 +67,10 @@ pub struct PingoraProxyService {
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
     /// UserApp 流量唤醒（stopped app 收到请求时 hold-and-wait 拉起）
     wake_control: Option<Arc<dyn shared_types::AppWakeControl>>,
+    /// 开发容器懒启动回调（dev 终端族 miss 时自动 ensure，而非 404）。
+    /// ArcSwap 槽——AppState 就绪晚于 Pingora 启动，main 侧经
+    /// [`Self::set_dev_ensure`] 回填（PortProxy 共享同槽实时见）
+    pub(crate) dev_ensure_slot: Arc<ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>>,
     /// userApp 运行容器 IPv4 解析（Docker 模式；ArcSwap 槽——启动后经
     /// [`Self::set_app_runtime_ip_resolver`] 回填，PortProxy 共享同槽实时见）
     pub(crate) app_runtime_ip_slot: Arc<ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>>,
@@ -103,6 +107,8 @@ pub struct PortProxy {
     /// UserApp 访问追踪 + 流量唤醒（/proxy/userapp/prod/* 路由用）
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
     wake_control: Option<Arc<dyn shared_types::AppWakeControl>>,
+    /// 开发容器懒启动回调槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) dev_ensure_slot: Arc<ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>>,
     /// userApp 运行容器 IPv4 解析槽（与 PingoraProxyService 共享同一 Arc）
     pub(crate) app_runtime_ip_slot: Arc<ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>>,
 }
@@ -128,6 +134,7 @@ impl PingoraProxyService {
             container_lookup: None,
             access_tracker: None,
             wake_control: None,
+            dev_ensure_slot: Arc::new(ArcSwapOption::from(None)),
             app_runtime_ip_slot: Arc::new(ArcSwapOption::from(None)),
         }
     }
@@ -160,6 +167,12 @@ impl PingoraProxyService {
     pub fn with_wake_control(mut self, wc: Arc<dyn shared_types::AppWakeControl>) -> Self {
         self.wake_control = Some(wc);
         self
+    }
+
+    /// 回填开发容器懒启动回调（启动后调用——AppState 就绪晚于 Pingora 启动；
+    /// PortProxy 共享槽，无锁生效）
+    pub fn set_dev_ensure(&self, de: Arc<dyn shared_types::UserappDevEnsure>) {
+        self.dev_ensure_slot.store(Some(Arc::new(de)));
     }
 
     /// 设置负载均衡算法
@@ -212,6 +225,7 @@ impl PingoraProxyService {
             container_lookup: self.container_lookup.clone(),
             access_tracker: self.access_tracker.clone(),
             wake_control: self.wake_control.clone(),
+            dev_ensure_slot: Arc::clone(&self.dev_ensure_slot),
             app_runtime_ip_slot: self.app_runtime_ip_slot.clone(),
         })
     }
@@ -233,6 +247,7 @@ impl Clone for PingoraProxyService {
             container_lookup: self.container_lookup.clone(),
             access_tracker: self.access_tracker.clone(),
             wake_control: self.wake_control.clone(),
+            dev_ensure_slot: Arc::clone(&self.dev_ensure_slot),
             app_runtime_ip_slot: self.app_runtime_ip_slot.clone(),
         }
     }

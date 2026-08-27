@@ -142,6 +142,7 @@ impl PortProxy {
                     ctx,
                     &self.metrics,
                     &self.container_lookup,
+                    &self.dev_ensure_slot,
                 )
                 .await?;
             }
@@ -153,6 +154,7 @@ impl PortProxy {
                     ctx,
                     &self.metrics,
                     &self.container_lookup,
+                    &self.dev_ensure_slot,
                 )
                 .await?;
             }
@@ -300,6 +302,7 @@ impl PortProxy {
                     params,
                     &self.metrics,
                     &self.container_lookup,
+                    &self.dev_ensure_slot,
                 )
                 .await
             }
@@ -309,6 +312,7 @@ impl PortProxy {
                     params,
                     &self.metrics,
                     &self.container_lookup,
+                    &self.dev_ensure_slot,
                 )
                 .await
             }
@@ -344,6 +348,7 @@ impl PortProxy {
                     params,
                     &self.metrics,
                     &self.container_lookup,
+                    &self.dev_ensure_slot,
                 )
                 .await
             }
