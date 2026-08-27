@@ -35,32 +35,39 @@ pub struct GitQuery {
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GitWriteBody {
+    /// 工作区类型：project / computer
     pub workspace_type: String,
+    /// 项目 ID（workspaceType=project 时必填）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub project_id: Option<String>,
+    /// 用户 ID（workspaceType=computer 时必填）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub user_id: Option<String>,
+    /// 容器/实例 ID（workspaceType=computer 时必填）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub c_id: Option<String>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
 }
@@ -73,6 +80,7 @@ pub struct FileContentBody {
     /// nuwax 字段名 `ref` (Rust 关键字, 用 ref_ + serde rename)
     #[serde(rename = "ref", default)]
     pub ref_: Option<String>,
+    /// 文件相对路径
     pub file_path: String,
 }
 
@@ -81,6 +89,7 @@ pub struct FileContentBody {
 pub struct FilesBody {
     #[serde(flatten)]
     pub base: GitWriteBody,
+    /// 暂存文件集合（缺省等价 git add -A）
     #[serde(default)]
     pub files: Option<Vec<String>>,
 }
@@ -91,14 +100,18 @@ pub struct CommitBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
+    /// 提交信息（必填非空）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub message: String,
+    /// 限定提交的文件集合（缺省等价提交全部暂存）
     #[serde(default)]
     #[garde(skip)]
     pub files: Option<Vec<String>>,
+    /// 覆盖提交者名称（缺省用服务端配置）
     #[serde(default)]
     #[garde(skip)]
     pub author_name: Option<String>,
+    /// 覆盖提交者邮箱（缺省用服务端配置）
     #[serde(default)]
     #[garde(skip)]
     pub author_email: Option<String>,
@@ -109,12 +122,16 @@ pub struct CommitBody {
 pub struct DiffBody {
     #[serde(flatten)]
     pub base: GitWriteBody,
+    /// 差异来源：worktree / staged / commit（缺省 worktree）
     #[serde(default)]
     pub source: String,
+    /// 起始 ref（缺省 HEAD）
     #[serde(default)]
     pub from: Option<String>,
+    /// 结束 ref（缺省工作区）
     #[serde(default)]
     pub to: Option<String>,
+    /// 限定差异的路径集合
     #[serde(default)]
     pub paths: Option<Vec<String>>,
 }
@@ -125,6 +142,7 @@ pub struct TargetBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
+    /// 目标 ref（checkout 用，必填非空）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub target: String,
 }
@@ -135,8 +153,10 @@ pub struct ResetBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
+    /// 重置目标 ref（必填非空）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub target: String,
+    /// 重置模式：soft / mixed / hard（缺省 mixed）
     #[serde(default)]
     #[garde(skip)]
     pub mode: String,
@@ -148,14 +168,18 @@ pub struct RevertBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
+    /// 要 revert 的目标 ref（必填非空）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub target: String,
+    /// revert 提交信息（缺省自动生成）
     #[serde(default)]
     #[garde(skip)]
     pub message: Option<String>,
+    /// 覆盖提交者名称（缺省用服务端配置）
     #[serde(default)]
     #[garde(skip)]
     pub author_name: Option<String>,
+    /// 覆盖提交者邮箱（缺省用服务端配置）
     #[serde(default)]
     #[garde(skip)]
     pub author_email: Option<String>,
@@ -167,8 +191,10 @@ pub struct BranchCreateBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
+    /// 新建分支名（必填非空）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub branch_name: String,
+    /// 分支起点（缺省当前 HEAD）
     #[serde(default)]
     #[garde(skip)]
     pub start_point: Option<String>,
@@ -180,6 +206,7 @@ pub struct BranchNameBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
+    /// 分支名（必填非空）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub branch_name: String,
     /// branch-delete 强制删除未合并分支 (对齐 nuwax deleteBranch force)。
@@ -194,8 +221,10 @@ pub struct TagCreateBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
+    /// 标签名（必填非空）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub tag_name: String,
+    /// 附注标签的消息（缺省创建轻量标签）
     #[serde(default)]
     #[garde(skip)]
     pub message: Option<String>,
@@ -207,6 +236,7 @@ pub struct TagNameBody {
     #[serde(flatten)]
     #[garde(skip)]
     pub base: GitWriteBody,
+    /// 标签名（必填非空）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub tag_name: String,
 }

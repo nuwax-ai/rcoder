@@ -3,7 +3,7 @@
 //! 按职责拆分:
 //! - [`mod@self`] (本文件): [`Config`] 结构定义、默认值与常量;
 //! - [`env`][]: 环境变量解析工具与限额校验;
-//! - [`load`][]: 配置文件/环境变量加载入口与 [`Config::validate`]。
+//! - `load`: 配置文件/环境变量加载入口与 [`Config::validate`]。
 //!
 //! 仅含业务路径与开关; 工作区根 (project/computer) 由 [`crate::workspace::WorkspaceResolver`] 负责。
 

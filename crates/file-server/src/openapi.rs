@@ -100,6 +100,75 @@ mod tests {
         document(crate::routes::api_router().into_openapi())
     }
 
+    /// 文档质量守卫：全部 components schema 的字段必须有非空 description
+    /// （doc comment 是 swagger description 唯一来源——同事按 swagger 对接，
+    /// 缺描述即对接盲区；与 file-server-userapp 的同款守卫对齐）。serde
+    /// flatten 生成的 allOf 组合 schema（git 写操作族）逐 part 解引用后同
+    /// 规则检查；$ref / array 取值的字段不带自身 description，跳过（与
+    /// userapp 守卫同口径）。走序列化 JSON 而非 utoipa 类型 API（版本无关）。
+    #[test]
+    fn schema_fields_are_documented() {
+        let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
+        let schemas = value["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        let mut checked = 0usize;
+        let mut missing = Vec::new();
+
+        fn check_props(
+            label: &str,
+            props: &serde_json::Map<String, Value>,
+            checked: &mut usize,
+            missing: &mut Vec<String>,
+        ) {
+            for (field, field_schema) in props {
+                let Some(obj) = field_schema.as_object() else {
+                    continue;
+                };
+                if !obj.contains_key("type") && !obj.contains_key("$ref") {
+                    continue;
+                }
+                let documented = obj
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .is_some_and(|d| !d.trim().is_empty());
+                if documented {
+                    *checked += 1;
+                } else {
+                    missing.push(format!("{label}.{field}"));
+                }
+            }
+        }
+
+        for (name, schema) in schemas {
+            let Some(obj) = schema.as_object() else {
+                continue;
+            };
+            if let Some(props) = obj.get("properties").and_then(Value::as_object) {
+                check_props(name, props, &mut checked, &mut missing);
+            }
+            if let Some(parts) = obj.get("allOf").and_then(Value::as_array) {
+                for part in parts {
+                    let target = part
+                        .get("$ref")
+                        .and_then(Value::as_str)
+                        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+                        .and_then(|key| schemas.get(key))
+                        .unwrap_or(part);
+                    if let Some(props) = target.get("properties").and_then(Value::as_object) {
+                        check_props(name, props, &mut checked, &mut missing);
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "schema 字段缺 description（补 doc comment）：\n{}",
+            missing.join("\n")
+        );
+        assert!(checked > 250, "sanity: 覆盖异常, 实际 {checked}");
+    }
+
     #[test]
     fn document_contains_every_registered_operation() {
         let document = generated_document();

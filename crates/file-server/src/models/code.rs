@@ -61,13 +61,18 @@ impl FromStr for FileOperation {
 #[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FileOp {
+    /// 操作类型：create / delete / rename / modify
     #[schema(value_type = FileOperation)]
     pub operation: String,
+    /// 目标文件相对路径（rename 时为新路径）
     pub name: String,
+    /// 是否目录（缺省 false）
     #[serde(default)]
     pub is_dir: Option<bool>,
+    /// 文本内容（create/modify 时写入；服务端做 URL 解码）
     #[serde(default)]
     pub contents: Option<String>,
+    /// rename 的源路径（操作为 rename 时必填）
     #[serde(default)]
     pub rename_from: Option<String>,
 }
@@ -76,15 +81,21 @@ pub struct FileOp {
 #[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
+    /// 文件相对路径
     pub name: String,
+    /// 文本内容（全量覆盖写入；服务端做 URL 解码）
     #[serde(default)]
     pub contents: Option<String>,
+    /// 二进制内容标记（对齐 nuwax 字段位）
     #[serde(default)]
     pub binary: Option<bool>,
+    /// 内容超过单文件上限时置 true（此时内容被丢弃）
     #[serde(default)]
     pub size_exceeded: Option<bool>,
+    /// 是否目录
     #[serde(default)]
     pub is_dir: Option<bool>,
+    /// rename 的源路径（同名字段重命名场景）
     #[serde(default)]
     pub rename_from: Option<String>,
 }

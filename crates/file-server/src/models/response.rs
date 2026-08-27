@@ -12,30 +12,45 @@ use utoipa::ToSchema;
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
+    /// 恒为 "ok"（探活判定依据）
     pub status: String,
+    /// 当前 epoch 毫秒
     pub timestamp: i64,
+    /// 进程运行秒数
     pub uptime: u64,
+    /// 服务版本号
     pub version: String,
+    /// 运行平台标识（os）
     pub platform: String,
+    /// 运行时标识（Rust 版，对齐 nuwax nodeVersion 字段位）
     pub node_version: String,
+    /// 进程 PID
     pub pid: u32,
+    /// 内存占用明细（MB）
     pub memory: MemoryUsage,
+    /// 运行环境标识（NODE_ENV，缺省 unknown）
     pub env: String,
 }
 
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryUsage {
+    /// 常驻内存（MB）
     pub rss: f64,
+    /// 堆已用（MB；Rust 无 GC 堆，恒 0）
     pub heap_used: f64,
+    /// 堆总量（MB；恒 0）
     pub heap_total: f64,
+    /// 外部内存（MB；恒 0）
     pub external: f64,
 }
 
 /// `/api/version` 响应 (对齐 TS `{ success: true, version }`)。
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct VersionResponse {
+    /// 恒为 true
     pub success: bool,
+    /// 服务版本号
     pub version: String,
 }
 
@@ -76,7 +91,9 @@ pub struct KilledPid {
 /// 一行日志 (对齐 nuwax getDevLog 响应)。
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct LogLine {
+    /// 行号（1 起）
     pub line: usize,
+    /// 日志行内容
     pub content: String,
 }
 
@@ -98,8 +115,11 @@ pub struct ReadDevLogResult {
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DevStarted {
+    /// 操作是否成功
     pub success: bool,
+    /// 启动结果消息
     pub message: String,
+    /// 项目 ID
     pub project_id: String,
     /// dev server 主进程 PID（keep-alive 心跳回传它）
     pub pid: u32,
@@ -111,8 +131,11 @@ pub struct DevStarted {
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DevStopped {
+    /// 操作是否成功
     pub success: bool,
+    /// 停止结果消息
     pub message: String,
+    /// 项目 ID
     pub project_id: String,
     /// 恒 null（按 app 定位进程组，无需 pid）
     pub pid: Option<u32>,
@@ -124,6 +147,7 @@ pub struct DevStopped {
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DevList {
+    /// 操作是否成功
     pub success: bool,
     /// 在跑的 dev server 进程列表
     pub list: Vec<DevProcess>,
@@ -133,10 +157,15 @@ pub struct DevList {
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct KeepAlive {
+    /// 操作是否成功
     pub success: bool,
+    /// 项目 ID
     pub project_id: String,
+    /// 主进程 PID
     pub pid: u32,
+    /// 监听端口
     pub port: u16,
+    /// 心跳结果消息
     pub message: String,
     /// 心跳结果动作（"restarted" = 探活失败已重启；存活时省略）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,7 +176,9 @@ pub struct KeepAlive {
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PortPool {
+    /// 操作是否成功
     pub success: bool,
+    /// 结果消息
     pub message: String,
     /// 端口池范围（如 "4000-55000"，保留区已剔除）
     pub port_range: String,
@@ -161,7 +192,9 @@ pub struct PortPool {
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DevLog {
+    /// 操作是否成功
     pub success: bool,
+    /// 结果消息
     pub message: String,
     /// 日志行列表（含行号）
     pub logs: Vec<LogLine>,
@@ -181,7 +214,9 @@ pub struct DevLog {
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Simple {
+    /// 操作是否成功
     pub success: bool,
+    /// 结果消息
     pub message: String,
 }
 
@@ -189,7 +224,9 @@ pub struct Simple {
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LogCacheStats {
+    /// 操作是否成功
     pub success: bool,
+    /// 结果消息
     pub message: String,
     /// 日志缓存配置与运行时统计
     pub stats: LogCacheStatsData,
@@ -226,8 +263,11 @@ pub struct LogCacheStatsData {
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildDone {
+    /// 操作是否成功
     pub success: bool,
+    /// 构建结果消息
     pub message: String,
+    /// 项目 ID
     pub project_id: String,
 }
 
@@ -254,6 +294,8 @@ pub struct DevProcess {
 #[derive(Debug, Clone, serde::Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PortAllocation {
+    /// 占用方项目 ID
     pub project_id: String,
+    /// 分配到的端口
     pub port: u16,
 }

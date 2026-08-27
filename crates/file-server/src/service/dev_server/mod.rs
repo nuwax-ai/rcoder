@@ -3,8 +3,8 @@
 //! 替换 nuwax 的裸 `child_process.spawn` (detached) + 内存 Map。
 //! 用 `tokio::process::Command` (process_group + 丢弃 Child 句柄) + `Mutex<HashMap>`。
 //!
-//! 拆分: [`types`] (类型定义 + 管理器本体) / [`start`] (启动 + 就绪轮询 + 守卫) /
-//! [`stop`] (终止 + shutdown_all + Drop)。本 mod.rs 保留组合方法 (restart/keep-alive/查询)。
+//! 拆分: `types` (类型定义 + 管理器本体) / `start` (启动 + 就绪轮询 + 守卫) /
+//! `stop` (终止 + shutdown_all + Drop)。本 mod.rs 保留组合方法 (restart/keep-alive/查询)。
 //!
 //! 注意 (对齐 nuwax 已知宽松行为):
 //! - 纯内存状态, 无持久化 (重启即丢)

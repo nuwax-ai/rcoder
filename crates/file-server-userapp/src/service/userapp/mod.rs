@@ -6,9 +6,9 @@
 //! - 组装成版本化整体包 `builds/workspace-package-<release_id>.zip`，内含 release lock。
 //!
 //! 子模块：
-//! - [`manifest`]：两级 manifest 类型 + 解析
-//! - [`assemble`]：整体包 zip 组装（raw copy 子产物 + 入口文件 + pingap 配置写入）
-//! - [`pingap`]：pingap 反代配置（`pingap.toml`）+ `.service-ports` 生成（独立可扩展）
+//! - `manifest`：两级 manifest 类型 + 解析
+//! - `assemble`：整体包 zip 组装（raw copy 子产物 + 入口文件 + pingap 配置写入）
+//! - `pingap`：pingap 反代配置（`pingap.toml`）+ `.service-ports` 生成（独立可扩展）
 
 mod assemble;
 pub mod import;
@@ -75,7 +75,7 @@ struct BuiltProject {
 /// 1. `resolve_userapp_dev(app_id)` → workspace 根（UserApp 开发卷）
 /// 2. 读 `workspace.manifest.toml` → 子项目列表
 /// 3. 遍历子项目：读 `project.manifest.toml` → `build_generic(cmd, artifact, cwd={ws}/{path})`
-/// 4. [`assemble::assemble_workspace_package`] 组装整体包（含 pingap 配置 + `.service-ports`）
+/// 4. `assemble::assemble_workspace_package` 组装整体包（含 pingap 配置 + `.service-ports`）
 ///
 /// `release_id` 由调用方预生成（start_build_task 在任务创建时生成并预置进 task
 /// 快照——创建响应即可返回确定性产物路径），本函数不再内部生成。

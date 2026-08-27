@@ -5,11 +5,11 @@
 //! - `staged`: HEAD ↔ 暂存区 (index)
 //! - `commit`: `from` ↔ `to` (to 缺省取 from 的首个 parent; 无 parent 则对空 tree)
 //!
-//! unified diff 文本由 gix [`UnifiedDiff`] 渲染 (上下文 3 行, Myers 算法),
+//! unified diff 文本由 gix `UnifiedDiff` 渲染 (上下文 3 行, Myers 算法),
 //! 文件级头 (`diff --git` / `index` / `---` / `+++` / `new file mode` / `deleted file mode`)
 //! 按 git CLI 规则自行拼装 (对齐 nuwax `makeDiffPatch`)。
 //!
-//! gix [`UnifiedDiff`] 负责 hunk 边界，定制 [`ConsumeHunk`] delegate 负责 Git 无尾换行标记与统计；
+//! gix `UnifiedDiff` 负责 hunk 边界，定制 `ConsumeHunk` delegate 负责 Git 无尾换行标记与统计；
 //! 文件级头和 JSON summary 由本模块按 API 契约组织。
 
 use std::collections::BTreeSet;

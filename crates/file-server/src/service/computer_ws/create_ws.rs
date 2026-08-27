@@ -26,7 +26,7 @@ pub struct CreateWorkspaceResult {
 /// 4. 写入 agent hook 配置 (claude/codex/opencode mcp/hooks/permissions/hookScripts; best-effort)
 /// 5. 若无 file 且无 skillUrls → syncAgents + 早退
 /// 6. file: 校验 `.zip` + 解压 + 移动 skills/ 子目录与 agents/ 整目录
-/// 7. skillUrls: 逐个下载解压, 集成 skill 目录 (skills/<name> 或顶层 <name>)
+/// 7. skillUrls: 逐个下载解压, 集成 skill 目录 (`skills/<name>` 或顶层 `<name>`)
 /// 8. syncAgents
 pub async fn create_workspace(
     workspace: &Path,

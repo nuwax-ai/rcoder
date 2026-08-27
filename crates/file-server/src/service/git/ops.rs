@@ -276,7 +276,7 @@ pub fn revert_to_commit(
 
 /// `switch_branch` (对齐 nuwax branch-switch): 切到已存在分支。
 /// - clean-tree 检查
-/// - HEAD symbolic ref → refs/heads/<name>
+/// - HEAD symbolic ref → `refs/heads/<name>`
 /// - index + worktree 重置为分支 tree (删除多余文件)
 pub fn switch_branch(repo: &Repository, name: &str) -> AppResult<()> {
     clean_tree_check(repo)?;

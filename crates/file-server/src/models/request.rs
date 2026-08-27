@@ -13,9 +13,11 @@ use super::code::{FileEntry, FileOp};
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ParseErrorBody {
-    #[allow(dead_code)]
+    /// 关联项目 ID（仅参与反序列化，解析只消费 errorMessage）
+    #[allow(dead_code, reason = "仅参与反序列化；解析只消费 error_message")]
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub project_id: String,
+    /// 构建错误原始输出
     pub error_message: String,
 }
 
@@ -171,65 +173,81 @@ pub struct DeleteParams {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateProjectBody {
+    /// 项目 ID（必填非空）
     #[serde(default, deserialize_with = "crate::extract::deserialize_id_string")]
     #[schema(required = true)]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    /// 模板类型（缺省 react）
     pub template_type: Option<String>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     pub isolation_type: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CopyProjectBody {
+    /// 源项目 ID
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub source_project_id: String,
+    /// 目标项目 ID
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub target_project_id: String,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
+    /// 源项目租户 ID（缺省回退公共 tenantId）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub source_tenant_id: Option<String>,
+    /// 源项目空间 ID（缺省回退公共 spaceId）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub source_space_id: Option<String>,
+    /// 源项目隔离类型（缺省回退公共值）
     #[serde(default)]
     pub source_isolation_type: Option<String>,
+    /// 目标项目租户 ID（缺省回退公共 tenantId）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub target_tenant_id: Option<String>,
+    /// 目标项目空间 ID（缺省回退公共 spaceId）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub target_space_id: Option<String>,
+    /// 目标项目隔离类型（缺省回退公共值）
     #[serde(default)]
     pub target_isolation_type: Option<String>,
 }
@@ -238,21 +256,26 @@ pub struct CopyProjectBody {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupVersionBody {
+    /// 项目 ID（workspace 根目录名）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    /// 代码版本号（快照归属版本）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
 }
@@ -261,23 +284,29 @@ pub struct BackupVersionBody {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub struct RollbackBody {
+    /// 项目 ID（workspace 根目录名）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    /// 代码版本号
     #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
+    /// 回滚目标版本（必填非空）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub rollback_to: String,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
 }
@@ -286,26 +315,33 @@ pub struct RollbackBody {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportBody {
+    /// 项目 ID（workspace 根目录名）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    /// 导出目标的代码版本号
     #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
+    /// 导出类型（可选）
     #[serde(default)]
     pub export_type: Option<String>,
+    /// 导出配置（结构随 exportType 变化，可选）
     #[serde(default)]
     #[schema(value_type = Object)]
     pub config: Option<serde_json::Value>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
 }
@@ -314,22 +350,28 @@ pub struct ExportBody {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub struct SpecifiedBody {
+    /// 项目 ID（workspace 根目录名）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    /// 代码版本号
     #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
+    /// 增量文件操作列表（create/delete/rename/modify）
     pub files: Vec<FileOp>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
 }
@@ -338,27 +380,35 @@ pub struct SpecifiedBody {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub struct AllFilesBody {
+    /// 项目 ID（workspace 根目录名）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub project_id: String,
+    /// 代码版本号
     #[garde(custom(crate::validation_rules::not_blank))]
     pub code_version: String,
+    /// 全量文件列表（覆盖式写入并清理缺失项）
     pub files: Vec<FileEntry>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
     #[serde(
         default,
         deserialize_with = "crate::extract::deserialize_optional_id_string"
     )]
     pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
     #[serde(default)]
     pub isolation_type: Option<String>,
+    /// nuwax 接收但未使用的字段位
     #[allow(dead_code)]
     #[serde(default)]
     pub base_path: Option<String>, // nuwax 接收但未使用
+    /// nuwax 接收但未使用的字段位
     #[allow(dead_code)]
     #[serde(default)]
     pub pid: Option<String>,

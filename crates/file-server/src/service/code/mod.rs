@@ -1,7 +1,7 @@
 //! code 文件写操作 (对齐 nuwax `codeService.specifiedFilesUpdate` / `allFilesUpdate`)。
 //!
-//! 拆分: [`codec`] (URI 编解码) / [`specified`] (增量操作 + apply_file_ops +
-//! ModifyStrategy + 行级 diff) / [`all_files`] (全量覆盖 + prune)。请求结构
+//! 拆分: `codec` (URI 编解码) / `specified` (增量操作 + apply_file_ops +
+//! ModifyStrategy + 行级 diff) / `all_files` (全量覆盖 + prune)。请求结构
 //! (FileOp/FileEntry/FileOperation) 在 [`crate::models::code`]。
 
 mod all_files;

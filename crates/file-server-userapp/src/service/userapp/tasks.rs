@@ -1,4 +1,4 @@
-//! UserApp 异步编译/发布任务:BuildTaskStore(Mutex<HashMap>)+ 状态机 + 进度事件。
+//! UserApp 异步编译/发布任务:BuildTaskStore(`Mutex<HashMap>`)+ 状态机 + 进度事件。
 //!
 //! 设计参考 app_manager `ReleaseStatus`(Prepared/PendingStart/Active/Failed)状态机;
 //! 进度事件用 `broadcast`(实时 SSE 推送)+ `VecDeque` ring(seq replay,断线重连)。
@@ -53,7 +53,7 @@ struct TaskState {
 /// 单个异步任务:状态 + 进度事件流 + cancel + build 进程 pid。
 ///
 /// 并发模型:所有可变状态在【一把】`state` 锁后;`emit`/`subscribe` 各取一次锁、互不嵌套调用
-/// (共享临界逻辑在自由函数 [`publish_mut`],它吃 `&mut TaskState`、无 `&self`,类型上无法再去
+/// (共享临界逻辑在自由函数 `publish_mut`,它吃 `&mut TaskState`、无 `&self`,类型上无法再去
 /// 取 state 锁),从结构上根除锁序/重入死锁。`cancelled`/`terminal_at`/`created_at`/`pid`
 /// 保持在锁外:供 cancel/store/同步 on_pid 回调无锁读写。
 pub struct BuildTask {
@@ -151,9 +151,9 @@ impl BuildTask {
         self.state.lock().await.workspace_root.clone()
     }
 
-    /// 发进度事件:取一次 state 锁 → [`publish_mut`] → 释放 → broadcast。
+    /// 发进度事件:取一次 state 锁 → `publish_mut` → 释放 → broadcast。
     /// 已 Completed/Failed/Cancelled 的任务丢弃后续事件(终态)。
-    /// 发进度事件:取一次 state 锁 → [`publish_mut`] → broadcast → 释放。
+    /// 发进度事件:取一次 state 锁 → `publish_mut` → broadcast → 释放。
     /// 已 Completed/Failed/Cancelled 的任务丢弃后续事件(终态)。
     pub async fn emit(&self, event: BuildProgressEvent) {
         let terminal = {
@@ -299,7 +299,7 @@ fn apply_event(state: &mut TaskState, event: &BuildProgressEvent) {
     }
 }
 
-/// 全局任务表(Mutex<HashMap>,内存;build 短期不需持久化,发布产物由 app_manager release index 持久)。
+/// 全局任务表(`Mutex<HashMap>`,内存;build 短期不需持久化,发布产物由 app_manager release index 持久)。
 /// 用 tokio::sync::Mutex(无 poison,符合禁止 unwrap/expect);并发度低(任务数有限)。
 pub struct BuildTaskStore {
     map: Mutex<HashMap<BuildTaskId, Arc<BuildTask>>>,

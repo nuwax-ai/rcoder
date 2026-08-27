@@ -1,6 +1,6 @@
 //! HTTP 提取器适配层：把 Axum 原生 rejection 统一映射为 file-server `AppError`。
 //!
-//! 另含 userApp 分流标记（[`USERAPP_FLAG`]）：`X-Service-Type: userapp` 请求经
+//! 另含 userApp 分流标记（`USERAPP_FLAG`）：`X-Service-Type: userapp` 请求经
 //! 反向代理/rcoder 拦截层透传到容器内，由 [`scope_userapp_flag`] 中间件读 header
 //! 注入 task-local，computer 域 workspace 定位（`ws_path` 等）据此切换到
 //! userApp 开发卷——HTTP 层标记，与 ServiceType 枚举（容器编排层）互不相干。

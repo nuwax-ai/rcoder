@@ -19,7 +19,7 @@ pub fn not_blank(value: &str, _: &()) -> garde::Result {
     Ok(())
 }
 
-/// Option<String> 必填且 trim 后非空 (对齐 TS "X is required" 语义)。
+/// `Option<String>` 必填且 trim 后非空 (对齐 TS "X is required" 语义)。
 ///
 /// 注: garde 的 `custom` 规则不像内置规则那样自动解包 `Option` —— custom 函数
 /// 收到的是 `&Option<String>` 而非 `&str`, 故需单独处理。None 或纯空白都拒绝。

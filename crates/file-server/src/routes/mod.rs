@@ -1,7 +1,7 @@
 //! HTTP 路由的唯一组装入口。
 //!
 //! 本模块只维护 method、URL 前缀与 handler 的映射。HTTP 提取与 utoipa 注解
-//! 位于 [`crate::handlers`]，wire 契约类型位于 [`crate::models`]，业务实现
+//! 位于 `crate::handlers`，wire 契约类型位于 [`crate::models`]，业务实现
 //! 位于 [`crate::service`]，跨 crate 共享实现位于 [`crate::ops`]。
 //!
 //! `/api/v1/userapp` 域已拆出至 file-server-userapp crate（洋葱模型：依赖本 crate

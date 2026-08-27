@@ -11,7 +11,7 @@ use crate::error::AppError;
 use crate::service::temp_file::{TemporaryFile, TemporaryFileWriter};
 use crate::service::zip;
 
-pub(super) async fn computer_tmp_zip(state: &AppState) -> Result<TemporaryFile, AppError> {
+async fn computer_tmp_zip(state: &AppState) -> Result<TemporaryFile, AppError> {
     TemporaryFileWriter::create(
         &state.config.upload_project_dir.join("temp"),
         "computer-download-",
@@ -23,10 +23,7 @@ pub(super) async fn computer_tmp_zip(state: &AppState) -> Result<TemporaryFile, 
 }
 
 /// zip 下载响应头: Content-Type + UTF-8 Content-Disposition (对齐 nuwax `filename` + `filename*`)。
-pub(super) async fn zip_response(
-    filename: &str,
-    archive: TemporaryFile,
-) -> Result<Response, AppError> {
+async fn zip_response(filename: &str, archive: TemporaryFile) -> Result<Response, AppError> {
     let disposition = format!(
         "attachment; filename=\"{}\"; filename*=UTF-8''{}",
         filename,

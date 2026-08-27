@@ -120,33 +120,43 @@ pub struct SearchFilesQuery {
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallBody {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub c_id: String,
+    /// 语言：typescript/ts → pnpm install；python/py → pip install
     pub programming_language: String,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildAgentBody {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub c_id: String,
     // agentId 同 user_id/c_id: TS 原版 buildAgentPackage 标注 {string|number},Java 后端传 DB bigint(整数)。
+    /// 智能体 ID（Java 后端传 DB bigint，此处字符串化）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub agent_id: String,
+    /// 安装包版本号
     pub version: String,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupBuildArtifactsBody {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub c_id: String,
+    /// 自定义目标目录（可选；缺省用 user/cid 推导的默认根）
     #[serde(default)]
     pub custom_target_dir: Option<String>,
 }
@@ -155,12 +165,15 @@ pub struct CleanupBuildArtifactsBody {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecCommandBody {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub c_id: String,
+    /// shell 命令串（经 shell -c 执行，cwd=workspace）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub command: String,
 }
@@ -189,10 +202,13 @@ fn default_tail_lines() -> usize {
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ZipBody {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub c_id: String,
+    /// 额外排除目录（与内置排除表合并，按任意路径段匹配）
     #[serde(default)]
     pub exclude_dirs: Option<Vec<String>>,
 }
@@ -200,8 +216,10 @@ pub struct ZipBody {
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteWorkspaceBody {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub c_id: String,
 }
@@ -209,11 +227,15 @@ pub struct DeleteWorkspaceBody {
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FilesUpdateBody {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     pub c_id: String,
+    /// 增量文件操作列表（modify 用字节比较）
     pub files: Vec<FileOp>,
+    /// 自定义目标目录（可选；缺省用 user/cid 推导的默认根）
     #[serde(default)]
     pub custom_target_dir: Option<String>,
 }
@@ -222,9 +244,11 @@ pub struct FilesUpdateBody {
 #[garde(allow_unvalidated)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateFileBody {
+    /// 用户 ID（computer 树第一级 `{root}/{user_id}/{cId}`）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub user_id: String,
+    /// 容器/实例 ID（computer 树第二级，Electron 全局根语义）
     #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
     #[garde(custom(crate::validation_rules::not_blank))]
     pub c_id: String,

@@ -94,7 +94,7 @@ pub fn add_cors_headers(mut resp: Response, origin: Option<&str>, cors: &CorsCon
             HeaderName::from_static("access-control-allow-credentials"),
             HeaderValue::from_static("true"),
         ));
-        let _ = headers.append(axum::http::header::VARY, HeaderValue::from_static("Origin"));
+        headers.append(axum::http::header::VARY, HeaderValue::from_static("Origin"));
     }
     resp
 }

@@ -1,7 +1,7 @@
 //! Dev server 进程 spawn/kill/探活 (对齐 nuwax `processManager.js`)。
 //!
-//! 拆分: [`mod@self`] (spawn + run_command + 进程发现/探活) / [`signal`] (跨平台
-//! 进程组信号) / [`log_pipe`] (stdout/stderr 日志管道 + vite 噪音过滤)。
+//! 拆分: [`mod@self`] (spawn + run_command + 进程发现/探活) / `signal` (跨平台
+//! 进程组信号) / `log_pipe` (stdout/stderr 日志管道 + vite 噪音过滤)。
 //!
 //! 关键点 (对齐 nuwax):
 //! - `exec` 前缀让 child.pid == vite/next 本体 pid (非 sh wrapper)

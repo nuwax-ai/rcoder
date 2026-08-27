@@ -5,7 +5,7 @@
 //! { "success": false, "code": "UNKNOWN_ERROR",
 //!   "error": { "type": "<TYPE>", "message": "...", "timestamp": "<CST>", "requestId": "..."[, "details": {}] } }
 //! ```
-//! HTTP 状态码由错误类型决定 (见 [`AppError::status_code`])。
+//! HTTP 状态码由错误类型决定 (见 `AppError::status_code`)。
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -213,7 +213,7 @@ impl IntoResponse for AppError {
 }
 
 /// garde 校验错误 (Report) → AppError::validation (对齐 shared_types::garde_err_to_app_error,
-/// 但返回 file-server 本地的 AppError)。消息形如 "field: <rule message>; field2: ..."。
+/// 但返回 file-server 本地的 AppError)。消息形如 "field: `<rule message>`; field2: ..."。
 pub fn from_garde(report: garde::Report) -> AppError {
     let msg = report
         .iter()
