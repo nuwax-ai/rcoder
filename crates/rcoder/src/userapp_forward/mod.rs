@@ -11,7 +11,7 @@
 //! （幂等；注册 state.projects 防孤立清理）。
 
 pub(crate) mod db;
-mod forward;
+pub(crate) mod forward;
 pub(crate) mod workspace;
 
 use std::sync::Arc;
@@ -48,8 +48,8 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/v1/userapp/tasks/{task_id}/logs",
     "/api/v1/userapp/tasks/{task_id}/logs/stream",
     "/api/v1/userapp/tasks/{task_id}/cancel",
-    "/api/v1/userapp/projects/detect",
-    "/api/v1/userapp/projects/confirm",
+    // projects/detect|confirm、install-project 已上收 `{app_id}/{env}` 门面路由
+    // （见 routes_for_env_flattened：dev-only，env 折叠后仍以容器平铺契约转发）
     // 文件镜像（TS nuwax-file-server 同名老接口族）
     "/api/v1/userapp/get-file-list",
     "/api/v1/userapp/resolve-file",
@@ -59,17 +59,12 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/v1/userapp/upload-files",
     "/api/v1/userapp/generate-file",
     "/api/v1/userapp/import-project",
-    // 容器文件操作（新形态 app-files 族；clear=rcoder dev storage/clear 的容器侧实现）
-    "/api/v1/userapp/app-files/upload",
-    "/api/v1/userapp/app-files/upload-from-url",
-    "/api/v1/userapp/app-files/list",
-    "/api/v1/userapp/app-files/delete",
-    "/api/v1/userapp/app-files/clear",
+    // 容器文件操作（新形态 app-files 族）——对外经 `{app_id}/{env}/upload 族`
+    // 与 dev storage/clear 面（容器契约端点保留，对外平铺不再注册）
     // 开发工具链
     "/api/v1/userapp/ensure-workspace",
     "/api/v1/userapp/execute-command",
     "/api/v1/userapp/get-logs",
-    "/api/v1/userapp/install-project",
     "/api/v1/userapp/zip-workspace",
     "/api/v1/userapp/download-all-files",
     "/api/v1/userapp/init-project-template",
@@ -90,11 +85,15 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
 pub(crate) mod guard_tables {
     /// rcoder 本地实现的 userapp 路径快照（`routes()` 显式入口部分；
     /// 守卫闭包比对用——改动路由须同步）。
-    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 4] = [
+    pub(crate) const LOCAL_USERAPP_PATHS: [&str; 7] = [
         "/api/v1/userapp/workspace",
         "/api/v1/userapp/db/{env}/align-credentials",
         "/api/v1/userapp/db/{env}/reset-password",
         "/api/v1/userapp/db/{env}/create-database",
+        // `{env}` 门面折叠路由（dev-only 构建链；URI 还原容器平铺契约转发）
+        "/api/v1/userapp/{app_id}/{env}/projects/detect",
+        "/api/v1/userapp/{app_id}/{env}/projects/confirm",
+        "/api/v1/userapp/{app_id}/{env}/install-project",
     ];
 
     /// app_manager 具体路由路径快照（crates/app_manager/src/routes.rs；同样供
@@ -106,17 +105,17 @@ pub(crate) mod guard_tables {
         "/api/v1/userapp/runtime",
         "/api/v1/userapp/{app_id}",
         "/api/v1/userapp/{app_id}/update",
-        "/api/v1/userapp/{app_id}/delete",
+        "/api/v1/userapp/{app_id}/{env}/delete",
         "/api/v1/userapp/{app_id}/start",
         "/api/v1/userapp/{app_id}/stop",
         "/api/v1/userapp/{app_id}/restart",
-        "/api/v1/userapp/{app_id}/recycle-policy",
-        "/api/v1/userapp/{app_id}/logs/sources/query",
-        "/api/v1/userapp/{app_id}/logs/query",
-        "/api/v1/userapp/{app_id}/logs/stream",
-        "/api/v1/userapp/{app_id}/health",
-        "/api/v1/userapp/{app_id}/stats",
-        "/api/v1/userapp/{app_id}/events",
+        "/api/v1/userapp/{app_id}/{env}/recycle-policy",
+        "/api/v1/userapp/{app_id}/{env}/logs/sources/query",
+        "/api/v1/userapp/{app_id}/{env}/logs/query",
+        "/api/v1/userapp/{app_id}/{env}/logs/stream",
+        "/api/v1/userapp/{app_id}/{env}/health",
+        "/api/v1/userapp/{app_id}/{env}/stats",
+        "/api/v1/userapp/{app_id}/{env}/events",
         "/api/v1/userapp/{app_id}/{env}/upload",
         "/api/v1/userapp/{app_id}/{env}/upload-from-url",
         "/api/v1/userapp/{app_id}/{env}/files",
@@ -128,11 +127,26 @@ pub(crate) mod guard_tables {
     ];
 }
 
-/// userApp 域路由（挂 rcoder 主 Router）：本地实现入口 + 显式透传清单。
+/// userApp 域路由（挂 rcoder 主 Router）：本地实现入口 + 显式透传清单
+/// ＋ `{env}` 门面折叠路由。
 ///
 /// `/api/v1/userapp` 族不再来自 file-server 本地路由——聚合文档时已剔除。
 pub fn routes() -> Router<Arc<AppState>> {
     let mut router = Router::new()
+        // `{env}` 门面（dev-only 构建链；URI 折叠回容器平铺契约后定向转发：
+        // detect/confirm=项目类型探测确认、install-project=模板安装）
+        .route(
+            "/api/v1/userapp/{app_id}/{env}/projects/detect",
+            post(forward::flat_dev_projects_detect),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/{env}/projects/confirm",
+            post(forward::flat_dev_projects_confirm),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/{env}/install-project",
+            post(forward::flat_dev_install_project),
+        )
         .route(
             "/api/v1/userapp/workspace",
             post(workspace::create_workspace),

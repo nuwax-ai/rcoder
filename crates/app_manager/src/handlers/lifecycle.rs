@@ -107,7 +107,7 @@ pub async fn get_app(
         (status = 200, description = "更新成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · 生产运维"
 )]
 #[instrument(skip(state, request))]
 pub async fn update_app(
@@ -122,30 +122,77 @@ pub async fn update_app(
 
 /// 删除应用
 ///
-/// 默认保留持久存储；body `{"purge": true}` 一键连数据面一起清空。
+/// 删计算资源并注销运行态；默认保留持久存储，body `{"purge": true}` 连数据面
+/// 一起清空。**仅 prod**：dev 开发环境的销毁走 storage 面的
+/// `{env=dev}` destroy（builder 容器自愈重建语义不适合"删除"操作）。
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/delete",
+    path = "/api/v1/userapp/{app_id}/{env}/delete",
     params(
-        ("app_id" = String, Path, description = "应用 ID")
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("env" = String, Path, description = "目标环境：仅支持 `prod`（运行容器删除）")
     ),
     request_body = DeleteAppRequest,
+    description = r#"
+删除应用：停容器 → 注销 pingora backend → 删除 Deployment/Service/HTTPRoute
+等计算资源（元数据行保留，误删找回可用）；`purge=true` 时连持久存储一起销毁。
+
+- **仅 prod**：传 `env=dev` 返回 400——开发环境的销毁由 storage 面
+  （`{env=dev}` destroy）承担，builder 容器常驻自愈无"删除"语义；
+- Docker compose 下 purge 按 `user_id` 精确清理宿主机目录
+  `prod/{user_id}/data/{app_id}` 分区（缺省回退归属元数据→通配兜底），
+  **建议始终携带 user_id**；
+- 乐观锁：`expected_resource_version` 不匹配 → 409。
+"#,
     responses(
         (status = 200, description = "删除成功", body = HttpResult<String>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 400, description = "env 非法或 dev 不支持 / user_id 非法", body = HttpResult<String>),
+        (status = 404, description = "应用不存在", body = HttpResult<String>),
+        (status = 409, description = "resource_version 不匹配", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · 生产运维"
 )]
 #[instrument(skip(state, body))]
 pub async fn delete_app(
     State(state): State<Arc<AppManagerState>>,
-    Path(app_id): Path<String>,
+    Path((app_id, env)): Path<(String, String)>,
     body: Option<Json<DeleteAppRequest>>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    let (purge, expected_rv) = body
-        .map(|Json(r)| (r.purge.unwrap_or(false), r.expected_resource_version))
-        .unwrap_or((false, None));
-    info!("[APP] deleting app: {} (purge={})", app_id, purge);
+    if shared_types::UserappEnv::parse(&env) != Some(shared_types::UserappEnv::Prod) {
+        return Err(AppError::validation_error(
+            "`delete` is a prod-runtime capability: pass env=prod (to tear down a dev environment use the storage destroy endpoint with env=dev)",
+        ));
+    }
+    let (purge, user_id, expected_rv) = body
+        .map(|Json(r)| {
+            (
+                r.purge.unwrap_or(false),
+                r.user_id,
+                r.expected_resource_version,
+            )
+        })
+        .unwrap_or((false, None, None));
+    // 显式 user_id 白名单校验后补录 owner 元数据（start 同款 best-effort——
+    // 失败仅告警：后续 purge 的目录解析回退 metadata owner / 通配兜底）
+    if let Some(uid) = user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        shared_types::validate_identifier(uid, "user_id")
+            .map_err(|e| AppError::validation_error(&e))?;
+        if let Err(e) = state
+            .app_service
+            .record_dev_registration(&app_id, uid)
+            .await
+        {
+            tracing::warn!(
+                "[APP] delete owner registration failed (ignored): app_id={app_id}: {e}"
+            );
+        }
+        info!(
+            "[APP] deleting app: {} (purge={}, user_id={})",
+            app_id, purge, uid
+        );
+    } else {
+        info!("[APP] deleting app: {} (purge={})", app_id, purge);
+    }
     state
         .app_service
         .delete_app(&app_id, purge, expected_rv.as_deref())

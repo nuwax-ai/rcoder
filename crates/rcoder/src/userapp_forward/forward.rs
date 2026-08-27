@@ -17,9 +17,12 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::Request;
+use axum::http::Uri;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
+
+use shared_types::HttpResult;
 
 use crate::router::AppState;
 use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder};
@@ -377,6 +380,158 @@ pub(crate) async fn forward_userapp(
     }
 }
 
+/// `/api/v1/userapp/{app_id}/{env}` 门面折叠转发（dev-only 构建链公用内核）：
+///
+/// 1. `{env}` 仅认 `dev`——构建链是开发阶段能力，传 prod 返回 400 明示；
+/// 2. 容器定位沿用透传面契约：`X-App-Id` header（require_app_id 白名单校验），
+///    body 自带的 app_id 字段由容器侧 `resolve_userapp_dev` 消费；
+/// 3. **URI 折叠**：剥掉门面段 `/api/v1/userapp/{app_id}/{env}` 还原容器平铺
+///    契约路径（file-server-userapp 端点零改动），query 原样保留。
+async fn fold_env_forward(
+    state: Arc<AppState>,
+    path: axum::extract::Path<(String, String)>,
+    req: Request,
+    target_path: &'static str,
+) -> Response {
+    use shared_types::UserappEnv;
+    let (path_app_id, env) = path.0;
+    let Some(env) = UserappEnv::parse(&env) else {
+        return HttpResultError::bad_request("path segment `env` must be `dev` or `prod`")
+            .into_response();
+    };
+    if env != UserappEnv::Dev {
+        return HttpResultError::bad_request(format!(
+            "`{target_path}` is a dev (build-chain) capability: pass env=dev"
+        ))
+        .into_response();
+    }
+    let Some(app_id) = require_app_id(&req) else {
+        return missing_app_id_response();
+    };
+    // 门面段一致性：path 与 X-App-Id 不一致直接拒（防错把请求打进别的开发容器）
+    if path_app_id != app_id {
+        return HttpResultError::bad_request(format!(
+            "path app_id '{path_app_id}' != header `X-App-Id` '{app_id}'"
+        ))
+        .into_response();
+    }
+
+    let mut req = req;
+    let rebuilt = match rebuild_uri_with(req.uri(), target_path) {
+        Ok(uri) => uri,
+        Err(e) => return HttpResultError::system(e).into_response(),
+    };
+    *req.uri_mut() = rebuilt;
+
+    info!(
+        "[USERAPP_FORWARD] {} {} -> dev container (folded env, app_id={app_id})",
+        req.method(),
+        req.uri().path()
+    );
+    forward_to_dev(&state, &app_id, req).await
+}
+
+/// 以 `target_path` 替换原 URI 的 path 部分、拼接原 query，重建 [`Uri`]。
+fn rebuild_uri_with(uri: &Uri, target_path: &'static str) -> Result<Uri, String> {
+    let pq = match uri.query() {
+        Some(q) => format!("{target_path}?{q}"),
+        None => target_path.to_string(),
+    };
+    Uri::try_from(pq).map_err(|e| format!("rebuild forwarded uri: {e:?}"))
+}
+
+/// 探测开发容器内的项目类型
+#[utoipa::path(
+    post,
+    path = "/api/v1/userapp/{app_id}/{env}/projects/detect",
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("env" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
+    ),
+    request_body(
+        content = serde_json::Value,
+        description = "同容器平铺契约 `{appId/app_id, userId/user_id}`；结构详见 file-server 文档同路径"
+    ),
+    description = r#"
+分析开发容器 workspace 的文件结构，推断项目类型（Node/Python/Java…）与推荐配置，
+作为 confirm 的输入。**仅 dev**——构建链是开发阶段能力，传 prod 返回 400。
+
+定位沿用透传面契约：header `X-App-Id` 指定目标开发容器（须与 path 一致）；
+URI 折叠为容器内平铺路径 `/api/v1/userapp/projects/detect` 后流式转发。
+"#,
+    responses(
+        (status = 200, description = "探测结果（HttpResult 信封，data 含类型推断与文件清单）", body = HttpResult<serde_json::Value>),
+        (status = 400, description = "env 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
+    ),
+    tag = "UserApp · 开发与构建",
+)]
+pub(crate) async fn flat_dev_projects_detect(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    path: axum::extract::Path<(String, String)>,
+    req: Request,
+) -> Response {
+    fold_env_forward(state, path, req, "/api/v1/userapp/projects/detect").await
+}
+
+/// 确认开发容器的项目类型
+#[utoipa::path(
+    post,
+    path = "/api/v1/userapp/{app_id}/{env}/projects/confirm",
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("env" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
+    ),
+    request_body(
+        content = serde_json::Value,
+        description = "detect 结果的用户修正确认 + 项目基础信息；字段同容器平铺契约"
+    ),
+    description = r#"
+用户在 detect 推断基础上选择/修正项目类型后提交确认（幂等附带 git init 双开关）。
+**仅 dev**；定位与折叠语义同 [`flat_dev_projects_detect`]。
+"#,
+    responses(
+        (status = 200, description = "确认结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
+        (status = 400, description = "env 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
+    ),
+    tag = "UserApp · 开发与构建",
+)]
+pub(crate) async fn flat_dev_projects_confirm(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    path: axum::extract::Path<(String, String)>,
+    req: Request,
+) -> Response {
+    fold_env_forward(state, path, req, "/api/v1/userapp/projects/confirm").await
+}
+
+/// 安装项目到开发容器
+#[utoipa::path(
+    post,
+    path = "/api/v1/userapp/{app_id}/{env}/install-project",
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("env" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
+    ),
+    request_body(
+        content = serde_json::Value,
+        description = "安装参数（同容器平铺契约 install 表单；详见 file-server 文档同路径）"
+    ),
+    description = r#"
+将项目安装进开发容器工作区（依赖安装等初始化动作的统一入口）。**仅 dev**；
+定位与折叠语义同 [`flat_dev_projects_detect`]。
+"#,
+    responses(
+        (status = 200, description = "安装结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
+        (status = 400, description = "env 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
+    ),
+    tag = "UserApp · 开发与构建",
+)]
+pub(crate) async fn flat_dev_install_project(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    path: axum::extract::Path<(String, String)>,
+    req: Request,
+) -> Response {
+    fold_env_forward(state, path, req, "/api/v1/userapp/install-project").await
+}
 /// `/api/computer/*` 拦截层：header `X-Service-Type: userapp` 即短路转发该 app
 /// 目标容器**同路径**（TS 路径原样、body 零解析，header 随请求透传供容器内
 /// computer handler 消费做 workspace 切换）；无该 header 落本地移植 handler。

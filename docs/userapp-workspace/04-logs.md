@@ -8,9 +8,9 @@
 外部 API：
 
 ```text
-POST /api/v1/userapp/{app_id}/logs/sources/query
-POST /api/v1/userapp/{app_id}/logs/query
-POST /api/v1/userapp/{app_id}/logs/stream
+POST /api/v1/userapp/{app_id}/{env}/logs/sources/query
+POST /api/v1/userapp/{app_id}/{env}/logs/query
+POST /api/v1/userapp/{app_id}/{env}/logs/stream
 ```
 
 内部 API 使用相同 body，路径为 `/v1/logs/...`。`sources/query` 与 `query` 的响应为

@@ -502,6 +502,20 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Ok(ResourceUsage::default())
     }
 
+    /// 按[`ServiceType`]维度查询容器资源用量——env 显式化路由用：
+    /// prod 运行容器走 [`Self::get_app_resource_usage`]；开发容器
+    /// （UserAppBuilder）经此方法以双键 label selector
+    /// （`app.kubernetes.io/instance` + `rcoder.io/service-type`）定位 Pod。
+    /// 默认返回空（Docker/compose 形态 metrics 本就缺失，语义为降级 0 不报错）。
+    async fn get_app_resource_usage_for(
+        &self,
+        app_id: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<ResourceUsage> {
+        let _ = (app_id, service_type);
+        Ok(ResourceUsage::default())
+    }
+
     /// 校验 app 管理前置条件（启动时 Fail Fast，防静默失败）
     ///
     /// K8s 模式探测 RBAC（list deployments，403 则明确报错指向 ClusterRole 缺权限）；

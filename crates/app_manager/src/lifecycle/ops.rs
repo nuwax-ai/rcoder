@@ -188,15 +188,26 @@ impl AppService {
         self.get_app(app_id).await
     }
 
-    /// 获取资源使用情况。
+    /// 获取资源使用情况（env 分派：prod=运行容器 label 查询；dev=开发容器
+    /// 双键 selector——instance+service-type，K8s 专属）。
     ///
     /// CPU/内存用量 + 限额来自运行时（K8s = metrics.k8s.io PodMetrics + pod limits；Docker 默认 0），
-    /// 百分比 = usage/limit×100（limit=0 → 0）。restart_count 来自 Deployment 状态。
+    /// 百分比 = usage/limit×100（limit=0 → 0）。restart_count 来自 Deployment 状态
+    /// （dev 形态为 STS 容器，restart 计数无对应视图 → 取 dev_container_alive 探活结果粗略映射 0/自身不计）。
     /// network（rx/tx）metrics.k8s.io 不提供，留 0。运行时用量查询失败降级为 0（不 500）。
     #[instrument(skip(self))]
-    pub async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats> {
+    pub async fn get_app_stats(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+    ) -> AppResult<ResourceStats> {
+        use shared_types::UserappEnv;
         validate_app_id(app_id)?;
+        if env == UserappEnv::Dev {
+            return self.get_dev_stats(app_id).await;
+        }
         let status = self.fetch_runtime_status_or_err(app_id).await?;
+        let restart_count = status.restart_count;
         let usage = match self.runtime.get_app_resource_usage(app_id).await {
             Ok(u) => u,
             Err(e) => {
@@ -204,6 +215,30 @@ impl AppService {
                 Default::default()
             }
         };
+        Ok(Self::resource_stats_from(usage, restart_count))
+    }
+
+    /// 开发容器资源统计：`get_app_resource_usage_for(UserAppBuilder)` 双键定位。
+    /// 用量降级语义与 prod 相同；dev builder 常驻自愈，restart 视图不存在 → 0。
+    async fn get_dev_stats(&self, app_id: &str) -> AppResult<ResourceStats> {
+        let usage = match self
+            .runtime
+            .get_app_resource_usage_for(app_id, &shared_types::ServiceType::UserAppBuilder)
+            .await
+        {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("[APP] dev resource usage failed app_id={app_id}: {e} (stats 降级 0)");
+                Default::default()
+            }
+        };
+        Ok(Self::resource_stats_from(usage, 0))
+    }
+
+    fn resource_stats_from(
+        usage: container_runtime_api::ResourceUsage,
+        restart_count: u32,
+    ) -> ResourceStats {
         let cpu_percent = if usage.cpu_limit_cores > 0.0 {
             (usage.cpu_usage_cores / usage.cpu_limit_cores * 100.0).clamp(0.0, 100.0)
         } else {
@@ -214,8 +249,8 @@ impl AppService {
         } else {
             0.0
         };
-        Ok(ResourceStats {
-            restart_count: status.restart_count,
+        ResourceStats {
+            restart_count,
             cpu: CpuStats {
                 usage_cores: usage.cpu_usage_cores,
                 limit_cores: usage.cpu_limit_cores,
@@ -227,7 +262,70 @@ impl AppService {
                 usage_percent: mem_percent,
             },
             network: NetworkStats::default(),
+        }
+    }
+
+    /// 获取应用健康状态（env 分派）：
+    /// - prod：实时集群查询派生（`AppRuntimeInfo.health`）
+    /// - dev：探活开发容器内 file-server `/health`（经 `UserappDevLocator`
+    ///   幂等 ensure+探活自愈定位）；2xx→Running / 其余→Unhealthy
+    #[instrument(skip(self))]
+    pub async fn get_app_health(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+    ) -> AppResult<HealthInfo> {
+        validate_app_id(app_id)?;
+        if env == shared_types::UserappEnv::Prod {
+            let runtime = self.get_app(app_id).await?;
+            return Ok(runtime.health);
+        }
+        let base = self.app_files_base(env, app_id).await?;
+        let ok = reqwest::Client::new()
+            .get(format!("{base}/health"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        Ok(HealthInfo {
+            status: if ok { "Running" } else { "Unhealthy" }.to_string(),
+            instance: None,
+            probes: None,
         })
+    }
+
+    /// 日志管理面转发基址（容器内 app-cli :3010）。prod=运行实例 IP；
+    /// dev=从 `UserappDevLocator.dev_file_server_addr`（:60000）解析 host 重拼端口。
+    #[instrument(skip(self))]
+    pub async fn log_api_base(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+    ) -> AppResult<String> {
+        validate_app_id(app_id)?;
+        if env == shared_types::UserappEnv::Prod {
+            let runtime = self.get_app(app_id).await?;
+            let ip = runtime
+                .health
+                .instance
+                .map(|instance| instance.ip)
+                .filter(|ip| !ip.is_empty())
+                .ok_or_else(|| {
+                    AppOperationError::InvalidState(format!(
+                        "app {app_id} has no ready runtime IP for log access"
+                    ))
+                })?;
+            return Ok(format!("http://{ip}:3010"));
+        }
+        let file_server = self.app_files_base(env, app_id).await?;
+        // http://{host}:60000 → http://{host}:3010（host 段原样保留，仅换管理端口）
+        let host = file_server
+            .trim_start_matches("http://")
+            .split(':')
+            .next()
+            .unwrap_or_default();
+        Ok(format!("http://{host}:3010"))
     }
 
     /// 获取应用事件（K8s Events API：调度/拉取/启动/崩溃）

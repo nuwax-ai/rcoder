@@ -1,6 +1,11 @@
 //! 应用日志 handler（sources/query/stream，转发到 app 容器内 app-cli :3010）。
 //!
+//! 三条接口支持 `{env}` 显式环境分派（prod=运行容器实例 IP / dev=开发容器
+//! host 重拼 :3010，见 `AppService::log_api_base`）。
+//!
 //! JSON 转发（sources/query、query）是**透明代理**：透传 app-cli 的状态码 +
+//! 三条接口均支持 `{env}` 显式环境分派（prod=运行容器实例 IP / dev=开发容器
+//! host 重拼 :3010，见 [`AppService::log_api_base`]）——
 //! 响应体——app-cli 侧统一 `HttpResult` 信封（`{code,message,data,tid,success}`），
 //! 成功失败都以信封直达调用方，code/message 保真不二次包装；仅连接/读取失败
 //! 由 rcoder 生成自己的 HttpResult 错误（AppError 路径）。SSE（stream）豁免信封。
@@ -26,9 +31,15 @@ use super::AppManagerState;
 /// 应用声明的日志源与匹配到的日志文件（转发 app-cli /v1/logs/sources/query）。
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/logs/sources/query",
-    params(("app_id" = String, Path, description = "应用 ID")),
-    request_body = LogQueryRequest,
+    path = "/api/v1/userapp/{app_id}/{env}/logs/sources/query",
+    params(("app_id" = String, Path, description = "应用 ID"),
+        ("env" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）")
+    ),
+    description = r#"
+查询应用声明的日志源及匹配到的日志文件清单（选日志面板"源选择器"用）。
+`env` 决定目标容器：dev=开发容器的实时源 / prod=运行容器的应用日志源；
+请求体 selectors 支持 per-service 过滤（空 = 全量声明面）。
+"#,
     responses(
         (
             status = 200,
@@ -44,10 +55,13 @@ use super::AppManagerState;
 )]
 pub async fn query_app_log_sources(
     State(state): State<Arc<AppManagerState>>,
-    Path(app_id): Path<String>,
+    Path((app_id, env)): Path<(String, String)>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
-    forward_json(&state, &app_id, "/v1/logs/sources/query", request).await
+    let env = shared_types::UserappEnv::parse(&env)
+        .ok_or_else(|| AppError::validation_error("path segment `env` must be `dev` or `prod`"))?;
+    let base = state.app_service.log_api_base(env, &app_id).await?;
+    forward_json(&state, base.clone(), "/v1/logs/sources/query", request).await
 }
 
 /// 查询应用日志快照
@@ -55,9 +69,15 @@ pub async fn query_app_log_sources(
 /// 多服务日志快照，带 checkpoint 游标支持增量拉取（转发 app-cli /v1/logs/query）。
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/logs/query",
-    params(("app_id" = String, Path, description = "应用 ID")),
-    request_body = LogQueryRequest,
+    path = "/api/v1/userapp/{app_id}/{env}/logs/query",
+    params(("app_id" = String, Path, description = "应用 ID"),
+        ("env" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）")
+    ),
+    description = r#"
+多服务日志快照（分页拉取，非 SSE）：携带上次响应的 `cursor` 即可断点续拉；
+`cursor_reset=true` 表示跨部署代需从 tail 重读。`env` 选择目标容器同
+sources/query。
+"#,
     responses(
         (
             status = 200,
@@ -73,10 +93,13 @@ pub async fn query_app_log_sources(
 )]
 pub async fn query_app_logs(
     State(state): State<Arc<AppManagerState>>,
-    Path(app_id): Path<String>,
+    Path((app_id, env)): Path<(String, String)>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
-    forward_json(&state, &app_id, "/v1/logs/query", request).await
+    let env = shared_types::UserappEnv::parse(&env)
+        .ok_or_else(|| AppError::validation_error("path segment `env` must be `dev` or `prod`"))?;
+    let base = state.app_service.log_api_base(env, &app_id).await?;
+    forward_json(&state, base, "/v1/logs/query", request).await
 }
 
 /// 实时日志 SSE 流
@@ -84,9 +107,15 @@ pub async fn query_app_logs(
 /// 转发 app-cli /v1/logs/stream，Content-Type: text/event-stream。
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/logs/stream",
-    params(("app_id" = String, Path, description = "应用 ID")),
-    request_body = LogQueryRequest,
+    path = "/api/v1/userapp/{app_id}/{env}/logs/stream",
+    params(("app_id" = String, Path, description = "应用 ID"),
+        ("env" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）；`prod`=运行容器（UserApp）")
+    ),
+    description = r#"
+SSE 实时日志流（500ms 轮询内核）：事件清单与断线续传协议见 200 响应说明。
+`env` 选择目标容器同 sources/query；断线后以最近 checkpoint 回填 cursor 重连，
+部署代切换收 `cursor_reset` 后重置游标。
+"#,
     responses(
         (
             status = 200,
@@ -102,10 +131,12 @@ pub async fn query_app_logs(
 )]
 pub async fn stream_app_logs_v1(
     State(state): State<Arc<AppManagerState>>,
-    Path(app_id): Path<String>,
+    Path((app_id, env)): Path<(String, String)>,
     Json(request): Json<LogQueryRequest>,
 ) -> Result<Response<Body>, AppError> {
-    let base = runtime_api_base(&state, &app_id).await?;
+    let env = shared_types::UserappEnv::parse(&env)
+        .ok_or_else(|| AppError::validation_error("path segment `env` must be `dev` or `prod`"))?;
+    let base = state.app_service.log_api_base(env, &app_id).await?;
     let response = state
         .http_client
         .post(format!("{base}/v1/logs/stream"))
@@ -138,11 +169,10 @@ pub async fn stream_app_logs_v1(
 /// 走 rcoder 自己的 AppError→HttpResult 错误。
 async fn forward_json(
     state: &Arc<AppManagerState>,
-    app_id: &str,
+    base: String,
     path: &str,
     request: LogQueryRequest,
 ) -> Result<Response<Body>, AppError> {
-    let base = runtime_api_base(state, app_id).await?;
     let response = state
         .http_client
         .post(format!("{base}{path}"))
@@ -165,21 +195,6 @@ async fn forward_json(
     builder
         .body(Body::from(body))
         .map_err(|error| AppError::from(backend(format!("build forwarded log response: {error}"))))
-}
-
-async fn runtime_api_base(state: &Arc<AppManagerState>, app_id: &str) -> Result<String, AppError> {
-    let runtime = state.app_service.get_app(app_id).await?;
-    let ip = runtime
-        .health
-        .instance
-        .map(|instance| instance.ip)
-        .filter(|ip| !ip.is_empty())
-        .ok_or_else(|| {
-            AppOperationError::InvalidState(format!(
-                "app {app_id} has no ready runtime IP for log access"
-            ))
-        })?;
-    Ok(format!("http://{ip}:3010"))
 }
 
 fn backend(message: String) -> AppOperationError {

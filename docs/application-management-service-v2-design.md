@@ -486,9 +486,9 @@ runtime.err.log
 外部：
 
 ```text
-POST /api/v1/userapp/{app_id}/logs/sources/query
-POST /api/v1/userapp/{app_id}/logs/query
-POST /api/v1/userapp/{app_id}/logs/stream
+POST /api/v1/userapp/{app_id}/{env}/logs/sources/query
+POST /api/v1/userapp/{app_id}/{env}/logs/query
+POST /api/v1/userapp/{app_id}/{env}/logs/stream
 ```
 
 内部：
@@ -570,11 +570,11 @@ POST /api/v1/userapp/query
 GET  /api/v1/userapp/runtime
 GET  /api/v1/userapp/{app_id}
 POST /api/v1/userapp/{app_id}/update
-POST /api/v1/userapp/{app_id}/delete
+POST /api/v1/userapp/{app_id}/{env}/delete
 POST /api/v1/userapp/{app_id}/start
 POST /api/v1/userapp/{app_id}/stop
 POST /api/v1/userapp/{app_id}/restart
-POST /api/v1/userapp/{app_id}/recycle-policy
+POST /api/v1/userapp/{app_id}/{env}/recycle-policy
 ```
 
 RCoder 不持久化 name/image/env 等业务元数据。后续 GET 返回 observed
@@ -593,9 +593,9 @@ K8s update 使用 `resourceVersion` 乐观锁和 SSA；Docker 模式当前为 la
 ### 9.2 查询与诊断
 
 ```text
-GET /api/v1/userapp/{app_id}/health
-GET /api/v1/userapp/{app_id}/stats
-GET /api/v1/userapp/{app_id}/events
+GET /api/v1/userapp/{app_id}/{env}/health
+GET /api/v1/userapp/{app_id}/{env}/stats
+GET /api/v1/userapp/{app_id}/{env}/events
 ```
 
 `GET /apps/runtime` 是 RCoder/Java 重启后的运行时对账入口。
@@ -696,7 +696,7 @@ per-app 覆盖（Deployment 注解，由 `CreateAppRequest`/`UpdateAppRequest`/`
 #### 动态回收策略端点
 
 ```text
-POST /api/v1/userapp/{app_id}/recycle-policy
+POST /api/v1/userapp/{app_id}/{env}/recycle-policy
 ```
 
 ```json

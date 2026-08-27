@@ -580,8 +580,7 @@ mod tests {
             .workspace_ids
             .insert("UserApp".to_string(), vec!["app-prod".to_string()]);
         let service = test_service(std::path::Path::new("/tmp/ws"), runtime.clone());
-        *service.dev_locator.write().expect("dev_locator lock") =
-            Some(Arc::new(StubDevLocator));
+        *service.dev_locator.write().expect("dev_locator lock") = Some(Arc::new(StubDevLocator));
 
         let dev_resp = service
             .query_storage(

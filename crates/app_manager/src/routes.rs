@@ -23,7 +23,7 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             post(handlers::update_app),
         )
         .route(
-            "/api/v1/userapp/{app_id}/delete",
+            "/api/v1/userapp/{app_id}/{env}/delete",
             post(handlers::delete_app),
         )
         // 应用操作
@@ -34,32 +34,32 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             post(handlers::restart_app),
         )
         .route(
-            "/api/v1/userapp/{app_id}/recycle-policy",
+            "/api/v1/userapp/{app_id}/{env}/recycle-policy",
             post(handlers::set_recycle_policy),
         )
         // 查询接口
         .route(
-            "/api/v1/userapp/{app_id}/logs/sources/query",
+            "/api/v1/userapp/{app_id}/{env}/logs/sources/query",
             post(handlers::query_app_log_sources),
         )
         .route(
-            "/api/v1/userapp/{app_id}/logs/query",
+            "/api/v1/userapp/{app_id}/{env}/logs/query",
             post(handlers::query_app_logs),
         )
         .route(
-            "/api/v1/userapp/{app_id}/logs/stream",
+            "/api/v1/userapp/{app_id}/{env}/logs/stream",
             post(handlers::stream_app_logs_v1),
         )
         .route(
-            "/api/v1/userapp/{app_id}/health",
+            "/api/v1/userapp/{app_id}/{env}/health",
             get(handlers::get_app_health),
         )
         .route(
-            "/api/v1/userapp/{app_id}/stats",
+            "/api/v1/userapp/{app_id}/{env}/stats",
             get(handlers::get_app_stats),
         )
         .route(
-            "/api/v1/userapp/{app_id}/events",
+            "/api/v1/userapp/{app_id}/{env}/events",
             get(handlers::get_app_events),
         )
         // 文件管理（env 显式分派：dev=开发容器 workspace / prod=运行容器 /app）

@@ -284,7 +284,7 @@ spec:
 | POST | `/api/v1/userapp/query` | 查询应用列表 | Body: QueryAppsRequest |
 | GET | `/api/v1/userapp/{app_id}` | 获取应用详情 | - |
 | POST | `/api/v1/userapp/{app_id}/update` | 更新应用配置 | Body: UpdateAppRequest |
-| POST | `/api/v1/userapp/{app_id}/delete` | 删除应用 | - |
+| POST | `/api/v1/userapp/{app_id}/{env}/delete` | 删除应用 | - |
 
 #### 应用操作
 
@@ -299,9 +299,9 @@ spec:
 | 方法 | 路径 | 描述 | 说明 |
 |------|------|------|------|
 | GET | `/api/v1/userapp/{app_id}/logs` | 获取日志 | Query: tail, follow |
-| GET | `/api/v1/userapp/{app_id}/health` | 获取健康状态 | - |
-| GET | `/api/v1/userapp/{app_id}/events` | 获取事件 | - |
-| GET | `/api/v1/userapp/{app_id}/stats` | 获取资源使用 | - |
+| GET | `/api/v1/userapp/{app_id}/{env}/health` | 获取健康状态 | - |
+| GET | `/api/v1/userapp/{app_id}/{env}/events` | 获取事件 | - |
+| GET | `/api/v1/userapp/{app_id}/{env}/stats` | 获取资源使用 | - |
 
 #### 文件管理接口
 

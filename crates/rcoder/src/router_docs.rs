@@ -99,6 +99,9 @@ use crate::handler;
         app_manager::handlers::query_storage,
         app_manager::handlers::stream_app_logs_v1,
         app_manager::handlers::upload_from_url,
+        crate::userapp_forward::forward::flat_dev_projects_detect,
+        crate::userapp_forward::forward::flat_dev_projects_confirm,
+        crate::userapp_forward::forward::flat_dev_install_project,
         crate::userapp_forward::db::align_credentials,
         crate::userapp_forward::db::reset_password,
         crate::userapp_forward::db::create_database,
@@ -244,7 +247,8 @@ use crate::handler;
         )
     ),
     tags(
-        (name = "UserApp · 生命周期", description = "应用生产生命周期：查询/启停/更新/删除/健康/统计/事件/回收策略"),
+        (name = "UserApp · 生产运维", description = "userApp 生产环境（运行容器）操作接口：部署启动、停止重启、更新与回收策略"),
+        (name = "UserApp · 生命周期", description = "应用查询/详情/健康/统计/事件与删除（含 dev/prod 双环境观测）"),
         (name = "UserApp · 日志", description = "应用日志：日志源、检索与 SSE 实时流"),
         (name = "UserApp · 文件与存储", description = "应用文件上传/管理与存储卷查询/清理"),
         (name = "UserApp · 数据库", description = "应用 PostgreSQL 账号与数据库管理（dev/prod）"),
@@ -329,7 +333,7 @@ pub struct ApiDoc;
 /// 内部路由 path（file-server-proxy 分流代理的上游镜像接口）：路由保留、对外
 /// 文档不暴露——Java 同事调 computer 域同名接口，带 `x-service-type: userapp`
 /// header 经 60000 分流代理内部路由到这些；直接暴露会让调用方绕过分流契约。
-const INTERNAL_USERAPP_PATHS: [&str; 13] = [
+const INTERNAL_USERAPP_PATHS: [&str; 21] = [
     "/api/v1/userapp/download-all-files",
     "/api/v1/userapp/files-update",
     "/api/v1/userapp/generate-file",
@@ -343,6 +347,19 @@ const INTERNAL_USERAPP_PATHS: [&str; 13] = [
     "/api/v1/userapp/upload-files",
     "/api/v1/userapp/workspace",
     "/api/v1/userapp/zip-workspace",
+    // app-files 族五条：dev storage/clear 与文件族 ({app_id}/{env}/upload、
+    // files、files/delete) 的容器侧实现端点（rcoder 出站调用），对外语义由
+    // 相应 `{env}` 门面承载
+    "/api/v1/userapp/app-files/clear",
+    "/api/v1/userapp/app-files/upload",
+    "/api/v1/userapp/app-files/upload-from-url",
+    "/api/v1/userapp/app-files/list",
+    "/api/v1/userapp/app-files/delete",
+    // 构建链 dev-only 三条：已上收 `{app_id}/{env}` 门面路由（folded URI 转发，
+    // 容器侧平铺端点保留），平铺形态不再对外暴露
+    "/api/v1/userapp/projects/detect",
+    "/api/v1/userapp/projects/confirm",
+    "/api/v1/userapp/install-project",
 ];
 
 /// 从文档剔除内部路由 path（components 中失去引用的 schema 残留无害，不追引
@@ -571,20 +588,21 @@ mod openapi_tests {
                 }
             }
         }
-        // 口径：生命周期12 + 日志3 + 文件存储8 + 数据库3 + 终端代理12 +
-        // 开发构建 20（userapp crate 33 条中 13 条内部路径已按 INTERNAL_USERAPP_PATHS 剔除）
+        // 口径（{env} 显式化后）：生产运维6(start/stop/restart/update/delete/recycle-policy)
+        // + 生命周期7(query/runtime/{app_id}/health/stats/events 生命期侧) + 日志3×2形态近似…
+        // 精确值以实际聚合为准（内部剔除 21 条后实测 UserApp 系 op 总数=54），下限防漂移不设满额
         assert!(
-            userapp_ops >= 58,
-            "UserApp 系 operation 计数下限（58）未达: {userapp_ops}"
+            userapp_ops >= 54,
+            "UserApp 系 operation 计数下限（54）未达: {userapp_ops}"
         );
 
         let tag_of = |path: &str, method: &str| sole_tag("primary", &document, path, method);
         assert_eq!(
             tag_of("/api/v1/userapp/{app_id}/start", "post"),
-            "UserApp · 生命周期"
+            "UserApp · 生产运维"
         );
         assert_eq!(
-            tag_of("/api/v1/userapp/{app_id}/logs/stream", "post"),
+            tag_of("/api/v1/userapp/{app_id}/{env}/logs/stream", "post"),
             "UserApp · 日志"
         );
         assert_eq!(
@@ -650,7 +668,7 @@ mod openapi_tests {
         let item = document
             .paths
             .paths
-            .get("/api/v1/userapp/{app_id}/logs/stream")
+            .get("/api/v1/userapp/{app_id}/{env}/logs/stream")
             .expect("logs/stream path documented");
         let op = item.post.as_ref().expect("POST operation");
         let resp = op
@@ -684,8 +702,8 @@ mod openapi_tests {
         let paths = document.paths.paths;
         for path in [
             // releases 五接口已随 RBD 卷形态删除（部署只走 start+url，见 handbook 10）
-            "/api/v1/userapp/{app_id}/logs/query",
-            "/api/v1/userapp/{app_id}/logs/stream",
+            "/api/v1/userapp/{app_id}/{env}/logs/query",
+            "/api/v1/userapp/{app_id}/{env}/logs/stream",
             "/api/v1/userapp/{app_id}/start",
         ] {
             assert!(paths.contains_key(path), "OpenAPI path missing: {path}");
@@ -718,7 +736,7 @@ mod openapi_tests {
         for path in [
             "/api/project/create-project",
             "/api/v1/userapp/build",
-            "/api/v1/userapp/projects/detect",
+            "/api/v1/userapp/dev/start",
         ] {
             assert!(
                 paths.contains_key(path),
@@ -729,11 +747,10 @@ mod openapi_tests {
             .keys()
             .filter(|p| p.starts_with("/api/v1/userapp/"))
             .count();
-        // 全量 100 paths - 12 个内部镜像 path(file-server 侧; 第 13 条
-        // /api/v1/userapp/workspace 仅存在于 rcoder 侧转发路由, 对 file-server 文档
-        // 是永不命中的防御条目) = 88
+        // 内部剔除扩容（13→21：新增 app-files 族五条 + 构建链 dev-only 三条上收）
+        // 后实测 userapp 面路径数下降；下限防漂移不设满额
         assert!(paths.len() >= 85, "聚合文档路径总数异常: {}", paths.len());
-        assert!(userapp_count >= 15, "userapp 路径数异常: {userapp_count}");
+        assert!(userapp_count >= 14, "userapp 路径数异常: {userapp_count}");
     }
 
     /// 内部路由面防回归: 13 个 [`INTERNAL_USERAPP_PATHS`]（file-server-proxy 分流
@@ -760,7 +777,7 @@ mod openapi_tests {
             "/api/v1/userapp/build",
             "/api/v1/userapp/dev/start",
             "/api/v1/userapp/get-logs",
-            "/api/v1/userapp/projects/detect",
+            "/api/v1/userapp/{app_id}/{env}/projects/detect",
         ] {
             assert!(
                 primary.paths.paths.contains_key(anchor),

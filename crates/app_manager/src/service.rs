@@ -300,8 +300,24 @@ impl super::AppServiceTrait for AppService {
         self.set_recycle_policy(app_id, request).await
     }
 
-    async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats> {
-        self.get_app_stats(app_id).await
+    async fn get_app_stats(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+    ) -> AppResult<ResourceStats> {
+        self.get_app_stats(env, app_id).await
+    }
+
+    async fn get_app_health(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+    ) -> AppResult<HealthInfo> {
+        self.get_app_health(env, app_id).await
+    }
+
+    async fn log_api_base(&self, env: shared_types::UserappEnv, app_id: &str) -> AppResult<String> {
+        self.log_api_base(env, app_id).await
     }
 
     async fn get_app_events(

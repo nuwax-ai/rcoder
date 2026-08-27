@@ -87,19 +87,19 @@ Day 3：读 10（发布）→ 跑通 build→prepare→activate 链路
            GET    /api/v1/userapp/runtime                        对账：列全部托管应用
            GET    /api/v1/userapp/{app_id}                       运行时详情（observed）
            POST   /api/v1/userapp/{app_id}/update                更新（全量替换）
-           POST   /api/v1/userapp/{app_id}/delete                删除（默认保留数据）
+           POST   /api/v1/userapp/{app_id}/{env}/delete                删除（默认保留数据）
 
 操作       POST   /api/v1/userapp/{app_id}/start                 启动（scale=1）
            POST   /api/v1/userapp/{app_id}/stop                  停止（scale=0）
            POST   /api/v1/userapp/{app_id}/restart               重启（rollout）
-           POST   /api/v1/userapp/{app_id}/recycle-policy        设置闲置回收策略（免重启）
+           POST   /api/v1/userapp/{app_id}/{env}/recycle-policy        设置闲置回收策略（免重启）
 
-日志       POST   /api/v1/userapp/{app_id}/logs/sources/query    查询声明的日志源
-           POST   /api/v1/userapp/{app_id}/logs/query            多服务文件日志快照
-           POST   /api/v1/userapp/{app_id}/logs/stream           SSE 实时流
-           GET    /api/v1/userapp/{app_id}/health                健康状态
-           GET    /api/v1/userapp/{app_id}/stats                 资源使用（best-effort）
-           GET    /api/v1/userapp/{app_id}/events                应用事件
+日志       POST   /api/v1/userapp/{app_id}/{env}/logs/sources/query    查询声明的日志源
+           POST   /api/v1/userapp/{app_id}/{env}/logs/query            多服务文件日志快照
+           POST   /api/v1/userapp/{app_id}/{env}/logs/stream           SSE 实时流
+           GET    /api/v1/userapp/{app_id}/{env}/health                健康状态
+           GET    /api/v1/userapp/{app_id}/{env}/stats                 资源使用（best-effort）
+           GET    /api/v1/userapp/{app_id}/{env}/events                应用事件
 
 文件管理   POST   /api/v1/userapp/{app_id}/{env}/upload                上传文件（multipart）
            POST   /api/v1/userapp/{app_id}/{env}/upload-from-url       从 URL 下载并上传

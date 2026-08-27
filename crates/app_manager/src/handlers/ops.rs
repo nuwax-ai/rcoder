@@ -26,7 +26,7 @@ use crate::models::{AppRuntimeInfo, RecyclePolicyRequest, StartAppRequest, Start
         (status = 400, description = "创建空容器缺 user_id / deploy_mode 非法值", body = HttpResult<String>),
         (status = 409, description = "release 幂等冲突（同 id 不同内容）", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · 生产运维"
 )]
 #[instrument(skip(state))]
 pub async fn start_app(
@@ -67,7 +67,7 @@ pub async fn start_app(
         (status = 200, description = "停止成功", body = HttpResult<AppRuntimeInfo>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · 生产运维"
 )]
 #[instrument(skip(state))]
 pub async fn stop_app(
@@ -94,7 +94,7 @@ pub async fn stop_app(
         (status = 200, description = "重启/部署成功", body = HttpResult<StartAppResult>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · 生产运维"
 )]
 #[instrument(skip(state))]
 pub async fn restart_app(
@@ -119,26 +119,43 @@ pub async fn restart_app(
 ///
 /// 动态、免重启（免费↔付费 tier 变更）：strategic-merge Deployment 注解,不碰 pod template → 不触发 rollout,下个扫描 tick 生效。
 /// 比 update 轻（无需 image）。三字段（recycle_enabled/idle_timeout_seconds/wake_on_traffic）皆 None → 400。
+/// **仅 prod**：策略作用于运行容器 Deployment 注解，dev 开发环境无回收语义。
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/recycle-policy",
+    path = "/api/v1/userapp/{app_id}/{env}/recycle-policy",
     params(
-        ("app_id" = String, Path, description = "应用 ID")
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("env" = String, Path, description = "目标环境：仅支持 `prod`（运行容器 Deployment 注解）")
     ),
     request_body = RecyclePolicyRequest,
+    description = r#"
+动态设置应用的闲置自动回收与流量唤醒策略，免重启、下个扫描 tick 生效：
+- `recycle_enabled`：开关闲置回收
+- `idle_timeout_seconds`：闲置阈值秒数
+- `wake_on_traffic`：流量唤醒开关
+
+三字段全 None → 400。
+
+> **仅 prod**：传 `env=dev` 返回 400（开发容器常驻自愈，无回收语义）。
+"#,
     responses(
         (status = 200, description = "策略已更新（免重启）", body = HttpResult<AppRuntimeInfo>),
-        (status = 400, description = "参数错误（三字段皆空）", body = HttpResult<String>),
+        (status = 400, description = "参数错误（三字段皆空 / env 非法或 dev 不支持）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
-    tag = "UserApp · 生命周期"
+    tag = "UserApp · 生产运维"
 )]
 #[instrument(skip(state, request))]
 pub async fn set_recycle_policy(
     State(state): State<Arc<AppManagerState>>,
-    Path(app_id): Path<String>,
+    Path((app_id, env)): Path<(String, String)>,
     Json(request): Json<RecyclePolicyRequest>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    if shared_types::UserappEnv::parse(&env) != Some(shared_types::UserappEnv::Prod) {
+        return Err(AppError::validation_error(
+            "`recycle-policy` is a prod-runtime capability: pass env=prod (dev environment has no recycle semantics)",
+        ));
+    }
     let runtime = state
         .app_service
         .set_recycle_policy(&app_id, request)

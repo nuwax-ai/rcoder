@@ -127,10 +127,30 @@ pub trait AppServiceTrait: Send + Sync {
         request: RecyclePolicyRequest,
     ) -> AppResult<AppRuntimeInfo>;
 
-    /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
-    async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats>;
+    /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）。
+    /// env=prod 查运行容器（label app-id）；env=dev 查开发容器（双键 instance+service-type），
+    /// Docker/compose 形态无 metrics → 用量 0（降级语义与 prod 一致）
+    async fn get_app_stats(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+    ) -> AppResult<ResourceStats>;
 
-    /// 获取应用事件（K8s Events API：调度/拉取/启动/崩溃）
+    /// 获取应用健康状态：prod=运行时状态派生；dev=探活开发容器内 file-server
+    /// `/health`（常驻自愈容器，phase=Running 即达）。不支持 dev 语义的能力接口
+    /// （events/recycle-policy 等）由 handler 层拦截，不进 trait。
+    async fn get_app_health(
+        &self,
+        env: shared_types::UserappEnv,
+        app_id: &str,
+    ) -> AppResult<HealthInfo>;
+
+    /// 日志/管理面转发基址（app-cli :3010）：prod=运行实例 IP；dev=开发容器 host
+    /// 解析重拼。logs 三接口的透明转发源
+    async fn log_api_base(&self, env: shared_types::UserappEnv, app_id: &str) -> AppResult<String>;
+
+    /// 获取应用事件（K8s Events API：调度/拉取/启动/崩溃；仅 prod 运行容器——
+    /// 调用方 handler 层负责环境校验）
     async fn get_app_events(
         &self,
         app_id: &str,

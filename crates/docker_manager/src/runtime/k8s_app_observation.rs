@@ -288,10 +288,43 @@ impl KubernetesRuntime {
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<container_runtime_api::ResourceUsage> {
+        self.app_resource_usage_by_labels(
+            app_id,
+            format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX),
+        )
+        .await
+    }
+
+    /// 按双键标准标签定位任意 rcoder 托管容器的资源用量——开发容器
+    /// （UserAppBuilder STS）stats 的 dev 环境入口：builder 由
+    /// `build_standard_labels` 打标，同 app_id 下与 prod Deployment 以
+    /// service-type 维度区分，零创建链改动即可被 metrics API 命中。
+    pub async fn app_resource_usage_for(
+        &self,
+        app_id: &str,
+        service_type: &shared_types::ServiceType,
+    ) -> ContainerRuntimeResult<container_runtime_api::ResourceUsage> {
+        self.app_resource_usage_by_labels(
+            app_id,
+            format!(
+                "app.kubernetes.io/instance={app_id},{}/service-type={service_type}",
+                RCODER_LABEL_PREFIX
+            ),
+        )
+        .await
+    }
+
+    /// 资源用量采集内核：按 label selector 定位 Pod（单副本取第一个），
+    /// PodMetrics 用量 + pod spec limits 限额。
+    async fn app_resource_usage_by_labels(
+        &self,
+        app_id: &str,
+        label_selector: String,
+    ) -> ContainerRuntimeResult<container_runtime_api::ResourceUsage> {
         use container_runtime_api::ResourceUsage;
 
         // 1. 关联 Pod（UserApp 单副本；取第一个）
-        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
+        let lp = ListParams::default().labels(&label_selector);
         let pod = self
             .pods_api()
             .list(&lp)
