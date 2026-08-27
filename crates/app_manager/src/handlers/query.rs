@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
+use serde::Deserialize;
 use tracing::{info, instrument};
 
 use shared_types::{AppError, HttpResult};
@@ -36,6 +37,19 @@ pub async fn get_app_health(
     Ok(Json(HttpResult::success(runtime.health)))
 }
 
+/// stats 查询参数
+///
+/// `userId` 必填：Docker compose 部署下按 owner 关联宿主机数据卷目录
+/// （`prod/{user_id}/data/{app_id}` 分区）与调用侧映射关系维护；服务端
+/// 当前用于审计留痕与 owner 一致性校验。
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsParams {
+    /// 所属用户 ID（必填；标识符白名单校验）
+    pub user_id: String,
+}
+
 /// 获取应用资源使用
 ///
 /// best-effort：restart_count 来自运行时；CPU/内存需 metrics-server。
@@ -43,20 +57,29 @@ pub async fn get_app_health(
     get,
     path = "/api/v1/userapp/{app_id}/stats",
     params(
-        ("app_id" = String, Path, description = "应用 ID")
+        ("app_id" = String, Path, description = "应用 ID"),
+        StatsParams
     ),
     responses(
         (status = 200, description = "查询成功", body = HttpResult<ResourceStats>),
+        (status = 400, description = "参数错误（userId 缺失/非法）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "UserApp · 生命周期"
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state, params))]
 pub async fn get_app_stats(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
+    Query(params): Query<StatsParams>,
 ) -> Result<Json<HttpResult<ResourceStats>>, AppError> {
-    info!("[APP] getting app stats: {}", app_id);
+    // 标识符白名单校验（user_id 进宿主机卷路径分区与审计留痕，含 `/` 即逃逸）
+    shared_types::validate_identifier(&params.user_id, "userId")
+        .map_err(|e| AppError::validation_error(&e))?;
+    info!(
+        "[APP] getting app stats: {} (user_id={})",
+        app_id, params.user_id
+    );
     let stats = state.app_service.get_app_stats(&app_id).await?;
     Ok(Json(HttpResult::success(stats)))
 }

@@ -224,6 +224,16 @@ impl AppService {
 
         // 3. ensure/re-apply 运行容器：env 变更 → config-hash → Recreate rollout
         //    → 新 Pod 启动时 app-cli 部署段生效
+        // 显式 user_id 直接落 create params（Docker 数据卷 bind 源 prod/{user_id}/data/{app_id}
+        // 分区依据）——不依赖 finish 段先行的 owner 补记注册（fire-and-forget，失败仅告警，
+        // 曾致首次部署回退查空 → runtime 兜底 app_id 出孤儿目录 prod/{app_id}/）；缺失仍走
+        // metadata 回退（build 后二次部署等场景请求侧无 user_id）。
+        let explicit_user_id = request
+            .user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         match self.get_app(app_id).await {
             Ok(_) => {
                 // 已存在 → update 通道（env 显式整段替换，其余字段 live 回退）。
@@ -245,10 +255,9 @@ impl AppService {
                 self.update_app(app_id, update).await?;
             }
             Err(AppOperationError::NotFound(_)) => {
-                // 首次部署 → ensure 创建（镜像/端口/探针平台内定，env 携带部署三元组）；
-                // user_id 走 metadata 回退（发布链无 user 上下文）
+                // 首次部署 → ensure 创建（镜像/端口/探针平台内定，env 携带部署三元组）
                 let lock = self.acquire_process_release_lock(app_id).await;
-                self.ensure_app_runtime(app_id, app_id, Some(env), None, lock)
+                self.ensure_app_runtime(app_id, app_id, Some(env), explicit_user_id, lock)
                     .await?;
             }
             Err(e) => return Err(e),
