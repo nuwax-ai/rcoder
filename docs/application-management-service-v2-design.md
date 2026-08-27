@@ -630,7 +630,7 @@ POST /api/v1/userapp/db/{env}/create-database
 ```
 
 接口以 body `app_id` + path `{env}`（dev=开发容器 / prod=运行容器）定位，容器 exec 本地
-psql 完成（改密支持 username 可选账号 upsert，并做 dbx 预置连接同步）；只适用于带
+psql 完成（改密支持 username 可选账号 upsert）；只适用于带
 PostgreSQL 的 app-runtime。普通数据操作由 pgweb 或业务迁移完成。
 > 原 `POST /api/v1/userapp/{app_id}/db/*` 两路为上述接口的子集，已下线。
 

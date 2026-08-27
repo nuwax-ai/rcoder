@@ -49,9 +49,6 @@ pub(crate) struct MockRuntime {
     pub resize_fails: AtomicBool,
     /// 注入 resize_app_storage 返回 outcome（None → 默认模拟 K8s Grow 成功）。
     pub resize_outcome: std::sync::Mutex<Option<StorageResizeOutcome>>,
-    /// exec 收到的命令历史（key=app_id 按序追加；exit 恒 0——dbx 同步链路断言用；
-    /// 需注入失败时用 resize_fails 同款模式扩展）。
-    pub exec_calls: DashMap<String, Vec<String>>,
     /// workspace_volume_name 收到的 (app_id, service_type debug) 历史——storage
     /// env 分派断言用（dev→UserAppBuilder / prod→UserApp）。
     pub volume_name_calls: DashMap<String, Vec<String>>,
@@ -176,23 +173,6 @@ impl UserAppDeploymentRuntime for MockRuntime {
             .into();
         }
         Ok(())
-    }
-
-    /// exec 覆写：记录命令并模拟成功（reset-password/dbx 同步链路断言）。
-    async fn exec(
-        &self,
-        app_id: &str,
-        command: Vec<String>,
-    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
-        self.exec_calls
-            .entry(app_id.to_string())
-            .or_default()
-            .push(command.join(" "));
-        Ok(container_runtime_api::ExecResult {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        })
     }
 
     async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {

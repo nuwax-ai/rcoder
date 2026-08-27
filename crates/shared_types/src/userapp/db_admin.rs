@@ -128,32 +128,6 @@ pub async fn upsert_pg_user(
     Ok(outcome)
 }
 
-/// 改密成功后的 dbx 预置连接同步（共用钩子：reset-password 两条分支调用）。
-///
-/// - `Some(username)`：指定账号版——命令条件内建，仅当账号 == 容器内
-///   `$POSTGRES_USER`（local-pg 预置连接在用账号）时才重写+重启；重置业务
-///   账号不动 local-pg。
-/// - `None`：superuser 版——重置目标就是 `$POSTGRES_USER`，恒同步。
-///
-/// best-effort：失败仅返回 Err（调用方 warn 留痕，不阻断改密结果——密码已
-/// 生效）；错误信息**不含密码**。`username` 须已过白名单（`upsert_pg_user`
-/// 成功返回即保证）。
-pub async fn sync_dbx_after_password_change(
-    runner: &dyn super::db_align::PgCommandRunner,
-    username: Option<&str>,
-    password: &str,
-) -> Result<(), String> {
-    let cmd = match username {
-        Some(u) => crate::userapp::dbx_sync::dbx_sync_cmd_for_user(u, password),
-        None => crate::userapp::dbx_sync::dbx_sync_cmd_superuser(password),
-    };
-    let r = runner.run(&cmd).await?;
-    if r.exit_code != 0 {
-        return Err(format!("exit {}: {}", r.exit_code, r.stderr.trim()));
-    }
-    Ok(())
-}
-
 /// 建库核心流程（check-then-act：先 `pg_database` 存在性判定，已存在报 409 语义；
 /// PG 不支持 CREATE DATABASE IF NOT EXISTS、也不能进事务/DO 块，故不靠失败后
 /// 解析 stderr 文本判定——它随 PG 版本/locale 变，不稳定）。
@@ -246,8 +220,6 @@ mod tests {
                 "db_exists"
             } else if cmd.contains("CREATE DATABASE") {
                 "create_db"
-            } else if cmd.contains("connections.json") {
-                "dbx_sync"
             } else {
                 "unknown"
             }
@@ -315,38 +287,6 @@ mod tests {
             upsert_pg_user(&runner, "biz", "").await.unwrap_err(),
             DbAdminError::InvalidInput(_)
         ));
-    }
-
-    #[tokio::test]
-    async fn dbx_sync_hook_routes_by_username_presence() {
-        // superuser 分支 → 无条件命令（无 if [）；指定账号 → 条件内建命令
-        let runner = ScriptedRunner::new(vec![ok(0, "")]);
-        sync_dbx_after_password_change(&runner, None, "pw")
-            .await
-            .unwrap();
-        let superuser_cmd = runner.seen.lock().unwrap()[0].clone();
-        assert!(superuser_cmd.starts_with("printf"), "got: {superuser_cmd}");
-        assert!(!superuser_cmd.contains("if ["));
-
-        let runner = ScriptedRunner::new(vec![ok(0, "")]);
-        sync_dbx_after_password_change(&runner, Some("app"), "pw")
-            .await
-            .unwrap();
-        let user_cmd = runner.seen.lock().unwrap()[0].clone();
-        assert!(
-            user_cmd.starts_with("if [ 'app' = \"$POSTGRES_USER\" ]"),
-            "got: {user_cmd}"
-        );
-    }
-
-    #[tokio::test]
-    async fn dbx_sync_hook_failure_is_err_without_password() {
-        let runner = ScriptedRunner::new(vec![ok(1, "dbx down")]);
-        let err = sync_dbx_after_password_change(&runner, None, "secret-pw")
-            .await
-            .unwrap_err();
-        assert!(err.starts_with("exit 1"), "got: {err}");
-        assert!(!err.contains("secret-pw"), "错误信息不得含密码");
     }
 
     #[tokio::test]

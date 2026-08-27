@@ -16,7 +16,6 @@ pub mod activity;
 pub mod build_event;
 pub mod db_admin;
 pub mod db_align;
-pub mod dbx_sync;
 pub mod dev_cleanup;
 pub mod dev_locator;
 pub mod env;

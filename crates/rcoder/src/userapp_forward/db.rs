@@ -80,7 +80,7 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
         (status = 404, description = "prod 环境 app 不存在或未运行", body = HttpResult<String>),
         (status = 502, description = "开发容器不可达", body = HttpResult<String>)
     ),
-    tag = "UserApp · 数据库",
+    tag = "UserApp · 双态 · 数据库",
     operation_id = "align_userapp_db_credentials",
     summary = "PG 凭据对齐",
     description = r#"
@@ -332,7 +332,7 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
         (status = 404, description = "prod 环境 app 不存在", body = HttpResult<String>),
         (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
     ),
-    tag = "UserApp · 数据库",
+    tag = "UserApp · 双态 · 数据库",
     operation_id = "userapp_db_reset_password",
     summary = "重置/创建 PG 账号密码",
     description = r#"
@@ -389,39 +389,12 @@ pub(crate) async fn reset_password(
                     ),
                 ));
             }
-            // dbx 预置连接同步（best-effort）：重置目标即 local-pg 在用账号，
-            // 恒同步；失败仅 warn——密码已生效，不阻断响应。
-            if let Err(e) =
-                shared_types::sync_dbx_after_password_change(&runner, None, &body.new_password)
-                    .await
-            {
-                tracing::warn!(
-                    "[USERAPP_DB_ADMIN] dbx connection sync failed (password already applied): env={}, app_id={}: {e}",
-                    env.as_str(),
-                    body.app_id
-                );
-            }
             "密码已重置".to_string()
         }
         Some(username) => {
             let outcome = shared_types::upsert_pg_user(&runner, username, &body.new_password)
                 .await
                 .map_err(|e| AppError::with_message(db_admin_error_code(&e), e.to_string()))?;
-            // dbx 预置连接同步（best-effort，条件内建）：仅当指定账号 ==
-            // $POSTGRES_USER（local-pg 在用账号）时才动 local-pg；重置业务账号跳过。
-            if let Err(e) = shared_types::sync_dbx_after_password_change(
-                &runner,
-                Some(username),
-                &body.new_password,
-            )
-            .await
-            {
-                tracing::warn!(
-                    "[USERAPP_DB_ADMIN] dbx connection sync failed (password already applied): env={}, app_id={}, username={username}: {e}",
-                    env.as_str(),
-                    body.app_id
-                );
-            }
             match outcome {
                 shared_types::DbUserUpsertOutcome::Created => "账号已创建并设置密码".to_string(),
                 shared_types::DbUserUpsertOutcome::Reset => "密码已重置".to_string(),
@@ -454,7 +427,7 @@ pub(crate) async fn reset_password(
         (status = 409, description = "数据库已存在（含并发创建竞态复检）", body = HttpResult<String>),
         (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
     ),
-    tag = "UserApp · 数据库",
+    tag = "UserApp · 双态 · 数据库",
     operation_id = "userapp_db_create_database",
     summary = "新建 PG 数据库",
     description = r#"
