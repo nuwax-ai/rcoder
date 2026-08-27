@@ -46,7 +46,7 @@ Pending → Running → (Cancelling) → Completed / Failed / Cancelled
 ```
 
 - `page` 默认 1（<1 → 400）；`page_size` 默认 20，范围 1..=100（越界 → 400）；`filters` 可省略。
-- 排序 `createdAt DESC, taskId DESC`。
+- 排序 `created_at DESC, task_id DESC`。
 
 **响应** `HttpResult<PaginatedResponse<PublishTaskSnapshot>>`：
 ```jsonc

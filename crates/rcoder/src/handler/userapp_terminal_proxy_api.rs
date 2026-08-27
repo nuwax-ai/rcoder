@@ -377,7 +377,7 @@ pub async fn userapp_proxy_routes_doc() -> Json<Value> {
                 "dbx（数据库 Web GUI，已预置本地 PG 连接，首访设密码）": "/userapp/prod/dbx/{app_id}/{path}"
             }
         },
-        "appTraffic": {
+        "app_traffic": {
             "说明": "应用流量（免端口——代理内部固定拨 pingap 统一入口 APP_ENTRY_PORT=9080）；切环境只改 dev→prod 一段；dev 无开发容器 → 502，prod 未部署 → 502",
             "dev（开发预览，manifest 流程恒起 pingap）": "/proxy/userapp/dev/{user_id}/{app_id}/{path}",
             "prod（部署访问，access.external.http 即此格式）": "/proxy/userapp/prod/{user_id}/{app_id}/{path}"

@@ -39,12 +39,11 @@ pub async fn get_app_health(
 
 /// stats 查询参数
 ///
-/// `userId` 必填：Docker compose 部署下按 owner 关联宿主机数据卷目录
+/// `user_id` 必填：Docker compose 部署下按 owner 关联宿主机数据卷目录
 /// （`prod/{user_id}/data/{app_id}` 分区）与调用侧映射关系维护；服务端
 /// 当前用于审计留痕与 owner 一致性校验。
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
 pub struct StatsParams {
     /// 所属用户 ID（必填；标识符白名单校验）
     pub user_id: String,
@@ -62,7 +61,7 @@ pub struct StatsParams {
     ),
     responses(
         (status = 200, description = "查询成功", body = HttpResult<ResourceStats>),
-        (status = 400, description = "参数错误（userId 缺失/非法）", body = HttpResult<String>),
+        (status = 400, description = "参数错误（user_id 缺失/非法）", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>)
     ),
     tag = "UserApp · 生命周期"
@@ -74,7 +73,7 @@ pub async fn get_app_stats(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<HttpResult<ResourceStats>>, AppError> {
     // 标识符白名单校验（user_id 进宿主机卷路径分区与审计留痕，含 `/` 即逃逸）
-    shared_types::validate_identifier(&params.user_id, "userId")
+    shared_types::validate_identifier(&params.user_id, "user_id")
         .map_err(|e| AppError::validation_error(&e))?;
     info!(
         "[APP] getting app stats: {} (user_id={})",

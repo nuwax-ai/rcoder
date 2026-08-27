@@ -200,7 +200,7 @@ POST /api/v1/userapp/projects/confirm
 GET  /api/v1/userapp/static/{app_id}/{path}
 ```
 
-构建响应包含 `releaseId`、`schemaVersion`、文件名、SHA-256 和字节数。
+构建响应包含 `release_id`、`schema_version`、文件名、SHA-256 和字节数。
 
 detect 只读取常见项目描述文件，不执行项目脚本；确认前不能生成正式 Manifest。
 
@@ -469,7 +469,7 @@ app-cli：
 ```
 
 每个 source 的 glob 在 `project.manifest.toml` 声明，并在 release lock 中锁定。查询接口只接受
-`serviceId/sourceIds`，不接受客户端提供文件路径或 glob。
+`service_id/source_ids`，不接受客户端提供文件路径或 glob。
 
 app-cli 同时捕获 service stdout/stderr 到：
 
@@ -508,8 +508,8 @@ stream 返回 `Content-Type: text/event-stream`。浏览器使用 `fetch + Reada
 {
   "selectors": [
     {
-      "serviceId": "backend-go",
-      "sourceIds": ["application", "access"]
+      "service_id": "backend-go",
+      "source_ids": ["application", "access"]
     }
   ],
   "levels": ["WARN", "ERROR"],
@@ -522,7 +522,7 @@ stream 返回 `Content-Type: text/event-stream`。浏览器使用 `fetch + Reada
 ```
 
 - selectors 为空：全部 enabled service 的全部声明 source；
-- service 有值、sourceIds 为空：该 service 的全部 source；
+- service 有值、source_ids 为空：该 service 的全部 source；
 - tail 按 source 计算；
 - cursor 优先于 tail；
 - selector 非法时整个请求返回 400；

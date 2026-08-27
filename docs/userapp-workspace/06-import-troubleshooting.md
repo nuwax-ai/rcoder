@@ -5,7 +5,7 @@ POST /api/v1/userapp/projects/detect
 POST /api/v1/userapp/projects/confirm
 ```
 
-请求提供 `appId` 和 workspace 一级 `projectDir`。detect 只读取 package.json、pom.xml、
+请求提供 `app_id` 和 workspace 一级 `project_dir`。detect 只读取 package.json、pom.xml、
 go.mod、pyproject/requirements、Cargo.toml，不执行脚本，生成
 `project.manifest.draft.toml`。draft 不参与构建。
 
