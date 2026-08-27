@@ -296,7 +296,10 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         let name = app_deployment_name(app_id);
         let client = self.inner.get_docker_client();
         if replicas == 0 {
-            client
+            // stop 幂等语义：容器已停（304）bollard 当成功；并发消失（404）容忍
+            // ——stop 的目标态就是"不在跑"，容器没了目标态已达成（对齐
+            // delete_deployment 的 404 容忍范式，竞态窗口不再 500）
+            if let Err(e) = client
                 .stop_container(
                     &name,
                     Some(StopContainerOptions {
@@ -305,7 +308,20 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                     }),
                 )
                 .await
-                .map_err(|e| ContainerRuntimeError::ContainerStopError(e.to_string()))?;
+            {
+                match e {
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404, ..
+                    } => {
+                        tracing::debug!(
+                            "[DOCKER] stop container {name} not found (raced removal?), idempotent ok"
+                        );
+                    }
+                    other => {
+                        return Err(ContainerRuntimeError::ContainerStopError(other.to_string()));
+                    }
+                }
+            }
         } else {
             client
                 .start_container(&name, None::<StartContainerOptions>)

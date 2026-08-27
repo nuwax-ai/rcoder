@@ -302,8 +302,10 @@ impl AppService {
         })
     }
 
-    /// 日志管理面转发基址（容器内 app-cli :3010）。prod=运行实例 IP；
-    /// dev=从 `UserappDevLocator.dev_file_server_addr`（:60000）解析 host 重拼端口
+    /// 日志管理面转发基址（容器内 app-cli :3010）。prod=唤醒后运行实例 IP
+    /// （读日志是使用语义，闲置回收的 stopped 容器自动拉起——与文件族
+    /// `app_files_base` prod 分支同款 wake）；dev=从
+    /// `UserappDevLocator.dev_file_server_addr`（:60000）解析 host 重拼端口
     /// （user_id 为 dev 懒创建容器的显式 owner 档）。
     #[instrument(skip(self))]
     pub async fn log_api_base(
@@ -314,6 +316,22 @@ impl AppService {
     ) -> AppResult<String> {
         validate_app_id(app_id)?;
         if env == shared_types::UserappEnv::Prod {
+            // 幻报拦截：ensure_running 对不存在的 app 返回 AlreadyRunning
+            // （stopped-set 语义），get_app NotFound 兜底 404
+            use shared_types::AppWakeControl;
+            match self.activity.ensure_running(app_id).await {
+                shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
+                shared_types::WakeOutcome::Timeout => {
+                    return Err(AppOperationError::InvalidState(format!(
+                        "app {app_id} wake timed out; retry later"
+                    )));
+                }
+                shared_types::WakeOutcome::Failed(e) => {
+                    return Err(AppOperationError::InvalidState(format!(
+                        "app {app_id} wake failed: {e}"
+                    )));
+                }
+            }
             let runtime = self.get_app(app_id).await?;
             let ip = runtime
                 .health
