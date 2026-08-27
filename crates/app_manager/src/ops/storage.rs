@@ -154,7 +154,7 @@ impl crate::service::AppService {
         validate_app_id(app_id)?;
         if env == UserappEnv::Dev {
             let base = self
-                .app_files_base(UserappEnv::Dev, app_id, user_id)
+                .app_files_base(UserappEnv::Dev, app_id, Some(user_id))
                 .await?;
             let resp = reqwest::Client::new()
                 .post(format!("{base}/api/v1/userapp/app-files/clear"))

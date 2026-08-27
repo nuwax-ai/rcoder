@@ -281,13 +281,16 @@ impl AppService {
             return Ok(runtime.health);
         }
         // health 不在接口面收 user_id（⚪/dev🟢 不补参）——dev 懒创建走 metadata
-        // owner 链（空值经 resolve_owner 空白档降级 metadata，不破坏 fail-fast）
-        let user_id = self
+        // owner 链（None = 无显式入参，由 ensure 侧取值链降级 metadata；空白
+        // 值在此过滤，不以空串哨兵下传）
+        let explicit_user = self
             .metadata
             .lookup(app_id)
             .and_then(|r| r.user_id)
-            .unwrap_or_default();
-        let base = self.app_files_base(env, app_id, &user_id).await?;
+            .filter(|uid| !uid.trim().is_empty());
+        let base = self
+            .app_files_base(env, app_id, explicit_user.as_deref())
+            .await?;
         let ok = reqwest::Client::new()
             .get(format!("{base}/health"))
             .timeout(std::time::Duration::from_secs(5))
@@ -345,7 +348,7 @@ impl AppService {
                 })?;
             return Ok(format!("http://{ip}:3010"));
         }
-        let file_server = self.app_files_base(env, app_id, user_id).await?;
+        let file_server = self.app_files_base(env, app_id, Some(user_id)).await?;
         // http://{host}:60000 → http://{host}:3010（host 段原样保留，仅换管理端口）
         let host = file_server
             .trim_start_matches("http://")

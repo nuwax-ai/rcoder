@@ -54,11 +54,14 @@ impl AppService {
     /// - `env=dev`：经 `UserappDevLocator` 契约幂等 ensure UserAppBuilder（探活
     ///   自愈，开发容器常驻无唤醒语义——app_manager 的 runtime 视图无 agent
     ///   能力，委托宿主 rcoder）。
+    ///
+    /// `user_id`：dev 懒创建容器的 owner 显式档——`None` = 调用方无显式入参，
+    /// 由 ensure 侧取值链降级 metadata（**勿传空串哨兵**，空值用 None 表达）。
     pub(crate) async fn app_files_base(
         &self,
         env: UserappEnv,
         app_id: &str,
-        user_id: &str,
+        user_id: Option<&str>,
     ) -> AppResult<String> {
         if env == UserappEnv::Dev {
             let locator = self
@@ -70,7 +73,7 @@ impl AppService {
                     AppOperationError::Backend("dev container locator not injected".to_string())
                 })?;
             return locator
-                .dev_file_server_addr(app_id, Some(user_id))
+                .dev_file_server_addr(app_id, user_id)
                 .await
                 .map_err(|e| {
                     AppOperationError::Backend(format!(
@@ -127,7 +130,7 @@ impl AppService {
                 "file data is empty".to_string(),
             ));
         }
-        let base = self.app_files_base(env, app_id, user_id).await?;
+        let base = self.app_files_base(env, app_id, Some(user_id)).await?;
         let file_name = std::path::Path::new(target)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -173,7 +176,7 @@ impl AppService {
     ) -> AppResult<UploadResult> {
         validate_app_id(app_id)?;
         validate_upload_target(target)?;
-        let base = self.app_files_base(env, app_id, user_id).await?;
+        let base = self.app_files_base(env, app_id, Some(user_id)).await?;
         let body = serde_json::json!({
             "app_id": app_id,
             "url": url,
@@ -218,7 +221,7 @@ impl AppService {
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>> {
         validate_app_id(app_id)?;
-        let base = self.app_files_base(env, app_id, user_id).await?;
+        let base = self.app_files_base(env, app_id, Some(user_id)).await?;
         let mut url = format!(
             "{base}/api/v1/userapp/app-files/list?app_id={}",
             urlencode(app_id)
@@ -263,7 +266,7 @@ impl AppService {
                 "file path is empty".to_string(),
             ));
         }
-        let base = self.app_files_base(env, app_id, user_id).await?;
+        let base = self.app_files_base(env, app_id, Some(user_id)).await?;
         let body = serde_json::json!({"app_id": app_id, "path": file_path});
         let resp = reqwest::Client::new()
             .post(format!("{base}/api/v1/userapp/app-files/delete"))
