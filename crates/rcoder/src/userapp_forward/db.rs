@@ -18,13 +18,11 @@ use tracing::info;
 
 // ExecRunner 方法语法调用所需（trait 本体经 shared_types 全路径引用）
 use shared_types::PgCommandRunner as _;
+use shared_types::UserappStage;
 
 use crate::router::AppState;
 use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder_probed};
 use crate::{AppError, HttpResult};
-
-/// 目标环境路径段（`shared_types::UserappEnv`——与文件/存储八接口的 `{env}` 共用词表与解析）。
-use shared_types::UserappEnv as DbEnv;
 
 /// 开发容器执行通道：容器内 file-server `execute-command`（cwd=workspace 须已存在，
 /// 故本 handler 前置幂等 ensure-workspace）。
@@ -66,17 +64,17 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
     }
 }
 
-/// `POST /api/v1/userapp/db/{env}/align-credentials`
+/// `POST /api/v1/userapp/db/{app_stage}/align-credentials`
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/db/{env}/align-credentials",
+    path = "/api/v1/userapp/db/{app_stage}/align-credentials",
     request_body = shared_types::AlignCredentialsRequest,
     params(
-        ("env" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
     ),
     responses(
         (status = 200, description = "对齐完成（aligned=true；reset_performed 表示是否执行了重置）", body = HttpResult<shared_types::AlignCredentialsOutcome>),
-        (status = 400, description = "参数校验失败（env/username/password）", body = HttpResult<String>),
+        (status = 400, description = "参数校验失败（app_stage/username/password）", body = HttpResult<String>),
         (status = 404, description = "prod 环境 app 不存在或未运行", body = HttpResult<String>),
         (status = 502, description = "开发容器不可达", body = HttpResult<String>)
     ),
@@ -87,7 +85,7 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
 校验目标容器内 PG 的账号密码与传入值是否一致（TCP scram 探测），不一致则用
 本地 trust 认证改密对齐并复验——**部署链 pg 凭据自动对齐的独立入口**。
 
-- 定位：body `app_id` + path `{env}`（dev=开发容器 / prod=运行容器）；
+- 定位：body `app_id` + path `{app_stage}`（dev=开发容器 / prod=运行容器）；
 - `username` 指定目标账号（缺省 superuser）；`password` 为期望值；
 - dev 环境：容器不存在时幂等 ensure 开发容器（builder）；
 - prod 环境：app 不存在 → 404；stopped 自动唤醒并等待 PG 就绪
@@ -99,18 +97,18 @@ impl shared_types::PgCommandRunner for DevHttpRunner<'_> {
 )]
 pub(crate) async fn align_credentials(
     State(state): State<Arc<AppState>>,
-    Path(env): Path<String>,
+    Path(app_stage): Path<String>,
     Json(body): Json<shared_types::AlignCredentialsRequest>,
 ) -> Result<HttpResult<shared_types::AlignCredentialsOutcome>, AppError> {
-    let env = DbEnv::parse(&env)
-        .ok_or_else(|| AppError::bad_request("path segment `env` must be `dev` or `prod`"))?;
+    let app_stage = UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request("path segment `app_stage` must be `dev` or `prod`"))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
     shared_types::validate_identifier(&body.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
 
-    let outcome = match env {
-        DbEnv::Dev => {
+    let outcome = match app_stage {
+        UserappStage::Dev => {
             // 开发容器：ensure（幂等 + 探活自愈，stopped/exited builder 自动重建；
             // owner 显式档=body user_id）+ ensure-workspace（execute-command 的 cwd 前置）
             let (info, _recreated) =
@@ -142,7 +140,7 @@ pub(crate) async fn align_credentials(
                 .await
                 .map_err(|e| AppError::with_message(align_error_code(&e), e.to_string()))?
         }
-        DbEnv::Prod => state
+        UserappStage::Prod => state
             .app_service
             .align_db_credentials(&body.app_id, body.clone())
             .await
@@ -160,8 +158,8 @@ pub(crate) async fn align_credentials(
     };
 
     info!(
-        "[USERAPP_DB_ALIGN] aligned: env={}, app_id={}, username={}, reset_performed={}",
-        env.as_str(),
+        "[USERAPP_DB_ALIGN] aligned: app_stage={}, app_id={}, username={}, reset_performed={}",
+        app_stage.as_str(),
         body.app_id,
         body.username,
         outcome.reset_performed
@@ -218,17 +216,17 @@ impl shared_types::PgCommandRunner for ExecRunner<'_> {
 ///   hold-and-wait ≤ wake_timeout 默认 60s；与文件透传/pod ensure prod 同款）
 async fn resolve_exec_target(
     state: &AppState,
-    env: DbEnv,
+    app_stage: UserappStage,
     app_id: &str,
     user_id: &str,
 ) -> Result<String, AppError> {
-    match env {
-        DbEnv::Dev => {
+    match app_stage {
+        UserappStage::Dev => {
             let (info, _recreated) = ensure_userapp_builder_probed(state, app_id, Some(user_id))
                 .await
                 .map_err(|e| {
                     tracing::error!(
-                        "[USERAPP_DB_ADMIN] ensure dev container failed: env=dev, app_id={app_id}: {e:#}"
+                        "[USERAPP_DB_ADMIN] ensure dev container failed: app_stage=dev, app_id={app_id}: {e:#}"
                     );
                     AppError::with_message(
                         shared_types::error_codes::ERR_CONTAINER_ERROR,
@@ -260,7 +258,7 @@ async fn resolve_exec_target(
             }
             Ok(info.container_name)
         }
-        DbEnv::Prod => {
+        UserappStage::Prod => {
             if let Err(e) = state.app_service.get_app(app_id).await {
                 tracing::error!("[USERAPP_DB_ADMIN] prod app not found: app_id={app_id}: {e:#}");
                 return Err(AppError::not_found(&format!(
@@ -316,17 +314,17 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
     }
 }
 
-/// `POST /api/v1/userapp/db/{env}/reset-password`
+/// `POST /api/v1/userapp/db/{app_stage}/reset-password`
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/db/{env}/reset-password",
+    path = "/api/v1/userapp/db/{app_stage}/reset-password",
     request_body = shared_types::UserappDbResetPasswordRequest,
     params(
-        ("env" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
     ),
     responses(
         (status = 200, description = "密码已设置（message 区分\"账号已创建并设置密码\"/\"密码已重置\"）", body = HttpResult<String>),
-        (status = 400, description = "参数校验失败（env/app_id/new_password/username 非法）", body = HttpResult<String>),
+        (status = 400, description = "参数校验失败（app_stage/app_id/new_password/username 非法）", body = HttpResult<String>),
         (status = 404, description = "prod 环境 app 不存在", body = HttpResult<String>),
         (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
     ),
@@ -345,16 +343,16 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
 指定业务账号且非 local-pg 在用账号时自动跳过），同步失败不阻断响应（密码已生效）。
 prod 环境目标容器 stopped 会自动唤醒并等待 PG 就绪。
 
-**密码只出现在 exec 命令内，日志零落盘**（仅记 app_id/env/username/结果）。
+**密码只出现在 exec 命令内，日志零落盘**（仅记 app_id/app_stage/username/结果）。
 "#,
 )]
 pub(crate) async fn reset_password(
     State(state): State<Arc<AppState>>,
-    Path(env): Path<String>,
+    Path(app_stage): Path<String>,
     Json(body): Json<shared_types::UserappDbResetPasswordRequest>,
 ) -> Result<HttpResult<String>, AppError> {
-    let env = DbEnv::parse(&env)
-        .ok_or_else(|| AppError::bad_request("path segment `env` must be `dev` or `prod`"))?;
+    let app_stage = UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request("path segment `app_stage` must be `dev` or `prod`"))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
     shared_types::validate_identifier(&body.user_id, "user_id")
@@ -363,7 +361,7 @@ pub(crate) async fn reset_password(
         return Err(AppError::bad_request("new_password must not be empty"));
     }
 
-    let target = resolve_exec_target(&state, env, &body.app_id, &body.user_id).await?;
+    let target = resolve_exec_target(&state, app_stage, &body.app_id, &body.user_id).await?;
     let runtime = state.runtime().clone();
     let runner = ExecRunner {
         runtime: &runtime,
@@ -401,10 +399,10 @@ pub(crate) async fn reset_password(
             }
         }
     };
-    // 密码不落日志（只记 app_id/env/username/结果）
+    // 密码不落日志（只记 app_id/app_stage/username/结果）
     info!(
-        "[USERAPP_DB_ADMIN] password set: env={}, app_id={}, username={}, result={}",
-        env.as_str(),
+        "[USERAPP_DB_ADMIN] password set: app_stage={}, app_id={}, username={}, result={}",
+        app_stage.as_str(),
         body.app_id,
         body.username.as_deref().unwrap_or("<superuser>"),
         message
@@ -412,17 +410,17 @@ pub(crate) async fn reset_password(
     Ok(HttpResult::success(message))
 }
 
-/// `POST /api/v1/userapp/db/{env}/create-database`
+/// `POST /api/v1/userapp/db/{app_stage}/create-database`
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/db/{env}/create-database",
+    path = "/api/v1/userapp/db/{app_stage}/create-database",
     request_body = shared_types::UserappDbCreateDatabaseRequest,
     params(
-        ("env" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder）内的 PG；`prod`=运行容器（UserApp）内的 PG")
     ),
     responses(
         (status = 200, description = "数据库已创建", body = HttpResult<String>),
-        (status = 400, description = "参数校验失败（env/app_id/database/owner 非标识符）", body = HttpResult<String>),
+        (status = 400, description = "参数校验失败（app_stage/app_id/database/owner 非标识符）", body = HttpResult<String>),
         (status = 404, description = "prod 环境 app 不存在", body = HttpResult<String>),
         (status = 409, description = "数据库已存在（含并发创建竞态复检）", body = HttpResult<String>),
         (status = 500, description = "容器侧执行失败（PG 未就绪/SQL 失败）", body = HttpResult<String>)
@@ -444,17 +442,17 @@ pub(crate) async fn reset_password(
 )]
 pub(crate) async fn create_database(
     State(state): State<Arc<AppState>>,
-    Path(env): Path<String>,
+    Path(app_stage): Path<String>,
     Json(body): Json<shared_types::UserappDbCreateDatabaseRequest>,
 ) -> Result<HttpResult<String>, AppError> {
-    let env = DbEnv::parse(&env)
-        .ok_or_else(|| AppError::bad_request("path segment `env` must be `dev` or `prod`"))?;
+    let app_stage = UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request("path segment `app_stage` must be `dev` or `prod`"))?;
     shared_types::validate_identifier(&body.app_id, "app_id")
         .map_err(|e| AppError::bad_request(&e))?;
     shared_types::validate_identifier(&body.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
 
-    let target = resolve_exec_target(&state, env, &body.app_id, &body.user_id).await?;
+    let target = resolve_exec_target(&state, app_stage, &body.app_id, &body.user_id).await?;
     let runtime = state.runtime().clone();
     let runner = ExecRunner {
         runtime: &runtime,
@@ -464,8 +462,8 @@ pub(crate) async fn create_database(
         .await
         .map_err(|e| AppError::with_message(db_admin_error_code(&e), e.to_string()))?;
     info!(
-        "[USERAPP_DB_ADMIN] database created: env={}, app_id={}, database={}, owner={:?}",
-        env.as_str(),
+        "[USERAPP_DB_ADMIN] database created: app_stage={}, app_id={}, database={}, owner={:?}",
+        app_stage.as_str(),
         body.app_id,
         body.database,
         body.owner

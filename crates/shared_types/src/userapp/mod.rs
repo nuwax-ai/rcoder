@@ -13,11 +13,11 @@
 //! 下游不应依赖 `shared_types::userapp::` 路径。
 
 pub mod activity;
+pub mod app_stage;
 pub mod build_event;
 pub mod db_admin;
 pub mod db_align;
 pub mod dev_cleanup;
 pub mod dev_locator;
-pub mod env;
 pub mod forward_contract;
 pub mod metadata;

@@ -124,21 +124,21 @@ pub async fn update_app(
 ///
 /// 删计算资源并注销运行态；默认保留持久存储，body `{"purge": true}` 连数据面
 /// 一起清空。**仅 prod**：dev 开发环境的销毁走 storage 面的
-/// `{env=dev}` destroy（builder 容器自愈重建语义不适合"删除"操作）。
+/// `{app_stage=dev}` destroy（builder 容器自愈重建语义不适合"删除"操作）。
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/{env}/delete",
+    path = "/api/v1/userapp/{app_id}/{app_stage}/delete",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("env" = String, Path, description = "目标环境：仅支持 `prod`（运行容器删除）")
+        ("app_stage" = String, Path, description = "目标环境：仅支持 `prod`（运行容器删除）")
     ),
     request_body = DeleteAppRequest,
     description = r#"
 删除应用：停容器 → 注销 pingora backend → 删除 Deployment/Service/HTTPRoute
 等计算资源（元数据行保留，误删找回可用）；`purge=true` 时连持久存储一起销毁。
 
-- **仅 prod**：传 `env=dev` 返回 400——开发环境的销毁由 storage 面
-  （`{env=dev}` destroy）承担，builder 容器常驻自愈无"删除"语义；
+- **仅 prod**：传 `app_stage=dev` 返回 400——开发环境的销毁由 storage 面
+  （`{app_stage=dev}` destroy）承担，builder 容器常驻自愈无"删除"语义；
 - Docker compose 下 purge 按 `user_id` 精确清理宿主机目录
   `prod/{user_id}/data/{app_id}` 分区（缺省回退归属元数据→通配兜底），
   **建议始终携带 user_id**；
@@ -146,7 +146,7 @@ pub async fn update_app(
 "#,
     responses(
         (status = 200, description = "删除成功", body = HttpResult<String>),
-        (status = 400, description = "env 非法或 dev 不支持 / user_id 非法", body = HttpResult<String>),
+        (status = 400, description = "app_stage 非法或 dev 不支持 / user_id 非法", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
         (status = 409, description = "resource_version 不匹配", body = HttpResult<String>)
     ),
@@ -155,12 +155,12 @@ pub async fn update_app(
 #[instrument(skip(state, body))]
 pub async fn delete_app(
     State(state): State<Arc<AppManagerState>>,
-    Path((app_id, env)): Path<(String, String)>,
+    Path((app_id, app_stage)): Path<(String, String)>,
     body: Option<Json<DeleteAppRequest>>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    if shared_types::UserappEnv::parse(&env) != Some(shared_types::UserappEnv::Prod) {
+    if shared_types::UserappStage::parse(&app_stage) != Some(shared_types::UserappStage::Prod) {
         return Err(AppError::validation_error(
-            "`delete` is a prod-runtime capability: pass env=prod (to tear down a dev environment use the storage destroy endpoint with env=dev)",
+            "`delete` is a prod-runtime capability: pass app_stage=prod (to tear down a dev environment use the storage destroy endpoint with app_stage=dev)",
         ));
     }
     let (purge, user_id, expected_rv) = body

@@ -53,7 +53,7 @@ pub trait AppServiceTrait: Send + Sync {
     /// 查询单个应用持久存储状态（prod=运行卷 / dev=开发卷；O(1) stat，不含 size_bytes）
     async fn get_app_storage(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
     ) -> AppResult<StorageInfo>;
 
@@ -61,7 +61,7 @@ pub trait AppServiceTrait: Send + Sync {
     /// workspace 内容留容器留卷——"重置开发工作区"）
     async fn clear_app_storage(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
     ) -> AppResult<()>;
@@ -70,7 +70,7 @@ pub trait AppServiceTrait: Send + Sync {
     /// dev：销毁整个开发环境=builder 容器+dev 卷+目录，不动 metadata）
     async fn destroy_app_storage(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
         confirm: &str,
@@ -94,7 +94,7 @@ pub trait AppServiceTrait: Send + Sync {
     /// 分页查询持久存储（强制分页，无全量模式；prod=运行卷清单，dev=开发卷清单）
     async fn query_storage(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         request: QueryStorageRequest,
     ) -> AppResult<PaginatedResponse<StorageInfo>>;
 
@@ -102,7 +102,7 @@ pub trait AppServiceTrait: Send + Sync {
     async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
 
     /// 统一部署+启动（无参数 = 传统 start；带 url = 轻量部署 prepare→activate→启动；
-    /// 可选 env/idle/pg 对齐）——REST 面删除 create 后的统一入口
+    /// 可选 app_stage/idle/pg 对齐）——REST 面删除 create 后的统一入口
     async fn start_app_enhanced(
         &self,
         app_id: &str,
@@ -133,11 +133,11 @@ pub trait AppServiceTrait: Send + Sync {
     ) -> AppResult<AppRuntimeInfo>;
 
     /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）。
-    /// env=prod 查运行容器（label app-id）；env=dev 查开发容器（双键 instance+service-type），
+    /// app_stage=prod 查运行容器（label app-id）；app_stage=dev 查开发容器（双键 instance+service-type），
     /// Docker/compose 形态无 metrics → 用量 0（降级语义与 prod 一致）
     async fn get_app_stats(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
     ) -> AppResult<ResourceStats>;
 
@@ -146,7 +146,7 @@ pub trait AppServiceTrait: Send + Sync {
     /// （events/recycle-policy 等）由 handler 层拦截，不进 trait。
     async fn get_app_health(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
     ) -> AppResult<HealthInfo>;
 
@@ -154,7 +154,7 @@ pub trait AppServiceTrait: Send + Sync {
     /// 解析重拼。logs 三接口的透明转发源
     async fn log_api_base(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
     ) -> AppResult<String>;
@@ -167,10 +167,10 @@ pub trait AppServiceTrait: Send + Sync {
     ) -> AppResult<Vec<container_runtime_api::AppEventInfo>>;
 
     /// 上传文件 / 压缩包（魔数判断：zip/tar.gz → 解压到 target 目录；单文件存 target；flatten 剥 wrapper）。
-    /// env=prod 转发运行容器（target 相对 /app 根）；env=dev 转发开发容器（target 相对 workspace 根）
+    /// app_stage=prod 转发运行容器（target 相对 /app 根）；app_stage=dev 转发开发容器（target 相对 workspace 根）
     async fn upload_file(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
         file_data: Vec<u8>,
@@ -181,7 +181,7 @@ pub trait AppServiceTrait: Send + Sync {
     /// 从 HTTP(S) URL 下载文件/压缩包并上传；允许内网地址，复用 upload_file 解压和路径安全校验。
     async fn upload_from_url(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
         url: &str,
@@ -193,7 +193,7 @@ pub trait AppServiceTrait: Send + Sync {
     /// dev 环境根基准为开发容器 workspace 根）
     async fn list_files(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
         subpath: Option<&str>,
@@ -202,7 +202,7 @@ pub trait AppServiceTrait: Send + Sync {
     /// 删除文件（app 根相对路径，可指向 code/data/logs 下任意文件）
     async fn delete_file(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
         file_path: &str,

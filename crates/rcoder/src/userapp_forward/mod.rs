@@ -4,7 +4,7 @@
 //!   [`CONTAINER_PASS_THROUGH_PATHS`]），并承接 `/api/computer/*` 拦截层
 //!   （`X-Service-Type: userapp` 分流时反向代理转来的 TS 老路径原样透传）
 //! - [`workspace`]：`POST /api/v1/userapp/workspace` 创建项目显式入口
-//! - [`db`]：`POST /api/v1/userapp/db/{env}/align-credentials` PG 凭据对齐
+//! - [`db`]：`POST /api/v1/userapp/db/{app_stage}/align-credentials` PG 凭据对齐
 //! - 本模块：路由聚合 + 开发容器 ensure-workspace 公共调用
 //!
 //! 容器定位/创建复用 [`crate::userapp_builder::ensure_userapp_builder`]
@@ -48,8 +48,8 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/v1/userapp/tasks/{task_id}/logs",
     "/api/v1/userapp/tasks/{task_id}/logs/stream",
     "/api/v1/userapp/tasks/{task_id}/cancel",
-    // projects/detect|confirm、install-project 已上收 `{app_id}/{env}` 门面路由
-    // （见 routes_for_env_flattened：dev-only，env 折叠后仍以容器平铺契约转发）
+    // projects/detect|confirm、install-project 已上收 `{app_id}/{app_stage}` 门面路由
+    // （见 routes_for_env_flattened：dev-only，app_stage 折叠后仍以容器平铺契约转发）
     // 文件镜像（TS nuwax-file-server 同名老接口族）
     "/api/v1/userapp/get-file-list",
     "/api/v1/userapp/resolve-file",
@@ -59,7 +59,7 @@ pub(crate) const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/v1/userapp/upload-files",
     "/api/v1/userapp/generate-file",
     "/api/v1/userapp/import-project",
-    // 容器文件操作（新形态 app-files 族）——对外经 `{app_id}/{env}/upload 族`
+    // 容器文件操作（新形态 app-files 族）——对外经 `{app_id}/{app_stage}/upload 族`
     // 与 dev storage/clear 面（容器契约端点保留，对外平铺不再注册）
     // 开发工具链
     "/api/v1/userapp/ensure-workspace",
@@ -87,64 +87,64 @@ pub(crate) mod guard_tables {
     /// 守卫闭包比对用——改动路由须同步）。
     pub(crate) const LOCAL_USERAPP_PATHS: [&str; 7] = [
         "/api/v1/userapp/workspace",
-        "/api/v1/userapp/db/{env}/align-credentials",
-        "/api/v1/userapp/db/{env}/reset-password",
-        "/api/v1/userapp/db/{env}/create-database",
-        // `{env}` 门面折叠路由（dev-only 构建链；URI 还原容器平铺契约转发）
-        "/api/v1/userapp/{app_id}/{env}/projects/detect",
-        "/api/v1/userapp/{app_id}/{env}/projects/confirm",
-        "/api/v1/userapp/{app_id}/{env}/install-project",
+        "/api/v1/userapp/db/{app_stage}/align-credentials",
+        "/api/v1/userapp/db/{app_stage}/reset-password",
+        "/api/v1/userapp/db/{app_stage}/create-database",
+        // `{app_stage}` 门面折叠路由（dev-only 构建链；URI 还原容器平铺契约转发）
+        "/api/v1/userapp/{app_id}/{app_stage}/projects/detect",
+        "/api/v1/userapp/{app_id}/{app_stage}/projects/confirm",
+        "/api/v1/userapp/{app_id}/{app_stage}/install-project",
     ];
 
     /// app_manager 具体路由路径快照（crates/app_manager/src/routes.rs；同样供
     /// 守卫闭包比对——该清单增删须同步。原 `{app_id}/db/*` 两路已下线，数据库
-    /// 管理统一走转发层 `/api/v1/userapp/db/{env}/*`；文件/存储八接口已加
-    /// `{env}` 段显式分派 dev/prod）。
+    /// 管理统一走转发层 `/api/v1/userapp/db/{app_stage}/*`；文件/存储八接口已加
+    /// `{app_stage}` 段显式分派 dev/prod）。
     pub(crate) const APP_MANAGER_PATHS: [&str; 23] = [
         "/api/v1/userapp/query",
         "/api/v1/userapp/runtime",
         "/api/v1/userapp/{app_id}",
         "/api/v1/userapp/{app_id}/update",
-        "/api/v1/userapp/{app_id}/{env}/delete",
+        "/api/v1/userapp/{app_id}/{app_stage}/delete",
         "/api/v1/userapp/{app_id}/start",
         "/api/v1/userapp/{app_id}/stop",
         "/api/v1/userapp/{app_id}/restart",
-        "/api/v1/userapp/{app_id}/{env}/recycle-policy",
-        "/api/v1/userapp/{app_id}/{env}/logs/sources/query",
-        "/api/v1/userapp/{app_id}/{env}/logs/query",
-        "/api/v1/userapp/{app_id}/{env}/logs/stream",
-        "/api/v1/userapp/{app_id}/{env}/health",
-        "/api/v1/userapp/{app_id}/{env}/stats",
-        "/api/v1/userapp/{app_id}/{env}/events",
-        "/api/v1/userapp/{app_id}/{env}/upload",
-        "/api/v1/userapp/{app_id}/{env}/upload-from-url",
-        "/api/v1/userapp/{app_id}/{env}/files",
-        "/api/v1/userapp/{app_id}/{env}/files/delete",
-        "/api/v1/userapp/{app_id}/{env}/storage",
-        "/api/v1/userapp/{app_id}/{env}/storage/clear",
-        "/api/v1/userapp/{app_id}/{env}/storage/destroy",
-        "/api/v1/userapp/storage/{env}/query",
+        "/api/v1/userapp/{app_id}/{app_stage}/recycle-policy",
+        "/api/v1/userapp/{app_id}/{app_stage}/logs/sources/query",
+        "/api/v1/userapp/{app_id}/{app_stage}/logs/query",
+        "/api/v1/userapp/{app_id}/{app_stage}/logs/stream",
+        "/api/v1/userapp/{app_id}/{app_stage}/health",
+        "/api/v1/userapp/{app_id}/{app_stage}/stats",
+        "/api/v1/userapp/{app_id}/{app_stage}/events",
+        "/api/v1/userapp/{app_id}/{app_stage}/upload",
+        "/api/v1/userapp/{app_id}/{app_stage}/upload-from-url",
+        "/api/v1/userapp/{app_id}/{app_stage}/files",
+        "/api/v1/userapp/{app_id}/{app_stage}/files/delete",
+        "/api/v1/userapp/{app_id}/{app_stage}/storage",
+        "/api/v1/userapp/{app_id}/{app_stage}/storage/clear",
+        "/api/v1/userapp/{app_id}/{app_stage}/storage/destroy",
+        "/api/v1/userapp/storage/{app_stage}/query",
     ];
 }
 
 /// userApp 域路由（挂 rcoder 主 Router）：本地实现入口 + 显式透传清单
-/// ＋ `{env}` 门面折叠路由。
+/// ＋ `{app_stage}` 门面折叠路由。
 ///
 /// `/api/v1/userapp` 族不再来自 file-server 本地路由——聚合文档时已剔除。
 pub fn routes() -> Router<Arc<AppState>> {
     let mut router = Router::new()
-        // `{env}` 门面（dev-only 构建链；URI 折叠回容器平铺契约后定向转发：
+        // `{app_stage}` 门面（dev-only 构建链；URI 折叠回容器平铺契约后定向转发：
         // detect/confirm=项目类型探测确认、install-project=模板安装）
         .route(
-            "/api/v1/userapp/{app_id}/{env}/projects/detect",
+            "/api/v1/userapp/{app_id}/{app_stage}/projects/detect",
             post(forward::flat_dev_projects_detect),
         )
         .route(
-            "/api/v1/userapp/{app_id}/{env}/projects/confirm",
+            "/api/v1/userapp/{app_id}/{app_stage}/projects/confirm",
             post(forward::flat_dev_projects_confirm),
         )
         .route(
-            "/api/v1/userapp/{app_id}/{env}/install-project",
+            "/api/v1/userapp/{app_id}/{app_stage}/install-project",
             post(forward::flat_dev_install_project),
         )
         .route(
@@ -152,15 +152,15 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(workspace::create_workspace),
         )
         .route(
-            "/api/v1/userapp/db/{env}/align-credentials",
+            "/api/v1/userapp/db/{app_stage}/align-credentials",
             post(db::align_credentials),
         )
         .route(
-            "/api/v1/userapp/db/{env}/reset-password",
+            "/api/v1/userapp/db/{app_stage}/reset-password",
             post(db::reset_password),
         )
         .route(
-            "/api/v1/userapp/db/{env}/create-database",
+            "/api/v1/userapp/db/{app_stage}/create-database",
             post(db::create_database),
         );
     for path in CONTAINER_PASS_THROUGH_PATHS {

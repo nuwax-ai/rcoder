@@ -188,7 +188,7 @@ impl AppService {
         self.get_app(app_id).await
     }
 
-    /// 获取资源使用情况（env 分派：prod=运行容器 label 查询；dev=开发容器
+    /// 获取资源使用情况（app_stage 分派：prod=运行容器 label 查询；dev=开发容器
     /// 双键 selector——instance+service-type，K8s 专属）。
     ///
     /// CPU/内存用量 + 限额来自运行时（K8s = metrics.k8s.io PodMetrics + pod limits；Docker 默认 0），
@@ -198,12 +198,12 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn get_app_stats(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
     ) -> AppResult<ResourceStats> {
-        use shared_types::UserappEnv;
+        use shared_types::UserappStage;
         validate_app_id(app_id)?;
-        if env == UserappEnv::Dev {
+        if app_stage == UserappStage::Dev {
             return self.get_dev_stats(app_id).await;
         }
         let status = self.fetch_runtime_status_or_err(app_id).await?;
@@ -265,18 +265,18 @@ impl AppService {
         }
     }
 
-    /// 获取应用健康状态（env 分派）：
+    /// 获取应用健康状态（app_stage 分派）：
     /// - prod：实时集群查询派生（`AppRuntimeInfo.health`）
     /// - dev：探活开发容器内 file-server `/health`（经 `UserappDevLocator`
     ///   幂等 ensure+探活自愈定位）；2xx→Running / 其余→Unhealthy
     #[instrument(skip(self))]
     pub async fn get_app_health(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
     ) -> AppResult<HealthInfo> {
         validate_app_id(app_id)?;
-        if env == shared_types::UserappEnv::Prod {
+        if app_stage == shared_types::UserappStage::Prod {
             let runtime = self.get_app(app_id).await?;
             return Ok(runtime.health);
         }
@@ -289,7 +289,7 @@ impl AppService {
             .and_then(|r| r.user_id)
             .filter(|uid| !uid.trim().is_empty());
         let base = self
-            .app_files_base(env, app_id, explicit_user.as_deref())
+            .app_files_base(app_stage, app_id, explicit_user.as_deref())
             .await?;
         let ok = reqwest::Client::new()
             .get(format!("{base}/health"))
@@ -313,12 +313,12 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn log_api_base(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
     ) -> AppResult<String> {
         validate_app_id(app_id)?;
-        if env == shared_types::UserappEnv::Prod {
+        if app_stage == shared_types::UserappStage::Prod {
             // 幻报拦截：ensure_running 对不存在的 app 返回 AlreadyRunning
             // （stopped-set 语义），get_app NotFound 兜底 404
             use shared_types::AppWakeControl;
@@ -348,7 +348,9 @@ impl AppService {
                 })?;
             return Ok(format!("http://{ip}:3010"));
         }
-        let file_server = self.app_files_base(env, app_id, Some(user_id)).await?;
+        let file_server = self
+            .app_files_base(app_stage, app_id, Some(user_id))
+            .await?;
         // http://{host}:60000 → http://{host}:3010（host 段原样保留，仅换管理端口）
         let host = file_server
             .trim_start_matches("http://")

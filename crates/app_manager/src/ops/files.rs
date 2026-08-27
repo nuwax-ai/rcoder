@@ -1,17 +1,17 @@
-//! 文件管理转发层（容器中心化，`env` 显式分派 dev/prod）。
+//! 文件管理转发层（容器中心化，`app_stage` 显式分派 dev/prod）。
 //!
 //! 四接口（upload / upload-from-url / files / files-delete）不直读写卷——
-//! rcoder 对生产 RBD 卷零挂载。改为：按 `env` 定位目标容器 → 转发其内
+//! rcoder 对生产 RBD 卷零挂载。改为：按 `app_stage` 定位目标容器 → 转发其内
 //! file-server-proxy (:60000) 的 `/api/v1/userapp/app-files/*` 内部契约。
 //! file-server 侧同语义实现（魔数识别 zip/tar.gz 解压 + flatten、防穿越），
 //! REST 契约（handbook）对 Java 保持不变。
-//! - `env=prod`：唤醒（闲置回收的 app 自动拉起）→ 运行容器；target 相对 /app 根
-//! - `env=dev`：幂等 ensure 开发容器（UserAppBuilder）；target 相对 workspace 根
+//! - `app_stage=prod`：唤醒（闲置回收的 app 自动拉起）→ 运行容器；target 相对 /app 根
+//! - `app_stage=dev`：幂等 ensure 开发容器（UserAppBuilder）；target 相对 workspace 根
 
 use tracing::{info, instrument, warn};
 
 use serde::Deserialize;
-use shared_types::{AppWakeControl, UserappEnv};
+use shared_types::{AppWakeControl, UserappStage};
 
 use crate::models::*;
 use crate::service::AppService;
@@ -48,10 +48,10 @@ struct ListResp {
 impl AppService {
     /// 唤醒/定位 + 解析目标容器 file-server 基址（`http://{host}:60000`）。
     ///
-    /// - `env=prod`：`ensure_running` 唤醒（闲置回收的 app 自动拉起）→ `get_app`
+    /// - `app_stage=prod`：`ensure_running` 唤醒（闲置回收的 app 自动拉起）→ `get_app`
     ///   拿运行容器 IP。幻报拦截：`ensure_running` 对不存在的 app 返回
     ///   AlreadyRunning（stopped-set 语义），后续 `get_app` NotFound 兜底 404。
-    /// - `env=dev`：经 `UserappDevLocator` 契约幂等 ensure UserAppBuilder（探活
+    /// - `app_stage=dev`：经 `UserappDevLocator` 契约幂等 ensure UserAppBuilder（探活
     ///   自愈，开发容器常驻无唤醒语义——app_manager 的 runtime 视图无 agent
     ///   能力，委托宿主 rcoder）。
     ///
@@ -59,11 +59,11 @@ impl AppService {
     /// 由 ensure 侧取值链降级 metadata（**勿传空串哨兵**，空值用 None 表达）。
     pub(crate) async fn app_files_base(
         &self,
-        env: UserappEnv,
+        app_stage: UserappStage,
         app_id: &str,
         user_id: Option<&str>,
     ) -> AppResult<String> {
-        if env == UserappEnv::Dev {
+        if app_stage == UserappStage::Dev {
             let locator = self
                 .dev_locator
                 .read()
@@ -112,11 +112,11 @@ impl AppService {
     ///
     /// 自动判断（魔数）：zip/tar.gz 压缩包 → 解压到 `target` 目录；其它 → 单文件存 `target`。
     /// 单文件：`target`=文件路径（如 `code/app.jar`）；压缩包：`target`=解压目录（如 `code/`）。
-    /// `target` 根基准随 env：prod=运行容器 app 根（/app）；dev=开发容器 workspace 根。
+    /// `target` 根基准随 app_stage：prod=运行容器 app 根（/app）；dev=开发容器 workspace 根。
     #[instrument(skip(self, file_data))]
     pub async fn upload_file(
         &self,
-        env: UserappEnv,
+        app_stage: UserappStage,
         app_id: &str,
         user_id: &str,
         file_data: Vec<u8>,
@@ -130,7 +130,9 @@ impl AppService {
                 "file data is empty".to_string(),
             ));
         }
-        let base = self.app_files_base(env, app_id, Some(user_id)).await?;
+        let base = self
+            .app_files_base(app_stage, app_id, Some(user_id))
+            .await?;
         let file_name = std::path::Path::new(target)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -167,7 +169,7 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn upload_from_url(
         &self,
-        env: UserappEnv,
+        app_stage: UserappStage,
         app_id: &str,
         user_id: &str,
         url: &str,
@@ -176,7 +178,9 @@ impl AppService {
     ) -> AppResult<UploadResult> {
         validate_app_id(app_id)?;
         validate_upload_target(target)?;
-        let base = self.app_files_base(env, app_id, Some(user_id)).await?;
+        let base = self
+            .app_files_base(app_stage, app_id, Some(user_id))
+            .await?;
         let body = serde_json::json!({
             "app_id": app_id,
             "url": url,
@@ -211,17 +215,19 @@ impl AppService {
     ///
     /// `subpath` 为 None/空 → 列 app 根；返回的 `path` 字段是 **app-root-relative**
     /// （如 "code/app.jar"），可直接作为 upload 的 target / delete 的 path（契约
-    /// 同旧直读写实现）。env=dev 时根基准为开发容器 workspace 根。
+    /// 同旧直读写实现）。app_stage=dev 时根基准为开发容器 workspace 根。
     #[instrument(skip(self))]
     pub async fn list_files(
         &self,
-        env: UserappEnv,
+        app_stage: UserappStage,
         app_id: &str,
         user_id: &str,
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>> {
         validate_app_id(app_id)?;
-        let base = self.app_files_base(env, app_id, Some(user_id)).await?;
+        let base = self
+            .app_files_base(app_stage, app_id, Some(user_id))
+            .await?;
         let mut url = format!(
             "{base}/api/v1/userapp/app-files/list?app_id={}",
             urlencode(app_id)
@@ -255,7 +261,7 @@ impl AppService {
     #[instrument(skip(self))]
     pub async fn delete_file(
         &self,
-        env: UserappEnv,
+        app_stage: UserappStage,
         app_id: &str,
         user_id: &str,
         file_path: &str,
@@ -266,7 +272,9 @@ impl AppService {
                 "file path is empty".to_string(),
             ));
         }
-        let base = self.app_files_base(env, app_id, Some(user_id)).await?;
+        let base = self
+            .app_files_base(app_stage, app_id, Some(user_id))
+            .await?;
         let body = serde_json::json!({"app_id": app_id, "path": file_path});
         let resp = reqwest::Client::new()
             .post(format!("{base}/api/v1/userapp/app-files/delete"))

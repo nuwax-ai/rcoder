@@ -254,10 +254,10 @@ use crate::handler;
         (name = "UserApp · prod · 部署与启停", description = "prod 专属（目标为 UserApp 生产运行容器/Deployment）：部署启动、停止、重启与配置更新"),
         (name = "UserApp · prod · 应用查询", description = "prod 专属：应用详情、分页查询与运行时清单"),
         (name = "UserApp · prod · 终端工具", description = "prod 专属（目标容器 UserApp 生产运行容器）：ttyd/pgweb/dbx 生产终端入口"),
-        (name = "UserApp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{env} 段分派）：文件上传/管理与存储卷查询/清理/销毁"),
-        (name = "UserApp · 双态 · 日志", description = "dev/prod 双态（路径 {env} 段分派）：日志源、检索与 SSE 实时流，转发容器内 app-cli"),
-        (name = "UserApp · 双态 · 数据库", description = "dev/prod 双态（路径 {env} 段分派）：应用 PostgreSQL 凭据对齐/改密/建库"),
-        (name = "UserApp · 双态 · 生命周期", description = "dev/prod 双态（路径 {env} 段分派）：健康/统计/事件、回收策略与删除"),
+        (name = "UserApp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{app_stage} 段分派）：文件上传/管理与存储卷查询/清理/销毁"),
+        (name = "UserApp · 双态 · 日志", description = "dev/prod 双态（路径 {app_stage} 段分派）：日志源、检索与 SSE 实时流，转发容器内 app-cli"),
+        (name = "UserApp · 双态 · 数据库", description = "dev/prod 双态（路径 {app_stage} 段分派）：应用 PostgreSQL 凭据对齐/改密/建库"),
+        (name = "UserApp · 双态 · 生命周期", description = "dev/prod 双态（路径 {app_stage} 段分派）：健康/统计/事件、回收策略与删除"),
         (name = "UserApp · 访问入口", description = "流量代理（/proxy/userapp/{dev,prod}，前端切换只改 dev→prod 一段）与终端代理路由速查表"),
         (name = "computer", description = "Computer Agent 桌面、聊天与容器内 PG 管理接口"),
         (name = "pod", description = "Pod 容器管理接口（监控/保活/重启；支持 service_type=userapp 分派 dev/prod 容器）"),
@@ -352,15 +352,15 @@ const INTERNAL_USERAPP_PATHS: [&str; 21] = [
     "/api/v1/userapp/upload-files",
     "/api/v1/userapp/workspace",
     "/api/v1/userapp/zip-workspace",
-    // app-files 族五条：dev storage/clear 与文件族 ({app_id}/{env}/upload、
+    // app-files 族五条：dev storage/clear 与文件族 ({app_id}/{app_stage}/upload、
     // files、files/delete) 的容器侧实现端点（rcoder 出站调用），对外语义由
-    // 相应 `{env}` 门面承载
+    // 相应 `{app_stage}` 门面承载
     "/api/v1/userapp/app-files/clear",
     "/api/v1/userapp/app-files/upload",
     "/api/v1/userapp/app-files/upload-from-url",
     "/api/v1/userapp/app-files/list",
     "/api/v1/userapp/app-files/delete",
-    // 构建链 dev-only 三条：已上收 `{app_id}/{env}` 门面路由（folded URI 转发，
+    // 构建链 dev-only 三条：已上收 `{app_id}/{app_stage}` 门面路由（folded URI 转发，
     // 容器侧平铺端点保留），平铺形态不再对外暴露
     "/api/v1/userapp/projects/detect",
     "/api/v1/userapp/projects/confirm",
@@ -673,23 +673,23 @@ mod openapi_tests {
             "UserApp · prod · 部署与启停"
         );
         assert_eq!(
-            tag_of("/api/v1/userapp/{app_id}/{env}/storage", "get"),
+            tag_of("/api/v1/userapp/{app_id}/{app_stage}/storage", "get"),
             "UserApp · 双态 · 文件与存储"
         );
         assert_eq!(
-            tag_of("/api/v1/userapp/{app_id}/{env}/logs/stream", "post"),
+            tag_of("/api/v1/userapp/{app_id}/{app_stage}/logs/stream", "post"),
             "UserApp · 双态 · 日志"
         );
         assert_eq!(
-            tag_of("/api/v1/userapp/db/{env}/reset-password", "post"),
+            tag_of("/api/v1/userapp/db/{app_stage}/reset-password", "post"),
             "UserApp · 双态 · 数据库"
         );
         assert_eq!(
-            tag_of("/api/v1/userapp/db/{env}/align-credentials", "post"),
+            tag_of("/api/v1/userapp/db/{app_stage}/align-credentials", "post"),
             "UserApp · 双态 · 数据库"
         );
         assert_eq!(
-            tag_of("/api/v1/userapp/{app_id}/{env}/health", "get"),
+            tag_of("/api/v1/userapp/{app_id}/{app_stage}/health", "get"),
             "UserApp · 双态 · 生命周期"
         );
         assert_eq!(
@@ -806,7 +806,7 @@ mod openapi_tests {
         let item = document
             .paths
             .paths
-            .get("/api/v1/userapp/{app_id}/{env}/logs/stream")
+            .get("/api/v1/userapp/{app_id}/{app_stage}/logs/stream")
             .expect("logs/stream path documented");
         let op = item.post.as_ref().expect("POST operation");
         let resp = op
@@ -840,8 +840,8 @@ mod openapi_tests {
         let paths = document.paths.paths;
         for path in [
             // releases 五接口已随 RBD 卷形态删除（部署只走 start+url，见 handbook 10）
-            "/api/v1/userapp/{app_id}/{env}/logs/query",
-            "/api/v1/userapp/{app_id}/{env}/logs/stream",
+            "/api/v1/userapp/{app_id}/{app_stage}/logs/query",
+            "/api/v1/userapp/{app_id}/{app_stage}/logs/stream",
             "/api/v1/userapp/{app_id}/start",
         ] {
             assert!(paths.contains_key(path), "OpenAPI path missing: {path}");
@@ -915,7 +915,7 @@ mod openapi_tests {
             "/api/v1/userapp/build",
             "/api/v1/userapp/dev/start",
             "/api/v1/userapp/get-logs",
-            "/api/v1/userapp/{app_id}/{env}/projects/detect",
+            "/api/v1/userapp/{app_id}/{app_stage}/projects/detect",
         ] {
             assert!(
                 primary.paths.paths.contains_key(anchor),

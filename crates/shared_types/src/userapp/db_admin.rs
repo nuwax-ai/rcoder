@@ -1,6 +1,6 @@
 //! UserApp PG 账号/库管理契约（跨 crate，按模块契约约定置于 shared_types）。
 //!
-//! 业务：Java 调 `POST /api/v1/userapp/db/{env}/reset-password|create-database` 管理
+//! 业务：Java 调 `POST /api/v1/userapp/db/{app_stage}/reset-password|create-database` 管理
 //! userApp dev（UserAppBuilder 开发容器）/ prod（运行容器）的容器内 PG——
 //! 账号 upsert（存在改密 / 不存在建号，补齐 [`super::db_align`] 只重置不建号的
 //! 缺口）与 API 化建库。
@@ -15,7 +15,7 @@ use crate::pg_utils::{
     pg_role_exists_cmd, validate_pg_identifier,
 };
 
-/// `POST /api/v1/userapp/db/{env}/reset-password` 请求体。
+/// `POST /api/v1/userapp/db/{app_stage}/reset-password` 请求体。
 #[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
 pub struct UserappDbResetPasswordRequest {
     /// 应用 ID（定位 dev=开发容器 / prod=运行容器）
@@ -32,7 +32,7 @@ pub struct UserappDbResetPasswordRequest {
     pub username: Option<String>,
 }
 
-/// `POST /api/v1/userapp/db/{env}/create-database` 请求体。
+/// `POST /api/v1/userapp/db/{app_stage}/create-database` 请求体。
 #[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
 pub struct UserappDbCreateDatabaseRequest {
     /// 应用 ID（定位 dev=开发容器 / prod=运行容器）

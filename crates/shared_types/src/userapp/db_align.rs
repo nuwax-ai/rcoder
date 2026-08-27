@@ -14,7 +14,7 @@ use crate::pg_utils::{
     pg_alter_password_cmd, pg_role_exists_cmd, pg_verify_credentials_cmd, validate_pg_identifier,
 };
 
-/// `POST /api/v1/userapp/db/{env}/align-credentials` 请求体（dev/prod 两接口一致）。
+/// `POST /api/v1/userapp/db/{app_stage}/align-credentials` 请求体（dev/prod 两接口一致）。
 #[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
 pub struct AlignCredentialsRequest {
     /// 应用 ID（定位 dev=开发容器 / prod=运行容器）

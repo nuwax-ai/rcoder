@@ -24,29 +24,33 @@ use crate::models::{FileInfo, UploadResult};
 /// 压缩包自动识别并解压；单文件直写。typical：发版前的静态资源/配置文件补充。
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/{env}/upload",
+    path = "/api/v1/userapp/{app_id}/{app_stage}/upload",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("env" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder，target 相对 workspace 根）/ `prod`=生产运行容器（target 相对 /app 根）")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserAppBuilder，target 相对 workspace 根）/ `prod`=生产运行容器（target 相对 /app 根）")
     ),
     request_body(content_type = "multipart/form-data", description = "上传文件"),
     responses(
         (status = 200, description = "上传成功", body = HttpResult<UploadResult>),
-        (status = 400, description = "multipart 解析失败 / 缺 file 字段 / env 非法", body = HttpResult<String>),
+        (status = 400, description = "multipart 解析失败 / 缺 file 字段 / app_stage 非法", body = HttpResult<String>),
         (status = 404, description = "应用不存在", body = HttpResult<String>),
-        (status = 502, description = "env=dev 开发容器不可达", body = HttpResult<String>)
+        (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
     ),
     tag = "UserApp · 双态 · 文件与存储"
 )]
 #[instrument(skip(state, multipart))]
 pub async fn upload_file(
     State(state): State<Arc<AppManagerState>>,
-    Path((app_id, env)): Path<(String, String)>,
+    Path((app_id, app_stage)): Path<(String, String)>,
     mut multipart: Multipart,
 ) -> Result<Json<HttpResult<UploadResult>>, AppError> {
-    let env = shared_types::UserappEnv::parse(&env)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_env_error(&env)))?;
-    info!("[APP] uploading file: {} (env={})", app_id, env.as_str());
+    let app_stage = shared_types::UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
+    info!(
+        "[APP] uploading file: {} (app_stage={})",
+        app_id,
+        app_stage.as_str()
+    );
 
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
@@ -101,7 +105,7 @@ pub async fn upload_file(
 
     let result = state
         .app_service
-        .upload_file(env, &app_id, &user_id, data, &target, flatten)
+        .upload_file(app_stage, &app_id, &user_id, data, &target, flatten)
         .await?;
 
     Ok(Json(HttpResult::success(result)))
@@ -129,31 +133,31 @@ pub struct UploadFromUrlRequest {
 /// flatten 可选，缺省 `code/`、不剥层）。
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/{env}/upload-from-url",
+    path = "/api/v1/userapp/{app_id}/{app_stage}/upload-from-url",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("env" = String, Path, description = "目标环境：`dev`=开发容器 / `prod`=生产运行容器（target 根基准同 upload）")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器 / `prod`=生产运行容器（target 根基准同 upload）")
     ),
     request_body = UploadFromUrlRequest,
     responses(
         (status = 200, description = "下载并上传成功", body = HttpResult<UploadResult>),
-        (status = 400, description = "URL 非法或不是 HTTP(S) / env 非法", body = HttpResult<String>),
-        (status = 502, description = "env=dev 开发容器不可达", body = HttpResult<String>)
+        (status = 400, description = "URL 非法或不是 HTTP(S) / app_stage 非法", body = HttpResult<String>),
+        (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
     ),
     tag = "UserApp · 双态 · 文件与存储"
 )]
 #[instrument(skip(state))]
 pub async fn upload_from_url(
     State(state): State<Arc<AppManagerState>>,
-    Path((app_id, env)): Path<(String, String)>,
+    Path((app_id, app_stage)): Path<(String, String)>,
     Json(req): Json<UploadFromUrlRequest>,
 ) -> Result<Json<HttpResult<UploadResult>>, AppError> {
-    let env = shared_types::UserappEnv::parse(&env)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_env_error(&env)))?;
+    let app_stage = shared_types::UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
     info!(
-        "[APP] upload from url: {} (env={}, url={})",
+        "[APP] upload from url: {} (app_stage={}, url={})",
         app_id,
-        env.as_str(),
+        app_stage.as_str(),
         req.url
     );
     let target = req.target.unwrap_or_else(|| "code/".to_string());
@@ -162,7 +166,7 @@ pub async fn upload_from_url(
         .map_err(|e| AppError::bad_request(&e))?;
     let result = state
         .app_service
-        .upload_from_url(env, &app_id, &req.user_id, &req.url, &target, flatten)
+        .upload_from_url(app_stage, &app_id, &req.user_id, &req.url, &target, flatten)
         .await?;
     Ok(Json(HttpResult::success(result)))
 }
@@ -184,40 +188,40 @@ pub struct ListFilesQuery {
 /// 递归遍历请逐层下钻或配合 file-server 文件镜像族接口使用。
 #[utoipa::path(
     get,
-    path = "/api/v1/userapp/{app_id}/{env}/files",
+    path = "/api/v1/userapp/{app_id}/{app_stage}/files",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("env" = String, Path, description = "目标环境：`dev`=开发容器（根=workspace）/ `prod`=生产运行容器（根=/app）"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（根=workspace）/ `prod`=生产运行容器（根=/app）"),
         ("path" = Option<String>, Query, description = "子目录（相对环境根，如 code/data/logs；默认列根）")
     ),
     responses(
         (status = 200, description = "查询成功", body = HttpResult<Vec<FileInfo>>),
-        (status = 400, description = "env 非法", body = HttpResult<String>),
+        (status = 400, description = "app_stage 非法", body = HttpResult<String>),
         (status = 404, description = "应用/路径不存在", body = HttpResult<String>),
-        (status = 502, description = "env=dev 开发容器不可达", body = HttpResult<String>)
+        (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
     ),
     tag = "UserApp · 双态 · 文件与存储"
 )]
 #[instrument(skip(state))]
 pub async fn list_files(
     State(state): State<Arc<AppManagerState>>,
-    Path((app_id, env)): Path<(String, String)>,
+    Path((app_id, app_stage)): Path<(String, String)>,
     Query(q): Query<ListFilesQuery>,
 ) -> Result<Json<HttpResult<Vec<FileInfo>>>, AppError> {
-    let env = shared_types::UserappEnv::parse(&env)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_env_error(&env)))?;
+    let app_stage = shared_types::UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
     shared_types::validate_identifier(&q.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
     info!(
-        "[APP] listing files: {} (env={}, user_id={}, subpath={:?})",
+        "[APP] listing files: {} (app_stage={}, user_id={}, subpath={:?})",
         app_id,
-        env.as_str(),
+        app_stage.as_str(),
         q.user_id,
         q.path
     );
     let files = state
         .app_service
-        .list_files(env, &app_id, &q.user_id, q.path.as_deref())
+        .list_files(app_stage, &app_id, &q.user_id, q.path.as_deref())
         .await?;
     Ok(Json(HttpResult::success(files)))
 }
@@ -238,39 +242,39 @@ pub struct DeleteFileRequest {
 /// 任意文件）；目录递归清理不在此面——危险操作走 storage/clear。
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/{env}/files/delete",
+    path = "/api/v1/userapp/{app_id}/{app_stage}/files/delete",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("env" = String, Path, description = "目标环境：`dev`=开发容器（workspace 根相对）/ `prod`=生产运行容器（/app 根相对）")
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（workspace 根相对）/ `prod`=生产运行容器（/app 根相对）")
     ),
     request_body = DeleteFileRequest,
     responses(
         (status = 200, description = "删除成功", body = HttpResult<String>),
-        (status = 400, description = "env 非法", body = HttpResult<String>),
+        (status = 400, description = "app_stage 非法", body = HttpResult<String>),
         (status = 404, description = "文件/应用不存在", body = HttpResult<String>),
-        (status = 502, description = "env=dev 开发容器不可达", body = HttpResult<String>)
+        (status = 502, description = "app_stage=dev 开发容器不可达", body = HttpResult<String>)
     ),
     tag = "UserApp · 双态 · 文件与存储"
 )]
 pub async fn delete_file(
     State(state): State<Arc<AppManagerState>>,
-    Path((app_id, env)): Path<(String, String)>,
+    Path((app_id, app_stage)): Path<(String, String)>,
     Json(request): Json<DeleteFileRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
-    let env = shared_types::UserappEnv::parse(&env)
-        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_env_error(&env)))?;
+    let app_stage = shared_types::UserappStage::parse(&app_stage)
+        .ok_or_else(|| AppError::bad_request(&shared_types::invalid_app_stage_error(&app_stage)))?;
     shared_types::validate_identifier(&request.user_id, "user_id")
         .map_err(|e| AppError::bad_request(&e))?;
     info!(
-        "[APP] deleting file: {}/{} (env={}, user_id={})",
+        "[APP] deleting file: {}/{} (app_stage={}, user_id={})",
         app_id,
         request.path,
-        env.as_str(),
+        app_stage.as_str(),
         request.user_id
     );
     state
         .app_service
-        .delete_file(env, &app_id, &request.user_id, &request.path)
+        .delete_file(app_stage, &app_id, &request.user_id, &request.path)
         .await?;
     Ok(Json(HttpResult::success("文件删除成功".to_string())))
 }

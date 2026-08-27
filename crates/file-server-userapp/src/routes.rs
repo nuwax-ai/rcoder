@@ -67,7 +67,7 @@ pub(crate) fn userapp_top_router() -> OpenApiRouter<UserAppState> {
         (name = "UserApp · dev · 工作区与工具链", description = "dev 专属（目标容器 UserAppBuilder 开发容器）：workspace 创建、命令执行、打包下载、模板与技能安装、项目类型探测确认"),
         (name = "UserApp · dev · 进程管理", description = "dev 专属（目标容器 UserAppBuilder 开发容器，路径自带 dev）：dev server 进程启停/列表/日志"),
         (name = "UserApp · 双态 · 文件镜像", description = "dev/prod 双态（X-App-Stage header 分派，缺省 dev）：TS 老接口族文件操作（camelCase 永久契约）"),
-        (name = "UserApp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{env} 段分派）：文件上传/管理与存储卷查询/清理/销毁")
+        (name = "UserApp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{app_stage} 段分派）：文件上传/管理与存储卷查询/清理/销毁")
     )
 )]
 struct ApiDoc;

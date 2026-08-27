@@ -1,4 +1,4 @@
-//! 持久存储管理（query/clear/destroy storage + orphan 检测，`env` 显式分派 dev/prod）
+//! 持久存储管理（query/clear/destroy storage + orphan 检测，`app_stage` 显式分派 dev/prod）
 //!
 //! RBD 卷形态（rcoder 零挂载）：`exists` = PVC 归属（K8s label 集）/目录存在
 //! （Docker）；`path` = PVC 名（K8s，非可挂载路径）/bind 源目录（Docker）；
@@ -12,16 +12,16 @@
 use tracing::{info, warn};
 
 use shared_types::ServiceType;
-use shared_types::UserappEnv;
+use shared_types::UserappStage;
 
 use crate::models::*;
 use crate::utils::*;
 
-/// env → 卷形态的 ServiceType（K8s PVC label / Docker 目录树都按它分形）。
-fn service_type_of(env: UserappEnv) -> ServiceType {
-    match env {
-        UserappEnv::Dev => ServiceType::UserAppBuilder,
-        UserappEnv::Prod => ServiceType::UserApp,
+/// app_stage → 卷形态的 ServiceType（K8s PVC label / Docker 目录树都按它分形）。
+fn service_type_of(app_stage: UserappStage) -> ServiceType {
+    match app_stage {
+        UserappStage::Dev => ServiceType::UserAppBuilder,
+        UserappStage::Prod => ServiceType::UserApp,
     }
 }
 
@@ -31,13 +31,17 @@ impl crate::service::AppService {
     // StorageInfo 不含 size_bytes——需容器运行时 exec du，跨面语义不稳（见设计文档 §5.4）。
 
     /// 查询单个应用的持久存储状态（prod=运行卷；dev=开发卷）。
-    pub async fn get_app_storage(&self, env: UserappEnv, app_id: &str) -> AppResult<StorageInfo> {
+    pub async fn get_app_storage(
+        &self,
+        app_stage: UserappStage,
+        app_id: &str,
+    ) -> AppResult<StorageInfo> {
         validate_app_id(app_id)?;
-        let is_orphan = match env {
-            UserappEnv::Prod => self.is_storage_orphan(app_id).await,
-            UserappEnv::Dev => self.is_dev_storage_orphan(app_id).await,
+        let is_orphan = match app_stage {
+            UserappStage::Prod => self.is_storage_orphan(app_id).await,
+            UserappStage::Dev => self.is_dev_storage_orphan(app_id).await,
         };
-        let (exists, path) = self.storage_path_info(env, app_id).await?;
+        let (exists, path) = self.storage_path_info(app_stage, app_id).await?;
         let modified_at = if shared_types::is_kubernetes_runtime() {
             None // RBD 卷不可挂载，无路径视角；容器 exec stat 属运行时依赖，降级
         } else {
@@ -59,10 +63,10 @@ impl crate::service::AppService {
     /// 存储标识 + 存在性（K8s：PVC 名 + label 集含否；Docker：bind 目录 + 本地 stat）。
     async fn storage_path_info(
         &self,
-        env: UserappEnv,
+        app_stage: UserappStage,
         app_id: &str,
     ) -> AppResult<(bool, std::path::PathBuf)> {
-        let service_type = service_type_of(env);
+        let service_type = service_type_of(app_stage);
         let path = self
             .runtime
             .workspace_volume_name(app_id, &service_type)
@@ -82,9 +86,9 @@ impl crate::service::AppService {
         } else {
             // Docker：workspace_volume_name 返回的是展示标识（通配串，非可 stat
             // 路径）——存在性用元数据 uid 精确定位对应树的 workspace 段。
-            let ws_dir = match env {
-                UserappEnv::Prod => self.app_prod_dirs(app_id)[0].clone(),
-                UserappEnv::Dev => self.app_dev_dirs(app_id)[0].clone(),
+            let ws_dir = match app_stage {
+                UserappStage::Prod => self.app_prod_dirs(app_id)[0].clone(),
+                UserappStage::Dev => self.app_dev_dirs(app_id)[0].clone(),
             };
             let exists = tokio::fs::metadata(&ws_dir).await.is_ok();
             Ok((exists, path))
@@ -147,14 +151,14 @@ impl crate::service::AppService {
     ///   幂等；容器内为旧镜像（无 clear 端点）时 404 上抛 Backend。
     pub async fn clear_app_storage(
         &self,
-        env: UserappEnv,
+        app_stage: UserappStage,
         app_id: &str,
         user_id: &str,
     ) -> AppResult<()> {
         validate_app_id(app_id)?;
-        if env == UserappEnv::Dev {
+        if app_stage == UserappStage::Dev {
             let base = self
-                .app_files_base(UserappEnv::Dev, app_id, Some(user_id))
+                .app_files_base(UserappStage::Dev, app_id, Some(user_id))
                 .await?;
             let resp = reqwest::Client::new()
                 .post(format!("{base}/api/v1/userapp/app-files/clear"))
@@ -212,12 +216,12 @@ impl crate::service::AppService {
     ///   保留——create-workspace 幂等重建开发环境）。幂等：资源不存在视为成功。
     pub async fn destroy_app_storage(
         &self,
-        env: UserappEnv,
+        app_stage: UserappStage,
         app_id: &str,
         user_id: &str,
         confirm: &str,
     ) -> AppResult<()> {
-        if env == UserappEnv::Dev {
+        if app_stage == UserappStage::Dev {
             validate_app_id(app_id)?;
             if confirm != app_id {
                 return Err(AppOperationError::Validation(format!(
@@ -331,7 +335,7 @@ impl crate::service::AppService {
     /// （显式成本），否则仅对当前页条目探测（≤page_size 次）。
     pub async fn query_storage(
         &self,
-        env: UserappEnv,
+        app_stage: UserappStage,
         request: QueryStorageRequest,
     ) -> AppResult<PaginatedResponse<StorageInfo>> {
         if request.page == 0 {
@@ -350,9 +354,9 @@ impl crate::service::AppService {
                 "[APP] query_storage tenant_id/space_id filters not supported in stateless mode (rcoder holds no app→tenant mapping), ignored"
             );
         }
-        let service_type = service_type_of(env);
+        let service_type = service_type_of(app_stage);
         // dev 逐项 alive 探测通道（仅 Dev 使用；未注入时保守判"在"→非 orphan）
-        let dev_locator = if env == UserappEnv::Dev {
+        let dev_locator = if app_stage == UserappStage::Dev {
             Some(
                 self.dev_locator
                     .read()
@@ -367,7 +371,7 @@ impl crate::service::AppService {
         };
         // 现有 app 集合（供 prod 的 is_orphan），一次 list 调用；dev 不整集预取
         //（builder 非 Deployment，无整集接口——见上注释）
-        let existing: std::collections::HashSet<String> = if env == UserappEnv::Prod {
+        let existing: std::collections::HashSet<String> = if app_stage == UserappStage::Prod {
             self.runtime
                 .list_deployments()
                 .await
@@ -426,7 +430,7 @@ impl crate::service::AppService {
         let filtered: Vec<String> = if orphan_only {
             let mut kept = Vec::new();
             for app_id in filtered {
-                let is_orphan = if env == UserappEnv::Prod {
+                let is_orphan = if app_stage == UserappStage::Prod {
                     !existing.contains(&app_id)
                 } else {
                     !dev_alive(&dev_locator, &app_id).await
@@ -447,13 +451,13 @@ impl crate::service::AppService {
 
         let mut items = Vec::with_capacity(paged.len());
         for app_id in paged {
-            let is_orphan = if env == UserappEnv::Prod {
+            let is_orphan = if app_stage == UserappStage::Prod {
                 !existing.contains(&app_id)
             } else {
                 !dev_alive(&dev_locator, &app_id).await
             };
             // 单项标识解析失败（瞬时 K8s API 抖动）不中断整个列表：warn + 标记 not exist
-            let (exists, path) = match self.storage_path_info(env, &app_id).await {
+            let (exists, path) = match self.storage_path_info(app_stage, &app_id).await {
                 Ok(ok) => ok,
                 Err(e) => {
                     warn!(
@@ -542,8 +546,8 @@ mod tests {
     use super::*;
     use crate::test_support::{MockRuntime, test_service};
 
-    /// storage 的 env 分派落点：workspace_volume_name / list_workspace_identifiers
-    /// 必须按 env 换 ServiceType（dev→UserAppBuilder / prod→UserApp）——K8s 卷
+    /// storage 的 app_stage 分派落点：workspace_volume_name / list_workspace_identifiers
+    /// 必须按 app_stage 换 ServiceType（dev→UserAppBuilder / prod→UserApp）——K8s 卷
     /// label 与 Docker 目录树都按它分形，分派错即查错卷。
     #[tokio::test]
     async fn storage_env_dispatches_service_type() {
@@ -551,11 +555,11 @@ mod tests {
         let service = test_service(std::path::Path::new("/tmp/ws"), runtime.clone());
 
         service
-            .get_app_storage(UserappEnv::Prod, "app-1")
+            .get_app_storage(UserappStage::Prod, "app-1")
             .await
             .expect("prod storage");
         service
-            .get_app_storage(UserappEnv::Dev, "app-1")
+            .get_app_storage(UserappStage::Dev, "app-1")
             .await
             .expect("dev storage");
 
@@ -567,7 +571,7 @@ mod tests {
         );
     }
 
-    /// query 的 env 分派：dev 清单枚举 UserAppBuilder 卷（不并入 Deployment 集），
+    /// query 的 app_stage 分派：dev 清单枚举 UserAppBuilder 卷（不并入 Deployment 集），
     /// prod 枚举 UserApp 卷（并入运行中 app 兜底）。
     #[tokio::test]
     async fn query_storage_env_selects_volume_family() {
@@ -599,7 +603,7 @@ mod tests {
 
         let dev_resp = service
             .query_storage(
-                UserappEnv::Dev,
+                UserappStage::Dev,
                 QueryStorageRequest {
                     page: 1,
                     page_size: 10,
@@ -620,7 +624,7 @@ mod tests {
 
         let prod_resp = service
             .query_storage(
-                UserappEnv::Prod,
+                UserappStage::Prod,
                 QueryStorageRequest {
                     page: 1,
                     page_size: 10,

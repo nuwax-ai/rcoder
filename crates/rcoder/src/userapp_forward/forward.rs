@@ -29,6 +29,7 @@ use crate::userapp_builder::{dev_file_server_addr, ensure_userapp_builder, regis
 
 // 分流契约常量（X-Service-Type / X-App-Id / X-App-Stage）定义在 shared_types
 // （rcoder 转发层与容器内 file-server 共用的单一事实源）。
+use shared_types::UserappStage;
 pub use shared_types::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER,
 };
@@ -488,7 +489,7 @@ const WAKE_503_RETRY_AFTER_SECS: u32 = 15;
 
 /// dev/prod 阶段分派解析：缺省 dev（向后兼容既有无 header 调用）；
 /// 未知值 fail-fast 400（header 拼错不该静默落错容器）。
-fn parse_app_stage(req: &Request) -> Result<AppStage, Box<Response>> {
+fn parse_app_stage(req: &Request) -> Result<UserappStage, Box<Response>> {
     let Some(value) = req
         .headers()
         .get(APP_STAGE_HEADER)
@@ -496,11 +497,11 @@ fn parse_app_stage(req: &Request) -> Result<AppStage, Box<Response>> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     else {
-        return Ok(AppStage::Dev);
+        return Ok(UserappStage::Dev);
     };
     match value.to_ascii_lowercase().as_str() {
-        v if v == APP_STAGE_DEV => Ok(AppStage::Dev),
-        v if v == APP_STAGE_PROD => Ok(AppStage::Prod),
+        v if v == APP_STAGE_DEV => Ok(UserappStage::Dev),
+        v if v == APP_STAGE_PROD => Ok(UserappStage::Prod),
         other => Err(Box::new(
             HttpResultError::bad_request(format!(
                 "invalid `{APP_STAGE_HEADER}` value '{other}'; expected `{APP_STAGE_DEV}` or `{APP_STAGE_PROD}`"
@@ -508,11 +509,6 @@ fn parse_app_stage(req: &Request) -> Result<AppStage, Box<Response>> {
             .into_response(),
         )),
     }
-}
-
-enum AppStage {
-    Dev,
-    Prod,
 }
 
 /// `/api/v1/userapp/{*rest}` 通配透传 handler。
@@ -566,7 +562,7 @@ pub(crate) async fn forward_userapp(
         Err(resp) => return *resp,
     };
     match stage {
-        AppStage::Dev => {
+        UserappStage::Dev => {
             // 停止/查询短路：仅容器不在时生效（容器在则照常转发）
             let action = classify_dev_absent(&path);
             let short_circuit = !matches!(action, DevAbsentAction::Ensure)
@@ -603,7 +599,7 @@ pub(crate) async fn forward_userapp(
             );
             forward_to_dev(&state, &app_id, req, explicit_user.as_deref()).await
         }
-        AppStage::Prod => {
+        UserappStage::Prod => {
             info!(
                 "[USERAPP_FORWARD] {} {} -> prod runtime container (app_id={app_id})",
                 req.method(),
@@ -614,12 +610,12 @@ pub(crate) async fn forward_userapp(
     }
 }
 
-/// `/api/v1/userapp/{app_id}/{env}` 门面折叠转发（dev-only 构建链公用内核）：
+/// `/api/v1/userapp/{app_id}/{app_stage}` 门面折叠转发（dev-only 构建链公用内核）：
 ///
-/// 1. `{env}` 仅认 `dev`——构建链是开发阶段能力，传 prod 返回 400 明示；
+/// 1. `{app_stage}` 仅认 `dev`——构建链是开发阶段能力，传 prod 返回 400 明示；
 /// 2. 容器定位沿用透传面契约：`X-App-Id` header（require_app_id 白名单校验），
 ///    body 自带的 app_id 字段由容器侧 `resolve_userapp_dev` 消费；
-/// 3. **URI 折叠**：剥掉门面段 `/api/v1/userapp/{app_id}/{env}` 还原容器平铺
+/// 3. **URI 折叠**：剥掉门面段 `/api/v1/userapp/{app_id}/{app_stage}` 还原容器平铺
 ///    契约路径（file-server-userapp 端点零改动），query 原样保留。
 async fn fold_env_forward(
     state: Arc<AppState>,
@@ -627,15 +623,15 @@ async fn fold_env_forward(
     req: Request,
     target_path: &'static str,
 ) -> Response {
-    use shared_types::UserappEnv;
-    let (path_app_id, env) = path.0;
-    let Some(env) = UserappEnv::parse(&env) else {
-        return HttpResultError::bad_request("path segment `env` must be `dev` or `prod`")
+    use shared_types::UserappStage;
+    let (path_app_id, app_stage) = path.0;
+    let Some(app_stage) = UserappStage::parse(&app_stage) else {
+        return HttpResultError::bad_request("path segment `app_stage` must be `dev` or `prod`")
             .into_response();
     };
-    if env != UserappEnv::Dev {
+    if app_stage != UserappStage::Dev {
         return HttpResultError::bad_request(format!(
-            "`{target_path}` is a dev (build-chain) capability: pass env=dev"
+            "`{target_path}` is a dev (build-chain) capability: pass app_stage=dev"
         ))
         .into_response();
     }
@@ -658,7 +654,7 @@ async fn fold_env_forward(
     *req.uri_mut() = rebuilt;
 
     info!(
-        "[USERAPP_FORWARD] {} {} -> dev container (folded env, app_id={app_id})",
+        "[USERAPP_FORWARD] {} {} -> dev container (folded app_stage, app_id={app_id})",
         req.method(),
         req.uri().path()
     );
@@ -679,10 +675,10 @@ fn rebuild_uri_with(uri: &Uri, target_path: &'static str) -> Result<Uri, String>
 /// 探测开发容器内的项目类型
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/{env}/projects/detect",
+    path = "/api/v1/userapp/{app_id}/{app_stage}/projects/detect",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("env" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
+        ("app_stage" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
     ),
     request_body(
         content = serde_json::Value,
@@ -697,7 +693,7 @@ URI 折叠为容器内平铺路径 `/api/v1/userapp/projects/detect` 后流式�
 "#,
     responses(
         (status = 200, description = "探测结果（HttpResult 信封，data 含类型推断与文件清单）", body = HttpResult<serde_json::Value>),
-        (status = 400, description = "env 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
+        (status = 400, description = "app_stage 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
     ),
     tag = "UserApp · dev · 工作区与工具链",
 )]
@@ -712,10 +708,10 @@ pub(crate) async fn flat_dev_projects_detect(
 /// 确认开发容器的项目类型
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/{env}/projects/confirm",
+    path = "/api/v1/userapp/{app_id}/{app_stage}/projects/confirm",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("env" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
+        ("app_stage" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
     ),
     request_body(
         content = serde_json::Value,
@@ -727,7 +723,7 @@ pub(crate) async fn flat_dev_projects_detect(
 "#,
     responses(
         (status = 200, description = "确认结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
-        (status = 400, description = "env 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
+        (status = 400, description = "app_stage 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
     ),
     tag = "UserApp · dev · 工作区与工具链",
 )]
@@ -742,10 +738,10 @@ pub(crate) async fn flat_dev_projects_confirm(
 /// 安装项目到开发容器
 #[utoipa::path(
     post,
-    path = "/api/v1/userapp/{app_id}/{env}/install-project",
+    path = "/api/v1/userapp/{app_id}/{app_stage}/install-project",
     params(
         ("app_id" = String, Path, description = "应用 ID"),
-        ("env" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
+        ("app_stage" = String, Path, description = "目标环境：仅支持 `dev`（构建链为开发阶段能力）")
     ),
     request_body(
         content = serde_json::Value,
@@ -757,7 +753,7 @@ pub(crate) async fn flat_dev_projects_confirm(
 "#,
     responses(
         (status = 200, description = "安装结果（HttpResult 信封）", body = HttpResult<serde_json::Value>),
-        (status = 400, description = "env 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
+        (status = 400, description = "app_stage 非 dev / 缺或错 X-App-Id / 参数非法", body = HttpResult<String>)
     ),
     tag = "UserApp · dev · 工作区与工具链",
 )]
@@ -793,7 +789,7 @@ pub(crate) async fn computer_intercept(
         Err(resp) => return *resp,
     };
     match stage {
-        AppStage::Dev => {
+        UserappStage::Dev => {
             info!(
                 "[USERAPP_FORWARD] intercepted computer request {} -> dev container (app_id={app_id})",
                 req.uri().path()
@@ -801,7 +797,7 @@ pub(crate) async fn computer_intercept(
             // TS 老族 body 携 user_id（camelCase 契约）但流式不解析——metadata 链
             forward_to_dev(&state, &app_id, req, None).await
         }
-        AppStage::Prod => {
+        UserappStage::Prod => {
             info!(
                 "[USERAPP_FORWARD] intercepted computer request {} -> prod runtime container (app_id={app_id})",
                 req.uri().path()

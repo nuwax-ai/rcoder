@@ -3,7 +3,7 @@
 //! rcoder 是无状态的应用 pod 引擎：
 //! - 写操作（create/start/stop/restart/delete）转调 [`ContainerRuntime`] 的 Deployment 能力；
 //! - 读操作（get/query/list）实时查集群，返回 [`AppRuntimeInfo`]；
-//! - 业务元数据（name/image/command/env 等）由调用方（Java）持久化，rcoder 不存。
+//! - 业务元数据（name/image/command/app_stage 等）由调用方（Java）持久化，rcoder 不存。
 //!
 //! K8s 模式 `create_deployment` 创建 ConfigMap/Secret/ClusterIP Service/Deployment；
 //! HTTP 入口按 `http_expose`：Pingora（默认，两后端统一，本服务注册 Pingora backend
@@ -50,7 +50,7 @@ pub struct AppService {
     /// UserApp 开发资源回收回调（宿主注入；purge 时回收 UserAppBuilder 开发容器
     /// 与 per-app PVC——app_manager 的 runtime 视图无 agent 能力，经契约委托宿主）。
     pub(crate) dev_cleanup: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevCleanup>>>,
-    /// UserApp 开发容器定位回调（宿主注入；文件/存储接口 `env=dev` 分支经此
+    /// UserApp 开发容器定位回调（宿主注入；文件/存储接口 `app_stage=dev` 分支经此
     /// ensure/定位 UserAppBuilder 的 file-server——同 dev_cleanup 的委托根因）。
     pub(crate) dev_locator: std::sync::RwLock<Option<Arc<dyn shared_types::UserappDevLocator>>>,
     /// Deployment 列表查询缓存（TTL + 写路径失效 + single-flight）。防查询面
@@ -213,29 +213,29 @@ impl super::AppServiceTrait for AppService {
 
     async fn get_app_storage(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
     ) -> AppResult<StorageInfo> {
-        self.get_app_storage(env, app_id).await
+        self.get_app_storage(app_stage, app_id).await
     }
 
     async fn clear_app_storage(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
     ) -> AppResult<()> {
-        self.clear_app_storage(env, app_id, user_id).await
+        self.clear_app_storage(app_stage, app_id, user_id).await
     }
 
     async fn destroy_app_storage(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
         confirm: &str,
     ) -> AppResult<()> {
-        self.destroy_app_storage(env, app_id, user_id, confirm)
+        self.destroy_app_storage(app_stage, app_id, user_id, confirm)
             .await
     }
 
@@ -257,10 +257,10 @@ impl super::AppServiceTrait for AppService {
 
     async fn query_storage(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         request: QueryStorageRequest,
     ) -> AppResult<PaginatedResponse<StorageInfo>> {
-        self.query_storage(env, request).await
+        self.query_storage(app_stage, request).await
     }
 
     async fn start_app_enhanced(
@@ -305,27 +305,27 @@ impl super::AppServiceTrait for AppService {
 
     async fn get_app_stats(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
     ) -> AppResult<ResourceStats> {
-        self.get_app_stats(env, app_id).await
+        self.get_app_stats(app_stage, app_id).await
     }
 
     async fn get_app_health(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
     ) -> AppResult<HealthInfo> {
-        self.get_app_health(env, app_id).await
+        self.get_app_health(app_stage, app_id).await
     }
 
     async fn log_api_base(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
     ) -> AppResult<String> {
-        self.log_api_base(env, app_id, user_id).await
+        self.log_api_base(app_stage, app_id, user_id).await
     }
 
     async fn get_app_events(
@@ -337,48 +337,49 @@ impl super::AppServiceTrait for AppService {
 
     async fn upload_file(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
         file_data: Vec<u8>,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult> {
-        self.upload_file(env, app_id, user_id, file_data, target, flatten)
+        self.upload_file(app_stage, app_id, user_id, file_data, target, flatten)
             .await
     }
 
     async fn upload_from_url(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
         url: &str,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult> {
-        self.upload_from_url(env, app_id, user_id, url, target, flatten)
+        self.upload_from_url(app_stage, app_id, user_id, url, target, flatten)
             .await
     }
 
     async fn list_files(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
         subpath: Option<&str>,
     ) -> AppResult<Vec<FileInfo>> {
-        self.list_files(env, app_id, user_id, subpath).await
+        self.list_files(app_stage, app_id, user_id, subpath).await
     }
 
     async fn delete_file(
         &self,
-        env: shared_types::UserappEnv,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         user_id: &str,
         file_path: &str,
     ) -> AppResult<()> {
-        self.delete_file(env, app_id, user_id, file_path).await
+        self.delete_file(app_stage, app_id, user_id, file_path)
+            .await
     }
 }
 
@@ -792,7 +793,7 @@ mod tests {
 
         service
             .destroy_app_storage(
-                shared_types::UserappEnv::Prod,
+                shared_types::UserappStage::Prod,
                 "app-purge",
                 "u-purge",
                 "app-purge",

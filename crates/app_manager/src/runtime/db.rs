@@ -3,7 +3,7 @@
 //! 职责：`align_db_credentials`（凭据对齐，流程单头
 //! `shared_types::align_pg_credentials`）与 exec 前置 `ensure_app_running`。
 //! 改密/建库 HTTP 面已按拍板下线，统一走 rcoder 转发层
-//! `/api/v1/userapp/db/{env}/*`——userapp_forward::db 的 env 双环境 +
+//! `/api/v1/userapp/db/{app_stage}/*`——userapp_forward::db 的 app_stage 双环境 +
 //! （dbx 预置连接已改为容器内 socket 免密,与改密链解耦）。
 
 use async_trait::async_trait;

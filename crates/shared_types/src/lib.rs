@@ -20,6 +20,7 @@ pub use project_store::ProjectStore;
 pub use userapp::activity::{
     ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, WakeOutcome,
 };
+pub use userapp::app_stage::{UserappStage, invalid_app_stage_error};
 pub use userapp::build_event::BuildProgressEvent;
 pub use userapp::db_admin::{
     DbAdminError, DbUserUpsertOutcome, UserappDbCreateDatabaseRequest,
@@ -31,7 +32,6 @@ pub use userapp::db_align::{
 };
 pub use userapp::dev_cleanup::UserappDevCleanup;
 pub use userapp::dev_locator::{UserappDevEnsure, UserappDevLocator};
-pub use userapp::env::{UserappEnv, invalid_env_error};
 pub use userapp::forward_contract::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, SERVICE_TYPE_HEADER,
     SERVICE_TYPE_USERAPP, is_userapp_service_type_value,
